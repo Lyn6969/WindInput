@@ -11,6 +11,7 @@ use wind_dict::cached::CachedDict;
 use wind_dict::codetable::CodetableDict;
 use wind_engine::pinyin::syllable::SyllableTrie;
 use wind_engine::pinyin::dag::Dag;
+use wind_engine::pinyin::scorer::AbbrevMatcher;
 use wind_ipc::protocol::{EVENT_KEY_DOWN, MOD_CTRL, MOD_ALT};
 use wind_ui::manager::{UiCommand, UiManager};
 use wind_ui::candidate_window::CandidateItem;
@@ -406,6 +407,21 @@ impl MinimalCoordinator {
                             weight,
                             order,
                         });
+                    }
+                }
+
+                // 4. 缩写匹配（如 "bzd" → "不知道"）
+                if AbbrevMatcher::is_abbreviation(input, trie) {
+                    let abbrev_results = AbbrevMatcher::find_candidates(input, trie, dict, 10);
+                    for abbrev in abbrev_results {
+                        if !state.candidates.iter().any(|c| c.text == abbrev.text) {
+                            state.candidates.push(Candidate {
+                                text: abbrev.text,
+                                code: abbrev.code,
+                                weight: abbrev.weight,
+                                order: 999999, // 缩写匹配排在后面
+                            });
+                        }
                     }
                 }
             } else {
