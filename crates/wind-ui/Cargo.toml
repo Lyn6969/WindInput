@@ -1,0 +1,18 @@
+[package]
+name = "wind-ui"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+wind-theme = { path = "../wind-theme" }
+wind-candidate = { path = "../wind-candidate" }
+wind-bridge = { path = "../wind-bridge" }
+tiny-skia = { workspace = true }
+tracing = { workspace = true }
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+image = { workspace = true }
+tokio = { workspace = true }
+
+[target.'cfg(windows)'.dependencies]
+windows = { workspace = true }

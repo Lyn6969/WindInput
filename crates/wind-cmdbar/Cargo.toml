@@ -1,0 +1,9 @@
+[package]
+name = "wind-cmdbar"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+tracing = { workspace = true }
+anyhow = { workspace = true }
+thiserror = { workspace = true }

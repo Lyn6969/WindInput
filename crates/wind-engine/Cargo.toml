@@ -1,0 +1,12 @@
+[package]
+name = "wind-engine"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+wind-candidate = { path = "../wind-candidate" }
+wind-dict = { path = "../wind-dict" }
+wind-config = { path = "../wind-config" }
+tracing = { workspace = true }
+anyhow = { workspace = true }
+thiserror = { workspace = true }

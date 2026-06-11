@@ -1,0 +1,109 @@
+//! 延迟处理器：启动时返回安全默认值，就绪后切换到真实处理器
+//!
+//! 与 Go 版本 `wind_input/internal/bridge/deferred_handler.go` 对齐。
+
+use crate::handler::*;
+use std::sync::{Arc, RwLock};
+use tracing::info;
+
+/// 延迟处理器：在服务初始化完成前返回安全默认值
+pub struct DeferredHandler {
+    inner: RwLock<Option<Arc<dyn MessageHandler>>>,
+}
+
+impl DeferredHandler {
+    pub fn new() -> Arc<Self> {
+        Arc::new(Self {
+            inner: RwLock::new(None),
+        })
+    }
+
+    /// 设置真实处理器（初始化完成后调用）
+    pub fn set_ready(&self, handler: Arc<dyn MessageHandler>) {
+        info!("DeferredHandler: switching to real handler");
+        *self.inner.write().unwrap() = Some(handler);
+    }
+
+    /// 检查是否已就绪
+    pub fn is_ready(&self) -> bool {
+        self.inner.read().unwrap().is_some()
+    }
+
+    /// 获取内部真实处理器（如果已就绪）
+    fn with_handler<F, R>(&self, default: R, f: F) -> R
+    where
+        F: FnOnce(&dyn MessageHandler) -> R,
+    {
+        let guard = self.inner.read().unwrap();
+        match guard.as_ref() {
+            Some(handler) => f(handler.as_ref()),
+            None => default,
+        }
+    }
+}
+
+impl MessageHandler for DeferredHandler {
+    fn handle_key_event(&self, data: &KeyEventData) -> KeyAction {
+        self.with_handler(KeyAction::PassThrough, |h| h.handle_key_event(data))
+    }
+
+    fn handle_focus_gained(&self, data: &FocusData) -> Option<StatusUpdateData> {
+        self.with_handler(None, |h| h.handle_focus_gained(data))
+    }
+
+    fn handle_focus_lost(&self) {
+        self.with_handler((), |h| h.handle_focus_lost())
+    }
+
+    fn handle_ime_activated(&self, client_token: u64) -> Option<StatusUpdateData> {
+        self.with_handler(None, |h| h.handle_ime_activated(client_token))
+    }
+
+    fn handle_ime_deactivated(&self) {
+        self.with_handler((), |h| h.handle_ime_deactivated())
+    }
+
+    fn handle_mode_notify(&self, flags: u32) {
+        self.with_handler((), |h| h.handle_mode_notify(flags))
+    }
+
+    fn handle_toggle_mode(&self) -> (Option<StatusUpdateData>, String) {
+        self.with_handler((None, String::new()), |h| h.handle_toggle_mode())
+    }
+
+    fn handle_system_mode_switch(&self, chinese_mode: bool) -> (Option<StatusUpdateData>, String) {
+        self.with_handler((None, String::new()), |h| h.handle_system_mode_switch(chinese_mode))
+    }
+
+    fn handle_menu_command(&self, command: &str) -> Option<StatusUpdateData> {
+        self.with_handler(None, |h| h.handle_menu_command(command))
+    }
+
+    fn handle_composition_terminated(&self) {
+        self.with_handler((), |h| h.handle_composition_terminated())
+    }
+
+    fn handle_caret_update(&self, data: &CaretData) {
+        self.with_handler((), |h| h.handle_caret_update(data))
+    }
+
+    fn handle_caret_pending(&self) {
+        self.with_handler((), |h| h.handle_caret_pending())
+    }
+
+    fn handle_selection_changed(&self, prev_char: u16) {
+        self.with_handler((), |h| h.handle_selection_changed(prev_char))
+    }
+
+    fn handle_commit_request(&self, data: &CommitRequestData) -> Option<CommitResultData> {
+        self.with_handler(None, |h| h.handle_commit_request(data))
+    }
+
+    fn handle_host_render_request(&self) {
+        self.with_handler((), |h| h.handle_host_render_request())
+    }
+
+    fn handle_host_render_ready(&self) {
+        self.with_handler((), |h| h.handle_host_render_ready())
+    }
+}

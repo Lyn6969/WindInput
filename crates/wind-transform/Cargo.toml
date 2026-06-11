@@ -1,0 +1,8 @@
+[package]
+name = "wind-transform"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+wind-config = { path = "../wind-config" }
+tracing = { workspace = true }

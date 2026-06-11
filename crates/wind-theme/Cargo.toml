@@ -1,0 +1,13 @@
+[package]
+name = "wind-theme"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+serde = { workspace = true }
+serde_yaml = { workspace = true }
+tracing = { workspace = true }
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+image = { workspace = true }
+resvg = "0.44"

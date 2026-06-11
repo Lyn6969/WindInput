@@ -1,0 +1,15 @@
+[package]
+name = "wind-dict"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+wind-candidate = { path = "../wind-candidate" }
+wind-store = { path = "../wind-store" }
+tracing = { workspace = true }
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+memmap2 = "0.9"
+
+[target.'cfg(windows)'.dependencies]
+windows = { workspace = true }

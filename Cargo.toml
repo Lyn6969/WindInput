@@ -1,0 +1,81 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/wind-ipc",
+    "crates/wind-bridge",
+    "crates/wind-config",
+    "crates/wind-store",
+    "crates/wind-dict",
+    "crates/wind-engine",
+    "crates/wind-candidate",
+    "crates/wind-transform",
+    "crates/wind-theme",
+    "crates/wind-ui",
+    "crates/wind-cmdbar",
+    "crates/wind-coordinator",
+    "wind_service",
+    "wind_rpc",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+
+[workspace.dependencies]
+# Async runtime
+tokio = { version = "1", features = ["full"] }
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+serde_yaml = "0.9"
+toml = "0.8"
+# Logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+# Error handling
+anyhow = "1"
+thiserror = "2"
+# Database
+redb = "2"
+# Image processing
+image = "0.25"
+# Config
+dirs = "6"
+uuid = { version = "1", features = ["v4"] }
+# 2D rendering
+tiny-skia = "0.11"
+# Windows API
+windows = { version = "0.58", features = [
+    "Win32_Foundation",
+    "Win32_System_Memory",
+    "Win32_System_Pipes",
+    "Win32_System_Threading",
+    "Win32_Security",
+    "Win32_Security_Authorization",
+    "Win32_Graphics_Gdi",
+    "Win32_UI_WindowsAndMessaging",
+    "Win32_UI_Shell",
+    "Win32_Graphics_DirectWrite",
+    "Win32_Graphics_Direct2D_Common",
+    "Win32_UI_HiDpi",
+    "Win32_System_SystemServices",
+    "Win32_System_LibraryLoader",
+    "Win32_System_SystemInformation",
+    "Win32_Graphics_Dwm",
+    "Win32_UI_Input_KeyboardAndMouse",
+    "Win32_System_Mailslots",
+    "Win32_System_IO",
+    "Win32_System_Com",
+    "Win32_System_Ole",
+    "Win32_Storage_FileSystem",
+]}
+# Random
+rand = "0.8"
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+strip = true
+panic = "abort"

@@ -1,0 +1,20 @@
+[package]
+name = "wind-coordinator"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+wind-ipc = { path = "../wind-ipc" }
+wind-bridge = { path = "../wind-bridge" }
+wind-config = { path = "../wind-config" }
+wind-store = { path = "../wind-store" }
+wind-dict = { path = "../wind-dict" }
+wind-engine = { path = "../wind-engine" }
+wind-candidate = { path = "../wind-candidate" }
+wind-transform = { path = "../wind-transform" }
+wind-theme = { path = "../wind-theme" }
+wind-ui = { path = "../wind-ui" }
+wind-cmdbar = { path = "../wind-cmdbar" }
+tokio = { workspace = true }
+tracing = { workspace = true }
+anyhow = { workspace = true }
