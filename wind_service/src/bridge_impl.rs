@@ -11,7 +11,9 @@ use wind_dict::cached::CachedDict;
 use wind_dict::codetable::CodetableDict;
 use wind_engine::pinyin::syllable::SyllableTrie;
 use wind_engine::pinyin::dag::Dag;
+use wind_engine::pinyin::viterbi::{ViterbiDecoder, WordNode};
 use wind_engine::pinyin::scorer::AbbrevMatcher;
+use wind_store::freq::FreqTracker;
 use wind_ipc::protocol::{EVENT_KEY_DOWN, MOD_CTRL, MOD_ALT};
 use wind_ui::manager::{UiCommand, UiManager};
 use wind_ui::candidate_window::CandidateItem;
@@ -51,6 +53,10 @@ pub struct MinimalCoordinator {
     ui_tx: std::sync::mpsc::Sender<UiCommand>,
     /// 音节 Trie（拼音模式用于连续输入切分）
     syllable_trie: Option<SyllableTrie>,
+    /// Viterbi 解码器
+    viterbi: ViterbiDecoder,
+    /// 词频跟踪器
+    freq_tracker: FreqTracker,
 }
 
 impl MinimalCoordinator {
@@ -103,6 +109,8 @@ impl MinimalCoordinator {
             } else {
                 None
             },
+            viterbi: ViterbiDecoder::new(),
+            freq_tracker: FreqTracker::new(),
         })
     }
 
@@ -345,7 +353,21 @@ impl MinimalCoordinator {
     }
 
     /// 根据输入缓冲区更新候选词
-    fn update_candidates(state: &mut State, dict: Option<&CachedDict>, syllable_trie: Option<&SyllableTrie>) {
+    ///
+    /// 完整流程（对齐 Go 版 convertCore）：
+    /// 1. 精确查找
+    /// 2. Viterbi 长句解码（拼音模式）
+    /// 3. DAG 子短语查找
+    /// 4. 前缀查找
+    /// 5. 缩写匹配
+    /// 6. 频率 boost 排序
+    fn update_candidates(
+        state: &mut State,
+        dict: Option<&CachedDict>,
+        syllable_trie: Option<&SyllableTrie>,
+        viterbi: &ViterbiDecoder,
+        freq_tracker: &FreqTracker,
+    ) {
         state.candidates.clear();
         if state.input_buffer.is_empty() {
             return;
@@ -358,37 +380,78 @@ impl MinimalCoordinator {
             let exact = dict.search(input);
             if !exact.is_empty() {
                 for (text, weight, order) in exact {
+                    let boosted = weight + freq_tracker.get_boost(&text) as i32;
                     state.candidates.push(Candidate {
                         text,
                         code: input.clone(),
-                        weight,
+                        weight: boosted,
                         order,
                     });
                 }
             }
 
-            // 2. 拼音连续输入：使用 DAG 切分 + 子短语查找
             if let Some(trie) = syllable_trie {
                 let dag = Dag::build(input, trie);
                 let syllables = dag.maximum_match();
 
-                // 用切分出的音节组合查询词典
+                // 2. Viterbi 长句解码（>=2 个音节时）
                 if syllables.len() >= 2 {
-                    // 尝试所有连续子序列（如 "nihaozhongguo" → "你好", "中国", "你好中国"）
+                    // 构建 lattice：按 endPos 索引的词节点
+                    let input_len = input.len();
+                    let mut lattice: Vec<Vec<WordNode>> = vec![Vec::new(); input_len + 1];
+
+                    // 对每个起始位置，尝试 1~6 个连续音节组合
                     for start in 0..syllables.len() {
                         for end in (start + 1)..=syllables.len().min(start + 6) {
                             let code: String = syllables[start..end].join("");
-                            if code == *input {
-                                continue; // 跳过已精确匹配的
+                            let results = dict.search(&code);
+                            for (text, weight, _order) in &results {
+                                // 计算该词在输入中的字符位置
+                                let char_start: usize = syllables[..start].iter().map(|s| s.len()).sum();
+                                let char_end: usize = syllables[..end].iter().map(|s| s.len()).sum();
+                                if char_end <= input_len {
+                                    let log_prob = viterbi.word_log_prob(text, *weight);
+                                    lattice[char_end].push(WordNode {
+                                        start: char_start,
+                                        end: char_end,
+                                        word: text.clone(),
+                                        log_prob,
+                                    });
+                                }
                             }
+                        }
+                    }
+
+                    // Viterbi 解码
+                    let result = viterbi.decode(&lattice, input_len);
+                    if !result.words.is_empty() {
+                        let sentence: String = result.words.join("");
+                        if !sentence.is_empty() && !state.candidates.iter().any(|c| c.text == sentence) {
+                            let boosted = (result.log_prob as i32).max(1) + freq_tracker.get_boost(&sentence) as i32;
+                            state.candidates.insert(0, Candidate {
+                                text: sentence,
+                                code: input.clone(),
+                                weight: boosted,
+                                order: 0,
+                            });
+                        }
+                    }
+                }
+
+                // 3. DAG 子短语查找
+                if syllables.len() >= 2 {
+                    for start in 0..syllables.len() {
+                        for end in (start + 1)..=syllables.len().min(start + 6) {
+                            let code: String = syllables[start..end].join("");
+                            if code == *input { continue; }
                             let results = dict.search(&code);
                             for (text, weight, order) in results {
-                                // 去重
                                 if !state.candidates.iter().any(|c| c.text == text) {
+                                    let boosted = weight + freq_tracker.get_boost(&text) as i32;
                                     state.candidates.push(Candidate {
                                         text,
                                         code: code.clone(),
-                                        weight,
+                                        weight: boosted,
                                         order,
                                     });
                                 }
@@ -397,20 +460,21 @@ impl MinimalCoordinator {
                     }
                 }
 
-                // 3. 前缀查找（部分音节匹配）
+                // 4. 前缀查找
                 let prefix_results = dict.search_prefix(input, 30);
                 for (code, text, weight, order) in prefix_results {
                     if !state.candidates.iter().any(|c| c.text == text) {
+                        let boosted = weight + freq_tracker.get_boost(&text) as i32;
                         state.candidates.push(Candidate {
                             text,
                             code,
-                            weight,
+                            weight: boosted,
                             order,
                         });
                     }
                 }
 
-                // 4. 缩写匹配（如 "bzd" → "不知道"）
+                // 5. 缩写匹配
                 if AbbrevMatcher::is_abbreviation(input, trie) {
                     let abbrev_results = AbbrevMatcher::find_candidates(input, trie, dict, 10);
                     for abbrev in abbrev_results {
@@ -419,7 +483,7 @@ impl MinimalCoordinator {
                                 text: abbrev.text,
                                 code: abbrev.code,
                                 weight: abbrev.weight,
-                                order: 999999, // 缩写匹配排在后面
+                                order: 999999,
                             });
                         }
                     }
@@ -428,17 +492,18 @@ impl MinimalCoordinator {
                 // 五笔模式：前缀查找
                 let prefix = dict.search_prefix(input, 50);
                 for (code, text, weight, order) in prefix {
+                    let boosted = weight + freq_tracker.get_boost(&text) as i32;
                     state.candidates.push(Candidate {
                         text,
                         code,
-                        weight,
+                        weight: boosted,
                         order,
                     });
                 }
             }
         }
 
-        // 按权重排序，截取前 9 个
+        // 6. 按权重排序，截取前 9 个
         state.candidates.sort_by(|a, b| b.weight.cmp(&a.weight).then(a.order.cmp(&b.order)));
         state.candidates.truncate(9);
     }
@@ -534,7 +599,7 @@ impl MessageHandler for MinimalCoordinator {
                 // Backspace
                 if !state.input_buffer.is_empty() {
                     state.input_buffer.pop();
-                    Self::update_candidates(&mut state, self.dict.as_ref(), self.syllable_trie.as_ref());
+                    Self::update_candidates(&mut state, self.dict.as_ref(), self.syllable_trie.as_ref(), &self.viterbi, &self.freq_tracker);
                     if state.input_buffer.is_empty() {
                         self.notify_ui_hide();
                         KeyAction::ClearComposition
@@ -636,7 +701,7 @@ impl MessageHandler for MinimalCoordinator {
                 // A-Z 字母键
                 let ch = (b'a' + (data.key_code - 0x41) as u8) as char;
                 state.input_buffer.push(ch);
-                Self::update_candidates(&mut state, self.dict.as_ref(), self.syllable_trie.as_ref());
+                Self::update_candidates(&mut state, self.dict.as_ref(), self.syllable_trie.as_ref(), &self.viterbi, &self.freq_tracker);
                 let display = Self::build_preedit_display(&state.input_buffer, &state.candidates);
                 self.notify_ui_update(&state);
                 KeyAction::UpdateComposition {
