@@ -9,6 +9,8 @@ use wind_bridge::push::PushServer;
 use wind_config::Config;
 use wind_dict::cached::CachedDict;
 use wind_dict::codetable::CodetableDict;
+use wind_engine::pinyin::syllable::SyllableTrie;
+use wind_engine::pinyin::dag::Dag;
 use wind_ipc::protocol::{EVENT_KEY_DOWN, MOD_CTRL, MOD_ALT};
 use wind_ui::manager::{UiCommand, UiManager};
 use wind_ui::candidate_window::CandidateItem;
@@ -46,6 +48,8 @@ pub struct MinimalCoordinator {
     dict: Option<CachedDict>,
     /// UI 管理器（候选窗口）
     ui_tx: std::sync::mpsc::Sender<UiCommand>,
+    /// 音节 Trie（拼音模式用于连续输入切分）
+    syllable_trie: Option<SyllableTrie>,
 }
 
 impl MinimalCoordinator {
@@ -93,6 +97,11 @@ impl MinimalCoordinator {
             config,
             dict,
             ui_tx,
+            syllable_trie: if schema_id == "pinyin" {
+                Some(SyllableTrie::new())
+            } else {
+                None
+            },
         })
     }
 
@@ -335,7 +344,7 @@ impl MinimalCoordinator {
     }
 
     /// 根据输入缓冲区更新候选词
-    fn update_candidates(state: &mut State, dict: Option<&CachedDict>) {
+    fn update_candidates(state: &mut State, dict: Option<&CachedDict>, syllable_trie: Option<&SyllableTrie>) {
         state.candidates.clear();
         if state.input_buffer.is_empty() {
             return;
@@ -344,7 +353,7 @@ impl MinimalCoordinator {
         let input = &state.input_buffer;
 
         if let Some(dict) = dict {
-            // 先精确查找
+            // 1. 精确查找（完整匹配）
             let exact = dict.search(input);
             if !exact.is_empty() {
                 for (text, weight, order) in exact {
@@ -355,8 +364,52 @@ impl MinimalCoordinator {
                         order,
                     });
                 }
+            }
+
+            // 2. 拼音连续输入：使用 DAG 切分 + 子短语查找
+            if let Some(trie) = syllable_trie {
+                let dag = Dag::build(input, trie);
+                let syllables = dag.maximum_match();
+
+                // 用切分出的音节组合查询词典
+                if syllables.len() >= 2 {
+                    // 尝试所有连续子序列（如 "nihaozhongguo" → "你好", "中国", "你好中国"）
+                    for start in 0..syllables.len() {
+                        for end in (start + 1)..=syllables.len().min(start + 6) {
+                            let code: String = syllables[start..end].join("");
+                            if code == *input {
+                                continue; // 跳过已精确匹配的
+                            }
+                            let results = dict.search(&code);
+                            for (text, weight, order) in results {
+                                // 去重
+                                if !state.candidates.iter().any(|c| c.text == text) {
+                                    state.candidates.push(Candidate {
+                                        text,
+                                        code: code.clone(),
+                                        weight,
+                                        order,
+                                    });
+                                }
+                            }
+                        }
+                    }
+                }
+
+                // 3. 前缀查找（部分音节匹配）
+                let prefix_results = dict.search_prefix(input, 30);
+                for (code, text, weight, order) in prefix_results {
+                    if !state.candidates.iter().any(|c| c.text == text) {
+                        state.candidates.push(Candidate {
+                            text,
+                            code,
+                            weight,
+                            order,
+                        });
+                    }
+                }
             } else {
-                // 前缀查找
+                // 五笔模式：前缀查找
                 let prefix = dict.search_prefix(input, 50);
                 for (code, text, weight, order) in prefix {
                     state.candidates.push(Candidate {
@@ -369,6 +422,8 @@ impl MinimalCoordinator {
             }
         }
 
+        // 按权重排序，截取前 9 个
+        state.candidates.sort_by(|a, b| b.weight.cmp(&a.weight).then(a.order.cmp(&b.order)));
         state.candidates.truncate(9);
     }
 
@@ -463,7 +518,7 @@ impl MessageHandler for MinimalCoordinator {
                 // Backspace
                 if !state.input_buffer.is_empty() {
                     state.input_buffer.pop();
-                    Self::update_candidates(&mut state, self.dict.as_ref());
+                    Self::update_candidates(&mut state, self.dict.as_ref(), self.syllable_trie.as_ref());
                     if state.input_buffer.is_empty() {
                         self.notify_ui_hide();
                         KeyAction::ClearComposition
@@ -565,7 +620,7 @@ impl MessageHandler for MinimalCoordinator {
                 // A-Z 字母键
                 let ch = (b'a' + (data.key_code - 0x41) as u8) as char;
                 state.input_buffer.push(ch);
-                Self::update_candidates(&mut state, self.dict.as_ref());
+                Self::update_candidates(&mut state, self.dict.as_ref(), self.syllable_trie.as_ref());
                 let display = Self::build_preedit_display(&state.input_buffer, &state.candidates);
                 self.notify_ui_update(&state);
                 KeyAction::UpdateComposition {
