@@ -2041,7 +2041,10 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "memmap2",
+ "serde",
+ "serde_yaml",
  "thiserror",
+ "toml",
  "tracing",
  "wind-candidate",
  "wind-store",
@@ -2144,7 +2147,10 @@ name = "wind_service"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "serde",
+ "serde_yaml",
  "tokio",
+ "toml",
  "tracing",
  "tracing-subscriber",
  "wind-bridge",
