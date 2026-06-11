@@ -9,6 +9,8 @@ use wind_bridge::push::PushServer;
 use wind_config::Config;
 use wind_dict::codetable::CodetableDict;
 use wind_ipc::protocol::{EVENT_KEY_DOWN, MOD_CTRL, MOD_ALT};
+use wind_ui::manager::{UiCommand, UiManager};
+use wind_ui::candidate_window::CandidateItem;
 use tracing::{info, debug, warn};
 
 /// 候选词
@@ -41,6 +43,8 @@ pub struct MinimalCoordinator {
     config: Config,
     /// 主词典（五笔/拼音等）
     dict: Option<CodetableDict>,
+    /// UI 管理器（候选窗口）
+    ui_tx: std::sync::mpsc::Sender<UiCommand>,
 }
 
 impl MinimalCoordinator {
@@ -54,6 +58,22 @@ impl MinimalCoordinator {
 
         // 加载词典
         let dict = Self::load_dictionary(&schema_id, data_dir.as_deref());
+
+        // 创建 UI 管理器（候选窗口线程）
+        let ui_tx = match UiManager::new() {
+            Ok(ui) => {
+                let tx = ui.sender();
+                // 保持 UiManager 存活（它在 drop 时会发送 Shutdown）
+                std::mem::forget(ui);
+                tx
+            }
+            Err(e) => {
+                warn!("Failed to create UI manager: {}", e);
+                // 创建一个不会被使用的通道
+                let (tx, _rx) = std::sync::mpsc::channel();
+                tx
+            }
+        };
 
         Arc::new(Self {
             state: Mutex::new(State {
@@ -71,6 +91,7 @@ impl MinimalCoordinator {
             push_server,
             config,
             dict,
+            ui_tx,
         })
     }
 
@@ -225,6 +246,32 @@ impl MinimalCoordinator {
         }
         display
     }
+
+    /// 通知 UI 更新候选窗口
+    fn notify_ui_update(&self, state: &State) {
+        if state.candidates.is_empty() && state.input_buffer.is_empty() {
+            let _ = self.ui_tx.send(UiCommand::HideCandidates);
+            return;
+        }
+
+        let items: Vec<CandidateItem> = state.candidates.iter().map(|c| CandidateItem {
+            text: c.text.clone(),
+            code: c.code.clone(),
+        }).collect();
+
+        let _ = self.ui_tx.send(UiCommand::UpdateCandidates {
+            preedit: state.input_buffer.clone(),
+            candidates: items,
+            selected: 0,
+            caret_x: state.caret_x,
+            caret_y: state.caret_y,
+        });
+    }
+
+    /// 通知 UI 隐藏候选窗口
+    fn notify_ui_hide(&self) {
+        let _ = self.ui_tx.send(UiCommand::HideCandidates);
+    }
 }
 
 use std::path::Path;
@@ -267,6 +314,7 @@ impl MessageHandler for MinimalCoordinator {
                 // Escape
                 state.input_buffer.clear();
                 state.candidates.clear();
+                self.notify_ui_hide();
                 KeyAction::ClearComposition
             }
             0x08 => {
@@ -275,9 +323,11 @@ impl MessageHandler for MinimalCoordinator {
                     state.input_buffer.pop();
                     Self::update_candidates(&mut state, self.dict.as_ref());
                     if state.input_buffer.is_empty() {
+                        self.notify_ui_hide();
                         KeyAction::ClearComposition
                     } else {
                         let display = Self::build_preedit_display(&state.input_buffer, &state.candidates);
+                        self.notify_ui_update(&state);
                         KeyAction::UpdateComposition {
                             text: display,
                             caret_pos: state.input_buffer.len() as u32,
@@ -293,6 +343,7 @@ impl MessageHandler for MinimalCoordinator {
                     let text = state.candidates[0].text.clone();
                     state.input_buffer.clear();
                     state.candidates.clear();
+                    self.notify_ui_hide();
                     KeyAction::InsertText {
                         text,
                         new_composition: None,
@@ -304,6 +355,7 @@ impl MessageHandler for MinimalCoordinator {
                     let text = state.input_buffer.clone();
                     state.input_buffer.clear();
                     state.candidates.clear();
+                    self.notify_ui_hide();
                     KeyAction::InsertText {
                         text,
                         new_composition: None,
@@ -321,6 +373,7 @@ impl MessageHandler for MinimalCoordinator {
                     let text = state.input_buffer.clone();
                     state.input_buffer.clear();
                     state.candidates.clear();
+                    self.notify_ui_hide();
                     KeyAction::InsertText {
                         text,
                         new_composition: None,
@@ -339,6 +392,7 @@ impl MessageHandler for MinimalCoordinator {
                     let text = state.candidates[idx].text.clone();
                     state.input_buffer.clear();
                     state.candidates.clear();
+                    self.notify_ui_hide();
                     KeyAction::InsertText {
                         text,
                         new_composition: None,
@@ -353,6 +407,7 @@ impl MessageHandler for MinimalCoordinator {
                     state.candidates.clear();
                     let digit = (b'0' + data.key_code as u8) as char;
                     text.push(digit);
+                    self.notify_ui_hide();
                     KeyAction::InsertText {
                         text,
                         new_composition: None,
@@ -370,6 +425,7 @@ impl MessageHandler for MinimalCoordinator {
                 state.input_buffer.push(ch);
                 Self::update_candidates(&mut state, self.dict.as_ref());
                 let display = Self::build_preedit_display(&state.input_buffer, &state.candidates);
+                self.notify_ui_update(&state);
                 KeyAction::UpdateComposition {
                     text: display,
                     caret_pos: state.input_buffer.len() as u32,
@@ -493,6 +549,8 @@ impl MessageHandler for MinimalCoordinator {
         let mut state = self.state.lock().unwrap();
         state.input_buffer.clear();
         state.candidates.clear();
+        drop(state);
+        self.notify_ui_hide();
     }
 
     fn handle_caret_update(&self, data: &CaretData) {
