@@ -71,7 +71,7 @@ impl DictKeyIndex {
     }
 }
 
-/// 条目记录 V3 (14 bytes，含 Order)
+/// 条目记录
 #[derive(Debug, Clone)]
 pub struct EntryRecord {
     pub text: String,
@@ -92,7 +92,6 @@ pub struct DictEntry {
 pub struct DictReader {
     mmap: Mmap,
     header: DictFileHeader,
-    /// 条目记录大小（V2=10, V3=14）
     entry_size: usize,
 }
 
@@ -107,72 +106,43 @@ impl DictReader {
             .ok_or_else(|| anyhow::anyhow!("invalid wdb file: too short"))?;
 
         if header.magic != MAGIC {
-            anyhow::bail!(
-                "invalid wdb magic: expected WDIC, got {:?}",
-                header.magic
-            );
+            anyhow::bail!("invalid wdb magic: expected WDIC, got {:?}", header.magic);
         }
 
         let version = header.version;
         let key_count = header.key_count;
-        let index_off = header.index_off;
-        let data_off = header.data_off;
-        let str_off = header.str_off;
 
         let entry_size = match version {
             3 => 14,
-            2 => 10,
-            1 => 10,
+            2 | 1 => 10,
             _ => anyhow::bail!("unsupported wdb version: {}", version),
         };
+        info!("Opened wdb: {} ({} keys, v{})", path.display(), key_count, version);
 
-        info!(
-            "Opened wdb: {} ({} keys, v{}, index_off={}, data_off={}, str_off={})",
-            path.display(),
-            key_count,
-            version,
-            index_off,
-            data_off,
-            str_off,
-        );
-
-        Ok(Self {
-            mmap,
-            header,
-            entry_size,
-        })
+        Ok(Self { mmap, header, entry_size })
     }
 
-    /// 获取 mmap 数据
     fn data(&self) -> &[u8] {
         &self.mmap
     }
 
-    /// 读取字符串池中的字符串
     fn read_string(&self, off: u32, len: u16) -> &str {
         let start = self.header.str_off as usize + off as usize;
         let end = start + len as usize;
-        if end > self.data().len() {
-            return "";
-        }
+        if end > self.data().len() { return ""; }
         std::str::from_utf8(&self.data()[start..end]).unwrap_or("")
     }
 
-    /// 读取第 i 个键索引
     fn read_key_index(&self, i: u32) -> Option<DictKeyIndex> {
         let offset = self.header.index_off as usize + (i as usize) * DictKeyIndex::SIZE;
         DictKeyIndex::from_bytes(&self.data()[offset..])
     }
 
-    /// 读取条目记录
     fn read_entry(&self, entry_off: u32, entry_idx: u16) -> Option<EntryRecord> {
         let base = self.header.data_off as usize + entry_off as usize;
         let offset = base + (entry_idx as usize) * self.entry_size;
         let buf = &self.data()[offset..];
-
-        if buf.len() < self.entry_size {
-            return None;
-        }
+        if buf.len() < self.entry_size { return None; }
 
         let text_off = u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]);
         let text_len = u16::from_le_bytes([buf[4], buf[5]]);
@@ -185,22 +155,14 @@ impl DictReader {
         };
 
         let text = self.read_string(text_off, text_len).to_string();
-
-        Some(EntryRecord {
-            text,
-            weight,
-            order,
-        })
+        Some(EntryRecord { text, weight, order })
     }
 
     /// 精确查找：二分搜索键索引
     pub fn search(&self, code: &str) -> Vec<DictEntry> {
         let key_count = self.header.key_count;
-        if key_count == 0 {
-            return Vec::new();
-        }
+        if key_count == 0 { return Vec::new(); }
 
-        // 二分搜索
         let mut lo = 0u32;
         let mut hi = key_count;
 
@@ -208,17 +170,10 @@ impl DictReader {
             let mid = lo + (hi - lo) / 2;
             if let Some(idx) = self.read_key_index(mid) {
                 let mid_code = self.read_string(idx.code_off, idx.code_len);
-                if mid_code < code {
-                    lo = mid + 1;
-                } else {
-                    hi = mid;
-                }
-            } else {
-                break;
-            }
+                if mid_code < code { lo = mid + 1; } else { hi = mid; }
+            } else { break; }
         }
 
-        // 检查是否精确匹配
         if lo < key_count {
             if let Some(idx) = self.read_key_index(lo) {
                 let found_code = self.read_string(idx.code_off, idx.code_len);
@@ -227,58 +182,40 @@ impl DictReader {
                 }
             }
         }
-
         Vec::new()
     }
 
-    /// 前缀查找：找到第一个 >= prefix 的键，然后向后扫描
+    /// 前缀查找
     pub fn search_prefix(&self, prefix: &str, limit: usize) -> Vec<DictEntry> {
         let key_count = self.header.key_count;
-        if key_count == 0 {
-            return Vec::new();
-        }
+        if key_count == 0 { return Vec::new(); }
 
-        // 二分找到第一个 >= prefix 的位置
         let mut lo = 0u32;
         let mut hi = key_count;
-
         while lo < hi {
             let mid = lo + (hi - lo) / 2;
             if let Some(idx) = self.read_key_index(mid) {
                 let mid_code = self.read_string(idx.code_off, idx.code_len);
-                if mid_code < prefix {
-                    lo = mid + 1;
-                } else {
-                    hi = mid;
-                }
-            } else {
-                break;
-            }
+                if mid_code < prefix { lo = mid + 1; } else { hi = mid; }
+            } else { break; }
         }
 
-        // 从 lo 开始向后扫描，收集前缀匹配的结果
         let mut results = Vec::new();
         let mut i = lo;
-
         while i < key_count && results.len() < limit {
             if let Some(idx) = self.read_key_index(i) {
                 let code = self.read_string(idx.code_off, idx.code_len);
-                if !code.starts_with(prefix) {
-                    break;
-                }
-                let entries = self.collect_entries(&idx, code);
-                results.extend(entries);
+                if !code.starts_with(prefix) { break; }
+                results.extend(self.collect_entries(&idx, code));
             }
             i += 1;
         }
 
-        // 按 weight 降序排序
         results.sort_by(|a, b| b.weight.cmp(&a.weight).then(a.order.cmp(&b.order)));
         results.truncate(limit);
         results
     }
 
-    /// 收集某个键下的所有条目
     fn collect_entries(&self, idx: &DictKeyIndex, code: &str) -> Vec<DictEntry> {
         let mut entries = Vec::with_capacity(idx.entry_len as usize);
         for j in 0..idx.entry_len {
@@ -294,18 +231,130 @@ impl DictReader {
         entries
     }
 
-    /// 获取键总数
-    pub fn key_count(&self) -> u32 {
-        self.header.key_count
+    pub fn key_count(&self) -> u32 { self.header.key_count }
+}
+
+/// 二进制词典写入器（用于将 rime dict.yaml 转换为 .wdb）
+pub struct DictWriter {
+    keys: Vec<(String, Vec<(String, i32)>)>, // (code, [(text, weight)])
+}
+
+impl DictWriter {
+    pub fn new() -> Self {
+        Self { keys: Vec::new() }
     }
 
-    /// 遍历所有键（用于调试/统计）
-    pub fn for_each_key<F: FnMut(&str)>(&self, mut f: F) {
-        for i in 0..self.header.key_count {
-            if let Some(idx) = self.read_key_index(i) {
-                let code = self.read_string(idx.code_off, idx.code_len);
-                f(code);
+    /// 添加一个键及其条目
+    pub fn add(&mut self, code: String, entries: Vec<(String, i32)>) {
+        if !entries.is_empty() {
+            self.keys.push((code, entries));
+        }
+    }
+
+    /// 从键数估算文件大小
+    pub fn key_count(&self) -> usize { self.keys.len() }
+
+    /// 写入 wdb 文件
+    pub fn write(&self, path: impl AsRef<Path>) -> anyhow::Result<()> {
+        use std::io::Write;
+
+        // 按 code 排序
+        let mut sorted_keys = self.keys.clone();
+        sorted_keys.sort_by(|a, b| a.0.cmp(&b.0));
+
+        // 构建字符串池
+        let mut string_pool = Vec::new();
+        let mut string_offsets: std::collections::HashMap<String, u32> = std::collections::HashMap::new();
+
+        let get_string_offset = |pool: &mut Vec<u8>, offsets: &mut std::collections::HashMap<String, u32>, s: &str| -> u32 {
+            if let Some(&off) = offsets.get(s) { return off; }
+            let off = pool.len() as u32;
+            pool.extend_from_slice(s.as_bytes());
+            offsets.insert(s.to_string(), off);
+            off
+        };
+
+        // 预计算所有字符串偏移
+        for (code, entries) in &sorted_keys {
+            get_string_offset(&mut string_pool, &mut string_offsets, code);
+            for (text, _) in entries {
+                get_string_offset(&mut string_pool, &mut string_offsets, text);
             }
         }
+
+        // 计算各段偏移
+        let header_size = DictFileHeader::SIZE;
+        let index_size = sorted_keys.len() * DictKeyIndex::SIZE;
+
+        let mut total_entries = 0usize;
+        for (_, entries) in &sorted_keys {
+            total_entries += entries.len();
+        }
+        let entry_size = 14usize; // V3
+        let data_size = total_entries * entry_size;
+
+        let index_off = header_size as u32;
+        let data_off = (header_size + index_size) as u32;
+        let str_off = (header_size + index_size + data_size) as u32;
+
+        // 写入文件
+        let mut file = std::fs::File::create(path)?;
+
+        // Header
+        let header = DictFileHeader {
+            magic: MAGIC,
+            version: 3,
+            key_count: sorted_keys.len() as u32,
+            index_off,
+            data_off,
+            str_off,
+            abbrev_off: 0,
+            meta_off: 0,
+        };
+        file.write_all(&header.magic)?;
+        file.write_all(&header.version.to_le_bytes())?;
+        file.write_all(&header.key_count.to_le_bytes())?;
+        file.write_all(&header.index_off.to_le_bytes())?;
+        file.write_all(&header.data_off.to_le_bytes())?;
+        file.write_all(&header.str_off.to_le_bytes())?;
+        file.write_all(&header.abbrev_off.to_le_bytes())?;
+        file.write_all(&header.meta_off.to_le_bytes())?;
+
+        // KeyIndex + EntryRecords（交错写入）
+        let mut entry_offset = 0u32;
+        for (code, entries) in &sorted_keys {
+            let code_off = string_offsets[code];
+            let code_len = code.len() as u16;
+
+            // KeyIndex
+            file.write_all(&code_off.to_le_bytes())?;
+            file.write_all(&code_len.to_le_bytes())?;
+            file.write_all(&entry_offset.to_le_bytes())?;
+            file.write_all(&(entries.len() as u16).to_le_bytes())?;
+
+            entry_offset += entries.len() as u32;
+        }
+
+        // EntryRecords
+        let mut order = 0i32;
+        for (_, entries) in &sorted_keys {
+            for (text, weight) in entries {
+                let text_off = string_offsets[text];
+                let text_len = text.len() as u16;
+                file.write_all(&text_off.to_le_bytes())?;
+                file.write_all(&text_len.to_le_bytes())?;
+                file.write_all(&weight.to_le_bytes())?;
+                file.write_all(&order.to_le_bytes())?;
+                order += 1;
+            }
+        }
+
+        // StringPool
+        file.write_all(&string_pool)?;
+
+        info!("Wrote wdb: {} keys, {} entries, {} bytes string pool",
+            sorted_keys.len(), total_entries, string_pool.len());
+
+        Ok(())
     }
 }

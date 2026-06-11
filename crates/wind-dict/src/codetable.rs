@@ -169,4 +169,29 @@ impl CodetableDict {
         }
         self.total_entries = self.entries.values().map(|v| v.len()).sum();
     }
+
+    /// 导出到 DictWriter（用于写入 .wdb 缓存）
+    pub fn export_to_writer(&self, writer: &mut crate::binformat::DictWriter) {
+        for (code, entries) in &self.entries {
+            let entries_data: Vec<(String, i32)> = entries.iter()
+                .map(|e| (e.text.clone(), e.weight))
+                .collect();
+            writer.add(code.clone(), entries_data);
+        }
+    }
+
+    /// 合并单个条目（用于从 CachedDict 提取数据）
+    pub fn merge_single(&mut self, code: String, text: String, weight: i32, _order: i32) {
+        let existing = self.entries.entry(code).or_default();
+        existing.push(CodetableEntry { text, weight, order: existing.len() as i32 });
+        self.total_entries += 1;
+    }
+
+    /// 写入 .wdb 缓存文件
+    pub fn write_to_wdb(&self, path: &std::path::Path) -> anyhow::Result<()> {
+        use crate::binformat::DictWriter;
+        let mut writer = DictWriter::new();
+        self.export_to_writer(&mut writer);
+        writer.write(path)
+    }
 }

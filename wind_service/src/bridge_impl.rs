@@ -7,6 +7,7 @@ use std::sync::{Arc, Mutex};
 use wind_bridge::handler::*;
 use wind_bridge::push::PushServer;
 use wind_config::Config;
+use wind_dict::cached::CachedDict;
 use wind_dict::codetable::CodetableDict;
 use wind_ipc::protocol::{EVENT_KEY_DOWN, MOD_CTRL, MOD_ALT};
 use wind_ui::manager::{UiCommand, UiManager};
@@ -41,8 +42,8 @@ pub struct MinimalCoordinator {
     state: Mutex<State>,
     push_server: Arc<PushServer>,
     config: Config,
-    /// 主词典（五笔/拼音等）
-    dict: Option<CodetableDict>,
+    /// 主词典（五笔/拼音等，自动使用 mmap 缓存）
+    dict: Option<CachedDict>,
     /// UI 管理器（候选窗口）
     ui_tx: std::sync::mpsc::Sender<UiCommand>,
 }
@@ -96,7 +97,7 @@ impl MinimalCoordinator {
     }
 
     /// 加载指定 schema 的词典
-    fn load_dictionary(schema_id: &str, data_dir: Option<&Path>) -> Option<CodetableDict> {
+    fn load_dictionary(schema_id: &str, data_dir: Option<&Path>) -> Option<CachedDict> {
         use std::path::Path;
 
         let data_dir = data_dir?;
@@ -130,7 +131,7 @@ impl MinimalCoordinator {
                 if dict_type == "rime_pinyin" {
                     Self::load_rime_pinyin_dict(&full_path, data_dir)
                 } else {
-                    match CodetableDict::load(&full_path) {
+                    match CachedDict::load(&full_path) {
                         Ok(dict) => {
                             info!("Dictionary loaded: {} entries", dict.len());
                             Some(dict)
@@ -150,8 +151,22 @@ impl MinimalCoordinator {
     }
 
     /// 加载 rime_pinyin 格式词典（支持 import_tables 引用子词典）
-    fn load_rime_pinyin_dict(dict_path: &Path, _data_dir: &Path) -> Option<CodetableDict> {
+    fn load_rime_pinyin_dict(dict_path: &Path, _data_dir: &Path) -> Option<CachedDict> {
         info!("load_rime_pinyin_dict: {}", dict_path.display());
+
+        // 检查合并后的 .wdb 缓存
+        let merged_wdb = dict_path.with_extension("merged.wdb");
+        if merged_wdb.exists() {
+            match CachedDict::load(&merged_wdb) {
+                Ok(dict) => {
+                    info!("Using merged mmap cache: {} ({} entries)", merged_wdb.display(), dict.len());
+                    return Some(dict);
+                }
+                Err(e) => {
+                    warn!("Failed to load merged cache: {}", e);
+                }
+            }
+        }
 
         let content = match std::fs::read_to_string(dict_path) {
             Ok(c) => {
@@ -194,53 +209,81 @@ impl MinimalCoordinator {
         };
         info!("Dict directory: {}", dict_dir.display());
 
-        // 合并所有子词典
-        let mut merged = CodetableDict::empty();
+        // 直接从子词典 mmap 写入合并 .wdb，不经过内存合并
+        let merged_wdb = dict_path.with_extension("merged.wdb");
+        let mut writer = wind_dict::binformat::DictWriter::new();
+        let mut total_entries = 0usize;
 
-        // 先加载主词典（如果有直接条目）
-        match CodetableDict::load(dict_path) {
-            Ok(main_dict) => {
-                info!("Main dict loaded: {} entries", main_dict.len());
-                merged.merge(main_dict);
-            }
-            Err(e) => {
-                info!("Main dict has no direct entries (expected for import_tables): {}", e);
-            }
-        }
+        // 收集所有子词典路径
+        let mut sub_paths: Vec<std::path::PathBuf> = Vec::new();
+        sub_paths.push(dict_path.to_path_buf());
 
-        // 加载 import_tables 引用的子词典
         if let Some(import_tables) = yaml.get("import_tables").and_then(|v| v.as_sequence()) {
-            info!("Found {} import_tables entries", import_tables.len());
             for table_ref in import_tables {
                 if let Some(table_name) = table_ref.as_str() {
                     let sub_path = dict_dir.join(format!("{}.dict.yaml", table_name));
-                    info!("Checking sub-dict: {} -> {}", table_name, sub_path.display());
                     if sub_path.exists() {
-                        match CodetableDict::load(&sub_path) {
-                            Ok(sub_dict) => {
-                                info!("  Loaded {} entries from {}", sub_dict.len(), table_name);
-                                merged.merge(sub_dict);
-                            }
-                            Err(e) => {
-                                warn!("  Failed to load {}: {}", table_name, e);
-                            }
-                        }
-                    } else {
-                        warn!("Sub-dictionary not found: {}", sub_path.display());
+                        sub_paths.push(sub_path);
                     }
                 }
             }
-        } else {
-            warn!("No import_tables found in YAML");
         }
 
-        if merged.is_empty() {
-            warn!("No entries loaded from pinyin dictionary");
-            None
-        } else {
-            info!("Pinyin dictionary loaded: {} total entries", merged.len());
-            Some(merged)
+        // 逐个加载子词典并直接导出到 writer
+        for sub_path in &sub_paths {
+            match CachedDict::load(sub_path) {
+                Ok(sub_dict) => {
+                    let count = sub_dict.len();
+                    info!("  Loading {} entries from {}", count, sub_path.display());
+                    // 使用 search_prefix 获取所有条目（限制合理大小）
+                    let entries = sub_dict.search_prefix("", 500_000);
+                    for (code, text, weight, _order) in entries {
+                        writer.add(code, vec![(text, weight)]);
+                    }
+                    total_entries += count;
+                }
+                Err(e) => {
+                    warn!("  Failed to load {}: {}", sub_path.display(), e);
+                }
+            }
         }
+
+        if total_entries == 0 {
+            warn!("No entries loaded from pinyin dictionary");
+            return None;
+        }
+
+        info!("Writing merged .wdb cache ({} entries)...", total_entries);
+        match writer.write(&merged_wdb) {
+            Ok(_) => {
+                info!("Wrote merged .wdb cache: {}", merged_wdb.display());
+                match CachedDict::load(&merged_wdb) {
+                    Ok(dict) => {
+                        info!("Using merged mmap cache ({} entries)", dict.len());
+                        return Some(dict);
+                    }
+                    Err(e) => {
+                        warn!("Failed to open merged cache: {}", e);
+                    }
+                }
+            }
+            Err(e) => {
+                warn!("Failed to write merged cache: {}", e);
+            }
+        }
+
+        // 回退：加载到内存
+        let merged = CodetableDict::load(dict_path).ok()?;
+        Some(CachedDict::Memory(merged))
+    }
+
+    /// 从 CachedDict 提取所有条目（用于合并子词典）
+    fn extract_all_entries(dict: &CachedDict) -> Vec<(String, String, i32, i32)> {
+        // 使用空前缀搜索获取所有条目（限制为大数）
+        dict.search_prefix("", 1_000_000)
+            .into_iter()
+            .map(|(code, text, weight, order)| (code, text, weight, order))
+            .collect()
     }
 
     /// 构建当前状态的 StatusUpdateData
@@ -292,7 +335,7 @@ impl MinimalCoordinator {
     }
 
     /// 根据输入缓冲区更新候选词
-    fn update_candidates(state: &mut State, dict: Option<&CodetableDict>) {
+    fn update_candidates(state: &mut State, dict: Option<&CachedDict>) {
         state.candidates.clear();
         if state.input_buffer.is_empty() {
             return;
