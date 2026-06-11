@@ -12,6 +12,8 @@ use wind_dict::codetable::CodetableDict;
 use wind_engine::pinyin::syllable::SyllableTrie;
 use wind_engine::pinyin::dag::Dag;
 use wind_engine::pinyin::viterbi::{ViterbiDecoder, WordNode};
+use wind_engine::pinyin::lattice::LatticeBuilder;
+use wind_engine::pinyin::fuzzy::FuzzyConfig;
 use wind_engine::pinyin::scorer::AbbrevMatcher;
 use wind_store::freq::FreqTracker;
 use wind_ipc::protocol::{EVENT_KEY_DOWN, MOD_CTRL, MOD_ALT};
@@ -55,6 +57,10 @@ pub struct MinimalCoordinator {
     syllable_trie: Option<SyllableTrie>,
     /// Viterbi 解码器
     viterbi: ViterbiDecoder,
+    /// 格子构建器
+    lattice_builder: LatticeBuilder,
+    /// 模糊拼音配置
+    fuzzy_config: FuzzyConfig,
     /// 词频跟踪器
     freq_tracker: FreqTracker,
 }
@@ -110,6 +116,8 @@ impl MinimalCoordinator {
                 None
             },
             viterbi: ViterbiDecoder::new(),
+            lattice_builder: LatticeBuilder::new(),
+            fuzzy_config: FuzzyConfig::default(),
             freq_tracker: FreqTracker::new(),
         })
     }
@@ -366,6 +374,8 @@ impl MinimalCoordinator {
         dict: Option<&CachedDict>,
         syllable_trie: Option<&SyllableTrie>,
         viterbi: &ViterbiDecoder,
+        lattice_builder: &LatticeBuilder,
+        fuzzy_config: &FuzzyConfig,
         freq_tracker: &FreqTracker,
     ) {
         state.candidates.clear();
@@ -396,28 +406,21 @@ impl MinimalCoordinator {
 
                 // 2. Viterbi 长句解码（>=2 个音节时）
                 if syllables.len() >= 2 {
-                    // 构建 lattice：按 endPos 索引的词节点
+                    // 使用 LatticeBuilder 构建词图（含模糊拼音支持）
+                    let lattice_nodes = lattice_builder.build(input, trie, dict, Some(fuzzy_config));
+
+                    // 转换为 Viterbi 所需格式
                     let input_len = input.len();
                     let mut lattice: Vec<Vec<WordNode>> = vec![Vec::new(); input_len + 1];
-
-                    // 对每个起始位置，尝试 1~6 个连续音节组合
-                    for start in 0..syllables.len() {
-                        for end in (start + 1)..=syllables.len().min(start + 6) {
-                            let code: String = syllables[start..end].join("");
-                            let results = dict.search(&code);
-                            for (text, weight, _order) in &results {
-                                // 计算该词在输入中的字符位置
-                                let char_start: usize = syllables[..start].iter().map(|s| s.len()).sum();
-                                let char_end: usize = syllables[..end].iter().map(|s| s.len()).sum();
-                                if char_end <= input_len {
-                                    let log_prob = viterbi.word_log_prob(text, *weight);
-                                    lattice[char_end].push(WordNode {
-                                        start: char_start,
-                                        end: char_end,
-                                        word: text.clone(),
-                                        log_prob,
-                                    });
-                                }
+                    for (end_pos, nodes_at_end) in lattice_nodes.iter().enumerate() {
+                        for node in nodes_at_end {
+                            if end_pos <= input_len {
+                                lattice[end_pos].push(WordNode {
+                                    start: node.start,
+                                    end: node.end,
+                                    word: node.word.clone(),
+                                    log_prob: node.log_prob,
+                                });
                             }
                         }
                     }
@@ -599,7 +602,7 @@ impl MessageHandler for MinimalCoordinator {
                 // Backspace
                 if !state.input_buffer.is_empty() {
                     state.input_buffer.pop();
-                    Self::update_candidates(&mut state, self.dict.as_ref(), self.syllable_trie.as_ref(), &self.viterbi, &self.freq_tracker);
+                    Self::update_candidates(&mut state, self.dict.as_ref(), self.syllable_trie.as_ref(), &self.viterbi, &self.lattice_builder, &self.fuzzy_config, &self.freq_tracker);
                     if state.input_buffer.is_empty() {
                         self.notify_ui_hide();
                         KeyAction::ClearComposition
@@ -701,7 +704,7 @@ impl MessageHandler for MinimalCoordinator {
                 // A-Z 字母键
                 let ch = (b'a' + (data.key_code - 0x41) as u8) as char;
                 state.input_buffer.push(ch);
-                Self::update_candidates(&mut state, self.dict.as_ref(), self.syllable_trie.as_ref(), &self.viterbi, &self.freq_tracker);
+                Self::update_candidates(&mut state, self.dict.as_ref(), self.syllable_trie.as_ref(), &self.viterbi, &self.lattice_builder, &self.fuzzy_config, &self.freq_tracker);
                 let display = Self::build_preedit_display(&state.input_buffer, &state.candidates);
                 self.notify_ui_update(&state);
                 KeyAction::UpdateComposition {
