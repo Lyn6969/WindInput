@@ -23,6 +23,10 @@ const PIPE_SUFFIX: &str = "_debug";
 const PIPE_SUFFIX: &str = "";
 
 fn main() {
+    // 0. 设置 DPI 感知（与 Go 版 setDPIAwareness 对齐）
+    // 必须在任何窗口创建之前调用，否则坐标会被 Windows DPI 虚拟化
+    set_dpi_awareness();
+
     // 1. 初始化日志
     init_logger();
 
@@ -191,3 +195,24 @@ impl Drop for SingletonGuard {
 
 #[cfg(not(windows))]
 struct SingletonGuard {}
+
+/// 设置进程 DPI 感知（与 Go 版 setDPIAwareness 对齐）
+///
+/// 使用 SetProcessDpiAwareness(PROCESS_PER_MONITOR_DPI_AWARE) 设置 Per-Monitor DPI 感知。
+/// 必须在任何窗口创建之前调用，否则坐标会被 Windows DPI 虚拟化。
+#[cfg(windows)]
+fn set_dpi_awareness() {
+    use windows::Win32::UI::HiDpi::{SetProcessDpiAwareness, PROCESS_PER_MONITOR_DPI_AWARE};
+
+    let result = unsafe { SetProcessDpiAwareness(PROCESS_PER_MONITOR_DPI_AWARE) };
+    if result.is_ok() {
+        tracing::info!("DPI awareness set to Per-Monitor DPI Aware");
+    } else {
+        tracing::warn!("Failed to set DPI awareness: {:?}", result);
+    }
+}
+
+#[cfg(not(windows))]
+fn set_dpi_awareness() {
+    // 非 Windows 平台无需设置
+}

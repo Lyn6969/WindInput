@@ -29,6 +29,9 @@ impl LayeredWindow {
 
             let class_wide: Vec<u16> = class_name.encode_utf16().chain(std::iter::once(0)).collect();
 
+            // 加载箭头光标（避免鼠标繁忙状态）
+            let cursor = LoadCursorW(None, IDC_ARROW).unwrap_or_default();
+
             let wnd_class = WNDCLASSEXW {
                 cbSize: std::mem::size_of::<WNDCLASSEXW>() as u32,
                 style: CS_HREDRAW | CS_VREDRAW,
@@ -41,7 +44,7 @@ impl LayeredWindow {
                 lpszClassName: windows::core::PCWSTR(class_wide.as_ptr()),
                 hIcon: HICON::default(),
                 hIconSm: HICON::default(),
-                hCursor: HCURSOR::default(),
+                hCursor: cursor,
             };
 
             RegisterClassExW(&wnd_class);
