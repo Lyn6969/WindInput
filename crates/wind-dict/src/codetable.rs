@@ -48,14 +48,24 @@ impl CodetableDict {
                 continue;
             }
 
-            // 格式: code\ttext\tweight
+            // 格式检测：
+            // - 五笔: code\ttext\tweight (如: a	工	9999)
+            // - 拼音: text\tcode\tweight (如: 啊	a	241987)
             let parts: Vec<&str> = line.split('\t').collect();
             if parts.len() < 2 {
                 continue;
             }
 
-            let code = parts[0].to_string();
-            let text = parts[1].to_string();
+            // 检测格式：第一列是否为 ASCII（五笔码）或中文（拼音文本）
+            let first_is_code = parts[0].chars().all(|c| c.is_ascii());
+            let (code, text) = if first_is_code {
+                // 五笔格式: code\ttext
+                (parts[0].to_string(), parts[1].to_string())
+            } else {
+                // 拼音格式: text\tcode
+                (parts[1].to_string(), parts[0].to_string())
+            };
+
             let weight: i32 = if parts.len() >= 3 {
                 parts[2].parse().unwrap_or(0)
             } else {
@@ -136,5 +146,26 @@ impl CodetableDict {
     /// 是否为空
     pub fn is_empty(&self) -> bool {
         self.total_entries == 0
+    }
+
+    /// 创建空词典
+    pub fn empty() -> Self {
+        Self {
+            entries: BTreeMap::new(),
+            total_entries: 0,
+        }
+    }
+
+    /// 合并另一个词典（用于 rime_pinyin 的 import_tables）
+    pub fn merge(&mut self, other: CodetableDict) {
+        for (code, entries) in other.entries {
+            let existing = self.entries.entry(code).or_default();
+            let base_order = existing.len() as i32;
+            for mut entry in entries {
+                entry.order += base_order;
+                existing.push(entry);
+            }
+        }
+        self.total_entries = self.entries.values().map(|v| v.len()).sum();
     }
 }

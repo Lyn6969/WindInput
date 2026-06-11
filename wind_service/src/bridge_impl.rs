@@ -125,15 +125,20 @@ impl MinimalCoordinator {
         info!("Loading dictionary: {} (type={})", full_path.display(), dict_type);
 
         match dict_type {
-            "rime_codetable" => {
-                match CodetableDict::load(&full_path) {
-                    Ok(dict) => {
-                        info!("Dictionary loaded: {} entries", dict.len());
-                        Some(dict)
-                    }
-                    Err(e) => {
-                        warn!("Failed to load dictionary: {}", e);
-                        None
+            "rime_codetable" | "rime_pinyin" => {
+                // rime_pinyin 格式有 import_tables 引用子词典
+                if dict_type == "rime_pinyin" {
+                    Self::load_rime_pinyin_dict(&full_path, data_dir)
+                } else {
+                    match CodetableDict::load(&full_path) {
+                        Ok(dict) => {
+                            info!("Dictionary loaded: {} entries", dict.len());
+                            Some(dict)
+                        }
+                        Err(e) => {
+                            warn!("Failed to load dictionary: {}", e);
+                            None
+                        }
                     }
                 }
             }
@@ -141,6 +146,54 @@ impl MinimalCoordinator {
                 warn!("Unsupported dictionary type: {}", dict_type);
                 None
             }
+        }
+    }
+
+    /// 加载 rime_pinyin 格式词典（支持 import_tables 引用子词典）
+    fn load_rime_pinyin_dict(dict_path: &Path, data_dir: &Path) -> Option<CodetableDict> {
+        let content = std::fs::read_to_string(dict_path).ok()?;
+        let yaml: serde_yaml::Value = serde_yaml::from_str(&content).ok()?;
+
+        // 获取词典所在目录
+        let dict_dir = dict_path.parent()?;
+
+        // 合并所有子词典
+        let mut merged = CodetableDict::empty();
+
+        // 先加载主词典（如果有直接条目）
+        if let Ok(main_dict) = CodetableDict::load(dict_path) {
+            merged.merge(main_dict);
+        }
+
+        // 加载 import_tables 引用的子词典
+        if let Some(import_tables) = yaml.get("import_tables").and_then(|v| v.as_sequence()) {
+            for table_ref in import_tables {
+                if let Some(table_name) = table_ref.as_str() {
+                    let sub_path = dict_dir.join(format!("{}.dict.yaml", table_name));
+                    if sub_path.exists() {
+                        info!("Loading sub-dictionary: {}", sub_path.display());
+                        match CodetableDict::load(&sub_path) {
+                            Ok(sub_dict) => {
+                                info!("  Loaded {} entries", sub_dict.len());
+                                merged.merge(sub_dict);
+                            }
+                            Err(e) => {
+                                warn!("  Failed to load: {}", e);
+                            }
+                        }
+                    } else {
+                        warn!("Sub-dictionary not found: {}", sub_path.display());
+                    }
+                }
+            }
+        }
+
+        if merged.is_empty() {
+            warn!("No entries loaded from pinyin dictionary");
+            None
+        } else {
+            info!("Pinyin dictionary loaded: {} total entries", merged.len());
+            Some(merged)
         }
     }
 
