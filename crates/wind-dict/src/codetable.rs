@@ -62,8 +62,9 @@ impl CodetableDict {
                 // 五笔格式: code\ttext
                 (parts[0].to_string(), parts[1].to_string())
             } else {
-                // 拼音格式: text\tcode
-                (parts[1].to_string(), parts[0].to_string())
+                // 拼音格式: text\tcode（去掉空格，使 "ni hao" -> "nihao"）
+                let code = parts[1].replace(' ', "");
+                (code, parts[0].to_string())
             };
 
             let weight: i32 = if parts.len() >= 3 {

@@ -150,35 +150,79 @@ impl MinimalCoordinator {
     }
 
     /// 加载 rime_pinyin 格式词典（支持 import_tables 引用子词典）
-    fn load_rime_pinyin_dict(dict_path: &Path, data_dir: &Path) -> Option<CodetableDict> {
-        let content = std::fs::read_to_string(dict_path).ok()?;
-        let yaml: serde_yaml::Value = serde_yaml::from_str(&content).ok()?;
+    fn load_rime_pinyin_dict(dict_path: &Path, _data_dir: &Path) -> Option<CodetableDict> {
+        info!("load_rime_pinyin_dict: {}", dict_path.display());
+
+        let content = match std::fs::read_to_string(dict_path) {
+            Ok(c) => {
+                info!("Read {} bytes from dict file", c.len());
+                c
+            }
+            Err(e) => {
+                warn!("Failed to read dict file: {}", e);
+                return None;
+            }
+        };
+
+        // rime dict 格式有多文档标记（--- 和 ...），需要提取头部 YAML
+        let yaml_section = if let Some(start) = content.find("---") {
+            let after_start = &content[start + 3..];
+            if let Some(end) = after_start.find("...") {
+                &after_start[..end]
+            } else {
+                after_start
+            }
+        } else {
+            &content
+        };
+
+        let yaml: serde_yaml::Value = match serde_yaml::from_str(yaml_section) {
+            Ok(y) => y,
+            Err(e) => {
+                warn!("Failed to parse YAML header: {}", e);
+                return None;
+            }
+        };
 
         // 获取词典所在目录
-        let dict_dir = dict_path.parent()?;
+        let dict_dir = match dict_path.parent() {
+            Some(d) => d,
+            None => {
+                warn!("No parent directory for dict path");
+                return None;
+            }
+        };
+        info!("Dict directory: {}", dict_dir.display());
 
         // 合并所有子词典
         let mut merged = CodetableDict::empty();
 
         // 先加载主词典（如果有直接条目）
-        if let Ok(main_dict) = CodetableDict::load(dict_path) {
-            merged.merge(main_dict);
+        match CodetableDict::load(dict_path) {
+            Ok(main_dict) => {
+                info!("Main dict loaded: {} entries", main_dict.len());
+                merged.merge(main_dict);
+            }
+            Err(e) => {
+                info!("Main dict has no direct entries (expected for import_tables): {}", e);
+            }
         }
 
         // 加载 import_tables 引用的子词典
         if let Some(import_tables) = yaml.get("import_tables").and_then(|v| v.as_sequence()) {
+            info!("Found {} import_tables entries", import_tables.len());
             for table_ref in import_tables {
                 if let Some(table_name) = table_ref.as_str() {
                     let sub_path = dict_dir.join(format!("{}.dict.yaml", table_name));
+                    info!("Checking sub-dict: {} -> {}", table_name, sub_path.display());
                     if sub_path.exists() {
-                        info!("Loading sub-dictionary: {}", sub_path.display());
                         match CodetableDict::load(&sub_path) {
                             Ok(sub_dict) => {
-                                info!("  Loaded {} entries", sub_dict.len());
+                                info!("  Loaded {} entries from {}", sub_dict.len(), table_name);
                                 merged.merge(sub_dict);
                             }
                             Err(e) => {
-                                warn!("  Failed to load: {}", e);
+                                warn!("  Failed to load {}: {}", table_name, e);
                             }
                         }
                     } else {
@@ -186,6 +230,8 @@ impl MinimalCoordinator {
                     }
                 }
             }
+        } else {
+            warn!("No import_tables found in YAML");
         }
 
         if merged.is_empty() {
