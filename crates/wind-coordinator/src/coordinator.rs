@@ -86,6 +86,10 @@ pub struct Coordinator {
     compiled_hotkeys: CompiledHotkeys,
     /// 标点转换器（引号左右状态）
     punct: Mutex<PunctuationConverter>,
+    /// 词频持久化文件路径（None=不持久化）
+    freq_path: Option<std::path::PathBuf>,
+    /// 自上次落盘以来的新增选词数（达阈值触发保存）
+    freq_dirty: Mutex<u32>,
 }
 
 impl Coordinator {
@@ -109,12 +113,14 @@ impl Coordinator {
             }
         };
 
-        Self::build(config, data_dir.as_deref(), push_server, ui_tx)
+        // 词频持久化文件：优先用户配置目录，其次 data 目录
+        let freq_path = Config::user_config_dir()
+            .or_else(|| data_dir.as_deref().map(|d| d.to_path_buf()))
+            .map(|d| d.join("freq.tsv"));
+        Self::build(config, data_dir.as_deref(), push_server, ui_tx, freq_path)
     }
 
-    /// 无头构造器（测试用）：跳过 UI 线程，显式传入配置与数据目录。
-    ///
-    /// 用于对按键流程做端到端测试，不创建 Win32 窗口。
+    /// 无头构造器（测试用）：跳过 UI 线程，不做词频持久化（避免污染真实文件）。
     pub fn new_headless(config: Config, data_dir: Option<&Path>) -> Arc<Self> {
         // 无头模式无 UI 消费端：丢弃 rx，notify_ui_* 的 send 会静默失败（已用 `let _ =` 忽略）
         let (ui_tx, _rx) = std::sync::mpsc::channel();
@@ -123,7 +129,7 @@ impl Coordinator {
             suffix: String::new(),
             write_timeout_ms: 30_000,
         }));
-        Self::build(config, data_dir, push_server, ui_tx)
+        Self::build(config, data_dir.as_deref(), push_server, ui_tx, None)
     }
 
     fn build(
@@ -131,6 +137,7 @@ impl Coordinator {
         data_dir: Option<&Path>,
         push_server: Arc<PushServer>,
         ui_tx: std::sync::mpsc::Sender<UiCommand>,
+        freq_path: Option<std::path::PathBuf>,
     ) -> Arc<Self> {
         let engine_mgr = EngineManager::new(&config, data_dir);
         let compiled_hotkeys = hotkey::Compiler::new(config.clone()).compile();
@@ -139,6 +146,14 @@ impl Coordinator {
             compiled_hotkeys.key_down.len(),
             compiled_hotkeys.key_up.len()
         );
+
+        let freq_tracker = FreqTracker::new();
+        if let Some(p) = &freq_path {
+            match freq_tracker.load_from_file(p) {
+                Ok(_) => info!("Loaded freq: {} entries from {}", freq_tracker.len(), p.display()),
+                Err(e) => warn!("Failed to load freq {}: {}", p.display(), e),
+            }
+        }
 
         Arc::new(Self {
             state: Mutex::new(State {
@@ -157,10 +172,36 @@ impl Coordinator {
             config,
             ui_tx,
             engine_mgr,
-            freq_tracker: FreqTracker::new(),
+            freq_tracker,
             compiled_hotkeys,
             punct: Mutex::new(PunctuationConverter::new()),
+            freq_path,
+            freq_dirty: Mutex::new(0),
         })
+    }
+
+    /// 记录一次选词并按阈值落盘（脏计数达到 8 或后续 focus_lost 时保存）。
+    fn record_selection(&self, word: &str) {
+        if word.is_empty() {
+            return;
+        }
+        self.freq_tracker.record_selection(word);
+        let mut dirty = self.freq_dirty.lock().unwrap_or_else(|e| e.into_inner());
+        *dirty += 1;
+        if *dirty >= 8 {
+            *dirty = 0;
+            drop(dirty);
+            self.save_freq();
+        }
+    }
+
+    /// 立即把词频落盘（focus_lost / 阈值触发）
+    fn save_freq(&self) {
+        if let Some(p) = &self.freq_path {
+            if let Err(e) = self.freq_tracker.save_to_file(p) {
+                warn!("Failed to save freq {}: {}", p.display(), e);
+            }
+        }
     }
 
     /// 当前活跃方案 ID（测试/诊断用）
@@ -199,7 +240,7 @@ impl Coordinator {
 
     /// 提交某个候选（记录词频后清空状态）
     fn commit_candidate(&self, state: &mut State, text: &str) {
-        self.freq_tracker.record_selection(text);
+        self.record_selection(text);
         state.input_buffer.clear();
         state.candidates.clear();
     }
@@ -516,7 +557,7 @@ impl MessageHandler for Coordinator {
                     let mut out = String::new();
                     if !state.candidates.is_empty() {
                         let t = state.candidates[0].text.clone();
-                        self.freq_tracker.record_selection(&t);
+                        self.record_selection(&t);
                         out.push_str(&t);
                     } else if !state.input_buffer.is_empty() {
                         out.push_str(&state.input_buffer);
@@ -569,7 +610,10 @@ impl MessageHandler for Coordinator {
         Some(status)
     }
 
-    fn handle_focus_lost(&self) {}
+    fn handle_focus_lost(&self) {
+        // 失焦是稳定的落盘时机，把累积词频持久化
+        self.save_freq();
+    }
 
     fn handle_ime_activated(&self, _client_token: u64) -> Option<StatusUpdateData> {
         let status = self.build_status();
@@ -702,9 +746,7 @@ impl MessageHandler for Coordinator {
         state.input_buffer.clear();
         state.candidates.clear();
         // 与 handle_key_event 的选词路径保持一致：记录词频用于学习排序
-        if !text.is_empty() {
-            self.freq_tracker.record_selection(&text);
-        }
+        self.record_selection(&text);
         Some(CommitResultData {
             barrier_seq: data.barrier_seq,
             text,

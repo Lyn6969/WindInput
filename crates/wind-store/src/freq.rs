@@ -117,4 +117,92 @@ impl FreqTracker {
         let mut map = self.freq_map.write().unwrap();
         map.clear();
     }
+
+    /// 从文件加载词频（格式：`word\tcount`，每行一条）。文件不存在时静默忽略。
+    pub fn load_from_file(&self, path: &std::path::Path) -> std::io::Result<()> {
+        let content = match std::fs::read_to_string(path) {
+            Ok(c) => c,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(e) => return Err(e),
+        };
+        let mut records = Vec::new();
+        for line in content.lines() {
+            let line = line.trim();
+            if line.is_empty() {
+                continue;
+            }
+            let mut it = line.split('\t');
+            if let (Some(w), Some(c)) = (it.next(), it.next()) {
+                if let Ok(count) = c.trim().parse::<u32>() {
+                    if !w.is_empty() && count > 0 {
+                        records.push((w.to_string(), count));
+                    }
+                }
+            }
+        }
+        self.import_records(&records);
+        Ok(())
+    }
+
+    /// 将词频保存到文件（原子写：先写临时文件再 rename）。
+    pub fn save_to_file(&self, path: &std::path::Path) -> std::io::Result<()> {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let mut out = String::new();
+        {
+            let map = self.freq_map.read().unwrap_or_else(|e| e.into_inner());
+            for (word, count) in map.iter() {
+                if *count > 0 {
+                    out.push_str(word);
+                    out.push('\t');
+                    out.push_str(&count.to_string());
+                    out.push('\n');
+                }
+            }
+        }
+        let tmp = path.with_extension("tmp");
+        std::fs::write(&tmp, out.as_bytes())?;
+        std::fs::rename(&tmp, path)?;
+        Ok(())
+    }
+
+    /// 当前记录条数
+    pub fn len(&self) -> usize {
+        self.freq_map.read().unwrap_or_else(|e| e.into_inner()).len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_freq_save_load_roundtrip() {
+        let tmp = std::env::temp_dir().join("wind_freq_roundtrip.tsv");
+        let _ = std::fs::remove_file(&tmp);
+
+        let a = FreqTracker::new();
+        a.record_selection("你好");
+        a.record_selection("你好");
+        a.record_selection("中国");
+        a.save_to_file(&tmp).unwrap();
+
+        // 新 tracker 从文件加载，计数应保留（重启不丢）
+        let b = FreqTracker::new();
+        b.load_from_file(&tmp).unwrap();
+        assert_eq!(b.get_count("你好"), 2);
+        assert_eq!(b.get_count("中国"), 1);
+        assert!(b.get_boost("你好") > 0.0);
+
+        // 不存在的文件静默成功
+        let c = FreqTracker::new();
+        assert!(c.load_from_file(std::path::Path::new("/nonexistent/x.tsv")).is_ok());
+
+        let _ = std::fs::remove_file(&tmp);
+    }
 }
