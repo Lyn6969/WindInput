@@ -175,6 +175,60 @@ fn test_schema_switch_clears_input() {
 }
 
 #[test]
+fn test_chinese_punctuation() {
+    if !has_schemas() {
+        return;
+    }
+    let coord = Coordinator::new_headless(config_with("wubi86"), Some(&data_dir()));
+    assert!(coord.is_chinese_mode());
+
+    // 空缓冲下按 . (VK_OEM_PERIOD=0xBE) → 中文句号 。
+    let act = coord.handle_key_event(&key_event(0xBE, EVENT_KEY_DOWN));
+    match act {
+        KeyAction::InsertText { text, .. } => assert_eq!(text, "。"),
+        other => panic!("应上屏中文句号，实际: {:?}", other),
+    }
+    // 逗号 , (0xBC) → ，
+    match coord.handle_key_event(&key_event(0xBC, EVENT_KEY_DOWN)) {
+        KeyAction::InsertText { text, .. } => assert_eq!(text, "，"),
+        other => panic!("应上屏中文逗号，实际: {:?}", other),
+    }
+    // Shift+1 = ! → ！
+    let shifted = KeyEventData {
+        key_code: 0x31,
+        scan_code: 0,
+        modifiers: 0x0001, // MOD_SHIFT
+        event_type: EVENT_KEY_DOWN,
+        toggles: 0,
+        event_seq: 0,
+        prev_char: 0,
+    };
+    match coord.handle_key_event(&shifted) {
+        KeyAction::InsertText { text, .. } => assert_eq!(text, "！"),
+        other => panic!("Shift+1 应上屏中文叹号，实际: {:?}", other),
+    }
+}
+
+#[test]
+fn test_punct_commits_candidate_first() {
+    if !has_schemas() {
+        return;
+    }
+    let coord = Coordinator::new_headless(config_with("wubi86"), Some(&data_dir()));
+    // 输入 aaaa（有候选），再按句号 → 先上屏首选候选，再接中文句号
+    for _ in 0..4 {
+        press_letter(&coord, 'a');
+    }
+    match coord.handle_key_event(&key_event(0xBE, EVENT_KEY_DOWN)) {
+        KeyAction::InsertText { text, .. } => {
+            assert!(text.ends_with("。"), "应以中文句号结尾，实际: {}", text);
+            assert!(text.chars().count() >= 2, "应包含上屏候选+句号，实际: {}", text);
+        }
+        other => panic!("应上屏候选+句号，实际: {:?}", other),
+    }
+}
+
+#[test]
 fn test_mode_toggle_via_shift() {
     if !has_schemas() {
         return;

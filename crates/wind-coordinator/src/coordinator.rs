@@ -20,10 +20,41 @@ use wind_candidate::Candidate;
 use wind_config::Config;
 use wind_config::hotkey::{self, CompiledHotkeys};
 use wind_engine::EngineManager;
-use wind_ipc::protocol::{EVENT_KEY_DOWN, EVENT_KEY_UP, MOD_ALT, MOD_CTRL, calc_key_hash};
+use wind_ipc::protocol::{EVENT_KEY_DOWN, EVENT_KEY_UP, MOD_ALT, MOD_CTRL, MOD_SHIFT, calc_key_hash};
 use wind_store::freq::FreqTracker;
+use wind_transform::fullwidth::to_full_width;
+use wind_transform::punctuation::PunctuationConverter;
 use wind_ui::candidate_window::CandidateItem;
 use wind_ui::manager::{UiCommand, UiManager};
+
+/// VK + shift → 该键产生的 ASCII 标点/符号字符（字母键返回 None，由拼音/码表处理）。
+fn punct_char(key_code: u32, shift: bool) -> Option<char> {
+    let (base, shifted) = match key_code {
+        0x30 => ('0', ')'),
+        0x31 => ('1', '!'),
+        0x32 => ('2', '@'),
+        0x33 => ('3', '#'),
+        0x34 => ('4', '$'),
+        0x35 => ('5', '%'),
+        0x36 => ('6', '^'),
+        0x37 => ('7', '&'),
+        0x38 => ('8', '*'),
+        0x39 => ('9', '('),
+        0xBA => (';', ':'),
+        0xBB => ('=', '+'),
+        0xBC => (',', '<'),
+        0xBD => ('-', '_'),
+        0xBE => ('.', '>'),
+        0xBF => ('/', '?'),
+        0xC0 => ('`', '~'),
+        0xDB => ('[', '{'),
+        0xDC => ('\\', '|'),
+        0xDD => (']', '}'),
+        0xDE => ('\'', '"'),
+        _ => return None,
+    };
+    Some(if shift { shifted } else { base })
+}
 
 /// 引擎一次转换请求的候选上限（boost 重排后截断到 9）
 const ENGINE_MAX_CANDIDATES: usize = 50;
@@ -53,6 +84,8 @@ pub struct Coordinator {
     engine_mgr: EngineManager,
     freq_tracker: FreqTracker,
     compiled_hotkeys: CompiledHotkeys,
+    /// 标点转换器（引号左右状态）
+    punct: Mutex<PunctuationConverter>,
 }
 
 impl Coordinator {
@@ -126,6 +159,7 @@ impl Coordinator {
             engine_mgr,
             freq_tracker: FreqTracker::new(),
             compiled_hotkeys,
+            punct: Mutex::new(PunctuationConverter::new()),
         })
     }
 
@@ -443,8 +477,8 @@ impl MessageHandler for Coordinator {
                     KeyAction::PassThrough
                 }
             }
-            0x31..=0x39 => {
-                // 数字键 1-9 选词
+            0x31..=0x39 if data.modifiers & MOD_SHIFT == 0 => {
+                // 数字键 1-9 选词（Shift+数字走标点分支）
                 let idx = (data.key_code - 0x31) as usize;
                 if idx < state.candidates.len() {
                     let text = state.candidates[idx].text.clone();
@@ -476,7 +510,45 @@ impl MessageHandler for Coordinator {
                 }
             }
             _ => {
-                if !state.input_buffer.is_empty() {
+                let shift = data.modifiers & MOD_SHIFT != 0;
+                if let Some(ch) = punct_char(data.key_code, shift) {
+                    // 标点/符号键：先上屏首选候选（若有输入），再追加（转换后的）标点
+                    let mut out = String::new();
+                    if !state.candidates.is_empty() {
+                        let t = state.candidates[0].text.clone();
+                        self.freq_tracker.record_selection(&t);
+                        out.push_str(&t);
+                    } else if !state.input_buffer.is_empty() {
+                        out.push_str(&state.input_buffer);
+                    }
+                    let had_input = !state.input_buffer.is_empty() || !state.candidates.is_empty();
+                    state.input_buffer.clear();
+                    state.candidates.clear();
+
+                    // 中文标点转换；未配置中文标点时按全角/原样输出
+                    let piece = if state.chinese_punct {
+                        self.punct
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .to_chinese(ch)
+                            .unwrap_or_else(|| {
+                                if state.full_width {
+                                    to_full_width(&ch.to_string())
+                                } else {
+                                    ch.to_string()
+                                }
+                            })
+                    } else if state.full_width {
+                        to_full_width(&ch.to_string())
+                    } else {
+                        ch.to_string()
+                    };
+                    out.push_str(&piece);
+                    if had_input {
+                        self.notify_ui_hide();
+                    }
+                    Self::commit_action(out, true)
+                } else if !state.input_buffer.is_empty() {
                     KeyAction::Consumed
                 } else {
                     KeyAction::PassThrough
@@ -532,6 +604,7 @@ impl MessageHandler for Coordinator {
             String::new()
         };
         drop(state);
+        self.punct.lock().unwrap_or_else(|e| e.into_inner()).reset();
         self.push_state_update();
         (Some(self.build_status()), commit_text)
     }
@@ -550,6 +623,7 @@ impl MessageHandler for Coordinator {
             String::new()
         };
         drop(state);
+        self.punct.lock().unwrap_or_else(|e| e.into_inner()).reset();
         self.push_state_update();
         (Some(self.build_status()), commit_text)
     }
