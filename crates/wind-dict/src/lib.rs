@@ -12,6 +12,7 @@ pub mod layer;
 pub mod manager;
 pub mod store_layer;
 pub mod trie;
+pub mod unigram;
 
 pub use composite::CompositeDict;
 pub use layer::{DictLayer, LayerType, MutableLayer};

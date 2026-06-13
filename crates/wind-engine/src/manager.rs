@@ -309,22 +309,13 @@ impl EngineManager {
         };
 
         if schema.is_pinyin() {
-            // 加载 unigram 语言模型（长句 Viterbi 打分），失败则回退词典权重
-            let unigram: Option<std::sync::Arc<dyn crate::pinyin::lm::UnigramLookup>> =
-                if !schema.learning.unigram_path.is_empty() {
-                    let ug_path = schemas.join(&schema.learning.unigram_path);
-                    match crate::pinyin::lm::UnigramModel::load(&ug_path) {
-                        Ok(m) => {
-                            info!("Loaded unigram model: {} ({} words)", ug_path.display(), m.size());
-                            Some(std::sync::Arc::new(m))
-                        }
-                        Err(e) => {
-                            warn!("Failed to load unigram {}: {}", ug_path.display(), e);
-                            None
-                        }
-                    }
-                } else {
+            // 加载 unigram 语言模型（长句 Viterbi 打分）：mmap 零拷贝，失败回退词典权重。
+            let unigram: Option<Arc<dyn crate::pinyin::lm::UnigramLookup>> =
+                if schema.learning.unigram_path.is_empty() {
                     None
+                } else {
+                    let ug_txt = schemas.join(&schema.learning.unigram_path);
+                    Self::load_unigram_mmap(&ug_txt)
                 };
             Some(Box::new(PinyinEngine::with_unigram(
                 PinyinConfig::default(),
@@ -338,6 +329,42 @@ impl EngineManager {
                 4
             };
             Some(Box::new(CodeTableEngine::new(mcl, dict)))
+        }
+    }
+
+    /// 加载 unigram 语言模型（mmap）：从 unigram.txt 懒生成 unigram.wdb 后 mmap 打开。
+    /// 几乎不占常驻内存（页按需载入），替代旧的全量 HashMap 方案。
+    fn load_unigram_mmap(
+        ug_txt: &Path,
+    ) -> Option<Arc<dyn crate::pinyin::lm::UnigramLookup>> {
+        use crate::pinyin::lm::{parse_unigram_freqs, MmapUnigram};
+        use wind_dict::unigram::{write_unigram_wdb, UnigramReader};
+
+        let ug_wdb = ug_txt.with_extension("wdb");
+        // wdb 比 txt 新则直接用；否则从 txt 重建
+        let fresh = Self::combined_cache_fresh(&[ug_txt], &ug_wdb);
+        if !(ug_wdb.exists() && fresh) {
+            match parse_unigram_freqs(ug_txt) {
+                Ok(freqs) => {
+                    if let Err(e) = write_unigram_wdb(&ug_wdb, &freqs) {
+                        warn!("Failed to write unigram.wdb {}: {}", ug_wdb.display(), e);
+                    }
+                }
+                Err(e) => {
+                    warn!("Failed to parse unigram {}: {}", ug_txt.display(), e);
+                    return None;
+                }
+            }
+        }
+        match UnigramReader::open(&ug_wdb) {
+            Ok(reader) => {
+                info!("Unigram mmap: {} ({} keys)", ug_wdb.display(), reader.key_count());
+                Some(Arc::new(MmapUnigram::new(reader)))
+            }
+            Err(e) => {
+                warn!("Failed to mmap unigram.wdb {}: {}", ug_wdb.display(), e);
+                None
+            }
         }
     }
 

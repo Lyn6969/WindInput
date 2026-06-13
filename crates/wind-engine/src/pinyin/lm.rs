@@ -6,6 +6,7 @@
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::RwLock;
+use wind_dict::unigram::UnigramReader;
 
 /// Unigram 查找接口
 pub trait UnigramLookup: Send + Sync {
@@ -13,6 +14,92 @@ pub trait UnigramLookup: Send + Sync {
     fn contains(&self, word: &str) -> bool;
     fn char_based_score(&self, word: &str) -> f64;
     fn boost_user_freq(&self, word: &str, delta: i32);
+}
+
+/// 解析 unigram.txt（`词\t频次`，`#` 注释）为 (词, 频次) 列表。
+pub fn parse_unigram_freqs(path: &Path) -> anyhow::Result<Vec<(String, f64)>> {
+    let content = std::fs::read_to_string(path)?;
+    let mut freqs = Vec::new();
+    for line in content.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let mut it = line.split('\t');
+        if let (Some(word), Some(freq_s)) = (it.next(), it.next()) {
+            if !word.is_empty() {
+                if let Ok(freq) = freq_s.trim().parse::<f64>() {
+                    if freq > 0.0 {
+                        freqs.push((word.to_string(), freq));
+                    }
+                }
+            }
+        }
+    }
+    if freqs.is_empty() {
+        anyhow::bail!("unigram txt empty: {}", path.display());
+    }
+    Ok(freqs)
+}
+
+/// mmap 版 Unigram 模型：词频数据走 mmap（几乎不占常驻内存），
+/// 仅 user_freq（用户选词加成）在内存。优先选用此实现。
+pub struct MmapUnigram {
+    reader: UnigramReader,
+    user_freq: RwLock<HashMap<String, i32>>,
+}
+
+impl MmapUnigram {
+    pub fn new(reader: UnigramReader) -> Self {
+        Self {
+            reader,
+            user_freq: RwLock::new(HashMap::new()),
+        }
+    }
+
+    pub fn size(&self) -> usize {
+        self.reader.key_count() as usize
+    }
+}
+
+impl UnigramLookup for MmapUnigram {
+    fn log_prob(&self, word: &str) -> f64 {
+        let base = match self.reader.lookup(word) {
+            Some(lp) => lp as f64,
+            None if word.chars().count() > 1 => self.char_based_score(word),
+            None => self.reader.min_prob() as f64,
+        };
+        let freq = *self
+            .user_freq
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(word)
+            .unwrap_or(&0);
+        if freq > 0 {
+            base + ((freq as f64) * 0.5).min(5.0)
+        } else {
+            base
+        }
+    }
+
+    fn contains(&self, word: &str) -> bool {
+        self.reader.contains(word)
+    }
+
+    fn char_based_score(&self, word: &str) -> f64 {
+        let chars: Vec<char> = word.chars().collect();
+        if chars.is_empty() {
+            return self.reader.min_prob() as f64;
+        }
+        let sum: f64 = chars.iter().map(|c| self.log_prob(&c.to_string())).sum();
+        sum / chars.len() as f64
+    }
+
+    fn boost_user_freq(&self, word: &str, delta: i32) {
+        let mut freq = self.user_freq.write().unwrap_or_else(|e| e.into_inner());
+        let entry = freq.entry(word.to_string()).or_insert(0);
+        *entry = (*entry + delta).min(100);
+    }
 }
 
 /// 从文件加载的 Unigram 模型（对齐 Go `UnigramModel`）。
