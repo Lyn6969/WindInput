@@ -69,6 +69,9 @@ struct State {
     toolbar_visible: bool,
     caps_lock: bool,
     input_buffer: String,
+    /// 组合区显示文本（拼音含音节分隔 "ni hao"；码表为原始编码）。
+    /// 仅显示输入码/拼音，绝不包含候选列表。
+    preedit: String,
     candidates: Vec<Candidate>,
     caret_x: i32,
     caret_y: i32,
@@ -163,6 +166,7 @@ impl Coordinator {
                 toolbar_visible: true,
                 caps_lock: false,
                 input_buffer: String::new(),
+                preedit: String::new(),
                 candidates: Vec::new(),
                 caret_x: 0,
                 caret_y: 0,
@@ -217,12 +221,18 @@ impl Coordinator {
     /// 根据输入缓冲更新候选（委托引擎 + 应用词频 boost）
     fn update_candidates(&self, state: &mut State) {
         state.candidates.clear();
+        state.preedit = state.input_buffer.clone();
         if state.input_buffer.is_empty() {
             return;
         }
         let result = self
             .engine_mgr
             .convert(&state.input_buffer, ENGINE_MAX_CANDIDATES);
+
+        // 组合区只显示输入码/拼音（拼音含音节分隔 "ni hao"），绝不含候选列表
+        if !result.preedit_display.is_empty() {
+            state.preedit = result.preedit_display;
+        }
 
         let mut candidates = result.candidates;
         // 运行时词频 boost
@@ -242,22 +252,8 @@ impl Coordinator {
     fn commit_candidate(&self, state: &mut State, text: &str) {
         self.record_selection(text);
         state.input_buffer.clear();
+        state.preedit.clear();
         state.candidates.clear();
-    }
-
-    fn build_preedit_display(input: &str, candidates: &[Candidate]) -> String {
-        let mut display = String::from(input);
-        if !candidates.is_empty() {
-            display.push_str(" [");
-            for (i, c) in candidates.iter().enumerate() {
-                if i > 0 {
-                    display.push(' ');
-                }
-                display.push_str(&format!("{}.{}", i + 1, c.text));
-            }
-            display.push(']');
-        }
-        display
     }
 
     fn notify_ui_update(&self, state: &State) {
@@ -274,7 +270,7 @@ impl Coordinator {
             })
             .collect();
         let _ = self.ui_tx.send(UiCommand::UpdateCandidates {
-            preedit: state.input_buffer.clone(),
+            preedit: state.preedit.clone(),
             candidates: items,
             selected: 0,
             caret_x: state.caret_x,
@@ -478,7 +474,7 @@ impl MessageHandler for Coordinator {
                         self.notify_ui_hide();
                         KeyAction::ClearComposition
                     } else {
-                        let display = Self::build_preedit_display(&state.input_buffer, &state.candidates);
+                        let display = state.preedit.clone();
                         self.notify_ui_update(&state);
                         KeyAction::UpdateComposition {
                             text: display,
@@ -543,7 +539,7 @@ impl MessageHandler for Coordinator {
                 let ch = (b'a' + (data.key_code - 0x41) as u8) as char;
                 state.input_buffer.push(ch);
                 self.update_candidates(&mut state);
-                let display = Self::build_preedit_display(&state.input_buffer, &state.candidates);
+                let display = state.preedit.clone();
                 self.notify_ui_update(&state);
                 KeyAction::UpdateComposition {
                     text: display,

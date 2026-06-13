@@ -77,11 +77,8 @@ fn test_wubi_basic_input_and_commit() {
         last = press_letter(&coord, c);
     }
     let preedit = action_text(&last).expect("应返回 UpdateComposition");
-    assert!(
-        preedit.contains("恭恭敬敬"),
-        "五笔 'aaaa' 预编辑应含候选 恭恭敬敬，实际: {}",
-        preedit
-    );
+    // 组合区只显示编码，不含候选列表（候选在候选窗口）
+    assert_eq!(preedit, "aaaa", "五笔组合区应只显示编码，实际: {}", preedit);
 
     // 空格上屏首选
     let commit = coord.handle_key_event(&key_event(0x20, EVENT_KEY_DOWN));
@@ -100,10 +97,10 @@ fn test_wubi_number_select() {
         return;
     }
     let coord = Coordinator::new_headless(config_with("wubi86"), Some(&data_dir()));
-    // "a" → 候选 工/戈...
+    // "a" → 组合区显示编码 "a"，候选在候选窗口
     let act = press_letter(&coord, 'a');
     let preedit = action_text(&act).unwrap();
-    assert!(preedit.contains("工"), "'a' 应含候选 工，实际: {}", preedit);
+    assert_eq!(preedit, "a", "组合区应只显示编码 a，实际: {}", preedit);
 
     // 数字键 2 选第二个候选
     let commit = coord.handle_key_event(&key_event(0x32, EVENT_KEY_DOWN));
@@ -126,18 +123,17 @@ fn test_pinyin_basic_input() {
         last = press_letter(&coord, c);
     }
     let preedit = action_text(&last).expect("应返回 UpdateComposition");
-    assert!(
-        preedit.contains("你好"),
-        "拼音 'nihao' 预编辑应含 你好，实际: {}",
-        preedit
-    );
+    // 拼音组合区显示音节分隔的拼音串，不含候选
+    assert_eq!(preedit, "ni hao", "拼音组合区应显示 'ni hao'，实际: {}", preedit);
 
-    // 空格上屏
+    // 空格上屏首选，应得到 你好
     let commit = coord.handle_key_event(&key_event(0x20, EVENT_KEY_DOWN));
-    assert!(
-        matches!(commit, KeyAction::InsertText { .. }),
-        "空格应上屏 InsertText"
-    );
+    match commit {
+        KeyAction::InsertText { text, .. } => {
+            assert!(text.contains("你好"), "空格上屏应含 你好，实际: {}", text);
+        }
+        other => panic!("空格应上屏 InsertText，实际: {:?}", other),
+    }
 }
 
 #[test]

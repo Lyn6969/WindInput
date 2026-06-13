@@ -171,23 +171,29 @@ impl Engine for PinyinEngine {
             // 不能把这种空/错误路径强插到首选位置。
             if !result.words.is_empty() && result.log_prob.is_finite() {
                 let sentence: String = result.words.join("");
-                if !sentence.is_empty() && !candidates.iter().any(|c| c.text == sentence) {
+                if !sentence.is_empty() {
                     // 整句优先：给予高权重置顶（log_prob 为负，原 .max(1) 会被截断淘汰）。
-                    // 仅当输入跨多音节、且非已存在的精确匹配时插入。
                     // clamp + saturating_add 防止超长低频句的 log_prob 溢出 i32 导致沉底/panic。
-                    let log_offset = (result.log_prob * 1000.0).clamp(-(SENTENCE_WEIGHT_BASE as f64), 0.0) as i32;
+                    let log_offset =
+                        (result.log_prob * 1000.0).clamp(-(SENTENCE_WEIGHT_BASE as f64), 0.0) as i32;
                     let weight = SENTENCE_WEIGHT_BASE.saturating_add(log_offset);
-                    candidates.insert(
-                        0,
-                        Candidate {
-                            text: sentence,
-                            code: input.to_string(),
-                            weight,
-                            natural_order: 0,
-                            source: CandidateSource::Pinyin,
-                            ..Default::default()
-                        },
-                    );
+                    if let Some(existing) = candidates.iter_mut().find(|c| c.text == sentence) {
+                        // 整句与已有候选（如精确匹配 你好）同文：提升其权重置顶，
+                        // 否则单字（如 你）会因词频更高反超整句词。
+                        existing.weight = existing.weight.max(weight);
+                    } else {
+                        candidates.insert(
+                            0,
+                            Candidate {
+                                text: sentence,
+                                code: input.to_string(),
+                                weight,
+                                natural_order: 0,
+                                source: CandidateSource::Pinyin,
+                                ..Default::default()
+                            },
+                        );
+                    }
                 }
             }
         }

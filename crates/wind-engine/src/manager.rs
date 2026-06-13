@@ -14,7 +14,7 @@ use crate::engine::{ConvertResult, Engine, EngineType};
 use crate::pinyin::{Config as PinyinConfig, PinyinEngine};
 use std::collections::HashMap;
 use std::path::Path;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use tracing::{info, warn};
 use wind_config::Config;
 use wind_dict::cached::CachedDict;
@@ -44,12 +44,21 @@ struct EngineSection {
     engine_type: String,
     #[serde(default)]
     codetable: CodetableSection,
+    #[serde(default)]
+    pinyin: PinyinSection,
 }
 
 #[derive(Debug, Clone, Default, serde::Deserialize)]
 struct CodetableSection {
     #[serde(default)]
     max_code_length: usize,
+}
+
+#[derive(Debug, Clone, Default, serde::Deserialize)]
+struct PinyinSection {
+    /// 拼音方案："full"=全拼（支持）；"shuangpin"=双拼（暂未实现）
+    #[serde(default)]
+    scheme: String,
 }
 
 #[derive(Debug, Clone, Default, serde::Deserialize)]
@@ -90,54 +99,96 @@ impl SchemaFile {
             .or_else(|| self.dictionaries.first());
         matches!(default, Some(d) if d.dict_type == "rime_pinyin")
     }
+
+    /// 该方案当前是否受支持（双拼 scheme≠full 暂未实现，先排除）
+    fn is_supported(&self) -> bool {
+        if self.is_pinyin() {
+            let s = self.engine.pinyin.scheme.to_lowercase();
+            return s.is_empty() || s == "full";
+        }
+        true
+    }
 }
 
-/// 引擎管理器
+/// 引擎管理器（懒加载：仅在需要时构建对应方案引擎，降低启动内存）
 pub struct EngineManager {
-    /// schema_id -> 引擎实例（构造后只读）
-    engines: HashMap<String, Box<dyn Engine>>,
-    /// 当前活跃方案 ID（Mutex 支持运行时切换）
+    /// schema_id -> 引擎实例（懒加载，Arc 便于无锁 convert）
+    engines: Mutex<HashMap<String, Arc<dyn Engine>>>,
+    /// 当前活跃方案 ID
     active: Mutex<String>,
-    /// 可用方案列表（用于循环切换）
+    /// 可用方案列表（已过滤不支持的方案，用于循环切换）
     available: Vec<String>,
+    /// 数据目录（懒加载时按需读取 schema）
+    data_dir: Option<std::path::PathBuf>,
 }
 
 impl EngineManager {
-    /// 从配置预加载所有可用方案的引擎
+    /// 从配置创建；仅构建活跃方案引擎，其余按需懒加载。
     pub fn new(config: &Config, data_dir: Option<&Path>) -> Self {
         let active_id = config.active_schema().to_string();
         let mut available = config.schema.available.clone();
         if available.is_empty() {
             available.push(active_id.clone());
         }
+        // 过滤不支持的方案（如双拼），但始终保留活跃方案
+        available.retain(|sid| {
+            sid == &active_id || Self::schema_supported(sid, data_dir)
+        });
 
-        let mut engines: HashMap<String, Box<dyn Engine>> = HashMap::new();
-        for sid in &available {
-            match Self::build_engine(sid, data_dir) {
-                Some(engine) => {
-                    info!(
-                        "Pre-loaded engine: {} (type={:?})",
-                        sid,
-                        engine.engine_type()
-                    );
-                    engines.insert(sid.clone(), engine);
-                }
-                None => warn!("Failed to build engine for schema: {}", sid),
-            }
-        }
-
-        // 确保活跃方案已加载
-        if !engines.contains_key(&active_id) {
-            if let Some(engine) = Self::build_engine(&active_id, data_dir) {
-                engines.insert(active_id.clone(), engine);
-            }
-        }
-
-        Self {
-            engines,
-            active: Mutex::new(active_id),
+        let mgr = Self {
+            engines: Mutex::new(HashMap::new()),
+            active: Mutex::new(active_id.clone()),
             available,
+            data_dir: data_dir.map(|d| d.to_path_buf()),
+        };
+        // 仅构建活跃方案（其余懒加载）
+        mgr.ensure_loaded(&active_id);
+        mgr
+    }
+
+    /// 读取 schema 判断是否受支持（不构建引擎，仅解析 TOML）
+    fn schema_supported(schema_id: &str, data_dir: Option<&Path>) -> bool {
+        match Self::read_schema(schema_id, data_dir) {
+            Some(s) => s.is_supported(),
+            None => false,
         }
+    }
+
+    /// 确保指定方案引擎已加载；返回是否可用
+    fn ensure_loaded(&self, schema_id: &str) -> bool {
+        if self
+            .engines
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .contains_key(schema_id)
+        {
+            return true;
+        }
+        match Self::build_engine(schema_id, self.data_dir.as_deref()) {
+            Some(engine) => {
+                info!("Loaded engine: {} (type={:?})", schema_id, engine.engine_type());
+                self.engines
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .insert(schema_id.to_string(), Arc::from(engine));
+                true
+            }
+            None => {
+                warn!("Failed to build engine for schema: {}", schema_id);
+                false
+            }
+        }
+    }
+
+    /// 取当前活跃引擎（必要时懒加载）
+    fn active_engine(&self) -> Option<Arc<dyn Engine>> {
+        let id = self.active_schema_id();
+        self.ensure_loaded(&id);
+        self.engines
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&id)
+            .cloned()
     }
 
     /// 当前活跃方案 ID
@@ -147,9 +198,7 @@ impl EngineManager {
 
     /// 当前活跃引擎是否为拼音类型
     pub fn is_pinyin(&self) -> bool {
-        let id = self.active_schema_id();
-        self.engines
-            .get(&id)
+        self.active_engine()
             .map(|e| e.engine_type() == EngineType::Pinyin)
             .unwrap_or(false)
     }
@@ -159,10 +208,9 @@ impl EngineManager {
         &self.available
     }
 
-    /// 切换到指定方案；成功返回 true
+    /// 切换到指定方案；成功返回 true（必要时懒加载）
     pub fn switch_schema(&self, schema_id: &str) -> bool {
-        if !self.engines.contains_key(schema_id) {
-            warn!("Schema not loaded: {}", schema_id);
+        if !self.ensure_loaded(schema_id) {
             return false;
         }
         let mut active = self.active.lock().unwrap_or_else(|e| e.into_inner());
@@ -174,28 +222,29 @@ impl EngineManager {
         true
     }
 
-    /// 循环切换到下一个【已成功加载】的方案；返回新方案 ID。
-    /// 单次加锁完成 read-modify-write，避免 TOCTOU 竞争；跳过构建失败/未加载的方案，
-    /// 否则当 available 中夹杂未加载方案（如 mixed/shuangpin）时按键会"无反应"。
+    /// 循环切换到下一个可加载的方案；返回新方案 ID。
+    /// 懒加载：在加载前不持 active 锁，避免首次加载（拼音合并/unigram）阻塞按键路径。
     pub fn cycle_schema(&self) -> Option<String> {
         let n = self.available.len();
         if n <= 1 {
             return None;
         }
-        let mut active = self.active.lock().unwrap_or_else(|e| e.into_inner());
+        let current = self.active_schema_id();
         let cur = self
             .available
             .iter()
-            .position(|s| s == active.as_str())
+            .position(|s| s == &current)
             .unwrap_or(0);
-        // 从下一个开始环形查找首个已加载方案
         for step in 1..n {
-            let cand = &self.available[(cur + step) % n];
-            if cand != active.as_str() && self.engines.contains_key(cand) {
-                let next = cand.clone();
-                info!("Cycling schema: {} -> {}", *active, next);
-                *active = next.clone();
-                return Some(next);
+            let cand = self.available[(cur + step) % n].clone();
+            if cand == current {
+                continue;
+            }
+            if self.ensure_loaded(&cand) {
+                let mut active = self.active.lock().unwrap_or_else(|e| e.into_inner());
+                info!("Cycling schema: {} -> {}", *active, cand);
+                *active = cand.clone();
+                return Some(cand);
             }
         }
         None
@@ -203,51 +252,53 @@ impl EngineManager {
 
     /// 转换输入为候选（分发到当前引擎）
     pub fn convert(&self, input: &str, max_candidates: usize) -> ConvertResult {
-        let id = self.active_schema_id();
-        match self.engines.get(&id) {
-            Some(engine) => engine
-                .convert(input, max_candidates)
-                .unwrap_or_else(|e| {
-                    warn!("convert error: {}", e);
-                    ConvertResult::default()
-                }),
+        match self.active_engine() {
+            Some(engine) => engine.convert(input, max_candidates).unwrap_or_else(|e| {
+                warn!("convert error: {}", e);
+                ConvertResult::default()
+            }),
             None => ConvertResult::default(),
         }
     }
 
     // ───────────────────────── 词典加载 ─────────────────────────
 
-    /// 为指定 schema 构建引擎
-    ///
-    /// schema 文件优先读取 Go 规范格式 `{id}.schema.toml`，回退到遗留 `{id}.schema.yaml`。
-    fn build_engine(schema_id: &str, data_dir: Option<&Path>) -> Option<Box<dyn Engine>> {
+    /// 读取并解析 schema 文件（优先 .schema.toml，回退遗留 .schema.yaml）。仅解析不构建引擎。
+    fn read_schema(schema_id: &str, data_dir: Option<&Path>) -> Option<SchemaFile> {
         let data_dir = data_dir?;
         let schemas = data_dir.join("schemas");
         let toml_path = schemas.join(format!("{}.schema.toml", schema_id));
         let yaml_path = schemas.join(format!("{}.schema.yaml", schema_id));
 
-        let schema: SchemaFile = if toml_path.exists() {
+        if toml_path.exists() {
             let content = std::fs::read_to_string(&toml_path).ok()?;
             match toml::from_str(&content) {
-                Ok(s) => s,
+                Ok(s) => Some(s),
                 Err(e) => {
                     warn!("Parse schema TOML failed {}: {}", toml_path.display(), e);
-                    return None;
+                    None
                 }
             }
         } else if yaml_path.exists() {
             let content = std::fs::read_to_string(&yaml_path).ok()?;
             match serde_yaml::from_str(&content) {
-                Ok(s) => s,
+                Ok(s) => Some(s),
                 Err(e) => {
                     warn!("Parse schema YAML failed {}: {}", yaml_path.display(), e);
-                    return None;
+                    None
                 }
             }
         } else {
             warn!("Schema file not found: {}.schema.toml/.yaml", schema_id);
-            return None;
-        };
+            None
+        }
+    }
+
+    /// 为指定 schema 构建引擎
+    fn build_engine(schema_id: &str, data_dir: Option<&Path>) -> Option<Box<dyn Engine>> {
+        let data_dir = data_dir?;
+        let schemas = data_dir.join("schemas");
+        let schema = Self::read_schema(schema_id, Some(data_dir))?;
 
         let dict = match Self::load_dictionary(&schema, &schemas) {
             Some(d) => d,
