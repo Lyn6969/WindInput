@@ -163,42 +163,59 @@ impl CandidateWindow {
         self.visible
     }
 
-    fn calculate_size(&self) -> (u32, u32) {
-        let num_items = self.candidates.len().min(self.config.per_page);
+    /// 候选间距（横向布局中相邻候选 cell 的间隔）
+    const CELL_GAP: f32 = 14.0;
 
-        // 使用 TextRenderer 测量实际文本高度
-        let sample_metrics = self.text_renderer.measure_text("国");
-        let item_height = sample_metrics.height + self.config.item_spacing;
-
-        let preedit_height = if self.preedit.is_empty() {
-            0.0
-        } else {
-            item_height
-        };
-
-        // 每个候选行宽 = 序号"N." + 间距 + 候选文本；取最宽行
-        let index_width = self.text_renderer.measure_text("9.").width + 8.0;
-        let mut max_row_width: f32 = 0.0;
-        for candidate in self.candidates.iter().take(self.config.per_page) {
-            let text_w = self.text_renderer.measure_text(&candidate.text).width;
-            max_row_width = max_row_width.max(index_width + text_w);
+    /// 计算横向候选布局：返回每个候选的 (显示标签 "N.文本", 起始 x, cell 宽度)。
+    /// 静态以便 calculate_size 与 draw 复用，保证两者尺寸一致。
+    fn layout_cells(
+        candidates: &[CandidateItem],
+        per_page: usize,
+        padding_x: f32,
+        renderer: &TextRenderer,
+    ) -> (Vec<(String, f32, f32)>, f32) {
+        let mut cells = Vec::new();
+        let mut x = padding_x;
+        for (i, c) in candidates.iter().take(per_page).enumerate() {
+            let label = format!("{}.{}", i + 1, c.text);
+            let w = renderer.measure_text(&label).width;
+            cells.push((label, x, w));
+            x += w + Self::CELL_GAP;
         }
+        // 内容宽度 = 最后一个 cell 右边界（去掉多余 gap）+ 右 padding
+        let content_width = if cells.is_empty() {
+            padding_x * 2.0
+        } else {
+            x - Self::CELL_GAP + padding_x
+        };
+        (cells, content_width)
+    }
 
-        // 关键修复：preedit 行宽也要纳入，否则长 preedit（如 "ni hao zh"）会被裁剪
+    fn calculate_size(&self) -> (u32, u32) {
+        let line_height =
+            self.text_renderer.measure_text("国").height + self.config.item_spacing;
+
+        let preedit_height = if self.preedit.is_empty() { 0.0 } else { line_height };
+        let cand_height = if self.candidates.is_empty() { 0.0 } else { line_height };
+
+        let (_, cand_width) = Self::layout_cells(
+            &self.candidates,
+            self.config.per_page,
+            self.config.padding_x,
+            &self.text_renderer,
+        );
+
+        // preedit 行宽（含左右 padding），与候选行宽取最大
         let preedit_width = if self.preedit.is_empty() {
             0.0
         } else {
-            self.text_renderer.measure_text(&self.preedit).width
+            self.text_renderer.measure_text(&self.preedit).width + self.config.padding_x * 2.0
         };
 
-        let content_width = max_row_width.max(preedit_width);
-        let width = (content_width + self.config.padding_x * 2.0).max(80.0);
+        let width = cand_width.max(preedit_width).max(80.0);
+        let height = preedit_height + cand_height + self.config.padding_y * 2.0;
 
-        let height = preedit_height
-            + num_items as f32 * item_height
-            + self.config.padding_y * 2.0;
-
-        (width.ceil() as u32, height.max(30.0).ceil() as u32)
+        (width.ceil() as u32, height.max(28.0).ceil() as u32)
     }
 
     /// 静态渲染函数，避免借用冲突
@@ -272,17 +289,23 @@ impl CandidateWindow {
             }
         }
 
-        // 绘制候选列表
-        for (i, candidate) in candidates.iter().take(config.per_page).enumerate() {
+        // 绘制候选列表（横向：1.你好  2.尼号  3...）
+        let (cells, _) =
+            Self::layout_cells(candidates, config.per_page, config.padding_x, text_renderer);
+        let row_top = cy;
+        for (i, (label, cell_x, cell_w)) in cells.iter().enumerate() {
             let is_selected = i == selected;
 
-            // 选中项背景
+            // 选中项背景块（覆盖该 cell，上下留 2px）
             if is_selected {
                 let sel_bg = config.selected_bg;
-                let start_y = cy as usize;
-                let end_y = (cy + item_height) as usize;
-                for dy in start_y..end_y.min(h) {
-                    for dx in 4..w.saturating_sub(4) {
+                let pad = 6.0; // cell 背景左右内边距
+                let x0 = (cell_x - pad).max(2.0) as usize;
+                let x1 = (cell_x + cell_w + pad).min(w as f32 - 2.0) as usize;
+                let y0 = row_top as usize;
+                let y1 = (row_top + item_height).min(h as f32) as usize;
+                for dy in y0..y1 {
+                    for dx in x0..x1 {
                         let idx = (dy * w + dx) * 4;
                         if idx + 3 < buf.len() {
                             buf[idx] = sel_bg[0];
@@ -294,26 +317,12 @@ impl CandidateWindow {
                 }
             }
 
-            // 序号
-            let index_text = format!("{}.", i + 1);
-            let index_color = if is_selected {
-                config.highlight_color
-            } else {
-                [150, 150, 150, 255]
-            };
-            Self::draw_text_static(buf, w, h, &index_text, config.padding_x, cy, text_renderer, index_color);
-
-            // 候选文本（序号宽度 + 间距）
-            let index_metrics = text_renderer.measure_text(&index_text);
-            let text_x = config.padding_x + index_metrics.width + 8.0;
-            let text_color = if is_selected {
+            let color = if is_selected {
                 config.highlight_color
             } else {
                 config.text_color
             };
-            Self::draw_text_static(buf, w, h, &candidate.text, text_x, cy, text_renderer, text_color);
-
-            cy += item_height;
+            Self::draw_text_static(buf, w, h, label, *cell_x, row_top, text_renderer, color);
         }
     }
 
