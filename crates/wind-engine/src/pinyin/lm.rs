@@ -4,6 +4,7 @@
 //! 基于词典权重的简化语言模型。
 
 use std::collections::HashMap;
+use std::path::Path;
 use std::sync::RwLock;
 
 /// Unigram 查找接口
@@ -12,6 +13,128 @@ pub trait UnigramLookup: Send + Sync {
     fn contains(&self, word: &str) -> bool;
     fn char_based_score(&self, word: &str) -> f64;
     fn boost_user_freq(&self, word: &str, delta: i32);
+}
+
+/// 从文件加载的 Unigram 模型（对齐 Go `UnigramModel`）。
+///
+/// 文件格式：`词语\t频次`，`#` 开头为注释。
+/// `log_prob(word) = ln(freq/total)`；OOV 单字回退 `min_prob = ln(0.5/total)`，
+/// 多字 OOV 用字符平均（避免合法多字词被单字组合碾压）。
+pub struct UnigramModel {
+    log_probs: HashMap<String, f64>,
+    user_freq: RwLock<HashMap<String, i32>>,
+    min_prob: f64,
+}
+
+impl UnigramModel {
+    /// 从 unigram.txt 加载
+    pub fn load(path: &Path) -> anyhow::Result<Self> {
+        let content = std::fs::read_to_string(path)?;
+        let mut freqs: Vec<(String, f64)> = Vec::new();
+        let mut total = 0.0f64;
+        for line in content.lines() {
+            let line = line.trim();
+            if line.is_empty() || line.starts_with('#') {
+                continue;
+            }
+            let mut it = line.split('\t');
+            match (it.next(), it.next()) {
+                (Some(word), Some(freq_s)) if !word.is_empty() => {
+                    if let Ok(freq) = freq_s.trim().parse::<f64>() {
+                        if freq > 0.0 {
+                            freqs.push((word.to_string(), freq));
+                            total += freq;
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        if total == 0.0 {
+            anyhow::bail!("unigram model is empty: {}", path.display());
+        }
+        let mut log_probs = HashMap::with_capacity(freqs.len());
+        for (w, f) in freqs {
+            log_probs.insert(w, (f / total).ln());
+        }
+        Ok(Self {
+            log_probs,
+            user_freq: RwLock::new(HashMap::new()),
+            min_prob: (0.5 / total).ln(),
+        })
+    }
+
+    pub fn size(&self) -> usize {
+        self.log_probs.len()
+    }
+}
+
+impl UnigramLookup for UnigramModel {
+    fn log_prob(&self, word: &str) -> f64 {
+        let base = if let Some(p) = self.log_probs.get(word) {
+            *p
+        } else if word.chars().count() > 1 {
+            self.char_based_score(word)
+        } else {
+            self.min_prob
+        };
+        let freq = *self
+            .user_freq
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(word)
+            .unwrap_or(&0);
+        if freq > 0 {
+            base + ((freq as f64) * 0.5).min(5.0)
+        } else {
+            base
+        }
+    }
+
+    fn contains(&self, word: &str) -> bool {
+        self.log_probs.contains_key(word)
+    }
+
+    fn char_based_score(&self, word: &str) -> f64 {
+        let chars: Vec<char> = word.chars().collect();
+        if chars.is_empty() {
+            return self.min_prob;
+        }
+        // 逐字走 log_prob（含 user_freq boost），与 Go CharBasedScore→LogProb 链一致。
+        // 单字不会再递归进本函数（log_prob 仅对多字 OOV 调用 char_based_score）。
+        let sum: f64 = chars.iter().map(|c| self.log_prob(&c.to_string())).sum();
+        sum / chars.len() as f64
+    }
+
+    fn boost_user_freq(&self, word: &str, delta: i32) {
+        let mut freq = self.user_freq.write().unwrap_or_else(|e| e.into_inner());
+        let entry = freq.entry(word.to_string()).or_insert(0);
+        *entry = (*entry + delta).min(100);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_unigram_load_and_logprob() {
+        let tmp = std::env::temp_dir().join("wind_unigram_test.txt");
+        std::fs::write(&tmp, "# comment\n的\t100\n中国\t40\n爱\t10\n").unwrap();
+        let m = UnigramModel::load(&tmp).unwrap();
+        assert_eq!(m.size(), 3);
+        // 高频词 log_prob 更大（更接近 0）
+        assert!(m.log_prob("的") > m.log_prob("中国"));
+        assert!(m.log_prob("中国") > m.log_prob("爱"));
+        assert!(m.contains("中国"));
+        // OOV 单字回退 min_prob；多字 OOV 用字符平均
+        assert!(m.log_prob("龘") <= m.log_prob("爱"));
+        // 用户频率 boost
+        let before = m.log_prob("爱");
+        m.boost_user_freq("爱", 4);
+        assert!(m.log_prob("爱") > before);
+        let _ = std::fs::remove_file(&tmp);
+    }
 }
 
 /// 基于词典权重的 Unigram 模型

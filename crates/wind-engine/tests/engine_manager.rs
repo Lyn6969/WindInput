@@ -44,6 +44,34 @@ fn test_wubi_engine_candidates() {
 }
 
 #[test]
+fn test_wubi_extra_dict_loaded() {
+    let dir = data_dir();
+    if !schema_exists(&dir, "wubi86") {
+        eprintln!("跳过：wubi86 schema 不存在");
+        return;
+    }
+    // 删除旧 combined 缓存，强制重新合并多库
+    let _ = std::fs::remove_file(
+        dir.join("schemas/wubi86/wubi86_jidian.dict.combined.wdb"),
+    );
+    let cfg = make_config(&["wubi86"]);
+    let mgr = EngineManager::new(&cfg, Some(&dir));
+
+    // "甘蓝菜"(aaae) 仅存在于扩展库 wubi86_jidian_extra；主库没有。
+    // 能查到即证明扩展库已被合并加载。
+    let r = mgr.convert("aaae", 20);
+    assert!(
+        r.candidates.iter().any(|c| c.text == "甘蓝菜"),
+        "扩展库词 '甘蓝菜'(aaae) 应能查到，实际: {:?}",
+        r.candidates.iter().take(10).map(|c| c.text.as_str()).collect::<Vec<_>>()
+    );
+
+    // 主库词仍在
+    let a = mgr.convert("aaaa", 20);
+    assert!(a.candidates.iter().any(|c| c.text == "恭恭敬敬"), "主库词应仍在");
+}
+
+#[test]
 fn test_pinyin_engine_candidates() {
     let dir = data_dir();
     if !schema_exists(&dir, "pinyin") {
@@ -64,6 +92,39 @@ fn test_pinyin_engine_candidates() {
         result.candidates.iter().any(|c| c.text.contains("你好") || c.text == "你好"),
         "应包含 你好，实际: {:?}",
         result.candidates.iter().take(10).map(|c| c.text.as_str()).collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn test_pinyin_long_sentence() {
+    let dir = data_dir();
+    if !schema_exists(&dir, "pinyin") {
+        eprintln!("跳过：pinyin schema 不存在");
+        return;
+    }
+    let cfg = make_config(&["pinyin"]);
+    let mgr = EngineManager::new(&cfg, Some(&dir));
+
+    // 长拼音串：Viterbi 整句解码应产出一个 >=4 字的合理句子候选
+    let r = mgr.convert("woaizhongguo", 20);
+    let longest = r
+        .candidates
+        .iter()
+        .map(|c| c.text.chars().count())
+        .max()
+        .unwrap_or(0);
+    eprintln!(
+        "woaizhongguo 候选: {:?}",
+        r.candidates.iter().take(8).map(|c| c.text.as_str()).collect::<Vec<_>>()
+    );
+    assert!(
+        longest >= 4,
+        "长句应产出 >=4 字候选（Viterbi+unigram），最长仅 {} 字",
+        longest
+    );
+    assert!(
+        r.candidates.iter().any(|c| c.text == "我爱中国"),
+        "应能整句解码出 我爱中国"
     );
 }
 

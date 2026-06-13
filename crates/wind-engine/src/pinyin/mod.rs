@@ -25,11 +25,16 @@ use crate::engine::{ConvertResult, Engine, EngineType};
 use dag::Dag;
 use fuzzy::FuzzyConfig;
 use lattice::LatticeBuilder;
+use lm::UnigramLookup;
 use scorer::AbbrevMatcher;
+use std::sync::Arc;
 use syllable::SyllableTrie;
 use viterbi::{ViterbiDecoder, WordNode};
 use wind_candidate::{Candidate, CandidateSource};
 use wind_dict::cached::CachedDict;
+
+/// 整句候选权重基准（高于拼音词频上限 ~19260817，确保整句置顶且不被截断）
+const SENTENCE_WEIGHT_BASE: i32 = 30_000_000;
 
 /// 拼音引擎配置
 #[derive(Debug, Clone, Default)]
@@ -50,10 +55,20 @@ pub struct PinyinEngine {
     viterbi: ViterbiDecoder,
     lattice_builder: LatticeBuilder,
     fuzzy_config: FuzzyConfig,
+    /// Unigram 语言模型（长句 Viterbi 打分；缺失时回退词典权重）
+    unigram: Option<Arc<dyn UnigramLookup>>,
 }
 
 impl PinyinEngine {
     pub fn new(config: Config, dict: CachedDict) -> Self {
+        Self::with_unigram(config, dict, None)
+    }
+
+    pub fn with_unigram(
+        config: Config,
+        dict: CachedDict,
+        unigram: Option<Arc<dyn UnigramLookup>>,
+    ) -> Self {
         Self {
             config,
             dict,
@@ -61,6 +76,7 @@ impl PinyinEngine {
             viterbi: ViterbiDecoder::new(),
             lattice_builder: LatticeBuilder::new(),
             fuzzy_config: FuzzyConfig::default(),
+            unigram,
         }
     }
 
@@ -128,9 +144,13 @@ impl Engine for PinyinEngine {
 
         // 2. Viterbi 长句解码（>=2 音节）
         if syllables.len() >= 2 {
-            let lattice_nodes =
-                self.lattice_builder
-                    .build(input, trie, dict, Some(&self.fuzzy_config));
+            let lattice_nodes = self.lattice_builder.build(
+                input,
+                trie,
+                dict,
+                Some(&self.fuzzy_config),
+                self.unigram.as_deref(),
+            );
             let input_len = input.len();
             let mut lattice: Vec<Vec<WordNode>> = vec![Vec::new(); input_len + 1];
             for (end_pos, nodes_at_end) in lattice_nodes.iter().enumerate() {
@@ -152,7 +172,11 @@ impl Engine for PinyinEngine {
             if !result.words.is_empty() && result.log_prob.is_finite() {
                 let sentence: String = result.words.join("");
                 if !sentence.is_empty() && !candidates.iter().any(|c| c.text == sentence) {
-                    let weight = (result.log_prob as i32).max(1);
+                    // 整句优先：给予高权重置顶（log_prob 为负，原 .max(1) 会被截断淘汰）。
+                    // 仅当输入跨多音节、且非已存在的精确匹配时插入。
+                    // clamp + saturating_add 防止超长低频句的 log_prob 溢出 i32 导致沉底/panic。
+                    let log_offset = (result.log_prob * 1000.0).clamp(-(SENTENCE_WEIGHT_BASE as f64), 0.0) as i32;
+                    let weight = SENTENCE_WEIGHT_BASE.saturating_add(log_offset);
                     candidates.insert(
                         0,
                         Candidate {

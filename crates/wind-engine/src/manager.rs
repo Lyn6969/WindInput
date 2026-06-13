@@ -27,6 +27,15 @@ struct SchemaFile {
     engine: EngineSection,
     #[serde(default)]
     dictionaries: Vec<DictEntry>,
+    #[serde(default)]
+    learning: LearningSection,
+}
+
+#[derive(Debug, Clone, Default, serde::Deserialize)]
+struct LearningSection {
+    /// unigram 语言模型路径（相对 schemas 目录），拼音长句打分用
+    #[serde(default)]
+    unigram_path: String,
 }
 
 #[derive(Debug, Clone, Default, serde::Deserialize)]
@@ -51,6 +60,16 @@ struct DictEntry {
     dict_type: String,
     #[serde(default)]
     default: bool,
+    /// 非默认但默认启用的附加词库（如五笔扩展库/emoji）
+    #[serde(default)]
+    default_enabled: bool,
+}
+
+impl DictEntry {
+    /// 是否应加载（主词库或默认启用的附加词库）
+    fn is_enabled(&self) -> bool {
+        self.default || self.default_enabled
+    }
 }
 
 impl SchemaFile {
@@ -239,7 +258,28 @@ impl EngineManager {
         };
 
         if schema.is_pinyin() {
-            Some(Box::new(PinyinEngine::new(PinyinConfig::default(), dict)))
+            // 加载 unigram 语言模型（长句 Viterbi 打分），失败则回退词典权重
+            let unigram: Option<std::sync::Arc<dyn crate::pinyin::lm::UnigramLookup>> =
+                if !schema.learning.unigram_path.is_empty() {
+                    let ug_path = schemas.join(&schema.learning.unigram_path);
+                    match crate::pinyin::lm::UnigramModel::load(&ug_path) {
+                        Ok(m) => {
+                            info!("Loaded unigram model: {} ({} words)", ug_path.display(), m.size());
+                            Some(std::sync::Arc::new(m))
+                        }
+                        Err(e) => {
+                            warn!("Failed to load unigram {}: {}", ug_path.display(), e);
+                            None
+                        }
+                    }
+                } else {
+                    None
+                };
+            Some(Box::new(PinyinEngine::with_unigram(
+                PinyinConfig::default(),
+                dict,
+                unigram,
+            )))
         } else {
             let mcl = if schema.engine.codetable.max_code_length > 0 {
                 schema.engine.codetable.max_code_length
@@ -250,44 +290,168 @@ impl EngineManager {
         }
     }
 
-    /// 加载 schema 的默认词典
+    /// 加载 schema 的词典：合并所有 enabled 词库（主词库 + default_enabled 附加库）。
+    ///
+    /// - 拼音（rime_pinyin）：单库经 import_tables 合并（load_rime_pinyin_dict）。
+    /// - 码表（rime_codetable）：主库 + 扩展库/emoji 等多库合并到 .combined.wdb。
     fn load_dictionary(schema: &SchemaFile, schemas_dir: &Path) -> Option<CachedDict> {
-        let entry = schema
+        // 收集 enabled 词库（保持 schema 顺序：主库在前，扩展库在后）
+        let mut enabled: Vec<&DictEntry> = schema
             .dictionaries
             .iter()
-            .find(|d| d.default)
-            .or_else(|| schema.dictionaries.first())?;
-        if entry.path.is_empty() {
-            warn!("Default dictionary has empty path");
+            .filter(|d| d.is_enabled() && !d.path.is_empty())
+            .collect();
+        if enabled.is_empty() {
+            enabled = schema
+                .dictionaries
+                .iter()
+                .filter(|d| !d.path.is_empty())
+                .take(1)
+                .collect();
+        }
+        if enabled.is_empty() {
+            warn!("No usable dictionary in schema");
             return None;
         }
-        let dict_type = if entry.dict_type.is_empty() {
-            "rime_codetable"
-        } else {
-            entry.dict_type.as_str()
-        };
-        let full_path = schemas_dir.join(&entry.path);
-        info!("Loading dictionary: {} (type={})", full_path.display(), dict_type);
 
-        match dict_type {
-            "rime_pinyin" => Self::load_rime_pinyin_dict(&full_path),
-            _ => match CachedDict::load(&full_path) {
-                Ok(dict) => {
-                    info!("Dictionary loaded: {} entries", dict.len());
-                    Some(dict)
+        let dtype = |e: &DictEntry| {
+            if e.dict_type.is_empty() {
+                "rime_codetable".to_string()
+            } else {
+                e.dict_type.clone()
+            }
+        };
+
+        // 单库快路径
+        if enabled.len() == 1 {
+            let e = enabled[0];
+            let full = schemas_dir.join(&e.path);
+            info!("Loading dictionary: {} (type={})", full.display(), dtype(e));
+            return if dtype(e) == "rime_pinyin" {
+                Self::load_rime_pinyin_dict(&full)
+            } else {
+                match CachedDict::load(&full) {
+                    Ok(d) => {
+                        info!("Dictionary loaded: {} entries", d.len());
+                        Some(d)
+                    }
+                    Err(err) => {
+                        warn!("Failed to load dictionary: {}", err);
+                        None
+                    }
+                }
+            };
+        }
+
+        // 多库：合并到 combined.wdb（缓存键 = 主词库路径 + .combined.wdb）
+        let sources: Vec<(std::path::PathBuf, String)> = enabled
+            .iter()
+            .map(|e| (schemas_dir.join(&e.path), dtype(e)))
+            .collect();
+        let combined = sources[0].0.with_extension("combined.wdb");
+        Self::load_merged_dicts(&sources, &combined)
+    }
+
+    /// 把多个词库合并到一个 combined.wdb（按 code 聚合），并 mmap 打开。
+    /// 每个源按其 dict_type 加载：rime_pinyin 先经 import_tables 展开。
+    /// 缓存有效性：combined 比所有源都新则直接复用。
+    fn load_merged_dicts(sources: &[(std::path::PathBuf, String)], combined: &Path) -> Option<CachedDict> {
+        let paths: Vec<&Path> = sources.iter().map(|(p, _)| p.as_path()).collect();
+        if Self::combined_cache_fresh(&paths, combined) {
+            if let Ok(reader) = wind_dict::binformat::DictReader::open(combined) {
+                info!(
+                    "Using combined cache: {} ({} keys)",
+                    combined.display(),
+                    reader.key_count()
+                );
+                return Some(CachedDict::Mmap(reader));
+            }
+        }
+
+        // 按 code 聚合所有源词库条目（前面的库优先级更高，先加入；同 text 取更高权重）
+        let mut agg: HashMap<String, Vec<(String, i32)>> = HashMap::new();
+        let mut total = 0usize;
+        for (p, dict_type) in sources {
+            // rime_pinyin 需经 import_tables 展开，否则只读到主文件元数据
+            let loaded = if dict_type == "rime_pinyin" {
+                Self::load_rime_pinyin_dict(p)
+            } else {
+                CachedDict::load(p).ok()
+            };
+            match loaded {
+                Some(d) => {
+                    let n = d.len();
+                    info!("  Merging {} entries from {}", n, p.display());
+                    for (code, text, weight, _order) in d.search_prefix("", 5_000_000) {
+                        let e = agg.entry(code).or_default();
+                        if let Some(slot) = e.iter_mut().find(|(t, _)| t == &text) {
+                            if weight > slot.1 {
+                                slot.1 = weight; // 继承后续库中同词更高权重（对齐 Go composite）
+                            }
+                        } else {
+                            e.push((text, weight));
+                        }
+                    }
+                    total += n;
+                }
+                None => warn!("  Failed to load {}", p.display()),
+            }
+        }
+        if total == 0 {
+            return None;
+        }
+
+        let mut writer = wind_dict::binformat::DictWriter::new();
+        for (code, mut entries) in agg {
+            entries.sort_by(|a, b| b.1.cmp(&a.1));
+            writer.add(code, entries);
+        }
+        match writer.write(combined) {
+            Ok(_) => match wind_dict::binformat::DictReader::open(combined) {
+                Ok(reader) => {
+                    info!(
+                        "Wrote combined cache: {} ({} keys from {} dicts)",
+                        combined.display(),
+                        reader.key_count(),
+                        sources.len()
+                    );
+                    Some(CachedDict::Mmap(reader))
                 }
                 Err(e) => {
-                    warn!("Failed to load dictionary: {}", e);
+                    warn!("Failed to open combined cache: {}", e);
                     None
                 }
             },
+            Err(e) => {
+                warn!("Failed to write combined cache: {}", e);
+                None
+            }
         }
+    }
+
+    /// combined.wdb 是否比所有源文件新（源文件缺失/不可访问视为缓存失效）
+    fn combined_cache_fresh(paths: &[&Path], combined: &Path) -> bool {
+        let Ok(cmb_meta) = std::fs::metadata(combined) else {
+            return false;
+        };
+        let Ok(cmb_mtime) = cmb_meta.modified() else {
+            return false;
+        };
+        for p in paths {
+            match std::fs::metadata(p).and_then(|m| m.modified()) {
+                Ok(src_mtime) if src_mtime <= cmb_mtime => {}
+                _ => return false, // 源比缓存新、或源不可访问 → 强制重建
+            }
+        }
+        true
     }
 
     /// 加载 rime_pinyin 词典（合并 import_tables 子词典到 .merged.wdb）
     fn load_rime_pinyin_dict(dict_path: &Path) -> Option<CachedDict> {
         let merged_wdb = dict_path.with_extension("merged.wdb");
-        if merged_wdb.exists() {
+        // 仅当 merged 比主词库文件新时复用（主库更新后强制重建；子库通常随主库一同更新）
+        let merged_fresh = Self::combined_cache_fresh(&[dict_path], &merged_wdb);
+        if merged_wdb.exists() && merged_fresh {
             match wind_dict::binformat::DictReader::open(&merged_wdb) {
                 Ok(reader) => {
                     info!(
@@ -302,6 +466,9 @@ impl EngineManager {
                     let _ = std::fs::remove_file(&merged_wdb);
                 }
             }
+        } else if merged_wdb.exists() {
+            info!("merged cache stale (source newer), regenerating: {}", merged_wdb.display());
+            let _ = std::fs::remove_file(&merged_wdb);
         }
 
         let content = std::fs::read_to_string(dict_path).ok()?;

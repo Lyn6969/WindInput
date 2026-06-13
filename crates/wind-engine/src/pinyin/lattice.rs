@@ -6,7 +6,69 @@
 use crate::pinyin::dag::Dag;
 use crate::pinyin::syllable::SyllableTrie;
 use crate::pinyin::fuzzy::{FuzzyConfig, FuzzyMatcher};
+use crate::pinyin::lm::UnigramLookup;
 use wind_dict::cached::CachedDict;
+
+/// 虚词集合（单字时轻微惩罚，对齐 Go functionWords）
+fn is_function_word(w: &str) -> bool {
+    matches!(
+        w,
+        "了" | "的" | "地" | "得" | "着" | "过"
+            | "我" | "你" | "他" | "她" | "它" | "们" | "这" | "那"
+            | "和" | "与" | "在" | "把" | "被" | "让" | "从" | "到" | "对" | "向" | "跟"
+            | "不" | "没" | "也" | "都" | "就" | "才" | "还" | "又" | "再" | "很" | "太" | "最"
+            | "是" | "有" | "会" | "能" | "要" | "可" | "去" | "来" | "做" | "说" | "看" | "想"
+    )
+}
+
+/// V+助词尾字（多字词以此结尾时降权，对齐 Go particleSuffixes）
+fn is_particle_suffix(c: char) -> bool {
+    matches!(c, '了' | '的' | '着' | '过' | '得' | '地')
+}
+
+/// 节点对数概率打分（对齐 Go lattice calcLogProb + 惩罚/加成）。
+/// 无 unigram 时回退到归一化词典权重。
+fn score_node(word: &str, weight: i32, unigram: Option<&dyn UnigramLookup>) -> f64 {
+    const SINGLE_CHAR_PENALTY: f64 = -3.0;
+    const FUNCTION_WORD_BONUS: f64 = 2.0; // 虚词加成（Go 原名 functionWordPenalty，值为正）
+    const VERB_PARTICLE_PENALTY: f64 = -1.0;
+    const BASE_CONTENT_WORD_BONUS: f64 = 3.0;
+    const CHAR_BASED_PENALTY: f64 = -2.0; // 多字 OOV 用字符平均估算时的惩罚（对齐 Go）
+    const LOG_PROB_MIN: f64 = -15.0;
+    const LOG_PROB_RANGE: f64 = 12.0;
+
+    let chars: Vec<char> = word.chars().collect();
+    let char_count = chars.len();
+
+    let Some(ug) = unigram else {
+        // 无 unigram：用词典权重归一化（与 Go calcLogProb 的 nil 分支一致）
+        return weight as f64 / 100_000.0;
+    };
+
+    // 基础 logProb：单字或在 unigram 中的词直接取；多字 OOV 用字符平均 + 惩罚，
+    // 避免高频字组合（如"接了"）虚高碾压有真实词频的词（如"和解"）。
+    let mut log_prob = if char_count <= 1 || ug.contains(word) {
+        ug.log_prob(word)
+    } else {
+        ug.char_based_score(word) + CHAR_BASED_PENALTY
+    };
+
+    if char_count == 1 {
+        if is_function_word(word) {
+            log_prob += FUNCTION_WORD_BONUS;
+        } else {
+            log_prob += SINGLE_CHAR_PENALTY;
+        }
+    } else if char_count > 1 {
+        if chars.last().map(|c| is_particle_suffix(*c)).unwrap_or(false) {
+            log_prob += VERB_PARTICLE_PENALTY;
+        } else if ug.contains(word) {
+            let freq_factor = ((log_prob - LOG_PROB_MIN) / LOG_PROB_RANGE).clamp(0.0, 1.0);
+            log_prob += BASE_CONTENT_WORD_BONUS * (char_count as f64).sqrt() * freq_factor;
+        }
+    }
+    log_prob
+}
 
 /// 格子节点
 #[derive(Debug, Clone)]
@@ -22,19 +84,11 @@ pub struct LatticeNode {
 pub struct LatticeBuilder {
     /// 最大词长（音节数）
     max_word_len: usize,
-    /// 单字惩罚
-    single_char_penalty: f64,
-    /// 功能词奖励
-    function_word_bonus: f64,
 }
 
 impl LatticeBuilder {
     pub fn new() -> Self {
-        Self {
-            max_word_len: 6,
-            single_char_penalty: -3.0,
-            function_word_bonus: 2.0,
-        }
+        Self { max_word_len: 6 }
     }
 
     /// 构建格子
@@ -47,6 +101,7 @@ impl LatticeBuilder {
         trie: &SyllableTrie,
         dict: &CachedDict,
         fuzzy_config: Option<&FuzzyConfig>,
+        unigram: Option<&dyn UnigramLookup>,
     ) -> Vec<Vec<LatticeNode>> {
         let dag = Dag::build(input, trie);
         let syllables = dag.maximum_match();
@@ -68,7 +123,7 @@ impl LatticeBuilder {
                 // 查找词典
                 let results = dict.search(&code);
                 for (text, weight, _order) in &results {
-                    let log_prob = self.word_log_prob(text, *weight);
+                    let log_prob = score_node(text, *weight, unigram);
                     nodes[char_end].push(LatticeNode {
                         start: char_start,
                         end: char_end,
@@ -86,7 +141,7 @@ impl LatticeBuilder {
                         for (text, weight, _order) in &variant_results {
                             // 去重
                             if !nodes[char_end].iter().any(|n| n.word == *text && n.start == char_start) {
-                                let log_prob = self.word_log_prob(text, *weight) - 0.5; // 模糊匹配轻微惩罚
+                                let log_prob = score_node(text, *weight, unigram) - 0.5; // 模糊匹配轻微惩罚
                                 nodes[char_end].push(LatticeNode {
                                     start: char_start,
                                     end: char_end,
@@ -103,33 +158,4 @@ impl LatticeBuilder {
 
         nodes
     }
-
-    /// 计算词的对数概率
-    fn word_log_prob(&self, word: &str, dict_weight: i32) -> f64 {
-        let char_count = word.chars().count();
-        let base_prob = (dict_weight as f64 + 1.0).ln();
-
-        if char_count == 1 {
-            if is_function_word(word) {
-                base_prob + self.function_word_bonus
-            } else {
-                base_prob + self.single_char_penalty
-            }
-        } else {
-            base_prob + 3.0 * (char_count as f64).sqrt()
-        }
-    }
-}
-
-/// 是否为功能词
-fn is_function_word(word: &str) -> bool {
-    matches!(
-        word,
-        "的" | "了" | "在" | "是" | "我" | "你" | "他" | "她" | "它"
-            | "们" | "这" | "那" | "有" | "不" | "人" | "大" | "一"
-            | "和" | "就" | "都" | "而" | "及" | "与" | "或" | "但"
-            | "把" | "被" | "让" | "给" | "从" | "向" | "对" | "以"
-            | "也" | "还" | "又" | "再" | "很" | "太" | "最" | "更"
-            | "没" | "无" | "非" | "未" | "别" | "莫" | "勿" | "休"
-    )
 }

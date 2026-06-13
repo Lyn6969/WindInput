@@ -28,19 +28,14 @@ struct DpEntry {
 }
 
 /// Viterbi 解码器
-pub struct ViterbiDecoder {
-    /// 单字惩罚（负值 = 惩罚）
-    single_char_penalty: f64,
-    /// 功能词奖励
-    function_word_bonus: f64,
-}
+///
+/// 节点权重（含单字惩罚/虚词加成/实体词加成）在 lattice 构建阶段由 `score_node`
+/// 计算并写入 `WordNode.log_prob`，解码器只做最优路径 DP。
+pub struct ViterbiDecoder {}
 
 impl ViterbiDecoder {
     pub fn new() -> Self {
-        Self {
-            single_char_penalty: -3.0,
-            function_word_bonus: 2.0,
-        }
+        Self {}
     }
 
     /// Viterbi 解码：找到最优词序列
@@ -118,24 +113,6 @@ impl ViterbiDecoder {
             log_prob: dp[input_len].log_prob,
         }
     }
-
-    /// 计算词的对数概率（考虑长度惩罚）
-    pub fn word_log_prob(&self, word: &str, dict_weight: i32) -> f64 {
-        let char_count = word.chars().count();
-        let base_prob = (dict_weight as f64 + 1.0).ln();
-
-        if char_count == 1 {
-            // 单字：检查是否为功能词
-            if is_function_word(word) {
-                base_prob + self.function_word_bonus
-            } else {
-                base_prob + self.single_char_penalty
-            }
-        } else {
-            // 多字词：奖励
-            base_prob + 3.0 * (char_count as f64).sqrt()
-        }
-    }
 }
 
 #[cfg(test)]
@@ -173,17 +150,4 @@ mod tests {
         let result = decoder.decode(&nodes, input_len);
         assert_eq!(result.words, vec!["你".to_string(), "好".to_string()]);
     }
-}
-
-/// 是否为功能词（代词、助词、介词等）
-fn is_function_word(word: &str) -> bool {
-    matches!(
-        word,
-        "的" | "了" | "在" | "是" | "我" | "你" | "他" | "她" | "它"
-            | "们" | "这" | "那" | "有" | "不" | "人" | "大" | "一"
-            | "和" | "就" | "都" | "而" | "及" | "与" | "或" | "但"
-            | "把" | "被" | "让" | "给" | "从" | "向" | "对" | "以"
-            | "也" | "还" | "又" | "再" | "很" | "太" | "最" | "更"
-            | "没" | "无" | "非" | "未" | "别" | "莫" | "勿" | "休"
-    )
 }
