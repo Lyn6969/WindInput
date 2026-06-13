@@ -317,6 +317,30 @@ impl Coordinator {
         self.push_server.push_to_active(&encoded);
     }
 
+    /// 在当前光标上方显示状态提示气泡（中英/标点/全半角/方案切换）
+    fn show_tip(&self, text: &str) {
+        let (x, y) = {
+            let s = self.state.lock().unwrap_or_else(|e| e.into_inner());
+            (s.caret_x, s.caret_y)
+        };
+        let _ = self.ui_tx.send(UiCommand::ShowStatusTip {
+            text: text.to_string(),
+            x,
+            y,
+        });
+    }
+
+    /// 方案显示名（友好名优先，未知回退 id）
+    fn schema_display_name(id: &str) -> String {
+        match id {
+            "wubi86" => "五笔".to_string(),
+            "pinyin" => "拼音".to_string(),
+            "shuangpin" => "双拼".to_string(),
+            "wubi86_pinyin" => "五笔拼音".to_string(),
+            other => other.to_string(),
+        }
+    }
+
     /// 切换方案：清空输入并推送状态
     fn switch_schema(&self, schema_id: &str) {
         if self.engine_mgr.switch_schema(schema_id) {
@@ -334,9 +358,11 @@ impl Coordinator {
             let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
             state.input_buffer.clear();
             state.candidates.clear();
+            state.preedit.clear();
             drop(state);
             self.notify_ui_hide();
             self.push_state_update();
+            self.show_tip(&Self::schema_display_name(&next));
             info!("Cycled to schema: {}", next);
         }
     }
@@ -362,19 +388,23 @@ impl Coordinator {
                 true
             }
             "toggle_full_width" => {
-                {
+                let full = {
                     let mut s = self.state.lock().unwrap_or_else(|e| e.into_inner());
                     s.full_width = !s.full_width;
-                }
+                    s.full_width
+                };
                 self.push_state_update();
+                self.show_tip(if full { "全角" } else { "半角" });
                 true
             }
             "toggle_punct" => {
-                {
+                let cn = {
                     let mut s = self.state.lock().unwrap_or_else(|e| e.into_inner());
                     s.chinese_punct = !s.chinese_punct;
-                }
+                    s.chinese_punct
+                };
                 self.push_state_update();
+                self.show_tip(if cn { "中文标点" } else { "英文标点" });
                 true
             }
             _ => {
@@ -633,6 +663,7 @@ impl MessageHandler for Coordinator {
     fn handle_toggle_mode(&self) -> (Option<StatusUpdateData>, String) {
         let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
         state.chinese_mode = !state.chinese_mode;
+        let chinese = state.chinese_mode;
         let commit_text = if !state.input_buffer.is_empty() && !state.chinese_mode {
             let t = state.input_buffer.clone();
             state.input_buffer.clear();
@@ -646,6 +677,7 @@ impl MessageHandler for Coordinator {
         drop(state);
         self.punct.lock().unwrap_or_else(|e| e.into_inner()).reset();
         self.push_state_update();
+        self.show_tip(if chinese { "中" } else { "英" });
         (Some(self.build_status()), commit_text)
     }
 

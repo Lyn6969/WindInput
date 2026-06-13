@@ -7,6 +7,7 @@ pub mod manager;
 pub mod popup_menu;
 pub mod renderer;
 pub mod status;
+pub mod status_tip;
 pub mod text;
 pub mod toast;
 pub mod toolbar;

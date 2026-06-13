@@ -22,6 +22,8 @@ pub enum UiCommand {
     },
     /// 隐藏候选窗口
     HideCandidates,
+    /// 显示状态提示气泡（中英/标点/全半角/方案切换），约 1 秒后自动隐藏
+    ShowStatusTip { text: String, x: i32, y: i32 },
     /// 关闭 UI
     Shutdown,
 }
@@ -67,8 +69,27 @@ impl UiManager {
             }
         };
 
+        // 状态提示气泡（best-effort，失败不影响候选窗口）
+        let mut status_tip = match crate::status_tip::StatusTip::new() {
+            Ok(t) => Some(t),
+            Err(e) => {
+                error!("Failed to create status tip: {}", e);
+                None
+            }
+        };
+        let mut tip_hide_at: Option<std::time::Instant> = None;
+
         // Win32 消息循环 + 通道接收
         loop {
+            // 状态提示气泡到期自动隐藏
+            if let Some(deadline) = tip_hide_at {
+                if std::time::Instant::now() >= deadline {
+                    if let Some(t) = &status_tip {
+                        t.hide();
+                    }
+                    tip_hide_at = None;
+                }
+            }
             // 非阻塞处理 Win32 消息
             let mut msg = MSG::default();
             unsafe {
@@ -104,9 +125,22 @@ impl UiManager {
                             debug!("UI: HideCandidates");
                             candidate_window.hide();
                         }
+                        UiCommand::ShowStatusTip { text, x, y } => {
+                            debug!("UI: ShowStatusTip '{}' at ({},{})", text, x, y);
+                            if let Some(t) = &mut status_tip {
+                                t.show(&text, x, y);
+                                tip_hide_at = Some(
+                                    std::time::Instant::now()
+                                        + std::time::Duration::from_millis(1000),
+                                );
+                            }
+                        }
                         UiCommand::Shutdown => {
                             info!("UI: Shutdown");
                             candidate_window.hide();
+                            if let Some(t) = &status_tip {
+                                t.hide();
+                            }
                             break;
                         }
                     }
