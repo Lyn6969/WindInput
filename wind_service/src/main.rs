@@ -5,11 +5,10 @@
 
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
-mod bridge_impl;
-
 use std::sync::Arc;
 use tracing::{error, info};
 use tracing_subscriber::EnvFilter;
+use tracing_subscriber::prelude::*;
 
 use wind_bridge::deferred::DeferredHandler;
 use wind_bridge::push::{PushConfig, PushServer};
@@ -90,8 +89,8 @@ fn main() {
         }
     });
 
-    // 8. 创建最小协调器（传入 PushServer 用于激活状态推送）
-    let coordinator = bridge_impl::MinimalCoordinator::new(push_server.clone());
+    // 8. 创建中央协调器（传入 PushServer 用于激活状态推送）
+    let coordinator = wind_coordinator::Coordinator::new(push_server.clone());
     deferred.set_ready(coordinator);
 
     info!(
@@ -109,11 +108,39 @@ fn main() {
 fn init_logger() {
     let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
 
-    tracing_subscriber::fmt()
-        .with_env_filter(filter)
+    // 日志输出到可执行文件同目录的 logs/ 子目录
+    let log_dir = std::env::current_exe()
+        .ok()
+        .and_then(|p| p.parent().map(|d| d.join("logs")))
+        .unwrap_or_else(|| std::path::PathBuf::from("logs"));
+
+    let file_appender = tracing_appender::rolling::daily(&log_dir, "wind_input.log");
+    let (file_writer, _guard) = tracing_appender::non_blocking(file_appender);
+
+    // 控制台输出
+    let console_layer = tracing_subscriber::fmt::layer()
         .with_target(true)
         .with_thread_ids(true)
+        .with_filter(filter);
+
+    // 文件输出（debug 级别，记录更多细节）
+    let file_layer = tracing_subscriber::fmt::layer()
+        .with_writer(file_writer)
+        .with_target(true)
+        .with_thread_ids(true)
+        .with_ansi(false)
+        .with_filter(EnvFilter::new("debug"));
+
+    tracing_subscriber::registry()
+        .with(console_layer)
+        .with(file_layer)
         .init();
+
+    // 保持 _guard 存活（non_blocking writer 的 flush guard）
+    // 使用 Box::leak 让 guard 在进程生命周期内不被释放
+    Box::leak(Box::new(_guard));
+
+    info!("Log directory: {}", log_dir.display());
 }
 
 /// 单例检查：通过 Windows Named Mutex 确保只有一个实例运行

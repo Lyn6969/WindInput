@@ -18,3 +18,8 @@ wind-cmdbar = { path = "../wind-cmdbar" }
 tokio = { workspace = true }
 tracing = { workspace = true }
 anyhow = { workspace = true }
+
+[dev-dependencies]
+wind-config = { path = "../wind-config" }
+wind-bridge = { path = "../wind-bridge" }
+wind-ipc = { path = "../wind-ipc" }

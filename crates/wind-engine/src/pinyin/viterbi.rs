@@ -69,11 +69,14 @@ impl ViterbiDecoder {
         dp[0].log_prob = 0.0;
 
         // 前向 DP
+        // nodes[end_pos] = 所有在字节位置 end_pos 结束的词（与 LatticeBuilder::build 的
+        // 存储约定一致：node 存入 nodes[char_end]）。此前误读 nodes[end_pos-1] 导致
+        // 整段 Viterbi 长句解码恒为空（差一 bug）。
         for end_pos in 1..=input_len {
-            if end_pos > nodes.len() {
+            if end_pos >= nodes.len() {
                 continue;
             }
-            for node in &nodes[end_pos - 1] {
+            for node in &nodes[end_pos] {
                 let start_pos = node.start;
                 if dp[start_pos].log_prob == f64::NEG_INFINITY {
                     continue;
@@ -132,6 +135,43 @@ impl ViterbiDecoder {
             // 多字词：奖励
             base_prob + 3.0 * (char_count as f64).sqrt()
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 锁定 nodes[end_pos] 的索引约定（C1 差一回归）。
+    /// 输入 "nihao"（5 字节），节点在 char_end=5 结束。若 decode 误读
+    /// nodes[end_pos-1]，则永远取不到结束于 5 的节点，words 为空。
+    #[test]
+    fn test_decode_index_convention() {
+        let input_len = 5usize; // "nihao"
+        let mut nodes: Vec<Vec<WordNode>> = vec![Vec::new(); input_len + 1];
+        // 单个双字词 "你好" 覆盖 [0,5]，结束于位置 5
+        nodes[5].push(WordNode {
+            start: 0,
+            end: 5,
+            word: "你好".to_string(),
+            log_prob: 10.0,
+        });
+        let decoder = ViterbiDecoder::new();
+        let result = decoder.decode(&nodes, input_len);
+        assert_eq!(result.words, vec!["你好".to_string()], "应解码出 你好");
+        assert!(result.log_prob.is_finite());
+    }
+
+    /// 两段路径：ni(0..2) + hao(2..5)，验证多节点拼接。
+    #[test]
+    fn test_decode_two_segments() {
+        let input_len = 5usize;
+        let mut nodes: Vec<Vec<WordNode>> = vec![Vec::new(); input_len + 1];
+        nodes[2].push(WordNode { start: 0, end: 2, word: "你".to_string(), log_prob: 3.0 });
+        nodes[5].push(WordNode { start: 2, end: 5, word: "好".to_string(), log_prob: 3.0 });
+        let decoder = ViterbiDecoder::new();
+        let result = decoder.decode(&nodes, input_len);
+        assert_eq!(result.words, vec!["你".to_string(), "好".to_string()]);
     }
 }
 

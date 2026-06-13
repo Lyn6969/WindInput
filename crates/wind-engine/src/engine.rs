@@ -13,13 +13,24 @@ pub enum EngineType {
 }
 
 /// 引擎转换结果
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct ConvertResult {
+    /// 候选列表（已按引擎内部权重排序，未应用运行时词频 boost）
     pub candidates: Vec<Candidate>,
+    /// 预编辑显示文本（拼音：含音节分隔；码表：原始编码）
     pub preedit_display: String,
+    /// 已完成音节（拼音 UI 高亮用）
     pub completed_syllables: Vec<String>,
+    /// 末尾未完成音节（拼音）
     pub partial_syllable: String,
+    /// 是否存在未完成音节
     pub has_partial: bool,
+    /// 是否应自动上屏（码表满码等）
+    pub should_commit: bool,
+    /// 自动上屏的文本
+    pub commit_text: String,
+    /// 是否为空码（有输入但无候选）
+    pub is_empty: bool,
 }
 
 /// 基础引擎接口

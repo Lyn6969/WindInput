@@ -16,13 +16,10 @@ impl MixedEngine {
 }
 
 impl Engine for MixedEngine {
-    fn convert(&self, input: &str, max_candidates: usize) -> anyhow::Result<ConvertResult> {
+    fn convert(&self, input: &str, _max_candidates: usize) -> anyhow::Result<ConvertResult> {
         Ok(ConvertResult {
-            candidates: Vec::new(),
             preedit_display: input.to_string(),
-            completed_syllables: Vec::new(),
-            partial_syllable: String::new(),
-            has_partial: false,
+            ..Default::default()
         })
     }
 

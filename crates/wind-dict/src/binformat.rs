@@ -111,12 +111,25 @@ impl DictReader {
 
         let version = header.version;
         let key_count = header.key_count;
+        let file_len = mmap.len();
 
         let entry_size = match version {
             3 => 14,
             2 | 1 => 10,
             _ => anyhow::bail!("unsupported wdb version: {}", version),
         };
+
+        // 校验 header 中各段偏移是否在文件范围内
+        let index_off = header.index_off as usize;
+        let index_end = index_off + key_count as usize * DictKeyIndex::SIZE;
+        if index_end > file_len {
+            anyhow::bail!(
+                "wdb index section out of range: index_end={} > file_len={} \
+                 (key_count={}, index_off={}). File may be from an incompatible format",
+                index_end, file_len, key_count, index_off
+            );
+        }
+
         info!("Opened wdb: {} ({} keys, v{})", path.display(), key_count, version);
 
         Ok(Self { mmap, header, entry_size })
@@ -135,6 +148,9 @@ impl DictReader {
 
     fn read_key_index(&self, i: u32) -> Option<DictKeyIndex> {
         let offset = self.header.index_off as usize + (i as usize) * DictKeyIndex::SIZE;
+        if offset + DictKeyIndex::SIZE > self.data().len() {
+            return None;
+        }
         DictKeyIndex::from_bytes(&self.data()[offset..])
     }
 
@@ -321,6 +337,9 @@ impl DictWriter {
         file.write_all(&header.meta_off.to_le_bytes())?;
 
         // KeyIndex + EntryRecords（交错写入）
+        // entry_off 是 EntryRecords 区内的【字节偏移】（= 累计条目数 × entry_size），
+        // 与 Go binformat writer.go (`off := len(entryRecords) * DictEntryRecordSize`)
+        // 及本文件 read_entry 的 `data_off + entry_off + idx*entry_size` 读取逻辑对齐。
         let mut entry_offset = 0u32;
         for (code, entries) in &sorted_keys {
             let code_off = string_offsets[code];
@@ -332,7 +351,7 @@ impl DictWriter {
             file.write_all(&entry_offset.to_le_bytes())?;
             file.write_all(&(entries.len() as u16).to_le_bytes())?;
 
-            entry_offset += entries.len() as u32;
+            entry_offset += entries.len() as u32 * entry_size as u32;
         }
 
         // EntryRecords
@@ -356,5 +375,57 @@ impl DictWriter {
             sorted_keys.len(), total_entries, string_pool.len());
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 往返测试：写入多 key、每个 key 多条目，确保【非首 key】也能读对。
+    /// 这是 entry_off 字节偏移语义的回归保护——历史 bug 是写入器把 entry_off
+    /// 写成了累计条目数（count）而非字节偏移（count × entry_size），导致除首
+    /// key 外的所有词条读到错误位置（text 为空/乱码），五笔与拼音候选全废。
+    #[test]
+    fn test_writer_reader_roundtrip_multi_key() {
+        let tmp = std::env::temp_dir().join("wind_dict_roundtrip_test.wdb");
+
+        let mut writer = DictWriter::new();
+        // 故意让第一个 key 有 2 条，使后续 key 的 entry_off > 0（暴露 off-by-size bug）
+        writer.add("a".to_string(), vec![("工".to_string(), 9999), ("戈".to_string(), 100)]);
+        writer.add("ni".to_string(), vec![("你".to_string(), 800), ("尼".to_string(), 50)]);
+        writer.add("nihao".to_string(), vec![("你好".to_string(), 1200)]);
+        writer.add("zhongguo".to_string(), vec![("中国".to_string(), 2000)]);
+        writer.write(&tmp).expect("write wdb");
+
+        let reader = DictReader::open(&tmp).expect("open wdb");
+        assert_eq!(reader.key_count(), 4);
+
+        // 首 key（entry_off=0）
+        let a = reader.search("a");
+        assert_eq!(a.len(), 2);
+        assert!(a.iter().any(|e| e.text == "工" && e.weight == 9999));
+
+        // 非首 key（entry_off > 0）——历史 bug 在此读到乱码
+        let nihao = reader.search("nihao");
+        assert_eq!(nihao.len(), 1, "nihao 应有 1 条候选");
+        assert_eq!(nihao[0].text, "你好");
+        assert_eq!(nihao[0].weight, 1200);
+
+        let ni = reader.search("ni");
+        assert_eq!(ni.len(), 2);
+        assert!(ni.iter().any(|e| e.text == "你" && e.weight == 800));
+        assert!(ni.iter().any(|e| e.text == "尼"));
+
+        let zg = reader.search("zhongguo");
+        assert_eq!(zg.len(), 1);
+        assert_eq!(zg[0].text, "中国");
+
+        // 前缀查找：ni 前缀应命中 ni / nihao
+        let prefix = reader.search_prefix("ni", 10);
+        assert!(prefix.iter().any(|e| e.text == "你好"));
+        assert!(prefix.iter().any(|e| e.text == "你"));
+
+        let _ = std::fs::remove_file(&tmp);
     }
 }

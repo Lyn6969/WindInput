@@ -129,9 +129,17 @@ function Copy-TsfDll {
 function Copy-Data {
     param([string]$OutDir = $BuildDir)
 
-    $goData = "$GoRepoRoot\WindInput\data"
+    # 注意：必须用 Go 仓库的 build_debug\data（构建产物，含已下载的 rime 词典 +
+    # .schema.toml），而非 WindInput\data（源目录，不含 .dict.yaml 词典文件）。
+    # 否则部署后词典缺失，引擎无法构建，只能显示编码无候选。
+    $goData = "$GoRepoRoot\WindInput\build_debug\data"
+    if (-not (Test-Path "$goData\schemas\wubi86\wubi86_jidian.dict.yaml")) {
+        # 回退：若 build_debug 未构建，退回源目录（仅 schema，无词典）
+        Write-Host "警告: $goData 缺少词典，回退到源目录(无词典)" -ForegroundColor Yellow
+        $goData = "$GoRepoRoot\WindInput\data"
+    }
 
-    Write-Host "`n从 Go 仓库复制 data/..." -ForegroundColor Green
+    Write-Host "`n从 Go 仓库复制 data/ ($goData)..." -ForegroundColor Green
 
     if (Test-Path $goData) {
         New-Item -ItemType Directory -Path $OutDir -Force | Out-Null

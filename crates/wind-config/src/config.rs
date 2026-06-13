@@ -86,6 +86,10 @@ pub struct HotkeysConfig {
     #[serde(default)]
     pub activate_ime: String,
     #[serde(default)]
+    pub pin_candidate: String,
+    #[serde(default)]
+    pub delete_candidate: String,
+    #[serde(default)]
     pub global_hotkeys: Vec<String>,
 }
 
@@ -350,17 +354,46 @@ impl Config {
 
         if let Some(hotkeys) = partial.get("hotkeys") {
             let h: HotkeysConfig = hotkeys.clone().try_into().unwrap_or_default();
+            // 合并所有热键字段：仅当该 key 出现在文件中才覆盖（否则保留下层值）。
+            // 此前只合并了 4 个字段，导致 switch_engine 等被丢弃 → Ctrl+Shift+E 等热键失效。
             if hotkeys.get("toggle_mode_keys").is_some() {
                 self.hotkeys.toggle_mode_keys = h.toggle_mode_keys;
             }
             if hotkeys.get("commit_on_switch").is_some() {
                 self.hotkeys.commit_on_switch = h.commit_on_switch;
             }
+            if hotkeys.get("switch_engine").is_some() {
+                self.hotkeys.switch_engine = h.switch_engine;
+            }
             if hotkeys.get("toggle_full_width").is_some() {
                 self.hotkeys.toggle_full_width = h.toggle_full_width;
             }
             if hotkeys.get("toggle_punct").is_some() {
                 self.hotkeys.toggle_punct = h.toggle_punct;
+            }
+            if hotkeys.get("toggle_toolbar").is_some() {
+                self.hotkeys.toggle_toolbar = h.toggle_toolbar;
+            }
+            if hotkeys.get("open_settings").is_some() {
+                self.hotkeys.open_settings = h.open_settings;
+            }
+            if hotkeys.get("add_word").is_some() {
+                self.hotkeys.add_word = h.add_word;
+            }
+            if hotkeys.get("toggle_s2t").is_some() {
+                self.hotkeys.toggle_s2t = h.toggle_s2t;
+            }
+            if hotkeys.get("activate_ime").is_some() {
+                self.hotkeys.activate_ime = h.activate_ime;
+            }
+            if hotkeys.get("pin_candidate").is_some() {
+                self.hotkeys.pin_candidate = h.pin_candidate;
+            }
+            if hotkeys.get("delete_candidate").is_some() {
+                self.hotkeys.delete_candidate = h.delete_candidate;
+            }
+            if hotkeys.get("global_hotkeys").is_some() {
+                self.hotkeys.global_hotkeys = h.global_hotkeys;
             }
         }
 
