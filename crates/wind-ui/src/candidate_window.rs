@@ -176,26 +176,29 @@ impl CandidateWindow {
             item_height
         };
 
-        // 测量最长候选词的实际宽度
-        let mut max_text_width: f32 = 0.0;
+        // 每个候选行宽 = 序号"N." + 间距 + 候选文本；取最宽行
+        let index_width = self.text_renderer.measure_text("9.").width + 8.0;
+        let mut max_row_width: f32 = 0.0;
         for candidate in self.candidates.iter().take(self.config.per_page) {
-            let metrics = self.text_renderer.measure_text(&candidate.text);
-            if metrics.width > max_text_width {
-                max_text_width = metrics.width;
-            }
+            let text_w = self.text_renderer.measure_text(&candidate.text).width;
+            max_row_width = max_row_width.max(index_width + text_w);
         }
 
-        // 测量序号宽度（如 "1. "）
-        let index_metrics = self.text_renderer.measure_text("1.");
-        let index_width = index_metrics.width + 8.0; // 序号后留 8px 间距
+        // 关键修复：preedit 行宽也要纳入，否则长 preedit（如 "ni hao zh"）会被裁剪
+        let preedit_width = if self.preedit.is_empty() {
+            0.0
+        } else {
+            self.text_renderer.measure_text(&self.preedit).width
+        };
 
-        let width = (index_width + max_text_width + self.config.padding_x * 2.0).max(100.0);
+        let content_width = max_row_width.max(preedit_width);
+        let width = (content_width + self.config.padding_x * 2.0).max(80.0);
 
         let height = preedit_height
             + num_items as f32 * item_height
             + self.config.padding_y * 2.0;
 
-        (width as u32, height.max(30.0) as u32)
+        (width.ceil() as u32, height.max(30.0).ceil() as u32)
     }
 
     /// 静态渲染函数，避免借用冲突
@@ -253,6 +256,20 @@ impl CandidateWindow {
         if !preedit.is_empty() {
             Self::draw_text_static(buf, w, h, preedit, config.padding_x, cy, text_renderer, config.highlight_color);
             cy += item_height;
+            // preedit 与候选之间的分隔线
+            let sep_y = (cy - config.item_spacing * 0.5) as usize;
+            let sep = config.border_color;
+            if sep_y < h {
+                for dx in 4..w.saturating_sub(4) {
+                    let idx = (sep_y * w + dx) * 4;
+                    if idx + 3 < buf.len() {
+                        buf[idx] = sep[0];
+                        buf[idx + 1] = sep[1];
+                        buf[idx + 2] = sep[2];
+                        buf[idx + 3] = sep[3];
+                    }
+                }
+            }
         }
 
         // 绘制候选列表
