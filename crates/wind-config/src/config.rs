@@ -178,14 +178,29 @@ pub struct CapslockConfig {
     pub cancel_on_mode_switch: bool,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+fn default_per_page() -> usize {
+    7
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UiConfig {
     #[serde(default)]
     pub font_size: f64,
-    #[serde(default)]
+    /// 候选每页显示数（默认 7，对齐 Go 版本）
+    #[serde(default = "default_per_page")]
     pub per_page: usize,
     #[serde(default)]
     pub theme: String,
+}
+
+impl Default for UiConfig {
+    fn default() -> Self {
+        Self {
+            font_size: 0.0,
+            per_page: default_per_page(),
+            theme: String::new(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -420,8 +435,16 @@ impl Config {
             if ui.get("font_size").is_some() {
                 self.ui.font_size = ui.get("font_size").and_then(|v| v.as_float()).unwrap_or(14.0);
             }
-            if ui.get("per_page").is_some() {
-                self.ui.per_page = ui.get("per_page").and_then(|v| v.as_integer()).unwrap_or(5) as usize;
+            // per_page 实际位于 [ui.candidate]（对齐 Go 配置结构），回退兼容 [ui].per_page
+            if let Some(pp) = ui
+                .get("candidate")
+                .and_then(|c| c.get("per_page"))
+                .or_else(|| ui.get("per_page"))
+                .and_then(|v| v.as_integer())
+            {
+                if pp > 0 {
+                    self.ui.per_page = pp as usize;
+                }
             }
             if ui.get("theme").is_some() {
                 self.ui.theme = ui.get("theme").and_then(|v| v.as_str()).unwrap_or("").to_string();
@@ -451,5 +474,45 @@ impl Config {
         } else {
             &self.schema.active
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_default_per_page_is_7() {
+        assert_eq!(Config::default().ui.per_page, 7, "候选每页默认应为 7");
+    }
+
+    #[test]
+    fn test_merge_reads_per_page_from_ui_candidate() {
+        // per_page 位于 [ui.candidate]（对齐 Go 配置结构）
+        let toml = "[ui.candidate]\nper_page = 9\n";
+        let dir = std::env::temp_dir();
+        let path = dir.join("windinput_test_per_page.toml");
+        std::fs::write(&path, toml).unwrap();
+
+        let mut cfg = Config::default();
+        cfg.merge_from_file(&path).unwrap();
+        let _ = std::fs::remove_file(&path);
+
+        assert_eq!(cfg.ui.per_page, 9, "应从 [ui.candidate] 读取 per_page=9");
+    }
+
+    #[test]
+    fn test_merge_per_page_zero_keeps_default() {
+        // per_page=0 视为无效，保留默认值，避免每页只显示 1 个
+        let toml = "[ui.candidate]\nper_page = 0\n";
+        let dir = std::env::temp_dir();
+        let path = dir.join("windinput_test_per_page_zero.toml");
+        std::fs::write(&path, toml).unwrap();
+
+        let mut cfg = Config::default();
+        cfg.merge_from_file(&path).unwrap();
+        let _ = std::fs::remove_file(&path);
+
+        assert_eq!(cfg.ui.per_page, 7, "per_page=0 应保留默认 7");
     }
 }

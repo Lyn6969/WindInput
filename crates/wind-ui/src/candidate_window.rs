@@ -168,15 +168,15 @@ impl CandidateWindow {
 
     /// 计算横向候选布局：返回每个候选的 (显示标签 "N.文本", 起始 x, cell 宽度)。
     /// 静态以便 calculate_size 与 draw 复用，保证两者尺寸一致。
+    /// 注：协调器已按 per_page 切片为单页，此处渲染收到的全部候选。
     fn layout_cells(
         candidates: &[CandidateItem],
-        per_page: usize,
         padding_x: f32,
         renderer: &TextRenderer,
     ) -> (Vec<(String, f32, f32)>, f32) {
         let mut cells = Vec::new();
         let mut x = padding_x;
-        for (i, c) in candidates.iter().take(per_page).enumerate() {
+        for (i, c) in candidates.iter().enumerate() {
             let label = format!("{}.{}", i + 1, c.text);
             let w = renderer.measure_text(&label).width;
             cells.push((label, x, w));
@@ -200,7 +200,6 @@ impl CandidateWindow {
 
         let (_, cand_width) = Self::layout_cells(
             &self.candidates,
-            self.config.per_page,
             self.config.padding_x,
             &self.text_renderer,
         );
@@ -290,8 +289,7 @@ impl CandidateWindow {
         }
 
         // 绘制候选列表（横向：1.你好  2.尼号  3...）
-        let (cells, _) =
-            Self::layout_cells(candidates, config.per_page, config.padding_x, text_renderer);
+        let (cells, _) = Self::layout_cells(candidates, config.padding_x, text_renderer);
         let row_top = cy;
         for (i, (label, cell_x, cell_w)) in cells.iter().enumerate() {
             let is_selected = i == selected;
