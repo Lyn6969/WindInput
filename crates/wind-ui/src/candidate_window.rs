@@ -8,6 +8,7 @@ use std::cell::RefCell;
 use std::rc::Rc;
 use std::sync::mpsc::Sender;
 
+use crate::debounce::Debouncer;
 use crate::manager::{UiEvent, HOVER_PAGE_NEXT as TAG_PAGE_NEXT, HOVER_PAGE_PREV as TAG_PAGE_PREV};
 use crate::text::dwrite::TextRenderer;
 use crate::view::{Align, Edges, Layout, Rect, View};
@@ -106,6 +107,14 @@ pub struct CandidateWindow {
     visible: bool,
     x: i32,
     y: i32,
+    /// 光标高度（上翻定位用）
+    caret_height: i32,
+    /// 当前光标坐标是否有效
+    caret_valid: bool,
+    /// 组合期间锚定位置（首次显示时按光标算定，之后保持不动）；隐藏时清空
+    anchor: Option<(i32, i32)>,
+    /// 锚点是否已按有效坐标锁定（false=临时位置，待有效坐标到达后重锚）
+    anchor_locked: bool,
     text_renderer: TextRenderer,
     /// arrange 后收集的候选命中矩形：(候选页内下标, 矩形)，供鼠标层使用
     hit_rects: Vec<(i32, Rect)>,
@@ -123,6 +132,8 @@ impl CandidateWindow {
             hit_rects: Vec::new(),
             events,
             last_hover: -1,
+            last_cursor: (i32::MIN, i32::MIN),
+            hover_debounce: Debouncer::new(120),
         }));
         window.register_mouse(mouse.clone());
         Ok(Self {
@@ -137,6 +148,10 @@ impl CandidateWindow {
             visible: false,
             x: 0,
             y: 0,
+            caret_height: 0,
+            caret_valid: false,
+            anchor: None,
+            anchor_locked: false,
             text_renderer,
             hit_rects: Vec::new(),
             mouse,
@@ -161,9 +176,11 @@ impl CandidateWindow {
         self.total_pages = total_pages.max(1);
     }
 
-    pub fn set_position(&mut self, x: i32, y: i32) {
+    pub fn set_position(&mut self, x: i32, y: i32, caret_height: i32, caret_valid: bool) {
         self.x = x;
         self.y = y;
+        self.caret_height = caret_height;
+        self.caret_valid = caret_valid;
     }
 
     /// 候选页内命中矩形（绝对坐标，相对窗口左上角）
@@ -212,7 +229,18 @@ impl CandidateWindow {
             tracing::warn!("CandidateWindow update failed: {}", e);
         }
 
-        let (px, py) = Self::clamp_to_work_area(self.x, self.y, width, height);
+        // 位置锚定：组合期间固定——锚点一旦按有效坐标锁定，打字/悬停/翻页刷新都复用，
+        // 避免窗口随光标/刷新漂移。首次连接尚无有效坐标时，锚点为"临时"，
+        // 待有效坐标到达再重锚（避免卡在左上角不恢复）。
+        let keep = self.visible && self.anchor_locked && self.anchor.is_some();
+        let (px, py) = if keep {
+            self.anchor.unwrap()
+        } else {
+            let p = Self::clamp_to_work_area(self.x, self.y, self.caret_height, width, height);
+            self.anchor = Some(p);
+            self.anchor_locked = self.caret_valid; // 仅有效坐标才锁定
+            p
+        };
         self.window.show(px, py);
         self.visible = true;
         self.update_tooltip(px, py);
@@ -250,10 +278,10 @@ impl CandidateWindow {
     /// 将候选窗钳制在光标所在显示器的工作区内：
     /// 默认显示在光标下方（+gap）；下方空间不足则上翻到光标上方；
     /// 左右溢出则贴边。避免窗口跑到屏幕外。
-    fn clamp_to_work_area(caret_x: i32, caret_y: i32, w: u32, h: u32) -> (i32, i32) {
-        let gap = 6;
-        let caret_h = 20; // 光标高度估计（光标下方留白）
-        let (mut x, mut y) = (caret_x, caret_y + caret_h);
+    fn clamp_to_work_area(caret_x: i32, caret_y: i32, caret_h: i32, w: u32, h: u32) -> (i32, i32) {
+        let gap = 2;
+        // caret_y 为光标底端（与 Go 一致）：默认显示在其下方，仅留 gap
+        let (mut x, mut y) = (caret_x, caret_y + gap);
         #[cfg(windows)]
         {
             use windows::Win32::Foundation::POINT;
@@ -270,9 +298,9 @@ impl CandidateWindow {
                 if GetMonitorInfoW(mon, &mut mi).as_bool() {
                     let wa = mi.rcWork;
                     let (wi, hi) = (w as i32, h as i32);
-                    // 下方放不下 → 上翻到光标上方
+                    // 下方放不下 → 上翻到光标上方（光标顶端 = caret_y - caret_h）
                     if y + hi > wa.bottom {
-                        let above = caret_y - hi - gap;
+                        let above = caret_y - caret_h.max(0) - hi - gap;
                         y = if above >= wa.top { above } else { wa.bottom - hi };
                     }
                     // 左右钳制
@@ -379,9 +407,17 @@ impl CandidateWindow {
     pub fn hide(&mut self) {
         self.window.hide();
         self.visible = false;
+        self.anchor = None; // 组合结束，下次显示重新锚定
+        self.anchor_locked = false;
+        self.mouse.borrow_mut().reset_hover();
         if let Some(t) = self.tooltip.as_mut() {
             t.hide();
         }
+    }
+
+    /// UI 循环每轮调用：推进悬停防抖（稳定后才发出 Hover 事件）。
+    pub fn tick(&self) {
+        self.mouse.borrow_mut().flush();
     }
 
     pub fn is_visible(&self) -> bool {
@@ -402,7 +438,31 @@ impl CandidateWindow {
 pub struct CandidateMouse {
     hit_rects: Vec<(i32, Rect)>,
     events: Sender<UiEvent>,
+    /// 已生效（已发出）的悬停目标，去重用
     last_hover: i32,
+    /// 上次物理光标屏幕坐标——过滤内容变化引起的伪 WM_MOUSEMOVE
+    last_cursor: (i32, i32),
+    /// 悬停防抖：稳定后才发出（避免打字/快速划过的高亮+tooltip 闪烁）
+    hover_debounce: Debouncer<i32>,
+}
+
+impl CandidateMouse {
+    /// 由 UI 循环每轮调用：到期则发出去抖后的悬停目标。
+    fn flush(&mut self) {
+        if let Some(t) = self.hover_debounce.poll() {
+            if t != self.last_hover {
+                self.last_hover = t;
+                let _ = self.events.send(UiEvent::Hover(t));
+            }
+        }
+    }
+
+    /// 重置悬停状态（窗口隐藏 / 新组合）。
+    fn reset_hover(&mut self) {
+        self.hover_debounce.cancel();
+        self.last_hover = -1;
+        self.last_cursor = (i32::MIN, i32::MIN);
+    }
 }
 
 impl CandidateMouse {
@@ -451,13 +511,21 @@ impl WindowMouse for CandidateMouse {
                 Some(LRESULT(0))
             }
             WM_MOUSEMOVE => {
-                let (x, y) = mouse_pos(lparam);
-                // 命中目标：候选下标(0..N) / 翻页 tag / -1 无；统一作为悬停目标上报
-                let raw = self.hit(x, y);
-                if raw != self.last_hover {
-                    self.last_hover = raw;
-                    let _ = self.events.send(UiEvent::Hover(raw));
+                // 物理移动门控：内容变化（打字换候选/窗口刷新）也会产生 WM_MOUSEMOVE，
+                // 但此时物理光标屏幕坐标不变 → 忽略，避免静止鼠标下方候选变化引起闪烁。
+                let (sx, sy) = unsafe {
+                    let mut p = windows::Win32::Foundation::POINT::default();
+                    let _ = GetCursorPos(&mut p);
+                    (p.x, p.y)
+                };
+                if (sx, sy) == self.last_cursor {
+                    return Some(LRESULT(0));
                 }
+                self.last_cursor = (sx, sy);
+                let (x, y) = mouse_pos(lparam);
+                // 命中目标经防抖：稳定 ~120ms 后才高亮/显示 tooltip
+                let raw = self.hit(x, y);
+                self.hover_debounce.trigger(raw);
                 Some(LRESULT(0))
             }
             WM_RBUTTONDOWN => {

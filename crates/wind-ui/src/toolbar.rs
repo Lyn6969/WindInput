@@ -97,11 +97,13 @@ impl Toolbar {
         })
     }
 
-    /// 设置工具栏位置（启动恢复持久化位置）
+    /// 设置工具栏位置（启动恢复持久化位置）；钳制到工作区内。
     pub fn set_pos(&mut self, x: i32, y: i32) {
-        self.mouse.borrow_mut().pos = Some((x, y));
+        let (w, h) = self.window.size();
+        let (cx, cy) = clamp_to_work_area(x, y, w, h);
+        self.mouse.borrow_mut().pos = Some((cx, cy));
         if self.visible {
-            self.window.show(x, y);
+            self.window.show(cx, cy);
         }
     }
 
@@ -190,15 +192,15 @@ impl Toolbar {
             tracing::warn!("Toolbar update failed: {}", e);
         }
 
-        // 位置：优先用持久化/拖动后的位置；首次落在工作区右下角（避开任务栏）
+        // 位置：优先用持久化/拖动后的位置；首次落在工作区右下角（避开任务栏）。
+        // 钳制到当前显示器工作区内——避免切换显示器/远程后旧坐标落在屏外不可见。
         let (px, py) = {
             let mut m = self.mouse.borrow_mut();
-            // 同步命中矩形给鼠标处理器
-            m.hits = hits;
-            if m.pos.is_none() {
-                m.pos = Some(Self::corner_position(w, h));
-            }
-            m.pos.unwrap()
+            m.hits = hits; // 同步命中矩形给鼠标处理器
+            let raw = m.pos.unwrap_or_else(|| Self::corner_position(w, h));
+            let clamped = clamp_to_work_area(raw.0, raw.1, w, h);
+            m.pos = Some(clamped);
+            clamped
         };
         self.window.show(px, py);
         self.visible = true;
@@ -207,7 +209,10 @@ impl Toolbar {
     pub fn show(&mut self) {
         let pos = self.mouse.borrow().pos;
         if let Some((x, y)) = pos {
-            self.window.show(x, y);
+            let (w, h) = self.window.size();
+            let (cx, cy) = clamp_to_work_area(x, y, w, h);
+            self.mouse.borrow_mut().pos = Some((cx, cy));
+            self.window.show(cx, cy);
             self.visible = true;
         }
     }
@@ -388,6 +393,45 @@ impl WindowMouse for ToolbarMouse {
 }
 
 /// 在缓冲区子区域 (x,y,w,h) 内填充圆角矩形
+/// 将 (x,y,w,h) 钳制到所在（或最近）显示器工作区内，保证完整可见。
+/// 用于切换显示器 / 远程连接后旧坐标落到屏外时拉回。
+fn clamp_to_work_area(x: i32, y: i32, w: u32, h: u32) -> (i32, i32) {
+    #[cfg(windows)]
+    {
+        use windows::Win32::Graphics::Gdi::{
+            GetMonitorInfoW, MonitorFromPoint, MONITORINFO, MONITOR_DEFAULTTONEAREST,
+        };
+        unsafe {
+            let pt = POINT { x, y };
+            let mon = MonitorFromPoint(pt, MONITOR_DEFAULTTONEAREST);
+            let mut mi = MONITORINFO {
+                cbSize: std::mem::size_of::<MONITORINFO>() as u32,
+                ..Default::default()
+            };
+            if GetMonitorInfoW(mon, &mut mi).as_bool() {
+                let wa = mi.rcWork;
+                let (wi, hi) = (w as i32, h as i32);
+                let mut nx = x;
+                let mut ny = y;
+                if nx + wi > wa.right {
+                    nx = wa.right - wi;
+                }
+                if ny + hi > wa.bottom {
+                    ny = wa.bottom - hi;
+                }
+                if nx < wa.left {
+                    nx = wa.left;
+                }
+                if ny < wa.top {
+                    ny = wa.top;
+                }
+                return (nx, ny);
+            }
+        }
+    }
+    (x, y)
+}
+
 /// 圆角填充：复用 view 的抗锯齿 + 预乘混合实现，保持各窗口圆角一致。
 fn fill_rounded(
     buf: &mut [u8],

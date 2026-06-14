@@ -3,6 +3,7 @@
 //! 与 Go 版本 `wind_input/internal/ui/` 对齐。
 
 pub mod candidate_window;
+pub mod debounce;
 pub mod manager;
 pub mod popup_menu;
 pub mod renderer;

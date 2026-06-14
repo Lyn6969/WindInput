@@ -26,6 +26,10 @@ pub enum UiCommand {
         total_pages: usize,
         caret_x: i32,
         caret_y: i32,
+        /// 光标高度（用于上翻时定位到光标上方）
+        caret_height: i32,
+        /// 光标坐标是否有效（无效时窗口仅临时显示、不锁定锚点）
+        caret_valid: bool,
     },
     /// 隐藏候选窗口
     HideCandidates,
@@ -206,6 +210,8 @@ impl UiManager {
             }
         };
         let mut tip_hide_at: Option<std::time::Instant> = None;
+        // 状态提示防抖：合并快速连续的提示（如连按切换），避免气泡闪烁
+        let mut tip_debounce = crate::debounce::Debouncer::<(String, i32, i32)>::new(60);
 
         // 右键候选弹出菜单（best-effort）
         let mut popup_menu = match crate::popup_menu::PopupMenu::new(event_tx.clone()) {
@@ -245,6 +251,18 @@ impl UiManager {
                 }
             }
 
+            // 推进鼠标悬停防抖（稳定后才发出 Hover）
+            candidate_window.tick();
+
+            // 推进状态提示防抖（稳定后才真正显示气泡）
+            if let Some((text, x, y)) = tip_debounce.poll() {
+                if let Some(t) = &mut status_tip {
+                    t.show(&text, x, y);
+                    tip_hide_at =
+                        Some(std::time::Instant::now() + std::time::Duration::from_millis(1000));
+                }
+            }
+
             // 非阻塞接收 UI 命令
             match rx.try_recv() {
                 Ok(cmd) => {
@@ -258,6 +276,8 @@ impl UiManager {
                             total_pages,
                             caret_x,
                             caret_y,
+                            caret_height,
+                            caret_valid,
                         } => {
                             debug!(
                                 "UI: UpdateCandidates ({} items, selected={}, hover={}, page={}/{}, pos={},{})",
@@ -270,7 +290,7 @@ impl UiManager {
                                 caret_y
                             );
                             candidate_window.update(&preedit, candidates, selected, hover, page, total_pages);
-                            candidate_window.set_position(caret_x, caret_y);
+                            candidate_window.set_position(caret_x, caret_y, caret_height, caret_valid);
                             candidate_window.show();
                         }
                         UiCommand::HideCandidates => {
@@ -304,13 +324,8 @@ impl UiManager {
                         }
                         UiCommand::ShowStatusTip { text, x, y } => {
                             debug!("UI: ShowStatusTip '{}' at ({},{})", text, x, y);
-                            if let Some(t) = &mut status_tip {
-                                t.show(&text, x, y);
-                                tip_hide_at = Some(
-                                    std::time::Instant::now()
-                                        + std::time::Duration::from_millis(1000),
-                                );
-                            }
+                            // 经防抖：合并快速连续提示，避免气泡闪烁
+                            tip_debounce.trigger((text, x, y));
                         }
                         UiCommand::UpdateToolbar(tb_state) => {
                             debug!("UI: UpdateToolbar {:?}", tb_state);

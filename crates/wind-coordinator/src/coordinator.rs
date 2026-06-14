@@ -187,6 +187,10 @@ pub struct Coordinator {
     cn_pairs: Vec<(char, char)>,
     en_pairs: Vec<(char, char)>,
     pair_tracker: Mutex<wind_transform::pair_tracker::PairTracker>,
+    /// 最近一次有效光标坐标 (x,y,height)；用于无效坐标时回退，避免候选窗跑到左上角
+    last_valid_caret: Mutex<(i32, i32, i32)>,
+    /// 正在等待有效光标坐标（首次连接尚未拿到时为 true）；拿到后触发重定位
+    awaiting_caret: Mutex<bool>,
 }
 
 /// 短语候选权重基准（高于普通候选，使短语展开排在前列）
@@ -397,6 +401,8 @@ impl Coordinator {
             cn_pairs,
             en_pairs,
             pair_tracker: Mutex::new(wind_transform::pair_tracker::PairTracker::new()),
+            last_valid_caret: Mutex::new((0, 0, 0)),
+            awaiting_caret: Mutex::new(false),
         });
         // 启动即显示常驻工具栏（反映初始 中英/方案/标点/全半角）
         coordinator.notify_toolbar();
@@ -1401,6 +1407,21 @@ impl Coordinator {
             }
             h => h, // 翻页器 tag / -1
         };
+        // 有效光标坐标判定：高度>0、非 (0,0)、在合理范围；无效则回退到最近有效坐标
+        let (cx, cy, ch) = (state.caret_x, state.caret_y, state.caret_height);
+        let valid = ch > 0 && !(cx == 0 && cy == 0) && cx.abs() < 32000 && cy.abs() < 32000;
+        let (caret_x, caret_y, caret_height, caret_valid) = {
+            let mut lv = self.last_valid_caret.lock().unwrap_or_else(|e| e.into_inner());
+            if valid {
+                *lv = (cx, cy, ch);
+                (cx, cy, ch, true)
+            } else if lv.2 > 0 {
+                (lv.0, lv.1, lv.2, true) // 回退到最近有效坐标，避免跑到屏幕左上角
+            } else {
+                (cx, cy, ch, false) // 尚无任何有效坐标：临时显示，待有效坐标到达再重定位
+            }
+        };
+        *self.awaiting_caret.lock().unwrap_or_else(|e| e.into_inner()) = !caret_valid;
         let _ = self.ui_tx.send(UiCommand::UpdateCandidates {
             preedit: state.preedit.clone(),
             candidates: items,
@@ -1408,8 +1429,10 @@ impl Coordinator {
             hover,
             page: state.current_page + 1,
             total_pages,
-            caret_x: state.caret_x,
-            caret_y: state.caret_y,
+            caret_x,
+            caret_y,
+            caret_height,
+            caret_valid,
         });
     }
 
@@ -2530,6 +2553,14 @@ impl MessageHandler for Coordinator {
         state.caret_x = data.x;
         state.caret_y = data.y;
         state.caret_height = data.height;
+        // 首次连接尚无有效坐标时，候选窗临时显示在左上角；待有效坐标到达即重定位。
+        let now_valid =
+            data.height > 0 && !(data.x == 0 && data.y == 0) && data.x.abs() < 32000;
+        let awaiting = *self.awaiting_caret.lock().unwrap_or_else(|e| e.into_inner());
+        let composing = !state.candidates.is_empty() || !state.input_buffer.is_empty();
+        if awaiting && now_valid && composing {
+            self.notify_ui_update(&state);
+        }
     }
 
     fn handle_caret_pending(&self) {}
