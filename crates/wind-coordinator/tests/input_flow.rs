@@ -725,6 +725,35 @@ fn test_s2t_disabled_keeps_simplified() {
 }
 
 #[test]
+fn test_smart_punct_after_digit() {
+    if !has_schemas() {
+        return;
+    }
+    let coord = Coordinator::new_headless(config_with("wubi86"), Some(&data_dir()));
+    // 句号(0xBE)，光标前字符为数字 '5'(0x35) → 应输出英文 '.'
+    let mut ev = key_event(0xBE, EVENT_KEY_DOWN);
+    ev.prev_char = '5' as u16;
+    match coord.handle_key_event(&ev) {
+        KeyAction::InsertText { text, .. } => assert_eq!(text, ".", "数字后句号应为英文 ."),
+        other => panic!("应上屏英文句号，实际: {:?}", other),
+    }
+    // 光标前为非数字（'a'）→ 应为中文句号 。
+    let mut ev2 = key_event(0xBE, EVENT_KEY_DOWN);
+    ev2.prev_char = 'a' as u16;
+    match coord.handle_key_event(&ev2) {
+        KeyAction::InsertText { text, .. } => assert_eq!(text, "。", "字母后句号应为中文 。"),
+        other => panic!("应上屏中文句号，实际: {:?}", other),
+    }
+    // 逗号(0xBC)数字后 → 英文 ','
+    let mut ev3 = key_event(0xBC, EVENT_KEY_DOWN);
+    ev3.prev_char = '9' as u16;
+    match coord.handle_key_event(&ev3) {
+        KeyAction::InsertText { text, .. } => assert_eq!(text, ",", "数字后逗号应为英文 ,"),
+        other => panic!("应上屏英文逗号，实际: {:?}", other),
+    }
+}
+
+#[test]
 fn test_mode_toggle_via_shift() {
     if !has_schemas() {
         return;

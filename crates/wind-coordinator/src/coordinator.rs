@@ -750,6 +750,25 @@ impl Coordinator {
             .any(|vk| vk == key_code)
     }
 
+    /// 数字后智能标点：在中文标点模式下，若 ch 在智能标点列表且光标前一字符为数字，
+    /// 则该标点应按英文（半角）输出（如 "3." 不转成 "3。"）。
+    fn is_smart_punct_after_digit(&self, ch: char, prev_char: u16) -> bool {
+        if !self.config.input.smart_punct_after_digit {
+            return false;
+        }
+        let list = &self.config.input.smart_punct_list;
+        let in_list = if list.is_empty() {
+            ch == '.' || ch == ','
+        } else {
+            list.contains(ch)
+        };
+        if !in_list {
+            return false;
+        }
+        // prev_char 为 UTF-16 单元，数字 '0'..='9' = 0x30..=0x39
+        (0x30..=0x39).contains(&prev_char)
+    }
+
     /// 按当前中英标点/全半角配置转换一个标点字符为上屏文本。
     fn convert_punct_char(&self, state: &State, ch: char) -> String {
         if state.chinese_punct {
@@ -1549,8 +1568,10 @@ impl MessageHandler for Coordinator {
                     state.input_buffer.clear();
                     state.candidates.clear();
 
-                    // 中文标点转换；未配置中文标点时按全角/原样输出
-                    let piece = if state.chinese_punct {
+                    // 数字后智能标点：光标前为数字时该标点按英文输出（如 3. 不转 3。）
+                    let smart_en = self.is_smart_punct_after_digit(ch, data.prev_char);
+                    // 中文标点转换；智能标点命中或非中文标点模式时按全角/原样输出
+                    let piece = if state.chinese_punct && !smart_en {
                         self.punct
                             .lock()
                             .unwrap_or_else(|e| e.into_inner())
