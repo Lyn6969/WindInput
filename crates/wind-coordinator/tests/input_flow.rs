@@ -918,3 +918,62 @@ fn test_mode_toggle_via_shift() {
     coord.handle_key_event(&key_event(0xA1, EVENT_KEY_UP));
     assert!(coord.is_chinese_mode(), "右 Shift 释放应切回中文");
 }
+
+#[test]
+fn test_candidate_op_move_top_and_delete() {
+    if !has_schemas() {
+        return;
+    }
+    use wind_ui::manager::CandidateOp;
+    let coord = Coordinator::new_headless(config_with("pinyin"), Some(&data_dir()));
+    // 拼音输入若干字母以获取多个候选
+    for c in "shi".chars() {
+        press_letter(&coord, c);
+    }
+    let before = coord.debug_page_texts();
+    if before.len() < 2 {
+        return; // 候选不足，跳过
+    }
+    let second = before[1].clone();
+
+    // 置顶第二项 → 应成为首项
+    coord.debug_candidate_op(CandidateOp::MoveTop, 1);
+    let after = coord.debug_page_texts();
+    assert_eq!(after.first(), Some(&second), "置顶后第二项应排首位");
+
+    // 删除一个多字候选（绕过单字保护）→ 应从候选中消失
+    if let Some((pl, w)) = after
+        .iter()
+        .enumerate()
+        .find(|(_, w)| w.chars().count() >= 2)
+        .map(|(i, w)| (i, w.clone()))
+    {
+        coord.debug_candidate_op(CandidateOp::Delete, pl);
+        let after2 = coord.debug_page_texts();
+        assert!(!after2.contains(&w), "删除后 '{}' 不应再出现", w);
+    }
+}
+
+#[test]
+fn test_candidate_op_delete_single_char_protected() {
+    if !has_schemas() {
+        return;
+    }
+    use wind_ui::manager::CandidateOp;
+    let coord = Coordinator::new_headless(config_with("pinyin"), Some(&data_dir()));
+    for c in "shi".chars() {
+        press_letter(&coord, c);
+    }
+    let before = coord.debug_page_texts();
+    // 找一个单字候选，删除应被拒绝（仍在列表）
+    if let Some((pl, w)) = before
+        .iter()
+        .enumerate()
+        .find(|(_, w)| w.chars().count() == 1)
+        .map(|(i, w)| (i, w.clone()))
+    {
+        coord.debug_candidate_op(CandidateOp::Delete, pl);
+        let after = coord.debug_page_texts();
+        assert!(after.contains(&w), "单字 '{}' 删除应被保护", w);
+    }
+}

@@ -52,6 +52,21 @@ pub enum ToolbarAction {
     ToggleWidth,
 }
 
+/// 候选词条操作（右键菜单）；复制由 UI 侧直接处理，不在此列。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CandidateOp {
+    /// 置顶
+    MoveTop,
+    /// 前移
+    MoveUp,
+    /// 后移
+    MoveDown,
+    /// 删除（屏蔽）
+    Delete,
+    /// 恢复默认
+    Reset,
+}
+
 /// UI → 协调器的反向事件（鼠标交互）
 #[derive(Debug, Clone)]
 pub enum UiEvent {
@@ -63,6 +78,8 @@ pub enum UiEvent {
     Hover(i32),
     /// 工具栏单元格点击
     Toolbar(ToolbarAction),
+    /// 候选词条操作（页内下标 + 动作）
+    CandidateOp { op: CandidateOp, page_local: usize },
 }
 
 /// UI 管理器（在独立线程中运行）

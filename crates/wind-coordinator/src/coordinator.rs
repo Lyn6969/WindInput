@@ -22,10 +22,11 @@ use wind_config::hotkey::{self, CompiledHotkeys};
 use wind_engine::EngineManager;
 use wind_ipc::protocol::{EVENT_KEY_DOWN, EVENT_KEY_UP, MOD_ALT, MOD_CTRL, MOD_SHIFT, calc_key_hash};
 use wind_store::freq::FreqTracker;
+use wind_store::shadow::ShadowStore;
 use wind_transform::fullwidth::to_full_width;
 use wind_transform::punctuation::PunctuationConverter;
 use wind_ui::candidate_window::CandidateItem;
-use wind_ui::manager::{ToolbarAction, UiCommand, UiEvent, UiManager};
+use wind_ui::manager::{CandidateOp, ToolbarAction, UiCommand, UiEvent, UiManager};
 use wind_ui::toolbar::ToolbarState;
 
 /// VK + shift → 该键产生的 ASCII 标点/符号字符（字母键返回 None，由拼音/码表处理）。
@@ -150,6 +151,10 @@ pub struct Coordinator {
     phrases: crate::phrases::PhraseLayer,
     /// 简繁转换器（OpenCC；None=数据缺失不可用）
     s2t: Option<wind_transform::s2t::Converter>,
+    /// Shadow 规则（候选置顶/前后移/删除）
+    shadow: ShadowStore,
+    /// Shadow 持久化文件路径（None=不持久化）
+    shadow_path: Option<std::path::PathBuf>,
 }
 
 /// 短语候选权重基准（高于普通候选，使短语展开排在前列）
@@ -258,6 +263,15 @@ impl Coordinator {
             }
         }
 
+        // Shadow 规则（与 freq 同目录的 shadow.json）
+        let shadow = ShadowStore::new();
+        let shadow_path = freq_path.as_ref().map(|p| p.with_file_name("shadow.json"));
+        if let Some(p) = &shadow_path {
+            if let Err(e) = shadow.load_from_file(p) {
+                warn!("Failed to load shadow {}: {}", p.display(), e);
+            }
+        }
+
         let coordinator = Arc::new(Self {
             state: Mutex::new(State {
                 chinese_mode: config.general.default_chinese_mode,
@@ -299,6 +313,8 @@ impl Coordinator {
             freq_dirty: Mutex::new(0),
             phrases,
             s2t,
+            shadow,
+            shadow_path,
         });
         // 启动即显示常驻工具栏（反映初始 中英/方案/标点/全半角）
         coordinator.notify_toolbar();
@@ -381,6 +397,11 @@ impl Coordinator {
             .collect()
     }
 
+    /// 候选词条操作（测试/诊断用）
+    pub fn debug_candidate_op(&self, op: CandidateOp, page_local: usize) {
+        self.candidate_op(op, page_local);
+    }
+
     /// 首次加载候选上限（对齐 Go：短前缀小批量分级加载，长前缀近全量）。
     fn initial_candidate_limit(&self, input: &str) -> usize {
         let len = input.chars().count();
@@ -428,8 +449,35 @@ impl Coordinator {
         });
         let mut seen = std::collections::HashSet::new();
         candidates.retain(|c| seen.insert(c.text.clone()));
+        // Shadow 规则：删除过滤 + 置顶/移动重排（优先级最高，排序后应用）
+        self.apply_shadow(&mut candidates, &state.input_buffer);
         state.candidates = candidates;
         engine_count
+    }
+
+    /// 应用 Shadow 规则：先按 deleted 过滤，再把 pinned 按目标位置重排。
+    fn apply_shadow(&self, candidates: &mut Vec<Candidate>, code: &str) {
+        if self.shadow.is_empty() || code.is_empty() {
+            return;
+        }
+        let schema = self.engine_mgr.active_schema_id();
+        let rec = match self.shadow.get_rules(&schema, code) {
+            Some(r) => r,
+            None => return,
+        };
+        if !rec.deleted.is_empty() {
+            candidates.retain(|c| !rec.deleted.iter().any(|d| d == &c.text));
+        }
+        // 按 position 升序应用，使后续插入考虑前面已就位的项
+        let mut pins = rec.pinned.clone();
+        pins.sort_by_key(|p| p.position);
+        for pin in pins {
+            if let Some(cur) = candidates.iter().position(|c| c.text == pin.word) {
+                let cand = candidates.remove(cur);
+                let at = pin.position.min(candidates.len());
+                candidates.insert(at, cand);
+            }
+        }
     }
 
     /// 根据输入缓冲更新候选（动态分级加载：首次小批量，翻页到边界再扩展）。
@@ -1281,6 +1329,59 @@ impl Coordinator {
             UiEvent::Page(dir) => self.mouse_page(dir),
             UiEvent::Hover(i) => self.mouse_hover(i),
             UiEvent::Toolbar(a) => self.mouse_toolbar(a),
+            UiEvent::CandidateOp { op, page_local } => self.candidate_op(op, page_local),
+        }
+    }
+
+    /// 候选词条操作（右键菜单）：调整 Shadow 规则并即时重排重绘。
+    /// code 取当前输入码（state.input_buffer）；按方案隔离。
+    fn candidate_op(&self, op: CandidateOp, page_local: usize) {
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        if state.candidates.is_empty() || state.input_buffer.is_empty() {
+            return;
+        }
+        let (start, end) = self.page_range(&state);
+        let idx = start + page_local;
+        if idx >= end || idx >= state.candidates.len() {
+            return;
+        }
+        let word = state.candidates[idx].text.clone();
+        let code = state.input_buffer.clone();
+        let schema = self.engine_mgr.active_schema_id();
+
+        match op {
+            CandidateOp::MoveTop => self.shadow.pin(&schema, &code, &word, 0),
+            CandidateOp::MoveUp => {
+                let pos = idx.saturating_sub(1);
+                self.shadow.pin(&schema, &code, &word, pos);
+            }
+            CandidateOp::MoveDown => {
+                self.shadow.pin(&schema, &code, &word, (idx + 1).min(state.candidates.len() - 1));
+            }
+            CandidateOp::Delete => {
+                // 单字无规则保护：避免把某个单字彻底锁死
+                if word.chars().count() <= 1 {
+                    debug!("candidate_op: 拒绝删除单字 '{}'", word);
+                    return;
+                }
+                self.shadow.delete(&schema, &code, &word);
+            }
+            CandidateOp::Reset => self.shadow.reset(&schema, &code, &word),
+        }
+
+        // 重新构建候选（会重新应用 Shadow）并重绘
+        self.update_candidates(&mut state);
+        self.notify_ui_update(&state);
+        drop(state);
+        self.save_shadow();
+    }
+
+    /// 持久化 Shadow 规则（best-effort）
+    fn save_shadow(&self) {
+        if let Some(p) = &self.shadow_path {
+            if let Err(e) = self.shadow.save_to_file(p) {
+                warn!("Failed to save shadow {}: {}", p.display(), e);
+            }
         }
     }
 
