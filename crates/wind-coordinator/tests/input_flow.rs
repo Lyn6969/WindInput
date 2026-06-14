@@ -852,6 +852,52 @@ fn test_temp_english_esc_exits() {
     }
 }
 
+fn config_mixed() -> Config {
+    let mut cfg = Config::default();
+    cfg.schema.available = vec![
+        "wubi86_pinyin".into(),
+        "wubi86".into(),
+        "pinyin".into(),
+    ];
+    cfg.schema.active = "wubi86_pinyin".into();
+    cfg.general.default_chinese_mode = true;
+    cfg
+}
+
+#[test]
+fn test_mixed_wubi_exact_priority() {
+    if !has_schemas() {
+        return;
+    }
+    let coord = Coordinator::new_headless(config_mixed(), Some(&data_dir()));
+    assert_eq!(coord.active_schema_id(), "wubi86_pinyin");
+    // 五笔精确码 aaaa（+10M）应压过拼音候选排首位
+    for _ in 0..4 {
+        press_letter(&coord, 'a');
+    }
+    let texts = coord.debug_page_texts();
+    assert!(!texts.is_empty(), "混输应有候选");
+    assert_eq!(texts[0], "恭恭敬敬", "五笔精确匹配应排首位，实际: {:?}", &texts[..texts.len().min(3)]);
+}
+
+#[test]
+fn test_mixed_pinyin_supplement() {
+    if !has_schemas() {
+        return;
+    }
+    let coord = Coordinator::new_headless(config_mixed(), Some(&data_dir()));
+    // 输入 nihao（拼音）→ 次引擎应补充拼音候选 你好
+    for c in "nihao".chars() {
+        press_letter(&coord, c);
+    }
+    let texts = coord.debug_page_texts();
+    assert!(
+        texts.iter().any(|t| t.contains("你好")),
+        "混输应含拼音补充候选 你好，实际: {:?}",
+        &texts[..texts.len().min(8)]
+    );
+}
+
 #[test]
 fn test_mode_toggle_via_shift() {
     if !has_schemas() {

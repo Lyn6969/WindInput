@@ -46,6 +46,21 @@ struct EngineSection {
     codetable: CodetableSection,
     #[serde(default)]
     pinyin: PinyinSection,
+    #[serde(default)]
+    mixed: MixedSection,
+}
+
+/// 混输方案配置（码表主 + 拼音次）
+#[derive(Debug, Clone, Default, serde::Deserialize)]
+struct MixedSection {
+    #[serde(default)]
+    primary_schema: String,
+    #[serde(default)]
+    secondary_schema: String,
+    #[serde(default)]
+    min_pinyin_length: usize,
+    #[serde(default)]
+    codetable_weight_boost: i32,
 }
 
 #[derive(Debug, Clone, Default, serde::Deserialize)]
@@ -358,6 +373,38 @@ impl EngineManager {
         let data_dir = data_dir?;
         let schemas = data_dir.join("schemas");
         let schema = Self::read_schema(schema_id, Some(data_dir))?;
+
+        // 混输方案：递归构建主（码表）+ 次（拼音）子引擎，包装为 MixedEngine
+        if schema.engine.engine_type.to_lowercase() == "mixed" {
+            let m = &schema.engine.mixed;
+            if m.primary_schema.is_empty() {
+                warn!("mixed schema {} 缺少 primary_schema", schema_id);
+                return None;
+            }
+            let primary = Self::build_engine(&m.primary_schema, Some(data_dir))?;
+            let secondary = if m.secondary_schema.is_empty() {
+                None
+            } else {
+                Self::build_engine(&m.secondary_schema, Some(data_dir))
+            };
+            let boost = if m.codetable_weight_boost > 0 {
+                m.codetable_weight_boost
+            } else {
+                10_000_000
+            };
+            let min_py = if m.min_pinyin_length > 0 {
+                m.min_pinyin_length
+            } else {
+                2
+            };
+            info!(
+                "Built mixed engine {} (primary={}, secondary={})",
+                schema_id, m.primary_schema, m.secondary_schema
+            );
+            return Some(Box::new(crate::mixed::MixedEngine::new(
+                primary, secondary, min_py, boost,
+            )));
+        }
 
         let dict = match Self::load_dictionary(&schema, &schemas) {
             Some(d) => d,
