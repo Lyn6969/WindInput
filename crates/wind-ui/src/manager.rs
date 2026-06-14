@@ -24,6 +24,10 @@ pub enum UiCommand {
     HideCandidates,
     /// 显示状态提示气泡（中英/标点/全半角/方案切换），约 1 秒后自动隐藏
     ShowStatusTip { text: String, x: i32, y: i32 },
+    /// 更新常驻工具栏状态（中英/方案/标点/全半角）
+    UpdateToolbar(crate::toolbar::ToolbarState),
+    /// 隐藏工具栏
+    HideToolbar,
     /// 关闭 UI
     Shutdown,
 }
@@ -78,6 +82,15 @@ impl UiManager {
             }
         };
         let mut tip_hide_at: Option<std::time::Instant> = None;
+
+        // 常驻工具栏（best-effort，失败不影响其它窗口）
+        let mut toolbar = match crate::toolbar::Toolbar::new() {
+            Ok(t) => Some(t),
+            Err(e) => {
+                error!("Failed to create toolbar: {}", e);
+                None
+            }
+        };
 
         // Win32 消息循环 + 通道接收
         loop {
@@ -135,10 +148,25 @@ impl UiManager {
                                 );
                             }
                         }
+                        UiCommand::UpdateToolbar(tb_state) => {
+                            debug!("UI: UpdateToolbar {:?}", tb_state);
+                            if let Some(t) = &mut toolbar {
+                                t.update(&tb_state);
+                            }
+                        }
+                        UiCommand::HideToolbar => {
+                            debug!("UI: HideToolbar");
+                            if let Some(t) = &mut toolbar {
+                                t.hide();
+                            }
+                        }
                         UiCommand::Shutdown => {
                             info!("UI: Shutdown");
                             candidate_window.hide();
                             if let Some(t) = &status_tip {
+                                t.hide();
+                            }
+                            if let Some(t) = &mut toolbar {
                                 t.hide();
                             }
                             break;

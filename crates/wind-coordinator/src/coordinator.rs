@@ -26,6 +26,7 @@ use wind_transform::fullwidth::to_full_width;
 use wind_transform::punctuation::PunctuationConverter;
 use wind_ui::candidate_window::CandidateItem;
 use wind_ui::manager::{UiCommand, UiManager};
+use wind_ui::toolbar::ToolbarState;
 
 /// VK + shift → 该键产生的 ASCII 标点/符号字符（字母键返回 None，由拼音/码表处理）。
 fn punct_char(key_code: u32, shift: bool) -> Option<char> {
@@ -158,7 +159,7 @@ impl Coordinator {
             }
         }
 
-        Arc::new(Self {
+        let coordinator = Arc::new(Self {
             state: Mutex::new(State {
                 chinese_mode: config.general.default_chinese_mode,
                 full_width: config.general.default_full_width,
@@ -181,7 +182,10 @@ impl Coordinator {
             punct: Mutex::new(PunctuationConverter::new()),
             freq_path,
             freq_dirty: Mutex::new(0),
-        })
+        });
+        // 启动即显示常驻工具栏（反映初始 中英/方案/标点/全半角）
+        coordinator.notify_toolbar();
+        coordinator
     }
 
     /// 记录一次选词并按阈值落盘（脏计数达到 8 或后续 focus_lost 时保存）。
@@ -317,6 +321,20 @@ impl Coordinator {
         self.push_server.push_to_active(&encoded);
     }
 
+    /// 推送当前状态到常驻工具栏（中英/方案/标点/全半角）
+    fn notify_toolbar(&self) {
+        let schema_label = Self::schema_display_name(&self.engine_mgr.active_schema_id());
+        let s = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        let tb = ToolbarState {
+            chinese_mode: s.chinese_mode,
+            schema_label,
+            full_width: s.full_width,
+            chinese_punct: s.chinese_punct,
+        };
+        drop(s);
+        let _ = self.ui_tx.send(UiCommand::UpdateToolbar(tb));
+    }
+
     /// 在当前光标上方显示状态提示气泡（中英/标点/全半角/方案切换）
     fn show_tip(&self, text: &str) {
         let (x, y) = {
@@ -363,6 +381,7 @@ impl Coordinator {
             self.notify_ui_hide();
             self.push_state_update();
             self.show_tip(&Self::schema_display_name(&next));
+            self.notify_toolbar();
             info!("Cycled to schema: {}", next);
         }
     }
@@ -395,6 +414,7 @@ impl Coordinator {
                 };
                 self.push_state_update();
                 self.show_tip(if full { "全角" } else { "半角" });
+                self.notify_toolbar();
                 true
             }
             "toggle_punct" => {
@@ -405,6 +425,7 @@ impl Coordinator {
                 };
                 self.push_state_update();
                 self.show_tip(if cn { "中文标点" } else { "英文标点" });
+                self.notify_toolbar();
                 true
             }
             _ => {
@@ -678,6 +699,7 @@ impl MessageHandler for Coordinator {
         self.punct.lock().unwrap_or_else(|e| e.into_inner()).reset();
         self.push_state_update();
         self.show_tip(if chinese { "中" } else { "英" });
+        self.notify_toolbar();
         (Some(self.build_status()), commit_text)
     }
 
@@ -697,6 +719,7 @@ impl MessageHandler for Coordinator {
         drop(state);
         self.punct.lock().unwrap_or_else(|e| e.into_inner()).reset();
         self.push_state_update();
+        self.notify_toolbar();
         (Some(self.build_status()), commit_text)
     }
 
