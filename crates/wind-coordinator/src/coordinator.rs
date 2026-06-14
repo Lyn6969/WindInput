@@ -86,6 +86,8 @@ struct State {
     chinese_mode: bool,
     full_width: bool,
     chinese_punct: bool,
+    /// 简繁转换开关（运行时切换；commit 时把简体输出转繁体）
+    s2t_enabled: bool,
     toolbar_visible: bool,
     caps_lock: bool,
     input_buffer: String,
@@ -133,6 +135,8 @@ pub struct Coordinator {
     freq_dirty: Mutex<u32>,
     /// 短语层（system.phrases.toml；$Y$M$D 模板）
     phrases: crate::phrases::PhraseLayer,
+    /// 简繁转换器（OpenCC；None=数据缺失不可用）
+    s2t: Option<wind_transform::s2t::Converter>,
 }
 
 /// 短语候选权重基准（高于普通候选，使短语展开排在前列）
@@ -206,6 +210,20 @@ impl Coordinator {
             None => crate::phrases::PhraseLayer::default(),
         };
 
+        // 简繁转换器：从 data/opencc 加载（变体来自配置，默认 s2t）
+        let s2t = data_dir.and_then(|d| {
+            let variant = if config.features.s2t.variant.is_empty() {
+                "s2t"
+            } else {
+                &config.features.s2t.variant
+            };
+            let conv = wind_transform::s2t::Converter::load_variant(&d.join("opencc"), variant);
+            if conv.is_some() {
+                info!("Loaded S2T converter (variant={})", variant);
+            }
+            conv
+        });
+
         let freq_tracker = FreqTracker::new();
         if let Some(p) = &freq_path {
             match freq_tracker.load_from_file(p) {
@@ -219,6 +237,7 @@ impl Coordinator {
                 chinese_mode: config.general.default_chinese_mode,
                 full_width: config.general.default_full_width,
                 chinese_punct: config.general.default_chinese_punct,
+                s2t_enabled: config.features.s2t.enabled,
                 toolbar_visible: true,
                 caps_lock: false,
                 input_buffer: String::new(),
@@ -247,6 +266,7 @@ impl Coordinator {
             freq_path,
             freq_dirty: Mutex::new(0),
             phrases,
+            s2t,
         });
         // 启动即显示常驻工具栏（反映初始 中英/方案/标点/全半角）
         coordinator.notify_toolbar();
@@ -285,6 +305,15 @@ impl Coordinator {
     /// 当前是否中文模式（测试/诊断用）
     pub fn is_chinese_mode(&self) -> bool {
         self.state.lock().unwrap_or_else(|e| e.into_inner()).chinese_mode
+    }
+
+    /// 设置简繁开关（测试/诊断用）。返回是否生效（数据缺失则 false）。
+    pub fn debug_set_s2t(&self, on: bool) -> bool {
+        if self.s2t.is_none() {
+            return false;
+        }
+        self.state.lock().unwrap_or_else(|e| e.into_inner()).s2t_enabled = on;
+        true
     }
 
     /// 候选总数（测试/诊断用）
@@ -572,9 +601,10 @@ impl Coordinator {
                     let idx = self.highlighted_global_index(state).min(state.candidates.len() - 1);
                     let text = state.candidates[idx].text.clone();
                     self.record_selection(&text);
+                    let out = self.maybe_s2t(state, &text);
                     self.exit_temp_pinyin(state);
                     self.notify_ui_hide();
-                    Self::commit_action(text, true)
+                    Self::commit_action(out, true)
                 } else {
                     self.exit_temp_pinyin(state);
                     self.notify_ui_hide();
@@ -588,9 +618,10 @@ impl Coordinator {
                 if idx < end {
                     let text = state.candidates[idx].text.clone();
                     self.record_selection(&text);
+                    let out = self.maybe_s2t(state, &text);
                     self.exit_temp_pinyin(state);
                     self.notify_ui_hide();
-                    Self::commit_action(text, true)
+                    Self::commit_action(out, true)
                 } else {
                     KeyAction::Consumed
                 }
@@ -640,9 +671,10 @@ impl Coordinator {
                         if idx < end {
                             let text = state.candidates[idx].text.clone();
                             self.record_selection(&text);
+                            let out = self.maybe_s2t(state, &text);
                             self.exit_temp_pinyin(state);
                             self.notify_ui_hide();
-                            return Self::commit_action(text, true);
+                            return Self::commit_action(out, true);
                         }
                     }
                 }
@@ -652,9 +684,10 @@ impl Coordinator {
                     let idx = self.highlighted_global_index(state).min(state.candidates.len() - 1);
                     let text = state.candidates[idx].text.clone();
                     self.record_selection(&text);
+                    let out = self.maybe_s2t(state, &text);
                     self.exit_temp_pinyin(state);
                     self.notify_ui_hide();
-                    Self::commit_action(text, true)
+                    Self::commit_action(out, true)
                 } else {
                     self.exit_temp_pinyin(state);
                     self.notify_ui_hide();
@@ -966,14 +999,26 @@ impl Coordinator {
         }
     }
 
-    /// 提交某个候选（记录词频后清空状态）
-    fn commit_candidate(&self, state: &mut State, text: &str) {
+    /// 若开启简繁转换，把简体文本转为繁体（数据缺失则原样返回）。
+    fn maybe_s2t(&self, state: &State, text: &str) -> String {
+        if state.s2t_enabled {
+            if let Some(conv) = &self.s2t {
+                return conv.convert(text);
+            }
+        }
+        text.to_string()
+    }
+
+    /// 提交某个候选（记录原始简体词频后清空状态），返回上屏文本（按需简繁转换）。
+    fn commit_candidate(&self, state: &mut State, text: &str) -> String {
         self.record_selection(text);
+        let out = self.maybe_s2t(state, text);
         state.input_buffer.clear();
         state.preedit.clear();
         state.candidates.clear();
         state.current_page = 0;
         state.selected_index = 0;
+        out
     }
 
     fn notify_ui_update(&self, state: &State) {
@@ -1161,6 +1206,19 @@ impl Coordinator {
                 self.notify_toolbar();
                 true
             }
+            "toggle_s2t" => {
+                if self.s2t.is_none() {
+                    self.show_tip("简繁数据缺失");
+                    return true;
+                }
+                let on = {
+                    let mut s = self.state.lock().unwrap_or_else(|e| e.into_inner());
+                    s.s2t_enabled = !s.s2t_enabled;
+                    s.s2t_enabled
+                };
+                self.show_tip(if on { "繁體" } else { "简体" });
+                true
+            }
             _ => {
                 debug!("Unhandled hotkey action: {}", action);
                 false
@@ -1325,9 +1383,9 @@ impl MessageHandler for Coordinator {
                 if !state.candidates.is_empty() {
                     let idx = self.highlighted_global_index(&state).min(state.candidates.len() - 1);
                     let text = state.candidates[idx].text.clone();
-                    self.commit_candidate(&mut state, &text);
+                    let out = self.commit_candidate(&mut state, &text);
                     self.notify_ui_hide();
-                    Self::commit_action(text, true)
+                    Self::commit_action(out, true)
                 } else if !state.input_buffer.is_empty() {
                     let text = state.input_buffer.clone();
                     state.input_buffer.clear();
@@ -1357,9 +1415,9 @@ impl MessageHandler for Coordinator {
                 let idx = start + in_page;
                 if idx < end {
                     let text = state.candidates[idx].text.clone();
-                    self.commit_candidate(&mut state, &text);
+                    let out = self.commit_candidate(&mut state, &text);
                     self.notify_ui_hide();
-                    Self::commit_action(text, true)
+                    Self::commit_action(out, true)
                 } else if !state.input_buffer.is_empty() {
                     let mut text = state.input_buffer.clone();
                     state.input_buffer.clear();
@@ -1446,9 +1504,9 @@ impl MessageHandler for Coordinator {
                         let idx = start + offset;
                         if idx < end {
                             let text = state.candidates[idx].text.clone();
-                            self.commit_candidate(&mut state, &text);
+                            let out = self.commit_candidate(&mut state, &text);
                             self.notify_ui_hide();
-                            return Self::commit_action(text, true);
+                            return Self::commit_action(out, true);
                         }
                     }
                     // D. 模式触发键 → 顶屏高亮候选 + 进模式（快捷输入 > 临时拼音）
@@ -1472,7 +1530,7 @@ impl MessageHandler for Coordinator {
                         let idx = self.highlighted_global_index(&state).min(state.candidates.len() - 1);
                         let t = state.candidates[idx].text.clone();
                         self.record_selection(&t);
-                        out.push_str(&t);
+                        out.push_str(&self.maybe_s2t(&state, &t));
                     } else if !state.input_buffer.is_empty() {
                         out.push_str(&state.input_buffer);
                     }

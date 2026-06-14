@@ -639,6 +639,62 @@ fn test_phrase_time_expansion() {
 }
 
 #[test]
+fn test_s2t_converts_committed_candidate() {
+    if !has_schemas() {
+        return;
+    }
+    let coord = Coordinator::new_headless(config_with("pinyin"), Some(&data_dir()));
+    if !coord.debug_set_s2t(true) {
+        eprintln!("跳过：缺少 opencc 数据");
+        return;
+    }
+    // 拼音输入 hanzi → 候选含 汉字；开启简繁后上屏应为 漢字
+    for c in "hanzi".chars() {
+        press_letter(&coord, c);
+    }
+    // 找到"汉字"所在候选位置并用数字键选择；若首选即是则空格
+    let texts = coord.debug_page_texts();
+    let pos = texts.iter().position(|t| t == "汉字");
+    let commit = if let Some(p) = pos {
+        // 数字键 (p+1)
+        coord.handle_key_event(&key_event(0x31 + p as u32, EVENT_KEY_DOWN))
+    } else {
+        // 退化：直接空格上屏首选，仅校验为繁体（不强等于）
+        coord.handle_key_event(&key_event(0x20, EVENT_KEY_DOWN))
+    };
+    match commit {
+        KeyAction::InsertText { text, .. } => {
+            if pos.is_some() {
+                assert_eq!(text, "漢字", "开启简繁后 汉字 应上屏为 漢字");
+            } else {
+                // 至少不应是简体"汉字"
+                assert_ne!(text, "汉字");
+            }
+        }
+        other => panic!("应上屏 InsertText，实际: {:?}", other),
+    }
+}
+
+#[test]
+fn test_s2t_disabled_keeps_simplified() {
+    if !has_schemas() {
+        return;
+    }
+    let coord = Coordinator::new_headless(config_with("pinyin"), Some(&data_dir()));
+    // 默认关闭简繁：上屏保持简体
+    for c in "hanzi".chars() {
+        press_letter(&coord, c);
+    }
+    let texts = coord.debug_page_texts();
+    if let Some(p) = texts.iter().position(|t| t == "汉字") {
+        match coord.handle_key_event(&key_event(0x31 + p as u32, EVENT_KEY_DOWN)) {
+            KeyAction::InsertText { text, .. } => assert_eq!(text, "汉字", "默认应保持简体"),
+            other => panic!("应上屏，实际: {:?}", other),
+        }
+    }
+}
+
+#[test]
 fn test_mode_toggle_via_shift() {
     if !has_schemas() {
         return;
