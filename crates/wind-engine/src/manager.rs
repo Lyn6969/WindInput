@@ -52,6 +52,18 @@ struct EngineSection {
 struct CodetableSection {
     #[serde(default)]
     max_code_length: usize,
+    /// 临时拼音：码表方案下通过触发键临时切到拼音反查
+    #[serde(default)]
+    temp_pinyin: TempPinyinSection,
+}
+
+#[derive(Debug, Clone, Default, serde::Deserialize)]
+struct TempPinyinSection {
+    #[serde(default)]
+    enabled: bool,
+    /// 临时拼音使用的拼音方案 id（默认回退 "pinyin"）
+    #[serde(default)]
+    schema: String,
 }
 
 #[derive(Debug, Clone, Default, serde::Deserialize)]
@@ -255,6 +267,53 @@ impl EngineManager {
         match self.active_engine() {
             Some(engine) => engine.convert(input, max_candidates).unwrap_or_else(|e| {
                 warn!("convert error: {}", e);
+                ConvertResult::default()
+            }),
+            None => ConvertResult::default(),
+        }
+    }
+
+    /// 当前活跃引擎类型（必要时懒加载）
+    pub fn current_engine_type(&self) -> Option<EngineType> {
+        self.active_engine().map(|e| e.engine_type())
+    }
+
+    /// 当前活跃方案（须为码表类型）的临时拼音目标方案 id。
+    /// 启用且目标方案可加载时返回 Some(target)，否则 None。
+    pub fn temp_pinyin_target(&self) -> Option<String> {
+        let id = self.active_schema_id();
+        let schema = Self::read_schema(&id, self.data_dir.as_deref())?;
+        let tp = &schema.engine.codetable.temp_pinyin;
+        if !tp.enabled {
+            return None;
+        }
+        let target = if tp.schema.is_empty() {
+            "pinyin".to_string()
+        } else {
+            tp.schema.clone()
+        };
+        if self.ensure_loaded(&target) {
+            Some(target)
+        } else {
+            None
+        }
+    }
+
+    /// 用指定方案引擎转换（不改变当前活跃方案，必要时懒加载）。
+    /// 用于临时拼音：码表模式下临时借用拼音引擎反查。
+    pub fn convert_with(&self, schema_id: &str, input: &str, max_candidates: usize) -> ConvertResult {
+        if !self.ensure_loaded(schema_id) {
+            return ConvertResult::default();
+        }
+        let engine = self
+            .engines
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(schema_id)
+            .cloned();
+        match engine {
+            Some(e) => e.convert(input, max_candidates).unwrap_or_else(|err| {
+                warn!("convert_with error: {}", err);
                 ConvertResult::default()
             }),
             None => ConvertResult::default(),

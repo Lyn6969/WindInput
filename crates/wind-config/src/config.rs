@@ -123,6 +123,28 @@ pub struct InputConfig {
     pub shift_temp_english: ShiftTempEnglishConfig,
     #[serde(default)]
     pub capslock: CapslockConfig,
+    #[serde(default)]
+    pub temp_pinyin: TempPinyinConfig,
+}
+
+/// 临时拼音配置（码表方案下临时切到拼音反查）
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TempPinyinConfig {
+    /// 触发键（如 "backtick" / "z" / "semicolon"），默认反引号
+    #[serde(default = "default_temp_pinyin_triggers")]
+    pub trigger_keys: Vec<String>,
+}
+
+fn default_temp_pinyin_triggers() -> Vec<String> {
+    vec!["backtick".to_string()]
+}
+
+impl Default for TempPinyinConfig {
+    fn default() -> Self {
+        Self {
+            trigger_keys: default_temp_pinyin_triggers(),
+        }
+    }
 }
 
 impl Default for InputConfig {
@@ -136,6 +158,7 @@ impl Default for InputConfig {
             select_char_keys: vec![],
             smart_punct_after_digit: true,
             smart_punct_list: ".,:".to_string(),
+            temp_pinyin: TempPinyinConfig::default(),
             enter_behavior: "commit".to_string(),
             space_on_empty_behavior: "commit".to_string(),
             numpad_behavior: String::new(),
@@ -428,6 +451,9 @@ impl Config {
             }
             if input.get("pinyin_separator").is_some() {
                 self.input.pinyin_separator = i.pinyin_separator;
+            }
+            if input.get("temp_pinyin").is_some() {
+                self.input.temp_pinyin = i.temp_pinyin;
             }
         }
 

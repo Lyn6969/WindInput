@@ -371,6 +371,80 @@ fn test_select_key_falls_back_to_punct_when_insufficient() {
 }
 
 #[test]
+fn test_temp_pinyin_backtick_trigger_and_commit() {
+    if !has_schemas() {
+        return;
+    }
+    // 五笔方案下，反引号(`, VK_OEM_3=0xC0)触发临时拼音
+    let coord = Coordinator::new_headless(config_with("wubi86"), Some(&data_dir()));
+    assert_eq!(coord.active_schema_id(), "wubi86");
+
+    // 按反引号进入临时拼音，组合区应显示前缀 "`"
+    let act = coord.handle_key_event(&key_event(0xC0, EVENT_KEY_DOWN));
+    let preedit = action_text(&act).expect("反引号应进入临时拼音并返回组合区");
+    assert_eq!(preedit, "`", "进入临时拼音组合区应为前缀 `");
+
+    // 输入拼音 nihao
+    let mut last = act;
+    for c in "nihao".chars() {
+        last = press_letter(&coord, c);
+    }
+    let preedit = action_text(&last).unwrap();
+    assert_eq!(preedit, "`ni hao", "临时拼音组合区应为 `ni hao，实际: {}", preedit);
+
+    // 候选应来自拼音引擎（含 你好）
+    let texts = coord.debug_page_texts();
+    assert!(
+        texts.iter().any(|t| t.contains("你好")),
+        "临时拼音候选应含 你好，实际: {:?}",
+        texts
+    );
+
+    // 空格上屏首选并退出临时拼音
+    match coord.handle_key_event(&key_event(0x20, EVENT_KEY_DOWN)) {
+        KeyAction::InsertText { text, .. } => {
+            assert!(text.contains("你好"), "应上屏 你好，实际: {}", text);
+        }
+        other => panic!("空格应上屏候选，实际: {:?}", other),
+    }
+
+    // 退出后五笔输入应恢复正常（输入 a 显示编码 a）
+    let act = press_letter(&coord, 'a');
+    assert_eq!(action_text(&act).unwrap(), "a", "退出临时拼音后五笔应正常");
+}
+
+#[test]
+fn test_temp_pinyin_esc_exits() {
+    if !has_schemas() {
+        return;
+    }
+    let coord = Coordinator::new_headless(config_with("wubi86"), Some(&data_dir()));
+    coord.handle_key_event(&key_event(0xC0, EVENT_KEY_DOWN));
+    press_letter(&coord, 'n');
+    // Esc 退出
+    match coord.handle_key_event(&key_event(0x1B, EVENT_KEY_DOWN)) {
+        KeyAction::ClearComposition => {}
+        other => panic!("Esc 应清空组合区退出，实际: {:?}", other),
+    }
+    // 退出后五笔正常
+    let act = press_letter(&coord, 'a');
+    assert_eq!(action_text(&act).unwrap(), "a");
+}
+
+#[test]
+fn test_temp_pinyin_not_triggered_in_pinyin_mode() {
+    if !has_schemas() {
+        return;
+    }
+    // 拼音方案下反引号不应触发临时拼音（仅码表方案启用）
+    let coord = Coordinator::new_headless(config_with("pinyin"), Some(&data_dir()));
+    let act = coord.handle_key_event(&key_event(0xC0, EVENT_KEY_DOWN));
+    // 应作为标点处理（反引号→ 不在中文标点表则原样/全角），不应进入临时拼音前缀
+    let txt = action_text(&act).unwrap_or_default();
+    assert_ne!(txt, "`ni", "拼音方案不应进入临时拼音");
+}
+
+#[test]
 fn test_mode_toggle_via_shift() {
     if !has_schemas() {
         return;

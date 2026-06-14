@@ -76,6 +76,14 @@ struct State {
     selected_index: usize,
     /// 当前页码（0-based）
     current_page: usize,
+    /// 临时拼音模式（码表方案下经触发键临时切到拼音反查）
+    temp_pinyin_mode: bool,
+    /// 临时拼音输入缓冲（拼音串）
+    temp_pinyin_buffer: String,
+    /// 临时拼音目标方案 id（如 "pinyin"）
+    temp_pinyin_schema: String,
+    /// 临时拼音组合区前缀字符（触发键，如 "`"）
+    temp_pinyin_prefix: String,
     caret_x: i32,
     caret_y: i32,
     caret_height: i32,
@@ -173,6 +181,10 @@ impl Coordinator {
                 candidates: Vec::new(),
                 selected_index: 0,
                 current_page: 0,
+                temp_pinyin_mode: false,
+                temp_pinyin_buffer: String::new(),
+                temp_pinyin_schema: String::new(),
+                temp_pinyin_prefix: String::new(),
                 caret_x: 0,
                 caret_y: 0,
                 caret_height: 0,
@@ -368,6 +380,224 @@ impl Coordinator {
             true
         } else {
             false
+        }
+    }
+
+    // ───────────────────────── 临时拼音 ─────────────────────────
+
+    /// 触发键名 → VK（不含 z，z 混合模式后置实现）
+    fn temp_pinyin_trigger_vk(key: &str) -> Option<u32> {
+        match key.trim().to_lowercase().as_str() {
+            "backtick" | "grave" | "`" => Some(0xC0),
+            "semicolon" | ";" => Some(0xBA),
+            "quote" | "'" => Some(0xDE),
+            "comma" | "," => Some(0xBC),
+            "period" | "." => Some(0xBE),
+            "slash" | "/" => Some(0xBF),
+            "lbracket" | "[" => Some(0xDB),
+            "rbracket" | "]" => Some(0xDD),
+            _ => None,
+        }
+    }
+
+    /// VK → 组合区前缀字符
+    fn temp_pinyin_prefix_for(key_code: u32) -> &'static str {
+        match key_code {
+            0xC0 => "`",
+            0xBA => ";",
+            0xDE => "'",
+            0xBC => ",",
+            0xBE => ".",
+            0xBF => "/",
+            0xDB => "[",
+            0xDD => "]",
+            _ => "`",
+        }
+    }
+
+    /// 当前按键是否匹配配置的临时拼音触发键
+    fn is_temp_pinyin_trigger(&self, key_code: u32) -> bool {
+        self.config
+            .input
+            .temp_pinyin
+            .trigger_keys
+            .iter()
+            .filter_map(|k| Self::temp_pinyin_trigger_vk(k))
+            .any(|vk| vk == key_code)
+    }
+
+    /// 退出临时拼音模式并清空相关状态
+    fn exit_temp_pinyin(&self, state: &mut State) {
+        state.temp_pinyin_mode = false;
+        state.temp_pinyin_buffer.clear();
+        state.temp_pinyin_schema.clear();
+        state.temp_pinyin_prefix.clear();
+        state.candidates.clear();
+        state.preedit.clear();
+        state.current_page = 0;
+        state.selected_index = 0;
+    }
+
+    /// 用临时拼音目标方案转换缓冲，刷新候选与组合区（前缀 + 拼音）
+    fn update_temp_pinyin_candidates(&self, state: &mut State) {
+        state.candidates.clear();
+        state.current_page = 0;
+        state.selected_index = 0;
+        let prefix = state.temp_pinyin_prefix.clone();
+        if state.temp_pinyin_buffer.is_empty() {
+            state.preedit = prefix;
+            return;
+        }
+        let result = self.engine_mgr.convert_with(
+            &state.temp_pinyin_schema,
+            &state.temp_pinyin_buffer,
+            ENGINE_MAX_CANDIDATES,
+        );
+        let display = if result.preedit_display.is_empty() {
+            state.temp_pinyin_buffer.clone()
+        } else {
+            result.preedit_display
+        };
+        state.preedit = format!("{}{}", prefix, display);
+
+        let mut candidates = result.candidates;
+        for c in &mut candidates {
+            c.weight += self.freq_tracker.get_boost(&c.text) as i32;
+        }
+        candidates.sort_by(|a, b| {
+            b.weight
+                .cmp(&a.weight)
+                .then(a.natural_order.cmp(&b.natural_order))
+        });
+        candidates.truncate(ENGINE_MAX_CANDIDATES);
+        state.candidates = candidates;
+    }
+
+    /// 临时拼音模式下的按键处理
+    fn handle_temp_pinyin_key(&self, state: &mut State, data: &KeyEventData) -> KeyAction {
+        match data.key_code {
+            0x1B => {
+                // Esc：退出
+                self.exit_temp_pinyin(state);
+                self.notify_ui_hide();
+                KeyAction::ClearComposition
+            }
+            0x08 => {
+                // Backspace：删字符，空则退出
+                if state.temp_pinyin_buffer.is_empty() {
+                    self.exit_temp_pinyin(state);
+                    self.notify_ui_hide();
+                    return KeyAction::ClearComposition;
+                }
+                state.temp_pinyin_buffer.pop();
+                if state.temp_pinyin_buffer.is_empty() {
+                    self.exit_temp_pinyin(state);
+                    self.notify_ui_hide();
+                    return KeyAction::ClearComposition;
+                }
+                self.update_temp_pinyin_candidates(state);
+                let display = state.preedit.clone();
+                self.notify_ui_update(state);
+                KeyAction::UpdateComposition {
+                    text: display.clone(),
+                    caret_pos: display.chars().count() as u32,
+                }
+            }
+            0x20 | 0x0D => {
+                // Space/Enter：上屏高亮候选并退出
+                if !state.candidates.is_empty() {
+                    let idx = self.highlighted_global_index(state).min(state.candidates.len() - 1);
+                    let text = state.candidates[idx].text.clone();
+                    self.record_selection(&text);
+                    self.exit_temp_pinyin(state);
+                    self.notify_ui_hide();
+                    Self::commit_action(text, true)
+                } else {
+                    self.exit_temp_pinyin(state);
+                    self.notify_ui_hide();
+                    KeyAction::ClearComposition
+                }
+            }
+            0x31..=0x39 if data.modifiers & MOD_SHIFT == 0 => {
+                // 数字键选当前页第 N 个
+                let (start, end) = self.page_range(state);
+                let idx = start + (data.key_code - 0x31) as usize;
+                if idx < end {
+                    let text = state.candidates[idx].text.clone();
+                    self.record_selection(&text);
+                    self.exit_temp_pinyin(state);
+                    self.notify_ui_hide();
+                    Self::commit_action(text, true)
+                } else {
+                    KeyAction::Consumed
+                }
+            }
+            0x41..=0x5A if data.modifiers & (MOD_CTRL | MOD_ALT) == 0 => {
+                // 字母累积拼音
+                let ch = (b'a' + (data.key_code - 0x41) as u8) as char;
+                state.temp_pinyin_buffer.push(ch);
+                self.update_temp_pinyin_candidates(state);
+                let display = state.preedit.clone();
+                self.notify_ui_update(state);
+                KeyAction::UpdateComposition {
+                    text: display.clone(),
+                    caret_pos: display.chars().count() as u32,
+                }
+            }
+            0x26 | 0x28 => {
+                // 上/下方向键
+                let changed = if data.key_code == 0x26 {
+                    self.move_up(state)
+                } else {
+                    self.move_down(state)
+                };
+                if changed {
+                    self.notify_ui_update(state);
+                }
+                KeyAction::Consumed
+            }
+            0x21 | 0x22 => {
+                // 翻页
+                let changed = if data.key_code == 0x21 {
+                    self.page_prev(state)
+                } else {
+                    self.page_next(state)
+                };
+                if changed {
+                    self.notify_ui_update(state);
+                }
+                KeyAction::Consumed
+            }
+            _ => {
+                // 二三候选键
+                if data.modifiers & MOD_SHIFT == 0 {
+                    if let Some(offset) = self.select_key_offset(data.key_code) {
+                        let (start, end) = self.page_range(state);
+                        let idx = start + offset;
+                        if idx < end {
+                            let text = state.candidates[idx].text.clone();
+                            self.record_selection(&text);
+                            self.exit_temp_pinyin(state);
+                            self.notify_ui_hide();
+                            return Self::commit_action(text, true);
+                        }
+                    }
+                }
+                // 其它键：先上屏高亮候选退出，再让标点字符按普通流程？
+                // 简化：有候选则上屏高亮候选并退出（吞掉该键）；否则退出清空。
+                if !state.candidates.is_empty() {
+                    let idx = self.highlighted_global_index(state).min(state.candidates.len() - 1);
+                    let text = state.candidates[idx].text.clone();
+                    self.record_selection(&text);
+                    self.exit_temp_pinyin(state);
+                    self.notify_ui_hide();
+                    Self::commit_action(text, true)
+                } else {
+                    self.exit_temp_pinyin(state);
+                    self.notify_ui_hide();
+                    KeyAction::ClearComposition
+                }
+            }
         }
     }
 
@@ -621,6 +851,33 @@ impl MessageHandler for Coordinator {
         // 英文模式：直接透传
         if !state.chinese_mode {
             return KeyAction::PassThrough;
+        }
+
+        // 临时拼音模式：路由到专用处理器（独占按键）
+        if state.temp_pinyin_mode {
+            return self.handle_temp_pinyin_key(&mut state, data);
+        }
+
+        // 触发临时拼音：码表方案 + 空缓冲 + 匹配触发键 + 无修饰键
+        if state.input_buffer.is_empty()
+            && data.modifiers & (MOD_CTRL | MOD_ALT | MOD_SHIFT) == 0
+            && self.is_temp_pinyin_trigger(data.key_code)
+        {
+            if let Some(target) = self.engine_mgr.temp_pinyin_target() {
+                state.temp_pinyin_mode = true;
+                state.temp_pinyin_schema = target;
+                state.temp_pinyin_buffer.clear();
+                state.temp_pinyin_prefix =
+                    Self::temp_pinyin_prefix_for(data.key_code).to_string();
+                self.update_temp_pinyin_candidates(&mut state);
+                let display = state.preedit.clone();
+                self.notify_ui_update(&state);
+                debug!("Entered temp pinyin mode (prefix={})", state.temp_pinyin_prefix);
+                return KeyAction::UpdateComposition {
+                    text: display.clone(),
+                    caret_pos: display.chars().count() as u32,
+                };
+            }
         }
 
         // Ctrl/Alt 组合（非热键）：有输入则清空，否则透传
