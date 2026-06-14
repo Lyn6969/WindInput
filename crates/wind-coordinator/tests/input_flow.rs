@@ -784,6 +784,74 @@ fn test_dynamic_paging_expands_candidates() {
     }
 }
 
+/// 按下 Shift+字母
+fn press_shift_letter(coord: &Coordinator, c: char) -> KeyAction {
+    let vk = (c.to_ascii_uppercase() as u32) & 0xFF;
+    let mut ev = key_event(vk, EVENT_KEY_DOWN);
+    ev.modifiers = 0x0001; // MOD_SHIFT
+    coord.handle_key_event(&ev)
+}
+
+#[test]
+fn test_temp_english_shift_letter_commit() {
+    if !has_schemas() {
+        return;
+    }
+    let coord = Coordinator::new_headless(config_with("wubi86"), Some(&data_dir()));
+    // Shift+H 进入临时英文，首字母大写
+    let act = press_shift_letter(&coord, 'h');
+    assert_eq!(action_text(&act).unwrap(), "H", "Shift+H 应进入临时英文显示 H");
+
+    // 续输 ello（无 Shift → 小写）
+    let mut last = act;
+    for c in "ello".chars() {
+        last = press_letter(&coord, c);
+    }
+    assert_eq!(action_text(&last).unwrap(), "Hello", "组合区应为 Hello");
+
+    // 空格上屏
+    match coord.handle_key_event(&key_event(0x20, EVENT_KEY_DOWN)) {
+        KeyAction::InsertText { text, .. } => assert_eq!(text, "Hello"),
+        other => panic!("空格应上屏 Hello，实际: {:?}", other),
+    }
+    // 退出后五笔恢复正常
+    let act = press_letter(&coord, 'a');
+    assert_eq!(action_text(&act).unwrap(), "a");
+}
+
+#[test]
+fn test_temp_english_digits_and_punct() {
+    if !has_schemas() {
+        return;
+    }
+    let coord = Coordinator::new_headless(config_with("wubi86"), Some(&data_dir()));
+    press_shift_letter(&coord, 'v'); // V
+    press_letter(&coord, 'e');
+    press_letter(&coord, 'r');
+    // 数字入缓冲
+    press_vk(&coord, 0x32, false); // 2
+    let last = press_letter(&coord, 'b');
+    assert_eq!(action_text(&last).unwrap(), "Ver2b", "数字应入缓冲");
+    // 句号(0xBE)：上屏缓冲 + 中文句号（默认中文标点）
+    match coord.handle_key_event(&key_event(0xBE, EVENT_KEY_DOWN)) {
+        KeyAction::InsertText { text, .. } => assert_eq!(text, "Ver2b。", "应上屏缓冲+中文句号"),
+        other => panic!("标点应上屏缓冲+标点，实际: {:?}", other),
+    }
+}
+
+#[test]
+fn test_temp_english_esc_exits() {
+    if !has_schemas() {
+        return;
+    }
+    let coord = Coordinator::new_headless(config_with("wubi86"), Some(&data_dir()));
+    press_shift_letter(&coord, 'a');
+    match coord.handle_key_event(&key_event(0x1B, EVENT_KEY_DOWN)) {
+        KeyAction::ClearComposition => {}
+        other => panic!("Esc 应退出临时英文，实际: {:?}", other),
+    }
+}
+
 #[test]
 fn test_mode_toggle_via_shift() {
     if !has_schemas() {

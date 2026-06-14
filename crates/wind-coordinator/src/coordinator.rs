@@ -119,6 +119,10 @@ struct State {
     quick_input_buffer: String,
     /// 快捷输入组合区前缀字符（触发键，如 ";"）
     quick_input_prefix: String,
+    /// 临时英文模式（Shift+字母触发，临时输入英文）
+    temp_english_mode: bool,
+    /// 临时英文输入缓冲
+    temp_english_buffer: String,
     caret_x: i32,
     caret_y: i32,
     caret_height: i32,
@@ -261,6 +265,8 @@ impl Coordinator {
                 quick_input_mode: false,
                 quick_input_buffer: String::new(),
                 quick_input_prefix: String::new(),
+                temp_english_mode: false,
+                temp_english_buffer: String::new(),
                 caret_x: 0,
                 caret_y: 0,
                 caret_height: 0,
@@ -1021,6 +1027,86 @@ impl Coordinator {
         }
     }
 
+    // ───────────────────────── 临时英文 ─────────────────────────
+
+    /// 退出临时英文模式并清空状态
+    fn exit_temp_english(&self, state: &mut State) {
+        state.temp_english_mode = false;
+        state.temp_english_buffer.clear();
+        state.preedit.clear();
+    }
+
+    /// 临时英文模式按键处理（首版：缓冲累积 + 空格/回车/标点上屏，暂无词库候选）
+    fn handle_temp_english_key(&self, state: &mut State, data: &KeyEventData) -> KeyAction {
+        let comp = |buf: &str| KeyAction::UpdateComposition {
+            text: buf.to_string(),
+            caret_pos: buf.chars().count() as u32,
+        };
+        match data.key_code {
+            0x1B => {
+                // Esc：放弃退出
+                self.exit_temp_english(state);
+                KeyAction::ClearComposition
+            }
+            0x08 => {
+                // 退格：删字符，空则退出
+                state.temp_english_buffer.pop();
+                if state.temp_english_buffer.is_empty() {
+                    self.exit_temp_english(state);
+                    KeyAction::ClearComposition
+                } else {
+                    comp(&state.temp_english_buffer)
+                }
+            }
+            0x20 | 0x0D => {
+                // 空格/回车：上屏缓冲
+                let mut text = state.temp_english_buffer.clone();
+                if state.full_width {
+                    text = to_full_width(&text);
+                }
+                self.exit_temp_english(state);
+                if text.is_empty() {
+                    KeyAction::ClearComposition
+                } else {
+                    Self::commit_action(text, true)
+                }
+            }
+            0x41..=0x5A => {
+                // 字母：Shift 大写，否则小写
+                let shift = data.modifiers & MOD_SHIFT != 0;
+                let base = data.key_code - 0x41;
+                let ch = if shift {
+                    (b'A' + base as u8) as char
+                } else {
+                    (b'a' + base as u8) as char
+                };
+                state.temp_english_buffer.push(ch);
+                comp(&state.temp_english_buffer)
+            }
+            0x30..=0x39 if data.modifiers & MOD_SHIFT == 0 => {
+                // 数字直接入缓冲（英文常含数字，如 v2）
+                let ch = (b'0' + (data.key_code - 0x30) as u8) as char;
+                state.temp_english_buffer.push(ch);
+                comp(&state.temp_english_buffer)
+            }
+            _ => {
+                // 其它（标点等）：上屏缓冲 + 转换后的标点，退出
+                let shift = data.modifiers & MOD_SHIFT != 0;
+                if let Some(ch) = punct_char(data.key_code, shift) {
+                    let mut text = state.temp_english_buffer.clone();
+                    if state.full_width {
+                        text = to_full_width(&text);
+                    }
+                    let punct = self.convert_punct_char(state, ch);
+                    self.exit_temp_english(state);
+                    Self::commit_action(format!("{}{}", text, punct), true)
+                } else {
+                    KeyAction::Consumed
+                }
+            }
+        }
+    }
+
     /// 顶屏当前高亮候选（若有）并进入临时拼音模式（对齐 Go decideBufferedTrigger 的 actEnterMode）。
     /// 有候选：上屏高亮候选 + 原子开启临时拼音组合；空码：丢弃缓冲后进入。
     fn commit_and_enter_temp_pinyin(
@@ -1389,6 +1475,31 @@ impl MessageHandler for Coordinator {
         // 快捷输入模式：路由到专用处理器（独占按键）
         if state.quick_input_mode {
             return self.handle_quick_input_key(&mut state, data);
+        }
+
+        // 临时英文模式：路由到专用处理器（独占按键）
+        if state.temp_english_mode {
+            return self.handle_temp_english_key(&mut state, data);
+        }
+
+        // 触发临时英文：Shift+字母（中文模式 + 空缓冲 + 无候选 + 已启用）
+        if state.input_buffer.is_empty()
+            && state.candidates.is_empty()
+            && self.config.input.shift_temp_english.enabled
+            && data.modifiers & MOD_SHIFT != 0
+            && data.modifiers & (MOD_CTRL | MOD_ALT) == 0
+            && (0x41..=0x5A).contains(&data.key_code)
+        {
+            let ch = (b'A' + (data.key_code - 0x41) as u8) as char; // 首字母大写
+            state.temp_english_mode = true;
+            state.temp_english_buffer = ch.to_string();
+            self.notify_ui_hide();
+            let buf_disp = state.temp_english_buffer.clone();
+            debug!("Entered temp English mode (buffer={})", buf_disp);
+            return KeyAction::UpdateComposition {
+                text: buf_disp.clone(),
+                caret_pos: buf_disp.chars().count() as u32,
+            };
         }
 
         // 触发快捷输入：空缓冲 + 无候选 + 匹配触发键 + 无修饰键
