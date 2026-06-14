@@ -4,8 +4,18 @@
 //! 横向圆角小条，每格一个状态；中文模式格高亮。固定显示于工作区右下角。
 //! 点击切换暂未实现（后续 UI 统一优化阶段补齐拖动 + 命中），当前为展示用。
 
+use std::cell::RefCell;
+use std::rc::Rc;
+use std::sync::mpsc::Sender;
+
+use crate::manager::{ToolbarAction, UiEvent};
 use crate::text::dwrite::TextRenderer;
-use crate::window::LayeredWindow;
+use crate::view::Rect;
+use crate::window::{LayeredWindow, WindowMouse};
+use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, WPARAM};
+use windows::Win32::UI::WindowsAndMessaging::{
+    LoadCursorW, SetCursor, IDC_ARROW, WM_LBUTTONDOWN, WM_SETCURSOR,
+};
 
 /// 工具栏状态（由协调器推送）
 #[derive(Debug, Clone)]
@@ -28,10 +38,11 @@ impl Default for ToolbarState {
     }
 }
 
-/// 一个单元格：文本 + 是否高亮（中文模式格）
+/// 一个单元格：文本 + 是否高亮（中文模式格）+ 点击动作
 struct Cell {
     text: String,
     highlight: bool,
+    action: ToolbarAction,
 }
 
 /// 工具栏窗口
@@ -42,6 +53,8 @@ pub struct Toolbar {
     /// 是否已计算固定位置
     pos: Option<(i32, i32)>,
     visible: bool,
+    /// 鼠标处理器（与 window 共享，wnd_proc 经注册表回调）
+    mouse: Rc<RefCell<ToolbarMouse>>,
 }
 
 impl Toolbar {
@@ -59,16 +72,22 @@ impl Toolbar {
     const SEP: [u8; 4] = [70, 70, 74, 255]; // 分隔线
     const GRIP: [u8; 4] = [120, 120, 124, 255];
 
-    pub fn new() -> Result<Self, String> {
+    pub fn new(events: Sender<UiEvent>) -> Result<Self, String> {
         let scale = Self::dpi_scale();
         let window = LayeredWindow::create(None, 160, 40, "WindInputToolbar")?;
         let renderer = TextRenderer::new("Microsoft YaHei UI", Self::FONT_PX * scale)?;
+        let mouse = Rc::new(RefCell::new(ToolbarMouse {
+            hits: Vec::new(),
+            events,
+        }));
+        window.register_mouse(mouse.clone());
         Ok(Self {
             window,
             renderer,
             scale,
             pos: None,
             visible: false,
+            mouse,
         })
     }
 
@@ -84,10 +103,10 @@ impl Toolbar {
         let punct = if state.chinese_punct { "，。" } else { ",." };
         let width = if state.full_width { "全" } else { "半" };
         vec![
-            Cell { text: mode.to_string(), highlight: state.chinese_mode },
-            Cell { text: schema, highlight: false },
-            Cell { text: punct.to_string(), highlight: false },
-            Cell { text: width.to_string(), highlight: false },
+            Cell { text: mode.to_string(), highlight: state.chinese_mode, action: ToolbarAction::ToggleMode },
+            Cell { text: schema, highlight: false, action: ToolbarAction::SwitchEngine },
+            Cell { text: punct.to_string(), highlight: false, action: ToolbarAction::TogglePunct },
+            Cell { text: width.to_string(), highlight: false, action: ToolbarAction::ToggleWidth },
         ]
     }
 
@@ -122,11 +141,13 @@ impl Toolbar {
             draw_grip(buf, w, h, grip_w as u32, Self::GRIP, s);
         }
 
-        // 逐格绘制
+        // 逐格绘制 + 记录命中矩形
         let mut x = grip_w;
         let font_h = self.renderer.measure_text("中").height;
+        let mut hits: Vec<(ToolbarAction, Rect)> = Vec::with_capacity(cells.len());
         for (i, c) in cells.iter().enumerate() {
             let cw = cell_widths[i];
+            hits.push((c.action, Rect { x, y: 0.0, w: cw, h: h as f32 }));
             // 分隔线（首格前不画）
             if i > 0 {
                 draw_vsep(self.window.buffer_mut(), w, h, x as u32, Self::SEP, s);
@@ -151,6 +172,8 @@ impl Toolbar {
                 .draw_text(self.window.buffer_mut(), w, h, tx.max(x), ty.max(0.0), &c.text, fg);
             x += cw;
         }
+        // 同步命中矩形给鼠标处理器
+        self.mouse.borrow_mut().hits = hits;
 
         if let Err(e) = self.window.update() {
             tracing::warn!("Toolbar update failed: {}", e);
@@ -220,6 +243,46 @@ impl Toolbar {
         #[cfg(not(windows))]
         {
             1.0
+        }
+    }
+}
+
+/// 工具栏鼠标处理器：点击单元格发送对应切换动作。
+pub struct ToolbarMouse {
+    hits: Vec<(ToolbarAction, Rect)>,
+    events: Sender<UiEvent>,
+}
+
+impl WindowMouse for ToolbarMouse {
+    fn on_message(
+        &mut self,
+        _hwnd: HWND,
+        msg: u32,
+        _wparam: WPARAM,
+        lparam: LPARAM,
+    ) -> Option<LRESULT> {
+        match msg {
+            WM_LBUTTONDOWN => {
+                let v = lparam.0 as u32;
+                let x = (v & 0xFFFF) as i16 as f32;
+                let y = ((v >> 16) & 0xFFFF) as i16 as f32;
+                for (action, r) in &self.hits {
+                    if r.contains(x, y) {
+                        let _ = self.events.send(UiEvent::Toolbar(*action));
+                        break;
+                    }
+                }
+                Some(LRESULT(0))
+            }
+            WM_SETCURSOR => {
+                unsafe {
+                    if let Ok(c) = LoadCursorW(None, IDC_ARROW) {
+                        SetCursor(c);
+                    }
+                }
+                Some(LRESULT(1))
+            }
+            _ => None,
         }
     }
 }

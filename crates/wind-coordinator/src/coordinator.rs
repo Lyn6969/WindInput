@@ -25,7 +25,7 @@ use wind_store::freq::FreqTracker;
 use wind_transform::fullwidth::to_full_width;
 use wind_transform::punctuation::PunctuationConverter;
 use wind_ui::candidate_window::CandidateItem;
-use wind_ui::manager::{UiCommand, UiEvent, UiManager};
+use wind_ui::manager::{ToolbarAction, UiCommand, UiEvent, UiManager};
 use wind_ui::toolbar::ToolbarState;
 
 /// VK + shift → 该键产生的 ASCII 标点/符号字符（字母键返回 None，由拼音/码表处理）。
@@ -1280,7 +1280,20 @@ impl Coordinator {
             UiEvent::CandidateSelect(i) => self.mouse_select(i),
             UiEvent::Page(dir) => self.mouse_page(dir),
             UiEvent::Hover(i) => self.mouse_hover(i),
+            UiEvent::Toolbar(a) => self.mouse_toolbar(a),
         }
+    }
+
+    /// 工具栏单元格点击：复用菜单命令切换状态（内部已推送 C++），再刷新工具栏显示。
+    fn mouse_toolbar(&self, action: ToolbarAction) {
+        let cmd = match action {
+            ToolbarAction::ToggleMode => "toggle_mode",
+            ToolbarAction::SwitchEngine => "switch_engine",
+            ToolbarAction::TogglePunct => "toggle_punct",
+            ToolbarAction::ToggleWidth => "toggle_width",
+        };
+        self.handle_menu_command(cmd);
+        self.notify_toolbar();
     }
 
     /// 点击选词：提交页内第 N 个候选，经 push 管道异步上屏（对齐 Go PushCommitText）。

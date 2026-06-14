@@ -39,6 +39,19 @@ pub enum UiCommand {
     Shutdown,
 }
 
+/// 工具栏单元格动作
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ToolbarAction {
+    /// 中/英切换
+    ToggleMode,
+    /// 切换输入方案
+    SwitchEngine,
+    /// 中/英标点切换
+    TogglePunct,
+    /// 全/半角切换
+    ToggleWidth,
+}
+
 /// UI → 协调器的反向事件（鼠标交互）
 #[derive(Debug, Clone)]
 pub enum UiEvent {
@@ -48,6 +61,8 @@ pub enum UiEvent {
     Page(i32),
     /// 悬停到页内候选下标（-1 表示离开）
     Hover(i32),
+    /// 工具栏单元格点击
+    Toolbar(ToolbarAction),
 }
 
 /// UI 管理器（在独立线程中运行）
@@ -88,7 +103,7 @@ impl UiManager {
     fn ui_thread(rx: mpsc::Receiver<UiCommand>, event_tx: mpsc::Sender<UiEvent>) {
         // 创建候选窗口
         let config = CandidateWindowConfig::default();
-        let mut candidate_window = match CandidateWindow::new(config, event_tx) {
+        let mut candidate_window = match CandidateWindow::new(config, event_tx.clone()) {
             Ok(w) => {
                 info!("Candidate window created");
                 w
@@ -110,7 +125,7 @@ impl UiManager {
         let mut tip_hide_at: Option<std::time::Instant> = None;
 
         // 常驻工具栏（best-effort，失败不影响其它窗口）
-        let mut toolbar = match crate::toolbar::Toolbar::new() {
+        let mut toolbar = match crate::toolbar::Toolbar::new(event_tx.clone()) {
             Ok(t) => Some(t),
             Err(e) => {
                 error!("Failed to create toolbar: {}", e);
