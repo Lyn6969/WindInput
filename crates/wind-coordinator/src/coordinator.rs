@@ -191,6 +191,12 @@ pub struct Coordinator {
     last_valid_caret: Mutex<(i32, i32, i32)>,
     /// 正在等待有效光标坐标（首次连接尚未拿到时为 true）；拿到后触发重定位
     awaiting_caret: Mutex<bool>,
+    /// 主题目录（data/themes）
+    themes_dir: Option<std::path::PathBuf>,
+    /// 当前主题名
+    theme_name: Mutex<String>,
+    /// 主题选择持久化文件（theme.txt）
+    theme_path: Option<std::path::PathBuf>,
 }
 
 /// 短语候选权重基准（高于普通候选，使短语展开排在前列）
@@ -264,21 +270,13 @@ impl Coordinator {
             let _ = coordinator.ui_tx.send(UiCommand::SetToolbarPos { x, y });
         }
 
-        // 加载并下发主题
-        if let Some(d) = &data_dir {
-            let name = if coordinator.config.ui.theme.is_empty() {
-                "default"
-            } else {
-                &coordinator.config.ui.theme
-            };
-            match wind_theme::ResolvedTheme::load(&d.join("themes"), name, false) {
-                Ok(t) => {
-                    info!("Loaded theme: {}", name);
-                    let _ = coordinator.ui_tx.send(UiCommand::SetTheme(Box::new(t)));
-                }
-                Err(e) => warn!("Failed to load theme {}: {}", name, e),
-            }
-        }
+        // 加载并下发初始主题
+        let name = coordinator
+            .theme_name
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        coordinator.push_theme(&name);
         coordinator
     }
 
@@ -358,6 +356,23 @@ impl Coordinator {
         let shadow = ShadowStore::new();
         let shadow_path = freq_path.as_ref().map(|p| p.with_file_name("shadow.json"));
         let toolbar_pos_path = freq_path.as_ref().map(|p| p.with_file_name("toolbar_pos.txt"));
+        let theme_path = freq_path.as_ref().map(|p| p.with_file_name("theme.txt"));
+        let themes_dir = data_dir.map(|d| d.join("themes"));
+        // 初始主题名：theme.txt（用户上次选择）> config.ui.theme > "default"
+        let initial_theme = theme_path
+            .as_ref()
+            .and_then(|p| std::fs::read_to_string(p).ok())
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .or_else(|| {
+                let t = config.ui.theme.trim();
+                if t.is_empty() {
+                    None
+                } else {
+                    Some(t.to_string())
+                }
+            })
+            .unwrap_or_else(|| "default".to_string());
         if let Some(p) = &shadow_path {
             if let Err(e) = shadow.load_from_file(p) {
                 warn!("Failed to load shadow {}: {}", p.display(), e);
@@ -419,6 +434,9 @@ impl Coordinator {
             pair_tracker: Mutex::new(wind_transform::pair_tracker::PairTracker::new()),
             last_valid_caret: Mutex::new((0, 0, 0)),
             awaiting_caret: Mutex::new(false),
+            themes_dir,
+            theme_name: Mutex::new(initial_theme),
+            theme_path,
         });
         // 启动即显示常驻工具栏（反映初始 中英/方案/标点/全半角）
         coordinator.notify_toolbar();
@@ -1548,7 +1566,67 @@ impl Coordinator {
                     let _ = self.ui_tx.send(UiCommand::OpenPath(d.display().to_string()));
                 }
             }
+            MenuCmd::CycleTheme => self.cycle_theme(),
         }
+    }
+
+    /// 加载并下发指定主题（失败保留当前）。
+    fn push_theme(&self, name: &str) {
+        let dir = match &self.themes_dir {
+            Some(d) => d,
+            None => return,
+        };
+        match wind_theme::ResolvedTheme::load(dir, name, false) {
+            Ok(t) => {
+                info!("Loaded theme: {}", name);
+                let _ = self.ui_tx.send(UiCommand::SetTheme(Box::new(t)));
+            }
+            Err(e) => warn!("Failed to load theme {}: {}", name, e),
+        }
+    }
+
+    /// 列出可用主题（themes 下含 theme.yaml、非 `_` 前缀的目录，按名排序）。
+    fn list_themes(&self) -> Vec<String> {
+        let dir = match &self.themes_dir {
+            Some(d) => d,
+            None => return Vec::new(),
+        };
+        let mut names: Vec<String> = match std::fs::read_dir(dir) {
+            Ok(rd) => rd
+                .filter_map(|e| e.ok())
+                .filter(|e| e.path().is_dir())
+                .filter_map(|e| e.file_name().into_string().ok())
+                .filter(|n| !n.starts_with('_'))
+                .filter(|n| dir.join(n).join("theme.yaml").exists())
+                .collect(),
+            Err(_) => Vec::new(),
+        };
+        names.sort();
+        names
+    }
+
+    /// 循环切换到下一个主题，重绘并持久化选择。
+    fn cycle_theme(&self) {
+        let list = self.list_themes();
+        if list.is_empty() {
+            return;
+        }
+        let cur = self
+            .theme_name
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        let idx = list.iter().position(|n| n == &cur).unwrap_or(0);
+        let next = list[(idx + 1) % list.len()].clone();
+        *self.theme_name.lock().unwrap_or_else(|e| e.into_inner()) = next.clone();
+        self.push_theme(&next);
+        if let Some(p) = &self.theme_path {
+            if let Some(parent) = p.parent() {
+                let _ = std::fs::create_dir_all(parent);
+            }
+            let _ = std::fs::write(p, &next);
+        }
+        self.show_tip(&format!("主题: {}", next));
     }
 
     /// 构建并显示功能主菜单（候选窗空白/工具栏/任务栏指示入口）。
@@ -1582,6 +1660,7 @@ impl Coordinator {
                 MenuCmd::ToggleS2t,
             ),
             MenuItemSpec { label: String::new(), kind: MenuKind::Separator, enabled: false },
+            item("切换主题".into(), MenuCmd::CycleTheme),
             item("打开配置目录".into(), MenuCmd::OpenConfigDir),
         ];
         let selected = first_enabled_menu(&items).unwrap_or(0);

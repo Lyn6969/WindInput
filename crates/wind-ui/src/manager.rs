@@ -104,6 +104,8 @@ pub enum MenuCmd {
     ToggleWidth,
     ToggleS2t,
     OpenConfigDir,
+    /// 切换主题（循环可用主题）
+    CycleTheme,
 }
 
 /// 菜单项的动作类型（右键候选菜单 + 功能主菜单共用）
