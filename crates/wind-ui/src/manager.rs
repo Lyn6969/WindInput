@@ -17,6 +17,10 @@ pub enum UiCommand {
         preedit: String,
         candidates: Vec<CandidateItem>,
         selected: usize,
+        /// 当前页（1 起）
+        page: usize,
+        /// 总页数（含动态加载估计）
+        total_pages: usize,
         caret_x: i32,
         caret_y: i32,
     },
@@ -120,17 +124,21 @@ impl UiManager {
                             preedit,
                             candidates,
                             selected,
+                            page,
+                            total_pages,
                             caret_x,
                             caret_y,
                         } => {
                             debug!(
-                                "UI: UpdateCandidates ({} items, selected={}, pos={},{})",
+                                "UI: UpdateCandidates ({} items, selected={}, page={}/{}, pos={},{})",
                                 candidates.len(),
                                 selected,
+                                page,
+                                total_pages,
                                 caret_x,
                                 caret_y
                             );
-                            candidate_window.update(&preedit, candidates, selected);
+                            candidate_window.update(&preedit, candidates, selected, page, total_pages);
                             candidate_window.set_position(caret_x, caret_y);
                             candidate_window.show();
                         }

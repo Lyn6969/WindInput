@@ -1226,18 +1226,15 @@ impl Coordinator {
                 },
             })
             .collect();
-        // 多页时在组合区追加页码指示（如 "ni hao (1/3)"）
+        // 翻页信息改为结构化字段传给候选窗（窗口内渲染独立的页码指示）
         let total_pages = self.total_pages(state);
-        let preedit = if total_pages > 1 {
-            format!("{} ({}/{})", state.preedit, state.current_page + 1, total_pages)
-        } else {
-            state.preedit.clone()
-        };
         let selected = state.selected_index.min(items.len().saturating_sub(1));
         let _ = self.ui_tx.send(UiCommand::UpdateCandidates {
-            preedit,
+            preedit: state.preedit.clone(),
             candidates: items,
             selected,
+            page: state.current_page + 1,
+            total_pages,
             caret_x: state.caret_x,
             caret_y: state.caret_y,
         });

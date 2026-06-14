@@ -12,6 +12,7 @@ pub mod text;
 pub mod toast;
 pub mod toolbar;
 pub mod tooltip;
+pub mod view;
 pub mod viewbox;
 pub mod window;
 
