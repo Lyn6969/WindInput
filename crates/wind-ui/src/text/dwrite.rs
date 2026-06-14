@@ -246,8 +246,9 @@ impl TextRenderer {
             }
 
             // 2) 渲染文本：颜色经 clientDrawingContext 透传给字形回调。
+            // 入参 color 约定为 [R,G,B,A]；COLORREF = 0x00BBGGRR。
             let colorref: u32 =
-                (color[2] as u32) | ((color[1] as u32) << 8) | ((color[0] as u32) << 16);
+                (color[0] as u32) | ((color[1] as u32) << 8) | ((color[2] as u32) << 16);
             let layout = self.create_layout(text, buf_width as f32, buf_height as f32)?;
             layout
                 .Draw(

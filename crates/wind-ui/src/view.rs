@@ -349,7 +349,8 @@ impl View {
 
 // ———————————————— 像素绘制工具 ————————————————
 
-/// 在缓冲区子区域填充圆角矩形（覆盖写入，预乘 alpha 由颜色自带）
+/// 在缓冲区子区域填充圆角矩形：圆角抗锯齿 + 预乘 alpha 源覆盖混合。
+/// `color` 约定为直通 [R,G,B,A]；缓冲区按预乘 BGRA 维护（供 UpdateLayeredWindow）。
 pub fn fill_rounded(
     buf: &mut [u8],
     buf_w: u32,
@@ -365,13 +366,15 @@ pub fn fill_rounded(
     let y0 = y.round() as i32;
     let wi = w.round() as i32;
     let hi = h.round() as i32;
-    let r = radius.round() as i32;
     if wi <= 0 || hi <= 0 {
         return;
     }
+    let r = radius.round().max(0.0);
+    let ca = color[3] as f32;
     for ry in 0..hi {
         for rx in 0..wi {
-            if !corner_inside(rx, ry, wi, hi, r) {
+            let cov = corner_coverage(rx as f32, ry as f32, wi as f32, hi as f32, r);
+            if cov <= 0.0 {
                 continue;
             }
             let px = x0 + rx;
@@ -380,32 +383,45 @@ pub fn fill_rounded(
                 continue;
             }
             let idx = ((py * buf_w as i32 + px) * 4) as usize;
-            if idx + 3 < buf.len() {
-                buf[idx] = color[0];
-                buf[idx + 1] = color[1];
-                buf[idx + 2] = color[2];
-                buf[idx + 3] = color[3];
+            if idx + 3 >= buf.len() {
+                continue;
             }
+            // 源最终 alpha（含覆盖率）；预乘并按源覆盖混合到已有（预乘）背景上。
+            // color 为 [R,G,B,A]，缓冲为 BGRA：写入时做 R/B 换序。
+            let sa = ca * cov;
+            let inv = (255.0 - sa) / 255.0;
+            let src_bgr = [color[2], color[1], color[0]]; // B,G,R
+            for c in 0..3 {
+                let sp = src_bgr[c] as f32 * sa / 255.0; // 预乘源通道
+                buf[idx + c] = (sp + buf[idx + c] as f32 * inv).round().min(255.0) as u8;
+            }
+            buf[idx + 3] = (sa + buf[idx + 3] as f32 * inv).round().min(255.0) as u8;
         }
     }
 }
 
-fn corner_inside(x: i32, y: i32, w: i32, h: i32, r: i32) -> bool {
-    if r <= 0 {
-        return true;
+/// 圆角覆盖率 [0,1]：四角按到圆心距离做 1px 抗锯齿带，直边返回 1。
+fn corner_coverage(x: f32, y: f32, w: f32, h: f32, r: f32) -> f32 {
+    if r <= 0.0 {
+        return 1.0;
     }
+    // 像素中心
+    let px = x + 0.5;
+    let py = y + 0.5;
+    // 各角圆心；判断像素是否落在某角的圆角区
     let corners = [
-        (r, r, x < r && y < r),
-        (w - 1 - r, r, x > w - 1 - r && y < r),
-        (r, h - 1 - r, x < r && y > h - 1 - r),
-        (w - 1 - r, h - 1 - r, x > w - 1 - r && y > h - 1 - r),
+        (r, r, px < r && py < r),
+        (w - r, r, px > w - r && py < r),
+        (r, h - r, px < r && py > h - r),
+        (w - r, h - r, px > w - r && py > h - r),
     ];
     for (cx, cy, in_quadrant) in corners {
         if in_quadrant {
-            let dx = (x - cx) as f32;
-            let dy = (y - cy) as f32;
-            return dx * dx + dy * dy <= (r * r) as f32;
+            let dx = px - cx;
+            let dy = py - cy;
+            let dist = (dx * dx + dy * dy).sqrt();
+            return (r + 0.5 - dist).clamp(0.0, 1.0);
         }
     }
-    true
+    1.0
 }
