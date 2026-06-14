@@ -327,11 +327,21 @@ impl Coordinator {
         (s.current_page, s.selected_index, self.total_pages(&s))
     }
 
-    /// 当前页候选文本列表（测试/诊断用）
+    /// 当前页候选文本列表（内部简体；测试/诊断用）
     pub fn debug_page_texts(&self) -> Vec<String> {
         let s = self.state.lock().unwrap_or_else(|e| e.into_inner());
         let (start, end) = self.page_range(&s);
         s.candidates[start..end].iter().map(|c| c.text.clone()).collect()
+    }
+
+    /// 当前页候选的"显示文本"（应用简繁后，与候选窗口一致；测试/诊断用）
+    pub fn debug_page_display_texts(&self) -> Vec<String> {
+        let s = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        let (start, end) = self.page_range(&s);
+        s.candidates[start..end]
+            .iter()
+            .map(|c| self.maybe_s2t(&s, &c.text))
+            .collect()
     }
 
     /// 根据输入缓冲更新候选（委托引擎 + 应用词频 boost）
@@ -1034,7 +1044,8 @@ impl Coordinator {
             .iter()
             .enumerate()
             .map(|(i, c)| CandidateItem {
-                text: c.text.clone(),
+                // 开启简繁时显示也转繁体（内部候选仍存简体，用于词频/匹配）
+                text: self.maybe_s2t(state, &c.text),
                 code: c.code.clone(),
                 label: if alpha {
                     ((b'a' + i as u8) as char).to_string()

@@ -676,6 +676,36 @@ fn test_s2t_converts_committed_candidate() {
 }
 
 #[test]
+fn test_s2t_converts_candidate_display() {
+    if !has_schemas() {
+        return;
+    }
+    let coord = Coordinator::new_headless(config_with("pinyin"), Some(&data_dir()));
+    if !coord.debug_set_s2t(true) {
+        eprintln!("跳过：缺少 opencc 数据");
+        return;
+    }
+    for c in "hanzi".chars() {
+        press_letter(&coord, c);
+    }
+    // 内部候选仍是简体（供词频/匹配）
+    let internal = coord.debug_page_texts();
+    // 显示文本应为繁体
+    let display = coord.debug_page_display_texts();
+    if let Some(p) = internal.iter().position(|t| t == "汉字") {
+        assert_eq!(display[p], "漢字", "候选显示应为繁体 漢字");
+    } else {
+        eprintln!("跳过：候选未含 汉字");
+    }
+    // 简体与显示长度一致、且至少有一项被转换
+    assert_eq!(internal.len(), display.len());
+    assert!(
+        internal.iter().zip(&display).any(|(a, b)| a != b),
+        "开启简繁后显示应有候选被转换"
+    );
+}
+
+#[test]
 fn test_s2t_disabled_keeps_simplified() {
     if !has_schemas() {
         return;
