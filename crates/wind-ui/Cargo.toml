@@ -16,3 +16,5 @@ tokio = { workspace = true }
 
 [target.'cfg(windows)'.dependencies]
 windows = { workspace = true }
+# `#[implement]` 宏展开引用 `::windows_core`，需作为直接依赖（版本随 windows 0.58）。
+windows-core = "0.58"

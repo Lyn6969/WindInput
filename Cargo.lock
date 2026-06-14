@@ -2206,6 +2206,7 @@ dependencies = [
  "wind-candidate",
  "wind-theme",
  "windows",
+ "windows-core 0.58.0",
 ]
 
 [[package]]

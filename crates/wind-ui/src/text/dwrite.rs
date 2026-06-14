@@ -1,17 +1,24 @@
-//! 文本渲染后端（GDI 实现，后续升级到 DirectWrite）
+//! 文本渲染后端（DirectWrite 实现）
 //!
-//! 使用 Win32 GDI TextOutW 渲染文本到 BGRA 缓冲区。
-//! 支持中文字符，自动创建合适大小的字体。
+//! 与 Go 版本 `wind_input/internal/ui/dwrite_text.go` 对齐。
+//!
+//! 管线：IDWriteFactory → IDWriteTextFormat/IDWriteTextLayout（测量）
+//!      → IDWriteGdiInterop::CreateBitmapRenderTarget（内存 DC 上的 32bpp 顶端向下 DIB）
+//!      → 自定义 IDWriteTextRenderer 回调里调 IDWriteBitmapRenderTarget::DrawGlyphRun
+//!      → 预乘 alpha 选择性回写到调用方 BGRA 缓冲区。
+//!
+//! 透明度正确性（修复 GDI 旧实现"黑字被当背景吞掉、抗锯齿丢失"）：
+//! 先把目标缓冲区按"不透明"复制进 DIB（GDI 对不透明背景做抗锯齿混合），渲染后
+//! 逐像素对比——RGB 未变 = 背景，保留原 alpha；RGB 变了 = 文字像素，按窗口原
+//! alpha 预乘（R' = R×A/255），使其成为合法预乘像素，与背景共享同一透明度。
 
-use windows::Win32::Foundation::*;
-use windows::Win32::Graphics::Gdi::*;
-use tracing::{debug, error, info, warn};
+use std::cell::RefCell;
+use std::ffi::c_void;
 
-/// 文本渲染器
-pub struct TextRenderer {
-    font_family: String,
-    font_size: f32,
-}
+use windows::core::{implement, PCWSTR};
+use windows::Win32::Foundation::{BOOL, COLORREF, FALSE};
+use windows::Win32::Graphics::DirectWrite::*;
+use windows::Win32::Graphics::Gdi::{GetCurrentObject, GetObjectW, DIBSECTION, OBJ_BITMAP};
 
 /// 文本度量信息
 #[derive(Debug, Clone)]
@@ -20,91 +27,170 @@ pub struct TextMetrics {
     pub height: f32,
 }
 
+/// 渲染表面：尺寸绑定的位图渲染目标 + 其专属字形渲染器回调对象。
+struct Surface {
+    target: IDWriteBitmapRenderTarget,
+    renderer: IDWriteTextRenderer,
+    width: u32,
+    height: u32,
+}
+
+/// 文本渲染器
+pub struct TextRenderer {
+    /// 字体族（宽字符，含结尾 0）
+    family: Vec<u16>,
+    /// 语言区域（宽字符，含结尾 0）
+    locale: Vec<u16>,
+    font_size: f32,
+    factory: IDWriteFactory,
+    gdi_interop: IDWriteGdiInterop,
+    params: IDWriteRenderingParams,
+    /// 缓存的文本格式（family/size 固定，故单槽即可）
+    format: RefCell<Option<IDWriteTextFormat>>,
+    /// 当前位图渲染表面（按需重建）
+    surface: RefCell<Option<Surface>>,
+}
+
 impl TextRenderer {
     /// 创建文本渲染器
     pub fn new(font_family: &str, font_size: f32) -> Result<Self, String> {
-        Ok(Self {
-            font_family: font_family.to_string(),
-            font_size,
-        })
-    }
-
-    /// 创建 GDI 字体
-    fn create_font(&self) -> Result<HFONT, String> {
-        let family_wide: Vec<u16> = self.font_family.encode_utf16().chain(std::iter::once(0)).collect();
-
-        // 字体高度（逻辑像素，GDI 会自动处理 DPI 缩放）
-        let height = -(self.font_size as i32);
-
         unsafe {
-            let hfont = CreateFontW(
-                height,    // nHeight
-                0,         // nWidth (自动)
-                0,         // nEscapement
-                0,         // nOrientation
-                400,       // nWeight (FW_NORMAL = 400)
-                0,         // bItalic
-                0,         // bUnderline
-                0,         // bStrikeOut
-                1,         // nCharSet (DEFAULT_CHARSET = 1)
-                0,         // nOutputPrecision (OUT_DEFAULT_PRECIS = 0)
-                0,         // nClipPrecision (CLIP_DEFAULT_PRECIS = 0)
-                5,         // nQuality (CLEARTYPE_QUALITY = 5)
-                0,         // nPitchAndFamily (DEFAULT_PITCH | FF_DONTCARE = 0)
-                windows::core::PCWSTR(family_wide.as_ptr()),
-            );
+            let factory: IDWriteFactory = DWriteCreateFactory(DWRITE_FACTORY_TYPE_SHARED)
+                .map_err(|e| format!("DWriteCreateFactory: {e}"))?;
+            let gdi_interop = factory
+                .GetGdiInterop()
+                .map_err(|e| format!("GetGdiInterop: {e}"))?;
+            // 默认渲染参数（系统 ClearType 设置）
+            let params = factory
+                .CreateRenderingParams()
+                .map_err(|e| format!("CreateRenderingParams: {e}"))?;
 
-            if hfont.is_invalid() {
-                return Err("CreateFontW failed".to_string());
-            }
+            let family: Vec<u16> = font_family
+                .encode_utf16()
+                .chain(std::iter::once(0))
+                .collect();
+            let locale: Vec<u16> = "zh-cn".encode_utf16().chain(std::iter::once(0)).collect();
 
-            Ok(hfont)
+            Ok(Self {
+                family,
+                locale,
+                font_size,
+                factory,
+                gdi_interop,
+                params,
+                format: RefCell::new(None),
+                surface: RefCell::new(None),
+            })
         }
     }
 
-    /// 测量文本尺寸
+    /// 取得（或创建）文本格式。
+    fn ensure_format(&self) -> Result<IDWriteTextFormat, String> {
+        if let Some(f) = self.format.borrow().as_ref() {
+            return Ok(f.clone());
+        }
+        unsafe {
+            let fmt = self
+                .factory
+                .CreateTextFormat(
+                    PCWSTR(self.family.as_ptr()),
+                    None,
+                    DWRITE_FONT_WEIGHT_NORMAL,
+                    DWRITE_FONT_STYLE_NORMAL,
+                    DWRITE_FONT_STRETCH_NORMAL,
+                    self.font_size,
+                    PCWSTR(self.locale.as_ptr()),
+                )
+                .map_err(|e| format!("CreateTextFormat: {e}"))?;
+            *self.format.borrow_mut() = Some(fmt.clone());
+            Ok(fmt)
+        }
+    }
+
+    /// 为给定文本创建布局对象。
+    fn create_layout(&self, text: &str, max_w: f32, max_h: f32) -> Result<IDWriteTextLayout, String> {
+        let fmt = self.ensure_format()?;
+        let wide: Vec<u16> = text.encode_utf16().collect();
+        unsafe {
+            self.factory
+                .CreateTextLayout(&wide, &fmt, max_w.max(1.0), max_h.max(1.0))
+                .map_err(|e| format!("CreateTextLayout: {e}"))
+        }
+    }
+
+    /// 测量文本尺寸（宽含尾随空白，高为行高）。
     pub fn measure_text(&self, text: &str) -> TextMetrics {
         if text.is_empty() {
-            return TextMetrics { width: 0.0, height: self.font_size * 1.2 };
-        }
-
-        unsafe {
-            let hdc = GetDC(HWND::default());
-            let hfont = match self.create_font() {
-                Ok(f) => f,
-                Err(_) => {
-                    ReleaseDC(HWND::default(), hdc);
-                    return TextMetrics {
-                        width: text.len() as f32 * self.font_size * 0.6,
-                        height: self.font_size * 1.2,
-                    };
-                }
+            return TextMetrics {
+                width: 0.0,
+                height: self.font_size * 1.2,
             };
-
-            let old_font: HGDIOBJ = SelectObject(hdc, HGDIOBJ(hfont.0));
-
-            let text_wide: Vec<u16> = text.encode_utf16().collect();
-            let mut size = SIZE::default();
-            let _ = GetTextExtentPoint32W(hdc, &text_wide, &mut size);
-
-            SelectObject(hdc, old_font);
-            let _: BOOL = DeleteObject(HGDIOBJ(hfont.0));
-            ReleaseDC(HWND::default(), hdc);
-
+        }
+        let layout = match self.create_layout(text, f32::MAX / 2.0, f32::MAX / 2.0) {
+            Ok(l) => l,
+            Err(_) => {
+                return TextMetrics {
+                    width: text.chars().count() as f32 * self.font_size * 0.6,
+                    height: self.font_size * 1.2,
+                }
+            }
+        };
+        unsafe {
+            let mut m = DWRITE_TEXT_METRICS::default();
+            if layout.GetMetrics(&mut m).is_err() {
+                return TextMetrics {
+                    width: text.chars().count() as f32 * self.font_size * 0.6,
+                    height: self.font_size * 1.2,
+                };
+            }
+            let height = if m.height > 0.0 {
+                m.height
+            } else {
+                self.font_size * 1.2
+            };
             TextMetrics {
-                width: size.cx as f32,
-                height: size.cy as f32,
+                width: m.widthIncludingTrailingWhitespace,
+                height,
             }
         }
     }
 
-    /// 渲染文本到 BGRA 缓冲区
+    /// 确保位图渲染表面为给定尺寸（不匹配则重建）。
+    fn ensure_surface(&self, w: u32, h: u32) -> Result<(), String> {
+        if let Some(s) = self.surface.borrow().as_ref() {
+            if s.width == w && s.height == h {
+                return Ok(());
+            }
+        }
+        unsafe {
+            let target = self
+                .gdi_interop
+                .CreateBitmapRenderTarget(None, w, h)
+                .map_err(|e| format!("CreateBitmapRenderTarget: {e}"))?;
+            target
+                .SetPixelsPerDip(1.0)
+                .map_err(|e| format!("SetPixelsPerDip: {e}"))?;
+            let renderer: IDWriteTextRenderer = GlyphRenderer {
+                target: target.clone(),
+                params: self.params.clone(),
+            }
+            .into();
+            *self.surface.borrow_mut() = Some(Surface {
+                target,
+                renderer,
+                width: w,
+                height: h,
+            });
+        }
+        Ok(())
+    }
+
+    /// 渲染文本到 BGRA 缓冲区。
     ///
-    /// - `buf`: 目标 BGRA 缓冲区（已包含背景）
-    /// - `buf_width`, `buf_height`: 缓冲区尺寸
-    /// - `x`, `y`: 文本绘制位置（逻辑坐标）
-    /// - `text`: 要渲染的文本
-    /// - `color`: 文本颜色 (B, G, R, A)
+    /// - `buf`: 目标 BGRA 缓冲区（已含背景，预乘 alpha）
+    /// - `buf_width`/`buf_height`: 缓冲区尺寸
+    /// - `x`/`y`: 文本左上角（像素坐标）
+    /// - `color`: 文本颜色 [B, G, R, A]
     pub fn draw_text(
         &self,
         buf: &mut [u8],
@@ -115,113 +201,191 @@ impl TextRenderer {
         text: &str,
         color: [u8; 4],
     ) -> Result<(), String> {
-        if text.is_empty() {
+        if text.is_empty() || buf_width == 0 || buf_height == 0 {
             return Ok(());
         }
+        let w = buf_width as usize;
+        let h = buf_height as usize;
+        if buf.len() < w * h * 4 {
+            return Err("buffer too small".into());
+        }
+
+        self.ensure_surface(buf_width, buf_height)?;
+        let surface = self.surface.borrow();
+        let surface = surface.as_ref().ok_or("no surface")?;
 
         unsafe {
-            // 创建内存 DC
-            let hdc_screen = GetDC(HWND::default());
-            let hdc_mem = CreateCompatibleDC(hdc_screen);
-
-            // 创建 DIB
-            let bmi = BITMAPINFO {
-                bmiHeader: BITMAPINFOHEADER {
-                    biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
-                    biWidth: buf_width as i32,
-                    biHeight: -(buf_height as i32), // top-down
-                    biPlanes: 1,
-                    biBitCount: 32,
-                    biCompression: BI_RGB.0,
-                    biSizeImage: 0,
-                    biXPelsPerMeter: 0,
-                    biYPelsPerMeter: 0,
-                    biClrUsed: 0,
-                    biClrImportant: 0,
-                },
-                ..std::mem::zeroed()
-            };
-
-            let mut bits_ptr: *mut std::ffi::c_void = std::ptr::null_mut();
-            let hbitmap = match CreateDIBSection(
-                hdc_mem,
-                &bmi,
-                DIB_RGB_COLORS,
-                &mut bits_ptr,
-                None,
-                0,
-            ) {
-                Ok(h) => h,
-                Err(e) => {
-                    DeleteDC(hdc_mem);
-                    ReleaseDC(HWND::default(), hdc_screen);
-                    return Err(format!("CreateDIBSection failed: {}", e));
-                }
-            };
-
-            let old_bmp: HGDIOBJ = SelectObject(hdc_mem, HGDIOBJ(hbitmap.0));
-
-            // 清零位图（透明背景）
-            let bitmap_size = (buf_width * buf_height * 4) as usize;
-            std::ptr::write_bytes(bits_ptr as *mut u8, 0, bitmap_size);
-
-            // 设置文本颜色 (COLORREF = 0x00BBGGRR)
-            let text_color_ref = COLORREF(
-                (color[0] as u32) | ((color[1] as u32) << 8) | ((color[2] as u32) << 16)
+            // 取内存 DC 中 DIB 的像素指针与行距。
+            let memdc = surface.target.GetMemoryDC();
+            let hbmp = GetCurrentObject(memdc, OBJ_BITMAP);
+            let mut ds = DIBSECTION::default();
+            let n = GetObjectW(
+                hbmp,
+                std::mem::size_of::<DIBSECTION>() as i32,
+                Some(&mut ds as *mut _ as *mut c_void),
             );
-            SetTextColor(hdc_mem, text_color_ref);
-            SetBkMode(hdc_mem, TRANSPARENT);
+            if n == 0 || ds.dsBm.bmBits.is_null() {
+                return Err("GetObjectW(DIBSECTION) failed".into());
+            }
+            let stride = ds.dsBm.bmWidthBytes as usize; // 32bpp 顶端向下，bmBits 指向首（顶）行
+            let bits = ds.dsBm.bmBits as *mut u8;
+            let dib = std::slice::from_raw_parts_mut(bits, stride * h);
 
-            // 创建并选择字体
-            let hfont = match self.create_font() {
-                Ok(f) => f,
-                Err(e) => {
-                    SelectObject(hdc_mem, old_bmp);
-                    let _: BOOL = DeleteObject(HGDIOBJ(hbitmap.0));
-                    DeleteDC(hdc_mem);
-                    ReleaseDC(HWND::default(), hdc_screen);
-                    return Err(e);
-                }
-            };
-            let old_font: HGDIOBJ = SelectObject(hdc_mem, HGDIOBJ(hfont.0));
-
-            // 绘制文本
-            let text_wide: Vec<u16> = text.encode_utf16().collect();
-            let pixel_x = x as i32;
-            let pixel_y = y as i32;
-            let _ = TextOutW(hdc_mem, pixel_x, pixel_y, &text_wide);
-
-            // 从 DIB 复制像素到目标缓冲区
-            let src_buf = std::slice::from_raw_parts(
-                bits_ptr as *const u8,
-                (buf_width * buf_height * 4) as usize,
-            );
-
-            // 合并：GDI TextOutW 不设置 alpha，需要检测 RGB 非零像素
-            for i in 0..(buf_width * buf_height) as usize {
-                let idx = i * 4;
-                let src_b = src_buf[idx];
-                let src_g = src_buf[idx + 1];
-                let src_r = src_buf[idx + 2];
-
-                // 如果 RGB 有值（文字像素），设置 alpha=255
-                if src_b > 0 || src_g > 0 || src_r > 0 {
-                    buf[idx] = src_b;
-                    buf[idx + 1] = src_g;
-                    buf[idx + 2] = src_r;
-                    buf[idx + 3] = 255; // 完全不透明
+            // 1) 背景按不透明复制进 DIB（B,G,R 保留，A 置 255）。
+            for row in 0..h {
+                let src = row * w * 4;
+                let dst = row * stride;
+                for col in 0..w {
+                    let s = src + col * 4;
+                    let d = dst + col * 4;
+                    dib[d] = buf[s];
+                    dib[d + 1] = buf[s + 1];
+                    dib[d + 2] = buf[s + 2];
+                    dib[d + 3] = 255;
                 }
             }
 
-            // 清理
-            SelectObject(hdc_mem, old_font);
-            let _: BOOL = DeleteObject(HGDIOBJ(hfont.0));
-            SelectObject(hdc_mem, old_bmp);
-            let _: BOOL = DeleteObject(HGDIOBJ(hbitmap.0));
-            DeleteDC(hdc_mem);
-            ReleaseDC(HWND::default(), hdc_screen);
+            // 2) 渲染文本：颜色经 clientDrawingContext 透传给字形回调。
+            let colorref: u32 =
+                (color[2] as u32) | ((color[1] as u32) << 8) | ((color[0] as u32) << 16);
+            let layout = self.create_layout(text, buf_width as f32, buf_height as f32)?;
+            layout
+                .Draw(
+                    Some(&colorref as *const u32 as *const c_void),
+                    &surface.renderer,
+                    x,
+                    y,
+                )
+                .map_err(|e| format!("TextLayout::Draw: {e}"))?;
 
-            Ok(())
+            // 3) 选择性预乘回写：RGB 变动的像素视为文字，按窗口原 alpha 预乘。
+            for row in 0..h {
+                let sbase = row * w * 4;
+                let dbase = row * stride;
+                for col in 0..w {
+                    let s = sbase + col * 4;
+                    let d = dbase + col * 4;
+                    let nb = dib[d];
+                    let ng = dib[d + 1];
+                    let nr = dib[d + 2];
+                    if nb == buf[s] && ng == buf[s + 1] && nr == buf[s + 2] {
+                        continue; // 背景未变
+                    }
+                    let a = buf[s + 3] as u32;
+                    buf[s] = (nb as u32 * a / 255) as u8;
+                    buf[s + 1] = (ng as u32 * a / 255) as u8;
+                    buf[s + 2] = (nr as u32 * a / 255) as u8;
+                    // alpha 保持窗口原值
+                }
+            }
         }
+        Ok(())
+    }
+}
+
+/// 自定义字形渲染器：把布局 Draw 产生的字形运行画到位图渲染目标。
+/// 颜色不存于对象内，而是每次 Draw 经 clientDrawingContext 透传，避免可变状态。
+#[implement(IDWriteTextRenderer)]
+struct GlyphRenderer {
+    target: IDWriteBitmapRenderTarget,
+    params: IDWriteRenderingParams,
+}
+
+#[allow(non_snake_case)]
+impl IDWritePixelSnapping_Impl for GlyphRenderer_Impl {
+    fn IsPixelSnappingDisabled(&self, _ctx: *const c_void) -> windows::core::Result<BOOL> {
+        Ok(FALSE)
+    }
+
+    fn GetCurrentTransform(
+        &self,
+        _ctx: *const c_void,
+        transform: *mut DWRITE_MATRIX,
+    ) -> windows::core::Result<()> {
+        // 单位矩阵
+        unsafe {
+            if !transform.is_null() {
+                *transform = DWRITE_MATRIX {
+                    m11: 1.0,
+                    m12: 0.0,
+                    m21: 0.0,
+                    m22: 1.0,
+                    dx: 0.0,
+                    dy: 0.0,
+                };
+            }
+        }
+        Ok(())
+    }
+
+    fn GetPixelsPerDip(&self, _ctx: *const c_void) -> windows::core::Result<f32> {
+        Ok(1.0)
+    }
+}
+
+#[allow(non_snake_case)]
+impl IDWriteTextRenderer_Impl for GlyphRenderer_Impl {
+    fn DrawGlyphRun(
+        &self,
+        ctx: *const c_void,
+        baseline_x: f32,
+        baseline_y: f32,
+        measuring_mode: DWRITE_MEASURING_MODE,
+        glyph_run: *const DWRITE_GLYPH_RUN,
+        _desc: *const DWRITE_GLYPH_RUN_DESCRIPTION,
+        _effect: Option<&windows::core::IUnknown>,
+    ) -> windows::core::Result<()> {
+        let colorref = if ctx.is_null() {
+            0u32
+        } else {
+            unsafe { *(ctx as *const u32) }
+        };
+        unsafe {
+            self.target.DrawGlyphRun(
+                baseline_x,
+                baseline_y,
+                measuring_mode,
+                glyph_run,
+                &self.params,
+                COLORREF(colorref),
+                None,
+            )?;
+        }
+        Ok(())
+    }
+
+    fn DrawUnderline(
+        &self,
+        _ctx: *const c_void,
+        _x: f32,
+        _y: f32,
+        _underline: *const DWRITE_UNDERLINE,
+        _effect: Option<&windows::core::IUnknown>,
+    ) -> windows::core::Result<()> {
+        Ok(())
+    }
+
+    fn DrawStrikethrough(
+        &self,
+        _ctx: *const c_void,
+        _x: f32,
+        _y: f32,
+        _strikethrough: *const DWRITE_STRIKETHROUGH,
+        _effect: Option<&windows::core::IUnknown>,
+    ) -> windows::core::Result<()> {
+        Ok(())
+    }
+
+    fn DrawInlineObject(
+        &self,
+        _ctx: *const c_void,
+        _x: f32,
+        _y: f32,
+        _obj: Option<&IDWriteInlineObject>,
+        _sideways: BOOL,
+        _rtl: BOOL,
+        _effect: Option<&windows::core::IUnknown>,
+    ) -> windows::core::Result<()> {
+        Ok(())
     }
 }
