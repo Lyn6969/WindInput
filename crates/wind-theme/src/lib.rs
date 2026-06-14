@@ -7,8 +7,7 @@ pub mod manager;
 pub mod palette;
 pub mod resolved;
 pub mod theme;
-pub mod views;
 
 pub use manager::ThemeManager;
-pub use resolved::ResolvedV3;
-pub use theme::Theme;
+pub use palette::Rgba;
+pub use resolved::{Pad, ResolvedTheme};
