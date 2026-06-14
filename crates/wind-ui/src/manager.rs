@@ -43,17 +43,15 @@ pub enum UiCommand {
     SetToolbarPos { x: i32, y: i32 },
     /// 应用主题（协调器加载解析后下发）
     SetTheme(Box<wind_theme::ResolvedTheme>),
-    /// 显示右键候选菜单（协调器构建好菜单项后下发）
+    /// 显示菜单（候选右键菜单 / 功能主菜单；UI 自管导航与子菜单）
     ShowCandidateMenu {
         items: Vec<MenuItemSpec>,
         x: i32,
         y: i32,
-        /// 初始高亮项（菜单项下标）
-        selected: usize,
     },
-    /// 更新菜单高亮项（键盘/悬停导航时，仅重绘不移位）
-    UpdateMenuHighlight(usize),
-    /// 隐藏右键菜单
+    /// 转发键给打开的菜单（方向键/回车/ESC/空格）；菜单窗无焦点，键由协调器转发
+    MenuKey(u32),
+    /// 隐藏菜单
     HideMenu,
     /// 写剪贴板（菜单"复制"由协调器驱动 → UI 侧执行）
     CopyToClipboard(String),
@@ -95,17 +93,37 @@ pub enum CandidateOp {
     Reset,
 }
 
-/// 功能主菜单命令
+/// 功能主菜单命令（对齐 Go 统一菜单）
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MenuCmd {
-    ToggleMode,
-    SwitchEngine,
+    /// 切到英文模式
+    SchemaEnglish,
+    /// 选择第 N 个输入方案
+    SchemaSelect(usize),
+    /// 中/英标点切换
     TogglePunct,
+    /// 全/半角切换
     ToggleWidth,
+    /// 简繁转换开关
     ToggleS2t,
+    /// 简繁变体（0 标准/1 台湾/2 台湾含词/3 香港）
+    S2tVariant(usize),
+    /// 选择第 N 个主题
+    ThemeSelect(usize),
+    /// 主题明暗（0 跟随/1 亮/2 暗）
+    ThemeStyle(u8),
+    /// 显示/隐藏工具栏
+    ToggleToolbar,
+    /// 重载配置
+    ReloadConfig,
+    /// 打开配置目录
     OpenConfigDir,
-    /// 切换主题（循环可用主题）
-    CycleTheme,
+    /// 词库管理（暂兜底为打开配置目录）
+    OpenDictionary,
+    /// 设置（暂兜底为打开配置目录）
+    OpenSettings,
+    /// 关于（暂兜底）
+    OpenAbout,
 }
 
 /// 菜单项的动作类型（右键候选菜单 + 功能主菜单共用）
@@ -117,16 +135,34 @@ pub enum MenuKind {
     Copy,
     /// 功能主菜单命令
     Command(MenuCmd),
+    /// 子菜单父项（点击/回车进入 children）
+    Submenu,
     /// 分隔线（不可点击）
     Separator,
 }
 
-/// 菜单项规格（由协调器构建，含启用态）
+/// 菜单项规格（由协调器构建）。支持勾选态与子菜单。
 #[derive(Debug, Clone)]
 pub struct MenuItemSpec {
     pub label: String,
     pub kind: MenuKind,
     pub enabled: bool,
+    /// 勾选标记（当前方案/主题/开关态）
+    pub checked: bool,
+    /// 子菜单项（kind=Submenu 时有效）
+    pub children: Vec<MenuItemSpec>,
+}
+
+impl MenuItemSpec {
+    pub fn leaf(label: impl Into<String>, kind: MenuKind, enabled: bool, checked: bool) -> Self {
+        Self { label: label.into(), kind, enabled, checked, children: Vec::new() }
+    }
+    pub fn separator() -> Self {
+        Self { label: String::new(), kind: MenuKind::Separator, enabled: false, checked: false, children: Vec::new() }
+    }
+    pub fn submenu(label: impl Into<String>, children: Vec<MenuItemSpec>) -> Self {
+        Self { label: label.into(), kind: MenuKind::Submenu, enabled: true, checked: false, children }
+    }
 }
 
 /// UI → 协调器的反向事件（鼠标交互）
@@ -148,11 +184,9 @@ pub enum UiEvent {
     RequestCandidateMenu { page_local: usize, x: i32, y: i32 },
     /// 请求功能主菜单（屏幕坐标）；来自候选窗空白/工具栏右键
     RequestMainMenu { x: i32, y: i32 },
-    /// 菜单内鼠标悬停项（-1 表示无）→ 协调器更新高亮
-    MenuHover(i32),
-    /// 菜单项点击激活（菜单项下标）
-    MenuActivate(usize),
-    /// 关闭菜单（点击菜单外 / 右键）
+    /// 菜单项激活（携带动作）：UI 自管导航/子菜单，仅把最终动作回送协调器
+    MenuAction(MenuKind),
+    /// 关闭菜单（点击菜单外 / ESC / 右键）
     MenuClose,
 }
 
@@ -257,6 +291,10 @@ impl UiManager {
 
             // 推进鼠标悬停防抖（稳定后才发出 Hover）
             candidate_window.tick();
+            // 推进菜单（脏重绘 / 关闭）
+            if let Some(m) = &mut popup_menu {
+                m.tick();
+            }
 
             // 推进状态提示防抖（稳定后才真正显示气泡）
             if let Some((text, x, y)) = tip_debounce.poll() {
@@ -304,15 +342,15 @@ impl UiManager {
                                 m.hide();
                             }
                         }
-                        UiCommand::ShowCandidateMenu { items, x, y, selected } => {
-                            debug!("UI: ShowCandidateMenu ({} items) at ({},{})", items.len(), x, y);
+                        UiCommand::ShowCandidateMenu { items, x, y } => {
+                            debug!("UI: ShowMenu ({} items) at ({},{})", items.len(), x, y);
                             if let Some(m) = &mut popup_menu {
-                                m.show(items, x, y, selected);
+                                m.show(items, x, y);
                             }
                         }
-                        UiCommand::UpdateMenuHighlight(sel) => {
+                        UiCommand::MenuKey(key) => {
                             if let Some(m) = &mut popup_menu {
-                                m.set_highlight(sel);
+                                m.on_key(key);
                             }
                         }
                         UiCommand::HideMenu => {

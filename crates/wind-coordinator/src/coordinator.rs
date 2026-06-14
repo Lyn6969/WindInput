@@ -145,13 +145,9 @@ struct State {
     caret_x: i32,
     caret_y: i32,
     caret_height: i32,
-    /// 右键候选菜单是否打开（打开时键盘事件被菜单拦截）
+    /// 菜单是否打开（打开时键盘事件转发给菜单窗口；UI 自管导航）
     menu_open: bool,
-    /// 菜单当前高亮项（菜单项下标）
-    menu_selected: usize,
-    /// 菜单项规格（用于键盘导航与激活判定）
-    menu_items: Vec<MenuItemSpec>,
-    /// 菜单目标候选（页内下标 + 文本）
+    /// 菜单目标候选（页内下标 + 文本），供候选词条操作/复制
     menu_target_page_local: usize,
     menu_target_text: String,
 }
@@ -195,36 +191,14 @@ pub struct Coordinator {
     themes_dir: Option<std::path::PathBuf>,
     /// 当前主题名
     theme_name: Mutex<String>,
+    /// 主题暗色模式
+    theme_dark: Mutex<bool>,
     /// 主题选择持久化文件（theme.txt）
     theme_path: Option<std::path::PathBuf>,
 }
 
 /// 短语候选权重基准（高于普通候选，使短语展开排在前列）
 const PHRASE_WEIGHT_BASE: i32 = 40_000_000;
-
-/// 菜单首个可激活项（启用且非分隔）下标
-fn first_enabled_menu(items: &[MenuItemSpec]) -> Option<usize> {
-    items
-        .iter()
-        .position(|it| it.enabled && !matches!(it.kind, MenuKind::Separator))
-}
-
-/// 从 from 沿 dir(±1) 找下一个可激活项（环绕），跳过分隔/禁用
-fn next_enabled_menu(items: &[MenuItemSpec], from: usize, dir: i32) -> Option<usize> {
-    let n = items.len();
-    if n == 0 {
-        return None;
-    }
-    let mut i = from as i32;
-    for _ in 0..n {
-        i = (i + dir).rem_euclid(n as i32);
-        let idx = i as usize;
-        if items[idx].enabled && !matches!(items[idx].kind, MenuKind::Separator) {
-            return Some(idx);
-        }
-    }
-    None
-}
 
 impl Coordinator {
     /// 生产构造器：从 exe 同目录加载配置，启动候选窗口 UI 线程
@@ -276,7 +250,7 @@ impl Coordinator {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .clone();
-        coordinator.push_theme(&name);
+        coordinator.push_theme(&name, false);
         coordinator
     }
 
@@ -409,8 +383,6 @@ impl Coordinator {
                 caret_y: 0,
                 caret_height: 0,
                 menu_open: false,
-                menu_selected: 0,
-                menu_items: Vec::new(),
                 menu_target_page_local: 0,
                 menu_target_text: String::new(),
             }),
@@ -436,6 +408,7 @@ impl Coordinator {
             awaiting_caret: Mutex::new(false),
             themes_dir,
             theme_name: Mutex::new(initial_theme),
+            theme_dark: Mutex::new(false),
             theme_path,
         });
         // 启动即显示常驻工具栏（反映初始 中英/方案/标点/全半角）
@@ -1489,43 +1462,16 @@ impl Coordinator {
                 self.show_candidate_menu(page_local, x, y)
             }
             UiEvent::RequestMainMenu { x, y } => self.show_main_menu(x, y),
-            UiEvent::MenuHover(i) => self.menu_hover(i),
-            UiEvent::MenuActivate(idx) => self.menu_activate(idx),
+            UiEvent::MenuAction(kind) => self.menu_action(kind),
             UiEvent::MenuClose => self.menu_close(),
         }
     }
 
-    /// 鼠标悬停菜单项 → 更新高亮（仅对启用项）
-    fn menu_hover(&self, idx: i32) {
-        if idx < 0 {
-            return;
-        }
-        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
-        if !state.menu_open {
-            return;
-        }
-        let i = idx as usize;
-        if i < state.menu_items.len()
-            && state.menu_items[i].enabled
-            && state.menu_selected != i
-        {
-            state.menu_selected = i;
-            let _ = self.ui_tx.send(UiCommand::UpdateMenuHighlight(i));
-        }
-    }
-
-    /// 激活菜单项（鼠标点击 / 键盘回车）
-    fn menu_activate(&self, idx: usize) {
-        let (kind, page_local, text) = {
-            let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
-            if !state.menu_open || idx >= state.menu_items.len() {
-                return;
-            }
-            let item = &state.menu_items[idx];
-            if !item.enabled || matches!(item.kind, MenuKind::Separator) {
-                return;
-            }
-            (item.kind, state.menu_target_page_local, state.menu_target_text.clone())
+    /// 菜单项激活：UI 已自管导航/子菜单，这里仅按动作派发。
+    fn menu_action(&self, kind: MenuKind) {
+        let (page_local, text) = {
+            let s = self.state.lock().unwrap_or_else(|e| e.into_inner());
+            (s.menu_target_page_local, s.menu_target_text.clone())
         };
         self.menu_close();
         match kind {
@@ -1534,21 +1480,19 @@ impl Coordinator {
                 let _ = self.ui_tx.send(UiCommand::CopyToClipboard(text));
             }
             MenuKind::Command(cmd) => self.run_menu_cmd(cmd),
-            MenuKind::Separator => {}
+            MenuKind::Submenu | MenuKind::Separator => {}
         }
     }
 
     /// 执行功能主菜单命令
     fn run_menu_cmd(&self, cmd: MenuCmd) {
         match cmd {
-            MenuCmd::ToggleMode => {
-                self.handle_menu_command("toggle_mode");
+            MenuCmd::SchemaEnglish => {
+                self.handle_system_mode_switch(false);
                 self.notify_toolbar();
+                self.notify_ui_hide();
             }
-            MenuCmd::SwitchEngine => {
-                self.handle_menu_command("switch_engine");
-                self.notify_toolbar();
-            }
+            MenuCmd::SchemaSelect(i) => self.select_schema(i),
             MenuCmd::TogglePunct => {
                 self.handle_menu_command("toggle_punct");
                 self.notify_toolbar();
@@ -1561,24 +1505,114 @@ impl Coordinator {
                 self.handle_menu_command("toggle_s2t");
                 self.notify_toolbar();
             }
-            MenuCmd::OpenConfigDir => {
+            MenuCmd::S2tVariant(_) => self.show_tip("简繁变体切换暂未实现"),
+            MenuCmd::ThemeSelect(i) => self.select_theme(i),
+            MenuCmd::ThemeStyle(style) => self.set_theme_style(style),
+            MenuCmd::ToggleToolbar => self.toggle_toolbar(),
+            MenuCmd::ReloadConfig => self.reload_config(),
+            MenuCmd::OpenConfigDir
+            | MenuCmd::OpenDictionary
+            | MenuCmd::OpenSettings
+            | MenuCmd::OpenAbout => {
                 if let Some(d) = Config::user_config_dir() {
                     let _ = self.ui_tx.send(UiCommand::OpenPath(d.display().to_string()));
                 }
             }
-            MenuCmd::CycleTheme => self.cycle_theme(),
+        }
+    }
+
+    /// 选择第 N 个输入方案（隐含切到中文模式）。
+    fn select_schema(&self, index: usize) {
+        let list = self.engine_mgr.available_schemas().to_vec();
+        if index >= list.len() {
+            return;
+        }
+        let id = list[index].clone();
+        self.engine_mgr.switch_schema(&id);
+        {
+            let mut s = self.state.lock().unwrap_or_else(|e| e.into_inner());
+            s.chinese_mode = true;
+            s.input_buffer.clear();
+            s.candidates.clear();
+        }
+        self.push_state_update();
+        self.notify_toolbar();
+        self.notify_ui_hide();
+        self.show_tip(&id);
+    }
+
+    /// 选择第 N 个主题。
+    fn select_theme(&self, index: usize) {
+        let list = self.list_themes();
+        if index >= list.len() {
+            return;
+        }
+        let name = list[index].clone();
+        *self.theme_name.lock().unwrap_or_else(|e| e.into_inner()) = name.clone();
+        let dark = *self.theme_dark.lock().unwrap_or_else(|e| e.into_inner());
+        self.push_theme(&name, dark);
+        self.persist_theme(&name);
+        self.show_tip(&format!("主题: {}", name));
+    }
+
+    /// 设置主题明暗（0 跟随/1 亮/2 暗），用当前主题重解析。
+    fn set_theme_style(&self, style: u8) {
+        let dark = style == 2;
+        *self.theme_dark.lock().unwrap_or_else(|e| e.into_inner()) = dark;
+        let name = self
+            .theme_name
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        self.push_theme(&name, dark);
+        self.show_tip(if dark { "暗色" } else { "亮色" });
+    }
+
+    /// 显示/隐藏工具栏。
+    fn toggle_toolbar(&self) {
+        let visible = {
+            let mut s = self.state.lock().unwrap_or_else(|e| e.into_inner());
+            s.toolbar_visible = !s.toolbar_visible;
+            s.toolbar_visible
+        };
+        if visible {
+            self.notify_toolbar();
+        } else {
+            let _ = self.ui_tx.send(UiCommand::HideToolbar);
+        }
+    }
+
+    /// 重载配置（best-effort：重新下发当前主题）。
+    fn reload_config(&self) {
+        let name = self
+            .theme_name
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        let dark = *self.theme_dark.lock().unwrap_or_else(|e| e.into_inner());
+        self.push_theme(&name, dark);
+        self.show_tip("已重载");
+    }
+
+    /// 持久化主题选择到 theme.txt。
+    fn persist_theme(&self, name: &str) {
+        if let Some(p) = &self.theme_path {
+            if let Some(parent) = p.parent() {
+                let _ = std::fs::create_dir_all(parent);
+            }
+            let _ = std::fs::write(p, name);
         }
     }
 
     /// 加载并下发指定主题（失败保留当前）。
-    fn push_theme(&self, name: &str) {
+    fn push_theme(&self, name: &str, is_dark: bool) {
         let dir = match &self.themes_dir {
             Some(d) => d,
             None => return,
         };
-        match wind_theme::ResolvedTheme::load(dir, name, false) {
+        match wind_theme::ResolvedTheme::load(dir, name, is_dark) {
             Ok(t) => {
-                info!("Loaded theme: {}", name);
+                info!("Loaded theme: {} (dark={})", name, is_dark);
                 let _ = self.ui_tx.send(UiCommand::SetTheme(Box::new(t)));
             }
             Err(e) => warn!("Failed to load theme {}: {}", name, e),
@@ -1606,73 +1640,78 @@ impl Coordinator {
     }
 
     /// 循环切换到下一个主题，重绘并持久化选择。
-    fn cycle_theme(&self) {
-        let list = self.list_themes();
-        if list.is_empty() {
-            return;
+    /// 构建并显示功能主菜单（对齐 Go 统一菜单：方案/主题子菜单 + 勾选态）。
+    /// x/y 为屏幕坐标；i32::MIN 表示由 UI 取光标位置。
+    fn show_main_menu(&self, x: i32, y: i32) {
+        use wind_ui::manager::MenuItemSpec as M;
+        let (chinese, punct, full, s2t, toolbar_vis) = {
+            let s = self.state.lock().unwrap_or_else(|e| e.into_inner());
+            (s.chinese_mode, s.chinese_punct, s.full_width, s.s2t_enabled, s.toolbar_visible)
+        };
+        let cmd = |c: MenuCmd| MenuKind::Command(c);
+
+        // 输入方案子菜单：英文 + 方案单选
+        let active = self.engine_mgr.active_schema_id();
+        let schemas = self.engine_mgr.available_schemas().to_vec();
+        let mut schema_children = vec![M::leaf("英文", cmd(MenuCmd::SchemaEnglish), true, !chinese)];
+        if !schemas.is_empty() {
+            schema_children.push(M::separator());
+            for (i, id) in schemas.iter().enumerate() {
+                schema_children.push(M::leaf(
+                    id.clone(),
+                    cmd(MenuCmd::SchemaSelect(i)),
+                    true,
+                    chinese && *id == active,
+                ));
+            }
         }
-        let cur = self
+
+        // 主题子菜单：主题单选 + 亮/暗
+        let themes = self.list_themes();
+        let cur_theme = self
             .theme_name
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .clone();
-        let idx = list.iter().position(|n| n == &cur).unwrap_or(0);
-        let next = list[(idx + 1) % list.len()].clone();
-        *self.theme_name.lock().unwrap_or_else(|e| e.into_inner()) = next.clone();
-        self.push_theme(&next);
-        if let Some(p) = &self.theme_path {
-            if let Some(parent) = p.parent() {
-                let _ = std::fs::create_dir_all(parent);
-            }
-            let _ = std::fs::write(p, &next);
+        let dark = *self.theme_dark.lock().unwrap_or_else(|e| e.into_inner());
+        let mut theme_children = Vec::new();
+        for (i, name) in themes.iter().enumerate() {
+            theme_children.push(M::leaf(
+                name.clone(),
+                cmd(MenuCmd::ThemeSelect(i)),
+                true,
+                *name == cur_theme,
+            ));
         }
-        self.show_tip(&format!("主题: {}", next));
-    }
+        if !theme_children.is_empty() {
+            theme_children.push(M::separator());
+        }
+        theme_children.push(M::leaf("亮色", cmd(MenuCmd::ThemeStyle(1)), true, !dark));
+        theme_children.push(M::leaf("暗色", cmd(MenuCmd::ThemeStyle(2)), true, dark));
 
-    /// 构建并显示功能主菜单（候选窗空白/工具栏/任务栏指示入口）。
-    /// x/y 为屏幕坐标；i32::MIN 表示由 UI 取光标位置。
-    fn show_main_menu(&self, x: i32, y: i32) {
-        let (chinese, punct, full, s2t) = {
-            let s = self.state.lock().unwrap_or_else(|e| e.into_inner());
-            (s.chinese_mode, s.chinese_punct, s.full_width, s.s2t_enabled)
-        };
-        let item = |label: String, cmd: MenuCmd| MenuItemSpec {
-            label,
-            kind: MenuKind::Command(cmd),
-            enabled: true,
-        };
         let items = vec![
-            item(
-                if chinese { "切换到英文".into() } else { "切换到中文".into() },
-                MenuCmd::ToggleMode,
-            ),
-            item("切换输入方案".into(), MenuCmd::SwitchEngine),
-            item(
-                if punct { "英文标点".into() } else { "中文标点".into() },
-                MenuCmd::TogglePunct,
-            ),
-            item(
-                if full { "半角".into() } else { "全角".into() },
-                MenuCmd::ToggleWidth,
-            ),
-            item(
-                if s2t { "关闭简繁转换".into() } else { "开启简繁转换".into() },
-                MenuCmd::ToggleS2t,
-            ),
-            MenuItemSpec { label: String::new(), kind: MenuKind::Separator, enabled: false },
-            item("切换主题".into(), MenuCmd::CycleTheme),
-            item("打开配置目录".into(), MenuCmd::OpenConfigDir),
+            M::submenu("输入方案", schema_children),
+            M::leaf("全角", cmd(MenuCmd::ToggleWidth), true, full),
+            M::leaf("中文标点", cmd(MenuCmd::TogglePunct), true, punct),
+            M::leaf("简入繁出", cmd(MenuCmd::ToggleS2t), true, s2t),
+            M::separator(),
+            M::leaf("显示工具栏", cmd(MenuCmd::ToggleToolbar), true, toolbar_vis),
+            M::submenu("主题", theme_children),
+            M::separator(),
+            M::leaf("重载配置", cmd(MenuCmd::ReloadConfig), true, false),
+            M::separator(),
+            M::leaf("词库管理...", cmd(MenuCmd::OpenDictionary), true, false),
+            M::leaf("设置...", cmd(MenuCmd::OpenSettings), true, false),
+            M::separator(),
+            M::leaf("关于", cmd(MenuCmd::OpenAbout), true, false),
         ];
-        let selected = first_enabled_menu(&items).unwrap_or(0);
         {
-            let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
-            state.menu_open = true;
-            state.menu_selected = selected;
-            state.menu_items = items.clone();
-            state.menu_target_page_local = 0;
-            state.menu_target_text = String::new();
+            let mut s = self.state.lock().unwrap_or_else(|e| e.into_inner());
+            s.menu_open = true;
+            s.menu_target_page_local = 0;
+            s.menu_target_text = String::new();
         }
-        let _ = self.ui_tx.send(UiCommand::ShowCandidateMenu { items, x, y, selected });
+        let _ = self.ui_tx.send(UiCommand::ShowCandidateMenu { items, x, y });
     }
 
     fn is_menu_open(&self) -> bool {
@@ -1684,53 +1723,30 @@ impl Coordinator {
         let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
         if state.menu_open {
             state.menu_open = false;
-            state.menu_items.clear();
             drop(state);
             let _ = self.ui_tx.send(UiCommand::HideMenu);
         }
     }
 
-    /// 菜单键盘导航：返回 true 表示已被菜单消费。
-    /// 仅在 menu_open 时调用；处理方向键/回车/ESC。
-    fn menu_handle_key(&self, key_code: u32) -> bool {
-        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
-        if !state.menu_open {
+    /// 菜单打开时转发导航键给菜单窗口；返回 true 表示已消费。
+    fn forward_menu_key(&self, key_code: u32) -> bool {
+        if !self.is_menu_open() {
             return false;
         }
         match key_code {
-            0x26 | 0x28 => {
-                // 上/下：移到上/下一个启用项（跳过分隔/禁用）
-                let dir: i32 = if key_code == 0x26 { -1 } else { 1 };
-                if let Some(next) = next_enabled_menu(&state.menu_items, state.menu_selected, dir) {
-                    state.menu_selected = next;
-                    let _ = self.ui_tx.send(UiCommand::UpdateMenuHighlight(next));
-                }
-                true
+            // 方向键/回车/空格/ESC → 菜单窗口处理（导航/下钻/返回/激活/关闭）
+            0x26 | 0x28 | 0x25 | 0x27 | 0x0D | 0x20 | 0x1B => {
+                let _ = self.ui_tx.send(UiCommand::MenuKey(key_code));
             }
-            0x0D | 0x20 => {
-                // 回车/空格：激活当前项
-                let idx = state.menu_selected;
-                drop(state);
-                self.menu_activate(idx);
-                true
-            }
-            0x1B => {
-                // ESC：关闭菜单
-                drop(state);
-                self.menu_close();
-                true
-            }
-            _ => {
-                // 其它键：关闭菜单并吞掉（避免误入输入）
-                drop(state);
-                self.menu_close();
-                true
-            }
+            // 其它键：关闭菜单并吞掉
+            _ => self.menu_close(),
         }
+        true
     }
 
     /// 构建右键候选菜单项并下发给 UI 显示。
     fn show_candidate_menu(&self, page_local: usize, x: i32, y: i32) {
+        use wind_ui::manager::MenuItemSpec as M;
         let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
         if state.candidates.is_empty() || state.input_buffer.is_empty() {
             return;
@@ -1748,33 +1764,24 @@ impl Coordinator {
         let schema = self.engine_mgr.active_schema_id();
         let has_rule = self.shadow.has_rule(&schema, &code, &word);
         let multi_char = word.chars().count() > 1;
+        let op = |o: CandidateOp| MenuKind::Op(o);
 
-        let item = |label: &str, kind: MenuKind, enabled: bool| MenuItemSpec {
-            label: label.to_string(),
-            kind,
-            enabled,
-        };
         let items = vec![
-            item("置顶", MenuKind::Op(CandidateOp::MoveTop), true),
-            item("前移", MenuKind::Op(CandidateOp::MoveUp), idx > 0),
-            item("后移", MenuKind::Op(CandidateOp::MoveDown), idx + 1 < total),
-            item("删除", MenuKind::Op(CandidateOp::Delete), multi_char),
-            item("恢复默认", MenuKind::Op(CandidateOp::Reset), has_rule),
-            MenuItemSpec { label: String::new(), kind: MenuKind::Separator, enabled: false },
-            item("复制", MenuKind::Copy, true),
+            M::leaf("置顶", op(CandidateOp::MoveTop), true, false),
+            M::leaf("前移", op(CandidateOp::MoveUp), idx > 0, false),
+            M::leaf("后移", op(CandidateOp::MoveDown), idx + 1 < total, false),
+            M::leaf("删除", op(CandidateOp::Delete), multi_char, false),
+            M::leaf("恢复默认", op(CandidateOp::Reset), has_rule, false),
+            M::separator(),
+            M::leaf("复制", MenuKind::Copy, true, false),
         ];
-        let selected = first_enabled_menu(&items).unwrap_or(0);
-
-        // 记录菜单状态（供键盘导航/激活）
         {
             let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
             state.menu_open = true;
-            state.menu_selected = selected;
-            state.menu_items = items.clone();
             state.menu_target_page_local = page_local;
             state.menu_target_text = word;
         }
-        let _ = self.ui_tx.send(UiCommand::ShowCandidateMenu { items, x, y, selected });
+        let _ = self.ui_tx.send(UiCommand::ShowCandidateMenu { items, x, y });
     }
 
     /// 候选词条操作（右键菜单）：调整 Shadow 规则并即时重排重绘。
@@ -2148,7 +2155,7 @@ impl MessageHandler for Coordinator {
         }
 
         // ── 右键菜单打开时：方向键/回车/ESC 由菜单消费（优先于一切）──
-        if self.is_menu_open() && self.menu_handle_key(data.key_code) {
+        if self.is_menu_open() && self.forward_menu_key(data.key_code) {
             return KeyAction::Consumed;
         }
 
