@@ -12,6 +12,8 @@ use tracing::{debug, info};
 pub struct CandidateItem {
     pub text: String,
     pub code: String,
+    /// 序号标签（如 "1" / "a"）；空则按位置自动用数字编号
+    pub label: String,
 }
 
 /// 候选窗口配置
@@ -177,7 +179,12 @@ impl CandidateWindow {
         let mut cells = Vec::new();
         let mut x = padding_x;
         for (i, c) in candidates.iter().enumerate() {
-            let label = format!("{}.{}", i + 1, c.text);
+            let marker = if c.label.is_empty() {
+                (i + 1).to_string()
+            } else {
+                c.label.clone()
+            };
+            let label = format!("{}.{}", marker, c.text);
             let w = renderer.measure_text(&label).width;
             cells.push((label, x, w));
             x += w + Self::CELL_GAP;

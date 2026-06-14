@@ -263,10 +263,34 @@ pub struct S2TConfig {
     pub variant: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct QuickInputConfig {
     #[serde(default)]
     pub enabled: bool,
+    /// 触发键（如 "semicolon"），默认分号
+    #[serde(default = "default_quick_input_triggers")]
+    pub trigger_keys: Vec<String>,
+    /// 计算器结果小数位数，默认 6
+    #[serde(default = "default_decimal_places")]
+    pub decimal_places: i32,
+}
+
+fn default_quick_input_triggers() -> Vec<String> {
+    vec!["semicolon".to_string()]
+}
+
+fn default_decimal_places() -> i32 {
+    6
+}
+
+impl Default for QuickInputConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            trigger_keys: default_quick_input_triggers(),
+            decimal_places: default_decimal_places(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]

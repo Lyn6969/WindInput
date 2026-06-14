@@ -2096,6 +2096,7 @@ name = "wind-coordinator"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "chrono",
  "tokio",
  "tracing",
  "wind-bridge",

@@ -18,6 +18,7 @@ wind-cmdbar = { path = "../wind-cmdbar" }
 tokio = { workspace = true }
 tracing = { workspace = true }
 anyhow = { workspace = true }
+chrono = "0.4"
 
 [dev-dependencies]
 wind-config = { path = "../wind-config" }

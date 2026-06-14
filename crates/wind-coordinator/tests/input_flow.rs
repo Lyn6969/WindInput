@@ -356,17 +356,17 @@ fn test_second_third_candidate_keys() {
 }
 
 #[test]
-fn test_select_key_falls_back_to_punct_when_insufficient() {
+fn test_empty_buffer_semicolon_enters_quick_input() {
     if !has_schemas() {
         return;
     }
     let coord = Coordinator::new_headless(config_with("pinyin"), Some(&data_dir()));
-    // 空缓冲下按分号 → 应作为中文标点（；），而非选词
+    // 空缓冲下按分号 → 进入快捷输入（分号是默认快捷输入触发键），组合区前缀 ";"
     match coord.handle_key_event(&key_event(0xBA, EVENT_KEY_DOWN)) {
-        KeyAction::InsertText { text, .. } => {
-            assert_eq!(text, "；", "空缓冲分号应上屏中文分号");
+        KeyAction::UpdateComposition { text, .. } => {
+            assert_eq!(text, ";", "空缓冲分号应进入快捷输入显示前缀");
         }
-        other => panic!("空缓冲分号应作标点，实际: {:?}", other),
+        other => panic!("空缓冲分号应进入快捷输入，实际: {:?}", other),
     }
 }
 
@@ -442,6 +442,128 @@ fn test_temp_pinyin_not_triggered_in_pinyin_mode() {
     // 应作为标点处理（反引号→ 不在中文标点表则原样/全角），不应进入临时拼音前缀
     let txt = action_text(&act).unwrap_or_default();
     assert_ne!(txt, "`ni", "拼音方案不应进入临时拼音");
+}
+
+/// 按下一个字符键（vk + 可选 shift）
+fn press_vk(coord: &Coordinator, vk: u32, shift: bool) -> KeyAction {
+    let mut ev = key_event(vk, EVENT_KEY_DOWN);
+    if shift {
+        ev.modifiers = 0x0001;
+    }
+    coord.handle_key_event(&ev)
+}
+
+#[test]
+fn test_quick_input_calc() {
+    if !has_schemas() {
+        return;
+    }
+    let coord = Coordinator::new_headless(config_with("wubi86"), Some(&data_dir()));
+    // 分号(;, VK_OEM_1=0xBA)进入快捷输入，组合区前缀 ";"
+    let act = coord.handle_key_event(&key_event(0xBA, EVENT_KEY_DOWN));
+    assert_eq!(action_text(&act).unwrap(), ";", "分号应进入快捷输入");
+
+    // 输入 1+2*3：1(0x31) +(Shift+=,0xBB) 2(0x32) *(Shift+8,0x38) 3(0x33)
+    press_vk(&coord, 0x31, false);
+    press_vk(&coord, 0xBB, true); // +
+    press_vk(&coord, 0x32, false);
+    press_vk(&coord, 0x38, true); // *
+    let last = press_vk(&coord, 0x33, false);
+    assert_eq!(action_text(&last).unwrap(), ";1+2*3", "组合区应为 ;1+2*3");
+
+    // 首选候选应为 "1+2*3=7"
+    let texts = coord.debug_page_texts();
+    assert_eq!(texts[0], "1+2*3=7", "计算器首选应为表达式=结果，实际: {:?}", texts);
+
+    // 字母 a 选第 1 个候选上屏
+    match press_vk(&coord, 0x41, false) {
+        KeyAction::InsertText { text, .. } => assert_eq!(text, "1+2*3=7"),
+        other => panic!("字母 a 应上屏首选，实际: {:?}", other),
+    }
+}
+
+#[test]
+fn test_quick_input_date_space_commits() {
+    if !has_schemas() {
+        return;
+    }
+    let coord = Coordinator::new_headless(config_with("wubi86"), Some(&data_dir()));
+    coord.handle_key_event(&key_event(0xBA, EVENT_KEY_DOWN)); // ;
+    // 输入 2025.12.25
+    for vk in [0x32, 0x30, 0x32, 0x35] {
+        press_vk(&coord, vk, false);
+    }
+    press_vk(&coord, 0xBE, false); // .
+    for vk in [0x31, 0x32] {
+        press_vk(&coord, vk, false);
+    }
+    press_vk(&coord, 0xBE, false); // .
+    for vk in [0x32, 0x35] {
+        press_vk(&coord, vk, false);
+    }
+    let texts = coord.debug_page_texts();
+    assert!(
+        texts.iter().any(|t| t == "2025年12月25日"),
+        "日期候选应含 2025年12月25日，实际: {:?}",
+        texts
+    );
+    // 空格上屏高亮（首选 20251225）
+    match coord.handle_key_event(&key_event(0x20, EVENT_KEY_DOWN)) {
+        KeyAction::InsertText { text, .. } => assert_eq!(text, "20251225"),
+        other => panic!("空格应上屏日期首选，实际: {:?}", other),
+    }
+}
+
+#[test]
+fn test_quick_input_double_semicolon_outputs_literal() {
+    if !has_schemas() {
+        return;
+    }
+    let coord = Coordinator::new_headless(config_with("wubi86"), Some(&data_dir()));
+    coord.handle_key_event(&key_event(0xBA, EVENT_KEY_DOWN)); // ; 进入
+    // 再按 ; → 上屏字面 ";" 并退出
+    match coord.handle_key_event(&key_event(0xBA, EVENT_KEY_DOWN)) {
+        KeyAction::InsertText { text, .. } => assert_eq!(text, ";"),
+        other => panic!("双分号应上屏字面分号，实际: {:?}", other),
+    }
+    // 退出后五笔正常
+    let act = press_letter(&coord, 'a');
+    assert_eq!(action_text(&act).unwrap(), "a");
+}
+
+#[test]
+fn test_quick_input_esc_exits() {
+    if !has_schemas() {
+        return;
+    }
+    let coord = Coordinator::new_headless(config_with("wubi86"), Some(&data_dir()));
+    coord.handle_key_event(&key_event(0xBA, EVENT_KEY_DOWN));
+    press_vk(&coord, 0x31, false);
+    match coord.handle_key_event(&key_event(0x1B, EVENT_KEY_DOWN)) {
+        KeyAction::ClearComposition => {}
+        other => panic!("Esc 应退出快捷输入，实际: {:?}", other),
+    }
+}
+
+#[test]
+fn test_semicolon_still_selects_second_candidate_with_candidates() {
+    if !has_schemas() {
+        return;
+    }
+    // 有候选时分号仍应作二三候选（不进入快捷输入）
+    let coord = Coordinator::new_headless(config_with("wubi86"), Some(&data_dir()));
+    press_letter(&coord, 'a');
+    let texts = coord.debug_page_texts();
+    if texts.len() < 2 {
+        return;
+    }
+    let second = texts[1].clone();
+    match coord.handle_key_event(&key_event(0xBA, EVENT_KEY_DOWN)) {
+        KeyAction::InsertText { text, .. } => {
+            assert_eq!(text, second, "有候选时分号应选第 2 个候选");
+        }
+        other => panic!("有候选时分号应作二三候选，实际: {:?}", other),
+    }
 }
 
 #[test]

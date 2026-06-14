@@ -57,6 +57,27 @@ fn punct_char(key_code: u32, shift: bool) -> Option<char> {
     Some(if shift { shifted } else { base })
 }
 
+/// VK + shift → 快捷输入表达式字符（数字/运算符/点/括号；含小键盘）。其它返回 None。
+fn quick_input_char(key_code: u32, shift: bool) -> Option<char> {
+    // 小键盘
+    match key_code {
+        0x60..=0x69 => return Some((b'0' + (key_code - 0x60) as u8) as char),
+        0x6A => return Some('*'),
+        0x6B => return Some('+'),
+        0x6D => return Some('-'),
+        0x6E => return Some('.'),
+        0x6F => return Some('/'),
+        _ => {}
+    }
+    // 主键盘：复用 punct_char，仅保留表达式有效字符
+    let c = punct_char(key_code, shift)?;
+    if c.is_ascii_digit() || matches!(c, '+' | '-' | '*' | '/' | '.' | '(' | ')') {
+        Some(c)
+    } else {
+        None
+    }
+}
+
 /// 引擎一次转换请求的候选上限（boost 重排后截断到 9）
 const ENGINE_MAX_CANDIDATES: usize = 50;
 
@@ -84,6 +105,12 @@ struct State {
     temp_pinyin_schema: String,
     /// 临时拼音组合区前缀字符（触发键，如 "`"）
     temp_pinyin_prefix: String,
+    /// 快捷输入模式（分号触发：日期/计算器）
+    quick_input_mode: bool,
+    /// 快捷输入缓冲（如 "1+2*3" / "12.25"）
+    quick_input_buffer: String,
+    /// 快捷输入组合区前缀字符（触发键，如 ";"）
+    quick_input_prefix: String,
     caret_x: i32,
     caret_y: i32,
     caret_height: i32,
@@ -185,6 +212,9 @@ impl Coordinator {
                 temp_pinyin_buffer: String::new(),
                 temp_pinyin_schema: String::new(),
                 temp_pinyin_prefix: String::new(),
+                quick_input_mode: false,
+                quick_input_buffer: String::new(),
+                quick_input_prefix: String::new(),
                 caret_x: 0,
                 caret_y: 0,
                 caret_height: 0,
@@ -601,6 +631,212 @@ impl Coordinator {
         }
     }
 
+    // ───────────────────────── 快捷输入 ─────────────────────────
+
+    /// 触发键名 → VK
+    fn quick_input_trigger_vk(key: &str) -> Option<u32> {
+        match key.trim().to_lowercase().as_str() {
+            "semicolon" | ";" => Some(0xBA),
+            "backtick" | "grave" | "`" => Some(0xC0),
+            "quote" | "'" => Some(0xDE),
+            "comma" | "," => Some(0xBC),
+            "period" | "." => Some(0xBE),
+            "slash" | "/" => Some(0xBF),
+            "lbracket" | "[" => Some(0xDB),
+            "rbracket" | "]" => Some(0xDD),
+            _ => None,
+        }
+    }
+
+    /// VK → 组合区前缀字符
+    fn quick_input_prefix_for(key_code: u32) -> &'static str {
+        match key_code {
+            0xBA => ";",
+            0xC0 => "`",
+            0xDE => "'",
+            0xBC => ",",
+            0xBE => ".",
+            0xBF => "/",
+            0xDB => "[",
+            0xDD => "]",
+            _ => ";",
+        }
+    }
+
+    /// 当前按键是否匹配配置的快捷输入触发键
+    fn is_quick_input_trigger(&self, key_code: u32) -> bool {
+        self.config
+            .features
+            .quick_input
+            .trigger_keys
+            .iter()
+            .filter_map(|k| Self::quick_input_trigger_vk(k))
+            .any(|vk| vk == key_code)
+    }
+
+    /// 退出快捷输入模式并清空状态
+    fn exit_quick_input(&self, state: &mut State) {
+        state.quick_input_mode = false;
+        state.quick_input_buffer.clear();
+        state.quick_input_prefix.clear();
+        state.candidates.clear();
+        state.preedit.clear();
+        state.current_page = 0;
+        state.selected_index = 0;
+    }
+
+    /// 由缓冲生成日期/计算器候选，刷新组合区（前缀 + 缓冲）
+    fn update_quick_input_candidates(&self, state: &mut State) {
+        state.candidates.clear();
+        state.current_page = 0;
+        state.selected_index = 0;
+        let prefix = state.quick_input_prefix.clone();
+        if state.quick_input_buffer.is_empty() {
+            state.preedit = prefix;
+            return;
+        }
+        state.preedit = format!("{}{}", prefix, state.quick_input_buffer);
+        let dp = self.config.features.quick_input.decimal_places;
+        let texts =
+            crate::quick_input::generate_quick_input_candidates(&state.quick_input_buffer, dp);
+        state.candidates = texts
+            .into_iter()
+            .enumerate()
+            .map(|(i, t)| Candidate {
+                text: t,
+                natural_order: i as i32,
+                ..Default::default()
+            })
+            .collect();
+    }
+
+    /// 快捷输入模式组合区刷新结果（UpdateComposition）
+    fn quick_input_composition(&self, state: &State) -> KeyAction {
+        let display = state.preedit.clone();
+        KeyAction::UpdateComposition {
+            text: display.clone(),
+            caret_pos: display.chars().count() as u32,
+        }
+    }
+
+    /// 快捷输入模式下的按键处理
+    fn handle_quick_input_key(&self, state: &mut State, data: &KeyEventData) -> KeyAction {
+        match data.key_code {
+            0x1B => {
+                self.exit_quick_input(state);
+                self.notify_ui_hide();
+                KeyAction::ClearComposition
+            }
+            0x08 => {
+                // 退格：空缓冲退出，否则删末字符（可退到仅前缀）
+                if state.quick_input_buffer.is_empty() {
+                    self.exit_quick_input(state);
+                    self.notify_ui_hide();
+                    return KeyAction::ClearComposition;
+                }
+                state.quick_input_buffer.pop();
+                self.update_quick_input_candidates(state);
+                if state.candidates.is_empty() {
+                    self.notify_ui_hide();
+                } else {
+                    self.notify_ui_update(state);
+                }
+                self.quick_input_composition(state)
+            }
+            0x20 => {
+                // 空格：上屏当前高亮候选；无候选则退出
+                if !state.candidates.is_empty() {
+                    let idx = self.highlighted_global_index(state).min(state.candidates.len() - 1);
+                    let text = state.candidates[idx].text.clone();
+                    self.exit_quick_input(state);
+                    self.notify_ui_hide();
+                    Self::commit_action(text, true)
+                } else {
+                    self.exit_quick_input(state);
+                    self.notify_ui_hide();
+                    KeyAction::ClearComposition
+                }
+            }
+            0x0D => {
+                // 回车：上屏缓冲原文（空则上屏前缀字符）
+                let out = if state.quick_input_buffer.is_empty() {
+                    state.quick_input_prefix.clone()
+                } else {
+                    state.quick_input_buffer.clone()
+                };
+                self.exit_quick_input(state);
+                self.notify_ui_hide();
+                if out.is_empty() {
+                    KeyAction::ClearComposition
+                } else {
+                    Self::commit_action(out, true)
+                }
+            }
+            0x26 | 0x28 => {
+                let changed = if data.key_code == 0x26 {
+                    self.move_up(state)
+                } else {
+                    self.move_down(state)
+                };
+                if changed {
+                    self.notify_ui_update(state);
+                }
+                KeyAction::Consumed
+            }
+            0x21 | 0x22 => {
+                let changed = if data.key_code == 0x21 {
+                    self.page_prev(state)
+                } else {
+                    self.page_next(state)
+                };
+                if changed {
+                    self.notify_ui_update(state);
+                }
+                KeyAction::Consumed
+            }
+            0x41..=0x5A if data.modifiers & (MOD_CTRL | MOD_ALT) == 0 => {
+                // 字母 a-z 按标签选当前页候选（a=第1个）
+                let (start, end) = self.page_range(state);
+                let idx = start + (data.key_code - 0x41) as usize;
+                if idx < end {
+                    let text = state.candidates[idx].text.clone();
+                    self.exit_quick_input(state);
+                    self.notify_ui_hide();
+                    Self::commit_action(text, true)
+                } else {
+                    KeyAction::Consumed
+                }
+            }
+            _ => {
+                // 再次按触发键且缓冲为空：上屏前缀字符并退出
+                if state.quick_input_buffer.is_empty()
+                    && self.is_quick_input_trigger(data.key_code)
+                {
+                    let prefix = state.quick_input_prefix.clone();
+                    self.exit_quick_input(state);
+                    self.notify_ui_hide();
+                    return Self::commit_action(prefix, true);
+                }
+                // 可打印字符（数字/运算符/点/括号等）累积到缓冲
+                let shift = data.modifiers & MOD_SHIFT != 0;
+                if let Some(ch) = quick_input_char(data.key_code, shift) {
+                    if state.quick_input_buffer.chars().count() < 20 {
+                        state.quick_input_buffer.push(ch);
+                        self.update_quick_input_candidates(state);
+                        if state.candidates.is_empty() {
+                            self.notify_ui_hide();
+                        } else {
+                            self.notify_ui_update(state);
+                        }
+                    }
+                    self.quick_input_composition(state)
+                } else {
+                    KeyAction::Consumed
+                }
+            }
+        }
+    }
+
     /// 提交某个候选（记录词频后清空状态）
     fn commit_candidate(&self, state: &mut State, text: &str) {
         self.record_selection(text);
@@ -618,11 +854,19 @@ impl Coordinator {
         }
         // 仅推送当前页候选（窗口按 1..N 编号，翻页后重新编号）
         let (start, end) = self.page_range(state);
+        // 快捷输入用字母标签（a/b/c，因数字键需录入表达式），其余用数字
+        let alpha = state.quick_input_mode;
         let items: Vec<CandidateItem> = state.candidates[start..end]
             .iter()
-            .map(|c| CandidateItem {
+            .enumerate()
+            .map(|(i, c)| CandidateItem {
                 text: c.text.clone(),
                 code: c.code.clone(),
+                label: if alpha {
+                    ((b'a' + i as u8) as char).to_string()
+                } else {
+                    (i + 1).to_string()
+                },
             })
             .collect();
         // 多页时在组合区追加页码指示（如 "ni hao (1/3)"）
@@ -856,6 +1100,30 @@ impl MessageHandler for Coordinator {
         // 临时拼音模式：路由到专用处理器（独占按键）
         if state.temp_pinyin_mode {
             return self.handle_temp_pinyin_key(&mut state, data);
+        }
+
+        // 快捷输入模式：路由到专用处理器（独占按键）
+        if state.quick_input_mode {
+            return self.handle_quick_input_key(&mut state, data);
+        }
+
+        // 触发快捷输入：空缓冲 + 无候选 + 匹配触发键 + 无修饰键
+        if state.input_buffer.is_empty()
+            && state.candidates.is_empty()
+            && data.modifiers & (MOD_CTRL | MOD_ALT | MOD_SHIFT) == 0
+            && self.is_quick_input_trigger(data.key_code)
+        {
+            state.quick_input_mode = true;
+            state.quick_input_buffer.clear();
+            state.quick_input_prefix = Self::quick_input_prefix_for(data.key_code).to_string();
+            self.update_quick_input_candidates(&mut state);
+            let display = state.preedit.clone();
+            self.notify_ui_update(&state);
+            debug!("Entered quick input mode (prefix={})", state.quick_input_prefix);
+            return KeyAction::UpdateComposition {
+                text: display.clone(),
+                caret_pos: display.chars().count() as u32,
+            };
         }
 
         // 触发临时拼音：码表方案 + 空缓冲 + 匹配触发键 + 无修饰键
