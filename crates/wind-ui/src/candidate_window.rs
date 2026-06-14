@@ -8,7 +8,7 @@ use std::cell::RefCell;
 use std::rc::Rc;
 use std::sync::mpsc::Sender;
 
-use crate::manager::UiEvent;
+use crate::manager::{UiEvent, HOVER_PAGE_NEXT as TAG_PAGE_NEXT, HOVER_PAGE_PREV as TAG_PAGE_PREV};
 use crate::text::dwrite::TextRenderer;
 use crate::view::{Align, Edges, Layout, Rect, View};
 use crate::window::{LayeredWindow, WindowMouse};
@@ -25,6 +25,8 @@ pub struct CandidateItem {
     pub code: String,
     /// 序号标签（如 "1" / "a"）；空则按位置自动用数字编号
     pub label: String,
+    /// 悬停反查提示（逐字编码/拼音，多行）；空则用 code 兜底
+    pub tooltip: String,
 }
 
 /// 候选窗口配置
@@ -109,6 +111,8 @@ pub struct CandidateWindow {
     hit_rects: Vec<(i32, Rect)>,
     /// 鼠标处理器（与 window 共享，wnd_proc 经注册表回调）
     mouse: Rc<RefCell<CandidateMouse>>,
+    /// 悬停编码反查气泡
+    tooltip: Option<crate::tooltip::Tooltip>,
 }
 
 impl CandidateWindow {
@@ -136,6 +140,7 @@ impl CandidateWindow {
             text_renderer,
             hit_rects: Vec::new(),
             mouse,
+            tooltip: crate::tooltip::Tooltip::new().ok(),
         })
     }
 
@@ -210,6 +215,36 @@ impl CandidateWindow {
         let (px, py) = Self::clamp_to_work_area(self.x, self.y, width, height);
         self.window.show(px, py);
         self.visible = true;
+        self.update_tooltip(px, py);
+    }
+
+    /// 悬停时在该候选下方显示其编码（反查）；无悬停或无编码则隐藏。
+    fn update_tooltip(&mut self, px: i32, py: i32) {
+        let hover = self.hover;
+        // 仅候选项（非翻页器 tag）显示反查提示
+        let info = if (0..TAG_PAGE_PREV).contains(&hover) {
+            let code = self
+                .candidates
+                .get(hover as usize)
+                .map(|c| c.tooltip.clone())
+                .unwrap_or_default();
+            self.hit_rects
+                .iter()
+                .find(|(t, _)| *t == hover)
+                .map(|(_, r)| *r)
+                .filter(|_| !code.is_empty())
+                .map(|r| (code, r))
+        } else {
+            None
+        };
+        if let Some(tip) = self.tooltip.as_mut() {
+            match info {
+                Some((code, r)) => {
+                    tip.show(&code, px + r.x as i32, py + (r.y + r.h) as i32 + 2)
+                }
+                None => tip.hide(),
+            }
+        }
     }
 
     /// 将候选窗钳制在光标所在显示器的工作区内：
@@ -307,12 +342,35 @@ impl CandidateWindow {
             row = row.child(item);
         }
 
-        // 翻页指示（多页时）
+        // 翻页器（多页时）：‹ p/t › —— 箭头可点击翻页，带悬停高亮 + 禁用态
         if self.total_pages > 1 {
-            row = row.child(
-                View::leaf(format!("{}/{}", self.page, self.total_pages), c.marker_color())
-                    .margin(Edges::xy(s, 0.0)),
-            );
+            let disabled = [180, 180, 185, 255]; // 禁用灰
+            let arrow = |txt: &str, tag: i32, enabled: bool, hovered: bool| {
+                let color = if enabled { c.highlight_color } else { disabled };
+                let mut v = View::leaf(txt, color)
+                    .pad(Edges::xy(s * 1.2, s * 0.5))
+                    .radius(c.font_size * 0.18)
+                    .cross(Align::Center);
+                if enabled {
+                    v = v.tag(tag); // 仅启用项参与命中
+                    if hovered {
+                        v = v.bg(c.hover_bg);
+                    }
+                }
+                v
+            };
+            let prev_on = self.page > 1;
+            let next_on = self.page < self.total_pages;
+            row = row
+                .child(
+                    arrow("‹", TAG_PAGE_PREV, prev_on, self.hover == TAG_PAGE_PREV)
+                        .margin(Edges::xy(s, 0.0)),
+                )
+                .child(View::leaf(
+                    format!("{}/{}", self.page, self.total_pages),
+                    c.marker_color(),
+                ))
+                .child(arrow("›", TAG_PAGE_NEXT, next_on, self.hover == TAG_PAGE_NEXT));
         }
 
         root.child(row)
@@ -321,6 +379,9 @@ impl CandidateWindow {
     pub fn hide(&mut self) {
         self.window.hide();
         self.visible = false;
+        if let Some(t) = self.tooltip.as_mut() {
+            t.hide();
+        }
     }
 
     pub fn is_visible(&self) -> bool {
@@ -375,17 +436,27 @@ impl WindowMouse for CandidateMouse {
             WM_LBUTTONDOWN => {
                 let (x, y) = mouse_pos(lparam);
                 let i = self.hit(x, y);
-                if i >= 0 {
-                    let _ = self.events.send(UiEvent::CandidateSelect(i as usize));
+                match i {
+                    TAG_PAGE_PREV => {
+                        let _ = self.events.send(UiEvent::Page(-1));
+                    }
+                    TAG_PAGE_NEXT => {
+                        let _ = self.events.send(UiEvent::Page(1));
+                    }
+                    i if i >= 0 => {
+                        let _ = self.events.send(UiEvent::CandidateSelect(i as usize));
+                    }
+                    _ => {}
                 }
                 Some(LRESULT(0))
             }
             WM_MOUSEMOVE => {
                 let (x, y) = mouse_pos(lparam);
-                let i = self.hit(x, y);
-                if i >= 0 && i != self.last_hover {
-                    self.last_hover = i;
-                    let _ = self.events.send(UiEvent::Hover(i));
+                // 命中目标：候选下标(0..N) / 翻页 tag / -1 无；统一作为悬停目标上报
+                let raw = self.hit(x, y);
+                if raw != self.last_hover {
+                    self.last_hover = raw;
+                    let _ = self.events.send(UiEvent::Hover(raw));
                 }
                 Some(LRESULT(0))
             }

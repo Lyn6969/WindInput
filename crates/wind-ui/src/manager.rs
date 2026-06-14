@@ -57,6 +57,10 @@ pub enum UiCommand {
     Shutdown,
 }
 
+/// 翻页器命中/悬停 tag（远高于候选下标，避免冲突）
+pub const HOVER_PAGE_PREV: i32 = 100_000;
+pub const HOVER_PAGE_NEXT: i32 = 100_001;
+
 /// 工具栏单元格动作
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ToolbarAction {

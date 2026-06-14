@@ -32,6 +32,19 @@ use wind_ui::manager::{
 use wind_ui::toolbar::ToolbarState;
 
 /// VK + shift → 该键产生的 ASCII 标点/符号字符（字母键返回 None，由拼音/码表处理）。
+/// 解析配对表（每项 2 字符 "（）"）为 (左,右) 字符对，忽略非法项。
+fn parse_pairs(list: &[String]) -> Vec<(char, char)> {
+    list.iter()
+        .filter_map(|s| {
+            let mut it = s.chars();
+            match (it.next(), it.next(), it.next()) {
+                (Some(l), Some(r), None) => Some((l, r)),
+                _ => None,
+            }
+        })
+        .collect()
+}
+
 fn punct_char(key_code: u32, shift: bool) -> Option<char> {
     let (base, shifted) = match key_code {
         0x30 => ('0', ')'),
@@ -100,9 +113,9 @@ struct State {
     candidates: Vec<Candidate>,
     /// 当前页内高亮候选下标（0-based，相对当前页）——键盘选中项，空格上屏的目标
     selected_index: usize,
-    /// 当前页内鼠标悬停候选下标（0-based，相对当前页）；None 表示无悬停。
+    /// 鼠标悬停目标（原始 tag）：-1 无，0..N 候选页内下标，或翻页器 tag。
     /// 与 selected_index 相互独立：悬停只是视觉提示，不改变空格上屏的目标。
-    hover_index: Option<usize>,
+    hover_index: i32,
     /// 当前页码（0-based）
     current_page: usize,
     /// 动态分级加载：当前候选对应的输入码
@@ -168,6 +181,12 @@ pub struct Coordinator {
     shadow_path: Option<std::path::PathBuf>,
     /// 工具栏位置持久化文件路径（toolbar_pos.txt；None=不持久化）
     toolbar_pos_path: Option<std::path::PathBuf>,
+    /// 候选反查（编码/拆字/拼音）供悬停提示
+    reverse: crate::reverse::ReverseLookup,
+    /// 标点配对：中/英配对表（left,right）+ 跟踪栈（用于智能跳过）
+    cn_pairs: Vec<(char, char)>,
+    en_pairs: Vec<(char, char)>,
+    pair_tracker: Mutex<wind_transform::pair_tracker::PairTracker>,
 }
 
 /// 短语候选权重基准（高于普通候选，使短语展开排在前列）
@@ -305,6 +324,16 @@ impl Coordinator {
             }
         }
 
+        // 标点配对表（解析为 (左,右) 字符对）
+        let cn_pairs = parse_pairs(&config.input.auto_pair.chinese_pairs);
+        let en_pairs = parse_pairs(&config.input.auto_pair.english_pairs);
+
+        // 候选反查表（拆字/拼音）
+        let reverse = crate::reverse::ReverseLookup::load(data_dir);
+        if !reverse.is_empty() {
+            info!("Loaded reverse-lookup (chaizi/pinyin)");
+        }
+
         // Shadow 规则（与 freq 同目录的 shadow.json）
         let shadow = ShadowStore::new();
         let shadow_path = freq_path.as_ref().map(|p| p.with_file_name("shadow.json"));
@@ -327,7 +356,7 @@ impl Coordinator {
                 preedit: String::new(),
                 candidates: Vec::new(),
                 selected_index: 0,
-                hover_index: None,
+                hover_index: -1,
                 current_page: 0,
                 candidate_input: String::new(),
                 candidate_limit: 0,
@@ -364,6 +393,10 @@ impl Coordinator {
             shadow,
             shadow_path,
             toolbar_pos_path,
+            reverse,
+            cn_pairs,
+            en_pairs,
+            pair_tracker: Mutex::new(wind_transform::pair_tracker::PairTracker::new()),
         });
         // 启动即显示常驻工具栏（反映初始 中英/方案/标点/全半角）
         coordinator.notify_toolbar();
@@ -547,7 +580,7 @@ impl Coordinator {
         // 候选变化：复位翻页与高亮（含清除鼠标悬停）
         state.current_page = 0;
         state.selected_index = 0;
-        state.hover_index = None;
+        state.hover_index = -1;
     }
 
     /// 扩展候选（翻页/下移到边界时调用）：上限翻倍（≤5000）重新加载，保持当前页/高亮。
@@ -610,7 +643,7 @@ impl Coordinator {
 
     /// 上移高亮（页首回卷到上一页末项）；返回是否变化
     fn move_up(&self, state: &mut State) -> bool {
-        state.hover_index = None;
+        state.hover_index = -1;
         if state.candidates.is_empty() {
             return false;
         }
@@ -628,7 +661,7 @@ impl Coordinator {
 
     /// 下移高亮（页尾回卷到下一页首项）；返回是否变化
     fn move_down(&self, state: &mut State) -> bool {
-        state.hover_index = None;
+        state.hover_index = -1;
         if state.candidates.is_empty() {
             return false;
         }
@@ -651,7 +684,7 @@ impl Coordinator {
 
     /// 上一页（高亮归零）；返回是否变化
     fn page_prev(&self, state: &mut State) -> bool {
-        state.hover_index = None;
+        state.hover_index = -1;
         if state.current_page > 0 {
             state.current_page -= 1;
             state.selected_index = 0;
@@ -663,7 +696,7 @@ impl Coordinator {
 
     /// 下一页（高亮归零）；返回是否变化
     fn page_next(&self, state: &mut State) -> bool {
-        state.hover_index = None;
+        state.hover_index = -1;
         // 接近末页且有更多 → 先动态扩展加载，使新页可达
         if state.has_more && state.current_page + 2 >= self.total_pages(state) {
             self.expand_candidates(state);
@@ -1334,24 +1367,39 @@ impl Coordinator {
         let items: Vec<CandidateItem> = state.candidates[start..end]
             .iter()
             .enumerate()
-            .map(|(i, c)| CandidateItem {
-                // 开启简繁时显示也转繁体（内部候选仍存简体，用于词频/匹配）
-                text: self.maybe_s2t(state, &c.text),
-                code: c.code.clone(),
-                label: if alpha {
-                    ((b'a' + i as u8) as char).to_string()
-                } else {
-                    (i + 1).to_string()
-                },
+            .map(|(i, c)| {
+                let disp = self.maybe_s2t(state, &c.text);
+                // 反查提示：优先逐字编码/拼音，无则回退引擎给的整体编码
+                let mut tooltip = self.reverse.tooltip_for(&disp);
+                if tooltip.is_empty() && !c.code.is_empty() {
+                    tooltip = c.code.clone();
+                }
+                CandidateItem {
+                    // 开启简繁时显示也转繁体（内部候选仍存简体，用于词频/匹配）
+                    text: disp,
+                    code: c.code.clone(),
+                    label: if alpha {
+                        ((b'a' + i as u8) as char).to_string()
+                    } else {
+                        (i + 1).to_string()
+                    },
+                    tooltip,
+                }
             })
             .collect();
         // 翻页信息改为结构化字段传给候选窗（窗口内渲染独立的页码指示）
         let total_pages = self.total_pages(state);
         let selected = state.selected_index.min(items.len().saturating_sub(1));
-        // 悬停项独立于选中项；越界则视为无悬停
+        // 悬停目标独立于选中项：候选越界视为无悬停，翻页器 tag 原样透传
         let hover = match state.hover_index {
-            Some(h) if h < items.len() => h as i32,
-            _ => -1,
+            h if (0..wind_ui::manager::HOVER_PAGE_PREV).contains(&h) => {
+                if (h as usize) < items.len() {
+                    h
+                } else {
+                    -1
+                }
+            }
+            h => h, // 翻页器 tag / -1
         };
         let _ = self.ui_tx.send(UiCommand::UpdateCandidates {
             preedit: state.preedit.clone(),
@@ -1674,6 +1722,18 @@ impl Coordinator {
         }
     }
 
+    /// 当前模式下生效的配对表（按中/英标点 + 各自开关）
+    fn active_pairs(&self, chinese_punct: bool) -> Option<&Vec<(char, char)>> {
+        if chinese_punct {
+            if self.config.input.auto_pair.chinese {
+                return Some(&self.cn_pairs);
+            }
+        } else if self.config.input.auto_pair.english {
+            return Some(&self.en_pairs);
+        }
+        None
+    }
+
     /// 持久化 Shadow 规则（best-effort）
     fn save_shadow(&self) {
         if let Some(p) = &self.shadow_path {
@@ -1744,23 +1804,26 @@ impl Coordinator {
         }
     }
 
-    /// 悬停高亮：设置独立的悬停项（不改键盘选中项），重绘。
-    /// page_local<0 表示离开，清除悬停。空格上屏仍以 selected_index 为准。
-    fn mouse_hover(&self, page_local: i32) {
+    /// 悬停高亮：设置独立的悬停目标（候选或翻页器），不改键盘选中项，重绘。
+    /// target<0 表示离开。空格上屏仍以 selected_index 为准。
+    fn mouse_hover(&self, target: i32) {
         let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
         if state.candidates.is_empty() {
             return;
         }
-        let new_hover = if page_local < 0 {
-            None
-        } else {
+        let new_hover = if target == wind_ui::manager::HOVER_PAGE_PREV
+            || target == wind_ui::manager::HOVER_PAGE_NEXT
+        {
+            target // 翻页器悬停
+        } else if target >= 0 {
             let (start, end) = self.page_range(&state);
-            let pl = page_local as usize;
-            if pl < end - start {
-                Some(pl)
+            if (target as usize) < end - start {
+                target
             } else {
-                None
+                -1
             }
+        } else {
+            -1
         };
         if state.hover_index != new_hover {
             state.hover_index = new_hover;
@@ -2295,6 +2358,32 @@ impl MessageHandler for Coordinator {
                     out.push_str(&piece);
                     if had_input {
                         self.notify_ui_hide();
+                    }
+                    // 标点配对（对齐 Go）：插入配对 + 智能跳过
+                    let pch = piece.chars().last().unwrap_or(' ');
+                    if let Some(pairs) = self.active_pairs(state.chinese_punct) {
+                        // 智能跳过：仅无候选前缀（out 即标点本身）时，输右括号→光标右移
+                        if out == piece && pairs.iter().any(|(_, r)| *r == pch) {
+                            let mut tr =
+                                self.pair_tracker.lock().unwrap_or_else(|e| e.into_inner());
+                            if tr.peek().map_or(false, |e| e.right == pch) {
+                                tr.pop();
+                                return KeyAction::MoveCursorRight;
+                            }
+                            tr.clear();
+                        }
+                        // 插入配对：左括号 → 补右括号，光标置于其间
+                        if let Some((_, right)) =
+                            pairs.iter().find(|(l, _)| *l == pch).copied()
+                        {
+                            self.pair_tracker
+                                .lock()
+                                .unwrap_or_else(|e| e.into_inner())
+                                .push(pch, right);
+                            let cursor_offset = out.encode_utf16().count() as u32;
+                            let text = format!("{}{}", out, right);
+                            return KeyAction::InsertTextWithCursor { text, cursor_offset };
+                        }
                     }
                     Self::commit_action(out, true)
                 } else if !state.input_buffer.is_empty() {

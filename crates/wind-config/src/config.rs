@@ -111,6 +111,9 @@ pub struct InputConfig {
     pub smart_punct_after_digit: bool,
     #[serde(default = "default_smart_punct_list")]
     pub smart_punct_list: String,
+    /// 标点配对（输入左括号自动补右括号 + 输右括号智能跳过）
+    #[serde(default)]
+    pub auto_pair: AutoPairConfig,
     #[serde(default = "default_enter_behavior")]
     pub enter_behavior: String,
     #[serde(default = "default_space_behavior")]
@@ -125,6 +128,45 @@ pub struct InputConfig {
     pub capslock: CapslockConfig,
     #[serde(default)]
     pub temp_pinyin: TempPinyinConfig,
+}
+
+/// 标点配对配置（对齐 Go AutoPairConfig）
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AutoPairConfig {
+    /// 中文标点配对开关
+    #[serde(default = "default_true")]
+    pub chinese: bool,
+    /// 英文标点配对开关
+    #[serde(default = "default_true")]
+    pub english: bool,
+    /// 中文配对表（每项 2 字符："（）"）
+    #[serde(default = "default_chinese_pairs")]
+    pub chinese_pairs: Vec<String>,
+    /// 英文配对表（每项 2 字符："()"）
+    #[serde(default = "default_english_pairs")]
+    pub english_pairs: Vec<String>,
+}
+
+impl Default for AutoPairConfig {
+    fn default() -> Self {
+        Self {
+            chinese: true,
+            english: true,
+            chinese_pairs: default_chinese_pairs(),
+            english_pairs: default_english_pairs(),
+        }
+    }
+}
+
+fn default_chinese_pairs() -> Vec<String> {
+    ["（）", "【】", "｛｝", "《》", "〈〉", "「」", "『』"]
+        .iter()
+        .map(|s| s.to_string())
+        .collect()
+}
+
+fn default_english_pairs() -> Vec<String> {
+    ["()", "[]", "{}"].iter().map(|s| s.to_string()).collect()
 }
 
 /// 临时拼音配置（码表方案下临时切到拼音反查）
@@ -158,6 +200,7 @@ impl Default for InputConfig {
             select_char_keys: vec![],
             smart_punct_after_digit: true,
             smart_punct_list: ".,:".to_string(),
+            auto_pair: AutoPairConfig::default(),
             temp_pinyin: TempPinyinConfig::default(),
             enter_behavior: "commit".to_string(),
             space_on_empty_behavior: "commit".to_string(),
