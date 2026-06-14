@@ -25,7 +25,7 @@ use wind_store::freq::FreqTracker;
 use wind_transform::fullwidth::to_full_width;
 use wind_transform::punctuation::PunctuationConverter;
 use wind_ui::candidate_window::CandidateItem;
-use wind_ui::manager::{UiCommand, UiManager};
+use wind_ui::manager::{UiCommand, UiEvent, UiManager};
 use wind_ui::toolbar::ToolbarState;
 
 /// VK + shift → 该键产生的 ASCII 标点/符号字符（字母键返回 None，由拼音/码表处理）。
@@ -95,8 +95,11 @@ struct State {
     /// 仅显示输入码/拼音，绝不包含候选列表。
     preedit: String,
     candidates: Vec<Candidate>,
-    /// 当前页内高亮候选下标（0-based，相对当前页）
+    /// 当前页内高亮候选下标（0-based，相对当前页）——键盘选中项，空格上屏的目标
     selected_index: usize,
+    /// 当前页内鼠标悬停候选下标（0-based，相对当前页）；None 表示无悬停。
+    /// 与 selected_index 相互独立：悬停只是视觉提示，不改变空格上屏的目标。
+    hover_index: Option<usize>,
     /// 当前页码（0-based）
     current_page: usize,
     /// 动态分级加载：当前候选对应的输入码
@@ -160,16 +163,17 @@ impl Coordinator {
         info!("Active schema: {}", config.active_schema());
 
         // UI 管理器（候选窗口线程）
-        let ui_tx = match UiManager::new() {
-            Ok(ui) => {
+        let (ui_tx, event_rx) = match UiManager::new() {
+            Ok(mut ui) => {
                 let tx = ui.sender();
+                let rx = ui.take_event_rx();
                 std::mem::forget(ui); // 进程生命周期内保持 UI 线程存活
-                tx
+                (tx, rx)
             }
             Err(e) => {
                 warn!("Failed to create UI manager: {}", e);
                 let (tx, _rx) = std::sync::mpsc::channel();
-                tx
+                (tx, None)
             }
         };
 
@@ -177,7 +181,19 @@ impl Coordinator {
         let freq_path = Config::user_config_dir()
             .or_else(|| data_dir.as_deref().map(|d| d.to_path_buf()))
             .map(|d| d.join("freq.tsv"));
-        Self::build(config, data_dir.as_deref(), push_server, ui_tx, freq_path)
+        let coordinator = Self::build(config, data_dir.as_deref(), push_server, ui_tx, freq_path);
+
+        // 鼠标事件处理线程：候选窗的点击/悬停/滚轮经此回到协调器
+        if let Some(rx) = event_rx {
+            let c = Arc::clone(&coordinator);
+            std::thread::spawn(move || {
+                for ev in rx {
+                    c.handle_ui_event(ev);
+                }
+                debug!("UI event channel closed");
+            });
+        }
+        coordinator
     }
 
     /// 无头构造器（测试用）：跳过 UI 线程，不做词频持久化（避免污染真实文件）。
@@ -254,6 +270,7 @@ impl Coordinator {
                 preedit: String::new(),
                 candidates: Vec::new(),
                 selected_index: 0,
+                hover_index: None,
                 current_page: 0,
                 candidate_input: String::new(),
                 candidate_limit: 0,
@@ -430,9 +447,10 @@ impl Coordinator {
         state.candidate_limit = limit;
         // 引擎返回数达到上限 → 可能还有更多未加载
         state.has_more = engine_count >= limit;
-        // 候选变化：复位翻页与高亮
+        // 候选变化：复位翻页与高亮（含清除鼠标悬停）
         state.current_page = 0;
         state.selected_index = 0;
+        state.hover_index = None;
     }
 
     /// 扩展候选（翻页/下移到边界时调用）：上限翻倍（≤5000）重新加载，保持当前页/高亮。
@@ -495,6 +513,7 @@ impl Coordinator {
 
     /// 上移高亮（页首回卷到上一页末项）；返回是否变化
     fn move_up(&self, state: &mut State) -> bool {
+        state.hover_index = None;
         if state.candidates.is_empty() {
             return false;
         }
@@ -512,6 +531,7 @@ impl Coordinator {
 
     /// 下移高亮（页尾回卷到下一页首项）；返回是否变化
     fn move_down(&self, state: &mut State) -> bool {
+        state.hover_index = None;
         if state.candidates.is_empty() {
             return false;
         }
@@ -534,6 +554,7 @@ impl Coordinator {
 
     /// 上一页（高亮归零）；返回是否变化
     fn page_prev(&self, state: &mut State) -> bool {
+        state.hover_index = None;
         if state.current_page > 0 {
             state.current_page -= 1;
             state.selected_index = 0;
@@ -545,6 +566,7 @@ impl Coordinator {
 
     /// 下一页（高亮归零）；返回是否变化
     fn page_next(&self, state: &mut State) -> bool {
+        state.hover_index = None;
         // 接近末页且有更多 → 先动态扩展加载，使新页可达
         if state.has_more && state.current_page + 2 >= self.total_pages(state) {
             self.expand_candidates(state);
@@ -1229,10 +1251,16 @@ impl Coordinator {
         // 翻页信息改为结构化字段传给候选窗（窗口内渲染独立的页码指示）
         let total_pages = self.total_pages(state);
         let selected = state.selected_index.min(items.len().saturating_sub(1));
+        // 悬停项独立于选中项；越界则视为无悬停
+        let hover = match state.hover_index {
+            Some(h) if h < items.len() => h as i32,
+            _ => -1,
+        };
         let _ = self.ui_tx.send(UiCommand::UpdateCandidates {
             preedit: state.preedit.clone(),
             candidates: items,
             selected,
+            hover,
             page: state.current_page + 1,
             total_pages,
             caret_x: state.caret_x,
@@ -1242,6 +1270,90 @@ impl Coordinator {
 
     fn notify_ui_hide(&self) {
         let _ = self.ui_tx.send(UiCommand::HideCandidates);
+    }
+
+    // ———————————————— 鼠标交互（来自 UI 线程的反向事件）————————————————
+
+    /// 分发 UI 鼠标事件（在专用线程中执行，可安全加锁/推送）
+    fn handle_ui_event(&self, ev: UiEvent) {
+        match ev {
+            UiEvent::CandidateSelect(i) => self.mouse_select(i),
+            UiEvent::Page(dir) => self.mouse_page(dir),
+            UiEvent::Hover(i) => self.mouse_hover(i),
+        }
+    }
+
+    /// 点击选词：提交页内第 N 个候选，经 push 管道异步上屏（对齐 Go PushCommitText）。
+    fn mouse_select(&self, page_local: usize) {
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        if state.candidates.is_empty() {
+            return;
+        }
+        let (start, end) = self.page_range(&state);
+        let idx = start + page_local;
+        if idx >= end || idx >= state.candidates.len() {
+            return;
+        }
+        let text = state.candidates[idx].text.clone();
+        let chinese_mode = state.chinese_mode;
+        let out = self.commit_candidate(&mut state, &text);
+        // 鼠标提交后彻底复位各输入模式，避免遗留状态
+        state.temp_pinyin_mode = false;
+        state.temp_pinyin_buffer.clear();
+        state.temp_pinyin_prefix.clear();
+        state.quick_input_mode = false;
+        state.quick_input_buffer.clear();
+        state.quick_input_prefix.clear();
+        state.temp_english_mode = false;
+        state.temp_english_buffer.clear();
+        drop(state);
+
+        self.notify_ui_hide();
+        let encoded =
+            wind_ipc::codec::encode_commit_text(&out, None, false, chinese_mode, false);
+        // 仅推给活动客户端，避免广播导致多个 TSF 端重复上屏
+        self.push_server.push_commit_to_active(&encoded);
+        debug!("mouse_select: committed '{}' (page_local={})", out, page_local);
+    }
+
+    /// 滚轮翻页：dir<0 上一页，dir>0 下一页；仅重绘候选窗，不上屏。
+    fn mouse_page(&self, dir: i32) {
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        if state.candidates.is_empty() {
+            return;
+        }
+        let changed = if dir < 0 {
+            self.page_prev(&mut state)
+        } else {
+            self.page_next(&mut state)
+        };
+        if changed {
+            self.notify_ui_update(&state);
+        }
+    }
+
+    /// 悬停高亮：设置独立的悬停项（不改键盘选中项），重绘。
+    /// page_local<0 表示离开，清除悬停。空格上屏仍以 selected_index 为准。
+    fn mouse_hover(&self, page_local: i32) {
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        if state.candidates.is_empty() {
+            return;
+        }
+        let new_hover = if page_local < 0 {
+            None
+        } else {
+            let (start, end) = self.page_range(&state);
+            let pl = page_local as usize;
+            if pl < end - start {
+                Some(pl)
+            } else {
+                None
+            }
+        };
+        if state.hover_index != new_hover {
+            state.hover_index = new_hover;
+            self.notify_ui_update(&state);
+        }
     }
 
     fn build_status(&self) -> StatusUpdateData {
@@ -1784,6 +1896,10 @@ impl MessageHandler for Coordinator {
             state.caret_y = data.y;
             state.caret_height = data.height;
         }
+        // 记录活动客户端：鼠标点击的 commit 只推给它，避免广播多发
+        if data.client_token != 0 {
+            self.push_server.set_active_token(data.client_token);
+        }
         let status = self.build_status();
         self.push_activation_status();
         Some(status)
@@ -1794,7 +1910,10 @@ impl MessageHandler for Coordinator {
         self.save_freq();
     }
 
-    fn handle_ime_activated(&self, _client_token: u64) -> Option<StatusUpdateData> {
+    fn handle_ime_activated(&self, client_token: u64) -> Option<StatusUpdateData> {
+        if client_token != 0 {
+            self.push_server.set_active_token(client_token);
+        }
         let status = self.build_status();
         self.push_activation_status();
         Some(status)

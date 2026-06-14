@@ -16,7 +16,10 @@ pub enum UiCommand {
     UpdateCandidates {
         preedit: String,
         candidates: Vec<CandidateItem>,
+        /// 键盘选中项（页内下标），空格上屏目标
         selected: usize,
+        /// 鼠标悬停项（页内下标），-1 表示无；与 selected 独立
+        hover: i32,
         /// 当前页（1 起）
         page: usize,
         /// 总页数（含动态加载估计）
@@ -36,24 +39,38 @@ pub enum UiCommand {
     Shutdown,
 }
 
+/// UI → 协调器的反向事件（鼠标交互）
+#[derive(Debug, Clone)]
+pub enum UiEvent {
+    /// 点击选中当前页内第 N 个候选（0 起）
+    CandidateSelect(usize),
+    /// 滚轮翻页：>0 下一页，<0 上一页
+    Page(i32),
+    /// 悬停到页内候选下标（-1 表示离开）
+    Hover(i32),
+}
+
 /// UI 管理器（在独立线程中运行）
 pub struct UiManager {
     cmd_tx: mpsc::Sender<UiCommand>,
+    event_rx: Option<mpsc::Receiver<UiEvent>>,
     _thread: std::thread::JoinHandle<()>,
 }
 
 impl UiManager {
     pub fn new() -> anyhow::Result<Self> {
         let (tx, rx) = mpsc::channel::<UiCommand>();
+        let (ev_tx, ev_rx) = mpsc::channel::<UiEvent>();
 
         let thread = std::thread::Builder::new()
             .name("ui-manager".into())
             .spawn(move || {
-                Self::ui_thread(rx);
+                Self::ui_thread(rx, ev_tx);
             })?;
 
         Ok(Self {
             cmd_tx: tx,
+            event_rx: Some(ev_rx),
             _thread: thread,
         })
     }
@@ -62,11 +79,16 @@ impl UiManager {
         self.cmd_tx.clone()
     }
 
+    /// 取出 UI 事件接收端（仅可取一次）；协调器据此处理鼠标交互。
+    pub fn take_event_rx(&mut self) -> Option<mpsc::Receiver<UiEvent>> {
+        self.event_rx.take()
+    }
+
     /// UI 线程主循环
-    fn ui_thread(rx: mpsc::Receiver<UiCommand>) {
+    fn ui_thread(rx: mpsc::Receiver<UiCommand>, event_tx: mpsc::Sender<UiEvent>) {
         // 创建候选窗口
         let config = CandidateWindowConfig::default();
-        let mut candidate_window = match CandidateWindow::new(config) {
+        let mut candidate_window = match CandidateWindow::new(config, event_tx) {
             Ok(w) => {
                 info!("Candidate window created");
                 w
@@ -124,21 +146,23 @@ impl UiManager {
                             preedit,
                             candidates,
                             selected,
+                            hover,
                             page,
                             total_pages,
                             caret_x,
                             caret_y,
                         } => {
                             debug!(
-                                "UI: UpdateCandidates ({} items, selected={}, page={}/{}, pos={},{})",
+                                "UI: UpdateCandidates ({} items, selected={}, hover={}, page={}/{}, pos={},{})",
                                 candidates.len(),
                                 selected,
+                                hover,
                                 page,
                                 total_pages,
                                 caret_x,
                                 caret_y
                             );
-                            candidate_window.update(&preedit, candidates, selected, page, total_pages);
+                            candidate_window.update(&preedit, candidates, selected, hover, page, total_pages);
                             candidate_window.set_position(caret_x, caret_y);
                             candidate_window.show();
                         }

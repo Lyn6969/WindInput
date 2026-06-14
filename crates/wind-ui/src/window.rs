@@ -2,11 +2,27 @@
 //!
 //! 用于候选窗口、工具栏等浮层。使用 UpdateLayeredWindow 实现透明渲染。
 
+use std::cell::RefCell;
+use std::collections::HashMap;
+use std::rc::Rc;
 use windows::Win32::Foundation::*;
 use windows::Win32::Graphics::Gdi::*;
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::WindowsAndMessaging::*;
 use tracing::{debug, error, info};
+
+/// 浮层窗口鼠标消息处理器（由具体窗口实现，如候选窗）。
+/// 返回 `Some(lresult)` 表示已处理；`None` 交回默认处理。
+pub trait WindowMouse {
+    fn on_message(&mut self, hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
+        -> Option<LRESULT>;
+}
+
+thread_local! {
+    /// hwnd → 鼠标处理器（仅 UI 线程访问，wnd_proc 与窗口同线程）
+    static MOUSE_HANDLERS: RefCell<HashMap<isize, Rc<RefCell<dyn WindowMouse>>>> =
+        RefCell::new(HashMap::new());
+}
 
 /// Layered Window 封装
 pub struct LayeredWindow {
@@ -81,6 +97,14 @@ impl LayeredWindow {
 
     pub fn hwnd(&self) -> HWND {
         self.hwnd
+    }
+
+    /// 注册鼠标处理器（绑定到本窗口 hwnd）
+    pub fn register_mouse(&self, handler: Rc<RefCell<dyn WindowMouse>>) {
+        let key = self.hwnd.0 as isize;
+        MOUSE_HANDLERS.with(|m| {
+            m.borrow_mut().insert(key, handler);
+        });
     }
 
     pub fn buffer(&self) -> &[u8] {
@@ -210,12 +234,37 @@ impl LayeredWindow {
         wparam: WPARAM,
         lparam: LPARAM,
     ) -> LRESULT {
+        // 不抢焦点：点击浮层不激活窗口，目标应用保持前台
+        if msg == WM_MOUSEACTIVATE {
+            return LRESULT(MA_NOACTIVATE as isize);
+        }
+        // 命中测试：返回 HTCLIENT 才能收到鼠标消息
+        if msg == WM_NCHITTEST {
+            return LRESULT(HTCLIENT as isize);
+        }
+        // 鼠标相关消息派发给已注册处理器（先取出 Rc 释放注册表借用，避免重入冲突）
+        if matches!(
+            msg,
+            WM_LBUTTONDOWN | WM_LBUTTONUP | WM_MOUSEMOVE | WM_MOUSEWHEEL | WM_SETCURSOR
+        ) {
+            let key = hwnd.0 as isize;
+            let handler = MOUSE_HANDLERS.with(|m| m.borrow().get(&key).cloned());
+            if let Some(h) = handler {
+                if let Some(lr) = h.borrow_mut().on_message(hwnd, msg, wparam, lparam) {
+                    return lr;
+                }
+            }
+        }
         DefWindowProcW(hwnd, msg, wparam, lparam)
     }
 }
 
 impl Drop for LayeredWindow {
     fn drop(&mut self) {
+        let key = self.hwnd.0 as isize;
+        MOUSE_HANDLERS.with(|m| {
+            m.borrow_mut().remove(&key);
+        });
         unsafe {
             let _ = DestroyWindow(self.hwnd);
         }

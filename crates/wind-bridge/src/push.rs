@@ -3,6 +3,7 @@
 //! 与 Go 版本 `wind_input/internal/bridge/server_push.go` 对齐。
 //! 服务端主动推送状态更新、配置同步等消息给 TSF DLL。
 
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use tracing::{debug, error, info, warn};
 use wind_ipc::protocol::*;
@@ -37,6 +38,8 @@ struct PushClient {
 pub struct PushServer {
     config: PushConfig,
     clients: Arc<Mutex<Vec<PushClient>>>,
+    /// 当前活动（有焦点）客户端 token；commit 仅投递给它，避免广播多发
+    active_token: Arc<AtomicU64>,
 }
 
 impl PushServer {
@@ -44,7 +47,13 @@ impl PushServer {
         Self {
             config,
             clients: Arc::new(Mutex::new(Vec::new())),
+            active_token: Arc::new(AtomicU64::new(0)),
         }
+    }
+
+    /// 记录活动客户端 token（焦点获取 / IME 激活时调用）
+    pub fn set_active_token(&self, token: u64) {
+        self.active_token.store(token, Ordering::Relaxed);
     }
 
     /// 获取推送管道名称
@@ -81,11 +90,36 @@ impl PushServer {
         Ok(())
     }
 
-    /// 向活跃客户端推送消息
+    /// 向所有连接客户端广播消息（用于状态/激活同步，幂等无副作用）
     pub fn push_to_active(&self, data: &[u8]) {
         let clients = self.clients.lock().unwrap();
         for client in clients.iter() {
             let _ = client.tx.send(data.to_vec());
+        }
+    }
+
+    /// 仅向活动客户端投递（用于 commit 等带副作用的消息，避免广播导致多次上屏）。
+    /// 优先按活动 token 匹配；无匹配且仅一个客户端时兜底发它；否则跳过。
+    pub fn push_commit_to_active(&self, data: &[u8]) {
+        let active = self.active_token.load(Ordering::Relaxed);
+        let clients = self.clients.lock().unwrap();
+        if clients.is_empty() {
+            return;
+        }
+        if active != 0 {
+            if let Some(c) = clients.iter().find(|c| c.token == active) {
+                let _ = c.tx.send(data.to_vec());
+                return;
+            }
+        }
+        if clients.len() == 1 {
+            let _ = clients[0].tx.send(data.to_vec());
+        } else {
+            warn!(
+                "push_commit: 无匹配活动客户端 (active=0x{:016X}, clients={})，跳过以防多发",
+                active,
+                clients.len()
+            );
         }
     }
 
