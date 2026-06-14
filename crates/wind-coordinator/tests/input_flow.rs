@@ -225,6 +225,103 @@ fn test_punct_commits_candidate_first() {
 }
 
 #[test]
+fn test_arrow_down_then_space_selects_highlighted() {
+    if !has_schemas() {
+        return;
+    }
+    let coord = Coordinator::new_headless(config_with("wubi86"), Some(&data_dir()));
+    // "a" 在五笔下有多个候选
+    press_letter(&coord, 'a');
+    let texts = coord.debug_page_texts();
+    if texts.len() < 2 {
+        eprintln!("跳过：当前页候选不足 2 个");
+        return;
+    }
+    let second = texts[1].clone();
+
+    // 初始高亮在第 0 项
+    let (_, sel0, _) = coord.debug_page_info();
+    assert_eq!(sel0, 0, "初始高亮应为第 0 项");
+
+    // 下方向键 → 高亮移到第 1 项
+    coord.handle_key_event(&key_event(0x28, EVENT_KEY_DOWN));
+    let (_, sel1, _) = coord.debug_page_info();
+    assert_eq!(sel1, 1, "下方向键后高亮应为第 1 项");
+
+    // 空格上屏高亮项（第 2 个候选）
+    match coord.handle_key_event(&key_event(0x20, EVENT_KEY_DOWN)) {
+        KeyAction::InsertText { text, .. } => {
+            assert_eq!(text, second, "空格应上屏高亮的第 2 个候选");
+        }
+        other => panic!("空格应上屏高亮候选，实际: {:?}", other),
+    }
+}
+
+#[test]
+fn test_page_down_changes_page_and_renumbers() {
+    if !has_schemas() {
+        return;
+    }
+    let coord = Coordinator::new_headless(config_with("wubi86"), Some(&data_dir()));
+    press_letter(&coord, 'a');
+    let (_, _, total_pages) = coord.debug_page_info();
+    if total_pages < 2 {
+        eprintln!("跳过：候选不足两页");
+        return;
+    }
+    let page1_first = coord.debug_page_texts()[0].clone();
+
+    // PageDown(0x22) → 翻到第 2 页
+    coord.handle_key_event(&key_event(0x22, EVENT_KEY_DOWN));
+    let (page, sel, _) = coord.debug_page_info();
+    assert_eq!(page, 1, "PageDown 后应在第 2 页（0-based=1）");
+    assert_eq!(sel, 0, "翻页后高亮应归零");
+
+    let page2_first = coord.debug_page_texts()[0].clone();
+    assert_ne!(page1_first, page2_first, "第 2 页首项应不同于第 1 页首项");
+
+    // 第 2 页按数字键 '1' → 上屏第 2 页的首项（编号重置）
+    match coord.handle_key_event(&key_event(0x31, EVENT_KEY_DOWN)) {
+        KeyAction::InsertText { text, .. } => {
+            assert_eq!(text, page2_first, "第 2 页数字键 1 应上屏第 2 页首项");
+        }
+        other => panic!("数字键应上屏，实际: {:?}", other),
+    }
+}
+
+#[test]
+fn test_page_up_wraps_at_first_page() {
+    if !has_schemas() {
+        return;
+    }
+    let coord = Coordinator::new_headless(config_with("wubi86"), Some(&data_dir()));
+    press_letter(&coord, 'a');
+    // 第 1 页按 PageUp 应保持在第 1 页（不越界）
+    coord.handle_key_event(&key_event(0x21, EVENT_KEY_DOWN));
+    let (page, _, _) = coord.debug_page_info();
+    assert_eq!(page, 0, "首页 PageUp 应仍在首页");
+}
+
+#[test]
+fn test_minus_equal_paging_when_candidates() {
+    if !has_schemas() {
+        return;
+    }
+    let coord = Coordinator::new_headless(config_with("wubi86"), Some(&data_dir()));
+    press_letter(&coord, 'a');
+    let (_, _, total_pages) = coord.debug_page_info();
+    if total_pages < 2 {
+        return;
+    }
+    // '=' (0xBB) 下一页
+    coord.handle_key_event(&key_event(0xBB, EVENT_KEY_DOWN));
+    assert_eq!(coord.debug_page_info().0, 1, "'=' 应翻到下一页");
+    // '-' (0xBD) 上一页
+    coord.handle_key_event(&key_event(0xBD, EVENT_KEY_DOWN));
+    assert_eq!(coord.debug_page_info().0, 0, "'-' 应翻回上一页");
+}
+
+#[test]
 fn test_mode_toggle_via_shift() {
     if !has_schemas() {
         return;

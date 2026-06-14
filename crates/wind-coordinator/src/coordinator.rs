@@ -59,8 +59,6 @@ fn punct_char(key_code: u32, shift: bool) -> Option<char> {
 
 /// 引擎一次转换请求的候选上限（boost 重排后截断到 9）
 const ENGINE_MAX_CANDIDATES: usize = 50;
-/// 最终展示候选数
-const DISPLAY_CANDIDATES: usize = 9;
 
 /// 协调器输入状态
 struct State {
@@ -74,6 +72,10 @@ struct State {
     /// 仅显示输入码/拼音，绝不包含候选列表。
     preedit: String,
     candidates: Vec<Candidate>,
+    /// 当前页内高亮候选下标（0-based，相对当前页）
+    selected_index: usize,
+    /// 当前页码（0-based）
+    current_page: usize,
     caret_x: i32,
     caret_y: i32,
     caret_height: i32,
@@ -169,6 +171,8 @@ impl Coordinator {
                 input_buffer: String::new(),
                 preedit: String::new(),
                 candidates: Vec::new(),
+                selected_index: 0,
+                current_page: 0,
                 caret_x: 0,
                 caret_y: 0,
                 caret_height: 0,
@@ -222,6 +226,24 @@ impl Coordinator {
         self.state.lock().unwrap_or_else(|e| e.into_inner()).chinese_mode
     }
 
+    /// 候选总数（测试/诊断用）
+    pub fn debug_candidate_count(&self) -> usize {
+        self.state.lock().unwrap_or_else(|e| e.into_inner()).candidates.len()
+    }
+
+    /// 分页信息 (当前页0-based, 页内高亮0-based, 总页数)（测试/诊断用）
+    pub fn debug_page_info(&self) -> (usize, usize, usize) {
+        let s = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        (s.current_page, s.selected_index, self.total_pages(&s))
+    }
+
+    /// 当前页候选文本列表（测试/诊断用）
+    pub fn debug_page_texts(&self) -> Vec<String> {
+        let s = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        let (start, end) = self.page_range(&s);
+        s.candidates[start..end].iter().map(|c| c.text.clone()).collect()
+    }
+
     /// 根据输入缓冲更新候选（委托引擎 + 应用词频 boost）
     fn update_candidates(&self, state: &mut State) {
         state.candidates.clear();
@@ -248,8 +270,94 @@ impl Coordinator {
                 .cmp(&a.weight)
                 .then(a.natural_order.cmp(&b.natural_order))
         });
-        candidates.truncate(DISPLAY_CANDIDATES);
+        // 保留多页候选用于翻页（不再截断到单页）
+        candidates.truncate(ENGINE_MAX_CANDIDATES);
         state.candidates = candidates;
+        // 候选变化：复位翻页与高亮
+        state.current_page = 0;
+        state.selected_index = 0;
+    }
+
+    /// 每页候选数（来自配置，至少 1）
+    fn per_page(&self) -> usize {
+        self.config.ui.per_page.max(1)
+    }
+
+    /// 总页数（至少 1）
+    fn total_pages(&self, state: &State) -> usize {
+        let pp = self.per_page();
+        state.candidates.len().div_ceil(pp).max(1)
+    }
+
+    /// 当前页候选切片的 [start, end) 区间
+    fn page_range(&self, state: &State) -> (usize, usize) {
+        let pp = self.per_page();
+        let start = state.current_page * pp;
+        let end = (start + pp).min(state.candidates.len());
+        (start, end)
+    }
+
+    /// 当前高亮候选的全局下标（页起点 + 页内高亮）
+    fn highlighted_global_index(&self, state: &State) -> usize {
+        let (start, _) = self.page_range(state);
+        start + state.selected_index
+    }
+
+    /// 上移高亮（页首回卷到上一页末项）；返回是否变化
+    fn move_up(&self, state: &mut State) -> bool {
+        if state.candidates.is_empty() {
+            return false;
+        }
+        if state.selected_index > 0 {
+            state.selected_index -= 1;
+        } else if state.current_page > 0 {
+            state.current_page -= 1;
+            let (s, e) = self.page_range(state);
+            state.selected_index = e - s - 1;
+        } else {
+            return false;
+        }
+        true
+    }
+
+    /// 下移高亮（页尾回卷到下一页首项）；返回是否变化
+    fn move_down(&self, state: &mut State) -> bool {
+        if state.candidates.is_empty() {
+            return false;
+        }
+        let (s, e) = self.page_range(state);
+        let page_count = e - s;
+        if state.selected_index + 1 < page_count {
+            state.selected_index += 1;
+        } else if state.current_page + 1 < self.total_pages(state) {
+            state.current_page += 1;
+            state.selected_index = 0;
+        } else {
+            return false;
+        }
+        true
+    }
+
+    /// 上一页（高亮归零）；返回是否变化
+    fn page_prev(&self, state: &mut State) -> bool {
+        if state.current_page > 0 {
+            state.current_page -= 1;
+            state.selected_index = 0;
+            true
+        } else {
+            false
+        }
+    }
+
+    /// 下一页（高亮归零）；返回是否变化
+    fn page_next(&self, state: &mut State) -> bool {
+        if state.current_page + 1 < self.total_pages(state) {
+            state.current_page += 1;
+            state.selected_index = 0;
+            true
+        } else {
+            false
+        }
     }
 
     /// 提交某个候选（记录词频后清空状态）
@@ -258,6 +366,8 @@ impl Coordinator {
         state.input_buffer.clear();
         state.preedit.clear();
         state.candidates.clear();
+        state.current_page = 0;
+        state.selected_index = 0;
     }
 
     fn notify_ui_update(&self, state: &State) {
@@ -265,18 +375,27 @@ impl Coordinator {
             let _ = self.ui_tx.send(UiCommand::HideCandidates);
             return;
         }
-        let items: Vec<CandidateItem> = state
-            .candidates
+        // 仅推送当前页候选（窗口按 1..N 编号，翻页后重新编号）
+        let (start, end) = self.page_range(state);
+        let items: Vec<CandidateItem> = state.candidates[start..end]
             .iter()
             .map(|c| CandidateItem {
                 text: c.text.clone(),
                 code: c.code.clone(),
             })
             .collect();
+        // 多页时在组合区追加页码指示（如 "ni hao (1/3)"）
+        let total_pages = self.total_pages(state);
+        let preedit = if total_pages > 1 {
+            format!("{} ({}/{})", state.preedit, state.current_page + 1, total_pages)
+        } else {
+            state.preedit.clone()
+        };
+        let selected = state.selected_index.min(items.len().saturating_sub(1));
         let _ = self.ui_tx.send(UiCommand::UpdateCandidates {
-            preedit: state.preedit.clone(),
+            preedit,
             candidates: items,
-            selected: 0,
+            selected,
             caret_x: state.caret_x,
             caret_y: state.caret_y,
         });
@@ -537,9 +656,10 @@ impl MessageHandler for Coordinator {
                 }
             }
             0x20 => {
-                // Space：选首选 / 上屏编码
+                // Space：选当前高亮候选 / 上屏编码
                 if !state.candidates.is_empty() {
-                    let text = state.candidates[0].text.clone();
+                    let idx = self.highlighted_global_index(&state).min(state.candidates.len() - 1);
+                    let text = state.candidates[idx].text.clone();
                     self.commit_candidate(&mut state, &text);
                     self.notify_ui_hide();
                     Self::commit_action(text, true)
@@ -566,9 +686,11 @@ impl MessageHandler for Coordinator {
                 }
             }
             0x31..=0x39 if data.modifiers & MOD_SHIFT == 0 => {
-                // 数字键 1-9 选词（Shift+数字走标点分支）
-                let idx = (data.key_code - 0x31) as usize;
-                if idx < state.candidates.len() {
+                // 数字键 1-9 选当前页第 N 个候选（Shift+数字走标点分支）
+                let (start, end) = self.page_range(&state);
+                let in_page = (data.key_code - 0x31) as usize;
+                let idx = start + in_page;
+                if idx < end {
                     let text = state.candidates[idx].text.clone();
                     self.commit_candidate(&mut state, &text);
                     self.notify_ui_hide();
@@ -597,13 +719,66 @@ impl MessageHandler for Coordinator {
                     caret_pos: state.input_buffer.len() as u32,
                 }
             }
+            0x26 | 0x28 => {
+                // 上/下方向键：移动高亮（跨页回卷）
+                if state.candidates.is_empty() {
+                    return if state.input_buffer.is_empty() {
+                        KeyAction::PassThrough
+                    } else {
+                        KeyAction::Consumed
+                    };
+                }
+                let changed = if data.key_code == 0x26 {
+                    self.move_up(&mut state)
+                } else {
+                    self.move_down(&mut state)
+                };
+                if changed {
+                    self.notify_ui_update(&state);
+                }
+                KeyAction::Consumed
+            }
+            0x21 | 0x22 => {
+                // PageUp / PageDown：翻页
+                if state.candidates.is_empty() {
+                    return if state.input_buffer.is_empty() {
+                        KeyAction::PassThrough
+                    } else {
+                        KeyAction::Consumed
+                    };
+                }
+                let changed = if data.key_code == 0x21 {
+                    self.page_prev(&mut state)
+                } else {
+                    self.page_next(&mut state)
+                };
+                if changed {
+                    self.notify_ui_update(&state);
+                }
+                KeyAction::Consumed
+            }
+            0xBD | 0xBB
+                if !state.candidates.is_empty() && data.modifiers & MOD_SHIFT == 0 =>
+            {
+                // '-' / '=' 翻页（仅有候选且无 Shift 时；否则落入标点分支）
+                let changed = if data.key_code == 0xBD {
+                    self.page_prev(&mut state)
+                } else {
+                    self.page_next(&mut state)
+                };
+                if changed {
+                    self.notify_ui_update(&state);
+                }
+                KeyAction::Consumed
+            }
             _ => {
                 let shift = data.modifiers & MOD_SHIFT != 0;
                 if let Some(ch) = punct_char(data.key_code, shift) {
                     // 标点/符号键：先上屏首选候选（若有输入），再追加（转换后的）标点
                     let mut out = String::new();
                     if !state.candidates.is_empty() {
-                        let t = state.candidates[0].text.clone();
+                        let idx = self.highlighted_global_index(&state).min(state.candidates.len() - 1);
+                        let t = state.candidates[idx].text.clone();
                         self.record_selection(&t);
                         out.push_str(&t);
                     } else if !state.input_buffer.is_empty() {
