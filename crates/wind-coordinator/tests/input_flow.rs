@@ -754,6 +754,37 @@ fn test_smart_punct_after_digit() {
 }
 
 #[test]
+fn test_dynamic_paging_expands_candidates() {
+    if !has_schemas() {
+        return;
+    }
+    // 单字母前缀通常有大量候选：旧实现固定封顶 50，新实现按前缀加载全部（≥初始上限再分级扩展）
+    let coord = Coordinator::new_headless(config_with("wubi86"), Some(&data_dir()));
+    press_letter(&coord, 'a');
+    let initial = coord.debug_candidate_count();
+    // 核心修复：不再固定截断到 50（'a' 前缀候选应远超旧上限）
+    assert!(
+        initial > 50,
+        "应加载超过旧固定上限(50)的全部前缀候选，实际: {}",
+        initial
+    );
+
+    // 若仍达到初始分级上限，翻页到边界应动态扩展加载更多
+    if coord.debug_has_more() {
+        for _ in 0..15 {
+            coord.handle_key_event(&key_event(0x22, EVENT_KEY_DOWN)); // PageDown
+        }
+        let expanded = coord.debug_candidate_count();
+        assert!(
+            expanded > initial,
+            "翻页到边界应动态加载更多候选: {} -> {}",
+            initial,
+            expanded
+        );
+    }
+}
+
+#[test]
 fn test_mode_toggle_via_shift() {
     if !has_schemas() {
         return;

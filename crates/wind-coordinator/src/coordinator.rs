@@ -99,6 +99,12 @@ struct State {
     selected_index: usize,
     /// 当前页码（0-based）
     current_page: usize,
+    /// 动态分级加载：当前候选对应的输入码
+    candidate_input: String,
+    /// 动态分级加载：当前加载上限
+    candidate_limit: usize,
+    /// 动态分级加载：是否可能还有更多前缀候选未加载
+    has_more: bool,
     /// 临时拼音模式（码表方案下经触发键临时切到拼音反查）
     temp_pinyin_mode: bool,
     /// 临时拼音输入缓冲（拼音串）
@@ -245,6 +251,9 @@ impl Coordinator {
                 candidates: Vec::new(),
                 selected_index: 0,
                 current_page: 0,
+                candidate_input: String::new(),
+                candidate_limit: 0,
+                has_more: false,
                 temp_pinyin_mode: false,
                 temp_pinyin_buffer: String::new(),
                 temp_pinyin_schema: String::new(),
@@ -321,6 +330,11 @@ impl Coordinator {
         self.state.lock().unwrap_or_else(|e| e.into_inner()).candidates.len()
     }
 
+    /// 是否还有更多候选未加载（测试/诊断用）
+    pub fn debug_has_more(&self) -> bool {
+        self.state.lock().unwrap_or_else(|e| e.into_inner()).has_more
+    }
+
     /// 分页信息 (当前页0-based, 页内高亮0-based, 总页数)（测试/诊断用）
     pub fn debug_page_info(&self) -> (usize, usize, usize) {
         let s = self.state.lock().unwrap_or_else(|e| e.into_inner());
@@ -344,28 +358,36 @@ impl Coordinator {
             .collect()
     }
 
-    /// 根据输入缓冲更新候选（委托引擎 + 应用词频 boost）
-    fn update_candidates(&self, state: &mut State) {
-        state.candidates.clear();
-        state.preedit = state.input_buffer.clone();
-        if state.input_buffer.is_empty() {
-            return;
+    /// 首次加载候选上限（对齐 Go：短前缀小批量分级加载，长前缀近全量）。
+    fn initial_candidate_limit(&self, input: &str) -> usize {
+        let len = input.chars().count();
+        match self.engine_mgr.current_engine_type() {
+            Some(wind_engine::engine::EngineType::CodeTable) => match len {
+                0 | 1 => 100,
+                2 => 300,
+                _ => 1000,
+            },
+            // 拼音 / 混输
+            _ => 300,
         }
-        let result = self
-            .engine_mgr
-            .convert(&state.input_buffer, ENGINE_MAX_CANDIDATES);
+    }
 
-        // 组合区只显示输入码/拼音（拼音含音节分隔 "ni hao"），绝不含候选列表
-        if !result.preedit_display.is_empty() {
-            state.preedit = result.preedit_display;
-        }
+    /// 用给定上限转换并构建候选（引擎 + 词频 boost + 短语 + 排序去重）。
+    /// 返回引擎候选数（不含短语），供判断 has_more。不复位翻页/高亮。
+    fn build_candidates(&self, state: &mut State, limit: usize) -> usize {
+        let result = self.engine_mgr.convert(&state.input_buffer, limit);
+        // 组合区只显示输入码/拼音
+        state.preedit = if result.preedit_display.is_empty() {
+            state.input_buffer.clone()
+        } else {
+            result.preedit_display
+        };
+        let engine_count = result.candidates.len();
 
         let mut candidates = result.candidates;
-        // 运行时词频 boost
         for c in &mut candidates {
             c.weight += self.freq_tracker.get_boost(&c.text) as i32;
         }
-        // 短语层：输入码命中短语 code → 展开模板候选（高权重，排前列）
         if !self.phrases.is_empty() {
             for (text, w) in self.phrases.lookup(&state.input_buffer) {
                 candidates.push(Candidate {
@@ -381,15 +403,52 @@ impl Coordinator {
                 .cmp(&a.weight)
                 .then(a.natural_order.cmp(&b.natural_order))
         });
-        // 按文本去重（保留排序后首现 = 最高权重），避免短语与引擎候选重复
         let mut seen = std::collections::HashSet::new();
         candidates.retain(|c| seen.insert(c.text.clone()));
-        // 保留多页候选用于翻页（不再截断到单页）
-        candidates.truncate(ENGINE_MAX_CANDIDATES);
         state.candidates = candidates;
+        engine_count
+    }
+
+    /// 根据输入缓冲更新候选（动态分级加载：首次小批量，翻页到边界再扩展）。
+    fn update_candidates(&self, state: &mut State) {
+        state.candidates.clear();
+        state.preedit = state.input_buffer.clone();
+        if state.input_buffer.is_empty() {
+            state.has_more = false;
+            state.candidate_input.clear();
+            return;
+        }
+        let limit = self.initial_candidate_limit(&state.input_buffer);
+        let engine_count = self.build_candidates(state, limit);
+        state.candidate_input = state.input_buffer.clone();
+        state.candidate_limit = limit;
+        // 引擎返回数达到上限 → 可能还有更多未加载
+        state.has_more = engine_count >= limit;
         // 候选变化：复位翻页与高亮
         state.current_page = 0;
         state.selected_index = 0;
+    }
+
+    /// 扩展候选（翻页/下移到边界时调用）：上限翻倍（≤5000）重新加载，保持当前页/高亮。
+    fn expand_candidates(&self, state: &mut State) {
+        if !state.has_more || state.candidate_input != state.input_buffer {
+            return;
+        }
+        let new_limit = (state.candidate_limit.saturating_mul(2)).min(5000);
+        if new_limit <= state.candidate_limit {
+            state.has_more = false;
+            return;
+        }
+        let prev_len = state.candidates.len();
+        let engine_count = self.build_candidates(state, new_limit);
+        if state.candidates.len() <= prev_len {
+            // 没有新增 → 已到底
+            state.has_more = false;
+            return;
+        }
+        state.candidate_limit = new_limit;
+        state.has_more = engine_count >= new_limit;
+        // 保持当前页/高亮不变（build_candidates 未改动它们）
     }
 
     /// 每页候选数（来自配置，至少 1）
@@ -450,6 +509,10 @@ impl Coordinator {
         if state.candidates.is_empty() {
             return false;
         }
+        // 接近末页且有更多 → 先动态扩展加载
+        if state.has_more && state.current_page + 2 >= self.total_pages(state) {
+            self.expand_candidates(state);
+        }
         let (s, e) = self.page_range(state);
         let page_count = e - s;
         if state.selected_index + 1 < page_count {
@@ -476,6 +539,10 @@ impl Coordinator {
 
     /// 下一页（高亮归零）；返回是否变化
     fn page_next(&self, state: &mut State) -> bool {
+        // 接近末页且有更多 → 先动态扩展加载，使新页可达
+        if state.has_more && state.current_page + 2 >= self.total_pages(state) {
+            self.expand_candidates(state);
+        }
         if state.current_page + 1 < self.total_pages(state) {
             state.current_page += 1;
             state.selected_index = 0;
