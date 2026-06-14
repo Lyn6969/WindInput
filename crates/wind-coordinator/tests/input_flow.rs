@@ -414,6 +414,43 @@ fn test_temp_pinyin_backtick_trigger_and_commit() {
 }
 
 #[test]
+fn test_temp_pinyin_commit_and_enter_with_candidates() {
+    if !has_schemas() {
+        return;
+    }
+    // 五笔下已有候选时按反引号 → 顶屏高亮候选 + 进入临时拼音
+    let coord = Coordinator::new_headless(config_with("wubi86"), Some(&data_dir()));
+    press_letter(&coord, 'a');
+    let first = coord.debug_page_texts()[0].clone();
+
+    // 反引号：应上屏当前高亮候选并原子开启临时拼音组合
+    match coord.handle_key_event(&key_event(0xC0, EVENT_KEY_DOWN)) {
+        KeyAction::InsertText {
+            text,
+            new_composition,
+            has_new_composition,
+            ..
+        } => {
+            assert_eq!(text, first, "应顶屏当前高亮候选");
+            assert!(has_new_composition, "应原子开启新组合");
+            assert_eq!(new_composition.as_deref(), Some("`"), "新组合应为临时拼音前缀");
+        }
+        other => panic!("有候选按反引号应顶屏+进临时拼音，实际: {:?}", other),
+    }
+
+    // 现已在临时拼音模式：输入拼音 nihao 应得拼音候选
+    let mut last = KeyAction::PassThrough;
+    for c in "nihao".chars() {
+        last = press_letter(&coord, c);
+    }
+    assert_eq!(action_text(&last).unwrap(), "`ni hao", "应处于临时拼音模式");
+    match coord.handle_key_event(&key_event(0x20, EVENT_KEY_DOWN)) {
+        KeyAction::InsertText { text, .. } => assert!(text.contains("你好")),
+        other => panic!("空格应上屏拼音候选，实际: {:?}", other),
+    }
+}
+
+#[test]
 fn test_temp_pinyin_esc_exits() {
     if !has_schemas() {
         return;
@@ -521,10 +558,10 @@ fn test_quick_input_double_semicolon_outputs_literal() {
     }
     let coord = Coordinator::new_headless(config_with("wubi86"), Some(&data_dir()));
     coord.handle_key_event(&key_event(0xBA, EVENT_KEY_DOWN)); // ; 进入
-    // 再按 ; → 上屏字面 ";" 并退出
+    // 再按 ; → 按标点配置上屏（默认中文标点 → ；）并退出
     match coord.handle_key_event(&key_event(0xBA, EVENT_KEY_DOWN)) {
-        KeyAction::InsertText { text, .. } => assert_eq!(text, ";"),
-        other => panic!("双分号应上屏字面分号，实际: {:?}", other),
+        KeyAction::InsertText { text, .. } => assert_eq!(text, "；", "双分号应按中文标点上屏 ；"),
+        other => panic!("双分号应上屏标点，实际: {:?}", other),
     }
     // 退出后五笔正常
     let act = press_letter(&coord, 'a');

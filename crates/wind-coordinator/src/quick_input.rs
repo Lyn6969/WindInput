@@ -9,7 +9,7 @@
 
 use chrono::Datelike;
 
-/// 合并各提供器候选并去重（保留首现顺序：日期 → 计算器）。
+/// 合并各提供器候选并去重（保留首现顺序：日期 → 年月 → 计算器 → 数字/金额）。
 pub fn generate_quick_input_candidates(buffer: &str, decimal_places: i32) -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
     let mut push_unique = |s: String, out: &mut Vec<String>| {
@@ -24,6 +24,9 @@ pub fn generate_quick_input_candidates(buffer: &str, decimal_places: i32) -> Vec
         push_unique(c, &mut out);
     }
     for c in generate_calc_candidates(buffer, decimal_places) {
+        push_unique(c, &mut out);
+    }
+    for c in generate_number_candidates(buffer) {
         push_unique(c, &mut out);
     }
     out
@@ -243,6 +246,257 @@ pub fn format_calc_result_prec(val: f64, decimal_places: i32) -> String {
     s
 }
 
+// ───────────────────────── 数字 / 金额 / 中文数字 ─────────────────────────
+
+const LOWER_DIGITS: [&str; 10] = ["零", "一", "二", "三", "四", "五", "六", "七", "八", "九"];
+const UPPER_DIGITS: [&str; 10] = ["零", "壹", "贰", "叁", "肆", "伍", "陆", "柒", "捌", "玖"];
+const LOWER_UNITS: [&str; 4] = ["", "十", "百", "千"];
+const UPPER_UNITS: [&str; 4] = ["", "拾", "佰", "仟"];
+const GROUP_UNITS: [&str; 4] = ["", "万", "亿", "万亿"];
+
+/// 是否为纯数字（整数或小数，允许尾部点号，不允许多点/点开头）。
+fn is_decimal_number(s: &str) -> bool {
+    if s.is_empty() || !s.as_bytes()[0].is_ascii_digit() {
+        return false;
+    }
+    let mut dots = 0;
+    for ch in s.bytes() {
+        if ch == b'.' {
+            dots += 1;
+            if dots > 1 {
+                return false;
+            }
+        } else if !ch.is_ascii_digit() {
+            return false;
+        }
+    }
+    true
+}
+
+/// "123.45" → ("123","45")，"123" → ("123","")
+fn split_decimal(s: &str) -> (&str, &str) {
+    match s.find('.') {
+        Some(i) => (&s[..i], &s[i + 1..]),
+        None => (s, ""),
+    }
+}
+
+fn needs_leading_zero(group: &str) -> bool {
+    group.len() < 4 || group.as_bytes()[0] == b'0'
+}
+
+fn group_to_chinese(group: &str, digits: &[&str; 10], units: &[&str; 4]) -> String {
+    let mut result = String::new();
+    let mut all_zero = true;
+    let mut prev_zero = false;
+    let length = group.len();
+    for (i, b) in group.bytes().enumerate() {
+        let d = (b - b'0') as usize;
+        let unit_idx = length - 1 - i;
+        if d == 0 {
+            prev_zero = true;
+            continue;
+        }
+        all_zero = false;
+        if prev_zero && !result.is_empty() {
+            result.push_str(digits[0]);
+        }
+        prev_zero = false;
+        result.push_str(digits[d]);
+        if unit_idx < units.len() {
+            result.push_str(units[unit_idx]);
+        }
+    }
+    if all_zero {
+        String::new()
+    } else {
+        result
+    }
+}
+
+/// 数字串 → 中文（按每 4 位一组：个/万/亿/万亿）
+fn number_to_chinese(num: &str, digits: &[&str; 10], units: &[&str; 4]) -> String {
+    let num = num.trim_start_matches('0');
+    if num.is_empty() {
+        return digits[0].to_string();
+    }
+    // 从右往左切 4 位一组
+    let mut groups: Vec<&str> = Vec::new();
+    let mut end = num.len();
+    while end > 0 {
+        let start = end.saturating_sub(4);
+        groups.push(&num[start..end]);
+        end = start;
+    }
+    let mut result = String::new();
+    for i in (0..groups.len()).rev() {
+        let group_str = groups[i];
+        let group_text = group_to_chinese(group_str, digits, units);
+        if group_text.is_empty() {
+            continue;
+        }
+        if !result.is_empty() && needs_leading_zero(group_str) {
+            result.push_str(digits[0]);
+        }
+        result.push_str(&group_text);
+        if i < GROUP_UNITS.len() {
+            result.push_str(GROUP_UNITS[i]);
+        }
+    }
+    if result.is_empty() {
+        digits[0].to_string()
+    } else {
+        result
+    }
+}
+
+fn number_to_amount(num: &str, upper: bool) -> String {
+    let text = if upper {
+        number_to_chinese(num, &UPPER_DIGITS, &UPPER_UNITS)
+    } else {
+        number_to_chinese(num, &LOWER_DIGITS, &LOWER_UNITS)
+    };
+    format!("{}元整", text)
+}
+
+/// 带角分金额转换（≤2 位小数）；超 2 位返回空串。
+fn decimal_to_amount(int_part: &str, dec_part: &str, upper: bool) -> String {
+    let int_text = if upper {
+        number_to_chinese(int_part, &UPPER_DIGITS, &UPPER_UNITS)
+    } else {
+        number_to_chinese(int_part, &LOWER_DIGITS, &LOWER_UNITS)
+    };
+    let digits = if upper { &UPPER_DIGITS } else { &LOWER_DIGITS };
+    if dec_part.is_empty() {
+        return format!("{}元整", int_text);
+    }
+    if dec_part.len() > 2 {
+        return String::new();
+    }
+    let jiao = (dec_part.as_bytes()[0] - b'0') as usize;
+    let fen = if dec_part.len() == 2 {
+        (dec_part.as_bytes()[1] - b'0') as usize
+    } else {
+        0
+    };
+    if jiao == 0 && fen == 0 {
+        return format!("{}元整", int_text);
+    }
+    let mut b = format!("{}元", int_text);
+    if jiao == 0 {
+        b.push_str("零");
+        b.push_str(digits[fen]);
+        b.push_str("分");
+    } else if fen == 0 {
+        b.push_str(digits[jiao]);
+        b.push_str("角整");
+    } else {
+        b.push_str(digits[jiao]);
+        b.push_str("角");
+        b.push_str(digits[fen]);
+        b.push_str("分");
+    }
+    b
+}
+
+/// 中文小数读法："123","456" → "一百二十三点四五六"
+fn decimal_to_chinese_text(int_part: &str, dec_part: &str, upper: bool) -> String {
+    let int_text = if upper {
+        number_to_chinese(int_part, &UPPER_DIGITS, &UPPER_UNITS)
+    } else {
+        number_to_chinese(int_part, &LOWER_DIGITS, &LOWER_UNITS)
+    };
+    if dec_part.is_empty() {
+        return int_text;
+    }
+    let digits = if upper { &UPPER_DIGITS } else { &LOWER_DIGITS };
+    let mut b = int_text;
+    b.push_str("点");
+    for ch in dec_part.bytes() {
+        if ch.is_ascii_digit() {
+            b.push_str(digits[(ch - b'0') as usize]);
+        }
+    }
+    b
+}
+
+/// 逐位中文（含小数点）："123" → "一二三"
+fn digits_to_chinese_chars(num: &str, upper: bool) -> String {
+    let digits = if upper { &UPPER_DIGITS } else { &LOWER_DIGITS };
+    let mut b = String::new();
+    for ch in num.chars() {
+        if ch.is_ascii_digit() {
+            b.push_str(digits[(ch as u8 - b'0') as usize]);
+        } else if ch == '.' {
+            b.push_str("点");
+        }
+    }
+    if b.is_empty() {
+        digits[0].to_string()
+    } else {
+        b
+    }
+}
+
+/// 千分位分组："1234567" → "1,234,567"
+fn format_thousands(num: &str) -> String {
+    if num.len() <= 3 {
+        return num.to_string();
+    }
+    let mut b = String::new();
+    let remainder = num.len() % 3;
+    if remainder > 0 {
+        b.push_str(&num[..remainder]);
+    }
+    let mut i = remainder;
+    while i < num.len() {
+        if !b.is_empty() {
+            b.push(',');
+        }
+        b.push_str(&num[i..i + 3]);
+        i += 3;
+    }
+    b
+}
+
+/// 由纯数字串生成候选（金额/中文数字/千分位）。非数字串返回空。
+pub fn generate_number_candidates(s: &str) -> Vec<String> {
+    if !is_decimal_number(s) {
+        return Vec::new();
+    }
+    let (int_part_raw, dec_part) = split_decimal(s);
+    let int_part = if int_part_raw.is_empty() { "0" } else { int_part_raw };
+
+    if dec_part.is_empty() {
+        // 整数（含 "123." 情况）
+        return vec![
+            number_to_amount(int_part, true),
+            number_to_amount(int_part, false),
+            number_to_chinese(int_part, &LOWER_DIGITS, &LOWER_UNITS),
+            number_to_chinese(int_part, &UPPER_DIGITS, &UPPER_UNITS),
+            digits_to_chinese_chars(int_part, false),
+            digits_to_chinese_chars(int_part, true),
+            format_thousands(int_part),
+        ];
+    }
+
+    // 小数
+    let mut out = Vec::new();
+    let amt_u = decimal_to_amount(int_part, dec_part, true);
+    if !amt_u.is_empty() {
+        out.push(amt_u);
+    }
+    let amt_l = decimal_to_amount(int_part, dec_part, false);
+    if !amt_l.is_empty() {
+        out.push(amt_l);
+    }
+    out.push(decimal_to_chinese_text(int_part, dec_part, false));
+    out.push(decimal_to_chinese_text(int_part, dec_part, true));
+    out.push(digits_to_chinese_chars(s, false));
+    out.push(digits_to_chinese_chars(s, true));
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -313,5 +567,57 @@ mod tests {
         let c = generate_quick_input_candidates("3*3", 6);
         assert_eq!(c[0], "3*3=9");
         assert!(c.contains(&"9".to_string()));
+    }
+
+    #[test]
+    fn test_number_integer_candidates() {
+        let c = generate_number_candidates("123");
+        assert!(c.contains(&"壹佰贰拾叁元整".to_string()), "大写金额，实际: {:?}", c);
+        assert!(c.contains(&"一百二十三".to_string()), "中文小写，实际: {:?}", c);
+        assert!(c.contains(&"壹佰贰拾叁".to_string()), "中文大写");
+        assert!(c.contains(&"一二三".to_string()), "逐位");
+    }
+
+    #[test]
+    fn test_number_thousands() {
+        let c = generate_number_candidates("1234567");
+        assert!(c.contains(&"1,234,567".to_string()), "千分位，实际: {:?}", c);
+        assert!(c.contains(&"一百二十三万四千五百六十七".to_string()), "中文大数，实际: {:?}", c);
+    }
+
+    #[test]
+    fn test_number_decimal_amount() {
+        let c = generate_number_candidates("123.45");
+        assert!(
+            c.contains(&"壹佰贰拾叁元肆角伍分".to_string()),
+            "大写角分金额，实际: {:?}",
+            c
+        );
+        assert!(
+            c.contains(&"一百二十三点四五".to_string()),
+            "中文小数读法，实际: {:?}",
+            c
+        );
+    }
+
+    #[test]
+    fn test_pure_number_via_merge() {
+        // 纯整数经合并入口也应产出金额候选（修复"123 无候选"）
+        let c = generate_quick_input_candidates("123", 6);
+        assert!(!c.is_empty(), "纯数字应有候选");
+        assert!(c.contains(&"一百二十三".to_string()));
+    }
+
+    #[test]
+    fn test_number_with_zeros() {
+        // 连续零合并
+        assert_eq!(
+            number_to_chinese("10001", &LOWER_DIGITS, &LOWER_UNITS),
+            "一万零一"
+        );
+        assert_eq!(
+            number_to_chinese("100", &LOWER_DIGITS, &LOWER_UNITS),
+            "一百"
+        );
     }
 }

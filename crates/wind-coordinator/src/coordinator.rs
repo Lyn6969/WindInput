@@ -674,6 +674,27 @@ impl Coordinator {
             .any(|vk| vk == key_code)
     }
 
+    /// 按当前中英标点/全半角配置转换一个标点字符为上屏文本。
+    fn convert_punct_char(&self, state: &State, ch: char) -> String {
+        if state.chinese_punct {
+            self.punct
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .to_chinese(ch)
+                .unwrap_or_else(|| {
+                    if state.full_width {
+                        to_full_width(&ch.to_string())
+                    } else {
+                        ch.to_string()
+                    }
+                })
+        } else if state.full_width {
+            to_full_width(&ch.to_string())
+        } else {
+            ch.to_string()
+        }
+    }
+
     /// 退出快捷输入模式并清空状态
     fn exit_quick_input(&self, state: &mut State) {
         state.quick_input_mode = false;
@@ -808,14 +829,15 @@ impl Coordinator {
                 }
             }
             _ => {
-                // 再次按触发键且缓冲为空：上屏前缀字符并退出
+                // 再次按触发键且缓冲为空：按标点配置上屏前缀字符并退出
                 if state.quick_input_buffer.is_empty()
                     && self.is_quick_input_trigger(data.key_code)
                 {
-                    let prefix = state.quick_input_prefix.clone();
+                    let ch = state.quick_input_prefix.chars().next().unwrap_or(';');
+                    let out = self.convert_punct_char(state, ch);
                     self.exit_quick_input(state);
                     self.notify_ui_hide();
-                    return Self::commit_action(prefix, true);
+                    return Self::commit_action(out, true);
                 }
                 // 可打印字符（数字/运算符/点/括号等）累积到缓冲
                 let shift = data.modifiers & MOD_SHIFT != 0;
@@ -834,6 +856,80 @@ impl Coordinator {
                     KeyAction::Consumed
                 }
             }
+        }
+    }
+
+    /// 顶屏当前高亮候选（若有）并进入临时拼音模式（对齐 Go decideBufferedTrigger 的 actEnterMode）。
+    /// 有候选：上屏高亮候选 + 原子开启临时拼音组合；空码：丢弃缓冲后进入。
+    fn commit_and_enter_temp_pinyin(
+        &self,
+        state: &mut State,
+        key_code: u32,
+        target: String,
+    ) -> KeyAction {
+        let committed = if !state.candidates.is_empty() {
+            let idx = self.highlighted_global_index(state).min(state.candidates.len() - 1);
+            let t = state.candidates[idx].text.clone();
+            self.record_selection(&t);
+            Some(t)
+        } else {
+            None
+        };
+        state.input_buffer.clear();
+        state.candidates.clear();
+        // 进入临时拼音
+        state.temp_pinyin_mode = true;
+        state.temp_pinyin_schema = target;
+        state.temp_pinyin_buffer.clear();
+        state.temp_pinyin_prefix = Self::temp_pinyin_prefix_for(key_code).to_string();
+        self.update_temp_pinyin_candidates(state);
+        self.notify_ui_update(state);
+        let prefix = state.temp_pinyin_prefix.clone();
+        match committed {
+            Some(text) => KeyAction::InsertText {
+                text,
+                new_composition: Some(prefix),
+                mode_changed: false,
+                chinese_mode: true,
+                has_new_composition: true,
+            },
+            None => KeyAction::UpdateComposition {
+                text: prefix.clone(),
+                caret_pos: prefix.chars().count() as u32,
+            },
+        }
+    }
+
+    /// 顶屏当前高亮候选（若有）并进入快捷输入模式。
+    fn commit_and_enter_quick_input(&self, state: &mut State, key_code: u32) -> KeyAction {
+        let committed = if !state.candidates.is_empty() {
+            let idx = self.highlighted_global_index(state).min(state.candidates.len() - 1);
+            let t = state.candidates[idx].text.clone();
+            self.record_selection(&t);
+            Some(t)
+        } else {
+            None
+        };
+        state.input_buffer.clear();
+        state.candidates.clear();
+        state.quick_input_mode = true;
+        state.quick_input_buffer.clear();
+        state.quick_input_prefix = Self::quick_input_prefix_for(key_code).to_string();
+        self.update_quick_input_candidates(state);
+        self.notify_ui_update(state);
+        let prefix = state.quick_input_prefix.clone();
+        match committed {
+            Some(text) => KeyAction::InsertText {
+                text,
+                new_composition: Some(prefix),
+                mode_changed: false,
+                chinese_mode: true,
+                has_new_composition: true,
+            },
+            None => KeyAction::UpdateComposition {
+                text: prefix.clone(),
+                caret_pos: prefix.chars().count() as u32,
+            },
         }
     }
 
@@ -1309,8 +1405,9 @@ impl MessageHandler for Coordinator {
             }
             _ => {
                 let shift = data.modifiers & MOD_SHIFT != 0;
-                // 二/三候选键（无 Shift）：选当前页第 (1+offset) 个候选；不足则落入标点逻辑
+                // 触发键优先级链（对齐 Go decideBufferedTrigger，缓冲非空/有候选时）：
                 if !shift {
+                    // B/C. 二/三候选键 + 候选足够 → 选候选
                     if let Some(offset) = self.select_key_offset(data.key_code) {
                         let (start, end) = self.page_range(&state);
                         let idx = start + offset;
@@ -1319,6 +1416,19 @@ impl MessageHandler for Coordinator {
                             self.commit_candidate(&mut state, &text);
                             self.notify_ui_hide();
                             return Self::commit_action(text, true);
+                        }
+                    }
+                    // D. 模式触发键 → 顶屏高亮候选 + 进模式（快捷输入 > 临时拼音）
+                    if self.is_quick_input_trigger(data.key_code) {
+                        return self.commit_and_enter_quick_input(&mut state, data.key_code);
+                    }
+                    if self.is_temp_pinyin_trigger(data.key_code) {
+                        if let Some(target) = self.engine_mgr.temp_pinyin_target() {
+                            return self.commit_and_enter_temp_pinyin(
+                                &mut state,
+                                data.key_code,
+                                target,
+                            );
                         }
                     }
                 }
