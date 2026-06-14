@@ -229,6 +229,18 @@ fn compile_select_key_group(group: &str) -> Vec<u32> {
     }
 }
 
+/// 选词键组 → 有序 VK 列表（位置 0 = 次选键/选第2个，位置 1 = 三选键/选第3个）。
+/// 供协调器把按键映射为候选偏移（与 compile_select_key_group 同源）。
+pub fn select_key_vks(group: &str) -> Vec<u32> {
+    match group.trim().to_lowercase().as_str() {
+        "semicolon_quote" => vec![VK_OEM_1, VK_OEM_7],
+        "comma_period" => vec![VK_OEM_COMMA, VK_OEM_PERIOD],
+        "lrshift" => vec![VK_LSHIFT, VK_RSHIFT],
+        "lrctrl" => vec![VK_LCONTROL, VK_RCONTROL],
+        _ => Vec::new(),
+    }
+}
+
 /// 翻页键组 → raw hash 列表
 fn compile_page_key_group(group: &str) -> Vec<u32> {
     match group.trim().to_lowercase().as_str() {

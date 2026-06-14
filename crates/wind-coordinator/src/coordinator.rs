@@ -283,6 +283,17 @@ impl Coordinator {
         self.config.ui.per_page.max(1)
     }
 
+    /// 若 key_code 是配置的二/三候选键，返回页内候选偏移（1=次选/第2项，2=三选/第3项）。
+    fn select_key_offset(&self, key_code: u32) -> Option<usize> {
+        for group in &self.config.input.select_key_groups {
+            let vks = hotkey::select_key_vks(group);
+            if let Some(pos) = vks.iter().position(|vk| *vk == key_code) {
+                return Some(pos + 1);
+            }
+        }
+        None
+    }
+
     /// 总页数（至少 1）
     fn total_pages(&self, state: &State) -> usize {
         let pp = self.per_page();
@@ -773,6 +784,19 @@ impl MessageHandler for Coordinator {
             }
             _ => {
                 let shift = data.modifiers & MOD_SHIFT != 0;
+                // 二/三候选键（无 Shift）：选当前页第 (1+offset) 个候选；不足则落入标点逻辑
+                if !shift {
+                    if let Some(offset) = self.select_key_offset(data.key_code) {
+                        let (start, end) = self.page_range(&state);
+                        let idx = start + offset;
+                        if idx < end {
+                            let text = state.candidates[idx].text.clone();
+                            self.commit_candidate(&mut state, &text);
+                            self.notify_ui_hide();
+                            return Self::commit_action(text, true);
+                        }
+                    }
+                }
                 if let Some(ch) = punct_char(data.key_code, shift) {
                     // 标点/符号键：先上屏首选候选（若有输入），再追加（转换后的）标点
                     let mut out = String::new();

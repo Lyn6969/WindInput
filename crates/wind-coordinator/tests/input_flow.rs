@@ -322,6 +322,55 @@ fn test_minus_equal_paging_when_candidates() {
 }
 
 #[test]
+fn test_second_third_candidate_keys() {
+    if !has_schemas() {
+        return;
+    }
+    let coord = Coordinator::new_headless(config_with("wubi86"), Some(&data_dir()));
+    press_letter(&coord, 'a');
+    let texts = coord.debug_page_texts();
+    if texts.len() < 3 {
+        eprintln!("跳过：当前页候选不足 3 个");
+        return;
+    }
+    let second = texts[1].clone();
+
+    // 分号(;, VK_OEM_1=0xBA) → 上屏第 2 个候选
+    match coord.handle_key_event(&key_event(0xBA, EVENT_KEY_DOWN)) {
+        KeyAction::InsertText { text, .. } => {
+            assert_eq!(text, second, "分号应上屏第 2 个候选");
+        }
+        other => panic!("分号应上屏次选候选，实际: {:?}", other),
+    }
+
+    // 重新输入，引号(', VK_OEM_7=0xDE) → 上屏第 3 个候选
+    press_letter(&coord, 'a');
+    let texts2 = coord.debug_page_texts();
+    let third = texts2[2].clone();
+    match coord.handle_key_event(&key_event(0xDE, EVENT_KEY_DOWN)) {
+        KeyAction::InsertText { text, .. } => {
+            assert_eq!(text, third, "引号应上屏第 3 个候选");
+        }
+        other => panic!("引号应上屏三选候选，实际: {:?}", other),
+    }
+}
+
+#[test]
+fn test_select_key_falls_back_to_punct_when_insufficient() {
+    if !has_schemas() {
+        return;
+    }
+    let coord = Coordinator::new_headless(config_with("pinyin"), Some(&data_dir()));
+    // 空缓冲下按分号 → 应作为中文标点（；），而非选词
+    match coord.handle_key_event(&key_event(0xBA, EVENT_KEY_DOWN)) {
+        KeyAction::InsertText { text, .. } => {
+            assert_eq!(text, "；", "空缓冲分号应上屏中文分号");
+        }
+        other => panic!("空缓冲分号应作标点，实际: {:?}", other),
+    }
+}
+
+#[test]
 fn test_mode_toggle_via_shift() {
     if !has_schemas() {
         return;
