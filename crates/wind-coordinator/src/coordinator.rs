@@ -263,6 +263,22 @@ impl Coordinator {
         if let Some((x, y)) = coordinator.load_toolbar_pos() {
             let _ = coordinator.ui_tx.send(UiCommand::SetToolbarPos { x, y });
         }
+
+        // 加载并下发主题
+        if let Some(d) = &data_dir {
+            let name = if coordinator.config.ui.theme.is_empty() {
+                "default"
+            } else {
+                &coordinator.config.ui.theme
+            };
+            match wind_theme::ResolvedTheme::load(&d.join("themes"), name, false) {
+                Ok(t) => {
+                    info!("Loaded theme: {}", name);
+                    let _ = coordinator.ui_tx.send(UiCommand::SetTheme(Box::new(t)));
+                }
+                Err(e) => warn!("Failed to load theme {}: {}", name, e),
+            }
+        }
         coordinator
     }
 

@@ -41,6 +41,8 @@ pub enum UiCommand {
     HideToolbar,
     /// 设置工具栏位置（启动时恢复持久化位置）
     SetToolbarPos { x: i32, y: i32 },
+    /// 应用主题（协调器加载解析后下发）
+    SetTheme(Box<wind_theme::ResolvedTheme>),
     /// 显示右键候选菜单（协调器构建好菜单项后下发）
     ShowCandidateMenu {
         items: Vec<MenuItemSpec>,
@@ -344,6 +346,10 @@ impl UiManager {
                             if let Some(t) = &mut toolbar {
                                 t.set_pos(x, y);
                             }
+                        }
+                        UiCommand::SetTheme(theme) => {
+                            debug!("UI: SetTheme (dark={})", theme.is_dark);
+                            candidate_window.set_theme(*theme);
                         }
                         UiCommand::Shutdown => {
                             info!("UI: Shutdown");

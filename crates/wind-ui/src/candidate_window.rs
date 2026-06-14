@@ -74,7 +74,7 @@ impl CandidateWindowConfig {
         [140, 140, 145, 255]
     }
 
-    fn get_dpi_scale() -> f32 {
+    pub(crate) fn get_dpi_scale() -> f32 {
         #[cfg(windows)]
         {
             use windows::Win32::Foundation::HWND;
@@ -122,6 +122,10 @@ pub struct CandidateWindow {
     mouse: Rc<RefCell<CandidateMouse>>,
     /// 悬停编码反查气泡
     tooltip: Option<crate::tooltip::Tooltip>,
+    /// 已解析主题（颜色/几何）；默认兜底清风蓝
+    theme: wind_theme::ResolvedTheme,
+    /// DPI 缩放（主题几何为逻辑像素，渲染时乘此）
+    scale: f32,
 }
 
 impl CandidateWindow {
@@ -156,7 +160,14 @@ impl CandidateWindow {
             hit_rects: Vec::new(),
             mouse,
             tooltip: crate::tooltip::Tooltip::new().ok(),
+            theme: wind_theme::ResolvedTheme::default(),
+            scale: CandidateWindowConfig::get_dpi_scale(),
         })
+    }
+
+    /// 应用主题（协调器下发）。
+    pub fn set_theme(&mut self, theme: wind_theme::ResolvedTheme) {
+        self.theme = theme;
     }
 
     pub fn update(
@@ -322,27 +333,38 @@ impl CandidateWindow {
 
     /// 按当前状态构建候选视图树（横向布局）
     fn build_tree(&self) -> View {
-        let c = &self.config;
-        let s = c.item_spacing.max(2.0);
+        let t = &self.theme;
+        let s = self.scale;
+        let gap = self.config.item_spacing.max(2.0);
+        let fs = self.config.font_size;
+        // 主题四边内边距（逻辑像素）→ 设备像素
+        let edges = |p: &wind_theme::Pad| Edges {
+            l: p.l * s,
+            t: p.t * s,
+            r: p.r * s,
+            b: p.b * s,
+        };
 
         let mut root = View::container(Layout::Column)
-            .bg(c.bg_color)
-            .border(c.border_color, 1.0)
-            .radius(c.font_size * 0.25)
-            .pad(Edges::xy(c.padding_x, c.padding_y))
-            .gap(s);
+            .bg(t.win_bg)
+            .border(t.win_border, (t.win_border_width * s).max(1.0))
+            .radius(t.win_radius * s)
+            .pad(edges(&t.win_pad))
+            .gap(gap);
 
-        // 预编辑行
+        // 预编辑行（主题背景带 + 文本色）
         if !self.preedit.is_empty() {
             root = root.child(
                 View::container(Layout::Row)
-                    .child(View::leaf(self.preedit.clone(), c.highlight_color)),
+                    .bg(t.preedit_bg)
+                    .radius(t.item_radius * s)
+                    .pad(edges(&t.preedit_pad))
+                    .child(View::leaf(self.preedit.clone(), t.preedit_color)),
             );
         }
 
         // 候选行：[序号 文本] cell 横排
-        let mut row = View::container(Layout::Row).gap(s * 2.0).cross(Align::Center);
-        let item_pad = Edges::xy(s * 1.5, s * 0.5);
+        let mut row = View::container(Layout::Row).gap(gap * 2.0).cross(Align::Center);
         for (i, cand) in self.candidates.iter().enumerate() {
             let marker = if cand.label.is_empty() {
                 (i + 1).to_string()
@@ -351,38 +373,48 @@ impl CandidateWindow {
             };
             let is_sel = i == self.selected;
             let is_hover = self.hover >= 0 && self.hover as usize == i;
-            let txt_color = if is_sel { c.highlight_color } else { c.text_color };
+            let txt_color = if is_sel { t.sel_text } else { t.text_color };
+
+            // 序号：圆圈样式 → 带底色 + 大圆角（药丸近似圆）
+            let mut idx_leaf = View::leaf(marker, t.index_color);
+            if t.index_circle {
+                idx_leaf = idx_leaf
+                    .bg(t.index_circle_bg)
+                    .radius(fs * 0.5)
+                    .pad(Edges::xy(s * 4.0, s * 1.0));
+            }
 
             let mut item = View::container(Layout::Row)
                 .cross(Align::Center)
-                .gap(s * 0.5)
-                .pad(item_pad)
-                .radius(c.font_size * 0.18)
+                .gap(t.text_margin_l * s)
+                .pad(edges(&t.item_pad))
+                .radius(t.item_radius * s)
                 .tag(i as i32)
-                .child(View::leaf(marker, c.marker_color()))
+                .child(idx_leaf)
                 .child(View::leaf(cand.text.clone(), txt_color));
             // 选中底色优先于悬停底色（两者独立：选中=空格上屏目标，悬停=鼠标提示）
             if is_sel {
-                item = item.bg(c.selected_bg);
+                item = item.bg(t.sel_bg);
             } else if is_hover {
-                item = item.bg(c.hover_bg);
+                item = item.bg(t.hover_bg);
             }
             row = row.child(item);
         }
 
         // 翻页器（多页时）：‹ p/t › —— 箭头可点击翻页，带悬停高亮 + 禁用态
         if self.total_pages > 1 {
-            let disabled = [180, 180, 185, 255]; // 禁用灰
+            let disabled = t.color("text_hint", [180, 180, 185, 255]);
+            let marker_c = t.color("text_dim", [140, 140, 145, 255]);
             let arrow = |txt: &str, tag: i32, enabled: bool, hovered: bool| {
-                let color = if enabled { c.highlight_color } else { disabled };
+                let color = if enabled { t.accent_bar } else { disabled };
                 let mut v = View::leaf(txt, color)
-                    .pad(Edges::xy(s * 1.2, s * 0.5))
-                    .radius(c.font_size * 0.18)
+                    .pad(Edges::xy(gap * 1.2, gap * 0.5))
+                    .radius(t.item_radius * s)
                     .cross(Align::Center);
                 if enabled {
                     v = v.tag(tag); // 仅启用项参与命中
                     if hovered {
-                        v = v.bg(c.hover_bg);
+                        v = v.bg(t.hover_bg);
                     }
                 }
                 v
@@ -392,11 +424,11 @@ impl CandidateWindow {
             row = row
                 .child(
                     arrow("‹", TAG_PAGE_PREV, prev_on, self.hover == TAG_PAGE_PREV)
-                        .margin(Edges::xy(s, 0.0)),
+                        .margin(Edges::xy(gap, 0.0)),
                 )
                 .child(View::leaf(
                     format!("{}/{}", self.page, self.total_pages),
-                    c.marker_color(),
+                    marker_c,
                 ))
                 .child(arrow("›", TAG_PAGE_NEXT, next_on, self.hover == TAG_PAGE_NEXT));
         }
