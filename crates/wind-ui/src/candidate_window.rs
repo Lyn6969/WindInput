@@ -392,18 +392,22 @@ impl WindowMouse for CandidateMouse {
             WM_RBUTTONDOWN => {
                 let (x, y) = mouse_pos(lparam);
                 let i = self.hit(x, y);
+                // 用屏幕光标坐标定位菜单
+                let (sx, sy) = unsafe {
+                    let mut p = windows::Win32::Foundation::POINT::default();
+                    let _ = GetCursorPos(&mut p);
+                    (p.x, p.y)
+                };
                 if i >= 0 {
-                    // 用屏幕光标坐标定位菜单
-                    let (sx, sy) = unsafe {
-                        let mut p = windows::Win32::Foundation::POINT::default();
-                        let _ = GetCursorPos(&mut p);
-                        (p.x, p.y)
-                    };
+                    // 命中候选 → 词条菜单
                     let _ = self.events.send(UiEvent::RequestCandidateMenu {
                         page_local: i as usize,
                         x: sx,
                         y: sy,
                     });
+                } else {
+                    // 空白处 → 功能主菜单
+                    let _ = self.events.send(UiEvent::RequestMainMenu { x: sx, y: sy });
                 }
                 Some(LRESULT(0))
             }

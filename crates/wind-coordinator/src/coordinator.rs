@@ -27,7 +27,7 @@ use wind_transform::fullwidth::to_full_width;
 use wind_transform::punctuation::PunctuationConverter;
 use wind_ui::candidate_window::CandidateItem;
 use wind_ui::manager::{
-    CandidateOp, MenuItemSpec, MenuKind, ToolbarAction, UiCommand, UiEvent, UiManager,
+    CandidateOp, MenuCmd, MenuItemSpec, MenuKind, ToolbarAction, UiCommand, UiEvent, UiManager,
 };
 use wind_ui::toolbar::ToolbarState;
 
@@ -166,6 +166,8 @@ pub struct Coordinator {
     shadow: ShadowStore,
     /// Shadow 持久化文件路径（None=不持久化）
     shadow_path: Option<std::path::PathBuf>,
+    /// 工具栏位置持久化文件路径（toolbar_pos.txt；None=不持久化）
+    toolbar_pos_path: Option<std::path::PathBuf>,
 }
 
 /// 短语候选权重基准（高于普通候选，使短语展开排在前列）
@@ -232,6 +234,11 @@ impl Coordinator {
                 }
                 debug!("UI event channel closed");
             });
+        }
+
+        // 恢复持久化的工具栏位置
+        if let Some((x, y)) = coordinator.load_toolbar_pos() {
+            let _ = coordinator.ui_tx.send(UiCommand::SetToolbarPos { x, y });
         }
         coordinator
     }
@@ -301,6 +308,7 @@ impl Coordinator {
         // Shadow 规则（与 freq 同目录的 shadow.json）
         let shadow = ShadowStore::new();
         let shadow_path = freq_path.as_ref().map(|p| p.with_file_name("shadow.json"));
+        let toolbar_pos_path = freq_path.as_ref().map(|p| p.with_file_name("toolbar_pos.txt"));
         if let Some(p) = &shadow_path {
             if let Err(e) = shadow.load_from_file(p) {
                 warn!("Failed to load shadow {}: {}", p.display(), e);
@@ -355,6 +363,7 @@ impl Coordinator {
             s2t,
             shadow,
             shadow_path,
+            toolbar_pos_path,
         });
         // 启动即显示常驻工具栏（反映初始 中英/方案/标点/全半角）
         coordinator.notify_toolbar();
@@ -1369,10 +1378,12 @@ impl Coordinator {
             UiEvent::Page(dir) => self.mouse_page(dir),
             UiEvent::Hover(i) => self.mouse_hover(i),
             UiEvent::Toolbar(a) => self.mouse_toolbar(a),
+            UiEvent::ToolbarMoved { x, y } => self.save_toolbar_pos(x, y),
             UiEvent::CandidateOp { op, page_local } => self.candidate_op(op, page_local),
             UiEvent::RequestCandidateMenu { page_local, x, y } => {
                 self.show_candidate_menu(page_local, x, y)
             }
+            UiEvent::RequestMainMenu { x, y } => self.show_main_menu(x, y),
             UiEvent::MenuHover(i) => self.menu_hover(i),
             UiEvent::MenuActivate(idx) => self.menu_activate(idx),
             UiEvent::MenuClose => self.menu_close(),
@@ -1417,8 +1428,85 @@ impl Coordinator {
             MenuKind::Copy => {
                 let _ = self.ui_tx.send(UiCommand::CopyToClipboard(text));
             }
+            MenuKind::Command(cmd) => self.run_menu_cmd(cmd),
             MenuKind::Separator => {}
         }
+    }
+
+    /// 执行功能主菜单命令
+    fn run_menu_cmd(&self, cmd: MenuCmd) {
+        match cmd {
+            MenuCmd::ToggleMode => {
+                self.handle_menu_command("toggle_mode");
+                self.notify_toolbar();
+            }
+            MenuCmd::SwitchEngine => {
+                self.handle_menu_command("switch_engine");
+                self.notify_toolbar();
+            }
+            MenuCmd::TogglePunct => {
+                self.handle_menu_command("toggle_punct");
+                self.notify_toolbar();
+            }
+            MenuCmd::ToggleWidth => {
+                self.handle_menu_command("toggle_width");
+                self.notify_toolbar();
+            }
+            MenuCmd::ToggleS2t => {
+                self.handle_menu_command("toggle_s2t");
+                self.notify_toolbar();
+            }
+            MenuCmd::OpenConfigDir => {
+                if let Some(d) = Config::user_config_dir() {
+                    let _ = self.ui_tx.send(UiCommand::OpenPath(d.display().to_string()));
+                }
+            }
+        }
+    }
+
+    /// 构建并显示功能主菜单（候选窗空白/工具栏/任务栏指示入口）。
+    /// x/y 为屏幕坐标；i32::MIN 表示由 UI 取光标位置。
+    fn show_main_menu(&self, x: i32, y: i32) {
+        let (chinese, punct, full, s2t) = {
+            let s = self.state.lock().unwrap_or_else(|e| e.into_inner());
+            (s.chinese_mode, s.chinese_punct, s.full_width, s.s2t_enabled)
+        };
+        let item = |label: String, cmd: MenuCmd| MenuItemSpec {
+            label,
+            kind: MenuKind::Command(cmd),
+            enabled: true,
+        };
+        let items = vec![
+            item(
+                if chinese { "切换到英文".into() } else { "切换到中文".into() },
+                MenuCmd::ToggleMode,
+            ),
+            item("切换输入方案".into(), MenuCmd::SwitchEngine),
+            item(
+                if punct { "英文标点".into() } else { "中文标点".into() },
+                MenuCmd::TogglePunct,
+            ),
+            item(
+                if full { "半角".into() } else { "全角".into() },
+                MenuCmd::ToggleWidth,
+            ),
+            item(
+                if s2t { "关闭简繁转换".into() } else { "开启简繁转换".into() },
+                MenuCmd::ToggleS2t,
+            ),
+            MenuItemSpec { label: String::new(), kind: MenuKind::Separator, enabled: false },
+            item("打开配置目录".into(), MenuCmd::OpenConfigDir),
+        ];
+        let selected = first_enabled_menu(&items).unwrap_or(0);
+        {
+            let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+            state.menu_open = true;
+            state.menu_selected = selected;
+            state.menu_items = items.clone();
+            state.menu_target_page_local = 0;
+            state.menu_target_text = String::new();
+        }
+        let _ = self.ui_tx.send(UiCommand::ShowCandidateMenu { items, x, y, selected });
     }
 
     fn is_menu_open(&self) -> bool {
@@ -1564,6 +1652,26 @@ impl Coordinator {
         self.notify_ui_update(&state);
         drop(state);
         self.save_shadow();
+    }
+
+    /// 读取持久化的工具栏位置（"x y" 文本）
+    fn load_toolbar_pos(&self) -> Option<(i32, i32)> {
+        let p = self.toolbar_pos_path.as_ref()?;
+        let content = std::fs::read_to_string(p).ok()?;
+        let mut it = content.split_whitespace();
+        let x: i32 = it.next()?.parse().ok()?;
+        let y: i32 = it.next()?.parse().ok()?;
+        Some((x, y))
+    }
+
+    /// 持久化工具栏位置（best-effort）
+    fn save_toolbar_pos(&self, x: i32, y: i32) {
+        if let Some(p) = &self.toolbar_pos_path {
+            if let Some(parent) = p.parent() {
+                let _ = std::fs::create_dir_all(parent);
+            }
+            let _ = std::fs::write(p, format!("{} {}", x, y));
+        }
     }
 
     /// 持久化 Shadow 规则（best-effort）
@@ -2307,6 +2415,15 @@ impl MessageHandler for Coordinator {
                 self.cycle_schema();
                 Some(self.build_status())
             }
+            "toggle_s2t" => {
+                let on = {
+                    let mut s = self.state.lock().unwrap_or_else(|e| e.into_inner());
+                    s.s2t_enabled = !s.s2t_enabled;
+                    s.s2t_enabled
+                };
+                self.show_tip(if on { "繁" } else { "简" });
+                Some(self.build_status())
+            }
             _ => None,
         }
     }
@@ -2369,4 +2486,8 @@ impl MessageHandler for Coordinator {
 
     fn handle_host_render_request(&self) {}
     fn handle_host_render_ready(&self) {}
+
+    fn handle_show_context_menu(&self, x: i32, y: i32) {
+        self.show_main_menu(x, y);
+    }
 }

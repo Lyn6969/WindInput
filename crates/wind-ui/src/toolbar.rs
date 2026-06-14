@@ -12,9 +12,12 @@ use crate::manager::{ToolbarAction, UiEvent};
 use crate::text::dwrite::TextRenderer;
 use crate::view::Rect;
 use crate::window::{LayeredWindow, WindowMouse};
-use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, WPARAM};
+use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
+use windows::Win32::UI::Input::KeyboardAndMouse::{ReleaseCapture, SetCapture};
 use windows::Win32::UI::WindowsAndMessaging::{
-    LoadCursorW, SetCursor, IDC_ARROW, WM_LBUTTONDOWN, WM_SETCURSOR,
+    GetCursorPos, GetWindowRect, LoadCursorW, SetCursor, SetWindowPos, HWND_TOPMOST, IDC_ARROW,
+    IDC_SIZEALL, SWP_NOACTIVATE, SWP_NOSIZE, SWP_NOZORDER, WM_LBUTTONDOWN, WM_LBUTTONUP,
+    WM_MOUSEMOVE, WM_RBUTTONDOWN, WM_SETCURSOR,
 };
 
 /// 工具栏状态（由协调器推送）
@@ -50,10 +53,8 @@ pub struct Toolbar {
     window: LayeredWindow,
     renderer: TextRenderer,
     scale: f32,
-    /// 是否已计算固定位置
-    pos: Option<(i32, i32)>,
     visible: bool,
-    /// 鼠标处理器（与 window 共享，wnd_proc 经注册表回调）
+    /// 鼠标处理器（与 window 共享，wnd_proc 经注册表回调）；位置存于其中以便拖动同步
     mouse: Rc<RefCell<ToolbarMouse>>,
 }
 
@@ -76,19 +77,32 @@ impl Toolbar {
         let scale = Self::dpi_scale();
         let window = LayeredWindow::create(None, 160, 40, "WindInputToolbar")?;
         let renderer = TextRenderer::new("Microsoft YaHei UI", Self::FONT_PX * scale)?;
+        let hwnd = window.hwnd();
         let mouse = Rc::new(RefCell::new(ToolbarMouse {
             hits: Vec::new(),
             events,
+            hwnd,
+            pos: None,
+            dragging: false,
+            anchor: (0, 0),
+            origin: (0, 0),
         }));
         window.register_mouse(mouse.clone());
         Ok(Self {
             window,
             renderer,
             scale,
-            pos: None,
             visible: false,
             mouse,
         })
+    }
+
+    /// 设置工具栏位置（启动恢复持久化位置）
+    pub fn set_pos(&mut self, x: i32, y: i32) {
+        self.mouse.borrow_mut().pos = Some((x, y));
+        if self.visible {
+            self.window.show(x, y);
+        }
     }
 
     /// 根据状态构建单元格序列
@@ -172,21 +186,27 @@ impl Toolbar {
                 .draw_text(self.window.buffer_mut(), w, h, tx.max(x), ty.max(0.0), &c.text, fg);
             x += cw;
         }
-        // 同步命中矩形给鼠标处理器
-        self.mouse.borrow_mut().hits = hits;
-
         if let Err(e) = self.window.update() {
             tracing::warn!("Toolbar update failed: {}", e);
         }
 
-        // 固定位置：工作区右下角（避开任务栏）
-        let (px, py) = *self.pos.get_or_insert_with(|| Self::corner_position(w, h));
+        // 位置：优先用持久化/拖动后的位置；首次落在工作区右下角（避开任务栏）
+        let (px, py) = {
+            let mut m = self.mouse.borrow_mut();
+            // 同步命中矩形给鼠标处理器
+            m.hits = hits;
+            if m.pos.is_none() {
+                m.pos = Some(Self::corner_position(w, h));
+            }
+            m.pos.unwrap()
+        };
         self.window.show(px, py);
         self.visible = true;
     }
 
     pub fn show(&mut self) {
-        if let Some((x, y)) = self.pos {
+        let pos = self.mouse.borrow().pos;
+        if let Some((x, y)) = pos {
             self.window.show(x, y);
             self.visible = true;
         }
@@ -247,10 +267,27 @@ impl Toolbar {
     }
 }
 
-/// 工具栏鼠标处理器：点击单元格发送对应切换动作。
+/// 工具栏鼠标处理器：点击单元格切换；非单元格区（拖动柄）按下拖动整条工具栏。
 pub struct ToolbarMouse {
     hits: Vec<(ToolbarAction, Rect)>,
     events: Sender<UiEvent>,
+    hwnd: HWND,
+    /// 当前位置（屏幕坐标）；None = 尚未定位
+    pos: Option<(i32, i32)>,
+    dragging: bool,
+    /// 拖动起点：光标屏幕坐标
+    anchor: (i32, i32),
+    /// 拖动起点：窗口屏幕坐标
+    origin: (i32, i32),
+}
+
+impl ToolbarMouse {
+    fn cell_at(&self, x: f32, y: f32) -> Option<ToolbarAction> {
+        self.hits
+            .iter()
+            .find(|(_, r)| r.contains(x, y))
+            .map(|(a, _)| *a)
+    }
 }
 
 impl WindowMouse for ToolbarMouse {
@@ -261,22 +298,85 @@ impl WindowMouse for ToolbarMouse {
         _wparam: WPARAM,
         lparam: LPARAM,
     ) -> Option<LRESULT> {
+        let v = lparam.0 as u32;
+        let cx = (v & 0xFFFF) as i16 as f32;
+        let cy = ((v >> 16) & 0xFFFF) as i16 as f32;
         match msg {
             WM_LBUTTONDOWN => {
-                let v = lparam.0 as u32;
-                let x = (v & 0xFFFF) as i16 as f32;
-                let y = ((v >> 16) & 0xFFFF) as i16 as f32;
-                for (action, r) in &self.hits {
-                    if r.contains(x, y) {
-                        let _ = self.events.send(UiEvent::Toolbar(*action));
-                        break;
+                if self.cell_at(cx, cy).is_none() {
+                    // 非单元格（拖动柄区）→ 开始拖动
+                    let mut p = POINT::default();
+                    unsafe {
+                        let _ = GetCursorPos(&mut p);
+                    }
+                    self.anchor = (p.x, p.y);
+                    self.origin = self.pos.unwrap_or((p.x, p.y));
+                    self.dragging = true;
+                    unsafe {
+                        SetCapture(self.hwnd);
                     }
                 }
                 Some(LRESULT(0))
             }
+            WM_MOUSEMOVE => {
+                if self.dragging {
+                    let mut p = POINT::default();
+                    unsafe {
+                        let _ = GetCursorPos(&mut p);
+                    }
+                    let nx = self.origin.0 + (p.x - self.anchor.0);
+                    let ny = self.origin.1 + (p.y - self.anchor.1);
+                    self.pos = Some((nx, ny));
+                    unsafe {
+                        let _ = SetWindowPos(
+                            self.hwnd,
+                            HWND_TOPMOST,
+                            nx,
+                            ny,
+                            0,
+                            0,
+                            SWP_NOSIZE | SWP_NOACTIVATE | SWP_NOZORDER,
+                        );
+                    }
+                }
+                Some(LRESULT(0))
+            }
+            WM_LBUTTONUP => {
+                if self.dragging {
+                    self.dragging = false;
+                    unsafe {
+                        let _ = ReleaseCapture();
+                    }
+                    // 取实际窗口位置回报，供持久化
+                    let mut r = RECT::default();
+                    let (x, y) = unsafe {
+                        if GetWindowRect(self.hwnd, &mut r).is_ok() {
+                            (r.left, r.top)
+                        } else {
+                            self.pos.unwrap_or((0, 0))
+                        }
+                    };
+                    self.pos = Some((x, y));
+                    let _ = self.events.send(UiEvent::ToolbarMoved { x, y });
+                } else if let Some(action) = self.cell_at(cx, cy) {
+                    // 单元格：按下未拖动 → 抬起时触发切换
+                    let _ = self.events.send(UiEvent::Toolbar(action));
+                }
+                Some(LRESULT(0))
+            }
+            WM_RBUTTONDOWN => {
+                // 右键工具栏 → 功能主菜单（屏幕光标定位）
+                let mut p = POINT::default();
+                unsafe {
+                    let _ = GetCursorPos(&mut p);
+                }
+                let _ = self.events.send(UiEvent::RequestMainMenu { x: p.x, y: p.y });
+                Some(LRESULT(0))
+            }
             WM_SETCURSOR => {
                 unsafe {
-                    if let Ok(c) = LoadCursorW(None, IDC_ARROW) {
+                    let cur = if self.dragging { IDC_SIZEALL } else { IDC_ARROW };
+                    if let Ok(c) = LoadCursorW(None, cur) {
                         SetCursor(c);
                     }
                 }
@@ -288,6 +388,7 @@ impl WindowMouse for ToolbarMouse {
 }
 
 /// 在缓冲区子区域 (x,y,w,h) 内填充圆角矩形
+/// 圆角填充：复用 view 的抗锯齿 + 预乘混合实现，保持各窗口圆角一致。
 fn fill_rounded(
     buf: &mut [u8],
     buf_w: u32,
@@ -299,48 +400,17 @@ fn fill_rounded(
     color: [u8; 4],
     radius: u32,
 ) {
-    let r = radius as i32;
-    let (x0, y0) = (x as i32, y as i32);
-    let (wi, hi) = (w as i32, h as i32);
-    for ry in 0..hi {
-        for rx in 0..wi {
-            if !corner_inside(rx, ry, wi, hi, r) {
-                continue;
-            }
-            let px = x0 + rx;
-            let py = y0 + ry;
-            if px < 0 || py < 0 || px >= buf_w as i32 || py >= buf_h as i32 {
-                continue;
-            }
-            let idx = ((py * buf_w as i32 + px) * 4) as usize;
-            if idx + 3 < buf.len() {
-                buf[idx] = color[0];
-                buf[idx + 1] = color[1];
-                buf[idx + 2] = color[2];
-                buf[idx + 3] = color[3];
-            }
-        }
-    }
-}
-
-fn corner_inside(x: i32, y: i32, w: i32, h: i32, r: i32) -> bool {
-    if r <= 0 {
-        return true;
-    }
-    let corners = [
-        (r, r, x < r && y < r),
-        (w - 1 - r, r, x > w - 1 - r && y < r),
-        (r, h - 1 - r, x < r && y > h - 1 - r),
-        (w - 1 - r, h - 1 - r, x > w - 1 - r && y > h - 1 - r),
-    ];
-    for (cx, cy, in_quadrant) in corners {
-        if in_quadrant {
-            let dx = (x - cx) as f32;
-            let dy = (y - cy) as f32;
-            return dx * dx + dy * dy <= (r * r) as f32;
-        }
-    }
-    true
+    crate::view::fill_rounded(
+        buf,
+        buf_w,
+        buf_h,
+        x as f32,
+        y as f32,
+        w as f32,
+        h as f32,
+        color,
+        radius as f32,
+    );
 }
 
 /// 竖直分隔线（在 x 处，上下各内缩 6px）
@@ -354,9 +424,10 @@ fn draw_vsep(buf: &mut [u8], buf_w: u32, buf_h: u32, x: u32, color: [u8; 4], sca
     for y in y0..y1 {
         let idx = ((y * buf_w + x) * 4) as usize;
         if idx + 3 < buf.len() {
-            buf[idx] = color[0];
+            // color 为 [R,G,B,A]，缓冲为 BGRA
+            buf[idx] = color[2];
             buf[idx + 1] = color[1];
-            buf[idx + 2] = color[2];
+            buf[idx + 2] = color[0];
             buf[idx + 3] = color[3];
         }
     }
@@ -394,9 +465,10 @@ fn fill_dot(buf: &mut [u8], buf_w: u32, buf_h: u32, cx: f32, cy: f32, r: f32, co
             if ddx * ddx + ddy * ddy <= r2 {
                 let idx = ((py * buf_w as i32 + px) * 4) as usize;
                 if idx + 3 < buf.len() {
-                    buf[idx] = color[0];
+                    // color 为 [R,G,B,A]，缓冲为 BGRA
+                    buf[idx] = color[2];
                     buf[idx + 1] = color[1];
-                    buf[idx + 2] = color[2];
+                    buf[idx + 2] = color[0];
                     buf[idx + 3] = color[3];
                 }
             }

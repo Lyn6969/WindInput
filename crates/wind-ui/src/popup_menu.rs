@@ -13,7 +13,7 @@ use crate::manager::{MenuItemSpec, MenuKind, UiEvent};
 use crate::text::dwrite::TextRenderer;
 use crate::view::{Align, Edges, Layout, Rect, View};
 use crate::window::{LayeredWindow, WindowMouse};
-use windows::Win32::Foundation::{HANDLE, HWND, LPARAM, LRESULT, WPARAM};
+use windows::Win32::Foundation::{HANDLE, HWND, LPARAM, LRESULT, POINT, WPARAM};
 use windows::Win32::System::DataExchange::{
     CloseClipboard, EmptyClipboard, OpenClipboard, SetClipboardData,
 };
@@ -21,8 +21,8 @@ use windows::Win32::System::Memory::{GlobalAlloc, GlobalLock, GlobalUnlock, GMEM
 use windows::Win32::System::Ole::CF_UNICODETEXT;
 use windows::Win32::UI::Input::KeyboardAndMouse::{ReleaseCapture, SetCapture};
 use windows::Win32::UI::WindowsAndMessaging::{
-    LoadCursorW, SetCursor, ShowWindow, IDC_ARROW, SW_HIDE, WM_LBUTTONDOWN, WM_MOUSEMOVE,
-    WM_RBUTTONDOWN, WM_SETCURSOR,
+    GetCursorPos, LoadCursorW, SetCursor, ShowWindow, IDC_ARROW, SW_HIDE, WM_LBUTTONDOWN,
+    WM_MOUSEMOVE, WM_RBUTTONDOWN, WM_SETCURSOR,
 };
 
 const FONT_PX: f32 = 14.0;
@@ -82,7 +82,17 @@ impl PopupMenu {
         self.width = w;
         self.height = h;
 
-        let (px, py) = clamp_to_work_area(x, y, w, h);
+        // 坐标哨兵 i32::MIN → 取当前光标位置（任务栏指示无坐标时）
+        let (ax, ay) = if x == i32::MIN || y == i32::MIN {
+            let mut p = POINT::default();
+            unsafe {
+                let _ = GetCursorPos(&mut p);
+            }
+            (p.x, p.y)
+        } else {
+            (x, y)
+        };
+        let (px, py) = clamp_to_work_area(ax, ay, w, h);
         self.window.show(px, py);
         self.visible = true;
         unsafe {

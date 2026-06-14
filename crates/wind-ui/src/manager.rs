@@ -35,6 +35,8 @@ pub enum UiCommand {
     UpdateToolbar(crate::toolbar::ToolbarState),
     /// 隐藏工具栏
     HideToolbar,
+    /// 设置工具栏位置（启动时恢复持久化位置）
+    SetToolbarPos { x: i32, y: i32 },
     /// 显示右键候选菜单（协调器构建好菜单项后下发）
     ShowCandidateMenu {
         items: Vec<MenuItemSpec>,
@@ -49,6 +51,8 @@ pub enum UiCommand {
     HideMenu,
     /// 写剪贴板（菜单"复制"由协调器驱动 → UI 侧执行）
     CopyToClipboard(String),
+    /// 用资源管理器打开路径（菜单"打开配置目录"）
+    OpenPath(String),
     /// 关闭 UI
     Shutdown,
 }
@@ -81,13 +85,26 @@ pub enum CandidateOp {
     Reset,
 }
 
-/// 右键候选菜单项的动作类型
+/// 功能主菜单命令
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MenuCmd {
+    ToggleMode,
+    SwitchEngine,
+    TogglePunct,
+    ToggleWidth,
+    ToggleS2t,
+    OpenConfigDir,
+}
+
+/// 菜单项的动作类型（右键候选菜单 + 功能主菜单共用）
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MenuKind {
     /// 词条操作（置顶/移动/删除/恢复）
     Op(CandidateOp),
     /// 复制候选文本（UI 侧写剪贴板）
     Copy,
+    /// 功能主菜单命令
+    Command(MenuCmd),
     /// 分隔线（不可点击）
     Separator,
 }
@@ -111,10 +128,14 @@ pub enum UiEvent {
     Hover(i32),
     /// 工具栏单元格点击
     Toolbar(ToolbarAction),
+    /// 工具栏被拖动到新位置（屏幕坐标），供协调器持久化
+    ToolbarMoved { x: i32, y: i32 },
     /// 候选词条操作（页内下标 + 动作）
     CandidateOp { op: CandidateOp, page_local: usize },
     /// 右键候选请求弹出菜单（页内下标 + 屏幕坐标）；协调器据此构建菜单项回送
     RequestCandidateMenu { page_local: usize, x: i32, y: i32 },
+    /// 请求功能主菜单（屏幕坐标）；来自候选窗空白/工具栏右键
+    RequestMainMenu { x: i32, y: i32 },
     /// 菜单内鼠标悬停项（-1 表示无）→ 协调器更新高亮
     MenuHover(i32),
     /// 菜单项点击激活（菜单项下标）
@@ -274,6 +295,9 @@ impl UiManager {
                         UiCommand::CopyToClipboard(text) => {
                             crate::popup_menu::set_clipboard_text(&text);
                         }
+                        UiCommand::OpenPath(path) => {
+                            open_path(&path);
+                        }
                         UiCommand::ShowStatusTip { text, x, y } => {
                             debug!("UI: ShowStatusTip '{}' at ({},{})", text, x, y);
                             if let Some(t) = &mut status_tip {
@@ -294,6 +318,12 @@ impl UiManager {
                             debug!("UI: HideToolbar");
                             if let Some(t) = &mut toolbar {
                                 t.hide();
+                            }
+                        }
+                        UiCommand::SetToolbarPos { x, y } => {
+                            debug!("UI: SetToolbarPos ({},{})", x, y);
+                            if let Some(t) = &mut toolbar {
+                                t.set_pos(x, y);
                             }
                         }
                         UiCommand::Shutdown => {
@@ -327,3 +357,27 @@ impl Drop for UiManager {
         let _ = self.cmd_tx.send(UiCommand::Shutdown);
     }
 }
+
+/// 用资源管理器打开路径（best-effort）
+#[cfg(windows)]
+fn open_path(path: &str) {
+    use windows::core::PCWSTR;
+    use windows::Win32::Foundation::HWND;
+    use windows::Win32::UI::Shell::ShellExecuteW;
+    use windows::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
+    let verb: Vec<u16> = "open\0".encode_utf16().collect();
+    let file: Vec<u16> = path.encode_utf16().chain(std::iter::once(0)).collect();
+    unsafe {
+        ShellExecuteW(
+            HWND::default(),
+            PCWSTR(verb.as_ptr()),
+            PCWSTR(file.as_ptr()),
+            PCWSTR::null(),
+            PCWSTR::null(),
+            SW_SHOWNORMAL,
+        );
+    }
+}
+
+#[cfg(not(windows))]
+fn open_path(_path: &str) {}

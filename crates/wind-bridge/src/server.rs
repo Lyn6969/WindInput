@@ -493,8 +493,18 @@ fn dispatch_command(
             None
         }
 
-        // ── 显示上下文菜单（同步） ──
+        // ── 显示功能主菜单（任务栏输入法指示右键，同步）──
         CMD_SHOW_CONTEXT_MENU => {
+            // 载荷若含 8 字节则为屏幕坐标 (i32 x, i32 y)，否则用哨兵让 UI 取光标位
+            let (x, y) = if payload.len() >= 8 {
+                (
+                    i32::from_le_bytes(payload[0..4].try_into().unwrap()),
+                    i32::from_le_bytes(payload[4..8].try_into().unwrap()),
+                )
+            } else {
+                (i32::MIN, i32::MIN)
+            };
+            handler.handle_show_context_menu(x, y);
             Some(encode_ack())
         }
 

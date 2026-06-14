@@ -167,4 +167,8 @@ pub trait MessageHandler: Send + Sync {
 
     /// Host Render 就绪回调
     fn handle_host_render_ready(&self);
+
+    /// 显示功能主菜单（任务栏输入法指示右键）。x/y 为屏幕坐标；
+    /// i32::MIN 表示坐标缺失（由 UI 取光标位置）。默认空实现。
+    fn handle_show_context_menu(&self, _x: i32, _y: i32) {}
 }

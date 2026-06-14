@@ -55,6 +55,10 @@ impl MessageHandler for DeferredHandler {
         self.with_handler((), |h| h.handle_focus_lost())
     }
 
+    fn handle_show_context_menu(&self, x: i32, y: i32) {
+        self.with_handler((), |h| h.handle_show_context_menu(x, y))
+    }
+
     fn handle_ime_activated(&self, client_token: u64) -> Option<StatusUpdateData> {
         self.with_handler(None, |h| h.handle_ime_activated(client_token))
     }
