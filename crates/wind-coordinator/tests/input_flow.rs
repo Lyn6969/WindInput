@@ -604,6 +604,41 @@ fn test_semicolon_still_selects_second_candidate_with_candidates() {
 }
 
 #[test]
+fn test_phrase_date_expansion() {
+    if !has_schemas() {
+        return;
+    }
+    // 输入 "date" → 短语层应展开当前日期候选（如 2026年6月14日）
+    let coord = Coordinator::new_headless(config_with("wubi86"), Some(&data_dir()));
+    for c in "date".chars() {
+        press_letter(&coord, c);
+    }
+    let texts = coord.debug_page_texts();
+    // 短语高权重 → 应在候选中且靠前；校验存在「年…月…日」格式
+    let has_date_phrase = texts.iter().any(|t| t.contains('年') && t.contains('月') && t.contains('日'));
+    assert!(
+        has_date_phrase,
+        "输入 date 应出现日期短语候选，实际: {:?}",
+        texts
+    );
+}
+
+#[test]
+fn test_phrase_time_expansion() {
+    if !has_schemas() {
+        return;
+    }
+    let coord = Coordinator::new_headless(config_with("wubi86"), Some(&data_dir()));
+    for c in "time".chars() {
+        press_letter(&coord, c);
+    }
+    let texts = coord.debug_page_texts();
+    // 时间短语 $HH:$mm:$ss → 含冒号的时间串
+    let has_time = texts.iter().any(|t| t.matches(':').count() >= 1 && t.chars().any(|c| c.is_ascii_digit()));
+    assert!(has_time, "输入 time 应出现时间短语候选，实际: {:?}", texts);
+}
+
+#[test]
 fn test_mode_toggle_via_shift() {
     if !has_schemas() {
         return;

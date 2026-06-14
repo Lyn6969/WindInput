@@ -131,7 +131,12 @@ pub struct Coordinator {
     freq_path: Option<std::path::PathBuf>,
     /// 自上次落盘以来的新增选词数（达阈值触发保存）
     freq_dirty: Mutex<u32>,
+    /// 短语层（system.phrases.toml；$Y$M$D 模板）
+    phrases: crate::phrases::PhraseLayer,
 }
+
+/// 短语候选权重基准（高于普通候选，使短语展开排在前列）
+const PHRASE_WEIGHT_BASE: i32 = 40_000_000;
 
 impl Coordinator {
     /// 生产构造器：从 exe 同目录加载配置，启动候选窗口 UI 线程
@@ -188,6 +193,19 @@ impl Coordinator {
             compiled_hotkeys.key_up.len()
         );
 
+        // 短语层：从 data 目录加载 system.phrases.toml
+        let phrases = match data_dir {
+            Some(d) => {
+                let p = d.join("system.phrases.toml");
+                let layer = crate::phrases::PhraseLayer::load(&p);
+                if !layer.is_empty() {
+                    info!("Loaded phrases from {}", p.display());
+                }
+                layer
+            }
+            None => crate::phrases::PhraseLayer::default(),
+        };
+
         let freq_tracker = FreqTracker::new();
         if let Some(p) = &freq_path {
             match freq_tracker.load_from_file(p) {
@@ -228,6 +246,7 @@ impl Coordinator {
             punct: Mutex::new(PunctuationConverter::new()),
             freq_path,
             freq_dirty: Mutex::new(0),
+            phrases,
         });
         // 启动即显示常驻工具栏（反映初始 中英/方案/标点/全半角）
         coordinator.notify_toolbar();
@@ -307,11 +326,25 @@ impl Coordinator {
         for c in &mut candidates {
             c.weight += self.freq_tracker.get_boost(&c.text) as i32;
         }
+        // 短语层：输入码命中短语 code → 展开模板候选（高权重，排前列）
+        if !self.phrases.is_empty() {
+            for (text, w) in self.phrases.lookup(&state.input_buffer) {
+                candidates.push(Candidate {
+                    text,
+                    weight: PHRASE_WEIGHT_BASE + w,
+                    is_phrase: true,
+                    ..Default::default()
+                });
+            }
+        }
         candidates.sort_by(|a, b| {
             b.weight
                 .cmp(&a.weight)
                 .then(a.natural_order.cmp(&b.natural_order))
         });
+        // 按文本去重（保留排序后首现 = 最高权重），避免短语与引擎候选重复
+        let mut seen = std::collections::HashSet::new();
+        candidates.retain(|c| seen.insert(c.text.clone()));
         // 保留多页候选用于翻页（不再截断到单页）
         candidates.truncate(ENGINE_MAX_CANDIDATES);
         state.candidates = candidates;
