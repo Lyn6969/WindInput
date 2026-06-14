@@ -35,6 +35,20 @@ pub enum UiCommand {
     UpdateToolbar(crate::toolbar::ToolbarState),
     /// 隐藏工具栏
     HideToolbar,
+    /// 显示右键候选菜单（协调器构建好菜单项后下发）
+    ShowCandidateMenu {
+        items: Vec<MenuItemSpec>,
+        x: i32,
+        y: i32,
+        /// 初始高亮项（菜单项下标）
+        selected: usize,
+    },
+    /// 更新菜单高亮项（键盘/悬停导航时，仅重绘不移位）
+    UpdateMenuHighlight(usize),
+    /// 隐藏右键菜单
+    HideMenu,
+    /// 写剪贴板（菜单"复制"由协调器驱动 → UI 侧执行）
+    CopyToClipboard(String),
     /// 关闭 UI
     Shutdown,
 }
@@ -67,6 +81,25 @@ pub enum CandidateOp {
     Reset,
 }
 
+/// 右键候选菜单项的动作类型
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MenuKind {
+    /// 词条操作（置顶/移动/删除/恢复）
+    Op(CandidateOp),
+    /// 复制候选文本（UI 侧写剪贴板）
+    Copy,
+    /// 分隔线（不可点击）
+    Separator,
+}
+
+/// 菜单项规格（由协调器构建，含启用态）
+#[derive(Debug, Clone)]
+pub struct MenuItemSpec {
+    pub label: String,
+    pub kind: MenuKind,
+    pub enabled: bool,
+}
+
 /// UI → 协调器的反向事件（鼠标交互）
 #[derive(Debug, Clone)]
 pub enum UiEvent {
@@ -80,6 +113,14 @@ pub enum UiEvent {
     Toolbar(ToolbarAction),
     /// 候选词条操作（页内下标 + 动作）
     CandidateOp { op: CandidateOp, page_local: usize },
+    /// 右键候选请求弹出菜单（页内下标 + 屏幕坐标）；协调器据此构建菜单项回送
+    RequestCandidateMenu { page_local: usize, x: i32, y: i32 },
+    /// 菜单内鼠标悬停项（-1 表示无）→ 协调器更新高亮
+    MenuHover(i32),
+    /// 菜单项点击激活（菜单项下标）
+    MenuActivate(usize),
+    /// 关闭菜单（点击菜单外 / 右键）
+    MenuClose,
 }
 
 /// UI 管理器（在独立线程中运行）
@@ -141,6 +182,15 @@ impl UiManager {
         };
         let mut tip_hide_at: Option<std::time::Instant> = None;
 
+        // 右键候选弹出菜单（best-effort）
+        let mut popup_menu = match crate::popup_menu::PopupMenu::new(event_tx.clone()) {
+            Ok(m) => Some(m),
+            Err(e) => {
+                error!("Failed to create popup menu: {}", e);
+                None
+            }
+        };
+
         // 常驻工具栏（best-effort，失败不影响其它窗口）
         let mut toolbar = match crate::toolbar::Toolbar::new(event_tx.clone()) {
             Ok(t) => Some(t),
@@ -201,6 +251,28 @@ impl UiManager {
                         UiCommand::HideCandidates => {
                             debug!("UI: HideCandidates");
                             candidate_window.hide();
+                            if let Some(m) = &mut popup_menu {
+                                m.hide();
+                            }
+                        }
+                        UiCommand::ShowCandidateMenu { items, x, y, selected } => {
+                            debug!("UI: ShowCandidateMenu ({} items) at ({},{})", items.len(), x, y);
+                            if let Some(m) = &mut popup_menu {
+                                m.show(items, x, y, selected);
+                            }
+                        }
+                        UiCommand::UpdateMenuHighlight(sel) => {
+                            if let Some(m) = &mut popup_menu {
+                                m.set_highlight(sel);
+                            }
+                        }
+                        UiCommand::HideMenu => {
+                            if let Some(m) = &mut popup_menu {
+                                m.hide();
+                            }
+                        }
+                        UiCommand::CopyToClipboard(text) => {
+                            crate::popup_menu::set_clipboard_text(&text);
                         }
                         UiCommand::ShowStatusTip { text, x, y } => {
                             debug!("UI: ShowStatusTip '{}' at ({},{})", text, x, y);

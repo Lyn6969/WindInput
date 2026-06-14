@@ -173,6 +173,10 @@ impl View {
         self.fixed_h = Some(h);
         self
     }
+    pub fn fixed_w(mut self, w: f32) -> Self {
+        self.fixed_w = Some(w);
+        self
+    }
     pub fn child(mut self, c: View) -> Self {
         self.children.push(c);
         self

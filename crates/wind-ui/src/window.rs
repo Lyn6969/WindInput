@@ -245,7 +245,12 @@ impl LayeredWindow {
         // 鼠标相关消息派发给已注册处理器（先取出 Rc 释放注册表借用，避免重入冲突）
         if matches!(
             msg,
-            WM_LBUTTONDOWN | WM_LBUTTONUP | WM_MOUSEMOVE | WM_MOUSEWHEEL | WM_SETCURSOR
+            WM_LBUTTONDOWN
+                | WM_LBUTTONUP
+                | WM_RBUTTONDOWN
+                | WM_MOUSEMOVE
+                | WM_MOUSEWHEEL
+                | WM_SETCURSOR
         ) {
             let key = hwnd.0 as isize;
             let handler = MOUSE_HANDLERS.with(|m| m.borrow().get(&key).cloned());

@@ -26,7 +26,9 @@ use wind_store::shadow::ShadowStore;
 use wind_transform::fullwidth::to_full_width;
 use wind_transform::punctuation::PunctuationConverter;
 use wind_ui::candidate_window::CandidateItem;
-use wind_ui::manager::{CandidateOp, ToolbarAction, UiCommand, UiEvent, UiManager};
+use wind_ui::manager::{
+    CandidateOp, MenuItemSpec, MenuKind, ToolbarAction, UiCommand, UiEvent, UiManager,
+};
 use wind_ui::toolbar::ToolbarState;
 
 /// VK + shift → 该键产生的 ASCII 标点/符号字符（字母键返回 None，由拼音/码表处理）。
@@ -130,6 +132,15 @@ struct State {
     caret_x: i32,
     caret_y: i32,
     caret_height: i32,
+    /// 右键候选菜单是否打开（打开时键盘事件被菜单拦截）
+    menu_open: bool,
+    /// 菜单当前高亮项（菜单项下标）
+    menu_selected: usize,
+    /// 菜单项规格（用于键盘导航与激活判定）
+    menu_items: Vec<MenuItemSpec>,
+    /// 菜单目标候选（页内下标 + 文本）
+    menu_target_page_local: usize,
+    menu_target_text: String,
 }
 
 /// 中央协调器
@@ -159,6 +170,30 @@ pub struct Coordinator {
 
 /// 短语候选权重基准（高于普通候选，使短语展开排在前列）
 const PHRASE_WEIGHT_BASE: i32 = 40_000_000;
+
+/// 菜单首个可激活项（启用且非分隔）下标
+fn first_enabled_menu(items: &[MenuItemSpec]) -> Option<usize> {
+    items
+        .iter()
+        .position(|it| it.enabled && !matches!(it.kind, MenuKind::Separator))
+}
+
+/// 从 from 沿 dir(±1) 找下一个可激活项（环绕），跳过分隔/禁用
+fn next_enabled_menu(items: &[MenuItemSpec], from: usize, dir: i32) -> Option<usize> {
+    let n = items.len();
+    if n == 0 {
+        return None;
+    }
+    let mut i = from as i32;
+    for _ in 0..n {
+        i = (i + dir).rem_euclid(n as i32);
+        let idx = i as usize;
+        if items[idx].enabled && !matches!(items[idx].kind, MenuKind::Separator) {
+            return Some(idx);
+        }
+    }
+    None
+}
 
 impl Coordinator {
     /// 生产构造器：从 exe 同目录加载配置，启动候选窗口 UI 线程
@@ -301,6 +336,11 @@ impl Coordinator {
                 caret_x: 0,
                 caret_y: 0,
                 caret_height: 0,
+                menu_open: false,
+                menu_selected: 0,
+                menu_items: Vec::new(),
+                menu_target_page_local: 0,
+                menu_target_text: String::new(),
             }),
             push_server,
             config,
@@ -1330,7 +1370,157 @@ impl Coordinator {
             UiEvent::Hover(i) => self.mouse_hover(i),
             UiEvent::Toolbar(a) => self.mouse_toolbar(a),
             UiEvent::CandidateOp { op, page_local } => self.candidate_op(op, page_local),
+            UiEvent::RequestCandidateMenu { page_local, x, y } => {
+                self.show_candidate_menu(page_local, x, y)
+            }
+            UiEvent::MenuHover(i) => self.menu_hover(i),
+            UiEvent::MenuActivate(idx) => self.menu_activate(idx),
+            UiEvent::MenuClose => self.menu_close(),
         }
+    }
+
+    /// 鼠标悬停菜单项 → 更新高亮（仅对启用项）
+    fn menu_hover(&self, idx: i32) {
+        if idx < 0 {
+            return;
+        }
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        if !state.menu_open {
+            return;
+        }
+        let i = idx as usize;
+        if i < state.menu_items.len()
+            && state.menu_items[i].enabled
+            && state.menu_selected != i
+        {
+            state.menu_selected = i;
+            let _ = self.ui_tx.send(UiCommand::UpdateMenuHighlight(i));
+        }
+    }
+
+    /// 激活菜单项（鼠标点击 / 键盘回车）
+    fn menu_activate(&self, idx: usize) {
+        let (kind, page_local, text) = {
+            let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+            if !state.menu_open || idx >= state.menu_items.len() {
+                return;
+            }
+            let item = &state.menu_items[idx];
+            if !item.enabled || matches!(item.kind, MenuKind::Separator) {
+                return;
+            }
+            (item.kind, state.menu_target_page_local, state.menu_target_text.clone())
+        };
+        self.menu_close();
+        match kind {
+            MenuKind::Op(op) => self.candidate_op(op, page_local),
+            MenuKind::Copy => {
+                let _ = self.ui_tx.send(UiCommand::CopyToClipboard(text));
+            }
+            MenuKind::Separator => {}
+        }
+    }
+
+    fn is_menu_open(&self) -> bool {
+        self.state.lock().unwrap_or_else(|e| e.into_inner()).menu_open
+    }
+
+    /// 关闭菜单
+    fn menu_close(&self) {
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        if state.menu_open {
+            state.menu_open = false;
+            state.menu_items.clear();
+            drop(state);
+            let _ = self.ui_tx.send(UiCommand::HideMenu);
+        }
+    }
+
+    /// 菜单键盘导航：返回 true 表示已被菜单消费。
+    /// 仅在 menu_open 时调用；处理方向键/回车/ESC。
+    fn menu_handle_key(&self, key_code: u32) -> bool {
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        if !state.menu_open {
+            return false;
+        }
+        match key_code {
+            0x26 | 0x28 => {
+                // 上/下：移到上/下一个启用项（跳过分隔/禁用）
+                let dir: i32 = if key_code == 0x26 { -1 } else { 1 };
+                if let Some(next) = next_enabled_menu(&state.menu_items, state.menu_selected, dir) {
+                    state.menu_selected = next;
+                    let _ = self.ui_tx.send(UiCommand::UpdateMenuHighlight(next));
+                }
+                true
+            }
+            0x0D | 0x20 => {
+                // 回车/空格：激活当前项
+                let idx = state.menu_selected;
+                drop(state);
+                self.menu_activate(idx);
+                true
+            }
+            0x1B => {
+                // ESC：关闭菜单
+                drop(state);
+                self.menu_close();
+                true
+            }
+            _ => {
+                // 其它键：关闭菜单并吞掉（避免误入输入）
+                drop(state);
+                self.menu_close();
+                true
+            }
+        }
+    }
+
+    /// 构建右键候选菜单项并下发给 UI 显示。
+    fn show_candidate_menu(&self, page_local: usize, x: i32, y: i32) {
+        let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        if state.candidates.is_empty() || state.input_buffer.is_empty() {
+            return;
+        }
+        let (start, end) = self.page_range(&state);
+        let idx = start + page_local;
+        if idx >= end || idx >= state.candidates.len() {
+            return;
+        }
+        let word = state.candidates[idx].text.clone();
+        let code = state.input_buffer.clone();
+        let total = state.candidates.len();
+        drop(state);
+
+        let schema = self.engine_mgr.active_schema_id();
+        let has_rule = self.shadow.has_rule(&schema, &code, &word);
+        let multi_char = word.chars().count() > 1;
+
+        let item = |label: &str, kind: MenuKind, enabled: bool| MenuItemSpec {
+            label: label.to_string(),
+            kind,
+            enabled,
+        };
+        let items = vec![
+            item("置顶", MenuKind::Op(CandidateOp::MoveTop), true),
+            item("前移", MenuKind::Op(CandidateOp::MoveUp), idx > 0),
+            item("后移", MenuKind::Op(CandidateOp::MoveDown), idx + 1 < total),
+            item("删除", MenuKind::Op(CandidateOp::Delete), multi_char),
+            item("恢复默认", MenuKind::Op(CandidateOp::Reset), has_rule),
+            MenuItemSpec { label: String::new(), kind: MenuKind::Separator, enabled: false },
+            item("复制", MenuKind::Copy, true),
+        ];
+        let selected = first_enabled_menu(&items).unwrap_or(0);
+
+        // 记录菜单状态（供键盘导航/激活）
+        {
+            let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+            state.menu_open = true;
+            state.menu_selected = selected;
+            state.menu_items = items.clone();
+            state.menu_target_page_local = page_local;
+            state.menu_target_text = word;
+        }
+        let _ = self.ui_tx.send(UiCommand::ShowCandidateMenu { items, x, y, selected });
     }
 
     /// 候选词条操作（右键菜单）：调整 Shadow 规则并即时重排重绘。
@@ -1666,6 +1856,11 @@ impl MessageHandler for Coordinator {
         }
         if data.event_type != EVENT_KEY_DOWN {
             return KeyAction::PassThrough;
+        }
+
+        // ── 右键菜单打开时：方向键/回车/ESC 由菜单消费（优先于一切）──
+        if self.is_menu_open() && self.menu_handle_key(data.key_code) {
+            return KeyAction::Consumed;
         }
 
         // ── key_down 热键匹配 ──

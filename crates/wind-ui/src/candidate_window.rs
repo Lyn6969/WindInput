@@ -14,7 +14,8 @@ use crate::view::{Align, Edges, Layout, Rect, View};
 use crate::window::{LayeredWindow, WindowMouse};
 use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, WPARAM};
 use windows::Win32::UI::WindowsAndMessaging::{
-    LoadCursorW, SetCursor, IDC_ARROW, WM_LBUTTONDOWN, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_SETCURSOR,
+    GetCursorPos, LoadCursorW, SetCursor, IDC_ARROW, WM_LBUTTONDOWN, WM_MOUSEMOVE, WM_MOUSEWHEEL,
+    WM_RBUTTONDOWN, WM_SETCURSOR,
 };
 
 /// 候选词数据
@@ -385,6 +386,24 @@ impl WindowMouse for CandidateMouse {
                 if i >= 0 && i != self.last_hover {
                     self.last_hover = i;
                     let _ = self.events.send(UiEvent::Hover(i));
+                }
+                Some(LRESULT(0))
+            }
+            WM_RBUTTONDOWN => {
+                let (x, y) = mouse_pos(lparam);
+                let i = self.hit(x, y);
+                if i >= 0 {
+                    // 用屏幕光标坐标定位菜单
+                    let (sx, sy) = unsafe {
+                        let mut p = windows::Win32::Foundation::POINT::default();
+                        let _ = GetCursorPos(&mut p);
+                        (p.x, p.y)
+                    };
+                    let _ = self.events.send(UiEvent::RequestCandidateMenu {
+                        page_local: i as usize,
+                        x: sx,
+                        y: sy,
+                    });
                 }
                 Some(LRESULT(0))
             }
