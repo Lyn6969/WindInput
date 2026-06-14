@@ -349,7 +349,17 @@ impl UiManager {
                         }
                         UiCommand::SetTheme(theme) => {
                             debug!("UI: SetTheme (dark={})", theme.is_dark);
-                            candidate_window.set_theme(*theme);
+                            let t = *theme;
+                            if let Some(tb) = &mut toolbar {
+                                tb.set_theme(&t);
+                            }
+                            if let Some(m) = &mut popup_menu {
+                                m.set_theme(&t);
+                            }
+                            if let Some(st) = &mut status_tip {
+                                st.set_theme(&t);
+                            }
+                            candidate_window.set_theme(t); // 同时更新其 tooltip
                         }
                         UiCommand::Shutdown => {
                             info!("UI: Shutdown");

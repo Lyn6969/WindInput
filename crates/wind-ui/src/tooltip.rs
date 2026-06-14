@@ -17,6 +17,8 @@ pub struct Tooltip {
     renderer: TextRenderer,
     scale: f32,
     visible: bool,
+    bg: [u8; 4],
+    fg: [u8; 4],
 }
 
 impl Tooltip {
@@ -29,7 +31,15 @@ impl Tooltip {
             renderer,
             scale,
             visible: false,
+            bg: BG,
+            fg: FG,
         })
+    }
+
+    /// 应用主题（tooltip 底色/文字色）。
+    pub fn set_theme(&mut self, theme: &wind_theme::ResolvedTheme) {
+        self.bg = theme.color("tooltip_bg", BG);
+        self.fg = theme.color("tooltip_text", FG);
     }
 
     /// 显示提示，左上角对齐 (x,y)（屏幕坐标）
@@ -39,8 +49,8 @@ impl Tooltip {
             return;
         }
         let s = self.scale;
-        let mut tip = View::leaf(text, FG)
-            .bg(BG)
+        let mut tip = View::leaf(text, self.fg)
+            .bg(self.bg)
             .pad(Edges::xy(8.0 * s, 4.0 * s))
             .text_align(Align::Center);
         tip.corner_radius = 5.0 * s;

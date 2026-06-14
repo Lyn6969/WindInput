@@ -56,6 +56,13 @@ pub struct Toolbar {
     visible: bool,
     /// 鼠标处理器（与 window 共享，wnd_proc 经注册表回调）；位置存于其中以便拖动同步
     mouse: Rc<RefCell<ToolbarMouse>>,
+    // 主题色（默认深灰，set_theme 覆盖）
+    bg: [u8; 4],
+    fg: [u8; 4],
+    hl_bg: [u8; 4],
+    hl_fg: [u8; 4],
+    sep: [u8; 4],
+    grip: [u8; 4],
 }
 
 impl Toolbar {
@@ -94,7 +101,23 @@ impl Toolbar {
             scale,
             visible: false,
             mouse,
+            bg: Self::BG,
+            fg: Self::FG,
+            hl_bg: Self::HL_BG,
+            hl_fg: Self::HL_FG,
+            sep: Self::SEP,
+            grip: Self::GRIP,
         })
+    }
+
+    /// 应用主题（工具栏各色，跟随语义）。
+    pub fn set_theme(&mut self, theme: &wind_theme::ResolvedTheme) {
+        self.bg = theme.color("toolbar_background", self.bg);
+        self.fg = theme.color("toolbar_full_width_off_text", self.fg);
+        self.hl_bg = theme.color("toolbar_mode_chinese_bg", self.hl_bg);
+        self.hl_fg = theme.color("toolbar_mode_text", self.hl_fg);
+        self.sep = theme.color("toolbar_border", self.sep);
+        self.grip = theme.color("toolbar_grip", self.grip);
     }
 
     /// 设置工具栏位置（启动恢复持久化位置）；钳制到工作区内。
@@ -152,9 +175,9 @@ impl Toolbar {
             let buf = self.window.buffer_mut();
             buf[..buf_size].fill(0);
             let radius = (h as f32 * 0.22) as u32;
-            fill_rounded(buf, w, h, 0, 0, w, h, Self::BG, radius);
+            fill_rounded(buf, w, h, 0, 0, w, h, self.bg, radius);
             // 拖动柄点阵（视觉对齐 Go，暂不响应拖动）
-            draw_grip(buf, w, h, grip_w as u32, Self::GRIP, s);
+            draw_grip(buf, w, h, grip_w as u32, self.grip, s);
         }
 
         // 逐格绘制 + 记录命中矩形
@@ -166,7 +189,7 @@ impl Toolbar {
             hits.push((c.action, Rect { x, y: 0.0, w: cw, h: h as f32 }));
             // 分隔线（首格前不画）
             if i > 0 {
-                draw_vsep(self.window.buffer_mut(), w, h, x as u32, Self::SEP, s);
+                draw_vsep(self.window.buffer_mut(), w, h, x as u32, self.sep, s);
             }
             // 高亮底（中文模式格）
             if c.highlight {
@@ -176,13 +199,13 @@ impl Toolbar {
                 let hw = (cw as u32).saturating_sub(inset);
                 let hh = h.saturating_sub(inset * 2);
                 let hr = (hh as f32 * 0.3) as u32;
-                fill_rounded(self.window.buffer_mut(), w, h, hx, hy, hw, hh, Self::HL_BG, hr);
+                fill_rounded(self.window.buffer_mut(), w, h, hx, hy, hw, hh, self.hl_bg, hr);
             }
             // 居中文字
             let m = self.renderer.measure_text(&c.text);
             let tx = x + (cw - m.width) * 0.5;
             let ty = (h as f32 - font_h) * 0.5;
-            let fg = if c.highlight { Self::HL_FG } else { Self::FG };
+            let fg = if c.highlight { self.hl_fg } else { self.fg };
             let _ = self
                 .renderer
                 .draw_text(self.window.buffer_mut(), w, h, tx.max(x), ty.max(0.0), &c.text, fg);

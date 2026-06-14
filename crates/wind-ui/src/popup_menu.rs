@@ -44,6 +44,13 @@ pub struct PopupMenu {
     selected: usize,
     width: u32,
     height: u32,
+    // 主题色（默认浅色，set_theme 覆盖）
+    bg: [u8; 4],
+    fg: [u8; 4],
+    disabled: [u8; 4],
+    border: [u8; 4],
+    sep: [u8; 4],
+    hl_bg: [u8; 4],
 }
 
 impl PopupMenu {
@@ -68,7 +75,23 @@ impl PopupMenu {
             selected: 0,
             width: 0,
             height: 0,
+            bg: BG,
+            fg: FG,
+            disabled: DISABLED,
+            border: BORDER,
+            sep: SEP,
+            hl_bg: HL_BG,
         })
+    }
+
+    /// 应用主题（菜单各色）。
+    pub fn set_theme(&mut self, theme: &wind_theme::ResolvedTheme) {
+        self.bg = theme.color("menu_bg", BG);
+        self.fg = theme.color("menu_text", FG);
+        self.disabled = theme.color("menu_disabled", DISABLED);
+        self.border = theme.color("menu_border", BORDER);
+        self.sep = theme.color("menu_separator", SEP);
+        self.hl_bg = theme.color("menu_hover_bg", HL_BG);
     }
 
     /// 显示菜单于屏幕坐标 (x,y)，初始高亮 selected。
@@ -124,8 +147,8 @@ impl PopupMenu {
         let item_w = (max_label + pad.l + pad.r).max(80.0 * s);
 
         let mut root = View::container(Layout::Column)
-            .bg(BG)
-            .border(BORDER, 1.0)
+            .bg(self.bg)
+            .border(self.border, 1.0)
             .radius(6.0 * s)
             .pad(Edges::all(4.0 * s));
 
@@ -136,11 +159,11 @@ impl PopupMenu {
                         .fixed_w(item_w)
                         .fixed_h(1.0_f32.max(s))
                         .margin(Edges::xy(0.0, 3.0 * s))
-                        .bg(SEP),
+                        .bg(self.sep),
                 );
                 continue;
             }
-            let color = if it.enabled { FG } else { DISABLED };
+            let color = if it.enabled { self.fg } else { self.disabled };
             let mut item = View::container(Layout::Row)
                 .fixed_w(item_w)
                 .fixed_h(item_h)
@@ -152,7 +175,7 @@ impl PopupMenu {
                 item = item.tag(i as i32);
             }
             if i == self.selected && it.enabled {
-                item = item.bg(HL_BG);
+                item = item.bg(self.hl_bg);
             }
             root = root.child(item);
         }

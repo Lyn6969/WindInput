@@ -165,8 +165,11 @@ impl CandidateWindow {
         })
     }
 
-    /// 应用主题（协调器下发）。
+    /// 应用主题（协调器下发）。同步更新悬停 tooltip 配色。
     pub fn set_theme(&mut self, theme: wind_theme::ResolvedTheme) {
+        if let Some(tip) = self.tooltip.as_mut() {
+            tip.set_theme(&theme);
+        }
         self.theme = theme;
     }
 

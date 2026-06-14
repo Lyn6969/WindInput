@@ -30,6 +30,12 @@ impl StatusTip {
         })
     }
 
+    /// 应用主题（状态气泡底色/文字色）。
+    pub fn set_theme(&mut self, theme: &wind_theme::ResolvedTheme) {
+        self.bg = theme.color("status_bg", self.bg);
+        self.fg = theme.color("status_text", self.fg);
+    }
+
     /// 显示提示文本，居中于 (cx, cy) 上方
     pub fn show(&mut self, text: &str, cx: i32, cy: i32) {
         let s = self.scale;
