@@ -24,10 +24,15 @@ impl CachedDict {
     /// 3. 如果否，加载 .yaml，写入 .wdb 缓存，然后 mmap 打开
     pub fn load(yaml_path: &Path) -> anyhow::Result<Self> {
         let wdb_path = yaml_path.with_extension("wdb");
+        Self::load_at(yaml_path, &wdb_path)
+    }
 
+    /// 加载词典，使用指定的 .wdb 缓存路径（缓存可与源分离，如放
+    /// `%LOCALAPPDATA%\WindInput\cache`，避免写入只读的安装目录）。
+    pub fn load_at(yaml_path: &Path, wdb_path: &Path) -> anyhow::Result<Self> {
         // 检查缓存是否有效
-        if Self::cache_is_valid(yaml_path, &wdb_path) {
-            match DictReader::open(&wdb_path) {
+        if Self::cache_is_valid(yaml_path, wdb_path) {
+            match DictReader::open(wdb_path) {
                 Ok(reader) => {
                     info!("Using mmap cache: {} ({} keys)", wdb_path.display(), reader.key_count());
                     return Ok(Self::Mmap(reader));
@@ -42,14 +47,17 @@ impl CachedDict {
         let dict = CodetableDict::load(yaml_path)?;
         info!("Loaded yaml: {} ({} entries)", yaml_path.display(), dict.len());
 
-        // 写入 .wdb 缓存
-        if let Err(e) = Self::write_cache(&dict, &wdb_path) {
+        // 确保缓存目录存在后写入 .wdb 缓存
+        if let Some(parent) = wdb_path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        if let Err(e) = Self::write_cache(&dict, wdb_path) {
             warn!("Failed to write .wdb cache: {}", e);
             return Ok(Self::Memory(dict));
         }
 
         // 用 mmap 重新打开缓存
-        match DictReader::open(&wdb_path) {
+        match DictReader::open(wdb_path) {
             Ok(reader) => {
                 info!("Using mmap cache: {} ({} keys)", wdb_path.display(), reader.key_count());
                 Ok(Self::Mmap(reader))

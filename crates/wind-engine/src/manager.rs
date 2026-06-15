@@ -149,9 +149,44 @@ pub struct EngineManager {
     data_dir: Option<std::path::PathBuf>,
 }
 
+/// 进程级缓存根目录（%LOCALAPPDATA%\WindInput\cache），EngineManager::new 设置一次。
+static CACHE_DIR: std::sync::OnceLock<Option<std::path::PathBuf>> = std::sync::OnceLock::new();
+
+/// 源文件 → 缓存 .wdb 路径：放缓存根下（名字含父目录名，避免跨方案同名冲突）；
+/// 未设置缓存根时回退到源旁（保持旧行为，便于测试/无 LOCALAPPDATA 场景）。
+fn cache_path(source: &Path, ext: &str) -> std::path::PathBuf {
+    if let Some(Some(dir)) = CACHE_DIR.get() {
+        let parent = source
+            .parent()
+            .and_then(|p| p.file_name())
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        let stem = source
+            .file_stem()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        let name = if parent.is_empty() {
+            format!("{}.{}", stem, ext)
+        } else {
+            format!("{}_{}.{}", parent, stem, ext)
+        };
+        return dir.join(name);
+    }
+    source.with_extension(ext)
+}
+
 impl EngineManager {
     /// 从配置创建；仅构建活跃方案引擎，其余按需懒加载。
     pub fn new(config: &Config, data_dir: Option<&Path>) -> Self {
+        // 初始化缓存根（一次）：%LOCALAPPDATA%\WindInput\cache，提前建好目录
+        CACHE_DIR.get_or_init(|| {
+            let dir = Config::cache_dir();
+            if let Some(d) = &dir {
+                let _ = std::fs::create_dir_all(d);
+            }
+            dir
+        });
+
         let active_id = config.active_schema().to_string();
         let mut available = config.schema.available.clone();
         if available.is_empty() {
@@ -435,7 +470,7 @@ impl EngineManager {
         use crate::pinyin::lm::{parse_unigram_freqs, MmapUnigram};
         use wind_dict::unigram::{write_unigram_wdb, UnigramReader};
 
-        let ug_wdb = ug_txt.with_extension("wdb");
+        let ug_wdb = cache_path(ug_txt, "wdb");
         // wdb 比 txt 新则直接用；否则从 txt 重建
         let fresh = Self::combined_cache_fresh(&[ug_txt], &ug_wdb);
         if !(ug_wdb.exists() && fresh) {
@@ -503,7 +538,7 @@ impl EngineManager {
             return if dtype(e) == "rime_pinyin" {
                 Self::load_rime_pinyin_dict(&full)
             } else {
-                match CachedDict::load(&full) {
+                match CachedDict::load_at(&full, &cache_path(&full, "wdb")) {
                     Ok(d) => {
                         info!("Dictionary loaded: {} entries", d.len());
                         Some(d)
@@ -521,7 +556,7 @@ impl EngineManager {
             .iter()
             .map(|e| (schemas_dir.join(&e.path), dtype(e)))
             .collect();
-        let combined = sources[0].0.with_extension("combined.wdb");
+        let combined = cache_path(sources[0].0.as_path(), "combined.wdb");
         Self::load_merged_dicts(&sources, &combined)
     }
 

@@ -382,7 +382,8 @@ impl Coordinator {
         // Shadow 规则（与 freq 同目录的 shadow.json）
         let shadow = ShadowStore::new();
         let shadow_path = freq_path.as_ref().map(|p| p.with_file_name("shadow.json"));
-        let toolbar_pos_path = freq_path.as_ref().map(|p| p.with_file_name("toolbar_pos.txt"));
+        // 工具栏位置属本机状态（不随漫游）：放 %LOCALAPPDATA%\WindInput
+        let toolbar_pos_path = Config::local_dir().map(|d| d.join("toolbar_pos.txt"));
         let theme_path = freq_path.as_ref().map(|p| p.with_file_name("theme.txt"));
         let themes_dir = data_dir.map(|d| d.join("themes"));
         // 初始主题名：theme.txt（用户上次选择）> config.ui.theme > "default"

@@ -145,10 +145,16 @@ fn init_logger() {
     let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
 
     // 日志输出到可执行文件同目录的 logs/ 子目录
-    let log_dir = std::env::current_exe()
-        .ok()
-        .and_then(|p| p.parent().map(|d| d.join("logs")))
+    // 日志写入 %LOCALAPPDATA%\WindInput\logs（不随漫游；避免装到 Program Files 时
+    // exe 目录只读导致写入失败）。取不到则回退到 exe 旁 logs。
+    let log_dir = wind_config::Config::log_dir()
+        .or_else(|| {
+            std::env::current_exe()
+                .ok()
+                .and_then(|p| p.parent().map(|d| d.join("logs")))
+        })
         .unwrap_or_else(|| std::path::PathBuf::from("logs"));
+    let _ = std::fs::create_dir_all(&log_dir);
 
     let file_appender = tracing_appender::rolling::daily(&log_dir, "wind_input.log");
     let (file_writer, _guard) = tracing_appender::non_blocking(file_appender);

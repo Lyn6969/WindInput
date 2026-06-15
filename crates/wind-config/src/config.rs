@@ -548,9 +548,36 @@ impl Config {
         Ok(())
     }
 
-    /// 获取用户配置目录
+    /// 应用数据目录名：正式版 `WindInput`；调试变体 `WindInputDebug`
+    /// （隔离调试与正式版的配置/缓存/日志，与 PIPE_SUFFIX 同源于 debug_variant 特性）。
+    pub fn app_dir_name() -> &'static str {
+        if cfg!(feature = "debug_variant") {
+            "WindInputDebug"
+        } else {
+            "WindInput"
+        }
+    }
+
+    /// 获取用户配置目录（漫游 %APPDATA%\<App>）：随用户同步的语言数据
+    /// （config.toml / 词频 / shadow 置顶删词 / 主题选择 / 用户词库）。
     pub fn user_config_dir() -> Option<PathBuf> {
-        dirs::config_dir().map(|d| d.join("WindInput"))
+        dirs::config_dir().map(|d| d.join(Self::app_dir_name()))
+    }
+
+    /// 本机状态目录（%LOCALAPPDATA%\<App>）：不随漫游同步的机器相关数据
+    /// （工具栏位置等）。
+    pub fn local_dir() -> Option<PathBuf> {
+        dirs::data_local_dir().map(|d| d.join(Self::app_dir_name()))
+    }
+
+    /// 缓存目录（%LOCALAPPDATA%\WindInput\cache）：词库 .wdb 等可重建产物。
+    pub fn cache_dir() -> Option<PathBuf> {
+        Self::local_dir().map(|d| d.join("cache"))
+    }
+
+    /// 日志目录（%LOCALAPPDATA%\WindInput\logs）。
+    pub fn log_dir() -> Option<PathBuf> {
+        Self::local_dir().map(|d| d.join("logs"))
     }
 
     /// 获取 data 目录（与可执行文件同目录的 data/）
