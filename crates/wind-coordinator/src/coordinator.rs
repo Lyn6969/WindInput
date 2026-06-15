@@ -106,6 +106,23 @@ const S2T_VARIANTS: [(&str, &str); 4] = [
     ("s2hk", "香港繁体"),
 ];
 
+/// 重启信号通道（对齐 Go restartRequestCh）：菜单"重启服务"→ main 重拉进程。
+static RESTART_TX: std::sync::OnceLock<std::sync::mpsc::Sender<()>> = std::sync::OnceLock::new();
+
+/// 创建重启信号通道，返回接收端（main 在创建协调器前调用并阻塞等待）。
+pub fn restart_signal() -> std::sync::mpsc::Receiver<()> {
+    let (tx, rx) = std::sync::mpsc::channel();
+    let _ = RESTART_TX.set(tx);
+    rx
+}
+
+/// 请求重启服务（菜单触发；向 main 发信号，由 main 释放单例并重拉自身）。
+pub fn request_restart() {
+    if let Some(tx) = RESTART_TX.get() {
+        let _ = tx.send(());
+    }
+}
+
 struct State {
     chinese_mode: bool,
     full_width: bool,
@@ -1528,6 +1545,7 @@ impl Coordinator {
             MenuCmd::ThemeStyle(style) => self.set_theme_style(style),
             MenuCmd::ToggleToolbar => self.toggle_toolbar(),
             MenuCmd::ReloadConfig => self.reload_config(),
+            MenuCmd::RestartService => self.restart_service(),
             MenuCmd::OpenConfigDir
             | MenuCmd::OpenDictionary
             | MenuCmd::OpenSettings
@@ -1630,6 +1648,14 @@ impl Coordinator {
         } else {
             let _ = self.ui_tx.send(UiCommand::HideToolbar);
         }
+    }
+
+    /// 重启服务进程：隐藏 UI 后向 main 发重启信号（main 释放单例并重拉自身）。
+    fn restart_service(&self) {
+        info!("Restart service requested from menu");
+        self.notify_ui_hide();
+        let _ = self.ui_tx.send(UiCommand::HideToolbar);
+        crate::request_restart();
     }
 
     /// 重载配置（best-effort：重新下发当前主题）。
@@ -1765,6 +1791,7 @@ impl Coordinator {
             M::submenu("主题", theme_children),
             M::separator(),
             M::leaf("重载配置", cmd(MenuCmd::ReloadConfig), true, false),
+            M::leaf("重启服务", cmd(MenuCmd::RestartService), true, false),
             M::separator(),
             M::leaf("词库管理...", cmd(MenuCmd::OpenDictionary), true, false),
             M::leaf("设置...", cmd(MenuCmd::OpenSettings), true, false),

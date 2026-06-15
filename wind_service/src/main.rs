@@ -89,7 +89,10 @@ fn main() {
         }
     });
 
-    // 8. 创建中央协调器（传入 PushServer 用于激活状态推送）
+    // 8. 创建重启信号通道（须在协调器创建前，使 request_restart 的发送端就绪）
+    let restart_rx = wind_coordinator::restart_signal();
+
+    // 9. 创建中央协调器（传入 PushServer 用于激活状态推送）
     let coordinator = wind_coordinator::Coordinator::new(push_server.clone());
     deferred.set_ready(coordinator);
 
@@ -98,10 +101,43 @@ fn main() {
         PIPE_SUFFIX, PIPE_SUFFIX
     );
 
-    // 9. 阻塞主线程
-    // TODO: 监听退出信号（如 Ctrl+C 或 Windows 消息）
-    loop {
-        std::thread::park();
+    // 10. 阻塞主线程，直到菜单触发"重启服务"
+    match restart_rx.recv() {
+        Ok(()) => {
+            info!("Restart requested, relaunching service...");
+            // 先释放单例 Named Mutex（关闭句柄），让新实例可获取所有权，避免竞争
+            drop(_singleton_guard);
+            relaunch_self();
+            std::process::exit(0);
+        }
+        Err(_) => loop {
+            // 通道断开（不应发生）：退回挂起
+            std::thread::park();
+        },
+    }
+}
+
+/// 以分离子进程重新启动自身（用于"重启服务"）。
+#[cfg(windows)]
+fn relaunch_self() {
+    use std::os::windows::process::CommandExt;
+    const DETACHED_PROCESS: u32 = 0x0000_0008;
+    const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
+    if let Ok(exe) = std::env::current_exe() {
+        match std::process::Command::new(&exe)
+            .creation_flags(DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP)
+            .spawn()
+        {
+            Ok(_) => info!("Relaunched: {}", exe.display()),
+            Err(e) => error!("Failed to relaunch: {}", e),
+        }
+    }
+}
+
+#[cfg(not(windows))]
+fn relaunch_self() {
+    if let Ok(exe) = std::env::current_exe() {
+        let _ = std::process::Command::new(exe).spawn();
     }
 }
 

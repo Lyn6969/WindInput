@@ -116,6 +116,8 @@ pub enum MenuCmd {
     ToggleToolbar,
     /// 重载配置
     ReloadConfig,
+    /// 重启服务进程
+    RestartService,
     /// 打开配置目录
     OpenConfigDir,
     /// 词库管理（暂兜底为打开配置目录）

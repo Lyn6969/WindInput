@@ -20,4 +20,4 @@ pub mod reverse;
 pub mod stats;
 pub mod watchdog;
 
-pub use coordinator::Coordinator;
+pub use coordinator::{request_restart, restart_signal, Coordinator};
