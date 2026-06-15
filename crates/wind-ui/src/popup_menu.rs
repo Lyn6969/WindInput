@@ -1,8 +1,9 @@
 //! 弹出菜单（右键候选菜单 + 功能主菜单）
 //!
-//! 与 Go 版本 `wind_input/internal/ui/popup_menu.go` + `unified_menu_build.go` 对齐（简化）。
-//! 单窗口下钻式子菜单（栈 + "‹ 返回"）、✓ 勾选态、▶ 子菜单标识；
-//! 鼠标本地悬停/点击，键盘经协调器 MenuKey 转发。UI 自管导航，仅把最终动作回送协调器。
+//! 标准多级级联菜单：父面板常驻，悬停带 ▶ 的项时子菜单作为独立窗口在右侧弹出，可层层展开。
+//! 仿 Win32 原生菜单：只在根窗口 SetCapture 一次，捕获后所有鼠标消息以根窗口客户区坐标投递，
+//! 再用屏幕坐标对各级面板命中测试。逻辑（结构变更）集中在 MenuState（wnd_proc 侧），
+//! 窗口协调（渲染/定位/隐藏多余窗口）在 PopupMenu.tick() 侧。键盘经协调器 MenuKey 转发。
 
 use std::cell::RefCell;
 use std::rc::Rc;
@@ -32,147 +33,244 @@ const BORDER: [u8; 4] = [205, 205, 208, 230];
 const SEP: [u8; 4] = [228, 228, 230, 255];
 const HL_BG: [u8; 4] = [225, 236, 252, 255];
 
-/// 一个可渲染/可交互行的动作
-enum RowAction {
-    Back,
-    Separator,
-    Leaf(MenuKind),
-    Drill(usize), // 进入 当前层 items[idx] 的子菜单
-}
+/// 无选中哨兵
+const NONE_SEL: usize = usize::MAX;
 
-/// 渲染行（含勾选/子菜单标识）
-struct Row {
-    label: String,
-    checked: bool,
-    has_children: bool,
-    enabled: bool,
-    action: RowAction,
-}
-
-/// 菜单交互状态（与 wnd_proc 共享）。鼠标处理与键盘导航都改这里，dirty 触发重绘。
-struct MenuState {
-    /// 菜单层级栈（last = 当前层）
-    stack: Vec<Vec<MenuItemSpec>>,
-    /// 当前层渲染行（render 时由 PopupMenu 计算写入）
-    rows: Vec<Row>,
-    /// 当前层命中矩形 (行下标, 矩形)
-    item_rects: Vec<(usize, Rect)>,
-    /// 高亮行
+/// 一个打开的菜单层级
+struct Level {
+    /// 本层菜单项（内容源）
+    items: Vec<MenuItemSpec>,
+    /// 高亮行（== item 下标；NONE_SEL = 无）
     selected: usize,
-    /// 需要重绘
+    /// 屏幕坐标左上角（由 PopupMenu 渲染后写回）
+    origin: (i32, i32),
+    /// 窗口尺寸
+    size: (u32, u32),
+    /// 命中矩形 (item 下标, 窗口局部矩形)
+    item_rects: Vec<(usize, Rect)>,
+}
+
+impl Level {
+    fn new(items: Vec<MenuItemSpec>, selected: usize) -> Self {
+        Self {
+            items,
+            selected,
+            origin: (0, 0),
+            size: (0, 0),
+            item_rects: Vec::new(),
+        }
+    }
+}
+
+fn is_separator(it: &MenuItemSpec) -> bool {
+    matches!(it.kind, MenuKind::Separator)
+}
+fn is_submenu(it: &MenuItemSpec) -> bool {
+    matches!(it.kind, MenuKind::Submenu)
+}
+fn selectable(it: &MenuItemSpec) -> bool {
+    !is_separator(it) && it.enabled
+}
+
+fn first_selectable(items: &[MenuItemSpec]) -> usize {
+    items
+        .iter()
+        .position(selectable)
+        .unwrap_or(NONE_SEL)
+}
+
+/// 菜单交互状态（与 wnd_proc 共享）。只做结构变更，dirty 触发 PopupMenu 协调重绘。
+struct MenuState {
+    /// 打开的层级链（last = 最深/当前活动层）
+    levels: Vec<Level>,
+    /// 根窗口（捕获窗口）屏幕原点，用于把客户坐标换算回屏幕坐标
+    capture_origin: (i32, i32),
+    /// 需要重新协调/重绘
     dirty: bool,
     /// 请求关闭
     closed: bool,
     events: Sender<UiEvent>,
-    last_cursor: (i32, i32),
 }
 
 impl MenuState {
-    fn cur_depth(&self) -> usize {
-        self.stack.len()
+    fn screen(&self, x: i32, y: i32) -> (i32, i32) {
+        (self.capture_origin.0 + x, self.capture_origin.1 + y)
     }
 
-    /// 移动高亮到下一个可选行（跳过分隔），dir=±1。
-    fn move_sel(&mut self, dir: i32) {
-        let n = self.rows.len();
+    /// 屏幕坐标命中：从最深层往外找。返回 (层下标, Some(行) | None=面板空白)。
+    fn find_hit(&self, sx: i32, sy: i32) -> Option<(usize, Option<usize>)> {
+        for k in (0..self.levels.len()).rev() {
+            let lv = &self.levels[k];
+            let (ox, oy) = lv.origin;
+            let (w, h) = lv.size;
+            if sx >= ox && sx < ox + w as i32 && sy >= oy && sy < oy + h as i32 {
+                let lx = (sx - ox) as f32;
+                let ly = (sy - oy) as f32;
+                for (row, r) in &lv.item_rects {
+                    if r.contains(lx, ly) {
+                        return Some((k, Some(*row)));
+                    }
+                }
+                return Some((k, None));
+            }
+        }
+        None
+    }
+
+    /// 压入 levels[k].selected 指向的子菜单。focus=true 时聚焦首个可选项（键盘）。
+    fn open_child(&mut self, k: usize, focus: bool) {
+        let sel = self.levels[k].selected;
+        if sel == NONE_SEL {
+            return;
+        }
+        let children = match self.levels[k].items.get(sel) {
+            Some(it) if is_submenu(it) => it.children.clone(),
+            _ => return,
+        };
+        let child_sel = if focus {
+            first_selectable(&children)
+        } else {
+            NONE_SEL
+        };
+        self.levels.push(Level::new(children, child_sel));
+        self.dirty = true;
+    }
+
+    /// 鼠标悬停到 (层 k, 行 r)：更新高亮、收起更深层、必要时展开子菜单。
+    fn hover(&mut self, k: usize, r: usize) {
+        let (ok, sub) = match self.levels[k].items.get(r) {
+            Some(it) => (selectable(it), is_submenu(it)),
+            None => return,
+        };
+        if !ok {
+            return;
+        }
+        if self.levels[k].selected != r {
+            self.levels[k].selected = r;
+            self.levels.truncate(k + 1);
+            self.dirty = true;
+        }
+        // 子菜单尚未展开则展开（子层 selected=NONE，避免递归自动深入）
+        if sub && self.levels.len() == k + 1 {
+            self.open_child(k, false);
+        }
+    }
+
+    /// 鼠标点击 (层 k, 行 r)。
+    fn click(&mut self, k: usize, r: usize) {
+        let (ok, sub, kind) = match self.levels[k].items.get(r) {
+            Some(it) => (selectable(it), is_submenu(it), it.kind),
+            None => return,
+        };
+        if !ok {
+            return;
+        }
+        if self.levels[k].selected != r {
+            self.levels[k].selected = r;
+            self.levels.truncate(k + 1);
+        }
+        if sub {
+            if self.levels.len() == k + 1 {
+                self.open_child(k, false);
+            }
+        } else {
+            let _ = self.events.send(UiEvent::MenuAction(kind));
+            self.closed = true;
+        }
+    }
+
+    /// 在某层移动高亮（跳过分隔/禁用），dir=±1。
+    fn move_sel(&mut self, k: usize, dir: i32) {
+        let n = self.levels[k].items.len();
         if n == 0 {
             return;
         }
-        let mut i = self.selected as i32;
+        let cur = self.levels[k].selected;
+        let mut i = if cur == NONE_SEL {
+            if dir > 0 {
+                -1
+            } else {
+                0
+            }
+        } else {
+            cur as i32
+        };
         for _ in 0..n {
             i = (i + dir).rem_euclid(n as i32);
-            let idx = i as usize;
-            if !matches!(self.rows[idx].action, RowAction::Separator) && self.rows[idx].enabled {
-                self.selected = idx;
+            if selectable(&self.levels[k].items[i as usize]) {
+                self.levels[k].selected = i as usize;
                 self.dirty = true;
                 return;
             }
         }
     }
 
-    fn first_selectable(&self) -> usize {
-        self.rows
-            .iter()
-            .position(|r| !matches!(r.action, RowAction::Separator) && r.enabled)
-            .unwrap_or(0)
+    fn deepest(&self) -> usize {
+        self.levels.len().saturating_sub(1)
     }
 
-    /// 激活某行：下钻/返回/触发动作/关闭。
-    fn activate(&mut self, row: usize) {
-        let Some(r) = self.rows.get(row) else { return };
-        if !r.enabled {
-            return;
-        }
-        match &r.action {
-            RowAction::Back => self.pop_level(),
-            RowAction::Separator => {}
-            RowAction::Drill(idx) => {
-                if let Some(children) =
-                    self.stack.last().and_then(|lvl| lvl.get(*idx)).map(|it| it.children.clone())
-                {
-                    self.stack.push(children);
-                    self.selected = self.first_selectable_for_top();
-                    self.dirty = true;
-                }
-            }
-            RowAction::Leaf(kind) => {
-                let _ = self.events.send(UiEvent::MenuAction(*kind));
-                self.closed = true;
-            }
+    // —— 键盘动作（都作用于最深活动层）——
+    fn key_up(&mut self) {
+        let k = self.deepest();
+        self.move_sel(k, -1);
+    }
+    fn key_down(&mut self) {
+        let k = self.deepest();
+        self.move_sel(k, 1);
+    }
+    fn key_right(&mut self) {
+        let k = self.deepest();
+        let sel = self.levels[k].selected;
+        if sel != NONE_SEL
+            && self.levels[k].items.get(sel).map_or(false, is_submenu)
+            && self.levels.len() == k + 1
+        {
+            self.open_child(k, true);
         }
     }
-
-    fn pop_level(&mut self) {
-        if self.stack.len() > 1 {
-            self.stack.pop();
-            self.selected = 0;
+    fn key_left(&mut self) {
+        if self.levels.len() > 1 {
+            self.levels.pop();
             self.dirty = true;
         } else {
-            self.closed = true;
-            let _ = self.events.send(UiEvent::MenuClose);
+            self.close();
         }
     }
-
-    /// 进入当前层 rows[selected] 若为子菜单。
-    fn enter_submenu(&mut self) {
-        if let Some(r) = self.rows.get(self.selected) {
-            if r.has_children {
-                let row = self.selected;
-                self.activate(row);
-            }
+    fn key_enter(&mut self) {
+        let k = self.deepest();
+        let sel = self.levels[k].selected;
+        if sel == NONE_SEL {
+            return;
         }
-    }
-
-    // 子菜单刚 push 后还没 render rows，无法用 rows 求首项；用 stack 顶估计（含返回项偏移 1）。
-    fn first_selectable_for_top(&self) -> usize {
-        let lvl = match self.stack.last() {
-            Some(l) => l,
-            None => return 0,
+        let Some(it) = self.levels[k].items.get(sel) else {
+            return;
         };
-        let back = if self.stack.len() > 1 { 1 } else { 0 };
-        for (i, it) in lvl.iter().enumerate() {
-            if !matches!(it.kind, MenuKind::Separator) && it.enabled {
-                return back + i;
+        if is_submenu(it) {
+            if self.levels.len() == k + 1 {
+                self.open_child(k, true);
             }
+        } else if selectable(it) {
+            let kind = it.kind;
+            let _ = self.events.send(UiEvent::MenuAction(kind));
+            self.closed = true;
         }
-        back
     }
 
-    fn hit(&self, x: f32, y: f32) -> Option<usize> {
-        self.item_rects
-            .iter()
-            .find(|(_, r)| r.contains(x, y))
-            .map(|(i, _)| *i)
+    fn close(&mut self) {
+        self.closed = true;
+        let _ = self.events.send(UiEvent::MenuClose);
     }
 }
 
-/// 弹出菜单窗口
+/// 弹出菜单窗口（级联，窗口池按需增长）
 pub struct PopupMenu {
-    window: LayeredWindow,
+    windows: Vec<LayeredWindow>,
     renderer: TextRenderer,
     scale: f32,
     state: Rc<RefCell<MenuState>>,
     visible: bool,
+    /// 根面板锚点（已钳制到工作区）
+    anchor: (i32, i32),
     bg: [u8; 4],
     fg: [u8; 4],
     disabled: [u8; 4],
@@ -184,32 +282,41 @@ pub struct PopupMenu {
 impl PopupMenu {
     pub fn new(events: Sender<UiEvent>) -> Result<Self, String> {
         let scale = dpi_scale();
-        let window = LayeredWindow::create(None, 160, 120, "WindInputPopupMenu")?;
         let renderer = TextRenderer::new("Microsoft YaHei UI", FONT_PX * scale)?;
         let state = Rc::new(RefCell::new(MenuState {
-            stack: Vec::new(),
-            rows: Vec::new(),
-            item_rects: Vec::new(),
-            selected: 0,
+            levels: Vec::new(),
+            capture_origin: (0, 0),
             dirty: false,
             closed: false,
             events,
-            last_cursor: (i32::MIN, i32::MIN),
         }));
-        window.register_mouse(state.clone());
-        Ok(Self {
-            window,
+        let mut menu = Self {
+            windows: Vec::new(),
             renderer,
             scale,
             state,
             visible: false,
+            anchor: (0, 0),
             bg: BG,
             fg: FG,
             disabled: DISABLED,
             border: BORDER,
             sep: SEP,
             hl_bg: HL_BG,
-        })
+        };
+        // 预创建根窗口并绑定鼠标处理器（捕获后只有根窗口收消息）
+        menu.ensure_windows(1)?;
+        Ok(menu)
+    }
+
+    /// 确保窗口池至少有 n 个窗口（新窗口绑定共享 MenuState 处理器）。
+    fn ensure_windows(&mut self, n: usize) -> Result<(), String> {
+        while self.windows.len() < n {
+            let w = LayeredWindow::create(None, 160, 120, "WindInputPopupMenu")?;
+            w.register_mouse(self.state.clone());
+            self.windows.push(w);
+        }
+        Ok(())
     }
 
     /// 应用主题（菜单各色）。
@@ -227,16 +334,12 @@ impl PopupMenu {
         if items.is_empty() {
             return;
         }
-        {
-            let mut st = self.state.borrow_mut();
-            st.stack = vec![items];
-            st.selected = st.first_selectable_for_top();
-            st.dirty = false;
-            st.closed = false;
-            st.last_cursor = (i32::MIN, i32::MIN);
+        if self.ensure_windows(1).is_err() {
+            return;
         }
-        let (w, h) = self.render();
-
+        let sel = first_selectable(&items);
+        // 先测量根面板尺寸以钳制锚点
+        let (_root, w, h, _hits) = self.build_view(&items, sel);
         let (ax, ay) = if x == i32::MIN || y == i32::MIN {
             let mut p = POINT::default();
             unsafe {
@@ -246,15 +349,21 @@ impl PopupMenu {
         } else {
             (x, y)
         };
-        let (px, py) = clamp_to_work_area(ax, ay, w, h);
-        self.window.show(px, py);
+        self.anchor = clamp_to_work_area(ax, ay, w, h);
+        {
+            let mut st = self.state.borrow_mut();
+            st.levels = vec![Level::new(items, sel)];
+            st.dirty = false;
+            st.closed = false;
+        }
+        self.reconcile();
         self.visible = true;
         unsafe {
-            SetCapture(self.window.hwnd());
+            SetCapture(self.windows[0].hwnd());
         }
     }
 
-    /// UI 循环每轮调用：脏则重绘；请求关闭则隐藏。
+    /// UI 循环每轮调用：脏则协调重绘；请求关闭则隐藏。
     pub fn tick(&mut self) {
         if !self.visible {
             return;
@@ -269,7 +378,7 @@ impl PopupMenu {
         }
         if dirty {
             self.state.borrow_mut().dirty = false;
-            self.render();
+            self.reconcile();
         }
     }
 
@@ -278,52 +387,110 @@ impl PopupMenu {
         if !self.visible {
             return;
         }
-        match key {
-            0x26 => self.state.borrow_mut().move_sel(-1), // Up
-            0x28 => self.state.borrow_mut().move_sel(1),  // Down
-            0x27 => self.state.borrow_mut().enter_submenu(), // Right
-            0x25 | 0x1B => {
-                // Left / ESC：返回上层或关闭
-                self.state.borrow_mut().pop_level();
+        {
+            let mut st = self.state.borrow_mut();
+            match key {
+                0x26 => st.key_up(),               // Up
+                0x28 => st.key_down(),             // Down
+                0x27 => st.key_right(),            // Right → 展开子菜单
+                0x25 => st.key_left(),             // Left → 收起/返回
+                0x1B => st.close(),                // ESC → 关闭
+                0x0D | 0x20 => st.key_enter(),     // Enter / Space → 激活
+                _ => {}
             }
-            0x0D | 0x20 => {
-                // Enter / Space：激活当前
-                let sel = self.state.borrow().selected;
-                self.state.borrow_mut().activate(sel);
-            }
-            _ => {}
         }
         self.tick();
     }
 
-    /// 渲染当前层，返回 (宽,高)。计算 rows + item_rects 写回 state。
-    fn render(&mut self) -> (u32, u32) {
+    /// 协调窗口：按当前 levels 渲染/定位每一级，隐藏多余窗口，写回几何。
+    fn reconcile(&mut self) {
+        // 快照内容，避免渲染期间持有 state 借用
+        let snap: Vec<(Vec<MenuItemSpec>, usize)> = {
+            let st = self.state.borrow();
+            st.levels.iter().map(|l| (l.items.clone(), l.selected)).collect()
+        };
+        if snap.is_empty() {
+            return;
+        }
+        if self.ensure_windows(snap.len()).is_err() {
+            return;
+        }
+
+        // 逐级渲染并定位：(origin_x, origin_y, w, h, item_rects)
+        let mut geom: Vec<(i32, i32, u32, u32, Vec<(usize, Rect)>)> = Vec::with_capacity(snap.len());
+        for k in 0..snap.len() {
+            let (items, selected) = &snap[k];
+            let (root, w, h, hits) = self.build_view(items, *selected);
+            let origin = if k == 0 {
+                self.anchor
+            } else {
+                let (pox, poy, pw, ph, prects) = &geom[k - 1];
+                let psel = snap[k - 1].1;
+                let prect = prects.iter().find(|(i, _)| *i == psel).map(|(_, r)| *r);
+                place_child((*pox, *poy), (*pw, *ph), prect, (w, h), self.scale)
+            };
+            // 绘制到窗口 k（拆分字段借用：renderer 与 windows 是不同字段，可并存）
+            {
+                let r = &self.renderer;
+                let win = &mut self.windows[k];
+                win.resize(w, h);
+                let buf = win.buffer_mut();
+                let n = (w * h * 4) as usize;
+                buf[..n].fill(0);
+                root.paint(buf, w, h, r);
+                let _ = win.update();
+                win.show(origin.0, origin.1);
+            }
+            geom.push((origin.0, origin.1, w, h, hits));
+        }
+
+        // 隐藏多余窗口
+        for k in snap.len()..self.windows.len() {
+            self.windows[k].hide();
+        }
+
+        // 写回几何
+        {
+            let mut st = self.state.borrow_mut();
+            for (k, (ox, oy, w, h, rects)) in geom.into_iter().enumerate() {
+                if let Some(l) = st.levels.get_mut(k) {
+                    l.origin = (ox, oy);
+                    l.size = (w, h);
+                    l.item_rects = rects;
+                }
+            }
+            st.capture_origin = st.levels.first().map(|l| l.origin).unwrap_or((0, 0));
+        }
+    }
+
+    /// 构建一层菜单的视图，返回 (根视图, 宽, 高, 命中矩形)。
+    fn build_view(
+        &self,
+        items: &[MenuItemSpec],
+        selected: usize,
+    ) -> (View, u32, u32, Vec<(usize, Rect)>) {
         let s = self.scale;
         let item_h = (FONT_PX * 1.9 * s).ceil();
         let pad = Edges::xy(12.0 * s, 4.0 * s);
 
-        // 计算行
-        let rows = self.compute_rows();
-
         // 统一项宽 = 最长行 + 内边距
         let mut max_label = 0.0f32;
-        for r in &rows {
-            if !matches!(r.action, RowAction::Separator) {
-                let w = self.renderer.measure_text(&self.row_text(r)).width;
+        for it in items {
+            if !is_separator(it) {
+                let w = self.renderer.measure_text(&row_text(it)).width;
                 max_label = max_label.max(w);
             }
         }
         let item_w = (max_label + pad.l + pad.r).max(90.0 * s);
 
-        let selected = self.state.borrow().selected;
         let mut root = View::container(Layout::Column)
             .bg(self.bg)
             .border(self.border, 1.0)
             .radius(6.0 * s)
             .pad(Edges::all(4.0 * s));
 
-        for (i, r) in rows.iter().enumerate() {
-            if matches!(r.action, RowAction::Separator) {
+        for (i, it) in items.iter().enumerate() {
+            if is_separator(it) {
                 root = root.child(
                     View::container(Layout::Row)
                         .fixed_w(item_w)
@@ -333,7 +500,7 @@ impl PopupMenu {
                 );
                 continue;
             }
-            let color = if r.enabled { self.fg } else { self.disabled };
+            let color = if it.enabled { self.fg } else { self.disabled };
             let mut item = View::container(Layout::Row)
                 .fixed_w(item_w)
                 .fixed_h(item_h)
@@ -341,8 +508,8 @@ impl PopupMenu {
                 .radius(4.0 * s)
                 .cross(Align::Center)
                 .tag(i as i32)
-                .child(View::leaf(self.row_text(r), color));
-            if i == selected && r.enabled {
+                .child(View::leaf(row_text(it), color));
+            if i == selected && it.enabled {
                 item = item.bg(self.hl_bg);
             }
             root = root.child(item);
@@ -355,88 +522,24 @@ impl PopupMenu {
 
         let mut hits = Vec::new();
         root.collect_hits(&mut hits);
+        let item_rects: Vec<(usize, Rect)> = hits.iter().map(|(t, r)| (*t as usize, *r)).collect();
 
-        self.window.resize(width, height);
-        {
-            let buf = self.window.buffer_mut();
-            let n = (width * height * 4) as usize;
-            buf[..n].fill(0);
-            root.paint(buf, width, height, &self.renderer);
-        }
-        let _ = self.window.update();
-
-        // 写回 state
-        {
-            let mut st = self.state.borrow_mut();
-            st.item_rects = hits.iter().map(|(t, r)| (*t as usize, *r)).collect();
-            st.rows = rows;
-        }
-        (width, height)
-    }
-
-    /// 行显示文本：勾选前缀 + 标签 + 子菜单箭头。
-    fn row_text(&self, r: &Row) -> String {
-        let mark = if r.checked { "✓ " } else { "   " };
-        let arrow = if r.has_children { "  ▶" } else { "" };
-        format!("{}{}{}", mark, r.label, arrow)
-    }
-
-    /// 由当前层 items 计算行（含 "‹ 返回"）。
-    fn compute_rows(&self) -> Vec<Row> {
-        let st = self.state.borrow();
-        let lvl = match st.stack.last() {
-            Some(l) => l,
-            None => return Vec::new(),
-        };
-        let mut rows = Vec::new();
-        if st.stack.len() > 1 {
-            rows.push(Row {
-                label: "‹ 返回".into(),
-                checked: false,
-                has_children: false,
-                enabled: true,
-                action: RowAction::Back,
-            });
-        }
-        for (i, it) in lvl.iter().enumerate() {
-            match it.kind {
-                MenuKind::Separator => rows.push(Row {
-                    label: String::new(),
-                    checked: false,
-                    has_children: false,
-                    enabled: false,
-                    action: RowAction::Separator,
-                }),
-                MenuKind::Submenu => rows.push(Row {
-                    label: it.label.clone(),
-                    checked: it.checked,
-                    has_children: true,
-                    enabled: it.enabled,
-                    action: RowAction::Drill(i),
-                }),
-                kind => rows.push(Row {
-                    label: it.label.clone(),
-                    checked: it.checked,
-                    has_children: false,
-                    enabled: it.enabled,
-                    action: RowAction::Leaf(kind),
-                }),
-            }
-        }
-        rows
+        (root, width, height, item_rects)
     }
 
     pub fn hide(&mut self) {
         if self.visible {
             unsafe {
                 let _ = ReleaseCapture();
-                let _ = ShowWindow(self.window.hwnd(), SW_HIDE);
+            }
+            for w in &self.windows {
+                unsafe {
+                    let _ = ShowWindow(w.hwnd(), SW_HIDE);
+                }
             }
             self.visible = false;
             let mut st = self.state.borrow_mut();
-            st.stack.clear();
-            st.rows.clear();
-            st.item_rects.clear();
+            st.levels.clear();
             st.closed = false;
             st.dirty = false;
         }
@@ -445,6 +548,13 @@ impl PopupMenu {
     pub fn is_visible(&self) -> bool {
         self.visible
     }
+}
+
+/// 行显示文本：勾选前缀 + 标签 + 子菜单箭头。
+fn row_text(it: &MenuItemSpec) -> String {
+    let mark = if it.checked { "✓ " } else { "   " };
+    let arrow = if is_submenu(it) { "  ▶" } else { "" };
+    format!("{}{}{}", mark, it.label, arrow)
 }
 
 impl WindowMouse for MenuState {
@@ -456,32 +566,26 @@ impl WindowMouse for MenuState {
         lparam: LPARAM,
     ) -> Option<LRESULT> {
         let v = lparam.0 as u32;
-        let x = (v & 0xFFFF) as i16 as f32;
-        let y = ((v >> 16) & 0xFFFF) as i16 as f32;
+        let x = (v & 0xFFFF) as i16 as i32;
+        let y = ((v >> 16) & 0xFFFF) as i16 as i32;
+        let (sx, sy) = self.screen(x, y);
         match msg {
             WM_MOUSEMOVE => {
-                if let Some(i) = self.hit(x, y) {
-                    if self.selected != i && self.rows.get(i).map_or(false, |r| r.enabled) {
-                        self.selected = i;
-                        self.dirty = true;
-                    }
+                if let Some((k, Some(r))) = self.find_hit(sx, sy) {
+                    self.hover(k, r);
                 }
                 Some(LRESULT(0))
             }
             WM_LBUTTONDOWN => {
-                match self.hit(x, y) {
-                    Some(i) => self.activate(i),
-                    None => {
-                        // 点击菜单外 → 关闭
-                        self.closed = true;
-                        let _ = self.events.send(UiEvent::MenuClose);
-                    }
+                match self.find_hit(sx, sy) {
+                    Some((k, Some(r))) => self.click(k, r),
+                    Some((_, None)) => {} // 面板空白处：忽略
+                    None => self.close(),  // 菜单外 → 关闭
                 }
                 Some(LRESULT(0))
             }
             WM_RBUTTONDOWN => {
-                self.closed = true;
-                let _ = self.events.send(UiEvent::MenuClose);
+                self.close();
                 Some(LRESULT(0))
             }
             WM_SETCURSOR => {
@@ -542,8 +646,8 @@ fn dpi_scale() -> f32 {
     }
 }
 
-/// 将菜单钳制在光标所在显示器工作区内（右/下溢出贴边）。
-fn clamp_to_work_area(x: i32, y: i32, w: u32, h: u32) -> (i32, i32) {
+/// 取某屏幕点所在显示器的工作区矩形 (left, top, right, bottom)。
+fn work_area_of(x: i32, y: i32) -> Option<(i32, i32, i32, i32)> {
     #[cfg(windows)]
     {
         use windows::Win32::Graphics::Gdi::{
@@ -558,23 +662,68 @@ fn clamp_to_work_area(x: i32, y: i32, w: u32, h: u32) -> (i32, i32) {
             };
             if GetMonitorInfoW(mon, &mut mi).as_bool() {
                 let wa = mi.rcWork;
-                let (wi, hi) = (w as i32, h as i32);
-                let mut nx = x;
-                let mut ny = y;
-                if nx + wi > wa.right {
-                    nx = wa.right - wi;
-                }
-                if ny + hi > wa.bottom {
-                    ny = (y - hi).max(wa.top);
-                }
-                if nx < wa.left {
-                    nx = wa.left;
-                }
-                if ny < wa.top {
-                    ny = wa.top;
-                }
-                return (nx, ny);
+                return Some((wa.left, wa.top, wa.right, wa.bottom));
             }
+        }
+    }
+    let _ = (x, y);
+    None
+}
+
+/// 将菜单钳制在光标所在显示器工作区内（右/下溢出贴边）。
+fn clamp_to_work_area(x: i32, y: i32, w: u32, h: u32) -> (i32, i32) {
+    if let Some((left, top, right, bottom)) = work_area_of(x, y) {
+        let (wi, hi) = (w as i32, h as i32);
+        let mut nx = x;
+        let mut ny = y;
+        if nx + wi > right {
+            nx = right - wi;
+        }
+        if ny + hi > bottom {
+            ny = (y - hi).max(top);
+        }
+        if nx < left {
+            nx = left;
+        }
+        if ny < top {
+            ny = top;
+        }
+        return (nx, ny);
+    }
+    (x, y)
+}
+
+/// 子菜单定位：默认贴父面板右侧、纵向对齐父高亮项；右溢出则翻到左侧；最后钳制工作区。
+fn place_child(
+    parent_origin: (i32, i32),
+    parent_size: (u32, u32),
+    parent_item: Option<Rect>,
+    child_size: (u32, u32),
+    scale: f32,
+) -> (i32, i32) {
+    let (pox, poy) = parent_origin;
+    let (pw, _ph) = parent_size;
+    let (cw, ch) = (child_size.0 as i32, child_size.1 as i32);
+    let overlap = (3.0 * scale) as i32;
+    let pad_top = (4.0 * scale) as i32;
+
+    let item_top = parent_item.map(|r| r.y as i32).unwrap_or(0);
+    let mut x = pox + pw as i32 - overlap;
+    let mut y = poy + item_top - pad_top;
+
+    if let Some((left, top, right, bottom)) = work_area_of(pox, poy) {
+        // 右侧放不下 → 翻到父面板左侧
+        if x + cw > right {
+            x = pox - cw + overlap;
+        }
+        if x < left {
+            x = left;
+        }
+        if y + ch > bottom {
+            y = bottom - ch;
+        }
+        if y < top {
+            y = top;
         }
     }
     (x, y)
