@@ -2,12 +2,16 @@
 # 用法: .\dev.ps1 或 powershell -File dev.ps1
 
 $ErrorActionPreference = "Stop"
-# 脚本现位于 scripts/ 子目录，工程根为其父目录
+# 目录层级: <产品仓>\wind_input\scripts\dev.ps1
+#   ProjectRoot = wind_input    (Cargo workspace 根)
+#   ProductRoot = WindInput (产品仓根, 含 docs\VERSION 等共享资产)
 $ProjectRoot = Split-Path $PSScriptRoot -Parent
-$Version = (Get-Content "$ProjectRoot\docs\VERSION" -Raw).Trim()
+$ProductRoot = Split-Path $ProjectRoot -Parent
+$Version = (Get-Content "$ProductRoot\docs\VERSION" -Raw).Trim()
 $BuildDir = "$ProjectRoot\build"
 $BuildDebugDir = "$ProjectRoot\build_debug"
-$GoRepoRoot = Split-Path $ProjectRoot -Parent
+# Go 仓库与产品仓同级
+$GoRepoRoot = Split-Path $ProductRoot -Parent
 
 function Show-Menu {
     Clear-Host

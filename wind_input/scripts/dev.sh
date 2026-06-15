@@ -27,14 +27,18 @@
 set -o pipefail
 
 # ---------- 路径 ----------
-# 脚本位于 scripts/ 子目录, 工程根为其父目录
+# 目录层级: <产品仓>/wind_input/scripts/dev.sh
+#   SCRIPT_DIR   = wind_input/scripts
+#   PROJECT_ROOT = wind_input        (Cargo workspace 根)
+#   PRODUCT_ROOT = WindInput     (产品仓根, 含 docs/VERSION 等共享资产)
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(dirname "$SCRIPT_DIR")"
-VERSION="$(tr -d '[:space:]' < "$PROJECT_ROOT/docs/VERSION" 2>/dev/null || echo '?')"
+PRODUCT_ROOT="$(dirname "$PROJECT_ROOT")"
+VERSION="$(tr -d '[:space:]' < "$PRODUCT_ROOT/docs/VERSION" 2>/dev/null || echo '?')"
 BUILD_DIR="$PROJECT_ROOT/build"
 BUILD_DEBUG_DIR="$PROJECT_ROOT/build_debug"
-# Go 仓库与本工程同级: windinput/WindInput
-GO_REPO="$(dirname "$PROJECT_ROOT")/WindInput"
+# Go 仓库与产品仓同级: windinput/WindInput
+GO_REPO="$(dirname "$PRODUCT_ROOT")/WindInput"
 
 TARGET="x86_64-pc-windows-gnu"
 
