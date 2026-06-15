@@ -2,8 +2,9 @@
 # 用法: .\dev.ps1 或 powershell -File dev.ps1
 
 $ErrorActionPreference = "Stop"
-$ProjectRoot = $PSScriptRoot
-$Version = (Get-Content "$ProjectRoot\VERSION" -Raw).Trim()
+# 脚本现位于 scripts/ 子目录，工程根为其父目录
+$ProjectRoot = Split-Path $PSScriptRoot -Parent
+$Version = (Get-Content "$ProjectRoot\docs\VERSION" -Raw).Trim()
 $BuildDir = "$ProjectRoot\build"
 $BuildDebugDir = "$ProjectRoot\build_debug"
 $GoRepoRoot = Split-Path $ProjectRoot -Parent

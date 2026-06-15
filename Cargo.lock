@@ -2085,7 +2085,6 @@ dependencies = [
  "anyhow",
  "dirs",
  "serde",
- "serde_yaml",
  "thiserror",
  "toml",
  "tracing",
@@ -2231,7 +2230,6 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "serde",
- "serde_yaml",
  "tokio",
  "toml",
  "tracing",

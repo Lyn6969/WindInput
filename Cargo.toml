@@ -13,8 +13,8 @@ members = [
     "crates/wind-ui",
     "crates/wind-cmdbar",
     "crates/wind-coordinator",
-    "wind_service",
-    "wind_rpc",
+    "apps/service",
+    "apps/rpc",
 ]
 
 [workspace.package]

@@ -12,15 +12,15 @@ default = []
 debug_variant = ["wind-config/debug_variant"]
 
 [dependencies]
-wind-ipc = { path = "../crates/wind-ipc" }
-wind-coordinator = { path = "../crates/wind-coordinator" }
-wind-bridge = { path = "../crates/wind-bridge" }
-wind-config = { path = "../crates/wind-config" }
-wind-store = { path = "../crates/wind-store" }
-wind-dict = { path = "../crates/wind-dict" }
-wind-engine = { path = "../crates/wind-engine" }
-wind-ui = { path = "../crates/wind-ui" }
-wind-theme = { path = "../crates/wind-theme" }
+wind-ipc = { path = "../../crates/wind-ipc" }
+wind-coordinator = { path = "../../crates/wind-coordinator" }
+wind-bridge = { path = "../../crates/wind-bridge" }
+wind-config = { path = "../../crates/wind-config" }
+wind-store = { path = "../../crates/wind-store" }
+wind-dict = { path = "../../crates/wind-dict" }
+wind-engine = { path = "../../crates/wind-engine" }
+wind-ui = { path = "../../crates/wind-ui" }
+wind-theme = { path = "../../crates/wind-theme" }
 tokio = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
