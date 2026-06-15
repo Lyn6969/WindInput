@@ -553,7 +553,7 @@ impl PopupMenu {
 /// 行显示文本：勾选前缀 + 标签 + 子菜单箭头。
 fn row_text(it: &MenuItemSpec) -> String {
     let mark = if it.checked { "✓ " } else { "   " };
-    let arrow = if is_submenu(it) { "  ▶" } else { "" };
+    let arrow = if is_submenu(it) { " ▸" } else { "" };
     format!("{}{}{}", mark, it.label, arrow)
 }
 

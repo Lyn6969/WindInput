@@ -337,34 +337,23 @@ impl EngineManager {
 
     // ───────────────────────── 词典加载 ─────────────────────────
 
-    /// 读取并解析 schema 文件（优先 .schema.toml，回退遗留 .schema.yaml）。仅解析不构建引擎。
+    /// 读取并解析 schema 文件（仅 TOML）。仅解析不构建引擎。
     fn read_schema(schema_id: &str, data_dir: Option<&Path>) -> Option<SchemaFile> {
         let data_dir = data_dir?;
-        let schemas = data_dir.join("schemas");
-        let toml_path = schemas.join(format!("{}.schema.toml", schema_id));
-        let yaml_path = schemas.join(format!("{}.schema.yaml", schema_id));
-
-        if toml_path.exists() {
-            let content = std::fs::read_to_string(&toml_path).ok()?;
-            match toml::from_str(&content) {
-                Ok(s) => Some(s),
-                Err(e) => {
-                    warn!("Parse schema TOML failed {}: {}", toml_path.display(), e);
-                    None
-                }
+        let toml_path = data_dir
+            .join("schemas")
+            .join(format!("{}.schema.toml", schema_id));
+        if !toml_path.exists() {
+            warn!("Schema file not found: {}.schema.toml", schema_id);
+            return None;
+        }
+        let content = std::fs::read_to_string(&toml_path).ok()?;
+        match toml::from_str(&content) {
+            Ok(s) => Some(s),
+            Err(e) => {
+                warn!("Parse schema TOML failed {}: {}", toml_path.display(), e);
+                None
             }
-        } else if yaml_path.exists() {
-            let content = std::fs::read_to_string(&yaml_path).ok()?;
-            match serde_yaml::from_str(&content) {
-                Ok(s) => Some(s),
-                Err(e) => {
-                    warn!("Parse schema YAML failed {}: {}", yaml_path.display(), e);
-                    None
-                }
-            }
-        } else {
-            warn!("Schema file not found: {}.schema.toml/.yaml", schema_id);
-            None
         }
     }
 
