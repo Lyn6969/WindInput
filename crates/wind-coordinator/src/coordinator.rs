@@ -1373,6 +1373,7 @@ impl Coordinator {
             let _ = self.ui_tx.send(UiCommand::HideCandidates);
             return;
         }
+        let t_nu = std::time::Instant::now();
         // 仅推送当前页候选（窗口按 1..N 编号，翻页后重新编号）
         let (start, end) = self.page_range(state);
         // 快捷输入用字母标签（a/b/c，因数字键需录入表达式），其余用数字
@@ -1429,6 +1430,7 @@ impl Coordinator {
             }
         };
         *self.awaiting_caret.lock().unwrap_or_else(|e| e.into_inner()) = !caret_valid;
+        let n_items = items.len();
         let _ = self.ui_tx.send(UiCommand::UpdateCandidates {
             preedit: state.preedit.clone(),
             candidates: items,
@@ -1441,6 +1443,7 @@ impl Coordinator {
             caret_height,
             caret_valid,
         });
+        tracing::debug!("notify_ui_update: build+send {:?} (n={})", t_nu.elapsed(), n_items);
     }
 
     fn notify_ui_hide(&self) {

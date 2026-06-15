@@ -270,7 +270,10 @@ impl UiManager {
         };
 
         // Win32 消息循环 + 通道接收
-        loop {
+        // 待处理命令队列：每轮排空通道并合并连续候选更新（只渲染最新一帧），
+        // 避免长按翻页/连按方向键时 UpdateCandidates 堆积、松键后仍继续刷新。
+        let mut pending: std::collections::VecDeque<UiCommand> = std::collections::VecDeque::new();
+        'main: loop {
             // 状态提示气泡到期自动隐藏
             if let Some(deadline) = tip_hide_at {
                 if std::time::Instant::now() >= deadline {
@@ -305,9 +308,29 @@ impl UiManager {
                 }
             }
 
-            // 非阻塞接收 UI 命令
-            match rx.try_recv() {
-                Ok(cmd) => {
+            // 排空通道：合并连续候选更新（只保留最新一条），其它命令保序
+            let mut disconnected = false;
+            loop {
+                match rx.try_recv() {
+                    Ok(cmd) => {
+                        // 新候选更新若紧跟在另一候选更新之后，丢弃旧的（只渲染最新帧）
+                        if matches!(cmd, UiCommand::UpdateCandidates { .. })
+                            && matches!(pending.back(), Some(UiCommand::UpdateCandidates { .. }))
+                        {
+                            pending.pop_back();
+                        }
+                        pending.push_back(cmd);
+                    }
+                    Err(mpsc::TryRecvError::Empty) => break,
+                    Err(mpsc::TryRecvError::Disconnected) => {
+                        disconnected = true;
+                        break;
+                    }
+                }
+            }
+            let had_cmd = !pending.is_empty();
+            // 一轮处理完所有待办（候选更新已合并为至多一条），不留积压到下一轮
+            while let Some(cmd) = pending.pop_front() {
                     match cmd {
                         UiCommand::UpdateCandidates {
                             preedit,
@@ -410,18 +433,17 @@ impl UiManager {
                             if let Some(t) = &mut toolbar {
                                 t.hide();
                             }
-                            break;
+                            break 'main;
                         }
                     }
-                }
-                Err(mpsc::TryRecvError::Empty) => {
-                    // 没有命令，短暂休眠避免 CPU 空转
-                    std::thread::sleep(std::time::Duration::from_millis(8));
-                }
-                Err(mpsc::TryRecvError::Disconnected) => {
-                    info!("UI: Channel disconnected, shutting down");
-                    break;
-                }
+            }
+            if disconnected {
+                info!("UI: Channel disconnected, shutting down");
+                break 'main;
+            }
+            if !had_cmd {
+                // 无命令，短暂休眠避免 CPU 空转
+                std::thread::sleep(std::time::Duration::from_millis(8));
             }
         }
     }

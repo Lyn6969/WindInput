@@ -82,3 +82,11 @@ lto = true
 codegen-units = 1
 strip = true
 panic = "abort"
+
+# dev 构建优化：让逐像素渲染等热路径接近 release 速度。
+# 注意 package."*" 只作用于依赖，不含本工作区代码；故本工作区代码另加 opt-level=1。
+[profile.dev]
+opt-level = 1 # 本工作区代码：基础优化，仍保留可调试性（行号/断点）
+
+[profile.dev.package."*"]
+opt-level = 2 # 所有依赖（含 tiny-skia/windows）：更高优化，编译一次后缓存

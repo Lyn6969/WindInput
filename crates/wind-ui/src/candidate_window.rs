@@ -210,12 +210,19 @@ impl CandidateWindow {
             return;
         }
 
+        // ── 渲染计时（定位长按翻页卡顿耗时段）──
+        let t_start = Instant::now();
+
         // 构建并测量 View 树
         let mut root = self.build_tree();
+        let t_build = t_start.elapsed();
+
+        let t_layout0 = Instant::now();
         root.layout(0.0, 0.0, &self.text_renderer);
         let (w_f, h_f) = root.measured_size();
         let width = (w_f.ceil() as u32).max(40);
         let height = (h_f.ceil() as u32).max(24);
+        let t_layout = t_layout0.elapsed();
 
         // 收集候选命中矩形并同步给鼠标处理器
         self.hit_rects.clear();
@@ -229,21 +236,26 @@ impl CandidateWindow {
         self.window.resize(width, height);
 
         // 透明清屏 + 绘制
+        let t_paint0 = Instant::now();
         {
             let buf = self.window.buffer_mut();
             let buf_size = (width * height * 4) as usize;
             buf[..buf_size].fill(0);
             root.paint(buf, width, height, &self.text_renderer);
         }
+        let t_paint = t_paint0.elapsed();
 
-        tracing::debug!(
-            "CandidateWindow::show pos=({},{}), size=({},{}), candidates={}, page={}/{}",
-            self.x, self.y, width, height, self.candidates.len(), self.page, self.total_pages
-        );
-
+        let t_blit0 = Instant::now();
         if let Err(e) = self.window.update() {
             tracing::warn!("CandidateWindow update failed: {}", e);
         }
+        let t_blit = t_blit0.elapsed();
+
+        tracing::debug!(
+            "render[{}x{} n={}]: build={:?} layout={:?} paint={:?} blit={:?} | total={:?}",
+            width, height, self.candidates.len(),
+            t_build, t_layout, t_paint, t_blit, t_start.elapsed()
+        );
 
         // 位置锚定：组合期间固定——锚点一旦按有效坐标锁定，打字/悬停/翻页刷新都复用，
         // 避免窗口随光标/刷新漂移。首次连接尚无有效坐标时，锚点为"临时"，
@@ -259,7 +271,12 @@ impl CandidateWindow {
         };
         self.window.show(px, py);
         self.visible = true;
+        let t_tip0 = Instant::now();
         self.update_tooltip(px, py);
+        let t_tip = t_tip0.elapsed();
+        if t_tip.as_micros() > 200 {
+            tracing::debug!("render tooltip={:?}", t_tip);
+        }
     }
 
     /// 悬停时在该候选下方显示其编码（反查）；无悬停或无编码则隐藏。

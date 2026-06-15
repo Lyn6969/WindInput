@@ -155,17 +155,24 @@ impl TextRenderer {
         }
     }
 
-    /// 确保位图渲染表面为给定尺寸（不匹配则重建）。
+    /// 确保位图渲染表面至少为给定尺寸（只增长不重建：翻页时窗口宽度抖动，
+    /// 复用最大表面可避免每帧重建 COM 渲染目标）。DIB 实际可比窗口大，
+    /// draw_text 用窗口尺寸裁剪、用 DIBSECTION 的真实 stride 索引，故安全。
     fn ensure_surface(&self, w: u32, h: u32) -> Result<(), String> {
-        if let Some(s) = self.surface.borrow().as_ref() {
-            if s.width == w && s.height == h {
-                return Ok(());
-            }
+        let (cur_w, cur_h) = self
+            .surface
+            .borrow()
+            .as_ref()
+            .map_or((0, 0), |s| (s.width, s.height));
+        if cur_w >= w && cur_h >= h {
+            return Ok(());
         }
+        let nw = w.max(cur_w);
+        let nh = h.max(cur_h);
         unsafe {
             let target = self
                 .gdi_interop
-                .CreateBitmapRenderTarget(None, w, h)
+                .CreateBitmapRenderTarget(None, nw, nh)
                 .map_err(|e| format!("CreateBitmapRenderTarget: {e}"))?;
             target
                 .SetPixelsPerDip(1.0)
@@ -178,8 +185,8 @@ impl TextRenderer {
             *self.surface.borrow_mut() = Some(Surface {
                 target,
                 renderer,
-                width: w,
-                height: h,
+                width: nw,
+                height: nh,
             });
         }
         Ok(())
@@ -231,11 +238,33 @@ impl TextRenderer {
             let bits = ds.dsBm.bmBits as *mut u8;
             let dib = std::slice::from_raw_parts_mut(bits, stride * h);
 
-            // 1) 背景按不透明复制进 DIB（B,G,R 保留，A 置 255）。
-            for row in 0..h {
+            // 颜色经 clientDrawingContext 透传给字形回调。
+            // 入参 color 约定为 [R,G,B,A]；COLORREF = 0x00BBGGRR。
+            let colorref: u32 =
+                (color[0] as u32) | ((color[1] as u32) << 8) | ((color[2] as u32) << 16);
+            let layout = self.create_layout(text, buf_width as f32, buf_height as f32)?;
+
+            // 关键优化：用文本度量算出包围盒，后续两遍逐像素操作只在盒内进行
+            // （原实现每次绘制都遍历整窗，单帧十余次 × 整窗 → paint 高达 ~100ms）。
+            // ClearType/抗锯齿可能轻微外溢，留 2px 余量。
+            let mut tm = DWRITE_TEXT_METRICS::default();
+            let _ = layout.GetMetrics(&mut tm);
+            const MARGIN: f32 = 2.0;
+            let cx0 = (x + tm.left - MARGIN).floor().max(0.0) as usize;
+            let cy0 = (y + tm.top - MARGIN).floor().max(0.0) as usize;
+            let cx1 = (((x + tm.left + tm.widthIncludingTrailingWhitespace + MARGIN).ceil())
+                .max(0.0) as usize)
+                .min(w);
+            let cy1 = (((y + tm.top + tm.height + MARGIN).ceil()).max(0.0) as usize).min(h);
+            if cx0 >= cx1 || cy0 >= cy1 {
+                return Ok(());
+            }
+
+            // 1) 背景按不透明复制进 DIB（仅包围盒；盒外 DIB 残留不会被读取）。
+            for row in cy0..cy1 {
                 let src = row * w * 4;
                 let dst = row * stride;
-                for col in 0..w {
+                for col in cx0..cx1 {
                     let s = src + col * 4;
                     let d = dst + col * 4;
                     dib[d] = buf[s];
@@ -245,11 +274,7 @@ impl TextRenderer {
                 }
             }
 
-            // 2) 渲染文本：颜色经 clientDrawingContext 透传给字形回调。
-            // 入参 color 约定为 [R,G,B,A]；COLORREF = 0x00BBGGRR。
-            let colorref: u32 =
-                (color[0] as u32) | ((color[1] as u32) << 8) | ((color[2] as u32) << 16);
-            let layout = self.create_layout(text, buf_width as f32, buf_height as f32)?;
+            // 2) 渲染文本（绝对坐标 x,y，不受 DIB 实际尺寸影响）。
             layout
                 .Draw(
                     Some(&colorref as *const u32 as *const c_void),
@@ -259,11 +284,11 @@ impl TextRenderer {
                 )
                 .map_err(|e| format!("TextLayout::Draw: {e}"))?;
 
-            // 3) 选择性预乘回写：RGB 变动的像素视为文字，按窗口原 alpha 预乘。
-            for row in 0..h {
+            // 3) 选择性预乘回写：RGB 变动的像素视为文字，按窗口原 alpha 预乘（仅包围盒）。
+            for row in cy0..cy1 {
                 let sbase = row * w * 4;
                 let dbase = row * stride;
-                for col in 0..w {
+                for col in cx0..cx1 {
                     let s = sbase + col * 4;
                     let d = dbase + col * 4;
                     let nb = dib[d];

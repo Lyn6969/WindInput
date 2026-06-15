@@ -370,32 +370,66 @@ pub fn fill_rounded(
         return;
     }
     let r = radius.round().max(0.0);
-    let ca = color[3] as f32;
+    let ri = r as i32;
+    let ca = color[3] as u32;
+    if ca == 0 {
+        return;
+    }
+    let opaque = ca == 255;
+    let bw = buf_w as i32;
+    let bh = buf_h as i32;
+    // 预乘常量（内部 cov=1 像素复用，避免逐像素重复计算）。color 为 [R,G,B,A]，
+    // 缓冲为预乘 BGRA：B=color[2] G=color[1] R=color[0]。
+    let inv = 255 - ca;
+    let pre = [
+        (color[2] as u32 * ca + 127) / 255, // B
+        (color[1] as u32 * ca + 127) / 255, // G
+        (color[0] as u32 * ca + 127) / 255, // R
+    ];
     for ry in 0..hi {
+        let py = y0 + ry;
+        if py < 0 || py >= bh {
+            continue;
+        }
+        // 仅顶/底 r 行可能落入圆角带
+        let corner_row = ri > 0 && (ry < ri || ry >= hi - ri);
         for rx in 0..wi {
-            let cov = corner_coverage(rx as f32, ry as f32, wi as f32, hi as f32, r);
-            if cov <= 0.0 {
-                continue;
-            }
             let px = x0 + rx;
-            let py = y0 + ry;
-            if px < 0 || py < 0 || px >= buf_w as i32 || py >= buf_h as i32 {
+            if px < 0 || px >= bw {
                 continue;
             }
-            let idx = ((py * buf_w as i32 + px) * 4) as usize;
+            let idx = ((py * bw + px) * 4) as usize;
             if idx + 3 >= buf.len() {
                 continue;
             }
-            // 源最终 alpha（含覆盖率）；预乘并按源覆盖混合到已有（预乘）背景上。
-            // color 为 [R,G,B,A]，缓冲为 BGRA：写入时做 R/B 换序。
-            let sa = ca * cov;
-            let inv = (255.0 - sa) / 255.0;
-            let src_bgr = [color[2], color[1], color[0]]; // B,G,R
-            for c in 0..3 {
-                let sp = src_bgr[c] as f32 * sa / 255.0; // 预乘源通道
-                buf[idx + c] = (sp + buf[idx + c] as f32 * inv).round().min(255.0) as u8;
+            // 仅四角（角行 ∩ 角列）需要抗锯齿覆盖率；其余像素 cov=1
+            let corner_col = ri > 0 && (rx < ri || rx >= wi - ri);
+            if corner_row && corner_col {
+                let cov = corner_coverage(rx as f32, ry as f32, wi as f32, hi as f32, r);
+                if cov <= 0.0 {
+                    continue;
+                }
+                let sa = (ca as f32 * cov) as u32; // 0..=255
+                let inv2 = 255 - sa;
+                buf[idx] = ((color[2] as u32 * sa + 127) / 255 + buf[idx] as u32 * inv2 / 255) as u8;
+                buf[idx + 1] =
+                    ((color[1] as u32 * sa + 127) / 255 + buf[idx + 1] as u32 * inv2 / 255) as u8;
+                buf[idx + 2] =
+                    ((color[0] as u32 * sa + 127) / 255 + buf[idx + 2] as u32 * inv2 / 255) as u8;
+                buf[idx + 3] = (sa + buf[idx + 3] as u32 * inv2 / 255) as u8;
+            } else if opaque {
+                // 快路径：不透明实心，直接写入（占整窗绝大多数像素）
+                buf[idx] = color[2];
+                buf[idx + 1] = color[1];
+                buf[idx + 2] = color[0];
+                buf[idx + 3] = 255;
+            } else {
+                // 半透明内部：预乘整数混合（常量已预计算）
+                buf[idx] = (pre[0] + buf[idx] as u32 * inv / 255) as u8;
+                buf[idx + 1] = (pre[1] + buf[idx + 1] as u32 * inv / 255) as u8;
+                buf[idx + 2] = (pre[2] + buf[idx + 2] as u32 * inv / 255) as u8;
+                buf[idx + 3] = (ca + buf[idx + 3] as u32 * inv / 255) as u8;
             }
-            buf[idx + 3] = (sa + buf[idx + 3] as f32 * inv).round().min(255.0) as u8;
         }
     }
 }
