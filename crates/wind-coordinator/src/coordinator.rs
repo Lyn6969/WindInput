@@ -98,12 +98,22 @@ fn quick_input_char(key_code: u32, shift: bool) -> Option<char> {
 const ENGINE_MAX_CANDIDATES: usize = 50;
 
 /// 协调器输入状态
+/// 简繁变体（与 Go config.S2TVariant 对齐）：(opencc 变体名, 菜单显示名)
+const S2T_VARIANTS: [(&str, &str); 4] = [
+    ("s2t", "标准繁体"),
+    ("s2tw", "台湾繁体"),
+    ("s2twp", "台湾繁体（含词汇）"),
+    ("s2hk", "香港繁体"),
+];
+
 struct State {
     chinese_mode: bool,
     full_width: bool,
     chinese_punct: bool,
     /// 简繁转换开关（运行时切换；commit 时把简体输出转繁体）
     s2t_enabled: bool,
+    /// 简繁变体（s2t/s2tw/s2twp/s2hk；运行时切换）
+    s2t_variant: String,
     toolbar_visible: bool,
     caps_lock: bool,
     input_buffer: String,
@@ -169,8 +179,10 @@ pub struct Coordinator {
     freq_dirty: Mutex<u32>,
     /// 短语层（system.phrases.toml；$Y$M$D 模板）
     phrases: crate::phrases::PhraseLayer,
-    /// 简繁转换器（OpenCC；None=数据缺失不可用）
-    s2t: Option<wind_transform::s2t::Converter>,
+    /// 简繁转换器（OpenCC；None=数据缺失不可用）。变体可运行时切换，故置于 Mutex。
+    s2t: Mutex<Option<wind_transform::s2t::Converter>>,
+    /// OpenCC 数据目录（运行时按变体重载转换器用）
+    opencc_dir: Option<std::path::PathBuf>,
     /// Shadow 规则（候选置顶/前后移/删除）
     shadow: ShadowStore,
     /// Shadow 持久化文件路径（None=不持久化）
@@ -295,15 +307,16 @@ impl Coordinator {
         };
 
         // 简繁转换器：从 data/opencc 加载（变体来自配置，默认 s2t）
-        let s2t = data_dir.and_then(|d| {
-            let variant = if config.features.s2t.variant.is_empty() {
-                "s2t"
-            } else {
-                &config.features.s2t.variant
-            };
-            let conv = wind_transform::s2t::Converter::load_variant(&d.join("opencc"), variant);
+        let opencc_dir = data_dir.map(|d| d.join("opencc"));
+        let s2t_variant = if config.features.s2t.variant.is_empty() {
+            "s2t".to_string()
+        } else {
+            config.features.s2t.variant.clone()
+        };
+        let s2t = opencc_dir.as_ref().and_then(|dir| {
+            let conv = wind_transform::s2t::Converter::load_variant(dir, &s2t_variant);
             if conv.is_some() {
-                info!("Loaded S2T converter (variant={})", variant);
+                info!("Loaded S2T converter (variant={})", s2t_variant);
             }
             conv
         });
@@ -359,6 +372,7 @@ impl Coordinator {
                 full_width: config.general.default_full_width,
                 chinese_punct: config.general.default_chinese_punct,
                 s2t_enabled: config.features.s2t.enabled,
+                s2t_variant: s2t_variant.clone(),
                 toolbar_visible: true,
                 caps_lock: false,
                 input_buffer: String::new(),
@@ -396,7 +410,8 @@ impl Coordinator {
             freq_path,
             freq_dirty: Mutex::new(0),
             phrases,
-            s2t,
+            s2t: Mutex::new(s2t),
+            opencc_dir,
             shadow,
             shadow_path,
             toolbar_pos_path,
@@ -452,7 +467,7 @@ impl Coordinator {
 
     /// 设置简繁开关（测试/诊断用）。返回是否生效（数据缺失则 false）。
     pub fn debug_set_s2t(&self, on: bool) -> bool {
-        if self.s2t.is_none() {
+        if self.s2t.lock().unwrap_or_else(|e| e.into_inner()).is_none() {
             return false;
         }
         self.state.lock().unwrap_or_else(|e| e.into_inner()).s2t_enabled = on;
@@ -1349,7 +1364,7 @@ impl Coordinator {
     /// 若开启简繁转换，把简体文本转为繁体（数据缺失则原样返回）。
     fn maybe_s2t(&self, state: &State, text: &str) -> String {
         if state.s2t_enabled {
-            if let Some(conv) = &self.s2t {
+            if let Some(conv) = self.s2t.lock().unwrap_or_else(|e| e.into_inner()).as_ref() {
                 return conv.convert(text);
             }
         }
@@ -1508,7 +1523,7 @@ impl Coordinator {
                 self.handle_menu_command("toggle_s2t");
                 self.notify_toolbar();
             }
-            MenuCmd::S2tVariant(_) => self.show_tip("简繁变体切换暂未实现"),
+            MenuCmd::S2tVariant(i) => self.set_s2t_variant(i),
             MenuCmd::ThemeSelect(i) => self.select_theme(i),
             MenuCmd::ThemeStyle(style) => self.set_theme_style(style),
             MenuCmd::ToggleToolbar => self.toggle_toolbar(),
@@ -1569,6 +1584,38 @@ impl Coordinator {
             .clone();
         self.push_theme(&name, dark);
         self.show_tip(if dark { "暗色" } else { "亮色" });
+    }
+
+    /// 切换简繁变体（0=s2t 1=s2tw 2=s2twp 3=s2hk），重载转换器并刷新候选显示。
+    fn set_s2t_variant(&self, index: usize) {
+        let (variant, label) = match S2T_VARIANTS.get(index) {
+            Some(v) => *v,
+            None => return,
+        };
+        let dir = match &self.opencc_dir {
+            Some(d) => d.clone(),
+            None => {
+                self.show_tip("简繁数据缺失");
+                return;
+            }
+        };
+        match wind_transform::s2t::Converter::load_variant(&dir, variant) {
+            Some(conv) => {
+                *self.s2t.lock().unwrap_or_else(|e| e.into_inner()) = Some(conv);
+                {
+                    let mut s = self.state.lock().unwrap_or_else(|e| e.into_inner());
+                    s.s2t_variant = variant.to_string();
+                }
+                // 组合中则按新变体重渲染候选显示
+                let s = self.state.lock().unwrap_or_else(|e| e.into_inner());
+                if !s.candidates.is_empty() {
+                    self.notify_ui_update(&s);
+                }
+                drop(s);
+                self.show_tip(label);
+            }
+            None => self.show_tip("简繁数据缺失"),
+        }
     }
 
     /// 显示/隐藏工具栏。
@@ -1647,9 +1694,16 @@ impl Coordinator {
     /// x/y 为屏幕坐标；i32::MIN 表示由 UI 取光标位置。
     fn show_main_menu(&self, x: i32, y: i32) {
         use wind_ui::manager::MenuItemSpec as M;
-        let (chinese, punct, full, s2t, toolbar_vis) = {
+        let (chinese, punct, full, s2t, s2t_variant, toolbar_vis) = {
             let s = self.state.lock().unwrap_or_else(|e| e.into_inner());
-            (s.chinese_mode, s.chinese_punct, s.full_width, s.s2t_enabled, s.toolbar_visible)
+            (
+                s.chinese_mode,
+                s.chinese_punct,
+                s.full_width,
+                s.s2t_enabled,
+                s.s2t_variant.clone(),
+                s.toolbar_visible,
+            )
         };
         let cmd = |c: MenuCmd| MenuKind::Command(c);
 
@@ -1692,11 +1746,20 @@ impl Coordinator {
         theme_children.push(M::leaf("亮色", cmd(MenuCmd::ThemeStyle(1)), true, !dark));
         theme_children.push(M::leaf("暗色", cmd(MenuCmd::ThemeStyle(2)), true, dark));
 
+        // 简入繁出子菜单：启用开关 + 变体单选
+        let mut s2t_children = vec![
+            M::leaf("启用", cmd(MenuCmd::ToggleS2t), true, s2t),
+            M::separator(),
+        ];
+        for (i, (id, label)) in S2T_VARIANTS.iter().enumerate() {
+            s2t_children.push(M::leaf(*label, cmd(MenuCmd::S2tVariant(i)), true, s2t_variant == *id));
+        }
+
         let items = vec![
             M::submenu("输入方案", schema_children),
             M::leaf("全角", cmd(MenuCmd::ToggleWidth), true, full),
             M::leaf("中文标点", cmd(MenuCmd::TogglePunct), true, punct),
-            M::leaf("简入繁出", cmd(MenuCmd::ToggleS2t), true, s2t),
+            M::submenu("简入繁出", s2t_children),
             M::separator(),
             M::leaf("显示工具栏", cmd(MenuCmd::ToggleToolbar), true, toolbar_vis),
             M::submenu("主题", theme_children),
@@ -2102,7 +2165,7 @@ impl Coordinator {
                 true
             }
             "toggle_s2t" => {
-                if self.s2t.is_none() {
+                if self.s2t.lock().unwrap_or_else(|e| e.into_inner()).is_none() {
                     self.show_tip("简繁数据缺失");
                     return true;
                 }
