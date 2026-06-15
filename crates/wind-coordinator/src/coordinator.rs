@@ -106,6 +106,13 @@ const S2T_VARIANTS: [(&str, &str); 4] = [
     ("s2hk", "香港繁体"),
 ];
 
+/// 检索范围过滤模式（与 Go config.FilterMode 对齐）：(模式, 菜单显示名)
+const FILTER_MODES: [(wind_candidate::FilterMode, &str); 3] = [
+    (wind_candidate::FilterMode::Smart, "智能模式"),
+    (wind_candidate::FilterMode::General, "常用字"),
+    (wind_candidate::FilterMode::Gb18030, "全部字符"),
+];
+
 /// 重启信号通道（对齐 Go restartRequestCh）：菜单"重启服务"→ main 重拉进程。
 static RESTART_TX: std::sync::OnceLock<std::sync::mpsc::Sender<()>> = std::sync::OnceLock::new();
 
@@ -131,6 +138,8 @@ struct State {
     s2t_enabled: bool,
     /// 简繁变体（s2t/s2tw/s2twp/s2hk；运行时切换）
     s2t_variant: String,
+    /// 检索范围过滤模式（smart/general/gb18030；运行时切换）
+    filter_mode: wind_candidate::FilterMode,
     toolbar_visible: bool,
     caps_lock: bool,
     input_buffer: String,
@@ -200,6 +209,8 @@ pub struct Coordinator {
     s2t: Mutex<Option<wind_transform::s2t::Converter>>,
     /// OpenCC 数据目录（运行时按变体重载转换器用）
     opencc_dir: Option<std::path::PathBuf>,
+    /// 通用规范汉字表（检索范围"常用字"判定；空集时退化为不过滤）
+    common_chars: wind_candidate::CommonChars,
     /// Shadow 规则（候选置顶/前后移/删除）
     shadow: ShadowStore,
     /// Shadow 持久化文件路径（None=不持久化）
@@ -350,6 +361,18 @@ impl Coordinator {
         let cn_pairs = parse_pairs(&config.input.auto_pair.chinese_pairs);
         let en_pairs = parse_pairs(&config.input.auto_pair.english_pairs);
 
+        // 通用规范汉字表（检索范围"常用字"判定）
+        let common_chars = wind_candidate::CommonChars::load(
+            &data_dir
+                .map(|d| d.join("schemas").join("common_chars.txt"))
+                .unwrap_or_default(),
+        );
+        if common_chars.is_empty() {
+            warn!("common_chars.txt 缺失，检索范围过滤将退化为不过滤");
+        } else {
+            info!("Loaded common chars table");
+        }
+
         // 候选反查表（拆字/拼音）
         let reverse = crate::reverse::ReverseLookup::load(data_dir);
         if !reverse.is_empty() {
@@ -390,6 +413,7 @@ impl Coordinator {
                 chinese_punct: config.general.default_chinese_punct,
                 s2t_enabled: config.features.s2t.enabled,
                 s2t_variant: s2t_variant.clone(),
+                filter_mode: wind_candidate::FilterMode::from_str(&config.input.filter_mode),
                 toolbar_visible: true,
                 caps_lock: false,
                 input_buffer: String::new(),
@@ -429,6 +453,7 @@ impl Coordinator {
             phrases,
             s2t: Mutex::new(s2t),
             opencc_dir,
+            common_chars,
             shadow,
             shadow_path,
             toolbar_pos_path,
@@ -576,10 +601,29 @@ impl Coordinator {
         });
         let mut seen = std::collections::HashSet::new();
         candidates.retain(|c| seen.insert(c.text.clone()));
+        // 检索范围过滤（填充常用标志后按模式过滤；对齐 Go 引擎内过滤）
+        self.apply_filter(state, &mut candidates);
         // Shadow 规则：删除过滤 + 置顶/移动重排（优先级最高，排序后应用）
         self.apply_shadow(&mut candidates, &state.input_buffer);
         state.candidates = candidates;
         engine_count
+    }
+
+    /// 按当前检索范围过滤候选：先填充 is_common（常用字表），再按模式过滤。
+    /// Gb18030 或数据缺失时不过滤（避免误删）。
+    fn apply_filter(&self, state: &State, candidates: &mut Vec<Candidate>) {
+        let mode = state.filter_mode;
+        if mode == wind_candidate::FilterMode::Gb18030 || self.common_chars.is_empty() {
+            return;
+        }
+        for c in candidates.iter_mut() {
+            // 短语保留（is_phrase 已置位）；其余按常用字表判定
+            if !c.is_phrase {
+                c.is_common = self.common_chars.is_string_common(&c.text);
+            }
+        }
+        let taken = std::mem::take(candidates);
+        *candidates = wind_candidate::filter_candidates(taken, mode);
     }
 
     /// 应用 Shadow 规则：先按 deleted 过滤，再把 pinned 按目标位置重排。
@@ -1541,6 +1585,7 @@ impl Coordinator {
                 self.notify_toolbar();
             }
             MenuCmd::S2tVariant(i) => self.set_s2t_variant(i),
+            MenuCmd::FilterMode(i) => self.set_filter_mode(i),
             MenuCmd::ThemeSelect(i) => self.select_theme(i),
             MenuCmd::ThemeStyle(style) => self.set_theme_style(style),
             MenuCmd::ToggleToolbar => self.toggle_toolbar(),
@@ -1636,6 +1681,29 @@ impl Coordinator {
         }
     }
 
+    /// 切换检索范围（0 智能/1 常用字/2 全部字符），以新范围重过滤并刷新候选。
+    fn set_filter_mode(&self, index: usize) {
+        let (mode, label) = match FILTER_MODES.get(index) {
+            Some(&(m, l)) => (m, l),
+            None => return,
+        };
+        {
+            let mut s = self.state.lock().unwrap_or_else(|e| e.into_inner());
+            if s.filter_mode == mode {
+                return;
+            }
+            s.filter_mode = mode;
+        }
+        // 组合中：以新范围重建候选并刷新
+        let mut s = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        if !s.input_buffer.is_empty() {
+            self.update_candidates(&mut s);
+            self.notify_ui_update(&s);
+        }
+        drop(s);
+        self.show_tip(label);
+    }
+
     /// 显示/隐藏工具栏。
     fn toggle_toolbar(&self) {
         let visible = {
@@ -1720,7 +1788,7 @@ impl Coordinator {
     /// x/y 为屏幕坐标；i32::MIN 表示由 UI 取光标位置。
     fn show_main_menu(&self, x: i32, y: i32) {
         use wind_ui::manager::MenuItemSpec as M;
-        let (chinese, punct, full, s2t, s2t_variant, toolbar_vis) = {
+        let (chinese, punct, full, s2t, s2t_variant, filter_mode, toolbar_vis) = {
             let s = self.state.lock().unwrap_or_else(|e| e.into_inner());
             (
                 s.chinese_mode,
@@ -1728,6 +1796,7 @@ impl Coordinator {
                 s.full_width,
                 s.s2t_enabled,
                 s.s2t_variant.clone(),
+                s.filter_mode,
                 s.toolbar_visible,
             )
         };
@@ -1781,11 +1850,21 @@ impl Coordinator {
             s2t_children.push(M::leaf(*label, cmd(MenuCmd::S2tVariant(i)), true, s2t_variant == *id));
         }
 
+        // 检索范围子菜单：过滤模式单选
+        let filter_children: Vec<_> = FILTER_MODES
+            .iter()
+            .enumerate()
+            .map(|(i, (m, label))| {
+                M::leaf(*label, cmd(MenuCmd::FilterMode(i)), true, filter_mode == *m)
+            })
+            .collect();
+
         let items = vec![
             M::submenu("输入方案", schema_children),
             M::leaf("全角", cmd(MenuCmd::ToggleWidth), true, full),
             M::leaf("中文标点", cmd(MenuCmd::TogglePunct), true, punct),
             M::submenu("简入繁出", s2t_children),
+            M::submenu("检索范围", filter_children),
             M::separator(),
             M::leaf("显示工具栏", cmd(MenuCmd::ToggleToolbar), true, toolbar_vis),
             M::submenu("主题", theme_children),
