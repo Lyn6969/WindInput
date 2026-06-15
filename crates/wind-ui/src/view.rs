@@ -8,6 +8,7 @@
 //! 不含 Go 的渐变 / 九宫格图 / 阴影模糊 / z 分层等重特性（后续按需扩展）。
 
 use crate::text::dwrite::TextRenderer;
+use tiny_skia::{Color, FillRule, Paint, PathBuilder, PixmapMut, Transform};
 
 /// 四边内/外边距
 #[derive(Clone, Copy, Default)]
@@ -349,8 +350,14 @@ impl View {
 
 // ———————————————— 像素绘制工具 ————————————————
 
-/// 在缓冲区子区域填充圆角矩形：圆角抗锯齿 + 预乘 alpha 源覆盖混合。
+/// 贝塞尔逼近圆弧的控制点比例（kappa）。
+const KAPPA: f32 = 0.552_284_75;
+
+/// 在缓冲区子区域填充圆角矩形：tiny-skia 抗锯齿填充 + 源覆盖混合。
 /// `color` 约定为直通 [R,G,B,A]；缓冲区按预乘 BGRA 维护（供 UpdateLayeredWindow）。
+///
+/// 关键技巧：把 BGRA 缓冲当作 tiny-skia 的"RGBA" Pixmap 直接渲染（零拷贝），
+/// 传色时交换 R/B（Color 取 [B,G,R,A]）。预乘 alpha 合成逐通道对称，故输出即合法 BGRA。
 pub fn fill_rounded(
     buf: &mut [u8],
     buf_w: u32,
@@ -362,100 +369,68 @@ pub fn fill_rounded(
     color: [u8; 4],
     radius: f32,
 ) {
-    let x0 = x.round() as i32;
-    let y0 = y.round() as i32;
-    let wi = w.round() as i32;
-    let hi = h.round() as i32;
-    if wi <= 0 || hi <= 0 {
+    if color[3] == 0 {
         return;
     }
-    let r = radius.round().max(0.0);
-    let ri = r as i32;
-    let ca = color[3] as u32;
-    if ca == 0 {
+    // 位置/尺寸对齐像素网格（这些盒子本就像素对齐），半径保留浮点供 AA。
+    let x = x.round();
+    let y = y.round();
+    let w = w.round();
+    let h = h.round();
+    if w <= 0.0 || h <= 0.0 || buf_w == 0 || buf_h == 0 {
         return;
     }
-    let opaque = ca == 255;
-    let bw = buf_w as i32;
-    let bh = buf_h as i32;
-    // 预乘常量（内部 cov=1 像素复用，避免逐像素重复计算）。color 为 [R,G,B,A]，
-    // 缓冲为预乘 BGRA：B=color[2] G=color[1] R=color[0]。
-    let inv = 255 - ca;
-    let pre = [
-        (color[2] as u32 * ca + 127) / 255, // B
-        (color[1] as u32 * ca + 127) / 255, // G
-        (color[0] as u32 * ca + 127) / 255, // R
-    ];
-    for ry in 0..hi {
-        let py = y0 + ry;
-        if py < 0 || py >= bh {
-            continue;
-        }
-        // 仅顶/底 r 行可能落入圆角带
-        let corner_row = ri > 0 && (ry < ri || ry >= hi - ri);
-        for rx in 0..wi {
-            let px = x0 + rx;
-            if px < 0 || px >= bw {
-                continue;
-            }
-            let idx = ((py * bw + px) * 4) as usize;
-            if idx + 3 >= buf.len() {
-                continue;
-            }
-            // 仅四角（角行 ∩ 角列）需要抗锯齿覆盖率；其余像素 cov=1
-            let corner_col = ri > 0 && (rx < ri || rx >= wi - ri);
-            if corner_row && corner_col {
-                let cov = corner_coverage(rx as f32, ry as f32, wi as f32, hi as f32, r);
-                if cov <= 0.0 {
-                    continue;
-                }
-                let sa = (ca as f32 * cov) as u32; // 0..=255
-                let inv2 = 255 - sa;
-                buf[idx] = ((color[2] as u32 * sa + 127) / 255 + buf[idx] as u32 * inv2 / 255) as u8;
-                buf[idx + 1] =
-                    ((color[1] as u32 * sa + 127) / 255 + buf[idx + 1] as u32 * inv2 / 255) as u8;
-                buf[idx + 2] =
-                    ((color[0] as u32 * sa + 127) / 255 + buf[idx + 2] as u32 * inv2 / 255) as u8;
-                buf[idx + 3] = (sa + buf[idx + 3] as u32 * inv2 / 255) as u8;
-            } else if opaque {
-                // 快路径：不透明实心，直接写入（占整窗绝大多数像素）
-                buf[idx] = color[2];
-                buf[idx + 1] = color[1];
-                buf[idx + 2] = color[0];
-                buf[idx + 3] = 255;
-            } else {
-                // 半透明内部：预乘整数混合（常量已预计算）
-                buf[idx] = (pre[0] + buf[idx] as u32 * inv / 255) as u8;
-                buf[idx + 1] = (pre[1] + buf[idx + 1] as u32 * inv / 255) as u8;
-                buf[idx + 2] = (pre[2] + buf[idx + 2] as u32 * inv / 255) as u8;
-                buf[idx + 3] = (ca + buf[idx + 3] as u32 * inv / 255) as u8;
-            }
-        }
-    }
+    let Some(path) = round_rect_path(x, y, w, h, radius.round().max(0.0)) else {
+        return;
+    };
+    let Some(mut pm) = PixmapMut::from_bytes(buf, buf_w, buf_h) else {
+        return;
+    };
+    let mut paint = Paint::default();
+    paint.anti_alias = true;
+    // BGRA 缓冲被当作 RGBA：换 R/B，输出即正确的预乘 BGRA。
+    paint.set_color(Color::from_rgba8(color[2], color[1], color[0], color[3]));
+    pm.fill_path(&path, &paint, FillRule::Winding, Transform::identity(), None);
 }
 
-/// 圆角覆盖率 [0,1]：四角按到圆心距离做 1px 抗锯齿带，直边返回 1。
-fn corner_coverage(x: f32, y: f32, w: f32, h: f32, r: f32) -> f32 {
+/// 填充实心圆（tiny-skia 抗锯齿）。`color` 为 [R,G,B,A]，缓冲预乘 BGRA（同 fill_rounded 换 R/B）。
+pub fn fill_circle(buf: &mut [u8], buf_w: u32, buf_h: u32, cx: f32, cy: f32, r: f32, color: [u8; 4]) {
+    if color[3] == 0 || r <= 0.0 || buf_w == 0 || buf_h == 0 {
+        return;
+    }
+    let mut pb = PathBuilder::new();
+    pb.push_circle(cx, cy, r);
+    let Some(path) = pb.finish() else {
+        return;
+    };
+    let Some(mut pm) = PixmapMut::from_bytes(buf, buf_w, buf_h) else {
+        return;
+    };
+    let mut paint = Paint::default();
+    paint.anti_alias = true;
+    paint.set_color(Color::from_rgba8(color[2], color[1], color[0], color[3]));
+    pm.fill_path(&path, &paint, FillRule::Winding, Transform::identity(), None);
+}
+
+/// 构造圆角矩形路径（radius 自动钳制到 min(w,h)/2；为 0 时退化为直角矩形）。
+fn round_rect_path(x: f32, y: f32, w: f32, h: f32, radius: f32) -> Option<tiny_skia::Path> {
+    let r = radius.min(w * 0.5).min(h * 0.5).max(0.0);
+    let mut pb = PathBuilder::new();
     if r <= 0.0 {
-        return 1.0;
+        pb.push_rect(tiny_skia::Rect::from_xywh(x, y, w, h)?);
+    } else {
+        let (l, t, rt, b) = (x, y, x + w, y + h);
+        let k = r * KAPPA;
+        pb.move_to(l + r, t);
+        pb.line_to(rt - r, t);
+        pb.cubic_to(rt - r + k, t, rt, t + r - k, rt, t + r);
+        pb.line_to(rt, b - r);
+        pb.cubic_to(rt, b - r + k, rt - r + k, b, rt - r, b);
+        pb.line_to(l + r, b);
+        pb.cubic_to(l + r - k, b, l, b - r + k, l, b - r);
+        pb.line_to(l, t + r);
+        pb.cubic_to(l, t + r - k, l + r - k, t, l + r, t);
+        pb.close();
     }
-    // 像素中心
-    let px = x + 0.5;
-    let py = y + 0.5;
-    // 各角圆心；判断像素是否落在某角的圆角区
-    let corners = [
-        (r, r, px < r && py < r),
-        (w - r, r, px > w - r && py < r),
-        (r, h - r, px < r && py > h - r),
-        (w - r, h - r, px > w - r && py > h - r),
-    ];
-    for (cx, cy, in_quadrant) in corners {
-        if in_quadrant {
-            let dx = px - cx;
-            let dy = py - cy;
-            let dist = (dx * dx + dy * dy).sqrt();
-            return (r + 0.5 - dist).clamp(0.0, 1.0);
-        }
-    }
-    1.0
+    pb.finish()
 }

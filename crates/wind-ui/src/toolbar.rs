@@ -485,19 +485,21 @@ fn draw_vsep(buf: &mut [u8], buf_w: u32, buf_h: u32, x: u32, color: [u8; 4], sca
     let inset = (6.0 * scale) as u32;
     let y0 = inset;
     let y1 = buf_h.saturating_sub(inset);
-    if x >= buf_w {
+    if x >= buf_w || y1 <= y0 {
         return;
     }
-    for y in y0..y1 {
-        let idx = ((y * buf_w + x) * 4) as usize;
-        if idx + 3 < buf.len() {
-            // color 为 [R,G,B,A]，缓冲为 BGRA
-            buf[idx] = color[2];
-            buf[idx + 1] = color[1];
-            buf[idx + 2] = color[0];
-            buf[idx + 3] = color[3];
-        }
-    }
+    // 1px 竖线 = 直角矩形（tiny-skia），与其它形状统一
+    crate::view::fill_rounded(
+        buf,
+        buf_w,
+        buf_h,
+        x as f32,
+        y0 as f32,
+        1.0,
+        (y1 - y0) as f32,
+        color,
+        0.0,
+    );
 }
 
 /// 左侧拖动柄：2×3 点阵
@@ -517,28 +519,6 @@ fn draw_grip(buf: &mut [u8], buf_w: u32, buf_h: u32, grip_w: u32, color: [u8; 4]
 }
 
 fn fill_dot(buf: &mut [u8], buf_w: u32, buf_h: u32, cx: f32, cy: f32, r: f32, color: [u8; 4]) {
-    let r2 = r * r;
-    let x0 = (cx - r).floor() as i32;
-    let x1 = (cx + r).ceil() as i32;
-    let y0 = (cy - r).floor() as i32;
-    let y1 = (cy + r).ceil() as i32;
-    for py in y0..y1 {
-        for px in x0..x1 {
-            if px < 0 || py < 0 || px >= buf_w as i32 || py >= buf_h as i32 {
-                continue;
-            }
-            let ddx = px as f32 + 0.5 - cx;
-            let ddy = py as f32 + 0.5 - cy;
-            if ddx * ddx + ddy * ddy <= r2 {
-                let idx = ((py * buf_w as i32 + px) * 4) as usize;
-                if idx + 3 < buf.len() {
-                    // color 为 [R,G,B,A]，缓冲为 BGRA
-                    buf[idx] = color[2];
-                    buf[idx + 1] = color[1];
-                    buf[idx + 2] = color[0];
-                    buf[idx + 3] = color[3];
-                }
-            }
-        }
-    }
+    // 抗锯齿圆点（tiny-skia），与其它形状统一
+    crate::view::fill_circle(buf, buf_w, buf_h, cx, cy, r, color);
 }
