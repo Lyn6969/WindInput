@@ -8,7 +8,7 @@ use std::cell::RefCell;
 use std::rc::Rc;
 use std::sync::mpsc::Sender;
 
-use crate::debounce::Debouncer;
+use std::time::{Duration, Instant};
 use crate::manager::{UiEvent, HOVER_PAGE_NEXT as TAG_PAGE_NEXT, HOVER_PAGE_PREV as TAG_PAGE_PREV};
 use crate::text::dwrite::TextRenderer;
 use crate::view::{Align, Edges, Layout, Rect, View};
@@ -137,7 +137,9 @@ impl CandidateWindow {
             events,
             last_hover: -1,
             last_cursor: (i32::MIN, i32::MIN),
-            hover_debounce: Debouncer::new(120),
+            engaged: false,
+            engage_at: None,
+            pending_raw: -1,
         }));
         window.register_mouse(mouse.clone());
         Ok(Self {
@@ -477,26 +479,46 @@ pub struct CandidateMouse {
     last_hover: i32,
     /// 上次物理光标屏幕坐标——过滤内容变化引起的伪 WM_MOUSEMOVE
     last_cursor: (i32, i32),
-    /// 悬停防抖：稳定后才发出（避免打字/快速划过的高亮+tooltip 闪烁）
-    hover_debounce: Debouncer<i32>,
+    /// 窗口级闸门：是否已"激活"（用户已真实移动鼠标过本窗口）。
+    /// 激活后每次 hover 立即响应，不再有逐项延迟。
+    engaged: bool,
+    /// 首次真实移动后的激活时刻；到期即激活（窗口级一次性防抖）。
+    engage_at: Option<Instant>,
+    /// 最近一次命中目标（激活瞬间据此发出首个悬停）。
+    pending_raw: i32,
 }
 
 impl CandidateMouse {
-    /// 由 UI 循环每轮调用：到期则发出去抖后的悬停目标。
+    /// 由 UI 循环每轮调用：未激活时检查激活闸门到期，激活瞬间补发当前悬停。
     fn flush(&mut self) {
-        if let Some(t) = self.hover_debounce.poll() {
-            if t != self.last_hover {
-                self.last_hover = t;
-                let _ = self.events.send(UiEvent::Hover(t));
+        if self.engaged {
+            return; // 已激活：悬停在 on_message 内即时发出
+        }
+        if let Some(at) = self.engage_at {
+            if Instant::now() >= at {
+                self.engaged = true;
+                self.engage_at = None;
+                if self.pending_raw != self.last_hover {
+                    self.last_hover = self.pending_raw;
+                    let _ = self.events.send(UiEvent::Hover(self.pending_raw));
+                }
             }
         }
     }
 
     /// 重置悬停状态（窗口隐藏 / 新组合）。
+    /// 以当前物理光标位作基线，使内容刷新引起的伪移动被门控，仅真实移动才激活。
     fn reset_hover(&mut self) {
-        self.hover_debounce.cancel();
         self.last_hover = -1;
-        self.last_cursor = (i32::MIN, i32::MIN);
+        self.engaged = false;
+        self.engage_at = None;
+        self.pending_raw = -1;
+        let (sx, sy) = unsafe {
+            let mut p = windows::Win32::Foundation::POINT::default();
+            let _ = GetCursorPos(&mut p);
+            (p.x, p.y)
+        };
+        self.last_cursor = (sx, sy);
     }
 }
 
@@ -558,9 +580,18 @@ impl WindowMouse for CandidateMouse {
                 }
                 self.last_cursor = (sx, sy);
                 let (x, y) = mouse_pos(lparam);
-                // 命中目标经防抖：稳定 ~120ms 后才高亮/显示 tooltip
                 let raw = self.hit(x, y);
-                self.hover_debounce.trigger(raw);
+                self.pending_raw = raw;
+                if self.engaged {
+                    // 已激活：即时高亮/显示 tooltip，无逐项延迟
+                    if raw != self.last_hover {
+                        self.last_hover = raw;
+                        let _ = self.events.send(UiEvent::Hover(raw));
+                    }
+                } else if self.engage_at.is_none() {
+                    // 首次真实移动：启动窗口级激活闸门（仅一次，~60ms）
+                    self.engage_at = Some(Instant::now() + Duration::from_millis(60));
+                }
                 Some(LRESULT(0))
             }
             WM_RBUTTONDOWN => {
