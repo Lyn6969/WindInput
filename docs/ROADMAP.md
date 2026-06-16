@@ -86,6 +86,9 @@ WindInput/              产品仓根
   ④ coordinator 吸取 Go 统一管线/模式融合**目标态**（避开半迁移双轨）；⑤ schema 是质量特性配置面，统一为一套富 Schema。
   ⑥ **智能拼音单列权威设计**（见 redesign/pinyin-smart-input.md）：lattice 用 trie common-prefix-search（拼音系统词库=只读 mmap trie，crawdad/yada/fst 评估），bigram 必做；
   **纠正**前 dict.md"弃 wdat 统一 wdb"——码表用 wdb、拼音用 trie（按访问模式分，Go 分法是对的）。
+  ⑦ **跨平台包架构**（见 redesign/platform-architecture.md）：核心 crate 已 0 平台行（含 coordinator），耦合仅 wind-ui/wind-bridge/apps；
+  目标=核心无关层 + 平台 trait 层(Transport/TextClient/Surface/SystemServices) + 平台实现(cfg/平台crate) + 原生 host(wind_tsf C++/wind_macos Swift) + wind-ffi；
+  光栅用 tiny-skia(跨平台)、文本走 backend trait(DirectWrite/CoreText)；macOS 实现排期阶段 D 后，现在只留门(trait 边界 + CI 守护核心 0 平台行 + 缺失能力按平台 trait 设计)。
   落地顺序：config 合并修复 + 富 Schema → store redb(user/temp/freq/shadow) → dict 接通 composite → engine 打分器/拼音 lattice trie + bigram → coordinator pipeline。
 
 ### 阶段 B — 输入质量核心补齐（engine + dict + store）
