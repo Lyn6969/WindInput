@@ -128,7 +128,7 @@ F → 透传
 - **engine 内融合**（engine.md mixed）：同一方案内码表+拼音候选分层加权。
 - **coordinator 级融合**（本文 Provider）：跨来源（日期/计算/英文/生僻字/临时拼音）候选并入一个列表。
 - 二者是不同层次：Provider 的 ProviderPinyin 委托 engine 出候选；engine 不感知 quick_input 等 coordinator 模式。
-- dict 差分的"查询时 FreqBoost"+ store 的词频，发生在 engine/dict 层；coordinator 只消费候选并管交互。三者经由 `Candidate.{weight,source,consumed_length}` 协作。
+- 词库合并（dict composite）+ 词频重排（engine 排序层，见 [frequency.md](./frequency.md)）+ 打分（engine RimeScorer）都在 engine/dict 层；coordinator 只消费候选并管交互。三者经由 `Candidate.{weight,source,consumed_length}` 协作。
 
 ## 9. 落地顺序
 coordinator 重构属 **阶段 C（交互层）**，不阻塞 engine/dict/store 的质量核心（阶段 B）。但架构现已锁定：

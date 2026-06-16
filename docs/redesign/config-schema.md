@@ -43,9 +43,9 @@
 - **MixedSpec**（对齐 engine.md §3）：primary_schema / secondary_schema / min_pinyin_length(默认2) / codetable_weight_boost(默认1e7) / show_source_hint / enable_abbrev_match / pinyin_only_overflow(默认true) / enable_english / top_code_override_pinyin。
 - **DictSpec**（对齐 dict.md）：id/label/path/type(codetable/rime_codetable/rime_pinyin) / default / default_enabled:Option<bool> / enabled:Option<bool> / role(system) / **weight_spec(median/max/min/mode:linear|log/target，归一化上限 10000)** / weight_as_order。
 - **EncoderSpec**（造词/编码提示）：rules[{length_equal | length_in_range:[min,max], formula:"AaAbBaBb"}] / max_word_length / exclude_patterns。
-- **LearningSpec**（对齐 store.md §3-4）：auto_learn{count_threshold:2, min_word_length:2, weight_delta:40, add_weight:800} / auto_phrase{min/max_phrase_len:2/5, idle_timeout_ms:5000, ...} / **freq{enabled, protect_top_n, half_life:72h, boost_max:2000, max_recency, base_scale, streak_scale, streak_cap}** / unigram_path / temp_max_entries:5000 / temp_promote_count:5。
+- **LearningSpec**（对齐 store.md §3 + [frequency.md](./frequency.md)）：auto_learn{count_threshold:2, min_word_length:2, weight_delta:40, add_weight:800} / auto_phrase{min/max_phrase_len:2/5, idle_timeout_ms:5000, ...} / **freq{enabled, 拼音衰减参数: half_life:72h, base_scale, recency_peak}**（**词频已重构，去掉 boost_max/streak_scale/streak_cap 等 boost-to-weight 旧字段**）/ 码表排序在 CodeTableSpec.candidate_sort_mode 选 `frequency` / unigram_path / temp_max_entries:5000 / temp_promote_count:5。
 
-> ⚠️ **词频默认值两套源**（已核实）：schema `FreqSpec` 注释默认（max_recency 300 / base_scale 100 / streak_scale 50 / streak_cap 250）≠ store `DefaultFreqProfile`（100/50/30/150）。Go 中 schema 仅在字段 >0 时覆盖 store 默认。**Rust 必须定唯一真值源**（建议 store 为默认、schema 为覆盖层，文档对齐），与 store.md §4 联动。
+> ⚠️ **词频系统已完全重构**，以 [frequency.md](./frequency.md) 为准：词频与权重解耦、只存 {count,last_used}、作排序独立维度（码表 used-first 可选模式 / 拼音衰减分）。FreqSpec 仅保留拼音衰减参数，**单一真值源**（store 默认 + schema 覆盖）——消除旧"两套默认源不一致"。
 
 ---
 

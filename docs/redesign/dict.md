@@ -23,7 +23,7 @@
 2. Rust 已有干净的 `DictLayer`/`LayerType` trait 设计，缺的是把 store 层和 DictManager 接上。
 3. **保留** Rust 的 mmap combined.wdb 作为 **System 层后端**（不可变层的预合并是合理优化，契合内存目标）。
 
-> **跨文档修正**：engine.md 记的"词频 boost 由 coordinator 应用"是 Rust 现状；目标改为**在 CompositeDict 查询时应用 FreqBoost**（freq → dictWeight → engine RimeScorer 归一化 + LM）。引擎的 `dict` 字段从 `CachedDict` 改为 composite 查询接口。
+> **跨文档修正（再修正）**：词频以 [frequency.md](./frequency.md) 为准——**词频与权重彻底解耦，不在查询时改 weight**。CompositeDict 只负责**合并各层候选**（system+用户词+temp+phrase，带 weight）；词频作为**排序阶段的独立维度**由 engine 排序层应用（码表 used-first 可选模式 / 拼音衰减分）。引擎的 `dict` 字段从 `CachedDict` 改为 composite 查询接口。
 
 ---
 
@@ -40,7 +40,7 @@
 
 - **Shadow 不是层**：它是 `ShadowProvider`，引擎排序后应用（pin/delete）。
   → **修 Rust 现 bug**：`layer.rs` 把 `Shadow=1` 当成 LayerType（与 Go 同款死枚举错误），重设计删除它，Shadow 独立为 provider。
-- 查询语义照搬 Go composite（去重保更高 weight/更短 code + perLayerNOOffset + 查询时 FreqBoost + 排序截断），但用栈上 `HashMap` 去重，不引入 sync.Pool。
+- 查询语义照搬 Go composite（去重保更高 weight/更短 code + perLayerNOOffset + 排序截断），但用栈上 `HashMap` 去重，不引入 sync.Pool。**不做查询时 FreqBoost**（词频改为排序阶段独立维度，见 [frequency.md](./frequency.md)）。
 - 前缀按前缀长度限流（Go defaultPrefixSafeLimit 200/800/500/300，魔法值，Rust 按实际词库规模重定）。
 - `SearchSystemOnly`（仅 System/Cell，不调频）供 ProtectTopN。
 
@@ -55,7 +55,7 @@ Go（store_layer.go，已核实）：
 - 词频：`FreqHandler.Record`→`store.IncrementFreqAsync`（**异步批量写**，减 redb 写锁竞争）；`StoreFreqScorer.FreqBoost`(code,text)→`CalcFreqBoostWithProfile`，查询时加到 weight。
 
 Rust 现状：`store_layer.rs` 空壳；用户词/词频/temp/shadow 散落 wind-store，未经 composite 统一。
-**目标边界**：实现 `store_layer.rs`，把 wind-store 的 user/temp/freq/shadow 包装成 `DictLayer`/`ShadowProvider`/`FreqScorer` 挂进 composite。异步词频写保留（对齐 Go，契合 redb）。**此项牵动 wind-store**，需在 store 差分同步定义接口（GetUserWords/LearnTempWord/CalcFreqBoost/Shadow 记录等）。
+**目标边界**：实现 `store_layer.rs`，把 wind-store 的 **user/temp 词包装成 `DictLayer`、shadow 包装成 `ShadowProvider` 挂进 composite**。**词频不挂 composite**——它是 engine 排序层的独立维度（[frequency.md](./frequency.md)），engine 只需 store 的 freq 只读访问（`freq_lookup`）。异步词频写保留（对齐 Go，契合 redb）。**此项牵动 wind-store**，需在 store 差分同步定义接口（GetUserWords/LearnTempWord/freq_lookup/Shadow 记录等）。
 
 ---
 

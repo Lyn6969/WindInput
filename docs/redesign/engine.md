@@ -58,7 +58,7 @@ weight = int(score * 1_000_000)
 | 打分模型 | RimeScorer（归一+LM+iq+coverage） | 裸 weight 排序 | **候选排序质量差距的主因** |
 | initialQuality 分档 | 每步细分 | 无 | 单字/词组/简拼混排无序 |
 | 流水线步骤 | ~10 步 | 5 步 | 多切分/简拼/首字候选缺失 |
-| 用户词频学习 | unigram.BoostUserFreq | 上层 coordinator 简单 boost（待核） | 自适应弱 |
+| 用户词频学习 | unigram.BoostUserFreq（加权到 weight，已弃）| 上层 coordinator 简单 boost | **重构**：见 [frequency.md](./frequency.md)，词频解耦为排序独立维度 |
 | 双拼 | 完整 converter+内置方案+预编辑 | **完全缺失/被过滤** | 双拼用户无法用 |
 | bigram | 可选 | 无 | 长句二阶上下文缺 |
 | Shadow/代码提示/模糊音热更 | 有 | 无/弱 | 功能缺 |
@@ -71,6 +71,7 @@ weight = int(score * 1_000_000)
 
 ### 1.6 Rust 目标边界（决策）
 1. **引入单一打分器** `RimeScorer` 等价物：`normalize_weight(dict_weight)` + `unigram.log_prob*0.3` + `initial_quality` + `coverage`，`×1e6`。这是阶段 B 的第一优先（最大质量杠杆）。
+   - 注：打分器只产出**词库基础质量分**（基于权重+LM）。**用户词频不进打分器、不改 dict_weight**——它是打分之后的**独立重排步骤**（码表 used-first 可选模式 / 拼音衰减分叠加），详见 [frequency.md](./frequency.md)。engine 排序层需持 store 的 freq 只读访问。
 2. `initial_quality` 用 `enum CandidateTier { Command, Sentence, ExactPhrase, MultiSeg, SubPhrase, LeadingChar, Abbrev, PartialExpand }` → f32 常量表，集中定义。
 3. 补流水线步骤：命令查询、多切分并行打分、首段/首音节单字、纯简拼（字数=音节数）。
 4. 双拼作为**独立工作项**（见 §4）：converter + 内置方案表 + 双拼预编辑 + 解除 manager 过滤。

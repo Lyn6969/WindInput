@@ -63,9 +63,13 @@ Rust 现状：`user_words.rs` 仅 `UserWordRecord` 结构（字段名 created_at
 
 ---
 
-## 4. 词频模型（质量相关，与 engine scorer 联动）
+## 4. 词频模型（质量相关）
 
-Go `CalcFreqBoostWithProfile`（已核实公式）：
+> ⚠️ **本节已被 [frequency.md](./frequency.md) 取代**（用户反馈：Go 的 boost-to-weight 完全重构）。
+> 新模型：词频与权重**彻底解耦**，freq 只存 `{count, last_used}`（去 streak/boost），作为**排序独立维度**
+> （码表 used-first 可选模式；拼音衰减分），**不再加到 weight**。下方 Go 现状仅作"被推翻的旧设计"留档。
+
+Go `CalcFreqBoostWithProfile`（已核实公式，**旧模型，已弃**）：
 ```
 base    = log2(Count+1) * BaseScale(50)
 lambda  = ln2 / DecayHalfLife(72h)
@@ -140,5 +144,5 @@ Rust 现状：`shadow.rs` 逻辑**已对齐且扎实**（pin LIFO、delete 优�
 2. **user_words + temp_words**（§3）+ **freq 统一模型**（§4）+ **shadow 迁 redb**（§5）——满足 §9 契约，解锁 dict 的 store_layer。
 3. phrases（随 dict Logic 层）、stats/bulk（阶段 D）、Go 数据导入工具（阶段 D，字段现已兼容）。
 
-> 与 engine.md（freq→dictWeight→scorer 归一化）、dict.md（store_layer 挂层 + 查询时 FreqBoost）三者构成质量核心闭环；落地建议顺序：store §10.1-2 → dict §9.1 → engine 打分器。
+> 词频设计以 [frequency.md](./frequency.md) 为准（解耦权重、排序独立维度）。落地建议顺序：store §10.1-2 → dict §9.1 → engine 打分器 + 词频重排。
 > 每步 `wind_input/scripts/dev.sh ci` 把关。
