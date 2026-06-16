@@ -142,9 +142,10 @@ struct State {
     filter_mode: wind_candidate::FilterMode,
     /// 用户是否开启常驻工具栏（菜单开关；与“当前是否激活”正交）。
     toolbar_visible: bool,
-    /// 本输入法当前是否处于激活态（IME_ACTIVATED/FocusGained 置真，
-    /// IME_DEACTIVATED 置假）。工具栏仅在激活态显示，对齐 Go toolbar_reducer
-    /// 的 `imeActivated && userWantsVisible` 公式，根治“切走输入法工具栏仍常驻”。
+    /// 本输入法当前是否处于激活态：IME_ACTIVATED/FocusGained 置真；
+    /// IME_DEACTIVATED（切换输入法）与 FocusLost（失焦，含“每应用独立输入法”下切到
+    /// 别的输入法的应用）置假。工具栏仅在激活态显示，对齐 Go toolbar_reducer 的
+    /// `imeActivated && userWantsVisible` 公式；隐藏经 UI 层 50ms 防抖消除切换闪烁。
     ime_active: bool,
     caps_lock: bool,
     input_buffer: String,
@@ -2727,6 +2728,11 @@ impl MessageHandler for Coordinator {
     fn handle_focus_lost(&self) {
         // 失焦是稳定的落盘时机，把累积词频持久化
         self.save_freq();
+        // 失焦即视为非激活并隐藏工具栏：用户开启系统“为每个应用窗口使用不同输入法”时，
+        // 切到使用别的输入法的应用不会触发 IME_DEACTIVATED，只有 FocusLost。隐藏经 UI 层
+        // 50ms 防抖——若紧接着 FocusGained（同输入法切窗/切文本框）会取消隐藏，无闪烁。
+        self.state.lock().unwrap_or_else(|e| e.into_inner()).ime_active = false;
+        self.notify_toolbar();
     }
 
     fn get_current_mode(&self) -> (bool, bool) {

@@ -254,6 +254,10 @@ impl UiManager {
         let mut tip_hide_at: Option<std::time::Instant> = None;
         // 状态提示防抖：合并快速连续的提示（如连按切换），避免气泡闪烁
         let mut tip_debounce = crate::debounce::Debouncer::<(String, i32, i32)>::new(60);
+        // 工具栏隐藏防抖：HideToolbar 不立即隐藏，延后 50ms；若期间收到 UpdateToolbar
+        // （应用间切换的 FocusLost→FocusGained 串），取消隐藏并显示——消除 Alt+Tab 闪烁。
+        let mut toolbar_hide_at: Option<std::time::Instant> = None;
+        const TOOLBAR_HIDE_DEBOUNCE: std::time::Duration = std::time::Duration::from_millis(50);
 
         // 右键候选弹出菜单（best-effort）
         let mut popup_menu = match crate::popup_menu::PopupMenu::new(event_tx.clone()) {
@@ -285,6 +289,15 @@ impl UiManager {
                         t.hide();
                     }
                     tip_hide_at = None;
+                }
+            }
+            // 工具栏隐藏防抖到期：确认隐藏
+            if let Some(deadline) = toolbar_hide_at {
+                if std::time::Instant::now() >= deadline {
+                    if let Some(t) = &mut toolbar {
+                        t.hide();
+                    }
+                    toolbar_hide_at = None;
                 }
             }
             // 非阻塞处理 Win32 消息
@@ -398,15 +411,15 @@ impl UiManager {
                         }
                         UiCommand::UpdateToolbar(tb_state) => {
                             debug!("UI: UpdateToolbar {:?}", tb_state);
+                            toolbar_hide_at = None; // 取消待定隐藏（切回本输入法 → 保持显示）
                             if let Some(t) = &mut toolbar {
                                 t.update(&tb_state);
                             }
                         }
                         UiCommand::HideToolbar => {
-                            debug!("UI: HideToolbar");
-                            if let Some(t) = &mut toolbar {
-                                t.hide();
-                            }
+                            debug!("UI: HideToolbar (debounced {}ms)", TOOLBAR_HIDE_DEBOUNCE.as_millis());
+                            // 延后隐藏：50ms 内若有 UpdateToolbar 则取消，消除应用间切换闪烁。
+                            toolbar_hide_at = Some(std::time::Instant::now() + TOOLBAR_HIDE_DEBOUNCE);
                         }
                         UiCommand::SetToolbarPos { x, y } => {
                             debug!("UI: SetToolbarPos ({},{})", x, y);
