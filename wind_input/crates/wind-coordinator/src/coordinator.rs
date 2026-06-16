@@ -393,7 +393,7 @@ impl Coordinator {
             .map(|s| s.trim().to_string())
             .filter(|s| !s.is_empty())
             .or_else(|| {
-                let t = config.ui.theme.trim();
+                let t = config.ui.theme.name.trim();
                 if t.is_empty() {
                     None
                 } else {
@@ -697,7 +697,7 @@ impl Coordinator {
 
     /// 每页候选数（来自配置，至少 1）
     fn per_page(&self) -> usize {
-        self.config.ui.per_page.max(1)
+        self.config.ui.candidate.per_page.max(1)
     }
 
     /// 若 key_code 是配置的二/三候选键，返回页内候选偏移（1=次选/第2项，2=三选/第3项）。

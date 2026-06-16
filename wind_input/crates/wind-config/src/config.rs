@@ -5,7 +5,25 @@
 
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
-use tracing::{debug, info};
+use tracing::info;
+
+/// 深合并两个 TOML 值：表递归合并（overlay 的键覆盖/新增），标量与数组由 overlay 整体覆盖。
+/// 用于配置三层合并——overlay 中未出现的键保留 base 的值。
+fn merge_value(base: &mut toml::Value, overlay: toml::Value) {
+    match (base, overlay) {
+        (toml::Value::Table(b), toml::Value::Table(o)) => {
+            for (k, v) in o {
+                match b.get_mut(&k) {
+                    Some(bv) => merge_value(bv, v),
+                    None => {
+                        b.insert(k, v);
+                    }
+                }
+            }
+        }
+        (b, o) => *b = o,
+    }
+}
 
 /// 完整配置
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -248,25 +266,63 @@ fn default_per_page() -> usize {
     7
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// UI 配置（子表结构，对齐真实 config.toml：[ui.candidate] / [ui.font] / [ui.theme]）
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct UiConfig {
     #[serde(default)]
-    pub font_size: f64,
+    pub candidate: UiCandidateConfig,
+    #[serde(default)]
+    pub font: UiFontConfig,
+    #[serde(default)]
+    pub theme: UiThemeConfig,
+}
+
+/// 候选窗配置（[ui.candidate]）
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UiCandidateConfig {
     /// 候选每页显示数（默认 7，对齐 Go 版本）
     #[serde(default = "default_per_page")]
     pub per_page: usize,
     #[serde(default)]
-    pub theme: String,
+    pub layout: String,
+    #[serde(default)]
+    pub inline_preedit: bool,
+    #[serde(default)]
+    pub preedit_mode: String,
+    #[serde(default)]
+    pub hide_window: bool,
 }
 
-impl Default for UiConfig {
+impl Default for UiCandidateConfig {
     fn default() -> Self {
         Self {
-            font_size: 0.0,
             per_page: default_per_page(),
-            theme: String::new(),
+            layout: String::new(),
+            inline_preedit: false,
+            preedit_mode: String::new(),
+            hide_window: false,
         }
     }
+}
+
+/// 字体配置（[ui.font]）
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct UiFontConfig {
+    #[serde(default)]
+    pub family: String,
+    #[serde(default)]
+    pub path: String,
+    #[serde(default)]
+    pub render_mode: String,
+}
+
+/// 主题配置（[ui.theme]）
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct UiThemeConfig {
+    #[serde(default)]
+    pub name: String,
+    #[serde(default)]
+    pub style: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -400,15 +456,20 @@ impl Default for Config {
 }
 
 impl Config {
-    /// 三层合并加载：默认值 → data_dir/config.toml → 用户配置
+    /// 三层合并加载：默认值 → data_dir/config.toml → 用户配置。
+    ///
+    /// 合并方式：把三层各自的 `toml::Value`（默认值序列化得到）深合并（表递归、标量/数组后者覆盖），
+    /// 最后一次性反序列化为 `Config`。相比旧的手写逐字段合并，**所有段（含 features/compat/debug）
+    /// 都会被合并**，不再静默丢弃；新增配置字段无需改合并代码。
     pub fn load(data_dir: Option<&Path>) -> anyhow::Result<Self> {
-        let mut config = Self::default();
+        // Layer 1: 代码默认值（序列化为 Value，保证所有字段存在）
+        let mut merged = toml::Value::try_from(Self::default())?;
 
         // Layer 2: 系统预置配置 (data/config.toml)
         if let Some(data_dir) = data_dir {
             let sys_config = data_dir.join("config.toml");
-            if sys_config.exists() {
-                config.merge_from_file(&sys_config)?;
+            if let Some(v) = Self::read_toml_value(&sys_config) {
+                merge_value(&mut merged, v);
                 info!("Loaded system config: {}", sys_config.display());
             }
         }
@@ -416,136 +477,42 @@ impl Config {
         // Layer 3: 用户配置 (%APPDATA%/WindInput/config.toml)
         if let Some(user_dir) = Self::user_config_dir() {
             let user_config = user_dir.join("config.toml");
-            if user_config.exists() {
-                config.merge_from_file(&user_config)?;
+            if let Some(v) = Self::read_toml_value(&user_config) {
+                merge_value(&mut merged, v);
                 info!("Loaded user config: {}", user_config.display());
             }
         }
 
+        let mut config: Config = merged.try_into()?;
+        config.normalize();
         Ok(config)
     }
 
-    /// 从 TOML 文件合并配置（部分覆盖）
-    fn merge_from_file(&mut self, path: &Path) -> anyhow::Result<()> {
-        let content = std::fs::read_to_string(path)?;
-        let partial: toml::Value = toml::from_str(&content)?;
-
-        // 逐段合并
-        if let Some(general) = partial.get("general") {
-            let g: GeneralConfig = general.clone().try_into().unwrap_or_default();
-            if general.get("remember_last_state").is_some() {
-                self.general.remember_last_state = g.remember_last_state;
-            }
-            if general.get("default_chinese_mode").is_some() {
-                self.general.default_chinese_mode = g.default_chinese_mode;
-            }
-            if general.get("default_full_width").is_some() {
-                self.general.default_full_width = g.default_full_width;
-            }
-            if general.get("default_chinese_punct").is_some() {
-                self.general.default_chinese_punct = g.default_chinese_punct;
-            }
+    /// 读取 TOML 文件为 Value（不存在/解析失败返回 None 并告警，不中断加载）
+    fn read_toml_value(path: &Path) -> Option<toml::Value> {
+        if !path.exists() {
+            return None;
         }
-
-        if let Some(schema) = partial.get("schema") {
-            let s: SchemaConfig = schema.clone().try_into().unwrap_or_default();
-            if schema.get("active").is_some() {
-                self.schema.active = s.active;
-            }
-            if schema.get("available").is_some() {
-                self.schema.available = s.available;
-            }
-        }
-
-        if let Some(hotkeys) = partial.get("hotkeys") {
-            let h: HotkeysConfig = hotkeys.clone().try_into().unwrap_or_default();
-            // 合并所有热键字段：仅当该 key 出现在文件中才覆盖（否则保留下层值）。
-            // 此前只合并了 4 个字段，导致 switch_engine 等被丢弃 → Ctrl+Shift+E 等热键失效。
-            if hotkeys.get("toggle_mode_keys").is_some() {
-                self.hotkeys.toggle_mode_keys = h.toggle_mode_keys;
-            }
-            if hotkeys.get("commit_on_switch").is_some() {
-                self.hotkeys.commit_on_switch = h.commit_on_switch;
-            }
-            if hotkeys.get("switch_engine").is_some() {
-                self.hotkeys.switch_engine = h.switch_engine;
-            }
-            if hotkeys.get("toggle_full_width").is_some() {
-                self.hotkeys.toggle_full_width = h.toggle_full_width;
-            }
-            if hotkeys.get("toggle_punct").is_some() {
-                self.hotkeys.toggle_punct = h.toggle_punct;
-            }
-            if hotkeys.get("toggle_toolbar").is_some() {
-                self.hotkeys.toggle_toolbar = h.toggle_toolbar;
-            }
-            if hotkeys.get("open_settings").is_some() {
-                self.hotkeys.open_settings = h.open_settings;
-            }
-            if hotkeys.get("add_word").is_some() {
-                self.hotkeys.add_word = h.add_word;
-            }
-            if hotkeys.get("toggle_s2t").is_some() {
-                self.hotkeys.toggle_s2t = h.toggle_s2t;
-            }
-            if hotkeys.get("activate_ime").is_some() {
-                self.hotkeys.activate_ime = h.activate_ime;
-            }
-            if hotkeys.get("pin_candidate").is_some() {
-                self.hotkeys.pin_candidate = h.pin_candidate;
-            }
-            if hotkeys.get("delete_candidate").is_some() {
-                self.hotkeys.delete_candidate = h.delete_candidate;
-            }
-            if hotkeys.get("global_hotkeys").is_some() {
-                self.hotkeys.global_hotkeys = h.global_hotkeys;
-            }
-        }
-
-        if let Some(input) = partial.get("input") {
-            let i: InputConfig = input.clone().try_into().unwrap_or_default();
-            if input.get("filter_mode").is_some() {
-                self.input.filter_mode = i.filter_mode;
-            }
-            if input.get("select_key_groups").is_some() {
-                self.input.select_key_groups = i.select_key_groups;
-            }
-            if input.get("page_keys").is_some() {
-                self.input.page_keys = i.page_keys;
-            }
-            if input.get("enter_behavior").is_some() {
-                self.input.enter_behavior = i.enter_behavior;
-            }
-            if input.get("pinyin_separator").is_some() {
-                self.input.pinyin_separator = i.pinyin_separator;
-            }
-            if input.get("temp_pinyin").is_some() {
-                self.input.temp_pinyin = i.temp_pinyin;
-            }
-        }
-
-        if let Some(ui) = partial.get("ui") {
-            if ui.get("font_size").is_some() {
-                self.ui.font_size = ui.get("font_size").and_then(|v| v.as_float()).unwrap_or(14.0);
-            }
-            // per_page 实际位于 [ui.candidate]（对齐 Go 配置结构），回退兼容 [ui].per_page
-            if let Some(pp) = ui
-                .get("candidate")
-                .and_then(|c| c.get("per_page"))
-                .or_else(|| ui.get("per_page"))
-                .and_then(|v| v.as_integer())
-            {
-                if pp > 0 {
-                    self.ui.per_page = pp as usize;
+        match std::fs::read_to_string(path) {
+            Ok(content) => match toml::from_str::<toml::Value>(&content) {
+                Ok(v) => Some(v),
+                Err(e) => {
+                    info!("Skip invalid config {}: {}", path.display(), e);
+                    None
                 }
-            }
-            if ui.get("theme").is_some() {
-                self.ui.theme = ui.get("theme").and_then(|v| v.as_str()).unwrap_or("").to_string();
+            },
+            Err(e) => {
+                info!("Cannot read config {}: {}", path.display(), e);
+                None
             }
         }
+    }
 
-        debug!("Config merged from {}", path.display());
-        Ok(())
+    /// 反序列化后的归一化：修正无效值（如 per_page=0 视为未设置，回退默认）。
+    fn normalize(&mut self) {
+        if self.ui.candidate.per_page == 0 {
+            self.ui.candidate.per_page = default_per_page();
+        }
     }
 
     /// 应用数据目录名：正式版 `WindInput`；调试变体 `WindInputDebug`
@@ -601,38 +568,61 @@ impl Config {
 mod tests {
     use super::*;
 
+    /// 模拟 load 的合并：默认 Value ← overlay 深合并 → 反序列化 + normalize。
+    fn merged_with(overlay_toml: &str) -> Config {
+        let mut base = toml::Value::try_from(Config::default()).unwrap();
+        let overlay: toml::Value = toml::from_str(overlay_toml).unwrap();
+        merge_value(&mut base, overlay);
+        let mut cfg: Config = base.try_into().unwrap();
+        cfg.normalize();
+        cfg
+    }
+
     #[test]
     fn test_default_per_page_is_7() {
-        assert_eq!(Config::default().ui.per_page, 7, "候选每页默认应为 7");
+        assert_eq!(Config::default().ui.candidate.per_page, 7, "候选每页默认应为 7");
     }
 
     #[test]
     fn test_merge_reads_per_page_from_ui_candidate() {
-        // per_page 位于 [ui.candidate]（对齐 Go 配置结构）
-        let toml = "[ui.candidate]\nper_page = 9\n";
-        let dir = std::env::temp_dir();
-        let path = dir.join("windinput_test_per_page.toml");
-        std::fs::write(&path, toml).unwrap();
-
-        let mut cfg = Config::default();
-        cfg.merge_from_file(&path).unwrap();
-        let _ = std::fs::remove_file(&path);
-
-        assert_eq!(cfg.ui.per_page, 9, "应从 [ui.candidate] 读取 per_page=9");
+        let cfg = merged_with("[ui.candidate]\nper_page = 9\n");
+        assert_eq!(cfg.ui.candidate.per_page, 9, "应从 [ui.candidate] 读取 per_page=9");
     }
 
     #[test]
     fn test_merge_per_page_zero_keeps_default() {
-        // per_page=0 视为无效，保留默认值，避免每页只显示 1 个
-        let toml = "[ui.candidate]\nper_page = 0\n";
-        let dir = std::env::temp_dir();
-        let path = dir.join("windinput_test_per_page_zero.toml");
-        std::fs::write(&path, toml).unwrap();
+        // per_page=0 视为无效，normalize 回退默认，避免每页只显示 1 个
+        let cfg = merged_with("[ui.candidate]\nper_page = 0\n");
+        assert_eq!(cfg.ui.candidate.per_page, 7, "per_page=0 应保留默认 7");
+    }
 
-        let mut cfg = Config::default();
-        cfg.merge_from_file(&path).unwrap();
-        let _ = std::fs::remove_file(&path);
+    #[test]
+    fn test_merge_keeps_features_compat_debug() {
+        // 回归：旧手写合并完全丢弃 features/compat/debug 段；deep-merge 必须保留
+        let cfg = merged_with(
+            "[features.s2t]\nenabled = true\nvariant = \"s2tw\"\n\
+             [debug]\nlog_level = \"trace\"\n\
+             [compat]\nhost_render_processes = [\"a.exe\"]\n",
+        );
+        assert!(cfg.features.s2t.enabled, "features.s2t.enabled 应被合并");
+        assert_eq!(cfg.features.s2t.variant, "s2tw");
+        assert_eq!(cfg.debug.log_level, "trace", "debug 段应被合并");
+        assert_eq!(cfg.compat.host_render_processes, vec!["a.exe".to_string()]);
+    }
 
-        assert_eq!(cfg.ui.per_page, 7, "per_page=0 应保留默认 7");
+    #[test]
+    fn test_merge_partial_keeps_unspecified_default() {
+        // overlay 只覆盖单个字段，同段其它字段保留默认（不被清空）
+        let cfg = merged_with("[input]\nenter_behavior = \"clear\"\n");
+        assert_eq!(cfg.input.enter_behavior, "clear");
+        assert_eq!(cfg.input.filter_mode, "smart", "同段未指定字段应保留默认");
+    }
+
+    #[test]
+    fn test_merge_input_subtable_fields() {
+        // 旧合并漏掉的 input 字段（如 smart_punct/auto_pair）现应合并
+        let cfg = merged_with("[input.auto_pair]\nchinese = false\nenglish = false\n");
+        assert!(!cfg.input.auto_pair.chinese);
+        assert!(!cfg.input.auto_pair.english);
     }
 }
