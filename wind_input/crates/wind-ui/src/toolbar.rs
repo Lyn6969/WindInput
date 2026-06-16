@@ -354,13 +354,24 @@ impl WindowMouse for ToolbarMouse {
                     }
                     let nx = self.origin.0 + (p.x - self.anchor.0);
                     let ny = self.origin.1 + (p.y - self.anchor.1);
-                    self.pos = Some((nx, ny));
+                    // 钳制到（最近显示器的）工作区，防止拖出桌面/拖入任务栏。
+                    // 多显示器下 MonitorFromPoint(NEAREST) 会随光标过界切到目标显示器。
+                    let (w, h) = unsafe {
+                        let mut r = RECT::default();
+                        if GetWindowRect(self.hwnd, &mut r).is_ok() {
+                            ((r.right - r.left) as u32, (r.bottom - r.top) as u32)
+                        } else {
+                            (0, 0)
+                        }
+                    };
+                    let (cx, cy) = clamp_to_work_area(nx, ny, w, h);
+                    self.pos = Some((cx, cy));
                     unsafe {
                         let _ = SetWindowPos(
                             self.hwnd,
                             HWND_TOPMOST,
-                            nx,
-                            ny,
+                            cx,
+                            cy,
                             0,
                             0,
                             SWP_NOSIZE | SWP_NOACTIVATE | SWP_NOZORDER,
