@@ -80,6 +80,11 @@ WindInput/              产品仓根
 参考 Go 仓库 `wind_input/docs/design/`（含归档设计稿）。
 - 优先子系统：**engine、dict、store**（候选质量短板集中处），其次 coordinator、schema/config。
 - 产出：每子系统一份 redesign spec（落 `docs/redesign/<模块>.md`），用户逐份确认后再进入补实现。
+- **已完成（2026-06-16）**：engine / dict / store / coordinator / config-schema 五份差分，证据化（Go 侧 agent 提取 + grep 抽验 file:line）。
+  关键交叉结论：① 词频流 store(算 boost)→dict(查询时加权)→engine(RimeScorer 归一化+LM)；
+  ② dict 分层 CompositeDict 脚手架存在但未接线，决策接通；③ store redb 未落地，决策统一后端；
+  ④ coordinator 吸取 Go 统一管线/模式融合**目标态**（避开半迁移双轨）；⑤ schema 是质量特性配置面，统一为一套富 Schema。
+  落地顺序：config 合并修复 + 富 Schema → store redb(user/temp/freq/shadow) → dict 接通 composite → engine 打分器 → coordinator pipeline。
 
 ### 阶段 B — 输入质量核心补齐（engine + dict + store）
 按阶段 A 锁定的架构补候选质量：拼音 LM/打分/模糊音、码表深度、混输策略、用户词频学习、临时词、影子层。
