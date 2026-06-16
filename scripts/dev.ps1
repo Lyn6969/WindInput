@@ -2,14 +2,16 @@
 # 用法: .\dev.ps1 或 powershell -File dev.ps1
 
 $ErrorActionPreference = "Stop"
-# 目录层级: <产品仓>\wind_input\scripts\dev.ps1
-#   ProjectRoot = wind_input    (Cargo workspace 根)
-#   ProductRoot = WindInput (产品仓根, 含 docs\VERSION 等共享资产)
-$ProjectRoot = Split-Path $PSScriptRoot -Parent
-$ProductRoot = Split-Path $ProjectRoot -Parent
+# 目录层级: <产品仓>\scripts\dev.ps1 （产品级编排脚本，统管 wind_input\ 及未来的 tsf\macos\）
+#   ProductRoot = <产品仓>          (产品仓根, 含 docs\VERSION、data\ 等共享资产)
+#   ProjectRoot = <产品仓>\wind_input (Cargo workspace 根)
+$ProductRoot = Split-Path $PSScriptRoot -Parent
+$ProjectRoot = "$ProductRoot\wind_input"
 $Version = (Get-Content "$ProductRoot\docs\VERSION" -Raw).Trim()
 $BuildDir = "$ProjectRoot\build"
 $BuildDebugDir = "$ProjectRoot\build_debug"
+$LocalData = "$ProductRoot\data"
+$DictProbe = "schemas\wubi86\wubi86_jidian.dict.yaml"
 # Go 仓库与产品仓同级
 $GoRepoRoot = Split-Path $ProductRoot -Parent
 
@@ -114,48 +116,52 @@ function Invoke-Clean {
 function Copy-TsfDll {
     param([string]$OutDir = $BuildDir, [string]$Suffix = "")
 
-    $goBuild = "$GoRepoRoot\WindInput\build"
-
-    Write-Host "`n从 Go 仓库复制 TSF DLL..." -ForegroundColor Green
-
+    Write-Host "`n复制 TSF DLL (暂复用 Go 仓库产物, 尚无 Rust 版)..." -ForegroundColor Green
+    New-Item -ItemType Directory -Path $OutDir -Force | Out-Null
+    $found = $false
     foreach ($dll in @("wind_tsf.dll", "wind_tsf_x86.dll")) {
-        $src = "$goBuild\$dll"
-        $dst = "$OutDir\$dll"
-        if (Test-Path $src) {
-            New-Item -ItemType Directory -Path $OutDir -Force | Out-Null
-            Copy-Item $src $dst -Force
-            Write-Host "已复制: $dll" -ForegroundColor Gray
-        } else {
-            Write-Host "未找到: $src" -ForegroundColor Yellow
+        foreach ($base in @("$GoRepoRoot\WindInput\build", "$GoRepoRoot\WindInput\build_debug")) {
+            $src = "$base\$dll"
+            if (Test-Path $src) {
+                Copy-Item $src "$OutDir\$dll" -Force
+                Write-Host "已复制: $dll (来自 $base)" -ForegroundColor Gray
+                $found = $true
+                break
+            }
         }
+    }
+    if (-not $found) {
+        Write-Host "未找到 Go TSF DLL (Go 仓库未构建); 仅本地完整镜像需要它。" -ForegroundColor Gray
     }
 }
 
 function Copy-Data {
     param([string]$OutDir = $BuildDir)
 
-    # 注意：必须用 Go 仓库的 build_debug\data（构建产物，含已下载的 rime 词典 +
-    # .schema.toml），而非 WindInput\data（源目录，不含 .dict.yaml 词典文件）。
-    # 否则部署后词典缺失，引擎无法构建，只能显示编码无候选。
-    $goData = "$GoRepoRoot\WindInput\build_debug\data"
-    if (-not (Test-Path "$goData\schemas\wubi86\wubi86_jidian.dict.yaml")) {
-        # 回退：若 build_debug 未构建，退回源目录（仅 schema，无词典）
-        Write-Host "警告: $goData 缺少词典，回退到源目录(无词典)" -ForegroundColor Yellow
-        $goData = "$GoRepoRoot\WindInput\data"
-    }
-
-    Write-Host "`n从 Go 仓库复制 data/ ($goData)..." -ForegroundColor Green
-
-    if (Test-Path $goData) {
-        New-Item -ItemType Directory -Path $OutDir -Force | Out-Null
-        if (Test-Path "$OutDir\data") {
-            Remove-Item -Recurse -Force "$OutDir\data"
-        }
-        Copy-Item "$goData" "$OutDir\data" -Recurse -Force
-        Write-Host "已复制: data/" -ForegroundColor Gray
+    # data 来源优先级：① 本机真实词库 ($LocalData) ② Go 构建产物 (build_debug\data)
+    # ③ Go 源目录 (仅 schema, 无 .dict.yaml → 引擎无候选)。优先真实词库，避免缺词典回退。
+    $src = $null
+    if (Test-Path "$LocalData\$DictProbe") {
+        $src = $LocalData
+        Write-Host "data 源: 本机真实词库 $LocalData" -ForegroundColor Gray
+    } elseif (Test-Path "$GoRepoRoot\WindInput\build_debug\data\$DictProbe") {
+        $src = "$GoRepoRoot\WindInput\build_debug\data"
+        Write-Host "data 源: Go 构建产物 $src" -ForegroundColor Gray
+    } elseif (Test-Path "$GoRepoRoot\WindInput\data") {
+        $src = "$GoRepoRoot\WindInput\data"
+        Write-Host "data 源: Go 源目录 (仅 schema, 无词典)" -ForegroundColor Yellow
     } else {
-        Write-Host "未找到: $goData" -ForegroundColor Yellow
+        Write-Host "找不到任何 data 源; 跳过 data 复制" -ForegroundColor Yellow
+        return
     }
+
+    Write-Host "`n复制 data/ ($src)..." -ForegroundColor Green
+    New-Item -ItemType Directory -Path $OutDir -Force | Out-Null
+    if (Test-Path "$OutDir\data") {
+        Remove-Item -Recurse -Force "$OutDir\data"
+    }
+    Copy-Item "$src" "$OutDir\data" -Recurse -Force
+    Write-Host "已复制: data/" -ForegroundColor Gray
 }
 
 function Deploy-All {

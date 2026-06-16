@@ -2,4 +2,4 @@ target/
 build_debug/
 build/
 /data/
-wind_input/scripts/deploy.local
+scripts/deploy.local

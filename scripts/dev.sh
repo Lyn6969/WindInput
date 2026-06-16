@@ -37,13 +37,14 @@
 set -o pipefail
 
 # ---------- 路径 ----------
-# 目录层级: <产品仓>/wind_input/scripts/dev.sh
-#   SCRIPT_DIR   = wind_input/scripts
-#   PROJECT_ROOT = wind_input        (Cargo workspace 根)
-#   PRODUCT_ROOT = WindInput     (产品仓根, 含 docs/VERSION 等共享资产)
+# 目录层级: <产品仓>/scripts/dev.sh （产品级编排脚本，统管 wind_input/ 及未来的 tsf/macos/）
+#   SCRIPT_DIR   = <产品仓>/scripts
+#   PRODUCT_ROOT = <产品仓>          (产品仓根, 含 docs/VERSION、data/ 等共享资产)
+#   PROJECT_ROOT = <产品仓>/wind_input (Cargo workspace 根)
+# 路径全部相对脚本自身(BASH_SOURCE)解析，与 CWD 无关。
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-PROJECT_ROOT="$(dirname "$SCRIPT_DIR")"
-PRODUCT_ROOT="$(dirname "$PROJECT_ROOT")"
+PRODUCT_ROOT="$(dirname "$SCRIPT_DIR")"
+PROJECT_ROOT="$PRODUCT_ROOT/wind_input"
 VERSION="$(tr -d '[:space:]' < "$PRODUCT_ROOT/docs/VERSION" 2>/dev/null || echo '?')"
 BUILD_DIR="$PROJECT_ROOT/build"
 BUILD_DEBUG_DIR="$PROJECT_ROOT/build_debug"
@@ -155,40 +156,60 @@ do_ci() {
 # 注意: Go 仓库 (../WindInput) 需先自行构建, 否则 DLL/词典缺失, 此处仅告警。
 copy_tsf_dll() {
     local outdir="${1:-$BUILD_DIR}"
-    local go_build="$GO_REPO/build"
-    say "\n从 Go 仓库复制 TSF DLL ($go_build)..."
     mkdir -p "$outdir"
-    local dll
+    say "\n复制 TSF DLL (暂复用 Go 仓库产物, 尚无 Rust 版)..."
+    local dll base src found=0
     for dll in wind_tsf.dll wind_tsf_x86.dll; do
-        if [ -f "$go_build/$dll" ]; then
-            cp -f "$go_build/$dll" "$outdir/$dll"
-            gray "已复制: $dll"
-        else
-            warn "未找到: $go_build/$dll"
-        fi
+        for base in "$GO_REPO/build" "$GO_REPO/build_debug"; do
+            src="$base/$dll"
+            if [ -f "$src" ]; then
+                cp -f "$src" "$outdir/$dll"
+                gray "已复制: $dll (来自 $base)"
+                found=1
+                break
+            fi
+        done
     done
+    if [ "$found" = 0 ]; then
+        gray "未找到 Go TSF DLL (Go 仓库未构建)。多数情况下无碍：'push' 经 SSH 部署时"
+        gray "复用 Windows 安装目录里已有的 DLL；仅在制作本地 build/ 完整镜像时才需要它。"
+    fi
 }
+
+# 词典探针：判断某 data 目录是否含已处理词典（而非仅 schema）。
+DICT_PROBE="schemas/wubi86/wubi86_jidian.dict.yaml"
 
 copy_data() {
     local outdir="${1:-$BUILD_DIR}"
-    # 必须用 Go 仓库的 build_debug/data (构建产物, 含已下载的 rime 词典 + .schema.toml),
-    # 而非 WindInput/data (源目录, 不含 .dict.yaml 词典文件)。否则部署后词典缺失,
-    # 引擎无法构建, 只能显示编码无候选。
-    local go_data="$GO_REPO/build_debug/data"
-    if [ ! -f "$go_data/schemas/wubi86/wubi86_jidian.dict.yaml" ]; then
-        warn "警告: $go_data 缺少词典, 回退到源目录 (仅 schema, 无词典)"
-        go_data="$GO_REPO/data"
+    # data 来源优先级：① 本机已拉取的真实词库 ($LOCAL_DATA, 来自 pull-data)
+    #                  ② Go 构建产物 (build_debug/data, 含 rime 词典)
+    #                  ③ Go 源目录 (仅 schema, 无 .dict.yaml 词典 → 引擎无候选)
+    # 优先真实词库，避免历史上的"缺词典回退"告警。
+    local src
+    if [ -f "$LOCAL_DATA/$DICT_PROBE" ]; then
+        src="$LOCAL_DATA"
+        gray "data 源: 本机真实词库 $LOCAL_DATA (来自 pull-data)"
+    elif [ -f "$GO_REPO/build_debug/data/$DICT_PROBE" ]; then
+        src="$GO_REPO/build_debug/data"
+        gray "data 源: Go 构建产物 $src"
+    elif [ -d "$GO_REPO/data" ]; then
+        src="$GO_REPO/data"
+        warn "data 源: Go 源目录 (仅 schema, 无词典) —— 建议先 './dev.sh dl' 拉真实词库"
+    else
+        warn "找不到任何 data 源 (本机无真实词库, Go 仓库也未构建); 跳过 data 复制"
+        return 0
     fi
 
-    say "\n从 Go 仓库复制 data/ ($go_data)..."
-    if [ -d "$go_data" ]; then
-        mkdir -p "$outdir"
-        rm -rf "$outdir/data"
-        cp -rf "$go_data" "$outdir/data"
-        gray "已复制: data/"
-    else
-        warn "未找到: $go_data"
+    # 避免自拷：源即目标时无需复制。
+    if [ "$src" = "$outdir/data" ]; then
+        gray "data 已在目标位置, 跳过"
+        return 0
     fi
+    say "\n复制 data/ ($src → $outdir/data)..."
+    mkdir -p "$outdir"
+    rm -rf "$outdir/data"
+    cp -rf "$src" "$outdir/data"
+    gray "已复制: data/"
 }
 
 deploy_all() {
@@ -301,10 +322,16 @@ show_menu() {
     echo  "    2  - cargo check (快速编译检查)"
     echo  "    3  - cargo clippy (代码检查)"
     echo  "    4  - cargo test (运行测试, 本机)"
-    printf '\n%b  部署:%b\n' "$C_YELLOW" "$C_RESET"
-    echo  "    5  - 完整部署 (复制 DLL + data)"
+    printf '\n%b  部署 (本机 build/ 镜像):%b\n' "$C_YELLOW" "$C_RESET"
+    echo  "    5  - 完整部署 (复制 DLL + data 到 build/)"
     echo  "    6  - 从 Go 仓库复制 TSF DLL"
-    echo  "    7  - 从 Go 仓库复制 data/"
+    echo  "    7  - 复制 data/ (优先真实词库, 见 dl)"
+    printf '\n%b  实测 / 远程 (SSH → %s):%b\n' "$C_YELLOW" "${WIND_REMOTE:-未配置}" "$C_RESET"
+    echo  "    r  - 候选 REPL (本机验证, 无需 Windows)"
+    echo  "    p  - push: 交叉编译 exe → Windows (release)"
+    echo  "    pd - push debug: → wind_input_debug.exe (调试)"
+    echo  "    dl - pull-data: 从 Windows 拉真实词库回本机"
+    echo  "    gd - gen-data: 独立下载+转换词库"
     printf '\n%b  工具:%b\n' "$C_YELLOW" "$C_RESET"
     echo  "    f  - cargo fmt (代码格式化)"
     echo  "    i  - ci (fmt-check + clippy + test)"
@@ -329,6 +356,11 @@ menu_loop() {
             5)   deploy_all;        pause ;;
             6)   copy_tsf_dll;      pause ;;
             7)   copy_data;         pause ;;
+            r)   do_repl;           pause ;;
+            p)   do_push;           pause ;;
+            pd)  do_push debug;     pause ;;
+            dl)  do_pull_data;      pause ;;
+            gd)  do_gen_data;       pause ;;
             f)   do_fmt;            pause ;;
             i)   do_ci;             pause ;;
             c)   do_clean;          pause ;;
