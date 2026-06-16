@@ -2312,6 +2312,22 @@ impl Coordinator {
             has_new_composition: false,
         }
     }
+
+    /// 切换中英文时取消当前输入：清空缓冲/候选/preedit，并按 `hotkeys.commit_on_switch`
+    /// 决定是否把已输入的原始编码上屏（仅在切到英文且有待输入时）。返回待上屏文本。
+    fn take_input_on_mode_switch(&self, state: &mut State, chinese: bool) -> String {
+        let commit =
+            !state.input_buffer.is_empty() && !chinese && self.config.hotkeys.commit_on_switch;
+        let text = if commit {
+            state.input_buffer.clone()
+        } else {
+            String::new()
+        };
+        state.input_buffer.clear();
+        state.candidates.clear();
+        state.preedit.clear();
+        text
+    }
 }
 
 impl MessageHandler for Coordinator {
@@ -2328,7 +2344,18 @@ impl MessageHandler for Coordinator {
         if data.event_type == EVENT_KEY_UP {
             if self.is_toggle_mode_keycode(data.key_code) {
                 debug!("toggle_mode key_up: code=0x{:02X}", data.key_code);
-                let (status, _) = self.handle_toggle_mode();
+                let (status, commit_text) = self.handle_toggle_mode();
+                // 切到英文且 hotkeys.commit_on_switch=true 且有待输入：上屏原始编码并同时切换模式。
+                // （commit_text 仅在切英文时非空，见 take_input_on_mode_switch）
+                if !commit_text.is_empty() {
+                    return KeyAction::InsertText {
+                        text: commit_text,
+                        new_composition: None,
+                        mode_changed: true,
+                        chinese_mode: false,
+                        has_new_composition: false,
+                    };
+                }
                 if let Some(status) = status {
                     return KeyAction::StatusUpdate(status);
                 }
@@ -2442,11 +2469,13 @@ impl MessageHandler for Coordinator {
             }
         }
 
-        // Ctrl/Alt 组合（非热键）：有输入则清空，否则透传
+        // Ctrl/Alt 组合（非热键）：有输入则清空并隐藏候选窗，否则透传。
+        // 必须 notify_ui_hide：否则候选窗残留（如 Ctrl+A 时卡死，需再输入才复位）。
         if data.modifiers & (MOD_CTRL | MOD_ALT) != 0 {
             if !state.input_buffer.is_empty() {
                 state.input_buffer.clear();
                 state.candidates.clear();
+                self.notify_ui_hide();
                 return KeyAction::ClearComposition;
             }
             return KeyAction::PassThrough;
@@ -2738,6 +2767,7 @@ impl MessageHandler for Coordinator {
             s.input_buffer.clear();
             s.preedit.clear();
             s.candidates.clear();
+            s.menu_open = false; // 复位菜单态，否则下一个键被 forward_menu_key 吞掉
         }
         self.notify_toolbar(); // 隐藏工具栏（防抖）
         self.notify_ui_hide(); // 隐藏候选窗 + 弹出菜单（HideCandidates 连带关菜单）
@@ -2769,6 +2799,7 @@ impl MessageHandler for Coordinator {
             s.input_buffer.clear();
             s.preedit.clear();
             s.candidates.clear();
+            s.menu_open = false;
         }
         self.notify_toolbar(); // 非激活态 → notify_toolbar 内部下发 HideToolbar
         self.notify_ui_hide(); // 隐藏候选窗 + 弹出菜单
@@ -2789,41 +2820,25 @@ impl MessageHandler for Coordinator {
         let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
         state.chinese_mode = !state.chinese_mode;
         let chinese = state.chinese_mode;
-        let commit_text = if !state.input_buffer.is_empty() && !state.chinese_mode {
-            let t = state.input_buffer.clone();
-            state.input_buffer.clear();
-            state.candidates.clear();
-            t
-        } else {
-            state.input_buffer.clear();
-            state.candidates.clear();
-            String::new()
-        };
+        let commit_text = self.take_input_on_mode_switch(&mut state, chinese);
         drop(state);
         self.punct.lock().unwrap_or_else(|e| e.into_inner()).reset();
         self.push_state_update();
         self.show_tip(if chinese { "中" } else { "英" });
         self.notify_toolbar();
+        self.notify_ui_hide(); // 取消输入：隐藏候选窗
         (Some(self.build_status()), commit_text)
     }
 
     fn handle_system_mode_switch(&self, chinese_mode: bool) -> (Option<StatusUpdateData>, String) {
         let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
         state.chinese_mode = chinese_mode;
-        let commit_text = if !state.input_buffer.is_empty() && !chinese_mode {
-            let t = state.input_buffer.clone();
-            state.input_buffer.clear();
-            state.candidates.clear();
-            t
-        } else {
-            state.input_buffer.clear();
-            state.candidates.clear();
-            String::new()
-        };
+        let commit_text = self.take_input_on_mode_switch(&mut state, chinese_mode);
         drop(state);
         self.punct.lock().unwrap_or_else(|e| e.into_inner()).reset();
         self.push_state_update();
         self.notify_toolbar();
+        self.notify_ui_hide(); // 取消输入：隐藏候选窗
         (Some(self.build_status()), commit_text)
     }
 
@@ -2868,6 +2883,9 @@ impl MessageHandler for Coordinator {
         let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
         state.input_buffer.clear();
         state.candidates.clear();
+        // 复位菜单状态：点击别处会终止 composition 并经 notify_ui_hide 隐藏菜单窗口，
+        // 但若不清 menu_open，下一个键会被 forward_menu_key 当作菜单键吞掉（首字符失效）。
+        state.menu_open = false;
         drop(state);
         self.notify_ui_hide();
     }
