@@ -107,9 +107,10 @@ Rust 现状：`shadow.rs` 逻辑**已对齐且扎实**（pin LIFO、delete 优�
 | bulk 导入导出 | 5 类数据全量导出/批量追加（备份恢复）| 无 | **阶段 D**（备份/迁移工具）|
 | migration | **无版本表**，仅 2 个一次性幂等迁移（短语格式）| 空 | 见下 |
 
-**迁移决策**：
-- Go 缺统一版本管理是坏设计 → Rust **从一开始引入 `meta/schema_version`**，迁移按版本链执行。
-- **Go 用户数据导入**：WindInput 要替代 WindInput，老用户的用户词/词频/shadow 在 Go 的 bbolt(`user_data.db`)。为不丢学习数据，需规划一次性 **bbolt→redb 导入**（独立工具或首次启动检测；可借 Go 端 bulk 导出为中间格式）。**记为 Phase D 工具项，但 key/字段设计现在就要兼容**（故 §2 的 record 字段尽量对齐 Go 语义）。
+**迁移决策**（2026-06-16 用户澄清）：
+- Go 缺统一版本管理是坏设计 → Rust **从一开始引入 `meta/schema_version`**，迁移按版本链执行（已落地，store.rs）。
+- **legacy 文件式（FreqTracker/ShadowStore）无需迁移**：它们从未实际投产，**切换到 redb 时直接删除**，不保留、不迁数据。
+- **Go 用户数据导入用通用导出+导入格式**（非 bbolt→redb 原地迁移）：Go 端导出为通用交换格式（如 JSON/TSV），Rust 端导入。解耦两边实现、避免 Rust 依赖 bbolt。属 Phase D 工具项；本阶段不实现，redb 记录字段保持语义清晰即可。
 
 ---
 

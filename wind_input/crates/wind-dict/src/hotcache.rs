@@ -25,7 +25,8 @@ pub struct CachedCandidate {
 pub struct HotCache {
     /// 文件键 -> 缓存条目
     entries: RwLock<HashMap<String, CacheEntry>>,
-    /// 每个前缀缓存的最大候选数
+    /// 每个前缀缓存的最大候选数（hotcache 接线时启用，见 dict.md §5.4）
+    #[allow(dead_code)]
     max_per_prefix: usize,
 }
 

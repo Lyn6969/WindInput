@@ -6,7 +6,7 @@
 use memmap2::Mmap;
 use std::fs::File;
 use std::path::Path;
-use tracing::{debug, info, warn};
+use tracing::info;
 
 /// wdb 魔数 "WDIC"
 const MAGIC: [u8; 4] = [b'W', b'D', b'I', b'C'];

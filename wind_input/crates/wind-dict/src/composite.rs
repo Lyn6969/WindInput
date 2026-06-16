@@ -2,7 +2,7 @@
 //!
 //! 与 Go 版本 `wind_input/internal/dict/composite.go` 对齐。
 
-use crate::layer::{DictLayer, LayerType};
+use crate::layer::DictLayer;
 use std::sync::RwLock;
 use wind_candidate::Candidate;
 

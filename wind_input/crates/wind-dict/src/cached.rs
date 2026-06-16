@@ -4,8 +4,8 @@
 
 use crate::binformat::{DictReader, DictWriter};
 use crate::codetable::CodetableDict;
-use std::path::{Path, PathBuf};
-use tracing::{debug, info, warn};
+use std::path::Path;
+use tracing::{info, warn};
 
 /// 缓存词典：优先使用 mmap，回退到内存模式
 pub enum CachedDict {

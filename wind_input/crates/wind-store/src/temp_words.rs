@@ -100,6 +100,43 @@ impl Store {
         })
     }
 
+    /// 前缀检索临时词（跨 code）。limit<=0 不限。
+    pub fn search_temp_words_prefix(
+        &self,
+        schema: &str,
+        prefix: &str,
+        limit: usize,
+    ) -> anyhow::Result<Vec<UserWordRecord>> {
+        let scan = format!("{schema}\u{0}{prefix}");
+        self.with_db(|db| {
+            let txn = db.begin_read()?;
+            let t = txn.open_table(TEMP_WORDS)?;
+            let mut out = Vec::new();
+            for item in t.range(scan.as_str()..)? {
+                let (k, v) = item?;
+                let key = k.value();
+                if !key.starts_with(&scan) {
+                    break;
+                }
+                if let (Some((_, code, text)), Some((w, c, ca))) =
+                    (crate::user_words::split_key(key), dec_val(v.value()))
+                {
+                    out.push(UserWordRecord {
+                        code: code.to_string(),
+                        text: text.to_string(),
+                        weight: w,
+                        count: c,
+                        created_at: ca,
+                    });
+                }
+                if limit > 0 && out.len() >= limit {
+                    break;
+                }
+            }
+            Ok(out)
+        })
+    }
+
     /// 淘汰：保留权重最高的 max_keep 条，删除其余（按 weight 升序淘汰最低的）。
     /// 单写事务完成（先在事务内收集快照再删除，无 TOCTOU）。返回淘汰条数。
     pub fn evict_temp_words(&self, schema: &str, max_keep: usize) -> anyhow::Result<usize> {

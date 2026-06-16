@@ -4,16 +4,17 @@
 
 use wind_candidate::Candidate;
 
-/// 词典层类型（数值越小优先级越高）
+/// 词典层类型（数值越小优先级越高）。
+/// 注：Shadow（置顶/删除）**不是查询层**，而是 ShadowProvider，在引擎排序后应用
+/// （见 docs/redesign/dict.md §2）——故不在此枚举中。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 #[repr(u8)]
 pub enum LayerType {
     Logic = 0,  // 命令（日期、UUID）
-    Shadow = 1, // 用户覆盖（置顶/删除）
-    User = 2,   // 用户自造词
-    Temp = 3,   // 临时学习词
-    Cell = 4,   // 单元词典
-    System = 5, // 系统主词典
+    User = 1,   // 用户自造词
+    Temp = 2,   // 临时学习词
+    Cell = 3,   // 单元词典
+    System = 4, // 系统主词典
 }
 
 /// 词典层接口
