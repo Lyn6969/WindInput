@@ -23,6 +23,15 @@
 #   fmt-check       cargo fmt --check (CI 用)
 #   clean   | c     cargo clean
 #   ci              fmt-check + clippy + test (提交前一把过)
+#
+# 实测 / 远程部署（SSH；配置见 scripts/deploy.local: WIND_REMOTE / WIND_REMOTE_DIR）:
+#   repl [data]     本机跑候选 REPL（无需 TSF/UI；读编码→打印候选）
+#   push            交叉编译 release exe 并 drop-in 到 Windows 安装目录（复用其 TSF DLL+data）
+#   pull-data       从 Windows 安装目录拉 data/（真实词库）回本机供 REPL
+#   gen-data        独立下载+转换词库（暂用 Go 工具；Rust 化为后续）
+#
+# 推荐实测流程：① pull-data 拉真实词库 → ② repl 在 Linux 验证候选逻辑
+#               ③ push 把 exe drop-in 到 Windows → 重启服务做应用内实测（并验协议兼容）
 
 set -o pipefail
 
@@ -39,6 +48,16 @@ BUILD_DIR="$PROJECT_ROOT/build"
 BUILD_DEBUG_DIR="$PROJECT_ROOT/build_debug"
 # Go 仓库与产品仓同级: windinput/WindInput
 GO_REPO="$(dirname "$PRODUCT_ROOT")/WindInput"
+
+# 远程 Windows 测试机配置（SSH）。在 scripts/deploy.local 或环境变量中设置：
+#   WIND_REMOTE      = user@host           （SSH 目标）
+#   WIND_REMOTE_DIR  = Windows 安装目录     （含 wind_input.exe，如 'C:/Users/x/WindInput' 或安装路径）
+# deploy.local 不入库（.gitignore）。
+[ -f "$SCRIPT_DIR/deploy.local" ] && . "$SCRIPT_DIR/deploy.local"
+WIND_REMOTE="${WIND_REMOTE:-}"
+WIND_REMOTE_DIR="${WIND_REMOTE_DIR:-}"
+# 本机给 REPL 用的 data 目录（pull-data 拉取到此）
+LOCAL_DATA="$PRODUCT_ROOT/data"
 
 TARGET="x86_64-pc-windows-gnu"
 
@@ -178,6 +197,74 @@ deploy_all() {
     say "部署完成! -> $outdir"
 }
 
+# ---------- 实测 / 远程部署（SSH）----------
+
+# 本机跑候选 REPL（无需 TSF/UI）：读编码→打印候选。data 目录优先 $LOCAL_DATA，可传参覆盖。
+do_repl() {
+    local data="${1:-$LOCAL_DATA}"
+    say "\n启动候选 REPL (data=$data)..."
+    cd "$PROJECT_ROOT" && WIND_DATA="$data" cargo run --release -p wind-repl -- "$data"
+}
+
+# 校验远程配置
+require_remote() {
+    if [ -z "$WIND_REMOTE" ] || [ -z "$WIND_REMOTE_DIR" ]; then
+        err "未配置远程：请在 $SCRIPT_DIR/deploy.local 设置 WIND_REMOTE 与 WIND_REMOTE_DIR"
+        echo "  示例: WIND_REMOTE=me@192.168.1.10"
+        echo "        WIND_REMOTE_DIR='C:/Users/me/AppData/Local/Programs/WindInput'"
+        return 1
+    fi
+}
+
+# drop-in：把交叉编译的 release wind_input.exe 推到 Windows 安装目录（复用其 TSF DLL + data/）。
+# 复用 Go 版安装即可实测，并顺带验证 IPC 协议兼容性。
+do_push() {
+    require_remote || return 1
+    local exe="$PROJECT_ROOT/target/$TARGET/release/wind_input.exe"
+    if [ ! -f "$exe" ]; then
+        warn "未找到 release exe，先构建..."
+        cargo build --release --target "$TARGET" -p wind_service || { err "构建失败"; return 1; }
+    fi
+    say "\n推送 wind_input.exe → $WIND_REMOTE:$WIND_REMOTE_DIR/"
+    warn "提示：Windows 上需先停止正在运行的 wind_input.exe（文件占用），否则覆盖失败。"
+    rsync -avz --progress "$exe" "$WIND_REMOTE:$WIND_REMOTE_DIR/wind_input.exe" \
+        && say "已推送。请在 Windows 重启服务后实测。" \
+        || err "rsync 失败（检查 SSH/路径/文件占用）"
+}
+
+# 从 Windows 安装目录拉取已处理的 data/（含真实词库）到本机，供 REPL 使用。
+do_pull_data() {
+    require_remote || return 1
+    say "\n拉取 data/ ← $WIND_REMOTE:$WIND_REMOTE_DIR/data/  →  $LOCAL_DATA"
+    mkdir -p "$LOCAL_DATA"
+    rsync -avz --delete "$WIND_REMOTE:$WIND_REMOTE_DIR/data/" "$LOCAL_DATA/" \
+        && say "已拉取。现在可 './scripts/dev.sh repl' 用真实词库测试。" \
+        || err "rsync 失败"
+}
+
+# 独立词库流水线（不依赖 Windows 安装）：下载 rime 原始词库 + 转换。
+# 转换暂复用 Go 仓库的工具（go run），Rust 化转换器为后续任务（见 docs）。
+# 当前仅编排：调用 Go 仓库 build 脚本产出 data，再复制到 $LOCAL_DATA。
+do_gen_data() {
+    if ! command -v go >/dev/null 2>&1; then
+        err "需要 Go 工具链（转换器仍是 Go 实现，Rust 化为后续任务）"; return 1
+    fi
+    if [ ! -d "$GO_REPO" ]; then
+        err "未找到 Go 仓库: $GO_REPO（词库下载/转换工具在此）"; return 1
+    fi
+    warn "调用 Go 仓库下载+转换词库（首次约下载数十 MB）..."
+    # build.sh 为 macOS 风格，Linux 可能需适配；失败请改用 pull-data 复用 Windows 已处理 data/。
+    ( cd "$GO_REPO" && bash scripts_mac/build/build.sh data ) || { err "Go data 构建失败（可改用 pull-data）"; return 1; }
+    local src="$GO_REPO/build/data"
+    [ -d "$src" ] || src="$GO_REPO/build_debug/data"
+    if [ -d "$src" ]; then
+        mkdir -p "$LOCAL_DATA"; rsync -a --delete "$src/" "$LOCAL_DATA/"
+        say "已生成 data → $LOCAL_DATA"
+    else
+        err "未找到生成的 data（$src）"
+    fi
+}
+
 # ---------- 菜单 ----------
 show_menu() {
     clear 2>/dev/null || true
@@ -243,6 +330,10 @@ case "${1:-}" in
     fmt-check)          do_fmt_check ;;
     clean|c)            do_clean ;;
     ci|i)               do_ci ;;
+    repl)               do_repl "${2:-}" ;;
+    push)               do_push ;;
+    pull-data)          do_pull_data ;;
+    gen-data)           do_gen_data ;;
     -h|--help|help)
         grep '^#' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
         ;;

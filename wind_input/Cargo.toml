@@ -15,6 +15,7 @@ members = [
     "crates/wind-coordinator",
     "apps/service",
     "apps/rpc",
+    "apps/repl",
 ]
 
 [workspace.package]
