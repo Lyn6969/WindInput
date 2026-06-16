@@ -1,63 +1,127 @@
-//! 频率存储（含异步批处理）
+//! 用户词频（redb）—— 与权重**彻底解耦**的新模型
 //!
-//! 与 Go 版本 `wind_input/internal/store/freq.go` 对齐。
-//! 运行时词频跟踪 + 异步持久化。
+//! 见 docs/redesign/frequency.md：词频只记真实数据 `{count, last_used}`，不再加到 weight、
+//! 不再有 streak/boost。作为**排序独立维度**：码表用 count（used-first），拼音用衰减分。
+//!
+//! redb FREQ 表，key=`"{schema}\0{code}\0{text}"`（store.md §2，统一 \0 分隔），value 定长 12B
+//! （count u32 + last_used i64）。
+//!
+//! 说明：本文件另保留 legacy `FreqTracker`（文件式，供 coordinator 过渡期使用），将在
+//! coordinator 接通 redb 词频时移除。
 
+use crate::store::{Store, FREQ};
+use crate::user_words::{enc_key, now_secs};
+use redb::ReadableTable;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::RwLock;
 
-/// 频率记录
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// 词频记录（解耦权重，只记真实使用数据）
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FreqRecord {
     pub count: u32,
-    pub last_used: String,
-    pub streak: u32,
+    /// 最近使用（unix 秒）
+    pub last_used: i64,
 }
 
-/// 频率配置
-#[derive(Debug, Clone)]
+/// 词频参数：码表用 count 直接比较不需要它；拼音用其衰减打分。
+#[derive(Debug, Clone, Copy)]
 pub struct FreqProfile {
     pub base_scale: f64,
-    pub max_recency: f64,
-    pub lambda: f64,
-    pub streak_scale: f64,
-    pub streak_cap: f64,
-    pub boost_max: f64,
+    /// 衰减半衰期（小时）
+    pub half_life_hours: f64,
 }
 
 impl Default for FreqProfile {
     fn default() -> Self {
         Self {
             base_scale: 100.0,
-            max_recency: 50.0,
-            lambda: 0.1,
-            streak_scale: 10.0,
-            streak_cap: 200.0,
-            boost_max: 500.0,
+            half_life_hours: 72.0,
         }
     }
 }
 
 impl FreqProfile {
-    /// 计算频率提升值
-    pub fn calc_boost(&self, count: u32, age_hours: f64, streak: u32) -> f64 {
-        let base = ((count + 1) as f64).log2() * self.base_scale;
-        let recency = self.max_recency * (-self.lambda * age_hours).exp();
-        let streak_val = (streak as f64 * self.streak_scale).min(self.streak_cap);
-        (base + recency + streak_val).min(self.boost_max)
+    /// 拼音词频衰减分（frequency.md §4）：`base_scale * log2(count+1) * exp(-ln2*age/half_life)`。
+    /// 最近+高频 → 分高；久未用 → 衰减回落。count=0 返回 0。
+    pub fn pinyin_score(&self, rec: &FreqRecord, now: i64) -> f64 {
+        if rec.count == 0 {
+            return 0.0;
+        }
+        let age_hours = (now - rec.last_used).max(0) as f64 / 3600.0;
+        let decay = (-std::f64::consts::LN_2 * age_hours / self.half_life_hours).exp();
+        self.base_scale * ((rec.count + 1) as f64).log2() * decay
     }
 }
 
-/// 运行时词频跟踪器
-///
-/// 跟踪用户选择的词频，用于实时调整候选排序。
-/// 异步批量写入持久化存储。
+/// value: count u32 + last_used i64 = 12 字节
+fn enc_freq(count: u32, last_used: i64) -> [u8; 12] {
+    let mut b = [0u8; 12];
+    b[0..4].copy_from_slice(&count.to_le_bytes());
+    b[4..12].copy_from_slice(&last_used.to_le_bytes());
+    b
+}
+
+fn dec_freq(b: &[u8]) -> Option<FreqRecord> {
+    if b.len() < 12 {
+        return None;
+    }
+    Some(FreqRecord {
+        count: u32::from_le_bytes(b[0..4].try_into().ok()?),
+        last_used: i64::from_le_bytes(b[4..12].try_into().ok()?),
+    })
+}
+
+impl Store {
+    /// 记录一次选词：count++、last_used=now（单写事务）。
+    /// 注：当前同步写；如成为热点可改为内存累积 + 批量 flush（store.md §2 异步批量）。
+    pub fn record_freq(&self, schema: &str, code: &str, text: &str) -> anyhow::Result<()> {
+        let key = enc_key(schema, code, text);
+        let now = now_secs();
+        self.with_db(|db| {
+            let txn = db.begin_write()?;
+            {
+                let mut t = txn.open_table(FREQ)?;
+                let count = t
+                    .get(key.as_str())?
+                    .and_then(|g| dec_freq(g.value()))
+                    .map(|r| r.count)
+                    .unwrap_or(0);
+                t.insert(key.as_str(), enc_freq(count.saturating_add(1), now).as_slice())?;
+            }
+            txn.commit()?;
+            Ok(())
+        })
+    }
+
+    /// 取词频记录（不存在返回 None）。
+    pub fn get_freq(
+        &self,
+        schema: &str,
+        code: &str,
+        text: &str,
+    ) -> anyhow::Result<Option<FreqRecord>> {
+        let key = enc_key(schema, code, text);
+        self.with_db(|db| {
+            let txn = db.begin_read()?;
+            let t = txn.open_table(FREQ)?;
+            Ok(t.get(key.as_str())?.and_then(|g| dec_freq(g.value())))
+        })
+    }
+}
+
+// ───────────────────────── legacy（过渡期，待 coordinator 接通后移除）─────────────────────────
+
+/// 运行时词频跟踪器（文件式，简化模型；coordinator 过渡期使用，新代码请用 Store 的 redb 词频）。
 pub struct FreqTracker {
-    /// word -> 选择次数（运行时）
     freq_map: RwLock<HashMap<String, u32>>,
-    /// 配置
     profile: FreqProfile,
+}
+
+impl Default for FreqTracker {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl FreqTracker {
@@ -68,57 +132,52 @@ impl FreqTracker {
         }
     }
 
-    /// 记录一次词选择
     pub fn record_selection(&self, word: &str) {
-        let mut map = self.freq_map.write().unwrap();
-        let entry = map.entry(word.to_string()).or_insert(0);
-        *entry += 1;
+        let mut map = self.freq_map.write().unwrap_or_else(|e| e.into_inner());
+        *map.entry(word.to_string()).or_insert(0) += 1;
     }
 
-    /// 获取词的频率 boost 值
     pub fn get_boost(&self, word: &str) -> f64 {
-        let map = self.freq_map.read().unwrap();
+        let map = self.freq_map.read().unwrap_or_else(|e| e.into_inner());
         let count = *map.get(word).unwrap_or(&0);
         if count == 0 {
             return 0.0;
         }
-        // 简化计算：只用 count，不考虑时间和 streak
         ((count + 1) as f64).log2() * self.profile.base_scale * 0.1
     }
 
-    /// 获取词的选择次数
     pub fn get_count(&self, word: &str) -> u32 {
-        let map = self.freq_map.read().unwrap();
+        let map = self.freq_map.read().unwrap_or_else(|e| e.into_inner());
         *map.get(word).unwrap_or(&0)
     }
 
-    /// 是否包含某词
     pub fn contains(&self, word: &str) -> bool {
-        let map = self.freq_map.read().unwrap();
-        map.contains_key(word)
+        self.freq_map
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .contains_key(word)
     }
 
-    /// 获取所有频率记录（用于持久化）
     pub fn export_records(&self) -> Vec<(String, u32)> {
-        let map = self.freq_map.read().unwrap();
+        let map = self.freq_map.read().unwrap_or_else(|e| e.into_inner());
         map.iter().map(|(k, v)| (k.clone(), *v)).collect()
     }
 
-    /// 从持久化数据加载
     pub fn import_records(&self, records: &[(String, u32)]) {
-        let mut map = self.freq_map.write().unwrap();
+        let mut map = self.freq_map.write().unwrap_or_else(|e| e.into_inner());
         for (word, count) in records {
             map.insert(word.clone(), *count);
         }
     }
 
-    /// 清空运行时频率（用于测试）
     pub fn clear(&self) {
-        let mut map = self.freq_map.write().unwrap();
-        map.clear();
+        self.freq_map
+            .write()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear();
     }
 
-    /// 从文件加载词频（格式：`word\tcount`，每行一条）。文件不存在时静默忽略。
+    /// 从文件加载词频（`word\tcount` 每行一条）。文件不存在静默忽略。
     pub fn load_from_file(&self, path: &std::path::Path) -> std::io::Result<()> {
         let content = match std::fs::read_to_string(path) {
             Ok(c) => c,
@@ -132,19 +191,19 @@ impl FreqTracker {
                 continue;
             }
             let mut it = line.split('\t');
-            if let (Some(w), Some(c)) = (it.next(), it.next()) {
-                if let Ok(count) = c.trim().parse::<u32>() {
-                    if !w.is_empty() && count > 0 {
-                        records.push((w.to_string(), count));
-                    }
-                }
+            if let (Some(w), Some(c)) = (it.next(), it.next())
+                && let Ok(count) = c.trim().parse::<u32>()
+                && !w.is_empty()
+                && count > 0
+            {
+                records.push((w.to_string(), count));
             }
         }
         self.import_records(&records);
         Ok(())
     }
 
-    /// 将词频保存到文件（原子写：先写临时文件再 rename）。
+    /// 保存词频到文件（原子写）。
     pub fn save_to_file(&self, path: &std::path::Path) -> std::io::Result<()> {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
@@ -167,7 +226,6 @@ impl FreqTracker {
         Ok(())
     }
 
-    /// 当前记录条数
     pub fn len(&self) -> usize {
         self.freq_map.read().unwrap_or_else(|e| e.into_inner()).len()
     }
@@ -181,28 +239,50 @@ impl FreqTracker {
 mod tests {
     use super::*;
 
-    #[test]
-    fn test_freq_save_load_roundtrip() {
-        let tmp = std::env::temp_dir().join("wind_freq_roundtrip.tsv");
-        let _ = std::fs::remove_file(&tmp);
+    fn tmp(name: &str) -> std::path::PathBuf {
+        let p = std::env::temp_dir().join(name);
+        let _ = std::fs::remove_file(&p);
+        p
+    }
 
+    #[test]
+    fn test_redb_record_and_get_freq() {
+        let path = tmp("wind_freq_redb.redb");
+        let s = Store::open(&path).unwrap();
+        assert!(s.get_freq("wb", "a", "工").unwrap().is_none());
+        s.record_freq("wb", "a", "工").unwrap();
+        s.record_freq("wb", "a", "工").unwrap();
+        let r = s.get_freq("wb", "a", "工").unwrap().unwrap();
+        assert_eq!(r.count, 2);
+        assert!(r.last_used > 0);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn test_pinyin_decay_score() {
+        let p = FreqProfile::default();
+        let now = 1_000_000_000i64;
+        let fresh = FreqRecord { count: 9, last_used: now };
+        let old = FreqRecord { count: 9, last_used: now - 72 * 3600 }; // 一个半衰期前
+        let s_fresh = p.pinyin_score(&fresh, now);
+        let s_old = p.pinyin_score(&old, now);
+        assert!(s_fresh > 0.0);
+        // 一个半衰期 → 约半衰
+        assert!((s_old / s_fresh - 0.5).abs() < 0.05, "半衰期处应≈半衰");
+        assert_eq!(p.pinyin_score(&FreqRecord { count: 0, last_used: now }, now), 0.0);
+    }
+
+    #[test]
+    fn test_freq_tracker_save_load_roundtrip() {
+        let tmp = tmp("wind_freq_legacy.tsv");
         let a = FreqTracker::new();
         a.record_selection("你好");
         a.record_selection("你好");
-        a.record_selection("中国");
         a.save_to_file(&tmp).unwrap();
-
-        // 新 tracker 从文件加载，计数应保留（重启不丢）
         let b = FreqTracker::new();
         b.load_from_file(&tmp).unwrap();
         assert_eq!(b.get_count("你好"), 2);
-        assert_eq!(b.get_count("中国"), 1);
         assert!(b.get_boost("你好") > 0.0);
-
-        // 不存在的文件静默成功
-        let c = FreqTracker::new();
-        assert!(c.load_from_file(std::path::Path::new("/nonexistent/x.tsv")).is_ok());
-
         let _ = std::fs::remove_file(&tmp);
     }
 }

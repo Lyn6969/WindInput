@@ -5,6 +5,8 @@
 //! 规则在词频排序之后应用，优先级最高。规则的「应用」由调用方（协调器）完成，
 //! 本模块只负责规则的增删查与持久化，避免对候选类型产生依赖。
 
+use crate::store::{Store, SHADOW};
+use redb::ReadableTable;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::RwLock;
@@ -13,6 +15,9 @@ use std::sync::RwLock;
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ShadowPin {
     pub word: String,
+    /// 候选稳定 id（动态短语用；非空时按 id 精准匹配，对齐 Go R2，见 store.md §5）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cand_id: Option<String>,
     pub position: usize,
 }
 
@@ -27,8 +32,41 @@ pub struct ShadowRecord {
 }
 
 impl ShadowRecord {
-    fn is_empty(&self) -> bool {
+    pub fn is_empty(&self) -> bool {
         self.pinned.is_empty() && self.deleted.is_empty()
+    }
+
+    /// 置顶/移动：把 (word, cand_id) 固定到 position。LIFO（新规则插队首）；置顶优先于删除。
+    /// 去重键：cand_id 双方非空时按 cand_id，否则按 word。
+    pub fn apply_pin(&mut self, word: &str, cand_id: Option<String>, position: usize) {
+        let same = |w: &str, id: &Option<String>| match (&cand_id, id) {
+            (Some(a), Some(b)) => a == b,
+            _ => w == word,
+        };
+        self.pinned.retain(|p| !same(&p.word, &p.cand_id));
+        self.deleted.retain(|d| d != word);
+        self.pinned.insert(
+            0,
+            ShadowPin {
+                word: word.to_string(),
+                cand_id,
+                position,
+            },
+        );
+    }
+
+    /// 删除（屏蔽）：word 不再出现；同时移除其置顶规则。
+    pub fn apply_delete(&mut self, word: &str) {
+        self.pinned.retain(|p| p.word != word);
+        if !self.deleted.iter().any(|d| d == word) {
+            self.deleted.push(word.to_string());
+        }
+    }
+
+    /// 恢复默认：清除该 word 的置顶与删除规则。
+    pub fn apply_remove(&mut self, word: &str) {
+        self.pinned.retain(|p| p.word != word);
+        self.deleted.retain(|d| d != word);
     }
 }
 
@@ -57,20 +95,17 @@ impl ShadowStore {
     /// 置顶/移动：把 word 固定到 position（0 = 首位）。LIFO：最新规则覆盖同词旧规则。
     pub fn pin(&self, schema: &str, code: &str, word: &str, position: usize) {
         let mut map = self.map.write().unwrap_or_else(|e| e.into_inner());
-        let rec = map.entry(Self::key(schema, code)).or_default();
-        rec.pinned.retain(|p| p.word != word);
-        rec.deleted.retain(|d| d != word); // 置顶优先于删除
-        rec.pinned.insert(0, ShadowPin { word: word.to_string(), position });
+        map.entry(Self::key(schema, code))
+            .or_default()
+            .apply_pin(word, None, position);
     }
 
     /// 删除（屏蔽）：word 不再出现在该输入码的候选中。
     pub fn delete(&self, schema: &str, code: &str, word: &str) {
         let mut map = self.map.write().unwrap_or_else(|e| e.into_inner());
-        let rec = map.entry(Self::key(schema, code)).or_default();
-        rec.pinned.retain(|p| p.word != word);
-        if !rec.deleted.iter().any(|d| d == word) {
-            rec.deleted.push(word.to_string());
-        }
+        map.entry(Self::key(schema, code))
+            .or_default()
+            .apply_delete(word);
     }
 
     /// 恢复默认：清除该 word 的置顶与删除规则。
@@ -78,8 +113,7 @@ impl ShadowStore {
         let mut map = self.map.write().unwrap_or_else(|e| e.into_inner());
         let key = Self::key(schema, code);
         if let Some(rec) = map.get_mut(&key) {
-            rec.pinned.retain(|p| p.word != word);
-            rec.deleted.retain(|d| d != word);
+            rec.apply_remove(word);
             if rec.is_empty() {
                 map.remove(&key);
             }
@@ -137,6 +171,85 @@ impl ShadowStore {
     }
 }
 
+// ───────────────────────── redb Shadow ops（新后端，满足 dict §9 契约）─────────────────────────
+//
+// key=`"{schema}\0{code}"`，value=ShadowRecord 的 JSON（每码规则稀疏、写入低频，JSON 足够）。
+// 规则的「应用」（pin/delete 落到候选）仍由引擎排序阶段负责（dict.md：Shadow 是 Provider 非层）。
+
+fn shadow_key(schema: &str, code: &str) -> String {
+    format!("{schema}\u{0}{code}")
+}
+
+impl Store {
+    /// 读改写一条 code 的 Shadow 规则；改完为空则删除该键（单写事务）。
+    fn modify_shadow(
+        &self,
+        schema: &str,
+        code: &str,
+        f: impl FnOnce(&mut ShadowRecord),
+    ) -> anyhow::Result<()> {
+        let key = shadow_key(schema, code);
+        self.with_db(|db| {
+            let txn = db.begin_write()?;
+            {
+                let mut t = txn.open_table(SHADOW)?;
+                let mut rec: ShadowRecord = t
+                    .get(key.as_str())?
+                    .and_then(|g| serde_json::from_slice(g.value()).ok())
+                    .unwrap_or_default();
+                f(&mut rec);
+                if rec.is_empty() {
+                    t.remove(key.as_str())?;
+                } else {
+                    let bytes = serde_json::to_vec(&rec)?;
+                    t.insert(key.as_str(), bytes.as_slice())?;
+                }
+            }
+            txn.commit()?;
+            Ok(())
+        })
+    }
+
+    /// 置顶/移动候选（cand_id 非空=动态短语按 id 匹配）。
+    pub fn pin_shadow(
+        &self,
+        schema: &str,
+        code: &str,
+        word: &str,
+        cand_id: Option<&str>,
+        position: usize,
+    ) -> anyhow::Result<()> {
+        self.modify_shadow(schema, code, |rec| {
+            rec.apply_pin(word, cand_id.map(String::from), position)
+        })
+    }
+
+    /// 删除（屏蔽）候选。
+    pub fn delete_shadow(&self, schema: &str, code: &str, word: &str) -> anyhow::Result<()> {
+        self.modify_shadow(schema, code, |rec| rec.apply_delete(word))
+    }
+
+    /// 移除某候选的 Shadow 规则（恢复默认）。
+    pub fn remove_shadow_rule(&self, schema: &str, code: &str, word: &str) -> anyhow::Result<()> {
+        self.modify_shadow(schema, code, |rec| rec.apply_remove(word))
+    }
+
+    /// 取某 code 的 Shadow 规则（无则 None）。
+    pub fn get_shadow_rules(
+        &self,
+        schema: &str,
+        code: &str,
+    ) -> anyhow::Result<Option<ShadowRecord>> {
+        let key = shadow_key(schema, code);
+        self.with_db(|db| {
+            let txn = db.begin_read()?;
+            let t = txn.open_table(SHADOW)?;
+            Ok(t.get(key.as_str())?
+                .and_then(|g| serde_json::from_slice(g.value()).ok()))
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -178,5 +291,39 @@ mod tests {
         assert!(b.has_rule("py", "nihao", "你好"));
         assert!(b.has_rule("py", "ceshi", "测试"));
         let _ = std::fs::remove_file(&tmp);
+    }
+
+    #[test]
+    fn test_redb_shadow_ops() {
+        let path = std::env::temp_dir().join("wind_shadow_redb.redb");
+        let _ = std::fs::remove_file(&path);
+        let s = Store::open(&path).unwrap();
+
+        // pin + delete 不同码
+        s.pin_shadow("wb", "aaaa", "恭恭敬敬", None, 0).unwrap();
+        s.delete_shadow("wb", "bbbb", "某词").unwrap();
+        let r = s.get_shadow_rules("wb", "aaaa").unwrap().unwrap();
+        assert_eq!(r.pinned.len(), 1);
+        assert_eq!(r.pinned[0].position, 0);
+        assert!(s.get_shadow_rules("wb", "bbbb").unwrap().unwrap().deleted == vec!["某词".to_string()]);
+
+        // pin 后 delete 同词 → pin 被移除、转为 deleted
+        s.delete_shadow("wb", "aaaa", "恭恭敬敬").unwrap();
+        let r = s.get_shadow_rules("wb", "aaaa").unwrap().unwrap();
+        assert!(r.pinned.is_empty());
+        assert_eq!(r.deleted, vec!["恭恭敬敬".to_string()]);
+
+        // remove → 规则清空后该键删除
+        s.remove_shadow_rule("wb", "aaaa", "恭恭敬敬").unwrap();
+        assert!(s.get_shadow_rules("wb", "aaaa").unwrap().is_none());
+
+        // cand_id 动态短语：按 id 去重
+        s.pin_shadow("wb", "zz", "日期", Some("phrase:zz:date"), 0).unwrap();
+        s.pin_shadow("wb", "zz", "日期改", Some("phrase:zz:date"), 1).unwrap();
+        let r = s.get_shadow_rules("wb", "zz").unwrap().unwrap();
+        assert_eq!(r.pinned.len(), 1, "同 cand_id 应去重为 1 条");
+        assert_eq!(r.pinned[0].word, "日期改");
+
+        let _ = std::fs::remove_file(&path);
     }
 }
