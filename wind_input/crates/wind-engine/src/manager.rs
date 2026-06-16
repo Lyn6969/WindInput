@@ -17,125 +17,12 @@ use std::path::Path;
 use std::sync::{Arc, Mutex};
 use tracing::{info, warn};
 use wind_config::Config;
+use wind_config::schema::{DictSpec, Schema};
 use wind_dict::cached::CachedDict;
 use wind_dict::codetable::CodetableDict;
 
-/// schema 文件结构（兼容 Go `.schema.toml` 与遗留 `.schema.yaml`）
-#[derive(Debug, Clone, Default, serde::Deserialize)]
-struct SchemaFile {
-    #[serde(default)]
-    engine: EngineSection,
-    #[serde(default)]
-    dictionaries: Vec<DictEntry>,
-    #[serde(default)]
-    learning: LearningSection,
-}
-
-#[derive(Debug, Clone, Default, serde::Deserialize)]
-struct LearningSection {
-    /// unigram 语言模型路径（相对 schemas 目录），拼音长句打分用
-    #[serde(default)]
-    unigram_path: String,
-}
-
-#[derive(Debug, Clone, Default, serde::Deserialize)]
-struct EngineSection {
-    #[serde(rename = "type", default)]
-    engine_type: String,
-    #[serde(default)]
-    codetable: CodetableSection,
-    #[serde(default)]
-    pinyin: PinyinSection,
-    #[serde(default)]
-    mixed: MixedSection,
-}
-
-/// 混输方案配置（码表主 + 拼音次）
-#[derive(Debug, Clone, Default, serde::Deserialize)]
-struct MixedSection {
-    #[serde(default)]
-    primary_schema: String,
-    #[serde(default)]
-    secondary_schema: String,
-    #[serde(default)]
-    min_pinyin_length: usize,
-    #[serde(default)]
-    codetable_weight_boost: i32,
-}
-
-#[derive(Debug, Clone, Default, serde::Deserialize)]
-struct CodetableSection {
-    #[serde(default)]
-    max_code_length: usize,
-    /// 临时拼音：码表方案下通过触发键临时切到拼音反查
-    #[serde(default)]
-    temp_pinyin: TempPinyinSection,
-}
-
-#[derive(Debug, Clone, Default, serde::Deserialize)]
-struct TempPinyinSection {
-    #[serde(default)]
-    enabled: bool,
-    /// 临时拼音使用的拼音方案 id（默认回退 "pinyin"）
-    #[serde(default)]
-    schema: String,
-}
-
-#[derive(Debug, Clone, Default, serde::Deserialize)]
-struct PinyinSection {
-    /// 拼音方案："full"=全拼（支持）；"shuangpin"=双拼（暂未实现）
-    #[serde(default)]
-    scheme: String,
-}
-
-#[derive(Debug, Clone, Default, serde::Deserialize)]
-struct DictEntry {
-    #[serde(default)]
-    path: String,
-    #[serde(rename = "type", default)]
-    dict_type: String,
-    #[serde(default)]
-    default: bool,
-    /// 非默认但默认启用的附加词库（如五笔扩展库/emoji）
-    #[serde(default)]
-    default_enabled: bool,
-}
-
-impl DictEntry {
-    /// 是否应加载（主词库或默认启用的附加词库）
-    fn is_enabled(&self) -> bool {
-        self.default || self.default_enabled
-    }
-}
-
-impl SchemaFile {
-    /// 是否为拼音类型引擎
-    fn is_pinyin(&self) -> bool {
-        let t = self.engine.engine_type.to_lowercase();
-        if t == "pinyin" {
-            return true;
-        }
-        if t == "codetable" || t == "mixed" {
-            return false;
-        }
-        // engine.type 缺省时，依据默认词典类型判定
-        let default = self
-            .dictionaries
-            .iter()
-            .find(|d| d.default)
-            .or_else(|| self.dictionaries.first());
-        matches!(default, Some(d) if d.dict_type == "rime_pinyin")
-    }
-
-    /// 该方案当前是否受支持（双拼 scheme≠full 暂未实现，先排除）
-    fn is_supported(&self) -> bool {
-        if self.is_pinyin() {
-            let s = self.engine.pinyin.scheme.to_lowercase();
-            return s.is_empty() || s == "full";
-        }
-        true
-    }
-}
+// 方案定义已统一到 wind_config::schema::Schema（取代此前的私有 SchemaFile）。
+// 引擎只消费该共享类型；构建逻辑（build_engine）保持不变。
 
 /// 引擎管理器（懒加载：仅在需要时构建对应方案引擎，降低启动内存）
 pub struct EngineManager {
@@ -373,7 +260,7 @@ impl EngineManager {
     // ───────────────────────── 词典加载 ─────────────────────────
 
     /// 读取并解析 schema 文件（仅 TOML）。仅解析不构建引擎。
-    fn read_schema(schema_id: &str, data_dir: Option<&Path>) -> Option<SchemaFile> {
+    fn read_schema(schema_id: &str, data_dir: Option<&Path>) -> Option<Schema> {
         let data_dir = data_dir?;
         let toml_path = data_dir
             .join("schemas")
@@ -502,9 +389,9 @@ impl EngineManager {
     ///
     /// - 拼音（rime_pinyin）：单库经 import_tables 合并（load_rime_pinyin_dict）。
     /// - 码表（rime_codetable）：主库 + 扩展库/emoji 等多库合并到 .combined.wdb。
-    fn load_dictionary(schema: &SchemaFile, schemas_dir: &Path) -> Option<CachedDict> {
+    fn load_dictionary(schema: &Schema, schemas_dir: &Path) -> Option<CachedDict> {
         // 收集 enabled 词库（保持 schema 顺序：主库在前，扩展库在后）
-        let mut enabled: Vec<&DictEntry> = schema
+        let mut enabled: Vec<&DictSpec> = schema
             .dictionaries
             .iter()
             .filter(|d| d.is_enabled() && !d.path.is_empty())
@@ -522,7 +409,7 @@ impl EngineManager {
             return None;
         }
 
-        let dtype = |e: &DictEntry| {
+        let dtype = |e: &DictSpec| {
             if e.dict_type.is_empty() {
                 "rime_codetable".to_string()
             } else {
