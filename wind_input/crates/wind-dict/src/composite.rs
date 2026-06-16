@@ -7,6 +7,7 @@ use std::sync::RwLock;
 use wind_candidate::Candidate;
 
 /// 多层复合词典
+#[derive(Default)]
 pub struct CompositeDict {
     layers: RwLock<Vec<Box<dyn DictLayer>>>,
 }

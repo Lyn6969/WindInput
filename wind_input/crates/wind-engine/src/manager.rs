@@ -345,7 +345,11 @@ impl EngineManager {
             } else {
                 4
             };
-            Some(Box::new(CodeTableEngine::new(mcl, dict)))
+            // 码表引擎经 DictManager(CompositeDict) 查询：系统词库作 System 层。
+            // 用户/临时词层将在 Store 接入 coordinator 后注册（dict.md §3）。
+            let dm = wind_dict::DictManager::new();
+            dm.register_layer(Box::new(wind_dict::SystemDictLayer::new(dict, "codetable-system")));
+            Some(Box::new(CodeTableEngine::new(mcl, Arc::new(dm))))
         }
     }
 

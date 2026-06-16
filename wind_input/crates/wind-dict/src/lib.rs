@@ -16,4 +16,5 @@ pub mod unigram;
 
 pub use composite::CompositeDict;
 pub use layer::{DictLayer, LayerType, MutableLayer};
-pub use manager::DictManager;
+pub use manager::{DictManager, SystemDictLayer};
+pub use store_layer::{StoreTempLayer, StoreUserLayer};
