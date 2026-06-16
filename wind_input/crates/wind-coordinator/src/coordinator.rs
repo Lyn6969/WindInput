@@ -23,7 +23,6 @@ use wind_engine::EngineManager;
 use wind_ipc::protocol::{EVENT_KEY_DOWN, EVENT_KEY_UP, MOD_ALT, MOD_CTRL, MOD_SHIFT, calc_key_hash};
 use wind_store::Store;
 use wind_store::freq::FreqTracker;
-use wind_store::shadow::ShadowStore;
 use wind_transform::fullwidth::to_full_width;
 use wind_transform::punctuation::PunctuationConverter;
 use wind_ui::candidate_window::CandidateItem;
@@ -220,10 +219,7 @@ pub struct Coordinator {
     opencc_dir: Option<std::path::PathBuf>,
     /// 通用规范汉字表（检索范围"常用字"判定；空集时退化为不过滤）
     common_chars: wind_candidate::CommonChars,
-    /// Shadow 规则（候选置顶/前后移/删除）
-    shadow: ShadowStore,
-    /// Shadow 持久化文件路径（None=不持久化）
-    shadow_path: Option<std::path::PathBuf>,
+    // Shadow 规则已迁至 redb（self.store 的 SHADOW 表）。
     /// 工具栏位置持久化文件路径（toolbar_pos.txt；None=不持久化）
     toolbar_pos_path: Option<std::path::PathBuf>,
     /// 候选反查（编码/拆字/拼音）供悬停提示
@@ -406,9 +402,7 @@ impl Coordinator {
             info!("Loaded reverse-lookup (chaizi/pinyin)");
         }
 
-        // Shadow 规则（与 freq 同目录的 shadow.json）
-        let shadow = ShadowStore::new();
-        let shadow_path = freq_path.as_ref().map(|p| p.with_file_name("shadow.json"));
+        // Shadow 规则已迁至 redb（self.store 的 SHADOW 表，事务持久），不再用 shadow.json。
         // 工具栏位置属本机状态（不随漫游）：放 %LOCALAPPDATA%\WindInput
         let toolbar_pos_path = Config::local_dir().map(|d| d.join("toolbar_pos.txt"));
         let theme_path = freq_path.as_ref().map(|p| p.with_file_name("theme.txt"));
@@ -428,11 +422,6 @@ impl Coordinator {
                 }
             })
             .unwrap_or_else(|| "default".to_string());
-        if let Some(p) = &shadow_path {
-            if let Err(e) = shadow.load_from_file(p) {
-                warn!("Failed to load shadow {}: {}", p.display(), e);
-            }
-        }
 
         let coordinator = Arc::new(Self {
             state: Mutex::new(State {
@@ -484,8 +473,6 @@ impl Coordinator {
             s2t: Mutex::new(s2t),
             opencc_dir,
             common_chars,
-            shadow,
-            shadow_path,
             toolbar_pos_path,
             reverse,
             cn_pairs,
@@ -658,13 +645,16 @@ impl Coordinator {
 
     /// 应用 Shadow 规则：先按 deleted 过滤，再把 pinned 按目标位置重排。
     fn apply_shadow(&self, candidates: &mut Vec<Candidate>, code: &str) {
-        if self.shadow.is_empty() || code.is_empty() {
+        if code.is_empty() {
             return;
         }
+        let Some(store) = &self.store else {
+            return;
+        };
         let schema = self.engine_mgr.active_schema_id();
-        let rec = match self.shadow.get_rules(&schema, code) {
-            Some(r) => r,
-            None => return,
+        let rec = match store.get_shadow_rules(&schema, code) {
+            Ok(Some(r)) => r,
+            _ => return,
         };
         if !rec.deleted.is_empty() {
             candidates.retain(|c| !rec.deleted.iter().any(|d| d == &c.text));
@@ -1960,7 +1950,7 @@ impl Coordinator {
         drop(state);
 
         let schema = self.engine_mgr.active_schema_id();
-        let has_rule = self.shadow.has_rule(&schema, &code, &word);
+        let has_rule = self.shadow_has_rule(&schema, &code, &word);
         let multi_char = word.chars().count() > 1;
         let op = |o: CandidateOp| MenuKind::Op(o);
 
@@ -1998,31 +1988,45 @@ impl Coordinator {
         let code = state.input_buffer.clone();
         let schema = self.engine_mgr.active_schema_id();
 
-        match op {
-            CandidateOp::MoveTop => self.shadow.pin(&schema, &code, &word, 0),
-            CandidateOp::MoveUp => {
-                let pos = idx.saturating_sub(1);
-                self.shadow.pin(&schema, &code, &word, pos);
-            }
-            CandidateOp::MoveDown => {
-                self.shadow.pin(&schema, &code, &word, (idx + 1).min(state.candidates.len() - 1));
-            }
-            CandidateOp::Delete => {
-                // 单字无规则保护：避免把某个单字彻底锁死
-                if word.chars().count() <= 1 {
-                    debug!("candidate_op: 拒绝删除单字 '{}'", word);
-                    return;
+        // 单字无规则保护：避免把某个单字彻底锁死（在写规则前判定）
+        if matches!(op, CandidateOp::Delete) && word.chars().count() <= 1 {
+            debug!("candidate_op: 拒绝删除单字 '{}'", word);
+            return;
+        }
+        let last = state.candidates.len().saturating_sub(1);
+        if let Some(store) = &self.store {
+            // None cand_id：码表静态词无动态短语 id。redb 事务持久，无需显式落盘。
+            let r = match op {
+                CandidateOp::MoveTop => store.pin_shadow(&schema, &code, &word, None, 0),
+                CandidateOp::MoveUp => {
+                    store.pin_shadow(&schema, &code, &word, None, idx.saturating_sub(1))
                 }
-                self.shadow.delete(&schema, &code, &word);
+                CandidateOp::MoveDown => {
+                    store.pin_shadow(&schema, &code, &word, None, (idx + 1).min(last))
+                }
+                CandidateOp::Delete => store.delete_shadow(&schema, &code, &word),
+                CandidateOp::Reset => store.remove_shadow_rule(&schema, &code, &word),
+            };
+            if let Err(e) = r {
+                warn!("shadow op failed: {}", e);
             }
-            CandidateOp::Reset => self.shadow.reset(&schema, &code, &word),
         }
 
         // 重新构建候选（会重新应用 Shadow）并重绘
         self.update_candidates(&mut state);
         self.notify_ui_update(&state);
-        drop(state);
-        self.save_shadow();
+    }
+
+    /// 影子规则：当前 code 是否对 word 有规则（置顶/删除），决定菜单"恢复默认"可用性。
+    fn shadow_has_rule(&self, schema: &str, code: &str, word: &str) -> bool {
+        let Some(store) = &self.store else {
+            return false;
+        };
+        matches!(
+            store.get_shadow_rules(schema, code),
+            Ok(Some(rec))
+                if rec.pinned.iter().any(|p| p.word == word) || rec.deleted.iter().any(|d| d == word)
+        )
     }
 
     /// 读取持久化的工具栏位置（"x y" 文本）
@@ -2055,15 +2059,6 @@ impl Coordinator {
             return Some(&self.en_pairs);
         }
         None
-    }
-
-    /// 持久化 Shadow 规则（best-effort）
-    fn save_shadow(&self) {
-        if let Some(p) = &self.shadow_path {
-            if let Err(e) = self.shadow.save_to_file(p) {
-                warn!("Failed to save shadow {}: {}", p.display(), e);
-            }
-        }
     }
 
     /// 工具栏单元格点击：复用菜单命令切换状态（内部已推送 C++），再刷新工具栏显示。
