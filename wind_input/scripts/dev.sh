@@ -26,7 +26,8 @@
 #
 # 实测 / 远程部署（SSH；配置见 scripts/deploy.local: WIND_REMOTE / WIND_REMOTE_DIR）:
 #   repl [data]     本机跑候选 REPL（无需 TSF/UI；读编码→打印候选）
-#   push            交叉编译 release exe 并 drop-in 到 Windows 安装目录（复用其 TSF DLL+data）
+#   push [debug]    交叉编译 exe 并 drop-in 到 Windows 安装目录（复用其 TSF DLL+data）；
+#                   debug → 构建 debug_variant 并推为 wind_input_debug.exe；先 taskkill 远程进程再覆盖
 #   pull-data       从 Windows 安装目录拉 data/（真实词库）回本机供 REPL
 #   gen-data        独立下载+转换词库（暂用 Go 工具；Rust 化为后续）
 #
@@ -51,8 +52,9 @@ GO_REPO="$(dirname "$PRODUCT_ROOT")/WindInput"
 
 # 远程 Windows 测试机配置（SSH）。在 scripts/deploy.local 或环境变量中设置：
 #   WIND_REMOTE      = user@host           （SSH 目标）
-#   WIND_REMOTE_DIR  = Windows 安装目录     （含 wind_input.exe，如 'C:/Users/x/WindInput' 或安装路径）
-# deploy.local 不入库（.gitignore）。
+#   WIND_REMOTE_DIR  = Windows 安装目录     （含 wind_input.exe；用 scp 正斜杠风格，
+#                      如 'C:/Users/me/AppData/Local/Programs/WindInput'；调试时指向 WindInputDebug 安装目录）
+# 传输用 scp（stock Windows OpenSSH 自带，无需装 rsync）。deploy.local 不入库（.gitignore）。
 [ -f "$SCRIPT_DIR/deploy.local" ] && . "$SCRIPT_DIR/deploy.local"
 WIND_REMOTE="${WIND_REMOTE:-}"
 WIND_REMOTE_DIR="${WIND_REMOTE_DIR:-}"
@@ -216,30 +218,52 @@ require_remote() {
     fi
 }
 
-# drop-in：把交叉编译的 release wind_input.exe 推到 Windows 安装目录（复用其 TSF DLL + data/）。
-# 复用 Go 版安装即可实测，并顺带验证 IPC 协议兼容性。
+# drop-in：把交叉编译的 exe 推到 Windows 安装目录（复用其 TSF DLL + data/），顺带验证 IPC 协议兼容。
+# 用法: push          → release，推为 wind_input.exe
+#       push debug    → debug 变体，推为 wind_input_debug.exe（WindInputDebug 隔离环境）
+# 处理文件占用：先 taskkill 远程进程再 scp（覆盖后请在 Windows 桌面重启，TSF 自动重连）。
 do_push() {
     require_remote || return 1
-    local exe="$PROJECT_ROOT/target/$TARGET/release/wind_input.exe"
-    if [ ! -f "$exe" ]; then
-        warn "未找到 release exe，先构建..."
+    cd "$PROJECT_ROOT" || return 1
+    local variant="${1:-}"
+    local exe exe_name
+    if [ "$variant" = "debug" ]; then
+        say "\n构建 debug 变体 (debug_variant)..."
+        cargo build --target "$TARGET" -p wind_service --features debug_variant || { err "构建失败"; return 1; }
+        exe="$PROJECT_ROOT/target/$TARGET/debug/wind_input.exe"
+        exe_name="wind_input_debug.exe"
+    else
+        say "\n构建 release..."
         cargo build --release --target "$TARGET" -p wind_service || { err "构建失败"; return 1; }
+        exe="$PROJECT_ROOT/target/$TARGET/release/wind_input.exe"
+        exe_name="wind_input.exe"
     fi
-    say "\n推送 wind_input.exe → $WIND_REMOTE:$WIND_REMOTE_DIR/"
-    warn "提示：Windows 上需先停止正在运行的 wind_input.exe（文件占用），否则覆盖失败。"
-    rsync -avz --progress "$exe" "$WIND_REMOTE:$WIND_REMOTE_DIR/wind_input.exe" \
-        && say "已推送。请在 Windows 重启服务后实测。" \
-        || err "rsync 失败（检查 SSH/路径/文件占用）"
+    [ -f "$exe" ] || { err "未找到产物: $exe"; return 1; }
+
+    say "停止远程 $exe_name（若在运行，避免文件占用）..."
+    ssh "$WIND_REMOTE" "taskkill /F /IM $exe_name" >/dev/null 2>&1 || true
+    sleep 1
+
+    say "推送 $exe_name → $WIND_REMOTE:$WIND_REMOTE_DIR/"
+    if scp "$exe" "$WIND_REMOTE:$WIND_REMOTE_DIR/$exe_name"; then
+        say "已推送。请在 Windows 桌面重启 $exe_name（双击或经输入法菜单/重启服务），TSF 会自动重连命名管道。"
+    else
+        err "scp 失败：检查 WIND_REMOTE_DIR 路径(正斜杠 C:/...)、SSH 连通、文件是否仍被占用"
+    fi
 }
 
 # 从 Windows 安装目录拉取已处理的 data/（含真实词库）到本机，供 REPL 使用。
+# 用 scp -r（stock OpenSSH 兼容）；若你的 Windows 装了 rsync，可自行用 rsync 做增量。
 do_pull_data() {
     require_remote || return 1
-    say "\n拉取 data/ ← $WIND_REMOTE:$WIND_REMOTE_DIR/data/  →  $LOCAL_DATA"
-    mkdir -p "$LOCAL_DATA"
-    rsync -avz --delete "$WIND_REMOTE:$WIND_REMOTE_DIR/data/" "$LOCAL_DATA/" \
-        && say "已拉取。现在可 './scripts/dev.sh repl' 用真实词库测试。" \
-        || err "rsync 失败"
+    say "\n拉取 data/ ← $WIND_REMOTE:$WIND_REMOTE_DIR/data  →  $LOCAL_DATA"
+    rm -rf "$LOCAL_DATA"
+    # scp -r 把远程 data 目录整体拷到产品仓根，即得 $PRODUCT_ROOT/data (=$LOCAL_DATA)
+    if scp -r "$WIND_REMOTE:$WIND_REMOTE_DIR/data" "$PRODUCT_ROOT/"; then
+        say "已拉取 → $LOCAL_DATA。现在可 './scripts/dev.sh repl' 用真实词库测试。"
+    else
+        err "scp 失败（检查路径/SSH）"
+    fi
 }
 
 # 独立词库流水线（不依赖 Windows 安装）：下载 rime 原始词库 + 转换。
@@ -331,7 +355,7 @@ case "${1:-}" in
     clean|c)            do_clean ;;
     ci|i)               do_ci ;;
     repl)               do_repl "${2:-}" ;;
-    push)               do_push ;;
+    push)               do_push "${2:-}" ;;
     pull-data)          do_pull_data ;;
     gen-data)           do_gen_data ;;
     -h|--help|help)
