@@ -76,7 +76,11 @@ Rust 现状：`binformat.rs`（.wdb，V2 10B/V3 14B 含 Order，mmap 二分 + �
 Go 对应：.wdb header 32B 含 `AbbrevOff/MetaOff`；**abbrev 简拼段**（AbbrevHeader 16B + AbbrevIndex 12B）；topk.go min-heap top-K 截断；hotcache 单字母前缀（z 子树 ~47k）；registry.go（Windows mmap 文件锁→原子替换前强制关 reader）；拼音用 **.wdat**(datformat 双数组 trie)。
 
 **目标边界（决策）**：
-1. **统一为单一 .wdb，丢弃 .wdat**（Go 自己也认两套格式是坏设计）：Rust 删 datformat 桩，拼音词典也走 binformat。
+1. **按访问模式分格式（已纠正，见 [pinyin-smart-input.md](./pinyin-smart-input.md) §0/§2）**：
+   - **码表词库 → wdb**（排序数组，精确+有限前缀够用），保留只读。
+   - **拼音词库 → 只读 mmap trie**（common-prefix-search 支撑智能 lattice；wdb 的二分不适配拼音）——
+     用纯 Rust trie crate（crawdad/yada/fst，落地前基准），**不是**之前误判的"统一 wdb"。
+   - 即 Go 的 wdb(码表)+wdat(拼音 trie) 分法是对的；Rust 的 `datformat.rs` 桩升级为真正的拼音 trie。
 2. **实现 abbrev 简拼段**：写 pinyin .wdb 时构建简拼索引、`search_abbrev` 读取——支撑 engine.md 的简拼流水线（比运行时扫描快）。Rust `DictFileHeader` 已留 `abbrev_off` 字段（现写 0）。
 3. **前缀查找用 top-K min-heap**（对齐 Go topk），替换全收集+排序——单字母前缀性能关键。
 4. **接通 hotcache**：单字母前缀（limit≤500）走 hotcache，避免 z 子树每次全扫。
@@ -100,7 +104,7 @@ Go 对应：.wdb header 32B 含 `AbbrevOff/MetaOff`；**abbrev 简拼段**（Abb
 
 ## 7. Go 坏设计（不照搬）汇总
 1. `Shadow` 作为 LayerType 枚举值（实为 Provider，死枚举）——**Rust layer.rs 现有同款 bug，删除**。
-2. 两套并行二进制格式 .wdb/.wdat → 统一 .wdb。
+2. ~~两套并行二进制格式 .wdb/.wdat → 统一 .wdb~~ **（已撤销，见 pinyin-smart-input.md §0）**：码表/拼音访问模式不同，应按模式分（wdb 排序数组 / 拼音 trie），而非强行统一。
 3. abbrev 词条混存 + offset 含主区大小（语义不统一）；AbbrevHeader 绝对偏移 + Reserved 浪费。
 4. IsCommon 每次查询重算 → 存盘。
 5. sync.Pool 复用去重 map / topk picker（Go GC 妥协）→ Rust 栈上复用。
@@ -112,7 +116,7 @@ Go 对应：.wdb header 32B 含 `AbbrevOff/MetaOff`；**abbrev 简拼段**（Abb
 
 ## 8. Rust 现状要保留的优点
 - mmap combined.wdb 预合并作 System 层后端（懒加载、低内存）。
-- 单一 .wdb 格式（不要引入 .wdat）。
+- mmap 零拷贝低内存（wdb 码表 / 拼音 trie 同享此特性）。
 - CachedDict 的 Mmap/Memory 回退。
 
 ---
@@ -120,7 +124,7 @@ Go 对应：.wdb header 32B 含 `AbbrevOff/MetaOff`；**abbrev 简拼段**（Abb
 ## 9. 落地顺序（feed 阶段 B；多数为 engine 质量的前置依赖）
 1. **接通 CompositeDict + store_layer + DictManager**（§1/§2/§3）：引擎改用 composite 查询面，词频移入查询时。**engine 打分器之前/同步做**（打分依赖 freq 已并入 dictWeight）。牵动 wind-store，需先定 store 接口。
 2. **binformat：top-K + hotcache + abbrev 段**（§5.2-5.4）：支撑码表前缀质量与拼音简拼。
-3. **删 datformat、修 Shadow 枚举**（§5.1/§7.1）：清理。
+3. **拼音 trie 接入（替换 datformat 桩，见 pinyin-smart-input.md）、修 Shadow 枚举**（§5.1/§7.1）。
 4. **common_chars / IsCommon 存盘**（§6/§5）：码表 common-first BFS 依赖。
 5. phrase Logic 层、english、dictio 工具按各自子系统/阶段推进。
 

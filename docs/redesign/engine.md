@@ -32,6 +32,11 @@
 
 ## 1. 拼音引擎（pinyin）
 
+> ⚠️ **智能拼音的权威设计见 [pinyin-smart-input.md](./pinyin-smart-input.md)**（主流长句/整句目标）。要点：
+> lattice 构建的核心原语是 **trie common-prefix-search**（非 wdb 二分；拼音系统词库用只读 mmap trie，
+> 见 dict.md §5.1 纠正）；**bigram LM 升为阶段 B 必做**；词频按 frequency.md 解耦衰减。
+> 本节下方为 Go 现状/差距参考。
+
 ### 1.1 Go 候选流水线（engine_ex.go convertCore，:60）
 按序：双拼→全拼预处理 → Parse 音节 → Composition 预编辑 → **步骤0 命令精确匹配** → **步骤0b Viterbi 造句**（≥2 连续音节 + unigram + 完整码≥4）→ **步骤1 完整音节词组精确匹配（含模糊变体）** → **步骤1b 多切分并行打分** → **步骤2 子词组枚举（n..2 音节）** → **步骤4a/4 首段/首音节单字** → **步骤4b 纯 partial 多音节首字** → **步骤5 trailing partial 前缀查找** → **步骤6 简拼/纯简拼（字数=音节数规则）** → 排序 → Shadow → Filter → 代码提示 → 双拼后处理。
 
@@ -76,7 +81,7 @@ weight = int(score * 1_000_000)
 3. 补流水线步骤：命令查询、多切分并行打分、首段/首音节单字、纯简拼（字数=音节数）。
 4. 双拼作为**独立工作项**（见 §4）：converter + **自定义映射数据（非硬编码内置方案）** + 双拼预编辑 + 解除 manager 过滤。
 5. 接通 config：show_code_hint（代码提示）/ filter_mode / candidate_order；模糊音改 `ArcSwap` 热更新。
-6. bigram 暂缓（unigram 打分到位后再评估收益）。
+6. **bigram LM 必做**（主流智能长句的关键，见 [pinyin-smart-input.md](./pinyin-smart-input.md) §3）；lattice 用 trie common-prefix-search 构建。
 
 ---
 

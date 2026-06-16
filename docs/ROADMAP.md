@@ -84,7 +84,9 @@ WindInput/              产品仓根
   关键交叉结论：① **词频已完全重构**（见 redesign/frequency.md）：词频与权重解耦，只存 {count,last_used}，作排序独立维度（码表 used-first 可选模式 / 拼音衰减分），不再加到 weight；engine 打分器只出基础质量分；
   ② dict 分层 CompositeDict 脚手架存在但未接线，决策接通；③ store redb 未落地，决策统一后端；
   ④ coordinator 吸取 Go 统一管线/模式融合**目标态**（避开半迁移双轨）；⑤ schema 是质量特性配置面，统一为一套富 Schema。
-  落地顺序：config 合并修复 + 富 Schema → store redb(user/temp/freq/shadow) → dict 接通 composite → engine 打分器 → coordinator pipeline。
+  ⑥ **智能拼音单列权威设计**（见 redesign/pinyin-smart-input.md）：lattice 用 trie common-prefix-search（拼音系统词库=只读 mmap trie，crawdad/yada/fst 评估），bigram 必做；
+  **纠正**前 dict.md"弃 wdat 统一 wdb"——码表用 wdb、拼音用 trie（按访问模式分，Go 分法是对的）。
+  落地顺序：config 合并修复 + 富 Schema → store redb(user/temp/freq/shadow) → dict 接通 composite → engine 打分器/拼音 lattice trie + bigram → coordinator pipeline。
 
 ### 阶段 B — 输入质量核心补齐（engine + dict + store）
 按阶段 A 锁定的架构补候选质量：拼音 LM/打分/模糊音、码表深度、混输策略、用户词频学习、临时词、影子层。
