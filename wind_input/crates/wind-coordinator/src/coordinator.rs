@@ -140,7 +140,12 @@ struct State {
     s2t_variant: String,
     /// 检索范围过滤模式（smart/general/gb18030；运行时切换）
     filter_mode: wind_candidate::FilterMode,
+    /// 用户是否开启常驻工具栏（菜单开关；与“当前是否激活”正交）。
     toolbar_visible: bool,
+    /// 本输入法当前是否处于激活态（IME_ACTIVATED/FocusGained 置真，
+    /// IME_DEACTIVATED 置假）。工具栏仅在激活态显示，对齐 Go toolbar_reducer
+    /// 的 `imeActivated && userWantsVisible` 公式，根治“切走输入法工具栏仍常驻”。
+    ime_active: bool,
     caps_lock: bool,
     input_buffer: String,
     /// 组合区显示文本（拼音含音节分隔 "ni hao"；码表为原始编码）。
@@ -416,6 +421,7 @@ impl Coordinator {
                 s2t_variant: s2t_variant.clone(),
                 filter_mode: wind_candidate::FilterMode::from_str(&config.input.filter_mode),
                 toolbar_visible: true,
+                ime_active: false, // 启动未激活：工具栏待 IME_ACTIVATED/FocusGained 才显示
                 caps_lock: false,
                 input_buffer: String::new(),
                 preedit: String::new(),
@@ -1705,18 +1711,14 @@ impl Coordinator {
         self.show_tip(label);
     }
 
-    /// 显示/隐藏工具栏。
+    /// 用户开关常驻工具栏（菜单）。仅翻转 toolbar_visible，显隐交 notify_toolbar
+    /// 单点决策（结合 ime_active）。
     fn toggle_toolbar(&self) {
-        let visible = {
+        {
             let mut s = self.state.lock().unwrap_or_else(|e| e.into_inner());
             s.toolbar_visible = !s.toolbar_visible;
-            s.toolbar_visible
-        };
-        if visible {
-            self.notify_toolbar();
-        } else {
-            let _ = self.ui_tx.send(UiCommand::HideToolbar);
         }
+        self.notify_toolbar();
     }
 
     /// 重启服务进程：隐藏 UI 后向 main 发重启信号（main 释放单例并重拉自身）。
@@ -2165,9 +2167,18 @@ impl Coordinator {
     }
 
     /// 推送当前状态到常驻工具栏（中英/方案/标点/全半角）
+    /// 工具栏可见性单点决策 + 内容刷新。对齐 Go toolbar_reducer 的合取公式：
+    /// 仅当 `ime_active && toolbar_visible` 时显示（UpdateToolbar 会刷内容+定位+显示），
+    /// 否则下发 HideToolbar。所有调用点（启动/切模式/切方案/激活/失活）经此单点决策，
+    /// 不再各自直接显示，根治“工具栏总是显示、切走输入法不隐藏”。
     fn notify_toolbar(&self) {
         let schema_label = Self::schema_display_name(&self.engine_mgr.active_schema_id());
         let s = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        if !(s.ime_active && s.toolbar_visible) {
+            drop(s);
+            let _ = self.ui_tx.send(UiCommand::HideToolbar);
+            return;
+        }
         let tb = ToolbarState {
             chinese_mode: s.chinese_mode,
             schema_label,
@@ -2699,6 +2710,9 @@ impl MessageHandler for Coordinator {
             state.caret_x = data.x;
             state.caret_y = data.y;
             state.caret_height = data.height;
+            // 焦点进入文本框 = 本输入法激活（对齐 Go HandleFocusGained → SetIMEActivated(true)）。
+            // 不依赖 IME_ACTIVATED 的到达时机，确保工具栏在焦点到达时即可显示。
+            state.ime_active = true;
         }
         // 记录活动客户端：鼠标点击的 commit 只推给它，避免广播多发
         if data.client_token != 0 {
@@ -2706,6 +2720,7 @@ impl MessageHandler for Coordinator {
         }
         let status = self.build_status();
         self.push_activation_status();
+        self.notify_toolbar(); // 激活态 → 工具栏显示
         Some(status)
     }
 
@@ -2724,12 +2739,19 @@ impl MessageHandler for Coordinator {
         if client_token != 0 {
             self.push_server.set_active_token(client_token);
         }
+        self.state.lock().unwrap_or_else(|e| e.into_inner()).ime_active = true;
         let status = self.build_status();
         self.push_activation_status();
+        self.notify_toolbar(); // 激活态 → 工具栏显示
         Some(status)
     }
 
-    fn handle_ime_deactivated(&self) {}
+    fn handle_ime_deactivated(&self) {
+        // 切走本输入法（换到别的 IME / 非输入法应用）：清激活态并隐藏工具栏。
+        // 对齐 Go SetIMEActivated(false) 的工具栏隐藏分支，根治“切走仍常驻显示”。
+        self.state.lock().unwrap_or_else(|e| e.into_inner()).ime_active = false;
+        self.notify_toolbar(); // 非激活态 → notify_toolbar 内部下发 HideToolbar
+    }
 
     fn handle_mode_notify(&self, flags: u32) {
         let chinese_mode = (flags & wind_ipc::protocol::STATUS_CHINESE_MODE) != 0;
