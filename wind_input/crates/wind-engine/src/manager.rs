@@ -34,6 +34,8 @@ pub struct EngineManager {
     available: Vec<String>,
     /// 数据目录（懒加载时按需读取 schema）
     data_dir: Option<std::path::PathBuf>,
+    /// redb 持久化存储（用户词/临时词层；None=无持久化，如纯测试/REPL）
+    store: Option<Arc<wind_store::Store>>,
 }
 
 /// 进程级缓存根目录（%LOCALAPPDATA%\WindInput\cache），EngineManager::new 设置一次。
@@ -65,6 +67,15 @@ fn cache_path(source: &Path, ext: &str) -> std::path::PathBuf {
 impl EngineManager {
     /// 从配置创建；仅构建活跃方案引擎，其余按需懒加载。
     pub fn new(config: &Config, data_dir: Option<&Path>) -> Self {
+        Self::with_store(config, data_dir, None)
+    }
+
+    /// 同 [`new`]，但注入 redb 存储以注册用户词/临时词层（coordinator 用）。
+    pub fn with_store(
+        config: &Config,
+        data_dir: Option<&Path>,
+        store: Option<Arc<wind_store::Store>>,
+    ) -> Self {
         // 初始化缓存根（一次）：%LOCALAPPDATA%\WindInput\cache，提前建好目录
         CACHE_DIR.get_or_init(|| {
             let dir = Config::cache_dir();
@@ -89,6 +100,7 @@ impl EngineManager {
             active: Mutex::new(active_id.clone()),
             available,
             data_dir: data_dir.map(|d| d.to_path_buf()),
+            store,
         };
         // 仅构建活跃方案（其余懒加载）
         mgr.ensure_loaded(&active_id);
@@ -113,7 +125,7 @@ impl EngineManager {
         {
             return true;
         }
-        match Self::build_engine(schema_id, self.data_dir.as_deref()) {
+        match Self::build_engine(schema_id, self.data_dir.as_deref(), self.store.clone()) {
             Some(engine) => {
                 info!("Loaded engine: {} (type={:?})", schema_id, engine.engine_type());
                 self.engines
@@ -280,7 +292,11 @@ impl EngineManager {
     }
 
     /// 为指定 schema 构建引擎
-    fn build_engine(schema_id: &str, data_dir: Option<&Path>) -> Option<Box<dyn Engine>> {
+    fn build_engine(
+        schema_id: &str,
+        data_dir: Option<&Path>,
+        store: Option<Arc<wind_store::Store>>,
+    ) -> Option<Box<dyn Engine>> {
         let data_dir = data_dir?;
         let schemas = data_dir.join("schemas");
         let schema = Self::read_schema(schema_id, Some(data_dir))?;
@@ -292,11 +308,11 @@ impl EngineManager {
                 warn!("mixed schema {} 缺少 primary_schema", schema_id);
                 return None;
             }
-            let primary = Self::build_engine(&m.primary_schema, Some(data_dir))?;
+            let primary = Self::build_engine(&m.primary_schema, Some(data_dir), store.clone())?;
             let secondary = if m.secondary_schema.is_empty() {
                 None
             } else {
-                Self::build_engine(&m.secondary_schema, Some(data_dir))
+                Self::build_engine(&m.secondary_schema, Some(data_dir), store.clone())
             };
             let boost = if m.codetable_weight_boost > 0 {
                 m.codetable_weight_boost
@@ -346,8 +362,12 @@ impl EngineManager {
                 4
             };
             // 码表引擎经 DictManager(CompositeDict) 查询：系统词库作 System 层。
-            // 用户/临时词层将在 Store 接入 coordinator 后注册（dict.md §3）。
+            // 注入 redb Store 时，注册用户词/临时词层（按 schema 隔离），让用户词进候选合并。
             let dm = wind_dict::DictManager::new();
+            if let Some(store) = &store {
+                dm.register_layer(Box::new(wind_dict::StoreUserLayer::new(store.clone(), schema_id)));
+                dm.register_layer(Box::new(wind_dict::StoreTempLayer::new(store.clone(), schema_id)));
+            }
             dm.register_layer(Box::new(wind_dict::SystemDictLayer::new(dict, "codetable-system")));
             Some(Box::new(CodeTableEngine::new(mcl, Arc::new(dm))))
         }

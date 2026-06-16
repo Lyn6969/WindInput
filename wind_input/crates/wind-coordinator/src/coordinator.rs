@@ -21,6 +21,7 @@ use wind_config::Config;
 use wind_config::hotkey::{self, CompiledHotkeys};
 use wind_engine::EngineManager;
 use wind_ipc::protocol::{EVENT_KEY_DOWN, EVENT_KEY_UP, MOD_ALT, MOD_CTRL, MOD_SHIFT, calc_key_hash};
+use wind_store::Store;
 use wind_store::freq::FreqTracker;
 use wind_store::shadow::ShadowStore;
 use wind_transform::fullwidth::to_full_width;
@@ -201,6 +202,8 @@ pub struct Coordinator {
     config: Config,
     ui_tx: std::sync::mpsc::Sender<UiCommand>,
     engine_mgr: EngineManager,
+    /// redb 持久化存储（用户词/临时词/词频/影子规则）；None=无持久化（headless 测试）。
+    store: Option<Arc<Store>>,
     freq_tracker: FreqTracker,
     compiled_hotkeys: CompiledHotkeys,
     /// 标点转换器（引号左右状态）
@@ -272,7 +275,23 @@ impl Coordinator {
         let freq_path = Config::user_config_dir()
             .or_else(|| data_dir.as_deref().map(|d| d.to_path_buf()))
             .map(|d| d.join("freq.tsv"));
-        let coordinator = Self::build(config, data_dir.as_deref(), push_server, ui_tx, freq_path);
+        // redb 用户数据库（本机数据，不随漫游；debug 变体已隔离到 WindInputDebug）。
+        let store = Config::local_dir().and_then(|d| {
+            let _ = std::fs::create_dir_all(&d);
+            let p = d.join("userdata.redb");
+            match Store::open(&p) {
+                Ok(s) => {
+                    info!("Opened redb store: {}", p.display());
+                    Some(Arc::new(s))
+                }
+                Err(e) => {
+                    warn!("Failed to open redb store {}: {}", p.display(), e);
+                    None
+                }
+            }
+        });
+        let coordinator =
+            Self::build(config, data_dir.as_deref(), push_server, ui_tx, freq_path, store);
 
         // 鼠标事件处理线程：候选窗的点击/悬停/滚轮经此回到协调器
         if let Some(rx) = event_rx {
@@ -309,7 +328,7 @@ impl Coordinator {
             suffix: String::new(),
             write_timeout_ms: 30_000,
         }));
-        Self::build(config, data_dir.as_deref(), push_server, ui_tx, None)
+        Self::build(config, data_dir.as_deref(), push_server, ui_tx, None, None)
     }
 
     fn build(
@@ -318,8 +337,10 @@ impl Coordinator {
         push_server: Arc<PushServer>,
         ui_tx: std::sync::mpsc::Sender<UiCommand>,
         freq_path: Option<std::path::PathBuf>,
+        store: Option<Arc<Store>>,
     ) -> Arc<Self> {
-        let engine_mgr = EngineManager::new(&config, data_dir);
+        // 注入 redb Store：码表引擎注册用户词/临时词层，用户词进候选合并。
+        let engine_mgr = EngineManager::with_store(&config, data_dir, store.clone());
         let compiled_hotkeys = hotkey::Compiler::new(config.clone()).compile();
         info!(
             "Compiled hotkeys: {} key_down, {} key_up",
@@ -453,6 +474,7 @@ impl Coordinator {
             config,
             ui_tx,
             engine_mgr,
+            store,
             freq_tracker,
             compiled_hotkeys,
             punct: Mutex::new(PunctuationConverter::new()),

@@ -2142,6 +2142,7 @@ dependencies = [
  "wind-candidate",
  "wind-config",
  "wind-dict",
+ "wind-store",
 ]
 
 [[package]]
