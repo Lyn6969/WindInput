@@ -2728,11 +2728,19 @@ impl MessageHandler for Coordinator {
     fn handle_focus_lost(&self) {
         // 失焦是稳定的落盘时机，把累积词频持久化
         self.save_freq();
-        // 失焦即视为非激活并隐藏工具栏：用户开启系统“为每个应用窗口使用不同输入法”时，
-        // 切到使用别的输入法的应用不会触发 IME_DEACTIVATED，只有 FocusLost。隐藏经 UI 层
-        // 50ms 防抖——若紧接着 FocusGained（同输入法切窗/切文本框）会取消隐藏，无闪烁。
-        self.state.lock().unwrap_or_else(|e| e.into_inner()).ime_active = false;
-        self.notify_toolbar();
+        {
+            let mut s = self.state.lock().unwrap_or_else(|e| e.into_inner());
+            // 失焦即视为非激活并隐藏工具栏：用户开启系统“为每个应用窗口使用不同输入法”时，
+            // 切到使用别的输入法的应用不会触发 IME_DEACTIVATED，只有 FocusLost。工具栏隐藏经
+            // UI 层 50ms 防抖——若紧接着 FocusGained（同输入法切窗/切文本框）会取消隐藏，无闪烁。
+            s.ime_active = false;
+            // 焦点切换后旧 composition 上下文已失效，清理输入态，避免候选残留到新焦点。
+            s.input_buffer.clear();
+            s.preedit.clear();
+            s.candidates.clear();
+        }
+        self.notify_toolbar(); // 隐藏工具栏（防抖）
+        self.notify_ui_hide(); // 隐藏候选窗 + 弹出菜单（HideCandidates 连带关菜单）
     }
 
     fn get_current_mode(&self) -> (bool, bool) {
@@ -2753,10 +2761,17 @@ impl MessageHandler for Coordinator {
     }
 
     fn handle_ime_deactivated(&self) {
-        // 切走本输入法（换到别的 IME / 非输入法应用）：清激活态并隐藏工具栏。
-        // 对齐 Go SetIMEActivated(false) 的工具栏隐藏分支，根治“切走仍常驻显示”。
-        self.state.lock().unwrap_or_else(|e| e.into_inner()).ime_active = false;
+        // 切走本输入法（换到别的 IME / 非输入法应用）：清激活态、清输入、隐藏全部 UI。
+        // 对齐 Go SetIMEActivated(false)（隐藏工具栏 + hideUI），根治“切走仍残留显示”。
+        {
+            let mut s = self.state.lock().unwrap_or_else(|e| e.into_inner());
+            s.ime_active = false;
+            s.input_buffer.clear();
+            s.preedit.clear();
+            s.candidates.clear();
+        }
         self.notify_toolbar(); // 非激活态 → notify_toolbar 内部下发 HideToolbar
+        self.notify_ui_hide(); // 隐藏候选窗 + 弹出菜单
     }
 
     fn handle_mode_notify(&self, flags: u32) {
