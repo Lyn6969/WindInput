@@ -22,7 +22,6 @@ use wind_config::hotkey::{self, CompiledHotkeys};
 use wind_engine::EngineManager;
 use wind_ipc::protocol::{EVENT_KEY_DOWN, EVENT_KEY_UP, MOD_ALT, MOD_CTRL, MOD_SHIFT, calc_key_hash};
 use wind_store::Store;
-use wind_store::freq::FreqTracker;
 use wind_transform::fullwidth::to_full_width;
 use wind_transform::punctuation::PunctuationConverter;
 use wind_ui::candidate_window::CandidateItem;
@@ -203,14 +202,9 @@ pub struct Coordinator {
     engine_mgr: EngineManager,
     /// redb 持久化存储（用户词/临时词/词频/影子规则）；None=无持久化（headless 测试）。
     store: Option<Arc<Store>>,
-    freq_tracker: FreqTracker,
     compiled_hotkeys: CompiledHotkeys,
     /// 标点转换器（引号左右状态）
     punct: Mutex<PunctuationConverter>,
-    /// 词频持久化文件路径（None=不持久化）
-    freq_path: Option<std::path::PathBuf>,
-    /// 自上次落盘以来的新增选词数（达阈值触发保存）
-    freq_dirty: Mutex<u32>,
     /// 短语层（system.phrases.toml；$Y$M$D 模板）
     phrases: crate::phrases::PhraseLayer,
     /// 简繁转换器（OpenCC；None=数据缺失不可用）。变体可运行时切换，故置于 Mutex。
@@ -267,10 +261,9 @@ impl Coordinator {
             }
         };
 
-        // 词频持久化文件：优先用户配置目录，其次 data 目录
-        let freq_path = Config::user_config_dir()
-            .or_else(|| data_dir.as_deref().map(|d| d.to_path_buf()))
-            .map(|d| d.join("freq.tsv"));
+        // 用户配置目录：theme.txt 等小型 UI 偏好的锚点（词频已迁 redb，不再用 freq.tsv）。
+        let user_dir =
+            Config::user_config_dir().or_else(|| data_dir.as_deref().map(|d| d.to_path_buf()));
         // redb 用户数据库（本机数据，不随漫游；debug 变体已隔离到 WindInputDebug）。
         let store = Config::local_dir().and_then(|d| {
             let _ = std::fs::create_dir_all(&d);
@@ -287,7 +280,7 @@ impl Coordinator {
             }
         });
         let coordinator =
-            Self::build(config, data_dir.as_deref(), push_server, ui_tx, freq_path, store);
+            Self::build(config, data_dir.as_deref(), push_server, ui_tx, user_dir, store);
 
         // 鼠标事件处理线程：候选窗的点击/悬停/滚轮经此回到协调器
         if let Some(rx) = event_rx {
@@ -332,7 +325,7 @@ impl Coordinator {
         data_dir: Option<&Path>,
         push_server: Arc<PushServer>,
         ui_tx: std::sync::mpsc::Sender<UiCommand>,
-        freq_path: Option<std::path::PathBuf>,
+        user_dir: Option<std::path::PathBuf>,
         store: Option<Arc<Store>>,
     ) -> Arc<Self> {
         // 注入 redb Store：码表引擎注册用户词/临时词层，用户词进候选合并。
@@ -372,13 +365,7 @@ impl Coordinator {
             conv
         });
 
-        let freq_tracker = FreqTracker::new();
-        if let Some(p) = &freq_path {
-            match freq_tracker.load_from_file(p) {
-                Ok(_) => info!("Loaded freq: {} entries from {}", freq_tracker.len(), p.display()),
-                Err(e) => warn!("Failed to load freq {}: {}", p.display(), e),
-            }
-        }
+        // 词频已迁 redb（self.store 的 FREQ 表，选词时 record_freq）。
 
         // 标点配对表（解析为 (左,右) 字符对）
         let cn_pairs = parse_pairs(&config.input.auto_pair.chinese_pairs);
@@ -405,7 +392,7 @@ impl Coordinator {
         // Shadow 规则已迁至 redb（self.store 的 SHADOW 表，事务持久），不再用 shadow.json。
         // 工具栏位置属本机状态（不随漫游）：放 %LOCALAPPDATA%\WindInput
         let toolbar_pos_path = Config::local_dir().map(|d| d.join("toolbar_pos.txt"));
-        let theme_path = freq_path.as_ref().map(|p| p.with_file_name("theme.txt"));
+        let theme_path = user_dir.as_ref().map(|d| d.join("theme.txt"));
         let themes_dir = data_dir.map(|d| d.join("themes"));
         // 初始主题名：theme.txt（用户上次选择）> config.ui.theme > "default"
         let initial_theme = theme_path
@@ -464,11 +451,8 @@ impl Coordinator {
             ui_tx,
             engine_mgr,
             store,
-            freq_tracker,
             compiled_hotkeys,
             punct: Mutex::new(PunctuationConverter::new()),
-            freq_path,
-            freq_dirty: Mutex::new(0),
             phrases,
             s2t: Mutex::new(s2t),
             opencc_dir,
@@ -490,28 +474,47 @@ impl Coordinator {
         coordinator
     }
 
-    /// 记录一次选词并按阈值落盘（脏计数达到 8 或后续 focus_lost 时保存）。
-    fn record_selection(&self, word: &str) {
-        if word.is_empty() {
+    /// 记录一次选词到 redb FREQ（词频维度：count+1、last_used=now，按 schema+code+text）。
+    /// 词频是与权重解耦的独立维度（frequency.md），仅记真实使用数据；redb 事务即时持久。
+    fn record_selection(&self, code: &str, text: &str) {
+        if text.is_empty() {
             return;
         }
-        self.freq_tracker.record_selection(word);
-        let mut dirty = self.freq_dirty.lock().unwrap_or_else(|e| e.into_inner());
-        *dirty += 1;
-        if *dirty >= 8 {
-            *dirty = 0;
-            drop(dirty);
-            self.save_freq();
+        if let Some(store) = &self.store {
+            let schema = self.engine_mgr.active_schema_id();
+            if let Err(e) = store.record_freq(&schema, code, text) {
+                warn!("record_freq failed: {}", e);
+            }
         }
     }
 
-    /// 立即把词频落盘（focus_lost / 阈值触发）
-    fn save_freq(&self) {
-        if let Some(p) = &self.freq_path {
-            if let Err(e) = self.freq_tracker.save_to_file(p) {
-                warn!("Failed to save freq {}: {}", p.display(), e);
-            }
+    /// 词频重排（独立维度，**绝不改 weight**）：按 redb 词频 count 做 used-first 稳定重排——
+    /// 用过的候选（count>0）按 count 降序上浮，未用候选保持基础(权重)序。对齐 frequency.md §3。
+    /// 注：每候选一次 redb 点查（mmap 微秒级）；S1 将下沉到引擎排序层。
+    fn apply_freq_rerank(&self, candidates: &mut [Candidate], code: &str) {
+        let Some(store) = &self.store else {
+            return;
+        };
+        if code.is_empty() || candidates.len() < 2 {
+            return;
         }
+        let schema = self.engine_mgr.active_schema_id();
+        let counts: std::collections::HashMap<String, u32> = candidates
+            .iter()
+            .filter_map(|c| match store.get_freq(&schema, code, &c.text) {
+                Ok(Some(r)) if r.count > 0 => Some((c.text.clone(), r.count)),
+                _ => None,
+            })
+            .collect();
+        if counts.is_empty() {
+            return;
+        }
+        // sort_by 稳定：count 相等（含均为 0）保持原序，故未用候选不被打乱。
+        candidates.sort_by(|a, b| {
+            let ca = counts.get(&a.text).copied().unwrap_or(0);
+            let cb = counts.get(&b.text).copied().unwrap_or(0);
+            cb.cmp(&ca)
+        });
     }
 
     /// 当前活跃方案 ID（测试/诊断用）
@@ -598,9 +601,6 @@ impl Coordinator {
         let engine_count = result.candidates.len();
 
         let mut candidates = result.candidates;
-        for c in &mut candidates {
-            c.weight += self.freq_tracker.get_boost(&c.text) as i32;
-        }
         if !self.phrases.is_empty() {
             for (text, w) in self.phrases.lookup(&state.input_buffer) {
                 candidates.push(Candidate {
@@ -620,6 +620,8 @@ impl Coordinator {
         candidates.retain(|c| seen.insert(c.text.clone()));
         // 检索范围过滤（填充常用标志后按模式过滤；对齐 Go 引擎内过滤）
         self.apply_filter(state, &mut candidates);
+        // 用户词频重排（独立维度，used-first，绝不改 weight；frequency.md §3）
+        self.apply_freq_rerank(&mut candidates, &state.input_buffer);
         // Shadow 规则：删除过滤 + 置顶/移动重排（优先级最高，排序后应用）
         self.apply_shadow(&mut candidates, &state.input_buffer);
         state.candidates = candidates;
@@ -896,10 +898,8 @@ impl Coordinator {
         };
         state.preedit = format!("{}{}", prefix, display);
 
+        // 临时拼音候选按词库权重排序（其词频维度涉及特殊模式配置归属，待 S1 引擎层处理）。
         let mut candidates = result.candidates;
-        for c in &mut candidates {
-            c.weight += self.freq_tracker.get_boost(&c.text) as i32;
-        }
         candidates.sort_by(|a, b| {
             b.weight
                 .cmp(&a.weight)
@@ -944,7 +944,7 @@ impl Coordinator {
                 if !state.candidates.is_empty() {
                     let idx = self.highlighted_global_index(state).min(state.candidates.len() - 1);
                     let text = state.candidates[idx].text.clone();
-                    self.record_selection(&text);
+                    self.record_selection(&state.input_buffer, &text);
                     let out = self.maybe_s2t(state, &text);
                     self.exit_temp_pinyin(state);
                     self.notify_ui_hide();
@@ -961,7 +961,7 @@ impl Coordinator {
                 let idx = start + (data.key_code - 0x31) as usize;
                 if idx < end {
                     let text = state.candidates[idx].text.clone();
-                    self.record_selection(&text);
+                    self.record_selection(&state.input_buffer, &text);
                     let out = self.maybe_s2t(state, &text);
                     self.exit_temp_pinyin(state);
                     self.notify_ui_hide();
@@ -1014,7 +1014,7 @@ impl Coordinator {
                         let idx = start + offset;
                         if idx < end {
                             let text = state.candidates[idx].text.clone();
-                            self.record_selection(&text);
+                            self.record_selection(&state.input_buffer, &text);
                             let out = self.maybe_s2t(state, &text);
                             self.exit_temp_pinyin(state);
                             self.notify_ui_hide();
@@ -1027,7 +1027,7 @@ impl Coordinator {
                 if !state.candidates.is_empty() {
                     let idx = self.highlighted_global_index(state).min(state.candidates.len() - 1);
                     let text = state.candidates[idx].text.clone();
-                    self.record_selection(&text);
+                    self.record_selection(&state.input_buffer, &text);
                     let out = self.maybe_s2t(state, &text);
                     self.exit_temp_pinyin(state);
                     self.notify_ui_hide();
@@ -1379,7 +1379,7 @@ impl Coordinator {
         let committed = if !state.candidates.is_empty() {
             let idx = self.highlighted_global_index(state).min(state.candidates.len() - 1);
             let t = state.candidates[idx].text.clone();
-            self.record_selection(&t);
+            self.record_selection(&state.input_buffer, &t);
             Some(t)
         } else {
             None
@@ -1414,7 +1414,7 @@ impl Coordinator {
         let committed = if !state.candidates.is_empty() {
             let idx = self.highlighted_global_index(state).min(state.candidates.len() - 1);
             let t = state.candidates[idx].text.clone();
-            self.record_selection(&t);
+            self.record_selection(&state.input_buffer, &t);
             Some(t)
         } else {
             None
@@ -1454,7 +1454,7 @@ impl Coordinator {
 
     /// 提交某个候选（记录原始简体词频后清空状态），返回上屏文本（按需简繁转换）。
     fn commit_candidate(&self, state: &mut State, text: &str) -> String {
-        self.record_selection(text);
+        self.record_selection(&state.input_buffer, text);
         let out = self.maybe_s2t(state, text);
         state.input_buffer.clear();
         state.preedit.clear();
@@ -2682,7 +2682,7 @@ impl MessageHandler for Coordinator {
                     if !state.candidates.is_empty() {
                         let idx = self.highlighted_global_index(&state).min(state.candidates.len() - 1);
                         let t = state.candidates[idx].text.clone();
-                        self.record_selection(&t);
+                        self.record_selection(&state.input_buffer, &t);
                         out.push_str(&self.maybe_s2t(&state, &t));
                     } else if !state.input_buffer.is_empty() {
                         out.push_str(&state.input_buffer);
@@ -2772,8 +2772,7 @@ impl MessageHandler for Coordinator {
     }
 
     fn handle_focus_lost(&self) {
-        // 失焦是稳定的落盘时机，把累积词频持久化
-        self.save_freq();
+        // 词频已即时写入 redb（事务持久），失焦无需再落盘。
         {
             let mut s = self.state.lock().unwrap_or_else(|e| e.into_inner());
             // 失焦即视为非激活并隐藏工具栏：用户开启系统“为每个应用窗口使用不同输入法”时，
@@ -2950,10 +2949,11 @@ impl MessageHandler for Coordinator {
         } else {
             state.input_buffer.clone()
         };
+        let code = state.input_buffer.clone(); // 清空前捕获输入码，供词频记录
         state.input_buffer.clear();
         state.candidates.clear();
         // 与 handle_key_event 的选词路径保持一致：记录词频用于学习排序
-        self.record_selection(&text);
+        self.record_selection(&code, &text);
         Some(CommitResultData {
             barrier_seq: data.barrier_seq,
             text,
