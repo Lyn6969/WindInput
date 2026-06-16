@@ -76,8 +76,11 @@ impl Store {
         Ok(())
     }
 
-    /// 在持有 db 的前提下执行闭包；暂停态返回错误。
-    fn with_db<R>(&self, f: impl FnOnce(&Database) -> anyhow::Result<R>) -> anyhow::Result<R> {
+    /// 在持有 db 的前提下执行闭包；暂停态返回错误。各模块 ops（user_words/temp_words…）经此访问 db。
+    pub(crate) fn with_db<R>(
+        &self,
+        f: impl FnOnce(&Database) -> anyhow::Result<R>,
+    ) -> anyhow::Result<R> {
         let guard = self.db.lock().unwrap_or_else(|e| e.into_inner());
         match guard.as_ref() {
             Some(db) => f(db),
@@ -169,41 +172,6 @@ impl Store {
     pub fn path(&self) -> &Path {
         &self.path
     }
-
-    // ── 低层 KV 助手（供后续 user_words/temp_words/freq/shadow ops 复用；当前仅骨架测试用）──
-
-    /// 写入一个键值（单事务提交）。
-    #[allow(dead_code)] // 下一增量（store ops）接入；骨架阶段仅测试使用
-    pub(crate) fn put(
-        &self,
-        table: TableDefinition<&str, &[u8]>,
-        key: &str,
-        value: &[u8],
-    ) -> anyhow::Result<()> {
-        self.with_db(|db| {
-            let txn = db.begin_write()?;
-            {
-                let mut t = txn.open_table(table)?;
-                t.insert(key, value)?;
-            }
-            txn.commit()?;
-            Ok(())
-        })
-    }
-
-    /// 读取一个键值（不存在返回 None）。
-    #[allow(dead_code)] // 下一增量（store ops）接入；骨架阶段仅测试使用
-    pub(crate) fn get(
-        &self,
-        table: TableDefinition<&str, &[u8]>,
-        key: &str,
-    ) -> anyhow::Result<Option<Vec<u8>>> {
-        self.with_db(|db| {
-            let txn = db.begin_read()?;
-            let t = txn.open_table(table)?;
-            Ok(t.get(key)?.map(|g| g.value().to_vec()))
-        })
-    }
 }
 
 #[cfg(test)]
@@ -232,19 +200,6 @@ mod tests {
             assert!(!s.is_paused());
             assert_eq!(s.version().unwrap(), CURRENT_VERSION);
         }
-        let _ = std::fs::remove_file(&path);
-    }
-
-    #[test]
-    fn test_put_get_roundtrip() {
-        let path = std::env::temp_dir().join("wind_store_putget_test.redb");
-        let _ = std::fs::remove_file(&path);
-
-        let s = Store::open(&path).unwrap();
-        s.put(USER_WORDS, "wubi86\0a\0工", b"rec").unwrap();
-        assert_eq!(s.get(USER_WORDS, "wubi86\0a\0工").unwrap().as_deref(), Some(&b"rec"[..]));
-        assert_eq!(s.get(USER_WORDS, "missing").unwrap(), None);
-
         let _ = std::fs::remove_file(&path);
     }
 }
