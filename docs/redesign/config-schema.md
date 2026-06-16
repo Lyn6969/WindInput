@@ -31,6 +31,7 @@
 2. `wind-engine` 的 `SchemaFile` 与 `build_engine` 改为消费这套 Schema——**schema 定义与引擎构建解耦**（Go 的 factory 在 schema 包，引擎是被构建对象）。
 3. tri-state 字段一律 `Option<bool>`（修 Go 的 plain bool / *bool 混用坏设计）。
 4. EngineBundle 的 `interface{}` → Rust **enum**（Pinyin/CodeTable/Mixed）。
+5. **合理精简字段**：不照搬 Go 全部 spec 字段——剔除仅为**临时功能兼容**的遗留（如 `auto_commit_unique` 已被 `auto_commit_at_full` 取代）与可能过度设计的架构字段，**只支持实际有意义的**。每个保留字段须对应一个真实特性。
 
 ---
 
@@ -38,14 +39,35 @@
 
 > 这些字段就是前几份差分里"缺失能力"的开关。Schema 扩展是阶段 B 质量特性的**前置**：没有 spec 字段就无法配置 auto_commit / fuzzy / freq 参数。
 
-- **CodeTableSpec**（对齐 engine.md §2）：max_code_length / auto_commit_at_full:Option<bool> / auto_commit_min_len / auto_commit_block_on_pinyin / clear_on_empty_max / top_code_commit / punct_commit / show_code_hint / single_code_input / single_code_complete / candidate_sort_mode / dedup_candidates / skip_single_char_freq / temp_pinyin / z_key_repeat / **weight_mode / prefix_mode / bucket_limit / short_code_first / charset_preference**（这些直接对应 codetable 引擎缺失项）。
-- **PinyinSpec**（对齐 engine.md §1）：scheme(full/shuangpin) / **shuangpin.layout(ziranma/xiaohe/sogou/mspy)** / show_code_hint / use_smart_compose / candidate_order / **fuzzy(12 标志: zh_z/ch_c/sh_s/n_l/f_h/r_l/an_ang/en_eng/in_ing/ian_iang/uan_uang + enabled)**。
+- **CodeTableSpec**（对齐 engine.md §2）：max_code_length / auto_commit_at_full:Option<bool> / auto_commit_min_len / auto_commit_block_on_pinyin / clear_on_empty_max / top_code_commit / punct_commit / show_code_hint / single_code_input / single_code_complete / dedup_candidates / skip_single_char_freq / temp_pinyin / z_key_repeat / **排序两层（见 [frequency.md](./frequency.md)）: base_sort(weight|natural) + user_frequency:bool + freq_strategy(top|step，step 预留)** / **weight_mode / prefix_mode / bucket_limit / short_code_first / charset_preference** / **input_chars（码元字符集，见 §3b）**。
+- **PinyinSpec**（对齐 engine.md §1）：scheme(full/shuangpin) / **shuangpin（自定义映射引用，见 §3b——非硬编码内置方案）** / show_code_hint / use_smart_compose / candidate_order / **fuzzy(12 标志: zh_z/ch_c/sh_s/n_l/f_h/r_l/an_ang/en_eng/in_ing/ian_iang/uan_uang + enabled)**。
 - **MixedSpec**（对齐 engine.md §3）：primary_schema / secondary_schema / min_pinyin_length(默认2) / codetable_weight_boost(默认1e7) / show_source_hint / enable_abbrev_match / pinyin_only_overflow(默认true) / enable_english / top_code_override_pinyin。
 - **DictSpec**（对齐 dict.md）：id/label/path/type(codetable/rime_codetable/rime_pinyin) / default / default_enabled:Option<bool> / enabled:Option<bool> / role(system) / **weight_spec(median/max/min/mode:linear|log/target，归一化上限 10000)** / weight_as_order。
 - **EncoderSpec**（造词/编码提示）：rules[{length_equal | length_in_range:[min,max], formula:"AaAbBaBb"}] / max_word_length / exclude_patterns。
-- **LearningSpec**（对齐 store.md §3 + [frequency.md](./frequency.md)）：auto_learn{count_threshold:2, min_word_length:2, weight_delta:40, add_weight:800} / auto_phrase{min/max_phrase_len:2/5, idle_timeout_ms:5000, ...} / **freq{enabled, 拼音衰减参数: half_life:72h, base_scale, recency_peak}**（**词频已重构，去掉 boost_max/streak_scale/streak_cap 等 boost-to-weight 旧字段**）/ 码表排序在 CodeTableSpec.candidate_sort_mode 选 `frequency` / unigram_path / temp_max_entries:5000 / temp_promote_count:5。
+- **LearningSpec**（对齐 store.md §3 + [frequency.md](./frequency.md)）：auto_learn{count_threshold:2, min_word_length:2, weight_delta:40, add_weight:800} / auto_phrase{min/max_phrase_len:2/5, idle_timeout_ms:5000, ...} / **freq{enabled, 拼音衰减参数: half_life:72h, base_scale, recency_peak}**（**词频已重构，去掉 boost_max/streak_scale/streak_cap 等 boost-to-weight 旧字段**）/ 码表排序见 CodeTableSpec 的 base_sort+user_frequency / unigram_path / temp_max_entries:5000 / temp_promote_count:5。
 
 > ⚠️ **词频系统已完全重构**，以 [frequency.md](./frequency.md) 为准：词频与权重解耦、只存 {count,last_used}、作排序独立维度（码表 used-first 可选模式 / 拼音衰减分）。FreqSpec 仅保留拼音衰减参数，**单一真值源**（store 默认 + schema 覆盖）——消除旧"两套默认源不一致"。
+
+---
+
+## 3b. 输入方案字符定义（新特性：码元字符集 / 双拼自定义 / 优先级）
+
+> 当前 Rust 把"哪些键是输入码""双拼映射与 `;` 符号"**硬编码**在 coordinator/engine 里。本次改为**方案可配置**。
+
+### 码元字符集 `input_chars`（方案级）
+方案声明哪些字符构成"输入码"——决定一次按键是**进输入缓冲**还是作标点/上屏/透传。
+- 例：五笔标准 `a-x`；某库还含 `/test` 这类词条 → 配 `a-x/`；虎码等 26 键方案 → `a-z`。
+- **取代** coordinator 对 `A-Z`(0x41–0x5A) 的硬编码（见 coordinator.md：按键是否累积进 buffer 改为查方案 `input_chars`）。
+- 格式：范围 + 字面集（如 `"a-x/"`、`"a-z"`）。码表词条的合法码元也据此校验（dict 层）。
+
+### 双拼自定义映射（取代硬编码内置方案）
+- 现状：Rust `shuangpin.rs` 是 3 行桩；Go 把 ziranma/xiaohe/sogou/mspy **硬编码为内置方案**，映射中的 `;` 等符号也硬编码。
+- 目标：双拼方案 = **自定义映射数据**（键位→声母/韵母表 + 该布局使用的符号，如某布局用 `;` 作某韵母），由配置/预置文件提供；**引擎只消费通用映射，不内置具体方案**。
+  - 常见布局作为**预置数据文件**随程序发布（默认值），而非代码 enum——用户可改、可加新布局。
+  - 布局所用符号是映射的一部分，一并自定义（不再内部硬编码 `;`）。
+
+### 优先级
+字符定义（`input_chars` / 双拼映射 / 使用符号）的优先级：**方案配置 > 全局配置 > 内置默认**。原则上**以输入方案配置为主**。
 
 ---
 

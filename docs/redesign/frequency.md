@@ -21,22 +21,25 @@ Go 的做法：记录使用次数 → 以**加权方式把 boost 加到词的 we
 - **不再有 streak / boost / weight 叠加**（Go 的 streak 批量累加语义混乱、boost-to-weight 无效，一并去除）。
 - 排序时把 weight 与 frequency 作为**独立维度组合**，**绝不改 weight**。
 
-## 3. 码表方案：词频为可选主排序维度
-用户可选 `candidate_sort_mode`（方案/用户级配置）：
-- `weight`：按词库权重（默认）。
-- `natural`：自然/字根序（inner_order，对应 dict.md 的 WeightMode）。
-- `frequency`：**用户词频优先**。
+## 3. 码表方案：基础排序 + 词频（两层关系）
+排序是**两层**，不是互斥三选一：
 
-`frequency` 模式的排序规则（"used-first"）：
-1. 有词频数据的候选**整体优先**，按词频度量排序；
-2. 无词频数据的候选**回退**到默认 `weight`/`natural` 排序，排在已用词之后。
+**第一层 基础排序 `base_sort`**：`weight`（词库权重）或 `natural`（自然/字根序，对应 dict.md WeightMode 的 inner_order）。
+- 为何可选：**有些词库无权重，只能自然排序；有些词库虽有权重，但设计上就按自然序走**。故基础排序由方案/用户指定。
 
-排序键：`(has_freq?1:0 desc, freq_metric desc, weight desc, natural asc)`。
-- 码表 `freq_metric`：以 **count 为主**（确定性——"这个码我选了这个词 N 次，置前"）；可选用 last_used 作轻量 tiebreak（同次数时近用优先）。
+**第二层 用户词频 `user_frequency`（开关）**：开启后，**以 base_sort 为基底**，把用过的词按词频上浮。
+开启后规则（used-first，基底=base_sort）：
+1. 有词频数据的候选**优先**，按 `freq_metric` 排序；
+2. 无词频数据的候选**回退**到 base_sort（weight 或 natural），排在已用词之后。
+
+排序键：`(has_freq?1:0 desc, freq_metric desc, <base_sort: weight desc | natural asc>)`。
+- 码表 `freq_metric`：以 **count 为主**（"这个码我选了这个词 N 次，置前"）；last_used 作轻量 tiebreak。
 - 效果：**用一次即可靠上浮**，不受 weight 量级压制——修复 Go 痛点。
+- 不混算 weight 与 count（量纲不同），用分区/分层实现。
 
-> 注：码表"used-first"是用户明确意图（"优先使用用户词频排序，没数据时用默认"）。
-> 不混算 weight 与 count（两者量纲不同），用分区/分层实现。
+**词频应用策略 `freq_strategy`（可插拔，为未来预留）**：
+- 当前阶段：`top`（置前）——按 freq_metric 把用过的词排到区段前列。
+- **预留 `step`（逐次前进）**：每次选择只让该词**前进一位**，而非直接置顶（部分输入法的渐进调频风格）。**本阶段不实现**，但数据模型 `{count,last_used}` 与排序接口必须能容纳——即把词频应用做成**策略点**（FreqApplyStrategy trait），不要把"置前"逻辑写死。
 
 ## 4. 拼音方案：次数 + 最近时间 + 衰减
 拼音候选多、有整句组合，**不宜硬 used-first**（会破坏长句质量）。词频按**衰减分**参与排序：
@@ -59,7 +62,7 @@ decay      = exp(-ln2 * age_hours / half_life)     // 半衰期衰减，最近�
 > 区分两个易混概念：**用户词**（用户造的词，是 dict 的一个 layer，有自己的 weight）≠ **用户词频**（对任意候选的使用统计，是排序维度）。本文只讲后者；前者仍按 dict.md 的 store_layer。
 
 ## 6. 配置（修正 config-schema 旧 FreqSpec）
-- 码表：`candidate_sort_mode: weight | natural | frequency`（已在 CodeTableSpec）。
+- 码表排序（两层，对齐 §3）：`base_sort: weight | natural` + `user_frequency: bool` + `freq_strategy: top | step`（step 预留不实现）。**取代** Go 的单一 `candidate_sort_mode`。
 - 拼音衰减参数（FreqSpec 仅保留衰减相关）：`half_life`（默认 72h）、`base_scale`、可选 `recency_peak`。
 - **删除**旧的 boost-to-weight 语义字段（BoostMax / StreakScale / StreakCap 等"加权上限/连击"参数——属旧模型）。
 - 词频默认值改为**单一真值源**（store 提供默认 + schema 可覆盖），消除 store.md 指出的"两套默认源不一致"。
@@ -68,6 +71,6 @@ decay      = exp(-ln2 * age_hours / half_life)     // 半衰期衰减，最近�
 1. store：freq table 改为 `{count, last_used}`，去 streak/boost；提供 lookup + record。
 2. engine 排序层：新增**词频重排步骤**（码表 used-first 分区；拼音衰减分叠加），持 store freq 只读访问。
 3. dict：composite 去掉查询时 FreqBoost，只合并层。
-4. config：CodeTableSpec.candidate_sort_mode 加 frequency；FreqSpec 改衰减参数。
+4. config：CodeTableSpec 排序改两层 `base_sort(weight|natural) + user_frequency:bool + freq_strategy(top|step)`；FreqSpec 改衰减参数。
 
 > 受影响差分均已加指针指向本文。每步 `wind_input/scripts/dev.sh ci` 把关。

@@ -74,7 +74,7 @@ weight = int(score * 1_000_000)
    - 注：打分器只产出**词库基础质量分**（基于权重+LM）。**用户词频不进打分器、不改 dict_weight**——它是打分之后的**独立重排步骤**（码表 used-first 可选模式 / 拼音衰减分叠加），详见 [frequency.md](./frequency.md)。engine 排序层需持 store 的 freq 只读访问。
 2. `initial_quality` 用 `enum CandidateTier { Command, Sentence, ExactPhrase, MultiSeg, SubPhrase, LeadingChar, Abbrev, PartialExpand }` → f32 常量表，集中定义。
 3. 补流水线步骤：命令查询、多切分并行打分、首段/首音节单字、纯简拼（字数=音节数）。
-4. 双拼作为**独立工作项**（见 §4）：converter + 内置方案表 + 双拼预编辑 + 解除 manager 过滤。
+4. 双拼作为**独立工作项**（见 §4）：converter + **自定义映射数据（非硬编码内置方案）** + 双拼预编辑 + 解除 manager 过滤。
 5. 接通 config：show_code_hint（代码提示）/ filter_mode / candidate_order；模糊音改 `ArcSwap` 热更新。
 6. bigram 暂缓（unigram 打分到位后再评估收益）。
 
@@ -145,7 +145,8 @@ weight = int(score * 1_000_000)
 
 Go：`pinyin/shuangpin/`（converter.go 533 + schemes_builtin.go 342 + scheme.go 94 ≈ 969 行）——双拼键对→全拼转换、内置方案表（自然码/微软/小鹤等）、模糊音、双拼专用 preedit（engine_ex.go:667 buildShuangpinPreedit）。
 Rust：仅 3 行空模块，方案被 manager 过滤。
-目标：移植 converter + 内置方案表 + 双拼 preedit；manager 解除 `is_supported()` 对双拼的过滤；接通 `UpdateShuangpinLayout` 热切换。**体量约 600-900 行，建议作为阶段 B 后段单独推进**。
+目标：converter + 双拼 preedit + manager 解除 `is_supported()` 过滤 + `UpdateShuangpinLayout` 热切换。
+**关键改进（不照搬 Go 硬编码内置方案）**：双拼布局做成**自定义映射数据**（键位→声母/韵母 + 所用符号，如 `;` 作某韵母），引擎只消费通用映射；常见布局（自然码/微软/小鹤/搜狗…）作**预置数据文件**随程序发布而非代码 enum——用户可改可加（见 config-schema.md §3b）。**体量约 600-900 行，建议作为阶段 B 后段单独推进**。
 
 ---
 

@@ -107,6 +107,7 @@ F → 透传
 8. **EffectiveMode enum**（Chinese/EnglishLower/EnglishUpper）+ 敏感字段局部覆盖。
 9. **拼音分步确认**（confirmedSegments）作为 engine_default 宿主的状态补上（当前缺）；但 commit 路径设计要避免 Go 的"双轨状态污染每个出口"。
 10. 入口 `handle_key_event` 瘦身为：toggle/热键/修饰预处理 → 进 pipeline 分发，不再是 595 行上帝函数。
+11. **按键是否为"输入码"改查方案 `input_chars`**（见 config-schema.md §3b），**取代当前 `A-Z`(0x41–0x5A) 硬编码**。如五笔 `a-x`、含 `/test` 词条 `a-x/`、虎码 `a-z`。优先级：方案配置 > 全局 > 默认。双拼所用符号同样由方案映射决定，不再硬编码 `;`。
 
 ---
 
