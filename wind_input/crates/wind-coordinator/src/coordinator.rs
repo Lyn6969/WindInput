@@ -2714,6 +2714,12 @@ impl MessageHandler for Coordinator {
         self.save_freq();
     }
 
+    fn get_current_mode(&self) -> (bool, bool) {
+        // FocusGained 同步路径回传 ModePush：仅锁+读两字段，DLL 正同步阻塞等本值。
+        let s = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        (s.chinese_mode, s.full_width)
+    }
+
     fn handle_ime_activated(&self, client_token: u64) -> Option<StatusUpdateData> {
         if client_token != 0 {
             self.push_server.set_active_token(client_token);

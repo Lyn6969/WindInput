@@ -171,4 +171,11 @@ pub trait MessageHandler: Send + Sync {
     /// 显示功能主菜单（任务栏输入法指示右键）。x/y 为屏幕坐标；
     /// i32::MIN 表示坐标缺失（由 UI 取光标位置）。默认空实现。
     fn handle_show_context_menu(&self, _x: i32, _y: i32) {}
+
+    /// 返回当前权威模式 (chinese_mode, full_width)，供 FocusGained 同步路径回传 ModePush。
+    /// 必须极轻量（仅锁+读两字段），不得有任何阻塞/跨进程调用——DLL 正同步阻塞等本值。
+    /// 与 Go `MessageHandler.GetCurrentMode` 对齐。默认返回中文模式（安全默认）。
+    fn get_current_mode(&self) -> (bool, bool) {
+        (true, false)
+    }
 }

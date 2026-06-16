@@ -233,6 +233,22 @@ pub fn encode_ack() -> Vec<u8> {
     ipc.to_bytes().to_vec()
 }
 
+/// 编码 ModePush 响应（FocusGained 同步路径）：4 字节 LE flags，仅携带中英/全半角。
+/// DLL 收到后在首键前写好 _bChineseMode/_bFullWidth。与 Go `EncodeModePush` 字节对齐。
+pub fn encode_mode_push(chinese_mode: bool, full_width: bool) -> Vec<u8> {
+    let mut flags: u32 = 0;
+    if chinese_mode {
+        flags |= STATUS_CHINESE_MODE;
+    }
+    if full_width {
+        flags |= STATUS_FULL_WIDTH;
+    }
+    let ipc = IpcHeader::new(CMD_MODE_PUSH, 4);
+    let mut out = ipc.to_bytes().to_vec();
+    out.extend_from_slice(&flags.to_le_bytes());
+    out
+}
+
 /// 编码 PassThrough 响应
 pub fn encode_pass_through() -> Vec<u8> {
     let ipc = IpcHeader::new(CMD_PASS_THROUGH, 0);

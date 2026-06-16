@@ -254,6 +254,24 @@ fn handle_client(pipe: PipeHandle, handler: Arc<dyn MessageHandler>, _timeout_ms
         } else {
             info!("No response for cmd 0x{:04X} (async)", cmd);
         }
+
+        // FOCUS_GAINED 重型段延后到响应写出之后（对齐 Go runActivationHandlerAndPush）：
+        // 同步段已回 ModePush 解除 DLL 阻塞，此处再 build_status + push 完整激活状态
+        // （工具栏/热键/图标/active token），不占用 DLL 的同步等待窗口。
+        if cmd == CMD_FOCUS_GAINED
+            && let Ok(fg) = decode_focus_gained(payload)
+        {
+            let data = FocusData {
+                x: fg.caret.x,
+                y: fg.caret.y,
+                height: fg.caret.height,
+                composition_start_x: fg.caret.composition_start_x,
+                composition_start_y: fg.caret.composition_start_y,
+                client_token: fg.client_token,
+                input_scope_mask: fg.input_scope_mask,
+            };
+            handler.handle_focus_gained(&data);
+        }
     }
 
     unsafe {
@@ -268,7 +286,8 @@ fn handle_client(pipe: PipeHandle, handler: Arc<dyn MessageHandler>, _timeout_ms
 /// 与 Go 版 `processRequest` 对齐：
 /// - 同步命令返回 Some(response_bytes)
 /// - 异步命令返回 None（不写响应）
-/// - IME_ACTIVATED / FOCUS_GAINED 的状态推送由 handler 内部完成（通过 push pipe）
+/// - FOCUS_GAINED：同步命令，回 CMD_MODE_PUSH（权威 chinese/full）；重型 push 延后到
+///   handle_client 写出响应之后（见该处）。IME_ACTIVATED 仍异步，状态由 handler 经 push pipe 回送。
 fn dispatch_command(
     handler: &Arc<dyn MessageHandler>,
     command: u16,
@@ -325,22 +344,15 @@ fn dispatch_command(
             }
         }
 
-        // ── 焦点获取（异步） ──
-        // Go 的两阶段模式：Phase1 只同步 caret + 回 Ack，Phase2 在 Ack 后调用
-        // HandleFocusGained 并通过 push pipe 推送 ActivationStatusPush。
-        // Rust 简化：handler 内部完成所有逻辑（包括 push），此处不返回响应。
+        // ── 焦点获取（同步命令，对齐 Go fix(focus) 0acf860b） ──
+        // 两段式：本同步段只做纯内存轻量操作并**立即回 CMD_MODE_PUSH**（权威 chinese/full）：
+        //   DLL 现为同步发送，在 OnSetFocus 内阻塞等本响应，首键前写好 _bChineseMode，
+        //   根治"切到微信首键上屏英文"；并解除阻塞（旧实现返回 None → DLL 卡到超时，
+        //   表现为切应用卡顿）。重型 handle_focus_gained（build_status + push 完整激活状态）
+        //   延后到 handle_client 写出响应之后再跑，不在 DLL 阻塞路径上（见 handle_client）。
         CMD_FOCUS_GAINED => {
             if let Ok(fg) = decode_focus_gained(payload) {
-                let data = FocusData {
-                    x: fg.caret.x,
-                    y: fg.caret.y,
-                    height: fg.caret.height,
-                    composition_start_x: fg.caret.composition_start_x,
-                    composition_start_y: fg.caret.composition_start_y,
-                    client_token: fg.client_token,
-                    input_scope_mask: fg.input_scope_mask,
-                };
-                // 先同步 caret（与 Go applyFocusGainedCaret 对齐）
+                // 同步 caret（首键前必须就绪，纯字段写入，对齐 Go applyFocusGainedCaret）
                 handler.handle_caret_update(&CaretData {
                     x: fg.caret.x,
                     y: fg.caret.y,
@@ -348,10 +360,16 @@ fn dispatch_command(
                     composition_start_x: fg.caret.composition_start_x,
                     composition_start_y: fg.caret.composition_start_y,
                 });
-                // 调用 handleFocusGained（内部会 push ActivationStatusPush）
-                handler.handle_focus_gained(&data);
             }
-            None // 异步命令不返回响应
+            // 新 DLL 同步发送（is_async=false）：回传权威模式解除其阻塞并消除首键竞态。
+            // 旧 DLL fire-and-forget（is_async=true）：不读响应，回了反而污染管道 → 返回 None。
+            // 无论哪种，重型 handle_focus_gained 都在 handle_client 写出响应后统一触发。
+            if is_async {
+                None
+            } else {
+                let (chinese_mode, full_width) = handler.get_current_mode();
+                Some(encode_mode_push(chinese_mode, full_width))
+            }
         }
 
         // ── 焦点丢失（异步） ──

@@ -72,6 +72,10 @@ pub const CMD_STATUS_UPDATE: u16 = 0x0202;
 pub const CMD_STATE_PUSH: u16 = 0x0206;
 pub const CMD_SERVICE_READY: u16 = 0x0207; // push only
 pub const CMD_ACTIVATION_STATUS_PUSH: u16 = 0x020C;
+/// FocusGained 同步路径的轻量模式回传（仅 chineseMode+fullWidth，4 字节 flags）。
+/// DLL 在 OnSetFocus 内同步等本响应，首键前写好 _bChineseMode，根治"切应用首键上屏英文"
+/// 竞态；同时解除 DLL 的同步等待（否则无响应会卡到 READ_TIMEOUT_MS）。位定义同 STATUS_*。
+pub const CMD_MODE_PUSH: u16 = 0x020D;
 pub const CMD_SYNC_CONFIG: u16 = 0x0303;
 
 // 消费确认
