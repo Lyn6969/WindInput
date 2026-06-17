@@ -3446,27 +3446,8 @@ impl Coordinator {
             });
         }
 
-        // 快捷输入：空缓冲 + 无候选 + 匹配触发键 + 无修饰键
-        if state.input_buffer.is_empty()
-            && state.candidates.is_empty()
-            && data.modifiers & (MOD_CTRL | MOD_ALT | MOD_SHIFT) == 0
-            && self.is_quick_input_trigger(data.key_code)
-        {
-            state.active = Some(ModeKind::QuickInput);
-            state.quick_input_buffer.clear();
-            state.quick_input_prefix = Self::quick_input_prefix_for(data.key_code).to_string();
-            self.update_quick_input_candidates(state);
-            let display = state.preedit.clone();
-            self.notify_ui_update(state);
-            debug!(
-                "Entered quick input mode (prefix={})",
-                state.quick_input_prefix
-            );
-            return Some(KeyAction::UpdateComposition {
-                text: display.clone(),
-                caret_pos: display.chars().count() as u32,
-            });
-        }
+        // 快捷输入已退役为内置类方案 mix 成员（quick_input），不再独立激活：
+        // 想要纯快捷输入，配一个 members=["quick_input"] 的 mix 即可。; 默认走「快捷」融合 mix。
 
         // 临时拼音：码表方案 + 空缓冲 + 匹配触发键 + 无修饰键（不要求候选空）
         if state.input_buffer.is_empty()
