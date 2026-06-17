@@ -124,7 +124,9 @@ TempMix overlay: 触发键 → 同时查 [pinyin 反查, special:rare_char, spec
 - **M2 特殊模式拉平为真方案**（commit `183e959`）✅：`SpecialModeConfig` 去内嵌引擎字段、改引用 `schema`；候选走 `convert_with(spec.schema, …)`，全码策略由码表引擎接管；删 `special_tables`/`ensure_special_table`/`decide_special_auto_commit` 旁路。配套 `quick_symbols.schema.toml`（设备验证：`Loaded engine: quick_symbols`）。
 - **M3 英文词库**（commit `e0812df` 加载器 + `399554e` 临英候选）✅：`CodetableDict::load_lowercased` + `dict_type="english"`（小写码、原样文本）；临英候选感知（首候选=原文 + 词库前缀匹配 + `detect_en_case`/`adapt_en_case` 大小写适配）。配套 `english.schema.toml`。
 - **M4 overlay 引擎来源单一映射**（commit `12a2bca`）✅：`overlay_engine_schema(state)` 集中「模式→方案」映射，三处 `update_*_candidates` 统一经此取方案。激活触发条件保持 S4d 显式链（异构，不强塞统一表，避免死抽象）。
-- **M5 临时 mix**：`features.mix_modes[]{members:[schema…]}` + `ModeKind::Mix(u8)`；触发后对每个成员方案 `convert_with` 并按成员序合并候选，融合临拼/快符/生僻字。🚧 进行中。
+- **M5 临时 mix**（commit `03f1a3b`）✅：`features.mix_modes[]{members:[schema…]}` + `ModeKind::Mix(u8)`；触发后对每个可加载成员方案 `convert_with`、按成员序合并、按文本去重；`handle_mix_key` 候选感知（空格选高亮/数字与二三候选键选词/上下翻页/回车上屏原码/标点顶屏，手动选无自动上屏）。
+
+> **模式/方案统一 M1–M5 全部完成**：特殊模式拉平为真方案、临时英文挂英文词库、overlay 引擎来源单一映射、临时 mix 复合，均统一经方案注册表 `convert_with` 查询。
 
 ## 7. 已定决策（用户 2026-06-17）
 

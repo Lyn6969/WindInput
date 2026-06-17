@@ -105,9 +105,9 @@ WindInput/              产品仓根
 
 ### 阶段 C — 交互与配置完善（🚧 进行中）
 - ✅ 按键管线统一（key-pipeline S1–S4：单点决策/符号流水线/URL/特殊模式/全码策略/激活融合）。
-- 🔜 **模式/方案统一**（下一阶段，已拍板，先出设计 `redesign/mode-scheme-unify.md` 评审）：
-  临拼/特殊模式引擎统一为 scheme 实例（base 持久 / overlay 瞬态分离的 Processor-lite），
-  支持临时 mix 复合引擎融合临拼/快符/生僻字。
+- ✅ **模式/方案统一**（M1–M5，见 `redesign/mode-scheme-unify.md`）：schema 用户目录覆盖、
+  特殊模式拉平为真方案、临时英文挂英文词库、overlay 引擎来源单一映射、临时 mix 复合引擎；
+  临拼/特殊/临英/mix 候选均统一经方案注册表 `convert_with` 查询。
 - ⬜ **S5 按钮自定义**（工具栏/候选操作键映射）。
 - ⬜ **cmdbar**（命令栏 DSL + 内置函数，当前骨架）。
 - ⬜ **foreground 应用级配置**（前台窗口检测 → 按 app 自动切模式/方案）。
