@@ -265,8 +265,19 @@ fn resolve_image_path(p: &str, base_dir: &Path) -> String {
 /// 便捷：按名加载主题（base 深合并 + 类型化）并求值为 `Resolved`。
 /// theme_dir = themes_dir/<name>（resources 相对路径基准）。
 pub fn load_resolved(themes_dir: &Path, name: &str, is_dark: bool) -> anyhow::Result<Resolved> {
-    let t = crate::theme::load_typed(themes_dir, name)?;
-    Ok(resolve(&t, is_dark, &themes_dir.join(name)))
+    load_resolved_dirs(&[themes_dir.to_path_buf()], name, is_dark)
+}
+
+/// 多目录版：在 dirs 中定位主题并求值（base 跨目录、resources 相对其自身目录）。
+pub fn load_resolved_dirs(
+    dirs: &[std::path::PathBuf],
+    name: &str,
+    is_dark: bool,
+) -> anyhow::Result<Resolved> {
+    let t = crate::theme::load_typed_dirs(dirs, name)?;
+    let theme_dir = crate::theme::find_theme_dir(dirs, name)
+        .ok_or_else(|| anyhow::anyhow!("theme '{}' not found", name))?;
+    Ok(resolve(&t, is_dark, &theme_dir))
 }
 
 /// 求值入口：typed `Theme` + is_dark + theme 目录 → `Resolved`。
@@ -490,6 +501,22 @@ mod tests {
         let status = r.views.status.as_ref().expect("status rvnode");
         assert!(status.bg_image.is_some());
         assert_eq!(status.layers.len(), 1);
+    }
+
+    #[test]
+    fn test_read_meta_and_multidir_base() {
+        let dir = themes_dir();
+        let dirs = vec![dir.clone()];
+        // 显示名 / order 取自主题自身 meta（不 base 合并）。
+        let m = crate::theme::read_meta(&dirs, "jidian-classic").expect("jidian meta");
+        assert_eq!(m.name, "极点经典(位图)");
+        assert_eq!(m.order, 2);
+        let dm = crate::theme::read_meta(&dirs, "default").expect("default meta");
+        assert_eq!(dm.name, "默认主题");
+        // 多目录加载：jidian `base: _base` 跨目录解析正常（resources/views 出来）。
+        let r = load_resolved_dirs(&dirs, "jidian-classic", false).expect("resolve jidian");
+        assert!(r.views.window.bg_image.is_some(), "应解析出 _base+jidian 合并后的 window 背景图");
+        assert!(r.resources.contains_key("panel"));
     }
 
     #[test]

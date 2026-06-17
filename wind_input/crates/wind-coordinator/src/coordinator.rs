@@ -2711,11 +2711,11 @@ impl Coordinator {
         if index >= list.len() {
             return;
         }
-        let name = list[index].clone();
-        *self.theme_name.lock().unwrap_or_else(|e| e.into_inner()) = name.clone();
+        let (id, name) = list[index].clone();
+        *self.theme_name.lock().unwrap_or_else(|e| e.into_inner()) = id.clone();
         let dark = *self.theme_dark.lock().unwrap_or_else(|e| e.into_inner());
-        self.push_theme(&name, dark);
-        self.persist_theme(&name);
+        self.push_theme(&id, dark);
+        self.persist_theme(&id);
         self.show_tip(&format!("主题: {}", name));
     }
 
@@ -2827,13 +2827,26 @@ impl Coordinator {
         }
     }
 
-    /// 加载并下发指定主题（失败保留当前）。
+    /// 主题搜索目录：用户主题目录（%APPDATA%\WindInput\themes，优先覆盖）+ 安装主题目录。
+    /// 用户目录靠前 → 同名主题用户版覆盖内置；base 继承跨目录解析（用户主题可 `base: _base`）。
+    fn theme_search_dirs(&self) -> Vec<std::path::PathBuf> {
+        let mut dirs = Vec::new();
+        if let Some(d) = Config::user_config_dir() {
+            dirs.push(d.join("themes"));
+        }
+        if let Some(d) = &self.themes_dir {
+            dirs.push(d.clone());
+        }
+        dirs
+    }
+
+    /// 加载并下发指定主题（失败保留当前）。跨用户+安装目录解析（含 base 继承）。
     fn push_theme(&self, name: &str, is_dark: bool) {
-        let dir = match &self.themes_dir {
-            Some(d) => d,
-            None => return,
-        };
-        match wind_theme::load_resolved(dir, name, is_dark) {
+        let dirs = self.theme_search_dirs();
+        if dirs.is_empty() {
+            return;
+        }
+        match wind_theme::load_resolved_dirs(&dirs, name, is_dark) {
             Ok(t) => {
                 info!("Loaded theme: {} (dark={})", name, is_dark);
                 let _ = self.ui_tx.send(UiCommand::SetTheme(Box::new(t)));
@@ -2842,24 +2855,41 @@ impl Coordinator {
         }
     }
 
-    /// 列出可用主题（themes 下含 theme.yaml、非 `_` 前缀的目录，按名排序）。
-    fn list_themes(&self) -> Vec<String> {
-        let dir = match &self.themes_dir {
-            Some(d) => d,
-            None => return Vec::new(),
-        };
-        let mut names: Vec<String> = match std::fs::read_dir(dir) {
-            Ok(rd) => rd
-                .filter_map(|e| e.ok())
-                .filter(|e| e.path().is_dir())
-                .filter_map(|e| e.file_name().into_string().ok())
-                .filter(|n| !n.starts_with('_'))
-                .filter(|n| dir.join(n).join("theme.yaml").exists())
-                .collect(),
-            Err(_) => Vec::new(),
-        };
-        names.sort();
-        names
+    /// 列出可用主题：(id, 显示名)。扫用户+安装目录，含 theme.yaml、非 `_` 前缀；
+    /// 显示名取 meta.name（缺则用 id），按 (meta.order, id) 排序。
+    fn list_themes(&self) -> Vec<(String, String)> {
+        let dirs = self.theme_search_dirs();
+        let mut seen = std::collections::HashSet::new();
+        let mut rows: Vec<(String, String, i32)> = Vec::new();
+        for dir in &dirs {
+            let Ok(rd) = std::fs::read_dir(dir) else {
+                continue;
+            };
+            for e in rd.filter_map(|e| e.ok()) {
+                if !e.path().is_dir() {
+                    continue;
+                }
+                let Ok(id) = e.file_name().into_string() else {
+                    continue;
+                };
+                if id.starts_with('_') || !dir.join(&id).join("theme.yaml").exists() {
+                    continue;
+                }
+                if !seen.insert(id.clone()) {
+                    continue;
+                }
+                let meta = wind_theme::read_meta(&dirs, &id);
+                let name = meta
+                    .as_ref()
+                    .map(|m| m.name.clone())
+                    .filter(|s| !s.is_empty())
+                    .unwrap_or_else(|| id.clone());
+                let order = meta.as_ref().map(|m| m.order).unwrap_or(0);
+                rows.push((id, name, order));
+            }
+        }
+        rows.sort_by(|a, b| a.2.cmp(&b.2).then_with(|| a.0.cmp(&b.0)));
+        rows.into_iter().map(|(id, name, _)| (id, name)).collect()
     }
 
     /// 循环切换到下一个主题，重绘并持久化选择。
@@ -2907,12 +2937,12 @@ impl Coordinator {
             .clone();
         let dark = *self.theme_dark.lock().unwrap_or_else(|e| e.into_inner());
         let mut theme_children = Vec::new();
-        for (i, name) in themes.iter().enumerate() {
+        for (i, (id, name)) in themes.iter().enumerate() {
             theme_children.push(M::leaf(
                 name.clone(),
                 cmd(MenuCmd::ThemeSelect(i)),
                 true,
-                *name == cur_theme,
+                *id == cur_theme,
             ));
         }
         if !theme_children.is_empty() {
