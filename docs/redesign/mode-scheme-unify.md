@@ -72,16 +72,30 @@ struct ModeSpec {
 | 临时英文 | None（首版无候选；将来可挂英文词库方案） | 不动；留挂载点 |
 | URL | None | 不动 |
 
-### 特殊模式表 → 方案的映射
+### 特殊模式拉平为真方案（决策①：和其它 schema 同级）
 
-`features.special_modes[]{id, name, trigger_keys, table, auto_commit, fixed_length}` 保持为**激活面**配置
-（触发键、显示名属于 overlay 行为，不是引擎属性）。新增：把其 `table` 在 EngineManager 注册为一个
-**合成方案** `special:<id>`，引擎类型=码表，`CodeTableSpec` 由 special_modes 的 `auto_commit`/`fixed_length`
-映射 + 全局 `[input.code_commit]` 继承（复用 S4 的 tri-state 解析）。
+不再用合成 `special:<id>`。特殊模式的**引擎配置直接是一个真实方案文件**（如
+`data/schemas/quick_symbols.schema.toml`，与 `wubi86`/`pinyin` 同级同格式，含完整 `[engine.codetable]`：
+table / auto_commit / fixed_length / 排序 / …）。
 
-> 收益：特殊模式**白嫖**全码自动上屏/顶码/排序/用户词频/shadow 等成套能力；S3c 里手写的
-> `decide_special_auto_commit` 可由码表引擎的 `should_auto_commit` 接管（三档 prefix_free/fixed_length/manual
-> 对齐到 CodeTableSpec），删重复。
+`features.special_modes[]` 退化为**纯 overlay 激活面**：
+```toml
+[[features.special_modes]]
+name = "快符"
+trigger_keys = ["backslash"]
+schema = "quick_symbols"      # ← 引用真实方案，引擎配置全在该 .schema.toml
+```
+原来内嵌的 `table`/`auto_commit`/`fixed_length` **移除**，迁进 `quick_symbols.schema.toml`。
+
+- EngineManager 的 `convert_with(schema_id, code, n)` **本就懒加载任意方案**（`ensure_loaded`），
+  故引擎来源抽象**基本现成**：特殊模式 = `convert_with(spec.schema, …)`，无需"注册合成方案"。
+- 这些方案**不进** `schema.available`（不参与 cycle 持久切换），仅由 overlay 触发时按 id 懒加载。
+
+> 收益：特殊模式**白嫖**全码自动上屏/顶码/排序/用户词频/shadow 等成套能力；S3c 手写的
+> `decide_special_auto_commit` **由码表引擎 `should_auto_commit` 取代**（决策②），删重复。
+>
+> 代价/前置：方案文件需在 schemas 目录就位；schema 暂不支持用户覆盖合并（`read_schema` 只读安装目录，
+> 已知 gap），故特殊方案文件随安装目录部署（或推进"schema 用户覆盖"独立小项）。
 
 ## 4. 临时 mix 复合引擎（融合临拼 / 快符 / 生僻字）
 
@@ -106,22 +120,25 @@ TempMix overlay: 触发键 → 同时查 [pinyin 反查, special:rare_char, spec
 
 ## 6. 增量阶段（每步：编译 + 测试 + 交叉编译 + 提交）
 
-- **M1 引擎来源抽象**：EngineManager 支持注册"合成方案"（给定 id + 码表文件 → 方案实例）；
-  暴露按 id 懒加载/查询的稳定 API。host 可测（内存词典）。**不改 coordinator 行为**。
-- **M2 特殊模式迁移**：特殊模式候选改走 `convert_with("special:<id>")` + 质量链；删 `State.special_tables`
-  与 `decide_special_auto_commit`（由码表引擎全码策略接管）。设备回归：快符 `\` 仍正常。
-- **M3 ModeSpec 表驱动**：把临拼/特殊/快捷/英文/URL 的触发与引擎来源收进 `ModeSpec` 表，`try_activate_mode`
+- **M1 特殊模式拉平**：`features.special_modes[]` config 改为引用 `schema` id（去掉内嵌 table/auto_commit/
+  fixed_length）；提供 `quick_symbols.schema.toml`（迁移现有快符表）。EngineManager 复用 `convert_with` 懒加载。
+- **M2 特殊模式迁移到方案查询**：候选改走 `convert_with(spec.schema, code, n)` + coordinator 质量链；删
+  `State.special_tables`/`ensure_special_table`/`update_special_candidates` 直查与 `decide_special_auto_commit`
+  （全码策略由码表引擎接管）。设备回归：快符 `\` 仍正常，且现在带排序/词频。
+- **M3 英文词库**：移植 Go 英文词库（作为一个方案/引擎），临时英文模式 `convert_with(英文方案)` 出候选。
+- **M4 ModeSpec 表驱动**：把临拼/特殊/快捷/英文/URL 的触发与引擎来源收进 `ModeSpec` 表，`try_activate_mode`
   与 active 分派读表。纯重构，行为不变。
-- **M4 临时 mix**（可选，按需）：`CompositeOverlayEngine` + `features.mix_modes`，融合临拼/快符/生僻字。
+- **M5 临时 mix**：`CompositeOverlayEngine`（推广 `MixedEngine` 支持 N 路）+ `features.mix_modes`，
+  融合临拼/快符/生僻字等多方案候选。
 
-## 7. 待确认决策（评审点）
+## 7. 已定决策（用户 2026-06-17）
 
-1. **合成方案的 id 命名与配置面**：用 `special:<id>` 隐式生成，还是让 special_modes 直接写一个 `schema` 字段
-   指向真实方案？（倾向隐式生成，special_modes 配置不变，向后兼容。）
-2. **特殊模式三档自动上屏**与 CodeTableSpec 的映射：`prefix_free→?`、`fixed_length→auto_commit_min_len+max_code_length`、
-   `manual→关`。是否完全用 CodeTableSpec 取代 S3c 的 `decide_special_auto_commit`？（倾向取代，删重复。）
-3. **临时 mix 是否本轮做**：还是先 M1–M3 统一、mix 留到确有需求（如生僻字方案就绪）时再上 M4？
-4. **临时英文**要不要顺带挂英文词库方案出候选（目前无候选），还是保持纯累积？
+1. **特殊模式拉平为真方案**：和其它 schema 同级，`features.special_modes[]` 仅留 overlay（trigger/name/`schema`），
+   引擎配置进 `<id>.schema.toml`。不做合成 id。
+2. **取代**：完全用码表方案的 `CodeTableSpec` 全码策略取代 S3c 手写的 `decide_special_auto_commit`，删重复。
+3. **临时 mix 本轮做**（M4 纳入本轮）。
+4. **临时英文挂英文词库**：Go 现已有英文词库出候选，本轮一并移植（temp english 查英文词典出候选，
+   非纯累积）。英文词库的载体（独立英文方案/引擎类型 vs 词典层）在实现时定，倾向作为一个方案（与拉平一致）。
 
 ---
 
