@@ -47,34 +47,122 @@ struct FuzzyRule {
 /// 获取所有模糊音规则
 fn fuzzy_rules() -> Vec<FuzzyRule> {
     vec![
-        FuzzyRule { from: "zh", to: "z", flag: |c| c.zh_z },
-        FuzzyRule { from: "z", to: "zh", flag: |c| c.zh_z },
-        FuzzyRule { from: "ch", to: "c", flag: |c| c.ch_c },
-        FuzzyRule { from: "c", to: "ch", flag: |c| c.ch_c },
-        FuzzyRule { from: "sh", to: "s", flag: |c| c.sh_s },
-        FuzzyRule { from: "s", to: "sh", flag: |c| c.sh_s },
-        FuzzyRule { from: "n", to: "l", flag: |c| c.n_l },
-        FuzzyRule { from: "l", to: "n", flag: |c| c.n_l },
-        FuzzyRule { from: "f", to: "h", flag: |c| c.f_h },
-        FuzzyRule { from: "h", to: "f", flag: |c| c.f_h },
-        FuzzyRule { from: "r", to: "l", flag: |c| c.r_l },
-        FuzzyRule { from: "l", to: "r", flag: |c| c.r_l },
+        FuzzyRule {
+            from: "zh",
+            to: "z",
+            flag: |c| c.zh_z,
+        },
+        FuzzyRule {
+            from: "z",
+            to: "zh",
+            flag: |c| c.zh_z,
+        },
+        FuzzyRule {
+            from: "ch",
+            to: "c",
+            flag: |c| c.ch_c,
+        },
+        FuzzyRule {
+            from: "c",
+            to: "ch",
+            flag: |c| c.ch_c,
+        },
+        FuzzyRule {
+            from: "sh",
+            to: "s",
+            flag: |c| c.sh_s,
+        },
+        FuzzyRule {
+            from: "s",
+            to: "sh",
+            flag: |c| c.sh_s,
+        },
+        FuzzyRule {
+            from: "n",
+            to: "l",
+            flag: |c| c.n_l,
+        },
+        FuzzyRule {
+            from: "l",
+            to: "n",
+            flag: |c| c.n_l,
+        },
+        FuzzyRule {
+            from: "f",
+            to: "h",
+            flag: |c| c.f_h,
+        },
+        FuzzyRule {
+            from: "h",
+            to: "f",
+            flag: |c| c.f_h,
+        },
+        FuzzyRule {
+            from: "r",
+            to: "l",
+            flag: |c| c.r_l,
+        },
+        FuzzyRule {
+            from: "l",
+            to: "r",
+            flag: |c| c.r_l,
+        },
     ]
 }
 
 /// 韵母模糊音规则
 fn fuzzy_final_rules() -> Vec<FuzzyRule> {
     vec![
-        FuzzyRule { from: "ang", to: "an", flag: |c| c.an_ang },
-        FuzzyRule { from: "an", to: "ang", flag: |c| c.an_ang },
-        FuzzyRule { from: "eng", to: "en", flag: |c| c.en_eng },
-        FuzzyRule { from: "en", to: "eng", flag: |c| c.en_eng },
-        FuzzyRule { from: "ing", to: "in", flag: |c| c.in_ing },
-        FuzzyRule { from: "in", to: "ing", flag: |c| c.in_ing },
-        FuzzyRule { from: "iang", to: "ian", flag: |c| c.ian_iang },
-        FuzzyRule { from: "ian", to: "iang", flag: |c| c.ian_iang },
-        FuzzyRule { from: "uang", to: "uan", flag: |c| c.uan_uang },
-        FuzzyRule { from: "uan", to: "uang", flag: |c| c.uan_uang },
+        FuzzyRule {
+            from: "ang",
+            to: "an",
+            flag: |c| c.an_ang,
+        },
+        FuzzyRule {
+            from: "an",
+            to: "ang",
+            flag: |c| c.an_ang,
+        },
+        FuzzyRule {
+            from: "eng",
+            to: "en",
+            flag: |c| c.en_eng,
+        },
+        FuzzyRule {
+            from: "en",
+            to: "eng",
+            flag: |c| c.en_eng,
+        },
+        FuzzyRule {
+            from: "ing",
+            to: "in",
+            flag: |c| c.in_ing,
+        },
+        FuzzyRule {
+            from: "in",
+            to: "ing",
+            flag: |c| c.in_ing,
+        },
+        FuzzyRule {
+            from: "iang",
+            to: "ian",
+            flag: |c| c.ian_iang,
+        },
+        FuzzyRule {
+            from: "ian",
+            to: "iang",
+            flag: |c| c.ian_iang,
+        },
+        FuzzyRule {
+            from: "uang",
+            to: "uan",
+            flag: |c| c.uan_uang,
+        },
+        FuzzyRule {
+            from: "uan",
+            to: "uang",
+            flag: |c| c.uan_uang,
+        },
     ]
 }
 

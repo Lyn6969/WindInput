@@ -90,9 +90,7 @@ impl EngineManager {
             available.push(active_id.clone());
         }
         // 过滤不支持的方案（如双拼），但始终保留活跃方案
-        available.retain(|sid| {
-            sid == &active_id || Self::schema_supported(sid, data_dir)
-        });
+        available.retain(|sid| sid == &active_id || Self::schema_supported(sid, data_dir));
 
         let mgr = Self {
             engines: Mutex::new(HashMap::new()),
@@ -126,7 +124,11 @@ impl EngineManager {
         }
         match Self::build_engine(schema_id, self.data_dir.as_deref(), self.store.clone()) {
             Some(engine) => {
-                info!("Loaded engine: {} (type={:?})", schema_id, engine.engine_type());
+                info!(
+                    "Loaded engine: {} (type={:?})",
+                    schema_id,
+                    engine.engine_type()
+                );
                 self.engines
                     .lock()
                     .unwrap_or_else(|e| e.into_inner())
@@ -153,7 +155,10 @@ impl EngineManager {
 
     /// 当前活跃方案 ID
     pub fn active_schema_id(&self) -> String {
-        self.active.lock().unwrap_or_else(|e| e.into_inner()).clone()
+        self.active
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
     }
 
     /// 当前活跃引擎是否为拼音类型
@@ -249,7 +254,12 @@ impl EngineManager {
 
     /// 用指定方案引擎转换（不改变当前活跃方案，必要时懒加载）。
     /// 用于临时拼音：码表模式下临时借用拼音引擎反查。
-    pub fn convert_with(&self, schema_id: &str, input: &str, max_candidates: usize) -> ConvertResult {
+    pub fn convert_with(
+        &self,
+        schema_id: &str,
+        input: &str,
+        max_candidates: usize,
+    ) -> ConvertResult {
         if !self.ensure_loaded(schema_id) {
             return ConvertResult::default();
         }
@@ -360,25 +370,41 @@ impl EngineManager {
             } else {
                 4
             };
+            // 全码自动上屏：auto_commit_at_full 为 tri-state，未设置时回退 legacy auto_commit_unique。
+            let ct = &schema.engine.codetable;
+            let auto_commit_at_full = ct.auto_commit_at_full.unwrap_or(ct.auto_commit_unique);
+            let auto_commit_min_len = ct.auto_commit_min_len;
             // 码表引擎经 DictManager(CompositeDict) 查询：系统词库作 System 层。
             // 注入 redb Store 时，注册用户词/临时词层（按 schema 隔离），让用户词进候选合并。
             let dm = wind_dict::DictManager::new();
             if let Some(store) = &store {
-                dm.register_layer(Box::new(wind_dict::StoreUserLayer::new(store.clone(), schema_id)));
-                dm.register_layer(Box::new(wind_dict::StoreTempLayer::new(store.clone(), schema_id)));
+                dm.register_layer(Box::new(wind_dict::StoreUserLayer::new(
+                    store.clone(),
+                    schema_id,
+                )));
+                dm.register_layer(Box::new(wind_dict::StoreTempLayer::new(
+                    store.clone(),
+                    schema_id,
+                )));
             }
-            dm.register_layer(Box::new(wind_dict::SystemDictLayer::new(dict, "codetable-system")));
-            Some(Box::new(CodeTableEngine::new(mcl, Arc::new(dm))))
+            dm.register_layer(Box::new(wind_dict::SystemDictLayer::new(
+                dict,
+                "codetable-system",
+            )));
+            Some(Box::new(CodeTableEngine::new(
+                mcl,
+                auto_commit_at_full,
+                auto_commit_min_len,
+                Arc::new(dm),
+            )))
         }
     }
 
     /// 加载 unigram 语言模型（mmap）：从 unigram.txt 懒生成 unigram.wdb 后 mmap 打开。
     /// 几乎不占常驻内存（页按需载入），替代旧的全量 HashMap 方案。
-    fn load_unigram_mmap(
-        ug_txt: &Path,
-    ) -> Option<Arc<dyn crate::pinyin::lm::UnigramLookup>> {
-        use crate::pinyin::lm::{parse_unigram_freqs, MmapUnigram};
-        use wind_dict::unigram::{write_unigram_wdb, UnigramReader};
+    fn load_unigram_mmap(ug_txt: &Path) -> Option<Arc<dyn crate::pinyin::lm::UnigramLookup>> {
+        use crate::pinyin::lm::{MmapUnigram, parse_unigram_freqs};
+        use wind_dict::unigram::{UnigramReader, write_unigram_wdb};
 
         let ug_wdb = cache_path(ug_txt, "wdb");
         // wdb 比 txt 新则直接用；否则从 txt 重建
@@ -398,7 +424,11 @@ impl EngineManager {
         }
         match UnigramReader::open(&ug_wdb) {
             Ok(reader) => {
-                info!("Unigram mmap: {} ({} keys)", ug_wdb.display(), reader.key_count());
+                info!(
+                    "Unigram mmap: {} ({} keys)",
+                    ug_wdb.display(),
+                    reader.key_count()
+                );
                 Some(Arc::new(MmapUnigram::new(reader)))
             }
             Err(e) => {
@@ -473,7 +503,10 @@ impl EngineManager {
     /// 把多个词库合并到一个 combined.wdb（按 code 聚合），并 mmap 打开。
     /// 每个源按其 dict_type 加载：rime_pinyin 先经 import_tables 展开。
     /// 缓存有效性：combined 比所有源都新则直接复用。
-    fn load_merged_dicts(sources: &[(std::path::PathBuf, String)], combined: &Path) -> Option<CachedDict> {
+    fn load_merged_dicts(
+        sources: &[(std::path::PathBuf, String)],
+        combined: &Path,
+    ) -> Option<CachedDict> {
         let paths: Vec<&Path> = sources.iter().map(|(p, _)| p.as_path()).collect();
         if Self::combined_cache_fresh(&paths, combined) {
             if let Ok(reader) = wind_dict::binformat::DictReader::open(combined) {
@@ -587,7 +620,10 @@ impl EngineManager {
                 }
             }
         } else if merged_wdb.exists() {
-            info!("merged cache stale (source newer), regenerating: {}", merged_wdb.display());
+            info!(
+                "merged cache stale (source newer), regenerating: {}",
+                merged_wdb.display()
+            );
             let _ = std::fs::remove_file(&merged_wdb);
         }
 

@@ -38,7 +38,11 @@ fn test_wubi_engine_candidates() {
     assert!(
         result.candidates.iter().any(|c| c.text == "恭恭敬敬"),
         "应包含 恭恭敬敬，实际: {:?}",
-        result.candidates.iter().map(|c| c.text.as_str()).collect::<Vec<_>>()
+        result
+            .candidates
+            .iter()
+            .map(|c| c.text.as_str())
+            .collect::<Vec<_>>()
     );
     assert!(!mgr.is_pinyin(), "wubi86 不应判定为拼音");
 }
@@ -51,9 +55,7 @@ fn test_wubi_extra_dict_loaded() {
         return;
     }
     // 删除旧 combined 缓存，强制重新合并多库
-    let _ = std::fs::remove_file(
-        dir.join("schemas/wubi86/wubi86_jidian.dict.combined.wdb"),
-    );
+    let _ = std::fs::remove_file(dir.join("schemas/wubi86/wubi86_jidian.dict.combined.wdb"));
     let cfg = make_config(&["wubi86"]);
     let mgr = EngineManager::new(&cfg, Some(&dir));
 
@@ -63,12 +65,19 @@ fn test_wubi_extra_dict_loaded() {
     assert!(
         r.candidates.iter().any(|c| c.text == "甘蓝菜"),
         "扩展库词 '甘蓝菜'(aaae) 应能查到，实际: {:?}",
-        r.candidates.iter().take(10).map(|c| c.text.as_str()).collect::<Vec<_>>()
+        r.candidates
+            .iter()
+            .take(10)
+            .map(|c| c.text.as_str())
+            .collect::<Vec<_>>()
     );
 
     // 主库词仍在
     let a = mgr.convert("aaaa", 20);
-    assert!(a.candidates.iter().any(|c| c.text == "恭恭敬敬"), "主库词应仍在");
+    assert!(
+        a.candidates.iter().any(|c| c.text == "恭恭敬敬"),
+        "主库词应仍在"
+    );
 }
 
 #[test]
@@ -84,14 +93,19 @@ fn test_pinyin_engine_candidates() {
     assert!(mgr.is_pinyin(), "pinyin 应判定为拼音");
 
     let result = mgr.convert("nihao", 9);
+    assert!(!result.candidates.is_empty(), "拼音 'nihao' 应产出候选");
     assert!(
-        !result.candidates.is_empty(),
-        "拼音 'nihao' 应产出候选"
-    );
-    assert!(
-        result.candidates.iter().any(|c| c.text.contains("你好") || c.text == "你好"),
+        result
+            .candidates
+            .iter()
+            .any(|c| c.text.contains("你好") || c.text == "你好"),
         "应包含 你好，实际: {:?}",
-        result.candidates.iter().take(10).map(|c| c.text.as_str()).collect::<Vec<_>>()
+        result
+            .candidates
+            .iter()
+            .take(10)
+            .map(|c| c.text.as_str())
+            .collect::<Vec<_>>()
     );
 }
 
@@ -115,7 +129,11 @@ fn test_pinyin_long_sentence() {
         .unwrap_or(0);
     eprintln!(
         "woaizhongguo 候选: {:?}",
-        r.candidates.iter().take(8).map(|c| c.text.as_str()).collect::<Vec<_>>()
+        r.candidates
+            .iter()
+            .take(8)
+            .map(|c| c.text.as_str())
+            .collect::<Vec<_>>()
     );
     assert!(
         longest >= 4,
@@ -131,9 +149,7 @@ fn test_pinyin_long_sentence() {
 #[test]
 fn test_schema_cycle() {
     let dir = data_dir();
-    if !schema_exists(&dir, "wubi86")
-        || !schema_exists(&dir, "pinyin")
-    {
+    if !schema_exists(&dir, "wubi86") || !schema_exists(&dir, "pinyin") {
         eprintln!("跳过：缺少 schema");
         return;
     }
@@ -160,5 +176,9 @@ fn test_schema_cycle_skips_unloaded() {
     let mgr = EngineManager::new(&cfg, Some(&dir));
     assert_eq!(mgr.active_schema_id(), "wubi86");
     let next = mgr.cycle_schema();
-    assert_eq!(next.as_deref(), Some("pinyin"), "应跳过未加载方案直达 pinyin");
+    assert_eq!(
+        next.as_deref(),
+        Some("pinyin"),
+        "应跳过未加载方案直达 pinyin"
+    );
 }

@@ -286,10 +286,13 @@ impl UnigramLookup for DictUnigramModel {
         // 对于 OOV 词，使用平均每字得分
         let probs = self.probs.read().unwrap();
         let char_count = word.chars().count().max(1);
-        let total: f64 = word.chars().map(|c| {
-            let s = c.to_string();
-            *probs.get(&s).unwrap_or(&self.default_prob)
-        }).sum();
+        let total: f64 = word
+            .chars()
+            .map(|c| {
+                let s = c.to_string();
+                *probs.get(&s).unwrap_or(&self.default_prob)
+            })
+            .sum();
         total / char_count as f64
     }
 

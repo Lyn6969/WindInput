@@ -4,20 +4,63 @@
 //! 构建词图并支持多路径评分，用于 Viterbi 解码。
 
 use crate::pinyin::dag::Dag;
-use crate::pinyin::syllable::SyllableTrie;
 use crate::pinyin::fuzzy::{FuzzyConfig, FuzzyMatcher};
 use crate::pinyin::lm::UnigramLookup;
+use crate::pinyin::syllable::SyllableTrie;
 use wind_dict::cached::CachedDict;
 
 /// 虚词集合（单字时轻微惩罚，对齐 Go functionWords）
 fn is_function_word(w: &str) -> bool {
     matches!(
         w,
-        "了" | "的" | "地" | "得" | "着" | "过"
-            | "我" | "你" | "他" | "她" | "它" | "们" | "这" | "那"
-            | "和" | "与" | "在" | "把" | "被" | "让" | "从" | "到" | "对" | "向" | "跟"
-            | "不" | "没" | "也" | "都" | "就" | "才" | "还" | "又" | "再" | "很" | "太" | "最"
-            | "是" | "有" | "会" | "能" | "要" | "可" | "去" | "来" | "做" | "说" | "看" | "想"
+        "了" | "的"
+            | "地"
+            | "得"
+            | "着"
+            | "过"
+            | "我"
+            | "你"
+            | "他"
+            | "她"
+            | "它"
+            | "们"
+            | "这"
+            | "那"
+            | "和"
+            | "与"
+            | "在"
+            | "把"
+            | "被"
+            | "让"
+            | "从"
+            | "到"
+            | "对"
+            | "向"
+            | "跟"
+            | "不"
+            | "没"
+            | "也"
+            | "都"
+            | "就"
+            | "才"
+            | "还"
+            | "又"
+            | "再"
+            | "很"
+            | "太"
+            | "最"
+            | "是"
+            | "有"
+            | "会"
+            | "能"
+            | "要"
+            | "可"
+            | "去"
+            | "来"
+            | "做"
+            | "说"
+            | "看"
+            | "想"
     )
 }
 
@@ -60,7 +103,11 @@ fn score_node(word: &str, weight: i32, unigram: Option<&dyn UnigramLookup>) -> f
             log_prob += SINGLE_CHAR_PENALTY;
         }
     } else if char_count > 1 {
-        if chars.last().map(|c| is_particle_suffix(*c)).unwrap_or(false) {
+        if chars
+            .last()
+            .map(|c| is_particle_suffix(*c))
+            .unwrap_or(false)
+        {
             log_prob += VERB_PARTICLE_PENALTY;
         } else if ug.contains(word) {
             let freq_factor = ((log_prob - LOG_PROB_MIN) / LOG_PROB_RANGE).clamp(0.0, 1.0);
@@ -140,7 +187,10 @@ impl LatticeBuilder {
                         let variant_results = dict.search(&variant);
                         for (text, weight, _order) in &variant_results {
                             // 去重
-                            if !nodes[char_end].iter().any(|n| n.word == *text && n.start == char_start) {
+                            if !nodes[char_end]
+                                .iter()
+                                .any(|n| n.word == *text && n.start == char_start)
+                            {
                                 let log_prob = score_node(text, *weight, unigram) - 0.5; // 模糊匹配轻微惩罚
                                 nodes[char_end].push(LatticeNode {
                                     start: char_start,

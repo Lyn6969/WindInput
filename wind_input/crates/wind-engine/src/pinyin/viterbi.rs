@@ -144,8 +144,18 @@ mod tests {
     fn test_decode_two_segments() {
         let input_len = 5usize;
         let mut nodes: Vec<Vec<WordNode>> = vec![Vec::new(); input_len + 1];
-        nodes[2].push(WordNode { start: 0, end: 2, word: "你".to_string(), log_prob: 3.0 });
-        nodes[5].push(WordNode { start: 2, end: 5, word: "好".to_string(), log_prob: 3.0 });
+        nodes[2].push(WordNode {
+            start: 0,
+            end: 2,
+            word: "你".to_string(),
+            log_prob: 3.0,
+        });
+        nodes[5].push(WordNode {
+            start: 2,
+            end: 5,
+            word: "好".to_string(),
+            log_prob: 3.0,
+        });
         let decoder = ViterbiDecoder::new();
         let result = decoder.decode(&nodes, input_len);
         assert_eq!(result.words, vec!["你".to_string(), "好".to_string()]);

@@ -120,19 +120,20 @@ impl Engine for PinyinEngine {
         let trie = &self.trie;
         let mut candidates: Vec<Candidate> = Vec::new();
 
-        let push_unique = |cands: &mut Vec<Candidate>, text: String, code: String, weight: i32, order: i32| {
-            if text.is_empty() || cands.iter().any(|c| c.text == text) {
-                return;
-            }
-            cands.push(Candidate {
-                text,
-                code,
-                weight,
-                natural_order: order,
-                source: CandidateSource::Pinyin,
-                ..Default::default()
-            });
-        };
+        let push_unique =
+            |cands: &mut Vec<Candidate>, text: String, code: String, weight: i32, order: i32| {
+                if text.is_empty() || cands.iter().any(|c| c.text == text) {
+                    return;
+                }
+                cands.push(Candidate {
+                    text,
+                    code,
+                    weight,
+                    natural_order: order,
+                    source: CandidateSource::Pinyin,
+                    ..Default::default()
+                });
+            };
 
         // 1. 精确查找（完整匹配）
         for (text, weight, order) in dict.search(input) {
@@ -174,8 +175,9 @@ impl Engine for PinyinEngine {
                 if !sentence.is_empty() {
                     // 整句优先：给予高权重置顶（log_prob 为负，原 .max(1) 会被截断淘汰）。
                     // clamp + saturating_add 防止超长低频句的 log_prob 溢出 i32 导致沉底/panic。
-                    let log_offset =
-                        (result.log_prob * 1000.0).clamp(-(SENTENCE_WEIGHT_BASE as f64), 0.0) as i32;
+                    let log_offset = (result.log_prob * 1000.0)
+                        .clamp(-(SENTENCE_WEIGHT_BASE as f64), 0.0)
+                        as i32;
                     let weight = SENTENCE_WEIGHT_BASE.saturating_add(log_offset);
                     if let Some(existing) = candidates.iter_mut().find(|c| c.text == sentence) {
                         // 整句与已有候选（如精确匹配 你好）同文：提升其权重置顶，
@@ -221,7 +223,13 @@ impl Engine for PinyinEngine {
         // 5. 缩写/简拼匹配
         if AbbrevMatcher::is_abbreviation(input, trie) {
             for abbrev in AbbrevMatcher::find_candidates(input, trie, dict, 10) {
-                push_unique(&mut candidates, abbrev.text, abbrev.code, abbrev.weight, 999999);
+                push_unique(
+                    &mut candidates,
+                    abbrev.text,
+                    abbrev.code,
+                    abbrev.weight,
+                    999999,
+                );
             }
         }
 

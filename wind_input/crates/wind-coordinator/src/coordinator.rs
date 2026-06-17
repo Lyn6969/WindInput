@@ -669,7 +669,9 @@ impl Coordinator {
 
     /// 用给定上限转换并构建候选（引擎 + 词频 boost + 短语 + 排序去重）。
     /// 返回引擎候选数（不含短语），供判断 has_more。不复位翻页/高亮。
-    fn build_candidates(&self, state: &mut State, limit: usize) -> usize {
+    /// 返回 (引擎候选数, 全码自动上屏文本)。自动上屏文本经 shadow 复核后才返回，
+    /// 避免上屏被置顶删词移除的候选。调用方仅在「正向输入字母」时消费该上屏文本。
+    fn build_candidates(&self, state: &mut State, limit: usize) -> (usize, Option<String>) {
         let result = self.engine_mgr.convert(&state.input_buffer, limit);
         // 组合区只显示输入码/拼音
         state.preedit = if result.preedit_display.is_empty() {
@@ -678,6 +680,12 @@ impl Coordinator {
             result.preedit_display
         };
         let engine_count = result.candidates.len();
+        // 引擎给出的全码自动上屏意向（基于引擎候选；下方 shadow 后复核存活性）。
+        let auto_commit = if result.should_commit && !result.commit_text.is_empty() {
+            Some(result.commit_text.clone())
+        } else {
+            None
+        };
 
         let mut candidates = result.candidates;
         if !self.phrases.is_empty() {
@@ -704,7 +712,9 @@ impl Coordinator {
         // Shadow 规则：删除过滤 + 置顶/移动重排（优先级最高，排序后应用）
         self.apply_shadow(&mut candidates, &state.input_buffer);
         state.candidates = candidates;
-        engine_count
+        // 复核：仅当上屏目标在最终候选中仍存在（未被 shadow 删除）才放行自动上屏。
+        let auto_commit = auto_commit.filter(|t| state.candidates.iter().any(|c| &c.text == t));
+        (engine_count, auto_commit)
     }
 
     /// 按当前检索范围过滤候选：先填充 is_common（常用字表），再按模式过滤。
@@ -753,16 +763,17 @@ impl Coordinator {
     }
 
     /// 根据输入缓冲更新候选（动态分级加载：首次小批量，翻页到边界再扩展）。
-    fn update_candidates(&self, state: &mut State) {
+    /// 返回全码自动上屏文本（若该输入触发全码上屏）；多数调用方忽略，仅正向输入字母时消费。
+    fn update_candidates(&self, state: &mut State) -> Option<String> {
         state.candidates.clear();
         state.preedit = state.input_buffer.clone();
         if state.input_buffer.is_empty() {
             state.has_more = false;
             state.candidate_input.clear();
-            return;
+            return None;
         }
         let limit = self.initial_candidate_limit(&state.input_buffer);
-        let engine_count = self.build_candidates(state, limit);
+        let (engine_count, auto_commit) = self.build_candidates(state, limit);
         state.candidate_input = state.input_buffer.clone();
         state.candidate_limit = limit;
         // 引擎返回数达到上限 → 可能还有更多未加载
@@ -771,6 +782,7 @@ impl Coordinator {
         state.current_page = 0;
         state.selected_index = 0;
         state.hover_index = -1;
+        auto_commit
     }
 
     /// 扩展候选（翻页/下移到边界时调用）：上限翻倍（≤5000）重新加载，保持当前页/高亮。
@@ -784,7 +796,8 @@ impl Coordinator {
             return;
         }
         let prev_len = state.candidates.len();
-        let engine_count = self.build_candidates(state, new_limit);
+        // 翻页扩展不消费全码自动上屏（仅正向输入字母时才上屏）。
+        let (engine_count, _) = self.build_candidates(state, new_limit);
         if state.candidates.len() <= prev_len {
             // 没有新增 → 已到底
             state.has_more = false;
@@ -3392,7 +3405,12 @@ impl MessageHandler for Coordinator {
                 // A-Z 字母累积
                 let ch = (b'a' + (data.key_code - 0x41) as u8) as char;
                 state.input_buffer.push(ch);
-                self.update_candidates(&mut state);
+                // 全码自动上屏：唯一全码且无更长后继时直接上屏（schema.auto_commit_at_full）。
+                if let Some(text) = self.update_candidates(&mut state) {
+                    let out = self.commit_candidate(&mut state, &text);
+                    self.notify_ui_hide();
+                    return Self::commit_action(out, true);
+                }
                 let display = state.preedit.clone();
                 self.notify_ui_update(&state);
                 KeyAction::UpdateComposition {
