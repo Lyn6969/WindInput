@@ -66,6 +66,8 @@ pub const CMD_COMMIT_RESULT: u16 = 0x0105;
 pub const CMD_COMMIT_TEXT_WITH_CURSOR: u16 = 0x0106;
 pub const CMD_MOVE_CURSOR: u16 = 0x0107;
 pub const CMD_DELETE_PAIR: u16 = 0x0108;
+/// 删除光标前 N 个字符并插入文本（智能符号替换）。
+pub const CMD_REPLACE_BACKWARD: u16 = 0x0109;
 
 // 状态
 pub const CMD_STATUS_UPDATE: u16 = 0x0202;

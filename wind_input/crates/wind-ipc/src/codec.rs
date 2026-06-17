@@ -479,6 +479,23 @@ pub fn encode_delete_pair() -> Vec<u8> {
     ipc.to_bytes().to_vec()
 }
 
+/// 编码 ReplaceBackward 响应 (CMD_REPLACE_BACKWARD 0x0109)
+///
+/// 格式: count(4) + text_len(4) + UTF-8 text —— 删光标前 count 个字符后插入 text（智能符号替换）
+pub fn encode_replace_backward(count: u32, text: &str) -> Vec<u8> {
+    let text_bytes = text.as_bytes();
+    let payload_len = 8 + text_bytes.len();
+    let mut buf = Vec::with_capacity(IpcHeader::SIZE + payload_len);
+
+    let ipc = IpcHeader::new(CMD_REPLACE_BACKWARD, payload_len as u32);
+    buf.extend_from_slice(&ipc.to_bytes());
+    buf.extend_from_slice(&count.to_le_bytes());
+    buf.extend_from_slice(&(text_bytes.len() as u32).to_le_bytes());
+    buf.extend_from_slice(text_bytes);
+
+    buf
+}
+
 /// 编码 HostRenderSetup 响应 (CMD_HOST_RENDER_SETUP 0x0501)
 ///
 /// 格式: entryCount(u32) + entries...

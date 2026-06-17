@@ -94,6 +94,8 @@ pub enum KeyAction {
     MoveCursorRight,
     /// 删除配对（智能删除）
     DeletePair,
+    /// 删除光标前 count 个字符并插入文本（智能符号替换）
+    ReplaceBackward { count: u32, text: String },
 }
 
 /// 焦点数据

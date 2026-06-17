@@ -191,6 +191,19 @@ struct State {
     menu_target_text: String,
 }
 
+/// 智能符号模式待命态：press1 提交一个参与集合内的中文标点后武装，等待时限内同键 press2
+/// 触发替换。对齐 Go `smartSymbol*` 字段。
+#[derive(Default)]
+struct SmartSymbolArm {
+    armed: bool,
+    /// 武装的触发键（原始英文标点字符）
+    key: char,
+    /// press1 产出的中文标点串（…… 为多 rune），删除数 = 其 rune 数
+    str: String,
+    /// 武装时刻（None=未武装）；用于时限判定
+    at: Option<std::time::Instant>,
+}
+
 /// 中央协调器
 pub struct Coordinator {
     state: Mutex<State>,
@@ -203,6 +216,8 @@ pub struct Coordinator {
     compiled_hotkeys: CompiledHotkeys,
     /// 标点转换器（引号左右状态）
     punct: Mutex<PunctuationConverter>,
+    /// 智能符号模式待命态（同键连按删中文标点改英文）
+    smart_symbol: Mutex<SmartSymbolArm>,
     /// 短语层（system.phrases.toml；$Y$M$D 模板）
     phrases: crate::phrases::PhraseLayer,
     /// 简繁转换器（OpenCC；None=数据缺失不可用）。变体可运行时切换，故置于 Mutex。
@@ -456,6 +471,7 @@ impl Coordinator {
             store,
             compiled_hotkeys,
             punct: Mutex::new(punct_conv),
+            smart_symbol: Mutex::new(SmartSymbolArm::default()),
             phrases,
             s2t: Mutex::new(s2t),
             opencc_dir,
@@ -1160,6 +1176,149 @@ impl Coordinator {
             piece = to_full_width(&piece);
         }
         piece
+    }
+
+    /// 智能符号模式判定时限（非法值回退 500ms）。
+    fn smart_symbol_timeout(&self) -> std::time::Duration {
+        let ms = self.config.input.smart_symbol_timeout_ms;
+        let ms = if ms <= 0 { 500 } else { ms };
+        std::time::Duration::from_millis(ms as u64)
+    }
+
+    /// 纯查表读自定义标点映射的指定列（不碰转换器引号状态），供智能符号无副作用计算用。
+    /// 与 `PunctuationConverter::lookup_custom` 的非引号分支等价。
+    fn smart_symbol_custom_lookup(&self, ch: char, col_idx: usize) -> Option<String> {
+        let vals = self.config.input.punct_custom.mappings.get(&ch.to_string())?;
+        let v = vals.get(col_idx)?;
+        if v.is_empty() { None } else { Some(v.clone()) }
+    }
+
+    /// 无副作用地计算 `ch` 在当前模式下的标点产物，**镜像** `convert_punct` 优先级
+    /// （自定义列 > 中/英转换 > 全半角）。对齐 Go `computePunctStrPure`。
+    ///   - `chinese=true`：算中文标点产物（武装/匹配用，引号经 peek 预测不改状态）。
+    ///   - `chinese=false`：算英文标点产物（替换用，即该键英文模式下输出）。
+    /// 引号有状态、键名特殊，此处保守跳过自定义、走标准引号/英文产物。
+    fn compute_punct_str_pure(&self, state: &State, ch: char, chinese: bool) -> Option<String> {
+        let full_width = state.full_width;
+        let is_quote = ch == '\'' || ch == '"';
+
+        if !is_quote && self.config.input.punct_custom.enabled {
+            let col_idx = if chinese && full_width {
+                Some(2) // 中文全角
+            } else if chinese {
+                Some(0) // 中文半角
+            } else if full_width {
+                Some(1) // 英文全角
+            } else {
+                None // 英文半角：无自定义（col 3 由 convert_punct 用，pure 计算走原样）
+            };
+            if let Some(ci) = col_idx {
+                if let Some(v) = self.smart_symbol_custom_lookup(ch, ci) {
+                    return Some(v);
+                }
+            }
+        }
+
+        let mut s = ch.to_string();
+        if chinese {
+            s = self
+                .punct
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .peek_chinese_str(ch)?;
+        }
+        if full_width {
+            s = to_full_width(&s);
+        }
+        Some(s)
+    }
+
+    /// 判断中文标点串 `cn` 是否在用户配置的参与集合内（子串包含匹配，支持多字符/引号）。
+    fn smart_symbol_participates(&self, cn: &str) -> bool {
+        !cn.is_empty() && self.config.input.smart_symbol_chars.contains(cn)
+    }
+
+    /// 计算 `ch` 当前会产生的「参与集合内的中文标点串」用于武装；不参与返回 None。
+    /// 对齐 Go `smartSymbolArmStr`：仅中文标点模式 + 非数字后智能 + 在参与集合内。
+    fn smart_symbol_arm_str(&self, state: &State, ch: char, prev_char: u16) -> Option<String> {
+        if !state.chinese_punct {
+            return None;
+        }
+        if self.is_smart_punct_after_digit(ch, prev_char) {
+            return None;
+        }
+        let cn = self.compute_punct_str_pure(state, ch, true)?;
+        if !self.smart_symbol_participates(&cn) {
+            return None;
+        }
+        Some(cn)
+    }
+
+    /// 智能符号替换判定（在标点分支入口调用）。对齐 Go `trySmartSymbolReplace`：
+    ///   - 返回 Some：本次为 press2 触发，调用方应直接返回该替换响应（短路）。
+    ///   - 返回 None：未触发；已按需更新武装态，调用方继续普通标点流程。
+    fn try_smart_symbol_replace(
+        &self,
+        state: &State,
+        ch: char,
+        prev_char: u16,
+    ) -> Option<KeyAction> {
+        if !self.config.input.smart_symbol_mode {
+            return None;
+        }
+        let mut arm = self.smart_symbol.lock().unwrap_or_else(|e| e.into_inner());
+
+        // press2 触发：仍在中文标点模式 + 已武装 + 同键 + 时限内 + 光标前字符为武装串末位 rune。
+        // 匹配的是 press1 的产物，故引号（“→”）也能命中。
+        if arm.armed
+            && ch == arm.key
+            && state.chinese_punct
+            && arm
+                .at
+                .map(|t| t.elapsed() < self.smart_symbol_timeout())
+                .unwrap_or(false)
+        {
+            let armed_runes: Vec<char> = arm.str.chars().collect();
+            if let Some(&last) = armed_runes.last() {
+                if last as u32 == prev_char as u32 {
+                    if let Some(rep) = self.compute_punct_str_pure(state, ch, false) {
+                        arm.armed = false;
+                        // 吃掉一个引号后回退引号交替状态，使下次同引号仍从左引号开始。
+                        if ch == '\'' || ch == '"' {
+                            self.punct
+                                .lock()
+                                .unwrap_or_else(|e| e.into_inner())
+                                .revert_last_quote(ch);
+                        }
+                        debug!(
+                            "SmartSymbol: replace prev chinese punct with english (count={})",
+                            armed_runes.len()
+                        );
+                        return Some(KeyAction::ReplaceBackward {
+                            count: armed_runes.len() as u32,
+                            text: rep,
+                        });
+                    }
+                }
+            }
+        }
+
+        // 未触发：尝试以本次按键的中文产物武装，等待下次同键快速重复。
+        match self.smart_symbol_arm_str(state, ch, prev_char) {
+            Some(cn) => {
+                arm.armed = true;
+                arm.key = ch;
+                arm.str = cn;
+                arm.at = Some(std::time::Instant::now());
+            }
+            None => arm.armed = false,
+        }
+        None
+    }
+
+    /// 解除智能符号待命态（焦点变化/模式切换等的防御性复位）。
+    fn disarm_smart_symbol(&self) {
+        self.smart_symbol.lock().unwrap_or_else(|e| e.into_inner()).armed = false;
     }
 
     /// 退出快捷输入模式并清空状态
@@ -2380,6 +2539,8 @@ impl Coordinator {
         state.input_buffer.clear();
         state.candidates.clear();
         state.preedit.clear();
+        // 焦点/模式切换：解除智能符号待命，避免跨上下文误触发替换。
+        self.disarm_smart_symbol();
         if dirty {
             debug!("reset_exclusive_modes: cleared residual exclusive input mode state");
         }
@@ -2743,6 +2904,11 @@ impl MessageHandler for Coordinator {
                     }
                 }
                 if let Some(ch) = punct_char(data.key_code, shift) {
+                    // 智能符号模式：同键连按删中文标点改英文（press2 短路返回）。
+                    // 须在候选提交逻辑之前：press2 时无待输入，依赖光标前字符匹配武装态。
+                    if let Some(act) = self.try_smart_symbol_replace(&state, ch, data.prev_char) {
+                        return act;
+                    }
                     // 标点/符号键：先上屏首选候选（若有输入），再追加（转换后的）标点
                     let mut out = String::new();
                     if !state.candidates.is_empty() {
@@ -2890,6 +3056,7 @@ impl MessageHandler for Coordinator {
         let commit_text = self.take_input_on_mode_switch(&mut state, chinese);
         drop(state);
         self.punct.lock().unwrap_or_else(|e| e.into_inner()).reset();
+        self.disarm_smart_symbol();
         self.push_state_update();
         self.show_tip(if chinese { "中" } else { "英" });
         self.notify_toolbar();
@@ -2903,6 +3070,7 @@ impl MessageHandler for Coordinator {
         let commit_text = self.take_input_on_mode_switch(&mut state, chinese_mode);
         drop(state);
         self.punct.lock().unwrap_or_else(|e| e.into_inner()).reset();
+        self.disarm_smart_symbol();
         self.push_state_update();
         self.notify_toolbar();
         self.notify_ui_hide(); // 取消输入：隐藏候选窗

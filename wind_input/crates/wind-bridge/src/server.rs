@@ -633,6 +633,7 @@ fn encode_key_action(action: &KeyAction) -> Vec<u8> {
         }
         KeyAction::MoveCursorRight => encode_move_cursor(1),
         KeyAction::DeletePair => encode_delete_pair(),
+        KeyAction::ReplaceBackward { count, text } => encode_replace_backward(*count, text),
     }
 }
 
