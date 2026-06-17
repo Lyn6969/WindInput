@@ -441,8 +441,8 @@ pub struct FeaturesConfig {
     pub special_modes: Vec<SpecialModeConfig>,
 }
 
-/// 特殊模式配置（对齐 Go SpecialModeConfig）。
-/// 每个实例自带码表文件与全码上屏策略，由引导键在空缓冲时触发激活。
+/// 特殊模式配置（纯 overlay 激活面）。引擎/码表配置拉平到其引用的真实方案
+/// `<schema>.schema.toml`（与 wubi86/pinyin 同级），全码策略复用方案的 [engine.codetable]。
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct SpecialModeConfig {
     /// 实例唯一标识
@@ -451,22 +451,12 @@ pub struct SpecialModeConfig {
     /// 显示名（UI 徽标）
     #[serde(default)]
     pub name: String,
-    /// 引导键列表（如 "grave"/"semicolon"/"z"）
+    /// 引导键列表（如 "grave"/"backslash"/"z"）
     #[serde(default)]
     pub trigger_keys: Vec<String>,
-    /// 码表文件路径（相对 schemas 目录）
+    /// 引用的方案 id（其 .schema.toml 提供码表与全码策略；不进 schema.available，仅 overlay 触发懒加载）
     #[serde(default)]
-    pub table: String,
-    /// 自动上屏策略："prefix_free" / "fixed_length" / "manual"（默认 manual）
-    #[serde(default = "default_special_auto_commit")]
-    pub auto_commit: String,
-    /// 固定码长（仅 fixed_length 策略使用）
-    #[serde(default)]
-    pub fixed_length: usize,
-}
-
-fn default_special_auto_commit() -> String {
-    "manual".to_string()
+    pub schema: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

@@ -12,8 +12,7 @@
 
 use crate::keymap;
 use crate::pipeline::{ModeKind, Rewind};
-use std::collections::HashMap;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::{Arc, Mutex};
 use tracing::{debug, info, warn};
 
@@ -22,7 +21,6 @@ use wind_bridge::push::{PushConfig, PushServer};
 use wind_candidate::Candidate;
 use wind_config::Config;
 use wind_config::hotkey::{self, CompiledHotkeys};
-use wind_dict::codetable::CodetableDict;
 use wind_engine::EngineManager;
 use wind_ipc::protocol::{
     EVENT_KEY_DOWN, EVENT_KEY_UP, MOD_ALT, MOD_CTRL, MOD_SHIFT, calc_key_hash,
@@ -212,8 +210,6 @@ struct State {
     special_buffer: String,
     /// 当前特殊模式下标（= features.special_modes 索引；仅 active==Special 时有效）
     special_id: u8,
-    /// 特殊模式码表懒加载缓存（下标 → 码表）
-    special_tables: HashMap<u8, CodetableDict>,
     caret_x: i32,
     caret_y: i32,
     caret_height: i32,
@@ -510,7 +506,6 @@ impl Coordinator {
                 rewind: None,
                 special_buffer: String::new(),
                 special_id: 0,
-                special_tables: HashMap::new(),
                 caret_x: 0,
                 caret_y: 0,
                 caret_height: 0,
@@ -1690,24 +1685,6 @@ impl Coordinator {
 
     // ───────────────────────── 特殊模式 ─────────────────────────
 
-    /// 特殊模式自动上屏判定（纯函数，对齐 Go decideSpecialAutoCommit）。
-    /// - prefix_free：唯一精确候选且无更长前缀 → 自动上屏
-    /// - fixed_length：编码达固定长度且唯一精确候选 → 自动上屏
-    /// - manual（及未知策略）：永不自动
-    fn decide_special_auto_commit(
-        strategy: &str,
-        fixed_length: usize,
-        buf_len: usize,
-        exact_count: usize,
-        has_longer: bool,
-    ) -> bool {
-        match strategy {
-            "prefix_free" => exact_count == 1 && !has_longer,
-            "fixed_length" => fixed_length > 0 && buf_len >= fixed_length && exact_count == 1,
-            _ => false,
-        }
-    }
-
     /// 引导键名 → VK（特殊模式触发；统一映射 + 额外支持单字母 a-z 引导键，见 `keymap`）。
     fn special_trigger_vk(key: &str) -> Option<u32> {
         keymap::key_name_to_vk_with_letters(key)
@@ -1730,54 +1707,17 @@ impl Coordinator {
         None
     }
 
-    /// 解析特殊模式码表路径（在 [用户配置/schemas, data/schemas] 中查找）。
-    fn resolve_special_table_path(table: &str) -> Option<PathBuf> {
-        let mut dirs: Vec<PathBuf> = Vec::new();
-        if let Some(d) = Config::user_config_dir() {
-            dirs.push(d.join("schemas"));
-        }
-        if let Some(d) = Config::data_dir() {
-            dirs.push(d.join("schemas"));
-        }
-        dirs.into_iter()
-            .map(|d| d.join(table))
-            .find(|p| p.is_file())
+    /// 特殊模式引用的方案 id（features.special_modes[idx].schema）。
+    fn special_schema(&self, idx: u8) -> Option<String> {
+        self.config
+            .features
+            .special_modes
+            .get(idx as usize)
+            .map(|m| m.schema.clone())
+            .filter(|s| !s.is_empty())
     }
 
-    /// 懒加载特殊模式码表（已缓存即跳过）。成功返回 true。
-    fn ensure_special_table(&self, state: &mut State, idx: u8) -> bool {
-        if state.special_tables.contains_key(&idx) {
-            return true;
-        }
-        let table = match self.config.features.special_modes.get(idx as usize) {
-            Some(m) => m.table.clone(),
-            None => return false,
-        };
-        let path = match Self::resolve_special_table_path(&table) {
-            Some(p) => p,
-            None => {
-                warn!("Special mode table not found: {}", table);
-                return false;
-            }
-        };
-        match CodetableDict::load(&path) {
-            Ok(dict) => {
-                info!(
-                    "Loaded special mode table idx={} ({} entries)",
-                    idx,
-                    dict.len()
-                );
-                state.special_tables.insert(idx, dict);
-                true
-            }
-            Err(e) => {
-                warn!("Failed to load special table {}: {}", path.display(), e);
-                false
-            }
-        }
-    }
-
-    /// 进入特殊模式（码表须已 ensure 加载）。清空普通输入，初始化空编码缓冲。
+    /// 进入特殊模式（其方案须可加载，由激活点 ensure_schema 保证）。清空普通输入，初始化空编码缓冲。
     fn enter_special_mode(&self, state: &mut State, idx: u8) -> KeyAction {
         state.input_buffer.clear();
         state.candidates.clear();
@@ -1802,7 +1742,8 @@ impl Coordinator {
         state.preedit.clear();
     }
 
-    /// 按当前编码缓冲刷新特殊模式候选。返回 Some(text) 表示应自动上屏该精确候选。
+    /// 按当前编码缓冲刷新特殊模式候选（经其引用方案的引擎查询，复用方案 CodeTableSpec 全码策略）。
+    /// 返回 Some(text) 表示该方案的全码策略请求自动上屏。
     fn update_special_candidates(&self, state: &mut State) -> Option<String> {
         state.candidates.clear();
         state.current_page = 0;
@@ -1811,42 +1752,21 @@ impl Coordinator {
         if state.special_buffer.is_empty() {
             return None;
         }
-        let idx = state.special_id;
-        let buf = state.special_buffer.clone();
-        let results = match state.special_tables.get(&idx) {
-            Some(table) => table.search_prefix(&buf, 100),
-            None => return None,
-        };
-        let mut exact_count = 0usize;
-        let mut has_longer = false;
-        let mut cands = Vec::with_capacity(results.len());
-        for (i, (code, text, _w, _o)) in results.iter().enumerate() {
-            if code == &buf {
-                exact_count += 1;
-            } else if code.len() > buf.len() {
-                has_longer = true;
-            }
-            cands.push(Candidate {
-                text: text.clone(),
-                natural_order: i as i32,
-                ..Default::default()
-            });
-        }
-        state.candidates = cands;
-
-        let m = self.config.features.special_modes.get(idx as usize)?;
-        let auto = Self::decide_special_auto_commit(
-            &m.auto_commit,
-            m.fixed_length,
-            buf.chars().count(),
-            exact_count,
-            has_longer,
-        );
-        if auto {
-            return results
+        let schema = self.special_schema(state.special_id)?;
+        let result = self
+            .engine_mgr
+            .convert_with(&schema, &state.special_buffer, 100);
+        state.candidates = result.candidates;
+        // 自动上屏由方案码表引擎的 should_auto_commit 决定（prefix_free≈全码唯一、fixed_length 等
+        // 映射到该方案的 [engine.codetable] 配置）；复核上屏目标仍在候选中。
+        if result.should_commit
+            && !result.commit_text.is_empty()
+            && state
+                .candidates
                 .iter()
-                .find(|(code, _, _, _)| code == &buf)
-                .map(|(_, t, _, _)| t.clone());
+                .any(|c| c.text == result.commit_text)
+        {
+            return Some(result.commit_text);
         }
         None
     }
@@ -3159,8 +3079,11 @@ impl Coordinator {
             && data.modifiers & (MOD_CTRL | MOD_ALT | MOD_SHIFT) == 0
         {
             if let Some(idx) = self.match_special_trigger(data.key_code) {
-                if self.ensure_special_table(state, idx) {
-                    return Some(self.enter_special_mode(state, idx));
+                // 方案可加载才进入（否则不拦截该键，落普通流程）。
+                if let Some(schema) = self.special_schema(idx) {
+                    if self.engine_mgr.ensure_schema(&schema) {
+                        return Some(self.enter_special_mode(state, idx));
+                    }
                 }
             }
         }

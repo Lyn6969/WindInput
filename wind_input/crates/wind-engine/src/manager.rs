@@ -239,6 +239,11 @@ impl EngineManager {
         self.active_engine().map(|e| e.engine_type())
     }
 
+    /// 确保指定方案可加载（懒加载）。用于 overlay 模式（特殊模式等）激活前的可用性校验。
+    pub fn ensure_schema(&self, schema_id: &str) -> bool {
+        self.ensure_loaded(schema_id)
+    }
+
     /// 顶码上屏：超过满码长时取前 N 码首选上屏，返回 (上屏文本, 剩余编码)。
     /// 仅码表/混输引擎按 top_code_commit 实现，其余返回 None。
     pub fn handle_top_code(&self, input: &str) -> Option<(String, String)> {
