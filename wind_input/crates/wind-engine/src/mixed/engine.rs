@@ -29,6 +29,8 @@ pub struct MixedEngine {
     min_pinyin_length: usize,
     /// 码表精确匹配提权
     codetable_weight_boost: i32,
+    /// 全码自动上屏时，若存在拼音候选则否决（保护拼音用户，对齐 Go AutoCommitBlockOnPinyin）
+    auto_commit_block_on_pinyin: bool,
 }
 
 impl MixedEngine {
@@ -37,12 +39,14 @@ impl MixedEngine {
         secondary: Option<Box<dyn Engine>>,
         min_pinyin_length: usize,
         codetable_weight_boost: i32,
+        auto_commit_block_on_pinyin: bool,
     ) -> Self {
         Self {
             primary,
             secondary,
             min_pinyin_length,
             codetable_weight_boost,
+            auto_commit_block_on_pinyin,
         }
     }
 }
@@ -56,6 +60,9 @@ impl Engine for MixedEngine {
 
         // 1. 码表候选 + 加权
         let ct = self.primary.convert(input, max_candidates)?;
+        // 主码表的全码自动上屏意向（下方按拼音守护 + 合并存活性复核后才放行）。
+        let ct_should_commit = ct.should_commit;
+        let ct_commit_text = ct.commit_text.clone();
         let mut codetable: Vec<Candidate> = ct.candidates;
         for c in &mut codetable {
             if c.is_phrase {
@@ -84,6 +91,7 @@ impl Engine for MixedEngine {
         }
 
         // 3. 合并（码表在前，拼音在后）→ 按权重稳定排序 → 按文本去重
+        let has_pinyin = !pinyin.is_empty();
         let mut merged = codetable;
         merged.extend(pinyin);
         merged.sort_by(|a, b| {
@@ -95,12 +103,27 @@ impl Engine for MixedEngine {
         merged.retain(|c| seen.insert(c.text.clone()));
         merged.truncate(max_candidates);
 
+        // 全码自动上屏重评（对齐 Go recheckAutoCommit）：取主码表意向，
+        // 但若开启拼音守护且存在拼音候选则否决（输入可能是拼音，留给用户选）；
+        // 并复核上屏目标在合并结果中仍存活。
+        let (should_commit, commit_text) = if ct_should_commit
+            && !ct_commit_text.is_empty()
+            && !(self.auto_commit_block_on_pinyin && has_pinyin)
+            && merged.iter().any(|c| c.text == ct_commit_text)
+        {
+            (true, ct_commit_text)
+        } else {
+            (false, String::new())
+        };
+
         let is_empty = merged.is_empty();
         Ok(ConvertResult {
             candidates: merged,
             // 混输组合区显示原始输入码（五笔为主，简明）
             preedit_display: input.to_string(),
             is_empty,
+            should_commit,
+            commit_text,
             ..Default::default()
         })
     }
@@ -114,5 +137,57 @@ impl Engine for MixedEngine {
 
     fn engine_type(&self) -> EngineType {
         EngineType::Mixed
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::codetable::CodeTableEngine;
+    use std::sync::Arc;
+    use wind_dict::cached::CachedDict;
+    use wind_dict::codetable::CodetableDict;
+    use wind_dict::{DictManager, SystemDictLayer};
+
+    /// 构建一个内存码表引擎（可选开启全码自动上屏）。
+    fn ct_engine(entries: &[(&str, &str, i32)], at_full: bool) -> Box<dyn Engine> {
+        let mut d = CodetableDict::empty();
+        for (i, (code, text, w)) in entries.iter().enumerate() {
+            d.merge_single(code.to_string(), text.to_string(), *w, i as i32);
+        }
+        let dm = DictManager::new();
+        dm.register_layer(Box::new(SystemDictLayer::new(CachedDict::Memory(d), "sys")));
+        Box::new(CodeTableEngine::new(4, at_full, 4, Arc::new(dm)))
+    }
+
+    #[test]
+    fn mixed_propagates_auto_commit_without_pinyin() {
+        // 主码表唯一全码自动上屏；无次引擎 → 无拼音候选 → 放行。
+        let primary = ct_engine(&[("aaaa", "工", 100)], true);
+        let e = MixedEngine::new(primary, None, 2, 10_000_000, true);
+        let r = e.convert("aaaa", 50).unwrap();
+        assert!(r.should_commit, "无拼音候选时应放行全码上屏");
+        assert_eq!(r.commit_text, "工");
+    }
+
+    #[test]
+    fn mixed_blocks_auto_commit_when_pinyin_present() {
+        // 次引擎对同一输入也产出候选（模拟拼音命中）+ 守护开 → 否决上屏。
+        let primary = ct_engine(&[("aaaa", "工", 100)], true);
+        let secondary = ct_engine(&[("aaaa", "啊啊", 50)], false);
+        let e = MixedEngine::new(primary, Some(secondary), 2, 10_000_000, true);
+        let r = e.convert("aaaa", 50).unwrap();
+        assert!(!r.should_commit, "有拼音候选且守护开时应否决全码上屏");
+    }
+
+    #[test]
+    fn mixed_allows_auto_commit_when_guard_off() {
+        // 守护关 → 即便有拼音候选也放行。
+        let primary = ct_engine(&[("aaaa", "工", 100)], true);
+        let secondary = ct_engine(&[("aaaa", "啊啊", 50)], false);
+        let e = MixedEngine::new(primary, Some(secondary), 2, 10_000_000, false);
+        let r = e.convert("aaaa", 50).unwrap();
+        assert!(r.should_commit, "守护关时应放行");
+        assert_eq!(r.commit_text, "工");
     }
 }

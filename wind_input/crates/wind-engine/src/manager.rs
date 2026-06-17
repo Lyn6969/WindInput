@@ -333,12 +333,20 @@ impl EngineManager {
             } else {
                 2
             };
+            // 拼音守护：读主码表方案的 auto_commit_block_on_pinyin（tri-state，默认 true）。
+            let block_on_pinyin = Self::read_schema(&m.primary_schema, Some(data_dir))
+                .and_then(|s| s.engine.codetable.auto_commit_block_on_pinyin)
+                .unwrap_or(true);
             info!(
                 "Built mixed engine {} (primary={}, secondary={})",
                 schema_id, m.primary_schema, m.secondary_schema
             );
             return Some(Box::new(crate::mixed::MixedEngine::new(
-                primary, secondary, min_py, boost,
+                primary,
+                secondary,
+                min_py,
+                boost,
+                block_on_pinyin,
             )));
         }
 
