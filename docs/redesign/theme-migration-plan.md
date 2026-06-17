@@ -65,11 +65,18 @@ Default/load_resolved、RvNode 加 bg_shape（序号圆形）。windows-gnu 交�
 **仍未做（已知差异）**：comment 内联（需 coordinator→UI 数据管线）、窗口阴影（需窗口缓冲扩边）、
 真圆序号（现药丸近似）、竖排/多列布局、背景图/layers（=T4）。
 
-### T4：图片管线 nine_slice + layers + SVG tint（wind-ui 解码缓存 + wind-theme RVImage）
-**目标**：`bgimage.rs`/svg tint 落地；wind-ui 按 ref 解码缓存位图，九宫格/拉伸/平铺/center + z 层 +
-tint mask（resvg 已是依赖）。footer chevron SVG tint 走此路径。
-**成功标准**：jidian-classic 九宫格背景 + 右下角水印层在候选窗正确渲染。
-**状态**：未开始
+### T4：图片管线 nine_slice + layers + SVG tint
+- **T4a ✅**（提交 `d87e3aa`）：背景填充图。新增 `image_cache.rs`（image 解码 → 逐像素按
+  nine_slice/stretch/tile/center 采样 + 预乘 + R/B 交换 BGRA；线程局部缓存）；`View.bg_image` +
+  paint 用 tiny-skia Pattern 填圆角路径。候选窗 window + 候选项（含选中态 sel.png）背景。**用户已验证**
+  jidian 位图背景渲染正常（无红蓝颠倒/九宫格变形）。
+- **T4b ✅**（提交 `b2abb2f`）：z 层覆盖图。`View.layers` + ViewLayer；paint 按 z<0/z>=0 分两段；
+  `paint_layer` 按 anchor 九宫定位 + offset（dp + 百分比）+ size + opacity，stretch 后 Pattern 绘制。
+  接到 window 节点（jidian 右下角 mark 水印）。
+- **T4c 待做**：footer SVG tint 箭头。`_base` 的翻页箭头是 `chevron_prev/next.svg` + tint（**所有主题**
+  都用），现仍渲染文字 `‹ ›`。需给 wind-ui 加 resvg 依赖 + SVG 栅格化 + tint（图当 alpha mask 填 tint 色）；
+  ViewImage 加 tint；footer 用图标节点替代文字箭头（prev/next_image 存在时）。
+**部署便利**：jidian-classic 已拷入 data/themes + build_debug/data/themes（gitignore 不入库）供测试。
 
 ### T5：其它窗口走 RVNode（status/tooltip/menu/toast/toolbar）
 **目标**：other_views 等价——各窗口注入自己 palette 语义色，复用 RvNode 解析 + 图片管线。
