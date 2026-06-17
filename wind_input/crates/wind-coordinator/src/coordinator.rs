@@ -10,7 +10,7 @@
 //!
 //! 候选生成委托给 [`EngineManager`]，运行时词频 boost + 最终排序在本层应用。
 
-use crate::pipeline::ModeKind;
+use crate::pipeline::{ModeKind, Rewind};
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 use tracing::{debug, info, warn};
@@ -202,6 +202,8 @@ struct State {
     temp_english_buffer: String,
     /// 网址模式输入缓冲（原样累积的 URL 文本）
     url_buffer: String,
+    /// 统一夺取回退登记（仅在夺取式模式激活时为 Some，见 pipeline::Rewind）
+    rewind: Option<Rewind>,
     caret_x: i32,
     caret_y: i32,
     caret_height: i32,
@@ -485,6 +487,7 @@ impl Coordinator {
                 quick_input_prefix: String::new(),
                 temp_english_buffer: String::new(),
                 url_buffer: String::new(),
+                rewind: None,
                 caret_x: 0,
                 caret_y: 0,
                 caret_height: 0,
@@ -1571,11 +1574,18 @@ impl Coordinator {
 
     /// 进入网址模式：以补全前缀的完整文本作初始缓冲，清空普通输入/候选，隐藏候选窗。
     /// 网址模式无候选，仅在组合区原样显示累积文本。
+    /// 同时登记夺取回退：snapshot=夺取前的正常输入（=前缀去掉补全键），host_text=完整前缀。
     fn enter_url_mode(&self, state: &mut State, buffer: String) -> KeyAction {
+        // 夺取前的正常 input_buffer 即回退快照（前缀的最后一字符是刚补全的那一键）。
+        let snapshot = state.input_buffer.clone();
         state.input_buffer.clear();
         state.candidates.clear();
         state.active = Some(ModeKind::Url);
-        state.url_buffer = buffer;
+        state.url_buffer = buffer.clone();
+        state.rewind = Some(Rewind {
+            snapshot,
+            host_text: buffer,
+        });
         self.notify_ui_hide();
         let disp = state.url_buffer.clone();
         debug!("Entered URL mode (buffer={})", disp);
@@ -1585,11 +1595,51 @@ impl Coordinator {
         }
     }
 
-    /// 退出网址模式并清空相关状态。
+    /// 退出网址模式并清空相关状态（含作废回退登记）。
     fn exit_url_mode(&self, state: &mut State) {
         state.active = None;
         state.url_buffer.clear();
         state.preedit.clear();
+        state.rewind = None;
+    }
+
+    /// 当前夺取式模式的 buffer（用于回退边界判定）。非夺取式模式返回 None。
+    fn active_hijack_buffer<'a>(&self, state: &'a State) -> Option<&'a str> {
+        match state.active {
+            Some(ModeKind::Url) => Some(&state.url_buffer),
+            // z 临拼夺取（后续 S3/S4 接入）：Some(&state.temp_pinyin_buffer)
+            _ => None,
+        }
+    }
+
+    /// 是否可回退：已登记 + 当前模式 buffer 已退回到夺取边界（== 登记时的 host_text）。
+    fn can_rewind(&self, state: &State) -> bool {
+        match (&state.rewind, self.active_hijack_buffer(state)) {
+            (Some(rw), Some(buf)) => buf == rw.host_text,
+            _ => false,
+        }
+    }
+
+    /// 执行夺取回退：撤销夺取，把快照回放到正常码表输入流并重算候选。
+    fn rewind_hijack(&self, state: &mut State) -> KeyAction {
+        let snapshot = state.rewind.take().map(|r| r.snapshot).unwrap_or_default();
+        // 退出当前夺取式模式（目前仅 URL；z 临拼接入后在此扩展 match）。
+        match state.active {
+            Some(ModeKind::Url) => self.exit_url_mode(state),
+            _ => self.reset_exclusive_modes(state),
+        }
+        state.input_buffer = snapshot;
+        self.update_candidates(state);
+        self.notify_ui_update(state);
+        let display = state.preedit.clone();
+        debug!(
+            "rewind_hijack: restored normal input '{}'",
+            state.input_buffer
+        );
+        KeyAction::UpdateComposition {
+            text: display,
+            caret_pos: state.input_buffer.chars().count() as u32,
+        }
     }
 
     /// 网址模式按键处理：可见 ASCII 原样累积；空格/回车上屏原文；退格删空退出；Esc 放弃。
@@ -2731,6 +2781,7 @@ impl Coordinator {
         state.quick_input_buffer.clear();
         state.quick_input_prefix.clear();
         state.url_buffer.clear();
+        state.rewind = None;
         // 清理可能残留的组合显示（临时拼音/快捷输入会产生候选与 preedit）
         state.input_buffer.clear();
         state.candidates.clear();
@@ -2841,6 +2892,13 @@ impl MessageHandler for Coordinator {
         // 英文模式：直接透传
         if !state.chinese_mode {
             return KeyAction::PassThrough;
+        }
+
+        // 统一夺取回退：夺取式模式（URL/后续 z 临拼）中，退到夺取边界再按退格 →
+        // 撤销夺取、把快照回放回正常码表输入流（而非停在无候选的独占模式）。
+        // 须先于下方单点分派，否则退格会被模式处理器按普通删字符消费。
+        if data.key_code == 0x08 && self.can_rewind(&state) {
+            return self.rewind_hijack(&mut state);
         }
 
         // 已激活独占模式：单点分派到专用处理器（唯一入口，见 pipeline.rs）。

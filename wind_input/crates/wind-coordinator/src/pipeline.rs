@@ -40,3 +40,16 @@ pub enum ModeKind {
     Url,
     // S3 将追加：Special(u8)
 }
+
+/// 统一夺取回退登记（对齐 Go decider 的 armRewind/canRewind/rewindHijack）。
+///
+/// 「夺取式」模式从正常输入流中抢走若干字符进入独占模式（URL 抢前缀、z 抢前导拼音）。
+/// 登记此结构后，在前缀边界退格时撤销夺取、把 `snapshot` 回放回正常码表输入流，
+/// 而非停留在无候选的独占模式里。URL 与 z（后续）共用这一套，避免各写各的回退。
+#[derive(Clone, Debug)]
+pub struct Rewind {
+    /// 夺取前的正常 `input_buffer` 快照（回放目标）。
+    pub snapshot: String,
+    /// 夺取瞬间的模式 buffer（「是否退到边界」判定：当前模式 buffer == 此值即在边界）。
+    pub host_text: String,
+}
