@@ -55,6 +55,16 @@ derive 忽略；validate warn 级。**保留 `ResolvedTheme` 扁平 facade**（�
 Default/load_resolved、RvNode 加 bg_shape（序号圆形）。windows-gnu 交叉编译 Finished。
 **未做**：旧 `resolved.rs`(ResolvedTheme/ThemeManager) 暂留（仅自身测试引用），待后续 T6/清理删除。
 
+### T3.5：候选窗渲染完整度（拉近与 Go 外观，提交 `e16b277`）✅
+诊断：Rust 与 Go 候选窗差异**在渲染层非主题数据**。本阶段补：
+- **字号接主题**：base = `behavior.font_size`（默认 18，Go 同）× DPI，取代硬编码 24（之前大 33%）。
+- **每节点字号偏移**：序号/注释/预编辑/翻页器按各 RvNode.font_size 渲染（序号/翻页更小）。
+- **选中强调条**：主题启用（accent_bar.enabled，msime/jidian）时选中项左缘画竖条。
+- 基建：`TextRenderer`(dwrite) 改为按调用传字号（size-keyed format 缓存，加 `*_sized`/`base_size`）；
+  `View` 加 `font_size`/`left_bar`；`RvViews` 加 `accent_bar_enabled`。
+**仍未做（已知差异）**：comment 内联（需 coordinator→UI 数据管线）、窗口阴影（需窗口缓冲扩边）、
+真圆序号（现药丸近似）、竖排/多列布局、背景图/layers（=T4）。
+
 ### T4：图片管线 nine_slice + layers + SVG tint（wind-ui 解码缓存 + wind-theme RVImage）
 **目标**：`bgimage.rs`/svg tint 落地；wind-ui 按 ref 解码缓存位图，九宫格/拉伸/平铺/center + z 层 +
 tint mask（resvg 已是依赖）。footer chevron SVG tint 走此路径。
