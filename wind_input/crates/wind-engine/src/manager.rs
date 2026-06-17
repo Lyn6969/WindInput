@@ -19,7 +19,6 @@ use tracing::{info, warn};
 use wind_config::Config;
 use wind_config::schema::{DictSpec, Schema};
 use wind_dict::cached::CachedDict;
-use wind_dict::codetable::CodetableDict;
 
 // 方案定义已统一到 wind_config::schema::Schema（取代此前的私有 SchemaFile）。
 // 引擎只消费该共享类型；构建逻辑（build_engine）保持不变。
@@ -567,7 +566,9 @@ impl EngineManager {
 
     /// 加载 rime_pinyin 词典（合并 import_tables 子词典到 .merged.wdb）
     fn load_rime_pinyin_dict(dict_path: &Path) -> Option<CachedDict> {
-        let merged_wdb = dict_path.with_extension("merged.wdb");
+        // merged.wdb 写到可写缓存目录（与 unigram 一致）。安装目录（如 Program Files）
+        // 通常只读，若写在源旁会失败 → 回退仅主词典(rime header 数十条) → 拼音无候选。
+        let merged_wdb = cache_path(dict_path, "merged.wdb");
         // 仅当 merged 比主词库文件新时复用（主库更新后强制重建；子库通常随主库一同更新）
         let merged_fresh = Self::combined_cache_fresh(&[dict_path], &merged_wdb);
         if merged_wdb.exists() && merged_fresh {
@@ -620,7 +621,7 @@ impl EngineManager {
         // 其中之一，导致同 code 的其余候选系统性丢失（拼音词典尤甚）。
         let mut agg: HashMap<String, Vec<(String, i32)>> = HashMap::new();
         for sub_path in &sub_paths {
-            match CachedDict::load(sub_path) {
+            match CachedDict::load_at(sub_path, &cache_path(sub_path, "wdb")) {
                 Ok(sub_dict) => {
                     let count = sub_dict.len();
                     info!("  Loading {} entries from {}", count, sub_path.display());
@@ -645,21 +646,31 @@ impl EngineManager {
         }
 
         info!("Writing merged .wdb cache ({} entries)...", total_entries);
-        match writer.write(&merged_wdb) {
-            Ok(_) => match wind_dict::binformat::DictReader::open(&merged_wdb) {
+        // 写缓存目录；若仍失败（缓存目录不可写等）退到系统临时目录。绝不退化成仅主词典
+        // （rime header 仅数十条），那会让拼音/混输/临时拼音全部无候选。
+        let temp_fallback = std::env::temp_dir().join(
+            merged_wdb
+                .file_name()
+                .unwrap_or_else(|| std::ffi::OsStr::new("rime.merged.wdb")),
+        );
+        for target in [&merged_wdb, &temp_fallback] {
+            if let Err(e) = writer.write(target) {
+                warn!("Failed to write merged cache {}: {}", target.display(), e);
+                continue;
+            }
+            match wind_dict::binformat::DictReader::open(target) {
                 Ok(reader) => {
-                    info!("Using merged mmap cache ({} keys)", reader.key_count());
-                    Some(CachedDict::Mmap(reader))
+                    info!(
+                        "Using merged mmap cache: {} ({} keys)",
+                        target.display(),
+                        reader.key_count()
+                    );
+                    return Some(CachedDict::Mmap(reader));
                 }
-                Err(e) => {
-                    warn!("Failed to open merged cache: {}", e);
-                    CodetableDict::load(dict_path).ok().map(CachedDict::Memory)
-                }
-            },
-            Err(e) => {
-                warn!("Failed to write merged cache: {}", e);
-                CodetableDict::load(dict_path).ok().map(CachedDict::Memory)
+                Err(e) => warn!("Failed to open merged cache {}: {}", target.display(), e),
             }
         }
+        warn!("All merged cache writes failed; pinyin dictionary unavailable");
+        None
     }
 }
