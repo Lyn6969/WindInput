@@ -28,6 +28,24 @@ pub struct ViewImage {
     pub opacity: f32,
 }
 
+/// z 层级覆盖图（按 anchor 九宫定位 + offset + size 绘于 host 内）。
+#[derive(Clone, Debug)]
+pub struct ViewLayer {
+    pub path: String,
+    pub z: i32,
+    pub anchor: String,
+    /// dp 偏移（已 ×scale，px）。
+    pub off_x: f32,
+    pub off_y: f32,
+    /// 百分比偏移（相对 host 宽/高；paint 期换算）。与 dp 偏移叠加。
+    pub off_x_pct: f32,
+    pub off_y_pct: f32,
+    /// 目标尺寸 px（0=原图尺寸）。
+    pub w: f32,
+    pub h: f32,
+    pub opacity: f32,
+}
+
 /// 四边内/外边距
 #[derive(Clone, Copy, Default)]
 pub struct Edges {
@@ -105,6 +123,8 @@ pub struct View {
     pub left_bar: Option<([u8; 4], f32)>,
     /// 背景填充图（叠在底色之上，裁到圆角内）。
     pub bg_image: Option<ViewImage>,
+    /// z 层级覆盖图（z<0 在内容下、z>0 在内容上）。
+    pub layers: Vec<ViewLayer>,
     pub children: Vec<View>,
     /// 命中标识：>=0 参与命中收集（如候选下标 / 按钮 id），<0 忽略
     pub tag: i32,
@@ -133,6 +153,7 @@ impl Default for View {
             text_align: Align::Start,
             left_bar: None,
             bg_image: None,
+            layers: Vec::new(),
             children: Vec::new(),
             tag: -1,
             mw: 0.0,
@@ -203,6 +224,10 @@ impl View {
     }
     pub fn bg_image(mut self, img: ViewImage) -> Self {
         self.bg_image = Some(img);
+        self
+    }
+    pub fn layers(mut self, layers: Vec<ViewLayer>) -> Self {
+        self.layers = layers;
         self
     }
     pub fn tag(mut self, t: i32) -> Self {
@@ -376,6 +401,10 @@ impl View {
             let by = r.y + (r.h - bh) * 0.5;
             fill_rounded(buf, buf_w, buf_h, r.x, by, bw, bh, color, bw * 0.5);
         }
+        // z<0 覆盖图（在内容下方）。
+        for layer in self.layers.iter().filter(|l| l.z < 0) {
+            paint_layer(buf, buf_w, buf_h, r, layer);
+        }
         // 文本
         if let Some(t) = &self.text {
             let size = self.font_size.unwrap_or(tr.base_size());
@@ -403,6 +432,10 @@ impl View {
         // 子节点
         for c in &self.children {
             c.paint(buf, buf_w, buf_h, tr);
+        }
+        // z>=0 覆盖图（在内容上方）。
+        for layer in self.layers.iter().filter(|l| l.z >= 0) {
+            paint_layer(buf, buf_w, buf_h, r, layer);
         }
     }
 }
@@ -456,6 +489,68 @@ fn paint_bg_image(buf: &mut [u8], buf_w: u32, buf_h: u32, r: Rect, radius: f32, 
         };
         pm.fill_path(&path, &paint, FillRule::Winding, Transform::identity(), None);
     });
+}
+
+/// 绘制 z 层覆盖图：按 anchor 九宫定位 + offset（dp + 百分比）置于 host 内，stretch 到目标尺寸 + opacity。
+fn paint_layer(buf: &mut [u8], buf_w: u32, buf_h: u32, host: Rect, layer: &ViewLayer) {
+    IMAGE_CACHE.with(|c| {
+        let mut cache = c.borrow_mut();
+        // 目标尺寸：指定则用之，否则用原图尺寸。
+        let (lw, lh) = if layer.w > 0.0 && layer.h > 0.0 {
+            (layer.w.round().max(1.0), layer.h.round().max(1.0))
+        } else {
+            let Some((sw, sh)) = cache.src_size(&layer.path) else {
+                return;
+            };
+            (sw as f32, sh as f32)
+        };
+        // anchor 九宫基位（host 内）+ offset（dp px + 百分比相对 host 宽/高）。
+        let (ax, ay) = anchor_pos(&layer.anchor, host, lw, lh);
+        let lx = (ax + layer.off_x + layer.off_x_pct / 100.0 * host.w).round();
+        let ly = (ay + layer.off_y + layer.off_y_pct / 100.0 * host.h).round();
+        let Some(fill) = cache.fill(&layer.path, crate::image_cache::mode_code("stretch"), [0; 4], lw as u32, lh as u32)
+        else {
+            return;
+        };
+        let Some(path) = round_rect_path(lx, ly, lw, lh, 0.0) else {
+            return;
+        };
+        let Some(mut pm) = PixmapMut::from_bytes(buf, buf_w, buf_h) else {
+            return;
+        };
+        let shader = Pattern::new(
+            fill.as_ref(),
+            SpreadMode::Pad,
+            FilterQuality::Nearest,
+            layer.opacity.clamp(0.0, 1.0),
+            Transform::from_translate(lx, ly),
+        );
+        let paint = Paint {
+            shader,
+            anti_alias: true,
+            ..Default::default()
+        };
+        pm.fill_path(&path, &paint, FillRule::Winding, Transform::identity(), None);
+    });
+}
+
+/// anchor 九宫定位：返回覆盖图左上角在 host 内的基准坐标（未含 offset）。
+fn anchor_pos(anchor: &str, host: Rect, lw: f32, lh: f32) -> (f32, f32) {
+    let ax = if anchor.contains("left") {
+        host.x
+    } else if anchor.contains("right") {
+        host.x + host.w - lw
+    } else {
+        host.x + (host.w - lw) * 0.5
+    };
+    let ay = if anchor.contains("top") {
+        host.y
+    } else if anchor.contains("bottom") {
+        host.y + host.h - lh
+    } else {
+        host.y + (host.h - lh) * 0.5
+    };
+    (ax, ay)
 }
 
 pub fn fill_rounded(

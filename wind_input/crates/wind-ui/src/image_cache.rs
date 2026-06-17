@@ -56,6 +56,11 @@ impl ImageCache {
         self.src.get(path).and_then(|o| o.as_ref())
     }
 
+    /// 源图原始尺寸（解码后；用于 layer size=0 时取原尺寸）。
+    pub fn src_size(&mut self, path: &str) -> Option<(u32, u32)> {
+        self.decode(path).map(|s| (s.w, s.h))
+    }
+
     /// 取（或构建）目标尺寸填充位图（BGRA 序 + 预乘）。
     pub fn fill(
         &mut self,

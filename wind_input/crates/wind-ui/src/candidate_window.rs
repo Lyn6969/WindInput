@@ -11,7 +11,7 @@ use std::sync::mpsc::Sender;
 use std::time::{Duration, Instant};
 use crate::manager::{UiEvent, HOVER_PAGE_NEXT as TAG_PAGE_NEXT, HOVER_PAGE_PREV as TAG_PAGE_PREV};
 use crate::text::dwrite::TextRenderer;
-use crate::view::{Align, Edges, Layout, Rect, View, ViewImage};
+use crate::view::{Align, Edges, Layout, Rect, View, ViewImage, ViewLayer};
 use crate::window::{LayeredWindow, WindowMouse};
 use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, WPARAM};
 use windows::Win32::UI::WindowsAndMessaging::{
@@ -414,6 +414,46 @@ impl CandidateWindow {
         })
     }
 
+    /// RvImage[] → ViewLayer[]：解析路径 + 偏移分流（dp×scale / 百分比）+ 尺寸×scale。
+    fn rv_layers(&self, layers: &[wind_theme::RvImage]) -> Vec<ViewLayer> {
+        use wind_theme::schema::Dim;
+        let s = self.scale;
+        let split = |d: Option<Dim>| match d {
+            Some(Dim::Dp(v)) => (v * s, 0.0),
+            Some(Dim::Px(v)) => (v, 0.0),
+            Some(Dim::Pct(v)) => (0.0, v),
+            None => (0.0, 0.0),
+        };
+        layers
+            .iter()
+            .filter_map(|im| {
+                if im.reference.is_empty() {
+                    return None;
+                }
+                let path = self
+                    .theme
+                    .resources
+                    .get(&im.reference)
+                    .cloned()
+                    .unwrap_or_else(|| im.reference.clone());
+                let (off_x, off_x_pct) = split(im.offset_x);
+                let (off_y, off_y_pct) = split(im.offset_y);
+                Some(ViewLayer {
+                    path,
+                    z: im.z,
+                    anchor: im.anchor.clone(),
+                    off_x,
+                    off_y,
+                    off_x_pct,
+                    off_y_pct,
+                    w: if im.w > 0 { im.w as f32 * s } else { 0.0 },
+                    h: if im.h > 0 { im.h as f32 * s } else { 0.0 },
+                    opacity: im.opacity,
+                })
+            })
+            .collect()
+    }
+
     /// 按当前状态构建候选视图树（横向布局）。
     /// T3：从 RVNode 树（`Resolved.views`）取色/几何，颜色 None→兜底（与旧 ResolvedTheme 默认等值，零回归）。
     fn build_tree(&self) -> View {
@@ -461,6 +501,11 @@ impl CandidateWindow {
         // 窗口背景图（九宫格/拉伸位图皮肤，如 jidian 的 panel）。
         if let Some(vi) = self.rv_image(v.window.bg_image.as_ref()) {
             root = root.bg_image(vi);
+        }
+        // 窗口 z 层覆盖图（如 jidian 右下角 mark 水印）。
+        let win_layers = self.rv_layers(&v.window.layers);
+        if !win_layers.is_empty() {
+            root = root.layers(win_layers);
         }
 
         // 预编辑行（主题背景带 + 文本色）
