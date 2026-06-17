@@ -294,12 +294,22 @@ impl EngineManager {
 
     // ───────────────────────── 词典加载 ─────────────────────────
 
-    /// 读取并解析 schema 文件（仅 TOML）。仅解析不构建引擎。
+    /// 在 [用户配置/schemas, 安装/schemas] 中解析一个 schemas 相对文件路径，用户目录优先。
+    /// 用户目录存在同名文件即覆盖安装目录（schema 用户覆盖；方案/词典/字根表共用）。
+    fn resolve_schema_file(rel: &str, data_dir: &Path) -> std::path::PathBuf {
+        if let Some(user) = Config::user_config_dir() {
+            let p = user.join("schemas").join(rel);
+            if p.is_file() {
+                return p;
+            }
+        }
+        data_dir.join("schemas").join(rel)
+    }
+
+    /// 读取并解析 schema 文件（仅 TOML）。用户目录优先（见 resolve_schema_file）。
     fn read_schema(schema_id: &str, data_dir: Option<&Path>) -> Option<Schema> {
         let data_dir = data_dir?;
-        let toml_path = data_dir
-            .join("schemas")
-            .join(format!("{}.schema.toml", schema_id));
+        let toml_path = Self::resolve_schema_file(&format!("{}.schema.toml", schema_id), data_dir);
         if !toml_path.exists() {
             warn!("Schema file not found: {}.schema.toml", schema_id);
             return None;
@@ -497,6 +507,17 @@ impl EngineManager {
             return None;
         }
 
+        // 词典文件路径解析：用户配置/schemas 优先，回退 schemas_dir（与 read_schema 同语义）。
+        let resolve = |rel: &str| -> std::path::PathBuf {
+            if let Some(u) = Config::user_config_dir() {
+                let p = u.join("schemas").join(rel);
+                if p.is_file() {
+                    return p;
+                }
+            }
+            schemas_dir.join(rel)
+        };
+
         let dtype = |e: &DictSpec| {
             if e.dict_type.is_empty() {
                 "rime_codetable".to_string()
@@ -508,7 +529,7 @@ impl EngineManager {
         // 单库快路径
         if enabled.len() == 1 {
             let e = enabled[0];
-            let full = schemas_dir.join(&e.path);
+            let full = resolve(&e.path);
             info!("Loading dictionary: {} (type={})", full.display(), dtype(e));
             return if dtype(e) == "rime_pinyin" {
                 Self::load_rime_pinyin_dict(&full)
@@ -529,7 +550,7 @@ impl EngineManager {
         // 多库：合并到 combined.wdb（缓存键 = 主词库路径 + .combined.wdb）
         let sources: Vec<(std::path::PathBuf, String)> = enabled
             .iter()
-            .map(|e| (schemas_dir.join(&e.path), dtype(e)))
+            .map(|e| (resolve(&e.path), dtype(e)))
             .collect();
         let combined = cache_path(sources[0].0.as_path(), "combined.wdb");
         Self::load_merged_dicts(&sources, &combined)
