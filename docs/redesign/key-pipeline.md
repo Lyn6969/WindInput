@@ -118,6 +118,11 @@ impl Decider { fn decide(&mut self, cx, key) -> KeyAction { /* 见下序 */ } }
 
 ### 2.2 Capability —— 引擎副作用单点（对齐 `applyEngineDiff`）
 
+> **实施修正（S1 勘探代码后裁掉，2026-06-17）**：Capability 在 Rust **不移植**。Go 需要
+> `applyEngineDiff` 是因为它在切 processor 时挂卸**共享引擎**的词典层；而 Rust 各模式按
+> schema id **独立查询**引擎（`EngineManager::convert_with(schema_id, ...)`），不存在被多模式
+> 改写的共享引擎，故没有「引擎副作用」需要单点统一。强行引入只是死抽象。原设计如下存档：
+
 ```rust
 bitflags Capability { CODETABLE, PINYIN, ENGLISH_DICT, NONE }
 ```
@@ -126,6 +131,10 @@ bitflags Capability { CODETABLE, PINYIN, ENGLISH_DICT, NONE }
 （临时拼音挂拼音层/卸码表层等）。**唯一**改引擎层状态的地方，杜绝多处副作用漂移。
 
 ### 2.3 CommitStrategy —— 配置随 Processor 走（根治歧义）
+
+> **实施说明**：推迟到 **S4** 落地。Rust coordinator 当前**尚未实现**全码/空码上屏
+> （`codetable::engine::should_auto_commit` 为空实现），现在没有调用点消费策略归属，
+> 故按「避免过早抽象」与实现 S4 时一起设计。设计目标态如下：
 
 ```rust
 enum CommitStrategy {
@@ -174,8 +183,9 @@ enum CommitStrategy {
 
 ## 4. 分阶段实施（每阶段：IME 可用 + 测试 + 交叉编译 + 提交）
 
-- **S0 redb 接线**（§2.6）：独立地基，落实用户造词/词频持久化。先行。
-- **S1 Decider/Processor 骨架**（§2.1/2.2）：收编现有三模式，建立 Capability 引擎单点 + CommitStrategy 归属。架构地基。
+- **S0 redb 接线**（§2.6）：独立地基，落实用户造词/词频持久化。✅ 完成。
+- **S1 模式收编为单点决策**（§2.1）：三散装 bool → 单一 `State.active: Option<ModeKind>` + 单点 `match` 分派 + 单一激活/复位入口。✅ 完成（commit `432cbc8`）。
+  - 修正：Capability 不移植（§2.2，Rust 无共享引擎副作用）；CommitStrategy 推迟到 S4（全码上屏尚未实现，当前无消费方，避免过早抽象）。enum 分派替代 trait 对象（模式逻辑与 Coordinator 紧耦合，trait+Ctx 间接层不划算）。
 - **S2 符号单点流水线**（§2.5）：自定义映射 + 智能符号 + 数字后智能 + 全半角。
 - **S3 新模式**（§2.4）：URL + 特殊模式接入 Decider；统一夺取回退。
 - **S4 全码/空码策略落地 + 模式激活键融合**（§2.3）：CommitStrategy 各 Processor 实现；激活键统一判定。
