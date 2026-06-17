@@ -81,9 +81,21 @@ Default/load_resolved、RvNode 加 bg_shape（序号圆形）。windows-gnu 交�
 **T4 全部完成**：背景图（九宫格/拉伸/平铺/center）+ z 层 layers + footer SVG tint 箭头。
 **部署便利**：jidian-classic 已拷入 data/themes + build_debug/data/themes（gitignore 不入库）供测试。
 
-## 剩余清理（非阻塞）
-- 旧 `resolved.rs`(ResolvedTheme/ThemeManager) 删除（仅自身测试引用，wind-ui 已全切到 Resolved/RvNode）。
-- 仍未做的渲染细节：真圆序号（现药丸近似）、竖排/多列布局、状态几何（刻意不做）。
+### T5：其它窗口位图 ✅（提交 `31e1f03`）
+status 气泡 / tooltip / 弹出菜单也消费 RVNode 背景图+层（jidian 在这些窗口出九宫格 panel + 角标水印）。
+新增 `theme_assets.rs`（asset_path/rv_image/rv_layers 各窗口共享）；RvViews 加 menu_root。toast 是空壳跳过；
+toolbar 仅 palette 颜色。
+
+### 收尾打磨 ✅
+- 死代码清理（提交 `714269f`）：删 resolved.rs/manager.rs/bgimage.rs（ResolvedTheme 链路已退役）。
+- 真圆序号（提交 `4ae4b7e`）：View.circle_bg + fill_circle，取代圆角矩形药丸近似。
+- 竖排布局（提交 `4949602`）：ui.candidate.layout=vertical 驱动；build_tree 横排=Row/竖排=Column，
+  翻页器位置随之；coordinator 启动下发（此前布局配置未被消费）。
+
+## 主题迁移 — 全部完成 🎯
+T1 schema → T2 RVNode → T3 候选窗 → T3.5 渲染完整度 → A1 comment → A2 阴影 →
+T4a 背景图 → T4b layers → T4c SVG 箭头 → 菜单修复 → 死代码清理 → 真圆 → T5 其它窗口 → 竖排。
+仍未做（按需）：多列布局、状态几何（刻意不做，防跳动）。
 
 ### T5：其它窗口走 RVNode（status/tooltip/menu/toast/toolbar）
 **目标**：other_views 等价——各窗口注入自己 palette 语义色，复用 RvNode 解析 + 图片管线。
