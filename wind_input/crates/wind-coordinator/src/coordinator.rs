@@ -2164,8 +2164,20 @@ impl Coordinator {
         state.candidates = cands;
     }
 
-    /// mix 模式按键处理：编码累积 + 候选选择（空格选高亮、数字/二三候选键选词、
-    /// 上下/翻页导航、回车上屏编码原文、退格删空退出、标点顶屏）。无自动上屏（手动选）。
+    /// 数字 lens（计算/表达式）：数字与符号（含 `=`）作输入，字母作选词。
+    /// 仅含 quick_input 成员的 mix 在首字符为数字/符号时进入。返回该键应输入的字符。
+    fn mix_numeric_input_char(key_code: u32, shift: bool) -> Option<char> {
+        if (keymap::VK_A..=keymap::VK_Z).contains(&key_code) {
+            None // 字母在数字 lens 作选词，不输入
+        } else {
+            printable_char(key_code, shift) // 数字 + 任意符号（含 = + - * / . 等）入缓冲
+        }
+    }
+
+    /// mix 模式按键处理 —— 双透镜统一管线（见架构说明）。
+    /// 首字符确定 lens：数字/符号 → 数字 lens（符号输入、字母选词）；字母 → 文本 lens
+    /// （字母输入、数字选词、`-`/`=` 翻页）。每键顺序：控制键 → ①输入字符 → ②翻页/高亮
+    /// → ③本 lens 选词键 → ④配置二三候选键 → ⑤其它标点顶屏。
     fn handle_mix_key(&self, state: &mut State, data: &KeyEventData) -> KeyAction {
         let refresh = |this: &Self, state: &mut State| -> KeyAction {
             this.update_mix_candidates(state);
@@ -2176,9 +2188,15 @@ impl Coordinator {
                 caret_pos: d.chars().count() as u32,
             }
         };
-        if let Some(act) = self.handle_candidate_nav(state, data) {
-            return act;
-        }
+        let commit_text = |this: &Self, state: &mut State, t: String| -> KeyAction {
+            this.exit_mix_mode(state);
+            this.notify_ui_hide();
+            if t.is_empty() {
+                KeyAction::ClearComposition
+            } else {
+                Self::commit_action(t, true)
+            }
+        };
         match data.key_code {
             keymap::VK_ESCAPE => {
                 self.exit_mix_mode(state);
@@ -2196,88 +2214,73 @@ impl Coordinator {
                 }
             }
             keymap::VK_SPACE => {
-                // 空格：上屏当前高亮候选；无候选则退出
-                if !state.candidates.is_empty() {
+                // 空格：上屏当前高亮候选
+                let text = if state.candidates.is_empty() {
+                    String::new()
+                } else {
                     let idx = self
                         .highlighted_global_index(state)
                         .min(state.candidates.len() - 1);
-                    let text = state.candidates[idx].text.clone();
-                    self.exit_mix_mode(state);
-                    self.notify_ui_hide();
-                    Self::commit_action(text, true)
-                } else {
-                    self.exit_mix_mode(state);
-                    self.notify_ui_hide();
-                    KeyAction::ClearComposition
-                }
+                    state.candidates[idx].text.clone()
+                };
+                commit_text(self, state, text)
             }
             keymap::VK_RETURN => {
+                // 回车：上屏缓冲原文（如完整表达式 100+200=300）
                 let text = state.mix_buffer.clone();
-                self.exit_mix_mode(state);
-                self.notify_ui_hide();
-                if text.is_empty() {
-                    KeyAction::ClearComposition
-                } else {
-                    Self::commit_action(text, true)
-                }
-            }
-            keymap::VK_A..=keymap::VK_Z => {
-                // 数字模式：字母选词（a=首选 b=次选…，对齐老 quick_input）；否则字母作输入。
-                let calc = self.mix_has_quick_input(state.mix_id);
-                if calc && !state.mix_buffer.is_empty() && state.mix_numeric {
-                    return self.mix_select(state, (data.key_code - keymap::VK_A) as usize);
-                }
-                if state.mix_buffer.is_empty() {
-                    state.mix_numeric = false; // 首字符是字母 → 文本模式
-                }
-                let ch = (b'a' + (data.key_code - keymap::VK_A) as u8) as char;
-                state.mix_buffer.push(ch);
-                refresh(self, state)
+                commit_text(self, state, text)
             }
             _ => {
                 let shift = data.modifiers & MOD_SHIFT != 0;
                 let calc = self.mix_has_quick_input(state.mix_id);
-                // 表达式字符（数字/运算符/./()）：首字符 → 数字模式；数字模式中作输入。
-                if let Some(ch) = quick_input_char(data.key_code, shift) {
-                    if calc && state.mix_buffer.is_empty() {
-                        state.mix_numeric = true; // 首字符是数字/符号 → 数字模式
-                        state.mix_buffer.push(ch);
-                        return refresh(self, state);
-                    }
-                    if calc && state.mix_numeric {
-                        state.mix_buffer.push(ch);
-                        return refresh(self, state);
-                    }
-                    // 文本模式（或非 calc mix）+ 数字 → 选词（1=首选）
-                    if let Some(d) = ch.to_digit(10) {
-                        if d >= 1 {
-                            return self.mix_select(state, (d - 1) as usize);
-                        }
-                    }
-                    // 文本模式 + 运算符 → 落到下方标点提交
+                // 首字符确定 lens：非字母可打印字符（数字/符号）→ 数字 lens。
+                if state.mix_buffer.is_empty() {
+                    let is_letter = (keymap::VK_A..=keymap::VK_Z).contains(&data.key_code);
+                    state.mix_numeric =
+                        calc && !is_letter && printable_char(data.key_code, shift).is_some();
                 }
-                // 数字模式下 = 作「求值上屏」：上屏当前高亮结果，不追加 =（计算器约定）。
-                if calc && state.mix_numeric && data.key_code == keymap::VK_EQUAL {
-                    if state.candidates.is_empty() {
-                        self.exit_mix_mode(state);
-                        self.notify_ui_hide();
-                        return KeyAction::ClearComposition;
-                    }
-                    let idx = self
-                        .highlighted_global_index(state)
-                        .min(state.candidates.len() - 1);
-                    let text = state.candidates[idx].text.clone();
-                    self.exit_mix_mode(state);
-                    self.notify_ui_hide();
-                    return Self::commit_action(text, true);
+                let numeric = calc && state.mix_numeric;
+
+                // ① 输入字符（按 lens）
+                let input = if numeric {
+                    Self::mix_numeric_input_char(data.key_code, shift)
+                } else if (keymap::VK_A..=keymap::VK_Z).contains(&data.key_code) {
+                    Some((b'a' + (data.key_code - keymap::VK_A) as u8) as char)
+                } else {
+                    None
+                };
+                if let Some(ch) = input {
+                    state.mix_buffer.push(ch);
+                    return refresh(self, state);
                 }
-                // 二三候选键（配置驱动）选词
+
+                // ② 翻页/高亮（输入字符已消费；数字 lens 的 -/= 已作输入吃掉）
+                if let Some(act) = self.apply_nav_key(state, data, true) {
+                    return act;
+                }
+
+                // ③ 本 lens 选词键：数字 lens 用字母（a=首选），文本 lens 用数字（1=首选）
+                let sel = if numeric {
+                    (keymap::VK_A..=keymap::VK_Z)
+                        .contains(&data.key_code)
+                        .then(|| (data.key_code - keymap::VK_A) as usize)
+                } else {
+                    (keymap::VK_1..=keymap::VK_9)
+                        .contains(&data.key_code)
+                        .then(|| (data.key_code - keymap::VK_1) as usize)
+                };
+                if let Some(off) = sel {
+                    return self.mix_select(state, off);
+                }
+
+                // ④ 配置二三候选键
                 if !shift {
                     if let Some(offset) = self.select_key_offset(data.key_code) {
                         return self.mix_select(state, offset);
                     }
                 }
-                // 其它标点：顶屏当前高亮候选 + 转换后标点，退出
+
+                // ⑤ 其它标点：顶屏当前高亮候选 + 转换后标点，退出
                 if let Some(ch) = punct_char(data.key_code, shift) {
                     let committed = if !state.candidates.is_empty() {
                         let idx = self
