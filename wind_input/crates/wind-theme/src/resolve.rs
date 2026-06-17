@@ -38,7 +38,7 @@ impl Default for ResolvedBehavior {
 }
 
 /// v3 主题求值后的最终形态——渲染层唯一来源（T3 起 wind-ui 消费）。
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Default)]
 pub struct Resolved {
     pub is_dark: bool,
     /// 全部已解析颜色 token（顶层语义 + selection/hover + toolbar_* 等功能前缀）。
@@ -156,6 +156,7 @@ fn resolve_view_node(
         border_width: n.border.width,
         border_color: def_border,
         bg_color: def_bg,
+        bg_shape: n.background.shape.clone(),
         font_size: n.font_size.unwrap_or(0) as f32,
         font_weight: n.font_weight.unwrap_or(0),
         font_family: n.font_family.clone(),
@@ -259,6 +260,13 @@ fn resolve_image_path(p: &str, base_dir: &Path) -> String {
         return p.to_string();
     }
     base_dir.join(p).to_string_lossy().into_owned()
+}
+
+/// 便捷：按名加载主题（base 深合并 + 类型化）并求值为 `Resolved`。
+/// theme_dir = themes_dir/<name>（resources 相对路径基准）。
+pub fn load_resolved(themes_dir: &Path, name: &str, is_dark: bool) -> anyhow::Result<Resolved> {
+    let t = crate::theme::load_typed(themes_dir, name)?;
+    Ok(resolve(&t, is_dark, &themes_dir.join(name)))
 }
 
 /// 求值入口：typed `Theme` + is_dark + theme 目录 → `Resolved`。

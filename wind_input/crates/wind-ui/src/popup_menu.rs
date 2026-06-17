@@ -320,7 +320,7 @@ impl PopupMenu {
     }
 
     /// 应用主题（菜单各色）。
-    pub fn set_theme(&mut self, theme: &wind_theme::ResolvedTheme) {
+    pub fn set_theme(&mut self, theme: &wind_theme::Resolved) {
         self.bg = theme.color("menu_bg", BG);
         self.fg = theme.color("menu_text", FG);
         self.disabled = theme.color("menu_disabled", DISABLED);

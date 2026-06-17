@@ -42,7 +42,7 @@ pub enum UiCommand {
     /// 设置工具栏位置（启动时恢复持久化位置）
     SetToolbarPos { x: i32, y: i32 },
     /// 应用主题（协调器加载解析后下发）
-    SetTheme(Box<wind_theme::ResolvedTheme>),
+    SetTheme(Box<wind_theme::Resolved>),
     /// 显示菜单（候选右键菜单 / 功能主菜单；UI 自管导航与子菜单）
     ShowCandidateMenu {
         items: Vec<MenuItemSpec>,

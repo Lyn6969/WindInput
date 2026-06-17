@@ -13,6 +13,6 @@ pub mod theme;
 
 pub use manager::ThemeManager;
 pub use palette::Rgba;
-pub use resolve::{Resolved, ResolvedBehavior};
+pub use resolve::{load_resolved, resolve, Resolved, ResolvedBehavior};
 pub use resolved::{Pad, ResolvedTheme};
 pub use rvnode::{RvGradient, RvImage, RvNode, RvViews};

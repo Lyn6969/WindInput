@@ -37,7 +37,7 @@ impl Tooltip {
     }
 
     /// 应用主题（tooltip 底色/文字色）。
-    pub fn set_theme(&mut self, theme: &wind_theme::ResolvedTheme) {
+    pub fn set_theme(&mut self, theme: &wind_theme::Resolved) {
         self.bg = theme.color("tooltip_bg", BG);
         self.fg = theme.color("tooltip_text", FG);
     }

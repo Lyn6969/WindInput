@@ -111,7 +111,7 @@ impl Toolbar {
     }
 
     /// 应用主题（工具栏各色，跟随语义）。
-    pub fn set_theme(&mut self, theme: &wind_theme::ResolvedTheme) {
+    pub fn set_theme(&mut self, theme: &wind_theme::Resolved) {
         self.bg = theme.color("toolbar_background", self.bg);
         self.fg = theme.color("toolbar_full_width_off_text", self.fg);
         self.hl_bg = theme.color("toolbar_mode_chinese_bg", self.hl_bg);

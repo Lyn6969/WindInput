@@ -2813,7 +2813,7 @@ impl Coordinator {
             Some(d) => d,
             None => return,
         };
-        match wind_theme::ResolvedTheme::load(dir, name, is_dark) {
+        match wind_theme::load_resolved(dir, name, is_dark) {
             Ok(t) => {
                 info!("Loaded theme: {} (dark={})", name, is_dark);
                 let _ = self.ui_tx.send(UiCommand::SetTheme(Box::new(t)));

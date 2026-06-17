@@ -122,8 +122,8 @@ pub struct CandidateWindow {
     mouse: Rc<RefCell<CandidateMouse>>,
     /// 悬停编码反查气泡
     tooltip: Option<crate::tooltip::Tooltip>,
-    /// 已解析主题（颜色/几何）；默认兜底清风蓝
-    theme: wind_theme::ResolvedTheme,
+    /// 已解析主题（RVNode 树 + palette）；默认兜底（空 palette + 渲染器内置色）
+    theme: wind_theme::Resolved,
     /// DPI 缩放（主题几何为逻辑像素，渲染时乘此）
     scale: f32,
 }
@@ -162,13 +162,13 @@ impl CandidateWindow {
             hit_rects: Vec::new(),
             mouse,
             tooltip: crate::tooltip::Tooltip::new().ok(),
-            theme: wind_theme::ResolvedTheme::default(),
+            theme: wind_theme::Resolved::default(),
             scale: CandidateWindowConfig::get_dpi_scale(),
         })
     }
 
     /// 应用主题（协调器下发）。同步更新悬停 tooltip 配色。
-    pub fn set_theme(&mut self, theme: wind_theme::ResolvedTheme) {
+    pub fn set_theme(&mut self, theme: wind_theme::Resolved) {
         if let Some(tip) = self.tooltip.as_mut() {
             tip.set_theme(&theme);
         }
@@ -353,37 +353,75 @@ impl CandidateWindow {
         (x, y)
     }
 
-    /// 按当前状态构建候选视图树（横向布局）
+    /// 按当前状态构建候选视图树（横向布局）。
+    /// T3：从 RVNode 树（`Resolved.views`）取色/几何，颜色 None→兜底（与旧 ResolvedTheme 默认等值，零回归）。
     fn build_tree(&self) -> View {
+        use wind_theme::rvnode::{RvEdges, RvNode};
+        use wind_theme::schema::Dim;
         let t = &self.theme;
+        let v = &t.views;
         let s = self.scale;
         let gap = self.config.item_spacing.max(2.0);
         let fs = self.config.font_size;
-        // 主题四边内边距（逻辑像素）→ 设备像素
-        let edges = |p: &wind_theme::Pad| Edges {
-            l: p.l * s,
-            t: p.t * s,
-            r: p.r * s,
-            b: p.b * s,
+
+        // 颜色：None→兜底。
+        let col = |o: Option<[u8; 4]>, d: [u8; 4]| o.unwrap_or(d);
+        // 单个 Dim→设备像素（dp×scale）；None→def_logical×scale。
+        let dim = |o: Option<Dim>, def_logical: f32| {
+            o.map(|x| x.resolve(s, 0.0)).unwrap_or(def_logical * s)
+        };
+        // RvEdges 四边内边距→设备像素 Edges；逐边 None→对应 def_logical×scale。
+        let edges_or = |e: &RvEdges, d: [f32; 4]| Edges {
+            t: e.top.map(|x| x.resolve(s, 0.0)).unwrap_or(d[0] * s),
+            r: e.right.map(|x| x.resolve(s, 0.0)).unwrap_or(d[1] * s),
+            b: e.bottom.map(|x| x.resolve(s, 0.0)).unwrap_or(d[2] * s),
+            l: e.left.map(|x| x.resolve(s, 0.0)).unwrap_or(d[3] * s),
+        };
+        // 状态 patch 取色（selected/hover 的 bg/text，None patch 或缺色→兜底）。
+        let patch_bg = |p: &Option<Box<RvNode>>, d: [u8; 4]| {
+            p.as_ref().and_then(|n| n.bg_color).unwrap_or(d)
         };
 
         let mut root = View::container(Layout::Column)
-            .bg(t.win_bg)
-            .border(t.win_border, (t.win_border_width * s).max(1.0))
-            .radius(t.win_radius * s)
-            .pad(edges(&t.win_pad))
+            .bg(col(v.window.bg_color, [255, 255, 255, 255]))
+            .border(
+                col(v.window.border_color, [200, 200, 200, 200]),
+                dim(v.window.border_width, 1.0).max(1.0),
+            )
+            .radius(dim(v.window.border_radius, 8.0))
+            .pad(edges_or(&v.window.padding, [6.0, 8.0, 6.0, 8.0]))
             .gap(gap);
 
         // 预编辑行（主题背景带 + 文本色）
         if !self.preedit.is_empty() {
             root = root.child(
                 View::container(Layout::Row)
-                    .bg(t.preedit_bg)
-                    .radius(t.item_radius * s)
-                    .pad(edges(&t.preedit_pad))
-                    .child(View::leaf(self.preedit.clone(), t.preedit_color)),
+                    .bg(col(v.preedit_bar.bg_color, [240, 240, 240, 255]))
+                    .radius(dim(v.item.border_radius, 4.0))
+                    .pad(edges_or(&v.preedit_bar.padding, [3.0, 8.0, 3.0, 8.0]))
+                    .child(View::leaf(
+                        self.preedit.clone(),
+                        col(v.preedit_bar.text_color, [100, 100, 100, 255]),
+                    )),
             );
         }
+
+        // 候选项颜色（基态 + 选中态）。
+        let text_color = col(v.text.text_color, [30, 30, 30, 255]);
+        let sel_text = v
+            .text
+            .selected
+            .as_ref()
+            .and_then(|n| n.text_color)
+            .unwrap_or([30, 30, 30, 255]);
+        let sel_bg = patch_bg(&v.item.selected, [230, 240, 255, 255]);
+        let hover_bg = patch_bg(&v.item.hover, [238, 242, 247, 255]);
+        let index_color = col(v.index.text_color, [66, 133, 244, 255]);
+        let index_circle = v.index.bg_shape == "circle";
+        let index_circle_bg = col(v.index.bg_color, [66, 133, 244, 255]);
+        let text_margin_l = dim(v.text.margin.left, 4.0);
+        let item_pad = edges_or(&v.item.padding, [7.0, 10.0, 7.0, 8.0]);
+        let item_radius = dim(v.item.border_radius, 4.0);
 
         // 候选行：[序号 文本] cell 横排
         let mut row = View::container(Layout::Row).gap(gap * 2.0).cross(Align::Center);
@@ -395,30 +433,30 @@ impl CandidateWindow {
             };
             let is_sel = i == self.selected;
             let is_hover = self.hover >= 0 && self.hover as usize == i;
-            let txt_color = if is_sel { t.sel_text } else { t.text_color };
+            let txt_color = if is_sel { sel_text } else { text_color };
 
             // 序号：圆圈样式 → 带底色 + 大圆角（药丸近似圆）
-            let mut idx_leaf = View::leaf(marker, t.index_color);
-            if t.index_circle {
+            let mut idx_leaf = View::leaf(marker, index_color);
+            if index_circle {
                 idx_leaf = idx_leaf
-                    .bg(t.index_circle_bg)
+                    .bg(index_circle_bg)
                     .radius(fs * 0.5)
                     .pad(Edges::xy(s * 4.0, s * 1.0));
             }
 
             let mut item = View::container(Layout::Row)
                 .cross(Align::Center)
-                .gap(t.text_margin_l * s)
-                .pad(edges(&t.item_pad))
-                .radius(t.item_radius * s)
+                .gap(text_margin_l)
+                .pad(item_pad)
+                .radius(item_radius)
                 .tag(i as i32)
                 .child(idx_leaf)
                 .child(View::leaf(cand.text.clone(), txt_color));
             // 选中底色优先于悬停底色（两者独立：选中=空格上屏目标，悬停=鼠标提示）
             if is_sel {
-                item = item.bg(t.sel_bg);
+                item = item.bg(sel_bg);
             } else if is_hover {
-                item = item.bg(t.hover_bg);
+                item = item.bg(hover_bg);
             }
             row = row.child(item);
         }
@@ -427,16 +465,17 @@ impl CandidateWindow {
         if self.total_pages > 1 {
             let disabled = t.color("text_hint", [180, 180, 185, 255]);
             let marker_c = t.color("text_dim", [140, 140, 145, 255]);
+            let accent = col(v.accent_bar.bg_color, [66, 133, 244, 255]);
             let arrow = |txt: &str, tag: i32, enabled: bool, hovered: bool| {
-                let color = if enabled { t.accent_bar } else { disabled };
+                let color = if enabled { accent } else { disabled };
                 let mut v = View::leaf(txt, color)
                     .pad(Edges::xy(gap * 1.2, gap * 0.5))
-                    .radius(t.item_radius * s)
+                    .radius(item_radius)
                     .cross(Align::Center);
                 if enabled {
                     v = v.tag(tag); // 仅启用项参与命中
                     if hovered {
-                        v = v.bg(t.hover_bg);
+                        v = v.bg(hover_bg);
                     }
                 }
                 v

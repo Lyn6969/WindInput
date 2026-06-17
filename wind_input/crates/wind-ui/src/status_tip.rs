@@ -31,7 +31,7 @@ impl StatusTip {
     }
 
     /// 应用主题（状态气泡底色/文字色）。
-    pub fn set_theme(&mut self, theme: &wind_theme::ResolvedTheme) {
+    pub fn set_theme(&mut self, theme: &wind_theme::Resolved) {
         self.bg = theme.color("status_bg", self.bg);
         self.fg = theme.color("status_text", self.fg);
     }

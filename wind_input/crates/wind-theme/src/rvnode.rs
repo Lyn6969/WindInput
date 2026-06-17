@@ -81,6 +81,8 @@ pub struct RvNode {
     pub border_width: Option<Dim>,
     pub border_color: Option<Rgba>,
     pub bg_color: Option<Rgba>,
+    /// 背景形状："circle"|"none"（空=none）。当前仅 index 序号消费（圆形序号底）。
+    pub bg_shape: String,
     /// 相对主候选字体的有符号偏移（逻辑 px）；0=同主字体。
     pub font_size: f32,
     /// 0=继承全局。
