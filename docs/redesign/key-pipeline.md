@@ -186,7 +186,9 @@ enum CommitStrategy {
 - **S0 redb 接线**（§2.6）：独立地基，落实用户造词/词频持久化。✅ 完成。
 - **S1 模式收编为单点决策**（§2.1）：三散装 bool → 单一 `State.active: Option<ModeKind>` + 单点 `match` 分派 + 单一激活/复位入口。✅ 完成（commit `432cbc8`）。
   - 修正：Capability 不移植（§2.2，Rust 无共享引擎副作用）；CommitStrategy 推迟到 S4（全码上屏尚未实现，当前无消费方，避免过早抽象）。enum 分派替代 trait 对象（模式逻辑与 Coordinator 紧耦合，trait+Ctx 间接层不划算）。
-- **S2 符号单点流水线**（§2.5）：自定义映射 + 智能符号 + 数字后智能 + 全半角。
+- **S2 符号单点流水线**（§2.5）：自定义映射 + 智能符号 + 数字后智能 + 全半角。✅ 完成。
+  - S2a（commit `09a00bf`）：统一 `convert_punct(state,ch,prev_char)`（自定义映射>数字后智能>中文标点>全半角）；config 增 `punct_custom`/`smart_symbol*`；transform 增 `lookup_custom`/`peek_chinese_str`/`revert_last_quote`。
+  - S2b（commit `48ec31d`）：智能符号模式 + 协议 `CMD_REPLACE_BACKWARD=0x0109`/`KeyAction::ReplaceBackward`；`try_smart_symbol_replace` 在标点分支入口短路；焦点/模式切换 disarm。
 - **S3 新模式**（§2.4）：URL + 特殊模式接入 Decider；统一夺取回退。
 - **S4 全码/空码策略落地 + 模式激活键融合**（§2.3）：CommitStrategy 各 Processor 实现；激活键统一判定。
 - **S5 按钮自定义**。
