@@ -416,6 +416,11 @@ impl Coordinator {
             .unwrap_or_else(|e| e.into_inner())
             .clone();
         coordinator.push_theme(&name, false);
+        // 下发候选布局方向（ui.candidate.layout == "vertical"）。
+        let vertical = coordinator.config.ui.candidate.layout.eq_ignore_ascii_case("vertical");
+        let _ = coordinator
+            .ui_tx
+            .send(UiCommand::SetCandidateLayout(vertical));
         coordinator
     }
 

@@ -128,6 +128,8 @@ pub struct CandidateWindow {
     theme: wind_theme::Resolved,
     /// DPI 缩放（主题几何为逻辑像素，渲染时乘此）
     scale: f32,
+    /// 竖排布局（候选纵向堆叠）；默认横排。来自 ui.candidate.layout。
+    vertical: bool,
 }
 
 impl CandidateWindow {
@@ -166,10 +168,16 @@ impl CandidateWindow {
             tooltip: crate::tooltip::Tooltip::new().ok(),
             theme: wind_theme::Resolved::default(),
             scale: CandidateWindowConfig::get_dpi_scale(),
+            vertical: false,
         })
     }
 
     /// 应用主题（协调器下发）。同步更新悬停 tooltip 配色。
+    /// 设置候选布局方向（true=竖排）。
+    pub fn set_vertical(&mut self, vertical: bool) {
+        self.vertical = vertical;
+    }
+
     pub fn set_theme(&mut self, theme: wind_theme::Resolved) {
         if let Some(tip) = self.tooltip.as_mut() {
             tip.set_theme(&theme);
@@ -523,8 +531,12 @@ impl CandidateWindow {
             .accent_bar_enabled
             .then(|| (col(v.accent_bar.bg_color, [66, 133, 244, 255]), dim(v.accent_bar_width, 3.0)));
 
-        // 候选行：[序号 文本] cell 横排
-        let mut row = View::container(Layout::Row).gap(gap * 2.0).cross(Align::Center);
+        // 候选列表：横排=Row（cell 并列）；竖排=Column（候选纵向堆叠）。
+        let mut list = if self.vertical {
+            View::container(Layout::Column).gap(gap * 0.6)
+        } else {
+            View::container(Layout::Row).gap(gap * 2.0).cross(Align::Center)
+        };
         for (i, cand) in self.candidates.iter().enumerate() {
             let marker = if cand.label.is_empty() {
                 (i + 1).to_string()
@@ -584,11 +596,11 @@ impl CandidateWindow {
             if let Some(vi) = item_img {
                 item = item.bg_image(vi);
             }
-            row = row.child(item);
+            list = list.child(item);
         }
 
         // 翻页器（多页时）：‹ p/t › —— 箭头可点击翻页，带悬停高亮 + 禁用态
-        if self.total_pages > 1 {
+        let pager = if self.total_pages > 1 {
             let disabled = t.color("text_hint", [180, 180, 185, 255]);
             let marker_c = t.color("text_dim", [140, 140, 145, 255]);
             let accent = col(v.accent_bar.bg_color, [66, 133, 244, 255]);
@@ -620,25 +632,42 @@ impl CandidateWindow {
                 }
                 node
             };
-            row = row
-                .child(
-                    arrow(prev_icon, "‹", TAG_PAGE_PREV, prev_on, self.hover == TAG_PAGE_PREV)
-                        .margin(Edges::xy(gap, 0.0)),
-                )
-                .child(
-                    View::leaf(format!("{}/{}", self.page, self.total_pages), marker_c)
-                        .font_size(footer_fs),
-                )
-                .child(arrow(
-                    next_icon,
-                    "›",
-                    TAG_PAGE_NEXT,
-                    next_on,
-                    self.hover == TAG_PAGE_NEXT,
-                ));
-        }
+            Some(
+                View::container(Layout::Row)
+                    .cross(Align::Center)
+                    .child(
+                        arrow(prev_icon, "‹", TAG_PAGE_PREV, prev_on, self.hover == TAG_PAGE_PREV)
+                            .margin(Edges::xy(gap, 0.0)),
+                    )
+                    .child(
+                        View::leaf(format!("{}/{}", self.page, self.total_pages), marker_c)
+                            .font_size(footer_fs),
+                    )
+                    .child(arrow(
+                        next_icon,
+                        "›",
+                        TAG_PAGE_NEXT,
+                        next_on,
+                        self.hover == TAG_PAGE_NEXT,
+                    )),
+            )
+        } else {
+            None
+        };
 
-        root.child(row)
+        // 装配：横排把翻页器并入候选行尾；竖排把候选列表 + 翻页器纵向堆入窗口。
+        if self.vertical {
+            root = root.child(list);
+            if let Some(p) = pager {
+                root = root.child(p);
+            }
+        } else {
+            if let Some(p) = pager {
+                list = list.child(p);
+            }
+            root = root.child(list);
+        }
+        root
     }
 
     pub fn hide(&mut self) {

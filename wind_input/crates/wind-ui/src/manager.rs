@@ -43,6 +43,8 @@ pub enum UiCommand {
     SetToolbarPos { x: i32, y: i32 },
     /// 应用主题（协调器加载解析后下发）
     SetTheme(Box<wind_theme::Resolved>),
+    /// 候选布局方向（true=竖排）。来自 ui.candidate.layout。
+    SetCandidateLayout(bool),
     /// 显示菜单（候选右键菜单 / 功能主菜单；UI 自管导航与子菜单）
     ShowCandidateMenu {
         items: Vec<MenuItemSpec>,
@@ -440,6 +442,9 @@ impl UiManager {
                                 st.set_theme(&t);
                             }
                             candidate_window.set_theme(t); // 同时更新其 tooltip
+                        }
+                        UiCommand::SetCandidateLayout(vertical) => {
+                            candidate_window.set_vertical(vertical);
                         }
                         UiCommand::Shutdown => {
                             info!("UI: Shutdown");
