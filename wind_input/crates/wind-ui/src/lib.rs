@@ -4,6 +4,7 @@
 
 pub mod candidate_window;
 pub mod debounce;
+pub mod image_cache;
 pub mod manager;
 pub mod popup_menu;
 pub mod renderer;

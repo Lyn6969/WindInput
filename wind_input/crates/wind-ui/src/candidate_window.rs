@@ -11,7 +11,7 @@ use std::sync::mpsc::Sender;
 use std::time::{Duration, Instant};
 use crate::manager::{UiEvent, HOVER_PAGE_NEXT as TAG_PAGE_NEXT, HOVER_PAGE_PREV as TAG_PAGE_PREV};
 use crate::text::dwrite::TextRenderer;
-use crate::view::{Align, Edges, Layout, Rect, View};
+use crate::view::{Align, Edges, Layout, Rect, View, ViewImage};
 use crate::window::{LayeredWindow, WindowMouse};
 use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, WPARAM};
 use windows::Win32::UI::WindowsAndMessaging::{
@@ -394,6 +394,26 @@ impl CandidateWindow {
         Some((ox, oy, blur, color))
     }
 
+    /// RvImage → 渲染用 ViewImage：把 reference 经主题 resources 解析为绝对路径（缺则按字面 path）。
+    fn rv_image(&self, im: Option<&wind_theme::RvImage>) -> Option<ViewImage> {
+        let im = im?;
+        if im.reference.is_empty() {
+            return None;
+        }
+        let path = self
+            .theme
+            .resources
+            .get(&im.reference)
+            .cloned()
+            .unwrap_or_else(|| im.reference.clone());
+        Some(ViewImage {
+            path,
+            mode: im.mode.clone(),
+            slice: im.slice,
+            opacity: im.opacity,
+        })
+    }
+
     /// 按当前状态构建候选视图树（横向布局）。
     /// T3：从 RVNode 树（`Resolved.views`）取色/几何，颜色 None→兜底（与旧 ResolvedTheme 默认等值，零回归）。
     fn build_tree(&self) -> View {
@@ -438,6 +458,10 @@ impl CandidateWindow {
             .radius(dim(v.window.border_radius, 8.0))
             .pad(edges_or(&v.window.padding, [6.0, 8.0, 6.0, 8.0]))
             .gap(gap);
+        // 窗口背景图（九宫格/拉伸位图皮肤，如 jidian 的 panel）。
+        if let Some(vi) = self.rv_image(v.window.bg_image.as_ref()) {
+            root = root.bg_image(vi);
+        }
 
         // 预编辑行（主题背景带 + 文本色）
         if !self.preedit.is_empty() {
@@ -528,6 +552,16 @@ impl CandidateWindow {
                 }
             } else if is_hover {
                 item = item.bg(hover_bg);
+            }
+            // 候选项背景图：选中态优先用 selected patch 的图（如 jidian 的 sel.png），否则用 base。
+            let item_img = if is_sel {
+                self.rv_image(v.item.selected.as_ref().and_then(|n| n.bg_image.as_ref()))
+                    .or_else(|| self.rv_image(v.item.bg_image.as_ref()))
+            } else {
+                self.rv_image(v.item.bg_image.as_ref())
+            };
+            if let Some(vi) = item_img {
+                item = item.bg_image(vi);
             }
             row = row.child(item);
         }

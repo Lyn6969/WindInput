@@ -8,7 +8,25 @@
 //! 不含 Go 的渐变 / 九宫格图 / 阴影模糊 / z 分层等重特性（后续按需扩展）。
 
 use crate::text::dwrite::TextRenderer;
-use tiny_skia::{Color, FillRule, Paint, PathBuilder, PixmapMut, Transform};
+use std::cell::RefCell;
+use tiny_skia::{
+    Color, FillRule, FilterQuality, Paint, PathBuilder, Pattern, PixmapMut, SpreadMode, Transform,
+};
+
+thread_local! {
+    /// 背景图解码/填充缓存（UI 单线程，跨帧复用，避免每帧解码）。
+    static IMAGE_CACHE: RefCell<crate::image_cache::ImageCache> =
+        RefCell::new(crate::image_cache::ImageCache::new());
+}
+
+/// 背景填充图（已解析路径 + 模式）。slice 为源图四边切片像素 [上,右,下,左]。
+#[derive(Clone, Debug)]
+pub struct ViewImage {
+    pub path: String,
+    pub mode: String,
+    pub slice: [f32; 4],
+    pub opacity: f32,
+}
 
 /// 四边内/外边距
 #[derive(Clone, Copy, Default)]
@@ -85,6 +103,8 @@ pub struct View {
     pub text_align: Align,
     /// 左侧强调条 (颜色, 宽度 px)：在节点左缘内绘制竖条（选中候选用）；不占布局空间（落在左内边距内）。
     pub left_bar: Option<([u8; 4], f32)>,
+    /// 背景填充图（叠在底色之上，裁到圆角内）。
+    pub bg_image: Option<ViewImage>,
     pub children: Vec<View>,
     /// 命中标识：>=0 参与命中收集（如候选下标 / 按钮 id），<0 忽略
     pub tag: i32,
@@ -112,6 +132,7 @@ impl Default for View {
             font_size: None,
             text_align: Align::Start,
             left_bar: None,
+            bg_image: None,
             children: Vec::new(),
             tag: -1,
             mw: 0.0,
@@ -178,6 +199,10 @@ impl View {
     }
     pub fn left_bar(mut self, color: [u8; 4], width: f32) -> Self {
         self.left_bar = Some((color, width));
+        self
+    }
+    pub fn bg_image(mut self, img: ViewImage) -> Self {
+        self.bg_image = Some(img);
         self
     }
     pub fn tag(mut self, t: i32) -> Self {
@@ -341,6 +366,10 @@ impl View {
             }
             (None, None) => {}
         }
+        // 背景填充图（叠在底色上，裁到圆角内）。
+        if let Some(img) = &self.bg_image {
+            paint_bg_image(buf, buf_w, buf_h, r, self.corner_radius, img);
+        }
         // 左侧强调条（选中候选）：在左内边距内画竖条，高 = 内容高的 60%，垂直居中。不占布局。
         if let Some((color, bw)) = self.left_bar {
             let bh = (r.h * 0.6).max(2.0);
@@ -388,6 +417,47 @@ const KAPPA: f32 = 0.552_284_75;
 ///
 /// 关键技巧：把 BGRA 缓冲当作 tiny-skia 的"RGBA" Pixmap 直接渲染（零拷贝），
 /// 传色时交换 R/B（Color 取 [B,G,R,A]）。预乘 alpha 合成逐通道对称，故输出即合法 BGRA。
+/// 绘制背景填充图：从线程局部缓存取目标尺寸填充位图（BGRA 预乘），以 Pattern 填到圆角路径内。
+fn paint_bg_image(buf: &mut [u8], buf_w: u32, buf_h: u32, r: Rect, radius: f32, img: &ViewImage) {
+    let x = r.x.round();
+    let y = r.y.round();
+    let rw = r.w.round().max(1.0);
+    let rh = r.h.round().max(1.0);
+    let slice = [
+        img.slice[0].round().max(0.0) as u32,
+        img.slice[1].round().max(0.0) as u32,
+        img.slice[2].round().max(0.0) as u32,
+        img.slice[3].round().max(0.0) as u32,
+    ];
+    let mode = crate::image_cache::mode_code(&img.mode);
+    let Some(path) = round_rect_path(x, y, rw, rh, radius.round().max(0.0)) else {
+        return;
+    };
+    IMAGE_CACHE.with(|c| {
+        let mut cache = c.borrow_mut();
+        let Some(fill) = cache.fill(&img.path, mode, slice, rw as u32, rh as u32) else {
+            return;
+        };
+        let Some(mut pm) = PixmapMut::from_bytes(buf, buf_w, buf_h) else {
+            return;
+        };
+        // 填充位图已是目标尺寸（mode 缩放完成），Pattern 仅平移到 rect → 无需再缩放（Nearest 即可）。
+        let shader = Pattern::new(
+            fill.as_ref(),
+            SpreadMode::Pad,
+            FilterQuality::Nearest,
+            img.opacity.clamp(0.0, 1.0),
+            Transform::from_translate(x, y),
+        );
+        let paint = Paint {
+            shader,
+            anti_alias: true,
+            ..Default::default()
+        };
+        pm.fill_path(&path, &paint, FillRule::Winding, Transform::identity(), None);
+    });
+}
+
 pub fn fill_rounded(
     buf: &mut [u8],
     buf_w: u32,
