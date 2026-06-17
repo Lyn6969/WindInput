@@ -20,6 +20,118 @@ pub const VK_BACKSLASH: u32 = 0xDC; // \ |  VK_OEM_5
 pub const VK_RBRACKET: u32 = 0xDD; // ] }  VK_OEM_6
 pub const VK_QUOTE: u32 = 0xDE; // ' "  VK_OEM_7
 
+// 控制 / 编辑 / 导航虚拟键码（统一定义，杜绝散落的裸十六进制）。
+pub const VK_BACK: u32 = 0x08; // 退格
+pub const VK_TAB: u32 = 0x09;
+pub const VK_RETURN: u32 = 0x0D; // 回车
+pub const VK_ESCAPE: u32 = 0x1B;
+pub const VK_SPACE: u32 = 0x20;
+pub const VK_PRIOR: u32 = 0x21; // PageUp
+pub const VK_NEXT: u32 = 0x22; // PageDown
+pub const VK_LEFT: u32 = 0x25;
+pub const VK_UP: u32 = 0x26;
+pub const VK_RIGHT: u32 = 0x27;
+pub const VK_DOWN: u32 = 0x28;
+// 字母 / 数字区间端点（区间用 VK_A..=VK_Z / VK_0..=VK_9 表达，VK 与 ASCII 大写/数字一致）。
+pub const VK_A: u32 = 0x41;
+pub const VK_Z: u32 = 0x5A;
+pub const VK_0: u32 = 0x30;
+pub const VK_9: u32 = 0x39;
+pub const VK_1: u32 = 0x31;
+
+/// 候选导航动作（翻页 / 高亮移动）。统一分类的结果，见 [`NavKeys`]。
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum NavAction {
+    PagePrev,
+    PageNext,
+    HighlightUp,
+    HighlightDown,
+}
+
+/// 一个导航键绑定：(键码, 是否需 Shift, 动作, 该键是否为可打印字符)。
+/// `printable=true`（如 `-`/`=`/`[`/`]`）在文本/表达式模式（临英/快捷输入）中作输入而非导航，
+/// 由 `classify(..., include_printable=false)` 排除；专用导航键（PageUp/Down、方向键、Tab）恒生效。
+#[derive(Clone, Copy)]
+struct NavBind {
+    key: u32,
+    shift: bool,
+    action: NavAction,
+    printable: bool,
+}
+
+/// 配置驱动的候选导航键分类器。从 `input.page_keys` / `input.highlight_keys` 组名编译一次，
+/// 普通模式与所有 overlay 模式共用 [`classify`](NavKeys::classify)，消除各处硬编码翻页/高亮判断。
+#[derive(Clone, Default)]
+pub struct NavKeys {
+    binds: Vec<NavBind>,
+}
+
+impl NavKeys {
+    /// 从配置组名编译。page 组：pageupdown / minus_equal / brackets / shift_tab；
+    /// highlight 组：arrows / tab。未识别组名忽略。
+    pub fn from_config(page_groups: &[String], highlight_groups: &[String]) -> Self {
+        use NavAction::*;
+        let mut binds = Vec::new();
+        let mut push = |key, shift, action, printable| {
+            binds.push(NavBind {
+                key,
+                shift,
+                action,
+                printable,
+            })
+        };
+        for g in page_groups {
+            match g.trim().to_lowercase().as_str() {
+                "pageupdown" => {
+                    push(VK_PRIOR, false, PagePrev, false);
+                    push(VK_NEXT, false, PageNext, false);
+                }
+                "minus_equal" => {
+                    push(VK_MINUS, false, PagePrev, true);
+                    push(VK_EQUAL, false, PageNext, true);
+                }
+                "brackets" => {
+                    push(VK_LBRACKET, false, PagePrev, true);
+                    push(VK_RBRACKET, false, PageNext, true);
+                }
+                "shift_tab" => {
+                    push(VK_TAB, true, PagePrev, false);
+                    push(VK_TAB, false, PageNext, false);
+                }
+                _ => {}
+            }
+        }
+        for g in highlight_groups {
+            match g.trim().to_lowercase().as_str() {
+                "arrows" => {
+                    push(VK_UP, false, HighlightUp, false);
+                    push(VK_DOWN, false, HighlightDown, false);
+                }
+                "tab" => {
+                    push(VK_TAB, true, HighlightUp, false);
+                    push(VK_TAB, false, HighlightDown, false);
+                }
+                _ => {}
+            }
+        }
+        Self { binds }
+    }
+
+    /// 分类一个键。`include_printable=false` 时排除可打印导航键（`-`/`=`/`[`/`]`），
+    /// 供输入需要这些字符的模式（临英/快捷输入）使用，避免吞掉输入语义。
+    pub fn classify(
+        &self,
+        key_code: u32,
+        shift: bool,
+        include_printable: bool,
+    ) -> Option<NavAction> {
+        self.binds
+            .iter()
+            .find(|b| b.key == key_code && b.shift == shift && (include_printable || !b.printable))
+            .map(|b| b.action)
+    }
+}
+
 /// 单个键的定义：虚拟键码、组合区前缀字符、可接受的键名别名（全小写）。
 struct KeyDef {
     vk: u32,
@@ -137,6 +249,51 @@ mod tests {
         assert_eq!(key_name_to_vk_with_letters("z"), Some(0x5A));
         assert_eq!(key_name_to_vk_with_letters("a"), Some(0x41));
         assert_eq!(key_name_to_vk_with_letters("backslash"), Some(VK_BACKSLASH));
+    }
+
+    #[test]
+    fn nav_classify_config_driven() {
+        let nk = NavKeys::from_config(
+            &["pageupdown".into(), "minus_equal".into()],
+            &["arrows".into(), "tab".into()],
+        );
+        // 专用导航键恒生效
+        assert_eq!(
+            nk.classify(VK_PRIOR, false, false),
+            Some(NavAction::PagePrev)
+        );
+        assert_eq!(
+            nk.classify(VK_NEXT, false, false),
+            Some(NavAction::PageNext)
+        );
+        assert_eq!(
+            nk.classify(VK_UP, false, false),
+            Some(NavAction::HighlightUp)
+        );
+        assert_eq!(
+            nk.classify(VK_DOWN, false, false),
+            Some(NavAction::HighlightDown)
+        );
+        // tab=下移、shift+tab=上移
+        assert_eq!(
+            nk.classify(VK_TAB, false, false),
+            Some(NavAction::HighlightDown)
+        );
+        assert_eq!(
+            nk.classify(VK_TAB, true, false),
+            Some(NavAction::HighlightUp)
+        );
+        // -/= 仅在 include_printable 时作翻页（码表模式 true，文本模式 false）
+        assert_eq!(
+            nk.classify(VK_MINUS, false, true),
+            Some(NavAction::PagePrev)
+        );
+        assert_eq!(
+            nk.classify(VK_EQUAL, false, true),
+            Some(NavAction::PageNext)
+        );
+        assert_eq!(nk.classify(VK_MINUS, false, false), None);
+        assert_eq!(nk.classify(VK_EQUAL, false, false), None);
     }
 
     #[test]

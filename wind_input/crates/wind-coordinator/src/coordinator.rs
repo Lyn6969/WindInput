@@ -146,7 +146,7 @@ fn adapt_en_case(word: &str, case: EnCase) -> String {
 /// 用于网址模式原样累积与前缀探测。非可打印键返回 None。
 fn printable_char(key_code: u32, shift: bool) -> Option<char> {
     match key_code {
-        0x41..=0x5A => {
+        keymap::VK_A..=keymap::VK_Z => {
             let base = (key_code - 0x41) as u8;
             Some(if shift {
                 (b'A' + base) as char
@@ -154,7 +154,7 @@ fn printable_char(key_code: u32, shift: bool) -> Option<char> {
                 (b'a' + base) as char
             })
         }
-        0x30..=0x39 if !shift => Some((b'0' + (key_code - 0x30) as u8) as char),
+        keymap::VK_0..=keymap::VK_9 if !shift => Some((b'0' + (key_code - 0x30) as u8) as char),
         _ => punct_char(key_code, shift),
     }
 }
@@ -291,6 +291,8 @@ pub struct Coordinator {
     /// redb 持久化存储（用户词/临时词/词频/影子规则）；None=无持久化（headless 测试）。
     store: Option<Arc<Store>>,
     compiled_hotkeys: CompiledHotkeys,
+    /// 配置驱动的候选导航键分类器（翻页/高亮，普通模式与各 overlay 共用）
+    nav_keys: keymap::NavKeys,
     /// 标点转换器（引号左右状态）
     punct: Mutex<PunctuationConverter>,
     /// 智能符号模式待命态（同键连按删中文标点改英文）
@@ -442,6 +444,8 @@ impl Coordinator {
             compiled_hotkeys.key_down.len(),
             compiled_hotkeys.key_up.len()
         );
+        let nav_keys =
+            keymap::NavKeys::from_config(&config.input.page_keys, &config.input.highlight_keys);
 
         // 短语层：从 data 目录加载 system.phrases.toml
         let phrases = match data_dir {
@@ -569,6 +573,7 @@ impl Coordinator {
             engine_mgr,
             store,
             compiled_hotkeys,
+            nav_keys,
             punct: Mutex::new(punct_conv),
             smart_symbol: Mutex::new(SmartSymbolArm::default()),
             phrases,
@@ -973,6 +978,44 @@ impl Coordinator {
         }
     }
 
+    /// 候选导航键的统一执行（配置驱动，见 `keymap::NavKeys`）：高亮上下 + 翻页。
+    /// 普通模式与所有候选模式共用；`include_printable` 区分码表型（`-`/`=` 作翻页）与
+    /// 文本/表达式型（临英/快捷输入，`-`/`=` 作输入，不当导航）。命中返回 Some。
+    fn apply_nav_key(
+        &self,
+        state: &mut State,
+        data: &KeyEventData,
+        include_printable: bool,
+    ) -> Option<KeyAction> {
+        if state.candidates.is_empty() {
+            return None;
+        }
+        let shift = data.modifiers & MOD_SHIFT != 0;
+        let action = self
+            .nav_keys
+            .classify(data.key_code, shift, include_printable)?;
+        let changed = match action {
+            keymap::NavAction::HighlightUp => self.move_up(state),
+            keymap::NavAction::HighlightDown => self.move_down(state),
+            keymap::NavAction::PagePrev => self.page_prev(state),
+            keymap::NavAction::PageNext => self.page_next(state),
+        };
+        if changed {
+            self.notify_ui_update(state);
+        }
+        Some(KeyAction::Consumed)
+    }
+
+    /// overlay 候选模式的导航分派：码表型（特殊/mix/临拼）`-`/`=` 作翻页；
+    /// 文本型（临英）与表达式型（快捷输入）不把 `-`/`=` 当导航。由 active 自判。
+    fn handle_candidate_nav(&self, state: &mut State, data: &KeyEventData) -> Option<KeyAction> {
+        let include_printable = matches!(
+            state.active,
+            Some(ModeKind::Special(_)) | Some(ModeKind::Mix(_)) | Some(ModeKind::TempPinyin)
+        );
+        self.apply_nav_key(state, data, include_printable)
+    }
+
     // ───────────────────────── 临时拼音 ─────────────────────────
 
     /// 触发键名 → VK（统一映射，见 `keymap`；不含 z，z 混合模式后置实现）
@@ -1045,14 +1088,17 @@ impl Coordinator {
 
     /// 临时拼音模式下的按键处理
     fn handle_temp_pinyin_key(&self, state: &mut State, data: &KeyEventData) -> KeyAction {
+        if let Some(act) = self.handle_candidate_nav(state, data) {
+            return act;
+        }
         match data.key_code {
-            0x1B => {
+            keymap::VK_ESCAPE => {
                 // Esc：退出
                 self.exit_temp_pinyin(state);
                 self.notify_ui_hide();
                 KeyAction::ClearComposition
             }
-            0x08 => {
+            keymap::VK_BACK => {
                 // Backspace：删字符，空则退出
                 if state.temp_pinyin_buffer.is_empty() {
                     self.exit_temp_pinyin(state);
@@ -1073,7 +1119,7 @@ impl Coordinator {
                     caret_pos: display.chars().count() as u32,
                 }
             }
-            0x20 | 0x0D => {
+            keymap::VK_SPACE | keymap::VK_RETURN => {
                 // Space/Enter：上屏高亮候选并退出
                 if !state.candidates.is_empty() {
                     let idx = self
@@ -1091,7 +1137,7 @@ impl Coordinator {
                     KeyAction::ClearComposition
                 }
             }
-            0x31..=0x39 if data.modifiers & MOD_SHIFT == 0 => {
+            keymap::VK_1..=keymap::VK_9 if data.modifiers & MOD_SHIFT == 0 => {
                 // 数字键选当前页第 N 个
                 let (start, end) = self.page_range(state);
                 let idx = start + (data.key_code - 0x31) as usize;
@@ -1106,7 +1152,7 @@ impl Coordinator {
                     KeyAction::Consumed
                 }
             }
-            0x41..=0x5A if data.modifiers & (MOD_CTRL | MOD_ALT) == 0 => {
+            keymap::VK_A..=keymap::VK_Z if data.modifiers & (MOD_CTRL | MOD_ALT) == 0 => {
                 // 字母累积拼音
                 let ch = (b'a' + (data.key_code - 0x41) as u8) as char;
                 state.temp_pinyin_buffer.push(ch);
@@ -1117,30 +1163,6 @@ impl Coordinator {
                     text: display.clone(),
                     caret_pos: display.chars().count() as u32,
                 }
-            }
-            0x26 | 0x28 => {
-                // 上/下方向键
-                let changed = if data.key_code == 0x26 {
-                    self.move_up(state)
-                } else {
-                    self.move_down(state)
-                };
-                if changed {
-                    self.notify_ui_update(state);
-                }
-                KeyAction::Consumed
-            }
-            0x21 | 0x22 => {
-                // 翻页
-                let changed = if data.key_code == 0x21 {
-                    self.page_prev(state)
-                } else {
-                    self.page_next(state)
-                };
-                if changed {
-                    self.notify_ui_update(state);
-                }
-                KeyAction::Consumed
             }
             _ => {
                 // 二三候选键
@@ -1217,7 +1239,7 @@ impl Coordinator {
         if !in_list {
             return false;
         }
-        // prev_char 为 UTF-16 单元，数字 '0'..='9' = 0x30..=0x39
+        // prev_char 为 UTF-16 单元（非 VK），数字 '0'..='9' = 0x30..=0x39
         (0x30..=0x39).contains(&prev_char)
     }
 
@@ -1483,13 +1505,17 @@ impl Coordinator {
 
     /// 快捷输入模式下的按键处理
     fn handle_quick_input_key(&self, state: &mut State, data: &KeyEventData) -> KeyAction {
+        // 表达式模式：`-`/`=` 是运算符输入，不当翻页（include_printable=false）。
+        if let Some(act) = self.apply_nav_key(state, data, false) {
+            return act;
+        }
         match data.key_code {
-            0x1B => {
+            keymap::VK_ESCAPE => {
                 self.exit_quick_input(state);
                 self.notify_ui_hide();
                 KeyAction::ClearComposition
             }
-            0x08 => {
+            keymap::VK_BACK => {
                 // 退格：空缓冲退出，否则删末字符（可退到仅前缀）
                 if state.quick_input_buffer.is_empty() {
                     self.exit_quick_input(state);
@@ -1505,7 +1531,7 @@ impl Coordinator {
                 }
                 self.quick_input_composition(state)
             }
-            0x20 => {
+            keymap::VK_SPACE => {
                 // 空格：上屏当前高亮候选；无候选则退出
                 if !state.candidates.is_empty() {
                     let idx = self
@@ -1521,7 +1547,7 @@ impl Coordinator {
                     KeyAction::ClearComposition
                 }
             }
-            0x0D => {
+            keymap::VK_RETURN => {
                 // 回车：上屏缓冲原文（空则上屏前缀字符）
                 let out = if state.quick_input_buffer.is_empty() {
                     state.quick_input_prefix.clone()
@@ -1536,29 +1562,7 @@ impl Coordinator {
                     Self::commit_action(out, true)
                 }
             }
-            0x26 | 0x28 => {
-                let changed = if data.key_code == 0x26 {
-                    self.move_up(state)
-                } else {
-                    self.move_down(state)
-                };
-                if changed {
-                    self.notify_ui_update(state);
-                }
-                KeyAction::Consumed
-            }
-            0x21 | 0x22 => {
-                let changed = if data.key_code == 0x21 {
-                    self.page_prev(state)
-                } else {
-                    self.page_next(state)
-                };
-                if changed {
-                    self.notify_ui_update(state);
-                }
-                KeyAction::Consumed
-            }
-            0x41..=0x5A if data.modifiers & (MOD_CTRL | MOD_ALT) == 0 => {
+            keymap::VK_A..=keymap::VK_Z if data.modifiers & (MOD_CTRL | MOD_ALT) == 0 => {
                 // 字母 a-z 按标签选当前页候选（a=第1个）
                 let (start, end) = self.page_range(state);
                 let idx = start + (data.key_code - 0x41) as usize;
@@ -1742,12 +1746,12 @@ impl Coordinator {
             caret_pos: buf.chars().count() as u32,
         };
         match data.key_code {
-            0x1B => {
+            keymap::VK_ESCAPE => {
                 // Esc：放弃退出（无上屏）
                 self.exit_url_mode(state);
                 KeyAction::ClearComposition
             }
-            0x08 => {
+            keymap::VK_BACK => {
                 // 退格：删尾字符；删空则退出
                 state.url_buffer.pop();
                 if state.url_buffer.is_empty() {
@@ -1757,7 +1761,7 @@ impl Coordinator {
                     comp(&state.url_buffer)
                 }
             }
-            0x20 | 0x0D => {
+            keymap::VK_SPACE | keymap::VK_RETURN => {
                 // 空格/回车：上屏当前缓冲原文（不做全半角/标点转换）
                 let text = state.url_buffer.clone();
                 self.exit_url_mode(state);
@@ -1892,14 +1896,17 @@ impl Coordinator {
 
     /// 特殊模式按键处理：编码累积 + 候选选择 + 三档自动上屏；空格选高亮、回车上屏编码原文。
     fn handle_special_key(&self, state: &mut State, data: &KeyEventData) -> KeyAction {
+        if let Some(act) = self.handle_candidate_nav(state, data) {
+            return act;
+        }
         match data.key_code {
-            0x1B => {
+            keymap::VK_ESCAPE => {
                 // Esc：放弃退出
                 self.exit_special_mode(state);
                 self.notify_ui_hide();
                 KeyAction::ClearComposition
             }
-            0x08 => {
+            keymap::VK_BACK => {
                 // 退格：删编码；空则退出。删除时不触发自动上屏。
                 state.special_buffer.pop();
                 if state.special_buffer.is_empty() {
@@ -1916,7 +1923,7 @@ impl Coordinator {
                     }
                 }
             }
-            0x20 => {
+            keymap::VK_SPACE => {
                 // 空格：有候选选高亮上屏；无候选退出
                 if !state.candidates.is_empty() {
                     let idx = self
@@ -1932,7 +1939,7 @@ impl Coordinator {
                     KeyAction::ClearComposition
                 }
             }
-            0x0D => {
+            keymap::VK_RETURN => {
                 // 回车：上屏编码原文
                 let text = state.special_buffer.clone();
                 self.exit_special_mode(state);
@@ -1943,7 +1950,7 @@ impl Coordinator {
                     Self::commit_action(text, true)
                 }
             }
-            0x31..=0x39 => {
+            keymap::VK_1..=keymap::VK_9 => {
                 // 数字 1-9 选当前页候选
                 let (start, end) = self.page_range(state);
                 let gi = start + (data.key_code - 0x31) as usize;
@@ -1956,7 +1963,7 @@ impl Coordinator {
                     KeyAction::Consumed
                 }
             }
-            0x41..=0x5A => {
+            keymap::VK_A..=keymap::VK_Z => {
                 // 字母：小写归一累积编码
                 let ch = (b'a' + (data.key_code - 0x41) as u8) as char;
                 state.special_buffer.push(ch);
@@ -1971,36 +1978,6 @@ impl Coordinator {
                     text: display.clone(),
                     caret_pos: display.chars().count() as u32,
                 }
-            }
-            0x26 | 0x28 => {
-                // 上/下：移动高亮
-                if state.candidates.is_empty() {
-                    return KeyAction::Consumed;
-                }
-                let changed = if data.key_code == 0x26 {
-                    self.move_up(state)
-                } else {
-                    self.move_down(state)
-                };
-                if changed {
-                    self.notify_ui_update(state);
-                }
-                KeyAction::Consumed
-            }
-            0x21 | 0x22 => {
-                // PageUp/PageDown：翻页
-                if state.candidates.is_empty() {
-                    return KeyAction::Consumed;
-                }
-                let changed = if data.key_code == 0x21 {
-                    self.page_prev(state)
-                } else {
-                    self.page_next(state)
-                };
-                if changed {
-                    self.notify_ui_update(state);
-                }
-                KeyAction::Consumed
             }
             _ => {
                 let shift = data.modifiers & MOD_SHIFT != 0;
@@ -2133,13 +2110,16 @@ impl Coordinator {
                 caret_pos: d.chars().count() as u32,
             }
         };
+        if let Some(act) = self.handle_candidate_nav(state, data) {
+            return act;
+        }
         match data.key_code {
-            0x1B => {
+            keymap::VK_ESCAPE => {
                 self.exit_mix_mode(state);
                 self.notify_ui_hide();
                 KeyAction::ClearComposition
             }
-            0x08 => {
+            keymap::VK_BACK => {
                 state.mix_buffer.pop();
                 if state.mix_buffer.is_empty() {
                     self.exit_mix_mode(state);
@@ -2149,7 +2129,7 @@ impl Coordinator {
                     refresh(self, state)
                 }
             }
-            0x20 => {
+            keymap::VK_SPACE => {
                 // 空格：上屏当前高亮候选；无候选则退出
                 if !state.candidates.is_empty() {
                     let idx = self
@@ -2165,7 +2145,7 @@ impl Coordinator {
                     KeyAction::ClearComposition
                 }
             }
-            0x0D => {
+            keymap::VK_RETURN => {
                 let text = state.mix_buffer.clone();
                 self.exit_mix_mode(state);
                 self.notify_ui_hide();
@@ -2175,7 +2155,7 @@ impl Coordinator {
                     Self::commit_action(text, true)
                 }
             }
-            0x31..=0x39 => {
+            keymap::VK_1..=keymap::VK_9 => {
                 let (start, end) = self.page_range(state);
                 let gi = start + (data.key_code - 0x31) as usize;
                 if gi < end {
@@ -2187,38 +2167,10 @@ impl Coordinator {
                     KeyAction::Consumed
                 }
             }
-            0x41..=0x5A => {
+            keymap::VK_A..=keymap::VK_Z => {
                 let ch = (b'a' + (data.key_code - 0x41) as u8) as char;
                 state.mix_buffer.push(ch);
                 refresh(self, state)
-            }
-            0x26 | 0x28 => {
-                if state.candidates.is_empty() {
-                    return KeyAction::Consumed;
-                }
-                let changed = if data.key_code == 0x26 {
-                    self.move_up(state)
-                } else {
-                    self.move_down(state)
-                };
-                if changed {
-                    self.notify_ui_update(state);
-                }
-                KeyAction::Consumed
-            }
-            0x21 | 0x22 => {
-                if state.candidates.is_empty() {
-                    return KeyAction::Consumed;
-                }
-                let changed = if data.key_code == 0x21 {
-                    self.page_prev(state)
-                } else {
-                    self.page_next(state)
-                };
-                if changed {
-                    self.notify_ui_update(state);
-                }
-                KeyAction::Consumed
             }
             _ => {
                 let shift = data.modifiers & MOD_SHIFT != 0;
@@ -2281,13 +2233,16 @@ impl Coordinator {
                 Self::commit_action(text, true)
             }
         };
+        if let Some(act) = self.handle_candidate_nav(state, data) {
+            return act;
+        }
         match data.key_code {
-            0x1B => {
+            keymap::VK_ESCAPE => {
                 self.exit_temp_english(state);
                 self.notify_ui_hide();
                 KeyAction::ClearComposition
             }
-            0x08 => {
+            keymap::VK_BACK => {
                 state.temp_english_buffer.pop();
                 if state.temp_english_buffer.is_empty() {
                     self.exit_temp_english(state);
@@ -2297,7 +2252,7 @@ impl Coordinator {
                     refresh(self, state)
                 }
             }
-            0x20 => {
+            keymap::VK_SPACE => {
                 // 空格：上屏当前高亮候选（首候选=原始输入）
                 let text = if !state.candidates.is_empty() {
                     let idx = self
@@ -2309,12 +2264,12 @@ impl Coordinator {
                 };
                 commit_text(self, state, text)
             }
-            0x0D => {
+            keymap::VK_RETURN => {
                 // 回车：上屏原始输入文本（不取候选）
                 let text = state.temp_english_buffer.clone();
                 commit_text(self, state, text)
             }
-            0x41..=0x5A => {
+            keymap::VK_A..=keymap::VK_Z => {
                 let shift = data.modifiers & MOD_SHIFT != 0;
                 let base = data.key_code - 0x41;
                 let ch = if shift {
@@ -2325,7 +2280,7 @@ impl Coordinator {
                 state.temp_english_buffer.push(ch);
                 refresh(self, state)
             }
-            0x31..=0x39 if data.modifiers & MOD_SHIFT == 0 => {
+            keymap::VK_1..=keymap::VK_9 if data.modifiers & MOD_SHIFT == 0 => {
                 // 数字：有词库候选（>1，即除原文外还有匹配）时按页选词；否则作输入（英文含数字 v2）
                 let (start, end) = self.page_range(state);
                 let gi = start + (data.key_code - 0x31) as usize;
@@ -2341,35 +2296,6 @@ impl Coordinator {
             0x30 if data.modifiers & MOD_SHIFT == 0 => {
                 state.temp_english_buffer.push('0');
                 refresh(self, state)
-            }
-            0x26 | 0x28 => {
-                // 上/下：移动高亮
-                if state.candidates.is_empty() {
-                    return KeyAction::Consumed;
-                }
-                let changed = if data.key_code == 0x26 {
-                    self.move_up(state)
-                } else {
-                    self.move_down(state)
-                };
-                if changed {
-                    self.notify_ui_update(state);
-                }
-                KeyAction::Consumed
-            }
-            0x21 | 0x22 => {
-                if state.candidates.is_empty() {
-                    return KeyAction::Consumed;
-                }
-                let changed = if data.key_code == 0x21 {
-                    self.page_prev(state)
-                } else {
-                    self.page_next(state)
-                };
-                if changed {
-                    self.notify_ui_update(state);
-                }
-                KeyAction::Consumed
             }
             _ => {
                 // 其它（标点等）：上屏当前高亮候选 + 转换后标点，退出
@@ -2977,7 +2903,13 @@ impl Coordinator {
         }
         match key_code {
             // 方向键/回车/空格/ESC → 菜单窗口处理（导航/下钻/返回/激活/关闭）
-            0x26 | 0x28 | 0x25 | 0x27 | 0x0D | 0x20 | 0x1B => {
+            0x26
+            | 0x28
+            | 0x25
+            | 0x27
+            | keymap::VK_RETURN
+            | keymap::VK_SPACE
+            | keymap::VK_ESCAPE => {
                 let _ = self.ui_tx.send(UiCommand::MenuKey(key_code));
             }
             // 其它键：关闭菜单并吞掉
@@ -3421,7 +3353,7 @@ impl Coordinator {
             && self.config.input.shift_temp_english.enabled
             && data.modifiers & MOD_SHIFT != 0
             && data.modifiers & (MOD_CTRL | MOD_ALT) == 0
-            && (0x41..=0x5A).contains(&data.key_code)
+            && (keymap::VK_A..=keymap::VK_Z).contains(&data.key_code)
         {
             let ch = (b'A' + (data.key_code - 0x41) as u8) as char; // 首字母大写
             state.active = Some(ModeKind::TempEnglish);
@@ -3636,7 +3568,7 @@ impl MessageHandler for Coordinator {
         // 统一夺取回退：夺取式模式（URL/后续 z 临拼）中，退到夺取边界再按退格 →
         // 撤销夺取、把快照回放回正常码表输入流（而非停在无候选的独占模式）。
         // 须先于下方单点分派，否则退格会被模式处理器按普通删字符消费。
-        if data.key_code == 0x08 && self.can_rewind(&state) {
+        if data.key_code == keymap::VK_BACK && self.can_rewind(&state) {
             return self.rewind_hijack(&mut state);
         }
 
@@ -3687,15 +3619,21 @@ impl MessageHandler for Coordinator {
             data.key_code, data.modifiers, state.chinese_mode, state.input_buffer
         );
 
+        // 候选翻页/高亮：配置驱动统一处理（普通模式为码表型，`-`/`=` 可作翻页）。
+        // 仅有候选时生效；无候选时下方 match 的回退臂负责透传方向/翻页键。
+        if let Some(act) = self.apply_nav_key(&mut state, data, true) {
+            return act;
+        }
+
         match data.key_code {
-            0x1B => {
+            keymap::VK_ESCAPE => {
                 // Escape
                 state.input_buffer.clear();
                 state.candidates.clear();
                 self.notify_ui_hide();
                 KeyAction::ClearComposition
             }
-            0x08 => {
+            keymap::VK_BACK => {
                 // Backspace
                 if !state.input_buffer.is_empty() {
                     state.input_buffer.pop();
@@ -3715,7 +3653,7 @@ impl MessageHandler for Coordinator {
                     KeyAction::PassThrough
                 }
             }
-            0x20 => {
+            keymap::VK_SPACE => {
                 // Space：选当前高亮候选 / 上屏编码
                 if !state.candidates.is_empty() {
                     let idx = self
@@ -3735,7 +3673,7 @@ impl MessageHandler for Coordinator {
                     KeyAction::PassThrough
                 }
             }
-            0x0D => {
+            keymap::VK_RETURN => {
                 // Enter：上屏原始编码
                 if !state.input_buffer.is_empty() {
                     let text = state.input_buffer.clone();
@@ -3747,7 +3685,7 @@ impl MessageHandler for Coordinator {
                     KeyAction::PassThrough
                 }
             }
-            0x31..=0x39 if data.modifiers & MOD_SHIFT == 0 => {
+            keymap::VK_1..=keymap::VK_9 if data.modifiers & MOD_SHIFT == 0 => {
                 // 数字键 1-9 选当前页第 N 个候选（Shift+数字走标点分支）
                 let (start, end) = self.page_range(&state);
                 let in_page = (data.key_code - 0x31) as usize;
@@ -3761,7 +3699,7 @@ impl MessageHandler for Coordinator {
                     let mut text = state.input_buffer.clone();
                     state.input_buffer.clear();
                     state.candidates.clear();
-                    // 数字键 vk 0x31..=0x39 即 ASCII '1'..='9'
+                    // 数字键 vk keymap::VK_1..=keymap::VK_9 即 ASCII '1'..='9'
                     text.push(data.key_code as u8 as char);
                     self.notify_ui_hide();
                     Self::commit_action(text, true)
@@ -3769,7 +3707,7 @@ impl MessageHandler for Coordinator {
                     KeyAction::PassThrough
                 }
             }
-            0x41..=0x5A => {
+            keymap::VK_A..=keymap::VK_Z => {
                 // A-Z 字母累积
                 let ch = (b'a' + (data.key_code - 0x41) as u8) as char;
                 state.input_buffer.push(ch);
@@ -3818,55 +3756,14 @@ impl MessageHandler for Coordinator {
                     caret_pos: state.input_buffer.len() as u32,
                 }
             }
-            0x26 | 0x28 => {
-                // 上/下方向键：移动高亮（跨页回卷）
-                if state.candidates.is_empty() {
-                    return if state.input_buffer.is_empty() {
-                        KeyAction::PassThrough
-                    } else {
-                        KeyAction::Consumed
-                    };
-                }
-                let changed = if data.key_code == 0x26 {
-                    self.move_up(&mut state)
+            keymap::VK_UP | keymap::VK_DOWN | keymap::VK_PRIOR | keymap::VK_NEXT => {
+                // 方向/翻页键回退臂：有候选时翻页/高亮已由上面的 apply_nav_key（配置驱动）处理，
+                // 这里只剩"无候选"情形——无组合则透传给应用，有组合则消费。
+                if state.input_buffer.is_empty() {
+                    KeyAction::PassThrough
                 } else {
-                    self.move_down(&mut state)
-                };
-                if changed {
-                    self.notify_ui_update(&state);
+                    KeyAction::Consumed
                 }
-                KeyAction::Consumed
-            }
-            0x21 | 0x22 => {
-                // PageUp / PageDown：翻页
-                if state.candidates.is_empty() {
-                    return if state.input_buffer.is_empty() {
-                        KeyAction::PassThrough
-                    } else {
-                        KeyAction::Consumed
-                    };
-                }
-                let changed = if data.key_code == 0x21 {
-                    self.page_prev(&mut state)
-                } else {
-                    self.page_next(&mut state)
-                };
-                if changed {
-                    self.notify_ui_update(&state);
-                }
-                KeyAction::Consumed
-            }
-            0xBD | 0xBB if !state.candidates.is_empty() && data.modifiers & MOD_SHIFT == 0 => {
-                // '-' / '=' 翻页（仅有候选且无 Shift 时；否则落入标点分支）
-                let changed = if data.key_code == 0xBD {
-                    self.page_prev(&mut state)
-                } else {
-                    self.page_next(&mut state)
-                };
-                if changed {
-                    self.notify_ui_update(&state);
-                }
-                KeyAction::Consumed
             }
             _ => {
                 let shift = data.modifiers & MOD_SHIFT != 0;
@@ -4151,17 +4048,17 @@ impl MessageHandler for Coordinator {
         if state.input_buffer.is_empty() {
             return None;
         }
-        let tk = data.trigger_key;
-        let text = if tk == 0x20 {
+        let tk = data.trigger_key as u32; // 协议为 u16，统一按 VK(u32) 比对
+        let text = if tk == keymap::VK_SPACE {
             if !state.candidates.is_empty() {
                 state.candidates[0].text.clone()
             } else {
                 state.input_buffer.clone()
             }
-        } else if tk == 0x0D {
+        } else if tk == keymap::VK_RETURN {
             state.input_buffer.clone()
-        } else if (0x31..=0x39).contains(&tk) {
-            let idx = (tk - 0x31) as usize;
+        } else if (keymap::VK_1..=keymap::VK_9).contains(&tk) {
+            let idx = (tk - keymap::VK_1) as usize;
             if idx < state.candidates.len() {
                 state.candidates[idx].text.clone()
             } else {
