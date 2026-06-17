@@ -626,11 +626,22 @@ impl Coordinator {
             return;
         }
         let schema = self.engine_mgr.active_schema_id();
+        let input_len = code.len();
         let counts: std::collections::HashMap<String, u32> = candidates
             .iter()
-            .filter_map(|c| match store.get_freq(&schema, code, &c.text) {
-                Ok(Some(r)) if r.count > 0 => Some((c.text.clone(), r.count)),
-                _ => None,
+            .filter_map(|c| {
+                // 仅"消费整串"的候选按当前输入码计词频。分段子候选（consumed_length < 整串，
+                // 如「nihao」里的「你」只消费「ni」）的词频归属其自身前缀码，不能被整串码
+                // 的历史计数上浮——否则单字会浮到整句「你好」之上。consumed_length==0 表示
+                // 引擎未标注（码表型），视为整串匹配。
+                let consumes_all = c.consumed_length == 0 || c.consumed_length >= input_len;
+                if !consumes_all {
+                    return None;
+                }
+                match store.get_freq(&schema, code, &c.text) {
+                    Ok(Some(r)) if r.count > 0 => Some((c.text.clone(), r.count)),
+                    _ => None,
+                }
             })
             .collect();
         if counts.is_empty() {

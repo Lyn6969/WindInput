@@ -94,18 +94,22 @@ fn test_pinyin_engine_candidates() {
 
     let result = mgr.convert("nihao", 9);
     assert!(!result.candidates.is_empty(), "拼音 'nihao' 应产出候选");
+    let top10: Vec<&str> = result
+        .candidates
+        .iter()
+        .take(10)
+        .map(|c| c.text.as_str())
+        .collect();
+    // 整句应在首位（SENTENCE_WEIGHT_BASE 置顶）。
+    assert_eq!(result.candidates[0].text, "你好", "首候选应为 你好，实际: {top10:?}");
+    // 前缀子候选「你」应存在并标注只消费「ni」（分段上屏）。
+    let ni = result.candidates.iter().find(|c| c.text == "你");
+    assert!(ni.is_some(), "应包含前缀候选 你，实际: {top10:?}");
+    assert_eq!(ni.unwrap().consumed_length, 2, "你 应只消费 ni 两字节");
+    // 非前缀子串「好」（来自 hao 段）不应作为 nihao 的直接候选出现。
     assert!(
-        result
-            .candidates
-            .iter()
-            .any(|c| c.text.contains("你好") || c.text == "你好"),
-        "应包含 你好，实际: {:?}",
-        result
-            .candidates
-            .iter()
-            .take(10)
-            .map(|c| c.text.as_str())
-            .collect::<Vec<_>>()
+        !result.candidates.iter().any(|c| c.text == "好"),
+        "不应包含非前缀子候选 好，实际: {top10:?}"
     );
 }
 

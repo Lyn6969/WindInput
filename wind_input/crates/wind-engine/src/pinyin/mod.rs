@@ -200,17 +200,17 @@ impl Engine for PinyinEngine {
             }
         }
 
-        // 3. DAG 子短语查找
+        // 3. DAG 前缀子短语查找（仅 start==0）：给出输入的各级前缀词，供从左到右分段上屏
+        //    （「nihao」→「你」「你好」）。不取中段/后段子串（如「hao」→「好」）——非前缀词
+        //    应在前缀提交后、剩余拼音重转时才出现，否则会污染整串候选并破坏分段语义。
         if syllables.len() >= 2 {
-            for start in 0..syllables.len() {
-                for end in (start + 1)..=syllables.len().min(start + 6) {
-                    let code: String = syllables[start..end].join("");
-                    if code == input {
-                        continue;
-                    }
-                    for (text, weight, order) in dict.search(&code) {
-                        push_unique(&mut candidates, text, code.clone(), weight, order);
-                    }
+            for end in 1..syllables.len().min(6) {
+                let code: String = syllables[..end].join("");
+                if code == input {
+                    continue;
+                }
+                for (text, weight, order) in dict.search(&code) {
+                    push_unique(&mut candidates, text, code.clone(), weight, order);
                 }
             }
         }
