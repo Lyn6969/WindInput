@@ -1251,6 +1251,14 @@ impl Coordinator {
         if !self.smart_symbol_participates(&cn) {
             return None;
         }
+        // 与自动配对互斥：被配对的符号（单字符且在配对表）不武装智能符号。否则 press1 插入配对
+        // 并回退光标至中间，press2 时 prevChar 恰为配对左符号 → 误删左符号改英文、留下中文右符号。
+        if cn.chars().count() == 1 {
+            let c0 = cn.chars().next().unwrap();
+            if self.is_auto_pair_char(state, c0) {
+                return None;
+            }
+        }
         Some(cn)
     }
 
@@ -2256,6 +2264,15 @@ impl Coordinator {
             return Some(&self.en_pairs);
         }
         None
+    }
+
+    /// 判断标点字符 `ch` 是否参与当前生效的自动配对（作为左符号或右符号）。
+    /// 智能符号与自动配对互斥的判定依据（见 `smart_symbol_arm_str`）。
+    fn is_auto_pair_char(&self, state: &State, ch: char) -> bool {
+        match self.active_pairs(state.chinese_punct) {
+            Some(pairs) => pairs.iter().any(|(l, r)| *l == ch || *r == ch),
+            None => false,
+        }
     }
 
     /// 工具栏单元格点击：复用菜单命令切换状态（内部已推送 C++），再刷新工具栏显示。
