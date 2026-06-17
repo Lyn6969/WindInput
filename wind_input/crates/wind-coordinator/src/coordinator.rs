@@ -2330,9 +2330,46 @@ impl Coordinator {
         }
     }
 
+    /// 复位三种独占输入模式（临时英文/临时拼音/快捷输入）的状态。仅清空，不负责上屏；
+    /// 调用方需在调用前取出待上屏文本（如模式切换时的临时英文缓冲）。
+    fn reset_exclusive_modes(&self, state: &mut State) {
+        let dirty = state.temp_english_mode || state.temp_pinyin_mode || state.quick_input_mode;
+        state.temp_english_mode = false;
+        state.temp_english_buffer.clear();
+        state.temp_pinyin_mode = false;
+        state.temp_pinyin_buffer.clear();
+        state.temp_pinyin_prefix.clear();
+        state.quick_input_mode = false;
+        state.quick_input_buffer.clear();
+        state.quick_input_prefix.clear();
+        // 清理可能残留的组合显示（临时拼音/快捷输入会产生候选与 preedit）
+        state.input_buffer.clear();
+        state.candidates.clear();
+        state.preedit.clear();
+        if dirty {
+            debug!("reset_exclusive_modes: cleared residual exclusive input mode state");
+        }
+    }
+
     /// 切换中英文时取消当前输入：清空缓冲/候选/preedit，并按 `hotkeys.commit_on_switch`
     /// 决定是否把已输入的原始编码上屏（仅在切到英文且有待输入时）。返回待上屏文本。
     fn take_input_on_mode_switch(&self, state: &mut State, chinese: bool) -> String {
+        // 独占模式优先：临时英文残留按“模式切换上屏”语义提交，临时拼音/快捷输入丢弃。
+        // 独占模式下 input_buffer 必为空，与下方普通组合分支互斥，故在此提前返回。
+        if state.temp_english_mode || state.temp_pinyin_mode || state.quick_input_mode {
+            let text = if state.temp_english_mode && !state.temp_english_buffer.is_empty() {
+                if state.full_width {
+                    to_full_width(&state.temp_english_buffer)
+                } else {
+                    state.temp_english_buffer.clone()
+                }
+            } else {
+                String::new()
+            };
+            self.reset_exclusive_modes(state);
+            self.notify_ui_hide();
+            return text;
+        }
         let commit =
             !state.input_buffer.is_empty() && !chinese && self.config.hotkeys.commit_on_switch;
         let text = if commit {
@@ -2784,6 +2821,7 @@ impl MessageHandler for Coordinator {
             s.preedit.clear();
             s.candidates.clear();
             s.menu_open = false; // 复位菜单态，否则下一个键被 forward_menu_key 吞掉
+            self.reset_exclusive_modes(&mut s); // 失焦丢弃临时英文/拼音/快捷输入残留
         }
         self.notify_toolbar(); // 隐藏工具栏（防抖）
         self.notify_ui_hide(); // 隐藏候选窗 + 弹出菜单（HideCandidates 连带关菜单）
@@ -2816,6 +2854,7 @@ impl MessageHandler for Coordinator {
             s.preedit.clear();
             s.candidates.clear();
             s.menu_open = false;
+            self.reset_exclusive_modes(&mut s); // 切走本输入法时丢弃独占模式残留
         }
         self.notify_toolbar(); // 非激活态 → notify_toolbar 内部下发 HideToolbar
         self.notify_ui_hide(); // 隐藏候选窗 + 弹出菜单
@@ -2829,6 +2868,7 @@ impl MessageHandler for Coordinator {
         if clear_input {
             state.input_buffer.clear();
             state.candidates.clear();
+            self.reset_exclusive_modes(&mut state); // 系统模式切换时丢弃独占模式残留
         }
     }
 
