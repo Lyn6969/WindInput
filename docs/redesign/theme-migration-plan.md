@@ -73,10 +73,17 @@ Default/load_resolved、RvNode 加 bg_shape（序号圆形）。windows-gnu 交�
 - **T4b ✅**（提交 `b2abb2f`）：z 层覆盖图。`View.layers` + ViewLayer；paint 按 z<0/z>=0 分两段；
   `paint_layer` 按 anchor 九宫定位 + offset（dp + 百分比）+ size + opacity，stretch 后 Pattern 绘制。
   接到 window 节点（jidian 右下角 mark 水印）。
-- **T4c 待做**：footer SVG tint 箭头。`_base` 的翻页箭头是 `chevron_prev/next.svg` + tint（**所有主题**
-  都用），现仍渲染文字 `‹ ›`。需给 wind-ui 加 resvg 依赖 + SVG 栅格化 + tint（图当 alpha mask 填 tint 色）；
-  ViewImage 加 tint；footer 用图标节点替代文字箭头（prev/next_image 存在时）。
+- **T4c ✅**（提交 `b0cb683`）：footer SVG tint 箭头。wind-ui 加 resvg；image_cache 支持 SVG 栅格化 +
+  tint（图当 alpha mask 填色）；ViewImage 加 tint；footer 用 SVG 图标节点（启用→tint、禁用→
+  disabled_tint），无图回退文字。**资产链解析**：wind-theme resolve 暴露 asset_dirs（self+base 链，
+  theme_chain_dirs）；wind-ui asset_path 按 resources→data/绝对→asset_dirs 搜字面文件——_base 的 chevron
+  字面 ref 在 base 目录可被派生主题找到。
+**T4 全部完成**：背景图（九宫格/拉伸/平铺/center）+ z 层 layers + footer SVG tint 箭头。
 **部署便利**：jidian-classic 已拷入 data/themes + build_debug/data/themes（gitignore 不入库）供测试。
+
+## 剩余清理（非阻塞）
+- 旧 `resolved.rs`(ResolvedTheme/ThemeManager) 删除（仅自身测试引用，wind-ui 已全切到 Resolved/RvNode）。
+- 仍未做的渲染细节：真圆序号（现药丸近似）、竖排/多列布局、状态几何（刻意不做）。
 
 ### T5：其它窗口走 RVNode（status/tooltip/menu/toast/toolbar）
 **目标**：other_views 等价——各窗口注入自己 palette 语义色，复用 RvNode 解析 + 图片管线。
