@@ -539,7 +539,9 @@ impl EngineManager {
             return if dtype(e) == "rime_pinyin" {
                 Self::load_rime_pinyin_dict(&full)
             } else {
-                match CachedDict::load_at(&full, &cache_path(&full, "wdb")) {
+                // 英文词库：code 列小写化（大小写不敏感前缀匹配，text 保留原样）。
+                let lowercase = dtype(e) == "english";
+                match CachedDict::load_at_with(&full, &cache_path(&full, "wdb"), lowercase) {
                     Ok(d) => {
                         info!("Dictionary loaded: {} entries", d.len());
                         Some(d)

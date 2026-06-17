@@ -126,13 +126,25 @@ impl DictReader {
             anyhow::bail!(
                 "wdb index section out of range: index_end={} > file_len={} \
                  (key_count={}, index_off={}). File may be from an incompatible format",
-                index_end, file_len, key_count, index_off
+                index_end,
+                file_len,
+                key_count,
+                index_off
             );
         }
 
-        info!("Opened wdb: {} ({} keys, v{})", path.display(), key_count, version);
+        info!(
+            "Opened wdb: {} ({} keys, v{})",
+            path.display(),
+            key_count,
+            version
+        );
 
-        Ok(Self { mmap, header, entry_size })
+        Ok(Self {
+            mmap,
+            header,
+            entry_size,
+        })
     }
 
     fn data(&self) -> &[u8] {
@@ -142,7 +154,9 @@ impl DictReader {
     fn read_string(&self, off: u32, len: u16) -> &str {
         let start = self.header.str_off as usize + off as usize;
         let end = start + len as usize;
-        if end > self.data().len() { return ""; }
+        if end > self.data().len() {
+            return "";
+        }
         std::str::from_utf8(&self.data()[start..end]).unwrap_or("")
     }
 
@@ -158,7 +172,9 @@ impl DictReader {
         let base = self.header.data_off as usize + entry_off as usize;
         let offset = base + (entry_idx as usize) * self.entry_size;
         let buf = &self.data()[offset..];
-        if buf.len() < self.entry_size { return None; }
+        if buf.len() < self.entry_size {
+            return None;
+        }
 
         let text_off = u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]);
         let text_len = u16::from_le_bytes([buf[4], buf[5]]);
@@ -171,13 +187,19 @@ impl DictReader {
         };
 
         let text = self.read_string(text_off, text_len).to_string();
-        Some(EntryRecord { text, weight, order })
+        Some(EntryRecord {
+            text,
+            weight,
+            order,
+        })
     }
 
     /// 精确查找：二分搜索键索引
     pub fn search(&self, code: &str) -> Vec<DictEntry> {
         let key_count = self.header.key_count;
-        if key_count == 0 { return Vec::new(); }
+        if key_count == 0 {
+            return Vec::new();
+        }
 
         let mut lo = 0u32;
         let mut hi = key_count;
@@ -186,8 +208,14 @@ impl DictReader {
             let mid = lo + (hi - lo) / 2;
             if let Some(idx) = self.read_key_index(mid) {
                 let mid_code = self.read_string(idx.code_off, idx.code_len);
-                if mid_code < code { lo = mid + 1; } else { hi = mid; }
-            } else { break; }
+                if mid_code < code {
+                    lo = mid + 1;
+                } else {
+                    hi = mid;
+                }
+            } else {
+                break;
+            }
         }
 
         if lo < key_count {
@@ -204,7 +232,9 @@ impl DictReader {
     /// 前缀查找
     pub fn search_prefix(&self, prefix: &str, limit: usize) -> Vec<DictEntry> {
         let key_count = self.header.key_count;
-        if key_count == 0 { return Vec::new(); }
+        if key_count == 0 {
+            return Vec::new();
+        }
 
         let mut lo = 0u32;
         let mut hi = key_count;
@@ -212,8 +242,14 @@ impl DictReader {
             let mid = lo + (hi - lo) / 2;
             if let Some(idx) = self.read_key_index(mid) {
                 let mid_code = self.read_string(idx.code_off, idx.code_len);
-                if mid_code < prefix { lo = mid + 1; } else { hi = mid; }
-            } else { break; }
+                if mid_code < prefix {
+                    lo = mid + 1;
+                } else {
+                    hi = mid;
+                }
+            } else {
+                break;
+            }
         }
 
         let mut results = Vec::new();
@@ -221,7 +257,9 @@ impl DictReader {
         while i < key_count && results.len() < limit {
             if let Some(idx) = self.read_key_index(i) {
                 let code = self.read_string(idx.code_off, idx.code_len);
-                if !code.starts_with(prefix) { break; }
+                if !code.starts_with(prefix) {
+                    break;
+                }
                 results.extend(self.collect_entries(&idx, code));
             }
             i += 1;
@@ -247,7 +285,9 @@ impl DictReader {
         entries
     }
 
-    pub fn key_count(&self) -> u32 { self.header.key_count }
+    pub fn key_count(&self) -> u32 {
+        self.header.key_count
+    }
 }
 
 /// 二进制词典写入器（用于将 rime dict.yaml 转换为 .wdb）
@@ -268,7 +308,9 @@ impl DictWriter {
     }
 
     /// 从键数估算文件大小
-    pub fn key_count(&self) -> usize { self.keys.len() }
+    pub fn key_count(&self) -> usize {
+        self.keys.len()
+    }
 
     /// 写入 wdb 文件
     pub fn write(&self, path: impl AsRef<Path>) -> anyhow::Result<()> {
@@ -280,10 +322,16 @@ impl DictWriter {
 
         // 构建字符串池
         let mut string_pool = Vec::new();
-        let mut string_offsets: std::collections::HashMap<String, u32> = std::collections::HashMap::new();
+        let mut string_offsets: std::collections::HashMap<String, u32> =
+            std::collections::HashMap::new();
 
-        let get_string_offset = |pool: &mut Vec<u8>, offsets: &mut std::collections::HashMap<String, u32>, s: &str| -> u32 {
-            if let Some(&off) = offsets.get(s) { return off; }
+        let get_string_offset = |pool: &mut Vec<u8>,
+                                 offsets: &mut std::collections::HashMap<String, u32>,
+                                 s: &str|
+         -> u32 {
+            if let Some(&off) = offsets.get(s) {
+                return off;
+            }
             let off = pool.len() as u32;
             pool.extend_from_slice(s.as_bytes());
             offsets.insert(s.to_string(), off);
@@ -371,8 +419,12 @@ impl DictWriter {
         // StringPool
         file.write_all(&string_pool)?;
 
-        info!("Wrote wdb: {} keys, {} entries, {} bytes string pool",
-            sorted_keys.len(), total_entries, string_pool.len());
+        info!(
+            "Wrote wdb: {} keys, {} entries, {} bytes string pool",
+            sorted_keys.len(),
+            total_entries,
+            string_pool.len()
+        );
 
         Ok(())
     }
@@ -392,8 +444,14 @@ mod tests {
 
         let mut writer = DictWriter::new();
         // 故意让第一个 key 有 2 条，使后续 key 的 entry_off > 0（暴露 off-by-size bug）
-        writer.add("a".to_string(), vec![("工".to_string(), 9999), ("戈".to_string(), 100)]);
-        writer.add("ni".to_string(), vec![("你".to_string(), 800), ("尼".to_string(), 50)]);
+        writer.add(
+            "a".to_string(),
+            vec![("工".to_string(), 9999), ("戈".to_string(), 100)],
+        );
+        writer.add(
+            "ni".to_string(),
+            vec![("你".to_string(), 800), ("尼".to_string(), 50)],
+        );
         writer.add("nihao".to_string(), vec![("你好".to_string(), 1200)]);
         writer.add("zhongguo".to_string(), vec![("中国".to_string(), 2000)]);
         writer.write(&tmp).expect("write wdb");

@@ -52,8 +52,18 @@ impl UnigramReader {
         if index_end > mmap.len() || str_off as usize > mmap.len() {
             anyhow::bail!("unigram.wdb offsets out of range");
         }
-        info!("Opened unigram.wdb: {} ({} keys)", path.display(), key_count);
-        Ok(Self { mmap, key_count, index_off, str_off, min_prob })
+        info!(
+            "Opened unigram.wdb: {} ({} keys)",
+            path.display(),
+            key_count
+        );
+        Ok(Self {
+            mmap,
+            key_count,
+            index_off,
+            str_off,
+            min_prob,
+        })
     }
 
     pub fn key_count(&self) -> u32 {
@@ -104,10 +114,7 @@ impl UnigramReader {
 
 /// 从 (词, 频次) 列表构建 unigram.wdb。
 /// log_prob = ln(freq/total)；OOV min_prob = ln(0.5/total)。
-pub fn write_unigram_wdb(
-    path: impl AsRef<Path>,
-    freqs: &[(String, f64)],
-) -> anyhow::Result<()> {
+pub fn write_unigram_wdb(path: impl AsRef<Path>, freqs: &[(String, f64)]) -> anyhow::Result<()> {
     use std::io::Write;
 
     let total: f64 = freqs.iter().map(|(_, f)| *f).sum();

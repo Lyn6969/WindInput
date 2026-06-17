@@ -30,11 +30,25 @@ impl CachedDict {
     /// 加载词典，使用指定的 .wdb 缓存路径（缓存可与源分离，如放
     /// `%LOCALAPPDATA%\WindInput\cache`，避免写入只读的安装目录）。
     pub fn load_at(yaml_path: &Path, wdb_path: &Path) -> anyhow::Result<Self> {
+        Self::load_at_with(yaml_path, wdb_path, false)
+    }
+
+    /// 同 [`load_at`]，`lowercase_code=true` 时把 code 列小写化（英文词库）。
+    /// 缓存命中时直接 mmap（缓存内已是小写码）；缓存重建时用 `load_lowercased`。
+    pub fn load_at_with(
+        yaml_path: &Path,
+        wdb_path: &Path,
+        lowercase_code: bool,
+    ) -> anyhow::Result<Self> {
         // 检查缓存是否有效
         if Self::cache_is_valid(yaml_path, wdb_path) {
             match DictReader::open(wdb_path) {
                 Ok(reader) => {
-                    info!("Using mmap cache: {} ({} keys)", wdb_path.display(), reader.key_count());
+                    info!(
+                        "Using mmap cache: {} ({} keys)",
+                        wdb_path.display(),
+                        reader.key_count()
+                    );
                     return Ok(Self::Mmap(reader));
                 }
                 Err(e) => {
@@ -44,8 +58,16 @@ impl CachedDict {
         }
 
         // 加载 yaml
-        let dict = CodetableDict::load(yaml_path)?;
-        info!("Loaded yaml: {} ({} entries)", yaml_path.display(), dict.len());
+        let dict = if lowercase_code {
+            CodetableDict::load_lowercased(yaml_path)?
+        } else {
+            CodetableDict::load(yaml_path)?
+        };
+        info!(
+            "Loaded yaml: {} ({} entries)",
+            yaml_path.display(),
+            dict.len()
+        );
 
         // 确保缓存目录存在后写入 .wdb 缓存
         if let Some(parent) = wdb_path.parent() {
@@ -59,7 +81,11 @@ impl CachedDict {
         // 用 mmap 重新打开缓存
         match DictReader::open(wdb_path) {
             Ok(reader) => {
-                info!("Using mmap cache: {} ({} keys)", wdb_path.display(), reader.key_count());
+                info!(
+                    "Using mmap cache: {} ({} keys)",
+                    wdb_path.display(),
+                    reader.key_count()
+                );
                 Ok(Self::Mmap(reader))
             }
             Err(e) => {
@@ -71,7 +97,9 @@ impl CachedDict {
 
     /// 检查缓存是否有效（存在且比源文件新）
     fn cache_is_valid(yaml_path: &Path, wdb_path: &Path) -> bool {
-        if !wdb_path.exists() { return false; }
+        if !wdb_path.exists() {
+            return false;
+        }
 
         let yaml_mtime = match std::fs::metadata(yaml_path) {
             Ok(m) => m.modified().ok(),
@@ -100,18 +128,22 @@ impl CachedDict {
         }
 
         writer.write(wdb_path)?;
-        info!("Wrote .wdb cache: {} ({} keys)", wdb_path.display(), writer.key_count());
+        info!(
+            "Wrote .wdb cache: {} ({} keys)",
+            wdb_path.display(),
+            writer.key_count()
+        );
         Ok(())
     }
 
     /// 精确查找
     pub fn search(&self, code: &str) -> Vec<(String, i32, i32)> {
         match self {
-            Self::Mmap(reader) => {
-                reader.search(code).into_iter()
-                    .map(|e| (e.text, e.weight, e.order))
-                    .collect()
-            }
+            Self::Mmap(reader) => reader
+                .search(code)
+                .into_iter()
+                .map(|e| (e.text, e.weight, e.order))
+                .collect(),
             Self::Memory(dict) => dict.search(code),
         }
     }
@@ -119,11 +151,11 @@ impl CachedDict {
     /// 前缀查找
     pub fn search_prefix(&self, prefix: &str, limit: usize) -> Vec<(String, String, i32, i32)> {
         match self {
-            Self::Mmap(reader) => {
-                reader.search_prefix(prefix, limit).into_iter()
-                    .map(|e| (e.code, e.text, e.weight, e.order))
-                    .collect()
-            }
+            Self::Mmap(reader) => reader
+                .search_prefix(prefix, limit)
+                .into_iter()
+                .map(|e| (e.code, e.text, e.weight, e.order))
+                .collect(),
             Self::Memory(dict) => dict.search_prefix(prefix, limit),
         }
     }
@@ -136,5 +168,7 @@ impl CachedDict {
         }
     }
 
-    pub fn is_empty(&self) -> bool { self.len() == 0 }
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
 }

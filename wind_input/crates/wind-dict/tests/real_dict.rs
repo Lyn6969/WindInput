@@ -10,8 +10,7 @@ use wind_dict::cached::CachedDict;
 
 /// 仓库内 build_debug 数据目录（相对 crate manifest 向上两级）
 fn data_schemas() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("../../build_debug/data/schemas")
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../build_debug/data/schemas")
 }
 
 #[test]
@@ -36,7 +35,10 @@ fn test_real_wubi_candidates() {
     // 非首 key（验证 entry_off 字节偏移修复）
     let aaaa = dict.search("aaaa");
     assert!(!aaaa.is_empty(), "'aaaa' 应有候选");
-    assert!(aaaa.iter().any(|(t, _, _)| t == "恭恭敬敬"), "'aaaa' 应包含 恭恭敬敬");
+    assert!(
+        aaaa.iter().any(|(t, _, _)| t == "恭恭敬敬"),
+        "'aaaa' 应包含 恭恭敬敬"
+    );
 
     // 前缀查找
     let prefix = dict.search_prefix("aa", 20);

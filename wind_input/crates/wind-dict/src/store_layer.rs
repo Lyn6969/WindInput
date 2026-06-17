@@ -5,7 +5,7 @@
 
 use crate::layer::{DictLayer, LayerType};
 use std::sync::Arc;
-use wind_candidate::{better, Candidate};
+use wind_candidate::{Candidate, better};
 use wind_store::Store;
 use wind_store::user_words::UserWordRecord;
 
@@ -67,7 +67,10 @@ impl DictLayer for StoreUserLayer {
             .store
             .get_user_words(&self.schema_id, code)
             .unwrap_or_default();
-        let cands = recs.into_iter().map(|r| record_to_candidate(r, false)).collect();
+        let cands = recs
+            .into_iter()
+            .map(|r| record_to_candidate(r, false))
+            .collect();
         sort_trunc(cands, limit)
     }
 
@@ -76,7 +79,10 @@ impl DictLayer for StoreUserLayer {
             .store
             .search_user_words_prefix(&self.schema_id, prefix, limit)
             .unwrap_or_default();
-        let cands = recs.into_iter().map(|r| record_to_candidate(r, false)).collect();
+        let cands = recs
+            .into_iter()
+            .map(|r| record_to_candidate(r, false))
+            .collect();
         sort_trunc(cands, limit)
     }
 }
@@ -114,7 +120,10 @@ impl DictLayer for StoreTempLayer {
             .store
             .get_temp_words(&self.schema_id, code)
             .unwrap_or_default();
-        let cands = recs.into_iter().map(|r| record_to_candidate(r, true)).collect();
+        let cands = recs
+            .into_iter()
+            .map(|r| record_to_candidate(r, true))
+            .collect();
         sort_trunc(cands, limit)
     }
 
@@ -123,7 +132,10 @@ impl DictLayer for StoreTempLayer {
             .store
             .search_temp_words_prefix(&self.schema_id, prefix, limit)
             .unwrap_or_default();
-        let cands = recs.into_iter().map(|r| record_to_candidate(r, true)).collect();
+        let cands = recs
+            .into_iter()
+            .map(|r| record_to_candidate(r, true))
+            .collect();
         sort_trunc(cands, limit)
     }
 }

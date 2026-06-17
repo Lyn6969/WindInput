@@ -25,8 +25,17 @@ pub struct CodetableDict {
 }
 
 impl CodetableDict {
-    /// 从 .dict.yaml 文件加载
+    /// 从 .dict.yaml 文件加载（code 保持原样）
     pub fn load(path: impl AsRef<Path>) -> anyhow::Result<Self> {
+        Self::load_impl(path, false)
+    }
+
+    /// 从 .dict.yaml 加载并把 code 列小写化（英文词库用：大小写不敏感前缀匹配，text 保留原样大小写）
+    pub fn load_lowercased(path: impl AsRef<Path>) -> anyhow::Result<Self> {
+        Self::load_impl(path, true)
+    }
+
+    fn load_impl(path: impl AsRef<Path>, lowercase_code: bool) -> anyhow::Result<Self> {
         let path = path.as_ref();
         let content = fs::read_to_string(path)?;
 
@@ -58,7 +67,7 @@ impl CodetableDict {
 
             // 检测格式：第一列是否为 ASCII（五笔码）或中文（拼音文本）
             let first_is_code = parts[0].chars().all(|c| c.is_ascii());
-            let (code, text) = if first_is_code {
+            let (mut code, text) = if first_is_code {
                 // 五笔格式: code\ttext
                 (parts[0].to_string(), parts[1].to_string())
             } else {
@@ -66,6 +75,9 @@ impl CodetableDict {
                 let code = parts[1].replace(' ', "");
                 (code, parts[0].to_string())
             };
+            if lowercase_code {
+                code = code.to_lowercase();
+            }
 
             let weight: i32 = if parts.len() >= 3 {
                 parts[2].parse().unwrap_or(0)
@@ -173,9 +185,8 @@ impl CodetableDict {
     /// 导出到 DictWriter（用于写入 .wdb 缓存）
     pub fn export_to_writer(&self, writer: &mut crate::binformat::DictWriter) {
         for (code, entries) in &self.entries {
-            let entries_data: Vec<(String, i32)> = entries.iter()
-                .map(|e| (e.text.clone(), e.weight))
-                .collect();
+            let entries_data: Vec<(String, i32)> =
+                entries.iter().map(|e| (e.text.clone(), e.weight)).collect();
             writer.add(code.clone(), entries_data);
         }
     }
@@ -183,7 +194,11 @@ impl CodetableDict {
     /// 合并单个条目（用于从 CachedDict 提取数据）
     pub fn merge_single(&mut self, code: String, text: String, weight: i32, _order: i32) {
         let existing = self.entries.entry(code).or_default();
-        existing.push(CodetableEntry { text, weight, order: existing.len() as i32 });
+        existing.push(CodetableEntry {
+            text,
+            weight,
+            order: existing.len() as i32,
+        });
         self.total_entries += 1;
     }
 
@@ -193,5 +208,38 @@ impl CodetableDict {
         let mut writer = DictWriter::new();
         self.export_to_writer(&mut writer);
         writer.write(path)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Write;
+
+    /// 英文词库格式 `word<TAB>word`（混合大小写）：load_lowercased 应小写化 code、
+    /// 保留 text 原样，使大小写不敏感前缀匹配生效。
+    #[test]
+    fn load_lowercased_english() {
+        let path = std::env::temp_dir().join("wind_en_lowercase_test.dict.yaml");
+        {
+            let mut f = std::fs::File::create(&path).unwrap();
+            writeln!(f, "---\nname: en\n...").unwrap();
+            writeln!(f, "# ab\tab").unwrap(); // 注释行跳过
+            writeln!(f, "Aaron\tAaron").unwrap();
+            writeln!(f, "abandon\tabandon").unwrap();
+            writeln!(f, "ABC\tABC").unwrap();
+        }
+        let d = CodetableDict::load_lowercased(&path).unwrap();
+        let _ = std::fs::remove_file(&path);
+        // 小写前缀 "aa" 命中 Aaron（原样大小写 text）
+        let r = d.search_prefix("aa", 10);
+        assert!(
+            r.iter()
+                .any(|(code, text, _, _)| code == "aaron" && text == "Aaron"),
+            "应小写码命中、保留原样 text: {:?}",
+            r
+        );
+        // 精确小写 "abc" 命中 ABC
+        assert!(d.search("abc").iter().any(|(t, _, _)| t == "ABC"));
     }
 }

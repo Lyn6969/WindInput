@@ -9,7 +9,7 @@
 use crate::cached::CachedDict;
 use crate::composite::CompositeDict;
 use crate::layer::{DictLayer, LayerType};
-use wind_candidate::{better, Candidate, CandidateSource};
+use wind_candidate::{Candidate, CandidateSource, better};
 
 /// 词典管理器：持有一个方案的多层复合词典。
 #[derive(Default)]

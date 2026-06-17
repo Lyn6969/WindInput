@@ -43,12 +43,7 @@ impl HotCache {
     /// - `file_key`: 文件标识（路径+大小+mtime）
     /// - `first_byte`: 首字母（如 's'）
     /// - `build`: 构建函数，返回该前缀的 top-K 候选
-    pub fn get_or_build<F>(
-        &self,
-        file_key: &str,
-        first_byte: u8,
-        build: F,
-    ) -> Vec<CachedCandidate>
+    pub fn get_or_build<F>(&self, file_key: &str, first_byte: u8, build: F) -> Vec<CachedCandidate>
     where
         F: FnOnce() -> Vec<CachedCandidate>,
     {
