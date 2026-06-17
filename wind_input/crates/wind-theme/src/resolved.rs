@@ -2,7 +2,7 @@
 //!
 //! 与 Go 版本 `wind_input/pkg/theme/resolved.go` 对齐（候选窗子集，逐步扩展到其它窗口）。
 
-use crate::palette::{color_token, resolve_palette, Rgba};
+use crate::palette::{Rgba, color_token, resolve_palette};
 use crate::theme;
 use serde_yaml::Value;
 use std::collections::HashMap;
@@ -68,11 +68,26 @@ impl Default for ResolvedTheme {
             win_border: [200, 200, 200, 200],
             win_radius: 8.0,
             win_border_width: 1.0,
-            win_pad: Pad { t: 6.0, r: 8.0, b: 6.0, l: 8.0 },
+            win_pad: Pad {
+                t: 6.0,
+                r: 8.0,
+                b: 6.0,
+                l: 8.0,
+            },
             preedit_bg: [240, 240, 240, 255],
             preedit_color: [100, 100, 100, 255],
-            preedit_pad: Pad { t: 3.0, r: 8.0, b: 3.0, l: 8.0 },
-            item_pad: Pad { t: 7.0, r: 10.0, b: 7.0, l: 8.0 },
+            preedit_pad: Pad {
+                t: 3.0,
+                r: 8.0,
+                b: 3.0,
+                l: 8.0,
+            },
+            item_pad: Pad {
+                t: 7.0,
+                r: 10.0,
+                b: 7.0,
+                l: 8.0,
+            },
             item_radius: 4.0,
             sel_bg: [230, 240, 255, 255],
             sel_text: [30, 30, 30, 255],
@@ -135,8 +150,11 @@ impl ResolvedTheme {
             text_color: col(&["text", "color"], d.text_color),
             text_margin_l: num(views, &["text", "margin", "left"], d.text_margin_l),
             comment_color: col(&["comment", "color"], d.comment_color),
-            comment_font_offset: num(views, &["comment", "font_size"], d.comment_font_offset as f32)
-                as i32,
+            comment_font_offset: num(
+                views,
+                &["comment", "font_size"],
+                d.comment_font_offset as f32,
+            ) as i32,
             footer_font_offset: num(
                 views,
                 &["footer_bar", "font_size"],

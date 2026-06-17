@@ -36,7 +36,10 @@ impl ThemeManager {
 
     /// 当前已解析主题（副本）。
     pub fn resolved(&self) -> ResolvedTheme {
-        self.current.read().unwrap_or_else(|e| e.into_inner()).clone()
+        self.current
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
     }
 
     /// 切换暗色模式（用当前主题名重解析）。

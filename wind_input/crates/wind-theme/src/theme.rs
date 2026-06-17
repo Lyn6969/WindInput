@@ -3,8 +3,18 @@
 //! 与 Go 版本 `wind_input/pkg/theme/theme.go` 对齐（v3 schema）。
 //! 用 serde_yaml::Value 作中间表示：base 提供全量，派生主题深合并覆盖。
 
+use crate::schema::Theme;
 use serde_yaml::Value;
 use std::path::Path;
+
+/// 加载并 base 深合并主题，解析为类型化 `Theme`（未求值的原始 schema）。
+/// 合并在 Value 层完成（先合并后类型化），未知字段忽略（前向兼容）。
+pub fn load_typed(themes_dir: &Path, name: &str) -> anyhow::Result<Theme> {
+    let merged = load_merged(themes_dir, name, 0)?;
+    let theme: Theme = serde_yaml::from_value(merged)
+        .map_err(|e| anyhow::anyhow!("type theme {}: {}", name, e))?;
+    Ok(theme)
+}
 
 /// 读取 themes_dir/<name>/theme.yaml 并按 base 链深合并（base 在下、派生在上）。
 /// 防御循环继承（最多 8 层）。

@@ -6,6 +6,7 @@ pub mod bgimage;
 pub mod manager;
 pub mod palette;
 pub mod resolved;
+pub mod schema;
 pub mod theme;
 
 pub use manager::ThemeManager;
