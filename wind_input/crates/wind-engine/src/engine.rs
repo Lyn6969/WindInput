@@ -31,6 +31,8 @@ pub struct ConvertResult {
     pub commit_text: String,
     /// 是否为空码（有输入但无候选）
     pub is_empty: bool,
+    /// 满码空码时是否应清空缓冲（码表 clear_on_empty_max）
+    pub should_clear: bool,
 }
 
 /// 基础引擎接口
@@ -43,6 +45,12 @@ pub trait Engine: Send + Sync {
 
     /// 引擎类型
     fn engine_type(&self) -> EngineType;
+
+    /// 顶码上屏：超过满码长时取前 N 码首选上屏，返回 (上屏文本, 剩余编码)。
+    /// 默认不支持（拼音等）；码表/混输引擎按 schema 的 top_code_commit 实现。
+    fn handle_top_code(&self, _input: &str) -> Option<(String, String)> {
+        None
+    }
 }
 
 /// 扩展引擎接口（码表引擎特有）
@@ -55,7 +63,4 @@ pub trait ExtendedEngine: Engine {
 
     /// 处理空编码
     fn handle_empty_code(&self, input: &str) -> (bool, bool, String);
-
-    /// 处理顶码
-    fn handle_top_code(&self, input: &str) -> Option<(String, String)>;
 }

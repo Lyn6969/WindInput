@@ -4,4 +4,4 @@
 
 pub mod engine;
 
-pub use engine::CodeTableEngine;
+pub use engine::{CodeTableEngine, CommitOptions};

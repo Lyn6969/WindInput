@@ -63,6 +63,7 @@ impl Engine for MixedEngine {
         // 主码表的全码自动上屏意向（下方按拼音守护 + 合并存活性复核后才放行）。
         let ct_should_commit = ct.should_commit;
         let ct_commit_text = ct.commit_text.clone();
+        let ct_should_clear = ct.should_clear;
         let mut codetable: Vec<Candidate> = ct.candidates;
         for c in &mut codetable {
             if c.is_phrase {
@@ -116,6 +117,9 @@ impl Engine for MixedEngine {
             (false, String::new())
         };
 
+        // 空码清空：仅当主码表请求清空且无拼音候选（合法拼音序列留给拼音，不清空）。
+        let should_clear = ct_should_clear && !has_pinyin;
+
         let is_empty = merged.is_empty();
         Ok(ConvertResult {
             candidates: merged,
@@ -124,6 +128,7 @@ impl Engine for MixedEngine {
             is_empty,
             should_commit,
             commit_text,
+            should_clear,
             ..Default::default()
         })
     }
@@ -138,12 +143,17 @@ impl Engine for MixedEngine {
     fn engine_type(&self) -> EngineType {
         EngineType::Mixed
     }
+
+    /// 顶码委托主码表引擎（拼音守护的精细判定后续随混输顶码细化补充）。
+    fn handle_top_code(&self, input: &str) -> Option<(String, String)> {
+        self.primary.handle_top_code(input)
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::codetable::CodeTableEngine;
+    use crate::codetable::{CodeTableEngine, CommitOptions};
     use std::sync::Arc;
     use wind_dict::cached::CachedDict;
     use wind_dict::codetable::CodetableDict;
@@ -157,7 +167,12 @@ mod tests {
         }
         let dm = DictManager::new();
         dm.register_layer(Box::new(SystemDictLayer::new(CachedDict::Memory(d), "sys")));
-        Box::new(CodeTableEngine::new(4, at_full, 4, Arc::new(dm)))
+        let opts = CommitOptions {
+            auto_commit_at_full: at_full,
+            auto_commit_min_len: 4,
+            ..Default::default()
+        };
+        Box::new(CodeTableEngine::new(4, opts, Arc::new(dm)))
     }
 
     #[test]

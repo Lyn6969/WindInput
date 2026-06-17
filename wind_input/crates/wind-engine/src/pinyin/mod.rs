@@ -255,6 +255,7 @@ impl Engine for PinyinEngine {
             should_commit: false,
             commit_text: String::new(),
             is_empty,
+            should_clear: false,
         })
     }
 

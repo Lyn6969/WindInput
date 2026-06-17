@@ -285,6 +285,16 @@ pub struct Coordinator {
 /// 短语候选权重基准（高于普通候选，使短语展开排在前列）
 const PHRASE_WEIGHT_BASE: i32 = 40_000_000;
 
+/// 一次候选刷新后的输入结局（码表全码/空码策略，仅正向输入字母时消费）。
+enum InputOutcome {
+    /// 正常更新候选，继续组合。
+    Normal,
+    /// 全码自动上屏该文本。
+    AutoCommit(String),
+    /// 满码空码：清空缓冲。
+    Clear,
+}
+
 impl Coordinator {
     /// 生产构造器：从 exe 同目录加载配置，启动候选窗口 UI 线程
     pub fn new(push_server: Arc<PushServer>) -> Arc<Self> {
@@ -669,9 +679,9 @@ impl Coordinator {
 
     /// 用给定上限转换并构建候选（引擎 + 词频 boost + 短语 + 排序去重）。
     /// 返回引擎候选数（不含短语），供判断 has_more。不复位翻页/高亮。
-    /// 返回 (引擎候选数, 全码自动上屏文本)。自动上屏文本经 shadow 复核后才返回，
-    /// 避免上屏被置顶删词移除的候选。调用方仅在「正向输入字母」时消费该上屏文本。
-    fn build_candidates(&self, state: &mut State, limit: usize) -> (usize, Option<String>) {
+    /// 返回 (引擎候选数, 输入结局)。结局含全码自动上屏 / 满码空码清空；自动上屏文本经
+    /// shadow 复核后才放行，避免上屏被置顶删词移除的候选。调用方仅在「正向输入字母」时消费。
+    fn build_candidates(&self, state: &mut State, limit: usize) -> (usize, InputOutcome) {
         let result = self.engine_mgr.convert(&state.input_buffer, limit);
         // 组合区只显示输入码/拼音
         state.preedit = if result.preedit_display.is_empty() {
@@ -686,6 +696,7 @@ impl Coordinator {
         } else {
             None
         };
+        let should_clear = result.should_clear;
 
         let mut candidates = result.candidates;
         if !self.phrases.is_empty() {
@@ -713,8 +724,12 @@ impl Coordinator {
         self.apply_shadow(&mut candidates, &state.input_buffer);
         state.candidates = candidates;
         // 复核：仅当上屏目标在最终候选中仍存在（未被 shadow 删除）才放行自动上屏。
-        let auto_commit = auto_commit.filter(|t| state.candidates.iter().any(|c| &c.text == t));
-        (engine_count, auto_commit)
+        let outcome = match auto_commit.filter(|t| state.candidates.iter().any(|c| &c.text == t)) {
+            Some(t) => InputOutcome::AutoCommit(t),
+            None if should_clear => InputOutcome::Clear,
+            None => InputOutcome::Normal,
+        };
+        (engine_count, outcome)
     }
 
     /// 按当前检索范围过滤候选：先填充 is_common（常用字表），再按模式过滤。
@@ -763,17 +778,17 @@ impl Coordinator {
     }
 
     /// 根据输入缓冲更新候选（动态分级加载：首次小批量，翻页到边界再扩展）。
-    /// 返回全码自动上屏文本（若该输入触发全码上屏）；多数调用方忽略，仅正向输入字母时消费。
-    fn update_candidates(&self, state: &mut State) -> Option<String> {
+    /// 返回输入结局（全码自动上屏 / 满码空码清空）；多数调用方忽略，仅正向输入字母时消费。
+    fn update_candidates(&self, state: &mut State) -> InputOutcome {
         state.candidates.clear();
         state.preedit = state.input_buffer.clone();
         if state.input_buffer.is_empty() {
             state.has_more = false;
             state.candidate_input.clear();
-            return None;
+            return InputOutcome::Normal;
         }
         let limit = self.initial_candidate_limit(&state.input_buffer);
-        let (engine_count, auto_commit) = self.build_candidates(state, limit);
+        let (engine_count, outcome) = self.build_candidates(state, limit);
         state.candidate_input = state.input_buffer.clone();
         state.candidate_limit = limit;
         // 引擎返回数达到上限 → 可能还有更多未加载
@@ -782,7 +797,7 @@ impl Coordinator {
         state.current_page = 0;
         state.selected_index = 0;
         state.hover_index = -1;
-        auto_commit
+        outcome
     }
 
     /// 扩展候选（翻页/下移到边界时调用）：上限翻倍（≤5000）重新加载，保持当前页/高亮。
@@ -3405,11 +3420,43 @@ impl MessageHandler for Coordinator {
                 // A-Z 字母累积
                 let ch = (b'a' + (data.key_code - 0x41) as u8) as char;
                 state.input_buffer.push(ch);
-                // 全码自动上屏：唯一全码且无更长后继时直接上屏（schema.auto_commit_at_full）。
-                if let Some(text) = self.update_candidates(&mut state) {
-                    let out = self.commit_candidate(&mut state, &text);
-                    self.notify_ui_hide();
-                    return Self::commit_action(out, true);
+
+                // 顶码上屏：缓冲超过满码长且整串无匹配 → 顶前 N 码首选，余码续打
+                // （schema.top_code_commit；置于候选刷新前，对齐 Go handleAlphaKey）。
+                if let Some((top_text, remainder)) =
+                    self.engine_mgr.handle_top_code(&state.input_buffer)
+                {
+                    let buf = state.input_buffer.clone();
+                    let prefix = &buf[..buf.len().saturating_sub(remainder.len())];
+                    self.record_selection(prefix, &top_text);
+                    state.input_buffer = remainder.clone();
+                    let _ = self.update_candidates(&mut state); // 余码候选（不再消费其结局）
+                    let preedit = state.preedit.clone();
+                    self.notify_ui_update(&state);
+                    let has_comp = !remainder.is_empty();
+                    return KeyAction::InsertText {
+                        text: top_text,
+                        new_composition: has_comp.then_some(preedit),
+                        mode_changed: false,
+                        chinese_mode: true,
+                        has_new_composition: has_comp,
+                    };
+                }
+
+                // 全码自动上屏 / 满码空码清空（schema.auto_commit_at_full / clear_on_empty_max）。
+                match self.update_candidates(&mut state) {
+                    InputOutcome::AutoCommit(text) => {
+                        let out = self.commit_candidate(&mut state, &text);
+                        self.notify_ui_hide();
+                        return Self::commit_action(out, true);
+                    }
+                    InputOutcome::Clear => {
+                        state.input_buffer.clear();
+                        state.candidates.clear();
+                        self.notify_ui_hide();
+                        return KeyAction::ClearComposition;
+                    }
+                    InputOutcome::Normal => {}
                 }
                 let display = state.preedit.clone();
                 self.notify_ui_update(&state);

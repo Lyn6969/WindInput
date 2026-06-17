@@ -35,6 +35,8 @@ pub struct EngineManager {
     data_dir: Option<std::path::PathBuf>,
     /// redb 持久化存储（用户词/临时词层；None=无持久化，如纯测试/REPL）
     store: Option<Arc<wind_store::Store>>,
+    /// 全码/空码上屏策略全局默认（方案级 tri-state 未设时回退至此）
+    code_commit: wind_config::CodeCommitConfig,
 }
 
 /// 进程级缓存根目录（%LOCALAPPDATA%\WindInput\cache），EngineManager::new 设置一次。
@@ -98,6 +100,7 @@ impl EngineManager {
             available,
             data_dir: data_dir.map(|d| d.to_path_buf()),
             store,
+            code_commit: config.input.code_commit.clone(),
         };
         // 仅构建活跃方案（其余懒加载）
         mgr.ensure_loaded(&active_id);
@@ -122,7 +125,12 @@ impl EngineManager {
         {
             return true;
         }
-        match Self::build_engine(schema_id, self.data_dir.as_deref(), self.store.clone()) {
+        match Self::build_engine(
+            schema_id,
+            self.data_dir.as_deref(),
+            self.store.clone(),
+            &self.code_commit,
+        ) {
             Some(engine) => {
                 info!(
                     "Loaded engine: {} (type={:?})",
@@ -231,6 +239,12 @@ impl EngineManager {
         self.active_engine().map(|e| e.engine_type())
     }
 
+    /// 顶码上屏：超过满码长时取前 N 码首选上屏，返回 (上屏文本, 剩余编码)。
+    /// 仅码表/混输引擎按 top_code_commit 实现，其余返回 None。
+    pub fn handle_top_code(&self, input: &str) -> Option<(String, String)> {
+        self.active_engine()?.handle_top_code(input)
+    }
+
     /// 当前活跃方案（须为码表类型）的临时拼音目标方案 id。
     /// 启用且目标方案可加载时返回 Some(target)，否则 None。
     pub fn temp_pinyin_target(&self) -> Option<String> {
@@ -305,6 +319,7 @@ impl EngineManager {
         schema_id: &str,
         data_dir: Option<&Path>,
         store: Option<Arc<wind_store::Store>>,
+        commit: &wind_config::CodeCommitConfig,
     ) -> Option<Box<dyn Engine>> {
         let data_dir = data_dir?;
         let schemas = data_dir.join("schemas");
@@ -317,11 +332,12 @@ impl EngineManager {
                 warn!("mixed schema {} 缺少 primary_schema", schema_id);
                 return None;
             }
-            let primary = Self::build_engine(&m.primary_schema, Some(data_dir), store.clone())?;
+            let primary =
+                Self::build_engine(&m.primary_schema, Some(data_dir), store.clone(), commit)?;
             let secondary = if m.secondary_schema.is_empty() {
                 None
             } else {
-                Self::build_engine(&m.secondary_schema, Some(data_dir), store.clone())
+                Self::build_engine(&m.secondary_schema, Some(data_dir), store.clone(), commit)
             };
             let boost = if m.codetable_weight_boost > 0 {
                 m.codetable_weight_boost
@@ -333,10 +349,10 @@ impl EngineManager {
             } else {
                 2
             };
-            // 拼音守护：读主码表方案的 auto_commit_block_on_pinyin（tri-state，默认 true）。
+            // 拼音守护：主码表方案 tri-state > 全局 input.code_commit。
             let block_on_pinyin = Self::read_schema(&m.primary_schema, Some(data_dir))
                 .and_then(|s| s.engine.codetable.auto_commit_block_on_pinyin)
-                .unwrap_or(true);
+                .unwrap_or(commit.auto_commit_block_on_pinyin);
             info!(
                 "Built mixed engine {} (primary={}, secondary={})",
                 schema_id, m.primary_schema, m.secondary_schema
@@ -378,10 +394,22 @@ impl EngineManager {
             } else {
                 4
             };
-            // 全码自动上屏：auto_commit_at_full 为 tri-state，未设置时回退 legacy auto_commit_unique。
+            // 上屏策略解析（tri-state 继承）：方案级 Some > 全局 input.code_commit > 内置默认。
+            // auto_commit_at_full 额外兼容 legacy auto_commit_unique（方案显式 true 优先于全局）。
             let ct = &schema.engine.codetable;
-            let auto_commit_at_full = ct.auto_commit_at_full.unwrap_or(ct.auto_commit_unique);
-            let auto_commit_min_len = ct.auto_commit_min_len;
+            let commit_opts = crate::codetable::CommitOptions {
+                auto_commit_at_full: ct
+                    .auto_commit_at_full
+                    .or(ct.auto_commit_unique.then_some(true))
+                    .unwrap_or(commit.auto_commit_at_full),
+                auto_commit_min_len: if ct.auto_commit_min_len > 0 {
+                    ct.auto_commit_min_len
+                } else {
+                    commit.auto_commit_min_len
+                },
+                clear_on_empty_max: ct.clear_on_empty_max.unwrap_or(commit.clear_on_empty_max),
+                top_code_commit: ct.top_code_commit.unwrap_or(commit.top_code_commit),
+            };
             // 码表引擎经 DictManager(CompositeDict) 查询：系统词库作 System 层。
             // 注入 redb Store 时，注册用户词/临时词层（按 schema 隔离），让用户词进候选合并。
             let dm = wind_dict::DictManager::new();
@@ -401,8 +429,7 @@ impl EngineManager {
             )));
             Some(Box::new(CodeTableEngine::new(
                 mcl,
-                auto_commit_at_full,
-                auto_commit_min_len,
+                commit_opts,
                 Arc::new(dm),
             )))
         }

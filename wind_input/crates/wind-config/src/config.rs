@@ -161,6 +161,43 @@ pub struct InputConfig {
     pub temp_pinyin: TempPinyinConfig,
     #[serde(default)]
     pub url_input: UrlInputConfig,
+    /// 全码/空码上屏策略的全局默认（方案级 [engine.codetable] 的 tri-state 字段未设时回退至此）
+    #[serde(default)]
+    pub code_commit: CodeCommitConfig,
+}
+
+/// 全码/空码上屏策略全局默认（对齐方案级 [engine.codetable] 同名字段）。
+/// 解析顺序：方案级 Some > 本全局 > 内置默认。放在 `config.toml`（用户可合并），
+/// 使非主方案/未单独配置的方案统一吃全局，且无需改只读安装目录的 schema。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CodeCommitConfig {
+    /// 全码自动上屏（唯一精确 + 无更长后继时直接上屏）
+    #[serde(default)]
+    pub auto_commit_at_full: bool,
+    /// 自动上屏最短码长（0 跟随方案 max_code_length）
+    #[serde(default)]
+    pub auto_commit_min_len: usize,
+    /// 满码无候选时清空缓冲
+    #[serde(default)]
+    pub clear_on_empty_max: bool,
+    /// 超过满码长时取前 N 码顶字上屏
+    #[serde(default)]
+    pub top_code_commit: bool,
+    /// 混输全码上屏时，存在拼音候选则否决（保护拼音用户）
+    #[serde(default = "default_true")]
+    pub auto_commit_block_on_pinyin: bool,
+}
+
+impl Default for CodeCommitConfig {
+    fn default() -> Self {
+        Self {
+            auto_commit_at_full: false,
+            auto_commit_min_len: 0,
+            clear_on_empty_max: false,
+            top_code_commit: false,
+            auto_commit_block_on_pinyin: true,
+        }
+    }
 }
 
 /// 自定义标点映射配置（对齐 Go PunctCustomConfig）。
@@ -289,6 +326,7 @@ impl Default for InputConfig {
             shift_temp_english: ShiftTempEnglishConfig::default(),
             capslock: CapslockConfig::default(),
             url_input: UrlInputConfig::default(),
+            code_commit: CodeCommitConfig::default(),
         }
     }
 }

@@ -71,12 +71,12 @@ pub struct CodeTableSpec {
     /// 混输时有拼音候选则否决自动上屏
     #[serde(default)]
     pub auto_commit_block_on_pinyin: Option<bool>,
-    /// 满码无候选时清空
+    /// 满码无候选时清空（tri-state；未设置时回退全局 input.code_commit）
     #[serde(default)]
-    pub clear_on_empty_max: bool,
-    /// 五码顶字上屏
+    pub clear_on_empty_max: Option<bool>,
+    /// 五码顶字上屏（tri-state；未设置时回退全局 input.code_commit）
     #[serde(default)]
-    pub top_code_commit: bool,
+    pub top_code_commit: Option<bool>,
     /// 标点触发上屏
     #[serde(default)]
     pub punct_commit: bool,
