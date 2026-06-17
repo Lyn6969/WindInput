@@ -13,6 +13,7 @@
 //! alpha 预乘（R' = R×A/255），使其成为合法预乘像素，与背景共享同一透明度。
 
 use std::cell::RefCell;
+use std::collections::HashMap;
 use std::ffi::c_void;
 
 use windows::core::{implement, PCWSTR};
@@ -41,12 +42,13 @@ pub struct TextRenderer {
     family: Vec<u16>,
     /// 语言区域（宽字符，含结尾 0）
     locale: Vec<u16>,
+    /// 基准字号（family 固定）；可按调用传不同字号（序号/注释相对偏移）。
     font_size: f32,
     factory: IDWriteFactory,
     gdi_interop: IDWriteGdiInterop,
     params: IDWriteRenderingParams,
-    /// 缓存的文本格式（family/size 固定，故单槽即可）
-    format: RefCell<Option<IDWriteTextFormat>>,
+    /// 文本格式缓存：按字号（取整 px）keyed，避免每帧重建 COM 对象。
+    formats: RefCell<HashMap<u32, IDWriteTextFormat>>,
     /// 当前位图渲染表面（按需重建）
     surface: RefCell<Option<Surface>>,
 }
@@ -78,15 +80,21 @@ impl TextRenderer {
                 factory,
                 gdi_interop,
                 params,
-                format: RefCell::new(None),
+                formats: RefCell::new(HashMap::new()),
                 surface: RefCell::new(None),
             })
         }
     }
 
-    /// 取得（或创建）文本格式。
-    fn ensure_format(&self) -> Result<IDWriteTextFormat, String> {
-        if let Some(f) = self.format.borrow().as_ref() {
+    /// 基准字号（View 叶子未显式指定字号时回退）。
+    pub fn base_size(&self) -> f32 {
+        self.font_size
+    }
+
+    /// 取得（或创建）给定字号的文本格式（按取整 px 缓存）。
+    fn ensure_format(&self, size: f32) -> Result<IDWriteTextFormat, String> {
+        let key = size.max(1.0).round() as u32;
+        if let Some(f) = self.formats.borrow().get(&key) {
             return Ok(f.clone());
         }
         unsafe {
@@ -98,18 +106,24 @@ impl TextRenderer {
                     DWRITE_FONT_WEIGHT_NORMAL,
                     DWRITE_FONT_STYLE_NORMAL,
                     DWRITE_FONT_STRETCH_NORMAL,
-                    self.font_size,
+                    key as f32,
                     PCWSTR(self.locale.as_ptr()),
                 )
                 .map_err(|e| format!("CreateTextFormat: {e}"))?;
-            *self.format.borrow_mut() = Some(fmt.clone());
+            self.formats.borrow_mut().insert(key, fmt.clone());
             Ok(fmt)
         }
     }
 
-    /// 为给定文本创建布局对象。
-    fn create_layout(&self, text: &str, max_w: f32, max_h: f32) -> Result<IDWriteTextLayout, String> {
-        let fmt = self.ensure_format()?;
+    /// 为给定文本/字号创建布局对象。
+    fn create_layout(
+        &self,
+        text: &str,
+        size: f32,
+        max_w: f32,
+        max_h: f32,
+    ) -> Result<IDWriteTextLayout, String> {
+        let fmt = self.ensure_format(size)?;
         let wide: Vec<u16> = text.encode_utf16().collect();
         unsafe {
             self.factory
@@ -118,20 +132,25 @@ impl TextRenderer {
         }
     }
 
-    /// 测量文本尺寸（宽含尾随空白，高为行高）。
+    /// 测量文本尺寸（用基准字号）。
     pub fn measure_text(&self, text: &str) -> TextMetrics {
+        self.measure_text_sized(text, self.font_size)
+    }
+
+    /// 测量文本尺寸（指定字号；宽含尾随空白，高为行高）。
+    pub fn measure_text_sized(&self, text: &str, size: f32) -> TextMetrics {
         if text.is_empty() {
             return TextMetrics {
                 width: 0.0,
-                height: self.font_size * 1.2,
+                height: size * 1.2,
             };
         }
-        let layout = match self.create_layout(text, f32::MAX / 2.0, f32::MAX / 2.0) {
+        let layout = match self.create_layout(text, size, f32::MAX / 2.0, f32::MAX / 2.0) {
             Ok(l) => l,
             Err(_) => {
                 return TextMetrics {
-                    width: text.chars().count() as f32 * self.font_size * 0.6,
-                    height: self.font_size * 1.2,
+                    width: text.chars().count() as f32 * size * 0.6,
+                    height: size * 1.2,
                 }
             }
         };
@@ -139,15 +158,11 @@ impl TextRenderer {
             let mut m = DWRITE_TEXT_METRICS::default();
             if layout.GetMetrics(&mut m).is_err() {
                 return TextMetrics {
-                    width: text.chars().count() as f32 * self.font_size * 0.6,
-                    height: self.font_size * 1.2,
+                    width: text.chars().count() as f32 * size * 0.6,
+                    height: size * 1.2,
                 };
             }
-            let height = if m.height > 0.0 {
-                m.height
-            } else {
-                self.font_size * 1.2
-            };
+            let height = if m.height > 0.0 { m.height } else { size * 1.2 };
             TextMetrics {
                 width: m.widthIncludingTrailingWhitespace,
                 height,
@@ -198,6 +213,8 @@ impl TextRenderer {
     /// - `buf_width`/`buf_height`: 缓冲区尺寸
     /// - `x`/`y`: 文本左上角（像素坐标）
     /// - `color`: 文本颜色 [B, G, R, A]
+    /// 绘制文本（用基准字号）。
+    #[allow(clippy::too_many_arguments)]
     pub fn draw_text(
         &self,
         buf: &mut [u8],
@@ -206,6 +223,22 @@ impl TextRenderer {
         x: f32,
         y: f32,
         text: &str,
+        color: [u8; 4],
+    ) -> Result<(), String> {
+        self.draw_text_sized(buf, buf_width, buf_height, x, y, text, self.font_size, color)
+    }
+
+    /// 绘制文本（指定字号）。
+    #[allow(clippy::too_many_arguments)]
+    pub fn draw_text_sized(
+        &self,
+        buf: &mut [u8],
+        buf_width: u32,
+        buf_height: u32,
+        x: f32,
+        y: f32,
+        text: &str,
+        size: f32,
         color: [u8; 4],
     ) -> Result<(), String> {
         if text.is_empty() || buf_width == 0 || buf_height == 0 {
@@ -242,7 +275,7 @@ impl TextRenderer {
             // 入参 color 约定为 [R,G,B,A]；COLORREF = 0x00BBGGRR。
             let colorref: u32 =
                 (color[0] as u32) | ((color[1] as u32) << 8) | ((color[2] as u32) << 16);
-            let layout = self.create_layout(text, buf_width as f32, buf_height as f32)?;
+            let layout = self.create_layout(text, size, buf_width as f32, buf_height as f32)?;
 
             // 关键优化：用文本度量算出包围盒，后续两遍逐像素操作只在盒内进行
             // （原实现每次绘制都遍历整窗，单帧十余次 × 整窗 → paint 高达 ~100ms）。

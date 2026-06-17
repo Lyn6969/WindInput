@@ -80,7 +80,11 @@ pub struct View {
     pub border: Option<([u8; 4], f32)>,
     pub text: Option<String>,
     pub text_color: [u8; 4],
+    /// 文本字号（设备像素）；None=用渲染器基准字号。序号/注释按相对偏移设具体值。
+    pub font_size: Option<f32>,
     pub text_align: Align,
+    /// 左侧强调条 (颜色, 宽度 px)：在节点左缘内绘制竖条（选中候选用）；不占布局空间（落在左内边距内）。
+    pub left_bar: Option<([u8; 4], f32)>,
     pub children: Vec<View>,
     /// 命中标识：>=0 参与命中收集（如候选下标 / 按钮 id），<0 忽略
     pub tag: i32,
@@ -105,7 +109,9 @@ impl Default for View {
             border: None,
             text: None,
             text_color: [0, 0, 0, 255],
+            font_size: None,
             text_align: Align::Start,
+            left_bar: None,
             children: Vec::new(),
             tag: -1,
             mw: 0.0,
@@ -166,6 +172,14 @@ impl View {
         self.text_align = a;
         self
     }
+    pub fn font_size(mut self, px: f32) -> Self {
+        self.font_size = Some(px);
+        self
+    }
+    pub fn left_bar(mut self, color: [u8; 4], width: f32) -> Self {
+        self.left_bar = Some((color, width));
+        self
+    }
     pub fn tag(mut self, t: i32) -> Self {
         self.tag = t;
         self
@@ -195,7 +209,7 @@ impl View {
 
     fn measure(&mut self, tr: &TextRenderer) {
         let (cw, ch) = if let Some(t) = &self.text {
-            let m = tr.measure_text(t);
+            let m = tr.measure_text_sized(t, self.font_size.unwrap_or(tr.base_size()));
             (m.width, m.height)
         } else {
             let mut main = 0.0f32;
@@ -327,9 +341,16 @@ impl View {
             }
             (None, None) => {}
         }
+        // 左侧强调条（选中候选）：在左内边距内画竖条，高 = 内容高的 60%，垂直居中。不占布局。
+        if let Some((color, bw)) = self.left_bar {
+            let bh = (r.h * 0.6).max(2.0);
+            let by = r.y + (r.h - bh) * 0.5;
+            fill_rounded(buf, buf_w, buf_h, r.x, by, bw, bh, color, bw * 0.5);
+        }
         // 文本
         if let Some(t) = &self.text {
-            let m = tr.measure_text(t);
+            let size = self.font_size.unwrap_or(tr.base_size());
+            let m = tr.measure_text_sized(t, size);
             let cx0 = r.x + self.padding.l;
             let content_w = r.w - self.padding.w();
             let content_h = r.h - self.padding.h();
@@ -339,7 +360,16 @@ impl View {
                 Align::End => cx0 + content_w - m.width,
             };
             let ty = r.y + self.padding.t + (content_h - m.height) * 0.5;
-            let _ = tr.draw_text(buf, buf_w, buf_h, tx.max(r.x), ty.max(r.y), t, self.text_color);
+            let _ = tr.draw_text_sized(
+                buf,
+                buf_w,
+                buf_h,
+                tx.max(r.x),
+                ty.max(r.y),
+                t,
+                size,
+                self.text_color,
+            );
         }
         // 子节点
         for c in &self.children {

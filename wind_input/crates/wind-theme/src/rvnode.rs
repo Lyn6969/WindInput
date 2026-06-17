@@ -136,6 +136,7 @@ pub struct RvViews {
     pub item_spacing: Option<Dim>,
     pub window_gap: Option<Dim>,
     pub row_gap: Option<Dim>,
+    pub accent_bar_enabled: bool,
     pub accent_bar_width: Option<Dim>,
     pub accent_bar_offset: Option<Dim>,
     pub accent_bar_height_ratio: f32,

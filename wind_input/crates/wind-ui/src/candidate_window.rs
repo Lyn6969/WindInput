@@ -362,7 +362,13 @@ impl CandidateWindow {
         let v = &t.views;
         let s = self.scale;
         let gap = self.config.item_spacing.max(2.0);
-        let fs = self.config.font_size;
+        // 字号：base = 主题 behavior.font_size（默认 18，主题/用户可调）× DPI；
+        // 序号/注释/预编辑按各节点 font_size（相对主字号的有符号逻辑偏移）调整。
+        let base_fs = (t.behavior.font_size as f32) * s;
+        let node_fs = |n: &RvNode| (base_fs + n.font_size * s).max(6.0 * s);
+        let index_fs = node_fs(&v.index);
+        let text_fs = node_fs(&v.text);
+        let preedit_fs = node_fs(&v.preedit_bar);
 
         // 颜色：None→兜底。
         let col = |o: Option<[u8; 4]>, d: [u8; 4]| o.unwrap_or(d);
@@ -399,10 +405,13 @@ impl CandidateWindow {
                     .bg(col(v.preedit_bar.bg_color, [240, 240, 240, 255]))
                     .radius(dim(v.item.border_radius, 4.0))
                     .pad(edges_or(&v.preedit_bar.padding, [3.0, 8.0, 3.0, 8.0]))
-                    .child(View::leaf(
-                        self.preedit.clone(),
-                        col(v.preedit_bar.text_color, [100, 100, 100, 255]),
-                    )),
+                    .child(
+                        View::leaf(
+                            self.preedit.clone(),
+                            col(v.preedit_bar.text_color, [100, 100, 100, 255]),
+                        )
+                        .font_size(preedit_fs),
+                    ),
             );
         }
 
@@ -422,6 +431,10 @@ impl CandidateWindow {
         let text_margin_l = dim(v.text.margin.left, 4.0);
         let item_pad = edges_or(&v.item.padding, [7.0, 10.0, 7.0, 8.0]);
         let item_radius = dim(v.item.border_radius, 4.0);
+        // 选中候选左侧强调条（仅主题启用时，如 msime/jidian）。
+        let accent_bar = v
+            .accent_bar_enabled
+            .then(|| (col(v.accent_bar.bg_color, [66, 133, 244, 255]), dim(v.accent_bar_width, 3.0)));
 
         // 候选行：[序号 文本] cell 横排
         let mut row = View::container(Layout::Row).gap(gap * 2.0).cross(Align::Center);
@@ -436,11 +449,11 @@ impl CandidateWindow {
             let txt_color = if is_sel { sel_text } else { text_color };
 
             // 序号：圆圈样式 → 带底色 + 大圆角（药丸近似圆）
-            let mut idx_leaf = View::leaf(marker, index_color);
+            let mut idx_leaf = View::leaf(marker, index_color).font_size(index_fs);
             if index_circle {
                 idx_leaf = idx_leaf
                     .bg(index_circle_bg)
-                    .radius(fs * 0.5)
+                    .radius(index_fs * 0.5)
                     .pad(Edges::xy(s * 4.0, s * 1.0));
             }
 
@@ -451,10 +464,13 @@ impl CandidateWindow {
                 .radius(item_radius)
                 .tag(i as i32)
                 .child(idx_leaf)
-                .child(View::leaf(cand.text.clone(), txt_color));
+                .child(View::leaf(cand.text.clone(), txt_color).font_size(text_fs));
             // 选中底色优先于悬停底色（两者独立：选中=空格上屏目标，悬停=鼠标提示）
             if is_sel {
                 item = item.bg(sel_bg);
+                if let Some((c, w)) = accent_bar {
+                    item = item.left_bar(c, w);
+                }
             } else if is_hover {
                 item = item.bg(hover_bg);
             }
@@ -466,9 +482,11 @@ impl CandidateWindow {
             let disabled = t.color("text_hint", [180, 180, 185, 255]);
             let marker_c = t.color("text_dim", [140, 140, 145, 255]);
             let accent = col(v.accent_bar.bg_color, [66, 133, 244, 255]);
+            let footer_fs = node_fs(&v.footer_bar);
             let arrow = |txt: &str, tag: i32, enabled: bool, hovered: bool| {
                 let color = if enabled { accent } else { disabled };
                 let mut v = View::leaf(txt, color)
+                    .font_size(footer_fs)
                     .pad(Edges::xy(gap * 1.2, gap * 0.5))
                     .radius(item_radius)
                     .cross(Align::Center);
@@ -487,10 +505,10 @@ impl CandidateWindow {
                     arrow("‹", TAG_PAGE_PREV, prev_on, self.hover == TAG_PAGE_PREV)
                         .margin(Edges::xy(gap, 0.0)),
                 )
-                .child(View::leaf(
-                    format!("{}/{}", self.page, self.total_pages),
-                    marker_c,
-                ))
+                .child(
+                    View::leaf(format!("{}/{}", self.page, self.total_pages), marker_c)
+                        .font_size(footer_fs),
+                )
                 .child(arrow("›", TAG_PAGE_NEXT, next_on, self.hover == TAG_PAGE_NEXT));
         }
 

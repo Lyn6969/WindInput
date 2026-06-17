@@ -382,7 +382,8 @@ fn resolve_views(v: &Views, palette: &HashMap<String, Rgba>, is_dark: bool) -> R
             rv.shadow_color = Some(c);
         }
     }
-    // accent_bar 几何。
+    // accent_bar 启用 + 几何。
+    rv.accent_bar_enabled = v.accent_bar.enabled.unwrap_or(false);
     rv.accent_bar_width = v.accent_bar.width;
     rv.accent_bar_offset = v.accent_bar.offset;
     if let Some(r) = v.accent_bar.height_ratio {
