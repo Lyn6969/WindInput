@@ -21,7 +21,9 @@ use wind_candidate::Candidate;
 use wind_config::Config;
 use wind_config::hotkey::{self, CompiledHotkeys};
 use wind_engine::EngineManager;
-use wind_ipc::protocol::{EVENT_KEY_DOWN, EVENT_KEY_UP, MOD_ALT, MOD_CTRL, MOD_SHIFT, calc_key_hash};
+use wind_ipc::protocol::{
+    EVENT_KEY_DOWN, EVENT_KEY_UP, MOD_ALT, MOD_CTRL, MOD_SHIFT, calc_key_hash,
+};
 use wind_store::Store;
 use wind_transform::fullwidth::to_full_width;
 use wind_transform::punctuation::PunctuationConverter;
@@ -91,6 +93,23 @@ fn quick_input_char(key_code: u32, shift: bool) -> Option<char> {
         Some(c)
     } else {
         None
+    }
+}
+
+/// VK + shift → 可打印 ASCII 字符（字母按 shift 决定大小写、数字/符号复用 punct_char）。
+/// 用于网址模式原样累积与前缀探测。非可打印键返回 None。
+fn printable_char(key_code: u32, shift: bool) -> Option<char> {
+    match key_code {
+        0x41..=0x5A => {
+            let base = (key_code - 0x41) as u8;
+            Some(if shift {
+                (b'A' + base) as char
+            } else {
+                (b'a' + base) as char
+            })
+        }
+        0x30..=0x39 if !shift => Some((b'0' + (key_code - 0x30) as u8) as char),
+        _ => punct_char(key_code, shift),
     }
 }
 
@@ -181,6 +200,8 @@ struct State {
     quick_input_prefix: String,
     /// 临时英文输入缓冲
     temp_english_buffer: String,
+    /// 网址模式输入缓冲（原样累积的 URL 文本）
+    url_buffer: String,
     caret_x: i32,
     caret_y: i32,
     caret_height: i32,
@@ -292,8 +313,14 @@ impl Coordinator {
                 }
             }
         });
-        let coordinator =
-            Self::build(config, data_dir.as_deref(), push_server, ui_tx, user_dir, store);
+        let coordinator = Self::build(
+            config,
+            data_dir.as_deref(),
+            push_server,
+            ui_tx,
+            user_dir,
+            store,
+        );
 
         // 鼠标事件处理线程：候选窗的点击/悬停/滚轮经此回到协调器
         if let Some(rx) = event_rx {
@@ -457,6 +484,7 @@ impl Coordinator {
                 quick_input_buffer: String::new(),
                 quick_input_prefix: String::new(),
                 temp_english_buffer: String::new(),
+                url_buffer: String::new(),
                 caret_x: 0,
                 caret_y: 0,
                 caret_height: 0,
@@ -543,7 +571,10 @@ impl Coordinator {
 
     /// 当前是否中文模式（测试/诊断用）
     pub fn is_chinese_mode(&self) -> bool {
-        self.state.lock().unwrap_or_else(|e| e.into_inner()).chinese_mode
+        self.state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .chinese_mode
     }
 
     /// 设置简繁开关（测试/诊断用）。返回是否生效（数据缺失则 false）。
@@ -551,18 +582,28 @@ impl Coordinator {
         if self.s2t.lock().unwrap_or_else(|e| e.into_inner()).is_none() {
             return false;
         }
-        self.state.lock().unwrap_or_else(|e| e.into_inner()).s2t_enabled = on;
+        self.state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .s2t_enabled = on;
         true
     }
 
     /// 候选总数（测试/诊断用）
     pub fn debug_candidate_count(&self) -> usize {
-        self.state.lock().unwrap_or_else(|e| e.into_inner()).candidates.len()
+        self.state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .candidates
+            .len()
     }
 
     /// 是否还有更多候选未加载（测试/诊断用）
     pub fn debug_has_more(&self) -> bool {
-        self.state.lock().unwrap_or_else(|e| e.into_inner()).has_more
+        self.state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .has_more
     }
 
     /// 分页信息 (当前页0-based, 页内高亮0-based, 总页数)（测试/诊断用）
@@ -575,7 +616,10 @@ impl Coordinator {
     pub fn debug_page_texts(&self) -> Vec<String> {
         let s = self.state.lock().unwrap_or_else(|e| e.into_inner());
         let (start, end) = self.page_range(&s);
-        s.candidates[start..end].iter().map(|c| c.text.clone()).collect()
+        s.candidates[start..end]
+            .iter()
+            .map(|c| c.text.clone())
+            .collect()
     }
 
     /// 当前页候选的"显示文本"（应用简繁后，与候选窗口一致；测试/诊断用）
@@ -961,7 +1005,9 @@ impl Coordinator {
             0x20 | 0x0D => {
                 // Space/Enter：上屏高亮候选并退出
                 if !state.candidates.is_empty() {
-                    let idx = self.highlighted_global_index(state).min(state.candidates.len() - 1);
+                    let idx = self
+                        .highlighted_global_index(state)
+                        .min(state.candidates.len() - 1);
                     let text = state.candidates[idx].text.clone();
                     self.record_selection(&state.input_buffer, &text);
                     let out = self.maybe_s2t(state, &text);
@@ -1044,7 +1090,9 @@ impl Coordinator {
                 // 其它键：先上屏高亮候选退出，再让标点字符按普通流程？
                 // 简化：有候选则上屏高亮候选并退出（吞掉该键）；否则退出清空。
                 if !state.candidates.is_empty() {
-                    let idx = self.highlighted_global_index(state).min(state.candidates.len() - 1);
+                    let idx = self
+                        .highlighted_global_index(state)
+                        .min(state.candidates.len() - 1);
                     let text = state.candidates[idx].text.clone();
                     self.record_selection(&state.input_buffer, &text);
                     let out = self.maybe_s2t(state, &text);
@@ -1188,7 +1236,12 @@ impl Coordinator {
     /// 纯查表读自定义标点映射的指定列（不碰转换器引号状态），供智能符号无副作用计算用。
     /// 与 `PunctuationConverter::lookup_custom` 的非引号分支等价。
     fn smart_symbol_custom_lookup(&self, ch: char, col_idx: usize) -> Option<String> {
-        let vals = self.config.input.punct_custom.mappings.get(&ch.to_string())?;
+        let vals = self
+            .config
+            .input
+            .punct_custom
+            .mappings
+            .get(&ch.to_string())?;
         let v = vals.get(col_idx)?;
         if v.is_empty() { None } else { Some(v.clone()) }
     }
@@ -1326,7 +1379,10 @@ impl Coordinator {
 
     /// 解除智能符号待命态（焦点变化/模式切换等的防御性复位）。
     fn disarm_smart_symbol(&self) {
-        self.smart_symbol.lock().unwrap_or_else(|e| e.into_inner()).armed = false;
+        self.smart_symbol
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .armed = false;
     }
 
     /// 退出快捷输入模式并清空状态
@@ -1401,7 +1457,9 @@ impl Coordinator {
             0x20 => {
                 // 空格：上屏当前高亮候选；无候选则退出
                 if !state.candidates.is_empty() {
-                    let idx = self.highlighted_global_index(state).min(state.candidates.len() - 1);
+                    let idx = self
+                        .highlighted_global_index(state)
+                        .min(state.candidates.len() - 1);
                     let text = state.candidates[idx].text.clone();
                     self.exit_quick_input(state);
                     self.notify_ui_hide();
@@ -1464,8 +1522,7 @@ impl Coordinator {
             }
             _ => {
                 // 再次按触发键且缓冲为空：按标点配置上屏前缀字符并退出
-                if state.quick_input_buffer.is_empty()
-                    && self.is_quick_input_trigger(data.key_code)
+                if state.quick_input_buffer.is_empty() && self.is_quick_input_trigger(data.key_code)
                 {
                     let ch = state.quick_input_prefix.chars().next().unwrap_or(';');
                     let out = self.convert_punct_char(state, ch);
@@ -1500,6 +1557,84 @@ impl Coordinator {
         state.active = None;
         state.temp_english_buffer.clear();
         state.preedit.clear();
+    }
+
+    /// 探针是否恰好等于某个网址前缀（精确匹配，对齐 Go urlActivationResidual 的全匹配语义）。
+    fn is_url_prefix(&self, probe: &str) -> bool {
+        self.config
+            .input
+            .url_input
+            .prefixes
+            .iter()
+            .any(|p| !p.is_empty() && p == probe)
+    }
+
+    /// 进入网址模式：以补全前缀的完整文本作初始缓冲，清空普通输入/候选，隐藏候选窗。
+    /// 网址模式无候选，仅在组合区原样显示累积文本。
+    fn enter_url_mode(&self, state: &mut State, buffer: String) -> KeyAction {
+        state.input_buffer.clear();
+        state.candidates.clear();
+        state.active = Some(ModeKind::Url);
+        state.url_buffer = buffer;
+        self.notify_ui_hide();
+        let disp = state.url_buffer.clone();
+        debug!("Entered URL mode (buffer={})", disp);
+        KeyAction::UpdateComposition {
+            text: disp.clone(),
+            caret_pos: disp.chars().count() as u32,
+        }
+    }
+
+    /// 退出网址模式并清空相关状态。
+    fn exit_url_mode(&self, state: &mut State) {
+        state.active = None;
+        state.url_buffer.clear();
+        state.preedit.clear();
+    }
+
+    /// 网址模式按键处理：可见 ASCII 原样累积；空格/回车上屏原文；退格删空退出；Esc 放弃。
+    fn handle_url_key(&self, state: &mut State, data: &KeyEventData) -> KeyAction {
+        let comp = |buf: &str| KeyAction::UpdateComposition {
+            text: buf.to_string(),
+            caret_pos: buf.chars().count() as u32,
+        };
+        match data.key_code {
+            0x1B => {
+                // Esc：放弃退出（无上屏）
+                self.exit_url_mode(state);
+                KeyAction::ClearComposition
+            }
+            0x08 => {
+                // 退格：删尾字符；删空则退出
+                state.url_buffer.pop();
+                if state.url_buffer.is_empty() {
+                    self.exit_url_mode(state);
+                    KeyAction::ClearComposition
+                } else {
+                    comp(&state.url_buffer)
+                }
+            }
+            0x20 | 0x0D => {
+                // 空格/回车：上屏当前缓冲原文（不做全半角/标点转换）
+                let text = state.url_buffer.clone();
+                self.exit_url_mode(state);
+                if text.is_empty() {
+                    KeyAction::ClearComposition
+                } else {
+                    Self::commit_action(text, true)
+                }
+            }
+            _ => {
+                let shift = data.modifiers & MOD_SHIFT != 0;
+                if let Some(ch) = printable_char(data.key_code, shift) {
+                    state.url_buffer.push(ch);
+                    comp(&state.url_buffer)
+                } else {
+                    // 方向键等非可打印键：消费但不改缓冲（首版不支持光标内编辑）
+                    KeyAction::Consumed
+                }
+            }
+        }
     }
 
     /// 临时英文模式按键处理（首版：缓冲累积 + 空格/回车/标点上屏，暂无词库候选）
@@ -1582,7 +1717,9 @@ impl Coordinator {
         target: String,
     ) -> KeyAction {
         let committed = if !state.candidates.is_empty() {
-            let idx = self.highlighted_global_index(state).min(state.candidates.len() - 1);
+            let idx = self
+                .highlighted_global_index(state)
+                .min(state.candidates.len() - 1);
             let t = state.candidates[idx].text.clone();
             self.record_selection(&state.input_buffer, &t);
             Some(t)
@@ -1617,7 +1754,9 @@ impl Coordinator {
     /// 顶屏当前高亮候选（若有）并进入快捷输入模式。
     fn commit_and_enter_quick_input(&self, state: &mut State, key_code: u32) -> KeyAction {
         let committed = if !state.candidates.is_empty() {
-            let idx = self.highlighted_global_index(state).min(state.candidates.len() - 1);
+            let idx = self
+                .highlighted_global_index(state)
+                .min(state.candidates.len() - 1);
             let t = state.candidates[idx].text.clone();
             self.record_selection(&state.input_buffer, &t);
             Some(t)
@@ -1708,11 +1847,7 @@ impl Coordinator {
         // 悬停目标独立于选中项：候选越界视为无悬停，翻页器 tag 原样透传
         let hover = match state.hover_index {
             h if (0..wind_ui::manager::HOVER_PAGE_PREV).contains(&h) => {
-                if (h as usize) < items.len() {
-                    h
-                } else {
-                    -1
-                }
+                if (h as usize) < items.len() { h } else { -1 }
             }
             h => h, // 翻页器 tag / -1
         };
@@ -1720,7 +1855,10 @@ impl Coordinator {
         let (cx, cy, ch) = (state.caret_x, state.caret_y, state.caret_height);
         let valid = ch > 0 && !(cx == 0 && cy == 0) && cx.abs() < 32000 && cy.abs() < 32000;
         let (caret_x, caret_y, caret_height, caret_valid) = {
-            let mut lv = self.last_valid_caret.lock().unwrap_or_else(|e| e.into_inner());
+            let mut lv = self
+                .last_valid_caret
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
             if valid {
                 *lv = (cx, cy, ch);
                 (cx, cy, ch, true)
@@ -1730,7 +1868,10 @@ impl Coordinator {
                 (cx, cy, ch, false) // 尚无任何有效坐标：临时显示，待有效坐标到达再重定位
             }
         };
-        *self.awaiting_caret.lock().unwrap_or_else(|e| e.into_inner()) = !caret_valid;
+        *self
+            .awaiting_caret
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = !caret_valid;
         let n_items = items.len();
         let _ = self.ui_tx.send(UiCommand::UpdateCandidates {
             preedit: state.preedit.clone(),
@@ -1744,7 +1885,11 @@ impl Coordinator {
             caret_height,
             caret_valid,
         });
-        tracing::debug!("notify_ui_update: build+send {:?} (n={})", t_nu.elapsed(), n_items);
+        tracing::debug!(
+            "notify_ui_update: build+send {:?} (n={})",
+            t_nu.elapsed(),
+            n_items
+        );
     }
 
     fn notify_ui_hide(&self) {
@@ -1821,7 +1966,9 @@ impl Coordinator {
             | MenuCmd::OpenSettings
             | MenuCmd::OpenAbout => {
                 if let Some(d) = Config::user_config_dir() {
-                    let _ = self.ui_tx.send(UiCommand::OpenPath(d.display().to_string()));
+                    let _ = self
+                        .ui_tx
+                        .send(UiCommand::OpenPath(d.display().to_string()));
                 }
             }
         }
@@ -2026,7 +2173,8 @@ impl Coordinator {
         // 输入方案子菜单：英文 + 方案单选
         let active = self.engine_mgr.active_schema_id();
         let schemas = self.engine_mgr.available_schemas().to_vec();
-        let mut schema_children = vec![M::leaf("英文", cmd(MenuCmd::SchemaEnglish), true, !chinese)];
+        let mut schema_children =
+            vec![M::leaf("英文", cmd(MenuCmd::SchemaEnglish), true, !chinese)];
         if !schemas.is_empty() {
             schema_children.push(M::separator());
             for (i, id) in schemas.iter().enumerate() {
@@ -2068,7 +2216,12 @@ impl Coordinator {
             M::separator(),
         ];
         for (i, (id, label)) in S2T_VARIANTS.iter().enumerate() {
-            s2t_children.push(M::leaf(*label, cmd(MenuCmd::S2tVariant(i)), true, s2t_variant == *id));
+            s2t_children.push(M::leaf(
+                *label,
+                cmd(MenuCmd::S2tVariant(i)),
+                true,
+                s2t_variant == *id,
+            ));
         }
 
         // 检索范围子菜单：过滤模式单选
@@ -2104,11 +2257,16 @@ impl Coordinator {
             s.menu_target_page_local = 0;
             s.menu_target_text = String::new();
         }
-        let _ = self.ui_tx.send(UiCommand::ShowCandidateMenu { items, x, y });
+        let _ = self
+            .ui_tx
+            .send(UiCommand::ShowCandidateMenu { items, x, y });
     }
 
     fn is_menu_open(&self) -> bool {
-        self.state.lock().unwrap_or_else(|e| e.into_inner()).menu_open
+        self.state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .menu_open
     }
 
     /// 关闭菜单
@@ -2174,7 +2332,9 @@ impl Coordinator {
             state.menu_target_page_local = page_local;
             state.menu_target_text = word;
         }
-        let _ = self.ui_tx.send(UiCommand::ShowCandidateMenu { items, x, y });
+        let _ = self
+            .ui_tx
+            .send(UiCommand::ShowCandidateMenu { items, x, y });
     }
 
     /// 候选词条操作（右键菜单）：调整 Shadow 规则并即时重排重绘。
@@ -2311,11 +2471,13 @@ impl Coordinator {
         drop(state);
 
         self.notify_ui_hide();
-        let encoded =
-            wind_ipc::codec::encode_commit_text(&out, None, false, chinese_mode, false);
+        let encoded = wind_ipc::codec::encode_commit_text(&out, None, false, chinese_mode, false);
         // 仅推给活动客户端，避免广播导致多个 TSF 端重复上屏
         self.push_server.push_commit_to_active(&encoded);
-        debug!("mouse_select: committed '{}' (page_local={})", out, page_local);
+        debug!(
+            "mouse_select: committed '{}' (page_local={})",
+            out, page_local
+        );
     }
 
     /// 滚轮翻页：dir<0 上一页，dir>0 下一页；仅重绘候选窗，不上屏。
@@ -2369,7 +2531,11 @@ impl Coordinator {
             chinese_punct: state.chinese_punct,
             toolbar_visible: state.toolbar_visible,
             caps_lock: state.caps_lock,
-            icon_label: if state.chinese_mode { "中".into() } else { "英".into() },
+            icon_label: if state.chinese_mode {
+                "中".into()
+            } else {
+                "英".into()
+            },
             key_down_hotkeys: self.compiled_hotkeys.key_down_tsf_hashes(),
             key_up_hotkeys: self.compiled_hotkeys.key_up_tsf_hashes(),
         }
@@ -2382,8 +2548,15 @@ impl Coordinator {
             s.chinese_mode, s.key_down_hotkeys, s.key_up_hotkeys
         );
         let encoded = wind_ipc::codec::encode_activation_status_push(
-            s.chinese_mode, s.full_width, s.chinese_punct, s.toolbar_visible, s.caps_lock,
-            false, &s.key_down_hotkeys, &s.key_up_hotkeys, &s.icon_label,
+            s.chinese_mode,
+            s.full_width,
+            s.chinese_punct,
+            s.toolbar_visible,
+            s.caps_lock,
+            false,
+            &s.key_down_hotkeys,
+            &s.key_up_hotkeys,
+            &s.icon_label,
         );
         self.push_server.push_to_active(&encoded);
     }
@@ -2391,7 +2564,12 @@ impl Coordinator {
     fn push_state_update(&self) {
         let s = self.build_status();
         let encoded = wind_ipc::codec::encode_state_push(
-            s.chinese_mode, s.full_width, s.chinese_punct, s.toolbar_visible, s.caps_lock, &s.icon_label,
+            s.chinese_mode,
+            s.full_width,
+            s.chinese_punct,
+            s.toolbar_visible,
+            s.caps_lock,
+            &s.icon_label,
         );
         self.push_server.push_to_active(&encoded);
     }
@@ -2552,6 +2730,7 @@ impl Coordinator {
         state.temp_pinyin_prefix.clear();
         state.quick_input_buffer.clear();
         state.quick_input_prefix.clear();
+        state.url_buffer.clear();
         // 清理可能残留的组合显示（临时拼音/快捷输入会产生候选与 preedit）
         state.input_buffer.clear();
         state.candidates.clear();
@@ -2646,7 +2825,10 @@ impl MessageHandler for Coordinator {
         let norm_hash = calc_key_hash(norm_mods, data.key_code);
         if let Some(action) = self.compiled_hotkeys.match_key_down(norm_hash) {
             if !action.is_empty() {
-                debug!("Hotkey matched (key_down): {} (0x{:08X})", action, norm_hash);
+                debug!(
+                    "Hotkey matched (key_down): {} (0x{:08X})",
+                    action, norm_hash
+                );
                 let action = action.to_string();
                 if self.dispatch_hotkey(&action) {
                     return KeyAction::StatusUpdate(self.build_status());
@@ -2666,6 +2848,7 @@ impl MessageHandler for Coordinator {
             Some(ModeKind::TempPinyin) => return self.handle_temp_pinyin_key(&mut state, data),
             Some(ModeKind::QuickInput) => return self.handle_quick_input_key(&mut state, data),
             Some(ModeKind::TempEnglish) => return self.handle_temp_english_key(&mut state, data),
+            Some(ModeKind::Url) => return self.handle_url_key(&mut state, data),
             None => {}
         }
 
@@ -2701,7 +2884,10 @@ impl MessageHandler for Coordinator {
             self.update_quick_input_candidates(&mut state);
             let display = state.preedit.clone();
             self.notify_ui_update(&state);
-            debug!("Entered quick input mode (prefix={})", state.quick_input_prefix);
+            debug!(
+                "Entered quick input mode (prefix={})",
+                state.quick_input_prefix
+            );
             return KeyAction::UpdateComposition {
                 text: display.clone(),
                 caret_pos: display.chars().count() as u32,
@@ -2717,12 +2903,14 @@ impl MessageHandler for Coordinator {
                 state.active = Some(ModeKind::TempPinyin);
                 state.temp_pinyin_schema = target;
                 state.temp_pinyin_buffer.clear();
-                state.temp_pinyin_prefix =
-                    Self::temp_pinyin_prefix_for(data.key_code).to_string();
+                state.temp_pinyin_prefix = Self::temp_pinyin_prefix_for(data.key_code).to_string();
                 self.update_temp_pinyin_candidates(&mut state);
                 let display = state.preedit.clone();
                 self.notify_ui_update(&state);
-                debug!("Entered temp pinyin mode (prefix={})", state.temp_pinyin_prefix);
+                debug!(
+                    "Entered temp pinyin mode (prefix={})",
+                    state.temp_pinyin_prefix
+                );
                 return KeyAction::UpdateComposition {
                     text: display.clone(),
                     caret_pos: display.chars().count() as u32,
@@ -2740,6 +2928,20 @@ impl MessageHandler for Coordinator {
                 return KeyAction::ClearComposition;
             }
             return KeyAction::PassThrough;
+        }
+
+        // ── 网址模式激活（夺取式）──
+        // 普通输入累积时，若 input_buffer + 当前键字符 恰好等于某前缀（如 "www."/"http"），
+        // 则夺取进入网址模式。置于主分派前，确保「补全前缀的那一键」（字母或 '.'）先被截获，
+        // 不落入普通码表/标点处理。前缀按惯例小写，故探针用小写字母对齐 input_buffer。
+        if self.config.input.url_input.enabled {
+            let shift = data.modifiers & MOD_SHIFT != 0;
+            if let Some(ch) = printable_char(data.key_code, shift) {
+                let probe = format!("{}{}", state.input_buffer, ch.to_ascii_lowercase());
+                if self.is_url_prefix(&probe) {
+                    return self.enter_url_mode(&mut state, probe);
+                }
+            }
         }
 
         debug!(
@@ -2778,7 +2980,9 @@ impl MessageHandler for Coordinator {
             0x20 => {
                 // Space：选当前高亮候选 / 上屏编码
                 if !state.candidates.is_empty() {
-                    let idx = self.highlighted_global_index(&state).min(state.candidates.len() - 1);
+                    let idx = self
+                        .highlighted_global_index(&state)
+                        .min(state.candidates.len() - 1);
                     let text = state.candidates[idx].text.clone();
                     let out = self.commit_candidate(&mut state, &text);
                     self.notify_ui_hide();
@@ -2877,9 +3081,7 @@ impl MessageHandler for Coordinator {
                 }
                 KeyAction::Consumed
             }
-            0xBD | 0xBB
-                if !state.candidates.is_empty() && data.modifiers & MOD_SHIFT == 0 =>
-            {
+            0xBD | 0xBB if !state.candidates.is_empty() && data.modifiers & MOD_SHIFT == 0 => {
                 // '-' / '=' 翻页（仅有候选且无 Shift 时；否则落入标点分支）
                 let changed = if data.key_code == 0xBD {
                     self.page_prev(&mut state)
@@ -2929,7 +3131,9 @@ impl MessageHandler for Coordinator {
                     // 标点/符号键：先上屏首选候选（若有输入），再追加（转换后的）标点
                     let mut out = String::new();
                     if !state.candidates.is_empty() {
-                        let idx = self.highlighted_global_index(&state).min(state.candidates.len() - 1);
+                        let idx = self
+                            .highlighted_global_index(&state)
+                            .min(state.candidates.len() - 1);
                         let t = state.candidates[idx].text.clone();
                         self.record_selection(&state.input_buffer, &t);
                         out.push_str(&self.maybe_s2t(&state, &t));
@@ -2960,16 +3164,17 @@ impl MessageHandler for Coordinator {
                             tr.clear();
                         }
                         // 插入配对：左括号 → 补右括号，光标置于其间
-                        if let Some((_, right)) =
-                            pairs.iter().find(|(l, _)| *l == pch).copied()
-                        {
+                        if let Some((_, right)) = pairs.iter().find(|(l, _)| *l == pch).copied() {
                             self.pair_tracker
                                 .lock()
                                 .unwrap_or_else(|e| e.into_inner())
                                 .push(pch, right);
                             let cursor_offset = out.encode_utf16().count() as u32;
                             let text = format!("{}{}", out, right);
-                            return KeyAction::InsertTextWithCursor { text, cursor_offset };
+                            return KeyAction::InsertTextWithCursor {
+                                text,
+                                cursor_offset,
+                            };
                         }
                     }
                     Self::commit_action(out, true)
@@ -3031,7 +3236,10 @@ impl MessageHandler for Coordinator {
         if client_token != 0 {
             self.push_server.set_active_token(client_token);
         }
-        self.state.lock().unwrap_or_else(|e| e.into_inner()).ime_active = true;
+        self.state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .ime_active = true;
         let status = self.build_status();
         self.push_activation_status();
         self.notify_toolbar(); // 激活态 → 工具栏显示
@@ -3148,9 +3356,11 @@ impl MessageHandler for Coordinator {
         state.caret_y = data.y;
         state.caret_height = data.height;
         // 首次连接尚无有效坐标时，候选窗临时显示在左上角；待有效坐标到达即重定位。
-        let now_valid =
-            data.height > 0 && !(data.x == 0 && data.y == 0) && data.x.abs() < 32000;
-        let awaiting = *self.awaiting_caret.lock().unwrap_or_else(|e| e.into_inner());
+        let now_valid = data.height > 0 && !(data.x == 0 && data.y == 0) && data.x.abs() < 32000;
+        let awaiting = *self
+            .awaiting_caret
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let composing = !state.candidates.is_empty() || !state.input_buffer.is_empty();
         if awaiting && now_valid && composing {
             self.notify_ui_update(&state);

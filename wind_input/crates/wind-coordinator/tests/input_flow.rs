@@ -124,7 +124,11 @@ fn test_pinyin_basic_input() {
     }
     let preedit = action_text(&last).expect("应返回 UpdateComposition");
     // 拼音组合区显示音节分隔的拼音串，不含候选
-    assert_eq!(preedit, "ni hao", "拼音组合区应显示 'ni hao'，实际: {}", preedit);
+    assert_eq!(
+        preedit, "ni hao",
+        "拼音组合区应显示 'ni hao'，实际: {}",
+        preedit
+    );
 
     // 空格上屏首选，应得到 你好
     let commit = coord.handle_key_event(&key_event(0x20, EVENT_KEY_DOWN));
@@ -218,7 +222,11 @@ fn test_punct_commits_candidate_first() {
     match coord.handle_key_event(&key_event(0xBE, EVENT_KEY_DOWN)) {
         KeyAction::InsertText { text, .. } => {
             assert!(text.ends_with("。"), "应以中文句号结尾，实际: {}", text);
-            assert!(text.chars().count() >= 2, "应包含上屏候选+句号，实际: {}", text);
+            assert!(
+                text.chars().count() >= 2,
+                "应包含上屏候选+句号，实际: {}",
+                text
+            );
         }
         other => panic!("应上屏候选+句号，实际: {:?}", other),
     }
@@ -390,7 +398,11 @@ fn test_temp_pinyin_backtick_trigger_and_commit() {
         last = press_letter(&coord, c);
     }
     let preedit = action_text(&last).unwrap();
-    assert_eq!(preedit, "`ni hao", "临时拼音组合区应为 `ni hao，实际: {}", preedit);
+    assert_eq!(
+        preedit, "`ni hao",
+        "临时拼音组合区应为 `ni hao，实际: {}",
+        preedit
+    );
 
     // 候选应来自拼音引擎（含 你好）
     let texts = coord.debug_page_texts();
@@ -433,7 +445,11 @@ fn test_temp_pinyin_commit_and_enter_with_candidates() {
         } => {
             assert_eq!(text, first, "应顶屏当前高亮候选");
             assert!(has_new_composition, "应原子开启新组合");
-            assert_eq!(new_composition.as_deref(), Some("`"), "新组合应为临时拼音前缀");
+            assert_eq!(
+                new_composition.as_deref(),
+                Some("`"),
+                "新组合应为临时拼音前缀"
+            );
         }
         other => panic!("有候选按反引号应顶屏+进临时拼音，实际: {:?}", other),
     }
@@ -510,7 +526,11 @@ fn test_quick_input_calc() {
 
     // 首选候选应为 "1+2*3=7"
     let texts = coord.debug_page_texts();
-    assert_eq!(texts[0], "1+2*3=7", "计算器首选应为表达式=结果，实际: {:?}", texts);
+    assert_eq!(
+        texts[0], "1+2*3=7",
+        "计算器首选应为表达式=结果，实际: {:?}",
+        texts
+    );
 
     // 字母 a 选第 1 个候选上屏
     match press_vk(&coord, 0x41, false) {
@@ -615,7 +635,9 @@ fn test_phrase_date_expansion() {
     }
     let texts = coord.debug_page_texts();
     // 短语高权重 → 应在候选中且靠前；校验存在「年…月…日」格式
-    let has_date_phrase = texts.iter().any(|t| t.contains('年') && t.contains('月') && t.contains('日'));
+    let has_date_phrase = texts
+        .iter()
+        .any(|t| t.contains('年') && t.contains('月') && t.contains('日'));
     assert!(
         has_date_phrase,
         "输入 date 应出现日期短语候选，实际: {:?}",
@@ -634,7 +656,9 @@ fn test_phrase_time_expansion() {
     }
     let texts = coord.debug_page_texts();
     // 时间短语 $HH:$mm:$ss → 含冒号的时间串
-    let has_time = texts.iter().any(|t| t.matches(':').count() >= 1 && t.chars().any(|c| c.is_ascii_digit()));
+    let has_time = texts
+        .iter()
+        .any(|t| t.matches(':').count() >= 1 && t.chars().any(|c| c.is_ascii_digit()));
     assert!(has_time, "输入 time 应出现时间短语候选，实际: {:?}", texts);
 }
 
@@ -800,7 +824,11 @@ fn test_temp_english_shift_letter_commit() {
     let coord = Coordinator::new_headless(config_with("wubi86"), Some(&data_dir()));
     // Shift+H 进入临时英文，首字母大写
     let act = press_shift_letter(&coord, 'h');
-    assert_eq!(action_text(&act).unwrap(), "H", "Shift+H 应进入临时英文显示 H");
+    assert_eq!(
+        action_text(&act).unwrap(),
+        "H",
+        "Shift+H 应进入临时英文显示 H"
+    );
 
     // 续输 ello（无 Shift → 小写）
     let mut last = act;
@@ -854,11 +882,7 @@ fn test_temp_english_esc_exits() {
 
 fn config_mixed() -> Config {
     let mut cfg = Config::default();
-    cfg.schema.available = vec![
-        "wubi86_pinyin".into(),
-        "wubi86".into(),
-        "pinyin".into(),
-    ];
+    cfg.schema.available = vec!["wubi86_pinyin".into(), "wubi86".into(), "pinyin".into()];
     cfg.schema.active = "wubi86_pinyin".into();
     cfg.general.default_chinese_mode = true;
     cfg
@@ -877,7 +901,12 @@ fn test_mixed_wubi_exact_priority() {
     }
     let texts = coord.debug_page_texts();
     assert!(!texts.is_empty(), "混输应有候选");
-    assert_eq!(texts[0], "恭恭敬敬", "五笔精确匹配应排首位，实际: {:?}", &texts[..texts.len().min(3)]);
+    assert_eq!(
+        texts[0],
+        "恭恭敬敬",
+        "五笔精确匹配应排首位，实际: {:?}",
+        &texts[..texts.len().min(3)]
+    );
 }
 
 #[test]

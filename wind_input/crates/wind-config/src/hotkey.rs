@@ -371,9 +371,7 @@ fn parse_key_name(name: &str) -> Option<u32> {
         }
 
         // 十六进制键码（如 "0x41"）
-        _ if name.starts_with("0x") => {
-            u32::from_str_radix(&name[2..], 16).ok()
-        }
+        _ if name.starts_with("0x") => u32::from_str_radix(&name[2..], 16).ok(),
 
         _ => None,
     }

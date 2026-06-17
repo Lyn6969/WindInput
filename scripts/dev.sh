@@ -29,6 +29,9 @@
 #   push [debug]    交叉编译 exe 并 drop-in 到 Windows 安装目录（复用其 TSF DLL+data）；
 #                   debug → 构建 debug_variant 并推为 wind_input_debug.exe；先 taskkill 远程进程再覆盖
 #   pull-data       从 Windows 安装目录拉 data/（真实词库）回本机供 REPL
+#   pull-config     从 Windows 拉 config.toml（%APPDATA%\<App>）到 .remote/ 查看
+#   pull-log [all]  从 Windows 拉日志（%LOCALAPPDATA%\<App>\logs）到 .remote/；
+#                   默认仅最新一天，all 拉整目录（需 deploy.local 配 WIND_DATA_DIR/WIND_LOCAL_DIR）
 #   gen-data        独立下载+转换词库（暂用 Go 工具；Rust 化为后续）
 #
 # 推荐实测流程：① pull-data 拉真实词库 → ② repl 在 Linux 验证候选逻辑
@@ -59,8 +62,15 @@ GO_REPO="$(dirname "$PRODUCT_ROOT")/WindInput"
 [ -f "$SCRIPT_DIR/deploy.local" ] && . "$SCRIPT_DIR/deploy.local"
 WIND_REMOTE="${WIND_REMOTE:-}"
 WIND_REMOTE_DIR="${WIND_REMOTE_DIR:-}"
+# 远程数据/本地目录（拉配置、拉日志用；见 deploy.local 注释）：
+#   WIND_DATA_DIR   = %APPDATA%\<App>        含 config.toml（用户配置）
+#   WIND_LOCAL_DIR  = %LOCALAPPDATA%\<App>   含 logs/（服务日志）、cache/
+WIND_DATA_DIR="${WIND_DATA_DIR:-}"
+WIND_LOCAL_DIR="${WIND_LOCAL_DIR:-}"
 # 本机给 REPL 用的 data 目录（pull-data 拉取到此）
 LOCAL_DATA="$PRODUCT_ROOT/data"
+# 从远程拉取的配置/日志落地处（本地查看用，不入库）
+REMOTE_PULL_DIR="$PRODUCT_ROOT/.remote"
 
 TARGET="x86_64-pc-windows-gnu"
 
@@ -287,6 +297,62 @@ do_pull_data() {
     fi
 }
 
+# 校验远程数据/本地目录配置（拉配置、拉日志用）
+require_remote_dirs() {
+    require_remote || return 1
+    if [ -z "$WIND_DATA_DIR" ] || [ -z "$WIND_LOCAL_DIR" ]; then
+        err "未配置远程目录：请在 $SCRIPT_DIR/deploy.local 设置 WIND_DATA_DIR 与 WIND_LOCAL_DIR"
+        echo "  示例: WIND_DATA_DIR='C:/Users/me/AppData/Roaming/WindInputDebug'   # %APPDATA%"
+        echo "        WIND_LOCAL_DIR='C:/Users/me/AppData/Local/WindInputDebug'    # %LOCALAPPDATA%"
+        return 1
+    fi
+}
+
+# 从 Windows 拉取用户配置 config.toml（%APPDATA%\<App>\config.toml）到本机查看。
+do_pull_config() {
+    require_remote_dirs || return 1
+    mkdir -p "$REMOTE_PULL_DIR"
+    local dst="$REMOTE_PULL_DIR/config.toml"
+    say "\n拉取 config.toml ← $WIND_REMOTE:$WIND_DATA_DIR/config.toml"
+    if scp "$WIND_REMOTE:$WIND_DATA_DIR/config.toml" "$dst"; then
+        say "已拉取 → $dst"
+    else
+        err "scp 失败（检查 WIND_DATA_DIR 路径/SSH；config.toml 可能尚未生成）"
+    fi
+}
+
+# 从 Windows 拉取服务日志（%LOCALAPPDATA%\<App>\logs\）到本机查看。
+# 默认只拉最新一天的日志；传 all 拉整个 logs 目录。cache/ 不在此目录，不会被带下来。
+do_pull_log() {
+    require_remote_dirs || return 1
+    mkdir -p "$REMOTE_PULL_DIR/logs"
+    local mode="${1:-}"
+    if [ "$mode" = "all" ]; then
+        say "\n拉取全部日志 ← $WIND_REMOTE:$WIND_LOCAL_DIR/logs/"
+        if scp -r "$WIND_REMOTE:$WIND_LOCAL_DIR/logs" "$REMOTE_PULL_DIR/"; then
+            say "已拉取 → $REMOTE_PULL_DIR/logs/"
+        else
+            err "scp 失败（检查 WIND_LOCAL_DIR 路径/SSH）"
+        fi
+        return
+    fi
+    # 取远程最新的日志文件（按天滚动：wind_input.log.YYYY-MM-DD）
+    say "\n查询远程最新日志 ← $WIND_REMOTE:$WIND_LOCAL_DIR/logs/"
+    local latest
+    latest="$(ssh "$WIND_REMOTE" "powershell -NoProfile -Command \"Get-ChildItem -Path '$WIND_LOCAL_DIR/logs' -Filter 'wind_input.log*' | Sort-Object LastWriteTime -Descending | Select-Object -First 1 -ExpandProperty Name\"" 2>/dev/null | tr -d '\r')"
+    if [ -z "$latest" ]; then
+        err "未找到日志文件（检查 WIND_LOCAL_DIR/logs 是否存在；或用 'pull-log all' 整目录拉取）"
+        return 1
+    fi
+    local dst="$REMOTE_PULL_DIR/logs/$latest"
+    say "拉取最新日志 $latest"
+    if scp "$WIND_REMOTE:$WIND_LOCAL_DIR/logs/$latest" "$dst"; then
+        say "已拉取 → $dst"
+    else
+        err "scp 失败（检查 SSH/路径）"
+    fi
+}
+
 # 独立词库流水线（不依赖 Windows 安装）：下载 rime 原始词库 + 转换。
 # 转换暂复用 Go 仓库的工具（go run），Rust 化转换器为后续任务（见 docs）。
 # 当前仅编排：调用 Go 仓库 build 脚本产出 data，再复制到 $LOCAL_DATA。
@@ -331,6 +397,8 @@ show_menu() {
     echo  "    p  - push: 交叉编译 exe → Windows (release)"
     echo  "    pd - push debug: → wind_input_debug.exe (调试)"
     echo  "    dl - pull-data: 从 Windows 拉真实词库回本机"
+    echo  "    pc - pull-config: 从 Windows 拉 config.toml 回本机查看"
+    echo  "    pl - pull-log: 从 Windows 拉最新日志回本机 (pla = 整目录)"
     echo  "    gd - gen-data: 独立下载+转换词库"
     printf '\n%b  工具:%b\n' "$C_YELLOW" "$C_RESET"
     echo  "    f  - cargo fmt (代码格式化)"
@@ -360,6 +428,9 @@ menu_loop() {
             p)   do_push;           pause ;;
             pd)  do_push debug;     pause ;;
             dl)  do_pull_data;      pause ;;
+            pc)  do_pull_config;    pause ;;
+            pl)  do_pull_log;       pause ;;
+            pla) do_pull_log all;   pause ;;
             gd)  do_gen_data;       pause ;;
             f)   do_fmt;            pause ;;
             i)   do_ci;             pause ;;
@@ -389,6 +460,8 @@ case "${1:-}" in
     repl)               do_repl "${2:-}" ;;
     push)               do_push "${2:-}" ;;
     pull-data)          do_pull_data ;;
+    pull-config)        do_pull_config ;;
+    pull-log)           do_pull_log "${2:-}" ;;
     gen-data)           do_gen_data ;;
     -h|--help|help)
         grep '^#' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'

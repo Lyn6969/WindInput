@@ -139,7 +139,10 @@ pub fn generate_calc_candidates(expr: &str, decimal_places: i32) -> Vec<String> 
 /// 递归下降求值（支持 + - * / 与括号、优先级）。返回 None 表示解析失败。
 pub fn evaluate_expression(expr: &str) -> Option<f64> {
     let bytes: Vec<u8> = expr.bytes().collect();
-    let mut p = ExprParser { input: &bytes, pos: 0 };
+    let mut p = ExprParser {
+        input: &bytes,
+        pos: 0,
+    };
     let v = p.parse_expr()?;
     // 必须消费完整输入
     if p.pos != p.input.len() {
@@ -307,11 +310,7 @@ fn group_to_chinese(group: &str, digits: &[&str; 10], units: &[&str; 4]) -> Stri
             result.push_str(units[unit_idx]);
         }
     }
-    if all_zero {
-        String::new()
-    } else {
-        result
-    }
+    if all_zero { String::new() } else { result }
 }
 
 /// 数字串 → 中文（按每 4 位一组：个/万/亿/万亿）
@@ -465,7 +464,11 @@ pub fn generate_number_candidates(s: &str) -> Vec<String> {
         return Vec::new();
     }
     let (int_part_raw, dec_part) = split_decimal(s);
-    let int_part = if int_part_raw.is_empty() { "0" } else { int_part_raw };
+    let int_part = if int_part_raw.is_empty() {
+        "0"
+    } else {
+        int_part_raw
+    };
 
     if dec_part.is_empty() {
         // 整数（含 "123." 情况）
@@ -572,8 +575,16 @@ mod tests {
     #[test]
     fn test_number_integer_candidates() {
         let c = generate_number_candidates("123");
-        assert!(c.contains(&"壹佰贰拾叁元整".to_string()), "大写金额，实际: {:?}", c);
-        assert!(c.contains(&"一百二十三".to_string()), "中文小写，实际: {:?}", c);
+        assert!(
+            c.contains(&"壹佰贰拾叁元整".to_string()),
+            "大写金额，实际: {:?}",
+            c
+        );
+        assert!(
+            c.contains(&"一百二十三".to_string()),
+            "中文小写，实际: {:?}",
+            c
+        );
         assert!(c.contains(&"壹佰贰拾叁".to_string()), "中文大写");
         assert!(c.contains(&"一二三".to_string()), "逐位");
     }
@@ -581,8 +592,16 @@ mod tests {
     #[test]
     fn test_number_thousands() {
         let c = generate_number_candidates("1234567");
-        assert!(c.contains(&"1,234,567".to_string()), "千分位，实际: {:?}", c);
-        assert!(c.contains(&"一百二十三万四千五百六十七".to_string()), "中文大数，实际: {:?}", c);
+        assert!(
+            c.contains(&"1,234,567".to_string()),
+            "千分位，实际: {:?}",
+            c
+        );
+        assert!(
+            c.contains(&"一百二十三万四千五百六十七".to_string()),
+            "中文大数，实际: {:?}",
+            c
+        );
     }
 
     #[test]

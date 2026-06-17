@@ -159,6 +159,8 @@ pub struct InputConfig {
     pub capslock: CapslockConfig,
     #[serde(default)]
     pub temp_pinyin: TempPinyinConfig,
+    #[serde(default)]
+    pub url_input: UrlInputConfig,
 }
 
 /// 自定义标点映射配置（对齐 Go PunctCustomConfig）。
@@ -231,6 +233,38 @@ impl Default for TempPinyinConfig {
     }
 }
 
+/// 网址模式配置（对齐 Go UrlInputConfig）。
+/// 普通输入累积时，若 `input_buffer + 当前键字符` 恰好等于某前缀，则夺取进入网址模式：
+/// 后续可见 ASCII 字符原样累积，空格/回车上屏原文，退格删空退出。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UrlInputConfig {
+    /// 总开关（默认关闭）
+    #[serde(default)]
+    pub enabled: bool,
+    /// 触发前缀（恰好匹配；如 "www." / "http" / "https" / "ftp."）
+    #[serde(default = "default_url_prefixes")]
+    pub prefixes: Vec<String>,
+}
+
+fn default_url_prefixes() -> Vec<String> {
+    vec![
+        "www.".to_string(),
+        "http".to_string(),
+        "https".to_string(),
+        "ftp.".to_string(),
+        "bbs.".to_string(),
+    ]
+}
+
+impl Default for UrlInputConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            prefixes: default_url_prefixes(),
+        }
+    }
+}
+
 impl Default for InputConfig {
     fn default() -> Self {
         Self {
@@ -254,6 +288,7 @@ impl Default for InputConfig {
             pinyin_separator: "auto".to_string(),
             shift_temp_english: ShiftTempEnglishConfig::default(),
             capslock: CapslockConfig::default(),
+            url_input: UrlInputConfig::default(),
         }
     }
 }
@@ -585,15 +620,19 @@ impl Config {
 
     /// 获取 data 目录（与可执行文件同目录的 data/）
     pub fn data_dir() -> Option<PathBuf> {
-        std::env::current_exe().ok().and_then(|p| {
-            p.parent().map(|d| d.join("data"))
-        })
+        std::env::current_exe()
+            .ok()
+            .and_then(|p| p.parent().map(|d| d.join("data")))
     }
 
     /// 获取当前激活的 schema ID
     pub fn active_schema(&self) -> &str {
         if self.schema.active.is_empty() {
-            self.schema.available.first().map(|s| s.as_str()).unwrap_or("wubi86")
+            self.schema
+                .available
+                .first()
+                .map(|s| s.as_str())
+                .unwrap_or("wubi86")
         } else {
             &self.schema.active
         }
@@ -616,13 +655,20 @@ mod tests {
 
     #[test]
     fn test_default_per_page_is_7() {
-        assert_eq!(Config::default().ui.candidate.per_page, 7, "候选每页默认应为 7");
+        assert_eq!(
+            Config::default().ui.candidate.per_page,
+            7,
+            "候选每页默认应为 7"
+        );
     }
 
     #[test]
     fn test_merge_reads_per_page_from_ui_candidate() {
         let cfg = merged_with("[ui.candidate]\nper_page = 9\n");
-        assert_eq!(cfg.ui.candidate.per_page, 9, "应从 [ui.candidate] 读取 per_page=9");
+        assert_eq!(
+            cfg.ui.candidate.per_page, 9,
+            "应从 [ui.candidate] 读取 per_page=9"
+        );
     }
 
     #[test]

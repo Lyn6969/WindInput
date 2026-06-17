@@ -36,5 +36,7 @@ pub enum ModeKind {
     QuickInput,
     /// 临时英文：Shift+字母触发的临时英文输入。
     TempEnglish,
-    // S3 将追加：Url、Special(u8)
+    /// 网址模式：普通输入累积到某前缀（如 "www."/"http"）时夺取，原样累积 ASCII。
+    Url,
+    // S3 将追加：Special(u8)
 }

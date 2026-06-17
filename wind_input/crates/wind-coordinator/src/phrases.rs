@@ -200,14 +200,25 @@ fn small_int_chinese(n: u32) -> String {
         return CN_DIGITS[n as usize].to_string();
     }
     if n < 20 {
-        return format!("十{}", if n % 10 == 0 { "" } else { CN_DIGITS[(n % 10) as usize] });
+        return format!(
+            "十{}",
+            if n % 10 == 0 {
+                ""
+            } else {
+                CN_DIGITS[(n % 10) as usize]
+            }
+        );
     }
     let tens = n / 10;
     let ones = n % 10;
     format!(
         "{}十{}",
         CN_DIGITS[tens as usize],
-        if ones == 0 { "" } else { CN_DIGITS[ones as usize] }
+        if ones == 0 {
+            ""
+        } else {
+            CN_DIGITS[ones as usize]
+        }
     )
 }
 
@@ -224,7 +235,10 @@ mod tests {
     #[test]
     fn test_expand_date() {
         let now = fixed();
-        assert_eq!(expand_template("$Y年$M月$D日", &now).unwrap(), "2026年6月14日");
+        assert_eq!(
+            expand_template("$Y年$M月$D日", &now).unwrap(),
+            "2026年6月14日"
+        );
         assert_eq!(expand_template("$Y-$MM-$DD", &now).unwrap(), "2026-06-14");
     }
 
@@ -238,7 +252,10 @@ mod tests {
     #[test]
     fn test_expand_chinese() {
         let now = fixed();
-        assert_eq!(expand_template("${YC}年${MC}月${DC}日", &now).unwrap(), "二〇二六年六月十四日");
+        assert_eq!(
+            expand_template("${YC}年${MC}月${DC}日", &now).unwrap(),
+            "二〇二六年六月十四日"
+        );
     }
 
     #[test]
