@@ -11,8 +11,16 @@ use chrono::Datelike;
 
 /// 合并各提供器候选并去重（保留首现顺序：日期 → 年月 → 计算器 → 数字/金额）。
 pub fn generate_quick_input_candidates(buffer: &str, decimal_places: i32) -> Vec<String> {
+    // 表达式以运算符结尾（输入未完成，如 "123+"）：候选维持为去掉尾部运算符后的样子，
+    // 不中断。"123+" → 与 "123" 一致；"1+2*" → 与 "1+2" 一致。
+    let trimmed = buffer.trim_end_matches(['+', '-', '*', '/']);
+    let buffer = if trimmed.len() != buffer.len() && !trimmed.is_empty() {
+        trimmed
+    } else {
+        buffer
+    };
     let mut out: Vec<String> = Vec::new();
-    let mut push_unique = |s: String, out: &mut Vec<String>| {
+    let push_unique = |s: String, out: &mut Vec<String>| {
         if !s.is_empty() && !out.contains(&s) {
             out.push(s);
         }
@@ -113,7 +121,10 @@ fn has_operator(s: &str) -> bool {
 
 /// 由计算表达式生成候选（首版：表达式=结果 / 结果）。
 pub fn generate_calc_candidates(expr: &str, decimal_places: i32) -> Vec<String> {
-    let clean: &str = expr.trim_end_matches(['+', '-', '*', '/']);
+    // 用户可手打完整等式（如 "100+200=300"）：取首个 '=' 前的表达式部分求值，
+    // 使「再按 =」乃至续打答案时首候选维持为 "100+200=300"，不清空。
+    let lhs = expr.split('=').next().unwrap_or(expr);
+    let clean: &str = lhs.trim_end_matches(['+', '-', '*', '/']);
     if clean.is_empty() || !has_operator(clean) {
         return Vec::new();
     }
@@ -533,6 +544,32 @@ mod tests {
     fn test_calc_rejects_non_expression() {
         assert!(generate_calc_candidates("123", 6).is_empty()); // 无运算符
         assert!(generate_calc_candidates("abc", 6).is_empty());
+    }
+
+    #[test]
+    fn test_calc_keeps_result_through_equals() {
+        // 用户按 = 写出完整等式：首候选维持为 123+100=223，不清空。
+        let c0 = generate_calc_candidates("123+100", 6);
+        assert_eq!(c0[0], "123+100=223");
+        let c1 = generate_calc_candidates("123+100=", 6);
+        assert_eq!(c1[0], "123+100=223");
+        // 续打答案也维持（取 = 前的表达式求值）。
+        let c2 = generate_calc_candidates("123+100=223", 6);
+        assert_eq!(c2[0], "123+100=223");
+    }
+
+    #[test]
+    fn test_trailing_operator_matches_prefix() {
+        // "123+" 的候选与 "123" 一致（不中断）。
+        assert_eq!(
+            generate_quick_input_candidates("123+", 6),
+            generate_quick_input_candidates("123", 6)
+        );
+        // "1+2*" 的候选与 "1+2" 一致。
+        assert_eq!(
+            generate_quick_input_candidates("1+2*", 6),
+            generate_quick_input_candidates("1+2", 6)
+        );
     }
 
     #[test]

@@ -241,6 +241,17 @@ impl Engine for PinyinEngine {
         });
         candidates.truncate(max_candidates);
 
+        // 分段上屏所需：标注每个候选实际消费的输入字节数。
+        // code 为 input 的前缀（如 "ni" ⊂ "nihao"）→ 只消费该前缀，选中后保留剩余拼音续转；
+        // 否则（整句/前缀补全/非前缀子串）消费整串。0 表示未知（由调用方按整串处理）。
+        for c in candidates.iter_mut() {
+            c.consumed_length = if !c.code.is_empty() && input.starts_with(&c.code) {
+                c.code.len()
+            } else {
+                input.len()
+            };
+        }
+
         let (preedit_display, completed_syllables, partial_syllable) =
             self.compute_composition(input);
         let has_partial = !partial_syllable.is_empty();

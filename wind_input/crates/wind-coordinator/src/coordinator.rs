@@ -1092,6 +1092,28 @@ impl Coordinator {
         state.candidates = candidates;
     }
 
+    /// 临时拼音分段上屏：按候选 `consumed_length` 只吃掉对应拼音前缀，保留剩余续转、留在模式内；
+    /// 整串消费时退出模式。返回 (上屏文本, 是否仍在模式内)。与 `commit_result_action` 配合成 KeyAction。
+    fn commit_temp_pinyin_selected(&self, state: &mut State, cand: &Candidate) -> (String, bool) {
+        let code = if cand.code.is_empty() {
+            state.temp_pinyin_buffer.clone()
+        } else {
+            cand.code.clone()
+        };
+        self.record_selection(&code, &cand.text);
+        let out = self.maybe_s2t(state, &cand.text);
+        let total = state.temp_pinyin_buffer.len();
+        let consumed = cand.consumed_length;
+        if consumed > 0 && consumed < total && state.temp_pinyin_buffer.is_char_boundary(consumed) {
+            state.temp_pinyin_buffer = state.temp_pinyin_buffer[consumed..].to_string();
+            self.update_temp_pinyin_candidates(state);
+            (out, true)
+        } else {
+            self.exit_temp_pinyin(state);
+            (out, false)
+        }
+    }
+
     /// 临时拼音模式下的按键处理
     fn handle_temp_pinyin_key(&self, state: &mut State, data: &KeyEventData) -> KeyAction {
         if let Some(act) = self.handle_candidate_nav(state, data) {
@@ -1126,17 +1148,14 @@ impl Coordinator {
                 }
             }
             keymap::VK_SPACE | keymap::VK_RETURN => {
-                // Space/Enter：上屏高亮候选并退出
+                // Space/Enter：上屏高亮候选（分段则保留剩余拼音续转）
                 if !state.candidates.is_empty() {
                     let idx = self
                         .highlighted_global_index(state)
                         .min(state.candidates.len() - 1);
-                    let text = state.candidates[idx].text.clone();
-                    self.record_selection(&state.input_buffer, &text);
-                    let out = self.maybe_s2t(state, &text);
-                    self.exit_temp_pinyin(state);
-                    self.notify_ui_hide();
-                    Self::commit_action(out, true)
+                    let cand = state.candidates[idx].clone();
+                    let (out, in_mode) = self.commit_temp_pinyin_selected(state, &cand);
+                    self.commit_result_action(state, out, in_mode)
                 } else {
                     self.exit_temp_pinyin(state);
                     self.notify_ui_hide();
@@ -1148,12 +1167,9 @@ impl Coordinator {
                 let (start, end) = self.page_range(state);
                 let idx = start + (data.key_code - 0x31) as usize;
                 if idx < end {
-                    let text = state.candidates[idx].text.clone();
-                    self.record_selection(&state.input_buffer, &text);
-                    let out = self.maybe_s2t(state, &text);
-                    self.exit_temp_pinyin(state);
-                    self.notify_ui_hide();
-                    Self::commit_action(out, true)
+                    let cand = state.candidates[idx].clone();
+                    let (out, in_mode) = self.commit_temp_pinyin_selected(state, &cand);
+                    self.commit_result_action(state, out, in_mode)
                 } else {
                     KeyAction::Consumed
                 }
@@ -1177,27 +1193,20 @@ impl Coordinator {
                         let (start, end) = self.page_range(state);
                         let idx = start + offset;
                         if idx < end {
-                            let text = state.candidates[idx].text.clone();
-                            self.record_selection(&state.input_buffer, &text);
-                            let out = self.maybe_s2t(state, &text);
-                            self.exit_temp_pinyin(state);
-                            self.notify_ui_hide();
-                            return Self::commit_action(out, true);
+                            let cand = state.candidates[idx].clone();
+                            let (out, in_mode) = self.commit_temp_pinyin_selected(state, &cand);
+                            return self.commit_result_action(state, out, in_mode);
                         }
                     }
                 }
-                // 其它键：先上屏高亮候选退出，再让标点字符按普通流程？
-                // 简化：有候选则上屏高亮候选并退出（吞掉该键）；否则退出清空。
+                // 其它键：有候选则上屏高亮候选（分段则保留剩余拼音）；否则退出清空。
                 if !state.candidates.is_empty() {
                     let idx = self
                         .highlighted_global_index(state)
                         .min(state.candidates.len() - 1);
-                    let text = state.candidates[idx].text.clone();
-                    self.record_selection(&state.input_buffer, &text);
-                    let out = self.maybe_s2t(state, &text);
-                    self.exit_temp_pinyin(state);
-                    self.notify_ui_hide();
-                    Self::commit_action(out, true)
+                    let cand = state.candidates[idx].clone();
+                    let (out, in_mode) = self.commit_temp_pinyin_selected(state, &cand);
+                    self.commit_result_action(state, out, in_mode)
                 } else {
                     self.exit_temp_pinyin(state);
                     self.notify_ui_hide();
@@ -2520,6 +2529,53 @@ impl Coordinator {
         out
     }
 
+    /// 键盘选词的分段上屏：按候选实际消费的码长（`consumed_length`）只吃掉对应前缀，
+    /// 保留剩余编码并重转（拼音「你好」选「你」后留「hao」续转）。返回 (上屏文本, 是否仍有剩余组合)。
+    /// `consumed_length` 为 0 或覆盖整串（码表/整句/前缀补全）时退化为整串上屏并清空。
+    fn commit_selected(&self, state: &mut State, cand: &Candidate) -> (String, bool) {
+        // 词频按候选实际编码记账（分段时为前缀码，如「ni」而非整串「nihao」）。
+        let code = if cand.code.is_empty() {
+            state.input_buffer.clone()
+        } else {
+            cand.code.clone()
+        };
+        self.record_selection(&code, &cand.text);
+        let out = self.maybe_s2t(state, &cand.text);
+        let total = state.input_buffer.len();
+        let consumed = cand.consumed_length;
+        if consumed > 0 && consumed < total && state.input_buffer.is_char_boundary(consumed) {
+            state.input_buffer = state.input_buffer[consumed..].to_string();
+            let _ = self.update_candidates(state); // 重转剩余编码（复位翻页/高亮）
+            (out, true)
+        } else {
+            state.input_buffer.clear();
+            state.preedit.clear();
+            state.candidates.clear();
+            state.current_page = 0;
+            state.selected_index = 0;
+            (out, false)
+        }
+    }
+
+    /// 把分段提交结果转为 KeyAction：仍有剩余组合则上屏已选 + 把剩余 preedit 作新组合并刷新候选窗；
+    /// 否则隐藏候选窗、按普通上屏返回。普通输入路与临时拼音路共用。
+    fn commit_result_action(&self, state: &State, out: String, has_more: bool) -> KeyAction {
+        if has_more {
+            let preedit = state.preedit.clone();
+            self.notify_ui_update(state);
+            KeyAction::InsertText {
+                text: out,
+                new_composition: Some(preedit),
+                mode_changed: false,
+                chinese_mode: true,
+                has_new_composition: true,
+            }
+        } else {
+            self.notify_ui_hide();
+            Self::commit_action(out, true)
+        }
+    }
+
     fn notify_ui_update(&self, state: &State) {
         if state.candidates.is_empty() && state.input_buffer.is_empty() {
             let _ = self.ui_tx.send(UiCommand::HideCandidates);
@@ -3754,8 +3810,9 @@ impl MessageHandler for Coordinator {
                         let display = state.preedit.clone();
                         self.notify_ui_update(&state);
                         KeyAction::UpdateComposition {
+                            // 光标按显示串字符数（拼音 preedit 含分词空格，与原始字节长不同）。
+                            caret_pos: display.chars().count() as u32,
                             text: display,
-                            caret_pos: state.input_buffer.len() as u32,
                         }
                     }
                 } else {
@@ -3768,10 +3825,9 @@ impl MessageHandler for Coordinator {
                     let idx = self
                         .highlighted_global_index(&state)
                         .min(state.candidates.len() - 1);
-                    let text = state.candidates[idx].text.clone();
-                    let out = self.commit_candidate(&mut state, &text);
-                    self.notify_ui_hide();
-                    Self::commit_action(out, true)
+                    let cand = state.candidates[idx].clone();
+                    let (out, has_more) = self.commit_selected(&mut state, &cand);
+                    self.commit_result_action(&state, out, has_more)
                 } else if !state.input_buffer.is_empty() {
                     let text = state.input_buffer.clone();
                     state.input_buffer.clear();
@@ -3800,10 +3856,9 @@ impl MessageHandler for Coordinator {
                 let in_page = (data.key_code - 0x31) as usize;
                 let idx = start + in_page;
                 if idx < end {
-                    let text = state.candidates[idx].text.clone();
-                    let out = self.commit_candidate(&mut state, &text);
-                    self.notify_ui_hide();
-                    Self::commit_action(out, true)
+                    let cand = state.candidates[idx].clone();
+                    let (out, has_more) = self.commit_selected(&mut state, &cand);
+                    self.commit_result_action(&state, out, has_more)
                 } else if !state.input_buffer.is_empty() {
                     let mut text = state.input_buffer.clone();
                     state.input_buffer.clear();
@@ -3861,8 +3916,9 @@ impl MessageHandler for Coordinator {
                 let display = state.preedit.clone();
                 self.notify_ui_update(&state);
                 KeyAction::UpdateComposition {
+                    // 光标按显示串字符数（拼音 preedit 含分词空格，与原始字节长不同）。
+                    caret_pos: display.chars().count() as u32,
                     text: display,
-                    caret_pos: state.input_buffer.len() as u32,
                 }
             }
             keymap::VK_UP | keymap::VK_DOWN | keymap::VK_PRIOR | keymap::VK_NEXT => {
@@ -3883,10 +3939,9 @@ impl MessageHandler for Coordinator {
                         let (start, end) = self.page_range(&state);
                         let idx = start + offset;
                         if idx < end {
-                            let text = state.candidates[idx].text.clone();
-                            let out = self.commit_candidate(&mut state, &text);
-                            self.notify_ui_hide();
-                            return Self::commit_action(out, true);
+                            let cand = state.candidates[idx].clone();
+                            let (out, has_more) = self.commit_selected(&mut state, &cand);
+                            return self.commit_result_action(&state, out, has_more);
                         }
                     }
                     // D. 模式触发键 → 顶屏高亮候选 + 进模式（快捷输入 > 临时拼音）
