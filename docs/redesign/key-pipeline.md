@@ -197,9 +197,11 @@ enum CommitStrategy {
 - **S4 全码/空码策略落地 + 模式激活键融合**（§2.3）：🚧 进行中。
   - S4a（commit `2403194`）：码表全码自动上屏。`CodeTableEngine` 注入 `auto_commit_at_full`/`auto_commit_min_len`；`decide_auto_commit` 纯判定（唯一精确 + 无更长后继）填 `ConvertResult.should_commit/commit_text`；coordinator 字母分支消费、shadow 后复核存活才上屏。6 单测。
   - S4c（commit `3ecf217`）：混输全码自动上屏 + 拼音守护。`MixedEngine` 取主码表意向，`auto_commit_block_on_pinyin`（默认 true）存在拼音候选时否决。3 单测。
-  - **待办**：S4b 空码清空（`clear_on_empty_max`）+ 顶码上屏（`top_code_commit`，>满码长时取前 N 码顶字）；S4d 模式激活键融合（把散落的快捷/临拼/特殊/URL 激活判定收敛为单一 dispatcher）。
-  - 实施说明：决策落在引擎层（host 可测）而非 coordinator，因引擎持 `dm` 可判 `has_longer_code`；CommitStrategy enum 未显式建模——策略已随激活引擎（码表/混输各自实现 `should_auto_commit`），无独立消费方，避免过早抽象。
-  - **注意**：`auto_commit_at_full` 为 schema 级配置且 `read_schema` 不支持用户覆盖合并，启用需改 `data/schemas/<id>.schema.toml`；schema 用户覆盖是独立待办。
+  - S4b（commit `fce9abb`）：空码清空 + 顶码上屏。`ConvertResult.should_clear`（满码无候选 + `clear_on_empty_max` + 无更长后继）；`handle_top_code` 上移到 `Engine` trait（默认 None），码表实现「超满码长 + 整串无匹配 + 无更长后继 → 顶前 N 码首选、余码续打」，`MixedEngine` 委托主码表，`EngineManager::handle_top_code` 暴露；coordinator 引入 `InputOutcome{Normal,AutoCommit,Clear}` 统一字母分支结局，顶码先于候选刷新。`CommitOptions` 结构统一码表上屏开关。
+  - **想法一·全局默认 + 方案可选覆盖**（commit `fce9abb`）：config 增 `[input.code_commit]` 全局默认；方案级 `clear_on_empty_max`/`top_code_commit` 升为 `Option<bool>`（tri-state）；解析 = 方案 Some > 全局 > 内置默认（`at_full` 额外兼容 legacy `auto_commit_unique`）。全局配置在 `config.toml`（用户可合并）→ **无需改只读安装目录 schema 即可调全码策略**，顺带解决了"非主方案统一控制"。
+  - **待办**：S4d 模式激活键融合（把散落的快捷/临拼/特殊/URL 激活判定收敛为单一 dispatcher）。
+  - 实施说明：决策落在引擎层（host 可测）而非 coordinator，因引擎持 `dm` 可判 `has_longer_code`；CommitStrategy enum 未显式建模——策略已随激活引擎（码表/混输各自实现 `should_auto_commit`/`handle_top_code`），无独立消费方，避免过早抽象。
+  - **后续大阶段（用户拍板）**：把临时拼音/特殊模式的引擎统一为 scheme 实例（base 持久 / overlay 瞬态分离的 Processor-lite），再支持临时 mix 复合引擎融合临拼/快符/生僻字。见对话决议。
 - **S5 按钮自定义**。
 
 ## 5. 配置 schema 增补（详见 config-schema.md 收口）
