@@ -426,7 +426,7 @@ pub struct UiThemeConfig {
     pub style: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FeaturesConfig {
     #[serde(default)]
     pub stats: StatsConfig,
@@ -439,9 +439,36 @@ pub struct FeaturesConfig {
     /// 特殊模式列表（各自带码表 + 上屏策略；引导键触发）
     #[serde(default)]
     pub special_modes: Vec<SpecialModeConfig>,
-    /// 临时 mix 模式列表（引导键触发，合并多个成员方案的候选）
-    #[serde(default)]
+    /// 临时 mix 模式列表（引导键触发，合并多个成员方案的候选）。
+    /// 默认含一个 ; 触发的「快捷」融合：quick_input（日期/计算，内置类方案）+ pinyin + english。
+    #[serde(default = "default_mix_modes")]
     pub mix_modes: Vec<MixModeConfig>,
+}
+
+fn default_mix_modes() -> Vec<MixModeConfig> {
+    vec![MixModeConfig {
+        id: "quick_mix".to_string(),
+        name: "快捷".to_string(),
+        trigger_keys: vec!["semicolon".to_string()],
+        members: vec![
+            "quick_input".to_string(),
+            "pinyin".to_string(),
+            "english".to_string(),
+        ],
+    }]
+}
+
+impl Default for FeaturesConfig {
+    fn default() -> Self {
+        Self {
+            stats: StatsConfig::default(),
+            s2t: S2TConfig::default(),
+            quick_input: QuickInputConfig::default(),
+            cmdbar: CmdbarConfig::default(),
+            special_modes: Vec::new(),
+            mix_modes: default_mix_modes(),
+        }
+    }
 }
 
 /// 临时 mix 模式配置（overlay 激活面）。触发后对每个成员方案查询并按成员序合并候选，
@@ -518,7 +545,9 @@ pub struct QuickInputConfig {
 }
 
 fn default_quick_input_triggers() -> Vec<String> {
-    vec!["semicolon".to_string()]
+    // 默认不再独立抢 ;：; 由内置 mix「快捷」融合接管（quick_input 作为其成员）。
+    // 仍可显式配置 trigger_keys 让 quick_input 作独立模式。
+    Vec::new()
 }
 
 fn default_decimal_places() -> i32 {

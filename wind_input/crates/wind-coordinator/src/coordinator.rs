@@ -258,6 +258,9 @@ struct State {
     mix_buffer: String,
     /// 当前 mix 模式下标（= features.mix_modes 索引；仅 active==Mix 时有效）
     mix_id: u8,
+    /// mix 数字模式（仅含 quick_input 成员时有效）：首字符数字/符号 → true（表达式：数字/符号
+    /// 输入、字母选词）；首字符字母 → false（拼音/英文：字母输入、数字选词）。
+    mix_numeric: bool,
     caret_x: i32,
     caret_y: i32,
     caret_height: i32,
@@ -560,6 +563,7 @@ impl Coordinator {
                 special_id: 0,
                 mix_buffer: String::new(),
                 mix_id: 0,
+                mix_numeric: false,
                 caret_x: 0,
                 caret_y: 0,
                 caret_height: 0,
@@ -1006,13 +1010,15 @@ impl Coordinator {
         Some(KeyAction::Consumed)
     }
 
-    /// overlay 候选模式的导航分派：码表型（特殊/mix/临拼）`-`/`=` 作翻页；
-    /// 文本型（临英）与表达式型（快捷输入）不把 `-`/`=` 当导航。由 active 自判。
+    /// overlay 候选模式的导航分派：码表型（特殊/临拼，及不含 quick_input 的 mix）`-`/`=` 作翻页；
+    /// 文本型（临英）、表达式型（快捷输入）、含 quick_input 的 mix（`-`/`=` 是运算符输入）不把
+    /// `-`/`=` 当导航。由 active 自判。
     fn handle_candidate_nav(&self, state: &mut State, data: &KeyEventData) -> Option<KeyAction> {
-        let include_printable = matches!(
-            state.active,
-            Some(ModeKind::Special(_)) | Some(ModeKind::Mix(_)) | Some(ModeKind::TempPinyin)
-        );
+        let include_printable = match state.active {
+            Some(ModeKind::Special(_)) | Some(ModeKind::TempPinyin) => true,
+            Some(ModeKind::Mix(idx)) => !self.mix_has_quick_input(idx),
+            _ => false,
+        };
         self.apply_nav_key(state, data, include_printable)
     }
 
@@ -2035,6 +2041,7 @@ impl Coordinator {
     }
 
     /// mix 模式可加载的成员方案列表（过滤空/不可加载）。
+    /// mix 可用的真实方案成员（过滤空 / 不可加载 / 内置 quick_input）。
     fn mix_members(&self, idx: u8) -> Vec<String> {
         self.config
             .features
@@ -2043,11 +2050,37 @@ impl Coordinator {
             .map(|m| {
                 m.members
                     .iter()
-                    .filter(|s| !s.is_empty() && self.engine_mgr.ensure_schema(s))
+                    .filter(|s| {
+                        !s.is_empty() && *s != "quick_input" && self.engine_mgr.ensure_schema(s)
+                    })
                     .cloned()
                     .collect()
             })
             .unwrap_or_default()
+    }
+
+    /// mix 是否含内置类方案 quick_input（日期/计算）成员——启用「首字符数字/字母决定选词逻辑」。
+    fn mix_has_quick_input(&self, idx: u8) -> bool {
+        self.config
+            .features
+            .mix_modes
+            .get(idx as usize)
+            .map(|m| m.members.iter().any(|s| s == "quick_input"))
+            .unwrap_or(false)
+    }
+
+    /// 选中当前页第 `page_offset`（0=首选）候选并上屏退出。
+    fn mix_select(&self, state: &mut State, page_offset: usize) -> KeyAction {
+        let (start, end) = self.page_range(state);
+        let gi = start + page_offset;
+        if gi < end {
+            let text = state.candidates[gi].text.clone();
+            self.exit_mix_mode(state);
+            self.notify_ui_hide();
+            Self::commit_action(text, true)
+        } else {
+            KeyAction::Consumed
+        }
     }
 
     /// 进入 mix 模式（至少一个成员方案可加载，由激活点保证）。
@@ -2057,6 +2090,7 @@ impl Coordinator {
         state.active = Some(ModeKind::Mix(idx));
         state.mix_id = idx;
         state.mix_buffer.clear();
+        state.mix_numeric = false; // 由首字符（数字/字母）决定
         self.update_mix_candidates(state);
         self.notify_ui_update(state);
         let display = state.preedit.clone();
@@ -2075,7 +2109,10 @@ impl Coordinator {
         state.preedit.clear();
     }
 
-    /// 刷新 mix 候选：对每个成员方案 convert_with 查询，按成员序合并、按文本去重。
+    /// 刷新 mix 候选：按配置成员序逐个查询、合并、按文本去重。
+    /// "quick_input" 是内置类方案（日期/计算），用 generate_quick_input_candidates 计算；
+    /// 其余为真实方案经 convert_with。数字模式只取 quick_input（表达式），文本模式只取真实方案
+    /// （拼音/英文），避免互相污染候选。
     fn update_mix_candidates(&self, state: &mut State) {
         state.candidates.clear();
         state.current_page = 0;
@@ -2084,14 +2121,43 @@ impl Coordinator {
         if state.mix_buffer.is_empty() {
             return;
         }
-        let members = self.mix_members(state.mix_id);
+        let numeric = self.mix_has_quick_input(state.mix_id) && state.mix_numeric;
+        let members = self
+            .config
+            .features
+            .mix_modes
+            .get(state.mix_id as usize)
+            .map(|m| m.members.clone())
+            .unwrap_or_default();
         let mut cands: Vec<Candidate> = Vec::new();
         let mut seen = std::collections::HashSet::new();
-        for schema in &members {
-            let result = self.engine_mgr.convert_with(schema, &state.mix_buffer, 50);
-            for c in result.candidates {
-                if seen.insert(c.text.clone()) {
-                    cands.push(c);
+        for member in &members {
+            if member == "quick_input" {
+                if !numeric {
+                    continue; // 文本模式跳过计算
+                }
+                let dp = self.config.features.quick_input.decimal_places;
+                for t in crate::quick_input::generate_quick_input_candidates(&state.mix_buffer, dp)
+                {
+                    if seen.insert(t.clone()) {
+                        cands.push(Candidate {
+                            text: t,
+                            ..Default::default()
+                        });
+                    }
+                }
+            } else {
+                if numeric {
+                    continue; // 数字模式跳过真实方案（表达式无拼音/英文意义）
+                }
+                if !self.engine_mgr.ensure_schema(member) {
+                    continue;
+                }
+                let result = self.engine_mgr.convert_with(member, &state.mix_buffer, 50);
+                for c in result.candidates {
+                    if seen.insert(c.text.clone()) {
+                        cands.push(c);
+                    }
                 }
             }
         }
@@ -2155,37 +2221,48 @@ impl Coordinator {
                     Self::commit_action(text, true)
                 }
             }
-            keymap::VK_1..=keymap::VK_9 => {
-                let (start, end) = self.page_range(state);
-                let gi = start + (data.key_code - 0x31) as usize;
-                if gi < end {
-                    let text = state.candidates[gi].text.clone();
-                    self.exit_mix_mode(state);
-                    self.notify_ui_hide();
-                    Self::commit_action(text, true)
-                } else {
-                    KeyAction::Consumed
-                }
-            }
             keymap::VK_A..=keymap::VK_Z => {
-                let ch = (b'a' + (data.key_code - 0x41) as u8) as char;
+                // 数字模式：字母选词（a=首选 b=次选…，对齐老 quick_input）；否则字母作输入。
+                let calc = self.mix_has_quick_input(state.mix_id);
+                if calc && !state.mix_buffer.is_empty() && state.mix_numeric {
+                    return self.mix_select(state, (data.key_code - keymap::VK_A) as usize);
+                }
+                if state.mix_buffer.is_empty() {
+                    state.mix_numeric = false; // 首字符是字母 → 文本模式
+                }
+                let ch = (b'a' + (data.key_code - keymap::VK_A) as u8) as char;
                 state.mix_buffer.push(ch);
                 refresh(self, state)
             }
             _ => {
                 let shift = data.modifiers & MOD_SHIFT != 0;
-                if !shift {
-                    if let Some(offset) = self.select_key_offset(data.key_code) {
-                        let (start, end) = self.page_range(state);
-                        let gi = start + offset;
-                        if gi < end {
-                            let text = state.candidates[gi].text.clone();
-                            self.exit_mix_mode(state);
-                            self.notify_ui_hide();
-                            return Self::commit_action(text, true);
+                let calc = self.mix_has_quick_input(state.mix_id);
+                // 表达式字符（数字/运算符/./()）：首字符 → 数字模式；数字模式中作输入。
+                if let Some(ch) = quick_input_char(data.key_code, shift) {
+                    if calc && state.mix_buffer.is_empty() {
+                        state.mix_numeric = true; // 首字符是数字/符号 → 数字模式
+                        state.mix_buffer.push(ch);
+                        return refresh(self, state);
+                    }
+                    if calc && state.mix_numeric {
+                        state.mix_buffer.push(ch);
+                        return refresh(self, state);
+                    }
+                    // 文本模式（或非 calc mix）+ 数字 → 选词（1=首选）
+                    if let Some(d) = ch.to_digit(10) {
+                        if d >= 1 {
+                            return self.mix_select(state, (d - 1) as usize);
                         }
                     }
+                    // 文本模式 + 运算符 → 落到下方标点提交
                 }
+                // 二三候选键（配置驱动）选词
+                if !shift {
+                    if let Some(offset) = self.select_key_offset(data.key_code) {
+                        return self.mix_select(state, offset);
+                    }
+                }
+                // 其它标点：顶屏当前高亮候选 + 转换后标点，退出
                 if let Some(ch) = punct_char(data.key_code, shift) {
                     let committed = if !state.candidates.is_empty() {
                         let idx = self
@@ -3429,9 +3506,9 @@ impl Coordinator {
                     }
                 }
             }
-            // 临时 mix：至少一个成员方案可加载才进入（优先级最低）。
+            // 临时 mix：含 quick_input 或至少一个可加载成员方案才进入（优先级最低）。
             if let Some(idx) = self.match_mix_trigger(data.key_code) {
-                if !self.mix_members(idx).is_empty() {
+                if self.mix_has_quick_input(idx) || !self.mix_members(idx).is_empty() {
                     return Some(self.enter_mix_mode(state, idx));
                 }
             }
@@ -3454,6 +3531,7 @@ impl Coordinator {
         state.rewind = None;
         state.special_buffer.clear();
         state.mix_buffer.clear();
+        state.mix_numeric = false;
         // 清理可能残留的组合显示（临时拼音/快捷输入会产生候选与 preedit）
         state.input_buffer.clear();
         state.candidates.clear();
