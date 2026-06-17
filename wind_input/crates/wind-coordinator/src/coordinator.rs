@@ -10,6 +10,7 @@
 //!
 //! 候选生成委托给 [`EngineManager`]，运行时词频 boost + 最终排序在本层应用。
 
+use crate::keymap;
 use crate::pipeline::{ModeKind, Rewind};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -50,6 +51,7 @@ fn parse_pairs(list: &[String]) -> Vec<(char, char)> {
 }
 
 fn punct_char(key_code: u32, shift: bool) -> Option<char> {
+    use keymap::*;
     let (base, shifted) = match key_code {
         0x30 => ('0', ')'),
         0x31 => ('1', '!'),
@@ -61,17 +63,17 @@ fn punct_char(key_code: u32, shift: bool) -> Option<char> {
         0x37 => ('7', '&'),
         0x38 => ('8', '*'),
         0x39 => ('9', '('),
-        0xBA => (';', ':'),
-        0xBB => ('=', '+'),
-        0xBC => (',', '<'),
-        0xBD => ('-', '_'),
-        0xBE => ('.', '>'),
-        0xBF => ('/', '?'),
-        0xC0 => ('`', '~'),
-        0xDB => ('[', '{'),
-        0xDC => ('\\', '|'),
-        0xDD => (']', '}'),
-        0xDE => ('\'', '"'),
+        VK_SEMICOLON => (';', ':'),
+        VK_EQUAL => ('=', '+'),
+        VK_COMMA => (',', '<'),
+        VK_MINUS => ('-', '_'),
+        VK_PERIOD => ('.', '>'),
+        VK_SLASH => ('/', '?'),
+        VK_BACKTICK => ('`', '~'),
+        VK_LBRACKET => ('[', '{'),
+        VK_BACKSLASH => ('\\', '|'),
+        VK_RBRACKET => (']', '}'),
+        VK_QUOTE => ('\'', '"'),
         _ => return None,
     };
     Some(if shift { shifted } else { base })
@@ -900,34 +902,14 @@ impl Coordinator {
 
     // ───────────────────────── 临时拼音 ─────────────────────────
 
-    /// 触发键名 → VK（不含 z，z 混合模式后置实现）
+    /// 触发键名 → VK（统一映射，见 `keymap`；不含 z，z 混合模式后置实现）
     fn temp_pinyin_trigger_vk(key: &str) -> Option<u32> {
-        match key.trim().to_lowercase().as_str() {
-            "backtick" | "grave" | "`" => Some(0xC0),
-            "semicolon" | ";" => Some(0xBA),
-            "quote" | "'" => Some(0xDE),
-            "comma" | "," => Some(0xBC),
-            "period" | "." => Some(0xBE),
-            "slash" | "/" => Some(0xBF),
-            "lbracket" | "[" => Some(0xDB),
-            "rbracket" | "]" => Some(0xDD),
-            _ => None,
-        }
+        keymap::key_name_to_vk(key)
     }
 
-    /// VK → 组合区前缀字符
-    fn temp_pinyin_prefix_for(key_code: u32) -> &'static str {
-        match key_code {
-            0xC0 => "`",
-            0xBA => ";",
-            0xDE => "'",
-            0xBC => ",",
-            0xBE => ".",
-            0xBF => "/",
-            0xDB => "[",
-            0xDD => "]",
-            _ => "`",
-        }
+    /// VK → 组合区前缀字符（统一映射，见 `keymap`；缺省回退反引号）
+    fn temp_pinyin_prefix_for(key_code: u32) -> char {
+        keymap::vk_to_prefix_char(key_code).unwrap_or('`')
     }
 
     /// 当前按键是否匹配配置的临时拼音触发键
@@ -1126,32 +1108,12 @@ impl Coordinator {
 
     /// 触发键名 → VK
     fn quick_input_trigger_vk(key: &str) -> Option<u32> {
-        match key.trim().to_lowercase().as_str() {
-            "semicolon" | ";" => Some(0xBA),
-            "backtick" | "grave" | "`" => Some(0xC0),
-            "quote" | "'" => Some(0xDE),
-            "comma" | "," => Some(0xBC),
-            "period" | "." => Some(0xBE),
-            "slash" | "/" => Some(0xBF),
-            "lbracket" | "[" => Some(0xDB),
-            "rbracket" | "]" => Some(0xDD),
-            _ => None,
-        }
+        keymap::key_name_to_vk(key)
     }
 
-    /// VK → 组合区前缀字符
-    fn quick_input_prefix_for(key_code: u32) -> &'static str {
-        match key_code {
-            0xBA => ";",
-            0xC0 => "`",
-            0xDE => "'",
-            0xBC => ",",
-            0xBE => ".",
-            0xBF => "/",
-            0xDB => "[",
-            0xDD => "]",
-            _ => ";",
-        }
+    /// VK → 组合区前缀字符（统一映射，见 `keymap`；缺省回退分号）
+    fn quick_input_prefix_for(key_code: u32) -> char {
+        keymap::vk_to_prefix_char(key_code).unwrap_or(';')
     }
 
     /// 当前按键是否匹配配置的快捷输入触发键
@@ -1718,24 +1680,9 @@ impl Coordinator {
         }
     }
 
-    /// 引导键名 → VK（特殊模式触发；复用临拼标点名映射，额外支持 backslash 等 OEM 键与单字母 a-z）。
+    /// 引导键名 → VK（特殊模式触发；统一映射 + 额外支持单字母 a-z 引导键，见 `keymap`）。
     fn special_trigger_vk(key: &str) -> Option<u32> {
-        let k = key.trim().to_lowercase();
-        if let Some(vk) = Self::temp_pinyin_trigger_vk(&k) {
-            return Some(vk);
-        }
-        // 临拼映射未覆盖的 OEM 键（Go 触发键集合的补集）。
-        match k.as_str() {
-            "backslash" | "\\" => return Some(0xDC),
-            "minus" | "-" => return Some(0xBD),
-            "equal" | "equals" | "=" => return Some(0xBB),
-            _ => {}
-        }
-        let bytes = k.as_bytes();
-        if bytes.len() == 1 && bytes[0].is_ascii_lowercase() {
-            return Some(0x41 + (bytes[0] - b'a') as u32);
-        }
-        None
+        keymap::key_name_to_vk_with_letters(key)
     }
 
     /// 找出 key_code 匹配的特殊模式下标（按配置顺序先到先得；最多 256 个）。
