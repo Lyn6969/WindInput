@@ -26,6 +26,8 @@ pub struct ViewImage {
     pub mode: String,
     pub slice: [f32; 4],
     pub opacity: f32,
+    /// 单色染色（None=图原样）；非 None 时把图当 alpha mask、用此色填充（单色 SVG/图标随主题变色）。
+    pub tint: Option<[u8; 4]>,
 }
 
 /// z 层级覆盖图（按 anchor 九宫定位 + offset + size 绘于 host 内）。
@@ -463,12 +465,13 @@ fn paint_bg_image(buf: &mut [u8], buf_w: u32, buf_h: u32, r: Rect, radius: f32, 
         img.slice[3].round().max(0.0) as u32,
     ];
     let mode = crate::image_cache::mode_code(&img.mode);
+    let tint = img.tint.unwrap_or([0, 0, 0, 0]);
     let Some(path) = round_rect_path(x, y, rw, rh, radius.round().max(0.0)) else {
         return;
     };
     IMAGE_CACHE.with(|c| {
         let mut cache = c.borrow_mut();
-        let Some(fill) = cache.fill(&img.path, mode, slice, rw as u32, rh as u32) else {
+        let Some(fill) = cache.fill(&img.path, mode, slice, rw as u32, rh as u32, tint) else {
             return;
         };
         let Some(mut pm) = PixmapMut::from_bytes(buf, buf_w, buf_h) else {
@@ -508,8 +511,14 @@ fn paint_layer(buf: &mut [u8], buf_w: u32, buf_h: u32, host: Rect, layer: &ViewL
         let (ax, ay) = anchor_pos(&layer.anchor, host, lw, lh);
         let lx = (ax + layer.off_x + layer.off_x_pct / 100.0 * host.w).round();
         let ly = (ay + layer.off_y + layer.off_y_pct / 100.0 * host.h).round();
-        let Some(fill) = cache.fill(&layer.path, crate::image_cache::mode_code("stretch"), [0; 4], lw as u32, lh as u32)
-        else {
+        let Some(fill) = cache.fill(
+            &layer.path,
+            crate::image_cache::mode_code("stretch"),
+            [0; 4],
+            lw as u32,
+            lh as u32,
+            [0, 0, 0, 0],
+        ) else {
             return;
         };
         let Some(path) = round_rect_path(lx, ly, lw, lh, 0.0) else {

@@ -47,6 +47,9 @@ pub struct Resolved {
     pub behavior: ResolvedBehavior,
     /// 图片资源：名→绝对路径 / data: URI（相对路径已按 theme 目录解析，按 is_dark 选变体）。
     pub resources: HashMap<String, String>,
+    /// 资产搜索目录（self + base 链）：用于视图节点里**字面** image ref（如 _base 的 chevron.svg，
+    /// 不在 resources 注册表）解析为绝对路径——派生主题继承 base 的图标需到 base 目录查找。
+    pub asset_dirs: Vec<std::path::PathBuf>,
 }
 
 /// 颜色 token 求值（与 Go resolveColorToken 对齐）：
@@ -263,25 +266,32 @@ fn resolve_image_path(p: &str, base_dir: &Path) -> String {
 }
 
 /// 便捷：按名加载主题（base 深合并 + 类型化）并求值为 `Resolved`。
-/// theme_dir = themes_dir/<name>（resources 相对路径基准）。
 pub fn load_resolved(themes_dir: &Path, name: &str, is_dark: bool) -> anyhow::Result<Resolved> {
     load_resolved_dirs(&[themes_dir.to_path_buf()], name, is_dark)
 }
 
-/// 多目录版：在 dirs 中定位主题并求值（base 跨目录、resources 相对其自身目录）。
+/// 多目录版：在 dirs 中定位主题并求值（base 跨目录、资产按 base 链目录查找）。
 pub fn load_resolved_dirs(
     dirs: &[std::path::PathBuf],
     name: &str,
     is_dark: bool,
 ) -> anyhow::Result<Resolved> {
     let t = crate::theme::load_typed_dirs(dirs, name)?;
-    let theme_dir = crate::theme::find_theme_dir(dirs, name)
-        .ok_or_else(|| anyhow::anyhow!("theme '{}' not found", name))?;
-    Ok(resolve(&t, is_dark, &theme_dir))
+    let chain = crate::theme::theme_chain_dirs(dirs, name);
+    if chain.is_empty() {
+        anyhow::bail!("theme '{}' not found", name);
+    }
+    Ok(resolve(&t, is_dark, &chain))
 }
 
-/// 求值入口：typed `Theme` + is_dark + theme 目录 → `Resolved`。
-pub fn resolve(theme: &Theme, is_dark: bool, theme_dir: &Path) -> Resolved {
+/// 求值入口：typed `Theme` + is_dark + 资产目录链（self 在前，base 在后）→ `Resolved`。
+/// `asset_dirs[0]` = self 主题目录（resources 相对路径基准）；全部用于字面 image ref 查找。
+pub fn resolve(theme: &Theme, is_dark: bool, asset_dirs: &[std::path::PathBuf]) -> Resolved {
+    let self_dir = asset_dirs
+        .first()
+        .cloned()
+        .unwrap_or_else(|| std::path::PathBuf::from("."));
+    let theme_dir = self_dir.as_path();
     // 1. palette（不 derive；resolve_palette 已忽略 derive 块）。
     let palette = resolve_palette(theme.colors.as_ref(), is_dark);
     // 2. views（无 views 块 → 全默认 RvViews，仅 palette 取色，零回归）。
@@ -308,6 +318,7 @@ pub fn resolve(theme: &Theme, is_dark: bool, theme_dir: &Path) -> Resolved {
         views,
         behavior,
         resources,
+        asset_dirs: asset_dirs.to_vec(),
     }
 }
 
@@ -433,16 +444,13 @@ impl Resolved {
 mod tests {
     use super::*;
     use crate::schema::Dim;
-    use crate::theme::load_typed;
 
     fn themes_dir() -> std::path::PathBuf {
         Path::new(env!("CARGO_MANIFEST_DIR")).join("testdata/themes")
     }
 
     fn load(name: &str, is_dark: bool) -> Resolved {
-        let dir = themes_dir();
-        let t = load_typed(&dir, name).unwrap();
-        resolve(&t, is_dark, &dir.join(name))
+        load_resolved_dirs(&[themes_dir()], name, is_dark).unwrap()
     }
 
     #[test]
@@ -517,6 +525,17 @@ mod tests {
         let r = load_resolved_dirs(&dirs, "jidian-classic", false).expect("resolve jidian");
         assert!(r.views.window.bg_image.is_some(), "应解析出 _base+jidian 合并后的 window 背景图");
         assert!(r.resources.contains_key("panel"));
+
+        // 资产链：default 继承 _base，链中应含 _base 目录（footer chevron.svg 在 _base）。
+        let d = load_resolved_dirs(&dirs, "default", false).expect("resolve default");
+        assert!(
+            d.asset_dirs.iter().any(|p| p.ends_with("_base")),
+            "default 资产链应含 _base 目录"
+        );
+        // footer 翻页箭头继承自 _base（chevron SVG + tint）。
+        let prev = d.views.footer_bar.prev_image.as_ref().expect("footer prev_image");
+        assert_eq!(prev.reference, "chevron_prev.svg");
+        assert!(prev.tint.is_some(), "chevron 应有 tint(${{accent}})");
     }
 
     #[test]

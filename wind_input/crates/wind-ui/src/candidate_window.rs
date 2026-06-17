@@ -394,23 +394,56 @@ impl CandidateWindow {
         Some((ox, oy, blur, color))
     }
 
-    /// RvImage → 渲染用 ViewImage：把 reference 经主题 resources 解析为绝对路径（缺则按字面 path）。
-    fn rv_image(&self, im: Option<&wind_theme::RvImage>) -> Option<ViewImage> {
-        let im = im?;
-        if im.reference.is_empty() {
+    /// 把 image ref 解析为可读绝对路径：resources 注册表 → data:/绝对 → 在 asset_dirs（base 链目录）
+    /// 搜字面文件（如 _base 的 chevron.svg）。
+    fn asset_path(&self, reference: &str) -> Option<String> {
+        if reference.is_empty() {
             return None;
         }
-        let path = self
-            .theme
-            .resources
-            .get(&im.reference)
-            .cloned()
-            .unwrap_or_else(|| im.reference.clone());
+        if let Some(p) = self.theme.resources.get(reference) {
+            return Some(p.clone());
+        }
+        if reference.starts_with("data:") || std::path::Path::new(reference).is_absolute() {
+            return Some(reference.to_string());
+        }
+        for d in &self.theme.asset_dirs {
+            let p = d.join(reference);
+            if p.exists() {
+                return Some(p.to_string_lossy().into_owned());
+            }
+        }
+        Some(reference.to_string())
+    }
+
+    /// RvImage → 渲染用 ViewImage（reference 解析为绝对路径）。
+    fn rv_image(&self, im: Option<&wind_theme::RvImage>) -> Option<ViewImage> {
+        let im = im?;
+        let path = self.asset_path(&im.reference)?;
         Some(ViewImage {
             path,
             mode: im.mode.clone(),
             slice: im.slice,
             opacity: im.opacity,
+            tint: im.tint,
+        })
+    }
+
+    /// footer 翻页箭头图标（SVG + tint）。无 prev/next_image 时 None（回退文字箭头）。
+    /// enabled→tint（如 ${accent}）；disabled→disabled_tint（如 ${text_hint}），缺则回退 tint。
+    fn arrow_icon(&self, im: Option<&wind_theme::RvImage>, enabled: bool) -> Option<ViewImage> {
+        let im = im?;
+        let path = self.asset_path(&im.reference)?;
+        let tint = if enabled {
+            im.tint
+        } else {
+            im.disabled_tint.or(im.tint)
+        };
+        Some(ViewImage {
+            path,
+            mode: "stretch".into(),
+            slice: [0.0; 4],
+            opacity: 1.0,
+            tint,
         })
     }
 
@@ -427,15 +460,7 @@ impl CandidateWindow {
         layers
             .iter()
             .filter_map(|im| {
-                if im.reference.is_empty() {
-                    return None;
-                }
-                let path = self
-                    .theme
-                    .resources
-                    .get(&im.reference)
-                    .cloned()
-                    .unwrap_or_else(|| im.reference.clone());
+                let path = self.asset_path(&im.reference)?;
                 let (off_x, off_x_pct) = split(im.offset_x);
                 let (off_y, off_y_pct) = split(im.offset_y);
                 Some(ViewLayer {
@@ -617,33 +642,49 @@ impl CandidateWindow {
             let marker_c = t.color("text_dim", [140, 140, 145, 255]);
             let accent = col(v.accent_bar.bg_color, [66, 133, 244, 255]);
             let footer_fs = node_fs(&v.footer_bar);
-            let arrow = |txt: &str, tag: i32, enabled: bool, hovered: bool| {
-                let color = if enabled { accent } else { disabled };
-                let mut v = View::leaf(txt, color)
-                    .font_size(footer_fs)
+            let prev_on = self.page > 1;
+            let next_on = self.page < self.total_pages;
+            // 翻页箭头：主题配了 prev/next_image（如 _base 的 chevron SVG + tint）则用图标，否则回退文字 ‹ ›。
+            let prev_icon = self.arrow_icon(v.footer_bar.prev_image.as_ref(), prev_on);
+            let next_icon = self.arrow_icon(v.footer_bar.next_image.as_ref(), next_on);
+            let arrow = |icon: Option<ViewImage>, txt: &str, tag: i32, enabled: bool, hovered: bool| {
+                let mut node = match icon {
+                    Some(vi) => View::container(Layout::Row)
+                        .fixed_w(footer_fs)
+                        .fixed_h(footer_fs)
+                        .bg_image(vi),
+                    None => {
+                        View::leaf(txt, if enabled { accent } else { disabled }).font_size(footer_fs)
+                    }
+                };
+                node = node
                     .pad(Edges::xy(gap * 1.2, gap * 0.5))
                     .radius(item_radius)
                     .cross(Align::Center);
                 if enabled {
-                    v = v.tag(tag); // 仅启用项参与命中
+                    node = node.tag(tag); // 仅启用项参与命中
                     if hovered {
-                        v = v.bg(hover_bg);
+                        node = node.bg(hover_bg);
                     }
                 }
-                v
+                node
             };
-            let prev_on = self.page > 1;
-            let next_on = self.page < self.total_pages;
             row = row
                 .child(
-                    arrow("‹", TAG_PAGE_PREV, prev_on, self.hover == TAG_PAGE_PREV)
+                    arrow(prev_icon, "‹", TAG_PAGE_PREV, prev_on, self.hover == TAG_PAGE_PREV)
                         .margin(Edges::xy(gap, 0.0)),
                 )
                 .child(
                     View::leaf(format!("{}/{}", self.page, self.total_pages), marker_c)
                         .font_size(footer_fs),
                 )
-                .child(arrow("›", TAG_PAGE_NEXT, next_on, self.hover == TAG_PAGE_NEXT));
+                .child(arrow(
+                    next_icon,
+                    "›",
+                    TAG_PAGE_NEXT,
+                    next_on,
+                    self.hover == TAG_PAGE_NEXT,
+                ));
         }
 
         root.child(row)

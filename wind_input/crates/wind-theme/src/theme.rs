@@ -14,6 +14,36 @@ pub fn find_theme_dir(dirs: &[PathBuf], name: &str) -> Option<PathBuf> {
         .find(|p| p.join("theme.yaml").exists())
 }
 
+/// 主题 base 链的目录列表（self 在前，base 在后）。
+/// 用于资产（图片/SVG）字面 ref 解析：base 主题（如 _base）的 chevron 在其自身目录，派生主题继承后
+/// 需到 base 目录查找该文件。
+pub fn theme_chain_dirs(dirs: &[PathBuf], name: &str) -> Vec<PathBuf> {
+    let mut out: Vec<PathBuf> = Vec::new();
+    let mut cur = name.to_string();
+    for _ in 0..9 {
+        let Some(d) = find_theme_dir(dirs, &cur) else {
+            break;
+        };
+        if out.contains(&d) {
+            break;
+        }
+        let base = std::fs::read_to_string(d.join("theme.yaml"))
+            .ok()
+            .and_then(|t| serde_yaml::from_str::<Value>(&t).ok())
+            .and_then(|v| {
+                v.get("base")
+                    .and_then(|b| b.as_str())
+                    .map(|s| s.to_string())
+            });
+        out.push(d);
+        match base {
+            Some(b) if !b.is_empty() && b != cur => cur = b,
+            _ => break,
+        }
+    }
+    out
+}
+
 /// 读取主题自身 yaml 的 meta（不做 base 合并；用于主题列表显示 name/order）。
 pub fn read_meta(dirs: &[PathBuf], name: &str) -> Option<Meta> {
     let dir = find_theme_dir(dirs, name)?;

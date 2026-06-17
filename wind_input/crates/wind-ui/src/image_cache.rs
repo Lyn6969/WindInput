@@ -7,6 +7,43 @@
 use std::collections::HashMap;
 use tiny_skia::{Pixmap, PremultipliedColorU8};
 
+#[inline]
+fn transparent() -> PremultipliedColorU8 {
+    PremultipliedColorU8::from_rgba(0, 0, 0, 0).unwrap()
+}
+
+/// 合成单像素为 BGRA 预乘（R/B 交换以适配 BGRA 缓冲）。
+/// tint[3]>0：把图当 alpha mask、用 tint 色填充；否则按 premult 标志直通（svg 已预乘 / 位图未预乘）。
+#[inline]
+fn compose(r: u8, g: u8, b: u8, a: u8, tint: [u8; 4], premult: bool) -> PremultipliedColorU8 {
+    if tint[3] > 0 {
+        let ta = ((a as u16 * tint[3] as u16) / 255) as u8;
+        let p = |c: u8| ((c as u16 * ta as u16) / 255) as u8;
+        PremultipliedColorU8::from_rgba(p(tint[2]), p(tint[1]), p(tint[0]), ta).unwrap_or_else(transparent)
+    } else if premult {
+        PremultipliedColorU8::from_rgba(b, g, r, a).unwrap_or_else(transparent)
+    } else {
+        let p = |c: u8| ((c as u16 * a as u16) / 255) as u8;
+        PremultipliedColorU8::from_rgba(p(b), p(g), p(r), a).unwrap_or_else(transparent)
+    }
+}
+
+/// 栅格化 SVG 到 w×h，返回预乘 RGBA 字节（resvg 输出）。
+fn rasterize_svg(path: &str, w: u32, h: u32) -> Option<Vec<u8>> {
+    let data = std::fs::read(path).ok()?;
+    let tree = resvg::usvg::Tree::from_data(&data, &resvg::usvg::Options::default()).ok()?;
+    let size = tree.size();
+    let mut pm = resvg::tiny_skia::Pixmap::new(w, h)?;
+    let sx = w as f32 / size.width().max(1.0);
+    let sy = h as f32 / size.height().max(1.0);
+    resvg::render(
+        &tree,
+        resvg::tiny_skia::Transform::from_scale(sx, sy),
+        &mut pm.as_mut(),
+    );
+    Some(pm.data().to_vec())
+}
+
 /// 填充模式码：0=stretch（默认）1=nine_slice 2=tile 3=center。
 pub fn mode_code(mode: &str) -> u8 {
     match mode {
@@ -24,7 +61,7 @@ struct Src {
     rgba: Vec<u8>,
 }
 
-type FillKey = (String, u8, [u32; 4], u32, u32);
+type FillKey = (String, u8, [u32; 4], u32, u32, [u8; 4]);
 
 #[derive(Default)]
 pub struct ImageCache {
@@ -62,6 +99,7 @@ impl ImageCache {
     }
 
     /// 取（或构建）目标尺寸填充位图（BGRA 序 + 预乘）。
+    /// tint=[0,0,0,0] 表示不染色；非零时把图当 alpha mask、用 tint 色填充（单色 SVG/图标随主题变色）。
     pub fn fill(
         &mut self,
         path: &str,
@@ -69,25 +107,45 @@ impl ImageCache {
         slice: [u32; 4],
         w: u32,
         h: u32,
+        tint: [u8; 4],
     ) -> Option<&Pixmap> {
-        let key = (path.to_string(), mode, slice, w, h);
+        let key = (path.to_string(), mode, slice, w, h, tint);
         if !self.fills.contains_key(&key) {
-            let built = self.build_fill(path, mode, slice, w, h);
+            let built = self.build_fill(path, mode, slice, w, h, tint);
             self.fills.insert(key.clone(), built);
         }
         self.fills.get(&key).and_then(|o| o.as_ref())
     }
 
-    fn build_fill(&mut self, path: &str, mode: u8, slice: [u32; 4], w: u32, h: u32) -> Option<Pixmap> {
+    fn build_fill(
+        &mut self,
+        path: &str,
+        mode: u8,
+        slice: [u32; 4],
+        w: u32,
+        h: u32,
+        tint: [u8; 4],
+    ) -> Option<Pixmap> {
         if w == 0 || h == 0 {
             return None;
         }
+        let mut pm = Pixmap::new(w, h)?;
+        if path.to_ascii_lowercase().ends_with(".svg") {
+            // SVG：按目标尺寸栅格化（resvg 输出预乘 RGBA），逐像素 tint/直通 + R/B 交换。
+            let rgba = rasterize_svg(path, w, h)?;
+            let px = pm.pixels_mut();
+            for (i, p) in px.iter_mut().enumerate() {
+                let b = i * 4;
+                *p = compose(rgba[b], rgba[b + 1], rgba[b + 2], rgba[b + 3], tint, true);
+            }
+            return Some(pm);
+        }
+        // 位图：image 解码（未预乘）→ 按模式采样 → tint/预乘 + R/B 交换。
         let src = self.decode(path)?;
         let (sw, sh, data) = (src.w, src.h, &src.rgba);
         if sw == 0 || sh == 0 {
             return None;
         }
-        let mut pm = Pixmap::new(w, h)?;
         let px = pm.pixels_mut();
         for dy in 0..h {
             for dx in 0..w {
@@ -95,12 +153,8 @@ impl ImageCache {
                     continue; // 透明（Pixmap::new 已清零）
                 };
                 let si = ((sy * sw + sx) * 4) as usize;
-                let (r, g, b, a) = (data[si], data[si + 1], data[si + 2], data[si + 3]);
-                // 预乘 + R/B 交换（目标缓冲按 BGRA 维护，tiny-skia 当 RGBA 处理）。
-                let pm_ = |c: u8| ((c as u16 * a as u16) / 255) as u8;
-                let di = (dy * w + dx) as usize;
-                px[di] = PremultipliedColorU8::from_rgba(pm_(b), pm_(g), pm_(r), a)
-                    .unwrap_or(PremultipliedColorU8::from_rgba(0, 0, 0, 0).unwrap());
+                px[(dy * w + dx) as usize] =
+                    compose(data[si], data[si + 1], data[si + 2], data[si + 3], tint, false);
             }
         }
         Some(pm)
