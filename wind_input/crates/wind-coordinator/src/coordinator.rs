@@ -408,6 +408,13 @@ impl Coordinator {
             })
             .unwrap_or_else(|| "default".to_string());
 
+        // 标点转换器：注入自定义映射（四状态）。
+        let mut punct_conv = PunctuationConverter::new();
+        punct_conv.set_custom_mappings(
+            config.input.punct_custom.enabled,
+            config.input.punct_custom.mappings.clone(),
+        );
+
         let coordinator = Arc::new(Self {
             state: Mutex::new(State {
                 chinese_mode: config.general.default_chinese_mode,
@@ -448,7 +455,7 @@ impl Coordinator {
             engine_mgr,
             store,
             compiled_hotkeys,
-            punct: Mutex::new(PunctuationConverter::new()),
+            punct: Mutex::new(punct_conv),
             phrases,
             s2t: Mutex::new(s2t),
             opencc_dir,
@@ -1099,25 +1106,60 @@ impl Coordinator {
         (0x30..=0x39).contains(&prev_char)
     }
 
-    /// 按当前中英标点/全半角配置转换一个标点字符为上屏文本。
+    /// 按当前中英标点/全半角配置转换一个标点字符为上屏文本（无 prev_char 上下文）。
+    /// 用于独占模式（快捷输入/临时英文）等不涉及数字后智能的场景。
     fn convert_punct_char(&self, state: &State, ch: char) -> String {
-        if state.chinese_punct {
-            self.punct
+        self.convert_punct(state, ch, 0)
+    }
+
+    /// 标点转换单点流水线（对齐 Go `convertPunct`，固定优先级）：
+    ///   1. 自定义映射（四状态：中半 0 / 英全 1 / 中全 2 / 英半 3，按当前中英标点+全半角选列）
+    ///   2. 数字后智能转换（命中则该标点按英文输出，不转中文）
+    ///   3. 中文标点转换（引号左右交替状态机）
+    ///   4. 全半角转换
+    /// `prev_char` 为光标前一字符的 UTF-16 单元（0=不可用），用于数字后智能判定。
+    fn convert_punct(&self, state: &State, ch: char, prev_char: u16) -> String {
+        let effective_ch_punct = state.chinese_punct;
+        let smart_en = effective_ch_punct && self.is_smart_punct_after_digit(ch, prev_char);
+        let is_chinese_punct = effective_ch_punct && !smart_en;
+
+        // 1. 自定义映射优先（四状态均可配置）。
+        if self.config.input.punct_custom.enabled {
+            let col_idx = if is_chinese_punct && state.full_width {
+                2 // 中文全角
+            } else if is_chinese_punct {
+                0 // 中文半角
+            } else if state.full_width {
+                1 // 英文全角
+            } else {
+                3 // 英文半角
+            };
+            if let Some(text) = self
+                .punct
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .lookup_custom(ch, col_idx)
+            {
+                return text;
+            }
+        }
+
+        // 2~4. 默认转换：中文标点（含引号状态机）→ 全半角。
+        let mut piece = ch.to_string();
+        if is_chinese_punct {
+            if let Some(c) = self
+                .punct
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
                 .to_chinese(ch)
-                .unwrap_or_else(|| {
-                    if state.full_width {
-                        to_full_width(&ch.to_string())
-                    } else {
-                        ch.to_string()
-                    }
-                })
-        } else if state.full_width {
-            to_full_width(&ch.to_string())
-        } else {
-            ch.to_string()
+            {
+                piece = c;
+            }
         }
+        if state.full_width {
+            piece = to_full_width(&piece);
+        }
+        piece
     }
 
     /// 退出快捷输入模式并清空状态
@@ -2715,26 +2757,8 @@ impl MessageHandler for Coordinator {
                     state.input_buffer.clear();
                     state.candidates.clear();
 
-                    // 数字后智能标点：光标前为数字时该标点按英文输出（如 3. 不转 3。）
-                    let smart_en = self.is_smart_punct_after_digit(ch, data.prev_char);
-                    // 中文标点转换；智能标点命中或非中文标点模式时按全角/原样输出
-                    let piece = if state.chinese_punct && !smart_en {
-                        self.punct
-                            .lock()
-                            .unwrap_or_else(|e| e.into_inner())
-                            .to_chinese(ch)
-                            .unwrap_or_else(|| {
-                                if state.full_width {
-                                    to_full_width(&ch.to_string())
-                                } else {
-                                    ch.to_string()
-                                }
-                            })
-                    } else if state.full_width {
-                        to_full_width(&ch.to_string())
-                    } else {
-                        ch.to_string()
-                    };
+                    // 标点单点流水线：自定义映射 > 数字后智能 > 中文标点 > 全半角。
+                    let piece = self.convert_punct(&state, ch, data.prev_char);
                     out.push_str(&piece);
                     if had_input {
                         self.notify_ui_hide();

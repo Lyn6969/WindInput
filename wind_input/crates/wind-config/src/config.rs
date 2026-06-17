@@ -4,6 +4,7 @@
 //! 配置文件为 TOML 格式，三层合并：默认值 → data/config.toml → %APPDATA%/WindInput/config.toml
 
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use tracing::info;
 
@@ -129,6 +130,18 @@ pub struct InputConfig {
     pub smart_punct_after_digit: bool,
     #[serde(default = "default_smart_punct_list")]
     pub smart_punct_list: String,
+    /// 智能符号模式：同一中文标点在时限内连按两次，删前一字符替换为英文（默认 false）
+    #[serde(default)]
+    pub smart_symbol_mode: bool,
+    /// 智能符号模式判定时限（毫秒，默认 500）
+    #[serde(default = "default_smart_symbol_timeout_ms")]
+    pub smart_symbol_timeout_ms: i32,
+    /// 参与智能符号转换的中文标点集合（子串包含匹配，含成对/多字符标点）
+    #[serde(default = "default_smart_symbol_chars")]
+    pub smart_symbol_chars: String,
+    /// 自定义标点映射（四状态：中半/英全/中全/英半）
+    #[serde(default)]
+    pub punct_custom: PunctCustomConfig,
     /// 标点配对（输入左括号自动补右括号 + 输右括号智能跳过）
     #[serde(default)]
     pub auto_pair: AutoPairConfig,
@@ -146,6 +159,17 @@ pub struct InputConfig {
     pub capslock: CapslockConfig,
     #[serde(default)]
     pub temp_pinyin: TempPinyinConfig,
+}
+
+/// 自定义标点映射配置（对齐 Go PunctCustomConfig）。
+/// `mappings`: key=源字符（引号用 `"1`/`"2`/`'1`/`'2` 区分左右），
+/// value=`[中文半角, 英文全角, 中文全角, 英文半角]`（空串/缺列=回退默认转换）。
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct PunctCustomConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default)]
+    pub mappings: HashMap<String, Vec<String>>,
 }
 
 /// 标点配对配置（对齐 Go AutoPairConfig）
@@ -218,6 +242,10 @@ impl Default for InputConfig {
             select_char_keys: vec![],
             smart_punct_after_digit: true,
             smart_punct_list: ".,:".to_string(),
+            smart_symbol_mode: false,
+            smart_symbol_timeout_ms: default_smart_symbol_timeout_ms(),
+            smart_symbol_chars: default_smart_symbol_chars(),
+            punct_custom: PunctCustomConfig::default(),
             auto_pair: AutoPairConfig::default(),
             temp_pinyin: TempPinyinConfig::default(),
             enter_behavior: "commit".to_string(),
@@ -414,6 +442,14 @@ pub struct DebugConfig {
 
 fn default_true() -> bool {
     true
+}
+
+fn default_smart_symbol_timeout_ms() -> i32 {
+    500
+}
+
+fn default_smart_symbol_chars() -> String {
+    "。，？！：；、～￥·……——".to_string()
 }
 
 fn default_filter_mode() -> String {
