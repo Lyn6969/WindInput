@@ -3082,6 +3082,92 @@ impl Coordinator {
         }
     }
 
+    /// 空缓冲模式激活的单一入口（对齐 key-pipeline.md §2.1 优先级链）。
+    /// 优先级：临时英文(Shift+字母) > 快捷输入 > 临时拼音 > 特殊模式。命中返回激活 KeyAction，
+    /// 都不命中返回 None（落普通输入）。URL 前缀夺取是「缓冲扩展夺取」语义，不在此链，单独处理。
+    fn try_activate_mode(&self, state: &mut State, data: &KeyEventData) -> Option<KeyAction> {
+        // 临时英文：Shift+字母（空缓冲 + 无候选 + 已启用）
+        if state.input_buffer.is_empty()
+            && state.candidates.is_empty()
+            && self.config.input.shift_temp_english.enabled
+            && data.modifiers & MOD_SHIFT != 0
+            && data.modifiers & (MOD_CTRL | MOD_ALT) == 0
+            && (0x41..=0x5A).contains(&data.key_code)
+        {
+            let ch = (b'A' + (data.key_code - 0x41) as u8) as char; // 首字母大写
+            state.active = Some(ModeKind::TempEnglish);
+            state.temp_english_buffer = ch.to_string();
+            self.notify_ui_hide();
+            let buf_disp = state.temp_english_buffer.clone();
+            debug!("Entered temp English mode (buffer={})", buf_disp);
+            return Some(KeyAction::UpdateComposition {
+                text: buf_disp.clone(),
+                caret_pos: buf_disp.chars().count() as u32,
+            });
+        }
+
+        // 快捷输入：空缓冲 + 无候选 + 匹配触发键 + 无修饰键
+        if state.input_buffer.is_empty()
+            && state.candidates.is_empty()
+            && data.modifiers & (MOD_CTRL | MOD_ALT | MOD_SHIFT) == 0
+            && self.is_quick_input_trigger(data.key_code)
+        {
+            state.active = Some(ModeKind::QuickInput);
+            state.quick_input_buffer.clear();
+            state.quick_input_prefix = Self::quick_input_prefix_for(data.key_code).to_string();
+            self.update_quick_input_candidates(state);
+            let display = state.preedit.clone();
+            self.notify_ui_update(state);
+            debug!(
+                "Entered quick input mode (prefix={})",
+                state.quick_input_prefix
+            );
+            return Some(KeyAction::UpdateComposition {
+                text: display.clone(),
+                caret_pos: display.chars().count() as u32,
+            });
+        }
+
+        // 临时拼音：码表方案 + 空缓冲 + 匹配触发键 + 无修饰键（不要求候选空）
+        if state.input_buffer.is_empty()
+            && data.modifiers & (MOD_CTRL | MOD_ALT | MOD_SHIFT) == 0
+            && self.is_temp_pinyin_trigger(data.key_code)
+        {
+            if let Some(target) = self.engine_mgr.temp_pinyin_target() {
+                state.active = Some(ModeKind::TempPinyin);
+                state.temp_pinyin_schema = target;
+                state.temp_pinyin_buffer.clear();
+                state.temp_pinyin_prefix = Self::temp_pinyin_prefix_for(data.key_code).to_string();
+                self.update_temp_pinyin_candidates(state);
+                let display = state.preedit.clone();
+                self.notify_ui_update(state);
+                debug!(
+                    "Entered temp pinyin mode (prefix={})",
+                    state.temp_pinyin_prefix
+                );
+                return Some(KeyAction::UpdateComposition {
+                    text: display.clone(),
+                    caret_pos: display.chars().count() as u32,
+                });
+            }
+        }
+
+        // 特殊模式：空缓冲 + 无候选 + 无修饰键 + 引导键匹配（优先级最低）。
+        // 码表不可用时不拦截该键，返回 None 继续普通流程。
+        if state.input_buffer.is_empty()
+            && state.candidates.is_empty()
+            && data.modifiers & (MOD_CTRL | MOD_ALT | MOD_SHIFT) == 0
+        {
+            if let Some(idx) = self.match_special_trigger(data.key_code) {
+                if self.ensure_special_table(state, idx) {
+                    return Some(self.enter_special_mode(state, idx));
+                }
+            }
+        }
+
+        None
+    }
+
     /// 复位三种独占输入模式（临时英文/临时拼音/快捷输入）的状态。仅清空，不负责上屏；
     /// 调用方需在调用前取出待上屏文本（如模式切换时的临时英文缓冲）。
     fn reset_exclusive_modes(&self, state: &mut State) {
@@ -3224,83 +3310,9 @@ impl MessageHandler for Coordinator {
             None => {}
         }
 
-        // 触发临时英文：Shift+字母（中文模式 + 空缓冲 + 无候选 + 已启用）
-        if state.input_buffer.is_empty()
-            && state.candidates.is_empty()
-            && self.config.input.shift_temp_english.enabled
-            && data.modifiers & MOD_SHIFT != 0
-            && data.modifiers & (MOD_CTRL | MOD_ALT) == 0
-            && (0x41..=0x5A).contains(&data.key_code)
-        {
-            let ch = (b'A' + (data.key_code - 0x41) as u8) as char; // 首字母大写
-            state.active = Some(ModeKind::TempEnglish);
-            state.temp_english_buffer = ch.to_string();
-            self.notify_ui_hide();
-            let buf_disp = state.temp_english_buffer.clone();
-            debug!("Entered temp English mode (buffer={})", buf_disp);
-            return KeyAction::UpdateComposition {
-                text: buf_disp.clone(),
-                caret_pos: buf_disp.chars().count() as u32,
-            };
-        }
-
-        // 触发快捷输入：空缓冲 + 无候选 + 匹配触发键 + 无修饰键
-        if state.input_buffer.is_empty()
-            && state.candidates.is_empty()
-            && data.modifiers & (MOD_CTRL | MOD_ALT | MOD_SHIFT) == 0
-            && self.is_quick_input_trigger(data.key_code)
-        {
-            state.active = Some(ModeKind::QuickInput);
-            state.quick_input_buffer.clear();
-            state.quick_input_prefix = Self::quick_input_prefix_for(data.key_code).to_string();
-            self.update_quick_input_candidates(&mut state);
-            let display = state.preedit.clone();
-            self.notify_ui_update(&state);
-            debug!(
-                "Entered quick input mode (prefix={})",
-                state.quick_input_prefix
-            );
-            return KeyAction::UpdateComposition {
-                text: display.clone(),
-                caret_pos: display.chars().count() as u32,
-            };
-        }
-
-        // 触发临时拼音：码表方案 + 空缓冲 + 匹配触发键 + 无修饰键
-        if state.input_buffer.is_empty()
-            && data.modifiers & (MOD_CTRL | MOD_ALT | MOD_SHIFT) == 0
-            && self.is_temp_pinyin_trigger(data.key_code)
-        {
-            if let Some(target) = self.engine_mgr.temp_pinyin_target() {
-                state.active = Some(ModeKind::TempPinyin);
-                state.temp_pinyin_schema = target;
-                state.temp_pinyin_buffer.clear();
-                state.temp_pinyin_prefix = Self::temp_pinyin_prefix_for(data.key_code).to_string();
-                self.update_temp_pinyin_candidates(&mut state);
-                let display = state.preedit.clone();
-                self.notify_ui_update(&state);
-                debug!(
-                    "Entered temp pinyin mode (prefix={})",
-                    state.temp_pinyin_prefix
-                );
-                return KeyAction::UpdateComposition {
-                    text: display.clone(),
-                    caret_pos: display.chars().count() as u32,
-                };
-            }
-        }
-
-        // 触发特殊模式：空缓冲 + 无候选 + 无修饰键 + 引导键匹配（优先级低于快捷/临拼）。
-        // 码表不可用时不拦截该键，继续普通流程。
-        if state.input_buffer.is_empty()
-            && state.candidates.is_empty()
-            && data.modifiers & (MOD_CTRL | MOD_ALT | MOD_SHIFT) == 0
-        {
-            if let Some(idx) = self.match_special_trigger(data.key_code) {
-                if self.ensure_special_table(&mut state, idx) {
-                    return self.enter_special_mode(&mut state, idx);
-                }
-            }
+        // 空缓冲模式激活：单一入口，优先级链见 try_activate_mode（对齐 key-pipeline.md §2.1）。
+        if let Some(act) = self.try_activate_mode(&mut state, data) {
+            return act;
         }
 
         // Ctrl/Alt 组合（非热键）：有输入则清空并隐藏候选窗，否则透传。
