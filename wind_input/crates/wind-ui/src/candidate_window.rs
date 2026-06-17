@@ -222,8 +222,16 @@ impl CandidateWindow {
         let t_layout0 = Instant::now();
         root.layout(0.0, 0.0, &self.text_renderer);
         let (w_f, h_f) = root.measured_size();
-        let width = (w_f.ceil() as u32).max(40);
-        let height = (h_f.ceil() as u32).max(24);
+        let content_w = (w_f.ceil() as u32).max(40);
+        let content_h = (h_f.ceil() as u32).max(24);
+        // 窗口投影：仅向右/下扩展缓冲（offset 取非负），内容仍绘于 (0,0)，故定位/命中不变。
+        let shadow = self.shadow_params();
+        let (ext_r, ext_b) = match shadow {
+            Some((ox, oy, blur, _)) => ((ox + blur).ceil() as u32, (oy + blur).ceil() as u32),
+            None => (0, 0),
+        };
+        let width = content_w + ext_r;
+        let height = content_h + ext_b;
         let t_layout = t_layout0.elapsed();
 
         // 收集候选命中矩形并同步给鼠标处理器
@@ -243,6 +251,20 @@ impl CandidateWindow {
             let buf = self.window.buffer_mut();
             let buf_size = (width * height * 4) as usize;
             buf[..buf_size].fill(0);
+            // 先画投影（在内容下方），再画内容覆盖其上。
+            if let Some((ox, oy, blur, color)) = shadow {
+                let radius = self
+                    .theme
+                    .views
+                    .window
+                    .border_radius
+                    .map(|d| d.resolve(self.scale, 0.0))
+                    .unwrap_or(8.0 * self.scale);
+                paint_soft_shadow(
+                    buf, width, height, ox, oy, content_w as f32, content_h as f32, radius, blur,
+                    color,
+                );
+            }
             root.paint(buf, width, height, &self.text_renderer);
         }
         let t_paint = t_paint0.elapsed();
@@ -353,6 +375,23 @@ impl CandidateWindow {
             }
         }
         (x, y)
+    }
+
+    /// 窗口投影参数 (offset_x, offset_y, blur, color)：offset 取非负（向右下）；
+    /// 无色/全透明/零偏移零模糊 → None（不画投影）。
+    fn shadow_params(&self) -> Option<(f32, f32, f32, [u8; 4])> {
+        let v = &self.theme.views;
+        let s = self.scale;
+        let color = v.shadow_color?;
+        if color[3] == 0 {
+            return None;
+        }
+        let r = |d: Option<wind_theme::schema::Dim>| d.map(|x| x.resolve(s, 0.0)).unwrap_or(0.0).max(0.0);
+        let (ox, oy, blur) = (r(v.shadow_offset_x), r(v.shadow_offset_y), r(v.shadow_blur));
+        if ox + oy + blur <= 0.0 {
+            return None;
+        }
+        Some((ox, oy, blur, color))
     }
 
     /// 按当前状态构建候选视图树（横向布局）。
@@ -620,6 +659,40 @@ impl CandidateMouse {
             }
         }
         -1
+    }
+}
+
+/// 羽化窗口投影近似：blur 分层向外扩张、alpha 均摊（源覆盖叠加近似柔边）；blur=0 时单层硬投影。
+/// 仅画在内容左上之外的右/下区域可见（内容随后覆盖其上）。
+#[allow(clippy::too_many_arguments)]
+fn paint_soft_shadow(
+    buf: &mut [u8],
+    w: u32,
+    h: u32,
+    ox: f32,
+    oy: f32,
+    cw: f32,
+    ch: f32,
+    radius: f32,
+    blur: f32,
+    color: [u8; 4],
+) {
+    let steps = (blur.round() as i32).clamp(1, 8);
+    let a = (color[3] as f32 / steps as f32).round().clamp(1.0, 255.0) as u8;
+    let c = [color[0], color[1], color[2], a];
+    for k in 0..steps {
+        let grow = k as f32;
+        crate::view::fill_rounded(
+            buf,
+            w,
+            h,
+            (ox - grow).max(0.0),
+            (oy - grow).max(0.0),
+            cw + 2.0 * grow,
+            ch + 2.0 * grow,
+            c,
+            radius + grow,
+        );
     }
 }
 
