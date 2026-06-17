@@ -28,6 +28,8 @@ pub struct CandidateItem {
     pub label: String,
     /// 悬停反查提示（逐字编码/拼音，多行）；空则用 code 兜底
     pub tooltip: String,
+    /// 候选注释（编码后缀/短语提示等），非空时在候选词右侧以注释样式内联显示；空则不显示
+    pub comment: String,
 }
 
 /// 候选窗口配置
@@ -426,6 +428,9 @@ impl CandidateWindow {
         let sel_bg = patch_bg(&v.item.selected, [230, 240, 255, 255]);
         let hover_bg = patch_bg(&v.item.hover, [238, 242, 247, 255]);
         let index_color = col(v.index.text_color, [66, 133, 244, 255]);
+        let comment_color = col(v.comment.text_color, [150, 150, 150, 255]);
+        let comment_fs = node_fs(&v.comment);
+        let comment_margin_l = dim(v.comment.margin.left, 6.0);
         let index_circle = v.index.bg_shape == "circle";
         let index_circle_bg = col(v.index.bg_color, [66, 133, 244, 255]);
         let text_margin_l = dim(v.text.margin.left, 4.0);
@@ -465,6 +470,17 @@ impl CandidateWindow {
                 .tag(i as i32)
                 .child(idx_leaf)
                 .child(View::leaf(cand.text.clone(), txt_color).font_size(text_fs));
+            // 注释（编码后缀/短语提示）：非空时在候选词右侧以注释样式内联显示。
+            if !cand.comment.is_empty() {
+                item = item.child(
+                    View::leaf(cand.comment.clone(), comment_color)
+                        .font_size(comment_fs)
+                        .margin(Edges {
+                            l: comment_margin_l,
+                            ..Edges::default()
+                        }),
+                );
+            }
             // 选中底色优先于悬停底色（两者独立：选中=空格上屏目标，悬停=鼠标提示）
             if is_sel {
                 item = item.bg(sel_bg);

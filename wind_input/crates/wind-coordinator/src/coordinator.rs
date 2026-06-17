@@ -2455,6 +2455,7 @@ impl Coordinator {
                         (i + 1).to_string()
                     },
                     tooltip,
+                    comment: c.comment.clone(),
                 }
             })
             .collect();
