@@ -1012,11 +1012,13 @@ impl Coordinator {
             state.preedit = prefix;
             return;
         }
-        let result = self.engine_mgr.convert_with(
-            &state.temp_pinyin_schema,
-            &state.temp_pinyin_buffer,
-            ENGINE_MAX_CANDIDATES,
-        );
+        let Some(schema) = self.overlay_engine_schema(state) else {
+            state.preedit = format!("{}{}", prefix, state.temp_pinyin_buffer);
+            return;
+        };
+        let result =
+            self.engine_mgr
+                .convert_with(&schema, &state.temp_pinyin_buffer, ENGINE_MAX_CANDIDATES);
         let display = if result.preedit_display.is_empty() {
             state.temp_pinyin_buffer.clone()
         } else {
@@ -1620,10 +1622,10 @@ impl Coordinator {
             natural_order: 0,
             ..Default::default()
         }];
-        if self.config.input.shift_temp_english.show_english_candidates {
+        if let Some(schema) = self.overlay_engine_schema(state) {
             let lower = buf.to_lowercase();
             let case = detect_en_case(&buf);
-            let result = self.engine_mgr.convert_with("english", &lower, 60);
+            let result = self.engine_mgr.convert_with(&schema, &lower, 60);
             let mut seen = std::collections::HashSet::new();
             seen.insert(lower);
             for (i, c) in result.candidates.into_iter().enumerate() {
@@ -1806,6 +1808,28 @@ impl Coordinator {
             .filter(|s| !s.is_empty())
     }
 
+    /// 当前 overlay 模式背后的方案 id —— "模式即方案" 的单一映射（M4）。
+    /// 引擎驱动型模式（临拼/特殊/临英）返回 Some(scheme)；无词典模式（快捷/URL）返回 None。
+    /// overlay 候选查询统一经此取方案再走 `convert_with`；M5 临时 mix 复用此映射枚举成员方案。
+    ///
+    /// 说明：激活「触发条件」因各模式高度异构（Shift+字母 / 无修饰触发键 / schema 查找 /
+    /// 缓冲扩展夺取）保持 S4d `try_activate_mode` 的显式优先级链，不强塞统一表（避免死抽象）。
+    fn overlay_engine_schema(&self, state: &State) -> Option<String> {
+        match state.active {
+            Some(ModeKind::TempPinyin) => {
+                (!state.temp_pinyin_schema.is_empty()).then(|| state.temp_pinyin_schema.clone())
+            }
+            Some(ModeKind::Special(idx)) => self.special_schema(idx),
+            Some(ModeKind::TempEnglish) => self
+                .config
+                .input
+                .shift_temp_english
+                .show_english_candidates
+                .then(|| "english".to_string()),
+            _ => None,
+        }
+    }
+
     /// 进入特殊模式（其方案须可加载，由激活点 ensure_schema 保证）。清空普通输入，初始化空编码缓冲。
     fn enter_special_mode(&self, state: &mut State, idx: u8) -> KeyAction {
         state.input_buffer.clear();
@@ -1841,7 +1865,7 @@ impl Coordinator {
         if state.special_buffer.is_empty() {
             return None;
         }
-        let schema = self.special_schema(state.special_id)?;
+        let schema = self.overlay_engine_schema(state)?;
         let result = self
             .engine_mgr
             .convert_with(&schema, &state.special_buffer, 100);
