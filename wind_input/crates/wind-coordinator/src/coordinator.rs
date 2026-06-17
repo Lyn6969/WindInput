@@ -98,6 +98,50 @@ fn quick_input_char(key_code: u32, shift: bool) -> Option<char> {
     }
 }
 
+/// 英文输入大小写模式（临时英文候选适配用，对齐 Go detectCasePattern）。
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum EnCase {
+    Lower,
+    Upper,
+    Title,
+    Mixed,
+}
+
+/// 检测缓冲的大小写模式（仅看字母）。
+fn detect_en_case(s: &str) -> EnCase {
+    let letters: Vec<char> = s.chars().filter(|c| c.is_ascii_alphabetic()).collect();
+    if letters.is_empty() {
+        return EnCase::Lower;
+    }
+    if letters.iter().all(|c| c.is_ascii_lowercase()) {
+        return EnCase::Lower;
+    }
+    if letters.len() > 1 && letters.iter().all(|c| c.is_ascii_uppercase()) {
+        return EnCase::Upper;
+    }
+    // 首字母大写、其余小写（含单个大写字母如 "A"）→ Title
+    if letters[0].is_ascii_uppercase() && letters[1..].iter().all(|c| c.is_ascii_lowercase()) {
+        return EnCase::Title;
+    }
+    EnCase::Mixed
+}
+
+/// 把词库单词适配为输入的大小写模式（对齐 Go adaptCase）。
+fn adapt_en_case(word: &str, case: EnCase) -> String {
+    match case {
+        EnCase::Lower => word.to_lowercase(),
+        EnCase::Upper => word.to_uppercase(),
+        EnCase::Title => {
+            let mut chars = word.chars();
+            match chars.next() {
+                Some(f) => f.to_uppercase().collect::<String>() + &chars.as_str().to_lowercase(),
+                None => String::new(),
+            }
+        }
+        EnCase::Mixed => word.to_string(),
+    }
+}
+
 /// VK + shift → 可打印 ASCII 字符（字母按 shift 决定大小写、数字/符号复用 punct_char）。
 /// 用于网址模式原样累积与前缀探测。非可打印键返回 None。
 fn printable_char(key_code: u32, shift: bool) -> Option<char> {
@@ -1556,6 +1600,51 @@ impl Coordinator {
         state.active = None;
         state.temp_english_buffer.clear();
         state.preedit.clear();
+        state.candidates.clear();
+    }
+
+    /// 刷新临时英文候选：首候选=用户原始输入，其后为英文词库前缀匹配（大小写适配）。
+    /// 需 `shift_temp_english.show_english_candidates` 开启才查词库；词库为固定 id "english" 方案。
+    fn update_temp_english_candidates(&self, state: &mut State) {
+        state.candidates.clear();
+        state.current_page = 0;
+        state.selected_index = 0;
+        let buf = state.temp_english_buffer.clone();
+        state.preedit = buf.clone();
+        if buf.is_empty() {
+            return;
+        }
+        // 首候选始终是用户所打原文（保证能上屏自己输入的内容）。
+        let mut cands = vec![Candidate {
+            text: buf.clone(),
+            natural_order: 0,
+            ..Default::default()
+        }];
+        if self.config.input.shift_temp_english.show_english_candidates {
+            let lower = buf.to_lowercase();
+            let case = detect_en_case(&buf);
+            let result = self.engine_mgr.convert_with("english", &lower, 60);
+            let mut seen = std::collections::HashSet::new();
+            seen.insert(lower);
+            for (i, c) in result.candidates.into_iter().enumerate() {
+                let cl = c.text.to_lowercase();
+                if !seen.insert(cl.clone()) {
+                    continue;
+                }
+                // 词库全小写词按输入大小写适配；专有词（iPhone/Aaron）保持原样。
+                let display = if case != EnCase::Lower && c.text == cl {
+                    adapt_en_case(&c.text, case)
+                } else {
+                    c.text
+                };
+                cands.push(Candidate {
+                    text: display,
+                    natural_order: (i + 1) as i32,
+                    ..Default::default()
+                });
+            }
+        }
+        state.candidates = cands;
     }
 
     /// 探针是否恰好等于某个网址前缀（精确匹配，对齐 Go urlActivationResidual 的全匹配语义）。
@@ -1921,41 +2010,65 @@ impl Coordinator {
 
     /// 临时英文模式按键处理（首版：缓冲累积 + 空格/回车/标点上屏，暂无词库候选）
     fn handle_temp_english_key(&self, state: &mut State, data: &KeyEventData) -> KeyAction {
-        let comp = |buf: &str| KeyAction::UpdateComposition {
-            text: buf.to_string(),
-            caret_pos: buf.chars().count() as u32,
+        // 候选感知刷新后返回组合区动作。
+        let refresh = |this: &Self, state: &mut State| -> KeyAction {
+            this.update_temp_english_candidates(state);
+            let d = state.preedit.clone();
+            this.notify_ui_update(state);
+            KeyAction::UpdateComposition {
+                text: d.clone(),
+                caret_pos: d.chars().count() as u32,
+            }
+        };
+        // 上屏文本（可选全角）+ 退出。
+        let commit_text = |this: &Self, state: &mut State, t: String| -> KeyAction {
+            let text = if state.full_width {
+                to_full_width(&t)
+            } else {
+                t
+            };
+            this.exit_temp_english(state);
+            this.notify_ui_hide();
+            if text.is_empty() {
+                KeyAction::ClearComposition
+            } else {
+                Self::commit_action(text, true)
+            }
         };
         match data.key_code {
             0x1B => {
-                // Esc：放弃退出
                 self.exit_temp_english(state);
+                self.notify_ui_hide();
                 KeyAction::ClearComposition
             }
             0x08 => {
-                // 退格：删字符，空则退出
                 state.temp_english_buffer.pop();
                 if state.temp_english_buffer.is_empty() {
                     self.exit_temp_english(state);
+                    self.notify_ui_hide();
                     KeyAction::ClearComposition
                 } else {
-                    comp(&state.temp_english_buffer)
+                    refresh(self, state)
                 }
             }
-            0x20 | 0x0D => {
-                // 空格/回车：上屏缓冲
-                let mut text = state.temp_english_buffer.clone();
-                if state.full_width {
-                    text = to_full_width(&text);
-                }
-                self.exit_temp_english(state);
-                if text.is_empty() {
-                    KeyAction::ClearComposition
+            0x20 => {
+                // 空格：上屏当前高亮候选（首候选=原始输入）
+                let text = if !state.candidates.is_empty() {
+                    let idx = self
+                        .highlighted_global_index(state)
+                        .min(state.candidates.len() - 1);
+                    state.candidates[idx].text.clone()
                 } else {
-                    Self::commit_action(text, true)
-                }
+                    state.temp_english_buffer.clone()
+                };
+                commit_text(self, state, text)
+            }
+            0x0D => {
+                // 回车：上屏原始输入文本（不取候选）
+                let text = state.temp_english_buffer.clone();
+                commit_text(self, state, text)
             }
             0x41..=0x5A => {
-                // 字母：Shift 大写，否则小写
                 let shift = data.modifiers & MOD_SHIFT != 0;
                 let base = data.key_code - 0x41;
                 let ch = if shift {
@@ -1964,25 +2077,75 @@ impl Coordinator {
                     (b'a' + base as u8) as char
                 };
                 state.temp_english_buffer.push(ch);
-                comp(&state.temp_english_buffer)
+                refresh(self, state)
             }
-            0x30..=0x39 if data.modifiers & MOD_SHIFT == 0 => {
-                // 数字直接入缓冲（英文常含数字，如 v2）
-                let ch = (b'0' + (data.key_code - 0x30) as u8) as char;
-                state.temp_english_buffer.push(ch);
-                comp(&state.temp_english_buffer)
+            0x31..=0x39 if data.modifiers & MOD_SHIFT == 0 => {
+                // 数字：有词库候选（>1，即除原文外还有匹配）时按页选词；否则作输入（英文含数字 v2）
+                let (start, end) = self.page_range(state);
+                let gi = start + (data.key_code - 0x31) as usize;
+                if state.candidates.len() > 1 && gi < end {
+                    let text = state.candidates[gi].text.clone();
+                    commit_text(self, state, text)
+                } else {
+                    let ch = (b'0' + (data.key_code - 0x30) as u8) as char;
+                    state.temp_english_buffer.push(ch);
+                    refresh(self, state)
+                }
+            }
+            0x30 if data.modifiers & MOD_SHIFT == 0 => {
+                state.temp_english_buffer.push('0');
+                refresh(self, state)
+            }
+            0x26 | 0x28 => {
+                // 上/下：移动高亮
+                if state.candidates.is_empty() {
+                    return KeyAction::Consumed;
+                }
+                let changed = if data.key_code == 0x26 {
+                    self.move_up(state)
+                } else {
+                    self.move_down(state)
+                };
+                if changed {
+                    self.notify_ui_update(state);
+                }
+                KeyAction::Consumed
+            }
+            0x21 | 0x22 => {
+                if state.candidates.is_empty() {
+                    return KeyAction::Consumed;
+                }
+                let changed = if data.key_code == 0x21 {
+                    self.page_prev(state)
+                } else {
+                    self.page_next(state)
+                };
+                if changed {
+                    self.notify_ui_update(state);
+                }
+                KeyAction::Consumed
             }
             _ => {
-                // 其它（标点等）：上屏缓冲 + 转换后的标点，退出
+                // 其它（标点等）：上屏当前高亮候选 + 转换后标点，退出
                 let shift = data.modifiers & MOD_SHIFT != 0;
                 if let Some(ch) = punct_char(data.key_code, shift) {
-                    let mut text = state.temp_english_buffer.clone();
-                    if state.full_width {
-                        text = to_full_width(&text);
-                    }
+                    let base = if !state.candidates.is_empty() {
+                        let idx = self
+                            .highlighted_global_index(state)
+                            .min(state.candidates.len() - 1);
+                        state.candidates[idx].text.clone()
+                    } else {
+                        state.temp_english_buffer.clone()
+                    };
+                    let base = if state.full_width {
+                        to_full_width(&base)
+                    } else {
+                        base
+                    };
                     let punct = self.convert_punct_char(state, ch);
                     self.exit_temp_english(state);
-                    Self::commit_action(format!("{}{}", text, punct), true)
+                    self.notify_ui_hide();
+                    Self::commit_action(format!("{}{}", base, punct), true)
                 } else {
                     KeyAction::Consumed
                 }
@@ -3017,12 +3180,13 @@ impl Coordinator {
             let ch = (b'A' + (data.key_code - 0x41) as u8) as char; // 首字母大写
             state.active = Some(ModeKind::TempEnglish);
             state.temp_english_buffer = ch.to_string();
-            self.notify_ui_hide();
-            let buf_disp = state.temp_english_buffer.clone();
-            debug!("Entered temp English mode (buffer={})", buf_disp);
+            self.update_temp_english_candidates(state);
+            let disp = state.preedit.clone();
+            self.notify_ui_update(state);
+            debug!("Entered temp English mode (buffer={})", disp);
             return Some(KeyAction::UpdateComposition {
-                text: buf_disp.clone(),
-                caret_pos: buf_disp.chars().count() as u32,
+                text: disp.clone(),
+                caret_pos: disp.chars().count() as u32,
             });
         }
 
