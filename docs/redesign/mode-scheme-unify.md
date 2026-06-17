@@ -120,16 +120,11 @@ TempMix overlay: 触发键 → 同时查 [pinyin 反查, special:rare_char, spec
 
 ## 6. 增量阶段（每步：编译 + 测试 + 交叉编译 + 提交）
 
-- **M1 特殊模式拉平**：`features.special_modes[]` config 改为引用 `schema` id（去掉内嵌 table/auto_commit/
-  fixed_length）；提供 `quick_symbols.schema.toml`（迁移现有快符表）。EngineManager 复用 `convert_with` 懒加载。
-- **M2 特殊模式迁移到方案查询**：候选改走 `convert_with(spec.schema, code, n)` + coordinator 质量链；删
-  `State.special_tables`/`ensure_special_table`/`update_special_candidates` 直查与 `decide_special_auto_commit`
-  （全码策略由码表引擎接管）。设备回归：快符 `\` 仍正常，且现在带排序/词频。
-- **M3 英文词库**：移植 Go 英文词库（作为一个方案/引擎），临时英文模式 `convert_with(英文方案)` 出候选。
-- **M4 ModeSpec 表驱动**：把临拼/特殊/快捷/英文/URL 的触发与引擎来源收进 `ModeSpec` 表，`try_activate_mode`
-  与 active 分派读表。纯重构，行为不变。
-- **M5 临时 mix**：`CompositeOverlayEngine`（推广 `MixedEngine` 支持 N 路）+ `features.mix_modes`，
-  融合临拼/快符/生僻字等多方案候选。
+- **M1 schema 用户目录覆盖**（commit `f69eabd`）✅：`read_schema`/`load_dictionary` 解析改 [用户/schemas, 安装/schemas] 优先。前置：特殊/英文方案文件可放 `%APPDATA%` 加载，不碰只读安装目录。
+- **M2 特殊模式拉平为真方案**（commit `183e959`）✅：`SpecialModeConfig` 去内嵌引擎字段、改引用 `schema`；候选走 `convert_with(spec.schema, …)`，全码策略由码表引擎接管；删 `special_tables`/`ensure_special_table`/`decide_special_auto_commit` 旁路。配套 `quick_symbols.schema.toml`（设备验证：`Loaded engine: quick_symbols`）。
+- **M3 英文词库**（commit `e0812df` 加载器 + `399554e` 临英候选）✅：`CodetableDict::load_lowercased` + `dict_type="english"`（小写码、原样文本）；临英候选感知（首候选=原文 + 词库前缀匹配 + `detect_en_case`/`adapt_en_case` 大小写适配）。配套 `english.schema.toml`。
+- **M4 overlay 引擎来源单一映射**（commit `12a2bca`）✅：`overlay_engine_schema(state)` 集中「模式→方案」映射，三处 `update_*_candidates` 统一经此取方案。激活触发条件保持 S4d 显式链（异构，不强塞统一表，避免死抽象）。
+- **M5 临时 mix**：`features.mix_modes[]{members:[schema…]}` + `ModeKind::Mix(u8)`；触发后对每个成员方案 `convert_with` 并按成员序合并候选，融合临拼/快符/生僻字。🚧 进行中。
 
 ## 7. 已定决策（用户 2026-06-17）
 

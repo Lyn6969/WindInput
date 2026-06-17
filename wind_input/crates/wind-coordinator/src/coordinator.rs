@@ -254,6 +254,10 @@ struct State {
     special_buffer: String,
     /// 当前特殊模式下标（= features.special_modes 索引；仅 active==Special 时有效）
     special_id: u8,
+    /// 临时 mix 编码缓冲
+    mix_buffer: String,
+    /// 当前 mix 模式下标（= features.mix_modes 索引；仅 active==Mix 时有效）
+    mix_id: u8,
     caret_x: i32,
     caret_y: i32,
     caret_height: i32,
@@ -550,6 +554,8 @@ impl Coordinator {
                 rewind: None,
                 special_buffer: String::new(),
                 special_id: 0,
+                mix_buffer: String::new(),
+                mix_id: 0,
                 caret_x: 0,
                 caret_y: 0,
                 caret_height: 0,
@@ -2032,6 +2038,222 @@ impl Coordinator {
         }
     }
 
+    // ───────────────────────── 临时 mix 模式 ─────────────────────────
+
+    /// 找出 key_code 匹配的 mix 模式下标（按配置顺序先到先得）。
+    fn match_mix_trigger(&self, key_code: u32) -> Option<u8> {
+        for (i, m) in self.config.features.mix_modes.iter().enumerate() {
+            if i > u8::MAX as usize {
+                break;
+            }
+            if m.trigger_keys
+                .iter()
+                .filter_map(|k| Self::special_trigger_vk(k))
+                .any(|vk| vk == key_code)
+            {
+                return Some(i as u8);
+            }
+        }
+        None
+    }
+
+    /// mix 模式可加载的成员方案列表（过滤空/不可加载）。
+    fn mix_members(&self, idx: u8) -> Vec<String> {
+        self.config
+            .features
+            .mix_modes
+            .get(idx as usize)
+            .map(|m| {
+                m.members
+                    .iter()
+                    .filter(|s| !s.is_empty() && self.engine_mgr.ensure_schema(s))
+                    .cloned()
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// 进入 mix 模式（至少一个成员方案可加载，由激活点保证）。
+    fn enter_mix_mode(&self, state: &mut State, idx: u8) -> KeyAction {
+        state.input_buffer.clear();
+        state.candidates.clear();
+        state.active = Some(ModeKind::Mix(idx));
+        state.mix_id = idx;
+        state.mix_buffer.clear();
+        self.update_mix_candidates(state);
+        self.notify_ui_update(state);
+        let display = state.preedit.clone();
+        debug!("Entered mix mode idx={}", idx);
+        KeyAction::UpdateComposition {
+            text: display.clone(),
+            caret_pos: display.chars().count() as u32,
+        }
+    }
+
+    /// 退出 mix 模式并清空相关状态。
+    fn exit_mix_mode(&self, state: &mut State) {
+        state.active = None;
+        state.mix_buffer.clear();
+        state.candidates.clear();
+        state.preedit.clear();
+    }
+
+    /// 刷新 mix 候选：对每个成员方案 convert_with 查询，按成员序合并、按文本去重。
+    fn update_mix_candidates(&self, state: &mut State) {
+        state.candidates.clear();
+        state.current_page = 0;
+        state.selected_index = 0;
+        state.preedit = state.mix_buffer.clone();
+        if state.mix_buffer.is_empty() {
+            return;
+        }
+        let members = self.mix_members(state.mix_id);
+        let mut cands: Vec<Candidate> = Vec::new();
+        let mut seen = std::collections::HashSet::new();
+        for schema in &members {
+            let result = self.engine_mgr.convert_with(schema, &state.mix_buffer, 50);
+            for c in result.candidates {
+                if seen.insert(c.text.clone()) {
+                    cands.push(c);
+                }
+            }
+        }
+        state.candidates = cands;
+    }
+
+    /// mix 模式按键处理：编码累积 + 候选选择（空格选高亮、数字/二三候选键选词、
+    /// 上下/翻页导航、回车上屏编码原文、退格删空退出、标点顶屏）。无自动上屏（手动选）。
+    fn handle_mix_key(&self, state: &mut State, data: &KeyEventData) -> KeyAction {
+        let refresh = |this: &Self, state: &mut State| -> KeyAction {
+            this.update_mix_candidates(state);
+            let d = state.preedit.clone();
+            this.notify_ui_update(state);
+            KeyAction::UpdateComposition {
+                text: d.clone(),
+                caret_pos: d.chars().count() as u32,
+            }
+        };
+        match data.key_code {
+            0x1B => {
+                self.exit_mix_mode(state);
+                self.notify_ui_hide();
+                KeyAction::ClearComposition
+            }
+            0x08 => {
+                state.mix_buffer.pop();
+                if state.mix_buffer.is_empty() {
+                    self.exit_mix_mode(state);
+                    self.notify_ui_hide();
+                    KeyAction::ClearComposition
+                } else {
+                    refresh(self, state)
+                }
+            }
+            0x20 => {
+                // 空格：上屏当前高亮候选；无候选则退出
+                if !state.candidates.is_empty() {
+                    let idx = self
+                        .highlighted_global_index(state)
+                        .min(state.candidates.len() - 1);
+                    let text = state.candidates[idx].text.clone();
+                    self.exit_mix_mode(state);
+                    self.notify_ui_hide();
+                    Self::commit_action(text, true)
+                } else {
+                    self.exit_mix_mode(state);
+                    self.notify_ui_hide();
+                    KeyAction::ClearComposition
+                }
+            }
+            0x0D => {
+                let text = state.mix_buffer.clone();
+                self.exit_mix_mode(state);
+                self.notify_ui_hide();
+                if text.is_empty() {
+                    KeyAction::ClearComposition
+                } else {
+                    Self::commit_action(text, true)
+                }
+            }
+            0x31..=0x39 => {
+                let (start, end) = self.page_range(state);
+                let gi = start + (data.key_code - 0x31) as usize;
+                if gi < end {
+                    let text = state.candidates[gi].text.clone();
+                    self.exit_mix_mode(state);
+                    self.notify_ui_hide();
+                    Self::commit_action(text, true)
+                } else {
+                    KeyAction::Consumed
+                }
+            }
+            0x41..=0x5A => {
+                let ch = (b'a' + (data.key_code - 0x41) as u8) as char;
+                state.mix_buffer.push(ch);
+                refresh(self, state)
+            }
+            0x26 | 0x28 => {
+                if state.candidates.is_empty() {
+                    return KeyAction::Consumed;
+                }
+                let changed = if data.key_code == 0x26 {
+                    self.move_up(state)
+                } else {
+                    self.move_down(state)
+                };
+                if changed {
+                    self.notify_ui_update(state);
+                }
+                KeyAction::Consumed
+            }
+            0x21 | 0x22 => {
+                if state.candidates.is_empty() {
+                    return KeyAction::Consumed;
+                }
+                let changed = if data.key_code == 0x21 {
+                    self.page_prev(state)
+                } else {
+                    self.page_next(state)
+                };
+                if changed {
+                    self.notify_ui_update(state);
+                }
+                KeyAction::Consumed
+            }
+            _ => {
+                let shift = data.modifiers & MOD_SHIFT != 0;
+                if !shift {
+                    if let Some(offset) = self.select_key_offset(data.key_code) {
+                        let (start, end) = self.page_range(state);
+                        let gi = start + offset;
+                        if gi < end {
+                            let text = state.candidates[gi].text.clone();
+                            self.exit_mix_mode(state);
+                            self.notify_ui_hide();
+                            return Self::commit_action(text, true);
+                        }
+                    }
+                }
+                if let Some(ch) = punct_char(data.key_code, shift) {
+                    let committed = if !state.candidates.is_empty() {
+                        let idx = self
+                            .highlighted_global_index(state)
+                            .min(state.candidates.len() - 1);
+                        state.candidates[idx].text.clone()
+                    } else {
+                        String::new()
+                    };
+                    let punct = self.convert_punct_char(state, ch);
+                    self.exit_mix_mode(state);
+                    self.notify_ui_hide();
+                    Self::commit_action(format!("{}{}", committed, punct), true)
+                } else {
+                    KeyAction::Consumed
+                }
+            }
+        }
+    }
+
     /// 临时英文模式按键处理（首版：缓冲累积 + 空格/回车/标点上屏，暂无词库候选）
     fn handle_temp_english_key(&self, state: &mut State, data: &KeyEventData) -> KeyAction {
         // 候选感知刷新后返回组合区动作。
@@ -3274,6 +3496,12 @@ impl Coordinator {
                     }
                 }
             }
+            // 临时 mix：至少一个成员方案可加载才进入（优先级最低）。
+            if let Some(idx) = self.match_mix_trigger(data.key_code) {
+                if !self.mix_members(idx).is_empty() {
+                    return Some(self.enter_mix_mode(state, idx));
+                }
+            }
         }
 
         None
@@ -3292,6 +3520,7 @@ impl Coordinator {
         state.url_buffer.clear();
         state.rewind = None;
         state.special_buffer.clear();
+        state.mix_buffer.clear();
         // 清理可能残留的组合显示（临时拼音/快捷输入会产生候选与 preedit）
         state.input_buffer.clear();
         state.candidates.clear();
@@ -3418,6 +3647,7 @@ impl MessageHandler for Coordinator {
             Some(ModeKind::TempEnglish) => return self.handle_temp_english_key(&mut state, data),
             Some(ModeKind::Url) => return self.handle_url_key(&mut state, data),
             Some(ModeKind::Special(_)) => return self.handle_special_key(&mut state, data),
+            Some(ModeKind::Mix(_)) => return self.handle_mix_key(&mut state, data),
             None => {}
         }
 

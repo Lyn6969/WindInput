@@ -40,6 +40,8 @@ pub enum ModeKind {
     Url,
     /// 特殊模式：引导键触发，自带码表 + 全码上屏策略。载荷为 `features.special_modes` 下标。
     Special(u8),
+    /// 临时 mix：引导键触发，合并多个成员方案候选。载荷为 `features.mix_modes` 下标。
+    Mix(u8),
 }
 
 /// 统一夺取回退登记（对齐 Go decider 的 armRewind/canRewind/rewindHijack）。

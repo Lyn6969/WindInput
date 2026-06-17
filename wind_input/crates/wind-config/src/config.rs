@@ -439,6 +439,27 @@ pub struct FeaturesConfig {
     /// 特殊模式列表（各自带码表 + 上屏策略；引导键触发）
     #[serde(default)]
     pub special_modes: Vec<SpecialModeConfig>,
+    /// 临时 mix 模式列表（引导键触发，合并多个成员方案的候选）
+    #[serde(default)]
+    pub mix_modes: Vec<MixModeConfig>,
+}
+
+/// 临时 mix 模式配置（overlay 激活面）。触发后对每个成员方案查询并按成员序合并候选，
+/// 融合临拼/快符/生僻字等。成员为真实方案 id（同特殊模式的拉平思路）。
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct MixModeConfig {
+    /// 实例唯一标识
+    #[serde(default)]
+    pub id: String,
+    /// 显示名（UI 徽标）
+    #[serde(default)]
+    pub name: String,
+    /// 引导键列表
+    #[serde(default)]
+    pub trigger_keys: Vec<String>,
+    /// 成员方案 id 列表（按序合并候选；如 ["pinyin", "quick_symbols"]）
+    #[serde(default)]
+    pub members: Vec<String>,
 }
 
 /// 特殊模式配置（纯 overlay 激活面）。引擎/码表配置拉平到其引用的真实方案
