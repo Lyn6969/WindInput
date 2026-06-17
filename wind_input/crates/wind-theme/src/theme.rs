@@ -29,11 +29,14 @@ pub fn load_merged(themes_dir: &Path, name: &str, depth: usize) -> anyhow::Resul
         .map_err(|e| anyhow::anyhow!("parse theme {}: {}", path.display(), e))?;
 
     // base 继承：先加载 base，再用本主题覆盖
-    if let Some(base_name) = value.get("base").and_then(|b| b.as_str()) {
-        if !base_name.is_empty() && base_name != name {
-            let base = load_merged(themes_dir, base_name, depth + 1)?;
-            return Ok(merge(base, value));
-        }
+    // base 链继承：先加载 base，再用本主题覆盖（merge）。
+    if let Some(base_name) = value
+        .get("base")
+        .and_then(|b| b.as_str())
+        .filter(|b| !b.is_empty() && *b != name)
+    {
+        let base = load_merged(themes_dir, base_name, depth + 1)?;
+        return Ok(merge(base, value));
     }
     Ok(value)
 }

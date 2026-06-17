@@ -41,7 +41,11 @@ token 递归求值 + 环检测（扩 palette.rs）；light/dark 坍缩（颜色+
 derive 忽略；validate warn 级。**保留 `ResolvedTheme` 扁平 facade**（从 Resolved 投影），让 wind-ui
 迁移期零改动继续编译。
 **成功标准**：jidian-classic 解析出含 BgImage/Layers/状态 patch 的 RvNode；旧 ResolvedTheme 测试仍绿。
-**状态**：未开始
+**状态**：✅ 完成（`rvnode.rs` RVNode 树 + `resolve.rs` 求值；10 单测全绿、clippy 干净、windows-gnu 交叉编译 0 错误）。
+要点：不 derive；LightDark 解析期坍缩（颜色+resources ref+tint）；validate 降级为 tracing::warn；
+状态 patch nil-gating 不看几何；window 投影/accent_bar/列表几何归位；status/tooltip/toast 注入各自 palette 默认。
+**未做（留后续阶段）**：toolbar/menu 复杂结构（T5 其它窗口）；ResolvedTheme 扁平 facade 暂保持独立旧实现
+（wind-ui 仍消费旧 ResolvedTheme，T3 再切换到 Resolved/RvNode，届时删旧实现）。
 
 ### T3：候选窗消费 RVNode（wind-ui）
 **目标**：candidate_window/viewbox 从 RvNode 取几何/色/字体（替换扁平字段读法）。
