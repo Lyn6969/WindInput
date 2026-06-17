@@ -1718,11 +1718,18 @@ impl Coordinator {
         }
     }
 
-    /// 引导键名 → VK（特殊模式触发；复用临拼标点名映射，并额外支持单字母 a-z）。
+    /// 引导键名 → VK（特殊模式触发；复用临拼标点名映射，额外支持 backslash 等 OEM 键与单字母 a-z）。
     fn special_trigger_vk(key: &str) -> Option<u32> {
         let k = key.trim().to_lowercase();
         if let Some(vk) = Self::temp_pinyin_trigger_vk(&k) {
             return Some(vk);
+        }
+        // 临拼映射未覆盖的 OEM 键（Go 触发键集合的补集）。
+        match k.as_str() {
+            "backslash" | "\\" => return Some(0xDC),
+            "minus" | "-" => return Some(0xBD),
+            "equal" | "equals" | "=" => return Some(0xBB),
+            _ => {}
         }
         let bytes = k.as_bytes();
         if bytes.len() == 1 && bytes[0].is_ascii_lowercase() {
