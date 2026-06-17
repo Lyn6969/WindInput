@@ -10,6 +10,7 @@
 //!
 //! 候选生成委托给 [`EngineManager`]，运行时词频 boost + 最终排序在本层应用。
 
+use crate::pipeline::ModeKind;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 use tracing::{debug, info, warn};
@@ -165,22 +166,19 @@ struct State {
     candidate_limit: usize,
     /// 动态分级加载：是否可能还有更多前缀候选未加载
     has_more: bool,
-    /// 临时拼音模式（码表方案下经触发键临时切到拼音反查）
-    temp_pinyin_mode: bool,
+    /// 当前激活的独占输入模式（临时拼音/快捷输入/临时英文）。`None` = 普通输入。
+    /// 单点决策的唯一真相源：结构上保证同一时刻至多一个独占模式（见 `pipeline.rs`）。
+    active: Option<ModeKind>,
     /// 临时拼音输入缓冲（拼音串）
     temp_pinyin_buffer: String,
     /// 临时拼音目标方案 id（如 "pinyin"）
     temp_pinyin_schema: String,
     /// 临时拼音组合区前缀字符（触发键，如 "`"）
     temp_pinyin_prefix: String,
-    /// 快捷输入模式（分号触发：日期/计算器）
-    quick_input_mode: bool,
     /// 快捷输入缓冲（如 "1+2*3" / "12.25"）
     quick_input_buffer: String,
     /// 快捷输入组合区前缀字符（触发键，如 ";"）
     quick_input_prefix: String,
-    /// 临时英文模式（Shift+字母触发，临时输入英文）
-    temp_english_mode: bool,
     /// 临时英文输入缓冲
     temp_english_buffer: String,
     caret_x: i32,
@@ -430,14 +428,12 @@ impl Coordinator {
                 candidate_input: String::new(),
                 candidate_limit: 0,
                 has_more: false,
-                temp_pinyin_mode: false,
+                active: None,
                 temp_pinyin_buffer: String::new(),
                 temp_pinyin_schema: String::new(),
                 temp_pinyin_prefix: String::new(),
-                quick_input_mode: false,
                 quick_input_buffer: String::new(),
                 quick_input_prefix: String::new(),
-                temp_english_mode: false,
                 temp_english_buffer: String::new(),
                 caret_x: 0,
                 caret_y: 0,
@@ -866,7 +862,7 @@ impl Coordinator {
 
     /// 退出临时拼音模式并清空相关状态
     fn exit_temp_pinyin(&self, state: &mut State) {
-        state.temp_pinyin_mode = false;
+        state.active = None;
         state.temp_pinyin_buffer.clear();
         state.temp_pinyin_schema.clear();
         state.temp_pinyin_prefix.clear();
@@ -1126,7 +1122,7 @@ impl Coordinator {
 
     /// 退出快捷输入模式并清空状态
     fn exit_quick_input(&self, state: &mut State) {
-        state.quick_input_mode = false;
+        state.active = None;
         state.quick_input_buffer.clear();
         state.quick_input_prefix.clear();
         state.candidates.clear();
@@ -1292,7 +1288,7 @@ impl Coordinator {
 
     /// 退出临时英文模式并清空状态
     fn exit_temp_english(&self, state: &mut State) {
-        state.temp_english_mode = false;
+        state.active = None;
         state.temp_english_buffer.clear();
         state.preedit.clear();
     }
@@ -1387,7 +1383,7 @@ impl Coordinator {
         state.input_buffer.clear();
         state.candidates.clear();
         // 进入临时拼音
-        state.temp_pinyin_mode = true;
+        state.active = Some(ModeKind::TempPinyin);
         state.temp_pinyin_schema = target;
         state.temp_pinyin_buffer.clear();
         state.temp_pinyin_prefix = Self::temp_pinyin_prefix_for(key_code).to_string();
@@ -1421,7 +1417,7 @@ impl Coordinator {
         };
         state.input_buffer.clear();
         state.candidates.clear();
-        state.quick_input_mode = true;
+        state.active = Some(ModeKind::QuickInput);
         state.quick_input_buffer.clear();
         state.quick_input_prefix = Self::quick_input_prefix_for(key_code).to_string();
         self.update_quick_input_candidates(state);
@@ -1473,7 +1469,7 @@ impl Coordinator {
         // 仅推送当前页候选（窗口按 1..N 编号，翻页后重新编号）
         let (start, end) = self.page_range(state);
         // 快捷输入用字母标签（a/b/c，因数字键需录入表达式），其余用数字
-        let alpha = state.quick_input_mode;
+        let alpha = state.active == Some(ModeKind::QuickInput);
         let items: Vec<CandidateItem> = state.candidates[start..end]
             .iter()
             .enumerate()
@@ -2088,13 +2084,11 @@ impl Coordinator {
         let chinese_mode = state.chinese_mode;
         let out = self.commit_candidate(&mut state, &text);
         // 鼠标提交后彻底复位各输入模式，避免遗留状态
-        state.temp_pinyin_mode = false;
+        state.active = None;
         state.temp_pinyin_buffer.clear();
         state.temp_pinyin_prefix.clear();
-        state.quick_input_mode = false;
         state.quick_input_buffer.clear();
         state.quick_input_prefix.clear();
-        state.temp_english_mode = false;
         state.temp_english_buffer.clear();
         drop(state);
 
@@ -2333,13 +2327,11 @@ impl Coordinator {
     /// 复位三种独占输入模式（临时英文/临时拼音/快捷输入）的状态。仅清空，不负责上屏；
     /// 调用方需在调用前取出待上屏文本（如模式切换时的临时英文缓冲）。
     fn reset_exclusive_modes(&self, state: &mut State) {
-        let dirty = state.temp_english_mode || state.temp_pinyin_mode || state.quick_input_mode;
-        state.temp_english_mode = false;
+        let dirty = state.active.is_some();
+        state.active = None;
         state.temp_english_buffer.clear();
-        state.temp_pinyin_mode = false;
         state.temp_pinyin_buffer.clear();
         state.temp_pinyin_prefix.clear();
-        state.quick_input_mode = false;
         state.quick_input_buffer.clear();
         state.quick_input_prefix.clear();
         // 清理可能残留的组合显示（临时拼音/快捷输入会产生候选与 preedit）
@@ -2356,8 +2348,10 @@ impl Coordinator {
     fn take_input_on_mode_switch(&self, state: &mut State, chinese: bool) -> String {
         // 独占模式优先：临时英文残留按“模式切换上屏”语义提交，临时拼音/快捷输入丢弃。
         // 独占模式下 input_buffer 必为空，与下方普通组合分支互斥，故在此提前返回。
-        if state.temp_english_mode || state.temp_pinyin_mode || state.quick_input_mode {
-            let text = if state.temp_english_mode && !state.temp_english_buffer.is_empty() {
+        if state.active.is_some() {
+            let text = if state.active == Some(ModeKind::TempEnglish)
+                && !state.temp_english_buffer.is_empty()
+            {
                 if state.full_width {
                     to_full_width(&state.temp_english_buffer)
                 } else {
@@ -2447,19 +2441,12 @@ impl MessageHandler for Coordinator {
             return KeyAction::PassThrough;
         }
 
-        // 临时拼音模式：路由到专用处理器（独占按键）
-        if state.temp_pinyin_mode {
-            return self.handle_temp_pinyin_key(&mut state, data);
-        }
-
-        // 快捷输入模式：路由到专用处理器（独占按键）
-        if state.quick_input_mode {
-            return self.handle_quick_input_key(&mut state, data);
-        }
-
-        // 临时英文模式：路由到专用处理器（独占按键）
-        if state.temp_english_mode {
-            return self.handle_temp_english_key(&mut state, data);
+        // 已激活独占模式：单点分派到专用处理器（唯一入口，见 pipeline.rs）。
+        match state.active {
+            Some(ModeKind::TempPinyin) => return self.handle_temp_pinyin_key(&mut state, data),
+            Some(ModeKind::QuickInput) => return self.handle_quick_input_key(&mut state, data),
+            Some(ModeKind::TempEnglish) => return self.handle_temp_english_key(&mut state, data),
+            None => {}
         }
 
         // 触发临时英文：Shift+字母（中文模式 + 空缓冲 + 无候选 + 已启用）
@@ -2471,7 +2458,7 @@ impl MessageHandler for Coordinator {
             && (0x41..=0x5A).contains(&data.key_code)
         {
             let ch = (b'A' + (data.key_code - 0x41) as u8) as char; // 首字母大写
-            state.temp_english_mode = true;
+            state.active = Some(ModeKind::TempEnglish);
             state.temp_english_buffer = ch.to_string();
             self.notify_ui_hide();
             let buf_disp = state.temp_english_buffer.clone();
@@ -2488,7 +2475,7 @@ impl MessageHandler for Coordinator {
             && data.modifiers & (MOD_CTRL | MOD_ALT | MOD_SHIFT) == 0
             && self.is_quick_input_trigger(data.key_code)
         {
-            state.quick_input_mode = true;
+            state.active = Some(ModeKind::QuickInput);
             state.quick_input_buffer.clear();
             state.quick_input_prefix = Self::quick_input_prefix_for(data.key_code).to_string();
             self.update_quick_input_candidates(&mut state);
@@ -2507,7 +2494,7 @@ impl MessageHandler for Coordinator {
             && self.is_temp_pinyin_trigger(data.key_code)
         {
             if let Some(target) = self.engine_mgr.temp_pinyin_target() {
-                state.temp_pinyin_mode = true;
+                state.active = Some(ModeKind::TempPinyin);
                 state.temp_pinyin_schema = target;
                 state.temp_pinyin_buffer.clear();
                 state.temp_pinyin_prefix =
