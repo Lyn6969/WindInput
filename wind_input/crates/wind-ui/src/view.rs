@@ -123,6 +123,8 @@ pub struct View {
     pub text_align: Align,
     /// 左侧强调条 (颜色, 宽度 px)：在节点左缘内绘制竖条（选中候选用）；不占布局空间（落在左内边距内）。
     pub left_bar: Option<([u8; 4], f32)>,
+    /// 圆形背景色：在节点中心画真圆（直径=min(w,h)）；序号圆圈用，替代圆角矩形药丸近似。
+    pub circle_bg: Option<[u8; 4]>,
     /// 背景填充图（叠在底色之上，裁到圆角内）。
     pub bg_image: Option<ViewImage>,
     /// z 层级覆盖图（z<0 在内容下、z>0 在内容上）。
@@ -154,6 +156,7 @@ impl Default for View {
             font_size: None,
             text_align: Align::Start,
             left_bar: None,
+            circle_bg: None,
             bg_image: None,
             layers: Vec::new(),
             children: Vec::new(),
@@ -222,6 +225,10 @@ impl View {
     }
     pub fn left_bar(mut self, color: [u8; 4], width: f32) -> Self {
         self.left_bar = Some((color, width));
+        self
+    }
+    pub fn circle_bg(mut self, color: [u8; 4]) -> Self {
+        self.circle_bg = Some(color);
         self
     }
     pub fn bg_image(mut self, img: ViewImage) -> Self {
@@ -402,6 +409,12 @@ impl View {
             let bh = (r.h * 0.6).max(2.0);
             let by = r.y + (r.h - bh) * 0.5;
             fill_rounded(buf, buf_w, buf_h, r.x, by, bw, bh, color, bw * 0.5);
+        }
+        // 圆形背景（序号圆圈）：节点中心真圆，直径 = min(w,h)。
+        if let Some(color) = self.circle_bg {
+            let cx = r.x + r.w * 0.5;
+            let cy = r.y + r.h * 0.5;
+            fill_circle(buf, buf_w, buf_h, cx, cy, r.w.min(r.h) * 0.5, color);
         }
         // z<0 覆盖图（在内容下方）。
         for layer in self.layers.iter().filter(|l| l.z < 0) {

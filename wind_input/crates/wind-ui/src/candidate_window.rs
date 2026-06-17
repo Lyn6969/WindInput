@@ -586,13 +586,15 @@ impl CandidateWindow {
             let is_hover = self.hover >= 0 && self.hover as usize == i;
             let txt_color = if is_sel { sel_text } else { text_color };
 
-            // 序号：圆圈样式 → 带底色 + 大圆角（药丸近似圆）
+            // 序号：圆圈样式 → 方形节点 + 真圆背景 + 居中数字。
             let mut idx_leaf = View::leaf(marker, index_color).font_size(index_fs);
             if index_circle {
+                let d = (index_fs * 1.5).round();
                 idx_leaf = idx_leaf
-                    .bg(index_circle_bg)
-                    .radius(index_fs * 0.5)
-                    .pad(Edges::xy(s * 4.0, s * 1.0));
+                    .circle_bg(index_circle_bg)
+                    .fixed_w(d)
+                    .fixed_h(d)
+                    .text_align(Align::Center);
             }
 
             let mut item = View::container(Layout::Row)
