@@ -425,6 +425,11 @@ fn resolve_views(v: &Views, palette: &HashMap<String, Rgba>, is_dark: bool) -> R
         .toast
         .as_ref()
         .map(|n| build(n, tk("toast_bg"), None, tk("toast_text")));
+    // 菜单容器（menu.root）：背景图/层来源；颜色默认 menu_bg/menu_border/menu_text。
+    rv.menu_root = v
+        .menu
+        .as_ref()
+        .map(|m| build(&m.root, tk("menu_bg"), tk("menu_border"), tk("menu_text")));
 
     rv
 }

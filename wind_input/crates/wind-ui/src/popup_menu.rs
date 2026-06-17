@@ -277,6 +277,9 @@ pub struct PopupMenu {
     border: [u8; 4],
     sep: [u8; 4],
     hl_bg: [u8; 4],
+    /// 菜单容器位图背景 + z 层（jidian menu.root 吃九宫格 panel + 角标水印）。
+    bg_image: Option<crate::view::ViewImage>,
+    layers: Vec<crate::view::ViewLayer>,
 }
 
 impl PopupMenu {
@@ -303,6 +306,8 @@ impl PopupMenu {
             border: BORDER,
             sep: SEP,
             hl_bg: HL_BG,
+            bg_image: None,
+            layers: Vec::new(),
         };
         // 预创建根窗口并绑定鼠标处理器（捕获后只有根窗口收消息）
         menu.ensure_windows(1)?;
@@ -327,6 +332,13 @@ impl PopupMenu {
         self.border = theme.color("menu_border", BORDER);
         self.sep = theme.color("menu_separator", SEP);
         self.hl_bg = theme.color("menu_hover_bg", HL_BG);
+        if let Some(node) = &theme.views.menu_root {
+            self.bg_image = crate::theme_assets::rv_image(theme, node.bg_image.as_ref());
+            self.layers = crate::theme_assets::rv_layers(theme, &node.layers, self.scale);
+        } else {
+            self.bg_image = None;
+            self.layers = Vec::new();
+        }
     }
 
     /// 显示菜单（顶层 items）于屏幕坐标 (x,y)。i32::MIN → 取光标位。
@@ -488,6 +500,13 @@ impl PopupMenu {
             .border(self.border, 1.0)
             .radius(6.0 * s)
             .pad(Edges::all(4.0 * s));
+        // 主题位图背景 + 层（jidian menu.root 吃九宫格 panel + 角标水印）。
+        if let Some(img) = &self.bg_image {
+            root = root.bg_image(img.clone());
+        }
+        if !self.layers.is_empty() {
+            root = root.layers(self.layers.clone());
+        }
 
         for (i, it) in items.iter().enumerate() {
             if is_separator(it) {

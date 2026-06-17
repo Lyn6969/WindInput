@@ -4,7 +4,7 @@
 //! 统一到 View 盒模型 + DirectWrite：深色半透明圆角底 + 居中白字，约 1 秒后自动隐藏。
 
 use crate::text::dwrite::TextRenderer;
-use crate::view::{Align, Edges, View};
+use crate::view::{Align, Edges, View, ViewImage, ViewLayer};
 use crate::window::LayeredWindow;
 
 /// 状态提示气泡窗口
@@ -14,6 +14,9 @@ pub struct StatusTip {
     scale: f32,
     bg: [u8; 4],
     fg: [u8; 4],
+    /// 主题位图背景（如 jidian status 的九宫格 panel）+ z 层水印。
+    bg_image: Option<ViewImage>,
+    layers: Vec<ViewLayer>,
 }
 
 impl StatusTip {
@@ -27,13 +30,22 @@ impl StatusTip {
             scale,
             bg: [40, 40, 40, 235],
             fg: [245, 245, 245, 255],
+            bg_image: None,
+            layers: Vec::new(),
         })
     }
 
-    /// 应用主题（状态气泡底色/文字色）。
+    /// 应用主题（状态气泡底色/文字色 + 位图背景/层）。
     pub fn set_theme(&mut self, theme: &wind_theme::Resolved) {
         self.bg = theme.color("status_bg", self.bg);
         self.fg = theme.color("status_text", self.fg);
+        if let Some(node) = &theme.views.status {
+            self.bg_image = crate::theme_assets::rv_image(theme, node.bg_image.as_ref());
+            self.layers = crate::theme_assets::rv_layers(theme, &node.layers, self.scale);
+        } else {
+            self.bg_image = None;
+            self.layers = Vec::new();
+        }
     }
 
     /// 显示提示文本，居中于 (cx, cy) 上方
@@ -46,6 +58,13 @@ impl StatusTip {
             .text_align(Align::Center);
         // 圆角随高度（估算字高 + 内边距）
         tip.corner_radius = (self.renderer.measure_text("国").height + 20.0 * s) * 0.28;
+        // 主题位图背景 + 层（jidian status 吃九宫格 panel + 角标水印）。
+        if let Some(img) = &self.bg_image {
+            tip = tip.bg_image(img.clone());
+        }
+        if !self.layers.is_empty() {
+            tip = tip.layers(self.layers.clone());
+        }
 
         tip.layout(0.0, 0.0, &self.renderer);
         let (w_f, h_f) = tip.measured_size();

@@ -4,7 +4,7 @@
 //! 深色圆角小气泡 + DirectWrite 文本。
 
 use crate::text::dwrite::TextRenderer;
-use crate::view::{Align, Edges, View};
+use crate::view::{Align, Edges, View, ViewImage, ViewLayer};
 use crate::window::LayeredWindow;
 
 const FONT_PX: f32 = 13.0;
@@ -19,6 +19,9 @@ pub struct Tooltip {
     visible: bool,
     bg: [u8; 4],
     fg: [u8; 4],
+    /// 主题位图背景 + z 层（jidian tooltip 吃九宫格 panel + 角标水印）。
+    bg_image: Option<ViewImage>,
+    layers: Vec<ViewLayer>,
 }
 
 impl Tooltip {
@@ -33,13 +36,22 @@ impl Tooltip {
             visible: false,
             bg: BG,
             fg: FG,
+            bg_image: None,
+            layers: Vec::new(),
         })
     }
 
-    /// 应用主题（tooltip 底色/文字色）。
+    /// 应用主题（tooltip 底色/文字色 + 位图背景/层）。
     pub fn set_theme(&mut self, theme: &wind_theme::Resolved) {
         self.bg = theme.color("tooltip_bg", BG);
         self.fg = theme.color("tooltip_text", FG);
+        if let Some(node) = &theme.views.tooltip {
+            self.bg_image = crate::theme_assets::rv_image(theme, node.bg_image.as_ref());
+            self.layers = crate::theme_assets::rv_layers(theme, &node.layers, self.scale);
+        } else {
+            self.bg_image = None;
+            self.layers = Vec::new();
+        }
     }
 
     /// 显示提示，左上角对齐 (x,y)（屏幕坐标）
@@ -54,6 +66,12 @@ impl Tooltip {
             .pad(Edges::xy(8.0 * s, 4.0 * s))
             .text_align(Align::Center);
         tip.corner_radius = 5.0 * s;
+        if let Some(img) = &self.bg_image {
+            tip = tip.bg_image(img.clone());
+        }
+        if !self.layers.is_empty() {
+            tip = tip.layers(self.layers.clone());
+        }
 
         tip.layout(0.0, 0.0, &self.renderer);
         let (w_f, h_f) = tip.measured_size();

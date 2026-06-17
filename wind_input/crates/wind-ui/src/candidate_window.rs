@@ -394,38 +394,14 @@ impl CandidateWindow {
         Some((ox, oy, blur, color))
     }
 
-    /// 把 image ref 解析为可读绝对路径：resources 注册表 → data:/绝对 → 在 asset_dirs（base 链目录）
-    /// 搜字面文件（如 _base 的 chevron.svg）。
+    /// 把 image ref 解析为可读绝对路径（委托共享 theme_assets）。
     fn asset_path(&self, reference: &str) -> Option<String> {
-        if reference.is_empty() {
-            return None;
-        }
-        if let Some(p) = self.theme.resources.get(reference) {
-            return Some(p.clone());
-        }
-        if reference.starts_with("data:") || std::path::Path::new(reference).is_absolute() {
-            return Some(reference.to_string());
-        }
-        for d in &self.theme.asset_dirs {
-            let p = d.join(reference);
-            if p.exists() {
-                return Some(p.to_string_lossy().into_owned());
-            }
-        }
-        Some(reference.to_string())
+        crate::theme_assets::asset_path(&self.theme, reference)
     }
 
-    /// RvImage → 渲染用 ViewImage（reference 解析为绝对路径）。
+    /// RvImage → 渲染用 ViewImage（委托共享 theme_assets）。
     fn rv_image(&self, im: Option<&wind_theme::RvImage>) -> Option<ViewImage> {
-        let im = im?;
-        let path = self.asset_path(&im.reference)?;
-        Some(ViewImage {
-            path,
-            mode: im.mode.clone(),
-            slice: im.slice,
-            opacity: im.opacity,
-            tint: im.tint,
-        })
+        crate::theme_assets::rv_image(&self.theme, im)
     }
 
     /// footer 翻页箭头图标（SVG + tint）。无 prev/next_image 时 None（回退文字箭头）。
@@ -447,36 +423,9 @@ impl CandidateWindow {
         })
     }
 
-    /// RvImage[] → ViewLayer[]：解析路径 + 偏移分流（dp×scale / 百分比）+ 尺寸×scale。
+    /// RvImage[] → ViewLayer[]（委托共享 theme_assets）。
     fn rv_layers(&self, layers: &[wind_theme::RvImage]) -> Vec<ViewLayer> {
-        use wind_theme::schema::Dim;
-        let s = self.scale;
-        let split = |d: Option<Dim>| match d {
-            Some(Dim::Dp(v)) => (v * s, 0.0),
-            Some(Dim::Px(v)) => (v, 0.0),
-            Some(Dim::Pct(v)) => (0.0, v),
-            None => (0.0, 0.0),
-        };
-        layers
-            .iter()
-            .filter_map(|im| {
-                let path = self.asset_path(&im.reference)?;
-                let (off_x, off_x_pct) = split(im.offset_x);
-                let (off_y, off_y_pct) = split(im.offset_y);
-                Some(ViewLayer {
-                    path,
-                    z: im.z,
-                    anchor: im.anchor.clone(),
-                    off_x,
-                    off_y,
-                    off_x_pct,
-                    off_y_pct,
-                    w: if im.w > 0 { im.w as f32 * s } else { 0.0 },
-                    h: if im.h > 0 { im.h as f32 * s } else { 0.0 },
-                    opacity: im.opacity,
-                })
-            })
-            .collect()
+        crate::theme_assets::rv_layers(&self.theme, layers, self.scale)
     }
 
     /// 按当前状态构建候选视图树（横向布局）。

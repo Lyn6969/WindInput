@@ -131,6 +131,8 @@ pub struct RvViews {
     pub status: Option<RvNode>,
     pub tooltip: Option<RvNode>,
     pub toast: Option<RvNode>,
+    /// 弹出菜单容器（menu.root）：背景图/层 + 容器色。item/separator 颜色仍走 palette。
+    pub menu_root: Option<RvNode>,
 
     // 列表级几何（V3-D 属性归位：从 candidate_list / window / accent_bar 节点读取）。
     pub item_spacing: Option<Dim>,
