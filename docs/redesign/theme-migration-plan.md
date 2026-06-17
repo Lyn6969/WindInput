@@ -50,7 +50,10 @@ derive 忽略；validate warn 级。**保留 `ResolvedTheme` 扁平 facade**（�
 ### T3：候选窗消费 RVNode（wind-ui）
 **目标**：candidate_window/viewbox 从 RvNode 取几何/色/字体（替换扁平字段读法）。
 **成功标准**：候选窗外观与迁移前一致（default/msime 零回归）。
-**状态**：未开始
+**状态**：✅ 完成（提交 `cefbaf9`）。Resolved 端到端贯通：coordinator.push_theme→load_resolved→SetTheme
+(Box<Resolved>)→5 窗口；候选窗 build_tree 全读 RvViews/RvNode + 兜底色（与旧默认等值）；Resolved 加
+Default/load_resolved、RvNode 加 bg_shape（序号圆形）。windows-gnu 交叉编译 Finished。
+**未做**：旧 `resolved.rs`(ResolvedTheme/ThemeManager) 暂留（仅自身测试引用），待后续 T6/清理删除。
 
 ### T4：图片管线 nine_slice + layers + SVG tint（wind-ui 解码缓存 + wind-theme RVImage）
 **目标**：`bgimage.rs`/svg tint 落地；wind-ui 按 ref 解码缓存位图，九宫格/拉伸/平铺/center + z 层 +
