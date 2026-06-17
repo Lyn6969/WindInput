@@ -11,7 +11,8 @@
 //! 候选生成委托给 [`EngineManager`]，运行时词频 boost + 最终排序在本层应用。
 
 use crate::pipeline::{ModeKind, Rewind};
-use std::path::Path;
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use tracing::{debug, info, warn};
 
@@ -20,6 +21,7 @@ use wind_bridge::push::{PushConfig, PushServer};
 use wind_candidate::Candidate;
 use wind_config::Config;
 use wind_config::hotkey::{self, CompiledHotkeys};
+use wind_dict::codetable::CodetableDict;
 use wind_engine::EngineManager;
 use wind_ipc::protocol::{
     EVENT_KEY_DOWN, EVENT_KEY_UP, MOD_ALT, MOD_CTRL, MOD_SHIFT, calc_key_hash,
@@ -204,6 +206,12 @@ struct State {
     url_buffer: String,
     /// 统一夺取回退登记（仅在夺取式模式激活时为 Some，见 pipeline::Rewind）
     rewind: Option<Rewind>,
+    /// 特殊模式编码缓冲（自带码表的查询码）
+    special_buffer: String,
+    /// 当前特殊模式下标（= features.special_modes 索引；仅 active==Special 时有效）
+    special_id: u8,
+    /// 特殊模式码表懒加载缓存（下标 → 码表）
+    special_tables: HashMap<u8, CodetableDict>,
     caret_x: i32,
     caret_y: i32,
     caret_height: i32,
@@ -488,6 +496,9 @@ impl Coordinator {
                 temp_english_buffer: String::new(),
                 url_buffer: String::new(),
                 rewind: None,
+                special_buffer: String::new(),
+                special_id: 0,
+                special_tables: HashMap::new(),
                 caret_x: 0,
                 caret_y: 0,
                 caret_height: 0,
@@ -1687,6 +1698,325 @@ impl Coordinator {
         }
     }
 
+    // ───────────────────────── 特殊模式 ─────────────────────────
+
+    /// 特殊模式自动上屏判定（纯函数，对齐 Go decideSpecialAutoCommit）。
+    /// - prefix_free：唯一精确候选且无更长前缀 → 自动上屏
+    /// - fixed_length：编码达固定长度且唯一精确候选 → 自动上屏
+    /// - manual（及未知策略）：永不自动
+    fn decide_special_auto_commit(
+        strategy: &str,
+        fixed_length: usize,
+        buf_len: usize,
+        exact_count: usize,
+        has_longer: bool,
+    ) -> bool {
+        match strategy {
+            "prefix_free" => exact_count == 1 && !has_longer,
+            "fixed_length" => fixed_length > 0 && buf_len >= fixed_length && exact_count == 1,
+            _ => false,
+        }
+    }
+
+    /// 引导键名 → VK（特殊模式触发；复用临拼标点名映射，并额外支持单字母 a-z）。
+    fn special_trigger_vk(key: &str) -> Option<u32> {
+        let k = key.trim().to_lowercase();
+        if let Some(vk) = Self::temp_pinyin_trigger_vk(&k) {
+            return Some(vk);
+        }
+        let bytes = k.as_bytes();
+        if bytes.len() == 1 && bytes[0].is_ascii_lowercase() {
+            return Some(0x41 + (bytes[0] - b'a') as u32);
+        }
+        None
+    }
+
+    /// 找出 key_code 匹配的特殊模式下标（按配置顺序先到先得；最多 256 个）。
+    fn match_special_trigger(&self, key_code: u32) -> Option<u8> {
+        for (i, m) in self.config.features.special_modes.iter().enumerate() {
+            if i > u8::MAX as usize {
+                break;
+            }
+            if m.trigger_keys
+                .iter()
+                .filter_map(|k| Self::special_trigger_vk(k))
+                .any(|vk| vk == key_code)
+            {
+                return Some(i as u8);
+            }
+        }
+        None
+    }
+
+    /// 解析特殊模式码表路径（在 [用户配置/schemas, data/schemas] 中查找）。
+    fn resolve_special_table_path(table: &str) -> Option<PathBuf> {
+        let mut dirs: Vec<PathBuf> = Vec::new();
+        if let Some(d) = Config::user_config_dir() {
+            dirs.push(d.join("schemas"));
+        }
+        if let Some(d) = Config::data_dir() {
+            dirs.push(d.join("schemas"));
+        }
+        dirs.into_iter()
+            .map(|d| d.join(table))
+            .find(|p| p.is_file())
+    }
+
+    /// 懒加载特殊模式码表（已缓存即跳过）。成功返回 true。
+    fn ensure_special_table(&self, state: &mut State, idx: u8) -> bool {
+        if state.special_tables.contains_key(&idx) {
+            return true;
+        }
+        let table = match self.config.features.special_modes.get(idx as usize) {
+            Some(m) => m.table.clone(),
+            None => return false,
+        };
+        let path = match Self::resolve_special_table_path(&table) {
+            Some(p) => p,
+            None => {
+                warn!("Special mode table not found: {}", table);
+                return false;
+            }
+        };
+        match CodetableDict::load(&path) {
+            Ok(dict) => {
+                info!(
+                    "Loaded special mode table idx={} ({} entries)",
+                    idx,
+                    dict.len()
+                );
+                state.special_tables.insert(idx, dict);
+                true
+            }
+            Err(e) => {
+                warn!("Failed to load special table {}: {}", path.display(), e);
+                false
+            }
+        }
+    }
+
+    /// 进入特殊模式（码表须已 ensure 加载）。清空普通输入，初始化空编码缓冲。
+    fn enter_special_mode(&self, state: &mut State, idx: u8) -> KeyAction {
+        state.input_buffer.clear();
+        state.candidates.clear();
+        state.active = Some(ModeKind::Special(idx));
+        state.special_id = idx;
+        state.special_buffer.clear();
+        self.update_special_candidates(state);
+        self.notify_ui_update(state);
+        let display = state.preedit.clone();
+        debug!("Entered special mode idx={}", idx);
+        KeyAction::UpdateComposition {
+            text: display.clone(),
+            caret_pos: display.chars().count() as u32,
+        }
+    }
+
+    /// 退出特殊模式并清空相关状态（码表缓存保留供复用）。
+    fn exit_special_mode(&self, state: &mut State) {
+        state.active = None;
+        state.special_buffer.clear();
+        state.candidates.clear();
+        state.preedit.clear();
+    }
+
+    /// 按当前编码缓冲刷新特殊模式候选。返回 Some(text) 表示应自动上屏该精确候选。
+    fn update_special_candidates(&self, state: &mut State) -> Option<String> {
+        state.candidates.clear();
+        state.current_page = 0;
+        state.selected_index = 0;
+        state.preedit = state.special_buffer.clone();
+        if state.special_buffer.is_empty() {
+            return None;
+        }
+        let idx = state.special_id;
+        let buf = state.special_buffer.clone();
+        let results = match state.special_tables.get(&idx) {
+            Some(table) => table.search_prefix(&buf, 100),
+            None => return None,
+        };
+        let mut exact_count = 0usize;
+        let mut has_longer = false;
+        let mut cands = Vec::with_capacity(results.len());
+        for (i, (code, text, _w, _o)) in results.iter().enumerate() {
+            if code == &buf {
+                exact_count += 1;
+            } else if code.len() > buf.len() {
+                has_longer = true;
+            }
+            cands.push(Candidate {
+                text: text.clone(),
+                natural_order: i as i32,
+                ..Default::default()
+            });
+        }
+        state.candidates = cands;
+
+        let m = self.config.features.special_modes.get(idx as usize)?;
+        let auto = Self::decide_special_auto_commit(
+            &m.auto_commit,
+            m.fixed_length,
+            buf.chars().count(),
+            exact_count,
+            has_longer,
+        );
+        if auto {
+            return results
+                .iter()
+                .find(|(code, _, _, _)| code == &buf)
+                .map(|(_, t, _, _)| t.clone());
+        }
+        None
+    }
+
+    /// 特殊模式按键处理：编码累积 + 候选选择 + 三档自动上屏；空格选高亮、回车上屏编码原文。
+    fn handle_special_key(&self, state: &mut State, data: &KeyEventData) -> KeyAction {
+        match data.key_code {
+            0x1B => {
+                // Esc：放弃退出
+                self.exit_special_mode(state);
+                self.notify_ui_hide();
+                KeyAction::ClearComposition
+            }
+            0x08 => {
+                // 退格：删编码；空则退出。删除时不触发自动上屏。
+                state.special_buffer.pop();
+                if state.special_buffer.is_empty() {
+                    self.exit_special_mode(state);
+                    self.notify_ui_hide();
+                    KeyAction::ClearComposition
+                } else {
+                    self.update_special_candidates(state);
+                    let display = state.preedit.clone();
+                    self.notify_ui_update(state);
+                    KeyAction::UpdateComposition {
+                        text: display.clone(),
+                        caret_pos: display.chars().count() as u32,
+                    }
+                }
+            }
+            0x20 => {
+                // 空格：有候选选高亮上屏；无候选退出
+                if !state.candidates.is_empty() {
+                    let idx = self
+                        .highlighted_global_index(state)
+                        .min(state.candidates.len() - 1);
+                    let text = state.candidates[idx].text.clone();
+                    self.exit_special_mode(state);
+                    self.notify_ui_hide();
+                    Self::commit_action(text, true)
+                } else {
+                    self.exit_special_mode(state);
+                    self.notify_ui_hide();
+                    KeyAction::ClearComposition
+                }
+            }
+            0x0D => {
+                // 回车：上屏编码原文
+                let text = state.special_buffer.clone();
+                self.exit_special_mode(state);
+                self.notify_ui_hide();
+                if text.is_empty() {
+                    KeyAction::ClearComposition
+                } else {
+                    Self::commit_action(text, true)
+                }
+            }
+            0x31..=0x39 => {
+                // 数字 1-9 选当前页候选
+                let (start, end) = self.page_range(state);
+                let gi = start + (data.key_code - 0x31) as usize;
+                if gi < end {
+                    let text = state.candidates[gi].text.clone();
+                    self.exit_special_mode(state);
+                    self.notify_ui_hide();
+                    Self::commit_action(text, true)
+                } else {
+                    KeyAction::Consumed
+                }
+            }
+            0x41..=0x5A => {
+                // 字母：小写归一累积编码
+                let ch = (b'a' + (data.key_code - 0x41) as u8) as char;
+                state.special_buffer.push(ch);
+                if let Some(text) = self.update_special_candidates(state) {
+                    self.exit_special_mode(state);
+                    self.notify_ui_hide();
+                    return Self::commit_action(text, true);
+                }
+                let display = state.preedit.clone();
+                self.notify_ui_update(state);
+                KeyAction::UpdateComposition {
+                    text: display.clone(),
+                    caret_pos: display.chars().count() as u32,
+                }
+            }
+            0x26 | 0x28 => {
+                // 上/下：移动高亮
+                if state.candidates.is_empty() {
+                    return KeyAction::Consumed;
+                }
+                let changed = if data.key_code == 0x26 {
+                    self.move_up(state)
+                } else {
+                    self.move_down(state)
+                };
+                if changed {
+                    self.notify_ui_update(state);
+                }
+                KeyAction::Consumed
+            }
+            0x21 | 0x22 => {
+                // PageUp/PageDown：翻页
+                if state.candidates.is_empty() {
+                    return KeyAction::Consumed;
+                }
+                let changed = if data.key_code == 0x21 {
+                    self.page_prev(state)
+                } else {
+                    self.page_next(state)
+                };
+                if changed {
+                    self.notify_ui_update(state);
+                }
+                KeyAction::Consumed
+            }
+            _ => {
+                let shift = data.modifiers & MOD_SHIFT != 0;
+                // 二三候选键 → 选候选
+                if !shift {
+                    if let Some(offset) = self.select_key_offset(data.key_code) {
+                        let (start, end) = self.page_range(state);
+                        let gi = start + offset;
+                        if gi < end {
+                            let text = state.candidates[gi].text.clone();
+                            self.exit_special_mode(state);
+                            self.notify_ui_hide();
+                            return Self::commit_action(text, true);
+                        }
+                    }
+                }
+                // 其它可打印标点：顶屏当前高亮候选 + 转换后标点，退出
+                if let Some(ch) = punct_char(data.key_code, shift) {
+                    let committed = if !state.candidates.is_empty() {
+                        let idx = self
+                            .highlighted_global_index(state)
+                            .min(state.candidates.len() - 1);
+                        state.candidates[idx].text.clone()
+                    } else {
+                        String::new()
+                    };
+                    let punct = self.convert_punct_char(state, ch);
+                    self.exit_special_mode(state);
+                    self.notify_ui_hide();
+                    Self::commit_action(format!("{}{}", committed, punct), true)
+                } else {
+                    KeyAction::Consumed
+                }
+            }
+        }
+    }
+
     /// 临时英文模式按键处理（首版：缓冲累积 + 空格/回车/标点上屏，暂无词库候选）
     fn handle_temp_english_key(&self, state: &mut State, data: &KeyEventData) -> KeyAction {
         let comp = |buf: &str| KeyAction::UpdateComposition {
@@ -2782,6 +3112,7 @@ impl Coordinator {
         state.quick_input_prefix.clear();
         state.url_buffer.clear();
         state.rewind = None;
+        state.special_buffer.clear();
         // 清理可能残留的组合显示（临时拼音/快捷输入会产生候选与 preedit）
         state.input_buffer.clear();
         state.candidates.clear();
@@ -2907,6 +3238,7 @@ impl MessageHandler for Coordinator {
             Some(ModeKind::QuickInput) => return self.handle_quick_input_key(&mut state, data),
             Some(ModeKind::TempEnglish) => return self.handle_temp_english_key(&mut state, data),
             Some(ModeKind::Url) => return self.handle_url_key(&mut state, data),
+            Some(ModeKind::Special(_)) => return self.handle_special_key(&mut state, data),
             None => {}
         }
 
@@ -2973,6 +3305,19 @@ impl MessageHandler for Coordinator {
                     text: display.clone(),
                     caret_pos: display.chars().count() as u32,
                 };
+            }
+        }
+
+        // 触发特殊模式：空缓冲 + 无候选 + 无修饰键 + 引导键匹配（优先级低于快捷/临拼）。
+        // 码表不可用时不拦截该键，继续普通流程。
+        if state.input_buffer.is_empty()
+            && state.candidates.is_empty()
+            && data.modifiers & (MOD_CTRL | MOD_ALT | MOD_SHIFT) == 0
+        {
+            if let Some(idx) = self.match_special_trigger(data.key_code) {
+                if self.ensure_special_table(&mut state, idx) {
+                    return self.enter_special_mode(&mut state, idx);
+                }
             }
         }
 

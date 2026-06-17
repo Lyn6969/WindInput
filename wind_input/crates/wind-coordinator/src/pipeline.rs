@@ -38,7 +38,8 @@ pub enum ModeKind {
     TempEnglish,
     /// 网址模式：普通输入累积到某前缀（如 "www."/"http"）时夺取，原样累积 ASCII。
     Url,
-    // S3 将追加：Special(u8)
+    /// 特殊模式：引导键触发，自带码表 + 全码上屏策略。载荷为 `features.special_modes` 下标。
+    Special(u8),
 }
 
 /// 统一夺取回退登记（对齐 Go decider 的 armRewind/canRewind/rewindHijack）。
