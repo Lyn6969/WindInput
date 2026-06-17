@@ -194,7 +194,12 @@ enum CommitStrategy {
   - S3b（commit `72b6602`）：统一夺取回退。`pipeline::Rewind{snapshot,host_text}`；进入 URL 时登记，退到前缀边界再退格→`rewind_hijack` 回放快照到正常码表输入流。`active_hijack_buffer/can_rewind/rewind_hijack` 模式无关。
   - S3c（commit `0302f0e`）：特殊模式。config 增 `features.special_modes[]`；`ModeKind::Special(u8)`；`CodetableDict` 懒加载+缓存（[用户/data]/schemas 查找）；`decide_special_auto_commit` 纯函数（prefix_free/fixed_length/manual）；`handle_special_key` 全套。
   - 修正：**z 键回退**（z+字母无前缀→临时拼音）未随 S3 落地——它是独立的临拼补全特性（需把 z 配为临拼触发键，默认 backtick 不触发），且依赖「加键后无码表前缀」的引擎前缀探测。S3b 的 Rewind 机制已做成模式无关，z 落地时（并入临拼补全或 S4）可直接接入 `active_hijack_buffer` 的 `TempPinyin` 臂。
-- **S4 全码/空码策略落地 + 模式激活键融合**（§2.3）：CommitStrategy 各 Processor 实现；激活键统一判定。
+- **S4 全码/空码策略落地 + 模式激活键融合**（§2.3）：🚧 进行中。
+  - S4a（commit `2403194`）：码表全码自动上屏。`CodeTableEngine` 注入 `auto_commit_at_full`/`auto_commit_min_len`；`decide_auto_commit` 纯判定（唯一精确 + 无更长后继）填 `ConvertResult.should_commit/commit_text`；coordinator 字母分支消费、shadow 后复核存活才上屏。6 单测。
+  - S4c（commit `3ecf217`）：混输全码自动上屏 + 拼音守护。`MixedEngine` 取主码表意向，`auto_commit_block_on_pinyin`（默认 true）存在拼音候选时否决。3 单测。
+  - **待办**：S4b 空码清空（`clear_on_empty_max`）+ 顶码上屏（`top_code_commit`，>满码长时取前 N 码顶字）；S4d 模式激活键融合（把散落的快捷/临拼/特殊/URL 激活判定收敛为单一 dispatcher）。
+  - 实施说明：决策落在引擎层（host 可测）而非 coordinator，因引擎持 `dm` 可判 `has_longer_code`；CommitStrategy enum 未显式建模——策略已随激活引擎（码表/混输各自实现 `should_auto_commit`），无独立消费方，避免过早抽象。
+  - **注意**：`auto_commit_at_full` 为 schema 级配置且 `read_schema` 不支持用户覆盖合并，启用需改 `data/schemas/<id>.schema.toml`；schema 用户覆盖是独立待办。
 - **S5 按钮自定义**。
 
 ## 5. 配置 schema 增补（详见 config-schema.md 收口）
