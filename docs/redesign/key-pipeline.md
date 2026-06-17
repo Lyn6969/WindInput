@@ -189,7 +189,11 @@ enum CommitStrategy {
 - **S2 符号单点流水线**（§2.5）：自定义映射 + 智能符号 + 数字后智能 + 全半角。✅ 完成。
   - S2a（commit `09a00bf`）：统一 `convert_punct(state,ch,prev_char)`（自定义映射>数字后智能>中文标点>全半角）；config 增 `punct_custom`/`smart_symbol*`；transform 增 `lookup_custom`/`peek_chinese_str`/`revert_last_quote`。
   - S2b（commit `48ec31d`）：智能符号模式 + 协议 `CMD_REPLACE_BACKWARD=0x0109`/`KeyAction::ReplaceBackward`；`try_smart_symbol_replace` 在标点分支入口短路；焦点/模式切换 disarm。
-- **S3 新模式**（§2.4）：URL + 特殊模式接入 Decider；统一夺取回退。
+- **S3 新模式**（§2.4）：URL + 特殊模式接入 Decider；统一夺取回退。✅ 完成。
+  - S3a（commit `d940f33`）：网址模式。config 增 `input.url_input{enabled,prefixes}`；`ModeKind::Url`；普通输入累积到 `input_buffer+键==前缀` 时夺取；`handle_url_key`（原样累积/空格回车上屏原文/退格删空退出/Esc 放弃）；`printable_char` VK→ASCII。
+  - S3b（commit `72b6602`）：统一夺取回退。`pipeline::Rewind{snapshot,host_text}`；进入 URL 时登记，退到前缀边界再退格→`rewind_hijack` 回放快照到正常码表输入流。`active_hijack_buffer/can_rewind/rewind_hijack` 模式无关。
+  - S3c（commit `0302f0e`）：特殊模式。config 增 `features.special_modes[]`；`ModeKind::Special(u8)`；`CodetableDict` 懒加载+缓存（[用户/data]/schemas 查找）；`decide_special_auto_commit` 纯函数（prefix_free/fixed_length/manual）；`handle_special_key` 全套。
+  - 修正：**z 键回退**（z+字母无前缀→临时拼音）未随 S3 落地——它是独立的临拼补全特性（需把 z 配为临拼触发键，默认 backtick 不触发），且依赖「加键后无码表前缀」的引擎前缀探测。S3b 的 Rewind 机制已做成模式无关，z 落地时（并入临拼补全或 S4）可直接接入 `active_hijack_buffer` 的 `TempPinyin` 臂。
 - **S4 全码/空码策略落地 + 模式激活键融合**（§2.3）：CommitStrategy 各 Processor 实现；激活键统一判定。
 - **S5 按钮自定义**。
 
