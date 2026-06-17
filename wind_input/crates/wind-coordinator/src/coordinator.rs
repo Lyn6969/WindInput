@@ -2256,6 +2256,21 @@ impl Coordinator {
                     }
                     // 文本模式 + 运算符 → 落到下方标点提交
                 }
+                // 数字模式下 = 作「求值上屏」：上屏当前高亮结果，不追加 =（计算器约定）。
+                if calc && state.mix_numeric && data.key_code == keymap::VK_EQUAL {
+                    if state.candidates.is_empty() {
+                        self.exit_mix_mode(state);
+                        self.notify_ui_hide();
+                        return KeyAction::ClearComposition;
+                    }
+                    let idx = self
+                        .highlighted_global_index(state)
+                        .min(state.candidates.len() - 1);
+                    let text = state.candidates[idx].text.clone();
+                    self.exit_mix_mode(state);
+                    self.notify_ui_hide();
+                    return Self::commit_action(text, true);
+                }
                 // 二三候选键（配置驱动）选词
                 if !shift {
                     if let Some(offset) = self.select_key_offset(data.key_code) {
@@ -2510,8 +2525,9 @@ impl Coordinator {
         let t_nu = std::time::Instant::now();
         // 仅推送当前页候选（窗口按 1..N 编号，翻页后重新编号）
         let (start, end) = self.page_range(state);
-        // 快捷输入用字母标签（a/b/c，因数字键需录入表达式），其余用数字
-        let alpha = state.active == Some(ModeKind::QuickInput);
+        // 数字键需录入表达式的场景用字母标签（a/b/c）选词：旧快捷输入，以及 mix 的数字模式。
+        let alpha = state.active == Some(ModeKind::QuickInput)
+            || (matches!(state.active, Some(ModeKind::Mix(_))) && state.mix_numeric);
         let items: Vec<CandidateItem> = state.candidates[start..end]
             .iter()
             .enumerate()
