@@ -151,6 +151,32 @@ fn test_pinyin_long_sentence() {
 }
 
 #[test]
+fn test_pinyin_trailing_partial_keeps_sentence() {
+    let dir = data_dir();
+    if !schema_exists(&dir, "pinyin") {
+        eprintln!("跳过：pinyin schema 不存在");
+        return;
+    }
+    let cfg = make_config(&["pinyin"]);
+    let mgr = EngineManager::new(&cfg, Some(&dir));
+
+    // 尾部多打一个不成音节的残码「m」：整句「你好」仍应排首位（bug①），
+    // 残码不计入消费（consumed_length=5，留「m」在缓冲续输）。
+    let r = mgr.convert("nihaom", 9);
+    let top: Vec<&str> = r
+        .candidates
+        .iter()
+        .take(8)
+        .map(|c| c.text.as_str())
+        .collect();
+    assert_eq!(r.candidates[0].text, "你好", "首候选应为 你好（残码不破坏整句），实际: {top:?}");
+    assert_eq!(
+        r.candidates[0].consumed_length, 5,
+        "你好 应只消费 nihao 五字节，残码 m 留缓冲"
+    );
+}
+
+#[test]
 fn test_schema_cycle() {
     let dir = data_dir();
     if !schema_exists(&dir, "wubi86") || !schema_exists(&dir, "pinyin") {

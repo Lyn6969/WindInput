@@ -143,16 +143,21 @@ impl Engine for PinyinEngine {
         let dag = Dag::build(input, trie);
         let syllables = dag.maximum_match();
 
-        // 2. Viterbi 长句解码（>=2 音节）
+        // 完成音节覆盖的连续前缀（从起点算）。尾部不成音节的残码（如「nihaom」的「m」）
+        // 不参与整句解码——否则 lattice 到不了残码末端、Viterbi 失败、整句退化成单字（bug①）。
+        let completed_len: usize = syllables.iter().map(|s| s.len()).sum();
+        let completed: &str = &input[..completed_len];
+
+        // 2. Viterbi 长句解码（>=2 音节，仅在完成音节前缀上跑）
         if syllables.len() >= 2 {
             let lattice_nodes = self.lattice_builder.build(
-                input,
+                completed,
                 trie,
                 dict,
                 Some(&self.fuzzy_config),
                 self.unigram.as_deref(),
             );
-            let input_len = input.len();
+            let input_len = completed.len();
             let mut lattice: Vec<Vec<WordNode>> = vec![Vec::new(); input_len + 1];
             for (end_pos, nodes_at_end) in lattice_nodes.iter().enumerate() {
                 if end_pos > input_len {
@@ -188,7 +193,9 @@ impl Engine for PinyinEngine {
                             0,
                             Candidate {
                                 text: sentence,
-                                code: input.to_string(),
+                                // 码为完成音节前缀（不含残码），使 consumed_length=completed_len，
+                                // 整句上屏后残码留缓冲续输（你好m → 选你好留 m）。
+                                code: completed.to_string(),
                                 weight,
                                 natural_order: 0,
                                 source: CandidateSource::Pinyin,
