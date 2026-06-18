@@ -394,17 +394,17 @@ fn decimal_to_amount(int_part: &str, dec_part: &str, upper: bool) -> String {
     }
     let mut b = format!("{}元", int_text);
     if jiao == 0 {
-        b.push_str("零");
+        b.push('零');
         b.push_str(digits[fen]);
-        b.push_str("分");
+        b.push('分');
     } else if fen == 0 {
         b.push_str(digits[jiao]);
         b.push_str("角整");
     } else {
         b.push_str(digits[jiao]);
-        b.push_str("角");
+        b.push('角');
         b.push_str(digits[fen]);
-        b.push_str("分");
+        b.push('分');
     }
     b
 }
@@ -421,7 +421,7 @@ fn decimal_to_chinese_text(int_part: &str, dec_part: &str, upper: bool) -> Strin
     }
     let digits = if upper { &UPPER_DIGITS } else { &LOWER_DIGITS };
     let mut b = int_text;
-    b.push_str("点");
+    b.push('点');
     for ch in dec_part.bytes() {
         if ch.is_ascii_digit() {
             b.push_str(digits[(ch - b'0') as usize]);
@@ -438,7 +438,7 @@ fn digits_to_chinese_chars(num: &str, upper: bool) -> String {
         if ch.is_ascii_digit() {
             b.push_str(digits[(ch as u8 - b'0') as usize]);
         } else if ch == '.' {
-            b.push_str("点");
+            b.push('点');
         }
     }
     if b.is_empty() {

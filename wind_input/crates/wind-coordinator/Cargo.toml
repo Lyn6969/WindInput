@@ -17,6 +17,7 @@ wind-ui = { path = "../wind-ui" }
 wind-cmdbar = { path = "../wind-cmdbar" }
 wind-phrase = { path = "../wind-phrase" }
 wind-keys = { path = "../wind-keys" }
+wind-quick-input = { path = "../wind-quick-input" }
 tokio = { workspace = true }
 tracing = { workspace = true }
 anyhow = { workspace = true }

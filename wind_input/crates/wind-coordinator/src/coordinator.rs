@@ -1724,7 +1724,7 @@ impl Coordinator {
         state.preedit = format!("{}{}", prefix, state.quick_input_buffer);
         let dp = self.config.features.quick_input.decimal_places;
         let texts =
-            crate::quick_input::generate_quick_input_candidates(&state.quick_input_buffer, dp);
+            wind_quick_input::generate_quick_input_candidates(&state.quick_input_buffer, dp);
         state.candidates = texts
             .into_iter()
             .enumerate()
@@ -2410,7 +2410,7 @@ impl Coordinator {
                     continue; // 文本模式跳过计算
                 }
                 let dp = self.config.features.quick_input.decimal_places;
-                for t in crate::quick_input::generate_quick_input_candidates(&state.mix_buffer, dp)
+                for t in wind_quick_input::generate_quick_input_candidates(&state.mix_buffer, dp)
                 {
                     if seen.insert(t.clone()) {
                         cands.push(Candidate {
