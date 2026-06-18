@@ -151,6 +151,54 @@ fn test_pinyin_long_sentence() {
 }
 
 #[test]
+fn test_mixed_wubi_priority_and_consistency() {
+    let dir = data_dir();
+    if !schema_exists(&dir, "wubi86_pinyin") {
+        eprintln!("跳过：wubi86_pinyin schema 不存在");
+        return;
+    }
+    let cfg = make_config(&["wubi86_pinyin"]);
+    let mgr = EngineManager::new(&cfg, Some(&dir));
+
+    // cang：五笔精确全码「駏」(+10M tier) 应压过拼音「藏」(/100)，首候选=駏（五笔优先）。
+    let r = mgr.convert("cang", 9);
+    let top: Vec<&str> = r
+        .candidates
+        .iter()
+        .take(6)
+        .map(|c| c.text.as_str())
+        .collect();
+    assert_eq!(r.candidates[0].text, "駏", "cang 首候选应为五笔精确码 駏，实际: {top:?}");
+    // 一致性：若放行全码自动上屏，commit_text 必等于显示首候选（杜绝显示/上屏漂移）。
+    if r.should_commit {
+        assert_eq!(
+            r.commit_text, r.candidates[0].text,
+            "全码上屏文本应与首候选一致"
+        );
+    }
+    // 拼音「藏」仍在候选中（可选），只是不在首位。
+    assert!(r.candidates.iter().any(|c| c.text == "藏"), "藏 应仍可选: {top:?}");
+}
+
+#[test]
+fn test_mixed_multisyllable_pinyin_preedit_separated() {
+    let dir = data_dir();
+    if !schema_exists(&dir, "wubi86_pinyin") {
+        eprintln!("跳过：wubi86_pinyin schema 不存在");
+        return;
+    }
+    let cfg = make_config(&["wubi86_pinyin"]);
+    let mgr = EngineManager::new(&cfg, Some(&dir));
+    // 多音节拼音：组合区应带音节分隔（"ni hao"），而非连写。
+    let r = mgr.convert("nihao", 9);
+    assert!(
+        r.preedit_display.contains(' '),
+        "多音节拼音组合区应有音节分隔，实际 preedit: {:?}",
+        r.preedit_display
+    );
+}
+
+#[test]
 fn test_pinyin_trailing_partial_keeps_sentence() {
     let dir = data_dir();
     if !schema_exists(&dir, "pinyin") {

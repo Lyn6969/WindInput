@@ -77,9 +77,15 @@ impl Engine for MixedEngine {
 
         // 2. 拼音候选（输入达到最小长度）+ 归一化降档
         let mut pinyin: Vec<Candidate> = Vec::new();
+        // 多音节拼音的组合区分隔显示（如 "ni hao"）：仅当拼音解析出 ≥2 完成音节时采用，
+        // 否则保持原始码（单音节如 "cang" 无需分隔，纯五笔码更不应被拆）。
+        let mut pinyin_preedit: Option<String> = None;
         if input_len >= self.min_pinyin_length {
             if let Some(sec) = &self.secondary {
                 if let Ok(py) = sec.convert(input, max_candidates) {
+                    if py.completed_syllables.len() >= 2 && !py.preedit_display.is_empty() {
+                        pinyin_preedit = Some(py.preedit_display.clone());
+                    }
                     pinyin = py.candidates;
                     for c in &mut pinyin {
                         c.weight /= PINYIN_TIER_SCALE;
@@ -123,8 +129,8 @@ impl Engine for MixedEngine {
         let is_empty = merged.is_empty();
         Ok(ConvertResult {
             candidates: merged,
-            // 混输组合区显示原始输入码（五笔为主，简明）
-            preedit_display: input.to_string(),
+            // 组合区：多音节拼音用音节分隔（ni hao），否则原始码（五笔为主，简明）。
+            preedit_display: pinyin_preedit.unwrap_or_else(|| input.to_string()),
             is_empty,
             should_commit,
             commit_text,

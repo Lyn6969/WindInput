@@ -664,12 +664,32 @@ impl Coordinator {
         if counts.is_empty() {
             return;
         }
-        // sort_by 稳定：count 相等（含均为 0）保持原序，故未用候选不被打乱。
+        // 档位感知的 used-first 重排（五笔优先）：先按来源档位（码表精确 < 词/短语 < 码表前缀
+        // < 拼音），档内再按词频 count 降序。稳定排序保证同档同频维持引擎权重序。
+        // 这样词频自适应只在同档内生效，绝不把拼音浮到五笔精确全码之上（修候选/上屏不一致）。
         candidates.sort_by(|a, b| {
+            let ta = Self::freq_tier(a, code);
+            let tb = Self::freq_tier(b, code);
             let ca = counts.get(&a.text).copied().unwrap_or(0);
             let cb = counts.get(&b.text).copied().unwrap_or(0);
-            cb.cmp(&ca)
+            ta.cmp(&tb).then(cb.cmp(&ca))
         });
+    }
+
+    /// 候选来源档位（数字越小越靠前）。五笔优先的硬约束：码表精确全码恒在拼音之上，
+    /// 词频重排只在同档内调整。纯拼音/纯码表模式下同源候选档位相同，退化为按词频排序。
+    fn freq_tier(c: &Candidate, input: &str) -> u8 {
+        use wind_candidate::CandidateSource::*;
+        if c.is_phrase {
+            return 1;
+        }
+        match c.source {
+            CodeTable if c.code == input => 0, // 码表精确全码（如五笔 cang→駏）
+            CodeTable => 2,                    // 码表前缀补全
+            Pinyin => 3,
+            English => 3,
+            _ => 2,
+        }
     }
 
     /// 当前活跃方案 ID（测试/诊断用）
@@ -807,7 +827,14 @@ impl Coordinator {
         state.candidates = candidates;
         // 复核：仅当上屏目标在最终候选中仍存在（未被 shadow 删除）才放行自动上屏。
         let outcome = match auto_commit.filter(|t| state.candidates.iter().any(|c| &c.text == t)) {
-            Some(t) => InputOutcome::AutoCommit(t),
+            Some(_) => {
+                // 一致性：自动上屏文本取「实际显示的首候选」，与空格/点选同源，杜绝
+                // "显示藏、全码上屏駏"的漂移（首候选已由档位排序保证是五笔精确全码）。
+                match state.candidates.first() {
+                    Some(c) => InputOutcome::AutoCommit(c.text.clone()),
+                    None => InputOutcome::Normal,
+                }
+            }
             None if should_clear => InputOutcome::Clear,
             None => InputOutcome::Normal,
         };
