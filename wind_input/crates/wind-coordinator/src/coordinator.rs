@@ -331,7 +331,7 @@ pub struct Coordinator {
     /// 工具栏位置持久化文件路径（toolbar_pos.txt；None=不持久化）
     toolbar_pos_path: Option<std::path::PathBuf>,
     /// 候选反查（编码/拆字/拼音）供悬停提示
-    reverse: crate::reverse::ReverseLookup,
+    reverse: wind_reverse::ReverseLookup,
     /// 标点配对：中/英配对表（left,right）+ 跟踪栈（用于智能跳过）
     cn_pairs: Vec<(char, char)>,
     en_pairs: Vec<(char, char)>,
@@ -540,7 +540,7 @@ impl Coordinator {
         }
 
         // 候选反查表（拆字/拼音）
-        let reverse = crate::reverse::ReverseLookup::load(data_dir);
+        let reverse = wind_reverse::ReverseLookup::load(data_dir);
         if !reverse.is_empty() {
             info!("Loaded reverse-lookup (chaizi/pinyin)");
         }

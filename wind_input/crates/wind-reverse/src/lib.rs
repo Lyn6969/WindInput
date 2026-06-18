@@ -48,14 +48,13 @@ impl ReverseLookup {
                 continue;
             };
             let mut chars = ch.chars();
-            if let (Some(c), None) = (chars.next(), chars.next()) {
-                if let Some(code) = code {
+            if let (Some(c), None) = (chars.next(), chars.next())
+                && let Some(code) = code {
                     let code = code.trim();
                     if !code.is_empty() {
                         self.code.insert(c, code.to_string());
                     }
                 }
-            }
         }
     }
 
@@ -83,11 +82,10 @@ impl ReverseLookup {
             let py = rest
                 .split_whitespace()
                 .find(|t| *t != "->" && *t != "?" && *t != "<-" && !t.starts_with('#'));
-            if let Some(py) = py {
-                if !py.is_empty() {
+            if let Some(py) = py
+                && !py.is_empty() {
                     self.pinyin.insert(c, py.to_string());
                 }
-            }
         }
     }
 

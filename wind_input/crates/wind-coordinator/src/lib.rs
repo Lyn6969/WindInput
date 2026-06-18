@@ -15,7 +15,6 @@ pub mod handle_temp;
 pub mod handle_tooltip;
 pub mod hotkey_match;
 pub mod pipeline;
-pub mod reverse;
 pub mod stats;
 pub mod watchdog;
 
