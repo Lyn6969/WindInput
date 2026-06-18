@@ -162,6 +162,10 @@ fn printable_char(key_code: u32, shift: bool) -> Option<char> {
 /// 引擎一次转换请求的候选上限（boost 重排后截断到 9）
 const ENGINE_MAX_CANDIDATES: usize = 50;
 
+/// 自动造词（L）写入临时层的初始权重与每次复选增量（保守默认；后续可接 schema.learning 配置）。
+const LEARN_ADD_WEIGHT: i32 = 800;
+const LEARN_WEIGHT_DELTA: i32 = 40;
+
 /// 协调器输入状态
 /// 简繁变体（与 Go config.S2TVariant 对齐）：(opencc 变体名, 菜单显示名)
 const S2T_VARIANTS: [(&str, &str); 4] = [
@@ -231,6 +235,12 @@ struct State {
     candidate_limit: usize,
     /// 动态分级加载：是否可能还有更多前缀候选未加载
     has_more: bool,
+    /// 拼音类组合区「已转换前缀」（逐步转换：选中的汉字累积于此、留在组合区不上屏，
+    /// 全部转换完才整体上屏）。内部存简体原文，输出时再 s2t。仅拼音/临拼/混输文本透镜使用，
+    /// 码表（五笔）选词消费整串、绝不进入此态。见 docs/redesign/pinyin-composition-enhance.md。
+    committed_text: String,
+    /// 已转换前缀的分段记录 (消费码, 汉字)：供退格逐段回退与完整上屏时自动造词。
+    committed_segs: Vec<(String, String)>,
     /// 当前激活的独占输入模式（临时拼音/快捷输入/临时英文）。`None` = 普通输入。
     /// 单点决策的唯一真相源：结构上保证同一时刻至多一个独占模式（见 `pipeline.rs`）。
     active: Option<ModeKind>,
@@ -555,6 +565,8 @@ impl Coordinator {
                 candidate_input: String::new(),
                 candidate_limit: 0,
                 has_more: false,
+                committed_text: String::new(),
+                committed_segs: Vec::new(),
                 active: None,
                 temp_pinyin_buffer: String::new(),
                 temp_pinyin_schema: String::new(),
@@ -855,10 +867,16 @@ impl Coordinator {
         if state.input_buffer.is_empty() {
             state.has_more = false;
             state.candidate_input.clear();
+            // 缓冲空但有已转换前缀（逐步转换中删空剩余拼音）：组合区仍显示前缀。
+            state.preedit = state.committed_text.clone();
             return InputOutcome::Normal;
         }
         let limit = self.initial_candidate_limit(&state.input_buffer);
         let (engine_count, outcome) = self.build_candidates(state, limit);
+        // 拼音逐步转换：组合区 = 已转换前缀 + 剩余拼音显示（前缀恒空于码表模式，无副作用）。
+        if !state.committed_text.is_empty() {
+            state.preedit = format!("{}{}", state.committed_text, state.preedit);
+        }
         state.candidate_input = state.input_buffer.clone();
         state.candidate_limit = limit;
         // 引擎返回数达到上限 → 可能还有更多未加载
@@ -1061,24 +1079,26 @@ impl Coordinator {
             .any(|vk| vk == key_code)
     }
 
-    /// 退出临时拼音模式并清空相关状态
+    /// 退出临时拼音模式并清空相关状态（含逐步转换的已转换前缀）
     fn exit_temp_pinyin(&self, state: &mut State) {
         state.active = None;
         state.temp_pinyin_buffer.clear();
         state.temp_pinyin_schema.clear();
         state.temp_pinyin_prefix.clear();
+        state.committed_text.clear();
+        state.committed_segs.clear();
         state.candidates.clear();
         state.preedit.clear();
         state.current_page = 0;
         state.selected_index = 0;
     }
 
-    /// 用临时拼音目标方案转换缓冲，刷新候选与组合区（前缀 + 拼音）
+    /// 用临时拼音目标方案转换缓冲，刷新候选与组合区（前缀 + 已转换汉字 + 剩余拼音）
     fn update_temp_pinyin_candidates(&self, state: &mut State) {
         state.candidates.clear();
         state.current_page = 0;
         state.selected_index = 0;
-        let prefix = state.temp_pinyin_prefix.clone();
+        let prefix = format!("{}{}", state.temp_pinyin_prefix, state.committed_text);
         if state.temp_pinyin_buffer.is_empty() {
             state.preedit = prefix;
             return;
@@ -1108,25 +1128,34 @@ impl Coordinator {
         state.candidates = candidates;
     }
 
-    /// 临时拼音分段上屏：按候选 `consumed_length` 只吃掉对应拼音前缀，保留剩余续转、留在模式内；
-    /// 整串消费时退出模式。返回 (上屏文本, 是否仍在模式内)。与 `commit_result_action` 配合成 KeyAction。
-    fn commit_temp_pinyin_selected(&self, state: &mut State, cand: &Candidate) -> (String, bool) {
-        let code = if cand.code.is_empty() {
-            state.temp_pinyin_buffer.clone()
-        } else {
-            cand.code.clone()
-        };
-        self.record_selection(&code, &cand.text);
-        let out = self.maybe_s2t(state, &cand.text);
+    /// 临时拼音选词 —— 组合区逐步转换（C）。部分匹配并入 committed 前缀留模式内（不上屏）；
+    /// 完整匹配整体上屏 committed+候选（前缀触发键不输出）+ 造词，退出。返回最终 KeyAction。
+    fn commit_temp_pinyin_selected(&self, state: &mut State, cand: &Candidate) -> KeyAction {
         let total = state.temp_pinyin_buffer.len();
         let consumed = cand.consumed_length;
-        if consumed > 0 && consumed < total && state.temp_pinyin_buffer.is_char_boundary(consumed) {
+        let code = Self::cand_code(&state.temp_pinyin_buffer, cand);
+        let partial =
+            consumed > 0 && consumed < total && state.temp_pinyin_buffer.is_char_boundary(consumed);
+        self.record_selection(&code, &cand.text);
+        if partial {
+            state.committed_segs.push((code, cand.text.clone()));
+            state.committed_text.push_str(&cand.text);
             state.temp_pinyin_buffer = state.temp_pinyin_buffer[consumed..].to_string();
             self.update_temp_pinyin_candidates(state);
-            (out, true)
+            let display = state.preedit.clone();
+            self.notify_ui_update(state);
+            KeyAction::UpdateComposition {
+                caret_pos: display.chars().count() as u32,
+                text: display,
+            }
         } else {
+            state.committed_segs.push((code, cand.text.clone()));
+            let final_simplified = format!("{}{}", state.committed_text, cand.text);
+            self.learn_phrase_on_commit(state);
+            let out = self.maybe_s2t(state, &final_simplified);
             self.exit_temp_pinyin(state);
-            (out, false)
+            self.notify_ui_hide();
+            Self::commit_action(out, true)
         }
     }
 
@@ -1143,14 +1172,28 @@ impl Coordinator {
                 KeyAction::ClearComposition
             }
             keymap::VK_BACK => {
-                // Backspace：删字符，空则退出
+                // Backspace：先删剩余拼音末字符；剩余为空则回退最后一个已转换段（你→ni 续编辑）；
+                // 两者皆空则退出。
                 if state.temp_pinyin_buffer.is_empty() {
+                    if let Some((code, _)) = state.committed_segs.pop() {
+                        // committed_text 即各段汉字拼接，弹段后由剩余段重建（避免按字符数回删出错）。
+                        state.committed_text =
+                            state.committed_segs.iter().map(|(_, t)| t.as_str()).collect();
+                        state.temp_pinyin_buffer = code; // 段码还原进缓冲继续编辑
+                        self.update_temp_pinyin_candidates(state);
+                        let display = state.preedit.clone();
+                        self.notify_ui_update(state);
+                        return KeyAction::UpdateComposition {
+                            caret_pos: display.chars().count() as u32,
+                            text: display,
+                        };
+                    }
                     self.exit_temp_pinyin(state);
                     self.notify_ui_hide();
                     return KeyAction::ClearComposition;
                 }
                 state.temp_pinyin_buffer.pop();
-                if state.temp_pinyin_buffer.is_empty() {
+                if state.temp_pinyin_buffer.is_empty() && state.committed_text.is_empty() {
                     self.exit_temp_pinyin(state);
                     self.notify_ui_hide();
                     return KeyAction::ClearComposition;
@@ -1159,23 +1202,34 @@ impl Coordinator {
                 let display = state.preedit.clone();
                 self.notify_ui_update(state);
                 KeyAction::UpdateComposition {
-                    text: display.clone(),
                     caret_pos: display.chars().count() as u32,
+                    text: display,
                 }
             }
-            keymap::VK_SPACE | keymap::VK_RETURN => {
-                // Space/Enter：上屏高亮候选（分段则保留剩余拼音续转）
+            keymap::VK_SPACE => {
+                // 空格：选当前高亮候选（逐步转换）
                 if !state.candidates.is_empty() {
                     let idx = self
                         .highlighted_global_index(state)
                         .min(state.candidates.len() - 1);
                     let cand = state.candidates[idx].clone();
-                    let (out, in_mode) = self.commit_temp_pinyin_selected(state, &cand);
-                    self.commit_result_action(state, out, in_mode)
+                    self.commit_temp_pinyin_selected(state, &cand)
                 } else {
                     self.exit_temp_pinyin(state);
                     self.notify_ui_hide();
                     KeyAction::ClearComposition
+                }
+            }
+            keymap::VK_RETURN => {
+                // 回车：上屏「当前显示」= 已转换前缀 + 剩余拼音原码（已选中文照样上屏），退出。
+                let out = format!("{}{}", state.committed_text, state.temp_pinyin_buffer);
+                let out = self.maybe_s2t(state, &out);
+                self.exit_temp_pinyin(state);
+                self.notify_ui_hide();
+                if out.is_empty() {
+                    KeyAction::ClearComposition
+                } else {
+                    Self::commit_action(out, true)
                 }
             }
             keymap::VK_1..=keymap::VK_9 if data.modifiers & MOD_SHIFT == 0 => {
@@ -1184,8 +1238,7 @@ impl Coordinator {
                 let idx = start + (data.key_code - 0x31) as usize;
                 if idx < end {
                     let cand = state.candidates[idx].clone();
-                    let (out, in_mode) = self.commit_temp_pinyin_selected(state, &cand);
-                    self.commit_result_action(state, out, in_mode)
+                    self.commit_temp_pinyin_selected(state, &cand)
                 } else {
                     KeyAction::Consumed
                 }
@@ -1210,8 +1263,7 @@ impl Coordinator {
                         let idx = start + offset;
                         if idx < end {
                             let cand = state.candidates[idx].clone();
-                            let (out, in_mode) = self.commit_temp_pinyin_selected(state, &cand);
-                            return self.commit_result_action(state, out, in_mode);
+                            return self.commit_temp_pinyin_selected(state, &cand);
                         }
                     }
                 }
@@ -1221,8 +1273,7 @@ impl Coordinator {
                         .highlighted_global_index(state)
                         .min(state.candidates.len() - 1);
                     let cand = state.candidates[idx].clone();
-                    let (out, in_mode) = self.commit_temp_pinyin_selected(state, &cand);
-                    self.commit_result_action(state, out, in_mode)
+                    self.commit_temp_pinyin_selected(state, &cand)
                 } else {
                     self.exit_temp_pinyin(state);
                     self.notify_ui_hide();
@@ -2094,17 +2145,49 @@ impl Coordinator {
             .unwrap_or(false)
     }
 
-    /// 选中当前页第 `page_offset`（0=首选）候选并上屏退出。
+    /// 选中当前页第 `page_offset`（0=首选）候选。
+    /// 文本透镜（拼音/英文）走组合区逐步转换：部分匹配并入 committed 前缀、裁剪缓冲、重转剩余
+    /// （剩余仍由 mix 成员方案出候选，不落五笔），留模式内不上屏；完整匹配整体上屏 + 造词。
+    /// 数字透镜（计算）的候选恒整体上屏。
     fn mix_select(&self, state: &mut State, page_offset: usize) -> KeyAction {
         let (start, end) = self.page_range(state);
         let gi = start + page_offset;
-        if gi < end {
-            let text = state.candidates[gi].text.clone();
+        if gi >= end {
+            return KeyAction::Consumed;
+        }
+        let cand = state.candidates[gi].clone();
+        let numeric = self.mix_has_quick_input(state.mix_id) && state.mix_numeric;
+        let total = state.mix_buffer.len();
+        let consumed = cand.consumed_length;
+        let partial = !numeric
+            && consumed > 0
+            && consumed < total
+            && state.mix_buffer.is_char_boundary(consumed);
+        if partial {
+            let code = Self::cand_code(&state.mix_buffer, &cand);
+            self.record_selection(&code, &cand.text);
+            state.committed_segs.push((code, cand.text.clone()));
+            state.committed_text.push_str(&cand.text);
+            state.mix_buffer = state.mix_buffer[consumed..].to_string();
+            self.update_mix_candidates(state);
+            let display = state.preedit.clone();
+            self.notify_ui_update(state);
+            KeyAction::UpdateComposition {
+                caret_pos: display.chars().count() as u32,
+                text: display,
+            }
+        } else {
+            let out = format!("{}{}", state.committed_text, cand.text);
+            if !numeric {
+                let code = Self::cand_code(&state.mix_buffer, &cand);
+                self.record_selection(&code, &cand.text);
+                state.committed_segs.push((code, cand.text.clone()));
+                self.learn_phrase_on_commit(state);
+            }
+            let out = self.maybe_s2t(state, &out);
             self.exit_mix_mode(state);
             self.notify_ui_hide();
-            Self::commit_action(text, true)
-        } else {
-            KeyAction::Consumed
+            Self::commit_action(out, true)
         }
     }
 
@@ -2126,10 +2209,12 @@ impl Coordinator {
         }
     }
 
-    /// 退出 mix 模式并清空相关状态。
+    /// 退出 mix 模式并清空相关状态（含逐步转换的已转换前缀）。
     fn exit_mix_mode(&self, state: &mut State) {
         state.active = None;
         state.mix_buffer.clear();
+        state.committed_text.clear();
+        state.committed_segs.clear();
         state.candidates.clear();
         state.preedit.clear();
     }
@@ -2142,7 +2227,8 @@ impl Coordinator {
         state.candidates.clear();
         state.current_page = 0;
         state.selected_index = 0;
-        state.preedit = state.mix_buffer.clone();
+        // 组合区 = 已转换前缀（文本透镜逐步转换累积）+ 剩余缓冲。
+        state.preedit = format!("{}{}", state.committed_text, state.mix_buffer);
         if state.mix_buffer.is_empty() {
             return;
         }
@@ -2231,6 +2317,13 @@ impl Coordinator {
             keymap::VK_BACK => {
                 state.mix_buffer.pop();
                 if state.mix_buffer.is_empty() {
+                    if let Some((code, _)) = state.committed_segs.pop() {
+                        // 文本透镜：回退最后一个已转换段（你→ni 续编辑）。
+                        state.committed_text =
+                            state.committed_segs.iter().map(|(_, t)| t.as_str()).collect();
+                        state.mix_buffer = code;
+                        return refresh(self, state);
+                    }
                     self.exit_mix_mode(state);
                     self.notify_ui_hide();
                     KeyAction::ClearComposition
@@ -2239,21 +2332,24 @@ impl Coordinator {
                 }
             }
             keymap::VK_SPACE => {
-                // 空格：上屏当前高亮候选
-                let text = if state.candidates.is_empty() {
-                    String::new()
+                // 空格：选当前高亮候选（文本透镜逐步转换）
+                if state.candidates.is_empty() {
+                    let out = self
+                        .maybe_s2t(state, &format!("{}{}", state.committed_text, state.mix_buffer));
+                    commit_text(self, state, out)
                 } else {
-                    let idx = self
+                    let (start, _) = self.page_range(state);
+                    let gi = self
                         .highlighted_global_index(state)
                         .min(state.candidates.len() - 1);
-                    state.candidates[idx].text.clone()
-                };
-                commit_text(self, state, text)
+                    self.mix_select(state, gi - start)
+                }
             }
             keymap::VK_RETURN => {
-                // 回车：上屏缓冲原文（如完整表达式 100+200=300）
-                let text = state.mix_buffer.clone();
-                commit_text(self, state, text)
+                // 回车：上屏「已转换前缀 + 缓冲原文」（如完整表达式 100+200=300，或已转中文+剩余拼音）
+                let out =
+                    self.maybe_s2t(state, &format!("{}{}", state.committed_text, state.mix_buffer));
+                commit_text(self, state, out)
             }
             _ => {
                 let shift = data.modifiers & MOD_SHIFT != 0;
@@ -2305,20 +2401,21 @@ impl Coordinator {
                     }
                 }
 
-                // ⑤ 其它标点：顶屏当前高亮候选 + 转换后标点，退出
+                // ⑤ 其它标点：顶屏「已转换前缀 + 当前高亮候选」+ 转换后标点，退出
                 if let Some(ch) = punct_char(data.key_code, shift) {
-                    let committed = if !state.candidates.is_empty() {
+                    let head = if !state.candidates.is_empty() {
                         let idx = self
                             .highlighted_global_index(state)
                             .min(state.candidates.len() - 1);
-                        state.candidates[idx].text.clone()
+                        format!("{}{}", state.committed_text, state.candidates[idx].text)
                     } else {
-                        String::new()
+                        state.committed_text.clone()
                     };
+                    let head = self.maybe_s2t(state, &head);
                     let punct = self.convert_punct_char(state, ch);
                     self.exit_mix_mode(state);
                     self.notify_ui_hide();
-                    Self::commit_action(format!("{}{}", committed, punct), true)
+                    Self::commit_action(format!("{}{}", head, punct), true)
                 } else {
                     KeyAction::Consumed
                 }
@@ -2453,13 +2550,16 @@ impl Coordinator {
         key_code: u32,
         target: String,
     ) -> KeyAction {
+        let prefix = self.take_committed(state); // 拼音逐步转换的已转换前缀一并上屏
         let committed = if !state.candidates.is_empty() {
             let idx = self
                 .highlighted_global_index(state)
                 .min(state.candidates.len() - 1);
             let t = state.candidates[idx].text.clone();
             self.record_selection(&state.input_buffer, &t);
-            Some(t)
+            Some(format!("{prefix}{t}"))
+        } else if !prefix.is_empty() {
+            Some(prefix)
         } else {
             None
         };
@@ -2490,13 +2590,16 @@ impl Coordinator {
 
     /// 顶屏当前高亮候选（若有）并进入快捷输入模式。
     fn commit_and_enter_quick_input(&self, state: &mut State, key_code: u32) -> KeyAction {
+        let prefix = self.take_committed(state); // 拼音逐步转换的已转换前缀一并上屏
         let committed = if !state.candidates.is_empty() {
             let idx = self
                 .highlighted_global_index(state)
                 .min(state.candidates.len() - 1);
             let t = state.candidates[idx].text.clone();
             self.record_selection(&state.input_buffer, &t);
-            Some(t)
+            Some(format!("{prefix}{t}"))
+        } else if !prefix.is_empty() {
+            Some(prefix)
         } else {
             None
         };
@@ -2545,50 +2648,85 @@ impl Coordinator {
         out
     }
 
-    /// 键盘选词的分段上屏：按候选实际消费的码长（`consumed_length`）只吃掉对应前缀，
-    /// 保留剩余编码并重转（拼音「你好」选「你」后留「hao」续转）。返回 (上屏文本, 是否仍有剩余组合)。
-    /// `consumed_length` 为 0 或覆盖整串（码表/整句/前缀补全）时退化为整串上屏并清空。
-    fn commit_selected(&self, state: &mut State, cand: &Candidate) -> (String, bool) {
-        // 词频按候选实际编码记账（分段时为前缀码，如「ni」而非整串「nihao」）。
-        let code = if cand.code.is_empty() {
-            state.input_buffer.clone()
+    /// 拼音类「消费码」：候选自带 code（拼音段）则用之，否则退回整个输入缓冲。
+    fn cand_code(buf: &str, cand: &Candidate) -> String {
+        if cand.code.is_empty() {
+            buf.to_string()
         } else {
             cand.code.clone()
-        };
-        self.record_selection(&code, &cand.text);
-        let out = self.maybe_s2t(state, &cand.text);
-        let total = state.input_buffer.len();
-        let consumed = cand.consumed_length;
-        if consumed > 0 && consumed < total && state.input_buffer.is_char_boundary(consumed) {
-            state.input_buffer = state.input_buffer[consumed..].to_string();
-            let _ = self.update_candidates(state); // 重转剩余编码（复位翻页/高亮）
-            (out, true)
-        } else {
-            state.input_buffer.clear();
-            state.preedit.clear();
-            state.candidates.clear();
-            state.current_page = 0;
-            state.selected_index = 0;
-            (out, false)
         }
     }
 
-    /// 把分段提交结果转为 KeyAction：仍有剩余组合则上屏已选 + 把剩余 preedit 作新组合并刷新候选窗；
-    /// 否则隐藏候选窗、按普通上屏返回。普通输入路与临时拼音路共用。
-    fn commit_result_action(&self, state: &State, out: String, has_more: bool) -> KeyAction {
-        if has_more {
-            let preedit = state.preedit.clone();
+    /// 取出并清空「已转换前缀」（简体），用于非选词的终结性上屏（回车/空格上屏原码/标点键）。
+    /// 码表模式恒为空串，无副作用。
+    fn take_committed(&self, state: &mut State) -> String {
+        state.committed_segs.clear();
+        std::mem::take(&mut state.committed_text)
+    }
+
+    /// 清空拼音逐步转换的组合态（已转换前缀 + 缓冲 + 候选）。
+    fn reset_pinyin_composition(&self, state: &mut State) {
+        state.committed_text.clear();
+        state.committed_segs.clear();
+        state.input_buffer.clear();
+        state.preedit.clear();
+        state.candidates.clear();
+        state.current_page = 0;
+        state.selected_index = 0;
+    }
+
+    /// 主输入路拼音选词 —— 组合区逐步转换（C）。
+    /// 部分匹配（候选只消费缓冲前缀）：把汉字并入 `committed_text` 前缀、裁剪缓冲、重转剩余，
+    /// **留在组合区不上屏到应用**，返回 UpdateComposition。
+    /// 完整匹配（消费整串）：整体上屏 `committed_text + 候选` 到应用，触发自动造词（L），清空。
+    fn commit_selected(&self, state: &mut State, cand: &Candidate) -> KeyAction {
+        let total = state.input_buffer.len();
+        let consumed = cand.consumed_length;
+        let code = Self::cand_code(&state.input_buffer, cand);
+        let partial =
+            consumed > 0 && consumed < total && state.input_buffer.is_char_boundary(consumed);
+        // 词频按候选实际编码记账（分段时为前缀码，如「ni」而非整串「nihao」）。
+        self.record_selection(&code, &cand.text);
+        if partial {
+            state.committed_segs.push((code, cand.text.clone()));
+            state.committed_text.push_str(&cand.text);
+            state.input_buffer = state.input_buffer[consumed..].to_string();
+            let _ = self.update_candidates(state); // preedit 已含前缀（update_candidates 内拼接）
+            let display = state.preedit.clone();
             self.notify_ui_update(state);
-            KeyAction::InsertText {
-                text: out,
-                new_composition: Some(preedit),
-                mode_changed: false,
-                chinese_mode: true,
-                has_new_composition: true,
+            KeyAction::UpdateComposition {
+                caret_pos: display.chars().count() as u32,
+                text: display,
             }
         } else {
+            state.committed_segs.push((code, cand.text.clone()));
+            let final_simplified = format!("{}{}", state.committed_text, cand.text);
+            self.learn_phrase_on_commit(state); // 自动造词（多段组成的词）
+            let out = self.maybe_s2t(state, &final_simplified);
+            self.reset_pinyin_composition(state);
             self.notify_ui_hide();
             Self::commit_action(out, true)
+        }
+    }
+
+    /// 自动造词（L）：仅当用户**分步**组成（committed_segs ≥2 段、合并 ≥2 字）才学。
+    /// 完整拼音码 = 各段码拼接；词 = 各段汉字拼接。写入临时层（需临时层，达阈值由 store 晋升路线处理）。
+    fn learn_phrase_on_commit(&self, state: &State) {
+        if state.committed_segs.len() < 2 {
+            return;
+        }
+        let code: String = state.committed_segs.iter().map(|(c, _)| c.as_str()).collect();
+        let text: String = state.committed_segs.iter().map(|(_, t)| t.as_str()).collect();
+        if text.chars().count() < 2 || code.is_empty() {
+            return;
+        }
+        let Some(store) = &self.store else { return };
+        let schema = self.engine_mgr.active_schema_id();
+        // add_weight/delta 取保守默认；晋升计数阈值由临时层累积达成（后续可接入 schema.learning 配置）。
+        if let Err(e) = store.learn_temp_word(&schema, &code, &text, LEARN_ADD_WEIGHT, LEARN_WEIGHT_DELTA) {
+            warn!("learn_temp_word failed: {}", e);
+        } else {
+            debug!("auto-learned phrase: {} -> {}", code, text);
         }
     }
 
@@ -3638,6 +3776,9 @@ impl Coordinator {
         state.input_buffer.clear();
         state.candidates.clear();
         state.preedit.clear();
+        // 拼音逐步转换的已转换前缀一并丢弃（焦点/模式切换不保留半成品组合）。
+        state.committed_text.clear();
+        state.committed_segs.clear();
         // 焦点/模式切换：解除智能符号待命，避免跨上下文误触发替换。
         self.disarm_smart_symbol();
         if dirty {
@@ -3666,13 +3807,17 @@ impl Coordinator {
             self.notify_ui_hide();
             return text;
         }
-        let commit =
-            !state.input_buffer.is_empty() && !chinese && self.config.hotkeys.commit_on_switch;
+        let has_pending = !state.input_buffer.is_empty() || !state.committed_text.is_empty();
+        let commit = has_pending && !chinese && self.config.hotkeys.commit_on_switch;
         let text = if commit {
-            state.input_buffer.clone()
+            // 切到英文且配置上屏：把「已转换前缀 + 剩余原码」一并上屏。
+            let prefix = self.take_committed(state);
+            self.maybe_s2t(state, &format!("{}{}", prefix, state.input_buffer))
         } else {
             String::new()
         };
+        state.committed_text.clear();
+        state.committed_segs.clear();
         state.input_buffer.clear();
         state.candidates.clear();
         state.preedit.clear();
@@ -3772,9 +3917,8 @@ impl MessageHandler for Coordinator {
         // Ctrl/Alt 组合（非热键）：有输入则清空并隐藏候选窗，否则透传。
         // 必须 notify_ui_hide：否则候选窗残留（如 Ctrl+A 时卡死，需再输入才复位）。
         if data.modifiers & (MOD_CTRL | MOD_ALT) != 0 {
-            if !state.input_buffer.is_empty() {
-                state.input_buffer.clear();
-                state.candidates.clear();
+            if !state.input_buffer.is_empty() || !state.committed_text.is_empty() {
+                self.reset_pinyin_composition(&mut state);
                 self.notify_ui_hide();
                 return KeyAction::ClearComposition;
             }
@@ -3808,9 +3952,8 @@ impl MessageHandler for Coordinator {
 
         match data.key_code {
             keymap::VK_ESCAPE => {
-                // Escape
-                state.input_buffer.clear();
-                state.candidates.clear();
+                // Escape：取消整个组合（含已转换前缀），不上屏
+                self.reset_pinyin_composition(&mut state);
                 self.notify_ui_hide();
                 KeyAction::ClearComposition
             }
@@ -3819,7 +3962,7 @@ impl MessageHandler for Coordinator {
                 if !state.input_buffer.is_empty() {
                     state.input_buffer.pop();
                     self.update_candidates(&mut state);
-                    if state.input_buffer.is_empty() {
+                    if state.input_buffer.is_empty() && state.committed_text.is_empty() {
                         self.notify_ui_hide();
                         KeyAction::ClearComposition
                     } else {
@@ -3830,6 +3973,19 @@ impl MessageHandler for Coordinator {
                             caret_pos: display.chars().count() as u32,
                             text: display,
                         }
+                    }
+                } else if !state.committed_segs.is_empty() {
+                    // 剩余拼音空、有已转换段：回退最后一段（你→ni 续编辑，主流拼音行为）。
+                    let (code, _) = state.committed_segs.pop().unwrap();
+                    state.committed_text =
+                        state.committed_segs.iter().map(|(_, t)| t.as_str()).collect();
+                    state.input_buffer = code;
+                    self.update_candidates(&mut state);
+                    let display = state.preedit.clone();
+                    self.notify_ui_update(&state);
+                    KeyAction::UpdateComposition {
+                        caret_pos: display.chars().count() as u32,
+                        text: display,
                     }
                 } else {
                     KeyAction::PassThrough
@@ -3842,10 +3998,11 @@ impl MessageHandler for Coordinator {
                         .highlighted_global_index(&state)
                         .min(state.candidates.len() - 1);
                     let cand = state.candidates[idx].clone();
-                    let (out, has_more) = self.commit_selected(&mut state, &cand);
-                    self.commit_result_action(&state, out, has_more)
-                } else if !state.input_buffer.is_empty() {
-                    let text = state.input_buffer.clone();
+                    self.commit_selected(&mut state, &cand)
+                } else if !state.input_buffer.is_empty() || !state.committed_text.is_empty() {
+                    // 无候选：上屏「已转换前缀 + 剩余拼音原码」。
+                    let prefix = self.take_committed(&mut state);
+                    let text = self.maybe_s2t(&state, &format!("{}{}", prefix, state.input_buffer));
                     state.input_buffer.clear();
                     state.candidates.clear();
                     self.notify_ui_hide();
@@ -3855,9 +4012,10 @@ impl MessageHandler for Coordinator {
                 }
             }
             keymap::VK_RETURN => {
-                // Enter：上屏原始编码
-                if !state.input_buffer.is_empty() {
-                    let text = state.input_buffer.clone();
+                // Enter：上屏「当前显示」= 已转换前缀 + 剩余原码（已选中文照样上屏），退出
+                if !state.input_buffer.is_empty() || !state.committed_text.is_empty() {
+                    let prefix = self.take_committed(&mut state);
+                    let text = self.maybe_s2t(&state, &format!("{}{}", prefix, state.input_buffer));
                     state.input_buffer.clear();
                     state.candidates.clear();
                     self.notify_ui_hide();
@@ -3873,14 +4031,15 @@ impl MessageHandler for Coordinator {
                 let idx = start + in_page;
                 if idx < end {
                     let cand = state.candidates[idx].clone();
-                    let (out, has_more) = self.commit_selected(&mut state, &cand);
-                    self.commit_result_action(&state, out, has_more)
-                } else if !state.input_buffer.is_empty() {
-                    let mut text = state.input_buffer.clone();
+                    self.commit_selected(&mut state, &cand)
+                } else if !state.input_buffer.is_empty() || !state.committed_text.is_empty() {
+                    let prefix = self.take_committed(&mut state);
+                    let mut text = format!("{}{}", prefix, state.input_buffer);
                     state.input_buffer.clear();
                     state.candidates.clear();
                     // 数字键 vk keymap::VK_1..=keymap::VK_9 即 ASCII '1'..='9'
                     text.push(data.key_code as u8 as char);
+                    let text = self.maybe_s2t(&state, &text);
                     self.notify_ui_hide();
                     Self::commit_action(text, true)
                 } else {
@@ -3940,7 +4099,7 @@ impl MessageHandler for Coordinator {
             keymap::VK_UP | keymap::VK_DOWN | keymap::VK_PRIOR | keymap::VK_NEXT => {
                 // 方向/翻页键回退臂：有候选时翻页/高亮已由上面的 apply_nav_key（配置驱动）处理，
                 // 这里只剩"无候选"情形——无组合则透传给应用，有组合则消费。
-                if state.input_buffer.is_empty() {
+                if state.input_buffer.is_empty() && state.committed_text.is_empty() {
                     KeyAction::PassThrough
                 } else {
                     KeyAction::Consumed
@@ -3956,8 +4115,7 @@ impl MessageHandler for Coordinator {
                         let idx = start + offset;
                         if idx < end {
                             let cand = state.candidates[idx].clone();
-                            let (out, has_more) = self.commit_selected(&mut state, &cand);
-                            return self.commit_result_action(&state, out, has_more);
+                            return self.commit_selected(&mut state, &cand);
                         }
                     }
                     // D. 模式触发键 → 顶屏高亮候选 + 进模式（快捷输入 > 临时拼音）
@@ -3980,8 +4138,9 @@ impl MessageHandler for Coordinator {
                     if let Some(act) = self.try_smart_symbol_replace(&state, ch, data.prev_char) {
                         return act;
                     }
-                    // 标点/符号键：先上屏首选候选（若有输入），再追加（转换后的）标点
-                    let mut out = String::new();
+                    // 标点/符号键：先上屏已转换前缀 + 首选候选（若有输入），再追加（转换后的）标点
+                    let committed = self.take_committed(&mut state);
+                    let mut out = self.maybe_s2t(&state, &committed);
                     if !state.candidates.is_empty() {
                         let idx = self
                             .highlighted_global_index(&state)
@@ -3992,7 +4151,9 @@ impl MessageHandler for Coordinator {
                     } else if !state.input_buffer.is_empty() {
                         out.push_str(&state.input_buffer);
                     }
-                    let had_input = !state.input_buffer.is_empty() || !state.candidates.is_empty();
+                    let had_input = !state.input_buffer.is_empty()
+                        || !state.candidates.is_empty()
+                        || !committed.is_empty();
                     state.input_buffer.clear();
                     state.candidates.clear();
 
