@@ -518,22 +518,32 @@ impl CandidateWindow {
             root = root.layers(win_layers);
         }
 
-        // 预编辑行（主题背景带 + 文本色）
+        // 预编辑行（主题背景带 + 文本色）。完整渲染 preedit_bar 自身背景：底色 + 位图背景 +
+        // z 层 + 边框（此前只画底色，位图主题的 preedit 背景/边框丢失）。
         if !self.preedit.is_empty() {
-            root = root.child(
-                View::container(Layout::Row)
-                    .bg(col(v.preedit_bar.bg_color, [240, 240, 240, 255]))
-                    .radius(dim(v.item.border_radius, 4.0))
-                    .pad(edges_or(&v.preedit_bar.padding, [3.0, 8.0, 3.0, 8.0]))
-                    .margin(edges_or(&v.preedit_bar.margin, [0.0; 4]))
-                    .child(
-                        View::leaf(
-                            self.preedit.clone(),
-                            col(v.preedit_bar.text_color, [100, 100, 100, 255]),
-                        )
-                        .font_size(preedit_fs),
-                    ),
-            );
+            let mut band = View::container(Layout::Row)
+                .bg(col(v.preedit_bar.bg_color, [240, 240, 240, 255]))
+                .radius(dim(v.item.border_radius, 4.0))
+                .pad(edges_or(&v.preedit_bar.padding, [3.0, 8.0, 3.0, 8.0]))
+                .margin(edges_or(&v.preedit_bar.margin, [0.0; 4]))
+                .child(
+                    View::leaf(
+                        self.preedit.clone(),
+                        col(v.preedit_bar.text_color, [100, 100, 100, 255]),
+                    )
+                    .font_size(preedit_fs),
+                );
+            if let Some(vi) = self.rv_image(v.preedit_bar.bg_image.as_ref()) {
+                band = band.bg_image(vi);
+            }
+            let band_layers = self.rv_layers(&v.preedit_bar.layers);
+            if !band_layers.is_empty() {
+                band = band.layers(band_layers);
+            }
+            if let Some(bc) = v.preedit_bar.border_color {
+                band = band.border(bc, dim(v.preedit_bar.border_width, 0.0).max(1.0));
+            }
+            root = root.child(band);
         }
 
         // 候选项颜色（基态）。状态色（选中/悬停）逐项经 eff_text 计算。
