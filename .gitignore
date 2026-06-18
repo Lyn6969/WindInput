@@ -1,6 +1,13 @@
 target/
 build_debug/
 build/
-/data/
+# 编译生成的词典二进制（由 .yaml/.dict 编译而来）
+/data/**/*.wdb
+# OpenCC 编译产物
+/data/opencc/*.octrie
+# rime-frost 外部下载的拼音词典包
+/data/schemas/pinyin/cn_dicts/
+# rime-frost unigram 频率数据（外部下载）
+/data/schemas/pinyin/unigram.txt
 scripts/deploy.local
 /.remote/

@@ -1,0 +1,21 @@
+# Rime dictionary - WindInput 五笔扩展词库 (symbols)
+# 来源: rime-wubi86-jidian extra，由 dictgen 按字符类型拆分
+# 生成: 2026-06-16
+---
+name: wubi86_jidian_symbols
+version: "2026-06-16"
+sort: by_weight
+use_preset_vocabulary: false
+columns:
+  - code
+  - text
+  - weight
+...
+aqvx	Ω	100
+cykg	×	100
+ggjt	⭐	100
+guyy	²	100
+ijya	℃	100
+jtjt	⭐	100
+qeya	°	100
+uuyy	³	100

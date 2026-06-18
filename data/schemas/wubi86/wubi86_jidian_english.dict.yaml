@@ -1,0 +1,119 @@
+# Rime dictionary - WindInput 五笔扩展词库 (english)
+# 来源: rime-wubi86-jidian extra，由 dictgen 按字符类型拆分
+# 生成: 2026-06-16
+---
+name: wubi86_jidian_english
+version: "2026-06-16"
+sort: by_weight
+use_preset_vocabulary: false
+columns:
+  - code
+  - text
+  - weight
+...
+abs	ABS	100
+ac	AppleCare	12
+adob	Adobe	20
+agv	AGV	20
+ai	AI	100
+aion	AION	100
+aird	AirDrop	20
+airp	AirPods	100
+airp	AirPods Pro	100
+airp	AirPower	100
+airt	AirTag	100
+am	AM	100
+andr	Android	100
+andr	AndroidStudio	100
+apex	Apex	100
+api	api	100
+apk	APK	9
+apk	apk	8
+app	app	100
+appl	Apple Watch	100
+apw	Apple Watch	9
+axio	axios	100
+bash	bash	100
+bb	BlackBerry	5
+bili	bilibili	20
+brz	BRZ	100
+bt	bluetooth	15
+cad	CAD	100
+capa	Capacitor	100
+carp	CarPlay	100
+cbr	CBR500R	100
+cbr	CBR650R	10
+cc	C-C	100
+cctv	CCTV	100
+cpu	CPU	20
+dido	DIDO	100
+dwjf	L/100km	100
+elem	ElementUI	100
+emo	emoji	100
+emoj	emoji	100
+etc	ETC	100
+fina	FinalCutPro	100
+flip	Flipper	100
+flip	FlipperZero	100
+fm	FM	5
+git	github	100
+gith	github	100
+goo	Google	20
+goog	Google	20
+gop	GoPro	100
+gopr	GoPro	20
+gps	GPS	100
+gpu	GPU	20
+gsx	GSX250R	100
+hdm	HDMI	100
+hdmi	HDMI	100
+hif	HiFi	20
+hifi	HiFi	20
+hond	Honda	100
+iclo	iCloud	100
+ijya	%RH	100
+imac	iMac	20
+imes	iMessage	100
+ipad	iPadOS	19
+ipad	iPadPro	19
+it	IT	5
+jetb	JetBrains	10
+kbd	<kbd></kbd>	100
+kot	Kotlin	100
+macm	MacMini	100
+macs	MacStudio	100
+mag	MagSafe	100
+mags	MagSafe	100
+max	Max	20
+miyo	Miyoo	100
+miyo	MiyooA30	100
+miyo	MiyooMini+	100
+ninj	Ninja400	100
+ninj	Ninja650	100
+npm	NPM	2
+pdf	PDF	100
+plu	Plus	20
+plus	Plus	20
+pro	Pro	20
+ps	PhotoShop	100
+pych	PyCharm	10
+rfid	RFID	100
+siri	Siri	100
+swif	Swift	100
+swif	SwiftUI	100
+thun	Thunder	100
+trim	Trimui Bricks	100
+trim	Trimui Smart Pro	100
+trim	TrimUI	20
+ulan	Ulanzi	100
+unia	uniapp	100
+usb	USB-C	100
+usb	USB	20
+usbc	USB-C	100
+vue	vue	100
+vue	Vue	2
+web	Web	100
+webs	WebStorm	100
+wifi	WiFi	100
+wiki	Wiki	100
+wiki	Wikipedia	100
