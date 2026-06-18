@@ -358,6 +358,8 @@ pub struct Coordinator {
     preedit_embedded: Mutex<bool>,
     /// 候选窗隐藏开关（命令栏 ime.toggle("candwin") 切换；隐藏时 notify_ui_update 不显示候选）。
     hide_candidate_window: Mutex<bool>,
+    /// 候选布局方向运行时态（命令栏 ime.toggle("layout") 切换；true=竖排，初值随配置，持久化）。
+    candidate_vertical: Mutex<bool>,
 }
 
 /// 短语候选权重基准（高于普通候选，使短语展开排在前列）
@@ -580,6 +582,13 @@ impl Coordinator {
                 .preedit_mode
                 .eq_ignore_ascii_case("embedded");
 
+        // 候选布局方向运行时初值（与下方 SetCandidateLayout 下发一致；config 移入前先算）。
+        let candidate_vertical_init = config
+            .ui
+            .candidate
+            .layout
+            .eq_ignore_ascii_case("vertical");
+
         let coordinator = Arc::new(Self {
             state: Mutex::new(State {
                 chinese_mode: config.general.default_chinese_mode,
@@ -652,6 +661,7 @@ impl Coordinator {
             recent_commits: Mutex::new(std::collections::VecDeque::new()),
             preedit_embedded: Mutex::new(preedit_embedded_init),
             hide_candidate_window: Mutex::new(false),
+            candidate_vertical: Mutex::new(candidate_vertical_init),
         });
         // 命令栏：装配 Services（ime/config/dict 后端）+ 自身 Weak 引用。
         coordinator.init_cmdbar();
@@ -2961,6 +2971,7 @@ impl Coordinator {
             "toolbar" => self.toggle_toolbar(),
             "preedit" => self.cmd_toggle_preedit(),
             "candwin" => self.cmd_toggle_candwin(),
+            "layout" => self.cmd_toggle_layout(),
             other => {
                 warn!("ime.toggle: 暂不支持 target {:?}（Rust 平台能力待补）", other)
             }
@@ -3002,6 +3013,28 @@ impl Coordinator {
             let _ = self.ui_tx.send(UiCommand::HideCandidates);
         }
         self.show_tip(if hidden { "候选窗:隐藏" } else { "候选窗:显示" });
+    }
+
+    /// 切换候选布局方向（横排 ↔ 竖排），下发 UI 并持久化。命令栏 ime.toggle("layout")。
+    /// 切换时 composition 已清（命令选中即 ClearComposition），下次输入按新方向渲染。
+    fn cmd_toggle_layout(&self) {
+        let vertical = {
+            let mut v = self
+                .candidate_vertical
+                .lock()
+                .unwrap_or_else(|x| x.into_inner());
+            *v = !*v;
+            *v
+        };
+        let _ = self.ui_tx.send(UiCommand::SetCandidateLayout(vertical));
+        // 持久化 ui.candidate.layout（重启后保留）。
+        if let Err(e) = Config::set_user_string(
+            &["ui", "candidate", "layout"],
+            if vertical { "vertical" } else { "horizontal" },
+        ) {
+            warn!("ime.toggle layout: 持久化失败: {}", e);
+        }
+        self.show_tip(if vertical { "候选:竖排" } else { "候选:横排" });
     }
 
     /// 切换输入方案并持久化 `schema.active` 到用户层配置（重启后保留）。
