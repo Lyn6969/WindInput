@@ -2844,8 +2844,15 @@ impl Coordinator {
             .lock()
             .unwrap_or_else(|e| e.into_inner()) = !caret_valid;
         let n_items = items.len();
+        // preedit 是否在候选窗显示，按配置门控：inline_preedit=true 时组合串内联显示在应用内
+        // （应用侧嵌入编码），候选窗不再重复显示 preedit 条。否则照常显示（默认 top 模式）。
+        let preedit = if self.config.ui.candidate.inline_preedit {
+            String::new()
+        } else {
+            state.preedit.clone()
+        };
         let _ = self.ui_tx.send(UiCommand::UpdateCandidates {
-            preedit: state.preedit.clone(),
+            preedit,
             candidates: items,
             selected,
             hover,
