@@ -197,18 +197,28 @@ pub struct PhraseConfig {
     /// < 该长度不列举，避免单字符噪音）。默认 2。
     #[serde(default = "default_phrase_min_prefix")]
     pub min_prefix_length: usize,
+    /// 短语/命令候选显示文本的最大字符数（超出截断加省略号，换行/制表统一转空格）。
+    /// 防 `clip()`/`last()` 等注入超长/多行内容把候选列撑爆（如 coad 的 `{clip()}`）。
+    /// 0 表示不限制。默认 30。
+    #[serde(default = "default_phrase_max_display_chars")]
+    pub max_display_chars: usize,
 }
 
 impl Default for PhraseConfig {
     fn default() -> Self {
         Self {
             min_prefix_length: default_phrase_min_prefix(),
+            max_display_chars: default_phrase_max_display_chars(),
         }
     }
 }
 
 fn default_phrase_min_prefix() -> usize {
     2
+}
+
+fn default_phrase_max_display_chars() -> usize {
+    30
 }
 
 /// 全码/空码上屏策略全局默认（对齐方案级 [engine.codetable] 同名字段）。

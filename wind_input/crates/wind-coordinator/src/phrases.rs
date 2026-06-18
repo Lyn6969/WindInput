@@ -54,12 +54,24 @@ impl PhraseHit {
         }
     }
 
-    /// 前缀导航候选：`code` 为补全目标完整码，`comment` 为相对输入前缀的码后缀。
+    /// 前缀导航——**组**候选（`$SS`/`$AA`）：`code` 为补全目标完整码，选中后补全展开。
     fn nav(text: String, weight: i32, code: String, comment: String) -> Self {
         Self {
             text,
             weight,
             command_src: None,
+            nav_code: Some(code),
+            comment,
+        }
+    }
+
+    /// 前缀导航——**命令**候选（`$CC`）：选中后**直接执行** `src`（不二级展开），
+    /// `code` 为完整码（执行时作输入上下文），`comment` 为码后缀。
+    fn command_nav(text: String, weight: i32, src: String, code: String, comment: String) -> Self {
+        Self {
+            text,
+            weight,
+            command_src: Some(src),
             nav_code: Some(code),
             comment,
         }
@@ -204,7 +216,10 @@ impl PhraseLayer {
             return Vec::new();
         }
         let reg = default_registry();
-        let ctx = PhraseCtx {
+        // 廉价上下文：clip/sel/app/title 返回空，**避免列举时读整个剪贴板**（如 coad 的
+        // display `剪贴板加词:{clip()}` 会读全部剪贴板内容 → 内存暴涨）；last 仍取真实
+        // 快照（仅 Vec 索引，廉价，coll/cozd 等可正常显示）。真正执行命令时才用完整上下文。
+        let ctx = NavCtx {
             input: code.to_string(),
             now,
             last,
@@ -224,32 +239,39 @@ impl PhraseLayer {
                     Ok(p) => p,
                     Err(_) => continue,
                 };
-                // prefix 语义：**除非显式 `{prefix: false}` 否则都列**（`!= Some(false)`）。
-                // $SS/$AA 默认注入 prefix:true → Some(true)；$CC 无默认 → None → 仍列出
-                // （满足"命令默认列出"，且不必给 $CC 注入默认而破坏内嵌规则）。
-                // display 名：$SS/$AA 用组名，$CC 求值 display。
-                let (display, prefix_on) = match &phrase {
+                // prefix 语义：除非显式 `{prefix: false}` 否则都列。
+                // $SS/$AA → **组** nav（选中补全到码再展开成员，二级选择）；
+                // $CC → **命令** nav（选中**直接执行**，不二级展开），display 经廉价上下文求值。
+                match &phrase {
                     Phrase::Array(ap) => {
-                        (ap.name.clone(), ap.modifiers.get_bool("prefix") != Some(false))
+                        if ap.modifiers.get_bool("prefix") == Some(false) {
+                            continue;
+                        }
+                        out.push(PhraseHit::nav(
+                            ap.name.clone(),
+                            e.weight,
+                            full_code.clone(),
+                            suffix.clone(),
+                        ));
                     }
                     Phrase::Command(cp) => {
-                        let on = cp.modifiers.get_bool("prefix") != Some(false);
-                        match evaluate(&phrase, &ctx, reg) {
-                            Ok(ev) => (ev.display, on),
-                            Err(_) => continue,
+                        if cp.modifiers.get_bool("prefix") == Some(false) {
+                            continue;
                         }
+                        let display = match evaluate(&phrase, &ctx, reg) {
+                            Ok(ev) => ev.display,
+                            Err(_) => continue,
+                        };
+                        out.push(PhraseHit::command_nav(
+                            display,
+                            e.weight,
+                            e.text.clone(),
+                            full_code.clone(),
+                            suffix.clone(),
+                        ));
                     }
                     _ => continue, // Literal / Template 不列
-                };
-                if !prefix_on {
-                    continue;
                 }
-                out.push(PhraseHit::nav(
-                    display,
-                    e.weight,
-                    full_code.clone(),
-                    suffix.clone(),
-                ));
             }
         }
         // 权重降序，同权重按完整码字母序——导航候选顺序稳定可预测。
@@ -294,6 +316,49 @@ impl wind_cmdbar::EvalContext for PhraseCtx<'_> {
         {
             String::new()
         }
+    }
+    fn sel(&self) -> String {
+        String::new()
+    }
+    fn app(&self) -> String {
+        String::new()
+    }
+    fn title(&self) -> String {
+        String::new()
+    }
+    fn env(&self, name: &str) -> String {
+        std::env::var(name).unwrap_or_default()
+    }
+    fn now(&self) -> DateTime<Local> {
+        self.now
+    }
+    fn services(&self) -> Option<&Services> {
+        None
+    }
+}
+
+/// 前缀导航列举用的**廉价**求值上下文：`clip`/`sel`/`app`/`title` 一律返回空，
+/// 避免列举多条命令时各自读整个剪贴板/前台窗口等昂贵副作用（内存暴涨根因）。
+/// `last` 仍取真实快照（仅 Vec 索引，廉价），`now`/`env` 廉价照常。命令真正执行时
+/// 由 coordinator 用完整 CmdbarCtx（含真实剪贴板）求值。
+struct NavCtx<'a> {
+    input: String,
+    now: DateTime<Local>,
+    last: &'a [String],
+}
+
+impl wind_cmdbar::EvalContext for NavCtx<'_> {
+    fn input(&self) -> String {
+        self.input.clone()
+    }
+    fn last(&self, n: i64) -> String {
+        if n < 1 {
+            return String::new();
+        }
+        self.last.get((n - 1) as usize).cloned().unwrap_or_default()
+    }
+    fn clip(&self, _n: i64) -> String {
+        String::new() // 列举阶段不读剪贴板
     }
     fn sel(&self) -> String {
         String::new()
@@ -673,6 +738,28 @@ mod tests {
         assert_eq!(got[0].text, "百度");
         assert_eq!(got[0].comment, "bd");
         assert_eq!(got[0].nav_code.as_deref(), Some("cobd"));
+        // 命令 nav：携命令源（选中**直接执行**，非二级展开）。
+        assert!(got[0].command_src.is_some());
+    }
+
+    #[test]
+    fn test_prefix_nav_command_display_skips_clipboard_read() {
+        // 命令 display 含 {clip()}（如 coad）：列举用廉价上下文，clip() 返回空——
+        // 不读整个剪贴板（内存安全），只显示静态部分。
+        let mut map: HashMap<String, Vec<PhraseEntry>> = HashMap::new();
+        map.insert(
+            "coad".into(),
+            vec![PhraseEntry {
+                text: r#"$CC("剪贴板加词:{clip()}", type("x"))"#.into(),
+                weight: 500,
+                position: 0,
+            }],
+        );
+        let layer = PhraseLayer { map };
+        let got = layer.lookup_prefix_at("co", fixed(), &[], 2);
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].text, "剪贴板加词:");
+        assert!(got[0].command_src.is_some());
     }
 
     #[test]

@@ -874,10 +874,11 @@ impl Coordinator {
         let mut candidates = result.candidates;
         if !self.phrases.is_empty() {
             let recent = self.recent_commits_snapshot();
+            let max_disp = self.config.input.phrase.max_display_chars;
             for hit in self.phrases.lookup(&state.input_buffer, &recent) {
                 let is_command = hit.command_src.is_some();
                 candidates.push(Candidate {
-                    text: hit.text,
+                    text: Self::clamp_candidate_display(&hit.text, max_disp),
                     weight: PHRASE_WEIGHT_BASE + hit.weight,
                     is_phrase: true,
                     // $CC 命令短语：标记 is_command，phrase_template 暂存命令源；
@@ -888,24 +889,38 @@ impl Coordinator {
                 });
             }
             // 前缀导航：敲 `zz`/`co` 等前缀（长度 ≥ min_prefix_length）列出所有该前缀的
-            // marker 短语（组名 display + 码后缀 comment）。选中 is_group 候选时由
-            // commit_selected/mouse_select 补全输入到完整码并重查展开（二级选择）。
+            // marker 短语。**$CC 命令** → is_command（选中直接执行，group_code 作执行输入
+            // 上下文）；**$SS/$AA 组** → is_group（选中补全到完整码再展开成员，二级选择）。
             let min_prefix = self.config.input.phrase.min_prefix_length;
             for hit in self
                 .phrases
                 .lookup_prefix(&state.input_buffer, &recent, min_prefix)
             {
                 let code = hit.nav_code.unwrap_or_default();
-                candidates.push(Candidate {
-                    text: hit.text.clone(),
-                    weight: PHRASE_WEIGHT_BASE + hit.weight,
-                    is_phrase: true,
-                    is_group: true,
-                    group_code: code,
-                    group_name: hit.text,
-                    comment: hit.comment,
-                    ..Default::default()
-                });
+                let text = Self::clamp_candidate_display(&hit.text, max_disp);
+                if let Some(src) = hit.command_src {
+                    candidates.push(Candidate {
+                        text,
+                        weight: PHRASE_WEIGHT_BASE + hit.weight,
+                        is_phrase: true,
+                        is_command: true,
+                        phrase_template: src,
+                        group_code: code,
+                        comment: hit.comment,
+                        ..Default::default()
+                    });
+                } else {
+                    candidates.push(Candidate {
+                        text: text.clone(),
+                        weight: PHRASE_WEIGHT_BASE + hit.weight,
+                        is_phrase: true,
+                        is_group: true,
+                        group_code: code,
+                        group_name: text,
+                        comment: hit.comment,
+                        ..Default::default()
+                    });
+                }
             }
         }
         candidates.sort_by(|a, b| {
@@ -2811,6 +2826,27 @@ impl Coordinator {
     /// 部分匹配（候选只消费缓冲前缀）：把汉字并入 `committed_text` 前缀、裁剪缓冲、重转剩余，
     /// **留在组合区不上屏到应用**，返回 UpdateComposition。
     /// 完整匹配（消费整串）：整体上屏 `committed_text + 候选` 到应用，触发自动造词（L），清空。
+    /// 规整短语/命令候选显示文本：换行/制表 → 空格（杜绝多行候选），超长截断加省略号。
+    /// `max` 为最大字符数（`input.phrase.max_display_chars`），0 表示不限制。
+    fn clamp_candidate_display(s: &str, max: usize) -> String {
+        let one_line: String = s
+            .chars()
+            .map(|c| {
+                if c == '\n' || c == '\r' || c == '\t' {
+                    ' '
+                } else {
+                    c
+                }
+            })
+            .collect();
+        if max == 0 || one_line.chars().count() <= max {
+            one_line
+        } else {
+            let head: String = one_line.chars().take(max).collect();
+            format!("{head}…")
+        }
+    }
+
     /// 前缀导航候选选中：把输入缓冲补全到该组完整码并重查候选（展开成员/精确命令），
     /// 实现"敲 zz → 选标点 → 展开标点字符"的二级选择。返回新 preedit 显示文本。
     fn complete_to_group_code(&self, state: &mut State, group_code: &str) -> String {
@@ -2869,7 +2905,13 @@ impl Coordinator {
     /// 处理释放锁后再跑（对齐 Go「不在 SearchCommand 持锁路径里再 Lock」的约束）。
     fn commit_command(&self, state: &mut State, cand: &Candidate) -> KeyAction {
         let src = cand.phrase_template.clone();
-        let input = state.input_buffer.clone();
+        // 命令 nav（从前缀列举选中）携完整码 group_code，用它作执行输入上下文
+        // （让 code()/input() 等按完整码求值）；精确码命令 group_code 空 → 用当前缓冲。
+        let input = if cand.group_code.is_empty() {
+            state.input_buffer.clone()
+        } else {
+            cand.group_code.clone()
+        };
         self.reset_pinyin_composition(state);
         self.notify_ui_hide();
         self.spawn_command(src, input);
@@ -3739,7 +3781,13 @@ impl Coordinator {
         // $CC 命令候选：执行动作而非上屏 display 标签（释放锁后异步执行，避免重入死锁）。
         if state.candidates[idx].is_command {
             let src = state.candidates[idx].phrase_template.clone();
-            let input = state.input_buffer.clone();
+            // 命令 nav 携完整码 group_code 作执行输入；精确码命令用当前缓冲。
+            let gc = state.candidates[idx].group_code.clone();
+            let input = if gc.is_empty() {
+                state.input_buffer.clone()
+            } else {
+                gc
+            };
             state.active = None;
             drop(state);
             self.notify_ui_hide();
