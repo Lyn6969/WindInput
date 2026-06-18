@@ -2126,6 +2126,7 @@ dependencies = [
  "wind-theme",
  "wind-transform",
  "wind-ui",
+ "windows",
 ]
 
 [[package]]
