@@ -352,6 +352,8 @@ pub struct Coordinator {
     pub(crate) cmdbar_services: std::sync::OnceLock<wind_cmdbar::Services>,
     /// 自身 Weak 引用：$CC 命令在独立线程异步执行（避免持 state 锁回调自锁方法致死锁）。
     pub(crate) self_weak: std::sync::OnceLock<std::sync::Weak<Coordinator>>,
+    /// 上屏历史环形缓冲（index 0 = 最近）：供命令栏 `last(n)` 取最近上屏文本。
+    recent_commits: Mutex<std::collections::VecDeque<String>>,
 }
 
 /// 短语候选权重基准（高于普通候选，使短语展开排在前列）
@@ -634,6 +636,7 @@ impl Coordinator {
             theme_path,
             cmdbar_services: std::sync::OnceLock::new(),
             self_weak: std::sync::OnceLock::new(),
+            recent_commits: Mutex::new(std::collections::VecDeque::new()),
         });
         // 命令栏：装配 Services（ime/config/dict 后端）+ 自身 Weak 引用。
         coordinator.init_cmdbar();
@@ -648,12 +651,33 @@ impl Coordinator {
         if text.is_empty() {
             return;
         }
+        // 上屏历史（命令栏 last(n) 用）：最近置前，限 16 条。
+        {
+            let mut h = self
+                .recent_commits
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            h.push_front(text.to_string());
+            if h.len() > 16 {
+                h.truncate(16);
+            }
+        }
         if let Some(store) = &self.store {
             let schema = self.engine_mgr.active_schema_id();
             if let Err(e) = store.record_freq(&schema, code, text) {
                 warn!("record_freq failed: {}", e);
             }
         }
+    }
+
+    /// 上屏历史快照（index 0 = 最近）。供命令栏 `last(n)` 读取。
+    pub(crate) fn recent_commits_snapshot(&self) -> Vec<String> {
+        self.recent_commits
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .cloned()
+            .collect()
     }
 
     /// 词频重排（独立维度，**绝不改 weight**）：按 redb 词频记录做档位感知的 used-first 稳定
@@ -2795,22 +2819,30 @@ impl Coordinator {
         self.reset_pinyin_composition(state);
         self.notify_ui_hide();
         self.spawn_command(src, input);
-        KeyAction::Consumed
+        // ClearComposition 而非 Consumed：清掉应用里已输入的命令码（如 "coen"），
+        // 否则 composition 残留（Consumed 仅吞键、不结束 composition）。type() 的上屏文本
+        // 由命令线程经 push 管道单独提交。
+        KeyAction::ClearComposition
     }
 
-    /// 在独立线程执行命令源（解析→求值→跑动作）；`type()` 的上屏文本经 push 管道送活动客户端。
+    /// 在独立线程执行命令源（解析→求值→按序跑动作；type 文本经 push 提交、其余为副作用）。
     fn spawn_command(&self, src: String, input: String) {
         let Some(this) = self.self_weak.get().and_then(std::sync::Weak::upgrade) else {
             warn!("cmdbar: self_weak 未装配，命令跳过");
             return;
         };
         std::thread::spawn(move || {
-            let out = this.run_command_candidate(&src, &input);
-            if !out.is_empty() {
-                let encoded = wind_ipc::codec::encode_commit_text(&out, None, false, true, false);
-                this.push_server.push_commit_to_active(&encoded);
-            }
+            this.run_command_candidate(&src, &input);
         });
+    }
+
+    /// 把命令产生的文本经 push 管道提交给活动客户端（命令在独立线程执行，走 push 而非 KeyAction）。
+    pub(crate) fn push_commit_text(&self, text: &str) {
+        if text.is_empty() {
+            return;
+        }
+        let encoded = wind_ipc::codec::encode_commit_text(text, None, false, true, false);
+        self.push_server.push_commit_to_active(&encoded);
     }
 
     /// cmdbar 能力 wrapper（被 handle_cmdbar 控制器经 Weak 回调）。各方法自锁，**禁止**在持

@@ -13,9 +13,9 @@ use crate::manager::{MenuItemSpec, MenuKind, UiEvent};
 use crate::text::dwrite::TextRenderer;
 use crate::view::{Align, Edges, Layout, Rect, View};
 use crate::window::{LayeredWindow, WindowMouse};
-use windows::Win32::Foundation::{HANDLE, HWND, LPARAM, LRESULT, POINT, WPARAM};
+use windows::Win32::Foundation::{HANDLE, HGLOBAL, HWND, LPARAM, LRESULT, POINT, WPARAM};
 use windows::Win32::System::DataExchange::{
-    CloseClipboard, EmptyClipboard, OpenClipboard, SetClipboardData,
+    CloseClipboard, EmptyClipboard, GetClipboardData, OpenClipboard, SetClipboardData,
 };
 use windows::Win32::System::Memory::{GlobalAlloc, GlobalLock, GlobalUnlock, GMEM_MOVEABLE};
 use windows::Win32::System::Ole::CF_UNICODETEXT;
@@ -735,6 +735,32 @@ pub fn set_clipboard_text(text: &str) {
             }
         }
         let _ = CloseClipboard();
+    }
+}
+
+/// 读剪贴板文本（CF_UNICODETEXT）。失败/无文本返回空串。
+pub fn get_clipboard_text() -> String {
+    unsafe {
+        if OpenClipboard(HWND::default()).is_err() {
+            return String::new();
+        }
+        let mut out = String::new();
+        if let Ok(h) = GetClipboardData(CF_UNICODETEXT.0 as u32) {
+            let hglobal = HGLOBAL(h.0);
+            let ptr = GlobalLock(hglobal) as *const u16;
+            if !ptr.is_null() {
+                // 读到 NUL 结尾的宽字符串。
+                let mut len = 0usize;
+                while *ptr.add(len) != 0 {
+                    len += 1;
+                }
+                let slice = std::slice::from_raw_parts(ptr, len);
+                out = String::from_utf16_lossy(slice);
+                let _ = GlobalUnlock(hglobal);
+            }
+        }
+        let _ = CloseClipboard();
+        out
     }
 }
 

@@ -39,41 +39,69 @@ impl Coordinator {
         let _ = self.cmdbar_services.set(svc);
     }
 
-    /// 执行一个 `$CC` 命令源：解析 → 求值 → 跑动作链。返回待上屏文本（多数命令为空）。
+    /// 执行一个 `$CC` 命令源：解析 → 求值 → **按列表顺序**跑动作链。
+    /// type() 文本经 push 管道上屏；其余为副作用。文本上屏后稍候再跑后续副作用，
+    /// 让落字先于后续按键（如 `type("「」")` 后 `key.tap("Left")` 才能把光标落到括号中间）。
     /// **必须在独立线程、未持 state 锁时调用**（控制器会回调自锁的 coordinator 方法）。
-    pub(crate) fn run_command_candidate(&self, src: &str, input: &str) -> String {
+    pub(crate) fn run_command_candidate(&self, src: &str, input: &str) {
         let Some(services) = self.cmdbar_services.get() else {
-            return String::new();
+            return;
         };
         let ctx = CmdbarCtx {
             input: input.to_string(),
             now: Local::now(),
+            last: self.recent_commits_snapshot(),
             services,
         };
         let reg = wind_cmdbar::default_registry();
-        match wind_cmdbar::evaluate_phrase(src, &ctx, reg) {
-            Ok(wind_cmdbar::PhraseEval::Single { actions, .. }) => {
-                let (insert, err) = wind_cmdbar::run_actions(&actions, &ctx, reg);
-                if let Some(e) = err {
-                    warn!("cmdbar 命令动作失败: {}", e);
-                }
-                insert
-            }
+        let actions = match wind_cmdbar::evaluate_phrase(src, &ctx, reg) {
+            Ok(wind_cmdbar::PhraseEval::Single { actions, .. }) => actions,
             // $SS 数组的动作在各元素自身选中时执行，整组选中不跑动作。
-            Ok(wind_cmdbar::PhraseEval::Array(_)) => String::new(),
+            Ok(wind_cmdbar::PhraseEval::Array(_)) => return,
             Err(e) => {
                 warn!("cmdbar 命令求值失败 ({:?}): {}", src, e);
-                String::new()
+                return;
+            }
+        };
+        let mut text_pending = false;
+        let mut first_text = true;
+        for a in &actions {
+            match a.kind {
+                wind_cmdbar::ActionKind::Text => match a.run(&ctx, reg) {
+                    Ok(t) if !t.is_empty() => {
+                        // 首次上屏前稍候：让选词返回的 ClearComposition 先到达客户端，
+                        // 避免命令线程的 push 文本与清 composition 竞争（顺序错乱）。
+                        if first_text {
+                            std::thread::sleep(std::time::Duration::from_millis(30));
+                            first_text = false;
+                        }
+                        self.push_commit_text(&t);
+                        text_pending = true;
+                    }
+                    Ok(_) => {}
+                    Err(e) => warn!("cmdbar type 动作失败: {}", e),
+                },
+                wind_cmdbar::ActionKind::Effect => {
+                    if text_pending {
+                        std::thread::sleep(std::time::Duration::from_millis(30));
+                        text_pending = false;
+                    }
+                    if let Err(e) = a.run(&ctx, reg) {
+                        warn!("cmdbar 动作失败: {}", e);
+                    }
+                }
             }
         }
     }
 }
 
-/// 命令栏求值上下文（coordinator 适配）。当前提供 input/now/env + services；
-/// 交互态（last/clip/sel/app/title）待平台层补齐后接入（与 Go 早期实现一致先留空）。
+/// 命令栏求值上下文（coordinator 适配）。提供 input/now/env + 上屏历史 last + 剪贴板 clip + services；
+/// sel/app/title 待前台窗口能力补齐后接入（与 Go 早期实现一致先留空）。
 struct CmdbarCtx<'a> {
     input: String,
     now: DateTime<Local>,
+    /// 上屏历史快照（index 0 = 最近一次），触发命令时冻结。
+    last: Vec<String>,
     services: &'a Services,
 }
 
@@ -81,11 +109,22 @@ impl EvalContext for CmdbarCtx<'_> {
     fn input(&self) -> String {
         self.input.clone()
     }
-    fn last(&self, _n: i64) -> String {
-        String::new()
+    fn last(&self, n: i64) -> String {
+        if n < 1 {
+            return String::new();
+        }
+        self.last.get((n - 1) as usize).cloned().unwrap_or_default()
     }
     fn clip(&self, _n: i64) -> String {
-        String::new()
+        // 仅当前剪贴板（n>1 历史栈未实现）。
+        #[cfg(windows)]
+        {
+            wind_ui::popup_menu::get_clipboard_text()
+        }
+        #[cfg(not(windows))]
+        {
+            String::new()
+        }
     }
     fn sel(&self) -> String {
         String::new()
