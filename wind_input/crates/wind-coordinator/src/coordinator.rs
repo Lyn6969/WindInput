@@ -2894,6 +2894,13 @@ impl Coordinator {
             *e
         };
         let _ = self.ui_tx.send(UiCommand::SetPreeditEmbedded(embedded));
+        // 持久化到用户层 ui.candidate.preedit_mode（重启后保留）。
+        if let Err(e) = Config::set_user_string(
+            &["ui", "candidate", "preedit_mode"],
+            if embedded { "embedded" } else { "top" },
+        ) {
+            warn!("ime.toggle preedit: 持久化失败: {}", e);
+        }
         self.show_tip(if embedded { "编码:嵌入" } else { "编码:顶部" });
     }
 
@@ -2913,9 +2920,12 @@ impl Coordinator {
         self.show_tip(if hidden { "候选窗:隐藏" } else { "候选窗:显示" });
     }
 
-    /// 切换输入方案（持久化由 switch_schema 内部处理）。
+    /// 切换输入方案并持久化 `schema.active` 到用户层配置（重启后保留）。
     pub(crate) fn cmd_set_schema(&self, id: &str) {
         self.switch_schema(id);
+        if let Err(e) = Config::set_user_string(&["schema", "active"], id) {
+            warn!("ime.schema: 持久化 schema.active 失败: {}", e);
+        }
     }
 
     /// 循环切换主题并持久化；dir="prev" 向前，其余向后。返回新主题显示名。

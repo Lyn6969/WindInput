@@ -3,6 +3,7 @@
 //! 与 Go 版本 `wind_input/pkg/config/config.go` 对齐。
 //! 配置文件为 TOML 格式，三层合并：默认值 → data/config.toml → %APPDATA%/WindInput/config.toml
 
+use anyhow::Context;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -23,6 +24,26 @@ fn merge_value(base: &mut toml::Value, overlay: toml::Value) {
             }
         }
         (b, o) => *b = o,
+    }
+}
+
+/// 在 TOML 表里按 `path` 导航（缺失则创建嵌套表），把叶子设为 `value`。
+/// 路径中途若遇非表值（类型冲突）则覆盖为表。供 [`Config::set_user_value`] 部分合并用。
+fn set_nested(table: &mut toml::Table, path: &[&str], value: toml::Value) {
+    if path.len() == 1 {
+        table.insert(path[0].to_string(), value);
+        return;
+    }
+    let entry = table
+        .entry(path[0].to_string())
+        .or_insert_with(|| toml::Value::Table(Default::default()));
+    match entry {
+        toml::Value::Table(t) => set_nested(t, &path[1..], value),
+        other => {
+            let mut t = toml::Table::new();
+            set_nested(&mut t, &path[1..], value);
+            *other = toml::Value::Table(t);
+        }
     }
 }
 
@@ -711,6 +732,48 @@ impl Config {
         dirs::config_dir().map(|d| d.join(Self::app_dir_name()))
     }
 
+    /// 把单个配置项**部分合并**写入用户层 `config.toml`（%APPDATA%/WindInput/config.toml）。
+    ///
+    /// 只改 `path` 指定的项、保留用户文件里其它已有项，**不写入未改动的默认/系统段**——
+    /// 用户层维持最小 diff，避免覆盖系统层/默认层的后续更新（对齐 wind-setting 的"快照→diff"模型）。
+    /// 原子写（tmp + rename）。`path` 如 `["ui","candidate","preedit_mode"]`。
+    pub fn set_user_value(path: &[&str], value: toml::Value) -> anyhow::Result<()> {
+        if path.is_empty() {
+            anyhow::bail!("set_user_value: empty path");
+        }
+        let dir = Self::user_config_dir().context("no user config dir")?;
+        std::fs::create_dir_all(&dir)?;
+        let file = dir.join("config.toml");
+
+        // 读现有用户层（partial），不存在/解析失败则空表（不丢已有项时尽量保留）。
+        let mut root = std::fs::read_to_string(&file)
+            .ok()
+            .and_then(|s| toml::from_str::<toml::Value>(&s).ok())
+            .unwrap_or_else(|| toml::Value::Table(Default::default()));
+        if !root.is_table() {
+            root = toml::Value::Table(Default::default());
+        }
+        if let toml::Value::Table(t) = &mut root {
+            set_nested(t, path, value);
+        }
+
+        let out = toml::to_string_pretty(&root)?;
+        let tmp = file.with_extension("toml.tmp");
+        std::fs::write(&tmp, out)?;
+        std::fs::rename(&tmp, &file)?;
+        Ok(())
+    }
+
+    /// [`set_user_value`](Self::set_user_value) 的字符串便捷形式。
+    pub fn set_user_string(path: &[&str], value: &str) -> anyhow::Result<()> {
+        Self::set_user_value(path, toml::Value::String(value.to_string()))
+    }
+
+    /// [`set_user_value`](Self::set_user_value) 的布尔便捷形式。
+    pub fn set_user_bool(path: &[&str], value: bool) -> anyhow::Result<()> {
+        Self::set_user_value(path, toml::Value::Boolean(value))
+    }
+
     /// 本机状态目录（%LOCALAPPDATA%\<App>）：不随漫游同步的机器相关数据
     /// （工具栏位置等）。
     pub fn local_dir() -> Option<PathBuf> {
@@ -751,6 +814,48 @@ impl Config {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn set_nested_creates_overwrites_and_preserves() {
+        let mut t = toml::Table::new();
+        t.insert("keep".into(), toml::Value::String("x".into()));
+        set_nested(
+            &mut t,
+            &["ui", "candidate", "preedit_mode"],
+            toml::Value::String("embedded".into()),
+        );
+        set_nested(
+            &mut t,
+            &["schema", "active"],
+            toml::Value::String("pinyin".into()),
+        );
+        // 原有项保留
+        assert_eq!(t.get("keep").unwrap().as_str(), Some("x"));
+        // 嵌套创建
+        assert_eq!(
+            t.get("ui").unwrap().get("candidate").unwrap().get("preedit_mode").unwrap().as_str(),
+            Some("embedded")
+        );
+        assert_eq!(
+            t.get("schema").unwrap().get("active").unwrap().as_str(),
+            Some("pinyin")
+        );
+        // 同路径覆盖
+        set_nested(
+            &mut t,
+            &["ui", "candidate", "preedit_mode"],
+            toml::Value::String("top".into()),
+        );
+        assert_eq!(
+            t.get("ui").unwrap().get("candidate").unwrap().get("preedit_mode").unwrap().as_str(),
+            Some("top")
+        );
+        // 其它兄弟键不受影响
+        assert_eq!(
+            t.get("schema").unwrap().get("active").unwrap().as_str(),
+            Some("pinyin")
+        );
+    }
 
     /// 模拟 load 的合并：默认 Value ← overlay 深合并 → 反序列化 + normalize。
     fn merged_with(overlay_toml: &str) -> Config {
