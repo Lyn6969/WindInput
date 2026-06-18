@@ -873,7 +873,8 @@ impl Coordinator {
 
         let mut candidates = result.candidates;
         if !self.phrases.is_empty() {
-            for hit in self.phrases.lookup(&state.input_buffer) {
+            let recent = self.recent_commits_snapshot();
+            for hit in self.phrases.lookup(&state.input_buffer, &recent) {
                 let is_command = hit.command_src.is_some();
                 candidates.push(Candidate {
                     text: hit.text,

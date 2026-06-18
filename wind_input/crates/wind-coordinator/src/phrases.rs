@@ -109,12 +109,14 @@ impl PhraseLayer {
     }
 
     /// 查 code 对应的展开短语；跳过含不支持变量的项。
-    pub fn lookup(&self, code: &str) -> Vec<PhraseHit> {
-        self.lookup_at(code, Local::now())
+    /// `last` 为上屏历史快照（index 0 = 最近），供命令栏 display 侧的 `last(n)` 使用
+    /// （如 `coll` 的 `$CC(last(), ...)` 候选需显示上一次上屏内容）。
+    pub fn lookup(&self, code: &str, last: &[String]) -> Vec<PhraseHit> {
+        self.lookup_at(code, Local::now(), last)
     }
 
     /// 同 lookup，但显式传入时间（便于测试）。
-    pub fn lookup_at(&self, code: &str, now: DateTime<Local>) -> Vec<PhraseHit> {
+    pub fn lookup_at(&self, code: &str, now: DateTime<Local>, last: &[String]) -> Vec<PhraseHit> {
         let entries = match self.map.get(code) {
             Some(e) => e,
             None => return Vec::new(),
@@ -122,10 +124,11 @@ impl PhraseLayer {
         let mut out = Vec::new();
         for e in entries {
             if is_cmdbar_grammar(&e.text) {
-                // 命令栏路径：纯函数 display 求值（无服务）。失败跳过并记 WARN，不阻断输入。
+                // 命令栏路径：display 求值（纯函数 + last/clip 上下文，无副作用服务）。
                 let ctx = PhraseCtx {
                     input: code.to_string(),
                     now,
+                    last,
                 };
                 match evaluate_phrase(&e.text, &ctx, default_registry()) {
                     // 无动作（literal/template，如 {date()}）→ 显示即上屏文本。
@@ -157,22 +160,34 @@ impl PhraseLayer {
 }
 
 /// 命令栏 display 侧的 [`wind_cmdbar::EvalContext`] 适配器（短语候选生成用）。
-/// 仅提供纯函数所需的 input/now/env；交互态（last/clip/sel/app/title）与服务侧留空，
-/// 待宿主平台层补齐后由 coordinator 提供完整实现。
-struct PhraseCtx {
+/// 提供 input/now/env + 上屏历史 last + 剪贴板 clip（供 `coll`/`coad` 等命令的 display
+/// 标签显示 `last()`/`clip()`）；sel/app/title 与副作用服务侧留空（生成阶段不跑动作）。
+struct PhraseCtx<'a> {
     input: String,
     now: DateTime<Local>,
+    /// 上屏历史快照（index 0 = 最近）。
+    last: &'a [String],
 }
 
-impl wind_cmdbar::EvalContext for PhraseCtx {
+impl wind_cmdbar::EvalContext for PhraseCtx<'_> {
     fn input(&self) -> String {
         self.input.clone()
     }
-    fn last(&self, _n: i64) -> String {
-        String::new()
+    fn last(&self, n: i64) -> String {
+        if n < 1 {
+            return String::new();
+        }
+        self.last.get((n - 1) as usize).cloned().unwrap_or_default()
     }
     fn clip(&self, _n: i64) -> String {
-        String::new()
+        #[cfg(windows)]
+        {
+            wind_ui::popup_menu::get_clipboard_text()
+        }
+        #[cfg(not(windows))]
+        {
+            String::new()
+        }
     }
     fn sel(&self) -> String {
         String::new()
@@ -397,20 +412,20 @@ mod tests {
         let layer = PhraseLayer { map };
         let now = fixed();
         assert_eq!(
-            layer.lookup_at("rq", now),
+            layer.lookup_at("rq", now, &[]),
             vec![PhraseHit::plain("2026-06-14".into(), 1000)]
         );
         assert_eq!(
-            layer.lookup_at("js", now),
+            layer.lookup_at("js", now, &[]),
             vec![PhraseHit::plain("7".into(), 900)]
         );
         // 旧简单模板路径仍工作
         assert_eq!(
-            layer.lookup_at("old", now),
+            layer.lookup_at("old", now, &[]),
             vec![PhraseHit::plain("2026-06-14".into(), 800)]
         );
         // 命令短语：display 为标签，携带命令源（选中时执行动作）。
-        let cmd = layer.lookup_at("cmd", now);
+        let cmd = layer.lookup_at("cmd", now, &[]);
         assert_eq!(cmd.len(), 1);
         assert_eq!(cmd[0].text, "切简繁");
         assert_eq!(
@@ -431,7 +446,7 @@ mod tests {
             }],
         );
         let layer = PhraseLayer { map };
-        let got = layer.lookup_at("fh", fixed());
+        let got = layer.lookup_at("fh", fixed(), &[]);
         assert_eq!(
             got,
             vec![
@@ -439,6 +454,26 @@ mod tests {
                 PhraseHit::plain("【】".into(), 500)
             ]
         );
+    }
+
+    #[test]
+    fn test_cmdbar_command_display_uses_last() {
+        // coll = $CC(last(), type(last()))：候选 display 应显示上一次上屏内容，并携命令源。
+        let mut map: HashMap<String, Vec<PhraseEntry>> = HashMap::new();
+        map.insert(
+            "coll".into(),
+            vec![PhraseEntry {
+                text: "$CC(last(), type(last()))".into(),
+                weight: 2000,
+                position: 0,
+            }],
+        );
+        let layer = PhraseLayer { map };
+        let recent = vec!["上次内容".to_string()];
+        let got = layer.lookup_at("coll", fixed(), &recent);
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].text, "上次内容"); // display = last() 显示上次上屏
+        assert!(got[0].command_src.is_some()); // 仍是命令（选中执行 type(last())）
     }
 
     #[test]
