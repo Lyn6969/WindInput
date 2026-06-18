@@ -639,9 +639,16 @@ impl Coordinator {
         }
     }
 
-    /// 词频重排（独立维度，**绝不改 weight**）：按 redb 词频 count 做 used-first 稳定重排——
-    /// 用过的候选（count>0）按 count 降序上浮，未用候选保持基础(权重)序。对齐 frequency.md §3。
-    /// 注：每候选一次 redb 点查（mmap 微秒级）；S1 将下沉到引擎排序层。
+    /// 词频重排（独立维度，**绝不改 weight**）：按 redb 词频记录做档位感知的 used-first 稳定
+    /// 重排——用过的候选（count>0）按策略上浮，未用候选保持基础(权重)序。对齐 frequency.md §3。
+    ///
+    /// 策略（engine.codetable.freq_strategy）：
+    /// - `step`（默认/逐次提升）：count 降序、last_used 降序 tiebreak（累积使用才爬升，抗误选）。
+    /// - `top`（一次到顶/MRU）：last_used 降序、count 降序 tiebreak（最近选的置该档之首）。
+    ///
+    /// 主开关 `learning.freq.enabled` 关闭则完全不重排（修"配置说关、代码却排"的潜在 bug）。
+    /// 拼音暂挂同码表逻辑，待 F2 替换为衰减软置前（frequency.md §4/§8）。
+    /// 注：每候选一次 redb 点查（mmap 微秒级）；后续可下沉到引擎排序层。
     fn apply_freq_rerank(&self, candidates: &mut [Candidate], code: &str) {
         let Some(store) = &self.store else {
             return;
@@ -649,37 +656,51 @@ impl Coordinator {
         if code.is_empty() || candidates.len() < 2 {
             return;
         }
+        let settings = self.engine_mgr.freq_settings();
+        if !settings.enabled {
+            return;
+        }
         let schema = self.engine_mgr.active_schema_id();
         let input_len = code.len();
-        let counts: std::collections::HashMap<String, u32> = candidates
+        // 取每个"消费整串"候选的词频记录 (count, last_used)。分段子候选（consumed_length < 整串，
+        // 如「nihao」里的「你」只消费「ni」）的词频归属其自身前缀码，不能被整串码的历史计数
+        // 上浮——否则单字会浮到整句「你好」之上。consumed_length==0 表示引擎未标注（码表型），
+        // 视为整串匹配。
+        let recs: std::collections::HashMap<String, (u32, i64)> = candidates
             .iter()
             .filter_map(|c| {
-                // 仅"消费整串"的候选按当前输入码计词频。分段子候选（consumed_length < 整串，
-                // 如「nihao」里的「你」只消费「ni」）的词频归属其自身前缀码，不能被整串码
-                // 的历史计数上浮——否则单字会浮到整句「你好」之上。consumed_length==0 表示
-                // 引擎未标注（码表型），视为整串匹配。
                 let consumes_all = c.consumed_length == 0 || c.consumed_length >= input_len;
                 if !consumes_all {
                     return None;
                 }
                 match store.get_freq(&schema, code, &c.text) {
-                    Ok(Some(r)) if r.count > 0 => Some((c.text.clone(), r.count)),
+                    Ok(Some(r)) if r.count > 0 => Some((c.text.clone(), (r.count, r.last_used))),
                     _ => None,
                 }
             })
             .collect();
-        if counts.is_empty() {
+        if recs.is_empty() {
             return;
         }
         // 档位感知的 used-first 重排（五笔优先）：先按来源档位（码表精确 < 词/短语 < 码表前缀
-        // < 拼音），档内再按词频 count 降序。稳定排序保证同档同频维持引擎权重序。
-        // 这样词频自适应只在同档内生效，绝不把拼音浮到五笔精确全码之上（修候选/上屏不一致）。
+        // < 拼音），档内再 used-first（用过的优先）+ 策略排序。稳定排序保证同档无记录者维持引擎
+        // 权重序，绝不把拼音浮到五笔精确全码之上（修候选/上屏不一致）。
+        use std::cmp::Ordering;
         candidates.sort_by(|a, b| {
             let ta = Self::freq_tier(a, code);
             let tb = Self::freq_tier(b, code);
-            let ca = counts.get(&a.text).copied().unwrap_or(0);
-            let cb = counts.get(&b.text).copied().unwrap_or(0);
-            ta.cmp(&tb).then(cb.cmp(&ca))
+            if ta != tb {
+                return ta.cmp(&tb);
+            }
+            match (recs.get(&a.text), recs.get(&b.text)) {
+                (Some(_), None) => Ordering::Less,
+                (None, Some(_)) => Ordering::Greater,
+                (None, None) => Ordering::Equal, // 同档均无记录 → 维持引擎权重序（稳定排序）
+                (Some(&(ca, la)), Some(&(cb, lb))) => match settings.strategy {
+                    wind_engine::FreqStrategy::Top => lb.cmp(&la).then(cb.cmp(&ca)),
+                    wind_engine::FreqStrategy::Step => cb.cmp(&ca).then(lb.cmp(&la)),
+                },
+            }
         });
     }
 

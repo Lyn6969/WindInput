@@ -37,9 +37,14 @@ Go 的做法：记录使用次数 → 以**加权方式把 boost 加到词的 we
 - 效果：**用一次即可靠上浮**，不受 weight 量级压制——修复 Go 痛点。
 - 不混算 weight 与 count（量纲不同），用分区/分层实现。
 
-**词频应用策略 `freq_strategy`（可插拔，为未来预留）**：
-- 当前阶段：`top`（置前）——按 freq_metric 把用过的词排到区段前列。
-- **预留 `step`（逐次前进）**：每次选择只让该词**前进一位**，而非直接置顶（部分输入法的渐进调频风格）。**本阶段不实现**，但数据模型 `{count,last_used}` 与排序接口必须能容纳——即把词频应用做成**策略点**（FreqApplyStrategy trait），不要把"置前"逻辑写死。
+**词频应用策略 `freq_strategy`（两种语义，对应用户诉求"一次到顶 / 逐次提升"）**：
+| 策略 | used 集合内排序键 | 行为 | 适合 |
+|---|---|---|---|
+| **`top`（一次到顶 / MRU）** | `last_used desc` 主，`count desc` 次 | 选一次→立即置该档之首 | "刚选的下次就在首位" |
+| **`step`（逐次提升）** | `count desc` 主，`last_used desc` 次 | 累积使用才爬升，抗误选 | 稳健，默认 |
+- 两者共用 used-first 基底：用过的（count>0）浮到未用之上，未用回退 base_sort（稳定排序保持其原序）。
+- 真正的"逐位移动一格"需存显式 rank、收益低；用 `count desc` 表达"逐次提升"语义已是 Go/搜狗码表标准做法。
+- `step` 是默认（等价旧的无配置 used-first count 序，仅多加 last_used tiebreak）。
 
 ## 4. 拼音方案：次数 + 最近时间 + 衰减
 拼音候选多、有整句组合，**不宜硬 used-first**（会破坏长句质量）。词频按**衰减分**参与排序：
@@ -52,6 +57,12 @@ decay      = exp(-ln2 * age_hours / half_life)     // 半衰期衰减，最近�
 - **关键差异（相对 Go）**：freq_score 在**归一化分数层**与引擎基础质量分结合，**不是加到原始大 weight 上**。引擎 RimeScorer 的基础质量分本就是受控小范围（见 engine.md §1.2），freq_score 按可比量级叠加 → **真正能重排**。
 - 组合方式：`final = base_quality + freq_score`（base_quality 来自 RimeScorer 的词库质量分，与 LM/initialQuality 同源、同量级）。具体系数实现期调参，目标是"高频近用词稳定靠前、但不压垮整句最优解"。
 
+**实现细化（关键，避免重蹈 Go 覆辙）**：当前 Rust 拼音引擎候选用的是**原始大 weight**（整句 `SENTENCE_WEIGHT_BASE=30M`、词百万级），而 `pinyin_score`（`base_scale=100`）量级极小。**绝不能 `weight += freq_score`**——会被大 weight 淹没（=Go bug 重演）。拼音侧改为**带衰减的软置前 + 整句豁免**：
+1. **整句豁免**：`SENTENCE_WEIGHT_BASE` 的整句候选（Viterbi 最优解）恒不被词频挤下。
+2. **非整句候选**：用过的按 `pinyin_score` 软置前于未用候选。
+3. **阈值褪色**：当 `pinyin_score < ε`（久未用、衰减回落）→ 该候选**失去 used-first 资格**，落回 weight 序。
+- 本质分野：**码表的"用过"是永久的（count 不衰减），拼音的"用过"是会褪色的（半衰期衰减）。**
+
 ## 5. 数据与排序的位置（修正 dict/engine 旧设计）
 - **存储**（store）：freq table `{count, last_used}`，按 (schema, code, text)。异步批量写保留。提供 `freq_lookup(schema, code, text) -> Option<{count,last_used}>` 与 `record_selection`。
 - **排序阶段应用**（engine 排序层，**非 dict 查询时**）：
@@ -62,7 +73,8 @@ decay      = exp(-ln2 * age_hours / half_life)     // 半衰期衰减，最近�
 > 区分两个易混概念：**用户词**（用户造的词，是 dict 的一个 layer，有自己的 weight）≠ **用户词频**（对任意候选的使用统计，是排序维度）。本文只讲后者；前者仍按 dict.md 的 store_layer。
 
 ## 6. 配置（修正 config-schema 旧 FreqSpec）
-- 码表排序（两层，对齐 §3）：`base_sort: weight | natural` + `user_frequency: bool` + `freq_strategy: top | step`（step 预留不实现）。**取代** Go 的单一 `candidate_sort_mode`。
+- 码表排序（两层，对齐 §3）：`base_sort: weight | natural` + `user_frequency: bool` + `freq_strategy: top | step`。**取代** Go 的单一 `candidate_sort_mode`。
+- 主开关：`[learning.freq] enabled`（词频维度总闸，关闭则完全不重排）。shipped schema 默认 `true`。
 - 拼音衰减参数（FreqSpec 仅保留衰减相关）：`half_life`（默认 72h）、`base_scale`、可选 `recency_peak`。
 - **删除**旧的 boost-to-weight 语义字段（BoostMax / StreakScale / StreakCap 等"加权上限/连击"参数——属旧模型）。
 - 词频默认值改为**单一真值源**（store 提供默认 + schema 可覆盖），消除 store.md 指出的"两套默认源不一致"。
@@ -74,3 +86,13 @@ decay      = exp(-ln2 * age_hours / half_life)     // 半衰期衰减，最近�
 4. config：CodeTableSpec 排序改两层 `base_sort(weight|natural) + user_frequency:bool + freq_strategy(top|step)`；FreqSpec 改衰减参数。
 
 > 受影响差分均已加指针指向本文。每步 `wind_input/scripts/dev.sh ci` 把关。
+
+## 8. 落地状态（2026-06-18）
+- **F1 码表策略 + F3 配置（码表部分）**：进行中。
+  - `EngineManager::freq_settings()` 按活跃方案解析并缓存 `{enabled, strategy(top/step)}`（`learning.freq.enabled` + `engine.codetable.freq_strategy`），避免每键读盘。
+  - `apply_freq_rerank` 改：① 主开关 `enabled` gate（关则不排，修"配置说关、代码却排"的潜在 bug）；② used-first 内按 `top`(last_used desc, count desc) / `step`(count desc, last_used desc)；③ 档位（五笔优先）约束不变。
+  - shipped schema（wubi86 / wubi86_pinyin）设 `[learning.freq] enabled = true`，`engine.codetable.freq_strategy = "step"`（默认）。
+  - **拼音暂挂同码表逻辑**（used-first count 序），待 F2 替换为 §4 的衰减软置前+整句豁免（细调讲究，单独迭代）。
+- **F2 拼音衰减**：未开始。复用已实现的 `FreqProfile::pinyin_score`（freq.rs），按 §4 接入。
+- **L 造词显现**：未开始。拼音引擎需挂 `StoreUserLayer/StoreTempLayer`（现仅码表引擎挂，manager.rs），否则拼音造的词进不了候选。F2 与 L 建议捆绑。
+- **protect_top_n**：字段保留，本阶段不实现（与 `top` 语义冲突，默认 0）。

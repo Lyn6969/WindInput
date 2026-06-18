@@ -23,6 +23,34 @@ use wind_dict::cached::CachedDict;
 // 方案定义已统一到 wind_config::schema::Schema（取代此前的私有 SchemaFile）。
 // 引擎只消费该共享类型；构建逻辑（build_engine）保持不变。
 
+/// 码表词频应用策略（见 docs/redesign/frequency.md §3）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FreqStrategy {
+    /// 一次到顶（MRU）：last_used 优先，最近选的置该档之首。
+    Top,
+    /// 逐次提升（默认）：count 优先，累积使用才爬升，抗误选。
+    Step,
+}
+
+/// 活跃方案的词频排序设置（apply_freq_rerank 用）。
+/// 按方案解析后缓存，避免每键读盘（frequency.md §8）。
+#[derive(Debug, Clone, Copy)]
+pub struct FreqSettings {
+    /// 词频维度主开关（learning.freq.enabled）；关则完全不重排。
+    pub enabled: bool,
+    /// used-first 内的排序策略（engine.codetable.freq_strategy）。
+    pub strategy: FreqStrategy,
+}
+
+impl Default for FreqSettings {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            strategy: FreqStrategy::Step,
+        }
+    }
+}
+
 /// 引擎管理器（懒加载：仅在需要时构建对应方案引擎，降低启动内存）
 pub struct EngineManager {
     /// schema_id -> 引擎实例（懒加载，Arc 便于无锁 convert）
@@ -37,6 +65,8 @@ pub struct EngineManager {
     store: Option<Arc<wind_store::Store>>,
     /// 全码/空码上屏策略全局默认（方案级 tri-state 未设时回退至此）
     code_commit: wind_config::CodeCommitConfig,
+    /// 词频排序设置缓存（schema_id -> FreqSettings；按需解析、避免每键读盘）
+    freq_cache: Mutex<HashMap<String, FreqSettings>>,
 }
 
 /// 进程级缓存根目录（%LOCALAPPDATA%\WindInput\cache），EngineManager::new 设置一次。
@@ -101,6 +131,7 @@ impl EngineManager {
             data_dir: data_dir.map(|d| d.to_path_buf()),
             store,
             code_commit: config.input.code_commit.clone(),
+            freq_cache: Mutex::new(HashMap::new()),
         };
         // 仅构建活跃方案（其余懒加载）
         mgr.ensure_loaded(&active_id);
@@ -268,6 +299,40 @@ impl EngineManager {
             Some(target)
         } else {
             None
+        }
+    }
+
+    /// 活跃方案的词频排序设置（frequency.md §3/§8）。按方案解析后缓存，避免每键读盘。
+    /// 读盘失败回退默认（enabled=false → 不重排）。
+    pub fn freq_settings(&self) -> FreqSettings {
+        let id = self.active_schema_id();
+        if let Some(s) = self
+            .freq_cache
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&id)
+        {
+            return *s;
+        }
+        let settings = Self::read_schema(&id, self.data_dir.as_deref())
+            .map(|sc| Self::parse_freq_settings(&sc))
+            .unwrap_or_default();
+        self.freq_cache
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(id, settings);
+        settings
+    }
+
+    /// 从方案解析词频排序设置（纯映射，便于单测）。
+    fn parse_freq_settings(sc: &Schema) -> FreqSettings {
+        let strategy = match sc.engine.codetable.freq_strategy.as_str() {
+            "top" => FreqStrategy::Top,
+            _ => FreqStrategy::Step,
+        };
+        FreqSettings {
+            enabled: sc.learning.freq.enabled,
+            strategy,
         }
     }
 
@@ -771,5 +836,41 @@ impl EngineManager {
         }
         warn!("All merged cache writes failed; pinyin dictionary unavailable");
         None
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn parse(toml: &str) -> FreqSettings {
+        let sc: Schema = toml::from_str(toml).expect("schema toml");
+        EngineManager::parse_freq_settings(&sc)
+    }
+
+    #[test]
+    fn freq_settings_defaults_disabled_step() {
+        // 空方案：主开关默认关、策略默认 step。
+        let s = parse("");
+        assert!(!s.enabled, "默认应关闭词频维度");
+        assert_eq!(s.strategy, FreqStrategy::Step, "默认策略应为 step");
+    }
+
+    #[test]
+    fn freq_settings_enabled_top() {
+        let s = parse(
+            "[engine.codetable]\nfreq_strategy = \"top\"\n[learning.freq]\nenabled = true\n",
+        );
+        assert!(s.enabled);
+        assert_eq!(s.strategy, FreqStrategy::Top, "freq_strategy=top 应解析为 Top");
+    }
+
+    #[test]
+    fn freq_settings_step_explicit_and_unknown_fallback() {
+        let s = parse("[engine.codetable]\nfreq_strategy = \"step\"\n[learning.freq]\nenabled = true\n");
+        assert_eq!(s.strategy, FreqStrategy::Step);
+        // 未知策略值回退 step（稳健默认）。
+        let u = parse("[engine.codetable]\nfreq_strategy = \"bogus\"\n[learning.freq]\nenabled = true\n");
+        assert_eq!(u.strategy, FreqStrategy::Step, "未知策略应回退 step");
     }
 }
