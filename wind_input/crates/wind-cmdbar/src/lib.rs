@@ -13,6 +13,7 @@ pub mod error;
 pub mod eval;
 pub mod funcs;
 pub mod parser;
+pub mod phrase;
 pub mod registry;
 pub mod services;
 
@@ -22,6 +23,7 @@ pub use context::{EvalContext, History, MemoryContext};
 pub use error::{CmdbarError, Result};
 pub use eval::{evaluate, expand_array, ArrayElement, ArrayExpansion, Evaluated};
 pub use parser::parse;
+pub use phrase::{evaluate_phrase, is_cmdbar_grammar, run_actions, PhraseEval};
 pub use registry::{default_registry, Category, FuncSpec, Registry};
 pub use services::{
     ClipboardService, ConfigService, DictService, ImeController, KeyInjector, ProcessRunner,

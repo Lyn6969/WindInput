@@ -28,6 +28,12 @@ pub fn parse(src: &str) -> Result<Phrase> {
     Ok(Phrase::Literal(src.to_string()))
 }
 
+/// 源是否使用命令栏语法（含顶层 marker 或顶层未转义 `{` 插值）。
+/// 宿主据此分流：true 走命令栏求值，false 走旧的简单模板/字面量路径。
+pub fn is_cmdbar_grammar(src: &str) -> bool {
+    find_top_level_marker(src).is_some() || has_top_level_brace(src)
+}
+
 /// 顶层 marker 表（最长前缀优先；`$CC1` 必须排在 `$CC` 前）。
 const MARKER_TABLE: &[&str] = &["$CC1", "$CC", "$SS"];
 

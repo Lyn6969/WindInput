@@ -1,15 +1,21 @@
-//! 短语系统：静态/动态短语（`$Y$M$D` 等模板展开）。
+//! 短语系统：静态/动态短语模板展开 + 命令栏（cmdbar）双路径。
 //!
-//! 与 Go 版本 `wind_input/internal/dict/phrase.go` 对齐（首版）。
-//! 加载 `system.phrases.toml`，输入码命中短语 code 时展开模板生成候选。
+//! 与 Go 版本 `wind_input/internal/dict/phrase.go` + `internal/cmdbar` 对齐。
+//! 加载 `system.phrases.toml`，输入码命中短语 code 时生成候选。
 //!
-//! 已支持模板变量：日期时间（$Y/$M/$MM/$D/$DD/$HH/$mm/$ss/$WC/$YC/$MC/$DC/$ts/$tsms）。
-//! 后置：$AA（数组展开）、$CC（命令直通车）、$uuid。含不支持变量的短语项被跳过。
+//! **双路径**（对齐 Go design §7.2）：
+//! - 短语 text 使用命令栏语法（含 `$CC(`/`$SS(` marker 或顶层 `{expr}` 插值）→ 经
+//!   `wind-cmdbar` 解析求值（`{date()}`/`{calc(code)}`/`{upper(code)}`/`$SS` 数组等）。
+//! - 否则 → 旧的简单模板变量展开（$Y/$M/$MM/$D/$DD/$HH/$mm/$ss/$WC/$YC/$MC/$DC/$ts/$tsms）。
+//!
+//! 命令栏 display 侧只用纯函数（无需宿主服务）；`$CC` 的副作用动作需平台服务（按键/剪贴板/
+//! 进程注入），Rust 端平台层尚缺，故当前仅显现 display 候选，动作执行待平台服务补齐。
 
 use chrono::{DateTime, Datelike, Local, Timelike};
 use std::collections::HashMap;
 use std::path::Path;
 use tracing::warn;
+use wind_cmdbar::{default_registry, evaluate_phrase, is_cmdbar_grammar, PhraseEval, Services};
 
 /// 一条短语（同 code 下按 weight 降序、position 升序排列）
 #[derive(Debug, Clone)]
@@ -95,11 +101,73 @@ impl PhraseLayer {
         };
         let mut out = Vec::new();
         for e in entries {
-            if let Some(text) = expand_template(&e.text, &now) {
+            if is_cmdbar_grammar(&e.text) {
+                // 命令栏路径：纯函数 display 求值（无服务）。失败跳过并记 WARN，不阻断输入。
+                let ctx = PhraseCtx {
+                    input: code.to_string(),
+                    now,
+                };
+                match evaluate_phrase(&e.text, &ctx, default_registry()) {
+                    // 无动作（literal/template，如 {date()}）→ 显示即上屏文本，安全显现。
+                    Ok(PhraseEval::Single { display, actions }) if actions.is_empty() => {
+                        out.push((display, e.weight))
+                    }
+                    // $CC 命令短语（有动作）：选中应执行动作而非上屏 display 标签，
+                    // 需平台服务 + 选词执行通路（Rust 端待补）。暂不显现，避免误上屏标签文本。
+                    Ok(PhraseEval::Single { .. }) => {}
+                    Ok(PhraseEval::Array(arr)) => {
+                        for el in arr.elements {
+                            // 仅显现无动作的字面元素（符号等）；带动作的嵌入 $CC 同上跳过。
+                            if el.actions.is_empty() {
+                                out.push((el.display, e.weight));
+                            }
+                        }
+                    }
+                    Err(err) => warn!("cmdbar phrase eval failed ({:?}): {}", e.text, err),
+                }
+            } else if let Some(text) = expand_template(&e.text, &now) {
                 out.push((text, e.weight));
             }
         }
         out
+    }
+}
+
+/// 命令栏 display 侧的 [`wind_cmdbar::EvalContext`] 适配器（短语候选生成用）。
+/// 仅提供纯函数所需的 input/now/env；交互态（last/clip/sel/app/title）与服务侧留空，
+/// 待宿主平台层补齐后由 coordinator 提供完整实现。
+struct PhraseCtx {
+    input: String,
+    now: DateTime<Local>,
+}
+
+impl wind_cmdbar::EvalContext for PhraseCtx {
+    fn input(&self) -> String {
+        self.input.clone()
+    }
+    fn last(&self, _n: i64) -> String {
+        String::new()
+    }
+    fn clip(&self, _n: i64) -> String {
+        String::new()
+    }
+    fn sel(&self) -> String {
+        String::new()
+    }
+    fn app(&self) -> String {
+        String::new()
+    }
+    fn title(&self) -> String {
+        String::new()
+    }
+    fn env(&self, name: &str) -> String {
+        std::env::var(name).unwrap_or_default()
+    }
+    fn now(&self) -> DateTime<Local> {
+        self.now
+    }
+    fn services(&self) -> Option<&Services> {
+        None
     }
 }
 
@@ -264,6 +332,72 @@ mod tests {
         assert_eq!(expand_template("$$5", &now).unwrap(), "$5");
         // 含不支持变量（$AA）→ None
         assert!(expand_template("$AA", &now).is_none());
+    }
+
+    #[test]
+    fn test_cmdbar_dual_path() {
+        // 命令栏语法（含 {expr}）走 cmdbar；其余走简单模板。
+        let mut map: HashMap<String, Vec<PhraseEntry>> = HashMap::new();
+        map.insert(
+            "rq".into(),
+            vec![PhraseEntry {
+                text: r#"{date("YYYY-MM-DD")}"#.into(),
+                weight: 1000,
+                position: 0,
+            }],
+        );
+        map.insert(
+            "js".into(),
+            vec![PhraseEntry {
+                text: "{calc(\"1+2*3\")}".into(),
+                weight: 900,
+                position: 0,
+            }],
+        );
+        map.insert(
+            "old".into(),
+            vec![PhraseEntry {
+                text: "$Y-$MM-$DD".into(),
+                weight: 800,
+                position: 0,
+            }],
+        );
+        // $CC 命令短语（有动作）：暂不显现（待动作执行通路），避免误上屏 display 标签。
+        map.insert(
+            "cmd".into(),
+            vec![PhraseEntry {
+                text: r#"$CC("切简繁", ime.toggle("s2t"))"#.into(),
+                weight: 700,
+                position: 0,
+            }],
+        );
+        let layer = PhraseLayer { map };
+        let now = fixed();
+        assert_eq!(layer.lookup_at("rq", now), vec![("2026-06-14".into(), 1000)]);
+        assert_eq!(layer.lookup_at("js", now), vec![("7".into(), 900)]);
+        // 旧简单模板路径仍工作
+        assert_eq!(layer.lookup_at("old", now), vec![("2026-06-14".into(), 800)]);
+        // 命令短语暂不显现
+        assert!(layer.lookup_at("cmd", now).is_empty());
+    }
+
+    #[test]
+    fn test_cmdbar_array_phrase_expands() {
+        let mut map: HashMap<String, Vec<PhraseEntry>> = HashMap::new();
+        map.insert(
+            "fh".into(),
+            vec![PhraseEntry {
+                text: r#"$SS("符号", "（）", "【】")"#.into(),
+                weight: 500,
+                position: 0,
+            }],
+        );
+        let layer = PhraseLayer { map };
+        let got = layer.lookup_at("fh", fixed());
+        assert_eq!(
+            got,
+            vec![("（）".into(), 500), ("【】".into(), 500)]
+        );
     }
 
     #[test]

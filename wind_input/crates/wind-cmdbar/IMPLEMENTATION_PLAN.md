@@ -37,5 +37,12 @@
 - Stage 1（词法/语法/AST）: ✅ Complete（lexer/parser/ast，含转义/插值/marker/options bag/$SS）
 - Stage 2（注册表/上下文/求值/纯函数）: ✅ Complete（value/text/calc/help 全函数 + eval + 纯度检查）
 - Stage 3（服务/动作函数）: ✅ Complete（8 service traits + open/proc/key/clip/web/dict/ime/setting/config + type 特例）
-- Stage 4（协调器集成）: In Progress
-- 验证：`cargo test -p wind-cmdbar` 44 passed；clippy 零警告。
+- Stage 4（协调器集成）: 部分完成（display 侧）
+  - 高层 API `wind_cmdbar::phrase`：`is_cmdbar_grammar` / `evaluate_phrase` / `run_actions`（原生测试）。
+  - coordinator `phrases.rs` 双路径：cmdbar 语法（`$CC`/`$SS`/`{expr}`）走 cmdbar 求值，
+    否则走旧简单模板。安全显现策略：无动作的 template/literal-array 显现；带动作的 $CC 暂不显现
+    （避免误把 display 标签当文本上屏），待动作执行通路。
+  - **待补（平台依赖，本会话外）**：$CC 动作执行 —— 需 EvalContext 全量适配 + Services 装配
+    （ime/config/dict 有宿主支持可接；key/clip/proc/foreground 平台层 Rust 端尚缺）+ 选词执行
+    通路。这是 Rust 端平台能力缺口，非 cmdbar 引擎本身。
+- 验证：`cargo test -p wind-cmdbar` 48 passed；clippy 零警告；全工作区 windows 目标 check 通过。
