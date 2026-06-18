@@ -25,6 +25,26 @@ pub struct PhraseEntry {
     pub position: i32,
 }
 
+/// 一条短语命中：展开后的候选文本 + 权重 + 可选命令源。
+/// `command_src` 非空表示这是 `$CC` 命令短语（选中时执行动作而非上屏 text），
+/// 其值为待重新求值/执行的命令源（如 `$CC("切简繁", ime.toggle("s2t"))`）。
+#[derive(Debug, Clone, PartialEq)]
+pub struct PhraseHit {
+    pub text: String,
+    pub weight: i32,
+    pub command_src: Option<String>,
+}
+
+impl PhraseHit {
+    fn plain(text: String, weight: i32) -> Self {
+        Self {
+            text,
+            weight,
+            command_src: None,
+        }
+    }
+}
+
 /// 短语层：code → 多条短语
 #[derive(Debug, Default)]
 pub struct PhraseLayer {
@@ -88,13 +108,13 @@ impl PhraseLayer {
         self.map.is_empty()
     }
 
-    /// 查 code 对应的展开短语，返回 (展开文本, 权重)；跳过含不支持变量的项。
-    pub fn lookup(&self, code: &str) -> Vec<(String, i32)> {
+    /// 查 code 对应的展开短语；跳过含不支持变量的项。
+    pub fn lookup(&self, code: &str) -> Vec<PhraseHit> {
         self.lookup_at(code, Local::now())
     }
 
     /// 同 lookup，但显式传入时间（便于测试）。
-    pub fn lookup_at(&self, code: &str, now: DateTime<Local>) -> Vec<(String, i32)> {
+    pub fn lookup_at(&self, code: &str, now: DateTime<Local>) -> Vec<PhraseHit> {
         let entries = match self.map.get(code) {
             Some(e) => e,
             None => return Vec::new(),
@@ -108,25 +128,28 @@ impl PhraseLayer {
                     now,
                 };
                 match evaluate_phrase(&e.text, &ctx, default_registry()) {
-                    // 无动作（literal/template，如 {date()}）→ 显示即上屏文本，安全显现。
+                    // 无动作（literal/template，如 {date()}）→ 显示即上屏文本。
                     Ok(PhraseEval::Single { display, actions }) if actions.is_empty() => {
-                        out.push((display, e.weight))
+                        out.push(PhraseHit::plain(display, e.weight))
                     }
-                    // $CC 命令短语（有动作）：选中应执行动作而非上屏 display 标签，
-                    // 需平台服务 + 选词执行通路（Rust 端待补）。暂不显现，避免误上屏标签文本。
-                    Ok(PhraseEval::Single { .. }) => {}
+                    // $CC 命令短语（有动作）：携带命令源，选中时由 coordinator 执行动作。
+                    Ok(PhraseEval::Single { display, .. }) => out.push(PhraseHit {
+                        text: display,
+                        weight: e.weight,
+                        command_src: Some(e.text.clone()),
+                    }),
                     Ok(PhraseEval::Array(arr)) => {
                         for el in arr.elements {
-                            // 仅显现无动作的字面元素（符号等）；带动作的嵌入 $CC 同上跳过。
+                            // 仅显现无动作的字面元素（符号等）；带动作的嵌入 $CC 需元素级源，后续补。
                             if el.actions.is_empty() {
-                                out.push((el.display, e.weight));
+                                out.push(PhraseHit::plain(el.display, e.weight));
                             }
                         }
                     }
                     Err(err) => warn!("cmdbar phrase eval failed ({:?}): {}", e.text, err),
                 }
             } else if let Some(text) = expand_template(&e.text, &now) {
-                out.push((text, e.weight));
+                out.push(PhraseHit::plain(text, e.weight));
             }
         }
         out
@@ -373,12 +396,27 @@ mod tests {
         );
         let layer = PhraseLayer { map };
         let now = fixed();
-        assert_eq!(layer.lookup_at("rq", now), vec![("2026-06-14".into(), 1000)]);
-        assert_eq!(layer.lookup_at("js", now), vec![("7".into(), 900)]);
+        assert_eq!(
+            layer.lookup_at("rq", now),
+            vec![PhraseHit::plain("2026-06-14".into(), 1000)]
+        );
+        assert_eq!(
+            layer.lookup_at("js", now),
+            vec![PhraseHit::plain("7".into(), 900)]
+        );
         // 旧简单模板路径仍工作
-        assert_eq!(layer.lookup_at("old", now), vec![("2026-06-14".into(), 800)]);
-        // 命令短语暂不显现
-        assert!(layer.lookup_at("cmd", now).is_empty());
+        assert_eq!(
+            layer.lookup_at("old", now),
+            vec![PhraseHit::plain("2026-06-14".into(), 800)]
+        );
+        // 命令短语：display 为标签，携带命令源（选中时执行动作）。
+        let cmd = layer.lookup_at("cmd", now);
+        assert_eq!(cmd.len(), 1);
+        assert_eq!(cmd[0].text, "切简繁");
+        assert_eq!(
+            cmd[0].command_src.as_deref(),
+            Some(r#"$CC("切简繁", ime.toggle("s2t"))"#)
+        );
     }
 
     #[test]
@@ -396,7 +434,10 @@ mod tests {
         let got = layer.lookup_at("fh", fixed());
         assert_eq!(
             got,
-            vec![("（）".into(), 500), ("【】".into(), 500)]
+            vec![
+                PhraseHit::plain("（）".into(), 500),
+                PhraseHit::plain("【】".into(), 500)
+            ]
         );
     }
 

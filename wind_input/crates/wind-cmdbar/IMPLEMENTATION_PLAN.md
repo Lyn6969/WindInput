@@ -37,12 +37,16 @@
 - Stage 1（词法/语法/AST）: ✅ Complete（lexer/parser/ast，含转义/插值/marker/options bag/$SS）
 - Stage 2（注册表/上下文/求值/纯函数）: ✅ Complete（value/text/calc/help 全函数 + eval + 纯度检查）
 - Stage 3（服务/动作函数）: ✅ Complete（8 service traits + open/proc/key/clip/web/dict/ime/setting/config + type 特例）
-- Stage 4（协调器集成）: 部分完成（display 侧）
+- Stage 4（协调器集成）: ✅ 框架完成（display + $CC 动作执行；宿主能力部分接通）
   - 高层 API `wind_cmdbar::phrase`：`is_cmdbar_grammar` / `evaluate_phrase` / `run_actions`（原生测试）。
-  - coordinator `phrases.rs` 双路径：cmdbar 语法（`$CC`/`$SS`/`{expr}`）走 cmdbar 求值，
-    否则走旧简单模板。安全显现策略：无动作的 template/literal-array 显现；带动作的 $CC 暂不显现
-    （避免误把 display 标签当文本上屏），待动作执行通路。
-  - **待补（平台依赖，本会话外）**：$CC 动作执行 —— 需 EvalContext 全量适配 + Services 装配
-    （ime/config/dict 有宿主支持可接；key/clip/proc/foreground 平台层 Rust 端尚缺）+ 选词执行
-    通路。这是 Rust 端平台能力缺口，非 cmdbar 引擎本身。
-- 验证：`cargo test -p wind-cmdbar` 48 passed；clippy 零警告；全工作区 windows 目标 check 通过。
+  - coordinator `phrases.rs` 双路径：cmdbar 语法（`$CC`/`$SS`/`{expr}`）走 cmdbar 求值，否则走旧简单模板。
+    `PhraseHit` 携带 `command_src`：template/literal-array 直接显现；`$CC` 命令携源 + is_command。
+  - **$CC 动作执行**：候选选中（键盘 commit_selected / 鼠标 mouse_select）拦截 is_command →
+    `spawn_command` **独立线程**执行（避开持 state 锁回调自锁方法的重入死锁，对齐 Go 约束）→
+    `run_command_candidate` 解析+求值+跑动作；`type()` 文本经 push 管道上屏。
+  - 服务装配（handle_cmdbar.rs，Weak<Coordinator> 回调）：**已接通** ime.toggle(cn-en/fullshape/s2t)、
+    ime.schema、dict.add；**待补**（平台/配置能力）：key/clip/proc/url/search/config/setting/theme_cycle，
+    缺失返回 ServiceUnavailable 优雅降级。
+  - 验证局限：coordinator 无法原生测（wind-bridge 预存破）；cmdbar 侧 $CC ime 派发已原生测（mock 控制器）；
+    coordinator 集成仅 windows 目标 check + debug exe 链接通过，**功能需上设备实测**。
+- 验证：`cargo test -p wind-cmdbar` 50 passed；clippy 零警告；全工作区 windows check + debug exe 构建通过。

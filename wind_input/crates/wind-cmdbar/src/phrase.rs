@@ -169,4 +169,65 @@ mod tests {
         assert_eq!(insert, "《》");
         assert_eq!(log.0.lock().unwrap().as_slice(), &["Left".to_string()]);
     }
+
+    /// 端到端 ime 命令（宿主 $CC 执行通路依赖此流程）：
+    /// `$CC("切简繁", ime.toggle("s2t"))` 选中 → 派发到 ImeController.toggle("s2t")，无上屏文本。
+    #[test]
+    fn run_ime_command_dispatches_to_controller() {
+        use crate::services::{ImeController, Services};
+        use std::sync::{Arc, Mutex};
+
+        #[derive(Default)]
+        struct Ime(Mutex<Vec<String>>);
+        impl ImeController for Ime {
+            fn toggle(&self, target: &str) -> anyhow::Result<()> {
+                self.0.lock().unwrap().push(target.into());
+                Ok(())
+            }
+            fn open_setting(&self, _: &str) -> anyhow::Result<()> {
+                Ok(())
+            }
+            fn open_setting_web(&self, _: &str) -> anyhow::Result<()> {
+                Ok(())
+            }
+            fn set_schema(&self, _: &str) -> anyhow::Result<()> {
+                Ok(())
+            }
+            fn theme_cycle(&self, _: &str) -> anyhow::Result<String> {
+                Ok(String::new())
+            }
+        }
+
+        let ime = Arc::new(Ime::default());
+        let mut svc = Services::new();
+        svc.ime = Some(ime.clone());
+        let ctx = MemoryContext::new().with_services(svc);
+        let reg = Registry::full();
+
+        let r = evaluate_phrase(r#"$CC("切简繁", ime.toggle("s2t"))"#, &ctx, &reg).unwrap();
+        let (insert, err) = match r {
+            PhraseEval::Single { actions, .. } => run_actions(&actions, &ctx, &reg),
+            _ => panic!(),
+        };
+        assert!(err.is_none());
+        assert_eq!(insert, ""); // 纯副作用命令无上屏文本
+        assert_eq!(ime.0.lock().unwrap().as_slice(), &["s2t".to_string()]);
+    }
+
+    /// 缺服务时命令优雅降级：动作返回 ServiceUnavailable，run_actions 收集错误但不 panic。
+    #[test]
+    fn missing_service_degrades_gracefully() {
+        let ctx = MemoryContext::new().with_services(crate::services::Services::new());
+        let reg = Registry::full();
+        let r = evaluate_phrase(r#"$CC("x", open("https://y"))"#, &ctx, &reg).unwrap();
+        let (insert, err) = match r {
+            PhraseEval::Single { actions, .. } => run_actions(&actions, &ctx, &reg),
+            _ => panic!(),
+        };
+        assert_eq!(insert, "");
+        assert!(matches!(
+            err,
+            Some(crate::CmdbarError::ServiceUnavailable { .. })
+        ));
+    }
 }

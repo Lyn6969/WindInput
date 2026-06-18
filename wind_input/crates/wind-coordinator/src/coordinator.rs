@@ -348,6 +348,10 @@ pub struct Coordinator {
     theme_dark: Mutex<bool>,
     /// 主题选择持久化文件（theme.txt）
     theme_path: Option<std::path::PathBuf>,
+    /// 命令栏（cmdbar）服务束（ime/config/dict 等动作后端），构造后由 init_cmdbar 装配。
+    pub(crate) cmdbar_services: std::sync::OnceLock<wind_cmdbar::Services>,
+    /// 自身 Weak 引用：$CC 命令在独立线程异步执行（避免持 state 锁回调自锁方法致死锁）。
+    pub(crate) self_weak: std::sync::OnceLock<std::sync::Weak<Coordinator>>,
 }
 
 /// 短语候选权重基准（高于普通候选，使短语展开排在前列）
@@ -628,7 +632,11 @@ impl Coordinator {
             theme_name: Mutex::new(initial_theme),
             theme_dark: Mutex::new(false),
             theme_path,
+            cmdbar_services: std::sync::OnceLock::new(),
+            self_weak: std::sync::OnceLock::new(),
         });
+        // 命令栏：装配 Services（ime/config/dict 后端）+ 自身 Weak 引用。
+        coordinator.init_cmdbar();
         // 启动即显示常驻工具栏（反映初始 中英/方案/标点/全半角）
         coordinator.notify_toolbar();
         coordinator
@@ -826,11 +834,16 @@ impl Coordinator {
 
         let mut candidates = result.candidates;
         if !self.phrases.is_empty() {
-            for (text, w) in self.phrases.lookup(&state.input_buffer) {
+            for hit in self.phrases.lookup(&state.input_buffer) {
+                let is_command = hit.command_src.is_some();
                 candidates.push(Candidate {
-                    text,
-                    weight: PHRASE_WEIGHT_BASE + w,
+                    text: hit.text,
+                    weight: PHRASE_WEIGHT_BASE + hit.weight,
                     is_phrase: true,
+                    // $CC 命令短语：标记 is_command，phrase_template 暂存命令源；
+                    // 选中时由 commit_selected 拦截，执行动作而非上屏 display 标签。
+                    is_command,
+                    phrase_template: hit.command_src.unwrap_or_default(),
                     ..Default::default()
                 });
             }
@@ -2739,6 +2752,10 @@ impl Coordinator {
     /// **留在组合区不上屏到应用**，返回 UpdateComposition。
     /// 完整匹配（消费整串）：整体上屏 `committed_text + 候选` 到应用，触发自动造词（L），清空。
     fn commit_selected(&self, state: &mut State, cand: &Candidate) -> KeyAction {
+        // $CC 命令候选：执行动作而非上屏 display 标签。
+        if cand.is_command {
+            return self.commit_command(state, cand);
+        }
         let total = state.input_buffer.len();
         let consumed = cand.consumed_length;
         let code = Self::cand_code(&state.input_buffer, cand);
@@ -2766,6 +2783,67 @@ impl Coordinator {
             self.notify_ui_hide();
             Self::commit_action(out, true)
         }
+    }
+
+    /// $CC 命令候选选中：清理组合区、隐藏 UI，把命令源放独立线程异步执行。
+    /// **异步是必须的**：控制器经 Weak 回调 handle_menu_command 等自锁方法，而此刻本线程
+    /// 仍持 state 锁（std::sync::Mutex 非可重入），同线程重入即死锁——交独立线程待本次按键
+    /// 处理释放锁后再跑（对齐 Go「不在 SearchCommand 持锁路径里再 Lock」的约束）。
+    fn commit_command(&self, state: &mut State, cand: &Candidate) -> KeyAction {
+        let src = cand.phrase_template.clone();
+        let input = state.input_buffer.clone();
+        self.reset_pinyin_composition(state);
+        self.notify_ui_hide();
+        self.spawn_command(src, input);
+        KeyAction::Consumed
+    }
+
+    /// 在独立线程执行命令源（解析→求值→跑动作）；`type()` 的上屏文本经 push 管道送活动客户端。
+    fn spawn_command(&self, src: String, input: String) {
+        let Some(this) = self.self_weak.get().and_then(std::sync::Weak::upgrade) else {
+            warn!("cmdbar: self_weak 未装配，命令跳过");
+            return;
+        };
+        std::thread::spawn(move || {
+            let out = this.run_command_candidate(&src, &input);
+            if !out.is_empty() {
+                let encoded = wind_ipc::codec::encode_commit_text(&out, None, false, true, false);
+                this.push_server.push_commit_to_active(&encoded);
+            }
+        });
+    }
+
+    /// cmdbar 能力 wrapper（被 handle_cmdbar 控制器经 Weak 回调）。各方法自锁，**禁止**在持
+    /// state 锁时调用（spawn_command 已确保在独立线程、未持锁时执行）。
+    pub(crate) fn cmd_ime_toggle(&self, target: &str) {
+        let cmd = match target {
+            "cn-en" => "toggle_mode",
+            "fullshape" => "toggle_width",
+            "s2t" => "toggle_s2t",
+            other => {
+                warn!("ime.toggle: 暂不支持 target {:?}（Rust 平台能力待补）", other);
+                return;
+            }
+        };
+        self.handle_menu_command(cmd);
+    }
+
+    /// 切换输入方案（持久化由 switch_schema 内部处理）。
+    pub(crate) fn cmd_set_schema(&self, id: &str) {
+        self.switch_schema(id);
+    }
+
+    /// 加词到用户层（code 为空时暂不支持自动推导编码）。
+    pub(crate) fn cmd_dict_add(&self, text: &str, code: &str) -> anyhow::Result<()> {
+        let Some(store) = &self.store else {
+            anyhow::bail!("dict.add: 无 store");
+        };
+        if code.is_empty() {
+            anyhow::bail!("dict.add: code 为空（Rust 端暂未支持自动推导编码）");
+        }
+        let schema = self.engine_mgr.active_schema_id();
+        store.add_user_word(&schema, code, text, 100)?;
+        Ok(())
     }
 
     /// 自动造词（L）：仅当用户**分步**组成（committed_segs ≥2 段、合并 ≥2 字）才学。
@@ -3482,6 +3560,16 @@ impl Coordinator {
         let (start, end) = self.page_range(&state);
         let idx = start + page_local;
         if idx >= end || idx >= state.candidates.len() {
+            return;
+        }
+        // $CC 命令候选：执行动作而非上屏 display 标签（释放锁后异步执行，避免重入死锁）。
+        if state.candidates[idx].is_command {
+            let src = state.candidates[idx].phrase_template.clone();
+            let input = state.input_buffer.clone();
+            state.active = None;
+            drop(state);
+            self.notify_ui_hide();
+            self.spawn_command(src, input);
             return;
         }
         let text = state.candidates[idx].text.clone();
