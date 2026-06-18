@@ -160,8 +160,8 @@ fn printable_char(key_code: u32, shift: bool) -> Option<char> {
 pub(crate) const ENGINE_MAX_CANDIDATES: usize = 50;
 
 /// 自动造词（L）写入临时层的初始权重与每次复选增量（保守默认；后续可接 schema.learning 配置）。
-const LEARN_ADD_WEIGHT: i32 = 800;
-const LEARN_WEIGHT_DELTA: i32 = 40;
+pub(crate) const LEARN_ADD_WEIGHT: i32 = 800;
+pub(crate) const LEARN_WEIGHT_DELTA: i32 = 40;
 
 /// 当前 unix 秒（拼音衰减分以此对 last_used 计龄；与 store record_freq 同口径）。
 pub(crate) fn now_unix_secs() -> i64 {
@@ -1944,39 +1944,7 @@ impl Coordinator {
 
 
 
-    /// 加词到用户层（code 为空时暂不支持自动推导编码）。
-    pub(crate) fn cmd_dict_add(&self, text: &str, code: &str) -> anyhow::Result<()> {
-        let Some(store) = &self.store else {
-            anyhow::bail!("dict.add: 无 store");
-        };
-        if code.is_empty() {
-            anyhow::bail!("dict.add: code 为空（Rust 端暂未支持自动推导编码）");
-        }
-        let schema = self.engine_mgr.active_schema_id();
-        store.add_user_word(&schema, code, text, 100)?;
-        Ok(())
-    }
 
-    /// 自动造词（L）：仅当用户**分步**组成（committed_segs ≥2 段、合并 ≥2 字）才学。
-    /// 完整拼音码 = 各段码拼接；词 = 各段汉字拼接。写入临时层（需临时层，达阈值由 store 晋升路线处理）。
-    pub(crate) fn learn_phrase_on_commit(&self, state: &State) {
-        if state.committed_segs.len() < 2 {
-            return;
-        }
-        let code: String = state.committed_segs.iter().map(|(c, _)| c.as_str()).collect();
-        let text: String = state.committed_segs.iter().map(|(_, t)| t.as_str()).collect();
-        if text.chars().count() < 2 || code.is_empty() {
-            return;
-        }
-        let Some(store) = &self.store else { return };
-        let schema = self.engine_mgr.active_schema_id();
-        // add_weight/delta 取保守默认；晋升计数阈值由临时层累积达成（后续可接入 schema.learning 配置）。
-        if let Err(e) = store.learn_temp_word(&schema, &code, &text, LEARN_ADD_WEIGHT, LEARN_WEIGHT_DELTA) {
-            warn!("learn_temp_word failed: {}", e);
-        } else {
-            debug!("auto-learned phrase: {} -> {}", code, text);
-        }
-    }
 
     pub(crate) fn notify_ui_update(&self, state: &State) {
         if state.candidates.is_empty() && state.input_buffer.is_empty() {
