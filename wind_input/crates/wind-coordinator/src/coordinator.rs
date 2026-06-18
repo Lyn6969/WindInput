@@ -1469,20 +1469,7 @@ impl Coordinator {
     /// 数字后智能标点：在中文标点模式下，若 ch 在智能标点列表且光标前一字符为数字，
     /// 则该标点应按英文（半角）输出（如 "3." 不转成 "3。"）。
     fn is_smart_punct_after_digit(&self, ch: char, prev_char: u16) -> bool {
-        if !self.config.input.smart_punct_after_digit {
-            return false;
-        }
-        let list = &self.config.input.smart_punct_list;
-        let in_list = if list.is_empty() {
-            ch == '.' || ch == ','
-        } else {
-            list.contains(ch)
-        };
-        if !in_list {
-            return false;
-        }
-        // prev_char 为 UTF-16 单元（非 VK），数字 '0'..='9' = 0x30..=0x39
-        (0x30..=0x39).contains(&prev_char)
+        wind_punct::is_smart_punct_after_digit(&self.config.input, ch, prev_char)
     }
 
     /// 按当前中英标点/全半角配置转换一个标点字符为上屏文本（无 prev_char 上下文）。
@@ -1498,47 +1485,15 @@ impl Coordinator {
     ///   4. 全半角转换
     /// `prev_char` 为光标前一字符的 UTF-16 单元（0=不可用），用于数字后智能判定。
     fn convert_punct(&self, state: &State, ch: char, prev_char: u16) -> String {
-        let effective_ch_punct = state.chinese_punct;
-        let smart_en = effective_ch_punct && self.is_smart_punct_after_digit(ch, prev_char);
-        let is_chinese_punct = effective_ch_punct && !smart_en;
-
-        // 1. 自定义映射优先（四状态均可配置）。
-        if self.config.input.punct_custom.enabled {
-            let col_idx = if is_chinese_punct && state.full_width {
-                2 // 中文全角
-            } else if is_chinese_punct {
-                0 // 中文半角
-            } else if state.full_width {
-                1 // 英文全角
-            } else {
-                3 // 英文半角
-            };
-            if let Some(text) = self
-                .punct
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .lookup_custom(ch, col_idx)
-            {
-                return text;
-            }
-        }
-
-        // 2~4. 默认转换：中文标点（含引号状态机）→ 全半角。
-        let mut piece = ch.to_string();
-        if is_chinese_punct {
-            if let Some(c) = self
-                .punct
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .to_chinese(ch)
-            {
-                piece = c;
-            }
-        }
-        if state.full_width {
-            piece = to_full_width(&piece);
-        }
-        piece
+        let mut conv = self.punct.lock().unwrap_or_else(|e| e.into_inner());
+        wind_punct::convert_punct(
+            &mut conv,
+            &self.config.input,
+            state.chinese_punct,
+            state.full_width,
+            ch,
+            prev_char,
+        )
     }
 
     /// 智能符号模式判定时限（非法值回退 500ms）。
@@ -1551,14 +1506,7 @@ impl Coordinator {
     /// 纯查表读自定义标点映射的指定列（不碰转换器引号状态），供智能符号无副作用计算用。
     /// 与 `PunctuationConverter::lookup_custom` 的非引号分支等价。
     fn smart_symbol_custom_lookup(&self, ch: char, col_idx: usize) -> Option<String> {
-        let vals = self
-            .config
-            .input
-            .punct_custom
-            .mappings
-            .get(&ch.to_string())?;
-        let v = vals.get(col_idx)?;
-        if v.is_empty() { None } else { Some(v.clone()) }
+        wind_punct::custom_lookup(&self.config.input, ch, col_idx)
     }
 
     /// 无副作用地计算 `ch` 在当前模式下的标点产物，**镜像** `convert_punct` 优先级
@@ -1567,43 +1515,13 @@ impl Coordinator {
     ///   - `chinese=false`：算英文标点产物（替换用，即该键英文模式下输出）。
     /// 引号有状态、键名特殊，此处保守跳过自定义、走标准引号/英文产物。
     fn compute_punct_str_pure(&self, state: &State, ch: char, chinese: bool) -> Option<String> {
-        let full_width = state.full_width;
-        let is_quote = ch == '\'' || ch == '"';
-
-        if !is_quote && self.config.input.punct_custom.enabled {
-            let col_idx = if chinese && full_width {
-                Some(2) // 中文全角
-            } else if chinese {
-                Some(0) // 中文半角
-            } else if full_width {
-                Some(1) // 英文全角
-            } else {
-                None // 英文半角：无自定义（col 3 由 convert_punct 用，pure 计算走原样）
-            };
-            if let Some(ci) = col_idx {
-                if let Some(v) = self.smart_symbol_custom_lookup(ch, ci) {
-                    return Some(v);
-                }
-            }
-        }
-
-        let mut s = ch.to_string();
-        if chinese {
-            s = self
-                .punct
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .peek_chinese_str(ch)?;
-        }
-        if full_width {
-            s = to_full_width(&s);
-        }
-        Some(s)
+        let conv = self.punct.lock().unwrap_or_else(|e| e.into_inner());
+        wind_punct::compute_punct_str_pure(&conv, &self.config.input, state.full_width, ch, chinese)
     }
 
     /// 判断中文标点串 `cn` 是否在用户配置的参与集合内（子串包含匹配，支持多字符/引号）。
     fn smart_symbol_participates(&self, cn: &str) -> bool {
-        !cn.is_empty() && self.config.input.smart_symbol_chars.contains(cn)
+        wind_punct::participates(&self.config.input, cn)
     }
 
     /// 计算 `ch` 当前会产生的「参与集合内的中文标点串」用于武装；不参与返回 None。

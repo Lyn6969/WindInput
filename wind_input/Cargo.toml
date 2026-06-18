@@ -16,6 +16,7 @@ members = [
     "crates/wind-keys",
     "crates/wind-quick-input",
     "crates/wind-reverse",
+    "crates/wind-punct",
     "crates/wind-coordinator",
     "apps/service",
     "apps/rpc",
