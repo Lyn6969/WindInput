@@ -284,6 +284,11 @@ pub struct PopupMenu {
     /// 菜单容器位图背景 + z 层（jidian menu.root 吃九宫格 panel + 角标水印）。
     bg_image: Option<crate::view::ViewImage>,
     layers: Vec<crate::view::ViewLayer>,
+    /// 边框宽 / 圆角（设备像素，从 menu.root 节点 border 读取，px/dp 经 Dim 区分）。
+    border_w: f32,
+    radius: f32,
+    /// 主题配置的软投影（menu.root.shadow）。
+    shadow: Option<crate::view::SoftShadow>,
 }
 
 impl PopupMenu {
@@ -313,6 +318,9 @@ impl PopupMenu {
             hl_fg: HL_FG,
             bg_image: None,
             layers: Vec::new(),
+            border_w: scale, // 默认 1dp（≈1 设备像素，细边清晰）
+            radius: 6.0 * scale,
+            shadow: None,
         };
         // 预创建根窗口并绑定鼠标处理器（捕获后只有根窗口收消息）
         menu.ensure_windows(1)?;
@@ -338,12 +346,41 @@ impl PopupMenu {
         self.sep = theme.color("menu_separator", SEP);
         self.hl_bg = theme.color("menu_hover_bg", HL_BG);
         self.hl_fg = theme.color("menu_hover_text", self.fg);
+        let s = self.scale;
         if let Some(node) = &theme.views.menu_root {
             self.bg_image = crate::theme_assets::rv_image(theme, node.bg_image.as_ref());
-            self.layers = crate::theme_assets::rv_layers(theme, &node.layers, self.scale);
+            self.layers = crate::theme_assets::rv_layers(theme, &node.layers, s);
+            // 边框色/宽/圆角从 menu.root 节点读取（权威，px/dp 经 Dim 区分）；
+            // border_color 默认已带 menu_border token 兜底（resolve build 传入）。
+            if let Some(c) = node.border_color {
+                self.border = c;
+            }
+            self.border_w = node
+                .border_width
+                .map(|d| d.resolve(s, 0.0))
+                .unwrap_or(s)
+                .max(1.0);
+            self.radius = node
+                .border_radius
+                .map(|d| d.resolve(s, 0.0))
+                .unwrap_or(6.0 * s);
+            self.shadow = crate::view::SoftShadow::build(
+                node.shadow_offset_x,
+                node.shadow_offset_y,
+                node.shadow_blur,
+                node.shadow_spread,
+                node.shadow_spread_offset_x,
+                node.shadow_spread_offset_y,
+                node.shadow_color,
+                s,
+            );
         } else {
             self.bg_image = None;
             self.layers = Vec::new();
+            self.border = theme.color("menu_border", BORDER);
+            self.border_w = s;
+            self.radius = 6.0 * s;
+            self.shadow = None;
         }
     }
 
@@ -434,32 +471,61 @@ impl PopupMenu {
             return;
         }
 
-        // 逐级渲染并定位：(origin_x, origin_y, w, h, item_rects)
+        // 软投影四向扩边（与候选窗一致）：内容布局起点移到 (ml,mt)，窗口左上回移，阴影溢出。
+        // geom = 内容几何（屏幕坐标，供 place_child 链式定位）；wgeom = 窗口几何（含 margin，
+        // 供命中/写回）。命中 item_rects 为窗口相对（含 ml,mt），与 find_hit 的 screen−origin 一致。
+        let (ml, mt, mr, mb) = self.shadow.as_ref().map(|s| s.margins()).unwrap_or((0, 0, 0, 0));
         let mut geom: Vec<(i32, i32, u32, u32, Vec<(usize, Rect)>)> = Vec::with_capacity(snap.len());
+        let mut wgeom: Vec<(i32, i32, u32, u32, Vec<(usize, Rect)>)> = Vec::with_capacity(snap.len());
         for k in 0..snap.len() {
             let (items, selected) = &snap[k];
-            let (root, w, h, hits) = self.build_view(items, *selected);
-            let origin = if k == 0 {
+            let (mut root, cw, ch, content_hits) = self.build_view(items, *selected);
+            // 内容左上（屏幕）：顶层用 anchor；子级贴父内容右缘 + 高亮项纵向对齐。
+            let (cox, coy) = if k == 0 {
                 self.anchor
             } else {
                 let (pox, poy, pw, ph, prects) = &geom[k - 1];
                 let psel = snap[k - 1].1;
                 let prect = prects.iter().find(|(i, _)| *i == psel).map(|(_, r)| *r);
-                place_child((*pox, *poy), (*pw, *ph), prect, (w, h), self.scale)
+                place_child((*pox, *poy), (*pw, *ph), prect, (cw, ch), self.scale)
+            };
+            let (win_w, win_h) = (cw + ml + mr, ch + mt + mb);
+            let (wox, woy) = (cox - ml as i32, coy - mt as i32);
+            // 有阴影时把内容重排到 (ml,mt) 并重采窗口相对命中；无阴影时直接用内容命中。
+            let whits: Vec<(usize, Rect)> = if ml > 0 || mt > 0 {
+                root.layout(ml as f32, mt as f32, &self.renderer);
+                let mut raw = Vec::new();
+                root.collect_hits(&mut raw);
+                raw.iter().map(|(t, r)| (*t as usize, *r)).collect()
+            } else {
+                content_hits.clone()
             };
             // 绘制到窗口 k（拆分字段借用：renderer 与 windows 是不同字段，可并存）
             {
                 let r = &self.renderer;
                 let win = &mut self.windows[k];
-                win.resize(w, h);
+                win.resize(win_w, win_h);
                 let buf = win.buffer_mut();
-                let n = (w * h * 4) as usize;
+                let n = (win_w * win_h * 4) as usize;
                 buf[..n].fill(0);
-                root.paint(buf, w, h, r);
+                if let Some(s) = &self.shadow {
+                    s.paint(
+                        buf,
+                        win_w,
+                        win_h,
+                        ml as f32,
+                        mt as f32,
+                        cw as f32,
+                        ch as f32,
+                        root.corner_radius,
+                    );
+                }
+                root.paint(buf, win_w, win_h, r);
                 let _ = win.update();
-                win.show(origin.0, origin.1);
+                win.show(wox, woy);
             }
-            geom.push((origin.0, origin.1, w, h, hits));
+            geom.push((cox, coy, cw, ch, content_hits));
+            wgeom.push((wox, woy, win_w, win_h, whits));
         }
 
         // 隐藏多余窗口
@@ -467,10 +533,10 @@ impl PopupMenu {
             self.windows[k].hide();
         }
 
-        // 写回几何
+        // 写回几何（窗口坐标：origin/size 含 margin，item_rects 窗口相对）。
         {
             let mut st = self.state.borrow_mut();
-            for (k, (ox, oy, w, h, rects)) in geom.into_iter().enumerate() {
+            for (k, (ox, oy, w, h, rects)) in wgeom.into_iter().enumerate() {
                 if let Some(l) = st.levels.get_mut(k) {
                     l.origin = (ox, oy);
                     l.size = (w, h);
@@ -503,8 +569,8 @@ impl PopupMenu {
 
         let mut root = View::container(Layout::Column)
             .bg(self.bg)
-            .border(self.border, 1.0)
-            .radius(6.0 * s)
+            .border(self.border, self.border_w)
+            .radius(self.radius)
             .pad(Edges::all(4.0 * s));
         // 主题位图背景 + 层（jidian menu.root 吃九宫格 panel + 角标水印）。
         if let Some(img) = &self.bg_image {

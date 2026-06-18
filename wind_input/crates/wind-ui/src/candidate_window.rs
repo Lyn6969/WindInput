@@ -438,8 +438,9 @@ impl CandidateWindow {
         };
         Some(ViewImage {
             path,
-            // center：图标按原尺寸居中绘于按钮矩形内（与图片范围解耦），不随固定框拉伸变形。
-            mode: "center".into(),
+            // stretch：图标栅格化到其所在小节点尺寸（footer_fs，= 主题图标尺寸），
+            // 该小节点再居中于更大的触摸盒内，从而"图标尺寸不变、操作区放大"。
+            mode: "stretch".into(),
             slice: [0.0; 4],
             opacity: 1.0,
             tint,
@@ -647,13 +648,20 @@ impl CandidateWindow {
             // 翻页箭头：主题配了 prev/next_image（如 _base 的 chevron SVG + tint）则用图标，否则回退文字 ‹ ›。
             let prev_icon = self.arrow_icon(v.footer_bar.prev_image.as_ref(), prev_on);
             let next_icon = self.arrow_icon(v.footer_bar.next_image.as_ref(), next_on);
+            // 图标保持主题尺寸（footer_fs 方形），水平居中靠对称内边距撑到 arrow_w；
+            // 垂直靠 cross(Center) 居中于 row_h。触摸盒 = arrow_w × row_h，与图标像素范围解耦。
+            let icon_pad_x = ((arrow_w - footer_fs) * 0.5).max(0.0);
             let arrow = |icon: Option<ViewImage>, txt: &str, tag: i32, enabled: bool, hovered: bool| {
-                // 统一固定矩形按钮：图标走 center 居中绘制，文字走 text_align Center 居中。
                 let mut node = match icon {
                     Some(vi) => View::container(Layout::Row)
-                        .fixed_w(arrow_w)
                         .fixed_h(row_h)
-                        .bg_image(vi),
+                        .pad(Edges::xy(icon_pad_x, 0.0))
+                        .child(
+                            View::container(Layout::Row)
+                                .fixed_w(footer_fs)
+                                .fixed_h(footer_fs)
+                                .bg_image(vi),
+                        ),
                     None => View::leaf(txt, if enabled { accent } else { disabled })
                         .font_size(footer_fs)
                         .fixed_w(arrow_w)
