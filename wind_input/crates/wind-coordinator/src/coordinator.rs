@@ -1005,19 +1005,10 @@ impl Coordinator {
             Ok(Some(r)) => r,
             _ => return,
         };
-        if !rec.deleted.is_empty() {
-            candidates.retain(|c| !rec.deleted.iter().any(|d| d == &c.text));
-        }
-        // 按 position 升序应用，使后续插入考虑前面已就位的项
-        let mut pins = rec.pinned.clone();
-        pins.sort_by_key(|p| p.position);
-        for pin in pins {
-            if let Some(cur) = candidates.iter().position(|c| c.text == pin.word) {
-                let cand = candidates.remove(cur);
-                let at = pin.position.min(candidates.len());
-                candidates.insert(at, cand);
-            }
-        }
+        // 纯重排逻辑下沉 wind_candidate（用元组解耦，避免该 crate 依赖 wind-store）。
+        let pinned: Vec<(String, usize)> =
+            rec.pinned.iter().map(|p| (p.word.clone(), p.position)).collect();
+        wind_candidate::apply_shadow(candidates, &rec.deleted, &pinned);
     }
 
     /// 根据输入缓冲更新候选（动态分级加载：首次小批量，翻页到边界再扩展）。
