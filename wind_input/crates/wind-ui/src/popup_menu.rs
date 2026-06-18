@@ -32,6 +32,8 @@ const DISABLED: [u8; 4] = [175, 175, 178, 255];
 const BORDER: [u8; 4] = [205, 205, 208, 230];
 const SEP: [u8; 4] = [228, 228, 230, 255];
 const HL_BG: [u8; 4] = [225, 236, 252, 255];
+/// 高亮项文字色默认值（与基态 FG 同——主题可经 menu_hover_text 覆盖）。
+const HL_FG: [u8; 4] = FG;
 
 /// 无选中哨兵
 const NONE_SEL: usize = usize::MAX;
@@ -277,6 +279,8 @@ pub struct PopupMenu {
     border: [u8; 4],
     sep: [u8; 4],
     hl_bg: [u8; 4],
+    /// 高亮项文字色（menu_hover_text）：选中/悬停项文字与基态不同。
+    hl_fg: [u8; 4],
     /// 菜单容器位图背景 + z 层（jidian menu.root 吃九宫格 panel + 角标水印）。
     bg_image: Option<crate::view::ViewImage>,
     layers: Vec<crate::view::ViewLayer>,
@@ -306,6 +310,7 @@ impl PopupMenu {
             border: BORDER,
             sep: SEP,
             hl_bg: HL_BG,
+            hl_fg: HL_FG,
             bg_image: None,
             layers: Vec::new(),
         };
@@ -332,6 +337,7 @@ impl PopupMenu {
         self.border = theme.color("menu_border", BORDER);
         self.sep = theme.color("menu_separator", SEP);
         self.hl_bg = theme.color("menu_hover_bg", HL_BG);
+        self.hl_fg = theme.color("menu_hover_text", self.fg);
         if let Some(node) = &theme.views.menu_root {
             self.bg_image = crate::theme_assets::rv_image(theme, node.bg_image.as_ref());
             self.layers = crate::theme_assets::rv_layers(theme, &node.layers, self.scale);
@@ -519,7 +525,15 @@ impl PopupMenu {
                 );
                 continue;
             }
-            let color = if it.enabled { self.fg } else { self.disabled };
+            // 高亮项（选中/悬停且可用）文字用 hl_fg，否则基态 fg / 禁用色。
+            let is_hl = i == selected && it.enabled;
+            let color = if !it.enabled {
+                self.disabled
+            } else if is_hl {
+                self.hl_fg
+            } else {
+                self.fg
+            };
             let mut item = View::container(Layout::Row)
                 .fixed_w(item_w)
                 .fixed_h(item_h)
@@ -528,7 +542,7 @@ impl PopupMenu {
                 .cross(Align::Center)
                 .tag(i as i32)
                 .child(View::leaf(row_text(it), color));
-            if i == selected && it.enabled {
+            if is_hl {
                 item = item.bg(self.hl_bg);
             }
             root = root.child(item);

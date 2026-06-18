@@ -371,34 +371,25 @@ impl View {
     /// 递归绘制到 BGRA 缓冲区
     pub fn paint(&self, buf: &mut [u8], buf_w: u32, buf_h: u32, tr: &TextRenderer) {
         let r = self.rect;
-        // 背景 + 边框
-        match (self.bg, self.border) {
-            (Some(bg), Some((bc, bw))) => {
-                fill_rounded(buf, buf_w, buf_h, r.x, r.y, r.w, r.h, bc, self.corner_radius);
-                let inr = (self.corner_radius - bw).max(0.0);
-                fill_rounded(
-                    buf,
-                    buf_w,
-                    buf_h,
-                    r.x + bw,
-                    r.y + bw,
-                    (r.w - bw * 2.0).max(0.0),
-                    (r.h - bw * 2.0).max(0.0),
-                    bg,
-                    inr,
-                );
-            }
-            (Some(bg), None) => {
-                fill_rounded(buf, buf_w, buf_h, r.x, r.y, r.w, r.h, bg, self.corner_radius);
-            }
-            (None, Some((bc, bw))) => {
-                fill_rounded(buf, buf_w, buf_h, r.x, r.y, r.w, r.h, bc, self.corner_radius);
-                let inr = (self.corner_radius - bw).max(0.0);
-                // 仅描边：内部不填（保留已有背景）——此处简化为不支持纯描边镂空，
-                // 调用方需要透明镂空边框时应配合外层背景。当前候选窗边框始终配 bg。
-                let _ = inr;
-            }
-            (None, None) => {}
+        // 背景 + 边框：先铺底色（满圆角矩形），再画 even-odd 描边环覆盖外缘 bw 宽。
+        // 边框作为干净描边环绘制（粗细恒为 bw、内外各一条 AA），不再用内/外两次填充
+        // （旧法 AA 在边框/底色交界处双重混合致软边、且无法画镂空边框）。
+        if let Some(bg) = self.bg {
+            fill_rounded(buf, buf_w, buf_h, r.x, r.y, r.w, r.h, bg, self.corner_radius);
+        }
+        if let Some((bc, bw)) = self.border {
+            fill_ring(
+                buf,
+                buf_w,
+                buf_h,
+                r.x,
+                r.y,
+                r.w,
+                r.h,
+                bc,
+                self.corner_radius,
+                bw,
+            );
         }
         // 背景填充图（叠在底色上，裁到圆角内）。
         if let Some(img) = &self.bg_image {
@@ -777,25 +768,83 @@ fn box_blur_alpha(a: &mut [u8], w: i32, h: i32, r: i32) {
     }
 }
 
+/// 向 PathBuilder 追加一个圆角矩形子路径（radius 自动钳制到 min(w,h)/2；为 0 时退化为直角矩形）。
+fn push_round_rect(pb: &mut PathBuilder, x: f32, y: f32, w: f32, h: f32, radius: f32) {
+    if w <= 0.0 || h <= 0.0 {
+        return;
+    }
+    let r = radius.min(w * 0.5).min(h * 0.5).max(0.0);
+    if r <= 0.0 {
+        if let Some(rect) = tiny_skia::Rect::from_xywh(x, y, w, h) {
+            pb.push_rect(rect);
+        }
+        return;
+    }
+    let (l, t, rt, b) = (x, y, x + w, y + h);
+    let k = r * KAPPA;
+    pb.move_to(l + r, t);
+    pb.line_to(rt - r, t);
+    pb.cubic_to(rt - r + k, t, rt, t + r - k, rt, t + r);
+    pb.line_to(rt, b - r);
+    pb.cubic_to(rt, b - r + k, rt - r + k, b, rt - r, b);
+    pb.line_to(l + r, b);
+    pb.cubic_to(l + r - k, b, l, b - r + k, l, b - r);
+    pb.line_to(l, t + r);
+    pb.cubic_to(l, t + r - k, l + r - k, t, l + r, t);
+    pb.close();
+}
+
 /// 构造圆角矩形路径（radius 自动钳制到 min(w,h)/2；为 0 时退化为直角矩形）。
 fn round_rect_path(x: f32, y: f32, w: f32, h: f32, radius: f32) -> Option<tiny_skia::Path> {
-    let r = radius.min(w * 0.5).min(h * 0.5).max(0.0);
     let mut pb = PathBuilder::new();
-    if r <= 0.0 {
-        pb.push_rect(tiny_skia::Rect::from_xywh(x, y, w, h)?);
-    } else {
-        let (l, t, rt, b) = (x, y, x + w, y + h);
-        let k = r * KAPPA;
-        pb.move_to(l + r, t);
-        pb.line_to(rt - r, t);
-        pb.cubic_to(rt - r + k, t, rt, t + r - k, rt, t + r);
-        pb.line_to(rt, b - r);
-        pb.cubic_to(rt, b - r + k, rt - r + k, b, rt - r, b);
-        pb.line_to(l + r, b);
-        pb.cubic_to(l + r - k, b, l, b - r + k, l, b - r);
-        pb.line_to(l, t + r);
-        pb.cubic_to(l, t + r - k, l + r - k, t, l + r, t);
-        pb.close();
-    }
+    push_round_rect(&mut pb, x, y, w, h, radius);
     pb.finish()
+}
+
+/// 圆角矩形描边环（外圈 − 内圈，even-odd 单次填充）：粗细恒为 bw、内外各一条干净 AA，
+/// 对齐 Go 的边框画法（避免中心描边 AA 渗色致粗细不均）。透明内部也适用。
+/// color 为 [R,G,B,A]，缓冲预乘 BGRA（同 fill_rounded 换 R/B）。
+pub fn fill_ring(
+    buf: &mut [u8],
+    buf_w: u32,
+    buf_h: u32,
+    x: f32,
+    y: f32,
+    w: f32,
+    h: f32,
+    color: [u8; 4],
+    radius: f32,
+    bw: f32,
+) {
+    if color[3] == 0 || bw <= 0.0 || buf_w == 0 || buf_h == 0 {
+        return;
+    }
+    let x = x.round();
+    let y = y.round();
+    let w = w.round();
+    let h = h.round();
+    if w <= 0.0 || h <= 0.0 {
+        return;
+    }
+    let radius = radius.round().max(0.0);
+    let mut pb = PathBuilder::new();
+    push_round_rect(&mut pb, x, y, w, h, radius); // 外圈
+    push_round_rect(
+        &mut pb,
+        x + bw,
+        y + bw,
+        w - 2.0 * bw,
+        h - 2.0 * bw,
+        (radius - bw).max(0.0),
+    ); // 内圈（even-odd 挖空）
+    let Some(path) = pb.finish() else {
+        return;
+    };
+    let Some(mut pm) = PixmapMut::from_bytes(buf, buf_w, buf_h) else {
+        return;
+    };
+    let mut paint = Paint::default();
+    paint.anti_alias = true;
+    paint.set_color(Color::from_rgba8(color[2], color[1], color[0], color[3]));
+    pm.fill_path(&path, &paint, FillRule::EvenOdd, Transform::identity(), None);
 }

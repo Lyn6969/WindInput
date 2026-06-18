@@ -505,6 +505,18 @@ impl CandidateWindow {
         let patch_bg = |p: &Option<Box<RvNode>>, d: [u8; 4]| {
             p.as_ref().and_then(|n| n.bg_color).unwrap_or(d)
         };
+        // 状态文字色（与 Go effectiveNode 对齐）：选中优先于悬停；选中/悬停 patch 未给文字色
+        // → 回退基态色（不跨态借色）。index/text/comment 同一套消费。
+        let eff_text = |node: &RvNode, base: [u8; 4], sel: bool, hov: bool| -> [u8; 4] {
+            let st = if sel {
+                node.selected.as_deref()
+            } else if hov {
+                node.hover.as_deref()
+            } else {
+                None
+            };
+            st.and_then(|n| n.text_color).unwrap_or(base)
+        };
 
         let mut root = View::container(Layout::Column)
             .bg(col(v.window.bg_color, [255, 255, 255, 255]))
@@ -542,20 +554,13 @@ impl CandidateWindow {
             );
         }
 
-        // 候选项颜色（基态 + 选中态）。
+        // 候选项颜色（基态）。状态色（选中/悬停）逐项经 eff_text 计算。
         let text_color = col(v.text.text_color, [30, 30, 30, 255]);
-        let sel_text = v
-            .text
-            .selected
-            .as_ref()
-            .and_then(|n| n.text_color)
-            .unwrap_or([30, 30, 30, 255]);
         let sel_bg = patch_bg(&v.item.selected, [230, 240, 255, 255]);
         let hover_bg = patch_bg(&v.item.hover, [238, 242, 247, 255]);
         let index_color = col(v.index.text_color, [66, 133, 244, 255]);
         let comment_color = col(v.comment.text_color, [150, 150, 150, 255]);
         let comment_fs = node_fs(&v.comment);
-        let comment_margin_l = dim(v.comment.margin.left, 6.0);
         let index_circle = v.index.bg_shape == "circle";
         let index_circle_bg = col(v.index.bg_color, [66, 133, 244, 255]);
         let text_margin_l = dim(v.text.margin.left, 4.0);
@@ -580,10 +585,15 @@ impl CandidateWindow {
             };
             let is_sel = i == self.selected;
             let is_hover = self.hover >= 0 && self.hover as usize == i;
-            let txt_color = if is_sel { sel_text } else { text_color };
+            // 状态文字色（选中/悬停各自的色，回退基态）。
+            let txt_color = eff_text(&v.text, text_color, is_sel, is_hover);
+            let idx_color = eff_text(&v.index, index_color, is_sel, is_hover);
+            let cmt_color = eff_text(&v.comment, comment_color, is_sel, is_hover);
 
             // 序号：圆圈样式 → 方形节点 + 真圆背景 + 居中数字。
-            let mut idx_leaf = View::leaf(marker, index_color).font_size(index_fs);
+            let mut idx_leaf = View::leaf(marker, idx_color)
+                .font_size(index_fs)
+                .pad(edges_or(&v.index.padding, [0.0; 4]));
             if index_circle {
                 let d = (index_fs * 1.5).round();
                 idx_leaf = idx_leaf
@@ -600,16 +610,19 @@ impl CandidateWindow {
                 .radius(item_radius)
                 .tag(i as i32)
                 .child(idx_leaf)
-                .child(View::leaf(cand.text.clone(), txt_color).font_size(text_fs));
+                .child(
+                    View::leaf(cand.text.clone(), txt_color)
+                        .font_size(text_fs)
+                        .pad(edges_or(&v.text.padding, [0.0; 4])),
+                );
             // 注释（编码后缀/短语提示）：非空时在候选词右侧以注释样式内联显示。
+            // 内/外边距完整消费：comment.padding 四边 + comment.margin 四边（左默认 6dp 兜底间距）。
             if !cand.comment.is_empty() {
                 item = item.child(
-                    View::leaf(cand.comment.clone(), comment_color)
+                    View::leaf(cand.comment.clone(), cmt_color)
                         .font_size(comment_fs)
-                        .margin(Edges {
-                            l: comment_margin_l,
-                            ..Edges::default()
-                        }),
+                        .pad(edges_or(&v.comment.padding, [0.0; 4]))
+                        .margin(edges_or(&v.comment.margin, [0.0, 0.0, 0.0, 6.0])),
                 );
             }
             // 选中底色优先于悬停底色（两者独立：选中=空格上屏目标，悬停=鼠标提示）
@@ -655,8 +668,9 @@ impl CandidateWindow {
                         View::leaf(txt, if enabled { accent } else { disabled }).font_size(footer_fs)
                     }
                 };
+                // 命中区域 = 节点矩形（含 padding）。加大内边距让翻页箭头更易点中/触摸。
                 node = node
-                    .pad(Edges::xy(gap * 1.2, gap * 0.5))
+                    .pad(Edges::xy((gap * 2.5).max(11.0 * s), (gap * 1.5).max(8.0 * s)))
                     .radius(item_radius)
                     .cross(Align::Center);
                 if enabled {
