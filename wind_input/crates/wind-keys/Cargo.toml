@@ -1,0 +1,12 @@
+[package]
+name = "wind-keys"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+wind-cmdbar = { path = "../wind-cmdbar" }
+anyhow = { workspace = true }
+tracing = { workspace = true }
+
+[target.'cfg(windows)'.dependencies]
+windows = { workspace = true }

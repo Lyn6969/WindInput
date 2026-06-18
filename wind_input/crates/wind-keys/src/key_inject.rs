@@ -77,8 +77,8 @@ fn parse_key(name: &str) -> Option<u32> {
     Some(vk)
 }
 
-/// `SendInput` 后端的 KeyInjector。
-pub(crate) struct SysKeys;
+/// `SendInput` 后端的 KeyInjector（宿主经 wind-cmdbar 的 KeyInjector trait 使用）。
+pub struct SysKeys;
 
 impl KeyInjector for SysKeys {
     fn tap(&self, combo: &str) -> anyhow::Result<()> {
@@ -192,14 +192,35 @@ fn type_unicode(text: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
-#[cfg(not(windows))]
+// ───────────────────────── macOS 预留（待接入 Core Graphics）─────────────────────────
+// macOS 按键注入用 Core Graphics 事件：
+//   - send_key → `CGEventCreateKeyboardEvent(src, keycode, keydown)` + `CGEventPost(kCGHIDEventTap, ev)`
+//     注意 macOS 用的是 CGKeyCode（ANSI 键位码），与此处的 Win32 VK 不同，需要一张 VK→CGKeyCode
+//     映射表（或改用 keymap 直接产出 CGKeyCode）。
+//   - type_unicode → `CGEventKeyboardSetUnicodeString(ev, len, buf)` 直接发 UTF-16。
+// 接入时把下面两个桩替换为 `#[cfg(target_os = "macos")]` 的真实现（依赖 `core-graphics` crate）。
+
+#[cfg(target_os = "macos")]
 fn send_key(_vk: u32, _up: bool) -> anyhow::Result<()> {
-    anyhow::bail!("key 注入：非 Windows 平台暂未支持")
+    // TODO(macos): CGEventCreateKeyboardEvent + CGEventPost（需 VK→CGKeyCode 映射）。
+    anyhow::bail!("key 注入：macOS 待接入 Core Graphics（CGEvent）")
 }
 
-#[cfg(not(windows))]
+#[cfg(target_os = "macos")]
 fn type_unicode(_text: &str) -> anyhow::Result<()> {
-    anyhow::bail!("key.type：非 Windows 平台暂未支持")
+    // TODO(macos): CGEventKeyboardSetUnicodeString。
+    anyhow::bail!("key.type：macOS 待接入 Core Graphics（CGEvent）")
+}
+
+// 其他 Unix（Linux 等）：无统一按键注入通道，保持 no-op 桩。
+#[cfg(not(any(windows, target_os = "macos")))]
+fn send_key(_vk: u32, _up: bool) -> anyhow::Result<()> {
+    anyhow::bail!("key 注入：当前平台暂未支持")
+}
+
+#[cfg(not(any(windows, target_os = "macos")))]
+fn type_unicode(_text: &str) -> anyhow::Result<()> {
+    anyhow::bail!("key.type：当前平台暂未支持")
 }
 
 #[cfg(test)]

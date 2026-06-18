@@ -10,7 +10,7 @@
 //!
 //! 候选生成委托给 [`EngineManager`]，运行时词频 boost + 最终排序在本层应用。
 
-use crate::keymap;
+use wind_keys::keymap;
 use crate::pipeline::{ModeKind, Rewind};
 use std::path::Path;
 use std::sync::{Arc, Mutex};

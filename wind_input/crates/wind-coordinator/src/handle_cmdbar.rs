@@ -34,7 +34,7 @@ impl Coordinator {
         svc.proc = Some(Arc::new(StdProc));
         svc.open = Some(Arc::new(ShellOpener));
         svc.clip = Some(Arc::new(SysClip));
-        svc.keys = Some(Arc::new(crate::key_inject::SysKeys));
+        svc.keys = Some(Arc::new(wind_keys::key_inject::SysKeys));
         // search/config/setting：经 open 默认可用 / 配置能力待补，留 None。
         let _ = self.cmdbar_services.set(svc);
     }
@@ -237,13 +237,24 @@ fn open_target(target: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
-#[cfg(not(windows))]
+#[cfg(target_os = "macos")]
+fn open_target(target: &str) -> anyhow::Result<()> {
+    // macOS 用 `open` 打开 URL/文件/应用。
+    Command::new("open").arg(target).spawn()?;
+    Ok(())
+}
+
+#[cfg(not(any(windows, target_os = "macos")))]
 fn open_target(target: &str) -> anyhow::Result<()> {
     Command::new("xdg-open").arg(target).spawn()?;
     Ok(())
 }
 
-/// 系统剪贴板写入（clip.copy）。读/粘贴需平台读剪贴板或按键注入，暂未支持。
+/// 系统剪贴板写入（clip.copy）。读/粘贴需平台读剪贴板或按键注入。
+///
+/// **macOS 预留**：set_text/get_text 接 `NSPasteboard`（`general` → `setString:forType:` /
+/// `stringForType:`，类型 `NSPasteboardTypeString`，可用 `objc2`/`cocoa` crate）；paste 用
+/// 合成 ⌘V（见下方 cfg 分支）。
 struct SysClip;
 
 impl ClipboardService for SysClip {
@@ -255,16 +266,26 @@ impl ClipboardService for SysClip {
         }
         #[cfg(not(windows))]
         {
+            // TODO(macos): NSPasteboard general setString。其他 Unix 暂无统一通道。
             let _ = text;
-            anyhow::bail!("clip.copy: 非 Windows 平台暂未支持")
+            anyhow::bail!("clip.copy: 当前平台暂未支持（macOS 待接 NSPasteboard）")
         }
     }
     fn get_text(&self) -> anyhow::Result<String> {
+        // TODO(macos): NSPasteboard general stringForType。
         anyhow::bail!("clip get: 暂未支持（待平台读剪贴板）")
     }
     fn paste(&self) -> anyhow::Result<()> {
-        // 经按键注入合成 Ctrl+V（与 Go Windows 实现一致）。
+        // 经按键注入合成粘贴热键：Windows/Linux Ctrl+V，macOS ⌘V（Cmd 经 vk:0x37 LeftCmd）。
         use wind_cmdbar::KeyInjector;
-        crate::key_inject::SysKeys.tap("Ctrl+v")
+        #[cfg(target_os = "macos")]
+        {
+            // TODO(macos): 待 key 注入接入 CGEvent 后，用 Cmd+V（此处先占位组合）。
+            wind_keys::key_inject::SysKeys.tap("vk:0x37+v")
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            wind_keys::key_inject::SysKeys.tap("Ctrl+v")
+        }
     }
 }

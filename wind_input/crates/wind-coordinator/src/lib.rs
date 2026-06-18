@@ -14,8 +14,6 @@ pub mod handle_punct;
 pub mod handle_temp;
 pub mod handle_tooltip;
 pub mod hotkey_match;
-pub mod key_inject;
-pub mod keymap;
 pub mod pipeline;
 pub mod quick_input;
 pub mod reverse;
