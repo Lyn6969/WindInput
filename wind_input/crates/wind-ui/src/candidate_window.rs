@@ -227,19 +227,21 @@ impl CandidateWindow {
         let mut root = self.build_tree();
         let t_build = t_start.elapsed();
 
+        // 窗口投影：高斯软影四向扩边（与 Go shadowMargins 对齐），内容布局起点平移到 (ml, mt)，
+        // 窗口显示位置再左上回移 (ml, mt) → 视觉锚点/命中坐标与无阴影时一致，阴影四面溢出。
+        let shadow = self.shadow_params();
+        let (ml, mt, mr, mb) = match &shadow {
+            Some(s) => s.margins(),
+            None => (0, 0, 0, 0),
+        };
+
         let t_layout0 = Instant::now();
-        root.layout(0.0, 0.0, &self.text_renderer);
+        root.layout(ml as f32, mt as f32, &self.text_renderer);
         let (w_f, h_f) = root.measured_size();
         let content_w = (w_f.ceil() as u32).max(40);
         let content_h = (h_f.ceil() as u32).max(24);
-        // 窗口投影：仅向右/下扩展缓冲（offset 取非负），内容仍绘于 (0,0)，故定位/命中不变。
-        let shadow = self.shadow_params();
-        let (ext_r, ext_b) = match shadow {
-            Some((ox, oy, blur, _)) => ((ox + blur).ceil() as u32, (oy + blur).ceil() as u32),
-            None => (0, 0),
-        };
-        let width = content_w + ext_r;
-        let height = content_h + ext_b;
+        let width = content_w + ml + mr;
+        let height = content_h + mt + mb;
         let t_layout = t_layout0.elapsed();
 
         // 收集候选命中矩形并同步给鼠标处理器
@@ -259,8 +261,8 @@ impl CandidateWindow {
             let buf = self.window.buffer_mut();
             let buf_size = (width * height * 4) as usize;
             buf[..buf_size].fill(0);
-            // 先画投影（在内容下方），再画内容覆盖其上。
-            if let Some((ox, oy, blur, color)) = shadow {
+            // 先画投影（在内容下方），再画内容覆盖其上。内容盒左上 = (ml, mt)。
+            if let Some(s) = &shadow {
                 let radius = self
                     .theme
                     .views
@@ -268,9 +270,20 @@ impl CandidateWindow {
                     .border_radius
                     .map(|d| d.resolve(self.scale, 0.0))
                     .unwrap_or(8.0 * self.scale);
-                paint_soft_shadow(
-                    buf, width, height, ox, oy, content_w as f32, content_h as f32, radius, blur,
-                    color,
+                crate::view::paint_blur_shadow(
+                    buf,
+                    width,
+                    height,
+                    ml as f32,
+                    mt as f32,
+                    content_w as f32,
+                    content_h as f32,
+                    radius,
+                    s.blur,
+                    s.spread,
+                    s.off_x(),
+                    s.off_y(),
+                    s.color,
                 );
             }
             root.paint(buf, width, height, &self.text_renderer);
@@ -292,16 +305,24 @@ impl CandidateWindow {
         // 位置锚定：组合期间固定——锚点一旦按有效坐标锁定，打字/悬停/翻页刷新都复用，
         // 避免窗口随光标/刷新漂移。首次连接尚无有效坐标时，锚点为"临时"，
         // 待有效坐标到达再重锚（避免卡在左上角不恢复）。
+        // anchor 存内容盒左上（与无阴影时一致，blur/spread 变化不影响锚点）。
         let keep = self.visible && self.anchor_locked && self.anchor.is_some();
         let (px, py) = if keep {
             self.anchor.unwrap()
         } else {
-            let p = Self::clamp_to_work_area(self.x, self.y, self.caret_height, width, height);
+            let p = Self::clamp_to_work_area(
+                self.x,
+                self.y,
+                self.caret_height,
+                content_w,
+                content_h,
+            );
             self.anchor = Some(p);
             self.anchor_locked = self.caret_valid; // 仅有效坐标才锁定
             p
         };
-        self.window.show(px, py);
+        // 窗口实际左上 = 内容锚点 − 左/上 margin，使内容仍落在锚点处，阴影向四周溢出。
+        self.window.show(px - ml as i32, py - mt as i32);
         self.visible = true;
         let t_tip0 = Instant::now();
         self.update_tooltip(px, py);
@@ -385,21 +406,35 @@ impl CandidateWindow {
         (x, y)
     }
 
-    /// 窗口投影参数 (offset_x, offset_y, blur, color)：offset 取非负（向右下）；
-    /// 无色/全透明/零偏移零模糊 → None（不画投影）。
-    fn shadow_params(&self) -> Option<(f32, f32, f32, [u8; 4])> {
+    /// 窗口投影参数（设备像素，已 ×DPI）。offset 可为负（阴影偏向左/上）；
+    /// 扩散层额外偏移叠加在基础 offset 之上。无色/全透明/零模糊零扩散零偏移 → None。
+    fn shadow_params(&self) -> Option<ShadowSpec> {
         let v = &self.theme.views;
         let s = self.scale;
         let color = v.shadow_color?;
         if color[3] == 0 {
             return None;
         }
-        let r = |d: Option<wind_theme::schema::Dim>| d.map(|x| x.resolve(s, 0.0)).unwrap_or(0.0).max(0.0);
-        let (ox, oy, blur) = (r(v.shadow_offset_x), r(v.shadow_offset_y), r(v.shadow_blur));
-        if ox + oy + blur <= 0.0 {
+        // 偏移可负（保号）；blur/spread 取非负。
+        let signed = |d: Option<wind_theme::schema::Dim>| d.map(|x| x.resolve(s, 0.0)).unwrap_or(0.0);
+        let nonneg = |d: Option<wind_theme::schema::Dim>| signed(d).max(0.0);
+        let spec = ShadowSpec {
+            ox: signed(v.shadow_offset_x),
+            oy: signed(v.shadow_offset_y),
+            blur: nonneg(v.shadow_blur),
+            spread: nonneg(v.shadow_spread),
+            sox: signed(v.shadow_spread_offset_x),
+            soy: signed(v.shadow_spread_offset_y),
+            color,
+        };
+        if spec.blur <= 0.0
+            && spec.spread <= 0.0
+            && spec.off_x() == 0.0
+            && spec.off_y() == 0.0
+        {
             return None;
         }
-        Some((ox, oy, blur, color))
+        Some(spec)
     }
 
     /// 把 image ref 解析为可读绝对路径（委托共享 theme_assets）。
@@ -762,37 +797,38 @@ impl CandidateMouse {
     }
 }
 
-/// 羽化窗口投影近似：blur 分层向外扩张、alpha 均摊（源覆盖叠加近似柔边）；blur=0 时单层硬投影。
-/// 仅画在内容左上之外的右/下区域可见（内容随后覆盖其上）。
-#[allow(clippy::too_many_arguments)]
-fn paint_soft_shadow(
-    buf: &mut [u8],
-    w: u32,
-    h: u32,
+/// 窗口投影参数（设备像素）。模糊扩散层总偏移 = 基础 offset + 扩散额外偏移。
+struct ShadowSpec {
     ox: f32,
     oy: f32,
-    cw: f32,
-    ch: f32,
-    radius: f32,
     blur: f32,
+    spread: f32,
+    sox: f32,
+    soy: f32,
     color: [u8; 4],
-) {
-    let steps = (blur.round() as i32).clamp(1, 8);
-    let a = (color[3] as f32 / steps as f32).round().clamp(1.0, 255.0) as u8;
-    let c = [color[0], color[1], color[2], a];
-    for k in 0..steps {
-        let grow = k as f32;
-        crate::view::fill_rounded(
-            buf,
-            w,
-            h,
-            (ox - grow).max(0.0),
-            (oy - grow).max(0.0),
-            cw + 2.0 * grow,
-            ch + 2.0 * grow,
-            c,
-            radius + grow,
-        );
+}
+
+impl ShadowSpec {
+    /// 模糊扩散层在 X 方向的总偏移（基础 + 扩散额外）。
+    fn off_x(&self) -> f32 {
+        self.ox + self.sox
+    }
+    /// 模糊扩散层在 Y 方向的总偏移。
+    fn off_y(&self) -> f32 {
+        self.oy + self.soy
+    }
+
+    /// 四向缓冲扩边 (left, top, right, bottom)（与 Go shadowMargins 对齐）：
+    /// base = ceil(3σ)+2 + spread，再按总偏移正负分配到右下/左上。
+    fn margins(&self) -> (u32, u32, u32, u32) {
+        let sigma = (self.blur * (self.blur + 2.0)).max(0.0).sqrt();
+        let base = (3.0 * sigma).ceil() + 2.0 + self.spread;
+        let (ox, oy) = (self.off_x(), self.off_y());
+        let ml = (base + (-ox).max(0.0)).ceil() as u32;
+        let mt = (base + (-oy).max(0.0)).ceil() as u32;
+        let mr = (base + ox.max(0.0)).ceil() as u32;
+        let mb = (base + oy.max(0.0)).ceil() as u32;
+        (ml, mt, mr, mb)
     }
 }
 

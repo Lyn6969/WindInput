@@ -217,13 +217,16 @@ pub struct ViewFill {
     pub gradient: Option<ViewGradient>,
 }
 
-/// 结构化窗口投影。blur/spread 预留（暂不渲染）。
+/// 结构化窗口投影。blur 经高斯软影渲染；spread 扩张阴影盒。
 #[derive(Deserialize, Debug, Default, Clone)]
 pub struct ViewShadow {
     pub offset_x: Option<Dim>,
     pub offset_y: Option<Dim>,
     pub blur: Option<Dim>,
     pub spread: Option<Dim>,
+    /// 仅作用于模糊扩散层的额外偏移（叠加在 offset_x/offset_y 之上）。
+    pub spread_offset_x: Option<Dim>,
+    pub spread_offset_y: Option<Dim>,
     pub color: Option<Ld>,
 }
 

@@ -629,6 +629,154 @@ pub fn fill_circle(buf: &mut [u8], buf_w: u32, buf_h: u32, cx: f32, cy: f32, r: 
     pm.fill_path(&path, &paint, FillRule::Winding, Transform::identity(), None);
 }
 
+/// 高斯软投影（对齐 Go paintBlurredShadow）：在临时缓冲画 spread 扩张的圆角矩形，
+/// alpha 通道做 3 次方框模糊逼近高斯，着色后预乘 src-over 合成到主 BGRA 缓冲。
+/// (box_x, box_y, box_w, box_h) 为内容盒在主缓冲中的几何（不含 spread/offset）；
+/// off_x/off_y 为阴影总偏移（基础 + 扩散额外偏移之和）。
+#[allow(clippy::too_many_arguments)]
+pub fn paint_blur_shadow(
+    buf: &mut [u8],
+    buf_w: u32,
+    buf_h: u32,
+    box_x: f32,
+    box_y: f32,
+    box_w: f32,
+    box_h: f32,
+    radius: f32,
+    blur: f32,
+    spread: f32,
+    off_x: f32,
+    off_y: f32,
+    color: [u8; 4],
+) {
+    if color[3] == 0 || buf_w == 0 || buf_h == 0 {
+        return;
+    }
+    // 扩散后阴影盒（内容盒 ±spread，再加总偏移）
+    let bw = box_w + 2.0 * spread;
+    let bh = box_h + 2.0 * spread;
+    let bx = box_x + off_x - spread;
+    let by = box_y + off_y - spread;
+    if bw <= 0.0 || bh <= 0.0 {
+        return;
+    }
+    // 3 次方框模糊级联 sigma ≈ sqrt(blur*(blur+2))，3-sigma 需约 3×sigma px 衰减到透明。
+    let sigma = (blur * (blur + 2.0)).max(0.0).sqrt();
+    let pad = (3.0 * sigma).ceil() as i32 + 2;
+    let tmp_w = bw.ceil() as i32 + 2 * pad;
+    let tmp_h = bh.ceil() as i32 + 2 * pad;
+    if tmp_w < 1 || tmp_h < 1 {
+        return;
+    }
+    // 临时盒内阴影左上（保留亚像素偏移维持 AA）
+    let local_x = pad as f32 + (bx - bx.floor());
+    let local_y = pad as f32 + (by - by.floor());
+
+    let mut tmp = vec![0u8; (tmp_w * tmp_h * 4) as usize];
+    {
+        let Some(mut pm) = PixmapMut::from_bytes(&mut tmp, tmp_w as u32, tmp_h as u32) else {
+            return;
+        };
+        let Some(path) = round_rect_path(local_x, local_y, bw, bh, radius.max(0.0)) else {
+            return;
+        };
+        let mut paint = Paint::default();
+        paint.anti_alias = true;
+        paint.set_color(Color::from_rgba8(0, 0, 0, 255));
+        pm.fill_path(&path, &paint, FillRule::Winding, Transform::identity(), None);
+    }
+
+    // 提取 alpha 通道 → 3× 方框模糊
+    let n = (tmp_w * tmp_h) as usize;
+    let mut alpha = vec![0u8; n];
+    for (i, a) in alpha.iter_mut().enumerate() {
+        *a = tmp[i * 4 + 3];
+    }
+    let r = blur.round() as i32;
+    if r > 0 {
+        for _ in 0..3 {
+            box_blur_alpha(&mut alpha, tmp_w, tmp_h, r);
+        }
+    }
+
+    // 着色 + 预乘 src-over 合成到主缓冲（主缓冲为 BGRA：0=B,1=G,2=R,3=A；color 为 [R,G,B,A]）
+    let dst_x0 = bx.floor() as i32 - pad;
+    let dst_y0 = by.floor() as i32 - pad;
+    let (cr, cg, cb, ca) = (
+        color[0] as u32,
+        color[1] as u32,
+        color[2] as u32,
+        color[3] as u32,
+    );
+    for ty in 0..tmp_h {
+        for tx in 0..tmp_w {
+            let ma = alpha[(ty * tmp_w + tx) as usize] as u32;
+            if ma == 0 {
+                continue;
+            }
+            let fa = ma * ca / 255; // 最终 alpha
+            if fa == 0 {
+                continue;
+            }
+            let dx = dst_x0 + tx;
+            let dy = dst_y0 + ty;
+            if dx < 0 || dx >= buf_w as i32 || dy < 0 || dy >= buf_h as i32 {
+                continue;
+            }
+            let off = ((dy * buf_w as i32 + dx) * 4) as usize;
+            let inv = 255 - fa;
+            let sb = cb * fa / 255;
+            let sg = cg * fa / 255;
+            let sr = cr * fa / 255;
+            buf[off] = ((sb * 255 + buf[off] as u32 * inv) / 255) as u8;
+            buf[off + 1] = ((sg * 255 + buf[off + 1] as u32 * inv) / 255) as u8;
+            buf[off + 2] = ((sr * 255 + buf[off + 2] as u32 * inv) / 255) as u8;
+            buf[off + 3] = ((fa * 255 + buf[off + 3] as u32 * inv) / 255) as u8;
+        }
+    }
+}
+
+/// 对 alpha 缓冲做一次可分离方框模糊（水平 + 垂直），边界取延伸（clamp）。三次调用逼近高斯。
+fn box_blur_alpha(a: &mut [u8], w: i32, h: i32, r: i32) {
+    if r <= 0 || w <= 0 || h <= 0 {
+        return;
+    }
+    let win = (2 * r + 1) as u32;
+    let mut tmp = vec![0u8; a.len()];
+    // 水平
+    for y in 0..h {
+        let row = (y * w) as usize;
+        let mut sum: u32 = 0;
+        for k in -r..=r {
+            let xi = k.clamp(0, w - 1) as usize;
+            sum += a[row + xi] as u32;
+        }
+        for x in 0..w {
+            tmp[row + x as usize] = (sum / win) as u8;
+            let x_in = (x + r + 1).clamp(0, w - 1) as usize;
+            let x_out = (x - r).clamp(0, w - 1) as usize;
+            sum += a[row + x_in] as u32;
+            sum -= a[row + x_out] as u32;
+        }
+    }
+    // 垂直
+    for x in 0..w {
+        let xi = x as usize;
+        let mut sum: u32 = 0;
+        for k in -r..=r {
+            let yi = k.clamp(0, h - 1);
+            sum += tmp[(yi * w) as usize + xi] as u32;
+        }
+        for y in 0..h {
+            a[(y * w) as usize + xi] = (sum / win) as u8;
+            let y_in = (y + r + 1).clamp(0, h - 1);
+            let y_out = (y - r).clamp(0, h - 1);
+            sum += tmp[(y_in * w) as usize + xi] as u32;
+            sum -= tmp[(y_out * w) as usize + xi] as u32;
+        }
+    }
+}
+
 /// 构造圆角矩形路径（radius 自动钳制到 min(w,h)/2；为 0 时退化为直角矩形）。
 fn round_rect_path(x: f32, y: f32, w: f32, h: f32, radius: f32) -> Option<tiny_skia::Path> {
     let r = radius.min(w * 0.5).min(h * 0.5).max(0.0);

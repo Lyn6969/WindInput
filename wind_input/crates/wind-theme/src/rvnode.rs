@@ -107,6 +107,9 @@ pub struct RvNode {
     pub shadow_offset_y: Option<Dim>,
     pub shadow_blur: Option<Dim>,
     pub shadow_spread: Option<Dim>,
+    /// 仅模糊扩散层的额外偏移（叠加在 shadow_offset_x/y 之上）。
+    pub shadow_spread_offset_x: Option<Dim>,
+    pub shadow_spread_offset_y: Option<Dim>,
     pub shadow_color: Option<Rgba>,
     /// 状态 patch（递归）。仅合并色/图/边框/字体/层，不合并几何（state_geometry unsupported）。
     pub selected: Option<Box<RvNode>>,
@@ -146,5 +149,8 @@ pub struct RvViews {
     pub shadow_offset_y: Option<Dim>,
     pub shadow_blur: Option<Dim>,
     pub shadow_spread: Option<Dim>,
+    /// 仅模糊扩散层的额外偏移（叠加在 shadow_offset_x/y 之上）。
+    pub shadow_spread_offset_x: Option<Dim>,
+    pub shadow_spread_offset_y: Option<Dim>,
     pub shadow_color: Option<Rgba>,
 }

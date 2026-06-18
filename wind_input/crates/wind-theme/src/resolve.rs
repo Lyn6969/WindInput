@@ -206,6 +206,8 @@ fn resolve_view_node(
         out.shadow_offset_y = sh.offset_y;
         out.shadow_blur = sh.blur;
         out.shadow_spread = sh.spread;
+        out.shadow_spread_offset_x = sh.spread_offset_x;
+        out.shadow_spread_offset_y = sh.spread_offset_y;
         out.shadow_color = rc(&sh.color);
     }
     out
@@ -400,6 +402,8 @@ fn resolve_views(v: &Views, palette: &HashMap<String, Rgba>, is_dark: bool) -> R
         rv.shadow_offset_y = sh.offset_y;
         rv.shadow_blur = sh.blur;
         rv.shadow_spread = sh.spread;
+        rv.shadow_spread_offset_x = sh.spread_offset_x;
+        rv.shadow_spread_offset_y = sh.spread_offset_y;
         if let Some(c) = resolve_color(sh.color.as_ref(), palette, is_dark) {
             rv.shadow_color = Some(c);
         }
