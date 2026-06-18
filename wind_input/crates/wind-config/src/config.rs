@@ -185,6 +185,30 @@ pub struct InputConfig {
     /// 全码/空码上屏策略的全局默认（方案级 [engine.codetable] 的 tri-state 字段未设时回退至此）
     #[serde(default)]
     pub code_commit: CodeCommitConfig,
+    /// 短语（含命令栏 $CC/$SS/$AA）前缀列举配置
+    #[serde(default)]
+    pub phrase: PhraseConfig,
+}
+
+/// 短语前缀列举配置（对齐 Go `input.phrase`）。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PhraseConfig {
+    /// 触发前缀导航列举的最小输入长度（敲 `zz`/`co` 等前缀列出匹配短语；
+    /// < 该长度不列举，避免单字符噪音）。默认 2。
+    #[serde(default = "default_phrase_min_prefix")]
+    pub min_prefix_length: usize,
+}
+
+impl Default for PhraseConfig {
+    fn default() -> Self {
+        Self {
+            min_prefix_length: default_phrase_min_prefix(),
+        }
+    }
+}
+
+fn default_phrase_min_prefix() -> usize {
+    2
 }
 
 /// 全码/空码上屏策略全局默认（对齐方案级 [engine.codetable] 同名字段）。
@@ -348,6 +372,7 @@ impl Default for InputConfig {
             capslock: CapslockConfig::default(),
             url_input: UrlInputConfig::default(),
             code_commit: CodeCommitConfig::default(),
+            phrase: PhraseConfig::default(),
         }
     }
 }

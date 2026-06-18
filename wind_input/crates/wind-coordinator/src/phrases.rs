@@ -15,7 +15,10 @@ use chrono::{DateTime, Datelike, Local, Timelike};
 use std::collections::HashMap;
 use std::path::Path;
 use tracing::warn;
-use wind_cmdbar::{default_registry, evaluate_phrase, is_cmdbar_grammar, PhraseEval, Services};
+use wind_cmdbar::{
+    default_registry, evaluate, evaluate_phrase, is_cmdbar_grammar, parse, Phrase, PhraseEval,
+    Services,
+};
 
 /// 一条短语（同 code 下按 weight 降序、position 升序排列）
 #[derive(Debug, Clone)]
@@ -25,14 +28,19 @@ pub struct PhraseEntry {
     pub position: i32,
 }
 
-/// 一条短语命中：展开后的候选文本 + 权重 + 可选命令源。
-/// `command_src` 非空表示这是 `$CC` 命令短语（选中时执行动作而非上屏 text），
-/// 其值为待重新求值/执行的命令源（如 `$CC("切简繁", ime.toggle("s2t"))`）。
+/// 一条短语命中：展开后的候选文本 + 权重 + 可选命令源 / 前缀导航目标。
+/// - `command_src` 非空 → 这是 `$CC` 命令短语（选中时执行动作而非上屏 text），
+///   其值为待重新求值/执行的命令源（如 `$CC("切简繁", ime.toggle("s2t"))`）。
+/// - `nav_code` 非空 → 这是**前缀导航候选**（敲 `zz`/`co` 列出的 `zzbd`/`coen` 等），
+///   `text` 为组名/命令显示名，`comment` 为码后缀（如 `bd`）。选中时补全输入到
+///   `nav_code` 完整码并重查展开（见 coordinator commit_selected 的 is_group 臂）。
 #[derive(Debug, Clone, PartialEq)]
 pub struct PhraseHit {
     pub text: String,
     pub weight: i32,
     pub command_src: Option<String>,
+    pub nav_code: Option<String>,
+    pub comment: String,
 }
 
 impl PhraseHit {
@@ -41,6 +49,19 @@ impl PhraseHit {
             text,
             weight,
             command_src: None,
+            nav_code: None,
+            comment: String::new(),
+        }
+    }
+
+    /// 前缀导航候选：`code` 为补全目标完整码，`comment` 为相对输入前缀的码后缀。
+    fn nav(text: String, weight: i32, code: String, comment: String) -> Self {
+        Self {
+            text,
+            weight,
+            command_src: None,
+            nav_code: Some(code),
+            comment,
         }
     }
 }
@@ -140,6 +161,8 @@ impl PhraseLayer {
                         text: display,
                         weight: e.weight,
                         command_src: Some(e.text.clone()),
+                        nav_code: None,
+                        comment: String::new(),
                     }),
                     Ok(PhraseEval::Array(arr)) => {
                         for el in arr.elements {
@@ -155,6 +178,89 @@ impl PhraseLayer {
                 out.push(PhraseHit::plain(text, e.weight));
             }
         }
+        out
+    }
+
+    /// 前缀导航：敲 `code`（长度 ≥ `min_len`）时，列出所有**码以 `code` 开头但更长**的
+    /// marker 短语（`$CC`/`$SS`/`$AA`，未显式 `{prefix: false}`），每条出一个导航候选——
+    /// `text` 为组名/命令显示名，`comment` 为码后缀。选中后由 coordinator 补全到完整码再展开。
+    /// 数据驱动：新增短语零配置自动列出（对齐 Go SearchCommand 情况 3）。
+    ///
+    /// 不含精确码本身（走 [`Self::lookup_at`]），不列普通字面/模板短语（无 marker，维持
+    /// 精确匹配语义，对齐 Go SearchPrefix 对 `$X` 模板的处理）。
+    pub fn lookup_prefix(&self, code: &str, last: &[String], min_len: usize) -> Vec<PhraseHit> {
+        self.lookup_prefix_at(code, Local::now(), last, min_len)
+    }
+
+    /// 同 [`Self::lookup_prefix`]，显式传时间便于测试。
+    pub fn lookup_prefix_at(
+        &self,
+        code: &str,
+        now: DateTime<Local>,
+        last: &[String],
+        min_len: usize,
+    ) -> Vec<PhraseHit> {
+        if code.is_empty() || code.len() < min_len {
+            return Vec::new();
+        }
+        let reg = default_registry();
+        let ctx = PhraseCtx {
+            input: code.to_string(),
+            now,
+            last,
+        };
+        let mut out = Vec::new();
+        for (full_code, entries) in &self.map {
+            // 只列更长的码（精确码本身走 lookup）；码均为 ASCII，字节长即字符长。
+            if full_code.len() <= code.len() || !full_code.starts_with(code) {
+                continue;
+            }
+            let suffix = full_code[code.len()..].to_string();
+            for e in entries {
+                if !is_cmdbar_grammar(&e.text) {
+                    continue; // 普通字面/模板短语不参与前缀列举
+                }
+                let phrase = match parse(&e.text) {
+                    Ok(p) => p,
+                    Err(_) => continue,
+                };
+                // prefix 语义：**除非显式 `{prefix: false}` 否则都列**（`!= Some(false)`）。
+                // $SS/$AA 默认注入 prefix:true → Some(true)；$CC 无默认 → None → 仍列出
+                // （满足"命令默认列出"，且不必给 $CC 注入默认而破坏内嵌规则）。
+                // display 名：$SS/$AA 用组名，$CC 求值 display。
+                let (display, prefix_on) = match &phrase {
+                    Phrase::Array(ap) => {
+                        (ap.name.clone(), ap.modifiers.get_bool("prefix") != Some(false))
+                    }
+                    Phrase::Command(cp) => {
+                        let on = cp.modifiers.get_bool("prefix") != Some(false);
+                        match evaluate(&phrase, &ctx, reg) {
+                            Ok(ev) => (ev.display, on),
+                            Err(_) => continue,
+                        }
+                    }
+                    _ => continue, // Literal / Template 不列
+                };
+                if !prefix_on {
+                    continue;
+                }
+                out.push(PhraseHit::nav(
+                    display,
+                    e.weight,
+                    full_code.clone(),
+                    suffix.clone(),
+                ));
+            }
+        }
+        // 权重降序，同权重按完整码字母序——导航候选顺序稳定可预测。
+        out.sort_by(|a, b| {
+            b.weight.cmp(&a.weight).then_with(|| {
+                a.nav_code
+                    .as_deref()
+                    .unwrap_or("")
+                    .cmp(b.nav_code.as_deref().unwrap_or(""))
+            })
+        });
         out
     }
 }
@@ -479,6 +585,110 @@ mod tests {
                 PhraseHit::plain("③".into(), 500),
             ]
         );
+    }
+
+    #[test]
+    fn test_prefix_nav_lists_matching_groups() {
+        // 敲 zz → 列出 zzbd/zzsz 字符组导航候选（组名 + 码后缀），不含无关码。
+        let mut map: HashMap<String, Vec<PhraseEntry>> = HashMap::new();
+        map.insert(
+            "zzbd".into(),
+            vec![PhraseEntry {
+                text: r#"$AA("标点", "、。")"#.into(),
+                weight: 500,
+                position: 0,
+            }],
+        );
+        map.insert(
+            "zzsz".into(),
+            vec![PhraseEntry {
+                text: r#"$AA("数字", "①②")"#.into(),
+                weight: 500,
+                position: 0,
+            }],
+        );
+        map.insert(
+            "xx".into(),
+            vec![PhraseEntry {
+                text: "无关".into(),
+                weight: 500,
+                position: 0,
+            }],
+        );
+        let layer = PhraseLayer { map };
+        let got = layer.lookup_prefix_at("zz", fixed(), &[], 2);
+        assert_eq!(got.len(), 2);
+        // 同权重按完整码字母序 zzbd < zzsz。
+        assert_eq!(got[0].text, "标点");
+        assert_eq!(got[0].comment, "bd");
+        assert_eq!(got[0].nav_code.as_deref(), Some("zzbd"));
+        assert_eq!(got[1].text, "数字");
+        assert_eq!(got[1].comment, "sz");
+        assert_eq!(got[1].nav_code.as_deref(), Some("zzsz"));
+    }
+
+    #[test]
+    fn test_prefix_nav_min_len_gate_and_exact_excluded() {
+        let mut map: HashMap<String, Vec<PhraseEntry>> = HashMap::new();
+        map.insert(
+            "zzbd".into(),
+            vec![PhraseEntry {
+                text: r#"$AA("标点", "、。")"#.into(),
+                weight: 500,
+                position: 0,
+            }],
+        );
+        let layer = PhraseLayer { map };
+        // 前缀长度 < min_len → 不触发。
+        assert!(layer.lookup_prefix_at("z", fixed(), &[], 2).is_empty());
+        // 精确码本身（== 完整码）不作为导航候选返回（只列更长的码）。
+        assert!(layer.lookup_prefix_at("zzbd", fixed(), &[], 2).is_empty());
+        // 真前缀 → 1 个导航候选。
+        assert_eq!(layer.lookup_prefix_at("zz", fixed(), &[], 2).len(), 1);
+    }
+
+    #[test]
+    fn test_prefix_nav_command_default_on_prefix_false_off() {
+        let mut map: HashMap<String, Vec<PhraseEntry>> = HashMap::new();
+        map.insert(
+            "cobd".into(),
+            vec![PhraseEntry {
+                text: r#"$CC("百度", open("https://baidu.com"))"#.into(),
+                weight: 500,
+                position: 0,
+            }],
+        );
+        map.insert(
+            "coex".into(),
+            vec![PhraseEntry {
+                text: r#"$CC("退出", type("x"), {prefix: false})"#.into(),
+                weight: 500,
+                position: 0,
+            }],
+        );
+        let layer = PhraseLayer { map };
+        let got = layer.lookup_prefix_at("co", fixed(), &[], 2);
+        // $CC 默认列出（百度），显式 {prefix: false} 退出列举（退出）。
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].text, "百度");
+        assert_eq!(got[0].comment, "bd");
+        assert_eq!(got[0].nav_code.as_deref(), Some("cobd"));
+    }
+
+    #[test]
+    fn test_prefix_nav_skips_literal_template() {
+        // 普通模板短语（无 marker）不参与前缀列举，维持精确匹配语义。
+        let mut map: HashMap<String, Vec<PhraseEntry>> = HashMap::new();
+        map.insert(
+            "rq".into(),
+            vec![PhraseEntry {
+                text: "$Y-$MM-$DD".into(),
+                weight: 500,
+                position: 0,
+            }],
+        );
+        let layer = PhraseLayer { map };
+        assert!(layer.lookup_prefix_at("r", fixed(), &[], 1).is_empty());
     }
 
     #[test]

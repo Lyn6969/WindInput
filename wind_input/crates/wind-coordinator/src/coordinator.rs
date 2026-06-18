@@ -887,6 +887,26 @@ impl Coordinator {
                     ..Default::default()
                 });
             }
+            // 前缀导航：敲 `zz`/`co` 等前缀（长度 ≥ min_prefix_length）列出所有该前缀的
+            // marker 短语（组名 display + 码后缀 comment）。选中 is_group 候选时由
+            // commit_selected/mouse_select 补全输入到完整码并重查展开（二级选择）。
+            let min_prefix = self.config.input.phrase.min_prefix_length;
+            for hit in self
+                .phrases
+                .lookup_prefix(&state.input_buffer, &recent, min_prefix)
+            {
+                let code = hit.nav_code.unwrap_or_default();
+                candidates.push(Candidate {
+                    text: hit.text.clone(),
+                    weight: PHRASE_WEIGHT_BASE + hit.weight,
+                    is_phrase: true,
+                    is_group: true,
+                    group_code: code,
+                    group_name: hit.text,
+                    comment: hit.comment,
+                    ..Default::default()
+                });
+            }
         }
         candidates.sort_by(|a, b| {
             b.weight
@@ -2791,7 +2811,25 @@ impl Coordinator {
     /// 部分匹配（候选只消费缓冲前缀）：把汉字并入 `committed_text` 前缀、裁剪缓冲、重转剩余，
     /// **留在组合区不上屏到应用**，返回 UpdateComposition。
     /// 完整匹配（消费整串）：整体上屏 `committed_text + 候选` 到应用，触发自动造词（L），清空。
+    /// 前缀导航候选选中：把输入缓冲补全到该组完整码并重查候选（展开成员/精确命令），
+    /// 实现"敲 zz → 选标点 → 展开标点字符"的二级选择。返回新 preedit 显示文本。
+    fn complete_to_group_code(&self, state: &mut State, group_code: &str) -> String {
+        state.input_buffer = group_code.to_string();
+        let _ = self.update_candidates(state);
+        self.notify_ui_update(state);
+        state.preedit.clone()
+    }
+
     fn commit_selected(&self, state: &mut State, cand: &Candidate) -> KeyAction {
+        // 前缀导航候选：补全输入到该组完整码并重查展开（二级选择，不上屏组名）。
+        if cand.is_group {
+            let code = cand.group_code.clone();
+            let display = self.complete_to_group_code(state, &code);
+            return KeyAction::UpdateComposition {
+                caret_pos: display.chars().count() as u32,
+                text: display,
+            };
+        }
         // $CC 命令候选：执行动作而非上屏 display 标签。
         if cand.is_command {
             return self.commit_command(state, cand);
@@ -3690,6 +3728,12 @@ impl Coordinator {
         let (start, end) = self.page_range(&state);
         let idx = start + page_local;
         if idx >= end || idx >= state.candidates.len() {
+            return;
+        }
+        // 前缀导航候选：补全输入到完整码并重查展开（二级选择，鼠标点击同键盘选中）。
+        if state.candidates[idx].is_group {
+            let code = state.candidates[idx].group_code.clone();
+            self.complete_to_group_code(&mut state, &code);
             return;
         }
         // $CC 命令候选：执行动作而非上屏 display 标签（释放锁后异步执行，避免重入死锁）。

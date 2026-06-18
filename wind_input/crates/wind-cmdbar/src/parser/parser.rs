@@ -200,6 +200,10 @@ fn parse_command_phrase(src: &str, idx: usize, open: usize) -> Result<CommandPhr
 fn marker_defaults(marker: &str) -> Modifiers {
     let mut m = Modifiers::new();
     match marker {
+        // 注意：`$CC` 故意**不**注入 prefix 默认值——`$SS` 内嵌 `$CC` 元素禁止带 prefix
+        // 修饰符（组前缀由 `$SS` 控制），注入默认会误触发该校验。"`$CC` 默认参与前缀列举"
+        // 的语义放在前缀导航读取处（phrases.rs lookup_prefix：`prefix != Some(false)` 即列出，
+        // 显式 `{prefix: false}` 才退出），不污染解析期的内嵌规则。
         "$CC1" => m.push("prefix", ModValue::Bool(true)),
         // `$AA` 字符组与 `$SS` 字符串组共享数组默认值（精确匹配展开 + 导航 + 前缀）。
         "$SS" | "$AA" => {
