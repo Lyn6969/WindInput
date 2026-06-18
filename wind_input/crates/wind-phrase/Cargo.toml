@@ -1,0 +1,11 @@
+[package]
+name = "wind-phrase"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+wind-cmdbar = { path = "../wind-cmdbar" }
+tracing = { workspace = true }
+chrono = "0.4"
+serde = { workspace = true }
+toml = { workspace = true }

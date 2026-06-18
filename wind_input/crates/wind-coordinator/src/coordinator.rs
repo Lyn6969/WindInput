@@ -320,7 +320,7 @@ pub struct Coordinator {
     /// 智能符号模式待命态（同键连按删中文标点改英文）
     smart_symbol: Mutex<SmartSymbolArm>,
     /// 短语层（system.phrases.toml；$Y$M$D 模板）
-    phrases: crate::phrases::PhraseLayer,
+    phrases: wind_phrase::PhraseLayer,
     /// 简繁转换器（OpenCC；None=数据缺失不可用）。变体可运行时切换，故置于 Mutex。
     s2t: Mutex<Option<wind_transform::s2t::Converter>>,
     /// OpenCC 数据目录（运行时按变体重载转换器用）
@@ -497,13 +497,13 @@ impl Coordinator {
         let phrases = match data_dir {
             Some(d) => {
                 let p = d.join("system.phrases.toml");
-                let layer = crate::phrases::PhraseLayer::load(&p);
+                let layer = wind_phrase::PhraseLayer::load(&p);
                 if !layer.is_empty() {
                     info!("Loaded phrases from {}", p.display());
                 }
                 layer
             }
-            None => crate::phrases::PhraseLayer::default(),
+            None => wind_phrase::PhraseLayer::default(),
         };
 
         // 简繁转换器：从 data/opencc 加载（变体来自配置，默认 s2t）
@@ -885,7 +885,19 @@ impl Coordinator {
         if !self.phrases.is_empty() {
             let recent = self.recent_commits_snapshot();
             let max_disp = self.config.input.phrase.max_display_chars;
-            for hit in self.phrases.lookup(&state.input_buffer, &recent) {
+            // 剪贴板读取回调注入 wind-phrase（其不依赖平台 UI 层）：精确码命令 display
+            // 含 {clip()}（如 coad）时按需读取；非 windows 返回空。
+            let clip = |_n: i64| -> String {
+                #[cfg(windows)]
+                {
+                    wind_ui::popup_menu::get_clipboard_text()
+                }
+                #[cfg(not(windows))]
+                {
+                    String::new()
+                }
+            };
+            for hit in self.phrases.lookup(&state.input_buffer, &recent, &clip) {
                 let is_command = hit.command_src.is_some();
                 candidates.push(Candidate {
                     text: Self::clamp_candidate_display(&hit.text, max_disp),

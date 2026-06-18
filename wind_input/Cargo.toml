@@ -12,6 +12,7 @@ members = [
     "crates/wind-theme",
     "crates/wind-ui",
     "crates/wind-cmdbar",
+    "crates/wind-phrase",
     "crates/wind-coordinator",
     "apps/service",
     "apps/rpc",

@@ -15,6 +15,7 @@ wind-transform = { path = "../wind-transform" }
 wind-theme = { path = "../wind-theme" }
 wind-ui = { path = "../wind-ui" }
 wind-cmdbar = { path = "../wind-cmdbar" }
+wind-phrase = { path = "../wind-phrase" }
 tokio = { workspace = true }
 tracing = { workspace = true }
 anyhow = { workspace = true }
