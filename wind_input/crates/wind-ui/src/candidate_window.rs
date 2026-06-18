@@ -270,7 +270,7 @@ impl CandidateWindow {
                     .border_radius
                     .map(|d| d.resolve(self.scale, 0.0))
                     .unwrap_or(8.0 * self.scale);
-                crate::view::paint_blur_shadow(
+                s.paint(
                     buf,
                     width,
                     height,
@@ -279,11 +279,6 @@ impl CandidateWindow {
                     content_w as f32,
                     content_h as f32,
                     radius,
-                    s.blur,
-                    s.spread,
-                    s.off_x(),
-                    s.off_y(),
-                    s.color,
                 );
             }
             root.paint(buf, width, height, &self.text_renderer);
@@ -406,35 +401,19 @@ impl CandidateWindow {
         (x, y)
     }
 
-    /// 窗口投影参数（设备像素，已 ×DPI）。offset 可为负（阴影偏向左/上）；
-    /// 扩散层额外偏移叠加在基础 offset 之上。无色/全透明/零模糊零扩散零偏移 → None。
-    fn shadow_params(&self) -> Option<ShadowSpec> {
+    /// 窗口投影参数（共享 SoftShadow；读 RvViews 顶层 shadow_* 字段）。
+    fn shadow_params(&self) -> Option<crate::view::SoftShadow> {
         let v = &self.theme.views;
-        let s = self.scale;
-        let color = v.shadow_color?;
-        if color[3] == 0 {
-            return None;
-        }
-        // 偏移可负（保号）；blur/spread 取非负。
-        let signed = |d: Option<wind_theme::schema::Dim>| d.map(|x| x.resolve(s, 0.0)).unwrap_or(0.0);
-        let nonneg = |d: Option<wind_theme::schema::Dim>| signed(d).max(0.0);
-        let spec = ShadowSpec {
-            ox: signed(v.shadow_offset_x),
-            oy: signed(v.shadow_offset_y),
-            blur: nonneg(v.shadow_blur),
-            spread: nonneg(v.shadow_spread),
-            sox: signed(v.shadow_spread_offset_x),
-            soy: signed(v.shadow_spread_offset_y),
-            color,
-        };
-        if spec.blur <= 0.0
-            && spec.spread <= 0.0
-            && spec.off_x() == 0.0
-            && spec.off_y() == 0.0
-        {
-            return None;
-        }
-        Some(spec)
+        crate::view::SoftShadow::build(
+            v.shadow_offset_x,
+            v.shadow_offset_y,
+            v.shadow_blur,
+            v.shadow_spread,
+            v.shadow_spread_offset_x,
+            v.shadow_spread_offset_y,
+            v.shadow_color,
+            self.scale,
+        )
     }
 
     /// 把 image ref 解析为可读绝对路径（委托共享 theme_assets）。
@@ -459,7 +438,8 @@ impl CandidateWindow {
         };
         Some(ViewImage {
             path,
-            mode: "stretch".into(),
+            // center：图标按原尺寸居中绘于按钮矩形内（与图片范围解耦），不随固定框拉伸变形。
+            mode: "center".into(),
             slice: [0.0; 4],
             opacity: 1.0,
             tint,
@@ -544,6 +524,7 @@ impl CandidateWindow {
                     .bg(col(v.preedit_bar.bg_color, [240, 240, 240, 255]))
                     .radius(dim(v.item.border_radius, 4.0))
                     .pad(edges_or(&v.preedit_bar.padding, [3.0, 8.0, 3.0, 8.0]))
+                    .margin(edges_or(&v.preedit_bar.margin, [0.0; 4]))
                     .child(
                         View::leaf(
                             self.preedit.clone(),
@@ -563,7 +544,6 @@ impl CandidateWindow {
         let comment_fs = node_fs(&v.comment);
         let index_circle = v.index.bg_shape == "circle";
         let index_circle_bg = col(v.index.bg_color, [66, 133, 244, 255]);
-        let text_margin_l = dim(v.text.margin.left, 4.0);
         let item_pad = edges_or(&v.item.padding, [7.0, 10.0, 7.0, 8.0]);
         let item_radius = dim(v.item.border_radius, 4.0);
         // 选中候选左侧强调条（仅主题启用时，如 msime/jidian）。
@@ -593,7 +573,8 @@ impl CandidateWindow {
             // 序号：圆圈样式 → 方形节点 + 真圆背景 + 居中数字。
             let mut idx_leaf = View::leaf(marker, idx_color)
                 .font_size(index_fs)
-                .pad(edges_or(&v.index.padding, [0.0; 4]));
+                .pad(edges_or(&v.index.padding, [0.0; 4]))
+                .margin(edges_or(&v.index.margin, [0.0; 4]));
             if index_circle {
                 let d = (index_fs * 1.5).round();
                 idx_leaf = idx_leaf
@@ -603,17 +584,20 @@ impl CandidateWindow {
                     .text_align(Align::Center);
             }
 
+            // 行内间距改由各子节点 margin 承载（与前端盒模型一致）：text.margin.left 默认 4dp
+            // 作为序号↔文字间距；不再用容器 gap 借 text.margin.left。
             let mut item = View::container(Layout::Row)
                 .cross(Align::Center)
-                .gap(text_margin_l)
                 .pad(item_pad)
+                .margin(edges_or(&v.item.margin, [0.0; 4]))
                 .radius(item_radius)
                 .tag(i as i32)
                 .child(idx_leaf)
                 .child(
                     View::leaf(cand.text.clone(), txt_color)
                         .font_size(text_fs)
-                        .pad(edges_or(&v.text.padding, [0.0; 4])),
+                        .pad(edges_or(&v.text.padding, [0.0; 4]))
+                        .margin(edges_or(&v.text.margin, [0.0, 0.0, 0.0, 4.0])),
                 );
             // 注释（编码后缀/短语提示）：非空时在候选词右侧以注释样式内联显示。
             // 内/外边距完整消费：comment.padding 四边 + comment.margin 四边（左默认 6dp 兜底间距）。
@@ -655,28 +639,32 @@ impl CandidateWindow {
             let footer_fs = node_fs(&v.footer_bar);
             let prev_on = self.page > 1;
             let next_on = self.page < self.total_pages;
+            // 固定矩形触摸区（对齐 Go）：宽 = 字号 + 左右 padding，高 = 候选行高，内容居中。
+            // 命中区 = 整个矩形（与图标实际像素范围解耦），悬停在该矩形内即触发圆角高亮。
+            let fpad = edges_or(&v.footer_bar.padding, [0.0, 6.0, 0.0, 6.0]);
+            let arrow_w = footer_fs + fpad.l + fpad.r;
+            let row_h = text_fs + item_pad.t + item_pad.b;
             // 翻页箭头：主题配了 prev/next_image（如 _base 的 chevron SVG + tint）则用图标，否则回退文字 ‹ ›。
             let prev_icon = self.arrow_icon(v.footer_bar.prev_image.as_ref(), prev_on);
             let next_icon = self.arrow_icon(v.footer_bar.next_image.as_ref(), next_on);
             let arrow = |icon: Option<ViewImage>, txt: &str, tag: i32, enabled: bool, hovered: bool| {
+                // 统一固定矩形按钮：图标走 center 居中绘制，文字走 text_align Center 居中。
                 let mut node = match icon {
                     Some(vi) => View::container(Layout::Row)
-                        .fixed_w(footer_fs)
-                        .fixed_h(footer_fs)
+                        .fixed_w(arrow_w)
+                        .fixed_h(row_h)
                         .bg_image(vi),
-                    None => {
-                        View::leaf(txt, if enabled { accent } else { disabled }).font_size(footer_fs)
-                    }
+                    None => View::leaf(txt, if enabled { accent } else { disabled })
+                        .font_size(footer_fs)
+                        .fixed_w(arrow_w)
+                        .fixed_h(row_h)
+                        .text_align(Align::Center),
                 };
-                // 命中区域 = 节点矩形（含 padding）。加大内边距让翻页箭头更易点中/触摸。
-                node = node
-                    .pad(Edges::xy((gap * 2.5).max(11.0 * s), (gap * 1.5).max(8.0 * s)))
-                    .radius(item_radius)
-                    .cross(Align::Center);
+                node = node.radius(item_radius).cross(Align::Center);
                 if enabled {
                     node = node.tag(tag); // 仅启用项参与命中
                     if hovered {
-                        node = node.bg(hover_bg);
+                        node = node.bg(hover_bg); // 圆角悬停高亮覆盖整个按钮矩形
                     }
                 }
                 node
@@ -684,10 +672,14 @@ impl CandidateWindow {
             Some(
                 View::container(Layout::Row)
                     .cross(Align::Center)
-                    .child(
-                        arrow(prev_icon, "‹", TAG_PAGE_PREV, prev_on, self.hover == TAG_PAGE_PREV)
-                            .margin(Edges::xy(gap, 0.0)),
-                    )
+                    .margin(edges_or(&v.footer_bar.margin, [0.0, 0.0, 0.0, 8.0]))
+                    .child(arrow(
+                        prev_icon,
+                        "‹",
+                        TAG_PAGE_PREV,
+                        prev_on,
+                        self.hover == TAG_PAGE_PREV,
+                    ))
                     .child(
                         View::leaf(format!("{}/{}", self.page, self.total_pages), marker_c)
                             .font_size(footer_fs),
@@ -808,41 +800,6 @@ impl CandidateMouse {
             }
         }
         -1
-    }
-}
-
-/// 窗口投影参数（设备像素）。模糊扩散层总偏移 = 基础 offset + 扩散额外偏移。
-struct ShadowSpec {
-    ox: f32,
-    oy: f32,
-    blur: f32,
-    spread: f32,
-    sox: f32,
-    soy: f32,
-    color: [u8; 4],
-}
-
-impl ShadowSpec {
-    /// 模糊扩散层在 X 方向的总偏移（基础 + 扩散额外）。
-    fn off_x(&self) -> f32 {
-        self.ox + self.sox
-    }
-    /// 模糊扩散层在 Y 方向的总偏移。
-    fn off_y(&self) -> f32 {
-        self.oy + self.soy
-    }
-
-    /// 四向缓冲扩边 (left, top, right, bottom)（与 Go shadowMargins 对齐）：
-    /// base = ceil(3σ)+2 + spread，再按总偏移正负分配到右下/左上。
-    fn margins(&self) -> (u32, u32, u32, u32) {
-        let sigma = (self.blur * (self.blur + 2.0)).max(0.0).sqrt();
-        let base = (3.0 * sigma).ceil() + 2.0 + self.spread;
-        let (ox, oy) = (self.off_x(), self.off_y());
-        let ml = (base + (-ox).max(0.0)).ceil() as u32;
-        let mt = (base + (-oy).max(0.0)).ceil() as u32;
-        let mr = (base + ox.max(0.0)).ceil() as u32;
-        let mb = (base + oy.max(0.0)).ceil() as u32;
-        (ml, mt, mr, mb)
     }
 }
 

@@ -22,6 +22,10 @@ pub struct Tooltip {
     /// 主题位图背景 + z 层（jidian tooltip 吃九宫格 panel + 角标水印）。
     bg_image: Option<ViewImage>,
     layers: Vec<ViewLayer>,
+    /// 主题配置的软投影 / 边框 / 圆角（与候选窗一致化）。
+    shadow: Option<crate::view::SoftShadow>,
+    border: Option<([u8; 4], f32)>,
+    radius: Option<f32>,
 }
 
 impl Tooltip {
@@ -38,6 +42,9 @@ impl Tooltip {
             fg: FG,
             bg_image: None,
             layers: Vec::new(),
+            shadow: None,
+            border: None,
+            radius: None,
         })
     }
 
@@ -46,11 +53,35 @@ impl Tooltip {
         self.bg = theme.color("tooltip_bg", BG);
         self.fg = theme.color("tooltip_text", FG);
         if let Some(node) = &theme.views.tooltip {
+            let s = self.scale;
             self.bg_image = crate::theme_assets::rv_image(theme, node.bg_image.as_ref());
-            self.layers = crate::theme_assets::rv_layers(theme, &node.layers, self.scale);
+            self.layers = crate::theme_assets::rv_layers(theme, &node.layers, s);
+            self.shadow = crate::view::SoftShadow::build(
+                node.shadow_offset_x,
+                node.shadow_offset_y,
+                node.shadow_blur,
+                node.shadow_spread,
+                node.shadow_spread_offset_x,
+                node.shadow_spread_offset_y,
+                node.shadow_color,
+                s,
+            );
+            self.border = node.border_color.map(|c| {
+                (
+                    c,
+                    node.border_width
+                        .map(|d| d.resolve(s, 0.0))
+                        .unwrap_or(s)
+                        .max(1.0),
+                )
+            });
+            self.radius = node.border_radius.map(|d| d.resolve(s, 0.0));
         } else {
             self.bg_image = None;
             self.layers = Vec::new();
+            self.shadow = None;
+            self.border = None;
+            self.radius = None;
         }
     }
 
@@ -65,7 +96,10 @@ impl Tooltip {
             .bg(self.bg)
             .pad(Edges::xy(8.0 * s, 4.0 * s))
             .text_align(Align::Center);
-        tip.corner_radius = 5.0 * s;
+        if let Some((bc, bw)) = self.border {
+            tip = tip.border(bc, bw);
+        }
+        tip.corner_radius = self.radius.unwrap_or(5.0 * s);
         if let Some(img) = &self.bg_image {
             tip = tip.bg_image(img.clone());
         }
@@ -73,22 +107,30 @@ impl Tooltip {
             tip = tip.layers(self.layers.clone());
         }
 
-        tip.layout(0.0, 0.0, &self.renderer);
+        // 软投影四向扩边：内容布局起点移到 (ml, mt)，窗口位置左上回移。
+        let (ml, mt, mr, mb) = self.shadow.as_ref().map(|sh| sh.margins()).unwrap_or((0, 0, 0, 0));
+        tip.layout(ml as f32, mt as f32, &self.renderer);
         let (w_f, h_f) = tip.measured_size();
-        let w = (w_f.ceil() as u32).max(24);
-        let h = (h_f.ceil() as u32).max(20);
+        let cw = (w_f.ceil() as u32).max(24);
+        let ch = (h_f.ceil() as u32).max(20);
+        let w = cw + ml + mr;
+        let h = ch + mt + mb;
 
         self.window.resize(w, h);
         {
             let buf = self.window.buffer_mut();
             let n = (w * h * 4) as usize;
             buf[..n].fill(0);
+            if let Some(sh) = &self.shadow {
+                sh.paint(buf, w, h, ml as f32, mt as f32, cw as f32, ch as f32, tip.corner_radius);
+            }
             tip.paint(buf, w, h, &self.renderer);
         }
         let _ = self.window.update();
 
-        let (px, py) = clamp_to_work_area(x, y, w, h);
-        self.window.show(px, py);
+        // 内容盒按工作区钳位，窗口原点 = 内容锚点 − 左/上 margin（阴影向四周溢出）。
+        let (px, py) = clamp_to_work_area(x, y, cw, ch);
+        self.window.show(px - ml as i32, py - mt as i32);
         self.visible = true;
     }
 

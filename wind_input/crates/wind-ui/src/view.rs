@@ -12,6 +12,7 @@ use std::cell::RefCell;
 use tiny_skia::{
     Color, FillRule, FilterQuality, Paint, PathBuilder, Pattern, PixmapMut, SpreadMode, Transform,
 };
+use wind_theme::schema::Dim;
 
 thread_local! {
     /// 背景图解码/填充缓存（UI 单线程，跨帧复用，避免每帧解码）。
@@ -724,6 +725,106 @@ pub fn paint_blur_shadow(
             buf[off + 2] = ((sr * 255 + buf[off + 2] as u32 * inv) / 255) as u8;
             buf[off + 3] = ((fa * 255 + buf[off + 3] as u32 * inv) / 255) as u8;
         }
+    }
+}
+
+/// 窗口软投影参数（设备像素，已 ×scale）。模糊扩散层总偏移 = 基础 offset + 扩散额外偏移。
+/// 候选窗与其它窗口（status/tooltip/toast）共享：四向扩边 + 高斯软影绘制一处实现。
+pub struct SoftShadow {
+    pub ox: f32,
+    pub oy: f32,
+    pub blur: f32,
+    pub spread: f32,
+    pub sox: f32,
+    pub soy: f32,
+    pub color: [u8; 4],
+}
+
+impl SoftShadow {
+    /// 从节点 shadow_* 字段（Option<Dim> + 颜色）构建并 ×scale。
+    /// 无色/全透明/零模糊零扩散零偏移 → None（不画投影）。
+    #[allow(clippy::too_many_arguments)]
+    pub fn build(
+        offset_x: Option<Dim>,
+        offset_y: Option<Dim>,
+        blur: Option<Dim>,
+        spread: Option<Dim>,
+        spread_off_x: Option<Dim>,
+        spread_off_y: Option<Dim>,
+        color: Option<[u8; 4]>,
+        scale: f32,
+    ) -> Option<SoftShadow> {
+        let color = color?;
+        if color[3] == 0 {
+            return None;
+        }
+        let signed = |d: Option<Dim>| d.map(|x| x.resolve(scale, 0.0)).unwrap_or(0.0);
+        let nonneg = |d: Option<Dim>| signed(d).max(0.0);
+        let sh = SoftShadow {
+            ox: signed(offset_x),
+            oy: signed(offset_y),
+            blur: nonneg(blur),
+            spread: nonneg(spread),
+            sox: signed(spread_off_x),
+            soy: signed(spread_off_y),
+            color,
+        };
+        if sh.blur <= 0.0 && sh.spread <= 0.0 && sh.off_x() == 0.0 && sh.off_y() == 0.0 {
+            return None;
+        }
+        Some(sh)
+    }
+
+    /// 模糊扩散层 X 方向总偏移（基础 + 扩散额外）。
+    pub fn off_x(&self) -> f32 {
+        self.ox + self.sox
+    }
+    /// 模糊扩散层 Y 方向总偏移。
+    pub fn off_y(&self) -> f32 {
+        self.oy + self.soy
+    }
+
+    /// 四向缓冲扩边 (left, top, right, bottom)（与 Go shadowMargins 对齐）。
+    pub fn margins(&self) -> (u32, u32, u32, u32) {
+        let sigma = (self.blur * (self.blur + 2.0)).max(0.0).sqrt();
+        let base = (3.0 * sigma).ceil() + 2.0 + self.spread;
+        let (ox, oy) = (self.off_x(), self.off_y());
+        (
+            (base + (-ox).max(0.0)).ceil() as u32,
+            (base + (-oy).max(0.0)).ceil() as u32,
+            (base + ox.max(0.0)).ceil() as u32,
+            (base + oy.max(0.0)).ceil() as u32,
+        )
+    }
+
+    /// 在主缓冲画软影。(bx,by) 为内容盒左上（不含 offset/spread），(bw,bh) 内容盒尺寸，radius 圆角。
+    #[allow(clippy::too_many_arguments)]
+    pub fn paint(
+        &self,
+        buf: &mut [u8],
+        buf_w: u32,
+        buf_h: u32,
+        bx: f32,
+        by: f32,
+        bw: f32,
+        bh: f32,
+        radius: f32,
+    ) {
+        paint_blur_shadow(
+            buf,
+            buf_w,
+            buf_h,
+            bx,
+            by,
+            bw,
+            bh,
+            radius,
+            self.blur,
+            self.spread,
+            self.off_x(),
+            self.off_y(),
+            self.color,
+        );
     }
 }
 

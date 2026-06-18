@@ -17,6 +17,10 @@ pub struct StatusTip {
     /// 主题位图背景（如 jidian status 的九宫格 panel）+ z 层水印。
     bg_image: Option<ViewImage>,
     layers: Vec<ViewLayer>,
+    /// 主题配置的软投影 / 边框 / 圆角（与候选窗一致化）。
+    shadow: Option<crate::view::SoftShadow>,
+    border: Option<([u8; 4], f32)>,
+    radius: Option<f32>,
 }
 
 impl StatusTip {
@@ -32,6 +36,9 @@ impl StatusTip {
             fg: [245, 245, 245, 255],
             bg_image: None,
             layers: Vec::new(),
+            shadow: None,
+            border: None,
+            radius: None,
         })
     }
 
@@ -40,11 +47,35 @@ impl StatusTip {
         self.bg = theme.color("status_bg", self.bg);
         self.fg = theme.color("status_text", self.fg);
         if let Some(node) = &theme.views.status {
+            let s = self.scale;
             self.bg_image = crate::theme_assets::rv_image(theme, node.bg_image.as_ref());
-            self.layers = crate::theme_assets::rv_layers(theme, &node.layers, self.scale);
+            self.layers = crate::theme_assets::rv_layers(theme, &node.layers, s);
+            self.shadow = crate::view::SoftShadow::build(
+                node.shadow_offset_x,
+                node.shadow_offset_y,
+                node.shadow_blur,
+                node.shadow_spread,
+                node.shadow_spread_offset_x,
+                node.shadow_spread_offset_y,
+                node.shadow_color,
+                s,
+            );
+            self.border = node.border_color.map(|c| {
+                (
+                    c,
+                    node.border_width
+                        .map(|d| d.resolve(s, 0.0))
+                        .unwrap_or(s)
+                        .max(1.0),
+                )
+            });
+            self.radius = node.border_radius.map(|d| d.resolve(s, 0.0));
         } else {
             self.bg_image = None;
             self.layers = Vec::new();
+            self.shadow = None;
+            self.border = None;
+            self.radius = None;
         }
     }
 
@@ -56,8 +87,14 @@ impl StatusTip {
             .bg(self.bg)
             .pad(Edges::xy(18.0 * s, 10.0 * s))
             .text_align(Align::Center);
-        // 圆角随高度（估算字高 + 内边距）
-        tip.corner_radius = (self.renderer.measure_text("国").height + 20.0 * s) * 0.28;
+        // 边框（主题配了才描）。
+        if let Some((bc, bw)) = self.border {
+            tip = tip.border(bc, bw);
+        }
+        // 圆角：主题配置优先，否则随高度估算（字高 + 内边距）。
+        tip.corner_radius = self
+            .radius
+            .unwrap_or((self.renderer.measure_text("国").height + 20.0 * s) * 0.28);
         // 主题位图背景 + 层（jidian status 吃九宫格 panel + 角标水印）。
         if let Some(img) = &self.bg_image {
             tip = tip.bg_image(img.clone());
@@ -66,26 +103,33 @@ impl StatusTip {
             tip = tip.layers(self.layers.clone());
         }
 
-        tip.layout(0.0, 0.0, &self.renderer);
+        // 软投影四向扩边：内容布局起点移到 (ml, mt)，窗口位置左上回移，阴影四面溢出。
+        let (ml, mt, mr, mb) = self.shadow.as_ref().map(|sh| sh.margins()).unwrap_or((0, 0, 0, 0));
+        tip.layout(ml as f32, mt as f32, &self.renderer);
         let (w_f, h_f) = tip.measured_size();
-        let w = (w_f.ceil() as u32).max(48);
-        let h = (h_f.ceil() as u32).max(36);
+        let cw = (w_f.ceil() as u32).max(48);
+        let ch = (h_f.ceil() as u32).max(36);
+        let w = cw + ml + mr;
+        let h = ch + mt + mb;
 
         self.window.resize(w, h);
         {
             let buf = self.window.buffer_mut();
             let n = (w * h * 4) as usize;
             buf[..n].fill(0);
+            if let Some(sh) = &self.shadow {
+                sh.paint(buf, w, h, ml as f32, mt as f32, cw as f32, ch as f32, tip.corner_radius);
+            }
             tip.paint(buf, w, h, &self.renderer);
         }
         if let Err(e) = self.window.update() {
             tracing::warn!("StatusTip update failed: {}", e);
         }
 
-        // 显示在 caret 上方居中
-        let x = cx - (w as i32) / 2;
-        let y = cy - (h as i32) - 8;
-        self.window.show(x.max(0), y.max(0));
+        // 显示在 caret 上方居中（内容锚点 − 左/上 margin，阴影向四周溢出）。
+        let cx0 = (cx - (cw as i32) / 2).max(0);
+        let cy0 = (cy - (ch as i32) - 8).max(0);
+        self.window.show(cx0 - ml as i32, cy0 - mt as i32);
     }
 
     pub fn hide(&self) {
