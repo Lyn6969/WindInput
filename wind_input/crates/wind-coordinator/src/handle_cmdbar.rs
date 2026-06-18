@@ -34,7 +34,8 @@ impl Coordinator {
         svc.proc = Some(Arc::new(StdProc));
         svc.open = Some(Arc::new(ShellOpener));
         svc.clip = Some(Arc::new(SysClip));
-        // key/search/config/setting：平台/配置能力待补，留 None（web.search 经 open 默认可用）。
+        svc.keys = Some(Arc::new(crate::key_inject::SysKeys));
+        // search/config/setting：经 open 默认可用 / 配置能力待补，留 None。
         let _ = self.cmdbar_services.set(svc);
     }
 
@@ -223,6 +224,8 @@ impl ClipboardService for SysClip {
         anyhow::bail!("clip get: 暂未支持（待平台读剪贴板）")
     }
     fn paste(&self) -> anyhow::Result<()> {
-        anyhow::bail!("clip.paste: 需按键注入（key 服务待补）")
+        // 经按键注入合成 Ctrl+V（与 Go Windows 实现一致）。
+        use wind_cmdbar::KeyInjector;
+        crate::key_inject::SysKeys.tap("Ctrl+v")
     }
 }

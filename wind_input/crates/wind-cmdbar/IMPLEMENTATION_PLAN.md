@@ -48,8 +48,10 @@
     - ime.toggle(cn-en/fullshape/s2t/toolbar)、ime.schema、ime.theme_cycle、dict.add（Weak<Coordinator> 回调）；
     - proc.run/proc.shell（std::process::Command，跨平台）、open + web.search（系统外壳 cmd start / xdg-open）、
       clip.copy（wind_ui 写剪贴板，cfg(windows)）——这些无需 coordinator 回调，独立 struct。
-    - **待补**：key.*（按键注入 SendInput）、clip.paste/get（读剪贴板）、config.*（配置路径访问 + 持久化）、
-      setting.open/web（设置应用）、ime.toggle(preedit/candwin/layout)。缺失返回 ServiceUnavailable 优雅降级。
+    - key.tap/seq/hold/release/type（key_inject.rs：combo 解析 + Win32 SendInput，cfg(windows)；combo 解析
+      "Ctrl+Shift+End"/"Enter"/"vk:0x5D"/F1-F12/字母数字，有单测）、clip.paste（合成 Ctrl+V）。
+    - **待补**：config.*（配置路径访问 + 持久化）、setting.open/web（设置应用）、clip.get（读剪贴板）、
+      ime.toggle(preedit/candwin/layout)。缺失返回 ServiceUnavailable 优雅降级。
   - 验证局限：coordinator 无法原生测（wind-bridge 预存破）；cmdbar 侧动作派发已原生测（mock 控制器/服务）；
     coordinator 集成仅 windows 目标 check + debug exe 链接通过，**功能需上设备实测**。
 - 验证：`cargo test -p wind-cmdbar` 51 passed；clippy 零警告；全工作区 windows check + debug exe 构建通过。
