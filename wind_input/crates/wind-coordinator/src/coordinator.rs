@@ -2870,9 +2870,13 @@ impl Coordinator {
             }
             "fullshape" => {
                 self.handle_menu_command("toggle_width");
+                // handle_menu_command 只 push_state_update，不刷工具栏；菜单路径由调用方
+                // 补 notify_toolbar，命令栏路径同样需要补，否则工具栏全/半角状态不更新。
+                self.notify_toolbar();
             }
             "s2t" => {
                 self.handle_menu_command("toggle_s2t");
+                self.notify_toolbar();
             }
             "toolbar" => self.toggle_toolbar(),
             "preedit" => self.cmd_toggle_preedit(),
