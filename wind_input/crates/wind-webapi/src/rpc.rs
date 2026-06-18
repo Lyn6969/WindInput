@@ -41,7 +41,7 @@ fn handle(state: &WebState, method: &str, params: &Value) -> anyhow::Result<Valu
             let cfg: Config = toml::from_str("")?;
             Ok(serde_json::to_value(cfg)?)
         }
-        "config.setItems" => set_items(params),
+        "config.setItems" => set_items(state, params),
         "config.reload" => Ok(json!({ "ok": true })),
         _ => anyhow::bail!("unknown method: {}", method),
     }
@@ -55,7 +55,7 @@ fn platform_name() -> &'static str {
     }
 }
 
-fn set_items(params: &Value) -> anyhow::Result<Value> {
+fn set_items(state: &WebState, params: &Value) -> anyhow::Result<Value> {
     let items = params
         .get("items")
         .and_then(|v| v.as_array())
@@ -70,8 +70,9 @@ fn set_items(params: &Value) -> anyhow::Result<Value> {
         let toml_val = json_to_toml(&value)?;
         Config::set_user_value(&parts, toml_val)?;
     }
-    // MVP：仅落盘到用户层；热重载待接 Coordinator::apply_config（下次服务重启生效）。
-    Ok(json!({ "needsRestart": false }))
+    // 落盘后即时热重载：轻量字段立即生效，引擎结构性变更则 needsRestart=true。
+    let needs_restart = state.status.apply_config();
+    Ok(json!({ "needsRestart": needs_restart }))
 }
 
 /// JSON 标量/容器 → toml::Value（用于写用户层配置）。

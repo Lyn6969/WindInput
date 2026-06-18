@@ -33,6 +33,11 @@ pub(crate) const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
 pub trait CoreStatus: Send + Sync {
     fn is_chinese_mode(&self) -> bool;
     fn active_schema_id(&self) -> String;
+    /// config.setItems 落盘后重新加载并即时应用用户配置；返回是否仍需重启才能完全生效。
+    /// 默认实现保守返回 true（未接入热重载的宿主，如 dev server stub）。
+    fn apply_config(&self) -> bool {
+        true
+    }
 }
 
 /// 在调用方 tokio runtime 内启动 HTTP 服务（loopback）。一直 await 至服务结束。
