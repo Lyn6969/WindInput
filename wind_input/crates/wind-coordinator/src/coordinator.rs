@@ -1172,28 +1172,27 @@ impl Coordinator {
                 KeyAction::ClearComposition
             }
             keymap::VK_BACK => {
-                // Backspace：先删剩余拼音末字符；剩余为空则回退最后一个已转换段（你→ni 续编辑）；
-                // 两者皆空则退出。
+                // Backspace：分步撤销——有已转换段先退回最后一段（你→ni，码并回缓冲前部）；
+                // 否则删剩余拼音末字符；皆空则退出。
+                if let Some((code, _)) = state.committed_segs.pop() {
+                    state.committed_text =
+                        state.committed_segs.iter().map(|(_, t)| t.as_str()).collect();
+                    state.temp_pinyin_buffer = format!("{}{}", code, state.temp_pinyin_buffer);
+                    self.update_temp_pinyin_candidates(state);
+                    let display = state.preedit.clone();
+                    self.notify_ui_update(state);
+                    return KeyAction::UpdateComposition {
+                        caret_pos: display.chars().count() as u32,
+                        text: display,
+                    };
+                }
                 if state.temp_pinyin_buffer.is_empty() {
-                    if let Some((code, _)) = state.committed_segs.pop() {
-                        // committed_text 即各段汉字拼接，弹段后由剩余段重建（避免按字符数回删出错）。
-                        state.committed_text =
-                            state.committed_segs.iter().map(|(_, t)| t.as_str()).collect();
-                        state.temp_pinyin_buffer = code; // 段码还原进缓冲继续编辑
-                        self.update_temp_pinyin_candidates(state);
-                        let display = state.preedit.clone();
-                        self.notify_ui_update(state);
-                        return KeyAction::UpdateComposition {
-                            caret_pos: display.chars().count() as u32,
-                            text: display,
-                        };
-                    }
                     self.exit_temp_pinyin(state);
                     self.notify_ui_hide();
                     return KeyAction::ClearComposition;
                 }
                 state.temp_pinyin_buffer.pop();
-                if state.temp_pinyin_buffer.is_empty() && state.committed_text.is_empty() {
+                if state.temp_pinyin_buffer.is_empty() {
                     self.exit_temp_pinyin(state);
                     self.notify_ui_hide();
                     return KeyAction::ClearComposition;
@@ -2242,6 +2241,8 @@ impl Coordinator {
             .unwrap_or_default();
         let mut cands: Vec<Candidate> = Vec::new();
         let mut seen = std::collections::HashSet::new();
+        // 文本透镜：取首个真实方案的 preedit_display（拼音含音节分隔 "ni hao"）作组合区显示。
+        let mut text_display: Option<String> = None;
         for member in &members {
             if member == "quick_input" {
                 if !numeric {
@@ -2265,12 +2266,19 @@ impl Coordinator {
                     continue;
                 }
                 let result = self.engine_mgr.convert_with(member, &state.mix_buffer, 50);
+                if text_display.is_none() && !result.preedit_display.is_empty() {
+                    text_display = Some(result.preedit_display.clone());
+                }
                 for c in result.candidates {
                     if seen.insert(c.text.clone()) {
                         cands.push(c);
                     }
                 }
             }
+        }
+        // 文本透镜用音节分隔显示；数字透镜（计算）保持原始表达式。
+        if let Some(disp) = text_display {
+            state.preedit = format!("{}{}", state.committed_text, disp);
         }
         state.candidates = cands;
     }
@@ -2315,15 +2323,15 @@ impl Coordinator {
                 KeyAction::ClearComposition
             }
             keymap::VK_BACK => {
+                // 分步撤销：文本透镜有已转换段先退回最后一段（你→ni，码并回缓冲前部）。
+                if let Some((code, _)) = state.committed_segs.pop() {
+                    state.committed_text =
+                        state.committed_segs.iter().map(|(_, t)| t.as_str()).collect();
+                    state.mix_buffer = format!("{}{}", code, state.mix_buffer);
+                    return refresh(self, state);
+                }
                 state.mix_buffer.pop();
                 if state.mix_buffer.is_empty() {
-                    if let Some((code, _)) = state.committed_segs.pop() {
-                        // 文本透镜：回退最后一个已转换段（你→ni 续编辑）。
-                        state.committed_text =
-                            state.committed_segs.iter().map(|(_, t)| t.as_str()).collect();
-                        state.mix_buffer = code;
-                        return refresh(self, state);
-                    }
                     self.exit_mix_mode(state);
                     self.notify_ui_hide();
                     KeyAction::ClearComposition
@@ -3958,11 +3966,24 @@ impl MessageHandler for Coordinator {
                 KeyAction::ClearComposition
             }
             keymap::VK_BACK => {
-                // Backspace
-                if !state.input_buffer.is_empty() {
+                // Backspace：分步撤销——有已转换段则先把最后一段退回拼音（你→ni，码并回剩余
+                // 缓冲前部、重转），否则删剩余拼音末字符。
+                if !state.committed_segs.is_empty() {
+                    let (code, _) = state.committed_segs.pop().unwrap();
+                    state.committed_text =
+                        state.committed_segs.iter().map(|(_, t)| t.as_str()).collect();
+                    state.input_buffer = format!("{}{}", code, state.input_buffer);
+                    self.update_candidates(&mut state);
+                    let display = state.preedit.clone();
+                    self.notify_ui_update(&state);
+                    KeyAction::UpdateComposition {
+                        caret_pos: display.chars().count() as u32,
+                        text: display,
+                    }
+                } else if !state.input_buffer.is_empty() {
                     state.input_buffer.pop();
                     self.update_candidates(&mut state);
-                    if state.input_buffer.is_empty() && state.committed_text.is_empty() {
+                    if state.input_buffer.is_empty() {
                         self.notify_ui_hide();
                         KeyAction::ClearComposition
                     } else {
@@ -3973,19 +3994,6 @@ impl MessageHandler for Coordinator {
                             caret_pos: display.chars().count() as u32,
                             text: display,
                         }
-                    }
-                } else if !state.committed_segs.is_empty() {
-                    // 剩余拼音空、有已转换段：回退最后一段（你→ni 续编辑，主流拼音行为）。
-                    let (code, _) = state.committed_segs.pop().unwrap();
-                    state.committed_text =
-                        state.committed_segs.iter().map(|(_, t)| t.as_str()).collect();
-                    state.input_buffer = code;
-                    self.update_candidates(&mut state);
-                    let display = state.preedit.clone();
-                    self.notify_ui_update(&state);
-                    KeyAction::UpdateComposition {
-                        caret_pos: display.chars().count() as u32,
-                        text: display,
                     }
                 } else {
                     KeyAction::PassThrough
