@@ -3,6 +3,7 @@
 //! 提供与 Go 版 go-winio 相同的 SDDL 安全描述符，
 //! 允许 AppContainer/UWP 进程（如 Windows Store 版记事本）连接管道。
 
+#[cfg(windows)]
 use tracing::error;
 
 /// 共享的 SDDL 安全描述符字符串（与 Go 版 go-winio 的 PipeConfig.SecurityDescriptor 一致）
@@ -24,7 +25,15 @@ pub(crate) struct SecurityDescriptor {
 }
 
 impl SecurityDescriptor {
+    /// 从 SDDL 字符串解析安全描述符（仅 Windows；非 Windows 平台返回 None，
+    /// 让 wind-bridge 整体可原生编译/测试——`windows` 依赖是 `cfg(windows)` gated）。
+    #[cfg(not(windows))]
+    pub(crate) fn from_sddl(_sddl: &str) -> Option<Self> {
+        None
+    }
+
     /// 从 SDDL 字符串解析安全描述符
+    #[cfg(windows)]
     pub(crate) fn from_sddl(sddl: &str) -> Option<Self> {
         use windows::Win32::Security::Authorization::ConvertStringSecurityDescriptorToSecurityDescriptorA;
 
