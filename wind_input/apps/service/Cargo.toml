@@ -21,6 +21,7 @@ wind-dict = { path = "../../crates/wind-dict" }
 wind-engine = { path = "../../crates/wind-engine" }
 wind-ui = { path = "../../crates/wind-ui" }
 wind-theme = { path = "../../crates/wind-theme" }
+wind-webapi = { path = "../../crates/wind-webapi" }
 tokio = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }

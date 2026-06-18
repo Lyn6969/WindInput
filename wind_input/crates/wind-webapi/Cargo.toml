@@ -1,0 +1,18 @@
+[package]
+name = "wind-webapi"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+wind-ipc = { path = "../wind-ipc" }
+wind-config = { path = "../wind-config" }
+axum = { workspace = true }
+tokio = { workspace = true }
+serde_json = { workspace = true }
+toml = { workspace = true }
+anyhow = { workspace = true }
+tracing = { workspace = true }
+uuid = { workspace = true }
+
+[dev-dependencies]
+tower = { version = "0.5", features = ["util"] }

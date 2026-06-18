@@ -1,0 +1,82 @@
+# 统一声明式设置清单（core/setting/web 共用真相源）
+# core 解析后注入 app/engine/variant，经 system.manifest 暴露为 JSON。
+# 字段：key(点路径,对应 Config)/group/type/label/hint/default/since/options/min/max/step/unit/enabled_when
+
+[meta]
+version = 1                      # 清单格式版本（结构变更 +1）
+
+# ── 分组（→ web 页面/Tab、setting 导航）──
+[[groups]]
+key = "general"
+label = "通用"
+order = 1
+
+[[groups]]
+key = "appearance"
+label = "外观"
+order = 2
+
+# ── 设置项 ──
+[[items]]
+key = "input.filter_mode"
+group = "general"
+type = "select"
+label = "字符集过滤"
+hint = "限制候选字符集范围"
+default = "smart"
+since = 1
+options = [
+  { value = "smart", label = "智能" },
+  { value = "general", label = "通用" },
+  { value = "gb18030", label = "GB18030" },
+]
+
+[[items]]
+key = "input.smart_punct_after_digit"
+group = "general"
+type = "toggle"
+label = "数字后智能标点"
+hint = "数字后输入标点时自动判断中英文"
+default = true
+since = 1
+
+[[items]]
+key = "input.smart_symbol_mode"
+group = "general"
+type = "toggle"
+label = "智能符号"
+hint = "连续输入同一符号键时智能替换"
+default = false
+since = 1
+enabled_when = "input.smart_punct_after_digit == true"
+
+[[items]]
+key = "ui.candidate.per_page"
+group = "appearance"
+type = "slider"
+label = "每页候选数"
+hint = "候选窗每页显示的候选项数量"
+default = 7
+min = 3
+max = 9
+step = 1
+since = 1
+
+# ── 特性可用性（模块 + 子特性两层；web 据此显示/隐藏/禁用）──
+[features.dict]
+enabled = true
+paged = true
+import = false
+
+[features.freq]
+enabled = true
+
+[features.phrase]
+enabled = false
+
+[features.stats]
+enabled = false
+
+[features.theme]
+enabled = false
+import_url = false

@@ -94,7 +94,16 @@ fn main() {
 
     // 9. 创建中央协调器（传入 PushServer 用于激活状态推送）
     let coordinator = wind_coordinator::Coordinator::new(push_server.clone());
+    let coord_for_web = coordinator.clone();
     deferred.set_ready(coordinator);
+
+    // 9.5 启动内嵌 HTTP web API（仅 loopback，按需授权）：GUI 与远程 Web 共用同一套 API。
+    let web_status: Arc<dyn wind_webapi::CoreStatus> = Arc::new(WebStatus(coord_for_web));
+    runtime.spawn(async move {
+        if let Err(e) = wind_webapi::serve(web_status, variant).await {
+            error!("web api failed: {}", e);
+        }
+    });
 
     info!(
         "WindInput service ready (pipes: wind_input{}, wind_input_push{})",
@@ -114,6 +123,18 @@ fn main() {
             // 通道断开（不应发生）：退回挂起
             std::thread::park();
         },
+    }
+}
+
+/// 适配 Coordinator 为 web API 的运行时状态来源（解耦 wind-webapi 与 wind-coordinator）。
+struct WebStatus(Arc<wind_coordinator::Coordinator>);
+
+impl wind_webapi::CoreStatus for WebStatus {
+    fn is_chinese_mode(&self) -> bool {
+        self.0.is_chinese_mode()
+    }
+    fn active_schema_id(&self) -> String {
+        self.0.active_schema_id()
     }
 }
 
