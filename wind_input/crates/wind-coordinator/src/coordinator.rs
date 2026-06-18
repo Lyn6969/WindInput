@@ -30,10 +30,7 @@ use wind_store::freq::FreqRecord;
 use wind_transform::fullwidth::to_full_width;
 use wind_transform::punctuation::PunctuationConverter;
 use wind_ui::candidate_window::CandidateItem;
-use wind_ui::manager::{
-    CandidateOp, MenuCmd, MenuItemSpec, MenuKind, ToolbarAction, UiCommand, UiEvent, UiManager,
-};
-use wind_ui::toolbar::ToolbarState;
+use wind_ui::manager::{CandidateOp, UiCommand, UiEvent, UiManager};
 
 /// VK + shift → 该键产生的 ASCII 标点/符号字符（字母键返回 None，由拼音/码表处理）。
 /// 解析配对表（每项 2 字符 "（）"）为 (左,右) 字符对，忽略非法项。
@@ -177,7 +174,7 @@ fn now_unix_secs() -> i64 {
 
 /// 协调器输入状态
 /// 简繁变体（与 Go config.S2TVariant 对齐）：(opencc 变体名, 菜单显示名)
-const S2T_VARIANTS: [(&str, &str); 4] = [
+pub(crate) const S2T_VARIANTS: [(&str, &str); 4] = [
     ("s2t", "标准繁体"),
     ("s2tw", "台湾繁体"),
     ("s2twp", "台湾繁体（含词汇）"),
@@ -185,7 +182,7 @@ const S2T_VARIANTS: [(&str, &str); 4] = [
 ];
 
 /// 检索范围过滤模式（与 Go config.FilterMode 对齐）：(模式, 菜单显示名)
-const FILTER_MODES: [(wind_candidate::FilterMode, &str); 3] = [
+pub(crate) const FILTER_MODES: [(wind_candidate::FilterMode, &str); 3] = [
     (wind_candidate::FilterMode::Smart, "智能模式"),
     (wind_candidate::FilterMode::General, "常用字"),
     (wind_candidate::FilterMode::Gb18030, "全部字符"),
@@ -208,86 +205,86 @@ pub fn request_restart() {
     }
 }
 
-struct State {
-    chinese_mode: bool,
-    full_width: bool,
-    chinese_punct: bool,
+pub(crate) struct State {
+    pub(crate) chinese_mode: bool,
+    pub(crate) full_width: bool,
+    pub(crate) chinese_punct: bool,
     /// 简繁转换开关（运行时切换；commit 时把简体输出转繁体）
-    s2t_enabled: bool,
+    pub(crate) s2t_enabled: bool,
     /// 简繁变体（s2t/s2tw/s2twp/s2hk；运行时切换）
-    s2t_variant: String,
+    pub(crate) s2t_variant: String,
     /// 检索范围过滤模式（smart/general/gb18030；运行时切换）
-    filter_mode: wind_candidate::FilterMode,
+    pub(crate) filter_mode: wind_candidate::FilterMode,
     /// 用户是否开启常驻工具栏（菜单开关；与“当前是否激活”正交）。
-    toolbar_visible: bool,
+    pub(crate) toolbar_visible: bool,
     /// 本输入法当前是否处于激活态：IME_ACTIVATED/FocusGained 置真；
     /// IME_DEACTIVATED（切换输入法）与 FocusLost（失焦，含“每应用独立输入法”下切到
     /// 别的输入法的应用）置假。工具栏仅在激活态显示，对齐 Go toolbar_reducer 的
     /// `imeActivated && userWantsVisible` 公式；隐藏经 UI 层 50ms 防抖消除切换闪烁。
-    ime_active: bool,
-    caps_lock: bool,
-    input_buffer: String,
+    pub(crate) ime_active: bool,
+    pub(crate) caps_lock: bool,
+    pub(crate) input_buffer: String,
     /// 组合区显示文本（拼音含音节分隔 "ni hao"；码表为原始编码）。
     /// 仅显示输入码/拼音，绝不包含候选列表。
-    preedit: String,
-    candidates: Vec<Candidate>,
+    pub(crate) preedit: String,
+    pub(crate) candidates: Vec<Candidate>,
     /// 当前页内高亮候选下标（0-based，相对当前页）——键盘选中项，空格上屏的目标
-    selected_index: usize,
+    pub(crate) selected_index: usize,
     /// 鼠标悬停目标（原始 tag）：-1 无，0..N 候选页内下标，或翻页器 tag。
     /// 与 selected_index 相互独立：悬停只是视觉提示，不改变空格上屏的目标。
-    hover_index: i32,
+    pub(crate) hover_index: i32,
     /// 当前页码（0-based）
-    current_page: usize,
+    pub(crate) current_page: usize,
     /// 动态分级加载：当前候选对应的输入码
-    candidate_input: String,
+    pub(crate) candidate_input: String,
     /// 动态分级加载：当前加载上限
-    candidate_limit: usize,
+    pub(crate) candidate_limit: usize,
     /// 动态分级加载：是否可能还有更多前缀候选未加载
-    has_more: bool,
+    pub(crate) has_more: bool,
     /// 拼音类组合区「已转换前缀」（逐步转换：选中的汉字累积于此、留在组合区不上屏，
     /// 全部转换完才整体上屏）。内部存简体原文，输出时再 s2t。仅拼音/临拼/混输文本透镜使用，
     /// 码表（五笔）选词消费整串、绝不进入此态。见 docs/redesign/pinyin-composition-enhance.md。
-    committed_text: String,
+    pub(crate) committed_text: String,
     /// 已转换前缀的分段记录 (消费码, 汉字)：供退格逐段回退与完整上屏时自动造词。
-    committed_segs: Vec<(String, String)>,
+    pub(crate) committed_segs: Vec<(String, String)>,
     /// 当前激活的独占输入模式（临时拼音/快捷输入/临时英文）。`None` = 普通输入。
     /// 单点决策的唯一真相源：结构上保证同一时刻至多一个独占模式（见 `pipeline.rs`）。
-    active: Option<ModeKind>,
+    pub(crate) active: Option<ModeKind>,
     /// 临时拼音输入缓冲（拼音串）
-    temp_pinyin_buffer: String,
+    pub(crate) temp_pinyin_buffer: String,
     /// 临时拼音目标方案 id（如 "pinyin"）
-    temp_pinyin_schema: String,
+    pub(crate) temp_pinyin_schema: String,
     /// 临时拼音组合区前缀字符（触发键，如 "`"）
-    temp_pinyin_prefix: String,
+    pub(crate) temp_pinyin_prefix: String,
     /// 快捷输入缓冲（如 "1+2*3" / "12.25"）
-    quick_input_buffer: String,
+    pub(crate) quick_input_buffer: String,
     /// 快捷输入组合区前缀字符（触发键，如 ";"）
-    quick_input_prefix: String,
+    pub(crate) quick_input_prefix: String,
     /// 临时英文输入缓冲
-    temp_english_buffer: String,
+    pub(crate) temp_english_buffer: String,
     /// 网址模式输入缓冲（原样累积的 URL 文本）
-    url_buffer: String,
+    pub(crate) url_buffer: String,
     /// 统一夺取回退登记（仅在夺取式模式激活时为 Some，见 pipeline::Rewind）
-    rewind: Option<Rewind>,
+    pub(crate) rewind: Option<Rewind>,
     /// 特殊模式编码缓冲（自带码表的查询码）
-    special_buffer: String,
+    pub(crate) special_buffer: String,
     /// 当前特殊模式下标（= features.special_modes 索引；仅 active==Special 时有效）
-    special_id: u8,
+    pub(crate) special_id: u8,
     /// 临时 mix 编码缓冲
-    mix_buffer: String,
+    pub(crate) mix_buffer: String,
     /// 当前 mix 模式下标（= features.mix_modes 索引；仅 active==Mix 时有效）
-    mix_id: u8,
+    pub(crate) mix_id: u8,
     /// mix 数字模式（仅含 quick_input 成员时有效）：首字符数字/符号 → true（表达式：数字/符号
     /// 输入、字母选词）；首字符字母 → false（拼音/英文：字母输入、数字选词）。
-    mix_numeric: bool,
-    caret_x: i32,
-    caret_y: i32,
-    caret_height: i32,
+    pub(crate) mix_numeric: bool,
+    pub(crate) caret_x: i32,
+    pub(crate) caret_y: i32,
+    pub(crate) caret_height: i32,
     /// 菜单是否打开（打开时键盘事件转发给菜单窗口；UI 自管导航）
-    menu_open: bool,
+    pub(crate) menu_open: bool,
     /// 菜单目标候选（页内下标 + 文本），供候选词条操作/复制
-    menu_target_page_local: usize,
-    menu_target_text: String,
+    pub(crate) menu_target_page_local: usize,
+    pub(crate) menu_target_text: String,
 }
 
 /// 智能符号模式待命态：press1 提交一个参与集合内的中文标点后武装，等待时限内同键 press2
@@ -305,11 +302,11 @@ struct SmartSymbolArm {
 
 /// 中央协调器
 pub struct Coordinator {
-    state: Mutex<State>,
+    pub(crate) state: Mutex<State>,
     push_server: Arc<PushServer>,
     config: Config,
-    ui_tx: std::sync::mpsc::Sender<UiCommand>,
-    engine_mgr: EngineManager,
+    pub(crate) ui_tx: std::sync::mpsc::Sender<UiCommand>,
+    pub(crate) engine_mgr: EngineManager,
     /// redb 持久化存储（用户词/临时词/词频/影子规则）；None=无持久化（headless 测试）。
     store: Option<Arc<Store>>,
     compiled_hotkeys: CompiledHotkeys,
@@ -329,7 +326,7 @@ pub struct Coordinator {
     common_chars: wind_candidate::CommonChars,
     // Shadow 规则已迁至 redb（self.store 的 SHADOW 表）。
     /// 工具栏位置持久化文件路径（toolbar_pos.txt；None=不持久化）
-    toolbar_pos_path: Option<std::path::PathBuf>,
+    pub(crate) toolbar_pos_path: Option<std::path::PathBuf>,
     /// 候选反查（编码/拆字/拼音）供悬停提示
     reverse: wind_reverse::ReverseLookup,
     /// 标点配对：中/英配对表（left,right）+ 跟踪栈（用于智能跳过）
@@ -343,9 +340,9 @@ pub struct Coordinator {
     /// 主题目录（data/themes）
     themes_dir: Option<std::path::PathBuf>,
     /// 当前主题名
-    theme_name: Mutex<String>,
+    pub(crate) theme_name: Mutex<String>,
     /// 主题暗色模式
-    theme_dark: Mutex<bool>,
+    pub(crate) theme_dark: Mutex<bool>,
     /// 主题选择持久化文件（theme.txt）
     theme_path: Option<std::path::PathBuf>,
     /// 命令栏（cmdbar）服务束（ime/config/dict 等动作后端），构造后由 init_cmdbar 装配。
@@ -1086,7 +1083,7 @@ impl Coordinator {
     }
 
     /// 当前页候选切片的 [start, end) 区间
-    fn page_range(&self, state: &State) -> (usize, usize) {
+    pub(crate) fn page_range(&self, state: &State) -> (usize, usize) {
         let pp = self.per_page();
         let start = state.current_page * pp;
         let end = (start + pp).min(state.candidates.len());
@@ -3124,7 +3121,7 @@ impl Coordinator {
         );
     }
 
-    fn notify_ui_hide(&self) {
+    pub(crate) fn notify_ui_hide(&self) {
         let _ = self.ui_tx.send(UiCommand::HideCandidates);
     }
 
@@ -3148,66 +3145,10 @@ impl Coordinator {
         }
     }
 
-    /// 菜单项激活：UI 已自管导航/子菜单，这里仅按动作派发。
-    fn menu_action(&self, kind: MenuKind) {
-        let (page_local, text) = {
-            let s = self.state.lock().unwrap_or_else(|e| e.into_inner());
-            (s.menu_target_page_local, s.menu_target_text.clone())
-        };
-        self.menu_close();
-        match kind {
-            MenuKind::Op(op) => self.candidate_op(op, page_local),
-            MenuKind::Copy => {
-                let _ = self.ui_tx.send(UiCommand::CopyToClipboard(text));
-            }
-            MenuKind::Command(cmd) => self.run_menu_cmd(cmd),
-            MenuKind::Submenu | MenuKind::Separator => {}
-        }
-    }
 
-    /// 执行功能主菜单命令
-    fn run_menu_cmd(&self, cmd: MenuCmd) {
-        match cmd {
-            MenuCmd::SchemaEnglish => {
-                self.handle_system_mode_switch(false);
-                self.notify_toolbar();
-                self.notify_ui_hide();
-            }
-            MenuCmd::SchemaSelect(i) => self.select_schema(i),
-            MenuCmd::TogglePunct => {
-                self.handle_menu_command("toggle_punct");
-                self.notify_toolbar();
-            }
-            MenuCmd::ToggleWidth => {
-                self.handle_menu_command("toggle_width");
-                self.notify_toolbar();
-            }
-            MenuCmd::ToggleS2t => {
-                self.handle_menu_command("toggle_s2t");
-                self.notify_toolbar();
-            }
-            MenuCmd::S2tVariant(i) => self.set_s2t_variant(i),
-            MenuCmd::FilterMode(i) => self.set_filter_mode(i),
-            MenuCmd::ThemeSelect(i) => self.select_theme(i),
-            MenuCmd::ThemeStyle(style) => self.set_theme_style(style),
-            MenuCmd::ToggleToolbar => self.toggle_toolbar(),
-            MenuCmd::ReloadConfig => self.reload_config(),
-            MenuCmd::RestartService => self.restart_service(),
-            MenuCmd::OpenConfigDir
-            | MenuCmd::OpenDictionary
-            | MenuCmd::OpenSettings
-            | MenuCmd::OpenAbout => {
-                if let Some(d) = Config::user_config_dir() {
-                    let _ = self
-                        .ui_tx
-                        .send(UiCommand::OpenPath(d.display().to_string()));
-                }
-            }
-        }
-    }
 
     /// 选择第 N 个输入方案（隐含切到中文模式）。
-    fn select_schema(&self, index: usize) {
+    pub(crate) fn select_schema(&self, index: usize) {
         let list = self.engine_mgr.available_schemas().to_vec();
         if index >= list.len() {
             return;
@@ -3227,7 +3168,7 @@ impl Coordinator {
     }
 
     /// 选择第 N 个主题。
-    fn select_theme(&self, index: usize) {
+    pub(crate) fn select_theme(&self, index: usize) {
         let list = self.list_themes();
         if index >= list.len() {
             return;
@@ -3241,7 +3182,7 @@ impl Coordinator {
     }
 
     /// 设置主题明暗（0 跟随/1 亮/2 暗），用当前主题重解析。
-    fn set_theme_style(&self, style: u8) {
+    pub(crate) fn set_theme_style(&self, style: u8) {
         let dark = style == 2;
         *self.theme_dark.lock().unwrap_or_else(|e| e.into_inner()) = dark;
         let name = self
@@ -3254,7 +3195,7 @@ impl Coordinator {
     }
 
     /// 切换简繁变体（0=s2t 1=s2tw 2=s2twp 3=s2hk），重载转换器并刷新候选显示。
-    fn set_s2t_variant(&self, index: usize) {
+    pub(crate) fn set_s2t_variant(&self, index: usize) {
         let (variant, label) = match S2T_VARIANTS.get(index) {
             Some(v) => *v,
             None => return,
@@ -3286,7 +3227,7 @@ impl Coordinator {
     }
 
     /// 切换检索范围（0 智能/1 常用字/2 全部字符），以新范围重过滤并刷新候选。
-    fn set_filter_mode(&self, index: usize) {
+    pub(crate) fn set_filter_mode(&self, index: usize) {
         let (mode, label) = match FILTER_MODES.get(index) {
             Some(&(m, l)) => (m, l),
             None => return,
@@ -3308,18 +3249,9 @@ impl Coordinator {
         self.show_tip(label);
     }
 
-    /// 用户开关常驻工具栏（菜单）。仅翻转 toolbar_visible，显隐交 notify_toolbar
-    /// 单点决策（结合 ime_active）。
-    fn toggle_toolbar(&self) {
-        {
-            let mut s = self.state.lock().unwrap_or_else(|e| e.into_inner());
-            s.toolbar_visible = !s.toolbar_visible;
-        }
-        self.notify_toolbar();
-    }
 
     /// 重启服务进程：隐藏 UI 后向 main 发重启信号（main 释放单例并重拉自身）。
-    fn restart_service(&self) {
+    pub(crate) fn restart_service(&self) {
         info!("Restart service requested from menu");
         self.notify_ui_hide();
         let _ = self.ui_tx.send(UiCommand::HideToolbar);
@@ -3327,7 +3259,7 @@ impl Coordinator {
     }
 
     /// 重载配置（best-effort：重新下发当前主题）。
-    fn reload_config(&self) {
+    pub(crate) fn reload_config(&self) {
         let name = self
             .theme_name
             .lock()
@@ -3378,7 +3310,7 @@ impl Coordinator {
 
     /// 列出可用主题：(id, 显示名)。扫用户+安装目录，含 theme.yaml、非 `_` 前缀；
     /// 显示名取 meta.name（缺则用 id），按 (meta.order, id) 排序。
-    fn list_themes(&self) -> Vec<(String, String)> {
+    pub(crate) fn list_themes(&self) -> Vec<(String, String)> {
         let dirs = self.theme_search_dirs();
         let mut seen = std::collections::HashSet::new();
         let mut rows: Vec<(String, String, i32)> = Vec::new();
@@ -3413,201 +3345,14 @@ impl Coordinator {
         rows.into_iter().map(|(id, name, _)| (id, name)).collect()
     }
 
-    /// 循环切换到下一个主题，重绘并持久化选择。
-    /// 构建并显示功能主菜单（对齐 Go 统一菜单：方案/主题子菜单 + 勾选态）。
-    /// x/y 为屏幕坐标；i32::MIN 表示由 UI 取光标位置。
-    fn show_main_menu(&self, x: i32, y: i32) {
-        use wind_ui::manager::MenuItemSpec as M;
-        let (chinese, punct, full, s2t, s2t_variant, filter_mode, toolbar_vis) = {
-            let s = self.state.lock().unwrap_or_else(|e| e.into_inner());
-            (
-                s.chinese_mode,
-                s.chinese_punct,
-                s.full_width,
-                s.s2t_enabled,
-                s.s2t_variant.clone(),
-                s.filter_mode,
-                s.toolbar_visible,
-            )
-        };
-        let cmd = |c: MenuCmd| MenuKind::Command(c);
 
-        // 输入方案子菜单：英文 + 方案单选
-        let active = self.engine_mgr.active_schema_id();
-        let schemas = self.engine_mgr.available_schemas().to_vec();
-        let mut schema_children =
-            vec![M::leaf("英文", cmd(MenuCmd::SchemaEnglish), true, !chinese)];
-        if !schemas.is_empty() {
-            schema_children.push(M::separator());
-            for (i, id) in schemas.iter().enumerate() {
-                schema_children.push(M::leaf(
-                    id.clone(),
-                    cmd(MenuCmd::SchemaSelect(i)),
-                    true,
-                    chinese && *id == active,
-                ));
-            }
-        }
 
-        // 主题子菜单：主题单选 + 亮/暗
-        let themes = self.list_themes();
-        let cur_theme = self
-            .theme_name
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .clone();
-        let dark = *self.theme_dark.lock().unwrap_or_else(|e| e.into_inner());
-        let mut theme_children = Vec::new();
-        for (i, (id, name)) in themes.iter().enumerate() {
-            theme_children.push(M::leaf(
-                name.clone(),
-                cmd(MenuCmd::ThemeSelect(i)),
-                true,
-                *id == cur_theme,
-            ));
-        }
-        if !theme_children.is_empty() {
-            theme_children.push(M::separator());
-        }
-        theme_children.push(M::leaf("亮色", cmd(MenuCmd::ThemeStyle(1)), true, !dark));
-        theme_children.push(M::leaf("暗色", cmd(MenuCmd::ThemeStyle(2)), true, dark));
 
-        // 简入繁出子菜单：启用开关 + 变体单选
-        let mut s2t_children = vec![
-            M::leaf("启用", cmd(MenuCmd::ToggleS2t), true, s2t),
-            M::separator(),
-        ];
-        for (i, (id, label)) in S2T_VARIANTS.iter().enumerate() {
-            s2t_children.push(M::leaf(
-                *label,
-                cmd(MenuCmd::S2tVariant(i)),
-                true,
-                s2t_variant == *id,
-            ));
-        }
 
-        // 检索范围子菜单：过滤模式单选
-        let filter_children: Vec<_> = FILTER_MODES
-            .iter()
-            .enumerate()
-            .map(|(i, (m, label))| {
-                M::leaf(*label, cmd(MenuCmd::FilterMode(i)), true, filter_mode == *m)
-            })
-            .collect();
-
-        let items = vec![
-            M::submenu("输入方案", schema_children),
-            M::leaf("全角", cmd(MenuCmd::ToggleWidth), true, full),
-            M::leaf("中文标点", cmd(MenuCmd::TogglePunct), true, punct),
-            M::submenu("简入繁出", s2t_children),
-            M::submenu("检索范围", filter_children),
-            M::separator(),
-            M::leaf("显示工具栏", cmd(MenuCmd::ToggleToolbar), true, toolbar_vis),
-            M::submenu("主题", theme_children),
-            M::separator(),
-            M::leaf("重载配置", cmd(MenuCmd::ReloadConfig), true, false),
-            M::leaf("重启服务", cmd(MenuCmd::RestartService), true, false),
-            M::separator(),
-            M::leaf("词库管理...", cmd(MenuCmd::OpenDictionary), true, false),
-            M::leaf("设置...", cmd(MenuCmd::OpenSettings), true, false),
-            M::separator(),
-            M::leaf("关于", cmd(MenuCmd::OpenAbout), true, false),
-        ];
-        {
-            let mut s = self.state.lock().unwrap_or_else(|e| e.into_inner());
-            s.menu_open = true;
-            s.menu_target_page_local = 0;
-            s.menu_target_text = String::new();
-        }
-        let _ = self
-            .ui_tx
-            .send(UiCommand::ShowCandidateMenu { items, x, y });
-    }
-
-    fn is_menu_open(&self) -> bool {
-        self.state
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .menu_open
-    }
-
-    /// 关闭菜单
-    fn menu_close(&self) {
-        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
-        if state.menu_open {
-            state.menu_open = false;
-            drop(state);
-            let _ = self.ui_tx.send(UiCommand::HideMenu);
-        }
-    }
-
-    /// 菜单打开时转发导航键给菜单窗口；返回 true 表示已消费。
-    fn forward_menu_key(&self, key_code: u32) -> bool {
-        if !self.is_menu_open() {
-            return false;
-        }
-        match key_code {
-            // 方向键/回车/空格/ESC → 菜单窗口处理（导航/下钻/返回/激活/关闭）
-            0x26
-            | 0x28
-            | 0x25
-            | 0x27
-            | keymap::VK_RETURN
-            | keymap::VK_SPACE
-            | keymap::VK_ESCAPE => {
-                let _ = self.ui_tx.send(UiCommand::MenuKey(key_code));
-            }
-            // 其它键：关闭菜单并吞掉
-            _ => self.menu_close(),
-        }
-        true
-    }
-
-    /// 构建右键候选菜单项并下发给 UI 显示。
-    fn show_candidate_menu(&self, page_local: usize, x: i32, y: i32) {
-        use wind_ui::manager::MenuItemSpec as M;
-        let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
-        if state.candidates.is_empty() || state.input_buffer.is_empty() {
-            return;
-        }
-        let (start, end) = self.page_range(&state);
-        let idx = start + page_local;
-        if idx >= end || idx >= state.candidates.len() {
-            return;
-        }
-        let word = state.candidates[idx].text.clone();
-        let code = state.input_buffer.clone();
-        let total = state.candidates.len();
-        drop(state);
-
-        let schema = self.engine_mgr.active_schema_id();
-        let has_rule = self.shadow_has_rule(&schema, &code, &word);
-        let multi_char = word.chars().count() > 1;
-        let op = |o: CandidateOp| MenuKind::Op(o);
-
-        let items = vec![
-            M::leaf("置顶", op(CandidateOp::MoveTop), true, false),
-            M::leaf("前移", op(CandidateOp::MoveUp), idx > 0, false),
-            M::leaf("后移", op(CandidateOp::MoveDown), idx + 1 < total, false),
-            M::leaf("删除", op(CandidateOp::Delete), multi_char, false),
-            M::leaf("恢复默认", op(CandidateOp::Reset), has_rule, false),
-            M::separator(),
-            M::leaf("复制", MenuKind::Copy, true, false),
-        ];
-        {
-            let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
-            state.menu_open = true;
-            state.menu_target_page_local = page_local;
-            state.menu_target_text = word;
-        }
-        let _ = self
-            .ui_tx
-            .send(UiCommand::ShowCandidateMenu { items, x, y });
-    }
 
     /// 候选词条操作（右键菜单）：调整 Shadow 规则并即时重排重绘。
     /// code 取当前输入码（state.input_buffer）；按方案隔离。
-    fn candidate_op(&self, op: CandidateOp, page_local: usize) {
+    pub(crate) fn candidate_op(&self, op: CandidateOp, page_local: usize) {
         let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
         if state.candidates.is_empty() || state.input_buffer.is_empty() {
             return;
@@ -3651,7 +3396,7 @@ impl Coordinator {
     }
 
     /// 影子规则：当前 code 是否对 word 有规则（置顶/删除），决定菜单"恢复默认"可用性。
-    fn shadow_has_rule(&self, schema: &str, code: &str, word: &str) -> bool {
+    pub(crate) fn shadow_has_rule(&self, schema: &str, code: &str, word: &str) -> bool {
         let Some(store) = &self.store else {
             return false;
         };
@@ -3662,25 +3407,7 @@ impl Coordinator {
         )
     }
 
-    /// 读取持久化的工具栏位置（"x y" 文本）
-    fn load_toolbar_pos(&self) -> Option<(i32, i32)> {
-        let p = self.toolbar_pos_path.as_ref()?;
-        let content = std::fs::read_to_string(p).ok()?;
-        let mut it = content.split_whitespace();
-        let x: i32 = it.next()?.parse().ok()?;
-        let y: i32 = it.next()?.parse().ok()?;
-        Some((x, y))
-    }
 
-    /// 持久化工具栏位置（best-effort）
-    fn save_toolbar_pos(&self, x: i32, y: i32) {
-        if let Some(p) = &self.toolbar_pos_path {
-            if let Some(parent) = p.parent() {
-                let _ = std::fs::create_dir_all(parent);
-            }
-            let _ = std::fs::write(p, format!("{} {}", x, y));
-        }
-    }
 
     /// 当前模式下生效的配对表（按中/英标点 + 各自开关）
     fn active_pairs(&self, chinese_punct: bool) -> Option<&Vec<(char, char)>> {
@@ -3703,17 +3430,6 @@ impl Coordinator {
         }
     }
 
-    /// 工具栏单元格点击：复用菜单命令切换状态（内部已推送 C++），再刷新工具栏显示。
-    fn mouse_toolbar(&self, action: ToolbarAction) {
-        let cmd = match action {
-            ToolbarAction::ToggleMode => "toggle_mode",
-            ToolbarAction::SwitchEngine => "switch_engine",
-            ToolbarAction::TogglePunct => "toggle_punct",
-            ToolbarAction::ToggleWidth => "toggle_width",
-        };
-        self.handle_menu_command(cmd);
-        self.notify_toolbar();
-    }
 
     /// 点击选词：提交页内第 N 个候选，经 push 管道异步上屏（对齐 Go PushCommitText）。
     fn mouse_select(&self, page_local: usize) {
@@ -3864,28 +3580,6 @@ impl Coordinator {
         self.push_server.push_to_active(&encoded);
     }
 
-    /// 推送当前状态到常驻工具栏（中英/方案/标点/全半角）
-    /// 工具栏可见性单点决策 + 内容刷新。对齐 Go toolbar_reducer 的合取公式：
-    /// 仅当 `ime_active && toolbar_visible` 时显示（UpdateToolbar 会刷内容+定位+显示），
-    /// 否则下发 HideToolbar。所有调用点（启动/切模式/切方案/激活/失活）经此单点决策，
-    /// 不再各自直接显示，根治“工具栏总是显示、切走输入法不隐藏”。
-    fn notify_toolbar(&self) {
-        let schema_label = Self::schema_display_name(&self.engine_mgr.active_schema_id());
-        let s = self.state.lock().unwrap_or_else(|e| e.into_inner());
-        if !(s.ime_active && s.toolbar_visible) {
-            drop(s);
-            let _ = self.ui_tx.send(UiCommand::HideToolbar);
-            return;
-        }
-        let tb = ToolbarState {
-            chinese_mode: s.chinese_mode,
-            schema_label,
-            full_width: s.full_width,
-            chinese_punct: s.chinese_punct,
-        };
-        drop(s);
-        let _ = self.ui_tx.send(UiCommand::UpdateToolbar(tb));
-    }
 
     /// 在当前光标上方显示状态提示气泡（中英/标点/全半角/方案切换）
     fn show_tip(&self, text: &str) {
@@ -3901,7 +3595,7 @@ impl Coordinator {
     }
 
     /// 方案显示名（友好名优先，未知回退 id）
-    fn schema_display_name(id: &str) -> String {
+    pub(crate) fn schema_display_name(id: &str) -> String {
         match id {
             "wubi86" => "五笔".to_string(),
             "pinyin" => "拼音".to_string(),
@@ -4156,6 +3850,47 @@ impl Coordinator {
 }
 
 impl MessageHandler for Coordinator {
+    fn handle_menu_command(&self, command: &str) -> Option<StatusUpdateData> {
+        info!("Menu command: {}", command);
+        match command {
+            "toggle_mode" => self.handle_toggle_mode().0,
+            "toggle_width" => {
+                {
+                    let mut s = self.state.lock().unwrap_or_else(|e| e.into_inner());
+                    s.full_width = !s.full_width;
+                }
+                self.push_state_update();
+                Some(self.build_status())
+            }
+            "toggle_punct" => {
+                {
+                    let mut s = self.state.lock().unwrap_or_else(|e| e.into_inner());
+                    s.chinese_punct = !s.chinese_punct;
+                }
+                self.push_state_update();
+                Some(self.build_status())
+            }
+            "switch_engine" => {
+                self.cycle_schema();
+                Some(self.build_status())
+            }
+            "toggle_s2t" => {
+                let on = {
+                    let mut s = self.state.lock().unwrap_or_else(|e| e.into_inner());
+                    s.s2t_enabled = !s.s2t_enabled;
+                    s.s2t_enabled
+                };
+                self.show_tip(if on { "繁" } else { "简" });
+                Some(self.build_status())
+            }
+            _ => None,
+        }
+    }
+
+    fn handle_show_context_menu(&self, x: i32, y: i32) {
+        self.show_main_menu(x, y);
+    }
+
     fn handle_key_event(&self, data: &KeyEventData) -> KeyAction {
         debug!(
             "handle_key_event: type={} code=0x{:02X} mods=0x{:04X}",
@@ -4645,42 +4380,6 @@ impl MessageHandler for Coordinator {
         (Some(self.build_status()), commit_text)
     }
 
-    fn handle_menu_command(&self, command: &str) -> Option<StatusUpdateData> {
-        info!("Menu command: {}", command);
-        match command {
-            "toggle_mode" => self.handle_toggle_mode().0,
-            "toggle_width" => {
-                {
-                    let mut s = self.state.lock().unwrap_or_else(|e| e.into_inner());
-                    s.full_width = !s.full_width;
-                }
-                self.push_state_update();
-                Some(self.build_status())
-            }
-            "toggle_punct" => {
-                {
-                    let mut s = self.state.lock().unwrap_or_else(|e| e.into_inner());
-                    s.chinese_punct = !s.chinese_punct;
-                }
-                self.push_state_update();
-                Some(self.build_status())
-            }
-            "switch_engine" => {
-                self.cycle_schema();
-                Some(self.build_status())
-            }
-            "toggle_s2t" => {
-                let on = {
-                    let mut s = self.state.lock().unwrap_or_else(|e| e.into_inner());
-                    s.s2t_enabled = !s.s2t_enabled;
-                    s.s2t_enabled
-                };
-                self.show_tip(if on { "繁" } else { "简" });
-                Some(self.build_status())
-            }
-            _ => None,
-        }
-    }
 
     fn handle_composition_terminated(&self) {
         let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
@@ -4755,7 +4454,4 @@ impl MessageHandler for Coordinator {
     fn handle_host_render_request(&self) {}
     fn handle_host_render_ready(&self) {}
 
-    fn handle_show_context_menu(&self, x: i32, y: i32) {
-        self.show_main_menu(x, y);
-    }
 }

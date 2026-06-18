@@ -9,6 +9,7 @@ pub mod handle_cmdbar;
 pub mod handle_config;
 pub mod handle_key;
 pub mod handle_lifecycle;
+pub mod handle_menu;
 pub mod handle_mode;
 pub mod handle_punct;
 pub mod handle_temp;
