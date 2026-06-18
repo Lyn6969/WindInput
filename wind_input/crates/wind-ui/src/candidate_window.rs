@@ -460,7 +460,6 @@ impl CandidateWindow {
         let t = &self.theme;
         let v = &t.views;
         let s = self.scale;
-        let gap = self.config.item_spacing.max(2.0);
         // 字号：base = 主题 behavior.font_size（默认 18，主题/用户可调）× DPI；
         // 序号/注释/预编辑按各节点 font_size（相对主字号的有符号逻辑偏移）调整。
         let base_fs = (t.behavior.font_size as f32) * s;
@@ -507,7 +506,8 @@ impl CandidateWindow {
             )
             .radius(dim(v.window.border_radius, 8.0))
             .pad(edges_or(&v.window.padding, [6.0, 8.0, 6.0, 8.0]))
-            .gap(gap);
+            // band 间距（预编辑条↔候选列表↔翻页）= 主题 candidate_list.band_gap，未配→0（与 Go 一致）。
+            .gap(dim(v.window_gap, 0.0));
         // 窗口背景图（九宫格/拉伸位图皮肤，如 jidian 的 panel）。
         if let Some(vi) = self.rv_image(v.window.bg_image.as_ref()) {
             root = root.bg_image(vi);
@@ -547,6 +547,13 @@ impl CandidateWindow {
         let index_circle_bg = col(v.index.bg_color, [66, 133, 244, 255]);
         let item_pad = edges_or(&v.item.padding, [7.0, 10.0, 7.0, 8.0]);
         let item_radius = dim(v.item.border_radius, 4.0);
+        // 候选间距全由主题决定（与 Go 对齐，以主题配置为准）：
+        // 横排候选框间隙 = max(item_spacing − item 左右内边距, 0)——内边距本身已提供视觉间隔，
+        // 扣除避免"间距 + 内边距"叠加（旧逻辑用 config×2 凭空多加一段，致 msime 元素间隔不一致）。
+        // 竖排行距 = candidate_list.row_gap。主题未配 → 0（候选框相邻，靠 padding 分隔）。
+        let item_spacing = v.item_spacing.map(|d| d.resolve(s, 0.0)).unwrap_or(0.0);
+        let box_gap = (item_spacing - item_pad.l - item_pad.r).max(0.0);
+        let row_gap_v = dim(v.row_gap, 0.0);
         // 选中候选左侧强调条（仅主题启用时，如 msime/jidian）。
         let accent_bar = v
             .accent_bar_enabled
@@ -554,9 +561,9 @@ impl CandidateWindow {
 
         // 候选列表：横排=Row（cell 并列）；竖排=Column（候选纵向堆叠）。
         let mut list = if self.vertical {
-            View::container(Layout::Column).gap(gap * 0.6)
+            View::container(Layout::Column).gap(row_gap_v)
         } else {
-            View::container(Layout::Row).gap(gap * 2.0).cross(Align::Center)
+            View::container(Layout::Row).gap(box_gap).cross(Align::Center)
         };
         for (i, cand) in self.candidates.iter().enumerate() {
             let marker = if cand.label.is_empty() {

@@ -557,11 +557,16 @@ impl PopupMenu {
         let item_h = (FONT_PX * 1.9 * s).ceil();
         let pad = Edges::xy(12.0 * s, 4.0 * s);
 
-        // 统一项宽 = 最长行 + 内边距
+        // 统一项宽 = 最长行 + 内边距；子菜单项额外预留 ▸ 列宽（右对齐固定到末端）。
+        let arrow_w = self.renderer.measure_text(SUBMENU_ARROW).width;
+        let arrow_gap = 12.0 * s; // 标签与 ▸ 之间的最小留白
         let mut max_label = 0.0f32;
         for it in items {
             if !is_separator(it) {
-                let w = self.renderer.measure_text(&row_text(it)).width;
+                let mut w = self.renderer.measure_text(&row_text(it)).width;
+                if is_submenu(it) {
+                    w += arrow_gap + arrow_w;
+                }
                 max_label = max_label.max(w);
             }
         }
@@ -608,6 +613,12 @@ impl PopupMenu {
                 .cross(Align::Center)
                 .tag(i as i32)
                 .child(View::leaf(row_text(it), color));
+            // 子菜单 ▸：弹性占位把它推到菜单项右端（与标签解耦，标准菜单观感）。
+            if is_submenu(it) {
+                item = item
+                    .child(View::spacer())
+                    .child(View::leaf(SUBMENU_ARROW, color));
+            }
             if is_hl {
                 item = item.bg(self.hl_bg);
             }
@@ -650,11 +661,14 @@ impl PopupMenu {
 }
 
 /// 行显示文本：勾选前缀 + 标签 + 子菜单箭头。
+/// 行文本（不含子菜单 ▸；▸ 作为独立右对齐节点渲染）。
 fn row_text(it: &MenuItemSpec) -> String {
     let mark = if it.checked { "✓ " } else { "   " };
-    let arrow = if is_submenu(it) { " ▸" } else { "" };
-    format!("{}{}{}", mark, it.label, arrow)
+    format!("{}{}", mark, it.label)
 }
+
+/// 子菜单指示符（固定到菜单项右端）。
+const SUBMENU_ARROW: &str = "▸";
 
 impl WindowMouse for MenuState {
     fn on_message(

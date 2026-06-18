@@ -131,6 +131,8 @@ pub struct View {
     /// z 层级覆盖图（z<0 在内容下、z>0 在内容上）。
     pub layers: Vec<ViewLayer>,
     pub children: Vec<View>,
+    /// 弹性占位：主轴方向吸收容器剩余空间（用于把后续子节点推到末端，如菜单 ▸ 右对齐）。
+    pub grow: bool,
     /// 命中标识：>=0 参与命中收集（如候选下标 / 按钮 id），<0 忽略
     pub tag: i32,
     // 计算结果
@@ -161,6 +163,7 @@ impl Default for View {
             bg_image: None,
             layers: Vec::new(),
             children: Vec::new(),
+            grow: false,
             tag: -1,
             mw: 0.0,
             mh: 0.0,
@@ -185,6 +188,20 @@ impl View {
             layout,
             ..Default::default()
         }
+    }
+
+    /// 弹性占位：主轴吸收剩余空间，把其后的兄弟节点推到容器末端。
+    pub fn spacer() -> Self {
+        Self {
+            grow: true,
+            ..Default::default()
+        }
+    }
+
+    /// 标记本节点为弹性（主轴吸收剩余空间）。
+    pub fn grow(mut self) -> Self {
+        self.grow = true;
+        self
     }
 
     // —— 链式构建辅助 ——
@@ -324,8 +341,21 @@ impl View {
         let content_w = self.mw - self.padding.w();
         let content_h = self.mh - self.padding.h();
 
+        let n = self.children.len();
+        let gap_total = if n > 1 { self.gap * (n - 1) as f32 } else { 0.0 };
+        let growers = self.children.iter().filter(|c| c.grow).count();
+
         match self.layout {
             Layout::Row => {
+                // 弹性分配：主轴剩余空间均摊给 grow 子节点（撑大其 mw）。
+                if growers > 0 {
+                    let used: f32 =
+                        self.children.iter().map(|c| c.margin_box().0).sum::<f32>() + gap_total;
+                    let extra = (content_w - used).max(0.0) / growers as f32;
+                    for c in self.children.iter_mut().filter(|c| c.grow) {
+                        c.mw += extra;
+                    }
+                }
                 let mut cx = cx0;
                 for c in &mut self.children {
                     let (cmw, cmh) = c.margin_box();
@@ -339,6 +369,14 @@ impl View {
                 }
             }
             Layout::Column => {
+                if growers > 0 {
+                    let used: f32 =
+                        self.children.iter().map(|c| c.margin_box().1).sum::<f32>() + gap_total;
+                    let extra = (content_h - used).max(0.0) / growers as f32;
+                    for c in self.children.iter_mut().filter(|c| c.grow) {
+                        c.mh += extra;
+                    }
+                }
                 let mut cy = cy0;
                 for c in &mut self.children {
                     let (cmw, cmh) = c.margin_box();
