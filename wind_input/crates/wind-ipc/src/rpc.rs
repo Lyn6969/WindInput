@@ -13,7 +13,7 @@ pub const PROTOCOL_VERSION: i32 = 1;
 /// JSON-RPC 请求
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Request {
-    #[serde(rename = "v")]
+    /// 协议版本，线上字段名即 "version"（双边统一，避免 v 歧义）。
     pub version: i32,
     pub id: u64,
     pub method: String,

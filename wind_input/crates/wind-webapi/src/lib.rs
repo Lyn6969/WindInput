@@ -126,7 +126,10 @@ mod tests {
         if let Some(t) = token {
             rb = rb.header("x-windinput-token", t);
         }
-        let body = format!(r#"{{"v":1,"id":1,"method":"{}","params":{{}}}}"#, method);
+        let body = format!(
+            r#"{{"version":1,"id":1,"method":"{}","params":{{}}}}"#,
+            method
+        );
         let resp = build_router(st)
             .oneshot(rb.body(Body::from(body)).unwrap())
             .await
