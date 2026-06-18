@@ -44,9 +44,12 @@
   - **$CC 动作执行**：候选选中（键盘 commit_selected / 鼠标 mouse_select）拦截 is_command →
     `spawn_command` **独立线程**执行（避开持 state 锁回调自锁方法的重入死锁，对齐 Go 约束）→
     `run_command_candidate` 解析+求值+跑动作；`type()` 文本经 push 管道上屏。
-  - 服务装配（handle_cmdbar.rs，Weak<Coordinator> 回调）：**已接通** ime.toggle(cn-en/fullshape/s2t)、
-    ime.schema、dict.add；**待补**（平台/配置能力）：key/clip/proc/url/search/config/setting/theme_cycle，
-    缺失返回 ServiceUnavailable 优雅降级。
-  - 验证局限：coordinator 无法原生测（wind-bridge 预存破）；cmdbar 侧 $CC ime 派发已原生测（mock 控制器）；
+  - 服务装配（handle_cmdbar.rs）：**已接通**
+    - ime.toggle(cn-en/fullshape/s2t/toolbar)、ime.schema、ime.theme_cycle、dict.add（Weak<Coordinator> 回调）；
+    - proc.run/proc.shell（std::process::Command，跨平台）、open + web.search（系统外壳 cmd start / xdg-open）、
+      clip.copy（wind_ui 写剪贴板，cfg(windows)）——这些无需 coordinator 回调，独立 struct。
+    - **待补**：key.*（按键注入 SendInput）、clip.paste/get（读剪贴板）、config.*（配置路径访问 + 持久化）、
+      setting.open/web（设置应用）、ime.toggle(preedit/candwin/layout)。缺失返回 ServiceUnavailable 优雅降级。
+  - 验证局限：coordinator 无法原生测（wind-bridge 预存破）；cmdbar 侧动作派发已原生测（mock 控制器/服务）；
     coordinator 集成仅 windows 目标 check + debug exe 链接通过，**功能需上设备实测**。
-- 验证：`cargo test -p wind-cmdbar` 50 passed；clippy 零警告；全工作区 windows check + debug exe 构建通过。
+- 验证：`cargo test -p wind-cmdbar` 51 passed；clippy 零警告；全工作区 windows check + debug exe 构建通过。

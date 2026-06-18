@@ -15,19 +15,26 @@
 
 use crate::coordinator::Coordinator;
 use chrono::{DateTime, Local};
+use std::process::Command;
 use std::sync::{Arc, Weak};
 use tracing::warn;
-use wind_cmdbar::{DictService, EvalContext, ImeController, Services};
+use wind_cmdbar::{
+    ClipboardService, DictService, EvalContext, ImeController, ProcessRunner, Services, UrlOpener,
+};
 
 impl Coordinator {
-    /// 构造后装配 cmdbar：自身 Weak 引用 + Services（ime/dict 后端）。一次性，幂等。
+    /// 构造后装配 cmdbar：自身 Weak 引用 + Services。一次性，幂等。
     pub(crate) fn init_cmdbar(self: &Arc<Self>) {
         let _ = self.self_weak.set(Arc::downgrade(self));
         let weak = Arc::downgrade(self);
         let mut svc = Services::new();
         svc.ime = Some(Arc::new(CoordIme(weak.clone())));
         svc.dict = Some(Arc::new(CoordDict(weak)));
-        // config/key/clip/proc/url/search：平台/配置能力待补，留 None。
+        // 无需 coordinator 回调的能力：进程启动、打开 URL/文件、写剪贴板（纯平台/std）。
+        svc.proc = Some(Arc::new(StdProc));
+        svc.open = Some(Arc::new(ShellOpener));
+        svc.clip = Some(Arc::new(SysClip));
+        // key/search/config/setting：平台/配置能力待补，留 None（web.search 经 open 默认可用）。
         let _ = self.cmdbar_services.set(svc);
     }
 
@@ -123,9 +130,11 @@ impl ImeController for CoordIme {
         }
         Ok(())
     }
-    fn theme_cycle(&self, _dir: &str) -> anyhow::Result<String> {
-        warn!("ime.theme_cycle: Rust 端主题循环待补");
-        Ok(String::new())
+    fn theme_cycle(&self, dir: &str) -> anyhow::Result<String> {
+        match self.0.upgrade() {
+            Some(c) => Ok(c.cmd_theme_cycle(dir)),
+            None => Ok(String::new()),
+        }
     }
 }
 
@@ -138,5 +147,82 @@ impl DictService for CoordDict {
             c.cmd_dict_add(text, code)?;
         }
         Ok(())
+    }
+}
+
+/// 进程启动（std，跨平台，无需 coordinator）：proc.run / proc.shell。
+struct StdProc;
+
+impl ProcessRunner for StdProc {
+    fn run(&self, cmd: &str, args: &[String]) -> anyhow::Result<()> {
+        Command::new(cmd).args(args).spawn()?;
+        Ok(())
+    }
+    fn shell(&self, cmdline: &str) -> anyhow::Result<()> {
+        shell_spawn(cmdline)
+    }
+    fn shell_ex(&self, cmdline: &str, _flags: &[String]) -> anyhow::Result<()> {
+        // flags(term/pwsh)暂未区分，统一走默认 shell（待平台 shell 选择补齐）。
+        shell_spawn(cmdline)
+    }
+}
+
+#[cfg(windows)]
+fn shell_spawn(cmdline: &str) -> anyhow::Result<()> {
+    Command::new("cmd").args(["/C", cmdline]).spawn()?;
+    Ok(())
+}
+
+#[cfg(not(windows))]
+fn shell_spawn(cmdline: &str) -> anyhow::Result<()> {
+    Command::new("sh").args(["-c", cmdline]).spawn()?;
+    Ok(())
+}
+
+/// 打开 URL / 程序 / 文件（系统外壳，跨平台）：open / web.search 默认通路。
+struct ShellOpener;
+
+impl UrlOpener for ShellOpener {
+    fn open(&self, target: &str) -> anyhow::Result<()> {
+        open_target(target)
+    }
+}
+
+#[cfg(windows)]
+fn open_target(target: &str) -> anyhow::Result<()> {
+    // cmd start：第一个引号参数是窗口标题（留空），其后为目标。
+    Command::new("cmd")
+        .args(["/C", "start", "", target])
+        .spawn()?;
+    Ok(())
+}
+
+#[cfg(not(windows))]
+fn open_target(target: &str) -> anyhow::Result<()> {
+    Command::new("xdg-open").arg(target).spawn()?;
+    Ok(())
+}
+
+/// 系统剪贴板写入（clip.copy）。读/粘贴需平台读剪贴板或按键注入，暂未支持。
+struct SysClip;
+
+impl ClipboardService for SysClip {
+    fn set_text(&self, text: &str) -> anyhow::Result<()> {
+        #[cfg(windows)]
+        {
+            wind_ui::popup_menu::set_clipboard_text(text);
+            Ok(())
+        }
+        #[cfg(not(windows))]
+        {
+            let _ = text;
+            anyhow::bail!("clip.copy: 非 Windows 平台暂未支持")
+        }
+    }
+    fn get_text(&self) -> anyhow::Result<String> {
+        anyhow::bail!("clip get: 暂未支持（待平台读剪贴板）")
+    }
+    fn paste(&self) -> anyhow::Result<()> {
+        anyhow::bail!("clip.paste: 需按键注入（key 服务待补）")
     }
 }

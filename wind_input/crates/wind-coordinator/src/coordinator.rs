@@ -2816,21 +2816,48 @@ impl Coordinator {
     /// cmdbar 能力 wrapper（被 handle_cmdbar 控制器经 Weak 回调）。各方法自锁，**禁止**在持
     /// state 锁时调用（spawn_command 已确保在独立线程、未持锁时执行）。
     pub(crate) fn cmd_ime_toggle(&self, target: &str) {
-        let cmd = match target {
-            "cn-en" => "toggle_mode",
-            "fullshape" => "toggle_width",
-            "s2t" => "toggle_s2t",
-            other => {
-                warn!("ime.toggle: 暂不支持 target {:?}（Rust 平台能力待补）", other);
-                return;
+        match target {
+            "cn-en" => {
+                self.handle_menu_command("toggle_mode");
             }
-        };
-        self.handle_menu_command(cmd);
+            "fullshape" => {
+                self.handle_menu_command("toggle_width");
+            }
+            "s2t" => {
+                self.handle_menu_command("toggle_s2t");
+            }
+            "toolbar" => self.toggle_toolbar(),
+            other => {
+                warn!("ime.toggle: 暂不支持 target {:?}（Rust 平台能力待补）", other)
+            }
+        }
     }
 
     /// 切换输入方案（持久化由 switch_schema 内部处理）。
     pub(crate) fn cmd_set_schema(&self, id: &str) {
         self.switch_schema(id);
+    }
+
+    /// 循环切换主题并持久化；dir="prev" 向前，其余向后。返回新主题显示名。
+    pub(crate) fn cmd_theme_cycle(&self, dir: &str) -> String {
+        let list = self.list_themes(); // Vec<(id, name)>
+        if list.is_empty() {
+            return String::new();
+        }
+        let cur = self
+            .theme_name
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        let pos = list.iter().position(|(id, _)| *id == cur).unwrap_or(0);
+        let n = list.len();
+        let next = if dir == "prev" {
+            (pos + n - 1) % n
+        } else {
+            (pos + 1) % n
+        };
+        self.select_theme(next);
+        list[next].1.clone()
     }
 
     /// 加词到用户层（code 为空时暂不支持自动推导编码）。

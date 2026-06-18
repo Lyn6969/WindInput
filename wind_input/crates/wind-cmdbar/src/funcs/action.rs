@@ -186,6 +186,40 @@ mod tests {
     }
 
     #[test]
+    fn proc_run_dispatches_cmd_and_args() {
+        use crate::services::ProcessRunner;
+
+        #[derive(Default)]
+        struct RecProc(Mutex<Vec<String>>);
+        impl ProcessRunner for RecProc {
+            fn run(&self, cmd: &str, args: &[String]) -> anyhow::Result<()> {
+                self.0.lock().unwrap().push(format!("run:{cmd}:{}", args.join(",")));
+                Ok(())
+            }
+            fn shell(&self, cmdline: &str) -> anyhow::Result<()> {
+                self.0.lock().unwrap().push(format!("shell:{cmdline}"));
+                Ok(())
+            }
+            fn shell_ex(&self, cmdline: &str, flags: &[String]) -> anyhow::Result<()> {
+                self.0.lock().unwrap().push(format!("shellex:{cmdline}:{}", flags.join("|")));
+                Ok(())
+            }
+        }
+
+        let rec = Arc::new(RecProc::default());
+        let mut svc = Services::new();
+        svc.proc = Some(rec.clone());
+        let ctx = MemoryContext::new().with_services(svc);
+        fn_run(&ctx, &["notepad.exe".into(), "a.txt".into()]).unwrap();
+        fn_shell(&ctx, &["echo hi".into()]).unwrap();
+        fn_shell(&ctx, &["echo hi".into(), "term,pwsh".into()]).unwrap();
+        let log = rec.0.lock().unwrap();
+        assert_eq!(log[0], "run:notepad.exe:a.txt");
+        assert_eq!(log[1], "shell:echo hi");
+        assert_eq!(log[2], "shellex:echo hi:term|pwsh");
+    }
+
+    #[test]
     fn missing_service_errors() {
         let ctx = MemoryContext::new().with_services(Services::new());
         assert!(matches!(
