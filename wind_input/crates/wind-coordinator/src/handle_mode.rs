@@ -10,6 +10,12 @@ use wind_bridge::handler::KeyAction;
 use wind_config::Config;
 use wind_ui::manager::UiCommand;
 
+use crate::coordinator::{printable_char, punct_char};
+use wind_bridge::handler::KeyEventData;
+use wind_candidate::Candidate;
+use wind_ipc::protocol::MOD_SHIFT;
+use wind_keys::keymap;
+
 impl Coordinator {
     /// 设置简繁开关（测试/诊断用）。返回是否生效（数据缺失则 false）。
     pub fn debug_set_s2t(&self, on: bool) -> bool {
@@ -340,5 +346,280 @@ impl Coordinator {
             .key_up
             .iter()
             .any(|e| (e.match_hash & 0xFFFF) == key_code)
+    }
+
+    /// 找出 key_code 匹配的 mix 模式下标（按配置顺序先到先得）。
+    pub(crate) fn match_mix_trigger(&self, key_code: u32) -> Option<u8> {
+        for (i, m) in self.config.features.mix_modes.iter().enumerate() {
+            if i > u8::MAX as usize {
+                break;
+            }
+            if m.trigger_keys
+                .iter()
+                .filter_map(|k| Self::special_trigger_vk(k))
+                .any(|vk| vk == key_code)
+            {
+                return Some(i as u8);
+            }
+        }
+        None
+    }
+
+    /// 选中当前页第 `page_offset`（0=首选）候选。
+    /// 文本透镜（拼音/英文）走组合区逐步转换：部分匹配并入 committed 前缀、裁剪缓冲、重转剩余
+    /// （剩余仍由 mix 成员方案出候选，不落五笔），留模式内不上屏；完整匹配整体上屏 + 造词。
+    /// 数字透镜（计算）的候选恒整体上屏。
+    pub(crate) fn mix_select(&self, state: &mut State, page_offset: usize) -> KeyAction {
+        let (start, end) = self.page_range(state);
+        let gi = start + page_offset;
+        if gi >= end {
+            return KeyAction::Consumed;
+        }
+        let cand = state.candidates[gi].clone();
+        let numeric = self.mix_has_quick_input(state.mix_id) && state.mix_numeric;
+        let total = state.mix_buffer.len();
+        let consumed = cand.consumed_length;
+        let partial = !numeric
+            && consumed > 0
+            && consumed < total
+            && state.mix_buffer.is_char_boundary(consumed);
+        if partial {
+            let code = Self::cand_code(&state.mix_buffer, &cand);
+            self.record_selection(&code, &cand.text);
+            state.committed_segs.push((code, cand.text.clone()));
+            state.committed_text.push_str(&cand.text);
+            state.mix_buffer = state.mix_buffer[consumed..].to_string();
+            self.update_mix_candidates(state);
+            let display = state.preedit.clone();
+            self.notify_ui_update(state);
+            KeyAction::UpdateComposition {
+                caret_pos: display.chars().count() as u32,
+                text: display,
+            }
+        } else {
+            let out = format!("{}{}", state.committed_text, cand.text);
+            if !numeric {
+                let code = Self::cand_code(&state.mix_buffer, &cand);
+                self.record_selection(&code, &cand.text);
+                state.committed_segs.push((code, cand.text.clone()));
+                self.learn_phrase_on_commit(state);
+            }
+            let out = self.maybe_s2t(state, &out);
+            self.exit_mix_mode(state);
+            self.notify_ui_hide();
+            Self::commit_action(out, true)
+        }
+    }
+
+    /// 刷新 mix 候选：按配置成员序逐个查询、合并、按文本去重。
+    /// "quick_input" 是内置类方案（日期/计算），用 generate_quick_input_candidates 计算；
+    /// 其余为真实方案经 convert_with。数字模式只取 quick_input（表达式），文本模式只取真实方案
+    /// （拼音/英文），避免互相污染候选。
+    pub(crate) fn update_mix_candidates(&self, state: &mut State) {
+        state.candidates.clear();
+        state.current_page = 0;
+        state.selected_index = 0;
+        // 组合区 = 已转换前缀（文本透镜逐步转换累积）+ 剩余缓冲。
+        state.preedit = format!("{}{}", state.committed_text, state.mix_buffer);
+        if state.mix_buffer.is_empty() {
+            return;
+        }
+        let numeric = self.mix_has_quick_input(state.mix_id) && state.mix_numeric;
+        let members = self
+            .config
+            .features
+            .mix_modes
+            .get(state.mix_id as usize)
+            .map(|m| m.members.clone())
+            .unwrap_or_default();
+        let mut cands: Vec<Candidate> = Vec::new();
+        let mut seen = std::collections::HashSet::new();
+        // 文本透镜：取首个真实方案的 preedit_display（拼音含音节分隔 "ni hao"）作组合区显示。
+        let mut text_display: Option<String> = None;
+        for member in &members {
+            if member == "quick_input" {
+                if !numeric {
+                    continue; // 文本模式跳过计算
+                }
+                let dp = self.config.features.quick_input.decimal_places;
+                for t in wind_quick_input::generate_quick_input_candidates(&state.mix_buffer, dp)
+                {
+                    if seen.insert(t.clone()) {
+                        cands.push(Candidate {
+                            text: t,
+                            ..Default::default()
+                        });
+                    }
+                }
+            } else {
+                if numeric {
+                    continue; // 数字模式跳过真实方案（表达式无拼音/英文意义）
+                }
+                if !self.engine_mgr.ensure_schema(member) {
+                    continue;
+                }
+                let result = self.engine_mgr.convert_with(member, &state.mix_buffer, 50);
+                if text_display.is_none() && !result.preedit_display.is_empty() {
+                    text_display = Some(result.preedit_display.clone());
+                }
+                for c in result.candidates {
+                    if seen.insert(c.text.clone()) {
+                        cands.push(c);
+                    }
+                }
+            }
+        }
+        // 文本透镜用音节分隔显示；数字透镜（计算）保持原始表达式。
+        if let Some(disp) = text_display {
+            state.preedit = format!("{}{}", state.committed_text, disp);
+        }
+        state.candidates = cands;
+    }
+
+    /// 数字 lens（计算/表达式）：数字与符号（含 `=`）作输入，字母作选词。
+    /// 仅含 quick_input 成员的 mix 在首字符为数字/符号时进入。返回该键应输入的字符。
+    pub(crate) fn mix_numeric_input_char(key_code: u32, shift: bool) -> Option<char> {
+        if (keymap::VK_A..=keymap::VK_Z).contains(&key_code) {
+            None // 字母在数字 lens 作选词，不输入
+        } else {
+            printable_char(key_code, shift) // 数字 + 任意符号（含 = + - * / . 等）入缓冲
+        }
+    }
+
+    /// mix 模式按键处理 —— 双透镜统一管线（见架构说明）。
+    /// 首字符确定 lens：数字/符号 → 数字 lens（符号输入、字母选词）；字母 → 文本 lens
+    /// （字母输入、数字选词、`-`/`=` 翻页）。每键顺序：控制键 → ①输入字符 → ②翻页/高亮
+    /// → ③本 lens 选词键 → ④配置二三候选键 → ⑤其它标点顶屏。
+    pub(crate) fn handle_mix_key(&self, state: &mut State, data: &KeyEventData) -> KeyAction {
+        let refresh = |this: &Self, state: &mut State| -> KeyAction {
+            this.update_mix_candidates(state);
+            let d = state.preedit.clone();
+            this.notify_ui_update(state);
+            KeyAction::UpdateComposition {
+                text: d.clone(),
+                caret_pos: d.chars().count() as u32,
+            }
+        };
+        let commit_text = |this: &Self, state: &mut State, t: String| -> KeyAction {
+            this.exit_mix_mode(state);
+            this.notify_ui_hide();
+            if t.is_empty() {
+                KeyAction::ClearComposition
+            } else {
+                Self::commit_action(t, true)
+            }
+        };
+        match data.key_code {
+            keymap::VK_ESCAPE => {
+                self.exit_mix_mode(state);
+                self.notify_ui_hide();
+                KeyAction::ClearComposition
+            }
+            keymap::VK_BACK => {
+                // 分步撤销：文本透镜有已转换段先退回最后一段（你→ni，码并回缓冲前部）。
+                if let Some((code, _)) = state.committed_segs.pop() {
+                    state.committed_text =
+                        state.committed_segs.iter().map(|(_, t)| t.as_str()).collect();
+                    state.mix_buffer = format!("{}{}", code, state.mix_buffer);
+                    return refresh(self, state);
+                }
+                state.mix_buffer.pop();
+                if state.mix_buffer.is_empty() {
+                    self.exit_mix_mode(state);
+                    self.notify_ui_hide();
+                    KeyAction::ClearComposition
+                } else {
+                    refresh(self, state)
+                }
+            }
+            keymap::VK_SPACE => {
+                // 空格：选当前高亮候选（文本透镜逐步转换）
+                if state.candidates.is_empty() {
+                    let out = self
+                        .maybe_s2t(state, &format!("{}{}", state.committed_text, state.mix_buffer));
+                    commit_text(self, state, out)
+                } else {
+                    let (start, _) = self.page_range(state);
+                    let gi = self
+                        .highlighted_global_index(state)
+                        .min(state.candidates.len() - 1);
+                    self.mix_select(state, gi - start)
+                }
+            }
+            keymap::VK_RETURN => {
+                // 回车：上屏「已转换前缀 + 缓冲原文」（如完整表达式 100+200=300，或已转中文+剩余拼音）
+                let out =
+                    self.maybe_s2t(state, &format!("{}{}", state.committed_text, state.mix_buffer));
+                commit_text(self, state, out)
+            }
+            _ => {
+                let shift = data.modifiers & MOD_SHIFT != 0;
+                let calc = self.mix_has_quick_input(state.mix_id);
+                // 首字符确定 lens：非字母可打印字符（数字/符号）→ 数字 lens。
+                if state.mix_buffer.is_empty() {
+                    let is_letter = (keymap::VK_A..=keymap::VK_Z).contains(&data.key_code);
+                    state.mix_numeric =
+                        calc && !is_letter && printable_char(data.key_code, shift).is_some();
+                }
+                let numeric = calc && state.mix_numeric;
+
+                // ① 输入字符（按 lens）
+                let input = if numeric {
+                    Self::mix_numeric_input_char(data.key_code, shift)
+                } else if (keymap::VK_A..=keymap::VK_Z).contains(&data.key_code) {
+                    Some((b'a' + (data.key_code - keymap::VK_A) as u8) as char)
+                } else {
+                    None
+                };
+                if let Some(ch) = input {
+                    state.mix_buffer.push(ch);
+                    return refresh(self, state);
+                }
+
+                // ② 翻页/高亮（输入字符已消费；数字 lens 的 -/= 已作输入吃掉）
+                if let Some(act) = self.apply_nav_key(state, data, true) {
+                    return act;
+                }
+
+                // ③ 本 lens 选词键：数字 lens 用字母（a=首选），文本 lens 用数字（1=首选）
+                let sel = if numeric {
+                    (keymap::VK_A..=keymap::VK_Z)
+                        .contains(&data.key_code)
+                        .then(|| (data.key_code - keymap::VK_A) as usize)
+                } else {
+                    (keymap::VK_1..=keymap::VK_9)
+                        .contains(&data.key_code)
+                        .then(|| (data.key_code - keymap::VK_1) as usize)
+                };
+                if let Some(off) = sel {
+                    return self.mix_select(state, off);
+                }
+
+                // ④ 配置二三候选键
+                if !shift
+                    && let Some(offset) = self.select_key_offset(data.key_code) {
+                        return self.mix_select(state, offset);
+                    }
+
+                // ⑤ 其它标点：顶屏「已转换前缀 + 当前高亮候选」+ 转换后标点，退出
+                if let Some(ch) = punct_char(data.key_code, shift) {
+                    let head = if !state.candidates.is_empty() {
+                        let idx = self
+                            .highlighted_global_index(state)
+                            .min(state.candidates.len() - 1);
+                        format!("{}{}", state.committed_text, state.candidates[idx].text)
+                    } else {
+                        state.committed_text.clone()
+                    };
+                    let head = self.maybe_s2t(state, &head);
+                    let punct = self.convert_punct_char(state, ch);
+                    self.exit_mix_mode(state);
+                    self.notify_ui_hide();
+                    Self::commit_action(format!("{}{}", head, punct), true)
+                } else {
+                    KeyAction::Consumed
+                }
+            }
+        }
     }
 }
