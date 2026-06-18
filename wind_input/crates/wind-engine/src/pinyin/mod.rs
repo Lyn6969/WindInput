@@ -31,6 +31,7 @@ use std::sync::Arc;
 use syllable::SyllableTrie;
 use viterbi::{ViterbiDecoder, WordNode};
 use wind_candidate::{Candidate, CandidateSource};
+use wind_dict::DictManager;
 use wind_dict::cached::CachedDict;
 
 /// 整句候选权重基准（高于拼音词频上限 ~19260817，确保整句置顶且不被截断）
@@ -57,6 +58,9 @@ pub struct PinyinEngine {
     fuzzy_config: FuzzyConfig,
     /// Unigram 语言模型（长句 Viterbi 打分；缺失时回退词典权重）
     unigram: Option<Arc<dyn UnigramLookup>>,
+    /// 用户/临时造词层（L 造词显现）：仅含 StoreUserLayer/StoreTempLayer，无系统层。
+    /// 拼音候选除主词典外，按相同的码并入这些层的用户造词（None=无持久化，如纯测试）。
+    store_layers: Option<Arc<DictManager>>,
 }
 
 impl PinyinEngine {
@@ -77,7 +81,14 @@ impl PinyinEngine {
             lattice_builder: LatticeBuilder::new(),
             fuzzy_config: FuzzyConfig::default(),
             unigram,
+            store_layers: None,
         }
+    }
+
+    /// 注入用户/临时造词层（L 造词显现）。链式 builder：构造后由 EngineManager 按 schema 挂上。
+    pub fn with_store_layers(mut self, layers: Arc<DictManager>) -> Self {
+        self.store_layers = Some(layers);
+        self
     }
 
     /// 总条目数
@@ -240,6 +251,32 @@ impl Engine for PinyinEngine {
             }
         }
 
+        // 6. 用户/临时造词层（L：让拼音造的词显现）。查询与主词典相同的码——整串精确 +
+        //    各前缀子码（你好 coded「nihao」当输入「nihaoma」时部分消费）+ 前缀补全——
+        //    并入候选（dedup by text，已在系统词典出现的不重复加）。weight 由 store 记录给出，
+        //    随后统一按 weight 排序；词频上浮交协调器 apply_freq_rerank（衰减软置前，frequency.md §4）。
+        if let Some(store_dm) = &self.store_layers {
+            let limit = max_candidates.max(50);
+            let mut store_cands: Vec<Candidate> = store_dm.search(input, limit);
+            if syllables.len() >= 2 {
+                for end in 1..syllables.len().min(6) {
+                    let code: String = syllables[..end].join("");
+                    if code == input {
+                        continue;
+                    }
+                    store_cands.extend(store_dm.search(&code, limit));
+                }
+            }
+            store_cands.extend(store_dm.search_prefix(input, limit));
+            for mut c in store_cands {
+                if c.text.is_empty() || candidates.iter().any(|x| x.text == c.text) {
+                    continue;
+                }
+                c.source = CandidateSource::Pinyin;
+                candidates.push(c);
+            }
+        }
+
         // 引擎内部排序（按权重降序，自然顺序升序）
         candidates.sort_by(|a, b| {
             b.weight
@@ -281,5 +318,69 @@ impl Engine for PinyinEngine {
 
     fn engine_type(&self) -> EngineType {
         EngineType::Pinyin
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use wind_dict::codetable::CodetableDict;
+    use wind_store::Store;
+
+    fn empty_engine() -> PinyinEngine {
+        PinyinEngine::new(Config::default(), CachedDict::Memory(CodetableDict::empty()))
+    }
+
+    fn tmp_store(name: &str) -> Arc<Store> {
+        let p = std::env::temp_dir().join(format!("wind_pinyin_{name}.redb"));
+        let _ = std::fs::remove_file(&p);
+        Arc::new(Store::open(&p).unwrap())
+    }
+
+    /// L 造词显现：挂上用户/临时层后，拼音造的词应进入候选（即便主词典为空）。
+    #[test]
+    fn store_layer_words_appear_in_candidates() {
+        let store = tmp_store("layer_show");
+        store.add_user_word("pinyin", "nihao", "你好", 500).unwrap();
+        store.learn_temp_word("pinyin", "lanshou", "蓝瘦", 800, 0).unwrap();
+        let dm = DictManager::new();
+        dm.register_layer(Box::new(wind_dict::StoreUserLayer::new(store.clone(), "pinyin")));
+        dm.register_layer(Box::new(wind_dict::StoreTempLayer::new(store.clone(), "pinyin")));
+        let engine = empty_engine().with_store_layers(Arc::new(dm));
+
+        // 整串精确命中用户词
+        let r = engine.convert("nihao", 20).unwrap();
+        assert!(
+            r.candidates.iter().any(|c| c.text == "你好"),
+            "用户造词「你好」应出现在拼音候选"
+        );
+        // 临时词同样显现
+        let r2 = engine.convert("lanshou", 20).unwrap();
+        let shou = r2.candidates.iter().find(|c| c.text == "蓝瘦");
+        assert!(shou.is_some(), "临时造词「蓝瘦」应出现在拼音候选");
+        assert_eq!(shou.unwrap().source, CandidateSource::Pinyin, "来源应标为拼音");
+    }
+
+    /// 无 store 层时行为不变（不 panic、空词典无候选）。
+    #[test]
+    fn no_store_layer_is_inert() {
+        let engine = empty_engine();
+        let r = engine.convert("nihao", 20).unwrap();
+        assert!(r.candidates.is_empty(), "空词典无 store 层应无候选");
+    }
+
+    /// 部分消费：用户词码是输入的前缀（nihao ⊂ nihaoma）→ consumed_length 标为前缀长度，
+    /// 选中后保留剩余拼音续转（分段上屏）。
+    #[test]
+    fn store_word_prefix_marks_partial_consumption() {
+        let store = tmp_store("layer_partial");
+        store.add_user_word("pinyin", "nihao", "你好", 500).unwrap();
+        let dm = DictManager::new();
+        dm.register_layer(Box::new(wind_dict::StoreUserLayer::new(store.clone(), "pinyin")));
+        let engine = empty_engine().with_store_layers(Arc::new(dm));
+        let r = engine.convert("nihaoma", 20).unwrap();
+        let c = r.candidates.iter().find(|c| c.text == "你好");
+        assert!(c.is_some(), "前缀用户词应作为分段候选出现");
+        assert_eq!(c.unwrap().consumed_length, "nihao".len(), "应只消费前缀 nihao");
     }
 }

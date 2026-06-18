@@ -4,6 +4,7 @@
 
 pub mod codetable;
 pub mod engine;
+pub mod freq_rerank;
 pub mod manager;
 pub mod mixed;
 pub mod pinyin;

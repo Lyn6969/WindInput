@@ -26,6 +26,7 @@ use wind_ipc::protocol::{
     EVENT_KEY_DOWN, EVENT_KEY_UP, MOD_ALT, MOD_CTRL, MOD_SHIFT, calc_key_hash,
 };
 use wind_store::Store;
+use wind_store::freq::FreqRecord;
 use wind_transform::fullwidth::to_full_width;
 use wind_transform::punctuation::PunctuationConverter;
 use wind_ui::candidate_window::CandidateItem;
@@ -165,6 +166,14 @@ const ENGINE_MAX_CANDIDATES: usize = 50;
 /// 自动造词（L）写入临时层的初始权重与每次复选增量（保守默认；后续可接 schema.learning 配置）。
 const LEARN_ADD_WEIGHT: i32 = 800;
 const LEARN_WEIGHT_DELTA: i32 = 40;
+
+/// 当前 unix 秒（拼音衰减分以此对 last_used 计龄；与 store record_freq 同口径）。
+fn now_unix_secs() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
+}
 
 /// 协调器输入状态
 /// 简繁变体（与 Go config.S2TVariant 对齐）：(opencc 变体名, 菜单显示名)
@@ -647,7 +656,7 @@ impl Coordinator {
     /// - `top`（一次到顶/MRU）：last_used 降序、count 降序 tiebreak（最近选的置该档之首）。
     ///
     /// 主开关 `learning.freq.enabled` 关闭则完全不重排（修"配置说关、代码却排"的潜在 bug）。
-    /// 拼音暂挂同码表逻辑，待 F2 替换为衰减软置前（frequency.md §4/§8）。
+    /// 引擎类型分流：码表/混输走永久 used-first（§3），纯拼音走衰减软置前（§4）。
     /// 注：每候选一次 redb 点查（mmap 微秒级）；后续可下沉到引擎排序层。
     fn apply_freq_rerank(&self, candidates: &mut [Candidate], code: &str) {
         let Some(store) = &self.store else {
@@ -662,11 +671,10 @@ impl Coordinator {
         }
         let schema = self.engine_mgr.active_schema_id();
         let input_len = code.len();
-        // 取每个"消费整串"候选的词频记录 (count, last_used)。分段子候选（consumed_length < 整串，
-        // 如「nihao」里的「你」只消费「ni」）的词频归属其自身前缀码，不能被整串码的历史计数
-        // 上浮——否则单字会浮到整句「你好」之上。consumed_length==0 表示引擎未标注（码表型），
-        // 视为整串匹配。
-        let recs: std::collections::HashMap<String, (u32, i64)> = candidates
+        // 取每个"消费整串"候选的词频记录。分段子候选（consumed_length < 整串，如「nihao」里的「你」
+        // 只消费「ni」）的词频归属其自身前缀码，不能被整串码的历史计数上浮——否则单字会浮到整句
+        // 「你好」之上。consumed_length==0 表示引擎未标注（码表型），视为整串匹配。
+        let recs: std::collections::HashMap<String, FreqRecord> = candidates
             .iter()
             .filter_map(|c| {
                 let consumes_all = c.consumed_length == 0 || c.consumed_length >= input_len;
@@ -674,7 +682,7 @@ impl Coordinator {
                     return None;
                 }
                 match store.get_freq(&schema, code, &c.text) {
-                    Ok(Some(r)) if r.count > 0 => Some((c.text.clone(), (r.count, r.last_used))),
+                    Ok(Some(r)) if r.count > 0 => Some((c.text.clone(), r)),
                     _ => None,
                 }
             })
@@ -682,41 +690,17 @@ impl Coordinator {
         if recs.is_empty() {
             return;
         }
-        // 档位感知的 used-first 重排（五笔优先）：先按来源档位（码表精确 < 词/短语 < 码表前缀
-        // < 拼音），档内再 used-first（用过的优先）+ 策略排序。稳定排序保证同档无记录者维持引擎
-        // 权重序，绝不把拼音浮到五笔精确全码之上（修候选/上屏不一致）。
-        use std::cmp::Ordering;
-        candidates.sort_by(|a, b| {
-            let ta = Self::freq_tier(a, code);
-            let tb = Self::freq_tier(b, code);
-            if ta != tb {
-                return ta.cmp(&tb);
-            }
-            match (recs.get(&a.text), recs.get(&b.text)) {
-                (Some(_), None) => Ordering::Less,
-                (None, Some(_)) => Ordering::Greater,
-                (None, None) => Ordering::Equal, // 同档均无记录 → 维持引擎权重序（稳定排序）
-                (Some(&(ca, la)), Some(&(cb, lb))) => match settings.strategy {
-                    wind_engine::FreqStrategy::Top => lb.cmp(&la).then(cb.cmp(&ca)),
-                    wind_engine::FreqStrategy::Step => cb.cmp(&ca).then(lb.cmp(&la)),
-                },
-            }
-        });
-    }
-
-    /// 候选来源档位（数字越小越靠前）。五笔优先的硬约束：码表精确全码恒在拼音之上，
-    /// 词频重排只在同档内调整。纯拼音/纯码表模式下同源候选档位相同，退化为按词频排序。
-    fn freq_tier(c: &Candidate, input: &str) -> u8 {
-        use wind_candidate::CandidateSource::*;
-        if c.is_phrase {
-            return 1;
-        }
-        match c.source {
-            CodeTable if c.code == input => 0, // 码表精确全码（如五笔 cang→駏）
-            CodeTable => 2,                    // 码表前缀补全
-            Pinyin => 3,
-            English => 3,
-            _ => 2,
+        // 词频重排归属 engine 排序层（frequency.md §5/§7）：本协调器只负责取词频记录、按引擎
+        // 类型分流到纯函数。码表/混输永久 used-first（§3），纯拼音衰减软置前（§4）。
+        if self.engine_mgr.is_pinyin() {
+            wind_engine::freq_rerank::rerank_pinyin_decay(candidates, &recs, now_unix_secs());
+        } else {
+            wind_engine::freq_rerank::rerank_codetable_usedfirst(
+                candidates,
+                &recs,
+                code,
+                settings.strategy,
+            );
         }
     }
 

@@ -463,11 +463,22 @@ impl EngineManager {
                     let ug_txt = schemas.join(&schema.learning.unigram_path);
                     Self::load_unigram_mmap(&ug_txt)
                 };
-            Some(Box::new(PinyinEngine::with_unigram(
-                PinyinConfig::default(),
-                dict,
-                unigram,
-            )))
+            let mut engine = PinyinEngine::with_unigram(PinyinConfig::default(), dict, unigram);
+            // 注入 redb Store 时挂用户词/临时词层（L 造词显现）：让拼音造的词进候选合并。
+            // 仅含 User/Temp 层（系统词典仍由引擎自身的 CachedDict 承担 Viterbi/前缀）。
+            if let Some(store) = &store {
+                let dm = wind_dict::DictManager::new();
+                dm.register_layer(Box::new(wind_dict::StoreUserLayer::new(
+                    store.clone(),
+                    schema_id,
+                )));
+                dm.register_layer(Box::new(wind_dict::StoreTempLayer::new(
+                    store.clone(),
+                    schema_id,
+                )));
+                engine = engine.with_store_layers(Arc::new(dm));
+            }
+            Some(Box::new(engine))
         } else {
             let mcl = if schema.engine.codetable.max_code_length > 0 {
                 schema.engine.codetable.max_code_length

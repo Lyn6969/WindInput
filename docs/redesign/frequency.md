@@ -88,11 +88,11 @@ decay      = exp(-ln2 * age_hours / half_life)     // 半衰期衰减，最近�
 > 受影响差分均已加指针指向本文。每步 `wind_input/scripts/dev.sh ci` 把关。
 
 ## 8. 落地状态（2026-06-18）
-- **F1 码表策略 + F3 配置（码表部分）**：进行中。
+- **F1 码表策略 + F3 配置（码表部分）**：已完成并部署。
   - `EngineManager::freq_settings()` 按活跃方案解析并缓存 `{enabled, strategy(top/step)}`（`learning.freq.enabled` + `engine.codetable.freq_strategy`），避免每键读盘。
-  - `apply_freq_rerank` 改：① 主开关 `enabled` gate（关则不排，修"配置说关、代码却排"的潜在 bug）；② used-first 内按 `top`(last_used desc, count desc) / `step`(count desc, last_used desc)；③ 档位（五笔优先）约束不变。
   - shipped schema（wubi86 / wubi86_pinyin）设 `[learning.freq] enabled = true`，`engine.codetable.freq_strategy = "step"`（默认）。
-  - **拼音暂挂同码表逻辑**（used-first count 序），待 F2 替换为 §4 的衰减软置前+整句豁免（细调讲究，单独迭代）。
-- **F2 拼音衰减**：未开始。复用已实现的 `FreqProfile::pinyin_score`（freq.rs），按 §4 接入。
-- **L 造词显现**：未开始。拼音引擎需挂 `StoreUserLayer/StoreTempLayer`（现仅码表引擎挂，manager.rs），否则拼音造的词进不了候选。F2 与 L 建议捆绑。
+- **词频重排下沉 engine 排序层（§5/§7）**：重排纯函数移入 `wind-engine::freq_rerank`（`rerank_codetable_usedfirst` / `rerank_pinyin_decay` + `freq_tier`），coordinator 的 `apply_freq_rerank` 只负责取词频记录、按 `is_pinyin()` 分流调用。两路均有原生单测（wind-engine `freq_rerank::tests`，6 例）。
+- **F2 拼音衰减**：已完成。`rerank_pinyin_decay` 按 §4 实现 —— ① 整句/短语豁免（`weight ≥ PINYIN_SENTENCE_FLOOR=20M` 锚定顶部，介于词权重上限~19M 与整句基准 30M 之间）；② 非整句按 `FreqProfile::pinyin_score`（半衰期衰减）软置前；③ 阈值褪色（衰减分 `< PINYIN_FREQ_EPSILON=10.0` → 落回引擎权重序）。`now` 由 coordinator 注入便于测试。
+- **L 造词显现**：已完成。`PinyinEngine` 新增可选 `store_layers`（`with_store_layers`），`EngineManager::build_engine` 拼音分支在有 Store 时挂 `StoreUserLayer/StoreTempLayer`（按 schema 隔离）。convert 第 6 步按相同码（整串精确 + 各前缀子码 + 前缀补全）并入用户/临时造词，dedup by text、source=Pinyin、consumed_length 据前缀标注（部分消费分段上屏）。原生单测见 wind-engine `pinyin::tests`（3 例）。
+  - 注：混输的 pinyin 子引擎按 secondary schema id 挂层；混输造词键于 mixed schema id，故混输 L 不在此生效（无回归，待混输专项）。
 - **protect_top_n**：字段保留，本阶段不实现（与 `top` 语义冲突，默认 0）。
