@@ -784,7 +784,19 @@ impl Coordinator {
     /// 返回 (引擎候选数, 输入结局)。结局含全码自动上屏 / 满码空码清空；自动上屏文本经
     /// shadow 复核后才放行，避免上屏被置顶删词移除的候选。调用方仅在「正向输入字母」时消费。
     fn build_candidates(&self, state: &mut State, limit: usize) -> (usize, InputOutcome) {
-        let result = self.engine_mgr.convert(&state.input_buffer, limit);
+        // 分段上屏进行中（committed 前缀非空 ⟺ 来自拼音选词——五笔候选 consumed_length=0
+        // 永不部分匹配）：剩余编码强制按拼音方案转换，避免混输让五笔抢首选（你↑选后 hao→虚）。
+        let result = if !state.committed_text.is_empty()
+            && !self.config.schema.primary_pinyin.is_empty()
+        {
+            self.engine_mgr.convert_with(
+                &self.config.schema.primary_pinyin,
+                &state.input_buffer,
+                limit,
+            )
+        } else {
+            self.engine_mgr.convert(&state.input_buffer, limit)
+        };
         // 组合区只显示输入码/拼音
         state.preedit = if result.preedit_display.is_empty() {
             state.input_buffer.clone()
