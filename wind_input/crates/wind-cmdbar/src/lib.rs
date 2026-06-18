@@ -4,7 +4,8 @@
 //! `parse(src) -> Phrase` → `evaluate(phrase, ctx, reg) -> (display, actions)`
 //! → 宿主选中候选时 `action.run(ctx, reg)` 执行（文本上屏 / 副作用）。
 //!
-//! `$SS` 数组短语经 [`eval::expand_array`] 展开为多个候选。
+//! `$SS` 字符串组 / `$AA` 字符组（`$SS` 的逐字符简写）数组短语经 [`eval::expand_array`]
+//! 展开为多个候选。
 
 pub mod action;
 pub mod ast;

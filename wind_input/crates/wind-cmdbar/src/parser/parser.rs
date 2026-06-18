@@ -1,9 +1,13 @@
 //! 语法分析器（递归下降）
 //!
 //! 对照 Go `wind_input/internal/cmdbar/parser/parser.go`。顶层分派：
-//! 1. 源在 depth-0（非字符串内）含 marker（`$CC(` / `$CC1(` / `$SS(`）→ 命令/数组短语；
+//! 1. 源在 depth-0（非字符串内）含 marker（`$CC(` / `$CC1(` / `$SS(` / `$AA(`）→ 命令/数组短语；
+//!    其中 `$AA` 是 `$SS` 的字符组简写（单字面串按 rune 炸开），共用数组解析路径；
 //! 2. 否则含顶层未转义 `{` → 模板短语（隐式字符串包裹）；
 //! 3. 否则 → 字面短语。
+//!
+//! 新增 `$` 短语类型的扩展点：在 [`MARKER_TABLE`] 注册 marker，并在 [`parse`] 分派到
+//! 对应解析函数（可复用 [`parse_array_phrase`] 并按 marker 分策略，如 `$AA` 的 rune 炸开）。
 
 use super::lexer::{decode_escape_byte, Lexer, RawStringPart, Token, TokenKind};
 use crate::ast::{ArrayPhrase, CommandPhrase, Expr, ModValue, Modifiers, Phrase, StringPart};
@@ -18,7 +22,8 @@ pub fn parse(src: &str) -> Result<Phrase> {
         }
         return match marker {
             "$CC" | "$CC1" => parse_command_phrase(src, idx, open_off).map(Phrase::Command),
-            "$SS" => parse_array_phrase(src, idx, open_off),
+            // `$AA` 是 `$SS` 的字符组简写，共用数组解析（内部按 marker 分策略展开元素）。
+            "$SS" | "$AA" => parse_array_phrase(src, idx, open_off),
             _ => unreachable!(),
         };
     }
@@ -35,7 +40,7 @@ pub fn is_cmdbar_grammar(src: &str) -> bool {
 }
 
 /// 顶层 marker 表（最长前缀优先；`$CC1` 必须排在 `$CC` 前）。
-const MARKER_TABLE: &[&str] = &["$CC1", "$CC", "$SS"];
+const MARKER_TABLE: &[&str] = &["$CC1", "$CC", "$SS", "$AA"];
 
 /// 扫描首个不在字符串内的 marker，返回 (marker, '$' 偏移, '(' 偏移)。
 fn find_top_level_marker(src: &str) -> Option<(&'static str, usize, usize)> {
@@ -196,7 +201,8 @@ fn marker_defaults(marker: &str) -> Modifiers {
     let mut m = Modifiers::new();
     match marker {
         "$CC1" => m.push("prefix", ModValue::Bool(true)),
-        "$SS" => {
+        // `$AA` 字符组与 `$SS` 字符串组共享数组默认值（精确匹配展开 + 导航 + 前缀）。
+        "$SS" | "$AA" => {
             m.push("prefix", ModValue::Bool(true));
             m.push("expand", ModValue::Sym("exact".into()));
             m.push("nav", ModValue::Bool(true));
@@ -259,7 +265,12 @@ fn parse_array_phrase(src: &str, idx: usize, open: usize) -> Result<Phrase> {
         }
     };
 
-    let elements: Vec<Expr> = parsed.split_off(1);
+    let mut elements: Vec<Expr> = parsed.split_off(1);
+    // `$AA` 简写：把唯一的字面字符串参数按 rune 炸开为逐字符元素，
+    // 之后与 `$SS` 走完全相同的元素校验/展开路径。
+    if marker == "$AA" {
+        elements = explode_aa_elements(elements, marker, open)?;
+    }
     for (i, e) in elements.iter().enumerate() {
         match e {
             Expr::StringLit(_) => {}
@@ -292,6 +303,44 @@ fn parse_array_phrase(src: &str, idx: usize, open: usize) -> Result<Phrase> {
         elements,
         modifiers,
     }))
+}
+
+/// `$AA("名", "字符串")` 元素展开：把单个纯字面字符串按 rune 炸成逐字符 `StringLit`。
+///
+/// `$AA` 是 `$SS` 的字符组简写——`$AA("标点", "、。")` 等价于 `$SS("标点", "、", "。")`。
+/// 严格要求恰好一个参数（组名之后），且为纯字面串（无 `{expr}` 插值、非嵌入 `$CC`），
+/// 对齐 Go `dict.ParseAAMarker` 的 `[]rune(chars)` 拆分语义。
+fn explode_aa_elements(elements: Vec<Expr>, marker: &str, open: usize) -> Result<Vec<Expr>> {
+    if elements.len() != 1 {
+        return Err(CmdbarError::parse(
+            open,
+            format!(
+                "{marker} expects exactly one chars string after the group name, got {}",
+                elements.len()
+            ),
+        ));
+    }
+    let chars = match &elements[0] {
+        Expr::StringLit(parts) => string_lit_to_plain(parts).map_err(|_| {
+            CmdbarError::parse(open, format!("{marker}: chars string must not contain interpolation"))
+        })?,
+        other => {
+            return Err(CmdbarError::parse(
+                open,
+                format!("{marker}: chars argument must be a literal string, got {other:?}"),
+            ))
+        }
+    };
+    if chars.is_empty() {
+        return Err(CmdbarError::parse(
+            open,
+            format!("{marker}: chars string must not be empty"),
+        ));
+    }
+    Ok(chars
+        .chars()
+        .map(|c| Expr::StringLit(vec![StringPart::Text(c.to_string())]))
+        .collect())
 }
 
 /// 一个顶层 `$SS` 参数切片：原始子串 + 在原源中的字节偏移。
@@ -821,6 +870,47 @@ mod tests {
     #[test]
     fn array_nested_cc_with_prefix_rejected() {
         assert!(parse(r#"$SS("g", $CC1("x", type("x")))"#).is_err());
+    }
+
+    #[test]
+    fn aa_marker_explodes_into_per_rune_elements() {
+        // $AA 是 $SS 的字符组简写：单字符串参数按 rune 炸开为逐字符元素。
+        let p = pp(r#"$AA("标点", "、。·")"#);
+        match p {
+            Phrase::Array(a) => {
+                assert_eq!(a.name, "标点");
+                assert_eq!(a.elements.len(), 3);
+                assert_eq!(a.elements[0], Expr::StringLit(vec![StringPart::Text("、".into())]));
+                assert_eq!(a.elements[1], Expr::StringLit(vec![StringPart::Text("。".into())]));
+                assert_eq!(a.elements[2], Expr::StringLit(vec![StringPart::Text("·".into())]));
+                // 与 $SS 共享默认修饰符。
+                assert_eq!(a.modifiers.get_bool("prefix"), Some(true));
+                assert_eq!(a.modifiers.get_bool("nav"), Some(true));
+            }
+            _ => panic!("expected array"),
+        }
+    }
+
+    #[test]
+    fn aa_marker_multibyte_runes_counted_correctly() {
+        // 组合符号/圈号等多字节 rune 必须按 rune（非字节）切分。
+        let p = pp(r#"$AA("圆圈", "①②③")"#);
+        match p {
+            Phrase::Array(a) => assert_eq!(a.elements.len(), 3),
+            _ => panic!("expected array"),
+        }
+    }
+
+    #[test]
+    fn aa_marker_arity_and_literal_rules() {
+        // 缺 chars 参数（只有组名）→ err。
+        assert!(parse(r#"$AA("名")"#).is_err());
+        // 多于一个 chars 参数 → err（应合并为单串）。
+        assert!(parse(r#"$AA("名", "ab", "cd")"#).is_err());
+        // chars 含插值 → err（必须纯字面）。
+        assert!(parse(r#"$AA("名", "x{date()}")"#).is_err());
+        // 空 chars → err。
+        assert!(parse(r#"$AA("名", "")"#).is_err());
     }
 
     #[test]

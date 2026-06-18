@@ -275,4 +275,21 @@ mod tests {
         assert_eq!(arr.elements[1].display, "动作");
         assert_eq!(arr.elements[1].actions.len(), 1);
     }
+
+    #[test]
+    fn aa_marker_expands_to_char_candidates() {
+        // $AA 字符组：每个 rune 成为一个无动作的上屏文本候选。
+        let reg = Registry::full();
+        let ctx = MemoryContext::new();
+        let p = parse(r#"$AA("数字", "①②③")"#).unwrap();
+        let arr = match p {
+            Phrase::Array(a) => expand_array(&a, &ctx, &reg).unwrap(),
+            _ => panic!(),
+        };
+        assert_eq!(arr.name, "数字");
+        assert_eq!(arr.elements.len(), 3);
+        let displays: Vec<&str> = arr.elements.iter().map(|e| e.display.as_str()).collect();
+        assert_eq!(displays, ["①", "②", "③"]);
+        assert!(arr.elements.iter().all(|e| e.actions.is_empty()));
+    }
 }

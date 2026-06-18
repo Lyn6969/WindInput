@@ -4,8 +4,8 @@
 //! 加载 `system.phrases.toml`，输入码命中短语 code 时生成候选。
 //!
 //! **双路径**（对齐 Go design §7.2）：
-//! - 短语 text 使用命令栏语法（含 `$CC(`/`$SS(` marker 或顶层 `{expr}` 插值）→ 经
-//!   `wind-cmdbar` 解析求值（`{date()}`/`{calc(code)}`/`{upper(code)}`/`$SS` 数组等）。
+//! - 短语 text 使用命令栏语法（含 `$CC(`/`$SS(`/`$AA(` marker 或顶层 `{expr}` 插值）→ 经
+//!   `wind-cmdbar` 解析求值（`{date()}`/`{calc(code)}`/`{upper(code)}`/`$SS` 字符串组/`$AA` 字符组等）。
 //! - 否则 → 旧的简单模板变量展开（$Y/$M/$MM/$D/$DD/$HH/$mm/$ss/$WC/$YC/$MC/$DC/$ts/$tsms）。
 //!
 //! 命令栏 display 侧只用纯函数（无需宿主服务）；`$CC` 的副作用动作需平台服务（按键/剪贴板/
@@ -368,8 +368,9 @@ mod tests {
     fn test_escape_and_unsupported() {
         let now = fixed();
         assert_eq!(expand_template("$$5", &now).unwrap(), "$5");
-        // 含不支持变量（$AA）→ None
-        assert!(expand_template("$AA", &now).is_none());
+        // 含不支持的模板变量 → None（注意 $AA( 是 cmdbar 字符组 marker，走 cmdbar 路径，
+        // 不经此简单模板展开；这里用一个永不存在的变量名验证未知变量降级）。
+        assert!(expand_template("$QQ", &now).is_none());
     }
 
     #[test]
@@ -452,6 +453,30 @@ mod tests {
             vec![
                 PhraseHit::plain("（）".into(), 500),
                 PhraseHit::plain("【】".into(), 500)
+            ]
+        );
+    }
+
+    #[test]
+    fn test_cmdbar_aa_char_group_expands() {
+        // $AA 字符组：逐字符炸开为多个上屏候选（镜像发货 system.phrases.toml 的符号组）。
+        let mut map: HashMap<String, Vec<PhraseEntry>> = HashMap::new();
+        map.insert(
+            "zzsz".into(),
+            vec![PhraseEntry {
+                text: r#"$AA("数字", "①②③")"#.into(),
+                weight: 500,
+                position: 0,
+            }],
+        );
+        let layer = PhraseLayer { map };
+        let got = layer.lookup_at("zzsz", fixed(), &[]);
+        assert_eq!(
+            got,
+            vec![
+                PhraseHit::plain("①".into(), 500),
+                PhraseHit::plain("②".into(), 500),
+                PhraseHit::plain("③".into(), 500),
             ]
         );
     }
