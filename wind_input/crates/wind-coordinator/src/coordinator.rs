@@ -431,6 +431,13 @@ impl Coordinator {
         let _ = coordinator
             .ui_tx
             .send(UiCommand::SetCandidateLayout(vertical));
+        // 下发预编辑嵌入模式：preedit_mode == "embedded" 且非 inline_preedit（inline 时编码内联在应用）。
+        let cand_cfg = &coordinator.config.ui.candidate;
+        let embedded =
+            !cand_cfg.inline_preedit && cand_cfg.preedit_mode.eq_ignore_ascii_case("embedded");
+        let _ = coordinator
+            .ui_tx
+            .send(UiCommand::SetPreeditEmbedded(embedded));
         coordinator
     }
 

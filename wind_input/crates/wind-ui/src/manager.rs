@@ -45,6 +45,9 @@ pub enum UiCommand {
     SetTheme(Box<wind_theme::Resolved>),
     /// 候选布局方向（true=竖排）。来自 ui.candidate.layout。
     SetCandidateLayout(bool),
+    /// 预编辑嵌入模式（true=编码嵌入候选行首，不显示独立 preedit 条）。
+    /// 来自 ui.candidate.preedit_mode == "embedded"（且 inline_preedit=false）。
+    SetPreeditEmbedded(bool),
     /// 显示菜单（候选右键菜单 / 功能主菜单；UI 自管导航与子菜单）
     ShowCandidateMenu {
         items: Vec<MenuItemSpec>,
@@ -445,6 +448,9 @@ impl UiManager {
                         }
                         UiCommand::SetCandidateLayout(vertical) => {
                             candidate_window.set_vertical(vertical);
+                        }
+                        UiCommand::SetPreeditEmbedded(embedded) => {
+                            candidate_window.set_preedit_embedded(embedded);
                         }
                         UiCommand::Shutdown => {
                             info!("UI: Shutdown");

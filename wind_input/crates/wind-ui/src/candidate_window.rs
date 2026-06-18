@@ -130,6 +130,9 @@ pub struct CandidateWindow {
     scale: f32,
     /// 竖排布局（候选纵向堆叠）；默认横排。来自 ui.candidate.layout。
     vertical: bool,
+    /// 预编辑嵌入模式（编码嵌入候选行首，不显示独立 preedit 条）。
+    /// 来自 ui.candidate.preedit_mode == "embedded"。
+    preedit_embedded: bool,
 }
 
 impl CandidateWindow {
@@ -169,6 +172,7 @@ impl CandidateWindow {
             theme: wind_theme::Resolved::default(),
             scale: CandidateWindowConfig::get_dpi_scale(),
             vertical: false,
+            preedit_embedded: false,
         })
     }
 
@@ -176,6 +180,11 @@ impl CandidateWindow {
     /// 设置候选布局方向（true=竖排）。
     pub fn set_vertical(&mut self, vertical: bool) {
         self.vertical = vertical;
+    }
+
+    /// 设置预编辑嵌入模式（true=编码嵌入候选行首，不显示独立 preedit 条）。
+    pub fn set_preedit_embedded(&mut self, embedded: bool) {
+        self.preedit_embedded = embedded;
     }
 
     pub fn set_theme(&mut self, theme: wind_theme::Resolved) {
@@ -520,7 +529,8 @@ impl CandidateWindow {
 
         // 预编辑行（主题背景带 + 文本色）。完整渲染 preedit_bar 自身背景：底色 + 位图背景 +
         // z 层 + 边框（此前只画底色，位图主题的 preedit 背景/边框丢失）。
-        if !self.preedit.is_empty() {
+        // 嵌入模式（preedit_embedded）下不画独立条——编码作为候选行首单元内联（见下方 list 构建）。
+        if !self.preedit.is_empty() && !self.preedit_embedded {
             let mut band = View::container(Layout::Row)
                 .bg(col(v.preedit_bar.bg_color, [240, 240, 240, 255]))
                 .radius(dim(v.item.border_radius, 4.0))
@@ -575,6 +585,23 @@ impl CandidateWindow {
         } else {
             View::container(Layout::Row).gap(box_gap).cross(Align::Center)
         };
+        // 嵌入模式：编码作为候选行首单元内联（无独立背景，与候选间留白分隔），对齐 Go buildEmbeddedPreedit。
+        // 横排右留白、竖排下留白。
+        if self.preedit_embedded && !self.preedit.is_empty() {
+            let sep = if self.vertical {
+                Edges { b: 6.0 * s, ..Edges::default() }
+            } else {
+                Edges { r: 16.0 * s, ..Edges::default() }
+            };
+            list = list.child(
+                View::leaf(
+                    self.preedit.clone(),
+                    col(v.preedit_bar.text_color, [100, 100, 100, 255]),
+                )
+                .font_size(preedit_fs)
+                .margin(sep),
+            );
+        }
         for (i, cand) in self.candidates.iter().enumerate() {
             let marker = if cand.label.is_empty() {
                 (i + 1).to_string()
