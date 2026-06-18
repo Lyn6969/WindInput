@@ -354,6 +354,10 @@ pub struct Coordinator {
     pub(crate) self_weak: std::sync::OnceLock<std::sync::Weak<Coordinator>>,
     /// 上屏历史环形缓冲（index 0 = 最近）：供命令栏 `last(n)` 取最近上屏文本。
     recent_commits: Mutex<std::collections::VecDeque<String>>,
+    /// preedit 嵌入模式运行时态（命令栏 ime.toggle("preedit") 切换；初值随配置，暂不持久化）。
+    preedit_embedded: Mutex<bool>,
+    /// 候选窗隐藏开关（命令栏 ime.toggle("candwin") 切换；隐藏时 notify_ui_update 不显示候选）。
+    hide_candidate_window: Mutex<bool>,
 }
 
 /// 短语候选权重基准（高于普通候选，使短语展开排在前列）
@@ -567,6 +571,15 @@ impl Coordinator {
             config.input.punct_custom.mappings.clone(),
         );
 
+        // preedit 嵌入模式运行时初值（与 new() 下发 SetPreeditEmbedded 的判定一致）。
+        // 在 config 被移入结构体前先算出（结构体字段顺序会先移走 config）。
+        let preedit_embedded_init = !config.ui.candidate.inline_preedit
+            && config
+                .ui
+                .candidate
+                .preedit_mode
+                .eq_ignore_ascii_case("embedded");
+
         let coordinator = Arc::new(Self {
             state: Mutex::new(State {
                 chinese_mode: config.general.default_chinese_mode,
@@ -637,6 +650,8 @@ impl Coordinator {
             cmdbar_services: std::sync::OnceLock::new(),
             self_weak: std::sync::OnceLock::new(),
             recent_commits: Mutex::new(std::collections::VecDeque::new()),
+            preedit_embedded: Mutex::new(preedit_embedded_init),
+            hide_candidate_window: Mutex::new(false),
         });
         // 命令栏：装配 Services（ime/config/dict 后端）+ 自身 Weak 引用。
         coordinator.init_cmdbar();
@@ -2859,10 +2874,42 @@ impl Coordinator {
                 self.handle_menu_command("toggle_s2t");
             }
             "toolbar" => self.toggle_toolbar(),
+            "preedit" => self.cmd_toggle_preedit(),
+            "candwin" => self.cmd_toggle_candwin(),
             other => {
                 warn!("ime.toggle: 暂不支持 target {:?}（Rust 平台能力待补）", other)
             }
         }
+    }
+
+    /// 切换 preedit 编码显示模式（top ↔ embedded），下发 UI（运行时态，暂不持久化）。
+    fn cmd_toggle_preedit(&self) {
+        let embedded = {
+            let mut e = self
+                .preedit_embedded
+                .lock()
+                .unwrap_or_else(|x| x.into_inner());
+            *e = !*e;
+            *e
+        };
+        let _ = self.ui_tx.send(UiCommand::SetPreeditEmbedded(embedded));
+        self.show_tip(if embedded { "编码:嵌入" } else { "编码:顶部" });
+    }
+
+    /// 切换候选窗显隐（运行时态）。隐藏时下次刷新即不显示候选。
+    fn cmd_toggle_candwin(&self) {
+        let hidden = {
+            let mut h = self
+                .hide_candidate_window
+                .lock()
+                .unwrap_or_else(|x| x.into_inner());
+            *h = !*h;
+            *h
+        };
+        if hidden {
+            let _ = self.ui_tx.send(UiCommand::HideCandidates);
+        }
+        self.show_tip(if hidden { "候选窗:隐藏" } else { "候选窗:显示" });
     }
 
     /// 切换输入方案（持久化由 switch_schema 内部处理）。
@@ -2928,6 +2975,15 @@ impl Coordinator {
 
     fn notify_ui_update(&self, state: &State) {
         if state.candidates.is_empty() && state.input_buffer.is_empty() {
+            let _ = self.ui_tx.send(UiCommand::HideCandidates);
+            return;
+        }
+        // candwin 切换：用户隐藏候选窗时不显示（仍可盲打/自动上屏）。
+        if *self
+            .hide_candidate_window
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+        {
             let _ = self.ui_tx.send(UiCommand::HideCandidates);
             return;
         }
