@@ -1,140 +1,75 @@
-# 重设计：控制 RPC 服务端（apps/rpc → 内嵌 service）
+# 重设计：core 内嵌 HTTP 控制/配置 API（wind-webapi）
 
+> **架构已变更（2026-06-19）**：原"控制 RPC 服务端（命名管道 + JSON-RPC 帧 + 新建 wind-control crate）"方案**已弃用**。改为 **core(`apps/service`) 内嵌 HTTP 服务**，GUI 与远程 Web 共用同一套 HTTP API，不再有独立的 RPC 控制协议。本文档已更新为**实现态**。
 >
 
-## 1. 现状（已核实，2026-06-18）
+## 1. 为什么是 HTTP 而非 RPC（决策演进）
 
-| 部件 | 现状 |
-|------|------|
-| `apps/rpc/src/main.rs` | 仅 `println!` 占位，独立 bin `wind_rpc`，Cargo 依赖 tokio/wind-store/wind-dict/wind-config |
-| `apps/rpc/src/services/{config,dict,phrase,shadow,stats,system}.rs` | 各 ~22 字节注释空壳；`mod.rs` 仅重导出 |
-| `wind-ipc/rpc.rs` | **协议已就绪**：`Request{v,id,method,params}` / `Response{id,result,error}` / `EventMessage{event,data}`；`encode_message`(4B BE 长度+JSON) / `decode_message_header`；`MAX_MESSAGE_SIZE=16MB` |
-| `wind-bridge`（server.rs/push.rs） | **同步线程**传输框架：`CreateNamedPipe`(`PIPE_UNLIMITED_INSTANCES`) + 每连接一线程 `handle_client` 循环；经 `MessageHandler` trait 解耦。管道名 `\\.\pipe\wind_input{suffix}` / `..._push`。**无 `wind_input_ctrl` 控制管道** |
-| `apps/service/src/main.rs` | 启动序列：单例 mutex → tokio rt → PushServer.start → BridgeServer.start → `Coordinator::new(push_server)` → `deferred.set_ready` → `restart_rx.recv()` 阻塞 |
-| `Coordinator` | 字段 `config: Config` / `engine_mgr: EngineManager` / `store: Option<Arc<Store>>` **全私有**；公开仅 `active_schema_id` / `is_chinese_mode` / `debug_*`。**无 RPC 读写访问器** |
-| `Config`（config.rs） | 有 `load` / `user_config_dir`；**无 `save`** |
-| `Store` CRUD | `user_words`/`freq`/`shadow`/`temp_words` **已实现**（如 `add_user_word`/`get_user_words`/`search_user_words_prefix`/`remove_user_word`/`update_user_word_weight`）；`phrases`(21行)/`stats`(19行)/`migration`(3行) **空壳**；`Store` 自身仅 `open/version/pause/resume/path` |
-| `EngineManager` | `available_schemas`(→`&[String]` 仅 id) / `active_schema_id` / `switch_schema` / `cycle_schema` / `convert`·`convert_with`(编码) / `current_engine_type` / `freq_settings` 已有；**缺 SchemaInfo 元信息聚合** |
-| 设置前端事件推送 | **不存在**（仅有给 DLL 的二进制 `PushServer`） |
 
-## 2. 架构决策
+- **体积**：体积敏感的是注入每个应用进程的 **TSF DLL**，HTTP 不进 DLL；它进的是单一常驻的 `apps/service` 进程，单份开销。
+- **service 已依赖 tokio**（`main.rs` 即 `new_multi_thread()`），加 `axum` 只是 HTTP 层增量，不引入新运行时。
+- **简化**：GUI 与远程 Web 共用**一套 HTTP API**，省掉一套 RPC 协议 + 一个中间桥进程；契约单一（统一 manifest + HTTP）。
+- **安全可控**：成熟库（axum）+ 严格中间件 + **Web 授权按需**（见 §4）把跨站攻击面压到可接受。
 
-### D1 内嵌 service 进程（非独立）
-redb 基于文件锁，**不支持多进程并发**；`Coordinator` 在 service 进程内独占 `Arc<Store>` + `Config` + `EngineManager`。控制 RPC 必须与它**同进程**直接持有这些，否则要再加一层进程间中转，徒增延迟与一致性问题。
+代价：HTTP 服务在数据权威进程上（攻击面上移），靠中间件 + 按需授权缓解。`apps/rpc` 空壳 bin 维持废弃。
 
-- **`apps/rpc` 独立 bin 废弃**（或降为开发期 REPL 客户端）。
-- 控制服务端逻辑提为新库 crate **`wind-control`**（dispatcher + services + ctrl 传输），由 `apps/service` 依赖并在 `main` 启动。
-- `tokio` 不必引入控制路径——复用 wind-bridge 的同步线程模型。
+## 2. 现状（已实现，2026-06-19）
 
-### D2 新增控制管道 `wind_input_ctrl`
-与现有 `wind_input`(bridge)/`wind_input_push` 并列，新增 `\\.\pipe\wind_input_ctrl{suffix}`（Unix：`$XDG_RUNTIME_DIR/wind_input_ctrl{suffix}.sock`）。**走 JSON-RPC 帧**（`rpc.rs` 的 4B 长度+JSON），与 bridge 的二进制 `IpcHeader` 协议分离——职责清晰，互不干扰。
-
-### D3 鉴权靠 OS ACL
-
-## 3. 进程内布局
+新建 crate **`wind-webapi`**，由 `apps/service` 内嵌启动。`cargo test -p wind-webapi` 9/9 通过；真实浏览器 e2e（web↔core）验证 manifest 渲染 + config 读写 + 特性门控全绿。
 
 ```
-apps/service/src/main.rs 启动序列（在 Coordinator 就绪后插入）
-  ...
-  let coordinator = Coordinator::new(push_server.clone());   // 持 store/config/engine
-  deferred.set_ready(coordinator.clone());
-  // ▼ 新增
-  let ctrl = wind_control::ControlServer::new(ControlCtx {
-      coordinator: coordinator.clone(),   // 写操作经它的锁，避免与按键处理竞态
-      events: EventHub::new(),            // 给设置前端的事件广播
-      suffix: PIPE_SUFFIX,
-  });
-  ctrl.start();                            // 同步线程监听 wind_input_ctrl
-  ...
-  restart_rx.recv()                        // 主线程仍阻塞于此
-```
-
-```
-crates/wind-control/ (新库)
+crates/wind-webapi/
+├── Cargo.toml          deps: axum, tokio, serde_json, toml, anyhow, tracing, uuid, wind-ipc, wind-config
 └── src/
-    ├── lib.rs          ControlServer / ControlCtx / 启动
-    ├── transport.rs    ctrl 管道监听(仿 wind-bridge server.rs，但 rpc.rs 帧) + 每连接线程
-    ├── dispatch.rs     method:str → handler 路由表; Request→Response; 错误归一
-    ├── events.rs       EventHub: 广播 EventMessage 给所有活跃 ctrl 连接
-    ├── access.rs       数据访问层(见 §5): Coordinator 上的 RPC facade
-    └── services/       config/schema/dict/freq/temp/shadow/phrase/stats/theme/system
+    ├── lib.rs          serve() + build_router() + CoreStatus trait + 9 个契约测试
+    ├── session.rs      WebState：清单缓存 / 端口 / 按需 Web token（短时效）/ control{suffix}.json
+    ├── manifest.rs     加载 data/settings/manifest.toml + 注入运行时 app/engine/variant
+    ├── rpc.rs          /api/rpc 分发：system.* / config.*
+    ├── security.rs     /api/* 与 /local/* 两套中间件（token/Origin/CORS/PNA / 拒浏览器）
+    └── local.rs        /local/* 处理（GUI 专用：info / web-config open|close）
+    examples/dev_server.rs  无 core 的联调用 stub server（WIND_DEV=1 打印带 token 的 URL）
 ```
 
-## 4. 传输与分发
+## 3. 架构与端点
 
-- **传输**（`transport.rs`）：复用 wind-bridge 的"`CreateNamedPipe`(`PIPE_UNLIMITED_INSTANCES`) + `ConnectNamedPipe` + 每连接一线程"骨架。每连接循环：读 4B 长度 → 读 JSON → `decode` 为 `Request` → `dispatch` → 写 `Response`。同一连接上服务端可异步写 `EventMessage`（见 §6），故写出加锁串行化。
-- **分发**（`dispatch.rs`）：`method` 形如 `"config.get"`，按 `"<ns>.<op>"` 路由到 `services::<ns>::<op>(ctx, params) -> Result<Value, RpcError>`。统一包 `Response::success/error`。`v`/`id` 原样回带。
-- **错误模型**：`Response.error` 为字符串（协议所限）。约定 `"<code>: <msg>"` 前缀（如 `not_found:`、`invalid_params:`、`backend:`），前端按前缀分类。
+- 内嵌在 `apps/service`：`Coordinator` 就绪后 `runtime.spawn(wind_webapi::serve(status, variant))`。**仅监听 loopback** `127.0.0.1:<随机端口>`，端口写入 `%LOCALAPPDATA%/WindInput/control{suffix}.json` 供 GUI 发现。
+- **`CoreStatus` trait 解耦**：wind-webapi **不依赖 wind-coordinator/wind-ui**，运行时状态（`is_chinese_mode`/`active_schema_id`/`apply_config`）由宿主经 trait 注入（service 用 `WebStatus` 适配 `Coordinator`）。因此 wind-webapi 可在任意平台独立编译/联调。
+- 端点两层：
 
-## 5. 数据访问层（关键：handler 委托谁）
+| 端点 | 用途 |
+|------|------|
+| `POST /api/rpc` | Web 数据端点（JSON-RPC 形态 `{version,id,method,params}` → `{id,result,error}`）；system.* / config.* |
+| `GET /local/info` | GUI 专用：版本/变体/连接态/端口 |
+| `POST /local/web-config/open` | GUI 触发：按需签发短时效 token + 放行 Web，返回 `config.windinput.com/?port=&token=` |
+| `POST /local/web-config/close` | 撤销 token，收回 Web 访问 |
 
-handler **不直接碰私有字段**。在 `Coordinator` 上新增一组 RPC facade（`access.rs` 调用），统一在 `Coordinator` 的锁下操作，杜绝与按键处理的写竞态：
+## 4. 连接与安全模型
 
-```rust
-impl Coordinator {
-    // 读
-    pub fn rpc_config_snapshot(&self) -> Config;                     // 克隆当前 config
-    pub fn rpc_schemas(&self) -> Vec<SchemaInfo>;                    // 聚合 engine_mgr + schema 文件元信息
-    pub fn rpc_store(&self) -> Option<Arc<Store>>;                   // 词库/词频/shadow/temp 直读
-    // 写（内部加锁 + 落盘 + 应用 + 发事件）
-    pub fn rpc_apply_config(&self, items: &[ConfigSetItem]) -> anyhow::Result<SaveConfigResult>;
-    pub fn rpc_set_active_schema(&self, id: &str) -> anyhow::Result<()>;
-}
-```
+- **协议字段统一为 `version`**（`wind-ipc/rpc.rs` 的 `Request` 已去除 `#[serde(rename="v")]`；双边一致，避免 v 歧义）。
+- **`/api/*`**：默认拒绝；用户点"打开网页配置"→ core 签发短时效 token + 临时放行 `https://config.windinput.com` Origin（开发期放行 `http://localhost:*`/`127.0.0.1:*`）。逐请求校验 `X-WindInput-Token` + Origin 白名单 + CORS（含 `Access-Control-Allow-Private-Network: true` 处理 Chrome PNA 预检）。
+- **`/local/*`**：带 `Origin`（即浏览器跨源）一律 403，仅放行本机非浏览器客户端（GUI 的 ureq/同类）。
+- "按需"= 浏览器暴露窗口按需（token + Origin），而非端口物理开关——loopback 端口常开给本地 GUI，Web 通道按需授权、可即时撤销。
 
-- **读 store**：`dict/freq/temp/shadow` 直接用已实现的 `Store` 方法（§1 表）。`dict.listPaged` 的分页在 handler 层基于 `search_user_words_prefix` 结果切片，或给 store 补带 `limit/offset` 的查询。
-- **写配置**：`rpc_apply_config` = 深合并 `items`（段隔离，对齐前端 `lib/configDiff` 语义）→ `Config::save`（**待补**，§7）→ `apply`/`reload` 到 `engine_mgr` 与状态机 → `EventHub` 发 `config` 事件 → 必要时 `PushServer` 推 mode/重载给 DLL。返回 `{ needsRestart }`。
+## 5. 统一声明式设置清单（manifest）
 
-## 6. 事件推送（新增）
+真相源 `data/settings/manifest.toml`：`[meta]version` + `[[groups]]` + `[[items]]`(key/type/label/hint/default/since/options/min/max/step/enabled_when) + `[features]`(模块+子特性两层可用性)。core 解析后注入 `app/engine/variant`，经 `system.manifest` 返回 `{manifest,app,engine,variant,groups,items,features}`。web 据此渲染设置项并用 `features` 显示/隐藏/禁用模块。详见 web 端 `fromManifest.ts`/`useCapabilities.ts`。
 
-`EventHub`（`events.rs`）：维护活跃 ctrl 连接的发送端列表（仿 `push.rs` 的 clients 模式）。`Coordinator` 写操作完成后 `events.emit(EventMessage{event, data})`，各连接写 4B 长度+JSON。客户端区分：**有 `id` 字段 = `Response`；有 `event` 字段 = 事件**。
+## 6. 方法实现状态（按 contract.ts 10 命名空间）
 
-| 事件 | 触发 | data |
-|------|------|------|
-| `config-event` | config.setItems / schema 变更 | `{type, schemaId?, action}` |
-| `dict-event` | dict/temp/freq/shadow/phrase 变更 | `{type, schemaId?, action}` |
-| `stats-event` | 统计更新 | `{type}` |
-| `system-event` | 重载/方案切换 | `{type, action}` |
+| 命名空间 | 状态 |
+|----------|------|
+| `system` | status/info/manifest/fonts/notifyReload **已实现**（fonts MVP 返回空表、notifyReload 占位） |
+| `config` | get/getDefaults/setItems/reload **已实现**；setItems 经 `Config::set_user_value` 落用户层 + 调 `CoreStatus::apply_config` 返回真实 `needsRestart` |
+| `schema`/`dict`/`freq`/`temp`/`shadow`/`phrase`/`stats`/`theme` | **未实现**（返回 `unknown method`）；web 端靠 `features` 门控 + mock 兜底，属后续里程碑 |
 
+`config`+`system` 已 100% 形状对齐（曾修 `system.info` 字段错配 app/engine→version/platform/dataDir/running）。
 
-## 7. 配置写入与热重载链路（待补核心）
+## 7. 待补（后续里程碑）
 
-```
-config.setItems(items)
-  → 深合并到 user 层 Config (段隔离)
-  → Config::save()                 ← 新增: 写 user_config_dir()/config.toml, 仅用户层差异
-  → Coordinator::apply_config()    ← 新增: 重建/刷新 engine_mgr + 状态机 (热生效, 无需重启)
-  → EventHub.emit("config-event")
-  → 需要时 PushServer 推 ModePush / 触发 DLL 重载
-  → 返回 { needsRestart: 取决于改了哪些段 }
-```
+- 其余命名空间接真后端：`Store` 的 user_words/freq/shadow/temp 已实现可直接接线；`phrases.rs`/`stats.rs` 仍空壳需落地；schema 需 SchemaInfo 聚合 + 覆盖层。
+- **config 热重载**：草稿已设计（`Coordinator` 的 `config`→`RwLock<Arc<ConfigBundle>>` + `install_config`/`reload_user_config`，轻字段即时生效、引擎结构性变更标 `needsRestart`），待 `wind-ui` 在非 Windows 可编译后接入并验证。
+- **事件推送**：`GET /api/events`(SSE) 尚未实现（web 端有订阅，当前 CORS 失败属预期）。
 
-- `Config::save`：序列化为 TOML，写回 `user_config_dir()/config.toml`；只写用户层（系统预置层不动），保持三层合并语义。
-- `apply_config`：参考 `handle_config.rs`（当前无 `pub fn`，热重载入口待补）。区分"可热生效"(候选窗/标点/热键) 与"需重启"(引擎结构性变更) 的字段集。
+## 8. 验证
 
-## 8. 方法契约与实现状态映射
-
-按 `contract.ts` 的 10 命名空间，标注每组的落地路径与缺口：
-
-| 命名空间 | 方法 | 委托 | 状态 |
-|----------|------|------|------|
-| `config` | get/getDefaults/setItems/reload | `rpc_config_snapshot` / `Config::default` / `rpc_apply_config` | 读✅；**`Config::save`+`apply_config` 待补** |
-| `schema` | list/active/setActive/getConfig/saveConfig/resetConfig/setDictEnabled/references/delete | `engine_mgr` + schema 文件层 | active/switch✅；**SchemaInfo 聚合、覆盖层 save/reset、references 待补** |
-| `dict` | listPaged/search/add/update/remove/clear/stats/encode/genPinyin | `Store` user_words + `engine_mgr.convert` | CRUD✅；**listPaged 分页、stats、encode/genPinyin 接线待补** |
-| `freq` | listPaged/delete/clear | `Store` freq | ✅（分页接线） |
-| `temp` | list/promote/promoteAll/remove/clear | `Store` temp_words + 晋升逻辑 | CRUD✅；**promote 晋升到 user 层待接** |
-| `shadow` | list/pin/delete/removeRule | `Store` shadow | ✅ |
-| `phrase` | list/add/update/remove/setEnabled/resetDefault | `Store` phrases | **phrases.rs 空壳，全待实现** |
-| `stats` | summary/daily/clear/pruneBefore | `Store` stats | **stats.rs 空壳 + 统计收集器待实现** |
-
-
-## 9. 落地路线
-
-| 阶段 | 内容 | 验收 |
-|------|------|------|
-| **R0** | 新建 `wind-control` crate；`transport.rs`(ctrl 管道+rpc 帧)+`dispatch.rs`；内嵌 service 启动；`system.status` | 设置端 `system.status` 通 |
-| **R1** | `Config::save` + `Coordinator::rpc_apply_config`/`apply_config`；`config.*` 全通 + `config-event` | 改配置落盘+热生效+事件 |
-| **R2** | `schema.*`(SchemaInfo 聚合 + 覆盖层)；`dict/freq/temp/shadow.*`（已实现 store 接线 + 分页） | 词库/方案页接真后端 |
-| **R3** | 落地 `phrases.rs` + `stats.rs`(收集器) → `phrase.*`/`stats.*` | 短语/统计页接通 |
-| **R4** | `theme.*`；事件全量；并发与重连压测 | 取代前端 mock 全量联调 |
-
+`cargo test -p wind-webapi`（9 个契约测试：形状 + 安全行为）；web 端 `pnpm test`（zod 契约，mock + 真实 core 双层）；真实浏览器 e2e（chrome-headless-shell + Playwright，`WindInputSetting/web-e2e.mjs`）。
