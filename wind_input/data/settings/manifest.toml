@@ -489,6 +489,106 @@ options = [
   { value = "trace", label = "trace" },
 ]
 
+# ───────────────────────── 补全项（对照 wind-config 真实字段）─────────────────────────
+# 前端按 group 字段分组，文件顺序无关；以下补齐旧项目有而清单缺的用户级设置。
+[[items]]
+key = "hotkeys.open_settings"
+group = "hotkeys"
+type = "string"
+label = "打开设置"
+default = ""
+since = 2
+
+[[items]]
+key = "input.smart_symbol_chars"
+group = "input"
+type = "string"
+label = "智能符号字符集"
+hint = "参与智能符号转换的中文标点集合"
+default = "。，？！：；、～￥·……——"
+since = 2
+enabled_when = "input.smart_symbol_mode == true"
+
+[[items]]
+key = "input.numpad_behavior"
+group = "input"
+type = "string" # TODO opts：小键盘行为枚举待确认
+label = "小键盘行为"
+default = ""
+since = 2
+
+[[items]]
+key = "input.shift_temp_english.shift_behavior"
+group = "input"
+type = "string" # TODO opts：Shift 行为枚举待确认（temp_english/...）
+label = "Shift 行为"
+default = "temp_english"
+since = 2
+enabled_when = "input.shift_temp_english.enabled == true"
+
+[[items]]
+key = "input.shift_temp_english.allow_symbols"
+group = "input"
+type = "toggle"
+label = "临时英文允许符号"
+default = false
+since = 2
+enabled_when = "input.shift_temp_english.enabled == true"
+
+[[items]]
+key = "input.shift_temp_english.space_as_input"
+group = "input"
+type = "toggle"
+label = "临时英文空格作输入"
+default = false
+since = 2
+enabled_when = "input.shift_temp_english.enabled == true"
+
+[[items]]
+key = "input.code_commit.auto_commit_min_len"
+group = "input"
+type = "number"
+label = "自动上屏最短码长"
+hint = "0 跟随方案 max_code_length"
+default = 0
+min = 0
+max = 10
+since = 2
+enabled_when = "input.code_commit.auto_commit_at_full == true"
+
+[[items]]
+key = "input.code_commit.clear_on_empty_max"
+group = "input"
+type = "toggle"
+label = "满码无候选时清空缓冲"
+default = false
+since = 2
+
+[[items]]
+key = "ui.candidate.layout"
+group = "ui"
+type = "string" # TODO opts：候选排列枚举待确认（horizontal/vertical?）；当前 core 未消费
+label = "候选窗排列"
+default = ""
+since = 2
+
+[[items]]
+key = "ui.font.render_mode"
+group = "ui"
+type = "string" # TODO opts：字体渲染模式枚举待确认
+label = "字体渲染模式"
+default = ""
+since = 2
+
+[[items]]
+key = "features.s2t.variant"
+group = "advanced"
+type = "string" # TODO opts：简繁变体枚举待确认
+label = "简繁变体"
+default = ""
+since = 2
+enabled_when = "features.s2t.enabled == true"
+
 # ── 特性可用性（模块 + 子特性两层；web 据此显示/隐藏/禁用）──
 # 保留另一会话约定；随各命名空间深化(temp/freq/shadow/stats/phrase/theme)逐步开启。
 [features.dict]
