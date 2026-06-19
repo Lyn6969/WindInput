@@ -32,7 +32,7 @@ HTTP 传输/安全/引导/配置读写 + **数据桥(schema/dict 真实接入)**
 | W6 | 深化 theme.preview/import；dict.encode/genPinyin | ⬜ | | |
 | W7 | schema.getConfig/saveConfig(方案YAML) | ⬜ | | 对话框 |
 | W8 | 保存/重载/恢复默认 移到**导航栏**(替浮现栏) | ⬜ | | useConfig 已有 dirty/save/reset;补 getDefaults/reload |
-| W9 | 前端 Tab 重构(按 6 group 分页 + 二级对话框/分级) | ⬜ | | 前端 WindInputSetting |
+| W9 | 前端 Tab 全面 manifest 驱动(方案A) | ✅ | sess-A@06-19 | WindInputSetting 1571c0c;通用/输入/外观/高级按组渲染,删硬编码 schema 使用,build 通过。二级对话框/分级 UI 仍可后续细化 |
 | W10 | 热重载实装(apply_config) | ⬜ | | 见 hotreload-draft.patch |
 
 ## 待确认（manifest 中标 "# TODO opts"）
