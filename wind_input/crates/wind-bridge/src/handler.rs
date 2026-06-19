@@ -98,6 +98,36 @@ pub enum KeyAction {
     ReplaceBackward { count: u32, text: String },
 }
 
+impl KeyAction {
+    /// 非 app_inline（候选窗自行显示 preedit）时，应用侧组合串替换为单个占位空格、光标置前。
+    /// 目的：保留一段组合串供应用上报 caret 坐标（候选窗定位），但不在应用内显示真实编码
+    /// （避免与候选窗 preedit 重复）。对齐 Go 版"模拟空格 + 光标移前"。
+    pub fn with_composition_placeholder(self) -> KeyAction {
+        match self {
+            KeyAction::UpdateComposition { text, .. } if !text.is_empty() => {
+                KeyAction::UpdateComposition {
+                    text: " ".to_string(),
+                    caret_pos: 0,
+                }
+            }
+            KeyAction::InsertText {
+                text,
+                new_composition: Some(c),
+                mode_changed,
+                chinese_mode,
+                has_new_composition,
+            } if !c.is_empty() => KeyAction::InsertText {
+                text,
+                new_composition: Some(" ".to_string()),
+                mode_changed,
+                chinese_mode,
+                has_new_composition,
+            },
+            other => other,
+        }
+    }
+}
+
 /// 焦点数据
 #[derive(Debug, Clone)]
 pub struct FocusData {
@@ -124,6 +154,21 @@ pub struct CaretData {
 pub trait MessageHandler: Send + Sync {
     /// 处理按键事件
     fn handle_key_event(&self, data: &KeyEventData) -> KeyAction;
+
+    /// 应用侧组合串是否使用占位空格（候选窗显示 preedit 的非 app_inline 模式）。默认否（app_inline）。
+    fn preedit_uses_placeholder(&self) -> bool {
+        false
+    }
+
+    /// 处理按键并按 preedit 显示策略后处理组合串（bridge 入口应调用此方法）。
+    fn handle_key_event_policed(&self, data: &KeyEventData) -> KeyAction {
+        let action = self.handle_key_event(data);
+        if self.preedit_uses_placeholder() {
+            action.with_composition_placeholder()
+        } else {
+            action
+        }
+    }
 
     /// 处理焦点获取（返回状态用于 ActivationStatusPush）
     fn handle_focus_gained(&self, data: &FocusData) -> Option<StatusUpdateData>;

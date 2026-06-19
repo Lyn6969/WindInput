@@ -81,13 +81,17 @@ impl Coordinator {
     }
 
     /// 进入 mix 模式（至少一个成员方案可加载，由激活点保证）。
-    pub(crate) fn enter_mix_mode(&self, state: &mut State, idx: u8) -> KeyAction {
+    pub(crate) fn enter_mix_mode(&self, state: &mut State, idx: u8, key_code: u32) -> KeyAction {
         state.input_buffer.clear();
         state.candidates.clear();
         state.active = Some(ModeKind::Mix(idx));
         state.mix_id = idx;
         state.mix_buffer.clear();
         state.mix_numeric = false; // 由首字符（数字/字母）决定
+        // 显示态前缀（进入键符号，如 ";"）：只显示不消费，让用户看到按下的键。
+        state.mix_prefix = keymap::vk_to_prefix_char(key_code)
+            .map(|c| c.to_string())
+            .unwrap_or_default();
         self.update_mix_candidates(state);
         self.notify_ui_update(state);
         let display = state.preedit.clone();
@@ -102,6 +106,7 @@ impl Coordinator {
     pub(crate) fn exit_mix_mode(&self, state: &mut State) {
         state.active = None;
         state.mix_buffer.clear();
+        state.mix_prefix.clear();
         state.committed_text.clear();
         state.committed_segs.clear();
         state.candidates.clear();
@@ -312,6 +317,58 @@ impl Coordinator {
         }
     }
 
+    /// 当前激活模式的指示名 (全称, 短称)；None = 无可指示模式（普通输入/网址模式）。
+    /// 临时拼音/双拼按目标方案派生（拼/双）；mix/special 取配置 name + short_name。
+    pub(crate) fn mode_indicator_names(&self, state: &State) -> Option<(String, String)> {
+        match state.active? {
+            ModeKind::TempPinyin => {
+                let disp = Self::schema_display_name(&state.temp_pinyin_schema);
+                let short = disp.chars().next().map(|c| c.to_string()).unwrap_or_default();
+                Some((format!("临时{}", disp), short))
+            }
+            ModeKind::TempEnglish => Some(("临时英文".to_string(), "英".to_string())),
+            ModeKind::QuickInput => Some(("快捷输入".to_string(), "快".to_string())),
+            ModeKind::Url => None,
+            ModeKind::Mix(i) => {
+                let m = self.config.features.mix_modes.get(i as usize)?;
+                let full = if m.name.is_empty() {
+                    "快捷".to_string()
+                } else {
+                    m.name.clone()
+                };
+                let short = Self::short_or_first(&m.short_name, &full);
+                Some((full, short))
+            }
+            ModeKind::Special(i) => {
+                let m = self.config.features.special_modes.get(i as usize)?;
+                let full = m.name.clone();
+                let short = Self::short_or_first(&m.short_name, &full);
+                Some((full, short))
+            }
+        }
+    }
+
+    /// 短称：配置非空则用之，否则取全称首字。
+    fn short_or_first(short: &str, full: &str) -> String {
+        if !short.trim().is_empty() {
+            short.trim().to_string()
+        } else {
+            full.chars().next().map(|c| c.to_string()).unwrap_or_default()
+        }
+    }
+
+    /// 按 ui.mode_indicator.style 解析出当前应显示的指示文本；None = 不显示。
+    pub(crate) fn mode_indicator_text(&self, state: &State) -> Option<String> {
+        use wind_config::ModeIndicatorStyle;
+        let (full, short) = self.mode_indicator_names(state)?;
+        match self.config.ui.mode_indicator.parsed_style() {
+            ModeIndicatorStyle::None => None,
+            ModeIndicatorStyle::Full => Some(full),
+            ModeIndicatorStyle::Short => Some(short),
+        }
+    }
+
+
     /// 切换方案：清空输入并推送状态
     pub(crate) fn switch_schema(&self, schema_id: &str) {
         if self.engine_mgr.switch_schema(schema_id) {
@@ -419,8 +476,11 @@ impl Coordinator {
         state.candidates.clear();
         state.current_page = 0;
         state.selected_index = 0;
-        // 组合区 = 已转换前缀（文本透镜逐步转换累积）+ 剩余缓冲。
-        state.preedit = format!("{}{}", state.committed_text, state.mix_buffer);
+        // 组合区 = 显示态前缀 + 已转换前缀（文本透镜逐步转换累积）+ 剩余缓冲。
+        state.preedit = format!(
+            "{}{}{}",
+            state.mix_prefix, state.committed_text, state.mix_buffer
+        );
         if state.mix_buffer.is_empty() {
             return;
         }
@@ -471,7 +531,7 @@ impl Coordinator {
         }
         // 文本透镜用音节分隔显示；数字透镜（计算）保持原始表达式。
         if let Some(disp) = text_display {
-            state.preedit = format!("{}{}", state.committed_text, disp);
+            state.preedit = format!("{}{}{}", state.mix_prefix, state.committed_text, disp);
         }
         state.candidates = cands;
     }
@@ -509,6 +569,18 @@ impl Coordinator {
                 Self::commit_action(t, true)
             }
         };
+        // 进入键二次按下（缓冲空 + 无已转换前缀）：按中英标点配置上屏该符号并退出。
+        // 必须前置于下方数字透镜——否则 ; 等会被 printable_char 当表达式字符吞进缓冲。
+        if state.mix_buffer.is_empty()
+            && state.committed_text.is_empty()
+            && self.match_mix_trigger(data.key_code) == Some(state.mix_id)
+            && let Some(ch) = punct_char(data.key_code, data.modifiers & MOD_SHIFT != 0)
+        {
+            let out = self.convert_punct_char(state, ch);
+            self.exit_mix_mode(state);
+            self.notify_ui_hide();
+            return Self::commit_action(out, true);
+        }
         match data.key_code {
             keymap::VK_ESCAPE => {
                 self.exit_mix_mode(state);

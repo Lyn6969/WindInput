@@ -93,13 +93,13 @@ impl Coordinator {
                 // 方案可加载才进入（否则不拦截该键，落普通流程）。
                 if let Some(schema) = self.special_schema(idx)
                     && self.engine_mgr.ensure_schema(&schema) {
-                        return Some(self.enter_special_mode(state, idx));
+                        return Some(self.enter_special_mode(state, idx, data.key_code));
                     }
             }
             // 临时 mix：含 quick_input 或至少一个可加载成员方案才进入（优先级最低）。
             if let Some(idx) = self.match_mix_trigger(data.key_code)
                 && (self.mix_has_quick_input(idx) || !self.mix_members(idx).is_empty()) {
-                    return Some(self.enter_mix_mode(state, idx));
+                    return Some(self.enter_mix_mode(state, idx, data.key_code));
                 }
         }
 

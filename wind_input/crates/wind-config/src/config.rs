@@ -432,6 +432,55 @@ pub struct UiConfig {
     pub font: UiFontConfig,
     #[serde(default)]
     pub theme: UiThemeConfig,
+    #[serde(default)]
+    pub mode_indicator: ModeIndicatorConfig,
+}
+
+/// 模式指示器配置（[ui.mode_indicator]）：进入临时拼音/双拼/快捷/英文/快符等模式时的标识。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ModeIndicatorConfig {
+    /// 显示样式："short"（短称，默认）| "full"（全称）| "none"（不显示）。
+    #[serde(default = "default_mode_indicator_style")]
+    pub style: String,
+}
+
+fn default_mode_indicator_style() -> String {
+    "short".to_string()
+}
+
+impl Default for ModeIndicatorConfig {
+    fn default() -> Self {
+        Self {
+            style: default_mode_indicator_style(),
+        }
+    }
+}
+
+/// 模式指示样式（解析自 ui.mode_indicator.style）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ModeIndicatorStyle {
+    /// 短称（拼/双/快/英/符）。
+    Short,
+    /// 全称（临时拼音 等）。
+    Full,
+    /// 不显示。
+    None,
+}
+
+impl ModeIndicatorStyle {
+    pub fn from_config(s: &str) -> Self {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "full" => Self::Full,
+            "none" => Self::None,
+            _ => Self::Short,
+        }
+    }
+}
+
+impl ModeIndicatorConfig {
+    pub fn parsed_style(&self) -> ModeIndicatorStyle {
+        ModeIndicatorStyle::from_config(&self.style)
+    }
 }
 
 /// 候选窗配置（[ui.candidate]）
@@ -442,12 +491,77 @@ pub struct UiCandidateConfig {
     pub per_page: usize,
     #[serde(default)]
     pub layout: String,
-    #[serde(default)]
-    pub inline_preedit: bool,
-    #[serde(default)]
-    pub preedit_mode: String,
+    /// 编码（组合区）显示方式。单一权威配置，取代旧的 inline_preedit + preedit_mode 组合。
+    /// - "app_inline"（默认）：编码内嵌应用光标处，候选窗不显示 preedit 栏
+    /// - "candidate_top"：候选窗顶部独立 preedit 栏
+    /// - "candidate_inline"：编码作为候选窗首单元内联
+    #[serde(default = "default_preedit_display")]
+    pub preedit_display: String,
     #[serde(default)]
     pub hide_window: bool,
+}
+
+fn default_preedit_display() -> String {
+    "app_inline".to_string()
+}
+
+/// 编码显示方式（解析自 ui.candidate.preedit_display）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PreeditDisplay {
+    /// 内嵌应用光标处，候选窗不显示 preedit。
+    AppInline,
+    /// 候选窗顶部独立 preedit 栏。
+    CandidateTop,
+    /// 编码作为候选窗首单元内联。
+    CandidateInline,
+}
+
+impl PreeditDisplay {
+    /// 解析配置字符串（空/未知 → 默认 AppInline）。
+    pub fn from_config(s: &str) -> Self {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "candidate_top" => Self::CandidateTop,
+            "candidate_inline" => Self::CandidateInline,
+            _ => Self::AppInline,
+        }
+    }
+
+    /// 配置字符串形式（持久化用）。
+    pub fn as_config(self) -> &'static str {
+        match self {
+            Self::AppInline => "app_inline",
+            Self::CandidateTop => "candidate_top",
+            Self::CandidateInline => "candidate_inline",
+        }
+    }
+
+    /// 是否内嵌应用（候选窗不显示 preedit）。
+    pub fn in_app(self) -> bool {
+        matches!(self, Self::AppInline)
+    }
+
+    /// 是否编码内联候选首单元（对应旧 preedit_embedded）。
+    pub fn embedded(self) -> bool {
+        matches!(self, Self::CandidateInline)
+    }
+
+    /// 循环切换：内嵌应用 → 候选顶部 → 候选内联 → 内嵌应用。
+    pub fn next(self) -> Self {
+        match self {
+            Self::AppInline => Self::CandidateTop,
+            Self::CandidateTop => Self::CandidateInline,
+            Self::CandidateInline => Self::AppInline,
+        }
+    }
+
+    /// 简短中文名（状态提示用）。
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::AppInline => "编码:内嵌应用",
+            Self::CandidateTop => "编码:候选顶部",
+            Self::CandidateInline => "编码:候选内联",
+        }
+    }
 }
 
 impl Default for UiCandidateConfig {
@@ -455,10 +569,16 @@ impl Default for UiCandidateConfig {
         Self {
             per_page: default_per_page(),
             layout: String::new(),
-            inline_preedit: false,
-            preedit_mode: String::new(),
+            preedit_display: default_preedit_display(),
             hide_window: false,
         }
+    }
+}
+
+impl UiCandidateConfig {
+    /// 解析后的编码显示方式。
+    pub fn preedit(&self) -> PreeditDisplay {
+        PreeditDisplay::from_config(&self.preedit_display)
     }
 }
 
@@ -505,6 +625,7 @@ fn default_mix_modes() -> Vec<MixModeConfig> {
     vec![MixModeConfig {
         id: "quick_mix".to_string(),
         name: "快捷".to_string(),
+        short_name: "快".to_string(),
         trigger_keys: vec!["semicolon".to_string()],
         members: vec![
             "quick_input".to_string(),
@@ -534,9 +655,12 @@ pub struct MixModeConfig {
     /// 实例唯一标识
     #[serde(default)]
     pub id: String,
-    /// 显示名（UI 徽标）
+    /// 显示名（UI 徽标 / 模式指示全称）
     #[serde(default)]
     pub name: String,
+    /// 模式指示短称（空则取 name 首字）
+    #[serde(default)]
+    pub short_name: String,
     /// 引导键列表
     #[serde(default)]
     pub trigger_keys: Vec<String>,
@@ -552,9 +676,12 @@ pub struct SpecialModeConfig {
     /// 实例唯一标识
     #[serde(default)]
     pub id: String,
-    /// 显示名（UI 徽标）
+    /// 显示名（UI 徽标 / 模式指示全称，如 "快符"）
     #[serde(default)]
     pub name: String,
+    /// 模式指示短称（如 "符"；空则取 name 首字）
+    #[serde(default)]
+    pub short_name: String,
     /// 引导键列表（如 "grave"/"backslash"/"z"）
     #[serde(default)]
     pub trigger_keys: Vec<String>,

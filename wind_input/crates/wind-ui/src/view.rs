@@ -133,6 +133,9 @@ pub struct View {
     pub children: Vec<View>,
     /// 弹性占位：主轴方向吸收容器剩余空间（用于把后续子节点推到末端，如菜单 ▸ 右对齐）。
     pub grow: bool,
+    /// 跨轴填充：在父容器排布时把本节点撑满父内容的跨轴尺寸（Column→宽度），
+    /// 供其内部 spacer 实现右对齐（如 preedit 栏让模式标记贴右）。
+    pub fill_cross: bool,
     /// 命中标识：>=0 参与命中收集（如候选下标 / 按钮 id），<0 忽略
     pub tag: i32,
     // 计算结果
@@ -164,6 +167,7 @@ impl Default for View {
             layers: Vec::new(),
             children: Vec::new(),
             grow: false,
+            fill_cross: false,
             tag: -1,
             mw: 0.0,
             mh: 0.0,
@@ -201,6 +205,12 @@ impl View {
     /// 标记本节点为弹性（主轴吸收剩余空间）。
     pub fn grow(mut self) -> Self {
         self.grow = true;
+        self
+    }
+
+    /// 标记本节点跨轴填充父容器（Column→撑满宽度），供内部 spacer 右对齐。
+    pub fn fill_cross(mut self) -> Self {
+        self.fill_cross = true;
         self
     }
 
@@ -376,6 +386,10 @@ impl View {
                     for c in self.children.iter_mut().filter(|c| c.grow) {
                         c.mh += extra;
                     }
+                }
+                // 跨轴填充：fill_cross 子节点宽度撑满列内容宽（供其内部 spacer 右对齐）。
+                for c in self.children.iter_mut().filter(|c| c.fill_cross) {
+                    c.mw = (content_w - c.margin.w()).max(c.mw);
                 }
                 let mut cy = cy0;
                 for c in &mut self.children {

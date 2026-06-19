@@ -44,12 +44,16 @@ impl Coordinator {
     }
 
     /// 进入特殊模式（其方案须可加载，由激活点 ensure_schema 保证）。清空普通输入，初始化空编码缓冲。
-    pub(crate) fn enter_special_mode(&self, state: &mut State, idx: u8) -> KeyAction {
+    pub(crate) fn enter_special_mode(&self, state: &mut State, idx: u8, key_code: u32) -> KeyAction {
         state.input_buffer.clear();
         state.candidates.clear();
         state.active = Some(ModeKind::Special(idx));
         state.special_id = idx;
         state.special_buffer.clear();
+        // 显示态前缀（进入键符号，如 "\"）：只显示不消费。
+        state.special_prefix = keymap::vk_to_prefix_char(key_code)
+            .map(|c| c.to_string())
+            .unwrap_or_default();
         self.update_special_candidates(state);
         self.notify_ui_update(state);
         let display = state.preedit.clone();
@@ -64,6 +68,7 @@ impl Coordinator {
     pub(crate) fn exit_special_mode(&self, state: &mut State) {
         state.active = None;
         state.special_buffer.clear();
+        state.special_prefix.clear();
         state.candidates.clear();
         state.preedit.clear();
     }
@@ -74,7 +79,8 @@ impl Coordinator {
         state.candidates.clear();
         state.current_page = 0;
         state.selected_index = 0;
-        state.preedit = state.special_buffer.clone();
+        // 组合区 = 显示态前缀 + 编码缓冲（前缀只显示不参与查询）。
+        state.preedit = format!("{}{}", state.special_prefix, state.special_buffer);
         if state.special_buffer.is_empty() {
             return None;
         }
@@ -101,6 +107,16 @@ impl Coordinator {
     pub(crate) fn handle_special_key(&self, state: &mut State, data: &KeyEventData) -> KeyAction {
         if let Some(act) = self.handle_candidate_nav(state, data) {
             return act;
+        }
+        // 进入键二次按下（缓冲空）：按中英标点配置上屏该符号并退出。
+        if state.special_buffer.is_empty()
+            && self.match_special_trigger(data.key_code) == Some(state.special_id)
+            && let Some(ch) = punct_char(data.key_code, data.modifiers & MOD_SHIFT != 0)
+        {
+            let out = self.convert_punct_char(state, ch);
+            self.exit_special_mode(state);
+            self.notify_ui_hide();
+            return Self::commit_action(out, true);
         }
         match data.key_code {
             keymap::VK_ESCAPE => {

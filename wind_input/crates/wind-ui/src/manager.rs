@@ -15,6 +15,8 @@ pub enum UiCommand {
     /// 更新候选列表
     UpdateCandidates {
         preedit: String,
+        /// 模式指示文本（拼/双/快/英/符 或全称）；空=不显示。有 preedit 空间时随候选窗持久显示。
+        mode_label: String,
         candidates: Vec<CandidateItem>,
         /// 键盘选中项（页内下标），空格上屏目标
         selected: usize,
@@ -46,7 +48,7 @@ pub enum UiCommand {
     /// 候选布局方向（true=竖排）。来自 ui.candidate.layout。
     SetCandidateLayout(bool),
     /// 预编辑嵌入模式（true=编码嵌入候选行首，不显示独立 preedit 条）。
-    /// 来自 ui.candidate.preedit_mode == "embedded"（且 inline_preedit=false）。
+    /// 来自 ui.candidate.preedit_display == "candidate_inline"。
     SetPreeditEmbedded(bool),
     /// 显示菜单（候选右键菜单 / 功能主菜单；UI 自管导航与子菜单）
     ShowCandidateMenu {
@@ -356,6 +358,7 @@ impl UiManager {
                     match cmd {
                         UiCommand::UpdateCandidates {
                             preedit,
+                            mode_label,
                             candidates,
                             selected,
                             hover,
@@ -376,7 +379,7 @@ impl UiManager {
                                 caret_x,
                                 caret_y
                             );
-                            candidate_window.update(&preedit, candidates, selected, hover, page, total_pages);
+                            candidate_window.update(&preedit, &mode_label, candidates, selected, hover, page, total_pages);
                             candidate_window.set_position(caret_x, caret_y, caret_height, caret_valid);
                             candidate_window.show();
                         }

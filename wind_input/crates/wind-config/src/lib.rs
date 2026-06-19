@@ -8,5 +8,5 @@ pub mod hotkey;
 pub mod runtime_state;
 pub mod schema;
 
-pub use config::{CodeCommitConfig, Config};
+pub use config::{CodeCommitConfig, Config, ModeIndicatorStyle, PreeditDisplay};
 pub use schema::Schema;

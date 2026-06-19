@@ -20,6 +20,7 @@ use wind_bridge::handler::*;
 use wind_bridge::push::{PushConfig, PushServer};
 use wind_candidate::Candidate;
 use wind_config::Config;
+use wind_config::PreeditDisplay;
 use wind_config::hotkey::{self, CompiledHotkeys};
 use wind_engine::EngineManager;
 use wind_ipc::protocol::{
@@ -269,8 +270,12 @@ pub(crate) struct State {
     pub(crate) special_buffer: String,
     /// 当前特殊模式下标（= features.special_modes 索引；仅 active==Special 时有效）
     pub(crate) special_id: u8,
+    /// 特殊模式显示态前缀（进入键符号，如 "\"；只显示不消费，组合区前缀，对齐临时拼音）
+    pub(crate) special_prefix: String,
     /// 临时 mix 编码缓冲
     pub(crate) mix_buffer: String,
+    /// mix 模式显示态前缀（进入键符号，如 ";"；只显示不消费，组合区前缀）
+    pub(crate) mix_prefix: String,
     /// 当前 mix 模式下标（= features.mix_modes 索引；仅 active==Mix 时有效）
     pub(crate) mix_id: u8,
     /// mix 数字模式（仅含 quick_input 成员时有效）：首字符数字/符号 → true（表达式：数字/符号
@@ -350,8 +355,9 @@ pub struct Coordinator {
     pub(crate) self_weak: std::sync::OnceLock<std::sync::Weak<Coordinator>>,
     /// 上屏历史环形缓冲（index 0 = 最近）：供命令栏 `last(n)` 取最近上屏文本。
     pub(crate) recent_commits: Mutex<std::collections::VecDeque<String>>,
-    /// preedit 嵌入模式运行时态（命令栏 ime.toggle("preedit") 切换；初值随配置，暂不持久化）。
-    preedit_embedded: Mutex<bool>,
+    /// 编码显示方式运行时态（命令栏 ime.toggle("preedit") 循环切换；初值随配置）。
+    /// 统一权威：决定候选窗是否显示 preedit（in_app→不显示）及是否内联首单元（embedded）。
+    pub(crate) preedit_display: Mutex<PreeditDisplay>,
     /// 候选窗隐藏开关（命令栏 ime.toggle("candwin") 切换；隐藏时 notify_ui_update 不显示候选）。
     hide_candidate_window: Mutex<bool>,
     /// 候选布局方向运行时态（命令栏 ime.toggle("layout") 切换；true=竖排，初值随配置，持久化）。
@@ -448,10 +454,8 @@ impl Coordinator {
         let _ = coordinator
             .ui_tx
             .send(UiCommand::SetCandidateLayout(vertical));
-        // 下发预编辑嵌入模式：preedit_mode == "embedded" 且非 inline_preedit（inline 时编码内联在应用）。
-        let cand_cfg = &coordinator.config.ui.candidate;
-        let embedded =
-            !cand_cfg.inline_preedit && cand_cfg.preedit_mode.eq_ignore_ascii_case("embedded");
+        // 下发预编辑内联模式：仅 candidate_inline 需内联候选首单元（app_inline 不显示、candidate_top 独立条）。
+        let embedded = coordinator.config.ui.candidate.preedit().embedded();
         let _ = coordinator
             .ui_tx
             .send(UiCommand::SetPreeditEmbedded(embedded));
@@ -569,14 +573,8 @@ impl Coordinator {
             config.input.punct_custom.mappings.clone(),
         );
 
-        // preedit 嵌入模式运行时初值（与 new() 下发 SetPreeditEmbedded 的判定一致）。
-        // 在 config 被移入结构体前先算出（结构体字段顺序会先移走 config）。
-        let preedit_embedded_init = !config.ui.candidate.inline_preedit
-            && config
-                .ui
-                .candidate
-                .preedit_mode
-                .eq_ignore_ascii_case("embedded");
+        // 编码显示方式运行时初值（config 移入结构体前先算）。
+        let preedit_display_init = config.ui.candidate.preedit();
 
         // 候选布局方向运行时初值（与下方 SetCandidateLayout 下发一致；config 移入前先算）。
         let candidate_vertical_init = config
@@ -618,8 +616,10 @@ impl Coordinator {
                 rewind: None,
                 special_buffer: String::new(),
                 special_id: 0,
+                special_prefix: String::new(),
                 mix_buffer: String::new(),
                 mix_id: 0,
+                mix_prefix: String::new(),
                 mix_numeric: false,
                 caret_x: 0,
                 caret_y: 0,
@@ -655,7 +655,7 @@ impl Coordinator {
             cmdbar_services: std::sync::OnceLock::new(),
             self_weak: std::sync::OnceLock::new(),
             recent_commits: Mutex::new(std::collections::VecDeque::new()),
-            preedit_embedded: Mutex::new(preedit_embedded_init),
+            preedit_display: Mutex::new(preedit_display_init),
             hide_candidate_window: Mutex::new(false),
             candidate_vertical: Mutex::new(candidate_vertical_init),
         });
@@ -963,25 +963,25 @@ impl Coordinator {
         }
     }
 
-    /// 切换 preedit 编码显示模式（top ↔ embedded），下发 UI（运行时态，暂不持久化）。
+    /// 循环切换编码显示方式（内嵌应用 → 候选顶部 → 候选内联 → ...），下发 UI 并持久化。
     fn cmd_toggle_preedit(&self) {
-        let embedded = {
-            let mut e = self
-                .preedit_embedded
+        let mode = {
+            let mut m = self
+                .preedit_display
                 .lock()
                 .unwrap_or_else(|x| x.into_inner());
-            *e = !*e;
-            *e
+            *m = m.next();
+            *m
         };
-        let _ = self.ui_tx.send(UiCommand::SetPreeditEmbedded(embedded));
-        // 持久化到用户层 ui.candidate.preedit_mode（重启后保留）。
-        if let Err(e) = Config::set_user_string(
-            &["ui", "candidate", "preedit_mode"],
-            if embedded { "embedded" } else { "top" },
-        ) {
+        // 候选窗内联标志（仅 candidate_inline 为 true）；in_app 由 notify_ui_update 读运行时态门控。
+        let _ = self.ui_tx.send(UiCommand::SetPreeditEmbedded(mode.embedded()));
+        // 持久化到用户层 ui.candidate.preedit_display（重启后保留）。
+        if let Err(e) =
+            Config::set_user_string(&["ui", "candidate", "preedit_display"], mode.as_config())
+        {
             warn!("ime.toggle preedit: 持久化失败: {}", e);
         }
-        self.show_tip(if embedded { "编码:嵌入" } else { "编码:顶部" });
+        self.show_tip(mode.label());
     }
 
     /// 切换候选窗显隐（运行时态）。隐藏时下次刷新即不显示候选。
@@ -1027,7 +1027,15 @@ impl Coordinator {
 
 
     pub(crate) fn notify_ui_update(&self, state: &State) {
-        if state.candidates.is_empty() && state.input_buffer.is_empty() {
+        // 模式指示标记（拼/双/快/英/符）：仅在候选为空时显示（进入模式/无候选阶段），
+        // 一旦有候选即隐藏，减少干扰。必须纳入下方"空则隐藏"守卫——否则进入模式时
+        // 缓冲为空会直接隐藏，标记发不出。
+        let mode_label = if state.candidates.is_empty() {
+            self.mode_indicator_text(state).unwrap_or_default()
+        } else {
+            String::new()
+        };
+        if state.candidates.is_empty() && state.input_buffer.is_empty() && mode_label.is_empty() {
             let _ = self.ui_tx.send(UiCommand::HideCandidates);
             return;
         }
@@ -1102,15 +1110,22 @@ impl Coordinator {
             .lock()
             .unwrap_or_else(|e| e.into_inner()) = !caret_valid;
         let n_items = items.len();
-        // preedit 是否在候选窗显示，按配置门控：inline_preedit=true 时组合串内联显示在应用内
-        // （应用侧嵌入编码），候选窗不再重复显示 preedit 条。否则照常显示（默认 top 模式）。
-        let preedit = if self.config.ui.candidate.inline_preedit {
+        // preedit 是否在候选窗显示，按运行时编码显示方式门控：app_inline 时组合串内嵌应用，
+        // 候选窗不再重复显示 preedit；candidate_top/inline 时照常下发由候选窗渲染。
+        let in_app = self
+            .preedit_display
+            .lock()
+            .map(|m| m.in_app())
+            .unwrap_or(true);
+        let preedit = if in_app {
             String::new()
         } else {
             state.preedit.clone()
         };
+        // mode_label 已在顶部计算（纳入空则隐藏守卫）：作为候选窗内联标记随候选窗一并显示。
         let _ = self.ui_tx.send(UiCommand::UpdateCandidates {
             preedit,
+            mode_label,
             candidates: items,
             selected,
             hover,
@@ -1478,6 +1493,14 @@ impl MessageHandler for Coordinator {
 
     fn handle_show_context_menu(&self, x: i32, y: i32) {
         self.show_main_menu(x, y);
+    }
+
+    fn preedit_uses_placeholder(&self) -> bool {
+        // 非 app_inline（候选窗自显 preedit）→ 应用侧用占位空格，不重复显示编码。
+        self.preedit_display
+            .lock()
+            .map(|m| !m.in_app())
+            .unwrap_or(false)
     }
 
     fn handle_key_event(&self, data: &KeyEventData) -> KeyAction {

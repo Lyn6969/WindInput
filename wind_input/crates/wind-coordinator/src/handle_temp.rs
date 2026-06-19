@@ -120,6 +120,23 @@ impl Coordinator {
         if let Some(act) = self.handle_candidate_nav(state, data) {
             return act;
         }
+        // 进入键二次按下（缓冲空 + 无已转换前缀）：按中英标点配置上屏该符号并退出。
+        if state.temp_pinyin_buffer.is_empty()
+            && state.committed_text.is_empty()
+            && self.is_temp_pinyin_trigger(data.key_code)
+        {
+            let ch = state
+                .temp_pinyin_prefix
+                .chars()
+                .next()
+                .or_else(|| punct_char(data.key_code, data.modifiers & MOD_SHIFT != 0));
+            if let Some(ch) = ch {
+                let out = self.convert_punct_char(state, ch);
+                self.exit_temp_pinyin(state);
+                self.notify_ui_hide();
+                return Self::commit_action(out, true);
+            }
+        }
         match data.key_code {
             keymap::VK_ESCAPE => {
                 // Esc：退出

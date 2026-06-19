@@ -103,8 +103,8 @@ per_page = 7
 per_page_extended = 0
 max_chars = 16
 layout = "horizontal"
-inline_preedit = true
-preedit_mode = "top"
+# 编码显示方式：app_inline=内嵌应用光标处(候选窗不显 preedit) | candidate_top=候选窗顶部独立栏 | candidate_inline=编码内联候选首单元
+preedit_display = "app_inline"
 flip_when_above = false
 hide_window = false
 index_labels = ""
@@ -131,6 +131,11 @@ menu_size = 12.0
 name = "default"
 style = "system"
 editor_auto_start = false
+
+[ui.mode_indicator]
+# 进入临时拼音/双拼/快捷/英文/快符等模式时的标识：short=短称(拼/双/快/英/符) | full=全称(临时拼音…) | none=不显示
+# 有 preedit 空间时(candidate_top/inline)输入全程显示；内嵌应用(app_inline)时仅进入瞬间提示
+style = "short"
 
 [ui.status_indicator]
 enabled = true

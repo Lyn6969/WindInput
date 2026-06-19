@@ -308,7 +308,8 @@ fn dispatch_command(
                 }
             };
             let data = KeyEventData::from(&key_payload);
-            let action = handler.handle_key_event(&data);
+            // policed 入口：非 app_inline 时把应用侧组合串替换为占位空格（避免与候选窗 preedit 重复）。
+            let action = handler.handle_key_event_policed(&data);
             Some(encode_key_action(&action))
         }
 

@@ -101,6 +101,8 @@ pub struct CandidateWindow {
     config: CandidateWindowConfig,
     candidates: Vec<CandidateItem>,
     preedit: String,
+    /// 模式指示文本（拼/双/快/英/符 或全称）；空=不渲染。
+    mode_label: String,
     selected: usize,
     /// 鼠标悬停项（页内下标），-1 表示无；与 selected 独立渲染
     hover: i32,
@@ -131,7 +133,7 @@ pub struct CandidateWindow {
     /// 竖排布局（候选纵向堆叠）；默认横排。来自 ui.candidate.layout。
     vertical: bool,
     /// 预编辑嵌入模式（编码嵌入候选行首，不显示独立 preedit 条）。
-    /// 来自 ui.candidate.preedit_mode == "embedded"。
+    /// 来自 ui.candidate.preedit_display == "candidate_inline"。
     preedit_embedded: bool,
 }
 
@@ -154,6 +156,7 @@ impl CandidateWindow {
             config,
             candidates: Vec::new(),
             preedit: String::new(),
+            mode_label: String::new(),
             selected: 0,
             hover: -1,
             page: 1,
@@ -197,6 +200,7 @@ impl CandidateWindow {
     pub fn update(
         &mut self,
         preedit: &str,
+        mode_label: &str,
         candidates: Vec<CandidateItem>,
         selected: usize,
         hover: i32,
@@ -204,6 +208,7 @@ impl CandidateWindow {
         total_pages: usize,
     ) {
         self.preedit = preedit.to_string();
+        self.mode_label = mode_label.to_string();
         self.candidates = candidates;
         self.selected = selected;
         self.hover = hover;
@@ -224,9 +229,19 @@ impl CandidateWindow {
     }
 
     pub fn show(&mut self) {
-        if self.candidates.is_empty() && self.preedit.is_empty() {
+        // mode_label 非空表示已进入临时模式：即使暂无候选/preedit 也要弹窗显示模式标记。
+        if self.candidates.is_empty() && self.preedit.is_empty() && self.mode_label.is_empty() {
             self.hide();
             return;
+        }
+
+        // DPI 动态化：按光标所在显示器实时取缩放，换显示器后自动按新 DPI 渲染。
+        // 几何/字号全部由 self.scale 派生（build_tree 中现算），更新此值即生效。
+        let new_scale = crate::dpi::scale_for_point(self.x, self.y);
+        if (new_scale - self.scale).abs() > 0.01 {
+            self.scale = new_scale;
+            self.text_renderer
+                .set_base_size((self.theme.behavior.font_size as f32) * new_scale);
         }
 
         // ── 渲染计时（定位长按翻页卡顿耗时段）──
@@ -553,6 +568,24 @@ impl CandidateWindow {
             if let Some(bc) = v.preedit_bar.border_color {
                 band = band.border(bc, dim(v.preedit_bar.border_width, 0.0).max(1.0));
             }
+            // 模式标记：单行 preedit 栏模式下右对齐到栏行末尾。
+            // band 跨轴撑满窗口内容宽 + spacer 吸收中间空白 → 标记贴右；字号取主题 mode_label 配置。
+            if !self.mode_label.is_empty() {
+                let ml_fs = node_fs(&v.mode_label);
+                let mut chip = View::leaf(
+                    self.mode_label.clone(),
+                    col(v.mode_label.text_color, [120, 120, 128, 255]),
+                )
+                .font_size(ml_fs)
+                .margin(Edges { l: 12.0 * s, ..Edges::default() });
+                if let Some(bg) = v.mode_label.bg_color {
+                    chip = chip
+                        .bg(bg)
+                        .radius(dim(v.item.border_radius, 4.0))
+                        .pad(edges_or(&v.mode_label.padding, [1.0, 6.0, 1.0, 6.0]));
+                }
+                band = band.fill_cross().child(View::spacer()).child(chip);
+            }
             root = root.child(band);
         }
 
@@ -601,6 +634,33 @@ impl CandidateWindow {
                 .font_size(preedit_fs)
                 .margin(sep),
             );
+        }
+        // 模式标记（拼/双/快/英/符 或全称）：紧随输入缓冲之后、候选之前内联显示。
+        // 仅"无独立 preedit 栏"时在此（内联编码 candidate_inline / 内嵌应用 app_inline /
+        // 栏模式但暂无 preedit）；有 preedit 栏时已置于栏行最后（见上）。
+        // 颜色/背景由主题 mode_label 节点配置，与普通候选区分。横排右留白、竖排下留白。
+        let preedit_bar_shown = !self.preedit.is_empty() && !self.preedit_embedded;
+        if !self.mode_label.is_empty() && !preedit_bar_shown {
+            let ml_fs = node_fs(&v.mode_label);
+            let sep = if self.vertical {
+                Edges { b: 6.0 * s, ..Edges::default() }
+            } else {
+                Edges { r: 12.0 * s, ..Edges::default() }
+            };
+            let mut chip = View::leaf(
+                self.mode_label.clone(),
+                col(v.mode_label.text_color, [120, 120, 128, 255]),
+            )
+            .font_size(ml_fs)
+            .margin(sep);
+            // 主题为 mode_label 配了底色 → 渲染为小徽标（圆角 + 内边距）以更醒目。
+            if let Some(bg) = v.mode_label.bg_color {
+                chip = chip
+                    .bg(bg)
+                    .radius(dim(v.item.border_radius, 4.0))
+                    .pad(edges_or(&v.mode_label.padding, [1.0, 6.0, 1.0, 6.0]));
+            }
+            list = list.child(chip);
         }
         for (i, cand) in self.candidates.iter().enumerate() {
             let marker = if cand.label.is_empty() {

@@ -47,6 +47,10 @@ impl MessageHandler for DeferredHandler {
         self.with_handler(KeyAction::PassThrough, |h| h.handle_key_event(data))
     }
 
+    fn preedit_uses_placeholder(&self) -> bool {
+        self.with_handler(false, |h| h.preedit_uses_placeholder())
+    }
+
     fn handle_focus_gained(&self, data: &FocusData) -> Option<StatusUpdateData> {
         self.with_handler(None, |h| h.handle_focus_gained(data))
     }
