@@ -2122,6 +2122,11 @@ dependencies = [
  "wind-dict",
  "wind-engine",
  "wind-ipc",
+ "wind-keys",
+ "wind-phrase",
+ "wind-punct",
+ "wind-quick-input",
+ "wind-reverse",
  "wind-store",
  "wind-theme",
  "wind-transform",
@@ -2173,6 +2178,42 @@ dependencies = [
 ]
 
 [[package]]
+name = "wind-keys"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "tracing",
+ "wind-cmdbar",
+ "windows",
+]
+
+[[package]]
+name = "wind-phrase"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "serde",
+ "toml",
+ "tracing",
+ "wind-cmdbar",
+]
+
+[[package]]
+name = "wind-punct"
+version = "0.1.0"
+dependencies = [
+ "wind-config",
+ "wind-transform",
+]
+
+[[package]]
+name = "wind-quick-input"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+]
+
+[[package]]
 name = "wind-repl"
 version = "0.1.0"
 dependencies = [
@@ -2182,6 +2223,10 @@ dependencies = [
  "wind-config",
  "wind-engine",
 ]
+
+[[package]]
+name = "wind-reverse"
+version = "0.1.0"
 
 [[package]]
 name = "wind-store"
