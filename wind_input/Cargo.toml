@@ -21,6 +21,7 @@ members = [
     "apps/service",
     "apps/rpc",
     "apps/repl",
+    "apps/wind-tools",
 ]
 
 [workspace.package]

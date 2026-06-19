@@ -18,7 +18,7 @@
 #   test    | 4     cargo test (本机, 全工作区)
 #   deploy  | 5     完整部署 (复制 DLL + data)
 #   dll     | 6     从 Go 仓库复制 TSF DLL
-#   data    | 7     从 Go 仓库复制 data/
+#   data    | 7     组装 data/（data/ 源 + .cache/ 下载 → build_debug/data/）
 #   fmt     | f     cargo fmt
 #   fmt-check       cargo fmt --check (CI 用)
 #   clean   | c     cargo clean
@@ -28,37 +28,42 @@
 #   repl [data]     本机跑候选 REPL（无需 TSF/UI；读编码→打印候选）
 #   push [debug]    交叉编译 exe 并 drop-in 到 Windows 安装目录（复用其 TSF DLL+data）；
 #                   debug → 构建 debug_variant 并推为 wind_input_debug.exe；先 taskkill 远程进程再覆盖
-#   pull-data       从 Windows 安装目录拉 data/（真实词库）回本机供 REPL
+#   pull-data       从 Windows 安装目录拉 data/（真实词库）到 .cache/pulled-data/ 供 REPL 使用
 #   pull-config     从 Windows 拉 config.toml（%APPDATA%\<App>）到 .remote/ 查看
 #   pull-log [all]  从 Windows 拉日志（%LOCALAPPDATA%\<App>\logs）到 .remote/；
 #                   默认仅最新一天，all 拉整目录（需 deploy.local 配 WIND_DATA_DIR/WIND_LOCAL_DIR）
-#   gen-data        独立下载+转换词库（暂用 Go 工具；Rust 化为后续）
+#   gen-data        下载外部词库到 .cache/ + 组装 build_debug/data/
 #
-# 推荐实测流程：① pull-data 拉真实词库 → ② repl 在 Linux 验证候选逻辑
-#               ③ push 把 exe drop-in 到 Windows → 重启服务做应用内实测（并验协议兼容）
+# 数据目录说明：
+#   data/           源文件（入库）：配置、五笔词库、主题等手工维护文件
+#   .cache/         外部下载/生成（gitignore）：rime-frost、opencc、unigram 等
+#   build_debug/data/ 完整运行时数据（由 assemble_data 从 data/ + .cache/ 合并）
+#
+# 推荐实测流程：① gen-data 下载+组装词库 → ② repl 在 Linux 验证候选逻辑
+#               ③ push 把 exe drop-in 到 Windows → 重启服务做应用内实测
 
 set -o pipefail
 
 # ---------- 路径 ----------
-# 目录层级: <产品仓>/scripts/dev.sh （产品级编排脚本，统管 wind_input/ 及未来的 tsf/macos/）
+# 目录层级: <产品仓>/scripts/dev.sh
 #   SCRIPT_DIR   = <产品仓>/scripts
-#   PRODUCT_ROOT = <产品仓>          (产品仓根, 含 docs/VERSION、data/ 等共享资产)
+#   PRODUCT_ROOT = <产品仓>          (含 docs/VERSION、data/、.cache/ 等)
 #   PROJECT_ROOT = <产品仓>/wind_input (Cargo workspace 根)
-# 路径全部相对脚本自身(BASH_SOURCE)解析，与 CWD 无关。
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PRODUCT_ROOT="$(dirname "$SCRIPT_DIR")"
 PROJECT_ROOT="$PRODUCT_ROOT/wind_input"
 VERSION="$(tr -d '[:space:]' < "$PRODUCT_ROOT/docs/VERSION" 2>/dev/null || echo '?')"
 BUILD_DIR="$PROJECT_ROOT/build"
 BUILD_DEBUG_DIR="$PROJECT_ROOT/build_debug"
-# Go 仓库与产品仓同级: windinput/WindInput
-GO_REPO="$(dirname "$PRODUCT_ROOT")/WindInput"
+# 外部下载/生成的词库缓存目录（不入库）
+CACHE_DIR="$PRODUCT_ROOT/.cache"
+# Rust 工具链根目录（wind_input/ workspace）
+RUST_WORKSPACE="$PRODUCT_ROOT/wind_input"
 
 # 远程 Windows 测试机配置（SSH）。在 scripts/deploy.local 或环境变量中设置：
 #   WIND_REMOTE      = user@host           （SSH 目标）
 #   WIND_REMOTE_DIR  = Windows 安装目录     （含 wind_input.exe；用 scp 正斜杠风格，
 #                      如 'C:/Users/me/AppData/Local/Programs/WindInput'；调试时指向 WindInputDebug 安装目录）
-# 传输用 scp（stock Windows OpenSSH 自带，无需装 rsync）。deploy.local 不入库（.gitignore）。
 [ -f "$SCRIPT_DIR/deploy.local" ] && . "$SCRIPT_DIR/deploy.local"
 WIND_REMOTE="${WIND_REMOTE:-}"
 WIND_REMOTE_DIR="${WIND_REMOTE_DIR:-}"
@@ -67,8 +72,6 @@ WIND_REMOTE_DIR="${WIND_REMOTE_DIR:-}"
 #   WIND_LOCAL_DIR  = %LOCALAPPDATA%\<App>   含 logs/（服务日志）、cache/
 WIND_DATA_DIR="${WIND_DATA_DIR:-}"
 WIND_LOCAL_DIR="${WIND_LOCAL_DIR:-}"
-# 本机给 REPL 用的 data 目录（pull-data 拉取到此）
-LOCAL_DATA="$PRODUCT_ROOT/data"
 # 从远程拉取的配置/日志落地处（本地查看用，不入库）
 REMOTE_PULL_DIR="$PRODUCT_ROOT/.remote"
 
@@ -81,14 +84,12 @@ if [ -t 1 ]; then
 else
     C_CYAN=''; C_YELLOW=''; C_GREEN=''; C_RED=''; C_GRAY=''; C_RESET=''
 fi
-# 消息用 %b 解释 \n 等转义 (消息内容受控)
 say()  { printf '%b%b%b\n' "$C_GREEN" "$1" "$C_RESET"; }
 warn() { printf '%b%b%b\n' "$C_YELLOW" "$1" "$C_RESET"; }
 err()  { printf '%b%b%b\n' "$C_RED" "$1" "$C_RESET"; }
 gray() { printf '%b%b%b\n' "$C_GRAY" "$1" "$C_RESET"; }
 
 # ---------- 构建 ----------
-# 参数: $1 = "debug" 表示调试构建, 否则 release
 do_build() {
     local debug="${1:-}"
     local profile outdir suffix bindir
@@ -109,7 +110,6 @@ do_build() {
 
     mkdir -p "$outdir"
 
-    # 复制二进制
     local src_exe="$PROJECT_ROOT/target/$TARGET/$bindir/wind_input.exe"
     local dst_exe="$outdir/wind_input${suffix}.exe"
     if [ -f "$src_exe" ]; then
@@ -162,11 +162,12 @@ do_ci() {
     say "\nCI 全部通过 ✓"
 }
 
-# ---------- 部署 (从 Go 仓库复制 DLL / data) ----------
-# 注意: Go 仓库 (../WindInput) 需先自行构建, 否则 DLL/词典缺失, 此处仅告警。
+# ---------- 部署 ----------
 copy_tsf_dll() {
     local outdir="${1:-$BUILD_DIR}"
     mkdir -p "$outdir"
+    # TSF DLL 暂无 Rust 版，从同级 Go 仓库复制；待 Rust TSF 完成后删此函数
+    local GO_REPO="${GO_REPO:-$(dirname "$PRODUCT_ROOT")/WindInput}"
     say "\n复制 TSF DLL (暂复用 Go 仓库产物, 尚无 Rust 版)..."
     local dll base src found=0
     for dll in wind_tsf.dll wind_tsf_x86.dll; do
@@ -186,40 +187,123 @@ copy_tsf_dll() {
     fi
 }
 
-# 词典探针：判断某 data 目录是否含已处理词典（而非仅 schema）。
-DICT_PROBE="schemas/wubi86/wubi86_jidian.dict.yaml"
+# ---------- 词库下载 ----------
 
+# helper: 下载单个文件（已存在则跳过）
+download_file() {
+    local url="$1" dst="$2" desc="${3:-}"
+    if [ -f "$dst" ]; then
+        gray "[skip] $(basename "$dst") 已存在"
+        return 0
+    fi
+    gray "[get ] $(basename "$dst") $desc"
+    if ! curl -fsSL --retry 3 --retry-delay 2 -o "$dst" "$url"; then
+        err "下载失败: $url"
+        return 1
+    fi
+}
+
+# 下载外部词库到 .cache/
+download_dicts() {
+    say "\n下载外部词库 → $CACHE_DIR"
+    local rime_frost="$CACHE_DIR/rime-frost"
+    local rime_frost_cn="$rime_frost/cn_dicts"
+    local rime_frost_en="$rime_frost/en_dicts"
+    local opencc="$CACHE_DIR/opencc/dictionaries"
+    mkdir -p "$rime_frost_cn" "$rime_frost_en" "$opencc"
+
+    local FROST_BASE="https://raw.githubusercontent.com/gaboolic/rime-frost/master"
+    gray "rime-frost (拼音):"
+    download_file "$FROST_BASE/rime_frost.dict.yaml"              "$rime_frost/rime_frost.dict.yaml"        "词库入口"
+    download_file "$FROST_BASE/cn_dicts/8105.dict.yaml"           "$rime_frost_cn/8105.dict.yaml"           "单字词库"
+    download_file "$FROST_BASE/cn_dicts/41448.dict.yaml"          "$rime_frost_cn/41448.dict.yaml"          "扩展字表"
+    download_file "$FROST_BASE/cn_dicts/base.dict.yaml"           "$rime_frost_cn/base.dict.yaml"           "基础词库 ~10MB"
+    download_file "$FROST_BASE/cn_dicts/ext.dict.yaml"            "$rime_frost_cn/ext.dict.yaml"            "扩展词库 ~8MB"
+    download_file "$FROST_BASE/cn_dicts/others.dict.yaml"         "$rime_frost_cn/others.dict.yaml"         "容错词"
+    download_file "$FROST_BASE/cn_dicts/corrections.dict.yaml"    "$rime_frost_cn/corrections.dict.yaml"    "错音词"
+    download_file "$FROST_BASE/cn_dicts/tencent.dict.yaml"        "$rime_frost_cn/tencent.dict.yaml"        "腾讯词频 ~17MB"
+
+    gray "rime-frost (英文):"
+    download_file "$FROST_BASE/en_dicts/en.dict.yaml"     "$rime_frost_en/en.dict.yaml"     "主词库"
+    download_file "$FROST_BASE/en_dicts/en_ext.dict.yaml" "$rime_frost_en/en_ext.dict.yaml" "扩展"
+
+    local OPENCC_BASE="https://raw.githubusercontent.com/BYVoid/OpenCC/master/data/dictionary"
+    gray "OpenCC 简繁词典:"
+    download_file "$OPENCC_BASE/STCharacters.txt" "$opencc/STCharacters.txt" "简->繁 字级"
+    download_file "$OPENCC_BASE/STPhrases.txt"    "$opencc/STPhrases.txt"    "简->繁 词级"
+    download_file "$OPENCC_BASE/TWVariants.txt"   "$opencc/TWVariants.txt"   "台湾字形"
+    download_file "$OPENCC_BASE/TWPhrases.txt"    "$opencc/TWPhrases.txt"    "台湾词汇"
+    download_file "$OPENCC_BASE/HKVariants.txt"   "$opencc/HKVariants.txt"   "香港字形"
+}
+
+# 从 data/（源）+ .cache/（下载/生成）组装完整运行时数据到 $outdir/data/
+assemble_data() {
+    local outdir="${1:-$BUILD_DEBUG_DIR}"
+    local data="$outdir/data"
+    local schemas="$data/schemas"
+    local pinyin="$schemas/pinyin"
+    local pinyin_cn="$pinyin/cn_dicts"
+    local english="$schemas/english"
+    local rime_frost="$CACHE_DIR/rime-frost"
+
+    say "\n组装 data/ → $data"
+    rm -rf "$data"
+
+    # 1. 复制 data/ 源文件（configs、五笔词库、主题等）
+    cp -rf "$PRODUCT_ROOT/data" "$data"
+
+    # 2. rime-frost 拼音词库
+    mkdir -p "$pinyin_cn"
+    if [ -f "$rime_frost/rime_frost.dict.yaml" ]; then
+        cp -f "$rime_frost/rime_frost.dict.yaml" "$pinyin/"
+        for f in 8105.dict.yaml 41448.dict.yaml base.dict.yaml ext.dict.yaml \
+                 others.dict.yaml corrections.dict.yaml; do
+            [ -f "$rime_frost/cn_dicts/$f" ] && cp -f "$rime_frost/cn_dicts/$f" "$pinyin_cn/"
+        done
+    else
+        warn "缺 .cache/rime-frost/，拼音词库不可用（运行 gen-data 下载）"
+    fi
+
+    # 3. 英文词库
+    mkdir -p "$english"
+    for f in en.dict.yaml en_ext.dict.yaml; do
+        [ -f "$rime_frost/en_dicts/$f" ] && cp -f "$rime_frost/en_dicts/$f" "$english/"
+    done
+
+    # 4. Unigram 语言模型
+    local unigram_cache="$CACHE_DIR/pinyin-frost/unigram.txt"
+    if [ -f "$unigram_cache" ]; then
+        cp -f "$unigram_cache" "$pinyin/unigram.txt"
+    else
+        warn "缺 unigram.txt（运行 gen-data 生成）"
+    fi
+
+    # 5. OpenCC 编译 .octrie（Rust 工具 gen_opencc）
+    mkdir -p "$data/opencc"
+    if [ -d "$CACHE_DIR/opencc/dictionaries" ] && \
+       [ "$(ls "$CACHE_DIR/opencc/dictionaries/"*.txt 2>/dev/null | wc -l)" -gt 0 ]; then
+        gray "编译 OpenCC → .octrie ..."
+        ( cd "$RUST_WORKSPACE" && cargo run -q --bin gen_opencc -- \
+            --src "$CACHE_DIR/opencc/dictionaries" --out "$data/opencc" ) \
+            || warn "OpenCC 编译失败（简繁转换不可用）"
+    else
+        warn "缺 .cache/opencc/，OpenCC 不可用（运行 gen-data 下载）"
+    fi
+
+    gray "data/ 组装完成 ($(find "$data" -type f | wc -l) 文件)"
+}
+
+# 组装 data/ 到指定输出目录。
+# 优先从 data/ + .cache/ 本地组装；若 .cache/ 尚未下载，回退到 Go 构建产物。
 copy_data() {
     local outdir="${1:-$BUILD_DIR}"
-    # data 来源优先级：① 本机已拉取的真实词库 ($LOCAL_DATA, 来自 pull-data)
-    #                  ② Go 构建产物 (build_debug/data, 含 rime 词典)
-    #                  ③ Go 源目录 (仅 schema, 无 .dict.yaml 词典 → 引擎无候选)
-    # 优先真实词库，避免历史上的"缺词典回退"告警。
-    local src
-    if [ -f "$LOCAL_DATA/$DICT_PROBE" ]; then
-        src="$LOCAL_DATA"
-        gray "data 源: 本机真实词库 $LOCAL_DATA (来自 pull-data)"
-    elif [ -f "$GO_REPO/build_debug/data/$DICT_PROBE" ]; then
-        src="$GO_REPO/build_debug/data"
-        gray "data 源: Go 构建产物 $src"
-    elif [ -d "$GO_REPO/data" ]; then
-        src="$GO_REPO/data"
-        warn "data 源: Go 源目录 (仅 schema, 无词典) —— 建议先 './dev.sh dl' 拉真实词库"
-    else
-        warn "找不到任何 data 源 (本机无真实词库, Go 仓库也未构建); 跳过 data 复制"
-        return 0
-    fi
+    local cache_probe="$CACHE_DIR/rime-frost/cn_dicts/base.dict.yaml"
 
-    # 避免自拷：源即目标时无需复制。
-    if [ "$src" = "$outdir/data" ]; then
-        gray "data 已在目标位置, 跳过"
-        return 0
+    if [ -f "$cache_probe" ]; then
+        assemble_data "$outdir"
+    else
+        warn "找不到词典数据；请运行 'gen-data' 下载词库，或 'pull-data' 从 Windows 拉取"
     fi
-    say "\n复制 data/ ($src → $outdir/data)..."
-    mkdir -p "$outdir"
-    rm -rf "$outdir/data"
-    cp -rf "$src" "$outdir/data"
-    gray "已复制: data/"
 }
 
 deploy_all() {
@@ -232,14 +316,24 @@ deploy_all() {
 
 # ---------- 实测 / 远程部署（SSH）----------
 
-# 本机跑候选 REPL（无需 TSF/UI）：读编码→打印候选。data 目录优先 $LOCAL_DATA，可传参覆盖。
+# 本机跑候选 REPL。data 目录优先 build_debug/data/，其次 .cache/pulled-data/。
 do_repl() {
-    local data="${1:-$LOCAL_DATA}"
+    local data="${1:-}"
+    if [ -z "$data" ]; then
+        if [ -f "$BUILD_DEBUG_DIR/data/schemas/pinyin/unigram.txt" ]; then
+            data="$BUILD_DEBUG_DIR/data"
+        elif [ -d "$CACHE_DIR/pulled-data" ]; then
+            data="$CACHE_DIR/pulled-data"
+            gray "使用 pull-data 拉取的词库: $data"
+        else
+            warn "未找到词库数据；请先运行 gen-data 或 pull-data"
+            data="$BUILD_DEBUG_DIR/data"
+        fi
+    fi
     say "\n启动候选 REPL (data=$data)..."
     cd "$PROJECT_ROOT" && WIND_DATA="$data" cargo run --release -p wind-repl -- "$data"
 }
 
-# 校验远程配置
 require_remote() {
     if [ -z "$WIND_REMOTE" ] || [ -z "$WIND_REMOTE_DIR" ]; then
         err "未配置远程：请在 $SCRIPT_DIR/deploy.local 设置 WIND_REMOTE 与 WIND_REMOTE_DIR"
@@ -249,10 +343,7 @@ require_remote() {
     fi
 }
 
-# drop-in：把交叉编译的 exe 推到 Windows 安装目录（复用其 TSF DLL + data/），顺带验证 IPC 协议兼容。
-# 用法: push          → release，推为 wind_input.exe
-#       push debug    → debug 变体，推为 wind_input_debug.exe（WindInputDebug 隔离环境）
-# 处理文件占用：先 taskkill 远程进程再 scp（覆盖后请在 Windows 桌面重启，TSF 自动重连）。
+# drop-in：把交叉编译的 exe 推到 Windows 安装目录。
 do_push() {
     require_remote || return 1
     cd "$PROJECT_ROOT" || return 1
@@ -271,44 +362,43 @@ do_push() {
     fi
     [ -f "$exe" ] || { err "未找到产物: $exe"; return 1; }
 
-    say "停止远程 $exe_name（若在运行，避免文件占用）..."
+    say "停止远程 $exe_name..."
     ssh "$WIND_REMOTE" "taskkill /F /IM $exe_name" >/dev/null 2>&1 || true
     sleep 1
 
     say "推送 $exe_name → $WIND_REMOTE:$WIND_REMOTE_DIR/"
     if scp "$exe" "$WIND_REMOTE:$WIND_REMOTE_DIR/$exe_name"; then
-        say "已推送。请在 Windows 桌面重启 $exe_name（双击或经输入法菜单/重启服务），TSF 会自动重连命名管道。"
+        say "已推送。请在 Windows 桌面重启 $exe_name。"
     else
         err "scp 失败：检查 WIND_REMOTE_DIR 路径(正斜杠 C:/...)、SSH 连通、文件是否仍被占用"
     fi
 }
 
-# 从 Windows 安装目录拉取已处理的 data/（含真实词库）到本机，供 REPL 使用。
-# 用 scp -r（stock OpenSSH 兼容）；若你的 Windows 装了 rsync，可自行用 rsync 做增量。
+# 从 Windows 安装目录拉取已处理的 data/（含真实词库）到 .cache/pulled-data/ 供 REPL 使用。
 do_pull_data() {
     require_remote || return 1
-    say "\n拉取 data/ ← $WIND_REMOTE:$WIND_REMOTE_DIR/data  →  $LOCAL_DATA"
-    rm -rf "$LOCAL_DATA"
-    # scp -r 把远程 data 目录整体拷到产品仓根，即得 $PRODUCT_ROOT/data (=$LOCAL_DATA)
-    if scp -r "$WIND_REMOTE:$WIND_REMOTE_DIR/data" "$PRODUCT_ROOT/"; then
-        say "已拉取 → $LOCAL_DATA。现在可 './scripts/dev.sh repl' 用真实词库测试。"
+    local dst="$CACHE_DIR/pulled-data"
+    say "\n拉取 data/ ← $WIND_REMOTE:$WIND_REMOTE_DIR/data  →  $dst"
+    rm -rf "$dst"
+    mkdir -p "$CACHE_DIR"
+    if scp -r "$WIND_REMOTE:$WIND_REMOTE_DIR/data" "$dst"; then
+        say "已拉取 → $dst"
+        say "提示: REPL 会自动使用此词库，或用 './dev.sh repl $dst' 显式指定"
     else
         err "scp 失败（检查路径/SSH）"
     fi
 }
 
-# 校验远程数据/本地目录配置（拉配置、拉日志用）
 require_remote_dirs() {
     require_remote || return 1
     if [ -z "$WIND_DATA_DIR" ] || [ -z "$WIND_LOCAL_DIR" ]; then
         err "未配置远程目录：请在 $SCRIPT_DIR/deploy.local 设置 WIND_DATA_DIR 与 WIND_LOCAL_DIR"
-        echo "  示例: WIND_DATA_DIR='C:/Users/me/AppData/Roaming/WindInputDebug'   # %APPDATA%"
-        echo "        WIND_LOCAL_DIR='C:/Users/me/AppData/Local/WindInputDebug'    # %LOCALAPPDATA%"
+        echo "  示例: WIND_DATA_DIR='C:/Users/me/AppData/Roaming/WindInputDebug'"
+        echo "        WIND_LOCAL_DIR='C:/Users/me/AppData/Local/WindInputDebug'"
         return 1
     fi
 }
 
-# 从 Windows 拉取用户配置 config.toml（%APPDATA%\<App>\config.toml）到本机查看。
 do_pull_config() {
     require_remote_dirs || return 1
     mkdir -p "$REMOTE_PULL_DIR"
@@ -321,8 +411,6 @@ do_pull_config() {
     fi
 }
 
-# 从 Windows 拉取服务日志（%LOCALAPPDATA%\<App>\logs\）到本机查看。
-# 默认只拉最新一天的日志；传 all 拉整个 logs 目录。cache/ 不在此目录，不会被带下来。
 do_pull_log() {
     require_remote_dirs || return 1
     mkdir -p "$REMOTE_PULL_DIR/logs"
@@ -336,12 +424,11 @@ do_pull_log() {
         fi
         return
     fi
-    # 取远程最新的日志文件（按天滚动：wind_input.log.YYYY-MM-DD）
     say "\n查询远程最新日志 ← $WIND_REMOTE:$WIND_LOCAL_DIR/logs/"
     local latest
     latest="$(ssh "$WIND_REMOTE" "powershell -NoProfile -Command \"Get-ChildItem -Path '$WIND_LOCAL_DIR/logs' -Filter 'wind_input.log*' | Sort-Object LastWriteTime -Descending | Select-Object -First 1 -ExpandProperty Name\"" 2>/dev/null | tr -d '\r')"
     if [ -z "$latest" ]; then
-        err "未找到日志文件（检查 WIND_LOCAL_DIR/logs 是否存在；或用 'pull-log all' 整目录拉取）"
+        err "未找到日志文件（或用 'pull-log all' 整目录拉取）"
         return 1
     fi
     local dst="$REMOTE_PULL_DIR/logs/$latest"
@@ -349,31 +436,33 @@ do_pull_log() {
     if scp "$WIND_REMOTE:$WIND_LOCAL_DIR/logs/$latest" "$dst"; then
         say "已拉取 → $dst"
     else
-        err "scp 失败（检查 SSH/路径）"
+        err "scp 失败"
     fi
 }
 
-# 独立词库流水线（不依赖 Windows 安装）：下载 rime 原始词库 + 转换。
-# 转换暂复用 Go 仓库的工具（go run），Rust 化转换器为后续任务（见 docs）。
-# 当前仅编排：调用 Go 仓库 build 脚本产出 data，再复制到 $LOCAL_DATA。
+# 下载外部词库到 .cache/ + 生成 unigram + 组装 build_debug/data/
 do_gen_data() {
-    if ! command -v go >/dev/null 2>&1; then
-        err "需要 Go 工具链（转换器仍是 Go 实现，Rust 化为后续任务）"; return 1
+    if ! command -v curl >/dev/null 2>&1; then
+        err "需要 curl（下载词库用）"; return 1
     fi
-    if [ ! -d "$GO_REPO" ]; then
-        err "未找到 Go 仓库: $GO_REPO（词库下载/转换工具在此）"; return 1
-    fi
-    warn "调用 Go 仓库下载+转换词库（首次约下载数十 MB）..."
-    # build.sh 为 macOS 风格，Linux 可能需适配；失败请改用 pull-data 复用 Windows 已处理 data/。
-    ( cd "$GO_REPO" && bash scripts_mac/build/build.sh data ) || { err "Go data 构建失败（可改用 pull-data）"; return 1; }
-    local src="$GO_REPO/build/data"
-    [ -d "$src" ] || src="$GO_REPO/build_debug/data"
-    if [ -d "$src" ]; then
-        mkdir -p "$LOCAL_DATA"; rsync -a --delete "$src/" "$LOCAL_DATA/"
-        say "已生成 data → $LOCAL_DATA"
+
+    download_dicts || return 1
+
+    # 生成 Unigram 语言模型（Rust 工具 gen_unigram）
+    local unigram_cache="$CACHE_DIR/pinyin-frost/unigram.txt"
+    mkdir -p "$(dirname "$unigram_cache")"
+    if [ ! -f "$unigram_cache" ]; then
+        say "生成 Unigram 语言模型..."
+        ( cd "$RUST_WORKSPACE" && cargo run -q --bin gen_unigram -- \
+            --rime "$CACHE_DIR/rime-frost/cn_dicts" \
+            --out "$unigram_cache" ) \
+            || warn "Unigram 生成失败（智能组句不可用）"
     else
-        err "未找到生成的 data（$src）"
+        gray "Unigram 已缓存"
     fi
+
+    assemble_data "$BUILD_DEBUG_DIR"
+    say "gen-data 完成 → $BUILD_DEBUG_DIR/data"
 }
 
 # ---------- 菜单 ----------
@@ -391,15 +480,15 @@ show_menu() {
     printf '\n%b  部署 (本机 build/ 镜像):%b\n' "$C_YELLOW" "$C_RESET"
     echo  "    5  - 完整部署 (复制 DLL + data 到 build/)"
     echo  "    6  - 从 Go 仓库复制 TSF DLL"
-    echo  "    7  - 复制 data/ (优先真实词库, 见 dl)"
+    echo  "    7  - 组装 data/ (data/ 源 + .cache/ → build_debug/data/)"
     printf '\n%b  实测 / 远程 (SSH → %s):%b\n' "$C_YELLOW" "${WIND_REMOTE:-未配置}" "$C_RESET"
     echo  "    r  - 候选 REPL (本机验证, 无需 Windows)"
     echo  "    p  - push: 交叉编译 exe → Windows (release)"
     echo  "    pd - push debug: → wind_input_debug.exe (调试)"
-    echo  "    dl - pull-data: 从 Windows 拉真实词库回本机"
+    echo  "    dl - pull-data: 从 Windows 拉真实词库 → .cache/pulled-data/"
     echo  "    pc - pull-config: 从 Windows 拉 config.toml 回本机查看"
     echo  "    pl - pull-log: 从 Windows 拉最新日志回本机 (pla = 整目录)"
-    echo  "    gd - gen-data: 独立下载+转换词库"
+    echo  "    gd - gen-data: 下载外部词库 + 组装 build_debug/data/"
     printf '\n%b  工具:%b\n' "$C_YELLOW" "$C_RESET"
     echo  "    f  - cargo fmt (代码格式化)"
     echo  "    i  - ci (fmt-check + clippy + test)"
@@ -423,7 +512,7 @@ menu_loop() {
             4)   do_test;           pause ;;
             5)   deploy_all;        pause ;;
             6)   copy_tsf_dll;      pause ;;
-            7)   copy_data;         pause ;;
+            7)   copy_data "$BUILD_DEBUG_DIR"; pause ;;
             r)   do_repl;           pause ;;
             p)   do_push;           pause ;;
             pd)  do_push debug;     pause ;;
@@ -452,7 +541,7 @@ case "${1:-}" in
     test|4)             do_test ;;
     deploy|5)           deploy_all ;;
     dll|6)              copy_tsf_dll ;;
-    data|7)             copy_data ;;
+    data|7)             copy_data "$BUILD_DEBUG_DIR" ;;
     fmt|f)              do_fmt ;;
     fmt-check)          do_fmt_check ;;
     clean|c)            do_clean ;;

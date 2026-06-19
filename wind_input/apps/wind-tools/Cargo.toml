@@ -1,0 +1,18 @@
+[package]
+name = "wind-tools"
+version.workspace = true
+edition.workspace = true
+
+# 本机构建时工具（Linux 上运行，生成数据后部署到 Windows）
+# 不依赖 windows crate，可直接 `cargo run --bin <name>` 执行
+
+[[bin]]
+name = "gen_opencc"
+path = "src/bin/gen_opencc.rs"
+
+[[bin]]
+name = "gen_unigram"
+path = "src/bin/gen_unigram.rs"
+
+[dependencies]
+anyhow = { workspace = true }
