@@ -167,14 +167,33 @@ fn relaunch_self() {
     use std::os::windows::process::CommandExt;
     const DETACHED_PROCESS: u32 = 0x0000_0008;
     const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
-    if let Ok(exe) = std::env::current_exe() {
-        match std::process::Command::new(&exe)
-            .creation_flags(DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP)
-            .spawn()
-        {
-            Ok(_) => info!("Relaunched: {}", exe.display()),
-            Err(e) => error!("Failed to relaunch: {}", e),
+    // 脱离父进程的 Job Object：IME/TSF 宿主进程常处于 kill-on-job-close 作业对象中，
+    // 不加此标志时父进程一退出会连带杀掉刚拉起的子进程（症状：重启只退出、新进程不存活）。
+    const CREATE_BREAKAWAY_FROM_JOB: u32 = 0x0100_0000;
+
+    let exe = match std::env::current_exe() {
+        Ok(e) => e,
+        Err(e) => {
+            error!("Failed to resolve current exe for relaunch: {}", e);
+            return;
         }
+    };
+    let base = DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP;
+
+    // 优先带 breakaway；若作业对象不允许 breakaway（spawn 报错）则回退到不带该标志再试。
+    match std::process::Command::new(&exe)
+        .creation_flags(base | CREATE_BREAKAWAY_FROM_JOB)
+        .spawn()
+    {
+        Ok(_) => {
+            info!("Relaunched (breakaway): {}", exe.display());
+            return;
+        }
+        Err(e) => error!("Relaunch with breakaway failed ({e}); retrying without breakaway"),
+    }
+    match std::process::Command::new(&exe).creation_flags(base).spawn() {
+        Ok(_) => info!("Relaunched: {}", exe.display()),
+        Err(e) => error!("Failed to relaunch: {}", e),
     }
 }
 
