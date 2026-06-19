@@ -1,25 +1,70 @@
 # 统一声明式设置清单（core/setting/web 共用真相源）
 # core 解析后注入 app/engine/variant，经 system.manifest 暴露为 JSON。
 # 字段：key(点路径,对应 Config)/group/type/label/hint/default/since/options/min/max/step/unit/enabled_when
+#
+# 【对照来源】wind-config/src/config.rs（权威）。key 必须与真实配置点路径逐字一致。
+# 【未进清单·待对话框承载】hotkeys 键位合成(目前以 string 暴露)、input.punct_custom.mappings、
+#   input.auto_pair.*_pairs、schema.active/available（方案管理）、features.special_modes/mix_modes、
+#   各 *.trigger_keys / *_keys 键组、compat.host_render_processes。
+# 【待确认可选值】标 "# TODO opts" 的项：枚举字符串值未完全确认，暂用 string 承载，确认后改 select。
 
 [meta]
-version = 1                      # 清单格式版本（结构变更 +1）
+version = 2                      # 清单格式版本（结构变更：2 组→6 Tab + 真实全字段）
 
 # ── 分组（→ web 页面/Tab、setting 导航）──
 [[groups]]
-key = "general"
-label = "通用"
+key = "schema"
+label = "方案"
 order = 1
 
 [[groups]]
-key = "appearance"
-label = "外观"
+key = "input"
+label = "输入"
 order = 2
 
-# ── 设置项 ──
+[[groups]]
+key = "hotkeys"
+label = "快捷键"
+order = 3
+
+[[groups]]
+key = "ui"
+label = "外观"
+order = 4
+
+[[groups]]
+key = "general"
+label = "常规"
+order = 5
+
+[[groups]]
+key = "advanced"
+label = "高级"
+order = 6
+
+# ───────────────────────── 方案 ─────────────────────────
+[[items]]
+key = "schema.primary_pinyin"
+group = "schema"
+type = "string" # TODO opts：应为方案下拉（动态来自 schema.list）
+label = "主拼音方案"
+hint = "混输/临时拼音使用的拼音方案 id"
+default = ""
+since = 2
+
+[[items]]
+key = "schema.primary_codetable"
+group = "schema"
+type = "string" # TODO opts：应为方案下拉
+label = "主码表方案"
+hint = "主力码表方案 id（如 wubi86）"
+default = ""
+since = 2
+
+# ───────────────────────── 输入 ─────────────────────────
 [[items]]
 key = "input.filter_mode"
-group = "general"
+group = "input"
 type = "select"
 label = "字符集过滤"
 hint = "限制候选字符集范围"
@@ -32,27 +77,263 @@ options = [
 ]
 
 [[items]]
+key = "input.punct_follow_mode"
+group = "input"
+type = "toggle"
+label = "标点跟随中英模式"
+hint = "英文模式下自动用英文标点"
+default = false
+since = 2
+
+[[items]]
 key = "input.smart_punct_after_digit"
-group = "general"
+group = "input"
 type = "toggle"
 label = "数字后智能标点"
-hint = "数字后输入标点时自动判断中英文"
+hint = "数字后输入 . , : 保持英文"
 default = true
 since = 1
 
 [[items]]
-key = "input.smart_symbol_mode"
-group = "general"
-type = "toggle"
-label = "智能符号"
-hint = "连续输入同一符号键时智能替换"
-default = false
-since = 1
-enabled_when = "input.smart_punct_after_digit == true"
+key = "input.smart_punct_list"
+group = "input"
+type = "string"
+label = "数字后保持英文的标点"
+hint = "默认 .,:"
+default = ".,:"
+since = 2
 
 [[items]]
+key = "input.smart_symbol_mode"
+group = "input"
+type = "toggle"
+label = "智能符号模式"
+hint = "同一中文标点限时内连按两次，替换为英文"
+default = false
+since = 1
+
+[[items]]
+key = "input.smart_symbol_timeout_ms"
+group = "input"
+type = "slider"
+label = "智能符号判定时限"
+default = 500
+min = 100
+max = 2000
+step = 50
+unit = "ms"
+since = 2
+enabled_when = "input.smart_symbol_mode == true"
+
+[[items]]
+key = "input.auto_pair.chinese"
+group = "input"
+type = "toggle"
+label = "中文标点自动配对"
+hint = "输入左括号自动补右括号"
+default = true
+since = 2
+
+[[items]]
+key = "input.auto_pair.english"
+group = "input"
+type = "toggle"
+label = "英文标点自动配对"
+default = true
+since = 2
+
+[[items]]
+key = "input.enter_behavior"
+group = "input"
+type = "string" # TODO opts：回车行为（commit/... 待确认）
+label = "有编码时回车行为"
+default = "commit"
+since = 2
+
+[[items]]
+key = "input.space_on_empty_behavior"
+group = "input"
+type = "string" # TODO opts：空码空格行为
+label = "空码时空格行为"
+default = "commit"
+since = 2
+
+[[items]]
+key = "input.pinyin_separator"
+group = "input"
+type = "string" # TODO opts：拼音分隔（auto/...）
+label = "拼音分隔符"
+default = "auto"
+since = 2
+
+[[items]]
+key = "input.punct_custom.enabled"
+group = "input"
+type = "toggle"
+label = "启用自定义标点映射"
+hint = "映射表在「标点映射」对话框中编辑"
+default = false
+since = 2
+
+[[items]]
+key = "input.shift_temp_english.enabled"
+group = "input"
+type = "toggle"
+label = "Shift 临时英文"
+default = true
+since = 2
+
+[[items]]
+key = "input.shift_temp_english.show_english_candidates"
+group = "input"
+type = "toggle"
+label = "临时英文显示候选"
+default = true
+since = 2
+enabled_when = "input.shift_temp_english.enabled == true"
+
+[[items]]
+key = "input.capslock.cancel_on_mode_switch"
+group = "input"
+type = "toggle"
+label = "切换模式时取消大写锁定"
+default = false
+since = 2
+
+[[items]]
+key = "input.url_input.enabled"
+group = "input"
+type = "toggle"
+label = "网址输入模式"
+hint = "输入 www./http 等前缀进入网址直通模式"
+default = false
+since = 2
+
+[[items]]
+key = "input.code_commit.auto_commit_at_full"
+group = "input"
+type = "toggle"
+label = "全码自动上屏"
+hint = "唯一精确且无更长后继时直接上屏"
+default = false
+since = 2
+
+[[items]]
+key = "input.code_commit.auto_commit_block_on_pinyin"
+group = "input"
+type = "toggle"
+label = "有拼音候选时否决全码上屏"
+default = true
+since = 2
+enabled_when = "input.code_commit.auto_commit_at_full == true"
+
+[[items]]
+key = "input.code_commit.top_code_commit"
+group = "input"
+type = "toggle"
+label = "超长时取前 N 码顶字上屏"
+default = false
+since = 2
+
+[[items]]
+key = "input.phrase.min_prefix_length"
+group = "input"
+type = "number"
+label = "短语前缀触发最小长度"
+default = 2
+min = 1
+max = 5
+since = 2
+
+[[items]]
+key = "input.phrase.max_display_chars"
+group = "input"
+type = "number"
+label = "短语候选最大显示字数"
+hint = "0 表示不限制"
+default = 30
+min = 0
+max = 200
+since = 2
+
+# ───────────────────────── 快捷键 ─────────────────────────
+# 注：键位字符串理想用「热键合成器」对话框编辑；此处先以 string 暴露，便于查看/直填。
+[[items]]
+key = "hotkeys.commit_on_switch"
+group = "hotkeys"
+type = "toggle"
+label = "切换中英时上屏当前编码"
+default = true
+since = 2
+
+[[items]]
+key = "hotkeys.switch_engine"
+group = "hotkeys"
+type = "string"
+label = "切换方案"
+default = ""
+since = 2
+
+[[items]]
+key = "hotkeys.toggle_full_width"
+group = "hotkeys"
+type = "string"
+label = "切换全/半角"
+default = ""
+since = 2
+
+[[items]]
+key = "hotkeys.toggle_punct"
+group = "hotkeys"
+type = "string"
+label = "切换中/英标点"
+default = ""
+since = 2
+
+[[items]]
+key = "hotkeys.toggle_toolbar"
+group = "hotkeys"
+type = "string"
+label = "显示/隐藏工具栏"
+default = ""
+since = 2
+
+[[items]]
+key = "hotkeys.toggle_s2t"
+group = "hotkeys"
+type = "string"
+label = "切换简/繁"
+default = ""
+since = 2
+
+[[items]]
+key = "hotkeys.add_word"
+group = "hotkeys"
+type = "string"
+label = "造词"
+default = ""
+since = 2
+
+[[items]]
+key = "hotkeys.pin_candidate"
+group = "hotkeys"
+type = "string"
+label = "置顶候选"
+default = ""
+since = 2
+
+[[items]]
+key = "hotkeys.delete_candidate"
+group = "hotkeys"
+type = "string"
+label = "删除候选"
+default = ""
+since = 2
+
+# ───────────────────────── 外观 ─────────────────────────
+[[items]]
 key = "ui.candidate.per_page"
-group = "appearance"
+group = "ui"
 type = "slider"
 label = "每页候选数"
 hint = "候选窗每页显示的候选项数量"
@@ -62,7 +343,154 @@ max = 9
 step = 1
 since = 1
 
+[[items]]
+key = "ui.candidate.preedit_display"
+group = "ui"
+type = "select"
+label = "编码显示方式"
+hint = "编码（组合区）的显示位置"
+default = "app_inline"
+since = 2
+options = [
+  { value = "app_inline", label = "内嵌应用光标处", description = "候选窗不显示编码栏" },
+  { value = "candidate_top", label = "候选窗顶部独立栏" },
+  { value = "candidate_inline", label = "候选窗首单元内联" },
+]
+
+[[items]]
+key = "ui.candidate.hide_window"
+group = "ui"
+type = "toggle"
+label = "隐藏候选窗"
+default = false
+since = 2
+
+[[items]]
+key = "ui.mode_indicator.style"
+group = "ui"
+type = "select"
+label = "模式指示样式"
+hint = "进入临拼/双拼/快符/英文等模式时的标识"
+default = "short"
+since = 2
+options = [
+  { value = "short", label = "短称", description = "拼/双/快/英/符" },
+  { value = "full", label = "全称" },
+  { value = "none", label = "不显示" },
+]
+
+[[items]]
+key = "ui.font.family"
+group = "ui"
+type = "string"
+label = "候选窗字体"
+hint = "留空用主题默认"
+default = ""
+since = 2
+
+# ───────────────────────── 常规 ─────────────────────────
+[[items]]
+key = "general.default_chinese_mode"
+group = "general"
+type = "toggle"
+label = "启动默认中文模式"
+default = true
+since = 2
+
+[[items]]
+key = "general.default_chinese_punct"
+group = "general"
+type = "toggle"
+label = "启动默认中文标点"
+default = true
+since = 2
+
+[[items]]
+key = "general.default_full_width"
+group = "general"
+type = "toggle"
+label = "启动默认全角"
+default = false
+since = 2
+
+[[items]]
+key = "general.remember_last_state"
+group = "general"
+type = "toggle"
+label = "记住上次中英/标点状态"
+default = false
+since = 2
+
+# ───────────────────────── 高级 ─────────────────────────
+[[items]]
+key = "features.stats.enabled"
+group = "advanced"
+type = "toggle"
+label = "启用输入统计"
+default = true
+since = 2
+
+[[items]]
+key = "features.stats.track_english"
+group = "advanced"
+type = "toggle"
+label = "统计英文输入"
+default = false
+since = 2
+enabled_when = "features.stats.enabled == true"
+
+[[items]]
+key = "features.s2t.enabled"
+group = "advanced"
+type = "toggle"
+label = "简繁转换"
+default = false
+since = 2
+
+[[items]]
+key = "features.quick_input.enabled"
+group = "advanced"
+type = "toggle"
+label = "快捷输入（日期/计算）"
+default = false
+since = 2
+
+[[items]]
+key = "features.quick_input.decimal_places"
+group = "advanced"
+type = "number"
+label = "计算结果小数位数"
+default = 6
+min = 0
+max = 12
+since = 2
+enabled_when = "features.quick_input.enabled == true"
+
+[[items]]
+key = "features.cmdbar.enabled"
+group = "advanced"
+type = "toggle"
+label = "命令栏"
+default = false
+since = 2
+
+[[items]]
+key = "debug.log_level"
+group = "advanced"
+type = "select"
+label = "日志级别"
+default = "info"
+since = 2
+options = [
+  { value = "error", label = "error" },
+  { value = "warn", label = "warn" },
+  { value = "info", label = "info" },
+  { value = "debug", label = "debug" },
+  { value = "trace", label = "trace" },
+]
+
 # ── 特性可用性（模块 + 子特性两层；web 据此显示/隐藏/禁用）──
+# 保留另一会话约定；随各命名空间深化(temp/freq/shadow/stats/phrase/theme)逐步开启。
 [features.dict]
 enabled = true
 paged = true
