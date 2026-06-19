@@ -19,7 +19,7 @@ use crate::session::WebState;
 
 const ALLOWED_ORIGINS: &[&str] = &["https://setting.windinput.com"];
 
-fn is_allowed_origin(origin: &str) -> bool {
+pub(crate) fn is_allowed_origin(origin: &str) -> bool {
     if ALLOWED_ORIGINS.contains(&origin) {
         return true;
     }

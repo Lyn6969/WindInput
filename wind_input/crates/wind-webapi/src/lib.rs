@@ -19,7 +19,7 @@ use std::sync::Arc;
 
 use axum::{
     Json, Router,
-    extract::State,
+    extract::{Query, State},
     middleware::{from_fn, from_fn_with_state},
     routing::{get, post},
 };
@@ -75,12 +75,51 @@ fn build_router(state: Arc<WebState>) -> Router {
     let api = Router::new()
         .route("/api/rpc", post(api_rpc))
         .layer(from_fn_with_state(state.clone(), security::api_guard));
+    // SSE 事件流：EventSource 不能设自定义 header，故 token 走 query；handler 内自管 Origin/token/CORS。
+    let events = Router::new().route("/api/events", get(api_events));
     let local = Router::new()
         .route("/local/info", get(local::info))
         .route("/local/web-config/open", post(local::open))
         .route("/local/web-config/close", post(local::close))
         .layer(from_fn(security::local_guard));
-    Router::new().merge(api).merge(local).with_state(state)
+    Router::new().merge(api).merge(events).merge(local).with_state(state)
+}
+
+/// `/api/events`：SSE 事件流（query token 鉴权 + Origin 白名单 + CORS）。
+/// 当前无事件源，仅维持长连接 + 周期 keepalive，避免前端 EventSource 重连风暴。
+async fn api_events(
+    State(state): State<Arc<WebState>>,
+    headers: axum::http::HeaderMap,
+    Query(q): Query<std::collections::HashMap<String, String>>,
+) -> axum::response::Response {
+    use axum::http::{
+        HeaderValue, StatusCode,
+        header::{ACCESS_CONTROL_ALLOW_ORIGIN, ORIGIN},
+    };
+    use axum::response::{
+        IntoResponse,
+        sse::{Event, KeepAlive, Sse},
+    };
+
+    let origin = headers
+        .get(ORIGIN)
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.to_string());
+    if !origin.as_deref().map(security::is_allowed_origin).unwrap_or(false) {
+        return (StatusCode::FORBIDDEN, "forbidden: origin").into_response();
+    }
+    if !state.check_token(q.get("token").map(|s| s.as_str()).unwrap_or("")) {
+        return (StatusCode::UNAUTHORIZED, "unauthorized").into_response();
+    }
+
+    let stream = futures::stream::pending::<Result<Event, std::convert::Infallible>>();
+    let mut resp = Sse::new(stream).keep_alive(KeepAlive::default()).into_response();
+    if let Some(o) = origin {
+        if let Ok(v) = HeaderValue::from_str(&o) {
+            resp.headers_mut().insert(ACCESS_CONTROL_ALLOW_ORIGIN, v);
+        }
+    }
+    resp
 }
 
 async fn api_rpc(
