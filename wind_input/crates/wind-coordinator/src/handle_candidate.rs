@@ -129,10 +129,10 @@ impl Coordinator {
         // 分段上屏进行中（committed 前缀非空 ⟺ 来自拼音选词——五笔候选 consumed_length=0
         // 永不部分匹配）：剩余编码强制按拼音方案转换，避免混输让五笔抢首选（你↑选后 hao→虚）。
         let result = if !state.committed_text.is_empty()
-            && !self.config.schema.primary_pinyin.is_empty()
+            && !self.rt().config.schema.primary_pinyin.is_empty()
         {
             self.engine_mgr.convert_with(
-                &self.config.schema.primary_pinyin,
+                &self.rt().config.schema.primary_pinyin,
                 &state.input_buffer,
                 limit,
             )
@@ -157,7 +157,7 @@ impl Coordinator {
         let mut candidates = result.candidates;
         if !self.phrases.is_empty() {
             let recent = self.recent_commits_snapshot();
-            let max_disp = self.config.input.phrase.max_display_chars;
+            let max_disp = self.rt().config.input.phrase.max_display_chars;
             // 剪贴板读取回调注入 wind-phrase（其不依赖平台 UI 层）：精确码命令 display
             // 含 {clip()}（如 coad）时按需读取；非 windows 返回空。
             let clip = |_n: i64| -> String {
@@ -186,7 +186,7 @@ impl Coordinator {
             // 前缀导航：敲 `zz`/`co` 等前缀（长度 ≥ min_prefix_length）列出所有该前缀的
             // marker 短语。**$CC 命令** → is_command（选中直接执行，group_code 作执行输入
             // 上下文）；**$SS/$AA 组** → is_group（选中补全到完整码再展开成员，二级选择）。
-            let min_prefix = self.config.input.phrase.min_prefix_length;
+            let min_prefix = self.rt().config.input.phrase.min_prefix_length;
             for hit in self
                 .phrases
                 .lookup_prefix(&state.input_buffer, &recent, min_prefix)
@@ -338,7 +338,7 @@ impl Coordinator {
 
     /// 若 key_code 是配置的二/三候选键，返回页内候选偏移（1=次选/第2项，2=三选/第3项）。
     pub(crate) fn select_key_offset(&self, key_code: u32) -> Option<usize> {
-        for group in &self.config.input.select_key_groups {
+        for group in &self.rt().config.input.select_key_groups {
             let vks = hotkey::select_key_vks(group);
             if let Some(pos) = vks.iter().position(|vk| *vk == key_code) {
                 return Some(pos + 1);

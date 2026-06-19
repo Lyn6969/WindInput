@@ -54,7 +54,9 @@ impl Coordinator {
             MenuCmd::ThemeSelect(i) => self.select_theme(i),
             MenuCmd::ThemeStyle(style) => self.set_theme_style(style),
             MenuCmd::ToggleToolbar => self.toggle_toolbar(),
-            MenuCmd::ReloadConfig => self.reload_config(),
+            MenuCmd::ReloadConfig => {
+                self.reload_user_config();
+            }
             MenuCmd::RestartService => self.restart_service(),
             MenuCmd::OpenSettings => {
                 // 开启网页配置：经内嵌 web 服务签发 token 构造 URL，交系统默认浏览器打开。

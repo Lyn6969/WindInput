@@ -12,7 +12,7 @@ impl Coordinator {
     /// 数字后智能标点：在中文标点模式下，若 ch 在智能标点列表且光标前一字符为数字，
     /// 则该标点应按英文（半角）输出（如 "3." 不转成 "3。"）。
     pub(crate) fn is_smart_punct_after_digit(&self, ch: char, prev_char: u16) -> bool {
-        wind_punct::is_smart_punct_after_digit(&self.config.input, ch, prev_char)
+        wind_punct::is_smart_punct_after_digit(&self.rt().config.input, ch, prev_char)
     }
 
     /// 按当前中英标点/全半角配置转换一个标点字符为上屏文本（无 prev_char 上下文）。
@@ -31,7 +31,7 @@ impl Coordinator {
         let mut conv = self.punct.lock().unwrap_or_else(|e| e.into_inner());
         wind_punct::convert_punct(
             &mut conv,
-            &self.config.input,
+            &self.rt().config.input,
             state.chinese_punct,
             state.full_width,
             ch,
@@ -41,7 +41,7 @@ impl Coordinator {
 
     /// 智能符号模式判定时限（非法值回退 500ms）。
     pub(crate) fn smart_symbol_timeout(&self) -> std::time::Duration {
-        let ms = self.config.input.smart_symbol_timeout_ms;
+        let ms = self.rt().config.input.smart_symbol_timeout_ms;
         let ms = if ms <= 0 { 500 } else { ms };
         std::time::Duration::from_millis(ms as u64)
     }
@@ -53,12 +53,12 @@ impl Coordinator {
     /// 引号有状态、键名特殊，此处保守跳过自定义、走标准引号/英文产物。
     pub(crate) fn compute_punct_str_pure(&self, state: &State, ch: char, chinese: bool) -> Option<String> {
         let conv = self.punct.lock().unwrap_or_else(|e| e.into_inner());
-        wind_punct::compute_punct_str_pure(&conv, &self.config.input, state.full_width, ch, chinese)
+        wind_punct::compute_punct_str_pure(&conv, &self.rt().config.input, state.full_width, ch, chinese)
     }
 
     /// 判断中文标点串 `cn` 是否在用户配置的参与集合内（子串包含匹配，支持多字符/引号）。
     pub(crate) fn smart_symbol_participates(&self, cn: &str) -> bool {
-        wind_punct::participates(&self.config.input, cn)
+        wind_punct::participates(&self.rt().config.input, cn)
     }
 
     /// 计算 `ch` 当前会产生的「参与集合内的中文标点串」用于武装；不参与返回 None。
@@ -94,7 +94,7 @@ impl Coordinator {
         ch: char,
         prev_char: u16,
     ) -> Option<KeyAction> {
-        if !self.config.input.smart_symbol_mode {
+        if !self.rt().config.input.smart_symbol_mode {
             return None;
         }
         let mut arm = self.smart_symbol.lock().unwrap_or_else(|e| e.into_inner());

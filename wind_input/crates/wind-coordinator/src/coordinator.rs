@@ -321,18 +321,44 @@ pub(crate) struct SmartSymbolArm {
     pub(crate) at: Option<std::time::Instant>,
 }
 
+/// 配置 + 其轻量派生缓存的不可变快照；运行时整体原子替换以支持热重载。
+/// 重型组件（引擎/方案/词典）不在内，仍需重启才能完全切换。
+pub(crate) struct ConfigBundle {
+    pub(crate) config: Config,
+    pub(crate) compiled_hotkeys: CompiledHotkeys,
+    pub(crate) nav_keys: keymap::NavKeys,
+    pub(crate) cn_pairs: Vec<(char, char)>,
+    pub(crate) en_pairs: Vec<(char, char)>,
+}
+
+impl ConfigBundle {
+    fn build(config: Config) -> Self {
+        let compiled_hotkeys = hotkey::Compiler::new(config.clone()).compile();
+        let nav_keys =
+            keymap::NavKeys::from_config(&config.input.page_keys, &config.input.highlight_keys);
+        let cn_pairs = parse_pairs(&config.input.auto_pair.chinese_pairs);
+        let en_pairs = parse_pairs(&config.input.auto_pair.english_pairs);
+        Self {
+            config,
+            compiled_hotkeys,
+            nav_keys,
+            cn_pairs,
+            en_pairs,
+        }
+    }
+}
+
 /// 中央协调器
 pub struct Coordinator {
     pub(crate) state: Mutex<State>,
     pub(crate) push_server: Arc<PushServer>,
-    pub(crate) config: Config,
+    /// 配置 + 轻量派生缓存快照（RwLock<Arc<>> 原子替换支持热重载）。
+    /// 访问统一经 `self.rt()`。
+    rt: std::sync::RwLock<std::sync::Arc<ConfigBundle>>,
     pub(crate) ui_tx: std::sync::mpsc::Sender<UiCommand>,
     pub(crate) engine_mgr: EngineManager,
     /// redb 持久化存储（用户词/临时词/词频/影子规则）；None=无持久化（headless 测试）。
     pub(crate) store: Option<Arc<Store>>,
-    pub(crate) compiled_hotkeys: CompiledHotkeys,
-    /// 配置驱动的候选导航键分类器（翻页/高亮，普通模式与各 overlay 共用）
-    nav_keys: keymap::NavKeys,
     /// 标点转换器（引号左右状态）
     pub(crate) punct: Mutex<PunctuationConverter>,
     /// 智能符号模式待命态（同键连按删中文标点改英文）
@@ -350,9 +376,7 @@ pub struct Coordinator {
     pub(crate) toolbar_pos_path: Option<std::path::PathBuf>,
     /// 候选反查（编码/拆字/拼音）供悬停提示
     reverse: wind_reverse::ReverseLookup,
-    /// 标点配对：中/英配对表（left,right）+ 跟踪栈（用于智能跳过）
-    cn_pairs: Vec<(char, char)>,
-    en_pairs: Vec<(char, char)>,
+    /// 标点配对跟踪栈（用于智能跳过）；中/英配对表在 rt bundle 内。
     pair_tracker: Mutex<wind_transform::pair_tracker::PairTracker>,
     /// 最近一次有效光标坐标 (x,y,height)；用于无效坐标时回退，避免候选窗跑到左上角
     last_valid_caret: Mutex<(i32, i32, i32)>,
@@ -467,12 +491,12 @@ impl Coordinator {
             .clone();
         coordinator.push_theme(&name, false);
         // 下发候选布局方向（ui.candidate.layout == "vertical"）。
-        let vertical = coordinator.config.ui.candidate.layout.eq_ignore_ascii_case("vertical");
+        let vertical = coordinator.rt().config.ui.candidate.layout.eq_ignore_ascii_case("vertical");
         let _ = coordinator
             .ui_tx
             .send(UiCommand::SetCandidateLayout(vertical));
         // 下发预编辑内联模式：仅 candidate_inline 需内联候选首单元（app_inline 不显示、candidate_top 独立条）。
-        let embedded = coordinator.config.ui.candidate.preedit().embedded();
+        let embedded = coordinator.rt().config.ui.candidate.preedit().embedded();
         let _ = coordinator
             .ui_tx
             .send(UiCommand::SetPreeditEmbedded(embedded));
@@ -501,14 +525,13 @@ impl Coordinator {
     ) -> Arc<Self> {
         // 注入 redb Store：码表引擎注册用户词/临时词层，用户词进候选合并。
         let engine_mgr = EngineManager::with_store(&config, data_dir, store.clone());
-        let compiled_hotkeys = hotkey::Compiler::new(config.clone()).compile();
+        // 配置的轻量派生缓存集中到 ConfigBundle（支持运行时热替换）。
+        let bundle = ConfigBundle::build(config.clone());
         info!(
             "Compiled hotkeys: {} key_down, {} key_up",
-            compiled_hotkeys.key_down.len(),
-            compiled_hotkeys.key_up.len()
+            bundle.compiled_hotkeys.key_down.len(),
+            bundle.compiled_hotkeys.key_up.len()
         );
-        let nav_keys =
-            keymap::NavKeys::from_config(&config.input.page_keys, &config.input.highlight_keys);
 
         // 短语层：从 data 目录加载 system.phrases.toml
         let phrases = match data_dir {
@@ -540,9 +563,7 @@ impl Coordinator {
 
         // 词频已迁 redb（self.store 的 FREQ 表，选词时 record_freq）。
 
-        // 标点配对表（解析为 (左,右) 字符对）
-        let cn_pairs = parse_pairs(&config.input.auto_pair.chinese_pairs);
-        let en_pairs = parse_pairs(&config.input.auto_pair.english_pairs);
+        // 标点配对表（中/英）已在 ConfigBundle 内构建。
 
         // 通用规范汉字表（检索范围"常用字"判定）
         let common_chars = wind_candidate::CommonChars::load(
@@ -646,12 +667,10 @@ impl Coordinator {
                 menu_target_text: String::new(),
             }),
             push_server,
-            config,
+            rt: std::sync::RwLock::new(std::sync::Arc::new(bundle)),
             ui_tx,
             engine_mgr,
             store,
-            compiled_hotkeys,
-            nav_keys,
             punct: Mutex::new(punct_conv),
             smart_symbol: Mutex::new(SmartSymbolArm::default()),
             phrases,
@@ -660,8 +679,6 @@ impl Coordinator {
             common_chars,
             toolbar_pos_path,
             reverse,
-            cn_pairs,
-            en_pairs,
             pair_tracker: Mutex::new(wind_transform::pair_tracker::PairTracker::new()),
             last_valid_caret: Mutex::new((0, 0, 0)),
             awaiting_caret: Mutex::new(false),
@@ -694,6 +711,32 @@ impl Coordinator {
             .collect()
     }
 
+
+    /// 取当前「配置 + 派生缓存」快照（Arc 克隆，开销低）。所有配置读取经此。
+    pub(crate) fn rt(&self) -> std::sync::Arc<ConfigBundle> {
+        self.rt.read().unwrap_or_else(|e| e.into_inner()).clone()
+    }
+
+    /// 热重载用户配置：从磁盘重读 Config 并原子替换 bundle（轻量设置即时生效），
+    /// 再 best-effort 刷新主题/工具栏。返回是否仍需重启才能完全生效。
+    /// 轻量项（标点/智能符号/候选数/热键/配对/导航键等）即时生效；重型项（引擎/方案/
+    /// 词典/字体）当前不在 bundle 内，需重启——为不打断使用，这里统一返回 false，
+    /// 由调用方/用户按需重启。
+    pub fn reload_user_config(&self) -> bool {
+        match Config::load(Config::data_dir().as_deref()) {
+            Ok(cfg) => {
+                let bundle = std::sync::Arc::new(ConfigBundle::build(cfg));
+                *self.rt.write().unwrap_or_else(|e| e.into_inner()) = bundle;
+                info!("User config hot-reloaded");
+                self.reload_config(); // 刷新主题/工具栏（候选窗下次输入按新配置）
+                false
+            }
+            Err(e) => {
+                tracing::error!("热重载配置失败: {}", e);
+                true
+            }
+        }
+    }
 
     /// 当前活跃方案 ID（测试/诊断用）
     pub fn active_schema_id(&self) -> String {
@@ -753,7 +796,7 @@ impl Coordinator {
 
     /// 每页候选数（来自配置，至少 1）
     pub(crate) fn per_page(&self) -> usize {
-        self.config.ui.candidate.per_page.max(1)
+        self.rt().config.ui.candidate.per_page.max(1)
     }
 
 
@@ -848,6 +891,7 @@ impl Coordinator {
         }
         let shift = data.modifiers & MOD_SHIFT != 0;
         let action = self
+            .rt()
             .nav_keys
             .classify(data.key_code, shift, include_printable)?;
         let changed = match action {
@@ -1241,13 +1285,14 @@ impl Coordinator {
 
 
     /// 当前模式下生效的配对表（按中/英标点 + 各自开关）
-    fn active_pairs(&self, chinese_punct: bool) -> Option<&Vec<(char, char)>> {
+    fn active_pairs(&self, chinese_punct: bool) -> Option<Vec<(char, char)>> {
+        let rt = self.rt();
         if chinese_punct {
-            if self.config.input.auto_pair.chinese {
-                return Some(&self.cn_pairs);
+            if rt.config.input.auto_pair.chinese {
+                return Some(rt.cn_pairs.clone());
             }
-        } else if self.config.input.auto_pair.english {
-            return Some(&self.en_pairs);
+        } else if rt.config.input.auto_pair.english {
+            return Some(rt.en_pairs.clone());
         }
         None
     }
@@ -1319,8 +1364,8 @@ impl Coordinator {
             } else {
                 "英".into()
             },
-            key_down_hotkeys: self.compiled_hotkeys.key_down_tsf_hashes(),
-            key_up_hotkeys: self.compiled_hotkeys.key_up_tsf_hashes(),
+            key_down_hotkeys: self.rt().compiled_hotkeys.key_down_tsf_hashes(),
+            key_up_hotkeys: self.rt().compiled_hotkeys.key_up_tsf_hashes(),
         }
     }
 
@@ -1453,7 +1498,7 @@ impl Coordinator {
             return text;
         }
         let has_pending = !state.input_buffer.is_empty() || !state.committed_text.is_empty();
-        let commit = has_pending && !chinese && self.config.hotkeys.commit_on_switch;
+        let commit = has_pending && !chinese && self.rt().config.hotkeys.commit_on_switch;
         let text = if commit {
             // 切到英文且配置上屏：把「已转换前缀 + 剩余原码」一并上屏。
             let prefix = self.take_committed(state);
@@ -1565,7 +1610,7 @@ impl MessageHandler for Coordinator {
         // 通用位（ctrl/shift/alt/win）注册，故先掩掉具体位再比对 match_hash。
         let norm_mods = data.modifiers & hotkey::MOD_GENERIC_MASK;
         let norm_hash = calc_key_hash(norm_mods, data.key_code);
-        if let Some(action) = self.compiled_hotkeys.match_key_down(norm_hash)
+        if let Some(action) = self.rt().compiled_hotkeys.match_key_down(norm_hash)
             && !action.is_empty() {
                 debug!(
                     "Hotkey matched (key_down): {} (0x{:08X})",
@@ -1622,7 +1667,7 @@ impl MessageHandler for Coordinator {
         // 普通输入累积时，若 input_buffer + 当前键字符 恰好等于某前缀（如 "www."/"http"），
         // 则夺取进入网址模式。置于主分派前，确保「补全前缀的那一键」（字母或 '.'）先被截获，
         // 不落入普通码表/标点处理。前缀按惯例小写，故探针用小写字母对齐 input_buffer。
-        if self.config.input.url_input.enabled {
+        if self.rt().config.input.url_input.enabled {
             let shift = data.modifiers & MOD_SHIFT != 0;
             if let Some(ch) = printable_char(data.key_code, shift) {
                 let probe = format!("{}{}", state.input_buffer, ch.to_ascii_lowercase());
@@ -2081,4 +2126,32 @@ impl MessageHandler for Coordinator {
     fn handle_host_render_request(&self) {}
     fn handle_host_render_ready(&self) {}
 
+}
+
+#[cfg(test)]
+mod reload_tests {
+    //! 热重载基础：验证 ConfigBundle 能从 Config 正确重建轻量派生缓存。
+    //! （reload_user_config 走磁盘 IO 不在此测；这里测其核心——从配置重建派生状态。）
+    use super::*;
+
+    #[test]
+    fn config_bundle_rebuilds_pairs_from_config() {
+        let mut cfg = Config::default();
+        cfg.input.auto_pair.chinese_pairs = vec!["（）".to_string(), "【】".to_string()];
+        cfg.input.auto_pair.english_pairs = vec!["()".to_string()];
+        let b = ConfigBundle::build(cfg);
+        assert_eq!(b.cn_pairs, vec![('（', '）'), ('【', '】')]);
+        assert_eq!(b.en_pairs, vec![('(', ')')]);
+    }
+
+    #[test]
+    fn config_bundle_carries_config_values() {
+        // 改配置 → 重建 bundle → bundle.config 反映新值（热重载替换后读取生效的基础）。
+        let mut cfg = Config::default();
+        cfg.input.smart_symbol_mode = true;
+        cfg.ui.candidate.per_page = 9;
+        let b = ConfigBundle::build(cfg);
+        assert!(b.config.input.smart_symbol_mode);
+        assert_eq!(b.config.ui.candidate.per_page, 9);
+    }
 }

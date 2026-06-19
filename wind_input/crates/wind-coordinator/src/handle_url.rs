@@ -13,7 +13,7 @@ use wind_keys::keymap;
 impl Coordinator {
     /// 探针是否恰好等于某个网址前缀（精确匹配，对齐 Go urlActivationResidual 的全匹配语义）。
     pub(crate) fn is_url_prefix(&self, probe: &str) -> bool {
-        self.config
+        self.rt().config
             .input
             .url_input
             .prefixes

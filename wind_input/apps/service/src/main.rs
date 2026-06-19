@@ -149,6 +149,9 @@ impl wind_webapi::CoreStatus for WebStatus {
     fn active_schema_id(&self) -> String {
         self.0.active_schema_id()
     }
+    fn apply_config(&self) -> bool {
+        self.0.reload_user_config()
+    }
     fn data_rpc(
         &self,
         method: &str,

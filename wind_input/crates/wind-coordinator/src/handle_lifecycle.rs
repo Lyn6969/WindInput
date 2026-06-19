@@ -40,7 +40,7 @@ impl Coordinator {
         // 临时英文：Shift+字母（空缓冲 + 无候选 + 已启用）
         if state.input_buffer.is_empty()
             && state.candidates.is_empty()
-            && self.config.input.shift_temp_english.enabled
+            && self.rt().config.input.shift_temp_english.enabled
             && data.modifiers & MOD_SHIFT != 0
             && data.modifiers & (MOD_CTRL | MOD_ALT) == 0
             && (keymap::VK_A..=keymap::VK_Z).contains(&data.key_code)

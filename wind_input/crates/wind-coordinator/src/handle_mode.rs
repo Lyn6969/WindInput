@@ -42,6 +42,7 @@ impl Coordinator {
             }
             Some(ModeKind::Special(idx)) => self.special_schema(idx),
             Some(ModeKind::TempEnglish) => self
+                .rt()
                 .config
                 .input
                 .shift_temp_english
@@ -54,7 +55,7 @@ impl Coordinator {
     /// mix 模式可加载的成员方案列表（过滤空/不可加载）。
     /// mix 可用的真实方案成员（过滤空 / 不可加载 / 内置 quick_input）。
     pub(crate) fn mix_members(&self, idx: u8) -> Vec<String> {
-        self.config
+        self.rt().config
             .features
             .mix_modes
             .get(idx as usize)
@@ -72,7 +73,7 @@ impl Coordinator {
 
     /// mix 是否含内置类方案 quick_input（日期/计算）成员——启用「首字符数字/字母决定选词逻辑」。
     pub(crate) fn mix_has_quick_input(&self, idx: u8) -> bool {
-        self.config
+        self.rt().config
             .features
             .mix_modes
             .get(idx as usize)
@@ -330,7 +331,7 @@ impl Coordinator {
             ModeKind::QuickInput => Some(("快捷输入".to_string(), "快".to_string())),
             ModeKind::Url => None,
             ModeKind::Mix(i) => {
-                let m = self.config.features.mix_modes.get(i as usize)?;
+                let rt = self.rt(); let m = rt.config.features.mix_modes.get(i as usize)?;
                 let full = if m.name.is_empty() {
                     "快捷".to_string()
                 } else {
@@ -340,7 +341,7 @@ impl Coordinator {
                 Some((full, short))
             }
             ModeKind::Special(i) => {
-                let m = self.config.features.special_modes.get(i as usize)?;
+                let rt = self.rt(); let m = rt.config.features.special_modes.get(i as usize)?;
                 let full = m.name.clone();
                 let short = Self::short_or_first(&m.short_name, &full);
                 Some((full, short))
@@ -361,7 +362,7 @@ impl Coordinator {
     pub(crate) fn mode_indicator_text(&self, state: &State) -> Option<String> {
         use wind_config::ModeIndicatorStyle;
         let (full, short) = self.mode_indicator_names(state)?;
-        match self.config.ui.mode_indicator.parsed_style() {
+        match self.rt().config.ui.mode_indicator.parsed_style() {
             ModeIndicatorStyle::None => None,
             ModeIndicatorStyle::Full => Some(full),
             ModeIndicatorStyle::Short => Some(short),
@@ -399,7 +400,7 @@ impl Coordinator {
     /// 判断 key_code 是否为配置的 toggle 模式键（从编译后的 key_up 热键提取 vk 低 16 位）。
     /// TSF 仅在干净单击时于 keyUp 转发这些键，故据此判定即可直接切换。
     pub(crate) fn is_toggle_mode_keycode(&self, key_code: u32) -> bool {
-        self.compiled_hotkeys
+        self.rt().compiled_hotkeys
             .key_up
             .iter()
             .any(|e| (e.match_hash & 0xFFFF) == key_code)
@@ -407,7 +408,7 @@ impl Coordinator {
 
     /// 找出 key_code 匹配的 mix 模式下标（按配置顺序先到先得）。
     pub(crate) fn match_mix_trigger(&self, key_code: u32) -> Option<u8> {
-        for (i, m) in self.config.features.mix_modes.iter().enumerate() {
+        for (i, m) in self.rt().config.features.mix_modes.iter().enumerate() {
             if i > u8::MAX as usize {
                 break;
             }
@@ -486,6 +487,7 @@ impl Coordinator {
         }
         let numeric = self.mix_has_quick_input(state.mix_id) && state.mix_numeric;
         let members = self
+            .rt()
             .config
             .features
             .mix_modes
@@ -501,7 +503,7 @@ impl Coordinator {
                 if !numeric {
                     continue; // 文本模式跳过计算
                 }
-                let dp = self.config.features.quick_input.decimal_places;
+                let dp = self.rt().config.features.quick_input.decimal_places;
                 for t in wind_quick_input::generate_quick_input_candidates(&state.mix_buffer, dp)
                 {
                     if seen.insert(t.clone()) {

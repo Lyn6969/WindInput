@@ -23,7 +23,7 @@ impl Coordinator {
 
     /// 当前按键是否匹配配置的快捷输入触发键
     pub(crate) fn is_quick_input_trigger(&self, key_code: u32) -> bool {
-        self.config
+        self.rt().config
             .features
             .quick_input
             .trigger_keys
@@ -54,7 +54,7 @@ impl Coordinator {
             return;
         }
         state.preedit = format!("{}{}", prefix, state.quick_input_buffer);
-        let dp = self.config.features.quick_input.decimal_places;
+        let dp = self.rt().config.features.quick_input.decimal_places;
         let texts =
             wind_quick_input::generate_quick_input_candidates(&state.quick_input_buffer, dp);
         state.candidates = texts

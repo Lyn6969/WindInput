@@ -26,7 +26,7 @@ impl Coordinator {
 
     /// 当前按键是否匹配配置的临时拼音触发键
     pub(crate) fn is_temp_pinyin_trigger(&self, key_code: u32) -> bool {
-        self.config
+        self.rt().config
             .input
             .temp_pinyin
             .trigger_keys
