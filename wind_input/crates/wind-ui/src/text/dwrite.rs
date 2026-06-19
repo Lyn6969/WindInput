@@ -91,6 +91,12 @@ impl TextRenderer {
         self.font_size
     }
 
+    /// 更新基准字号（DPI 动态变化时调用）。格式按 px 缓存，无需重建 COM 对象，
+    /// 仅改变未显式指定字号的叶子的回退字号。
+    pub fn set_base_size(&mut self, size: f32) {
+        self.font_size = size;
+    }
+
     /// 取得（或创建）给定字号的文本格式（按取整 px 缓存）。
     fn ensure_format(&self, size: f32) -> Result<IDWriteTextFormat, String> {
         let key = size.max(1.0).round() as u32;

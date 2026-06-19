@@ -149,8 +149,20 @@ impl Toolbar {
         ]
     }
 
+    /// DPI 动态化：按工具栏当前位置所在显示器实时取缩放（拖到别的显示器后自动适配）。
+    /// 工具栏仅颜色随主题、几何随 scale 现算，故只需更新 scale 与字号。
+    fn ensure_scale(&mut self) {
+        let pos = self.mouse.borrow().pos.unwrap_or((0, 0));
+        let sc = crate::dpi::scale_for_point(pos.0, pos.1);
+        if (sc - self.scale).abs() > 0.01 {
+            self.scale = sc;
+            self.renderer.set_base_size(Self::FONT_PX * sc);
+        }
+    }
+
     /// 更新状态并重绘（首次会计算位置并显示）
     pub fn update(&mut self, state: &ToolbarState) {
+        self.ensure_scale();
         let s = self.scale;
         let height = (Self::HEIGHT * s).ceil();
         let grip_w = (Self::GRIP_W * s).ceil();

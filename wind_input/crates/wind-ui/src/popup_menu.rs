@@ -289,6 +289,8 @@ pub struct PopupMenu {
     radius: f32,
     /// 主题配置的软投影（menu.root.shadow）。
     shadow: Option<crate::view::SoftShadow>,
+    /// 已应用主题（DPI 变化时按新缩放重解析几何）。
+    theme: Option<wind_theme::Resolved>,
 }
 
 impl PopupMenu {
@@ -321,6 +323,7 @@ impl PopupMenu {
             border_w: scale, // 默认 1dp（≈1 设备像素，细边清晰）
             radius: 6.0 * scale,
             shadow: None,
+            theme: None,
         };
         // 预创建根窗口并绑定鼠标处理器（捕获后只有根窗口收消息）
         menu.ensure_windows(1)?;
@@ -337,8 +340,21 @@ impl PopupMenu {
         Ok(())
     }
 
+    /// DPI 动态化：按显示点所在显示器实时取缩放，变化则更新字号并按新缩放重解析主题几何。
+    fn ensure_scale(&mut self, x: i32, y: i32) {
+        let sc = crate::dpi::scale_for_point(x, y);
+        if (sc - self.scale).abs() > 0.01 {
+            self.scale = sc;
+            self.renderer.set_base_size(FONT_PX * sc);
+            if let Some(t) = self.theme.clone() {
+                self.set_theme(&t);
+            }
+        }
+    }
+
     /// 应用主题（菜单各色）。
     pub fn set_theme(&mut self, theme: &wind_theme::Resolved) {
+        self.theme = Some(theme.clone());
         self.bg = theme.color("menu_bg", BG);
         self.fg = theme.color("menu_text", FG);
         self.disabled = theme.color("menu_disabled", DISABLED);
@@ -392,9 +408,6 @@ impl PopupMenu {
         if self.ensure_windows(1).is_err() {
             return;
         }
-        let sel = first_selectable(&items);
-        // 先测量根面板尺寸以钳制锚点
-        let (_root, w, h, _hits) = self.build_view(&items, sel);
         let (ax, ay) = if x == i32::MIN || y == i32::MIN {
             let mut p = POINT::default();
             unsafe {
@@ -404,6 +417,11 @@ impl PopupMenu {
         } else {
             (x, y)
         };
+        // DPI 动态化：先按显示点所在显示器取缩放，再测量/构建（几何依赖 scale）。
+        self.ensure_scale(ax, ay);
+        let sel = first_selectable(&items);
+        // 先测量根面板尺寸以钳制锚点
+        let (_root, w, h, _hits) = self.build_view(&items, sel);
         self.anchor = clamp_to_work_area(ax, ay, w, h);
         {
             let mut st = self.state.borrow_mut();

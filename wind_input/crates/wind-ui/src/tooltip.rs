@@ -26,6 +26,8 @@ pub struct Tooltip {
     shadow: Option<crate::view::SoftShadow>,
     border: Option<([u8; 4], f32)>,
     radius: Option<f32>,
+    /// 已应用主题（DPI 变化时按新缩放重解析几何）。
+    theme: Option<wind_theme::Resolved>,
 }
 
 impl Tooltip {
@@ -45,11 +47,25 @@ impl Tooltip {
             shadow: None,
             border: None,
             radius: None,
+            theme: None,
         })
+    }
+
+    /// DPI 动态化：按显示点所在显示器实时取缩放，变化则更新字号并按新缩放重解析主题几何。
+    fn ensure_scale(&mut self, x: i32, y: i32) {
+        let sc = crate::dpi::scale_for_point(x, y);
+        if (sc - self.scale).abs() > 0.01 {
+            self.scale = sc;
+            self.renderer.set_base_size(FONT_PX * sc);
+            if let Some(t) = self.theme.clone() {
+                self.set_theme(&t);
+            }
+        }
     }
 
     /// 应用主题（tooltip 底色/文字色 + 位图背景/层）。
     pub fn set_theme(&mut self, theme: &wind_theme::Resolved) {
+        self.theme = Some(theme.clone());
         self.bg = theme.color("tooltip_bg", BG);
         self.fg = theme.color("tooltip_text", FG);
         if let Some(node) = &theme.views.tooltip {
@@ -91,6 +107,7 @@ impl Tooltip {
             self.hide();
             return;
         }
+        self.ensure_scale(x, y);
         let s = self.scale;
         let mut tip = View::leaf(text, self.fg)
             .bg(self.bg)
