@@ -57,16 +57,20 @@ pub struct EngineManager {
     engines: Mutex<HashMap<String, Arc<dyn Engine>>>,
     /// 当前活跃方案 ID
     active: Mutex<String>,
-    /// 可用方案列表（已过滤不支持的方案，用于循环切换）
-    available: Vec<String>,
+    /// 可用方案列表（已过滤不支持的方案，用于循环切换）。
+    /// Mutex 以支持配置热重载时原地更新（无需重建 EngineManager）。
+    available: Mutex<Vec<String>>,
     /// 数据目录（懒加载时按需读取 schema）
     data_dir: Option<std::path::PathBuf>,
     /// redb 持久化存储（用户词/临时词层；None=无持久化，如纯测试/REPL）
     store: Option<Arc<wind_store::Store>>,
-    /// 全码/空码上屏策略全局默认（方案级 tri-state 未设时回退至此）
-    code_commit: wind_config::CodeCommitConfig,
+    /// 全码/空码上屏策略全局默认（方案级 tri-state 未设时回退至此）。
+    /// Mutex 以支持热重载（变更后清空引擎缓存按新策略重建）。
+    code_commit: Mutex<wind_config::CodeCommitConfig>,
     /// 词频排序设置缓存（schema_id -> FreqSettings；按需解析、避免每键读盘）
     freq_cache: Mutex<HashMap<String, FreqSettings>>,
+    /// 方案显示名缓存（schema_id -> schema.name；缺则回退 id）。按需读盘一次。
+    name_cache: Mutex<HashMap<String, String>>,
 }
 
 /// 进程级缓存根目录（%LOCALAPPDATA%\WindInput\cache），EngineManager::new 设置一次。
@@ -127,11 +131,12 @@ impl EngineManager {
         let mgr = Self {
             engines: Mutex::new(HashMap::new()),
             active: Mutex::new(active_id.clone()),
-            available,
+            available: Mutex::new(available),
             data_dir: data_dir.map(|d| d.to_path_buf()),
             store,
-            code_commit: config.input.code_commit.clone(),
+            code_commit: Mutex::new(config.input.code_commit.clone()),
             freq_cache: Mutex::new(HashMap::new()),
+            name_cache: Mutex::new(HashMap::new()),
         };
         // 仅构建活跃方案（其余懒加载）
         mgr.ensure_loaded(&active_id);
@@ -156,11 +161,16 @@ impl EngineManager {
         {
             return true;
         }
+        let commit = self
+            .code_commit
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
         match Self::build_engine(
             schema_id,
             self.data_dir.as_deref(),
             self.store.clone(),
-            &self.code_commit,
+            &commit,
         ) {
             Some(engine) => {
                 info!(
@@ -207,9 +217,33 @@ impl EngineManager {
             .unwrap_or(false)
     }
 
-    /// 可用方案列表
-    pub fn available_schemas(&self) -> &[String] {
-        &self.available
+    /// 可用方案列表（快照拷贝）。
+    pub fn available_schemas(&self) -> Vec<String> {
+        self.available
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
+
+    /// 方案显示名（schema.name 优先，缺/读不到回退 id）。带缓存避免重复读盘。
+    pub fn schema_name(&self, schema_id: &str) -> String {
+        if let Some(n) = self
+            .name_cache
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(schema_id)
+        {
+            return n.clone();
+        }
+        let name = Self::read_schema(schema_id, self.data_dir.as_deref())
+            .map(|s| s.schema.name)
+            .filter(|n| !n.is_empty())
+            .unwrap_or_else(|| schema_id.to_string());
+        self.name_cache
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(schema_id.to_string(), name.clone());
+        name
     }
 
     /// 切换到指定方案；成功返回 true（必要时懒加载）
@@ -226,21 +260,53 @@ impl EngineManager {
         true
     }
 
+    /// 按新配置热重载方案集（无需重建 EngineManager）：重算可用方案、更新上屏策略、
+    /// 清空引擎/词频/名称缓存使其按新配置/词典重建，并切到新的活跃方案。
+    /// 返回活跃方案是否发生变化（供上层决定是否清输入缓冲、刷新 UI）。
+    pub fn reload_from_config(&self, config: &Config) -> bool {
+        let new_active = config.active_schema().to_string();
+        let mut available = config.schema.available.clone();
+        if available.is_empty() {
+            available.push(new_active.clone());
+        }
+        // 过滤不支持的方案，但始终保留活跃方案（与构造逻辑一致）。
+        available.retain(|sid| sid == &new_active || Self::schema_supported(sid, self.data_dir.as_deref()));
+
+        // 更新可变状态。
+        *self.available.lock().unwrap_or_else(|e| e.into_inner()) = available;
+        *self.code_commit.lock().unwrap_or_else(|e| e.into_inner()) = config.input.code_commit.clone();
+        // 丢弃缓存：引擎按新上屏策略/词典重建，名称/词频按新方案重读。
+        self.engines.lock().unwrap_or_else(|e| e.into_inner()).clear();
+        self.freq_cache.lock().unwrap_or_else(|e| e.into_inner()).clear();
+        self.name_cache.lock().unwrap_or_else(|e| e.into_inner()).clear();
+
+        // 切换活跃方案（即便 id 未变，引擎已被清空，这里立即重建避免首键延迟）。
+        let changed = {
+            let mut active = self.active.lock().unwrap_or_else(|e| e.into_inner());
+            let changed = *active != new_active;
+            *active = new_active.clone();
+            changed
+        };
+        self.ensure_loaded(&new_active);
+        info!("EngineManager reloaded from config (active={}, changed={})", new_active, changed);
+        changed
+    }
+
     /// 循环切换到下一个可加载的方案；返回新方案 ID。
     /// 懒加载：在加载前不持 active 锁，避免首次加载（拼音合并/unigram）阻塞按键路径。
     pub fn cycle_schema(&self) -> Option<String> {
-        let n = self.available.len();
+        let available = self.available_schemas();
+        let n = available.len();
         if n <= 1 {
             return None;
         }
         let current = self.active_schema_id();
-        let cur = self
-            .available
+        let cur = available
             .iter()
             .position(|s| s == &current)
             .unwrap_or(0);
         for step in 1..n {
-            let cand = self.available[(cur + step) % n].clone();
+            let cand = available[(cur + step) % n].clone();
             if cand == current {
                 continue;
             }

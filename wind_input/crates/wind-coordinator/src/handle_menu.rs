@@ -115,7 +115,7 @@ impl Coordinator {
             schema_children.push(M::separator());
             for (i, id) in schemas.iter().enumerate() {
                 schema_children.push(M::leaf(
-                    id.clone(),
+                    self.engine_mgr.schema_name(id),
                     cmd(MenuCmd::SchemaSelect(i)),
                     true,
                     chinese && *id == active,
@@ -317,7 +317,7 @@ impl Coordinator {
     /// 否则下发 HideToolbar。所有调用点（启动/切模式/切方案/激活/失活）经此单点决策，
     /// 不再各自直接显示，根治“工具栏总是显示、切走输入法不隐藏”。
     pub(crate) fn notify_toolbar(&self) {
-        let schema_label = Self::schema_display_name(&self.engine_mgr.active_schema_id());
+        let schema_label = self.engine_mgr.schema_name(&self.engine_mgr.active_schema_id());
         let s = self.state.lock().unwrap_or_else(|e| e.into_inner());
         if !(s.ime_active && s.toolbar_visible) {
             drop(s);

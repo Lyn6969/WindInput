@@ -260,3 +260,52 @@ fn test_schema_cycle_skips_unloaded() {
         "应跳过未加载方案直达 pinyin"
     );
 }
+
+/// 方案显示名取自 schema.name（friendly），未知方案回退 id。
+#[test]
+fn test_schema_name_from_meta() {
+    let dir = data_dir();
+    if !schema_exists(&dir, "wubi86") || !schema_exists(&dir, "pinyin") {
+        eprintln!("跳过：缺少 schema");
+        return;
+    }
+    let cfg = make_config(&["wubi86"]);
+    let mgr = EngineManager::new(&cfg, Some(&dir));
+    assert_eq!(mgr.schema_name("wubi86"), "五笔");
+    assert_eq!(mgr.schema_name("pinyin"), "全拼");
+    // 未知方案：回退 id 本身
+    assert_eq!(mgr.schema_name("__nonexistent__"), "__nonexistent__");
+}
+
+/// 配置热重载：切换活跃方案、更新可用列表，无需重建 EngineManager。
+#[test]
+fn test_reload_from_config_switches_active() {
+    let dir = data_dir();
+    if !schema_exists(&dir, "wubi86") || !schema_exists(&dir, "pinyin") {
+        eprintln!("跳过：缺少 schema");
+        return;
+    }
+    let cfg = make_config(&["wubi86", "pinyin"]);
+    let mgr = EngineManager::new(&cfg, Some(&dir));
+    assert_eq!(mgr.active_schema_id(), "wubi86");
+    assert!(!mgr.is_pinyin());
+
+    // 新配置：活跃切到 pinyin（顺序也变）
+    let mut cfg2 = Config::default();
+    cfg2.schema.available = vec!["pinyin".to_string(), "wubi86".to_string()];
+    cfg2.schema.active = "pinyin".to_string();
+    let changed = mgr.reload_from_config(&cfg2);
+    assert!(changed, "活跃方案应从 wubi86 切到 pinyin");
+    assert_eq!(mgr.active_schema_id(), "pinyin");
+    assert!(mgr.is_pinyin(), "重载后应为拼音引擎");
+    assert_eq!(
+        mgr.available_schemas(),
+        vec!["pinyin".to_string(), "wubi86".to_string()],
+        "可用列表应反映新配置"
+    );
+
+    // 相同配置再次重载：活跃未变 → false
+    let again = mgr.reload_from_config(&cfg2);
+    assert!(!again, "活跃方案未变时应返回 false");
+    assert_eq!(mgr.active_schema_id(), "pinyin");
+}

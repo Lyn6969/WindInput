@@ -91,7 +91,7 @@ impl Default for GeneralConfig {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
 pub struct SchemaConfig {
     #[serde(default)]
     pub active: String,
@@ -224,7 +224,7 @@ fn default_phrase_max_display_chars() -> usize {
 /// 全码/空码上屏策略全局默认（对齐方案级 [engine.codetable] 同名字段）。
 /// 解析顺序：方案级 Some > 本全局 > 内置默认。放在 `config.toml`（用户可合并），
 /// 使非主方案/未单独配置的方案统一吃全局，且无需改只读安装目录的 schema。
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct CodeCommitConfig {
     /// 全码自动上屏（唯一精确 + 无更长后继时直接上屏）
     #[serde(default)]

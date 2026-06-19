@@ -102,7 +102,7 @@ impl Coordinator {
             .engine_mgr
             .available_schemas()
             .iter()
-            .map(|id| json!({ "id": id, "name": id, "builtin": true }))
+            .map(|id| json!({ "id": id, "name": self.engine_mgr.schema_name(id), "builtin": true }))
             .collect();
         Ok(json!(items))
     }
@@ -214,11 +214,11 @@ impl Coordinator {
             None => return Ok(json!([])),
         };
         let mut out = Vec::new();
-        for id in self.engine_mgr.available_schemas() {
+        for id in self.engine_mgr.available_schemas().iter() {
             let user_words = store.search_user_words_prefix(id, "", 0).map(|v| v.len()).unwrap_or(0);
             out.push(json!({
                 "schemaId": id,
-                "name": id,
+                "name": self.engine_mgr.schema_name(id),
                 "userWords": user_words,
                 "tempWords": 0,   // 🚧 待深化
                 "shadowRules": 0, // 🚧 待深化

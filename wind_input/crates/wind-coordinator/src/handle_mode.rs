@@ -170,7 +170,7 @@ impl Coordinator {
         self.push_state_update();
         self.notify_toolbar();
         self.notify_ui_hide();
-        self.show_tip(&id);
+        self.show_tip(&self.engine_mgr.schema_name(&id));
     }
 
     /// 选择第 N 个主题。
@@ -391,7 +391,7 @@ impl Coordinator {
             drop(state);
             self.notify_ui_hide();
             self.push_state_update();
-            self.show_tip(&Self::schema_display_name(&next));
+            self.show_tip(&self.engine_mgr.schema_name(&next));
             self.notify_toolbar();
             info!("Cycled to schema: {}", next);
         }

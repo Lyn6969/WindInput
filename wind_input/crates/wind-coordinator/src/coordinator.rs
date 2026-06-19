@@ -725,9 +725,31 @@ impl Coordinator {
     pub fn reload_user_config(&self) -> bool {
         match Config::load(Config::data_dir().as_deref()) {
             Ok(cfg) => {
+                // 方案相关项（活跃/可用方案、全局上屏策略）是否变化：变了才热重建引擎，
+                // 避免每次保存都丢词典缓存（拼音合并/unigram 重建开销大）。
+                let old = self.rt();
+                let schema_dirty = old.config.schema != cfg.schema
+                    || old.config.input.code_commit != cfg.input.code_commit;
+                drop(old);
+
                 let bundle = std::sync::Arc::new(ConfigBundle::build(cfg));
+                let new_cfg = bundle.config.clone();
                 *self.rt.write().unwrap_or_else(|e| e.into_inner()) = bundle;
-                info!("User config hot-reloaded");
+                info!("User config hot-reloaded (schema_dirty={})", schema_dirty);
+
+                if schema_dirty {
+                    // 热重建方案集：清输入缓冲、刷新工具栏/状态，免重启切换方案。
+                    self.engine_mgr.reload_from_config(&new_cfg);
+                    {
+                        let mut s = self.state.lock().unwrap_or_else(|e| e.into_inner());
+                        s.input_buffer.clear();
+                        s.candidates.clear();
+                        s.preedit.clear();
+                    }
+                    self.notify_ui_hide();
+                    self.push_state_update();
+                    self.notify_toolbar(); // 方案名变化 → 刷新工具栏标签
+                }
                 self.reload_config(); // 刷新主题/工具栏（候选窗下次输入按新配置）
                 false
             }
