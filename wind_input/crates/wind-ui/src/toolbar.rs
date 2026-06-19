@@ -12,12 +12,11 @@ use crate::manager::{ToolbarAction, UiEvent};
 use crate::text::dwrite::TextRenderer;
 use crate::view::Rect;
 use crate::window::{LayeredWindow, WindowMouse};
-use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
-use windows::Win32::UI::Input::KeyboardAndMouse::{ReleaseCapture, SetCapture};
-use windows::Win32::UI::WindowsAndMessaging::{
-    GetCursorPos, GetWindowRect, LoadCursorW, SetCursor, SetWindowPos, HWND_TOPMOST, IDC_ARROW,
-    IDC_SIZEALL, SWP_NOACTIVATE, SWP_NOSIZE, SWP_NOZORDER, WM_LBUTTONDOWN, WM_LBUTTONUP,
-    WM_MOUSEMOVE, WM_RBUTTONDOWN, WM_SETCURSOR,
+use crate::sys::{
+    GetCursorPos, GetWindowRect, LoadCursorW, ReleaseCapture, SetCapture, SetCursor, SetWindowPos,
+    HWND, HWND_TOPMOST, IDC_ARROW, IDC_SIZEALL, LPARAM, LRESULT, POINT, RECT, SWP_NOACTIVATE,
+    SWP_NOSIZE, SWP_NOZORDER, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_RBUTTONDOWN,
+    WM_SETCURSOR, WPARAM,
 };
 
 /// 工具栏状态（由协调器推送）
@@ -258,6 +257,7 @@ impl Toolbar {
     }
 
     /// 工作区右下角位置（避开任务栏），右/下各留 12px 边距
+    #[cfg_attr(not(windows), allow(unused_variables))]
     fn corner_position(w: u32, h: u32) -> (i32, i32) {
         #[cfg(windows)]
         {
@@ -441,6 +441,8 @@ impl WindowMouse for ToolbarMouse {
 /// 在缓冲区子区域 (x,y,w,h) 内填充圆角矩形
 /// 将 (x,y,w,h) 钳制到所在（或最近）显示器工作区内，保证完整可见。
 /// 用于切换显示器 / 远程连接后旧坐标落到屏外时拉回。
+// 非 Windows 下无显示器工作区查询，w/h 仅 Windows 分支使用。
+#[cfg_attr(not(windows), allow(unused_variables))]
 fn clamp_to_work_area(x: i32, y: i32, w: u32, h: u32) -> (i32, i32) {
     #[cfg(windows)]
     {

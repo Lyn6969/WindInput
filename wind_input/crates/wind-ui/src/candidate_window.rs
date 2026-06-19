@@ -13,10 +13,9 @@ use crate::manager::{UiEvent, HOVER_PAGE_NEXT as TAG_PAGE_NEXT, HOVER_PAGE_PREV 
 use crate::text::dwrite::TextRenderer;
 use crate::view::{Align, Edges, Layout, Rect, View, ViewImage, ViewLayer};
 use crate::window::{LayeredWindow, WindowMouse};
-use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, WPARAM};
-use windows::Win32::UI::WindowsAndMessaging::{
-    GetCursorPos, LoadCursorW, SetCursor, IDC_ARROW, WM_LBUTTONDOWN, WM_MOUSEMOVE, WM_MOUSEWHEEL,
-    WM_RBUTTONDOWN, WM_SETCURSOR,
+use crate::sys::{
+    GetCursorPos, LoadCursorW, SetCursor, HWND, IDC_ARROW, LPARAM, LRESULT, POINT, WM_LBUTTONDOWN,
+    WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_RBUTTONDOWN, WM_SETCURSOR, WPARAM,
 };
 
 /// 候选词数据
@@ -383,6 +382,8 @@ impl CandidateWindow {
     /// 将候选窗钳制在光标所在显示器的工作区内：
     /// 默认显示在光标下方（+gap）；下方空间不足则上翻到光标上方；
     /// 左右溢出则贴边。避免窗口跑到屏幕外。
+    // 非 Windows 下窗口钳制为空实现，caret_h/w/h 及 x/y 的可变性仅 Windows 分支需要。
+    #[cfg_attr(not(windows), allow(unused_variables, unused_mut))]
     fn clamp_to_work_area(caret_x: i32, caret_y: i32, caret_h: i32, w: u32, h: u32) -> (i32, i32) {
         let gap = 2;
         // caret_y 为光标底端（与 Go 一致）：默认显示在其下方，仅留 gap
@@ -847,7 +848,7 @@ impl CandidateWindow {
         &self.candidates
     }
 
-    pub fn hwnd(&self) -> windows::Win32::Foundation::HWND {
+    pub fn hwnd(&self) -> HWND {
         self.window.hwnd()
     }
 }
@@ -896,7 +897,7 @@ impl CandidateMouse {
         self.engage_at = None;
         self.pending_raw = -1;
         let (sx, sy) = unsafe {
-            let mut p = windows::Win32::Foundation::POINT::default();
+            let mut p = POINT::default();
             let _ = GetCursorPos(&mut p);
             (p.x, p.y)
         };
@@ -953,7 +954,7 @@ impl WindowMouse for CandidateMouse {
                 // 物理移动门控：内容变化（打字换候选/窗口刷新）也会产生 WM_MOUSEMOVE，
                 // 但此时物理光标屏幕坐标不变 → 忽略，避免静止鼠标下方候选变化引起闪烁。
                 let (sx, sy) = unsafe {
-                    let mut p = windows::Win32::Foundation::POINT::default();
+                    let mut p = POINT::default();
                     let _ = GetCursorPos(&mut p);
                     (p.x, p.y)
                 };
@@ -981,7 +982,7 @@ impl WindowMouse for CandidateMouse {
                 let i = self.hit(x, y);
                 // 用屏幕光标坐标定位菜单
                 let (sx, sy) = unsafe {
-                    let mut p = windows::Win32::Foundation::POINT::default();
+                    let mut p = POINT::default();
                     let _ = GetCursorPos(&mut p);
                     (p.x, p.y)
                 };
