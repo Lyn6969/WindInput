@@ -40,13 +40,13 @@ crates/wind-webapi/
 |------|------|
 | `POST /api/rpc` | Web 数据端点（JSON-RPC 形态 `{version,id,method,params}` → `{id,result,error}`）；system.* / config.* |
 | `GET /local/info` | GUI 专用：版本/变体/连接态/端口 |
-| `POST /local/web-config/open` | GUI 触发：按需签发短时效 token + 放行 Web，返回 `config.windinput.com/?port=&token=` |
+| `POST /local/web-config/open` | GUI 触发：按需签发短时效 token + 放行 Web，返回 `setting.windinput.com/?port=&token=` |
 | `POST /local/web-config/close` | 撤销 token，收回 Web 访问 |
 
 ## 4. 连接与安全模型
 
 - **协议字段统一为 `version`**（`wind-ipc/rpc.rs` 的 `Request` 已去除 `#[serde(rename="v")]`；双边一致，避免 v 歧义）。
-- **`/api/*`**：默认拒绝；用户点"打开网页配置"→ core 签发短时效 token + 临时放行 `https://config.windinput.com` Origin（开发期放行 `http://localhost:*`/`127.0.0.1:*`）。逐请求校验 `X-WindInput-Token` + Origin 白名单 + CORS（含 `Access-Control-Allow-Private-Network: true` 处理 Chrome PNA 预检）。
+- **`/api/*`**：默认拒绝；用户点"打开网页配置"→ core 签发短时效 token + 临时放行 `https://setting.windinput.com` Origin（开发期放行 `http://localhost:*`/`127.0.0.1:*`）。逐请求校验 `X-WindInput-Token` + Origin 白名单 + CORS（含 `Access-Control-Allow-Private-Network: true` 处理 Chrome PNA 预检）。
 - **`/local/*`**：带 `Origin`（即浏览器跨源）一律 403，仅放行本机非浏览器客户端（GUI 的 ureq/同类）。
 - "按需"= 浏览器暴露窗口按需（token + Origin），而非端口物理开关——loopback 端口常开给本地 GUI，Web 通道按需授权、可即时撤销。
 
