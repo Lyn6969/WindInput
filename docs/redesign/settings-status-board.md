@@ -26,12 +26,12 @@ HTTP 传输/安全/引导/配置读写 + **数据桥(schema/dict 真实接入)**
 |---|---|---|---|---|
 | W1 | manifest 重写(6Tab+真实key) | ✅ | sess-A@06-19 | webapi 契约测试通过 |
 | W2 | data_rpc 桥 + schema/dict | ✅ | sess-A@06-19 | 真实 engine/store |
-| W3 | 深化 temp.* / freq.* / shadow.* | ⬜ | | wind-store 已有 API |
+| W3 | 深化 temp.* / freq.* / shadow.* | 🟡 | sess-A@06-19 | temp 可用现有API(补 remove_temp_word)；**freq/shadow 需给 wind-store 补"按schema扫描"方法**(照 search_user_words_prefix 扫 FREQ/SHADOW 表) |
 | W4 | 深化 stats.*(wind-store stats.rs) | ⬜ | | |
 | W5 | 深化 phrase.*(wind-store phrases.rs) | ⬜ | | |
 | W6 | 深化 theme.preview/import；dict.encode/genPinyin | ⬜ | | |
 | W7 | schema.getConfig/saveConfig(方案YAML) | ⬜ | | 对话框 |
-| W8 | 保存/重载/恢复默认 移到**导航栏**(替浮现栏) | ⬜ | | useConfig 已有 dirty/save/reset;补 getDefaults/reload |
+| W8 | 保存/还原/恢复默认/重载 移到**导航栏** | ✅ | sess-A@06-19 | WindInputSetting fd0c22d；全局操作栏覆盖 5 配置Tab；useConfig 补 reload/restoreDefaults/needsRestart |
 | W9 | 前端 Tab 全面 manifest 驱动(方案A) | ✅ | sess-A@06-19 | WindInputSetting 1571c0c;通用/输入/外观/高级按组渲染,删硬编码 schema 使用,build 通过。二级对话框/分级 UI 仍可后续细化 |
 | W10 | 热重载实装(apply_config) | ⬜ | | 见 hotreload-draft.patch |
 
