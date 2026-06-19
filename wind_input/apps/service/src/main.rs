@@ -98,12 +98,25 @@ fn main() {
     deferred.set_ready(coordinator);
 
     // 9.5 启动内嵌 HTTP web API（仅 loopback，按需授权）：GUI 与远程 Web 共用同一套 API。
+    // 预先构造 WebState 并共享句柄给「设置」菜单：菜单点击经此签发 token 构造网页配置 URL。
     let web_status: Arc<dyn wind_webapi::CoreStatus> = Arc::new(WebStatus(coord_for_web));
-    runtime.spawn(async move {
-        if let Err(e) = wind_webapi::serve(web_status, variant).await {
-            error!("web api failed: {}", e);
+    match wind_webapi::WebState::new(web_status, variant) {
+        Ok(state) => {
+            let web_state = Arc::new(state);
+            // 注入「设置」菜单的网页 URL 提供者；用 Weak 句柄避免与协调器形成 Arc 环
+            // （强引用由下方 serve 任务持有，进程生命周期内保活）。
+            let weak = Arc::downgrade(&web_state);
+            wind_coordinator::set_settings_url_provider(Box::new(move || {
+                weak.upgrade().map(|s| s.open_url())
+            }));
+            runtime.spawn(async move {
+                if let Err(e) = wind_webapi::serve_with_state(web_state).await {
+                    error!("web api failed: {}", e);
+                }
+            });
         }
-    });
+        Err(e) => error!("web api init failed (网页设置不可用): {}", e),
+    }
 
     info!(
         "WindInput service ready (pipes: wind_input{}, wind_input_push{})",
@@ -135,6 +148,13 @@ impl wind_webapi::CoreStatus for WebStatus {
     }
     fn active_schema_id(&self) -> String {
         self.0.active_schema_id()
+    }
+    fn data_rpc(
+        &self,
+        method: &str,
+        params: &serde_json::Value,
+    ) -> anyhow::Result<serde_json::Value> {
+        self.0.web_data_rpc(method, params)
     }
 }
 

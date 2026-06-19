@@ -2358,6 +2358,7 @@ dependencies = [
  "anyhow",
  "chrono",
  "serde",
+ "serde_json",
  "tokio",
  "toml",
  "tracing",
@@ -2573,6 +2574,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "serde",
+ "serde_json",
  "tokio",
  "toml",
  "tracing",

@@ -43,7 +43,8 @@ fn handle(state: &WebState, method: &str, params: &Value) -> anyhow::Result<Valu
         }
         "config.setItems" => set_items(state, params),
         "config.reload" => Ok(json!({ "ok": true })),
-        _ => anyhow::bail!("unknown method: {}", method),
+        // schema/dict/temp/freq/shadow/stats/theme/phrase 等数据类 RPC 转发到宿主 core。
+        _ => state.status.data_rpc(method, params),
     }
 }
 

@@ -61,6 +61,16 @@ impl WebState {
         Ok(())
     }
 
+    /// 「设置」菜单用：按需签发 token 并构造网页配置 URL（宿主据此交浏览器打开）。
+    /// 端口未绑定时返回的 URL 含 `port=0`（服务刚启动的瞬态）。
+    pub fn open_url(&self) -> String {
+        let token = self.issue_token();
+        let port = self.port();
+        let base = std::env::var("WIND_WEB_BASE")
+            .unwrap_or_else(|_| crate::local::DEFAULT_WEB_BASE.to_string());
+        format!("{}/?port={}&token={}", base, port, token)
+    }
+
     /// 按需签发短时效 Web token（覆盖旧 token）。
     pub(crate) fn issue_token(&self) -> String {
         let token = uuid::Uuid::new_v4().to_string();

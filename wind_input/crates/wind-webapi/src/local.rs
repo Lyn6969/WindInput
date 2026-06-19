@@ -7,7 +7,7 @@ use serde_json::{Value, json};
 
 use crate::session::WebState;
 
-const DEFAULT_WEB_BASE: &str = "https://config.windinput.com";
+pub(crate) const DEFAULT_WEB_BASE: &str = "https://setting.windinput.com";
 
 /// 本机信息：版本/变体/连接态/端口（GUI「关于」用）。
 pub async fn info(State(state): State<Arc<WebState>>) -> Json<Value> {

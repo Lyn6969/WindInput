@@ -38,11 +38,21 @@ pub trait CoreStatus: Send + Sync {
     fn apply_config(&self) -> bool {
         true
     }
+    /// 数据类 RPC（schema/dict/temp/freq/shadow/stats/theme/phrase）转发到宿主 core 实现。
+    /// 默认未接入（dev server stub）：返回 unknown method 错误。
+    fn data_rpc(&self, method: &str, _params: &serde_json::Value) -> anyhow::Result<serde_json::Value> {
+        anyhow::bail!("unknown method: {}", method)
+    }
 }
 
 /// 在调用方 tokio runtime 内启动 HTTP 服务（loopback）。一直 await 至服务结束。
 pub async fn serve(status: Arc<dyn CoreStatus>, variant: &'static str) -> anyhow::Result<()> {
-    let state = Arc::new(WebState::new(status, variant)?);
+    serve_with_state(Arc::new(WebState::new(status, variant)?)).await
+}
+
+/// 用调用方预先构造的 [`WebState`] 启动服务，使宿主可共享同一句柄
+/// （如「设置」菜单经 [`WebState::open_url`] 签发 token 开网页配置）。
+pub async fn serve_with_state(state: Arc<WebState>) -> anyhow::Result<()> {
     let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0)).await?;
     let port = listener.local_addr()?.port();
     state.on_bound(port)?;

@@ -17,7 +17,7 @@ use axum::{
 
 use crate::session::WebState;
 
-const ALLOWED_ORIGINS: &[&str] = &["https://config.windinput.com"];
+const ALLOWED_ORIGINS: &[&str] = &["https://setting.windinput.com"];
 
 fn is_allowed_origin(origin: &str) -> bool {
     if ALLOWED_ORIGINS.contains(&origin) {

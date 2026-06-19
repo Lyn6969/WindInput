@@ -56,10 +56,16 @@ impl Coordinator {
             MenuCmd::ToggleToolbar => self.toggle_toolbar(),
             MenuCmd::ReloadConfig => self.reload_config(),
             MenuCmd::RestartService => self.restart_service(),
-            MenuCmd::OpenConfigDir
-            | MenuCmd::OpenDictionary
-            | MenuCmd::OpenSettings
-            | MenuCmd::OpenAbout => {
+            MenuCmd::OpenSettings => {
+                // 开启网页配置：经内嵌 web 服务签发 token 构造 URL，交系统默认浏览器打开。
+                match crate::coordinator::settings_url() {
+                    Some(url) => {
+                        let _ = self.ui_tx.send(UiCommand::OpenPath(url));
+                    }
+                    None => tracing::warn!("打开设置失败：web 服务尚未就绪"),
+                }
+            }
+            MenuCmd::OpenConfigDir | MenuCmd::OpenDictionary | MenuCmd::OpenAbout => {
                 if let Some(d) = Config::user_config_dir() {
                     let _ = self
                         .ui_tx

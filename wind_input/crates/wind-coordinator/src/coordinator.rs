@@ -205,6 +205,23 @@ pub fn request_restart() {
     }
 }
 
+/// 「设置」菜单的网页配置 URL 提供者：由 main 注入（捕获 web_state 的 Weak 句柄，
+/// 调用时签发 token 构造 URL）。本 crate 仅持有闭包、不依赖 wind-webapi，保持解耦；
+/// 返回 None 表示未注入或 web 服务尚未就绪。
+#[allow(clippy::type_complexity)]
+static SETTINGS_URL_PROVIDER: std::sync::OnceLock<Box<dyn Fn() -> Option<String> + Send + Sync>> =
+    std::sync::OnceLock::new();
+
+/// 注入「设置」网页配置 URL 提供者（main 在启动 web 服务后调用一次）。
+pub fn set_settings_url_provider(f: Box<dyn Fn() -> Option<String> + Send + Sync>) {
+    let _ = SETTINGS_URL_PROVIDER.set(f);
+}
+
+/// 取「设置」网页配置 URL（菜单触发；None=未注入或服务未就绪）。
+pub(crate) fn settings_url() -> Option<String> {
+    SETTINGS_URL_PROVIDER.get().and_then(|f| f())
+}
+
 pub(crate) struct State {
     pub(crate) chinese_mode: bool,
     pub(crate) full_width: bool,
