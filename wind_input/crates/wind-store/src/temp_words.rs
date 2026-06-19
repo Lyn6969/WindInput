@@ -172,6 +172,20 @@ impl Store {
         })
     }
 
+    /// 删除临时词（不存在静默成功）。
+    pub fn remove_temp_word(&self, schema: &str, code: &str, text: &str) -> anyhow::Result<()> {
+        let key = enc_key(schema, code, text);
+        self.with_db(|db| {
+            let txn = db.begin_write()?;
+            {
+                let mut t = txn.open_table(TEMP_WORDS)?;
+                t.remove(key.as_str())?;
+            }
+            txn.commit()?;
+            Ok(())
+        })
+    }
+
     /// 晋升：把临时词移入用户词库（合并权重/计数），并从临时库删除。返回是否发生晋升。
     /// 合并：weight=min(temp+user,MAX)，count=temp+user，created_at 优先保留 user 旧值。
     pub fn promote_temp_word(

@@ -57,10 +57,12 @@ impl Coordinator {
             // 🚧 引擎编码/拼音生成：待深化
             "dict.encode" | "dict.genPinyin" => Ok(json!("")),
 
-            // ── temp.*（临时词）🚧 待深化 ────────────────────────
-            "temp.list" => Ok(json!([])),
-            "temp.promote" | "temp.remove" => Ok(json!({ "ok": true })),
-            "temp.promoteAll" | "temp.clear" => Ok(json!(0)),
+            // ── temp.*（临时词，redb）─────────────────────────────
+            "temp.list" => self.web_temp_list(params),
+            "temp.promote" => self.web_temp_promote(params),
+            "temp.remove" => self.web_temp_remove(params),
+            "temp.promoteAll" => self.web_temp_promote_all(params),
+            "temp.clear" => self.web_temp_clear(params),
 
             // ── freq.*（词频）🚧 待深化 ──────────────────────────
             "freq.listPaged" => Ok(json!({ "items": [], "total": 0 })),
@@ -223,6 +225,77 @@ impl Coordinator {
             }));
         }
         Ok(json!(out))
+    }
+
+    fn web_temp_list(&self, params: &Value) -> anyhow::Result<Value> {
+        let schema = str_param(params, "schemaId")?;
+        let store = self
+            .store
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("无持久化存储"))?;
+        let items: Vec<Value> = store
+            .search_temp_words_prefix(schema, "", 0)?
+            .into_iter()
+            .map(|r| json!({ "code": r.code, "text": r.text, "count": r.count }))
+            .collect();
+        Ok(json!(items))
+    }
+
+    fn web_temp_promote(&self, params: &Value) -> anyhow::Result<Value> {
+        let (schema, code, text) = (
+            str_param(params, "schemaId")?,
+            str_param(params, "code")?,
+            str_param(params, "text")?,
+        );
+        let store = self
+            .store
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("无持久化存储"))?;
+        store.promote_temp_word(schema, code, text)?;
+        Ok(json!({ "ok": true }))
+    }
+
+    fn web_temp_remove(&self, params: &Value) -> anyhow::Result<Value> {
+        let (schema, code, text) = (
+            str_param(params, "schemaId")?,
+            str_param(params, "code")?,
+            str_param(params, "text")?,
+        );
+        let store = self
+            .store
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("无持久化存储"))?;
+        store.remove_temp_word(schema, code, text)?;
+        Ok(json!({ "ok": true }))
+    }
+
+    fn web_temp_promote_all(&self, params: &Value) -> anyhow::Result<Value> {
+        let schema = str_param(params, "schemaId")?;
+        let store = self
+            .store
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("无持久化存储"))?;
+        let mut n = 0u64;
+        for r in store.search_temp_words_prefix(schema, "", 0)? {
+            if store.promote_temp_word(schema, &r.code, &r.text)? {
+                n += 1;
+            }
+        }
+        Ok(json!(n))
+    }
+
+    fn web_temp_clear(&self, params: &Value) -> anyhow::Result<Value> {
+        let schema = str_param(params, "schemaId")?;
+        let store = self
+            .store
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("无持久化存储"))?;
+        let all = store.search_temp_words_prefix(schema, "", 0)?;
+        let n = all.len();
+        for r in all {
+            store.remove_temp_word(schema, &r.code, &r.text)?;
+        }
+        Ok(json!(n))
     }
 
     fn web_theme_list(&self) -> anyhow::Result<Value> {
