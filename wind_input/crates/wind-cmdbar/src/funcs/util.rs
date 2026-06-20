@@ -8,7 +8,10 @@ use crate::services::Services;
 pub fn parse_arg_int(func: &str, s: &str) -> Result<i64> {
     let s = s.trim();
     if s.is_empty() {
-        return Err(CmdbarError::runtime(func, "expected integer, got empty string"));
+        return Err(CmdbarError::runtime(
+            func,
+            "expected integer, got empty string",
+        ));
     }
     if let Ok(i) = s.parse::<i64>() {
         return Ok(i);

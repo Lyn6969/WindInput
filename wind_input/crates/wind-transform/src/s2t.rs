@@ -80,10 +80,9 @@ impl Dict {
     }
 
     fn lookup(&self, key: &[u8]) -> Option<&[u8]> {
-        match self
-            .entries
-            .binary_search_by(|e| self.strings[e.key_off as usize..e.key_off as usize + e.key_len as usize].cmp(key))
-        {
+        match self.entries.binary_search_by(|e| {
+            self.strings[e.key_off as usize..e.key_off as usize + e.key_len as usize].cmp(key)
+        }) {
             Ok(i) => Some(self.val_of(i)),
             Err(_) => None,
         }

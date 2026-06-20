@@ -190,10 +190,10 @@ pub fn decode_commit_request(payload: &[u8]) -> Result<CommitRequestPayload, Cod
         // 剩余字节为 inputBuffer（可能有长度前缀，也可能直接是 UTF-8）
         // Go 版 DecodeCommitRequestPayload 读取：barrierSeq(2) + triggerKey(2) + modifiers(4) + inputBufferLen(4) + inputBuffer
         if payload.len() >= 12 {
-            let buf_len = u32::from_le_bytes([payload[8], payload[9], payload[10], payload[11]]) as usize;
+            let buf_len =
+                u32::from_le_bytes([payload[8], payload[9], payload[10], payload[11]]) as usize;
             if payload.len() >= 12 + buf_len {
-                String::from_utf8(payload[12..12 + buf_len].to_vec())
-                    .unwrap_or_default()
+                String::from_utf8(payload[12..12 + buf_len].to_vec()).unwrap_or_default()
             } else {
                 String::new()
             }

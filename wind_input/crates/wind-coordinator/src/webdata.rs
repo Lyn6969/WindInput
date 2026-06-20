@@ -32,7 +32,10 @@ fn usize_param(p: &Value, key: &str, default: usize) -> usize {
 
 /// 本地今天日期 "YYYY-MM-DD"（统计摘要的参照点）。
 fn today_str() -> String {
-    chrono::Local::now().date_naive().format("%Y-%m-%d").to_string()
+    chrono::Local::now()
+        .date_naive()
+        .format("%Y-%m-%d")
+        .to_string()
 }
 
 impl Coordinator {
@@ -248,11 +251,21 @@ impl Coordinator {
         };
         let mut out = Vec::new();
         for id in self.engine_mgr.available_schemas().iter() {
-            let user_words = store.search_user_words_prefix(id, "", 0).map(|v| v.len()).unwrap_or(0);
-            let temp_words = store.search_temp_words_prefix(id, "", 0).map(|v| v.len()).unwrap_or(0);
+            let user_words = store
+                .search_user_words_prefix(id, "", 0)
+                .map(|v| v.len())
+                .unwrap_or(0);
+            let temp_words = store
+                .search_temp_words_prefix(id, "", 0)
+                .map(|v| v.len())
+                .unwrap_or(0);
             let shadow_rules = store
                 .list_shadow_rules(id)
-                .map(|v| v.iter().map(|(_, r)| r.pinned.len() + r.deleted.len()).sum::<usize>())
+                .map(|v| {
+                    v.iter()
+                        .map(|(_, r)| r.pinned.len() + r.deleted.len())
+                        .sum::<usize>()
+                })
                 .unwrap_or(0);
             out.push(json!({
                 "schemaId": id,
@@ -307,7 +320,10 @@ impl Coordinator {
     fn web_schema_set_dict_enabled(&self, params: &Value) -> anyhow::Result<Value> {
         let id = str_param(params, "id")?;
         let dict_id = str_param(params, "dictId")?;
-        let enabled = params.get("enabled").and_then(|v| v.as_bool()).unwrap_or(true);
+        let enabled = params
+            .get("enabled")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(true);
         let mut merged = self
             .engine_mgr
             .schema_merged(id)
@@ -584,8 +600,14 @@ impl Coordinator {
         let (code, text) = (str_param(params, "code")?, str_param(params, "text")?);
         let new_code = params.get("newCode").and_then(|v| v.as_str());
         let new_text = params.get("newText").and_then(|v| v.as_str());
-        let position = params.get("position").and_then(|v| v.as_i64()).map(|n| n as i32);
-        let weight = params.get("weight").and_then(|v| v.as_i64()).map(|n| n as i32);
+        let position = params
+            .get("position")
+            .and_then(|v| v.as_i64())
+            .map(|n| n as i32);
+        let weight = params
+            .get("weight")
+            .and_then(|v| v.as_i64())
+            .map(|n| n as i32);
         let store = self
             .store
             .as_ref()
@@ -610,7 +632,10 @@ impl Coordinator {
 
     fn web_phrase_set_enabled(&self, params: &Value) -> anyhow::Result<Value> {
         let (code, text) = (str_param(params, "code")?, str_param(params, "text")?);
-        let enabled = params.get("enabled").and_then(|v| v.as_bool()).unwrap_or(true);
+        let enabled = params
+            .get("enabled")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(true);
         let store = self
             .store
             .as_ref()
@@ -629,7 +654,9 @@ impl Coordinator {
     fn web_stats_summary(&self) -> anyhow::Result<Value> {
         let store = match self.store.as_ref() {
             Some(s) => s,
-            None => return Ok(json!({ "today": 0, "week": 0, "month": 0, "total": 0, "streak": 0 })),
+            None => {
+                return Ok(json!({ "today": 0, "week": 0, "month": 0, "total": 0, "streak": 0 }));
+            }
         };
         let today = today_str();
         let s = store.stats_summary(&today)?;
@@ -673,7 +700,11 @@ impl Coordinator {
 
     fn web_stats_prune(&self, params: &Value) -> anyhow::Result<Value> {
         // 参数 days：删除早于 (今天 - days) 的统计。
-        let days = params.get("days").and_then(|v| v.as_i64()).unwrap_or(0).max(0);
+        let days = params
+            .get("days")
+            .and_then(|v| v.as_i64())
+            .unwrap_or(0)
+            .max(0);
         let store = match self.store.as_ref() {
             Some(s) => s,
             None => return Ok(json!({ "pruned": 0 })),
@@ -725,7 +756,10 @@ impl Coordinator {
 
     fn web_theme_import_text(&self, params: &Value) -> anyhow::Result<Value> {
         let yaml = str_param(params, "yaml")?;
-        let force = params.get("force").and_then(|v| v.as_bool()).unwrap_or(false);
+        let force = params
+            .get("force")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
         // 校验可解析为合法主题。
         wind_theme::validate_text(yaml)?;
         let meta = wind_theme::meta_from_text(yaml)
@@ -788,7 +822,11 @@ fn json_diff(base: &Value, cfg: &Value) -> Option<Value> {
                     }
                 }
             }
-            if out.is_empty() { None } else { Some(Value::Object(out)) }
+            if out.is_empty() {
+                None
+            } else {
+                Some(Value::Object(out))
+            }
         }
         _ => {
             if base == cfg {
@@ -814,9 +852,12 @@ fn json_to_toml(v: &Value) -> toml::Value {
         }
         Value::String(s) => toml::Value::String(s.clone()),
         // 跳过数组内 null（TOML 无 null），与对象分支语义一致，避免注入空串污染类型。
-        Value::Array(a) => {
-            toml::Value::Array(a.iter().filter(|x| !x.is_null()).map(json_to_toml).collect())
-        }
+        Value::Array(a) => toml::Value::Array(
+            a.iter()
+                .filter(|x| !x.is_null())
+                .map(json_to_toml)
+                .collect(),
+        ),
         Value::Object(o) => {
             let mut t = toml::map::Map::new();
             for (k, val) in o {
@@ -906,7 +947,10 @@ mod tests {
         // stats.summary 形状对齐 StatsSummary{today,week,month,total,streak}
         let sum = c.web_data_rpc("stats.summary", &json!({})).unwrap();
         for k in ["today", "week", "month", "total", "streak"] {
-            assert!(sum.get(k).and_then(|v| v.as_u64()).is_some(), "summary 缺 {k}");
+            assert!(
+                sum.get(k).and_then(|v| v.as_u64()).is_some(),
+                "summary 缺 {k}"
+            );
         }
         assert_eq!(sum["today"], 42);
 
@@ -940,7 +984,10 @@ mod tests {
 
         // freq.listPaged 形状对齐 PagedResult<FreqItem{code,text,count,lastUsed}>
         let r = c
-            .web_data_rpc("freq.listPaged", &json!({ "schemaId": "py", "limit": 50, "offset": 0 }))
+            .web_data_rpc(
+                "freq.listPaged",
+                &json!({ "schemaId": "py", "limit": 50, "offset": 0 }),
+            )
             .unwrap();
         assert_eq!(r["total"], 2);
         let it = &r["items"][0];
@@ -948,14 +995,22 @@ mod tests {
             assert!(it.get(k).is_some(), "FreqItem 缺 {k}");
         }
         // delete
-        c.web_data_rpc("freq.delete", &json!({ "schemaId": "py", "code": "de", "text": "的" }))
-            .unwrap();
+        c.web_data_rpc(
+            "freq.delete",
+            &json!({ "schemaId": "py", "code": "de", "text": "的" }),
+        )
+        .unwrap();
         let r2 = c
-            .web_data_rpc("freq.listPaged", &json!({ "schemaId": "py", "limit": 50, "offset": 0 }))
+            .web_data_rpc(
+                "freq.listPaged",
+                &json!({ "schemaId": "py", "limit": 50, "offset": 0 }),
+            )
             .unwrap();
         assert_eq!(r2["total"], 1);
         // clear 返回删除数（number）
-        let cleared = c.web_data_rpc("freq.clear", &json!({ "schemaId": "py" })).unwrap();
+        let cleared = c
+            .web_data_rpc("freq.clear", &json!({ "schemaId": "py" }))
+            .unwrap();
         assert_eq!(cleared, json!(1));
     }
 
@@ -995,9 +1050,19 @@ mod tests {
         assert_eq!(list3[0]["code"], json!("date"));
 
         // remove + resetDefault
-        c.web_data_rpc("phrase.remove", &json!({ "code": "date", "text": "2026-06-20" }))
-            .unwrap();
-        assert_eq!(c.web_data_rpc("phrase.list", &json!({})).unwrap().as_array().unwrap().len(), 0);
+        c.web_data_rpc(
+            "phrase.remove",
+            &json!({ "code": "date", "text": "2026-06-20" }),
+        )
+        .unwrap();
+        assert_eq!(
+            c.web_data_rpc("phrase.list", &json!({}))
+                .unwrap()
+                .as_array()
+                .unwrap()
+                .len(),
+            0
+        );
         c.web_data_rpc("phrase.resetDefault", &json!({})).unwrap();
     }
 
@@ -1020,9 +1085,10 @@ mod tests {
             .web_data_rpc("schema.getConfig", &json!({ "id": "pinyin" }))
             .unwrap();
         assert!(r.is_object() && r.as_object().unwrap().is_empty());
-        assert!(c
-            .web_data_rpc("schema.saveConfig", &json!({ "id": "pinyin", "cfg": {} }))
-            .is_err());
+        assert!(
+            c.web_data_rpc("schema.saveConfig", &json!({ "id": "pinyin", "cfg": {} }))
+                .is_err()
+        );
     }
 
     #[test]
@@ -1038,6 +1104,14 @@ mod tests {
             has_new_composition: false,
         });
         let today = today_str();
-        assert_eq!(c.store.as_ref().unwrap().get_daily_stat(&today).unwrap().chinese, 2);
+        assert_eq!(
+            c.store
+                .as_ref()
+                .unwrap()
+                .get_daily_stat(&today)
+                .unwrap()
+                .chinese,
+            2
+        );
     }
 }

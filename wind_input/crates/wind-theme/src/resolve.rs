@@ -532,7 +532,10 @@ mod tests {
         assert_eq!(dm.name, "默认主题");
         // 多目录加载：jidian `base: _base` 跨目录解析正常（resources/views 出来）。
         let r = load_resolved_dirs(&dirs, "jidian-classic", false).expect("resolve jidian");
-        assert!(r.views.window.bg_image.is_some(), "应解析出 _base+jidian 合并后的 window 背景图");
+        assert!(
+            r.views.window.bg_image.is_some(),
+            "应解析出 _base+jidian 合并后的 window 背景图"
+        );
         assert!(r.resources.contains_key("panel"));
 
         // 资产链：default 继承 _base，链中应含 _base 目录（footer chevron.svg 在 _base）。
@@ -542,7 +545,12 @@ mod tests {
             "default 资产链应含 _base 目录"
         );
         // footer 翻页箭头继承自 _base（chevron SVG + tint）。
-        let prev = d.views.footer_bar.prev_image.as_ref().expect("footer prev_image");
+        let prev = d
+            .views
+            .footer_bar
+            .prev_image
+            .as_ref()
+            .expect("footer prev_image");
         assert_eq!(prev.reference, "chevron_prev.svg");
         assert!(prev.tint.is_some(), "chevron 应有 tint(${{accent}})");
     }

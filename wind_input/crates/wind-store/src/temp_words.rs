@@ -5,7 +5,7 @@
 //! TOCTOU，store.md §7.4）。晋升条件（count≥promote_count）由调用方（dict StoreTempLayer）判定。
 
 use crate::store::{Store, TEMP_WORDS, USER_WORDS};
-use crate::user_words::{dec_val, enc_key, enc_val, now_secs, UserWordRecord};
+use crate::user_words::{UserWordRecord, dec_val, enc_key, enc_val, now_secs};
 use redb::ReadableTable;
 
 /// 临时词动态权重硬上限
@@ -29,9 +29,11 @@ impl Store {
             {
                 let mut t = txn.open_table(TEMP_WORDS)?;
                 let (w, c, ca) = match t.get(key.as_str())?.and_then(|g| dec_val(g.value())) {
-                    Some((ow, oc, oca)) => {
-                        (ow.saturating_add(weight_delta).min(TEMP_WORD_MAX_WEIGHT), oc + 1, oca)
-                    }
+                    Some((ow, oc, oca)) => (
+                        ow.saturating_add(weight_delta).min(TEMP_WORD_MAX_WEIGHT),
+                        oc + 1,
+                        oca,
+                    ),
                     None => (add_weight.min(TEMP_WORD_MAX_WEIGHT), 1, now_secs()),
                 };
                 new_count = c;
@@ -188,12 +190,7 @@ impl Store {
 
     /// 晋升：把临时词移入用户词库（合并权重/计数），并从临时库删除。返回是否发生晋升。
     /// 合并：weight=min(temp+user,MAX)，count=temp+user，created_at 优先保留 user 旧值。
-    pub fn promote_temp_word(
-        &self,
-        schema: &str,
-        code: &str,
-        text: &str,
-    ) -> anyhow::Result<bool> {
+    pub fn promote_temp_word(&self, schema: &str, code: &str, text: &str) -> anyhow::Result<bool> {
         let key = enc_key(schema, code, text);
         self.with_db(|db| {
             let txn = db.begin_write()?;
@@ -208,9 +205,11 @@ impl Store {
                             let mut user_t = txn.open_table(USER_WORDS)?;
                             let (nw, nc, nca) =
                                 match user_t.get(key.as_str())?.and_then(|g| dec_val(g.value())) {
-                                    Some((uw, uc, uca)) => {
-                                        (tw.saturating_add(uw).min(TEMP_WORD_MAX_WEIGHT), tc + uc, uca)
-                                    }
+                                    Some((uw, uc, uca)) => (
+                                        tw.saturating_add(uw).min(TEMP_WORD_MAX_WEIGHT),
+                                        tc + uc,
+                                        uca,
+                                    ),
                                     None => (tw.min(TEMP_WORD_MAX_WEIGHT), tc, tca),
                                 };
                             user_t.insert(key.as_str(), enc_val(nw, nc, nca).as_slice())?;
@@ -247,7 +246,10 @@ mod tests {
         assert_eq!(r[0].weight, 840, "800 + 40");
         // 权重上限
         let _ = s.learn_temp_word("wb", "b", "戈", 99999, 0).unwrap();
-        assert_eq!(s.get_temp_words("wb", "b").unwrap()[0].weight, TEMP_WORD_MAX_WEIGHT);
+        assert_eq!(
+            s.get_temp_words("wb", "b").unwrap()[0].weight,
+            TEMP_WORD_MAX_WEIGHT
+        );
         let _ = std::fs::remove_file(&path);
     }
 
@@ -255,9 +257,15 @@ mod tests {
     fn test_increment_if_exists() {
         let path = tmp("wind_tw_inc.redb");
         let s = Store::open(&path).unwrap();
-        assert_eq!(s.increment_temp_if_exists("wb", "a", "工", 10).unwrap(), (false, 0));
+        assert_eq!(
+            s.increment_temp_if_exists("wb", "a", "工", 10).unwrap(),
+            (false, 0)
+        );
         s.learn_temp_word("wb", "a", "工", 100, 10).unwrap();
-        assert_eq!(s.increment_temp_if_exists("wb", "a", "工", 10).unwrap(), (true, 2));
+        assert_eq!(
+            s.increment_temp_if_exists("wb", "a", "工", 10).unwrap(),
+            (true, 2)
+        );
         let _ = std::fs::remove_file(&path);
     }
 

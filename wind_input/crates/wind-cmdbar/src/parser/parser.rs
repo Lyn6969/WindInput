@@ -9,7 +9,7 @@
 //! 新增 `$` 短语类型的扩展点：在 [`MARKER_TABLE`] 注册 marker，并在 [`parse`] 分派到
 //! 对应解析函数（可复用 [`parse_array_phrase`] 并按 marker 分策略，如 `$AA` 的 rune 炸开）。
 
-use super::lexer::{decode_escape_byte, Lexer, RawStringPart, Token, TokenKind};
+use super::lexer::{Lexer, RawStringPart, Token, TokenKind, decode_escape_byte};
 use crate::ast::{ArrayPhrase, CommandPhrase, Expr, ModValue, Modifiers, Phrase, StringPart};
 use crate::error::{CmdbarError, Result};
 
@@ -18,7 +18,10 @@ pub fn parse(src: &str) -> Result<Phrase> {
     if let Some((marker, idx, open_off)) = find_top_level_marker(src) {
         // marker 之前只允许空白（短语不在顶层拼接）。
         if !src[..idx].trim().is_empty() {
-            return Err(CmdbarError::parse(0, format!("unexpected text before {marker}")));
+            return Err(CmdbarError::parse(
+                0,
+                format!("unexpected text before {marker}"),
+            ));
         }
         return match marker {
             "$CC" | "$CC1" => parse_command_phrase(src, idx, open_off).map(Phrase::Command),
@@ -142,7 +145,10 @@ fn find_matching_paren(src: &str, open_idx: usize) -> Result<usize> {
 fn parse_command_phrase(src: &str, idx: usize, open: usize) -> Result<CommandPhrase> {
     let marker = &src[idx..open];
     if open >= src.len() || src.as_bytes()[open] != b'(' {
-        return Err(CmdbarError::parse(idx, format!("expected '(' after {marker}")));
+        return Err(CmdbarError::parse(
+            idx,
+            format!("expected '(' after {marker}"),
+        ));
     }
     let end = find_matching_paren(src, open)?;
     let inner = &src[open + 1..end];
@@ -219,7 +225,10 @@ fn marker_defaults(marker: &str) -> Modifiers {
 fn parse_array_phrase(src: &str, idx: usize, open: usize) -> Result<Phrase> {
     let marker = &src[idx..open];
     if open >= src.len() || src.as_bytes()[open] != b'(' {
-        return Err(CmdbarError::parse(idx, format!("expected '(' after {marker}")));
+        return Err(CmdbarError::parse(
+            idx,
+            format!("expected '(' after {marker}"),
+        ));
     }
     let end = find_matching_paren(src, open)?;
     let inner = &src[open + 1..end];
@@ -264,8 +273,10 @@ fn parse_array_phrase(src: &str, idx: usize, open: usize) -> Result<Phrase> {
         other => {
             return Err(CmdbarError::parse(
                 open,
-                format!("{marker}: first argument must be a string literal (group name), got {other:?}"),
-            ))
+                format!(
+                    "{marker}: first argument must be a string literal (group name), got {other:?}"
+                ),
+            ));
         }
     };
 
@@ -296,7 +307,7 @@ fn parse_array_phrase(src: &str, idx: usize, open: usize) -> Result<Phrase> {
                         "{marker} element {}: must be string literal or $CC(...), got {other:?}",
                         i + 1
                     ),
-                ))
+                ));
             }
         }
     }
@@ -326,13 +337,16 @@ fn explode_aa_elements(elements: Vec<Expr>, marker: &str, open: usize) -> Result
     }
     let chars = match &elements[0] {
         Expr::StringLit(parts) => string_lit_to_plain(parts).map_err(|_| {
-            CmdbarError::parse(open, format!("{marker}: chars string must not contain interpolation"))
+            CmdbarError::parse(
+                open,
+                format!("{marker}: chars string must not contain interpolation"),
+            )
         })?,
         other => {
             return Err(CmdbarError::parse(
                 open,
                 format!("{marker}: chars argument must be a literal string, got {other:?}"),
-            ))
+            ));
         }
     };
     if chars.is_empty() {
@@ -397,10 +411,16 @@ fn split_array_args(inner: &str, base_off: usize) -> Result<Vec<ArgSpan<'_>>> {
         i += 1;
     }
     if in_string != 0 {
-        return Err(CmdbarError::parse(base_off, "unclosed string in array args"));
+        return Err(CmdbarError::parse(
+            base_off,
+            "unclosed string in array args",
+        ));
     }
     if depth != 0 {
-        return Err(CmdbarError::parse(base_off, "unbalanced brackets in array args"));
+        return Err(CmdbarError::parse(
+            base_off,
+            "unbalanced brackets in array args",
+        ));
     }
     out.push(ArgSpan {
         text: &inner[start..],
@@ -444,7 +464,10 @@ fn string_lit_to_plain(parts: &[StringPart]) -> Result<String> {
         match p {
             StringPart::Text(t) => s.push_str(t),
             StringPart::Interp(_) => {
-                return Err(CmdbarError::parse(0, "interpolation not allowed in group name"))
+                return Err(CmdbarError::parse(
+                    0,
+                    "interpolation not allowed in group name",
+                ));
             }
         }
     }
@@ -710,7 +733,10 @@ impl Parser {
             }
             let key = self.bump().lexeme;
             if self.peek().kind != TokenKind::Colon {
-                return Err(self.errf(self.peek().offset, format!("expected ':' after key {key:?}")));
+                return Err(self.errf(
+                    self.peek().offset,
+                    format!("expected ':' after key {key:?}"),
+                ));
             }
             self.bump(); // ':'
             let val = self.parse_modifier_value()?;
@@ -884,9 +910,18 @@ mod tests {
             Phrase::Array(a) => {
                 assert_eq!(a.name, "标点");
                 assert_eq!(a.elements.len(), 3);
-                assert_eq!(a.elements[0], Expr::StringLit(vec![StringPart::Text("、".into())]));
-                assert_eq!(a.elements[1], Expr::StringLit(vec![StringPart::Text("。".into())]));
-                assert_eq!(a.elements[2], Expr::StringLit(vec![StringPart::Text("·".into())]));
+                assert_eq!(
+                    a.elements[0],
+                    Expr::StringLit(vec![StringPart::Text("、".into())])
+                );
+                assert_eq!(
+                    a.elements[1],
+                    Expr::StringLit(vec![StringPart::Text("。".into())])
+                );
+                assert_eq!(
+                    a.elements[2],
+                    Expr::StringLit(vec![StringPart::Text("·".into())])
+                );
                 // 与 $SS 共享默认修饰符。
                 assert_eq!(a.modifiers.get_bool("prefix"), Some(true));
                 assert_eq!(a.modifiers.get_bool("nav"), Some(true));

@@ -168,13 +168,31 @@ pub struct MenuItemSpec {
 
 impl MenuItemSpec {
     pub fn leaf(label: impl Into<String>, kind: MenuKind, enabled: bool, checked: bool) -> Self {
-        Self { label: label.into(), kind, enabled, checked, children: Vec::new() }
+        Self {
+            label: label.into(),
+            kind,
+            enabled,
+            checked,
+            children: Vec::new(),
+        }
     }
     pub fn separator() -> Self {
-        Self { label: String::new(), kind: MenuKind::Separator, enabled: false, checked: false, children: Vec::new() }
+        Self {
+            label: String::new(),
+            kind: MenuKind::Separator,
+            enabled: false,
+            checked: false,
+            children: Vec::new(),
+        }
     }
     pub fn submenu(label: impl Into<String>, children: Vec<MenuItemSpec>) -> Self {
-        Self { label: label.into(), kind: MenuKind::Submenu, enabled: true, checked: false, children }
+        Self {
+            label: label.into(),
+            kind: MenuKind::Submenu,
+            enabled: true,
+            checked: false,
+            children,
+        }
     }
 }
 
@@ -358,118 +376,129 @@ impl UiManager {
             let had_cmd = !pending.is_empty();
             // 一轮处理完所有待办（候选更新已合并为至多一条），不留积压到下一轮
             while let Some(cmd) = pending.pop_front() {
-                    match cmd {
-                        UiCommand::UpdateCandidates {
-                            preedit,
-                            mode_label,
-                            candidates,
+                match cmd {
+                    UiCommand::UpdateCandidates {
+                        preedit,
+                        mode_label,
+                        candidates,
+                        selected,
+                        hover,
+                        page,
+                        total_pages,
+                        caret_x,
+                        caret_y,
+                        caret_height,
+                        caret_valid,
+                    } => {
+                        debug!(
+                            "UI: UpdateCandidates ({} items, selected={}, hover={}, page={}/{}, pos={},{})",
+                            candidates.len(),
                             selected,
                             hover,
                             page,
                             total_pages,
                             caret_x,
-                            caret_y,
-                            caret_height,
-                            caret_valid,
-                        } => {
-                            debug!(
-                                "UI: UpdateCandidates ({} items, selected={}, hover={}, page={}/{}, pos={},{})",
-                                candidates.len(),
-                                selected,
-                                hover,
-                                page,
-                                total_pages,
-                                caret_x,
-                                caret_y
-                            );
-                            candidate_window.update(&preedit, &mode_label, candidates, selected, hover, page, total_pages);
-                            candidate_window.set_position(caret_x, caret_y, caret_height, caret_valid);
-                            candidate_window.show();
-                        }
-                        UiCommand::HideCandidates => {
-                            debug!("UI: HideCandidates");
-                            candidate_window.hide();
-                            if let Some(m) = &mut popup_menu {
-                                m.hide();
-                            }
-                        }
-                        UiCommand::ShowCandidateMenu { items, x, y } => {
-                            debug!("UI: ShowMenu ({} items) at ({},{})", items.len(), x, y);
-                            if let Some(m) = &mut popup_menu {
-                                m.show(items, x, y);
-                            }
-                        }
-                        UiCommand::MenuKey(key) => {
-                            if let Some(m) = &mut popup_menu {
-                                m.on_key(key);
-                            }
-                        }
-                        UiCommand::HideMenu => {
-                            if let Some(m) = &mut popup_menu {
-                                m.hide();
-                            }
-                        }
-                        UiCommand::CopyToClipboard(text) => {
-                            crate::popup_menu::set_clipboard_text(&text);
-                        }
-                        UiCommand::OpenPath(path) => {
-                            open_path(&path);
-                        }
-                        UiCommand::ShowStatusTip { text, x, y } => {
-                            debug!("UI: ShowStatusTip '{}' at ({},{})", text, x, y);
-                            // 经防抖：合并快速连续提示，避免气泡闪烁
-                            tip_debounce.trigger((text, x, y));
-                        }
-                        UiCommand::UpdateToolbar(tb_state) => {
-                            debug!("UI: UpdateToolbar {:?}", tb_state);
-                            toolbar_hide_at = None; // 取消待定隐藏（切回本输入法 → 保持显示）
-                            if let Some(t) = &mut toolbar {
-                                t.update(&tb_state);
-                            }
-                        }
-                        UiCommand::HideToolbar => {
-                            debug!("UI: HideToolbar (debounced {}ms)", TOOLBAR_HIDE_DEBOUNCE.as_millis());
-                            // 延后隐藏：50ms 内若有 UpdateToolbar 则取消，消除应用间切换闪烁。
-                            toolbar_hide_at = Some(std::time::Instant::now() + TOOLBAR_HIDE_DEBOUNCE);
-                        }
-                        UiCommand::SetToolbarPos { x, y } => {
-                            debug!("UI: SetToolbarPos ({},{})", x, y);
-                            if let Some(t) = &mut toolbar {
-                                t.set_pos(x, y);
-                            }
-                        }
-                        UiCommand::SetTheme(theme) => {
-                            debug!("UI: SetTheme (dark={})", theme.is_dark);
-                            let t = *theme;
-                            if let Some(tb) = &mut toolbar {
-                                tb.set_theme(&t);
-                            }
-                            if let Some(m) = &mut popup_menu {
-                                m.set_theme(&t);
-                            }
-                            if let Some(st) = &mut status_tip {
-                                st.set_theme(&t);
-                            }
-                            candidate_window.set_theme(t); // 同时更新其 tooltip
-                        }
-                        UiCommand::SetCandidateLayout(vertical) => {
-                            candidate_window.set_vertical(vertical);
-                        }
-                        UiCommand::SetPreeditEmbedded(embedded) => {
-                            candidate_window.set_preedit_embedded(embedded);
-                        }
-                        UiCommand::Shutdown => {
-                            info!("UI: Shutdown");
-                            candidate_window.hide();
-                            if let Some(t) = &status_tip {
-                                t.hide();
-                            }
-                            if let Some(t) = &mut toolbar {
-                                t.hide();
-                            }
-                            break 'main;
+                            caret_y
+                        );
+                        candidate_window.update(
+                            &preedit,
+                            &mode_label,
+                            candidates,
+                            selected,
+                            hover,
+                            page,
+                            total_pages,
+                        );
+                        candidate_window.set_position(caret_x, caret_y, caret_height, caret_valid);
+                        candidate_window.show();
+                    }
+                    UiCommand::HideCandidates => {
+                        debug!("UI: HideCandidates");
+                        candidate_window.hide();
+                        if let Some(m) = &mut popup_menu {
+                            m.hide();
                         }
                     }
+                    UiCommand::ShowCandidateMenu { items, x, y } => {
+                        debug!("UI: ShowMenu ({} items) at ({},{})", items.len(), x, y);
+                        if let Some(m) = &mut popup_menu {
+                            m.show(items, x, y);
+                        }
+                    }
+                    UiCommand::MenuKey(key) => {
+                        if let Some(m) = &mut popup_menu {
+                            m.on_key(key);
+                        }
+                    }
+                    UiCommand::HideMenu => {
+                        if let Some(m) = &mut popup_menu {
+                            m.hide();
+                        }
+                    }
+                    UiCommand::CopyToClipboard(text) => {
+                        crate::popup_menu::set_clipboard_text(&text);
+                    }
+                    UiCommand::OpenPath(path) => {
+                        open_path(&path);
+                    }
+                    UiCommand::ShowStatusTip { text, x, y } => {
+                        debug!("UI: ShowStatusTip '{}' at ({},{})", text, x, y);
+                        // 经防抖：合并快速连续提示，避免气泡闪烁
+                        tip_debounce.trigger((text, x, y));
+                    }
+                    UiCommand::UpdateToolbar(tb_state) => {
+                        debug!("UI: UpdateToolbar {:?}", tb_state);
+                        toolbar_hide_at = None; // 取消待定隐藏（切回本输入法 → 保持显示）
+                        if let Some(t) = &mut toolbar {
+                            t.update(&tb_state);
+                        }
+                    }
+                    UiCommand::HideToolbar => {
+                        debug!(
+                            "UI: HideToolbar (debounced {}ms)",
+                            TOOLBAR_HIDE_DEBOUNCE.as_millis()
+                        );
+                        // 延后隐藏：50ms 内若有 UpdateToolbar 则取消，消除应用间切换闪烁。
+                        toolbar_hide_at = Some(std::time::Instant::now() + TOOLBAR_HIDE_DEBOUNCE);
+                    }
+                    UiCommand::SetToolbarPos { x, y } => {
+                        debug!("UI: SetToolbarPos ({},{})", x, y);
+                        if let Some(t) = &mut toolbar {
+                            t.set_pos(x, y);
+                        }
+                    }
+                    UiCommand::SetTheme(theme) => {
+                        debug!("UI: SetTheme (dark={})", theme.is_dark);
+                        let t = *theme;
+                        if let Some(tb) = &mut toolbar {
+                            tb.set_theme(&t);
+                        }
+                        if let Some(m) = &mut popup_menu {
+                            m.set_theme(&t);
+                        }
+                        if let Some(st) = &mut status_tip {
+                            st.set_theme(&t);
+                        }
+                        candidate_window.set_theme(t); // 同时更新其 tooltip
+                    }
+                    UiCommand::SetCandidateLayout(vertical) => {
+                        candidate_window.set_vertical(vertical);
+                    }
+                    UiCommand::SetPreeditEmbedded(embedded) => {
+                        candidate_window.set_preedit_embedded(embedded);
+                    }
+                    UiCommand::Shutdown => {
+                        info!("UI: Shutdown");
+                        candidate_window.hide();
+                        if let Some(t) = &status_tip {
+                            t.hide();
+                        }
+                        if let Some(t) = &mut toolbar {
+                            t.hide();
+                        }
+                        break 'main;
+                    }
+                }
             }
             if disconnected {
                 info!("UI: Channel disconnected, shutting down");
@@ -492,10 +521,10 @@ impl Drop for UiManager {
 /// 用资源管理器打开路径（best-effort）
 #[cfg(windows)]
 fn open_path(path: &str) {
-    use windows::core::PCWSTR;
     use windows::Win32::Foundation::HWND;
     use windows::Win32::UI::Shell::ShellExecuteW;
     use windows::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
+    use windows::core::PCWSTR;
     let verb: Vec<u16> = "open\0".encode_utf16().collect();
     let file: Vec<u16> = path.encode_utf16().chain(std::iter::once(0)).collect();
     unsafe {

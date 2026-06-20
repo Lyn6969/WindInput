@@ -120,7 +120,11 @@ fn parse_args(args: &[String]) -> anyhow::Result<(PathBuf, PathBuf)> {
         i += 1;
     }
     Ok((
-        rime.ok_or_else(|| anyhow::anyhow!("用法: gen_unigram --rime <cn_dicts_dir> --out <unigram.txt>"))?,
-        out.ok_or_else(|| anyhow::anyhow!("用法: gen_unigram --rime <cn_dicts_dir> --out <unigram.txt>"))?,
+        rime.ok_or_else(|| {
+            anyhow::anyhow!("用法: gen_unigram --rime <cn_dicts_dir> --out <unigram.txt>")
+        })?,
+        out.ok_or_else(|| {
+            anyhow::anyhow!("用法: gen_unigram --rime <cn_dicts_dir> --out <unigram.txt>")
+        })?,
     ))
 }

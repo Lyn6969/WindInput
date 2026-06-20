@@ -16,8 +16,8 @@ use std::collections::HashMap;
 use std::path::Path;
 use tracing::warn;
 use wind_cmdbar::{
-    default_registry, evaluate, evaluate_phrase, is_cmdbar_grammar, parse, Phrase, PhraseEval,
-    Services,
+    Phrase, PhraseEval, Services, default_registry, evaluate, evaluate_phrase, is_cmdbar_grammar,
+    parse,
 };
 
 /// 一条短语（同 code 下按 weight 降序、position 升序排列）

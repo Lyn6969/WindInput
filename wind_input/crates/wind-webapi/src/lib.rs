@@ -40,7 +40,11 @@ pub trait CoreStatus: Send + Sync {
     }
     /// 数据类 RPC（schema/dict/temp/freq/shadow/stats/theme/phrase）转发到宿主 core 实现。
     /// 默认未接入（dev server stub）：返回 unknown method 错误。
-    fn data_rpc(&self, method: &str, _params: &serde_json::Value) -> anyhow::Result<serde_json::Value> {
+    fn data_rpc(
+        &self,
+        method: &str,
+        _params: &serde_json::Value,
+    ) -> anyhow::Result<serde_json::Value> {
         anyhow::bail!("unknown method: {}", method)
     }
     /// 本机字体族名枚举（system.fonts）。默认空表（dev server / 无平台字体能力）。
@@ -86,7 +90,11 @@ fn build_router(state: Arc<WebState>) -> Router {
         .route("/local/web-config/open", post(local::open))
         .route("/local/web-config/close", post(local::close))
         .layer(from_fn(security::local_guard));
-    Router::new().merge(api).merge(events).merge(local).with_state(state)
+    Router::new()
+        .merge(api)
+        .merge(events)
+        .merge(local)
+        .with_state(state)
 }
 
 /// `/api/events`：SSE 事件流（query token 鉴权 + Origin 白名单 + CORS）。
@@ -109,7 +117,11 @@ async fn api_events(
         .get(ORIGIN)
         .and_then(|v| v.to_str().ok())
         .map(|s| s.to_string());
-    if !origin.as_deref().map(security::is_allowed_origin).unwrap_or(false) {
+    if !origin
+        .as_deref()
+        .map(security::is_allowed_origin)
+        .unwrap_or(false)
+    {
         return (StatusCode::FORBIDDEN, "forbidden: origin").into_response();
     }
     if !state.check_token(q.get("token").map(|s| s.as_str()).unwrap_or("")) {
@@ -117,7 +129,9 @@ async fn api_events(
     }
 
     let stream = futures::stream::pending::<Result<Event, std::convert::Infallible>>();
-    let mut resp = Sse::new(stream).keep_alive(KeepAlive::default()).into_response();
+    let mut resp = Sse::new(stream)
+        .keep_alive(KeepAlive::default())
+        .into_response();
     if let Some(o) = origin {
         if let Ok(v) = HeaderValue::from_str(&o) {
             resp.headers_mut().insert(ACCESS_CONTROL_ALLOW_ORIGIN, v);
@@ -200,7 +214,9 @@ mod tests {
         let (code, body) = rpc(st, Some(&tok), Some(DEV_ORIGIN), "system.manifest").await;
         assert_eq!(code, StatusCode::OK);
         let r = &body["result"];
-        for k in ["manifest", "app", "engine", "variant", "groups", "items", "features"] {
+        for k in [
+            "manifest", "app", "engine", "variant", "groups", "items", "features",
+        ] {
             assert!(r.get(k).is_some(), "manifest 缺字段 {k}");
         }
         assert!(r["items"].is_array() && r["groups"].is_array());
@@ -247,10 +263,7 @@ mod tests {
         assert!(b1["result"].is_object());
         let (c2, b2) = rpc(st, Some(&tok), Some(DEV_ORIGIN), "config.getDefaults").await;
         assert_eq!(c2, StatusCode::OK);
-        assert!(
-            b2["result"]["input"].is_object(),
-            "默认配置应含 input 段"
-        );
+        assert!(b2["result"]["input"].is_object(), "默认配置应含 input 段");
     }
 
     #[tokio::test]

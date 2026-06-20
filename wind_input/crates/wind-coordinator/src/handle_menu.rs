@@ -5,8 +5,8 @@
 
 use crate::coordinator::{Coordinator, FILTER_MODES, S2T_VARIANTS};
 use wind_bridge::handler::MessageHandler;
-use wind_keys::keymap;
 use wind_config::Config;
+use wind_keys::keymap;
 use wind_ui::manager::{CandidateOp, MenuCmd, MenuKind, ToolbarAction, UiCommand};
 use wind_ui::toolbar::ToolbarState;
 
@@ -317,7 +317,9 @@ impl Coordinator {
     /// 否则下发 HideToolbar。所有调用点（启动/切模式/切方案/激活/失活）经此单点决策，
     /// 不再各自直接显示，根治“工具栏总是显示、切走输入法不隐藏”。
     pub(crate) fn notify_toolbar(&self) {
-        let schema_label = self.engine_mgr.schema_name(&self.engine_mgr.active_schema_id());
+        let schema_label = self
+            .engine_mgr
+            .schema_name(&self.engine_mgr.active_schema_id());
         let s = self.state.lock().unwrap_or_else(|e| e.into_inner());
         if !(s.ime_active && s.toolbar_visible) {
             drop(s);

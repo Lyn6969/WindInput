@@ -959,11 +959,8 @@ fn test_candidate_op_move_top_and_delete() {
     let store_path = std::env::temp_dir().join("wind_candidate_op_test.redb");
     let _ = std::fs::remove_file(&store_path);
     let store = std::sync::Arc::new(wind_store::Store::open(&store_path).unwrap());
-    let coord = Coordinator::new_headless_with_store(
-        config_with("pinyin"),
-        Some(&data_dir()),
-        store,
-    );
+    let coord =
+        Coordinator::new_headless_with_store(config_with("pinyin"), Some(&data_dir()), store);
     // 拼音输入若干字母以获取多个候选
     for c in "shi".chars() {
         press_letter(&coord, c);
@@ -1031,7 +1028,10 @@ fn test_web_schema_get_config_and_encode_real() {
     assert!(cfg.get("engine").is_some(), "应含 engine 段");
     // dict.encode：拼音方案出拼音码；dict.genPinyin 同源。
     let code = coord
-        .web_data_rpc("dict.encode", &serde_json::json!({ "schemaId": "pinyin", "text": "你好" }))
+        .web_data_rpc(
+            "dict.encode",
+            &serde_json::json!({ "schemaId": "pinyin", "text": "你好" }),
+        )
         .unwrap();
     assert!(code.is_string(), "encode 应返回字符串");
 }
@@ -1048,8 +1048,13 @@ fn test_web_theme_preview_real() {
         .unwrap();
     assert!(prev.is_object(), "preview 应返回对象");
     // theme.list 至少含若干内置主题
-    let list = coord.web_data_rpc("theme.list", &serde_json::json!({})).unwrap();
-    assert!(list.as_array().map(|a| !a.is_empty()).unwrap_or(false), "应列出内置主题");
+    let list = coord
+        .web_data_rpc("theme.list", &serde_json::json!({}))
+        .unwrap();
+    assert!(
+        list.as_array().map(|a| !a.is_empty()).unwrap_or(false),
+        "应列出内置主题"
+    );
 }
 
 #[test]

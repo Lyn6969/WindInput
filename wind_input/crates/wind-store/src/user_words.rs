@@ -285,7 +285,11 @@ mod tests {
         for _ in 0..2 {
             s.on_word_selected("wb", "a", "工", 500, 3).unwrap();
         }
-        assert_eq!(s.get_user_words("wb", "a").unwrap()[0].weight, 0, "未到阈值不加权");
+        assert_eq!(
+            s.get_user_words("wb", "a").unwrap()[0].weight,
+            0,
+            "未到阈值不加权"
+        );
         s.on_word_selected("wb", "a", "工", 500, 3).unwrap();
         let r = s.get_user_words("wb", "a").unwrap();
         assert_eq!(r[0].count, 3);

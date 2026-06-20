@@ -27,9 +27,13 @@ fn fn_num(_: &dyn EvalContext, args: &[String]) -> Result<String> {
     let s = args[0].trim();
     let base = parse_arg_int("num", &args[1])?;
     if !matches!(base, 2 | 8 | 10 | 16) {
-        return Err(CmdbarError::runtime("num", format!("unsupported base {base}")));
+        return Err(CmdbarError::runtime(
+            "num",
+            format!("unsupported base {base}"),
+        ));
     }
-    let v = parse_int_auto(s).ok_or_else(|| CmdbarError::runtime("num", format!("invalid number {s:?}")))?;
+    let v = parse_int_auto(s)
+        .ok_or_else(|| CmdbarError::runtime("num", format!("invalid number {s:?}")))?;
     Ok(to_base(v, base as u32))
 }
 
@@ -196,14 +200,21 @@ impl ArithParser<'_> {
             let op = self.tok;
             self.next();
             let rhs = self.parse_term()?;
-            lhs = if op == ArithTok::Plus { lhs + rhs } else { lhs - rhs };
+            lhs = if op == ArithTok::Plus {
+                lhs + rhs
+            } else {
+                lhs - rhs
+            };
         }
         Ok(lhs)
     }
 
     fn parse_term(&mut self) -> std::result::Result<f64, String> {
         let mut lhs = self.parse_unary()?;
-        while matches!(self.tok, ArithTok::Star | ArithTok::Slash | ArithTok::Percent) {
+        while matches!(
+            self.tok,
+            ArithTok::Star | ArithTok::Slash | ArithTok::Percent
+        ) {
             let op = self.tok;
             self.next();
             let rhs = self.parse_unary()?;

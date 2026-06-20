@@ -85,11 +85,7 @@ impl History {
     /// 当前条目数。
     pub fn len(&self) -> usize {
         let h = self.inner.lock().unwrap_or_else(|e| e.into_inner());
-        if h.full {
-            h.cap
-        } else {
-            h.head
-        }
+        if h.full { h.cap } else { h.head }
     }
 
     pub fn is_empty(&self) -> bool {

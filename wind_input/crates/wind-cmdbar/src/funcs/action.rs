@@ -30,23 +30,34 @@ pub fn specs() -> Vec<FuncSpec> {
 
 fn fn_open(ctx: &dyn EvalContext, args: &[String]) -> Result<String> {
     let s = services("open", ctx)?;
-    let open = s.open.as_ref().ok_or_else(|| CmdbarError::service("open"))?;
+    let open = s
+        .open
+        .as_ref()
+        .ok_or_else(|| CmdbarError::service("open"))?;
     open.open(&args[0]).map_err(|e| runtime_err("open", e))?;
     Ok(String::new())
 }
 
 fn fn_run(ctx: &dyn EvalContext, args: &[String]) -> Result<String> {
     let s = services("proc.run", ctx)?;
-    let proc = s.proc.as_ref().ok_or_else(|| CmdbarError::service("proc.run"))?;
-    proc.run(&args[0], &args[1..]).map_err(|e| runtime_err("proc.run", e))?;
+    let proc = s
+        .proc
+        .as_ref()
+        .ok_or_else(|| CmdbarError::service("proc.run"))?;
+    proc.run(&args[0], &args[1..])
+        .map_err(|e| runtime_err("proc.run", e))?;
     Ok(String::new())
 }
 
 fn fn_shell(ctx: &dyn EvalContext, args: &[String]) -> Result<String> {
     let s = services("proc.shell", ctx)?;
-    let proc = s.proc.as_ref().ok_or_else(|| CmdbarError::service("proc.shell"))?;
+    let proc = s
+        .proc
+        .as_ref()
+        .ok_or_else(|| CmdbarError::service("proc.shell"))?;
     if args.len() == 1 {
-        proc.shell(&args[0]).map_err(|e| runtime_err("proc.shell", e))?;
+        proc.shell(&args[0])
+            .map_err(|e| runtime_err("proc.shell", e))?;
     } else {
         let flags: Vec<String> = args[1]
             .split(',')
@@ -54,7 +65,8 @@ fn fn_shell(ctx: &dyn EvalContext, args: &[String]) -> Result<String> {
             .filter(|p| !p.is_empty())
             .map(|p| p.to_string())
             .collect();
-        proc.shell_ex(&args[0], &flags).map_err(|e| runtime_err("proc.shell", e))?;
+        proc.shell_ex(&args[0], &flags)
+            .map_err(|e| runtime_err("proc.shell", e))?;
     }
     Ok(String::new())
 }
@@ -73,19 +85,22 @@ fn fn_key_seq(ctx: &dyn EvalContext, args: &[String]) -> Result<String> {
 
 fn fn_key_hold(ctx: &dyn EvalContext, args: &[String]) -> Result<String> {
     let keys = keys(ctx, "key.hold")?;
-    keys.hold(&args[0]).map_err(|e| runtime_err("key.hold", e))?;
+    keys.hold(&args[0])
+        .map_err(|e| runtime_err("key.hold", e))?;
     Ok(String::new())
 }
 
 fn fn_key_release(ctx: &dyn EvalContext, args: &[String]) -> Result<String> {
     let keys = keys(ctx, "key.release")?;
-    keys.release(&args[0]).map_err(|e| runtime_err("key.release", e))?;
+    keys.release(&args[0])
+        .map_err(|e| runtime_err("key.release", e))?;
     Ok(String::new())
 }
 
 fn fn_key_type(ctx: &dyn EvalContext, args: &[String]) -> Result<String> {
     let keys = keys(ctx, "key.type")?;
-    keys.type_text(&args[0]).map_err(|e| runtime_err("key.type", e))?;
+    keys.type_text(&args[0])
+        .map_err(|e| runtime_err("key.type", e))?;
     Ok(String::new())
 }
 
@@ -94,19 +109,28 @@ fn keys<'a>(
     func: &str,
 ) -> Result<&'a std::sync::Arc<dyn crate::services::KeyInjector>> {
     let s = services(func, ctx)?;
-    s.keys.as_ref().ok_or_else(|| CmdbarError::service(func.to_string()))
+    s.keys
+        .as_ref()
+        .ok_or_else(|| CmdbarError::service(func.to_string()))
 }
 
 fn fn_clip_copy(ctx: &dyn EvalContext, args: &[String]) -> Result<String> {
     let s = services("clip.copy", ctx)?;
-    let clip = s.clip.as_ref().ok_or_else(|| CmdbarError::service("clip.copy"))?;
-    clip.set_text(&args[0]).map_err(|e| runtime_err("clip.copy", e))?;
+    let clip = s
+        .clip
+        .as_ref()
+        .ok_or_else(|| CmdbarError::service("clip.copy"))?;
+    clip.set_text(&args[0])
+        .map_err(|e| runtime_err("clip.copy", e))?;
     Ok(String::new())
 }
 
 fn fn_clip_paste(ctx: &dyn EvalContext, _args: &[String]) -> Result<String> {
     let s = services("clip.paste", ctx)?;
-    let clip = s.clip.as_ref().ok_or_else(|| CmdbarError::service("clip.paste"))?;
+    let clip = s
+        .clip
+        .as_ref()
+        .ok_or_else(|| CmdbarError::service("clip.paste"))?;
     clip.paste().map_err(|e| runtime_err("clip.paste", e))?;
     Ok(String::new())
 }
@@ -125,7 +149,9 @@ fn fn_search(ctx: &dyn EvalContext, args: &[String]) -> Result<String> {
     let query = &args[1];
     // 宿主自定义搜索优先。
     if let Some(search) = &s.search {
-        search.search(&engine, query).map_err(|e| runtime_err("web.search", e))?;
+        search
+            .search(&engine, query)
+            .map_err(|e| runtime_err("web.search", e))?;
         return Ok(String::new());
     }
     // 默认：合成 URL 转发给 open。
@@ -134,9 +160,13 @@ fn fn_search(ctx: &dyn EvalContext, args: &[String]) -> Result<String> {
         .find(|(k, _)| *k == engine)
         .map(|(_, v)| *v)
         .ok_or_else(|| CmdbarError::runtime("web.search", format!("unknown engine {engine:?}")))?;
-    let open = s.open.as_ref().ok_or_else(|| CmdbarError::service("web.search"))?;
+    let open = s
+        .open
+        .as_ref()
+        .ok_or_else(|| CmdbarError::service("web.search"))?;
     let target = format!("{prefix}{}", super::text::query_escape(query));
-    open.open(&target).map_err(|e| runtime_err("web.search", e))?;
+    open.open(&target)
+        .map_err(|e| runtime_err("web.search", e))?;
     Ok(String::new())
 }
 
@@ -179,10 +209,7 @@ mod tests {
         svc.open = Some(rec.clone());
         let ctx = MemoryContext::new().with_services(svc);
         fn_search(&ctx, &["baidu".into(), "a b".into()]).unwrap();
-        assert_eq!(
-            rec.0.lock().unwrap()[0],
-            "https://www.baidu.com/s?wd=a+b"
-        );
+        assert_eq!(rec.0.lock().unwrap()[0], "https://www.baidu.com/s?wd=a+b");
     }
 
     #[test]
@@ -193,7 +220,10 @@ mod tests {
         struct RecProc(Mutex<Vec<String>>);
         impl ProcessRunner for RecProc {
             fn run(&self, cmd: &str, args: &[String]) -> anyhow::Result<()> {
-                self.0.lock().unwrap().push(format!("run:{cmd}:{}", args.join(",")));
+                self.0
+                    .lock()
+                    .unwrap()
+                    .push(format!("run:{cmd}:{}", args.join(",")));
                 Ok(())
             }
             fn shell(&self, cmdline: &str) -> anyhow::Result<()> {
@@ -201,7 +231,10 @@ mod tests {
                 Ok(())
             }
             fn shell_ex(&self, cmdline: &str, flags: &[String]) -> anyhow::Result<()> {
-                self.0.lock().unwrap().push(format!("shellex:{cmdline}:{}", flags.join("|")));
+                self.0
+                    .lock()
+                    .unwrap()
+                    .push(format!("shellex:{cmdline}:{}", flags.join("|")));
                 Ok(())
             }
         }

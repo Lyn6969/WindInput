@@ -50,8 +50,14 @@ impl PunctuationConverter {
             return None;
         }
         let (key, is_quote) = match c {
-            '"' => (if self.double_quote_left { "\"1" } else { "\"2" }.to_string(), true),
-            '\'' => (if self.single_quote_left { "'1" } else { "'2" }.to_string(), true),
+            '"' => (
+                if self.double_quote_left { "\"1" } else { "\"2" }.to_string(),
+                true,
+            ),
+            '\'' => (
+                if self.single_quote_left { "'1" } else { "'2" }.to_string(),
+                true,
+            ),
             _ => (c.to_string(), false),
         };
         let vals = self.custom_mappings.get(&key)?;
@@ -73,8 +79,22 @@ impl PunctuationConverter {
     /// 对齐 Go `PeekChineseStr`。返回 None 表示该键无中文标点映射。
     pub fn peek_chinese_str(&self, c: char) -> Option<String> {
         match c {
-            '\'' => Some(if self.single_quote_left { '\u{2018}' } else { '\u{2019}' }.to_string()),
-            '"' => Some(if self.double_quote_left { '\u{201C}' } else { '\u{201D}' }.to_string()),
+            '\'' => Some(
+                if self.single_quote_left {
+                    '\u{2018}'
+                } else {
+                    '\u{2019}'
+                }
+                .to_string(),
+            ),
+            '"' => Some(
+                if self.double_quote_left {
+                    '\u{201C}'
+                } else {
+                    '\u{201D}'
+                }
+                .to_string(),
+            ),
             _ => Self::static_chinese(c),
         }
     }
@@ -126,12 +146,20 @@ impl PunctuationConverter {
         // 引号需切换左右
         match c {
             '\'' => {
-                let r = if self.single_quote_left { '\u{2018}' } else { '\u{2019}' };
+                let r = if self.single_quote_left {
+                    '\u{2018}'
+                } else {
+                    '\u{2019}'
+                };
                 self.single_quote_left = !self.single_quote_left;
                 return Some(r.to_string());
             }
             '"' => {
-                let r = if self.double_quote_left { '\u{201C}' } else { '\u{201D}' };
+                let r = if self.double_quote_left {
+                    '\u{201C}'
+                } else {
+                    '\u{201D}'
+                };
                 self.double_quote_left = !self.double_quote_left;
                 return Some(r.to_string());
             }

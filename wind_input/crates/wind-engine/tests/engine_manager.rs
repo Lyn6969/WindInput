@@ -101,7 +101,10 @@ fn test_pinyin_engine_candidates() {
         .map(|c| c.text.as_str())
         .collect();
     // 整句应在首位（SENTENCE_WEIGHT_BASE 置顶）。
-    assert_eq!(result.candidates[0].text, "你好", "首候选应为 你好，实际: {top10:?}");
+    assert_eq!(
+        result.candidates[0].text, "你好",
+        "首候选应为 你好，实际: {top10:?}"
+    );
     // 前缀子候选「你」应存在并标注只消费「ni」（分段上屏）。
     let ni = result.candidates.iter().find(|c| c.text == "你");
     assert!(ni.is_some(), "应包含前缀候选 你，实际: {top10:?}");
@@ -168,7 +171,10 @@ fn test_mixed_wubi_priority_and_consistency() {
         .take(6)
         .map(|c| c.text.as_str())
         .collect();
-    assert_eq!(r.candidates[0].text, "駏", "cang 首候选应为五笔精确码 駏，实际: {top:?}");
+    assert_eq!(
+        r.candidates[0].text, "駏",
+        "cang 首候选应为五笔精确码 駏，实际: {top:?}"
+    );
     // 一致性：若放行全码自动上屏，commit_text 必等于显示首候选（杜绝显示/上屏漂移）。
     if r.should_commit {
         assert_eq!(
@@ -177,7 +183,10 @@ fn test_mixed_wubi_priority_and_consistency() {
         );
     }
     // 拼音「藏」仍在候选中（可选），只是不在首位。
-    assert!(r.candidates.iter().any(|c| c.text == "藏"), "藏 应仍可选: {top:?}");
+    assert!(
+        r.candidates.iter().any(|c| c.text == "藏"),
+        "藏 应仍可选: {top:?}"
+    );
 }
 
 #[test]
@@ -217,7 +226,10 @@ fn test_pinyin_trailing_partial_keeps_sentence() {
         .take(8)
         .map(|c| c.text.as_str())
         .collect();
-    assert_eq!(r.candidates[0].text, "你好", "首候选应为 你好（残码不破坏整句），实际: {top:?}");
+    assert_eq!(
+        r.candidates[0].text, "你好",
+        "首候选应为 你好（残码不破坏整句），实际: {top:?}"
+    );
     assert_eq!(
         r.candidates[0].consumed_length, 5,
         "你好 应只消费 nihao 五字节，残码 m 留缓冲"

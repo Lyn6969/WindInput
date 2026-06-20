@@ -77,8 +77,8 @@ fn fn_replace(_: &dyn EvalContext, args: &[String]) -> Result<String> {
 }
 
 fn fn_regex(_: &dyn EvalContext, args: &[String]) -> Result<String> {
-    let re = regex::Regex::new(&args[1])
-        .map_err(|e| CmdbarError::runtime("regex", e.to_string()))?;
+    let re =
+        regex::Regex::new(&args[1]).map_err(|e| CmdbarError::runtime("regex", e.to_string()))?;
     Ok(re.replace_all(&args[0], args[2].as_str()).into_owned())
 }
 

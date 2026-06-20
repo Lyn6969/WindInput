@@ -7,7 +7,7 @@
 //! （短语数量少、写入低频，JSON 足够）。系统短语来自 data/system.phrases.toml（wind-phrase
 //! 层），此处只存**用户**短语；resetDefault = 清空用户短语。
 
-use crate::store::{Store, PHRASES};
+use crate::store::{PHRASES, Store};
 use redb::ReadableTable;
 use serde::{Deserialize, Serialize};
 
@@ -59,9 +59,10 @@ impl Store {
             let mut out = Vec::new();
             for item in t.range::<&str>(..)? {
                 let (k, v) = item?;
-                if let (Some((code, text)), Ok(val)) =
-                    (split_phrase_key(k.value()), serde_json::from_slice::<PhraseValue>(v.value()))
-                {
+                if let (Some((code, text)), Ok(val)) = (
+                    split_phrase_key(k.value()),
+                    serde_json::from_slice::<PhraseValue>(v.value()),
+                ) {
                     out.push(PhraseRecord {
                         code: code.to_string(),
                         text: text.to_string(),
@@ -87,7 +88,12 @@ impl Store {
         self.put_phrase(
             code,
             text,
-            PhraseValue { weight, position, enabled: true, is_system: false },
+            PhraseValue {
+                weight,
+                position,
+                enabled: true,
+                is_system: false,
+            },
         )
     }
 
@@ -218,11 +224,17 @@ mod tests {
 
         // 启停
         s.set_phrase_enabled("rq", "2026-06-20", false).unwrap();
-        let rq = s.list_phrases().unwrap().into_iter().find(|p| p.code == "rq").unwrap();
+        let rq = s
+            .list_phrases()
+            .unwrap()
+            .into_iter()
+            .find(|p| p.code == "rq")
+            .unwrap();
         assert!(!rq.enabled);
 
         // 改 code（键迁移）
-        s.update_phrase("yx", "user@example.com", Some("mail"), None, None, Some(5)).unwrap();
+        s.update_phrase("yx", "user@example.com", Some("mail"), None, None, Some(5))
+            .unwrap();
         let list = s.list_phrases().unwrap();
         assert!(list.iter().any(|p| p.code == "mail" && p.weight == 5));
         assert!(!list.iter().any(|p| p.code == "yx"));

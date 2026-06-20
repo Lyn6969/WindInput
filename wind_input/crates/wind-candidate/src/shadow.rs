@@ -11,7 +11,11 @@ use crate::candidate::Candidate;
 ///      考虑前面已就位的项，位置越界时钳到末尾。
 ///
 /// `pinned` 用 `(String, usize)` 元组而非 store 的 ShadowPin，使本 crate 不依赖 wind-store。
-pub fn apply_shadow(candidates: &mut Vec<Candidate>, deleted: &[String], pinned: &[(String, usize)]) {
+pub fn apply_shadow(
+    candidates: &mut Vec<Candidate>,
+    deleted: &[String],
+    pinned: &[(String, usize)],
+) {
     if !deleted.is_empty() {
         candidates.retain(|c| !deleted.iter().any(|d| d == &c.text));
     }

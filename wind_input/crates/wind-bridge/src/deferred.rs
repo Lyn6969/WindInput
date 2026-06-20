@@ -87,7 +87,9 @@ impl MessageHandler for DeferredHandler {
     }
 
     fn handle_system_mode_switch(&self, chinese_mode: bool) -> (Option<StatusUpdateData>, String) {
-        self.with_handler((None, String::new()), |h| h.handle_system_mode_switch(chinese_mode))
+        self.with_handler((None, String::new()), |h| {
+            h.handle_system_mode_switch(chinese_mode)
+        })
     }
 
     fn handle_menu_command(&self, command: &str) -> Option<StatusUpdateData> {

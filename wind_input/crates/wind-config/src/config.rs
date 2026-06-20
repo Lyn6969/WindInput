@@ -995,7 +995,13 @@ mod tests {
         assert_eq!(t.get("keep").unwrap().as_str(), Some("x"));
         // 嵌套创建
         assert_eq!(
-            t.get("ui").unwrap().get("candidate").unwrap().get("preedit_mode").unwrap().as_str(),
+            t.get("ui")
+                .unwrap()
+                .get("candidate")
+                .unwrap()
+                .get("preedit_mode")
+                .unwrap()
+                .as_str(),
             Some("embedded")
         );
         assert_eq!(
@@ -1009,7 +1015,13 @@ mod tests {
             toml::Value::String("top".into()),
         );
         assert_eq!(
-            t.get("ui").unwrap().get("candidate").unwrap().get("preedit_mode").unwrap().as_str(),
+            t.get("ui")
+                .unwrap()
+                .get("candidate")
+                .unwrap()
+                .get("preedit_mode")
+                .unwrap()
+                .as_str(),
             Some("top")
         );
         // 其它兄弟键不受影响

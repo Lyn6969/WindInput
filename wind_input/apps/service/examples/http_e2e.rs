@@ -32,7 +32,9 @@ impl wind_webapi::CoreStatus for WebStatus {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    tracing_subscriber::fmt().with_max_level(tracing::Level::WARN).init();
+    tracing_subscriber::fmt()
+        .with_max_level(tracing::Level::WARN)
+        .init();
 
     let data_dir = std::env::args()
         .nth(1)
@@ -46,8 +48,7 @@ async fn main() -> anyhow::Result<()> {
 
     // 从 data_dir 载入 config（含 active schema）；失败回退默认。
     let cfg = wind_config::Config::load(Some(&data_dir)).unwrap_or_default();
-    let coord =
-        wind_coordinator::Coordinator::new_headless_with_store(cfg, Some(&data_dir), store);
+    let coord = wind_coordinator::Coordinator::new_headless_with_store(cfg, Some(&data_dir), store);
 
     let status: Arc<dyn wind_webapi::CoreStatus> = Arc::new(WebStatus(coord));
     // serve 在 WIND_DEV=1 时打印可用 URL（port+token）。一直 await。

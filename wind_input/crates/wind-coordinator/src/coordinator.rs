@@ -10,11 +10,11 @@
 //!
 //! 候选生成委托给 [`EngineManager`]，运行时词频 boost + 最终排序在本层应用。
 
-use wind_keys::keymap;
 use crate::pipeline::{ModeKind, Rewind};
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 use tracing::{debug, info, warn};
+use wind_keys::keymap;
 
 use wind_bridge::handler::*;
 use wind_bridge::push::{PushConfig, PushServer};
@@ -491,7 +491,13 @@ impl Coordinator {
             .clone();
         coordinator.push_theme(&name, false);
         // 下发候选布局方向（ui.candidate.layout == "vertical"）。
-        let vertical = coordinator.rt().config.ui.candidate.layout.eq_ignore_ascii_case("vertical");
+        let vertical = coordinator
+            .rt()
+            .config
+            .ui
+            .candidate
+            .layout
+            .eq_ignore_ascii_case("vertical");
         let _ = coordinator
             .ui_tx
             .send(UiCommand::SetCandidateLayout(vertical));
@@ -630,11 +636,7 @@ impl Coordinator {
         let preedit_display_init = config.ui.candidate.preedit();
 
         // 候选布局方向运行时初值（与下方 SetCandidateLayout 下发一致；config 移入前先算）。
-        let candidate_vertical_init = config
-            .ui
-            .candidate
-            .layout
-            .eq_ignore_ascii_case("vertical");
+        let candidate_vertical_init = config.ui.candidate.layout.eq_ignore_ascii_case("vertical");
 
         // 候选窗显隐运行时初值（ui.candidate.hide_window；此前恒为 false，配置不生效）。
         let hide_candidate_window_init = config.ui.candidate.hide_window;
@@ -718,7 +720,6 @@ impl Coordinator {
         coordinator
     }
 
-
     /// 上屏历史快照（index 0 = 最近）。供命令栏 `last(n)` 读取。
     pub(crate) fn recent_commits_snapshot(&self) -> Vec<String> {
         self.recent_commits
@@ -728,7 +729,6 @@ impl Coordinator {
             .cloned()
             .collect()
     }
-
 
     /// 取当前「配置 + 派生缓存」快照（Arc 克隆，开销低）。所有配置读取经此。
     pub(crate) fn rt(&self) -> std::sync::Arc<ConfigBundle> {
@@ -787,15 +787,26 @@ impl Coordinator {
         let cand = &bundle.config.ui.candidate;
         // 候选排列方向（ui.candidate.layout == "vertical"）
         let vertical = cand.layout.eq_ignore_ascii_case("vertical");
-        *self.candidate_vertical.lock().unwrap_or_else(|e| e.into_inner()) = vertical;
+        *self
+            .candidate_vertical
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = vertical;
         let _ = self.ui_tx.send(UiCommand::SetCandidateLayout(vertical));
         // 编码显示方式（ui.candidate.preedit_display）
         let mode = cand.preedit();
-        *self.preedit_display.lock().unwrap_or_else(|e| e.into_inner()) = mode;
-        let _ = self.ui_tx.send(UiCommand::SetPreeditEmbedded(mode.embedded()));
+        *self
+            .preedit_display
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = mode;
+        let _ = self
+            .ui_tx
+            .send(UiCommand::SetPreeditEmbedded(mode.embedded()));
         // 候选窗显隐（ui.candidate.hide_window）
         let hidden = cand.hide_window;
-        *self.hide_candidate_window.lock().unwrap_or_else(|e| e.into_inner()) = hidden;
+        *self
+            .hide_candidate_window
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = hidden;
         if hidden {
             let _ = self.ui_tx.send(UiCommand::HideCandidates);
         }
@@ -813,8 +824,6 @@ impl Coordinator {
             .unwrap_or_else(|e| e.into_inner())
             .chinese_mode
     }
-
-
 
     /// 是否还有更多候选未加载（测试/诊断用）
     pub fn debug_has_more(&self) -> bool {
@@ -850,26 +859,16 @@ impl Coordinator {
             .collect()
     }
 
-
-
-
-
-
-
-
     /// 每页候选数（来自配置，至少 1）
     pub(crate) fn per_page(&self) -> usize {
         self.rt().config.ui.candidate.per_page.max(1)
     }
-
 
     /// 总页数（至少 1）
     fn total_pages(&self, state: &State) -> usize {
         let pp = self.per_page();
         state.candidates.len().div_ceil(pp).max(1)
     }
-
-
 
     /// 上移高亮（页首回卷到上一页末项）；返回是否变化
     fn move_up(&self, state: &mut State) -> bool {
@@ -969,72 +968,15 @@ impl Coordinator {
         Some(KeyAction::Consumed)
     }
 
-
     // ───────────────────────── 临时拼音 ─────────────────────────
-
-
-
-
-
-
-
 
     // ───────────────────────── 快捷输入 ─────────────────────────
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
     // ───────────────────────── 临时英文 ─────────────────────────
-
-
-
-
-
-
-
-
-
 
     // ───────────────────────── 特殊模式 ─────────────────────────
 
-
-
-
-
-
-
-
-
     // ───────────────────────── 临时 mix 模式 ─────────────────────────
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 
     /// 取出并清空「已转换前缀」（简体），用于非选词的终结性上屏（回车/空格上屏原码/标点键）。
     /// 码表模式恒为空串，无副作用。
@@ -1053,12 +995,6 @@ impl Coordinator {
         state.current_page = 0;
         state.selected_index = 0;
     }
-
-
-
-
-
-
 
     /// cmdbar 能力 wrapper（被 handle_cmdbar 控制器经 Weak 回调）。各方法自锁，**禁止**在持
     /// state 锁时调用（spawn_command 已确保在独立线程、未持锁时执行）。
@@ -1082,7 +1018,10 @@ impl Coordinator {
             "candwin" => self.cmd_toggle_candwin(),
             "layout" => self.cmd_toggle_layout(),
             other => {
-                warn!("ime.toggle: 暂不支持 target {:?}（Rust 平台能力待补）", other)
+                warn!(
+                    "ime.toggle: 暂不支持 target {:?}（Rust 平台能力待补）",
+                    other
+                )
             }
         }
     }
@@ -1098,7 +1037,9 @@ impl Coordinator {
             *m
         };
         // 候选窗内联标志（仅 candidate_inline 为 true）；in_app 由 notify_ui_update 读运行时态门控。
-        let _ = self.ui_tx.send(UiCommand::SetPreeditEmbedded(mode.embedded()));
+        let _ = self
+            .ui_tx
+            .send(UiCommand::SetPreeditEmbedded(mode.embedded()));
         // 持久化到用户层 ui.candidate.preedit_display（重启后保留）。
         if let Err(e) =
             Config::set_user_string(&["ui", "candidate", "preedit_display"], mode.as_config())
@@ -1121,7 +1062,11 @@ impl Coordinator {
         if hidden {
             let _ = self.ui_tx.send(UiCommand::HideCandidates);
         }
-        self.show_tip(if hidden { "候选窗:隐藏" } else { "候选窗:显示" });
+        self.show_tip(if hidden {
+            "候选窗:隐藏"
+        } else {
+            "候选窗:显示"
+        });
     }
 
     /// 切换候选布局方向（横排 ↔ 竖排），下发 UI 并持久化。命令栏 ime.toggle("layout")。
@@ -1143,12 +1088,12 @@ impl Coordinator {
         ) {
             warn!("ime.toggle layout: 持久化失败: {}", e);
         }
-        self.show_tip(if vertical { "候选:竖排" } else { "候选:横排" });
+        self.show_tip(if vertical {
+            "候选:竖排"
+        } else {
+            "候选:横排"
+        });
     }
-
-
-
-
 
     pub(crate) fn notify_ui_update(&self, state: &State) {
         // 模式指示标记（拼/双/快/英/符）：仅在候选为空时显示（进入模式/无候选阶段），
@@ -1291,12 +1236,6 @@ impl Coordinator {
         }
     }
 
-
-
-
-
-
-
     /// 切换检索范围（0 智能/1 常用字/2 全部字符），以新范围重过滤并刷新候选。
     pub(crate) fn set_filter_mode(&self, index: usize) {
         let (mode, label) = match FILTER_MODES.get(index) {
@@ -1320,19 +1259,6 @@ impl Coordinator {
         self.show_tip(label);
     }
 
-
-
-
-
-
-
-
-
-
-
-
-
-
     /// 影子规则：当前 code 是否对 word 有规则（置顶/删除），决定菜单"恢复默认"可用性。
     pub(crate) fn shadow_has_rule(&self, schema: &str, code: &str, word: &str) -> bool {
         let Some(store) = &self.store else {
@@ -1344,8 +1270,6 @@ impl Coordinator {
                 if rec.pinned.iter().any(|p| p.word == word) || rec.deleted.iter().any(|d| d == word)
         )
     }
-
-
 
     /// 当前模式下生效的配对表（按中/英标点 + 各自开关）
     fn active_pairs(&self, chinese_punct: bool) -> Option<Vec<(char, char)>> {
@@ -1368,8 +1292,6 @@ impl Coordinator {
             None => false,
         }
     }
-
-
 
     /// 滚轮翻页：dir<0 上一页，dir>0 下一页；仅重绘候选窗，不上屏。
     fn mouse_page(&self, dir: i32) {
@@ -1465,7 +1387,6 @@ impl Coordinator {
         self.push_server.push_to_active(&encoded);
     }
 
-
     /// 在当前光标上方显示状态提示气泡（中英/标点/全半角/方案切换）
     pub(crate) fn show_tip(&self, text: &str) {
         let (x, y) = {
@@ -1478,10 +1399,6 @@ impl Coordinator {
             y,
         });
     }
-
-
-
-
 
     /// 分发热键动作；返回是否已处理
     fn dispatch_hotkey(&self, action: &str) -> bool {
@@ -1535,9 +1452,6 @@ impl Coordinator {
             }
         }
     }
-
-
-
 
     /// 切换中英文时取消当前输入：清空缓冲/候选/preedit，并按 `hotkeys.commit_on_switch`
     /// 决定是否把已输入的原始编码上屏（仅在切到英文且有待输入时）。返回待上屏文本。
@@ -1722,16 +1636,17 @@ impl MessageHandler for Coordinator {
         let norm_mods = data.modifiers & hotkey::MOD_GENERIC_MASK;
         let norm_hash = calc_key_hash(norm_mods, data.key_code);
         if let Some(action) = self.rt().compiled_hotkeys.match_key_down(norm_hash)
-            && !action.is_empty() {
-                debug!(
-                    "Hotkey matched (key_down): {} (0x{:08X})",
-                    action, norm_hash
-                );
-                let action = action.to_string();
-                if self.dispatch_hotkey(&action) {
-                    return KeyAction::StatusUpdate(self.build_status());
-                }
+            && !action.is_empty()
+        {
+            debug!(
+                "Hotkey matched (key_down): {} (0x{:08X})",
+                action, norm_hash
+            );
+            let action = action.to_string();
+            if self.dispatch_hotkey(&action) {
+                return KeyAction::StatusUpdate(self.build_status());
             }
+        }
 
         let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
 
@@ -1811,8 +1726,11 @@ impl MessageHandler for Coordinator {
                 // 缓冲前部、重转），否则删剩余拼音末字符。
                 if !state.committed_segs.is_empty() {
                     let (code, _) = state.committed_segs.pop().unwrap();
-                    state.committed_text =
-                        state.committed_segs.iter().map(|(_, t)| t.as_str()).collect();
+                    state.committed_text = state
+                        .committed_segs
+                        .iter()
+                        .map(|(_, t)| t.as_str())
+                        .collect();
                     state.input_buffer = format!("{}{}", code, state.input_buffer);
                     self.update_candidates(&mut state);
                     let display = state.preedit.clone();
@@ -1972,13 +1890,14 @@ impl MessageHandler for Coordinator {
                         return self.commit_and_enter_quick_input(&mut state, data.key_code);
                     }
                     if self.is_temp_pinyin_trigger(data.key_code)
-                        && let Some(target) = self.engine_mgr.temp_pinyin_target() {
-                            return self.commit_and_enter_temp_pinyin(
-                                &mut state,
-                                data.key_code,
-                                target,
-                            );
-                        }
+                        && let Some(target) = self.engine_mgr.temp_pinyin_target()
+                    {
+                        return self.commit_and_enter_temp_pinyin(
+                            &mut state,
+                            data.key_code,
+                            target,
+                        );
+                    }
                 }
                 if let Some(ch) = punct_char(data.key_code, shift) {
                     // 智能符号模式：同键连按删中文标点改英文（press2 短路返回）。
@@ -2163,7 +2082,6 @@ impl MessageHandler for Coordinator {
         (Some(self.build_status()), commit_text)
     }
 
-
     fn handle_composition_terminated(&self) {
         let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
         state.input_buffer.clear();
@@ -2236,7 +2154,6 @@ impl MessageHandler for Coordinator {
 
     fn handle_host_render_request(&self) {}
     fn handle_host_render_ready(&self) {}
-
 }
 
 #[cfg(test)]

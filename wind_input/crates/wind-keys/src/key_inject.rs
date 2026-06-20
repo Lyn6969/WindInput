@@ -82,8 +82,8 @@ pub struct SysKeys;
 
 impl KeyInjector for SysKeys {
     fn tap(&self, combo: &str) -> anyhow::Result<()> {
-        let (mods, vk) = parse_combo(combo)
-            .ok_or_else(|| anyhow::anyhow!("无法解析按键组合 {:?}", combo))?;
+        let (mods, vk) =
+            parse_combo(combo).ok_or_else(|| anyhow::anyhow!("无法解析按键组合 {:?}", combo))?;
         tap_combo(&mods, vk)
     }
     fn sequence(&self, combos: &[String]) -> anyhow::Result<()> {
@@ -93,16 +93,16 @@ impl KeyInjector for SysKeys {
         Ok(())
     }
     fn hold(&self, combo: &str) -> anyhow::Result<()> {
-        let (mods, vk) = parse_combo(combo)
-            .ok_or_else(|| anyhow::anyhow!("无法解析按键组合 {:?}", combo))?;
+        let (mods, vk) =
+            parse_combo(combo).ok_or_else(|| anyhow::anyhow!("无法解析按键组合 {:?}", combo))?;
         for m in &mods {
             send_key(*m, false)?;
         }
         send_key(vk, false)
     }
     fn release(&self, combo: &str) -> anyhow::Result<()> {
-        let (mods, vk) = parse_combo(combo)
-            .ok_or_else(|| anyhow::anyhow!("无法解析按键组合 {:?}", combo))?;
+        let (mods, vk) =
+            parse_combo(combo).ok_or_else(|| anyhow::anyhow!("无法解析按键组合 {:?}", combo))?;
         send_key(vk, true)?;
         for m in mods.iter().rev() {
             send_key(*m, true)?;
@@ -132,7 +132,7 @@ fn tap_combo(mods: &[u32], vk: u32) -> anyhow::Result<()> {
 #[cfg(windows)]
 fn send_key(vk: u32, up: bool) -> anyhow::Result<()> {
     use windows::Win32::UI::Input::KeyboardAndMouse::{
-        SendInput, INPUT, INPUT_0, INPUT_KEYBOARD, KEYBDINPUT, KEYBD_EVENT_FLAGS, KEYEVENTF_KEYUP,
+        INPUT, INPUT_0, INPUT_KEYBOARD, KEYBD_EVENT_FLAGS, KEYBDINPUT, KEYEVENTF_KEYUP, SendInput,
         VIRTUAL_KEY,
     };
     let flags = if up {
@@ -162,7 +162,7 @@ fn send_key(vk: u32, up: bool) -> anyhow::Result<()> {
 #[cfg(windows)]
 fn type_unicode(text: &str) -> anyhow::Result<()> {
     use windows::Win32::UI::Input::KeyboardAndMouse::{
-        SendInput, INPUT, INPUT_0, INPUT_KEYBOARD, KEYBDINPUT, KEYEVENTF_KEYUP, KEYEVENTF_UNICODE,
+        INPUT, INPUT_0, INPUT_KEYBOARD, KEYBDINPUT, KEYEVENTF_KEYUP, KEYEVENTF_UNICODE, SendInput,
         VIRTUAL_KEY,
     };
     for unit in text.encode_utf16() {

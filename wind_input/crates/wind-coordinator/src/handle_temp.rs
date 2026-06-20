@@ -4,14 +4,14 @@
 //! 触发键判定、进入/退出、候选刷新、按键处理、选词上屏。
 
 use crate::coordinator::{
-    adapt_en_case, detect_en_case, punct_char, EnCase, ENGINE_MAX_CANDIDATES, Coordinator, State,
+    Coordinator, ENGINE_MAX_CANDIDATES, EnCase, State, adapt_en_case, detect_en_case, punct_char,
 };
 use crate::pipeline::ModeKind;
-use wind_ipc::protocol::{MOD_ALT, MOD_CTRL, MOD_SHIFT};
-use wind_transform::fullwidth::to_full_width;
 use wind_bridge::handler::{KeyAction, KeyEventData};
 use wind_candidate::Candidate;
+use wind_ipc::protocol::{MOD_ALT, MOD_CTRL, MOD_SHIFT};
 use wind_keys::keymap;
+use wind_transform::fullwidth::to_full_width;
 
 impl Coordinator {
     /// 触发键名 → VK（统一映射，见 `keymap`；不含 z，z 混合模式后置实现）
@@ -26,7 +26,8 @@ impl Coordinator {
 
     /// 当前按键是否匹配配置的临时拼音触发键
     pub(crate) fn is_temp_pinyin_trigger(&self, key_code: u32) -> bool {
-        self.rt().config
+        self.rt()
+            .config
             .input
             .temp_pinyin
             .trigger_keys
@@ -86,7 +87,11 @@ impl Coordinator {
 
     /// 临时拼音选词 —— 组合区逐步转换（C）。部分匹配并入 committed 前缀留模式内（不上屏）；
     /// 完整匹配整体上屏 committed+候选（前缀触发键不输出）+ 造词，退出。返回最终 KeyAction。
-    pub(crate) fn commit_temp_pinyin_selected(&self, state: &mut State, cand: &Candidate) -> KeyAction {
+    pub(crate) fn commit_temp_pinyin_selected(
+        &self,
+        state: &mut State,
+        cand: &Candidate,
+    ) -> KeyAction {
         let total = state.temp_pinyin_buffer.len();
         let consumed = cand.consumed_length;
         let code = Self::cand_code(&state.temp_pinyin_buffer, cand);
@@ -116,7 +121,11 @@ impl Coordinator {
     }
 
     /// 临时拼音模式下的按键处理
-    pub(crate) fn handle_temp_pinyin_key(&self, state: &mut State, data: &KeyEventData) -> KeyAction {
+    pub(crate) fn handle_temp_pinyin_key(
+        &self,
+        state: &mut State,
+        data: &KeyEventData,
+    ) -> KeyAction {
         if let Some(act) = self.handle_candidate_nav(state, data) {
             return act;
         }
@@ -148,8 +157,11 @@ impl Coordinator {
                 // Backspace：分步撤销——有已转换段先退回最后一段（你→ni，码并回缓冲前部）；
                 // 否则删剩余拼音末字符；皆空则退出。
                 if let Some((code, _)) = state.committed_segs.pop() {
-                    state.committed_text =
-                        state.committed_segs.iter().map(|(_, t)| t.as_str()).collect();
+                    state.committed_text = state
+                        .committed_segs
+                        .iter()
+                        .map(|(_, t)| t.as_str())
+                        .collect();
                     state.temp_pinyin_buffer = format!("{}{}", code, state.temp_pinyin_buffer);
                     self.update_temp_pinyin_candidates(state);
                     let display = state.preedit.clone();
@@ -230,14 +242,15 @@ impl Coordinator {
             _ => {
                 // 二三候选键
                 if data.modifiers & MOD_SHIFT == 0
-                    && let Some(offset) = self.select_key_offset(data.key_code) {
-                        let (start, end) = self.page_range(state);
-                        let idx = start + offset;
-                        if idx < end {
-                            let cand = state.candidates[idx].clone();
-                            return self.commit_temp_pinyin_selected(state, &cand);
-                        }
+                    && let Some(offset) = self.select_key_offset(data.key_code)
+                {
+                    let (start, end) = self.page_range(state);
+                    let idx = start + offset;
+                    if idx < end {
+                        let cand = state.candidates[idx].clone();
+                        return self.commit_temp_pinyin_selected(state, &cand);
                     }
+                }
                 // 其它键：有候选则上屏高亮候选（分段则保留剩余拼音）；否则退出清空。
                 if !state.candidates.is_empty() {
                     let idx = self
@@ -307,7 +320,11 @@ impl Coordinator {
     }
 
     /// 临时英文模式按键处理（首版：缓冲累积 + 空格/回车/标点上屏，暂无词库候选）
-    pub(crate) fn handle_temp_english_key(&self, state: &mut State, data: &KeyEventData) -> KeyAction {
+    pub(crate) fn handle_temp_english_key(
+        &self,
+        state: &mut State,
+        data: &KeyEventData,
+    ) -> KeyAction {
         // 候选感知刷新后返回组合区动作。
         let refresh = |this: &Self, state: &mut State| -> KeyAction {
             this.update_temp_english_candidates(state);

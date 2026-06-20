@@ -60,7 +60,8 @@ impl SecurityDescriptor {
         }
 
         // 复制到 Vec<u8>，然后释放原始内存
-        let bytes = unsafe { std::slice::from_raw_parts(psd.0 as *const u8, sd_len as usize) }.to_vec();
+        let bytes =
+            unsafe { std::slice::from_raw_parts(psd.0 as *const u8, sd_len as usize) }.to_vec();
         unsafe {
             windows::Win32::Foundation::LocalFree(windows::Win32::Foundation::HLOCAL(psd.0));
         }

@@ -5,7 +5,7 @@
 //! 规则在词频排序之后应用，优先级最高。规则的「应用」由调用方（协调器）完成，
 //! 本模块只负责规则的增删查与持久化，避免对候选类型产生依赖。
 
-use crate::store::{Store, SHADOW};
+use crate::store::{SHADOW, Store};
 use redb::ReadableTable;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -125,8 +125,7 @@ impl ShadowStore {
         let map = self.map.read().unwrap_or_else(|e| e.into_inner());
         match map.get(&Self::key(schema, code)) {
             Some(rec) => {
-                rec.pinned.iter().any(|p| p.word == word)
-                    || rec.deleted.iter().any(|d| d == word)
+                rec.pinned.iter().any(|p| p.word == word) || rec.deleted.iter().any(|d| d == word)
             }
             None => false,
         }
@@ -139,7 +138,10 @@ impl ShadowStore {
     }
 
     pub fn is_empty(&self) -> bool {
-        self.map.read().unwrap_or_else(|e| e.into_inner()).is_empty()
+        self.map
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .is_empty()
     }
 
     /// 从 JSON 文件加载（不存在则静默忽略）
@@ -327,7 +329,9 @@ mod tests {
         let r = s.get_shadow_rules("wb", "aaaa").unwrap().unwrap();
         assert_eq!(r.pinned.len(), 1);
         assert_eq!(r.pinned[0].position, 0);
-        assert!(s.get_shadow_rules("wb", "bbbb").unwrap().unwrap().deleted == vec!["某词".to_string()]);
+        assert!(
+            s.get_shadow_rules("wb", "bbbb").unwrap().unwrap().deleted == vec!["某词".to_string()]
+        );
 
         // pin 后 delete 同词 → pin 被移除、转为 deleted
         s.delete_shadow("wb", "aaaa", "恭恭敬敬").unwrap();
@@ -340,8 +344,10 @@ mod tests {
         assert!(s.get_shadow_rules("wb", "aaaa").unwrap().is_none());
 
         // cand_id 动态短语：按 id 去重
-        s.pin_shadow("wb", "zz", "日期", Some("phrase:zz:date"), 0).unwrap();
-        s.pin_shadow("wb", "zz", "日期改", Some("phrase:zz:date"), 1).unwrap();
+        s.pin_shadow("wb", "zz", "日期", Some("phrase:zz:date"), 0)
+            .unwrap();
+        s.pin_shadow("wb", "zz", "日期改", Some("phrase:zz:date"), 1)
+            .unwrap();
         let r = s.get_shadow_rules("wb", "zz").unwrap().unwrap();
         assert_eq!(r.pinned.len(), 1, "同 cand_id 应去重为 1 条");
         assert_eq!(r.pinned[0].word, "日期改");

@@ -3,7 +3,7 @@
 //! 从 coordinator.rs 拆出（同 crate 内 `impl Coordinator` 块，组织性重构，无逻辑变更）。
 //! 简繁、方案切换、主题切换、mix 融合模式、引擎方案叠加。
 
-use crate::coordinator::{Coordinator, State, S2T_VARIANTS};
+use crate::coordinator::{Coordinator, S2T_VARIANTS, State};
 use crate::pipeline::ModeKind;
 use tracing::{debug, info, warn};
 use wind_bridge::handler::KeyAction;
@@ -55,7 +55,8 @@ impl Coordinator {
     /// mix 模式可加载的成员方案列表（过滤空/不可加载）。
     /// mix 可用的真实方案成员（过滤空 / 不可加载 / 内置 quick_input）。
     pub(crate) fn mix_members(&self, idx: u8) -> Vec<String> {
-        self.rt().config
+        self.rt()
+            .config
             .features
             .mix_modes
             .get(idx as usize)
@@ -73,7 +74,8 @@ impl Coordinator {
 
     /// mix 是否含内置类方案 quick_input（日期/计算）成员——启用「首字符数字/字母决定选词逻辑」。
     pub(crate) fn mix_has_quick_input(&self, idx: u8) -> bool {
-        self.rt().config
+        self.rt()
+            .config
             .features
             .mix_modes
             .get(idx as usize)
@@ -117,9 +119,10 @@ impl Coordinator {
     /// 若开启简繁转换，把简体文本转为繁体（数据缺失则原样返回）。
     pub(crate) fn maybe_s2t(&self, state: &State, text: &str) -> String {
         if state.s2t_enabled
-            && let Some(conv) = self.s2t.lock().unwrap_or_else(|e| e.into_inner()).as_ref() {
-                return conv.convert(text);
-            }
+            && let Some(conv) = self.s2t.lock().unwrap_or_else(|e| e.into_inner()).as_ref()
+        {
+            return conv.convert(text);
+        }
         text.to_string()
     }
 
@@ -324,14 +327,19 @@ impl Coordinator {
         match state.active? {
             ModeKind::TempPinyin => {
                 let disp = Self::schema_display_name(&state.temp_pinyin_schema);
-                let short = disp.chars().next().map(|c| c.to_string()).unwrap_or_default();
+                let short = disp
+                    .chars()
+                    .next()
+                    .map(|c| c.to_string())
+                    .unwrap_or_default();
                 Some((format!("临时{}", disp), short))
             }
             ModeKind::TempEnglish => Some(("临时英文".to_string(), "英".to_string())),
             ModeKind::QuickInput => Some(("快捷输入".to_string(), "快".to_string())),
             ModeKind::Url => None,
             ModeKind::Mix(i) => {
-                let rt = self.rt(); let m = rt.config.features.mix_modes.get(i as usize)?;
+                let rt = self.rt();
+                let m = rt.config.features.mix_modes.get(i as usize)?;
                 let full = if m.name.is_empty() {
                     "快捷".to_string()
                 } else {
@@ -341,7 +349,8 @@ impl Coordinator {
                 Some((full, short))
             }
             ModeKind::Special(i) => {
-                let rt = self.rt(); let m = rt.config.features.special_modes.get(i as usize)?;
+                let rt = self.rt();
+                let m = rt.config.features.special_modes.get(i as usize)?;
                 let full = m.name.clone();
                 let short = Self::short_or_first(&m.short_name, &full);
                 Some((full, short))
@@ -354,7 +363,10 @@ impl Coordinator {
         if !short.trim().is_empty() {
             short.trim().to_string()
         } else {
-            full.chars().next().map(|c| c.to_string()).unwrap_or_default()
+            full.chars()
+                .next()
+                .map(|c| c.to_string())
+                .unwrap_or_default()
         }
     }
 
@@ -368,7 +380,6 @@ impl Coordinator {
             ModeIndicatorStyle::Short => Some(short),
         }
     }
-
 
     /// 切换方案：清空输入并推送状态
     pub(crate) fn switch_schema(&self, schema_id: &str) {
@@ -400,7 +411,8 @@ impl Coordinator {
     /// 判断 key_code 是否为配置的 toggle 模式键（从编译后的 key_up 热键提取 vk 低 16 位）。
     /// TSF 仅在干净单击时于 keyUp 转发这些键，故据此判定即可直接切换。
     pub(crate) fn is_toggle_mode_keycode(&self, key_code: u32) -> bool {
-        self.rt().compiled_hotkeys
+        self.rt()
+            .compiled_hotkeys
             .key_up
             .iter()
             .any(|e| (e.match_hash & 0xFFFF) == key_code)
@@ -504,8 +516,7 @@ impl Coordinator {
                     continue; // 文本模式跳过计算
                 }
                 let dp = self.rt().config.features.quick_input.decimal_places;
-                for t in wind_quick_input::generate_quick_input_candidates(&state.mix_buffer, dp)
-                {
+                for t in wind_quick_input::generate_quick_input_candidates(&state.mix_buffer, dp) {
                     if seen.insert(t.clone()) {
                         cands.push(Candidate {
                             text: t,
@@ -592,8 +603,11 @@ impl Coordinator {
             keymap::VK_BACK => {
                 // 分步撤销：文本透镜有已转换段先退回最后一段（你→ni，码并回缓冲前部）。
                 if let Some((code, _)) = state.committed_segs.pop() {
-                    state.committed_text =
-                        state.committed_segs.iter().map(|(_, t)| t.as_str()).collect();
+                    state.committed_text = state
+                        .committed_segs
+                        .iter()
+                        .map(|(_, t)| t.as_str())
+                        .collect();
                     state.mix_buffer = format!("{}{}", code, state.mix_buffer);
                     return refresh(self, state);
                 }
@@ -609,8 +623,10 @@ impl Coordinator {
             keymap::VK_SPACE => {
                 // 空格：选当前高亮候选（文本透镜逐步转换）
                 if state.candidates.is_empty() {
-                    let out = self
-                        .maybe_s2t(state, &format!("{}{}", state.committed_text, state.mix_buffer));
+                    let out = self.maybe_s2t(
+                        state,
+                        &format!("{}{}", state.committed_text, state.mix_buffer),
+                    );
                     commit_text(self, state, out)
                 } else {
                     let (start, _) = self.page_range(state);
@@ -622,8 +638,10 @@ impl Coordinator {
             }
             keymap::VK_RETURN => {
                 // 回车：上屏「已转换前缀 + 缓冲原文」（如完整表达式 100+200=300，或已转中文+剩余拼音）
-                let out =
-                    self.maybe_s2t(state, &format!("{}{}", state.committed_text, state.mix_buffer));
+                let out = self.maybe_s2t(
+                    state,
+                    &format!("{}{}", state.committed_text, state.mix_buffer),
+                );
                 commit_text(self, state, out)
             }
             _ => {
@@ -670,10 +688,9 @@ impl Coordinator {
                 }
 
                 // ④ 配置二三候选键
-                if !shift
-                    && let Some(offset) = self.select_key_offset(data.key_code) {
-                        return self.mix_select(state, offset);
-                    }
+                if !shift && let Some(offset) = self.select_key_offset(data.key_code) {
+                    return self.mix_select(state, offset);
+                }
 
                 // ⑤ 其它标点：顶屏「已转换前缀 + 当前高亮候选」+ 转换后标点，退出
                 if let Some(ch) = punct_char(data.key_code, shift) {

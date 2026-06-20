@@ -10,14 +10,14 @@ use std::rc::Rc;
 use std::sync::mpsc::Sender;
 
 use crate::manager::{MenuItemSpec, MenuKind, UiEvent};
+use crate::sys::{
+    GetCursorPos, HWND, IDC_ARROW, LPARAM, LRESULT, LoadCursorW, POINT, ReleaseCapture, SW_HIDE,
+    SetCapture, SetCursor, ShowWindow, WM_LBUTTONDOWN, WM_MOUSEMOVE, WM_RBUTTONDOWN, WM_SETCURSOR,
+    WPARAM,
+};
 use crate::text::dwrite::TextRenderer;
 use crate::view::{Align, Edges, Layout, Rect, View};
 use crate::window::{LayeredWindow, WindowMouse};
-use crate::sys::{
-    GetCursorPos, LoadCursorW, ReleaseCapture, SetCapture, SetCursor, ShowWindow, HWND, IDC_ARROW,
-    LPARAM, LRESULT, POINT, SW_HIDE, WM_LBUTTONDOWN, WM_MOUSEMOVE, WM_RBUTTONDOWN, WM_SETCURSOR,
-    WPARAM,
-};
 #[cfg(windows)]
 use windows::Win32::Foundation::{HANDLE, HGLOBAL};
 #[cfg(windows)]
@@ -25,7 +25,7 @@ use windows::Win32::System::DataExchange::{
     CloseClipboard, EmptyClipboard, GetClipboardData, OpenClipboard, SetClipboardData,
 };
 #[cfg(windows)]
-use windows::Win32::System::Memory::{GlobalAlloc, GlobalLock, GlobalUnlock, GMEM_MOVEABLE};
+use windows::Win32::System::Memory::{GMEM_MOVEABLE, GlobalAlloc, GlobalLock, GlobalUnlock};
 #[cfg(windows)]
 use windows::Win32::System::Ole::CF_UNICODETEXT;
 
@@ -79,10 +79,7 @@ fn selectable(it: &MenuItemSpec) -> bool {
 }
 
 fn first_selectable(items: &[MenuItemSpec]) -> usize {
-    items
-        .iter()
-        .position(selectable)
-        .unwrap_or(NONE_SEL)
+    items.iter().position(selectable).unwrap_or(NONE_SEL)
 }
 
 /// 菜单交互状态（与 wnd_proc 共享）。只做结构变更，dirty 触发 PopupMenu 协调重绘。
@@ -193,11 +190,7 @@ impl MenuState {
         }
         let cur = self.levels[k].selected;
         let mut i = if cur == NONE_SEL {
-            if dir > 0 {
-                -1
-            } else {
-                0
-            }
+            if dir > 0 { -1 } else { 0 }
         } else {
             cur as i32
         };
@@ -467,12 +460,12 @@ impl PopupMenu {
         {
             let mut st = self.state.borrow_mut();
             match key {
-                0x26 => st.key_up(),               // Up
-                0x28 => st.key_down(),             // Down
-                0x27 => st.key_right(),            // Right → 展开子菜单
-                0x25 => st.key_left(),             // Left → 收起/返回
-                0x1B => st.close(),                // ESC → 关闭
-                0x0D | 0x20 => st.key_enter(),     // Enter / Space → 激活
+                0x26 => st.key_up(),           // Up
+                0x28 => st.key_down(),         // Down
+                0x27 => st.key_right(),        // Right → 展开子菜单
+                0x25 => st.key_left(),         // Left → 收起/返回
+                0x1B => st.close(),            // ESC → 关闭
+                0x0D | 0x20 => st.key_enter(), // Enter / Space → 激活
                 _ => {}
             }
         }
@@ -484,7 +477,10 @@ impl PopupMenu {
         // 快照内容，避免渲染期间持有 state 借用
         let snap: Vec<(Vec<MenuItemSpec>, usize)> = {
             let st = self.state.borrow();
-            st.levels.iter().map(|l| (l.items.clone(), l.selected)).collect()
+            st.levels
+                .iter()
+                .map(|l| (l.items.clone(), l.selected))
+                .collect()
         };
         if snap.is_empty() {
             return;
@@ -496,9 +492,15 @@ impl PopupMenu {
         // 软投影四向扩边（与候选窗一致）：内容布局起点移到 (ml,mt)，窗口左上回移，阴影溢出。
         // geom = 内容几何（屏幕坐标，供 place_child 链式定位）；wgeom = 窗口几何（含 margin，
         // 供命中/写回）。命中 item_rects 为窗口相对（含 ml,mt），与 find_hit 的 screen−origin 一致。
-        let (ml, mt, mr, mb) = self.shadow.as_ref().map(|s| s.margins()).unwrap_or((0, 0, 0, 0));
-        let mut geom: Vec<(i32, i32, u32, u32, Vec<(usize, Rect)>)> = Vec::with_capacity(snap.len());
-        let mut wgeom: Vec<(i32, i32, u32, u32, Vec<(usize, Rect)>)> = Vec::with_capacity(snap.len());
+        let (ml, mt, mr, mb) = self
+            .shadow
+            .as_ref()
+            .map(|s| s.margins())
+            .unwrap_or((0, 0, 0, 0));
+        let mut geom: Vec<(i32, i32, u32, u32, Vec<(usize, Rect)>)> =
+            Vec::with_capacity(snap.len());
+        let mut wgeom: Vec<(i32, i32, u32, u32, Vec<(usize, Rect)>)> =
+            Vec::with_capacity(snap.len());
         for k in 0..snap.len() {
             let (items, selected) = &snap[k];
             let (mut root, cw, ch, content_hits) = self.build_view(items, *selected);
@@ -715,7 +717,7 @@ impl WindowMouse for MenuState {
                 match self.find_hit(sx, sy) {
                     Some((k, Some(r))) => self.click(k, r),
                     Some((_, None)) => {} // 面板空白处：忽略
-                    None => self.close(),  // 菜单外 → 关闭
+                    None => self.close(), // 菜单外 → 关闭
                 }
                 Some(LRESULT(0))
             }
@@ -801,16 +803,12 @@ pub fn get_clipboard_text() -> String {
 fn dpi_scale() -> f32 {
     #[cfg(windows)]
     {
-        use windows::Win32::Graphics::Gdi::{GetDC, GetDeviceCaps, ReleaseDC, LOGPIXELSY};
+        use windows::Win32::Graphics::Gdi::{GetDC, GetDeviceCaps, LOGPIXELSY, ReleaseDC};
         unsafe {
             let hdc = GetDC(HWND::default());
             let dpi = GetDeviceCaps(hdc, LOGPIXELSY);
             ReleaseDC(HWND::default(), hdc);
-            if dpi > 0 {
-                dpi as f32 / 96.0
-            } else {
-                1.0
-            }
+            if dpi > 0 { dpi as f32 / 96.0 } else { 1.0 }
         }
     }
     #[cfg(not(windows))]
@@ -824,7 +822,7 @@ fn work_area_of(x: i32, y: i32) -> Option<(i32, i32, i32, i32)> {
     #[cfg(windows)]
     {
         use windows::Win32::Graphics::Gdi::{
-            GetMonitorInfoW, MonitorFromPoint, MONITORINFO, MONITOR_DEFAULTTONEAREST,
+            GetMonitorInfoW, MONITOR_DEFAULTTONEAREST, MONITORINFO, MonitorFromPoint,
         };
         unsafe {
             let pt = POINT { x, y };

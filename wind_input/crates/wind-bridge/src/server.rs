@@ -178,17 +178,28 @@ fn handle_client(pipe: PipeHandle, handler: Arc<dyn MessageHandler>, _timeout_ms
         if read_ok.is_err() {
             // 检查是否是 ERROR_MORE_DATA（消息模式下消息比缓冲区大时的正常情况）
             let last_err = unsafe { windows::Win32::Foundation::GetLastError() };
-            if last_err == windows::Win32::Foundation::ERROR_MORE_DATA && bytes_read as usize == IpcHeader::SIZE {
+            if last_err == windows::Win32::Foundation::ERROR_MORE_DATA
+                && bytes_read as usize == IpcHeader::SIZE
+            {
                 // 读到了完整的 header，继续处理（payload 会在后续读取）
-                info!("ReadFile returned ERROR_MORE_DATA but got full header ({} bytes), continuing", bytes_read);
+                info!(
+                    "ReadFile returned ERROR_MORE_DATA but got full header ({} bytes), continuing",
+                    bytes_read
+                );
             } else {
-                info!("Client disconnected from bridge pipe (read failed, bytes_read={}, last_err={:?})", bytes_read, last_err);
+                info!(
+                    "Client disconnected from bridge pipe (read failed, bytes_read={}, last_err={:?})",
+                    bytes_read, last_err
+                );
                 break;
             }
         }
 
         if bytes_read as usize != IpcHeader::SIZE {
-            info!("Client disconnected from bridge pipe (incomplete header: {} bytes)", bytes_read);
+            info!(
+                "Client disconnected from bridge pipe (incomplete header: {} bytes)",
+                bytes_read
+            );
             break;
         }
 
@@ -202,7 +213,12 @@ fn handle_client(pipe: PipeHandle, handler: Arc<dyn MessageHandler>, _timeout_ms
 
         let cmd = header.command;
         let len = header.length;
-        info!("Received command: 0x{:04X}, payload: {} bytes, async: {}", cmd, len, header.is_async());
+        info!(
+            "Received command: 0x{:04X}, payload: {} bytes, async: {}",
+            cmd,
+            len,
+            header.is_async()
+        );
 
         // 读取 payload（如果有）
         let payload_len = header.length as usize;
@@ -223,14 +239,23 @@ fn handle_client(pipe: PipeHandle, handler: Arc<dyn MessageHandler>, _timeout_ms
                 let last_err = unsafe { windows::Win32::Foundation::GetLastError() };
                 if last_err == windows::Win32::Foundation::ERROR_MORE_DATA {
                     // ERROR_MORE_DATA 表示消息比请求的字节数多，但已读到请求的字节数
-                    info!("ReadFile payload: ERROR_MORE_DATA but got {} bytes (requested {})", bytes_read, payload_len);
+                    info!(
+                        "ReadFile payload: ERROR_MORE_DATA but got {} bytes (requested {})",
+                        bytes_read, payload_len
+                    );
                 } else {
-                    warn!("Failed to read payload ({} bytes, read={}, err={:?})", payload_len, bytes_read, last_err);
+                    warn!(
+                        "Failed to read payload ({} bytes, read={}, err={:?})",
+                        payload_len, bytes_read, last_err
+                    );
                     break;
                 }
             }
             if (bytes_read as usize) < payload_len {
-                warn!("Incomplete payload: got {} of {} bytes", bytes_read, payload_len);
+                warn!(
+                    "Incomplete payload: got {} of {} bytes",
+                    bytes_read, payload_len
+                );
                 break;
             }
             &payload_buf[..payload_len]
@@ -243,7 +268,11 @@ fn handle_client(pipe: PipeHandle, handler: Arc<dyn MessageHandler>, _timeout_ms
 
         // 写入响应（异步命令返回 None，不写入）
         if let Some(resp) = response {
-            info!("Sending response: {} bytes for cmd 0x{:04X}", resp.len(), cmd);
+            info!(
+                "Sending response: {} bytes for cmd 0x{:04X}",
+                resp.len(),
+                cmd
+            );
             let mut bytes_written: u32 = 0;
             let write_ok = unsafe { WriteFile(pipe, Some(&resp), Some(&mut bytes_written), None) };
             if write_ok.is_err() {
@@ -314,36 +343,34 @@ fn dispatch_command(
         }
 
         // ── 提交请求（同步，barrier 机制） ──
-        CMD_COMMIT_REQUEST => {
-            match decode_commit_request(payload) {
-                Ok(req) => {
-                    let data = CommitRequestData {
-                        barrier_seq: req.barrier_seq,
-                        trigger_key: req.trigger_key,
-                        modifiers: req.modifiers,
-                        input_buffer: req.input_buffer,
-                    };
-                    match handler.handle_commit_request(&data) {
-                        Some(result) => Some(encode_commit_result(
-                            result.barrier_seq,
-                            &result.text,
-                            if result.new_composition.is_empty() {
-                                None
-                            } else {
-                                Some(&result.new_composition)
-                            },
-                            result.mode_changed,
-                            result.chinese_mode,
-                        )),
-                        None => Some(encode_ack()),
-                    }
-                }
-                Err(e) => {
-                    warn!("Invalid commit request payload: {}", e);
-                    Some(encode_ack())
+        CMD_COMMIT_REQUEST => match decode_commit_request(payload) {
+            Ok(req) => {
+                let data = CommitRequestData {
+                    barrier_seq: req.barrier_seq,
+                    trigger_key: req.trigger_key,
+                    modifiers: req.modifiers,
+                    input_buffer: req.input_buffer,
+                };
+                match handler.handle_commit_request(&data) {
+                    Some(result) => Some(encode_commit_result(
+                        result.barrier_seq,
+                        &result.text,
+                        if result.new_composition.is_empty() {
+                            None
+                        } else {
+                            Some(&result.new_composition)
+                        },
+                        result.mode_changed,
+                        result.chinese_mode,
+                    )),
+                    None => Some(encode_ack()),
                 }
             }
-        }
+            Err(e) => {
+                warn!("Invalid commit request payload: {}", e);
+                Some(encode_ack())
+            }
+        },
 
         // ── 焦点获取（同步命令，对齐 Go fix(focus) 0acf860b） ──
         // 两段式：本同步段只做纯内存轻量操作并**立即回 CMD_MODE_PUSH**（权威 chinese/full）：
@@ -416,7 +443,13 @@ fn dispatch_command(
             let (status, commit_text) = handler.handle_toggle_mode();
             if !commit_text.is_empty() {
                 let chinese_mode = status.as_ref().map_or(false, |s| s.chinese_mode);
-                Some(encode_commit_text(&commit_text, None, true, chinese_mode, false))
+                Some(encode_commit_text(
+                    &commit_text,
+                    None,
+                    true,
+                    chinese_mode,
+                    false,
+                ))
             } else if let Some(status) = status {
                 Some(encode_status_update_from_data(&status))
             } else {
@@ -435,7 +468,13 @@ fn dispatch_command(
             let chinese_mode = (flags & STATUS_CHINESE_MODE) != 0;
             let (status, commit_text) = handler.handle_system_mode_switch(chinese_mode);
             if !commit_text.is_empty() {
-                Some(encode_commit_text(&commit_text, None, true, chinese_mode, false))
+                Some(encode_commit_text(
+                    &commit_text,
+                    None,
+                    true,
+                    chinese_mode,
+                    false,
+                ))
             } else if let Some(status) = status {
                 Some(encode_status_update_from_data(&status))
             } else {
@@ -474,13 +513,22 @@ fn dispatch_command(
                 .or_else(|_| {
                     // CaretPayload 20 bytes
                     if payload.len() >= 20 {
-                        Ok(wind_ipc::protocol::CaretPayload::from_bytes(payload)
-                            .unwrap_or(wind_ipc::protocol::CaretPayload {
-                                x: 0, y: 0, height: 0,
-                                composition_start_x: 0, composition_start_y: 0,
-                            }))
+                        Ok(
+                            wind_ipc::protocol::CaretPayload::from_bytes(payload).unwrap_or(
+                                wind_ipc::protocol::CaretPayload {
+                                    x: 0,
+                                    y: 0,
+                                    height: 0,
+                                    composition_start_x: 0,
+                                    composition_start_y: 0,
+                                },
+                            ),
+                        )
                     } else {
-                        Err(wind_ipc::codec::CodecError::BufferTooShort { need: 20, got: payload.len() })
+                        Err(wind_ipc::codec::CodecError::BufferTooShort {
+                            need: 20,
+                            got: payload.len(),
+                        })
                     }
                 })
             {
@@ -531,9 +579,7 @@ fn dispatch_command(
         CMD_BATCH_EVENTS => handle_batch_events(handler, payload),
 
         // ── 输入统计（异步） ──
-        CMD_INPUT_STATS => {
-            None
-        }
+        CMD_INPUT_STATS => None,
 
         _ => {
             warn!("Unknown command: 0x{:04X}", command);
@@ -625,13 +671,12 @@ fn encode_key_action(action: &KeyAction) -> Vec<u8> {
         }
         KeyAction::ClearComposition => encode_clear_composition(),
         KeyAction::PassThrough | KeyAction::NotHandled => encode_pass_through(),
-        KeyAction::StatusUpdate(status) => {
-            encode_status_update_from_data(status)
-        }
+        KeyAction::StatusUpdate(status) => encode_status_update_from_data(status),
         KeyAction::Consumed => encode_consumed(),
-        KeyAction::InsertTextWithCursor { text, cursor_offset } => {
-            encode_commit_text_with_cursor(text, *cursor_offset)
-        }
+        KeyAction::InsertTextWithCursor {
+            text,
+            cursor_offset,
+        } => encode_commit_text_with_cursor(text, *cursor_offset),
         KeyAction::MoveCursorRight => encode_move_cursor(1),
         KeyAction::DeletePair => encode_delete_pair(),
         KeyAction::ReplaceBackward { count, text } => encode_replace_backward(*count, text),

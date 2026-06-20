@@ -32,7 +32,12 @@ fn handle(state: &WebState, method: &str, params: &Value) -> anyhow::Result<Valu
         "system.manifest" => Ok(state.manifest.clone()),
         // 本机字体枚举（平台能力经 CoreStatus 注入；dev server 默认空表）。
         "system.fonts" => Ok(Value::Array(
-            state.status.fonts().into_iter().map(|f| json!({ "family": f })).collect(),
+            state
+                .status
+                .fonts()
+                .into_iter()
+                .map(|f| json!({ "family": f }))
+                .collect(),
         )),
         "system.notifyReload" => Ok(json!({ "ok": true })),
         "config.get" => {

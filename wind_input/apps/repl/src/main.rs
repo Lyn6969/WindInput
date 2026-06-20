@@ -24,8 +24,7 @@ fn resolve_data_dir() -> Option<PathBuf> {
 fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "info".into()),
+            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
         )
         .with_writer(io::stderr)
         .init();
@@ -58,7 +57,11 @@ fn main() -> anyhow::Result<()> {
             "" => continue,
             ":q" | ":quit" => break,
             ":l" | ":list" => {
-                println!("可用方案: {:?}（当前 {}）", mgr.available_schemas(), mgr.active_schema_id());
+                println!(
+                    "可用方案: {:?}（当前 {}）",
+                    mgr.available_schemas(),
+                    mgr.active_schema_id()
+                );
                 continue;
             }
             _ if line.starts_with(":s ") => {
@@ -66,7 +69,10 @@ fn main() -> anyhow::Result<()> {
                 if mgr.switch_schema(id) {
                     println!("→ 已切换到 {}", mgr.active_schema_id());
                 } else {
-                    println!("✗ 切换失败（不存在或不可用）；当前 {}", mgr.active_schema_id());
+                    println!(
+                        "✗ 切换失败（不存在或不可用）；当前 {}",
+                        mgr.active_schema_id()
+                    );
                 }
                 continue;
             }

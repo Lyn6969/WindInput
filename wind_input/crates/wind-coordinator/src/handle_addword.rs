@@ -2,7 +2,7 @@
 //!
 //! 从 coordinator.rs 拆出（同 crate 内 `impl Coordinator` 块，组织性重构，无逻辑变更）。
 
-use crate::coordinator::{Coordinator, State, LEARN_ADD_WEIGHT, LEARN_WEIGHT_DELTA};
+use crate::coordinator::{Coordinator, LEARN_ADD_WEIGHT, LEARN_WEIGHT_DELTA, State};
 use tracing::{debug, warn};
 
 impl Coordinator {
@@ -25,15 +25,25 @@ impl Coordinator {
         if state.committed_segs.len() < 2 {
             return;
         }
-        let code: String = state.committed_segs.iter().map(|(c, _)| c.as_str()).collect();
-        let text: String = state.committed_segs.iter().map(|(_, t)| t.as_str()).collect();
+        let code: String = state
+            .committed_segs
+            .iter()
+            .map(|(c, _)| c.as_str())
+            .collect();
+        let text: String = state
+            .committed_segs
+            .iter()
+            .map(|(_, t)| t.as_str())
+            .collect();
         if text.chars().count() < 2 || code.is_empty() {
             return;
         }
         let Some(store) = &self.store else { return };
         let schema = self.engine_mgr.active_schema_id();
         // add_weight/delta 取保守默认；晋升计数阈值由临时层累积达成（后续可接入 schema.learning 配置）。
-        if let Err(e) = store.learn_temp_word(&schema, &code, &text, LEARN_ADD_WEIGHT, LEARN_WEIGHT_DELTA) {
+        if let Err(e) =
+            store.learn_temp_word(&schema, &code, &text, LEARN_ADD_WEIGHT, LEARN_WEIGHT_DELTA)
+        {
             warn!("learn_temp_word failed: {}", e);
         } else {
             debug!("auto-learned phrase: {} -> {}", code, text);

@@ -8,15 +8,15 @@ use std::cell::RefCell;
 use std::rc::Rc;
 use std::sync::mpsc::Sender;
 
-use std::time::{Duration, Instant};
-use crate::manager::{UiEvent, HOVER_PAGE_NEXT as TAG_PAGE_NEXT, HOVER_PAGE_PREV as TAG_PAGE_PREV};
+use crate::manager::{HOVER_PAGE_NEXT as TAG_PAGE_NEXT, HOVER_PAGE_PREV as TAG_PAGE_PREV, UiEvent};
+use crate::sys::{
+    GetCursorPos, HWND, IDC_ARROW, LPARAM, LRESULT, LoadCursorW, POINT, SetCursor, WM_LBUTTONDOWN,
+    WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_RBUTTONDOWN, WM_SETCURSOR, WPARAM,
+};
 use crate::text::dwrite::TextRenderer;
 use crate::view::{Align, Edges, Layout, Rect, View, ViewImage, ViewLayer};
 use crate::window::{LayeredWindow, WindowMouse};
-use crate::sys::{
-    GetCursorPos, LoadCursorW, SetCursor, HWND, IDC_ARROW, LPARAM, LRESULT, POINT, WM_LBUTTONDOWN,
-    WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_RBUTTONDOWN, WM_SETCURSOR, WPARAM,
-};
+use std::time::{Duration, Instant};
 
 /// 候选词数据
 #[derive(Debug, Clone)]
@@ -316,8 +316,14 @@ impl CandidateWindow {
 
         tracing::debug!(
             "render[{}x{} n={}]: build={:?} layout={:?} paint={:?} blit={:?} | total={:?}",
-            width, height, self.candidates.len(),
-            t_build, t_layout, t_paint, t_blit, t_start.elapsed()
+            width,
+            height,
+            self.candidates.len(),
+            t_build,
+            t_layout,
+            t_paint,
+            t_blit,
+            t_start.elapsed()
         );
 
         // 位置锚定：组合期间固定——锚点一旦按有效坐标锁定，打字/悬停/翻页刷新都复用，
@@ -328,13 +334,8 @@ impl CandidateWindow {
         let (px, py) = if keep {
             self.anchor.unwrap()
         } else {
-            let p = Self::clamp_to_work_area(
-                self.x,
-                self.y,
-                self.caret_height,
-                content_w,
-                content_h,
-            );
+            let p =
+                Self::clamp_to_work_area(self.x, self.y, self.caret_height, content_w, content_h);
             self.anchor = Some(p);
             self.anchor_locked = self.caret_valid; // 仅有效坐标才锁定
             p
@@ -371,9 +372,7 @@ impl CandidateWindow {
         };
         if let Some(tip) = self.tooltip.as_mut() {
             match info {
-                Some((code, r)) => {
-                    tip.show(&code, px + r.x as i32, py + (r.y + r.h) as i32 + 2)
-                }
+                Some((code, r)) => tip.show(&code, px + r.x as i32, py + (r.y + r.h) as i32 + 2),
                 None => tip.hide(),
             }
         }
@@ -392,10 +391,13 @@ impl CandidateWindow {
         {
             use windows::Win32::Foundation::POINT;
             use windows::Win32::Graphics::Gdi::{
-                GetMonitorInfoW, MonitorFromPoint, MONITORINFO, MONITOR_DEFAULTTONEAREST,
+                GetMonitorInfoW, MONITOR_DEFAULTTONEAREST, MONITORINFO, MonitorFromPoint,
             };
             unsafe {
-                let pt = POINT { x: caret_x, y: caret_y };
+                let pt = POINT {
+                    x: caret_x,
+                    y: caret_y,
+                };
                 let mon = MonitorFromPoint(pt, MONITOR_DEFAULTTONEAREST);
                 let mut mi = MONITORINFO {
                     cbSize: std::mem::size_of::<MONITORINFO>() as u32,
@@ -407,7 +409,11 @@ impl CandidateWindow {
                     // 下方放不下 → 上翻到光标上方（光标顶端 = caret_y - caret_h）
                     if y + hi > wa.bottom {
                         let above = caret_y - caret_h.max(0) - hi - gap;
-                        y = if above >= wa.top { above } else { wa.bottom - hi };
+                        y = if above >= wa.top {
+                            above
+                        } else {
+                            wa.bottom - hi
+                        };
                     }
                     // 左右钳制
                     if x + wi > wa.right {
@@ -507,9 +513,8 @@ impl CandidateWindow {
             l: e.left.map(|x| x.resolve(s, 0.0)).unwrap_or(d[3] * s),
         };
         // 状态 patch 取色（selected/hover 的 bg/text，None patch 或缺色→兜底）。
-        let patch_bg = |p: &Option<Box<RvNode>>, d: [u8; 4]| {
-            p.as_ref().and_then(|n| n.bg_color).unwrap_or(d)
-        };
+        let patch_bg =
+            |p: &Option<Box<RvNode>>, d: [u8; 4]| p.as_ref().and_then(|n| n.bg_color).unwrap_or(d);
         // 状态文字色（与 Go effectiveNode 对齐）：选中优先于悬停；选中/悬停 patch 未给文字色
         // → 回退基态色（不跨态借色）。index/text/comment 同一套消费。
         let eff_text = |node: &RvNode, base: [u8; 4], sel: bool, hov: bool| -> [u8; 4] {
@@ -578,7 +583,10 @@ impl CandidateWindow {
                     col(v.mode_label.text_color, [120, 120, 128, 255]),
                 )
                 .font_size(ml_fs)
-                .margin(Edges { l: 12.0 * s, ..Edges::default() });
+                .margin(Edges {
+                    l: 12.0 * s,
+                    ..Edges::default()
+                });
                 if let Some(bg) = v.mode_label.bg_color {
                     chip = chip
                         .bg(bg)
@@ -609,23 +617,34 @@ impl CandidateWindow {
         let box_gap = (item_spacing - item_pad.l - item_pad.r).max(0.0);
         let row_gap_v = dim(v.row_gap, 0.0);
         // 选中候选左侧强调条（仅主题启用时，如 msime/jidian）。
-        let accent_bar = v
-            .accent_bar_enabled
-            .then(|| (col(v.accent_bar.bg_color, [66, 133, 244, 255]), dim(v.accent_bar_width, 3.0)));
+        let accent_bar = v.accent_bar_enabled.then(|| {
+            (
+                col(v.accent_bar.bg_color, [66, 133, 244, 255]),
+                dim(v.accent_bar_width, 3.0),
+            )
+        });
 
         // 候选列表：横排=Row（cell 并列）；竖排=Column（候选纵向堆叠）。
         let mut list = if self.vertical {
             View::container(Layout::Column).gap(row_gap_v)
         } else {
-            View::container(Layout::Row).gap(box_gap).cross(Align::Center)
+            View::container(Layout::Row)
+                .gap(box_gap)
+                .cross(Align::Center)
         };
         // 嵌入模式：编码作为候选行首单元内联（无独立背景，与候选间留白分隔），对齐 Go buildEmbeddedPreedit。
         // 横排右留白、竖排下留白。
         if self.preedit_embedded && !self.preedit.is_empty() {
             let sep = if self.vertical {
-                Edges { b: 6.0 * s, ..Edges::default() }
+                Edges {
+                    b: 6.0 * s,
+                    ..Edges::default()
+                }
             } else {
-                Edges { r: 16.0 * s, ..Edges::default() }
+                Edges {
+                    r: 16.0 * s,
+                    ..Edges::default()
+                }
             };
             list = list.child(
                 View::leaf(
@@ -644,9 +663,15 @@ impl CandidateWindow {
         if !self.mode_label.is_empty() && !preedit_bar_shown {
             let ml_fs = node_fs(&v.mode_label);
             let sep = if self.vertical {
-                Edges { b: 6.0 * s, ..Edges::default() }
+                Edges {
+                    b: 6.0 * s,
+                    ..Edges::default()
+                }
             } else {
-                Edges { r: 12.0 * s, ..Edges::default() }
+                Edges {
+                    r: 12.0 * s,
+                    ..Edges::default()
+                }
             };
             let mut chip = View::leaf(
                 self.mode_label.clone(),
@@ -756,32 +781,33 @@ impl CandidateWindow {
             // 图标保持主题尺寸（footer_fs 方形），水平居中靠对称内边距撑到 arrow_w；
             // 垂直靠 cross(Center) 居中于 row_h。触摸盒 = arrow_w × row_h，与图标像素范围解耦。
             let icon_pad_x = ((arrow_w - footer_fs) * 0.5).max(0.0);
-            let arrow = |icon: Option<ViewImage>, txt: &str, tag: i32, enabled: bool, hovered: bool| {
-                let mut node = match icon {
-                    Some(vi) => View::container(Layout::Row)
-                        .fixed_h(row_h)
-                        .pad(Edges::xy(icon_pad_x, 0.0))
-                        .child(
-                            View::container(Layout::Row)
-                                .fixed_w(footer_fs)
-                                .fixed_h(footer_fs)
-                                .bg_image(vi),
-                        ),
-                    None => View::leaf(txt, if enabled { accent } else { disabled })
-                        .font_size(footer_fs)
-                        .fixed_w(arrow_w)
-                        .fixed_h(row_h)
-                        .text_align(Align::Center),
-                };
-                node = node.radius(item_radius).cross(Align::Center);
-                if enabled {
-                    node = node.tag(tag); // 仅启用项参与命中
-                    if hovered {
-                        node = node.bg(hover_bg); // 圆角悬停高亮覆盖整个按钮矩形
+            let arrow =
+                |icon: Option<ViewImage>, txt: &str, tag: i32, enabled: bool, hovered: bool| {
+                    let mut node = match icon {
+                        Some(vi) => View::container(Layout::Row)
+                            .fixed_h(row_h)
+                            .pad(Edges::xy(icon_pad_x, 0.0))
+                            .child(
+                                View::container(Layout::Row)
+                                    .fixed_w(footer_fs)
+                                    .fixed_h(footer_fs)
+                                    .bg_image(vi),
+                            ),
+                        None => View::leaf(txt, if enabled { accent } else { disabled })
+                            .font_size(footer_fs)
+                            .fixed_w(arrow_w)
+                            .fixed_h(row_h)
+                            .text_align(Align::Center),
+                    };
+                    node = node.radius(item_radius).cross(Align::Center);
+                    if enabled {
+                        node = node.tag(tag); // 仅启用项参与命中
+                        if hovered {
+                            node = node.bg(hover_bg); // 圆角悬停高亮覆盖整个按钮矩形
+                        }
                     }
-                }
-                node
-            };
+                    node
+                };
             Some(
                 View::container(Layout::Row)
                     .cross(Align::Center)

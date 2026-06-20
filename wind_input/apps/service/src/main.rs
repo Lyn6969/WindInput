@@ -194,7 +194,10 @@ fn relaunch_self() {
         }
         Err(e) => error!("Relaunch with breakaway failed ({e}); retrying without breakaway"),
     }
-    match std::process::Command::new(&exe).creation_flags(base).spawn() {
+    match std::process::Command::new(&exe)
+        .creation_flags(base)
+        .spawn()
+    {
         Ok(_) => info!("Relaunched: {}", exe.display()),
         Err(e) => error!("Failed to relaunch: {}", e),
     }
@@ -272,7 +275,10 @@ fn check_singleton() -> Option<SingletonGuard> {
     }
 
     let mutex_name = format!("Global\\WindInput{}IMEService", PIPE_SUFFIX);
-    let wide_name: Vec<u16> = mutex_name.encode_utf16().chain(std::iter::once(0)).collect();
+    let wide_name: Vec<u16> = mutex_name
+        .encode_utf16()
+        .chain(std::iter::once(0))
+        .collect();
 
     let handle = unsafe { CreateMutexW(std::ptr::null(), 0, wide_name.as_ptr()) };
 
@@ -293,9 +299,7 @@ fn check_singleton() -> Option<SingletonGuard> {
     }
 
     // 等待获取 mutex 所有权（立即返回）
-    let wait_result = unsafe {
-        windows::Win32::System::Threading::WaitForSingleObject(handle, 0)
-    };
+    let wait_result = unsafe { windows::Win32::System::Threading::WaitForSingleObject(handle, 0) };
 
     if wait_result == windows::Win32::Foundation::WAIT_OBJECT_0
         || wait_result == windows::Win32::Foundation::WAIT_ABANDONED
@@ -337,7 +341,7 @@ struct SingletonGuard {}
 /// 必须在任何窗口创建之前调用，否则坐标会被 Windows DPI 虚拟化。
 #[cfg(windows)]
 fn set_dpi_awareness() {
-    use windows::Win32::UI::HiDpi::{SetProcessDpiAwareness, PROCESS_PER_MONITOR_DPI_AWARE};
+    use windows::Win32::UI::HiDpi::{PROCESS_PER_MONITOR_DPI_AWARE, SetProcessDpiAwareness};
 
     let result = unsafe { SetProcessDpiAwareness(PROCESS_PER_MONITOR_DPI_AWARE) };
     if result.is_ok() {

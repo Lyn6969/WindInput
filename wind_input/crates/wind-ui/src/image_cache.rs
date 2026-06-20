@@ -19,7 +19,8 @@ fn compose(r: u8, g: u8, b: u8, a: u8, tint: [u8; 4], premult: bool) -> Premulti
     if tint[3] > 0 {
         let ta = ((a as u16 * tint[3] as u16) / 255) as u8;
         let p = |c: u8| ((c as u16 * ta as u16) / 255) as u8;
-        PremultipliedColorU8::from_rgba(p(tint[2]), p(tint[1]), p(tint[0]), ta).unwrap_or_else(transparent)
+        PremultipliedColorU8::from_rgba(p(tint[2]), p(tint[1]), p(tint[0]), ta)
+            .unwrap_or_else(transparent)
     } else if premult {
         PremultipliedColorU8::from_rgba(b, g, r, a).unwrap_or_else(transparent)
     } else {
@@ -153,8 +154,14 @@ impl ImageCache {
                     continue; // 透明（Pixmap::new 已清零）
                 };
                 let si = ((sy * sw + sx) * 4) as usize;
-                px[(dy * w + dx) as usize] =
-                    compose(data[si], data[si + 1], data[si + 2], data[si + 3], tint, false);
+                px[(dy * w + dx) as usize] = compose(
+                    data[si],
+                    data[si + 1],
+                    data[si + 2],
+                    data[si + 3],
+                    tint,
+                    false,
+                );
             }
         }
         Some(pm)

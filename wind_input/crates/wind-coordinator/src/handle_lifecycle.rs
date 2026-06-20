@@ -7,10 +7,10 @@
 use crate::coordinator::{Coordinator, State};
 use crate::pipeline::ModeKind;
 use tracing::{debug, info};
-use wind_ipc::protocol::{MOD_ALT, MOD_CTRL, MOD_SHIFT};
-use wind_ui::manager::UiCommand;
-use wind_keys::keymap;
 use wind_bridge::handler::{KeyAction, KeyEventData};
+use wind_ipc::protocol::{MOD_ALT, MOD_CTRL, MOD_SHIFT};
+use wind_keys::keymap;
+use wind_ui::manager::UiCommand;
 
 impl Coordinator {
     /// 重启服务进程：隐藏 UI 后向 main 发重启信号（main 释放单例并重拉自身）。
@@ -36,7 +36,11 @@ impl Coordinator {
     /// 空缓冲模式激活的单一入口（对齐 key-pipeline.md §2.1 优先级链）。
     /// 优先级：临时英文(Shift+字母) > 快捷输入 > 临时拼音 > 特殊模式。命中返回激活 KeyAction，
     /// 都不命中返回 None（落普通输入）。URL 前缀夺取是「缓冲扩展夺取」语义，不在此链，单独处理。
-    pub(crate) fn try_activate_mode(&self, state: &mut State, data: &KeyEventData) -> Option<KeyAction> {
+    pub(crate) fn try_activate_mode(
+        &self,
+        state: &mut State,
+        data: &KeyEventData,
+    ) -> Option<KeyAction> {
         // 临时英文：Shift+字母（空缓冲 + 无候选 + 已启用）
         if state.input_buffer.is_empty()
             && state.candidates.is_empty()
@@ -65,23 +69,24 @@ impl Coordinator {
         if state.input_buffer.is_empty()
             && data.modifiers & (MOD_CTRL | MOD_ALT | MOD_SHIFT) == 0
             && self.is_temp_pinyin_trigger(data.key_code)
-            && let Some(target) = self.engine_mgr.temp_pinyin_target() {
-                state.active = Some(ModeKind::TempPinyin);
-                state.temp_pinyin_schema = target;
-                state.temp_pinyin_buffer.clear();
-                state.temp_pinyin_prefix = Self::temp_pinyin_prefix_for(data.key_code).to_string();
-                self.update_temp_pinyin_candidates(state);
-                let display = state.preedit.clone();
-                self.notify_ui_update(state);
-                debug!(
-                    "Entered temp pinyin mode (prefix={})",
-                    state.temp_pinyin_prefix
-                );
-                return Some(KeyAction::UpdateComposition {
-                    text: display.clone(),
-                    caret_pos: display.chars().count() as u32,
-                });
-            }
+            && let Some(target) = self.engine_mgr.temp_pinyin_target()
+        {
+            state.active = Some(ModeKind::TempPinyin);
+            state.temp_pinyin_schema = target;
+            state.temp_pinyin_buffer.clear();
+            state.temp_pinyin_prefix = Self::temp_pinyin_prefix_for(data.key_code).to_string();
+            self.update_temp_pinyin_candidates(state);
+            let display = state.preedit.clone();
+            self.notify_ui_update(state);
+            debug!(
+                "Entered temp pinyin mode (prefix={})",
+                state.temp_pinyin_prefix
+            );
+            return Some(KeyAction::UpdateComposition {
+                text: display.clone(),
+                caret_pos: display.chars().count() as u32,
+            });
+        }
 
         // 特殊模式：空缓冲 + 无候选 + 无修饰键 + 引导键匹配（优先级最低）。
         // 码表不可用时不拦截该键，返回 None 继续普通流程。
@@ -92,15 +97,17 @@ impl Coordinator {
             if let Some(idx) = self.match_special_trigger(data.key_code) {
                 // 方案可加载才进入（否则不拦截该键，落普通流程）。
                 if let Some(schema) = self.special_schema(idx)
-                    && self.engine_mgr.ensure_schema(&schema) {
-                        return Some(self.enter_special_mode(state, idx, data.key_code));
-                    }
+                    && self.engine_mgr.ensure_schema(&schema)
+                {
+                    return Some(self.enter_special_mode(state, idx, data.key_code));
+                }
             }
             // 临时 mix：含 quick_input 或至少一个可加载成员方案才进入（优先级最低）。
             if let Some(idx) = self.match_mix_trigger(data.key_code)
-                && (self.mix_has_quick_input(idx) || !self.mix_members(idx).is_empty()) {
-                    return Some(self.enter_mix_mode(state, idx, data.key_code));
-                }
+                && (self.mix_has_quick_input(idx) || !self.mix_members(idx).is_empty())
+            {
+                return Some(self.enter_mix_mode(state, idx, data.key_code));
+            }
         }
 
         None

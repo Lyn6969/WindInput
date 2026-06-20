@@ -22,10 +22,10 @@ pub use action::{ActionKind, ResolvedAction};
 pub use ast::{ArrayPhrase, CommandPhrase, Expr, ModValue, Modifiers, Phrase};
 pub use context::{EvalContext, History, MemoryContext};
 pub use error::{CmdbarError, Result};
-pub use eval::{evaluate, expand_array, ArrayElement, ArrayExpansion, Evaluated};
+pub use eval::{ArrayElement, ArrayExpansion, Evaluated, evaluate, expand_array};
 pub use parser::parse;
-pub use phrase::{evaluate_phrase, is_cmdbar_grammar, run_actions, PhraseEval};
-pub use registry::{default_registry, Category, FuncSpec, Registry};
+pub use phrase::{PhraseEval, evaluate_phrase, is_cmdbar_grammar, run_actions};
+pub use registry::{Category, FuncSpec, Registry, default_registry};
 pub use services::{
     ClipboardService, ConfigService, DictService, ImeController, KeyInjector, ProcessRunner,
     SearchEngine, Services, UrlOpener,
@@ -87,6 +87,9 @@ mod integration_tests {
         let reg = Registry::with_builtins();
         let ctx = MemoryContext::new().with_input("abc");
         let p = parse("编码 {code} 共 {len(code)} 位").unwrap();
-        assert_eq!(evaluate(&p, &ctx, &reg).unwrap().display, "编码 abc 共 3 位");
+        assert_eq!(
+            evaluate(&p, &ctx, &reg).unwrap().display,
+            "编码 abc 共 3 位"
+        );
     }
 }

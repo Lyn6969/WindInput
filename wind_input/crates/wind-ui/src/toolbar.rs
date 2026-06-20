@@ -9,15 +9,15 @@ use std::rc::Rc;
 use std::sync::mpsc::Sender;
 
 use crate::manager::{ToolbarAction, UiEvent};
+use crate::sys::{
+    GetCursorPos, GetWindowRect, HWND, HWND_TOPMOST, IDC_ARROW, IDC_SIZEALL, LPARAM, LRESULT,
+    LoadCursorW, POINT, RECT, ReleaseCapture, SWP_NOACTIVATE, SWP_NOSIZE, SWP_NOZORDER, SetCapture,
+    SetCursor, SetWindowPos, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_RBUTTONDOWN,
+    WM_SETCURSOR, WPARAM,
+};
 use crate::text::dwrite::TextRenderer;
 use crate::view::Rect;
 use crate::window::{LayeredWindow, WindowMouse};
-use crate::sys::{
-    GetCursorPos, GetWindowRect, LoadCursorW, ReleaseCapture, SetCapture, SetCursor, SetWindowPos,
-    HWND, HWND_TOPMOST, IDC_ARROW, IDC_SIZEALL, LPARAM, LRESULT, POINT, RECT, SWP_NOACTIVATE,
-    SWP_NOSIZE, SWP_NOZORDER, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_RBUTTONDOWN,
-    WM_SETCURSOR, WPARAM,
-};
 
 /// 工具栏状态（由协调器推送）
 #[derive(Debug, Clone)]
@@ -141,10 +141,26 @@ impl Toolbar {
         let punct = if state.chinese_punct { "，。" } else { ",." };
         let width = if state.full_width { "全" } else { "半" };
         vec![
-            Cell { text: mode.to_string(), highlight: state.chinese_mode, action: ToolbarAction::ToggleMode },
-            Cell { text: schema, highlight: false, action: ToolbarAction::SwitchEngine },
-            Cell { text: punct.to_string(), highlight: false, action: ToolbarAction::TogglePunct },
-            Cell { text: width.to_string(), highlight: false, action: ToolbarAction::ToggleWidth },
+            Cell {
+                text: mode.to_string(),
+                highlight: state.chinese_mode,
+                action: ToolbarAction::ToggleMode,
+            },
+            Cell {
+                text: schema,
+                highlight: false,
+                action: ToolbarAction::SwitchEngine,
+            },
+            Cell {
+                text: punct.to_string(),
+                highlight: false,
+                action: ToolbarAction::TogglePunct,
+            },
+            Cell {
+                text: width.to_string(),
+                highlight: false,
+                action: ToolbarAction::ToggleWidth,
+            },
         ]
     }
 
@@ -197,7 +213,15 @@ impl Toolbar {
         let mut hits: Vec<(ToolbarAction, Rect)> = Vec::with_capacity(cells.len());
         for (i, c) in cells.iter().enumerate() {
             let cw = cell_widths[i];
-            hits.push((c.action, Rect { x, y: 0.0, w: cw, h: h as f32 }));
+            hits.push((
+                c.action,
+                Rect {
+                    x,
+                    y: 0.0,
+                    w: cw,
+                    h: h as f32,
+                },
+            ));
             // 分隔线（首格前不画）
             if i > 0 {
                 draw_vsep(self.window.buffer_mut(), w, h, x as u32, self.sep, s);
@@ -210,16 +234,32 @@ impl Toolbar {
                 let hw = (cw as u32).saturating_sub(inset);
                 let hh = h.saturating_sub(inset * 2);
                 let hr = (hh as f32 * 0.3) as u32;
-                fill_rounded(self.window.buffer_mut(), w, h, hx, hy, hw, hh, self.hl_bg, hr);
+                fill_rounded(
+                    self.window.buffer_mut(),
+                    w,
+                    h,
+                    hx,
+                    hy,
+                    hw,
+                    hh,
+                    self.hl_bg,
+                    hr,
+                );
             }
             // 居中文字
             let m = self.renderer.measure_text(&c.text);
             let tx = x + (cw - m.width) * 0.5;
             let ty = (h as f32 - font_h) * 0.5;
             let fg = if c.highlight { self.hl_fg } else { self.fg };
-            let _ = self
-                .renderer
-                .draw_text(self.window.buffer_mut(), w, h, tx.max(x), ty.max(0.0), &c.text, fg);
+            let _ = self.renderer.draw_text(
+                self.window.buffer_mut(),
+                w,
+                h,
+                tx.max(x),
+                ty.max(0.0),
+                &c.text,
+                fg,
+            );
             x += cw;
         }
         if let Err(e) = self.window.update() {
@@ -263,7 +303,7 @@ impl Toolbar {
         {
             use windows::Win32::Foundation::RECT;
             use windows::Win32::UI::WindowsAndMessaging::{
-                SystemParametersInfoW, SPI_GETWORKAREA, SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS,
+                SPI_GETWORKAREA, SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS, SystemParametersInfoW,
             };
             unsafe {
                 let mut rect = RECT::default();
@@ -293,11 +333,7 @@ impl Toolbar {
                 let hdc = GetDC(HWND::default());
                 let dpi = GetDeviceCaps(hdc, LOGPIXELSY);
                 ReleaseDC(HWND::default(), hdc);
-                if dpi > 0 {
-                    dpi as f32 / 96.0
-                } else {
-                    1.0
-                }
+                if dpi > 0 { dpi as f32 / 96.0 } else { 1.0 }
             }
         }
         #[cfg(not(windows))]
@@ -421,12 +457,18 @@ impl WindowMouse for ToolbarMouse {
                 unsafe {
                     let _ = GetCursorPos(&mut p);
                 }
-                let _ = self.events.send(UiEvent::RequestMainMenu { x: p.x, y: p.y });
+                let _ = self
+                    .events
+                    .send(UiEvent::RequestMainMenu { x: p.x, y: p.y });
                 Some(LRESULT(0))
             }
             WM_SETCURSOR => {
                 unsafe {
-                    let cur = if self.dragging { IDC_SIZEALL } else { IDC_ARROW };
+                    let cur = if self.dragging {
+                        IDC_SIZEALL
+                    } else {
+                        IDC_ARROW
+                    };
                     if let Ok(c) = LoadCursorW(None, cur) {
                         SetCursor(c);
                     }
@@ -447,7 +489,7 @@ fn clamp_to_work_area(x: i32, y: i32, w: u32, h: u32) -> (i32, i32) {
     #[cfg(windows)]
     {
         use windows::Win32::Graphics::Gdi::{
-            GetMonitorInfoW, MonitorFromPoint, MONITORINFO, MONITOR_DEFAULTTONEAREST,
+            GetMonitorInfoW, MONITOR_DEFAULTTONEAREST, MONITORINFO, MonitorFromPoint,
         };
         unsafe {
             let pt = POINT { x, y };

@@ -25,48 +25,63 @@ const UI_THEME_NAME: &str = "ui.theme.name";
 
 fn fn_dict_add(ctx: &dyn EvalContext, args: &[String]) -> Result<String> {
     let s = services("dict.add", ctx)?;
-    let dict = s.dict.as_ref().ok_or_else(|| CmdbarError::service("dict.add"))?;
+    let dict = s
+        .dict
+        .as_ref()
+        .ok_or_else(|| CmdbarError::service("dict.add"))?;
     let code = args.get(1).map(String::as_str).unwrap_or("");
-    dict.add_word(&args[0], code).map_err(|e| runtime_err("dict.add", e))?;
+    dict.add_word(&args[0], code)
+        .map_err(|e| runtime_err("dict.add", e))?;
     Ok(String::new())
 }
 
 fn fn_ime_toggle(ctx: &dyn EvalContext, args: &[String]) -> Result<String> {
     let ime = ime(ctx, "ime.toggle")?;
-    ime.toggle(&args[0]).map_err(|e| runtime_err("ime.toggle", e))?;
+    ime.toggle(&args[0])
+        .map_err(|e| runtime_err("ime.toggle", e))?;
     Ok(String::new())
 }
 
 fn fn_ime_schema(ctx: &dyn EvalContext, args: &[String]) -> Result<String> {
     let ime = ime(ctx, "ime.schema")?;
-    ime.set_schema(&args[0]).map_err(|e| runtime_err("ime.schema", e))?;
+    ime.set_schema(&args[0])
+        .map_err(|e| runtime_err("ime.schema", e))?;
     Ok(String::new())
 }
 
 fn fn_theme_cycle(ctx: &dyn EvalContext, args: &[String]) -> Result<String> {
     let ime = ime(ctx, "ime.theme_cycle")?;
     let dir = args.first().map(String::as_str).unwrap_or("");
-    let next = ime.theme_cycle(dir).map_err(|e| runtime_err("ime.theme_cycle", e))?;
+    let next = ime
+        .theme_cycle(dir)
+        .map_err(|e| runtime_err("ime.theme_cycle", e))?;
     Ok(next)
 }
 
 fn fn_setting_open(ctx: &dyn EvalContext, args: &[String]) -> Result<String> {
     let ime = ime(ctx, "setting.open")?;
-    ime.open_setting(&args[0]).map_err(|e| runtime_err("setting.open", e))?;
+    ime.open_setting(&args[0])
+        .map_err(|e| runtime_err("setting.open", e))?;
     Ok(String::new())
 }
 
 fn fn_setting_web(ctx: &dyn EvalContext, args: &[String]) -> Result<String> {
     let ime = ime(ctx, "setting.web")?;
-    ime.open_setting_web(&args[0]).map_err(|e| runtime_err("setting.web", e))?;
+    ime.open_setting_web(&args[0])
+        .map_err(|e| runtime_err("setting.web", e))?;
     Ok(String::new())
 }
 
 /// `ime.theme(name)` 经 ConfigService 设置主题名（与 config.set 等价）。
 fn fn_ime_theme(ctx: &dyn EvalContext, args: &[String]) -> Result<String> {
     let s = services("ime.theme", ctx)?;
-    let config = s.config.as_ref().ok_or_else(|| CmdbarError::service("ime.theme"))?;
-    config.set(UI_THEME_NAME, &args[0]).map_err(|e| runtime_err("ime.theme", e))?;
+    let config = s
+        .config
+        .as_ref()
+        .ok_or_else(|| CmdbarError::service("ime.theme"))?;
+    config
+        .set(UI_THEME_NAME, &args[0])
+        .map_err(|e| runtime_err("ime.theme", e))?;
     Ok(String::new())
 }
 
@@ -75,5 +90,7 @@ fn ime<'a>(
     func: &str,
 ) -> Result<&'a std::sync::Arc<dyn crate::services::ImeController>> {
     let s = services(func, ctx)?;
-    s.ime.as_ref().ok_or_else(|| CmdbarError::service(func.to_string()))
+    s.ime
+        .as_ref()
+        .ok_or_else(|| CmdbarError::service(func.to_string()))
 }

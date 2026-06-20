@@ -86,10 +86,7 @@ pub enum KeyAction {
     /// 按键不处理（未匹配）
     NotHandled,
     /// 插入文本并定位光标
-    InsertTextWithCursor {
-        text: String,
-        cursor_offset: u32,
-    },
+    InsertTextWithCursor { text: String, cursor_offset: u32 },
     /// 光标右移（智能跳过）
     MoveCursorRight,
     /// 删除配对（智能删除）

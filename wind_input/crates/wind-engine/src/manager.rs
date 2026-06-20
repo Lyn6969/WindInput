@@ -179,7 +179,11 @@ impl EngineManager {
     }
 
     /// 读取 schema 判断是否受支持（不构建引擎，仅解析 TOML）
-    fn schema_supported(schema_id: &str, data_dir: Option<&Path>, override_dir: Option<&Path>) -> bool {
+    fn schema_supported(
+        schema_id: &str,
+        data_dir: Option<&Path>,
+        override_dir: Option<&Path>,
+    ) -> bool {
         match Self::read_schema(schema_id, data_dir, override_dir) {
             Some(s) => s.is_supported(),
             None => false,
@@ -271,10 +275,14 @@ impl EngineManager {
         {
             return n.clone();
         }
-        let name = Self::read_schema(schema_id, self.data_dir.as_deref(), self.override_dir.as_deref())
-            .map(|s| s.schema.name)
-            .filter(|n| !n.is_empty())
-            .unwrap_or_else(|| schema_id.to_string());
+        let name = Self::read_schema(
+            schema_id,
+            self.data_dir.as_deref(),
+            self.override_dir.as_deref(),
+        )
+        .map(|s| s.schema.name)
+        .filter(|n| !n.is_empty())
+        .unwrap_or_else(|| schema_id.to_string());
         self.name_cache
             .lock()
             .unwrap_or_else(|e| e.into_inner())
@@ -285,8 +293,12 @@ impl EngineManager {
     /// 指定方案的引擎类型字符串（小写，如 "pinyin"|"codetable"|"mixed"）；读不到返回 None。
     /// 不切换活跃方案（设置页 dict.encode 据此选拼音/五笔出码规则）。
     pub fn schema_engine_type(&self, schema_id: &str) -> Option<String> {
-        Self::read_schema(schema_id, self.data_dir.as_deref(), self.override_dir.as_deref())
-            .map(|s| s.engine.engine_type.to_lowercase())
+        Self::read_schema(
+            schema_id,
+            self.data_dir.as_deref(),
+            self.override_dir.as_deref(),
+        )
+        .map(|s| s.engine.engine_type.to_lowercase())
     }
 
     /// 方案基础定义（不含 override 层）——设置页计算 saveConfig 稀疏 diff 的基准。
@@ -296,7 +308,11 @@ impl EngineManager {
 
     /// 方案合并定义（基础 + override 层）——设置页 getConfig 返回。
     pub fn schema_merged(&self, schema_id: &str) -> Option<Schema> {
-        Self::read_schema(schema_id, self.data_dir.as_deref(), self.override_dir.as_deref())
+        Self::read_schema(
+            schema_id,
+            self.data_dir.as_deref(),
+            self.override_dir.as_deref(),
+        )
     }
 
     /// 读取某方案 override 层（TOML 值，无则 None）。
@@ -306,7 +322,11 @@ impl EngineManager {
     }
 
     /// 写入某方案 override 层并使其引擎缓存失效（下次使用按新配置重建）。
-    pub fn write_schema_override(&self, schema_id: &str, value: &toml::Value) -> anyhow::Result<()> {
+    pub fn write_schema_override(
+        &self,
+        schema_id: &str,
+        value: &toml::Value,
+    ) -> anyhow::Result<()> {
         let dir = self
             .override_dir
             .as_deref()
@@ -400,16 +420,30 @@ impl EngineManager {
         // 过滤不支持的方案，但始终保留活跃方案（与构造逻辑一致）。
         available.retain(|sid| {
             sid == &new_active
-                || Self::schema_supported(sid, self.data_dir.as_deref(), self.override_dir.as_deref())
+                || Self::schema_supported(
+                    sid,
+                    self.data_dir.as_deref(),
+                    self.override_dir.as_deref(),
+                )
         });
 
         // 更新可变状态。
         *self.available.lock().unwrap_or_else(|e| e.into_inner()) = available;
-        *self.code_commit.lock().unwrap_or_else(|e| e.into_inner()) = config.input.code_commit.clone();
+        *self.code_commit.lock().unwrap_or_else(|e| e.into_inner()) =
+            config.input.code_commit.clone();
         // 丢弃缓存：引擎按新上屏策略/词典重建，名称/词频按新方案重读。
-        self.engines.lock().unwrap_or_else(|e| e.into_inner()).clear();
-        self.freq_cache.lock().unwrap_or_else(|e| e.into_inner()).clear();
-        self.name_cache.lock().unwrap_or_else(|e| e.into_inner()).clear();
+        self.engines
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear();
+        self.freq_cache
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear();
+        self.name_cache
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear();
 
         // 切换活跃方案（即便 id 未变，引擎已被清空，这里立即重建避免首键延迟）。
         let changed = {
@@ -419,7 +453,10 @@ impl EngineManager {
             changed
         };
         self.ensure_loaded(&new_active);
-        info!("EngineManager reloaded from config (active={}, changed={})", new_active, changed);
+        info!(
+            "EngineManager reloaded from config (active={}, changed={})",
+            new_active, changed
+        );
         changed
     }
 
@@ -432,10 +469,7 @@ impl EngineManager {
             return None;
         }
         let current = self.active_schema_id();
-        let cur = available
-            .iter()
-            .position(|s| s == &current)
-            .unwrap_or(0);
+        let cur = available.iter().position(|s| s == &current).unwrap_or(0);
         for step in 1..n {
             let cand = available[(cur + step) % n].clone();
             if cand == current {
@@ -482,7 +516,8 @@ impl EngineManager {
     /// 启用且目标方案可加载时返回 Some(target)，否则 None。
     pub fn temp_pinyin_target(&self) -> Option<String> {
         let id = self.active_schema_id();
-        let schema = Self::read_schema(&id, self.data_dir.as_deref(), self.override_dir.as_deref())?;
+        let schema =
+            Self::read_schema(&id, self.data_dir.as_deref(), self.override_dir.as_deref())?;
         let tp = &schema.engine.codetable.temp_pinyin;
         if !tp.enabled {
             return None;
@@ -511,9 +546,10 @@ impl EngineManager {
         {
             return *s;
         }
-        let settings = Self::read_schema(&id, self.data_dir.as_deref(), self.override_dir.as_deref())
-            .map(|sc| Self::parse_freq_settings(&sc))
-            .unwrap_or_default();
+        let settings =
+            Self::read_schema(&id, self.data_dir.as_deref(), self.override_dir.as_deref())
+                .map(|sc| Self::parse_freq_settings(&sc))
+                .unwrap_or_default();
         self.freq_cache
             .lock()
             .unwrap_or_else(|e| e.into_inner())
@@ -662,9 +698,10 @@ impl EngineManager {
                 2
             };
             // 拼音守护：主码表方案 tri-state > 全局 input.code_commit。
-            let block_on_pinyin = Self::read_schema(&m.primary_schema, Some(data_dir), override_dir)
-                .and_then(|s| s.engine.codetable.auto_commit_block_on_pinyin)
-                .unwrap_or(commit.auto_commit_block_on_pinyin);
+            let block_on_pinyin =
+                Self::read_schema(&m.primary_schema, Some(data_dir), override_dir)
+                    .and_then(|s| s.engine.codetable.auto_commit_block_on_pinyin)
+                    .unwrap_or(commit.auto_commit_block_on_pinyin);
             info!(
                 "Built mixed engine {} (primary={}, secondary={})",
                 schema_id, m.primary_schema, m.secondary_schema
@@ -1101,26 +1138,32 @@ mod tests {
 
     #[test]
     fn freq_settings_enabled_top() {
-        let s = parse(
-            "[engine.codetable]\nfreq_strategy = \"top\"\n[learning.freq]\nenabled = true\n",
-        );
+        let s =
+            parse("[engine.codetable]\nfreq_strategy = \"top\"\n[learning.freq]\nenabled = true\n");
         assert!(s.enabled);
-        assert_eq!(s.strategy, FreqStrategy::Top, "freq_strategy=top 应解析为 Top");
+        assert_eq!(
+            s.strategy,
+            FreqStrategy::Top,
+            "freq_strategy=top 应解析为 Top"
+        );
     }
 
     #[test]
     fn freq_settings_step_explicit_and_unknown_fallback() {
-        let s = parse("[engine.codetable]\nfreq_strategy = \"step\"\n[learning.freq]\nenabled = true\n");
+        let s = parse(
+            "[engine.codetable]\nfreq_strategy = \"step\"\n[learning.freq]\nenabled = true\n",
+        );
         assert_eq!(s.strategy, FreqStrategy::Step);
         // 未知策略值回退 step（稳健默认）。
-        let u = parse("[engine.codetable]\nfreq_strategy = \"bogus\"\n[learning.freq]\nenabled = true\n");
+        let u = parse(
+            "[engine.codetable]\nfreq_strategy = \"bogus\"\n[learning.freq]\nenabled = true\n",
+        );
         assert_eq!(u.strategy, FreqStrategy::Step, "未知策略应回退 step");
     }
 
     #[test]
     fn merge_toml_table_recurse_and_scalar_replace() {
-        let mut base: toml::Value =
-            toml::from_str("a = 1\n[t]\nx = 1\ny = 2\n").unwrap();
+        let mut base: toml::Value = toml::from_str("a = 1\n[t]\nx = 1\ny = 2\n").unwrap();
         let over: toml::Value = toml::from_str("a = 9\n[t]\ny = 20\nz = 30\n").unwrap();
         merge_toml(&mut base, over);
         assert_eq!(base.get("a").unwrap().as_integer(), Some(9));
@@ -1157,9 +1200,10 @@ mod tests {
         assert_eq!(base.engine.codetable.max_code_length, 4);
 
         // 写 override：覆盖 name + max_code_length
-        let ov: toml::Value =
-            toml::from_str("[schema]\nname = \"覆盖名\"\n[engine.codetable]\nmax_code_length = 5\n")
-                .unwrap();
+        let ov: toml::Value = toml::from_str(
+            "[schema]\nname = \"覆盖名\"\n[engine.codetable]\nmax_code_length = 5\n",
+        )
+        .unwrap();
         mgr.write_schema_override("tcfg", &ov).unwrap();
 
         let merged = mgr.schema_merged("tcfg").unwrap();

@@ -60,10 +60,20 @@ pub struct Edges {
 
 impl Edges {
     pub fn all(v: f32) -> Self {
-        Self { l: v, t: v, r: v, b: v }
+        Self {
+            l: v,
+            t: v,
+            r: v,
+            b: v,
+        }
     }
     pub fn xy(x: f32, y: f32) -> Self {
-        Self { l: x, t: y, r: x, b: y }
+        Self {
+            l: x,
+            t: y,
+            r: x,
+            b: y,
+        }
     }
     fn w(&self) -> f32 {
         self.l + self.r
@@ -352,7 +362,11 @@ impl View {
         let content_h = self.mh - self.padding.h();
 
         let n = self.children.len();
-        let gap_total = if n > 1 { self.gap * (n - 1) as f32 } else { 0.0 };
+        let gap_total = if n > 1 {
+            self.gap * (n - 1) as f32
+        } else {
+            0.0
+        };
         let growers = self.children.iter().filter(|c| c.grow).count();
 
         match self.layout {
@@ -428,7 +442,17 @@ impl View {
         // 边框作为干净描边环绘制（粗细恒为 bw、内外各一条 AA），不再用内/外两次填充
         // （旧法 AA 在边框/底色交界处双重混合致软边、且无法画镂空边框）。
         if let Some(bg) = self.bg {
-            fill_rounded(buf, buf_w, buf_h, r.x, r.y, r.w, r.h, bg, self.corner_radius);
+            fill_rounded(
+                buf,
+                buf_w,
+                buf_h,
+                r.x,
+                r.y,
+                r.w,
+                r.h,
+                bg,
+                self.corner_radius,
+            );
         }
         if let Some((bc, bw)) = self.border {
             fill_ring(
@@ -547,7 +571,13 @@ fn paint_bg_image(buf: &mut [u8], buf_w: u32, buf_h: u32, r: Rect, radius: f32, 
             anti_alias: true,
             ..Default::default()
         };
-        pm.fill_path(&path, &paint, FillRule::Winding, Transform::identity(), None);
+        pm.fill_path(
+            &path,
+            &paint,
+            FillRule::Winding,
+            Transform::identity(),
+            None,
+        );
     });
 }
 
@@ -596,7 +626,13 @@ fn paint_layer(buf: &mut [u8], buf_w: u32, buf_h: u32, host: Rect, layer: &ViewL
             anti_alias: true,
             ..Default::default()
         };
-        pm.fill_path(&path, &paint, FillRule::Winding, Transform::identity(), None);
+        pm.fill_path(
+            &path,
+            &paint,
+            FillRule::Winding,
+            Transform::identity(),
+            None,
+        );
     });
 }
 
@@ -651,11 +687,25 @@ pub fn fill_rounded(
     paint.anti_alias = true;
     // BGRA 缓冲被当作 RGBA：换 R/B，输出即正确的预乘 BGRA。
     paint.set_color(Color::from_rgba8(color[2], color[1], color[0], color[3]));
-    pm.fill_path(&path, &paint, FillRule::Winding, Transform::identity(), None);
+    pm.fill_path(
+        &path,
+        &paint,
+        FillRule::Winding,
+        Transform::identity(),
+        None,
+    );
 }
 
 /// 填充实心圆（tiny-skia 抗锯齿）。`color` 为 [R,G,B,A]，缓冲预乘 BGRA（同 fill_rounded 换 R/B）。
-pub fn fill_circle(buf: &mut [u8], buf_w: u32, buf_h: u32, cx: f32, cy: f32, r: f32, color: [u8; 4]) {
+pub fn fill_circle(
+    buf: &mut [u8],
+    buf_w: u32,
+    buf_h: u32,
+    cx: f32,
+    cy: f32,
+    r: f32,
+    color: [u8; 4],
+) {
     if color[3] == 0 || r <= 0.0 || buf_w == 0 || buf_h == 0 {
         return;
     }
@@ -670,7 +720,13 @@ pub fn fill_circle(buf: &mut [u8], buf_w: u32, buf_h: u32, cx: f32, cy: f32, r: 
     let mut paint = Paint::default();
     paint.anti_alias = true;
     paint.set_color(Color::from_rgba8(color[2], color[1], color[0], color[3]));
-    pm.fill_path(&path, &paint, FillRule::Winding, Transform::identity(), None);
+    pm.fill_path(
+        &path,
+        &paint,
+        FillRule::Winding,
+        Transform::identity(),
+        None,
+    );
 }
 
 /// 高斯软投影（对齐 Go paintBlurredShadow）：在临时缓冲画 spread 扩张的圆角矩形，
@@ -727,7 +783,13 @@ pub fn paint_blur_shadow(
         let mut paint = Paint::default();
         paint.anti_alias = true;
         paint.set_color(Color::from_rgba8(0, 0, 0, 255));
-        pm.fill_path(&path, &paint, FillRule::Winding, Transform::identity(), None);
+        pm.fill_path(
+            &path,
+            &paint,
+            FillRule::Winding,
+            Transform::identity(),
+            None,
+        );
     }
 
     // 提取 alpha 通道 → 3× 方框模糊
@@ -999,7 +1061,13 @@ pub fn fill_ring(
     let mut paint = Paint::default();
     paint.anti_alias = true;
     paint.set_color(Color::from_rgba8(color[2], color[1], color[0], color[3]));
-    pm.fill_path(&path, &paint, FillRule::EvenOdd, Transform::identity(), None);
+    pm.fill_path(
+        &path,
+        &paint,
+        FillRule::EvenOdd,
+        Transform::identity(),
+        None,
+    );
 }
 
 // ———————————————— 测试 ————————————————
@@ -1018,7 +1086,12 @@ mod geom_tests {
 
     #[test]
     fn rect_contains_includes_edges() {
-        let r = Rect { x: 10.0, y: 10.0, w: 20.0, h: 20.0 };
+        let r = Rect {
+            x: 10.0,
+            y: 10.0,
+            w: 20.0,
+            h: 20.0,
+        };
         assert!(r.contains(10.0, 10.0)); // 左上角
         assert!(r.contains(30.0, 30.0)); // 右下角（x+w, y+h 含边界）
         assert!(r.contains(20.0, 20.0)); // 内部
@@ -1042,7 +1115,17 @@ mod geom_tests {
     #[test]
     fn fill_rounded_writes_alpha() {
         let mut buf = vec![0u8; 10 * 10 * 4];
-        fill_rounded(&mut buf, 10, 10, 0.0, 0.0, 10.0, 10.0, [255, 0, 0, 255], 0.0);
+        fill_rounded(
+            &mut buf,
+            10,
+            10,
+            0.0,
+            0.0,
+            10.0,
+            10.0,
+            [255, 0, 0, 255],
+            0.0,
+        );
         let center = (5 * 10 + 5) * 4;
         assert!(buf[center + 3] > 0, "中心像素 alpha 应被写入");
     }
@@ -1065,7 +1148,18 @@ mod geom_tests {
     #[test]
     fn fill_ring_hollow_center() {
         let mut buf = vec![0u8; 20 * 20 * 4];
-        fill_ring(&mut buf, 20, 20, 0.0, 0.0, 20.0, 20.0, [0, 0, 255, 255], 0.0, 2.0);
+        fill_ring(
+            &mut buf,
+            20,
+            20,
+            0.0,
+            0.0,
+            20.0,
+            20.0,
+            [0, 0, 255, 255],
+            0.0,
+            2.0,
+        );
         // 边框环：靠边像素被描边，正中心（挖空）保持透明
         assert!(buf[(0 * 20 + 10) * 4 + 3] > 0, "上边框应被描边");
         assert_eq!(buf[(10 * 20 + 10) * 4 + 3], 0, "环中心应镂空透明");
@@ -1183,9 +1277,12 @@ mod layout_tests {
 
     #[test]
     fn arrange_applies_child_margin() {
-        let mut root = View::container(Layout::Row).child(
-            fixed(10.0, 10.0, 0).margin(Edges { l: 5.0, t: 3.0, r: 0.0, b: 0.0 }),
-        );
+        let mut root = View::container(Layout::Row).child(fixed(10.0, 10.0, 0).margin(Edges {
+            l: 5.0,
+            t: 3.0,
+            r: 0.0,
+            b: 0.0,
+        }));
         root.layout(0.0, 0.0, &tr());
         let r = hit(&root, 0);
         assert_eq!((r.x, r.y), (5.0, 3.0)); // margin 偏移子节点原点
@@ -1195,9 +1292,7 @@ mod layout_tests {
     fn collect_hits_depth_first_skips_untagged() {
         let mut root = View::container(Layout::Column)
             .child(fixed(10.0, 10.0, 0))
-            .child(
-                fixed(10.0, 10.0, 1).child(fixed(5.0, 5.0, 2)),
-            );
+            .child(fixed(10.0, 10.0, 1).child(fixed(5.0, 5.0, 2)));
         root.layout(0.0, 0.0, &tr());
         let mut out = Vec::new();
         root.collect_hits(&mut out);

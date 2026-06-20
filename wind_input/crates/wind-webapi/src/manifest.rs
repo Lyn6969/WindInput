@@ -17,7 +17,10 @@ pub fn load(variant: &str) -> anyhow::Result<serde_json::Value> {
         .unwrap_or(serde_json::json!(1));
     let groups = raw.get("groups").cloned().unwrap_or(serde_json::json!([]));
     let items = raw.get("items").cloned().unwrap_or(serde_json::json!([]));
-    let features = raw.get("features").cloned().unwrap_or(serde_json::json!({}));
+    let features = raw
+        .get("features")
+        .cloned()
+        .unwrap_or(serde_json::json!({}));
 
     Ok(serde_json::json!({
         "manifest": version,

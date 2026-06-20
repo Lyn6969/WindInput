@@ -8,7 +8,7 @@
 
 use crate::context::EvalContext;
 use crate::error::Result;
-use crate::eval::{evaluate, expand_array, ArrayExpansion};
+use crate::eval::{ArrayExpansion, evaluate, expand_array};
 use crate::parser::{self, parse};
 use crate::registry::Registry;
 use crate::{ActionKind, ResolvedAction};
@@ -159,7 +159,8 @@ mod tests {
         let ctx = MemoryContext::new().with_services(svc);
         let reg = Registry::full();
 
-        let r = evaluate_phrase(r#"$CC("《》", type("《》"), key.tap("Left"))"#, &ctx, &reg).unwrap();
+        let r =
+            evaluate_phrase(r#"$CC("《》", type("《》"), key.tap("Left"))"#, &ctx, &reg).unwrap();
         let actions = match r {
             PhraseEval::Single { actions, .. } => actions,
             _ => panic!(),

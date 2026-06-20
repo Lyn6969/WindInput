@@ -2,8 +2,7 @@
 //!
 //! 从 coordinator.rs 拆出（同 crate 内 `impl Coordinator` 块，组织性重构，无逻辑变更）。
 
-
-use crate::coordinator::{quick_input_char, Coordinator, State};
+use crate::coordinator::{Coordinator, State, quick_input_char};
 use crate::pipeline::ModeKind;
 use wind_bridge::handler::{KeyAction, KeyEventData};
 use wind_candidate::Candidate;
@@ -23,7 +22,8 @@ impl Coordinator {
 
     /// 当前按键是否匹配配置的快捷输入触发键
     pub(crate) fn is_quick_input_trigger(&self, key_code: u32) -> bool {
-        self.rt().config
+        self.rt()
+            .config
             .features
             .quick_input
             .trigger_keys
@@ -78,7 +78,11 @@ impl Coordinator {
     }
 
     /// 快捷输入模式下的按键处理
-    pub(crate) fn handle_quick_input_key(&self, state: &mut State, data: &KeyEventData) -> KeyAction {
+    pub(crate) fn handle_quick_input_key(
+        &self,
+        state: &mut State,
+        data: &KeyEventData,
+    ) -> KeyAction {
         // 表达式模式：`-`/`=` 是运算符输入，不当翻页（include_printable=false）。
         if let Some(act) = self.apply_nav_key(state, data, false) {
             return act;
@@ -180,7 +184,11 @@ impl Coordinator {
     }
 
     /// 顶屏当前高亮候选（若有）并进入快捷输入模式。
-    pub(crate) fn commit_and_enter_quick_input(&self, state: &mut State, key_code: u32) -> KeyAction {
+    pub(crate) fn commit_and_enter_quick_input(
+        &self,
+        state: &mut State,
+        key_code: u32,
+    ) -> KeyAction {
         let prefix = self.take_committed(state); // 拼音逐步转换的已转换前缀一并上屏
         let committed = if !state.candidates.is_empty() {
             let idx = self

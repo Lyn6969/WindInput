@@ -14,8 +14,13 @@ use crate::sys::{HWND, LPARAM, LRESULT, WPARAM};
 ///
 /// 非 Windows 平台上没有 Win32 消息泵，该 trait 的实现不会被调用，仅用于类型占位。
 pub trait WindowMouse {
-    fn on_message(&mut self, hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
-        -> Option<LRESULT>;
+    fn on_message(
+        &mut self,
+        hwnd: HWND,
+        msg: u32,
+        wparam: WPARAM,
+        lparam: LPARAM,
+    ) -> Option<LRESULT>;
 }
 
 #[cfg(windows)]
@@ -53,8 +58,10 @@ mod platform {
                 let instance =
                     GetModuleHandleW(None).map_err(|e| format!("GetModuleHandleW: {}", e))?;
 
-                let class_wide: Vec<u16> =
-                    class_name.encode_utf16().chain(std::iter::once(0)).collect();
+                let class_wide: Vec<u16> = class_name
+                    .encode_utf16()
+                    .chain(std::iter::once(0))
+                    .collect();
 
                 // 加载箭头光标（避免鼠标繁忙状态）
                 let cursor = LoadCursorW(None, IDC_ARROW).unwrap_or_default();
@@ -284,7 +291,7 @@ mod platform {
 
 #[cfg(not(windows))]
 mod platform {
-    use super::{Rc, RefCell, WindowMouse, HWND};
+    use super::{HWND, Rc, RefCell, WindowMouse};
 
     /// Layered Window 的非 Windows mock：持有 BGRA 缓冲区，窗口操作为空实现。
     pub struct LayeredWindow {

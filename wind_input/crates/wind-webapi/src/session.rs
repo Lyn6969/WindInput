@@ -38,7 +38,11 @@ impl WebState {
     }
 
     pub(crate) fn suffix(&self) -> &'static str {
-        if self.variant == "debug" { "_debug" } else { "" }
+        if self.variant == "debug" {
+            "_debug"
+        } else {
+            ""
+        }
     }
 
     pub(crate) fn port(&self) -> u16 {

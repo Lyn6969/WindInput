@@ -51,9 +51,20 @@ impl Coordinator {
     ///   - `chinese=true`：算中文标点产物（武装/匹配用，引号经 peek 预测不改状态）。
     ///   - `chinese=false`：算英文标点产物（替换用，即该键英文模式下输出）。
     /// 引号有状态、键名特殊，此处保守跳过自定义、走标准引号/英文产物。
-    pub(crate) fn compute_punct_str_pure(&self, state: &State, ch: char, chinese: bool) -> Option<String> {
+    pub(crate) fn compute_punct_str_pure(
+        &self,
+        state: &State,
+        ch: char,
+        chinese: bool,
+    ) -> Option<String> {
         let conv = self.punct.lock().unwrap_or_else(|e| e.into_inner());
-        wind_punct::compute_punct_str_pure(&conv, &self.rt().config.input, state.full_width, ch, chinese)
+        wind_punct::compute_punct_str_pure(
+            &conv,
+            &self.rt().config.input,
+            state.full_width,
+            ch,
+            chinese,
+        )
     }
 
     /// 判断中文标点串 `cn` 是否在用户配置的参与集合内（子串包含匹配，支持多字符/引号）。
@@ -63,7 +74,12 @@ impl Coordinator {
 
     /// 计算 `ch` 当前会产生的「参与集合内的中文标点串」用于武装；不参与返回 None。
     /// 对齐 Go `smartSymbolArmStr`：仅中文标点模式 + 非数字后智能 + 在参与集合内。
-    pub(crate) fn smart_symbol_arm_str(&self, state: &State, ch: char, prev_char: u16) -> Option<String> {
+    pub(crate) fn smart_symbol_arm_str(
+        &self,
+        state: &State,
+        ch: char,
+        prev_char: u16,
+    ) -> Option<String> {
         if !state.chinese_punct {
             return None;
         }
@@ -112,24 +128,25 @@ impl Coordinator {
             let armed_runes: Vec<char> = arm.str.chars().collect();
             if let Some(&last) = armed_runes.last()
                 && last as u32 == prev_char as u32
-                    && let Some(rep) = self.compute_punct_str_pure(state, ch, false) {
-                        arm.armed = false;
-                        // 吃掉一个引号后回退引号交替状态，使下次同引号仍从左引号开始。
-                        if ch == '\'' || ch == '"' {
-                            self.punct
-                                .lock()
-                                .unwrap_or_else(|e| e.into_inner())
-                                .revert_last_quote(ch);
-                        }
-                        debug!(
-                            "SmartSymbol: replace prev chinese punct with english (count={})",
-                            armed_runes.len()
-                        );
-                        return Some(KeyAction::ReplaceBackward {
-                            count: armed_runes.len() as u32,
-                            text: rep,
-                        });
-                    }
+                && let Some(rep) = self.compute_punct_str_pure(state, ch, false)
+            {
+                arm.armed = false;
+                // 吃掉一个引号后回退引号交替状态，使下次同引号仍从左引号开始。
+                if ch == '\'' || ch == '"' {
+                    self.punct
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .revert_last_quote(ch);
+                }
+                debug!(
+                    "SmartSymbol: replace prev chinese punct with english (count={})",
+                    armed_runes.len()
+                );
+                return Some(KeyAction::ReplaceBackward {
+                    count: armed_runes.len() as u32,
+                    text: rep,
+                });
+            }
         }
 
         // 未触发：尝试以本次按键的中文产物武装，等待下次同键快速重复。

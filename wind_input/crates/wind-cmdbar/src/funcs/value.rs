@@ -80,7 +80,11 @@ fn fn_date(ctx: &dyn EvalContext, args: &[String]) -> Result<String> {
 }
 
 fn fn_time(ctx: &dyn EvalContext, args: &[String]) -> Result<String> {
-    let fmt = if args.len() == 1 { &args[0] } else { "HH:mm:ss" };
+    let fmt = if args.len() == 1 {
+        &args[0]
+    } else {
+        "HH:mm:ss"
+    };
     Ok(format_date(&ctx.now(), fmt))
 }
 
@@ -221,7 +225,10 @@ mod tests {
         ctx.clip = "板".into();
         assert_eq!(fn_code(&ctx, &[]).unwrap(), "nihao");
         assert_eq!(fn_code(&ctx, &["3".into()]).unwrap(), "hao");
-        assert_eq!(fn_tail(&ctx, &["abcde".into(), "2".into()]).unwrap(), "bcde");
+        assert_eq!(
+            fn_tail(&ctx, &["abcde".into(), "2".into()]).unwrap(),
+            "bcde"
+        );
         assert_eq!(fn_clip(&ctx, &[]).unwrap(), "板");
     }
 

@@ -9,7 +9,7 @@
 //! 说明：本文件另保留 legacy `FreqTracker`（文件式，供 coordinator 过渡期使用），将在
 //! coordinator 接通 redb 词频时移除。
 
-use crate::store::{Store, FREQ};
+use crate::store::{FREQ, Store};
 use crate::user_words::{enc_key, now_secs};
 use redb::ReadableTable;
 use serde::{Deserialize, Serialize};
@@ -87,7 +87,10 @@ impl Store {
                     .and_then(|g| dec_freq(g.value()))
                     .map(|r| r.count)
                     .unwrap_or(0);
-                t.insert(key.as_str(), enc_freq(count.saturating_add(1), now).as_slice())?;
+                t.insert(
+                    key.as_str(),
+                    enc_freq(count.saturating_add(1), now).as_slice(),
+                )?;
             }
             txn.commit()?;
             Ok(())
@@ -136,7 +139,11 @@ impl Store {
                 }
             }
             let total = all.len();
-            let page: Vec<_> = all.into_iter().skip(offset).take(if limit == 0 { usize::MAX } else { limit }).collect();
+            let page: Vec<_> = all
+                .into_iter()
+                .skip(offset)
+                .take(if limit == 0 { usize::MAX } else { limit })
+                .collect();
             Ok((page, total))
         })
     }
@@ -303,7 +310,10 @@ impl FreqTracker {
     }
 
     pub fn len(&self) -> usize {
-        self.freq_map.read().unwrap_or_else(|e| e.into_inner()).len()
+        self.freq_map
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .len()
     }
 
     pub fn is_empty(&self) -> bool {
@@ -369,14 +379,29 @@ mod tests {
     fn test_pinyin_decay_score() {
         let p = FreqProfile::default();
         let now = 1_000_000_000i64;
-        let fresh = FreqRecord { count: 9, last_used: now };
-        let old = FreqRecord { count: 9, last_used: now - 72 * 3600 }; // 一个半衰期前
+        let fresh = FreqRecord {
+            count: 9,
+            last_used: now,
+        };
+        let old = FreqRecord {
+            count: 9,
+            last_used: now - 72 * 3600,
+        }; // 一个半衰期前
         let s_fresh = p.pinyin_score(&fresh, now);
         let s_old = p.pinyin_score(&old, now);
         assert!(s_fresh > 0.0);
         // 一个半衰期 → 约半衰
         assert!((s_old / s_fresh - 0.5).abs() < 0.05, "半衰期处应≈半衰");
-        assert_eq!(p.pinyin_score(&FreqRecord { count: 0, last_used: now }, now), 0.0);
+        assert_eq!(
+            p.pinyin_score(
+                &FreqRecord {
+                    count: 0,
+                    last_used: now
+                },
+                now
+            ),
+            0.0
+        );
     }
 
     #[test]

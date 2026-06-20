@@ -18,19 +18,34 @@ pub fn specs() -> Vec<FuncSpec> {
 
 fn fn_get(ctx: &dyn EvalContext, args: &[String]) -> Result<String> {
     let s = services("config.get", ctx)?;
-    let config = s.config.as_ref().ok_or_else(|| CmdbarError::service("config.get"))?;
-    config.get(&args[0]).map_err(|e| runtime_err("config.get", e))
+    let config = s
+        .config
+        .as_ref()
+        .ok_or_else(|| CmdbarError::service("config.get"))?;
+    config
+        .get(&args[0])
+        .map_err(|e| runtime_err("config.get", e))
 }
 
 fn fn_set(ctx: &dyn EvalContext, args: &[String]) -> Result<String> {
     let s = services("config.set", ctx)?;
-    let config = s.config.as_ref().ok_or_else(|| CmdbarError::service("config.set"))?;
-    config.set(&args[0], &args[1]).map_err(|e| runtime_err("config.set", e))?;
+    let config = s
+        .config
+        .as_ref()
+        .ok_or_else(|| CmdbarError::service("config.set"))?;
+    config
+        .set(&args[0], &args[1])
+        .map_err(|e| runtime_err("config.set", e))?;
     Ok(String::new())
 }
 
 fn fn_toggle(ctx: &dyn EvalContext, args: &[String]) -> Result<String> {
     let s = services("config.toggle", ctx)?;
-    let config = s.config.as_ref().ok_or_else(|| CmdbarError::service("config.toggle"))?;
-    config.toggle(&args[0]).map_err(|e| runtime_err("config.toggle", e))
+    let config = s
+        .config
+        .as_ref()
+        .ok_or_else(|| CmdbarError::service("config.toggle"))?;
+    config
+        .toggle(&args[0])
+        .map_err(|e| runtime_err("config.toggle", e))
 }

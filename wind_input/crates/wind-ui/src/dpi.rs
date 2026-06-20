@@ -12,7 +12,7 @@
 #[cfg(windows)]
 pub fn scale_for_point(x: i32, y: i32) -> f32 {
     use windows::Win32::Foundation::POINT;
-    use windows::Win32::Graphics::Gdi::{MonitorFromPoint, MONITOR_DEFAULTTONEAREST};
+    use windows::Win32::Graphics::Gdi::{MONITOR_DEFAULTTONEAREST, MonitorFromPoint};
     use windows::Win32::UI::HiDpi::{GetDpiForMonitor, MDT_EFFECTIVE_DPI};
     unsafe {
         let mon = MonitorFromPoint(POINT { x, y }, MONITOR_DEFAULTTONEAREST);

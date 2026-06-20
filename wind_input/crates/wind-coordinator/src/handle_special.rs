@@ -2,8 +2,7 @@
 //!
 //! 从 coordinator.rs 拆出（同 crate 内 `impl Coordinator` 块，组织性重构，无逻辑变更）。
 
-
-use crate::coordinator::{punct_char, Coordinator, State};
+use crate::coordinator::{Coordinator, State, punct_char};
 use crate::pipeline::ModeKind;
 use tracing::debug;
 use wind_bridge::handler::{KeyAction, KeyEventData};
@@ -35,7 +34,8 @@ impl Coordinator {
 
     /// 特殊模式引用的方案 id（features.special_modes[idx].schema）。
     pub(crate) fn special_schema(&self, idx: u8) -> Option<String> {
-        self.rt().config
+        self.rt()
+            .config
             .features
             .special_modes
             .get(idx as usize)
@@ -44,7 +44,12 @@ impl Coordinator {
     }
 
     /// 进入特殊模式（其方案须可加载，由激活点 ensure_schema 保证）。清空普通输入，初始化空编码缓冲。
-    pub(crate) fn enter_special_mode(&self, state: &mut State, idx: u8, key_code: u32) -> KeyAction {
+    pub(crate) fn enter_special_mode(
+        &self,
+        state: &mut State,
+        idx: u8,
+        key_code: u32,
+    ) -> KeyAction {
         state.input_buffer.clear();
         state.candidates.clear();
         state.active = Some(ModeKind::Special(idx));
@@ -201,17 +206,16 @@ impl Coordinator {
             _ => {
                 let shift = data.modifiers & MOD_SHIFT != 0;
                 // 二三候选键 → 选候选
-                if !shift
-                    && let Some(offset) = self.select_key_offset(data.key_code) {
-                        let (start, end) = self.page_range(state);
-                        let gi = start + offset;
-                        if gi < end {
-                            let text = state.candidates[gi].text.clone();
-                            self.exit_special_mode(state);
-                            self.notify_ui_hide();
-                            return Self::commit_action(text, true);
-                        }
+                if !shift && let Some(offset) = self.select_key_offset(data.key_code) {
+                    let (start, end) = self.page_range(state);
+                    let gi = start + offset;
+                    if gi < end {
+                        let text = state.candidates[gi].text.clone();
+                        self.exit_special_mode(state);
+                        self.notify_ui_hide();
+                        return Self::commit_action(text, true);
                     }
+                }
                 // 其它可打印标点：顶屏当前高亮候选 + 转换后标点，退出
                 if let Some(ch) = punct_char(data.key_code, shift) {
                     let committed = if !state.candidates.is_empty() {

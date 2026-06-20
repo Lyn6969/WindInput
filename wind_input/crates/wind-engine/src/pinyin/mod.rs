@@ -328,7 +328,10 @@ mod tests {
     use wind_store::Store;
 
     fn empty_engine() -> PinyinEngine {
-        PinyinEngine::new(Config::default(), CachedDict::Memory(CodetableDict::empty()))
+        PinyinEngine::new(
+            Config::default(),
+            CachedDict::Memory(CodetableDict::empty()),
+        )
     }
 
     fn tmp_store(name: &str) -> Arc<Store> {
@@ -342,10 +345,18 @@ mod tests {
     fn store_layer_words_appear_in_candidates() {
         let store = tmp_store("layer_show");
         store.add_user_word("pinyin", "nihao", "你好", 500).unwrap();
-        store.learn_temp_word("pinyin", "lanshou", "蓝瘦", 800, 0).unwrap();
+        store
+            .learn_temp_word("pinyin", "lanshou", "蓝瘦", 800, 0)
+            .unwrap();
         let dm = DictManager::new();
-        dm.register_layer(Box::new(wind_dict::StoreUserLayer::new(store.clone(), "pinyin")));
-        dm.register_layer(Box::new(wind_dict::StoreTempLayer::new(store.clone(), "pinyin")));
+        dm.register_layer(Box::new(wind_dict::StoreUserLayer::new(
+            store.clone(),
+            "pinyin",
+        )));
+        dm.register_layer(Box::new(wind_dict::StoreTempLayer::new(
+            store.clone(),
+            "pinyin",
+        )));
         let engine = empty_engine().with_store_layers(Arc::new(dm));
 
         // 整串精确命中用户词
@@ -358,7 +369,11 @@ mod tests {
         let r2 = engine.convert("lanshou", 20).unwrap();
         let shou = r2.candidates.iter().find(|c| c.text == "蓝瘦");
         assert!(shou.is_some(), "临时造词「蓝瘦」应出现在拼音候选");
-        assert_eq!(shou.unwrap().source, CandidateSource::Pinyin, "来源应标为拼音");
+        assert_eq!(
+            shou.unwrap().source,
+            CandidateSource::Pinyin,
+            "来源应标为拼音"
+        );
     }
 
     /// 无 store 层时行为不变（不 panic、空词典无候选）。
@@ -376,11 +391,18 @@ mod tests {
         let store = tmp_store("layer_partial");
         store.add_user_word("pinyin", "nihao", "你好", 500).unwrap();
         let dm = DictManager::new();
-        dm.register_layer(Box::new(wind_dict::StoreUserLayer::new(store.clone(), "pinyin")));
+        dm.register_layer(Box::new(wind_dict::StoreUserLayer::new(
+            store.clone(),
+            "pinyin",
+        )));
         let engine = empty_engine().with_store_layers(Arc::new(dm));
         let r = engine.convert("nihaoma", 20).unwrap();
         let c = r.candidates.iter().find(|c| c.text == "你好");
         assert!(c.is_some(), "前缀用户词应作为分段候选出现");
-        assert_eq!(c.unwrap().consumed_length, "nihao".len(), "应只消费前缀 nihao");
+        assert_eq!(
+            c.unwrap().consumed_length,
+            "nihao".len(),
+            "应只消费前缀 nihao"
+        );
     }
 }

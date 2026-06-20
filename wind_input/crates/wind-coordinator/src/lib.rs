@@ -15,14 +15,12 @@ pub mod handle_punct;
 pub mod handle_quick;
 pub mod handle_special;
 pub mod handle_temp;
-pub mod handle_url;
 pub mod handle_tooltip;
+pub mod handle_url;
 pub mod hotkey_match;
 pub mod pipeline;
 pub mod stats;
 pub mod watchdog;
 pub mod webdata;
 
-pub use coordinator::{
-    Coordinator, request_restart, restart_signal, set_settings_url_provider,
-};
+pub use coordinator::{Coordinator, request_restart, restart_signal, set_settings_url_provider};

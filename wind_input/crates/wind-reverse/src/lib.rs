@@ -49,12 +49,13 @@ impl ReverseLookup {
             };
             let mut chars = ch.chars();
             if let (Some(c), None) = (chars.next(), chars.next())
-                && let Some(code) = code {
-                    let code = code.trim();
-                    if !code.is_empty() {
-                        self.code.insert(c, code.to_string());
-                    }
+                && let Some(code) = code
+            {
+                let code = code.trim();
+                if !code.is_empty() {
+                    self.code.insert(c, code.to_string());
                 }
+            }
         }
     }
 
@@ -83,9 +84,10 @@ impl ReverseLookup {
                 .split_whitespace()
                 .find(|t| *t != "->" && *t != "?" && *t != "<-" && !t.starts_with('#'));
             if let Some(py) = py
-                && !py.is_empty() {
-                    self.pinyin.insert(c, py.to_string());
-                }
+                && !py.is_empty()
+            {
+                self.pinyin.insert(c, py.to_string());
+            }
         }
     }
 
@@ -105,13 +107,21 @@ impl ReverseLookup {
     pub fn wubi_word_code(&self, text: &str) -> String {
         let chars: Vec<char> = text.chars().collect();
         let firstn = |c: char, n: usize| -> String {
-            self.code.get(&c).map(|s| s.chars().take(n).collect()).unwrap_or_default()
+            self.code
+                .get(&c)
+                .map(|s| s.chars().take(n).collect())
+                .unwrap_or_default()
         };
         match chars.len() {
             0 => String::new(),
             1 => self.code.get(&chars[0]).cloned().unwrap_or_default(),
             2 => format!("{}{}", firstn(chars[0], 2), firstn(chars[1], 2)),
-            3 => format!("{}{}{}", firstn(chars[0], 1), firstn(chars[1], 1), firstn(chars[2], 2)),
+            3 => format!(
+                "{}{}{}",
+                firstn(chars[0], 1),
+                firstn(chars[1], 1),
+                firstn(chars[2], 2)
+            ),
             _ => {
                 let last = *chars.last().unwrap();
                 format!(

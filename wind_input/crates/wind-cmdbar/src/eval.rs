@@ -5,7 +5,7 @@
 //! （宿主走 InsertText 上屏），其余为 [`crate::action::ActionKind::Effect`]。
 
 use crate::action::ResolvedAction;
-use crate::ast::{fmt_number, ArrayPhrase, CommandPhrase, Expr, Modifiers, Phrase, StringPart};
+use crate::ast::{ArrayPhrase, CommandPhrase, Expr, Modifiers, Phrase, StringPart, fmt_number};
 use crate::context::EvalContext;
 use crate::error::{CmdbarError, Result};
 use crate::registry::Registry;
@@ -105,7 +105,7 @@ pub fn expand_array(
                 return Err(CmdbarError::runtime(
                     "expand_array",
                     format!("element {} unsupported expr {other:?}", i + 1),
-                ))
+                ));
             }
         }
     }

@@ -2,12 +2,12 @@
 //!
 //! 从 coordinator.rs 拆出（同 crate 内 `impl Coordinator` 块，组织性重构，无逻辑变更）。
 
-use crate::coordinator::{now_unix_secs, Coordinator, InputOutcome, State, PHRASE_WEIGHT_BASE};
+use crate::coordinator::{Coordinator, InputOutcome, PHRASE_WEIGHT_BASE, State, now_unix_secs};
 use crate::pipeline::ModeKind;
-use wind_config::hotkey;
 use tracing::{debug, warn};
 use wind_bridge::handler::{KeyAction, KeyEventData};
 use wind_candidate::Candidate;
+use wind_config::hotkey;
 use wind_store::freq::FreqRecord;
 use wind_ui::manager::CandidateOp;
 
@@ -125,7 +125,11 @@ impl Coordinator {
     /// 返回引擎候选数（不含短语），供判断 has_more。不复位翻页/高亮。
     /// 返回 (引擎候选数, 输入结局)。结局含全码自动上屏 / 满码空码清空；自动上屏文本经
     /// shadow 复核后才放行，避免上屏被置顶删词移除的候选。调用方仅在「正向输入字母」时消费。
-    pub(crate) fn build_candidates(&self, state: &mut State, limit: usize) -> (usize, InputOutcome) {
+    pub(crate) fn build_candidates(
+        &self,
+        state: &mut State,
+        limit: usize,
+    ) -> (usize, InputOutcome) {
         // 分段上屏进行中（committed 前缀非空 ⟺ 来自拼音选词——五笔候选 consumed_length=0
         // 永不部分匹配）：剩余编码强制按拼音方案转换，避免混输让五笔抢首选（你↑选后 hao→虚）。
         let result = if !state.committed_text.is_empty()
@@ -279,8 +283,11 @@ impl Coordinator {
             _ => return,
         };
         // 纯重排逻辑下沉 wind_candidate（用元组解耦，避免该 crate 依赖 wind-store）。
-        let pinned: Vec<(String, usize)> =
-            rec.pinned.iter().map(|p| (p.word.clone(), p.position)).collect();
+        let pinned: Vec<(String, usize)> = rec
+            .pinned
+            .iter()
+            .map(|p| (p.word.clone(), p.position))
+            .collect();
         wind_candidate::apply_shadow(candidates, &rec.deleted, &pinned);
     }
 
@@ -364,7 +371,11 @@ impl Coordinator {
     /// overlay 候选模式的导航分派：码表型（特殊/临拼，及不含 quick_input 的 mix）`-`/`=` 作翻页；
     /// 文本型（临英）、表达式型（快捷输入）、含 quick_input 的 mix（`-`/`=` 是运算符输入）不把
     /// `-`/`=` 当导航。由 active 自判。
-    pub(crate) fn handle_candidate_nav(&self, state: &mut State, data: &KeyEventData) -> Option<KeyAction> {
+    pub(crate) fn handle_candidate_nav(
+        &self,
+        state: &mut State,
+        data: &KeyEventData,
+    ) -> Option<KeyAction> {
         let include_printable = match state.active {
             Some(ModeKind::Special(_)) | Some(ModeKind::TempPinyin) => true,
             Some(ModeKind::Mix(idx)) => !self.mix_has_quick_input(idx),

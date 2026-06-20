@@ -3,7 +3,7 @@
 use super::func_specs;
 use crate::context::EvalContext;
 use crate::error::Result;
-use crate::registry::{default_registry, FuncSpec};
+use crate::registry::{FuncSpec, default_registry};
 
 pub fn specs() -> Vec<FuncSpec> {
     func_specs! {

@@ -134,13 +134,13 @@ impl PushServer {
         let label = if chinese_mode { "中" } else { "英" };
         let resp = wind_ipc::codec::encode_activation_status_push(
             chinese_mode,
-            false,  // full_width
-            true,   // chinese_punct
-            true,   // toolbar_visible
-            false,  // caps_lock
-            false,  // host_render_avail
-            &[],    // key_down_hotkeys
-            &[],    // key_up_hotkeys
+            false, // full_width
+            true,  // chinese_punct
+            true,  // toolbar_visible
+            false, // caps_lock
+            false, // host_render_avail
+            &[],   // key_down_hotkeys
+            &[],   // key_up_hotkeys
             label,
         );
         self.push_to_active(&resp);
@@ -218,7 +218,12 @@ fn run_push_pipe_server(pipe_name: &str, clients: Arc<Mutex<Vec<PushClient>>>) {
         {
             let mut bytes_written: u32 = 0;
             let write_ok = unsafe {
-                WriteFile(pipe_handle, Some(&ready_msg), Some(&mut bytes_written), None)
+                WriteFile(
+                    pipe_handle,
+                    Some(&ready_msg),
+                    Some(&mut bytes_written),
+                    None,
+                )
             };
             if write_ok.is_err() {
                 warn!("Failed to send SERVICE_READY to push client");
@@ -234,8 +239,14 @@ fn run_push_pipe_server(pipe_name: &str, clients: Arc<Mutex<Vec<PushClient>>>) {
         // 读取客户端 token（8 字节）
         let mut token_buf = [0u8; 8];
         let mut bytes_read: u32 = 0;
-        let read_ok =
-            unsafe { ReadFile(pipe_handle, Some(&mut token_buf), Some(&mut bytes_read), None) };
+        let read_ok = unsafe {
+            ReadFile(
+                pipe_handle,
+                Some(&mut token_buf),
+                Some(&mut bytes_read),
+                None,
+            )
+        };
 
         if read_ok.is_err() || bytes_read != 8 {
             warn!("Failed to read push client token");

@@ -61,8 +61,14 @@ pub fn rerank_codetable_usedfirst(
             (None, Some(_)) => Ordering::Greater,
             (None, None) => Ordering::Equal, // 同档均无记录 → 维持引擎权重序（稳定排序）
             (Some(ra), Some(rb)) => match strategy {
-                FreqStrategy::Top => rb.last_used.cmp(&ra.last_used).then(rb.count.cmp(&ra.count)),
-                FreqStrategy::Step => rb.count.cmp(&ra.count).then(rb.last_used.cmp(&ra.last_used)),
+                FreqStrategy::Top => rb
+                    .last_used
+                    .cmp(&ra.last_used)
+                    .then(rb.count.cmp(&ra.count)),
+                FreqStrategy::Step => rb
+                    .count
+                    .cmp(&ra.count)
+                    .then(rb.last_used.cmp(&ra.last_used)),
             },
         }
     });
@@ -91,7 +97,11 @@ pub fn rerank_pinyin_decay(
         let sa = a.weight >= PINYIN_SENTENCE_FLOOR;
         let sb = b.weight >= PINYIN_SENTENCE_FLOOR;
         if sa != sb {
-            return if sa { Ordering::Less } else { Ordering::Greater };
+            return if sa {
+                Ordering::Less
+            } else {
+                Ordering::Greater
+            };
         }
         if sa {
             return Ordering::Equal; // 均为整句/短语 → 维持引擎权重序
@@ -101,7 +111,11 @@ pub fn rerank_pinyin_decay(
         let ua = pa >= PINYIN_FREQ_EPSILON;
         let ub = pb >= PINYIN_FREQ_EPSILON;
         if ua != ub {
-            return if ua { Ordering::Less } else { Ordering::Greater };
+            return if ua {
+                Ordering::Less
+            } else {
+                Ordering::Greater
+            };
         }
         if ua {
             return pb.partial_cmp(&pa).unwrap_or(Ordering::Equal);
@@ -156,7 +170,11 @@ mod tests {
     /// 整句豁免：高权重整句恒置顶，即使某非整句词被频繁使用也不能反超。
     #[test]
     fn pinyin_sentence_is_anchored_on_top() {
-        let mut cands = vec![pin("你好世界", 30_000_000), pin("你好", 2000), pin("拟", 1000)];
+        let mut cands = vec![
+            pin("你好世界", 30_000_000),
+            pin("你好", 2000),
+            pin("拟", 1000),
+        ];
         let r = recs(&[("你好", 20, NOW)]);
         rerank_pinyin_decay(&mut cands, &r, NOW);
         assert_eq!(cands[0].text, "你好世界", "整句必须锚定首位");
@@ -186,7 +204,11 @@ mod tests {
     /// 码表 used-first（step）：用过的词按 count 降序置前，未用维持权重序殿后。
     #[test]
     fn codetable_step_orders_by_count() {
-        let mut cands = vec![ct("aaaa", "工", 100), ct("aaaa", "戈", 90), ct("aaaa", "啊", 80)];
+        let mut cands = vec![
+            ct("aaaa", "工", 100),
+            ct("aaaa", "戈", 90),
+            ct("aaaa", "啊", 80),
+        ];
         let r = recs(&[("戈", 5, NOW), ("工", 2, NOW)]);
         rerank_codetable_usedfirst(&mut cands, &r, "aaaa", FreqStrategy::Step);
         assert_eq!(cands[0].text, "戈", "step：count 高者置前");

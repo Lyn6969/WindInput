@@ -7,7 +7,7 @@
 //!
 //! key = "YYYY-MM-DD"（STATS_DAILY 表），value = DailyStats 的 JSON（每日一条、写入低频）。
 
-use crate::store::{Store, STATS_DAILY};
+use crate::store::{STATS_DAILY, Store};
 use chrono::{Duration, NaiveDate};
 use redb::ReadableTable;
 use serde::{Deserialize, Serialize};
@@ -140,7 +140,11 @@ impl Store {
 
         // 连续天数：从今天（若今天无数据则从昨天）往前数有记录的天数。
         if let Some(td) = today_date {
-            let mut cur = if have.contains(today) { td } else { td - Duration::days(1) };
+            let mut cur = if have.contains(today) {
+                td
+            } else {
+                td - Duration::days(1)
+            };
             while have.contains(&cur.format("%Y-%m-%d").to_string()) {
                 s.streak += 1;
                 cur -= Duration::days(1);

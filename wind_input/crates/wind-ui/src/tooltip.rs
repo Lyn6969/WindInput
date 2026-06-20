@@ -125,7 +125,11 @@ impl Tooltip {
         }
 
         // 软投影四向扩边：内容布局起点移到 (ml, mt)，窗口位置左上回移。
-        let (ml, mt, mr, mb) = self.shadow.as_ref().map(|sh| sh.margins()).unwrap_or((0, 0, 0, 0));
+        let (ml, mt, mr, mb) = self
+            .shadow
+            .as_ref()
+            .map(|sh| sh.margins())
+            .unwrap_or((0, 0, 0, 0));
         tip.layout(ml as f32, mt as f32, &self.renderer);
         let (w_f, h_f) = tip.measured_size();
         let cw = (w_f.ceil() as u32).max(24);
@@ -139,7 +143,16 @@ impl Tooltip {
             let n = (w * h * 4) as usize;
             buf[..n].fill(0);
             if let Some(sh) = &self.shadow {
-                sh.paint(buf, w, h, ml as f32, mt as f32, cw as f32, ch as f32, tip.corner_radius);
+                sh.paint(
+                    buf,
+                    w,
+                    h,
+                    ml as f32,
+                    mt as f32,
+                    cw as f32,
+                    ch as f32,
+                    tip.corner_radius,
+                );
             }
             tip.paint(buf, w, h, &self.renderer);
         }
@@ -163,16 +176,12 @@ fn dpi_scale() -> f32 {
     #[cfg(windows)]
     {
         use windows::Win32::Foundation::HWND;
-        use windows::Win32::Graphics::Gdi::{GetDC, GetDeviceCaps, ReleaseDC, LOGPIXELSY};
+        use windows::Win32::Graphics::Gdi::{GetDC, GetDeviceCaps, LOGPIXELSY, ReleaseDC};
         unsafe {
             let hdc = GetDC(HWND::default());
             let dpi = GetDeviceCaps(hdc, LOGPIXELSY);
             ReleaseDC(HWND::default(), hdc);
-            if dpi > 0 {
-                dpi as f32 / 96.0
-            } else {
-                1.0
-            }
+            if dpi > 0 { dpi as f32 / 96.0 } else { 1.0 }
         }
     }
     #[cfg(not(windows))]
@@ -187,7 +196,7 @@ fn clamp_to_work_area(x: i32, y: i32, w: u32, h: u32) -> (i32, i32) {
     {
         use windows::Win32::Foundation::POINT;
         use windows::Win32::Graphics::Gdi::{
-            GetMonitorInfoW, MonitorFromPoint, MONITORINFO, MONITOR_DEFAULTTONEAREST,
+            GetMonitorInfoW, MONITOR_DEFAULTTONEAREST, MONITORINFO, MonitorFromPoint,
         };
         unsafe {
             let pt = POINT { x, y };
