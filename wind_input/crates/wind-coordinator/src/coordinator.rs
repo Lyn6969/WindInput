@@ -621,6 +621,9 @@ impl Coordinator {
             .layout
             .eq_ignore_ascii_case("vertical");
 
+        // 候选窗显隐运行时初值（ui.candidate.hide_window；此前恒为 false，配置不生效）。
+        let hide_candidate_window_init = config.ui.candidate.hide_window;
+
         let coordinator = Arc::new(Self {
             state: Mutex::new(State {
                 chinese_mode: config.general.default_chinese_mode,
@@ -690,7 +693,7 @@ impl Coordinator {
             self_weak: std::sync::OnceLock::new(),
             recent_commits: Mutex::new(std::collections::VecDeque::new()),
             preedit_display: Mutex::new(preedit_display_init),
-            hide_candidate_window: Mutex::new(false),
+            hide_candidate_window: Mutex::new(hide_candidate_window_init),
             candidate_vertical: Mutex::new(candidate_vertical_init),
         });
         // 命令栏：装配 Services（ime/config/dict 后端）+ 自身 Weak 引用。
@@ -750,6 +753,7 @@ impl Coordinator {
                     self.push_state_update();
                     self.notify_toolbar(); // 方案名变化 → 刷新工具栏标签
                 }
+                self.apply_ui_config(); // 外观项（候选排列/编码显示/候选窗显隐）即时生效
                 self.reload_config(); // 刷新主题/工具栏（候选窗下次输入按新配置）
                 false
             }
@@ -757,6 +761,28 @@ impl Coordinator {
                 tracing::error!("热重载配置失败: {}", e);
                 true
             }
+        }
+    }
+
+    /// 按当前配置（bundle）重新下发外观相关 UI 指令并同步运行时态。
+    /// 热重载用：候选排列方向 / 编码显示方式 / 候选窗显隐 改动即时生效（无需重启）。
+    /// 与命令栏 ime.toggle 共写同一组运行时 Mutex；以 config 为准重置（config 为持久化真相源）。
+    pub(crate) fn apply_ui_config(&self) {
+        let bundle = self.rt();
+        let cand = &bundle.config.ui.candidate;
+        // 候选排列方向（ui.candidate.layout == "vertical"）
+        let vertical = cand.layout.eq_ignore_ascii_case("vertical");
+        *self.candidate_vertical.lock().unwrap_or_else(|e| e.into_inner()) = vertical;
+        let _ = self.ui_tx.send(UiCommand::SetCandidateLayout(vertical));
+        // 编码显示方式（ui.candidate.preedit_display）
+        let mode = cand.preedit();
+        *self.preedit_display.lock().unwrap_or_else(|e| e.into_inner()) = mode;
+        let _ = self.ui_tx.send(UiCommand::SetPreeditEmbedded(mode.embedded()));
+        // 候选窗显隐（ui.candidate.hide_window）
+        let hidden = cand.hide_window;
+        *self.hide_candidate_window.lock().unwrap_or_else(|e| e.into_inner()) = hidden;
+        if hidden {
+            let _ = self.ui_tx.send(UiCommand::HideCandidates);
         }
     }
 

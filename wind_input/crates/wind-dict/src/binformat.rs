@@ -171,10 +171,13 @@ impl DictReader {
     fn read_entry(&self, entry_off: u32, entry_idx: u16) -> Option<EntryRecord> {
         let base = self.header.data_off as usize + entry_off as usize;
         let offset = base + (entry_idx as usize) * self.entry_size;
-        let buf = &self.data()[offset..];
-        if buf.len() < self.entry_size {
+        let data = self.data();
+        // 起点先于切片做边界校验：offset 可能已超出 mmap 长度（截断/半写的 .wdb），
+        // 直接 &data[offset..] 会因起点越界 panic（range start index out of range）。
+        if offset > data.len() || data.len() - offset < self.entry_size {
             return None;
         }
+        let buf = &data[offset..];
 
         let text_off = u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]);
         let text_len = u16::from_le_bytes([buf[4], buf[5]]);
