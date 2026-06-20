@@ -26,8 +26,10 @@
 #
 # 实测 / 远程部署（SSH；配置见 scripts/deploy.local: WIND_REMOTE / WIND_REMOTE_DIR）:
 #   repl [data]     本机跑候选 REPL（无需 TSF/UI；读编码→打印候选）
-#   push [debug]    交叉编译 exe 并 drop-in 到 Windows 安装目录（复用其 TSF DLL+data）；
-#                   debug → 构建 debug_variant 并推为 wind_input_debug.exe；先 taskkill 远程进程再覆盖
+#   push [debug] [data]  交叉编译 exe 并 drop-in 到 Windows 安装目录（复用其 TSF DLL+大词库）；
+#                   debug → 构建 debug_variant 并推为 wind_input_debug.exe；先 taskkill 远程进程再覆盖；
+#                   data  → exe 推完再推源 data/（manifest/方案/主题），随手同步免遗漏
+#   push-data       仅推送源 data/（manifest/方案/主题/默认配置）到 Windows，不重编 exe
 #   pull-data       从 Windows 安装目录拉 data/（真实词库）到 .cache/pulled-data/ 供 REPL 使用
 #   pull-config     从 Windows 拉 config.toml（%APPDATA%\<App>）到 .remote/ 查看
 #   pull-log [all]  从 Windows 拉日志（%LOCALAPPDATA%\<App>\logs）到 .remote/；
@@ -352,10 +354,20 @@ require_remote() {
 }
 
 # drop-in：把交叉编译的 exe 推到 Windows 安装目录。
+# 参数（顺序无关，可组合）：
+#   debug  → 构建 debug_variant 并推为 wind_input_debug.exe（缺省推 release）
+#   data   → exe 推送后，额外推送源 data/（manifest/方案/主题等；见 do_push_data）
 do_push() {
     require_remote || return 1
     cd "$PROJECT_ROOT" || return 1
-    local variant="${1:-}"
+    local variant="" push_data=""
+    local a
+    for a in "$@"; do
+        case "$a" in
+            debug) variant="debug" ;;
+            data)  push_data="1" ;;
+        esac
+    done
     local exe exe_name
     if [ "$variant" = "debug" ]; then
         say "\n构建 debug 变体 (debug_variant)..."
@@ -376,9 +388,34 @@ do_push() {
 
     say "推送 $exe_name → $WIND_REMOTE:$WIND_REMOTE_DIR/"
     if scp "$exe" "$WIND_REMOTE:$WIND_REMOTE_DIR/$exe_name"; then
-        say "已推送。请在 Windows 桌面重启 $exe_name。"
+        say "已推送 exe。"
     else
         err "scp 失败：检查 WIND_REMOTE_DIR 路径(正斜杠 C:/...)、SSH 连通、文件是否仍被占用"
+        return 1
+    fi
+
+    # 可选：连源 data/ 一并推送（manifest/方案/主题改动随 exe 一起上去）
+    if [ -n "$push_data" ]; then
+        do_push_data || return 1
+    fi
+    say "完成。请在 Windows 桌面重启 $exe_name。"
+}
+
+# 推送源 data/（$PRODUCT_ROOT/data：manifest/方案 toml/主题/默认配置/短语）到 Windows 安装目录的 data/。
+# 仅覆盖同名文件、新增缺失文件（scp 合并语义，不删除）——远端组装的大词库（拼音/opencc/unigram，
+# 由 .cache 组装、不在源 data/）不受影响。适合改完 manifest/schema/theme 后单独同步，无需重编 exe。
+do_push_data() {
+    require_remote || return 1
+    local src="$PRODUCT_ROOT/data"
+    [ -d "$src" ] || { err "源 data/ 不存在: $src"; return 1; }
+    say "\n推送源 data/ → $WIND_REMOTE:$WIND_REMOTE_DIR/data/ ($(du -sh "$src" 2>/dev/null | cut -f1))"
+    # 推送 data/ 内容（用 /* 推内容而非目录本身，避免 scp 生成 data/data 嵌套）。
+    # 远端 data/ 已随安装存在；若不存在 scp 会明确报错（按提示先做一次完整 deploy）。
+    if scp -r "$src"/* "$WIND_REMOTE:$WIND_REMOTE_DIR/data/"; then
+        say "已推送源 data/（远端大词库未触碰）。manifest 改动重启或「重载配置」后生效。"
+    else
+        err "scp data 失败：检查 WIND_REMOTE_DIR/data 路径、SSH、文件占用"
+        return 1
     fi
 }
 
@@ -492,7 +529,8 @@ show_menu() {
     printf '\n%b  实测 / 远程 (SSH → %s):%b\n' "$C_YELLOW" "${WIND_REMOTE:-未配置}" "$C_RESET"
     echo  "    r  - 候选 REPL (本机验证, 无需 Windows)"
     echo  "    p  - push: 交叉编译 exe → Windows (release)"
-    echo  "    pd - push debug: → wind_input_debug.exe (调试)"
+    echo  "    pd - push debug: exe + 源 data/ → Windows (调试)"
+    echo  "    pda- push-data: 仅推源 data/ (manifest/方案/主题, 不重编 exe)"
     echo  "    dl - pull-data: 从 Windows 拉真实词库 → .cache/pulled-data/"
     echo  "    pc - pull-config: 从 Windows 拉 config.toml 回本机查看"
     echo  "    pl - pull-log: 从 Windows 拉最新日志回本机 (pla = 整目录)"
@@ -523,7 +561,8 @@ menu_loop() {
             7)   copy_data "$BUILD_DEBUG_DIR"; pause ;;
             r)   do_repl;           pause ;;
             p)   do_push;           pause ;;
-            pd)  do_push debug;     pause ;;
+            pd)  do_push debug data; pause ;;
+            pda) do_push_data;      pause ;;
             dl)  do_pull_data;      pause ;;
             pc)  do_pull_config;    pause ;;
             pl)  do_pull_log;       pause ;;
@@ -555,7 +594,8 @@ case "${1:-}" in
     clean|c)            do_clean ;;
     ci|i)               do_ci ;;
     repl)               do_repl "${2:-}" ;;
-    push)               do_push "${2:-}" ;;
+    push)               do_push "${2:-}" "${3:-}" ;;
+    push-data|pushdata) do_push_data ;;
     pull-data)          do_pull_data ;;
     pull-config)        do_pull_config ;;
     pull-log)           do_pull_log "${2:-}" ;;
