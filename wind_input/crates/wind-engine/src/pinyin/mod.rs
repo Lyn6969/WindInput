@@ -13,6 +13,7 @@
 
 pub mod dag;
 pub mod fuzzy;
+pub mod generate;
 pub mod lattice;
 pub mod lm;
 pub mod parser;
@@ -24,10 +25,11 @@ pub mod viterbi;
 use crate::engine::{ConvertResult, Engine, EngineType};
 use dag::Dag;
 use fuzzy::FuzzyConfig;
+use generate::CharPinyinIndex;
 use lattice::LatticeBuilder;
 use lm::UnigramLookup;
 use scorer::AbbrevMatcher;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use syllable::SyllableTrie;
 use viterbi::{ViterbiDecoder, WordNode};
 use wind_candidate::{Candidate, CandidateSource};
@@ -61,6 +63,8 @@ pub struct PinyinEngine {
     /// 用户/临时造词层（L 造词显现）：仅含 StoreUserLayer/StoreTempLayer，无系统层。
     /// 拼音候选除主词典外，按相同的码并入这些层的用户造词（None=无持久化，如纯测试）。
     store_layers: Option<Arc<DictManager>>,
+    /// 造词反推用的单字读音索引（懒构建：首次 generate_word_pinyin 时从词典派生）。
+    char_pinyin_idx: OnceLock<CharPinyinIndex>,
 }
 
 impl PinyinEngine {
@@ -82,6 +86,7 @@ impl PinyinEngine {
             fuzzy_config: FuzzyConfig::default(),
             unigram,
             store_layers: None,
+            char_pinyin_idx: OnceLock::new(),
         }
     }
 
@@ -94,6 +99,17 @@ impl PinyinEngine {
     /// 总条目数
     pub fn entry_count(&self) -> usize {
         self.dict.len()
+    }
+
+    /// 为词语生成全拼编码（如"你好"→"nihao"），解决多音字在词里的读音消歧。
+    ///
+    /// 用于：加词页自动填编码、词库批量导入、造词学习的编码反推 fallback。
+    /// 单字读音索引按词典权重懒构建并缓存。含无读音字符时返回 `None`。
+    pub fn generate_word_pinyin(&self, word: &str) -> Option<String> {
+        let idx = self
+            .char_pinyin_idx
+            .get_or_init(|| CharPinyinIndex::build(&self.dict));
+        generate::generate_word_pinyin(&self.dict, idx, word)
     }
 
     /// 计算 preedit 显示与音节信息
