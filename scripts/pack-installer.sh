@@ -118,7 +118,7 @@ echo ">>> 阶段二:bundle ..."
 rm -f "$ARCHIVE"
 cleanup; trap - EXIT
 
-SIZE="$(du -h "$OUTPUT" | cut -f1)"
+SIZE="$(du -h --apparent-size "$OUTPUT" | cut -f1)"
 echo "================================================"
 echo "  ✅ 打包完成: $OUTPUT ($SIZE)"
 echo "================================================"
