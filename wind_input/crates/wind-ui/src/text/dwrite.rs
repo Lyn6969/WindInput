@@ -537,7 +537,9 @@ mod imp {
     }
 }
 
-// 非 Windows mock 文本渲染器的冒烟测试。
+// 非 Windows mock 文本渲染器的冒烟测试：验证 mock 的等宽近似测量契约
+// （字符数 × 字号 × 0.6）与 draw_text 空操作。
+// 边界：真实字形宽度/渲染由 Windows + DirectWrite 决定，**不在此覆盖，须 Windows 实测**。
 #[cfg(all(test, not(windows)))]
 mod tests {
     use super::TextRenderer;

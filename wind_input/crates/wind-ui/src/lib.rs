@@ -1,6 +1,21 @@
 //! wind-ui: UI 渲染层（tiny-skia 渲染、Layered Window、多种窗口类型）
 //!
 //! 与 Go 版本 `wind_input/internal/ui/` 对齐。
+//!
+//! # 跨平台与测试边界
+//!
+//! 本 crate 在非 Windows 平台（Linux/macOS）以 mock 编译，便于在 Linux 上跑测试。
+//! 但并非所有逻辑在 Linux 都是“真实”验证——按可测性分三类：
+//!
+//! - **跨平台真实**（Linux 测试 == Windows 行为）：[`view`] 的盒模型布局
+//!   （measure/arrange/collect_hits）与形状绘制（fill_rounded/circle/ring/shadow，
+//!   基于纯 Rust 的 tiny-skia 光栅化）、[`viewbox`]、[`debounce`]、[`image_cache`]。
+//! - **mock 近似**（Linux 可测但数值是占位）：[`text::dwrite`] 的文本测量在非 Windows
+//!   返回 `字符数 × 字号 × 0.6` 的等宽近似；真实字形宽度需 Windows + DirectWrite。
+//!   含文本的布局测试因此 gate 到 `not(windows)`，以 mock 的确定尺寸做精确断言。
+//! - **仅占位、Linux 测不到真实行为**（必须 Windows 回归）：[`window`] 的 Layered Window
+//!   （UpdateLayeredWindow/消息分发）、[`text::dwrite`] 的实际字形渲染、popup_menu 剪贴板、
+//!   manager 的 Win32 消息泵。这些在非 Windows 是空实现，其测试仅验证 mock 的 API 契约。
 
 pub mod candidate_window;
 pub mod debounce;
