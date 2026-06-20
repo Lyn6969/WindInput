@@ -34,6 +34,22 @@ fn today_str() -> String {
 }
 
 impl Coordinator {
+    /// 枚举本机字体族名（去重升序）。供 system.fonts 经 CoreStatus 注入。
+    /// 首次调用会扫描系统字体目录（fontdb），开销可接受（设置页打开字体选择时一次）。
+    pub fn list_font_families(&self) -> Vec<String> {
+        let mut db = fontdb::Database::new();
+        db.load_system_fonts();
+        let mut set = std::collections::BTreeSet::new();
+        for face in db.faces() {
+            if let Some((family, _)) = face.families.first() {
+                if !family.is_empty() {
+                    set.insert(family.clone());
+                }
+            }
+        }
+        set.into_iter().collect()
+    }
+
     /// 数据类 RPC 总分派。方法名以 `<ns>.<method>` 形式分组；未知方法返回 Err。
     pub fn web_data_rpc(&self, method: &str, params: &Value) -> anyhow::Result<Value> {
         match method {
@@ -101,9 +117,11 @@ impl Coordinator {
 
             // ── theme.* ──────────────────────────────────────────
             "theme.list" => self.web_theme_list(),
-            "theme.preview" => Ok(json!({})), // 🚧 待深化
-            "theme.delete" | "theme.importFromText" | "theme.importFromUrl" => {
-                Ok(json!({ "ok": true }))
+            "theme.preview" => self.web_theme_preview(params),
+            "theme.delete" => self.web_theme_delete(params),
+            "theme.importFromText" => self.web_theme_import_text(params),
+            "theme.importFromUrl" => {
+                anyhow::bail!("URL 导入未启用（features.theme.import_url=false）")
             }
 
             other => anyhow::bail!("unknown method: {}", other),
@@ -663,6 +681,69 @@ impl Coordinator {
             .to_string();
         let n = store.prune_stats_before(&before)?;
         Ok(json!({ "pruned": n }))
+    }
+
+    /// 主题查找目录：用户主题（user_config_dir/themes）优先，回退内置（data/themes）。
+    fn theme_dirs(&self) -> Vec<std::path::PathBuf> {
+        let mut dirs = Vec::new();
+        if let Some(u) = wind_config::Config::user_config_dir() {
+            dirs.push(u.join("themes"));
+        }
+        if let Some(d) = &self.themes_dir {
+            dirs.push(d.clone());
+        }
+        dirs
+    }
+
+    /// 用户主题写入目录（导入/删除）。
+    fn user_themes_dir(&self) -> Option<std::path::PathBuf> {
+        wind_config::Config::user_config_dir().map(|u| u.join("themes"))
+    }
+
+    fn web_theme_preview(&self, params: &Value) -> anyhow::Result<Value> {
+        let name = str_param(params, "name")?;
+        let dirs = self.theme_dirs();
+        // 合并 base 链后的原始主题配置（serde_yaml::Value → JSON），供前端预览渲染。
+        let merged = wind_theme::load_merged_dirs(&dirs, name, 0)?;
+        Ok(serde_json::to_value(&merged)?)
+    }
+
+    fn web_theme_delete(&self, params: &Value) -> anyhow::Result<Value> {
+        let name = str_param(params, "name")?;
+        let user_dir = self
+            .user_themes_dir()
+            .ok_or_else(|| anyhow::anyhow!("无用户主题目录"))?;
+        let target = user_dir.join(name);
+        if !target.join("theme.yaml").exists() {
+            anyhow::bail!("内置主题不可删除或主题不存在: {}", name);
+        }
+        std::fs::remove_dir_all(&target)?;
+        Ok(json!({ "ok": true }))
+    }
+
+    fn web_theme_import_text(&self, params: &Value) -> anyhow::Result<Value> {
+        let yaml = str_param(params, "yaml")?;
+        let force = params.get("force").and_then(|v| v.as_bool()).unwrap_or(false);
+        // 校验可解析为合法主题。
+        wind_theme::validate_text(yaml)?;
+        let meta = wind_theme::meta_from_text(yaml)
+            .ok_or_else(|| anyhow::anyhow!("主题缺少 meta.name"))?;
+        if meta.name.trim().is_empty() {
+            anyhow::bail!("主题 meta.name 为空");
+        }
+        let user_dir = self
+            .user_themes_dir()
+            .ok_or_else(|| anyhow::anyhow!("无用户主题目录"))?;
+        let target = user_dir.join(&meta.name);
+        if target.join("theme.yaml").exists() && !force {
+            anyhow::bail!("主题已存在（force=false）: {}", meta.name);
+        }
+        std::fs::create_dir_all(&target)?;
+        let file = target.join("theme.yaml");
+        let tmp = file.with_extension("yaml.tmp");
+        std::fs::write(&tmp, yaml.as_bytes())?;
+        std::fs::rename(&tmp, &file)?;
+        Ok(json!({ "ok": true }))
     }
 
     fn web_theme_list(&self) -> anyhow::Result<Value> {

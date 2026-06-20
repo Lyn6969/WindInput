@@ -52,6 +52,20 @@ pub fn read_meta(dirs: &[PathBuf], name: &str) -> Option<Meta> {
     serde_yaml::from_value(v.get("meta")?.clone()).ok()
 }
 
+/// 从主题 yaml 文本解析其 meta（不读盘；用于导入时取主题名）。
+pub fn meta_from_text(yaml: &str) -> Option<Meta> {
+    let v: Value = serde_yaml::from_str(yaml).ok()?;
+    serde_yaml::from_value(v.get("meta")?.clone()).ok()
+}
+
+/// 校验主题 yaml 文本可解析为合法 Theme（导入前校验）。Err 含原因。
+pub fn validate_text(yaml: &str) -> anyhow::Result<()> {
+    let v: Value =
+        serde_yaml::from_str(yaml).map_err(|e| anyhow::anyhow!("YAML 解析失败: {}", e))?;
+    serde_yaml::from_value::<Theme>(v).map_err(|e| anyhow::anyhow!("主题结构非法: {}", e))?;
+    Ok(())
+}
+
 /// 加载并 base 深合并主题，解析为类型化 `Theme`（未求值的原始 schema）。
 /// 合并在 Value 层完成（先合并后类型化），未知字段忽略（前向兼容）。
 pub fn load_typed(themes_dir: &Path, name: &str) -> anyhow::Result<Theme> {
@@ -115,5 +129,27 @@ pub fn merge(base: Value, over: Value) -> Value {
         }
         // 非映射：over 优先
         (_, over) => over,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn meta_from_text_extracts_name() {
+        let y = "meta:\n  name: 测试主题\n  author: me\nviews: {}\n";
+        let m = meta_from_text(y).expect("应解析出 meta");
+        assert_eq!(m.name, "测试主题");
+        assert_eq!(m.author, "me");
+        // 无 meta → None
+        assert!(meta_from_text("foo: 1\n").is_none());
+    }
+
+    #[test]
+    fn validate_text_accepts_valid_rejects_garbage() {
+        assert!(validate_text("meta:\n  name: ok\n").is_ok());
+        // 非法 YAML
+        assert!(validate_text("  : : :\n\t- bad").is_err());
     }
 }

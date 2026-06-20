@@ -2412,6 +2412,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "chrono",
+ "fontdb",
  "serde",
  "serde_json",
  "tokio",

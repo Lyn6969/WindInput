@@ -11,5 +11,5 @@ pub mod theme;
 pub use palette::Rgba;
 pub use resolve::{load_resolved, load_resolved_dirs, resolve, Resolved, ResolvedBehavior};
 pub use schema::Meta;
-pub use theme::{find_theme_dir, read_meta};
+pub use theme::{find_theme_dir, load_merged_dirs, meta_from_text, read_meta, validate_text};
 pub use rvnode::{RvGradient, RvImage, RvNode, RvViews};

@@ -30,7 +30,10 @@ fn handle(state: &WebState, method: &str, params: &Value) -> anyhow::Result<Valu
             "activeSchema": state.status.active_schema_id(),
         })),
         "system.manifest" => Ok(state.manifest.clone()),
-        "system.fonts" => Ok(json!([])), // 本机字体枚举属平台能力，MVP 返回空表
+        // 本机字体枚举（平台能力经 CoreStatus 注入；dev server 默认空表）。
+        "system.fonts" => Ok(Value::Array(
+            state.status.fonts().into_iter().map(|f| json!({ "family": f })).collect(),
+        )),
         "system.notifyReload" => Ok(json!({ "ok": true })),
         "config.get" => {
             let cfg = Config::load(Config::data_dir().as_deref())?;

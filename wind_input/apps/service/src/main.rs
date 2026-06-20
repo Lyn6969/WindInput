@@ -159,6 +159,9 @@ impl wind_webapi::CoreStatus for WebStatus {
     ) -> anyhow::Result<serde_json::Value> {
         self.0.web_data_rpc(method, params)
     }
+    fn fonts(&self) -> Vec<String> {
+        self.0.list_font_families()
+    }
 }
 
 /// 以分离子进程重新启动自身（用于"重启服务"）。

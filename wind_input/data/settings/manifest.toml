@@ -668,5 +668,5 @@ enabled = true
 enabled = true
 
 [features.theme]
-enabled = false
+enabled = true
 import_url = false

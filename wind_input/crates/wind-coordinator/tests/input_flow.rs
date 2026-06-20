@@ -1035,3 +1035,19 @@ fn test_web_schema_get_config_and_encode_real() {
         .unwrap();
     assert!(code.is_string(), "encode 应返回字符串");
 }
+
+#[test]
+fn test_web_theme_preview_real() {
+    if !has_schemas() {
+        return;
+    }
+    let coord = Coordinator::new_headless(config_with("pinyin"), Some(&data_dir()));
+    // theme.preview：内置 default 主题合并 base 链后的配置（只读）。
+    let prev = coord
+        .web_data_rpc("theme.preview", &serde_json::json!({ "name": "default" }))
+        .unwrap();
+    assert!(prev.is_object(), "preview 应返回对象");
+    // theme.list 至少含若干内置主题
+    let list = coord.web_data_rpc("theme.list", &serde_json::json!({})).unwrap();
+    assert!(list.as_array().map(|a| !a.is_empty()).unwrap_or(false), "应列出内置主题");
+}

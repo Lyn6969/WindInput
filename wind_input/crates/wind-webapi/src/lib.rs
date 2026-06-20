@@ -43,6 +43,10 @@ pub trait CoreStatus: Send + Sync {
     fn data_rpc(&self, method: &str, _params: &serde_json::Value) -> anyhow::Result<serde_json::Value> {
         anyhow::bail!("unknown method: {}", method)
     }
+    /// 本机字体族名枚举（system.fonts）。默认空表（dev server / 无平台字体能力）。
+    fn fonts(&self) -> Vec<String> {
+        Vec::new()
+    }
 }
 
 /// 在调用方 tokio runtime 内启动 HTTP 服务（loopback）。一直 await 至服务结束。
@@ -213,6 +217,16 @@ mod tests {
         for k in ["version", "platform", "dataDir", "running"] {
             assert!(r.get(k).is_some(), "system.info 缺 web 字段 {k}");
         }
+    }
+
+    #[tokio::test]
+    async fn system_fonts_shape() {
+        // 契约 zSystemFonts = [{family}]；StubStatus.fonts() 默认空表 → []（合法）。
+        let st = state();
+        let tok = st.issue_token();
+        let (code, body) = rpc(st, Some(&tok), Some(DEV_ORIGIN), "system.fonts").await;
+        assert_eq!(code, StatusCode::OK);
+        assert!(body["result"].is_array(), "system.fonts 应为数组");
     }
 
     #[tokio::test]
