@@ -17,7 +17,7 @@
 #   clippy  | 3     cargo clippy (Windows 目标, 全工作区)
 #   test    | 4     cargo test (本机, 全工作区)
 #   deploy  | 5     完整部署 (复制 DLL + data)
-#   dll     | 6     从 Go 仓库复制 TSF DLL
+#   tsf     | 6     构建 C++ TSF DLL (MinGW 交叉编译; tsf debug → 调试变体)
 #   data    | 7     组装 data/（data/ 源 + .cache/ 下载 → build_debug/data/）
 #   fmt     | f     cargo fmt
 #   fmt-check       cargo fmt --check (CI 用)
@@ -52,6 +52,8 @@ set -o pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PRODUCT_ROOT="$(dirname "$SCRIPT_DIR")"
 PROJECT_ROOT="$PRODUCT_ROOT/wind_input"
+# C++ TSF 核心层（MinGW 交叉编译，见 wind_tsf/Makefile）
+TSF_DIR="$PRODUCT_ROOT/wind_tsf"
 VERSION="$(tr -d '[:space:]' < "$PRODUCT_ROOT/docs/VERSION" 2>/dev/null || echo '?')"
 BUILD_DIR="$PROJECT_ROOT/build"
 BUILD_DEBUG_DIR="$PROJECT_ROOT/build_debug"
@@ -119,7 +121,7 @@ do_build() {
         warn "未找到产物: $src_exe"
     fi
 
-    copy_tsf_dll "$outdir"
+    build_tsf "$outdir" "$debug"
     copy_data "$outdir"
     say "构建完成! -> $outdir"
 }
@@ -163,27 +165,33 @@ do_ci() {
 }
 
 # ---------- 部署 ----------
-copy_tsf_dll() {
+# 构建 C++ TSF 核心层（MinGW 交叉编译）并复制到输出目录。
+#   $1 outdir（默认 build/）  $2 = "debug" → 调试变体 wind_tsf_debug.dll
+build_tsf() {
     local outdir="${1:-$BUILD_DIR}"
+    local debug="${2:-}"
     mkdir -p "$outdir"
-    # TSF DLL 暂无 Rust 版，从同级 Go 仓库复制；待 Rust TSF 完成后删此函数
-    local GO_REPO="${GO_REPO:-$(dirname "$PRODUCT_ROOT")/WindInput}"
-    say "\n复制 TSF DLL (暂复用 Go 仓库产物, 尚无 Rust 版)..."
-    local dll base src found=0
-    for dll in wind_tsf.dll wind_tsf_x86.dll; do
-        for base in "$GO_REPO/build" "$GO_REPO/build_debug"; do
-            src="$base/$dll"
-            if [ -f "$src" ]; then
-                cp -f "$src" "$outdir/$dll"
-                gray "已复制: $dll (来自 $base)"
-                found=1
-                break
-            fi
-        done
-    done
-    if [ "$found" = 0 ]; then
-        gray "未找到 Go TSF DLL (Go 仓库未构建)。多数情况下无碍：'push' 经 SSH 部署时"
-        gray "复用 Windows 安装目录里已有的 DLL；仅在制作本地 build/ 完整镜像时才需要它。"
+
+    if ! command -v x86_64-w64-mingw32-g++ >/dev/null 2>&1; then
+        warn "未找到 x86_64-w64-mingw32-g++（mingw-w64 工具链）；跳过 TSF 构建。"
+        gray "  安装后可构建 TSF DLL；'push' 经 SSH 部署时也可复用 Windows 上已有的 DLL。"
+        return 0
+    fi
+
+    local mk_args dll
+    if [ "$debug" = "debug" ]; then
+        mk_args="DEBUG_VARIANT=1"; dll="wind_tsf_debug.dll"
+    else
+        mk_args=""; dll="wind_tsf.dll"
+    fi
+
+    say "\n正在交叉编译 TSF DLL ($dll)..."
+    # 让 make 直接输出到目标目录，避免二次复制
+    if make -C "$TSF_DIR" $mk_args VERSION="$VERSION" OUTDIR="$outdir" >/dev/null; then
+        gray "已构建: $dll ($(du -h "$outdir/$dll" 2>/dev/null | cut -f1))"
+    else
+        err "TSF DLL 构建失败！见 'make -C $TSF_DIR $mk_args' 输出。"
+        return 1
     fi
 }
 
@@ -309,7 +317,7 @@ copy_data() {
 deploy_all() {
     local outdir="${1:-$BUILD_DIR}"
     mkdir -p "$outdir"
-    copy_tsf_dll "$outdir"
+    build_tsf "$outdir"
     copy_data "$outdir"
     say "部署完成! -> $outdir"
 }
@@ -479,7 +487,7 @@ show_menu() {
     echo  "    4  - cargo test (运行测试, 本机)"
     printf '\n%b  部署 (本机 build/ 镜像):%b\n' "$C_YELLOW" "$C_RESET"
     echo  "    5  - 完整部署 (复制 DLL + data 到 build/)"
-    echo  "    6  - 从 Go 仓库复制 TSF DLL"
+    echo  "    6  - 构建 C++ TSF DLL (MinGW 交叉编译)"
     echo  "    7  - 组装 data/ (data/ 源 + .cache/ → build_debug/data/)"
     printf '\n%b  实测 / 远程 (SSH → %s):%b\n' "$C_YELLOW" "${WIND_REMOTE:-未配置}" "$C_RESET"
     echo  "    r  - 候选 REPL (本机验证, 无需 Windows)"
@@ -511,7 +519,7 @@ menu_loop() {
             3)   do_clippy;         pause ;;
             4)   do_test;           pause ;;
             5)   deploy_all;        pause ;;
-            6)   copy_tsf_dll;      pause ;;
+            6)   build_tsf;         pause ;;
             7)   copy_data "$BUILD_DEBUG_DIR"; pause ;;
             r)   do_repl;           pause ;;
             p)   do_push;           pause ;;
@@ -540,7 +548,7 @@ case "${1:-}" in
     clippy|3)           do_clippy ;;
     test|4)             do_test ;;
     deploy|5)           deploy_all ;;
-    dll|6)              copy_tsf_dll ;;
+    tsf|dll|6)          build_tsf "$BUILD_DIR" "${2:-}" ;;
     data|7)             copy_data "$BUILD_DEBUG_DIR" ;;
     fmt|f)              do_fmt ;;
     fmt-check)          do_fmt_check ;;
