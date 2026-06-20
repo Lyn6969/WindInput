@@ -94,15 +94,22 @@ done
 
 mkdir -p "$DIST_DIR"
 
-# ---- 注入卸载程序到产物目录(打包后移除,保持干净)----
-UNINSTALL_DEST="$BUILD_DIR/uninstall.exe"
-cp -f "$UNINSTALLER" "$UNINSTALL_DEST"
-cleanup() { rm -f "$UNINSTALL_DEST"; }
+# ---- 组装干净 staging 目录(只含分发文件,排除 obj/ 等 TSF 中间产物)----
+# pack --source 会递归打包整个目录,故不能直接打 BUILD_DIR(含 obj/)。
+STAGE="$DIST_DIR/stage"
+rm -rf "$STAGE"; mkdir -p "$STAGE"
+cleanup() { rm -rf "$STAGE"; }
 trap cleanup EXIT
+
+cp -f  "$BUILD_DIR/wind_input.exe"   "$STAGE/"
+cp -f  "$BUILD_DIR/wind_tsf.dll"     "$STAGE/"
+cp -f  "$BUILD_DIR/wind_tsf_x86.dll" "$STAGE/"
+cp -rf "$BUILD_DIR/data"             "$STAGE/"
+cp -f  "$UNINSTALLER"                "$STAGE/uninstall.exe"
 
 # ---- 阶段一:压缩打包 ----
 echo ">>> 阶段一:pack(算法 $COMPRESSION)..."
-"$PACKER" pack --source "$BUILD_DIR" --output "$ARCHIVE" --compression "$COMPRESSION"
+"$PACKER" pack --source "$STAGE" --output "$ARCHIVE" --compression "$COMPRESSION"
 
 # ---- 阶段二:拼接 stub + archive ----
 echo ">>> 阶段二:bundle ..."

@@ -1,0 +1,71 @@
+name: Release
+
+# push tag v* → 全 Linux 交叉编译 + 打包,产出草稿 Release。
+# 产物:WindInput-<版本>-Setup.exe(自解压安装程序,含 x64/x86 TSF + 词库)。
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: write          # 创建 Release / 上传产物
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      # 三个仓库需为同级目录:wind-installer 依赖 ../wind-ui-rust;
+      # pack-installer.sh 用 ../wind-installer。均 checkout 到 $GITHUB_WORKSPACE 下。
+      - name: 检出 WindInput
+        uses: actions/checkout@v4
+        with:
+          path: WindInput
+          fetch-depth: 0      # release notes 需完整历史
+      - name: 检出 wind-installer
+        uses: actions/checkout@v4
+        with:
+          repository: huanfeng/wind-installer
+          path: wind-installer
+          # 私有仓库需在仓库 Secrets 配置 PAT(repo 读权限);公开仓库可删此行。
+          token: ${{ secrets.WIND_REPOS_TOKEN }}
+      - name: 检出 wind-ui-rust (installer GUI 依赖)
+        uses: actions/checkout@v4
+        with:
+          repository: huanfeng/wind-ui-rust
+          path: wind-ui-rust
+          token: ${{ secrets.WIND_REPOS_TOKEN }}
+
+      - name: 安装 mingw-w64 (x86_64 + i686)
+        run: sudo apt-get update && sudo apt-get install -y mingw-w64
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-gnu
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            WindInput/wind_input
+            wind-installer
+
+      - name: 版本一致性校验 (docs/VERSION == tag)
+        working-directory: WindInput
+        run: |
+          TAG="${GITHUB_REF_NAME#v}"
+          FILE="$(tr -d '[:space:]' < docs/VERSION)"
+          echo "tag=$TAG  docs/VERSION=$FILE"
+          [ "$TAG" = "$FILE" ] || { echo "::error::docs/VERSION($FILE) 与 tag($TAG) 不一致"; exit 1; }
+
+      - name: 构建发布目录 (exe + x64/x86 TSF + data)
+        working-directory: WindInput
+        run: ./scripts/dev.sh dist
+
+      - name: 打包安装程序 (cross stub + native packer，免 wine)
+        working-directory: WindInput
+        run: ./scripts/pack-installer.sh --version "${GITHUB_REF_NAME#v}" --compression zstd
+
+      - name: 创建草稿 Release
+        uses: softprops/action-gh-release@v2
+        with:
+          draft: true                          # 人工审核 Release Notes 后再发布
+          generate_release_notes: true
+          files: wind-installer/dist/WindInput-*-Setup.exe
