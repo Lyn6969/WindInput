@@ -23,16 +23,18 @@ pub struct StatusTip {
     radius: Option<f32>,
     /// 已应用主题（DPI 变化时按新缩放重解析几何）。
     theme: Option<wind_theme::Resolved>,
+    /// 基准字号（逻辑像素）：跟随主题 behavior.font_size（+ status 节点偏移）。
+    base_logical: f32,
 }
 
 impl StatusTip {
-    /// 基准字号（逻辑像素）。
-    const FONT_PX: f32 = 22.0;
+    /// 无主题时的兜底字号（逻辑像素），与候选窗主题默认一致。
+    const DEFAULT_FONT_PX: f32 = 18.0;
 
     pub fn new() -> Result<Self, String> {
         let scale = Self::dpi_scale();
         let window = LayeredWindow::create(None, 200, 80, "WindInputStatusTip")?;
-        let renderer = TextRenderer::new("Microsoft YaHei UI", Self::FONT_PX * scale)?;
+        let renderer = TextRenderer::new("Microsoft YaHei UI", Self::DEFAULT_FONT_PX * scale)?;
         Ok(Self {
             window,
             renderer,
@@ -45,6 +47,7 @@ impl StatusTip {
             border: None,
             radius: None,
             theme: None,
+            base_logical: Self::DEFAULT_FONT_PX,
         })
     }
 
@@ -53,7 +56,7 @@ impl StatusTip {
         let sc = crate::dpi::scale_for_point(x, y);
         if (sc - self.scale).abs() > 0.01 {
             self.scale = sc;
-            self.renderer.set_base_size(Self::FONT_PX * sc);
+            self.renderer.set_base_size(self.base_logical * sc);
             if let Some(t) = self.theme.clone() {
                 self.set_theme(&t);
             }
@@ -65,6 +68,15 @@ impl StatusTip {
         self.theme = Some(theme.clone());
         self.bg = theme.color("status_bg", self.bg);
         self.fg = theme.color("status_text", self.fg);
+        // 尺寸跟随主题：基准 = behavior.font_size（+ status 节点相对偏移），弃用硬编码。
+        let node_off = theme
+            .views
+            .status
+            .as_ref()
+            .map(|n| n.font_size)
+            .unwrap_or(0.0);
+        self.base_logical = (theme.behavior.font_size as f32 + node_off).max(8.0);
+        self.renderer.set_base_size(self.base_logical * self.scale);
         if let Some(node) = &theme.views.status {
             let s = self.scale;
             self.bg_image = crate::theme_assets::rv_image(theme, node.bg_image.as_ref());
@@ -98,8 +110,9 @@ impl StatusTip {
         }
     }
 
-    /// 显示提示文本，居中于 (cx, cy) 上方
-    pub fn show(&mut self, text: &str, cx: i32, cy: i32) {
+    /// 显示提示文本：水平居中于光标、默认在光标下方（下方不足则上翻），加用户偏移。
+    /// `cy` 为光标底端，`caret_h` 为光标高度（上翻定位用）。
+    pub fn show(&mut self, text: &str, cx: i32, cy: i32, caret_h: i32, off_x: i32, off_y: i32) {
         self.ensure_scale(cx, cy);
         let s = self.scale;
         // 单个 View 叶子即气泡：背景 + 圆角 + 内边距 + 居中文字
@@ -159,16 +172,74 @@ impl StatusTip {
             tracing::warn!("StatusTip update failed: {}", e);
         }
 
-        // 显示在 caret 上方居中（内容锚点 − 左/上 margin，阴影向四周溢出）。
-        let cx0 = (cx - (cw as i32) / 2).max(0);
-        let cy0 = (cy - (ch as i32) - 8).max(0);
-        self.window.show(cx0 - ml as i32, cy0 - mt as i32);
+        // 水平居中于光标、默认光标下方（下方不足上翻），叠加用户偏移；按工作区钳位。
+        let gap = (4.0 * s).round() as i32;
+        let x = cx - (cw as i32) / 2 + off_x;
+        let y = cy + gap + off_y;
+        let (px, py) = clamp_below_or_above(x, y, cw, ch, cy, caret_h, gap);
+        // 内容锚点 − 左/上 margin，阴影向四周溢出。
+        self.window.show(px - ml as i32, py - mt as i32);
     }
 
     pub fn hide(&self) {
         self.window.hide();
     }
+}
 
+/// 把气泡钳制在光标所在显示器工作区：默认 (x, y_below)；下方放不下则上翻到光标上方
+/// （光标顶端 = caret_y - caret_h）；左右越界贴边。返回内容盒左上屏幕坐标。
+#[cfg_attr(not(windows), allow(unused_variables))]
+fn clamp_below_or_above(
+    x: i32,
+    y_below: i32,
+    w: u32,
+    h: u32,
+    caret_y: i32,
+    caret_h: i32,
+    gap: i32,
+) -> (i32, i32) {
+    let (mut nx, mut ny) = (x, y_below);
+    #[cfg(windows)]
+    {
+        use windows::Win32::Foundation::POINT;
+        use windows::Win32::Graphics::Gdi::{
+            GetMonitorInfoW, MONITOR_DEFAULTTONEAREST, MONITORINFO, MonitorFromPoint,
+        };
+        unsafe {
+            let pt = POINT { x, y: caret_y };
+            let mon = MonitorFromPoint(pt, MONITOR_DEFAULTTONEAREST);
+            let mut mi = MONITORINFO {
+                cbSize: std::mem::size_of::<MONITORINFO>() as u32,
+                ..Default::default()
+            };
+            if GetMonitorInfoW(mon, &mut mi).as_bool() {
+                let wa = mi.rcWork;
+                let (wi, hi) = (w as i32, h as i32);
+                // 下方放不下 → 上翻到光标上方
+                if ny + hi > wa.bottom {
+                    let above = caret_y - caret_h.max(0) - hi - gap;
+                    ny = if above >= wa.top {
+                        above
+                    } else {
+                        wa.bottom - hi
+                    };
+                }
+                if nx + wi > wa.right {
+                    nx = wa.right - wi;
+                }
+                if nx < wa.left {
+                    nx = wa.left;
+                }
+                if ny < wa.top {
+                    ny = wa.top;
+                }
+            }
+        }
+    }
+    (nx.max(0), ny.max(0))
+}
+
+impl StatusTip {
     /// 系统 DPI 缩放因子
     fn dpi_scale() -> f32 {
         #[cfg(windows)]

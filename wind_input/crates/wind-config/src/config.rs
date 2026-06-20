@@ -436,6 +436,20 @@ pub struct UiConfig {
     pub mode_indicator: ModeIndicatorConfig,
     #[serde(default)]
     pub tooltip: TooltipConfig,
+    #[serde(default)]
+    pub status_tip: StatusTipConfig,
+}
+
+/// 状态提示气泡配置（[ui.status_tip]）：中英/标点/全半角/方案切换的瞬时气泡。
+/// 尺寸跟随主题（theme.views.status），此处仅微调位置偏移。
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct StatusTipConfig {
+    /// 相对默认位置（光标下方居中）的水平偏移（像素，正=右）。
+    #[serde(default)]
+    pub offset_x: i32,
+    /// 相对默认位置的垂直偏移（像素，正=下）。
+    #[serde(default)]
+    pub offset_y: i32,
 }
 
 /// 模式指示器配置（[ui.mode_indicator]）：进入临时拼音/双拼/快捷/英文/快符等模式时的标识。

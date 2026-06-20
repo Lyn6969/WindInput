@@ -37,8 +37,16 @@ pub enum UiCommand {
     },
     /// 隐藏候选窗口
     HideCandidates,
-    /// 显示状态提示气泡（中英/标点/全半角/方案切换），约 1 秒后自动隐藏
-    ShowStatusTip { text: String, x: i32, y: i32 },
+    /// 显示状态提示气泡（中英/标点/全半角/方案切换），约 1 秒后自动隐藏。
+    /// (x,y)=光标点(y 为底端)，caret_height 上翻定位用，offset_x/y 用户位置微调。
+    ShowStatusTip {
+        text: String,
+        x: i32,
+        y: i32,
+        caret_height: i32,
+        offset_x: i32,
+        offset_y: i32,
+    },
     /// 更新常驻工具栏状态（中英/方案/标点/全半角）
     UpdateToolbar(crate::toolbar::ToolbarState),
     /// 隐藏工具栏
@@ -288,7 +296,9 @@ impl UiManager {
         };
         let mut tip_hide_at: Option<std::time::Instant> = None;
         // 状态提示防抖：合并快速连续的提示（如连按切换），避免气泡闪烁
-        let mut tip_debounce = crate::debounce::Debouncer::<(String, i32, i32)>::new(60);
+        // 载荷：(text, x, y, caret_height, offset_x, offset_y)
+        let mut tip_debounce =
+            crate::debounce::Debouncer::<(String, i32, i32, i32, i32, i32)>::new(60);
         // 工具栏隐藏防抖：HideToolbar 不立即隐藏，延后 50ms；若期间收到 UpdateToolbar
         // （应用间切换的 FocusLost→FocusGained 串），取消隐藏并显示——消除 Alt+Tab 闪烁。
         let mut toolbar_hide_at: Option<std::time::Instant> = None;
@@ -353,9 +363,9 @@ impl UiManager {
             }
 
             // 推进状态提示防抖（稳定后才真正显示气泡）
-            if let Some((text, x, y)) = tip_debounce.poll() {
+            if let Some((text, x, y, ch, ox, oy)) = tip_debounce.poll() {
                 if let Some(t) = &mut status_tip {
-                    t.show(&text, x, y);
+                    t.show(&text, x, y, ch, ox, oy);
                     tip_hide_at =
                         Some(std::time::Instant::now() + std::time::Duration::from_millis(1000));
                 }
@@ -449,10 +459,17 @@ impl UiManager {
                     UiCommand::OpenPath(path) => {
                         open_path(&path);
                     }
-                    UiCommand::ShowStatusTip { text, x, y } => {
+                    UiCommand::ShowStatusTip {
+                        text,
+                        x,
+                        y,
+                        caret_height,
+                        offset_x,
+                        offset_y,
+                    } => {
                         debug!("UI: ShowStatusTip '{}' at ({},{})", text, x, y);
                         // 经防抖：合并快速连续提示，避免气泡闪烁
-                        tip_debounce.trigger((text, x, y));
+                        tip_debounce.trigger((text, x, y, caret_height, offset_x, offset_y));
                     }
                     UiCommand::UpdateToolbar(tb_state) => {
                         debug!("UI: UpdateToolbar {:?}", tb_state);

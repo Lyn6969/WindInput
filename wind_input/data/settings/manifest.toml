@@ -805,6 +805,31 @@ options = [
   { value = "trace", label = "trace" },
 ]
 
+# ── 状态提示气泡（尺寸跟随主题，仅位置可微调）──
+[[items]]
+key = "ui.status_tip.offset_x"
+group = "ui"
+section = "状态提示"
+type = "number"
+label = "状态气泡水平偏移"
+hint = "相对光标下方居中的水平偏移（像素，正=右）"
+default = 0
+min = -400
+max = 400
+since = 3
+
+[[items]]
+key = "ui.status_tip.offset_y"
+group = "ui"
+section = "状态提示"
+type = "number"
+label = "状态气泡垂直偏移"
+hint = "相对光标下方的垂直偏移（像素，正=下）"
+default = 0
+min = -400
+max = 400
+since = 3
+
 # ── 特性可用性（模块 + 子特性两层；web 据此显示/隐藏/禁用）──
 # 保留另一会话约定；随各命名空间深化(temp/freq/shadow/stats/phrase/theme)逐步开启。
 [features.dict]

@@ -1439,16 +1439,20 @@ impl Coordinator {
         self.push_server.push_to_active(&encoded);
     }
 
-    /// 在当前光标上方显示状态提示气泡（中英/标点/全半角/方案切换）
+    /// 在当前光标下方显示状态提示气泡（中英/标点/全半角/方案切换）
     pub(crate) fn show_tip(&self, text: &str) {
-        let (x, y) = {
+        let (x, y, caret_height) = {
             let s = self.state.lock().unwrap_or_else(|e| e.into_inner());
-            (s.caret_x, s.caret_y)
+            (s.caret_x, s.caret_y, s.caret_height)
         };
+        let st = &self.rt().config.ui.status_tip;
         let _ = self.ui_tx.send(UiCommand::ShowStatusTip {
             text: text.to_string(),
             x,
             y,
+            caret_height,
+            offset_x: st.offset_x,
+            offset_y: st.offset_y,
         });
     }
 

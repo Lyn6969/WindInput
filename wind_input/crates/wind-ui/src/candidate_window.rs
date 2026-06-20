@@ -382,7 +382,8 @@ impl CandidateWindow {
         self.window.show(px - ml as i32, py - mt as i32);
         self.visible = true;
         let t_tip0 = Instant::now();
-        self.update_tooltip(px, py);
+        // 命中矩形是窗口缓冲坐标（内容起点在 (ml,mt)）；tooltip 定位须用窗口屏幕原点。
+        self.update_tooltip(px - ml as i32, py - mt as i32);
         let t_tip = t_tip0.elapsed();
         if t_tip.as_micros() > 200 {
             tracing::debug!("render tooltip={:?}", t_tip);
@@ -390,7 +391,8 @@ impl CandidateWindow {
     }
 
     /// 悬停时在该候选下方显示其编码（反查）；无悬停或无编码则隐藏。
-    fn update_tooltip(&mut self, px: i32, py: i32) {
+    /// `(wx, wy)` 为候选窗口屏幕原点（命中矩形坐标的基准）。
+    fn update_tooltip(&mut self, wx: i32, wy: i32) {
         let hover = self.hover;
         // 仅候选项（非翻页器 tag）显示反查提示
         let info = if (0..TAG_PAGE_PREV).contains(&hover) {
@@ -410,7 +412,7 @@ impl CandidateWindow {
         };
         if let Some(tip) = self.tooltip.as_mut() {
             match info {
-                Some((code, r)) => tip.show(&code, px + r.x as i32, py + (r.y + r.h) as i32 + 2),
+                Some((code, r)) => tip.show(&code, wx + r.x as i32, wy + (r.y + r.h) as i32 + 2),
                 None => tip.hide(),
             }
         }
