@@ -375,7 +375,7 @@ pub struct Coordinator {
     /// 工具栏位置持久化文件路径（toolbar_pos.txt；None=不持久化）
     pub(crate) toolbar_pos_path: Option<std::path::PathBuf>,
     /// 候选反查（编码/拆字/拼音）供悬停提示
-    reverse: wind_reverse::ReverseLookup,
+    pub(crate) reverse: wind_reverse::ReverseLookup,
     /// 标点配对跟踪栈（用于智能跳过）；中/英配对表在 rt bundle 内。
     pair_tracker: Mutex<wind_transform::pair_tracker::PairTracker>,
     /// 最近一次有效光标坐标 (x,y,height)；用于无效坐标时回退，避免候选窗跑到左上角

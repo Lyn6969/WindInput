@@ -662,7 +662,7 @@ import = false
 enabled = true
 
 [features.phrase]
-enabled = false
+enabled = true
 
 [features.stats]
 enabled = true

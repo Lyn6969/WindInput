@@ -246,6 +246,13 @@ impl EngineManager {
         name
     }
 
+    /// 指定方案的引擎类型字符串（小写，如 "pinyin"|"codetable"|"mixed"）；读不到返回 None。
+    /// 不切换活跃方案（设置页 dict.encode 据此选拼音/五笔出码规则）。
+    pub fn schema_engine_type(&self, schema_id: &str) -> Option<String> {
+        Self::read_schema(schema_id, self.data_dir.as_deref())
+            .map(|s| s.engine.engine_type.to_lowercase())
+    }
+
     /// 切换到指定方案；成功返回 true（必要时懒加载）
     pub fn switch_schema(&self, schema_id: &str) -> bool {
         if !self.ensure_loaded(schema_id) {

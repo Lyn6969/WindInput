@@ -59,8 +59,12 @@ impl Coordinator {
             "dict.remove" => self.web_dict_remove(params),
             "dict.clear" => self.web_dict_clear(params),
             "dict.stats" => self.web_dict_stats(),
-            // 🚧 引擎编码/拼音生成：待深化
-            "dict.encode" | "dict.genPinyin" => Ok(json!("")),
+            // 加词自动出码：按方案类型选拼音/五笔规则（reverse 反查表）。
+            "dict.encode" => self.web_dict_encode(params),
+            "dict.genPinyin" => {
+                let text = str_param(params, "text")?;
+                Ok(json!(self.reverse.gen_pinyin(text)))
+            }
 
             // ── temp.*（临时词，redb）─────────────────────────────
             "temp.list" => self.web_temp_list(params),
@@ -69,10 +73,10 @@ impl Coordinator {
             "temp.promoteAll" => self.web_temp_promote_all(params),
             "temp.clear" => self.web_temp_clear(params),
 
-            // ── freq.*（词频）🚧 待深化 ──────────────────────────
-            "freq.listPaged" => Ok(json!({ "items": [], "total": 0 })),
-            "freq.delete" => Ok(json!({ "ok": true })),
-            "freq.clear" => Ok(json!(0)),
+            // ── freq.*（用户词频，redb 持久化）───────────────────
+            "freq.listPaged" => self.web_freq_list_paged(params),
+            "freq.delete" => self.web_freq_delete(params),
+            "freq.clear" => self.web_freq_clear(params),
 
             // ── shadow.*（影子规则，redb 持久化）─────────────────
             "shadow.list" => self.web_shadow_list(params),
@@ -80,10 +84,13 @@ impl Coordinator {
             "shadow.delete" => self.web_shadow_delete(params),
             "shadow.removeRule" => self.web_shadow_remove_rule(params),
 
-            // ── phrase.*（短语）🚧 待深化 ────────────────────────
-            "phrase.list" => Ok(json!([])),
-            "phrase.add" | "phrase.update" | "phrase.remove" | "phrase.setEnabled"
-            | "phrase.resetDefault" => Ok(json!({ "ok": true })),
+            // ── phrase.*（用户短语，全局，redb 持久化）──────────
+            "phrase.list" => self.web_phrase_list(),
+            "phrase.add" => self.web_phrase_add(params),
+            "phrase.update" => self.web_phrase_update(params),
+            "phrase.remove" => self.web_phrase_remove(params),
+            "phrase.setEnabled" => self.web_phrase_set_enabled(params),
+            "phrase.resetDefault" => self.web_phrase_reset(),
 
             // ── stats.*（输入统计，redb 每日聚合）────────────────
             "stats.summary" => self.web_stats_summary(),
@@ -237,6 +244,65 @@ impl Coordinator {
         Ok(json!(out))
     }
 
+    fn web_dict_encode(&self, params: &Value) -> anyhow::Result<Value> {
+        let schema = str_param(params, "schemaId")?;
+        let text = str_param(params, "text")?;
+        // 拼音类方案出拼音码；其余（码表/五笔）出五笔词组码。
+        let is_pinyin = self
+            .engine_mgr
+            .schema_engine_type(schema)
+            .map(|t| t == "pinyin")
+            .unwrap_or(false);
+        let code = if is_pinyin {
+            self.reverse.gen_pinyin(text)
+        } else {
+            self.reverse.wubi_word_code(text)
+        };
+        Ok(json!(code))
+    }
+
+    fn web_freq_list_paged(&self, params: &Value) -> anyhow::Result<Value> {
+        let schema = str_param(params, "schemaId")?;
+        let prefix = params.get("prefix").and_then(|v| v.as_str()).unwrap_or("");
+        let offset = usize_param(params, "offset", 0);
+        let limit = usize_param(params, "limit", 50);
+        let store = self
+            .store
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("无持久化存储"))?;
+        let (page, total) = store.list_freq_paged(schema, prefix, offset, limit)?;
+        let items: Vec<Value> = page
+            .into_iter()
+            .map(|(code, text, rec)| {
+                json!({ "code": code, "text": text, "count": rec.count, "lastUsed": rec.last_used })
+            })
+            .collect();
+        Ok(json!({ "items": items, "total": total }))
+    }
+
+    fn web_freq_delete(&self, params: &Value) -> anyhow::Result<Value> {
+        let (schema, code, text) = (
+            str_param(params, "schemaId")?,
+            str_param(params, "code")?,
+            str_param(params, "text")?,
+        );
+        let store = self
+            .store
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("无持久化存储"))?;
+        store.delete_freq(schema, code, text)?;
+        Ok(json!({ "ok": true }))
+    }
+
+    fn web_freq_clear(&self, params: &Value) -> anyhow::Result<Value> {
+        let schema = str_param(params, "schemaId")?;
+        let store = self
+            .store
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("无持久化存储"))?;
+        Ok(json!(store.clear_freq(schema)?))
+    }
+
     fn web_shadow_list(&self, params: &Value) -> anyhow::Result<Value> {
         let schema = str_param(params, "schemaId")?;
         let store = self
@@ -379,6 +445,85 @@ impl Coordinator {
             store.remove_temp_word(schema, &r.code, &r.text)?;
         }
         Ok(json!(n))
+    }
+
+    fn web_phrase_list(&self) -> anyhow::Result<Value> {
+        let store = self
+            .store
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("无持久化存储"))?;
+        let items: Vec<Value> = store
+            .list_phrases()?
+            .into_iter()
+            .map(|p| {
+                json!({
+                    "code": p.code,
+                    "text": p.text,
+                    "position": p.position,
+                    "weight": p.weight,
+                    "enabled": p.enabled,
+                })
+            })
+            .collect();
+        Ok(json!(items))
+    }
+
+    fn web_phrase_add(&self, params: &Value) -> anyhow::Result<Value> {
+        let (code, text) = (str_param(params, "code")?, str_param(params, "text")?);
+        let position = i32_param(params, "position");
+        let weight = params.get("weight").and_then(|v| v.as_i64()).unwrap_or(1) as i32;
+        let store = self
+            .store
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("无持久化存储"))?;
+        store.add_phrase(code, text, position, weight)?;
+        Ok(json!({ "ok": true }))
+    }
+
+    fn web_phrase_update(&self, params: &Value) -> anyhow::Result<Value> {
+        let (code, text) = (str_param(params, "code")?, str_param(params, "text")?);
+        let new_code = params.get("newCode").and_then(|v| v.as_str());
+        let new_text = params.get("newText").and_then(|v| v.as_str());
+        let position = params.get("position").and_then(|v| v.as_i64()).map(|n| n as i32);
+        let weight = params.get("weight").and_then(|v| v.as_i64()).map(|n| n as i32);
+        let store = self
+            .store
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("无持久化存储"))?;
+        store.update_phrase(code, text, new_code, new_text, position, weight)?;
+        // 若同时携带 enabled，应用到新键。
+        if let Some(en) = params.get("enabled").and_then(|v| v.as_bool()) {
+            store.set_phrase_enabled(new_code.unwrap_or(code), new_text.unwrap_or(text), en)?;
+        }
+        Ok(json!({ "ok": true }))
+    }
+
+    fn web_phrase_remove(&self, params: &Value) -> anyhow::Result<Value> {
+        let (code, text) = (str_param(params, "code")?, str_param(params, "text")?);
+        let store = self
+            .store
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("无持久化存储"))?;
+        store.remove_phrase(code, text)?;
+        Ok(json!({ "ok": true }))
+    }
+
+    fn web_phrase_set_enabled(&self, params: &Value) -> anyhow::Result<Value> {
+        let (code, text) = (str_param(params, "code")?, str_param(params, "text")?);
+        let enabled = params.get("enabled").and_then(|v| v.as_bool()).unwrap_or(true);
+        let store = self
+            .store
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("无持久化存储"))?;
+        store.set_phrase_enabled(code, text, enabled)?;
+        Ok(json!({ "ok": true }))
+    }
+
+    fn web_phrase_reset(&self) -> anyhow::Result<Value> {
+        if let Some(store) = self.store.as_ref() {
+            store.reset_phrases()?;
+        }
+        Ok(json!({ "ok": true }))
     }
 
     fn web_stats_summary(&self) -> anyhow::Result<Value> {
@@ -562,6 +707,76 @@ mod tests {
         c.web_data_rpc("stats.clear", &json!({})).unwrap();
         let sum2 = c.web_data_rpc("stats.summary", &json!({})).unwrap();
         assert_eq!(sum2["total"], 0);
+    }
+
+    #[test]
+    fn freq_list_delete_clear_shape() {
+        let c = coord("freq");
+        let store = c.store.as_ref().unwrap();
+        store.record_freq("py", "de", "的").unwrap();
+        store.record_freq("py", "shi", "是").unwrap();
+
+        // freq.listPaged 形状对齐 PagedResult<FreqItem{code,text,count,lastUsed}>
+        let r = c
+            .web_data_rpc("freq.listPaged", &json!({ "schemaId": "py", "limit": 50, "offset": 0 }))
+            .unwrap();
+        assert_eq!(r["total"], 2);
+        let it = &r["items"][0];
+        for k in ["code", "text", "count", "lastUsed"] {
+            assert!(it.get(k).is_some(), "FreqItem 缺 {k}");
+        }
+        // delete
+        c.web_data_rpc("freq.delete", &json!({ "schemaId": "py", "code": "de", "text": "的" }))
+            .unwrap();
+        let r2 = c
+            .web_data_rpc("freq.listPaged", &json!({ "schemaId": "py", "limit": 50, "offset": 0 }))
+            .unwrap();
+        assert_eq!(r2["total"], 1);
+        // clear 返回删除数（number）
+        let cleared = c.web_data_rpc("freq.clear", &json!({ "schemaId": "py" })).unwrap();
+        assert_eq!(cleared, json!(1));
+    }
+
+    #[test]
+    fn phrase_crud_shape() {
+        let c = coord("phrase");
+        // add → list 形状对齐 PhraseItem{code,text,position,weight,enabled}
+        c.web_data_rpc(
+            "phrase.add",
+            &json!({ "code": "rq", "text": "2026-06-20", "position": 0, "weight": 1 }),
+        )
+        .unwrap();
+        let list = c.web_data_rpc("phrase.list", &json!({})).unwrap();
+        let arr = list.as_array().unwrap();
+        assert_eq!(arr.len(), 1);
+        for k in ["code", "text", "position", "weight", "enabled"] {
+            assert!(arr[0].get(k).is_some(), "PhraseItem 缺 {k}");
+        }
+        assert_eq!(arr[0]["enabled"], json!(true));
+
+        // setEnabled
+        c.web_data_rpc(
+            "phrase.setEnabled",
+            &json!({ "code": "rq", "text": "2026-06-20", "enabled": false }),
+        )
+        .unwrap();
+        let list2 = c.web_data_rpc("phrase.list", &json!({})).unwrap();
+        assert_eq!(list2[0]["enabled"], json!(false));
+
+        // update 改 code（键迁移）
+        c.web_data_rpc(
+            "phrase.update",
+            &json!({ "code": "rq", "text": "2026-06-20", "newCode": "date", "weight": 5 }),
+        )
+        .unwrap();
+        let list3 = c.web_data_rpc("phrase.list", &json!({})).unwrap();
+        assert_eq!(list3[0]["code"], json!("date"));
+
+        // remove + resetDefault
+        c.web_data_rpc("phrase.remove", &json!({ "code": "date", "text": "2026-06-20" }))
+            .unwrap();
+        assert_eq!(c.web_data_rpc("phrase.list", &json!({})).unwrap().as_array().unwrap().len(), 0);
+        c.web_data_rpc("phrase.resetDefault", &json!({})).unwrap();
     }
 
     #[test]

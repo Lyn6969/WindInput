@@ -89,6 +89,42 @@ impl ReverseLookup {
         }
     }
 
+    /// 生成词的拼音编码（空格分隔、去声调小写；ü→v）。无读音的字跳过。
+    /// 用于设置页 dict.genPinyin / 拼音方案加词自动出码。
+    pub fn gen_pinyin(&self, text: &str) -> String {
+        text.chars()
+            .filter_map(|c| self.pinyin.get(&c))
+            .map(|py| strip_tone(py))
+            .filter(|s| !s.is_empty())
+            .collect::<Vec<_>>()
+            .join(" ")
+    }
+
+    /// 五笔词组取码（86 版首码法）：1字=全码；2字=各取前2码；3字=前2字各首码+末字前2码；
+    /// ≥4字=前3字首码+末字首码。用于码表方案加词自动出码。无码的字按空串跳过。
+    pub fn wubi_word_code(&self, text: &str) -> String {
+        let chars: Vec<char> = text.chars().collect();
+        let firstn = |c: char, n: usize| -> String {
+            self.code.get(&c).map(|s| s.chars().take(n).collect()).unwrap_or_default()
+        };
+        match chars.len() {
+            0 => String::new(),
+            1 => self.code.get(&chars[0]).cloned().unwrap_or_default(),
+            2 => format!("{}{}", firstn(chars[0], 2), firstn(chars[1], 2)),
+            3 => format!("{}{}{}", firstn(chars[0], 1), firstn(chars[1], 1), firstn(chars[2], 2)),
+            _ => {
+                let last = *chars.last().unwrap();
+                format!(
+                    "{}{}{}{}",
+                    firstn(chars[0], 1),
+                    firstn(chars[1], 1),
+                    firstn(chars[2], 1),
+                    firstn(last, 1)
+                )
+            }
+        }
+    }
+
     /// 为候选文本生成反查提示（逐字一行："字  编码  拼音"）。无可用信息返回空串。
     pub fn tooltip_for(&self, text: &str) -> String {
         if self.is_empty() {
@@ -120,9 +156,49 @@ impl ReverseLookup {
     }
 }
 
+/// 去声调：带调号韵母 → 基本字母（ü→v，符合拼音输入习惯）。
+fn strip_tone(py: &str) -> String {
+    py.chars()
+        .map(|c| match c {
+            'ā' | 'á' | 'ǎ' | 'à' => 'a',
+            'ō' | 'ó' | 'ǒ' | 'ò' => 'o',
+            'ē' | 'é' | 'ě' | 'è' => 'e',
+            'ī' | 'í' | 'ǐ' | 'ì' => 'i',
+            'ū' | 'ú' | 'ǔ' | 'ù' => 'u',
+            'ǖ' | 'ǘ' | 'ǚ' | 'ǜ' | 'ü' => 'v',
+            other => other,
+        })
+        .collect::<String>()
+        .to_lowercase()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_strip_tone() {
+        assert_eq!(strip_tone("nǐ"), "ni");
+        assert_eq!(strip_tone("hǎo"), "hao");
+        assert_eq!(strip_tone("lǜ"), "lv");
+    }
+
+    #[test]
+    fn test_wubi_word_code_rules() {
+        let mut rl = ReverseLookup::default();
+        rl.code.insert('工', "aaaa".into());
+        rl.code.insert('人', "wwww".into());
+        rl.code.insert('大', "dddd".into());
+        rl.code.insert('小', "ihty".into());
+        // 1字=全码
+        assert_eq!(rl.wubi_word_code("工"), "aaaa");
+        // 2字=各前2码
+        assert_eq!(rl.wubi_word_code("工人"), "aaww");
+        // 3字=前2字首码+末字前2码
+        assert_eq!(rl.wubi_word_code("工人大"), "awdd");
+        // ≥4字=前3字首码+末字首码
+        assert_eq!(rl.wubi_word_code("工人大小"), "awdi");
+    }
 
     #[test]
     fn test_tooltip_format() {

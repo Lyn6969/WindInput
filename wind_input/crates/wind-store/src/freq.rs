@@ -108,6 +108,82 @@ impl Store {
             Ok(t.get(key.as_str())?.and_then(|g| dec_freq(g.value())))
         })
     }
+
+    /// 列举某方案的词频记录（设置页用）：按 code 前缀过滤，分页。
+    /// 返回 `(本页 [(code,text,记录)], 总数)`。limit=0 表示不限。
+    pub fn list_freq_paged(
+        &self,
+        schema: &str,
+        prefix: &str,
+        offset: usize,
+        limit: usize,
+    ) -> anyhow::Result<(Vec<(String, String, FreqRecord)>, usize)> {
+        let scan = format!("{schema}\u{0}{prefix}");
+        self.with_db(|db| {
+            let txn = db.begin_read()?;
+            let t = txn.open_table(FREQ)?;
+            let mut all = Vec::new();
+            for item in t.range(scan.as_str()..)? {
+                let (k, v) = item?;
+                let key = k.value();
+                if !key.starts_with(&scan) {
+                    break;
+                }
+                if let (Some((_, code, text)), Some(rec)) =
+                    (crate::user_words::split_key(key), dec_freq(v.value()))
+                {
+                    all.push((code.to_string(), text.to_string(), rec));
+                }
+            }
+            let total = all.len();
+            let page: Vec<_> = all.into_iter().skip(offset).take(if limit == 0 { usize::MAX } else { limit }).collect();
+            Ok((page, total))
+        })
+    }
+
+    /// 删除一条词频（不存在静默成功）。
+    pub fn delete_freq(&self, schema: &str, code: &str, text: &str) -> anyhow::Result<()> {
+        let key = enc_key(schema, code, text);
+        self.with_db(|db| {
+            let txn = db.begin_write()?;
+            {
+                let mut t = txn.open_table(FREQ)?;
+                t.remove(key.as_str())?;
+            }
+            txn.commit()?;
+            Ok(())
+        })
+    }
+
+    /// 清空某方案全部词频，返回删除条数。
+    pub fn clear_freq(&self, schema: &str) -> anyhow::Result<usize> {
+        let scan = format!("{schema}\u{0}");
+        self.with_db(|db| {
+            let txn = db.begin_write()?;
+            let n;
+            {
+                let mut t = txn.open_table(FREQ)?;
+                let keys: Vec<String> = {
+                    let mut ks = Vec::new();
+                    for item in t.range(scan.as_str()..)? {
+                        let (k, _) = item?;
+                        let key = k.value();
+                        if !key.starts_with(&scan) {
+                            break;
+                        }
+                        ks.push(key.to_string());
+                    }
+                    ks
+                };
+                n = keys.len();
+                for k in keys {
+                    t.remove(k.as_str())?;
+                }
+            }
+            txn.commit()?;
+            Ok(n)
+        })
+    }
 }
 
 // ───────────────────────── legacy（过渡期，待 coordinator 接通后移除）─────────────────────────
@@ -255,6 +331,37 @@ mod tests {
         let r = s.get_freq("wb", "a", "工").unwrap().unwrap();
         assert_eq!(r.count, 2);
         assert!(r.last_used > 0);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn test_freq_list_delete_clear() {
+        let path = tmp("wind_freq_listops.redb");
+        let s = Store::open(&path).unwrap();
+        s.record_freq("py", "de", "的").unwrap();
+        s.record_freq("py", "shi", "是").unwrap();
+        s.record_freq("py", "shi", "是").unwrap();
+        s.record_freq("wb", "a", "工").unwrap(); // 另一方案隔离
+
+        let (page, total) = s.list_freq_paged("py", "", 0, 50).unwrap();
+        assert_eq!(total, 2);
+        assert_eq!(page.len(), 2);
+        // 前缀过滤
+        let (page2, total2) = s.list_freq_paged("py", "sh", 0, 50).unwrap();
+        assert_eq!(total2, 1);
+        assert_eq!(page2[0].1, "是");
+        assert_eq!(page2[0].2.count, 2);
+        // 分页
+        let (page3, _) = s.list_freq_paged("py", "", 1, 1).unwrap();
+        assert_eq!(page3.len(), 1);
+
+        // 删除
+        s.delete_freq("py", "de", "的").unwrap();
+        assert_eq!(s.list_freq_paged("py", "", 0, 0).unwrap().1, 1);
+        // 清空（按方案隔离，wb 不受影响）
+        assert_eq!(s.clear_freq("py").unwrap(), 1);
+        assert_eq!(s.list_freq_paged("py", "", 0, 0).unwrap().1, 0);
+        assert_eq!(s.list_freq_paged("wb", "", 0, 0).unwrap().1, 1);
         let _ = std::fs::remove_file(&path);
     }
 
