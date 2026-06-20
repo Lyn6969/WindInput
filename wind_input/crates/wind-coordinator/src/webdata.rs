@@ -69,9 +69,11 @@ impl Coordinator {
             "freq.delete" => Ok(json!({ "ok": true })),
             "freq.clear" => Ok(json!(0)),
 
-            // ── shadow.*（影子规则）🚧 待深化 ────────────────────
-            "shadow.list" => Ok(json!([])),
-            "shadow.pin" | "shadow.delete" | "shadow.removeRule" => Ok(json!({ "ok": true })),
+            // ── shadow.*（影子规则，redb 持久化）─────────────────
+            "shadow.list" => self.web_shadow_list(params),
+            "shadow.pin" => self.web_shadow_pin(params),
+            "shadow.delete" => self.web_shadow_delete(params),
+            "shadow.removeRule" => self.web_shadow_remove_rule(params),
 
             // ── phrase.*（短语）🚧 待深化 ────────────────────────
             "phrase.list" => Ok(json!([])),
@@ -216,15 +218,93 @@ impl Coordinator {
         let mut out = Vec::new();
         for id in self.engine_mgr.available_schemas().iter() {
             let user_words = store.search_user_words_prefix(id, "", 0).map(|v| v.len()).unwrap_or(0);
+            let temp_words = store.search_temp_words_prefix(id, "", 0).map(|v| v.len()).unwrap_or(0);
+            let shadow_rules = store
+                .list_shadow_rules(id)
+                .map(|v| v.iter().map(|(_, r)| r.pinned.len() + r.deleted.len()).sum::<usize>())
+                .unwrap_or(0);
             out.push(json!({
                 "schemaId": id,
                 "name": self.engine_mgr.schema_name(id),
                 "userWords": user_words,
-                "tempWords": 0,   // 🚧 待深化
-                "shadowRules": 0, // 🚧 待深化
+                "tempWords": temp_words,
+                "shadowRules": shadow_rules,
             }));
         }
         Ok(json!(out))
+    }
+
+    fn web_shadow_list(&self, params: &Value) -> anyhow::Result<Value> {
+        let schema = str_param(params, "schemaId")?;
+        let store = self
+            .store
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("无持久化存储"))?;
+        let mut out = Vec::new();
+        for (code, rec) in store.list_shadow_rules(schema)? {
+            for p in rec.pinned {
+                out.push(json!({
+                    "code": code,
+                    "word": p.word,
+                    "candId": p.cand_id,
+                    "type": "pin",
+                    "position": p.position,
+                }));
+            }
+            for d in rec.deleted {
+                out.push(json!({
+                    "code": code,
+                    "word": d,
+                    "candId": Value::Null,
+                    "type": "delete",
+                }));
+            }
+        }
+        Ok(json!(out))
+    }
+
+    fn web_shadow_pin(&self, params: &Value) -> anyhow::Result<Value> {
+        let (schema, code, word) = (
+            str_param(params, "schemaId")?,
+            str_param(params, "code")?,
+            str_param(params, "word")?,
+        );
+        let cand_id = params.get("candId").and_then(|v| v.as_str());
+        let position = usize_param(params, "position", 0);
+        let store = self
+            .store
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("无持久化存储"))?;
+        store.pin_shadow(schema, code, word, cand_id, position)?;
+        Ok(json!({ "ok": true }))
+    }
+
+    fn web_shadow_delete(&self, params: &Value) -> anyhow::Result<Value> {
+        let (schema, code, word) = (
+            str_param(params, "schemaId")?,
+            str_param(params, "code")?,
+            str_param(params, "word")?,
+        );
+        let store = self
+            .store
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("无持久化存储"))?;
+        store.delete_shadow(schema, code, word)?;
+        Ok(json!({ "ok": true }))
+    }
+
+    fn web_shadow_remove_rule(&self, params: &Value) -> anyhow::Result<Value> {
+        let (schema, code, word) = (
+            str_param(params, "schemaId")?,
+            str_param(params, "code")?,
+            str_param(params, "word")?,
+        );
+        let store = self
+            .store
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("无持久化存储"))?;
+        store.remove_shadow_rule(schema, code, word)?;
+        Ok(json!({ "ok": true }))
     }
 
     fn web_temp_list(&self, params: &Value) -> anyhow::Result<Value> {
@@ -318,4 +398,72 @@ impl Coordinator {
 /// UserWordRecord → 前端 UserWordItem。
 fn word_item(r: wind_store::user_words::UserWordRecord) -> Value {
     json!({ "code": r.code, "text": r.text, "weight": r.weight, "enabled": true })
+}
+
+#[cfg(test)]
+mod tests {
+    //! 数据域 RPC 契约测试：真实 Coordinator + 临时 redb store，断言 web_data_rpc 输出形状
+    //! 与 WindInputSetting 的 mock.ts / models.ts 一致。
+    use super::*;
+    use crate::coordinator::Coordinator;
+    use std::sync::Arc;
+    use wind_config::Config;
+    use wind_store::Store;
+
+    /// 构造一个带临时 store 的无头 Coordinator。
+    fn coord(tag: &str) -> Arc<Coordinator> {
+        let path = std::env::temp_dir().join(format!("wind_webdata_{tag}.redb"));
+        let _ = std::fs::remove_file(&path);
+        let store = Arc::new(Store::open(&path).unwrap());
+        Coordinator::new_headless_with_store(Config::default(), None, store)
+    }
+
+    #[test]
+    fn shadow_roundtrip_shape() {
+        let c = coord("shadow");
+        // pin + delete 两条规则
+        c.web_data_rpc(
+            "shadow.pin",
+            &json!({ "schemaId": "wb", "code": "aaaa", "word": "恭恭敬敬", "candId": "c1", "position": 0 }),
+        )
+        .unwrap();
+        c.web_data_rpc(
+            "shadow.delete",
+            &json!({ "schemaId": "wb", "code": "bbbb", "word": "某词" }),
+        )
+        .unwrap();
+
+        let list = c
+            .web_data_rpc("shadow.list", &json!({ "schemaId": "wb" }))
+            .unwrap();
+        let arr = list.as_array().expect("shadow.list 应为数组");
+        assert_eq!(arr.len(), 2, "应有 pin/delete 两条");
+        // 每条形状对齐 ShadowRuleItem {code, word, candId, type, position?}
+        for it in arr {
+            assert!(it.get("code").is_some());
+            assert!(it.get("word").is_some());
+            assert!(it.get("candId").is_some());
+            let ty = it["type"].as_str().unwrap();
+            assert!(ty == "pin" || ty == "delete");
+        }
+        let pin = arr.iter().find(|i| i["type"] == "pin").unwrap();
+        assert_eq!(pin["candId"], "c1");
+        assert_eq!(pin["position"], 0);
+
+        // removeRule 后清空
+        c.web_data_rpc(
+            "shadow.removeRule",
+            &json!({ "schemaId": "wb", "code": "aaaa", "word": "恭恭敬敬" }),
+        )
+        .unwrap();
+        c.web_data_rpc(
+            "shadow.removeRule",
+            &json!({ "schemaId": "wb", "code": "bbbb", "word": "某词" }),
+        )
+        .unwrap();
+        let list2 = c
+            .web_data_rpc("shadow.list", &json!({ "schemaId": "wb" }))
+            .unwrap();
+        assert_eq!(list2.as_array().unwrap().len(), 0, "removeRule 后应清空");
+    }
 }

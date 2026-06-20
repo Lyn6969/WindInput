@@ -515,6 +515,21 @@ impl Coordinator {
         Self::build(config, data_dir, push_server, ui_tx, None, None)
     }
 
+    /// 无头 + 注入 redb store（测试用）：用于 web_data_rpc 数据域契约测试。
+    pub fn new_headless_with_store(
+        config: Config,
+        data_dir: Option<&Path>,
+        store: Arc<Store>,
+    ) -> Arc<Self> {
+        let (ui_tx, _rx) = std::sync::mpsc::channel();
+        drop(_rx);
+        let push_server = Arc::new(PushServer::new(PushConfig {
+            suffix: String::new(),
+            write_timeout_ms: 30_000,
+        }));
+        Self::build(config, data_dir, push_server, ui_tx, None, Some(store))
+    }
+
     fn build(
         config: Config,
         data_dir: Option<&Path>,

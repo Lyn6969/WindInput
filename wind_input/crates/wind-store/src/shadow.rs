@@ -248,6 +248,28 @@ impl Store {
                 .and_then(|g| serde_json::from_slice(g.value()).ok()))
         })
     }
+
+    /// 列举某方案下所有 code 的 Shadow 规则（设置页用）。返回 (code, 规则) 列表。
+    pub fn list_shadow_rules(&self, schema: &str) -> anyhow::Result<Vec<(String, ShadowRecord)>> {
+        let prefix = format!("{schema}\u{0}");
+        self.with_db(|db| {
+            let txn = db.begin_read()?;
+            let t = txn.open_table(SHADOW)?;
+            let mut out = Vec::new();
+            for item in t.range(prefix.as_str()..)? {
+                let (k, v) = item?;
+                let key = k.value();
+                if !key.starts_with(&prefix) {
+                    break;
+                }
+                let code = &key[prefix.len()..];
+                if let Ok(rec) = serde_json::from_slice::<ShadowRecord>(v.value()) {
+                    out.push((code.to_string(), rec));
+                }
+            }
+            Ok(out)
+        })
+    }
 }
 
 #[cfg(test)]
@@ -324,6 +346,27 @@ mod tests {
         assert_eq!(r.pinned.len(), 1, "同 cand_id 应去重为 1 条");
         assert_eq!(r.pinned[0].word, "日期改");
 
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn test_list_shadow_rules() {
+        let path = std::env::temp_dir().join("wind_shadow_list.redb");
+        let _ = std::fs::remove_file(&path);
+        let s = Store::open(&path).unwrap();
+        s.pin_shadow("wb", "aaaa", "恭恭敬敬", None, 0).unwrap();
+        s.delete_shadow("wb", "bbbb", "某词").unwrap();
+        s.pin_shadow("py", "nihao", "你好", None, 0).unwrap();
+
+        let mut wb = s.list_shadow_rules("wb").unwrap();
+        wb.sort_by(|a, b| a.0.cmp(&b.0));
+        assert_eq!(wb.len(), 2, "wb 应有 aaaa/bbbb 两个 code");
+        assert_eq!(wb[0].0, "aaaa");
+        assert_eq!(wb[0].1.pinned.len(), 1);
+        assert_eq!(wb[1].0, "bbbb");
+        assert_eq!(wb[1].1.deleted, vec!["某词".to_string()]);
+        // 跨方案隔离
+        assert_eq!(s.list_shadow_rules("py").unwrap().len(), 1);
         let _ = std::fs::remove_file(&path);
     }
 }
