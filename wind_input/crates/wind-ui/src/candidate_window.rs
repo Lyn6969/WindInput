@@ -136,6 +136,10 @@ pub struct CandidateWindow {
     preedit_embedded: bool,
     /// 候选字号覆盖（>0 时取代主题 behavior.font_size）。来自 ui.candidate.font_size。
     font_size_override: f32,
+    /// 候选窗在光标上方时反转候选顺序。来自 ui.candidate.flip_when_above。
+    flip_when_above: bool,
+    /// 当前锚点是否落在光标上方（定位时计算，随锚点锁定保持）。供 flip 判定。
+    placed_above: bool,
 }
 
 impl CandidateWindow {
@@ -179,6 +183,8 @@ impl CandidateWindow {
             vertical: false,
             preedit_embedded: false,
             font_size_override: 0.0,
+            flip_when_above: false,
+            placed_above: false,
         })
     }
 
@@ -196,6 +202,11 @@ impl CandidateWindow {
     /// 设置候选字号覆盖（0=跟随主题）。来自 ui.candidate.font_size。
     pub fn set_font_size_override(&mut self, font_size: f32) {
         self.font_size_override = font_size.max(0.0);
+    }
+
+    /// 设置"上方时反转候选顺序"。来自 ui.candidate.flip_when_above。
+    pub fn set_flip_when_above(&mut self, flip: bool) {
+        self.flip_when_above = flip;
     }
 
     /// 设置悬停提示激活延迟（毫秒）。来自 ui.tooltip.delay。
@@ -261,7 +272,7 @@ impl CandidateWindow {
         let t_start = Instant::now();
 
         // 构建并测量 View 树
-        let mut root = self.build_tree();
+        let mut root = self.build_tree(false);
         let t_build = t_start.elapsed();
 
         // 窗口投影：高斯软影四向扩边（与 Go shadowMargins 对齐），内容布局起点平移到 (ml, mt)，
@@ -281,7 +292,26 @@ impl CandidateWindow {
         let height = content_h + mt + mb;
         let t_layout = t_layout0.elapsed();
 
-        // 收集候选命中矩形并同步给鼠标处理器
+        // 定位提前到 paint 前（供 flip_when_above 判定）：组合期锚点锁定后复用，
+        // 仅首次/重锚时按工作区钳制并记录是否上翻（placed_above）。
+        let keep = self.visible && self.anchor_locked && self.anchor.is_some();
+        let (px, py) = if keep {
+            self.anchor.unwrap()
+        } else {
+            let (x, y, above) =
+                Self::clamp_to_work_area(self.x, self.y, self.caret_height, content_w, content_h);
+            self.anchor = Some((x, y));
+            self.anchor_locked = self.caret_valid; // 仅有效坐标才锁定
+            self.placed_above = above;
+            (x, y)
+        };
+        // 上方显示且启用 → 逆序重建候选树（项数/尺寸/位置不变，仅排列翻转）
+        if self.flip_when_above && self.placed_above {
+            root = self.build_tree(true);
+            root.layout(ml as f32, mt as f32, &self.text_renderer);
+        }
+
+        // 收集候选命中矩形并同步给鼠标处理器（须在 flip 重建后）
         self.hit_rects.clear();
         root.collect_hits(&mut self.hit_rects);
         {
@@ -340,20 +370,7 @@ impl CandidateWindow {
             t_start.elapsed()
         );
 
-        // 位置锚定：组合期间固定——锚点一旦按有效坐标锁定，打字/悬停/翻页刷新都复用，
-        // 避免窗口随光标/刷新漂移。首次连接尚无有效坐标时，锚点为"临时"，
-        // 待有效坐标到达再重锚（避免卡在左上角不恢复）。
-        // anchor 存内容盒左上（与无阴影时一致，blur/spread 变化不影响锚点）。
-        let keep = self.visible && self.anchor_locked && self.anchor.is_some();
-        let (px, py) = if keep {
-            self.anchor.unwrap()
-        } else {
-            let p =
-                Self::clamp_to_work_area(self.x, self.y, self.caret_height, content_w, content_h);
-            self.anchor = Some(p);
-            self.anchor_locked = self.caret_valid; // 仅有效坐标才锁定
-            p
-        };
+        // 位置 (px, py) 已在 paint 前计算并锚定（组合期锁定后复用，避免漂移）。
         // 窗口实际左上 = 内容锚点 − 左/上 margin，使内容仍落在锚点处，阴影向四周溢出。
         self.window.show(px - ml as i32, py - mt as i32);
         self.visible = true;
@@ -396,11 +413,19 @@ impl CandidateWindow {
     /// 默认显示在光标下方（+gap）；下方空间不足则上翻到光标上方；
     /// 左右溢出则贴边。避免窗口跑到屏幕外。
     // 非 Windows 下窗口钳制为空实现，caret_h/w/h 及 x/y 的可变性仅 Windows 分支需要。
+    /// 返回 (x, y, above)：above=true 表示窗口被上翻到光标上方（供 flip_when_above 判定）。
     #[cfg_attr(not(windows), allow(unused_variables, unused_mut))]
-    fn clamp_to_work_area(caret_x: i32, caret_y: i32, caret_h: i32, w: u32, h: u32) -> (i32, i32) {
+    fn clamp_to_work_area(
+        caret_x: i32,
+        caret_y: i32,
+        caret_h: i32,
+        w: u32,
+        h: u32,
+    ) -> (i32, i32, bool) {
         let gap = 2;
         // caret_y 为光标底端（与 Go 一致）：默认显示在其下方，仅留 gap
         let (mut x, mut y) = (caret_x, caret_y + gap);
+        let mut above = false;
         #[cfg(windows)]
         {
             use windows::Win32::Foundation::POINT;
@@ -422,12 +447,13 @@ impl CandidateWindow {
                     let (wi, hi) = (w as i32, h as i32);
                     // 下方放不下 → 上翻到光标上方（光标顶端 = caret_y - caret_h）
                     if y + hi > wa.bottom {
-                        let above = caret_y - caret_h.max(0) - hi - gap;
-                        y = if above >= wa.top {
-                            above
+                        let above_y = caret_y - caret_h.max(0) - hi - gap;
+                        if above_y >= wa.top {
+                            y = above_y;
+                            above = true;
                         } else {
-                            wa.bottom - hi
-                        };
+                            y = wa.bottom - hi;
+                        }
                     }
                     // 左右钳制
                     if x + wi > wa.right {
@@ -443,7 +469,7 @@ impl CandidateWindow {
                 }
             }
         }
-        (x, y)
+        (x, y, above)
     }
 
     /// 窗口投影参数（共享 SoftShadow；读 RvViews 顶层 shadow_* 字段）。
@@ -499,7 +525,9 @@ impl CandidateWindow {
 
     /// 按当前状态构建候选视图树（横向布局）。
     /// T3：从 RVNode 树（`Resolved.views`）取色/几何，颜色 None→兜底（与旧 ResolvedTheme 默认等值，零回归）。
-    fn build_tree(&self) -> View {
+    /// 构建候选 View 树。`flip=true` 时候选按相反顺序排列（上方显示场景），
+    /// 但每项的 tag/序号标签/选中判定仍用原始索引 i，确保命中/选中映射不变。
+    fn build_tree(&self, flip: bool) -> View {
         use wind_theme::rvnode::{RvEdges, RvNode};
         use wind_theme::schema::Dim;
         let t = &self.theme;
@@ -707,7 +735,12 @@ impl CandidateWindow {
             }
             list = list.child(chip);
         }
-        for (i, cand) in self.candidates.iter().enumerate() {
+        // 逆序仅改排列顺序；i 仍是原始索引（tag/标签/选中据此）
+        let mut order: Vec<(usize, &CandidateItem)> = self.candidates.iter().enumerate().collect();
+        if flip {
+            order.reverse();
+        }
+        for (i, cand) in order {
             let marker = if cand.label.is_empty() {
                 (i + 1).to_string()
             } else {

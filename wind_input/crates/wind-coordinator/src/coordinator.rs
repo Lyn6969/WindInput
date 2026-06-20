@@ -511,6 +511,9 @@ impl Coordinator {
         let _ = coordinator.ui_tx.send(UiCommand::SetCandidateFontSize(
             rt0.config.ui.candidate.font_size,
         ));
+        let _ = coordinator.ui_tx.send(UiCommand::SetCandidateFlipWhenAbove(
+            rt0.config.ui.candidate.flip_when_above,
+        ));
         let _ = coordinator
             .ui_tx
             .send(UiCommand::SetTooltipDelay(rt0.config.ui.tooltip.delay));
@@ -822,6 +825,10 @@ impl Coordinator {
         let _ = self
             .ui_tx
             .send(UiCommand::SetCandidateFontSize(cand.font_size));
+        // 上方时反转候选顺序（ui.candidate.flip_when_above）
+        let _ = self
+            .ui_tx
+            .send(UiCommand::SetCandidateFlipWhenAbove(cand.flip_when_above));
         // 悬停提示延迟（ui.tooltip.delay）
         let _ = self
             .ui_tx
