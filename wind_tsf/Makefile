@@ -71,9 +71,16 @@ VERRC   := $(OBJDIR)/version.rc
 RESOBJ  := $(OBJDIR)/resource_rc.o
 VEROBJ  := $(OBJDIR)/version_rc.o
 
-.PHONY: all clean
+.PHONY: all clean x86
 all: $(DLL)
 	@echo "✅ $(DLL) ($(VERSION))"
+
+# x86(32 位)构建 → $(OUTDIR)/wind_tsf_x86.dll
+# 32 位宿主程序(部分旧软件)需要对应位数的 TSF DLL 才能显示输入法。
+# 用 i686 工具链 + 独立 objdir,命令行赋值覆盖 TARGET/OBJDIR(对 := 同样生效)。
+x86:
+	$(MAKE) TRIPLE=i686-w64-mingw32 TARGET=wind_tsf_x86 \
+	        OBJDIR=$(OUTDIR)/obj_x86 VERSION=$(VERSION) all
 
 # 目标文件
 $(OBJDIR)/%.o: src/%.cpp | $(OBJDIR)
@@ -106,5 +113,5 @@ $(OBJDIR) $(OUTDIR):
 	mkdir -p $@
 
 clean:
-	rm -rf build/obj build_debug/obj_debug $(OBJDIR) \
-	       build/wind_tsf.dll build_debug/wind_tsf_debug.dll
+	rm -rf build/obj build/obj_x86 build_debug/obj_debug $(OBJDIR) \
+	       build/wind_tsf.dll build/wind_tsf_x86.dll build_debug/wind_tsf_debug.dll

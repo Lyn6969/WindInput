@@ -83,6 +83,38 @@ BOOL CHostWindow::_ResolveAPIs()
     return TRUE;
 }
 
+namespace {
+// Local alias matching CHostWindow::GetWindowBand_t (a private member typedef,
+// not visible at namespace scope). Identical function-pointer typedefs are the
+// same type, so assigning _pfnGetWindowBand into this field is well-formed.
+typedef BOOL (WINAPI* PfnGetWindowBand)(HWND hwnd, DWORD* pdwBand);
+
+struct BandEnumData
+{
+    DWORD targetPID;
+    PfnGetWindowBand pfnGetWindowBand;
+    DWORD bestBand;
+};
+
+// Free function with explicit CALLBACK (__stdcall). The x86 (i686) build does
+// not infer the stdcall calling convention from an inline lambda, so passing a
+// lambda to EnumWindows fails to convert to WNDENUMPROC there. x64 has a single
+// calling convention and would accept the lambda, but this form builds on both.
+BOOL CALLBACK BandEnumProc(HWND hwnd, LPARAM lParam)
+{
+    auto* data = reinterpret_cast<BandEnumData*>(lParam);
+    DWORD pid = 0;
+    GetWindowThreadProcessId(hwnd, &pid);
+    if (pid == data->targetPID)
+    {
+        DWORD b = 0;
+        if (data->pfnGetWindowBand(hwnd, &b) && b > data->bestBand)
+            data->bestBand = b;
+    }
+    return TRUE;
+}
+} // namespace
+
 DWORD CHostWindow::GetHostBand()
 {
     DWORD currentPID = GetCurrentProcessId();
@@ -102,26 +134,8 @@ DWORD CHostWindow::GetHostBand()
     }
 
     // Enumerate top-level windows owned by this process
-    struct EnumData
-    {
-        DWORD targetPID;
-        GetWindowBand_t pfnGetWindowBand;
-        DWORD bestBand;
-    } enumData = { currentPID, _pfnGetWindowBand, 0 };
-
-    EnumWindows([](HWND hwnd, LPARAM lParam) -> BOOL
-    {
-        auto* data = reinterpret_cast<EnumData*>(lParam);
-        DWORD pid = 0;
-        GetWindowThreadProcessId(hwnd, &pid);
-        if (pid == data->targetPID)
-        {
-            DWORD b = 0;
-            if (data->pfnGetWindowBand(hwnd, &b) && b > data->bestBand)
-                data->bestBand = b;
-        }
-        return TRUE;
-    }, (LPARAM)&enumData);
+    BandEnumData enumData = { currentPID, _pfnGetWindowBand, 0 };
+    EnumWindows(BandEnumProc, (LPARAM)&enumData);
 
     return enumData.bestBand;
 }
