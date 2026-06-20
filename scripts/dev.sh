@@ -579,27 +579,31 @@ menu_loop() {
 }
 
 # ---------- 命令行直调 ----------
-case "${1:-}" in
-    ""|menu)            menu_loop ;;
-    release|1)          do_build ;;
-    debug|1d)           do_build debug ;;
-    check|2)            do_check ;;
-    clippy|3)           do_clippy ;;
-    test|4)             do_test ;;
-    deploy|5)           deploy_all ;;
-    tsf|dll|6)          build_tsf "$BUILD_DIR" "${2:-}" ;;
-    data|7)             copy_data "$BUILD_DEBUG_DIR" ;;
-    fmt|f)              do_fmt ;;
-    fmt-check)          do_fmt_check ;;
-    clean|c)            do_clean ;;
-    ci|i)               do_ci ;;
-    repl)               do_repl "${2:-}" ;;
-    push)               do_push "${2:-}" "${3:-}" ;;
-    push-data|pushdata) do_push_data ;;
-    pull-data)          do_pull_data ;;
-    pull-config)        do_pull_config ;;
-    pull-log)           do_pull_log "${2:-}" ;;
-    gen-data)           do_gen_data ;;
+# 长名与菜单缩写均可直调（如 './dev.sh push-data' 等价 './dev.sh pda'）；命令转小写以容错。
+cmd="$(printf '%s' "${1:-}" | tr '[:upper:]' '[:lower:]')"
+case "$cmd" in
+    ""|menu)              menu_loop ;;
+    release|1)            do_build ;;
+    debug|1d)             do_build debug ;;
+    check|2)              do_check ;;
+    clippy|3)             do_clippy ;;
+    test|4)               do_test ;;
+    deploy|5)             deploy_all ;;
+    tsf|dll|6)            build_tsf "$BUILD_DIR" "${2:-}" ;;
+    data|7)               copy_data "$BUILD_DEBUG_DIR" ;;
+    fmt|f)                do_fmt ;;
+    fmt-check)            do_fmt_check ;;
+    clean|c)              do_clean ;;
+    ci|i)                 do_ci ;;
+    repl|r)               do_repl "${2:-}" ;;
+    push|p)               do_push "${2:-}" "${3:-}" ;;
+    pd)                   do_push debug data ;;
+    push-data|pushdata|pda) do_push_data ;;
+    pull-data|dl)         do_pull_data ;;
+    pull-config|pc)       do_pull_config ;;
+    pull-log|pl)          do_pull_log "${2:-}" ;;
+    pla)                  do_pull_log all ;;
+    gen-data|gd)          do_gen_data ;;
     -h|--help|help)
         grep '^#' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
         ;;
