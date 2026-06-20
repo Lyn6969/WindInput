@@ -1123,24 +1123,44 @@ impl Coordinator {
         // 数字键需录入表达式的场景用字母标签（a/b/c）选词：旧快捷输入，以及 mix 的数字模式。
         let alpha = state.active == Some(ModeKind::QuickInput)
             || (matches!(state.active, Some(ModeKind::Mix(_))) && state.mix_numeric);
+        // 悬停提示/候选微调配置（热重载快照）
+        let rt = self.rt();
+        let cand_cfg = &rt.config.ui.candidate;
+        let tip_cfg = &rt.config.ui.tooltip;
+        let tip_opts = wind_reverse::TooltipOptions {
+            code: tip_cfg.code.enabled,
+            pinyin: tip_cfg.pinyin.enabled,
+            heteronyms: tip_cfg.pinyin.heteronyms,
+            max_readings: tip_cfg.pinyin.max_readings,
+            chaizi: tip_cfg.chaizi.enabled,
+        };
         let items: Vec<CandidateItem> = state.candidates[start..end]
             .iter()
             .enumerate()
             .map(|(i, c)| {
-                let disp = self.maybe_s2t(state, &c.text);
-                // 反查提示：优先逐字编码/拼音，无则回退引擎给的整体编码
-                let mut tooltip = self.reverse.tooltip_for(&disp);
+                // 反查提示用完整文本（截断只影响显示，不影响"如何输入"提示）
+                let full = self.maybe_s2t(state, &c.text);
+                let mut tooltip = self.reverse.tooltip_for(&full, &tip_opts);
+                if tip_cfg.debug.enabled {
+                    let dbg = debug_tooltip_section(c);
+                    if !dbg.is_empty() {
+                        if !tooltip.is_empty() {
+                            tooltip.push('\n');
+                        }
+                        tooltip.push_str(&dbg);
+                    }
+                }
                 if tooltip.is_empty() && !c.code.is_empty() {
                     tooltip = c.code.clone();
                 }
                 CandidateItem {
-                    // 开启简繁时显示也转繁体（内部候选仍存简体，用于词频/匹配）
-                    text: disp,
+                    // 开启简繁时显示也转繁体（内部候选仍存简体，用于词频/匹配）；按 max_chars 截断显示
+                    text: cand_cfg.truncate_display(&full),
                     code: c.code.clone(),
                     label: if alpha {
                         ((b'a' + i as u8) as char).to_string()
                     } else {
-                        (i + 1).to_string()
+                        cand_cfg.index_label(i)
                     },
                     tooltip,
                     comment: c.comment.clone(),
@@ -2154,6 +2174,24 @@ impl MessageHandler for Coordinator {
 
     fn handle_host_render_request(&self) {}
     fn handle_host_render_ready(&self) {}
+}
+
+/// 候选调试信息段（tooltip debug provider）：编码/权重/引擎/标记。空候选返回空串。
+fn debug_tooltip_section(c: &Candidate) -> String {
+    let mut lines = Vec::new();
+    if !c.code.is_empty() {
+        lines.push(format!("编码: {}", c.code));
+    }
+    lines.push(format!("权重: {}", c.weight));
+    lines.push(format!("引擎: {:?}", c.source));
+    if c.has_shadow {
+        lines.push("标记: 已调整".to_string());
+    }
+    if lines.is_empty() {
+        String::new()
+    } else {
+        format!("调试\n{}", lines.join("\n"))
+    }
 }
 
 #[cfg(test)]

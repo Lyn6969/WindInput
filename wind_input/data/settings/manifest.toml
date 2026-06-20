@@ -534,6 +534,50 @@ hint = "盲打/自动上屏场景；隐藏后仍可输入"
 default = false
 since = 2
 
+[[items]]
+key = "ui.candidate.font_size"
+group = "ui"
+section = "候选窗"
+type = "number"
+label = "候选字号"
+hint = "0 = 跟随主题"
+default = 0
+min = 0
+max = 72
+since = 3
+
+[[items]]
+key = "ui.candidate.max_chars"
+group = "ui"
+section = "候选窗"
+type = "number"
+label = "候选文本最大字数"
+hint = "超出截断；0 = 不限"
+default = 0
+min = 0
+max = 64
+since = 3
+
+[[items]]
+key = "ui.candidate.index_labels"
+group = "ui"
+section = "候选窗"
+type = "string"
+label = "自定义序号标签"
+hint = "每字符一个槽位，如 asdfg；空 = 默认 1-9"
+default = ""
+since = 3
+
+[[items]]
+key = "ui.candidate.flip_when_above"
+group = "ui"
+section = "候选窗"
+type = "toggle"
+label = "候选窗在上方时反转顺序"
+hint = "候选窗显示在光标上方时，反转候选排列方向"
+default = false
+since = 3
+
 # ── 模式指示 ──
 [[items]]
 key = "ui.mode_indicator.style"
@@ -549,6 +593,81 @@ options = [
   { value = "full", label = "全称" },
   { value = "none", label = "不显示" },
 ]
+
+# ── 悬停提示 ──
+[[items]]
+key = "ui.tooltip.delay"
+group = "ui"
+section = "悬停提示"
+type = "number"
+label = "提示延迟（毫秒）"
+hint = "鼠标悬停候选多久后显示提示"
+default = 100
+min = 0
+max = 2000
+since = 3
+
+[[items]]
+key = "ui.tooltip.code.enabled"
+group = "ui"
+section = "悬停提示"
+type = "toggle"
+label = "显示编码"
+default = true
+since = 3
+
+[[items]]
+key = "ui.tooltip.pinyin.enabled"
+group = "ui"
+section = "悬停提示"
+type = "toggle"
+label = "显示拼音"
+default = true
+since = 3
+
+[[items]]
+key = "ui.tooltip.pinyin.heteronyms"
+group = "ui"
+section = "悬停提示"
+type = "toggle"
+label = "显示多音字所有读音"
+hint = "关闭则仅显示首音"
+default = true
+since = 3
+enabled_when = "ui.tooltip.pinyin.enabled == true"
+
+[[items]]
+key = "ui.tooltip.pinyin.max_readings"
+group = "ui"
+section = "悬停提示"
+type = "number"
+label = "每字最多读音数"
+hint = "0 = 不限"
+default = 0
+min = 0
+max = 8
+since = 3
+enabled_when = "ui.tooltip.pinyin.enabled == true"
+
+[[items]]
+key = "ui.tooltip.chaizi.enabled"
+group = "ui"
+section = "悬停提示"
+type = "toggle"
+label = "显示拆字"
+hint = "字根分解 + 编码"
+default = false
+since = 3
+
+[[items]]
+key = "ui.tooltip.debug.enabled"
+group = "ui"
+section = "悬停提示"
+type = "toggle"
+label = "显示调试信息"
+hint = "候选权重/来源等（排查用）"
+default = false
+since = 3
 
 # 注：字体/颜色由主题（theme.yaml）控制，ui.font.* 当前未接入 UI，故不在此暴露——
 # 待实装“候选窗字体覆盖”特性后再加回（family/path/render_mode）。

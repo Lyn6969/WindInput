@@ -11,11 +11,41 @@
 use std::collections::HashMap;
 use std::path::Path;
 
+/// 悬停提示生成选项（对齐 Go `ui.tooltip.*` provider 开关）。
+#[derive(Debug, Clone)]
+pub struct TooltipOptions {
+    /// 编码段（五笔编码）
+    pub code: bool,
+    /// 拼音段
+    pub pinyin: bool,
+    /// 拼音显示多音字所有读音（false 仅首音）
+    pub heteronyms: bool,
+    /// 每字最多显示读音数（0=不限）
+    pub max_readings: usize,
+    /// 拆字段（字根分解 [编码]）
+    pub chaizi: bool,
+}
+
+impl Default for TooltipOptions {
+    /// 与 Go 默认一致：编码+拼音(全读音)开，拆字关。
+    fn default() -> Self {
+        Self {
+            code: true,
+            pinyin: true,
+            heteronyms: true,
+            max_readings: 0,
+            chaizi: false,
+        }
+    }
+}
+
 /// 反查表
 #[derive(Default)]
 pub struct ReverseLookup {
     /// 字 → 五笔编码
     code: HashMap<char, String>,
+    /// 字 → 字根分解（拆字段用）
+    radicals: HashMap<char, String>,
     /// 字 → 拼音读音（多音字按常用频率排序，最常用在前）
     pinyin: HashMap<char, Vec<String>>,
 }
@@ -34,7 +64,7 @@ impl ReverseLookup {
         self.code.is_empty() && self.pinyin.is_empty()
     }
 
-    /// 载入五笔拆字库（字\t字根\t编码）；取编码列。
+    /// 载入五笔拆字库（字\t字根\t编码）；存编码列 + 字根列。
     fn load_chaizi(&mut self, path: &Path) {
         let Ok(content) = std::fs::read_to_string(path) else {
             return;
@@ -45,16 +75,22 @@ impl ReverseLookup {
                 continue;
             }
             let mut it = line.split('\t');
-            let (Some(ch), _radicals, code) = (it.next(), it.next(), it.next()) else {
+            let (Some(ch), radicals, code) = (it.next(), it.next(), it.next()) else {
                 continue;
             };
             let mut chars = ch.chars();
-            if let (Some(c), None) = (chars.next(), chars.next())
-                && let Some(code) = code
-            {
-                let code = code.trim();
-                if !code.is_empty() {
-                    self.code.insert(c, code.to_string());
+            if let (Some(c), None) = (chars.next(), chars.next()) {
+                if let Some(code) = code {
+                    let code = code.trim();
+                    if !code.is_empty() {
+                        self.code.insert(c, code.to_string());
+                    }
+                }
+                if let Some(radicals) = radicals {
+                    let radicals = radicals.trim();
+                    if !radicals.is_empty() {
+                        self.radicals.insert(c, radicals.to_string());
+                    }
                 }
             }
         }
@@ -142,35 +178,69 @@ impl ReverseLookup {
         }
     }
 
-    /// 为候选文本生成反查提示（逐字一行："字  编码  拼音"）。无可用信息返回空串。
-    pub fn tooltip_for(&self, text: &str) -> String {
+    /// 为候选文本生成反查提示，按 `opts` 门控各 provider，分段输出（对齐 Go tooltip）。
+    /// 段序：拼音 / 拆字 / 编码，每段含标题行 + 逐字「字：内容」。无可用信息返回空串。
+    pub fn tooltip_for(&self, text: &str, opts: &TooltipOptions) -> String {
         if self.is_empty() {
             return String::new();
         }
-        let mut lines = Vec::new();
-        for c in text.chars() {
-            // 跳过 ASCII / 非汉字
-            if (c as u32) < 0x3400 {
-                continue;
-            }
-            let code = self.code.get(&c);
-            let py = self.pinyin.get(&c);
-            if code.is_none() && py.is_none() {
-                continue;
-            }
-            let mut line = c.to_string();
-            if let Some(py) = py {
-                // 多音字读音以 "/" 连接（与 Go tooltip 一致）
-                line.push_str("  ");
-                line.push_str(&py.join("/"));
-            }
-            if let Some(code) = code {
-                line.push_str("  ");
-                line.push_str(code);
-            }
-            lines.push(line);
+        let chars: Vec<char> = text.chars().filter(|c| (*c as u32) >= 0x3400).collect();
+        if chars.is_empty() {
+            return String::new();
         }
-        lines.join("\n")
+        let mut sections: Vec<String> = Vec::new();
+
+        // 拼音段
+        if opts.pinyin {
+            let mut lines = Vec::new();
+            for &c in &chars {
+                if let Some(readings) = self.pinyin.get(&c) {
+                    let n = if !opts.heteronyms {
+                        1
+                    } else if opts.max_readings > 0 {
+                        opts.max_readings.min(readings.len())
+                    } else {
+                        readings.len()
+                    };
+                    let shown = readings[..n.min(readings.len())].join("/");
+                    if !shown.is_empty() {
+                        lines.push(format!("{c}：{shown}"));
+                    }
+                }
+            }
+            if !lines.is_empty() {
+                sections.push(format!("拼音\n{}", lines.join("\n")));
+            }
+        }
+        // 拆字段（字根 [编码]）
+        if opts.chaizi {
+            let mut lines = Vec::new();
+            for &c in &chars {
+                if let Some(rad) = self.radicals.get(&c) {
+                    let line = match self.code.get(&c) {
+                        Some(code) => format!("{c}：{rad} [{code}]"),
+                        None => format!("{c}：{rad}"),
+                    };
+                    lines.push(line);
+                }
+            }
+            if !lines.is_empty() {
+                sections.push(format!("拆字\n{}", lines.join("\n")));
+            }
+        }
+        // 编码段
+        if opts.code {
+            let mut lines = Vec::new();
+            for &c in &chars {
+                if let Some(code) = self.code.get(&c) {
+                    lines.push(format!("{c}：{code}"));
+                }
+            }
+            if !lines.is_empty() {
+                sections.push(format!("编码\n{}", lines.join("\n")));
+            }
+        }
+        sections.join("\n")
     }
 }
 
@@ -218,19 +288,80 @@ mod tests {
         assert_eq!(rl.wubi_word_code("工人大小"), "awdi");
     }
 
-    #[test]
-    fn test_tooltip_format() {
+    fn sample_rl() -> ReverseLookup {
         let mut rl = ReverseLookup::default();
         rl.code.insert('好', "vbg".to_string());
-        rl.pinyin.insert('好', vec!["hǎo".to_string()]);
+        rl.pinyin
+            .insert('好', vec!["hǎo".to_string(), "hào".to_string()]);
+        rl.radicals.insert('好', "女子".to_string());
         rl.code.insert('人', "w".to_string());
-        let t = rl.tooltip_for("好人");
-        assert!(t.contains("好"));
-        assert!(t.contains("hǎo"));
-        assert!(t.contains("vbg"));
-        assert!(t.contains('\n'), "多字应多行");
+        rl.pinyin.insert('人', vec!["rén".to_string()]);
+        rl.radicals.insert('人', "人".to_string());
+        rl
+    }
+
+    #[test]
+    fn test_tooltip_default_pinyin_and_code() {
+        let rl = sample_rl();
+        let t = rl.tooltip_for("好人", &TooltipOptions::default());
+        // 默认：拼音段 + 编码段，无拆字段
+        assert!(t.contains("拼音"), "{t}");
+        assert!(t.contains("好：hǎo/hào"), "默认 heteronyms 显示全读音: {t}");
+        assert!(t.contains("编码"), "{t}");
+        assert!(t.contains("好：vbg"), "{t}");
+        assert!(!t.contains("拆字"), "默认不含拆字: {t}");
         // 纯 ASCII 无反查
-        assert_eq!(rl.tooltip_for("abc"), "");
+        assert_eq!(rl.tooltip_for("abc", &TooltipOptions::default()), "");
+    }
+
+    #[test]
+    fn test_tooltip_provider_gating() {
+        let rl = sample_rl();
+        // 仅拼音
+        let opts = TooltipOptions {
+            code: false,
+            pinyin: true,
+            heteronyms: true,
+            max_readings: 0,
+            chaizi: false,
+        };
+        let t = rl.tooltip_for("好", &opts);
+        assert!(
+            t.contains("拼音") && !t.contains("编码") && !t.contains("拆字"),
+            "{t}"
+        );
+    }
+
+    #[test]
+    fn test_tooltip_heteronyms_and_max_readings() {
+        let rl = sample_rl();
+        // heteronyms=false → 仅首音
+        let opts = TooltipOptions {
+            heteronyms: false,
+            ..Default::default()
+        };
+        let t = rl.tooltip_for("好", &opts);
+        assert!(t.contains("好：hǎo") && !t.contains("hào"), "仅首音: {t}");
+        // max_readings=1 → 截断到 1
+        let opts2 = TooltipOptions {
+            max_readings: 1,
+            ..Default::default()
+        };
+        let t2 = rl.tooltip_for("好", &opts2);
+        assert!(t2.contains("好：hǎo") && !t2.contains("hào"), "截断: {t2}");
+    }
+
+    #[test]
+    fn test_tooltip_chaizi() {
+        let rl = sample_rl();
+        let opts = TooltipOptions {
+            code: false,
+            pinyin: false,
+            chaizi: true,
+            ..Default::default()
+        };
+        let t = rl.tooltip_for("好", &opts);
+        assert_eq!(t, "拆字\n好：女子 [vbg]", "拆字段含字根+编码: {t}");
     }
 
     #[test]
@@ -248,7 +379,7 @@ mod tests {
         let mut rl = ReverseLookup::default();
         rl.pinyin
             .insert('重', vec!["zhòng".to_string(), "chóng".to_string()]);
-        let t = rl.tooltip_for("重");
+        let t = rl.tooltip_for("重", &TooltipOptions::default());
         assert!(t.contains("zhòng/chóng"), "多音字读音应以 / 连接: {t}");
     }
 

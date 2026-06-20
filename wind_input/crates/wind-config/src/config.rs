@@ -434,6 +434,8 @@ pub struct UiConfig {
     pub theme: UiThemeConfig,
     #[serde(default)]
     pub mode_indicator: ModeIndicatorConfig,
+    #[serde(default)]
+    pub tooltip: TooltipConfig,
 }
 
 /// 模式指示器配置（[ui.mode_indicator]）：进入临时拼音/双拼/快捷/英文/快符等模式时的标识。
@@ -499,6 +501,18 @@ pub struct UiCandidateConfig {
     pub preedit_display: String,
     #[serde(default)]
     pub hide_window: bool,
+    /// 候选文本字号（0=跟随主题 behavior.font_size）。
+    #[serde(default)]
+    pub font_size: f32,
+    /// 候选文本最大显示字数，超出截断（0=不限）。
+    #[serde(default)]
+    pub max_chars: usize,
+    /// 自定义序号标签（如 "asdfg"；空=默认 1-9）。每字符一个槽位。
+    #[serde(default)]
+    pub index_labels: String,
+    /// 候选窗在光标上方时反转候选排列顺序。
+    #[serde(default)]
+    pub flip_when_above: bool,
 }
 
 fn default_preedit_display() -> String {
@@ -571,6 +585,10 @@ impl Default for UiCandidateConfig {
             layout: String::new(),
             preedit_display: default_preedit_display(),
             hide_window: false,
+            font_size: 0.0,
+            max_chars: 0,
+            index_labels: String::new(),
+            flip_when_above: false,
         }
     }
 }
@@ -579,6 +597,29 @@ impl UiCandidateConfig {
     /// 解析后的编码显示方式。
     pub fn preedit(&self) -> PreeditDisplay {
         PreeditDisplay::from_config(&self.preedit_display)
+    }
+
+    /// 第 `i` 个候选（0 基）的序号标签：有 index_labels 则取对应槽位，否则用 (i+1)。
+    /// 槽位不足时回退数字。
+    pub fn index_label(&self, i: usize) -> String {
+        // index_labels 为空时 nth 直接 None，无需额外空判
+        if let Some(ch) = self.index_labels.chars().nth(i) {
+            return ch.to_string();
+        }
+        (i + 1).to_string()
+    }
+
+    /// 按 max_chars 截断候选显示文本（0=不限）。超出时截断（不加省略号，对齐 Go）。
+    pub fn truncate_display(&self, text: &str) -> String {
+        if self.max_chars == 0 {
+            return text.to_string();
+        }
+        let chars: Vec<char> = text.chars().collect();
+        if chars.len() <= self.max_chars {
+            text.to_string()
+        } else {
+            chars[..self.max_chars].iter().collect()
+        }
     }
 }
 
@@ -600,6 +641,84 @@ pub struct UiThemeConfig {
     pub name: String,
     #[serde(default)]
     pub style: String,
+}
+
+/// 悬停提示配置（[ui.tooltip]，对齐 Go `ui.tooltip.*`）。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TooltipConfig {
+    /// 提示延迟显示时间（毫秒）。
+    #[serde(default = "default_tooltip_delay")]
+    pub delay: i32,
+    #[serde(default)]
+    pub code: TooltipToggle,
+    #[serde(default)]
+    pub pinyin: TooltipPinyinConfig,
+    #[serde(default = "default_tooltip_chaizi")]
+    pub chaizi: TooltipToggle,
+    #[serde(default = "default_tooltip_debug")]
+    pub debug: TooltipToggle,
+}
+
+fn default_tooltip_delay() -> i32 {
+    100
+}
+
+/// chaizi 默认关。
+fn default_tooltip_chaizi() -> TooltipToggle {
+    TooltipToggle { enabled: false }
+}
+
+/// debug 默认关。
+fn default_tooltip_debug() -> TooltipToggle {
+    TooltipToggle { enabled: false }
+}
+
+impl Default for TooltipConfig {
+    fn default() -> Self {
+        Self {
+            delay: default_tooltip_delay(),
+            code: TooltipToggle { enabled: true },
+            pinyin: TooltipPinyinConfig::default(),
+            chaizi: default_tooltip_chaizi(),
+            debug: default_tooltip_debug(),
+        }
+    }
+}
+
+/// 单开关 provider（code / chaizi / debug）。默认开（chaizi/debug 由专用 default 覆盖为关）。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TooltipToggle {
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+}
+
+impl Default for TooltipToggle {
+    fn default() -> Self {
+        Self { enabled: true }
+    }
+}
+
+/// 拼音 provider 配置（[ui.tooltip.pinyin]）。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TooltipPinyinConfig {
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    /// 显示多音字所有读音（false 仅首音）。
+    #[serde(default = "default_true")]
+    pub heteronyms: bool,
+    /// 每字最多显示读音数（0=不限）。
+    #[serde(default)]
+    pub max_readings: usize,
+}
+
+impl Default for TooltipPinyinConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            heteronyms: true,
+            max_readings: 0,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1094,5 +1213,63 @@ mod tests {
         let cfg = merged_with("[input.auto_pair]\nchinese = false\nenglish = false\n");
         assert!(!cfg.input.auto_pair.chinese);
         assert!(!cfg.input.auto_pair.english);
+    }
+
+    #[test]
+    fn test_tooltip_defaults_match_go() {
+        let t = Config::default().ui.tooltip;
+        assert_eq!(t.delay, 100);
+        assert!(t.code.enabled, "code 默认开");
+        assert!(
+            t.pinyin.enabled && t.pinyin.heteronyms,
+            "pinyin 默认开+全读音"
+        );
+        assert_eq!(t.pinyin.max_readings, 0);
+        assert!(!t.chaizi.enabled, "chaizi 默认关");
+        assert!(!t.debug.enabled, "debug 默认关");
+    }
+
+    #[test]
+    fn test_tooltip_merge_override() {
+        let cfg = merged_with(
+            "[ui.tooltip.chaizi]\nenabled = true\n\
+             [ui.tooltip.pinyin]\nheteronyms = false\nmax_readings = 2\n",
+        );
+        assert!(cfg.ui.tooltip.chaizi.enabled);
+        assert!(!cfg.ui.tooltip.pinyin.heteronyms);
+        assert_eq!(cfg.ui.tooltip.pinyin.max_readings, 2);
+        // 未指定字段保留默认
+        assert!(cfg.ui.tooltip.code.enabled, "code 未指定应保留默认开");
+        assert_eq!(cfg.ui.tooltip.delay, 100);
+    }
+
+    #[test]
+    fn test_candidate_tuning_defaults_and_methods() {
+        let c = Config::default().ui.candidate;
+        assert_eq!(c.font_size, 0.0, "字号默认 0=跟随主题");
+        assert_eq!(c.max_chars, 0, "默认不限");
+        assert!(c.index_labels.is_empty() && !c.flip_when_above);
+        // index_label：默认数字
+        assert_eq!(c.index_label(0), "1");
+        // truncate：0=不限
+        assert_eq!(
+            c.truncate_display("这是一个很长的候选"),
+            "这是一个很长的候选"
+        );
+    }
+
+    #[test]
+    fn test_candidate_index_labels_and_truncate() {
+        let cfg = merged_with("[ui.candidate]\nindex_labels = \"asdf\"\nmax_chars = 4\n");
+        let c = cfg.ui.candidate;
+        assert_eq!(c.index_label(0), "a");
+        assert_eq!(c.index_label(2), "d");
+        assert_eq!(c.index_label(9), "10", "槽位不足回退数字");
+        assert_eq!(
+            c.truncate_display("一二三四五六"),
+            "一二三四",
+            "截断到 4 字"
+        );
+        assert_eq!(c.truncate_display("一二"), "一二", "不足不截");
     }
 }
