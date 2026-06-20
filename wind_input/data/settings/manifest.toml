@@ -8,7 +8,8 @@
 # 【未进清单·待对话框承载】hotkeys 键位合成(目前以 string 暴露)、input.punct_custom.mappings、
 #   input.auto_pair.*_pairs、schema.active/available（方案管理）、features.special_modes/mix_modes、
 #   各 *.trigger_keys / *_keys 键组、compat.host_render_processes。
-# 【待确认可选值】标 "# TODO opts" 的项：枚举字符串值未完全确认，暂用 string 承载，确认后改 select。
+# 【动态可选值】select 项可用 options_source（如 codetableSchemas/pinyinSchemas/fonts）声明选项来源，
+#   选项由前端运行时从 schema.list / system.fonts 填充；此类项恒渲染为下拉。
 
 [meta]
 version = 2                      # 清单格式版本（结构变更：2 组→6 Tab + section 子分组 + 真实全字段）
@@ -49,7 +50,8 @@ order = 6
 key = "schema.primary_codetable"
 group = "schema"
 section = "默认方案"
-type = "string" # TODO opts：应为方案下拉（动态来自 schema.list）
+type = "select"
+options_source = "codetableSchemas"   # 选项运行时来自 schema.list（码表类）
 label = "主码表方案"
 hint = "主力码表方案 id（如 wubi86）"
 default = ""
@@ -59,7 +61,8 @@ since = 2
 key = "schema.primary_pinyin"
 group = "schema"
 section = "默认方案"
-type = "string" # TODO opts：应为方案下拉
+type = "select"
+options_source = "pinyinSchemas"      # 选项运行时来自 schema.list（拼音类）
 label = "主拼音方案"
 hint = "混输/临时拼音使用的拼音方案 id"
 default = ""
@@ -166,19 +169,31 @@ since = 2
 key = "input.enter_behavior"
 group = "input"
 section = "上屏控制"
-type = "string" # TODO opts：回车行为（commit/... 待确认）
+type = "select"
 label = "有编码时回车行为"
 default = "commit"
 since = 2
+options = [
+  { value = "commit", label = "上屏编码" },
+  { value = "clear", label = "清空编码" },
+  { value = "commit_and_input", label = "上屏并继续输入" },
+  { value = "ignore", label = "忽略" },
+]
 
 [[items]]
 key = "input.space_on_empty_behavior"
 group = "input"
 section = "上屏控制"
-type = "string" # TODO opts：空码空格行为
+type = "select"
 label = "空码时空格行为"
 default = "commit"
 since = 2
+options = [
+  { value = "commit", label = "上屏编码" },
+  { value = "clear", label = "清空编码" },
+  { value = "commit_and_input", label = "上屏并继续输入" },
+  { value = "ignore", label = "忽略" },
+]
 
 [[items]]
 key = "input.code_commit.auto_commit_at_full"
@@ -255,11 +270,15 @@ enabled_when = "input.shift_temp_english.enabled == true"
 key = "input.shift_temp_english.shift_behavior"
 group = "input"
 section = "临时英文与大小写"
-type = "string" # TODO opts：Shift 行为枚举待确认（temp_english/...）
+type = "select"
 label = "Shift 行为"
 default = "temp_english"
 since = 2
 enabled_when = "input.shift_temp_english.enabled == true"
+options = [
+  { value = "temp_english", label = "进入临时英文模式" },
+  { value = "direct_commit", label = "直接上屏大写字母" },
+]
 
 [[items]]
 key = "input.shift_temp_english.allow_symbols"
@@ -310,19 +329,29 @@ options = [
 key = "input.pinyin_separator"
 group = "input"
 section = "拼音与编码"
-type = "string" # TODO opts：拼音分隔（auto/...）
+type = "select"
 label = "拼音分隔符"
 default = "auto"
 since = 2
+options = [
+  { value = "auto", label = "自动（' 被选择键占用时改用 `）" },
+  { value = "quote", label = "单引号 ( ' )" },
+  { value = "backtick", label = "反引号 ( ` )" },
+  { value = "none", label = "不使用" },
+]
 
 [[items]]
 key = "input.numpad_behavior"
 group = "input"
 section = "拼音与编码"
-type = "string" # TODO opts：小键盘行为枚举待确认
+type = "select"
 label = "小键盘行为"
-default = ""
+default = ""                     # core 默认未设；"" 时引擎用内部默认，UI 回落首项显示
 since = 2
+options = [
+  { value = "direct", label = "直接输入数字" },
+  { value = "follow_main", label = "同主键盘区数字" },
+]
 
 # ── 短语 ──
 [[items]]
@@ -596,11 +625,17 @@ since = 2
 key = "features.s2t.variant"
 group = "advanced"
 section = "简繁转换"
-type = "string" # TODO opts：简繁变体枚举待确认
+type = "select"
 label = "简繁变体"
-default = ""
+default = ""                     # core 默认未设；启用后引擎按标准繁体(s2t)处理
 since = 2
 enabled_when = "features.s2t.enabled == true"
+options = [
+  { value = "s2t", label = "标准繁体" },
+  { value = "s2tw", label = "台湾繁体" },
+  { value = "s2twp", label = "台湾繁体（含词汇）" },
+  { value = "s2hk", label = "香港繁体" },
+]
 
 # ── 快捷输入 ──
 [[items]]
