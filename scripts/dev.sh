@@ -487,6 +487,7 @@ do_pull_log() {
 
 # 下载外部词库到 .cache/ + 生成 unigram + 组装 build_debug/data/
 do_gen_data() {
+    local outdir="${1:-$BUILD_DEBUG_DIR}"
     if ! command -v curl >/dev/null 2>&1; then
         err "需要 curl（下载词库用）"; return 1
     fi
@@ -506,8 +507,35 @@ do_gen_data() {
         gray "Unigram 已缓存"
     fi
 
-    assemble_data "$BUILD_DEBUG_DIR"
-    say "gen-data 完成 → $BUILD_DEBUG_DIR/data"
+    assemble_data "$outdir"
+    say "gen-data 完成 → $outdir/data"
+}
+
+# ---------- 发布:产出完整可打包目录(exe + x64/x86 TSF + data)----------
+# 全部产物落到 BUILD_DIR(wind_input/build/),供 scripts/pack-installer.sh 打包。
+do_dist() {
+    local outdir="$BUILD_DIR"
+    say "\n=== 构建发布目录 → $outdir ==="
+
+    do_build || return 1                    # release exe + x64 TSF + copy_data
+
+    # x86 TSF（32 位宿主程序兼容,需要 i686 工具链）
+    if command -v i686-w64-mingw32-g++ >/dev/null 2>&1; then
+        say "\n交叉编译 x86 TSF DLL (wind_tsf_x86.dll)..."
+        if make -C "$TSF_DIR" x86 VERSION="$VERSION" OUTDIR="$outdir" >/dev/null; then
+            gray "已构建: wind_tsf_x86.dll ($(du -h "$outdir/wind_tsf_x86.dll" 2>/dev/null | cut -f1))"
+        else
+            err "x86 TSF 构建失败！见 'make -C $TSF_DIR x86' 输出。"; return 1
+        fi
+    else
+        warn "未找到 i686-w64-mingw32-g++；跳过 x86 TSF（32 位宿主将无输入法）。"
+    fi
+
+    # 正式数据(下载词库 + gen_unigram + assemble→编译 opencc octrie)
+    do_gen_data "$outdir" || return 1
+
+    say "\n发布目录就绪 → $outdir"
+    say "  打包: scripts/pack-installer.sh --version $VERSION"
 }
 
 # ---------- 菜单 ----------
@@ -608,6 +636,7 @@ case "$cmd" in
     pull-log|pl)          do_pull_log "${2:-}" ;;
     pla)                  do_pull_log all ;;
     gen-data|gd)          do_gen_data ;;
+    dist)                 do_dist ;;
     -h|--help|help)
         grep '^#' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
         ;;
