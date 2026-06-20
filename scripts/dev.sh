@@ -543,13 +543,17 @@ show_menu() {
     printf '%b============================================%b\n' "$C_CYAN" "$C_RESET"
 }
 
-pause() { printf '\n'; read -r -p "按回车继续..." _; }
+pause() { printf '\n'; read -e -r -p "按回车继续..." _; }
 
 menu_loop() {
+    # 启用历史，使下方 read -e 的上/下方向键可调出历史输入。
+    set -o history 2>/dev/null || true
     while true; do
         show_menu
         printf '\n'
-        read -r -p "请输入选项: " choice
+        # -e 启用 readline 行编辑：方向键不再回显 ^[[A，左右移动光标、上下调历史。
+        read -e -r -p "请输入选项: " choice
+        [ -n "$choice" ] && history -s "$choice"
         case "$(printf '%s' "$choice" | tr '[:upper:]' '[:lower:]')" in
             1)   do_build;          pause ;;
             1d)  do_build debug;    pause ;;
