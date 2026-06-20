@@ -9,7 +9,8 @@
 
 ## 不变的部分
 
-- `wind_tsf/` — C++ TSF DLL（消费端，不改动）
+- `wind_tsf/` — C++ TSF DLL（消费端，逻辑不改动）。**已迁入本仓库并纳入交叉编译链路**（MinGW，
+  `dev.sh tsf` / `wind_tsf/Makefile`）；仅加可移植性垫片，业务逻辑保持不变。见 `docs/redesign/tsf-migration.md`。
 - `data/` — 配置/码表/主题数据文件
 - `installer/`、`scripts/` — 构建/安装脚本（适配 Rust 构建）
 
