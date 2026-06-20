@@ -595,6 +595,21 @@ impl EngineManager {
         }
     }
 
+    /// 用指定方案的引擎为词语生成全拼编码（造词反推、多音字消歧）。
+    /// 方案非拼音类、未能加载或无法生成时返回 None（调用方可回退逐字反查表）。
+    pub fn generate_word_pinyin(&self, schema_id: &str, text: &str) -> Option<String> {
+        if !self.ensure_loaded(schema_id) {
+            return None;
+        }
+        let engine = self
+            .engines
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(schema_id)
+            .cloned()?;
+        engine.generate_word_pinyin(text)
+    }
+
     // ───────────────────────── 词典加载 ─────────────────────────
 
     /// 在 [用户配置/schemas, 安装/schemas] 中解析一个 schemas 相对文件路径，用户目录优先。

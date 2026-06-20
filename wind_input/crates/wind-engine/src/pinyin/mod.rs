@@ -101,17 +101,6 @@ impl PinyinEngine {
         self.dict.len()
     }
 
-    /// 为词语生成全拼编码（如"你好"→"nihao"），解决多音字在词里的读音消歧。
-    ///
-    /// 用于：加词页自动填编码、词库批量导入、造词学习的编码反推 fallback。
-    /// 单字读音索引按词典权重懒构建并缓存。含无读音字符时返回 `None`。
-    pub fn generate_word_pinyin(&self, word: &str) -> Option<String> {
-        let idx = self
-            .char_pinyin_idx
-            .get_or_init(|| CharPinyinIndex::build(&self.dict));
-        generate::generate_word_pinyin(&self.dict, idx, word)
-    }
-
     /// 计算 preedit 显示与音节信息
     fn compute_composition(&self, input: &str) -> (String, Vec<String>, String) {
         let dag = Dag::build(input, &self.trie);
@@ -334,6 +323,15 @@ impl Engine for PinyinEngine {
 
     fn engine_type(&self) -> EngineType {
         EngineType::Pinyin
+    }
+
+    /// 为词语生成全拼编码（多音字按词典权重消歧）。
+    /// 单字读音索引按词典懒构建并缓存。含无读音字符时返回 `None`。
+    fn generate_word_pinyin(&self, word: &str) -> Option<String> {
+        let idx = self
+            .char_pinyin_idx
+            .get_or_init(|| CharPinyinIndex::build(&self.dict));
+        generate::generate_word_pinyin(&self.dict, idx, word)
     }
 }
 

@@ -85,7 +85,7 @@ impl Coordinator {
             "dict.encode" => self.web_dict_encode(params),
             "dict.genPinyin" => {
                 let text = str_param(params, "text")?;
-                Ok(json!(self.reverse.gen_pinyin(text)))
+                Ok(json!(self.gen_pinyin_word(text)))
             }
 
             // ── temp.*（临时词，redb）─────────────────────────────
@@ -370,11 +370,24 @@ impl Coordinator {
             .map(|t| t == "pinyin")
             .unwrap_or(false);
         let code = if is_pinyin {
-            self.reverse.gen_pinyin(text)
+            // 优先词级消歧（多音字按词典权重），引擎无果时回退逐字反查表。
+            self.engine_mgr
+                .generate_word_pinyin(schema, text)
+                .unwrap_or_else(|| self.reverse.gen_pinyin(text))
         } else {
             self.reverse.wubi_word_code(text)
         };
         Ok(json!(code))
+    }
+
+    /// 为词语生成拼音码：优先用拼音引擎词级消歧（活跃方案→"pinyin"方案），
+    /// 都无果时回退逐字反查表（pinyin_map.txt）。用于 dict.genPinyin（无方案上下文）。
+    fn gen_pinyin_word(&self, text: &str) -> String {
+        let active = self.engine_mgr.active_schema_id();
+        self.engine_mgr
+            .generate_word_pinyin(&active, text)
+            .or_else(|| self.engine_mgr.generate_word_pinyin("pinyin", text))
+            .unwrap_or_else(|| self.reverse.gen_pinyin(text))
     }
 
     fn web_freq_list_paged(&self, params: &Value) -> anyhow::Result<Value> {

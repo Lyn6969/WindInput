@@ -51,6 +51,13 @@ pub trait Engine: Send + Sync {
     fn handle_top_code(&self, _input: &str) -> Option<(String, String)> {
         None
     }
+
+    /// 为词语生成全拼编码（造词反推读音、多音字消歧）。
+    /// 默认不支持（码表/五笔等返回 None）；拼音引擎按词典权重消歧。
+    /// 用于加词页自动出码、词库导入。含无读音字符时返回 None。
+    fn generate_word_pinyin(&self, _word: &str) -> Option<String> {
+        None
+    }
 }
 
 /// 扩展引擎接口（码表引擎特有）
