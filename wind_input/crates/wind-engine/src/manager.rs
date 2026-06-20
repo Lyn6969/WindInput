@@ -71,10 +71,31 @@ pub struct EngineManager {
     freq_cache: Mutex<HashMap<String, FreqSettings>>,
     /// 方案显示名缓存（schema_id -> schema.name；缺则回退 id）。按需读盘一次。
     name_cache: Mutex<HashMap<String, String>>,
+    /// 方案 override 层目录（schema_overrides/{id}.toml）；读 schema 时深合并到基础方案之上。
+    /// None=不读 override（如纯测试）。设置页 saveConfig 写此目录。
+    override_dir: Option<std::path::PathBuf>,
 }
 
 /// 进程级缓存根目录（%LOCALAPPDATA%\WindInput\cache），EngineManager::new 设置一次。
 static CACHE_DIR: std::sync::OnceLock<Option<std::path::PathBuf>> = std::sync::OnceLock::new();
+
+/// 深合并 TOML：`over` 覆盖到 `base` 之上。两侧皆为 table 时逐键递归；否则 over 整体替换。
+/// 数组按整体替换（如 dictionaries 覆盖即替换全表）。
+fn merge_toml(base: &mut toml::Value, over: toml::Value) {
+    match (base, over) {
+        (toml::Value::Table(b), toml::Value::Table(o)) => {
+            for (k, ov) in o {
+                match b.get_mut(&k) {
+                    Some(bv) => merge_toml(bv, ov),
+                    None => {
+                        b.insert(k, ov);
+                    }
+                }
+            }
+        }
+        (b, ov) => *b = ov,
+    }
+}
 
 /// 源文件 → 缓存 .wdb 路径：放缓存根下（名字含父目录名，避免跨方案同名冲突）；
 /// 未设置缓存根时回退到源旁（保持旧行为，便于测试/无 LOCALAPPDATA 场景）。
@@ -106,10 +127,22 @@ impl EngineManager {
     }
 
     /// 同 [`new`]，但注入 redb 存储以注册用户词/临时词层（coordinator 用）。
+    /// override 目录默认取 `Config::user_config_dir()/schema_overrides`（与用户 schema 覆盖同根）。
     pub fn with_store(
         config: &Config,
         data_dir: Option<&Path>,
         store: Option<Arc<wind_store::Store>>,
+    ) -> Self {
+        let override_dir = Config::user_config_dir().map(|d| d.join("schema_overrides"));
+        Self::with_store_override(config, data_dir, store, override_dir)
+    }
+
+    /// 同 [`with_store`]，但显式指定 override 目录（测试用，避免污染真实用户目录）。
+    pub fn with_store_override(
+        config: &Config,
+        data_dir: Option<&Path>,
+        store: Option<Arc<wind_store::Store>>,
+        override_dir: Option<std::path::PathBuf>,
     ) -> Self {
         // 初始化缓存根（一次）：%LOCALAPPDATA%\WindInput\cache，提前建好目录
         CACHE_DIR.get_or_init(|| {
@@ -126,7 +159,8 @@ impl EngineManager {
             available.push(active_id.clone());
         }
         // 过滤不支持的方案（如双拼），但始终保留活跃方案
-        available.retain(|sid| sid == &active_id || Self::schema_supported(sid, data_dir));
+        let ov = override_dir.as_deref();
+        available.retain(|sid| sid == &active_id || Self::schema_supported(sid, data_dir, ov));
 
         let mgr = Self {
             engines: Mutex::new(HashMap::new()),
@@ -137,6 +171,7 @@ impl EngineManager {
             code_commit: Mutex::new(config.input.code_commit.clone()),
             freq_cache: Mutex::new(HashMap::new()),
             name_cache: Mutex::new(HashMap::new()),
+            override_dir,
         };
         // 仅构建活跃方案（其余懒加载）
         mgr.ensure_loaded(&active_id);
@@ -144,8 +179,8 @@ impl EngineManager {
     }
 
     /// 读取 schema 判断是否受支持（不构建引擎，仅解析 TOML）
-    fn schema_supported(schema_id: &str, data_dir: Option<&Path>) -> bool {
-        match Self::read_schema(schema_id, data_dir) {
+    fn schema_supported(schema_id: &str, data_dir: Option<&Path>, override_dir: Option<&Path>) -> bool {
+        match Self::read_schema(schema_id, data_dir, override_dir) {
             Some(s) => s.is_supported(),
             None => false,
         }
@@ -171,6 +206,7 @@ impl EngineManager {
             self.data_dir.as_deref(),
             self.store.clone(),
             &commit,
+            self.override_dir.as_deref(),
         ) {
             Some(engine) => {
                 info!(
@@ -235,7 +271,7 @@ impl EngineManager {
         {
             return n.clone();
         }
-        let name = Self::read_schema(schema_id, self.data_dir.as_deref())
+        let name = Self::read_schema(schema_id, self.data_dir.as_deref(), self.override_dir.as_deref())
             .map(|s| s.schema.name)
             .filter(|n| !n.is_empty())
             .unwrap_or_else(|| schema_id.to_string());
@@ -249,8 +285,93 @@ impl EngineManager {
     /// 指定方案的引擎类型字符串（小写，如 "pinyin"|"codetable"|"mixed"）；读不到返回 None。
     /// 不切换活跃方案（设置页 dict.encode 据此选拼音/五笔出码规则）。
     pub fn schema_engine_type(&self, schema_id: &str) -> Option<String> {
-        Self::read_schema(schema_id, self.data_dir.as_deref())
+        Self::read_schema(schema_id, self.data_dir.as_deref(), self.override_dir.as_deref())
             .map(|s| s.engine.engine_type.to_lowercase())
+    }
+
+    /// 方案基础定义（不含 override 层）——设置页计算 saveConfig 稀疏 diff 的基准。
+    pub fn schema_base(&self, schema_id: &str) -> Option<Schema> {
+        Self::read_schema(schema_id, self.data_dir.as_deref(), None)
+    }
+
+    /// 方案合并定义（基础 + override 层）——设置页 getConfig 返回。
+    pub fn schema_merged(&self, schema_id: &str) -> Option<Schema> {
+        Self::read_schema(schema_id, self.data_dir.as_deref(), self.override_dir.as_deref())
+    }
+
+    /// 读取某方案 override 层（TOML 值，无则 None）。
+    pub fn get_schema_override(&self, schema_id: &str) -> Option<toml::Value> {
+        let dir = self.override_dir.as_deref()?;
+        Self::read_override_value(schema_id, dir)
+    }
+
+    /// 写入某方案 override 层并使其引擎缓存失效（下次使用按新配置重建）。
+    pub fn write_schema_override(&self, schema_id: &str, value: &toml::Value) -> anyhow::Result<()> {
+        let dir = self
+            .override_dir
+            .as_deref()
+            .ok_or_else(|| anyhow::anyhow!("无 override 目录"))?;
+        std::fs::create_dir_all(dir)?;
+        let path = dir.join(format!("{schema_id}.toml"));
+        let out = toml::to_string_pretty(value)?;
+        let tmp = path.with_extension("toml.tmp");
+        std::fs::write(&tmp, out)?;
+        std::fs::rename(&tmp, &path)?;
+        self.invalidate_schema(schema_id);
+        Ok(())
+    }
+
+    /// 删除某方案 override 层并使其引擎缓存失效。返回是否删除了文件。
+    pub fn delete_schema_override(&self, schema_id: &str) -> anyhow::Result<bool> {
+        let removed = if let Some(dir) = self.override_dir.as_deref() {
+            let path = dir.join(format!("{schema_id}.toml"));
+            if path.exists() {
+                std::fs::remove_file(&path)?;
+                true
+            } else {
+                false
+            }
+        } else {
+            false
+        };
+        self.invalidate_schema(schema_id);
+        Ok(removed)
+    }
+
+    /// 删除用户自定义方案：仅当方案文件存在于用户目录（非内置 data 目录）时允许。
+    /// 同时清除其 override 并从可用列表移除。返回是否删除。内置方案返回 Err。
+    pub fn delete_user_schema(&self, schema_id: &str) -> anyhow::Result<bool> {
+        let user_file = Config::user_config_dir()
+            .map(|d| d.join("schemas").join(format!("{schema_id}.schema.toml")));
+        match &user_file {
+            Some(p) if p.is_file() => {
+                std::fs::remove_file(p)?;
+            }
+            _ => anyhow::bail!("内置方案不可删除: {}", schema_id),
+        }
+        let _ = self.delete_schema_override(schema_id);
+        self.available
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .retain(|s| s != schema_id);
+        self.invalidate_schema(schema_id);
+        Ok(true)
+    }
+
+    /// 使某方案的引擎与解析缓存失效（override/词典变更后，下次构建按新定义重建）。
+    pub fn invalidate_schema(&self, schema_id: &str) {
+        self.engines
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(schema_id);
+        self.freq_cache
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(schema_id);
+        self.name_cache
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(schema_id);
     }
 
     /// 切换到指定方案；成功返回 true（必要时懒加载）
@@ -277,7 +398,10 @@ impl EngineManager {
             available.push(new_active.clone());
         }
         // 过滤不支持的方案，但始终保留活跃方案（与构造逻辑一致）。
-        available.retain(|sid| sid == &new_active || Self::schema_supported(sid, self.data_dir.as_deref()));
+        available.retain(|sid| {
+            sid == &new_active
+                || Self::schema_supported(sid, self.data_dir.as_deref(), self.override_dir.as_deref())
+        });
 
         // 更新可变状态。
         *self.available.lock().unwrap_or_else(|e| e.into_inner()) = available;
@@ -358,7 +482,7 @@ impl EngineManager {
     /// 启用且目标方案可加载时返回 Some(target)，否则 None。
     pub fn temp_pinyin_target(&self) -> Option<String> {
         let id = self.active_schema_id();
-        let schema = Self::read_schema(&id, self.data_dir.as_deref())?;
+        let schema = Self::read_schema(&id, self.data_dir.as_deref(), self.override_dir.as_deref())?;
         let tp = &schema.engine.codetable.temp_pinyin;
         if !tp.enabled {
             return None;
@@ -387,7 +511,7 @@ impl EngineManager {
         {
             return *s;
         }
-        let settings = Self::read_schema(&id, self.data_dir.as_deref())
+        let settings = Self::read_schema(&id, self.data_dir.as_deref(), self.override_dir.as_deref())
             .map(|sc| Self::parse_freq_settings(&sc))
             .unwrap_or_default();
         self.freq_cache
@@ -449,8 +573,13 @@ impl EngineManager {
         data_dir.join("schemas").join(rel)
     }
 
-    /// 读取并解析 schema 文件（仅 TOML）。用户目录优先（见 resolve_schema_file）。
-    fn read_schema(schema_id: &str, data_dir: Option<&Path>) -> Option<Schema> {
+    /// 读取并解析 schema 文件（仅 TOML）。用户目录优先（见 resolve_schema_file）；
+    /// 若 `override_dir/{id}.toml` 存在则深合并到基础方案之上（设置页 override 层 L3）。
+    fn read_schema(
+        schema_id: &str,
+        data_dir: Option<&Path>,
+        override_dir: Option<&Path>,
+    ) -> Option<Schema> {
         let data_dir = data_dir?;
         let toml_path = Self::resolve_schema_file(&format!("{}.schema.toml", schema_id), data_dir);
         if !toml_path.exists() {
@@ -458,13 +587,31 @@ impl EngineManager {
             return None;
         }
         let content = std::fs::read_to_string(&toml_path).ok()?;
-        match toml::from_str(&content) {
-            Ok(s) => Some(s),
+        let mut base: toml::Value = match toml::from_str(&content) {
+            Ok(v) => v,
             Err(e) => {
                 warn!("Parse schema TOML failed {}: {}", toml_path.display(), e);
+                return None;
+            }
+        };
+        // 合并 override 层（存在才读；不存在则零影响）。
+        if let Some(ov) = override_dir.and_then(|d| Self::read_override_value(schema_id, d)) {
+            merge_toml(&mut base, ov);
+        }
+        match base.try_into() {
+            Ok(s) => Some(s),
+            Err(e) => {
+                warn!("Schema {} override 合并后解析失败: {}", schema_id, e);
                 None
             }
         }
+    }
+
+    /// 读取某方案的 override TOML 值（无则 None）。
+    fn read_override_value(schema_id: &str, override_dir: &Path) -> Option<toml::Value> {
+        let path = override_dir.join(format!("{schema_id}.toml"));
+        let content = std::fs::read_to_string(&path).ok()?;
+        toml::from_str(&content).ok()
     }
 
     /// 为指定 schema 构建引擎
@@ -473,10 +620,11 @@ impl EngineManager {
         data_dir: Option<&Path>,
         store: Option<Arc<wind_store::Store>>,
         commit: &wind_config::CodeCommitConfig,
+        override_dir: Option<&Path>,
     ) -> Option<Box<dyn Engine>> {
         let data_dir = data_dir?;
         let schemas = data_dir.join("schemas");
-        let schema = Self::read_schema(schema_id, Some(data_dir))?;
+        let schema = Self::read_schema(schema_id, Some(data_dir), override_dir)?;
 
         // 混输方案：递归构建主（码表）+ 次（拼音）子引擎，包装为 MixedEngine
         if schema.engine.engine_type.to_lowercase() == "mixed" {
@@ -485,12 +633,23 @@ impl EngineManager {
                 warn!("mixed schema {} 缺少 primary_schema", schema_id);
                 return None;
             }
-            let primary =
-                Self::build_engine(&m.primary_schema, Some(data_dir), store.clone(), commit)?;
+            let primary = Self::build_engine(
+                &m.primary_schema,
+                Some(data_dir),
+                store.clone(),
+                commit,
+                override_dir,
+            )?;
             let secondary = if m.secondary_schema.is_empty() {
                 None
             } else {
-                Self::build_engine(&m.secondary_schema, Some(data_dir), store.clone(), commit)
+                Self::build_engine(
+                    &m.secondary_schema,
+                    Some(data_dir),
+                    store.clone(),
+                    commit,
+                    override_dir,
+                )
             };
             let boost = if m.codetable_weight_boost > 0 {
                 m.codetable_weight_boost
@@ -503,7 +662,7 @@ impl EngineManager {
                 2
             };
             // 拼音守护：主码表方案 tri-state > 全局 input.code_commit。
-            let block_on_pinyin = Self::read_schema(&m.primary_schema, Some(data_dir))
+            let block_on_pinyin = Self::read_schema(&m.primary_schema, Some(data_dir), override_dir)
                 .and_then(|s| s.engine.codetable.auto_commit_block_on_pinyin)
                 .unwrap_or(commit.auto_commit_block_on_pinyin);
             info!(
@@ -956,5 +1115,65 @@ mod tests {
         // 未知策略值回退 step（稳健默认）。
         let u = parse("[engine.codetable]\nfreq_strategy = \"bogus\"\n[learning.freq]\nenabled = true\n");
         assert_eq!(u.strategy, FreqStrategy::Step, "未知策略应回退 step");
+    }
+
+    #[test]
+    fn merge_toml_table_recurse_and_scalar_replace() {
+        let mut base: toml::Value =
+            toml::from_str("a = 1\n[t]\nx = 1\ny = 2\n").unwrap();
+        let over: toml::Value = toml::from_str("a = 9\n[t]\ny = 20\nz = 30\n").unwrap();
+        merge_toml(&mut base, over);
+        assert_eq!(base.get("a").unwrap().as_integer(), Some(9));
+        let t = base.get("t").unwrap();
+        assert_eq!(t.get("x").unwrap().as_integer(), Some(1), "未覆盖键保留");
+        assert_eq!(t.get("y").unwrap().as_integer(), Some(20), "覆盖键替换");
+        assert_eq!(t.get("z").unwrap().as_integer(), Some(30), "新增键加入");
+    }
+
+    #[test]
+    fn schema_override_merge_and_delete() {
+        use std::io::Write;
+        let base_dir = std::env::temp_dir().join("wind_eng_ov_data");
+        let schemas = base_dir.join("schemas");
+        std::fs::create_dir_all(&schemas).unwrap();
+        let mut f = std::fs::File::create(schemas.join("tcfg.schema.toml")).unwrap();
+        write!(
+            f,
+            "[schema]\nid = \"tcfg\"\nname = \"基础名\"\n[engine]\ntype = \"codetable\"\n[engine.codetable]\nmax_code_length = 4\n"
+        )
+        .unwrap();
+        drop(f);
+
+        let ov_dir = std::env::temp_dir().join("wind_eng_ov_overrides");
+        let _ = std::fs::remove_dir_all(&ov_dir);
+
+        let cfg = Config::default();
+        let mgr =
+            EngineManager::with_store_override(&cfg, Some(&base_dir), None, Some(ov_dir.clone()));
+
+        // 基础层
+        let base = mgr.schema_base("tcfg").unwrap();
+        assert_eq!(base.schema.name, "基础名");
+        assert_eq!(base.engine.codetable.max_code_length, 4);
+
+        // 写 override：覆盖 name + max_code_length
+        let ov: toml::Value =
+            toml::from_str("[schema]\nname = \"覆盖名\"\n[engine.codetable]\nmax_code_length = 5\n")
+                .unwrap();
+        mgr.write_schema_override("tcfg", &ov).unwrap();
+
+        let merged = mgr.schema_merged("tcfg").unwrap();
+        assert_eq!(merged.schema.name, "覆盖名", "override 覆盖 name");
+        assert_eq!(merged.engine.codetable.max_code_length, 5);
+        assert_eq!(merged.schema.id, "tcfg", "未覆盖字段保留基础值");
+        // base 不受 override 影响
+        assert_eq!(mgr.schema_base("tcfg").unwrap().schema.name, "基础名");
+
+        // 删除 override → 回到基础层
+        assert!(mgr.delete_schema_override("tcfg").unwrap());
+        assert_eq!(mgr.schema_merged("tcfg").unwrap().schema.name, "基础名");
+
+        let _ = std::fs::remove_dir_all(&base_dir);
+        let _ = std::fs::remove_dir_all(&ov_dir);
     }
 }

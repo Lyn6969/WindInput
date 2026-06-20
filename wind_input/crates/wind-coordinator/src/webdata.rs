@@ -44,12 +44,13 @@ impl Coordinator {
                 let ok = self.engine_mgr.switch_schema(str_param(params, "id")?);
                 Ok(json!({ "ok": ok }))
             }
-            // 🚧 方案 YAML 配置编辑：待深化
-            "schema.getConfig" | "schema.references" => Ok(json!({})),
-            "schema.saveConfig"
-            | "schema.resetConfig"
-            | "schema.setDictEnabled"
-            | "schema.delete" => Ok(json!({ "ok": true })),
+            // ── 方案配置编辑（三层合并：默认 ← 方案文件 ← override 层）──
+            "schema.getConfig" => self.web_schema_get_config(params),
+            "schema.saveConfig" => self.web_schema_save_config(params),
+            "schema.resetConfig" => self.web_schema_reset_config(params),
+            "schema.setDictEnabled" => self.web_schema_set_dict_enabled(params),
+            "schema.delete" => self.web_schema_delete(params),
+            "schema.references" => Ok(json!({})), // 引用关系（删除安全检查）：暂返空，前端宽松消费
 
             // ── dict.*（用户词库，redb 持久化）────────────────────
             "dict.listPaged" => self.web_dict_list_paged(params),
@@ -242,6 +243,85 @@ impl Coordinator {
             }));
         }
         Ok(json!(out))
+    }
+
+    fn web_schema_get_config(&self, params: &Value) -> anyhow::Result<Value> {
+        let id = str_param(params, "id")?;
+        match self.engine_mgr.schema_merged(id) {
+            Some(schema) => Ok(serde_json::to_value(schema)?),
+            None => Ok(json!({})),
+        }
+    }
+
+    fn web_schema_save_config(&self, params: &Value) -> anyhow::Result<Value> {
+        let id = str_param(params, "id")?;
+        let cfg = params
+            .get("cfg")
+            .ok_or_else(|| anyhow::anyhow!("缺少参数 cfg"))?;
+        let base = self
+            .engine_mgr
+            .schema_base(id)
+            .ok_or_else(|| anyhow::anyhow!("方案不存在: {}", id))?;
+        let base_json = serde_json::to_value(&base)?;
+        // 稀疏 diff（仅变化项）写入 override 层，让方案文件后续更新仍能透传未改项。
+        let diff = json_diff(&base_json, cfg).unwrap_or(json!({}));
+        let mut ov = json_to_toml(&diff);
+        // 保留既有 override 的 dictionaries（附加词库开关由 setDictEnabled 单独管理）。
+        if let toml::Value::Table(t) = &mut ov
+            && !t.contains_key("dictionaries")
+            && let Some(prev) = self.engine_mgr.get_schema_override(id)
+            && let Some(d) = prev.get("dictionaries")
+        {
+            t.insert("dictionaries".to_string(), d.clone());
+        }
+        self.engine_mgr.write_schema_override(id, &ov)?;
+        Ok(json!({ "ok": true }))
+    }
+
+    fn web_schema_reset_config(&self, params: &Value) -> anyhow::Result<Value> {
+        let id = str_param(params, "id")?;
+        self.engine_mgr.delete_schema_override(id)?;
+        Ok(json!({ "ok": true }))
+    }
+
+    fn web_schema_set_dict_enabled(&self, params: &Value) -> anyhow::Result<Value> {
+        let id = str_param(params, "id")?;
+        let dict_id = str_param(params, "dictId")?;
+        let enabled = params.get("enabled").and_then(|v| v.as_bool()).unwrap_or(true);
+        let mut merged = self
+            .engine_mgr
+            .schema_merged(id)
+            .ok_or_else(|| anyhow::anyhow!("方案不存在: {}", id))?;
+        let mut found = false;
+        for d in merged.dictionaries.iter_mut() {
+            if d.id == dict_id {
+                d.enabled = Some(enabled);
+                found = true;
+            }
+        }
+        if !found {
+            anyhow::bail!("方案 {} 无附加词库 {}", id, dict_id);
+        }
+        // override 层写入完整 dictionaries 数组（合并时整体替换），保留其它 override 字段。
+        let dicts_val = toml::Value::try_from(&merged.dictionaries)?;
+        let mut ov = self
+            .engine_mgr
+            .get_schema_override(id)
+            .unwrap_or_else(|| toml::Value::Table(Default::default()));
+        if !ov.is_table() {
+            ov = toml::Value::Table(Default::default());
+        }
+        if let toml::Value::Table(t) = &mut ov {
+            t.insert("dictionaries".to_string(), dicts_val);
+        }
+        self.engine_mgr.write_schema_override(id, &ov)?;
+        Ok(json!({ "ok": true }))
+    }
+
+    fn web_schema_delete(&self, params: &Value) -> anyhow::Result<Value> {
+        let id = str_param(params, "id")?;
+        self.engine_mgr.delete_user_schema(id)?;
+        Ok(json!({ "ok": true }))
     }
 
     fn web_dict_encode(&self, params: &Value) -> anyhow::Result<Value> {
@@ -607,6 +687,62 @@ fn word_item(r: wind_store::user_words::UserWordRecord) -> Value {
     json!({ "code": r.code, "text": r.text, "weight": r.weight, "enabled": true })
 }
 
+/// 稀疏 diff：返回 `cfg` 相对 `base` 的变化项（仅含改动的叶子/键）；无变化返回 None。
+/// 对象逐键递归；数组/标量按整体比较（不同则取 cfg）。用于 schema override 最小化。
+fn json_diff(base: &Value, cfg: &Value) -> Option<Value> {
+    match (base, cfg) {
+        (Value::Object(b), Value::Object(c)) => {
+            let mut out = serde_json::Map::new();
+            for (k, cv) in c {
+                match b.get(k) {
+                    Some(bv) => {
+                        if let Some(d) = json_diff(bv, cv) {
+                            out.insert(k.clone(), d);
+                        }
+                    }
+                    None => {
+                        out.insert(k.clone(), cv.clone());
+                    }
+                }
+            }
+            if out.is_empty() { None } else { Some(Value::Object(out)) }
+        }
+        _ => {
+            if base == cfg {
+                None
+            } else {
+                Some(cfg.clone())
+            }
+        }
+    }
+}
+
+/// JSON → toml::Value（写 override 文件）。null 在对象中跳过（TOML 无 null）。
+fn json_to_toml(v: &Value) -> toml::Value {
+    match v {
+        Value::Null => toml::Value::String(String::new()),
+        Value::Bool(b) => toml::Value::Boolean(*b),
+        Value::Number(n) => {
+            if let Some(i) = n.as_i64() {
+                toml::Value::Integer(i)
+            } else {
+                toml::Value::Float(n.as_f64().unwrap_or(0.0))
+            }
+        }
+        Value::String(s) => toml::Value::String(s.clone()),
+        Value::Array(a) => toml::Value::Array(a.iter().map(json_to_toml).collect()),
+        Value::Object(o) => {
+            let mut t = toml::map::Map::new();
+            for (k, val) in o {
+                if !val.is_null() {
+                    t.insert(k.clone(), json_to_toml(val));
+                }
+            }
+            toml::Value::Table(t)
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     //! 数据域 RPC 契约测试：真实 Coordinator + 临时 redb store，断言 web_data_rpc 输出形状
@@ -777,6 +913,30 @@ mod tests {
             .unwrap();
         assert_eq!(c.web_data_rpc("phrase.list", &json!({})).unwrap().as_array().unwrap().len(), 0);
         c.web_data_rpc("phrase.resetDefault", &json!({})).unwrap();
+    }
+
+    #[test]
+    fn json_diff_sparse() {
+        let base = json!({ "a": 1, "t": { "x": 1, "y": 2 }, "same": "v" });
+        let cfg = json!({ "a": 9, "t": { "x": 1, "y": 20 }, "same": "v" });
+        let d = json_diff(&base, &cfg).unwrap();
+        // 仅含变化项：a + t.y
+        assert_eq!(d, json!({ "a": 9, "t": { "y": 20 } }));
+        // 完全相同 → None
+        assert!(json_diff(&base, &base).is_none());
+    }
+
+    #[test]
+    fn schema_get_config_graceful_without_data_dir() {
+        // data_dir=None（coord helper）→ 无方案文件 → getConfig 返回 {}，saveConfig 报错（无基础）。
+        let c = coord("schema");
+        let r = c
+            .web_data_rpc("schema.getConfig", &json!({ "id": "pinyin" }))
+            .unwrap();
+        assert!(r.is_object() && r.as_object().unwrap().is_empty());
+        assert!(c
+            .web_data_rpc("schema.saveConfig", &json!({ "id": "pinyin", "cfg": {} }))
+            .is_err());
     }
 
     #[test]

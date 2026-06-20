@@ -1015,3 +1015,23 @@ fn test_candidate_op_delete_single_char_protected() {
         assert!(after.contains(&w), "单字 '{}' 删除应被保护", w);
     }
 }
+
+#[test]
+fn test_web_schema_get_config_and_encode_real() {
+    if !has_schemas() {
+        return;
+    }
+    let coord = Coordinator::new_headless(config_with("pinyin"), Some(&data_dir()));
+    // schema.getConfig：三层合并视图，应含 schema/engine 段（无 override 时即基础方案）。
+    let cfg = coord
+        .web_data_rpc("schema.getConfig", &serde_json::json!({ "id": "pinyin" }))
+        .unwrap();
+    assert!(cfg.is_object(), "getConfig 应返回对象");
+    assert!(cfg.get("schema").is_some(), "应含 schema 段");
+    assert!(cfg.get("engine").is_some(), "应含 engine 段");
+    // dict.encode：拼音方案出拼音码；dict.genPinyin 同源。
+    let code = coord
+        .web_data_rpc("dict.encode", &serde_json::json!({ "schemaId": "pinyin", "text": "你好" }))
+        .unwrap();
+    assert!(code.is_string(), "encode 应返回字符串");
+}
