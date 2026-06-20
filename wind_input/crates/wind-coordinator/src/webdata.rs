@@ -813,7 +813,10 @@ fn json_to_toml(v: &Value) -> toml::Value {
             }
         }
         Value::String(s) => toml::Value::String(s.clone()),
-        Value::Array(a) => toml::Value::Array(a.iter().map(json_to_toml).collect()),
+        // 跳过数组内 null（TOML 无 null），与对象分支语义一致，避免注入空串污染类型。
+        Value::Array(a) => {
+            toml::Value::Array(a.iter().filter(|x| !x.is_null()).map(json_to_toml).collect())
+        }
         Value::Object(o) => {
             let mut t = toml::map::Map::new();
             for (k, val) in o {

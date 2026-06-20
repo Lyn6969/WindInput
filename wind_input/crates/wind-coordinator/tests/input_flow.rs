@@ -1051,3 +1051,48 @@ fn test_web_theme_preview_real() {
     let list = coord.web_data_rpc("theme.list", &serde_json::json!({})).unwrap();
     assert!(list.as_array().map(|a| !a.is_empty()).unwrap_or(false), "应列出内置主题");
 }
+
+#[test]
+fn test_stats_recorded_through_deferred_policed() {
+    // 回归：生产链路是 bridge → DeferredHandler → Coordinator，bridge 调 handle_key_event_policed。
+    // 若 DeferredHandler 不转发 policed，则 Coordinator 的统计埋点被跳过、上屏计数恒为 0。
+    // 本测试经 DeferredHandler 走完整 policed 链路，断言 store 真实记录了上屏中文字数。
+    if !has_schemas() {
+        return;
+    }
+    use std::sync::Arc;
+    use wind_bridge::deferred::DeferredHandler;
+
+    let store_path = std::env::temp_dir().join("wind_stats_deferred_test.redb");
+    let _ = std::fs::remove_file(&store_path);
+    let store = Arc::new(wind_store::Store::open(&store_path).unwrap());
+    let coord = Coordinator::new_headless_with_store(
+        config_with("pinyin"),
+        Some(&data_dir()),
+        store.clone(),
+    );
+    let deferred = DeferredHandler::new();
+    deferred.set_ready(coord);
+
+    // 经 policed 输入 "nihao" + 空格 → 上屏 你好
+    for c in "nihao".chars() {
+        let vk = (c.to_ascii_uppercase() as u32) & 0xFF;
+        deferred.handle_key_event_policed(&key_event(vk, EVENT_KEY_DOWN));
+    }
+    let commit = deferred.handle_key_event_policed(&key_event(0x20, EVENT_KEY_DOWN));
+    assert!(
+        matches!(commit, KeyAction::InsertText { .. }),
+        "空格应上屏 InsertText，实际: {:?}",
+        commit
+    );
+
+    // 统计应经 policed 链路真实落库（features.stats.enabled 默认 true）。
+    let all = store.daily_stats("2000-01-01", "2099-12-31").unwrap();
+    let chinese: u32 = all.iter().map(|(_, r)| r.chinese).sum();
+    assert!(
+        chinese >= 2,
+        "上屏'你好'应记 ≥2 个中文字，实际 chinese={}（policed 埋点未触达？）",
+        chinese
+    );
+    let _ = std::fs::remove_file(&store_path);
+}

@@ -47,6 +47,13 @@ impl MessageHandler for DeferredHandler {
         self.with_handler(KeyAction::PassThrough, |h| h.handle_key_event(data))
     }
 
+    /// bridge 真正入口（server.rs 调 policed）。必须转发到内层处理器的 policed，
+    /// 否则内层 Coordinator 重写的 policed（含统计埋点 + preedit 占位后处理）被跳过——
+    /// 只走 trait 默认实现（仅调内层 handle_key_event），导致上屏统计在生产中恒为 0。
+    fn handle_key_event_policed(&self, data: &KeyEventData) -> KeyAction {
+        self.with_handler(KeyAction::PassThrough, |h| h.handle_key_event_policed(data))
+    }
+
     fn preedit_uses_placeholder(&self) -> bool {
         self.with_handler(false, |h| h.preedit_uses_placeholder())
     }
