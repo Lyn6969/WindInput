@@ -5,7 +5,8 @@
 //!
 //! 数据源：
 //! - 拆字/五笔码：`schemas/wubi86/wubi86_chaizi.txt`（字\t字根\t五笔编码）
-//! - 拼音：`pinyin_map.txt`（kMandarin 格式：`U+4E00: yī  # 一`）
+//! - 拼音：`pinyin_map.txt`（pinyin-data 格式：`U+4E00: yī  # 一`，多音字逗号分隔）
+//!   由 wind-tools `gen_pinyin` 从 mozillazg/pinyin-data 合并生成。
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -15,8 +16,8 @@ use std::path::Path;
 pub struct ReverseLookup {
     /// 字 → 五笔编码
     code: HashMap<char, String>,
-    /// 字 → 拼音
-    pinyin: HashMap<char, String>,
+    /// 字 → 拼音读音（多音字按常用频率排序，最常用在前）
+    pinyin: HashMap<char, Vec<String>>,
 }
 
 impl ReverseLookup {
@@ -59,15 +60,19 @@ impl ReverseLookup {
         }
     }
 
-    /// 载入拼音表（kMandarin 格式：`U+4E00: yī  # 一`）。
+    /// 载入拼音表（pinyin-data 格式：`U+4E00: yī  # 一`，多音字逗号分隔）。
     fn load_pinyin(&mut self, path: &Path) {
         let Ok(content) = std::fs::read_to_string(path) else {
             return;
         };
         for line in content.lines() {
-            let line = line.trim();
+            let mut line = line.trim();
             if !line.starts_with("U+") {
                 continue;
+            }
+            // 去掉行内 `# 汉字` 注释
+            if let Some(idx) = line.find('#') {
+                line = line[..idx].trim();
             }
             let Some((hexpart, rest)) = line.split_once(':') else {
                 continue;
@@ -79,14 +84,16 @@ impl ReverseLookup {
             let Some(c) = char::from_u32(cp) else {
                 continue;
             };
-            // 取第一个非标记 token 作为读音
-            let py = rest
-                .split_whitespace()
-                .find(|t| *t != "->" && *t != "?" && *t != "<-" && !t.starts_with('#'));
-            if let Some(py) = py
-                && !py.is_empty()
-            {
-                self.pinyin.insert(c, py.to_string());
+            // 逗号分隔多音字读音，首项为最常用读音
+            let readings: Vec<String> = rest
+                .trim()
+                .split(',')
+                .map(|s| s.trim())
+                .filter(|s| !s.is_empty())
+                .map(|s| s.to_string())
+                .collect();
+            if !readings.is_empty() {
+                self.pinyin.insert(c, readings);
             }
         }
     }
@@ -95,7 +102,7 @@ impl ReverseLookup {
     /// 用于设置页 dict.genPinyin / 拼音方案加词自动出码。
     pub fn gen_pinyin(&self, text: &str) -> String {
         text.chars()
-            .filter_map(|c| self.pinyin.get(&c))
+            .filter_map(|c| self.pinyin.get(&c).and_then(|r| r.first()))
             .map(|py| strip_tone(py))
             .filter(|s| !s.is_empty())
             .collect::<Vec<_>>()
@@ -153,8 +160,9 @@ impl ReverseLookup {
             }
             let mut line = c.to_string();
             if let Some(py) = py {
+                // 多音字读音以 "/" 连接（与 Go tooltip 一致）
                 line.push_str("  ");
-                line.push_str(py);
+                line.push_str(&py.join("/"));
             }
             if let Some(code) = code {
                 line.push_str("  ");
@@ -214,7 +222,7 @@ mod tests {
     fn test_tooltip_format() {
         let mut rl = ReverseLookup::default();
         rl.code.insert('好', "vbg".to_string());
-        rl.pinyin.insert('好', "hǎo".to_string());
+        rl.pinyin.insert('好', vec!["hǎo".to_string()]);
         rl.code.insert('人', "w".to_string());
         let t = rl.tooltip_for("好人");
         assert!(t.contains("好"));
@@ -223,5 +231,46 @@ mod tests {
         assert!(t.contains('\n'), "多字应多行");
         // 纯 ASCII 无反查
         assert_eq!(rl.tooltip_for("abc"), "");
+    }
+
+    #[test]
+    fn test_gen_pinyin_uses_first_reading() {
+        let mut rl = ReverseLookup::default();
+        // 多音字"重"：首音 zhòng（最常用），次音 chóng
+        rl.pinyin
+            .insert('重', vec!["zhòng".to_string(), "chóng".to_string()]);
+        rl.pinyin.insert('要', vec!["yào".to_string()]);
+        assert_eq!(rl.gen_pinyin("重要"), "zhong yao");
+    }
+
+    #[test]
+    fn test_tooltip_multi_reading_joined() {
+        let mut rl = ReverseLookup::default();
+        rl.pinyin
+            .insert('重', vec!["zhòng".to_string(), "chóng".to_string()]);
+        let t = rl.tooltip_for("重");
+        assert!(t.contains("zhòng/chóng"), "多音字读音应以 / 连接: {t}");
+    }
+
+    #[test]
+    fn test_load_pinyin_parses_multi_reading() {
+        use std::io::Write;
+        let dir = std::env::temp_dir().join(format!("wind-reverse-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("pinyin_map.txt");
+        let mut f = std::fs::File::create(&path).unwrap();
+        writeln!(f, "# 头部注释").unwrap();
+        writeln!(f, "U+4E00: yī  # 一").unwrap();
+        writeln!(f, "U+91CD: zhòng,chóng  # 重").unwrap();
+        drop(f);
+
+        let mut rl = ReverseLookup::default();
+        rl.load_pinyin(&path);
+        assert_eq!(rl.pinyin.get(&'一').unwrap(), &vec!["yī".to_string()]);
+        assert_eq!(
+            rl.pinyin.get(&'重').unwrap(),
+            &vec!["zhòng".to_string(), "chóng".to_string()]
+        );
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

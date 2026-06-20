@@ -14,5 +14,9 @@ path = "src/bin/gen_opencc.rs"
 name = "gen_unigram"
 path = "src/bin/gen_unigram.rs"
 
+[[bin]]
+name = "gen_pinyin"
+path = "src/bin/gen_pinyin.rs"
+
 [dependencies]
 anyhow = { workspace = true }

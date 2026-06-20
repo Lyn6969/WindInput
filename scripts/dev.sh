@@ -237,6 +237,15 @@ download_dicts() {
     download_file "$FROST_BASE/en_dicts/en.dict.yaml"     "$rime_frost_en/en.dict.yaml"     "主词库"
     download_file "$FROST_BASE/en_dicts/en_ext.dict.yaml" "$rime_frost_en/en_ext.dict.yaml" "扩展"
 
+    local pinyin_data="$CACHE_DIR/pinyin-data"
+    mkdir -p "$pinyin_data"
+    local PINYIN_BASE="https://raw.githubusercontent.com/mozillazg/pinyin-data/master"
+    gray "pinyin-data (汉字拼音反查):"
+    download_file "$PINYIN_BASE/kXHC1983.txt"       "$pinyin_data/kXHC1983.txt"       "新华字典多音字"
+    download_file "$PINYIN_BASE/kTGHZ2013.txt"      "$pinyin_data/kTGHZ2013.txt"      "通用规范汉字"
+    download_file "$PINYIN_BASE/kMandarin_8105.txt" "$pinyin_data/kMandarin_8105.txt" "8105 标准首音"
+    download_file "$PINYIN_BASE/overwrite.txt"      "$pinyin_data/overwrite.txt"      "手工纠正"
+
     local OPENCC_BASE="https://raw.githubusercontent.com/BYVoid/OpenCC/master/data/dictionary"
     gray "OpenCC 简繁词典:"
     download_file "$OPENCC_BASE/STCharacters.txt" "$opencc/STCharacters.txt" "简->繁 字级"
@@ -286,6 +295,14 @@ assemble_data() {
         cp -f "$unigram_cache" "$pinyin/unigram.txt"
     else
         warn "缺 unigram.txt（运行 gen-data 生成）"
+    fi
+
+    # 4b. 汉字拼音反查表（候选拼音提示/拼音方案自动出码）
+    local pinyin_map_cache="$CACHE_DIR/pinyin-data/pinyin_map.txt"
+    if [ -f "$pinyin_map_cache" ]; then
+        cp -f "$pinyin_map_cache" "$data/pinyin_map.txt"
+    else
+        warn "缺 pinyin_map.txt（运行 gen-data 生成）"
     fi
 
     # 5. OpenCC 编译 .octrie（Rust 工具 gen_opencc）
@@ -505,6 +522,18 @@ do_gen_data() {
             || warn "Unigram 生成失败（智能组句不可用）"
     else
         gray "Unigram 已缓存"
+    fi
+
+    # 生成汉字拼音反查表（Rust 工具 gen_pinyin）
+    local pinyin_map_cache="$CACHE_DIR/pinyin-data/pinyin_map.txt"
+    if [ -f "$CACHE_DIR/pinyin-data/kMandarin_8105.txt" ]; then
+        say "生成汉字拼音反查表..."
+        ( cd "$RUST_WORKSPACE" && cargo run -q --bin gen_pinyin -- \
+            --src "$CACHE_DIR/pinyin-data" \
+            --out "$pinyin_map_cache" ) \
+            || warn "拼音反查表生成失败（候选拼音提示不可用）"
+    else
+        warn "缺 .cache/pinyin-data/，拼音反查表不可用"
     fi
 
     assemble_data "$outdir"
