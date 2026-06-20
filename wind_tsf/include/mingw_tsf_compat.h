@@ -55,6 +55,11 @@ typedef enum _TfLayoutCode {
 #ifndef TF_CLIENTID_NULL
 #define TF_CLIENTID_NULL ((TfClientId)0)
 #endif
+// TF_S_ASYNC：旧版 MinGW msctf.h 缺失（14.x 才补；CI 的 apt mingw-w64 11.x 无）。
+// 与 textstor.h 的 TS_S_ASYNC 同值（FACILITY_ITF, 0x0300）。异步编辑会话标记用。
+#ifndef TF_S_ASYNC
+#define TF_S_ASYNC MAKE_HRESULT(SEVERITY_SUCCESS, FACILITY_ITF, 0x0300)
+#endif
 
 // ----------------------------------------------------------------------------
 // 语言栏项信息/样式标志（TF_LBI_*，MinGW 缺失）
