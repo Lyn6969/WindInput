@@ -665,7 +665,7 @@ enabled = true
 enabled = false
 
 [features.stats]
-enabled = false
+enabled = true
 
 [features.theme]
 enabled = false

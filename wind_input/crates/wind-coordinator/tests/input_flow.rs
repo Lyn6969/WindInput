@@ -954,7 +954,16 @@ fn test_candidate_op_move_top_and_delete() {
         return;
     }
     use wind_ui::manager::CandidateOp;
-    let coord = Coordinator::new_headless(config_with("pinyin"), Some(&data_dir()));
+    // candidate_op 的置顶/删除经 self.store 持久化 Shadow 规则，故需注入真实 store
+    // （new_headless 的 store=None 会让 pin/delete 变空操作）。
+    let store_path = std::env::temp_dir().join("wind_candidate_op_test.redb");
+    let _ = std::fs::remove_file(&store_path);
+    let store = std::sync::Arc::new(wind_store::Store::open(&store_path).unwrap());
+    let coord = Coordinator::new_headless_with_store(
+        config_with("pinyin"),
+        Some(&data_dir()),
+        store,
+    );
     // 拼音输入若干字母以获取多个候选
     for c in "shi".chars() {
         press_letter(&coord, c);

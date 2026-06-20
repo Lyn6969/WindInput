@@ -1578,6 +1578,41 @@ impl Coordinator {
     }
 }
 
+impl Coordinator {
+    /// 从一次按键的最终 KeyAction 提取上屏文本，按中文/英文字符埋点到每日统计。
+    /// 受 `features.stats.enabled` 控制；`track_english` 关闭时不计英文。无 store 静默跳过。
+    pub(crate) fn record_input_stats(&self, action: &KeyAction) {
+        let text = match action {
+            KeyAction::InsertText { text, .. } => text.as_str(),
+            KeyAction::InsertTextWithCursor { text, .. } => text.as_str(),
+            _ => return,
+        };
+        if text.is_empty() {
+            return;
+        }
+        let store = match self.store.as_ref() {
+            Some(s) => s,
+            None => return,
+        };
+        let rt = self.rt();
+        let cfg = &rt.config.features.stats;
+        if !cfg.enabled {
+            return;
+        }
+        let (chinese, mut english) = wind_store::stats::classify_chars(text);
+        if !cfg.track_english {
+            english = 0;
+        }
+        let today = chrono::Local::now()
+            .date_naive()
+            .format("%Y-%m-%d")
+            .to_string();
+        if let Err(e) = store.record_stat(&today, chinese, english) {
+            warn!("record_stat failed: {}", e);
+        }
+    }
+}
+
 impl MessageHandler for Coordinator {
     fn handle_menu_command(&self, command: &str) -> Option<StatusUpdateData> {
         info!("Menu command: {}", command);
@@ -1626,6 +1661,19 @@ impl MessageHandler for Coordinator {
             .lock()
             .map(|m| !m.in_app())
             .unwrap_or(false)
+    }
+
+    /// bridge 真正入口：在按键处理之上统一埋点输入统计（上屏文本字符数），
+    /// 再做 preedit 占位后处理。集中在此避免修改 40+ 个 commit 返回点（对齐旧 Go
+    /// HandleKeyEvent 末尾的 recordCommitFallback 思路）。
+    fn handle_key_event_policed(&self, data: &KeyEventData) -> KeyAction {
+        let action = self.handle_key_event(data);
+        self.record_input_stats(&action);
+        if self.preedit_uses_placeholder() {
+            action.with_composition_placeholder()
+        } else {
+            action
+        }
     }
 
     fn handle_key_event(&self, data: &KeyEventData) -> KeyAction {

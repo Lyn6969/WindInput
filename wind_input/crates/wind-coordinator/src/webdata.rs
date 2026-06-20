@@ -28,6 +28,11 @@ fn usize_param(p: &Value, key: &str, default: usize) -> usize {
         .unwrap_or(default)
 }
 
+/// 本地今天日期 "YYYY-MM-DD"（统计摘要的参照点）。
+fn today_str() -> String {
+    chrono::Local::now().date_naive().format("%Y-%m-%d").to_string()
+}
+
 impl Coordinator {
     /// 数据类 RPC 总分派。方法名以 `<ns>.<method>` 形式分组；未知方法返回 Err。
     pub fn web_data_rpc(&self, method: &str, params: &Value) -> anyhow::Result<Value> {
@@ -80,13 +85,11 @@ impl Coordinator {
             "phrase.add" | "phrase.update" | "phrase.remove" | "phrase.setEnabled"
             | "phrase.resetDefault" => Ok(json!({ "ok": true })),
 
-            // ── stats.*（统计）🚧 待深化 ─────────────────────────
-            "stats.summary" => {
-                Ok(json!({ "today": 0, "week": 0, "month": 0, "total": 0, "streak": 0 }))
-            }
-            "stats.daily" => Ok(json!([])),
-            "stats.clear" => Ok(json!({ "ok": true })),
-            "stats.pruneBefore" => Ok(json!({ "pruned": 0 })),
+            // ── stats.*（输入统计，redb 每日聚合）────────────────
+            "stats.summary" => self.web_stats_summary(),
+            "stats.daily" => self.web_stats_daily(params),
+            "stats.clear" => self.web_stats_clear(),
+            "stats.pruneBefore" => self.web_stats_prune(params),
 
             // ── theme.* ──────────────────────────────────────────
             "theme.list" => self.web_theme_list(),
@@ -378,6 +381,65 @@ impl Coordinator {
         Ok(json!(n))
     }
 
+    fn web_stats_summary(&self) -> anyhow::Result<Value> {
+        let store = match self.store.as_ref() {
+            Some(s) => s,
+            None => return Ok(json!({ "today": 0, "week": 0, "month": 0, "total": 0, "streak": 0 })),
+        };
+        let today = today_str();
+        let s = store.stats_summary(&today)?;
+        Ok(serde_json::to_value(s)?)
+    }
+
+    fn web_stats_daily(&self, params: &Value) -> anyhow::Result<Value> {
+        let from = str_param(params, "from")?.to_string();
+        let to = str_param(params, "to")?.to_string();
+        let store = match self.store.as_ref() {
+            Some(s) => s,
+            None => return Ok(json!([])),
+        };
+        // 真实数据按日期建索引，再用区间内连续日期补 0（对齐 mock 的连续 DailyStat 序列，便于前端绘图）。
+        let mut by_date = std::collections::HashMap::new();
+        for (d, rec) in store.daily_stats(&from, &to)? {
+            by_date.insert(d, rec.total());
+        }
+        let mut out = Vec::new();
+        if let (Ok(f), Ok(t)) = (
+            chrono::NaiveDate::parse_from_str(&from, "%Y-%m-%d"),
+            chrono::NaiveDate::parse_from_str(&to, "%Y-%m-%d"),
+        ) {
+            let mut cur = f;
+            while cur <= t {
+                let key = cur.format("%Y-%m-%d").to_string();
+                let count = by_date.get(&key).copied().unwrap_or(0);
+                out.push(json!({ "date": key, "count": count }));
+                cur += chrono::Duration::days(1);
+            }
+        }
+        Ok(json!(out))
+    }
+
+    fn web_stats_clear(&self) -> anyhow::Result<Value> {
+        if let Some(store) = self.store.as_ref() {
+            store.clear_stats()?;
+        }
+        Ok(json!({ "ok": true }))
+    }
+
+    fn web_stats_prune(&self, params: &Value) -> anyhow::Result<Value> {
+        // 参数 days：删除早于 (今天 - days) 的统计。
+        let days = params.get("days").and_then(|v| v.as_i64()).unwrap_or(0).max(0);
+        let store = match self.store.as_ref() {
+            Some(s) => s,
+            None => return Ok(json!({ "pruned": 0 })),
+        };
+        let before = (chrono::Local::now().date_naive() - chrono::Duration::days(days))
+            .format("%Y-%m-%d")
+            .to_string();
+        let n = store.prune_stats_before(&before)?;
+        Ok(json!({ "pruned": n }))
+    }
+
     fn web_theme_list(&self) -> anyhow::Result<Value> {
         let mut out = Vec::new();
         if let Some(dir) = &self.themes_dir {
@@ -465,5 +527,56 @@ mod tests {
             .web_data_rpc("shadow.list", &json!({ "schemaId": "wb" }))
             .unwrap();
         assert_eq!(list2.as_array().unwrap().len(), 0, "removeRule 后应清空");
+    }
+
+    #[test]
+    fn stats_summary_daily_shape() {
+        let c = coord("stats");
+        let store = c.store.as_ref().unwrap();
+        let today = today_str();
+        store.record_stat(&today, 42, 0).unwrap();
+
+        // stats.summary 形状对齐 StatsSummary{today,week,month,total,streak}
+        let sum = c.web_data_rpc("stats.summary", &json!({})).unwrap();
+        for k in ["today", "week", "month", "total", "streak"] {
+            assert!(sum.get(k).and_then(|v| v.as_u64()).is_some(), "summary 缺 {k}");
+        }
+        assert_eq!(sum["today"], 42);
+
+        // stats.daily 形状对齐 DailyStat{date,count}，区间内连续补 0
+        let daily = c
+            .web_data_rpc("stats.daily", &json!({ "from": &today, "to": &today }))
+            .unwrap();
+        let arr = daily.as_array().unwrap();
+        assert_eq!(arr.len(), 1);
+        assert_eq!(arr[0]["date"], json!(today));
+        assert_eq!(arr[0]["count"], 42);
+
+        // pruneBefore(days) 返回 {pruned}
+        let pr = c
+            .web_data_rpc("stats.pruneBefore", &json!({ "days": 0 }))
+            .unwrap();
+        assert!(pr.get("pruned").and_then(|v| v.as_u64()).is_some());
+
+        // clear 后 summary 归零
+        c.web_data_rpc("stats.clear", &json!({})).unwrap();
+        let sum2 = c.web_data_rpc("stats.summary", &json!({})).unwrap();
+        assert_eq!(sum2["total"], 0);
+    }
+
+    #[test]
+    fn record_input_stats_counts_committed_text() {
+        use wind_bridge::handler::KeyAction;
+        let c = coord("stats_record");
+        // 模拟一次上屏「你好」（中文 2 字）
+        c.record_input_stats(&KeyAction::InsertText {
+            text: "你好".to_string(),
+            new_composition: None,
+            mode_changed: false,
+            chinese_mode: true,
+            has_new_composition: false,
+        });
+        let today = today_str();
+        assert_eq!(c.store.as_ref().unwrap().get_daily_stat(&today).unwrap().chinese, 2);
     }
 }
