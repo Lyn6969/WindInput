@@ -352,8 +352,9 @@ mod platform {
 
 pub use platform::LayeredWindow;
 
-// 非 Windows mock 的冒烟测试：验证缓冲区尺寸/resize/clear 行为，
-// 让 `cargo test` 在 Linux 上有可运行的断言。
+// 非 Windows mock 的冒烟测试：仅验证 mock 的缓冲区契约（尺寸/resize/clear）。
+// 边界：真实 Layered Window 行为（UpdateLayeredWindow 透明渲染、show/hide 定位、
+// wnd_proc 鼠标消息分发）在非 Windows 是空实现，**不在此覆盖，须 Windows 实测**。
 #[cfg(all(test, not(windows)))]
 mod tests {
     use super::*;

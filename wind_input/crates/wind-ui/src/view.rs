@@ -1001,3 +1001,207 @@ pub fn fill_ring(
     paint.set_color(Color::from_rgba8(color[2], color[1], color[0], color[3]));
     pm.fill_path(&path, &paint, FillRule::EvenOdd, Transform::identity(), None);
 }
+
+// ———————————————— 测试 ————————————————
+//
+// 测试边界说明：本模块的盒模型布局（measure/arrange/collect_hits）与形状绘制
+// （fill_rounded/fill_circle/fill_ring，基于纯 Rust 的 tiny-skia）在 **所有平台
+// 行为一致**，Linux 上的测试结果对 Windows 同样有效。唯一的跨平台差异是**文本
+// 测量**：Windows 用 DirectWrite，非 Windows 用 mock 近似（字符数 × 字号 × 0.6）。
+// 因此凡断言**具体文本尺寸/含文本布局数值**的用例都 gate 到 `not(windows)`，
+// 以 mock 的确定尺寸做精确断言；纯几何与形状用例则跨平台运行。
+
+/// 几何与形状绘制测试（跨平台真实：tiny-skia 纯 Rust 光栅化，不依赖文本后端）。
+#[cfg(test)]
+mod geom_tests {
+    use super::*;
+
+    #[test]
+    fn rect_contains_includes_edges() {
+        let r = Rect { x: 10.0, y: 10.0, w: 20.0, h: 20.0 };
+        assert!(r.contains(10.0, 10.0)); // 左上角
+        assert!(r.contains(30.0, 30.0)); // 右下角（x+w, y+h 含边界）
+        assert!(r.contains(20.0, 20.0)); // 内部
+        assert!(!r.contains(9.9, 20.0)); // 左外
+        assert!(!r.contains(30.1, 20.0)); // 右外
+        assert!(!r.contains(20.0, 9.9)); // 上外
+    }
+
+    #[test]
+    fn edges_helpers() {
+        let a = Edges::all(5.0);
+        assert_eq!((a.l, a.t, a.r, a.b), (5.0, 5.0, 5.0, 5.0));
+        assert_eq!(a.w(), 10.0);
+        assert_eq!(a.h(), 10.0);
+        let xy = Edges::xy(3.0, 4.0);
+        assert_eq!((xy.l, xy.t, xy.r, xy.b), (3.0, 4.0, 3.0, 4.0));
+        assert_eq!(xy.w(), 6.0);
+        assert_eq!(xy.h(), 8.0);
+    }
+
+    #[test]
+    fn fill_rounded_writes_alpha() {
+        let mut buf = vec![0u8; 10 * 10 * 4];
+        fill_rounded(&mut buf, 10, 10, 0.0, 0.0, 10.0, 10.0, [255, 0, 0, 255], 0.0);
+        let center = (5 * 10 + 5) * 4;
+        assert!(buf[center + 3] > 0, "中心像素 alpha 应被写入");
+    }
+
+    #[test]
+    fn fill_rounded_transparent_color_is_noop() {
+        let mut buf = vec![0u8; 4 * 4 * 4];
+        fill_rounded(&mut buf, 4, 4, 0.0, 0.0, 4.0, 4.0, [255, 0, 0, 0], 0.0);
+        assert!(buf.iter().all(|&b| b == 0), "alpha=0 不应写入任何像素");
+    }
+
+    #[test]
+    fn fill_circle_writes_center_not_corner() {
+        let mut buf = vec![0u8; 20 * 20 * 4];
+        fill_circle(&mut buf, 20, 20, 10.0, 10.0, 8.0, [0, 255, 0, 255]);
+        assert!(buf[(10 * 20 + 10) * 4 + 3] > 0, "圆心应被填充");
+        assert_eq!(buf[(0 * 20 + 0) * 4 + 3], 0, "角落在圆外，不应被填充");
+    }
+
+    #[test]
+    fn fill_ring_hollow_center() {
+        let mut buf = vec![0u8; 20 * 20 * 4];
+        fill_ring(&mut buf, 20, 20, 0.0, 0.0, 20.0, 20.0, [0, 0, 255, 255], 0.0, 2.0);
+        // 边框环：靠边像素被描边，正中心（挖空）保持透明
+        assert!(buf[(0 * 20 + 10) * 4 + 3] > 0, "上边框应被描边");
+        assert_eq!(buf[(10 * 20 + 10) * 4 + 3], 0, "环中心应镂空透明");
+    }
+}
+
+/// 盒模型布局测试。断言含文本尺寸，依赖非 Windows 的 mock 文本测量
+/// （`measure_text_sized` = 字符数 × 字号 × 0.6，行高 = 字号 × 1.2），故 gate 到 not(windows)。
+#[cfg(all(test, not(windows)))]
+mod layout_tests {
+    use super::*;
+    use crate::text::dwrite::TextRenderer;
+
+    fn tr() -> TextRenderer {
+        TextRenderer::new("test", 20.0).unwrap()
+    }
+
+    /// 构造一个固定尺寸的叶容器（无文本，尺寸跨平台确定）。
+    fn fixed(w: f32, h: f32, tag: i32) -> View {
+        View::container(Layout::Row).fixed_w(w).fixed_h(h).tag(tag)
+    }
+
+    /// 取某 tag 节点 arrange 后的绝对矩形。
+    fn hit(root: &View, tag: i32) -> Rect {
+        let mut out = Vec::new();
+        root.collect_hits(&mut out);
+        out.into_iter()
+            .find(|(t, _)| *t == tag)
+            .unwrap_or_else(|| panic!("tag {tag} 未命中"))
+            .1
+    }
+
+    #[test]
+    fn measure_row_sums_main_axis_with_gap() {
+        let mut v = View::container(Layout::Row)
+            .gap(10.0)
+            .child(fixed(50.0, 20.0, -1))
+            .child(fixed(50.0, 20.0, -1));
+        v.layout(0.0, 0.0, &tr());
+        assert_eq!(v.measured_size(), (110.0, 20.0)); // 50+50+gap10, 交叉轴取 max
+    }
+
+    #[test]
+    fn measure_column_sums_main_axis_with_gap() {
+        let mut v = View::container(Layout::Column)
+            .gap(10.0)
+            .child(fixed(50.0, 20.0, -1))
+            .child(fixed(50.0, 20.0, -1));
+        v.layout(0.0, 0.0, &tr());
+        assert_eq!(v.measured_size(), (50.0, 50.0)); // 宽取 max50, 高 20+20+gap10
+    }
+
+    #[test]
+    fn measure_adds_padding() {
+        let mut v = View::container(Layout::Row)
+            .pad(Edges::all(8.0))
+            .child(fixed(50.0, 20.0, -1));
+        v.layout(0.0, 0.0, &tr());
+        assert_eq!(v.measured_size(), (66.0, 36.0)); // +16 两侧 padding
+    }
+
+    #[test]
+    fn fixed_size_overrides_content() {
+        let mut v = View::container(Layout::Row)
+            .fixed_w(200.0)
+            .fixed_h(30.0)
+            .child(fixed(999.0, 999.0, -1));
+        v.layout(0.0, 0.0, &tr());
+        assert_eq!(v.measured_size(), (200.0, 30.0));
+    }
+
+    #[test]
+    fn leaf_text_measured_via_mock() {
+        let mut v = View::leaf("abc", [0, 0, 0, 255]).font_size(20.0);
+        v.layout(0.0, 0.0, &tr());
+        // mock: 3 字符 × 20 × 0.6 = 36 宽；20 × 1.2 = 24 高
+        assert_eq!(v.measured_size(), (36.0, 24.0));
+    }
+
+    #[test]
+    fn arrange_cross_center_offsets_child() {
+        let mut root = View::container(Layout::Row)
+            .cross(Align::Center)
+            .fixed_h(40.0)
+            .child(fixed(50.0, 20.0, 0));
+        root.layout(0.0, 0.0, &tr());
+        let r = hit(&root, 0);
+        assert_eq!(r.x, 0.0);
+        assert_eq!(r.y, 10.0); // (40-20)/2 居中
+    }
+
+    #[test]
+    fn arrange_grow_spacer_absorbs_remaining() {
+        let mut root = View::container(Layout::Row)
+            .fixed_w(200.0)
+            .child(fixed(50.0, 10.0, 0))
+            .child(View::spacer())
+            .child(fixed(50.0, 10.0, 2));
+        root.layout(0.0, 0.0, &tr());
+        assert_eq!(hit(&root, 0).x, 0.0);
+        assert_eq!(hit(&root, 2).x, 150.0); // spacer 吸收 200-100=100，把末项推到 150
+    }
+
+    #[test]
+    fn arrange_fill_cross_stretches_width() {
+        let mut root = View::container(Layout::Column).fixed_w(100.0).child(
+            View::container(Layout::Column)
+                .fixed_h(20.0)
+                .fill_cross()
+                .tag(0),
+        );
+        root.layout(0.0, 0.0, &tr());
+        assert_eq!(hit(&root, 0).w, 100.0); // 跨轴撑满列内容宽
+    }
+
+    #[test]
+    fn arrange_applies_child_margin() {
+        let mut root = View::container(Layout::Row).child(
+            fixed(10.0, 10.0, 0).margin(Edges { l: 5.0, t: 3.0, r: 0.0, b: 0.0 }),
+        );
+        root.layout(0.0, 0.0, &tr());
+        let r = hit(&root, 0);
+        assert_eq!((r.x, r.y), (5.0, 3.0)); // margin 偏移子节点原点
+    }
+
+    #[test]
+    fn collect_hits_depth_first_skips_untagged() {
+        let mut root = View::container(Layout::Column)
+            .child(fixed(10.0, 10.0, 0))
+            .child(
+                fixed(10.0, 10.0, 1).child(fixed(5.0, 5.0, 2)),
+            );
+        root.layout(0.0, 0.0, &tr());
+        let mut out = Vec::new();
+        root.collect_hits(&mut out);
+        let tags: Vec<i32> = out.iter().map(|(t, _)| *t).collect();
+        assert_eq!(tags, vec![0, 1, 2]); // 先序遍历；root 默认 tag=-1 不收集
+    }
+}
