@@ -181,6 +181,7 @@ fn dpi_scale() -> f32 {
     }
 }
 
+#[cfg_attr(not(windows), allow(unused_variables))]
 fn clamp_to_work_area(x: i32, y: i32, w: u32, h: u32) -> (i32, i32) {
     #[cfg(windows)]
     {

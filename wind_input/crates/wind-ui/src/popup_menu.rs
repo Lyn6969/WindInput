@@ -13,17 +13,21 @@ use crate::manager::{MenuItemSpec, MenuKind, UiEvent};
 use crate::text::dwrite::TextRenderer;
 use crate::view::{Align, Edges, Layout, Rect, View};
 use crate::window::{LayeredWindow, WindowMouse};
-use windows::Win32::Foundation::{HANDLE, HGLOBAL, HWND, LPARAM, LRESULT, POINT, WPARAM};
+use crate::sys::{
+    GetCursorPos, LoadCursorW, ReleaseCapture, SetCapture, SetCursor, ShowWindow, HWND, IDC_ARROW,
+    LPARAM, LRESULT, POINT, SW_HIDE, WM_LBUTTONDOWN, WM_MOUSEMOVE, WM_RBUTTONDOWN, WM_SETCURSOR,
+    WPARAM,
+};
+#[cfg(windows)]
+use windows::Win32::Foundation::{HANDLE, HGLOBAL};
+#[cfg(windows)]
 use windows::Win32::System::DataExchange::{
     CloseClipboard, EmptyClipboard, GetClipboardData, OpenClipboard, SetClipboardData,
 };
+#[cfg(windows)]
 use windows::Win32::System::Memory::{GlobalAlloc, GlobalLock, GlobalUnlock, GMEM_MOVEABLE};
+#[cfg(windows)]
 use windows::Win32::System::Ole::CF_UNICODETEXT;
-use windows::Win32::UI::Input::KeyboardAndMouse::{ReleaseCapture, SetCapture};
-use windows::Win32::UI::WindowsAndMessaging::{
-    GetCursorPos, LoadCursorW, SetCursor, ShowWindow, IDC_ARROW, SW_HIDE, WM_LBUTTONDOWN,
-    WM_MOUSEMOVE, WM_RBUTTONDOWN, WM_SETCURSOR,
-};
 
 const FONT_PX: f32 = 14.0;
 const BG: [u8; 4] = [250, 250, 250, 252];
@@ -733,6 +737,7 @@ impl WindowMouse for MenuState {
 }
 
 /// 写剪贴板（CF_UNICODETEXT）
+#[cfg(windows)]
 pub fn set_clipboard_text(text: &str) {
     if text.is_empty() {
         return;
@@ -756,7 +761,12 @@ pub fn set_clipboard_text(text: &str) {
     }
 }
 
+/// 写剪贴板（非 Windows mock：暂不接入平台剪贴板，空操作）。
+#[cfg(not(windows))]
+pub fn set_clipboard_text(_text: &str) {}
+
 /// 读剪贴板文本（CF_UNICODETEXT）。失败/无文本返回空串。
+#[cfg(windows)]
 pub fn get_clipboard_text() -> String {
     unsafe {
         if OpenClipboard(HWND::default()).is_err() {
@@ -780,6 +790,12 @@ pub fn get_clipboard_text() -> String {
         let _ = CloseClipboard();
         out
     }
+}
+
+/// 读剪贴板文本（非 Windows mock：返回空串）。
+#[cfg(not(windows))]
+pub fn get_clipboard_text() -> String {
+    String::new()
 }
 
 fn dpi_scale() -> f32 {

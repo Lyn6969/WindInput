@@ -5,8 +5,10 @@
 
 use crate::candidate_window::{CandidateItem, CandidateWindow, CandidateWindowConfig};
 use std::sync::mpsc;
-use tracing::{debug, error, info, warn};
+use tracing::{debug, error, info};
+#[cfg(windows)]
 use windows::Win32::Foundation::HWND;
+#[cfg(windows)]
 use windows::Win32::UI::WindowsAndMessaging::*;
 
 /// UI 命令
@@ -307,9 +309,10 @@ impl UiManager {
                     toolbar_hide_at = None;
                 }
             }
-            // 非阻塞处理 Win32 消息
-            let mut msg = MSG::default();
+            // 非阻塞处理 Win32 消息（仅 Windows 有消息泵；非 Windows 为 mock，跳过）
+            #[cfg(windows)]
             unsafe {
+                let mut msg = MSG::default();
                 while PeekMessageW(&mut msg, HWND::default(), 0, 0, PM_REMOVE).as_bool() {
                     let _ = TranslateMessage(&msg);
                     DispatchMessageW(&msg);
