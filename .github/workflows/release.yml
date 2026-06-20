@@ -47,13 +47,14 @@ jobs:
             WindInput/wind_input
             wind-installer
 
-      - name: 版本一致性校验 (docs/VERSION == tag)
+      # tag 为发布版本的唯一真值源；docs/VERSION 仅为开发占位。把 tag 版本写入
+      # docs/VERSION，让下游(build.rs 资源版本 / dev.sh dist / pack-installer)统一取到。
+      - name: 以 tag 版本为准写入 docs/VERSION
         working-directory: WindInput
         run: |
-          TAG="${GITHUB_REF_NAME#v}"
-          FILE="$(tr -d '[:space:]' < docs/VERSION)"
-          echo "tag=$TAG  docs/VERSION=$FILE"
-          [ "$TAG" = "$FILE" ] || { echo "::error::docs/VERSION($FILE) 与 tag($TAG) 不一致"; exit 1; }
+          V="${GITHUB_REF_NAME#v}"
+          echo "$V" > docs/VERSION
+          echo "release version = $V"
 
       - name: 构建发布目录 (exe + x64/x86 TSF + data)
         working-directory: WindInput
