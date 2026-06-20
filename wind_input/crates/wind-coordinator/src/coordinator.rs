@@ -31,6 +31,7 @@ use wind_transform::fullwidth::to_full_width;
 use wind_transform::punctuation::PunctuationConverter;
 use wind_ui::candidate_window::CandidateItem;
 use wind_ui::manager::{UiCommand, UiEvent, UiManager};
+use wind_ui::toast::{ToastKind, ToastPosition};
 
 /// VK + shift → 该键产生的 ASCII 标点/符号字符（字母键返回 None，由拼音/码表处理）。
 /// 解析配对表（每项 2 字符 "（）"）为 (左,右) 字符对，忽略非法项。
@@ -790,13 +791,33 @@ impl Coordinator {
                 }
                 self.apply_ui_config(); // 外观项（候选排列/编码显示/候选窗显隐）即时生效
                 self.reload_config(); // 刷新主题/工具栏（候选窗下次输入按新配置）
+                self.show_toast(
+                    "设置已更新",
+                    ToastPosition::BottomCenter,
+                    ToastKind::Success,
+                );
                 false
             }
             Err(e) => {
                 tracing::error!("热重载配置失败: {}", e);
+                self.show_toast(
+                    "配置加载失败",
+                    ToastPosition::BottomCenter,
+                    ToastKind::Error,
+                );
                 true
             }
         }
+    }
+
+    /// 显示一次性通知 toast（约 2.5 秒后自动隐藏）。供配置热重载、词库就绪、错误等一次性事件。
+    pub(crate) fn show_toast(&self, text: &str, position: ToastPosition, kind: ToastKind) {
+        let _ = self.ui_tx.send(UiCommand::ShowToast {
+            text: text.to_string(),
+            position,
+            kind,
+            duration_ms: 2500,
+        });
     }
 
     /// 按当前配置（bundle）重新下发外观相关 UI 指令并同步运行时态。

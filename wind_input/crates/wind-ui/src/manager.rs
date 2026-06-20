@@ -4,6 +4,7 @@
 //! 在独立线程中运行 Win32 消息循环，通过通道接收 UI 更新命令。
 
 use crate::candidate_window::{CandidateItem, CandidateWindow, CandidateWindowConfig};
+use crate::toast::{ToastKind, ToastPosition};
 use std::sync::mpsc;
 use tracing::{debug, error, info};
 #[cfg(windows)]
@@ -37,6 +38,13 @@ pub enum UiCommand {
     },
     /// 隐藏候选窗口
     HideCandidates,
+    /// 一次性通知 toast（方案切换/词库就绪/错误等）；duration_ms 后自动隐藏。
+    ShowToast {
+        text: String,
+        position: ToastPosition,
+        kind: ToastKind,
+        duration_ms: u64,
+    },
     /// 显示状态提示气泡（中英/标点/全半角/方案切换），约 1 秒后自动隐藏。
     /// (x,y)=光标点(y 为底端)，caret_height 上翻定位用，offset_x/y 用户位置微调。
     ShowStatusTip {
@@ -295,6 +303,16 @@ impl UiManager {
             }
         };
         let mut tip_hide_at: Option<std::time::Instant> = None;
+
+        // 一次性通知 toast（best-effort）
+        let mut toast = match crate::toast::Toast::new() {
+            Ok(t) => Some(t),
+            Err(e) => {
+                error!("Failed to create toast: {}", e);
+                None
+            }
+        };
+        let mut toast_hide_at: Option<std::time::Instant> = None;
         // 状态提示防抖：合并快速连续的提示（如连按切换），避免气泡闪烁
         // 载荷：(text, x, y, caret_height, offset_x, offset_y)
         let mut tip_debounce =
@@ -334,6 +352,15 @@ impl UiManager {
                         t.hide();
                     }
                     tip_hide_at = None;
+                }
+            }
+            // toast 到期自动隐藏
+            if let Some(deadline) = toast_hide_at {
+                if std::time::Instant::now() >= deadline {
+                    if let Some(t) = &toast {
+                        t.hide();
+                    }
+                    toast_hide_at = None;
                 }
             }
             // 工具栏隐藏防抖到期：确认隐藏
@@ -471,6 +498,21 @@ impl UiManager {
                         // 经防抖：合并快速连续提示，避免气泡闪烁
                         tip_debounce.trigger((text, x, y, caret_height, offset_x, offset_y));
                     }
+                    UiCommand::ShowToast {
+                        text,
+                        position,
+                        kind,
+                        duration_ms,
+                    } => {
+                        debug!("UI: ShowToast '{}' ({:?},{:?})", text, position, kind);
+                        if let Some(t) = &mut toast {
+                            t.show(&text, position, kind);
+                            toast_hide_at = Some(
+                                std::time::Instant::now()
+                                    + std::time::Duration::from_millis(duration_ms.max(1)),
+                            );
+                        }
+                    }
                     UiCommand::UpdateToolbar(tb_state) => {
                         debug!("UI: UpdateToolbar {:?}", tb_state);
                         toolbar_hide_at = None; // 取消待定隐藏（切回本输入法 → 保持显示）
@@ -504,6 +546,9 @@ impl UiManager {
                         if let Some(st) = &mut status_tip {
                             st.set_theme(&t);
                         }
+                        if let Some(to) = &mut toast {
+                            to.set_theme(&t);
+                        }
                         candidate_window.set_theme(t); // 同时更新其 tooltip
                     }
                     UiCommand::SetCandidateLayout(vertical) => {
@@ -528,6 +573,9 @@ impl UiManager {
                         info!("UI: Shutdown");
                         candidate_window.hide();
                         if let Some(t) = &status_tip {
+                            t.hide();
+                        }
+                        if let Some(t) = &toast {
                             t.hide();
                         }
                         if let Some(t) = &mut toolbar {
