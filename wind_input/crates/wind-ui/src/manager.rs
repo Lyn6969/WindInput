@@ -52,6 +52,10 @@ pub enum UiCommand {
     /// 预编辑嵌入模式（true=编码嵌入候选行首，不显示独立 preedit 条）。
     /// 来自 ui.candidate.preedit_display == "candidate_inline"。
     SetPreeditEmbedded(bool),
+    /// 候选字号覆盖（0=跟随主题）。来自 ui.candidate.font_size。
+    SetCandidateFontSize(f32),
+    /// 悬停提示激活延迟（毫秒）。来自 ui.tooltip.delay。
+    SetTooltipDelay(i32),
     /// 显示菜单（候选右键菜单 / 功能主菜单；UI 自管导航与子菜单）
     ShowCandidateMenu {
         items: Vec<MenuItemSpec>,
@@ -486,6 +490,12 @@ impl UiManager {
                     }
                     UiCommand::SetPreeditEmbedded(embedded) => {
                         candidate_window.set_preedit_embedded(embedded);
+                    }
+                    UiCommand::SetCandidateFontSize(size) => {
+                        candidate_window.set_font_size_override(size);
+                    }
+                    UiCommand::SetTooltipDelay(delay) => {
+                        candidate_window.set_tooltip_delay(delay);
                     }
                     UiCommand::Shutdown => {
                         info!("UI: Shutdown");

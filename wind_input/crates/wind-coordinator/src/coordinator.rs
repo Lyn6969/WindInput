@@ -506,6 +506,14 @@ impl Coordinator {
         let _ = coordinator
             .ui_tx
             .send(UiCommand::SetPreeditEmbedded(embedded));
+        // 候选字号覆盖 + 悬停提示延迟初值
+        let rt0 = coordinator.rt();
+        let _ = coordinator.ui_tx.send(UiCommand::SetCandidateFontSize(
+            rt0.config.ui.candidate.font_size,
+        ));
+        let _ = coordinator
+            .ui_tx
+            .send(UiCommand::SetTooltipDelay(rt0.config.ui.tooltip.delay));
         coordinator
     }
 
@@ -810,6 +818,14 @@ impl Coordinator {
         if hidden {
             let _ = self.ui_tx.send(UiCommand::HideCandidates);
         }
+        // 候选字号覆盖（ui.candidate.font_size，0=跟随主题）
+        let _ = self
+            .ui_tx
+            .send(UiCommand::SetCandidateFontSize(cand.font_size));
+        // 悬停提示延迟（ui.tooltip.delay）
+        let _ = self
+            .ui_tx
+            .send(UiCommand::SetTooltipDelay(bundle.config.ui.tooltip.delay));
     }
 
     /// 当前活跃方案 ID（测试/诊断用）

@@ -22,4 +22,9 @@ CandidateItem 构建处按 max_chars 截断 text、按 index_labels 覆盖序号
 ## Stage 4: wind-ui — 字号覆盖 / 上方翻转 / delay（Windows 目标）
 **Goal**: 新 UiCommand 下发 font_size(0=主题)/flip_when_above；tooltip delay 映射 hover 防抖。
 **Success**: x86_64-pc-windows-gnu 编译通过；设备实测候选字号/上方翻转/提示延迟。
-**Status**: Not Started
+**Status**: Partial
+- ✅ font_size 覆盖（render base_fs 用 override>0 否则主题）+ UiCommand::SetCandidateFontSize
+- ✅ tooltip delay（CandidateMouse.engage_delay_ms 取代硬编码 60ms）+ UiCommand::SetTooltipDelay
+- ⏸ flip_when_above 未做：需在定位(clamp_to_work_area 决定 above/below)后逆序候选渲染，
+  且保持 hit_rect/选中索引映射不变——属 render 流程重排，盲改风险高，待设备核验再实施。
+  配置/manifest 已就位（设置该项当前 UI 不响应）。

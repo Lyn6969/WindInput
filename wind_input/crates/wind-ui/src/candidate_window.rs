@@ -134,6 +134,8 @@ pub struct CandidateWindow {
     /// 预编辑嵌入模式（编码嵌入候选行首，不显示独立 preedit 条）。
     /// 来自 ui.candidate.preedit_display == "candidate_inline"。
     preedit_embedded: bool,
+    /// 候选字号覆盖（>0 时取代主题 behavior.font_size）。来自 ui.candidate.font_size。
+    font_size_override: f32,
 }
 
 impl CandidateWindow {
@@ -148,6 +150,7 @@ impl CandidateWindow {
             engaged: false,
             engage_at: None,
             pending_raw: -1,
+            engage_delay_ms: 60,
         }));
         window.register_mouse(mouse.clone());
         Ok(Self {
@@ -175,6 +178,7 @@ impl CandidateWindow {
             scale: CandidateWindowConfig::get_dpi_scale(),
             vertical: false,
             preedit_embedded: false,
+            font_size_override: 0.0,
         })
     }
 
@@ -187,6 +191,16 @@ impl CandidateWindow {
     /// 设置预编辑嵌入模式（true=编码嵌入候选行首，不显示独立 preedit 条）。
     pub fn set_preedit_embedded(&mut self, embedded: bool) {
         self.preedit_embedded = embedded;
+    }
+
+    /// 设置候选字号覆盖（0=跟随主题）。来自 ui.candidate.font_size。
+    pub fn set_font_size_override(&mut self, font_size: f32) {
+        self.font_size_override = font_size.max(0.0);
+    }
+
+    /// 设置悬停提示激活延迟（毫秒）。来自 ui.tooltip.delay。
+    pub fn set_tooltip_delay(&mut self, delay_ms: i32) {
+        self.mouse.borrow_mut().engage_delay_ms = delay_ms.max(0) as u64;
     }
 
     pub fn set_theme(&mut self, theme: wind_theme::Resolved) {
@@ -491,9 +505,14 @@ impl CandidateWindow {
         let t = &self.theme;
         let v = &t.views;
         let s = self.scale;
-        // 字号：base = 主题 behavior.font_size（默认 18，主题/用户可调）× DPI；
+        // 字号：base = 用户覆盖(ui.candidate.font_size>0) 否则主题 behavior.font_size（默认 18）× DPI；
         // 序号/注释/预编辑按各节点 font_size（相对主字号的有符号逻辑偏移）调整。
-        let base_fs = (t.behavior.font_size as f32) * s;
+        let base_logical = if self.font_size_override > 0.0 {
+            self.font_size_override
+        } else {
+            t.behavior.font_size as f32
+        };
+        let base_fs = base_logical * s;
         let node_fs = |n: &RvNode| (base_fs + n.font_size * s).max(6.0 * s);
         let index_fs = node_fs(&v.index);
         let text_fs = node_fs(&v.text);
@@ -895,6 +914,8 @@ pub struct CandidateMouse {
     engage_at: Option<Instant>,
     /// 最近一次命中目标（激活瞬间据此发出首个悬停）。
     pending_raw: i32,
+    /// 悬停激活延迟（毫秒）。来自 ui.tooltip.delay；默认 60。
+    engage_delay_ms: u64,
 }
 
 impl CandidateMouse {
@@ -999,7 +1020,8 @@ impl WindowMouse for CandidateMouse {
                     }
                 } else if self.engage_at.is_none() {
                     // 首次真实移动：启动窗口级激活闸门（仅一次，~60ms）
-                    self.engage_at = Some(Instant::now() + Duration::from_millis(60));
+                    self.engage_at =
+                        Some(Instant::now() + Duration::from_millis(self.engage_delay_ms));
                 }
                 Some(LRESULT(0))
             }
