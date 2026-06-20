@@ -517,6 +517,15 @@ impl Coordinator {
         let _ = coordinator
             .ui_tx
             .send(UiCommand::SetTooltipDelay(rt0.config.ui.tooltip.delay));
+        // 拆字字根字体（PUA 字根渲染）：随安装数据目录下发，存在才发。
+        if let Some(dir) = data_dir.as_deref() {
+            let font = dir.join("schemas/wubi86/HeiTiZiGen.ttf");
+            if font.is_file() {
+                let _ = coordinator.ui_tx.send(UiCommand::SetTooltipChaiziFont(
+                    font.to_string_lossy().into_owned(),
+                ));
+            }
+        }
         coordinator
     }
 

@@ -58,6 +58,8 @@ pub enum UiCommand {
     SetTooltipDelay(i32),
     /// 候选窗在光标上方时反转候选顺序。来自 ui.candidate.flip_when_above。
     SetCandidateFlipWhenAbove(bool),
+    /// 拆字字根字体路径（PUA 字根字符渲染）。空=不设。
+    SetTooltipChaiziFont(String),
     /// 显示菜单（候选右键菜单 / 功能主菜单；UI 自管导航与子菜单）
     ShowCandidateMenu {
         items: Vec<MenuItemSpec>,
@@ -501,6 +503,9 @@ impl UiManager {
                     }
                     UiCommand::SetCandidateFlipWhenAbove(flip) => {
                         candidate_window.set_flip_when_above(flip);
+                    }
+                    UiCommand::SetTooltipChaiziFont(path) => {
+                        candidate_window.set_tooltip_chaizi_font(&path);
                     }
                     UiCommand::Shutdown => {
                         info!("UI: Shutdown");

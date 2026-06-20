@@ -63,6 +63,13 @@ impl Tooltip {
         }
     }
 
+    /// 加载拆字字根字体（PUA 字根字符渲染）。失败仅日志，不影响普通提示。
+    pub fn set_chaizi_font(&mut self, path: &str) {
+        if let Err(e) = self.renderer.set_chaizi_font(path) {
+            tracing::warn!("加载拆字字根字体失败 ({path}): {e}");
+        }
+    }
+
     /// 应用主题（tooltip 底色/文字色 + 位图背景/层）。
     pub fn set_theme(&mut self, theme: &wind_theme::Resolved) {
         self.theme = Some(theme.clone());

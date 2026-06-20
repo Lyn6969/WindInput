@@ -33,7 +33,16 @@ mod imp {
     use windows::Win32::Foundation::{BOOL, COLORREF, FALSE};
     use windows::Win32::Graphics::DirectWrite::*;
     use windows::Win32::Graphics::Gdi::{DIBSECTION, GetCurrentObject, GetObjectW, OBJ_BITMAP};
-    use windows::core::{PCWSTR, implement};
+    use windows::core::{Interface, PCWSTR, implement};
+
+    /// 五笔字根字体的 DirectWrite 家族名（HeiTiZiGen.ttf 的 name 表家族名）。
+    const CHAIZI_FAMILY: &str = "黑体字根";
+
+    /// 拆字字根字体（自定义字体集 + 家族名），用于 PUA 字根字符的级联回退渲染。
+    struct ChaiziFont {
+        collection: IDWriteFontCollection1,
+        family: Vec<u16>,
+    }
 
     /// 渲染表面：尺寸绑定的位图渲染目标 + 其专属字形渲染器回调对象。
     struct Surface {
@@ -58,6 +67,8 @@ mod imp {
         formats: RefCell<HashMap<u32, IDWriteTextFormat>>,
         /// 当前位图渲染表面（按需重建）
         surface: RefCell<Option<Surface>>,
+        /// 拆字字根字体（可选）：设置后对 PUA 码位字符级联回退到该字体渲染。
+        chaizi: Option<ChaiziFont>,
     }
 
     impl TextRenderer {
@@ -89,7 +100,43 @@ mod imp {
                     params,
                     formats: RefCell::new(HashMap::new()),
                     surface: RefCell::new(None),
+                    chaizi: None,
                 })
+            }
+        }
+
+        /// 加载拆字字根字体（TTF）建自定义字体集，后续渲染中 PUA 码位字符回退到它。
+        /// 失败返回 Err（不影响普通文本渲染）。
+        pub fn set_chaizi_font(&mut self, path: &str) -> Result<(), String> {
+            unsafe {
+                let f3: IDWriteFactory3 = self
+                    .factory
+                    .cast()
+                    .map_err(|e| format!("cast IDWriteFactory3: {e}"))?;
+                let path_w: Vec<u16> = path.encode_utf16().chain(std::iter::once(0)).collect();
+                let file = f3
+                    .CreateFontFileReference(PCWSTR(path_w.as_ptr()), None)
+                    .map_err(|e| format!("CreateFontFileReference: {e}"))?;
+                let builder: IDWriteFontSetBuilder1 = f3
+                    .CreateFontSetBuilder()
+                    .map_err(|e| format!("CreateFontSetBuilder: {e}"))?
+                    .cast()
+                    .map_err(|e| format!("cast IDWriteFontSetBuilder1: {e}"))?;
+                builder
+                    .AddFontFile(&file)
+                    .map_err(|e| format!("AddFontFile: {e}"))?;
+                let set = builder
+                    .CreateFontSet()
+                    .map_err(|e| format!("CreateFontSet: {e}"))?;
+                let collection = f3
+                    .CreateFontCollectionFromFontSet(&set)
+                    .map_err(|e| format!("CreateFontCollectionFromFontSet: {e}"))?;
+                let family: Vec<u16> = CHAIZI_FAMILY
+                    .encode_utf16()
+                    .chain(std::iter::once(0))
+                    .collect();
+                self.chaizi = Some(ChaiziFont { collection, family });
+                Ok(())
             }
         }
 
@@ -139,9 +186,32 @@ mod imp {
             let fmt = self.ensure_format(size)?;
             let wide: Vec<u16> = text.encode_utf16().collect();
             unsafe {
-                self.factory
+                let layout = self
+                    .factory
                     .CreateTextLayout(&wide, &fmt, max_w.max(1.0), max_h.max(1.0))
-                    .map_err(|e| format!("CreateTextLayout: {e}"))
+                    .map_err(|e| format!("CreateTextLayout: {e}"))?;
+                // 拆字字根：对 PUA 码位（U+E000..=U+F8FF，皆 BMP 单码元）的连续段
+                // 切到黑体字根字体集，级联回退渲染字根字符。
+                if let Some(cf) = &self.chaizi {
+                    let mut i = 0usize;
+                    while i < wide.len() {
+                        if (0xE000..=0xF8FF).contains(&wide[i]) {
+                            let start = i;
+                            while i < wide.len() && (0xE000..=0xF8FF).contains(&wide[i]) {
+                                i += 1;
+                            }
+                            let range = DWRITE_TEXT_RANGE {
+                                startPosition: start as u32,
+                                length: (i - start) as u32,
+                            };
+                            let _ = layout.SetFontCollection(&cf.collection, range);
+                            let _ = layout.SetFontFamilyName(PCWSTR(cf.family.as_ptr()), range);
+                        } else {
+                            i += 1;
+                        }
+                    }
+                }
+                Ok(layout)
             }
         }
 
@@ -496,6 +566,10 @@ mod imp {
 
         pub fn set_base_size(&mut self, size: f32) {
             self.font_size = size;
+        }
+
+        pub fn set_chaizi_font(&mut self, _path: &str) -> Result<(), String> {
+            Ok(())
         }
 
         pub fn measure_text(&self, text: &str) -> TextMetrics {
