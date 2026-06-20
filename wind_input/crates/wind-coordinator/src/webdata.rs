@@ -3,9 +3,11 @@
 //! 经 wind-webapi 的 `CoreStatus::data_rpc` 转发到此（service 的 WebStatus 适配）。
 //! 方法名与前端 `contract.ts` 1:1 一致。
 //!
-//! 接入进度：
-//! - ✅ schema.list/active/setActive、dict.*（listPaged/search/add/update/remove/clear/stats）、theme.list
-//! - 🚧 其余命名空间先返回合法空壳/默认值（保证前端页面加载、不报 unknown method），逐步深化。
+//! 接入进度：契约全部数据域方法均接通真实 store/engine/theme：
+//! - schema.*（含三层合并 getConfig/saveConfig/resetConfig/setDictEnabled/delete）
+//! - dict.*（含 encode/genPinyin 反查出码）、temp.*、freq.*、shadow.*、phrase.*、stats.*、theme.*
+//! - `schema.references` 暂返 `{}`（删除安全检查未用，前端宽松消费）；
+//!   无 store/themes 时各方法返回合法空集（降级，不报错）。
 
 use serde_json::{Value, json};
 
