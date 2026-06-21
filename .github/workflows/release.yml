@@ -37,12 +37,24 @@ jobs:
           path: wind-ui-rust
           token: ${{ secrets.WIND_REPOS_TOKEN }}
 
-      - name: 安装 mingw-w64 (x86_64 + i686)
-        run: sudo apt-get update && sudo apt-get install -y mingw-w64
+      # mingw-w64:C++ TSF DLL 用;clang/lld/llvm:cargo-xwin 交叉编 Rust(MSVC)用
+      - name: 安装 mingw-w64 + clang/lld/llvm
+        run: sudo apt-get update && sudo apt-get install -y mingw-w64 clang lld llvm
 
       - uses: dtolnay/rust-toolchain@stable
         with:
-          targets: x86_64-pc-windows-gnu
+          targets: x86_64-pc-windows-msvc
+
+      - name: 安装 cargo-xwin
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-xwin
+
+      - name: 缓存 xwin SDK
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/cargo-xwin
+          key: xwin-${{ runner.os }}-v1
 
       - uses: Swatinem/rust-cache@v2
         with:

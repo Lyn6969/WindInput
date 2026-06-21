@@ -6,7 +6,8 @@
 #   ./scripts/dev.sh <命令>     # 非交互直调, 如 ./scripts/dev.sh release
 #
 # 本机 (Linux) 交叉编译为 Windows 可执行文件:
-#   - 目标 triple: x86_64-pc-windows-gnu (纯 Rust, 无 C 链接)
+#   - 目标 triple: x86_64-pc-windows-msvc (经 cargo-xwin;tier-1,+crt-static 自包含)
+#   - 依赖: cargo-xwin + clang + lld + llvm(C++ TSF DLL 另由 MinGW 构建)
 #   - 产物: target/<target>/<profile>/wind_input.exe
 #   - build/check/clippy 走 Windows 目标; test 在本机跑 (Windows 代码在 cfg(windows) 后)
 #
@@ -82,7 +83,9 @@ WIND_REMOTE_SETTING_DIR="${WIND_REMOTE_SETTING_DIR:-}"
 # 从远程拉取的配置/日志落地处（本地查看用，不入库）
 REMOTE_PULL_DIR="$PRODUCT_ROOT/.remote"
 
-TARGET="x86_64-pc-windows-gnu"
+# Rust 交叉编译目标:MSVC(经 cargo-xwin 在 Linux 上交叉编,tier-1 目标)。
+# 注:C++ TSF DLL 仍由 MinGW 构建(见 wind_tsf/Makefile),与本目标无关。
+TARGET="x86_64-pc-windows-msvc"
 
 # ---------- 颜色 ----------
 if [ -t 1 ]; then
@@ -95,6 +98,36 @@ say()  { printf '%b%b%b\n' "$C_GREEN" "$1" "$C_RESET"; }
 warn() { printf '%b%b%b\n' "$C_YELLOW" "$1" "$C_RESET"; }
 err()  { printf '%b%b%b\n' "$C_RED" "$1" "$C_RESET"; }
 gray() { printf '%b%b%b\n' "$C_GRAY" "$1" "$C_RESET"; }
+
+# ---------- cargo-xwin (MSVC 交叉编译) ----------
+# cargo-xwin 在 Linux 上交叉编 *-pc-windows-msvc:底层用 clang(当 clang-cl 调用)
+# + lld-link + llvm-rc/llvm-lib,首次自动下载 MSVC CRT/Windows SDK(缓存于
+# ~/.cache/cargo-xwin)。依赖:cargo-xwin、clang、lld、llvm。
+XWIN_BIN="$HOME/.local/xwin-bin"
+setup_xwin_env() {
+    # clang-cl 多数发行版无独立二进制,用 clang 改名调用(按 argv[0] 切 cl 模式);幂等。
+    if ! command -v clang-cl >/dev/null 2>&1; then
+        if command -v clang >/dev/null 2>&1; then
+            mkdir -p "$XWIN_BIN"
+            ln -sf "$(command -v clang)" "$XWIN_BIN/clang-cl"
+            case ":$PATH:" in *":$XWIN_BIN:"*) ;; *) export PATH="$XWIN_BIN:$PATH";; esac
+        else
+            err "未找到 clang;请安装 clang lld llvm(cargo-xwin 依赖)。"; return 1
+        fi
+    fi
+    if ! command -v cargo-xwin >/dev/null 2>&1; then
+        err "未找到 cargo-xwin;请运行 'cargo install cargo-xwin'。"; return 1
+    fi
+    export XWIN_ACCEPT_LICENSE="${XWIN_ACCEPT_LICENSE:-1}"  # 接受微软 SDK/CRT 许可
+}
+
+# 统一 MSVC 构建入口:确保工具链就绪,并注入 +crt-static(静态链 MSVC 运行时,
+# 产物自包含,无需目标机装 VC++ 运行库)。RUSTFLAGS 仅作用于此次 cargo-xwin 调用,
+# 不污染本机 host 工具(gen_unigram 等 cargo run)的构建。
+cargo_xwin() {
+    setup_xwin_env || return 1
+    RUSTFLAGS="${RUSTFLAGS:-} -C target-feature=+crt-static" cargo xwin "$@"
+}
 
 # ---------- 构建 ----------
 do_build() {
@@ -110,9 +143,9 @@ do_build() {
     cd "$PROJECT_ROOT" || return 1
 
     if [ "$debug" = "debug" ]; then
-        cargo build --target "$TARGET" -p wind_service --features debug_variant || { err "构建失败!"; return 1; }
+        cargo_xwin build --target "$TARGET" -p wind_service --features debug_variant || { err "构建失败!"; return 1; }
     else
-        cargo build --release --target "$TARGET" -p wind_service || { err "构建失败!"; return 1; }
+        cargo_xwin build --release --target "$TARGET" -p wind_service || { err "构建失败!"; return 1; }
     fi
 
     mkdir -p "$outdir"
@@ -133,12 +166,13 @@ do_build() {
 
 do_check() {
     say "\n正在运行 cargo check ($TARGET, 全工作区)..."
-    cd "$PROJECT_ROOT" && cargo check --target "$TARGET" --workspace
+    cd "$PROJECT_ROOT" && cargo_xwin check --target "$TARGET" --workspace
 }
 
 do_clippy() {
     say "\n正在运行 cargo clippy ($TARGET, 全工作区)..."
-    cd "$PROJECT_ROOT" && cargo clippy --target "$TARGET" --workspace
+    # 注:暂不加 -D warnings(现存 ~36 个 warning 待并发会话稳定后单独清理)
+    cd "$PROJECT_ROOT" && cargo_xwin clippy --target "$TARGET" --workspace
 }
 
 do_test() {
@@ -391,12 +425,12 @@ do_push() {
     local exe exe_name
     if [ "$variant" = "debug" ]; then
         say "\n构建 debug 变体 (debug_variant)..."
-        cargo build --target "$TARGET" -p wind_service --features debug_variant || { err "构建失败"; return 1; }
+        cargo_xwin build --target "$TARGET" -p wind_service --features debug_variant || { err "构建失败"; return 1; }
         exe="$PROJECT_ROOT/target/$TARGET/debug/wind_input.exe"
         exe_name="wind_input_debug.exe"
     else
         say "\n构建 release..."
-        cargo build --release --target "$TARGET" -p wind_service || { err "构建失败"; return 1; }
+        cargo_xwin build --release --target "$TARGET" -p wind_service || { err "构建失败"; return 1; }
         exe="$PROJECT_ROOT/target/$TARGET/release/wind_input.exe"
         exe_name="wind_input.exe"
     fi

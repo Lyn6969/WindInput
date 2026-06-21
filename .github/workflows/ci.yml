@@ -18,19 +18,32 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: 安装 mingw-w64 (x86_64 + i686，TSF 交叉编译用)
-        run: sudo apt-get update && sudo apt-get install -y mingw-w64
+      # mingw-w64:C++ TSF DLL 用;clang/lld/llvm:cargo-xwin 交叉编 Rust(MSVC)用
+      - name: 安装 mingw-w64 + clang/lld/llvm
+        run: sudo apt-get update && sudo apt-get install -y mingw-w64 clang lld llvm
 
       - uses: dtolnay/rust-toolchain@stable
         with:
-          targets: x86_64-pc-windows-gnu
+          targets: x86_64-pc-windows-msvc
           components: rustfmt, clippy
+
+      - name: 安装 cargo-xwin
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-xwin
+
+      # 缓存 MSVC CRT/Windows SDK(xwin 首次下载约数百 MB)
+      - name: 缓存 xwin SDK
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/cargo-xwin
+          key: xwin-${{ runner.os }}-v1
 
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: wind_input
 
-      # fmt --check + clippy(win-gnu target) + test(本机)
+      # fmt --check + clippy(msvc target) + test(本机)
       - name: dev.sh ci
         run: ./scripts/dev.sh ci
 

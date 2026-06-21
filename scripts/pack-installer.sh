@@ -20,7 +20,7 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PRODUCT_ROOT="$(dirname "$SCRIPT_DIR")"            # WindInput/
-TARGET="x86_64-pc-windows-gnu"
+TARGET="x86_64-pc-windows-msvc"   # cargo-xwin 交叉编译 stub/uninstaller;packer 原生编
 
 # ---- 默认值 ----
 VERSION="${WIND_VERSION:-}"
@@ -77,11 +77,20 @@ if [[ ${#missing[@]} -gt 0 ]]; then
 fi
 [[ -d "$INSTALLER_DIR" ]] || { echo "[ERROR] 找不到 wind-installer: $INSTALLER_DIR" >&2; exit 1; }
 
-# ---- 编译安装器 stub(交叉)+ packer(原生)----
-echo ">>> 交叉编译 wind-installer stub + 原生 wind-packer ..."
+# ---- 编译安装器 stub(cargo-xwin/MSVC 交叉)+ packer(原生)----
+echo ">>> 交叉编译 wind-installer stub (cargo-xwin/MSVC) + 原生 wind-packer ..."
+# clang-cl 软链(cargo-xwin 需要;clang 改名调用,幂等)
+XWIN_BIN="$HOME/.local/xwin-bin"
+if ! command -v clang-cl >/dev/null 2>&1 && command -v clang >/dev/null 2>&1; then
+  mkdir -p "$XWIN_BIN"; ln -sf "$(command -v clang)" "$XWIN_BIN/clang-cl"
+  export PATH="$XWIN_BIN:$PATH"
+fi
+export XWIN_ACCEPT_LICENSE="${XWIN_ACCEPT_LICENSE:-1}"
 (
   cd "$INSTALLER_DIR"
-  cargo build --release --target "$TARGET" --bin wind-installer --bin wind-uninstaller
+  # stub/uninstaller 交叉编 MSVC(+crt-static 自包含);packer 原生编(纯 IO,跑在主机)
+  RUSTFLAGS="-C target-feature=+crt-static" \
+    cargo xwin build --release --target "$TARGET" --bin wind-installer --bin wind-uninstaller
   cargo build --release --bin wind-packer
 )
 
