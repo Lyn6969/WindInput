@@ -63,6 +63,14 @@ jobs:
             WindInput/wind_input
             wind-installer
 
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+
       # tag 为发布版本的唯一真值源；docs/VERSION 仅为开发占位。把 tag 版本写入
       # docs/VERSION，让下游(build.rs 资源版本 / dev.sh dist / pack-installer)统一取到。
       - name: 确定版本并写入 docs/VERSION

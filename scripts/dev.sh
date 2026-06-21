@@ -661,6 +661,8 @@ do_dist() {
         warn "未找到 clang++-$WIND_LLVM_VER；跳过 x86 TSF（32 位宿主将无输入法）。"
     fi
 
+    build_setting_exe "$outdir" || return 1
+
     # 正式数据(下载词库 + gen_unigram + assemble→编译 opencc octrie)
     do_gen_data "$outdir" || return 1
 
@@ -701,6 +703,20 @@ do_setting_build() {
     # Tauri 应用经 cargo-xwin 交叉编 MSVC(Windows 用 WebView2,无需 Linux GTK)
     ( cd src-tauri && cargo_xwin check --target "$TARGET" ) || { err "src-tauri 编译失败"; return 1; }
     gray "提示: Windows 安装包(bundle/installer)仍须在 Windows 上 'pnpm tauri build'。"
+}
+
+# 工具链缺失(pnpm/clang)→ 告警跳过(非致命，安装包则不含设置应用);构建失败→致命。
+build_setting_exe() {
+    local outdir="${1:-$BUILD_DIR}"
+    if ! command -v pnpm >/dev/null 2>&1 || ! command -v "clang-$WIND_LLVM_VER" >/dev/null 2>&1; then
+        return 0
+    fi
+    (
+        cd "$SETTING_DIR" || exit 1
+        [ -d node_modules ] || pnpm install || exit 1
+        pnpm build || exit 1
+        cd src-tauri && cargo_xwin build --release --target "$TARGET" || exit 1
+    [ -f "$exe" ] || { err "未找到产物: $exe"; return 1; }
 }
 
 #   all [debug]
