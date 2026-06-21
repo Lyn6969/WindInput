@@ -1477,6 +1477,48 @@ impl Coordinator {
         });
     }
 
+    /// 合成当前 IME 核心状态文本：方案/中英(+大写) · 标点 · [全角] · [繁]。
+    /// 默认态省略（半角/简体不显示），减少干扰；标点总显示（。/.）。
+    pub(crate) fn status_indicator_text(&self) -> String {
+        let (chinese, punct_cn, full, s2t, caps) = {
+            let s = self.state.lock().unwrap_or_else(|e| e.into_inner());
+            (
+                s.chinese_mode,
+                s.chinese_punct,
+                s.full_width,
+                s.s2t_enabled,
+                s.caps_lock,
+            )
+        };
+        let mut parts: Vec<String> = Vec::new();
+        // 方案 / 中英 / 大写锁定
+        if caps {
+            parts.push("A".into());
+        } else if !chinese {
+            parts.push("英".into());
+        } else {
+            let id = self.engine_mgr.active_schema_id();
+            let name = self.engine_mgr.schema_name(&id);
+            parts.push(if name.is_empty() { "中".into() } else { name });
+        }
+        // 标点（总显示）
+        parts.push(if punct_cn { "。".into() } else { ".".into() });
+        // 全角（仅全角时）
+        if full {
+            parts.push("全".into());
+        }
+        // 繁（仅繁体时）
+        if s2t {
+            parts.push("繁".into());
+        }
+        parts.join(" ")
+    }
+
+    /// 显示合成的核心状态气泡（中英/标点/全半角/简繁/方案切换共用）。
+    pub(crate) fn show_status(&self) {
+        self.show_tip(&self.status_indicator_text());
+    }
+
     /// 分发热键动作；返回是否已处理
     fn dispatch_hotkey(&self, action: &str) -> bool {
         match action {
@@ -1489,38 +1531,39 @@ impl Coordinator {
                 true
             }
             "toggle_full_width" => {
-                let full = {
+                {
                     let mut s = self.state.lock().unwrap_or_else(|e| e.into_inner());
                     s.full_width = !s.full_width;
-                    s.full_width
-                };
+                }
                 self.push_state_update();
-                self.show_tip(if full { "全角" } else { "半角" });
+                self.show_status();
                 self.notify_toolbar();
                 true
             }
             "toggle_punct" => {
-                let cn = {
+                {
                     let mut s = self.state.lock().unwrap_or_else(|e| e.into_inner());
                     s.chinese_punct = !s.chinese_punct;
-                    s.chinese_punct
-                };
+                }
                 self.push_state_update();
-                self.show_tip(if cn { "中文标点" } else { "英文标点" });
+                self.show_status();
                 self.notify_toolbar();
                 true
             }
             "toggle_s2t" => {
                 if self.s2t.lock().unwrap_or_else(|e| e.into_inner()).is_none() {
-                    self.show_tip("简繁数据缺失");
+                    self.show_toast(
+                        "简繁数据缺失",
+                        ToastPosition::BottomCenter,
+                        ToastKind::Error,
+                    );
                     return true;
                 }
-                let on = {
+                {
                     let mut s = self.state.lock().unwrap_or_else(|e| e.into_inner());
                     s.s2t_enabled = !s.s2t_enabled;
-                    s.s2t_enabled
-                };
-                self.show_tip(if on { "繁體" } else { "简体" });
+                }
+                self.show_status();
                 true
             }
             _ => {
@@ -2140,7 +2183,7 @@ impl MessageHandler for Coordinator {
         self.punct.lock().unwrap_or_else(|e| e.into_inner()).reset();
         self.disarm_smart_symbol();
         self.push_state_update();
-        self.show_tip(if chinese { "中" } else { "英" });
+        self.show_status();
         self.notify_toolbar();
         self.notify_ui_hide(); // 取消输入：隐藏候选窗
         (Some(self.build_status()), commit_text)

@@ -115,10 +115,11 @@ impl StatusTip {
     pub fn show(&mut self, text: &str, cx: i32, cy: i32, caret_h: i32, off_x: i32, off_y: i32) {
         self.ensure_scale(cx, cy);
         let s = self.scale;
-        // 单个 View 叶子即气泡：背景 + 圆角 + 内边距 + 居中文字
+        // 单个 View 叶子即气泡：背景 + 圆角 + 内边距 + 居中文字。
+        // 内边距收紧（原 18/10 偏大，对齐 Go 的紧凑气泡）。
         let mut tip = View::leaf(text, self.fg)
             .bg(self.bg)
-            .pad(Edges::xy(18.0 * s, 10.0 * s))
+            .pad(Edges::xy(10.0 * s, 5.0 * s))
             .text_align(Align::Center);
         // 边框（主题配了才描）。
         if let Some((bc, bw)) = self.border {
@@ -127,7 +128,7 @@ impl StatusTip {
         // 圆角：主题配置优先，否则随高度估算（字高 + 内边距）。
         tip.corner_radius = self
             .radius
-            .unwrap_or((self.renderer.measure_text("国").height + 20.0 * s) * 0.28);
+            .unwrap_or((self.renderer.measure_text("国").height + 10.0 * s) * 0.3);
         // 主题位图背景 + 层（jidian status 吃九宫格 panel + 角标水印）。
         if let Some(img) = &self.bg_image {
             tip = tip.bg_image(img.clone());
@@ -144,8 +145,8 @@ impl StatusTip {
             .unwrap_or((0, 0, 0, 0));
         tip.layout(ml as f32, mt as f32, &self.renderer);
         let (w_f, h_f) = tip.measured_size();
-        let cw = (w_f.ceil() as u32).max(48);
-        let ch = (h_f.ceil() as u32).max(36);
+        let cw = (w_f.ceil() as u32).max(32);
+        let ch = (h_f.ceil() as u32).max(24);
         let w = cw + ml + mr;
         let h = ch + mt + mb;
 
