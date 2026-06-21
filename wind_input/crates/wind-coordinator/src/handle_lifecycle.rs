@@ -30,7 +30,7 @@ impl Coordinator {
             .clone();
         let dark = *self.theme_dark.lock().unwrap_or_else(|e| e.into_inner());
         self.push_theme(&name, dark);
-        self.show_tip("已重载");
+        // 不再弹「已重载」气泡：热重载统一由 reload_user_config 的 toast 通知，避免重复。
     }
 
     /// 空缓冲模式激活的单一入口（对齐 key-pipeline.md §2.1 优先级链）。

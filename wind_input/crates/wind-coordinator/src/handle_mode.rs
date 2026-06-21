@@ -9,6 +9,7 @@ use tracing::{debug, info, warn};
 use wind_bridge::handler::KeyAction;
 use wind_config::Config;
 use wind_ui::manager::UiCommand;
+use wind_ui::toast::{ToastKind, ToastPosition};
 
 use crate::coordinator::{printable_char, punct_char};
 use wind_bridge::handler::KeyEventData;
@@ -212,7 +213,11 @@ impl Coordinator {
         let dir = match &self.opencc_dir {
             Some(d) => d.clone(),
             None => {
-                self.show_tip("简繁数据缺失");
+                self.show_toast(
+                    "简繁数据缺失",
+                    ToastPosition::BottomCenter,
+                    ToastKind::Error,
+                );
                 return;
             }
         };
@@ -231,7 +236,11 @@ impl Coordinator {
                 drop(s);
                 self.show_tip(label);
             }
-            None => self.show_tip("简繁数据缺失"),
+            None => self.show_toast(
+                "简繁数据缺失",
+                ToastPosition::BottomCenter,
+                ToastKind::Error,
+            ),
         }
     }
 
