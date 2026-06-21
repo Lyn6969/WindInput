@@ -51,3 +51,44 @@ jobs:
         run: |
           make -C wind_tsf VERSION="${GITHUB_SHA::8}"
           make -C wind_tsf x86 VERSION="${GITHUB_SHA::8}"
+
+  # 独立 job——工具链(Node/pnpm + cargo-xwin)与 core 不同,并行跑。
+  setting:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # clang/lld/llvm:Tauri(src-tauri)经 cargo-xwin 交叉编 MSVC(用 WebView2,无需 Linux GTK)
+      - name: 安装 clang/lld/llvm
+        run: sudo apt-get update && sudo apt-get install -y clang lld llvm
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+
+      - name: 安装 cargo-xwin
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-xwin
+
+      - name: 缓存 xwin SDK
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/cargo-xwin
+          key: xwin-${{ runner.os }}-v1
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+
+      # 前端 dist(vue-tsc + vite)+ src-tauri cargo-xwin check(MSVC)
+      - name: dev.sh setting
+        run: ./scripts/dev.sh setting

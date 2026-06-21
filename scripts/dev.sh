@@ -654,16 +654,17 @@ do_dist() {
 
 # ---------- 菜单 ----------
 
-# 注：Tauri 的 Windows 安装包须在 Windows 上 `pnpm tauri build` 产出；
-# Linux 这里只做「前端构建 + Rust 编译校验」，供交叉验证与 push-all 后在 Windows 构建。
+# 注：Tauri 的 Windows 安装包(bundle)须在 Windows 上 `pnpm tauri build` 产出；
+# Linux 这里只做「前端构建 + Rust 交叉编译校验」，供交叉验证与 push-all 后在 Windows 构建。
 do_setting_build() {
     cd "$SETTING_DIR" || return 1
     if [ ! -d node_modules ]; then
         pnpm install || { err "pnpm install 失败"; return 1; }
     fi
     pnpm build || { err "前端构建失败"; return 1; }
-    ( cd src-tauri && cargo check ) || { err "src-tauri 编译失败"; return 1; }
-    gray "提示: Windows 安装包请在 Windows 上 'pnpm tauri build'。"
+    # Tauri 应用经 cargo-xwin 交叉编 MSVC(Windows 用 WebView2,无需 Linux GTK)
+    ( cd src-tauri && cargo_xwin check --target "$TARGET" ) || { err "src-tauri 编译失败"; return 1; }
+    gray "提示: Windows 安装包(bundle/installer)仍须在 Windows 上 'pnpm tauri build'。"
 }
 
 #   all [debug]
