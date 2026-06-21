@@ -135,8 +135,25 @@ pub(crate) fn run_ctrl_server(endpoint: &str, state: Arc<DispatchState>) {
             return;
         }
     };
+    // 多 acceptor:同时保持多个监听实例,吸收设置应用加载时的并发 RPC 突发,
+    // 避免"同刻仅 1 监听实例 → 并发连接撞 ERROR_PIPE_BUSY(231)"。
+    const ACCEPTORS: usize = 4;
+    let name = std::sync::Arc::new(pipe_name_c);
+    for i in 1..ACCEPTORS {
+        let name = name.clone();
+        let state = state.clone();
+        std::thread::Builder::new()
+            .name(format!("rpc-ctrl-acc{i}"))
+            .spawn(move || ctrl_accept_loop(&name, state))
+            .ok();
+    }
+    ctrl_accept_loop(&name, state); // 本线程也跑一个 acceptor
+}
+
+/// 单个 acceptor 循环:建实例 → 等连接 → 起线程处理 → 立即建下一个实例继续监听。
+fn ctrl_accept_loop(pipe_name_c: &CString, state: Arc<DispatchState>) {
     loop {
-        let handle = match create_pipe_instance(&pipe_name_c) {
+        let handle = match create_pipe_instance(pipe_name_c) {
             Some(h) => h,
             None => continue,
         };
