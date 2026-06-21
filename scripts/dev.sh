@@ -5,47 +5,33 @@
 #   ./scripts/dev.sh            # 交互式菜单 (对齐 dev.ps1)
 #   ./scripts/dev.sh <命令>     # 非交互直调, 如 ./scripts/dev.sh release
 #
-# 本机 (Linux) 交叉编译为 Windows 可执行文件:
-#   - 目标 triple: x86_64-pc-windows-msvc (经 cargo-xwin;tier-1,+crt-static 自包含)
-#   - 依赖: cargo-xwin + clang + lld + llvm(C++ TSF DLL 另由 MinGW 构建)
-#   - 产物: target/<target>/<profile>/wind_input.exe
-#   - build/check/clippy 走 Windows 目标; test 在本机跑 (Windows 代码在 cfg(windows) 后)
+# 本机 (Linux) 交叉编译为 Windows (MSVC) 可执行文件:
+#   - C++ TSF: clang + lld-link + llvm-rc + cargo-xwin 的 MSVC SDK (x64 + x86)
+#   - 依赖: cargo-xwin + clang-19/lld-19/llvm-19 (MSVC STL 要 clang≥19) + pnpm/node(Tauri)
+#   - 全构建产物落【项目根】build/(release) 或 build_debug/(debug)，内容 == 安装内容
 #
-# 命令列表 (与菜单一一对应):
-#   release | 1     Release 构建 + 部署
-#   debug   | 1d    Debug 构建 + 部署 (dev profile + debug_variant 特性)
-#   check   | 2     cargo check (Windows 目标, 全工作区)
-#   clippy  | 3     cargo clippy (Windows 目标, 全工作区)
-#   test    | 4     cargo test (本机, 全工作区)
-#   dist    | d     构建完整发布目录 (release exe + x64/x86 TSF + 正式词库 → build/)
-#   installer | pack | 8   一键生成安装包 (dist + pack-installer → Setup.exe)
-#   installer-skip | 8s    生成安装包但跳过编译 (直接打包现有 build/)
-#   deploy  | 5     完整部署 (复制 DLL + data)
-#   tsf     | 6     构建 C++ TSF DLL (clang/MSVC 交叉编译; tsf debug → 调试变体)
-#   data    | 7     组装 data/（data/ 源 + .cache/ 下载 → build_debug/data/）
-#   fmt     | f     cargo fmt
-#   fmt-check       cargo fmt --check (CI 用)
-#   clean   | c     cargo clean
-#   ci              fmt-check + clippy + test (提交前一把过)
+# 命令（菜单与命令行直调同一套；前缀 d=debug, p=push, m=单模块）:
+#   d1           Debug 全构建 → build_debug/
+#   m1 / dm1     仅 tsf (x64+x86)            release / debug
+#   m2 / dm2     仅 wind_input (核心 exe)     release / debug
+#   8            生成安装包 (= 1 + 打包 → Setup.exe + sha256)
+#   8s           跳过编译，直接打包现有 build/
+#   p1 / pd1     push 全部 build[_debug]/ → Windows 安装目录 (release / debug)
+#   pm1/pm2/pm3      push 单模块 (tsf/核心/设置, release)
+#   pdm1/pdm2/pdm3   push 单模块 (debug)
+#   k=check  l=clippy  t=test  f=fmt  fmt-check  ci(=fmt+clippy+test)  clean
+#   gd=gen-data  r=repl  dl=pull-data  pc=pull-config  pl=pull-log(pla=全部)
 #
-# 实测 / 远程部署（SSH；配置见 scripts/deploy.local: WIND_REMOTE / WIND_REMOTE_DIR）:
-#   repl [data]     本机跑候选 REPL（无需 TSF/UI；读编码→打印候选）
-#   push [debug] [data]  交叉编译 exe 并 drop-in 到 Windows 安装目录（复用其 TSF DLL+大词库）；
-#                   debug → 构建 debug_variant 并推为 wind_input_debug.exe；先 taskkill 远程进程再覆盖；
-#                   data  → exe 推完再推源 data/（manifest/方案/主题），随手同步免遗漏
-#                   到 Windows，再在 Windows 上 'pnpm install && pnpm tauri build/dev' 跑整套; pad=debug
-#                   需 deploy.local 配 WIND_REMOTE_SETTING_DIR + 远端 rsync
-#   push-data       仅推送源 data/（manifest/方案/主题/默认配置）到 Windows，不重编 exe
-#   pull-data       从 Windows 安装目录拉 data/（真实词库）到 .cache/pulled-data/ 供 REPL 使用
-#   pull-config     从 Windows 拉 config.toml（%APPDATA%\<App>）到 .remote/ 查看
-#   pull-log [all]  从 Windows 拉日志（%LOCALAPPDATA%\<App>\logs）到 .remote/；
-#                   默认仅最新一天，all 拉整目录（需 deploy.local 配 WIND_DATA_DIR/WIND_LOCAL_DIR）
-#   gen-data        下载外部词库到 .cache/ + 组装 build_debug/data/
+# 部署配置 scripts/deploy.local（SSH 推送到 Windows 实测机）:
+#   WIND_REMOTE              = user@host             # SSH 目标
+#   WIND_REMOTE_DIR_RELEASE  = C:/.../WindInput      # p1 全量/ pm* 推送目录
+#   WIND_REMOTE_DIR_DEBUG    = C:/.../WindInputDebug  # pd1 / pdm* 推送目录
+#   WIND_DATA_DIR / WIND_LOCAL_DIR  = %APPDATA% / %LOCALAPPDATA%\<App>  # pull-config/log 用
 #
 # 数据目录说明：
 #   data/           源文件（入库）：配置、五笔词库、主题等手工维护文件
-#   .cache/         外部下载/生成（gitignore）：rime-frost、opencc、unigram 等
-#   build_debug/data/ 完整运行时数据（由 assemble_data 从 data/ + .cache/ 合并）
+#   .cache/         外部下载/生成（gitignore）：rime-frost、opencc、unigram、tsf-obj 等
+#   build/ build_debug/  全构建产物（gitignore）；内容即安装到 Program Files 的内容
 #
 # 推荐实测流程：① gen-data 下载+组装词库 → ② repl 在 Linux 验证候选逻辑
 #               ③ push 把 exe drop-in 到 Windows → 重启服务做应用内实测
@@ -60,34 +46,38 @@ set -o pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PRODUCT_ROOT="$(dirname "$SCRIPT_DIR")"
 PROJECT_ROOT="$PRODUCT_ROOT/wind_input"
-# C++ TSF 核心层（MinGW 交叉编译，见 wind_tsf/Makefile）
+# C++ TSF 核心层（clang/MSVC 交叉编译，见 wind_tsf/Makefile）
 TSF_DIR="$PRODUCT_ROOT/wind_tsf"
 VERSION="$(tr -d '[:space:]' < "$PRODUCT_ROOT/docs/VERSION" 2>/dev/null || echo '?')"
-BUILD_DIR="$PROJECT_ROOT/build"
-BUILD_DEBUG_DIR="$PROJECT_ROOT/build_debug"
+# 发布产物目录在【项目根】（内容 == 安装到 Program Files 的内容，无中间产物）
+BUILD_DIR="$PRODUCT_ROOT/build"
+BUILD_DEBUG_DIR="$PRODUCT_ROOT/build_debug"
 # 外部下载/生成的词库缓存目录（不入库）
 CACHE_DIR="$PRODUCT_ROOT/.cache"
 # Rust 工具链根目录（wind_input/ workspace）
 RUST_WORKSPACE="$PRODUCT_ROOT/wind_input"
 
 # 远程 Windows 测试机配置（SSH）。在 scripts/deploy.local 或环境变量中设置：
-#   WIND_REMOTE      = user@host           （SSH 目标）
-#   WIND_REMOTE_DIR  = Windows 安装目录     （含 wind_input.exe；用 scp 正斜杠风格，
-#                      如 'C:/Users/me/AppData/Local/Programs/WindInput'；调试时指向 WindInputDebug 安装目录）
+#   WIND_REMOTE              = user@host          （SSH 目标）
+#   WIND_REMOTE_DIR_RELEASE  = release 安装目录    （p1/pm* 推送目标；scp 正斜杠风格，
+#                              如 'C:/Users/me/AppData/Local/Programs/WindInput'）
+#   WIND_REMOTE_DIR_DEBUG    = debug 安装目录      （pd1/pdm* 推送目标，如 .../WindInputDebug）
 [ -f "$SCRIPT_DIR/deploy.local" ] && . "$SCRIPT_DIR/deploy.local"
 WIND_REMOTE="${WIND_REMOTE:-}"
-WIND_REMOTE_DIR="${WIND_REMOTE_DIR:-}"
+WIND_REMOTE_DIR_RELEASE="${WIND_REMOTE_DIR_RELEASE:-}"
+WIND_REMOTE_DIR_DEBUG="${WIND_REMOTE_DIR_DEBUG:-}"
+WIND_REMOTE_DIR="${WIND_REMOTE_DIR:-}"   # 兼容旧配置：未设 _RELEASE 时作 release 回退
 # 远程数据/本地目录（拉配置、拉日志用；见 deploy.local 注释）：
 #   WIND_DATA_DIR   = %APPDATA%\<App>        含 config.toml（用户配置）
 #   WIND_LOCAL_DIR  = %LOCALAPPDATA%\<App>   含 logs/（服务日志）、cache/
 WIND_DATA_DIR="${WIND_DATA_DIR:-}"
 WIND_LOCAL_DIR="${WIND_LOCAL_DIR:-}"
-WIND_REMOTE_SETTING_DIR="${WIND_REMOTE_SETTING_DIR:-}"
 # 从远程拉取的配置/日志落地处（本地查看用，不入库）
 REMOTE_PULL_DIR="$PRODUCT_ROOT/.remote"
+REMOTE_DIR=""   # 由 resolve_remote_dir 按 profile 填充
 
 # Rust 交叉编译目标:MSVC(经 cargo-xwin 在 Linux 上交叉编,tier-1 目标)。
-# 注:C++ TSF DLL 仍由 MinGW 构建(见 wind_tsf/Makefile),与本目标无关。
+# C++ TSF DLL 也走 MSVC(clang + xwin SDK,见 wind_tsf/Makefile),整链统一。
 TARGET="x86_64-pc-windows-msvc"
 
 # ---------- 颜色 ----------
@@ -141,39 +131,29 @@ cargo_xwin() {
     RUSTFLAGS="${RUSTFLAGS:-} -C target-feature=+crt-static" cargo xwin "$@"
 }
 
-# ---------- 构建 ----------
-do_build() {
-    local debug="${1:-}"
-    local profile outdir suffix bindir
-    if [ "$debug" = "debug" ]; then
-        profile="debug"; outdir="$BUILD_DEBUG_DIR"; suffix="_debug"; bindir="debug"
-    else
-        profile="release"; outdir="$BUILD_DIR"; suffix=""; bindir="release"
-    fi
+# ---------- 构建（单模块 + 全构建）----------
+# 输出目录：release → BUILD_DIR；debug → BUILD_DEBUG_DIR。
+out_for() { [ "${1:-release}" = debug ] && echo "$BUILD_DEBUG_DIR" || echo "$BUILD_DIR"; }
 
-    say "\n正在交叉编译 ($profile, $TARGET)..."
-    cd "$PROJECT_ROOT" || return 1
-
-    if [ "$debug" = "debug" ]; then
-        cargo_xwin build --target "$TARGET" -p wind_service --features debug_variant || { err "构建失败!"; return 1; }
-    else
-        cargo_xwin build --release --target "$TARGET" -p wind_service || { err "构建失败!"; return 1; }
-    fi
-
+# 模块一：wind_input 核心 exe（debug = dev profile + debug_variant 特性）
+build_core() {
+    local profile="${1:-release}" outdir="${2:-$(out_for "$1")}"
     mkdir -p "$outdir"
-
-    local src_exe="$PROJECT_ROOT/target/$TARGET/$bindir/wind_input.exe"
-    local dst_exe="$outdir/wind_input${suffix}.exe"
-    if [ -f "$src_exe" ]; then
-        cp -f "$src_exe" "$dst_exe"
-        gray "已复制: wind_input${suffix}.exe ($(du -h "$dst_exe" | cut -f1))"
+    cd "$PROJECT_ROOT" || return 1
+    say "\n[core] 交叉编译 wind_input ($profile, $TARGET)..."
+    if [ "$profile" = debug ]; then
+        cargo_xwin build --target "$TARGET" -p wind_service --features debug_variant \
+            || { err "wind_input 构建失败!"; return 1; }
     else
-        warn "未找到产物: $src_exe"
+        cargo_xwin build --release --target "$TARGET" -p wind_service \
+            || { err "wind_input 构建失败!"; return 1; }
     fi
-
-    build_tsf "$outdir" "$debug"
-    copy_data "$outdir"
-    say "构建完成! -> $outdir"
+    local bindir suffix
+    [ "$profile" = debug ] && { bindir="debug"; suffix="_debug"; } || { bindir="release"; suffix=""; }
+    local src="$PROJECT_ROOT/target/$TARGET/$bindir/wind_input.exe"
+    [ -f "$src" ] || { err "未找到产物: $src"; return 1; }
+    cp -f "$src" "$outdir/wind_input${suffix}.exe"
+    gray "已构建: wind_input${suffix}.exe ($(du -h "$outdir/wind_input${suffix}.exe" | cut -f1))"
 }
 
 do_check() {
@@ -215,40 +195,31 @@ do_ci() {
     say "\nCI 全部通过 ✓"
 }
 
-# ---------- 部署 ----------
-# 构建 C++ TSF 核心层（MinGW 交叉编译）并复制到输出目录。
-#   $1 outdir（默认 build/）  $2 = "debug" → 调试变体 wind_tsf_debug.dll
-build_tsf() {
-    local outdir="${1:-$BUILD_DIR}"
-    local debug="${2:-}"
+# 模块二：C++ TSF DLL（x64 + x86；clang/MSVC 交叉编译）。
+# obj 中间产物落 .cache，保持 outdir 干净（== 安装内容）。debug → _debug 后缀。
+build_tsf_all() {
+    local profile="${1:-release}" outdir="${2:-$(out_for "$1")}"
     mkdir -p "$outdir"
-
     if ! command -v "clang++-$WIND_LLVM_VER" >/dev/null 2>&1; then
-        warn "未找到 clang++-$WIND_LLVM_VER（C++ TSF 经 clang/MSVC 交叉编译，需 clang≥19）；跳过 TSF 构建。"
-        gray "  安装 clang-$WIND_LLVM_VER lld-$WIND_LLVM_VER llvm-$WIND_LLVM_VER 后可构建；'push' 经 SSH 也可复用 Windows 已有 DLL。"
+        warn "未找到 clang++-$WIND_LLVM_VER（C++ TSF 需 clang≥19）；跳过 TSF。"
+        gray "  安装 clang-$WIND_LLVM_VER lld-$WIND_LLVM_VER llvm-$WIND_LLVM_VER 后可构建。"
         return 0
     fi
     if [ ! -d "$HOME/.cache/cargo-xwin/xwin/sdk" ]; then
-        warn "未找到 cargo-xwin 的 MSVC SDK 缓存；请先跑一次 'dev.sh release/dist'（会下载 SDK）。跳过 TSF。"
+        warn "未找到 MSVC SDK 缓存；请先跑一次完整构建（cargo-xwin 会下载 SDK）。跳过 TSF。"
         return 0
     fi
-
-    local mk_args dll
-    if [ "$debug" = "debug" ]; then
-        mk_args="DEBUG_VARIANT=1"; dll="wind_tsf_debug.dll"
-    else
-        mk_args=""; dll="wind_tsf.dll"
-    fi
-
-    say "\n正在交叉编译 TSF DLL ($dll, clang-$WIND_LLVM_VER/MSVC)..."
-    # 让 make 直接输出到目标目录，避免二次复制；CLANG/LLVM_RC 跟随 WIND_LLVM_VER
-    if make -C "$TSF_DIR" $mk_args VERSION="$VERSION" OUTDIR="$outdir" \
-         CLANG="clang++-$WIND_LLVM_VER" LLVM_RC="llvm-rc-$WIND_LLVM_VER" >/dev/null; then
-        gray "已构建: $dll ($(du -h "$outdir/$dll" 2>/dev/null | cut -f1))"
-    else
-        err "TSF DLL 构建失败！见 'make -C $TSF_DIR $mk_args' 输出。"
-        return 1
-    fi
+    local dv=0; [ "$profile" = debug ] && dv=1
+    local objbase="$CACHE_DIR/tsf-obj"
+    say "\n[tsf] 交叉编译 x64 + x86 ($profile, clang-$WIND_LLVM_VER/MSVC)..."
+    local a objsfx; [ "$dv" = 1 ] && objsfx="d" || objsfx=""
+    for a in x64 x86; do
+        make -C "$TSF_DIR" ARCH="$a" DEBUG_VARIANT="$dv" VERSION="$VERSION" OUTDIR="$outdir" \
+             OBJDIR="$objbase/$a$objsfx" \
+             CLANG="clang++-$WIND_LLVM_VER" LLVM_RC="llvm-rc-$WIND_LLVM_VER" >/dev/null \
+          || { err "TSF $a 构建失败！见 'make -C $TSF_DIR ARCH=$a' 输出。"; return 1; }
+    done
+    gray "已构建: $(cd "$outdir" && ls wind_tsf*.dll 2>/dev/null | tr '\n' ' ')"
 }
 
 # ---------- 词库下载 ----------
@@ -374,27 +345,6 @@ assemble_data() {
     gray "data/ 组装完成 ($(find "$data" -type f | wc -l) 文件)"
 }
 
-# 组装 data/ 到指定输出目录。
-# 优先从 data/ + .cache/ 本地组装；若 .cache/ 尚未下载，回退到 Go 构建产物。
-copy_data() {
-    local outdir="${1:-$BUILD_DIR}"
-    local cache_probe="$CACHE_DIR/rime-frost/cn_dicts/base.dict.yaml"
-
-    if [ -f "$cache_probe" ]; then
-        assemble_data "$outdir"
-    else
-        warn "找不到词典数据；请运行 'gen-data' 下载词库，或 'pull-data' 从 Windows 拉取"
-    fi
-}
-
-deploy_all() {
-    local outdir="${1:-$BUILD_DIR}"
-    mkdir -p "$outdir"
-    build_tsf "$outdir"
-    copy_data "$outdir"
-    say "部署完成! -> $outdir"
-}
-
 # ---------- 实测 / 远程部署（SSH）----------
 
 # 本机跑候选 REPL。data 目录优先 build_debug/data/，其次 .cache/pulled-data/。
@@ -416,88 +366,99 @@ do_repl() {
 }
 
 require_remote() {
-    if [ -z "$WIND_REMOTE" ] || [ -z "$WIND_REMOTE_DIR" ]; then
-        err "未配置远程：请在 $SCRIPT_DIR/deploy.local 设置 WIND_REMOTE 与 WIND_REMOTE_DIR"
-        echo "  示例: WIND_REMOTE=me@192.168.1.10"
-        echo "        WIND_REMOTE_DIR='C:/Users/me/AppData/Local/Programs/WindInput'"
+    if [ -z "$WIND_REMOTE" ]; then
+        err "未配置 WIND_REMOTE：请在 $SCRIPT_DIR/deploy.local 设置 SSH 目标"
+        echo "  示例: WIND_REMOTE=me@192.168.5.30"
         return 1
     fi
 }
 
-# drop-in：把交叉编译的 exe 推到 Windows 安装目录。
-# 参数（顺序无关，可组合）：
-#   debug  → 构建 debug_variant 并推为 wind_input_debug.exe（缺省推 release）
-#   data   → exe 推送后，额外推送源 data/（manifest/方案/主题等；见 do_push_data）
-do_push() {
-    require_remote || return 1
-    cd "$PROJECT_ROOT" || return 1
-    local variant="" push_data=""
-    local a
-    for a in "$@"; do
-        case "$a" in
-            debug) variant="debug" ;;
-            data)  push_data="1" ;;
-        esac
+# 解析远端安装目录（按 profile）。结果写入全局 REMOTE_DIR。
+#   release → WIND_REMOTE_DIR_RELEASE（兼容旧 WIND_REMOTE_DIR）
+#   debug   → WIND_REMOTE_DIR_DEBUG
+resolve_remote_dir() {
+    local profile="${1:-release}"
+    if [ "$profile" = debug ]; then
+        REMOTE_DIR="${WIND_REMOTE_DIR_DEBUG:-}"
+        [ -n "$REMOTE_DIR" ] || { err "未配置 WIND_REMOTE_DIR_DEBUG（deploy.local）"; return 1; }
+    else
+        REMOTE_DIR="${WIND_REMOTE_DIR_RELEASE:-${WIND_REMOTE_DIR:-}}"
+        [ -n "$REMOTE_DIR" ] || { err "未配置 WIND_REMOTE_DIR_RELEASE（deploy.local）"; return 1; }
+    fi
+}
+
+# 终止远端进程（按 profile 决定 _debug 后缀；mod 限定只杀该模块的进程）。
+remote_taskkill() {
+    local profile="$1" mod="${2:-}" sfx=""
+    [ "$profile" = debug ] && sfx="_debug"
+    local procs=()
+    case "$mod" in
+        core)    procs=("wind_input${sfx}.exe") ;;
+    esac
+    local p
+    for p in "${procs[@]}"; do
+        ssh "$WIND_REMOTE" "taskkill /F /IM $p" >/dev/null 2>&1 || true
     done
-    local exe exe_name
-    if [ "$variant" = "debug" ]; then
-        say "\n构建 debug 变体 (debug_variant)..."
-        cargo_xwin build --target "$TARGET" -p wind_service --features debug_variant || { err "构建失败"; return 1; }
-        exe="$PROJECT_ROOT/target/$TARGET/debug/wind_input.exe"
-        exe_name="wind_input_debug.exe"
-    else
-        say "\n构建 release..."
-        cargo_xwin build --release --target "$TARGET" -p wind_service || { err "构建失败"; return 1; }
-        exe="$PROJECT_ROOT/target/$TARGET/release/wind_input.exe"
-        exe_name="wind_input.exe"
-    fi
-    [ -f "$exe" ] || { err "未找到产物: $exe"; return 1; }
-
-    say "停止远程 $exe_name..."
-    ssh "$WIND_REMOTE" "taskkill /F /IM $exe_name" >/dev/null 2>&1 || true
     sleep 1
-
-    say "推送 $exe_name → $WIND_REMOTE:$WIND_REMOTE_DIR/"
-    if scp "$exe" "$WIND_REMOTE:$WIND_REMOTE_DIR/$exe_name"; then
-        say "已推送 exe。"
-    else
-        err "scp 失败：检查 WIND_REMOTE_DIR 路径(正斜杠 C:/...)、SSH 连通、文件是否仍被占用"
-        return 1
-    fi
-
-    # 可选：连源 data/ 一并推送（manifest/方案/主题改动随 exe 一起上去）
-    if [ -n "$push_data" ]; then
-        do_push_data || return 1
-    fi
-    say "完成。请在 Windows 桌面重启 $exe_name。"
 }
 
-# 推送源 data/（$PRODUCT_ROOT/data：manifest/方案 toml/主题/默认配置/短语）到 Windows 安装目录的 data/。
-# 仅覆盖同名文件、新增缺失文件（scp 合并语义，不删除）——远端组装的大词库（拼音/opencc/unigram，
-# 由 .cache 组装、不在源 data/）不受影响。适合改完 manifest/schema/theme 后单独同步，无需重编 exe。
-do_push_data() {
+# 全量 push：把整个 build[_debug]/ 覆盖到远端安装目录（= 干净安装内容）。
+#   p1 / pd1
+do_push_full() {
+    local profile="${1:-release}"
     require_remote || return 1
-    local src="$PRODUCT_ROOT/data"
-    [ -d "$src" ] || { err "源 data/ 不存在: $src"; return 1; }
-    say "\n推送源 data/ → $WIND_REMOTE:$WIND_REMOTE_DIR/data/ ($(du -sh "$src" 2>/dev/null | cut -f1))"
-    # 推送 data/ 内容（用 /* 推内容而非目录本身，避免 scp 生成 data/data 嵌套）。
-    # 远端 data/ 已随安装存在；若不存在 scp 会明确报错（按提示先做一次完整 deploy）。
-    if scp -r "$src"/* "$WIND_REMOTE:$WIND_REMOTE_DIR/data/"; then
-        say "已推送源 data/（远端大词库未触碰）。manifest 改动重启或「重载配置」后生效。"
+    resolve_remote_dir "$profile" || return 1
+    local outdir; outdir="$(out_for "$profile")"
+    [ -d "$outdir" ] || { err "无 $outdir；请先 '$([ "$profile" = debug ] && echo d1 || echo 1)' 全构建。"; return 1; }
+    say "\n停止远端进程（$profile）..."
+    remote_taskkill "$profile"
+    say "全量推送 $outdir/ → $WIND_REMOTE:$REMOTE_DIR/"
+    ssh "$WIND_REMOTE" "if not exist \"$REMOTE_DIR\" mkdir \"$REMOTE_DIR\"" >/dev/null 2>&1 || true
+    if scp -r "$outdir"/* "$WIND_REMOTE:$REMOTE_DIR/"; then
+        say "已全量推送（$profile）。请在 Windows 重启输入法。"
     else
-        err "scp data 失败：检查 WIND_REMOTE_DIR/data 路径、SSH、文件占用"
+        err "scp 失败：检查 $([ "$profile" = debug ] && echo WIND_REMOTE_DIR_DEBUG || echo WIND_REMOTE_DIR_RELEASE) 路径(正斜杠)、SSH、文件占用"
         return 1
     fi
+}
+
+# 单模块 push：只推对应文件（不重编，用现有 build[_debug]/ 产物）。
+#   pm1=tsf  pm2=core  pm3=setting （pd 前缀 = debug）
+do_push_module() {
+    local profile="${1:-release}" mod="$2"
+    require_remote || return 1
+    resolve_remote_dir "$profile" || return 1
+    local outdir; outdir="$(out_for "$profile")"
+    local sfx=""; [ "$profile" = debug ] && sfx="_debug"
+    local files=()
+    case "$mod" in
+        tsf)     files=("wind_tsf${sfx}.dll" "wind_tsf_x86${sfx}.dll") ;;
+        core)    files=("wind_input${sfx}.exe") ;;
+        *)       err "未知模块: $mod（tsf|core|setting）"; return 1 ;;
+    esac
+    say "\n停止远端进程（$profile/$mod）..."
+    remote_taskkill "$profile" "$mod"
+    local f ok=1
+    for f in "${files[@]}"; do
+        if [ -f "$outdir/$f" ]; then
+            say "推送 $f → $REMOTE_DIR/"
+            scp "$outdir/$f" "$WIND_REMOTE:$REMOTE_DIR/$f" || { err "scp $f 失败"; ok=0; }
+        else
+            warn "本地无 $outdir/$f（先构建对应模块）"; ok=0
+        fi
+    done
+    [ "$ok" = 1 ] && say "模块推送完成（$profile/$mod）。请在 Windows 重启输入法。"
 }
 
 # 从 Windows 安装目录拉取已处理的 data/（含真实词库）到 .cache/pulled-data/ 供 REPL 使用。
 do_pull_data() {
     require_remote || return 1
+    resolve_remote_dir "${1:-release}" || return 1
     local dst="$CACHE_DIR/pulled-data"
-    say "\n拉取 data/ ← $WIND_REMOTE:$WIND_REMOTE_DIR/data  →  $dst"
+    say "\n拉取 data/ ← $WIND_REMOTE:$REMOTE_DIR/data  →  $dst"
     rm -rf "$dst"
     mkdir -p "$CACHE_DIR"
-    if scp -r "$WIND_REMOTE:$WIND_REMOTE_DIR/data" "$dst"; then
+    if scp -r "$WIND_REMOTE:$REMOTE_DIR/data" "$dst"; then
         say "已拉取 → $dst"
         say "提示: REPL 会自动使用此词库，或用 './dev.sh repl $dst' 显式指定"
     else
@@ -639,42 +600,24 @@ verify_dist_data() {
     say "发布数据校验通过 ✓"
 }
 
-# ---------- 发布:产出完整可打包目录(exe + x64/x86 TSF + data)----------
-# 全部产物落到 BUILD_DIR(wind_input/build/),供 scripts/pack-installer.sh 打包。
-do_dist() {
-    local outdir="$BUILD_DIR"
-    say "\n=== 构建发布目录 → $outdir ==="
-
-    do_build || return 1                    # release exe + x64 TSF + copy_data
-
-    # x86 TSF（32 位宿主程序兼容；同一 clang 用 --target=i686 交叉编，x86 SDK 由
-    # cargo-xwin 按 XWIN_ARCH=x86,x86_64 splat，已在上面 do_build 的 cargo_xwin 触发）
-    if command -v "clang++-$WIND_LLVM_VER" >/dev/null 2>&1; then
-        say "\n交叉编译 x86 TSF DLL (wind_tsf_x86.dll, clang-$WIND_LLVM_VER/MSVC)..."
-        if make -C "$TSF_DIR" x86 VERSION="$VERSION" OUTDIR="$outdir" \
-             CLANG="clang++-$WIND_LLVM_VER" LLVM_RC="llvm-rc-$WIND_LLVM_VER" >/dev/null; then
-            gray "已构建: wind_tsf_x86.dll ($(du -h "$outdir/wind_tsf_x86.dll" 2>/dev/null | cut -f1))"
-        else
-            err "x86 TSF 构建失败！见 'make -C $TSF_DIR x86' 输出。"; return 1
-        fi
-    else
-        warn "未找到 clang++-$WIND_LLVM_VER；跳过 x86 TSF（32 位宿主将无输入法）。"
-    fi
-
-    build_setting_exe "$outdir" || return 1
-
-    # 正式数据(下载词库 + gen_unigram + assemble→编译 opencc octrie)
-    do_gen_data "$outdir" || return 1
-
-    # 发布硬门禁:词库/模型任一缺失即失败,防止打出残缺安装器
-    verify_dist_data "$outdir" || return 1
-
-    say "\n发布目录就绪 → $outdir"
-    say "  打包: scripts/dev.sh installer（或 scripts/pack-installer.sh --version $VERSION）"
+# ---------- 全构建（1 / d1）----------
+# 全部模块 + 数据落到【项目根】build/(release) 或 build_debug/(debug)。
+# 先清空输出目录，确保内容 == 安装到 Program Files 的内容，无任何中间产物。
+#   do_full [release|debug]
+do_full() {
+    local profile="${1:-release}" outdir; outdir="$(out_for "$profile")"
+    say "\n========== 全构建 ($profile) → $outdir =========="
+    rm -rf "$outdir"; mkdir -p "$outdir"
+    build_core    "$profile" "$outdir" || return 1   # wind_input[_debug].exe
+    build_tsf_all "$profile" "$outdir" || return 1   # wind_tsf[_x86][_debug].dll
+    do_gen_data   "$outdir"            || return 1   # data/(下载词库 + unigram/pinyin + opencc)
+    verify_dist_data "$outdir"         || return 1   # 硬门禁:词库/模型完整
+    say "\n========== 全构建完成 ($profile) → $outdir =========="
+    gray "内容即安装到 Program Files 的内容（无中间产物）；打包: dev.sh installer"
 }
 
-# ---------- 一键生成安装包 ----------
-# do_dist（完整构建 exe + x64/x86 TSF + 正式 data）→ pack-installer.sh 出自解压 Setup.exe。
+# ---------- 一键生成安装包（8 / 8s）----------
+# do_full release → pack-installer.sh 出自解压 Setup.exe + sha256。
 #   installer        完整重建 + 打包（对应 Go dev.ps1 的 8）
 #   installer skip   跳过重建，直接打包现有 build/（对应 8s）
 do_installer() {
@@ -682,9 +625,9 @@ do_installer() {
     if [ "$skip" = "skip" ]; then
         say "\n跳过构建，直接打包现有 $BUILD_DIR/"
         [ -f "$BUILD_DIR/wind_input.exe" ] || {
-            err "build/ 无产物；请先运行 'dev.sh installer'（不带 skip）或 'dev.sh dist'。"; return 1; }
+            err "build/ 无产物；请先运行 'dev.sh installer'（不带 skip）或 'dev.sh 1'。"; return 1; }
     else
-        do_dist || return 1
+        do_full release || return 1
     fi
     say "\n=== 打包安装程序 ==="
     "$SCRIPT_DIR/pack-installer.sh" --version "$VERSION" || return 1
@@ -705,178 +648,122 @@ do_setting_build() {
     gray "提示: Windows 安装包(bundle/installer)仍须在 Windows 上 'pnpm tauri build'。"
 }
 
-# 工具链缺失(pnpm/clang)→ 告警跳过(非致命，安装包则不含设置应用);构建失败→致命。
-build_setting_exe() {
-    local outdir="${1:-$BUILD_DIR}"
+# debug = dev profile + debug_variant 特性（管道后缀 _debug，连调试核心）。
+# 工具链缺失(pnpm/clang)→ 告警跳过(非致命);构建失败→致命。
+build_setting() {
+    local profile="${1:-release}" outdir="${2:-$(out_for "$1")}"
     if ! command -v pnpm >/dev/null 2>&1 || ! command -v "clang-$WIND_LLVM_VER" >/dev/null 2>&1; then
         return 0
     fi
+    local bindir suffix
+    [ "$profile" = debug ] && { bindir="debug"; suffix="_debug"; } || { bindir="release"; suffix=""; }
     (
         cd "$SETTING_DIR" || exit 1
         [ -d node_modules ] || pnpm install || exit 1
         pnpm build || exit 1
-        cd src-tauri && cargo_xwin build --release --target "$TARGET" || exit 1
+        cd src-tauri || exit 1
+        if [ "$profile" = debug ]; then
+            cargo_xwin build --target "$TARGET" --features debug_variant || exit 1
+        else
+            cargo_xwin build --release --target "$TARGET" || exit 1
+        fi
     [ -f "$exe" ] || { err "未找到产物: $exe"; return 1; }
-}
-
-#   all [debug]
-do_all() {
-    local debug="${1:-}"
-    say "\n========== 一键全编译 (${debug:-release}) =========="
-    do_build "$debug" || return 1
-    do_setting_build || return 1
-    say "\n========== 全部完成 =========="
-}
-
-#   push-all [debug]
-do_push_all() {
-    require_remote || return 1
-    local debug="${1:-}"
-    # 1) core exe + 源 data/
-    if [ "$debug" = "debug" ]; then
-        do_push debug data || return 1
-    else
-        do_push "" data || return 1
-    fi
-    if [ -z "$WIND_REMOTE_SETTING_DIR" ]; then
-        return 0
-    fi
-    if ! command -v rsync >/dev/null 2>&1; then
-        return 1
-    fi
-    if rsync -az --delete \
-        --exclude node_modules --exclude dist --exclude 'src-tauri/target' \
-        --exclude 'src-tauri/gen' --exclude .git \
-        -e ssh "$SETTING_DIR"/ "$WIND_REMOTE:$WIND_REMOTE_SETTING_DIR/"; then
-        say "请在 Windows: cd $WIND_REMOTE_SETTING_DIR && pnpm install && pnpm tauri build (或 pnpm tauri dev)。"
-    else
-        err "rsync 失败：检查远端 rsync/SSH、WIND_REMOTE_SETTING_DIR 路径。"
-        return 1
-    fi
 }
 
 show_menu() {
     clear 2>/dev/null || true
     printf '%b============================================%b\n' "$C_CYAN" "$C_RESET"
-    printf '%b  WindInput 开发菜单  v%s  (Linux→Win)%b\n' "$C_CYAN" "$VERSION" "$C_RESET"
+    printf '%b  WindInput 开发菜单  v%s  (Linux→Win, MSVC)%b\n' "$C_CYAN" "$VERSION" "$C_RESET"
     printf '%b============================================%b\n\n' "$C_CYAN" "$C_RESET"
-    printf '%b  构建:%b\n' "$C_YELLOW" "$C_RESET"
-    echo  "    1  - Release 构建 + 部署"
-    echo  "    1d - Debug 构建 + 部署"
-    echo  "    2  - cargo check (快速编译检查)"
-    echo  "    3  - cargo clippy (代码检查)"
-    echo  "    4  - cargo test (运行测试, 本机)"
-    printf '\n%b  发布:%b\n' "$C_YELLOW" "$C_RESET"
-    echo  "    d  - dist: 构建完整发布目录 (exe + x64/x86 TSF + 正式词库)"
-    echo  "    8  - 生成安装包 (dist + 打包 → Setup.exe)"
-    echo  "    8s - 生成安装包 (跳过编译, 直接打包现有 build/)"
-    printf '\n%b  部署 (本机 build/ 镜像):%b\n' "$C_YELLOW" "$C_RESET"
-    echo  "    5  - 完整部署 (复制 DLL + data 到 build/)"
-    echo  "    6  - 构建 C++ TSF DLL (clang/MSVC 交叉编译)"
-    echo  "    7  - 组装 data/ (data/ 源 + .cache/ → build_debug/data/)"
-    printf '\n%b  实测 / 远程 (SSH → %s):%b\n' "$C_YELLOW" "${WIND_REMOTE:-未配置}" "$C_RESET"
-    echo  "    r  - 候选 REPL (本机验证, 无需 Windows)"
-    echo  "    p  - push: 交叉编译 exe → Windows (release)"
-    echo  "    pd - push debug: exe + 源 data/ → Windows (调试)"
-    echo  "    pda- push-data: 仅推源 data/ (manifest/方案/主题, 不重编 exe)"
-    echo  "    dl - pull-data: 从 Windows 拉真实词库 → .cache/pulled-data/"
-    echo  "    pc - pull-config: 从 Windows 拉 config.toml 回本机查看"
-    echo  "    pl - pull-log: 从 Windows 拉最新日志回本机 (pla = 整目录)"
-    echo  "    gd - gen-data: 下载外部词库 + 组装 build_debug/data/"
-    printf '\n%b  工具:%b\n' "$C_YELLOW" "$C_RESET"
-    echo  "    f  - cargo fmt (代码格式化)"
-    echo  "    i  - ci (fmt-check + clippy + test)"
-    echo  "    c  - cargo clean (清理构建)"
-    echo  "    q  - 退出"
+    printf '%b  全构建 (→ 项目根 build/，内容 == 安装到 Program Files):%b\n' "$C_YELLOW" "$C_RESET"
+    echo  "    d1   Debug 全构建 (→ build_debug/)"
+    printf '\n%b  单模块构建 (前缀 d = debug):%b\n' "$C_YELLOW" "$C_RESET"
+    echo  "    m1   仅 tsf (x64+x86)        dm1"
+    echo  "    m2   仅 wind_input (核心)     dm2"
+    printf '\n%b  安装包:%b\n' "$C_YELLOW" "$C_RESET"
+    echo  "    8    生成安装包 (= 1 + 打包 → Setup.exe + sha256)"
+    echo  "    8s   跳过编译, 直接打包现有 build/"
+    printf '\n%b  部署 → Windows (deploy.local 配 RELEASE/DEBUG 路径; SSH → %s):%b\n' "$C_YELLOW" "${WIND_REMOTE:-未配置}" "$C_RESET"
+    echo  "    p1   push 全部 (release)        pd1   push 全部 (debug)"
+    echo  "    pm1/pm2/pm3  push 模块(tsf/核心/设置)    pdm1/pdm2/pdm3 (debug)"
+    printf '\n%b  代码质量:%b\n' "$C_YELLOW" "$C_RESET"
+    echo  "    k=check  l=clippy  t=test  f=fmt  ci=fmt+clippy+test"
+    printf '\n%b  远程数据 / 实测:%b\n' "$C_YELLOW" "$C_RESET"
+    echo  "    r=repl(本机)  dl=pull-data  pc=pull-config  pl=pull-log(pla=全部)"
+    printf '\n%b  杂项:%b\n' "$C_YELLOW" "$C_RESET"
     printf '%b============================================%b\n' "$C_CYAN" "$C_RESET"
 }
 
 pause() { printf '\n'; read -e -r -p "按回车继续..." _; }
 
+# 统一分发：菜单与命令行直调共用，命令已转小写。返回 1 表示无效命令。
+dispatch() {
+    case "$1" in
+        1|release)        do_full release ;;
+        d1|debug)         do_full debug ;;
+        m1)               build_tsf_all release ;;
+        dm1)              build_tsf_all debug ;;
+        m2)               build_core release ;;
+        dm2)              build_core debug ;;
+        m3)               build_setting release ;;
+        dm3)              build_setting debug ;;
+        8|installer|pack) do_installer ;;
+        8s|installer-skip) do_installer skip ;;
+        p1)               do_push_full release ;;
+        pd1)              do_push_full debug ;;
+        pm1)              do_push_module release tsf ;;
+        pm2)              do_push_module release core ;;
+        pm3)              do_push_module release setting ;;
+        pdm1)             do_push_module debug tsf ;;
+        pdm2)             do_push_module debug core ;;
+        pdm3)             do_push_module debug setting ;;
+        k|check)          do_check ;;
+        l|clippy)         do_clippy ;;
+        t|test)           do_test ;;
+        f|fmt)            do_fmt ;;
+        fmt-check)        do_fmt_check ;;
+        ci)               do_ci ;;
+        clean)            do_clean ;;
+        sb|setting)       do_setting_build ;;
+        gd|gen-data)      do_gen_data ;;
+        r|repl)           do_repl "${2:-}" ;;
+        dl|pull-data)     do_pull_data "${2:-}" ;;
+        pc|pull-config)   do_pull_config ;;
+        pl|pull-log)      do_pull_log "${2:-}" ;;
+        pla)              do_pull_log all ;;
+        *)                return 1 ;;
+    esac
+}
+
 menu_loop() {
-    # 启用历史，使下方 read -e 的上/下方向键可调出历史输入。
     set -o history 2>/dev/null || true
     while true; do
         show_menu
         printf '\n'
-        # -e 启用 readline 行编辑：方向键不再回显 ^[[A，左右移动光标、上下调历史。
         read -e -r -p "请输入选项: " choice
         [ -n "$choice" ] && history -s "$choice"
-        case "$(printf '%s' "$choice" | tr '[:upper:]' '[:lower:]')" in
-            1)   do_build;          pause ;;
-            1d)  do_build debug;    pause ;;
-            a)   do_all;            pause ;;
-            ad)  do_all debug;      pause ;;
-            sb)  do_setting_build;  pause ;;
-            2)   do_check;          pause ;;
-            3)   do_clippy;         pause ;;
-            4)   do_test;           pause ;;
-            d)   do_dist;           pause ;;
-            8)   do_installer;      pause ;;
-            8s)  do_installer skip;  pause ;;
-            5)   deploy_all;        pause ;;
-            6)   build_tsf;         pause ;;
-            7)   copy_data "$BUILD_DEBUG_DIR"; pause ;;
-            r)   do_repl;           pause ;;
-            p)   do_push;           pause ;;
-            pd)  do_push debug data; pause ;;
-            pa)  do_push_all;       pause ;;
-            pad) do_push_all debug; pause ;;
-            pda) do_push_data;      pause ;;
-            dl)  do_pull_data;      pause ;;
-            pc)  do_pull_config;    pause ;;
-            pl)  do_pull_log;       pause ;;
-            pla) do_pull_log all;   pause ;;
-            gd)  do_gen_data;       pause ;;
-            f)   do_fmt;            pause ;;
-            i)   do_ci;             pause ;;
-            c)   do_clean;          pause ;;
-            q)   exit 0 ;;
-            "")  ;;
-            *)   err "无效选项"; sleep 1 ;;
+        choice="$(printf '%s' "$choice" | tr '[:upper:]' '[:lower:]')"
+        case "$choice" in
+            q) exit 0 ;;
+            "") ;;
+            *) if dispatch "$choice"; then pause; else err "无效选项"; sleep 1; fi ;;
         esac
     done
 }
 
 # ---------- 命令行直调 ----------
-# 长名与菜单缩写均可直调（如 './dev.sh push-data' 等价 './dev.sh pda'）；命令转小写以容错。
+# 与菜单同一套命令（如 './dev.sh 1'、'./dev.sh p1'、'./dev.sh m2'）；命令转小写以容错。
 cmd="$(printf '%s' "${1:-}" | tr '[:upper:]' '[:lower:]')"
 case "$cmd" in
-    ""|menu)              menu_loop ;;
-    release|1)            do_build ;;
-    debug|1d)             do_build debug ;;
-    all|a)                do_all "${2:-}" ;;
-    setting|setting-build|sb) do_setting_build ;;
-    check|2)              do_check ;;
-    clippy|3)             do_clippy ;;
-    test|4)               do_test ;;
-    deploy|5)             deploy_all ;;
-    tsf|dll|6)            build_tsf "$BUILD_DIR" "${2:-}" ;;
-    data|7)               copy_data "$BUILD_DEBUG_DIR" ;;
-    fmt|f)                do_fmt ;;
-    fmt-check)            do_fmt_check ;;
-    clean|c)              do_clean ;;
-    ci|i)                 do_ci ;;
-    repl|r)               do_repl "${2:-}" ;;
-    push|p)               do_push "${2:-}" "${3:-}" ;;
-    pd)                   do_push debug data ;;
-    push-all|pushall|pa)  do_push_all "${2:-}" ;;
-    pad)                  do_push_all debug ;;
-    push-data|pushdata|pda) do_push_data ;;
-    pull-data|dl)         do_pull_data ;;
-    pull-config|pc)       do_pull_config ;;
-    pull-log|pl)          do_pull_log "${2:-}" ;;
-    pla)                  do_pull_log all ;;
-    gen-data|gd)          do_gen_data ;;
-    dist|d)               do_dist ;;
-    installer|pack|8)     do_installer ;;
-    installer-skip|8s)    do_installer skip ;;
+    ""|menu) menu_loop ;;
     -h|--help|help)
         grep '^#' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
         ;;
     *)
-        err "未知命令: $1"
-        echo "运行 './scripts/dev.sh --help' 查看可用命令"
-        exit 1
+        if ! dispatch "$cmd" "${2:-}"; then
+            err "未知命令: $1"
+            echo "运行 './scripts/dev.sh --help' 查看可用命令"
+            exit 1
+        fi
         ;;
 esac

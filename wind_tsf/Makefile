@@ -29,21 +29,31 @@ XWIN_ROOT ?= $(HOME)/.cache/cargo-xwin/xwin
 DEBUG_VARIANT ?= 0
 VERSION       ?= 0.0.0-dev
 
-# ---- 架构（x86 目标见 `make x86`）----
-TRIPLE  ?= x86_64-pc-windows-msvc
-LIBARCH ?= x86_64
+# ---- 架构（ARCH=x64|x86；x86 也可用 `make x86`）----
+ARCH ?= x64
+ifeq ($(ARCH),x86)
+  TRIPLE     := i686-pc-windows-msvc
+  LIBARCH    := x86
+  ARCHSUFFIX := _x86
+else
+  TRIPLE     := x86_64-pc-windows-msvc
+  LIBARCH    := x86_64
+  ARCHSUFFIX :=
+endif
 
+# 产物命名按 arch + variant 组合：wind_tsf[_x86][_debug].dll
 ifeq ($(DEBUG_VARIANT),1)
-  TARGET   := wind_tsf_debug
   OUTDIR   ?= build_debug
   VARFLAGS := -DWIND_DEBUG_VARIANT
+  DBGSUFFIX := _debug
   DISPLAY_NAME := 清风输入法开发版
 else
-  TARGET   := wind_tsf
   OUTDIR   ?= build
   VARFLAGS :=
+  DBGSUFFIX :=
   DISPLAY_NAME := 清风输入法
 endif
+TARGET := wind_tsf$(ARCHSUFFIX)$(DBGSUFFIX)
 
 # 版本号拆分（X.Y.Z[-suffix] → MAJOR/MINOR/PATCH）
 VER_CLEAN := $(firstword $(subst -, ,$(VERSION)))
@@ -54,7 +64,8 @@ VER_MAJOR := $(or $(VER_MAJOR),0)
 VER_MINOR := $(or $(VER_MINOR),0)
 VER_PATCH := $(or $(VER_PATCH),0)
 
-OBJDIR := $(OUTDIR)/obj$(if $(filter 1,$(DEBUG_VARIANT)),_debug,)
+# 中间产物目录（按 arch+variant 隔离）；可被 dev.sh 重定向到 .cache 以保持 OUTDIR 干净
+OBJDIR ?= $(OUTDIR)/obj/$(ARCH)$(DBGSUFFIX)
 
 # ---- SDK include / lib 路径（cargo-xwin splat 布局：crt/{include,lib}, sdk/{include,lib}）----
 INCFLAGS := -isystem $(XWIN_ROOT)/crt/include \
@@ -95,11 +106,11 @@ VEROBJ  := $(OBJDIR)/version.res
 all: $(DLL)
 	@echo "✅ $(DLL) ($(VERSION))"
 
-# x86(32 位)构建 → $(OUTDIR)/wind_tsf_x86.dll
+# x86(32 位)构建 → $(OUTDIR)/wind_tsf_x86[_debug].dll
 # 32 位宿主程序(部分旧软件)需要对应位数的 TSF DLL 才能显示输入法。
+# 透传 DEBUG_VARIANT/OUTDIR/VERSION，使 release/debug 与输出目录一致。
 x86:
-	$(MAKE) TRIPLE=i686-pc-windows-msvc LIBARCH=x86 TARGET=wind_tsf_x86 \
-	        OBJDIR=$(OUTDIR)/obj_x86 VERSION=$(VERSION) all
+	$(MAKE) ARCH=x86 DEBUG_VARIANT=$(DEBUG_VARIANT) OUTDIR=$(OUTDIR) VERSION=$(VERSION) all
 
 # 目标文件
 $(OBJDIR)/%.o: src/%.cpp | $(OBJDIR)
@@ -126,12 +137,15 @@ $(VEROBJ): $(VERRC)
 	$(LLVM_RC) $(RCFLAGS) /FO $@ $<
 
 # 链接 DLL（.res 作为位置参数交给 lld-link；/DEF 指定未装饰 COM 导出）
+# /IMPLIB 重定向到 OBJDIR：导入库 .lib/.exp 是中间产物（DLL 经 COM 加载，运行时不需要），
+# 不让它们落进 OUTDIR，保证发布目录 == 安装内容。
 $(DLL): $(OBJS) $(RESOBJ) $(VEROBJ) $(DEF) | $(OUTDIR)
-	$(CLANG) $(LDFLAGS) -o $@ $(OBJS) $(RESOBJ) $(VEROBJ) -Xlinker /DEF:$(DEF) $(LIBS)
+	$(CLANG) $(LDFLAGS) -o $@ $(OBJS) $(RESOBJ) $(VEROBJ) \
+		-Xlinker /DEF:$(DEF) -Xlinker /IMPLIB:$(OBJDIR)/$(TARGET).lib $(LIBS)
 
 $(OBJDIR) $(OUTDIR):
 	mkdir -p $@
 
 clean:
-	rm -rf build/obj build/obj_x86 build_debug/obj_debug $(OBJDIR) \
-	       build/wind_tsf.dll build/wind_tsf_x86.dll build_debug/wind_tsf_debug.dll
+	rm -rf build/obj build_debug/obj $(OBJDIR) \
+	       build/wind_tsf*.dll build_debug/wind_tsf*.dll

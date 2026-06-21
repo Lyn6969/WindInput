@@ -25,7 +25,7 @@ TARGET="x86_64-pc-windows-msvc"   # cargo-xwin 交叉编译 stub/uninstaller;pac
 # ---- 默认值 ----
 VERSION="${WIND_VERSION:-}"
 COMPRESSION="${WIND_COMPRESSION:-zstd}"
-BUILD_DIR="${WIND_BUILD_DIR:-$PRODUCT_ROOT/wind_input/build}"
+BUILD_DIR="${WIND_BUILD_DIR:-$PRODUCT_ROOT/build}"
 INSTALLER_DIR="${WIND_INSTALLER_DIR:-$PRODUCT_ROOT/../wind-installer}"
 OUTPUT=""
 
