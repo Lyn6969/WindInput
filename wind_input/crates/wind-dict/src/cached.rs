@@ -77,6 +77,8 @@ impl CachedDict {
             warn!("Failed to write .wdb cache: {}", e);
             return Ok(Self::Memory(dict));
         }
+        // 写内容指纹 sidecar，供下次按内容(而非 mtime)校验复用
+        crate::cache_fp::write_cache_fp(wdb_path, &[yaml_path]);
 
         // 用 mmap 重新打开缓存
         match DictReader::open(wdb_path) {
@@ -95,25 +97,9 @@ impl CachedDict {
         }
     }
 
-    /// 检查缓存是否有效（存在且比源文件新）
+    /// 检查缓存是否有效（按源文件**内容指纹**，不受 scp/部署刷新 mtime 影响）。
     fn cache_is_valid(yaml_path: &Path, wdb_path: &Path) -> bool {
-        if !wdb_path.exists() {
-            return false;
-        }
-
-        let yaml_mtime = match std::fs::metadata(yaml_path) {
-            Ok(m) => m.modified().ok(),
-            Err(_) => return false,
-        };
-        let wdb_mtime = match std::fs::metadata(wdb_path) {
-            Ok(m) => m.modified().ok(),
-            Err(_) => return false,
-        };
-
-        match (yaml_mtime, wdb_mtime) {
-            (Some(y), Some(w)) => w >= y,
-            _ => false,
-        }
+        crate::cache_fp::cache_is_fresh(wdb_path, &[yaml_path])
     }
 
     /// 将内存词典写入 .wdb 缓存

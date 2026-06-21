@@ -833,11 +833,10 @@ impl EngineManager {
         let fresh = Self::combined_cache_fresh(&[ug_txt], &ug_wdb);
         if !(ug_wdb.exists() && fresh) {
             match parse_unigram_freqs(ug_txt) {
-                Ok(freqs) => {
-                    if let Err(e) = write_unigram_wdb(&ug_wdb, &freqs) {
-                        warn!("Failed to write unigram.wdb {}: {}", ug_wdb.display(), e);
-                    }
-                }
+                Ok(freqs) => match write_unigram_wdb(&ug_wdb, &freqs) {
+                    Ok(()) => wind_dict::cache_fp::write_cache_fp(&ug_wdb, &[ug_txt]),
+                    Err(e) => warn!("Failed to write unigram.wdb {}: {}", ug_wdb.display(), e),
+                },
                 Err(e) => {
                     warn!("Failed to parse unigram {}: {}", ug_txt.display(), e);
                     return None;
@@ -993,7 +992,10 @@ impl EngineManager {
             writer.add(code, entries);
         }
         match writer.write(combined) {
-            Ok(_) => match wind_dict::binformat::DictReader::open(combined) {
+            Ok(_) => {
+                // 写内容指纹(覆盖全部源，与上面 fresh 校验的 paths 一致)
+                wind_dict::cache_fp::write_cache_fp(combined, &paths);
+                match wind_dict::binformat::DictReader::open(combined) {
                 Ok(reader) => {
                     info!(
                         "Wrote combined cache: {} ({} keys from {} dicts)",
@@ -1007,7 +1009,8 @@ impl EngineManager {
                     warn!("Failed to open combined cache: {}", e);
                     None
                 }
-            },
+                }
+            }
             Err(e) => {
                 warn!("Failed to write combined cache: {}", e);
                 None
@@ -1016,20 +1019,11 @@ impl EngineManager {
     }
 
     /// combined.wdb 是否比所有源文件新（源文件缺失/不可访问视为缓存失效）
+    /// 缓存是否可复用：按源文件**内容指纹**判定（非 mtime）。
+    /// scp/部署/版本控制会刷新源 mtime，旧的 mtime 校验会因此恒失效 → 每次重建(300MB)；
+    /// 改为内容指纹后，源内容未变即复用，构建后由 write_cache_fp 写指纹 sidecar。
     fn combined_cache_fresh(paths: &[&Path], combined: &Path) -> bool {
-        let Ok(cmb_meta) = std::fs::metadata(combined) else {
-            return false;
-        };
-        let Ok(cmb_mtime) = cmb_meta.modified() else {
-            return false;
-        };
-        for p in paths {
-            match std::fs::metadata(p).and_then(|m| m.modified()) {
-                Ok(src_mtime) if src_mtime <= cmb_mtime => {}
-                _ => return false, // 源比缓存新、或源不可访问 → 强制重建
-            }
-        }
-        true
+        wind_dict::cache_fp::cache_is_fresh(combined, paths)
     }
 
     /// 加载 rime_pinyin 词典（合并 import_tables 子词典到 .merged.wdb）
@@ -1128,6 +1122,10 @@ impl EngineManager {
             if let Err(e) = writer.write(target) {
                 warn!("Failed to write merged cache {}: {}", target.display(), e);
                 continue;
+            }
+            // 写内容指纹(仅对正式缓存路径；fresh 校验也只看 merged_wdb)
+            if target.as_path() == merged_wdb.as_path() {
+                wind_dict::cache_fp::write_cache_fp(&merged_wdb, &[dict_path]);
             }
             match wind_dict::binformat::DictReader::open(target) {
                 Ok(reader) => {

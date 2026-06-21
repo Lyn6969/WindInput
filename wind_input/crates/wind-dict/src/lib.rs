@@ -3,6 +3,7 @@
 //! 与 Go 版本 `wind_input/internal/dict/` 对齐。
 
 pub mod binformat;
+pub mod cache_fp;
 pub mod cached;
 pub mod codetable;
 pub mod composite;
