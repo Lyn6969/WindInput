@@ -1,6 +1,6 @@
 target/
 build_debug/
 build/
-/.cache/
+.cache/
 scripts/deploy.local
 /.remote/

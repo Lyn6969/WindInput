@@ -29,6 +29,8 @@
 #   push [debug] [data]  交叉编译 exe 并 drop-in 到 Windows 安装目录（复用其 TSF DLL+大词库）；
 #                   debug → 构建 debug_variant 并推为 wind_input_debug.exe；先 taskkill 远程进程再覆盖；
 #                   data  → exe 推完再推源 data/（manifest/方案/主题），随手同步免遗漏
+#                   到 Windows，再在 Windows 上 'pnpm install && pnpm tauri build/dev' 跑整套; pad=debug
+#                   需 deploy.local 配 WIND_REMOTE_SETTING_DIR + 远端 rsync
 #   push-data       仅推送源 data/（manifest/方案/主题/默认配置）到 Windows，不重编 exe
 #   pull-data       从 Windows 安装目录拉 data/（真实词库）到 .cache/pulled-data/ 供 REPL 使用
 #   pull-config     从 Windows 拉 config.toml（%APPDATA%\<App>）到 .remote/ 查看
@@ -76,6 +78,7 @@ WIND_REMOTE_DIR="${WIND_REMOTE_DIR:-}"
 #   WIND_LOCAL_DIR  = %LOCALAPPDATA%\<App>   含 logs/（服务日志）、cache/
 WIND_DATA_DIR="${WIND_DATA_DIR:-}"
 WIND_LOCAL_DIR="${WIND_LOCAL_DIR:-}"
+WIND_REMOTE_SETTING_DIR="${WIND_REMOTE_SETTING_DIR:-}"
 # 从远程拉取的配置/日志落地处（本地查看用，不入库）
 REMOTE_PULL_DIR="$PRODUCT_ROOT/.remote"
 
@@ -568,6 +571,55 @@ do_dist() {
 }
 
 # ---------- 菜单 ----------
+
+# 注：Tauri 的 Windows 安装包须在 Windows 上 `pnpm tauri build` 产出；
+# Linux 这里只做「前端构建 + Rust 编译校验」，供交叉验证与 push-all 后在 Windows 构建。
+do_setting_build() {
+    cd "$SETTING_DIR" || return 1
+    if [ ! -d node_modules ]; then
+        pnpm install || { err "pnpm install 失败"; return 1; }
+    fi
+    pnpm build || { err "前端构建失败"; return 1; }
+    ( cd src-tauri && cargo check ) || { err "src-tauri 编译失败"; return 1; }
+    gray "提示: Windows 安装包请在 Windows 上 'pnpm tauri build'。"
+}
+
+#   all [debug]
+do_all() {
+    local debug="${1:-}"
+    say "\n========== 一键全编译 (${debug:-release}) =========="
+    do_build "$debug" || return 1
+    do_setting_build || return 1
+    say "\n========== 全部完成 =========="
+}
+
+#   push-all [debug]
+do_push_all() {
+    require_remote || return 1
+    local debug="${1:-}"
+    # 1) core exe + 源 data/
+    if [ "$debug" = "debug" ]; then
+        do_push debug data || return 1
+    else
+        do_push "" data || return 1
+    fi
+    if [ -z "$WIND_REMOTE_SETTING_DIR" ]; then
+        return 0
+    fi
+    if ! command -v rsync >/dev/null 2>&1; then
+        return 1
+    fi
+    if rsync -az --delete \
+        --exclude node_modules --exclude dist --exclude 'src-tauri/target' \
+        --exclude 'src-tauri/gen' --exclude .git \
+        -e ssh "$SETTING_DIR"/ "$WIND_REMOTE:$WIND_REMOTE_SETTING_DIR/"; then
+        say "请在 Windows: cd $WIND_REMOTE_SETTING_DIR && pnpm install && pnpm tauri build (或 pnpm tauri dev)。"
+    else
+        err "rsync 失败：检查远端 rsync/SSH、WIND_REMOTE_SETTING_DIR 路径。"
+        return 1
+    fi
+}
+
 show_menu() {
     clear 2>/dev/null || true
     printf '%b============================================%b\n' "$C_CYAN" "$C_RESET"
@@ -614,6 +666,9 @@ menu_loop() {
         case "$(printf '%s' "$choice" | tr '[:upper:]' '[:lower:]')" in
             1)   do_build;          pause ;;
             1d)  do_build debug;    pause ;;
+            a)   do_all;            pause ;;
+            ad)  do_all debug;      pause ;;
+            sb)  do_setting_build;  pause ;;
             2)   do_check;          pause ;;
             3)   do_clippy;         pause ;;
             4)   do_test;           pause ;;
@@ -623,6 +678,8 @@ menu_loop() {
             r)   do_repl;           pause ;;
             p)   do_push;           pause ;;
             pd)  do_push debug data; pause ;;
+            pa)  do_push_all;       pause ;;
+            pad) do_push_all debug; pause ;;
             pda) do_push_data;      pause ;;
             dl)  do_pull_data;      pause ;;
             pc)  do_pull_config;    pause ;;
@@ -646,6 +703,8 @@ case "$cmd" in
     ""|menu)              menu_loop ;;
     release|1)            do_build ;;
     debug|1d)             do_build debug ;;
+    all|a)                do_all "${2:-}" ;;
+    setting|setting-build|sb) do_setting_build ;;
     check|2)              do_check ;;
     clippy|3)             do_clippy ;;
     test|4)               do_test ;;
@@ -659,6 +718,8 @@ case "$cmd" in
     repl|r)               do_repl "${2:-}" ;;
     push|p)               do_push "${2:-}" "${3:-}" ;;
     pd)                   do_push debug data ;;
+    push-all|pushall|pa)  do_push_all "${2:-}" ;;
+    pad)                  do_push_all debug ;;
     push-data|pushdata|pda) do_push_data ;;
     pull-data|dl)         do_pull_data ;;
     pull-config|pc)       do_pull_config ;;
