@@ -543,6 +543,51 @@ do_gen_data() {
     say "gen-data 完成 → $outdir/data"
 }
 
+# 发布前硬门禁:校验关键运行时数据完整。assemble_data 对缺失项仅 warn(交互式
+# 部分构建可容忍),但 dist(发版)必须完整——任一关键文件缺失/过小即失败,杜绝
+# 发出词库残缺(无智能组句/无简繁/词库不全)的安装器。
+verify_dist_data() {
+    local data="${1:-$BUILD_DIR}/data"
+    local ok=1
+    # "相对 data/ 的路径|最小字节数"(下限粗略,仅为捕获缺失/0 字节/截断)
+    local checks=(
+        "schemas/pinyin/unigram.txt|1000000"
+        "schemas/pinyin/cn_dicts/base.dict.yaml|1000000"
+        "schemas/pinyin/cn_dicts/8105.dict.yaml|10000"
+        "schemas/english/en.dict.yaml|1000"
+        "pinyin_map.txt|10000"
+    )
+    say "\n校验发布数据完整性 → $data"
+    local entry path min sz
+    for entry in "${checks[@]}"; do
+        path="${entry%%|*}"; min="${entry##*|}"
+        if [ ! -f "$data/$path" ]; then
+            err "  ✗ 缺失: $path"; ok=0; continue
+        fi
+        sz=$(stat -c%s "$data/$path" 2>/dev/null || echo 0)
+        if [ "$sz" -lt "$min" ]; then
+            err "  ✗ 过小(${sz}B < 期望 ${min}B,疑似下载/生成失败): $path"; ok=0
+        else
+            gray "  ✓ $path ($(numfmt --to=iec "$sz" 2>/dev/null || echo "${sz}B"))"
+        fi
+    done
+    # OpenCC:至少一个非空 .octrie(简繁转换)
+    local octrie_cnt
+    octrie_cnt=$(find "$data/opencc" -name '*.octrie' -size +0c 2>/dev/null | wc -l)
+    if [ "$octrie_cnt" -lt 1 ]; then
+        err "  ✗ 缺失: opencc/*.octrie(简繁转换编译失败)"; ok=0
+    else
+        gray "  ✓ opencc/*.octrie ($octrie_cnt 个)"
+    fi
+
+    if [ "$ok" -ne 1 ]; then
+        err "\n发布数据校验失败!上述文件缺失或异常会导致安装器功能残缺。"
+        err "请排查 gen-data 的下载/生成(词库源、网络、gen_unigram/gen_opencc)。"
+        return 1
+    fi
+    say "发布数据校验通过 ✓"
+}
+
 # ---------- 发布:产出完整可打包目录(exe + x64/x86 TSF + data)----------
 # 全部产物落到 BUILD_DIR(wind_input/build/),供 scripts/pack-installer.sh 打包。
 do_dist() {
@@ -565,6 +610,9 @@ do_dist() {
 
     # 正式数据(下载词库 + gen_unigram + assemble→编译 opencc octrie)
     do_gen_data "$outdir" || return 1
+
+    # 发布硬门禁:词库/模型任一缺失即失败,防止打出残缺安装器
+    verify_dist_data "$outdir" || return 1
 
     say "\n发布目录就绪 → $outdir"
     say "  打包: scripts/pack-installer.sh --version $VERSION"

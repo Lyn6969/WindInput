@@ -123,6 +123,12 @@ rm -f "$ARCHIVE"
 cleanup; trap - EXIT
 
 SIZE="$(du -h --apparent-size "$OUTPUT" | cut -f1)"
+
+# ---- 生成 SHA256 校验和(安装器未签名,供用户校验完整性;sha256sum -c 可校验)----
+SHA_FILE="$OUTPUT.sha256"
+( cd "$(dirname "$OUTPUT")" && sha256sum "$(basename "$OUTPUT")" > "$(basename "$SHA_FILE")" )
+
 echo "================================================"
 echo "  ✅ 打包完成: $OUTPUT ($SIZE)"
+echo "  🔒 校验和:   $SHA_FILE"
 echo "================================================"

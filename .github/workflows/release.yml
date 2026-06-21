@@ -1,10 +1,13 @@
 name: Release
 
-# push tag v* → 全 Linux 交叉编译 + 打包,产出草稿 Release。
+# 全 Linux 交叉编译 + 打包。两种触发:
+#   - push tag v*    → 产出草稿 Release(附 Setup.exe + .sha256)
+#   - workflow_dispatch → 产出可测 artifact(不发 Release),供合并前 Windows 实测
 # 产物:WindInput-<版本>-Setup.exe(自解压安装程序,含 x64/x86 TSF + 词库)。
 on:
   push:
     tags: ['v*']
+  workflow_dispatch: {}     # 手动触发:走完整打包,只产出可测 artifact,不发 Release
 
 permissions:
   contents: write          # 创建 Release / 上传产物
@@ -49,12 +52,17 @@ jobs:
 
       # tag 为发布版本的唯一真值源；docs/VERSION 仅为开发占位。把 tag 版本写入
       # docs/VERSION，让下游(build.rs 资源版本 / dev.sh dist / pack-installer)统一取到。
-      - name: 以 tag 版本为准写入 docs/VERSION
+      - name: 确定版本并写入 docs/VERSION
         working-directory: WindInput
         run: |
-          V="${GITHUB_REF_NAME#v}"
+          if [ "$GITHUB_REF_TYPE" = "tag" ]; then
+            V="${GITHUB_REF_NAME#v}"                                     # tag 为发布版本唯一真值源
+          else
+            V="$(tr -d '[:space:]' < docs/VERSION)-dev.${GITHUB_SHA::8}"  # 手动触发:开发占位版本
+          fi
           echo "$V" > docs/VERSION
-          echo "release version = $V"
+          echo "build version = $V"
+          echo "BUILD_VERSION=$V" >> "$GITHUB_ENV"
 
       - name: 构建发布目录 (exe + x64/x86 TSF + data)
         working-directory: WindInput
@@ -62,11 +70,24 @@ jobs:
 
       - name: 打包安装程序 (cross stub + native packer，免 wine)
         working-directory: WindInput
-        run: ./scripts/pack-installer.sh --version "${GITHUB_REF_NAME#v}" --compression zstd
+        run: ./scripts/pack-installer.sh --version "$BUILD_VERSION" --compression zstd
 
-      - name: 创建草稿 Release
+      - name: 创建草稿 Release (仅 tag 触发)
+        if: github.ref_type == 'tag'
         uses: softprops/action-gh-release@v2
         with:
           draft: true                          # 人工审核 Release Notes 后再发布
           generate_release_notes: true
-          files: wind-installer/dist/WindInput-*-Setup.exe
+          files: |
+            wind-installer/dist/WindInput-*-Setup.exe
+            wind-installer/dist/WindInput-*-Setup.exe.sha256
+
+      - name: 上传安装器 artifact (手动触发,供 Windows 实测)
+        if: github.ref_type != 'tag'
+        uses: actions/upload-artifact@v4
+        with:
+          name: WindInput-Setup-${{ github.sha }}
+          path: |
+            wind-installer/dist/WindInput-*-Setup.exe
+            wind-installer/dist/WindInput-*-Setup.exe.sha256
+          retention-days: 14
