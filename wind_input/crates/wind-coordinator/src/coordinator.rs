@@ -218,9 +218,21 @@ pub fn set_settings_url_provider(f: Box<dyn Fn() -> Option<String> + Send + Sync
     let _ = SETTINGS_URL_PROVIDER.set(f);
 }
 
-/// 取「设置」网页配置 URL（菜单触发；None=未注入或服务未就绪）。
+/// 取「设置」网页配置 URL（None=未注入或服务未就绪）。
 pub(crate) fn settings_url() -> Option<String> {
     SETTINGS_URL_PROVIDER.get().and_then(|f| f())
+}
+
+/// 取同目录下 wind_setting 设置应用的可执行路径（None=不存在）。
+/// 由当前 exe 名推导变体：wind_input[_debug].exe → wind_setting[_debug].exe，
+/// 故无需感知 debug_variant 特性，正式/调试版自动对应。
+pub(crate) fn settings_app_path() -> Option<String> {
+    let exe = std::env::current_exe().ok()?;
+    let dir = exe.parent()?;
+    let stem = exe.file_stem()?.to_str()?; // wind_input 或 wind_input_debug
+    let setting = stem.replacen("wind_input", "wind_setting", 1);
+    let path = dir.join(format!("{setting}.exe"));
+    path.exists().then(|| path.display().to_string())
 }
 
 pub(crate) struct State {

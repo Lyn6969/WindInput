@@ -135,22 +135,19 @@ cargo_xwin() {
 # 输出目录：release → BUILD_DIR；debug → BUILD_DEBUG_DIR。
 out_for() { [ "${1:-release}" = debug ] && echo "$BUILD_DEBUG_DIR" || echo "$BUILD_DIR"; }
 
-# 模块一：wind_input 核心 exe（debug = dev profile + debug_variant 特性）
+# 模块一：wind_input 核心 exe。
+# debug 变体 = release profile + debug_variant 特性（非 dev profile）：
+#   ① debug_assertions 关闭 → windows_subsystem="windows" 生效，无控制台窗口；
+#   ② 优化构建，Windows 上输入法手感正常；③ 仍是独立 _debug 身份(管道/目录隔离)。
 build_core() {
     local profile="${1:-release}" outdir="${2:-$(out_for "$1")}"
-    mkdir -p "$outdir"
-    cd "$PROJECT_ROOT" || return 1
-    say "\n[core] 交叉编译 wind_input ($profile, $TARGET)..."
-    if [ "$profile" = debug ]; then
-        cargo_xwin build --target "$TARGET" -p wind_service --features debug_variant \
-            || { err "wind_input 构建失败!"; return 1; }
-    else
-        cargo_xwin build --release --target "$TARGET" -p wind_service \
-            || { err "wind_input 构建失败!"; return 1; }
-    fi
-    local bindir suffix
-    [ "$profile" = debug ] && { bindir="debug"; suffix="_debug"; } || { bindir="release"; suffix=""; }
-    local src="$PROJECT_ROOT/target/$TARGET/$bindir/wind_input.exe"
+    mkdir -p "$outdir"; cd "$PROJECT_ROOT" || return 1
+    local feats="" suffix=""
+    [ "$profile" = debug ] && { feats="--features debug_variant"; suffix="_debug"; }
+    say "\n[core] 交叉编译 wind_input ($profile, release profile${feats:+ +debug_variant}, $TARGET)..."
+    cargo_xwin build --release --target "$TARGET" -p wind_service $feats \
+        || { err "wind_input 构建失败!"; return 1; }
+    local src="$PROJECT_ROOT/target/$TARGET/release/wind_input.exe"
     [ -f "$src" ] || { err "未找到产物: $src"; return 1; }
     cp -f "$src" "$outdir/wind_input${suffix}.exe"
     gray "已构建: wind_input${suffix}.exe ($(du -h "$outdir/wind_input${suffix}.exe" | cut -f1))"
@@ -695,25 +692,22 @@ do_setting_build() {
     gray "提示: Windows 安装包(bundle/installer)仍须在 Windows 上 'pnpm tauri build'。"
 }
 
-# debug = dev profile + debug_variant 特性（管道后缀 _debug，连调试核心）。
+# debug 变体同样走 release profile + debug_variant 特性：debug_assertions 关闭，
+# main.rs 的 windows_subsystem="windows" 生效 → 无 cmd 控制台窗口；管道后缀 _debug 连调试核心。
 # 工具链缺失(pnpm/clang)→ 告警跳过(非致命);构建失败→致命。
 build_setting() {
     local profile="${1:-release}" outdir="${2:-$(out_for "$1")}"
     if ! command -v pnpm >/dev/null 2>&1 || ! command -v "clang-$WIND_LLVM_VER" >/dev/null 2>&1; then
         return 0
     fi
-    local bindir suffix
-    [ "$profile" = debug ] && { bindir="debug"; suffix="_debug"; } || { bindir="release"; suffix=""; }
+    local feats="" suffix=""
+    [ "$profile" = debug ] && { feats="--features debug_variant"; suffix="_debug"; }
     (
         cd "$SETTING_DIR" || exit 1
         [ -d node_modules ] || pnpm install || exit 1
         pnpm build || exit 1
         cd src-tauri || exit 1
-        if [ "$profile" = debug ]; then
-            cargo_xwin build --target "$TARGET" --features debug_variant || exit 1
-        else
-            cargo_xwin build --release --target "$TARGET" || exit 1
-        fi
+        cargo_xwin build --release --target "$TARGET" $feats || exit 1
     [ -f "$exe" ] || { err "未找到产物: $exe"; return 1; }
 }
 

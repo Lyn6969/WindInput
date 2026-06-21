@@ -59,12 +59,14 @@ impl Coordinator {
             }
             MenuCmd::RestartService => self.restart_service(),
             MenuCmd::OpenSettings => {
-                // 开启网页配置：经内嵌 web 服务签发 token 构造 URL，交系统默认浏览器打开。
-                match crate::coordinator::settings_url() {
-                    Some(url) => {
-                        let _ = self.ui_tx.send(UiCommand::OpenPath(url));
-                    }
-                    None => tracing::warn!("打开设置失败：web 服务尚未就绪"),
+                // 优先启动同目录的 wind_setting 桌面应用（ShellExecute open exe 即运行）；
+                // 找不到再回退到内嵌 web 配置（签发 token 构造 URL，交默认浏览器）。
+                if let Some(app) = crate::coordinator::settings_app_path() {
+                    let _ = self.ui_tx.send(UiCommand::OpenPath(app));
+                } else if let Some(url) = crate::coordinator::settings_url() {
+                    let _ = self.ui_tx.send(UiCommand::OpenPath(url));
+                } else {
+                    tracing::warn!("打开设置失败：未找到 wind_setting 程序，web 服务也未就绪");
                 }
             }
             MenuCmd::OpenConfigDir | MenuCmd::OpenDictionary | MenuCmd::OpenAbout => {
