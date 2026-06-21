@@ -18,7 +18,7 @@ members = [
     "crates/wind-reverse",
     "crates/wind-punct",
     "crates/wind-coordinator",
-    "crates/wind-webapi",
+    "crates/wind-rpc",
     "apps/service",
     "apps/rpc",
     "apps/repl",

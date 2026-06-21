@@ -97,30 +97,24 @@ fn main() {
     let coord_for_web = coordinator.clone();
     deferred.set_ready(coordinator);
 
-    // 9.5 启动内嵌 HTTP web API（仅 loopback，按需授权）：GUI 与远程 Web 共用同一套 API。
-    // 预先构造 WebState 并共享句柄给「设置」菜单：菜单点击经此签发 token 构造网页配置 URL。
-    let web_status: Arc<dyn wind_webapi::CoreStatus> = Arc::new(WebStatus(coord_for_web));
-    match wind_webapi::WebState::new(web_status, variant) {
-        Ok(state) => {
-            let web_state = Arc::new(state);
-            // 注入「设置」菜单的网页 URL 提供者；用 Weak 句柄避免与协调器形成 Arc 环
-            // （强引用由下方 serve 任务持有，进程生命周期内保活）。
-            let weak = Arc::downgrade(&web_state);
-            wind_coordinator::set_settings_url_provider(Box::new(move || {
-                weak.upgrade().map(|s| s.open_url())
-            }));
-            runtime.spawn(async move {
-                if let Err(e) = wind_webapi::serve_with_state(web_state).await {
-                    error!("web api failed: {}", e);
-                }
-            });
+    // 9.5 启动本地控制 / 配置 JSON-RPC 服务（命名管道：..._ctrl + ..._events）。
+    // 本地授权靠 OS ACL（SDDL），不再需要 token/Origin/CORS/端口发现。
+    // 同步线程模型（与 bridge/push 一致），不引入 tokio 到控制路径。
+    let core_rpc: Arc<dyn wind_rpc::CoreRpc> = Arc::new(RpcCore(coord_for_web));
+    match wind_rpc::RpcServer::new(core_rpc, variant, PIPE_SUFFIX) {
+        Ok(rpc_server) => {
+            if let Err(e) = rpc_server.start() {
+                error!("RPC server failed to start: {}", e);
+            }
+            // 句柄需在进程生命周期内保活（控制/事件 server 已分别在后台线程运行）。
+            Box::leak(Box::new(rpc_server));
         }
-        Err(e) => error!("web api init failed (网页设置不可用): {}", e),
+        Err(e) => error!("RPC server init failed (网页/GUI 设置不可用): {}", e),
     }
 
     info!(
-        "WindInput service ready (pipes: wind_input{}, wind_input_push{})",
-        PIPE_SUFFIX, PIPE_SUFFIX
+        "WindInput service ready (pipes: wind_input{}, wind_input_push{}, wind_input{}_ctrl)",
+        PIPE_SUFFIX, PIPE_SUFFIX, PIPE_SUFFIX
     );
 
     // 10. 阻塞主线程，直到菜单触发"重启服务"
@@ -139,10 +133,10 @@ fn main() {
     }
 }
 
-/// 适配 Coordinator 为 web API 的运行时状态来源（解耦 wind-webapi 与 wind-coordinator）。
-struct WebStatus(Arc<wind_coordinator::Coordinator>);
+/// 适配 Coordinator 为 RPC 服务的运行时状态来源（解耦 wind-rpc 与 wind-coordinator）。
+struct RpcCore(Arc<wind_coordinator::Coordinator>);
 
-impl wind_webapi::CoreStatus for WebStatus {
+impl wind_rpc::CoreRpc for RpcCore {
     fn is_chinese_mode(&self) -> bool {
         self.0.is_chinese_mode()
     }

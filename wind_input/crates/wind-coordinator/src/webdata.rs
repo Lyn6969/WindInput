@@ -1,6 +1,6 @@
 //! Web 设置数据 RPC：schema/dict/temp/freq/shadow/stats/theme/phrase 命名空间。
 //!
-//! 经 wind-webapi 的 `CoreStatus::data_rpc` 转发到此（service 的 WebStatus 适配）。
+//! 经 wind-rpc 的 `CoreRpc::data_rpc` 转发到此（service 的 RpcCore 适配）。
 //! 方法名与前端 `contract.ts` 1:1 一致。
 //!
 //! 接入进度：契约全部数据域方法均接通真实 store/engine/theme：

@@ -1,5 +1,7 @@
 //! 统一声明式设置清单加载：解析 data/settings/manifest.toml，
 //! 组装为 system.manifest 的返回 JSON（注入运行时 app/engine/variant）。
+//!
+//! 从 wind-webapi/manifest.rs 原样迁移（仅 APP_VERSION 改为引用本 crate）。
 
 use std::path::PathBuf;
 
