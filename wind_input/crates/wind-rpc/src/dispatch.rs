@@ -112,7 +112,9 @@ fn handle(state: &DispatchState, method: &str, params: &Value) -> anyhow::Result
         "config.setItems" => set_items(state, params),
         "config.reload" => {
             // 变更通知：广播一个 config 变更事件，供订阅者（TSF/UI）刷新。
-            state.events.emit_config_changed(json!({ "reason": "reload" }));
+            state
+                .events
+                .emit_config_changed(json!({ "reason": "reload" }));
             Ok(json!({ "ok": true }))
         }
         // schema/dict/temp/freq/shadow/stats/theme/phrase 等数据类 RPC 转发到宿主 core。

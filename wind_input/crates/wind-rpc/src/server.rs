@@ -68,7 +68,11 @@ pub struct RpcServer {
 
 impl RpcServer {
     /// 构造 server：注入 core 实现，内部建好事件广播通道并接入 dispatch。
-    pub fn new(core: Arc<dyn CoreRpc>, variant: &'static str, suffix: &str) -> anyhow::Result<Self> {
+    pub fn new(
+        core: Arc<dyn CoreRpc>,
+        variant: &'static str,
+        suffix: &str,
+    ) -> anyhow::Result<Self> {
         let events = EventSink::new();
         let state = Arc::new(DispatchState::with_events(core, variant, events.clone())?);
         Ok(Self {
