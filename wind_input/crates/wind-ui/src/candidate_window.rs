@@ -412,7 +412,12 @@ impl CandidateWindow {
         };
         if let Some(tip) = self.tooltip.as_mut() {
             match info {
-                Some((code, r)) => tip.show(&code, wx + r.x as i32, wy + (r.y + r.h) as i32 + 2),
+                Some((code, r)) => tip.show(
+                    &code,
+                    wx + r.x as i32,
+                    wy + r.y as i32,         // 候选行上边界
+                    wy + (r.y + r.h) as i32, // 候选行下边界
+                ),
                 None => tip.hide(),
             }
         }

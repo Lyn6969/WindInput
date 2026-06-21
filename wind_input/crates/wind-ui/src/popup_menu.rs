@@ -140,12 +140,25 @@ impl MenuState {
     }
 
     /// 鼠标悬停到 (层 k, 行 r)：更新高亮、收起更深层、必要时展开子菜单。
+    /// 取消第 k 层高亮（仅当 k 为最深层，避免误关已展开子菜单）。鼠标移出条目时调用。
+    fn clear_hover(&mut self, k: usize) {
+        if k + 1 == self.levels.len() && self.levels[k].selected != NONE_SEL {
+            self.levels[k].selected = NONE_SEL;
+            self.dirty = true;
+        }
+    }
+
     fn hover(&mut self, k: usize, r: usize) {
         let (ok, sub) = match self.levels[k].items.get(r) {
             Some(it) => (selectable(it), is_submenu(it)),
-            None => return,
+            None => {
+                self.clear_hover(k);
+                return;
+            }
         };
+        // 禁用项/分隔符：不高亮，并清掉残留高亮（鼠标不在可选条目即不应高亮）。
         if !ok {
+            self.clear_hover(k);
             return;
         }
         if self.levels[k].selected != r {
@@ -581,13 +594,20 @@ impl PopupMenu {
         let item_h = (FONT_PX * 1.9 * s).ceil();
         let pad = Edges::xy(12.0 * s, 4.0 * s);
 
-        // 统一项宽 = 最长行 + 内边距；子菜单项额外预留 ▸ 列宽（右对齐固定到末端）。
+        // 统一项宽 = 勾选列 + 最长标签 + 内边距；子菜单项额外预留 ▸ 列宽（右对齐固定到末端）。
         let arrow_w = self.renderer.measure_text(SUBMENU_ARROW).width;
         let arrow_gap = 12.0 * s; // 标签与 ▸ 之间的最小留白
+        // 任一项可勾选时，所有项预留固定勾选列，保证文字左对齐（✓ 与空白等宽）。
+        let has_check = items.iter().any(|it| it.checked);
+        let check_col = if has_check {
+            self.renderer.measure_text(CHECK_MARK).width + 6.0 * s
+        } else {
+            0.0
+        };
         let mut max_label = 0.0f32;
         for it in items {
             if !is_separator(it) {
-                let mut w = self.renderer.measure_text(&row_text(it)).width;
+                let mut w = check_col + self.renderer.measure_text(&it.label).width;
                 if is_submenu(it) {
                     w += arrow_gap + arrow_w;
                 }
@@ -635,8 +655,17 @@ impl PopupMenu {
                 .pad(pad)
                 .radius(4.0 * s)
                 .cross(Align::Center)
-                .tag(i as i32)
-                .child(View::leaf(row_text(it), color));
+                .tag(i as i32);
+            // 勾选列（固定宽）：✓ 仅勾选项显示，但所有项占同宽 → 标签对齐。
+            if has_check {
+                let mark = if it.checked { CHECK_MARK } else { "" };
+                item = item.child(
+                    View::leaf(mark, color)
+                        .fixed_w(check_col)
+                        .text_align(Align::Start),
+                );
+            }
+            item = item.child(View::leaf(it.label.clone(), color));
             // 子菜单 ▸：弹性占位把它推到菜单项右端（与标签解耦，标准菜单观感）。
             if is_submenu(it) {
                 item = item
@@ -684,12 +713,8 @@ impl PopupMenu {
     }
 }
 
-/// 行显示文本：勾选前缀 + 标签 + 子菜单箭头。
-/// 行文本（不含子菜单 ▸；▸ 作为独立右对齐节点渲染）。
-fn row_text(it: &MenuItemSpec) -> String {
-    let mark = if it.checked { "✓ " } else { "   " };
-    format!("{}{}", mark, it.label)
-}
+/// 勾选标记（占独立固定宽列，保证标签对齐）。
+const CHECK_MARK: &str = "✓";
 
 /// 子菜单指示符（固定到菜单项右端）。
 const SUBMENU_ARROW: &str = "▸";
@@ -708,8 +733,12 @@ impl WindowMouse for MenuState {
         let (sx, sy) = self.screen(x, y);
         match msg {
             WM_MOUSEMOVE => {
-                if let Some((k, Some(r))) = self.find_hit(sx, sy) {
-                    self.hover(k, r);
+                match self.find_hit(sx, sy) {
+                    Some((k, Some(r))) => self.hover(k, r),
+                    // 面板内非条目处（分隔/空白）→ 取消该层高亮
+                    Some((k, None)) => self.clear_hover(k),
+                    // 菜单外 → 不强制清（移出窗口保持，避免边缘闪烁）
+                    None => {}
                 }
                 Some(LRESULT(0))
             }

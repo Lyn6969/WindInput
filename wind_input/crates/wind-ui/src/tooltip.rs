@@ -109,12 +109,14 @@ impl Tooltip {
     }
 
     /// 显示提示，左上角对齐 (x,y)（屏幕坐标）
-    pub fn show(&mut self, text: &str, x: i32, y: i32) {
+    /// 在候选行下方显示提示；下方放不下则上翻到候选行**上方**（让出整行高度，不遮候选）。
+    /// `anchor_top`/`anchor_bottom` 为候选行的屏幕上/下边界。
+    pub fn show(&mut self, text: &str, x: i32, anchor_top: i32, anchor_bottom: i32) {
         if text.is_empty() {
             self.hide();
             return;
         }
-        self.ensure_scale(x, y);
+        self.ensure_scale(x, anchor_bottom);
         let s = self.scale;
         let mut tip = View::leaf(text, self.fg)
             .bg(self.bg)
@@ -165,8 +167,8 @@ impl Tooltip {
         }
         let _ = self.window.update();
 
-        // 内容盒按工作区钳位，窗口原点 = 内容锚点 − 左/上 margin（阴影向四周溢出）。
-        let (px, py) = clamp_to_work_area(x, y, cw, ch);
+        // 内容盒按工作区钳位（下方优先，不足上翻到候选行上方）；窗口原点 = 内容锚点 − 左/上 margin。
+        let (px, py) = clamp_to_work_area(x, anchor_top, anchor_bottom, cw, ch);
         self.window.show(px - ml as i32, py - mt as i32);
         self.visible = true;
     }
@@ -197,8 +199,12 @@ fn dpi_scale() -> f32 {
     }
 }
 
+/// 钳位 tooltip 到工作区：默认候选行下方（anchor_bottom + gap）；下方放不下则上翻到候选行
+/// **上方**（anchor_top − gap − h，让出整行高度避免遮挡候选）；左右越界贴边。
 #[cfg_attr(not(windows), allow(unused_variables))]
-fn clamp_to_work_area(x: i32, y: i32, w: u32, h: u32) -> (i32, i32) {
+fn clamp_to_work_area(x: i32, anchor_top: i32, anchor_bottom: i32, w: u32, h: u32) -> (i32, i32) {
+    let gap = 2;
+    let (mut nx, mut ny) = (x, anchor_bottom + gap);
     #[cfg(windows)]
     {
         use windows::Win32::Foundation::POINT;
@@ -206,7 +212,10 @@ fn clamp_to_work_area(x: i32, y: i32, w: u32, h: u32) -> (i32, i32) {
             GetMonitorInfoW, MONITOR_DEFAULTTONEAREST, MONITORINFO, MonitorFromPoint,
         };
         unsafe {
-            let pt = POINT { x, y };
+            let pt = POINT {
+                x,
+                y: anchor_bottom,
+            };
             let mon = MonitorFromPoint(pt, MONITOR_DEFAULTTONEAREST);
             let mut mi = MONITORINFO {
                 cbSize: std::mem::size_of::<MONITORINFO>() as u32,
@@ -215,13 +224,12 @@ fn clamp_to_work_area(x: i32, y: i32, w: u32, h: u32) -> (i32, i32) {
             if GetMonitorInfoW(mon, &mut mi).as_bool() {
                 let wa = mi.rcWork;
                 let (wi, hi) = (w as i32, h as i32);
-                let mut nx = x;
-                let mut ny = y;
+                // 下方放不下 → 上翻到候选行上方（让出整行高度，不遮候选）
+                if ny + hi > wa.bottom {
+                    ny = (anchor_top - gap - hi).max(wa.top);
+                }
                 if nx + wi > wa.right {
                     nx = wa.right - wi;
-                }
-                if ny + hi > wa.bottom {
-                    ny = (y - hi).max(wa.top);
                 }
                 if nx < wa.left {
                     nx = wa.left;
@@ -233,5 +241,5 @@ fn clamp_to_work_area(x: i32, y: i32, w: u32, h: u32) -> (i32, i32) {
             }
         }
     }
-    (x, y)
+    (nx, ny)
 }
