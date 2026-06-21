@@ -187,7 +187,13 @@ function Build-Setting {
         pnpm install
         if ($LASTEXITCODE -ne 0) { Write-Host "pnpm install 失败!" -ForegroundColor Red; return }
     }
-    if ($Debug) { pnpm tauri build --debug } else { pnpm tauri build }
+    # debug 变体：必须把管道后缀 _debug 烤进 exe（终端用户启动时无环境变量），
+    # 故传 cargo --features debug_variant；--features 经 tauri 透传给 cargo。
+    if ($Debug) {
+        pnpm tauri build --debug --features debug_variant
+    } else {
+        pnpm tauri build
+    }
     if ($LASTEXITCODE -ne 0) { Write-Host "tauri build 失败!" -ForegroundColor Red; return }
 
     # Tauri 原始 exe 位于 src-tauri\target\<profile>\<bin>.exe（顶层，非 deps\）。
