@@ -830,6 +830,20 @@ min = -400
 max = 400
 since = 3
 
+[[items]]
+key = "ui.status_tip.schema_name_style"
+group = "ui"
+section = "状态提示"
+type = "select"
+label = "方案名显示样式"
+hint = "状态气泡里方案名用全名或图标短称"
+default = "full"
+since = 3
+options = [
+  { value = "full", label = "全名" },
+  { value = "short", label = "图标短称", description = "用方案 icon_label，无则回退全名" },
+]
+
 # ── 特性可用性（模块 + 子特性两层；web 据此显示/隐藏/禁用）──
 # 保留另一会话约定；随各命名空间深化(temp/freq/shadow/stats/phrase/theme)逐步开启。
 [features.dict]

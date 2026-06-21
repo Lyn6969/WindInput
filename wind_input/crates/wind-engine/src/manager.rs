@@ -290,6 +290,18 @@ impl EngineManager {
         name
     }
 
+    /// 指定方案的图标短称（schema.icon_label）；未配置返回空串。
+    /// 用于状态气泡 short 模式（对齐 Go GetSchemaDisplayInfo 的 iconLabel）。
+    pub fn schema_icon_label(&self, schema_id: &str) -> String {
+        Self::read_schema(
+            schema_id,
+            self.data_dir.as_deref(),
+            self.override_dir.as_deref(),
+        )
+        .map(|s| s.schema.icon_label)
+        .unwrap_or_default()
+    }
+
     /// 指定方案的引擎类型字符串（小写，如 "pinyin"|"codetable"|"mixed"）；读不到返回 None。
     /// 不切换活跃方案（设置页 dict.encode 据此选拼音/五笔出码规则）。
     pub fn schema_engine_type(&self, schema_id: &str) -> Option<String> {

@@ -1498,8 +1498,23 @@ impl Coordinator {
             parts.push("英".into());
         } else {
             let id = self.engine_mgr.active_schema_id();
-            let name = self.engine_mgr.schema_name(&id);
-            parts.push(if name.is_empty() { "中".into() } else { name });
+            // short 样式优先图标短称(icon_label)，无则回退全名；对齐 Go schema_name_style。
+            let short = self.rt().config.ui.status_tip.schema_name_style == "short";
+            let label = if short {
+                let icon = self.engine_mgr.schema_icon_label(&id);
+                if icon.is_empty() {
+                    self.engine_mgr.schema_name(&id)
+                } else {
+                    icon
+                }
+            } else {
+                self.engine_mgr.schema_name(&id)
+            };
+            parts.push(if label.is_empty() {
+                "中".into()
+            } else {
+                label
+            });
         }
         // 标点（总显示）
         parts.push(if punct_cn { "。".into() } else { ".".into() });

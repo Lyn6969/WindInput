@@ -441,8 +441,8 @@ pub struct UiConfig {
 }
 
 /// 状态提示气泡配置（[ui.status_tip]）：中英/标点/全半角/方案切换的瞬时气泡。
-/// 尺寸跟随主题（theme.views.status），此处仅微调位置偏移。
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+/// 尺寸跟随主题（theme.views.status），此处仅微调位置偏移与方案名样式。
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StatusTipConfig {
     /// 相对默认位置（光标下方居中）的水平偏移（像素，正=右）。
     #[serde(default)]
@@ -450,6 +450,24 @@ pub struct StatusTipConfig {
     /// 相对默认位置的垂直偏移（像素，正=下）。
     #[serde(default)]
     pub offset_y: i32,
+    /// 方案名显示样式："full"（全名，默认）| "short"（图标短称 icon_label，回退全名）。
+    /// 对齐 Go ui.status_indicator.schema_name_style。
+    #[serde(default = "default_schema_name_style")]
+    pub schema_name_style: String,
+}
+
+fn default_schema_name_style() -> String {
+    "full".to_string()
+}
+
+impl Default for StatusTipConfig {
+    fn default() -> Self {
+        Self {
+            offset_x: 0,
+            offset_y: 0,
+            schema_name_style: default_schema_name_style(),
+        }
+    }
 }
 
 /// 模式指示器配置（[ui.mode_indicator]）：进入临时拼音/双拼/快捷/英文/快符等模式时的标识。
