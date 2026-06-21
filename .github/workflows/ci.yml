@@ -18,9 +18,10 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # mingw-w64:C++ TSF DLL 用;clang/lld/llvm:cargo-xwin 交叉编 Rust(MSVC)用
-      - name: 安装 mingw-w64 + clang/lld/llvm
-        run: sudo apt-get update && sudo apt-get install -y mingw-w64 clang lld llvm
+      # 统一 MSVC 工具链:clang-19(C++ TSF 需 clang≥19)+ lld-19 + llvm-19;
+      # cargo-xwin 交叉编 Rust、clang 交叉编 C++ TSF,均经 MSVC SDK(无需 mingw)。
+      - name: 安装 clang-19/lld-19/llvm-19
+        run: sudo apt-get update && sudo apt-get install -y clang-19 lld-19 llvm-19
 
       - uses: dtolnay/rust-toolchain@stable
         with:
@@ -58,9 +59,9 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # clang/lld/llvm:Tauri(src-tauri)经 cargo-xwin 交叉编 MSVC(用 WebView2,无需 Linux GTK)
-      - name: 安装 clang/lld/llvm
-        run: sudo apt-get update && sudo apt-get install -y clang lld llvm
+      # clang-19/lld-19/llvm-19:Tauri(src-tauri)经 cargo-xwin 交叉编 MSVC(用 WebView2,无需 Linux GTK)
+      - name: 安装 clang-19/lld-19/llvm-19
+        run: sudo apt-get update && sudo apt-get install -y clang-19 lld-19 llvm-19
 
       - uses: dtolnay/rust-toolchain@stable
         with:

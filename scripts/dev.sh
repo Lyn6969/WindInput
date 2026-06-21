@@ -99,26 +99,35 @@ warn() { printf '%b%b%b\n' "$C_YELLOW" "$1" "$C_RESET"; }
 err()  { printf '%b%b%b\n' "$C_RED" "$1" "$C_RESET"; }
 gray() { printf '%b%b%b\n' "$C_GRAY" "$1" "$C_RESET"; }
 
-# ---------- cargo-xwin (MSVC 交叉编译) ----------
-# cargo-xwin 在 Linux 上交叉编 *-pc-windows-msvc:底层用 clang(当 clang-cl 调用)
-# + lld-link + llvm-rc/llvm-lib,首次自动下载 MSVC CRT/Windows SDK(缓存于
-# ~/.cache/cargo-xwin)。依赖:cargo-xwin、clang、lld、llvm。
+# ---------- cargo-xwin / clang (统一 MSVC 交叉编译工具链) ----------
+# Rust/Tauri 经 cargo-xwin、C++ TSF 经 clang+llvm-rc,均交叉编 *-pc-windows-msvc,
+# 共用 cargo-xwin 下载的 MSVC CRT/Windows SDK(缓存于 ~/.cache/cargo-xwin)。
+# 统一用带版本号的 clang(MSVC STL 要求 clang≥19);可用 WIND_LLVM_VER 切到 20。
+# 依赖:cargo-xwin、clang-<ver>、lld-<ver>、llvm-<ver>(含 llvm-rc/llvm-lib)。
 XWIN_BIN="$HOME/.local/xwin-bin"
+WIND_LLVM_VER="${WIND_LLVM_VER:-19}"
 setup_xwin_env() {
-    # clang-cl 多数发行版无独立二进制,用 clang 改名调用(按 argv[0] 切 cl 模式);幂等。
-    if ! command -v clang-cl >/dev/null 2>&1; then
-        if command -v clang >/dev/null 2>&1; then
-            mkdir -p "$XWIN_BIN"
-            ln -sf "$(command -v clang)" "$XWIN_BIN/clang-cl"
-            case ":$PATH:" in *":$XWIN_BIN:"*) ;; *) export PATH="$XWIN_BIN:$PATH";; esac
-        else
-            err "未找到 clang;请安装 clang lld llvm(cargo-xwin 依赖)。"; return 1
-        fi
+    local v="$WIND_LLVM_VER"
+    if ! command -v "clang-$v" >/dev/null 2>&1; then
+        err "未找到 clang-$v;请安装 clang-$v lld-$v llvm-$v(MSVC STL 要求 clang≥19)。"
+        return 1
     fi
     if ! command -v cargo-xwin >/dev/null 2>&1; then
         err "未找到 cargo-xwin;请运行 'cargo install cargo-xwin'。"; return 1
     fi
+    # 软链桥:cargo-xwin 按无版本名搜索 clang-cl/lld-link/llvm-rc/llvm-lib/llvm-dlltool,
+    # 全部指向 -<v>,使整条链(Rust/Tauri + C 依赖 + 链接)统一走 clang-<v>。幂等。
+    mkdir -p "$XWIN_BIN"
+    ln -sf "$(command -v clang-$v)"          "$XWIN_BIN/clang-cl"
+    ln -sf "$(command -v clang-$v)"          "$XWIN_BIN/clang"
+    ln -sf "$(command -v clang++-$v)"        "$XWIN_BIN/clang++"
+    ln -sf "$(command -v lld-link-$v)"       "$XWIN_BIN/lld-link"     2>/dev/null || true
+    ln -sf "$(command -v llvm-rc-$v)"        "$XWIN_BIN/llvm-rc"      2>/dev/null || true
+    ln -sf "$(command -v llvm-lib-$v)"       "$XWIN_BIN/llvm-lib"     2>/dev/null || true
+    ln -sf "$(command -v llvm-dlltool-$v)"   "$XWIN_BIN/llvm-dlltool" 2>/dev/null || true
+    case ":$PATH:" in *":$XWIN_BIN:"*) ;; *) export PATH="$XWIN_BIN:$PATH";; esac
     export XWIN_ACCEPT_LICENSE="${XWIN_ACCEPT_LICENSE:-1}"  # 接受微软 SDK/CRT 许可
+    export XWIN_ARCH="${XWIN_ARCH:-x86,x86_64}"             # 同时 splat 32/64 位(x86 TSF 需要)
 }
 
 # 统一 MSVC 构建入口:确保工具链就绪,并注入 +crt-static(静态链 MSVC 运行时,
@@ -211,9 +220,13 @@ build_tsf() {
     local debug="${2:-}"
     mkdir -p "$outdir"
 
-    if ! command -v x86_64-w64-mingw32-g++ >/dev/null 2>&1; then
-        warn "未找到 x86_64-w64-mingw32-g++（mingw-w64 工具链）；跳过 TSF 构建。"
-        gray "  安装后可构建 TSF DLL；'push' 经 SSH 部署时也可复用 Windows 上已有的 DLL。"
+    if ! command -v "clang++-$WIND_LLVM_VER" >/dev/null 2>&1; then
+        warn "未找到 clang++-$WIND_LLVM_VER（C++ TSF 经 clang/MSVC 交叉编译，需 clang≥19）；跳过 TSF 构建。"
+        gray "  安装 clang-$WIND_LLVM_VER lld-$WIND_LLVM_VER llvm-$WIND_LLVM_VER 后可构建；'push' 经 SSH 也可复用 Windows 已有 DLL。"
+        return 0
+    fi
+    if [ ! -d "$HOME/.cache/cargo-xwin/xwin/sdk" ]; then
+        warn "未找到 cargo-xwin 的 MSVC SDK 缓存；请先跑一次 'dev.sh release/dist'（会下载 SDK）。跳过 TSF。"
         return 0
     fi
 
@@ -224,9 +237,10 @@ build_tsf() {
         mk_args=""; dll="wind_tsf.dll"
     fi
 
-    say "\n正在交叉编译 TSF DLL ($dll)..."
-    # 让 make 直接输出到目标目录，避免二次复制
-    if make -C "$TSF_DIR" $mk_args VERSION="$VERSION" OUTDIR="$outdir" >/dev/null; then
+    say "\n正在交叉编译 TSF DLL ($dll, clang-$WIND_LLVM_VER/MSVC)..."
+    # 让 make 直接输出到目标目录，避免二次复制；CLANG/LLVM_RC 跟随 WIND_LLVM_VER
+    if make -C "$TSF_DIR" $mk_args VERSION="$VERSION" OUTDIR="$outdir" \
+         CLANG="clang++-$WIND_LLVM_VER" LLVM_RC="llvm-rc-$WIND_LLVM_VER" >/dev/null; then
         gray "已构建: $dll ($(du -h "$outdir/$dll" 2>/dev/null | cut -f1))"
     else
         err "TSF DLL 构建失败！见 'make -C $TSF_DIR $mk_args' 输出。"
@@ -630,16 +644,18 @@ do_dist() {
 
     do_build || return 1                    # release exe + x64 TSF + copy_data
 
-    # x86 TSF（32 位宿主程序兼容,需要 i686 工具链）
-    if command -v i686-w64-mingw32-g++ >/dev/null 2>&1; then
-        say "\n交叉编译 x86 TSF DLL (wind_tsf_x86.dll)..."
-        if make -C "$TSF_DIR" x86 VERSION="$VERSION" OUTDIR="$outdir" >/dev/null; then
+    # x86 TSF（32 位宿主程序兼容；同一 clang 用 --target=i686 交叉编，x86 SDK 由
+    # cargo-xwin 按 XWIN_ARCH=x86,x86_64 splat，已在上面 do_build 的 cargo_xwin 触发）
+    if command -v "clang++-$WIND_LLVM_VER" >/dev/null 2>&1; then
+        say "\n交叉编译 x86 TSF DLL (wind_tsf_x86.dll, clang-$WIND_LLVM_VER/MSVC)..."
+        if make -C "$TSF_DIR" x86 VERSION="$VERSION" OUTDIR="$outdir" \
+             CLANG="clang++-$WIND_LLVM_VER" LLVM_RC="llvm-rc-$WIND_LLVM_VER" >/dev/null; then
             gray "已构建: wind_tsf_x86.dll ($(du -h "$outdir/wind_tsf_x86.dll" 2>/dev/null | cut -f1))"
         else
             err "x86 TSF 构建失败！见 'make -C $TSF_DIR x86' 输出。"; return 1
         fi
     else
-        warn "未找到 i686-w64-mingw32-g++；跳过 x86 TSF（32 位宿主将无输入法）。"
+        warn "未找到 clang++-$WIND_LLVM_VER；跳过 x86 TSF（32 位宿主将无输入法）。"
     fi
 
     # 正式数据(下载词库 + gen_unigram + assemble→编译 opencc octrie)

@@ -37,9 +37,10 @@ jobs:
           path: wind-ui-rust
           token: ${{ secrets.WIND_REPOS_TOKEN }}
 
-      # mingw-w64:C++ TSF DLL 用;clang/lld/llvm:cargo-xwin 交叉编 Rust(MSVC)用
-      - name: 安装 mingw-w64 + clang/lld/llvm
-        run: sudo apt-get update && sudo apt-get install -y mingw-w64 clang lld llvm
+      # 统一 MSVC 工具链:clang-19(C++ TSF 需 clang≥19)+ lld-19 + llvm-19;
+      # Rust 经 cargo-xwin、C++ TSF 经 clang,均走 MSVC SDK(无需 mingw)。
+      - name: 安装 clang-19/lld-19/llvm-19
+        run: sudo apt-get update && sudo apt-get install -y clang-19 lld-19 llvm-19
 
       - uses: dtolnay/rust-toolchain@stable
         with:
