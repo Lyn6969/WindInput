@@ -53,7 +53,8 @@ else
   DBGSUFFIX :=
   DISPLAY_NAME := 清风输入法
 endif
-TARGET := wind_tsf$(ARCHSUFFIX)$(DBGSUFFIX)
+# 命名顺序对齐 Go 版：base + _debug + _x86（如 wind_tsf_debug_x86.dll）
+TARGET := wind_tsf$(DBGSUFFIX)$(ARCHSUFFIX)
 
 # 版本号拆分（X.Y.Z[-suffix] → MAJOR/MINOR/PATCH）
 VER_CLEAN := $(firstword $(subst -, ,$(VERSION)))

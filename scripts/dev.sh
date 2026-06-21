@@ -373,9 +373,8 @@ require_remote() {
     fi
 }
 
-# 解析远端安装目录（按 profile）。结果写入全局 REMOTE_DIR。
-#   release → WIND_REMOTE_DIR_RELEASE（兼容旧 WIND_REMOTE_DIR）
-#   debug   → WIND_REMOTE_DIR_DEBUG
+# 解析远端安装目录（按 profile）。结果写入全局 REMOTE_DIR（去尾斜杠避免 // ）。
+#   release → WIND_REMOTE_DIR_RELEASE（兼容旧 WIND_REMOTE_DIR）；debug → WIND_REMOTE_DIR_DEBUG
 resolve_remote_dir() {
     local profile="${1:-release}"
     if [ "$profile" = debug ]; then
@@ -385,7 +384,23 @@ resolve_remote_dir() {
         REMOTE_DIR="${WIND_REMOTE_DIR_RELEASE:-${WIND_REMOTE_DIR:-}}"
         [ -n "$REMOTE_DIR" ] || { err "未配置 WIND_REMOTE_DIR_RELEASE（deploy.local）"; return 1; }
     fi
+    REMOTE_DIR="${REMOTE_DIR%/}"
 }
+
+# 在远端跑 PowerShell：脚本经 UTF-16LE+base64 编码传入，彻底避开 bash/ssh/cmd 多层引号。
+remote_ps() {
+    command -v iconv >/dev/null 2>&1 || { err "需要 iconv（编码远端 PowerShell 脚本）"; return 1; }
+    local b64; b64="$(printf '%s' "$1" | iconv -t UTF-16LE | base64 | tr -d '\n')"
+    ssh "$WIND_REMOTE" "powershell -NoProfile -EncodedCommand $b64"
+}
+
+# 本 profile 的二进制基名（exe/dll）。data/ 不在此（不会被锁，直接 scp 覆盖）。
+bins_for() {
+    local sfx=""; [ "$1" = debug ] && sfx="_debug"
+}
+
+# 把 bash 列表转成 PowerShell 字符串数组字面量： a b → 'a','b'
+ps_list() { local out="" x; for x in "$@"; do out="$out${out:+,}'$x'"; done; printf '%s' "$out"; }
 
 # 终止远端进程（按 profile 决定 _debug 后缀；mod 限定只杀该模块的进程）。
 remote_taskkill() {
@@ -402,7 +417,27 @@ remote_taskkill() {
     sleep 1
 }
 
-# 全量 push：把整个 build[_debug]/ 覆盖到远端安装目录（= 干净安装内容）。
+# 把加载中的旧二进制改名让路（已加载的 DLL/EXE 可改名、不可覆盖）。$@ = 基名列表。
+remote_rename_aside() {
+    local arr; arr="$(ps_list "$@")"
+    remote_ps "\$ErrorActionPreference='SilentlyContinue'; \$d='$REMOTE_DIR'; \
+foreach(\$n in @($arr)){ \$p=Join-Path \$d \$n; if(Test-Path \$p){ Rename-Item \$p (\$n+'.old_'+(Get-Random)) -Force } }" >/dev/null 2>&1 || true
+}
+
+# 启动远端主进程（避免等 TSF 被动加载）。
+remote_start_main() {
+    local profile="$1" sfx=""; [ "$profile" = debug ] && sfx="_debug"
+    say "启动远端主进程 wind_input${sfx}.exe ..."
+    remote_ps "Start-Process -FilePath (Join-Path '$REMOTE_DIR' 'wind_input${sfx}.exe') -WorkingDirectory '$REMOTE_DIR'" >/dev/null 2>&1 \
+        || warn "启动主进程失败（可在 Windows 手动启动）。"
+}
+
+# 清理历史改名残留 .old_*（仍被占用的会自动跳过，下次部署再清）。
+remote_cleanup_old() {
+    remote_ps "Get-ChildItem -Path '$REMOTE_DIR' -Filter '*.old_*' -EA SilentlyContinue | Remove-Item -Force -EA SilentlyContinue" >/dev/null 2>&1 || true
+}
+
+# 全量 push：整个 build[_debug]/ → 远端安装目录（先改名锁定二进制让路，再 scp 覆盖，最后起主进程）。
 #   p1 / pd1
 do_push_full() {
     local profile="${1:-release}"
@@ -412,12 +447,17 @@ do_push_full() {
     [ -d "$outdir" ] || { err "无 $outdir；请先 '$([ "$profile" = debug ] && echo d1 || echo 1)' 全构建。"; return 1; }
     say "\n停止远端进程（$profile）..."
     remote_taskkill "$profile"
+    ssh "$WIND_REMOTE" "if not exist \"${REMOTE_DIR//\//\\}\" mkdir \"${REMOTE_DIR//\//\\}\"" >/dev/null 2>&1 || true
+    local bins; mapfile -t bins < <(bins_for "$profile")
+    say "改名让路（加载中的 DLL/EXE）..."
+    remote_rename_aside "${bins[@]}"
     say "全量推送 $outdir/ → $WIND_REMOTE:$REMOTE_DIR/"
-    ssh "$WIND_REMOTE" "if not exist \"$REMOTE_DIR\" mkdir \"$REMOTE_DIR\"" >/dev/null 2>&1 || true
     if scp -r "$outdir"/* "$WIND_REMOTE:$REMOTE_DIR/"; then
-        say "已全量推送（$profile）。请在 Windows 重启输入法。"
+        remote_start_main "$profile"
+        remote_cleanup_old
+        say "已全量部署并启动（$profile）。"
     else
-        err "scp 失败：检查 $([ "$profile" = debug ] && echo WIND_REMOTE_DIR_DEBUG || echo WIND_REMOTE_DIR_RELEASE) 路径(正斜杠)、SSH、文件占用"
+        err "scp 失败：检查 $([ "$profile" = debug ] && echo WIND_REMOTE_DIR_DEBUG || echo WIND_REMOTE_DIR_RELEASE) 路径(正斜杠)、SSH、磁盘。"
         return 1
     fi
 }
@@ -432,22 +472,29 @@ do_push_module() {
     local sfx=""; [ "$profile" = debug ] && sfx="_debug"
     local files=()
     case "$mod" in
-        tsf)     files=("wind_tsf${sfx}.dll" "wind_tsf_x86${sfx}.dll") ;;
+        tsf)     files=("wind_tsf${sfx}.dll" "wind_tsf${sfx}_x86.dll") ;;
         core)    files=("wind_input${sfx}.exe") ;;
         *)       err "未知模块: $mod（tsf|core|setting）"; return 1 ;;
     esac
+    local f
+    for f in "${files[@]}"; do
+        [ -f "$outdir/$f" ] || { err "本地无 $outdir/$f（先构建对应模块）"; return 1; }
+    done
     say "\n停止远端进程（$profile/$mod）..."
     remote_taskkill "$profile" "$mod"
-    local f ok=1
+    say "改名让路 + 推送..."
+    remote_rename_aside "${files[@]}"
+    local ok=1
     for f in "${files[@]}"; do
-        if [ -f "$outdir/$f" ]; then
-            say "推送 $f → $REMOTE_DIR/"
-            scp "$outdir/$f" "$WIND_REMOTE:$REMOTE_DIR/$f" || { err "scp $f 失败"; ok=0; }
-        else
-            warn "本地无 $outdir/$f（先构建对应模块）"; ok=0
-        fi
+        say "推送 $f → $REMOTE_DIR/"
+        scp "$outdir/$f" "$WIND_REMOTE:$REMOTE_DIR/$f" || { err "scp $f 失败"; ok=0; }
     done
-    [ "$ok" = 1 ] && say "模块推送完成（$profile/$mod）。请在 Windows 重启输入法。"
+    if [ "$ok" = 1 ]; then
+        # 推了核心/TSF 则重启主进程让其立即生效
+        case "$mod" in core|tsf) remote_start_main "$profile" ;; esac
+        remote_cleanup_old
+        say "模块部署完成（$profile/$mod）。"
+    fi
 }
 
 # 从 Windows 安装目录拉取已处理的 data/（含真实词库）到 .cache/pulled-data/ 供 REPL 使用。
@@ -731,7 +778,7 @@ dispatch() {
         pc|pull-config)   do_pull_config ;;
         pl|pull-log)      do_pull_log "${2:-}" ;;
         pla)              do_pull_log all ;;
-        *)                return 1 ;;
+        *)                return 127 ;;   # 哨兵:未知命令（区别于命令执行失败的非 0 返回）
     esac
 }
 
@@ -746,7 +793,15 @@ menu_loop() {
         case "$choice" in
             q) exit 0 ;;
             "") ;;
-            *) if dispatch "$choice"; then pause; else err "无效选项"; sleep 1; fi ;;
+            *)
+                dispatch "$choice"; local rc=$?
+                if [ "$rc" -eq 127 ]; then
+                    err "无效选项: $choice"; sleep 1     # 未知命令:短暂提示后刷新菜单
+                else
+                    [ "$rc" -ne 0 ] && err "\n命令 '$choice' 失败 (退出码 $rc)"
+                    pause                                # 已知命令:无论成败都停下，让你看到输出/错误
+                fi
+                ;;
         esac
     done
 }
@@ -760,10 +815,12 @@ case "$cmd" in
         grep '^#' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
         ;;
     *)
-        if ! dispatch "$cmd" "${2:-}"; then
+        dispatch "$cmd" "${2:-}"; rc=$?
+        if [ "$rc" -eq 127 ]; then
             err "未知命令: $1"
             echo "运行 './scripts/dev.sh --help' 查看可用命令"
             exit 1
         fi
+        exit "$rc"   # 透传命令真实退出码（CLI/CI 用）
         ;;
 esac
