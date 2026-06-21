@@ -13,6 +13,18 @@ use serde_json::{Value, json};
 
 use crate::coordinator::Coordinator;
 
+/// 解析方案的权威引擎类型（schema.toml 的 engine.type 可能为空，
+/// 此时按 Schema::is_pinyin/is_mixed 依据默认词库类型推断）。
+fn resolve_engine_type(s: &wind_config::Schema) -> &'static str {
+    if s.is_mixed() {
+        "mixed"
+    } else if s.is_pinyin() {
+        "pinyin"
+    } else {
+        "codetable"
+    }
+}
+
 fn str_param<'a>(p: &'a Value, key: &str) -> anyhow::Result<&'a str> {
     p.get(key)
         .and_then(|v| v.as_str())
@@ -138,7 +150,14 @@ impl Coordinator {
             .engine_mgr
             .available_schemas()
             .iter()
-            .map(|id| json!({ "id": id, "name": self.engine_mgr.schema_name(id), "builtin": true }))
+            .map(|id| {
+                json!({
+                    "id": id,
+                    "name": self.engine_mgr.schema_name(id),
+                    "engineType": self.engine_mgr.schema_merged(id).as_ref().map(resolve_engine_type),
+                    "builtin": true,
+                })
+            })
             .collect();
         Ok(json!(items))
     }
@@ -281,7 +300,15 @@ impl Coordinator {
     fn web_schema_get_config(&self, params: &Value) -> anyhow::Result<Value> {
         let id = str_param(params, "id")?;
         match self.engine_mgr.schema_merged(id) {
-            Some(schema) => Ok(serde_json::to_value(schema)?),
+            Some(schema) => {
+                let etype = resolve_engine_type(&schema);
+                let mut v = serde_json::to_value(schema)?;
+                // 确保 engine.type 为解析后的权威类型（schema.toml 可能未显式声明）
+                if let Some(eng) = v.get_mut("engine").and_then(|e| e.as_object_mut()) {
+                    eng.insert("type".to_string(), json!(etype));
+                }
+                Ok(v)
+            }
             None => Ok(json!({})),
         }
     }
