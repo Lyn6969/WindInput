@@ -422,11 +422,26 @@ foreach(\$n in @($arr)){ \$p=Join-Path \$d \$n; if(Test-Path \$p){ Rename-Item \
 }
 
 # 启动远端主进程（避免等 TSF 被动加载）。
+# 注意：经 SSH 直接 Start-Process 的子进程会随 SSH 断开被 Job Object 连带杀掉
+# （症状：部署后看不到进程）。改用计划任务(schtasks)在用户交互会话拉起，脱离 SSH 生命周期。
 remote_start_main() {
     local profile="$1" sfx=""; [ "$profile" = debug ] && sfx="_debug"
-    say "启动远端主进程 wind_input${sfx}.exe ..."
-    remote_ps "Start-Process -FilePath (Join-Path '$REMOTE_DIR' 'wind_input${sfx}.exe') -WorkingDirectory '$REMOTE_DIR'" >/dev/null 2>&1 \
-        || warn "启动主进程失败（可在 Windows 手动启动）。"
+    local exe="$REMOTE_DIR/wind_input${sfx}.exe"
+    say "启动远端主进程 wind_input${sfx}.exe (计划任务,脱离 SSH 会话)..."
+    # 用 ScheduledTasks cmdlet 在用户交互会话(session 1)拉起：进程脱离 SSH 的
+    # Job Object，SSH 断开后仍存活；路径作普通字符串传入，无 cmd 引号困扰。
+    remote_ps "\$ErrorActionPreference='SilentlyContinue'; \
+\$exe='$exe'.Replace('/','\\'); \$wd='$REMOTE_DIR'.Replace('/','\\'); \
+\$a=New-ScheduledTaskAction -Execute \$exe -WorkingDirectory \$wd; \
+Register-ScheduledTask -TaskName 'WindInputDeployBoot' -Action \$a -Force | Out-Null; \
+Start-ScheduledTask -TaskName 'WindInputDeployBoot'; Start-Sleep -Seconds 2; \
+Unregister-ScheduledTask -TaskName 'WindInputDeployBoot' -Confirm:\$false" >/dev/null 2>&1 || true
+    sleep 2
+    if ssh "$WIND_REMOTE" "tasklist /FI \"IMAGENAME eq wind_input${sfx}.exe\" /NH" 2>/dev/null | grep -qi "wind_input${sfx}.exe"; then
+        say "主进程已启动并存活。"
+    else
+        warn "未检测到主进程存活（可能被单例/任务策略挡住）；可在 Windows 手动启动，或开始输入由 TSF 拉起。"
+    fi
 }
 
 # 清理历史改名残留 .old_*（仍被占用的会自动跳过，下次部署再清）。
