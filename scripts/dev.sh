@@ -17,8 +17,11 @@
 #   check   | 2     cargo check (Windows 目标, 全工作区)
 #   clippy  | 3     cargo clippy (Windows 目标, 全工作区)
 #   test    | 4     cargo test (本机, 全工作区)
+#   dist    | d     构建完整发布目录 (release exe + x64/x86 TSF + 正式词库 → build/)
+#   installer | pack | 8   一键生成安装包 (dist + pack-installer → Setup.exe)
+#   installer-skip | 8s    生成安装包但跳过编译 (直接打包现有 build/)
 #   deploy  | 5     完整部署 (复制 DLL + data)
-#   tsf     | 6     构建 C++ TSF DLL (MinGW 交叉编译; tsf debug → 调试变体)
+#   tsf     | 6     构建 C++ TSF DLL (clang/MSVC 交叉编译; tsf debug → 调试变体)
 #   data    | 7     组装 data/（data/ 源 + .cache/ 下载 → build_debug/data/）
 #   fmt     | f     cargo fmt
 #   fmt-check       cargo fmt --check (CI 用)
@@ -665,7 +668,24 @@ do_dist() {
     verify_dist_data "$outdir" || return 1
 
     say "\n发布目录就绪 → $outdir"
-    say "  打包: scripts/pack-installer.sh --version $VERSION"
+    say "  打包: scripts/dev.sh installer（或 scripts/pack-installer.sh --version $VERSION）"
+}
+
+# ---------- 一键生成安装包 ----------
+# do_dist（完整构建 exe + x64/x86 TSF + 正式 data）→ pack-installer.sh 出自解压 Setup.exe。
+#   installer        完整重建 + 打包（对应 Go dev.ps1 的 8）
+#   installer skip   跳过重建，直接打包现有 build/（对应 8s）
+do_installer() {
+    local skip="${1:-}"
+    if [ "$skip" = "skip" ]; then
+        say "\n跳过构建，直接打包现有 $BUILD_DIR/"
+        [ -f "$BUILD_DIR/wind_input.exe" ] || {
+            err "build/ 无产物；请先运行 'dev.sh installer'（不带 skip）或 'dev.sh dist'。"; return 1; }
+    else
+        do_dist || return 1
+    fi
+    say "\n=== 打包安装程序 ==="
+    "$SCRIPT_DIR/pack-installer.sh" --version "$VERSION" || return 1
 }
 
 # ---------- 菜单 ----------
@@ -730,9 +750,13 @@ show_menu() {
     echo  "    2  - cargo check (快速编译检查)"
     echo  "    3  - cargo clippy (代码检查)"
     echo  "    4  - cargo test (运行测试, 本机)"
+    printf '\n%b  发布:%b\n' "$C_YELLOW" "$C_RESET"
+    echo  "    d  - dist: 构建完整发布目录 (exe + x64/x86 TSF + 正式词库)"
+    echo  "    8  - 生成安装包 (dist + 打包 → Setup.exe)"
+    echo  "    8s - 生成安装包 (跳过编译, 直接打包现有 build/)"
     printf '\n%b  部署 (本机 build/ 镜像):%b\n' "$C_YELLOW" "$C_RESET"
     echo  "    5  - 完整部署 (复制 DLL + data 到 build/)"
-    echo  "    6  - 构建 C++ TSF DLL (MinGW 交叉编译)"
+    echo  "    6  - 构建 C++ TSF DLL (clang/MSVC 交叉编译)"
     echo  "    7  - 组装 data/ (data/ 源 + .cache/ → build_debug/data/)"
     printf '\n%b  实测 / 远程 (SSH → %s):%b\n' "$C_YELLOW" "${WIND_REMOTE:-未配置}" "$C_RESET"
     echo  "    r  - 候选 REPL (本机验证, 无需 Windows)"
@@ -771,6 +795,9 @@ menu_loop() {
             2)   do_check;          pause ;;
             3)   do_clippy;         pause ;;
             4)   do_test;           pause ;;
+            d)   do_dist;           pause ;;
+            8)   do_installer;      pause ;;
+            8s)  do_installer skip;  pause ;;
             5)   deploy_all;        pause ;;
             6)   build_tsf;         pause ;;
             7)   copy_data "$BUILD_DEBUG_DIR"; pause ;;
@@ -825,7 +852,9 @@ case "$cmd" in
     pull-log|pl)          do_pull_log "${2:-}" ;;
     pla)                  do_pull_log all ;;
     gen-data|gd)          do_gen_data ;;
-    dist)                 do_dist ;;
+    dist|d)               do_dist ;;
+    installer|pack|8)     do_installer ;;
+    installer-skip|8s)    do_installer skip ;;
     -h|--help|help)
         grep '^#' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
         ;;
