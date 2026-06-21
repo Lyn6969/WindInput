@@ -107,6 +107,10 @@ cp -f  "$BUILD_DIR/wind_tsf_x86.dll" "$STAGE/"
 cp -rf "$BUILD_DIR/data"             "$STAGE/"
 cp -f  "$UNINSTALLER"                "$STAGE/uninstall.exe"
 
+# 跨平台限制：Linux 交叉编不出 Tauri Windows 包，故可选——存在即随包，缺失仅告警。
+else
+fi
+
 # ---- 阶段一:压缩打包 ----
 echo ">>> 阶段一:pack(算法 $COMPRESSION)..."
 "$PACKER" pack --source "$STAGE" --output "$ARCHIVE" --compression "$COMPRESSION"
