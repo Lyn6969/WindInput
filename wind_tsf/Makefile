@@ -56,7 +56,8 @@ CXXFLAGS := -std=c++17 -O2 -municode \
   -Iinclude -Isrc -include include/mingw_tsf_compat.h
 
 # 静态链接 libgcc/libstdc++/winpthread，使 DLL 自包含（drop-in 到无 MinGW 运行时的 Windows）
-LDFLAGS := -shared -municode -static -static-libgcc -static-libstdc++ \
+# -s：链接时剥离符号表，静态运行时的调试符号约占未剥离体积的 80%（3.4M→0.61M）
+LDFLAGS := -shared -municode -static -static-libgcc -static-libstdc++ -s \
   -Wl,--enable-stdcall-fixup
 LIBS := -ladvapi32 -ldwrite -lgdi32 -lole32 -loleaut32 -lshlwapi -luser32 -luuid -lkernel32 -lshell32
 
