@@ -700,14 +700,16 @@ build_setting() {
     if ! command -v pnpm >/dev/null 2>&1 || ! command -v "clang-$WIND_LLVM_VER" >/dev/null 2>&1; then
         return 0
     fi
-    local feats="" suffix=""
-    [ "$profile" = debug ] && { feats="--features debug_variant"; suffix="_debug"; }
+    # custom-protocol:Tauri 生产模式加载内嵌 frontendDist 必需(否则退回 devUrl/localhost)。
+    # 纯 cargo 构建不会自动带(tauri CLI 才会),故显式加。debug 再叠加 debug_variant。
+    local featlist="custom-protocol" suffix=""
+    [ "$profile" = debug ] && { featlist="custom-protocol,debug_variant"; suffix="_debug"; }
     (
         cd "$SETTING_DIR" || exit 1
         [ -d node_modules ] || pnpm install || exit 1
         pnpm build || exit 1
         cd src-tauri || exit 1
-        cargo_xwin build --release --target "$TARGET" $feats || exit 1
+        cargo_xwin build --release --target "$TARGET" --features "$featlist" || exit 1
     [ -f "$exe" ] || { err "未找到产物: $exe"; return 1; }
 }
 
