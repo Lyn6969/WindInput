@@ -717,13 +717,21 @@ build_setting() {
     fi
     # custom-protocol:Tauri 生产模式加载内嵌 frontendDist 必需(否则退回 devUrl/localhost)。
     # 纯 cargo 构建不会自动带(tauri CLI 才会),故显式加。debug 再叠加 debug_variant。
-    local featlist="custom-protocol" suffix=""
-    [ "$profile" = debug ] && { featlist="custom-protocol,debug_variant"; suffix="_debug"; }
+    local featlist="custom-protocol" suffix="" tauri_cfg=""
+    # debug 变体:① 叠加 debug_variant(devtools + 管道 _debug 后缀);
+    #            ② 经 TAURI_CONFIG 覆盖 identifier 为 com.windinput.setting-debug
+    #               → 单例插件的 {id}-sim 锁与 release 隔离、WebView2 数据目录也分开。
+    #               (纯 cargo 构建不经 tauri CLI,靠该环境变量在 build.rs/generate_context! 期合并)
+    [ "$profile" = debug ] && {
+        featlist="custom-protocol,debug_variant"; suffix="_debug"
+        tauri_cfg='{"identifier":"com.windinput.setting-debug","productName":"清风输入法设置 (Debug)"}'
+    }
     (
         cd "$SETTING_DIR" || exit 1
         [ -d node_modules ] || pnpm install || exit 1
         pnpm build || exit 1
         cd src-tauri || exit 1
+        [ -n "$tauri_cfg" ] && export TAURI_CONFIG="$tauri_cfg"
         cargo_xwin build --release --target "$TARGET" --features "$featlist" || exit 1
     [ -f "$exe" ] || { err "未找到产物: $exe"; return 1; }
 }
