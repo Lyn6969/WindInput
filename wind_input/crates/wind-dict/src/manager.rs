@@ -32,6 +32,11 @@ impl DictManager {
         self.composite.unregister_layer(name);
     }
 
+    /// 运行时启停某层（按名），用于码表扩展词库热插拔。返回是否命中。
+    pub fn set_layer_enabled(&self, name: &str, enabled: bool) -> bool {
+        self.composite.set_layer_enabled(name, enabled)
+    }
+
     /// 精确查找（跨层合并、排序、截断）。
     pub fn search(&self, code: &str, limit: usize) -> Vec<Candidate> {
         self.composite.search(code, limit)
@@ -49,16 +54,27 @@ impl DictManager {
 
 /// 系统主词库层：把不可变 mmap `CachedDict` 包成 DictLayer（System 优先级最低）。
 /// 候选 source 不在此设定（系统词库被码表/拼音引擎共用），由引擎按自身类型标注。
+///
+/// `enabled` 为原子标志：码表扩展词库支持运行时热插拔——禁用的扩展层仍常驻（已 mmap），
+/// 仅在查询时被 composite 跳过；`set_enabled` 取 `&self`，故无需重建引擎即可即时启停。
 pub struct SystemDictLayer {
     dict: CachedDict,
     name: String,
+    enabled: std::sync::atomic::AtomicBool,
 }
 
 impl SystemDictLayer {
+    /// 默认启用。
     pub fn new(dict: CachedDict, name: impl Into<String>) -> Self {
+        Self::with_enabled(dict, name, true)
+    }
+
+    /// 指定初始启用状态（码表扩展层按方案配置的 enabled 传入）。
+    pub fn with_enabled(dict: CachedDict, name: impl Into<String>, enabled: bool) -> Self {
         Self {
             dict,
             name: name.into(),
+            enabled: std::sync::atomic::AtomicBool::new(enabled),
         }
     }
 
@@ -79,6 +95,15 @@ impl DictLayer for SystemDictLayer {
 
     fn layer_type(&self) -> LayerType {
         LayerType::System
+    }
+
+    fn enabled(&self) -> bool {
+        self.enabled.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    fn set_enabled(&self, enabled: bool) {
+        self.enabled
+            .store(enabled, std::sync::atomic::Ordering::Relaxed);
     }
 
     fn search(&self, code: &str, limit: usize) -> Vec<Candidate> {

@@ -52,6 +52,16 @@ impl MixedEngine {
 }
 
 impl Engine for MixedEngine {
+    /// 热插拔扩展词库：转发到主/次子引擎（码表子引擎承载 codetable-extra 层）。
+    fn set_dict_enabled(&self, dict_id: &str, enabled: bool) -> bool {
+        let a = self.primary.set_dict_enabled(dict_id, enabled);
+        let b = self
+            .secondary
+            .as_ref()
+            .is_some_and(|s| s.set_dict_enabled(dict_id, enabled));
+        a || b
+    }
+
     fn convert(&self, input: &str, max_candidates: usize) -> anyhow::Result<ConvertResult> {
         if input.is_empty() {
             return Ok(ConvertResult::default());

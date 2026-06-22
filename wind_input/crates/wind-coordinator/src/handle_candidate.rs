@@ -305,6 +305,20 @@ impl Coordinator {
         }
         let limit = self.initial_candidate_limit(&state.input_buffer);
         let (engine_count, outcome) = self.build_candidates(state, limit);
+        // Z 键重复上屏：输入恰为 "z" 且当前方案启用 z_key_repeat 时，把最近一次上屏内容作为
+        // 首选候选注入到候选顶部（对齐 Go），供「z + 选词」重复上一次输入。
+        if state.input_buffer == "z"
+            && let Some(last) = self.z_key_repeat_text()
+        {
+            state.candidates.insert(
+                0,
+                Candidate {
+                    text: last,
+                    natural_order: -1,
+                    ..Default::default()
+                },
+            );
+        }
         // 拼音逐步转换：组合区 = 已转换前缀 + 剩余拼音显示（前缀恒空于码表模式，无副作用）。
         if !state.committed_text.is_empty() {
             state.preedit = format!("{}{}", state.committed_text, state.preedit);
@@ -318,6 +332,24 @@ impl Coordinator {
         state.selected_index = 0;
         state.hover_index = -1;
         outcome
+    }
+
+    /// Z 键重复上屏：当前方案（码表/混输）启用 z_key_repeat 时返回最近一次上屏文本，否则 None。
+    /// 配置经 schema_merged 读取（不依赖 EngineManager 内部，避免触碰其源码）。
+    fn z_key_repeat_text(&self) -> Option<String> {
+        let id = self.engine_mgr.active_schema_id();
+        let enabled = match self.engine_mgr.current_engine_type() {
+            Some(wind_engine::EngineType::CodeTable) => {
+                self.engine_mgr.schema_merged(&id)?.engine.codetable.z_key_repeat
+            }
+            Some(wind_engine::EngineType::Mixed) => {
+                self.engine_mgr.schema_merged(&id)?.engine.mixed.z_key_repeat
+            }
+            _ => false,
+        };
+        enabled
+            .then(|| self.recent_commits_snapshot().into_iter().next())
+            .flatten()
     }
 
     /// 扩展候选（翻页/下移到边界时调用）：上限翻倍（≤5000）重新加载，保持当前页/高亮。

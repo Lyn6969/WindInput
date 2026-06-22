@@ -85,6 +85,9 @@ pub struct EngineManager {
     /// None = 当前活跃方案不是双拼；Some = 双拼布局的 finals 键集合。
     /// 活跃方案 id 变化时按需重建（惰性），避免每键读盘。
     shuangpin_finals_cache: Mutex<(String, Option<std::collections::HashSet<u8>>)>,
+    /// 每方案构建锁（single-flight）：同一方案的引擎/缓存构建串行，避免后台预热与首次
+    /// 切换并发时重复构建同一份大缓存；不同方案可并行构建（缓存在各自子目录，互不冲突）。
+    build_locks: Mutex<HashMap<String, Arc<Mutex<()>>>>,
 }
 
 /// 进程级缓存根目录（%LOCALAPPDATA%\WindInput\cache），EngineManager::new 设置一次。
@@ -108,25 +111,32 @@ fn merge_toml(base: &mut toml::Value, over: toml::Value) {
     }
 }
 
-/// 源文件 → 缓存 .wdb 路径：放缓存根下（名字含父目录名，避免跨方案同名冲突）；
-/// 未设置缓存根时回退到源旁（保持旧行为，便于测试/无 LOCALAPPDATA 场景）。
+/// 源文件 → 缓存路径：`<cache>/<方案>/<文件名干>.<ext>`。
+///
+/// 用**每方案子目录**(父目录名=schemas/<方案>/ 即方案名)做命名空间，避免跨方案同名冲突，
+/// 并把一个方案的全部缓存(主库/扩展/unigram/merged)归拢一处，便于整方案失效=删一目录。
+/// 文件名干剥掉 `.dict.yaml` 的 `.dict` 冗余中缀(`rime_frost.dict` → `rime_frost`)。
+/// 未设置缓存根时回退到源旁(保持旧行为，便于测试/无 LOCALAPPDATA 场景)。
 fn cache_path(source: &Path, ext: &str) -> std::path::PathBuf {
     if let Some(Some(dir)) = CACHE_DIR.get() {
-        let parent = source
+        let scheme = source
             .parent()
             .and_then(|p| p.file_name())
             .map(|s| s.to_string_lossy().into_owned())
             .unwrap_or_default();
-        let stem = source
+        let mut stem = source
             .file_stem()
             .map(|s| s.to_string_lossy().into_owned())
             .unwrap_or_default();
-        let name = if parent.is_empty() {
-            format!("{}.{}", stem, ext)
+        if let Some(s) = stem.strip_suffix(".dict") {
+            stem = s.to_string();
+        }
+        let base = if scheme.is_empty() {
+            dir.clone()
         } else {
-            format!("{}_{}.{}", parent, stem, ext)
+            dir.join(&scheme)
         };
-        return dir.join(name);
+        return base.join(format!("{stem}.{ext}"));
     }
     source.with_extension(ext)
 }
@@ -190,8 +200,10 @@ impl EngineManager {
             reverse_index: Mutex::new(None),
             pinyin: Mutex::new(config.pinyin.clone()),
             shuangpin_finals_cache: Mutex::new((String::new(), None)),
+            build_locks: Mutex::new(HashMap::new()),
         };
-        // 仅构建活跃方案（其余懒加载）
+        // 仅同步构建活跃方案；其余方案由 Coordinator 启动后台预热（prewarm_schema）提前构建，
+        // 避免首次切换时同步重熔大词库卡顿。单飞构建锁保证预热与切换不重复构建。
         mgr.ensure_loaded(&active_id);
         mgr
     }
@@ -333,13 +345,47 @@ impl EngineManager {
     }
 
     /// 确保指定方案引擎已加载；返回是否可用
-    fn ensure_loaded(&self, schema_id: &str) -> bool {
-        if self
-            .engines
+    /// 某方案引擎是否已加载（已就绪，切换即时无构建）。
+    pub fn is_loaded(&self, schema_id: &str) -> bool {
+        self.engines
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .contains_key(schema_id)
-        {
+    }
+
+    /// 某方案是否正在后台构建（未加载且构建锁被占）。供 UI 显示「准备中」用。
+    pub fn is_building(&self, schema_id: &str) -> bool {
+        if self.is_loaded(schema_id) {
+            return false;
+        }
+        let lock = self
+            .build_locks
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(schema_id)
+            .cloned();
+        // 锁存在且被占 = 有线程正在构建该方案。
+        matches!(lock, Some(l) if l.try_lock().is_err())
+    }
+
+    /// 后台预热：构建某方案的引擎与缓存（阻塞，供后台线程调用）。返回是否成功。
+    /// 与首次切换共享 single-flight 构建锁，竞争时只构建一次。
+    pub fn prewarm_schema(&self, schema_id: &str) -> bool {
+        self.ensure_loaded(schema_id)
+    }
+
+    fn ensure_loaded(&self, schema_id: &str) -> bool {
+        if self.is_loaded(schema_id) {
+            return true;
+        }
+        // single-flight：取该方案的专用构建锁（不同方案各自一把，可并行构建）。
+        let build_lock = {
+            let mut locks = self.build_locks.lock().unwrap_or_else(|e| e.into_inner());
+            locks.entry(schema_id.to_string()).or_default().clone()
+        };
+        let _build_guard = build_lock.lock().unwrap_or_else(|e| e.into_inner());
+        // 抢到锁后复查：等待期间可能已被另一线程（预热/切换）构建完成。
+        if self.is_loaded(schema_id) {
             return true;
         }
         let commit = self
@@ -481,8 +527,9 @@ impl EngineManager {
         Self::read_override_value(schema_id, dir)
     }
 
-    /// 写入某方案 override 层并使其引擎缓存失效（下次使用按新配置重建）。
-    pub fn write_schema_override(
+    /// 仅写入某方案 override 层（原子 tmp+rename），**不**使引擎缓存失效。
+    /// 供「持久化 + 对已加载引擎 live 生效」的场景（如扩展词库热插拔）使用。
+    pub fn persist_schema_override(
         &self,
         schema_id: &str,
         value: &toml::Value,
@@ -497,8 +544,40 @@ impl EngineManager {
         let tmp = path.with_extension("toml.tmp");
         std::fs::write(&tmp, out)?;
         std::fs::rename(&tmp, &path)?;
+        Ok(())
+    }
+
+    /// 写入某方案 override 层并使其引擎缓存失效（下次使用按新配置重建）。
+    pub fn write_schema_override(
+        &self,
+        schema_id: &str,
+        value: &toml::Value,
+    ) -> anyhow::Result<()> {
+        self.persist_schema_override(schema_id, value)?;
         self.invalidate_schema(schema_id);
         Ok(())
+    }
+
+    /// 运行时启停某方案的扩展词库：对**已加载引擎**即时翻对应系统层的 enabled 标志
+    /// （无需重建/重熔大词库）；未加载的方案此处不做事（下次构建按已持久化的 override 生效）。
+    /// 启用集变化会影响反查索引/编码提示（基于启用词库合并），故一并失效之使下次重算。
+    /// 返回是否对已加载引擎即时生效。**注意**：调用方须先 [`persist_schema_override`] 持久化，
+    /// 否则重启/重建后状态丢失。
+    pub fn set_dict_enabled_live(&self, schema_id: &str, dict_id: &str, enabled: bool) -> bool {
+        let engine = self
+            .engines
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(schema_id)
+            .cloned();
+        let hit = engine.is_some_and(|e| e.set_dict_enabled(dict_id, enabled));
+        // 反查索引依赖「启用词库合并」，启用集变了须失效（懒重建）。
+        // 注：编码提示开关已改读全局 config.pinyin.show_code_hint，无方案级缓存需失效。
+        *self
+            .reverse_index
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = None;
+        hit
     }
 
     /// 删除某方案 override 层并使其引擎缓存失效。返回是否删除了文件。
@@ -920,15 +999,14 @@ impl EngineManager {
             )));
         }
 
-        let dict = match Self::load_dictionary(&schema, &schemas) {
-            Some(d) => d,
-            None => {
-                warn!("load_dictionary returned None for schema {}", schema_id);
-                return None;
-            }
-        };
-
         if schema.is_pinyin() {
+            let dict = match Self::load_dictionary(&schema, &schemas) {
+                Some(d) => d,
+                None => {
+                    warn!("load_dictionary returned None for schema {}", schema_id);
+                    return None;
+                }
+            };
             // 加载 unigram 语言模型（长句 Viterbi 打分）：mmap 零拷贝，失败回退词典权重。
             let unigram: Option<Arc<dyn crate::pinyin::lm::UnigramLookup>> =
                 if schema.learning.unigram_path.is_empty() {
@@ -1017,7 +1095,14 @@ impl EngineManager {
                 top_code_commit: ct.top_code_commit.unwrap_or(commit.top_code_commit),
                 show_code_hint: ct.show_code_hint,
             };
-            // 码表引擎经 DictManager(CompositeDict) 查询：系统词库作 System 层。
+            // 码表引擎经 DictManager(CompositeDict) 查询。系统词库不再合并成单个 combined，
+            // 而是主库 + 每个扩展（含禁用）各自一个 System 层，查询期由 composite 合并去重。
+            // 开关扩展只需翻该层 enabled 标志即时生效，无需重熔大词库。
+            let layers = Self::load_codetable_layers(&schema, &schemas);
+            if layers.is_empty() {
+                warn!("No usable codetable dictionary for schema {}", schema_id);
+                return None;
+            }
             // 注入 redb Store 时，注册用户词/临时词层（按 schema 隔离），让用户词进候选合并。
             let dm = wind_dict::DictManager::new();
             if let Some(store) = &store {
@@ -1030,10 +1115,12 @@ impl EngineManager {
                     schema_id,
                 )));
             }
-            dm.register_layer(Box::new(wind_dict::SystemDictLayer::new(
-                dict,
-                "codetable-system",
-            )));
+            // 主库优先注册（在 load_codetable_layers 中已置首），扩展库其后。
+            for (name, dict, enabled) in layers {
+                dm.register_layer(Box::new(wind_dict::SystemDictLayer::with_enabled(
+                    dict, name, enabled,
+                )));
+            }
             Some(Box::new(CodeTableEngine::new(
                 mcl,
                 commit_opts,
@@ -1079,10 +1166,88 @@ impl EngineManager {
         }
     }
 
+    /// 码表方案：把主词库 + 每个扩展词库（含**当前禁用**的）各自加载为独立 system 层。
+    /// 返回 `(层名, CachedDict, 初始enabled)`：主库 → `codetable-system`(恒启用)；扩展 →
+    /// `codetable-extra-<id>`(enabled=is_enabled())。**不再合并 combined.wdb**——查询期由
+    /// CompositeDict 合并去重，开关扩展只需翻该层 enabled 标志，无需重熔大词库（对齐 Go 的
+    /// 每库独立缓存 + 查询期合并）。主库优先返回（层序最靠前 → 等权重时排前）。
+    fn load_codetable_layers(
+        schema: &Schema,
+        schemas_dir: &Path,
+    ) -> Vec<(String, CachedDict, bool)> {
+        let resolve = |rel: &str| -> std::path::PathBuf {
+            if let Some(u) = Config::user_config_dir() {
+                let p = u.join("schemas").join(rel);
+                if p.is_file() {
+                    return p;
+                }
+            }
+            schemas_dir.join(rel)
+        };
+        let is_english = |e: &DictSpec| -> bool {
+            !e.dict_type.is_empty() && e.dict_type == "english"
+        };
+
+        let usable: Vec<&DictSpec> = schema
+            .dictionaries
+            .iter()
+            .filter(|d| !d.path.is_empty())
+            .collect();
+        if usable.is_empty() {
+            return Vec::new();
+        }
+        // 主库 = 首个 default；无 default 则取首个可用库。
+        let main_idx = usable.iter().position(|d| d.default).unwrap_or(0);
+
+        let load_one = |e: &DictSpec| -> Option<CachedDict> {
+            let full = resolve(&e.path);
+            match CachedDict::load_at_with(&full, &cache_path(&full, "wdb"), is_english(e)) {
+                Ok(d) => Some(d),
+                Err(err) => {
+                    warn!("Failed to load codetable dict {}: {}", full.display(), err);
+                    None
+                }
+            }
+        };
+
+        let mut out: Vec<(String, CachedDict, bool)> = Vec::new();
+        // 主库优先注册。加载失败 → 无系统层可用，放弃整方案（避免无候选）。
+        match load_one(usable[main_idx]) {
+            Some(d) => {
+                info!(
+                    "  codetable main: {} ({} entries)",
+                    usable[main_idx].path,
+                    d.len()
+                );
+                out.push(("codetable-system".to_string(), d, true));
+            }
+            None => return Vec::new(),
+        }
+        // 扩展库（含禁用的，全部加载常驻，供运行时热插拔）。
+        for (i, e) in usable.iter().enumerate() {
+            if i == main_idx {
+                continue;
+            }
+            let enabled = e.is_enabled();
+            if let Some(d) = load_one(e) {
+                info!(
+                    "  codetable extra: {} (id={}, enabled={}, {} entries)",
+                    e.path,
+                    e.id,
+                    enabled,
+                    d.len()
+                );
+                out.push((format!("codetable-extra-{}", e.id), d, enabled));
+            }
+        }
+        out
+    }
+
     /// 加载 schema 的词典：合并所有 enabled 词库（主词库 + default_enabled 附加库）。
     ///
     /// - 拼音（rime_pinyin）：单库经 import_tables 合并（load_rime_pinyin_dict）。
-    /// - 码表（rime_codetable）：主库 + 扩展库/emoji 等多库合并到 .combined.wdb。
+    /// - 码表反查索引用（build_primary_reverse_index）：主库 + 扩展库合并到 .combined.wdb。
+    ///   注意 live 查询层已改为 load_codetable_layers 的每库独立层，此处仅供反查索引复用。
     fn load_dictionary(schema: &Schema, schemas_dir: &Path) -> Option<CachedDict> {
         // 收集 enabled 词库（保持 schema 顺序：主库在前，扩展库在后）
         let mut enabled: Vec<&DictSpec> = schema
@@ -1251,9 +1416,34 @@ impl EngineManager {
         // merged.wdb 写到可写缓存目录（与 unigram 一致）。安装目录（如 Program Files）
         // 通常只读，若写在源旁会失败 → 回退仅主词典(rime header 数十条) → 拼音无候选。
         let merged_wdb = cache_path(dict_path, "merged.wdb");
-        // 仅当 merged 比主词库文件新时复用（主库更新后强制重建；子库通常随主库一同更新）
-        let merged_fresh = Self::combined_cache_fresh(&[dict_path], &merged_wdb);
-        if merged_wdb.exists() && merged_fresh {
+        // 先解析主表头部，收集全部源（主表 + import_tables 子表）。指纹/缓存校验需覆盖
+        // 全部源，故须先于 fresh 判定算出 sub_paths（仅解析头部 yaml，开销极低）。
+        let content = std::fs::read_to_string(dict_path).ok()?;
+        let yaml_section = if let Some(start) = content.find("---") {
+            let after = &content[start + 3..];
+            after.find("...").map(|end| &after[..end]).unwrap_or(after)
+        } else {
+            &content
+        };
+        let yaml: serde_yaml::Value = serde_yaml::from_str(yaml_section).ok()?;
+        let dict_dir = dict_path.parent()?;
+
+        let mut sub_paths = vec![dict_path.to_path_buf()];
+        if let Some(import_tables) = yaml.get("import_tables").and_then(|v| v.as_sequence()) {
+            for table_ref in import_tables {
+                if let Some(name) = table_ref.as_str() {
+                    let sub = dict_dir.join(format!("{}.dict.yaml", name));
+                    if sub.exists() {
+                        sub_paths.push(sub);
+                    }
+                }
+            }
+        }
+        let src_refs: Vec<&Path> = sub_paths.iter().map(|p| p.as_path()).collect();
+
+        // merged 缓存对**全部源**做内容指纹校验：主表或任一子表内容变化、或源清单增删都
+        // 判定失效并重建（避免「子表改了却仍用旧 merged」的静默陈旧）。
+        if merged_wdb.exists() && Self::combined_cache_fresh(&src_refs, &merged_wdb) {
             match wind_dict::binformat::DictReader::open(&merged_wdb) {
                 Ok(reader) => {
                     info!(
@@ -1270,47 +1460,26 @@ impl EngineManager {
             }
         } else if merged_wdb.exists() {
             info!(
-                "merged cache stale (source newer), regenerating: {}",
+                "merged cache stale (sources changed), regenerating: {}",
                 merged_wdb.display()
             );
             let _ = std::fs::remove_file(&merged_wdb);
         }
 
-        let content = std::fs::read_to_string(dict_path).ok()?;
-        let yaml_section = if let Some(start) = content.find("---") {
-            let after = &content[start + 3..];
-            after.find("...").map(|end| &after[..end]).unwrap_or(after)
-        } else {
-            &content
-        };
-        let yaml: serde_yaml::Value = serde_yaml::from_str(yaml_section).ok()?;
-        let dict_dir = dict_path.parent()?;
-
-        let mut writer = wind_dict::binformat::DictWriter::new();
-        let mut total_entries = 0usize;
-
-        let mut sub_paths = vec![dict_path.to_path_buf()];
-        if let Some(import_tables) = yaml.get("import_tables").and_then(|v| v.as_sequence()) {
-            for table_ref in import_tables {
-                if let Some(name) = table_ref.as_str() {
-                    let sub = dict_dir.join(format!("{}.dict.yaml", name));
-                    if sub.exists() {
-                        sub_paths.push(sub);
-                    }
-                }
-            }
-        }
-
-        // 按 code 聚合所有子词典条目。DictWriter::add 不会合并同 code 的多次调用，
-        // 若每条目单独 add，会在 wdb 中写出重复 KeyIndex，DictReader 的二分查找只能命中
-        // 其中之一，导致同 code 的其余候选系统性丢失（拼音词典尤甚）。
+        // 并行解析每个源正文（纯 CPU 多线程），直接产出 (code,text,weight)：不再为每个子表
+        // 生成中间 .wdb，也绕过 CodetableDict 的 BTreeMap 构建与逐 code 排序（merged 稍后会
+        // 统一按权重重排）。DictWriter::add 不合并同 code 多次调用，故先用 HashMap 聚合，否则
+        // wdb 出现重复 KeyIndex，DictReader 二分只命中其一 → 同 code 候选系统性丢失。
         let mut agg: HashMap<String, Vec<(String, i32)>> = HashMap::new();
+        let mut total_entries = 0usize;
         for sub_path in &sub_paths {
-            match CachedDict::load_at(sub_path, &cache_path(sub_path, "wdb")) {
-                Ok(sub_dict) => {
-                    let count = sub_dict.len();
+            // lowercase_code=false：import_tables 子表均为拼音表(非 english)，与改前
+            // CachedDict::load_at(默认不小写 code)行为一致。
+            match wind_dict::codetable::parse_rime_entries_parallel(sub_path, false) {
+                Ok(entries) => {
+                    let count = entries.len();
                     info!("  Loading {} entries from {}", count, sub_path.display());
-                    for (code, text, weight, _order) in sub_dict.search_prefix("", 5_000_000) {
+                    for (code, text, weight) in entries {
                         agg.entry(code).or_default().push((text, weight));
                     }
                     total_entries += count;
@@ -1323,6 +1492,8 @@ impl EngineManager {
             warn!("No entries loaded from pinyin dictionary");
             return None;
         }
+
+        let mut writer = wind_dict::binformat::DictWriter::new();
 
         for (code, mut entries) in agg {
             // 同 code 下按权重降序，保证 KeyIndex 内候选顺序稳定
@@ -1343,9 +1514,9 @@ impl EngineManager {
                 warn!("Failed to write merged cache {}: {}", target.display(), e);
                 continue;
             }
-            // 写内容指纹(仅对正式缓存路径；fresh 校验也只看 merged_wdb)
+            // 写内容指纹(覆盖全部源；仅对正式缓存路径，fresh 校验也只看 merged_wdb)
             if target.as_path() == merged_wdb.as_path() {
-                wind_dict::cache_fp::write_cache_fp(&merged_wdb, &[dict_path]);
+                wind_dict::cache_fp::write_cache_fp(&merged_wdb, &src_refs);
             }
             match wind_dict::binformat::DictReader::open(target) {
                 Ok(reader) => {

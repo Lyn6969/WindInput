@@ -97,6 +97,19 @@ impl Coordinator {
             .map(|c| c.to_string())
             .unwrap_or_default();
         self.update_mix_candidates(state);
+        // 快捷输入「强制竖排」：含 quick_input 成员的 mix（如默认「快捷」融合，; 触发），
+        // 进入时切竖排候选并记住原布局，退出恢复（与独立快捷输入模式一致）。
+        if self.mix_has_quick_input(idx) && self.rt().config.features.quick_input.force_vertical {
+            let cur = self
+                .rt()
+                .config
+                .ui
+                .candidate
+                .layout
+                .eq_ignore_ascii_case("vertical");
+            state.quick_saved_vertical = Some(cur);
+            let _ = self.ui_tx.send(UiCommand::SetCandidateLayout(true));
+        }
         self.notify_ui_update(state);
         let display = state.preedit.clone();
         debug!("Entered mix mode idx={}", idx);
@@ -115,6 +128,10 @@ impl Coordinator {
         state.committed_segs.clear();
         state.candidates.clear();
         state.preedit.clear();
+        // 强制竖排退出：恢复进入前布局。
+        if let Some(prev) = state.quick_saved_vertical.take() {
+            let _ = self.ui_tx.send(UiCommand::SetCandidateLayout(prev));
+        }
     }
 
     /// 若开启简繁转换，把简体文本转为繁体（数据缺失则原样返回）。
@@ -360,6 +377,13 @@ impl Coordinator {
 
     /// 切换方案：清空输入并推送状态
     pub(crate) fn switch_schema(&self, schema_id: &str) {
+        // 目标方案缓存尚未就绪（后台预热未到/正在构建）：显示「准备中」并放弃本次切换，
+        // 避免在 IME 线程同步重熔大词库卡顿。预热完成后用户再切即时生效。
+        if !self.engine_mgr.is_loaded(schema_id) {
+            let name = self.engine_mgr.schema_name(schema_id);
+            self.show_tip(&format!("{}准备中…", if name.is_empty() { schema_id } else { &name }));
+            return;
+        }
         if self.engine_mgr.switch_schema(schema_id) {
             let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
             state.input_buffer.clear();

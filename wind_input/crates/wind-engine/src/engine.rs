@@ -58,6 +58,13 @@ pub trait Engine: Send + Sync {
     fn generate_word_pinyin(&self, _word: &str) -> Option<String> {
         None
     }
+
+    /// 运行时启停某扩展词库（按 dict id），**无需重建引擎**：直接翻 composite 中对应
+    /// 系统层的 enabled 标志。返回是否命中该层。默认不支持（拼音等返回 false）；
+    /// 码表/混输按 `codetable-extra-<id>` 层翻标志。用于扩展词库热插拔。
+    fn set_dict_enabled(&self, _dict_id: &str, _enabled: bool) -> bool {
+        false
+    }
 }
 
 /// 扩展引擎接口（码表引擎特有）

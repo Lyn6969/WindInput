@@ -30,6 +30,16 @@ pub trait DictLayer: Send + Sync {
 
     /// 前缀查找
     fn search_prefix(&self, prefix: &str, limit: usize) -> Vec<Candidate>;
+
+    /// 该层当前是否启用：禁用层在 composite 查询时被跳过（不出候选）。默认始终启用。
+    /// 用于码表扩展词库的运行时热插拔——禁用的扩展层仍常驻（已 mmap），仅不参与查询。
+    fn enabled(&self) -> bool {
+        true
+    }
+
+    /// 运行时启停该层（支持热插拔的层覆盖此方法；默认 no-op）。
+    /// 取 `&self`（内部用原子标志），故无需重建引擎即可即时生效。
+    fn set_enabled(&self, _enabled: bool) {}
 }
 
 /// 可变词典层接口

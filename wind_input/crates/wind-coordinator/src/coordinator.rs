@@ -280,6 +280,8 @@ pub(crate) struct State {
     pub(crate) quick_input_buffer: String,
     /// 快捷输入组合区前缀字符（触发键，如 ";"）
     pub(crate) quick_input_prefix: String,
+    /// 快捷输入「强制竖排」时记住进入前的布局（Some(原 vertical) = 已强制，退出恢复）。
+    pub(crate) quick_saved_vertical: Option<bool>,
     /// 临时英文输入缓冲
     pub(crate) temp_english_buffer: String,
     /// 网址模式输入缓冲（原样累积的 URL 文本）
@@ -477,6 +479,28 @@ impl Coordinator {
                     c.handle_ui_event(ev);
                 }
                 debug!("UI event channel closed");
+            });
+        }
+
+        // 后台预热：提前构建其余方案的引擎与缓存（拼音 merged/unigram、码表 per-dict），
+        // 避免首次切换到拼音/临时拼音/码表时同步重熔大词库造成几十秒卡顿。
+        // single-flight 构建锁保证预热与用户切换不重复构建；按方案顺序逐个建（后台低频）。
+        {
+            let c = Arc::clone(&coordinator);
+            std::thread::spawn(move || {
+                let active = c.engine_mgr.active_schema_id();
+                for id in c.engine_mgr.available_schemas() {
+                    if id == active || c.engine_mgr.is_loaded(&id) {
+                        continue;
+                    }
+                    let t0 = std::time::Instant::now();
+                    if c.engine_mgr.prewarm_schema(&id) {
+                        debug!("Prewarmed schema {} in {:?}", id, t0.elapsed());
+                    } else {
+                        debug!("Prewarm skipped/failed for schema {}", id);
+                    }
+                }
+                debug!("Schema prewarm done");
             });
         }
 
@@ -692,6 +716,7 @@ impl Coordinator {
                 temp_pinyin_prefix: String::new(),
                 quick_input_buffer: String::new(),
                 quick_input_prefix: String::new(),
+                quick_saved_vertical: None,
                 temp_english_buffer: String::new(),
                 url_buffer: String::new(),
                 rewind: None,
@@ -1842,15 +1867,25 @@ impl MessageHandler for Coordinator {
         if data.event_type == EVENT_KEY_UP {
             if self.is_toggle_mode_keycode(data.key_code) {
                 debug!("toggle_mode key_up: code=0x{:02X}", data.key_code);
+                // 切换前是否有未上屏的编码/候选（决定是否需要结束应用 composition）。
+                let had_pending = {
+                    let s = self.state.lock().unwrap_or_else(|e| e.into_inner());
+                    !s.input_buffer.is_empty()
+                        || !s.committed_text.is_empty()
+                        || !s.candidates.is_empty()
+                };
                 let (status, commit_text) = self.handle_toggle_mode();
-                // 切到英文且 hotkeys.commit_on_switch=true 且有待输入：上屏原始编码并同时切换模式。
-                // （commit_text 仅在切英文时非空，见 take_input_on_mode_switch）
-                if !commit_text.is_empty() {
+                let chinese_after = status.as_ref().map(|s| s.chinese_mode).unwrap_or(false);
+                // 切英文（中→英）有待输入：commit_on_switch=true 上屏原始编码，否则空 commit。
+                // 两种都返回 InsertText：空文本 + 有 composition 时 C++ CommitText 仍会
+                // EndComposition，清掉应用里残留的编码（StatusUpdate 分支不结束 composition，
+                // 是“切英文后编码不清空”的根因）；mode_changed 同时更新中英图标。
+                if !commit_text.is_empty() || had_pending {
                     return KeyAction::InsertText {
                         text: commit_text,
                         new_composition: None,
                         mode_changed: true,
-                        chinese_mode: false,
+                        chinese_mode: chinese_after,
                         has_new_composition: false,
                     };
                 }
@@ -2006,7 +2041,16 @@ impl MessageHandler for Coordinator {
                     let cand = state.candidates[idx].clone();
                     self.commit_selected(&mut state, &cand)
                 } else if !state.input_buffer.is_empty() || !state.committed_text.is_empty() {
-                    // 无候选：上屏「已转换前缀 + 剩余拼音原码」。
+                    // 空码空格：按 space_on_empty_behavior（对齐 Go handleSpace 空码分支）——
+                    // "clear" 清空编码；否则上屏「已转换前缀 + 剩余拼音原码」。
+                    if self.rt().config.input.space_on_empty_behavior == "clear" {
+                        state.committed_text.clear();
+                        state.committed_segs.clear();
+                        state.input_buffer.clear();
+                        state.candidates.clear();
+                        self.notify_ui_hide();
+                        return KeyAction::ClearComposition;
+                    }
                     let prefix = self.take_committed(&mut state);
                     let text = self.maybe_s2t(&state, &format!("{}{}", prefix, state.input_buffer));
                     state.input_buffer.clear();
@@ -2018,8 +2062,17 @@ impl MessageHandler for Coordinator {
                 }
             }
             keymap::VK_RETURN => {
-                // Enter：上屏「当前显示」= 已转换前缀 + 剩余原码（已选中文照样上屏），退出
+                // Enter：按 enter_behavior 配置（对齐 Go handleEnter）——"clear" 清空编码
+                // (不上屏)；否则(commit)上屏「已转换前缀 + 剩余原码」。
                 if !state.input_buffer.is_empty() || !state.committed_text.is_empty() {
+                    if self.rt().config.input.enter_behavior == "clear" {
+                        state.committed_text.clear();
+                        state.committed_segs.clear();
+                        state.input_buffer.clear();
+                        state.candidates.clear();
+                        self.notify_ui_hide();
+                        return KeyAction::ClearComposition;
+                    }
                     let prefix = self.take_committed(&mut state);
                     let text = self.maybe_s2t(&state, &format!("{}{}", prefix, state.input_buffer));
                     state.input_buffer.clear();
@@ -2151,6 +2204,27 @@ impl MessageHandler for Coordinator {
                     // 须在候选提交逻辑之前：press2 时无待输入，依赖光标前字符匹配武装态。
                     if let Some(act) = self.try_smart_symbol_replace(&state, ch, data.prev_char) {
                         return act;
+                    }
+                    // 标点顶码上屏开关：有编码/已确认前缀时，码表/混输按方案
+                    // engine.codetable.punct_commit 决定是否顶字上屏。
+                    // 关闭时标点「直接无效」——吞掉该键、保留编码继续输入（不顶字、不透传上屏
+                    // 英文标点）。该功能少用，吞键比 Go 的 `return nil` 透传更符合预期。
+                    // TODO(拼音标点顶码)：拼音引擎也应有独立 punct_commit 配置（默认开），
+                    // 待相关引擎配置重构落定后接入；当前拼音恒顶字上屏（等价默认开）。
+                    let has_input =
+                        !state.input_buffer.is_empty() || !state.committed_text.is_empty();
+                    if has_input {
+                        let punct_commit = match self.engine_mgr.current_engine_type() {
+                            Some(wind_engine::EngineType::Pinyin) => true,
+                            _ => self
+                                .engine_mgr
+                                .schema_merged(&self.engine_mgr.active_schema_id())
+                                .map(|s| s.engine.codetable.punct_commit)
+                                .unwrap_or(false),
+                        };
+                        if !punct_commit {
+                            return KeyAction::Consumed;
+                        }
                     }
                     // 标点/符号键：先上屏已转换前缀 + 首选候选（若有输入），再追加（转换后的）标点
                     let committed = self.take_committed(&mut state);
@@ -2309,6 +2383,10 @@ impl MessageHandler for Coordinator {
         let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
         state.chinese_mode = !state.chinese_mode;
         let chinese = state.chinese_mode;
+        // 标点随中英文切换（对齐 Go）：开启 punct_follow_mode 时，标点中/英跟随当前模式。
+        if self.rt().config.input.punct_follow_mode {
+            state.chinese_punct = chinese;
+        }
         let commit_text = self.take_input_on_mode_switch(&mut state, chinese);
         drop(state);
         self.punct.lock().unwrap_or_else(|e| e.into_inner()).reset();
@@ -2323,6 +2401,10 @@ impl MessageHandler for Coordinator {
     fn handle_system_mode_switch(&self, chinese_mode: bool) -> (Option<StatusUpdateData>, String) {
         let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
         state.chinese_mode = chinese_mode;
+        // 标点随中英文切换（对齐 Go）：开启 punct_follow_mode 时，标点跟随模式。
+        if self.rt().config.input.punct_follow_mode {
+            state.chinese_punct = chinese_mode;
+        }
         let commit_text = self.take_input_on_mode_switch(&mut state, chinese_mode);
         drop(state);
         self.punct.lock().unwrap_or_else(|e| e.into_inner()).reset();

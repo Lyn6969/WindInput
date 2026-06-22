@@ -8,6 +8,7 @@ use wind_bridge::handler::{KeyAction, KeyEventData};
 use wind_candidate::Candidate;
 use wind_ipc::protocol::{MOD_ALT, MOD_CTRL, MOD_SHIFT};
 use wind_keys::keymap;
+use wind_ui::manager::UiCommand;
 
 impl Coordinator {
     /// 触发键名 → VK
@@ -41,6 +42,10 @@ impl Coordinator {
         state.preedit.clear();
         state.current_page = 0;
         state.selected_index = 0;
+        // 强制竖排退出：恢复进入前布局。
+        if let Some(prev) = state.quick_saved_vertical.take() {
+            let _ = self.ui_tx.send(UiCommand::SetCandidateLayout(prev));
+        }
     }
 
     /// 由缓冲生成日期/计算器候选，刷新组合区（前缀 + 缓冲）
@@ -208,6 +213,18 @@ impl Coordinator {
         state.quick_input_buffer.clear();
         state.quick_input_prefix = Self::quick_input_prefix_for(key_code).to_string();
         self.update_quick_input_candidates(state);
+        // 强制竖排（对齐 Go ForceVertical）：进入时切竖排并记住原布局，退出时恢复。
+        if self.rt().config.features.quick_input.force_vertical {
+            let cur = self
+                .rt()
+                .config
+                .ui
+                .candidate
+                .layout
+                .eq_ignore_ascii_case("vertical");
+            state.quick_saved_vertical = Some(cur);
+            let _ = self.ui_tx.send(UiCommand::SetCandidateLayout(true));
+        }
         self.notify_ui_update(state);
         let prefix = state.quick_input_prefix.clone();
         match committed {
