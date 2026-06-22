@@ -2180,11 +2180,10 @@ impl MessageHandler for Coordinator {
             keymap::VK_SPACE => {
                 // Space：选当前高亮候选 / 上屏编码
                 if !state.candidates.is_empty() {
-                    let idx = self
-                        .highlighted_global_index(&state)
-                        .min(state.candidates.len() - 1);
+                    let (start, _) = self.page_range(&state);
+                    let idx = (start + state.selected_index).min(state.candidates.len() - 1);
                     let cand = state.candidates[idx].clone();
-                    self.commit_selected(&mut state, &cand)
+                    self.commit_selected(&mut state, &cand, (idx - start) as i32)
                 } else if !state.input_buffer.is_empty() || !state.committed_text.is_empty() {
                     // 空码空格：按 space_on_empty_behavior（对齐 Go handleSpace 空码分支）——
                     // "clear" 清空编码；否则上屏「已转换前缀 + 剩余拼音原码」。
@@ -2254,6 +2253,8 @@ impl MessageHandler for Coordinator {
                     let buf = state.input_buffer.clone();
                     let prefix = &buf[..buf.len().saturating_sub(remainder.len())];
                     self.record_selection(prefix, &top_text);
+                    // 顶码即上屏首选（pos=0），code_len=被顶出的前缀码长。
+                    self.record_commit(&top_text, prefix.len() as u32, 0, CommitSource::Candidate);
                     state.input_buffer = remainder.clone();
                     let _ = self.update_candidates(&mut state); // 余码候选（不再消费其结局）
                     let preedit = state.preedit.clone();
@@ -2318,7 +2319,7 @@ impl MessageHandler for Coordinator {
                             let idx = start + offset;
                             if idx < end {
                                 let cand = state.candidates[idx].clone();
-                                return self.commit_selected(&mut state, &cand);
+                                return self.commit_selected(&mut state, &cand, offset as i32);
                             }
                             // E. 越界：记下触发键字符，延后到模式触发判定之后再按 overflow 策略处理
                             // （对齐 Go decideBufferedTrigger——次/三选键越界时 overflow 排在
@@ -2379,11 +2380,17 @@ impl MessageHandler for Coordinator {
                     let committed = self.take_committed(&mut state);
                     let mut out = self.maybe_s2t(&state, &committed);
                     if !state.candidates.is_empty() {
-                        let idx = self
-                            .highlighted_global_index(&state)
-                            .min(state.candidates.len() - 1);
+                        let (start, _) = self.page_range(&state);
+                        let idx = (start + state.selected_index).min(state.candidates.len() - 1);
                         let t = state.candidates[idx].text.clone();
                         self.record_selection(&state.input_buffer, &t);
+                        // 标点上屏前先记被顶出的高亮候选（来源候选）。
+                        self.record_commit(
+                            &t,
+                            state.input_buffer.len() as u32,
+                            (idx - start) as i32,
+                            CommitSource::Candidate,
+                        );
                         out.push_str(&self.maybe_s2t(&state, &t));
                     } else if !state.input_buffer.is_empty() {
                         out.push_str(&state.input_buffer);

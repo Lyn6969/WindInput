@@ -499,6 +499,12 @@ impl Coordinator {
         if partial {
             let code = Self::cand_code(&state.mix_buffer, &cand);
             self.record_selection(&code, &cand.text);
+            self.record_commit(
+                &cand.text,
+                code.len() as u32,
+                page_offset as i32,
+                wind_store::stats::CommitSource::Mix,
+            );
             state.committed_segs.push((code, cand.text.clone()));
             state.committed_text.push_str(&cand.text);
             state.mix_buffer = state.mix_buffer[consumed..].to_string();
@@ -511,12 +517,24 @@ impl Coordinator {
             }
         } else {
             let out = format!("{}{}", state.committed_text, cand.text);
+            let code_len = if numeric {
+                0
+            } else {
+                Self::cand_code(&state.mix_buffer, &cand).len() as u32
+            };
             if !numeric {
                 let code = Self::cand_code(&state.mix_buffer, &cand);
                 self.record_selection(&code, &cand.text);
                 state.committed_segs.push((code, cand.text.clone()));
                 self.learn_phrase_on_commit(state);
             }
+            // 输入统计：混合模式上屏（计算结果 code_len=0；选词用候选码长）。
+            self.record_commit(
+                &cand.text,
+                code_len,
+                page_offset as i32,
+                wind_store::stats::CommitSource::Mix,
+            );
             let out = self.maybe_s2t(state, &out);
             self.exit_mix_mode(state);
             self.notify_ui_hide();

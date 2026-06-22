@@ -91,6 +91,7 @@ impl Coordinator {
         &self,
         state: &mut State,
         cand: &Candidate,
+        candidate_pos: i32,
     ) -> KeyAction {
         let total = state.temp_pinyin_buffer.len();
         let consumed = cand.consumed_length;
@@ -98,6 +99,13 @@ impl Coordinator {
         let partial =
             consumed > 0 && consumed < total && state.temp_pinyin_buffer.is_char_boundary(consumed);
         self.record_selection(&code, &cand.text);
+        // 输入统计：每次临拼选词记一段（来源临时拼音）。
+        self.record_commit(
+            &cand.text,
+            code.len() as u32,
+            candidate_pos,
+            wind_store::stats::CommitSource::TempPinyin,
+        );
         if partial {
             state.committed_segs.push((code, cand.text.clone()));
             state.committed_text.push_str(&cand.text);
@@ -193,11 +201,10 @@ impl Coordinator {
             keymap::VK_SPACE => {
                 // 空格：选当前高亮候选（逐步转换）
                 if !state.candidates.is_empty() {
-                    let idx = self
-                        .highlighted_global_index(state)
-                        .min(state.candidates.len() - 1);
+                    let (start, _) = self.page_range(state);
+                    let idx = (start + state.selected_index).min(state.candidates.len() - 1);
                     let cand = state.candidates[idx].clone();
-                    self.commit_temp_pinyin_selected(state, &cand)
+                    self.commit_temp_pinyin_selected(state, &cand, (idx - start) as i32)
                 } else {
                     self.exit_temp_pinyin(state);
                     self.notify_ui_hide();
@@ -222,7 +229,7 @@ impl Coordinator {
                 let idx = start + (data.key_code - 0x31) as usize;
                 if idx < end {
                     let cand = state.candidates[idx].clone();
-                    self.commit_temp_pinyin_selected(state, &cand)
+                    self.commit_temp_pinyin_selected(state, &cand, (data.key_code - 0x31) as i32)
                 } else {
                     KeyAction::Consumed
                 }
@@ -248,16 +255,15 @@ impl Coordinator {
                     let idx = start + offset;
                     if idx < end {
                         let cand = state.candidates[idx].clone();
-                        return self.commit_temp_pinyin_selected(state, &cand);
+                        return self.commit_temp_pinyin_selected(state, &cand, offset as i32);
                     }
                 }
                 // 其它键：有候选则上屏高亮候选（分段则保留剩余拼音）；否则退出清空。
                 if !state.candidates.is_empty() {
-                    let idx = self
-                        .highlighted_global_index(state)
-                        .min(state.candidates.len() - 1);
+                    let (start, _) = self.page_range(state);
+                    let idx = (start + state.selected_index).min(state.candidates.len() - 1);
                     let cand = state.candidates[idx].clone();
-                    self.commit_temp_pinyin_selected(state, &cand)
+                    self.commit_temp_pinyin_selected(state, &cand, (idx - start) as i32)
                 } else {
                     self.exit_temp_pinyin(state);
                     self.notify_ui_hide();
@@ -463,11 +469,17 @@ impl Coordinator {
     ) -> KeyAction {
         let prefix = self.take_committed(state); // 拼音逐步转换的已转换前缀一并上屏
         let committed = if !state.candidates.is_empty() {
-            let idx = self
-                .highlighted_global_index(state)
-                .min(state.candidates.len() - 1);
+            let (start, _) = self.page_range(state);
+            let idx = (start + state.selected_index).min(state.candidates.len() - 1);
             let t = state.candidates[idx].text.clone();
             self.record_selection(&state.input_buffer, &t);
+            // 进入临时拼音前顶屏高亮候选（来源候选；prefix 段已在选词时记过）。
+            self.record_commit(
+                &t,
+                state.input_buffer.len() as u32,
+                (idx - start) as i32,
+                wind_store::stats::CommitSource::Candidate,
+            );
             Some(format!("{prefix}{t}"))
         } else if !prefix.is_empty() {
             Some(prefix)

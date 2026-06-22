@@ -489,7 +489,12 @@ impl Coordinator {
         state.preedit.clone()
     }
 
-    pub(crate) fn commit_selected(&self, state: &mut State, cand: &Candidate) -> KeyAction {
+    pub(crate) fn commit_selected(
+        &self,
+        state: &mut State,
+        cand: &Candidate,
+        candidate_pos: i32,
+    ) -> KeyAction {
         // 前缀导航候选：补全输入到该组完整码并重查展开（二级选择，不上屏组名）。
         if cand.is_group {
             let code = cand.group_code.clone();
@@ -510,6 +515,14 @@ impl Coordinator {
             consumed > 0 && consumed < total && state.input_buffer.is_char_boundary(consumed);
         // 词频按候选实际编码记账（分段时为前缀码，如「ni」而非整串「nihao」）。
         self.record_selection(&code, &cand.text);
+        // 输入统计：每次选词记一段（分段逐字选各段各记一次，不重复整串）；
+        // 在 partial 分支之前，两分支都经此处一次。
+        self.record_commit(
+            &cand.text,
+            code.len() as u32,
+            candidate_pos,
+            wind_store::stats::CommitSource::Candidate,
+        );
         if partial {
             state.committed_segs.push((code, cand.text.clone()));
             state.committed_text.push_str(&cand.text);
@@ -539,7 +552,8 @@ impl Coordinator {
         let idx = start + (num - 1);
         if idx < end {
             let cand = state.candidates[idx].clone();
-            return self.commit_selected(state, &cand);
+            // 数字键页内位置 = num-1（候选首选率统计）。
+            return self.commit_selected(state, &cand, (num - 1) as i32);
         }
         self.handle_overflow_number_key(state, num)
     }
@@ -559,12 +573,12 @@ impl Coordinator {
         match behavior.as_str() {
             "commit" => {
                 let cand = state.candidates[hi].clone();
-                self.commit_selected(state, &cand)
+                self.commit_selected(state, &cand, state.selected_index as i32)
             }
             "commit_and_input" => {
                 let full_width = state.full_width;
                 let cand = state.candidates[hi].clone();
-                let act = self.commit_selected(state, &cand);
+                let act = self.commit_selected(state, &cand, state.selected_index as i32);
                 let digit = (b'0' + (num % 10) as u8) as char;
                 let digit = if full_width {
                     wind_transform::fullwidth::to_full_width(&digit.to_string())
