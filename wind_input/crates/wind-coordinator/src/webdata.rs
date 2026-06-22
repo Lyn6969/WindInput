@@ -830,40 +830,49 @@ impl Coordinator {
     }
 
     fn web_theme_list(&self) -> anyhow::Result<Value> {
-        // 每个主题目录读取 theme.yaml 的 meta（名称/作者/版本/排序），供设置页显示友好名而非 id (#5)。
+        // 与右键菜单 list_themes 同源:扫用户+安装多目录(theme_search_dirs),含 theme.yaml、
+        // 过滤 `_` 前缀(_base 等)、用户优先去重;读 meta(名称/作者/版本/排序)。修列表不一致 (#5/主题)。
+        let dirs = self.theme_search_dirs();
+        let mut seen = std::collections::HashSet::new();
         let mut rows: Vec<(i32, String, Value)> = Vec::new();
-        if let Some(dir) = &self.themes_dir {
-            let dirs = [dir.clone()];
-            if let Ok(rd) = std::fs::read_dir(dir) {
-                for e in rd.flatten() {
-                    if !e.path().is_dir() {
-                        continue;
-                    }
-                    let Some(name) = e.file_name().to_str().map(|s| s.to_string()) else {
-                        continue;
-                    };
-                    let meta = wind_theme::read_meta(&dirs, &name);
-                    let display = meta
-                        .as_ref()
-                        .map(|m| m.name.clone())
-                        .filter(|s| !s.is_empty())
-                        .unwrap_or_else(|| name.clone());
-                    let order = meta.as_ref().map(|m| m.order).unwrap_or(0);
-                    rows.push((
-                        order,
-                        display.clone(),
-                        json!({
-                            "name": name,
-                            "display_name": display,
-                            "author": meta.as_ref().map(|m| m.author.clone()).unwrap_or_default(),
-                            "version": meta.as_ref().map(|m| m.version.clone()).unwrap_or_default(),
-                            "builtin": true,
-                        }),
-                    ));
+        for (i, dir) in dirs.iter().enumerate() {
+            let builtin = i > 0; // theme_search_dirs[0] 为用户目录
+            let Ok(rd) = std::fs::read_dir(dir) else {
+                continue;
+            };
+            for e in rd.flatten() {
+                if !e.path().is_dir() {
+                    continue;
                 }
+                let Some(id) = e.file_name().to_str().map(|s| s.to_string()) else {
+                    continue;
+                };
+                if id.starts_with('_') || !dir.join(&id).join("theme.yaml").exists() {
+                    continue;
+                }
+                if !seen.insert(id.clone()) {
+                    continue;
+                }
+                let meta = wind_theme::read_meta(&dirs, &id);
+                let display = meta
+                    .as_ref()
+                    .map(|m| m.name.clone())
+                    .filter(|s| !s.is_empty())
+                    .unwrap_or_else(|| id.clone());
+                let order = meta.as_ref().map(|m| m.order).unwrap_or(0);
+                rows.push((
+                    order,
+                    display.clone(),
+                    json!({
+                        "name": id,
+                        "display_name": display,
+                        "author": meta.as_ref().map(|m| m.author.clone()).unwrap_or_default(),
+                        "version": meta.as_ref().map(|m| m.version.clone()).unwrap_or_default(),
+                        "builtin": builtin,
+                    }),
+                ));
             }
         }
-        // 按 (order, 显示名) 稳定排序。
         rows.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
         let out: Vec<Value> = rows.into_iter().map(|(_, _, v)| v).collect();
         Ok(json!(out))

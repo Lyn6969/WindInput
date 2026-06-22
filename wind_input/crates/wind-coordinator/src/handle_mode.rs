@@ -191,10 +191,16 @@ impl Coordinator {
         self.show_tip(&format!("主题: {}", name));
     }
 
-    /// 设置主题明暗（0 跟随/1 亮/2 暗），用当前主题重解析。
+    /// 设置主题明暗（0 跟随/1 亮/2 暗），用当前主题重解析,并持久化到 config.ui.theme.style。
     pub(crate) fn set_theme_style(&self, style: u8) {
         let dark = style == 2;
         *self.theme_dark.lock().unwrap_or_else(|e| e.into_inner()) = dark;
+        let style_str = match style {
+            1 => "light",
+            2 => "dark",
+            _ => "system",
+        };
+        let _ = Config::set_user_string(&["ui", "theme", "style"], style_str);
         let name = self
             .theme_name
             .lock()
@@ -244,8 +250,10 @@ impl Coordinator {
         }
     }
 
-    /// 持久化主题选择到 theme.txt。
+    /// 持久化主题选择。以 config.ui.theme.name 为单一源(设置页/右键统一,reload 据此应用);
+    /// 兼写 theme.txt 供旧版/快速回退。
     pub(crate) fn persist_theme(&self, name: &str) {
+        let _ = Config::set_user_string(&["ui", "theme", "name"], name);
         if let Some(p) = &self.theme_path {
             if let Some(parent) = p.parent() {
                 let _ = std::fs::create_dir_all(parent);

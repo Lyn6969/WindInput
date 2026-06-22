@@ -642,21 +642,20 @@ impl Coordinator {
         let toolbar_pos_path = Config::local_dir().map(|d| d.join("toolbar_pos.txt"));
         let theme_path = user_dir.as_ref().map(|d| d.join("theme.txt"));
         let themes_dir = data_dir.map(|d| d.join("themes"));
-        // 初始主题名：theme.txt（用户上次选择）> config.ui.theme > "default"
-        let initial_theme = theme_path
-            .as_ref()
-            .and_then(|p| std::fs::read_to_string(p).ok())
-            .map(|s| s.trim().to_string())
-            .filter(|s| !s.is_empty())
-            .or_else(|| {
-                let t = config.ui.theme.name.trim();
-                if t.is_empty() {
-                    None
-                } else {
-                    Some(t.to_string())
-                }
-            })
-            .unwrap_or_else(|| "default".to_string());
+        // 初始主题名：config.ui.theme.name（设置页/右键统一写此为准）> theme.txt（旧版迁移回退）> "default"
+        let cfg_theme = config.ui.theme.name.trim();
+        let initial_theme = if !cfg_theme.is_empty() {
+            cfg_theme.to_string()
+        } else {
+            theme_path
+                .as_ref()
+                .and_then(|p| std::fs::read_to_string(p).ok())
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .unwrap_or_else(|| "default".to_string())
+        };
+        // 初始明暗：config.ui.theme.style == "dark"(否则亮/跟随系统按亮处理)。修启动不应用风格。
+        let theme_dark_init = config.ui.theme.style.eq_ignore_ascii_case("dark");
 
         // 标点转换器：注入自定义映射（四状态）。
         let mut punct_conv = PunctuationConverter::new();
@@ -737,7 +736,7 @@ impl Coordinator {
             awaiting_caret: Mutex::new(false),
             themes_dir,
             theme_name: Mutex::new(initial_theme),
-            theme_dark: Mutex::new(false),
+            theme_dark: Mutex::new(theme_dark_init),
             theme_path,
             cmdbar_services: std::sync::OnceLock::new(),
             self_weak: std::sync::OnceLock::new(),
@@ -800,6 +799,17 @@ impl Coordinator {
                     self.notify_ui_hide();
                     self.push_state_update();
                     self.notify_toolbar(); // 方案名变化 → 刷新工具栏标签
+                }
+                // 同步主题选择:设置页改 config.ui.theme.* 后内存态须跟随,reload_config 才会下发新主题
+                // (此前 reload_config 只重推旧内存主题 → 设置页切主题不生效)。
+                {
+                    let name = new_cfg.ui.theme.name.trim();
+                    if !name.is_empty() {
+                        *self.theme_name.lock().unwrap_or_else(|e| e.into_inner()) =
+                            name.to_string();
+                    }
+                    *self.theme_dark.lock().unwrap_or_else(|e| e.into_inner()) =
+                        new_cfg.ui.theme.style.eq_ignore_ascii_case("dark");
                 }
                 self.apply_ui_config(); // 外观项（候选排列/编码显示/候选窗显隐）即时生效
                 self.reload_config(); // 刷新主题/工具栏（候选窗下次输入按新配置）
