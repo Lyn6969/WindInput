@@ -1506,4 +1506,20 @@ mod tests {
         assert!(!c.pinyin.fuzzy.enabled);
         assert!(!c.pinyin.fuzzy.zh_z);
     }
+
+    #[test]
+    fn pinyin_global_merge_partial() {
+        // 仅覆盖 [pinyin.fuzzy] 的 enabled 和 zh_z，其余字段应保留默认值（深合并验证）
+        let c = merged_with("[pinyin.fuzzy]\nenabled = true\nzh_z = true\n");
+        // 被覆盖字段：变为 true
+        assert!(c.pinyin.fuzzy.enabled, "enabled 应被覆盖为 true");
+        assert!(c.pinyin.fuzzy.zh_z, "zh_z 应被覆盖为 true");
+        // 未覆盖的 fuzzy 字段：保留默认 false
+        assert!(!c.pinyin.fuzzy.ch_c, "ch_c 未覆盖，应保留默认 false");
+        assert!(!c.pinyin.fuzzy.sh_s, "sh_s 未覆盖，应保留默认 false");
+        // 未覆盖的 pinyin 顶层字段：保留默认值
+        assert!(c.pinyin.show_code_hint, "show_code_hint 未覆盖，应保留默认 true");
+        assert!(c.pinyin.use_smart_compose, "use_smart_compose 未覆盖，应保留默认 true");
+        assert_eq!(c.pinyin.candidate_order, "smart", "candidate_order 未覆盖，应保留默认 smart");
+    }
 }
