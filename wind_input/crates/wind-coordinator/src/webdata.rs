@@ -403,8 +403,11 @@ impl Coordinator {
         if let toml::Value::Table(t) = &mut ov {
             t.insert("dictionaries".to_string(), dicts_val);
         }
-        self.engine_mgr.write_schema_override(id, &ov)?;
-        Ok(json!({ "ok": true }))
+        // 持久化 override（不 invalidate），再对已加载引擎 live 翻该扩展层的 enabled 标志——
+        // 扩展词库热插拔：无需重熔大词库即时生效；未加载方案下次构建按新 override 生效。
+        self.engine_mgr.persist_schema_override(id, &ov)?;
+        let live = self.engine_mgr.set_dict_enabled_live(id, dict_id, enabled);
+        Ok(json!({ "ok": true, "live": live }))
     }
 
     fn web_schema_delete(&self, params: &Value) -> anyhow::Result<Value> {

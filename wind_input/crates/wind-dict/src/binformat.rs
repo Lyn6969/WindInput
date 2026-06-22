@@ -11,6 +11,9 @@ use tracing::info;
 /// wdb 魔数 "WDIC"
 const MAGIC: [u8; 4] = [b'W', b'D', b'I', b'C'];
 
+/// 原子写临时文件序号：并发写同一目标时避免 `.tmp` 文件名冲突（对齐 Go atomicWriteSeq）。
+static ATOMIC_WRITE_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 /// wdb 文件头 (32 bytes)
 #[derive(Debug, Clone)]
 #[repr(C, packed)]
@@ -332,9 +335,10 @@ impl DictWriter {
         self.keys.len()
     }
 
-    /// 写入 wdb 文件
+    /// 写入 wdb 文件（原子：先写 `<path>.tmp.<seq>` 再 rename 覆盖，避免读到半文件）。
     pub fn write(&self, path: impl AsRef<Path>) -> anyhow::Result<()> {
         use std::io::Write;
+        let path = path.as_ref();
 
         // 按 code 排序
         let mut sorted_keys = self.keys.clone();
@@ -381,8 +385,18 @@ impl DictWriter {
         let data_off = (header_size + index_size) as u32;
         let str_off = (header_size + index_size + data_size) as u32;
 
-        // 写入文件
-        let mut file = std::fs::File::create(path)?;
+        // 原子写：写入临时文件，成功后 rename 覆盖目标。
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        // tmp 名含 pid + 进程内递增序号：既防同进程并发写同目标，也防多进程同时重建同一
+        // 缓存时 `.tmp` 撞名（撞名会让一方截断另一方正在写的 tmp）。仅防「读到半文件」，
+        // 不追求崩溃安全——缓存可重建：崩溃后内容指纹校验失败会自动重建。
+        let seq = ATOMIC_WRITE_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let mut tmp_os = path.as_os_str().to_os_string();
+        tmp_os.push(format!(".tmp.{}.{seq}", std::process::id()));
+        let tmp = std::path::PathBuf::from(tmp_os);
+        let mut file = std::io::BufWriter::new(std::fs::File::create(&tmp)?);
 
         // Header
         let header = DictFileHeader {
@@ -438,6 +452,14 @@ impl DictWriter {
 
         // StringPool
         file.write_all(&string_pool)?;
+
+        // 落盘后原子替换：flush → 关闭 → rename。rename 失败则清理临时文件。
+        file.flush()?;
+        drop(file);
+        if let Err(e) = std::fs::rename(&tmp, path) {
+            let _ = std::fs::remove_file(&tmp);
+            return Err(e.into());
+        }
 
         info!(
             "Wrote wdb: {} keys, {} entries, {} bytes string pool",

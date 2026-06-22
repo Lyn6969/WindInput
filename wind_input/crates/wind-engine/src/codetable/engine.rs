@@ -85,6 +85,12 @@ fn decide_auto_commit(
 }
 
 impl Engine for CodeTableEngine {
+    /// 热插拔扩展词库：翻 composite 中 `codetable-extra-<id>` 层的 enabled 标志。
+    fn set_dict_enabled(&self, dict_id: &str, enabled: bool) -> bool {
+        self.dm
+            .set_layer_enabled(&format!("codetable-extra-{dict_id}"), enabled)
+    }
+
     fn convert(&self, input: &str, max_candidates: usize) -> anyhow::Result<ConvertResult> {
         if input.is_empty() {
             return Ok(ConvertResult::default());

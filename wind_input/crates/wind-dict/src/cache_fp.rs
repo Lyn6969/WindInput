@@ -62,6 +62,11 @@ mod tests {
         let p = std::env::temp_dir().join(format!("wind_fp_test_{name}"));
         let mut f = std::fs::File::create(&p).unwrap();
         f.write_all(content).unwrap();
+        // 清掉上轮可能残留的指纹 sidecar，确保固定 temp 路径下测试可重复（否则
+        // 上次 write_cache_fp 写的 `<p>.fp` 会让本轮「未写指纹应不新鲜」误判为新鲜）。
+        let mut side = p.clone().into_os_string();
+        side.push(".fp");
+        let _ = std::fs::remove_file(side);
         p
     }
 

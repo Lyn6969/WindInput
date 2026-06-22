@@ -80,6 +80,64 @@ fn test_wubi_extra_dict_loaded() {
     );
 }
 
+/// 扩展词库 **live 热插拔**：对已加载引擎翻 enabled 标志即时改候选，无需重建。
+#[test]
+fn test_codetable_extra_hot_toggle() {
+    let dir = data_dir();
+    if !schema_exists(&dir, "wubi86") {
+        eprintln!("跳过：wubi86 schema 不存在");
+        return;
+    }
+    let cfg = make_config(&["wubi86"]);
+    let mgr = EngineManager::new(&cfg, Some(&dir));
+
+    // 扩展词库 id（非默认、有 path）
+    let Some(merged) = mgr.schema_merged("wubi86") else {
+        eprintln!("跳过：无法读取 wubi86");
+        return;
+    };
+    let extra_ids: Vec<String> = merged
+        .dictionaries
+        .iter()
+        .filter(|d| !d.default && !d.path.is_empty())
+        .map(|d| d.id.clone())
+        .collect();
+    if extra_ids.is_empty() {
+        eprintln!("跳过：wubi86 无扩展词库");
+        return;
+    }
+
+    // 触发引擎加载并确认扩展库词 '甘蓝菜'(aaae) 初始可见
+    let has_extra =
+        |m: &EngineManager| m.convert("aaae", 20).candidates.iter().any(|c| c.text == "甘蓝菜");
+    if !has_extra(&mgr) {
+        eprintln!("跳过：扩展库词 '甘蓝菜' 不在该数据集");
+        return;
+    }
+
+    // 热关闭全部扩展（live，不重建）→ '甘蓝菜' 消失
+    for id in &extra_ids {
+        assert!(
+            mgr.set_dict_enabled_live("wubi86", id, false),
+            "已加载引擎应即时命中扩展层: {id}"
+        );
+    }
+    assert!(!has_extra(&mgr), "热关闭扩展后 '甘蓝菜' 应消失（live，未重建）");
+    assert!(
+        mgr.convert("aaaa", 20)
+            .candidates
+            .iter()
+            .any(|c| c.text == "恭恭敬敬"),
+        "主库词不受扩展开关影响"
+    );
+
+    // 热重新开启 → '甘蓝菜' 回来
+    for id in &extra_ids {
+        assert!(mgr.set_dict_enabled_live("wubi86", id, true));
+    }
+    assert!(has_extra(&mgr), "热开启扩展后 '甘蓝菜' 应回来");
+}
+
 #[test]
 fn test_pinyin_engine_candidates() {
     let dir = data_dir();
