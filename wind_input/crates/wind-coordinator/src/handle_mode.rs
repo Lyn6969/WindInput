@@ -651,6 +651,7 @@ impl Coordinator {
             && let Some(ch) = punct_char(data.key_code, data.modifiers & MOD_SHIFT != 0)
         {
             let out = self.convert_punct_char(state, ch);
+            self.record_commit(&out, 0, -1, wind_store::stats::CommitSource::Punctuation);
             self.exit_mix_mode(state);
             self.notify_ui_hide();
             return Self::commit_action(out, true);
@@ -684,6 +685,13 @@ impl Coordinator {
             keymap::VK_SPACE => {
                 // 空格：选当前高亮候选（文本透镜逐步转换）
                 if state.candidates.is_empty() {
+                    // 上屏剩余原码：committed 段已在各次选词记过，此处只记 mix_buffer 避免重复。
+                    self.record_commit(
+                        &state.mix_buffer,
+                        state.mix_buffer.len() as u32,
+                        -1,
+                        wind_store::stats::CommitSource::Mix,
+                    );
                     let out = self.maybe_s2t(
                         state,
                         &format!("{}{}", state.committed_text, state.mix_buffer),
@@ -699,6 +707,12 @@ impl Coordinator {
             }
             keymap::VK_RETURN => {
                 // 回车：上屏「已转换前缀 + 缓冲原文」（如完整表达式 100+200=300，或已转中文+剩余拼音）
+                self.record_commit(
+                    &state.mix_buffer,
+                    state.mix_buffer.len() as u32,
+                    -1,
+                    wind_store::stats::CommitSource::Mix,
+                );
                 let out = self.maybe_s2t(
                     state,
                     &format!("{}{}", state.committed_text, state.mix_buffer),

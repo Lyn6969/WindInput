@@ -1759,6 +1759,13 @@ impl Coordinator {
         let text = if commit {
             // 切到英文且配置上屏：把「已转换前缀 + 剩余原码」一并上屏。
             let prefix = self.take_committed(state);
+            // 模式切换上屏：committed 段已在选词时记过，此处只记剩余原码（来源模式切换）。
+            self.record_commit(
+                &state.input_buffer,
+                state.input_buffer.len() as u32,
+                -1,
+                CommitSource::ModeSwitch,
+            );
             self.maybe_s2t(state, &format!("{}{}", prefix, state.input_buffer))
         } else {
             String::new()
@@ -2196,6 +2203,13 @@ impl MessageHandler for Coordinator {
                         return KeyAction::ClearComposition;
                     }
                     let prefix = self.take_committed(&mut state);
+                    // 上屏剩余拼音原码：prefix(committed) 段已在选词时记过，此处只记 input_buffer 避免重复。
+                    self.record_commit(
+                        &state.input_buffer,
+                        state.input_buffer.len() as u32,
+                        -1,
+                        CommitSource::RawInput,
+                    );
                     let text = self.maybe_s2t(&state, &format!("{}{}", prefix, state.input_buffer));
                     state.input_buffer.clear();
                     state.candidates.clear();
@@ -2218,6 +2232,13 @@ impl MessageHandler for Coordinator {
                         return KeyAction::ClearComposition;
                     }
                     let prefix = self.take_committed(&mut state);
+                    // 上屏剩余拼音原码：prefix(committed) 段已在选词时记过，此处只记 input_buffer 避免重复。
+                    self.record_commit(
+                        &state.input_buffer,
+                        state.input_buffer.len() as u32,
+                        -1,
+                        CommitSource::RawInput,
+                    );
                     let text = self.maybe_s2t(&state, &format!("{}{}", prefix, state.input_buffer));
                     state.input_buffer.clear();
                     state.candidates.clear();
@@ -2404,6 +2425,9 @@ impl MessageHandler for Coordinator {
                     // 标点单点流水线：自定义映射 > 数字后智能 > 中文标点 > 全半角。
                     let piece = self.convert_punct(&state, ch, data.prev_char);
                     out.push_str(&piece);
+                    // 标点字符（候选部分已在标点前顶屏候选处记 Candidate；标点候选已 set
+                    // stat_recorded，故此处必须显式记标点，否则顶层 fallback 会跳过它）。
+                    self.record_commit(&piece, 0, -1, CommitSource::Punctuation);
                     if had_input {
                         self.notify_ui_hide();
                     }

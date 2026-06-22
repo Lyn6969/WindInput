@@ -93,8 +93,8 @@ Rust **并非完全缺失**统计，而是只迁了「极简骨架」：`wind-st
 - 每个注入点设 `stat_recorded=true`，fallback 只兜未命中路径
 - 词频 `record_selection`（已存在）与统计采集**保持独立**，不互相耦合
 **Tests**: 各来源/码长/首选率分类的针对性单测（构造 KeyEvent 序列断言 collector 聚合值）
-**Status**: Not Started
-**合并提示**: 本 stage 单独 commit；合并前 `git fetch && rebase main`，集中解决 coordinator 冲突。
+**Status**: ✅ Complete（3a `ab13cba` 候选核心 + 3b 来源细分；含 committed 段的点只记剩余 buffer 避免 fallback 重复计；标点 piece 显式记；13 测试绿）
+**合并提示**: 已碰 coordinator.rs/handle_candidate/temp/mode/quick/special/url 共 7 文件；合并前 `git fetch && rebase main` 集中解决 coordinator 冲突。
 
 ## Stage 4: RPC 扩展 + 前端点亮
 **Goal**: webdata 输出富字段，前端 StatsPage 不再显示 0。

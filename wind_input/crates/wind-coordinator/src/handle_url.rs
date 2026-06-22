@@ -125,6 +125,7 @@ impl Coordinator {
             keymap::VK_SPACE | keymap::VK_RETURN => {
                 // 空格/回车：上屏当前缓冲原文（不做全半角/标点转换）
                 let text = state.url_buffer.clone();
+                self.record_commit(&text, 0, -1, wind_store::stats::CommitSource::Url);
                 self.exit_url_mode(state);
                 self.notify_ui_hide();
                 if text.is_empty() {

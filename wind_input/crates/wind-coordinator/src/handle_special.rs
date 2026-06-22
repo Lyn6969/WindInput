@@ -119,6 +119,7 @@ impl Coordinator {
             && let Some(ch) = punct_char(data.key_code, data.modifiers & MOD_SHIFT != 0)
         {
             let out = self.convert_punct_char(state, ch);
+            self.record_commit(&out, 0, -1, wind_store::stats::CommitSource::Punctuation);
             self.exit_special_mode(state);
             self.notify_ui_hide();
             return Self::commit_action(out, true);
@@ -154,6 +155,12 @@ impl Coordinator {
                         .highlighted_global_index(state)
                         .min(state.candidates.len() - 1);
                     let text = state.candidates[idx].text.clone();
+                    self.record_commit(
+                        &text,
+                        state.special_buffer.len() as u32,
+                        -1,
+                        wind_store::stats::CommitSource::SpecialMode,
+                    );
                     self.exit_special_mode(state);
                     self.notify_ui_hide();
                     Self::commit_action(text, true)
@@ -166,6 +173,12 @@ impl Coordinator {
             keymap::VK_RETURN => {
                 // 回车：上屏编码原文
                 let text = state.special_buffer.clone();
+                self.record_commit(
+                    &text,
+                    text.len() as u32,
+                    -1,
+                    wind_store::stats::CommitSource::SpecialMode,
+                );
                 self.exit_special_mode(state);
                 self.notify_ui_hide();
                 if text.is_empty() {
@@ -180,6 +193,12 @@ impl Coordinator {
                 let gi = start + (data.key_code - 0x31) as usize;
                 if gi < end {
                     let text = state.candidates[gi].text.clone();
+                    self.record_commit(
+                        &text,
+                        state.special_buffer.len() as u32,
+                        -1,
+                        wind_store::stats::CommitSource::SpecialMode,
+                    );
                     self.exit_special_mode(state);
                     self.notify_ui_hide();
                     Self::commit_action(text, true)
@@ -192,6 +211,12 @@ impl Coordinator {
                 let ch = (b'a' + (data.key_code - 0x41) as u8) as char;
                 state.special_buffer.push(ch);
                 if let Some(text) = self.update_special_candidates(state) {
+                    self.record_commit(
+                        &text,
+                        state.special_buffer.len() as u32,
+                        -1,
+                        wind_store::stats::CommitSource::SpecialMode,
+                    );
                     self.exit_special_mode(state);
                     self.notify_ui_hide();
                     return Self::commit_action(text, true);
@@ -211,6 +236,12 @@ impl Coordinator {
                     let gi = start + offset;
                     if gi < end {
                         let text = state.candidates[gi].text.clone();
+                        self.record_commit(
+                            &text,
+                            state.special_buffer.len() as u32,
+                            -1,
+                            wind_store::stats::CommitSource::SpecialMode,
+                        );
                         self.exit_special_mode(state);
                         self.notify_ui_hide();
                         return Self::commit_action(text, true);
@@ -227,6 +258,13 @@ impl Coordinator {
                         String::new()
                     };
                     let punct = self.convert_punct_char(state, ch);
+                    self.record_commit(
+                        &committed,
+                        state.special_buffer.len() as u32,
+                        -1,
+                        wind_store::stats::CommitSource::SpecialMode,
+                    );
+                    self.record_commit(&punct, 0, -1, wind_store::stats::CommitSource::Punctuation);
                     self.exit_special_mode(state);
                     self.notify_ui_hide();
                     Self::commit_action(format!("{}{}", committed, punct), true)

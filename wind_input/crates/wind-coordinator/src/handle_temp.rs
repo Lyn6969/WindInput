@@ -149,6 +149,7 @@ impl Coordinator {
                 .or_else(|| punct_char(data.key_code, data.modifiers & MOD_SHIFT != 0));
             if let Some(ch) = ch {
                 let out = self.convert_punct_char(state, ch);
+                self.record_commit(&out, 0, -1, wind_store::stats::CommitSource::Punctuation);
                 self.exit_temp_pinyin(state);
                 self.notify_ui_hide();
                 return Self::commit_action(out, true);
@@ -213,6 +214,13 @@ impl Coordinator {
             }
             keymap::VK_RETURN => {
                 // 回车：上屏「当前显示」= 已转换前缀 + 剩余拼音原码（已选中文照样上屏），退出。
+                // committed 段已在选词时记过，此处只记剩余拼音原码避免重复。
+                self.record_commit(
+                    &state.temp_pinyin_buffer,
+                    state.temp_pinyin_buffer.len() as u32,
+                    -1,
+                    wind_store::stats::CommitSource::TempPinyin,
+                );
                 let out = format!("{}{}", state.committed_text, state.temp_pinyin_buffer);
                 let out = self.maybe_s2t(state, &out);
                 self.exit_temp_pinyin(state);
@@ -348,6 +356,8 @@ impl Coordinator {
             } else {
                 t
             };
+            // 临时英文上屏（独占模式，无分段 committed）：来源临英，英文无编码故 code_len=0。
+            this.record_commit(&text, 0, -1, wind_store::stats::CommitSource::TempEnglish);
             this.exit_temp_english(state);
             this.notify_ui_hide();
             if text.is_empty() {
@@ -449,6 +459,8 @@ impl Coordinator {
                         base
                     };
                     let punct = self.convert_punct_char(state, ch);
+                    self.record_commit(&base, 0, -1, wind_store::stats::CommitSource::TempEnglish);
+                    self.record_commit(&punct, 0, -1, wind_store::stats::CommitSource::Punctuation);
                     self.exit_temp_english(state);
                     self.notify_ui_hide();
                     Self::commit_action(format!("{}{}", base, punct), true)
