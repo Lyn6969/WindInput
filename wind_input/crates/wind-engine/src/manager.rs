@@ -84,6 +84,10 @@ pub struct EngineManager {
     reverse_index: Mutex<Option<(String, Arc<HashMap<String, String>>)>>,
     /// 全局拼音配置（fuzzy/show_code_hint/...）。Mutex 以支持热重载。
     pinyin: Mutex<wind_config::config::PinyinGlobalConfig>,
+    /// 双拼韵母键集缓存：(已缓存的活跃方案 id, Option<HashSet<u8>>)。
+    /// None = 当前活跃方案不是双拼；Some = 双拼布局的 finals 键集合。
+    /// 活跃方案 id 变化时按需重建（惰性），避免每键读盘（对齐 code_hint_cache 模式）。
+    shuangpin_finals_cache: Mutex<(String, Option<std::collections::HashSet<u8>>)>,
 }
 
 /// 进程级缓存根目录（%LOCALAPPDATA%\WindInput\cache），EngineManager::new 设置一次。
@@ -189,6 +193,7 @@ impl EngineManager {
             primary_codetable: Mutex::new(primary_codetable),
             reverse_index: Mutex::new(None),
             pinyin: Mutex::new(config.pinyin.clone()),
+            shuangpin_finals_cache: Mutex::new((String::new(), None)),
         };
         // 仅构建活跃方案（其余懒加载）
         mgr.ensure_loaded(&active_id);
@@ -200,6 +205,51 @@ impl EngineManager {
     /// (码表类方案的「剩余编码」由码表引擎在 convert 内处理，不走此路径。)
     pub fn pinyin_show_code_hint(&self) -> bool {
         self.pinyin.lock().unwrap_or_else(|e| e.into_inner()).show_code_hint
+    }
+
+    /// 活跃方案为双拼且 `key`（ASCII 字节）是其布局的韵母键时返回 true，否则 false。
+    /// 供选词热键避让：正在输入双拼时，韵母键优先作编码输入而非触发选词（对齐 Go IsShuangpinFinalKey）。
+    /// 内部按活跃方案 id 缓存韵母键集合，方案切换/reload/invalidate 时自动失效。
+    pub fn shuangpin_final_key(&self, key: u8) -> bool {
+        let active_id = self.active_schema_id();
+        // 检查缓存是否命中
+        {
+            let cache = self.shuangpin_finals_cache.lock().unwrap_or_else(|e| e.into_inner());
+            if cache.0 == active_id {
+                return cache.1.as_ref().map(|s| s.contains(&key)).unwrap_or(false);
+            }
+        }
+        // 缓存未命中：读取活跃方案，判断是否双拼并构建韵母键集合
+        let finals_set = self.build_shuangpin_finals(&active_id);
+        let result = finals_set.as_ref().map(|s| s.contains(&key)).unwrap_or(false);
+        *self.shuangpin_finals_cache.lock().unwrap_or_else(|e| e.into_inner()) =
+            (active_id, finals_set);
+        result
+    }
+
+    /// 内部辅助：为指定方案 id 构建双拼韵母键集（非双拼返回 None）。
+    fn build_shuangpin_finals(
+        &self,
+        schema_id: &str,
+    ) -> Option<std::collections::HashSet<u8>> {
+        let data_dir = self.data_dir.as_deref()?;
+        let schema =
+            Self::read_schema(schema_id, Some(data_dir), self.override_dir.as_deref())?;
+        if !schema.engine.pinyin.scheme.eq_ignore_ascii_case("shuangpin") {
+            return None;
+        }
+        let layout_id = if schema.engine.pinyin.shuangpin.layout.is_empty() {
+            "xiaohe".to_string()
+        } else {
+            schema.engine.pinyin.shuangpin.layout.clone()
+        };
+        let lp = data_dir
+            .join("schemas")
+            .join("shuangpin")
+            .join(format!("{layout_id}.toml"));
+        crate::pinyin::shuangpin::Layout::from_toml(&lp)
+            .map(|lay| lay.final_key_set())
+            .ok()
     }
 
     /// 拼音方案编码提示:返回主码表中 `text` 实际对应的编码(多码取权重/码长/字典序首位),
@@ -517,6 +567,11 @@ impl EngineManager {
             .reverse_index
             .lock()
             .unwrap_or_else(|e| e.into_inner()) = None;
+        // 双拼布局可能变更：失效韵母键缓存，下次按新布局重建。
+        *self
+            .shuangpin_finals_cache
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = (String::new(), None);
     }
 
     /// 切换到指定方案；成功返回 true（必要时懒加载）
@@ -581,6 +636,11 @@ impl EngineManager {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .clear();
+        // 双拼布局可能变更：失效韵母键缓存，下次按新布局重建。
+        *self
+            .shuangpin_finals_cache
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = (String::new(), None);
 
         // 切换活跃方案（即便 id 未变，引擎已被清空，这里立即重建避免首键延迟）。
         let changed = {
@@ -1505,6 +1565,100 @@ mod tests {
         );
 
         // 清理
+        let _ = std::fs::remove_dir_all(&base_dir);
+        let _ = std::fs::remove_dir_all(&ov_dir);
+    }
+
+    /// Task 5.1：双拼活跃时，韵母键 shuangpin_final_key 返回 true；非韵母键返回 false。
+    /// 用真实 data 目录 + mspy 布局（含 `;` = ing）验证。
+    #[test]
+    fn shuangpin_final_key_true_for_shuangpin() {
+        use std::io::Write;
+
+        // 真实 data 目录（含 shuangpin/ 布局文件 + 可读的 schema TOML）
+        let data_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../../data");
+        // 把测试用 schema 写到 data/schemas/ 目录下（与真实布局同 data_dir）
+        // 注意：测试结束后删除，防止污染。
+        let sp_schema_path = data_dir.join("schemas").join("sp_mspy_test.schema.toml");
+        {
+            let mut f = std::fs::File::create(&sp_schema_path).unwrap();
+            write!(
+                f,
+                "[schema]\nid = \"sp_mspy_test\"\n[engine]\ntype = \"pinyin\"\n[engine.pinyin]\nscheme = \"shuangpin\"\n[engine.pinyin.shuangpin]\nlayout = \"mspy\"\n"
+            )
+            .unwrap();
+        }
+
+        let mut cfg = Config::default();
+        cfg.schema.active = "sp_mspy_test".into();
+        cfg.schema.available = vec!["sp_mspy_test".into()];
+
+        let ov_dir = std::env::temp_dir().join("wind_eng_sp_finalkey_ov");
+        let _ = std::fs::remove_dir_all(&ov_dir);
+
+        let mgr = EngineManager::with_store_override(
+            &cfg,
+            Some(&data_dir),
+            None,
+            Some(ov_dir.clone()),
+        );
+
+        // mspy `;` = ing → 是韵母键
+        assert!(
+            mgr.shuangpin_final_key(b';'),
+            "mspy `;` 应是韵母键"
+        );
+        // `k` 在 mspy 是韵母键（ao）
+        assert!(
+            mgr.shuangpin_final_key(b'k'),
+            "mspy `k` 应是韵母键"
+        );
+        // `[` 不是 mspy 的韵母键（mspy finals 仅含字母和 `;`）
+        assert!(
+            !mgr.shuangpin_final_key(b'['),
+            "mspy `[` 不应是韵母键"
+        );
+
+        let _ = std::fs::remove_file(&sp_schema_path);
+        let _ = std::fs::remove_dir_all(&ov_dir);
+    }
+
+    /// Task 5.1：非双拼方案（codetable）时，shuangpin_final_key 对任何键返回 false。
+    #[test]
+    fn shuangpin_final_key_false_for_non_shuangpin() {
+        use std::io::Write;
+
+        let base_dir = std::env::temp_dir().join("wind_eng_sp_finalkey_ct_test");
+        let schemas = base_dir.join("schemas");
+        std::fs::create_dir_all(&schemas).unwrap();
+        {
+            let mut f = std::fs::File::create(schemas.join("wubi.schema.toml")).unwrap();
+            write!(
+                f,
+                "[schema]\nid = \"wubi\"\n[engine]\ntype = \"codetable\"\n"
+            )
+            .unwrap();
+        }
+
+        let mut cfg = Config::default();
+        cfg.schema.active = "wubi".into();
+        cfg.schema.available = vec!["wubi".into()];
+
+        let ov_dir = std::env::temp_dir().join("wind_eng_sp_finalkey_ct_ov");
+        let _ = std::fs::remove_dir_all(&ov_dir);
+
+        let mgr = EngineManager::with_store_override(
+            &cfg,
+            Some(&base_dir),
+            None,
+            Some(ov_dir.clone()),
+        );
+
+        // 非双拼方案，任何键均应返回 false
+        assert!(!mgr.shuangpin_final_key(b';'), "codetable 方案 `;` 应返回 false");
+        assert!(!mgr.shuangpin_final_key(b'k'), "codetable 方案 `k` 应返回 false");
+
         let _ = std::fs::remove_dir_all(&base_dir);
         let _ = std::fs::remove_dir_all(&ov_dir);
     }

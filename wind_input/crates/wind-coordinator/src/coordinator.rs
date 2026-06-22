@@ -2116,12 +2116,20 @@ impl MessageHandler for Coordinator {
                 // 触发键优先级链（对齐 Go decideBufferedTrigger，缓冲非空/有候选时）：
                 if !shift {
                     // B/C. 二/三候选键 + 候选足够 → 选候选
-                    if let Some(offset) = self.select_key_offset(data.key_code) {
-                        let (start, end) = self.page_range(&state);
-                        let idx = start + offset;
-                        if idx < end {
-                            let cand = state.candidates[idx].clone();
-                            return self.commit_selected(&mut state, &cand);
+                    // 双拼韵母键避让：正在输入双拼（缓冲非空）且该键是当前布局的韵母键时，
+                    // 跳过选词分支，让该键作为编码输入累积（对齐 Go IsShuangpinFinalKey）。
+                    let is_shuangpin_final = !state.input_buffer.is_empty()
+                        && punct_char(data.key_code, false)
+                            .map(|c| self.engine_mgr.shuangpin_final_key(c as u8))
+                            .unwrap_or(false);
+                    if !is_shuangpin_final {
+                        if let Some(offset) = self.select_key_offset(data.key_code) {
+                            let (start, end) = self.page_range(&state);
+                            let idx = start + offset;
+                            if idx < end {
+                                let cand = state.candidates[idx].clone();
+                                return self.commit_selected(&mut state, &cand);
+                            }
                         }
                     }
                     // D. 模式触发键 → 顶屏高亮候选 + 进模式（快捷输入 > 临时拼音）

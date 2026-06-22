@@ -93,6 +93,11 @@ impl Layout {
     pub fn is_final_key(&self, key: u8) -> bool {
         self.finals.contains_key(&key)
     }
+
+    /// 返回所有韵母键的集合（供 EngineManager 缓存，对齐 Go IsShuangpinFinalKey）。
+    pub fn final_key_set(&self) -> std::collections::HashSet<u8> {
+        self.finals.keys().copied().collect()
+    }
 }
 
 // ============================================================================
