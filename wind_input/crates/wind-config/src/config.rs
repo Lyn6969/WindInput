@@ -1018,6 +1018,9 @@ pub struct QuickInputConfig {
     /// 计算器结果小数位数，默认 6
     #[serde(default = "default_decimal_places")]
     pub decimal_places: i32,
+    /// 强制竖排显示：进入快捷输入时切竖排候选，退出恢复原布局。
+    #[serde(default)]
+    pub force_vertical: bool,
 }
 
 fn default_quick_input_triggers() -> Vec<String> {
@@ -1036,6 +1039,7 @@ impl Default for QuickInputConfig {
             enabled: false,
             trigger_keys: default_quick_input_triggers(),
             decimal_places: default_decimal_places(),
+            force_vertical: false,
         }
     }
 }

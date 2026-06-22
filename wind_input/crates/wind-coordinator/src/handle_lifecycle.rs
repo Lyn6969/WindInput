@@ -137,6 +137,10 @@ impl Coordinator {
         state.committed_segs.clear();
         // 焦点/模式切换：解除智能符号待命，避免跨上下文误触发替换。
         self.disarm_smart_symbol();
+        // 快捷输入「强制竖排」遗留：离开模式时恢复进入前布局。
+        if let Some(prev) = state.quick_saved_vertical.take() {
+            let _ = self.ui_tx.send(UiCommand::SetCandidateLayout(prev));
+        }
         if dirty {
             debug!("reset_exclusive_modes: cleared residual exclusive input mode state");
         }

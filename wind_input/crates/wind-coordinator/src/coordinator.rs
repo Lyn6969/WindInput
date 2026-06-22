@@ -280,6 +280,8 @@ pub(crate) struct State {
     pub(crate) quick_input_buffer: String,
     /// 快捷输入组合区前缀字符（触发键，如 ";"）
     pub(crate) quick_input_prefix: String,
+    /// 快捷输入「强制竖排」时记住进入前的布局（Some(原 vertical) = 已强制，退出恢复）。
+    pub(crate) quick_saved_vertical: Option<bool>,
     /// 临时英文输入缓冲
     pub(crate) temp_english_buffer: String,
     /// 网址模式输入缓冲（原样累积的 URL 文本）
@@ -477,6 +479,28 @@ impl Coordinator {
                     c.handle_ui_event(ev);
                 }
                 debug!("UI event channel closed");
+            });
+        }
+
+        // 后台预热：提前构建其余方案的引擎与缓存（拼音 merged/unigram、码表 per-dict），
+        // 避免首次切换到拼音/临时拼音/码表时同步重熔大词库造成几十秒卡顿。
+        // single-flight 构建锁保证预热与用户切换不重复构建；按方案顺序逐个建（后台低频）。
+        {
+            let c = Arc::clone(&coordinator);
+            std::thread::spawn(move || {
+                let active = c.engine_mgr.active_schema_id();
+                for id in c.engine_mgr.available_schemas() {
+                    if id == active || c.engine_mgr.is_loaded(&id) {
+                        continue;
+                    }
+                    let t0 = std::time::Instant::now();
+                    if c.engine_mgr.prewarm_schema(&id) {
+                        debug!("Prewarmed schema {} in {:?}", id, t0.elapsed());
+                    } else {
+                        debug!("Prewarm skipped/failed for schema {}", id);
+                    }
+                }
+                debug!("Schema prewarm done");
             });
         }
 
@@ -692,6 +716,7 @@ impl Coordinator {
                 temp_pinyin_prefix: String::new(),
                 quick_input_buffer: String::new(),
                 quick_input_prefix: String::new(),
+                quick_saved_vertical: None,
                 temp_english_buffer: String::new(),
                 url_buffer: String::new(),
                 rewind: None,
@@ -2016,7 +2041,16 @@ impl MessageHandler for Coordinator {
                     let cand = state.candidates[idx].clone();
                     self.commit_selected(&mut state, &cand)
                 } else if !state.input_buffer.is_empty() || !state.committed_text.is_empty() {
-                    // 无候选：上屏「已转换前缀 + 剩余拼音原码」。
+                    // 空码空格：按 space_on_empty_behavior（对齐 Go handleSpace 空码分支）——
+                    // "clear" 清空编码；否则上屏「已转换前缀 + 剩余拼音原码」。
+                    if self.rt().config.input.space_on_empty_behavior == "clear" {
+                        state.committed_text.clear();
+                        state.committed_segs.clear();
+                        state.input_buffer.clear();
+                        state.candidates.clear();
+                        self.notify_ui_hide();
+                        return KeyAction::ClearComposition;
+                    }
                     let prefix = self.take_committed(&mut state);
                     let text = self.maybe_s2t(&state, &format!("{}{}", prefix, state.input_buffer));
                     state.input_buffer.clear();
@@ -2028,8 +2062,17 @@ impl MessageHandler for Coordinator {
                 }
             }
             keymap::VK_RETURN => {
-                // Enter：上屏「当前显示」= 已转换前缀 + 剩余原码（已选中文照样上屏），退出
+                // Enter：按 enter_behavior 配置（对齐 Go handleEnter）——"clear" 清空编码
+                // (不上屏)；否则(commit)上屏「已转换前缀 + 剩余原码」。
                 if !state.input_buffer.is_empty() || !state.committed_text.is_empty() {
+                    if self.rt().config.input.enter_behavior == "clear" {
+                        state.committed_text.clear();
+                        state.committed_segs.clear();
+                        state.input_buffer.clear();
+                        state.candidates.clear();
+                        self.notify_ui_hide();
+                        return KeyAction::ClearComposition;
+                    }
                     let prefix = self.take_committed(&mut state);
                     let text = self.maybe_s2t(&state, &format!("{}{}", prefix, state.input_buffer));
                     state.input_buffer.clear();
