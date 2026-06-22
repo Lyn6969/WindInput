@@ -192,6 +192,11 @@ do_ci() {
     say "\nCI 全部通过 ✓"
 }
 
+# fmt-check + 纯逻辑 test(host) + clippy(Windows 目标，cargo-xwin)。
+    ( cd "$PORTABLE_DIR" && cargo fmt --all -- --check && cargo test ) \
+    ( cd "$PORTABLE_DIR" && cargo_xwin clippy --target "$TARGET" ) \
+}
+
 # 模块二：C++ TSF DLL（x64 + x86；clang/MSVC 交叉编译）。
 # obj 中间产物落 .cache，保持 outdir 干净（== 安装内容）。debug → _debug 后缀。
 build_tsf_all() {

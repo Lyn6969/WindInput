@@ -72,7 +72,7 @@ jobs:
           cache: pnpm
 
       # tag 为发布版本的唯一真值源；docs/VERSION 仅为开发占位。把 tag 版本写入
-      # docs/VERSION，让下游(build.rs 资源版本 / dev.sh dist / pack-installer)统一取到。
+      # docs/VERSION，让下游(build.rs 资源版本 / dev.sh release / pack-installer)统一取到。
       - name: 确定版本并写入 docs/VERSION
         working-directory: WindInput
         run: |
@@ -85,9 +85,8 @@ jobs:
           echo "build version = $V"
           echo "BUILD_VERSION=$V" >> "$GITHUB_ENV"
 
-      - name: 构建发布目录 (exe + x64/x86 TSF + data)
         working-directory: WindInput
-        run: ./scripts/dev.sh dist
+        run: ./scripts/dev.sh release
 
       - name: 打包安装程序 (cross stub + native packer，免 wine)
         working-directory: WindInput

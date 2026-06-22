@@ -120,6 +120,10 @@ cp -f  "$UNINSTALLER"                "$STAGE/uninstall.exe"
 else
 fi
 
+# 单一二进制，运行时自辨变体；不存在仅告警(运行 'dev.sh m4' 构建到 build/)。
+else
+fi
+
 # ---- 阶段一:压缩打包 ----
 echo ">>> 阶段一:pack(算法 $COMPRESSION)..."
 "$PACKER" pack --source "$STAGE" --output "$ARCHIVE" --compression "$COMPRESSION"
