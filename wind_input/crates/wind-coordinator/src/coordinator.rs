@@ -2144,6 +2144,27 @@ impl MessageHandler for Coordinator {
                     if let Some(act) = self.try_smart_symbol_replace(&state, ch, data.prev_char) {
                         return act;
                     }
+                    // 标点顶码上屏开关：有编码/已确认前缀时，码表/混输按方案
+                    // engine.codetable.punct_commit 决定是否顶字上屏。
+                    // 关闭时标点「直接无效」——吞掉该键、保留编码继续输入（不顶字、不透传上屏
+                    // 英文标点）。该功能少用，吞键比 Go 的 `return nil` 透传更符合预期。
+                    // TODO(拼音标点顶码)：拼音引擎也应有独立 punct_commit 配置（默认开），
+                    // 待相关引擎配置重构落定后接入；当前拼音恒顶字上屏（等价默认开）。
+                    let has_input =
+                        !state.input_buffer.is_empty() || !state.committed_text.is_empty();
+                    if has_input {
+                        let punct_commit = match self.engine_mgr.current_engine_type() {
+                            Some(wind_engine::EngineType::Pinyin) => true,
+                            _ => self
+                                .engine_mgr
+                                .schema_merged(&self.engine_mgr.active_schema_id())
+                                .map(|s| s.engine.codetable.punct_commit)
+                                .unwrap_or(false),
+                        };
+                        if !punct_commit {
+                            return KeyAction::Consumed;
+                        }
+                    }
                     // 标点/符号键：先上屏已转换前缀 + 首选候选（若有输入），再追加（转换后的）标点
                     let committed = self.take_committed(&mut state);
                     let mut out = self.maybe_s2t(&state, &committed);
