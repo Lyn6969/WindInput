@@ -1,0 +1,39 @@
+[meta]
+id = "ziguang"
+name = "紫光双拼"
+
+[initials]
+u = "zh"
+i = "sh"
+a = "ch"
+
+[finals]
+a = ["a"]
+o = ["uo", "o"]
+e = ["e"]
+i = ["i"]
+u = ["u"]
+b = ["iao"]
+d = ["ie"]
+f = ["ian"]
+g = ["iang", "uang"]
+h = ["iong", "ong"]
+j = ["er", "iu"]
+k = ["ei"]
+l = ["uan"]
+";" = ["ing"]
+m = ["un"]
+n = ["ue", "ui", "ve"]
+p = ["ai"]
+q = ["ao"]
+r = ["an"]
+s = ["ang"]
+t = ["eng"]
+w = ["en"]
+x = ["ia", "ua"]
+y = ["in", "uai"]
+z = ["ou"]
+
+[zero_initials]
+o = ["o", "ou"]
+e = ["e", "ei", "en", "eng", "er"]

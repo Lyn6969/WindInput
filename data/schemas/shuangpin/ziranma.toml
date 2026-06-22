@@ -1,0 +1,41 @@
+[meta]
+id = "ziranma"
+name = "自然码"
+
+[initials]
+v = "zh"
+i = "ch"
+u = "sh"
+
+[finals]
+a = ["a"]
+o = ["uo", "o"]
+e = ["e"]
+i = ["i"]
+u = ["u"]
+v = ["ui", "v"]
+b = ["ou"]
+c = ["iao"]
+d = ["uang", "iang"]
+f = ["en"]
+g = ["eng"]
+h = ["ang"]
+j = ["an"]
+k = ["ao"]
+l = ["ai"]
+m = ["ian"]
+n = ["in"]
+p = ["un"]
+q = ["iu"]
+r = ["uan", "er"]
+s = ["ong", "iong"]
+t = ["ue", "ve"]
+w = ["ia", "ua"]
+x = ["ie"]
+y = ["uai", "ing"]
+z = ["ei"]
+
+[zero_initials]
+a = ["a", "ai", "an", "ang", "ao"]
+o = ["o", "ou"]
+e = ["e", "ei", "en", "eng", "er"]

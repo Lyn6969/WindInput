@@ -141,4 +141,48 @@ a = ["a", "ai", "an", "ang", "ao"]
         assert!(lay.is_final_key(b';'));
         assert_eq!(lay.finals_of(b';'), &["ing".to_string()]);
     }
+
+    #[test]
+    fn builtin_layouts_load() {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../../data/schemas/shuangpin");
+        for id in ["xiaohe", "ziranma", "mspy", "sogou", "abc", "ziguang"] {
+            let p = dir.join(format!("{id}.toml"));
+            let lay = Layout::from_toml(&p)
+                .unwrap_or_else(|e| panic!("加载 {id} 失败: {e}"));
+            assert_eq!(lay.id, id, "{id} 的 meta.id 不匹配");
+            assert!(lay.is_final_key(b'k'), "{id} 应有 finals['k']");
+        }
+        // 差异点对拍：小鹤 ao=c，ai=d
+        let xh = Layout::from_toml(&dir.join("xiaohe.toml")).unwrap();
+        assert_eq!(xh.finals_of(b'c'), &["ao".to_string()], "小鹤 finals[c] 应为 ao");
+        assert_eq!(xh.finals_of(b'd'), &["ai".to_string()], "小鹤 finals[d] 应为 ai");
+        assert_eq!(xh.initial_of(b'v'), Some("zh"), "小鹤 initials[v] 应为 zh");
+
+        // 自然码 ao=k，ai=l（与小鹤不同）
+        let zrm = Layout::from_toml(&dir.join("ziranma.toml")).unwrap();
+        assert_eq!(zrm.finals_of(b'k'), &["ao".to_string()], "自然码 finals[k] 应为 ao");
+        assert_eq!(zrm.finals_of(b'l'), &["ai".to_string()], "自然码 finals[l] 应为 ai");
+
+        // 微软 ;=ing
+        let ms = Layout::from_toml(&dir.join("mspy.toml")).unwrap();
+        assert!(ms.is_final_key(b';'), "微软双拼应有 finals[;]");
+        assert_eq!(ms.finals_of(b';'), &["ing".to_string()], "微软 finals[;] 应为 ing");
+
+        // 智能ABC a=zh（声母），zero_initials 只有 o
+        let abc = Layout::from_toml(&dir.join("abc.toml")).unwrap();
+        assert_eq!(abc.initial_of(b'a'), Some("zh"), "智能ABC initials[a] 应为 zh");
+        assert_eq!(abc.initial_of(b'e'), Some("ch"), "智能ABC initials[e] 应为 ch");
+        assert_eq!(abc.initial_of(b'v'), Some("sh"), "智能ABC initials[v] 应为 sh");
+        assert!(abc.zero_of(b'a').is_empty(), "智能ABC zero_initials 不应有 a 键（a=zh 冲突）");
+
+        // 紫光 u=zh，i=sh，a=ch；zero_initials 无 a
+        let zg = Layout::from_toml(&dir.join("ziguang.toml")).unwrap();
+        assert_eq!(zg.initial_of(b'u'), Some("zh"), "紫光 initials[u] 应为 zh");
+        assert_eq!(zg.initial_of(b'i'), Some("sh"), "紫光 initials[i] 应为 sh");
+        assert_eq!(zg.initial_of(b'a'), Some("ch"), "紫光 initials[a] 应为 ch");
+        assert!(zg.zero_of(b'a').is_empty(), "紫光 zero_initials 不应有 a 键（a=ch 冲突）");
+        assert!(zg.is_final_key(b';'), "紫光应有 finals[;]");
+        assert_eq!(zg.finals_of(b';'), &["ing".to_string()], "紫光 finals[;] 应为 ing");
+    }
 }

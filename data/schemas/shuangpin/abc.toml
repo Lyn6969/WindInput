@@ -1,0 +1,39 @@
+[meta]
+id = "abc"
+name = "智能ABC"
+
+[initials]
+a = "zh"
+e = "ch"
+v = "sh"
+
+[finals]
+a = ["a"]
+o = ["uo", "o"]
+e = ["e"]
+i = ["i"]
+u = ["u"]
+v = ["v"]
+b = ["ou"]
+c = ["in", "uai"]
+d = ["ia", "ua"]
+f = ["en"]
+g = ["eng"]
+h = ["ang"]
+j = ["an"]
+k = ["ao"]
+l = ["ai"]
+m = ["ui", "ue", "ve"]
+n = ["un"]
+p = ["uan"]
+q = ["ei"]
+r = ["er", "iu"]
+s = ["ong", "iong"]
+t = ["iang", "uang"]
+w = ["ian"]
+x = ["ie"]
+y = ["ing"]
+z = ["iao"]
+
+[zero_initials]
+o = ["o", "ou"]
