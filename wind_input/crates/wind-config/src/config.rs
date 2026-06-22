@@ -650,10 +650,10 @@ pub struct UiCandidateConfig {
     pub preedit_display: String,
     #[serde(default)]
     pub hide_window: bool,
-    /// 候选文本字号（0=跟随主题 behavior.font_size）。
+    /// 候选文本字号（默认 18；0 亦表示跟随主题 behavior.font_size）。
     #[serde(default)]
     pub font_size: f32,
-    /// 字号跟随主题：true 时忽略 font_size，用主题 behavior.font_size。
+    /// 字号跟随主题（默认开）：true 时忽略 font_size，用主题 behavior.font_size。
     #[serde(default)]
     pub font_size_follow_theme: bool,
     /// 翻页栏显示覆盖："" 跟随主题 / "hide" / "auto"(>1页) / "always"。
@@ -741,14 +741,14 @@ impl Default for UiCandidateConfig {
         Self {
             per_page: default_per_page(),
             per_page_extended: 0,
-            layout: String::new(),
+            layout: "horizontal".to_string(),
             preedit_display: default_preedit_display(),
             hide_window: false,
-            font_size: 0.0,
-            font_size_follow_theme: false,
+            font_size: 18.0,
+            font_size_follow_theme: true,
             pager_bar_display: String::new(),
             page_number_display: String::new(),
-            max_chars: 0,
+            max_chars: 16,
             index_labels: String::new(),
             flip_when_above: false,
         }
@@ -797,12 +797,24 @@ pub struct UiFontConfig {
 }
 
 /// 主题配置（[ui.theme]）
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UiThemeConfig {
+    // 字段级缺省保持空：加载用户配置缺字段时回退 theme.txt（旧版迁移），不被强制成 default。
     #[serde(default)]
     pub name: String,
     #[serde(default)]
     pub style: String,
+}
+
+// 手写 Default：仅供 Config::default()（getDefaults/恢复本页）给出有效初值，
+// 与字段级 serde 缺省（空）解耦，避免影响加载期 theme.txt 迁移回退。
+impl Default for UiThemeConfig {
+    fn default() -> Self {
+        Self {
+            name: "default".to_string(),
+            style: "system".to_string(),
+        }
+    }
 }
 
 /// 悬停提示配置（[ui.tooltip]，对齐 Go `ui.tooltip.*`）。
@@ -1424,8 +1436,9 @@ mod tests {
     #[test]
     fn test_candidate_tuning_defaults_and_methods() {
         let c = Config::default().ui.candidate;
-        assert_eq!(c.font_size, 0.0, "字号默认 0=跟随主题");
-        assert_eq!(c.max_chars, 0, "默认不限");
+        assert_eq!(c.font_size, 18.0, "字号默认 18");
+        assert!(c.font_size_follow_theme, "默认跟随主题");
+        assert_eq!(c.max_chars, 16, "默认最大 16 字");
         assert!(c.index_labels.is_empty() && !c.flip_when_above);
         // index_label：默认数字
         assert_eq!(c.index_label(0), "1");
