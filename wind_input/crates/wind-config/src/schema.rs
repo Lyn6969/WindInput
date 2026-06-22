@@ -353,11 +353,11 @@ impl Schema {
         self.engine.engine_type.eq_ignore_ascii_case("mixed")
     }
 
-    /// 该方案当前是否受支持（双拼 scheme≠full 暂未实现，先排除）
+    /// 该方案当前是否受支持（全拼/双拼均支持）
     pub fn is_supported(&self) -> bool {
         if self.is_pinyin() {
             let s = self.engine.pinyin.scheme.to_lowercase();
-            return s.is_empty() || s == "full";
+            return s.is_empty() || s == "full" || s == "shuangpin";
         }
         true
     }
@@ -385,6 +385,14 @@ impl DictSpec {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn shuangpin_is_supported() {
+        let mut s = Schema::default();
+        s.engine.engine_type = "pinyin".into();
+        s.engine.pinyin.scheme = "shuangpin".into();
+        assert!(s.is_supported());
+    }
 
     #[test]
     fn pinyin_spec_ignores_removed_fields() {

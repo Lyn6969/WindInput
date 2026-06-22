@@ -909,7 +909,26 @@ impl EngineManager {
                 use_smart_compose: pg.use_smart_compose,
                 candidate_order: pg.candidate_order.clone(),
             };
-            let mut engine = PinyinEngine::with_unigram(pcfg, dict, unigram).with_fuzzy(fuzzy);
+            let mut engine = PinyinEngine::with_unigram(pcfg, dict, unigram).with_fuzzy(fuzzy.clone());
+            // 双拼方案：按 layout 加载布局并注入 ShuangpinConverter
+            if schema.engine.pinyin.scheme.eq_ignore_ascii_case("shuangpin") {
+                let layout_id = if schema.engine.pinyin.shuangpin.layout.is_empty() {
+                    "xiaohe".to_string()
+                } else {
+                    schema.engine.pinyin.shuangpin.layout.clone()
+                };
+                let lp = schemas.join("shuangpin").join(format!("{layout_id}.toml"));
+                match crate::pinyin::shuangpin::Layout::from_toml(&lp) {
+                    Ok(layout) => {
+                        let mut conv = crate::pinyin::shuangpin::ShuangpinConverter::new(layout);
+                        conv.set_fuzzy(fuzzy.zh_z, fuzzy.ch_c, fuzzy.sh_s);
+                        engine = engine.with_shuangpin(conv);
+                    }
+                    Err(e) => {
+                        warn!("双拼布局 {} 加载失败，回退全拼: {}", layout_id, e);
+                    }
+                }
+            }
             // 注入 redb Store 时挂用户词/临时词层（L 造词显现）：让拼音造的词进候选合并。
             // 仅含 User/Temp 层（系统词典仍由引擎自身的 CachedDict 承担 Viterbi/前缀）。
             if let Some(store) = &store {
