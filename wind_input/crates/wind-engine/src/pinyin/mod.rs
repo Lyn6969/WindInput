@@ -96,6 +96,18 @@ impl PinyinEngine {
         self
     }
 
+    /// 注入模糊音配置（取代 with_unigram 中的 FuzzyConfig::default()）。
+    pub fn with_fuzzy(mut self, fuzzy: FuzzyConfig) -> Self {
+        self.fuzzy_config = fuzzy;
+        self
+    }
+
+    /// 仅测试用：读取 fuzzy_config.zh_z 以验证 with_fuzzy 注入是否生效。
+    #[cfg(test)]
+    pub fn fuzzy_zh_z(&self) -> bool {
+        self.fuzzy_config.zh_z
+    }
+
     /// 总条目数
     pub fn entry_count(&self) -> usize {
         self.dict.len()
@@ -418,5 +430,15 @@ mod tests {
             "nihao".len(),
             "应只消费前缀 nihao"
         );
+    }
+
+    /// Task 1.4 TDD：with_fuzzy builder 注入的配置应被引擎持有（探针验证）。
+    #[test]
+    fn engine_applies_fuzzy_config() {
+        let dict = CachedDict::Memory(CodetableDict::empty());
+        let mut fz = FuzzyConfig::default();
+        fz.zh_z = true;
+        let eng = PinyinEngine::new(Config::default(), dict).with_fuzzy(fz);
+        assert!(eng.fuzzy_zh_z(), "with_fuzzy 注入的 zh_z=true 应被引擎持有");
     }
 }

@@ -82,6 +82,8 @@ pub struct EngineManager {
     /// 主码表反查索引缓存:(主码表 id, 汉字/词 → 实际编码)。供拼音方案编码提示按词查实际码。
     /// 懒建(首次需要时按主码表全量构建),主码表 id 变化时重建,invalidate/reload 时清空。
     reverse_index: Mutex<Option<(String, Arc<HashMap<String, String>>)>>,
+    /// 全局拼音配置（fuzzy/show_code_hint/...）。Mutex 以支持热重载。
+    pinyin: Mutex<wind_config::config::PinyinGlobalConfig>,
 }
 
 /// 进程级缓存根目录（%LOCALAPPDATA%\WindInput\cache），EngineManager::new 设置一次。
@@ -186,43 +188,18 @@ impl EngineManager {
             code_hint_cache: Mutex::new((String::new(), false)),
             primary_codetable: Mutex::new(primary_codetable),
             reverse_index: Mutex::new(None),
+            pinyin: Mutex::new(config.pinyin.clone()),
         };
         // 仅构建活跃方案（其余懒加载）
         mgr.ensure_loaded(&active_id);
         mgr
     }
 
-    /// 当前活跃方案是否显示编码提示(反查)。按活跃方案 id 缓存,id 变才读盘重算。
-    /// 供 notify_ui_update 每键查询,避免每键读 schema。
-    /// 当前活跃方案是否为「拼音类(含 mixed)且 pinyin.show_code_hint」。供协调器对拼音候选
-    /// 用主码表真实反查码填 comment。按活跃方案 id 缓存,id 变才读盘。
-    /// (码表类方案的「剩余编码」由码表引擎在 convert 内处理,不走此路径。)
+    /// 当前拼音方案是否显示编码提示(反查)。
+    /// Task 1.5：改为直接读全局 [pinyin] 配置，不再读 schema 级 show_code_hint。
+    /// (码表类方案的「剩余编码」由码表引擎在 convert 内处理，不走此路径。)
     pub fn pinyin_show_code_hint(&self) -> bool {
-        let id = self.active_schema_id();
-        let mut c = self.code_hint_cache.lock().unwrap_or_else(|e| e.into_inner());
-        if c.0 != id {
-            let flag = self
-                .schema_merged(&id)
-                .map(|s| {
-                    let t = s.engine.engine_type.to_lowercase();
-                    if t == "pinyin" {
-                        s.engine.pinyin.show_code_hint
-                    } else if t == "mixed" {
-                        // 混输方案自身通常无 [engine.pinyin] 段:反查提示跟随**次方案(拼音子方案)**
-                        // 的 show_code_hint(对齐 Go mixed.addCodeHintsFromCodetable 读 pinyinEngine 配置)。
-                        let sec = s.engine.mixed.secondary_schema.trim();
-                        let sec = if sec.is_empty() { "pinyin" } else { sec };
-                        self.schema_merged(sec)
-                            .map(|p| p.engine.pinyin.show_code_hint)
-                            .unwrap_or(false)
-                    } else {
-                        false
-                    }
-                })
-                .unwrap_or(false);
-            *c = (id, flag);
-        }
-        c.1
+        self.pinyin.lock().unwrap_or_else(|e| e.into_inner()).show_code_hint
     }
 
     /// 拼音方案编码提示:返回主码表中 `text` 实际对应的编码(多码取权重/码长/字典序首位),
@@ -324,12 +301,18 @@ impl EngineManager {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .clone();
+        let pinyin_cfg = self
+            .pinyin
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
         match Self::build_engine(
             schema_id,
             self.data_dir.as_deref(),
             self.store.clone(),
             &commit,
             self.override_dir.as_deref(),
+            &pinyin_cfg,
         ) {
             Some(engine) => {
                 info!(
@@ -583,6 +566,8 @@ impl EngineManager {
         *self.available.lock().unwrap_or_else(|e| e.into_inner()) = available;
         *self.code_commit.lock().unwrap_or_else(|e| e.into_inner()) =
             config.input.code_commit.clone();
+        // 全局拼音配置变更：更新缓存，引擎缓存随下方 clear() 一起失效，下次按新配置重建。
+        *self.pinyin.lock().unwrap_or_else(|e| e.into_inner()) = config.pinyin.clone();
         // 丢弃缓存：引擎按新上屏策略/词典重建，名称/词频按新方案重读。
         self.engines
             .lock()
@@ -824,6 +809,7 @@ impl EngineManager {
         store: Option<Arc<wind_store::Store>>,
         commit: &wind_config::CodeCommitConfig,
         override_dir: Option<&Path>,
+        pinyin_cfg: &wind_config::config::PinyinGlobalConfig,
     ) -> Option<Box<dyn Engine>> {
         let data_dir = data_dir?;
         let schemas = data_dir.join("schemas");
@@ -842,6 +828,7 @@ impl EngineManager {
                 store.clone(),
                 commit,
                 override_dir,
+                pinyin_cfg,
             )?;
             let secondary = if m.secondary_schema.is_empty() {
                 None
@@ -852,6 +839,7 @@ impl EngineManager {
                     store.clone(),
                     commit,
                     override_dir,
+                    pinyin_cfg,
                 )
             };
             let boost = if m.codetable_weight_boost > 0 {
@@ -899,7 +887,29 @@ impl EngineManager {
                     let ug_txt = schemas.join(&schema.learning.unigram_path);
                     Self::load_unigram_mmap(&ug_txt)
                 };
-            let mut engine = PinyinEngine::with_unigram(PinyinConfig::default(), dict, unigram);
+            // 从全局拼音配置构建引擎配置和模糊音（Task 1.4：修 fuzzy 从未生效 bug）。
+            // enabled 作总开关：未启用时所有模糊标志归零（与 Go 行为一致）。
+            let pg = pinyin_cfg;
+            let fuzzy = crate::pinyin::fuzzy::FuzzyConfig {
+                zh_z:      pg.fuzzy.enabled && pg.fuzzy.zh_z,
+                ch_c:      pg.fuzzy.enabled && pg.fuzzy.ch_c,
+                sh_s:      pg.fuzzy.enabled && pg.fuzzy.sh_s,
+                n_l:       pg.fuzzy.enabled && pg.fuzzy.n_l,
+                f_h:       pg.fuzzy.enabled && pg.fuzzy.f_h,
+                r_l:       pg.fuzzy.enabled && pg.fuzzy.r_l,
+                an_ang:    pg.fuzzy.enabled && pg.fuzzy.an_ang,
+                en_eng:    pg.fuzzy.enabled && pg.fuzzy.en_eng,
+                in_ing:    pg.fuzzy.enabled && pg.fuzzy.in_ing,
+                ian_iang:  pg.fuzzy.enabled && pg.fuzzy.ian_iang,
+                uan_uang:  pg.fuzzy.enabled && pg.fuzzy.uan_uang,
+            };
+            let pcfg = PinyinConfig {
+                show_code_hint: pg.show_code_hint,
+                filter_mode: schema.engine.filter_mode.clone(),
+                use_smart_compose: pg.use_smart_compose,
+                candidate_order: pg.candidate_order.clone(),
+            };
+            let mut engine = PinyinEngine::with_unigram(pcfg, dict, unigram).with_fuzzy(fuzzy);
             // 注入 redb Store 时挂用户词/临时词层（L 造词显现）：让拼音造的词进候选合并。
             // 仅含 User/Temp 层（系统词典仍由引擎自身的 CachedDict 承担 Viterbi/前缀）。
             if let Some(store) = &store {
