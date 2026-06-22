@@ -103,34 +103,88 @@ pub struct SchemaConfig {
     pub primary_pinyin: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HotkeysConfig {
-    #[serde(default)]
+    #[serde(default = "default_toggle_mode_keys")]
     pub toggle_mode_keys: Vec<String>,
     #[serde(default = "default_true")]
     pub commit_on_switch: bool,
-    #[serde(default)]
+    #[serde(default = "default_switch_engine")]
     pub switch_engine: String,
-    #[serde(default)]
+    #[serde(default = "default_toggle_full_width")]
     pub toggle_full_width: String,
-    #[serde(default)]
+    #[serde(default = "default_toggle_punct")]
     pub toggle_punct: String,
-    #[serde(default)]
+    #[serde(default = "default_hotkey_none")]
     pub toggle_toolbar: String,
-    #[serde(default)]
+    #[serde(default = "default_hotkey_none")]
     pub open_settings: String,
-    #[serde(default)]
+    #[serde(default = "default_add_word")]
     pub add_word: String,
-    #[serde(default)]
+    #[serde(default = "default_toggle_s2t")]
     pub toggle_s2t: String,
-    #[serde(default)]
+    #[serde(default = "default_activate_ime")]
     pub activate_ime: String,
-    #[serde(default)]
+    #[serde(default = "default_pin_candidate")]
     pub pin_candidate: String,
-    #[serde(default)]
+    #[serde(default = "default_delete_candidate")]
     pub delete_candidate: String,
     #[serde(default)]
     pub global_hotkeys: Vec<String>,
+}
+
+// 热键默认值对齐 Go 版 DefaultConfig.Hotkeys（wind_input/pkg/config/config.go）。
+// 关键：config.getDefaults 走 toml::from_str("")，[hotkeys] 整表缺失时用 Default::default()，
+// 故必须手写 Default（而非 derive 的空值），否则设置页"开关后默认键丢失"(#4)。
+fn default_toggle_mode_keys() -> Vec<String> {
+    vec!["lshift".to_string(), "rshift".to_string()]
+}
+fn default_switch_engine() -> String {
+    "ctrl+shift+e".to_string()
+}
+fn default_toggle_full_width() -> String {
+    "shift+space".to_string()
+}
+fn default_toggle_punct() -> String {
+    "ctrl+.".to_string()
+}
+fn default_add_word() -> String {
+    "ctrl+equal".to_string()
+}
+fn default_toggle_s2t() -> String {
+    "ctrl+shift+j".to_string()
+}
+fn default_activate_ime() -> String {
+    "ctrl+shift+[".to_string()
+}
+fn default_pin_candidate() -> String {
+    "ctrl+number".to_string()
+}
+fn default_delete_candidate() -> String {
+    "ctrl+shift+number".to_string()
+}
+fn default_hotkey_none() -> String {
+    "none".to_string()
+}
+
+impl Default for HotkeysConfig {
+    fn default() -> Self {
+        Self {
+            toggle_mode_keys: default_toggle_mode_keys(),
+            commit_on_switch: true,
+            switch_engine: default_switch_engine(),
+            toggle_full_width: default_toggle_full_width(),
+            toggle_punct: default_toggle_punct(),
+            toggle_toolbar: default_hotkey_none(),
+            open_settings: default_hotkey_none(),
+            add_word: default_add_word(),
+            toggle_s2t: default_toggle_s2t(),
+            activate_ime: default_activate_ime(),
+            pin_candidate: default_pin_candidate(),
+            delete_candidate: default_delete_candidate(),
+            global_hotkeys: Vec::new(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -395,6 +449,10 @@ pub struct ShiftTempEnglishConfig {
     pub show_english_candidates: bool,
     #[serde(default = "default_shift_behavior")]
     pub shift_behavior: String,
+    /// 触发键（符号键进入临时英文模式，类似临时拼音触发键）。默认空（仅 Shift+字母触发）。
+    /// 对齐 Go ShiftTempEnglishConfig.TriggerKeys；设置页 TriggerKeySelect 需此数组存在。
+    #[serde(default)]
+    pub trigger_keys: Vec<String>,
     #[serde(default)]
     pub allow_symbols: bool,
     #[serde(default)]
@@ -407,6 +465,7 @@ impl Default for ShiftTempEnglishConfig {
             enabled: true,
             show_english_candidates: true,
             shift_behavior: "temp_english".to_string(),
+            trigger_keys: Vec::new(),
             allow_symbols: false,
             space_as_input: false,
         }

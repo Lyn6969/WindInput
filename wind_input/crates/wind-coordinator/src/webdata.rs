@@ -151,11 +151,18 @@ impl Coordinator {
             .available_schemas()
             .iter()
             .map(|id| {
+                // 取合并后 Schema 一次，带出方案元信息（备注/版本/图标/作者），供设置页方案列表与详情显示。
+                let merged = self.engine_mgr.schema_merged(id);
+                let info = merged.as_ref().map(|s| &s.schema);
                 json!({
                     "id": id,
                     "name": self.engine_mgr.schema_name(id),
-                    "engineType": self.engine_mgr.schema_merged(id).as_ref().map(resolve_engine_type),
+                    "engineType": merged.as_ref().map(resolve_engine_type),
                     "builtin": true,
+                    "description": info.map(|i| i.description.clone()).unwrap_or_default(),
+                    "version": info.map(|i| i.version.clone()).unwrap_or_default(),
+                    "icon_label": info.map(|i| i.icon_label.clone()).unwrap_or_default(),
+                    "author": info.map(|i| i.author.clone()).unwrap_or_default(),
                 })
             })
             .collect();
@@ -823,18 +830,42 @@ impl Coordinator {
     }
 
     fn web_theme_list(&self) -> anyhow::Result<Value> {
-        let mut out = Vec::new();
+        // 每个主题目录读取 theme.yaml 的 meta（名称/作者/版本/排序），供设置页显示友好名而非 id (#5)。
+        let mut rows: Vec<(i32, String, Value)> = Vec::new();
         if let Some(dir) = &self.themes_dir {
+            let dirs = [dir.clone()];
             if let Ok(rd) = std::fs::read_dir(dir) {
                 for e in rd.flatten() {
-                    if e.path().is_dir() {
-                        if let Some(name) = e.file_name().to_str() {
-                            out.push(json!({ "name": name, "builtin": true }));
-                        }
+                    if !e.path().is_dir() {
+                        continue;
                     }
+                    let Some(name) = e.file_name().to_str().map(|s| s.to_string()) else {
+                        continue;
+                    };
+                    let meta = wind_theme::read_meta(&dirs, &name);
+                    let display = meta
+                        .as_ref()
+                        .map(|m| m.name.clone())
+                        .filter(|s| !s.is_empty())
+                        .unwrap_or_else(|| name.clone());
+                    let order = meta.as_ref().map(|m| m.order).unwrap_or(0);
+                    rows.push((
+                        order,
+                        display.clone(),
+                        json!({
+                            "name": name,
+                            "display_name": display,
+                            "author": meta.as_ref().map(|m| m.author.clone()).unwrap_or_default(),
+                            "version": meta.as_ref().map(|m| m.version.clone()).unwrap_or_default(),
+                            "builtin": true,
+                        }),
+                    ));
                 }
             }
         }
+        // 按 (order, 显示名) 稳定排序。
+        rows.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
+        let out: Vec<Value> = rows.into_iter().map(|(_, _, v)| v).collect();
         Ok(json!(out))
     }
 }
