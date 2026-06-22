@@ -95,6 +95,342 @@ impl Layout {
     }
 }
 
+// ============================================================================
+// ShuangpinConverter：双拼键序列 → 全拼（三层转换 + 模糊对偶声母兜底 + 位置映射）
+//
+// 忠实移植 Go `wind_input/internal/engine/pinyin/shuangpin/converter.go`：
+//   - convert_pair  ↔ Go convertPair（零声母 a/b/c 三路径 → 常规声母+韵母 → 单键重复）
+//   - convert       ↔ Go Convert（含奇数尾键 partial、无匹配键对原样回写）
+//   - 模糊兜底       ↔ Go fuzzyInitialPartners（z/zh、c/ch、s/sh 三对，对偶变体并入候选末尾）
+//   - map_consumed_length ↔ Go (*ConvertResult).MapConsumedLength（音节边界优先 + PositionMap 兜底）
+//   - normalize_pinyin / extract_final / matches_final ↔ Go 同名函数
+// 合法音节判定复用 SyllableTrie（与 Go validPinyinSyllables 对齐）。
+// ============================================================================
+
+use crate::pinyin::syllable::SyllableTrie;
+
+/// 一个转换后的音节（对齐 Go ConvertedSyllable）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConvertedSyllable {
+    /// 全拼文本（如 "hao"）
+    pub pinyin: String,
+    /// 在双拼原始输入中的起始位置
+    pub sp_start: usize,
+    /// 在双拼原始输入中的结束位置（不包含）
+    pub sp_end: usize,
+    /// 在全拼输出中的起始位置
+    pub fp_start: usize,
+    /// 在全拼输出中的结束位置（不包含）
+    pub fp_end: usize,
+}
+
+/// 双拼→全拼转换结果（对齐 Go ConvertResult）。
+#[derive(Debug, Clone, Default)]
+pub struct SpConvertResult {
+    /// 转换后的完整全拼字符串（如 "nihao"）。
+    /// 与 Go FullPinyin 一致：包含无匹配键对的原样回写，以及尾部 partial 声母前缀。
+    pub full_pinyin: String,
+    /// 已完成（或原样回写）的音节列表。
+    pub syllables: Vec<ConvertedSyllable>,
+    /// 未配对的最后一个键解析出的声母（无则 None）。
+    pub partial_initial: Option<String>,
+    /// 未配对的原始按键（无则 None）。
+    pub partial_key: Option<u8>,
+    /// 是否有未完成的输入。
+    pub has_partial: bool,
+    /// 全拼每字节 → 双拼原始字节偏移的映射（供 MapConsumedLength 回算）。
+    pub position_map: Vec<usize>,
+    /// 预编辑区显示文本（全拼 + `'` 分隔符），如 "ni'hao"。
+    pub preedit_display: String,
+}
+
+impl SpConvertResult {
+    /// 全拼字符串（与 Go FullPinyin 一致：含原样回写与 partial 前缀）。
+    pub fn full_pinyin(&self) -> String {
+        self.full_pinyin.clone()
+    }
+
+    /// 将全拼 ConsumedLength 回映射为双拼 ConsumedLength（对齐 Go MapConsumedLength）。
+    /// `fp_consumed`：全拼引擎报告的已消耗字节数；返回双拼原始输入中对应的字节数。
+    pub fn map_consumed_length(&self, fp_consumed: usize) -> usize {
+        if fp_consumed == 0 {
+            return 0;
+        }
+        // 优先通过音节边界精确映射。
+        let mut fp_end = 0;
+        for s in &self.syllables {
+            fp_end += s.pinyin.len();
+            if fp_end >= fp_consumed {
+                return s.sp_end;
+            }
+        }
+        // Fallback：使用位置映射表（覆盖 partial、无效键对/简拼等场景）。
+        let fp_consumed = fp_consumed.min(self.position_map.len());
+        if fp_consumed > 0 {
+            self.position_map[fp_consumed - 1] + 1
+        } else {
+            0
+        }
+    }
+}
+
+/// 双拼→全拼转换器（对齐 Go Converter）。
+pub struct ShuangpinConverter {
+    layout: Layout,
+    trie: SyllableTrie,
+    /// 声母模糊音开关：z↔zh / c↔ch / s↔sh。
+    fuzzy_zh_z: bool,
+    fuzzy_ch_c: bool,
+    fuzzy_sh_s: bool,
+}
+
+impl ShuangpinConverter {
+    pub fn new(layout: Layout) -> Self {
+        Self {
+            layout,
+            trie: SyllableTrie::new(),
+            fuzzy_zh_z: false,
+            fuzzy_ch_c: false,
+            fuzzy_sh_s: false,
+        }
+    }
+
+    /// 配置声母模糊音开关（对齐 Go SetFuzzyInitials）。
+    pub fn set_fuzzy(&mut self, zh_z: bool, ch_c: bool, sh_s: bool) {
+        self.fuzzy_zh_z = zh_z;
+        self.fuzzy_ch_c = ch_c;
+        self.fuzzy_sh_s = sh_s;
+    }
+
+    pub fn layout(&self) -> &Layout {
+        &self.layout
+    }
+
+    pub fn is_final_key(&self, key: u8) -> bool {
+        self.layout.is_final_key(key)
+    }
+
+    fn is_valid(&self, syl: &str) -> bool {
+        self.trie.is_syllable(syl)
+    }
+
+    /// 返回 initial 在当前模糊开关下的对偶变体（不含自身），对齐 Go fuzzyInitialPartners。
+    fn fuzzy_initial_partners(&self, initial: &str) -> Option<&'static str> {
+        match initial {
+            "z" if self.fuzzy_zh_z => Some("zh"),
+            "zh" if self.fuzzy_zh_z => Some("z"),
+            "c" if self.fuzzy_ch_c => Some("ch"),
+            "ch" if self.fuzzy_ch_c => Some("c"),
+            "s" if self.fuzzy_sh_s => Some("sh"),
+            "sh" if self.fuzzy_sh_s => Some("s"),
+            _ => None,
+        }
+    }
+
+    /// 转换一对键为全拼音节候选列表（对齐 Go convertPair，逐分支同序）。
+    fn convert_pair(&self, key1: u8, key2: u8) -> Vec<String> {
+        let mut results: Vec<String> = Vec::new();
+
+        // 1. 零声母
+        let zero_syllables = self.layout.zero_of(key1);
+        if !zero_syllables.is_empty() {
+            // a) FinalMap 路径：仅接受同时在 zeroSyllables 中允许的合法音节。
+            for f in self.layout.finals_of(key2) {
+                if !self.is_valid(f) {
+                    continue;
+                }
+                if !zero_syllables.iter().any(|zs| zs == f) {
+                    continue;
+                }
+                if !results.iter().any(|r| r == f) {
+                    results.push(f.clone());
+                }
+            }
+
+            // b) 字面匹配：仅在 FinalMap 路径无命中时生效。
+            if results.is_empty() {
+                let literal = format!("{}{}", key1 as char, key2 as char);
+                for syllable in zero_syllables {
+                    if *syllable == literal && self.is_valid(syllable) {
+                        results.push(syllable.clone());
+                        break;
+                    }
+                }
+            }
+
+            // c) matchesFinal 路径：兜底，处理方案特殊映射。
+            for syllable in zero_syllables {
+                if results.iter().any(|r| r == syllable) {
+                    continue;
+                }
+                if self.matches_final(syllable, key2) {
+                    results.push(syllable.clone());
+                }
+            }
+        }
+
+        // 2. 常规声母+韵母（原始声母在前，模糊对偶声母在后）。
+        if let Some(initial) = self.layout.initial_of(key1) {
+            let mut initial_candidates: Vec<&str> = vec![initial];
+            if let Some(alt) = self.fuzzy_initial_partners(initial) {
+                initial_candidates.push(alt);
+            }
+            for init in initial_candidates {
+                for f in self.layout.finals_of(key2) {
+                    let syllable = normalize_pinyin(&format!("{}{}", init, f));
+                    if self.is_valid(&syllable) && !results.iter().any(|r| *r == syllable) {
+                        results.push(syllable);
+                    }
+                }
+            }
+        }
+
+        // 3. 零声母特殊处理：单韵母重复键（aa→a, oo→o, ee→e）。
+        if key1 == key2 {
+            let single = (key1 as char).to_string();
+            if self.is_valid(&single) && !results.iter().any(|r| *r == single) {
+                results.push(single);
+            }
+        }
+
+        results
+    }
+
+    /// 检查一个完整音节是否匹配给定的韵母键（对齐 Go matchesFinal）。
+    fn matches_final(&self, syllable: &str, final_key: u8) -> bool {
+        let finals = self.layout.finals_of(final_key);
+        if finals.is_empty() {
+            return false;
+        }
+        let syllable_final = extract_final(syllable);
+        finals.iter().any(|f| f == syllable_final)
+    }
+
+    /// 将双拼键序列转换为全拼（对齐 Go Convert）。
+    /// `keys` 为小写字母序列（如小鹤方案下的 "nihc"）。
+    pub fn convert(&self, keys: &str) -> SpConvertResult {
+        let mut result = SpConvertResult::default();
+        if keys.is_empty() {
+            return result;
+        }
+
+        let input = keys.to_ascii_lowercase();
+        let b = input.as_bytes();
+
+        let mut full = String::new();
+        let mut preedit = String::new();
+        let mut fp_pos = 0usize;
+
+        let mut i = 0usize;
+        while i < b.len() {
+            let key1 = b[i];
+
+            if i + 1 >= b.len() {
+                // 奇数尾键：未配对（partial）。
+                let partial_str = match self.layout.initial_of(key1) {
+                    Some(init) => init.to_string(),
+                    None => (key1 as char).to_string(),
+                };
+                result.partial_initial = Some(partial_str.clone());
+                result.partial_key = Some(key1);
+                result.has_partial = true;
+
+                if !preedit.is_empty() {
+                    preedit.push('\'');
+                }
+                preedit.push_str(&partial_str);
+                full.push_str(&partial_str);
+                for _ in 0..partial_str.len() {
+                    result.position_map.push(i);
+                }
+                break;
+            }
+
+            let key2 = b[i + 1];
+            let syllables = self.convert_pair(key1, key2);
+
+            if !syllables.is_empty() {
+                let best = syllables[0].clone();
+                if !preedit.is_empty() {
+                    preedit.push('\'');
+                }
+                preedit.push_str(&best);
+                full.push_str(&best);
+
+                let best_len = best.len();
+                result.syllables.push(ConvertedSyllable {
+                    pinyin: best,
+                    sp_start: i,
+                    sp_end: i + 2,
+                    fp_start: fp_pos,
+                    fp_end: fp_pos + best_len,
+                });
+
+                // 位置映射：全拼前半字节映射回 key1（i），后半映射回 key2（i+1）。
+                for j in 0..best_len {
+                    if j < best_len / 2 {
+                        result.position_map.push(i);
+                    } else {
+                        result.position_map.push(i + 1);
+                    }
+                }
+                fp_pos += best_len;
+            } else {
+                // 无法匹配：两个键原样保留（简拼/无效键对）。
+                let s = format!("{}{}", key1 as char, key2 as char);
+                if !preedit.is_empty() {
+                    preedit.push('\'');
+                }
+                preedit.push_str(&s);
+                full.push_str(&s);
+                result.position_map.push(i);
+                result.position_map.push(i + 1);
+                fp_pos += 2;
+            }
+
+            i += 2;
+        }
+
+        result.full_pinyin = full;
+        result.preedit_display = preedit;
+        result
+    }
+}
+
+/// 提取拼音音节的韵母部分（对齐 Go extractFinal）。
+fn extract_final(syllable: &str) -> &str {
+    const INITIALS: &[&str] = &[
+        "zh", "ch", "sh", "b", "p", "m", "f", "d", "t", "n", "l", "g", "k", "h", "j", "q", "x",
+        "r", "z", "c", "s", "y", "w",
+    ];
+    for initial in INITIALS {
+        if syllable.starts_with(initial) && syllable.len() > initial.len() {
+            return &syllable[initial.len()..];
+        }
+    }
+    // 零声母：整个音节就是韵母。
+    syllable
+}
+
+/// 标准化拼音（处理 ü 相关规则，对齐 Go normalizePinyin）。
+/// j/q/x/y 后：ve→ue、vn→un、v→u；其余声母（如 n/l）的 v 保留为 ü 占位（nv/lv）。
+fn normalize_pinyin(pinyin: &str) -> String {
+    if pinyin.starts_with('j')
+        || pinyin.starts_with('q')
+        || pinyin.starts_with('x')
+        || pinyin.starts_with('y')
+    {
+        let mut p = pinyin.replacen("ve", "ue", 1);
+        p = p.replacen("vn", "un", 1);
+        if p.contains('v') {
+            p = p.replacen('v', "u", 1);
+        }
+        p
+    } else {
+        pinyin.to_string()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -184,5 +520,268 @@ a = ["a", "ai", "an", "ang", "ao"]
         assert!(zg.zero_of(b'a').is_empty(), "紫光 zero_initials 不应有 a 键（a=ch 冲突）");
         assert!(zg.is_final_key(b';'), "紫光应有 finals[;]");
         assert_eq!(zg.finals_of(b';'), &["ing".to_string()], "紫光 finals[;] 应为 ing");
+    }
+}
+
+// ============================================================================
+// ShuangpinConverter 测试：逐条转写自 Go converter_test.go / converter_fuzzy_test.go。
+// 真值以 Go 为准（含原样回写、partial 含声母前缀、PositionMap、MapConsumedLength）。
+// ============================================================================
+#[cfg(test)]
+mod converter_tests {
+    use super::*;
+
+    fn schema_dir() -> std::path::PathBuf {
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../../data/schemas/shuangpin")
+    }
+
+    fn conv(id: &str) -> ShuangpinConverter {
+        let p = schema_dir().join(format!("{id}.toml"));
+        let layout = Layout::from_toml(&p).unwrap_or_else(|e| panic!("加载 {id} 失败: {e}"));
+        ShuangpinConverter::new(layout)
+    }
+
+    // --- TestXiaoheBasic ---
+    #[test]
+    fn xiaohe_basic() {
+        let c = conv("xiaohe");
+        let cases = [
+            ("ni", "ni", false),
+            ("nihc", "nihao", false),
+            ("womf", "women", false),
+            ("n", "n", true),
+            ("", "", false),
+        ];
+        for (input, want, want_partial) in cases {
+            let r = c.convert(input);
+            assert_eq!(r.full_pinyin(), want, "convert({input:?}).full_pinyin");
+            assert_eq!(r.has_partial, want_partial, "convert({input:?}).has_partial");
+        }
+    }
+
+    // --- TestXiaoheSyllables ---
+    #[test]
+    fn xiaohe_syllables() {
+        let c = conv("xiaohe");
+        let r = c.convert("nihc");
+        assert_eq!(r.syllables.len(), 2);
+        assert_eq!(r.syllables[0].pinyin, "ni");
+        assert_eq!(r.syllables[1].pinyin, "hao");
+        assert_eq!((r.syllables[0].sp_start, r.syllables[0].sp_end), (0, 2));
+        assert_eq!((r.syllables[1].sp_start, r.syllables[1].sp_end), (2, 4));
+    }
+
+    // --- TestXiaoheZhChSh ---
+    #[test]
+    fn xiaohe_zh_ch_sh() {
+        let c = conv("xiaohe");
+        let cases = [
+            ("vs", "zhong"),
+            ("ig", "cheng"),
+            ("uf", "shen"),
+            ("vv", "zhui"),
+            ("dv", "dui"),
+            ("gv", "gui"),
+            ("go", "guo"),
+            ("ho", "huo"),
+            ("xp", "xie"),
+            ("bp", "bie"),
+            ("zz", "zou"),
+            ("dz", "dou"),
+            ("nv", "nv"),
+            ("lv", "lv"),
+        ];
+        for (input, want) in cases {
+            assert_eq!(c.convert(input).full_pinyin(), want, "convert({input:?})");
+        }
+    }
+
+    // --- TestXiaoheZeroInitial ---
+    #[test]
+    fn xiaohe_zero_initial() {
+        let c = conv("xiaohe");
+        let cases = [
+            ("aa", "a"),
+            ("oo", "o"),
+            ("ee", "e"),
+            ("ai", "ai"),
+            ("an", "an"),
+            ("ei", "ei"),
+            ("en", "en"),
+            ("ou", "ou"),
+        ];
+        for (input, want) in cases {
+            assert_eq!(c.convert(input).full_pinyin(), want, "convert({input:?})");
+        }
+    }
+
+    // --- TestConsumedLengthMapping ---
+    #[test]
+    fn consumed_length_mapping() {
+        let c = conv("xiaohe");
+        let r = c.convert("nihc");
+        assert_eq!(r.map_consumed_length(0), 0);
+        assert_eq!(r.map_consumed_length(2), 2);
+        assert_eq!(r.map_consumed_length(5), 4);
+    }
+
+    // --- TestConsumedLengthAbbrev ---
+    #[test]
+    fn consumed_length_abbrev() {
+        let c = conv("xiaohe");
+        let r = c.convert("bzd");
+        assert_eq!(r.map_consumed_length(3), 3);
+
+        let r2 = c.convert("nihcbzd");
+        assert_eq!(r2.map_consumed_length(8), 7);
+        assert_eq!(r2.map_consumed_length(5), 4);
+    }
+
+    // --- TestPartialInput ---
+    #[test]
+    fn partial_input() {
+        let c = conv("xiaohe");
+        let r = c.convert("nih");
+        assert_eq!(r.syllables.len(), 1);
+        assert!(r.has_partial);
+        assert_eq!(r.partial_initial.as_deref(), Some("h"));
+    }
+
+    // --- TestZiranmaVKey ---
+    #[test]
+    fn ziranma_v_key() {
+        let c = conv("ziranma");
+        let cases = [("dv", "dui"), ("gv", "gui"), ("nv", "nv"), ("lv", "lv")];
+        for (input, want) in cases {
+            assert_eq!(c.convert(input).full_pinyin(), want, "convert({input:?})");
+        }
+    }
+
+    // --- TestSogouVKey ---
+    #[test]
+    fn sogou_v_key() {
+        let c = conv("sogou");
+        let cases = [("dv", "dui"), ("gv", "gui"), ("ny", "nv"), ("ly", "lv")];
+        for (input, want) in cases {
+            assert_eq!(c.convert(input).full_pinyin(), want, "convert({input:?})");
+        }
+    }
+
+    // --- TestZiguangScheme ---
+    #[test]
+    fn ziguang_scheme() {
+        let c = conv("ziguang");
+        let cases = [
+            ("ut", "zheng"),
+            ("ux", "zhua"),
+            ("ir", "shan"),
+            ("ik", "shei"),
+            ("aq", "chao"),
+            ("nb", "niao"),
+            ("mw", "men"),
+            ("ds", "dang"),
+            ("gh", "gong"),
+            ("jj", "jiu"),
+            ("lk", "lei"),
+            ("ll", "luan"),
+            ("xy", "xin"),
+            ("gz", "gou"),
+            ("nn", "nve"),
+            ("ln", "lve"),
+        ];
+        for (input, want) in cases {
+            assert_eq!(c.convert(input).full_pinyin(), want, "convert({input:?})");
+        }
+    }
+
+    // --- TestZeroInitialAo ---
+    #[test]
+    fn zero_initial_ao() {
+        let cases = [
+            ("xiaohe", "ac", "ao"),
+            ("xiaohe", "aa", "a"),
+            ("xiaohe", "ai", "ai"),
+            ("xiaohe", "an", "an"),
+            ("xiaohe", "ah", "ang"),
+            ("ziranma", "ak", "ao"),
+            ("ziranma", "aa", "a"),
+            ("ziranma", "al", "ai"),
+            ("ziranma", "aj", "an"),
+            ("ziranma", "ah", "ang"),
+            ("mspy", "ak", "ao"),
+            ("mspy", "aa", "a"),
+            ("mspy", "al", "ai"),
+            ("mspy", "aj", "an"),
+            ("mspy", "ah", "ang"),
+            ("sogou", "ak", "ao"),
+            ("sogou", "aa", "a"),
+            ("sogou", "al", "ai"),
+            ("sogou", "aj", "an"),
+            ("sogou", "ah", "ang"),
+        ];
+        for (scheme, input, want) in cases {
+            let c = conv(scheme);
+            assert_eq!(c.convert(input).full_pinyin(), want, "{scheme} convert({input:?})");
+        }
+    }
+
+    // --- TestZeroInitialLiteralAo ---
+    #[test]
+    fn zero_initial_literal_ao() {
+        for scheme in ["xiaohe", "ziranma", "mspy", "sogou"] {
+            let c = conv(scheme);
+            assert_eq!(c.convert("ao").full_pinyin(), "ao", "{scheme} convert(\"ao\")");
+        }
+    }
+
+    // --- TestPreeditDisplay ---
+    #[test]
+    fn preedit_display() {
+        let c = conv("xiaohe");
+        let r = c.convert("nihc");
+        assert_eq!(r.preedit_display, "ni'hao");
+    }
+
+    // ===== converter_fuzzy_test.go =====
+
+    // --- TestXiaoheFuzzy_SLNeedsFuzzyToShuang ---
+    #[test]
+    fn xiaohe_fuzzy_sl_needs_fuzzy_to_shuang() {
+        let mut c = conv("xiaohe");
+        // fuzzy 关：s+l 无合法 → fallback "sl"
+        assert_eq!(c.convert("sl").full_pinyin(), "sl");
+        // fuzzy s↔sh 开启：s+l 应被 sh+l 模糊补救 → "shuang"
+        c.set_fuzzy(false, false, true);
+        assert_eq!(c.convert("sl").full_pinyin(), "shuang");
+        // 整段 slpb → shuangpin
+        assert_eq!(c.convert("slpb").full_pinyin(), "shuangpin");
+    }
+
+    // --- TestXiaoheFuzzy_OriginalLegalNotShadowed ---
+    #[test]
+    fn xiaohe_fuzzy_original_legal_not_shadowed() {
+        let mut c = conv("xiaohe");
+        c.set_fuzzy(true, true, true);
+        assert_eq!(c.convert("zi").full_pinyin(), "zi");
+        assert_eq!(c.convert("zisi").full_pinyin(), "zisi");
+    }
+
+    // --- TestXiaoheFuzzy_Bidirectional ---
+    #[test]
+    fn xiaohe_fuzzy_bidirectional() {
+        let mut c = conv("xiaohe");
+        c.set_fuzzy(true, false, false);
+        let results = c.convert_pair(b'v', b'd');
+        assert!(results.iter().any(|s| s == "zhai"), "缺 zhai: {results:?}");
+        assert!(results.iter().any(|s| s == "zai"), "应含 zai 候选: {results:?}");
+        assert_eq!(results[0], "zhai", "原始声母合法时应排首位: {results:?}");
+    }
+
+    // --- TestXiaoheFuzzy_DisabledSwitch ---
+    #[test]
+    fn xiaohe_fuzzy_disabled_switch() {
+        let c = conv("xiaohe");
+        let results = c.convert_pair(b's', b'l');
+        assert!(results.is_empty(), "fuzzy 关时 s+l 应为空: {results:?}");
     }
 }

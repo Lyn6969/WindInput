@@ -76,6 +76,9 @@ pub const STANDARD_SYLLABLES: &[&str] = &[
     "zeng", "zha", "zhai", "zhan", "zhang", "zhao", "zhe", "zhen", "zheng", "zhi", "zhong", "zhou",
     "zhu", "zhua", "zhuai", "zhuan", "zhuang", "zhui", "zhun", "zhuo", "zi", "zong", "zou", "zu",
     "zuan", "zui", "zun", "zuo",
+    // 与 Go syllable_trie.go / shuangpin.validPinyinSyllables 对齐补全的稀有音节
+    // （双拼转换真值依赖：紫光 ik→shei、ziguang 等；以及 kei/tei/zhei/nun/rua/yo）。
+    "kei", "tei", "zhei", "shei", "nun", "rua", "yo",
 ];
 
 impl SyllableTrie {
