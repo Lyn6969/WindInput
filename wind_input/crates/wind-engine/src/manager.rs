@@ -74,9 +74,6 @@ pub struct EngineManager {
     /// 方案 override 层目录（schema_overrides/{id}.toml）；读 schema 时深合并到基础方案之上。
     /// None=不读 override（如纯测试）。设置页 saveConfig 写此目录。
     override_dir: Option<std::path::PathBuf>,
-    /// 编码提示开关缓存：(已缓存的活跃方案 id, pinyin_show_code_hint)。
-    /// 活跃方案变化时才重算(读盘一次),供 notify_ui_update 每键廉价查询,避免每键读盘。
-    code_hint_cache: Mutex<(String, bool)>,
     /// 主码表方案 id(拼音反查码源):config.schema.primary_codetable 解析后(可空)。构造/重载时更新。
     primary_codetable: Mutex<String>,
     /// 主码表反查索引缓存:(主码表 id, 汉字/词 → 实际编码)。供拼音方案编码提示按词查实际码。
@@ -86,7 +83,7 @@ pub struct EngineManager {
     pinyin: Mutex<wind_config::config::PinyinGlobalConfig>,
     /// 双拼韵母键集缓存：(已缓存的活跃方案 id, Option<HashSet<u8>>)。
     /// None = 当前活跃方案不是双拼；Some = 双拼布局的 finals 键集合。
-    /// 活跃方案 id 变化时按需重建（惰性），避免每键读盘（对齐 code_hint_cache 模式）。
+    /// 活跃方案 id 变化时按需重建（惰性），避免每键读盘。
     shuangpin_finals_cache: Mutex<(String, Option<std::collections::HashSet<u8>>)>,
 }
 
@@ -189,7 +186,6 @@ impl EngineManager {
             freq_cache: Mutex::new(HashMap::new()),
             name_cache: Mutex::new(HashMap::new()),
             override_dir,
-            code_hint_cache: Mutex::new((String::new(), false)),
             primary_codetable: Mutex::new(primary_codetable),
             reverse_index: Mutex::new(None),
             pinyin: Mutex::new(config.pinyin.clone()),
@@ -556,12 +552,6 @@ impl EngineManager {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .remove(schema_id);
-        // 方案配置(含 pinyin.show_code_hint)可能变更:失效编码提示缓存,使下次按新配置重算。
-        // (码表的剩余编码随引擎重建已生效;拼音的反查 gate 走此缓存,不清则切开关不生效。)
-        *self
-            .code_hint_cache
-            .lock()
-            .unwrap_or_else(|e| e.into_inner()) = (String::new(), false);
         // 主码表(及其词库/override)可能变更:失效反查索引,下次按新内容重建。
         *self
             .reverse_index
