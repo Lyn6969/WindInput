@@ -54,9 +54,15 @@ pub enum UiCommand {
         caret_height: i32,
         offset_x: i32,
         offset_y: i32,
-        /// 自动隐藏时长（毫秒）；0=常驻不自动隐藏（display_mode=persistent）。
+        /// 自动隐藏时长（毫秒）；0=常驻不自动隐藏（display_mode=always）。
         duration_ms: u64,
+        /// 固定位置模式（position_mode=fixed）：用 fixed_x/fixed_y 作屏幕坐标，忽略光标。
+        fixed: bool,
+        fixed_x: i32,
+        fixed_y: i32,
     },
+    /// 隐藏状态提示气泡（常驻模式失焦/切走输入法时）。
+    HideStatusTip,
     /// 更新常驻工具栏状态（中英/方案/标点/全半角）
     UpdateToolbar(crate::toolbar::ToolbarState),
     /// 隐藏工具栏
@@ -323,8 +329,19 @@ impl UiManager {
         let mut toast_hide_at: Option<std::time::Instant> = None;
         // 状态提示防抖：合并快速连续的提示（如连按切换），避免气泡闪烁
         // 载荷：(text, x, y, caret_height, offset_x, offset_y)
-        let mut tip_debounce =
-            crate::debounce::Debouncer::<(String, i32, i32, i32, i32, i32, u64)>::new(60);
+        // payload: (text, x, y, caret_h, off_x, off_y, duration_ms, fixed, fixed_x, fixed_y)
+        let mut tip_debounce = crate::debounce::Debouncer::<(
+            String,
+            i32,
+            i32,
+            i32,
+            i32,
+            i32,
+            u64,
+            bool,
+            i32,
+            i32,
+        )>::new(60);
         // 工具栏隐藏防抖：HideToolbar 不立即隐藏，延后 50ms；若期间收到 UpdateToolbar
         // （应用间切换的 FocusLost→FocusGained 串），取消隐藏并显示——消除 Alt+Tab 闪烁。
         let mut toolbar_hide_at: Option<std::time::Instant> = None;
@@ -398,10 +415,14 @@ impl UiManager {
             }
 
             // 推进状态提示防抖（稳定后才真正显示气泡）
-            if let Some((text, x, y, ch, ox, oy, dur)) = tip_debounce.poll() {
+            if let Some((text, x, y, ch, ox, oy, dur, fixed, fx, fy)) = tip_debounce.poll() {
                 if let Some(t) = &mut status_tip {
-                    t.show(&text, x, y, ch, ox, oy);
-                    // dur==0 → 常驻(persistent):不设隐藏时刻;否则按配置时长自动隐藏。
+                    if fixed {
+                        t.show_fixed(&text, fx, fy);
+                    } else {
+                        t.show(&text, x, y, ch, ox, oy);
+                    }
+                    // dur==0 → 常驻(always):不设隐藏时刻;否则按配置时长自动隐藏。
                     tip_hide_at = if dur == 0 {
                         None
                     } else {
@@ -506,11 +527,32 @@ impl UiManager {
                         offset_x,
                         offset_y,
                         duration_ms,
+                        fixed,
+                        fixed_x,
+                        fixed_y,
                     } => {
                         debug!("UI: ShowStatusTip '{}' at ({},{})", text, x, y);
                         // 经防抖：合并快速连续提示，避免气泡闪烁
-                        tip_debounce
-                            .trigger((text, x, y, caret_height, offset_x, offset_y, duration_ms));
+                        tip_debounce.trigger((
+                            text,
+                            x,
+                            y,
+                            caret_height,
+                            offset_x,
+                            offset_y,
+                            duration_ms,
+                            fixed,
+                            fixed_x,
+                            fixed_y,
+                        ));
+                    }
+                    UiCommand::HideStatusTip => {
+                        // 取消待显示的防抖项 + 立即隐藏 + 清隐藏计时(常驻模式失焦)。
+                        tip_debounce.cancel();
+                        if let Some(t) = &status_tip {
+                            t.hide();
+                        }
+                        tip_hide_at = None;
                     }
                     UiCommand::ShowToast {
                         text,

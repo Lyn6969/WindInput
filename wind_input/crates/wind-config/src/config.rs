@@ -497,6 +497,28 @@ pub struct UiConfig {
     pub tooltip: TooltipConfig,
     #[serde(default)]
     pub status_indicator: StatusIndicatorConfig,
+    #[serde(default)]
+    pub toolbar: ToolbarConfig,
+}
+
+/// 工具栏配置（[ui.toolbar]，对齐 Go）。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ToolbarConfig {
+    /// 是否显示常驻工具栏（启动初值；运行时可经菜单切换）。
+    #[serde(default = "default_true")]
+    pub visible: bool,
+    /// 前台应用全屏时自动隐藏工具栏（默认 true）。
+    #[serde(default = "default_true")]
+    pub hide_in_fullscreen: bool,
+}
+
+impl Default for ToolbarConfig {
+    fn default() -> Self {
+        Self {
+            visible: true,
+            hide_in_fullscreen: true,
+        }
+    }
 }
 
 /// 状态提示气泡配置（[ui.status_indicator]，对齐 Go）：中英/标点/全半角/方案切换的瞬时气泡。
@@ -506,24 +528,16 @@ pub struct StatusIndicatorConfig {
     /// 是否启用状态提示气泡（false=完全不显示）。
     #[serde(default = "default_true")]
     pub enabled: bool,
-    /// 自动隐藏时长（毫秒）；display_mode="persistent" 时忽略（常驻不隐藏）。
+    /// 自动隐藏时长（毫秒）；display_mode="always" 时忽略（常驻不隐藏）。
     #[serde(default = "default_status_duration")]
     pub duration: i32,
-    /// 显示模式："temp"（临时,duration 后隐藏,默认）| "persistent"（常驻直到下次状态变化）。
+    /// 显示模式："temp"（临时,duration 后隐藏,默认）| "always"（常驻:激活/获焦时显示,失焦隐藏）。
+    /// 对齐 Go ui.status_indicator.display_mode。
     #[serde(default = "default_status_display_mode")]
     pub display_mode: String,
     /// 方案名显示样式："full"（全名，默认）| "short"（图标短称 icon_label，回退全名）。
     #[serde(default = "default_schema_name_style")]
     pub schema_name_style: String,
-    /// 中英模式变化时显示提示。
-    #[serde(default = "default_true")]
-    pub show_mode: bool,
-    /// 标点中英变化时显示提示。
-    #[serde(default = "default_true")]
-    pub show_punct: bool,
-    /// 全半角变化时显示提示。
-    #[serde(default)]
-    pub show_full_width: bool,
     /// 位置模式："follow_caret"（跟随光标,默认）| "fixed"（固定屏幕坐标 custom_x/custom_y）。
     #[serde(default = "default_status_position_mode")]
     pub position_mode: String,
@@ -561,9 +575,6 @@ impl Default for StatusIndicatorConfig {
             duration: default_status_duration(),
             display_mode: default_status_display_mode(),
             schema_name_style: default_schema_name_style(),
-            show_mode: true,
-            show_punct: true,
-            show_full_width: false,
             position_mode: default_status_position_mode(),
             offset_x: 0,
             offset_y: 0,

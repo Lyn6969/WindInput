@@ -684,7 +684,7 @@ impl Coordinator {
                 s2t_enabled: config.features.s2t.enabled,
                 s2t_variant: s2t_variant.clone(),
                 filter_mode: wind_candidate::FilterMode::from_str(&config.input.filter_mode),
-                toolbar_visible: true,
+                toolbar_visible: config.ui.toolbar.visible, // 启动初值来自配置(运行时可菜单切换)
                 ime_active: false, // 启动未激活：工具栏待 IME_ACTIVATED/FocusGained 才显示
                 caps_lock: false,
                 input_buffer: String::new(),
@@ -814,8 +814,14 @@ impl Coordinator {
                     *self.theme_dark.lock().unwrap_or_else(|e| e.into_inner()) =
                         new_cfg.ui.theme.style.eq_ignore_ascii_case("dark");
                 }
+                // 同步工具栏显隐:设置页改 ui.toolbar.visible 后运行时态跟随,再刷新工具栏。
+                {
+                    let mut s = self.state.lock().unwrap_or_else(|e| e.into_inner());
+                    s.toolbar_visible = new_cfg.ui.toolbar.visible;
+                }
                 self.apply_ui_config(); // 外观项（候选排列/编码显示/候选窗显隐）即时生效
                 self.reload_config(); // 刷新主题/工具栏（候选窗下次输入按新配置）
+                self.notify_toolbar(); // 工具栏显隐(visible/全屏)按新配置即时刷新
                 self.show_toast(
                     "设置已更新",
                     ToastPosition::BottomCenter,
@@ -1528,12 +1534,14 @@ impl Coordinator {
             let s = self.state.lock().unwrap_or_else(|e| e.into_inner());
             (s.caret_x, s.caret_y, s.caret_height)
         };
-        // 常驻(persistent)→ duration_ms=0(UI 不自动隐藏,直到下次状态变化覆盖);否则按 duration 自动隐藏。
-        let duration_ms = if si.display_mode.eq_ignore_ascii_case("persistent") {
+        // 常驻(always)→ duration_ms=0(UI 不自动隐藏);否则按 duration 自动隐藏。对齐 Go display_mode。
+        let duration_ms = if si.display_mode.eq_ignore_ascii_case("always") {
             0
         } else {
             si.duration.max(1) as u64
         };
+        // 位置模式 fixed:用固定屏幕坐标 custom_x/custom_y;否则跟随光标(caret + offset)。
+        let fixed = si.position_mode.eq_ignore_ascii_case("fixed");
         let _ = self.ui_tx.send(UiCommand::ShowStatusTip {
             text: text.to_string(),
             x,
@@ -1542,7 +1550,23 @@ impl Coordinator {
             offset_x: si.offset_x,
             offset_y: si.offset_y,
             duration_ms,
+            fixed,
+            fixed_x: si.custom_x,
+            fixed_y: si.custom_y,
         });
+    }
+
+    /// 隐藏状态提示气泡（常驻模式失焦时调用）。
+    pub(crate) fn hide_tip(&self) {
+        let _ = self.ui_tx.send(UiCommand::HideStatusTip);
+    }
+
+    /// 常驻(always)模式且启用时,显示当前合成状态(激活/获焦时调用)。temp 模式不在此显示。
+    pub(crate) fn show_persistent_status_if_always(&self) {
+        let si = &self.rt().config.ui.status_indicator;
+        if si.enabled && si.display_mode.eq_ignore_ascii_case("always") {
+            self.show_tip(&self.status_indicator_text());
+        }
     }
 
     /// 合成当前 IME 核心状态文本：方案/中英(+大写) · 标点 · [全角] · [繁]。
@@ -2187,6 +2211,7 @@ impl MessageHandler for Coordinator {
         let status = self.build_status();
         self.push_activation_status();
         self.notify_toolbar(); // 激活态 → 工具栏显示
+        self.show_persistent_status_if_always(); // 常驻模式:获焦即显示状态
         Some(status)
     }
 
@@ -2207,6 +2232,7 @@ impl MessageHandler for Coordinator {
         }
         self.notify_toolbar(); // 隐藏工具栏（防抖）
         self.notify_ui_hide(); // 隐藏候选窗 + 弹出菜单（HideCandidates 连带关菜单）
+        self.hide_tip(); // 失焦隐藏状态提示（常驻模式尤需）
     }
 
     fn get_current_mode(&self) -> (bool, bool) {
@@ -2226,6 +2252,7 @@ impl MessageHandler for Coordinator {
         let status = self.build_status();
         self.push_activation_status();
         self.notify_toolbar(); // 激活态 → 工具栏显示
+        self.show_persistent_status_if_always(); // 常驻模式:激活即显示状态
         Some(status)
     }
 
@@ -2243,6 +2270,7 @@ impl MessageHandler for Coordinator {
         }
         self.notify_toolbar(); // 非激活态 → notify_toolbar 内部下发 HideToolbar
         self.notify_ui_hide(); // 隐藏候选窗 + 弹出菜单
+        self.hide_tip(); // 切走本输入法隐藏状态提示
     }
 
     fn handle_mode_notify(&self, flags: u32) {

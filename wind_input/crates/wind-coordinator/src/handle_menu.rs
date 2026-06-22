@@ -82,10 +82,13 @@ impl Coordinator {
     /// 用户开关常驻工具栏（菜单）。仅翻转 toolbar_visible，显隐交 notify_toolbar
     /// 单点决策（结合 ime_active）。
     pub(crate) fn toggle_toolbar(&self) {
-        {
+        let vis = {
             let mut s = self.state.lock().unwrap_or_else(|e| e.into_inner());
             s.toolbar_visible = !s.toolbar_visible;
-        }
+            s.toolbar_visible
+        };
+        // 持久化到 config.ui.toolbar.visible(单一源:与设置页统一,reload 不会覆盖菜单选择)。
+        let _ = Config::set_user_bool(&["ui", "toolbar", "visible"], vis);
         self.notify_toolbar();
     }
 
@@ -322,8 +325,11 @@ impl Coordinator {
         let schema_label = self
             .engine_mgr
             .schema_name(&self.engine_mgr.active_schema_id());
+        // 前台应用全屏时隐藏工具栏（ui.toolbar.hide_in_fullscreen，对齐 Go）。
+        let hide_fullscreen = self.rt().config.ui.toolbar.hide_in_fullscreen
+            && crate::is_foreground_fullscreen();
         let s = self.state.lock().unwrap_or_else(|e| e.into_inner());
-        if !(s.ime_active && s.toolbar_visible) {
+        if !(s.ime_active && s.toolbar_visible) || hide_fullscreen {
             drop(s);
             let _ = self.ui_tx.send(UiCommand::HideToolbar);
             return;

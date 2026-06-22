@@ -110,33 +110,27 @@ impl StatusTip {
         }
     }
 
-    /// 显示提示文本：水平居中于光标、默认在光标下方（下方不足则上翻），加用户偏移。
-    /// `cy` 为光标底端，`caret_h` 为光标高度（上翻定位用）。
-    pub fn show(&mut self, text: &str, cx: i32, cy: i32, caret_h: i32, off_x: i32, off_y: i32) {
-        self.ensure_scale(cx, cy);
+    /// 渲染气泡到窗口缓冲并 update。返回 (内容宽 cw, 内容高 ch, 左 margin ml, 上 margin mt)。
+    /// 供 show(跟随光标) 与 show_fixed(固定坐标) 复用，只在定位上分叉。
+    fn render_bubble(&mut self, text: &str) -> (u32, u32, u32, u32) {
         let s = self.scale;
         // 单个 View 叶子即气泡：背景 + 圆角 + 内边距 + 居中文字。
-        // 内边距收紧（原 18/10 偏大，对齐 Go 的紧凑气泡）。
         let mut tip = View::leaf(text, self.fg)
             .bg(self.bg)
             .pad(Edges::xy(10.0 * s, 5.0 * s))
             .text_align(Align::Center);
-        // 边框（主题配了才描）。
         if let Some((bc, bw)) = self.border {
             tip = tip.border(bc, bw);
         }
-        // 圆角：主题配置优先，否则随高度估算（字高 + 内边距）。
         tip.corner_radius = self
             .radius
             .unwrap_or((self.renderer.measure_text("国").height + 10.0 * s) * 0.3);
-        // 主题位图背景 + 层（jidian status 吃九宫格 panel + 角标水印）。
         if let Some(img) = &self.bg_image {
             tip = tip.bg_image(img.clone());
         }
         if !self.layers.is_empty() {
             tip = tip.layers(self.layers.clone());
         }
-
         // 软投影四向扩边：内容布局起点移到 (ml, mt)，窗口位置左上回移，阴影四面溢出。
         let (ml, mt, mr, mb) = self
             .shadow
@@ -149,7 +143,6 @@ impl StatusTip {
         let ch = (h_f.ceil() as u32).max(24);
         let w = cw + ml + mr;
         let h = ch + mt + mb;
-
         self.window.resize(w, h);
         {
             let buf = self.window.buffer_mut();
@@ -172,7 +165,15 @@ impl StatusTip {
         if let Err(e) = self.window.update() {
             tracing::warn!("StatusTip update failed: {}", e);
         }
+        (cw, ch, ml, mt)
+    }
 
+    /// 显示提示文本：水平居中于光标、默认在光标下方（下方不足则上翻），加用户偏移。
+    /// `cy` 为光标底端，`caret_h` 为光标高度（上翻定位用）。
+    pub fn show(&mut self, text: &str, cx: i32, cy: i32, caret_h: i32, off_x: i32, off_y: i32) {
+        self.ensure_scale(cx, cy);
+        let s = self.scale;
+        let (cw, ch, ml, mt) = self.render_bubble(text);
         // 水平居中于光标、默认光标下方（下方不足上翻），叠加用户偏移；按工作区钳位。
         let gap = (4.0 * s).round() as i32;
         let x = cx - (cw as i32) / 2 + off_x;
@@ -180,6 +181,14 @@ impl StatusTip {
         let (px, py) = clamp_below_or_above(x, y, cw, ch, cy, caret_h, gap);
         // 内容锚点 − 左/上 margin，阴影向四周溢出。
         self.window.show(px - ml as i32, py - mt as i32);
+    }
+
+    /// 固定坐标显示（position_mode=fixed）：(fx,fy) 为内容左上屏幕坐标，不随光标。
+    pub fn show_fixed(&mut self, text: &str, fx: i32, fy: i32) {
+        self.ensure_scale(fx, fy);
+        let (_cw, _ch, ml, mt) = self.render_bubble(text);
+        // 内容锚点 (fx,fy) − 左/上 margin，阴影向四周溢出。
+        self.window.show(fx - ml as i32, fy - mt as i32);
     }
 
     pub fn hide(&self) {
