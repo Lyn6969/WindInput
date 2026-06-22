@@ -291,6 +291,23 @@ impl DictReader {
     pub fn key_count(&self) -> u32 {
         self.header.key_count
     }
+
+    /// 遍历全部条目(供反查索引构建):对每个 (code, text, weight) 调用 `f`。
+    /// 顺序为键索引顺序(码字典序);截断/半写的键索引处提前结束。
+    pub fn for_each_entry(&self, f: &mut dyn FnMut(&str, &str, i32)) {
+        for i in 0..self.header.key_count {
+            let Some(idx) = self.read_key_index(i) else {
+                break;
+            };
+            // code 借用 self.data();read_entry 同样借用,故先拷成 owned 避免借用冲突。
+            let code = self.read_string(idx.code_off, idx.code_len).to_string();
+            for j in 0..idx.entry_len {
+                if let Some(rec) = self.read_entry(idx.entry_off, j) {
+                    f(&code, &rec.text, rec.weight);
+                }
+            }
+        }
+    }
 }
 
 /// 二进制词典写入器（用于将 rime dict.yaml 转换为 .wdb）
@@ -486,6 +503,29 @@ mod tests {
         let prefix = reader.search_prefix("ni", 10);
         assert!(prefix.iter().any(|e| e.text == "你好"));
         assert!(prefix.iter().any(|e| e.text == "你"));
+
+        let _ = std::fs::remove_file(&tmp);
+    }
+
+    /// for_each_entry 应枚举全部 (code,text,weight),供反查索引构建(mmap 路径)。
+    #[test]
+    fn test_for_each_entry_enumerates_all() {
+        let tmp = std::env::temp_dir().join("wind_dict_foreach_test.wdb");
+        let mut writer = DictWriter::new();
+        writer.add(
+            "a".to_string(),
+            vec![("工".to_string(), 9999), ("戈".to_string(), 100)],
+        );
+        writer.add("aaaa".to_string(), vec![("工".to_string(), 50)]);
+        writer.write(&tmp).expect("write wdb");
+
+        let reader = DictReader::open(&tmp).expect("open wdb");
+        let mut got: Vec<(String, String, i32)> = Vec::new();
+        reader.for_each_entry(&mut |c, t, w| got.push((c.to_string(), t.to_string(), w)));
+        assert_eq!(got.len(), 3, "应枚举 3 条");
+        assert!(got.contains(&("a".to_string(), "工".to_string(), 9999)));
+        assert!(got.contains(&("a".to_string(), "戈".to_string(), 100)));
+        assert!(got.contains(&("aaaa".to_string(), "工".to_string(), 50)));
 
         let _ = std::fs::remove_file(&tmp);
     }

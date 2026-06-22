@@ -1234,6 +1234,17 @@ impl Coordinator {
         let tip_cfg = &rt.config.ui.tooltip;
         // 命令直通车候选前缀标注（features.cmdbar.candidate_prefix）：仅命令候选(is_command)显示。
         let cmd_prefix = rt.config.features.cmdbar.candidate_prefix.as_str();
+        // 编码提示(反查):对拼音来源候选,用主码表真实反查索引填 comment(实际填充见下方候选构造,
+        // 受 source==Pinyin 守卫)。门控两类:
+        //  - 普通拼音/混输方案:跟随方案 show_code_hint(pinyin_show_code_hint 解析,混输取次方案);
+        //  - overlay 反查模式(临时拼音 / 快捷输入(mix)内拼音):**无视开关强制显示**
+        //    (对齐 Go AddCodeHintsForced)——这些模式本身就是"用拼音反查码表编码",必须出码。
+        // 码表类方案/候选的剩余编码由码表引擎在 convert 内填,不在此处理。
+        let force_hint = matches!(
+            state.active,
+            Some(ModeKind::TempPinyin) | Some(ModeKind::Mix(_)) | Some(ModeKind::QuickInput)
+        );
+        let pinyin_hint = force_hint || self.engine_mgr.pinyin_show_code_hint();
         let tip_opts = wind_reverse::TooltipOptions {
             code: tip_cfg.code.enabled,
             pinyin: tip_cfg.pinyin.enabled,
@@ -1278,7 +1289,21 @@ impl Coordinator {
                         cand_cfg.index_label(i)
                     },
                     tooltip,
-                    comment: c.comment.clone(),
+                    // 编码提示:码表候选的剩余编码由码表引擎在 convert 时已填入 c.comment(故 !empty 时保留);
+                    // 拼音候选用码表真实反查索引填(仅 text 在码表词库中存在才显示,不生成、不臆测)。
+                    comment: if !c.comment.is_empty() {
+                        c.comment.clone()
+                    } else if pinyin_hint
+                        && c.source == wind_candidate::CandidateSource::Pinyin
+                    {
+                        // 反查码:仅对**拼音来源**候选,用主码表反向索引取该词在码表里的**实际**
+                        // 编码(不存在则不显示)。不按字生成码——生成码常与码表实际码不一致,会提示
+                        // 出打不出的码。对齐 Go addCodeHintsFromCodetable(Source==Pinyin && 空 comment)。
+                        // (码表来源候选的剩余编码已由码表引擎在 convert 时填入 c.comment。)
+                        self.engine_mgr.codetable_reverse_hint(&c.text)
+                    } else {
+                        String::new()
+                    },
                 }
             })
             .collect();

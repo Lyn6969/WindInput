@@ -151,6 +151,15 @@ impl CodetableDict {
         results
     }
 
+    /// 遍历全部条目(供反查索引构建):对每个 (code, text, weight) 调用 `f`。
+    pub fn for_each_entry(&self, f: &mut dyn FnMut(&str, &str, i32)) {
+        for (code, entries) in &self.entries {
+            for e in entries {
+                f(code, &e.text, e.weight);
+            }
+        }
+    }
+
     /// 总条目数
     pub fn len(&self) -> usize {
         self.total_entries

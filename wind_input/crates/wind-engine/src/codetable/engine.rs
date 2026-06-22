@@ -22,6 +22,8 @@ pub struct CommitOptions {
     pub clear_on_empty_max: bool,
     /// 超过满码长时取前 N 码顶字上屏
     pub top_code_commit: bool,
+    /// 显示编码提示：码表方案下,给前缀候选标注「剩余编码」(候选全码去掉已输入前缀)。
+    pub show_code_hint: bool,
 }
 
 /// 码表引擎
@@ -110,6 +112,17 @@ impl Engine for CodeTableEngine {
 
         candidates.sort_by(better);
         candidates.truncate(max_candidates);
+
+        // 编码提示(码表自身):前缀候选标注「剩余编码」=候选全码去掉已输入前缀(对齐 Go codetable.go)。
+        // 精确候选(code==input)剩余为空 → 不标注。已有 comment 的候选不覆盖。
+        if self.opts.show_code_hint {
+            let input_len = input.chars().count();
+            for c in candidates.iter_mut() {
+                if c.comment.is_empty() && c.code.chars().count() > input_len {
+                    c.comment = c.code.chars().skip(input_len).collect();
+                }
+            }
+        }
 
         let is_empty = candidates.is_empty();
         let (should_commit, commit_text) = match self.should_auto_commit(input, &candidates) {

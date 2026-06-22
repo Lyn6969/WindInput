@@ -74,6 +74,14 @@ pub struct EngineManager {
     /// 方案 override 层目录（schema_overrides/{id}.toml）；读 schema 时深合并到基础方案之上。
     /// None=不读 override（如纯测试）。设置页 saveConfig 写此目录。
     override_dir: Option<std::path::PathBuf>,
+    /// 编码提示开关缓存：(已缓存的活跃方案 id, pinyin_show_code_hint)。
+    /// 活跃方案变化时才重算(读盘一次),供 notify_ui_update 每键廉价查询,避免每键读盘。
+    code_hint_cache: Mutex<(String, bool)>,
+    /// 主码表方案 id(拼音反查码源):config.schema.primary_codetable 解析后(可空)。构造/重载时更新。
+    primary_codetable: Mutex<String>,
+    /// 主码表反查索引缓存:(主码表 id, 汉字/词 → 实际编码)。供拼音方案编码提示按词查实际码。
+    /// 懒建(首次需要时按主码表全量构建),主码表 id 变化时重建,invalidate/reload 时清空。
+    reverse_index: Mutex<Option<(String, Arc<HashMap<String, String>>)>>,
 }
 
 /// 进程级缓存根目录（%LOCALAPPDATA%\WindInput\cache），EngineManager::new 设置一次。
@@ -161,6 +169,9 @@ impl EngineManager {
         // 过滤不支持的方案（如双拼），但始终保留活跃方案
         let ov = override_dir.as_deref();
         available.retain(|sid| sid == &active_id || Self::schema_supported(sid, data_dir, ov));
+        // 主码表方案(拼音反查码源):config 显式 > available 首个 codetable 类型方案。
+        let primary_codetable =
+            Self::resolve_primary_codetable(&config.schema.primary_codetable, &available, data_dir, ov);
 
         let mgr = Self {
             engines: Mutex::new(HashMap::new()),
@@ -172,10 +183,118 @@ impl EngineManager {
             freq_cache: Mutex::new(HashMap::new()),
             name_cache: Mutex::new(HashMap::new()),
             override_dir,
+            code_hint_cache: Mutex::new((String::new(), false)),
+            primary_codetable: Mutex::new(primary_codetable),
+            reverse_index: Mutex::new(None),
         };
         // 仅构建活跃方案（其余懒加载）
         mgr.ensure_loaded(&active_id);
         mgr
+    }
+
+    /// 当前活跃方案是否显示编码提示(反查)。按活跃方案 id 缓存,id 变才读盘重算。
+    /// 供 notify_ui_update 每键查询,避免每键读 schema。
+    /// 当前活跃方案是否为「拼音类(含 mixed)且 pinyin.show_code_hint」。供协调器对拼音候选
+    /// 用主码表真实反查码填 comment。按活跃方案 id 缓存,id 变才读盘。
+    /// (码表类方案的「剩余编码」由码表引擎在 convert 内处理,不走此路径。)
+    pub fn pinyin_show_code_hint(&self) -> bool {
+        let id = self.active_schema_id();
+        let mut c = self.code_hint_cache.lock().unwrap_or_else(|e| e.into_inner());
+        if c.0 != id {
+            let flag = self
+                .schema_merged(&id)
+                .map(|s| {
+                    let t = s.engine.engine_type.to_lowercase();
+                    if t == "pinyin" {
+                        s.engine.pinyin.show_code_hint
+                    } else if t == "mixed" {
+                        // 混输方案自身通常无 [engine.pinyin] 段:反查提示跟随**次方案(拼音子方案)**
+                        // 的 show_code_hint(对齐 Go mixed.addCodeHintsFromCodetable 读 pinyinEngine 配置)。
+                        let sec = s.engine.mixed.secondary_schema.trim();
+                        let sec = if sec.is_empty() { "pinyin" } else { sec };
+                        self.schema_merged(sec)
+                            .map(|p| p.engine.pinyin.show_code_hint)
+                            .unwrap_or(false)
+                    } else {
+                        false
+                    }
+                })
+                .unwrap_or(false);
+            *c = (id, flag);
+        }
+        c.1
+    }
+
+    /// 拼音方案编码提示:返回主码表中 `text` 实际对应的编码(多码取权重/码长/字典序首位),
+    /// 不存在返回空。对齐 Go `manager_convert.go` 的 ApplyCodeHintsToCandidates——用主码表
+    /// **反向索引**取实际码,而非按字生成码再校验(后者生成码常与码表实际码不一致,导致全被拒)。
+    /// 索引按主码表 id 懒建并缓存,主码表 id 变化时重建,reload/invalidate 时清空。
+    pub fn codetable_reverse_hint(&self, text: &str) -> String {
+        let primary = self
+            .primary_codetable
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        if primary.is_empty() {
+            return String::new();
+        }
+        let idx = {
+            let mut guard = self.reverse_index.lock().unwrap_or_else(|e| e.into_inner());
+            match guard.as_ref() {
+                Some((id, m)) if *id == primary => m.clone(),
+                _ => {
+                    let m = Arc::new(self.build_primary_reverse_index(&primary));
+                    *guard = Some((primary.clone(), m.clone()));
+                    m
+                }
+            }
+        };
+        idx.get(text).cloned().unwrap_or_default()
+    }
+
+    /// 按主码表方案全量构建反查索引(汉字/词 → 实际编码)。失败返回空表。
+    fn build_primary_reverse_index(&self, primary: &str) -> HashMap<String, String> {
+        let Some(data_dir) = self.data_dir.as_deref() else {
+            return HashMap::new();
+        };
+        let schemas = data_dir.join("schemas");
+        let Some(schema) = Self::read_schema(primary, Some(data_dir), self.override_dir.as_deref())
+        else {
+            return HashMap::new();
+        };
+        match Self::load_dictionary(&schema, &schemas) {
+            Some(dict) => {
+                let idx = dict.build_reverse_index();
+                info!(
+                    "Built code-hint reverse index: {} ({} texts)",
+                    primary,
+                    idx.len()
+                );
+                idx
+            }
+            None => HashMap::new(),
+        }
+    }
+
+    /// 解析主码表方案 id:config 显式指定优先;否则取 available 中首个 codetable 类型方案;都无返回空。
+    fn resolve_primary_codetable(
+        cfg_primary: &str,
+        available: &[String],
+        data_dir: Option<&Path>,
+        override_dir: Option<&Path>,
+    ) -> String {
+        if !cfg_primary.is_empty() {
+            return cfg_primary.to_string();
+        }
+        for id in available {
+            if Self::read_schema(id, data_dir, override_dir)
+                .map(|s| s.engine.engine_type.eq_ignore_ascii_case("codetable"))
+                .unwrap_or(false)
+            {
+                return id.clone();
+            }
+        }
+        String::new()
     }
 
     /// 读取 schema 判断是否受支持（不构建引擎，仅解析 TOML）
@@ -404,6 +523,17 @@ impl EngineManager {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .remove(schema_id);
+        // 方案配置(含 pinyin.show_code_hint)可能变更:失效编码提示缓存,使下次按新配置重算。
+        // (码表的剩余编码随引擎重建已生效;拼音的反查 gate 走此缓存,不清则切开关不生效。)
+        *self
+            .code_hint_cache
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = (String::new(), false);
+        // 主码表(及其词库/override)可能变更:失效反查索引,下次按新内容重建。
+        *self
+            .reverse_index
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = None;
     }
 
     /// 切换到指定方案；成功返回 true（必要时懒加载）
@@ -440,6 +570,16 @@ impl EngineManager {
         });
 
         // 更新可变状态。
+        // 重算主码表(拼音反查码源)。在 available 移入锁前用其引用解析。
+        let primary = Self::resolve_primary_codetable(
+            &config.schema.primary_codetable,
+            &available,
+            self.data_dir.as_deref(),
+            self.override_dir.as_deref(),
+        );
+        *self.primary_codetable.lock().unwrap_or_else(|e| e.into_inner()) = primary;
+        // 主码表可能变更:失效反查索引,下次按新主码表重建。
+        *self.reverse_index.lock().unwrap_or_else(|e| e.into_inner()) = None;
         *self.available.lock().unwrap_or_else(|e| e.into_inner()) = available;
         *self.code_commit.lock().unwrap_or_else(|e| e.into_inner()) =
             config.input.code_commit.clone();
@@ -796,6 +936,7 @@ impl EngineManager {
                 },
                 clear_on_empty_max: ct.clear_on_empty_max.unwrap_or(commit.clear_on_empty_max),
                 top_code_commit: ct.top_code_commit.unwrap_or(commit.top_code_commit),
+                show_code_hint: ct.show_code_hint,
             };
             // 码表引擎经 DictManager(CompositeDict) 查询：系统词库作 System 层。
             // 注入 redb Store 时，注册用户词/临时词层（按 schema 隔离），让用户词进候选合并。
