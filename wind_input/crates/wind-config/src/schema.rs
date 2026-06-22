@@ -140,23 +140,16 @@ pub struct TempPinyinSpec {
     pub schema: String,
 }
 
-/// 拼音引擎配置（[engine.pinyin]）
+/// 拼音引擎配置（[engine.pinyin]）。
+/// 注：show_code_hint / use_smart_compose / candidate_order / fuzzy 已上移为全局 [pinyin]。
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct PinyinSpec {
     /// "full"（全拼）/ "shuangpin"（双拼）
     #[serde(default)]
     pub scheme: String,
-    #[serde(default)]
-    pub show_code_hint: bool,
-    #[serde(default)]
-    pub use_smart_compose: bool,
-    #[serde(default)]
-    pub candidate_order: String,
-    /// 双拼布局（自定义映射，见 config-schema.md §3b）
+    /// 双拼布局 id（引用 data/schemas/shuangpin/<layout>.toml）
     #[serde(default)]
     pub shuangpin: ShuangpinSpec,
-    #[serde(default)]
-    pub fuzzy: FuzzySpec,
 }
 
 /// 双拼布局（[engine.pinyin.shuangpin]）
@@ -169,34 +162,6 @@ pub struct ShuangpinSpec {
     pub layout: String,
 }
 
-/// 模糊音（[engine.pinyin.fuzzy]）
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub struct FuzzySpec {
-    #[serde(default)]
-    pub enabled: bool,
-    #[serde(default)]
-    pub zh_z: bool,
-    #[serde(default)]
-    pub ch_c: bool,
-    #[serde(default)]
-    pub sh_s: bool,
-    #[serde(default)]
-    pub n_l: bool,
-    #[serde(default)]
-    pub f_h: bool,
-    #[serde(default)]
-    pub r_l: bool,
-    #[serde(default)]
-    pub an_ang: bool,
-    #[serde(default)]
-    pub en_eng: bool,
-    #[serde(default)]
-    pub in_ing: bool,
-    #[serde(default)]
-    pub ian_iang: bool,
-    #[serde(default)]
-    pub uan_uang: bool,
-}
 
 /// 混输引擎配置（[engine.mixed]）
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -414,5 +379,24 @@ impl DictSpec {
         } else {
             &self.dict_type
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn pinyin_spec_ignores_removed_fields() {
+        let toml_str = r#"
+scheme = "shuangpin"
+show_code_hint = true
+fuzzy = { enabled = true, zh_z = true }
+[shuangpin]
+layout = "xiaohe"
+"#;
+        let spec: PinyinSpec = toml::from_str(toml_str).unwrap();
+        assert_eq!(spec.scheme, "shuangpin");
+        assert_eq!(spec.shuangpin.layout, "xiaohe");
     }
 }

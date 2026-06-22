@@ -12,12 +12,6 @@ filter_mode = "smart"
 
 [engine.pinyin]
 scheme = "full"
-show_code_hint = true
-use_smart_compose = true
-candidate_order = "smart"
-
-[engine.pinyin.fuzzy]
-enabled = false
 
 [[dictionaries]]
 id = "pinyin_main"

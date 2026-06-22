@@ -12,15 +12,9 @@ filter_mode = "smart"
 
 [engine.pinyin]
 scheme = "shuangpin"
-show_code_hint = true
-use_smart_compose = true
-candidate_order = "smart"
 
 [engine.pinyin.shuangpin]
 layout = "xiaohe"
-
-[engine.pinyin.fuzzy]
-enabled = false
 
 [[dictionaries]]
 id = "pinyin_main"
