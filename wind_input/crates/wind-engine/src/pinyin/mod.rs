@@ -112,18 +112,6 @@ impl PinyinEngine {
         self
     }
 
-    /// 把外部输入（可能是双拼键序列）规整为全拼串。
-    /// 无双拼方案（None）时原样返回；转换结果为空串时也回退原 input。
-    fn to_full_pinyin(&self, input: &str) -> String {
-        match &self.shuangpin {
-            Some(conv) => {
-                let s = conv.convert(input).full_pinyin;
-                if s.is_empty() { input.to_string() } else { s }
-            }
-            None => input.to_string(),
-        }
-    }
-
     /// 仅测试用：读取 fuzzy_config.zh_z 以验证 with_fuzzy 注入是否生效。
     #[cfg(test)]
     pub fn fuzzy_zh_z(&self) -> bool {
@@ -135,10 +123,10 @@ impl PinyinEngine {
         self.dict.len()
     }
 
-    /// 计算 preedit 显示与音节信息
-    fn compute_composition(&self, input: &str) -> (String, Vec<String>, String) {
-        let full = self.to_full_pinyin(input);
-        let input = full.as_str();
+    /// 计算 preedit 显示与音节信息。
+    /// `full_pinyin` 必须已是全拼串（调用方负责转换），本方法不再内部做双拼→全拼转换。
+    fn compute_composition(&self, full_pinyin: &str) -> (String, Vec<String>, String) {
+        let input = full_pinyin;
         let dag = Dag::build(input, &self.trie);
         let syllables = dag.maximum_match();
         let consumed: usize = syllables.iter().map(|s| s.len()).sum();
@@ -168,8 +156,14 @@ impl Engine for PinyinEngine {
             return Ok(ConvertResult::default());
         }
 
-        let full = self.to_full_pinyin(input);
-        let input = full.as_str();
+        // 双拼激活时保留 SpConvertResult，以便后续用 map_consumed_length 回算消费键数。
+        let sp_result: Option<shuangpin::SpConvertResult> = self.shuangpin.as_ref().map(|conv| conv.convert(input));
+        let full_owned: String = match &sp_result {
+            Some(r) if !r.full_pinyin.is_empty() => r.full_pinyin.clone(),
+            Some(_) => input.to_string(),
+            None => input.to_string(),
+        };
+        let input = full_owned.as_str();
 
         let dict = &self.dict;
         let trie = &self.trie;
@@ -330,13 +324,19 @@ impl Engine for PinyinEngine {
         candidates.truncate(max_candidates);
 
         // 分段上屏所需：标注每个候选实际消费的输入字节数。
-        // code 为 input 的前缀（如 "ni" ⊂ "nihao"）→ 只消费该前缀，选中后保留剩余拼音续转；
+        // code 为 input（全拼）的前缀（如 "ni" ⊂ "nihao"）→ 只消费该前缀，选中后保留剩余拼音续转；
         // 否则（整句/前缀补全/非前缀子串）消费整串。0 表示未知（由调用方按整串处理）。
+        // 双拼激活时：全拼字节数需通过 map_consumed_length 回算为双拼原始键数，
+        // 否则变长音节（2键→3字节，如 zh/ch/sh）会错误消费/越界双拼键缓冲区。
         for c in candidates.iter_mut() {
-            c.consumed_length = if !c.code.is_empty() && input.starts_with(&c.code) {
+            let fp_consumed = if !c.code.is_empty() && input.starts_with(&c.code) {
                 c.code.len()
             } else {
                 input.len()
+            };
+            c.consumed_length = match &sp_result {
+                Some(r) => r.map_consumed_length(fp_consumed),
+                None => fp_consumed,
             };
         }
 
@@ -468,6 +468,43 @@ mod tests {
         fz.zh_z = true;
         let eng = PinyinEngine::new(Config::default(), dict).with_fuzzy(fz);
         assert!(eng.fuzzy_zh_z(), "with_fuzzy 注入的 zh_z=true 应被引擎持有");
+    }
+
+    /// Task 4.1 TDD Step 2：多音节双拼——consumed_length 必须回算为双拼键数，
+    /// compute_composition 不能对已是全拼的串再做一次双拼转换。
+    /// 输入小鹤双拼 "nihc"（ni+hc → 全拼 "nihao"），词典含「你好」。
+    #[test]
+    fn pinyin_engine_shuangpin_multisyllable_consumed_length() {
+        // 构造含 "nihao"->"你好" 的最小词典
+        let mut raw = CodetableDict::empty();
+        raw.merge_single("nihao".to_string(), "你好".to_string(), 200, 0);
+        raw.merge_single("ni".to_string(), "你".to_string(), 100, 1);
+        let dict = CachedDict::Memory(raw);
+
+        let schema_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../../data/schemas/shuangpin");
+        let layout = Layout::from_toml(&schema_dir.join("xiaohe.toml"))
+            .expect("加载小鹤布局失败");
+        let conv = ShuangpinConverter::new(layout);
+
+        let eng = PinyinEngine::new(Config::default(), dict).with_shuangpin(conv);
+        // 小鹤双拼 "nihc" → 全拼 "nihao"
+        let r = eng.convert("nihc", 10).unwrap();
+
+        // 1. 候选含「你好」
+        assert!(
+            r.candidates.iter().any(|c| c.text == "你好"),
+            "双拼输入 \"nihc\" 应包含候选「你好」，实际候选: {:?}",
+            r.candidates.iter().map(|c| &c.text).collect::<Vec<_>>()
+        );
+
+        // 2. 「你好」的 consumed_length 必须是双拼键数 4，而非全拼字节数 5
+        let nihao = r.candidates.iter().find(|c| c.text == "你好").unwrap();
+        assert_eq!(
+            nihao.consumed_length, 4,
+            "「你好」consumed_length 应为双拼键数 4（\"nihc\" 的长度），实际为 {}",
+            nihao.consumed_length
+        );
     }
 
     /// Task 4.1 TDD Step 1：双拼端到端——装配小鹤双拼 converter 后，
