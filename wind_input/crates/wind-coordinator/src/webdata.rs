@@ -721,15 +721,112 @@ impl Coordinator {
     }
 
     fn web_stats_summary(&self) -> anyhow::Result<Value> {
-        let store = match self.store.as_ref() {
-            Some(s) => s,
-            None => {
-                return Ok(json!({ "today": 0, "week": 0, "month": 0, "total": 0, "streak": 0 }));
-            }
+        use chrono::Datelike;
+        let (collector, store) = match (self.stat_collector.as_ref(), self.store.as_ref()) {
+            (Some(c), Some(s)) => (c, s),
+            _ => return Ok(Self::empty_stats_summary()),
         };
+        // 当日数据来自采集器内存（始终最新、完整）；历史从 store 读。
+        let today_stat = collector.get_today_stat();
+        let meta = collector.get_meta();
         let today = today_str();
-        let s = store.stats_summary(&today)?;
-        Ok(serde_json::to_value(s)?)
+        let today_total = today_stat.total();
+
+        // 活跃天数（DB 天数；今天有数据但未 flush 时 +1）+ 日均。
+        let all = store
+            .daily_stats("0000-01-01", "9999-12-31")
+            .unwrap_or_default();
+        let mut active_days = all.iter().filter(|(_, r)| r.total() > 0).count();
+        let today_in_db = all.iter().any(|(d, _)| d == &today);
+        if today_total > 0 && !today_in_db {
+            active_days += 1;
+        }
+        let daily_avg = if active_days > 0 {
+            meta.total_chars / active_days as u64
+        } else {
+            0
+        };
+
+        // 周（周日起）/ 月统计（YYYY-MM-DD 字典序），今天用内存值。
+        let now = chrono::Local::now().date_naive();
+        let week_start = now - chrono::Duration::days(now.weekday().num_days_from_sunday() as i64);
+        let month_start = now.with_day(1).unwrap_or(now);
+        let week_chars: u64 = Self::daily_with_today_mem(
+            store,
+            &week_start.format("%Y-%m-%d").to_string(),
+            &today,
+            &today_stat,
+        )
+        .iter()
+        .map(|(_, r)| r.total() as u64)
+        .sum();
+        let month_chars: u64 = Self::daily_with_today_mem(
+            store,
+            &month_start.format("%Y-%m-%d").to_string(),
+            &today,
+            &today_stat,
+        )
+        .iter()
+        .map(|(_, r)| r.total() as u64)
+        .sum();
+
+        // 近 90 天：最高日 / 平均码长 / 首选率 / 平均速度。
+        let recent_from = (now - chrono::Duration::days(90))
+            .format("%Y-%m-%d")
+            .to_string();
+        let recent = Self::daily_with_today_mem(store, &recent_from, &today, &today_stat);
+        let (mut max_day_chars, mut max_day_date) = (0u32, String::new());
+        let (mut cl_sum, mut cl_cnt, mut first_sel, mut cand_sel) = (0u64, 0u64, 0u64, 0u64);
+        let (mut sp_chars, mut sp_active) = (0u64, 0u64);
+        for (d, r) in &recent {
+            let t = r.total();
+            if t > max_day_chars {
+                max_day_chars = t;
+                max_day_date = d.clone();
+            }
+            cl_sum += r.code_len_sum as u64;
+            cl_cnt += r.code_len_count as u64;
+            first_sel += r.cand_pos_dist[0] as u64;
+            cand_sel += r.cand_pos_dist.iter().map(|&v| v as u64).sum::<u64>();
+            sp_chars += t as u64;
+            sp_active += r.active_seconds as u64;
+        }
+        let avg_code_len = if cl_cnt > 0 {
+            cl_sum as f64 / cl_cnt as f64
+        } else {
+            0.0
+        };
+        let first_select_rate = if cand_sel > 0 {
+            first_sel as f64 / cand_sel as f64
+        } else {
+            0.0
+        };
+        let today_speed =
+            wind_store::stats::speed_per_minute(today_total, today_stat.active_seconds);
+        let overall_speed = wind_store::stats::speed_per_minute(
+            sp_chars.min(u32::MAX as u64) as u32,
+            sp_active.min(u32::MAX as u64) as u32,
+        );
+
+        Ok(json!({
+            "today_chars": today_total,
+            "today_chinese": today_stat.chinese,
+            "today_english": today_stat.english,
+            "total_chars": meta.total_chars,
+            "active_days": active_days,
+            "daily_avg": daily_avg,
+            "streak_current": meta.streak_current,
+            "streak_max": meta.streak_max,
+            "week_chars": week_chars,
+            "month_chars": month_chars,
+            "max_day_chars": max_day_chars,
+            "max_day_date": max_day_date,
+            "avg_code_len": avg_code_len,
+            "first_select_rate": first_select_rate,
+            "today_speed": today_speed,
+            "overall_speed": overall_speed,
+            "max_speed": meta.max_speed,
+        }))
     }
 
     fn web_stats_daily(&self, params: &Value) -> anyhow::Result<Value> {
@@ -739,11 +836,17 @@ impl Coordinator {
             Some(s) => s,
             None => return Ok(json!([])),
         };
-        // 真实数据按日期建索引，再用区间内连续日期补 0（对齐 mock 的连续 DailyStat 序列，便于前端绘图）。
-        let mut by_date = std::collections::HashMap::new();
-        for (d, rec) in store.daily_stats(&from, &to)? {
-            by_date.insert(d, rec.total());
+        // 真实数据按日期索引；今天用采集器内存最新值覆盖（DB 可能未 flush）。
+        let mut by_date: std::collections::HashMap<String, wind_store::stats::DailyStats> =
+            store.daily_stats(&from, &to)?.into_iter().collect();
+        let today = today_str();
+        if let Some(c) = self.stat_collector.as_ref() {
+            let ts = c.get_today_stat();
+            if today.as_str() >= from.as_str() && today.as_str() <= to.as_str() && ts.total() > 0 {
+                by_date.insert(today.clone(), ts);
+            }
         }
+        // 区间内连续日期补零值，输出完整 DailyStatItem（便于前端绘图）。
         let mut out = Vec::new();
         if let (Ok(f), Ok(t)) = (
             chrono::NaiveDate::parse_from_str(&from, "%Y-%m-%d"),
@@ -752,8 +855,8 @@ impl Coordinator {
             let mut cur = f;
             while cur <= t {
                 let key = cur.format("%Y-%m-%d").to_string();
-                let count = by_date.get(&key).copied().unwrap_or(0);
-                out.push(json!({ "date": key, "count": count }));
+                let rec = by_date.get(&key).cloned().unwrap_or_default();
+                out.push(Self::daily_item_json(&key, &rec));
                 cur += chrono::Duration::days(1);
             }
         }
@@ -763,6 +866,10 @@ impl Coordinator {
     fn web_stats_clear(&self) -> anyhow::Result<Value> {
         if let Some(store) = self.store.as_ref() {
             store.clear_stats()?;
+        }
+        // 同步清空采集器内存（今日 + 元数据），否则 summary 仍读到旧内存值。
+        if let Some(c) = self.stat_collector.as_ref() {
+            c.reset();
         }
         Ok(json!({ "ok": true }))
     }
@@ -782,7 +889,84 @@ impl Coordinator {
             .format("%Y-%m-%d")
             .to_string();
         let n = store.prune_stats_before(&before)?;
+        // 重建元数据（剔除已删历史）并让采集器重载：先 flush 今日落库，recalc 后 resume。
+        if let Some(c) = self.stat_collector.as_ref() {
+            c.flush();
+            store.recalculate_stats_meta()?;
+            c.resume();
+        } else {
+            store.recalculate_stats_meta()?;
+        }
         Ok(json!({ "pruned": n }))
+    }
+
+    /// 取 [from, today] 的每日统计，今天用采集器内存值替换/追加（对齐 Go GetSummary 用内存今天）。
+    fn daily_with_today_mem(
+        store: &wind_store::Store,
+        from: &str,
+        today: &str,
+        today_stat: &wind_store::stats::DailyStats,
+    ) -> Vec<(String, wind_store::stats::DailyStats)> {
+        let mut days = store.daily_stats(from, today).unwrap_or_default();
+        let mut has = false;
+        for (d, r) in days.iter_mut() {
+            if d == today {
+                *r = today_stat.clone();
+                has = true;
+            }
+        }
+        if !has && today >= from && today_stat.total() > 0 {
+            days.push((today.to_string(), today_stat.clone()));
+        }
+        days
+    }
+
+    /// 组装前端 DailyStatItem JSON（紧凑字段名，含按方案 bs / 按来源 src）。
+    fn daily_item_json(date: &str, r: &wind_store::stats::DailyStats) -> Value {
+        let bs: serde_json::Map<String, Value> = r
+            .by_schema
+            .iter()
+            .map(|(k, s)| {
+                (
+                    k.clone(),
+                    json!({
+                        "tc": s.total_chars,
+                        "cn": s.commit_count,
+                        "cls": s.code_len_sum,
+                        "clc": s.code_len_count,
+                        "cpd": s.cand_pos_dist,
+                    }),
+                )
+            })
+            .collect();
+        json!({
+            "d": date,
+            "tc": r.total(),
+            "cc": r.chinese,
+            "ec": r.english,
+            "pc": r.punct,
+            "oc": r.other,
+            "h": r.hours,
+            "cn": r.commit_count,
+            "cls": r.code_len_sum,
+            "clc": r.code_len_count,
+            "cld": r.code_len_dist,
+            "cpd": r.cand_pos_dist,
+            "as": r.active_seconds,
+            "bs": bs,
+            "src": r.by_source,
+        })
+    }
+
+    /// 无采集器/存储时的空摘要（17 字段全 0，对齐前端 StatsSummary 形状）。
+    fn empty_stats_summary() -> Value {
+        json!({
+            "today_chars": 0, "today_chinese": 0, "today_english": 0,
+            "total_chars": 0, "active_days": 0, "daily_avg": 0,
+            "streak_current": 0, "streak_max": 0, "week_chars": 0, "month_chars": 0,
+            "max_day_chars": 0, "max_day_date": "", "avg_code_len": 0.0,
+            "first_select_rate": 0.0, "today_speed": 0, "overall_speed": 0, "max_speed": 0,
+        })
     }
 
     /// 主题查找目录：用户主题（user_config_dir/themes）优先，回退内置（data/themes）。
@@ -1042,39 +1226,56 @@ mod tests {
     #[test]
     fn stats_summary_daily_shape() {
         let c = coord("stats");
-        let store = c.store.as_ref().unwrap();
         let today = today_str();
-        store.record_stat(&today, 42, 0).unwrap();
+        // 采集器记录今日：中文 2（码长 4，首选）。
+        c.record_commit("你好", 4, 0, wind_store::stats::CommitSource::Candidate);
 
-        // stats.summary 形状对齐 StatsSummary{today,week,month,total,streak}
+        // stats.summary 形状对齐富 StatsSummary（17 字段）。
         let sum = c.web_data_rpc("stats.summary", &json!({})).unwrap();
-        for k in ["today", "week", "month", "total", "streak"] {
-            assert!(
-                sum.get(k).and_then(|v| v.as_u64()).is_some(),
-                "summary 缺 {k}"
-            );
+        for k in [
+            "today_chars",
+            "today_chinese",
+            "today_english",
+            "total_chars",
+            "active_days",
+            "daily_avg",
+            "streak_current",
+            "streak_max",
+            "week_chars",
+            "month_chars",
+            "max_day_chars",
+            "avg_code_len",
+            "first_select_rate",
+            "today_speed",
+            "overall_speed",
+            "max_speed",
+        ] {
+            assert!(sum.get(k).is_some(), "summary 缺 {k}");
         }
-        assert_eq!(sum["today"], 42);
+        assert_eq!(sum["today_chars"], 2);
 
-        // stats.daily 形状对齐 DailyStat{date,count}，区间内连续补 0
+        // flush 落库后 stats.daily 形状对齐 DailyStatItem。
+        c.stat_collector.as_ref().unwrap().flush();
         let daily = c
             .web_data_rpc("stats.daily", &json!({ "from": &today, "to": &today }))
             .unwrap();
         let arr = daily.as_array().unwrap();
         assert_eq!(arr.len(), 1);
-        assert_eq!(arr[0]["date"], json!(today));
-        assert_eq!(arr[0]["count"], 42);
+        assert_eq!(arr[0]["d"], json!(today));
+        assert_eq!(arr[0]["tc"], 2);
+        assert_eq!(arr[0]["cc"], 2);
 
-        // pruneBefore(days) 返回 {pruned}
+        // pruneBefore(days) 返回 {pruned}。
         let pr = c
             .web_data_rpc("stats.pruneBefore", &json!({ "days": 0 }))
             .unwrap();
         assert!(pr.get("pruned").and_then(|v| v.as_u64()).is_some());
 
-        // clear 后 summary 归零
+        // clear 后 summary 归零（含采集器内存）。
         c.web_data_rpc("stats.clear", &json!({})).unwrap();
         let sum2 = c.web_data_rpc("stats.summary", &json!({})).unwrap();
-        assert_eq!(sum2["total"], 0);
+        assert_eq!(sum2["today_chars"], 0);
+        assert_eq!(sum2["total_chars"], 0);
     }
 
     #[test]
@@ -1228,6 +1429,47 @@ mod tests {
             c.stat_recorded.load(std::sync::atomic::Ordering::Relaxed),
             "record_commit 应置位 stat_recorded"
         );
+    }
+
+    #[test]
+    fn stats_summary_rich_fields() {
+        use wind_store::stats::CommitSource;
+        let c = coord("stats_summary_rich");
+        // 今日：中文 2(码长4,首选) + 英文 2(临英,次选)
+        c.record_commit("你好", 4, 0, CommitSource::Candidate);
+        c.record_commit("ab", 0, 1, CommitSource::TempEnglish);
+        let r = c.web_data_rpc("stats.summary", &json!({})).unwrap();
+        assert_eq!(r["today_chinese"], 2);
+        assert_eq!(r["today_english"], 2);
+        assert_eq!(r["today_chars"], 4);
+        assert_eq!(r["total_chars"], 4);
+        assert_eq!(r["active_days"], 1);
+        assert!((r["avg_code_len"].as_f64().unwrap() - 4.0).abs() < 1e-9);
+        assert!(
+            (r["first_select_rate"].as_f64().unwrap() - 0.5).abs() < 1e-9,
+            "首选率=首选1/总选2=0.5"
+        );
+    }
+
+    #[test]
+    fn stats_daily_rich_shape() {
+        use wind_store::stats::CommitSource;
+        let c = coord("stats_daily_rich");
+        c.record_commit("你好", 4, 0, CommitSource::Candidate);
+        c.stat_collector.as_ref().unwrap().flush(); // 落库才能被 daily 区间读到
+        let today = today_str();
+        let r = c
+            .web_data_rpc("stats.daily", &json!({ "from": today, "to": today }))
+            .unwrap();
+        let arr = r.as_array().unwrap();
+        assert_eq!(arr.len(), 1);
+        let d = &arr[0];
+        assert_eq!(d["d"], today);
+        assert_eq!(d["tc"], 2);
+        assert_eq!(d["cc"], 2);
+        assert_eq!(d["cls"], 4);
+        assert_eq!(d["h"].as_array().unwrap().len(), 24);
+        assert_eq!(d["cpd"][0], 1);
     }
 
     #[test]

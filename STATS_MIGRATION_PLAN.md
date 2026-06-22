@@ -101,9 +101,10 @@ Rust **并非完全缺失**统计，而是只迁了「极简骨架」：`wind-st
 **Success Criteria**:
 - `stats.summary` 扩展返回：today_chinese/english、active_days、daily_avg、streak_max、max_day、avg_code_len、first_select_rate、today/overall/max_speed（对照前端 `StatsSummary` 17 字段）
 - `stats.daily` 返回完整 `DailyStatItem`（h[24]/cld/cpd/bs/src/as）
-- 事件推送 `onStatsEvent`（写入后通知前端刷新）
-**Tests**: RPC 返回字段完整性测试；前端 `pnpm build` 通过
-**Status**: Not Started
+- 修 clear/prune 同步采集器内存（clear→reset；prune→flush+recalc+resume）
+- 事件推送 `onStatsEvent`：**延后**（onMounted 已 loadData 拉取，实时推送为优化非阻塞）
+**Tests**: RPC 富字段完整性测试；前端 `pnpm build`(vue-tsc+vite) 通过
+**Status**: ✅ Complete（13 后端测试绿；workspace 编译通过；前端 build 通过；commit `<stage4>`）
 
 ## Stage 5: 验证 + 合并
 **Goal**: 全绿 + Windows 实测 + 合入 main。
