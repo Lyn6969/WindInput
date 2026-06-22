@@ -153,7 +153,7 @@ impl wind_rpc::CoreRpc for RpcCore {
     ) -> anyhow::Result<serde_json::Value> {
         self.0.web_data_rpc(method, params)
     }
-    fn fonts(&self) -> Vec<String> {
+    fn fonts(&self) -> Vec<(String, String)> {
         self.0.list_font_families()
     }
 }

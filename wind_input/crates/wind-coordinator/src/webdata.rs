@@ -51,20 +51,39 @@ fn today_str() -> String {
 }
 
 impl Coordinator {
-    /// 枚举本机字体族名（去重升序）。供 system.fonts 经 CoreStatus 注入。
-    /// 首次调用会扫描系统字体目录（fontdb），开销可接受（设置页打开字体选择时一次）。
-    pub fn list_font_families(&self) -> Vec<String> {
+    /// 枚举本机字体：返回 (family, display_name)。family 为匹配/渲染用名(通常英文),
+    /// display_name 优先取该字体含 CJK 字符的本地化名(如"微软雅黑"),否则同 family。
+    /// 首次调用扫描系统字体目录（fontdb），开销可接受（设置页打开字体选择时一次）。
+    pub fn list_font_families(&self) -> Vec<(String, String)> {
+        fn has_cjk(s: &str) -> bool {
+            s.chars().any(|c| {
+                let u = c as u32;
+                (0x4E00..=0x9FFF).contains(&u) // CJK 统一表意
+                    || (0x3400..=0x4DBF).contains(&u) // 扩展 A
+                    || (0xF900..=0xFAFF).contains(&u) // 兼容表意
+            })
+        }
         let mut db = fontdb::Database::new();
         db.load_system_fonts();
-        let mut set = std::collections::BTreeSet::new();
+        // family(英文) → 显示名;同 family 保留首个本地化名。BTreeMap 去重 + 按 family 升序。
+        let mut map: std::collections::BTreeMap<String, String> = std::collections::BTreeMap::new();
         for face in db.faces() {
-            if let Some((family, _)) = face.families.first() {
-                if !family.is_empty() {
-                    set.insert(family.clone());
-                }
+            let Some((family, _)) = face.families.first() else {
+                continue;
+            };
+            if family.is_empty() {
+                continue;
             }
+            let display = face
+                .families
+                .iter()
+                .map(|(n, _)| n)
+                .find(|n| has_cjk(n))
+                .cloned()
+                .unwrap_or_else(|| family.clone());
+            map.entry(family.clone()).or_insert(display);
         }
-        set.into_iter().collect()
+        map.into_iter().collect()
     }
 
     /// 数据类 RPC 总分派。方法名以 `<ns>.<method>` 形式分组；未知方法返回 Err。

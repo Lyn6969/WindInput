@@ -29,8 +29,8 @@ pub trait CoreRpc: Send + Sync {
     fn data_rpc(&self, method: &str, _params: &Value) -> anyhow::Result<Value> {
         anyhow::bail!("unknown method: {}", method)
     }
-    /// 本机字体族名枚举（system.fonts）。默认空表（无平台字体能力）。
-    fn fonts(&self) -> Vec<String> {
+    /// 本机字体枚举（system.fonts）：(family, display_name)。默认空表（无平台字体能力）。
+    fn fonts(&self) -> Vec<(String, String)> {
         Vec::new()
     }
 }
@@ -96,7 +96,7 @@ fn handle(state: &DispatchState, method: &str, params: &Value) -> anyhow::Result
                 .core
                 .fonts()
                 .into_iter()
-                .map(|f| json!({ "family": f }))
+                .map(|(family, display_name)| json!({ "family": family, "display_name": display_name }))
                 .collect(),
         )),
         "system.notifyReload" => Ok(json!({ "ok": true })),
@@ -220,8 +220,8 @@ mod tests {
                 anyhow::bail!("unknown method: {}", method)
             }
         }
-        fn fonts(&self) -> Vec<String> {
-            vec!["Sans".to_string()]
+        fn fonts(&self) -> Vec<(String, String)> {
+            vec![("Sans".to_string(), "Sans".to_string())]
         }
     }
 
