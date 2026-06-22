@@ -1842,15 +1842,25 @@ impl MessageHandler for Coordinator {
         if data.event_type == EVENT_KEY_UP {
             if self.is_toggle_mode_keycode(data.key_code) {
                 debug!("toggle_mode key_up: code=0x{:02X}", data.key_code);
+                // 切换前是否有未上屏的编码/候选（决定是否需要结束应用 composition）。
+                let had_pending = {
+                    let s = self.state.lock().unwrap_or_else(|e| e.into_inner());
+                    !s.input_buffer.is_empty()
+                        || !s.committed_text.is_empty()
+                        || !s.candidates.is_empty()
+                };
                 let (status, commit_text) = self.handle_toggle_mode();
-                // 切到英文且 hotkeys.commit_on_switch=true 且有待输入：上屏原始编码并同时切换模式。
-                // （commit_text 仅在切英文时非空，见 take_input_on_mode_switch）
-                if !commit_text.is_empty() {
+                let chinese_after = status.as_ref().map(|s| s.chinese_mode).unwrap_or(false);
+                // 切英文（中→英）有待输入：commit_on_switch=true 上屏原始编码，否则空 commit。
+                // 两种都返回 InsertText：空文本 + 有 composition 时 C++ CommitText 仍会
+                // EndComposition，清掉应用里残留的编码（StatusUpdate 分支不结束 composition，
+                // 是“切英文后编码不清空”的根因）；mode_changed 同时更新中英图标。
+                if !commit_text.is_empty() || had_pending {
                     return KeyAction::InsertText {
                         text: commit_text,
                         new_composition: None,
                         mode_changed: true,
-                        chinese_mode: false,
+                        chinese_mode: chinese_after,
                         has_new_composition: false,
                     };
                 }
@@ -2322,6 +2332,10 @@ impl MessageHandler for Coordinator {
         let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
         state.chinese_mode = !state.chinese_mode;
         let chinese = state.chinese_mode;
+        // 标点随中英文切换（对齐 Go）：开启 punct_follow_mode 时，标点中/英跟随当前模式。
+        if self.rt().config.input.punct_follow_mode {
+            state.chinese_punct = chinese;
+        }
         let commit_text = self.take_input_on_mode_switch(&mut state, chinese);
         drop(state);
         self.punct.lock().unwrap_or_else(|e| e.into_inner()).reset();
@@ -2336,6 +2350,10 @@ impl MessageHandler for Coordinator {
     fn handle_system_mode_switch(&self, chinese_mode: bool) -> (Option<StatusUpdateData>, String) {
         let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
         state.chinese_mode = chinese_mode;
+        // 标点随中英文切换（对齐 Go）：开启 punct_follow_mode 时，标点跟随模式。
+        if self.rt().config.input.punct_follow_mode {
+            state.chinese_punct = chinese_mode;
+        }
         let commit_text = self.take_input_on_mode_switch(&mut state, chinese_mode);
         drop(state);
         self.punct.lock().unwrap_or_else(|e| e.into_inner()).reset();
