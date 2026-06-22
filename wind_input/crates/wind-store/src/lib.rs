@@ -7,6 +7,7 @@ pub mod freq;
 pub mod migration;
 pub mod phrases;
 pub mod shadow;
+pub mod stat_collector;
 pub mod stats;
 pub mod store;
 pub mod temp_words;
