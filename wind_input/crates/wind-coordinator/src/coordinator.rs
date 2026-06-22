@@ -97,6 +97,19 @@ pub(crate) fn quick_input_char(key_code: u32, shift: bool) -> Option<char> {
     }
 }
 
+/// 小键盘键码 → 字符（数字 0-9 / 运算符 * + - / / 小数点 .）。非小键盘键返回 None。
+pub(crate) fn numpad_char(key_code: u32) -> Option<char> {
+    match key_code {
+        0x60..=0x69 => Some((b'0' + (key_code - 0x60) as u8) as char),
+        0x6A => Some('*'),
+        0x6B => Some('+'),
+        0x6D => Some('-'),
+        0x6E => Some('.'),
+        0x6F => Some('/'),
+        _ => None,
+    }
+}
+
 /// 英文输入大小写模式（临时英文候选适配用，对齐 Go detectCasePattern）。
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) enum EnCase {
@@ -1986,6 +1999,37 @@ impl MessageHandler for Coordinator {
         // 仅有候选时生效；无候选时下方 match 的回退臂负责透传方向/翻页键。
         if let Some(act) = self.apply_nav_key(&mut state, data, true) {
             return act;
+        }
+
+        // 数字小键盘（对齐 Go）：follow_main 把数字键 1-9 视同主键盘数字（选当前页候选）；
+        // direct（默认）IME 直接输出小键盘字符（先丢弃当前未上屏编码）。仅中文模式到达此处。
+        if let Some(npc) = numpad_char(data.key_code) {
+            let follow_main = self.rt().config.input.numpad_behavior == "follow_main";
+            if follow_main && ('1'..='9').contains(&npc) {
+                let (start, end) = self.page_range(&state);
+                let idx = start + (npc as u8 - b'1') as usize;
+                if idx < end {
+                    let cand = state.candidates[idx].clone();
+                    return self.commit_selected(&mut state, &cand);
+                }
+            }
+            // direct（默认 / follow_main 未命中候选）：丢弃当前编码，直接输出小键盘字符。
+            if !state.input_buffer.is_empty()
+                || !state.committed_text.is_empty()
+                || !state.candidates.is_empty()
+            {
+                state.committed_text.clear();
+                state.committed_segs.clear();
+                state.input_buffer.clear();
+                state.candidates.clear();
+                self.notify_ui_hide();
+            }
+            let out = if state.full_width {
+                to_full_width(&npc.to_string())
+            } else {
+                npc.to_string()
+            };
+            return Self::commit_action(out, state.chinese_mode);
         }
 
         match data.key_code {
