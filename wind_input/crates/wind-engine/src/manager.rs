@@ -459,6 +459,47 @@ impl EngineManager {
             .clone()
     }
 
+    /// 所有已安装且受支持的方案列表（目录扫描）。
+    ///
+    /// 扫描 `data_dir/schemas/*.schema.toml`，对每个文件取去掉 `.schema.toml` 后缀的 id，
+    /// 按 `is_supported()` 过滤掉不支持的方案，再并入当前 `available`（保证已启用方案即使
+    /// 文件异常也在列），去重后按 id 字典序稳定排序返回。
+    ///
+    /// `data_dir` 为 None 时（纯测试）回退到 `available_schemas()`。
+    ///
+    /// 供设置页"方案管理"的候选全集使用；**不影响** `available_schemas()`（循环切换用）。
+    pub fn installed_schemas(&self) -> Vec<String> {
+        let Some(data_dir) = self.data_dir.as_deref() else {
+            return self.available_schemas();
+        };
+        let schemas_dir = data_dir.join("schemas");
+        let mut ids: Vec<String> = self.available_schemas();
+
+        if let Ok(entries) = std::fs::read_dir(&schemas_dir) {
+            for entry in entries.flatten() {
+                let fname = entry.file_name();
+                let fname_str = fname.to_string_lossy();
+                if let Some(id) = fname_str.strip_suffix(".schema.toml") {
+                    let id = id.to_string();
+                    if !ids.contains(&id) {
+                        // 只加入受支持的方案
+                        if Self::schema_supported(
+                            &id,
+                            Some(data_dir),
+                            self.override_dir.as_deref(),
+                        ) {
+                            ids.push(id);
+                        }
+                    }
+                }
+            }
+        }
+
+        ids.sort();
+        ids.dedup();
+        ids
+    }
+
     /// 方案显示名（schema.name 优先，缺/读不到回退 id）。带缓存避免重复读盘。
     pub fn schema_name(&self, schema_id: &str) -> String {
         if let Some(n) = self
@@ -1819,6 +1860,120 @@ mod tests {
         // 非双拼方案，任何键均应返回 false
         assert!(!mgr.shuangpin_final_key(b';'), "codetable 方案 `;` 应返回 false");
         assert!(!mgr.shuangpin_final_key(b'k'), "codetable 方案 `k` 应返回 false");
+
+        let _ = std::fs::remove_dir_all(&base_dir);
+        let _ = std::fs::remove_dir_all(&ov_dir);
+    }
+
+    /// installed_schemas 应返回所有已安装且受支持的方案，不受 available 限制。
+    ///
+    /// 测试方案：
+    ///   - "dummy_active": codetable，active 方案（始终在 available）
+    ///   - "sp_installed": pinyin + scheme="shuangpin"，已安装但**未**在 config.available
+    ///     → installed_schemas 应包含它，available_schemas 不含它
+    ///   - "unsupported_installed": pinyin + scheme="ziranma_xxx"，已安装但不受支持
+    ///     → installed_schemas 不含它
+    ///   - "ct_installed": codetable，已安装但未在 config.available
+    ///     → installed_schemas 应包含它
+    #[test]
+    fn installed_schemas_includes_all_supported_not_just_available() {
+        use std::io::Write;
+
+        let base_dir = std::env::temp_dir().join("wind_eng_installed_schemas_test");
+        let schemas = base_dir.join("schemas");
+        std::fs::create_dir_all(&schemas).unwrap();
+
+        // active（codetable）
+        {
+            let mut f = std::fs::File::create(schemas.join("dummy_active.schema.toml")).unwrap();
+            write!(
+                f,
+                "[schema]\nid = \"dummy_active\"\n[engine]\ntype = \"codetable\"\n"
+            )
+            .unwrap();
+        }
+
+        // 已安装双拼（shuangpin），未在 available → 应出现在 installed_schemas
+        {
+            let mut f = std::fs::File::create(schemas.join("sp_installed.schema.toml")).unwrap();
+            write!(
+                f,
+                "[schema]\nid = \"sp_installed\"\n[engine]\ntype = \"pinyin\"\n[engine.pinyin]\nscheme = \"shuangpin\"\n"
+            )
+            .unwrap();
+        }
+
+        // 已安装但不受支持（scheme="ziranma_xxx"）→ 应被过滤
+        {
+            let mut f =
+                std::fs::File::create(schemas.join("unsupported_installed.schema.toml")).unwrap();
+            write!(
+                f,
+                "[schema]\nid = \"unsupported_installed\"\n[engine]\ntype = \"pinyin\"\n[engine.pinyin]\nscheme = \"ziranma_xxx\"\n"
+            )
+            .unwrap();
+        }
+
+        // 已安装 codetable，未在 available → 应出现在 installed_schemas
+        {
+            let mut f = std::fs::File::create(schemas.join("ct_installed.schema.toml")).unwrap();
+            write!(
+                f,
+                "[schema]\nid = \"ct_installed\"\n[engine]\ntype = \"codetable\"\n"
+            )
+            .unwrap();
+        }
+
+        // config.available 只含 active，其余方案未启用
+        let mut cfg = Config::default();
+        cfg.schema.active = "dummy_active".into();
+        cfg.schema.available = vec!["dummy_active".into()];
+
+        let ov_dir = std::env::temp_dir().join("wind_eng_installed_schemas_ov");
+        let _ = std::fs::remove_dir_all(&ov_dir);
+
+        let mgr = EngineManager::with_store_override(
+            &cfg,
+            Some(&base_dir),
+            None,
+            Some(ov_dir.clone()),
+        );
+
+        let available = mgr.available_schemas();
+        let installed = mgr.installed_schemas();
+
+        // available 只含 active，未启用方案不在其中
+        assert_eq!(available, vec!["dummy_active".to_string()]);
+
+        // installed 含 active
+        assert!(
+            installed.contains(&"dummy_active".to_string()),
+            "active 应在 installed_schemas 中，实际={installed:?}"
+        );
+
+        // installed 含未启用的双拼方案
+        assert!(
+            installed.contains(&"sp_installed".to_string()),
+            "已安装 shuangpin 方案应在 installed_schemas 中，实际={installed:?}"
+        );
+
+        // installed 含未启用的 codetable 方案
+        assert!(
+            installed.contains(&"ct_installed".to_string()),
+            "已安装 codetable 方案应在 installed_schemas 中，实际={installed:?}"
+        );
+
+        // 不受支持的方案被过滤掉
+        assert!(
+            !installed.contains(&"unsupported_installed".to_string()),
+            "不支持的方案不应在 installed_schemas 中，实际={installed:?}"
+        );
+
+        // 结果有序（字典序）
+        let mut sorted = installed.clone();
+        sorted.sort();
+        sorted.dedup();
+        assert_eq!(installed, sorted, "installed_schemas 应按字典序排序且无重复");
 
         let _ = std::fs::remove_dir_all(&base_dir);
         let _ = std::fs::remove_dir_all(&ov_dir);

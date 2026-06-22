@@ -167,7 +167,7 @@ impl Coordinator {
     fn web_schema_list(&self) -> anyhow::Result<Value> {
         let items: Vec<Value> = self
             .engine_mgr
-            .available_schemas()
+            .installed_schemas()
             .iter()
             .map(|id| {
                 // 取合并后 Schema 一次，带出方案元信息（备注/版本/图标/作者），供设置页方案列表与详情显示。
