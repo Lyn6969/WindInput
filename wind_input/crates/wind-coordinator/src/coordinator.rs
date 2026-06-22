@@ -174,14 +174,6 @@ pub(crate) fn now_unix_secs() -> i64 {
 }
 
 /// 协调器输入状态
-/// 简繁变体（与 Go config.S2TVariant 对齐）：(opencc 变体名, 菜单显示名)
-pub(crate) const S2T_VARIANTS: [(&str, &str); 4] = [
-    ("s2t", "标准繁体"),
-    ("s2tw", "台湾繁体"),
-    ("s2twp", "台湾繁体（含词汇）"),
-    ("s2hk", "香港繁体"),
-];
-
 /// 检索范围过滤模式（与 Go config.FilterMode 对齐）：(模式, 菜单显示名)
 pub(crate) const FILTER_MODES: [(wind_candidate::FilterMode, &str); 3] = [
     (wind_candidate::FilterMode::Smart, "智能模式"),
@@ -241,8 +233,6 @@ pub(crate) struct State {
     pub(crate) chinese_punct: bool,
     /// 简繁转换开关（运行时切换；commit 时把简体输出转繁体）
     pub(crate) s2t_enabled: bool,
-    /// 简繁变体（s2t/s2tw/s2twp/s2hk；运行时切换）
-    pub(crate) s2t_variant: String,
     /// 检索范围过滤模式（smart/general/gb18030；运行时切换）
     pub(crate) filter_mode: wind_candidate::FilterMode,
     /// 用户是否开启常驻工具栏（菜单开关；与“当前是否激活”正交）。
@@ -378,10 +368,9 @@ pub struct Coordinator {
     pub(crate) smart_symbol: Mutex<SmartSymbolArm>,
     /// 短语层（system.phrases.toml；$Y$M$D 模板）
     pub(crate) phrases: wind_phrase::PhraseLayer,
-    /// 简繁转换器（OpenCC；None=数据缺失不可用）。变体可运行时切换，故置于 Mutex。
+    /// 简繁转换器（OpenCC；None=数据缺失不可用）。变体由配置 features.s2t.variant 决定，
+    /// 启动时加载；菜单仅提供开/关。置于 Mutex 兼容 reload 时整体替换。
     pub(crate) s2t: Mutex<Option<wind_transform::s2t::Converter>>,
-    /// OpenCC 数据目录（运行时按变体重载转换器用）
-    pub(crate) opencc_dir: Option<std::path::PathBuf>,
     /// 通用规范汉字表（检索范围"常用字"判定；空集时退化为不过滤）
     pub(crate) common_chars: wind_candidate::CommonChars,
     // Shadow 规则已迁至 redb（self.store 的 SHADOW 表）。
@@ -682,7 +671,6 @@ impl Coordinator {
                 full_width: config.general.default_full_width,
                 chinese_punct: config.general.default_chinese_punct,
                 s2t_enabled: config.features.s2t.enabled,
-                s2t_variant: s2t_variant.clone(),
                 filter_mode: wind_candidate::FilterMode::from_str(&config.input.filter_mode),
                 toolbar_visible: config.ui.toolbar.visible, // 启动初值来自配置(运行时可菜单切换)
                 ime_active: false, // 启动未激活：工具栏待 IME_ACTIVATED/FocusGained 才显示
@@ -730,7 +718,6 @@ impl Coordinator {
             smart_symbol: Mutex::new(SmartSymbolArm::default()),
             phrases,
             s2t: Mutex::new(s2t),
-            opencc_dir,
             common_chars,
             toolbar_pos_path,
             reverse,

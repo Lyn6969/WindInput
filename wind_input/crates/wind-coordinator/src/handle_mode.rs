@@ -3,7 +3,7 @@
 //! 从 coordinator.rs 拆出（同 crate 内 `impl Coordinator` 块，组织性重构，无逻辑变更）。
 //! 简繁、方案切换、主题切换、mix 融合模式、引擎方案叠加。
 
-use crate::coordinator::{Coordinator, S2T_VARIANTS, State};
+use crate::coordinator::{Coordinator, State};
 use crate::pipeline::ModeKind;
 use tracing::{debug, info, warn};
 use wind_bridge::handler::KeyAction;
@@ -208,46 +208,6 @@ impl Coordinator {
             .clone();
         self.push_theme(&name, dark);
         self.show_tip(if dark { "暗色" } else { "亮色" });
-    }
-
-    /// 切换简繁变体（0=s2t 1=s2tw 2=s2twp 3=s2hk），重载转换器并刷新候选显示。
-    pub(crate) fn set_s2t_variant(&self, index: usize) {
-        let (variant, label) = match S2T_VARIANTS.get(index) {
-            Some(v) => *v,
-            None => return,
-        };
-        let dir = match &self.opencc_dir {
-            Some(d) => d.clone(),
-            None => {
-                self.show_toast(
-                    "简繁数据缺失",
-                    ToastPosition::BottomCenter,
-                    ToastKind::Error,
-                );
-                return;
-            }
-        };
-        match wind_transform::s2t::Converter::load_variant(&dir, variant) {
-            Some(conv) => {
-                *self.s2t.lock().unwrap_or_else(|e| e.into_inner()) = Some(conv);
-                {
-                    let mut s = self.state.lock().unwrap_or_else(|e| e.into_inner());
-                    s.s2t_variant = variant.to_string();
-                }
-                // 组合中则按新变体重渲染候选显示
-                let s = self.state.lock().unwrap_or_else(|e| e.into_inner());
-                if !s.candidates.is_empty() {
-                    self.notify_ui_update(&s);
-                }
-                drop(s);
-                self.show_tip(label);
-            }
-            None => self.show_toast(
-                "简繁数据缺失",
-                ToastPosition::BottomCenter,
-                ToastKind::Error,
-            ),
-        }
     }
 
     /// 持久化主题选择。以 config.ui.theme.name 为单一源(设置页/右键统一,reload 据此应用);

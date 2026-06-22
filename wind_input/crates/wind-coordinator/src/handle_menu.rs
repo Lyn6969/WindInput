@@ -3,7 +3,7 @@
 //! 主菜单 / 候选右键菜单的构建与分派、工具栏点击/刷新/位置持久化。
 //! 从 coordinator.rs 拆出（同 crate 内 `impl Coordinator` 块，组织性重构，无逻辑变更）。
 
-use crate::coordinator::{Coordinator, FILTER_MODES, S2T_VARIANTS};
+use crate::coordinator::{Coordinator, FILTER_MODES};
 use wind_bridge::handler::MessageHandler;
 use wind_config::Config;
 use wind_keys::keymap;
@@ -49,7 +49,6 @@ impl Coordinator {
                 self.handle_menu_command("toggle_s2t");
                 self.notify_toolbar();
             }
-            MenuCmd::S2tVariant(i) => self.set_s2t_variant(i),
             MenuCmd::FilterMode(i) => self.set_filter_mode(i),
             MenuCmd::ThemeSelect(i) => self.select_theme(i),
             MenuCmd::ThemeStyle(style) => self.set_theme_style(style),
@@ -108,14 +107,13 @@ impl Coordinator {
     /// x/y 为屏幕坐标；i32::MIN 表示由 UI 取光标位置。
     pub(crate) fn show_main_menu(&self, x: i32, y: i32) {
         use wind_ui::manager::MenuItemSpec as M;
-        let (chinese, punct, full, s2t, s2t_variant, filter_mode, toolbar_vis) = {
+        let (chinese, punct, full, s2t, filter_mode, toolbar_vis) = {
             let s = self.state.lock().unwrap_or_else(|e| e.into_inner());
             (
                 s.chinese_mode,
                 s.chinese_punct,
                 s.full_width,
                 s.s2t_enabled,
-                s.s2t_variant.clone(),
                 s.filter_mode,
                 s.toolbar_visible,
             )
@@ -162,20 +160,6 @@ impl Coordinator {
         theme_children.push(M::leaf("亮色", cmd(MenuCmd::ThemeStyle(1)), true, !dark));
         theme_children.push(M::leaf("暗色", cmd(MenuCmd::ThemeStyle(2)), true, dark));
 
-        // 简入繁出子菜单：启用开关 + 变体单选
-        let mut s2t_children = vec![
-            M::leaf("启用", cmd(MenuCmd::ToggleS2t), true, s2t),
-            M::separator(),
-        ];
-        for (i, (id, label)) in S2T_VARIANTS.iter().enumerate() {
-            s2t_children.push(M::leaf(
-                *label,
-                cmd(MenuCmd::S2tVariant(i)),
-                true,
-                s2t_variant == *id,
-            ));
-        }
-
         // 检索范围子菜单：过滤模式单选
         let filter_children: Vec<_> = FILTER_MODES
             .iter()
@@ -189,7 +173,7 @@ impl Coordinator {
             M::submenu("输入方案", schema_children),
             M::leaf("全角", cmd(MenuCmd::ToggleWidth), true, full),
             M::leaf("中文标点", cmd(MenuCmd::TogglePunct), true, punct),
-            M::submenu("简入繁出", s2t_children),
+            M::leaf("简入繁出", cmd(MenuCmd::ToggleS2t), true, s2t),
             M::submenu("检索范围", filter_children),
             M::separator(),
             M::leaf("显示工具栏", cmd(MenuCmd::ToggleToolbar), true, toolbar_vis),

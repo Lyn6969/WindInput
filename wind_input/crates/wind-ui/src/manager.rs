@@ -155,8 +155,6 @@ pub enum MenuCmd {
     ToggleWidth,
     /// 简繁转换开关
     ToggleS2t,
-    /// 简繁变体（0 标准/1 台湾/2 台湾含词/3 香港）
-    S2tVariant(usize),
     /// 检索范围过滤（0 智能/1 常用字/2 全部字符）
     FilterMode(usize),
     /// 选择第 N 个主题
