@@ -54,6 +54,8 @@ pub enum UiCommand {
         caret_height: i32,
         offset_x: i32,
         offset_y: i32,
+        /// 自动隐藏时长（毫秒）；0=常驻不自动隐藏（display_mode=persistent）。
+        duration_ms: u64,
     },
     /// 更新常驻工具栏状态（中英/方案/标点/全半角）
     UpdateToolbar(crate::toolbar::ToolbarState),
@@ -322,7 +324,7 @@ impl UiManager {
         // 状态提示防抖：合并快速连续的提示（如连按切换），避免气泡闪烁
         // 载荷：(text, x, y, caret_height, offset_x, offset_y)
         let mut tip_debounce =
-            crate::debounce::Debouncer::<(String, i32, i32, i32, i32, i32)>::new(60);
+            crate::debounce::Debouncer::<(String, i32, i32, i32, i32, i32, u64)>::new(60);
         // 工具栏隐藏防抖：HideToolbar 不立即隐藏，延后 50ms；若期间收到 UpdateToolbar
         // （应用间切换的 FocusLost→FocusGained 串），取消隐藏并显示——消除 Alt+Tab 闪烁。
         let mut toolbar_hide_at: Option<std::time::Instant> = None;
@@ -396,11 +398,15 @@ impl UiManager {
             }
 
             // 推进状态提示防抖（稳定后才真正显示气泡）
-            if let Some((text, x, y, ch, ox, oy)) = tip_debounce.poll() {
+            if let Some((text, x, y, ch, ox, oy, dur)) = tip_debounce.poll() {
                 if let Some(t) = &mut status_tip {
                     t.show(&text, x, y, ch, ox, oy);
-                    tip_hide_at =
-                        Some(std::time::Instant::now() + std::time::Duration::from_millis(1000));
+                    // dur==0 → 常驻(persistent):不设隐藏时刻;否则按配置时长自动隐藏。
+                    tip_hide_at = if dur == 0 {
+                        None
+                    } else {
+                        Some(std::time::Instant::now() + std::time::Duration::from_millis(dur))
+                    };
                 }
             }
 
@@ -499,10 +505,12 @@ impl UiManager {
                         caret_height,
                         offset_x,
                         offset_y,
+                        duration_ms,
                     } => {
                         debug!("UI: ShowStatusTip '{}' at ({},{})", text, x, y);
                         // 经防抖：合并快速连续提示，避免气泡闪烁
-                        tip_debounce.trigger((text, x, y, caret_height, offset_x, offset_y));
+                        tip_debounce
+                            .trigger((text, x, y, caret_height, offset_x, offset_y, duration_ms));
                     }
                     UiCommand::ShowToast {
                         text,

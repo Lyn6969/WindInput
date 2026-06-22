@@ -496,35 +496,79 @@ pub struct UiConfig {
     #[serde(default)]
     pub tooltip: TooltipConfig,
     #[serde(default)]
-    pub status_tip: StatusTipConfig,
+    pub status_indicator: StatusIndicatorConfig,
 }
 
-/// 状态提示气泡配置（[ui.status_tip]）：中英/标点/全半角/方案切换的瞬时气泡。
-/// 尺寸跟随主题（theme.views.status），此处仅微调位置偏移与方案名样式。
+/// 状态提示气泡配置（[ui.status_indicator]，对齐 Go）：中英/标点/全半角/方案切换的瞬时气泡。
+/// 样式（字号/透明度/圆角/配色）跟随主题（theme.views.status）；此处为行为与位置。
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct StatusTipConfig {
-    /// 相对默认位置（光标下方居中）的水平偏移（像素，正=右）。
-    #[serde(default)]
-    pub offset_x: i32,
-    /// 相对默认位置的垂直偏移（像素，正=下）。
-    #[serde(default)]
-    pub offset_y: i32,
+pub struct StatusIndicatorConfig {
+    /// 是否启用状态提示气泡（false=完全不显示）。
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    /// 自动隐藏时长（毫秒）；display_mode="persistent" 时忽略（常驻不隐藏）。
+    #[serde(default = "default_status_duration")]
+    pub duration: i32,
+    /// 显示模式："temp"（临时,duration 后隐藏,默认）| "persistent"（常驻直到下次状态变化）。
+    #[serde(default = "default_status_display_mode")]
+    pub display_mode: String,
     /// 方案名显示样式："full"（全名，默认）| "short"（图标短称 icon_label，回退全名）。
-    /// 对齐 Go ui.status_indicator.schema_name_style。
     #[serde(default = "default_schema_name_style")]
     pub schema_name_style: String,
+    /// 中英模式变化时显示提示。
+    #[serde(default = "default_true")]
+    pub show_mode: bool,
+    /// 标点中英变化时显示提示。
+    #[serde(default = "default_true")]
+    pub show_punct: bool,
+    /// 全半角变化时显示提示。
+    #[serde(default)]
+    pub show_full_width: bool,
+    /// 位置模式："follow_caret"（跟随光标,默认）| "fixed"（固定屏幕坐标 custom_x/custom_y）。
+    #[serde(default = "default_status_position_mode")]
+    pub position_mode: String,
+    /// follow_caret 下相对默认位置（光标下方居中）的水平偏移（像素，正=右）。
+    #[serde(default)]
+    pub offset_x: i32,
+    /// follow_caret 下相对默认位置的垂直偏移（像素，正=下）。
+    #[serde(default)]
+    pub offset_y: i32,
+    /// fixed 模式的固定屏幕 X（像素）。
+    #[serde(default)]
+    pub custom_x: i32,
+    /// fixed 模式的固定屏幕 Y（像素）。
+    #[serde(default)]
+    pub custom_y: i32,
 }
 
 fn default_schema_name_style() -> String {
     "full".to_string()
 }
+fn default_status_duration() -> i32 {
+    800
+}
+fn default_status_display_mode() -> String {
+    "temp".to_string()
+}
+fn default_status_position_mode() -> String {
+    "follow_caret".to_string()
+}
 
-impl Default for StatusTipConfig {
+impl Default for StatusIndicatorConfig {
     fn default() -> Self {
         Self {
+            enabled: true,
+            duration: default_status_duration(),
+            display_mode: default_status_display_mode(),
+            schema_name_style: default_schema_name_style(),
+            show_mode: true,
+            show_punct: true,
+            show_full_width: false,
+            position_mode: default_status_position_mode(),
             offset_x: 0,
             offset_y: 0,
-            schema_name_style: default_schema_name_style(),
+            custom_x: 0,
+            custom_y: 0,
         }
     }
 }
@@ -973,10 +1017,26 @@ impl Default for QuickInputConfig {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CmdbarConfig {
     #[serde(default)]
     pub enabled: bool,
+    /// 副作用命令候选（含 ActionEffect）在候选框渲染时的前缀标注（对齐 Go,默认 "⚡"）。
+    #[serde(default = "default_candidate_prefix")]
+    pub candidate_prefix: String,
+}
+
+fn default_candidate_prefix() -> String {
+    "⚡".to_string()
+}
+
+impl Default for CmdbarConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            candidate_prefix: default_candidate_prefix(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]

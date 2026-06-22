@@ -1226,6 +1226,8 @@ impl Coordinator {
         let rt = self.rt();
         let cand_cfg = &rt.config.ui.candidate;
         let tip_cfg = &rt.config.ui.tooltip;
+        // 命令直通车候选前缀标注（features.cmdbar.candidate_prefix）：仅命令候选(is_command)显示。
+        let cmd_prefix = rt.config.features.cmdbar.candidate_prefix.as_str();
         let tip_opts = wind_reverse::TooltipOptions {
             code: tip_cfg.code.enabled,
             pinyin: tip_cfg.pinyin.enabled,
@@ -1253,8 +1255,16 @@ impl Coordinator {
                     tooltip = c.code.clone();
                 }
                 CandidateItem {
-                    // 开启简繁时显示也转繁体（内部候选仍存简体，用于词频/匹配）；按 max_chars 截断显示
-                    text: cand_cfg.truncate_display(&full),
+                    // 开启简繁时显示也转繁体（内部候选仍存简体，用于词频/匹配）；按 max_chars 截断显示。
+                    // 命令候选加前缀标注（截断后再加,保证前缀不被截掉）。
+                    text: {
+                        let disp = cand_cfg.truncate_display(&full);
+                        if c.is_command && !cmd_prefix.is_empty() {
+                            format!("{cmd_prefix}{disp}")
+                        } else {
+                            disp
+                        }
+                    },
                     code: c.code.clone(),
                     label: if alpha {
                         ((b'a' + i as u8) as char).to_string()
@@ -1508,18 +1518,30 @@ impl Coordinator {
 
     /// 在当前光标下方显示状态提示气泡（中英/标点/全半角/方案切换）
     pub(crate) fn show_tip(&self, text: &str) {
+        let bundle = self.rt();
+        let si = &bundle.config.ui.status_indicator;
+        // 禁用则完全不显示状态提示气泡。
+        if !si.enabled {
+            return;
+        }
         let (x, y, caret_height) = {
             let s = self.state.lock().unwrap_or_else(|e| e.into_inner());
             (s.caret_x, s.caret_y, s.caret_height)
         };
-        let st = &self.rt().config.ui.status_tip;
+        // 常驻(persistent)→ duration_ms=0(UI 不自动隐藏,直到下次状态变化覆盖);否则按 duration 自动隐藏。
+        let duration_ms = if si.display_mode.eq_ignore_ascii_case("persistent") {
+            0
+        } else {
+            si.duration.max(1) as u64
+        };
         let _ = self.ui_tx.send(UiCommand::ShowStatusTip {
             text: text.to_string(),
             x,
             y,
             caret_height,
-            offset_x: st.offset_x,
-            offset_y: st.offset_y,
+            offset_x: si.offset_x,
+            offset_y: si.offset_y,
+            duration_ms,
         });
     }
 
@@ -1545,7 +1567,7 @@ impl Coordinator {
         } else {
             let id = self.engine_mgr.active_schema_id();
             // short 样式优先图标短称(icon_label)，无则回退全名；对齐 Go schema_name_style。
-            let short = self.rt().config.ui.status_tip.schema_name_style == "short";
+            let short = self.rt().config.ui.status_indicator.schema_name_style == "short";
             let label = if short {
                 let icon = self.engine_mgr.schema_icon_label(&id);
                 if icon.is_empty() {
