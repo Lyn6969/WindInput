@@ -70,6 +70,8 @@ pub enum UiCommand {
     SetPreeditEmbedded(bool),
     /// 候选字号覆盖（0=跟随主题）。来自 ui.candidate.font_size。
     SetCandidateFontSize(f32),
+    /// 候选字体族（空=默认）。来自 ui.font.family。
+    SetCandidateFontFamily(String),
     /// 悬停提示激活延迟（毫秒）。来自 ui.tooltip.delay。
     SetTooltipDelay(i32),
     /// 候选窗在光标上方时反转候选顺序。来自 ui.candidate.flip_when_above。
@@ -563,6 +565,9 @@ impl UiManager {
                     }
                     UiCommand::SetCandidateFontSize(size) => {
                         candidate_window.set_font_size_override(size);
+                    }
+                    UiCommand::SetCandidateFontFamily(family) => {
+                        candidate_window.set_font_family(&family);
                     }
                     UiCommand::SetTooltipDelay(delay) => {
                         candidate_window.set_tooltip_delay(delay);

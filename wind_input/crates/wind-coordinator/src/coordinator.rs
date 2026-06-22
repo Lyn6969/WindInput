@@ -539,6 +539,9 @@ impl Coordinator {
                 ));
             }
         }
+        // 统一应用外观项（幂等）：补齐上面手动块未含的候选字体族 / 翻页栏 / 页码 / 字号跟随主题，
+        // 使首次启动即按 config 应用（与 reload_user_config 同一路径）。
+        coordinator.apply_ui_config();
         coordinator
     }
 
@@ -880,6 +883,10 @@ impl Coordinator {
             cand.font_size
         };
         let _ = self.ui_tx.send(UiCommand::SetCandidateFontSize(font_size));
+        // 候选字体族（ui.font.family；空=默认）。
+        let _ = self.ui_tx.send(UiCommand::SetCandidateFontFamily(
+            bundle.config.ui.font.family.clone(),
+        ));
         // 翻页栏 / 页码显示覆盖（ui.candidate.pager_bar_display / page_number_display）
         let _ = self
             .ui_tx

@@ -151,6 +151,15 @@ mod imp {
             self.font_size = size;
         }
 
+        /// 切换字体族（ui.font.family 变更时调用）。清空按字号缓存的 TextFormat，使新字体生效。
+        pub fn set_font_family(&mut self, font_family: &str) {
+            self.family = font_family
+                .encode_utf16()
+                .chain(std::iter::once(0))
+                .collect();
+            self.formats.borrow_mut().clear();
+        }
+
         /// 取得（或创建）给定字号的文本格式（按取整 px 缓存）。
         fn ensure_format(&self, size: f32) -> Result<IDWriteTextFormat, String> {
             let key = size.max(1.0).round() as u32;
@@ -567,6 +576,8 @@ mod imp {
         pub fn set_base_size(&mut self, size: f32) {
             self.font_size = size;
         }
+
+        pub fn set_font_family(&mut self, _font_family: &str) {}
 
         pub fn set_chaizi_font(&mut self, _path: &str) -> Result<(), String> {
             Ok(())

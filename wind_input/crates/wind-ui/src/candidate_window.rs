@@ -210,6 +210,16 @@ impl CandidateWindow {
         self.font_size_override = font_size.max(0.0);
     }
 
+    /// 设置候选字体族（来自 ui.font.family；空=默认 Microsoft YaHei UI）。
+    pub fn set_font_family(&mut self, family: &str) {
+        let f = if family.trim().is_empty() {
+            "Microsoft YaHei UI"
+        } else {
+            family
+        };
+        self.text_renderer.set_font_family(f);
+    }
+
     /// 设置"上方时反转候选顺序"。来自 ui.candidate.flip_when_above。
     pub fn set_flip_when_above(&mut self, flip: bool) {
         self.flip_when_above = flip;
