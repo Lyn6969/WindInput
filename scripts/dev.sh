@@ -736,6 +736,17 @@ build_setting() {
     [ -f "$exe" ] || { err "未找到产物: $exe"; return 1; }
 }
 
+
+# (扫描旁置的 wind_input_debug.exe)。故 release/debug 两种 profile 产出同一份 exe，
+# 同时拷到 build/ 与 build_debug/，变体在目标机由布局决定。
+    local profile="${1:-release}" outdir="${2:-$(out_for "$1")}"
+    mkdir -p "$outdir"
+    (
+        cd "$PORTABLE_DIR" || exit 1
+        cargo_xwin build --release --target "$TARGET" || exit 1
+    [ -f "$exe" ] || { err "未找到产物: $exe"; return 1; }
+}
+
 show_menu() {
     clear 2>/dev/null || true
     printf '%b============================================%b\n' "$C_CYAN" "$C_RESET"
