@@ -1415,4 +1415,97 @@ mod tests {
         let _ = std::fs::remove_dir_all(&base_dir);
         let _ = std::fs::remove_dir_all(&ov_dir);
     }
+
+    /// Task 4.3：验证 shuangpin 方案在 EngineManager 层 available 过滤中真正被放行。
+    ///
+    /// 测试设计：
+    /// - 用 temp 数据目录，写三个最小 schema TOML：
+    ///   * "dummy_ct"：codetable 类型，作为 active（ensure_loaded 无词库会 warn 但不 panic）
+    ///   * "sp_test"：pinyin + scheme="shuangpin" → is_supported()=true，应留在 available
+    ///   * "sp_unsupported"：pinyin + scheme="ziranma_xxx" → is_supported()=false，应被过滤
+    /// - 不触发词库加载（shuangpin 不是 active，schema_supported 只做 TOML 解析）
+    /// - Linux 无词库环境可跑。
+    #[test]
+    fn shuangpin_available_not_filtered_out() {
+        use std::io::Write;
+
+        // 建 temp 数据目录
+        let base_dir = std::env::temp_dir().join("wind_eng_sp_available_test");
+        let schemas = base_dir.join("schemas");
+        std::fs::create_dir_all(&schemas).unwrap();
+
+        // active schema：最小 codetable，无词库（ensure_loaded 失败 = warn，manager 仍构造成功）
+        {
+            let mut f = std::fs::File::create(schemas.join("dummy_ct.schema.toml")).unwrap();
+            write!(
+                f,
+                "[schema]\nid = \"dummy_ct\"\n[engine]\ntype = \"codetable\"\n"
+            )
+            .unwrap();
+        }
+
+        // shuangpin schema：engine.type="pinyin" + scheme="shuangpin" → is_supported()=true
+        {
+            let mut f = std::fs::File::create(schemas.join("sp_test.schema.toml")).unwrap();
+            write!(
+                f,
+                "[schema]\nid = \"sp_test\"\n[engine]\ntype = \"pinyin\"\n[engine.pinyin]\nscheme = \"shuangpin\"\n"
+            )
+            .unwrap();
+        }
+
+        // 不支持的双拼变体：engine.type="pinyin" + scheme="ziranma_xxx" → is_supported()=false
+        {
+            let mut f =
+                std::fs::File::create(schemas.join("sp_unsupported.schema.toml")).unwrap();
+            write!(
+                f,
+                "[schema]\nid = \"sp_unsupported\"\n[engine]\ntype = \"pinyin\"\n[engine.pinyin]\nscheme = \"ziranma_xxx\"\n"
+            )
+            .unwrap();
+        }
+
+        // 构造 config：active = dummy_ct（首个 available 即为 active）
+        let mut cfg = Config::default();
+        cfg.schema.active = "dummy_ct".into();
+        cfg.schema.available = vec![
+            "dummy_ct".into(),
+            "sp_test".into(),
+            "sp_unsupported".into(),
+        ];
+
+        let ov_dir = std::env::temp_dir().join("wind_eng_sp_available_ov");
+        let _ = std::fs::remove_dir_all(&ov_dir);
+
+        let mgr = EngineManager::with_store_override(
+            &cfg,
+            Some(&base_dir),
+            None,
+            Some(ov_dir.clone()),
+        );
+
+        let available = mgr.available_schemas();
+
+        // shuangpin 方案应通过过滤，进入 available 列表
+        assert!(
+            available.contains(&"sp_test".to_string()),
+            "shuangpin schema 应在 available 中，实际 available={available:?}"
+        );
+
+        // 不支持的 scheme 应被过滤掉（过滤仍有效）
+        assert!(
+            !available.contains(&"sp_unsupported".to_string()),
+            "ziranma_xxx schema 应被过滤，实际 available={available:?}"
+        );
+
+        // active 方案始终保留（不论 schema_supported 结果如何）
+        assert!(
+            available.contains(&"dummy_ct".to_string()),
+            "active schema 应始终保留，实际 available={available:?}"
+        );
+
+        // 清理
+        let _ = std::fs::remove_dir_all(&base_dir);
+        let _ = std::fs::remove_dir_all(&ov_dir);
+    }
 }
