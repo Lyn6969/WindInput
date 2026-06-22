@@ -483,6 +483,60 @@ a = ["a", "ai", "an", "ang", "ao"]
         assert_eq!(lay.finals_of(b';'), &["ing".to_string()]);
     }
 
+    // --- 边界测试 6.1-1：from_toml 不存在的路径 → Err，不 panic ---
+    #[test]
+    fn from_toml_nonexistent_path_returns_err() {
+        let p = std::path::Path::new("/nonexistent/path/does_not_exist.toml");
+        let result = Layout::from_toml(p);
+        assert!(result.is_err(), "不存在的文件应返回 Err，而非 panic");
+    }
+
+    // --- 边界测试 6.1-2a：from_str 缺少 [meta] → Err ---
+    #[test]
+    fn from_str_missing_meta_returns_err() {
+        let bad = r#"
+[finals]
+k = ["ao"]
+"#;
+        let result = Layout::from_str(bad);
+        assert!(result.is_err(), "缺 [meta] 的 toml 应返回 Err");
+    }
+
+    // --- 边界测试 6.1-2b：from_str meta 缺少 id 字段 → Err ---
+    #[test]
+    fn from_str_meta_missing_id_returns_err() {
+        let bad = r#"
+[meta]
+name = "无 id 方案"
+[finals]
+k = ["ao"]
+"#;
+        let result = Layout::from_str(bad);
+        assert!(result.is_err(), "meta 缺 id 字段应返回 Err");
+    }
+
+    // --- 边界测试 6.1-3：from_str 多字符键名 → key_byte 校验返回 Err ---
+    #[test]
+    fn from_str_multichar_key_returns_err() {
+        // initials 里使用 2 字符键名 "zh"（而非单字符），应被 key_byte 拒绝
+        let bad = r#"
+[meta]
+id = "bad"
+name = "bad"
+[initials]
+zh = "x"
+[finals]
+k = ["ao"]
+"#;
+        let result = Layout::from_str(bad);
+        assert!(result.is_err(), "多字符键名应被 key_byte 校验拒绝");
+        let err_msg = format!("{}", result.unwrap_err());
+        assert!(
+            err_msg.contains("单字符") || err_msg.contains("zh"),
+            "错误信息应提及多字符键: {err_msg}"
+        );
+    }
+
     #[test]
     fn builtin_layouts_load() {
         let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -788,5 +842,27 @@ mod converter_tests {
         let c = conv("xiaohe");
         let results = c.convert_pair(b's', b'l');
         assert!(results.is_empty(), "fuzzy 关时 s+l 应为空: {results:?}");
+    }
+
+    // --- 边界测试 6.1-4：符号键 `;` e2e 转换（mspy 布局，;=ing）---
+    // mspy 布局中 `;` 映射 ing，输入 "n;" 应转换为 "ning"（n 声母 + ; 韵母 ing）。
+    // 真值依据：mspy.toml 显式声明 ";" = ["ing"]，ning 为合法拼音音节；
+    //   与 Go converter 行为对齐（finals 路径：initial_of('n')="n" + finals_of(';')=["ing"] → "ning"）。
+    #[test]
+    fn mspy_semicolon_final_e2e() {
+        let c = conv("mspy");
+        // 单音节：n + ; → ning
+        let r = c.convert("n;");
+        assert_eq!(r.full_pinyin(), "ning", "mspy: n; 应转换为 ning");
+        assert_eq!(r.syllables.len(), 1, "应有 1 个音节");
+        assert_eq!(r.syllables[0].pinyin, "ning");
+        assert_eq!((r.syllables[0].sp_start, r.syllables[0].sp_end), (0, 2));
+
+        // 多音节：n; + ni → ning + ni（第二对是普通双拼）
+        let r2 = c.convert("n;ni");
+        assert_eq!(r2.full_pinyin(), "ningni", "mspy: n;ni 应转换为 ningni");
+        assert_eq!(r2.syllables.len(), 2);
+        assert_eq!(r2.syllables[0].pinyin, "ning");
+        assert_eq!(r2.syllables[1].pinyin, "ni");
     }
 }
