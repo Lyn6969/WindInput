@@ -80,6 +80,34 @@ fn test_wubi_extra_dict_loaded() {
     );
 }
 
+/// 后台预热 + single-flight 构建锁：并发预热同一方案不重复构建/不死锁，最终就绪。
+#[test]
+fn test_prewarm_single_flight() {
+    let dir = data_dir();
+    if !schema_exists(&dir, "wubi86") || !schema_exists(&dir, "pinyin") {
+        eprintln!("跳过：需要 wubi86 + pinyin schema");
+        return;
+    }
+    let cfg = make_config(&["wubi86", "pinyin"]); // active=wubi86
+    let mgr = std::sync::Arc::new(EngineManager::new(&cfg, Some(&dir)));
+
+    assert!(mgr.is_loaded("wubi86"), "活跃方案应已同步加载");
+    assert!(!mgr.is_loaded("pinyin"), "非活跃方案初始未加载");
+
+    // 4 线程并发预热同一方案：single-flight 应只构建一次、不死锁、全部成功返回。
+    let handles: Vec<_> = (0..4)
+        .map(|_| {
+            let m = std::sync::Arc::clone(&mgr);
+            std::thread::spawn(move || m.prewarm_schema("pinyin"))
+        })
+        .collect();
+    let oks: Vec<bool> = handles.into_iter().map(|h| h.join().unwrap()).collect();
+
+    assert!(oks.iter().all(|&b| b), "并发预热应全部成功: {oks:?}");
+    assert!(mgr.is_loaded("pinyin"), "预热后 pinyin 应已加载");
+    assert!(!mgr.is_building("pinyin"), "加载完成后不应再报构建中");
+}
+
 /// 扩展词库 **live 热插拔**：对已加载引擎翻 enabled 标志即时改候选，无需重建。
 #[test]
 fn test_codetable_extra_hot_toggle() {

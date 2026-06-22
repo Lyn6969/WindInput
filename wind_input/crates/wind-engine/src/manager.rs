@@ -82,6 +82,9 @@ pub struct EngineManager {
     /// 主码表反查索引缓存:(主码表 id, 汉字/词 → 实际编码)。供拼音方案编码提示按词查实际码。
     /// 懒建(首次需要时按主码表全量构建),主码表 id 变化时重建,invalidate/reload 时清空。
     reverse_index: Mutex<Option<(String, Arc<HashMap<String, String>>)>>,
+    /// 每方案构建锁（single-flight）：同一方案的引擎/缓存构建串行，避免后台预热与首次
+    /// 切换并发时重复构建同一份大缓存；不同方案可并行构建（缓存在各自子目录，互不冲突）。
+    build_locks: Mutex<HashMap<String, Arc<Mutex<()>>>>,
 }
 
 /// 进程级缓存根目录（%LOCALAPPDATA%\WindInput\cache），EngineManager::new 设置一次。
@@ -193,8 +196,10 @@ impl EngineManager {
             code_hint_cache: Mutex::new((String::new(), false)),
             primary_codetable: Mutex::new(primary_codetable),
             reverse_index: Mutex::new(None),
+            build_locks: Mutex::new(HashMap::new()),
         };
-        // 仅构建活跃方案（其余懒加载）
+        // 仅同步构建活跃方案；其余方案由 Coordinator 启动后台预热（prewarm_schema）提前构建，
+        // 避免首次切换时同步重熔大词库卡顿。单飞构建锁保证预热与切换不重复构建。
         mgr.ensure_loaded(&active_id);
         mgr
     }
@@ -317,13 +322,47 @@ impl EngineManager {
     }
 
     /// 确保指定方案引擎已加载；返回是否可用
-    fn ensure_loaded(&self, schema_id: &str) -> bool {
-        if self
-            .engines
+    /// 某方案引擎是否已加载（已就绪，切换即时无构建）。
+    pub fn is_loaded(&self, schema_id: &str) -> bool {
+        self.engines
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .contains_key(schema_id)
-        {
+    }
+
+    /// 某方案是否正在后台构建（未加载且构建锁被占）。供 UI 显示「准备中」用。
+    pub fn is_building(&self, schema_id: &str) -> bool {
+        if self.is_loaded(schema_id) {
+            return false;
+        }
+        let lock = self
+            .build_locks
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(schema_id)
+            .cloned();
+        // 锁存在且被占 = 有线程正在构建该方案。
+        matches!(lock, Some(l) if l.try_lock().is_err())
+    }
+
+    /// 后台预热：构建某方案的引擎与缓存（阻塞，供后台线程调用）。返回是否成功。
+    /// 与首次切换共享 single-flight 构建锁，竞争时只构建一次。
+    pub fn prewarm_schema(&self, schema_id: &str) -> bool {
+        self.ensure_loaded(schema_id)
+    }
+
+    fn ensure_loaded(&self, schema_id: &str) -> bool {
+        if self.is_loaded(schema_id) {
+            return true;
+        }
+        // single-flight：取该方案的专用构建锁（不同方案各自一把，可并行构建）。
+        let build_lock = {
+            let mut locks = self.build_locks.lock().unwrap_or_else(|e| e.into_inner());
+            locks.entry(schema_id.to_string()).or_default().clone()
+        };
+        let _build_guard = build_lock.lock().unwrap_or_else(|e| e.into_inner());
+        // 抢到锁后复查：等待期间可能已被另一线程（预热/切换）构建完成。
+        if self.is_loaded(schema_id) {
             return true;
         }
         let commit = self
