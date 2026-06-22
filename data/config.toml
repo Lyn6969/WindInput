@@ -207,3 +207,12 @@ host_render_processes = ["SearchHost.exe"]
 [debug]
 log_level = "info"
 perf_sampling = false
+
+# 全局拼音配置：所有拼音类方案（全拼/双拼/混输拼音子方案/临时拼音反查）共用一份。
+[pinyin]
+show_code_hint = true
+use_smart_compose = true
+candidate_order = "smart"
+
+[pinyin.fuzzy]
+enabled = false
