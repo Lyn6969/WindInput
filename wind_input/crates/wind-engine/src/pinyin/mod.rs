@@ -29,6 +29,7 @@ use generate::CharPinyinIndex;
 use lattice::LatticeBuilder;
 use lm::UnigramLookup;
 use scorer::AbbrevMatcher;
+use shuangpin::ShuangpinConverter;
 use std::sync::{Arc, OnceLock};
 use syllable::SyllableTrie;
 use viterbi::{ViterbiDecoder, WordNode};
@@ -65,6 +66,8 @@ pub struct PinyinEngine {
     store_layers: Option<Arc<DictManager>>,
     /// 造词反推用的单字读音索引（懒构建：首次 generate_word_pinyin 时从词典派生）。
     char_pinyin_idx: OnceLock<CharPinyinIndex>,
+    /// 双拼转换器（None 表示全拼模式，输入原样传递）。
+    shuangpin: Option<ShuangpinConverter>,
 }
 
 impl PinyinEngine {
@@ -87,6 +90,7 @@ impl PinyinEngine {
             unigram,
             store_layers: None,
             char_pinyin_idx: OnceLock::new(),
+            shuangpin: None,
         }
     }
 
@@ -102,6 +106,24 @@ impl PinyinEngine {
         self
     }
 
+    /// 注入双拼转换器（链式 builder）。注入后 convert/compute_composition 均先把输入转为全拼。
+    pub fn with_shuangpin(mut self, conv: ShuangpinConverter) -> Self {
+        self.shuangpin = Some(conv);
+        self
+    }
+
+    /// 把外部输入（可能是双拼键序列）规整为全拼串。
+    /// 无双拼方案（None）时原样返回；转换结果为空串时也回退原 input。
+    fn to_full_pinyin(&self, input: &str) -> String {
+        match &self.shuangpin {
+            Some(conv) => {
+                let s = conv.convert(input).full_pinyin;
+                if s.is_empty() { input.to_string() } else { s }
+            }
+            None => input.to_string(),
+        }
+    }
+
     /// 仅测试用：读取 fuzzy_config.zh_z 以验证 with_fuzzy 注入是否生效。
     #[cfg(test)]
     pub fn fuzzy_zh_z(&self) -> bool {
@@ -115,6 +137,8 @@ impl PinyinEngine {
 
     /// 计算 preedit 显示与音节信息
     fn compute_composition(&self, input: &str) -> (String, Vec<String>, String) {
+        let full = self.to_full_pinyin(input);
+        let input = full.as_str();
         let dag = Dag::build(input, &self.trie);
         let syllables = dag.maximum_match();
         let consumed: usize = syllables.iter().map(|s| s.len()).sum();
@@ -143,6 +167,9 @@ impl Engine for PinyinEngine {
         if input.is_empty() {
             return Ok(ConvertResult::default());
         }
+
+        let full = self.to_full_pinyin(input);
+        let input = full.as_str();
 
         let dict = &self.dict;
         let trie = &self.trie;
@@ -350,6 +377,7 @@ impl Engine for PinyinEngine {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::pinyin::shuangpin::{Layout, ShuangpinConverter};
     use wind_dict::codetable::CodetableDict;
     use wind_store::Store;
 
@@ -440,5 +468,30 @@ mod tests {
         fz.zh_z = true;
         let eng = PinyinEngine::new(Config::default(), dict).with_fuzzy(fz);
         assert!(eng.fuzzy_zh_z(), "with_fuzzy 注入的 zh_z=true 应被引擎持有");
+    }
+
+    /// Task 4.1 TDD Step 1：双拼端到端——装配小鹤双拼 converter 后，
+    /// 输入双拼键 "ni" 应返回含「你」的候选。
+    #[test]
+    fn pinyin_engine_shuangpin_input() {
+        // 构造含 "ni"->"你" 的最小词典
+        let mut raw = CodetableDict::empty();
+        raw.merge_single("ni".to_string(), "你".to_string(), 100, 0);
+        let dict = CachedDict::Memory(raw);
+
+        // 小鹤双拼：ni → ni（声母 n + 韵母 i=i，即全拼 "ni"，保持不变）
+        let schema_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../../data/schemas/shuangpin");
+        let layout = Layout::from_toml(&schema_dir.join("xiaohe.toml"))
+            .expect("加载小鹤布局失败");
+        let conv = ShuangpinConverter::new(layout);
+
+        let eng = PinyinEngine::new(Config::default(), dict).with_shuangpin(conv);
+        let r = eng.convert("ni", 10).unwrap();
+        assert!(
+            r.candidates.iter().any(|c| c.text == "你"),
+            "双拼输入 \"ni\" 经转换后应返回含「你」的候选，实际候选: {:?}",
+            r.candidates.iter().map(|c| &c.text).collect::<Vec<_>>()
+        );
     }
 }
