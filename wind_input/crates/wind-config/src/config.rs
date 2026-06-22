@@ -582,6 +582,9 @@ pub struct UiCandidateConfig {
     /// 候选每页显示数（默认 7，对齐 Go 版本）
     #[serde(default = "default_per_page")]
     pub per_page: usize,
+    /// 扩展档每页候选数（临拼/快捷/短语等 overlay 模式用，0=与 per_page 相同）。
+    #[serde(default)]
+    pub per_page_extended: usize,
     #[serde(default)]
     pub layout: String,
     /// 编码（组合区）显示方式。单一权威配置，取代旧的 inline_preedit + preedit_mode 组合。
@@ -595,6 +598,15 @@ pub struct UiCandidateConfig {
     /// 候选文本字号（0=跟随主题 behavior.font_size）。
     #[serde(default)]
     pub font_size: f32,
+    /// 字号跟随主题：true 时忽略 font_size，用主题 behavior.font_size。
+    #[serde(default)]
+    pub font_size_follow_theme: bool,
+    /// 翻页栏显示覆盖："" 跟随主题 / "hide" / "auto"(>1页) / "always"。
+    #[serde(default)]
+    pub pager_bar_display: String,
+    /// 页码文字显示覆盖："" 跟随主题 / "show" / "hide"。
+    #[serde(default)]
+    pub page_number_display: String,
     /// 候选文本最大显示字数，超出截断（0=不限）。
     #[serde(default)]
     pub max_chars: usize,
@@ -673,10 +685,14 @@ impl Default for UiCandidateConfig {
     fn default() -> Self {
         Self {
             per_page: default_per_page(),
+            per_page_extended: 0,
             layout: String::new(),
             preedit_display: default_preedit_display(),
             hide_window: false,
             font_size: 0.0,
+            font_size_follow_theme: false,
+            pager_bar_display: String::new(),
+            page_number_display: String::new(),
             max_chars: 0,
             index_labels: String::new(),
             flip_when_above: false,

@@ -140,6 +140,10 @@ pub struct CandidateWindow {
     flip_when_above: bool,
     /// 当前锚点是否落在光标上方（定位时计算，随锚点锁定保持）。供 flip 判定。
     placed_above: bool,
+    /// 翻页栏显示覆盖（""跟随主题/"hide"/"auto"/"always"）。来自 ui.candidate.pager_bar_display。
+    pager_display: String,
+    /// 页码文字显示覆盖（""跟随主题/"show"/"hide"）。来自 ui.candidate.page_number_display。
+    page_number_display: String,
 }
 
 impl CandidateWindow {
@@ -185,6 +189,8 @@ impl CandidateWindow {
             font_size_override: 0.0,
             flip_when_above: false,
             placed_above: false,
+            pager_display: String::new(),
+            page_number_display: String::new(),
         })
     }
 
@@ -207,6 +213,45 @@ impl CandidateWindow {
     /// 设置"上方时反转候选顺序"。来自 ui.candidate.flip_when_above。
     pub fn set_flip_when_above(&mut self, flip: bool) {
         self.flip_when_above = flip;
+    }
+
+    /// 设置翻页栏显示覆盖。来自 ui.candidate.pager_bar_display。
+    pub fn set_pager_display(&mut self, mode: String) {
+        self.pager_display = mode;
+    }
+
+    /// 设置页码文字显示覆盖。来自 ui.candidate.page_number_display。
+    pub fn set_page_number_display(&mut self, mode: String) {
+        self.page_number_display = mode;
+    }
+
+    /// 是否显示翻页栏（覆盖优先；""跟随主题 behavior）。
+    fn pager_visible(&self) -> bool {
+        match self.pager_display.as_str() {
+            "hide" => false,
+            "always" => true,
+            "auto" => self.total_pages > 1,
+            _ => {
+                // 跟随主题：hide_pager 隐藏；always_show_pager 总显示；否则 >1 页显示。
+                let b = &self.theme.behavior;
+                if b.hide_pager {
+                    false
+                } else if b.always_show_pager {
+                    true
+                } else {
+                    self.total_pages > 1
+                }
+            }
+        }
+    }
+
+    /// 翻页栏可见时是否显示页码文字（覆盖优先；""跟随主题 behavior.show_page_number）。
+    fn page_number_visible(&self) -> bool {
+        match self.page_number_display.as_str() {
+            "show" => true,
+            "hide" => false,
+            _ => self.theme.behavior.show_page_number,
+        }
     }
 
     /// 设置悬停提示激活延迟（毫秒）。来自 ui.tooltip.delay。
@@ -829,7 +874,7 @@ impl CandidateWindow {
         }
 
         // 翻页器（多页时）：‹ p/t › —— 箭头可点击翻页，带悬停高亮 + 禁用态
-        let pager = if self.total_pages > 1 {
+        let pager = if self.pager_visible() {
             let disabled = t.color("text_hint", [180, 180, 185, 255]);
             let marker_c = t.color("text_dim", [140, 140, 145, 255]);
             let accent = col(v.accent_bar.bg_color, [66, 133, 244, 255]);
@@ -886,8 +931,15 @@ impl CandidateWindow {
                         self.hover == TAG_PAGE_PREV,
                     ))
                     .child(
-                        View::leaf(format!("{}/{}", self.page, self.total_pages), marker_c)
-                            .font_size(footer_fs),
+                        View::leaf(
+                            if self.page_number_visible() {
+                                format!("{}/{}", self.page, self.total_pages)
+                            } else {
+                                String::new()
+                            },
+                            marker_c,
+                        )
+                        .font_size(footer_fs),
                     )
                     .child(arrow(
                         next_icon,

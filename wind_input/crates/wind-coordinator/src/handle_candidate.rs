@@ -356,7 +356,7 @@ impl Coordinator {
 
     /// 当前页候选切片的 [start, end) 区间
     pub(crate) fn page_range(&self, state: &State) -> (usize, usize) {
-        let pp = self.per_page();
+        let pp = self.per_page(state.active);
         let start = state.current_page * pp;
         let end = (start + pp).min(state.candidates.len());
         (start, end)

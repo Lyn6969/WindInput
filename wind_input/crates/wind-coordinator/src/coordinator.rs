@@ -873,10 +873,20 @@ impl Coordinator {
         if hidden {
             let _ = self.ui_tx.send(UiCommand::HideCandidates);
         }
-        // 候选字号覆盖（ui.candidate.font_size，0=跟随主题）
+        // 候选字号覆盖（ui.candidate.font_size，0=跟随主题）；font_size_follow_theme=true 时强制跟随。
+        let font_size = if cand.font_size_follow_theme {
+            0.0
+        } else {
+            cand.font_size
+        };
+        let _ = self.ui_tx.send(UiCommand::SetCandidateFontSize(font_size));
+        // 翻页栏 / 页码显示覆盖（ui.candidate.pager_bar_display / page_number_display）
         let _ = self
             .ui_tx
-            .send(UiCommand::SetCandidateFontSize(cand.font_size));
+            .send(UiCommand::SetPagerDisplay(cand.pager_bar_display.clone()));
+        let _ = self.ui_tx.send(UiCommand::SetPageNumberDisplay(
+            cand.page_number_display.clone(),
+        ));
         // 上方时反转候选顺序（ui.candidate.flip_when_above）
         let _ = self
             .ui_tx
@@ -935,13 +945,20 @@ impl Coordinator {
     }
 
     /// 每页候选数（来自配置，至少 1）
-    pub(crate) fn per_page(&self) -> usize {
-        self.rt().config.ui.candidate.per_page.max(1)
+    pub(crate) fn per_page(&self, active: Option<ModeKind>) -> usize {
+        let bundle = self.rt();
+        let cand = &bundle.config.ui.candidate;
+        // overlay 模式(临拼/快捷/短语/临英等,state.active 非空)用扩展档(配置>0 时)。
+        if active.is_some() && cand.per_page_extended > 0 {
+            cand.per_page_extended.max(1)
+        } else {
+            cand.per_page.max(1)
+        }
     }
 
     /// 总页数（至少 1）
     fn total_pages(&self, state: &State) -> usize {
-        let pp = self.per_page();
+        let pp = self.per_page(state.active);
         state.candidates.len().div_ceil(pp).max(1)
     }
 

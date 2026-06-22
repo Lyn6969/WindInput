@@ -74,6 +74,10 @@ pub enum UiCommand {
     SetTooltipDelay(i32),
     /// 候选窗在光标上方时反转候选顺序。来自 ui.candidate.flip_when_above。
     SetCandidateFlipWhenAbove(bool),
+    /// 翻页栏显示覆盖（""跟随主题/"hide"/"auto"/"always"）。来自 ui.candidate.pager_bar_display。
+    SetPagerDisplay(String),
+    /// 页码文字显示覆盖（""跟随主题/"show"/"hide"）。来自 ui.candidate.page_number_display。
+    SetPageNumberDisplay(String),
     /// 拆字字根字体路径（PUA 字根字符渲染）。空=不设。
     SetTooltipChaiziFont(String),
     /// 显示菜单（候选右键菜单 / 功能主菜单；UI 自管导航与子菜单）
@@ -565,6 +569,12 @@ impl UiManager {
                     }
                     UiCommand::SetCandidateFlipWhenAbove(flip) => {
                         candidate_window.set_flip_when_above(flip);
+                    }
+                    UiCommand::SetPagerDisplay(mode) => {
+                        candidate_window.set_pager_display(mode);
+                    }
+                    UiCommand::SetPageNumberDisplay(mode) => {
+                        candidate_window.set_page_number_display(mode);
                     }
                     UiCommand::SetTooltipChaiziFont(path) => {
                         candidate_window.set_tooltip_chaizi_font(&path);
