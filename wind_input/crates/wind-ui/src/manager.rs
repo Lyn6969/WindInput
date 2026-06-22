@@ -104,6 +104,8 @@ pub enum UiCommand {
     CopyToClipboard(String),
     /// 用资源管理器打开路径（菜单"打开配置目录"）
     OpenPath(String),
+    /// 启动应用程序并传参（如 wind_setting.exe `--page dictionary`）。
+    OpenApp { path: String, args: String },
     /// 关闭 UI
     Shutdown,
 }
@@ -519,6 +521,9 @@ impl UiManager {
                     UiCommand::OpenPath(path) => {
                         open_path(&path);
                     }
+                    UiCommand::OpenApp { path, args } => {
+                        open_app(&path, &args);
+                    }
                     UiCommand::ShowStatusTip {
                         text,
                         x,
@@ -691,3 +696,33 @@ fn open_path(path: &str) {
 
 #[cfg(not(windows))]
 fn open_path(_path: &str) {}
+
+/// 启动可执行程序并传参（ShellExecute open + params）；args 为空时等价 open_path。
+#[cfg(windows)]
+fn open_app(path: &str, args: &str) {
+    use windows::Win32::Foundation::HWND;
+    use windows::Win32::UI::Shell::ShellExecuteW;
+    use windows::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
+    use windows::core::PCWSTR;
+    let verb: Vec<u16> = "open\0".encode_utf16().collect();
+    let file: Vec<u16> = path.encode_utf16().chain(std::iter::once(0)).collect();
+    let params: Vec<u16> = args.encode_utf16().chain(std::iter::once(0)).collect();
+    let params_ptr = if args.is_empty() {
+        PCWSTR::null()
+    } else {
+        PCWSTR(params.as_ptr())
+    };
+    unsafe {
+        ShellExecuteW(
+            HWND::default(),
+            PCWSTR(verb.as_ptr()),
+            PCWSTR(file.as_ptr()),
+            params_ptr,
+            PCWSTR::null(),
+            SW_SHOWNORMAL,
+        );
+    }
+}
+
+#[cfg(not(windows))]
+fn open_app(_path: &str, _args: &str) {}

@@ -58,24 +58,35 @@ impl Coordinator {
                 self.reload_user_config();
             }
             MenuCmd::RestartService => self.restart_service(),
-            MenuCmd::OpenSettings => {
-                // 优先启动同目录的 wind_setting 桌面应用（ShellExecute open exe 即运行）；
-                // 找不到再回退到内嵌 web 配置（签发 token 构造 URL，交默认浏览器）。
-                if let Some(app) = crate::coordinator::settings_app_path() {
-                    let _ = self.ui_tx.send(UiCommand::OpenPath(app));
-                } else if let Some(url) = crate::coordinator::settings_url() {
-                    let _ = self.ui_tx.send(UiCommand::OpenPath(url));
-                } else {
-                    tracing::warn!("打开设置失败：未找到 wind_setting 程序，web 服务也未就绪");
-                }
-            }
-            MenuCmd::OpenConfigDir | MenuCmd::OpenDictionary | MenuCmd::OpenAbout => {
+            MenuCmd::OpenSettings => self.open_settings(None),
+            MenuCmd::OpenDictionary => self.open_settings(Some("dictionary")),
+            MenuCmd::OpenAbout => self.open_settings(Some("about")),
+            MenuCmd::OpenConfigDir => {
                 if let Some(d) = Config::user_config_dir() {
                     let _ = self
                         .ui_tx
                         .send(UiCommand::OpenPath(d.display().to_string()));
                 }
             }
+        }
+    }
+
+    /// 统一的「打开设置」入口：优先启动同目录的 wind_setting 桌面应用并跳转到指定页
+    /// （`--page <name>`，name ∈ general/input/hotkey/appearance/dictionary/advanced/about/stats）；
+    /// 找不到桌面应用再回退到内嵌 web 配置（签发 token 构造 URL，page 以 `#<name>` 片段附加）。
+    /// page=None 打开默认页。设置/词库管理/关于等菜单项统一经此函数。
+    pub(crate) fn open_settings(&self, page: Option<&str>) {
+        if let Some(app) = crate::coordinator::settings_app_path() {
+            let args = page.map(|p| format!("--page {p}")).unwrap_or_default();
+            let _ = self.ui_tx.send(UiCommand::OpenApp { path: app, args });
+        } else if let Some(url) = crate::coordinator::settings_url() {
+            let url = match page {
+                Some(p) => format!("{url}#{p}"),
+                None => url,
+            };
+            let _ = self.ui_tx.send(UiCommand::OpenPath(url));
+        } else {
+            tracing::warn!("打开设置失败：未找到 wind_setting 程序，web 服务也未就绪");
         }
     }
 

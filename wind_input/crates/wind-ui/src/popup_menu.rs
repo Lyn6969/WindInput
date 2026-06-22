@@ -429,13 +429,14 @@ impl PopupMenu {
         };
         // DPI 动态化：先按显示点所在显示器取缩放，再测量/构建（几何依赖 scale）。
         self.ensure_scale(ax, ay);
-        let sel = first_selectable(&items);
-        // 先测量根面板尺寸以钳制锚点
-        let (_root, w, h, _hits) = self.build_view(&items, sel);
+        // 先测量根面板尺寸以钳制锚点（选中态不影响尺寸，传无选中即可）。
+        let (_root, w, h, _hits) = self.build_view(&items, NONE_SEL);
         self.anchor = clamp_to_work_area(ax, ay, w, h);
         {
             let mut st = self.state.borrow_mut();
-            st.levels = vec![Level::new(items, sel)];
+            // 打开时不预选首项（仿 Win32 原生菜单）：避免首项被高亮“闪一下”；
+            // 悬停或方向键导航再点亮（move_sel 从 NONE_SEL 起步落到首个可选项）。
+            st.levels = vec![Level::new(items, NONE_SEL)];
             st.dirty = false;
             st.closed = false;
         }
