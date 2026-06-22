@@ -68,10 +68,12 @@ Rust **并非完全缺失**统计，而是只迁了「极简骨架」：`wind-st
 - `record_input_stats()` 改为构造 `StatEvent`（顶层能拿到的字段：字符分类 / 小时 / 活跃时间 / schemaID / source 兜底推测），调 `collector.record()`
 - 引入 `stat_recorded` 标志位，每键开始重置（对照 Go `handle_key_event.go:71`）
 - `handle_key_event_policed` 末尾做 **fallback**（对照 Go `recordCommitFallback`）：仅当未被 Stage3 注入命中时按推测来源记录
-- `apps/service`：启动时 `new`，退出/暂停时 `flush`；Windows 热替换走 pause/resume
-- 配置接通 `features.stats.{enabled, track_english}`；评估新增 `track_punct`
-**Tests**: collector 接线后端到端单测（webdata 现有 stats 测试仍绿）；跨天/flush 不丢数据
-**Status**: Not Started
+- 采集器随 `Coordinator::build` 构造（与 store 共享 Arc）；退出 flush 靠 Drop + 后台 30s。
+  无 store.pause/resume 调用点（Rust 暂无热替换），collector.pause/resume 保留备用。
+- `record_commit(text,code_len,candidate_pos,source)` 富字段采集入口 + `stat_recorded` AtomicBool；
+  `record_input_stats` 改为顶层 fallback。track_english 仅留作 TSF 路径，普通上屏按 Go 记录全部分类。
+**Tests**: collector 接线后端到端单测（webdata stats 测试仍绿）；跨天/flush 不丢数据
+**Status**: ✅ Complete（11 测试绿；workspace 整体编译通过；commit `<stage2>`）
 
 ## Stage 3: 散布注入富字段（碰 9 个 handle 文件）⚠️ 合并主战场
 **Goal**: 在各上屏路径注入 `record_commit(text, code_len, candidate_pos, source)`，产出码长/首选率/按方案/按来源。

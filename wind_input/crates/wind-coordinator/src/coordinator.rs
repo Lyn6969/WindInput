@@ -27,6 +27,8 @@ use wind_ipc::protocol::{
     EVENT_KEY_DOWN, EVENT_KEY_UP, MOD_ALT, MOD_CTRL, MOD_SHIFT, calc_key_hash,
 };
 use wind_store::Store;
+use wind_store::stat_collector::{StatCollector, StatEvent};
+use wind_store::stats::CommitSource;
 use wind_transform::fullwidth::to_full_width;
 use wind_transform::punctuation::PunctuationConverter;
 use wind_ui::candidate_window::CandidateItem;
@@ -406,6 +408,10 @@ pub struct Coordinator {
     hide_candidate_window: Mutex<bool>,
     /// 候选布局方向运行时态（命令栏 ime.toggle("layout") 切换；true=竖排，初值随配置，持久化）。
     candidate_vertical: Mutex<bool>,
+    /// 输入统计采集器（内存聚合 + 后台 flush，与 store 共享 Arc）；None=无持久化/headless。
+    pub(crate) stat_collector: Option<StatCollector>,
+    /// 本次按键是否已被具体上屏路径记录统计（AtomicBool，避免与 state 锁冲突致死锁）。
+    pub(crate) stat_recorded: std::sync::atomic::AtomicBool,
 }
 
 /// 短语候选权重基准（高于普通候选，使短语展开排在前列）
@@ -688,6 +694,8 @@ impl Coordinator {
         // 候选窗显隐运行时初值（ui.candidate.hide_window；此前恒为 false，配置不生效）。
         let hide_candidate_window_init = config.ui.candidate.hide_window;
 
+        // 统计采集器：与 store 共享 Arc，内存聚合 + 后台定时 flush。
+        let stat_collector = store.clone().map(StatCollector::new);
         let coordinator = Arc::new(Self {
             state: Mutex::new(State {
                 chinese_mode: config.general.default_chinese_mode,
@@ -761,6 +769,8 @@ impl Coordinator {
             preedit_display: Mutex::new(preedit_display_init),
             hide_candidate_window: Mutex::new(hide_candidate_window_init),
             candidate_vertical: Mutex::new(candidate_vertical_init),
+            stat_collector,
+            stat_recorded: std::sync::atomic::AtomicBool::new(false),
         });
         // 命令栏：装配 Services（ime/config/dict 后端）+ 自身 Weak 引用。
         coordinator.init_cmdbar();
@@ -1765,7 +1775,53 @@ impl Coordinator {
 impl Coordinator {
     /// 从一次按键的最终 KeyAction 提取上屏文本，按中文/英文字符埋点到每日统计。
     /// 受 `features.stats.enabled` 控制；`track_english` 关闭时不计英文。无 store 静默跳过。
+    /// 记录一次上屏事件到统计采集器。各上屏路径在已知码长/候选位/来源时调用，
+    /// 并置位 stat_recorded，使顶层 record_input_stats 跳过兜底（避免重复计数）。
+    /// 对齐 Go `recordCommit`：track_english 仅作用于 TSF 英文路径（Rust 暂无），
+    /// 普通上屏按 4 分类记录全部字符。
+    pub(crate) fn record_commit(
+        &self,
+        text: &str,
+        code_len: u32,
+        candidate_pos: i32,
+        source: CommitSource,
+    ) {
+        if text.is_empty() {
+            return;
+        }
+        let collector = match self.stat_collector.as_ref() {
+            Some(c) => c,
+            None => return,
+        };
+        if !self.rt().config.features.stats.enabled {
+            return;
+        }
+        let (chinese, english, punct, other) = wind_store::stats::classify_chars_full(text);
+        collector.record(StatEvent {
+            timestamp: chrono::Local::now(),
+            chinese,
+            english,
+            punct,
+            other,
+            code_len,
+            candidate_pos,
+            schema_id: self.active_schema_id(),
+            source,
+        });
+        self.stat_recorded
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// 顶层兜底统计（对齐 Go `recordCommitFallback`）：若本次按键已被具体上屏路径
+    /// 记录则跳过；否则按文本推测来源（含非 ASCII→候选，纯 ASCII→标点）记录，
+    /// 码长/候选位未知置 0/-1。
     pub(crate) fn record_input_stats(&self, action: &KeyAction) {
+        if self
+            .stat_recorded
+            .load(std::sync::atomic::Ordering::Relaxed)
+        {
+            return;
+        }
         let text = match action {
             KeyAction::InsertText { text, .. } => text.as_str(),
             KeyAction::InsertTextWithCursor { text, .. } => text.as_str(),
@@ -1774,26 +1830,12 @@ impl Coordinator {
         if text.is_empty() {
             return;
         }
-        let store = match self.store.as_ref() {
-            Some(s) => s,
-            None => return,
+        let source = if text.chars().any(|ch| !ch.is_ascii()) {
+            CommitSource::Candidate
+        } else {
+            CommitSource::Punctuation
         };
-        let rt = self.rt();
-        let cfg = &rt.config.features.stats;
-        if !cfg.enabled {
-            return;
-        }
-        let (chinese, mut english) = wind_store::stats::classify_chars(text);
-        if !cfg.track_english {
-            english = 0;
-        }
-        let today = chrono::Local::now()
-            .date_naive()
-            .format("%Y-%m-%d")
-            .to_string();
-        if let Err(e) = store.record_stat(&today, chinese, english) {
-            warn!("record_stat failed: {}", e);
-        }
+        self.record_commit(text, 0, -1, source);
     }
 }
 
@@ -1861,6 +1903,10 @@ impl MessageHandler for Coordinator {
     }
 
     fn handle_key_event(&self, data: &KeyEventData) -> KeyAction {
+        // 每次按键开始重置统计标志：具体上屏路径调 record_commit 置位，
+        // 顶层 record_input_stats 仅在未置位时兜底（对齐 Go handle_key_event 开头 reset）。
+        self.stat_recorded
+            .store(false, std::sync::atomic::Ordering::Relaxed);
         debug!(
             "handle_key_event: type={} code=0x{:02X} mods=0x{:04X}",
             data.event_type, data.key_code, data.modifiers

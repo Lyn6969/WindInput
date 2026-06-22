@@ -1194,10 +1194,49 @@ mod tests {
     }
 
     #[test]
-    fn record_input_stats_counts_committed_text() {
+    fn record_input_stats_fallback_records_full_classes() {
         use wind_bridge::handler::KeyAction;
-        let c = coord("stats_record");
-        // 模拟一次上屏「你好」（中文 2 字）
+        use wind_store::stats::CommitSource;
+        let c = coord("stats_fallback");
+        // 顶层 fallback：上屏「你好abc，」→ 4 分类，含中文推测来源为候选。
+        c.record_input_stats(&KeyAction::InsertText {
+            text: "你好abc，".to_string(),
+            new_composition: None,
+            mode_changed: false,
+            chinese_mode: true,
+            has_new_composition: false,
+        });
+        let day = c.stat_collector.as_ref().unwrap().get_today_stat();
+        assert_eq!(day.chinese, 2);
+        assert_eq!(day.english, 3);
+        assert_eq!(day.punct, 1);
+        assert_eq!(day.commit_count, 1);
+        assert_eq!(day.by_source[CommitSource::Candidate.index()], 6);
+    }
+
+    #[test]
+    fn record_commit_captures_code_len_and_pos() {
+        use wind_store::stats::CommitSource;
+        let c = coord("stats_commit");
+        c.record_commit("你好", 4, 0, CommitSource::Candidate);
+        let day = c.stat_collector.as_ref().unwrap().get_today_stat();
+        assert_eq!(day.chinese, 2);
+        assert_eq!(day.code_len_sum, 4);
+        assert_eq!(day.code_len_count, 1);
+        assert_eq!(day.cand_pos_dist[0], 1);
+        assert!(
+            c.stat_recorded.load(std::sync::atomic::Ordering::Relaxed),
+            "record_commit 应置位 stat_recorded"
+        );
+    }
+
+    #[test]
+    fn record_input_stats_skips_when_already_recorded() {
+        use wind_bridge::handler::KeyAction;
+        use wind_store::stats::CommitSource;
+        let c = coord("stats_skip");
+        // 具体路径已记录 → 顶层 fallback 应跳过，不重复计数。
+        c.record_commit("你好", 4, 0, CommitSource::Candidate);
         c.record_input_stats(&KeyAction::InsertText {
             text: "你好".to_string(),
             new_composition: None,
@@ -1205,15 +1244,7 @@ mod tests {
             chinese_mode: true,
             has_new_composition: false,
         });
-        let today = today_str();
-        assert_eq!(
-            c.store
-                .as_ref()
-                .unwrap()
-                .get_daily_stat(&today)
-                .unwrap()
-                .chinese,
-            2
-        );
+        let day = c.stat_collector.as_ref().unwrap().get_today_stat();
+        assert_eq!(day.commit_count, 1, "已记录则 fallback 跳过");
     }
 }
