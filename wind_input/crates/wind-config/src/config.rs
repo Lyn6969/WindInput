@@ -66,6 +66,8 @@ pub struct Config {
     pub compat: CompatConfig,
     #[serde(default)]
     pub debug: DebugConfig,
+    #[serde(default)]
+    pub pinyin: PinyinGlobalConfig,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1064,6 +1066,49 @@ pub struct DebugConfig {
     pub perf_sampling: bool,
 }
 
+/// 全局拼音配置（[pinyin]）。所有拼音类方案（全拼/双拼/混输拼音子方案/临时拼音反查）共用。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PinyinGlobalConfig {
+    #[serde(default = "default_true")]
+    pub show_code_hint: bool,
+    #[serde(default = "default_true")]
+    pub use_smart_compose: bool,
+    #[serde(default = "default_candidate_order")]
+    pub candidate_order: String,
+    #[serde(default)]
+    pub fuzzy: PinyinFuzzy,
+}
+
+fn default_candidate_order() -> String { "smart".to_string() }
+
+impl Default for PinyinGlobalConfig {
+    fn default() -> Self {
+        Self {
+            show_code_hint: true,
+            use_smart_compose: true,
+            candidate_order: "smart".to_string(),
+            fuzzy: PinyinFuzzy::default(),
+        }
+    }
+}
+
+/// 全局模糊音（[pinyin.fuzzy]）。字段对齐引擎 FuzzyConfig。
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct PinyinFuzzy {
+    #[serde(default)] pub enabled: bool,
+    #[serde(default)] pub zh_z: bool,
+    #[serde(default)] pub ch_c: bool,
+    #[serde(default)] pub sh_s: bool,
+    #[serde(default)] pub n_l: bool,
+    #[serde(default)] pub f_h: bool,
+    #[serde(default)] pub r_l: bool,
+    #[serde(default)] pub an_ang: bool,
+    #[serde(default)] pub en_eng: bool,
+    #[serde(default)] pub in_ing: bool,
+    #[serde(default)] pub ian_iang: bool,
+    #[serde(default)] pub uan_uang: bool,
+}
+
 fn default_true() -> bool {
     true
 }
@@ -1111,6 +1156,7 @@ impl Default for Config {
             features: FeaturesConfig::default(),
             compat: CompatConfig::default(),
             debug: DebugConfig::default(),
+            pinyin: PinyinGlobalConfig::default(),
         }
     }
 }
@@ -1449,5 +1495,15 @@ mod tests {
             "截断到 4 字"
         );
         assert_eq!(c.truncate_display("一二"), "一二", "不足不截");
+    }
+
+    #[test]
+    fn pinyin_global_config_defaults() {
+        let c = Config::default();
+        assert!(c.pinyin.show_code_hint);
+        assert!(c.pinyin.use_smart_compose);
+        assert_eq!(c.pinyin.candidate_order, "smart");
+        assert!(!c.pinyin.fuzzy.enabled);
+        assert!(!c.pinyin.fuzzy.zh_z);
     }
 }
