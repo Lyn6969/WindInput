@@ -62,6 +62,13 @@ pub struct Candidate {
     pub is_common: bool,
     pub is_phrase: bool,
     pub is_command: bool,
+    /// 是否来自模糊音变体命中（非原拼音精确匹配）。排序时模糊候选整体降到非模糊之后，
+    /// 使"原对应拼音"优先（如输入 si 时「四」优先于模糊命中的「是」）。
+    pub is_fuzzy: bool,
+    /// 是否为前缀补全候选（候选编码比输入更长，如输入 si 补全出「思考」(sikao)）。
+    /// 排序时前缀补全整体降到精确匹配（code==输入）之后，使等长精确候选优先
+    /// （如输入 si 时单字「四」优先于补全词「思考」），对齐 Go 的 Exact>>Partial 层级。
+    pub is_prefix: bool,
     pub consumed_length: usize,
     pub source: CandidateSource,
     pub phrase_template: String,
@@ -91,6 +98,8 @@ impl Default for Candidate {
             is_common: false,
             is_phrase: false,
             is_command: false,
+            is_fuzzy: false,
+            is_prefix: false,
             consumed_length: 0,
             source: CandidateSource::None,
             phrase_template: String::new(),

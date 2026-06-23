@@ -154,10 +154,17 @@ impl PinyinEngine {
     /// 用于生成模糊变体。返回与 `dict.search` 相同的 `(text, weight, order)`。
     ///
     /// fuzzy 全 false 时 fuzzy_variants 返回空 → 天然退化为纯 `dict.search`（无需 enabled 判断）。
-    fn lookup_with_fuzzy(&self, code: &str, syllables: &[String]) -> Vec<(String, i32, i32)> {
-        let mut results = self.dict.search(code);
+    /// 返回 `(text, weight, order, is_fuzzy)`：原 code 精确命中 is_fuzzy=false；
+    /// 模糊变体命中 is_fuzzy=true（供排序时整体降到精确候选之后）。
+    fn lookup_with_fuzzy(&self, code: &str, syllables: &[String]) -> Vec<(String, i32, i32, bool)> {
+        let mut results: Vec<(String, i32, i32, bool)> = self
+            .dict
+            .search(code)
+            .into_iter()
+            .map(|(t, w, o)| (t, w, o, false))
+            .collect();
         let mut seen: std::collections::HashSet<String> =
-            results.iter().map(|(t, _, _)| t.clone()).collect();
+            results.iter().map(|(t, _, _, _)| t.clone()).collect();
 
         if syllables.len() <= 1 {
             // 单音节：对该音节（无切分时退化为整码）生成变体逐个查询。
@@ -165,7 +172,7 @@ impl PinyinEngine {
             for variant in fuzzy::FuzzyMatcher::fuzzy_variants(syllable, &self.fuzzy_config) {
                 for (text, weight, order) in self.dict.search(&variant) {
                     if seen.insert(text.clone()) {
-                        results.push((text, weight, order));
+                        results.push((text, weight, order, true));
                     }
                 }
             }
@@ -177,7 +184,7 @@ impl PinyinEngine {
                 }
                 for (text, weight, order) in self.dict.search(&alt_code) {
                     if seen.insert(text.clone()) {
-                        results.push((text, weight, order));
+                        results.push((text, weight, order, true));
                     }
                 }
             }
@@ -270,28 +277,35 @@ impl Engine for PinyinEngine {
         let trie = &self.trie;
         let mut candidates: Vec<Candidate> = Vec::new();
 
-        let push_unique =
-            |cands: &mut Vec<Candidate>, text: String, code: String, weight: i32, order: i32| {
-                if text.is_empty() || cands.iter().any(|c| c.text == text) {
-                    return;
-                }
-                cands.push(Candidate {
-                    text,
-                    code,
-                    weight,
-                    natural_order: order,
-                    source: CandidateSource::Pinyin,
-                    ..Default::default()
-                });
-            };
+        let push_unique = |cands: &mut Vec<Candidate>,
+                           text: String,
+                           code: String,
+                           weight: i32,
+                           order: i32,
+                           is_fuzzy: bool,
+                           is_prefix: bool| {
+            if text.is_empty() || cands.iter().any(|c| c.text == text) {
+                return;
+            }
+            cands.push(Candidate {
+                text,
+                code,
+                weight,
+                natural_order: order,
+                source: CandidateSource::Pinyin,
+                is_fuzzy,
+                is_prefix,
+                ..Default::default()
+            });
+        };
 
         // DAG 分词提前到 step1 之前：lookup_with_fuzzy 需要音节列表生成模糊变体。
         let dag = Dag::build(input, trie);
         let syllables = dag.maximum_match();
 
-        // 1. 精确查找（完整匹配，含模糊扩展，对齐 Go lookupWithFuzzy）
-        for (text, weight, order) in self.lookup_with_fuzzy(input, &syllables) {
-            push_unique(&mut candidates, text, input.to_string(), weight, order);
+        // 1. 精确查找（完整匹配，含模糊扩展，对齐 Go lookupWithFuzzy）。code==input → 精确层级。
+        for (text, weight, order, is_fuzzy) in self.lookup_with_fuzzy(input, &syllables) {
+            push_unique(&mut candidates, text, input.to_string(), weight, order, is_fuzzy, false);
         }
 
         // 完成音节覆盖的连续前缀（从起点算）。尾部不成音节的残码（如「nihaom」的「m」）
@@ -367,15 +381,18 @@ impl Engine for PinyinEngine {
                 if code == input {
                     continue;
                 }
-                for (text, weight, order) in self.lookup_with_fuzzy(&code, &syllables[..end]) {
-                    push_unique(&mut candidates, text, code.clone(), weight, order);
+                // 子词组 code 是输入的真前缀（比输入*短*，如 nihao 的「你」(ni)），是合法的
+                // 分段上屏候选，与精确同层按权重排（不可降权——否则罕见全长词「拟好」会压过
+                // 常用子词组「你」）。只有 code 比输入*长*的补全词(step4)才算前缀补全降权。
+                for (text, weight, order, is_fuzzy) in self.lookup_with_fuzzy(&code, &syllables[..end]) {
+                    push_unique(&mut candidates, text, code.clone(), weight, order, is_fuzzy, false);
                 }
             }
         }
 
-        // 4. 前缀查找
+        // 4. 前缀查找（补全词，code 比输入长，如 si→思考）→ 前缀层级，降到精确之后。
         for (code, text, weight, order) in dict.search_prefix(input, 30) {
-            push_unique(&mut candidates, text, code, weight, order);
+            push_unique(&mut candidates, text, code, weight, order, false, true);
         }
 
         // 5. 简拼匹配（声母缩写，如 nh→你好）：查 wdat 预存的独立 AbbrevSection。
@@ -383,7 +400,7 @@ impl Engine for PinyinEngine {
         //    避免对全拼输入做无谓查找。natural_order=999999 让简拼候选默认排在全拼之后。
         if AbbrevMatcher::is_abbreviation(input, trie) {
             for (text, weight, _order) in dict.search_abbrev(input, 10) {
-                push_unique(&mut candidates, text, input.to_string(), weight, 999999);
+                push_unique(&mut candidates, text, input.to_string(), weight, 999999, false, true);
             }
         }
 
@@ -413,10 +430,15 @@ impl Engine for PinyinEngine {
             }
         }
 
-        // 引擎内部排序（按权重降序，自然顺序升序）
+        // 引擎内部排序（层级对齐 Go：Exact >> Partial/Prefix >> Fuzzy）：
+        // ① 非模糊优先于模糊（is_fuzzy=false 在前）；② 同模糊层内精确(code==输入)优先于
+        // 前缀补全(is_prefix=false 在前)；③ 同层内按权重降序、自然序升序。
+        // 使输入 si 时：精确单字「四/死」> 前缀补全「思考/似乎」> 模糊命中「是」。
         candidates.sort_by(|a, b| {
-            b.weight
-                .cmp(&a.weight)
+            a.is_fuzzy
+                .cmp(&b.is_fuzzy)
+                .then(a.is_prefix.cmp(&b.is_prefix))
+                .then(b.weight.cmp(&a.weight))
                 .then(a.natural_order.cmp(&b.natural_order))
         });
         candidates.truncate(max_candidates);
@@ -687,6 +709,84 @@ mod tests {
             "fuzzy sh_s 开启时，\"shi\" 应命中「四」，实际: {:?}",
             r2.candidates.iter().map(|c| &c.text).collect::<Vec<_>>()
         );
+    }
+
+    /// 优先级 TDD：原对应拼音（精确匹配）应优先于模糊命中——即便模糊词词频更高。
+    /// 词典 "si"→"四"(weight 100) 与 "shi"→"是"(weight 9000，更高频)；fuzzy sh_s=true。
+    /// 输入 "si"：「四」是精确命中、「是」是模糊命中，「四」必须排在「是」之前。
+    #[test]
+    fn fuzzy_exact_ranks_above_fuzzy() {
+        let mut raw = CodetableDict::empty();
+        raw.merge_single("si".to_string(), "四".to_string(), 100, 0);
+        raw.merge_single("shi".to_string(), "是".to_string(), 9000, 0);
+        let dict = CachedDict::Memory(raw);
+        let mut fz = FuzzyConfig::default();
+        fz.sh_s = true;
+        let eng = PinyinEngine::new(Config::default(), dict).with_fuzzy(fz);
+
+        let r = eng.convert("si", 10).unwrap();
+        let texts: Vec<&String> = r.candidates.iter().map(|c| &c.text).collect();
+        let pos_si = texts.iter().position(|t| *t == "四");
+        let pos_shi = texts.iter().position(|t| *t == "是");
+        assert!(pos_si.is_some(), "精确候选「四」应存在，实际: {texts:?}");
+        assert!(pos_shi.is_some(), "模糊候选「是」应存在，实际: {texts:?}");
+        assert!(
+            pos_si < pos_shi,
+            "精确命中「四」应排在模糊命中「是」之前（即便「是」词频更高），实际: {texts:?}"
+        );
+        // 「四」是精确（非模糊），「是」是模糊命中
+        assert!(!r.candidates[pos_si.unwrap()].is_fuzzy, "「四」应为非模糊");
+        assert!(r.candidates[pos_shi.unwrap()].is_fuzzy, "「是」应为模糊命中");
+    }
+
+    /// 层级 TDD：精确单字应优先于高频前缀补全词。词典 "si"→"四"(weight 100,单字精确) 与
+    /// "sikao"→"思考"(weight 9000,补全词，code 比输入长)。输入 "si" 时「四」(精确,code==输入)
+    /// 必须排在「思考」(前缀补全)之前——即便「思考」词频高得多。对齐 Go Exact>>Partial。
+    #[test]
+    fn exact_ranks_above_prefix_completion() {
+        let mut raw = CodetableDict::empty();
+        raw.merge_single("si".to_string(), "四".to_string(), 100, 0);
+        raw.merge_single("sikao".to_string(), "思考".to_string(), 9000, 0);
+        let dict = CachedDict::Memory(raw);
+        let eng = PinyinEngine::new(Config::default(), dict);
+
+        let r = eng.convert("si", 10).unwrap();
+        let texts: Vec<&String> = r.candidates.iter().map(|c| &c.text).collect();
+        let pos_si = texts.iter().position(|t| *t == "四");
+        let pos_kao = texts.iter().position(|t| *t == "思考");
+        assert!(pos_si.is_some(), "精确「四」应存在，实际: {texts:?}");
+        assert!(pos_kao.is_some(), "补全「思考」应存在，实际: {texts:?}");
+        assert!(
+            pos_si < pos_kao,
+            "精确单字「四」应优先于高频前缀补全「思考」，实际: {texts:?}"
+        );
+        assert!(!r.candidates[pos_si.unwrap()].is_prefix, "「四」应为精确(非前缀)");
+        assert!(r.candidates[pos_kao.unwrap()].is_prefix, "「思考」应为前缀补全");
+    }
+
+    /// 回归 TDD：子词组（code 比输入短，如 nihao 的「你」）不是前缀补全，不可降权——
+    /// 否则罕见全长精确词「拟好」(code==nihao,低权重) 会压过常用子词组「你」(高权重)。
+    /// 输入 "nihao"：「你」必须排在「拟好」之前(同层按权重)。
+    #[test]
+    fn subphrase_not_demoted_below_rare_exact() {
+        let mut raw = CodetableDict::empty();
+        raw.merge_single("nihao".to_string(), "你好".to_string(), 200, 0);
+        raw.merge_single("nihao".to_string(), "拟好".to_string(), 10, 1); // 罕见全长精确词
+        raw.merge_single("ni".to_string(), "你".to_string(), 5000, 0); // 常用子词组
+        let dict = CachedDict::Memory(raw);
+        let eng = PinyinEngine::new(Config::default(), dict);
+
+        let r = eng.convert("nihao", 10).unwrap();
+        let texts: Vec<&String> = r.candidates.iter().map(|c| &c.text).collect();
+        let pos_ni = texts.iter().position(|t| *t == "你");
+        let pos_nihao_rare = texts.iter().position(|t| *t == "拟好");
+        assert!(pos_ni.is_some() && pos_nihao_rare.is_some(), "候选缺失: {texts:?}");
+        assert!(
+            pos_ni < pos_nihao_rare,
+            "常用子词组「你」应优先于罕见全长精确词「拟好」(同层按权重)，实际: {texts:?}"
+        );
+        // 「你」是子词组，不应被标记为前缀补全
+        assert!(!r.candidates[pos_ni.unwrap()].is_prefix, "子词组「你」不应是前缀补全");
     }
 
     /// Fix B TDD：fuzzy 应接入多音节整串查询（expand_code 笛卡尔积）。

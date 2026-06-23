@@ -106,7 +106,26 @@ pub fn rerank_pinyin_decay(
         if sa {
             return Ordering::Equal; // 均为整句/短语 → 维持引擎权重序
         }
-        // ②③ 非整句：阈值褪色 + 衰减分降序
+        // ①.5 模糊层级：非模糊整体优先于模糊命中。词频(used-first)不得把模糊候选
+        //     提到精确候选之上——与 Go 分层评分一致(Exact 2000 >> Fuzzy 800，用户词加成
+        //     也压不过层级差)。否则用户曾在 si 下误选「是」会让模糊「是」永久压过精确「四」。
+        if a.is_fuzzy != b.is_fuzzy {
+            return if a.is_fuzzy {
+                Ordering::Greater
+            } else {
+                Ordering::Less
+            };
+        }
+        // ①.6 前缀补全层级：精确(code==输入)整体优先于前缀补全。词频不得把前缀补全词
+        //     提到精确候选之上（如输入 si 时，被频繁使用的补全「思考」也不能压过精确「四」）。
+        if a.is_prefix != b.is_prefix {
+            return if a.is_prefix {
+                Ordering::Greater
+            } else {
+                Ordering::Less
+            };
+        }
+        // ②③ 非整句、同层级：阈值褪色 + 衰减分降序
         let (pa, pb) = (score(a), score(b));
         let ua = pa >= PINYIN_FREQ_EPSILON;
         let ub = pb >= PINYIN_FREQ_EPSILON;
@@ -189,6 +208,31 @@ mod tests {
         let r = recs(&[("近用低权", 8, NOW)]);
         rerank_pinyin_decay(&mut cands, &r, NOW);
         assert_eq!(cands[0].text, "近用低权", "近期使用应软置前");
+    }
+
+    fn pin_fuzzy(text: &str, weight: i32) -> Candidate {
+        let mut c = pin(text, weight);
+        c.is_fuzzy = true;
+        c
+    }
+
+    /// 模糊层级优先于词频（完全模拟线上 si→是 词频污染场景）：
+    /// 用户曾在 "si" 下选过模糊命中「是」(有使用记录、权重更高)，但精确命中「四」(非模糊、
+    /// 未使用、权重更低) 仍须排在「是」之前——词频 used-first 不得把模糊提到精确之上。
+    #[test]
+    fn pinyin_exact_ranks_above_used_fuzzy() {
+        let mut cands = vec![
+            pin_fuzzy("是", 9000), // 模糊命中，高权重，且被频繁使用过
+            pin("四", 100),        // 精确命中，低权重，未使用
+        ];
+        let r = recs(&[("是", 4, NOW)]); // 「是」有使用记录（模拟 si→是 count=4）
+        rerank_pinyin_decay(&mut cands, &r, NOW);
+        assert_eq!(
+            cands[0].text, "四",
+            "精确命中「四」须优先于被使用过的模糊命中「是」，实际: {:?}",
+            cands.iter().map(|c| &c.text).collect::<Vec<_>>()
+        );
+        assert_eq!(cands[1].text, "是");
     }
 
     /// 阈值褪色：久未用（衰减分 < ε）失去 used-first 资格，落回引擎权重序。

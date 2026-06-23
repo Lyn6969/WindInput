@@ -222,9 +222,15 @@ impl Coordinator {
                 }
             }
         }
+        // 候选层级排序（与引擎一致，对齐 Go：Exact >> Prefix >> Fuzzy）：
+        // ① 非模糊优先于模糊；② 同模糊层内精确(code==输入)优先于前缀补全；
+        // ③ 同层内按权重降序、自然序升序。使输入 si 时精确单字「四」优先于
+        // 前缀补全「思考」、再优先于模糊命中「是」（即便后者词频更高）。
         candidates.sort_by(|a, b| {
-            b.weight
-                .cmp(&a.weight)
+            a.is_fuzzy
+                .cmp(&b.is_fuzzy)
+                .then(a.is_prefix.cmp(&b.is_prefix))
+                .then(b.weight.cmp(&a.weight))
                 .then(a.natural_order.cmp(&b.natural_order))
         });
         let mut seen = std::collections::HashSet::new();
