@@ -298,6 +298,14 @@ assemble_data() {
     # 1. 复制 data/ 源文件（configs、五笔词库、主题等）
     cp -rf "$PRODUCT_ROOT/data" "$data"
 
+    # 1b. 合并 wind_input/data/settings/（manifest.toml 等 RPC 元数据）。
+    # wind-rpc 运行时优先读 data_dir()/settings/manifest.toml；
+    # 该文件不在 PRODUCT_ROOT/data/ 故需单独合并，否则 Windows 部署端缺失/过期。
+    if [ -d "$PROJECT_ROOT/data/settings" ]; then
+        mkdir -p "$data/settings"
+        cp -rf "$PROJECT_ROOT/data/settings/." "$data/settings/"
+    fi
+
     # 2. rime-frost 拼音词库
     mkdir -p "$pinyin_cn"
     if [ -f "$rime_frost/rime_frost.dict.yaml" ]; then
