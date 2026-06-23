@@ -50,6 +50,15 @@ impl Coordinator {
             && (keymap::VK_A..=keymap::VK_Z).contains(&data.key_code)
         {
             let ch = (b'A' + (data.key_code - 0x41) as u8) as char; // 首字母大写
+            // shift_behavior == "direct_commit"：不进临时英文，直接上屏大写字母（对齐 Go）。
+            if self.rt().config.input.shift_temp_english.shift_behavior == "direct_commit" {
+                let out = if state.full_width {
+                    wind_transform::fullwidth::to_full_width(&ch.to_string())
+                } else {
+                    ch.to_string()
+                };
+                return Some(Self::commit_action(out, true));
+            }
             state.active = Some(ModeKind::TempEnglish);
             state.temp_english_buffer = ch.to_string();
             self.update_temp_english_candidates(state);

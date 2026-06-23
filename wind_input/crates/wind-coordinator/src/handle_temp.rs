@@ -370,16 +370,22 @@ impl Coordinator {
                 }
             }
             keymap::VK_SPACE => {
-                // 空格：上屏当前高亮候选（首候选=原始输入）
-                let text = if !state.candidates.is_empty() {
-                    let idx = self
-                        .highlighted_global_index(state)
-                        .min(state.candidates.len() - 1);
-                    state.candidates[idx].text.clone()
+                // space_as_input：空格作为输入字符入缓冲，仅回车上屏（对齐 Go）。
+                if self.rt().config.input.shift_temp_english.space_as_input {
+                    state.temp_english_buffer.push(' ');
+                    refresh(self, state)
                 } else {
-                    state.temp_english_buffer.clone()
-                };
-                commit_text(self, state, text)
+                    // 空格：上屏当前高亮候选（首候选=原始输入）
+                    let text = if !state.candidates.is_empty() {
+                        let idx = self
+                            .highlighted_global_index(state)
+                            .min(state.candidates.len() - 1);
+                        state.candidates[idx].text.clone()
+                    } else {
+                        state.temp_english_buffer.clone()
+                    };
+                    commit_text(self, state, text)
+                }
             }
             keymap::VK_RETURN => {
                 // 回车：上屏原始输入文本（不取候选）
@@ -418,6 +424,11 @@ impl Coordinator {
                 // 其它（标点等）：上屏当前高亮候选 + 转换后标点，退出
                 let shift = data.modifiers & MOD_SHIFT != 0;
                 if let Some(ch) = punct_char(data.key_code, shift) {
+                    // allow_symbols：可见符号直接入缓冲累积（如 C++），不上屏退出（对齐 Go）。
+                    if self.rt().config.input.shift_temp_english.allow_symbols {
+                        state.temp_english_buffer.push(ch);
+                        return refresh(self, state);
+                    }
                     let base = if !state.candidates.is_empty() {
                         let idx = self
                             .highlighted_global_index(state)
