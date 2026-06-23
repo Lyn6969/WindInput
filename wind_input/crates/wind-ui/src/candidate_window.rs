@@ -749,7 +749,9 @@ impl CandidateWindow {
         // 堆叠致提示窗口过高（网址/临拼/临英刚进入时尤甚）。preedit/徽标分隔方向亦随之。
         let list_vertical = self.vertical && !self.candidates.is_empty();
         let mut list = if list_vertical {
-            View::container(Layout::Column).gap(row_gap_v)
+            // fill_cross 让候选列撑满 root 宽度（= max(最宽候选, 翻页栏)），
+            // 再配合各候选 item 的 fill_cross，所有候选高亮宽度统一。
+            View::container(Layout::Column).gap(row_gap_v).fill_cross()
         } else {
             View::container(Layout::Row)
                 .gap(box_gap)
@@ -845,6 +847,10 @@ impl CandidateWindow {
                 .margin(edges_or(&v.item.margin, [0.0; 4]))
                 .radius(item_radius)
                 .tag(i as i32);
+            // 竖排时撑满列宽（等于最宽候选的宽度），高亮背景宽度统一，与 Go 行为一致。
+            if list_vertical {
+                item = item.fill_cross();
+            }
             // 序号节点：no_index 项（如快捷加词提示行）完全跳过，避免空圆圈占位。
             if !cand.no_index {
                 let marker = if cand.label.is_empty() {
