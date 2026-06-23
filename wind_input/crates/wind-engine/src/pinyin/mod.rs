@@ -148,6 +148,103 @@ impl PinyinEngine {
         }
         (preedit, syllables, partial)
     }
+
+    /// 带模糊拼音扩展的词库查找（对齐 Go lookupWithFuzzy）。
+    /// `code` 为待查询的全拼码（整串或前缀子码）；`syllables` 为该码对应的音节切分，
+    /// 用于生成模糊变体。返回与 `dict.search` 相同的 `(text, weight, order)`。
+    ///
+    /// fuzzy 全 false 时 fuzzy_variants 返回空 → 天然退化为纯 `dict.search`（无需 enabled 判断）。
+    fn lookup_with_fuzzy(&self, code: &str, syllables: &[String]) -> Vec<(String, i32, i32)> {
+        let mut results = self.dict.search(code);
+        let mut seen: std::collections::HashSet<String> =
+            results.iter().map(|(t, _, _)| t.clone()).collect();
+
+        if syllables.len() <= 1 {
+            // 单音节：对该音节（无切分时退化为整码）生成变体逐个查询。
+            let syllable: &str = if syllables.len() == 1 { &syllables[0] } else { code };
+            for variant in fuzzy::FuzzyMatcher::fuzzy_variants(syllable, &self.fuzzy_config) {
+                for (text, weight, order) in self.dict.search(&variant) {
+                    if seen.insert(text.clone()) {
+                        results.push((text, weight, order));
+                    }
+                }
+            }
+        } else {
+            // 多音节：笛卡尔积展开各音节变体，拼成完整 altCode 查询。
+            for alt_code in self.expand_code(syllables) {
+                if alt_code == code {
+                    continue;
+                }
+                for (text, weight, order) in self.dict.search(&alt_code) {
+                    if seen.insert(text.clone()) {
+                        results.push((text, weight, order));
+                    }
+                }
+            }
+        }
+
+        results
+    }
+
+    /// 对多音节做模糊变体笛卡尔积展开（对齐 Go FuzzyConfig.ExpandCode）。
+    /// 每个音节取 `[原音节] + fuzzy_variants(音节)`，做笛卡尔积拼接成完整 code。
+    /// 组合数超过上限（64）时跳过扩展返回空，避免组合爆炸。
+    fn expand_code(&self, syllables: &[String]) -> Vec<String> {
+        let per_syllable: Vec<Vec<String>> = syllables
+            .iter()
+            .map(|s| {
+                let mut opts = vec![s.clone()];
+                opts.extend(fuzzy::FuzzyMatcher::fuzzy_variants(s, &self.fuzzy_config));
+                opts
+            })
+            .collect();
+
+        // 预估组合数，超限直接放弃扩展，避免组合爆炸。
+        let mut combo_count: usize = 1;
+        for opts in &per_syllable {
+            combo_count = combo_count.saturating_mul(opts.len());
+            if combo_count > 64 {
+                return Vec::new();
+            }
+        }
+
+        let mut codes: Vec<String> = vec![String::new()];
+        for opts in &per_syllable {
+            let mut next: Vec<String> = Vec::with_capacity(codes.len() * opts.len());
+            for prefix in &codes {
+                for opt in opts {
+                    next.push(format!("{prefix}{opt}"));
+                }
+            }
+            codes = next;
+        }
+        codes
+    }
+}
+
+/// Fix A：用双拼原始按键重建 preedit（按音节边界以空格分隔）。
+/// 依次取每个已完成音节在原始输入中的字节区间 `raw[sp_start..sp_end]`；
+/// 若有 partial，把最后一个完成音节之后的剩余原始字节作为 partial 段追加。
+/// 分隔符与全拼自动分词一致用空格（`'` 保留给将来的手动拆分，见全拼处理）。
+/// 双拼键均为 ASCII，字节切片安全。
+fn build_raw_preedit(raw_input: &str, sp: &shuangpin::SpConvertResult) -> String {
+    if raw_input.is_empty() {
+        return String::new();
+    }
+    let mut segments: Vec<&str> = Vec::new();
+    let mut last_end = 0usize;
+    for s in &sp.syllables {
+        segments.push(&raw_input[s.sp_start..s.sp_end]);
+        last_end = s.sp_end;
+    }
+    if sp.has_partial && last_end < raw_input.len() {
+        segments.push(&raw_input[last_end..]);
+    }
+    if segments.is_empty() {
+        // 无 syllables 且无 partial：原样返回（如无匹配键对等边界）。
+        return raw_input.to_string();
+    }
+    segments.join(" ")
 }
 
 impl Engine for PinyinEngine {
@@ -155,6 +252,10 @@ impl Engine for PinyinEngine {
         if input.is_empty() {
             return Ok(ConvertResult::default());
         }
+
+        // Fix A：在任何 shadow 之前保存用户实际输入的原始字符（双拼键序列或全拼）。
+        // 仅用于重建 preedit_display（显示原始按键），不影响候选/消费语义。
+        let raw_input = input;
 
         // 双拼激活时保留 SpConvertResult，以便后续用 map_consumed_length 回算消费键数。
         let sp_result: Option<shuangpin::SpConvertResult> = self.shuangpin.as_ref().map(|conv| conv.convert(input));
@@ -184,13 +285,14 @@ impl Engine for PinyinEngine {
                 });
             };
 
-        // 1. 精确查找（完整匹配）
-        for (text, weight, order) in dict.search(input) {
-            push_unique(&mut candidates, text, input.to_string(), weight, order);
-        }
-
+        // DAG 分词提前到 step1 之前：lookup_with_fuzzy 需要音节列表生成模糊变体。
         let dag = Dag::build(input, trie);
         let syllables = dag.maximum_match();
+
+        // 1. 精确查找（完整匹配，含模糊扩展，对齐 Go lookupWithFuzzy）
+        for (text, weight, order) in self.lookup_with_fuzzy(input, &syllables) {
+            push_unique(&mut candidates, text, input.to_string(), weight, order);
+        }
 
         // 完成音节覆盖的连续前缀（从起点算）。尾部不成音节的残码（如「nihaom」的「m」）
         // 不参与整句解码——否则 lattice 到不了残码末端、Viterbi 失败、整句退化成单字（bug①）。
@@ -265,7 +367,7 @@ impl Engine for PinyinEngine {
                 if code == input {
                     continue;
                 }
-                for (text, weight, order) in dict.search(&code) {
+                for (text, weight, order) in self.lookup_with_fuzzy(&code, &syllables[..end]) {
                     push_unique(&mut candidates, text, code.clone(), weight, order);
                 }
             }
@@ -340,8 +442,16 @@ impl Engine for PinyinEngine {
             };
         }
 
-        let (preedit_display, completed_syllables, partial_syllable) =
+        let (mut preedit_display, completed_syllables, partial_syllable) =
             self.compute_composition(input);
+
+        // Fix A：双拼激活时，preedit 改为显示用户实际输入的原始按键（按双拼音节边界以 `'` 分隔），
+        // 而非转换后的全拼。仅覆盖 preedit_display；候选/completed_syllables/partial_syllable/
+        // consumed_length 仍保持全拼语义不变。
+        if let Some(r) = &sp_result {
+            preedit_display = build_raw_preedit(raw_input, r);
+        }
+
         let has_partial = !partial_syllable.is_empty();
         let is_empty = candidates.is_empty();
 
@@ -504,6 +614,118 @@ mod tests {
             nihao.consumed_length, 4,
             "「你好」consumed_length 应为双拼键数 4（\"nihc\" 的长度），实际为 {}",
             nihao.consumed_length
+        );
+    }
+
+    /// Fix A TDD：双拼 preedit 应显示用户实际输入的原始按键（按音节边界以空格分隔，
+    /// 与全拼自动分词一致），而非转换后的全拼。输入小鹤 "nihc"（→全拼 nihao）应显示
+    /// "ni hc"，候选仍含「你好」。
+    #[test]
+    fn shuangpin_preedit_shows_raw_keys() {
+        let mut raw = CodetableDict::empty();
+        raw.merge_single("nihao".to_string(), "你好".to_string(), 200, 0);
+        raw.merge_single("ni".to_string(), "你".to_string(), 100, 1);
+        let dict = CachedDict::Memory(raw);
+
+        let schema_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../../data/schemas/shuangpin");
+        let layout = Layout::from_toml(&schema_dir.join("xiaohe.toml"))
+            .expect("加载小鹤布局失败");
+        let conv = ShuangpinConverter::new(layout);
+        let eng = PinyinEngine::new(Config::default(), dict).with_shuangpin(conv);
+
+        // 完整双音节：preedit 为原始键按音节空格分隔 "ni hc"（而非全拼 "ni hao"）
+        let r = eng.convert("nihc", 10).unwrap();
+        assert_eq!(
+            r.preedit_display, "ni hc",
+            "双拼 preedit 应显示原始按键并按音节空格分隔，实际: {:?}",
+            r.preedit_display
+        );
+        // 候选仍走全拼语义，含「你好」
+        assert!(
+            r.candidates.iter().any(|c| c.text == "你好"),
+            "候选仍应含「你好」，实际: {:?}",
+            r.candidates.iter().map(|c| &c.text).collect::<Vec<_>>()
+        );
+
+        // 单音节：ni → "ni"
+        let r2 = eng.convert("ni", 10).unwrap();
+        assert_eq!(r2.preedit_display, "ni", "单音节 preedit 应为 \"ni\"");
+
+        // 含 partial：nih（ni 完成 + h 未配对）→ "ni h"
+        let r3 = eng.convert("nih", 10).unwrap();
+        assert_eq!(
+            r3.preedit_display, "ni h",
+            "含 partial 的双拼 preedit 应为 \"ni h\"，实际: {:?}",
+            r3.preedit_display
+        );
+    }
+
+    /// Fix B TDD：fuzzy 应接入精确/单音节查询。词典含 "shi"→"是"，
+    /// fuzzy sh_s=true 时，输入单音节全拼 "si" 应能命中「是」（sh↔s 模糊）。
+    #[test]
+    fn fuzzy_lookup_single_syllable() {
+        let mut raw = CodetableDict::empty();
+        raw.merge_single("shi".to_string(), "是".to_string(), 100, 0);
+        let dict = CachedDict::Memory(raw);
+        let mut fz = FuzzyConfig::default();
+        fz.sh_s = true;
+        let eng = PinyinEngine::new(Config::default(), dict).with_fuzzy(fz);
+
+        let r = eng.convert("si", 10).unwrap();
+        assert!(
+            r.candidates.iter().any(|c| c.text == "是"),
+            "fuzzy sh_s 开启时，单音节 \"si\" 应命中「是」，实际: {:?}",
+            r.candidates.iter().map(|c| &c.text).collect::<Vec<_>>()
+        );
+
+        // 反向：词典 "si"→"四"，输入 "shi" 应命中「四」
+        let mut raw2 = CodetableDict::empty();
+        raw2.merge_single("si".to_string(), "四".to_string(), 100, 0);
+        let mut fz2 = FuzzyConfig::default();
+        fz2.sh_s = true;
+        let eng2 = PinyinEngine::new(Config::default(), CachedDict::Memory(raw2)).with_fuzzy(fz2);
+        let r2 = eng2.convert("shi", 10).unwrap();
+        assert!(
+            r2.candidates.iter().any(|c| c.text == "四"),
+            "fuzzy sh_s 开启时，\"shi\" 应命中「四」，实际: {:?}",
+            r2.candidates.iter().map(|c| &c.text).collect::<Vec<_>>()
+        );
+    }
+
+    /// Fix B TDD：fuzzy 应接入多音节整串查询（expand_code 笛卡尔积）。
+    /// 词典只存 eng 形式 "shengri"→"生日"，用户输入 en 形式 "shenri"（DAG 切分 shen+ri），
+    /// fuzzy en_eng=true 时应通过 expand_code 生成 "shengri" 反查命中「生日」。
+    #[test]
+    fn fuzzy_lookup_multi_syllable() {
+        let mut raw = CodetableDict::empty();
+        raw.merge_single("shengri".to_string(), "生日".to_string(), 100, 0);
+        let dict = CachedDict::Memory(raw);
+        let mut fz = FuzzyConfig::default();
+        fz.en_eng = true;
+        let eng = PinyinEngine::new(Config::default(), dict).with_fuzzy(fz);
+
+        let r = eng.convert("shenri", 10).unwrap();
+        assert!(
+            r.candidates.iter().any(|c| c.text == "生日"),
+            "fuzzy en_eng 开启时，\"shenri\" 应模糊命中「生日」(shengri)，实际: {:?}",
+            r.candidates.iter().map(|c| &c.text).collect::<Vec<_>>()
+        );
+    }
+
+    /// Fix B TDD：fuzzy 全 false 时 lookup_with_fuzzy 退化为纯精确查找（不引入多余候选）。
+    #[test]
+    fn fuzzy_disabled_no_extra_candidates() {
+        let mut raw = CodetableDict::empty();
+        raw.merge_single("shi".to_string(), "是".to_string(), 100, 0);
+        let dict = CachedDict::Memory(raw);
+        // 无 with_fuzzy → FuzzyConfig::default() 全 false
+        let eng = PinyinEngine::new(Config::default(), dict);
+        let r = eng.convert("si", 10).unwrap();
+        assert!(
+            !r.candidates.iter().any(|c| c.text == "是"),
+            "fuzzy 关闭时 \"si\" 不应命中「是」，实际: {:?}",
+            r.candidates.iter().map(|c| &c.text).collect::<Vec<_>>()
         );
     }
 
