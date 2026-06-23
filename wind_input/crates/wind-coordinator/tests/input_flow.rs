@@ -111,6 +111,121 @@ fn test_wubi_number_select() {
 }
 
 #[test]
+fn test_overflow_number_key_ignore_default() {
+    if !has_schemas() {
+        return;
+    }
+    // 默认 overflow.number_key = "ignore"：数字键越界当前页候选时吞键无效（保留组合）。
+    let coord = Coordinator::new_headless(config_with("wubi86"), Some(&data_dir()));
+    press_letter(&coord, 'a');
+    let count = coord.debug_candidate_count();
+    if count == 0 || count >= 9 {
+        return; // 保证数字 9 必然越界
+    }
+    let act = coord.handle_key_event(&key_event(0x39, EVENT_KEY_DOWN)); // 主键盘 9
+    assert!(
+        matches!(act, KeyAction::Consumed),
+        "默认 ignore 下越界数字键应吞键(Consumed)，实际: {:?}",
+        act
+    );
+}
+
+#[test]
+fn test_overflow_number_key_commit_and_input() {
+    if !has_schemas() {
+        return;
+    }
+    // overflow.number_key = "commit_and_input"：越界时顶字上屏高亮候选 + 追加数字字符。
+    let mut cfg = config_with("wubi86");
+    cfg.input.overflow.number_key = "commit_and_input".into();
+    let coord = Coordinator::new_headless(cfg, Some(&data_dir()));
+    press_letter(&coord, 'a');
+    let count = coord.debug_candidate_count();
+    if count == 0 || count >= 9 {
+        return;
+    }
+    let act = coord.handle_key_event(&key_event(0x39, EVENT_KEY_DOWN)); // 越界数字 9
+    match act {
+        KeyAction::InsertText { text, .. } => {
+            assert!(
+                text.ends_with('9'),
+                "commit_and_input 应以越界数字 9 结尾，实际: {}",
+                text
+            );
+            assert!(
+                text.chars().count() >= 2,
+                "应为高亮候选 + 数字，实际: {}",
+                text
+            );
+        }
+        other => panic!("commit_and_input 应 InsertText，实际: {:?}", other),
+    }
+}
+
+#[test]
+fn test_numpad_direct_outputs_digit() {
+    if !has_schemas() {
+        return;
+    }
+    // 默认 numpad_behavior 为空 → direct：丢弃编码直接输出小键盘数字。
+    let coord = Coordinator::new_headless(config_with("wubi86"), Some(&data_dir()));
+    press_letter(&coord, 'a'); // 产生组合 + 候选
+    // 小键盘 5 (VK_NUMPAD5 = 0x65)
+    let act = coord.handle_key_event(&key_event(0x65, EVENT_KEY_DOWN));
+    match act {
+        KeyAction::InsertText { text, .. } => {
+            assert_eq!(text, "5", "direct 模式小键盘应直接输出数字 5，实际: {}", text);
+        }
+        other => panic!("direct 小键盘应 InsertText，实际: {:?}", other),
+    }
+}
+
+#[test]
+fn test_numpad_follow_main_selects_like_main() {
+    if !has_schemas() {
+        return;
+    }
+    // follow_main：小键盘数字键应与主键盘数字键选同一候选。
+    let mut cfg = config_with("wubi86");
+    cfg.input.numpad_behavior = "follow_main".into();
+    let coord_np = Coordinator::new_headless(cfg, Some(&data_dir()));
+    press_letter(&coord_np, 'a');
+    // 小键盘 2 (VK_NUMPAD2 = 0x62)
+    let np = coord_np.handle_key_event(&key_event(0x62, EVENT_KEY_DOWN));
+
+    // 对照：主键盘 2 (0x32) 选第二候选
+    let coord_main = Coordinator::new_headless(config_with("wubi86"), Some(&data_dir()));
+    press_letter(&coord_main, 'a');
+    let main = coord_main.handle_key_event(&key_event(0x32, EVENT_KEY_DOWN));
+
+    let np_text = action_text(&np).unwrap_or_default();
+    let main_text = action_text(&main).unwrap_or_default();
+    assert!(!np_text.is_empty(), "follow_main 小键盘 2 应上屏候选");
+    assert_eq!(
+        np_text, main_text,
+        "follow_main 小键盘 2 应与主键盘 2 选同一候选（np={}, main={}）",
+        np_text, main_text
+    );
+}
+
+#[test]
+fn test_numpad_follow_main_empty_passthrough() {
+    if !has_schemas() {
+        return;
+    }
+    // follow_main + 空缓冲：小键盘数字应透传（由应用原样输出数字），不被 IME 吞。
+    let mut cfg = config_with("wubi86");
+    cfg.input.numpad_behavior = "follow_main".into();
+    let coord = Coordinator::new_headless(cfg, Some(&data_dir()));
+    let act = coord.handle_key_event(&key_event(0x67, EVENT_KEY_DOWN)); // VK_NUMPAD7
+    assert!(
+        matches!(act, KeyAction::PassThrough),
+        "follow_main 空缓冲小键盘数字应 PassThrough，实际: {:?}",
+        act
+    );
+}
+
+#[test]
 fn test_pinyin_basic_input() {
     if !has_schemas() {
         return;

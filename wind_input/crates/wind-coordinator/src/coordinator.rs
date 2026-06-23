@@ -2005,15 +2005,43 @@ impl MessageHandler for Coordinator {
         // direct（默认）IME 直接输出小键盘字符（先丢弃当前未上屏编码）。仅中文模式到达此处。
         if let Some(npc) = numpad_char(data.key_code) {
             let follow_main = self.rt().config.input.numpad_behavior == "follow_main";
-            if follow_main && ('1'..='9').contains(&npc) {
-                let (start, end) = self.page_range(&state);
-                let idx = start + (npc as u8 - b'1') as usize;
-                if idx < end {
-                    let cand = state.candidates[idx].clone();
-                    return self.commit_selected(&mut state, &cand);
+            if follow_main {
+                let has_comp = !state.input_buffer.is_empty()
+                    || !state.committed_text.is_empty()
+                    || !state.candidates.is_empty();
+                if let Some(d) = npc.to_digit(10) {
+                    // 数字键：完全等同主键盘数字键——空缓冲透传输出数字，否则选词/越界 overflow。
+                    // `0` 对齐主键盘选第 10 个候选（num=10）。
+                    if !has_comp {
+                        return KeyAction::PassThrough;
+                    }
+                    let num = if d == 0 { 10 } else { d as usize };
+                    return self.handle_number_key_select(&mut state, num);
                 }
+                // 运算符 / 小数点：等同主键盘标点——有组合先顶字上屏高亮候选，再输出该字符。
+                let committed = self.take_committed(&mut state);
+                let mut out = self.maybe_s2t(&state, &committed);
+                if !state.candidates.is_empty() {
+                    let idx = self
+                        .highlighted_global_index(&state)
+                        .min(state.candidates.len() - 1);
+                    let t = state.candidates[idx].text.clone();
+                    self.record_selection(&state.input_buffer, &t);
+                    out.push_str(&self.maybe_s2t(&state, &t));
+                }
+                state.input_buffer.clear();
+                state.candidates.clear();
+                if has_comp {
+                    self.notify_ui_hide();
+                }
+                out.push_str(&if state.full_width {
+                    to_full_width(&npc.to_string())
+                } else {
+                    npc.to_string()
+                });
+                return Self::commit_action(out, state.chinese_mode);
             }
-            // direct（默认 / follow_main 未命中候选）：丢弃当前编码，直接输出小键盘字符。
+            // direct（默认）：丢弃当前未上屏编码，直接输出小键盘字符。
             if !state.input_buffer.is_empty()
                 || !state.committed_text.is_empty()
                 || !state.candidates.is_empty()
@@ -2128,26 +2156,17 @@ impl MessageHandler for Coordinator {
                 }
             }
             keymap::VK_1..=keymap::VK_9 if data.modifiers & MOD_SHIFT == 0 => {
-                // 数字键 1-9 选当前页第 N 个候选（Shift+数字走标点分支）
-                let (start, end) = self.page_range(&state);
-                let in_page = (data.key_code - 0x31) as usize;
-                let idx = start + in_page;
-                if idx < end {
-                    let cand = state.candidates[idx].clone();
-                    self.commit_selected(&mut state, &cand)
-                } else if !state.input_buffer.is_empty() || !state.committed_text.is_empty() {
-                    let prefix = self.take_committed(&mut state);
-                    let mut text = format!("{}{}", prefix, state.input_buffer);
-                    state.input_buffer.clear();
-                    state.candidates.clear();
-                    // 数字键 vk keymap::VK_1..=keymap::VK_9 即 ASCII '1'..='9'
-                    text.push(data.key_code as u8 as char);
-                    let text = self.maybe_s2t(&state, &text);
-                    self.notify_ui_hide();
-                    Self::commit_action(text, true)
-                } else {
-                    KeyAction::PassThrough
+                // 数字键 1-9 选当前页第 N 个候选；越界按 input.overflow.number_key 处理
+                // （ignore 吞键 / commit 上屏高亮 / commit_and_input 顶字+数字，对齐 Go）。
+                let num = (data.key_code - 0x31) as usize + 1; // 1..=9
+                // 无候选时保持透传：纯数字键应输出数字（不拦截空缓冲下的数字）。
+                if state.candidates.is_empty()
+                    && state.input_buffer.is_empty()
+                    && state.committed_text.is_empty()
+                {
+                    return KeyAction::PassThrough;
                 }
+                self.handle_number_key_select(&mut state, num)
             }
             keymap::VK_A..=keymap::VK_Z => {
                 // A-Z 字母累积

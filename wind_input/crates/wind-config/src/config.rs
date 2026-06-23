@@ -222,6 +222,9 @@ pub struct InputConfig {
     /// 标点配对（输入左括号自动补右括号 + 输右括号智能跳过）
     #[serde(default)]
     pub auto_pair: AutoPairConfig,
+    /// 候选无效按键策略（数字键/次选三选键/以词定字键超出候选范围时的处理）
+    #[serde(default)]
+    pub overflow: OverflowConfig,
     #[serde(default = "default_enter_behavior")]
     pub enter_behavior: String,
     #[serde(default = "default_space_behavior")]
@@ -413,6 +416,36 @@ impl Default for UrlInputConfig {
     }
 }
 
+/// 候选无效按键策略（对齐 Go OverflowConfig）。
+/// 每项取值："ignore"（吞键无效）/ "commit"（上屏当前高亮候选）/
+/// "commit_and_input"（上屏高亮候选 + 追加按键字符）。默认全 ignore。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OverflowConfig {
+    /// 数字键超出当前页候选数量时
+    #[serde(default = "default_overflow_behavior")]
+    pub number_key: String,
+    /// 次选/三选键候选不足时
+    #[serde(default = "default_overflow_behavior")]
+    pub select_key: String,
+    /// 以词定字键候选词长度不足时
+    #[serde(default = "default_overflow_behavior")]
+    pub select_char_key: String,
+}
+
+fn default_overflow_behavior() -> String {
+    "ignore".to_string()
+}
+
+impl Default for OverflowConfig {
+    fn default() -> Self {
+        Self {
+            number_key: default_overflow_behavior(),
+            select_key: default_overflow_behavior(),
+            select_char_key: default_overflow_behavior(),
+        }
+    }
+}
+
 impl Default for InputConfig {
     fn default() -> Self {
         Self {
@@ -429,6 +462,7 @@ impl Default for InputConfig {
             smart_symbol_chars: default_smart_symbol_chars(),
             punct_custom: PunctCustomConfig::default(),
             auto_pair: AutoPairConfig::default(),
+            overflow: OverflowConfig::default(),
             temp_pinyin: TempPinyinConfig::default(),
             enter_behavior: "commit".to_string(),
             space_on_empty_behavior: "commit".to_string(),

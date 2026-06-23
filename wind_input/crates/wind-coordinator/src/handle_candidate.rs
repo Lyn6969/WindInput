@@ -514,6 +514,73 @@ impl Coordinator {
         }
     }
 
+    /// 数字键选词统一入口（num 为 1-based：1-9 选页内对应候选，10 表示主键盘 `0` 选第 10 个）。
+    /// 命中当前页范围 → 选词上屏；越界 → 走 overflow 策略（对齐 Go handleNumberKey）。
+    pub(crate) fn handle_number_key_select(&self, state: &mut State, num: usize) -> KeyAction {
+        let (start, end) = self.page_range(state);
+        let idx = start + (num - 1);
+        if idx < end {
+            let cand = state.candidates[idx].clone();
+            return self.commit_selected(state, &cand);
+        }
+        self.handle_overflow_number_key(state, num)
+    }
+
+    /// 数字键超出当前页候选范围时的处理（对齐 Go handleOverflowNumberKey）。
+    /// 依 `input.overflow.number_key`：ignore 吞键 / commit 上屏高亮候选 /
+    /// commit_and_input 上屏高亮候选并追加数字字符。无候选或无有效高亮时一律吞键。
+    pub(crate) fn handle_overflow_number_key(&self, state: &mut State, num: usize) -> KeyAction {
+        if state.candidates.is_empty() {
+            return KeyAction::Consumed;
+        }
+        let hi = self.highlighted_global_index(state);
+        if hi >= state.candidates.len() {
+            return KeyAction::Consumed;
+        }
+        let behavior = self.rt().config.input.overflow.number_key.clone();
+        match behavior.as_str() {
+            "commit" => {
+                let cand = state.candidates[hi].clone();
+                self.commit_selected(state, &cand)
+            }
+            "commit_and_input" => {
+                let full_width = state.full_width;
+                let cand = state.candidates[hi].clone();
+                let act = self.commit_selected(state, &cand);
+                let digit = (b'0' + (num % 10) as u8) as char;
+                let digit = if full_width {
+                    wind_transform::fullwidth::to_full_width(&digit.to_string())
+                } else {
+                    digit.to_string()
+                };
+                Self::append_to_insert_text(act, &digit)
+            }
+            // "ignore" 及未知值：吞键无效（保留组合，不上屏）
+            _ => KeyAction::Consumed,
+        }
+    }
+
+    /// 把附加文本拼到 InsertText 结局尾部（用于 overflow commit_and_input 追加数字/标点）；
+    /// 其它 KeyAction（如分段选择产生的 UpdateComposition）原样返回。
+    pub(crate) fn append_to_insert_text(act: KeyAction, extra: &str) -> KeyAction {
+        match act {
+            KeyAction::InsertText {
+                text,
+                new_composition,
+                mode_changed,
+                chinese_mode,
+                has_new_composition,
+            } => KeyAction::InsertText {
+                text: format!("{}{}", text, extra),
+                new_composition,
+                mode_changed,
+                chinese_mode,
+                has_new_composition,
+            },
+            other => other,
+        }
+    }
+
     /// $CC 命令候选选中：清理组合区、隐藏 UI，把命令源放独立线程异步执行。
     /// **异步是必须的**：控制器经 Weak 回调 handle_menu_command 等自锁方法，而此刻本线程
     /// 仍持 state 锁（std::sync::Mutex 非可重入），同线程重入即死锁——交独立线程待本次按键
