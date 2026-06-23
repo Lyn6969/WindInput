@@ -150,6 +150,16 @@ impl Coordinator {
         if let Some(prev) = state.quick_saved_vertical.take() {
             let _ = self.ui_tx.send(UiCommand::SetCandidateLayout(prev));
         }
+        // 快捷加词模式遗留：焦点/模式切换时退出并恢复布局。
+        if state.add_word_active {
+            state.add_word_active = false;
+            state.add_word_chars.clear();
+            state.add_word_len = 0;
+            state.add_word_code.clear();
+            if let Some(prev) = state.add_word_saved_vertical.take() {
+                let _ = self.ui_tx.send(UiCommand::SetCandidateLayout(prev));
+            }
+        }
         if dirty {
             debug!("reset_exclusive_modes: cleared residual exclusive input mode state");
         }

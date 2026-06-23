@@ -324,6 +324,17 @@ pub(crate) struct State {
     /// 菜单目标候选（页内下标 + 文本），供候选词条操作/复制
     pub(crate) menu_target_page_local: usize,
     pub(crate) menu_target_text: String,
+    /// 快捷加词模式（对齐 Go addWordState）：候选窗内从最近上屏字符选字组词加入用户词库。
+    /// 与 `active`（独占输入模式）正交：加词模式不处理编码输入，仅 ↑↓ 调词长 / Enter 确认。
+    pub(crate) add_word_active: bool,
+    /// 加词候选字符池（最近上屏字符，时间序：旧→新，末尾为最近一字）。
+    pub(crate) add_word_chars: Vec<char>,
+    /// 当前选取的词长（取 `add_word_chars` 末尾 N 字；0 = 无可用字符）。
+    pub(crate) add_word_len: usize,
+    /// 当前词自动计算的编码（拼音生成 / 码表反查；空 = 无法计算，确认时中止）。
+    pub(crate) add_word_code: String,
+    /// 加词模式「强制竖排」时记住进入前的布局（Some(原 vertical) = 已强制，退出恢复）。
+    pub(crate) add_word_saved_vertical: Option<bool>,
 }
 
 /// 智能符号模式待命态：press1 提交一个参与集合内的中文标点后武装，等待时限内同键 press2
@@ -746,6 +757,11 @@ impl Coordinator {
                 menu_open: false,
                 menu_target_page_local: 0,
                 menu_target_text: String::new(),
+                add_word_active: false,
+                add_word_chars: Vec::new(),
+                add_word_len: 0,
+                add_word_code: String::new(),
+                add_word_saved_vertical: None,
             }),
             push_server,
             rt: std::sync::RwLock::new(std::sync::Arc::new(bundle)),
@@ -1329,6 +1345,7 @@ impl Coordinator {
                     } else {
                         String::new()
                     },
+                    no_index: false,
                 }
             })
             .collect();
@@ -1934,7 +1951,14 @@ impl MessageHandler for Coordinator {
                 action, norm_hash
             );
             let action = action.to_string();
-            if self.dispatch_hotkey(&action) {
+            // 加词热键需返回占位 composition（激活 C++ 转发全部按键），不符 dispatch_hotkey
+            // 的「bool→StatusUpdate」契约，故在此特判直接返回 KeyAction。仅中文模式响应。
+            if action == "add_word" {
+                let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+                if state.chinese_mode {
+                    return self.enter_add_word_mode(&mut state);
+                }
+            } else if self.dispatch_hotkey(&action) {
                 return KeyAction::StatusUpdate(self.build_status());
             }
         }
@@ -1947,6 +1971,11 @@ impl MessageHandler for Coordinator {
         }
 
         let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+
+        // 快捷加词模式：消费全部按键（↑↓调词长/Enter确认/Esc退出），先于英文透传与单点分派。
+        if state.add_word_active {
+            return self.handle_add_word_key(&mut state, data);
+        }
 
         // 英文模式：直接透传
         if !state.chinese_mode {

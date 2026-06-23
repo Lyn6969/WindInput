@@ -29,6 +29,9 @@ pub struct CandidateItem {
     pub tooltip: String,
     /// 候选注释（编码后缀/短语提示等），非空时在候选词右侧以注释样式内联显示；空则不显示
     pub comment: String,
+    /// 为 true 时完全不渲染序号节点（用于非候选的提示行，如快捷加词预览），
+    /// 避免默认主题下出现空的序号圆圈。
+    pub no_index: bool,
 }
 
 /// 候选窗口配置
@@ -828,31 +831,11 @@ impl CandidateWindow {
             order.reverse();
         }
         for (i, cand) in order {
-            let marker = if cand.label.is_empty() {
-                (i + 1).to_string()
-            } else {
-                cand.label.clone()
-            };
             let is_sel = i == self.selected;
             let is_hover = self.hover >= 0 && self.hover as usize == i;
             // 状态文字色（选中/悬停各自的色，回退基态）。
             let txt_color = eff_text(&v.text, text_color, is_sel, is_hover);
-            let idx_color = eff_text(&v.index, index_color, is_sel, is_hover);
             let cmt_color = eff_text(&v.comment, comment_color, is_sel, is_hover);
-
-            // 序号：圆圈样式 → 方形节点 + 真圆背景 + 居中数字。
-            let mut idx_leaf = View::leaf(marker, idx_color)
-                .font_size(index_fs)
-                .pad(edges_or(&v.index.padding, [0.0; 4]))
-                .margin(edges_or(&v.index.margin, [0.0; 4]));
-            if index_circle {
-                let d = (index_fs * 1.5).round();
-                idx_leaf = idx_leaf
-                    .circle_bg(index_circle_bg)
-                    .fixed_w(d)
-                    .fixed_h(d)
-                    .text_align(Align::Center);
-            }
 
             // 行内间距改由各子节点 margin 承载（与前端盒模型一致）：text.margin.left 默认 4dp
             // 作为序号↔文字间距；不再用容器 gap 借 text.margin.left。
@@ -861,14 +844,42 @@ impl CandidateWindow {
                 .pad(item_pad)
                 .margin(edges_or(&v.item.margin, [0.0; 4]))
                 .radius(item_radius)
-                .tag(i as i32)
-                .child(idx_leaf)
-                .child(
-                    View::leaf(cand.text.clone(), txt_color)
-                        .font_size(text_fs)
-                        .pad(edges_or(&v.text.padding, [0.0; 4]))
-                        .margin(edges_or(&v.text.margin, [0.0, 0.0, 0.0, 4.0])),
-                );
+                .tag(i as i32);
+            // 序号节点：no_index 项（如快捷加词提示行）完全跳过，避免空圆圈占位。
+            if !cand.no_index {
+                let marker = if cand.label.is_empty() {
+                    (i + 1).to_string()
+                } else {
+                    cand.label.clone()
+                };
+                let idx_color = eff_text(&v.index, index_color, is_sel, is_hover);
+                // 圆圈样式 → 方形节点 + 真圆背景 + 居中数字。
+                let mut idx_leaf = View::leaf(marker, idx_color)
+                    .font_size(index_fs)
+                    .pad(edges_or(&v.index.padding, [0.0; 4]))
+                    .margin(edges_or(&v.index.margin, [0.0; 4]));
+                if index_circle {
+                    let d = (index_fs * 1.5).round();
+                    idx_leaf = idx_leaf
+                        .circle_bg(index_circle_bg)
+                        .fixed_w(d)
+                        .fixed_h(d)
+                        .text_align(Align::Center);
+                }
+                item = item.child(idx_leaf);
+            }
+            // no_index 行无序号节点：文字左边距归零，顶格不留序号间距（消除占位）。
+            let text_margin = if cand.no_index {
+                Edges::default()
+            } else {
+                edges_or(&v.text.margin, [0.0, 0.0, 0.0, 4.0])
+            };
+            item = item.child(
+                View::leaf(cand.text.clone(), txt_color)
+                    .font_size(text_fs)
+                    .pad(edges_or(&v.text.padding, [0.0; 4]))
+                    .margin(text_margin),
+            );
             // 注释（编码后缀/短语提示）：非空时在候选词右侧以注释样式内联显示。
             // 内/外边距完整消费：comment.padding 四边 + comment.margin 四边（左默认 6dp 兜底间距）。
             if !cand.comment.is_empty() {
