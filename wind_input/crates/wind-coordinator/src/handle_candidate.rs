@@ -674,6 +674,64 @@ impl Coordinator {
         self.notify_ui_update(&state);
     }
 
+    /// 候选词操作热键匹配（对齐 Go matchCandidateActionKey，但 `0` 扩展为第 10 候选）。
+    /// template ∈ {"ctrl+number","ctrl+shift+number"}，命中返回 1-based 页内序号(1-10)，否则 0。
+    /// 数字键 1-9 → 序号 1-9；`0` → 序号 10（候选窗最多 10 项，与主键盘/小键盘选词一致）。
+    fn match_candidate_action_key(
+        template: &str,
+        has_ctrl: bool,
+        has_shift: bool,
+        key_code: u32,
+    ) -> usize {
+        // 0x30..=0x39 = '0'..'9'；'0' 映射为第 10 个候选。
+        let num = match key_code {
+            0x30 => 10,
+            0x31..=0x39 => (key_code - 0x30) as usize,
+            _ => return 0,
+        };
+        match template.trim().to_lowercase().as_str() {
+            "ctrl+number" if has_ctrl && !has_shift => num,
+            "ctrl+shift+number" if has_ctrl && has_shift => num,
+            _ => 0,
+        }
+    }
+
+    /// Ctrl+数字 / Ctrl+Shift+数字 置顶/删除当前页候选（对齐 Go handle_key_event 候选热键段）。
+    /// 仅中文模式 + 正常码表输入态（有候选 + 有输入码 + 非独占模式）生效；命中即消费按键。
+    /// 复用 `candidate_op`（页内序号驱动的 shadow 改写 + 重排重绘）。
+    pub(crate) fn handle_candidate_action_hotkey(&self, data: &KeyEventData) -> Option<KeyAction> {
+        use wind_ipc::protocol::{MOD_CTRL, MOD_SHIFT};
+        if data.modifiers & MOD_CTRL == 0 {
+            return None;
+        }
+        let has_shift = data.modifiers & MOD_SHIFT != 0;
+        let h = &self.rt().config.hotkeys;
+        // 删除优先匹配（与 Go 顺序一致：DeleteCandidate 先于 PinCandidate）。
+        let del = Self::match_candidate_action_key(&h.delete_candidate, true, has_shift, data.key_code);
+        let pin = Self::match_candidate_action_key(&h.pin_candidate, true, has_shift, data.key_code);
+        let (op, num) = if del > 0 {
+            (CandidateOp::Delete, del)
+        } else if pin > 0 {
+            (CandidateOp::MoveTop, pin)
+        } else {
+            return None;
+        };
+        // 门控：仅正常码表输入态。独占模式 input_buffer 必空，故下方判定亦自然排除之。
+        {
+            let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+            if !state.chinese_mode
+                || state.active.is_some()
+                || state.candidates.is_empty()
+                || state.input_buffer.is_empty()
+            {
+                return None;
+            }
+        }
+        // candidate_op 自行重新加锁并做页范围/单字保护校验。
+        self.candidate_op(op, num - 1);
+        Some(KeyAction::Consumed)
+    }
+
     /// 点击选词：提交页内第 N 个候选，经 push 管道异步上屏（对齐 Go PushCommitText）。
     pub(crate) fn mouse_select(&self, page_local: usize) {
         let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());

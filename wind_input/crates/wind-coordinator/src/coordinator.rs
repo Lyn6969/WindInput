@@ -1723,6 +1723,10 @@ impl Coordinator {
                 self.show_status();
                 true
             }
+            "open_settings" => {
+                self.open_settings(None);
+                true
+            }
             _ => {
                 debug!("Unhandled hotkey action: {}", action);
                 false
@@ -1933,6 +1937,13 @@ impl MessageHandler for Coordinator {
             if self.dispatch_hotkey(&action) {
                 return KeyAction::StatusUpdate(self.build_status());
             }
+        }
+
+        // ── 候选词操作热键（Ctrl+数字 置顶/删除）──
+        // 这两组在编译期仅注册转发（action 为空，上方匹配不触发），实际语义在此分派。
+        // 须先于下方 Ctrl/Alt 组合「清空隐藏候选」分支，否则 Ctrl+数字 会被当作普通组合吞掉。
+        if let Some(act) = self.handle_candidate_action_hotkey(data) {
+            return act;
         }
 
         let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());

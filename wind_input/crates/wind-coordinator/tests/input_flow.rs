@@ -47,6 +47,13 @@ fn key_event(key_code: u32, event_type: u8) -> KeyEventData {
     }
 }
 
+fn key_event_mods(key_code: u32, event_type: u8, modifiers: u32) -> KeyEventData {
+    KeyEventData {
+        modifiers,
+        ..key_event(key_code, event_type)
+    }
+}
+
 /// 按下一个字母键（vk = ASCII 大写）
 fn press_letter(coord: &Coordinator, c: char) -> KeyAction {
     let vk = (c.to_ascii_uppercase() as u32) & 0xFF;
@@ -151,6 +158,64 @@ fn test_url_mode_enter_and_commit() {
         }
         other => panic!("网址空格应上屏 InsertText，实际: {:?}", other),
     }
+}
+
+#[test]
+fn test_pin_candidate_hotkey_consumed_and_gated() {
+    if !has_schemas() {
+        return;
+    }
+    use wind_ipc::protocol::MOD_CTRL;
+    // #12 候选热键：默认 pin=ctrl+number。有候选+有输入码时 Ctrl+2 消费按键（置顶第2候选）；
+    // 无组合时 Ctrl+2 不应被当作候选热键吞掉（透传给应用）。
+    let coord = Coordinator::new_headless(config_with("wubi86"), Some(&data_dir()));
+
+    // 有组合：输入 "aaaa" 产生候选，Ctrl+2 → Consumed
+    for c in ['a', 'a', 'a', 'a'] {
+        press_letter(&coord, c);
+    }
+    let pin = coord.handle_key_event(&key_event_mods(0x32, EVENT_KEY_DOWN, MOD_CTRL));
+    assert!(
+        matches!(pin, KeyAction::Consumed),
+        "有候选时 Ctrl+2 应被候选热键消费，实际: {:?}",
+        pin
+    );
+
+    // Ctrl+0 → 第 10 候选（候选窗最大 10 项），同样应被消费（范围校验在 candidate_op 内）。
+    let pin0 = coord.handle_key_event(&key_event_mods(0x30, EVENT_KEY_DOWN, MOD_CTRL));
+    assert!(
+        matches!(pin0, KeyAction::Consumed),
+        "Ctrl+0 应作为第 10 候选热键被消费，实际: {:?}",
+        pin0
+    );
+
+    // 无组合：另起 coordinator，未输入任何码，Ctrl+2 → 不消费（PassThrough）
+    let coord2 = Coordinator::new_headless(config_with("wubi86"), Some(&data_dir()));
+    let no_comp = coord2.handle_key_event(&key_event_mods(0x32, EVENT_KEY_DOWN, MOD_CTRL));
+    assert!(
+        matches!(no_comp, KeyAction::PassThrough),
+        "无组合时 Ctrl+2 不应被候选热键吞掉，实际: {:?}",
+        no_comp
+    );
+}
+
+#[test]
+fn test_delete_candidate_hotkey_shift_gating() {
+    if !has_schemas() {
+        return;
+    }
+    use wind_ipc::protocol::{MOD_CTRL, MOD_SHIFT};
+    // 默认 delete=ctrl+shift+number。有候选时 Ctrl+Shift+3 消费（删除第3候选）。
+    let coord = Coordinator::new_headless(config_with("wubi86"), Some(&data_dir()));
+    for c in ['a', 'a', 'a', 'a'] {
+        press_letter(&coord, c);
+    }
+    let del = coord.handle_key_event(&key_event_mods(0x33, EVENT_KEY_DOWN, MOD_CTRL | MOD_SHIFT));
+    assert!(
+        matches!(del, KeyAction::Consumed),
+        "有候选时 Ctrl+Shift+3 应被删除热键消费，实际: {:?}",
+        del
+    );
 }
 
 #[test]
