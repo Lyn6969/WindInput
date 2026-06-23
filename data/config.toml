@@ -43,6 +43,9 @@ filter_mode = "smart"
 select_key_groups = ["semicolon_quote"]
 page_keys = ["pageupdown", "minus_equal"]
 highlight_keys = ["arrows", "tab"]
+# 以词定字：用成对标点键从当前高亮候选词中逐字上屏（第1键取第1字、第2键取第2字）。
+# 可选键组 comma_period(,/.) / minus_equal(-/=) / brackets([/])；空数组=禁用。
+# 词长不足时按 [input.overflow].select_char_key 策略处理。
 select_char_keys = []
 smart_punct_after_digit = true
 smart_punct_list = ".,:"
@@ -81,6 +84,9 @@ english_pairs = ["()", "[]", "{}", "<>"]
 [input.punct_custom]
 enabled = false
 
+# 无效按键策略（候选不足以命中目标位次时）：ignore=吞键 / commit=上屏高亮候选 /
+# commit_and_input=上屏高亮候选并追加该键字符。number_key=数字键、select_key=次/三选键、
+# select_char_key=以词定字键。
 [input.overflow]
 number_key = "ignore"
 select_key = "ignore"

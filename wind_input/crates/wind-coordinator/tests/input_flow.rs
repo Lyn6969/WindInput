@@ -1482,3 +1482,154 @@ fn test_semicolon_overflow_falls_to_mix_not_overflow() {
     }
 }
 
+// ---- 以词定字（select_char_keys，对齐 Go handleSelectChar/handleSelectCharWithOverflow）----
+// comma_period 组：`,`(VK_OEM_COMMA=0xBC) 取第 1 字，`.`(VK_OEM_PERIOD=0xBE) 取第 2 字。
+
+#[test]
+fn test_select_char_first_and_second() {
+    if !has_schemas() {
+        return;
+    }
+    // 启用以词定字 comma_period：从当前高亮候选词逐字上屏。
+    let mut cfg = config_with("pinyin");
+    cfg.input.select_char_keys = vec!["comma_period".into()];
+    let coord = Coordinator::new_headless(cfg, Some(&data_dir()));
+    for c in "nihao".chars() {
+        press_letter(&coord, c);
+    }
+    let texts = coord.debug_page_texts();
+    if texts.is_empty() {
+        return;
+    }
+    let word: Vec<char> = texts[0].chars().collect();
+    if word.len() < 2 {
+        return; // 需高亮词 ≥ 2 字方能测第 1/第 2 字
+    }
+    // `,` → 取第 1 字
+    match coord.handle_key_event(&key_event(0xBC, EVENT_KEY_DOWN)) {
+        KeyAction::InsertText { text, .. } => {
+            assert_eq!(text, word[0].to_string(), ", 应上屏高亮词第 1 字");
+        }
+        other => panic!(", 应以词定字上屏第 1 字，实际: {:?}", other),
+    }
+    // 重新输入，`.` → 取第 2 字
+    for c in "nihao".chars() {
+        press_letter(&coord, c);
+    }
+    match coord.handle_key_event(&key_event(0xBE, EVENT_KEY_DOWN)) {
+        KeyAction::InsertText { text, .. } => {
+            assert_eq!(text, word[1].to_string(), ". 应上屏高亮词第 2 字");
+        }
+        other => panic!(". 应以词定字上屏第 2 字，实际: {:?}", other),
+    }
+}
+
+#[test]
+fn test_select_char_disabled_by_default() {
+    if !has_schemas() {
+        return;
+    }
+    // 默认 select_char_keys 为空 → `,` 不作以词定字，走正常标点流水线（零回归）。
+    let coord = Coordinator::new_headless(config_with("pinyin"), Some(&data_dir()));
+    for c in "nihao".chars() {
+        press_letter(&coord, c);
+    }
+    let texts = coord.debug_page_texts();
+    if texts.is_empty() {
+        return;
+    }
+    let first_char = texts[0].chars().next().unwrap().to_string();
+    let act = coord.handle_key_event(&key_event(0xBC, EVENT_KEY_DOWN));
+    if let KeyAction::InsertText { text, .. } = &act {
+        assert_ne!(
+            *text, first_char,
+            "默认禁用时 , 不应只上屏首字（应走标点：顶词+逗号）"
+        );
+    }
+}
+
+#[test]
+fn test_select_char_overflow_ignore_default() {
+    if !has_schemas() {
+        return;
+    }
+    // 高亮词仅 1 字时按 `.`（取第 2 字）越界，默认 overflow.select_char_key = ignore → 吞键。
+    let mut cfg = config_with("wubi86");
+    cfg.input.select_char_keys = vec!["comma_period".into()];
+    let coord = Coordinator::new_headless(cfg, Some(&data_dir()));
+    for c in "qqqq".chars() {
+        press_letter(&coord, c);
+    }
+    let texts = coord.debug_page_texts();
+    if texts.is_empty() || texts[0].chars().count() != 1 {
+        return; // 需高亮为单字词方能让 . 越界
+    }
+    let act = coord.handle_key_event(&key_event(0xBE, EVENT_KEY_DOWN)); // . VK_OEM_PERIOD
+    assert!(
+        matches!(act, KeyAction::Consumed),
+        "默认 ignore 下以词定字越界应吞键(Consumed)，实际: {:?}",
+        act
+    );
+}
+
+#[test]
+fn test_select_char_overflow_commit() {
+    if !has_schemas() {
+        return;
+    }
+    // overflow.select_char_key = commit：越界时上屏当前高亮候选，不追加触发键字符。
+    let mut cfg = config_with("wubi86");
+    cfg.input.select_char_keys = vec!["comma_period".into()];
+    cfg.input.overflow.select_char_key = "commit".into();
+    let coord = Coordinator::new_headless(cfg, Some(&data_dir()));
+    for c in "qqqq".chars() {
+        press_letter(&coord, c);
+    }
+    let texts = coord.debug_page_texts();
+    if texts.is_empty() || texts[0].chars().count() != 1 {
+        return;
+    }
+    let highlighted = texts[0].clone();
+    match coord.handle_key_event(&key_event(0xBE, EVENT_KEY_DOWN)) {
+        KeyAction::InsertText { text, .. } => {
+            assert_eq!(text, highlighted, "commit 应只上屏高亮候选，无追加字符");
+        }
+        other => panic!("commit 应 InsertText，实际: {:?}", other),
+    }
+}
+
+#[test]
+fn test_select_char_overflow_commit_and_input() {
+    if !has_schemas() {
+        return;
+    }
+    // overflow.select_char_key = commit_and_input：越界时上屏高亮候选 + 追加转换后的触发键字符。
+    let mut cfg = config_with("wubi86");
+    cfg.input.select_char_keys = vec!["comma_period".into()];
+    cfg.input.overflow.select_char_key = "commit_and_input".into();
+    let coord = Coordinator::new_headless(cfg, Some(&data_dir()));
+    for c in "qqqq".chars() {
+        press_letter(&coord, c);
+    }
+    let texts = coord.debug_page_texts();
+    if texts.is_empty() || texts[0].chars().count() != 1 {
+        return;
+    }
+    let highlighted = texts[0].clone();
+    match coord.handle_key_event(&key_event(0xBE, EVENT_KEY_DOWN)) {
+        KeyAction::InsertText { text, .. } => {
+            assert!(
+                text.starts_with(&highlighted),
+                "commit_and_input 应以高亮候选开头，实际: {}",
+                text
+            );
+            assert!(
+                text.chars().count() > highlighted.chars().count(),
+                "commit_and_input 应在候选后追加触发键字符，实际: {}",
+                text
+            );
+        }
+        other => panic!("commit_and_input 应 InsertText，实际: {:?}", other),
+    }
+}
+

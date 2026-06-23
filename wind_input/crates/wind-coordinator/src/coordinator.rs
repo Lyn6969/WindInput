@@ -2006,6 +2006,22 @@ impl MessageHandler for Coordinator {
             data.key_code, data.modifiers, state.chinese_mode, state.input_buffer
         );
 
+        // 以词定字（select_char）：配置的成对标点键从当前高亮候选词逐字上屏（对齐 Go
+        // handleEngineDefault——select_char 优先于翻页键，故置于 apply_nav_key 之前）。默认
+        // `select_char_keys` 为空 → select_char_index 恒 None → 跳过（零回归）。仅在缓冲非空或
+        // 有候选时拦截；空缓冲且无候选时放行，让 `,`/`.` 作普通标点（对齐 Go 空缓冲回退标点）。
+        if data.modifiers & MOD_SHIFT == 0
+            && (!state.input_buffer.is_empty() || !state.candidates.is_empty())
+            && let Some(char_index) = self.select_char_index(data.key_code)
+        {
+            return self.handle_select_char_with_overflow(
+                &mut state,
+                char_index,
+                data.key_code,
+                data.prev_char,
+            );
+        }
+
         // 候选翻页/高亮：配置驱动统一处理（普通模式为码表型，`-`/`=` 可作翻页）。
         // 仅有候选时生效；无候选时下方 match 的回退臂负责透传方向/翻页键。
         if let Some(act) = self.apply_nav_key(&mut state, data, true) {

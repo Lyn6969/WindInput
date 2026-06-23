@@ -241,6 +241,17 @@ pub fn select_key_vks(group: &str) -> Vec<u32> {
     }
 }
 
+/// 以词定字键组 → 有序 VK 列表（位置 0 = 取第 1 字，位置 1 = 取第 2 字）。
+/// 允许的键组（对齐 Go selectCharAllowedGroups）：comma_period / minus_equal / brackets。
+pub fn select_char_vks(group: &str) -> Vec<u32> {
+    match group.trim().to_lowercase().as_str() {
+        "comma_period" => vec![VK_OEM_COMMA, VK_OEM_PERIOD],
+        "minus_equal" => vec![VK_OEM_MINUS, VK_OEM_PLUS],
+        "brackets" => vec![VK_OEM_4, VK_OEM_6],
+        _ => Vec::new(),
+    }
+}
+
 /// 翻页键组 → raw hash 列表
 fn compile_page_key_group(group: &str) -> Vec<u32> {
     match group.trim().to_lowercase().as_str() {

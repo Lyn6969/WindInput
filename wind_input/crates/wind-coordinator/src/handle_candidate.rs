@@ -392,6 +392,18 @@ impl Coordinator {
         None
     }
 
+    /// 若 key_code 是配置的以词定字键，返回取字下标（0=取第 1 字，1=取第 2 字）。
+    /// 默认 `select_char_keys` 为空 → 恒返回 None（功能禁用，零回归）。
+    pub(crate) fn select_char_index(&self, key_code: u32) -> Option<usize> {
+        for group in &self.rt().config.input.select_char_keys {
+            let vks = hotkey::select_char_vks(group);
+            if let Some(pos) = vks.iter().position(|vk| *vk == key_code) {
+                return Some(pos);
+            }
+        }
+        None
+    }
+
     /// 当前页候选切片的 [start, end) 区间
     pub(crate) fn page_range(&self, state: &State) -> (usize, usize) {
         let pp = self.per_page(state.active);
@@ -613,6 +625,100 @@ impl Coordinator {
                 Self::append_to_insert_text(act, &piece)
             }
             // "ignore" 及未知值：吞键无效（保留组合，不上屏）
+            _ => KeyAction::Consumed,
+        }
+    }
+
+    /// 以词定字：从当前高亮候选词中取第 `char_index` 个字符上屏（0-based，对齐 Go
+    /// handleSelectChar）。返回 `None` 表示「无法以词定字」——无候选 / 无缓冲 / 候选词长度不足 /
+    /// 命中的是未展开的组候选（组名不可作字源）——交调用方按 overflow 策略处理。
+    pub(crate) fn handle_select_char(&self, state: &mut State, char_index: usize) -> Option<KeyAction> {
+        if state.candidates.is_empty() || state.input_buffer.is_empty() {
+            return None;
+        }
+        let hi = self.highlighted_global_index(state);
+        if hi >= state.candidates.len() {
+            return None;
+        }
+        let cand = state.candidates[hi].clone();
+        // 未展开的组候选（cand.text 是组名如「标点符号」）不可作字源 → 吞键，让用户先展开
+        // （与 commit_selected 的组候选二级选择一致）。
+        if cand.is_group {
+            return Some(KeyAction::Consumed);
+        }
+        let runes: Vec<char> = cand.text.chars().collect();
+        // 候选词长度不足 → None，由调用方按 overflow 处理
+        if char_index >= runes.len() {
+            return None;
+        }
+        // 词频学习：以词定字应记实际选的「单字」（非整词），否则造词策略会误判为多字词；
+        // 仅普通候选（无副作用命令 Action）才学（对齐 Go len(cand.Actions)==0）。
+        if cand.actions.is_empty() {
+            let code = Self::cand_code(&state.input_buffer, &cand);
+            self.record_selection(&code, &runes[char_index].to_string());
+        }
+        // 拼接已确认段前缀 + 选中单字，整体按简繁模式转换（与 commit_selected 一致）。
+        let combined = format!("{}{}", state.committed_text, runes[char_index]);
+        let out = self.maybe_s2t(state, &combined);
+        let chinese = state.chinese_mode;
+        self.reset_pinyin_composition(state);
+        self.notify_ui_hide();
+        Some(Self::commit_action(out, chinese))
+    }
+
+    /// 以词定字的完整流程，含 overflow 策略（对齐 Go handleSelectCharWithOverflow）。
+    /// 仅在缓冲非空或有候选时调用（空缓冲且无候选的 `,`/`.` 应作普通标点，由调用方放行）。
+    /// 先尝试正常以词定字；失败（词长不足/空码）则按 `input.overflow.select_char_key` 处理，
+    /// 三策与 select_key overflow 同构：ignore 吞键 / commit 上屏高亮 / commit_and_input 追加字符。
+    pub(crate) fn handle_select_char_with_overflow(
+        &self,
+        state: &mut State,
+        char_index: usize,
+        key_code: u32,
+        prev_char: u16,
+    ) -> KeyAction {
+        if let Some(act) = self.handle_select_char(state, char_index) {
+            return act;
+        }
+        // None：候选词长度不足 / 空码。触发键字符用于 commit_and_input 追加。
+        let key_char = crate::coordinator::punct_char(key_code, false);
+        let behavior = self.rt().config.input.overflow.select_char_key.clone();
+        // 空码（缓冲非空但无候选）
+        if state.candidates.is_empty() {
+            return match behavior.as_str() {
+                "commit" => {
+                    self.reset_pinyin_composition(state);
+                    self.notify_ui_hide();
+                    KeyAction::ClearComposition
+                }
+                "commit_and_input" => {
+                    let piece = key_char
+                        .map(|c| self.convert_punct(state, c, prev_char))
+                        .unwrap_or_default();
+                    self.reset_pinyin_composition(state);
+                    self.notify_ui_hide();
+                    Self::commit_action(piece, state.chinese_mode)
+                }
+                _ => KeyAction::Consumed,
+            };
+        }
+        let hi = self.highlighted_global_index(state);
+        if hi >= state.candidates.len() {
+            return KeyAction::Consumed;
+        }
+        match behavior.as_str() {
+            "commit" => {
+                let cand = state.candidates[hi].clone();
+                self.commit_selected(state, &cand)
+            }
+            "commit_and_input" => {
+                let piece = key_char
+                    .map(|c| self.convert_punct(state, c, prev_char))
+                    .unwrap_or_default();
+                let cand = state.candidates[hi].clone();
+                let act = self.commit_selected(state, &cand);
+                Self::append_to_insert_text(act, &piece)
+            }
             _ => KeyAction::Consumed,
         }
     }
