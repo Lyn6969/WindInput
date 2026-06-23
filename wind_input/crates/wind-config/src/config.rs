@@ -1048,21 +1048,12 @@ pub struct S2TConfig {
 pub struct QuickInputConfig {
     #[serde(default)]
     pub enabled: bool,
-    /// 触发键（如 "semicolon"），默认分号
-    #[serde(default = "default_quick_input_triggers")]
-    pub trigger_keys: Vec<String>,
     /// 计算器结果小数位数，默认 6
     #[serde(default = "default_decimal_places")]
     pub decimal_places: i32,
     /// 强制竖排显示：进入快捷输入时切竖排候选，退出恢复原布局。
     #[serde(default)]
     pub force_vertical: bool,
-}
-
-fn default_quick_input_triggers() -> Vec<String> {
-    // 默认不再独立抢 ;：; 由内置 mix「快捷」融合接管（quick_input 作为其成员）。
-    // 仍可显式配置 trigger_keys 让 quick_input 作独立模式。
-    Vec::new()
 }
 
 fn default_decimal_places() -> i32 {
@@ -1073,7 +1064,6 @@ impl Default for QuickInputConfig {
     fn default() -> Self {
         Self {
             enabled: false,
-            trigger_keys: default_quick_input_triggers(),
             decimal_places: default_decimal_places(),
             force_vertical: false,
         }

@@ -187,7 +187,8 @@ enabled = false
 variant = "s2t"
 
 [features.quick_input]
-trigger_keys = ["semicolon"]
+# 注：; 由内置 mix「快捷」融合接管（quick_input 作为其成员，同时支持日期/计算/拼音/英文）。
+# 旧的独立 quick_input 触发键(trigger_keys)已移除。以下为融合内 quick_input 成员的参数。
 force_vertical = true
 decimal_places = 6
 accent_color = ""

@@ -76,27 +76,6 @@ pub(crate) fn punct_char(key_code: u32, shift: bool) -> Option<char> {
     Some(if shift { shifted } else { base })
 }
 
-/// VK + shift → 快捷输入表达式字符（数字/运算符/点/括号；含小键盘）。其它返回 None。
-pub(crate) fn quick_input_char(key_code: u32, shift: bool) -> Option<char> {
-    // 小键盘
-    match key_code {
-        0x60..=0x69 => return Some((b'0' + (key_code - 0x60) as u8) as char),
-        0x6A => return Some('*'),
-        0x6B => return Some('+'),
-        0x6D => return Some('-'),
-        0x6E => return Some('.'),
-        0x6F => return Some('/'),
-        _ => {}
-    }
-    // 主键盘：复用 punct_char，仅保留表达式有效字符
-    let c = punct_char(key_code, shift)?;
-    if c.is_ascii_digit() || matches!(c, '+' | '-' | '*' | '/' | '.' | '(' | ')') {
-        Some(c)
-    } else {
-        None
-    }
-}
-
 /// 小键盘键码 → 字符（数字 0-9 / 运算符 * + - / / 小数点 .）。非小键盘键返回 None。
 pub(crate) fn numpad_char(key_code: u32) -> Option<char> {
     match key_code {
@@ -289,11 +268,7 @@ pub(crate) struct State {
     pub(crate) temp_pinyin_schema: String,
     /// 临时拼音组合区前缀字符（触发键，如 "`"）
     pub(crate) temp_pinyin_prefix: String,
-    /// 快捷输入缓冲（如 "1+2*3" / "12.25"）
-    pub(crate) quick_input_buffer: String,
-    /// 快捷输入组合区前缀字符（触发键，如 ";"）
-    pub(crate) quick_input_prefix: String,
-    /// 快捷输入「强制竖排」时记住进入前的布局（Some(原 vertical) = 已强制，退出恢复）。
+    /// 融合「快捷」含 quick_input 成员时「强制竖排」记住进入前的布局（Some(原 vertical) = 已强制，退出恢复）。
     pub(crate) quick_saved_vertical: Option<bool>,
     /// 临时英文输入缓冲
     pub(crate) temp_english_buffer: String,
@@ -738,8 +713,6 @@ impl Coordinator {
                 temp_pinyin_buffer: String::new(),
                 temp_pinyin_schema: String::new(),
                 temp_pinyin_prefix: String::new(),
-                quick_input_buffer: String::new(),
-                quick_input_prefix: String::new(),
                 quick_saved_vertical: None,
                 temp_english_buffer: String::new(),
                 url_buffer: String::new(),
@@ -1266,9 +1239,8 @@ impl Coordinator {
         let t_nu = std::time::Instant::now();
         // 仅推送当前页候选（窗口按 1..N 编号，翻页后重新编号）
         let (start, end) = self.page_range(state);
-        // 数字键需录入表达式的场景用字母标签（a/b/c）选词：旧快捷输入，以及 mix 的数字模式。
-        let alpha = state.active == Some(ModeKind::QuickInput)
-            || (matches!(state.active, Some(ModeKind::Mix(_))) && state.mix_numeric);
+        // 数字键需录入表达式的场景用字母标签（a/b/c）选词：mix 的数字模式（含 quick_input 成员）。
+        let alpha = matches!(state.active, Some(ModeKind::Mix(_))) && state.mix_numeric;
         // 悬停提示/候选微调配置（热重载快照）
         let rt = self.rt();
         let cand_cfg = &rt.config.ui.candidate;
@@ -1283,7 +1255,7 @@ impl Coordinator {
         // 码表类方案/候选的剩余编码由码表引擎在 convert 内填,不在此处理。
         let force_hint = matches!(
             state.active,
-            Some(ModeKind::TempPinyin) | Some(ModeKind::Mix(_)) | Some(ModeKind::QuickInput)
+            Some(ModeKind::TempPinyin) | Some(ModeKind::Mix(_))
         );
         let pinyin_hint = force_hint || self.engine_mgr.pinyin_show_code_hint();
         let tip_opts = wind_reverse::TooltipOptions {
@@ -1992,7 +1964,6 @@ impl MessageHandler for Coordinator {
         // 已激活独占模式：单点分派到专用处理器（唯一入口，见 pipeline.rs）。
         match state.active {
             Some(ModeKind::TempPinyin) => return self.handle_temp_pinyin_key(&mut state, data),
-            Some(ModeKind::QuickInput) => return self.handle_quick_input_key(&mut state, data),
             Some(ModeKind::TempEnglish) => return self.handle_temp_english_key(&mut state, data),
             Some(ModeKind::Url) => return self.handle_url_key(&mut state, data),
             Some(ModeKind::Special(_)) => return self.handle_special_key(&mut state, data),
@@ -2278,6 +2249,7 @@ impl MessageHandler for Coordinator {
                         && punct_char(data.key_code, false)
                             .map(|c| self.engine_mgr.shuangpin_final_key(c as u8))
                             .unwrap_or(false);
+                    let mut select_overflow: Option<char> = None;
                     if !is_shuangpin_final {
                         if let Some(offset) = self.select_key_offset(data.key_code) {
                             let (start, end) = self.page_range(&state);
@@ -2286,11 +2258,19 @@ impl MessageHandler for Coordinator {
                                 let cand = state.candidates[idx].clone();
                                 return self.commit_selected(&mut state, &cand);
                             }
+                            // E. 越界：记下触发键字符，延后到模式触发判定之后再按 overflow 策略处理
+                            // （对齐 Go decideBufferedTrigger——次/三选键越界时 overflow 排在
+                            // 模式激活之后，故 `;` 候选不足时优先进快捷输入而非 overflow）。
+                            select_overflow = punct_char(data.key_code, false);
                         }
                     }
-                    // D. 模式触发键 → 顶屏高亮候选 + 进模式（快捷输入 > 临时拼音）
-                    if self.is_quick_input_trigger(data.key_code) {
-                        return self.commit_and_enter_quick_input(&mut state, data.key_code);
+                    // D. 模式触发键 → 顶屏高亮候选 + 进模式。
+                    // 融合「快捷」（现唯一的快捷输入形态，成员含日期/计算/拼音/英文）——对齐空缓冲
+                    // 时 handle_lifecycle 的 enter_mix_mode，使有无候选都进同一融合模式。
+                    if let Some(idx) = self.match_mix_trigger(data.key_code)
+                        && (self.mix_has_quick_input(idx) || !self.mix_members(idx).is_empty())
+                    {
+                        return self.commit_and_enter_mix_mode(&mut state, idx, data.key_code);
                     }
                     if self.is_temp_pinyin_trigger(data.key_code)
                         && let Some(target) = self.engine_mgr.temp_pinyin_target()
@@ -2300,6 +2280,10 @@ impl MessageHandler for Coordinator {
                             data.key_code,
                             target,
                         );
+                    }
+                    // E. 次/三选键越界且非模式触发键 → 按 input.overflow.select_key 处理
+                    if let Some(ch) = select_overflow {
+                        return self.handle_overflow_select_key(&mut state, ch, data.prev_char);
                     }
                 }
                 if let Some(ch) = punct_char(data.key_code, shift) {

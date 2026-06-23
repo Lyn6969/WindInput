@@ -130,8 +130,6 @@ impl Coordinator {
         state.temp_english_buffer.clear();
         state.temp_pinyin_buffer.clear();
         state.temp_pinyin_prefix.clear();
-        state.quick_input_buffer.clear();
-        state.quick_input_prefix.clear();
         state.url_buffer.clear();
         state.rewind = None;
         state.special_buffer.clear();

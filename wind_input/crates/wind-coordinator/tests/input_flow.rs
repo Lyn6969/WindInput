@@ -1324,3 +1324,161 @@ fn test_stats_recorded_through_deferred_policed() {
     );
     let _ = std::fs::remove_file(&store_path);
 }
+
+// ---- select_key overflow（次/三选键越界，对齐 Go handleOverflowSelectKey）----
+// 触发场景：五笔 "qqqq" 仅 2 个候选 ["金","狗狗"]，按三选键 '（VK_OEM_7）→ idx=2 越界。
+
+#[test]
+fn test_overflow_select_key_ignore_default() {
+    if !has_schemas() {
+        return;
+    }
+    // 默认 overflow.select_key = "ignore"：三选键越界（页内候选 < 3）时吞键无效。
+    let coord = Coordinator::new_headless(config_with("wubi86"), Some(&data_dir()));
+    for c in "qqqq".chars() {
+        press_letter(&coord, c);
+    }
+    let count = coord.debug_candidate_count();
+    if count == 0 || count >= 3 {
+        return; // 需 < 3 才能让 '（三选）越界
+    }
+    let act = coord.handle_key_event(&key_event(0xDE, EVENT_KEY_DOWN)); // ' VK_OEM_7
+    assert!(
+        matches!(act, KeyAction::Consumed),
+        "默认 ignore 下三选键越界应吞键(Consumed)，实际: {:?}",
+        act
+    );
+}
+
+#[test]
+fn test_overflow_select_key_commit() {
+    if !has_schemas() {
+        return;
+    }
+    // overflow.select_key = "commit"：越界时只上屏当前高亮候选，不追加触发键字符。
+    let mut cfg = config_with("wubi86");
+    cfg.input.overflow.select_key = "commit".into();
+    let coord = Coordinator::new_headless(cfg, Some(&data_dir()));
+    for c in "qqqq".chars() {
+        press_letter(&coord, c);
+    }
+    let texts = coord.debug_page_texts();
+    if texts.is_empty() || texts.len() >= 3 {
+        return;
+    }
+    let highlighted = texts[0].clone();
+    match coord.handle_key_event(&key_event(0xDE, EVENT_KEY_DOWN)) {
+        KeyAction::InsertText { text, .. } => {
+            assert_eq!(text, highlighted, "commit 应只上屏高亮候选，无追加字符");
+        }
+        other => panic!("commit 应 InsertText，实际: {:?}", other),
+    }
+}
+
+#[test]
+fn test_overflow_select_key_commit_and_input() {
+    if !has_schemas() {
+        return;
+    }
+    // overflow.select_key = "commit_and_input"：越界时上屏高亮候选 + 追加（转换后的）触发键字符。
+    let mut cfg = config_with("wubi86");
+    cfg.input.overflow.select_key = "commit_and_input".into();
+    let coord = Coordinator::new_headless(cfg, Some(&data_dir()));
+    for c in "qqqq".chars() {
+        press_letter(&coord, c);
+    }
+    let texts = coord.debug_page_texts();
+    if texts.is_empty() || texts.len() >= 3 {
+        return;
+    }
+    let highlighted = texts[0].clone();
+    match coord.handle_key_event(&key_event(0xDE, EVENT_KEY_DOWN)) {
+        KeyAction::InsertText { text, .. } => {
+            assert!(
+                text.starts_with(&highlighted),
+                "commit_and_input 应以高亮候选开头，实际: {}",
+                text
+            );
+            assert!(
+                text.chars().count() > highlighted.chars().count(),
+                "commit_and_input 应在候选后追加触发键字符，实际: {}",
+                text
+            );
+        }
+        other => panic!("commit_and_input 应 InsertText，实际: {:?}", other),
+    }
+}
+
+// ---- 有候选时按融合「快捷」触发键：顶字 + 进融合模式（现唯一的快捷输入形态，支持拼音）----
+
+#[test]
+fn test_semicolon_with_candidates_enters_mix_and_accepts_pinyin() {
+    if !has_schemas() {
+        return;
+    }
+    // 隔离选词职责（select_key_groups 置空），专测「有候选 → 按 ; 顶字 + 进融合 → 可打拼音」。
+    let mut cfg = config_with("wubi86");
+    cfg.input.select_key_groups = vec![];
+    let coord = Coordinator::new_headless(cfg, Some(&data_dir()));
+    press_letter(&coord, 'a'); // 产生候选
+    let texts = coord.debug_page_texts();
+    if texts.is_empty() {
+        return;
+    }
+    let highlighted = texts[0].clone();
+    match coord.handle_key_event(&key_event(0xBA, EVENT_KEY_DOWN)) {
+        KeyAction::InsertText {
+            text,
+            new_composition,
+            ..
+        } => {
+            assert_eq!(text, highlighted, "; 应顶字上屏当前高亮候选");
+            assert_eq!(
+                new_composition.as_deref(),
+                Some(";"),
+                "进入融合模式应显示前缀 ;"
+            );
+        }
+        other => panic!("有候选按 ; 应顶字+进融合模式，实际: {:?}", other),
+    }
+    // 融合模式输入拼音 nihao → 候选应含「你好」（拼音成员生效，证明能打拼音）
+    for c in "nihao".chars() {
+        press_letter(&coord, c);
+    }
+    let texts = coord.debug_page_texts();
+    assert!(
+        texts.iter().any(|t| t.contains("你好")),
+        "融合模式应能输入拼音（nihao→你好），实际: {:?}",
+        texts
+    );
+}
+
+#[test]
+fn test_semicolon_overflow_falls_to_mix_not_overflow() {
+    if !has_schemas() {
+        return;
+    }
+    // ; 同时是选词键(默认 semicolon_quote)与融合触发键；恰好 1 个候选时次选越界
+    // → 不走 overflow，而是顶字 + 进融合（对齐 Go 优先级：选词 < 进模式 < overflow）。
+    let coord = Coordinator::new_headless(config_with("wubi86"), Some(&data_dir()));
+    for c in "yyyg".chars() {
+        press_letter(&coord, c);
+    }
+    let texts = coord.debug_page_texts();
+    if texts.len() != 1 {
+        return; // 需恰好 1 个候选让 ; 次选越界
+    }
+    let only = texts[0].clone();
+    match coord.handle_key_event(&key_event(0xBA, EVENT_KEY_DOWN)) {
+        KeyAction::InsertText {
+            text,
+            new_composition,
+            ..
+        } => {
+            assert_eq!(text, only, "1 候选时 ; 应顶字上屏该候选");
+            assert_eq!(new_composition.as_deref(), Some(";"), "并进入融合模式");
+        }
+        other => panic!("1 候选时 ; 应顶字+进融合，实际: {:?}", other),
+    }
+}
+

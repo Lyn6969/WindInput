@@ -119,6 +119,49 @@ impl Coordinator {
         }
     }
 
+    /// 顶屏当前高亮候选（若有）并进入 mix 融合模式。
+    /// 用于缓冲非空 / 有候选时按下融合触发键（如 `;`）——对齐 `commit_and_enter_temp_pinyin`：
+    /// 先把已转换前缀 + 高亮候选上屏，再进融合模式。
+    /// （空缓冲 + 无候选的进入由 handle_lifecycle 的 `enter_mix_mode` 直接处理。）
+    pub(crate) fn commit_and_enter_mix_mode(
+        &self,
+        state: &mut State,
+        idx: u8,
+        key_code: u32,
+    ) -> KeyAction {
+        let prefix = self.take_committed(state); // 拼音逐步转换的已转换前缀一并上屏
+        let committed = if !state.candidates.is_empty() {
+            let i = self
+                .highlighted_global_index(state)
+                .min(state.candidates.len() - 1);
+            let t = state.candidates[i].text.clone();
+            self.record_selection(&state.input_buffer, &t);
+            Some(format!("{prefix}{t}"))
+        } else if !prefix.is_empty() {
+            Some(prefix)
+        } else {
+            None
+        };
+        // enter_mix_mode 内部清空 input_buffer/candidates、建组合区前缀、刷 UI 并返回 UpdateComposition。
+        let enter = self.enter_mix_mode(state, idx, key_code);
+        match committed {
+            Some(text) => {
+                let new_comp = match &enter {
+                    KeyAction::UpdateComposition { text, .. } => text.clone(),
+                    _ => state.preedit.clone(),
+                };
+                KeyAction::InsertText {
+                    text,
+                    new_composition: Some(new_comp),
+                    mode_changed: false,
+                    chinese_mode: true,
+                    has_new_composition: true,
+                }
+            }
+            None => enter,
+        }
+    }
+
     /// 退出 mix 模式并清空相关状态（含逐步转换的已转换前缀）。
     pub(crate) fn exit_mix_mode(&self, state: &mut State) {
         state.active = None;
@@ -329,7 +372,6 @@ impl Coordinator {
                 Some((format!("临时{}", disp), short))
             }
             ModeKind::TempEnglish => Some(("临时英文".to_string(), "英".to_string())),
-            ModeKind::QuickInput => Some(("快捷输入".to_string(), "快".to_string())),
             ModeKind::Url => Some(("网址输入".to_string(), "网址".to_string())),
             ModeKind::Mix(i) => {
                 let rt = self.rt();

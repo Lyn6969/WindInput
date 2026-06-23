@@ -566,6 +566,57 @@ impl Coordinator {
         }
     }
 
+    /// 次/三选键（`;`/`'`）越界（页内候选不足以命中目标位次）时的处理（对齐 Go
+    /// handleOverflowSelectKey）。须排在模式触发键判定之后调用——若该键同时是模式触发键
+    /// （如 `;` 触发快捷输入），候选不足时应优先进模式而非走此 overflow。
+    /// 依 `input.overflow.select_key`：ignore 吞键 / commit 上屏高亮候选 /
+    /// commit_and_input 上屏高亮候选并追加（转换后的）触发键字符。`key_char` 为触发键产生的
+    /// 字符（如 `'`），`prev_char` 为光标前字符（用于数字后智能标点）。
+    pub(crate) fn handle_overflow_select_key(
+        &self,
+        state: &mut State,
+        key_char: char,
+        prev_char: u16,
+    ) -> KeyAction {
+        let behavior = self.rt().config.input.overflow.select_key.clone();
+        // 无候选（缓冲非空但无候选）：commit 清组合，commit_and_input 清组合并输出该字符。
+        if state.candidates.is_empty() {
+            return match behavior.as_str() {
+                "commit" => {
+                    self.reset_pinyin_composition(state);
+                    self.notify_ui_hide();
+                    KeyAction::ClearComposition
+                }
+                "commit_and_input" => {
+                    let piece = self.convert_punct(state, key_char, prev_char);
+                    self.reset_pinyin_composition(state);
+                    self.notify_ui_hide();
+                    Self::commit_action(piece, state.chinese_mode)
+                }
+                _ => KeyAction::Consumed,
+            };
+        }
+        let hi = self.highlighted_global_index(state);
+        if hi >= state.candidates.len() {
+            return KeyAction::Consumed;
+        }
+        match behavior.as_str() {
+            "commit" => {
+                let cand = state.candidates[hi].clone();
+                self.commit_selected(state, &cand)
+            }
+            "commit_and_input" => {
+                // 触发键字符按标点流水线转换（在提交前取，chinese_punct 等状态不受提交影响）。
+                let piece = self.convert_punct(state, key_char, prev_char);
+                let cand = state.candidates[hi].clone();
+                let act = self.commit_selected(state, &cand);
+                Self::append_to_insert_text(act, &piece)
+            }
+            // "ignore" 及未知值：吞键无效（保留组合，不上屏）
+            _ => KeyAction::Consumed,
+        }
+    }
+
     /// 把附加文本拼到 InsertText 结局尾部（用于 overflow commit_and_input 追加数字/标点）；
     /// 其它 KeyAction（如分段选择产生的 UpdateComposition）原样返回。
     pub(crate) fn append_to_insert_text(act: KeyAction, extra: &str) -> KeyAction {
@@ -772,8 +823,6 @@ impl Coordinator {
         state.active = None;
         state.temp_pinyin_buffer.clear();
         state.temp_pinyin_prefix.clear();
-        state.quick_input_buffer.clear();
-        state.quick_input_prefix.clear();
         state.temp_english_buffer.clear();
         drop(state);
 

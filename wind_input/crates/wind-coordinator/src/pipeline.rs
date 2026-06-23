@@ -32,8 +32,6 @@
 pub enum ModeKind {
     /// 临时拼音：码表方案下经触发键临时切到拼音反查。
     TempPinyin,
-    /// 快捷输入：分号触发的日期/计算器。
-    QuickInput,
     /// 临时英文：Shift+字母触发的临时英文输入。
     TempEnglish,
     /// 网址模式：普通输入累积到某前缀（如 "www."/"http"）时夺取，原样累积 ASCII。
