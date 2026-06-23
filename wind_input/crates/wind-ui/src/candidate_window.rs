@@ -822,8 +822,7 @@ impl CandidateWindow {
                     .cross(Align::Center)
                     .pad(item_pad)
                     .child(
-                        View::leaf(" ".to_string(), [0, 0, 0, 0])
-                            .font_size(text_fs.max(index_fs)),
+                        View::leaf(" ".to_string(), [0, 0, 0, 0]).font_size(text_fs.max(index_fs)),
                     ),
             );
         }

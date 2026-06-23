@@ -583,7 +583,7 @@ fn dispatch_command(
         //                  + englishSpaces(4) + elapsedMs(4) = 20 字节
         CMD_INPUT_STATS => {
             if payload.len() >= 20 {
-                let chars  = u32::from_le_bytes(payload[0..4].try_into().unwrap_or([0; 4]));
+                let chars = u32::from_le_bytes(payload[0..4].try_into().unwrap_or([0; 4]));
                 let digits = u32::from_le_bytes(payload[4..8].try_into().unwrap_or([0; 4]));
                 let puncts = u32::from_le_bytes(payload[8..12].try_into().unwrap_or([0; 4]));
                 let spaces = u32::from_le_bytes(payload[12..16].try_into().unwrap_or([0; 4]));

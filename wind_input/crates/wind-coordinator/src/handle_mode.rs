@@ -423,7 +423,10 @@ impl Coordinator {
         // 避免在 IME 线程同步重熔大词库卡顿。预热完成后用户再切即时生效。
         if !self.engine_mgr.is_loaded(schema_id) {
             let name = self.engine_mgr.schema_name(schema_id);
-            self.show_tip(&format!("{}准备中…", if name.is_empty() { schema_id } else { &name }));
+            self.show_tip(&format!(
+                "{}准备中…",
+                if name.is_empty() { schema_id } else { &name }
+            ));
             return;
         }
         if self.engine_mgr.switch_schema(schema_id) {

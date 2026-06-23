@@ -539,7 +539,9 @@ mod imp {
                                 if !more.as_bool() {
                                     break;
                                 }
-                                let Ok(run_ptr) = en.GetCurrentRun() else { break };
+                                let Ok(run_ptr) = en.GetCurrentRun() else {
+                                    break;
+                                };
                                 if run_ptr.is_null() {
                                     break;
                                 }
@@ -564,7 +566,7 @@ mod imp {
                         return Ok(());
                     }
                     Err(e) if e.code() == DWRITE_E_NOCOLOR => {} // 无彩色数据：走单色
-                    Err(_) => {}                                  // 其它失败：保守走单色
+                    Err(_) => {}                                 // 其它失败：保守走单色
                 }
             }
 

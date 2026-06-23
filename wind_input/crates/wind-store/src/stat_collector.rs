@@ -349,11 +349,8 @@ mod tests {
         use std::sync::atomic::{AtomicU32, Ordering};
         static CNT: AtomicU32 = AtomicU32::new(0);
         let n = CNT.fetch_add(1, Ordering::Relaxed);
-        let p = std::env::temp_dir().join(format!(
-            "wind_collector_{}_{}.redb",
-            std::process::id(),
-            n
-        ));
+        let p =
+            std::env::temp_dir().join(format!("wind_collector_{}_{}.redb", std::process::id(), n));
         let _ = std::fs::remove_file(&p);
         Arc::new(Store::open(&p).unwrap())
     }
@@ -432,7 +429,11 @@ mod tests {
             source: CommitSource::Candidate,
             ..Default::default()
         });
-        assert_eq!(sc.get_today_stat().active_seconds, 10, "仅 10s 间隔计入活跃");
+        assert_eq!(
+            sc.get_today_stat().active_seconds,
+            10,
+            "仅 10s 间隔计入活跃"
+        );
     }
 
     #[test]

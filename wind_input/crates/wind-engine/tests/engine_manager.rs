@@ -136,8 +136,12 @@ fn test_codetable_extra_hot_toggle() {
     }
 
     // 触发引擎加载并确认扩展库词 '甘蓝菜'(aaae) 初始可见
-    let has_extra =
-        |m: &EngineManager| m.convert("aaae", 20).candidates.iter().any(|c| c.text == "甘蓝菜");
+    let has_extra = |m: &EngineManager| {
+        m.convert("aaae", 20)
+            .candidates
+            .iter()
+            .any(|c| c.text == "甘蓝菜")
+    };
     if !has_extra(&mgr) {
         eprintln!("跳过：扩展库词 '甘蓝菜' 不在该数据集");
         return;
@@ -150,7 +154,10 @@ fn test_codetable_extra_hot_toggle() {
             "已加载引擎应即时命中扩展层: {id}"
         );
     }
-    assert!(!has_extra(&mgr), "热关闭扩展后 '甘蓝菜' 应消失（live，未重建）");
+    assert!(
+        !has_extra(&mgr),
+        "热关闭扩展后 '甘蓝菜' 应消失（live，未重建）"
+    );
     assert!(
         mgr.convert("aaaa", 20)
             .candidates
@@ -420,7 +427,10 @@ fn test_pinyin_abbrev() {
     let cfg = make_config(&["pinyin"]);
     let mgr = EngineManager::new(&cfg, Some(&dir));
     let has = |input: &str, want: &str| -> bool {
-        mgr.convert(input, 20).candidates.iter().any(|c| c.text == want)
+        mgr.convert(input, 20)
+            .candidates
+            .iter()
+            .any(|c| c.text == want)
     };
     assert!(has("bzd", "不知道"), "简拼 bzd 应含 不知道");
     assert!(has("bj", "北京"), "简拼 bj 应含 北京");

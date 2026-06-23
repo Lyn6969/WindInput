@@ -192,7 +192,10 @@ impl Coordinator {
         let (word, code) = if state.add_word_len >= ADD_WORD_MIN_LEN
             && state.add_word_chars.len() >= ADD_WORD_MIN_LEN
         {
-            (self.add_word_current_word(state), state.add_word_code.clone())
+            (
+                self.add_word_current_word(state),
+                state.add_word_code.clone(),
+            )
         } else {
             (String::new(), String::new())
         };
@@ -218,7 +221,8 @@ impl Coordinator {
 
     /// 更新当前加词的编码（按方案：拼音生成 / 码表反查）。
     fn update_add_word_code(&self, state: &mut State) {
-        if state.add_word_len < ADD_WORD_MIN_LEN || state.add_word_chars.len() < state.add_word_len {
+        if state.add_word_len < ADD_WORD_MIN_LEN || state.add_word_chars.len() < state.add_word_len
+        {
             state.add_word_code.clear();
             return;
         }
@@ -340,8 +344,14 @@ mod tests {
     fn recent_chars_order_and_truncate() {
         let c = coord("recent");
         push_commits(&c, &["你", "好", "世界"]);
-        assert_eq!(c.add_word_recent_chars(20).iter().collect::<String>(), "你好世界");
-        assert_eq!(c.add_word_recent_chars(2).iter().collect::<String>(), "世界");
+        assert_eq!(
+            c.add_word_recent_chars(20).iter().collect::<String>(),
+            "你好世界"
+        );
+        assert_eq!(
+            c.add_word_recent_chars(2).iter().collect::<String>(),
+            "世界"
+        );
     }
 
     #[test]

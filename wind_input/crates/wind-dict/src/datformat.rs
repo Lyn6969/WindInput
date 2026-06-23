@@ -311,7 +311,14 @@ impl WdatWriter {
                 let a_entry_off = a_leaf_off + (a_leaves.len() * LEAF_SIZE) as u32;
                 let a_charmap_off = a_entry_off + (a_entries.len() * ENTRY_SIZE) as u32;
                 let after = a_charmap_off + CHARMAP_SIZE as u32;
-                (abbrev_off, a_dat_off, a_leaf_off, a_entry_off, a_charmap_off, after)
+                (
+                    abbrev_off,
+                    a_dat_off,
+                    a_leaf_off,
+                    a_entry_off,
+                    a_charmap_off,
+                    after,
+                )
             } else {
                 (0, 0, 0, 0, 0, after_pool)
             };
@@ -346,37 +353,37 @@ impl WdatWriter {
         f.write_all(&(entries.len() as u32).to_le_bytes())?;
         f.write_all(&char_map_off.to_le_bytes())?;
 
-        let write_dat_section =
-            |f: &mut std::io::BufWriter<std::fs::File>,
-             dat: &Dat,
-             leaves: &[(u32, u16)],
-             entries: &[(u32, u16, i32)]|
-             -> std::io::Result<()> {
-                for v in &dat.base {
-                    f.write_all(&v.to_le_bytes())?;
-                }
-                for v in &dat.check {
-                    f.write_all(&v.to_le_bytes())?;
-                }
-                for (eoff, elen) in leaves {
-                    f.write_all(&eoff.to_le_bytes())?;
-                    f.write_all(&elen.to_le_bytes())?;
-                    f.write_all(&0u16.to_le_bytes())?;
-                }
-                for (toff, tlen, w) in entries {
-                    f.write_all(&toff.to_le_bytes())?;
-                    f.write_all(&tlen.to_le_bytes())?;
-                    f.write_all(&w.to_le_bytes())?;
-                }
-                Ok(())
-            };
-        let write_charmap = |f: &mut std::io::BufWriter<std::fs::File>, dat: &Dat| -> std::io::Result<()> {
-            f.write_all(&dat.max_code.to_le_bytes())?;
-            for c in &dat.char_map {
-                f.write_all(&c.to_le_bytes())?;
+        let write_dat_section = |f: &mut std::io::BufWriter<std::fs::File>,
+                                 dat: &Dat,
+                                 leaves: &[(u32, u16)],
+                                 entries: &[(u32, u16, i32)]|
+         -> std::io::Result<()> {
+            for v in &dat.base {
+                f.write_all(&v.to_le_bytes())?;
+            }
+            for v in &dat.check {
+                f.write_all(&v.to_le_bytes())?;
+            }
+            for (eoff, elen) in leaves {
+                f.write_all(&eoff.to_le_bytes())?;
+                f.write_all(&elen.to_le_bytes())?;
+                f.write_all(&0u16.to_le_bytes())?;
+            }
+            for (toff, tlen, w) in entries {
+                f.write_all(&toff.to_le_bytes())?;
+                f.write_all(&tlen.to_le_bytes())?;
+                f.write_all(&w.to_le_bytes())?;
             }
             Ok(())
         };
+        let write_charmap =
+            |f: &mut std::io::BufWriter<std::fs::File>, dat: &Dat| -> std::io::Result<()> {
+                f.write_all(&dat.max_code.to_le_bytes())?;
+                for c in &dat.char_map {
+                    f.write_all(&c.to_le_bytes())?;
+                }
+                Ok(())
+            };
 
         // 主区段 + 共享池。
         write_dat_section(&mut f, &dat, &leaves, &entries)?;
@@ -883,8 +890,9 @@ mod tests {
             ("zhongguo", vec![("中国", 2000)]),
             ("zhi", vec![("之", 700), ("知", 690)]),
         ];
-        let to_owned =
-            |e: &Vec<(&str, i32)>| -> Vec<(String, i32)> { e.iter().map(|(t, w)| (t.to_string(), *w)).collect() };
+        let to_owned = |e: &Vec<(&str, i32)>| -> Vec<(String, i32)> {
+            e.iter().map(|(t, w)| (t.to_string(), *w)).collect()
+        };
 
         let wdb_path = std::env::temp_dir().join("wdat_parity.wdb");
         let mut dw = DictWriter::new();
@@ -906,10 +914,16 @@ mod tests {
 
         // 精确：每个 code 的 (text,weight) 集合一致。
         for (c, _) in &data {
-            let mut a: Vec<(String, i32)> =
-                wdb.search(c).into_iter().map(|e| (e.text, e.weight)).collect();
-            let mut b: Vec<(String, i32)> =
-                wdat.search(c).into_iter().map(|e| (e.text, e.weight)).collect();
+            let mut a: Vec<(String, i32)> = wdb
+                .search(c)
+                .into_iter()
+                .map(|e| (e.text, e.weight))
+                .collect();
+            let mut b: Vec<(String, i32)> = wdat
+                .search(c)
+                .into_iter()
+                .map(|e| (e.text, e.weight))
+                .collect();
             a.sort();
             b.sort();
             assert_eq!(a, b, "精确查询 '{c}' 不一致");

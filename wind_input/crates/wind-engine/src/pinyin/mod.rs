@@ -168,7 +168,11 @@ impl PinyinEngine {
 
         if syllables.len() <= 1 {
             // 单音节：对该音节（无切分时退化为整码）生成变体逐个查询。
-            let syllable: &str = if syllables.len() == 1 { &syllables[0] } else { code };
+            let syllable: &str = if syllables.len() == 1 {
+                &syllables[0]
+            } else {
+                code
+            };
             for variant in fuzzy::FuzzyMatcher::fuzzy_variants(syllable, &self.fuzzy_config) {
                 for (text, weight, order) in self.dict.search(&variant) {
                     if seen.insert(text.clone()) {
@@ -265,7 +269,8 @@ impl Engine for PinyinEngine {
         let raw_input = input;
 
         // 双拼激活时保留 SpConvertResult，以便后续用 map_consumed_length 回算消费键数。
-        let sp_result: Option<shuangpin::SpConvertResult> = self.shuangpin.as_ref().map(|conv| conv.convert(input));
+        let sp_result: Option<shuangpin::SpConvertResult> =
+            self.shuangpin.as_ref().map(|conv| conv.convert(input));
         let full_owned: String = match &sp_result {
             Some(r) if !r.full_pinyin.is_empty() => r.full_pinyin.clone(),
             Some(_) => input.to_string(),
@@ -305,7 +310,15 @@ impl Engine for PinyinEngine {
 
         // 1. 精确查找（完整匹配，含模糊扩展，对齐 Go lookupWithFuzzy）。code==input → 精确层级。
         for (text, weight, order, is_fuzzy) in self.lookup_with_fuzzy(input, &syllables) {
-            push_unique(&mut candidates, text, input.to_string(), weight, order, is_fuzzy, false);
+            push_unique(
+                &mut candidates,
+                text,
+                input.to_string(),
+                weight,
+                order,
+                is_fuzzy,
+                false,
+            );
         }
 
         // 完成音节覆盖的连续前缀（从起点算）。尾部不成音节的残码（如「nihaom」的「m」）
@@ -384,8 +397,18 @@ impl Engine for PinyinEngine {
                 // 子词组 code 是输入的真前缀（比输入*短*，如 nihao 的「你」(ni)），是合法的
                 // 分段上屏候选，与精确同层按权重排（不可降权——否则罕见全长词「拟好」会压过
                 // 常用子词组「你」）。只有 code 比输入*长*的补全词(step4)才算前缀补全降权。
-                for (text, weight, order, is_fuzzy) in self.lookup_with_fuzzy(&code, &syllables[..end]) {
-                    push_unique(&mut candidates, text, code.clone(), weight, order, is_fuzzy, false);
+                for (text, weight, order, is_fuzzy) in
+                    self.lookup_with_fuzzy(&code, &syllables[..end])
+                {
+                    push_unique(
+                        &mut candidates,
+                        text,
+                        code.clone(),
+                        weight,
+                        order,
+                        is_fuzzy,
+                        false,
+                    );
                 }
             }
         }
@@ -400,7 +423,15 @@ impl Engine for PinyinEngine {
         //    避免对全拼输入做无谓查找。natural_order=999999 让简拼候选默认排在全拼之后。
         if AbbrevMatcher::is_abbreviation(input, trie) {
             for (text, weight, _order) in dict.search_abbrev(input, 10) {
-                push_unique(&mut candidates, text, input.to_string(), weight, 999999, false, true);
+                push_unique(
+                    &mut candidates,
+                    text,
+                    input.to_string(),
+                    weight,
+                    999999,
+                    false,
+                    true,
+                );
             }
         }
 
@@ -611,8 +642,7 @@ mod tests {
 
         let schema_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("../../../data/schemas/shuangpin");
-        let layout = Layout::from_toml(&schema_dir.join("xiaohe.toml"))
-            .expect("加载小鹤布局失败");
+        let layout = Layout::from_toml(&schema_dir.join("xiaohe.toml")).expect("加载小鹤布局失败");
         let conv = ShuangpinConverter::new(layout);
 
         let eng = PinyinEngine::new(Config::default(), dict).with_shuangpin(conv);
@@ -647,8 +677,7 @@ mod tests {
 
         let schema_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("../../../data/schemas/shuangpin");
-        let layout = Layout::from_toml(&schema_dir.join("xiaohe.toml"))
-            .expect("加载小鹤布局失败");
+        let layout = Layout::from_toml(&schema_dir.join("xiaohe.toml")).expect("加载小鹤布局失败");
         let conv = ShuangpinConverter::new(layout);
         let eng = PinyinEngine::new(Config::default(), dict).with_shuangpin(conv);
 
@@ -736,7 +765,10 @@ mod tests {
         );
         // 「四」是精确（非模糊），「是」是模糊命中
         assert!(!r.candidates[pos_si.unwrap()].is_fuzzy, "「四」应为非模糊");
-        assert!(r.candidates[pos_shi.unwrap()].is_fuzzy, "「是」应为模糊命中");
+        assert!(
+            r.candidates[pos_shi.unwrap()].is_fuzzy,
+            "「是」应为模糊命中"
+        );
     }
 
     /// 层级 TDD：精确单字应优先于高频前缀补全词。词典 "si"→"四"(weight 100,单字精确) 与
@@ -760,8 +792,14 @@ mod tests {
             pos_si < pos_kao,
             "精确单字「四」应优先于高频前缀补全「思考」，实际: {texts:?}"
         );
-        assert!(!r.candidates[pos_si.unwrap()].is_prefix, "「四」应为精确(非前缀)");
-        assert!(r.candidates[pos_kao.unwrap()].is_prefix, "「思考」应为前缀补全");
+        assert!(
+            !r.candidates[pos_si.unwrap()].is_prefix,
+            "「四」应为精确(非前缀)"
+        );
+        assert!(
+            r.candidates[pos_kao.unwrap()].is_prefix,
+            "「思考」应为前缀补全"
+        );
     }
 
     /// 回归 TDD：子词组（code 比输入短，如 nihao 的「你」）不是前缀补全，不可降权——
@@ -780,13 +818,19 @@ mod tests {
         let texts: Vec<&String> = r.candidates.iter().map(|c| &c.text).collect();
         let pos_ni = texts.iter().position(|t| *t == "你");
         let pos_nihao_rare = texts.iter().position(|t| *t == "拟好");
-        assert!(pos_ni.is_some() && pos_nihao_rare.is_some(), "候选缺失: {texts:?}");
+        assert!(
+            pos_ni.is_some() && pos_nihao_rare.is_some(),
+            "候选缺失: {texts:?}"
+        );
         assert!(
             pos_ni < pos_nihao_rare,
             "常用子词组「你」应优先于罕见全长精确词「拟好」(同层按权重)，实际: {texts:?}"
         );
         // 「你」是子词组，不应被标记为前缀补全
-        assert!(!r.candidates[pos_ni.unwrap()].is_prefix, "子词组「你」不应是前缀补全");
+        assert!(
+            !r.candidates[pos_ni.unwrap()].is_prefix,
+            "子词组「你」不应是前缀补全"
+        );
     }
 
     /// Fix B TDD：fuzzy 应接入多音节整串查询（expand_code 笛卡尔积）。
@@ -837,8 +881,7 @@ mod tests {
         // 小鹤双拼：ni → ni（声母 n + 韵母 i=i，即全拼 "ni"，保持不变）
         let schema_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("../../../data/schemas/shuangpin");
-        let layout = Layout::from_toml(&schema_dir.join("xiaohe.toml"))
-            .expect("加载小鹤布局失败");
+        let layout = Layout::from_toml(&schema_dir.join("xiaohe.toml")).expect("加载小鹤布局失败");
         let conv = ShuangpinConverter::new(layout);
 
         let eng = PinyinEngine::new(Config::default(), dict).with_shuangpin(conv);

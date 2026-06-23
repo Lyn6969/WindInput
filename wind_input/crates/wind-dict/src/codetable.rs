@@ -253,7 +253,12 @@ fn parse_rime_line(
         let spaced = parts[1];
         let syllables: Vec<&str> = spaced.split(' ').filter(|s| !s.is_empty()).collect();
         let abbrev = if syllables.len() >= 2 {
-            Some(syllables.iter().filter_map(|s| s.chars().next()).collect::<String>())
+            Some(
+                syllables
+                    .iter()
+                    .filter_map(|s| s.chars().next())
+                    .collect::<String>(),
+            )
         } else {
             None
         };
@@ -286,7 +291,11 @@ fn rime_body_offset(content: &str) -> Option<usize> {
             line_start = i + 1;
         }
     }
-    if content[line_start..].strip_suffix('\r').unwrap_or(&content[line_start..]) == "..." {
+    if content[line_start..]
+        .strip_suffix('\r')
+        .unwrap_or(&content[line_start..])
+        == "..."
+    {
         Some(content.len())
     } else {
         None
@@ -469,7 +478,10 @@ mod tests {
         assert_eq!(e.len(), n, "并行切块不应丢行/重复");
         // 抽样首/中/尾
         assert_eq!(collect(&e, "文0"), vec![("code0".to_string(), 0)]);
-        assert_eq!(collect(&e, "文59999"), vec![("code59999".to_string(), 59999)]);
+        assert_eq!(
+            collect(&e, "文59999"),
+            vec![("code59999".to_string(), 59999)]
+        );
         // 全部 code 唯一（边界未把某行切成两半）
         let mut codes: Vec<&str> = e.iter().map(|(c, _, _)| c.as_str()).collect();
         codes.sort_unstable();

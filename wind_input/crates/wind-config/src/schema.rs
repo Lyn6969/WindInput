@@ -162,7 +162,6 @@ pub struct ShuangpinSpec {
     pub layout: String,
 }
 
-
 /// 混输引擎配置（[engine.mixed]）
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct MixedSpec {

@@ -183,8 +183,12 @@ impl EngineManager {
         let ov = override_dir.as_deref();
         available.retain(|sid| sid == &active_id || Self::schema_supported(sid, data_dir, ov));
         // 主码表方案(拼音反查码源):config 显式 > available 首个 codetable 类型方案。
-        let primary_codetable =
-            Self::resolve_primary_codetable(&config.schema.primary_codetable, &available, data_dir, ov);
+        let primary_codetable = Self::resolve_primary_codetable(
+            &config.schema.primary_codetable,
+            &available,
+            data_dir,
+            ov,
+        );
 
         let mgr = Self {
             engines: Mutex::new(HashMap::new()),
@@ -212,7 +216,10 @@ impl EngineManager {
     /// Task 1.5：改为直接读全局 [pinyin] 配置，不再读 schema 级 show_code_hint。
     /// (码表类方案的「剩余编码」由码表引擎在 convert 内处理，不走此路径。)
     pub fn pinyin_show_code_hint(&self) -> bool {
-        self.pinyin.lock().unwrap_or_else(|e| e.into_inner()).show_code_hint
+        self.pinyin
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .show_code_hint
     }
 
     /// 活跃方案为双拼且 `key`（ASCII 字节）是其布局的韵母键时返回 true，否则 false。
@@ -222,28 +229,37 @@ impl EngineManager {
         let active_id = self.active_schema_id();
         // 检查缓存是否命中
         {
-            let cache = self.shuangpin_finals_cache.lock().unwrap_or_else(|e| e.into_inner());
+            let cache = self
+                .shuangpin_finals_cache
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
             if cache.0 == active_id {
                 return cache.1.as_ref().map(|s| s.contains(&key)).unwrap_or(false);
             }
         }
         // 缓存未命中：读取活跃方案，判断是否双拼并构建韵母键集合
         let finals_set = self.build_shuangpin_finals(&active_id);
-        let result = finals_set.as_ref().map(|s| s.contains(&key)).unwrap_or(false);
-        *self.shuangpin_finals_cache.lock().unwrap_or_else(|e| e.into_inner()) =
-            (active_id, finals_set);
+        let result = finals_set
+            .as_ref()
+            .map(|s| s.contains(&key))
+            .unwrap_or(false);
+        *self
+            .shuangpin_finals_cache
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = (active_id, finals_set);
         result
     }
 
     /// 内部辅助：为指定方案 id 构建双拼韵母键集（非双拼返回 None）。
-    fn build_shuangpin_finals(
-        &self,
-        schema_id: &str,
-    ) -> Option<std::collections::HashSet<u8>> {
+    fn build_shuangpin_finals(&self, schema_id: &str) -> Option<std::collections::HashSet<u8>> {
         let data_dir = self.data_dir.as_deref()?;
-        let schema =
-            Self::read_schema(schema_id, Some(data_dir), self.override_dir.as_deref())?;
-        if !schema.engine.pinyin.scheme.eq_ignore_ascii_case("shuangpin") {
+        let schema = Self::read_schema(schema_id, Some(data_dir), self.override_dir.as_deref())?;
+        if !schema
+            .engine
+            .pinyin
+            .scheme
+            .eq_ignore_ascii_case("shuangpin")
+        {
             return None;
         }
         let layout_id = if schema.engine.pinyin.shuangpin.layout.is_empty() {
@@ -483,11 +499,8 @@ impl EngineManager {
                     let id = id.to_string();
                     if !ids.contains(&id) {
                         // 只加入受支持的方案
-                        if Self::schema_supported(
-                            &id,
-                            Some(data_dir),
-                            self.override_dir.as_deref(),
-                        ) {
+                        if Self::schema_supported(&id, Some(data_dir), self.override_dir.as_deref())
+                        {
                             ids.push(id);
                         }
                     }
@@ -614,10 +627,7 @@ impl EngineManager {
         let hit = engine.is_some_and(|e| e.set_dict_enabled(dict_id, enabled));
         // 反查索引依赖「启用词库合并」，启用集变了须失效（懒重建）。
         // 注：编码提示开关已改读全局 config.pinyin.show_code_hint，无方案级缓存需失效。
-        *self
-            .reverse_index
-            .lock()
-            .unwrap_or_else(|e| e.into_inner()) = None;
+        *self.reverse_index.lock().unwrap_or_else(|e| e.into_inner()) = None;
         hit
     }
 
@@ -673,10 +683,7 @@ impl EngineManager {
             .unwrap_or_else(|e| e.into_inner())
             .remove(schema_id);
         // 主码表(及其词库/override)可能变更:失效反查索引,下次按新内容重建。
-        *self
-            .reverse_index
-            .lock()
-            .unwrap_or_else(|e| e.into_inner()) = None;
+        *self.reverse_index.lock().unwrap_or_else(|e| e.into_inner()) = None;
         // 双拼布局可能变更：失效韵母键缓存，下次按新布局重建。
         *self
             .shuangpin_finals_cache
@@ -725,7 +732,10 @@ impl EngineManager {
             self.data_dir.as_deref(),
             self.override_dir.as_deref(),
         );
-        *self.primary_codetable.lock().unwrap_or_else(|e| e.into_inner()) = primary;
+        *self
+            .primary_codetable
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = primary;
         // 主码表可能变更:失效反查索引,下次按新主码表重建。
         *self.reverse_index.lock().unwrap_or_else(|e| e.into_inner()) = None;
         *self.available.lock().unwrap_or_else(|e| e.into_inner()) = available;
@@ -1060,17 +1070,17 @@ impl EngineManager {
             // enabled 作总开关：未启用时所有模糊标志归零（与 Go 行为一致）。
             let pg = pinyin_cfg;
             let fuzzy = crate::pinyin::fuzzy::FuzzyConfig {
-                zh_z:      pg.fuzzy.enabled && pg.fuzzy.zh_z,
-                ch_c:      pg.fuzzy.enabled && pg.fuzzy.ch_c,
-                sh_s:      pg.fuzzy.enabled && pg.fuzzy.sh_s,
-                n_l:       pg.fuzzy.enabled && pg.fuzzy.n_l,
-                f_h:       pg.fuzzy.enabled && pg.fuzzy.f_h,
-                r_l:       pg.fuzzy.enabled && pg.fuzzy.r_l,
-                an_ang:    pg.fuzzy.enabled && pg.fuzzy.an_ang,
-                en_eng:    pg.fuzzy.enabled && pg.fuzzy.en_eng,
-                in_ing:    pg.fuzzy.enabled && pg.fuzzy.in_ing,
-                ian_iang:  pg.fuzzy.enabled && pg.fuzzy.ian_iang,
-                uan_uang:  pg.fuzzy.enabled && pg.fuzzy.uan_uang,
+                zh_z: pg.fuzzy.enabled && pg.fuzzy.zh_z,
+                ch_c: pg.fuzzy.enabled && pg.fuzzy.ch_c,
+                sh_s: pg.fuzzy.enabled && pg.fuzzy.sh_s,
+                n_l: pg.fuzzy.enabled && pg.fuzzy.n_l,
+                f_h: pg.fuzzy.enabled && pg.fuzzy.f_h,
+                r_l: pg.fuzzy.enabled && pg.fuzzy.r_l,
+                an_ang: pg.fuzzy.enabled && pg.fuzzy.an_ang,
+                en_eng: pg.fuzzy.enabled && pg.fuzzy.en_eng,
+                in_ing: pg.fuzzy.enabled && pg.fuzzy.in_ing,
+                ian_iang: pg.fuzzy.enabled && pg.fuzzy.ian_iang,
+                uan_uang: pg.fuzzy.enabled && pg.fuzzy.uan_uang,
             };
             let pcfg = PinyinConfig {
                 show_code_hint: pg.show_code_hint,
@@ -1078,9 +1088,15 @@ impl EngineManager {
                 use_smart_compose: pg.use_smart_compose,
                 candidate_order: pg.candidate_order.clone(),
             };
-            let mut engine = PinyinEngine::with_unigram(pcfg, dict, unigram).with_fuzzy(fuzzy.clone());
+            let mut engine =
+                PinyinEngine::with_unigram(pcfg, dict, unigram).with_fuzzy(fuzzy.clone());
             // 双拼方案：按 layout 加载布局并注入 ShuangpinConverter
-            if schema.engine.pinyin.scheme.eq_ignore_ascii_case("shuangpin") {
+            if schema
+                .engine
+                .pinyin
+                .scheme
+                .eq_ignore_ascii_case("shuangpin")
+            {
                 let layout_id = if schema.engine.pinyin.shuangpin.layout.is_empty() {
                     "xiaohe".to_string()
                 } else {
@@ -1225,9 +1241,8 @@ impl EngineManager {
             }
             schemas_dir.join(rel)
         };
-        let is_english = |e: &DictSpec| -> bool {
-            !e.dict_type.is_empty() && e.dict_type == "english"
-        };
+        let is_english =
+            |e: &DictSpec| -> bool { !e.dict_type.is_empty() && e.dict_type == "english" };
 
         let usable: Vec<&DictSpec> = schema
             .dictionaries
@@ -1422,19 +1437,19 @@ impl EngineManager {
                 // 写内容指纹(覆盖全部源，与上面 fresh 校验的 paths 一致)
                 wind_dict::cache_fp::write_cache_fp(combined, &paths);
                 match wind_dict::datformat::WdatReader::open(combined) {
-                Ok(reader) => {
-                    info!(
-                        "Wrote combined cache: {} ({} keys from {} dicts)",
-                        combined.display(),
-                        reader.key_count(),
-                        sources.len()
-                    );
-                    Some(CachedDict::Mmap(reader))
-                }
-                Err(e) => {
-                    warn!("Failed to open combined cache: {}", e);
-                    None
-                }
+                    Ok(reader) => {
+                        info!(
+                            "Wrote combined cache: {} ({} keys from {} dicts)",
+                            combined.display(),
+                            reader.key_count(),
+                            sources.len()
+                        );
+                        Some(CachedDict::Mmap(reader))
+                    }
+                    Err(e) => {
+                        warn!("Failed to open combined cache: {}", e);
+                        None
+                    }
                 }
             }
             Err(e) => {
@@ -1739,8 +1754,7 @@ mod tests {
 
         // 不支持的双拼变体：engine.type="pinyin" + scheme="ziranma_xxx" → is_supported()=false
         {
-            let mut f =
-                std::fs::File::create(schemas.join("sp_unsupported.schema.toml")).unwrap();
+            let mut f = std::fs::File::create(schemas.join("sp_unsupported.schema.toml")).unwrap();
             write!(
                 f,
                 "[schema]\nid = \"sp_unsupported\"\n[engine]\ntype = \"pinyin\"\n[engine.pinyin]\nscheme = \"ziranma_xxx\"\n"
@@ -1751,21 +1765,13 @@ mod tests {
         // 构造 config：active = dummy_ct（首个 available 即为 active）
         let mut cfg = Config::default();
         cfg.schema.active = "dummy_ct".into();
-        cfg.schema.available = vec![
-            "dummy_ct".into(),
-            "sp_test".into(),
-            "sp_unsupported".into(),
-        ];
+        cfg.schema.available = vec!["dummy_ct".into(), "sp_test".into(), "sp_unsupported".into()];
 
         let ov_dir = std::env::temp_dir().join("wind_eng_sp_available_ov");
         let _ = std::fs::remove_dir_all(&ov_dir);
 
-        let mgr = EngineManager::with_store_override(
-            &cfg,
-            Some(&base_dir),
-            None,
-            Some(ov_dir.clone()),
-        );
+        let mgr =
+            EngineManager::with_store_override(&cfg, Some(&base_dir), None, Some(ov_dir.clone()));
 
         let available = mgr.available_schemas();
 
@@ -1799,8 +1805,7 @@ mod tests {
         use std::io::Write;
 
         // 真实 data 目录（含 shuangpin/ 布局文件 + 可读的 schema TOML）
-        let data_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../../../data");
+        let data_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../../data");
         // 把测试用 schema 写到 data/schemas/ 目录下（与真实布局同 data_dir）
         // 注意：测试结束后删除，防止污染。
         let sp_schema_path = data_dir.join("schemas").join("sp_mspy_test.schema.toml");
@@ -1820,28 +1825,15 @@ mod tests {
         let ov_dir = std::env::temp_dir().join("wind_eng_sp_finalkey_ov");
         let _ = std::fs::remove_dir_all(&ov_dir);
 
-        let mgr = EngineManager::with_store_override(
-            &cfg,
-            Some(&data_dir),
-            None,
-            Some(ov_dir.clone()),
-        );
+        let mgr =
+            EngineManager::with_store_override(&cfg, Some(&data_dir), None, Some(ov_dir.clone()));
 
         // mspy `;` = ing → 是韵母键
-        assert!(
-            mgr.shuangpin_final_key(b';'),
-            "mspy `;` 应是韵母键"
-        );
+        assert!(mgr.shuangpin_final_key(b';'), "mspy `;` 应是韵母键");
         // `k` 在 mspy 是韵母键（ao）
-        assert!(
-            mgr.shuangpin_final_key(b'k'),
-            "mspy `k` 应是韵母键"
-        );
+        assert!(mgr.shuangpin_final_key(b'k'), "mspy `k` 应是韵母键");
         // `[` 不是 mspy 的韵母键（mspy finals 仅含字母和 `;`）
-        assert!(
-            !mgr.shuangpin_final_key(b'['),
-            "mspy `[` 不应是韵母键"
-        );
+        assert!(!mgr.shuangpin_final_key(b'['), "mspy `[` 不应是韵母键");
 
         let _ = std::fs::remove_file(&sp_schema_path);
         let _ = std::fs::remove_dir_all(&ov_dir);
@@ -1871,16 +1863,18 @@ mod tests {
         let ov_dir = std::env::temp_dir().join("wind_eng_sp_finalkey_ct_ov");
         let _ = std::fs::remove_dir_all(&ov_dir);
 
-        let mgr = EngineManager::with_store_override(
-            &cfg,
-            Some(&base_dir),
-            None,
-            Some(ov_dir.clone()),
-        );
+        let mgr =
+            EngineManager::with_store_override(&cfg, Some(&base_dir), None, Some(ov_dir.clone()));
 
         // 非双拼方案，任何键均应返回 false
-        assert!(!mgr.shuangpin_final_key(b';'), "codetable 方案 `;` 应返回 false");
-        assert!(!mgr.shuangpin_final_key(b'k'), "codetable 方案 `k` 应返回 false");
+        assert!(
+            !mgr.shuangpin_final_key(b';'),
+            "codetable 方案 `;` 应返回 false"
+        );
+        assert!(
+            !mgr.shuangpin_final_key(b'k'),
+            "codetable 方案 `k` 应返回 false"
+        );
 
         let _ = std::fs::remove_dir_all(&base_dir);
         let _ = std::fs::remove_dir_all(&ov_dir);
@@ -1953,12 +1947,8 @@ mod tests {
         let ov_dir = std::env::temp_dir().join("wind_eng_installed_schemas_ov");
         let _ = std::fs::remove_dir_all(&ov_dir);
 
-        let mgr = EngineManager::with_store_override(
-            &cfg,
-            Some(&base_dir),
-            None,
-            Some(ov_dir.clone()),
-        );
+        let mgr =
+            EngineManager::with_store_override(&cfg, Some(&base_dir), None, Some(ov_dir.clone()));
 
         let available = mgr.available_schemas();
         let installed = mgr.installed_schemas();
@@ -1994,7 +1984,10 @@ mod tests {
         let mut sorted = installed.clone();
         sorted.sort();
         sorted.dedup();
-        assert_eq!(installed, sorted, "installed_schemas 应按字典序排序且无重复");
+        assert_eq!(
+            installed, sorted,
+            "installed_schemas 应按字典序排序且无重复"
+        );
 
         let _ = std::fs::remove_dir_all(&base_dir);
         let _ = std::fs::remove_dir_all(&ov_dir);

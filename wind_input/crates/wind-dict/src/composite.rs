@@ -149,7 +149,11 @@ mod tests {
             self.ltype
         }
         fn search(&self, code: &str, _limit: usize) -> Vec<Candidate> {
-            self.items.iter().filter(|c| c.code == code).cloned().collect()
+            self.items
+                .iter()
+                .filter(|c| c.code == code)
+                .cloned()
+                .collect()
         }
         fn search_prefix(&self, prefix: &str, _limit: usize) -> Vec<Candidate> {
             self.items
@@ -241,10 +245,18 @@ mod tests {
                 self.enabled.store(e, std::sync::atomic::Ordering::Relaxed);
             }
             fn search(&self, code: &str, _l: usize) -> Vec<Candidate> {
-                self.items.iter().filter(|c| c.code == code).cloned().collect()
+                self.items
+                    .iter()
+                    .filter(|c| c.code == code)
+                    .cloned()
+                    .collect()
             }
             fn search_prefix(&self, p: &str, _l: usize) -> Vec<Candidate> {
-                self.items.iter().filter(|c| c.code.starts_with(p)).cloned().collect()
+                self.items
+                    .iter()
+                    .filter(|c| c.code.starts_with(p))
+                    .cloned()
+                    .collect()
             }
         }
         let c = CompositeDict::new();

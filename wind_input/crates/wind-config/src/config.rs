@@ -1119,7 +1119,9 @@ pub struct PinyinGlobalConfig {
     pub fuzzy: PinyinFuzzy,
 }
 
-fn default_candidate_order() -> String { "smart".to_string() }
+fn default_candidate_order() -> String {
+    "smart".to_string()
+}
 
 impl Default for PinyinGlobalConfig {
     fn default() -> Self {
@@ -1135,18 +1137,30 @@ impl Default for PinyinGlobalConfig {
 /// 全局模糊音（[pinyin.fuzzy]）。字段对齐引擎 FuzzyConfig。
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct PinyinFuzzy {
-    #[serde(default)] pub enabled: bool,
-    #[serde(default)] pub zh_z: bool,
-    #[serde(default)] pub ch_c: bool,
-    #[serde(default)] pub sh_s: bool,
-    #[serde(default)] pub n_l: bool,
-    #[serde(default)] pub f_h: bool,
-    #[serde(default)] pub r_l: bool,
-    #[serde(default)] pub an_ang: bool,
-    #[serde(default)] pub en_eng: bool,
-    #[serde(default)] pub in_ing: bool,
-    #[serde(default)] pub ian_iang: bool,
-    #[serde(default)] pub uan_uang: bool,
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default)]
+    pub zh_z: bool,
+    #[serde(default)]
+    pub ch_c: bool,
+    #[serde(default)]
+    pub sh_s: bool,
+    #[serde(default)]
+    pub n_l: bool,
+    #[serde(default)]
+    pub f_h: bool,
+    #[serde(default)]
+    pub r_l: bool,
+    #[serde(default)]
+    pub an_ang: bool,
+    #[serde(default)]
+    pub en_eng: bool,
+    #[serde(default)]
+    pub in_ing: bool,
+    #[serde(default)]
+    pub ian_iang: bool,
+    #[serde(default)]
+    pub uan_uang: bool,
 }
 
 fn default_true() -> bool {
@@ -1559,8 +1573,17 @@ mod tests {
         assert!(!c.pinyin.fuzzy.ch_c, "ch_c 未覆盖，应保留默认 false");
         assert!(!c.pinyin.fuzzy.sh_s, "sh_s 未覆盖，应保留默认 false");
         // 未覆盖的 pinyin 顶层字段：保留默认值
-        assert!(c.pinyin.show_code_hint, "show_code_hint 未覆盖，应保留默认 true");
-        assert!(c.pinyin.use_smart_compose, "use_smart_compose 未覆盖，应保留默认 true");
-        assert_eq!(c.pinyin.candidate_order, "smart", "candidate_order 未覆盖，应保留默认 smart");
+        assert!(
+            c.pinyin.show_code_hint,
+            "show_code_hint 未覆盖，应保留默认 true"
+        );
+        assert!(
+            c.pinyin.use_smart_compose,
+            "use_smart_compose 未覆盖，应保留默认 true"
+        );
+        assert_eq!(
+            c.pinyin.candidate_order, "smart",
+            "candidate_order 未覆盖，应保留默认 smart"
+        );
     }
 }

@@ -321,8 +321,8 @@ impl Coordinator {
             .engine_mgr
             .schema_name(&self.engine_mgr.active_schema_id());
         // 前台应用全屏时隐藏工具栏（ui.toolbar.hide_in_fullscreen，对齐 Go）。
-        let hide_fullscreen = self.rt().config.ui.toolbar.hide_in_fullscreen
-            && crate::is_foreground_fullscreen();
+        let hide_fullscreen =
+            self.rt().config.ui.toolbar.hide_in_fullscreen && crate::is_foreground_fullscreen();
         let s = self.state.lock().unwrap_or_else(|e| e.into_inner());
         if !(s.ime_active && s.toolbar_visible) || hide_fullscreen {
             drop(s);

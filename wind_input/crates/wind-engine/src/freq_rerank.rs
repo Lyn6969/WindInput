@@ -228,7 +228,8 @@ mod tests {
         let r = recs(&[("是", 4, NOW)]); // 「是」有使用记录（模拟 si→是 count=4）
         rerank_pinyin_decay(&mut cands, &r, NOW);
         assert_eq!(
-            cands[0].text, "四",
+            cands[0].text,
+            "四",
             "精确命中「四」须优先于被使用过的模糊命中「是」，实际: {:?}",
             cands.iter().map(|c| &c.text).collect::<Vec<_>>()
         );
