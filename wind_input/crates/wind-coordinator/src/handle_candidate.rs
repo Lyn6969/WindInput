@@ -346,10 +346,18 @@ impl Coordinator {
         let id = self.engine_mgr.active_schema_id();
         let enabled = match self.engine_mgr.current_engine_type() {
             Some(wind_engine::EngineType::CodeTable) => {
-                self.engine_mgr.schema_merged(&id)?.engine.codetable.z_key_repeat
+                self.engine_mgr
+                    .schema_merged(&id)?
+                    .engine
+                    .codetable
+                    .z_key_repeat
             }
             Some(wind_engine::EngineType::Mixed) => {
-                self.engine_mgr.schema_merged(&id)?.engine.mixed.z_key_repeat
+                self.engine_mgr
+                    .schema_merged(&id)?
+                    .engine
+                    .mixed
+                    .z_key_repeat
             }
             _ => false,
         };
@@ -396,7 +404,7 @@ impl Coordinator {
     /// 默认 `select_char_keys` 为空 → 恒返回 None（功能禁用，零回归）。
     pub(crate) fn select_char_index(&self, key_code: u32) -> Option<usize> {
         for group in &self.rt().config.input.select_char_keys {
-            let vks = hotkey::select_char_vks(group);
+            let vks = hotkey::select_key_vks(group);
             if let Some(pos) = vks.iter().position(|vk| *vk == key_code) {
                 return Some(pos);
             }
@@ -646,7 +654,11 @@ impl Coordinator {
     /// 以词定字：从当前高亮候选词中取第 `char_index` 个字符上屏（0-based，对齐 Go
     /// handleSelectChar）。返回 `None` 表示「无法以词定字」——无候选 / 无缓冲 / 候选词长度不足 /
     /// 命中的是未展开的组候选（组名不可作字源）——交调用方按 overflow 策略处理。
-    pub(crate) fn handle_select_char(&self, state: &mut State, char_index: usize) -> Option<KeyAction> {
+    pub(crate) fn handle_select_char(
+        &self,
+        state: &mut State,
+        char_index: usize,
+    ) -> Option<KeyAction> {
         if state.candidates.is_empty() || state.input_buffer.is_empty() {
             return None;
         }
@@ -878,8 +890,10 @@ impl Coordinator {
         let has_shift = data.modifiers & MOD_SHIFT != 0;
         let h = &self.rt().config.hotkeys;
         // 删除优先匹配（与 Go 顺序一致：DeleteCandidate 先于 PinCandidate）。
-        let del = Self::match_candidate_action_key(&h.delete_candidate, true, has_shift, data.key_code);
-        let pin = Self::match_candidate_action_key(&h.pin_candidate, true, has_shift, data.key_code);
+        let del =
+            Self::match_candidate_action_key(&h.delete_candidate, true, has_shift, data.key_code);
+        let pin =
+            Self::match_candidate_action_key(&h.pin_candidate, true, has_shift, data.key_code);
         let (op, num) = if del > 0 {
             (CandidateOp::Delete, del)
         } else if pin > 0 {

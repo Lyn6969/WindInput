@@ -1316,9 +1316,7 @@ impl Coordinator {
                     // 拼音候选用码表真实反查索引填(仅 text 在码表词库中存在才显示,不生成、不臆测)。
                     comment: if !c.comment.is_empty() {
                         c.comment.clone()
-                    } else if pinyin_hint
-                        && c.source == wind_candidate::CandidateSource::Pinyin
-                    {
+                    } else if pinyin_hint && c.source == wind_candidate::CandidateSource::Pinyin {
                         // 反查码:仅对**拼音来源**候选,用主码表反向索引取该词在码表里的**实际**
                         // 编码(不存在则不显示)。不按字生成码——生成码常与码表实际码不一致,会提示
                         // 出打不出的码。对齐 Go addCodeHintsFromCodetable(Source==Pinyin && 空 comment)。
@@ -2092,7 +2090,9 @@ impl MessageHandler for Coordinator {
                 if let Some(d) = npc.to_digit(10) {
                     // 数字键：完全等同主键盘数字键——空缓冲透传输出数字，否则选词/越界 overflow。
                     // `0` 对齐主键盘选第 10 个候选（num=10）。
+                    // 对齐 Go：空缓冲透传前先记录统计（SourcePunctuation）。
                     if !has_comp {
+                        self.record_commit(&npc.to_string(), 0, -1, CommitSource::Punctuation);
                         return KeyAction::PassThrough;
                     }
                     let num = if d == 0 { 10 } else { d as usize };
@@ -2253,10 +2253,13 @@ impl MessageHandler for Coordinator {
                 // （ignore 吞键 / commit 上屏高亮 / commit_and_input 顶字+数字，对齐 Go）。
                 let num = (data.key_code - 0x31) as usize + 1; // 1..=9
                 // 无候选时保持透传：纯数字键应输出数字（不拦截空缓冲下的数字）。
+                // 对齐 Go：recordCommit(key, 0, -1, SourcePunctuation) 后再 return nil。
                 if state.candidates.is_empty()
                     && state.input_buffer.is_empty()
                     && state.committed_text.is_empty()
                 {
+                    let digit = (b'0' + num as u8) as char;
+                    self.record_commit(&digit.to_string(), 0, -1, CommitSource::Punctuation);
                     return KeyAction::PassThrough;
                 }
                 self.handle_number_key_select(&mut state, num)

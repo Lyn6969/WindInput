@@ -23,18 +23,18 @@ const STATS_META_KEY: &str = "stats_meta";
 #[repr(u8)]
 pub enum CommitSource {
     #[default]
-    Candidate = 0,    // 候选词选择
-    RawInput = 1,     // 原始编码上屏（回车/无候选/顶码）
-    Punctuation = 2,  // 标点符号
-    TempEnglish = 3,  // 临时英文
-    TempPinyin = 4,   // 临时拼音
-    QuickInput = 5,   // 快捷输入
-    FullWidth = 6,    // 全角转换（保留枚举值，Rust 暂不单独产出）
-    ModeSwitch = 7,   // 模式切换上屏
-    TsfDirect = 8,    // TSF 直接输入（保留枚举值，Rust 暂无该路径）
-    SpecialMode = 9,  // 引导键特殊模式
-    Url = 10,         // 网址模式（Rust 特有）
-    Mix = 11,         // 混合模式（Rust 特有）
+    Candidate = 0, // 候选词选择
+    RawInput = 1,    // 原始编码上屏（回车/无候选/顶码）
+    Punctuation = 2, // 标点符号
+    TempEnglish = 3, // 临时英文
+    TempPinyin = 4,  // 临时拼音
+    QuickInput = 5,  // 快捷输入
+    FullWidth = 6,   // 全角转换（保留枚举值，Rust 暂不单独产出）
+    ModeSwitch = 7,  // 模式切换上屏
+    TsfDirect = 8,   // TSF 直接输入（保留枚举值，Rust 暂无该路径）
+    SpecialMode = 9, // 引导键特殊模式
+    Url = 10,        // 网址模式（Rust 特有）
+    Mix = 11,        // 混合模式（Rust 特有）
 }
 
 impl CommitSource {
@@ -439,6 +439,7 @@ pub fn classify_chars_full(text: &str) -> (u32, u32, u32, u32) {
 }
 
 /// 标点/符号判定（ASCII 标点 + 常见 CJK/全角标点区段），近似 Go `unicode.IsPunct||IsSymbol`。
+/// 全角数字(FF10-FF19)和全角字母(FF21-FF3A/FF41-FF5A)在 Go 中为 other，此处同样排除。
 fn is_punct_or_symbol(ch: char) -> bool {
     if ch.is_ascii_punctuation() {
         return true;
@@ -447,7 +448,11 @@ fn is_punct_or_symbol(ch: char) -> bool {
         0x2000..=0x206F   // 通用标点
         | 0x3000..=0x303F // CJK 符号和标点
         | 0xFE30..=0xFE4F // CJK 兼容形式
-        | 0xFF00..=0xFFEF // 全角 ASCII / 半宽形式
+        // 全角 ASCII 标点区段（跳过 FF10-FF19 全角数字、FF21-FF3A/FF41-FF5A 全角字母）
+        | 0xFF00..=0xFF0F // ！＂＃＄％＆＇（）＊＋，－．／
+        | 0xFF1A..=0xFF20 // ：；＜＝＞？＠
+        | 0xFF3B..=0xFF40 // ［＼］＾＿｀
+        | 0xFF5B..=0xFFEF // ｛｜｝～ + 半宽形式
     )
 }
 
@@ -529,6 +534,26 @@ mod tests {
         assert_eq!(en, 3);
         assert_eq!(pu, 1, "，为全角标点");
         assert_eq!(ot, 3, "123 计入其他");
+    }
+
+    #[test]
+    fn test_classify_fullwidth_digits_as_other() {
+        // 全角数字 U+FF10-FF19 对齐 Go：unicode.IsPunct/IsSymbol 均为 false → other
+        let (zh, en, pu, ot) = classify_chars_full("０１２３４５６７８９");
+        assert_eq!(pu, 0, "全角数字不应计为标点");
+        assert_eq!(ot, 10, "全角数字应计为其他");
+        assert_eq!(zh, 0);
+        assert_eq!(en, 0);
+    }
+
+    #[test]
+    fn test_classify_fullwidth_letters_as_other() {
+        // 全角字母 U+FF21-FF3A/FF41-FF5A 对齐 Go：非 ASCII alpha、非 IsPunct → other
+        let (zh, en, pu, ot) = classify_chars_full("ＡＢＣａｂｃ");
+        assert_eq!(pu, 0, "全角字母不应计为标点");
+        assert_eq!(ot, 6, "全角字母应计为其他");
+        assert_eq!(zh, 0);
+        assert_eq!(en, 0);
     }
 
     #[test]
