@@ -629,13 +629,13 @@ impl Coordinator {
         match behavior.as_str() {
             "commit" => {
                 let cand = state.candidates[hi].clone();
-                self.commit_selected(state, &cand)
+                self.commit_selected(state, &cand, state.selected_index as i32)
             }
             "commit_and_input" => {
                 // 触发键字符按标点流水线转换（在提交前取，chinese_punct 等状态不受提交影响）。
                 let piece = self.convert_punct(state, key_char, prev_char);
                 let cand = state.candidates[hi].clone();
-                let act = self.commit_selected(state, &cand);
+                let act = self.commit_selected(state, &cand, state.selected_index as i32);
                 Self::append_to_insert_text(act, &piece)
             }
             // "ignore" 及未知值：吞键无效（保留组合，不上屏）
@@ -723,14 +723,14 @@ impl Coordinator {
         match behavior.as_str() {
             "commit" => {
                 let cand = state.candidates[hi].clone();
-                self.commit_selected(state, &cand)
+                self.commit_selected(state, &cand, state.selected_index as i32)
             }
             "commit_and_input" => {
                 let piece = key_char
                     .map(|c| self.convert_punct(state, c, prev_char))
                     .unwrap_or_default();
                 let cand = state.candidates[hi].clone();
-                let act = self.commit_selected(state, &cand);
+                let act = self.commit_selected(state, &cand, state.selected_index as i32);
                 Self::append_to_insert_text(act, &piece)
             }
             _ => KeyAction::Consumed,
