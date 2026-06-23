@@ -378,16 +378,12 @@ impl Engine for PinyinEngine {
             push_unique(&mut candidates, text, code, weight, order);
         }
 
-        // 5. 缩写/简拼匹配
+        // 5. 简拼匹配（声母缩写，如 nh→你好）：查 wdat 预存的独立 AbbrevSection。
+        //    仅当输入像简拼时才查（is_abbreviation：每字母均为某音节首字母、且非完整音节序列），
+        //    避免对全拼输入做无谓查找。natural_order=999999 让简拼候选默认排在全拼之后。
         if AbbrevMatcher::is_abbreviation(input, trie) {
-            for abbrev in AbbrevMatcher::find_candidates(input, trie, dict, 10) {
-                push_unique(
-                    &mut candidates,
-                    abbrev.text,
-                    abbrev.code,
-                    abbrev.weight,
-                    999999,
-                );
+            for (text, weight, _order) in dict.search_abbrev(input, 10) {
+                push_unique(&mut candidates, text, input.to_string(), weight, 999999);
             }
         }
 

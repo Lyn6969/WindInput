@@ -2,15 +2,15 @@
 //!
 //! 与 Go 版 mmap 共享池对齐，显著降低内存占用。
 
-use crate::binformat::{DictReader, DictWriter};
 use crate::codetable::CodetableDict;
+use crate::datformat::{WdatReader, WdatWriter};
 use std::path::Path;
 use tracing::{info, warn};
 
 /// 缓存词典：优先使用 mmap，回退到内存模式
 pub enum CachedDict {
-    /// mmap 零拷贝模式（低内存）
-    Mmap(DictReader),
+    /// mmap 零拷贝模式（低内存，wdat DAT 格式）
+    Mmap(WdatReader),
     /// 内存模式（首次加载或缓存写入失败）
     Memory(CodetableDict),
 }
@@ -23,7 +23,7 @@ impl CachedDict {
     /// 2. 如果是，直接 mmap 打开
     /// 3. 如果否，加载 .yaml，写入 .wdb 缓存，然后 mmap 打开
     pub fn load(yaml_path: &Path) -> anyhow::Result<Self> {
-        let wdb_path = yaml_path.with_extension("wdb");
+        let wdb_path = yaml_path.with_extension("wdat");
         Self::load_at(yaml_path, &wdb_path)
     }
 
@@ -42,7 +42,7 @@ impl CachedDict {
     ) -> anyhow::Result<Self> {
         // 检查缓存是否有效
         if Self::cache_is_valid(yaml_path, wdb_path) {
-            match DictReader::open(wdb_path) {
+            match WdatReader::open(wdb_path) {
                 Ok(reader) => {
                     info!(
                         "Using mmap cache: {} ({} keys)",
@@ -81,7 +81,7 @@ impl CachedDict {
         crate::cache_fp::write_cache_fp(wdb_path, &[yaml_path]);
 
         // 用 mmap 重新打开缓存
-        match DictReader::open(wdb_path) {
+        match WdatReader::open(wdb_path) {
             Ok(reader) => {
                 info!(
                     "Using mmap cache: {} ({} keys)",
@@ -104,10 +104,10 @@ impl CachedDict {
 
     /// 将内存词典写入 .wdb 缓存
     fn write_cache(dict: &CodetableDict, wdb_path: &Path) -> anyhow::Result<()> {
-        let mut writer = DictWriter::new();
+        let mut writer = WdatWriter::new();
 
         // 遍历所有键，导出到 writer
-        dict.export_to_writer(&mut writer);
+        dict.export_to_wdat(&mut writer);
 
         if writer.key_count() == 0 {
             anyhow::bail!("No entries to write");
@@ -143,6 +143,19 @@ impl CachedDict {
                 .map(|e| (e.code, e.text, e.weight, e.order))
                 .collect(),
             Self::Memory(dict) => dict.search_prefix(prefix, limit),
+        }
+    }
+
+    /// 简拼查找（声母缩写，如 nh→你好）：仅 wdat(Mmap) 的独立 AbbrevSection 支持；
+    /// 内存回退(yaml 未建简拼) 返回空。结果 (text, weight, order)，已按权重降序、截断。
+    pub fn search_abbrev(&self, code: &str, limit: usize) -> Vec<(String, i32, i32)> {
+        match self {
+            Self::Mmap(reader) => reader
+                .search_abbrev(code, limit)
+                .into_iter()
+                .map(|e| (e.text, e.weight, e.order))
+                .collect(),
+            Self::Memory(_) => Vec::new(),
         }
     }
 

@@ -1242,7 +1242,7 @@ impl EngineManager {
 
         let load_one = |e: &DictSpec| -> Option<CachedDict> {
             let full = resolve(&e.path);
-            match CachedDict::load_at_with(&full, &cache_path(&full, "wdb"), is_english(e)) {
+            match CachedDict::load_at_with(&full, &cache_path(&full, "wdat"), is_english(e)) {
                 Ok(d) => Some(d),
                 Err(err) => {
                     warn!("Failed to load codetable dict {}: {}", full.display(), err);
@@ -1338,7 +1338,7 @@ impl EngineManager {
             } else {
                 // 英文词库：code 列小写化（大小写不敏感前缀匹配，text 保留原样）。
                 let lowercase = dtype(e) == "english";
-                match CachedDict::load_at_with(&full, &cache_path(&full, "wdb"), lowercase) {
+                match CachedDict::load_at_with(&full, &cache_path(&full, "wdat"), lowercase) {
                     Ok(d) => {
                         info!("Dictionary loaded: {} entries", d.len());
                         Some(d)
@@ -1356,7 +1356,7 @@ impl EngineManager {
             .iter()
             .map(|e| (resolve(&e.path), dtype(e)))
             .collect();
-        let combined = cache_path(sources[0].0.as_path(), "combined.wdb");
+        let combined = cache_path(sources[0].0.as_path(), "combined.wdat");
         Self::load_merged_dicts(&sources, &combined)
     }
 
@@ -1369,7 +1369,7 @@ impl EngineManager {
     ) -> Option<CachedDict> {
         let paths: Vec<&Path> = sources.iter().map(|(p, _)| p.as_path()).collect();
         if Self::combined_cache_fresh(&paths, combined) {
-            if let Ok(reader) = wind_dict::binformat::DictReader::open(combined) {
+            if let Ok(reader) = wind_dict::datformat::WdatReader::open(combined) {
                 info!(
                     "Using combined cache: {} ({} keys)",
                     combined.display(),
@@ -1412,7 +1412,7 @@ impl EngineManager {
             return None;
         }
 
-        let mut writer = wind_dict::binformat::DictWriter::new();
+        let mut writer = wind_dict::datformat::WdatWriter::new();
         for (code, mut entries) in agg {
             entries.sort_by(|a, b| b.1.cmp(&a.1));
             writer.add(code, entries);
@@ -1421,7 +1421,7 @@ impl EngineManager {
             Ok(_) => {
                 // 写内容指纹(覆盖全部源，与上面 fresh 校验的 paths 一致)
                 wind_dict::cache_fp::write_cache_fp(combined, &paths);
-                match wind_dict::binformat::DictReader::open(combined) {
+                match wind_dict::datformat::WdatReader::open(combined) {
                 Ok(reader) => {
                     info!(
                         "Wrote combined cache: {} ({} keys from {} dicts)",
@@ -1456,7 +1456,7 @@ impl EngineManager {
     fn load_rime_pinyin_dict(dict_path: &Path) -> Option<CachedDict> {
         // merged.wdb 写到可写缓存目录（与 unigram 一致）。安装目录（如 Program Files）
         // 通常只读，若写在源旁会失败 → 回退仅主词典(rime header 数十条) → 拼音无候选。
-        let merged_wdb = cache_path(dict_path, "merged.wdb");
+        let merged_wdb = cache_path(dict_path, "merged.wdat");
         // 先解析主表头部，收集全部源（主表 + import_tables 子表）。指纹/缓存校验需覆盖
         // 全部源，故须先于 fresh 判定算出 sub_paths（仅解析头部 yaml，开销极低）。
         let content = std::fs::read_to_string(dict_path).ok()?;
@@ -1485,7 +1485,7 @@ impl EngineManager {
         // merged 缓存对**全部源**做内容指纹校验：主表或任一子表内容变化、或源清单增删都
         // 判定失效并重建（避免「子表改了却仍用旧 merged」的静默陈旧）。
         if merged_wdb.exists() && Self::combined_cache_fresh(&src_refs, &merged_wdb) {
-            match wind_dict::binformat::DictReader::open(&merged_wdb) {
+            match wind_dict::datformat::WdatReader::open(&merged_wdb) {
                 Ok(reader) => {
                     info!(
                         "Using merged mmap cache: {} ({} keys)",
@@ -1511,17 +1511,27 @@ impl EngineManager {
         // 生成中间 .wdb，也绕过 CodetableDict 的 BTreeMap 构建与逐 code 排序（merged 稍后会
         // 统一按权重重排）。DictWriter::add 不合并同 code 多次调用，故先用 HashMap 聚合，否则
         // wdb 出现重复 KeyIndex，DictReader 二分只命中其一 → 同 code 候选系统性丢失。
+        // 全拼按 code 聚合；简拼（声母缩写，如 nh→你好）按简拼码聚合，存进 wdat 独立 AbbrevSection。
         let mut agg: HashMap<String, Vec<(String, i32)>> = HashMap::new();
+        let mut agg_ab: HashMap<String, Vec<(String, i32)>> = HashMap::new();
         let mut total_entries = 0usize;
         for sub_path in &sub_paths {
             // lowercase_code=false：import_tables 子表均为拼音表(非 english)，与改前
             // CachedDict::load_at(默认不小写 code)行为一致。
             match wind_dict::codetable::parse_rime_entries_parallel(sub_path, false) {
-                Ok(entries) => {
-                    let count = entries.len();
-                    info!("  Loading {} entries from {}", count, sub_path.display());
-                    for (code, text, weight) in entries {
+                Ok((fulls, abbrevs)) => {
+                    let count = fulls.len();
+                    info!(
+                        "  Loading {} entries ({} abbrev) from {}",
+                        count,
+                        abbrevs.len(),
+                        sub_path.display()
+                    );
+                    for (code, text, weight) in fulls {
                         agg.entry(code).or_default().push((text, weight));
+                    }
+                    for (ab, text, weight) in abbrevs {
+                        agg_ab.entry(ab).or_default().push((text, weight));
                     }
                     total_entries += count;
                 }
@@ -1534,13 +1544,24 @@ impl EngineManager {
             return None;
         }
 
-        let mut writer = wind_dict::binformat::DictWriter::new();
+        let mut writer = wind_dict::datformat::WdatWriter::new();
 
         for (code, mut entries) in agg {
-            // 同 code 下按权重降序，保证 KeyIndex 内候选顺序稳定
+            // 同 code 下按权重降序，保证候选顺序稳定
             entries.sort_by(|a, b| b.1.cmp(&a.1));
             writer.add(code, entries);
         }
+        // 简拼表 → 独立 AbbrevSection（与全拼查询互不污染）；同简拼下按权重降序。
+        let abbrev_count = agg_ab.len();
+        for (ab, mut entries) in agg_ab {
+            entries.sort_by(|a, b| b.1.cmp(&a.1));
+            writer.add_abbrev(ab, entries);
+        }
+        info!(
+            "  merged pinyin: {} codes + {} abbrevs",
+            writer.key_count(),
+            abbrev_count
+        );
 
         info!("Writing merged .wdb cache ({} entries)...", total_entries);
         // 写缓存目录；若仍失败（缓存目录不可写等）退到系统临时目录。绝不退化成仅主词典
@@ -1559,7 +1580,7 @@ impl EngineManager {
             if target.as_path() == merged_wdb.as_path() {
                 wind_dict::cache_fp::write_cache_fp(&merged_wdb, &src_refs);
             }
-            match wind_dict::binformat::DictReader::open(target) {
+            match wind_dict::datformat::WdatReader::open(target) {
                 Ok(reader) => {
                     info!(
                         "Using merged mmap cache: {} ({} keys)",

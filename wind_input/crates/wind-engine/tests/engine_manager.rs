@@ -407,3 +407,26 @@ fn test_reload_from_config_switches_active() {
     assert!(!again, "活跃方案未变时应返回 false");
     assert_eq!(mgr.active_schema_id(), "pinyin");
 }
+
+/// 简拼（声母缩写）经 wdat 独立 AbbrevSection 产出候选：bzd→不知道 / bj→北京 等。
+/// 这是「简拼能力」的回归保护（迁 wdat 前简拼完全失效，返回空）。
+#[test]
+fn test_pinyin_abbrev() {
+    let dir = data_dir();
+    if !schema_exists(&dir, "pinyin") {
+        eprintln!("跳过：pinyin schema 不存在");
+        return;
+    }
+    let cfg = make_config(&["pinyin"]);
+    let mgr = EngineManager::new(&cfg, Some(&dir));
+    let has = |input: &str, want: &str| -> bool {
+        mgr.convert(input, 20).candidates.iter().any(|c| c.text == want)
+    };
+    assert!(has("bzd", "不知道"), "简拼 bzd 应含 不知道");
+    assert!(has("bj", "北京"), "简拼 bj 应含 北京");
+    assert!(has("nh", "你好"), "简拼 nh 应含 你好");
+    assert!(has("zg", "中国"), "简拼 zg 应含 中国");
+    assert!(has("zgr", "中国人"), "三字简拼 zgr 应含 中国人");
+    // 全拼仍正常（简拼区段不影响全拼查询）。
+    assert!(has("nihao", "你好"), "全拼 nihao 应含 你好");
+}
