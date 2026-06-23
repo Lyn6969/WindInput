@@ -741,7 +741,11 @@ impl CandidateWindow {
         });
 
         // 候选列表：横排=Row（cell 并列）；竖排=Column（候选纵向堆叠）。
-        let mut list = if self.vertical {
+        // 无候选时（仅提示徽标/preedit，无候选可纵向堆叠）强制用 Row：徽标 + 等高占位
+        // 并排成单行，高度 = 一个候选行，与横排一致；否则竖排下徽标行与占位行会纵向
+        // 堆叠致提示窗口过高（网址/临拼/临英刚进入时尤甚）。preedit/徽标分隔方向亦随之。
+        let list_vertical = self.vertical && !self.candidates.is_empty();
+        let mut list = if list_vertical {
             View::container(Layout::Column).gap(row_gap_v)
         } else {
             View::container(Layout::Row)
@@ -751,7 +755,7 @@ impl CandidateWindow {
         // 嵌入模式：编码作为候选行首单元内联（无独立背景，与候选间留白分隔），对齐 Go buildEmbeddedPreedit。
         // 横排右留白、竖排下留白。
         if self.preedit_embedded && !self.preedit.is_empty() {
-            let sep = if self.vertical {
+            let sep = if list_vertical {
                 Edges {
                     b: 6.0 * s,
                     ..Edges::default()
@@ -778,7 +782,7 @@ impl CandidateWindow {
         let preedit_bar_shown = !self.preedit.is_empty() && !self.preedit_embedded;
         if !self.mode_label.is_empty() && !preedit_bar_shown {
             let ml_fs = node_fs(&v.mode_label);
-            let sep = if self.vertical {
+            let sep = if list_vertical {
                 Edges {
                     b: 6.0 * s,
                     ..Edges::default()
@@ -803,6 +807,20 @@ impl CandidateWindow {
                     .pad(edges_or(&v.mode_label.padding, [1.0, 6.0, 1.0, 6.0]));
             }
             list = list.child(chip);
+        }
+        // 无候选但有提示（模式徽标 / preedit）时：补一个与正常候选行等高的透明占位行，
+        // 使提示窗口（如网址模式、临拼/临英刚进入）高度与有候选时及普通候选窗一致，
+        // 避免窗口忽高忽低。占位行内边距/字号与候选行一致 → 测得同高，内容透明不可见。
+        if self.candidates.is_empty() {
+            list = list.child(
+                View::container(Layout::Row)
+                    .cross(Align::Center)
+                    .pad(item_pad)
+                    .child(
+                        View::leaf(" ".to_string(), [0, 0, 0, 0])
+                            .font_size(text_fs.max(index_fs)),
+                    ),
+            );
         }
         // 逆序仅改排列顺序；i 仍是原始索引（tag/标签/选中据此）
         let mut order: Vec<(usize, &CandidateItem)> = self.candidates.iter().enumerate().collect();

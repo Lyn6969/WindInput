@@ -111,6 +111,49 @@ fn test_wubi_number_select() {
 }
 
 #[test]
+fn test_url_mode_enter_and_commit() {
+    if !has_schemas() {
+        return;
+    }
+    // #11 网址输入：打满前缀 "www." 夺取进入网址模式，续打累积，空格上屏原文。
+    let mut cfg = config_with("wubi86");
+    cfg.input.url_input.enabled = true;
+    cfg.input.url_input.prefixes = vec!["www.".into()];
+    let coord = Coordinator::new_headless(cfg, Some(&data_dir()));
+
+    // w w w . → 进入网址模式（最后一键补满前缀）
+    press_letter(&coord, 'w');
+    press_letter(&coord, 'w');
+    press_letter(&coord, 'w');
+    let enter = coord.handle_key_event(&key_event(0xBE, EVENT_KEY_DOWN)); // VK_OEM_PERIOD '.'
+    match &enter {
+        KeyAction::UpdateComposition { text, .. } => {
+            assert_eq!(text, "www.", "进入网址模式组合区应为 www.，实际: {}", text);
+        }
+        other => panic!("打满 www. 应进入网址模式(UpdateComposition)，实际: {:?}", other),
+    }
+
+    // 续打 g o → 缓冲累积（网址字符不上屏）
+    press_letter(&coord, 'g');
+    let acc = press_letter(&coord, 'o');
+    match &acc {
+        KeyAction::UpdateComposition { text, .. } => {
+            assert_eq!(text, "www.go", "网址续打应累积，实际: {}", text);
+        }
+        other => panic!("网址续打应 UpdateComposition，实际: {:?}", other),
+    }
+
+    // 空格上屏原文
+    let commit = coord.handle_key_event(&key_event(0x20, EVENT_KEY_DOWN));
+    match commit {
+        KeyAction::InsertText { text, .. } => {
+            assert_eq!(text, "www.go", "网址空格应上屏原文，实际: {}", text);
+        }
+        other => panic!("网址空格应上屏 InsertText，实际: {:?}", other),
+    }
+}
+
+#[test]
 fn test_overflow_number_key_ignore_default() {
     if !has_schemas() {
         return;

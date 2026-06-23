@@ -330,7 +330,7 @@ impl Coordinator {
             }
             ModeKind::TempEnglish => Some(("临时英文".to_string(), "英".to_string())),
             ModeKind::QuickInput => Some(("快捷输入".to_string(), "快".to_string())),
-            ModeKind::Url => None,
+            ModeKind::Url => Some(("网址输入".to_string(), "网址".to_string())),
             ModeKind::Mix(i) => {
                 let rt = self.rt();
                 let m = rt.config.features.mix_modes.get(i as usize)?;
