@@ -578,8 +578,20 @@ fn dispatch_command(
         // ── 批处理事件 ──
         CMD_BATCH_EVENTS => handle_batch_events(handler, payload),
 
-        // ── 输入统计（异步） ──
-        CMD_INPUT_STATS => None,
+        // ── 输入统计（异步，TSF 侧英文模式上报）──
+        // InputStatsPayload: englishChars(4) + englishDigits(4) + englishPuncts(4)
+        //                  + englishSpaces(4) + elapsedMs(4) = 20 字节
+        CMD_INPUT_STATS => {
+            if payload.len() >= 20 {
+                let chars  = u32::from_le_bytes(payload[0..4].try_into().unwrap_or([0; 4]));
+                let digits = u32::from_le_bytes(payload[4..8].try_into().unwrap_or([0; 4]));
+                let puncts = u32::from_le_bytes(payload[8..12].try_into().unwrap_or([0; 4]));
+                let spaces = u32::from_le_bytes(payload[12..16].try_into().unwrap_or([0; 4]));
+                // payload[16..20] = elapsedMs，暂不传入（活跃时间由 StatCollector 自估）
+                handler.handle_english_stats(chars, digits, puncts, spaces);
+            }
+            None
+        }
 
         _ => {
             warn!("Unknown command: 0x{:04X}", command);

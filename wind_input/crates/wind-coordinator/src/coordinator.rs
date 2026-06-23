@@ -1886,6 +1886,33 @@ impl MessageHandler for Coordinator {
         self.show_main_menu(x, y);
     }
 
+    fn handle_english_stats(&self, chars: u32, digits: u32, puncts: u32, spaces: u32) {
+        // TSF 侧英文模式统计（对齐 Go RecordTSFEnglish）。
+        // chars→english, digits+spaces→other（对齐 classify_chars_full 行为）, puncts→punct。
+        let collector = match self.stat_collector.as_ref() {
+            Some(c) => c,
+            None => return,
+        };
+        let cfg = &self.rt().config.features.stats;
+        if !cfg.enabled || !cfg.track_english {
+            return;
+        }
+        if chars == 0 && digits == 0 && puncts == 0 && spaces == 0 {
+            return;
+        }
+        collector.record(StatEvent {
+            timestamp: chrono::Local::now(),
+            chinese: 0,
+            english: chars,
+            punct: puncts,
+            other: digits.saturating_add(spaces),
+            code_len: 0,
+            candidate_pos: -1,
+            schema_id: self.active_schema_id(),
+            source: CommitSource::TsfDirect,
+        });
+    }
+
     fn preedit_uses_placeholder(&self) -> bool {
         // 非 app_inline（候选窗自显 preedit）→ 应用侧用占位空格，不重复显示编码。
         self.preedit_display

@@ -137,7 +137,10 @@ fn test_url_mode_enter_and_commit() {
         KeyAction::UpdateComposition { text, .. } => {
             assert_eq!(text, "www.", "进入网址模式组合区应为 www.，实际: {}", text);
         }
-        other => panic!("打满 www. 应进入网址模式(UpdateComposition)，实际: {:?}", other),
+        other => panic!(
+            "打满 www. 应进入网址模式(UpdateComposition)，实际: {:?}",
+            other
+        ),
     }
 
     // 续打 g o → 缓冲累积（网址字符不上屏）
@@ -282,7 +285,11 @@ fn test_numpad_direct_outputs_digit() {
     let act = coord.handle_key_event(&key_event(0x65, EVENT_KEY_DOWN));
     match act {
         KeyAction::InsertText { text, .. } => {
-            assert_eq!(text, "5", "direct 模式小键盘应直接输出数字 5，实际: {}", text);
+            assert_eq!(
+                text, "5",
+                "direct 模式小键盘应直接输出数字 5，实际: {}",
+                text
+            );
         }
         other => panic!("direct 小键盘应 InsertText，实际: {:?}", other),
     }
@@ -1633,3 +1640,10 @@ fn test_select_char_overflow_commit_and_input() {
     }
 }
 
+#[test]
+fn test_english_stats_callable_without_store() {
+    // handle_english_stats 无 store 时应静默跳过，不崩溃。
+    // 验证 MessageHandler trait 接口存在且协调器已实现。
+    let coord = Coordinator::new_headless(config_with("wubi86"), None);
+    coord.handle_english_stats(5, 3, 2, 1);
+}

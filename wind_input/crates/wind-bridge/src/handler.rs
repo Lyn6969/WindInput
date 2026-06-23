@@ -216,6 +216,11 @@ pub trait MessageHandler: Send + Sync {
     /// i32::MIN 表示坐标缺失（由 UI 取光标位置）。默认空实现。
     fn handle_show_context_menu(&self, _x: i32, _y: i32) {}
 
+    /// 处理 TSF 侧上报的英文模式输入统计（CMD_INPUT_STATS，异步，无响应）。
+    /// chars = a-z/A-Z 字符数; digits = 数字键(0-9/numpad); puncts = 符号键; spaces = 空格键。
+    /// 对齐 Go `RecordTSFEnglish`。默认空实现（无统计的 handler 静默忽略）。
+    fn handle_english_stats(&self, _chars: u32, _digits: u32, _puncts: u32, _spaces: u32) {}
+
     /// 返回当前权威模式 (chinese_mode, full_width)，供 FocusGained 同步路径回传 ModePush。
     /// 必须极轻量（仅锁+读两字段），不得有任何阻塞/跨进程调用——DLL 正同步阻塞等本值。
     /// 与 Go `MessageHandler.GetCurrentMode` 对齐。默认返回中文模式（安全默认）。
