@@ -60,7 +60,7 @@ fn locate() -> anyhow::Result<PathBuf> {
 mod schema_binding {
     //! manifest（展示层）↔ config_schema registry（类型/校验层）一致性绑定。
     //! 三层真相源（struct/registry/manifest）靠这些测试两两锁定，杜绝漂移。
-    use wind_config::config_schema::{FieldType, field};
+    use wind_config::config_schema::{FieldType, field, registry};
 
     fn items() -> Vec<serde_json::Value> {
         let m = super::load("test").expect("加载 manifest");
@@ -68,6 +68,78 @@ mod schema_binding {
             .and_then(|v| v.as_array())
             .cloned()
             .unwrap_or_default()
+    }
+
+    /// 前端 webview（wind_setting）仍引用、但 core 已不再登记的键。
+    /// core 的 setItems 会容错跳过它们（旧字段无害），此名单仅用于让下方 CI 校验放行——
+    /// 多为「延后的 Go 旧功能」或「主题层 theme.yaml 重复键」，详见 docs/deferred-config-features.md。
+    /// **新增前端字段时不要往这里加**：应同步到 config.rs 结构体 + config_schema 注册表。
+    const FRONTEND_AHEAD_ALLOWLIST: &[&str] = &[
+        "features.quick_input.accent_color",
+        "features.quick_input.alpha_providers.english",
+        "features.quick_input.alpha_providers.pinyin",
+        "features.quick_input.alpha_providers.rare_char",
+        "features.quick_input.alpha_providers.rare_char_id",
+        "features.quick_input.trigger_keys",
+        "features.stats.retain_days",
+        "hotkeys.enter_special_mode",
+        "hotkeys.enter_temp_pinyin",
+        "hotkeys.open_add_word_dialog",
+        "hotkeys.take_screenshot",
+        "input.auto_pair.blacklist",
+        "input.temp_pinyin.accent_color",
+        "input.temp_pinyin.z_include_on_commit",
+        "input.url_input.accent_color",
+        "ui.candidate.always_show_pager",
+        "ui.candidate.always_show_pager_follow_theme",
+        "ui.candidate.mode_accent_border",
+        "ui.candidate.show_page_number",
+        "ui.candidate.show_page_number_follow_theme",
+        "ui.candidate.vertical_max_width",
+        "ui.candidate.vertical_max_width_follow_theme",
+        "ui.font.gdi_scale",
+        "ui.font.gdi_weight",
+        "ui.font.menu_size",
+        "ui.font.menu_weight",
+        "ui.status_indicator.background_color",
+        "ui.status_indicator.border_radius",
+        "ui.status_indicator.font_size",
+        "ui.status_indicator.opacity",
+        "ui.status_indicator.show_full_width",
+        "ui.status_indicator.show_mode",
+        "ui.status_indicator.show_punct",
+        "ui.status_indicator.text_color",
+        "ui.theme.editor_auto_start",
+    ];
+
+    /// CI 校验：前端 `wind_setting/src/generated/config-keys.json` 的每个 key 要么在 registry，
+    /// 要么在 [`FRONTEND_AHEAD_ALLOWLIST`]。新增前端键若 core 不认识且未列入名单即红，
+    /// 提醒同步 struct+registry（防 cross-language 漂移；对齐用户「加 CI 校验」决策）。
+    #[test]
+    fn frontend_config_keys_known_to_core() {
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../../wind_setting/src/generated/config-keys.json"
+        );
+        let text = std::fs::read_to_string(path)
+            .unwrap_or_else(|e| panic!("读取前端 {path} 失败（CI 校验需要）: {e}"));
+        let keys: Vec<String> =
+            serde_json::from_str(&text).expect("config-keys.json 应为字符串数组");
+
+        let registered: std::collections::BTreeSet<&str> =
+            registry().iter().map(|f| f.key).collect();
+        let unexpected: Vec<&String> = keys
+            .iter()
+            .filter(|k| {
+                !registered.contains(k.as_str()) && !FRONTEND_AHEAD_ALLOWLIST.contains(&k.as_str())
+            })
+            .collect();
+        assert!(
+            unexpected.is_empty(),
+            "前端 config-keys.json 含 {} 个 core 未登记且不在允许名单的 key（请同步 config.rs 结构体 + config_schema 注册表，或确属前端先行则加入 FRONTEND_AHEAD_ALLOWLIST）: {:?}",
+            unexpected.len(),
+            unexpected
+        );
     }
 
     /// 每个 manifest item.key 必须在 registry 登记——否则写入会被 serde 静默丢弃。

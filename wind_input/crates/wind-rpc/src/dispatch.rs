@@ -139,23 +139,40 @@ fn set_items(state: &DispatchState, params: &Value) -> anyhow::Result<Value> {
         .get("items")
         .and_then(|v| v.as_array())
         .ok_or_else(|| anyhow::anyhow!("invalid_params: items missing"))?;
-    // 第一遍：解析 + 按注册表校验。全部通过才写，避免未知键/越界值部分落盘后静默失效。
+    // 第一遍：解析 + 按注册表校验。合法项收集待写；未知键/类型/枚举错的项**跳过并记录**，
+    // 不让整批因一个旧字段失败（保护沿用旧字段的 webview）。malformed item（无 key）仍为硬错误。
     let mut writes: Vec<(String, toml::Value)> = Vec::with_capacity(items.len());
+    let mut skipped: Vec<Value> = Vec::new();
     for it in items {
         let key = it
             .get("key")
             .and_then(|v| v.as_str())
             .ok_or_else(|| anyhow::anyhow!("invalid_params: item.key missing"))?;
         let value = it.get("value").cloned().unwrap_or(Value::Null);
-        let toml_val = json_to_toml(&value)?;
-        wind_config::config_schema::validate(key, &toml_val)
-            .map_err(|e| anyhow::anyhow!("invalid_config: 键 '{}' {}", key, e))?;
-        writes.push((key.to_string(), toml_val));
+        let toml_val = match json_to_toml(&value) {
+            Ok(v) => v,
+            Err(e) => {
+                skipped.push(json!({ "key": key, "reason": e.to_string() }));
+                continue;
+            }
+        };
+        match wind_config::config_schema::validate(key, &toml_val) {
+            Ok(()) => writes.push((key.to_string(), toml_val)),
+            Err(e) => skipped.push(json!({ "key": key, "reason": e.to_string() })),
+        }
     }
-    // 第二遍：落盘。
+    let applied = writes.len();
+    // 第二遍：落盘合法项（IO 失败仍为硬错误）。
     for (key, toml_val) in writes {
         let parts: Vec<&str> = key.split('.').collect();
         Config::set_user_value(&parts, toml_val)?;
+    }
+    if !skipped.is_empty() {
+        tracing::warn!(
+            "config.setItems 跳过 {} 个无效项（未登记/类型/枚举）: {:?}",
+            skipped.len(),
+            skipped
+        );
     }
     // 落盘后即时热重载：轻量字段立即生效，引擎结构性变更则 needsRestart=true。
     let needs_restart = state.core.apply_config();
@@ -163,7 +180,7 @@ fn set_items(state: &DispatchState, params: &Value) -> anyhow::Result<Value> {
     state
         .events
         .emit_config_changed(json!({ "reason": "setItems", "needsRestart": needs_restart }));
-    Ok(json!({ "needsRestart": needs_restart }))
+    Ok(json!({ "needsRestart": needs_restart, "applied": applied, "skipped": skipped }))
 }
 
 /// 把 config_schema 注册表序列化为 JSON（`{ fields: [{key, type, options?}] }`）。
@@ -360,11 +377,26 @@ mod tests {
         assert!(resp.result.unwrap().is_array());
     }
 
-    // ── Stage 2: registry 校验 + config.schema / config.getItem ──
-    // 注：reject 测试均在写盘前的校验阶段失败，故不触碰真实用户配置文件。
+    // ── Stage 2/4: registry 校验 + config.schema / config.getItem ──
+    // 容错策略：未知键/类型/枚举错的键被「跳过并在响应 skipped 里报告」，合法项照常应用，
+    // 整批不因一个旧字段失败（保护沿用旧字段的 webview）。下列测试单项无合法键，故不写盘。
+
+    /// 取响应里 skipped 数组中的 key 列表。
+    fn skipped_keys(resp: &Response) -> Vec<String> {
+        resp.result
+            .as_ref()
+            .and_then(|r| r.get("skipped"))
+            .and_then(|s| s.as_array())
+            .map(|a| {
+                a.iter()
+                    .filter_map(|it| it.get("key").and_then(|k| k.as_str()).map(String::from))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
 
     #[test]
-    fn set_items_rejects_unknown_key() {
+    fn set_items_skips_unknown_key() {
         let resp = dispatch(
             &state(),
             req(
@@ -372,16 +404,14 @@ mod tests {
                 json!({ "items": [{ "key": "ui.candidate.bogus", "value": 1 }] }),
             ),
         );
-        assert!(resp.result.is_none());
-        let e = resp.error.unwrap();
-        assert!(
-            e.contains("invalid_config") && e.contains("bogus"),
-            "应为结构化校验错误: {e}"
-        );
+        assert!(resp.error.is_none(), "整批不应失败");
+        let r = resp.result.clone().unwrap();
+        assert_eq!(r["applied"], json!(0));
+        assert!(skipped_keys(&resp).contains(&"ui.candidate.bogus".to_string()));
     }
 
     #[test]
-    fn set_items_rejects_enum_out_of_range() {
+    fn set_items_skips_enum_out_of_range() {
         let resp = dispatch(
             &state(),
             req(
@@ -389,12 +419,12 @@ mod tests {
                 json!({ "items": [{ "key": "ui.candidate.layout", "value": "diagonal" }] }),
             ),
         );
-        assert!(resp.result.is_none());
-        assert!(resp.error.unwrap().contains("invalid_config"));
+        assert!(resp.error.is_none());
+        assert!(skipped_keys(&resp).contains(&"ui.candidate.layout".to_string()));
     }
 
     #[test]
-    fn set_items_rejects_type_mismatch() {
+    fn set_items_skips_type_mismatch() {
         let resp = dispatch(
             &state(),
             req(
@@ -402,8 +432,8 @@ mod tests {
                 json!({ "items": [{ "key": "ui.candidate.per_page", "value": "seven" }] }),
             ),
         );
-        assert!(resp.result.is_none());
-        assert!(resp.error.unwrap().contains("invalid_config"));
+        assert!(resp.error.is_none());
+        assert!(skipped_keys(&resp).contains(&"ui.candidate.per_page".to_string()));
     }
 
     #[test]

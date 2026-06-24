@@ -205,13 +205,33 @@ fn apply_items(items: Vec<(String, toml::Value)>) -> i32 {
                 .get("needsRestart")
                 .and_then(Value::as_bool)
                 .unwrap_or(false);
+            let applied = res
+                .get("applied")
+                .and_then(Value::as_u64)
+                .unwrap_or(items.len() as u64);
+            // 正常情况 CLI 已预校验，skipped 应为空；防御性呈现 core 的跳过项。
+            let skipped = res
+                .get("skipped")
+                .and_then(Value::as_array)
+                .cloned()
+                .unwrap_or_default();
+            for s in &skipped {
+                let k = s.get("key").and_then(Value::as_str).unwrap_or("?");
+                let reason = s.get("reason").and_then(Value::as_str).unwrap_or("");
+                eprintln!("⚠ 跳过 {k}: {reason}");
+            }
             let note = if restart {
                 "（需重启 core 完全生效）"
             } else {
                 "（已热重载）"
             };
-            println!("✓ 已设置 {} 项{note}", items.len());
-            0
+            println!("✓ 已应用 {applied} 项{note}");
+            // 全部被跳过（一个都没应用）视为失败。
+            if applied == 0 && !skipped.is_empty() {
+                1
+            } else {
+                0
+            }
         }
         Err(_) => {
             // core 未运行：离线直写，下次启动生效。
