@@ -4,6 +4,7 @@
 
 pub mod app_compat;
 pub mod config;
+pub mod config_schema;
 pub mod hotkey;
 pub mod runtime_state;
 pub mod schema;

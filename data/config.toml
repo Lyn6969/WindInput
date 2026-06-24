@@ -30,11 +30,8 @@ pin_candidate = "ctrl+number"
 toggle_toolbar = 'ctrl+shift+\'
 open_settings = "ctrl+shift+]"
 add_word = "ctrl+equal"
-open_add_word_dialog = "none"
 toggle_s2t = "ctrl+shift+j"
-take_screenshot = "ctrl+shift+f11"
 activate_ime = "ctrl+shift+["
-enter_temp_pinyin = "none"
 global_hotkeys = []
 
 [input]
@@ -70,13 +67,10 @@ cancel_on_mode_switch = false
 
 [input.temp_pinyin]
 trigger_keys = ["backtick"]
-z_include_on_commit = true
-accent_color = ""
 
 [input.auto_pair]
 chinese = false
 english = false
-blacklist = []
 chinese_pairs = ["（）", "【】", "｛｝", "《》", "〈〉"]
 english_pairs = ["()", "[]", "{}", "<>"]
 
@@ -100,7 +94,6 @@ min_prefix_length = 2
 [input.url_input]
 enabled = false
 prefixes = ["www.", "http", "https", "ftp."]
-accent_color = ""
 
 [ui.candidate]
 font_size = 18
@@ -114,13 +107,6 @@ preedit_display = "app_inline"
 flip_when_above = false
 hide_window = false
 index_labels = ""
-mode_accent_border = false
-always_show_pager = false
-always_show_pager_follow_theme = true
-show_page_number = true
-show_page_number_follow_theme = true
-vertical_max_width = 600
-vertical_max_width_follow_theme = true
 pager_bar_display = ""
 page_number_display = ""
 
@@ -128,15 +114,10 @@ page_number_display = ""
 family = ""
 path = ""
 render_mode = "directwrite"
-gdi_weight = 500
-gdi_scale = 1.0
-menu_weight = 500
-menu_size = 12.0
 
 [ui.theme]
 name = "default"
 style = "system"
-editor_auto_start = false
 
 [ui.mode_indicator]
 # 进入临时拼音/双拼/快捷/英文/快符等模式时的标识：short=短称(拼/双/快/英/符) | full=全称(临时拼音…) | none=不显示
@@ -148,19 +129,11 @@ enabled = true
 duration = 800
 display_mode = "temp"
 schema_name_style = "full"
-show_mode = true
-show_punct = true
-show_full_width = false
 position_mode = "follow_caret"
 offset_x = 0
 offset_y = 0
 custom_x = 0
 custom_y = 0
-font_size = 18.0
-opacity = 0.9
-background_color = ""
-text_color = ""
-border_radius = 6.0
 
 [ui.tooltip]
 delay = 200
@@ -185,7 +158,6 @@ hide_in_fullscreen = true
 
 [features.stats]
 enabled = true
-retain_days = 0
 track_english = true
 
 [features.s2t]
@@ -197,13 +169,6 @@ variant = "s2t"
 # 旧的独立 quick_input 触发键(trigger_keys)已移除。以下为融合内 quick_input 成员的参数。
 force_vertical = true
 decimal_places = 6
-accent_color = ""
-
-[features.quick_input.alpha_providers]
-pinyin = true
-rare_char = false
-rare_char_id = ""
-english = false
 
 [features.cmdbar]
 candidate_prefix = "⚡"
