@@ -67,13 +67,18 @@
 - 端到端冒烟实测（新二进制）：list 前缀过滤 / describe 枚举可选值 / get / 三类 reject(exit 1) / 沙箱(XDG_CONFIG_HOME)set→get 往返均通过；真实用户配置零污染、无残留进程。
 - 测试：wind-config 37 + wind-rpc 15 + wind_service 4（config_cli parse/format 单测）全绿，fmt 已跑。
 
-## Stage 4: Native 补齐缺失页面至与 webview 对等
-**Success Criteria**:
-- 上述页面在 Native 可用，走同一套 RPC（dict.* / phrase.* / stats.* / schema.* / theme.*）。
-- schema 注册表辅助渲染/校验输入页（减少硬编码 Cell 绑定）。
-- Windows 实测各页面读写正常。
-**Tests**: 各页面 RPC 往返单测 + Windows 手动验收清单。
-**Status**: Not Started
+**Goal**: 让当前主用的 webview 与 Stage 1-3 的严格 core 兼容，并防 cross-language 漂移。
+**背景**: 实测前端 `config-keys.json`(137 键) vs registry(127) 漂移——**35 个前端键不在 registry**（=删除的 33 孤立键 + `hotkeys.enter_special_mode`/`features.quick_input.trigger_keys`），这些键本就从未生效（旧 core 也静默丢弃）。注：agent 误报「pinyin 15 键被拒」——已核实 pinyin 全在 registry，无事。
+**已拍板**: ① setItems 改「应用合法项+报告跳过项」（不再原子拒绝整批）；② 前端加 CI 校验（key ⊆ registry∪允许名单）。
+**Success Criteria / 已完成**:
+- `dispatch.rs` set_items：未知/类型/枚举错的项**跳过并记入响应 `skipped`**（含 `applied` 计数），合法项照常写——webview 不再因一个旧字段整批保存失败；malformed item(无 key) 仍硬错误；落盘 IO 失败仍硬错误。响应加 `applied`/`skipped` 向后兼容（前端只读 needsRestart）。
+- `config_cli.rs` apply_items：防御性呈现 skipped，全跳过(applied=0)视为失败 exit1。
+- `wind-rpc/manifest.rs` schema_binding 新增 `frontend_config_keys_known_to_core`：前端 config-keys.json 每键须 ∈ registry 或 `FRONTEND_AHEAD_ALLOWLIST`(35 键,注释指向 deferred 文档)；新增前端键不在二者即红。
+- 3 个 set_items 测试由 reject 改为 skip 断言（TDD RED→GREEN）。
+**Status**: Complete（核心+CI 校验）；**剩余可选**：前端 toast 呈现 skipped(让用户知道改了已废弃字段)、GeneralPage 拼音保存只 console.error 无 toast(既有小 bug)、前端清理 35 死字段(用户选择保留,未做)。
+**Tests**: wind-config 37 + wind-rpc 16 + wind_service 4 全绿。
+
+## Stage 4-orig（暂停）: Native 补齐缺失页面
 
 ## Stage 5（延后批）: webview 降级 + key 6 域重命名
 **Goal**: Native 对等后移除/降级 Tauri webview；按 6 域规范重命名 key，附 alias 旧名迁移表。
