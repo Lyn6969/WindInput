@@ -807,7 +807,7 @@ options = [
 
 # ── 状态提示气泡（尺寸跟随主题，仅位置可微调）──
 [[items]]
-key = "ui.status_tip.offset_x"
+key = "ui.status_indicator.offset_x"
 group = "ui"
 section = "状态提示"
 type = "number"
@@ -819,7 +819,7 @@ max = 400
 since = 3
 
 [[items]]
-key = "ui.status_tip.offset_y"
+key = "ui.status_indicator.offset_y"
 group = "ui"
 section = "状态提示"
 type = "number"
@@ -831,7 +831,7 @@ max = 400
 since = 3
 
 [[items]]
-key = "ui.status_tip.schema_name_style"
+key = "ui.status_indicator.schema_name_style"
 group = "ui"
 section = "状态提示"
 type = "select"

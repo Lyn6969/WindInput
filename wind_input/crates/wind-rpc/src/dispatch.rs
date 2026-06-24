@@ -110,6 +110,10 @@ fn handle(state: &DispatchState, method: &str, params: &Value) -> anyhow::Result
             Ok(serde_json::to_value(cfg)?)
         }
         "config.setItems" => set_items(state, params),
+        // 配置字段注册表（key+type+enum options）：CLI/设置端据此校验与补全。
+        "config.schema" => Ok(schema_json()),
+        // 单字段当前值（含三层合并）：补 config.get 只能整份的缺口。
+        "config.getItem" => get_item(params),
         "config.reload" => {
             // 变更通知：广播一个 config 变更事件，供订阅者（TSF/UI）刷新。
             state
@@ -135,14 +139,22 @@ fn set_items(state: &DispatchState, params: &Value) -> anyhow::Result<Value> {
         .get("items")
         .and_then(|v| v.as_array())
         .ok_or_else(|| anyhow::anyhow!("invalid_params: items missing"))?;
+    // 第一遍：解析 + 按注册表校验。全部通过才写，避免未知键/越界值部分落盘后静默失效。
+    let mut writes: Vec<(String, toml::Value)> = Vec::with_capacity(items.len());
     for it in items {
         let key = it
             .get("key")
             .and_then(|v| v.as_str())
             .ok_or_else(|| anyhow::anyhow!("invalid_params: item.key missing"))?;
         let value = it.get("value").cloned().unwrap_or(Value::Null);
-        let parts: Vec<&str> = key.split('.').collect();
         let toml_val = json_to_toml(&value)?;
+        wind_config::config_schema::validate(key, &toml_val)
+            .map_err(|e| anyhow::anyhow!("invalid_config: 键 '{}' {}", key, e))?;
+        writes.push((key.to_string(), toml_val));
+    }
+    // 第二遍：落盘。
+    for (key, toml_val) in writes {
+        let parts: Vec<&str> = key.split('.').collect();
         Config::set_user_value(&parts, toml_val)?;
     }
     // 落盘后即时热重载：轻量字段立即生效，引擎结构性变更则 needsRestart=true。
@@ -152,6 +164,53 @@ fn set_items(state: &DispatchState, params: &Value) -> anyhow::Result<Value> {
         .events
         .emit_config_changed(json!({ "reason": "setItems", "needsRestart": needs_restart }));
     Ok(json!({ "needsRestart": needs_restart }))
+}
+
+/// 把 config_schema 注册表序列化为 JSON（`{ fields: [{key, type, options?}] }`）。
+/// 供 `config.schema` RPC；CLI/设置端据此列出、补全、校验。
+fn schema_json() -> Value {
+    use wind_config::config_schema::{FieldType, registry};
+    let fields: Vec<Value> = registry()
+        .iter()
+        .map(|f| {
+            let (ty, options): (&str, Option<&[&str]>) = match f.ty {
+                FieldType::Bool => ("bool", None),
+                FieldType::Int => ("int", None),
+                FieldType::Float => ("float", None),
+                FieldType::Str => ("string", None),
+                FieldType::Enum(vs) => ("enum", Some(vs)),
+                FieldType::StrList => ("string[]", None),
+                FieldType::Map => ("map", None),
+                FieldType::StructList => ("array", None),
+            };
+            let mut obj = json!({ "key": f.key, "type": ty });
+            if let Some(vs) = options {
+                obj["options"] = json!(vs);
+            }
+            obj
+        })
+        .collect();
+    json!({ "fields": fields })
+}
+
+/// `config.getItem`：返回单个已登记键的当前值（三层合并后）。
+fn get_item(params: &Value) -> anyhow::Result<Value> {
+    let key = params
+        .get("key")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| anyhow::anyhow!("invalid_params: key missing"))?;
+    if !wind_config::config_schema::is_known_key(key) {
+        anyhow::bail!("invalid_config: 键 '{}' 未登记", key);
+    }
+    let cfg = Config::load(Config::data_dir().as_deref())?;
+    let full = serde_json::to_value(cfg)?;
+    let mut cur = &full;
+    for part in key.split('.') {
+        cur = cur
+            .get(part)
+            .ok_or_else(|| anyhow::anyhow!("config 缺少键 {}", key))?;
+    }
+    Ok(json!({ "key": key, "value": cur.clone() }))
 }
 
 /// JSON 标量/容器 → toml::Value（用于写用户层配置）。
@@ -299,5 +358,89 @@ mod tests {
         let resp = dispatch(&state(), req("dict.stats", json!({})));
         assert!(resp.error.is_none());
         assert!(resp.result.unwrap().is_array());
+    }
+
+    // ── Stage 2: registry 校验 + config.schema / config.getItem ──
+    // 注：reject 测试均在写盘前的校验阶段失败，故不触碰真实用户配置文件。
+
+    #[test]
+    fn set_items_rejects_unknown_key() {
+        let resp = dispatch(
+            &state(),
+            req(
+                "config.setItems",
+                json!({ "items": [{ "key": "ui.candidate.bogus", "value": 1 }] }),
+            ),
+        );
+        assert!(resp.result.is_none());
+        let e = resp.error.unwrap();
+        assert!(
+            e.contains("invalid_config") && e.contains("bogus"),
+            "应为结构化校验错误: {e}"
+        );
+    }
+
+    #[test]
+    fn set_items_rejects_enum_out_of_range() {
+        let resp = dispatch(
+            &state(),
+            req(
+                "config.setItems",
+                json!({ "items": [{ "key": "ui.candidate.layout", "value": "diagonal" }] }),
+            ),
+        );
+        assert!(resp.result.is_none());
+        assert!(resp.error.unwrap().contains("invalid_config"));
+    }
+
+    #[test]
+    fn set_items_rejects_type_mismatch() {
+        let resp = dispatch(
+            &state(),
+            req(
+                "config.setItems",
+                json!({ "items": [{ "key": "ui.candidate.per_page", "value": "seven" }] }),
+            ),
+        );
+        assert!(resp.result.is_none());
+        assert!(resp.error.unwrap().contains("invalid_config"));
+    }
+
+    #[test]
+    fn config_schema_lists_registered_fields() {
+        let resp = dispatch(&state(), req("config.schema", json!({})));
+        assert!(resp.error.is_none());
+        let r = resp.result.unwrap();
+        let fields = r["fields"].as_array().expect("fields 应为数组");
+        let layout = fields
+            .iter()
+            .find(|f| f["key"] == json!("ui.candidate.layout"))
+            .expect("应含 ui.candidate.layout");
+        assert_eq!(layout["type"], json!("enum"));
+        assert!(
+            layout["options"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|v| v == &json!("vertical")),
+            "enum 应带 options"
+        );
+    }
+
+    #[test]
+    fn config_get_item_known_returns_value_unknown_errors() {
+        let ok = dispatch(
+            &state(),
+            req("config.getItem", json!({ "key": "ui.candidate.per_page" })),
+        );
+        assert!(ok.error.is_none(), "已登记键应成功");
+        assert!(ok.result.unwrap()["value"].is_number());
+
+        let bad = dispatch(
+            &state(),
+            req("config.getItem", json!({ "key": "no.such.key" })),
+        );
+        assert!(bad.result.is_none());
+        assert!(bad.error.is_some());
     }
 }
