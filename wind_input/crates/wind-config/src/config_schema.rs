@@ -354,6 +354,30 @@ pub fn config_leaf_keys() -> Vec<String> {
     out
 }
 
+fn collect_leaf_entries(prefix: &str, value: &toml::Value, out: &mut Vec<(String, toml::Value)>) {
+    match value {
+        toml::Value::Table(t) if !t.is_empty() => {
+            for (k, v) in t {
+                let child = if prefix.is_empty() {
+                    k.clone()
+                } else {
+                    format!("{prefix}.{k}")
+                };
+                collect_leaf_entries(&child, v, out);
+            }
+        }
+        _ => out.push((prefix.to_string(), value.clone())),
+    }
+}
+
+/// 把任意 TOML 表展开为 `(点分键, 叶子值)` 列表（叶子规则同 [`config_leaf_keys`]）。
+/// 供 `config import` 把一份 TOML 拍平成逐字段 setItems。
+pub fn leaf_entries(value: &toml::Value) -> Vec<(String, toml::Value)> {
+    let mut out = Vec::new();
+    collect_leaf_entries("", value, &mut out);
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -400,6 +424,32 @@ mod tests {
         // 中间表不应作为叶子出现
         assert!(!keys.contains("ui.candidate"), "中间表不应是叶子");
         assert!(!keys.contains("ui"), "顶层表不应是叶子");
+    }
+
+    #[test]
+    fn leaf_entries_flattens_table_to_key_value_pairs() {
+        let v: toml::Value = toml::from_str(
+            "[ui.candidate]\nper_page = 9\nlayout = \"vertical\"\n[input.auto_pair]\nchinese = false\n",
+        )
+        .unwrap();
+        let entries = leaf_entries(&v);
+        assert!(
+            entries
+                .iter()
+                .any(|(k, val)| k == "ui.candidate.per_page" && val.as_integer() == Some(9))
+        );
+        assert!(
+            entries
+                .iter()
+                .any(|(k, val)| k == "ui.candidate.layout" && val.as_str() == Some("vertical"))
+        );
+        assert!(
+            entries
+                .iter()
+                .any(|(k, val)| k == "input.auto_pair.chinese" && val.as_bool() == Some(false))
+        );
+        // 不应出现中间表键
+        assert!(!entries.iter().any(|(k, _)| k == "ui.candidate"));
     }
 
     #[test]

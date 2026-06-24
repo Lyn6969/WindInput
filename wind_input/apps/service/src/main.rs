@@ -14,6 +14,8 @@ use wind_bridge::deferred::DeferredHandler;
 use wind_bridge::push::{PushConfig, PushServer};
 use wind_bridge::server::{BridgeConfig, BridgeServer};
 
+mod config_cli;
+
 /// 获取管道名称后缀（debug 变体使用 "_debug"）
 #[cfg(feature = "debug_variant")]
 const PIPE_SUFFIX: &str = "_debug";
@@ -22,6 +24,12 @@ const PIPE_SUFFIX: &str = "_debug";
 const PIPE_SUFFIX: &str = "";
 
 fn main() {
+    // CLI 子命令：`wind_input config ...`（查看/读写配置）。在服务启动前拦截，处理完即退出。
+    let cli_args: Vec<String> = std::env::args().collect();
+    if cli_args.get(1).map(String::as_str) == Some("config") {
+        std::process::exit(config_cli::run(&cli_args[2..]));
+    }
+
     // 0. 设置 DPI 感知（与 Go 版 setDPIAwareness 对齐）
     // 必须在任何窗口创建之前调用，否则坐标会被 Windows DPI 虚拟化
     set_dpi_awareness();
