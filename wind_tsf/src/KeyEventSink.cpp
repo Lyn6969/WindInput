@@ -1008,6 +1008,15 @@ STDAPI CKeyEventSink::OnKeyDown(ITfContext* pContext, WPARAM wParam, LPARAM lPar
     // This is simpler and matches Weasel's architecture
     *pfEaten = _HandleServiceResponse();
 
+    // 数字键"吃了又吐"缺口修复：有候选时数字键被 TSF eat（pfEaten=TRUE）发给 coordinator，
+    // coordinator 返回 PassThrough → OnKeyDown 返 FALSE。此时 OnTestKeyDown 里
+    // _lastPassthroughDigit 未设置（因彼时 pfEaten=TRUE 跳过了设置代码）。
+    // 在此补设，确保数字后智能标点备用路径在 OnEndEdit 不触发的应用中仍能正确获取 prevChar。
+    if (!(*pfEaten) && wParam >= '0' && wParam <= '9')
+    {
+        _lastPassthroughDigit = (WCHAR)wParam;
+    }
+
     // Ctrl/Alt combo during active session: decide pass-through based on Go's response.
     // If Go handled the key as a candidate operation (pin/delete) and the composition
     // is still active, respect Go's decision and eat the key. Only override to FALSE
