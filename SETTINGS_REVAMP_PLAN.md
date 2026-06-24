@@ -59,7 +59,13 @@
 **Tests**:
 - CLI 集成测试：set 后 get 回读一致；set 非法 enum 报错；list 输出含全部域。
 - core 离线路径冒烟测试。
-**Status**: Not Started
+**Status**: Complete
+- `wind-rpc/src/client.rs`：最小同步 RPC 客户端 `client::call(suffix, method, params)`（连 ctrl 通道，连不上即 Err）。
+- `wind-config/src/config_schema.rs`：新增 `leaf_entries()`（任意 TOML 表拍平为逐字段，供 import）。
+- `apps/service/src/config_cli.rs`：`list [前缀]` / `describe` / `get` / `set` / `export` / `import`；list/describe/get/export 纯本地，set/import 优先 RPC 热重载、core 未运行离线直写；写入前按注册表 `validate`；`parse_value` 按类型解析 CLI 字符串。
+- `main.rs`：`config` 子命令在服务启动前拦截（先于 init_logger，无日志噪音）。
+- 端到端冒烟实测（新二进制）：list 前缀过滤 / describe 枚举可选值 / get / 三类 reject(exit 1) / 沙箱(XDG_CONFIG_HOME)set→get 往返均通过；真实用户配置零污染、无残留进程。
+- 测试：wind-config 37 + wind-rpc 15 + wind_service 4（config_cli parse/format 单测）全绿，fmt 已跑。
 
 ## Stage 4: Native 补齐缺失页面至与 webview 对等
 **Success Criteria**:
