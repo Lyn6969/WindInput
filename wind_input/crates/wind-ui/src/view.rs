@@ -5,12 +5,13 @@
 //! 文本叶子。布局分三步——measure 自底向上算尺寸，arrange 自顶向下定坐标，
 //! paint 递归绘制；arrange 后每个带 tag 的节点都有绝对矩形，供鼠标命中复用。
 //!
-//! 不含 Go 的渐变 / 九宫格图 / 阴影模糊 / z 分层等重特性（后续按需扩展）。
+//! 九宫格图 / 阴影模糊 / z 分层 / 渐变背景均已支持。
 
 use crate::text::dwrite::TextRenderer;
 use std::cell::RefCell;
 use tiny_skia::{
-    Color, FillRule, FilterQuality, Paint, PathBuilder, Pattern, PixmapMut, SpreadMode, Transform,
+    Color, FillRule, FilterQuality, GradientStop, LinearGradient, Paint, PathBuilder, Pattern,
+    PixmapMut, Point, RadialGradient, SpreadMode, Transform,
 };
 use wind_theme::schema::Dim;
 
@@ -47,6 +48,16 @@ pub struct ViewLayer {
     pub w: f32,
     pub h: f32,
     pub opacity: f32,
+}
+
+/// 背景渐变（叠在底色之上、背景图之下，裁到圆角内）。
+/// linear 按 angle 方向铺色；radial 以节点中心为圆心。stops 为 (RGBA 直通, pos∈[0,1])。
+#[derive(Clone, Debug)]
+pub struct ViewGradient {
+    pub radial: bool,
+    /// 线性角度（度）：0=左→右，顺时针增大。radial 时忽略。
+    pub angle: f32,
+    pub stops: Vec<([u8; 4], f32)>,
 }
 
 /// 四边内/外边距
@@ -131,6 +142,10 @@ pub struct View {
     pub text_color: [u8; 4],
     /// 文本字号（设备像素）；None=用渲染器基准字号。序号/注释按相对偏移设具体值。
     pub font_size: Option<f32>,
+    /// 文本字重（400/500/700…）；None/0=继承渲染器默认（NORMAL）。
+    pub font_weight: Option<i32>,
+    /// 文本字体族覆盖；None/空=用渲染器全局字体族。
+    pub font_family: Option<String>,
     pub text_align: Align,
     /// 左侧强调条 (颜色, 宽度 px)：在节点左缘内绘制竖条（选中候选用）；不占布局空间（落在左内边距内）。
     pub left_bar: Option<([u8; 4], f32)>,
@@ -138,6 +153,8 @@ pub struct View {
     pub circle_bg: Option<[u8; 4]>,
     /// 背景填充图（叠在底色之上，裁到圆角内）。
     pub bg_image: Option<ViewImage>,
+    /// 背景渐变（叠在底色之上、背景图之下，裁到圆角内）。
+    pub bg_gradient: Option<ViewGradient>,
     /// z 层级覆盖图（z<0 在内容下、z>0 在内容上）。
     pub layers: Vec<ViewLayer>,
     pub children: Vec<View>,
@@ -170,10 +187,13 @@ impl Default for View {
             text: None,
             text_color: [0, 0, 0, 255],
             font_size: None,
+            font_weight: None,
+            font_family: None,
             text_align: Align::Start,
             left_bar: None,
             circle_bg: None,
             bg_image: None,
+            bg_gradient: None,
             layers: Vec::new(),
             children: Vec::new(),
             grow: false,
@@ -261,6 +281,20 @@ impl View {
         self.font_size = Some(px);
         self
     }
+    /// 设字重（>0 生效；0/None 继承默认 NORMAL）。
+    pub fn font_weight(mut self, w: i32) -> Self {
+        self.font_weight = if w > 0 { Some(w) } else { None };
+        self
+    }
+    /// 设字体族覆盖（非空生效）。
+    pub fn font_family(mut self, f: Option<String>) -> Self {
+        self.font_family = f.filter(|s| !s.trim().is_empty());
+        self
+    }
+    pub fn bg_gradient(mut self, g: ViewGradient) -> Self {
+        self.bg_gradient = Some(g);
+        self
+    }
     pub fn left_bar(mut self, color: [u8; 4], width: f32) -> Self {
         self.left_bar = Some((color, width));
         self
@@ -306,7 +340,12 @@ impl View {
 
     fn measure(&mut self, tr: &TextRenderer) {
         let (cw, ch) = if let Some(t) = &self.text {
-            let m = tr.measure_text_sized(t, self.font_size.unwrap_or(tr.base_size()));
+            let m = tr.measure_text_styled(
+                t,
+                self.font_size.unwrap_or(tr.base_size()),
+                self.font_weight.unwrap_or(0),
+                self.font_family.as_deref(),
+            );
             (m.width, m.height)
         } else {
             let mut main = 0.0f32;
@@ -454,6 +493,10 @@ impl View {
                 self.corner_radius,
             );
         }
+        // 背景渐变（叠在底色上、背景图下，裁到圆角内）。
+        if let Some(g) = &self.bg_gradient {
+            paint_bg_gradient(buf, buf_w, buf_h, r, self.corner_radius, g);
+        }
         if let Some((bc, bw)) = self.border {
             fill_ring(
                 buf,
@@ -491,7 +534,9 @@ impl View {
         // 文本
         if let Some(t) = &self.text {
             let size = self.font_size.unwrap_or(tr.base_size());
-            let m = tr.measure_text_sized(t, size);
+            let weight = self.font_weight.unwrap_or(0);
+            let family = self.font_family.as_deref();
+            let m = tr.measure_text_styled(t, size, weight, family);
             let cx0 = r.x + self.padding.l;
             let content_w = r.w - self.padding.w();
             let content_h = r.h - self.padding.h();
@@ -501,7 +546,7 @@ impl View {
                 Align::End => cx0 + content_w - m.width,
             };
             let ty = r.y + self.padding.t + (content_h - m.height) * 0.5;
-            let _ = tr.draw_text_sized(
+            let _ = tr.draw_text_styled(
                 buf,
                 buf_w,
                 buf_h,
@@ -509,6 +554,8 @@ impl View {
                 ty.max(r.y),
                 t,
                 size,
+                weight,
+                family,
                 self.text_color,
             );
         }
@@ -534,6 +581,85 @@ const KAPPA: f32 = 0.552_284_75;
 /// 关键技巧：把 BGRA 缓冲当作 tiny-skia 的"RGBA" Pixmap 直接渲染（零拷贝），
 /// 传色时交换 R/B（Color 取 [B,G,R,A]）。预乘 alpha 合成逐通道对称，故输出即合法 BGRA。
 /// 绘制背景填充图：从线程局部缓存取目标尺寸填充位图（BGRA 预乘），以 Pattern 填到圆角路径内。
+/// 绘制背景渐变：以 tiny-skia 线性/径向着色器填到圆角路径内（叠在底色之上、背景图之下）。
+fn paint_bg_gradient(
+    buf: &mut [u8],
+    buf_w: u32,
+    buf_h: u32,
+    r: Rect,
+    radius: f32,
+    g: &ViewGradient,
+) {
+    if g.stops.is_empty() {
+        return;
+    }
+    let x = r.x.round();
+    let y = r.y.round();
+    let rw = r.w.round().max(1.0);
+    let rh = r.h.round().max(1.0);
+    // 单色/退化 → 纯色填充（tiny-skia 渐变需 ≥2 停靠点）。
+    if g.stops.len() < 2 {
+        fill_rounded(buf, buf_w, buf_h, r.x, r.y, r.w, r.h, g.stops[0].0, radius);
+        return;
+    }
+    let Some(path) = round_rect_path(x, y, rw, rh, radius.round().max(0.0)) else {
+        return;
+    };
+    // (B,G,R,A) 交换：缓冲按 BGRA 维护，tiny-skia 当 RGBA 渲染（同 fill_rounded 约定）。
+    let to_color = |c: &[u8; 4]| Color::from_rgba8(c[2], c[1], c[0], c[3]);
+    // pos 规整：钳到 [0,1] 且单调不减（tiny-skia 要求递增停靠点）。
+    let mut last = 0.0f32;
+    let stops: Vec<GradientStop> = g
+        .stops
+        .iter()
+        .map(|(c, p)| {
+            let pos = p.clamp(0.0, 1.0).max(last);
+            last = pos;
+            GradientStop::new(pos, to_color(c))
+        })
+        .collect();
+    let cx = x + rw * 0.5;
+    let cy = y + rh * 0.5;
+    let shader = if g.radial {
+        let radius_len = 0.5 * (rw * rw + rh * rh).sqrt();
+        RadialGradient::new(
+            Point::from_xy(cx, cy),
+            Point::from_xy(cx, cy),
+            radius_len.max(1.0),
+            stops,
+            SpreadMode::Pad,
+            Transform::identity(),
+        )
+    } else {
+        // angle: 0=左→右，顺时针；端点沿方向投影覆盖整盒。
+        let rad = g.angle.to_radians();
+        let dx = rad.cos();
+        let dy = rad.sin();
+        let hl = (rw * dx).abs() * 0.5 + (rh * dy).abs() * 0.5;
+        let p0 = Point::from_xy(cx - dx * hl, cy - dy * hl);
+        let p1 = Point::from_xy(cx + dx * hl, cy + dy * hl);
+        LinearGradient::new(p0, p1, stops, SpreadMode::Pad, Transform::identity())
+    };
+    let Some(shader) = shader else {
+        return;
+    };
+    let Some(mut pm) = PixmapMut::from_bytes(buf, buf_w, buf_h) else {
+        return;
+    };
+    let paint = Paint {
+        shader,
+        anti_alias: true,
+        ..Default::default()
+    };
+    pm.fill_path(
+        &path,
+        &paint,
+        FillRule::Winding,
+        Transform::identity(),
+        None,
+    );
+}
+
 fn paint_bg_image(buf: &mut [u8], buf_w: u32, buf_h: u32, r: Rect, radius: f32, img: &ViewImage) {
     let x = r.x.round();
     let y = r.y.round();
@@ -1143,6 +1269,42 @@ mod geom_tests {
         fill_circle(&mut buf, 20, 20, 10.0, 10.0, 8.0, [0, 255, 0, 255]);
         assert!(buf[(10 * 20 + 10) * 4 + 3] > 0, "圆心应被填充");
         assert_eq!(buf[(0 * 20 + 0) * 4 + 3], 0, "角落在圆外，不应被填充");
+    }
+
+    #[test]
+    fn gradient_linear_writes_pixels() {
+        let mut buf = vec![0u8; 16 * 16 * 4];
+        let g = ViewGradient {
+            radial: false,
+            angle: 0.0,
+            stops: vec![([255, 0, 0, 255], 0.0), ([0, 0, 255, 255], 1.0)],
+        };
+        let r = Rect {
+            x: 0.0,
+            y: 0.0,
+            w: 16.0,
+            h: 16.0,
+        };
+        paint_bg_gradient(&mut buf, 16, 16, r, 0.0, &g);
+        assert!(buf[(8 * 16 + 8) * 4 + 3] > 0, "渐变中心 alpha 应被写入");
+    }
+
+    #[test]
+    fn gradient_single_stop_falls_back_to_solid() {
+        let mut buf = vec![0u8; 8 * 8 * 4];
+        let g = ViewGradient {
+            radial: false,
+            angle: 0.0,
+            stops: vec![([0, 255, 0, 255], 0.5)],
+        };
+        let r = Rect {
+            x: 0.0,
+            y: 0.0,
+            w: 8.0,
+            h: 8.0,
+        };
+        paint_bg_gradient(&mut buf, 8, 8, r, 0.0, &g);
+        assert!(buf[(4 * 8 + 4) * 4 + 3] > 0, "单停靠点退化为纯色填充");
     }
 
     #[test]

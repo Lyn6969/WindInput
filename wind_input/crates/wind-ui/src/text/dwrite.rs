@@ -190,10 +190,13 @@ mod imp {
         }
 
         /// 为给定文本/字号创建布局对象。
+        /// weight>0 且 ≠400 时覆盖字重；family 非空时覆盖字体族（皆作用于全文）。
         fn create_layout(
             &self,
             text: &str,
             size: f32,
+            weight: i32,
+            family: Option<&str>,
             max_w: f32,
             max_h: f32,
         ) -> Result<IDWriteTextLayout, String> {
@@ -204,6 +207,18 @@ mod imp {
                     .factory
                     .CreateTextLayout(&wide, &fmt, max_w.max(1.0), max_h.max(1.0))
                     .map_err(|e| format!("CreateTextLayout: {e}"))?;
+                // 节点级字重/字体族覆盖（作用于全文；下方 chaizi PUA 段会再覆盖字体族）。
+                let full = DWRITE_TEXT_RANGE {
+                    startPosition: 0,
+                    length: wide.len() as u32,
+                };
+                if weight > 0 && weight != 400 {
+                    let _ = layout.SetFontWeight(DWRITE_FONT_WEIGHT(weight), full);
+                }
+                if let Some(fam) = family.filter(|s| !s.trim().is_empty()) {
+                    let famw: Vec<u16> = fam.encode_utf16().chain(std::iter::once(0)).collect();
+                    let _ = layout.SetFontFamilyName(PCWSTR(famw.as_ptr()), full);
+                }
                 // 拆字字根：对 PUA 码位（U+E000..=U+F8FF，皆 BMP 单码元）的连续段
                 // 切到黑体字根字体集，级联回退渲染字根字符。
                 if let Some(cf) = &self.chaizi {
@@ -236,13 +251,31 @@ mod imp {
 
         /// 测量文本尺寸（指定字号；宽含尾随空白，高为行高）。
         pub fn measure_text_sized(&self, text: &str, size: f32) -> TextMetrics {
+            self.measure_text_styled(text, size, 0, None)
+        }
+
+        /// 测量文本尺寸（指定字号 + 字重 + 字体族覆盖）。
+        pub fn measure_text_styled(
+            &self,
+            text: &str,
+            size: f32,
+            weight: i32,
+            family: Option<&str>,
+        ) -> TextMetrics {
             if text.is_empty() {
                 return TextMetrics {
                     width: 0.0,
                     height: size * 1.2,
                 };
             }
-            let layout = match self.create_layout(text, size, f32::MAX / 2.0, f32::MAX / 2.0) {
+            let layout = match self.create_layout(
+                text,
+                size,
+                weight,
+                family,
+                f32::MAX / 2.0,
+                f32::MAX / 2.0,
+            ) {
                 Ok(l) => l,
                 Err(_) => {
                     return TextMetrics {
@@ -348,6 +381,24 @@ mod imp {
             size: f32,
             color: [u8; 4],
         ) -> Result<(), String> {
+            self.draw_text_styled(buf, buf_width, buf_height, x, y, text, size, 0, None, color)
+        }
+
+        /// 绘制文本（指定字号 + 字重 + 字体族覆盖）。
+        #[allow(clippy::too_many_arguments)]
+        pub fn draw_text_styled(
+            &self,
+            buf: &mut [u8],
+            buf_width: u32,
+            buf_height: u32,
+            x: f32,
+            y: f32,
+            text: &str,
+            size: f32,
+            weight: i32,
+            family: Option<&str>,
+            color: [u8; 4],
+        ) -> Result<(), String> {
             if text.is_empty() || buf_width == 0 || buf_height == 0 {
                 return Ok(());
             }
@@ -382,7 +433,14 @@ mod imp {
                 // 入参 color 约定为 [R,G,B,A]；COLORREF = 0x00BBGGRR。
                 let colorref: u32 =
                     (color[0] as u32) | ((color[1] as u32) << 8) | ((color[2] as u32) << 16);
-                let layout = self.create_layout(text, size, buf_width as f32, buf_height as f32)?;
+                let layout = self.create_layout(
+                    text,
+                    size,
+                    weight,
+                    family,
+                    buf_width as f32,
+                    buf_height as f32,
+                )?;
 
                 // 关键优化：用文本度量算出包围盒，后续两遍逐像素操作只在盒内进行
                 // （原实现每次绘制都遍历整窗，单帧十余次 × 整窗 → paint 高达 ~100ms）。
@@ -671,6 +729,17 @@ mod imp {
             }
         }
 
+        /// mock：字重/字体族不影响等宽近似测量，委托 sized。
+        pub fn measure_text_styled(
+            &self,
+            text: &str,
+            size: f32,
+            _weight: i32,
+            _family: Option<&str>,
+        ) -> TextMetrics {
+            self.measure_text_sized(text, size)
+        }
+
         #[allow(clippy::too_many_arguments)]
         pub fn draw_text(
             &self,
@@ -695,6 +764,24 @@ mod imp {
             _y: f32,
             _text: &str,
             _size: f32,
+            _color: [u8; 4],
+        ) -> Result<(), String> {
+            Ok(())
+        }
+
+        /// mock：绘制空操作（字重/字体族忽略）。
+        #[allow(clippy::too_many_arguments)]
+        pub fn draw_text_styled(
+            &self,
+            _buf: &mut [u8],
+            _buf_width: u32,
+            _buf_height: u32,
+            _x: f32,
+            _y: f32,
+            _text: &str,
+            _size: f32,
+            _weight: i32,
+            _family: Option<&str>,
             _color: [u8; 4],
         ) -> Result<(), String> {
             Ok(())

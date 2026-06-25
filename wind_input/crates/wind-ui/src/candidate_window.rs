@@ -351,7 +351,16 @@ impl CandidateWindow {
         let t_layout0 = Instant::now();
         root.layout(ml as f32, mt as f32, &self.text_renderer);
         let (w_f, h_f) = root.measured_size();
-        let content_w = (w_f.ceil() as u32).max(40);
+        let mut content_w = (w_f.ceil() as u32).max(40);
+        // 竖排最大宽度（behavior.vertical_max_width 逻辑 px，>0 生效）：钳制窗口宽度上限。
+        // 本 View 引擎不支持文本折行，超宽候选在窗口右缘裁切（draw_text 按缓冲宽度裁剪）。
+        if self.vertical && !self.candidates.is_empty() {
+            let vmax = self.theme.behavior.vertical_max_width;
+            if vmax > 0 {
+                let vmax_px = ((vmax as f32 * self.scale).ceil() as u32).max(40);
+                content_w = content_w.min(vmax_px);
+            }
+        }
         let content_h = (h_f.ceil() as u32).max(24);
         let width = content_w + ml + mr;
         let height = content_h + mt + mb;
@@ -595,6 +604,19 @@ impl CandidateWindow {
         crate::theme_assets::rv_layers(&self.theme, layers, self.scale)
     }
 
+    /// RvGradient → 渲染用 ViewGradient（stop 颜色直通 [R,G,B,A]）。
+    fn rv_gradient(&self, g: Option<&wind_theme::RvGradient>) -> Option<crate::view::ViewGradient> {
+        let g = g?;
+        if g.stops.is_empty() {
+            return None;
+        }
+        Some(crate::view::ViewGradient {
+            radial: g.kind == "radial",
+            angle: g.angle,
+            stops: g.stops.clone(),
+        })
+    }
+
     /// 按当前状态构建候选视图树（横向布局）。
     /// T3：从 RVNode 树（`Resolved.views`）取色/几何，颜色 None→兜底（与旧 ResolvedTheme 默认等值，零回归）。
     /// 构建候选 View 树。`flip=true` 时候选按相反顺序排列（上方显示场景），
@@ -646,6 +668,25 @@ impl CandidateWindow {
             };
             st.and_then(|n| n.text_color).unwrap_or(base)
         };
+        // 有效字重（与 eff_text 同构）：节点/item 的状态 patch 字重优先，回退节点/item 基态；0=继承默认。
+        // item 参与是因为主题常把"选中加粗"配在 [item.selected].font_weight（如 jidian），需作用到候选文本。
+        let eff_weight = |node: &RvNode, item: &RvNode, sel: bool, hov: bool| -> i32 {
+            let state = |n: &RvNode| -> Option<i32> {
+                let st = if sel {
+                    n.selected.as_deref()
+                } else if hov {
+                    n.hover.as_deref()
+                } else {
+                    None
+                };
+                st.map(|s| s.font_weight).filter(|w| *w != 0)
+            };
+            state(node)
+                .or_else(|| state(item))
+                .or_else(|| (node.font_weight != 0).then_some(node.font_weight))
+                .or_else(|| (item.font_weight != 0).then_some(item.font_weight))
+                .unwrap_or(0)
+        };
 
         let mut root = View::container(Layout::Column)
             .bg(col(v.window.bg_color, [255, 255, 255, 255]))
@@ -660,6 +701,10 @@ impl CandidateWindow {
         // 窗口背景图（九宫格/拉伸位图皮肤，如 jidian 的 panel）。
         if let Some(vi) = self.rv_image(v.window.bg_image.as_ref()) {
             root = root.bg_image(vi);
+        }
+        // 窗口背景渐变（叠在底色上、背景图下）。
+        if let Some(g) = self.rv_gradient(v.window.bg_gradient.as_ref()) {
+            root = root.bg_gradient(g);
         }
         // 窗口 z 层覆盖图（如 jidian 右下角 mark 水印）。
         let win_layers = self.rv_layers(&v.window.layers);
@@ -685,6 +730,9 @@ impl CandidateWindow {
                 );
             if let Some(vi) = self.rv_image(v.preedit_bar.bg_image.as_ref()) {
                 band = band.bg_image(vi);
+            }
+            if let Some(g) = self.rv_gradient(v.preedit_bar.bg_gradient.as_ref()) {
+                band = band.bg_gradient(g);
             }
             let band_layers = self.rv_layers(&v.preedit_bar.layers);
             if !band_layers.is_empty() {
@@ -861,6 +909,8 @@ impl CandidateWindow {
                 // 圆圈样式 → 方形节点 + 真圆背景 + 居中数字。
                 let mut idx_leaf = View::leaf(marker, idx_color)
                     .font_size(index_fs)
+                    .font_weight(eff_weight(&v.index, &v.item, is_sel, is_hover))
+                    .font_family(v.index.font_family.clone())
                     .pad(edges_or(&v.index.padding, [0.0; 4]))
                     .margin(edges_or(&v.index.margin, [0.0; 4]));
                 if index_circle {
@@ -882,6 +932,8 @@ impl CandidateWindow {
             item = item.child(
                 View::leaf(cand.text.clone(), txt_color)
                     .font_size(text_fs)
+                    .font_weight(eff_weight(&v.text, &v.item, is_sel, is_hover))
+                    .font_family(v.text.font_family.clone())
                     .pad(edges_or(&v.text.padding, [0.0; 4]))
                     .margin(text_margin),
             );
@@ -891,6 +943,8 @@ impl CandidateWindow {
                 item = item.child(
                     View::leaf(cand.comment.clone(), cmt_color)
                         .font_size(comment_fs)
+                        .font_weight(eff_weight(&v.comment, &v.item, is_sel, is_hover))
+                        .font_family(v.comment.font_family.clone())
                         .pad(edges_or(&v.comment.padding, [0.0; 4]))
                         .margin(edges_or(&v.comment.margin, [0.0, 0.0, 0.0, 6.0])),
                 );
@@ -913,6 +967,21 @@ impl CandidateWindow {
             };
             if let Some(vi) = item_img {
                 item = item.bg_image(vi);
+            }
+            // 候选项背景渐变：选中态优先用 selected patch 的渐变，否则用 base。
+            let item_grad = if is_sel {
+                self.rv_gradient(
+                    v.item
+                        .selected
+                        .as_ref()
+                        .and_then(|n| n.bg_gradient.as_ref()),
+                )
+                .or_else(|| self.rv_gradient(v.item.bg_gradient.as_ref()))
+            } else {
+                self.rv_gradient(v.item.bg_gradient.as_ref())
+            };
+            if let Some(g) = item_grad {
+                item = item.bg_gradient(g);
             }
             list = list.child(item);
         }
