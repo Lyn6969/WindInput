@@ -7,7 +7,7 @@
 //! - `Dim`：dp/px/% 三态坍缩成单 enum（取代 Go 的 Dimension 双 Marshal 样板）。
 //! - `Ld`：light/dark 原语，仅作**解析中间形态**；求值期 `select(is_dark)→单值`，不进 RVNode。
 //! - 未知字段一律忽略（不 deny）：对编辑器新增字段前向兼容，配合 unwrap 兜底（warn 而非 fail）。
-//! - `colors` 块保留为 `serde_yaml::Value`，由 palette 求值层消费（不在此处提前类型化派生/token）。
+//! - `colors` 块保留为 `toml::Value`，由 palette 求值层消费（不在此处提前类型化派生/token）。
 
 use serde::Deserialize;
 use std::collections::HashMap;
@@ -61,10 +61,11 @@ impl<'de> Deserialize<'de> for Dim {
     where
         D: serde::Deserializer<'de>,
     {
-        let v = serde_yaml::Value::deserialize(de)?;
+        let v = toml::Value::deserialize(de)?;
         match v {
-            serde_yaml::Value::Number(n) => Ok(Dim::Dp(n.as_f64().unwrap_or(0.0) as f32)),
-            serde_yaml::Value::String(s) => parse_dim(&s).map_err(serde::de::Error::custom),
+            toml::Value::Integer(n) => Ok(Dim::Dp(n as f32)),
+            toml::Value::Float(n) => Ok(Dim::Dp(n as f32)),
+            toml::Value::String(s) => parse_dim(&s).map_err(serde::de::Error::custom),
             _ => Err(serde::de::Error::custom(
                 "dimension must be number or string",
             )),
@@ -105,15 +106,11 @@ impl<'de> Deserialize<'de> for Ld {
     where
         D: serde::Deserializer<'de>,
     {
-        let v = serde_yaml::Value::deserialize(de)?;
+        let v = toml::Value::deserialize(de)?;
         match v {
-            serde_yaml::Value::String(s) => Ok(Ld::Scalar(s)),
-            serde_yaml::Value::Mapping(m) => {
-                let get = |k: &str| {
-                    m.get(serde_yaml::Value::from(k))
-                        .and_then(|x| x.as_str())
-                        .map(|s| s.to_string())
-                };
+            toml::Value::String(s) => Ok(Ld::Scalar(s)),
+            toml::Value::Table(m) => {
+                let get = |k: &str| m.get(k).and_then(|x| x.as_str()).map(|s| s.to_string());
                 // 非颜色映射（如 colors.derive {enabled, algorithm}）→ light/dark 皆 None，select 返回 None。
                 Ok(Ld::Variant {
                     light: get("light"),
@@ -140,6 +137,8 @@ pub struct ViewBorder {
     pub width: Option<Dim>,
     pub color: Option<Ld>,
     pub radius: Option<Dim>,
+    /// 线型：solid（默认）| dashed | dotted。None/空=solid。
+    pub style: Option<String>,
 }
 
 /// 覆盖图/定位背景图偏移；x/y 各支持 dp 或百分比（"N%"）。
@@ -402,7 +401,7 @@ pub struct Behavior {
 }
 
 /// 经 base 深合并后的「原始 Theme」（未求值）。
-/// `colors` 保留为 Value，由 palette 求值层消费；`resources` 名→ref（{light,dark} 或标量）。
+/// `colors` 保留为 `toml::Value`，由 palette 求值层消费；`resources` 名→ref（{light,dark} 或标量）。
 #[derive(Deserialize, Debug, Default)]
 pub struct Theme {
     #[serde(default)]
@@ -410,7 +409,7 @@ pub struct Theme {
     #[serde(default)]
     pub base: Option<String>,
     #[serde(default)]
-    pub colors: Option<serde_yaml::Value>,
+    pub colors: Option<toml::Value>,
     #[serde(default)]
     pub views: Option<Views>,
     #[serde(default)]
@@ -460,7 +459,7 @@ mod tests {
         };
         assert_eq!(only_light.select(true), Some("#FFF"));
         // derive {enabled, algorithm} 形态 → 皆 None
-        let derive: Ld = serde_yaml::from_str("{enabled: true, algorithm: hsl-shift}").unwrap();
+        let derive: Ld = toml::from_str("enabled = true\nalgorithm = \"hsl-shift\"").unwrap();
         assert_eq!(derive.select(false), None);
     }
 

@@ -1,17 +1,22 @@
 //! 主题原始加载 + base 单链继承深合并
 //!
 //! 与 Go 版本 `wind_input/pkg/theme/theme.go` 对齐（v3 schema）。
-//! 用 serde_yaml::Value 作中间表示：base 提供全量，派生主题深合并覆盖。
+//! 存储格式 TOML：用 `toml::Value` 作中间表示，base 提供全量、派生主题深合并覆盖；
+//! 合并后经 `normalize` 归一化（扁平人写形态 → 内存嵌套形态）再类型化。
 
+use crate::normalize::normalize_theme;
 use crate::schema::{Meta, Theme};
-use serde_yaml::Value;
 use std::path::{Path, PathBuf};
+use toml::Value;
+
+/// 主题文件名（每个主题目录下唯一）。
+pub const THEME_FILE: &str = "theme.toml";
 
 /// 在多个主题目录中定位 `<name>` 的主题目录（靠前目录优先；用户目录可覆盖内置）。
 pub fn find_theme_dir(dirs: &[PathBuf], name: &str) -> Option<PathBuf> {
     dirs.iter()
         .map(|d| d.join(name))
-        .find(|p| p.join("theme.yaml").exists())
+        .find(|p| p.join(THEME_FILE).exists())
 }
 
 /// 主题 base 链的目录列表（self 在前，base 在后）。
@@ -27,9 +32,9 @@ pub fn theme_chain_dirs(dirs: &[PathBuf], name: &str) -> Vec<PathBuf> {
         if out.contains(&d) {
             break;
         }
-        let base = std::fs::read_to_string(d.join("theme.yaml"))
+        let base = std::fs::read_to_string(d.join(THEME_FILE))
             .ok()
-            .and_then(|t| serde_yaml::from_str::<Value>(&t).ok())
+            .and_then(|t| toml::from_str::<Value>(&t).ok())
             .and_then(|v| {
                 v.get("base")
                     .and_then(|b| b.as_str())
@@ -44,48 +49,52 @@ pub fn theme_chain_dirs(dirs: &[PathBuf], name: &str) -> Vec<PathBuf> {
     out
 }
 
-/// 读取主题自身 yaml 的 meta（不做 base 合并；用于主题列表显示 name/order）。
+/// 读取主题自身 toml 的 meta（不做 base 合并；用于主题列表显示 name/order）。
 pub fn read_meta(dirs: &[PathBuf], name: &str) -> Option<Meta> {
     let dir = find_theme_dir(dirs, name)?;
-    let text = std::fs::read_to_string(dir.join("theme.yaml")).ok()?;
-    let v: Value = serde_yaml::from_str(&text).ok()?;
-    serde_yaml::from_value(v.get("meta")?.clone()).ok()
+    let text = std::fs::read_to_string(dir.join(THEME_FILE)).ok()?;
+    meta_from_text(&text)
 }
 
-/// 从主题 yaml 文本解析其 meta（不读盘；用于导入时取主题名）。
-pub fn meta_from_text(yaml: &str) -> Option<Meta> {
-    let v: Value = serde_yaml::from_str(yaml).ok()?;
-    serde_yaml::from_value(v.get("meta")?.clone()).ok()
+/// 从主题 toml 文本解析其 meta（不读盘；用于导入时取主题名）。
+pub fn meta_from_text(text: &str) -> Option<Meta> {
+    let v: Value = toml::from_str(text).ok()?;
+    v.get("meta")?.clone().try_into().ok()
 }
 
-/// 校验主题 yaml 文本可解析为合法 Theme（导入前校验）。Err 含原因。
-pub fn validate_text(yaml: &str) -> anyhow::Result<()> {
-    let v: Value =
-        serde_yaml::from_str(yaml).map_err(|e| anyhow::anyhow!("YAML 解析失败: {}", e))?;
-    serde_yaml::from_value::<Theme>(v).map_err(|e| anyhow::anyhow!("主题结构非法: {}", e))?;
+/// 校验主题 toml 文本可解析为合法 Theme（导入前校验）。Err 含原因。
+pub fn validate_text(text: &str) -> anyhow::Result<()> {
+    let v: Value = toml::from_str(text).map_err(|e| anyhow::anyhow!("TOML 解析失败: {}", e))?;
+    let n = normalize_theme(v);
+    let _theme: Theme = n
+        .try_into()
+        .map_err(|e| anyhow::anyhow!("主题结构非法: {}", e))?;
     Ok(())
 }
 
 /// 加载并 base 深合并主题，解析为类型化 `Theme`（未求值的原始 schema）。
-/// 合并在 Value 层完成（先合并后类型化），未知字段忽略（前向兼容）。
+/// 合并在 Value 层完成（先合并后归一化再类型化），未知字段忽略（前向兼容）。
 pub fn load_typed(themes_dir: &Path, name: &str) -> anyhow::Result<Theme> {
     load_typed_dirs(&[themes_dir.to_path_buf()], name)
 }
 
-/// 多目录版：base 可在任一目录（如用户主题 `base: _base` 继承内置 _base）。
+/// 多目录版：base 可在任一目录（如用户主题 `base = "_base"` 继承内置 _base）。
 pub fn load_typed_dirs(dirs: &[PathBuf], name: &str) -> anyhow::Result<Theme> {
     let merged = load_merged_dirs(dirs, name, 0)?;
-    let theme: Theme = serde_yaml::from_value(merged)
+    let normalized = normalize_theme(merged);
+    let theme: Theme = normalized
+        .try_into()
         .map_err(|e| anyhow::anyhow!("type theme {}: {}", name, e))?;
     Ok(theme)
 }
 
-/// 读取 themes_dir/<name>/theme.yaml 并按 base 链深合并（单目录；兼容旧调用）。
+/// 读取 themes_dir/<name>/theme.toml 并按 base 链深合并（单目录；兼容旧调用）。
 pub fn load_merged(themes_dir: &Path, name: &str, depth: usize) -> anyhow::Result<Value> {
     load_merged_dirs_at(&[themes_dir.to_path_buf()], name, depth)
 }
 
 /// 多目录 base 深合并（base 在下、派生在上）。防御循环继承（最多 8 层）。
+/// 返回**扁平人写形态**的合并 Value（未归一化；归一化在 `load_typed_dirs` 内）。
 pub fn load_merged_dirs(dirs: &[PathBuf], name: &str, depth: usize) -> anyhow::Result<Value> {
     load_merged_dirs_at(dirs, name, depth)
 }
@@ -96,10 +105,10 @@ fn load_merged_dirs_at(dirs: &[PathBuf], name: &str, depth: usize) -> anyhow::Re
     }
     let dir = find_theme_dir(dirs, name)
         .ok_or_else(|| anyhow::anyhow!("theme '{}' not found in {:?}", name, dirs))?;
-    let path = dir.join("theme.yaml");
+    let path = dir.join(THEME_FILE);
     let text = std::fs::read_to_string(&path)
         .map_err(|e| anyhow::anyhow!("read theme {}: {}", path.display(), e))?;
-    let value: Value = serde_yaml::from_str(&text)
+    let value: Value = toml::from_str(&text)
         .map_err(|e| anyhow::anyhow!("parse theme {}: {}", path.display(), e))?;
 
     // base 链继承：先加载 base（跨目录查找），再用本主题覆盖（merge）。
@@ -114,20 +123,20 @@ fn load_merged_dirs_at(dirs: &[PathBuf], name: &str, depth: usize) -> anyhow::Re
     Ok(value)
 }
 
-/// 深合并：over 覆盖 base。映射递归合并；其余（标量/序列）由 over 覆盖。
+/// 深合并：over 覆盖 base。表递归合并；其余（标量/数组）由 over 覆盖。
 pub fn merge(base: Value, over: Value) -> Value {
     match (base, over) {
-        (Value::Mapping(mut b), Value::Mapping(o)) => {
+        (Value::Table(mut b), Value::Table(o)) => {
             for (k, ov) in o {
-                let merged = match b.remove(&k) {
+                let merged = match b.remove(k.as_str()) {
                     Some(bv) => merge(bv, ov),
                     None => ov,
                 };
                 b.insert(k, merged);
             }
-            Value::Mapping(b)
+            Value::Table(b)
         }
-        // 非映射：over 优先
+        // 非表：over 优先
         (_, over) => over,
     }
 }
@@ -138,18 +147,28 @@ mod tests {
 
     #[test]
     fn meta_from_text_extracts_name() {
-        let y = "meta:\n  name: 测试主题\n  author: me\nviews: {}\n";
-        let m = meta_from_text(y).expect("应解析出 meta");
+        let s = "[meta]\nname = \"测试主题\"\nauthor = \"me\"\n";
+        let m = meta_from_text(s).expect("应解析出 meta");
         assert_eq!(m.name, "测试主题");
         assert_eq!(m.author, "me");
         // 无 meta → None
-        assert!(meta_from_text("foo: 1\n").is_none());
+        assert!(meta_from_text("foo = 1\n").is_none());
     }
 
     #[test]
     fn validate_text_accepts_valid_rejects_garbage() {
-        assert!(validate_text("meta:\n  name: ok\n").is_ok());
-        // 非法 YAML
+        assert!(validate_text("[meta]\nname = \"ok\"\n").is_ok());
+        // 非法 TOML
         assert!(validate_text("  : : :\n\t- bad").is_err());
+    }
+
+    #[test]
+    fn merge_deep_overrides() {
+        let base: Value = toml::from_str("[window]\npadding = 8\nradius = 4\n").unwrap();
+        let over: Value = toml::from_str("[window]\nradius = 6\n").unwrap();
+        let m = merge(base, over);
+        let w = m.get("window").unwrap();
+        assert_eq!(w.get("padding").unwrap().as_integer(), Some(8)); // base 保留
+        assert_eq!(w.get("radius").unwrap().as_integer(), Some(6)); // over 覆盖
     }
 }

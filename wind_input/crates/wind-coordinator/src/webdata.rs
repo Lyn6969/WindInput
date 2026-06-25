@@ -989,9 +989,11 @@ impl Coordinator {
     fn web_theme_preview(&self, params: &Value) -> anyhow::Result<Value> {
         let name = str_param(params, "name")?;
         let dirs = self.theme_dirs();
-        // 合并 base 链后的原始主题配置（serde_yaml::Value → JSON），供前端预览渲染。
+        // 合并 base 链 + 归一化（扁平人写形态 → 嵌套内存形态）后的主题配置（toml::Value → JSON），
+        // 供前端预览渲染（保持历史 views.* 嵌套契约）。
         let merged = wind_theme::load_merged_dirs(&dirs, name, 0)?;
-        Ok(serde_json::to_value(&merged)?)
+        let normalized = wind_theme::normalize::normalize_theme(merged);
+        Ok(serde_json::to_value(&normalized)?)
     }
 
     fn web_theme_delete(&self, params: &Value) -> anyhow::Result<Value> {
@@ -1000,7 +1002,7 @@ impl Coordinator {
             .user_themes_dir()
             .ok_or_else(|| anyhow::anyhow!("无用户主题目录"))?;
         let target = user_dir.join(name);
-        if !target.join("theme.yaml").exists() {
+        if !target.join("theme.toml").exists() {
             anyhow::bail!("内置主题不可删除或主题不存在: {}", name);
         }
         std::fs::remove_dir_all(&target)?;
@@ -1008,14 +1010,15 @@ impl Coordinator {
     }
 
     fn web_theme_import_text(&self, params: &Value) -> anyhow::Result<Value> {
-        let yaml = str_param(params, "yaml")?;
+        // 参数键沿用 "yaml"（前端契约未改），内容为 TOML 文本。
+        let text = str_param(params, "yaml")?;
         let force = params
             .get("force")
             .and_then(|v| v.as_bool())
             .unwrap_or(false);
         // 校验可解析为合法主题。
-        wind_theme::validate_text(yaml)?;
-        let meta = wind_theme::meta_from_text(yaml)
+        wind_theme::validate_text(text)?;
+        let meta = wind_theme::meta_from_text(text)
             .ok_or_else(|| anyhow::anyhow!("主题缺少 meta.name"))?;
         if meta.name.trim().is_empty() {
             anyhow::bail!("主题 meta.name 为空");
@@ -1024,19 +1027,19 @@ impl Coordinator {
             .user_themes_dir()
             .ok_or_else(|| anyhow::anyhow!("无用户主题目录"))?;
         let target = user_dir.join(&meta.name);
-        if target.join("theme.yaml").exists() && !force {
+        if target.join("theme.toml").exists() && !force {
             anyhow::bail!("主题已存在（force=false）: {}", meta.name);
         }
         std::fs::create_dir_all(&target)?;
-        let file = target.join("theme.yaml");
-        let tmp = file.with_extension("yaml.tmp");
-        std::fs::write(&tmp, yaml.as_bytes())?;
+        let file = target.join("theme.toml");
+        let tmp = file.with_extension("toml.tmp");
+        std::fs::write(&tmp, text.as_bytes())?;
         std::fs::rename(&tmp, &file)?;
         Ok(json!({ "ok": true }))
     }
 
     fn web_theme_list(&self) -> anyhow::Result<Value> {
-        // 与右键菜单 list_themes 同源:扫用户+安装多目录(theme_search_dirs),含 theme.yaml、
+        // 与右键菜单 list_themes 同源:扫用户+安装多目录(theme_search_dirs),含 theme.toml、
         // 过滤 `_` 前缀(_base 等)、用户优先去重;读 meta(名称/作者/版本/排序)。修列表不一致 (#5/主题)。
         let dirs = self.theme_search_dirs();
         let mut seen = std::collections::HashSet::new();
@@ -1053,7 +1056,7 @@ impl Coordinator {
                 let Some(id) = e.file_name().to_str().map(|s| s.to_string()) else {
                     continue;
                 };
-                if id.starts_with('_') || !dir.join(&id).join("theme.yaml").exists() {
+                if id.starts_with('_') || !dir.join(&id).join("theme.toml").exists() {
                     continue;
                 }
                 if !seen.insert(id.clone()) {

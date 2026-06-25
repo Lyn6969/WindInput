@@ -1,0 +1,23 @@
+# v3-C schema: base 单链继承唯一基础主题 _base（颜色清风蓝 + 候选窗几何基线 + toolbar 跟随语义）。
+# default 仅覆盖序号样式：把 _base 的「纯数字无圆圈」override 成「圆圈数字」。
+# 注意：顶层标量键 base 必须在任何 [table] 之前（否则被并入上一个表）。
+base = "_base"
+
+[meta]
+name = "默认主题"
+version = "3.0"
+author = "清风输入法"
+order = 0
+
+# v3 行为配置（P6）：可被用户 ui.pager_display_mode 覆盖。
+[behavior]
+always_show_pager = false   # 仅 1 页时不显示翻页区
+show_page_number = true     # 多页时显示 "1/3" 页码文字
+
+# override base 的无圆圈 → 圆圈数字
+[index]
+background = "${accent}"
+shape = "circle"
+color = "${on_accent}"
+font_size = -4
+padding = 2

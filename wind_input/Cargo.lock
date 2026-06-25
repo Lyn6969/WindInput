@@ -2315,8 +2315,8 @@ dependencies = [
  "image",
  "resvg",
  "serde",
- "serde_yaml",
  "thiserror",
+ "toml 0.8.23",
  "tracing",
 ]
 

@@ -310,7 +310,7 @@ impl Coordinator {
         }
     }
 
-    /// 列出可用主题：(id, 显示名)。扫用户+安装目录，含 theme.yaml、非 `_` 前缀；
+    /// 列出可用主题：(id, 显示名)。扫用户+安装目录，含 theme.toml、非 `_` 前缀；
     /// 显示名取 meta.name（缺则用 id），按 (meta.order, id) 排序。
     pub(crate) fn list_themes(&self) -> Vec<(String, String)> {
         let dirs = self.theme_search_dirs();
@@ -327,7 +327,7 @@ impl Coordinator {
                 let Ok(id) = e.file_name().into_string() else {
                     continue;
                 };
-                if id.starts_with('_') || !dir.join(&id).join("theme.yaml").exists() {
+                if id.starts_with('_') || !dir.join(&id).join("theme.toml").exists() {
                     continue;
                 }
                 if !seen.insert(id.clone()) {

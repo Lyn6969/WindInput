@@ -80,6 +80,9 @@ pub struct RvNode {
     pub border_radius: Option<Dim>,
     pub border_width: Option<Dim>,
     pub border_color: Option<Rgba>,
+    /// 边框线型："solid"(默认)|"dashed"|"dotted"。None/空=solid。
+    /// 数据通路已就绪；wind-ui 虚线/点线光栅绘制待补（当前按 solid 渲染）。
+    pub border_style: Option<String>,
     pub bg_color: Option<Rgba>,
     /// 背景形状："circle"|"none"（空=none）。当前仅 index 序号消费（圆形序号底）。
     pub bg_shape: String,

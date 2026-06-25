@@ -1,0 +1,162 @@
+# P7-C 验收样例：以九宫格背景图为主体的位图皮肤。
+# 复用 _base 基础主题（颜色 colors + 候选窗几何）；核心在 window.background.image。
+# 背景图 panel.png 由 tools 生成（64x64：2px 蓝边 + 浅蓝竖向渐变，slice=8 保四角清晰）。
+# 注意：顶层标量键 base 必须在任何 [table] 之前。
+base = "_base"
+
+[meta]
+name = "极点经典(位图)"
+version = "3.0"
+author = "清风输入法"
+order = 2
+
+# 顶层资源注册表：名→路径（相对 theme.toml），views 里按 ref 引用。
+# {light,dark} 双变体——切系统暗色时自动换深色版位图（与 palette 双变体对称）。
+[resources]
+panel = { light = "panel.png", dark = "panel-dark.png" }   # 九宫格背景填充
+sel = { light = "sel.png", dark = "sel-dark.png" }         # 选中态高亮渐变图
+mark = "mark.png"                                          # 角标水印（单图明暗共用）
+
+# 九宫格背景图：纯渐变填充，四角随 slice 保持原样、四边/中心拉伸贴合候选窗尺寸。
+# 边框/圆角由 View 提供（引擎裁剪），位图只负责填充——避免硬边被圆角裁出缺角。
+[window]
+background = { color = "${bg}", image = { ref = "panel", mode = "nine_slice", slice = 8 } }
+radius = 8
+border = { width = 1, color = "${border}" }
+padding = [8, 10]
+# 结构化阴影：offset + color 已实现（blur 预留、暂不渲染）。
+shadow = { offset = [3, 4], blur = 8, color = "${shadow}" }
+
+# 装饰层：右下角半透明水印，z>0 覆盖在内容之上。
+# offset 是屏幕平移(+x 右/+y 下)：bottom-right 锚点要内缩须用负偏移。
+[[window.layers]]
+ref = "mark"
+z = 1
+anchor = "bottom-right"
+offset = { x = -8, y = -6 }
+size = { w = 20, h = 20 }
+opacity = 0.9
+
+[preedit_bar]
+padding = { left = 8, right = 8 }
+background = "transparent"   # 透明：让窗口背景图从上到下整窗透出
+color = "${text_dim}"
+
+[item]
+padding = { left = 8, right = 10 }
+radius = 4
+
+# 选中态铺高亮渐变位图（被 item 圆角裁剪）+ 白色加粗文字。图加载失败时 color 作兜底底色。
+[item.selected]
+background = { color = "${selection}", image = { ref = "sel", mode = "stretch" } }
+color = "#FFFFFF"
+font_weight = 600
+
+[item.hover]
+background = "${hover}"
+
+[index]
+color = "${on_accent}"
+background = "${accent}"
+shape = "none"   # 极点风格：纯数字序号，无圆背景
+
+[text]
+margin = { left = 4 }
+color = "${text}"
+
+[comment]
+margin = { left = 6 }
+color = "${text_hint}"
+
+[accent_bar]
+enabled = true   # 选中候选左侧蓝色强调条
+width = 3
+background = "${accent}"
+
+# 状态泡/Tooltip/Toast 也吃九宫格背景图 + 右下角角标水印层（复用 panel/mark）。
+# ⚠️ 底色须用「不透明 + 与浅色 panel 同调」的颜色（圆角抗锯齿边缘会透出深色底色形成毛边）。
+[status]
+background = { color = "#EAF1FCFF", image = { ref = "panel", mode = "nine_slice", slice = 8 } }
+color = "#22344D"
+padding = [6, 12]
+
+[[status.layers]]
+ref = "mark"
+z = 1
+anchor = "bottom-right"
+offset = { x = -4, y = -4 }
+size = { w = 14, h = 14 }
+opacity = 0.85
+
+[tooltip]
+background = { color = "#EAF1FCFF", image = { ref = "panel", mode = "nine_slice", slice = 8 } }
+color = "#22344D"
+padding = [6, 10]
+
+[[tooltip.layers]]
+ref = "mark"
+z = 1
+anchor = "bottom-right"
+offset = { x = -5, y = -5 }
+size = { w = 14, h = 14 }
+opacity = 0.8
+
+[toast]
+background = { color = "#EAF1FCFF", image = { ref = "panel", mode = "nine_slice", slice = 8 } }
+color = "#22344D"
+
+[[toast.layers]]
+ref = "mark"
+z = 1
+anchor = "bottom-right"
+offset = { x = -8, y = -8 }
+size = { w = 18, h = 18 }
+opacity = 0.85
+
+[toolbar]
+background = "${toolbar_background}"
+border = { color = "${toolbar_border}" }
+
+[toolbar.grip]
+color = "${toolbar_grip}"
+
+[toolbar.button]
+background = "${toolbar_full_width_off_bg}"
+color = "${toolbar_full_width_off_text}"
+
+[toolbar.button.chinese]
+background = "${toolbar_mode_chinese_bg}"
+
+[toolbar.button.english]
+background = "${toolbar_mode_english_bg}"
+
+[toolbar.settings]
+icon = "${toolbar_settings_icon}"
+hole = "${toolbar_settings_hole}"
+
+# 菜单 root 吃九宫格背景图 + 右下角角标水印层。
+[menu.root]
+radius = 6
+background = { color = "${menu_bg}", image = { ref = "panel", mode = "nine_slice", slice = 8 } }
+border = { width = 1, color = "${menu_border}" }
+
+[[menu.root.layers]]
+ref = "mark"
+z = 1
+anchor = "bottom-right"
+offset = { x = -6, y = -6 }
+size = { w = 16, h = 16 }
+opacity = 0.8
+
+[menu.item]
+color = "${menu_text}"
+
+[menu.item.hover]
+background = "${menu_hover_bg}"
+color = "${menu_hover_text}"
+
+[menu.item.disabled]
+color = "${menu_disabled}"
+
+[menu.separator]
+background = "${menu_separator}"

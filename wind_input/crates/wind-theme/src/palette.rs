@@ -3,8 +3,8 @@
 //! 与 Go 版本 `wind_input/pkg/theme/palette.go` 对齐。
 //! 处理 `${var}` 引用（递归 + 环检测）、{light,dark} 变体、#RRGGBB[AA] 十六进制。
 
-use serde_yaml::Value;
 use std::collections::{HashMap, HashSet};
+use toml::Value;
 
 /// 颜色 [R, G, B, A]，与 UI 缓冲约定一致。
 pub type Rgba = [u8; 4];
@@ -24,15 +24,12 @@ pub fn parse_hex(s: &str) -> Option<Rgba> {
 /// is_dark 选择 {light,dark} 变体。derive 等非颜色项被忽略。
 pub fn resolve_palette(colors: Option<&Value>, is_dark: bool) -> HashMap<String, Rgba> {
     let mut out = HashMap::new();
-    let map = match colors.and_then(|c| c.as_mapping()) {
+    let map = match colors.and_then(|c| c.as_table()) {
         Some(m) => m,
         None => return out,
     };
     let mut visiting = HashSet::new();
-    let names: Vec<String> = map
-        .keys()
-        .filter_map(|k| k.as_str().map(|s| s.to_string()))
-        .collect();
+    let names: Vec<String> = map.keys().cloned().collect();
     for name in names {
         resolve_name(&name, map, is_dark, &mut out, &mut visiting);
     }
@@ -42,7 +39,7 @@ pub fn resolve_palette(colors: Option<&Value>, is_dark: bool) -> HashMap<String,
 /// 按名解析（递归 + 记忆 + 环检测）。
 fn resolve_name(
     name: &str,
-    map: &serde_yaml::Mapping,
+    map: &toml::Table,
     is_dark: bool,
     out: &mut HashMap<String, Rgba>,
     visiting: &mut HashSet<String>,
@@ -54,7 +51,7 @@ fn resolve_name(
         return None; // 环
     }
     visiting.insert(name.to_string());
-    let v = map.get(Value::from(name))?;
+    let v = map.get(name)?;
     let color = resolve_value(v, map, is_dark, out, visiting);
     visiting.remove(name);
     if let Some(c) = color {
@@ -66,17 +63,17 @@ fn resolve_name(
 /// 解析一个颜色值（字符串 hex / `${var}` / {light,dark}）。
 fn resolve_value(
     v: &Value,
-    map: &serde_yaml::Mapping,
+    map: &toml::Table,
     is_dark: bool,
     out: &mut HashMap<String, Rgba>,
     visiting: &mut HashSet<String>,
 ) -> Option<Rgba> {
     match v {
         Value::String(s) => resolve_str(s, map, is_dark, out, visiting),
-        Value::Mapping(m) => {
+        Value::Table(m) => {
             // {light: .., dark: ..} 变体
             let key = if is_dark { "dark" } else { "light" };
-            if let Some(inner) = m.get(Value::from(key)) {
+            if let Some(inner) = m.get(key) {
                 resolve_value(inner, map, is_dark, out, visiting)
             } else {
                 None // derive 等非颜色映射
@@ -88,7 +85,7 @@ fn resolve_value(
 
 fn resolve_str(
     s: &str,
-    map: &serde_yaml::Mapping,
+    map: &toml::Table,
     is_dark: bool,
     out: &mut HashMap<String, Rgba>,
     visiting: &mut HashSet<String>,
@@ -112,9 +109,9 @@ pub fn color_token(v: &Value, palette: &HashMap<String, Rgba>, is_dark: bool) ->
                 parse_hex(s)
             }
         }
-        Value::Mapping(m) => {
+        Value::Table(m) => {
             let key = if is_dark { "dark" } else { "light" };
-            m.get(Value::from(key))
+            m.get(key)
                 .and_then(|inner| color_token(inner, palette, is_dark))
         }
         _ => None,
@@ -134,14 +131,14 @@ mod tests {
 
     #[test]
     fn test_palette_var_and_lightdark() {
-        let yaml = r##"
-primary: "#4285F4"
-accent: "${primary}"
-bg: {light: "#FFFFFF", dark: "#2D2D2D"}
-selection_text: "${text}"
-text: {light: "#1E1E1E", dark: "#E0E0E0"}
+        let src = r##"
+primary = "#4285F4"
+accent = "${primary}"
+bg = { light = "#FFFFFF", dark = "#2D2D2D" }
+selection_text = "${text}"
+text = { light = "#1E1E1E", dark = "#E0E0E0" }
 "##;
-        let v: Value = serde_yaml::from_str(yaml).unwrap();
+        let v: Value = toml::from_str(src).unwrap();
         let light = resolve_palette(Some(&v), false);
         assert_eq!(light["primary"], [0x42, 0x85, 0xF4, 255]);
         assert_eq!(light["accent"], [0x42, 0x85, 0xF4, 255]); // ${primary}

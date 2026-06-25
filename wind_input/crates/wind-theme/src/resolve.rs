@@ -158,6 +158,7 @@ fn resolve_view_node(
         border_radius: n.border.radius,
         border_width: n.border.width,
         border_color: def_border,
+        border_style: n.border.style.clone(),
         bg_color: def_bg,
         bg_shape: n.background.shape.clone(),
         font_size: n.font_size.unwrap_or(0) as f32,
