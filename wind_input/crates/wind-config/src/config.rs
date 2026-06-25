@@ -1632,7 +1632,10 @@ mod tests {
         assert!(!c.schema.quick_input.enabled);
         assert_eq!(c.schema.quick_input.decimal_places, 6);
         // input 子组
-        assert!(c.input.punct.smart_after_digit, "punct.smart_after_digit 默认开");
+        assert!(
+            c.input.punct.smart_after_digit,
+            "punct.smart_after_digit 默认开"
+        );
         assert_eq!(c.input.symbol.smart_timeout_ms, 500);
         assert!(c.input.temp_english.enabled && c.input.temp_english.show_candidates);
         assert_eq!(c.input.url.prefixes.len(), 5);
