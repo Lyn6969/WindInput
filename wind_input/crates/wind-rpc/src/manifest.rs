@@ -70,47 +70,10 @@ mod schema_binding {
             .unwrap_or_default()
     }
 
-    /// 前端 webview（wind_setting）仍引用、但 core 已不再登记的键。
-    /// core 的 setItems 会容错跳过它们（旧字段无害），此名单仅用于让下方 CI 校验放行——
-    /// 多为「延后的 Go 旧功能」或「主题层 theme.yaml 重复键」，详见 docs/deferred-config-features.md。
-    /// **新增前端字段时不要往这里加**：应同步到 config.rs 结构体 + config_schema 注册表。
-    const FRONTEND_AHEAD_ALLOWLIST: &[&str] = &[
-        "features.quick_input.accent_color",
-        "features.quick_input.alpha_providers.english",
-        "features.quick_input.alpha_providers.pinyin",
-        "features.quick_input.alpha_providers.rare_char",
-        "features.quick_input.alpha_providers.rare_char_id",
-        "features.quick_input.trigger_keys",
-        "features.stats.retain_days",
-        "hotkeys.enter_special_mode",
-        "hotkeys.enter_temp_pinyin",
-        "hotkeys.open_add_word_dialog",
-        "hotkeys.take_screenshot",
-        "input.auto_pair.blacklist",
-        "input.temp_pinyin.accent_color",
-        "input.temp_pinyin.z_include_on_commit",
-        "input.url_input.accent_color",
-        "ui.candidate.always_show_pager",
-        "ui.candidate.always_show_pager_follow_theme",
-        "ui.candidate.mode_accent_border",
-        "ui.candidate.show_page_number",
-        "ui.candidate.show_page_number_follow_theme",
-        "ui.candidate.vertical_max_width",
-        "ui.candidate.vertical_max_width_follow_theme",
-        "ui.font.gdi_scale",
-        "ui.font.gdi_weight",
-        "ui.font.menu_size",
-        "ui.font.menu_weight",
-        "ui.status_indicator.background_color",
-        "ui.status_indicator.border_radius",
-        "ui.status_indicator.font_size",
-        "ui.status_indicator.opacity",
-        "ui.status_indicator.show_full_width",
-        "ui.status_indicator.show_mode",
-        "ui.status_indicator.show_punct",
-        "ui.status_indicator.text_color",
-        "ui.theme.editor_auto_start",
-    ];
+    /// 前端 webview（wind_setting）仍引用、但 core 不再登记的键。
+    /// 6 域重命名（不做向后兼容）后前端已与注册表锁步，名单清空——
+    /// 旧/孤立键已从前端删除，新增前端字段必须同步到 config.rs 结构体 + config_schema 注册表。
+    const FRONTEND_AHEAD_ALLOWLIST: &[&str] = &[];
 
     /// CI 校验：前端 `wind_setting/src/generated/config-keys.json` 的每个 key 要么在 registry，
     /// 要么在 [`FRONTEND_AHEAD_ALLOWLIST`]。新增前端键若 core 不认识且未列入名单即红，

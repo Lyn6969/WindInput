@@ -80,14 +80,22 @@
 
 ## Stage 4-orig（暂停）: Native 补齐缺失页面
 
-## Stage 5（延后批）: webview 降级 + key 6 域重命名
-**Goal**: Native 对等后移除/降级 Tauri webview；按 6 域规范重命名 key，附 alias 旧名迁移表。
-**Success Criteria**:
-- schema 增加 `aliases` 映射；加载时旧 key 自动迁移到新 key，老用户 config.toml 不失效。
-- key 按 6 域（schema/input/keys/appearance/dict/advanced）+ 最多三级 + snake_case 正向命名重排。
-- webview 从默认构建移除或标记可选。
-**Tests**: `alias_migration_maps_old_to_new`；老配置文件加载回归。
-**Status**: Not Started
+## Stage 5（进行中）: key 域重命名（**不做向后兼容**；webview 保留不降级）
+**用户拍板（4 项）**：① 旧配置直接遗弃，不写迁移代码（开发期、仅作者自用）；② **ui 顶层名保留**（中文用户习惯/简洁），但 `ui.tooltip` 4 级**拍平**到 3 级；③ **keys 扁平**；④ **不强求 6 顶级**——立"正交大类"软准则，稳定域原地保留；`features` 是"杂物抽屉"反模式须拆解，模式三件套（quick_input/special_modes/mix_modes）**现在就归 schema.\***（预定位到未来"英文/快捷做成方案"的归宿，避免改两次）。
+
+**最终顶级集合（约 9，正交大类）**：`general`/`schema`(方案+pinyin+模式)/`input`(+s2t/cmdbar,punct·symbol 分组)/`keys`/`ui`(tooltip 拍平)/`dict`(phrase)/`stats`(升顶级)/`compat`/`debug`。移除 `hotkeys`(→keys)/`pinyin`(→schema.pinyin)/`features`(拆解)。
+
+**映射真相源**：`docs/config-key-migration.md`（127 键旧→新，全表）。webview **保留备用**（等 Native 完全对等后才去除，非本阶段）。
+
+**子分期**（TDD，编译器引导；逐阶段 fmt 与逻辑分提交；main 不 push 不 `git add -A`）：
+- **5.1** 重构 `config.rs` 结构体+Default（删 hotkeys/features/pinyin 顶级，新增 keys/dict/stats，schema 吸收 pinyin+模式，input 吸收 s2t/cmdbar+punct/symbol 组，ui.tooltip 拍平，shift_temp_english→temp_english、url_input→url、phrase→dict.phrase）。
+- **5.2** 重写 `config_schema.rs` REGISTRY 127 键 + `internal_setter_paths` 守卫 + `data/config.toml`；三向绑定测试（struct↔registry↔toml）复绿。
+- **5.3** 修下游 ~50–60 Rust 读取点 + 6 处 `set_user_*` 路径；workspace 全测绿。
+- **5.4** `data/settings/manifest.toml` 全 key + manifest↔registry 三测复绿。
+- **5.5** 前端 `config-keys.json` + ~25 文件键名替换；`frontend_config_keys_known_to_core` 收紧（清空 ALLOWLIST，旧键不兼容）。
+- **5.6** 迁移表与实现核对定稿。
+**Tests**: 全程靠既有三向绑定测试 + 编译器报错兜底；无 alias 迁移测试（不做向后兼容）。
+**Status**: In Progress（5.1 开始）
 
 ---
 
@@ -170,4 +178,5 @@
 1. 顶层域 = 设置页签 = 用户心智，固定 6 个：`schema` / `input` / `keys` / `appearance` / `dict` / `advanced`。
 2. 路径最多三级 `<域>.<组>.<字段>`（现有四级如 `features.quick_input.alpha_providers.pinyin` 拍平）。
 3. 命名：全 snake_case；布尔正向（`enabled`/`show_*`，禁 `disable_*`）；枚举合法值集中在 schema；"跟随主题"的样式字段从 TOML 删除而非保留。
-4. 改名必带 alias 迁移表，保证向后兼容。
+4. 顶级域 = 设置页签 = 用户心智锚点；不卡死数量，立"正交大类"软准则（语义自洽/规模相当/能对应一页），排除"削足适履强并"与"碎片化堆放"两极。`features` 式杂物抽屉禁止。
+5. 本批**不做向后兼容**（开发期自用，旧配置遗弃）；改名映射记于 `docs/config-key-migration.md`，仅作文档与 codemod 依据，不写运行时 alias。

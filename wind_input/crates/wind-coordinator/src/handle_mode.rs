@@ -46,8 +46,8 @@ impl Coordinator {
                 .rt()
                 .config
                 .input
-                .shift_temp_english
-                .show_english_candidates
+                .temp_english
+                .show_candidates
                 .then(|| "english".to_string()),
             _ => None,
         }
@@ -58,7 +58,7 @@ impl Coordinator {
     pub(crate) fn mix_members(&self, idx: u8) -> Vec<String> {
         self.rt()
             .config
-            .features
+            .schema
             .mix_modes
             .get(idx as usize)
             .map(|m| {
@@ -77,7 +77,7 @@ impl Coordinator {
     pub(crate) fn mix_has_quick_input(&self, idx: u8) -> bool {
         self.rt()
             .config
-            .features
+            .schema
             .mix_modes
             .get(idx as usize)
             .map(|m| m.members.iter().any(|s| s == "quick_input"))
@@ -99,7 +99,7 @@ impl Coordinator {
         self.update_mix_candidates(state);
         // 快捷输入「强制竖排」：含 quick_input 成员的 mix（如默认「快捷」融合，; 触发），
         // 进入时切竖排候选并记住原布局，退出恢复（与独立快捷输入模式一致）。
-        if self.mix_has_quick_input(idx) && self.rt().config.features.quick_input.force_vertical {
+        if self.mix_has_quick_input(idx) && self.rt().config.schema.quick_input.force_vertical {
             let cur = self
                 .rt()
                 .config
@@ -375,7 +375,7 @@ impl Coordinator {
             ModeKind::Url => Some(("网址输入".to_string(), "网址".to_string())),
             ModeKind::Mix(i) => {
                 let rt = self.rt();
-                let m = rt.config.features.mix_modes.get(i as usize)?;
+                let m = rt.config.schema.mix_modes.get(i as usize)?;
                 let full = if m.name.is_empty() {
                     "快捷".to_string()
                 } else {
@@ -386,7 +386,7 @@ impl Coordinator {
             }
             ModeKind::Special(i) => {
                 let rt = self.rt();
-                let m = rt.config.features.special_modes.get(i as usize)?;
+                let m = rt.config.schema.special_modes.get(i as usize)?;
                 let full = m.name.clone();
                 let short = Self::short_or_first(&m.short_name, &full);
                 Some((full, short))
@@ -466,7 +466,7 @@ impl Coordinator {
 
     /// 找出 key_code 匹配的 mix 模式下标（按配置顺序先到先得）。
     pub(crate) fn match_mix_trigger(&self, key_code: u32) -> Option<u8> {
-        for (i, m) in self.rt().config.features.mix_modes.iter().enumerate() {
+        for (i, m) in self.rt().config.schema.mix_modes.iter().enumerate() {
             if i > u8::MAX as usize {
                 break;
             }
@@ -565,7 +565,7 @@ impl Coordinator {
         let members = self
             .rt()
             .config
-            .features
+            .schema
             .mix_modes
             .get(state.mix_id as usize)
             .map(|m| m.members.clone())
@@ -579,7 +579,7 @@ impl Coordinator {
                 if !numeric {
                     continue; // 文本模式跳过计算
                 }
-                let dp = self.rt().config.features.quick_input.decimal_places;
+                let dp = self.rt().config.schema.quick_input.decimal_places;
                 for t in wind_quick_input::generate_quick_input_candidates(&state.mix_buffer, dp) {
                     if seen.insert(t.clone()) {
                         cands.push(Candidate {

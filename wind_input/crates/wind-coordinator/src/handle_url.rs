@@ -15,7 +15,7 @@ impl Coordinator {
         self.rt()
             .config
             .input
-            .url_input
+            .url
             .prefixes
             .iter()
             .any(|p| !p.is_empty() && p == probe)

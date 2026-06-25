@@ -190,7 +190,7 @@ impl Coordinator {
             // 前缀导航：敲 `zz`/`co` 等前缀（长度 ≥ min_prefix_length）列出所有该前缀的
             // marker 短语。**$CC 命令** → is_command（选中直接执行，group_code 作执行输入
             // 上下文）；**$SS/$AA 组** → is_group（选中补全到完整码再展开成员，二级选择）。
-            let min_prefix = self.rt().config.input.phrase.min_prefix_length;
+            let min_prefix = self.rt().config.input.phrase.min_prefix;
             for hit in self
                 .phrases
                 .lookup_prefix(&state.input_buffer, &recent, min_prefix)
@@ -391,7 +391,7 @@ impl Coordinator {
 
     /// 若 key_code 是配置的二/三候选键，返回页内候选偏移（1=次选/第2项，2=三选/第3项）。
     pub(crate) fn select_key_offset(&self, key_code: u32) -> Option<usize> {
-        for group in &self.rt().config.input.select_key_groups {
+        for group in &self.rt().config.keys.select_key_groups {
             let vks = hotkey::select_key_vks(group);
             if let Some(pos) = vks.iter().position(|vk| *vk == key_code) {
                 return Some(pos + 1);
@@ -403,7 +403,7 @@ impl Coordinator {
     /// 若 key_code 是配置的以词定字键，返回取字下标（0=取第 1 字，1=取第 2 字）。
     /// 默认 `select_char_keys` 为空 → 恒返回 None（功能禁用，零回归）。
     pub(crate) fn select_char_index(&self, key_code: u32) -> Option<usize> {
-        for group in &self.rt().config.input.select_char_keys {
+        for group in &self.rt().config.keys.select_char_keys {
             let vks = hotkey::select_key_vks(group);
             if let Some(pos) = vks.iter().position(|vk| *vk == key_code) {
                 return Some(pos);
@@ -577,7 +577,7 @@ impl Coordinator {
         if hi >= state.candidates.len() {
             return KeyAction::Consumed;
         }
-        let behavior = self.rt().config.input.overflow.number_key.clone();
+        let behavior = self.rt().config.keys.overflow.number_key.clone();
         match behavior.as_str() {
             "commit" => {
                 let cand = state.candidates[hi].clone();
@@ -612,7 +612,7 @@ impl Coordinator {
         key_char: char,
         prev_char: u16,
     ) -> KeyAction {
-        let behavior = self.rt().config.input.overflow.select_key.clone();
+        let behavior = self.rt().config.keys.overflow.select_key.clone();
         // 无候选（缓冲非空但无候选）：commit 清组合，commit_and_input 清组合并输出该字符。
         if state.candidates.is_empty() {
             return match behavior.as_str() {
@@ -708,7 +708,7 @@ impl Coordinator {
         }
         // None：候选词长度不足 / 空码。触发键字符用于 commit_and_input 追加。
         let key_char = crate::coordinator::punct_char(key_code, false);
-        let behavior = self.rt().config.input.overflow.select_char_key.clone();
+        let behavior = self.rt().config.keys.overflow.select_char_key.clone();
         // 空码（缓冲非空但无候选）
         if state.candidates.is_empty() {
             return match behavior.as_str() {
@@ -888,7 +888,7 @@ impl Coordinator {
             return None;
         }
         let has_shift = data.modifiers & MOD_SHIFT != 0;
-        let h = &self.rt().config.hotkeys;
+        let h = &self.rt().config.keys;
         // 删除优先匹配（与 Go 顺序一致：DeleteCandidate 先于 PinCandidate）。
         let del =
             Self::match_candidate_action_key(&h.delete_candidate, true, has_shift, data.key_code);

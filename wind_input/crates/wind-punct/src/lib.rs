@@ -13,10 +13,10 @@ use wind_transform::punctuation::PunctuationConverter;
 /// 数字后智能标点：中文标点模式下，若 ch 在智能标点列表且光标前一字符为数字，
 /// 则该标点按英文（半角）输出（如 "3." 不转 "3。"）。`prev_char` 为 UTF-16 单元（0=不可用）。
 pub fn is_smart_punct_after_digit(cfg: &InputConfig, ch: char, prev_char: u16) -> bool {
-    if !cfg.smart_punct_after_digit {
+    if !cfg.punct.smart_after_digit {
         return false;
     }
-    let list = &cfg.smart_punct_list;
+    let list = &cfg.punct.smart_list;
     let in_list = if list.is_empty() {
         ch == '.' || ch == ','
     } else {
@@ -32,7 +32,7 @@ pub fn is_smart_punct_after_digit(cfg: &InputConfig, ch: char, prev_char: u16) -
 /// 纯查表读自定义标点映射的指定列（不碰转换器引号状态），供无副作用计算用。
 /// 四状态列：中半 0 / 英全 1 / 中全 2 / 英半 3。
 pub fn custom_lookup(cfg: &InputConfig, ch: char, col_idx: usize) -> Option<String> {
-    let vals = cfg.punct_custom.mappings.get(&ch.to_string())?;
+    let vals = cfg.punct.custom_mappings.get(&ch.to_string())?;
     let v = vals.get(col_idx)?;
     if v.is_empty() { None } else { Some(v.clone()) }
 }
@@ -50,7 +50,7 @@ pub fn convert_punct(
     let is_chinese_punct = chinese_punct && !smart_en;
 
     // 1. 自定义映射优先（四状态均可配置）。
-    if cfg.punct_custom.enabled {
+    if cfg.punct.custom_enabled {
         let col_idx = if is_chinese_punct && full_width {
             2 // 中文全角
         } else if is_chinese_punct {
@@ -88,7 +88,7 @@ pub fn compute_punct_str_pure(
 ) -> Option<String> {
     let is_quote = ch == '\'' || ch == '"';
 
-    if !is_quote && cfg.punct_custom.enabled {
+    if !is_quote && cfg.punct.custom_enabled {
         let col_idx = if chinese && full_width {
             Some(2) // 中文全角
         } else if chinese {
@@ -117,7 +117,7 @@ pub fn compute_punct_str_pure(
 
 /// 中文标点串 `cn` 是否在用户配置的智能符号参与集合内（子串包含匹配）。
 pub fn participates(cfg: &InputConfig, cn: &str) -> bool {
-    !cn.is_empty() && cfg.smart_symbol_chars.contains(cn)
+    !cn.is_empty() && cfg.symbol.smart_chars.contains(cn)
 }
 
 #[cfg(test)]
@@ -172,7 +172,7 @@ mod tests {
     #[test]
     fn participates_substring_match() {
         let mut c = cfg();
-        c.smart_symbol_chars = "。，".to_string();
+        c.symbol.smart_chars = "。，".to_string();
         assert!(participates(&c, "。"));
         assert!(!participates(&c, "！"));
         assert!(!participates(&c, ""));

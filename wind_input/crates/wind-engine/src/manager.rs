@@ -202,7 +202,7 @@ impl EngineManager {
             override_dir,
             primary_codetable: Mutex::new(primary_codetable),
             reverse_index: Mutex::new(None),
-            pinyin: Mutex::new(config.pinyin.clone()),
+            pinyin: Mutex::new(config.schema.pinyin.clone()),
             shuangpin_finals_cache: Mutex::new((String::new(), None)),
             build_locks: Mutex::new(HashMap::new()),
         };
@@ -742,7 +742,7 @@ impl EngineManager {
         *self.code_commit.lock().unwrap_or_else(|e| e.into_inner()) =
             config.input.code_commit.clone();
         // 全局拼音配置变更：更新缓存，引擎缓存随下方 clear() 一起失效，下次按新配置重建。
-        *self.pinyin.lock().unwrap_or_else(|e| e.into_inner()) = config.pinyin.clone();
+        *self.pinyin.lock().unwrap_or_else(|e| e.into_inner()) = config.schema.pinyin.clone();
         // 丢弃缓存：引擎按新上屏策略/词典重建，名称/词频按新方案重读。
         self.engines
             .lock()

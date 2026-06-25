@@ -341,7 +341,7 @@ impl ConfigBundle {
     fn build(config: Config) -> Self {
         let compiled_hotkeys = hotkey::Compiler::new(config.clone()).compile();
         let nav_keys =
-            keymap::NavKeys::from_config(&config.input.page_keys, &config.input.highlight_keys);
+            keymap::NavKeys::from_config(&config.keys.page_keys, &config.keys.highlight_keys);
         let cn_pairs = parse_pairs(&config.input.auto_pair.chinese_pairs);
         let en_pairs = parse_pairs(&config.input.auto_pair.english_pairs);
         Self {
@@ -623,10 +623,10 @@ impl Coordinator {
 
         // 简繁转换器：从 data/opencc 加载（变体来自配置，默认 s2t）
         let opencc_dir = data_dir.map(|d| d.join("opencc"));
-        let s2t_variant = if config.features.s2t.variant.is_empty() {
+        let s2t_variant = if config.input.s2t.variant.is_empty() {
             "s2t".to_string()
         } else {
-            config.features.s2t.variant.clone()
+            config.input.s2t.variant.clone()
         };
         let s2t = opencc_dir.as_ref().and_then(|dir| {
             let conv = wind_transform::s2t::Converter::load_variant(dir, &s2t_variant);
@@ -681,8 +681,8 @@ impl Coordinator {
         // 标点转换器：注入自定义映射（四状态）。
         let mut punct_conv = PunctuationConverter::new();
         punct_conv.set_custom_mappings(
-            config.input.punct_custom.enabled,
-            config.input.punct_custom.mappings.clone(),
+            config.input.punct.custom_enabled,
+            config.input.punct.custom_mappings.clone(),
         );
 
         // 编码显示方式运行时初值（config 移入结构体前先算）。
@@ -698,10 +698,10 @@ impl Coordinator {
         let stat_collector = store.clone().map(StatCollector::new);
         let coordinator = Arc::new(Self {
             state: Mutex::new(State {
-                chinese_mode: config.general.default_chinese_mode,
-                full_width: config.general.default_full_width,
-                chinese_punct: config.general.default_chinese_punct,
-                s2t_enabled: config.features.s2t.enabled,
+                chinese_mode: config.input.default.chinese_mode,
+                full_width: config.input.default.full_width,
+                chinese_punct: config.input.default.chinese_punct,
+                s2t_enabled: config.input.s2t.enabled,
                 filter_mode: wind_candidate::FilterMode::from_str(&config.input.filter_mode),
                 toolbar_visible: config.ui.toolbar.visible, // 启动初值来自配置(运行时可菜单切换)
                 ime_active: false, // 启动未激活：工具栏待 IME_ACTIVATED/FocusGained 才显示
@@ -1256,7 +1256,7 @@ impl Coordinator {
         let cand_cfg = &rt.config.ui.candidate;
         let tip_cfg = &rt.config.ui.tooltip;
         // 命令直通车候选前缀标注（features.cmdbar.candidate_prefix）：仅命令候选(is_command)显示。
-        let cmd_prefix = rt.config.features.cmdbar.candidate_prefix.as_str();
+        let cmd_prefix = rt.config.input.cmdbar.candidate_prefix.as_str();
         // 编码提示(反查):对拼音来源候选,用主码表真实反查索引填 comment(实际填充见下方候选构造,
         // 受 source==Pinyin 守卫)。门控两类:
         //  - 普通拼音/混输方案:跟随方案 show_code_hint(pinyin_show_code_hint 解析,混输取次方案);
@@ -1269,11 +1269,11 @@ impl Coordinator {
         );
         let pinyin_hint = force_hint || self.engine_mgr.pinyin_show_code_hint();
         let tip_opts = wind_reverse::TooltipOptions {
-            code: tip_cfg.code.enabled,
-            pinyin: tip_cfg.pinyin.enabled,
-            heteronyms: tip_cfg.pinyin.heteronyms,
-            max_readings: tip_cfg.pinyin.max_readings,
-            chaizi: tip_cfg.chaizi.enabled,
+            code: tip_cfg.code_enabled,
+            pinyin: tip_cfg.pinyin_enabled,
+            heteronyms: tip_cfg.pinyin_heteronyms,
+            max_readings: tip_cfg.pinyin_max_readings,
+            chaizi: tip_cfg.chaizi_enabled,
         };
         let items: Vec<CandidateItem> = state.candidates[start..end]
             .iter()
@@ -1282,7 +1282,7 @@ impl Coordinator {
                 // 反查提示用完整文本（截断只影响显示，不影响"如何输入"提示）
                 let full = self.maybe_s2t(state, &c.text);
                 let mut tooltip = self.reverse.tooltip_for(&full, &tip_opts);
-                if tip_cfg.debug.enabled {
+                if tip_cfg.debug_enabled {
                     let dbg = debug_tooltip_section(c);
                     if !dbg.is_empty() {
                         if !tooltip.is_empty() {
@@ -1572,7 +1572,7 @@ impl Coordinator {
     /// 在当前光标下方显示状态提示气泡（中英/标点/全半角/方案切换）
     pub(crate) fn show_tip(&self, text: &str) {
         let bundle = self.rt();
-        let si = &bundle.config.ui.status_indicator;
+        let si = &bundle.config.ui.status;
         // 禁用则完全不显示状态提示气泡。
         if !si.enabled {
             return;
@@ -1610,7 +1610,7 @@ impl Coordinator {
 
     /// 常驻(always)模式且启用时,显示当前合成状态(激活/获焦时调用)。temp 模式不在此显示。
     pub(crate) fn show_persistent_status_if_always(&self) {
-        let si = &self.rt().config.ui.status_indicator;
+        let si = &self.rt().config.ui.status;
         if si.enabled && si.display_mode.eq_ignore_ascii_case("always") {
             self.show_tip(&self.status_indicator_text());
         }
@@ -1638,7 +1638,7 @@ impl Coordinator {
         } else {
             let id = self.engine_mgr.active_schema_id();
             // short 样式优先图标短称(icon_label)，无则回退全名；对齐 Go schema_name_style。
-            let short = self.rt().config.ui.status_indicator.schema_name_style == "short";
+            let short = self.rt().config.ui.status.schema_name_style == "short";
             let label = if short {
                 let icon = self.engine_mgr.schema_icon_label(&id);
                 if icon.is_empty() {
@@ -1753,7 +1753,7 @@ impl Coordinator {
             return text;
         }
         let has_pending = !state.input_buffer.is_empty() || !state.committed_text.is_empty();
-        let commit = has_pending && !chinese && self.rt().config.hotkeys.commit_on_switch;
+        let commit = has_pending && !chinese && self.rt().config.keys.commit_on_switch;
         let text = if commit {
             // 切到英文且配置上屏：把「已转换前缀 + 剩余原码」一并上屏。
             let prefix = self.take_committed(state);
@@ -1798,7 +1798,7 @@ impl Coordinator {
             Some(c) => c,
             None => return,
         };
-        if !self.rt().config.features.stats.enabled {
+        if !self.rt().config.stats.enabled {
             return;
         }
         let (chinese, english, punct, other) = wind_store::stats::classify_chars_full(text);
@@ -1893,7 +1893,7 @@ impl MessageHandler for Coordinator {
             Some(c) => c,
             None => return,
         };
-        let cfg = &self.rt().config.features.stats;
+        let cfg = &self.rt().config.stats;
         if !cfg.enabled || !cfg.track_english {
             return;
         }
@@ -2069,7 +2069,7 @@ impl MessageHandler for Coordinator {
         // 普通输入累积时，若 input_buffer + 当前键字符 恰好等于某前缀（如 "www."/"http"），
         // 则夺取进入网址模式。置于主分派前，确保「补全前缀的那一键」（字母或 '.'）先被截获，
         // 不落入普通码表/标点处理。前缀按惯例小写，故探针用小写字母对齐 input_buffer。
-        if self.rt().config.input.url_input.enabled {
+        if self.rt().config.input.url.enabled {
             let shift = data.modifiers & MOD_SHIFT != 0;
             if let Some(ch) = printable_char(data.key_code, shift) {
                 let probe = format!("{}{}", state.input_buffer, ch.to_ascii_lowercase());
@@ -2594,7 +2594,7 @@ impl MessageHandler for Coordinator {
         state.chinese_mode = !state.chinese_mode;
         let chinese = state.chinese_mode;
         // 标点随中英文切换（对齐 Go）：开启 punct_follow_mode 时，标点中/英跟随当前模式。
-        if self.rt().config.input.punct_follow_mode {
+        if self.rt().config.input.punct.follow_mode {
             state.chinese_punct = chinese;
         }
         let commit_text = self.take_input_on_mode_switch(&mut state, chinese);
@@ -2612,7 +2612,7 @@ impl MessageHandler for Coordinator {
         let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
         state.chinese_mode = chinese_mode;
         // 标点随中英文切换（对齐 Go）：开启 punct_follow_mode 时，标点跟随模式。
-        if self.rt().config.input.punct_follow_mode {
+        if self.rt().config.input.punct.follow_mode {
             state.chinese_punct = chinese_mode;
         }
         let commit_text = self.take_input_on_mode_switch(&mut state, chinese_mode);
@@ -2737,10 +2737,10 @@ mod reload_tests {
     fn config_bundle_carries_config_values() {
         // 改配置 → 重建 bundle → bundle.config 反映新值（热重载替换后读取生效的基础）。
         let mut cfg = Config::default();
-        cfg.input.smart_symbol_mode = true;
+        cfg.input.symbol.smart_mode = true;
         cfg.ui.candidate.per_page = 9;
         let b = ConfigBundle::build(cfg);
-        assert!(b.config.input.smart_symbol_mode);
+        assert!(b.config.input.symbol.smart_mode);
         assert_eq!(b.config.ui.candidate.per_page, 9);
     }
 }

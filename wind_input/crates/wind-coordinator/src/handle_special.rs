@@ -17,7 +17,7 @@ impl Coordinator {
 
     /// 找出 key_code 匹配的特殊模式下标（按配置顺序先到先得；最多 256 个）。
     pub(crate) fn match_special_trigger(&self, key_code: u32) -> Option<u8> {
-        for (i, m) in self.rt().config.features.special_modes.iter().enumerate() {
+        for (i, m) in self.rt().config.schema.special_modes.iter().enumerate() {
             if i > u8::MAX as usize {
                 break;
             }
@@ -36,7 +36,7 @@ impl Coordinator {
     pub(crate) fn special_schema(&self, idx: u8) -> Option<String> {
         self.rt()
             .config
-            .features
+            .schema
             .special_modes
             .get(idx as usize)
             .map(|m| m.schema.clone())

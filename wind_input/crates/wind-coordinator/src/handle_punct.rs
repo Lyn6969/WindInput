@@ -41,7 +41,7 @@ impl Coordinator {
 
     /// 智能符号模式判定时限（非法值回退 500ms）。
     pub(crate) fn smart_symbol_timeout(&self) -> std::time::Duration {
-        let ms = self.rt().config.input.smart_symbol_timeout_ms;
+        let ms = self.rt().config.input.symbol.smart_timeout_ms;
         let ms = if ms <= 0 { 500 } else { ms };
         std::time::Duration::from_millis(ms as u64)
     }
@@ -110,7 +110,7 @@ impl Coordinator {
         ch: char,
         prev_char: u16,
     ) -> Option<KeyAction> {
-        if !self.rt().config.input.smart_symbol_mode {
+        if !self.rt().config.input.symbol.smart_mode {
             return None;
         }
         let mut arm = self.smart_symbol.lock().unwrap_or_else(|e| e.into_inner());

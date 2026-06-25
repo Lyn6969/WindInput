@@ -29,9 +29,9 @@ fn config_with(active: &str) -> Config {
     let mut cfg = Config::default();
     cfg.schema.available = vec!["wubi86".into(), "pinyin".into()];
     cfg.schema.active = active.into();
-    cfg.general.default_chinese_mode = true;
-    cfg.hotkeys.toggle_mode_keys = vec!["lshift".into(), "rshift".into()];
-    cfg.hotkeys.switch_engine = "ctrl+shift+e".into();
+    cfg.input.default.chinese_mode = true;
+    cfg.keys.toggle_mode_keys = vec!["lshift".into(), "rshift".into()];
+    cfg.keys.switch_engine = "ctrl+shift+e".into();
     cfg
 }
 
@@ -124,8 +124,8 @@ fn test_url_mode_enter_and_commit() {
     }
     // #11 网址输入：打满前缀 "www." 夺取进入网址模式，续打累积，空格上屏原文。
     let mut cfg = config_with("wubi86");
-    cfg.input.url_input.enabled = true;
-    cfg.input.url_input.prefixes = vec!["www.".into()];
+    cfg.input.url.enabled = true;
+    cfg.input.url.prefixes = vec!["www.".into()];
     let coord = Coordinator::new_headless(cfg, Some(&data_dir()));
 
     // w w w . → 进入网址模式（最后一键补满前缀）
@@ -248,7 +248,7 @@ fn test_overflow_number_key_commit_and_input() {
     }
     // overflow.number_key = "commit_and_input"：越界时顶字上屏高亮候选 + 追加数字字符。
     let mut cfg = config_with("wubi86");
-    cfg.input.overflow.number_key = "commit_and_input".into();
+    cfg.keys.overflow.number_key = "commit_and_input".into();
     let coord = Coordinator::new_headless(cfg, Some(&data_dir()));
     press_letter(&coord, 'a');
     let count = coord.debug_candidate_count();
@@ -1114,7 +1114,7 @@ fn config_mixed() -> Config {
     let mut cfg = Config::default();
     cfg.schema.available = vec!["wubi86_pinyin".into(), "wubi86".into(), "pinyin".into()];
     cfg.schema.active = "wubi86_pinyin".into();
-    cfg.general.default_chinese_mode = true;
+    cfg.input.default.chinese_mode = true;
     cfg
 }
 
@@ -1364,7 +1364,7 @@ fn test_overflow_select_key_commit() {
     }
     // overflow.select_key = "commit"：越界时只上屏当前高亮候选，不追加触发键字符。
     let mut cfg = config_with("wubi86");
-    cfg.input.overflow.select_key = "commit".into();
+    cfg.keys.overflow.select_key = "commit".into();
     let coord = Coordinator::new_headless(cfg, Some(&data_dir()));
     for c in "qqqq".chars() {
         press_letter(&coord, c);
@@ -1389,7 +1389,7 @@ fn test_overflow_select_key_commit_and_input() {
     }
     // overflow.select_key = "commit_and_input"：越界时上屏高亮候选 + 追加（转换后的）触发键字符。
     let mut cfg = config_with("wubi86");
-    cfg.input.overflow.select_key = "commit_and_input".into();
+    cfg.keys.overflow.select_key = "commit_and_input".into();
     let coord = Coordinator::new_headless(cfg, Some(&data_dir()));
     for c in "qqqq".chars() {
         press_letter(&coord, c);
@@ -1425,7 +1425,7 @@ fn test_semicolon_with_candidates_enters_mix_and_accepts_pinyin() {
     }
     // 隔离选词职责（select_key_groups 置空），专测「有候选 → 按 ; 顶字 + 进融合 → 可打拼音」。
     let mut cfg = config_with("wubi86");
-    cfg.input.select_key_groups = vec![];
+    cfg.keys.select_key_groups = vec![];
     let coord = Coordinator::new_headless(cfg, Some(&data_dir()));
     press_letter(&coord, 'a'); // 产生候选
     let texts = coord.debug_page_texts();
@@ -1499,7 +1499,7 @@ fn test_select_char_first_and_second() {
     }
     // 启用以词定字 comma_period：从当前高亮候选词逐字上屏。
     let mut cfg = config_with("pinyin");
-    cfg.input.select_char_keys = vec!["comma_period".into()];
+    cfg.keys.select_char_keys = vec!["comma_period".into()];
     let coord = Coordinator::new_headless(cfg, Some(&data_dir()));
     for c in "nihao".chars() {
         press_letter(&coord, c);
@@ -1562,7 +1562,7 @@ fn test_select_char_overflow_ignore_default() {
     }
     // 高亮词仅 1 字时按 `.`（取第 2 字）越界，默认 overflow.select_char_key = ignore → 吞键。
     let mut cfg = config_with("wubi86");
-    cfg.input.select_char_keys = vec!["comma_period".into()];
+    cfg.keys.select_char_keys = vec!["comma_period".into()];
     let coord = Coordinator::new_headless(cfg, Some(&data_dir()));
     for c in "qqqq".chars() {
         press_letter(&coord, c);
@@ -1586,8 +1586,8 @@ fn test_select_char_overflow_commit() {
     }
     // overflow.select_char_key = commit：越界时上屏当前高亮候选，不追加触发键字符。
     let mut cfg = config_with("wubi86");
-    cfg.input.select_char_keys = vec!["comma_period".into()];
-    cfg.input.overflow.select_char_key = "commit".into();
+    cfg.keys.select_char_keys = vec!["comma_period".into()];
+    cfg.keys.overflow.select_char_key = "commit".into();
     let coord = Coordinator::new_headless(cfg, Some(&data_dir()));
     for c in "qqqq".chars() {
         press_letter(&coord, c);
@@ -1612,8 +1612,8 @@ fn test_select_char_overflow_commit_and_input() {
     }
     // overflow.select_char_key = commit_and_input：越界时上屏高亮候选 + 追加转换后的触发键字符。
     let mut cfg = config_with("wubi86");
-    cfg.input.select_char_keys = vec!["comma_period".into()];
-    cfg.input.overflow.select_char_key = "commit_and_input".into();
+    cfg.keys.select_char_keys = vec!["comma_period".into()];
+    cfg.keys.overflow.select_char_key = "commit_and_input".into();
     let coord = Coordinator::new_headless(cfg, Some(&data_dir()));
     for c in "qqqq".chars() {
         press_letter(&coord, c);

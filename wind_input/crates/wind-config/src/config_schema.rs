@@ -5,7 +5,7 @@
 //! 对照（无孤立键）。CLI、core 端校验、设置 UI 均由此注册表派生，杜绝多份手写真相源漂移。
 //!
 //! 注：本注册表只描述 **config 类**（用户可改配置）；运行状态（state）与分发数据（data）不在此。
-//! 详见仓库根 `SETTINGS_REVAMP_PLAN.md` 的"数据三分准则"。
+//! 详见仓库根 `SETTINGS_REVAMP_PLAN.md` 的"数据三分准则"，键名映射见 `docs/config-key-migration.md`。
 
 use crate::config::Config;
 
@@ -49,77 +49,103 @@ use FieldType::{Bool, Enum, Float, Int, Map, Str, StrList, StructList};
 const OVERFLOW_VALUES: &[&str] = &["ignore", "commit", "commit_and_input"];
 
 /// 全部配置字段声明（单一真相源）。与 [`Config`] 经测试反向对照，保证零漂移。
+/// 域划分见 `docs/config-key-migration.md`（不做向后兼容，旧键已弃）。
 static REGISTRY: &[ConfigField] = &[
-    // ── general（基本/启动默认）──
-    f("general.remember_last_state", Bool),
-    f("general.default_chinese_mode", Bool),
-    f("general.default_full_width", Bool),
-    f("general.default_chinese_punct", Bool),
-    // ── schema（方案）──
+    // -- schema（方案 + 拼音 + 模式）--
     f("schema.active", Str),
     f("schema.available", StrList),
     f("schema.primary_codetable", Str),
     f("schema.primary_pinyin", Str),
-    // ── hotkeys（按键绑定）──
-    f("hotkeys.toggle_mode_keys", StrList),
-    f("hotkeys.commit_on_switch", Bool),
-    f("hotkeys.switch_engine", Str),
-    f("hotkeys.toggle_full_width", Str),
-    f("hotkeys.toggle_punct", Str),
-    f("hotkeys.toggle_toolbar", Str),
-    f("hotkeys.open_settings", Str),
-    f("hotkeys.add_word", Str),
-    f("hotkeys.toggle_s2t", Str),
-    f("hotkeys.activate_ime", Str),
-    f("hotkeys.pin_candidate", Str),
-    f("hotkeys.delete_candidate", Str),
-    f("hotkeys.global_hotkeys", StrList),
-    // ── input（输入行为）──
-    f("input.punct_follow_mode", Bool),
+    f("schema.pinyin.show_code_hint", Bool),
+    f("schema.pinyin.use_smart_compose", Bool),
+    f("schema.pinyin.candidate_order", Str),
+    f("schema.pinyin.separator", Str),
+    f("schema.pinyin.fuzzy.enabled", Bool),
+    f("schema.pinyin.fuzzy.zh_z", Bool),
+    f("schema.pinyin.fuzzy.ch_c", Bool),
+    f("schema.pinyin.fuzzy.sh_s", Bool),
+    f("schema.pinyin.fuzzy.n_l", Bool),
+    f("schema.pinyin.fuzzy.f_h", Bool),
+    f("schema.pinyin.fuzzy.r_l", Bool),
+    f("schema.pinyin.fuzzy.an_ang", Bool),
+    f("schema.pinyin.fuzzy.en_eng", Bool),
+    f("schema.pinyin.fuzzy.in_ing", Bool),
+    f("schema.pinyin.fuzzy.ian_iang", Bool),
+    f("schema.pinyin.fuzzy.uan_uang", Bool),
+    f("schema.quick_input.enabled", Bool),
+    f("schema.quick_input.decimal_places", Int),
+    f("schema.quick_input.force_vertical", Bool),
+    f("schema.special_modes", StructList),
+    f("schema.mix_modes", StructList),
+    // -- input（输入行为）--
     f("input.filter_mode", Str),
-    f("input.select_key_groups", StrList),
-    f("input.page_keys", StrList),
-    f("input.highlight_keys", StrList),
-    f("input.select_char_keys", StrList),
-    f("input.smart_punct_after_digit", Bool),
-    f("input.smart_punct_list", Str),
-    f("input.smart_symbol_mode", Bool),
-    f("input.smart_symbol_timeout_ms", Int),
-    f("input.smart_symbol_chars", Str),
     f("input.enter_behavior", Str),
     f("input.space_on_empty_behavior", Str),
     f("input.numpad_behavior", Str),
-    f("input.pinyin_separator", Str),
-    f("input.punct_custom.enabled", Bool),
-    f("input.punct_custom.mappings", Map),
+    // 启动默认状态（原 general 域）
+    f("input.default.remember_last_state", Bool),
+    f("input.default.chinese_mode", Bool),
+    f("input.default.full_width", Bool),
+    f("input.default.chinese_punct", Bool),
+    f("input.punct.follow_mode", Bool),
+    f("input.punct.smart_after_digit", Bool),
+    f("input.punct.smart_list", Str),
+    f("input.punct.custom_enabled", Bool),
+    f("input.punct.custom_mappings", Map),
+    f("input.symbol.smart_mode", Bool),
+    f("input.symbol.smart_timeout_ms", Int),
+    f("input.symbol.smart_chars", Str),
     f("input.auto_pair.chinese", Bool),
     f("input.auto_pair.english", Bool),
     f("input.auto_pair.chinese_pairs", StrList),
     f("input.auto_pair.english_pairs", StrList),
-    f("input.overflow.number_key", Enum(OVERFLOW_VALUES)),
-    f("input.overflow.select_key", Enum(OVERFLOW_VALUES)),
-    f("input.overflow.select_char_key", Enum(OVERFLOW_VALUES)),
-    f("input.shift_temp_english.enabled", Bool),
-    f("input.shift_temp_english.show_english_candidates", Bool),
+    f("input.temp_english.enabled", Bool),
+    f("input.temp_english.show_candidates", Bool),
     f(
-        "input.shift_temp_english.shift_behavior",
+        "input.temp_english.shift_behavior",
         Enum(&["temp_english", "direct_commit"]),
     ),
-    f("input.shift_temp_english.trigger_keys", StrList),
-    f("input.shift_temp_english.allow_symbols", Bool),
-    f("input.shift_temp_english.space_as_input", Bool),
+    f("input.temp_english.trigger_keys", StrList),
+    f("input.temp_english.allow_symbols", Bool),
+    f("input.temp_english.space_as_input", Bool),
     f("input.capslock.cancel_on_mode_switch", Bool),
     f("input.temp_pinyin.trigger_keys", StrList),
-    f("input.url_input.enabled", Bool),
-    f("input.url_input.prefixes", StrList),
+    f("input.url.enabled", Bool),
+    f("input.url.prefixes", StrList),
     f("input.code_commit.auto_commit_at_full", Bool),
     f("input.code_commit.auto_commit_min_len", Int),
     f("input.code_commit.clear_on_empty_max", Bool),
     f("input.code_commit.top_code_commit", Bool),
     f("input.code_commit.auto_commit_block_on_pinyin", Bool),
-    f("input.phrase.min_prefix_length", Int),
+    f("input.s2t.enabled", Bool),
+    f("input.s2t.variant", Str),
+    f("input.cmdbar.enabled", Bool),
+    f("input.cmdbar.candidate_prefix", Str),
+    // 短语前缀列举（原 dict.phrase）
+    f("input.phrase.min_prefix", Int),
     f("input.phrase.max_display_chars", Int),
-    // ── ui（外观）──
+    // -- keys（全部按键，扁平；overflow 保留一层）--
+    f("keys.toggle_mode_keys", StrList),
+    f("keys.commit_on_switch", Bool),
+    f("keys.switch_engine", Str),
+    f("keys.toggle_full_width", Str),
+    f("keys.toggle_punct", Str),
+    f("keys.toggle_toolbar", Str),
+    f("keys.open_settings", Str),
+    f("keys.add_word", Str),
+    f("keys.toggle_s2t", Str),
+    f("keys.activate_ime", Str),
+    f("keys.pin_candidate", Str),
+    f("keys.delete_candidate", Str),
+    f("keys.global_hotkeys", StrList),
+    f("keys.select_key_groups", StrList),
+    f("keys.page_keys", StrList),
+    f("keys.highlight_keys", StrList),
+    f("keys.select_char_keys", StrList),
+    f("keys.overflow.number_key", Enum(OVERFLOW_VALUES)),
+    f("keys.overflow.select_key", Enum(OVERFLOW_VALUES)),
+    f("keys.overflow.select_char_key", Enum(OVERFLOW_VALUES)),
+    // -- ui（外观）--
     f("ui.candidate.per_page", Int),
     f("ui.candidate.per_page_extended", Int),
     f("ui.candidate.layout", Enum(&["horizontal", "vertical"])),
@@ -148,68 +174,33 @@ static REGISTRY: &[ConfigField] = &[
     f("ui.theme.style", Str),
     f("ui.mode_indicator.style", Enum(&["short", "full", "none"])),
     f("ui.tooltip.delay", Int),
-    f("ui.tooltip.code.enabled", Bool),
-    f("ui.tooltip.pinyin.enabled", Bool),
-    f("ui.tooltip.pinyin.heteronyms", Bool),
-    f("ui.tooltip.pinyin.max_readings", Int),
-    f("ui.tooltip.chaizi.enabled", Bool),
-    f("ui.tooltip.debug.enabled", Bool),
-    f("ui.status_indicator.enabled", Bool),
-    f("ui.status_indicator.duration", Int),
-    f(
-        "ui.status_indicator.display_mode",
-        Enum(&["temp", "always"]),
-    ),
-    f(
-        "ui.status_indicator.schema_name_style",
-        Enum(&["full", "short"]),
-    ),
-    f(
-        "ui.status_indicator.position_mode",
-        Enum(&["follow_caret", "fixed"]),
-    ),
-    f("ui.status_indicator.offset_x", Int),
-    f("ui.status_indicator.offset_y", Int),
-    f("ui.status_indicator.custom_x", Int),
-    f("ui.status_indicator.custom_y", Int),
+    f("ui.tooltip.code_enabled", Bool),
+    f("ui.tooltip.pinyin_enabled", Bool),
+    f("ui.tooltip.pinyin_heteronyms", Bool),
+    f("ui.tooltip.pinyin_max_readings", Int),
+    f("ui.tooltip.chaizi_enabled", Bool),
+    f("ui.tooltip.debug_enabled", Bool),
+    f("ui.status.enabled", Bool),
+    f("ui.status.duration", Int),
+    f("ui.status.display_mode", Enum(&["temp", "always"])),
+    f("ui.status.schema_name_style", Enum(&["full", "short"])),
+    f("ui.status.position_mode", Enum(&["follow_caret", "fixed"])),
+    f("ui.status.offset_x", Int),
+    f("ui.status.offset_y", Int),
+    f("ui.status.custom_x", Int),
+    f("ui.status.custom_y", Int),
     f("ui.toolbar.visible", Bool),
     f("ui.toolbar.hide_in_fullscreen", Bool),
-    // ── features（功能）──
-    f("features.stats.enabled", Bool),
-    f("features.stats.track_english", Bool),
-    f("features.s2t.enabled", Bool),
-    f("features.s2t.variant", Str),
-    f("features.quick_input.enabled", Bool),
-    f("features.quick_input.decimal_places", Int),
-    f("features.quick_input.force_vertical", Bool),
-    f("features.cmdbar.enabled", Bool),
-    f("features.cmdbar.candidate_prefix", Str),
-    f("features.special_modes", StructList),
-    f("features.mix_modes", StructList),
-    // ── compat（兼容）──
+    // -- stats（统计，原 features.stats 升顶级）--
+    f("stats.enabled", Bool),
+    f("stats.track_english", Bool),
+    // -- compat（兼容）--
     f("compat.host_render_processes", StrList),
-    // ── debug（调试）──
+    // -- debug（调试）--
     f(
         "debug.log_level",
         Enum(&["trace", "debug", "info", "warn", "error"]),
     ),
-    f("debug.perf_sampling", Bool),
-    // ── pinyin（全局拼音）──
-    f("pinyin.show_code_hint", Bool),
-    f("pinyin.use_smart_compose", Bool),
-    f("pinyin.candidate_order", Str),
-    f("pinyin.fuzzy.enabled", Bool),
-    f("pinyin.fuzzy.zh_z", Bool),
-    f("pinyin.fuzzy.ch_c", Bool),
-    f("pinyin.fuzzy.sh_s", Bool),
-    f("pinyin.fuzzy.n_l", Bool),
-    f("pinyin.fuzzy.f_h", Bool),
-    f("pinyin.fuzzy.r_l", Bool),
-    f("pinyin.fuzzy.an_ang", Bool),
-    f("pinyin.fuzzy.en_eng", Bool),
-    f("pinyin.fuzzy.in_ing", Bool),
-    f("pinyin.fuzzy.ian_iang", Bool),
-    f("pinyin.fuzzy.uan_uang", Bool),
 ];
 
 /// 返回配置字段注册表。
@@ -327,7 +318,7 @@ pub fn validate(key: &str, value: &toml::Value) -> Result<(), ValidateError> {
 /// 把 TOML 值展开为点分叶子键列表。
 ///
 /// 规则：递归进入**非空表**；标量、数组、**空表**（如空 HashMap）均视为叶子。
-/// 故 `[ui.candidate]`（非空表）会下钻，而 `input.punct_custom.mappings = {}`（空表）作叶子保留。
+/// 故 `[ui.candidate]`（非空表）会下钻，而 `input.punct.custom_mappings = {}`（空表）作叶子保留。
 fn collect_leaf_keys(prefix: &str, value: &toml::Value, out: &mut Vec<String>) {
     match value {
         toml::Value::Table(t) if !t.is_empty() => {
@@ -407,18 +398,18 @@ mod tests {
         assert!(keys.contains("ui.candidate.per_page"), "应含标量叶子");
         // 嵌套标量
         assert!(
-            keys.contains("input.overflow.number_key"),
+            keys.contains("keys.overflow.number_key"),
             "应含嵌套标量叶子"
         );
         // 空 HashMap 作叶子保留
         assert!(
-            keys.contains("input.punct_custom.mappings"),
-            "空表(mappings)应作叶子保留"
+            keys.contains("input.punct.custom_mappings"),
+            "空表(custom_mappings)应作叶子保留"
         );
         // 数组作叶子（不下钻元素）
         assert!(keys.contains("schema.available"), "数组应作叶子");
         assert!(
-            keys.contains("features.mix_modes"),
+            keys.contains("schema.mix_modes"),
             "结构体数组应作单一叶子，不展开元素"
         );
         // 中间表不应作为叶子出现
@@ -492,7 +483,7 @@ mod tests {
         let f = field("ui.candidate.layout").expect("已登记键应查到");
         assert_eq!(f.key, "ui.candidate.layout");
         assert!(matches!(f.ty, FieldType::Enum(_)));
-        assert!(is_known_key("input.overflow.number_key"));
+        assert!(is_known_key("keys.overflow.number_key"));
         assert!(!is_known_key("ui.candidate.bogus"), "未登记键应返回 None");
         assert!(!is_known_key("totally.made.up"));
     }

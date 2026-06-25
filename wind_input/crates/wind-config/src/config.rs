@@ -2,6 +2,10 @@
 //!
 //! 与 Go 版本 `wind_input/pkg/config/config.go` 对齐。
 //! 配置文件为 TOML 格式，三层合并：默认值 → data/config.toml → %APPDATA%/WindInput/config.toml
+//!
+//! 顶级域（"正交大类"准则，详见 SETTINGS_REVAMP_PLAN.md / docs/config-key-migration.md）：
+//! schema(方案+pinyin+模式) / input(输入行为，含 default 启动默认 / phrase 短语) /
+//! keys(全部按键) / ui(外观) / stats(统计) / compat / debug。
 
 use anyhow::Context;
 use serde::{Deserialize, Serialize};
@@ -51,49 +55,49 @@ fn set_nested(table: &mut toml::Table, path: &[&str], value: toml::Value) {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
     #[serde(default)]
-    pub general: GeneralConfig,
-    #[serde(default)]
     pub schema: SchemaConfig,
-    #[serde(default)]
-    pub hotkeys: HotkeysConfig,
     #[serde(default)]
     pub input: InputConfig,
     #[serde(default)]
+    pub keys: KeysConfig,
+    #[serde(default)]
     pub ui: UiConfig,
     #[serde(default)]
-    pub features: FeaturesConfig,
+    pub stats: StatsConfig,
     #[serde(default)]
     pub compat: CompatConfig,
     #[serde(default)]
     pub debug: DebugConfig,
-    #[serde(default)]
-    pub pinyin: PinyinGlobalConfig,
 }
 
+// ──────────────── input.default（启动默认状态，原 general 域）────────────────
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct GeneralConfig {
+pub struct InputDefaultConfig {
     #[serde(default = "default_true")]
     pub remember_last_state: bool,
     #[serde(default = "default_true")]
-    pub default_chinese_mode: bool,
+    pub chinese_mode: bool,
     #[serde(default)]
-    pub default_full_width: bool,
+    pub full_width: bool,
     #[serde(default = "default_true")]
-    pub default_chinese_punct: bool,
+    pub chinese_punct: bool,
 }
 
-impl Default for GeneralConfig {
+impl Default for InputDefaultConfig {
     fn default() -> Self {
         Self {
             remember_last_state: false,
-            default_chinese_mode: true,
-            default_full_width: false,
-            default_chinese_punct: true,
+            chinese_mode: true,
+            full_width: false,
+            chinese_punct: true,
         }
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
+// ───────────────────────── schema（方案 + 拼音 + 模式）─────────────────────────
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct SchemaConfig {
     #[serde(default)]
     pub active: String,
@@ -103,229 +107,308 @@ pub struct SchemaConfig {
     pub primary_codetable: String,
     #[serde(default)]
     pub primary_pinyin: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct HotkeysConfig {
-    #[serde(default = "default_toggle_mode_keys")]
-    pub toggle_mode_keys: Vec<String>,
-    #[serde(default = "default_true")]
-    pub commit_on_switch: bool,
-    #[serde(default = "default_switch_engine")]
-    pub switch_engine: String,
-    #[serde(default = "default_toggle_full_width")]
-    pub toggle_full_width: String,
-    #[serde(default = "default_toggle_punct")]
-    pub toggle_punct: String,
-    #[serde(default = "default_hotkey_none")]
-    pub toggle_toolbar: String,
-    #[serde(default = "default_hotkey_none")]
-    pub open_settings: String,
-    #[serde(default = "default_add_word")]
-    pub add_word: String,
-    #[serde(default = "default_toggle_s2t")]
-    pub toggle_s2t: String,
-    #[serde(default = "default_activate_ime")]
-    pub activate_ime: String,
-    #[serde(default = "default_pin_candidate")]
-    pub pin_candidate: String,
-    #[serde(default = "default_delete_candidate")]
-    pub delete_candidate: String,
+    /// 全局拼音配置（所有拼音类方案共用：全拼/双拼/混输拼音子方案/临时拼音反查）。
     #[serde(default)]
-    pub global_hotkeys: Vec<String>,
+    pub pinyin: PinyinGlobalConfig,
+    /// 快捷输入（日期/计算等内置类方案）配置。将随"英文/快捷做成方案"一并重构。
+    #[serde(default)]
+    pub quick_input: QuickInputConfig,
+    /// 特殊模式列表（各自带码表 + 上屏策略；引导键触发）。
+    #[serde(default)]
+    pub special_modes: Vec<SpecialModeConfig>,
+    /// 临时 mix 模式列表（引导键触发，合并多个成员方案的候选）。
+    #[serde(default = "default_mix_modes")]
+    pub mix_modes: Vec<MixModeConfig>,
 }
 
-// 热键默认值对齐 Go 版 DefaultConfig.Hotkeys（wind_input/pkg/config/config.go）。
-// 关键：config.getDefaults 走 toml::from_str("")，[hotkeys] 整表缺失时用 Default::default()，
-// 故必须手写 Default（而非 derive 的空值），否则设置页"开关后默认键丢失"(#4)。
-fn default_toggle_mode_keys() -> Vec<String> {
-    vec!["lshift".to_string(), "rshift".to_string()]
-}
-fn default_switch_engine() -> String {
-    "ctrl+shift+e".to_string()
-}
-fn default_toggle_full_width() -> String {
-    "shift+space".to_string()
-}
-fn default_toggle_punct() -> String {
-    "ctrl+.".to_string()
-}
-fn default_add_word() -> String {
-    "ctrl+equal".to_string()
-}
-fn default_toggle_s2t() -> String {
-    "ctrl+shift+j".to_string()
-}
-fn default_activate_ime() -> String {
-    "ctrl+shift+[".to_string()
-}
-fn default_pin_candidate() -> String {
-    "ctrl+number".to_string()
-}
-fn default_delete_candidate() -> String {
-    "ctrl+shift+number".to_string()
-}
-fn default_hotkey_none() -> String {
-    "none".to_string()
-}
-
-impl Default for HotkeysConfig {
+impl Default for SchemaConfig {
     fn default() -> Self {
         Self {
-            toggle_mode_keys: default_toggle_mode_keys(),
-            commit_on_switch: true,
-            switch_engine: default_switch_engine(),
-            toggle_full_width: default_toggle_full_width(),
-            toggle_punct: default_toggle_punct(),
-            toggle_toolbar: default_hotkey_none(),
-            open_settings: default_hotkey_none(),
-            add_word: default_add_word(),
-            toggle_s2t: default_toggle_s2t(),
-            activate_ime: default_activate_ime(),
-            pin_candidate: default_pin_candidate(),
-            delete_candidate: default_delete_candidate(),
-            global_hotkeys: Vec::new(),
+            active: String::new(),
+            available: Vec::new(),
+            primary_codetable: String::new(),
+            primary_pinyin: String::new(),
+            pinyin: PinyinGlobalConfig::default(),
+            quick_input: QuickInputConfig::default(),
+            special_modes: Vec::new(),
+            mix_modes: default_mix_modes(),
         }
     }
 }
 
+/// 全局拼音配置（[schema.pinyin]）。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PinyinGlobalConfig {
+    #[serde(default = "default_true")]
+    pub show_code_hint: bool,
+    #[serde(default = "default_true")]
+    pub use_smart_compose: bool,
+    #[serde(default = "default_candidate_order")]
+    pub candidate_order: String,
+    /// 拼音分隔策略（"auto" 等）。原 input.pinyin_separator 收拢至此。
+    #[serde(default = "default_pinyin_separator")]
+    pub separator: String,
+    #[serde(default)]
+    pub fuzzy: PinyinFuzzy,
+}
+
+fn default_candidate_order() -> String {
+    "smart".to_string()
+}
+
+impl Default for PinyinGlobalConfig {
+    fn default() -> Self {
+        Self {
+            show_code_hint: true,
+            use_smart_compose: true,
+            candidate_order: "smart".to_string(),
+            separator: default_pinyin_separator(),
+            fuzzy: PinyinFuzzy::default(),
+        }
+    }
+}
+
+/// 全局模糊音（[schema.pinyin.fuzzy]）。字段对齐引擎 FuzzyConfig。
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PinyinFuzzy {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default)]
+    pub zh_z: bool,
+    #[serde(default)]
+    pub ch_c: bool,
+    #[serde(default)]
+    pub sh_s: bool,
+    #[serde(default)]
+    pub n_l: bool,
+    #[serde(default)]
+    pub f_h: bool,
+    #[serde(default)]
+    pub r_l: bool,
+    #[serde(default)]
+    pub an_ang: bool,
+    #[serde(default)]
+    pub en_eng: bool,
+    #[serde(default)]
+    pub in_ing: bool,
+    #[serde(default)]
+    pub ian_iang: bool,
+    #[serde(default)]
+    pub uan_uang: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct QuickInputConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    /// 计算器结果小数位数，默认 6
+    #[serde(default = "default_decimal_places")]
+    pub decimal_places: i32,
+    /// 强制竖排显示：进入快捷输入时切竖排候选，退出恢复原布局。
+    #[serde(default)]
+    pub force_vertical: bool,
+}
+
+fn default_decimal_places() -> i32 {
+    6
+}
+
+impl Default for QuickInputConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            decimal_places: default_decimal_places(),
+            force_vertical: false,
+        }
+    }
+}
+
+/// 临时 mix 模式配置（overlay 激活面）。触发后对每个成员方案查询并按成员序合并候选。
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
+pub struct MixModeConfig {
+    /// 实例唯一标识
+    #[serde(default)]
+    pub id: String,
+    /// 显示名（UI 徽标 / 模式指示全称）
+    #[serde(default)]
+    pub name: String,
+    /// 模式指示短称（空则取 name 首字）
+    #[serde(default)]
+    pub short_name: String,
+    /// 引导键列表
+    #[serde(default)]
+    pub trigger_keys: Vec<String>,
+    /// 成员方案 id 列表（按序合并候选；如 ["pinyin", "quick_symbols"]）
+    #[serde(default)]
+    pub members: Vec<String>,
+}
+
+fn default_mix_modes() -> Vec<MixModeConfig> {
+    vec![MixModeConfig {
+        id: "quick_mix".to_string(),
+        name: "快捷".to_string(),
+        short_name: "快".to_string(),
+        trigger_keys: vec!["semicolon".to_string()],
+        members: vec![
+            "quick_input".to_string(),
+            "pinyin".to_string(),
+            "english".to_string(),
+        ],
+    }]
+}
+
+/// 特殊模式配置（纯 overlay 激活面）。引擎/码表配置拉平到其引用的真实方案
+/// `<schema>.schema.toml`，全码策略复用方案的 [engine.codetable]。
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
+pub struct SpecialModeConfig {
+    /// 实例唯一标识
+    #[serde(default)]
+    pub id: String,
+    /// 显示名（UI 徽标 / 模式指示全称，如 "快符"）
+    #[serde(default)]
+    pub name: String,
+    /// 模式指示短称（如 "符"；空则取 name 首字）
+    #[serde(default)]
+    pub short_name: String,
+    /// 引导键列表（如 "grave"/"backslash"/"z"）
+    #[serde(default)]
+    pub trigger_keys: Vec<String>,
+    /// 引用的方案 id（其 .schema.toml 提供码表与全码策略；不进 schema.available，仅 overlay 触发懒加载）
+    #[serde(default)]
+    pub schema: String,
+}
+
+// ───────────────────────── input（输入行为）─────────────────────────
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct InputConfig {
-    #[serde(default)]
-    pub punct_follow_mode: bool,
     #[serde(default = "default_filter_mode")]
     pub filter_mode: String,
-    #[serde(default)]
-    pub select_key_groups: Vec<String>,
-    #[serde(default)]
-    pub page_keys: Vec<String>,
-    #[serde(default)]
-    pub highlight_keys: Vec<String>,
-    #[serde(default)]
-    pub select_char_keys: Vec<String>,
-    #[serde(default = "default_true")]
-    pub smart_punct_after_digit: bool,
-    #[serde(default = "default_smart_punct_list")]
-    pub smart_punct_list: String,
-    /// 智能符号模式：同一中文标点在时限内连按两次，删前一字符替换为英文（默认 false）
-    #[serde(default)]
-    pub smart_symbol_mode: bool,
-    /// 智能符号模式判定时限（毫秒，默认 500）
-    #[serde(default = "default_smart_symbol_timeout_ms")]
-    pub smart_symbol_timeout_ms: i32,
-    /// 参与智能符号转换的中文标点集合（子串包含匹配，含成对/多字符标点）
-    #[serde(default = "default_smart_symbol_chars")]
-    pub smart_symbol_chars: String,
-    /// 自定义标点映射（四状态：中半/英全/中全/英半）
-    #[serde(default)]
-    pub punct_custom: PunctCustomConfig,
-    /// 标点配对（输入左括号自动补右括号 + 输右括号智能跳过）
-    #[serde(default)]
-    pub auto_pair: AutoPairConfig,
-    /// 候选无效按键策略（数字键/次选三选键/以词定字键超出候选范围时的处理）
-    #[serde(default)]
-    pub overflow: OverflowConfig,
     #[serde(default = "default_enter_behavior")]
     pub enter_behavior: String,
     #[serde(default = "default_space_behavior")]
     pub space_on_empty_behavior: String,
     #[serde(default)]
     pub numpad_behavior: String,
-    #[serde(default = "default_pinyin_separator")]
-    pub pinyin_separator: String,
+    /// 启动默认状态（记住上次状态 / 默认中文 / 全角 / 中文标点；原 general 域）。
     #[serde(default)]
-    pub shift_temp_english: ShiftTempEnglishConfig,
+    pub default: InputDefaultConfig,
+    /// 标点相关（随中英、智能标点、自定义映射）。
+    #[serde(default)]
+    pub punct: PunctConfig,
+    /// 智能符号模式。
+    #[serde(default)]
+    pub symbol: SymbolConfig,
+    /// 标点配对（输入左括号自动补右括号 + 输右括号智能跳过）。
+    #[serde(default)]
+    pub auto_pair: AutoPairConfig,
+    /// 临时英文（Shift+字母 / 触发键进入临英缓冲）。
+    #[serde(default)]
+    pub temp_english: TempEnglishConfig,
     #[serde(default)]
     pub capslock: CapslockConfig,
+    /// 临时拼音（码表方案下临时切到拼音反查）。
     #[serde(default)]
     pub temp_pinyin: TempPinyinConfig,
+    /// 网址输入模式。
     #[serde(default)]
-    pub url_input: UrlInputConfig,
-    /// 全码/空码上屏策略的全局默认（方案级 [engine.codetable] 的 tri-state 字段未设时回退至此）
+    pub url: UrlConfig,
+    /// 全码/空码上屏策略的全局默认（方案级 [engine.codetable] 的 tri-state 字段未设时回退至此）。
     #[serde(default)]
     pub code_commit: CodeCommitConfig,
-    /// 短语（含命令栏 $CC/$SS/$AA）前缀列举配置
+    /// 简繁转换（上屏文字变换）。原 features.s2t。
+    #[serde(default)]
+    pub s2t: S2TConfig,
+    /// 命令栏（$CC/$SS/$AA 等命令候选）。原 features.cmdbar。
+    #[serde(default)]
+    pub cmdbar: CmdbarConfig,
+    /// 短语前缀列举（含命令栏 $CC/$SS/$AA）。原 dict.phrase / Go input.phrase。
     #[serde(default)]
     pub phrase: PhraseConfig,
 }
 
-/// 短语前缀列举配置（对齐 Go `input.phrase`）。
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct PhraseConfig {
-    /// 触发前缀导航列举的最小输入长度（敲 `zz`/`co` 等前缀列出匹配短语；
-    /// < 该长度不列举，避免单字符噪音）。默认 2。
-    #[serde(default = "default_phrase_min_prefix")]
-    pub min_prefix_length: usize,
-    /// 短语/命令候选显示文本的最大字符数（超出截断加省略号，换行/制表统一转空格）。
-    /// 防 `clip()`/`last()` 等注入超长/多行内容把候选列撑爆（如 coad 的 `{clip()}`）。
-    /// 0 表示不限制。默认 30。
-    #[serde(default = "default_phrase_max_display_chars")]
-    pub max_display_chars: usize,
-}
-
-impl Default for PhraseConfig {
+impl Default for InputConfig {
     fn default() -> Self {
         Self {
-            min_prefix_length: default_phrase_min_prefix(),
-            max_display_chars: default_phrase_max_display_chars(),
+            filter_mode: "smart".to_string(),
+            enter_behavior: "commit".to_string(),
+            space_on_empty_behavior: "commit".to_string(),
+            numpad_behavior: String::new(),
+            default: InputDefaultConfig::default(),
+            punct: PunctConfig::default(),
+            symbol: SymbolConfig::default(),
+            auto_pair: AutoPairConfig::default(),
+            temp_english: TempEnglishConfig::default(),
+            capslock: CapslockConfig::default(),
+            temp_pinyin: TempPinyinConfig::default(),
+            url: UrlConfig::default(),
+            code_commit: CodeCommitConfig::default(),
+            s2t: S2TConfig::default(),
+            cmdbar: CmdbarConfig::default(),
+            phrase: PhraseConfig::default(),
         }
     }
 }
 
-fn default_phrase_min_prefix() -> usize {
-    2
-}
-
-fn default_phrase_max_display_chars() -> usize {
-    30
-}
-
-/// 全码/空码上屏策略全局默认（对齐方案级 [engine.codetable] 同名字段）。
-/// 解析顺序：方案级 Some > 本全局 > 内置默认。放在 `config.toml`（用户可合并），
-/// 使非主方案/未单独配置的方案统一吃全局，且无需改只读安装目录的 schema。
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct CodeCommitConfig {
-    /// 全码自动上屏（唯一精确 + 无更长后继时直接上屏）
-    #[serde(default)]
-    pub auto_commit_at_full: bool,
-    /// 自动上屏最短码长（0 跟随方案 max_code_length）
-    #[serde(default)]
-    pub auto_commit_min_len: usize,
-    /// 满码无候选时清空缓冲
-    #[serde(default)]
-    pub clear_on_empty_max: bool,
-    /// 超过满码长时取前 N 码顶字上屏
-    #[serde(default)]
-    pub top_code_commit: bool,
-    /// 混输全码上屏时，存在拼音候选则否决（保护拼音用户）
-    #[serde(default = "default_true")]
-    pub auto_commit_block_on_pinyin: bool,
-}
-
-impl Default for CodeCommitConfig {
-    fn default() -> Self {
-        Self {
-            auto_commit_at_full: false,
-            auto_commit_min_len: 0,
-            clear_on_empty_max: false,
-            top_code_commit: false,
-            auto_commit_block_on_pinyin: true,
-        }
-    }
-}
-
-/// 自定义标点映射配置（对齐 Go PunctCustomConfig）。
-/// `mappings`: key=源字符（引号用 `"1`/`"2`/`'1`/`'2` 区分左右），
+/// 标点配置（[input.punct]）：随中英、智能标点、自定义映射。
+/// `custom_mappings`: key=源字符（引号用 `"1`/`"2`/`'1`/`'2` 区分左右），
 /// value=`[中文半角, 英文全角, 中文全角, 英文半角]`（空串/缺列=回退默认转换）。
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
-pub struct PunctCustomConfig {
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PunctConfig {
+    /// 标点随中英模式切换。
     #[serde(default)]
-    pub enabled: bool,
+    pub follow_mode: bool,
+    /// 数字后的标点智能直出英文。
+    #[serde(default = "default_true")]
+    pub smart_after_digit: bool,
+    /// 参与"数字后智能英文标点"的标点集合。
+    #[serde(default = "default_smart_punct_list")]
+    pub smart_list: String,
+    /// 自定义标点映射开关。
     #[serde(default)]
-    pub mappings: HashMap<String, Vec<String>>,
+    pub custom_enabled: bool,
+    /// 自定义标点映射表（四状态：中半/英全/中全/英半）。
+    #[serde(default)]
+    pub custom_mappings: HashMap<String, Vec<String>>,
 }
 
-/// 标点配对配置（对齐 Go AutoPairConfig）
+impl Default for PunctConfig {
+    fn default() -> Self {
+        Self {
+            follow_mode: false,
+            smart_after_digit: true,
+            smart_list: default_smart_punct_list(),
+            custom_enabled: false,
+            custom_mappings: HashMap::new(),
+        }
+    }
+}
+
+/// 智能符号配置（[input.symbol]）：同一中文标点在时限内连按两次，删前一字符替换为英文。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SymbolConfig {
+    /// 智能符号模式总开关（默认 false）。
+    #[serde(default)]
+    pub smart_mode: bool,
+    /// 判定时限（毫秒，默认 500）。
+    #[serde(default = "default_smart_symbol_timeout_ms")]
+    pub smart_timeout_ms: i32,
+    /// 参与智能符号转换的中文标点集合（子串包含匹配，含成对/多字符标点）。
+    #[serde(default = "default_smart_symbol_chars")]
+    pub smart_chars: String,
+}
+
+impl Default for SymbolConfig {
+    fn default() -> Self {
+        Self {
+            smart_mode: false,
+            smart_timeout_ms: default_smart_symbol_timeout_ms(),
+            smart_chars: default_smart_symbol_chars(),
+        }
+    }
+}
+
+/// 标点配对配置（[input.auto_pair]，对齐 Go AutoPairConfig）
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AutoPairConfig {
     /// 中文标点配对开关
@@ -364,7 +447,45 @@ fn default_english_pairs() -> Vec<String> {
     ["()", "[]", "{}"].iter().map(|s| s.to_string()).collect()
 }
 
-/// 临时拼音配置（码表方案下临时切到拼音反查）
+/// 临时英文配置（[input.temp_english]，原 input.shift_temp_english）。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TempEnglishConfig {
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    /// 显示英文候选（原 show_english_candidates）。
+    #[serde(default = "default_true")]
+    pub show_candidates: bool,
+    #[serde(default = "default_shift_behavior")]
+    pub shift_behavior: String,
+    /// 触发键（符号键进入临时英文模式，类似临时拼音触发键）。默认空（仅 Shift+字母触发）。
+    #[serde(default)]
+    pub trigger_keys: Vec<String>,
+    #[serde(default)]
+    pub allow_symbols: bool,
+    #[serde(default)]
+    pub space_as_input: bool,
+}
+
+impl Default for TempEnglishConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            show_candidates: true,
+            shift_behavior: "temp_english".to_string(),
+            trigger_keys: Vec::new(),
+            allow_symbols: false,
+            space_as_input: false,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct CapslockConfig {
+    #[serde(default)]
+    pub cancel_on_mode_switch: bool,
+}
+
+/// 临时拼音配置（[input.temp_pinyin]）。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TempPinyinConfig {
     /// 触发键（如 "backtick" / "z" / "semicolon"），默认反引号
@@ -384,11 +505,9 @@ impl Default for TempPinyinConfig {
     }
 }
 
-/// 网址模式配置（对齐 Go UrlInputConfig）。
-/// 普通输入累积时，若 `input_buffer + 当前键字符` 恰好等于某前缀，则夺取进入网址模式：
-/// 后续可见 ASCII 字符原样累积，空格/回车上屏原文，退格删空退出。
+/// 网址模式配置（[input.url]，原 input.url_input）。
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct UrlInputConfig {
+pub struct UrlConfig {
     /// 总开关（默认关闭）
     #[serde(default)]
     pub enabled: bool,
@@ -407,7 +526,7 @@ fn default_url_prefixes() -> Vec<String> {
     ]
 }
 
-impl Default for UrlInputConfig {
+impl Default for UrlConfig {
     fn default() -> Self {
         Self {
             enabled: false,
@@ -416,7 +535,183 @@ impl Default for UrlInputConfig {
     }
 }
 
-/// 候选无效按键策略（对齐 Go OverflowConfig）。
+/// 全码/空码上屏策略全局默认（对齐方案级 [engine.codetable] 同名字段）。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CodeCommitConfig {
+    /// 全码自动上屏（唯一精确 + 无更长后继时直接上屏）
+    #[serde(default)]
+    pub auto_commit_at_full: bool,
+    /// 自动上屏最短码长（0 跟随方案 max_code_length）
+    #[serde(default)]
+    pub auto_commit_min_len: usize,
+    /// 满码无候选时清空缓冲
+    #[serde(default)]
+    pub clear_on_empty_max: bool,
+    /// 超过满码长时取前 N 码顶字上屏
+    #[serde(default)]
+    pub top_code_commit: bool,
+    /// 混输全码上屏时，存在拼音候选则否决（保护拼音用户）
+    #[serde(default = "default_true")]
+    pub auto_commit_block_on_pinyin: bool,
+}
+
+impl Default for CodeCommitConfig {
+    fn default() -> Self {
+        Self {
+            auto_commit_at_full: false,
+            auto_commit_min_len: 0,
+            clear_on_empty_max: false,
+            top_code_commit: false,
+            auto_commit_block_on_pinyin: true,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct S2TConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default)]
+    pub variant: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CmdbarConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    /// 副作用命令候选（含 ActionEffect）在候选框渲染时的前缀标注（对齐 Go,默认 "⚡"）。
+    #[serde(default = "default_candidate_prefix")]
+    pub candidate_prefix: String,
+}
+
+fn default_candidate_prefix() -> String {
+    "⚡".to_string()
+}
+
+impl Default for CmdbarConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            candidate_prefix: default_candidate_prefix(),
+        }
+    }
+}
+
+// ───────────────────────── keys（全部按键）─────────────────────────
+
+/// 全部按键绑定（[keys]，扁平）：原 hotkeys.* + 散在 input 的选择/导航键 + overflow。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct KeysConfig {
+    // ── 热键（原 hotkeys.*）──
+    #[serde(default = "default_toggle_mode_keys")]
+    pub toggle_mode_keys: Vec<String>,
+    #[serde(default = "default_true")]
+    pub commit_on_switch: bool,
+    #[serde(default = "default_switch_engine")]
+    pub switch_engine: String,
+    #[serde(default = "default_toggle_full_width")]
+    pub toggle_full_width: String,
+    #[serde(default = "default_toggle_punct")]
+    pub toggle_punct: String,
+    #[serde(default = "default_hotkey_none")]
+    pub toggle_toolbar: String,
+    #[serde(default = "default_hotkey_none")]
+    pub open_settings: String,
+    #[serde(default = "default_add_word")]
+    pub add_word: String,
+    #[serde(default = "default_toggle_s2t")]
+    pub toggle_s2t: String,
+    #[serde(default = "default_activate_ime")]
+    pub activate_ime: String,
+    #[serde(default = "default_pin_candidate")]
+    pub pin_candidate: String,
+    #[serde(default = "default_delete_candidate")]
+    pub delete_candidate: String,
+    #[serde(default)]
+    pub global_hotkeys: Vec<String>,
+    // ── 选择/导航键（原 input.*）──
+    #[serde(default = "default_select_key_groups")]
+    pub select_key_groups: Vec<String>,
+    #[serde(default = "default_page_keys")]
+    pub page_keys: Vec<String>,
+    #[serde(default = "default_highlight_keys")]
+    pub highlight_keys: Vec<String>,
+    #[serde(default)]
+    pub select_char_keys: Vec<String>,
+    /// 候选无效按键策略（数字键/次选三选键/以词定字键超出候选范围时的处理）。
+    #[serde(default)]
+    pub overflow: OverflowConfig,
+}
+
+// 热键默认值对齐 Go 版 DefaultConfig.Hotkeys（wind_input/pkg/config/config.go）。
+// 关键：config.getDefaults 走 toml::from_str("")，[keys] 整表缺失时用 Default::default()，
+// 故必须手写 Default（而非 derive 的空值），否则设置页"开关后默认键丢失"。
+fn default_toggle_mode_keys() -> Vec<String> {
+    vec!["lshift".to_string(), "rshift".to_string()]
+}
+fn default_switch_engine() -> String {
+    "ctrl+shift+e".to_string()
+}
+fn default_toggle_full_width() -> String {
+    "shift+space".to_string()
+}
+fn default_toggle_punct() -> String {
+    "ctrl+.".to_string()
+}
+fn default_add_word() -> String {
+    "ctrl+equal".to_string()
+}
+fn default_toggle_s2t() -> String {
+    "ctrl+shift+j".to_string()
+}
+fn default_activate_ime() -> String {
+    "ctrl+shift+[".to_string()
+}
+fn default_pin_candidate() -> String {
+    "ctrl+number".to_string()
+}
+fn default_delete_candidate() -> String {
+    "ctrl+shift+number".to_string()
+}
+fn default_hotkey_none() -> String {
+    "none".to_string()
+}
+fn default_select_key_groups() -> Vec<String> {
+    vec!["semicolon_quote".to_string()]
+}
+fn default_page_keys() -> Vec<String> {
+    vec!["pageupdown".to_string(), "minus_equal".to_string()]
+}
+fn default_highlight_keys() -> Vec<String> {
+    vec!["arrows".to_string(), "tab".to_string()]
+}
+
+impl Default for KeysConfig {
+    fn default() -> Self {
+        Self {
+            toggle_mode_keys: default_toggle_mode_keys(),
+            commit_on_switch: true,
+            switch_engine: default_switch_engine(),
+            toggle_full_width: default_toggle_full_width(),
+            toggle_punct: default_toggle_punct(),
+            toggle_toolbar: default_hotkey_none(),
+            open_settings: default_hotkey_none(),
+            add_word: default_add_word(),
+            toggle_s2t: default_toggle_s2t(),
+            activate_ime: default_activate_ime(),
+            pin_candidate: default_pin_candidate(),
+            delete_candidate: default_delete_candidate(),
+            global_hotkeys: Vec::new(),
+            select_key_groups: default_select_key_groups(),
+            page_keys: default_page_keys(),
+            highlight_keys: default_highlight_keys(),
+            select_char_keys: Vec::new(),
+            overflow: OverflowConfig::default(),
+        }
+    }
+}
+
+/// 候选无效按键策略（[keys.overflow]，对齐 Go OverflowConfig）。
 /// 每项取值："ignore"（吞键无效）/ "commit"（上屏当前高亮候选）/
 /// "commit_and_input"（上屏高亮候选 + 追加按键字符）。默认全 ignore。
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -446,73 +741,7 @@ impl Default for OverflowConfig {
     }
 }
 
-impl Default for InputConfig {
-    fn default() -> Self {
-        Self {
-            punct_follow_mode: false,
-            filter_mode: "smart".to_string(),
-            select_key_groups: vec!["semicolon_quote".to_string()],
-            page_keys: vec!["pageupdown".to_string(), "minus_equal".to_string()],
-            highlight_keys: vec!["arrows".to_string(), "tab".to_string()],
-            select_char_keys: vec![],
-            smart_punct_after_digit: true,
-            smart_punct_list: ".,:".to_string(),
-            smart_symbol_mode: false,
-            smart_symbol_timeout_ms: default_smart_symbol_timeout_ms(),
-            smart_symbol_chars: default_smart_symbol_chars(),
-            punct_custom: PunctCustomConfig::default(),
-            auto_pair: AutoPairConfig::default(),
-            overflow: OverflowConfig::default(),
-            temp_pinyin: TempPinyinConfig::default(),
-            enter_behavior: "commit".to_string(),
-            space_on_empty_behavior: "commit".to_string(),
-            numpad_behavior: String::new(),
-            pinyin_separator: "auto".to_string(),
-            shift_temp_english: ShiftTempEnglishConfig::default(),
-            capslock: CapslockConfig::default(),
-            url_input: UrlInputConfig::default(),
-            code_commit: CodeCommitConfig::default(),
-            phrase: PhraseConfig::default(),
-        }
-    }
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ShiftTempEnglishConfig {
-    #[serde(default = "default_true")]
-    pub enabled: bool,
-    #[serde(default = "default_true")]
-    pub show_english_candidates: bool,
-    #[serde(default = "default_shift_behavior")]
-    pub shift_behavior: String,
-    /// 触发键（符号键进入临时英文模式，类似临时拼音触发键）。默认空（仅 Shift+字母触发）。
-    /// 对齐 Go ShiftTempEnglishConfig.TriggerKeys；设置页 TriggerKeySelect 需此数组存在。
-    #[serde(default)]
-    pub trigger_keys: Vec<String>,
-    #[serde(default)]
-    pub allow_symbols: bool,
-    #[serde(default)]
-    pub space_as_input: bool,
-}
-
-impl Default for ShiftTempEnglishConfig {
-    fn default() -> Self {
-        Self {
-            enabled: true,
-            show_english_candidates: true,
-            shift_behavior: "temp_english".to_string(),
-            trigger_keys: Vec::new(),
-            allow_symbols: false,
-            space_as_input: false,
-        }
-    }
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
-pub struct CapslockConfig {
-    #[serde(default)]
-    pub cancel_on_mode_switch: bool,
-}
+// ───────────────────────── ui（外观）─────────────────────────
 
 fn default_per_page() -> usize {
     7
@@ -532,7 +761,7 @@ pub struct UiConfig {
     #[serde(default)]
     pub tooltip: TooltipConfig,
     #[serde(default)]
-    pub status_indicator: StatusIndicatorConfig,
+    pub status: StatusIndicatorConfig,
     #[serde(default)]
     pub toolbar: ToolbarConfig,
 }
@@ -557,7 +786,7 @@ impl Default for ToolbarConfig {
     }
 }
 
-/// 状态提示气泡配置（[ui.status_indicator]，对齐 Go）：中英/标点/全半角/方案切换的瞬时气泡。
+/// 状态提示气泡配置（[ui.status]，对齐 Go）：中英/标点/全半角/方案切换的瞬时气泡。
 /// 样式（字号/透明度/圆角/配色）跟随主题（theme.views.status）；此处为行为与位置。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StatusIndicatorConfig {
@@ -568,7 +797,6 @@ pub struct StatusIndicatorConfig {
     #[serde(default = "default_status_duration")]
     pub duration: i32,
     /// 显示模式："temp"（临时,duration 后隐藏,默认）| "always"（常驻:激活/获焦时显示,失焦隐藏）。
-    /// 对齐 Go ui.status_indicator.display_mode。
     #[serde(default = "default_status_display_mode")]
     pub display_mode: String,
     /// 方案名显示样式："full"（全名，默认）| "short"（图标短称 icon_label，回退全名）。
@@ -853,171 +1081,82 @@ impl Default for UiThemeConfig {
     }
 }
 
-/// 悬停提示配置（[ui.tooltip]，对齐 Go `ui.tooltip.*`）。
+/// 悬停提示配置（[ui.tooltip]）。原 ui.tooltip.{code,pinyin,chaizi,debug}.* 子表拍平为平铺字段
+/// （三级上限：ui.tooltip.<字段>）。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TooltipConfig {
     /// 提示延迟显示时间（毫秒）。
     #[serde(default = "default_tooltip_delay")]
     pub delay: i32,
+    /// 编码提示（原 code.enabled）。默认开。
+    #[serde(default = "default_true")]
+    pub code_enabled: bool,
+    /// 拼音提示（原 pinyin.enabled）。默认开。
+    #[serde(default = "default_true")]
+    pub pinyin_enabled: bool,
+    /// 显示多音字所有读音（原 pinyin.heteronyms）。默认开。
+    #[serde(default = "default_true")]
+    pub pinyin_heteronyms: bool,
+    /// 每字最多显示读音数（原 pinyin.max_readings，0=不限）。
     #[serde(default)]
-    pub code: TooltipToggle,
+    pub pinyin_max_readings: usize,
+    /// 拆字提示（原 chaizi.enabled）。默认关。
     #[serde(default)]
-    pub pinyin: TooltipPinyinConfig,
-    #[serde(default = "default_tooltip_chaizi")]
-    pub chaizi: TooltipToggle,
-    #[serde(default = "default_tooltip_debug")]
-    pub debug: TooltipToggle,
+    pub chaizi_enabled: bool,
+    /// 调试提示（原 debug.enabled）。默认关。
+    #[serde(default)]
+    pub debug_enabled: bool,
 }
 
 fn default_tooltip_delay() -> i32 {
     100
 }
 
-/// chaizi 默认关。
-fn default_tooltip_chaizi() -> TooltipToggle {
-    TooltipToggle { enabled: false }
-}
-
-/// debug 默认关。
-fn default_tooltip_debug() -> TooltipToggle {
-    TooltipToggle { enabled: false }
-}
-
 impl Default for TooltipConfig {
     fn default() -> Self {
         Self {
             delay: default_tooltip_delay(),
-            code: TooltipToggle { enabled: true },
-            pinyin: TooltipPinyinConfig::default(),
-            chaizi: default_tooltip_chaizi(),
-            debug: default_tooltip_debug(),
+            code_enabled: true,
+            pinyin_enabled: true,
+            pinyin_heteronyms: true,
+            pinyin_max_readings: 0,
+            chaizi_enabled: false,
+            debug_enabled: false,
         }
     }
 }
 
-/// 单开关 provider（code / chaizi / debug）。默认开（chaizi/debug 由专用 default 覆盖为关）。
+// ───────────────────────── input.phrase（短语前缀列举）─────────────────────────
+
+/// 短语前缀列举配置（[input.phrase]，对齐 Go）。
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct TooltipToggle {
-    #[serde(default = "default_true")]
-    pub enabled: bool,
+pub struct PhraseConfig {
+    /// 触发前缀导航列举的最小输入长度（原 min_prefix_length）。默认 2。
+    #[serde(default = "default_phrase_min_prefix")]
+    pub min_prefix: usize,
+    /// 短语/命令候选显示文本的最大字符数（超出截断加省略号）。0 表示不限制。默认 30。
+    #[serde(default = "default_phrase_max_display_chars")]
+    pub max_display_chars: usize,
 }
 
-impl Default for TooltipToggle {
-    fn default() -> Self {
-        Self { enabled: true }
-    }
-}
-
-/// 拼音 provider 配置（[ui.tooltip.pinyin]）。
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct TooltipPinyinConfig {
-    #[serde(default = "default_true")]
-    pub enabled: bool,
-    /// 显示多音字所有读音（false 仅首音）。
-    #[serde(default = "default_true")]
-    pub heteronyms: bool,
-    /// 每字最多显示读音数（0=不限）。
-    #[serde(default)]
-    pub max_readings: usize,
-}
-
-impl Default for TooltipPinyinConfig {
+impl Default for PhraseConfig {
     fn default() -> Self {
         Self {
-            enabled: true,
-            heteronyms: true,
-            max_readings: 0,
+            min_prefix: default_phrase_min_prefix(),
+            max_display_chars: default_phrase_max_display_chars(),
         }
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct FeaturesConfig {
-    #[serde(default)]
-    pub stats: StatsConfig,
-    #[serde(default)]
-    pub s2t: S2TConfig,
-    #[serde(default)]
-    pub quick_input: QuickInputConfig,
-    #[serde(default)]
-    pub cmdbar: CmdbarConfig,
-    /// 特殊模式列表（各自带码表 + 上屏策略；引导键触发）
-    #[serde(default)]
-    pub special_modes: Vec<SpecialModeConfig>,
-    /// 临时 mix 模式列表（引导键触发，合并多个成员方案的候选）。
-    /// 默认含一个 ; 触发的「快捷」融合：quick_input（日期/计算，内置类方案）+ pinyin + english。
-    #[serde(default = "default_mix_modes")]
-    pub mix_modes: Vec<MixModeConfig>,
+fn default_phrase_min_prefix() -> usize {
+    2
 }
 
-fn default_mix_modes() -> Vec<MixModeConfig> {
-    vec![MixModeConfig {
-        id: "quick_mix".to_string(),
-        name: "快捷".to_string(),
-        short_name: "快".to_string(),
-        trigger_keys: vec!["semicolon".to_string()],
-        members: vec![
-            "quick_input".to_string(),
-            "pinyin".to_string(),
-            "english".to_string(),
-        ],
-    }]
+fn default_phrase_max_display_chars() -> usize {
+    30
 }
 
-impl Default for FeaturesConfig {
-    fn default() -> Self {
-        Self {
-            stats: StatsConfig::default(),
-            s2t: S2TConfig::default(),
-            quick_input: QuickInputConfig::default(),
-            cmdbar: CmdbarConfig::default(),
-            special_modes: Vec::new(),
-            mix_modes: default_mix_modes(),
-        }
-    }
-}
-
-/// 临时 mix 模式配置（overlay 激活面）。触发后对每个成员方案查询并按成员序合并候选，
-/// 融合临拼/快符/生僻字等。成员为真实方案 id（同特殊模式的拉平思路）。
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
-pub struct MixModeConfig {
-    /// 实例唯一标识
-    #[serde(default)]
-    pub id: String,
-    /// 显示名（UI 徽标 / 模式指示全称）
-    #[serde(default)]
-    pub name: String,
-    /// 模式指示短称（空则取 name 首字）
-    #[serde(default)]
-    pub short_name: String,
-    /// 引导键列表
-    #[serde(default)]
-    pub trigger_keys: Vec<String>,
-    /// 成员方案 id 列表（按序合并候选；如 ["pinyin", "quick_symbols"]）
-    #[serde(default)]
-    pub members: Vec<String>,
-}
-
-/// 特殊模式配置（纯 overlay 激活面）。引擎/码表配置拉平到其引用的真实方案
-/// `<schema>.schema.toml`（与 wubi86/pinyin 同级），全码策略复用方案的 [engine.codetable]。
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
-pub struct SpecialModeConfig {
-    /// 实例唯一标识
-    #[serde(default)]
-    pub id: String,
-    /// 显示名（UI 徽标 / 模式指示全称，如 "快符"）
-    #[serde(default)]
-    pub name: String,
-    /// 模式指示短称（如 "符"；空则取 name 首字）
-    #[serde(default)]
-    pub short_name: String,
-    /// 引导键列表（如 "grave"/"backslash"/"z"）
-    #[serde(default)]
-    pub trigger_keys: Vec<String>,
-    /// 引用的方案 id（其 .schema.toml 提供码表与全码策略；不进 schema.available，仅 overlay 触发懒加载）
-    #[serde(default)]
-    pub schema: String,
-}
+// ───────────────────────── stats（统计）─────────────────────────
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StatsConfig {
@@ -1036,61 +1175,7 @@ impl Default for StatsConfig {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
-pub struct S2TConfig {
-    #[serde(default)]
-    pub enabled: bool,
-    #[serde(default)]
-    pub variant: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct QuickInputConfig {
-    #[serde(default)]
-    pub enabled: bool,
-    /// 计算器结果小数位数，默认 6
-    #[serde(default = "default_decimal_places")]
-    pub decimal_places: i32,
-    /// 强制竖排显示：进入快捷输入时切竖排候选，退出恢复原布局。
-    #[serde(default)]
-    pub force_vertical: bool,
-}
-
-fn default_decimal_places() -> i32 {
-    6
-}
-
-impl Default for QuickInputConfig {
-    fn default() -> Self {
-        Self {
-            enabled: false,
-            decimal_places: default_decimal_places(),
-            force_vertical: false,
-        }
-    }
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct CmdbarConfig {
-    #[serde(default)]
-    pub enabled: bool,
-    /// 副作用命令候选（含 ActionEffect）在候选框渲染时的前缀标注（对齐 Go,默认 "⚡"）。
-    #[serde(default = "default_candidate_prefix")]
-    pub candidate_prefix: String,
-}
-
-fn default_candidate_prefix() -> String {
-    "⚡".to_string()
-}
-
-impl Default for CmdbarConfig {
-    fn default() -> Self {
-        Self {
-            enabled: false,
-            candidate_prefix: default_candidate_prefix(),
-        }
-    }
-}
+// ───────────────────────── compat / debug ─────────────────────────
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct CompatConfig {
@@ -1102,66 +1187,9 @@ pub struct CompatConfig {
 pub struct DebugConfig {
     #[serde(default)]
     pub log_level: String,
-    #[serde(default)]
-    pub perf_sampling: bool,
 }
 
-/// 全局拼音配置（[pinyin]）。所有拼音类方案（全拼/双拼/混输拼音子方案/临时拼音反查）共用。
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct PinyinGlobalConfig {
-    #[serde(default = "default_true")]
-    pub show_code_hint: bool,
-    #[serde(default = "default_true")]
-    pub use_smart_compose: bool,
-    #[serde(default = "default_candidate_order")]
-    pub candidate_order: String,
-    #[serde(default)]
-    pub fuzzy: PinyinFuzzy,
-}
-
-fn default_candidate_order() -> String {
-    "smart".to_string()
-}
-
-impl Default for PinyinGlobalConfig {
-    fn default() -> Self {
-        Self {
-            show_code_hint: true,
-            use_smart_compose: true,
-            candidate_order: "smart".to_string(),
-            fuzzy: PinyinFuzzy::default(),
-        }
-    }
-}
-
-/// 全局模糊音（[pinyin.fuzzy]）。字段对齐引擎 FuzzyConfig。
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub struct PinyinFuzzy {
-    #[serde(default)]
-    pub enabled: bool,
-    #[serde(default)]
-    pub zh_z: bool,
-    #[serde(default)]
-    pub ch_c: bool,
-    #[serde(default)]
-    pub sh_s: bool,
-    #[serde(default)]
-    pub n_l: bool,
-    #[serde(default)]
-    pub f_h: bool,
-    #[serde(default)]
-    pub r_l: bool,
-    #[serde(default)]
-    pub an_ang: bool,
-    #[serde(default)]
-    pub en_eng: bool,
-    #[serde(default)]
-    pub in_ing: bool,
-    #[serde(default)]
-    pub ian_iang: bool,
-    #[serde(default)]
-    pub uan_uang: bool,
-}
+// ───────────────────────── 共享 default 助手 ─────────────────────────
 
 fn default_true() -> bool {
     true
@@ -1202,15 +1230,13 @@ fn default_shift_behavior() -> String {
 impl Default for Config {
     fn default() -> Self {
         Self {
-            general: GeneralConfig::default(),
             schema: SchemaConfig::default(),
-            hotkeys: HotkeysConfig::default(),
             input: InputConfig::default(),
+            keys: KeysConfig::default(),
             ui: UiConfig::default(),
-            features: FeaturesConfig::default(),
+            stats: StatsConfig::default(),
             compat: CompatConfig::default(),
             debug: DebugConfig::default(),
-            pinyin: PinyinGlobalConfig::default(),
         }
     }
 }
@@ -1219,8 +1245,7 @@ impl Config {
     /// 三层合并加载：默认值 → data_dir/config.toml → 用户配置。
     ///
     /// 合并方式：把三层各自的 `toml::Value`（默认值序列化得到）深合并（表递归、标量/数组后者覆盖），
-    /// 最后一次性反序列化为 `Config`。相比旧的手写逐字段合并，**所有段（含 features/compat/debug）
-    /// 都会被合并**，不再静默丢弃；新增配置字段无需改合并代码。
+    /// 最后一次性反序列化为 `Config`。所有段都会被合并，不再静默丢弃；新增配置字段无需改合并代码。
     pub fn load(data_dir: Option<&Path>) -> anyhow::Result<Self> {
         // Layer 1: 代码默认值（序列化为 Value，保证所有字段存在）
         let mut merged = toml::Value::try_from(Self::default())?;
@@ -1294,8 +1319,8 @@ impl Config {
     /// 把单个配置项**部分合并**写入用户层 `config.toml`（%APPDATA%/WindInput/config.toml）。
     ///
     /// 只改 `path` 指定的项、保留用户文件里其它已有项，**不写入未改动的默认/系统段**——
-    /// 用户层维持最小 diff，避免覆盖系统层/默认层的后续更新（对齐 wind-setting 的"快照→diff"模型）。
-    /// 原子写（tmp + rename）。`path` 如 `["ui","candidate","preedit_mode"]`。
+    /// 用户层维持最小 diff，避免覆盖系统层/默认层的后续更新。
+    /// 原子写（tmp + rename）。`path` 如 `["ui","candidate","preedit_display"]`。
     pub fn set_user_value(path: &[&str], value: toml::Value) -> anyhow::Result<()> {
         if path.is_empty() {
             anyhow::bail!("set_user_value: empty path");
@@ -1380,8 +1405,8 @@ mod tests {
         t.insert("keep".into(), toml::Value::String("x".into()));
         set_nested(
             &mut t,
-            &["ui", "candidate", "preedit_mode"],
-            toml::Value::String("embedded".into()),
+            &["ui", "candidate", "preedit_display"],
+            toml::Value::String("candidate_inline".into()),
         );
         set_nested(
             &mut t,
@@ -1396,10 +1421,10 @@ mod tests {
                 .unwrap()
                 .get("candidate")
                 .unwrap()
-                .get("preedit_mode")
+                .get("preedit_display")
                 .unwrap()
                 .as_str(),
-            Some("embedded")
+            Some("candidate_inline")
         );
         assert_eq!(
             t.get("schema").unwrap().get("active").unwrap().as_str(),
@@ -1408,18 +1433,18 @@ mod tests {
         // 同路径覆盖
         set_nested(
             &mut t,
-            &["ui", "candidate", "preedit_mode"],
-            toml::Value::String("top".into()),
+            &["ui", "candidate", "preedit_display"],
+            toml::Value::String("candidate_top".into()),
         );
         assert_eq!(
             t.get("ui")
                 .unwrap()
                 .get("candidate")
                 .unwrap()
-                .get("preedit_mode")
+                .get("preedit_display")
                 .unwrap()
                 .as_str(),
-            Some("top")
+            Some("candidate_top")
         );
         // 其它兄弟键不受影响
         assert_eq!(
@@ -1464,15 +1489,15 @@ mod tests {
     }
 
     #[test]
-    fn test_merge_keeps_features_compat_debug() {
-        // 回归：旧手写合并完全丢弃 features/compat/debug 段；deep-merge 必须保留
+    fn test_merge_keeps_input_s2t_compat_debug() {
+        // 回归：deep-merge 必须保留各段（features 拆解后 s2t 归 input）
         let cfg = merged_with(
-            "[features.s2t]\nenabled = true\nvariant = \"s2tw\"\n\
+            "[input.s2t]\nenabled = true\nvariant = \"s2tw\"\n\
              [debug]\nlog_level = \"trace\"\n\
              [compat]\nhost_render_processes = [\"a.exe\"]\n",
         );
-        assert!(cfg.features.s2t.enabled, "features.s2t.enabled 应被合并");
-        assert_eq!(cfg.features.s2t.variant, "s2tw");
+        assert!(cfg.input.s2t.enabled, "input.s2t.enabled 应被合并");
+        assert_eq!(cfg.input.s2t.variant, "s2tw");
         assert_eq!(cfg.debug.log_level, "trace", "debug 段应被合并");
         assert_eq!(cfg.compat.host_render_processes, vec!["a.exe".to_string()]);
     }
@@ -1487,7 +1512,7 @@ mod tests {
 
     #[test]
     fn test_merge_input_subtable_fields() {
-        // 旧合并漏掉的 input 字段（如 smart_punct/auto_pair）现应合并
+        // 旧合并漏掉的 input 子表字段（如 auto_pair）现应合并
         let cfg = merged_with("[input.auto_pair]\nchinese = false\nenglish = false\n");
         assert!(!cfg.input.auto_pair.chinese);
         assert!(!cfg.input.auto_pair.english);
@@ -1497,27 +1522,26 @@ mod tests {
     fn test_tooltip_defaults_match_go() {
         let t = Config::default().ui.tooltip;
         assert_eq!(t.delay, 100);
-        assert!(t.code.enabled, "code 默认开");
+        assert!(t.code_enabled, "code 默认开");
         assert!(
-            t.pinyin.enabled && t.pinyin.heteronyms,
+            t.pinyin_enabled && t.pinyin_heteronyms,
             "pinyin 默认开+全读音"
         );
-        assert_eq!(t.pinyin.max_readings, 0);
-        assert!(!t.chaizi.enabled, "chaizi 默认关");
-        assert!(!t.debug.enabled, "debug 默认关");
+        assert_eq!(t.pinyin_max_readings, 0);
+        assert!(!t.chaizi_enabled, "chaizi 默认关");
+        assert!(!t.debug_enabled, "debug 默认关");
     }
 
     #[test]
     fn test_tooltip_merge_override() {
         let cfg = merged_with(
-            "[ui.tooltip.chaizi]\nenabled = true\n\
-             [ui.tooltip.pinyin]\nheteronyms = false\nmax_readings = 2\n",
+            "[ui.tooltip]\nchaizi_enabled = true\npinyin_heteronyms = false\npinyin_max_readings = 2\n",
         );
-        assert!(cfg.ui.tooltip.chaizi.enabled);
-        assert!(!cfg.ui.tooltip.pinyin.heteronyms);
-        assert_eq!(cfg.ui.tooltip.pinyin.max_readings, 2);
+        assert!(cfg.ui.tooltip.chaizi_enabled);
+        assert!(!cfg.ui.tooltip.pinyin_heteronyms);
+        assert_eq!(cfg.ui.tooltip.pinyin_max_readings, 2);
         // 未指定字段保留默认
-        assert!(cfg.ui.tooltip.code.enabled, "code 未指定应保留默认开");
+        assert!(cfg.ui.tooltip.code_enabled, "code 未指定应保留默认开");
         assert_eq!(cfg.ui.tooltip.delay, 100);
     }
 
@@ -1555,35 +1579,65 @@ mod tests {
     #[test]
     fn pinyin_global_config_defaults() {
         let c = Config::default();
-        assert!(c.pinyin.show_code_hint);
-        assert!(c.pinyin.use_smart_compose);
-        assert_eq!(c.pinyin.candidate_order, "smart");
-        assert!(!c.pinyin.fuzzy.enabled);
-        assert!(!c.pinyin.fuzzy.zh_z);
+        assert!(c.schema.pinyin.show_code_hint);
+        assert!(c.schema.pinyin.use_smart_compose);
+        assert_eq!(c.schema.pinyin.candidate_order, "smart");
+        assert_eq!(c.schema.pinyin.separator, "auto");
+        assert!(!c.schema.pinyin.fuzzy.enabled);
+        assert!(!c.schema.pinyin.fuzzy.zh_z);
     }
 
     #[test]
     fn pinyin_global_merge_partial() {
-        // 仅覆盖 [pinyin.fuzzy] 的 enabled 和 zh_z，其余字段应保留默认值（深合并验证）
-        let c = merged_with("[pinyin.fuzzy]\nenabled = true\nzh_z = true\n");
+        // 仅覆盖 [schema.pinyin.fuzzy] 的 enabled 和 zh_z，其余字段应保留默认值（深合并验证）
+        let c = merged_with("[schema.pinyin.fuzzy]\nenabled = true\nzh_z = true\n");
         // 被覆盖字段：变为 true
-        assert!(c.pinyin.fuzzy.enabled, "enabled 应被覆盖为 true");
-        assert!(c.pinyin.fuzzy.zh_z, "zh_z 应被覆盖为 true");
+        assert!(c.schema.pinyin.fuzzy.enabled, "enabled 应被覆盖为 true");
+        assert!(c.schema.pinyin.fuzzy.zh_z, "zh_z 应被覆盖为 true");
         // 未覆盖的 fuzzy 字段：保留默认 false
-        assert!(!c.pinyin.fuzzy.ch_c, "ch_c 未覆盖，应保留默认 false");
-        assert!(!c.pinyin.fuzzy.sh_s, "sh_s 未覆盖，应保留默认 false");
+        assert!(!c.schema.pinyin.fuzzy.ch_c, "ch_c 未覆盖，应保留默认 false");
+        assert!(!c.schema.pinyin.fuzzy.sh_s, "sh_s 未覆盖，应保留默认 false");
         // 未覆盖的 pinyin 顶层字段：保留默认值
         assert!(
-            c.pinyin.show_code_hint,
+            c.schema.pinyin.show_code_hint,
             "show_code_hint 未覆盖，应保留默认 true"
         );
         assert!(
-            c.pinyin.use_smart_compose,
+            c.schema.pinyin.use_smart_compose,
             "use_smart_compose 未覆盖，应保留默认 true"
         );
         assert_eq!(
-            c.pinyin.candidate_order, "smart",
+            c.schema.pinyin.candidate_order, "smart",
             "candidate_order 未覆盖，应保留默认 smart"
         );
+    }
+
+    #[test]
+    fn test_keys_defaults() {
+        // keys 合并 hotkeys + 选择键，默认值需保留（[keys] 整表缺失走 Default）
+        let k = Config::default().keys;
+        assert_eq!(k.toggle_mode_keys, vec!["lshift", "rshift"]);
+        assert_eq!(k.switch_engine, "ctrl+shift+e");
+        assert_eq!(k.select_key_groups, vec!["semicolon_quote"]);
+        assert_eq!(k.page_keys, vec!["pageupdown", "minus_equal"]);
+        assert_eq!(k.overflow.number_key, "ignore");
+    }
+
+    #[test]
+    fn test_schema_modes_and_input_groups() {
+        let c = Config::default();
+        // 模式三件套归 schema
+        assert_eq!(c.schema.mix_modes.len(), 1, "默认一个快捷 mix");
+        assert_eq!(c.schema.mix_modes[0].trigger_keys, vec!["semicolon"]);
+        assert!(!c.schema.quick_input.enabled);
+        assert_eq!(c.schema.quick_input.decimal_places, 6);
+        // input 子组
+        assert!(c.input.punct.smart_after_digit, "punct.smart_after_digit 默认开");
+        assert_eq!(c.input.symbol.smart_timeout_ms, 500);
+        assert!(c.input.temp_english.enabled && c.input.temp_english.show_candidates);
+        assert_eq!(c.input.url.prefixes.len(), 5);
+        // input.phrase / stats
+        assert_eq!(c.input.phrase.min_prefix, 2);
+        assert!(c.stats.enabled && !c.stats.track_english);
     }
 }

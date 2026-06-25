@@ -97,7 +97,7 @@ impl Compiler {
     /// 编译配置中的热键为 CompiledHotkeys（对齐 Go compiler.go::Compile）
     pub fn compile(&self) -> CompiledHotkeys {
         let mut result = CompiledHotkeys::default();
-        let h = &self.config.hotkeys;
+        let h = &self.config.keys;
 
         // ── KeyDown：两模式都吃（无 policy 位） ──
         for (name, value) in [
@@ -138,7 +138,7 @@ impl Compiler {
         }
 
         // ── KeyDown：选词键组（如 ;'），仅注册转发，由常规逻辑处理 ──
-        for group in &self.config.input.select_key_groups {
+        for group in &self.config.keys.select_key_groups {
             for raw in compile_select_key_group(group) {
                 result.key_down.push(HotkeyEntry {
                     tsf_hash: raw,
@@ -149,7 +149,7 @@ impl Compiler {
         }
 
         // ── KeyDown：翻页键组（pageupdown / minus_equal / brackets / shift_tab） ──
-        for group in &self.config.input.page_keys {
+        for group in &self.config.keys.page_keys {
             for raw in compile_page_key_group(group) {
                 result.key_down.push(HotkeyEntry {
                     tsf_hash: raw,
@@ -487,8 +487,8 @@ mod tests {
     #[test]
     fn test_compile_switch_engine_match_hash() {
         let mut cfg = Config::default();
-        cfg.hotkeys.switch_engine = "ctrl+shift+e".to_string();
-        cfg.hotkeys.toggle_mode_keys = vec!["lshift".into(), "rshift".into()];
+        cfg.keys.switch_engine = "ctrl+shift+e".to_string();
+        cfg.keys.toggle_mode_keys = vec!["lshift".into(), "rshift".into()];
         let compiled = Compiler::new(cfg).compile();
         // switch_engine 无 policy 位，match_hash == tsf_hash == 0x30045
         let se = compiled

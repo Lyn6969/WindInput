@@ -290,7 +290,7 @@ impl Coordinator {
     }
 
     /// 刷新临时英文候选：首候选=用户原始输入，其后为英文词库前缀匹配（大小写适配）。
-    /// 需 `shift_temp_english.show_english_candidates` 开启才查词库；词库为固定 id "english" 方案。
+    /// 需 `shift_temp_english.show_candidates` 开启才查词库；词库为固定 id "english" 方案。
     pub(crate) fn update_temp_english_candidates(&self, state: &mut State) {
         state.candidates.clear();
         state.current_page = 0;
@@ -387,7 +387,7 @@ impl Coordinator {
             }
             keymap::VK_SPACE => {
                 // space_as_input：空格作为输入字符入缓冲，仅回车上屏（对齐 Go）。
-                if self.rt().config.input.shift_temp_english.space_as_input {
+                if self.rt().config.input.temp_english.space_as_input {
                     state.temp_english_buffer.push(' ');
                     refresh(self, state)
                 } else {
@@ -441,7 +441,7 @@ impl Coordinator {
                 let shift = data.modifiers & MOD_SHIFT != 0;
                 if let Some(ch) = punct_char(data.key_code, shift) {
                     // allow_symbols：可见符号直接入缓冲累积（如 C++），不上屏退出（对齐 Go）。
-                    if self.rt().config.input.shift_temp_english.allow_symbols {
+                    if self.rt().config.input.temp_english.allow_symbols {
                         state.temp_english_buffer.push(ch);
                         return refresh(self, state);
                     }

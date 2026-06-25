@@ -1,16 +1,10 @@
-# WindInput 系统预置配置（v1 结构，见 docs/design/config-restructure.md §3）
+# WindInput 系统预置配置（键名 6 域重命名后，见 docs/config-key-migration.md）
 # 此文件为应用内置默认配置，随程序安装包分发。
 # 加载优先级：代码默认值（Layer 1）→ 本文件（Layer 2）→ 用户配置
 # （%APPDATA%\WindInput\config.toml，Layer 3）。
 # 修改此文件可调整新安装或新版本升级后的默认行为，无需重新编译。
 #
 # 注意：本文件不写 version 键——version 是用户文件的迁移状态锚点。
-
-[general]
-remember_last_state = false
-default_chinese_mode = true
-default_full_width = false
-default_chinese_punct = true
 
 [schema]
 active = "wubi86"
@@ -19,44 +13,51 @@ available = ["wubi86", "wubi86_pinyin"]
 primary_codetable = ""
 primary_pinyin = ""
 
-[hotkeys]
-toggle_mode_keys = ["lshift", "rshift"]
-commit_on_switch = true
-switch_engine = "ctrl+shift+e"
-toggle_full_width = "shift+space"
-toggle_punct = "ctrl+."
-delete_candidate = "ctrl+shift+number"
-pin_candidate = "ctrl+number"
-toggle_toolbar = 'ctrl+shift+\'
-open_settings = "ctrl+shift+]"
-add_word = "ctrl+equal"
-toggle_s2t = "ctrl+shift+j"
-activate_ime = "ctrl+shift+["
-global_hotkeys = []
+# 全局拼音配置：所有拼音类方案（全拼/双拼/混输拼音子方案/临时拼音反查）共用一份。
+[schema.pinyin]
+show_code_hint = true
+use_smart_compose = true
+candidate_order = "smart"
+separator = "auto"
+
+[schema.pinyin.fuzzy]
+enabled = false
+
+[schema.quick_input]
+# 注：; 由内置 mix「快捷」融合接管（quick_input 作为其成员，同时支持日期/计算/拼音/英文）。
+force_vertical = true
+decimal_places = 6
 
 [input]
-punct_follow_mode = false
 filter_mode = "smart"
-select_key_groups = ["semicolon_quote"]
-page_keys = ["pageupdown", "minus_equal"]
-highlight_keys = ["arrows", "tab"]
-# 以词定字：用成对标点键从当前高亮候选词中逐字上屏（第1键取第1字、第2键取第2字）。
-# 可选键组 comma_period(,/.) / minus_equal(-/=) / brackets([/])；空数组=禁用。
-# 词长不足时按 [input.overflow].select_char_key 策略处理。
-select_char_keys = []
-smart_punct_after_digit = true
-smart_punct_list = ".,:"
-smart_symbol_mode = false
-smart_symbol_timeout_ms = 500
-smart_symbol_chars = "。，？！：；、～￥·……——"
 enter_behavior = "commit"
 space_on_empty_behavior = "commit"
 numpad_behavior = "direct"
-pinyin_separator = "auto"
 
-[input.shift_temp_english]
+# 启动默认状态（原 [general] 域）
+[input.default]
+remember_last_state = false
+chinese_mode = true
+full_width = false
+chinese_punct = true
+
+# 标点：随中英、数字后智能英文标点、自定义映射
+[input.punct]
+follow_mode = false
+smart_after_digit = true
+smart_list = ".,:"
+# custom_enabled 为自定义标点映射总开关；custom_mappings 留空时全部走内置默认转换
+custom_enabled = false
+
+# 智能符号：同一中文标点在时限内连按两次，删前一字符替换为英文
+[input.symbol]
+smart_mode = false
+smart_timeout_ms = 500
+smart_chars = "。，？！：；、～￥·……——"
+
+[input.temp_english]
 enabled = true
-show_english_candidates = true
+show_candidates = true
 shift_behavior = "temp_english"
 trigger_keys = []
 allow_symbols = false
@@ -74,26 +75,52 @@ english = false
 chinese_pairs = ["（）", "【】", "｛｝", "《》", "〈〉"]
 english_pairs = ["()", "[]", "{}", "<>"]
 
-# 自定义标点映射：enabled 为总开关；mappings 留空时全部走内置默认转换
-[input.punct_custom]
+# URL 临时输入模式：正常输入下打出完整前缀（如 http / www.）即进入网址输入模式，
+# 模式内自由输入网址字符（不触发上屏），空格或回车上屏。默认关闭。
+[input.url]
 enabled = false
+prefixes = ["www.", "http", "https", "ftp."]
+
+[input.s2t]
+enabled = false
+variant = "s2t"
+
+[input.cmdbar]
+candidate_prefix = "⚡"
+
+# 短语前缀列举（原 [dict.phrase]）
+[input.phrase]
+min_prefix = 2
+
+[keys]
+toggle_mode_keys = ["lshift", "rshift"]
+commit_on_switch = true
+switch_engine = "ctrl+shift+e"
+toggle_full_width = "shift+space"
+toggle_punct = "ctrl+."
+delete_candidate = "ctrl+shift+number"
+pin_candidate = "ctrl+number"
+toggle_toolbar = 'ctrl+shift+\'
+open_settings = "ctrl+shift+]"
+add_word = "ctrl+equal"
+toggle_s2t = "ctrl+shift+j"
+activate_ime = "ctrl+shift+["
+global_hotkeys = []
+select_key_groups = ["semicolon_quote"]
+page_keys = ["pageupdown", "minus_equal"]
+highlight_keys = ["arrows", "tab"]
+# 以词定字：用成对标点键从当前高亮候选词中逐字上屏（第1键取第1字、第2键取第2字）。
+# 可选键组 comma_period(,/.) / minus_equal(-/=) / brackets([/])；空数组=禁用。
+# 词长不足时按 [keys.overflow].select_char_key 策略处理。
+select_char_keys = []
 
 # 无效按键策略（候选不足以命中目标位次时）：ignore=吞键 / commit=上屏高亮候选 /
 # commit_and_input=上屏高亮候选并追加该键字符。number_key=数字键、select_key=次/三选键、
 # select_char_key=以词定字键。
-[input.overflow]
+[keys.overflow]
 number_key = "ignore"
 select_key = "ignore"
 select_char_key = "ignore"
-
-[input.phrase]
-min_prefix_length = 2
-
-# URL 临时输入模式：正常输入下打出完整前缀（如 http / www.）即进入网址输入模式，
-# 模式内自由输入网址字符（不触发上屏），空格或回车上屏。默认关闭。
-[input.url_input]
-enabled = false
-prefixes = ["www.", "http", "https", "ftp."]
 
 [ui.candidate]
 font_size = 18
@@ -121,10 +148,9 @@ style = "system"
 
 [ui.mode_indicator]
 # 进入临时拼音/双拼/快捷/英文/快符等模式时的标识：short=短称(拼/双/快/英/符) | full=全称(临时拼音…) | none=不显示
-# 有 preedit 空间时(candidate_top/inline)输入全程显示；内嵌应用(app_inline)时仅进入瞬间提示
 style = "short"
 
-[ui.status_indicator]
+[ui.status]
 enabled = true
 duration = 800
 display_mode = "temp"
@@ -135,56 +161,26 @@ offset_y = 0
 custom_x = 0
 custom_y = 0
 
+# 悬停提示：原 ui.tooltip.{code,pinyin,chaizi,debug}.* 子表已拍平为平铺字段
 [ui.tooltip]
 delay = 200
-
-[ui.tooltip.code]
-enabled = true
-
-[ui.tooltip.pinyin]
-enabled = true
-heteronyms = true
-max_readings = 0
-
-[ui.tooltip.chaizi]
-enabled = false
-
-[ui.tooltip.debug]
-enabled = false
+code_enabled = true
+pinyin_enabled = true
+pinyin_heteronyms = true
+pinyin_max_readings = 0
+chaizi_enabled = false
+debug_enabled = false
 
 [ui.toolbar]
 visible = true
 hide_in_fullscreen = true
 
-[features.stats]
+[stats]
 enabled = true
 track_english = true
-
-[features.s2t]
-enabled = false
-variant = "s2t"
-
-[features.quick_input]
-# 注：; 由内置 mix「快捷」融合接管（quick_input 作为其成员，同时支持日期/计算/拼音/英文）。
-# 旧的独立 quick_input 触发键(trigger_keys)已移除。以下为融合内 quick_input 成员的参数。
-force_vertical = true
-decimal_places = 6
-
-[features.cmdbar]
-candidate_prefix = "⚡"
 
 [compat]
 host_render_processes = ["SearchHost.exe"]
 
 [debug]
 log_level = "info"
-perf_sampling = false
-
-# 全局拼音配置：所有拼音类方案（全拼/双拼/混输拼音子方案/临时拼音反查）共用一份。
-[pinyin]
-show_code_hint = true
-use_smart_compose = true
-candidate_order = "smart"
-
-[pinyin.fuzzy]
-enabled = false
