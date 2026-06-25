@@ -70,6 +70,7 @@ windows = { version = "0.58", features = [
     "Win32_Graphics_Direct2D_Common",
     "Win32_UI_HiDpi",
     "Win32_System_SystemServices",
+    "Win32_System_Console",
     "Win32_System_LibraryLoader",
     "Win32_System_SystemInformation",
     "Win32_Graphics_Dwm",

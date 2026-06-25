@@ -16,11 +16,78 @@ use wind_bridge::server::{BridgeConfig, BridgeServer};
 
 mod config_cli;
 
+/// 获取管道名称后缀（debug 变体使用 "_debug"）
+#[cfg(feature = "debug_variant")]
+const PIPE_SUFFIX: &str = "_debug";
+
+#[cfg(not(feature = "debug_variant"))]
+const PIPE_SUFFIX: &str = "";
+
+/// GUI 子系统（release profile，`windows_subsystem="windows"`）下进程不附着控制台，
+/// 故 CLI 子命令的 `println!` 无处可写。此函数把进程附着到**父控制台**（调用它的 cmd/PowerShell），
+/// 并把 `CONOUT$/CONIN$` 设回标准句柄，让 stdout/stderr/stdin 直达该终端。
+///
+/// 注意：GUI 子系统进程不会让 shell 等待——提示符会先返回、输出随后插入（交错）。
+/// 需"等它跑完"时请重定向（`> out.txt 2>&1`）或 `start /wait`。
+/// 无父控制台（双击启动/被服务拉起）时静默返回——那种场景本就不该走 CLI。
+#[cfg(windows)]
+fn attach_parent_console() {
+    use windows::Win32::Storage::FileSystem::{
+        CreateFileW, FILE_FLAGS_AND_ATTRIBUTES, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING,
+    };
+    use windows::Win32::System::Console::{
+        ATTACH_PARENT_PROCESS, AttachConsole, STD_ERROR_HANDLE, STD_INPUT_HANDLE,
+        STD_OUTPUT_HANDLE, SetStdHandle,
+    };
+    use windows::core::w;
+
+    // GENERIC_READ | GENERIC_WRITE（用裸常量避免跨版本导入路径差异）。
+    const GENERIC_RW: u32 = 0xC000_0000;
+
+    unsafe {
+        if AttachConsole(ATTACH_PARENT_PROCESS).is_err() {
+            return; // 没有父控制台
+        }
+        // 重新打开控制台读写设备并设为进程标准句柄；否则 GUI 子系统启动时标准句柄为空。
+        if let Ok(out) = CreateFileW(
+            w!("CONOUT$"),
+            GENERIC_RW,
+            FILE_SHARE_READ | FILE_SHARE_WRITE,
+            None,
+            OPEN_EXISTING,
+            FILE_FLAGS_AND_ATTRIBUTES(0),
+            None,
+        ) {
+            let _ = SetStdHandle(STD_OUTPUT_HANDLE, out);
+            let _ = SetStdHandle(STD_ERROR_HANDLE, out);
+        }
+        if let Ok(inp) = CreateFileW(
+            w!("CONIN$"),
+            GENERIC_RW,
+            FILE_SHARE_READ | FILE_SHARE_WRITE,
+            None,
+            OPEN_EXISTING,
+            FILE_FLAGS_AND_ATTRIBUTES(0),
+            None,
+        ) {
+            let _ = SetStdHandle(STD_INPUT_HANDLE, inp);
+        }
+    }
+}
+
 fn main() {
     // CLI 子命令：`wind_input config ...`（查看/读写配置）。在服务启动前拦截，处理完即退出。
     let cli_args: Vec<String> = std::env::args().collect();
     if cli_args.get(1).map(String::as_str) == Some("config") {
-        std::process::exit(config_cli::run(&cli_args[2..]));
+        // GUI 子系统下附着父控制台，让输出回到调用的终端（详见 attach_parent_console）。
+        #[cfg(windows)]
+        attach_parent_console();
+        let code = config_cli::run(&cli_args[2..]);
+        // process::exit 不会刷新缓冲，重定向/管道时可能丢尾部输出——显式 flush。
+        use std::io::Write;
+        let _ = std::io::stdout().flush();
+        let _ = std::io::stderr().flush();
+        std::process::exit(code);
     }
 
     // 0. 设置 DPI 感知（与 Go 版 setDPIAwareness 对齐）
