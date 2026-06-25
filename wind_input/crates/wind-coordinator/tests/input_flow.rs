@@ -1647,3 +1647,65 @@ fn test_english_stats_callable_without_store() {
     let coord = Coordinator::new_headless(config_with("wubi86"), None);
     coord.handle_english_stats(5, 3, 2, 1);
 }
+
+fn config_with_english_trigger(active: &str, trigger: &str) -> wind_config::Config {
+    let mut cfg = config_with(active);
+    cfg.input.temp_english.trigger_keys = vec![trigger.to_string()];
+    cfg
+}
+
+#[test]
+fn test_temp_english_trigger_key_shows_prefix() {
+    if !has_schemas() {
+        return;
+    }
+    let coord = Coordinator::new_headless(
+        config_with_english_trigger("wubi86", "slash"),
+        Some(&data_dir()),
+    );
+    // 空缓冲按 / 进入临时英文，preedit 应显示前缀 "/"
+    let act = coord.handle_key_event(&key_event(0xBF, EVENT_KEY_DOWN));
+    assert_eq!(
+        action_text(&act).as_deref(),
+        Some("/"),
+        "触发键进入临时英文，preedit 应显示前缀 /"
+    );
+}
+
+#[test]
+fn test_temp_english_trigger_key_prefix_in_preedit() {
+    if !has_schemas() {
+        return;
+    }
+    let coord = Coordinator::new_headless(
+        config_with_english_trigger("wubi86", "slash"),
+        Some(&data_dir()),
+    );
+    // 触发键进入后继续输入字母，preedit = 前缀 + 缓冲
+    coord.handle_key_event(&key_event(0xBF, EVENT_KEY_DOWN)); // /
+    let act = press_letter(&coord, 'h');
+    assert_eq!(
+        action_text(&act).as_deref(),
+        Some("/h"),
+        "输入 h 后 preedit 应为 /h"
+    );
+}
+
+#[test]
+fn test_temp_english_trigger_key_enter_empty_commits_prefix() {
+    if !has_schemas() {
+        return;
+    }
+    let coord = Coordinator::new_headless(
+        config_with_english_trigger("wubi86", "slash"),
+        Some(&data_dir()),
+    );
+    // 触发键进入，空缓冲直接回车 → 上屏触发键字符 "/"
+    coord.handle_key_event(&key_event(0xBF, EVENT_KEY_DOWN)); // /
+    let act = coord.handle_key_event(&key_event(0x0D, EVENT_KEY_DOWN)); // Enter
+    assert_eq!(
+        action_text(&act).as_deref(),
+        Some("/"),
+        "空缓冲回车应上屏触发键字符 /"
+    );
+}

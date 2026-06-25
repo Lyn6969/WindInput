@@ -36,6 +36,18 @@ impl Coordinator {
             .any(|vk| vk == key_code)
     }
 
+    /// 当前按键是否匹配配置的临时英文触发键
+    pub(crate) fn is_temp_english_trigger(&self, key_code: u32) -> bool {
+        self.rt()
+            .config
+            .input
+            .temp_english
+            .trigger_keys
+            .iter()
+            .filter_map(|k| keymap::key_name_to_vk(k))
+            .any(|vk| vk == key_code)
+    }
+
     /// 退出临时拼音模式并清空相关状态（含逐步转换的已转换前缀）
     pub(crate) fn exit_temp_pinyin(&self, state: &mut State) {
         state.active = None;
@@ -285,6 +297,7 @@ impl Coordinator {
     pub(crate) fn exit_temp_english(&self, state: &mut State) {
         state.active = None;
         state.temp_english_buffer.clear();
+        state.temp_english_prefix.clear();
         state.preedit.clear();
         state.candidates.clear();
     }
@@ -296,7 +309,7 @@ impl Coordinator {
         state.current_page = 0;
         state.selected_index = 0;
         let buf = state.temp_english_buffer.clone();
-        state.preedit = buf.clone();
+        state.preedit = format!("{}{}", state.temp_english_prefix, buf);
         if buf.is_empty() {
             return;
         }
@@ -404,8 +417,12 @@ impl Coordinator {
                 }
             }
             keymap::VK_RETURN => {
-                // 回车：上屏原始输入文本（不取候选）
-                let text = state.temp_english_buffer.clone();
+                // 回车：上屏原始输入文本（不取候选）；缓冲空时上屏触发键字符（触发键透传）
+                let text = if state.temp_english_buffer.is_empty() {
+                    state.temp_english_prefix.clone()
+                } else {
+                    state.temp_english_buffer.clone()
+                };
                 commit_text(self, state, text)
             }
             keymap::VK_A..=keymap::VK_Z => {

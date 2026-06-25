@@ -274,6 +274,8 @@ pub(crate) struct State {
     pub(crate) quick_saved_vertical: Option<bool>,
     /// 临时英文输入缓冲
     pub(crate) temp_english_buffer: String,
+    /// 临时英文前缀字符（触发键符号，如 "/"；触发键进入时非空，Shift+字母进入时为空）
+    pub(crate) temp_english_prefix: String,
     /// 网址模式输入缓冲（原样累积的 URL 文本）
     pub(crate) url_buffer: String,
     /// 统一夺取回退登记（仅在夺取式模式激活时为 Some，见 pipeline::Rewind）
@@ -723,6 +725,7 @@ impl Coordinator {
                 temp_pinyin_prefix: String::new(),
                 quick_saved_vertical: None,
                 temp_english_buffer: String::new(),
+                temp_english_prefix: String::new(),
                 url_buffer: String::new(),
                 rewind: None,
                 special_buffer: String::new(),

@@ -61,6 +61,7 @@ impl Coordinator {
             }
             state.active = Some(ModeKind::TempEnglish);
             state.temp_english_buffer = ch.to_string();
+            state.temp_english_prefix = String::new();
             self.update_temp_english_candidates(state);
             let disp = state.preedit.clone();
             self.notify_ui_update(state);
@@ -73,6 +74,32 @@ impl Coordinator {
 
         // 快捷输入已退役为内置类方案 mix 成员（quick_input），不再独立激活：
         // 想要纯快捷输入，配一个 members=["quick_input"] 的 mix 即可。; 默认走「快捷」融合 mix。
+
+        // 临时英文触发键：符号键进入（空缓冲 + 无候选 + 已启用 + 无修饰键 + 匹配 trigger_keys）
+        if state.input_buffer.is_empty()
+            && state.candidates.is_empty()
+            && self.rt().config.input.temp_english.enabled
+            && data.modifiers & (MOD_CTRL | MOD_ALT | MOD_SHIFT) == 0
+            && self.is_temp_english_trigger(data.key_code)
+        {
+            let prefix = wind_keys::keymap::vk_to_prefix_char(data.key_code)
+                .map(|c| c.to_string())
+                .unwrap_or_default();
+            state.active = Some(ModeKind::TempEnglish);
+            state.temp_english_buffer.clear();
+            state.temp_english_prefix = prefix;
+            self.update_temp_english_candidates(state);
+            let disp = state.preedit.clone();
+            self.notify_ui_update(state);
+            debug!(
+                "Entered temp English mode via trigger key (prefix={})",
+                state.temp_english_prefix
+            );
+            return Some(KeyAction::UpdateComposition {
+                text: disp.clone(),
+                caret_pos: disp.chars().count() as u32,
+            });
+        }
 
         // 临时拼音：码表方案 + 空缓冲 + 匹配触发键 + 无修饰键（不要求候选空）
         if state.input_buffer.is_empty()
@@ -128,6 +155,7 @@ impl Coordinator {
         let dirty = state.active.is_some();
         state.active = None;
         state.temp_english_buffer.clear();
+        state.temp_english_prefix.clear();
         state.temp_pinyin_buffer.clear();
         state.temp_pinyin_prefix.clear();
         state.url_buffer.clear();
