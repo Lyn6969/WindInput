@@ -95,7 +95,11 @@
 - **5.5** 前端 `config-keys.json` + ~25 文件键名替换；`frontend_config_keys_known_to_core` 收紧（清空 ALLOWLIST，旧键不兼容）。
 - **5.6** 迁移表与实现核对定稿。
 **Tests**: 全程靠既有三向绑定测试 + 编译器报错兜底；无 alias 迁移测试（不做向后兼容）。
-**Status**: In Progress（5.1 开始）
+**Status**: Complete（5.1–5.6 全完成）
+- config.rs 重排为 9 顶级域；config_schema 127 键 + data/config.toml + manifest.toml 同步；下游 ~60 读取点编译器引导改齐。
+- 前端 webview 同步：config-keys.json 按注册表重生成 127 键；schema/页面/搜索索引改键 + 删 35 死字段；`FRONTEND_AHEAD_ALLOWLIST` 清空。
+- Rust workspace 449 测 + 前端 vitest 73 + `pnpm build` 全绿。提交 main `15e0891`(feat)/`6da694a`(fmt)，**未 push**。
+- webview **保留备用**（等 Native 对等后再去除，非本阶段）。
 
 ---
 
