@@ -687,6 +687,30 @@ impl CandidateWindow {
                 .or_else(|| (item.font_weight != 0).then_some(item.font_weight))
                 .unwrap_or(0)
         };
+        // 有效边框（base ⊕ selected/hover patch，对齐 Go effectiveNode）：返回设备像素
+        // (颜色, 线宽, 圆角)。仅当节点/状态给了 border 色才绘制（如 svgtest text.selected.border）。
+        let eff_border = |node: &RvNode, sel: bool, hov: bool| -> Option<([u8; 4], f32, f32)> {
+            let st = if sel {
+                node.selected.as_deref()
+            } else if hov {
+                node.hover.as_deref()
+            } else {
+                None
+            };
+            let color = st.and_then(|n| n.border_color).or(node.border_color)?;
+            let width = st
+                .and_then(|n| n.border_width)
+                .or(node.border_width)
+                .map(|d| d.resolve(s, 0.0))
+                .unwrap_or(s)
+                .max(1.0);
+            let radius = st
+                .and_then(|n| n.border_radius)
+                .or(node.border_radius)
+                .map(|d| d.resolve(s, 0.0))
+                .unwrap_or(0.0);
+            Some((color, width, radius))
+        };
 
         let mut root = View::container(Layout::Column)
             .bg(col(v.window.bg_color, [255, 255, 255, 255]))
@@ -921,6 +945,9 @@ impl CandidateWindow {
                         .fixed_h(d)
                         .text_align(Align::Center);
                 }
+                if let Some((bc, bw, br)) = eff_border(&v.index, is_sel, is_hover) {
+                    idx_leaf = idx_leaf.border(bc, bw).radius(br);
+                }
                 item = item.child(idx_leaf);
             }
             // no_index 行无序号节点：文字左边距归零，顶格不留序号间距（消除占位）。
@@ -929,25 +956,29 @@ impl CandidateWindow {
             } else {
                 edges_or(&v.text.margin, [0.0, 0.0, 0.0, 4.0])
             };
-            item = item.child(
-                View::leaf(cand.text.clone(), txt_color)
-                    .font_size(text_fs)
-                    .font_weight(eff_weight(&v.text, &v.item, is_sel, is_hover))
-                    .font_family(v.text.font_family.clone())
-                    .pad(edges_or(&v.text.padding, [0.0; 4]))
-                    .margin(text_margin),
-            );
+            let mut tleaf = View::leaf(cand.text.clone(), txt_color)
+                .font_size(text_fs)
+                .font_weight(eff_weight(&v.text, &v.item, is_sel, is_hover))
+                .font_family(v.text.font_family.clone())
+                .pad(edges_or(&v.text.padding, [0.0; 4]))
+                .margin(text_margin);
+            if let Some((bc, bw, br)) = eff_border(&v.text, is_sel, is_hover) {
+                tleaf = tleaf.border(bc, bw).radius(br);
+            }
+            item = item.child(tleaf);
             // 注释（编码后缀/短语提示）：非空时在候选词右侧以注释样式内联显示。
             // 内/外边距完整消费：comment.padding 四边 + comment.margin 四边（左默认 6dp 兜底间距）。
             if !cand.comment.is_empty() {
-                item = item.child(
-                    View::leaf(cand.comment.clone(), cmt_color)
-                        .font_size(comment_fs)
-                        .font_weight(eff_weight(&v.comment, &v.item, is_sel, is_hover))
-                        .font_family(v.comment.font_family.clone())
-                        .pad(edges_or(&v.comment.padding, [0.0; 4]))
-                        .margin(edges_or(&v.comment.margin, [0.0, 0.0, 0.0, 6.0])),
-                );
+                let mut cleaf = View::leaf(cand.comment.clone(), cmt_color)
+                    .font_size(comment_fs)
+                    .font_weight(eff_weight(&v.comment, &v.item, is_sel, is_hover))
+                    .font_family(v.comment.font_family.clone())
+                    .pad(edges_or(&v.comment.padding, [0.0; 4]))
+                    .margin(edges_or(&v.comment.margin, [0.0, 0.0, 0.0, 6.0]));
+                if let Some((bc, bw, br)) = eff_border(&v.comment, is_sel, is_hover) {
+                    cleaf = cleaf.border(bc, bw).radius(br);
+                }
+                item = item.child(cleaf);
             }
             // 选中底色优先于悬停底色（两者独立：选中=空格上屏目标，悬停=鼠标提示）
             if is_sel {
@@ -1050,9 +1081,12 @@ impl CandidateWindow {
                             } else {
                                 String::new()
                             },
-                            marker_c,
+                            // 页码颜色用主题 footer_bar.color（如 svgtest 的亮红/暗粉），缺则回退 text_dim。
+                            col(v.footer_bar.text_color, marker_c),
                         )
-                        .font_size(footer_fs),
+                        .font_size(footer_fs)
+                        .font_weight(v.footer_bar.font_weight)
+                        .font_family(v.footer_bar.font_family.clone()),
                     )
                     .child(arrow(
                         next_icon,
