@@ -153,6 +153,8 @@ build_core() {
     [ -f "$src" ] || { err "未找到产物: $src"; return 1; }
     cp -f "$src" "$outdir/wind_input${suffix}.exe"
     gray "已构建: wind_input${suffix}.exe ($(du -h "$outdir/wind_input${suffix}.exe" | cut -f1))"
+    # CLI 包装器 (wind_input config ...; 运行时自辨 debug/release exe, 两变体共用一份)
+    [ -f "$PROJECT_ROOT/scripts/wind_cli.bat" ] && cp -f "$PROJECT_ROOT/scripts/wind_cli.bat" "$outdir/wind_cli.bat" && gray "已复制: wind_cli.bat"
 }
 
 do_check() {
@@ -502,7 +504,8 @@ do_push_module() {
     local files=()
     case "$mod" in
         tsf)     files=("wind_tsf${sfx}.dll" "wind_tsf${sfx}_x86.dll") ;;
-        core)    files=("wind_input${sfx}.exe") ;;
+        core)    files=("wind_input${sfx}.exe")
+                 [ -f "$outdir/wind_cli.bat" ] && files+=("wind_cli.bat") ;;  # CLI 包装器随核心
         *)       err "未知模块: $mod（tsf|core）"; return 1 ;;
     esac
     local f

@@ -3,4 +3,5 @@ build_debug/
 build/
 .cache/
 scripts/deploy.local
+scripts/deploy.local.ps1
 /.remote/

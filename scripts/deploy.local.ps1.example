@@ -1,0 +1,18 @@
+# scripts/deploy.local.ps1 —— Windows 本机部署配置（复制为 deploy.local.ps1 后修改；已 gitignore）
+# 供 dev.ps1 的部署命令 (p1 / pd1 / pm* / pdm*) 使用，覆盖默认目标目录。
+#
+# 格式：标准 PowerShell 变量赋值（由 dev.ps1 点源加载）。
+# 仅识别以下两个变量：
+#
+#   $DeployDirRelease  p1 / pm* 目标目录（release）
+#   $DeployDirDebug    pd1 / pdm* 目标目录（debug）
+#
+# 默认值（不配置即用此值）：
+#   $DeployDirRelease = "C:\Program Files\WindInput"
+#   $DeployDirDebug   = "C:\Program Files\WindInputDev"
+#
+# 注：目标在 C:\Program Files\ 等受保护目录时，部署会自动触发 UAC 提权。
+#     若改到非受保护目录（如下例），则无需管理员权限。
+
+$DeployDirRelease = "D:\Software\WindInput"
+$DeployDirDebug   = "D:\Software\WindInputDev"
