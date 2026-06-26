@@ -115,6 +115,8 @@ WindInput/              产品仓根
 
 ### 阶段 D — 配套与设置程序
 
+rpc（空桩，**用户已明确延后**）、backup、clipboard、systemfont、theme 完整、perf、e2e 测试设施、macOS 平台实现。
+
 ### 贯穿原则
 - 每个改动用 `wind_input/scripts/dev.sh ci`（fmt-check + clippy + test）把关。
 - 删坏设计：发现 Go 的冗余/坏抽象，记录在对应 redesign spec 的"不照搬"小节，明确不移植。
