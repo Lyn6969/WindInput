@@ -6,19 +6,21 @@
 #   ./scripts/dev.sh <命令>     # 非交互直调, 如 ./scripts/dev.sh release
 #
 # 本机 (Linux) 交叉编译为 Windows (MSVC) 可执行文件:
+#   - Rust(wind_input): cargo-xwin → x86_64-pc-windows-msvc (+crt-static 自包含)
 #   - C++ TSF: clang + lld-link + llvm-rc + cargo-xwin 的 MSVC SDK (x64 + x86)
-#   - 依赖: cargo-xwin + clang-19/lld-19/llvm-19 (MSVC STL 要 clang≥19) + pnpm/node(Tauri)
+#   - 依赖: cargo-xwin + clang-19/lld-19/llvm-19 (MSVC STL 要 clang≥19)
 #   - 全构建产物落【项目根】build/(release) 或 build_debug/(debug)，内容 == 安装内容
 #
 # 命令（菜单与命令行直调同一套；前缀 d=debug, p=push, m=单模块）:
+#   1            Release 全构建: wind_input + tsf(x64/x86) + 词库数据 → build/
 #   d1           Debug 全构建 → build_debug/
 #   m1 / dm1     仅 tsf (x64+x86)            release / debug
 #   m2 / dm2     仅 wind_input (核心 exe)     release / debug
 #   8            生成安装包 (= 1 + 打包 → Setup.exe + sha256)
 #   8s           跳过编译，直接打包现有 build/
 #   p1 / pd1     push 全部 build[_debug]/ → Windows 安装目录 (release / debug)
-#   pm1/pm2/pm3      push 单模块 (tsf/核心/设置, release)
-#   pdm1/pdm2/pdm3   push 单模块 (debug)
+#   pm1/pm2      push 单模块 (tsf/核心, release)
+#   pdm1/pdm2    push 单模块 (debug)
 #   k=check  l=clippy  t=test  f=fmt  fmt-check  ci(=fmt+clippy+test)  clean
 #   gd=gen-data  r=repl  dl=pull-data  pc=pull-config  pl=pull-log(pla=全部)
 #
@@ -407,6 +409,7 @@ remote_ps() {
 # 本 profile 的二进制基名（exe/dll）。data/ 不在此（不会被锁，直接 scp 覆盖）。
 bins_for() {
     local sfx=""; [ "$1" = debug ] && sfx="_debug"
+    printf '%s\n' "wind_input${sfx}.exe" "wind_tsf${sfx}.dll" "wind_tsf${sfx}_x86.dll"
 }
 
 # 把 bash 列表转成 PowerShell 字符串数组字面量： a b → 'a','b'
@@ -419,6 +422,7 @@ remote_taskkill() {
     local procs=()
     case "$mod" in
         core)    procs=("wind_input${sfx}.exe") ;;
+        tsf|"")  procs=("wind_input${sfx}.exe") ;;  # 改 DLL 也需停宿主
     esac
     local p
     for p in "${procs[@]}"; do
@@ -488,7 +492,7 @@ do_push_full() {
 }
 
 # 单模块 push：只推对应文件（不重编，用现有 build[_debug]/ 产物）。
-#   pm1=tsf  pm2=core  pm3=setting （pd 前缀 = debug）
+#   pm1=tsf  pm2=core （pd 前缀 = debug）
 do_push_module() {
     local profile="${1:-release}" mod="$2"
     require_remote || return 1
@@ -499,7 +503,7 @@ do_push_module() {
     case "$mod" in
         tsf)     files=("wind_tsf${sfx}.dll" "wind_tsf${sfx}_x86.dll") ;;
         core)    files=("wind_input${sfx}.exe") ;;
-        *)       err "未知模块: $mod（tsf|core|setting）"; return 1 ;;
+        *)       err "未知模块: $mod（tsf|core）"; return 1 ;;
     esac
     local f
     for f in "${files[@]}"; do
@@ -705,50 +709,6 @@ do_installer() {
     "$SCRIPT_DIR/pack-installer.sh" --version "$VERSION" || return 1
 }
 
-# ---------- 菜单 ----------
-
-# 注：Tauri 的 Windows 安装包(bundle)须在 Windows 上 `pnpm tauri build` 产出；
-# Linux 这里只做「前端构建 + Rust 交叉编译校验」，供交叉验证与 push-all 后在 Windows 构建。
-do_setting_build() {
-    cd "$SETTING_DIR" || return 1
-    if [ ! -d node_modules ]; then
-        pnpm install || { err "pnpm install 失败"; return 1; }
-    fi
-    pnpm build || { err "前端构建失败"; return 1; }
-    # Tauri 应用经 cargo-xwin 交叉编 MSVC(Windows 用 WebView2,无需 Linux GTK)
-    ( cd src-tauri && cargo_xwin check --target "$TARGET" ) || { err "src-tauri 编译失败"; return 1; }
-    gray "提示: Windows 安装包(bundle/installer)仍须在 Windows 上 'pnpm tauri build'。"
-}
-
-# debug 变体同样走 release profile + debug_variant 特性：debug_assertions 关闭，
-# main.rs 的 windows_subsystem="windows" 生效 → 无 cmd 控制台窗口；管道后缀 _debug 连调试核心。
-# 工具链缺失(pnpm/clang)→ 告警跳过(非致命);构建失败→致命。
-build_setting() {
-    local profile="${1:-release}" outdir="${2:-$(out_for "$1")}"
-    if ! command -v pnpm >/dev/null 2>&1 || ! command -v "clang-$WIND_LLVM_VER" >/dev/null 2>&1; then
-        return 0
-    fi
-    # custom-protocol:Tauri 生产模式加载内嵌 frontendDist 必需(否则退回 devUrl/localhost)。
-    # 纯 cargo 构建不会自动带(tauri CLI 才会),故显式加。debug 再叠加 debug_variant。
-    local featlist="custom-protocol" suffix="" tauri_cfg=""
-    # debug 变体:① 叠加 debug_variant(devtools + 管道 _debug 后缀);
-    #            ② 经 TAURI_CONFIG 覆盖 identifier 为 com.windinput.setting-debug
-    #               → 单例插件的 {id}-sim 锁与 release 隔离、WebView2 数据目录也分开。
-    #               (纯 cargo 构建不经 tauri CLI,靠该环境变量在 build.rs/generate_context! 期合并)
-    [ "$profile" = debug ] && {
-        featlist="custom-protocol,debug_variant"; suffix="_debug"
-        tauri_cfg='{"identifier":"com.windinput.setting-debug","productName":"清风输入法设置 (Debug)"}'
-    }
-    (
-        cd "$SETTING_DIR" || exit 1
-        [ -d node_modules ] || pnpm install || exit 1
-        pnpm build || exit 1
-        cd src-tauri || exit 1
-        [ -n "$tauri_cfg" ] && export TAURI_CONFIG="$tauri_cfg"
-        cargo_xwin build --release --target "$TARGET" --features "$featlist" || exit 1
-    [ -f "$exe" ] || { err "未找到产物: $exe"; return 1; }
-}
-
 
 # (扫描旁置的 wind_input_debug.exe)。故 release/debug 两种 profile 产出同一份 exe，
 # 同时拷到 build/ 与 build_debug/，变体在目标机由布局决定。
@@ -766,6 +726,7 @@ show_menu() {
     printf '%b  WindInput 开发菜单  v%s  (Linux→Win, MSVC)%b\n' "$C_CYAN" "$VERSION" "$C_RESET"
     printf '%b============================================%b\n\n' "$C_CYAN" "$C_RESET"
     printf '%b  全构建 (→ 项目根 build/，内容 == 安装到 Program Files):%b\n' "$C_YELLOW" "$C_RESET"
+    echo  "    1    Release 全构建: wind_input + tsf(x64/x86) + 词库数据"
     echo  "    d1   Debug 全构建 (→ build_debug/)"
     printf '\n%b  单模块构建 (前缀 d = debug):%b\n' "$C_YELLOW" "$C_RESET"
     echo  "    m1   仅 tsf (x64+x86)        dm1"
@@ -775,12 +736,13 @@ show_menu() {
     echo  "    8s   跳过编译, 直接打包现有 build/"
     printf '\n%b  部署 → Windows (deploy.local 配 RELEASE/DEBUG 路径; SSH → %s):%b\n' "$C_YELLOW" "${WIND_REMOTE:-未配置}" "$C_RESET"
     echo  "    p1   push 全部 (release)        pd1   push 全部 (debug)"
-    echo  "    pm1/pm2/pm3  push 模块(tsf/核心/设置)    pdm1/pdm2/pdm3 (debug)"
+    echo  "    pm1/pm2  push 模块(tsf/核心)    pdm1/pdm2 (debug)"
     printf '\n%b  代码质量:%b\n' "$C_YELLOW" "$C_RESET"
     echo  "    k=check  l=clippy  t=test  f=fmt  ci=fmt+clippy+test"
     printf '\n%b  远程数据 / 实测:%b\n' "$C_YELLOW" "$C_RESET"
     echo  "    r=repl(本机)  dl=pull-data  pc=pull-config  pl=pull-log(pla=全部)"
     printf '\n%b  杂项:%b\n' "$C_YELLOW" "$C_RESET"
+    echo  "    gd=gen-data  clean  q=退出"
     printf '%b============================================%b\n' "$C_CYAN" "$C_RESET"
 }
 
@@ -795,18 +757,14 @@ dispatch() {
         dm1)              build_tsf_all debug ;;
         m2)               build_core release ;;
         dm2)              build_core debug ;;
-        m3)               build_setting release ;;
-        dm3)              build_setting debug ;;
         8|installer|pack) do_installer ;;
         8s|installer-skip) do_installer skip ;;
         p1)               do_push_full release ;;
         pd1)              do_push_full debug ;;
         pm1)              do_push_module release tsf ;;
         pm2)              do_push_module release core ;;
-        pm3)              do_push_module release setting ;;
         pdm1)             do_push_module debug tsf ;;
         pdm2)             do_push_module debug core ;;
-        pdm3)             do_push_module debug setting ;;
         k|check)          do_check ;;
         l|clippy)         do_clippy ;;
         t|test)           do_test ;;
@@ -814,7 +772,6 @@ dispatch() {
         fmt-check)        do_fmt_check ;;
         ci)               do_ci ;;
         clean)            do_clean ;;
-        sb|setting)       do_setting_build ;;
         gd|gen-data)      do_gen_data ;;
         r|repl)           do_repl "${2:-}" ;;
         dl|pull-data)     do_pull_data "${2:-}" ;;

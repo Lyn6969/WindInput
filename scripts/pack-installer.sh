@@ -116,10 +116,6 @@ cp -f  "$BUILD_DIR/wind_tsf_x86.dll" "$STAGE/"
 cp -rf "$BUILD_DIR/data"             "$STAGE/"
 cp -f  "$UNINSTALLER"                "$STAGE/uninstall.exe"
 
-# 跨平台限制：Linux 交叉编不出 Tauri Windows 包，故可选——存在即随包，缺失仅告警。
-else
-fi
-
 # 单一二进制，运行时自辨变体；不存在仅告警(运行 'dev.sh m4' 构建到 build/)。
 else
 fi

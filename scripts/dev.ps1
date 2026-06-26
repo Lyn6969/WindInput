@@ -24,6 +24,7 @@ function Show-Menu {
     Write-Host "  构建:" -ForegroundColor Yellow
     Write-Host "    1  - Release 构建 + 部署" -ForegroundColor White
     Write-Host "    1d - Debug 构建 + 部署" -ForegroundColor White
+    Write-Host "    a  - 一键全编译 (core; ad = debug)" -ForegroundColor White
     Write-Host "    2  - cargo check (快速编译检查)" -ForegroundColor White
     Write-Host "    3  - cargo clippy (代码检查)" -ForegroundColor White
     Write-Host "    4  - cargo test (运行测试)" -ForegroundColor White
@@ -175,39 +176,10 @@ function Deploy-All {
     Write-Host "部署完成!" -ForegroundColor Green
 }
 
-function Build-Setting {
-    param([bool]$Debug = $false)
-    $outDir = if ($Debug) { $BuildDebugDir } else { $BuildDir }
-    $suffix = if ($Debug) { "_debug" } else { "" }
-    $binSuffix = if ($Debug) { "debug" } else { "release" }
-
-    Set-Location $SettingDir
-    if (-not (Test-Path "node_modules")) {
-        Write-Host "pnpm install..." -ForegroundColor Gray
-        pnpm install
-        if ($LASTEXITCODE -ne 0) { Write-Host "pnpm install 失败!" -ForegroundColor Red; return }
-    }
-    # debug 变体：必须把管道后缀 _debug 烤进 exe（终端用户启动时无环境变量），
-    # 故传 cargo --features debug_variant；--features 经 tauri 透传给 cargo。
-    if ($Debug) {
-        pnpm tauri build --debug --features debug_variant
-    } else {
-        pnpm tauri build
-    }
-    if ($LASTEXITCODE -ne 0) { Write-Host "tauri build 失败!" -ForegroundColor Red; return }
-
-    # Tauri 原始 exe 位于 src-tauri\target\<profile>\<bin>.exe（顶层，非 deps\）。
-    New-Item -ItemType Directory -Path $outDir -Force | Out-Null
-    $targetDir = "$SettingDir\src-tauri\target\$binSuffix"
-    $srcExe = Get-ChildItem "$targetDir\*.exe" -File -ErrorAction SilentlyContinue | Select-Object -First 1
-    if ($null -eq $srcExe) {
-    }
-}
-
+# 一键全编译（类 Go）：core(exe+TSF+data) 进 build/。
 function Build-All {
     param([bool]$Debug = $false)
     Invoke-Build -Debug $Debug
-    Build-Setting -Debug $Debug
     $outDir = if ($Debug) { $BuildDebugDir } else { $BuildDir }
     Write-Host "`n一键全编译完成 -> $outDir" -ForegroundColor Green
 }
@@ -222,8 +194,6 @@ while ($true) {
         "1d" { Invoke-Build -Debug $true; Pause }
         "a"  { Build-All -Debug $false; Pause }
         "ad" { Build-All -Debug $true; Pause }
-        "sb" { Build-Setting -Debug $false; Pause }
-        "sbd" { Build-Setting -Debug $true; Pause }
         "2"  { Invoke-Check; Pause }
         "3"  { Invoke-Clippy; Pause }
         "4"  { Invoke-Test; Pause }

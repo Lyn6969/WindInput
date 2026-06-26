@@ -60,7 +60,7 @@ fn locate() -> anyhow::Result<PathBuf> {
 mod schema_binding {
     //! manifest（展示层）↔ config_schema registry（类型/校验层）一致性绑定。
     //! 三层真相源（struct/registry/manifest）靠这些测试两两锁定，杜绝漂移。
-    use wind_config::config_schema::{FieldType, field, registry};
+    use wind_config::config_schema::{FieldType, field};
 
     fn items() -> Vec<serde_json::Value> {
         let m = super::load("test").expect("加载 manifest");
@@ -68,41 +68,6 @@ mod schema_binding {
             .and_then(|v| v.as_array())
             .cloned()
             .unwrap_or_default()
-    }
-
-    /// 前端 webview（wind_setting）仍引用、但 core 不再登记的键。
-    /// 6 域重命名（不做向后兼容）后前端已与注册表锁步，名单清空——
-    /// 旧/孤立键已从前端删除，新增前端字段必须同步到 config.rs 结构体 + config_schema 注册表。
-    const FRONTEND_AHEAD_ALLOWLIST: &[&str] = &[];
-
-    /// CI 校验：前端 `wind_setting/src/generated/config-keys.json` 的每个 key 要么在 registry，
-    /// 要么在 [`FRONTEND_AHEAD_ALLOWLIST`]。新增前端键若 core 不认识且未列入名单即红，
-    /// 提醒同步 struct+registry（防 cross-language 漂移；对齐用户「加 CI 校验」决策）。
-    #[test]
-    fn frontend_config_keys_known_to_core() {
-        let path = concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/../../../wind_setting/src/generated/config-keys.json"
-        );
-        let text = std::fs::read_to_string(path)
-            .unwrap_or_else(|e| panic!("读取前端 {path} 失败（CI 校验需要）: {e}"));
-        let keys: Vec<String> =
-            serde_json::from_str(&text).expect("config-keys.json 应为字符串数组");
-
-        let registered: std::collections::BTreeSet<&str> =
-            registry().iter().map(|f| f.key).collect();
-        let unexpected: Vec<&String> = keys
-            .iter()
-            .filter(|k| {
-                !registered.contains(k.as_str()) && !FRONTEND_AHEAD_ALLOWLIST.contains(&k.as_str())
-            })
-            .collect();
-        assert!(
-            unexpected.is_empty(),
-            "前端 config-keys.json 含 {} 个 core 未登记且不在允许名单的 key（请同步 config.rs 结构体 + config_schema 注册表，或确属前端先行则加入 FRONTEND_AHEAD_ALLOWLIST）: {:?}",
-            unexpected.len(),
-            unexpected
-        );
     }
 
     /// 每个 manifest item.key 必须在 registry 登记——否则写入会被 serde 静默丢弃。
