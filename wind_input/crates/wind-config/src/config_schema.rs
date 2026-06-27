@@ -620,4 +620,26 @@ mod tests {
             FieldType::Map => value.is_table(),
         }
     }
+
+    /// data/config.toml 每个已登记叶子键的值，必须通过 registry 校验（类型 / enum 合法）。
+    /// 注意：config.toml 作为系统预置可合法覆盖 code default，故此处只校验「合法」而非「等于默认」。
+    #[test]
+    fn data_config_toml_values_pass_validation() {
+        let toml_val = data_config_toml();
+        let mut bad = Vec::new();
+        for (key, value) in leaf_entries(&toml_val) {
+            // 未登记键由 data_config_toml_has_no_orphan_keys 守护，这里只校验已登记项的值
+            if field(&key).is_none() {
+                continue;
+            }
+            if let Err(e) = validate(&key, &value) {
+                bad.push(format!("{key}: {e}"));
+            }
+        }
+        assert!(
+            bad.is_empty(),
+            "data/config.toml 含非法值（类型/enum 不符 registry）:\n{}",
+            bad.join("\n")
+        );
+    }
 }

@@ -25,6 +25,7 @@ enabled = false
 
 [schema.quick_input]
 # 注：; 由内置 mix「快捷」融合接管（quick_input 作为其成员，同时支持日期/计算/拼音/英文）。
+enabled = true
 force_vertical = true
 decimal_places = 6
 
@@ -85,12 +86,22 @@ prefixes = ["www.", "http", "https", "ftp."]
 enabled = false
 variant = "s2t"
 
+# 全码/空码上屏策略全局默认（方案级 [engine.codetable] tri-state 字段未设时回退至此）
+[input.code_commit]
+auto_commit_at_full = false
+auto_commit_block_on_pinyin = true
+auto_commit_min_len = 0
+top_code_commit = false
+clear_on_empty_max = false
+
 [input.cmdbar]
+enabled = false
 candidate_prefix = "⚡"
 
 # 短语前缀列举（原 [dict.phrase]）
 [input.phrase]
 min_prefix = 2
+max_display_chars = 30
 
 [keys]
 toggle_mode_keys = ["lshift", "rshift"]

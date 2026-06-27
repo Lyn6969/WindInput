@@ -199,7 +199,7 @@ pub struct PinyinFuzzy {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct QuickInputConfig {
-    #[serde(default)]
+    #[serde(default = "default_true")]
     pub enabled: bool,
     /// 计算器结果小数位数，默认 6
     #[serde(default = "default_decimal_places")]
@@ -216,7 +216,7 @@ fn default_decimal_places() -> i32 {
 impl Default for QuickInputConfig {
     fn default() -> Self {
         Self {
-            enabled: false,
+            enabled: true,
             decimal_places: default_decimal_places(),
             force_vertical: false,
         }
@@ -288,7 +288,7 @@ pub struct InputConfig {
     pub enter_behavior: String,
     #[serde(default = "default_space_behavior")]
     pub space_on_empty_behavior: String,
-    #[serde(default)]
+    #[serde(default = "default_numpad_behavior")]
     pub numpad_behavior: String,
     /// 启动默认状态（记住上次状态 / 默认中文 / 全角 / 中文标点；原 general 域）。
     #[serde(default)]
@@ -333,7 +333,7 @@ impl Default for InputConfig {
             filter_mode: "smart".to_string(),
             enter_behavior: "commit".to_string(),
             space_on_empty_behavior: "commit".to_string(),
-            numpad_behavior: String::new(),
+            numpad_behavior: default_numpad_behavior(),
             default: InputDefaultConfig::default(),
             punct: PunctConfig::default(),
             symbol: SymbolConfig::default(),
@@ -412,10 +412,10 @@ impl Default for SymbolConfig {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AutoPairConfig {
     /// 中文标点配对开关
-    #[serde(default = "default_true")]
+    #[serde(default)]
     pub chinese: bool,
     /// 英文标点配对开关
-    #[serde(default = "default_true")]
+    #[serde(default)]
     pub english: bool,
     /// 中文配对表（每项 2 字符："（）"）
     #[serde(default = "default_chinese_pairs")]
@@ -428,8 +428,8 @@ pub struct AutoPairConfig {
 impl Default for AutoPairConfig {
     fn default() -> Self {
         Self {
-            chinese: true,
-            english: true,
+            chinese: false,
+            english: false,
             chinese_pairs: default_chinese_pairs(),
             english_pairs: default_english_pairs(),
         }
@@ -567,12 +567,21 @@ impl Default for CodeCommitConfig {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct S2TConfig {
     #[serde(default)]
     pub enabled: bool,
-    #[serde(default)]
+    #[serde(default = "default_s2t_variant")]
     pub variant: String,
+}
+
+impl Default for S2TConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            variant: default_s2t_variant(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -613,9 +622,9 @@ pub struct KeysConfig {
     pub toggle_full_width: String,
     #[serde(default = "default_toggle_punct")]
     pub toggle_punct: String,
-    #[serde(default = "default_hotkey_none")]
+    #[serde(default = "default_toggle_toolbar")]
     pub toggle_toolbar: String,
-    #[serde(default = "default_hotkey_none")]
+    #[serde(default = "default_open_settings")]
     pub open_settings: String,
     #[serde(default = "default_add_word")]
     pub add_word: String,
@@ -673,9 +682,6 @@ fn default_pin_candidate() -> String {
 fn default_delete_candidate() -> String {
     "ctrl+shift+number".to_string()
 }
-fn default_hotkey_none() -> String {
-    "none".to_string()
-}
 fn default_select_key_groups() -> Vec<String> {
     vec!["semicolon_quote".to_string()]
 }
@@ -694,8 +700,8 @@ impl Default for KeysConfig {
             switch_engine: default_switch_engine(),
             toggle_full_width: default_toggle_full_width(),
             toggle_punct: default_toggle_punct(),
-            toggle_toolbar: default_hotkey_none(),
-            open_settings: default_hotkey_none(),
+            toggle_toolbar: default_toggle_toolbar(),
+            open_settings: default_open_settings(),
             add_word: default_add_word(),
             toggle_s2t: default_toggle_s2t(),
             activate_ime: default_activate_ime(),
@@ -1109,7 +1115,7 @@ pub struct TooltipConfig {
 }
 
 fn default_tooltip_delay() -> i32 {
-    100
+    200
 }
 
 impl Default for TooltipConfig {
@@ -1162,7 +1168,7 @@ fn default_phrase_max_display_chars() -> usize {
 pub struct StatsConfig {
     #[serde(default = "default_true")]
     pub enabled: bool,
-    #[serde(default)]
+    #[serde(default = "default_true")]
     pub track_english: bool,
 }
 
@@ -1170,7 +1176,7 @@ impl Default for StatsConfig {
     fn default() -> Self {
         Self {
             enabled: true,
-            track_english: false,
+            track_english: true,
         }
     }
 }
@@ -1193,6 +1199,22 @@ pub struct DebugConfig {
 
 fn default_true() -> bool {
     true
+}
+
+fn default_numpad_behavior() -> String {
+    "direct".to_string()
+}
+
+fn default_s2t_variant() -> String {
+    "s2t".to_string()
+}
+
+fn default_toggle_toolbar() -> String {
+    "ctrl+shift+\\".to_string()
+}
+
+fn default_open_settings() -> String {
+    "ctrl+shift+]".to_string()
 }
 
 fn default_smart_symbol_timeout_ms() -> i32 {
@@ -1271,6 +1293,21 @@ impl Config {
         let mut config: Config = merged.try_into()?;
         config.normalize();
         Ok(config)
+    }
+
+    /// 系统预置配置的 TOML 值：代码默认(L1) ⊕ `data/config.toml`(L2)，**不含用户层(L3)**。
+    ///
+    /// 供 capability 的 `default` 来源——出厂默认 = L1⊕L2。config.toml 作为系统预置
+    /// 可合法覆盖 L1（如 schema.active、compat.host_render_processes）。
+    pub fn system_preset_value(data_dir: Option<&Path>) -> anyhow::Result<toml::Value> {
+        let mut merged = toml::Value::try_from(Self::default())?;
+        if let Some(data_dir) = data_dir {
+            let sys_config = data_dir.join("config.toml");
+            if let Some(v) = Self::read_toml_value(&sys_config) {
+                merge_value(&mut merged, v);
+            }
+        }
+        Ok(merged)
     }
 
     /// 读取 TOML 文件为 Value（不存在/解析失败返回 None 并告警，不中断加载）
@@ -1517,7 +1554,7 @@ mod tests {
     #[test]
     fn test_tooltip_defaults_match_go() {
         let t = Config::default().ui.tooltip;
-        assert_eq!(t.delay, 100);
+        assert_eq!(t.delay, 200, "delay 按 data/config.toml 预置默认 200（偏离 Go 的 100）");
         assert!(t.code_enabled, "code 默认开");
         assert!(
             t.pinyin_enabled && t.pinyin_heteronyms,
@@ -1538,7 +1575,7 @@ mod tests {
         assert_eq!(cfg.ui.tooltip.pinyin_max_readings, 2);
         // 未指定字段保留默认
         assert!(cfg.ui.tooltip.code_enabled, "code 未指定应保留默认开");
-        assert_eq!(cfg.ui.tooltip.delay, 100);
+        assert_eq!(cfg.ui.tooltip.delay, 200);
     }
 
     #[test]
@@ -1625,7 +1662,7 @@ mod tests {
         // 模式三件套归 schema
         assert_eq!(c.schema.mix_modes.len(), 1, "默认一个快捷 mix");
         assert_eq!(c.schema.mix_modes[0].trigger_keys, vec!["semicolon"]);
-        assert!(!c.schema.quick_input.enabled);
+        assert!(c.schema.quick_input.enabled);
         assert_eq!(c.schema.quick_input.decimal_places, 6);
         // input 子组
         assert!(
@@ -1637,6 +1674,24 @@ mod tests {
         assert_eq!(c.input.url.prefixes.len(), 5);
         // input.phrase / stats
         assert_eq!(c.input.phrase.min_prefix, 2);
-        assert!(c.stats.enabled && !c.stats.track_english);
+        assert!(c.stats.enabled && c.stats.track_english);
+    }
+
+    #[test]
+    fn system_preset_without_data_dir_equals_default() {
+        let preset = Config::system_preset_value(None).unwrap();
+        assert_eq!(preset, toml::Value::try_from(Config::default()).unwrap());
+    }
+
+    #[test]
+    fn system_preset_applies_config_toml_overrides() {
+        let data_dir = std::path::Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/../../../data"));
+        let preset = Config::system_preset_value(Some(data_dir)).unwrap();
+        let cfg: Config = preset.try_into().unwrap();
+        // config.toml 作为 L2 预置覆盖了空的 code default
+        assert_eq!(cfg.compat.host_render_processes, vec!["SearchHost.exe".to_string()]);
+        assert_eq!(cfg.schema.active, "wubi86");
+        // 佐证 L1 确实为空，覆盖来自 config.toml
+        assert!(Config::default().compat.host_render_processes.is_empty());
     }
 }
