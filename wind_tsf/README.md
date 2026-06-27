@@ -54,10 +54,10 @@ wind_tsf/
 
 ```bash
 make                       # → build/wind_tsf.dll
-make DEBUG_VARIANT=1       # → build_debug/wind_tsf_debug.dll（独立 CLSID/管道/日志）
+make DEV_VARIANT=1       # → build_dev/wind_tsf_dev.dll（独立 CLSID/管道/日志）
 # 或经 dev.sh：
 ../scripts/dev.sh tsf            # release
-../scripts/dev.sh tsf debug      # 调试变体
+../scripts/dev.sh tsf debug      # dev 变体
 ```
 
 构建输出：`build/wind_tsf.dll`（PE32+ x64，静态链接，无 MinGW 运行时依赖）。

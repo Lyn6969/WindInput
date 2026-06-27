@@ -30,7 +30,7 @@ The DLL exports standard TSF COM interfaces (DllCanUnloadNow, DllGetClassObject,
 
 | File | Description |
 |------|-------------|
-| `Makefile` | MinGW 交叉编译（Linux→Windows，本仓库默认路径）；`DEBUG_VARIANT=1` 出调试变体 |
+| `Makefile` | MinGW 交叉编译（Linux→Windows，本仓库默认路径）；`DEV_VARIANT=1` 出dev 变体 |
 | `CMakeLists.txt` | MSVC/Windows 原生构建（C++17, UTF-8；唯一目标 wind_tsf.dll；从 res/version.rc.in 生成版本资源） |
 | `include/mingw_tsf_compat.h` / `src/mingw_tsf_compat.cpp` | MinGW TSF 兼容垫片（仅 `__MINGW32__`；补缺失接口/GUID/常量） |
 | `wind_tsf.def` | Module definition file (exports COM entry points) |
@@ -51,7 +51,7 @@ The DLL exports standard TSF COM interfaces (DllCanUnloadNow, DllGetClassObject,
 ```bash
 cd wind_tsf
 make                       # → build/wind_tsf.dll（PE32+ x64，静态链接）
-make DEBUG_VARIANT=1       # → build_debug/wind_tsf_debug.dll
+make DEV_VARIANT=1       # → build_dev/wind_tsf_dev.dll
 make VERSION=1.0.0         # 指定版本号写入资源
 # 或经仓库脚本：../scripts/dev.sh tsf [debug]
 ```
