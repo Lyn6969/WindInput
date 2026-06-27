@@ -1422,7 +1422,13 @@ impl Config {
         Self::set_user_value(path, toml::Value::Boolean(value))
     }
 
-    /// 本机状态目录（userdata.redb / 工具栏位置等机器相关数据）。
+    /// 运行时状态目录（state.toml：工具栏位置等本机状态）。
+    /// 与 `local_dir()` 相同路径，独立命名便于语义区分。
+    pub fn state_dir() -> Option<PathBuf> {
+        Self::local_dir()
+    }
+
+    /// 本机状态目录（工具栏位置、日志、缓存等机器相关数据）。
     /// - 便携模式：`<exe目录>/userdata/`
     /// - 正常模式：`%LOCALAPPDATA%\WindInput[Dev]`（不随漫游同步）
     pub fn local_dir() -> Option<PathBuf> {

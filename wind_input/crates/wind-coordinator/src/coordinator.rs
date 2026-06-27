@@ -379,8 +379,8 @@ pub struct Coordinator {
     /// 通用规范汉字表（检索范围"常用字"判定；空集时退化为不过滤）
     pub(crate) common_chars: wind_candidate::CommonChars,
     // Shadow 规则已迁至 redb（self.store 的 SHADOW 表）。
-    /// 工具栏位置持久化文件路径（toolbar_pos.txt；None=不持久化）
-    pub(crate) toolbar_pos_path: Option<std::path::PathBuf>,
+    /// 工具栏位置，按显示器 key（"workRight,workBottom"）独立记录。
+    pub(crate) toolbar_positions: Mutex<std::collections::HashMap<String, (i32, i32)>>,
     /// 候选反查（编码/拆字/拼音）供悬停提示
     pub(crate) reverse: wind_reverse::ReverseLookup,
     /// 标点配对跟踪栈（用于智能跳过）；中/英配对表在 rt bundle 内。
@@ -520,8 +520,8 @@ impl Coordinator {
             });
         }
 
-        // 恢复持久化的工具栏位置
-        if let Some((x, y)) = coordinator.load_toolbar_pos() {
+        // 恢复持久化的工具栏位置（按当前光标所在显示器的 key 查找）
+        if let Some((x, y)) = coordinator.toolbar_pos_for_cursor() {
             let _ = coordinator.ui_tx.send(UiCommand::SetToolbarPos { x, y });
         }
 
@@ -670,8 +670,11 @@ impl Coordinator {
         }
 
         // Shadow 规则已迁至 redb（self.store 的 SHADOW 表，事务持久），不再用 shadow.json。
-        // 工具栏位置属本机状态（不随漫游）：放 %LOCALAPPDATA%\WindInput
-        let toolbar_pos_path = Config::local_dir().map(|d| d.join("toolbar_pos.txt"));
+        // 从 state.toml 加载工具栏位置（按显示器 key 独立存储）。
+        let runtime_state = Config::state_dir()
+            .map(|d| wind_config::RuntimeState::load(&d))
+            .unwrap_or_default();
+        let toolbar_positions_init = runtime_state.toolbar_positions.clone();
         let themes_dir = data_dir.map(|d| d.join("themes"));
         // 初始主题名：config.ui.theme.name 为单一源，未设置则回退 "default"。
         let cfg_theme = config.ui.theme.name.trim();
@@ -760,7 +763,7 @@ impl Coordinator {
             phrases,
             s2t: Mutex::new(s2t),
             common_chars,
-            toolbar_pos_path,
+            toolbar_positions: Mutex::new(toolbar_positions_init),
             reverse,
             pair_tracker: Mutex::new(wind_transform::pair_tracker::PairTracker::new()),
             last_valid_caret: Mutex::new((0, 0, 0)),

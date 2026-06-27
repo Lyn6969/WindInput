@@ -279,23 +279,27 @@ impl Coordinator {
             .send(UiCommand::ShowCandidateMenu { items, x, y });
     }
 
-    /// 读取持久化的工具栏位置（"x y" 文本）
-    pub(crate) fn load_toolbar_pos(&self) -> Option<(i32, i32)> {
-        let p = self.toolbar_pos_path.as_ref()?;
-        let content = std::fs::read_to_string(p).ok()?;
-        let mut it = content.split_whitespace();
-        let x: i32 = it.next()?.parse().ok()?;
-        let y: i32 = it.next()?.parse().ok()?;
-        Some((x, y))
+    /// 读取当前光标所在显示器对应的工具栏位置。
+    pub(crate) fn toolbar_pos_for_cursor(&self) -> Option<(i32, i32)> {
+        let (cx, cy) = cursor_pos();
+        let key = monitor_key_from_point(cx, cy);
+        let map = self.toolbar_positions.lock().unwrap_or_else(|e| e.into_inner());
+        map.get(&key).copied()
     }
 
-    /// 持久化工具栏位置（best-effort）
+    /// 持久化工具栏位置（按光标所在显示器 key 独立存储，best-effort）。
     pub(crate) fn save_toolbar_pos(&self, x: i32, y: i32) {
-        if let Some(p) = &self.toolbar_pos_path {
-            if let Some(parent) = p.parent() {
-                let _ = std::fs::create_dir_all(parent);
-            }
-            let _ = std::fs::write(p, format!("{} {}", x, y));
+        let (cx, cy) = cursor_pos();
+        let key = monitor_key_from_point(cx, cy);
+        {
+            let mut map = self.toolbar_positions.lock().unwrap_or_else(|e| e.into_inner());
+            map.insert(key, (x, y));
+        }
+        if let Some(state_dir) = Config::state_dir() {
+            let map = self.toolbar_positions.lock().unwrap_or_else(|e| e.into_inner());
+            let mut rs = wind_config::RuntimeState::load(&state_dir);
+            rs.toolbar_positions = map.clone();
+            let _ = rs.save(&state_dir);
         }
     }
 
@@ -338,4 +342,44 @@ impl Coordinator {
         drop(s);
         let _ = self.ui_tx.send(UiCommand::UpdateToolbar(tb));
     }
+}
+
+/// 返回当前鼠标光标的屏幕坐标；获取失败时返回 (0, 0)。
+fn cursor_pos() -> (i32, i32) {
+    #[cfg(target_os = "windows")]
+    {
+        use std::mem::zeroed;
+        use windows::Win32::Foundation::POINT;
+        use windows::Win32::UI::WindowsAndMessaging::GetCursorPos;
+        let mut pt: POINT = unsafe { zeroed() };
+        unsafe { let _ = GetCursorPos(&mut pt); }
+        (pt.x, pt.y)
+    }
+    #[cfg(not(target_os = "windows"))]
+    { (0, 0) }
+}
+
+/// 根据屏幕坐标计算显示器 key（工作区右下角："workRight,workBottom"）。
+/// 找不到显示器时返回 "0,0"（退化为单显示器情况下的无键状态）。
+fn monitor_key_from_point(x: i32, y: i32) -> String {
+    #[cfg(target_os = "windows")]
+    {
+        use std::mem::{size_of, zeroed};
+        use windows::Win32::Foundation::POINT;
+        use windows::Win32::Graphics::Gdi::{
+            GetMonitorInfoW, MONITORINFO, MONITOR_DEFAULTTONEAREST, MonitorFromPoint,
+        };
+        unsafe {
+            let pt = POINT { x, y };
+            let hmon = MonitorFromPoint(pt, MONITOR_DEFAULTTONEAREST);
+            let mut mi: MONITORINFO = zeroed();
+            mi.cbSize = size_of::<MONITORINFO>() as u32;
+            if GetMonitorInfoW(hmon, &mut mi).as_bool() {
+                return format!("{},{}", mi.rcWork.right, mi.rcWork.bottom);
+            }
+        }
+        "0,0".to_string()
+    }
+    #[cfg(not(target_os = "windows"))]
+    { "0,0".to_string() }
 }
