@@ -387,8 +387,19 @@ pub struct Coordinator {
     pair_tracker: Mutex<wind_transform::pair_tracker::PairTracker>,
     /// 最近一次有效光标坐标 (x,y,height)；用于无效坐标时回退，避免候选窗跑到左上角
     last_valid_caret: Mutex<(i32, i32, i32)>,
-    /// 正在等待有效光标坐标（首次连接尚未拿到时为 true）；拿到后触发重定位
-    awaiting_caret: Mutex<bool>,
+    /// 延迟首次显示：新组合首帧不立即显示候选窗，待 handle_caret_update 收到 reflow 后的权威坐标、
+    /// 或兜底 timer 超时再首显，避免在 reflow 前的陈旧坐标处先显示再跳（对齐 Go pendingFirstShow）。
+    pending_first_show: Mutex<bool>,
+    /// 上述兜底 timer 的代际令牌：每次 arm 自增，超时回调比对以作废被新按键取代的旧 timer。
+    pending_first_show_token: Mutex<u64>,
+    /// 本次组合候选窗是否已首次显示过（true=后续刷新可立即下发；false=首帧需延迟）。
+    candidate_shown: Mutex<bool>,
+    /// 显示授权：handle_caret_update / 兜底 timer 在调 notify_ui_update 前置位以放行首帧显示；
+    /// 按键路径不置位，首帧改为 arm 延迟。notify_ui_update 内 swap 消费。
+    show_authorized: std::sync::atomic::AtomicBool,
+    /// 组合起点屏幕坐标 (x, y, valid)：嵌入预编辑模式（编码插入宿主、光标随输入右移）下候选窗锚此处
+    /// （缓冲头部），不随输入移动。同一组合只锁定首个有效值（handle_caret_update），组合结束复位。
+    composition_start: Mutex<(i32, i32, bool)>,
     /// 主题目录（data/themes）
     pub(crate) themes_dir: Option<std::path::PathBuf>,
     /// 当前主题名
@@ -761,7 +772,11 @@ impl Coordinator {
             reverse,
             pair_tracker: Mutex::new(wind_transform::pair_tracker::PairTracker::new()),
             last_valid_caret: Mutex::new((0, 0, 0)),
-            awaiting_caret: Mutex::new(false),
+            pending_first_show: Mutex::new(false),
+            pending_first_show_token: Mutex::new(0),
+            candidate_shown: Mutex::new(false),
+            show_authorized: std::sync::atomic::AtomicBool::new(false),
+            composition_start: Mutex::new((0, 0, false)),
             themes_dir,
             theme_name: Mutex::new(initial_theme),
             theme_dark: Mutex::new(theme_dark_init),
@@ -1238,6 +1253,7 @@ impl Coordinator {
         };
         if state.candidates.is_empty() && state.input_buffer.is_empty() && mode_label.is_empty() {
             let _ = self.ui_tx.send(UiCommand::HideCandidates);
+            self.reset_first_show();
             return;
         }
         // candwin 切换：用户隐藏候选窗时不显示（仍可盲打/自动上屏）。
@@ -1247,6 +1263,22 @@ impl Coordinator {
             .unwrap_or_else(|e| e.into_inner())
         {
             let _ = self.ui_tx.send(UiCommand::HideCandidates);
+            self.reset_first_show();
+            return;
+        }
+        // 延迟首次显示：新组合首帧若非经授权（reflow 后权威坐标 / 兜底 timer）则不立即显示，
+        // 改 arm 兜底 timer，待 handle_caret_update 的权威坐标或超时再首显。避免在 reflow 前的
+        // 陈旧坐标处先显示、reflow 后再跳（根治"上屏后立即输入候选窗错位约一个上屏宽度"）。
+        let authorized = self
+            .show_authorized
+            .swap(false, std::sync::atomic::Ordering::Relaxed);
+        if !authorized
+            && !*self
+                .candidate_shown
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+        {
+            self.arm_pending_first_show();
             return;
         }
         let t_nu = std::time::Instant::now();
@@ -1342,8 +1374,26 @@ impl Coordinator {
             }
             h => h, // 翻页器 tag / -1
         };
-        // 有效光标坐标判定：高度>0、非 (0,0)、在合理范围；无效则回退到最近有效坐标
-        let (cx, cy, ch) = (state.caret_x, state.caret_y, state.caret_height);
+        // preedit 是否嵌入宿主（app_inline）：嵌入时编码插入宿主、光标随输入右移，候选窗须锚在
+        // 组合起点（缓冲头部）而非跟随光标末尾；非嵌入时 preedit 在候选窗、宿主光标不动，用当前光标。
+        // 该标志同时门控下方 preedit 是否下发候选窗渲染（嵌入时候选窗不重复显示 preedit）。
+        let in_app = self
+            .preedit_display
+            .lock()
+            .map(|m| m.in_app())
+            .unwrap_or(true);
+        // 坐标基准：嵌入模式且组合起点已锁定 → 用组合起点（钉在缓冲头部，不随输入移动）；否则当前光标。
+        // 组合起点由 handle_caret_update 在本组合首个有效坐标处锁定。候选窗首显已由"延迟首显"门控
+        // 保证发生在 reflow 后的权威坐标处。无效坐标回退最近有效坐标，避免跑到屏幕左上角。
+        let cs = *self
+            .composition_start
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let (cx, cy, ch) = if in_app && cs.2 {
+            (cs.0, cs.1, state.caret_height)
+        } else {
+            (state.caret_x, state.caret_y, state.caret_height)
+        };
         let valid = ch > 0 && !(cx == 0 && cy == 0) && cx.abs() < 32000 && cy.abs() < 32000;
         let (caret_x, caret_y, caret_height, caret_valid) = {
             let mut lv = self
@@ -1359,18 +1409,7 @@ impl Coordinator {
                 (cx, cy, ch, false) // 尚无任何有效坐标：临时显示，待有效坐标到达再重定位
             }
         };
-        *self
-            .awaiting_caret
-            .lock()
-            .unwrap_or_else(|e| e.into_inner()) = !caret_valid;
         let n_items = items.len();
-        // preedit 是否在候选窗显示，按运行时编码显示方式门控：app_inline 时组合串内嵌应用，
-        // 候选窗不再重复显示 preedit；candidate_top/inline 时照常下发由候选窗渲染。
-        let in_app = self
-            .preedit_display
-            .lock()
-            .map(|m| m.in_app())
-            .unwrap_or(true);
         let preedit = if in_app {
             String::new()
         } else {
@@ -1390,6 +1429,11 @@ impl Coordinator {
             caret_height,
             caret_valid,
         });
+        // 候选窗已下发显示：标记本组合已首显，后续刷新（翻页/选字/打字）即可立即下发不再延迟。
+        *self
+            .candidate_shown
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = true;
         tracing::debug!(
             "notify_ui_update: build+send {:?} (n={})",
             t_nu.elapsed(),
@@ -1399,6 +1443,89 @@ impl Coordinator {
 
     pub(crate) fn notify_ui_hide(&self) {
         let _ = self.ui_tx.send(UiCommand::HideCandidates);
+        self.reset_first_show();
+    }
+
+    /// 复位首显延迟状态（候选窗隐藏 / 组合结束）：下次新组合重新延迟首显，并作废未触发的兜底 timer。
+    fn reset_first_show(&self) {
+        *self
+            .candidate_shown
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = false;
+        *self
+            .pending_first_show
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = false;
+        let mut t = self
+            .pending_first_show_token
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        *t = t.wrapping_add(1);
+        drop(t);
+        // 组合结束：复位组合起点锚定，下一组合重新锁定首个有效 compStart。
+        *self
+            .composition_start
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = (0, 0, false);
+    }
+
+    /// 推迟首次显示候选窗：标记 pending 并启动兜底 timer（默认 150ms）。token 比对使后续按键的
+    /// arm 自动作废旧 timer。handle_caret_pending 握手会改用 600ms（应对 OnLayoutChange burst 慢的应用）。
+    fn arm_pending_first_show(&self) {
+        self.arm_pending_first_show_with_timeout(150);
+    }
+
+    fn arm_pending_first_show_with_timeout(&self, ms: u64) {
+        *self
+            .pending_first_show
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = true;
+        let token = {
+            let mut t = self
+                .pending_first_show_token
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            *t = t.wrapping_add(1);
+            *t
+        };
+        let Some(weak) = self.self_weak.get().cloned() else {
+            return;
+        };
+        std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(ms));
+            let Some(this) = weak.upgrade() else {
+                return;
+            };
+            // token/pending 校验：被新按键的 arm 取代、或已被首显/隐藏消费 → 放弃本次兜底。
+            {
+                let pending = *this
+                    .pending_first_show
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner());
+                let tok = *this
+                    .pending_first_show_token
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner());
+                if !pending || tok != token {
+                    return;
+                }
+            }
+            *this
+                .pending_first_show
+                .lock()
+                .unwrap_or_else(|e| e.into_inner()) = false;
+            // 兜底超时：reflow 坐标迟迟未到，用当前 state 强制首显（坐标可能为按键前旧值，
+            // 属慢应用降级，仍优于候选窗一直不显示）。
+            let state = this.state.lock().unwrap_or_else(|e| e.into_inner());
+            let has_content = !state.candidates.is_empty()
+                || !state.input_buffer.is_empty()
+                || this.mode_indicator_text(&state).is_some();
+            if has_content {
+                this.show_authorized
+                    .store(true, std::sync::atomic::Ordering::Relaxed);
+                this.notify_ui_update(&state);
+            }
+        });
     }
 
     // ———————————————— 鼠标交互（来自 UI 线程的反向事件）————————————————
@@ -2312,6 +2439,10 @@ impl MessageHandler for Coordinator {
                     state.input_buffer = remainder.clone();
                     let _ = self.update_candidates(&mut state); // 余码候选（不再消费其结局）
                     let preedit = state.preedit.clone();
+                    // 顶码上屏 = 部分上屏 + 余码续组合：宿主光标因 top_text 插入而前移，余码组合的起点已变。
+                    // 复位首显延迟状态，使余码候选窗重新延迟到 reflow 后的新坐标首显、重锁组合起点，
+                    // 避免停留在顶码前的旧位置（候选窗保持上一帧显示直到新坐标到达，对齐 Go）。
+                    self.reset_first_show();
                     self.notify_ui_update(&state);
                     let has_comp = !remainder.is_empty();
                     return KeyAction::InsertText {
@@ -2640,23 +2771,85 @@ impl MessageHandler for Coordinator {
     }
 
     fn handle_caret_update(&self, data: &CaretData) {
+        // height==0：宿主尚未 reflow，GetTextExt 返回退化矩形，坐标不可靠 → 跳过（不更新缓存、
+        // 不触发显示），等 OnLayoutChange 后的有效坐标（对齐 Go HandleCaretUpdate）。
+        if data.height == 0 {
+            return;
+        }
         let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        let (prev_x, prev_y) = (state.caret_x, state.caret_y);
         state.caret_x = data.x;
         state.caret_y = data.y;
         state.caret_height = data.height;
-        // 首次连接尚无有效坐标时，候选窗临时显示在左上角；待有效坐标到达即重定位。
-        let now_valid = data.height > 0 && !(data.x == 0 && data.y == 0) && data.x.abs() < 32000;
-        let awaiting = *self
-            .awaiting_caret
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let now_valid = !(data.x == 0 && data.y == 0) && data.x.abs() < 32000 && data.y.abs() < 32000;
+        if !now_valid {
+            return;
+        }
         let composing = !state.candidates.is_empty() || !state.input_buffer.is_empty();
-        if awaiting && now_valid && composing {
+        if !composing {
+            return;
+        }
+        // 组合起点锚定：同一组合只接受首个有效 compStart，后续即便携带新值也不覆盖（防部分控件
+        // GetRange 让起点随输入漂移，致候选窗随输入右移）。500px 校验排除 logical/physical 坐标系不一致。
+        {
+            let mut cs = self
+                .composition_start
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            if !cs.2 && (data.composition_start_x != 0 || data.composition_start_y != 0) {
+                let dx = (data.composition_start_x - data.x).abs();
+                let dy = (data.composition_start_y - data.y).abs();
+                if dx < 500 && dy < 500 {
+                    *cs = (data.composition_start_x, data.composition_start_y, true);
+                }
+            }
+        }
+        // 消费首显等待：本次为 reflow 后权威坐标。
+        let was_pending = {
+            let mut pfs = self
+                .pending_first_show
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            let w = *pfs;
+            *pfs = false;
+            w
+        };
+        if was_pending {
+            // 延迟的首次显示：用本权威坐标无条件首显（不过滤）。
+            self.show_authorized
+                .store(true, std::sync::atomic::Ordering::Relaxed);
+            self.notify_ui_update(&state);
+        } else if *self
+            .candidate_shown
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+        {
+            // 已显示后的坐标更新：≤3px 微移跳过 reshow（吞掉宿主 caret 微调，如 WPS 的 2px 偏移）；
+            // 显著变化（换行 / reflow 修正）才 reshow，由 UI 层 4px 位置阈值再次过滤微移。
+            let dx = (data.x - prev_x).abs();
+            let dy = (data.y - prev_y).abs();
+            if dx <= 3 && dy <= 3 {
+                return;
+            }
+            self.show_authorized
+                .store(true, std::sync::atomic::Ordering::Relaxed);
             self.notify_ui_update(&state);
         }
     }
 
-    fn handle_caret_pending(&self) {}
+    fn handle_caret_pending(&self) {
+        // DLL 新组合在 reflow 完成前发来的"坐标待定"握手（_compositionJustStarted）：
+        // 仅当正等待首显时，延长兜底超时到 600ms，避免 OnLayoutChange burst 慢的应用（如 EverEdit）
+        // 在真实坐标到达前被 150ms 兜底用旧坐标抢先显示。
+        if !*self
+            .pending_first_show
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+        {
+            return;
+        }
+        self.arm_pending_first_show_with_timeout(600);
+    }
 
     fn handle_selection_changed(&self, _prev_char: u16) {}
 
@@ -2689,6 +2882,9 @@ impl MessageHandler for Coordinator {
         state.candidates.clear();
         // 与 handle_key_event 的选词路径保持一致：记录词频用于学习排序
         self.record_selection(&code, &text);
+        // 上屏即组合结束：复位首显延迟状态，使下一组合首帧重新延迟到 reflow 后的权威坐标，
+        // 避免其锁定到本组合旧坐标（"上屏后立即输入候选窗错位"主场景）。
+        self.reset_first_show();
         Some(CommitResultData {
             barrier_seq: data.barrier_seq,
             text,

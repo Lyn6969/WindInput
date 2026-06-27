@@ -117,10 +117,9 @@ pub struct CandidateWindow {
     caret_height: i32,
     /// 当前光标坐标是否有效
     caret_valid: bool,
-    /// 组合期间锚定位置（首次显示时按光标算定，之后保持不动）；隐藏时清空
-    anchor: Option<(i32, i32)>,
-    /// 锚点是否已按有效坐标锁定（false=临时位置，待有效坐标到达后重锚）
-    anchor_locked: bool,
+    /// 上次内容锚点屏幕坐标 (px, py)：每帧 place_window 算出新位置后与之比较，微移(<4px*scale)则
+    /// 保持原位以抑制宿主 caret 抖动（位置保护）。隐藏时清空，下次组合重新落位。
+    last_content_pos: Option<(i32, i32)>,
     text_renderer: TextRenderer,
     /// arrange 后收集的候选命中矩形：(候选页内下标, 矩形)，供鼠标层使用
     hit_rects: Vec<(i32, Rect)>,
@@ -179,8 +178,7 @@ impl CandidateWindow {
             y: 0,
             caret_height: 0,
             caret_valid: false,
-            anchor: None,
-            anchor_locked: false,
+            last_content_pos: None,
             text_renderer,
             hit_rects: Vec::new(),
             mouse,
@@ -366,19 +364,27 @@ impl CandidateWindow {
         let height = content_h + mt + mb;
         let t_layout = t_layout0.elapsed();
 
-        // 定位提前到 paint 前（供 flip_when_above 判定）：组合期锚点锁定后复用，
-        // 仅首次/重锚时按工作区钳制并记录是否上翻（placed_above）。
-        let keep = self.visible && self.anchor_locked && self.anchor.is_some();
-        let (px, py) = if keep {
-            self.anchor.unwrap()
-        } else {
-            let (x, y, above) =
-                Self::clamp_to_work_area(self.x, self.y, self.caret_height, content_w, content_h);
-            self.anchor = Some((x, y));
-            self.anchor_locked = self.caret_valid; // 仅有效坐标才锁定
-            self.placed_above = above;
-            (x, y)
+        // 定位提前到 paint 前（供 flip_when_above 判定）。对齐 Go：每帧据当前光标 + 内容尺寸重算
+        // 位置（place_window 负责工作区钳制、上方底边参考、上翻粘滞），再用 4px 阈值抑制微移——
+        // 从而 (1) 输入缓冲变化致尺寸变化时按需重定位、不溢出屏幕；(2) 上方显示以底边贴光标为参考；
+        // (3) 已显示后宿主 caret 微抖动(<4px)不跳，位置保护；显著变化(换行/reflow 修正)才跟随；
+        // (4) 一旦上翻则粘滞上方。新组合首显已由协调器延迟到 reflow 后的权威坐标，故首帧即落在正确处。
+        let (px0, py0, above) =
+            Self::place_window(self.x, self.y, self.caret_height, content_w, content_h, self.placed_above);
+        self.placed_above = above;
+        // 位置稳定性：窗口已显示且新位置与上次内容锚点微移(<4px*scale)→保持原位，吞掉 caret 微抖。
+        let (px, py) = match self.last_content_pos {
+            Some((lx, ly)) if self.visible => {
+                let thr = (4.0 * self.scale).round().max(1.0) as i32;
+                if (px0 - lx).abs() < thr && (py0 - ly).abs() < thr {
+                    (lx, ly)
+                } else {
+                    (px0, py0)
+                }
+            }
+            _ => (px0, py0),
         };
+        self.last_content_pos = Some((px, py));
         // 上方显示且启用 → 逆序重建候选树（项数/尺寸/位置不变，仅排列翻转）
         if self.flip_when_above && self.placed_above {
             root = self.build_tree(true);
@@ -490,22 +496,31 @@ impl CandidateWindow {
         }
     }
 
-    /// 将候选窗钳制在光标所在显示器的工作区内：
-    /// 默认显示在光标下方（+gap）；下方空间不足则上翻到光标上方；
-    /// 左右溢出则贴边。避免窗口跑到屏幕外。
+    /// 据冻结光标锚点与当前内容尺寸计算候选窗位置，钳制在光标所在显示器工作区内。
+    /// 规则：
+    /// - 默认显示在光标下方（+gap）；下方空间不足则上翻到光标上方。
+    /// - 上方显示以"窗口底边贴近光标顶端"为参考：`above_y = caret_top - h - gap`，
+    ///   底边 = caret_top - gap 与高度无关 → 候选变少（h 减小）时顶边下移、底边不动，不会离光标变远。
+    /// - `sticky_above`=true（当前已在上方）时优先保持上方，仅当上方也放不下才回落下方，
+    ///   避免候选数量变化时上下抖动（需求 4）。
+    /// - 左右溢出则贴边（横向右方空间不足时允许左移，属位置保护的例外）。
     // 非 Windows 下窗口钳制为空实现，caret_h/w/h 及 x/y 的可变性仅 Windows 分支需要。
     /// 返回 (x, y, above)：above=true 表示窗口被上翻到光标上方（供 flip_when_above 判定）。
     #[cfg_attr(not(windows), allow(unused_variables, unused_mut))]
-    fn clamp_to_work_area(
+    fn place_window(
         caret_x: i32,
         caret_y: i32,
         caret_h: i32,
         w: u32,
         h: u32,
+        sticky_above: bool,
     ) -> (i32, i32, bool) {
         let gap = 2;
-        // caret_y 为光标底端（与 Go 一致）：默认显示在其下方，仅留 gap
-        let (mut x, mut y) = (caret_x, caret_y + gap);
+        let (wi, hi) = (w as i32, h as i32);
+        // caret_y 为光标底端（与 Go 一致）。下方锚点 = 光标底端 + gap；上方锚点以底边贴光标顶端为参考。
+        let below_y = caret_y + gap;
+        let above_y = caret_y - caret_h.max(0) - hi - gap;
+        let (mut x, mut y) = (caret_x, below_y);
         let mut above = false;
         #[cfg(windows)]
         {
@@ -525,27 +540,34 @@ impl CandidateWindow {
                 };
                 if GetMonitorInfoW(mon, &mut mi).as_bool() {
                     let wa = mi.rcWork;
-                    let (wi, hi) = (w as i32, h as i32);
-                    // 下方放不下 → 上翻到光标上方（光标顶端 = caret_y - caret_h）
-                    if y + hi > wa.bottom {
-                        let above_y = caret_y - caret_h.max(0) - hi - gap;
-                        if above_y >= wa.top {
-                            y = above_y;
-                            above = true;
-                        } else {
-                            y = wa.bottom - hi;
+                    let below_ok = below_y + hi <= wa.bottom;
+                    let above_ok = above_y >= wa.top;
+                    // 垂直方位决策：
+                    // - 已在上方（sticky）→ 只要上方放得下就保持上方；上方放不下才回落下方（需求 4）。
+                    // - 否则默认下方，仅当下方放不下且上方放得下才上翻。
+                    above = if sticky_above {
+                        above_ok
+                    } else {
+                        !below_ok && above_ok
+                    };
+                    y = if above { above_y } else { below_y };
+                    // 方位定后的越界兜底：贴住对应屏幕边。
+                    if above {
+                        if y < wa.top {
+                            y = wa.top;
+                        }
+                    } else if y + hi > wa.bottom {
+                        y = wa.bottom - hi;
+                        if y < wa.top {
+                            y = wa.top;
                         }
                     }
-                    // 左右钳制
+                    // 左右钳制（右溢出左移；左溢出贴左）。
                     if x + wi > wa.right {
                         x = wa.right - wi;
                     }
                     if x < wa.left {
                         x = wa.left;
-                    }
-                    // 垂直兜底
-                    if y < wa.top {
-                        y = wa.top;
                     }
                 }
             }
@@ -1118,8 +1140,8 @@ impl CandidateWindow {
     pub fn hide(&mut self) {
         self.window.hide();
         self.visible = false;
-        self.anchor = None; // 组合结束，下次显示重新锚定
-        self.anchor_locked = false;
+        self.last_content_pos = None; // 组合结束，下次显示重新落位
+        self.placed_above = false; // 清除上方粘滞，下次组合按下方默认重新判定
         self.mouse.borrow_mut().reset_hover();
         if let Some(t) = self.tooltip.as_mut() {
             t.hide();
