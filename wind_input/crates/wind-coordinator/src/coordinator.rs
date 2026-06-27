@@ -35,6 +35,52 @@ use wind_ui::candidate_window::CandidateItem;
 use wind_ui::manager::{UiCommand, UiEvent, UiManager};
 use wind_ui::toast::{ToastKind, ToastPosition};
 
+/// caret_use_top 兼容下保留给「上方显示」避让正文的最小行高（物理像素）。微信 reflow 后的
+/// 权威帧通常上报真实行高（~20px，随 DPI 缩放），直接取用；仅退化帧（height=1）落到此下限，
+/// 保证上方候选窗底边抬到正文之上而不遮挡。偏大只是多留空隙，故取一个稳妥的正文行高量级。
+const CARET_USE_TOP_MIN_LINE_H: i32 = 18;
+
+/// 取进程 ID 对应的可执行文件名（如 "Weixin.exe"）。对齐 Go `bridge.GetProcessName`：
+/// OpenProcess(QUERY_LIMITED_INFORMATION) + QueryFullProcessImageNameW，取末段文件名。
+/// 失败（进程已退出/权限不足）返回空串。
+#[cfg(windows)]
+fn process_name(pid: u32) -> String {
+    use windows::Win32::Foundation::{CloseHandle, MAX_PATH};
+    use windows::Win32::System::Threading::{
+        OpenProcess, QueryFullProcessImageNameW, PROCESS_NAME_FORMAT,
+        PROCESS_QUERY_LIMITED_INFORMATION,
+    };
+    if pid == 0 {
+        return String::new();
+    }
+    unsafe {
+        let handle = match OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid) {
+            Ok(h) => h,
+            Err(_) => return String::new(),
+        };
+        let mut buf = [0u16; MAX_PATH as usize];
+        let mut size = buf.len() as u32;
+        let ok = QueryFullProcessImageNameW(
+            handle,
+            PROCESS_NAME_FORMAT(0),
+            windows::core::PWSTR(buf.as_mut_ptr()),
+            &mut size,
+        );
+        let _ = CloseHandle(handle);
+        if ok.is_err() {
+            return String::new();
+        }
+        let full = String::from_utf16_lossy(&buf[..size as usize]);
+        full.rsplit(['\\', '/']).next().unwrap_or(&full).to_string()
+    }
+}
+
+/// 非 Windows（测试/交叉编译）下无进程名概念，返回空串 → 不命中任何兼容规则。
+#[cfg(not(windows))]
+fn process_name(_pid: u32) -> String {
+    String::new()
+}
+
 /// VK + shift → 该键产生的 ASCII 标点/符号字符（字母键返回 None，由拼音/码表处理）。
 /// 解析配对表（每项 2 字符 "（）"）为 (左,右) 字符对，忽略非法项。
 fn parse_pairs(list: &[String]) -> Vec<(char, char)> {
@@ -400,6 +446,12 @@ pub struct Coordinator {
     /// 组合起点屏幕坐标 (x, y, valid)：嵌入预编辑模式（编码插入宿主、光标随输入右移）下候选窗锚此处
     /// （缓冲头部），不随输入移动。同一组合只锁定首个有效值（handle_caret_update），组合结束复位。
     composition_start: Mutex<(i32, i32, bool)>,
+    /// 应用兼容规则表（compat.toml，系统层 + 用户层覆盖）。按焦点进程名查规则。
+    app_compat: wind_config::app_compat::AppCompat,
+    /// 当前焦点进程派生的 caret 兼容态 `(pid, caret_use_top)`：focus_gained / ime_activated
+    /// 时按 client_token 高 32 位的 PID 解析进程名并缓存，避免每次 caret 更新重复 OpenProcess。
+    /// 微信等 WebView 应用置 caret_use_top=true，handle_caret_update 据此把候选窗从 bottom 改锚 top。
+    active_compat: Mutex<(u32, bool)>,
     /// 主题目录（data/themes）
     pub(crate) themes_dir: Option<std::path::PathBuf>,
     /// 当前主题名
@@ -611,6 +663,10 @@ impl Coordinator {
     ) -> Arc<Self> {
         // 注入 redb Store：码表引擎注册用户词/临时词层，用户词进候选合并。
         let engine_mgr = EngineManager::with_store(&config, data_dir, store.clone());
+        // 应用兼容规则：系统层(data/compat.toml) + 用户层覆盖。供焦点进程按名查规则
+        // （如微信 caret_use_top）。
+        let app_compat =
+            wind_config::app_compat::AppCompat::load(data_dir, user_dir.as_deref());
         // 配置的轻量派生缓存集中到 ConfigBundle（支持运行时热替换）。
         let bundle = ConfigBundle::build(config.clone());
         info!(
@@ -772,6 +828,8 @@ impl Coordinator {
             candidate_shown: Mutex::new(false),
             show_authorized: std::sync::atomic::AtomicBool::new(false),
             composition_start: Mutex::new((0, 0, false)),
+            app_compat,
+            active_compat: Mutex::new((0, false)),
             themes_dir,
             theme_name: Mutex::new(initial_theme),
             theme_dark: Mutex::new(theme_dark_init),
@@ -804,6 +862,30 @@ impl Coordinator {
     /// 取当前「配置 + 派生缓存」快照（Arc 克隆，开销低）。所有配置读取经此。
     pub(crate) fn rt(&self) -> std::sync::Arc<ConfigBundle> {
         self.rt.read().unwrap_or_else(|e| e.into_inner()).clone()
+    }
+
+    /// 焦点/IME 激活时按 client_token 高 32 位的 PID 解析焦点进程名，缓存其 caret 兼容态
+    /// （对齐 Go `HandleFocusGained` 设置 activeCompatRule）。按 pid 缓存：同进程命中直接返回，
+    /// 避免每次焦点事件重复 OpenProcess。仅在重型/异步段调用，不在 DLL 同步阻塞路径上。
+    fn update_active_compat(&self, client_token: u64) {
+        let pid = (client_token >> 32) as u32;
+        if pid == 0 {
+            return;
+        }
+        let mut ac = self.active_compat.lock().unwrap_or_else(|e| e.into_inner());
+        if ac.0 == pid {
+            return; // 同进程，规则已缓存
+        }
+        let name = process_name(pid);
+        let use_top = self
+            .app_compat
+            .get_rule(&name)
+            .map(|r| r.caret_use_top)
+            .unwrap_or(false);
+        if use_top {
+            debug!("Compat rule matched: process={name} caret_use_top=true");
+        }
+        *ac = (pid, use_top);
     }
 
     /// 热重载用户配置：从磁盘重读 Config 并原子替换 bundle（轻量设置即时生效），
@@ -2640,6 +2722,9 @@ impl MessageHandler for Coordinator {
         if data.client_token != 0 {
             self.push_server.set_active_token(data.client_token);
         }
+        // 解析焦点进程的 caret 兼容态（微信 caret_use_top 等）。本段为 FOCUS_GAINED 的重型
+        // 后置段（DLL 阻塞响应已写出），同步 OpenProcess 不影响首键延迟。
+        self.update_active_compat(data.client_token);
         let status = self.build_status();
         self.push_activation_status();
         self.notify_toolbar(); // 激活态 → 工具栏显示
@@ -2677,6 +2762,8 @@ impl MessageHandler for Coordinator {
         if client_token != 0 {
             self.push_server.set_active_token(client_token);
         }
+        // 切回本输入法时同样刷新焦点进程的 caret 兼容态（异步段，不阻塞 DLL）。
+        self.update_active_compat(client_token);
         self.state
             .lock()
             .unwrap_or_else(|e| e.into_inner())
@@ -2770,6 +2857,32 @@ impl MessageHandler for Coordinator {
         if data.height == 0 {
             return;
         }
+        // 应用兼容规则 caret_use_top（对齐 Go HandleCaretUpdate 的 rect.bottom→rect.top）：
+        // 微信等 WebView 的 GetTextExt 返回 height 不稳定（1↔20px），rect.bottom 随之漂移 ~20px，
+        // 但 rect.top 始终稳定（≤1px，≈正文底端）。改用 top 定位：Y -= height，使候选窗下方显示
+        // 锚在稳定的 top（wind-ui 下方公式 = caret_y + gap，不读 height，故下方不受 height 影响）。
+        //
+        // 关键：height 不能压成 1。上方显示时 wind-ui 用 caret_top = caret_y - height 推算正文顶端
+        // （above 底边 = caret_y - height - gap）；若 height=1 则正文顶端被当成 top-1（≈正文底端），
+        // 候选窗会整条压住正文/光标。故保留真实行高 raw_h，并对退化帧（raw_h=1）取下限兜底，
+        // 让上方显示正确避让正文（偏大只是多留空隙，偏小才会遮挡——宁大勿小）。
+        // 组合起点 Y 同步上移以保持锚点一致。后续逻辑全部基于变换后的本地副本。
+        let mut data = *data;
+        if data.height > 0
+            && self
+                .active_compat
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .1
+        {
+            let raw_h = data.height;
+            data.y -= raw_h;
+            data.height = raw_h.max(CARET_USE_TOP_MIN_LINE_H);
+            if data.composition_start_y != 0 {
+                data.composition_start_y -= raw_h;
+            }
+        }
+        let data = &data;
         let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
         let (prev_x, prev_y) = (state.caret_x, state.caret_y);
         state.caret_x = data.x;
@@ -2935,5 +3048,72 @@ mod reload_tests {
         let b = ConfigBundle::build(cfg);
         assert!(b.config.input.symbol.smart_mode);
         assert_eq!(b.config.ui.candidate.per_page, 9);
+    }
+}
+
+#[cfg(test)]
+mod caret_compat_tests {
+    //! caret_use_top 兼容变换：微信等 WebView 下把候选窗定位基准从 rect.bottom 改为 rect.top。
+    use super::*;
+
+    fn coord() -> Arc<Coordinator> {
+        Coordinator::new_headless(Config::default(), None)
+    }
+
+    fn caret(y: i32, height: i32) -> CaretData {
+        CaretData {
+            x: 100,
+            y,
+            height,
+            composition_start_x: 100,
+            composition_start_y: y,
+        }
+    }
+
+    #[test]
+    fn caret_use_top_shifts_y_to_top_and_keeps_real_line_height() {
+        let c = coord();
+        // 模拟焦点进程命中 caret_use_top 规则。
+        *c.active_compat.lock().unwrap() = (1234, true);
+        c.handle_caret_update(&caret(200, 20));
+        let s = c.state.lock().unwrap();
+        // bottom(200) → top：200 - 20 = 180（下方显示锚此稳定值）。
+        assert_eq!(s.caret_y, 180);
+        // 保留真实行高 20（> 下限）供上方显示避让正文，而非压成 1。
+        assert_eq!(s.caret_height, 20);
+    }
+
+    #[test]
+    fn caret_use_top_degenerate_height_floored_to_min() {
+        let c = coord();
+        *c.active_compat.lock().unwrap() = (1234, true);
+        // 退化帧 height=1：top 仍稳定（bottom-1），但行高落到下限避免上方遮挡。
+        c.handle_caret_update(&caret(200, 1));
+        let s = c.state.lock().unwrap();
+        assert_eq!(s.caret_y, 199);
+        assert_eq!(s.caret_height, CARET_USE_TOP_MIN_LINE_H);
+    }
+
+    #[test]
+    fn no_rule_keeps_bottom_coordinates() {
+        let c = coord();
+        // 未命中规则（默认 (0,false)）：坐标保持原样，不做 top 变换。
+        c.handle_caret_update(&caret(200, 20));
+        let s = c.state.lock().unwrap();
+        assert_eq!(s.caret_y, 200);
+        assert_eq!(s.caret_height, 20);
+    }
+
+    #[test]
+    fn update_active_compat_extracts_pid_and_caches() {
+        let c = coord();
+        // client_token = PID<<32 | instance。PID=0（无效）不更新缓存。
+        c.update_active_compat(0);
+        assert_eq!(*c.active_compat.lock().unwrap(), (0, false));
+        // 合法 PID：headless（非真实进程）下 process_name 取不到名字 → caret_use_top=false，
+        // 但 pid 应被缓存（避免重复 OpenProcess）。
+        let token = (4321u64 << 32) | 7;
+        c.update_active_compat(token);
+        assert_eq!(c.active_compat.lock().unwrap().0, 4321);
     }
 }

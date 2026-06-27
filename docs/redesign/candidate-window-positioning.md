@@ -90,9 +90,10 @@ UI 层（`wind-ui/src/candidate_window.rs`）**每帧据当前光标 + 内容尺
 | 层 | 文件 | 关键点 |
 |----|------|--------|
 | DLL | `wind_tsf/src/TextService.cpp` | `_compositionJustStarted`、`SendCaretPositionUpdate`、`OnLayoutChange`、`SendCaretUpdate` |
-| 协调器 | `wind-coordinator/src/coordinator.rs` | `pending_first_show`/`candidate_shown`/`show_authorized`/`composition_start`、`arm_pending_first_show*`、`reset_first_show`、`notify_ui_update` 门控+坐标基准、`handle_caret_update`、`handle_caret_pending`、`handle_commit_request` |
-| IPC | `wind-bridge/src/{handler,server}.rs` | `CaretData{ x,y,height,composition_start_x,composition_start_y }`、`CMD_CARET_PENDING → handle_caret_pending` |
-| UI | `wind-ui/src/candidate_window.rs` | `place_window`、`last_content_pos` + 4px 阈值、`placed_above` 粘滞 |
+| 协调器 | `wind-coordinator/src/coordinator.rs` | `pending_first_show`/`candidate_shown`/`show_authorized`/`composition_start`、`arm_pending_first_show*`、`reset_first_show`、`notify_ui_update` 门控+坐标基准、`handle_caret_update`、`handle_caret_pending`、`handle_commit_request`、`update_active_compat`/`active_compat`/`process_name`（caret_use_top） |
+| 兼容规则 | `wind-config/src/app_compat.rs`、`data/compat.toml` | `AppCompat::load`/`get_rule`（`[[apps]]`：`process`/`caret_use_top`/…），系统层+用户层覆盖 |
+| IPC | `wind-bridge/src/{handler,server}.rs` | `CaretData{ x,y,height,composition_start_x,composition_start_y }`、`CMD_CARET_PENDING → handle_caret_pending`、`client_token`（高 32 位 = PID） |
+| UI | `wind-ui/src/candidate_window.rs` | `place_window`（下方 `caret_y+gap`、上方 `caret_y-height-…`）、`last_content_pos` + 4px 阈值、`placed_above` 粘滞 |
 
 ### 第 4 层：compositionStart 组合起点锚定 —— 钉在缓冲头部
 
@@ -105,6 +106,31 @@ UI 层（`wind-ui/src/candidate_window.rs`）**每帧据当前光标 + 内容尺
 - 非嵌入模式（preedit 显示在候选窗、宿主光标不动）仍用当前光标。
 
 > 局限：组合期间锁定首个 compStart，故宿主窗口在组合中途移动/滚动时候选窗不跟随（与 Go 一致；组合通常很短，影响小）。
+
+### 第 5 层：应用兼容规则 caret_use_top —— WebView 光标矩形归一化
+
+部分应用（微信 Qt WebView 输入框等）`GetTextExt` 返回的光标 `height` 不稳定：在 `1`/`20px` 间跳变，
+导致 `rect.bottom`（= top + height）相差达 ~20px，而 `rect.top` 始终稳定（≤1px，视觉上 ≈ 正文底端）。
+若按默认的 `rect.bottom` 定位，候选窗会随 height 跳变上下抖 ~20px。
+
+按进程名匹配的兼容规则（`compat.toml` 的 `[[apps]]`，对齐 Go `pkg/config/compat.go`）解决：
+
+- **规则加载**：`wind-config/src/app_compat.rs` 的 `AppCompat::load(data_dir, user_dir)`——系统层
+  `{data}/compat.toml` + 用户层 `{user_config}/compat.toml` 覆盖；`get_rule(process)` 不区分大小写。
+  系统预置见 `data/compat.toml`（`Weixin.exe → caret_use_top = true`）。
+- **进程识别**：协调器 `update_active_compat(client_token)` 从 `client_token` 高 32 位取 PID
+  （`pid = token >> 32`，复用既有 token 编码，无需改 IPC 协议），经 `process_name(pid)`
+  （`OpenProcess` + `QueryFullProcessImageNameW`，对齐 Go `bridge.GetProcessName`）解析进程名，
+  查规则后把 `(pid, caret_use_top)` 缓存进 `active_compat`；按 pid 缓存避免每帧 `OpenProcess`。
+  接入点：`handle_focus_gained`（FOCUS_GAINED 重型后置段，不在 DLL 同步阻塞路径上）、`handle_ime_activated`。
+- **坐标变换**（`handle_caret_update` 顶部，对齐 Go `HandleCaretUpdate`）：命中规则时
+  `Y -= rawH`（bottom → 稳定的 top）、组合起点 Y 同步上移。
+
+> **height 必须保留真实行高，不能压成 1**（与 Go 的差异点）：wind-ui 的**下方**公式 `below_y = caret_y + gap`
+> 不读 height，故下方紧贴只靠稳定的 top；但**上方**公式 `above_y = caret_y - height - hi - gap` 用
+> `caret_top = caret_y - height` 推算正文顶端。若 height=1，正文顶端被当成 `top-1`（≈正文底端），
+> 上方候选窗会整条压住正文/光标。故变换保留 `height = rawH.max(CARET_USE_TOP_MIN_LINE_H=18)`：
+> 真实行高让上方正确避让正文，退化帧（rawH=1）落到下限兜底。偏大只是上方多留空隙，偏小才遮挡——宁大勿小。
 
 ## 6. 已知降级与未移植项
 
