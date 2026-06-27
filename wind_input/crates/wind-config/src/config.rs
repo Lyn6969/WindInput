@@ -1369,9 +1369,9 @@ impl Config {
         crate::variant::app_dir_name()
     }
 
-    /// 用户配置目录（config.toml / 词频 / shadow 置顶删词 / 主题选择 / 用户词库）。
+    /// 用户配置目录（config.toml / userdata.redb / 词频 / shadow 置顶删词 / 用户词库）。
     /// - 便携模式：`<exe目录>/userdata/`
-    /// - 正常模式：漫游 `%APPDATA%\WindInput[Dev]`（随用户同步）
+    /// - 正常模式：漫游 `%APPDATA%\WindInput[Dev]`（随用户在多设备间同步）
     pub fn user_config_dir() -> Option<PathBuf> {
         if crate::variant::is_portable() {
             crate::variant::portable_userdata_dir()

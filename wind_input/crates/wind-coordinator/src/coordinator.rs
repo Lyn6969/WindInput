@@ -406,8 +406,6 @@ pub struct Coordinator {
     pub(crate) theme_name: Mutex<String>,
     /// 主题暗色模式
     pub(crate) theme_dark: Mutex<bool>,
-    /// 主题选择持久化文件（theme.txt）
-    pub(crate) theme_path: Option<std::path::PathBuf>,
     /// 命令栏（cmdbar）服务束（ime/config/dict 等动作后端），构造后由 init_cmdbar 装配。
     pub(crate) cmdbar_services: std::sync::OnceLock<wind_cmdbar::Services>,
     /// 自身 Weak 引用：$CC 命令在独立线程异步执行（避免持 state 锁回调自锁方法致死锁）。
@@ -462,11 +460,11 @@ impl Coordinator {
             }
         };
 
-        // 用户配置目录：theme.txt 等小型 UI 偏好的锚点（词频已迁 redb，不再用 freq.tsv）。
+        // 用户配置目录（%APPDATA%\WindInput）：config.toml / userdata.redb / 词频等用户偏好。
         let user_dir =
             Config::user_config_dir().or_else(|| data_dir.as_deref().map(|d| d.to_path_buf()));
-        // redb 用户数据库（本机数据，不随漫游；dev 变体已隔离到 WindInputDev）。
-        let store = Config::local_dir().and_then(|d| {
+        // redb 用户数据库（用户偏好数据：词频、自定义词、shadow 规则，应随用户漫游）。
+        let store = user_dir.as_deref().and_then(|d| {
             let _ = std::fs::create_dir_all(&d);
             let p = d.join("userdata.redb");
             match Store::open(&p) {
@@ -674,19 +672,13 @@ impl Coordinator {
         // Shadow 规则已迁至 redb（self.store 的 SHADOW 表，事务持久），不再用 shadow.json。
         // 工具栏位置属本机状态（不随漫游）：放 %LOCALAPPDATA%\WindInput
         let toolbar_pos_path = Config::local_dir().map(|d| d.join("toolbar_pos.txt"));
-        let theme_path = user_dir.as_ref().map(|d| d.join("theme.txt"));
         let themes_dir = data_dir.map(|d| d.join("themes"));
-        // 初始主题名：config.ui.theme.name（设置页/右键统一写此为准）> theme.txt（旧版迁移回退）> "default"
+        // 初始主题名：config.ui.theme.name 为单一源，未设置则回退 "default"。
         let cfg_theme = config.ui.theme.name.trim();
         let initial_theme = if !cfg_theme.is_empty() {
             cfg_theme.to_string()
         } else {
-            theme_path
-                .as_ref()
-                .and_then(|p| std::fs::read_to_string(p).ok())
-                .map(|s| s.trim().to_string())
-                .filter(|s| !s.is_empty())
-                .unwrap_or_else(|| "default".to_string())
+            "default".to_string()
         };
         // 初始明暗：config.ui.theme.style == "dark"(否则亮/跟随系统按亮处理)。修启动不应用风格。
         let theme_dark_init = config.ui.theme.style.eq_ignore_ascii_case("dark");
@@ -780,7 +772,6 @@ impl Coordinator {
             themes_dir,
             theme_name: Mutex::new(initial_theme),
             theme_dark: Mutex::new(theme_dark_init),
-            theme_path,
             cmdbar_services: std::sync::OnceLock::new(),
             self_weak: std::sync::OnceLock::new(),
             recent_commits: Mutex::new(std::collections::VecDeque::new()),

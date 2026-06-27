@@ -270,16 +270,9 @@ impl Coordinator {
         self.show_tip(if dark { "暗色" } else { "亮色" });
     }
 
-    /// 持久化主题选择。以 config.ui.theme.name 为单一源(设置页/右键统一,reload 据此应用);
-    /// 兼写 theme.txt 供旧版/快速回退。
+    /// 持久化主题选择。config.ui.theme.name 为单一源（设置页/右键统一，reload 据此应用）。
     pub(crate) fn persist_theme(&self, name: &str) {
         let _ = Config::set_user_string(&["ui", "theme", "name"], name);
-        if let Some(p) = &self.theme_path {
-            if let Some(parent) = p.parent() {
-                let _ = std::fs::create_dir_all(parent);
-            }
-            let _ = std::fs::write(p, name);
-        }
     }
 
     /// 主题搜索目录：用户主题目录（%APPDATA%\WindInput\themes，优先覆盖）+ 安装主题目录。
