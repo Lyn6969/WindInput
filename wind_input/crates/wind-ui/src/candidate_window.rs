@@ -808,7 +808,26 @@ impl CandidateWindow {
                 }
                 band = band.fill_cross().child(View::spacer()).child(chip);
             }
+            // 清风设计主题（定义 separator 色）：预编辑行全宽 + 底部极淡分隔线（与候选区分）；
+            // 普通/第三方主题（无 separator）保持原行为（内容宽、无分隔线），尽量减少影响。
+            let sep_col = t.color("separator", [0, 0, 0, 0]);
+            let preedit_designed = sep_col[3] > 0;
+            if preedit_designed {
+                band = band.fill_cross();
+            }
             root = root.child(band);
+            if preedit_designed {
+                root = root.child(
+                    View::container(Layout::Row)
+                        .bg(sep_col)
+                        .fixed_h((1.0 * s).max(1.0))
+                        .fill_cross()
+                        .margin(Edges {
+                            b: 4.0 * s,
+                            ..Edges::default()
+                        }),
+                );
+            }
         }
 
         // 候选项颜色（基态）。状态色（选中/悬停）逐项经 eff_text 计算。

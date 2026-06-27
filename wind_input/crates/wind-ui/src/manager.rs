@@ -117,14 +117,18 @@ pub const HOVER_PAGE_NEXT: i32 = 100_001;
 /// 工具栏单元格动作
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ToolbarAction {
-    /// 中/英切换
+    /// 中/英切换（合并方案显示）
     ToggleMode,
-    /// 切换输入方案
+    /// 切换输入方案（保留供外部调用，工具栏不单独显示）
     SwitchEngine,
     /// 中/英标点切换
     TogglePunct,
     /// 全/半角切换
     ToggleWidth,
+    /// 简/繁转换切换
+    ToggleS2t,
+    /// 打开设置
+    OpenSettings,
 }
 
 /// 候选词条操作（右键菜单）；复制由 UI 侧直接处理，不在此列。

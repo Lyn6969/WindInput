@@ -23,10 +23,14 @@ use crate::window::{LayeredWindow, WindowMouse};
 #[derive(Debug, Clone)]
 pub struct ToolbarState {
     pub chinese_mode: bool,
-    /// 方案友好名（如 "五笔" / "拼音"）
+    /// 方案友好名（如 "五笔" / "拼音"），与中英状态合并显示在同一格
     pub schema_label: String,
     pub full_width: bool,
     pub chinese_punct: bool,
+    /// 简繁转换当前是否启用（格内显示 "繁" 并高亮）
+    pub s2t_enabled: bool,
+    /// 是否显示简繁格（默认 false；用户开启简繁功能后显示）
+    pub s2t_shown: bool,
 }
 
 impl Default for ToolbarState {
@@ -36,14 +40,17 @@ impl Default for ToolbarState {
             schema_label: "五笔".to_string(),
             full_width: false,
             chinese_punct: true,
+            s2t_enabled: false,
+            s2t_shown: false,
         }
     }
 }
 
-/// 一个单元格：文本 + 是否高亮（中文模式格）+ 点击动作
+/// 一个单元格：文本 + 高亮(激活态，如中文/简繁开) + 淡显(次要状态，如半角/简) + 点击动作
 struct Cell {
     text: String,
     highlight: bool,
+    dim: bool,
     action: ToolbarAction,
 }
 
@@ -55,13 +62,14 @@ pub struct Toolbar {
     visible: bool,
     /// 鼠标处理器（与 window 共享，wnd_proc 经注册表回调）；位置存于其中以便拖动同步
     mouse: Rc<RefCell<ToolbarMouse>>,
-    // 主题色（默认深灰，set_theme 覆盖）
+    // 主题色（默认浅色，set_theme 加载主题后覆盖）
     bg: [u8; 4],
     fg: [u8; 4],
     hl_bg: [u8; 4],
     hl_fg: [u8; 4],
     sep: [u8; 4],
     grip: [u8; 4],
+    settings_icon: [u8; 4],
 }
 
 impl Toolbar {
@@ -72,12 +80,14 @@ impl Toolbar {
     const MIN_CELL_W: f32 = 26.0;
     const FONT_PX: f32 = 15.0;
 
-    const BG: [u8; 4] = [44, 44, 46, 240]; // 深灰圆角底
-    const FG: [u8; 4] = [235, 235, 238, 255]; // 普通文字
-    const HL_BG: [u8; 4] = [66, 133, 244, 255]; // 中文模式高亮蓝
+    // 默认浅色配色（主题加载后由 set_theme 覆盖，以下为无主题时的兜底值）
+    const BG: [u8; 4] = [255, 255, 255, 245];      // 白色半透明底
+    const FG: [u8; 4] = [72, 72, 78, 255];           // 正常文字深灰
+    const HL_BG: [u8; 4] = [66, 133, 244, 255];      // 高亮蓝（中文模式 / 简繁启用）
     const HL_FG: [u8; 4] = [255, 255, 255, 255];
-    const SEP: [u8; 4] = [70, 70, 74, 255]; // 分隔线
-    const GRIP: [u8; 4] = [120, 120, 124, 255];
+    const SEP: [u8; 4] = [214, 214, 220, 255];       // 浅灰分隔线
+    const GRIP: [u8; 4] = [186, 186, 194, 255];      // 拖动点
+    const SETTINGS_ICON: [u8; 4] = [140, 140, 148, 255]; // 设置图标（比普通文字更淡）
 
     pub fn new(events: Sender<UiEvent>) -> Result<Self, String> {
         let scale = Self::dpi_scale();
@@ -106,6 +116,7 @@ impl Toolbar {
             hl_fg: Self::HL_FG,
             sep: Self::SEP,
             grip: Self::GRIP,
+            settings_icon: Self::SETTINGS_ICON,
         })
     }
 
@@ -117,6 +128,7 @@ impl Toolbar {
         self.hl_fg = theme.color("toolbar_mode_text", self.hl_fg);
         self.sep = theme.color("toolbar_border", self.sep);
         self.grip = theme.color("toolbar_grip", self.grip);
+        self.settings_icon = theme.color("toolbar_settings_icon", self.settings_icon);
     }
 
     /// 设置工具栏位置（启动恢复持久化位置）；钳制到工作区内。
@@ -129,39 +141,55 @@ impl Toolbar {
         }
     }
 
-    /// 根据状态构建单元格序列
+    /// 根据状态构建单元格序列。
+    /// 布局：拖动条 | 中英状态（含方案名）| 符号 | 全半角 | [简繁] | 设置图标
     fn cells(state: &ToolbarState) -> Vec<Cell> {
-        let mode = if state.chinese_mode { "中" } else { "英" };
-        let schema = state
-            .schema_label
-            .chars()
-            .next()
-            .map(|c| c.to_string())
-            .unwrap_or_else(|| "?".to_string());
+        // 中英状态：模式 + 方案首字合并为单格（"中·五" / "英·五"）
+        // 中英状态：方案已统一并入此格，仅显示中/英（方案切换走右键菜单）。
+        let mode_text = if state.chinese_mode { "中" } else { "英" };
         let punct = if state.chinese_punct { "，。" } else { ",." };
         let width = if state.full_width { "全" } else { "半" };
-        vec![
+
+        let mut cells = vec![
             Cell {
-                text: mode.to_string(),
+                text: mode_text.to_string(),
                 highlight: state.chinese_mode,
+                dim: false,
                 action: ToolbarAction::ToggleMode,
-            },
-            Cell {
-                text: schema,
-                highlight: false,
-                action: ToolbarAction::SwitchEngine,
             },
             Cell {
                 text: punct.to_string(),
                 highlight: false,
+                dim: false,
                 action: ToolbarAction::TogglePunct,
             },
             Cell {
                 text: width.to_string(),
                 highlight: false,
+                dim: !state.full_width, // 半角为次要默认态，淡显
                 action: ToolbarAction::ToggleWidth,
             },
-        ]
+        ];
+
+        // 简繁格：默认不显示（s2t_shown=false），用户开启简繁功能后显示。
+        if state.s2t_shown {
+            cells.push(Cell {
+                text: if state.s2t_enabled { "繁" } else { "简" }.to_string(),
+                highlight: state.s2t_enabled,
+                dim: !state.s2t_enabled,
+                action: ToolbarAction::ToggleS2t,
+            });
+        }
+
+        // 设置图标（始终显示在末尾）。
+        cells.push(Cell {
+            text: "⚙".to_string(),
+            highlight: false,
+            dim: false,
+            action: ToolbarAction::OpenSettings,
+        });
+
+        cells
     }
 
     /// DPI 动态化：按工具栏当前位置所在显示器实时取缩放（拖到别的显示器后自动适配）。
@@ -201,9 +229,22 @@ impl Toolbar {
         {
             let buf = self.window.buffer_mut();
             buf[..buf_size].fill(0);
-            let radius = (h as f32 * 0.22) as u32;
+            let radius = (h as f32 * 0.30) as u32;
             fill_rounded(buf, w, h, 0, 0, w, h, self.bg, radius);
-            // 拖动柄点阵（视觉对齐 Go，暂不响应拖动）
+            // 细边框（与背景同弧度），增强浅色背景下的轮廓（对齐设计稿胶囊外框）。
+            crate::view::fill_ring(
+                buf,
+                w,
+                h,
+                0.0,
+                0.0,
+                w as f32,
+                h as f32,
+                self.sep,
+                radius as f32,
+                (1.0 * s).max(1.0),
+            );
+            // 拖动柄点阵
             draw_grip(buf, w, h, grip_w as u32, self.grip, s);
         }
 
@@ -222,8 +263,9 @@ impl Toolbar {
                     h: h as f32,
                 },
             ));
-            // 分隔线（首格前不画）
-            if i > 0 {
+            // 分隔线：仅「拖动柄之后」(首格前) 与「设置图标之前」绘制（对齐设计稿，状态格之间不画）。
+            let is_settings = matches!(c.action, ToolbarAction::OpenSettings);
+            if i == 0 || is_settings {
                 draw_vsep(self.window.buffer_mut(), w, h, x as u32, self.sep, s);
             }
             // 高亮底（中文模式格）
@@ -250,7 +292,15 @@ impl Toolbar {
             let m = self.renderer.measure_text(&c.text);
             let tx = x + (cw - m.width) * 0.5;
             let ty = (h as f32 - font_h) * 0.5;
-            let fg = if c.highlight { self.hl_fg } else { self.fg };
+            let fg = if c.highlight {
+                self.hl_fg
+            } else if is_settings {
+                self.settings_icon
+            } else if c.dim {
+                dim_color(self.fg)
+            } else {
+                self.fg
+            };
             let _ = self.renderer.draw_text(
                 self.window.buffer_mut(),
                 w,
@@ -545,6 +595,11 @@ fn fill_rounded(
         color,
         radius as f32,
     );
+}
+
+/// 次要状态文字淡显：alpha 降至 ~65%（半角/未启用简繁等次要态比正常文字更弱）。
+fn dim_color(c: [u8; 4]) -> [u8; 4] {
+    [c[0], c[1], c[2], (c[3] as f32 * 0.65) as u8]
 }
 
 /// 竖直分隔线（在 x 处，上下各内缩 6px）

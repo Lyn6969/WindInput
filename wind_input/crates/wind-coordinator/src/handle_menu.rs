@@ -305,11 +305,24 @@ impl Coordinator {
 
     /// 工具栏单元格点击：复用菜单命令切换状态（内部已推送 C++），再刷新工具栏显示。
     pub(crate) fn mouse_toolbar(&self, action: ToolbarAction) {
+        match action {
+            ToolbarAction::OpenSettings => {
+                self.open_settings(None);
+                return;
+            }
+            ToolbarAction::ToggleS2t => {
+                self.handle_menu_command("toggle_s2t");
+                self.notify_toolbar();
+                return;
+            }
+            _ => {}
+        }
         let cmd = match action {
             ToolbarAction::ToggleMode => "toggle_mode",
             ToolbarAction::SwitchEngine => "switch_engine",
             ToolbarAction::TogglePunct => "toggle_punct",
             ToolbarAction::ToggleWidth => "toggle_width",
+            ToolbarAction::ToggleS2t | ToolbarAction::OpenSettings => unreachable!(),
         };
         self.handle_menu_command(cmd);
         self.notify_toolbar();
@@ -338,6 +351,9 @@ impl Coordinator {
             schema_label,
             full_width: s.full_width,
             chinese_punct: s.chinese_punct,
+            s2t_enabled: s.s2t_enabled,
+            // 简繁格：已启用时才在工具栏显示（默认 false 不显示）
+            s2t_shown: s.s2t_enabled,
         };
         drop(s);
         let _ = self.ui_tx.send(UiCommand::UpdateToolbar(tb));
