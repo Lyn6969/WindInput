@@ -101,3 +101,15 @@ opt-level = 1 # 本工作区代码：基础优化，仍保留可调试性（行�
 
 [profile.dev.package."*"]
 opt-level = 2 # 所有依赖（含 tiny-skia/windows）：更高优化，编译一次后缓存
+
+# dev 变体专用 profile：继承 dev 的快编译优化（工作区 opt-level=1 / 依赖 opt-level=2），
+# 仅关闭 debug_assertions → 令 windows_subsystem="windows" 生效（无控制台窗口）。
+# 身份不靠它决定（运行期按 exe 文件名），只决定编译画像。
+[profile.dev-variant]
+inherits = "dev"
+debug-assertions = false
+overflow-checks = false
+
+# inherits 不继承 package 专属覆盖，需复刻 dev 的依赖优化档。
+[profile.dev-variant.package."*"]
+opt-level = 2

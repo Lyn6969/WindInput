@@ -13,7 +13,6 @@ winresource = "0.1"
 
 [features]
 default = []
-debug_variant = ["wind-config/debug_variant"]
 
 [dependencies]
 wind-ipc = { path = "../../crates/wind-ipc" }

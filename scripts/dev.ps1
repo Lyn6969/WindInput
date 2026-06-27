@@ -9,28 +9,29 @@
 #   - Rust(wind_input/portable): cargo build --release (host = x86_64-pc-windows-msvc)
 #   - C++ TSF: CMake + "Visual Studio 17 2022" 生成器 (x64 + Win32, 自动定位 MSVC)
 #   - 词库数据: 下载 rime-frost/pinyin-data/OpenCC + 生成 unigram/pinyin_map + 编 octrie
-#   - 全构建产物落【产品根】build/(release) 或 build_debug/(debug); 内容 == 安装内容
+#   - 全构建产物落【产品根】build/(release) 或 build_dev/(dev); 内容 == 安装内容
 #
-# 命令 (菜单与命令行直调同一套; 前缀 d=debug, p=push/部署, m=单模块):
+# 命令 (菜单与命令行直调同一套; 前缀 d=dev, p=push/部署, m=单模块):
 #   1            Release 全构建: wind_input + tsf(x64/x86) + portable + 词库数据 → build/
-#   d1           Debug 全构建 → build_debug/
-#   m1 / dm1     仅 tsf (x64+x86)            release / debug
-#   m2 / dm2     仅 wind_input (核心 exe)     release / debug
-#   p1 / pd1     系统安装全部 (release / debug): 复制 + 注册 TSF + 开机自启 + 启动服务
+#   d1           Dev 全构建 → build_dev/
+#   m1 / dm1     仅 tsf (x64+x86)            release / dev
+#   m2 / dm2     仅 wind_input (核心 exe)     release / dev
+#   p1 / pd1     系统安装全部 (release / dev): 复制 + 注册 TSF + 开机自启 + 启动服务
+#   u1 / ud1     系统卸载全部 (release / dev): 反注册 + 移出输入法列表 + 移除自启 + 删目录
 #   pm1 / pm2    系统安装单模块 (tsf / 核心, release)
-#   pdm1 / pdm2  系统安装单模块 (debug)
+#   pdm1 / pdm2  系统安装单模块 (dev)
 #   k=check  l=clippy  t=test  f=fmt  fmt-check  ci(=fmt+clippy+test)  clean
 #   gd=gen-data  r=repl
 #
 # 部署目标 (Go 非便携式系统安装; 默认在 Program Files 下, 部署自动 UAC 提权;
 # 在 scripts\deploy.local.ps1 覆盖, PowerShell 赋值格式):
 #   DeployDirRelease = C:\Program Files\WindInput      # p1 / pm* 目标
-#   DeployDirDebug   = C:\Program Files\WindInputDev   # pd1 / pdm* 目标
+#   DeployDirDev   = C:\Program Files\WindInputDev   # pd1 / pdm* 目标
 #
 # 数据目录说明:
 #   data/                源文件(入库): 配置、五笔词库、主题等手工维护文件
 #   .cache/              外部下载/生成(gitignore): rime-frost、opencc、unigram 等
-#   build/ build_debug/  全构建产物(gitignore); 内容即部署到目标目录的内容
+#   build/ build_dev/  全构建产物(gitignore); 内容即部署到目标目录的内容
 
 param(
     [Parameter(Position = 0)] [string]$Command = "",
@@ -50,12 +51,12 @@ $ProjectRoot   = "$ProductRoot\wind_input"
 $TsfDir        = "$ProductRoot\wind_tsf"      # C++ TSF 核心层 (CMake/MSVC)
 $Version       = (Get-Content "$ProductRoot\docs\VERSION" -Raw).Trim()
 $BuildDir      = "$ProductRoot\build"
-$BuildDebugDir = "$ProductRoot\build_debug"
+$BuildDevDir = "$ProductRoot\build_dev"
 $CacheDir      = "$ProductRoot\.cache"        # 外部下载/生成 (不入库)
 
 # ---------- 部署目标 (Go 便携式: 复制到指定本地目录) ----------
 $DeployDirRelease = "C:\Program Files\WindInput"
-$DeployDirDebug   = "C:\Program Files\WindInputDev"
+$DeployDirDev   = "C:\Program Files\WindInputDev"
 # 可在 scripts\deploy.local.ps1 覆盖上述变量 (PowerShell 赋值语法; 该文件 gitignore)。
 $deployCfg = "$ScriptDir\deploy.local.ps1"
 if (Test-Path $deployCfg) { . $deployCfg }
@@ -66,37 +67,37 @@ function Warn ([string]$m) { Write-Host $m -ForegroundColor Yellow }
 function ErrMsg ([string]$m) { Write-Host $m -ForegroundColor Red }
 function Gray ([string]$m) { Write-Host $m -ForegroundColor DarkGray }
 
-# release → BUILD_DIR; debug → BUILD_DEBUG_DIR
-function Out-For ([string]$profile) { if ($profile -eq "debug") { $BuildDebugDir } else { $BuildDir } }
+# release → BUILD_DIR; dev → BUILD_DEV_DIR
+function Out-For ([string]$profile) { if ($profile -eq "dev") { $BuildDevDir } else { $BuildDir } }
 
 # ---------- 构建: 核心 exe ----------
-# debug 变体 = release profile + debug_variant 特性 (非 dev profile):
+# dev 变体 = dev-variant profile（继承 dev + 关断言）:
 #   ① debug_assertions 关闭 → windows_subsystem="windows" 生效, 无控制台窗口;
-#   ② 优化构建, 输入法手感正常; ③ 仍是独立 _debug 身份 (管道/目录隔离)。
+#   ② 优化构建, 输入法手感正常; ③ 仍是独立 _dev 身份 (管道/目录隔离)。
 function Build-Core ([string]$profile = "release", [string]$outdir = $null) {
     if (-not $outdir) { $outdir = Out-For $profile }
     New-Item -ItemType Directory -Path $outdir -Force | Out-Null
-    $suffix = ""; $feats = @()
-    if ($profile -eq "debug") { $suffix = "_debug"; $feats = @("--features", "debug_variant") }
-    Say "`n[core] 构建 wind_input ($profile, release profile$(if($feats){' +debug_variant'}))..."
+    $suffix = ""; $prof = "release"
+    if ($profile -eq "dev") { $suffix = "_dev"; $prof = "dev-variant" }
+    Say "`n[core] 构建 wind_input ($prof)..."
     Push-Location $ProjectRoot
     try {
-        cargo build --release -p wind_service @feats
+        cargo build --profile $prof -p wind_service
         if ($LASTEXITCODE -ne 0) { ErrMsg "wind_input 构建失败!"; return $false }
     } finally { Pop-Location }
-    $src = "$ProjectRoot\target\release\wind_input.exe"
+    $src = "$ProjectRoot\target\$prof\wind_input.exe"
     if (-not (Test-Path $src)) { ErrMsg "未找到产物: $src"; return $false }
     Copy-Item $src "$outdir\wind_input$suffix.exe" -Force
     $sz = [math]::Round((Get-Item "$outdir\wind_input$suffix.exe").Length / 1MB, 1)
     Gray "已构建: wind_input$suffix.exe (${sz}MB)"
-    # CLI 包装器 (wind_input config ...; 运行时自辨 debug/release exe, 两变体共用一份)
+    # CLI 包装器 (wind_input config ...; 运行时自辨 dev/release exe, 两变体共用一份)
     $cli = "$ProjectRoot\scripts\wind_cli.bat"
     if (Test-Path $cli) { Copy-Item $cli "$outdir\wind_cli.bat" -Force; Gray "已复制: wind_cli.bat" }
     return $true
 }
 
 # ---------- 构建: C++ TSF DLL (x64 + x86; CMake/MSVC) ----------
-# CMakeLists 把 DLL 写死输出到 ..\build[_debug], x86/x64 同名 wind_tsf.dll。
+# CMakeLists 把 DLL 写死输出到 ..\build[_dev], x86/x64 同名 wind_tsf.dll。
 # 故先编 x86 → 改名 _x86, 再编 x64 (保留无后缀名), 避免互相覆盖。
 function Build-TsfAll ([string]$profile = "release", [string]$outdir = $null) {
     if (-not $outdir) { $outdir = Out-For $profile }
@@ -105,7 +106,7 @@ function Build-TsfAll ([string]$profile = "release", [string]$outdir = $null) {
         Warn "未找到 cmake; 跳过 TSF (安装 CMake + VS2022 C++ 工具后可构建)。"; return $true
     }
     $suffix = ""; $dvFlag = "OFF"
-    if ($profile -eq "debug") { $suffix = "_debug"; $dvFlag = "ON" }
+    if ($profile -eq "dev") { $suffix = "_dev"; $dvFlag = "ON" }
     # 解析版本号 (写入版本资源)
     $vp = ($Version -split '[.\-]')
     $vMaj = if ($vp.Count -ge 1) { $vp[0] } else { "0" }
@@ -121,7 +122,7 @@ function Build-TsfAll ([string]$profile = "release", [string]$outdir = $null) {
         $bin = "$CacheDir\tsf-cmake\$($a.A)$suffix"
         New-Item -ItemType Directory -Path $bin -Force | Out-Null
         cmake -S $TsfDir -B $bin -G "Visual Studio 17 2022" -A $a.A `
-            "-DWIND_DEBUG_VARIANT=$dvFlag" `
+            "-DWIND_DEV_VARIANT=$dvFlag" `
             "-DAPP_VERSION_STR=$Version" `
             "-DAPP_VERSION_MAJOR=$vMaj" "-DAPP_VERSION_MINOR=$vMin" "-DAPP_VERSION_PATCH=$vPat" `
             | Out-Null
@@ -130,7 +131,8 @@ function Build-TsfAll ([string]$profile = "release", [string]$outdir = $null) {
         if ($LASTEXITCODE -ne 0) { ErrMsg "TSF $($a.A) 构建失败!"; return $false }
         # CMakeLists 输出到 $outdir\wind_tsf$suffix.dll; x86 需改名加 _x86
         $produced = "$outdir\wind_tsf$suffix.dll"
-        $final    = "$outdir\wind_tsf$suffix$($a.Sfx).dll"
+        # 末尾化: 架构后缀在前, 变体后缀在后 → wind_tsf_x86_dev.dll (与 Register-Tsf/portable/Makefile 一致)
+        $final    = "$outdir\wind_tsf$($a.Sfx)$suffix.dll"
         if ((Test-Path $produced) -and ($produced -ne $final)) {
             Move-Item $produced $final -Force
         }
@@ -142,7 +144,7 @@ function Build-TsfAll ([string]$profile = "release", [string]$outdir = $null) {
     return $true
 }
 
-# 纯 Rust 单一二进制, 运行时自辨 debug/release 变体; release/debug 产出同一份 exe。
+# 纯 Rust 单一二进制, 运行时自辨 dev/release 变体; dev/release 产出同一份 exe。
 function Build-Portable ([string]$profile = "release", [string]$outdir = $null) {
     if (-not $outdir) { $outdir = Out-For $profile }
     New-Item -ItemType Directory -Path $outdir -Force | Out-Null
@@ -235,7 +237,7 @@ function Download-Dicts {
 }
 
 # 从 data/(源) + .cache/(下载/生成) 组装完整运行时数据到 $outdir\data\
-function Assemble-Data ([string]$outdir = $BuildDebugDir) {
+function Assemble-Data ([string]$outdir = $BuildDevDir) {
     $data      = "$outdir\data"
     $schemas   = "$data\schemas"
     $pinyin    = "$schemas\pinyin"
@@ -298,7 +300,7 @@ function Assemble-Data ([string]$outdir = $BuildDebugDir) {
 }
 
 # 下载外部词库 + 生成 unigram/pinyin + 组装 data/
-function Do-GenData ([string]$outdir = $BuildDebugDir) {
+function Do-GenData ([string]$outdir = $BuildDevDir) {
     if (-not (Download-Dicts)) { return $false }
 
     # 生成 Unigram 语言模型 (Rust 工具 gen_unigram)
@@ -361,15 +363,15 @@ function Verify-DistData ([string]$outdir = $BuildDir) {
 }
 
 # ---------- 全构建 (1 / d1) ----------
-# 全部模块 + 数据落到【产品根】build/(release) 或 build_debug/(debug)。
+# 全部模块 + 数据落到【产品根】build/(release) 或 build_dev/(dev)。
 # 先清空输出目录, 确保内容 == 部署到目标目录的内容, 无任何中间产物。
 function Do-Full ([string]$profile = "release") {
     $outdir = Out-For $profile
     Say "`n========== 全构建 ($profile) → $outdir =========="
     if (Test-Path $outdir) { Remove-Item -Recurse -Force $outdir }
     New-Item -ItemType Directory -Path $outdir -Force | Out-Null
-    if (-not (Build-Core     $profile $outdir)) { return $false }   # wind_input[_debug].exe
-    if (-not (Build-TsfAll   $profile $outdir)) { return $false }   # wind_tsf[_x86][_debug].dll
+    if (-not (Build-Core     $profile $outdir)) { return $false }   # wind_input[_dev].exe
+    if (-not (Build-TsfAll   $profile $outdir)) { return $false }   # wind_tsf[_x86][_dev].dll
     if (-not (Do-GenData     $outdir))          { return $false }   # data/
     if (-not (Verify-DistData $outdir))         { return $false }   # 硬门禁
     Say "`n========== 全构建完成 ($profile) → $outdir =========="
@@ -380,7 +382,7 @@ function Do-Full ([string]$profile = "release") {
 # ---------- 部署 (Go 非便携式 / 系统安装) ----------
 # 与便携式不同: 复制到安装目录后, regsvr32 注册 TSF COM (DllRegisterServer 自带
 # AddLanguageProfile + RegisterCategories, 输入法直接进系统列表), 授权 AppContainer
-# 宿主读取 DLL, 安装字根字体, 写开机自启, 直接启动 wind_input[_debug].exe (不靠
+# 宿主读取 DLL, 安装字根字体, 写开机自启, 直接启动 wind_input[_dev].exe (不靠
 function Test-Admin {
     $id = [Security.Principal.WindowsIdentity]::GetCurrent()
     (New-Object Security.Principal.WindowsPrincipal($id)).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
@@ -389,8 +391,8 @@ function Test-Admin {
 # 部署命令 → 目标安装目录; 非部署命令返回 $null (兼作"是否部署命令"判断)。
 function Deploy-TargetForCmd ([string]$cmd) {
     switch ($cmd) {
-        { $_ -in "p1", "pm1", "pm2" }    { $DeployDirRelease; break }
-        { $_ -in "pd1", "pdm1", "pdm2" } { $DeployDirDebug;   break }
+        { $_ -in "p1", "pm1", "pm2", "u1" }    { $DeployDirRelease; break }
+        { $_ -in "pd1", "pdm1", "pdm2", "ud1" } { $DeployDirDev;   break }
         default { $null }
     }
 }
@@ -406,7 +408,7 @@ function Invoke-Elevated ([string]$cmd, [string]$arg) {
     $host_exe = (Get-Process -Id $PID).Path   # pwsh.exe 或 powershell.exe
     if (-not $host_exe) { $host_exe = "powershell.exe" }
     # 提权窗口内重新执行同一命令, 完成后停留以便查看输出/错误。
-    $inner = "& '$PSCommandPath' $cmd $arg; Write-Host ''; Read-Host '操作结束, 按回车关闭'"
+    $inner = "& '$PSCommandPath' $cmd $arg; Write-Host ''; Write-Host '操作结束, 按回车关闭' -NoNewline; Read-Host"
     try {
         # -ErrorAction Stop 确保 UAC 被取消 (用户点否) 时抛出可捕获的终止错误。
         Start-Process -FilePath $host_exe -Verb RunAs -ErrorAction Stop `
@@ -436,7 +438,7 @@ function Get-Regsvr32X86 { Join-Path $env:SystemRoot "SysWOW64\regsvr32.exe" }
 # 反注册安装目录中的旧 TSF COM (x64 + x86)。
 function Unregister-Tsf ([string]$dir, [string]$suffix) {
     $x64 = Join-Path $dir "wind_tsf$suffix.dll"
-    $x86 = Join-Path $dir "wind_tsf${suffix}_x86.dll"
+    $x86 = Join-Path $dir "wind_tsf_x86${suffix}.dll"
     if (Test-Path $x64) { & regsvr32 /u /s $x64 2>$null }
     if (Test-Path $x86) { & (Get-Regsvr32X86) /u /s $x86 2>$null }
 }
@@ -444,7 +446,7 @@ function Unregister-Tsf ([string]$dir, [string]$suffix) {
 # 注册 TSF COM (x64 必须成功; x86 失败仅告警, 不阻断 64 位使用)。
 function Register-Tsf ([string]$dir, [string]$suffix) {
     $x64 = Join-Path $dir "wind_tsf$suffix.dll"
-    $x86 = Join-Path $dir "wind_tsf${suffix}_x86.dll"
+    $x86 = Join-Path $dir "wind_tsf_x86${suffix}.dll"
     & regsvr32 /s $x64
     if ($LASTEXITCODE -ne 0) { ErrMsg "  - x64 COM 注册失败: $x64"; return $false }
     Gray "  - x64 COM 已注册"
@@ -456,10 +458,42 @@ function Register-Tsf ([string]$dir, [string]$suffix) {
     return $true
 }
 
+# 将本变体 TSF 输入法加入【当前用户】中文(zh-CN)输入法列表 → 默认启用, 免去手动"添加键盘"。
+# 背景: regsvr32/DllRegisterServer 只把 IME 注册为系统级"可用"; 对已配置好的语言, Windows
+#       不会自动把新 TIP 追加进用户启用列表 (RegisterProfile 的 bEnabledByDefault 仅在该语言
+#       【首次添加】时生效)。故此处显式追加。
+# 注1: CLSID/Profile GUID 必须与 wind_tsf\src\Globals.cpp 一致 (dev=DEB0/DEB1, release=EE30/EE31)。
+# 注2: 仅"添加"本变体, 绝不删除其它输入法 → 与系统已装的标准版清风/微软拼音等共存。
+# 注3: 部署在管理员令牌下运行; 同账户 UAC 提升时 HKCU 仍指向本人, 故对当前用户生效。
+function Enable-TsfForUser ([string]$profile) {
+    if ($profile -eq "dev") {
+        $tip = "0804:{99C2DEB0-5C57-45A2-9C63-FB54B34FD90A}{99C2DEB1-5C57-45A2-9C63-FB54B34FD90A}"
+    } else {
+        $tip = "0804:{99C2EE30-5C57-45A2-9C63-FB54B34FD90A}{99C2EE31-5C57-45A2-9C63-FB54B34FD90A}"
+    }
+    try {
+        $list = Get-WinUserLanguageList
+        $zh = $list | Where-Object { $_.LanguageTag -like "zh-Hans*" -or $_.LanguageTag -like "zh-CN*" } | Select-Object -First 1
+        if (-not $zh) {
+            $list.Add("zh-Hans-CN")
+            $zh = $list | Where-Object { $_.LanguageTag -like "zh-Hans*" } | Select-Object -First 1
+        }
+        if ($zh -and ($zh.InputMethodTips -notcontains $tip)) {
+            $zh.InputMethodTips.Add($tip)
+            Set-WinUserLanguageList -LanguageList $list -Force
+            Gray "  - 已加入当前用户输入法列表 (默认启用, 与标准版共存)"
+        } else {
+            Gray "  - 输入法已在用户列表, 跳过"
+        }
+    } catch {
+        Warn "  - 自动启用输入法失败 (可在 设置>时间和语言>语言>中文>选项>键盘 手动添加): $($_.Exception.Message)"
+    }
+}
+
 # 授权 ALL APPLICATION PACKAGES 读取执行 TSF DLL (开始菜单/搜索等 AppContainer 宿主需要)。
 function Grant-TsfAcl ([string]$dir, [string]$suffix) {
     $sid = "*S-1-15-2-1"
-    foreach ($n in @("wind_tsf$suffix.dll", "wind_tsf${suffix}_x86.dll")) {
+    foreach ($n in @("wind_tsf$suffix.dll", "wind_tsf_x86${suffix}.dll")) {
         $p = Join-Path $dir $n
         if (Test-Path $p) { & icacls $p /grant "${sid}:(RX)" /c | Out-Null }
     }
@@ -510,14 +544,14 @@ function Stop-WindService ([string]$suffix) {
     Start-Sleep -Milliseconds 600
 }
 
-# 系统安装: 全部 build[_debug]/ → 安装目录, 注册 TSF + 开机自启 + 启动服务 (p1 / pd1)。
+# 系统安装: 全部 build[_dev]/ → 安装目录, 注册 TSF + 开机自启 + 启动服务 (p1 / pd1)。
 function Deploy-Full ([string]$profile = "release") {
     $outdir = Out-For $profile
-    $targetDir = if ($profile -eq "debug") { $DeployDirDebug } else { $DeployDirRelease }
-    $suffix = if ($profile -eq "debug") { "_debug" } else { "" }
+    $targetDir = if ($profile -eq "dev") { $DeployDirDev } else { $DeployDirRelease }
+    $suffix = if ($profile -eq "dev") { "_dev" } else { "" }
     if (-not (Require-Admin)) { return $false }
     if (-not (Test-Path "$outdir\wind_input$suffix.exe")) {
-        ErrMsg "无 $outdir 产物; 请先 '$(if($profile -eq 'debug'){'d1'}else{'1'})' 全构建。"; return $false
+        ErrMsg "无 $outdir 产物; 请先 '$(if($profile -eq 'dev'){'d1'}else{'1'})' 全构建。"; return $false
     }
     Say "`n========== 系统安装 ($profile) → $targetDir =========="
     Say "[1/7] 停止旧进程..."; Stop-WindService $suffix
@@ -539,32 +573,34 @@ function Deploy-Full ([string]$profile = "release") {
     Grant-TsfAcl $targetDir $suffix
     if (-not (Register-Tsf $targetDir $suffix)) { return $false }
     Install-WubiFont $targetDir
-    Say "[6/7] 配置开机自启..."; Set-AutoStart $targetDir $suffix
+    Say "[6/7] 配置开机自启 + 默认启用输入法..."
+    Set-AutoStart $targetDir $suffix
+    Enable-TsfForUser $profile
     Get-ChildItem "$targetDir\*.old_*" -ErrorAction SilentlyContinue | Remove-Item -Force -ErrorAction SilentlyContinue
     Say "[7/7] 启动输入法服务..."
     $exe = Join-Path $targetDir "wind_input$suffix.exe"
     Start-Process -FilePath $exe; Gray "  - 已启动 wind_input$suffix.exe"
     Say "`n系统安装完成 ($profile) → $targetDir"
-    Say "提示: 按 Win+Space 切换到清风输入法$(if($suffix){' (Debug)'})。"
+    Say "提示: 按 Win+Space 切换到清风输入法$(if($suffix){' (Dev)'})。"
     return $true
 }
 
-# 系统安装单模块 (不重编, 用现有产物): pm1=tsf pm2=core (pd 前缀=debug)。
+# 系统安装单模块 (不重编, 用现有产物): pm1=tsf pm2=core (pd 前缀=dev)。
 #   tsf : 停服务 → 反注册旧 COM → 复制 → icacls → 重注册 → 重启服务
 #   core: 停服务 → 复制 (含 wind_cli.bat) → 重启服务
 function Deploy-Module ([string]$profile, [string]$mod) {
     $outdir = Out-For $profile
-    $targetDir = if ($profile -eq "debug") { $DeployDirDebug } else { $DeployDirRelease }
-    $suffix = if ($profile -eq "debug") { "_debug" } else { "" }
+    $targetDir = if ($profile -eq "dev") { $DeployDirDev } else { $DeployDirRelease }
+    $suffix = if ($profile -eq "dev") { "_dev" } else { "" }
     $files = @()
     switch ($mod) {
-        "tsf"  { $files = @("wind_tsf$suffix.dll", "wind_tsf${suffix}_x86.dll") }
+        "tsf"  { $files = @("wind_tsf$suffix.dll", "wind_tsf_x86${suffix}.dll") }
         "core" { $files = @("wind_input$suffix.exe") }
         default { ErrMsg "未知模块: $mod (tsf|core)"; return $false }
     }
     if (-not (Require-Admin)) { return $false }
     if (-not (Test-Path $targetDir)) {
-        ErrMsg "安装目录不存在: $targetDir; 请先 '$(if($profile -eq 'debug'){'pd1'}else{'p1'})' 完整安装。"; return $false
+        ErrMsg "安装目录不存在: $targetDir; 请先 '$(if($profile -eq 'dev'){'pd1'}else{'p1'})' 完整安装。"; return $false
     }
     foreach ($f in $files) { if (-not (Test-Path "$outdir\$f")) { ErrMsg "本地无 $outdir\$f (先构建对应模块)"; return $false } }
     Say "`n========== 系统安装模块 ($profile/$mod) → $targetDir =========="
@@ -577,6 +613,7 @@ function Deploy-Module ([string]$profile, [string]$mod) {
     if ($mod -eq "tsf") {
         Grant-TsfAcl $targetDir $suffix
         if (-not (Register-Tsf $targetDir $suffix)) { return $false }
+        Enable-TsfForUser $profile
     }
     Get-ChildItem "$targetDir\*.old_*" -ErrorAction SilentlyContinue | Remove-Item -Force -ErrorAction SilentlyContinue
     Say "[4/4] 启动输入法服务..."
@@ -586,11 +623,96 @@ function Deploy-Module ([string]$profile, [string]$mod) {
     return $true
 }
 
+# ---------- 卸载 (系统卸载 = 安装的逆操作) ----------
+# 从当前用户中文输入法列表移除本变体 TIP (Enable-TsfForUser 的逆操作)。
+function Disable-TsfForUser ([string]$profile) {
+    if ($profile -eq "dev") {
+        $tip = "0804:{99C2DEB0-5C57-45A2-9C63-FB54B34FD90A}{99C2DEB1-5C57-45A2-9C63-FB54B34FD90A}"
+    } else {
+        $tip = "0804:{99C2EE30-5C57-45A2-9C63-FB54B34FD90A}{99C2EE31-5C57-45A2-9C63-FB54B34FD90A}"
+    }
+    try {
+        $list = Get-WinUserLanguageList
+        $changed = $false
+        foreach ($l in $list) {
+            if ($l.InputMethodTips -contains $tip) { [void]$l.InputMethodTips.Remove($tip); $changed = $true }
+        }
+        if ($changed) { Set-WinUserLanguageList -LanguageList $list -Force; Gray "  - 已从用户输入法列表移除" }
+        else { Gray "  - 用户列表无此输入法, 跳过" }
+    } catch { Warn "  - 移除用户输入法失败: $($_.Exception.Message)" }
+}
+
+# 移除开机自启 (HKCU Run; Set-AutoStart 的逆操作)。
+function Remove-AutoStart ([string]$suffix) {
+    $name = if ($suffix) { "WindInputDev" } else { "WindInput" }
+    Remove-ItemProperty -Path "HKCU:\Software\Microsoft\Windows\CurrentVersion\Run" -Name $name -ErrorAction SilentlyContinue
+    Gray "  - 已移除开机自启 ($name)"
+}
+
+# 删除单个文件; 被占用(已加载的 DLL)时改名 .old_ 让路 — NTFS 允许改名在用文件, 仅不可删。
+# 返回 $true=已真正删除; $false=删不掉(已改名让路或失败)。与 Copy-Replace 同一让路策略。
+function Remove-OrRename ([string]$path) {
+    if (-not (Test-Path $path)) { return $true }
+    $leaf = Split-Path $path -Leaf
+    try { Remove-Item $path -Force -ErrorAction Stop; Gray "  - 删除 $leaf"; return $true }
+    catch {
+        $old = "$path.old_$(Get-Random -Maximum 99999999)"
+        try {
+            Rename-Item $path $old -Force -ErrorAction Stop
+            Warn "  - $leaf 被占用, 已改名让路 ($(Split-Path $old -Leaf)); 重启后可清除"
+        } catch {
+            ErrMsg "  - $leaf 删除/改名均失败: $($_.Exception.Message)"
+        }
+        return $false
+    }
+}
+
+# 系统卸载: 完整撤销 Deploy-Full 的副作用 (u1 / ud1)。
+#   停进程 → 移出用户输入法列表 → 反注册 TSF COM(x64+x86) → 移除开机自启 → 删安装目录。
+# 共存安全: 仅动本变体 (CLSID/目录/自启名均带本变体后缀), 不影响另一变体或系统其它输入法。
+# 字体(黑体字根)为两变体共享, 故【不】卸载, 以免影响仍在用的另一变体。
+# 个人数据(词库/配置/统计)默认保留; 仅打印路径供手动清除。
+function Uninstall-Full ([string]$profile = "release") {
+    $targetDir = if ($profile -eq "dev") { $DeployDirDev } else { $DeployDirRelease }
+    $suffix = if ($profile -eq "dev") { "_dev" } else { "" }
+    if (-not (Require-Admin)) { return $false }
+    Say "`n========== 系统卸载 ($profile) → $targetDir =========="
+    Say "[1/5] 停止进程..."; Stop-WindService $suffix
+    Say "[2/5] 移出用户输入法列表..."; Disable-TsfForUser $profile
+    Say "[3/5] 反注册 TSF COM..."
+    if (Test-Path $targetDir) { Unregister-Tsf $targetDir $suffix; Gray "  - 已反注册 (x64 + x86)" }
+    else { Warn "  - 安装目录不存在, 跳过反注册 (可能已卸载)" }
+    Say "[4/5] 移除开机自启..."; Remove-AutoStart $suffix
+    Say "[5/5] 删除安装文件 (锁定的 DLL 改名让路)..."
+    if (Test-Path $targetDir) {
+        # 先清掉历史改名残留 (上次卸载留下、此刻或已可删)
+        Get-ChildItem "$targetDir\*.old_*" -Recurse -File -ErrorAction SilentlyContinue | Remove-Item -Force -ErrorAction SilentlyContinue
+        # 逐文件删除; 占用的(TSF DLL 等)改名让路, 不再因单个锁定文件整体失败
+        $allGone = $true
+        Get-ChildItem $targetDir -Recurse -File -ErrorAction SilentlyContinue | ForEach-Object {
+            if (-not (Remove-OrRename $_.FullName)) { $allGone = $false }
+        }
+        if ($allGone) {
+            try { Remove-Item $targetDir -Recurse -Force -ErrorAction Stop; Gray "  - 已删除安装目录 $targetDir" }
+            catch { Warn "  - 文件已清空, 但目录未能删除 (重启后可删): $targetDir" }
+        } else {
+            Warn "  - 部分文件被占用已改名让路; 重启系统后重跑本命令或手动删除残留目录:"
+            Warn "    $targetDir"
+        }
+    } else { Gray "  - 目录不存在, 跳过" }
+    Say "`n系统卸载完成 ($profile)。"
+    $appName = if ($suffix) { "WindInputDev" } else { "WindInput" }
+    Warn "提示: 个人数据已保留, 如需彻底清除请手动删除:"
+    Warn "  漫游配置/词库: $env:APPDATA\$appName"
+    Warn "  本机缓存/日志: $env:LOCALAPPDATA\$appName"
+    return $true
+}
+
 # ---------- 候选 REPL (本机) ----------
 function Do-Repl ([string]$data = "") {
     if (-not $data) {
-        if (Test-Path "$BuildDebugDir\data\schemas\pinyin\unigram.txt") { $data = "$BuildDebugDir\data" }
-        else { Warn "未找到词库数据; 请先运行 gen-data"; $data = "$BuildDebugDir\data" }
+        if (Test-Path "$BuildDevDir\data\schemas\pinyin\unigram.txt") { $data = "$BuildDevDir\data" }
+        else { Warn "未找到词库数据; 请先运行 gen-data"; $data = "$BuildDevDir\data" }
     }
     Say "`n启动候选 REPL (data=$data)..."
     Push-Location $ProjectRoot
@@ -605,15 +727,16 @@ function Show-Menu {
     Write-Host "============================================`n" -ForegroundColor Cyan
     Write-Host "  全构建 (→ build/, 内容 == 部署内容):" -ForegroundColor Yellow
     Write-Host "    1    Release 全构建: wind_input + tsf(x64/x86) + portable + 词库"
-    Write-Host "    d1   Debug 全构建 (→ build_debug/)"
-    Write-Host "`n  单模块构建 (前缀 d = debug):" -ForegroundColor Yellow
+    Write-Host "    d1   Dev 全构建 (→ build_dev/)"
+    Write-Host "`n  单模块构建 (前缀 d = dev):" -ForegroundColor Yellow
     Write-Host "    m1   仅 tsf (x64+x86)        dm1"
     Write-Host "    m2   仅 wind_input (核心)     dm2"
-    Write-Host "`n  系统安装 (复制 + 注册 TSF + 开机自启, 自动提权):" -ForegroundColor Yellow
-    Write-Host "    p1   安装全部 (release)        pd1   安装全部 (debug)"
-    Write-Host "    pm1/pm2  安装模块(tsf/核心)    pdm1/pdm2 (debug)"
+    Write-Host "`n  系统安装 / 卸载 (注册 TSF + 开机自启 + 默认启用, 自动提权):" -ForegroundColor Yellow
+    Write-Host "    p1   安装全部 (release)        pd1   安装全部 (dev)"
+    Write-Host "    pm1/pm2  安装模块(tsf/核心)    pdm1/pdm2 (dev)"
+    Write-Host "    u1   卸载全部 (release)        ud1   卸载全部 (dev)"
     Write-Host "      release → $DeployDirRelease" -ForegroundColor DarkGray
-    Write-Host "      debug   → $DeployDirDebug" -ForegroundColor DarkGray
+    Write-Host "      dev     → $DeployDirDev" -ForegroundColor DarkGray
     Write-Host "`n  代码质量:" -ForegroundColor Yellow
     Write-Host "    k=check  l=clippy  t=test  f=fmt  ci=fmt+clippy+test"
     Write-Host "`n  数据 / 实测:" -ForegroundColor Yellow
@@ -628,19 +751,21 @@ function Show-Menu {
 function Dispatch ([string]$cmd, [string]$arg) {
     switch ($cmd) {
         { $_ -in "1", "release" }      { if (Do-Full release) { 0 } else { 1 }; break }
-        { $_ -in "d1", "debug" }       { if (Do-Full debug)   { 0 } else { 1 }; break }
+        { $_ -in "d1", "dev" }       { if (Do-Full dev)   { 0 } else { 1 }; break }
         "m1"   { if (Build-TsfAll   release) { 0 } else { 1 }; break }
-        "dm1"  { if (Build-TsfAll   debug)   { 0 } else { 1 }; break }
+        "dm1"  { if (Build-TsfAll   dev)   { 0 } else { 1 }; break }
         "m2"   { if (Build-Core     release) { 0 } else { 1 }; break }
-        "dm2"  { if (Build-Core     debug)   { 0 } else { 1 }; break }
+        "dm2"  { if (Build-Core     dev)   { 0 } else { 1 }; break }
         "m4"   { if (Build-Portable release) { 0 } else { 1 }; break }
-        "dm4"  { if (Build-Portable debug)   { 0 } else { 1 }; break }
+        "dm4"  { if (Build-Portable dev)   { 0 } else { 1 }; break }
         "p1"   { if (Deploy-Full release) { 0 } else { 1 }; break }
-        "pd1"  { if (Deploy-Full debug)   { 0 } else { 1 }; break }
+        "pd1"  { if (Deploy-Full dev)   { 0 } else { 1 }; break }
         "pm1"  { if (Deploy-Module release tsf)  { 0 } else { 1 }; break }
         "pm2"  { if (Deploy-Module release core) { 0 } else { 1 }; break }
-        "pdm1" { if (Deploy-Module debug tsf)    { 0 } else { 1 }; break }
-        "pdm2" { if (Deploy-Module debug core)   { 0 } else { 1 }; break }
+        "pdm1" { if (Deploy-Module dev tsf)    { 0 } else { 1 }; break }
+        "pdm2" { if (Deploy-Module dev core)   { 0 } else { 1 }; break }
+        "u1"   { if (Uninstall-Full release) { 0 } else { 1 }; break }
+        "ud1"  { if (Uninstall-Full dev)   { 0 } else { 1 }; break }
         { $_ -in "k", "check" }   { Do-Check;  $LASTEXITCODE; break }
         { $_ -in "l", "clippy" }  { Do-Clippy; $LASTEXITCODE; break }
         { $_ -in "t", "test" }    { Do-Test;   $LASTEXITCODE; break }
@@ -662,13 +787,13 @@ function Menu-Loop {
         if (-not $choice) { continue }
         $el = Invoke-Elevated $choice ""               # 受保护目标 → UAC 提权
         if ($el -ne "skip") {                          # done/fail 都不本地执行
-            Write-Host ""; Read-Host "按回车继续..." | Out-Null; continue
+            Write-Host ""; Write-Host "按回车继续..." -NoNewline; Read-Host | Out-Null; continue
         }
         $rc = Dispatch $choice ""
         if ($rc -eq 127) { ErrMsg "无效选项: $choice"; Start-Sleep -Seconds 1 }
         else {
             if ($rc -ne 0) { ErrMsg "`n命令 '$choice' 失败 (退出码 $rc)" }
-            Write-Host ""; Read-Host "按回车继续..." | Out-Null
+            Write-Host ""; Write-Host "按回车继续..." -NoNewline; Read-Host | Out-Null
         }
     }
 }

@@ -6,9 +6,9 @@ WIND_REMOTE='me@192.168.5.30'
 
 # 安装目录（scp 正斜杠风格 C:/...）。release 与 debug 分开，对应 p1 / pd1：
 #   p1  / pm*   → WIND_REMOTE_DIR_RELEASE
-#   pd1 / pdm*  → WIND_REMOTE_DIR_DEBUG
+#   pd1 / pdm*  → WIND_REMOTE_DIR_DEV
 WIND_REMOTE_DIR_RELEASE='C:/Users/me/AppData/Local/Programs/WindInput'
-WIND_REMOTE_DIR_DEBUG='C:/Users/me/AppData/Local/Programs/WindInputDebug'
+WIND_REMOTE_DIR_DEV='C:/Users/me/AppData/Local/Programs/WindInputDev'
 
 # 拉取 config.toml / 日志用（pull-config / pull-log）：
 #   WIND_DATA_DIR  = %APPDATA%\<App>        含 config.toml

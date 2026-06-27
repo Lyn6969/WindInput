@@ -61,8 +61,8 @@ void CFileLogger::Init()
     // Create named mutex for file write synchronization (only needed for file mode)
     if (_mode == LogMode::File || _mode == LogMode::All)
     {
-#ifdef WIND_DEBUG_VARIANT
-        _hMutex = CreateMutexW(nullptr, FALSE, L"Local\\WindInputDebugTSFLogMutex");
+#ifdef WIND_DEV_VARIANT
+        _hMutex = CreateMutexW(nullptr, FALSE, L"Local\\WindInputDevTSFLogMutex");
 #else
         _hMutex = CreateMutexW(nullptr, FALSE, L"Local\\WindInputTSFLogMutex");
 #endif
@@ -296,8 +296,8 @@ void CFileLogger::_RotateIfNeeded()
 
     wchar_t oldPath[MAX_PATH];
     _snwprintf_s(oldPath, _countof(oldPath), _TRUNCATE,
-#ifdef WIND_DEBUG_VARIANT
-        L"%ls\\wind_tsf_debug.old.log", _logDir);
+#ifdef WIND_DEV_VARIANT
+        L"%ls\\wind_tsf_dev.old.log", _logDir);
 #else
         L"%ls\\wind_tsf.old.log", _logDir);
 #endif

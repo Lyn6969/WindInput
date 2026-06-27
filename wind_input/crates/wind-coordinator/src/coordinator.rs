@@ -210,12 +210,12 @@ pub(crate) fn settings_url() -> Option<String> {
 }
 
 /// 取同目录下 wind_setting 设置应用的可执行路径（None=不存在）。
-/// 由当前 exe 名推导变体：wind_input[_debug].exe → wind_setting[_debug].exe，
-/// 故无需感知 debug_variant 特性，正式/调试版自动对应。
+/// 由当前 exe 名推导变体：wind_input[_dev].exe → wind_setting[_dev].exe，
+/// 故无需感知编译期变体，正式/dev 版自动对应。
 pub(crate) fn settings_app_path() -> Option<String> {
     let exe = std::env::current_exe().ok()?;
     let dir = exe.parent()?;
-    let stem = exe.file_stem()?.to_str()?; // wind_input 或 wind_input_debug
+    let stem = exe.file_stem()?.to_str()?; // wind_input 或 wind_input_dev
     let setting = stem.replacen("wind_input", "wind_setting", 1);
     let path = dir.join(format!("{setting}.exe"));
     path.exists().then(|| path.display().to_string())
@@ -454,7 +454,7 @@ impl Coordinator {
         // 用户配置目录：theme.txt 等小型 UI 偏好的锚点（词频已迁 redb，不再用 freq.tsv）。
         let user_dir =
             Config::user_config_dir().or_else(|| data_dir.as_deref().map(|d| d.to_path_buf()));
-        // redb 用户数据库（本机数据，不随漫游；debug 变体已隔离到 WindInputDebug）。
+        // redb 用户数据库（本机数据，不随漫游；dev 变体已隔离到 WindInputDev）。
         let store = Config::local_dir().and_then(|d| {
             let _ = std::fs::create_dir_all(&d);
             let p = d.join("userdata.redb");

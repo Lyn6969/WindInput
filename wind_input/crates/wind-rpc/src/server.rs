@@ -21,7 +21,7 @@ use crate::events::EventSink;
 pub fn ctrl_endpoint(suffix: &str) -> String {
     #[cfg(windows)]
     {
-        format!(r"\\.\pipe\wind_input{}_ctrl", suffix)
+        format!(r"\\.\pipe\wind_input_ctrl{}", suffix)
     }
     #[cfg(unix)]
     {

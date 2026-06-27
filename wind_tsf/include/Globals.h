@@ -138,9 +138,9 @@ extern const GUID c_guidDisplayAttributeInput;
 extern const GUID c_guidDisplayAttributeConverted;
 
 // 输入法名称
-#ifdef WIND_DEBUG_VARIANT
-#define TEXTSERVICE_NAME        L"清风输入法 (Debug)"
-#define TEXTSERVICE_DESC        L"清风输入法 Debug (WindInputDebug)"
+#ifdef WIND_DEV_VARIANT
+#define TEXTSERVICE_NAME        L"清风输入法 (开发版)"
+#define TEXTSERVICE_DESC        L"清风输入法 Dev (WindInputDev)"
 #else
 #define TEXTSERVICE_NAME        L"清风输入法"
 #define TEXTSERVICE_DESC        L"清风输入法 (WindInput)"
@@ -152,9 +152,9 @@ extern const GUID c_guidDisplayAttributeConverted;
 
 // 命名管道名称 (与 Go Service 通信)
 // 注意：不使用 LOCAL\ 前缀，AppContainer 进程可能无法访问带目录前缀的管道
-#ifdef WIND_DEBUG_VARIANT
-#define PIPE_NAME               L"\\\\.\\pipe\\wind_input_debug"
-#define PUSH_PIPE_NAME          L"\\\\.\\pipe\\wind_input_debug_push"
+#ifdef WIND_DEV_VARIANT
+#define PIPE_NAME               L"\\\\.\\pipe\\wind_input_dev"
+#define PUSH_PIPE_NAME          L"\\\\.\\pipe\\wind_input_push_dev"
 #else
 #define PIPE_NAME               L"\\\\.\\pipe\\wind_input"
 #define PUSH_PIPE_NAME          L"\\\\.\\pipe\\wind_input_push"

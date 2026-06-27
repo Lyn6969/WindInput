@@ -11,11 +11,7 @@ use wind_config::config_schema::{
     FieldType, ValidateError, field, is_known_key, leaf_entries, registry, validate,
 };
 
-/// 变体后缀：须与运行中的 core 一致（debug 变体连 `_debug` 通道）。
-#[cfg(feature = "debug_variant")]
-const SUFFIX: &str = "_debug";
-#[cfg(not(feature = "debug_variant"))]
-const SUFFIX: &str = "";
+// 变体后缀经 wind_config::variant::pipe_suffix() 运行时取得：CLI 与 core 同一 exe，自辨一致。
 
 /// 子命令入口。`args` 为 `config` 之后的参数。返回进程退出码。
 pub fn run(args: &[String]) -> i32 {
@@ -199,7 +195,7 @@ fn apply_items(items: Vec<(String, toml::Value)>) -> i32 {
         })
         .collect();
 
-    match wind_rpc::client::call(SUFFIX, "config.setItems", json!({ "items": json_items })) {
+    match wind_rpc::client::call(wind_config::variant::pipe_suffix(), "config.setItems", json!({ "items": json_items })) {
         Ok(res) => {
             let restart = res
                 .get("needsRestart")

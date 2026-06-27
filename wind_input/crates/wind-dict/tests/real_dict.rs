@@ -8,9 +8,9 @@
 use std::path::PathBuf;
 use wind_dict::cached::CachedDict;
 
-/// 仓库内 build_debug 数据目录（相对 crate manifest 向上两级）
+/// 仓库内 build_dev 数据目录（相对 crate manifest 向上两级）
 fn data_schemas() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../build_debug/data/schemas")
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../build_dev/data/schemas")
 }
 
 #[test]

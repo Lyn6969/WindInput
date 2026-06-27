@@ -9,31 +9,31 @@
 #   - Rust(wind_input): cargo-xwin → x86_64-pc-windows-msvc (+crt-static 自包含)
 #   - C++ TSF: clang + lld-link + llvm-rc + cargo-xwin 的 MSVC SDK (x64 + x86)
 #   - 依赖: cargo-xwin + clang-19/lld-19/llvm-19 (MSVC STL 要 clang≥19)
-#   - 全构建产物落【项目根】build/(release) 或 build_debug/(debug)，内容 == 安装内容
+#   - 全构建产物落【项目根】build/(release) 或 build_dev/(dev)，内容 == 安装内容
 #
-# 命令（菜单与命令行直调同一套；前缀 d=debug, p=push, m=单模块）:
+# 命令（菜单与命令行直调同一套；前缀 d=dev, p=push, m=单模块）:
 #   1            Release 全构建: wind_input + tsf(x64/x86) + 词库数据 → build/
-#   d1           Debug 全构建 → build_debug/
-#   m1 / dm1     仅 tsf (x64+x86)            release / debug
-#   m2 / dm2     仅 wind_input (核心 exe)     release / debug
+#   d1           Debug 全构建 → build_dev/
+#   m1 / dm1     仅 tsf (x64+x86)            release / dev
+#   m2 / dm2     仅 wind_input (核心 exe)     release / dev
 #   8            生成安装包 (= 1 + 打包 → Setup.exe + sha256)
 #   8s           跳过编译，直接打包现有 build/
-#   p1 / pd1     push 全部 build[_debug]/ → Windows 安装目录 (release / debug)
+#   p1 / pd1     push 全部 build[_dev]/ → Windows 安装目录 (release / dev)
 #   pm1/pm2      push 单模块 (tsf/核心, release)
-#   pdm1/pdm2    push 单模块 (debug)
+#   pdm1/pdm2    push 单模块 (dev)
 #   k=check  l=clippy  t=test  f=fmt  fmt-check  ci(=fmt+clippy+test)  clean
 #   gd=gen-data  r=repl  dl=pull-data  pc=pull-config  pl=pull-log(pla=全部)
 #
 # 部署配置 scripts/deploy.local（SSH 推送到 Windows 实测机）:
 #   WIND_REMOTE              = user@host             # SSH 目标
 #   WIND_REMOTE_DIR_RELEASE  = C:/.../WindInput      # p1 全量/ pm* 推送目录
-#   WIND_REMOTE_DIR_DEBUG    = C:/.../WindInputDebug  # pd1 / pdm* 推送目录
+#   WIND_REMOTE_DIR_DEV    = C:/.../WindInputDev  # pd1 / pdm* 推送目录
 #   WIND_DATA_DIR / WIND_LOCAL_DIR  = %APPDATA% / %LOCALAPPDATA%\<App>  # pull-config/log 用
 #
 # 数据目录说明：
 #   data/           源文件（入库）：配置、五笔词库、主题等手工维护文件
 #   .cache/         外部下载/生成（gitignore）：rime-frost、opencc、unigram、tsf-obj 等
-#   build/ build_debug/  全构建产物（gitignore）；内容即安装到 Program Files 的内容
+#   build/ build_dev/  全构建产物（gitignore）；内容即安装到 Program Files 的内容
 #
 # 推荐实测流程：① gen-data 下载+组装词库 → ② repl 在 Linux 验证候选逻辑
 #               ③ push 把 exe drop-in 到 Windows → 重启服务做应用内实测
@@ -53,7 +53,7 @@ TSF_DIR="$PRODUCT_ROOT/wind_tsf"
 VERSION="$(tr -d '[:space:]' < "$PRODUCT_ROOT/docs/VERSION" 2>/dev/null || echo '?')"
 # 发布产物目录在【项目根】（内容 == 安装到 Program Files 的内容，无中间产物）
 BUILD_DIR="$PRODUCT_ROOT/build"
-BUILD_DEBUG_DIR="$PRODUCT_ROOT/build_debug"
+BUILD_DEV_DIR="$PRODUCT_ROOT/build_dev"
 # 外部下载/生成的词库缓存目录（不入库）
 CACHE_DIR="$PRODUCT_ROOT/.cache"
 # Rust 工具链根目录（wind_input/ workspace）
@@ -63,11 +63,11 @@ RUST_WORKSPACE="$PRODUCT_ROOT/wind_input"
 #   WIND_REMOTE              = user@host          （SSH 目标）
 #   WIND_REMOTE_DIR_RELEASE  = release 安装目录    （p1/pm* 推送目标；scp 正斜杠风格，
 #                              如 'C:/Users/me/AppData/Local/Programs/WindInput'）
-#   WIND_REMOTE_DIR_DEBUG    = debug 安装目录      （pd1/pdm* 推送目标，如 .../WindInputDebug）
+#   WIND_REMOTE_DIR_DEV    = dev 安装目录      （pd1/pdm* 推送目标，如 .../WindInputDev）
 [ -f "$SCRIPT_DIR/deploy.local" ] && . "$SCRIPT_DIR/deploy.local"
 WIND_REMOTE="${WIND_REMOTE:-}"
 WIND_REMOTE_DIR_RELEASE="${WIND_REMOTE_DIR_RELEASE:-}"
-WIND_REMOTE_DIR_DEBUG="${WIND_REMOTE_DIR_DEBUG:-}"
+WIND_REMOTE_DIR_DEV="${WIND_REMOTE_DIR_DEV:-}"
 WIND_REMOTE_DIR="${WIND_REMOTE_DIR:-}"   # 兼容旧配置：未设 _RELEASE 时作 release 回退
 # 远程数据/本地目录（拉配置、拉日志用；见 deploy.local 注释）：
 #   WIND_DATA_DIR   = %APPDATA%\<App>        含 config.toml（用户配置）
@@ -134,26 +134,26 @@ cargo_xwin() {
 }
 
 # ---------- 构建（单模块 + 全构建）----------
-# 输出目录：release → BUILD_DIR；debug → BUILD_DEBUG_DIR。
-out_for() { [ "${1:-release}" = debug ] && echo "$BUILD_DEBUG_DIR" || echo "$BUILD_DIR"; }
+# 输出目录：release → BUILD_DIR；dev → BUILD_DEV_DIR。
+out_for() { [ "${1:-release}" = dev ] && echo "$BUILD_DEV_DIR" || echo "$BUILD_DIR"; }
 
 # 模块一：wind_input 核心 exe。
-# debug 变体 = release profile + debug_variant 特性（非 dev profile）：
+# dev 变体 = dev-variant profile（继承 dev 优化 + 关 debug_assertions）；源码与 release 完全一致：
 #   ① debug_assertions 关闭 → windows_subsystem="windows" 生效，无控制台窗口；
-#   ② 优化构建，Windows 上输入法手感正常；③ 仍是独立 _debug 身份(管道/目录隔离)。
+#   ② opt-level=1 快编译且手感够用；③ 独立 _dev 身份(管道/目录隔离, 运行期按 exe 名探测)。
 build_core() {
     local profile="${1:-release}" outdir="${2:-$(out_for "$1")}"
     mkdir -p "$outdir"; cd "$PROJECT_ROOT" || return 1
-    local feats="" suffix=""
-    [ "$profile" = debug ] && { feats="--features debug_variant"; suffix="_debug"; }
-    say "\n[core] 交叉编译 wind_input ($profile, release profile${feats:+ +debug_variant}, $TARGET)..."
-    cargo_xwin build --release --target "$TARGET" -p wind_service $feats \
+    local suffix="" prof="release"
+    [ "$profile" = dev ] && { prof="dev-variant"; suffix="_dev"; }
+    say "\n[core] 交叉编译 wind_input ($prof, $TARGET)..."
+    cargo_xwin build --profile "$prof" --target "$TARGET" -p wind_service \
         || { err "wind_input 构建失败!"; return 1; }
-    local src="$PROJECT_ROOT/target/$TARGET/release/wind_input.exe"
+    local src="$PROJECT_ROOT/target/$TARGET/$prof/wind_input.exe"
     [ -f "$src" ] || { err "未找到产物: $src"; return 1; }
     cp -f "$src" "$outdir/wind_input${suffix}.exe"
     gray "已构建: wind_input${suffix}.exe ($(du -h "$outdir/wind_input${suffix}.exe" | cut -f1))"
-    # CLI 包装器 (wind_input config ...; 运行时自辨 debug/release exe, 两变体共用一份)
+    # CLI 包装器 (wind_input config ...; 运行时自辨 dev/release exe, 两变体共用一份)
     [ -f "$PROJECT_ROOT/scripts/wind_cli.bat" ] && cp -f "$PROJECT_ROOT/scripts/wind_cli.bat" "$outdir/wind_cli.bat" && gray "已复制: wind_cli.bat"
 }
 
@@ -202,7 +202,7 @@ do_ci() {
 }
 
 # 模块二：C++ TSF DLL（x64 + x86；clang/MSVC 交叉编译）。
-# obj 中间产物落 .cache，保持 outdir 干净（== 安装内容）。debug → _debug 后缀。
+# obj 中间产物落 .cache，保持 outdir 干净（== 安装内容）。dev → _dev 后缀。
 build_tsf_all() {
     local profile="${1:-release}" outdir="${2:-$(out_for "$1")}"
     mkdir -p "$outdir"
@@ -215,12 +215,12 @@ build_tsf_all() {
         warn "未找到 MSVC SDK 缓存；请先跑一次完整构建（cargo-xwin 会下载 SDK）。跳过 TSF。"
         return 0
     fi
-    local dv=0; [ "$profile" = debug ] && dv=1
+    local dv=0; [ "$profile" = dev ] && dv=1
     local objbase="$CACHE_DIR/tsf-obj"
     say "\n[tsf] 交叉编译 x64 + x86 ($profile, clang-$WIND_LLVM_VER/MSVC)..."
     local a objsfx; [ "$dv" = 1 ] && objsfx="d" || objsfx=""
     for a in x64 x86; do
-        make -C "$TSF_DIR" ARCH="$a" DEBUG_VARIANT="$dv" VERSION="$VERSION" OUTDIR="$outdir" \
+        make -C "$TSF_DIR" ARCH="$a" DEV_VARIANT="$dv" VERSION="$VERSION" OUTDIR="$outdir" \
              OBJDIR="$objbase/$a$objsfx" \
              CLANG="clang++-$WIND_LLVM_VER" LLVM_RC="llvm-rc-$WIND_LLVM_VER" >/dev/null \
           || { err "TSF $a 构建失败！见 'make -C $TSF_DIR ARCH=$a' 输出。"; return 1; }
@@ -288,7 +288,7 @@ download_dicts() {
 
 # 从 data/（源）+ .cache/（下载/生成）组装完整运行时数据到 $outdir/data/
 assemble_data() {
-    local outdir="${1:-$BUILD_DEBUG_DIR}"
+    local outdir="${1:-$BUILD_DEV_DIR}"
     local data="$outdir/data"
     local schemas="$data/schemas"
     local pinyin="$schemas/pinyin"
@@ -361,18 +361,18 @@ assemble_data() {
 
 # ---------- 实测 / 远程部署（SSH）----------
 
-# 本机跑候选 REPL。data 目录优先 build_debug/data/，其次 .cache/pulled-data/。
+# 本机跑候选 REPL。data 目录优先 build_dev/data/，其次 .cache/pulled-data/。
 do_repl() {
     local data="${1:-}"
     if [ -z "$data" ]; then
-        if [ -f "$BUILD_DEBUG_DIR/data/schemas/pinyin/unigram.txt" ]; then
-            data="$BUILD_DEBUG_DIR/data"
+        if [ -f "$BUILD_DEV_DIR/data/schemas/pinyin/unigram.txt" ]; then
+            data="$BUILD_DEV_DIR/data"
         elif [ -d "$CACHE_DIR/pulled-data" ]; then
             data="$CACHE_DIR/pulled-data"
             gray "使用 pull-data 拉取的词库: $data"
         else
             warn "未找到词库数据；请先运行 gen-data 或 pull-data"
-            data="$BUILD_DEBUG_DIR/data"
+            data="$BUILD_DEV_DIR/data"
         fi
     fi
     say "\n启动候选 REPL (data=$data)..."
@@ -388,12 +388,12 @@ require_remote() {
 }
 
 # 解析远端安装目录（按 profile）。结果写入全局 REMOTE_DIR（去尾斜杠避免 // ）。
-#   release → WIND_REMOTE_DIR_RELEASE（兼容旧 WIND_REMOTE_DIR）；debug → WIND_REMOTE_DIR_DEBUG
+#   release → WIND_REMOTE_DIR_RELEASE（兼容旧 WIND_REMOTE_DIR）；dev → WIND_REMOTE_DIR_DEV
 resolve_remote_dir() {
     local profile="${1:-release}"
-    if [ "$profile" = debug ]; then
-        REMOTE_DIR="${WIND_REMOTE_DIR_DEBUG:-}"
-        [ -n "$REMOTE_DIR" ] || { err "未配置 WIND_REMOTE_DIR_DEBUG（deploy.local）"; return 1; }
+    if [ "$profile" = dev ]; then
+        REMOTE_DIR="${WIND_REMOTE_DIR_DEV:-}"
+        [ -n "$REMOTE_DIR" ] || { err "未配置 WIND_REMOTE_DIR_DEV（deploy.local）"; return 1; }
     else
         REMOTE_DIR="${WIND_REMOTE_DIR_RELEASE:-${WIND_REMOTE_DIR:-}}"
         [ -n "$REMOTE_DIR" ] || { err "未配置 WIND_REMOTE_DIR_RELEASE（deploy.local）"; return 1; }
@@ -410,17 +410,17 @@ remote_ps() {
 
 # 本 profile 的二进制基名（exe/dll）。data/ 不在此（不会被锁，直接 scp 覆盖）。
 bins_for() {
-    local sfx=""; [ "$1" = debug ] && sfx="_debug"
+    local sfx=""; [ "$1" = dev ] && sfx="_dev"
     printf '%s\n' "wind_input${sfx}.exe" "wind_tsf${sfx}.dll" "wind_tsf${sfx}_x86.dll"
 }
 
 # 把 bash 列表转成 PowerShell 字符串数组字面量： a b → 'a','b'
 ps_list() { local out="" x; for x in "$@"; do out="$out${out:+,}'$x'"; done; printf '%s' "$out"; }
 
-# 终止远端进程（按 profile 决定 _debug 后缀；mod 限定只杀该模块的进程）。
+# 终止远端进程（按 profile 决定 _dev 后缀；mod 限定只杀该模块的进程）。
 remote_taskkill() {
     local profile="$1" mod="${2:-}" sfx=""
-    [ "$profile" = debug ] && sfx="_debug"
+    [ "$profile" = dev ] && sfx="_dev"
     local procs=()
     case "$mod" in
         core)    procs=("wind_input${sfx}.exe") ;;
@@ -444,7 +444,7 @@ foreach(\$n in @($arr)){ \$p=Join-Path \$d \$n; if(Test-Path \$p){ Rename-Item \
 # 注意：经 SSH 直接 Start-Process 的子进程会随 SSH 断开被 Job Object 连带杀掉
 # （症状：部署后看不到进程）。改用计划任务(schtasks)在用户交互会话拉起，脱离 SSH 生命周期。
 remote_start_main() {
-    local profile="$1" sfx=""; [ "$profile" = debug ] && sfx="_debug"
+    local profile="$1" sfx=""; [ "$profile" = dev ] && sfx="_dev"
     local exe="$REMOTE_DIR/wind_input${sfx}.exe"
     say "启动远端主进程 wind_input${sfx}.exe (计划任务,脱离 SSH 会话)..."
     # 用 ScheduledTasks cmdlet 在用户交互会话(session 1)拉起：进程脱离 SSH 的
@@ -468,14 +468,14 @@ remote_cleanup_old() {
     remote_ps "Get-ChildItem -Path '$REMOTE_DIR' -Filter '*.old_*' -EA SilentlyContinue | Remove-Item -Force -EA SilentlyContinue" >/dev/null 2>&1 || true
 }
 
-# 全量 push：整个 build[_debug]/ → 远端安装目录（先改名锁定二进制让路，再 scp 覆盖，最后起主进程）。
+# 全量 push：整个 build[_dev]/ → 远端安装目录（先改名锁定二进制让路，再 scp 覆盖，最后起主进程）。
 #   p1 / pd1
 do_push_full() {
     local profile="${1:-release}"
     require_remote || return 1
     resolve_remote_dir "$profile" || return 1
     local outdir; outdir="$(out_for "$profile")"
-    [ -d "$outdir" ] || { err "无 $outdir；请先 '$([ "$profile" = debug ] && echo d1 || echo 1)' 全构建。"; return 1; }
+    [ -d "$outdir" ] || { err "无 $outdir；请先 '$([ "$profile" = dev ] && echo d1 || echo 1)' 全构建。"; return 1; }
     say "\n停止远端进程（$profile）..."
     remote_taskkill "$profile"
     ssh "$WIND_REMOTE" "if not exist \"${REMOTE_DIR//\//\\}\" mkdir \"${REMOTE_DIR//\//\\}\"" >/dev/null 2>&1 || true
@@ -488,19 +488,19 @@ do_push_full() {
         remote_cleanup_old
         say "已全量部署并启动（$profile）。"
     else
-        err "scp 失败：检查 $([ "$profile" = debug ] && echo WIND_REMOTE_DIR_DEBUG || echo WIND_REMOTE_DIR_RELEASE) 路径(正斜杠)、SSH、磁盘。"
+        err "scp 失败：检查 $([ "$profile" = dev ] && echo WIND_REMOTE_DIR_DEV || echo WIND_REMOTE_DIR_RELEASE) 路径(正斜杠)、SSH、磁盘。"
         return 1
     fi
 }
 
-# 单模块 push：只推对应文件（不重编，用现有 build[_debug]/ 产物）。
-#   pm1=tsf  pm2=core （pd 前缀 = debug）
+# 单模块 push：只推对应文件（不重编，用现有 build[_dev]/ 产物）。
+#   pm1=tsf  pm2=core （pd 前缀 = dev）
 do_push_module() {
     local profile="${1:-release}" mod="$2"
     require_remote || return 1
     resolve_remote_dir "$profile" || return 1
     local outdir; outdir="$(out_for "$profile")"
-    local sfx=""; [ "$profile" = debug ] && sfx="_debug"
+    local sfx=""; [ "$profile" = dev ] && sfx="_dev"
     local files=()
     case "$mod" in
         tsf)     files=("wind_tsf${sfx}.dll" "wind_tsf${sfx}_x86.dll") ;;
@@ -549,8 +549,8 @@ require_remote_dirs() {
     require_remote || return 1
     if [ -z "$WIND_DATA_DIR" ] || [ -z "$WIND_LOCAL_DIR" ]; then
         err "未配置远程目录：请在 $SCRIPT_DIR/deploy.local 设置 WIND_DATA_DIR 与 WIND_LOCAL_DIR"
-        echo "  示例: WIND_DATA_DIR='C:/Users/me/AppData/Roaming/WindInputDebug'"
-        echo "        WIND_LOCAL_DIR='C:/Users/me/AppData/Local/WindInputDebug'"
+        echo "  示例: WIND_DATA_DIR='C:/Users/me/AppData/Roaming/WindInputDev'"
+        echo "        WIND_LOCAL_DIR='C:/Users/me/AppData/Local/WindInputDev'"
         return 1
     fi
 }
@@ -596,9 +596,9 @@ do_pull_log() {
     fi
 }
 
-# 下载外部词库到 .cache/ + 生成 unigram + 组装 build_debug/data/
+# 下载外部词库到 .cache/ + 生成 unigram + 组装 build_dev/data/
 do_gen_data() {
-    local outdir="${1:-$BUILD_DEBUG_DIR}"
+    local outdir="${1:-$BUILD_DEV_DIR}"
     if ! command -v curl >/dev/null 2>&1; then
         err "需要 curl（下载词库用）"; return 1
     fi
@@ -680,15 +680,15 @@ verify_dist_data() {
 }
 
 # ---------- 全构建（1 / d1）----------
-# 全部模块 + 数据落到【项目根】build/(release) 或 build_debug/(debug)。
+# 全部模块 + 数据落到【项目根】build/(release) 或 build_dev/(dev)。
 # 先清空输出目录，确保内容 == 安装到 Program Files 的内容，无任何中间产物。
-#   do_full [release|debug]
+#   do_full [release|dev]
 do_full() {
     local profile="${1:-release}" outdir; outdir="$(out_for "$profile")"
     say "\n========== 全构建 ($profile) → $outdir =========="
     rm -rf "$outdir"; mkdir -p "$outdir"
-    build_core    "$profile" "$outdir" || return 1   # wind_input[_debug].exe
-    build_tsf_all "$profile" "$outdir" || return 1   # wind_tsf[_x86][_debug].dll
+    build_core    "$profile" "$outdir" || return 1   # wind_input[_dev].exe
+    build_tsf_all "$profile" "$outdir" || return 1   # wind_tsf[_x86][_dev].dll
     do_gen_data   "$outdir"            || return 1   # data/(下载词库 + unigram/pinyin + opencc)
     verify_dist_data "$outdir"         || return 1   # 硬门禁:词库/模型完整
     say "\n========== 全构建完成 ($profile) → $outdir =========="
@@ -713,8 +713,8 @@ do_installer() {
 }
 
 
-# (扫描旁置的 wind_input_debug.exe)。故 release/debug 两种 profile 产出同一份 exe，
-# 同时拷到 build/ 与 build_debug/，变体在目标机由布局决定。
+# (扫描旁置的 wind_input_dev.exe)。故 release/dev 两种 profile 产出同一份 exe，
+# 同时拷到 build/ 与 build_dev/，变体在目标机由布局决定。
     local profile="${1:-release}" outdir="${2:-$(out_for "$1")}"
     mkdir -p "$outdir"
     (
@@ -730,16 +730,16 @@ show_menu() {
     printf '%b============================================%b\n\n' "$C_CYAN" "$C_RESET"
     printf '%b  全构建 (→ 项目根 build/，内容 == 安装到 Program Files):%b\n' "$C_YELLOW" "$C_RESET"
     echo  "    1    Release 全构建: wind_input + tsf(x64/x86) + 词库数据"
-    echo  "    d1   Debug 全构建 (→ build_debug/)"
-    printf '\n%b  单模块构建 (前缀 d = debug):%b\n' "$C_YELLOW" "$C_RESET"
+    echo  "    d1   Debug 全构建 (→ build_dev/)"
+    printf '\n%b  单模块构建 (前缀 d = dev):%b\n' "$C_YELLOW" "$C_RESET"
     echo  "    m1   仅 tsf (x64+x86)        dm1"
     echo  "    m2   仅 wind_input (核心)     dm2"
     printf '\n%b  安装包:%b\n' "$C_YELLOW" "$C_RESET"
     echo  "    8    生成安装包 (= 1 + 打包 → Setup.exe + sha256)"
     echo  "    8s   跳过编译, 直接打包现有 build/"
-    printf '\n%b  部署 → Windows (deploy.local 配 RELEASE/DEBUG 路径; SSH → %s):%b\n' "$C_YELLOW" "${WIND_REMOTE:-未配置}" "$C_RESET"
-    echo  "    p1   push 全部 (release)        pd1   push 全部 (debug)"
-    echo  "    pm1/pm2  push 模块(tsf/核心)    pdm1/pdm2 (debug)"
+    printf '\n%b  部署 → Windows (deploy.local 配 RELEASE/DEV 路径; SSH → %s):%b\n' "$C_YELLOW" "${WIND_REMOTE:-未配置}" "$C_RESET"
+    echo  "    p1   push 全部 (release)        pd1   push 全部 (dev)"
+    echo  "    pm1/pm2  push 模块(tsf/核心)    pdm1/pdm2 (dev)"
     printf '\n%b  代码质量:%b\n' "$C_YELLOW" "$C_RESET"
     echo  "    k=check  l=clippy  t=test  f=fmt  ci=fmt+clippy+test"
     printf '\n%b  远程数据 / 实测:%b\n' "$C_YELLOW" "$C_RESET"
@@ -755,19 +755,19 @@ pause() { printf '\n'; read -e -r -p "按回车继续..." _; }
 dispatch() {
     case "$1" in
         1|release)        do_full release ;;
-        d1|debug)         do_full debug ;;
+        d1|dev)         do_full dev ;;
         m1)               build_tsf_all release ;;
-        dm1)              build_tsf_all debug ;;
+        dm1)              build_tsf_all dev ;;
         m2)               build_core release ;;
-        dm2)              build_core debug ;;
+        dm2)              build_core dev ;;
         8|installer|pack) do_installer ;;
         8s|installer-skip) do_installer skip ;;
         p1)               do_push_full release ;;
-        pd1)              do_push_full debug ;;
+        pd1)              do_push_full dev ;;
         pm1)              do_push_module release tsf ;;
         pm2)              do_push_module release core ;;
-        pdm1)             do_push_module debug tsf ;;
-        pdm2)             do_push_module debug core ;;
+        pdm1)             do_push_module dev tsf ;;
+        pdm2)             do_push_module dev core ;;
         k|check)          do_check ;;
         l|clippy)         do_clippy ;;
         t|test)           do_test ;;

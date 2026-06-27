@@ -13,7 +13,7 @@ use wind_coordinator::Coordinator;
 use wind_ipc::protocol::{EVENT_KEY_DOWN, EVENT_KEY_UP};
 
 fn data_dir() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../build_debug/data")
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../build_dev/data")
 }
 
 fn has_schemas() -> bool {

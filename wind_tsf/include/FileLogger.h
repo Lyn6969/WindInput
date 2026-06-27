@@ -5,10 +5,10 @@
 #include <string>
 
 // Log path macros for debug variant coexistence
-#ifdef WIND_DEBUG_VARIANT
-#define WIND_LOG_DIR_NAME       L"WindInputDebug"
-#define WIND_LOG_FILE_NAME      L"wind_tsf_debug.log"
-#define WIND_LOG_CONFIG_NAME    L"tsf_debug_log_config"
+#ifdef WIND_DEV_VARIANT
+#define WIND_LOG_DIR_NAME       L"WindInputDev"
+#define WIND_LOG_FILE_NAME      L"wind_tsf_dev.log"
+#define WIND_LOG_CONFIG_NAME    L"tsf_dev_log_config"
 #else
 #define WIND_LOG_DIR_NAME       L"WindInput"
 #define WIND_LOG_FILE_NAME      L"wind_tsf.log"

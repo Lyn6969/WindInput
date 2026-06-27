@@ -1,5 +1,5 @@
 target/
-build_debug/
+build_dev/
 build/
 .cache/
 scripts/deploy.local

@@ -8,6 +8,7 @@ pub mod config_schema;
 pub mod hotkey;
 pub mod runtime_state;
 pub mod schema;
+pub mod variant;
 
 pub use config::{
     CodeCommitConfig, Config, ModeIndicatorStyle, PinyinFuzzy, PinyinGlobalConfig, PreeditDisplay,

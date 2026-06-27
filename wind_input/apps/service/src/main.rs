@@ -16,13 +16,6 @@ use wind_bridge::server::{BridgeConfig, BridgeServer};
 
 mod config_cli;
 
-/// 获取管道名称后缀（debug 变体使用 "_debug"）
-#[cfg(feature = "debug_variant")]
-const PIPE_SUFFIX: &str = "_debug";
-
-#[cfg(not(feature = "debug_variant"))]
-const PIPE_SUFFIX: &str = "";
-
 fn main() {
     // CLI 子命令：`wind_input config ...`（查看/读写配置）。在服务启动前拦截，处理完即退出。
     let cli_args: Vec<String> = std::env::args().collect();
@@ -37,10 +30,11 @@ fn main() {
     // 1. 初始化日志
     init_logger();
 
-    let variant = if PIPE_SUFFIX.is_empty() {
-        "release"
+    let pipe_suffix = wind_config::variant::pipe_suffix();
+    let variant = if wind_config::variant::is_dev() {
+        "dev"
     } else {
-        "debug"
+        "release"
     };
     info!(
         "WindInput service starting (v{}, {} variant)",
@@ -70,7 +64,7 @@ fn main() {
 
     // 5. 启动 Push 管道服务器
     let push_config = PushConfig {
-        suffix: PIPE_SUFFIX.to_string(),
+        suffix: pipe_suffix.to_string(),
         write_timeout_ms: 30_000,
     };
     let push_server = Arc::new(PushServer::new(push_config));
@@ -84,7 +78,7 @@ fn main() {
 
     // 6. 创建 Bridge 服务器
     let bridge_config = BridgeConfig {
-        suffix: PIPE_SUFFIX.to_string(),
+        suffix: pipe_suffix.to_string(),
         request_timeout_ms: 1000,
     };
     let bridge = BridgeServer::new(bridge_config, deferred.clone());
@@ -109,7 +103,7 @@ fn main() {
     // 本地授权靠 OS ACL（SDDL），不再需要 token/Origin/CORS/端口发现。
     // 同步线程模型（与 bridge/push 一致），不引入 tokio 到控制路径。
     let core_rpc: Arc<dyn wind_rpc::CoreRpc> = Arc::new(RpcCore(coord_for_web));
-    match wind_rpc::RpcServer::new(core_rpc, variant, PIPE_SUFFIX) {
+    match wind_rpc::RpcServer::new(core_rpc, variant, pipe_suffix) {
         Ok(rpc_server) => {
             if let Err(e) = rpc_server.start() {
                 error!("RPC server failed to start: {}", e);
@@ -121,8 +115,8 @@ fn main() {
     }
 
     info!(
-        "WindInput service ready (pipes: wind_input{}, wind_input_push{}, wind_input{}_ctrl)",
-        PIPE_SUFFIX, PIPE_SUFFIX, PIPE_SUFFIX
+        "WindInput service ready (pipes: wind_input{}, wind_input_push{}, wind_input_ctrl{})",
+        pipe_suffix, pipe_suffix, pipe_suffix
     );
 
     // 10. 阻塞主线程，直到菜单触发"重启服务"
@@ -276,7 +270,10 @@ fn check_singleton() -> Option<SingletonGuard> {
         ) -> windows::Win32::Foundation::HANDLE;
     }
 
-    let mutex_name = format!("Global\\WindInput{}IMEService", PIPE_SUFFIX);
+    let mutex_name = format!(
+        "Global\\WindInputIMEService{}",
+        wind_config::variant::pipe_suffix()
+    );
     let wide_name: Vec<u16> = mutex_name
         .encode_utf16()
         .chain(std::iter::once(0))

@@ -4,8 +4,6 @@ version.workspace = true
 edition.workspace = true
 
 [features]
-# 调试变体：用户数据目录改用 WindInputDebug，隔离调试与正式版的配置/缓存/日志。
-debug_variant = []
 
 [dependencies]
 serde = { workspace = true }

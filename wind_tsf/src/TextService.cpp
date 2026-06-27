@@ -1449,7 +1449,7 @@ static constexpr UINT     kFocusCheckIntervalMs = 500;
 // Win32 RegisterHotKey 热键 ID（前置声明给 OnKillThreadFocus 使用）
 // 窗口类名按 Debug / Release 区分（class name 是 per-process 不会跨进程冲突，但
 // 命名约定与 pipe / CLSID 等其他跨进程资源保持一致，便于 Spy++ 等工具区分两版本）。
-#ifdef WIND_DEBUG_VARIANT
+#ifdef WIND_DEV_VARIANT
 static const wchar_t* kHotkeyWndClassName = L"WindInputHotkeyWndDebug";
 static const wchar_t* kHotkeyWndTitle     = L"WindInputHotkeyDebug";
 #else

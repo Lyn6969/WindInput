@@ -1300,14 +1300,10 @@ impl Config {
         }
     }
 
-    /// 应用数据目录名：正式版 `WindInput`；调试变体 `WindInputDebug`
-    /// （隔离调试与正式版的配置/缓存/日志，与 PIPE_SUFFIX 同源于 debug_variant 特性）。
+    /// 应用数据目录名：正式版 `WindInput`；dev 变体 `WindInputDev`
+    /// （隔离调试与正式版的配置/缓存/日志，与管道后缀同源于运行时变体探测）。
     pub fn app_dir_name() -> &'static str {
-        if cfg!(feature = "debug_variant") {
-            "WindInputDebug"
-        } else {
-            "WindInput"
-        }
+        crate::variant::app_dir_name()
     }
 
     /// 获取用户配置目录（漫游 %APPDATA%\<App>）：随用户同步的语言数据

@@ -1,8 +1,8 @@
 @echo off
 setlocal
 
-if exist "%~dp0wind_input_debug.exe" (
-    set "TARGET=%~dp0wind_input_debug.exe"
+if exist "%~dp0wind_input_dev.exe" (
+    set "TARGET=%~dp0wind_input_dev.exe"
 ) else (
     set "TARGET=%~dp0wind_input.exe"
 )

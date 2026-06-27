@@ -218,7 +218,7 @@ mod tests {
     use std::path::PathBuf;
 
     fn opencc_dir() -> PathBuf {
-        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../build_debug/data/opencc")
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../build_dev/data/opencc")
     }
 
     #[test]

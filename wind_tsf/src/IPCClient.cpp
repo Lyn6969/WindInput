@@ -394,8 +394,8 @@ BOOL CIPCClient::_StartService()
 
     if (lastSlash)
     {
-#ifdef WIND_DEBUG_VARIANT
-        wcscpy_s(lastSlash + 1, MAX_PATH - (lastSlash - dllPath + 1), L"wind_input_debug.exe");
+#ifdef WIND_DEV_VARIANT
+        wcscpy_s(lastSlash + 1, MAX_PATH - (lastSlash - dllPath + 1), L"wind_input_dev.exe");
 #else
         wcscpy_s(lastSlash + 1, MAX_PATH - (lastSlash - dllPath + 1), L"wind_input.exe");
 #endif

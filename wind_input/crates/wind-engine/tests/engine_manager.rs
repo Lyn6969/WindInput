@@ -8,7 +8,7 @@ use wind_config::Config;
 use wind_engine::EngineManager;
 
 fn data_dir() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../build_debug/data")
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../build_dev/data")
 }
 
 fn make_config(schemas: &[&str]) -> Config {

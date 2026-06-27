@@ -33,18 +33,8 @@ fn main() {
     );
     let ver_u64 = ((maj as u64) << 48) | ((min as u64) << 32) | ((pat as u64) << 16);
 
-    // 调试变体：与 release 共存，产品名加「开发版」后缀以便区分。
-    let debug_variant = std::env::var("CARGO_FEATURE_DEBUG_VARIANT").is_ok();
-    let product_name = if debug_variant {
-        "清风输入法开发版"
-    } else {
-        "清风输入法"
-    };
-    let original_filename = if debug_variant {
-        "wind_input_debug.exe"
-    } else {
-        "wind_input.exe"
-    };
+    let product_name = "清风输入法";
+    let original_filename = "wind_input.exe";
 
     // manifest：asInvoker + PerMonitorV2 DPI 感知 + win10 + 长路径（对齐旧项目）。
     let manifest = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>

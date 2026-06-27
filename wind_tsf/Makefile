@@ -10,7 +10,7 @@
 # 用法：
 #   make                      # Release x64: build/wind_tsf.dll
 #   make x86                  # x86(32 位): build/wind_tsf_x86.dll（32 位宿主用）
-#   make DEBUG_VARIANT=1      # 调试变体: build_debug/wind_tsf_debug.dll
+#   make DEV_VARIANT=1      # 调试变体: build_dev/wind_tsf_dev.dll
 #   make OUTDIR=/path         # 指定输出目录
 #   make VERSION=1.2.3        # 指定版本号（写入版本资源）
 #   make clean
@@ -26,7 +26,7 @@ LLVM_RC   ?= llvm-rc-19
 XWIN_ROOT ?= $(HOME)/.cache/cargo-xwin/xwin
 
 # ---- 变体 / 版本 ----
-DEBUG_VARIANT ?= 0
+DEV_VARIANT ?= 0
 VERSION       ?= 0.0.0-dev
 
 # ---- 架构（ARCH=x64|x86；x86 也可用 `make x86`）----
@@ -41,11 +41,11 @@ else
   ARCHSUFFIX :=
 endif
 
-# 产物命名按 arch + variant 组合：wind_tsf[_x86][_debug].dll
-ifeq ($(DEBUG_VARIANT),1)
-  OUTDIR   ?= build_debug
-  VARFLAGS := -DWIND_DEBUG_VARIANT
-  DBGSUFFIX := _debug
+# 产物命名按 arch + variant 组合：wind_tsf[_x86][_dev].dll
+ifeq ($(DEV_VARIANT),1)
+  OUTDIR   ?= build_dev
+  VARFLAGS := -DWIND_DEV_VARIANT
+  DBGSUFFIX := _dev
   DISPLAY_NAME := 清风输入法开发版
 else
   OUTDIR   ?= build
@@ -53,8 +53,8 @@ else
   DBGSUFFIX :=
   DISPLAY_NAME := 清风输入法
 endif
-# 命名顺序对齐 Go 版：base + _debug + _x86（如 wind_tsf_debug_x86.dll）
-TARGET := wind_tsf$(DBGSUFFIX)$(ARCHSUFFIX)
+# 命名顺序对齐 Go 版：base + _x86 + _dev（如 wind_tsf_x86_dev.dll）
+TARGET := wind_tsf$(ARCHSUFFIX)$(DBGSUFFIX)
 
 # 版本号拆分（X.Y.Z[-suffix] → MAJOR/MINOR/PATCH）
 VER_CLEAN := $(firstword $(subst -, ,$(VERSION)))
@@ -107,11 +107,11 @@ VEROBJ  := $(OBJDIR)/version.res
 all: $(DLL)
 	@echo "✅ $(DLL) ($(VERSION))"
 
-# x86(32 位)构建 → $(OUTDIR)/wind_tsf_x86[_debug].dll
+# x86(32 位)构建 → $(OUTDIR)/wind_tsf_x86[_dev].dll
 # 32 位宿主程序(部分旧软件)需要对应位数的 TSF DLL 才能显示输入法。
-# 透传 DEBUG_VARIANT/OUTDIR/VERSION，使 release/debug 与输出目录一致。
+# 透传 DEV_VARIANT/OUTDIR/VERSION，使 release/debug 与输出目录一致。
 x86:
-	$(MAKE) ARCH=x86 DEBUG_VARIANT=$(DEBUG_VARIANT) OUTDIR=$(OUTDIR) VERSION=$(VERSION) all
+	$(MAKE) ARCH=x86 DEV_VARIANT=$(DEV_VARIANT) OUTDIR=$(OUTDIR) VERSION=$(VERSION) all
 
 # 目标文件
 $(OBJDIR)/%.o: src/%.cpp | $(OBJDIR)
@@ -148,5 +148,5 @@ $(OBJDIR) $(OUTDIR):
 	mkdir -p $@
 
 clean:
-	rm -rf build/obj build_debug/obj $(OBJDIR) \
-	       build/wind_tsf*.dll build_debug/wind_tsf*.dll
+	rm -rf build/obj build_dev/obj $(OBJDIR) \
+	       build/wind_tsf*.dll build_dev/wind_tsf*.dll

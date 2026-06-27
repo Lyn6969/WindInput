@@ -60,11 +60,11 @@ impl PushServer {
     ///
     /// 必须与 Go/TSF 一致：后缀插在 `wind_input` 与 `_push` 之间。
     /// Go `endpoint_windows.go`: `\\.\pipe\wind_input` + Suffix + `_push`；
-    /// TSF `Globals.h` debug 变体: `\\.\pipe\wind_input_debug_push`。
-    /// 此前误写成 `wind_input_push{suffix}` (= wind_input_push_debug)，
+    /// TSF `Globals.h` dev 变体: `\\.\pipe\wind_input_push_dev`。
+    /// 此前误写成 `wind_input_push{suffix}` (= wind_input_push_dev)，
     /// 导致 TSF 永远连不上 push 管道、收不到热键白名单 → Shift/Ctrl+Shift+E 不被转发。
     pub fn pipe_name(&self) -> String {
-        format!(r"\\.\pipe\wind_input{}_push", self.config.suffix)
+        format!(r"\\.\pipe\wind_input_push{}", self.config.suffix)
     }
 
     /// 启动推送管道服务器
@@ -332,11 +332,11 @@ mod tests {
     /// 与 Go endpoint_windows.go / TSF Globals.h 一致，否则 TSF 连不上 push 管道。
     #[test]
     fn test_push_pipe_name_suffix_position() {
-        let debug = PushServer::new(PushConfig {
-            suffix: "_debug".into(),
+        let dev = PushServer::new(PushConfig {
+            suffix: "_dev".into(),
             write_timeout_ms: 30_000,
         });
-        assert_eq!(debug.pipe_name(), r"\\.\pipe\wind_input_debug_push");
+        assert_eq!(dev.pipe_name(), r"\\.\pipe\wind_input_push_dev");
 
         let release = PushServer::new(PushConfig {
             suffix: String::new(),

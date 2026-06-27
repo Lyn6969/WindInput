@@ -302,7 +302,7 @@ mod tests {
     }
 
     fn state() -> DispatchState {
-        DispatchState::new(FakeCore::new(), "debug").expect("manifest 应能加载")
+        DispatchState::new(FakeCore::new(), "dev").expect("manifest 应能加载")
     }
 
     fn req(method: &str, params: Value) -> Request {
@@ -323,7 +323,7 @@ mod tests {
         for k in ["version", "platform", "dataDir", "running"] {
             assert!(r.get(k).is_some(), "system.info 缺字段 {k}");
         }
-        assert_eq!(r["variant"], json!("debug"));
+        assert_eq!(r["variant"], json!("dev"));
         assert_eq!(r["activeSchema"], json!("wubi86"));
     }
 

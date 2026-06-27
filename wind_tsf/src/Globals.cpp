@@ -15,7 +15,7 @@ HINSTANCE g_hInstance = nullptr;
 LONG g_lServerLock = 0;
 
 // GUID 定义
-#ifdef WIND_DEBUG_VARIANT
+#ifdef WIND_DEV_VARIANT
 // Debug variant GUIDs (DEBx series, coexists with release)
 // {99C2DEB0-5C57-45A2-9C63-FB54B34FD90A}
 const CLSID c_clsidTextService =
