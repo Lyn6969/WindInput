@@ -1189,10 +1189,36 @@ pub struct CompatConfig {
     pub host_render_processes: Vec<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DebugConfig {
+    /// 日志级别。空字符串等同 `info`（生产默认）。
+    /// 注意：`info` 级别日志不得包含用户输入内容、词库词条等隐私数据。
     #[serde(default)]
     pub log_level: String,
+    /// 单个日志文件的大小上限（MB），超出后滚动。默认 10。
+    #[serde(default = "default_log_max_size_mb")]
+    pub log_max_size_mb: u64,
+    /// 保留的旧日志文件数量上限。默认 5。
+    #[serde(default = "default_log_max_files")]
+    pub log_max_files: usize,
+}
+
+impl Default for DebugConfig {
+    fn default() -> Self {
+        Self {
+            log_level: String::new(),
+            log_max_size_mb: default_log_max_size_mb(),
+            log_max_files: default_log_max_files(),
+        }
+    }
+}
+
+fn default_log_max_size_mb() -> u64 {
+    10
+}
+
+fn default_log_max_files() -> usize {
+    5
 }
 
 // ───────────────────────── 共享 default 助手 ─────────────────────────
@@ -1402,9 +1428,15 @@ impl Config {
         Self::local_dir().map(|d| d.join("cache"))
     }
 
-    /// 日志目录（%LOCALAPPDATA%\WindInput\logs）。
+    /// 日志目录。
+    /// - 便携模式：`<exe目录>/userdata/logs`
+    /// - 正常模式：`%LOCALAPPDATA%\WindInput[Dev]\logs`
     pub fn log_dir() -> Option<PathBuf> {
-        Self::local_dir().map(|d| d.join("logs"))
+        if crate::variant::is_portable() {
+            crate::variant::portable_userdata_dir().map(|d| d.join("logs"))
+        } else {
+            Self::local_dir().map(|d| d.join("logs"))
+        }
     }
 
     /// 获取 data 目录（与可执行文件同目录的 data/）
@@ -1554,7 +1586,10 @@ mod tests {
     #[test]
     fn test_tooltip_defaults_match_go() {
         let t = Config::default().ui.tooltip;
-        assert_eq!(t.delay, 200, "delay 按 data/config.toml 预置默认 200（偏离 Go 的 100）");
+        assert_eq!(
+            t.delay, 200,
+            "delay 按 data/config.toml 预置默认 200（偏离 Go 的 100）"
+        );
         assert!(t.code_enabled, "code 默认开");
         assert!(
             t.pinyin_enabled && t.pinyin_heteronyms,
@@ -1689,7 +1724,10 @@ mod tests {
         let preset = Config::system_preset_value(Some(data_dir)).unwrap();
         let cfg: Config = preset.try_into().unwrap();
         // config.toml 作为 L2 预置覆盖了空的 code default
-        assert_eq!(cfg.compat.host_render_processes, vec!["SearchHost.exe".to_string()]);
+        assert_eq!(
+            cfg.compat.host_render_processes,
+            vec!["SearchHost.exe".to_string()]
+        );
         assert_eq!(cfg.schema.active, "wubi86");
         // 佐证 L1 确实为空，覆盖来自 config.toml
         assert!(Config::default().compat.host_render_processes.is_empty());

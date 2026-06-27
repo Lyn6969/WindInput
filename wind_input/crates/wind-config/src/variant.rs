@@ -2,6 +2,7 @@
 //!
 //! 身份与编译画像解耦——无论用哪个 cargo profile 编译，产物都叫 `wind_input.exe`；
 //! 被复制改名为 `wind_input_dev.exe` 后，此模块在运行时据文件名识别为 dev 变体。
+use std::path::PathBuf;
 use std::sync::OnceLock;
 
 /// 纯逻辑：给定 exe 文件名主干（file_stem），判断是否 dev 变体。抽出以便单测。
@@ -22,7 +23,10 @@ pub fn is_dev() -> bool {
         }
         std::env::current_exe()
             .ok()
-            .and_then(|p| p.file_stem().map(|s| is_dev_from_stem(&s.to_string_lossy())))
+            .and_then(|p| {
+                p.file_stem()
+                    .map(|s| is_dev_from_stem(&s.to_string_lossy()))
+            })
             .unwrap_or(false)
     })
 }
@@ -34,7 +38,31 @@ pub fn pipe_suffix() -> &'static str {
 
 /// 应用数据目录名：dev `WindInputDev`，release `WindInput`。
 pub fn app_dir_name() -> &'static str {
-    if is_dev() { "WindInputDev" } else { "WindInput" }
+    if is_dev() {
+        "WindInputDev"
+    } else {
+        "WindInput"
+    }
+}
+
+/// 便携模式标记文件名。
+
+/// 用 OnceLock 缓存，进程内只检测一次。
+pub fn is_portable() -> bool {
+    static IS_PORTABLE: OnceLock<bool> = OnceLock::new();
+    *IS_PORTABLE.get_or_init(|| {
+        std::env::current_exe()
+            .ok()
+            .and_then(|p| p.parent().map(|d| d.join(PORTABLE_MARKER_NAME).is_file()))
+            .unwrap_or(false)
+    })
+}
+
+/// 便携模式下的用户数据根目录（exe 同目录/userdata）。
+pub fn portable_userdata_dir() -> Option<PathBuf> {
+    std::env::current_exe()
+        .ok()
+        .and_then(|p| p.parent().map(|d| d.join("userdata")))
 }
 
 #[cfg(test)]

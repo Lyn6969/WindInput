@@ -50,6 +50,39 @@ git commit -m "style(fmt): cargo fmt 统一格式化"
 - 不要用 `git add -A`：只 stage 本次逻辑改动涉及的文件 + 对应 fmt 文件。
 - `cargo fmt` 对整个 workspace 生效，若其他 crate 也被格式化，一并纳入 fmt 提交。
 
+## 日志规范
+
+### 级别策略
+
+| 级别 | 用途 | 隐私要求 |
+|---|---|---|
+| `error` | 不可恢复错误，影响功能 | 无用户数据 |
+| `warn` | 可恢复异常，值得关注 | 无用户数据 |
+| `info` | **生产默认级别**，关键生命周期事件 | **严禁**包含用户输入、词库词条、候选词等隐私数据 |
+| `debug` | 诊断细节，开发时手动开启 | 可含调试上下文，部署时不应开启 |
+| `trace` | 极细粒度追踪 | 仅本地调试 |
+
+`info` 是正式部署时的唯一文件输出级别，开发者需在 `config.toml` 手动配置才能开启更详细级别：
+
+```toml
+[debug]
+log_level = "debug"   # 或 "trace"
+```
+
+### 日志文件
+
+- 滚动策略：按大小（默认 10 MB/文件），保留最近 N 个文件（默认 5 个）
+- 文件命名：`wind_input.log`（当前）、`wind_input.log.1`（上一个）…
+- 路径（变体感知）：
+  - 正常安装 release：`%LOCALAPPDATA%\WindInput\logs\`
+  - 正常安装 dev：`%LOCALAPPDATA%\WindInputDev\logs\`
+- 可通过 `RUST_LOG` 环境变量覆盖级别（优先级最高，仅用于开发排查）
+
+### 写日志准则
+
+- `info!` 只记录系统事件（启动/关闭/加载/错误），**不得**记录用户键入的字符、候选词、词库内容
+- `debug!` / `trace!` 可含诊断数据，但部署包中不应默认开启
+
 ## 构建 / 测试
 
 - 交叉编译检查（Windows 目标，纯 Rust 无 C 依赖）：

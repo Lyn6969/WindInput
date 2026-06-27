@@ -201,6 +201,8 @@ static REGISTRY: &[ConfigField] = &[
         "debug.log_level",
         Enum(&["trace", "debug", "info", "warn", "error"]),
     ),
+    f("debug.log_max_size_mb", Int),
+    f("debug.log_max_files", Int),
 ];
 
 /// 返回配置字段注册表。

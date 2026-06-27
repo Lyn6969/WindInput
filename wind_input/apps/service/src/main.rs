@@ -5,10 +5,12 @@
 
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+use file_rotate::compression::Compression;
+use file_rotate::suffix::AppendCount;
+use file_rotate::{ContentLimit, FileRotate};
 use std::sync::Arc;
 use tracing::{error, info};
 use tracing_subscriber::EnvFilter;
-use tracing_subscriber::prelude::*;
 
 use wind_bridge::deferred::DeferredHandler;
 use wind_bridge::push::{PushConfig, PushServer};
@@ -274,11 +276,23 @@ fn relaunch_self() {
 }
 
 fn init_logger() {
-    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
+    // 读取配置（失败时用默认值，不阻断日志初始化）
+    let cfg_debug = wind_config::Config::load(wind_config::Config::data_dir().as_deref())
+        .map(|c| c.debug)
+        .unwrap_or_default();
 
-    // 日志输出到可执行文件同目录的 logs/ 子目录
-    // 日志写入 %LOCALAPPDATA%\WindInput\logs（不随漫游；避免装到 Program Files 时
-    // exe 目录只读导致写入失败）。取不到则回退到 exe 旁 logs。
+    // RUST_LOG 最优先，其次 debug.log_level，默认 info。
+    // info 级别日志不得包含用户输入内容、词库词条等隐私数据。
+    let level = std::env::var("RUST_LOG")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .or_else(|| {
+            let l = &cfg_debug.log_level;
+            if l.is_empty() { None } else { Some(l.clone()) }
+        })
+        .unwrap_or_else(|| "info".to_string());
+
+    // 便携模式：<exe>/userdata/logs；正常模式：%LOCALAPPDATA%\WindInput[Dev]\logs。
     let log_dir = wind_config::Config::log_dir()
         .or_else(|| {
             std::env::current_exe()
@@ -288,33 +302,35 @@ fn init_logger() {
         .unwrap_or_else(|| std::path::PathBuf::from("logs"));
     let _ = std::fs::create_dir_all(&log_dir);
 
-    let file_appender = tracing_appender::rolling::daily(&log_dir, "wind_input.log");
-    let (file_writer, _guard) = tracing_appender::non_blocking(file_appender);
+    // 按大小滚动：wind_input.log → wind_input.log.1 → … → wind_input.log.N
+    let rotate = FileRotate::new(
+        log_dir.join("wind_input.log"),
+        AppendCount::new(cfg_debug.log_max_files),
+        ContentLimit::Bytes((cfg_debug.log_max_size_mb * 1024 * 1024) as usize),
+        Compression::None,
+        None,
+    );
+    let (writer, _guard) = tracing_appender::non_blocking(rotate);
 
-    // 控制台输出
-    let console_layer = tracing_subscriber::fmt::layer()
-        .with_target(true)
-        .with_thread_ids(true)
-        .with_filter(filter);
-
-    // 文件输出（debug 级别，记录更多细节）
-    let file_layer = tracing_subscriber::fmt::layer()
-        .with_writer(file_writer)
-        .with_target(true)
-        .with_thread_ids(true)
+    tracing_subscriber::fmt()
+        .with_writer(writer)
         .with_ansi(false)
-        .with_filter(EnvFilter::new("debug"));
-
-    tracing_subscriber::registry()
-        .with(console_layer)
-        .with(file_layer)
+        .with_target(true)
+        .with_thread_ids(true)
+        .with_env_filter(EnvFilter::new(&level))
         .init();
 
-    // 保持 _guard 存活（non_blocking writer 的 flush guard）
-    // 使用 Box::leak 让 guard 在进程生命周期内不被释放
+    // Box::leak 保持 guard 存活至进程退出，确保缓冲日志全部落盘。
     Box::leak(Box::new(_guard));
 
-    info!("Log directory: {}", log_dir.display());
+    info!(
+        log_dir = %log_dir.display(),
+        level = %level,
+        max_size_mb = cfg_debug.log_max_size_mb,
+        max_files = cfg_debug.log_max_files,
+        portable = wind_config::variant::is_portable(),
+        "logger initialized"
+    );
 }
 
 /// 单例检查：通过 Windows Named Mutex 确保只有一个实例运行
