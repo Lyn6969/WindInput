@@ -5,3 +5,5 @@ build/
 scripts/deploy.local
 scripts/deploy.local.ps1
 /.remote/
+.superpowers/
+.claude/
