@@ -1369,10 +1369,15 @@ impl Config {
         crate::variant::app_dir_name()
     }
 
-    /// 获取用户配置目录（漫游 %APPDATA%\<App>）：随用户同步的语言数据
-    /// （config.toml / 词频 / shadow 置顶删词 / 主题选择 / 用户词库）。
+    /// 用户配置目录（config.toml / 词频 / shadow 置顶删词 / 主题选择 / 用户词库）。
+    /// - 便携模式：`<exe目录>/userdata/`
+    /// - 正常模式：漫游 `%APPDATA%\WindInput[Dev]`（随用户同步）
     pub fn user_config_dir() -> Option<PathBuf> {
-        dirs::config_dir().map(|d| d.join(Self::app_dir_name()))
+        if crate::variant::is_portable() {
+            crate::variant::portable_userdata_dir()
+        } else {
+            dirs::config_dir().map(|d| d.join(Self::app_dir_name()))
+        }
     }
 
     /// 把单个配置项**部分合并**写入用户层 `config.toml`（%APPDATA%/WindInput/config.toml）。
@@ -1417,10 +1422,15 @@ impl Config {
         Self::set_user_value(path, toml::Value::Boolean(value))
     }
 
-    /// 本机状态目录（%LOCALAPPDATA%\<App>）：不随漫游同步的机器相关数据
-    /// （工具栏位置等）。
+    /// 本机状态目录（userdata.redb / 工具栏位置等机器相关数据）。
+    /// - 便携模式：`<exe目录>/userdata/`
+    /// - 正常模式：`%LOCALAPPDATA%\WindInput[Dev]`（不随漫游同步）
     pub fn local_dir() -> Option<PathBuf> {
-        dirs::data_local_dir().map(|d| d.join(Self::app_dir_name()))
+        if crate::variant::is_portable() {
+            crate::variant::portable_userdata_dir()
+        } else {
+            dirs::data_local_dir().map(|d| d.join(Self::app_dir_name()))
+        }
     }
 
     /// 缓存目录（%LOCALAPPDATA%\WindInput\cache）：词库 .wdb 等可重建产物。
