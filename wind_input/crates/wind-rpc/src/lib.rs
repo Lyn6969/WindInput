@@ -10,9 +10,9 @@
 //! 复用 wind-ipc 的 JSON-RPC 协议（Request/Response/EventMessage + 4 字节大端长度前缀帧）。
 
 pub mod client;
+mod capabilities;
 mod dispatch;
 mod events;
-mod manifest;
 mod security;
 mod server;
 

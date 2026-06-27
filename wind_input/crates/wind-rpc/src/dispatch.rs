@@ -2,7 +2,7 @@
 //! 未知/数据类方法转发到注入的 [`CoreRpc`]。
 //!
 //! 从 wind-webapi/rpc.rs 迁移，去掉 axum/WebState 依赖：改用 [`DispatchState`]
-//! 持有 manifest 缓存 + variant + 注入的 core 实现，返回 wind-ipc 的 [`Response`]。
+//! 持有 capabilities 缓存 + variant + 注入的 core 实现，返回 wind-ipc 的 [`Response`]。
 
 use std::sync::Arc;
 
@@ -35,11 +35,11 @@ pub trait CoreRpc: Send + Sync {
     }
 }
 
-/// 分发器共享状态：清单缓存 + 变体 + 注入的 core 实现。
+/// 分发器共享状态：能力清单缓存 + 变体 + 注入的 core 实现。
 pub struct DispatchState {
     pub(crate) core: Arc<dyn CoreRpc>,
     pub(crate) variant: &'static str,
-    pub(crate) manifest: Value,
+    pub(crate) capabilities: Value,
     /// 配置变更事件接收方（setItems/reload 后广播）。
     pub(crate) events: crate::events::EventSink,
 }
@@ -55,11 +55,11 @@ impl DispatchState {
         variant: &'static str,
         events: crate::events::EventSink,
     ) -> anyhow::Result<Self> {
-        let manifest = crate::manifest::load(variant)?;
+        let capabilities = crate::capabilities::generate(Config::data_dir().as_deref())?;
         Ok(Self {
             core,
             variant,
-            manifest,
+            capabilities,
             events,
         })
     }
@@ -89,7 +89,7 @@ fn handle(state: &DispatchState, method: &str, params: &Value) -> anyhow::Result
             "variant": state.variant,
             "activeSchema": state.core.active_schema_id(),
         })),
-        "system.manifest" => Ok(state.manifest.clone()),
+        "system.capabilities" => Ok(state.capabilities.clone()),
         // 本机字体枚举（平台能力经 CoreRpc 注入；默认空表）。
         "system.fonts" => Ok(Value::Array(
             state
@@ -302,7 +302,7 @@ mod tests {
     }
 
     fn state() -> DispatchState {
-        DispatchState::new(FakeCore::new(), "dev").expect("manifest 应能加载")
+        DispatchState::new(FakeCore::new(), "dev").expect("capabilities 应能加载")
     }
 
     fn req(method: &str, params: Value) -> Request {
@@ -344,15 +344,14 @@ mod tests {
     }
 
     #[test]
-    fn manifest_shape() {
-        let resp = dispatch(&state(), req("system.manifest", json!({})));
-        let r = resp.result.unwrap();
-        for k in [
-            "manifest", "app", "engine", "variant", "groups", "items", "features",
-        ] {
-            assert!(r.get(k).is_some(), "manifest 缺字段 {k}");
-        }
-        assert!(r["items"].is_array() && r["groups"].is_array());
+    fn capabilities_shape() {
+        let resp = dispatch(&state(), req("system.capabilities", json!({})));
+        let r = resp.result.expect("system.capabilities 应成功");
+        assert!(
+            r.get("configKeys").and_then(|v| v.as_array()).is_some(),
+            "capabilities 应含 configKeys 数组"
+        );
+        assert!(r.get("appVersion").is_some(), "capabilities 应含 appVersion");
     }
 
     #[test]
