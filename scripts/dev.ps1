@@ -20,6 +20,8 @@
 #   u1 / ud1     系统卸载全部 (release / dev): 反注册 + 移出输入法列表 + 移除自启 + 删目录
 #   pm1 / pm2    系统安装单模块 (tsf / 核心, release)
 #   pdm1 / pdm2  系统安装单模块 (dev)
+#   8  / d8      生成安装包 (release / dev): 全构建 + wind-installer 打包 → dist\*-Setup.exe
+#   8s / d8s     生成安装包 (跳过重建, 直接打包现有 build[_dev]/)
 #   k=check  l=clippy  t=test  f=fmt  fmt-check  ci(=fmt+clippy+test)  clean
 #   gd=gen-data  r=repl
 #
@@ -53,10 +55,13 @@ $Version       = (Get-Content "$ProductRoot\docs\VERSION" -Raw).Trim()
 $BuildDir      = "$ProductRoot\build"
 $BuildDevDir = "$ProductRoot\build_dev"
 $CacheDir      = "$ProductRoot\.cache"        # 外部下载/生成 (不入库)
+$DistDir       = "$ProductRoot\dist"          # 安装包输出目录 (gitignore)
 
 # ---------- 部署目标 (Go 便携式: 复制到指定本地目录) ----------
 $DeployDirRelease = "C:\Program Files\WindInput"
 $DeployDirDev   = "C:\Program Files\WindInputDev"
+# wind-installer: 通用安装器生成器 (兄弟项目, app.toml 驱动); 8/d8 打包命令调用其 pack.ps1。
+$InstallerDir  = "$ProductRoot\..\wind-installer"
 # 可在 scripts\deploy.local.ps1 覆盖上述变量 (PowerShell 赋值语法; 该文件 gitignore)。
 $deployCfg = "$ScriptDir\deploy.local.ps1"
 if (Test-Path $deployCfg) { . $deployCfg }
@@ -708,6 +713,135 @@ function Uninstall-Full ([string]$profile = "release") {
     return $true
 }
 
+# ---------- 安装包打包 (调用兄弟项目 wind-installer, app.toml 驱动) ----------
+# wind-installer 是「通用安装器生成器」: 同一预编译 stub 配不同 app.toml 即生成不同安装包。
+# 安装目录由 app.toml 的 [app] id 派生 (ProgramFiles\<id>), 故 dev=WindInputDev、release=WindInput
+# 自然落到与 pd1/p1 一致的目录; IME 注册 GUID/文件名/字体亦全部由清单描述, 无需改安装器源码。
+#
+# 生成变体 app.toml: 全用绝对路径 + 正斜杠 (TOML 与 Windows 均接受正斜杠, 免去反斜杠转义;
+# 且 pack.ps1 用 "([^"]+)" 正则解析 source_dir, 双引号字符串才能匹配)。落到 dist\ (在 source 之外,
+# 不会被 packer 递归打进包)。GUID 必须与 wind_tsf\src\Globals.cpp 一致 (dev=DEB0/DEB1, release=EE30/EE31)。
+function New-InstallerConfig ([string]$profile, [string]$outdir, [string]$cfgPath, [string]$assetsDir) {
+    if ($profile -eq "dev") {
+        $id = "WindInputDev"; $disp = "清风输入法 (开发版)"; $mainExe = "wind_input_dev.exe"
+        $menu = "清风输入法 (开发版)"; $title = "清风输入法 (开发版) 安装向导"; $proto = "windinputdev"
+        $acl   = '["wind_tsf_dev.dll", "wind_tsf_x86_dev.dll"]'
+        $clsid = "{99C2DEB0-5C57-45A2-9C63-FB54B34FD90A}"; $prof = "{99C2DEB1-5C57-45A2-9C63-FB54B34FD90A}"
+        $dllX64 = "wind_tsf_dev.dll"; $dllX86 = "wind_tsf_x86_dev.dll"; $outName = "WindInputDev-Setup"
+    } else {
+        $id = "WindInput"; $disp = "清风输入法"; $mainExe = "wind_input.exe"
+        $menu = "清风输入法"; $title = "清风输入法 安装向导"; $proto = "windinput"
+        $acl   = '["wind_tsf.dll", "wind_tsf_x86.dll"]'
+        $clsid = "{99C2EE30-5C57-45A2-9C63-FB54B34FD90A}"; $prof = "{99C2EE31-5C57-45A2-9C63-FB54B34FD90A}"
+        $dllX64 = "wind_tsf.dll"; $dllX86 = "wind_tsf_x86.dll"; $outName = "WindInput-Setup"
+    }
+    $srcFwd  = $outdir.Replace('\', '/')
+    $distFwd = $DistDir.Replace('\', '/')
+    $logoFwd = (Join-Path $assetsDir "logo.png").Replace('\', '/')
+    $iconFwd = (Join-Path $assetsDir "installer.ico").Replace('\', '/')
+    $toml = @"
+# 本文件由 dev.ps1 (Do-Installer) 自动生成 —— $profile 变体; 请勿手工编辑。
+[app]
+id                = "$id"
+display_name      = "$disp"
+version           = "$Version"
+publisher         = "清风输入法 项目"
+description       = "轻量开源输入法"
+main_exe          = "$mainExe"
+setting_exe       = ""
+start_menu_folder = "$menu"
+window_title      = "$title"
+url_protocol      = "$proto"
+portable_marker   = "portable_mode"
+process_names     = $procs
+acl_dlls          = $acl
+
+[ime]
+clsid        = "$clsid"
+profile_guid = "$prof"
+lang_id      = "0804"
+dll_x64      = "$dllX64"
+dll_x86      = "$dllX86"
+
+[[font]]
+file         = "HeiTiZiGen.ttf"
+display_name = "黑体字根 (TrueType)"
+source_rel   = "data/schemas/wubi86/HeiTiZiGen.ttf"
+
+[package]
+compression = "zstd"
+source_dir  = "$srcFwd"
+output_name = "$outName"
+output_dir  = "$distFwd"
+logo        = "$logoFwd"
+icon        = "$iconFwd"
+"@
+    # 无 BOM UTF-8 写出 (Rust toml 解析器对前置 BOM 会报错; PS5.1 的 Set-Content -Encoding UTF8 带 BOM)。
+    [System.IO.File]::WriteAllText($cfgPath, $toml, (New-Object System.Text.UTF8Encoding($false)))
+}
+
+# 生成安装包: (除非 skip) 全构建当前变体 → 生成 app.toml → 调 wind-installer\scripts\pack.ps1。
+#   pack.ps1 负责: 原生编译 stub/uninstaller/packer → 注入 uninstall.exe 到 source → wind-packer build。
+# 打包是纯文件 IO + cargo 构建, 不需管理员 (故未纳入 UAC 提权命令)。
+function Do-Installer ([string]$profile = "release", [bool]$skipBuild = $false) {
+    # 1. 定位 wind-installer 兄弟项目
+    $instDir = $InstallerDir
+    if (Test-Path $InstallerDir) { $instDir = (Resolve-Path $InstallerDir).Path }
+    if (-not (Test-Path $instDir)) {
+        ErrMsg "未找到 wind-installer 项目: $instDir"
+        ErrMsg "请将 wind-installer 与 WindInput 放在同级目录, 或在 scripts\deploy.local.ps1 设置 `$InstallerDir。"
+        return $false
+    }
+    $packPs1 = Join-Path $instDir "scripts\pack.ps1"
+    if (-not (Test-Path $packPs1)) { ErrMsg "缺少打包脚本: $packPs1"; return $false }
+    $assetsDir = Join-Path $instDir "assets"
+
+    # 2. 构建产物 (除非 skip)
+    $outdir = Out-For $profile
+    $suffix = if ($profile -eq "dev") { "_dev" } else { "" }
+    if (-not $skipBuild) {
+        if (-not (Do-Full $profile)) { return $false }
+    } elseif (-not (Test-Path "$outdir\wind_input$suffix.exe")) {
+        ErrMsg "无 $outdir 产物; 去掉 skip 先全构建, 或运行 '$(if($profile -eq 'dev'){'d1'}else{'1'})'。"; return $false
+    }
+
+    # 3. 生成变体 app.toml → dist\ (在 source 之外)
+    New-Item -ItemType Directory -Path $DistDir -Force | Out-Null
+    $cfgName = if ($profile -eq "dev") { "WindInputDev.app.toml" } else { "WindInput.app.toml" }
+    $cfg = Join-Path $DistDir $cfgName
+    New-InstallerConfig $profile $outdir $cfg $assetsDir
+
+    Say "`n========== 生成安装包 ($profile) =========="
+    Gray "  安装器: $instDir"
+    Gray "  产物:   $outdir"
+    Gray "  配置:   $cfg"
+    Gray "  输出:   $DistDir"
+
+    # 4. 调 pack.ps1 (编译 stub + 注入卸载器 + packer build)。
+    #    skip 模式且 installer 二进制已在 → 透传 -SkipBuild 跳过 stub 重编 (加速反复打包)。
+    $stub   = Join-Path $instDir "target\release\wind-installer.exe"
+    $packer = Join-Path $instDir "target\release\wind-packer.exe"
+    $unins  = Join-Path $instDir "target\release\wind-uninstaller.exe"
+    $instBuilt = (Test-Path $stub) -and (Test-Path $packer) -and (Test-Path $unins)
+    # 哈希表 splat 才能按名绑定 (数组 splat 会把 -Config 当成位置参数的值)。
+    $packArgs = @{ Config = $cfg }
+    if ($skipBuild -and $instBuilt) { $packArgs['SkipBuild'] = $true }
+    & $packPs1 @packArgs
+    if ($LASTEXITCODE -ne 0) { ErrMsg "打包失败 (见上方 wind-packer 输出)"; return $false }
+
+    $setup = Join-Path $DistDir "$(if($profile -eq 'dev'){'WindInputDev-Setup'}else{'WindInput-Setup'})-$Version.exe"
+    if (Test-Path $setup) {
+        $sz = [math]::Round((Get-Item $setup).Length / 1MB, 1)
+        Say "`n安装包已生成: $setup (${sz}MB)"
+        $sha = "$setup.sha256"
+        if (Test-Path $sha) { Gray "校验和: $sha" }
+    } else {
+        Warn "打包脚本已结束, 但未找到预期输出: $setup"
+        Warn "请检查上方 wind-packer 实际输出名 (dist\ 下)。"
+    }
+    return $true
+}
+
 # ---------- 候选 REPL (本机) ----------
 function Do-Repl ([string]$data = "") {
     if (-not $data) {
@@ -737,6 +871,10 @@ function Show-Menu {
     Write-Host "    u1   卸载全部 (release)        ud1   卸载全部 (dev)"
     Write-Host "      release → $DeployDirRelease" -ForegroundColor DarkGray
     Write-Host "      dev     → $DeployDirDev" -ForegroundColor DarkGray
+    Write-Host "`n  安装包 (调用兄弟项目 wind-installer 打包):" -ForegroundColor Yellow
+    Write-Host "    8    生成安装包 (release)       d8    生成安装包 (dev)"
+    Write-Host "    8s   跳过重建直接打包 (release)  d8s   跳过重建直接打包 (dev)"
+    Write-Host "      输出 → $DistDir" -ForegroundColor DarkGray
     Write-Host "`n  代码质量:" -ForegroundColor Yellow
     Write-Host "    k=check  l=clippy  t=test  f=fmt  ci=fmt+clippy+test"
     Write-Host "`n  数据 / 实测:" -ForegroundColor Yellow
@@ -766,6 +904,10 @@ function Dispatch ([string]$cmd, [string]$arg) {
         "pdm2" { if (Deploy-Module dev core)   { 0 } else { 1 }; break }
         "u1"   { if (Uninstall-Full release) { 0 } else { 1 }; break }
         "ud1"  { if (Uninstall-Full dev)   { 0 } else { 1 }; break }
+        { $_ -in "8", "installer" }     { if (Do-Installer release $false) { 0 } else { 1 }; break }
+        "8s"                            { if (Do-Installer release $true)  { 0 } else { 1 }; break }
+        { $_ -in "d8", "installer-dev" } { if (Do-Installer dev $false)   { 0 } else { 1 }; break }
+        "d8s"                           { if (Do-Installer dev $true)     { 0 } else { 1 }; break }
         { $_ -in "k", "check" }   { Do-Check;  $LASTEXITCODE; break }
         { $_ -in "l", "clippy" }  { Do-Clippy; $LASTEXITCODE; break }
         { $_ -in "t", "test" }    { Do-Test;   $LASTEXITCODE; break }
