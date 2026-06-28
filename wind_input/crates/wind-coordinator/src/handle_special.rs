@@ -171,7 +171,28 @@ impl Coordinator {
                 }
             }
             keymap::VK_RETURN => {
-                // 回车：上屏编码原文
+                // 空缓冲（只按了模式键、还没敲编码）：新增分支——commit 模式上屏模式键符号本身
+                // （原样不转换，补输被占用的符号，如 \）；clear 模式放弃退出（同原空缓冲行为）。
+                if state.special_buffer.is_empty() {
+                    if self.rt().config.input.enter_behavior != "clear"
+                        && !state.special_prefix.is_empty()
+                    {
+                        let sym = state.special_prefix.clone();
+                        self.record_commit(
+                            &sym,
+                            0,
+                            -1,
+                            wind_store::stats::CommitSource::Punctuation,
+                        );
+                        self.exit_special_mode(state);
+                        self.notify_ui_hide();
+                        return Self::commit_action(sym, true);
+                    }
+                    self.exit_special_mode(state);
+                    self.notify_ui_hide();
+                    return KeyAction::ClearComposition;
+                }
+                // 非空缓冲：上屏编码原文（原行为不变）
                 let text = state.special_buffer.clone();
                 self.record_commit(
                     &text,
@@ -181,11 +202,7 @@ impl Coordinator {
                 );
                 self.exit_special_mode(state);
                 self.notify_ui_hide();
-                if text.is_empty() {
-                    KeyAction::ClearComposition
-                } else {
-                    Self::commit_action(text, true)
-                }
+                Self::commit_action(text, true)
             }
             keymap::VK_1..=keymap::VK_9 => {
                 // 数字 1-9 选当前页候选

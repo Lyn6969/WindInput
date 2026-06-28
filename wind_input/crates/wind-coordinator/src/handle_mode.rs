@@ -702,17 +702,32 @@ impl Coordinator {
                 }
             }
             keymap::VK_RETURN => {
-                // 回车：上屏「已转换前缀 + 缓冲原文」（如完整表达式 100+200=300，或已转中文+剩余拼音）
+                // 空缓冲（只按了模式键、无已转换前缀）：新增分支——commit 模式上屏模式键符号本身
+                // （原样不转换，如 ;）；clear 模式放弃退出（同原空缓冲行为）。
+                if state.mix_buffer.is_empty() && state.committed_text.is_empty() {
+                    if self.rt().config.input.enter_behavior != "clear"
+                        && !state.mix_prefix.is_empty()
+                    {
+                        let sym = state.mix_prefix.clone();
+                        self.record_commit(
+                            &sym,
+                            0,
+                            -1,
+                            wind_store::stats::CommitSource::Punctuation,
+                        );
+                        return commit_text(self, state, sym);
+                    }
+                    return commit_text(self, state, String::new());
+                }
+                // 非空缓冲：上屏「已转换前缀 + 缓冲原文」（原行为不变，如 ;nihao → nihao）
                 self.record_commit(
                     &state.mix_buffer,
                     state.mix_buffer.len() as u32,
                     -1,
                     wind_store::stats::CommitSource::Mix,
                 );
-                let out = self.maybe_s2t(
-                    state,
-                    &format!("{}{}", state.committed_text, state.mix_buffer),
-                );
+                let out =
+                    self.maybe_s2t(state, &format!("{}{}", state.committed_text, state.mix_buffer));
                 commit_text(self, state, out)
             }
             _ => {

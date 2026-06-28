@@ -225,7 +225,28 @@ impl Coordinator {
                 }
             }
             keymap::VK_RETURN => {
-                // 回车：上屏「当前显示」= 已转换前缀 + 剩余拼音原码（已选中文照样上屏），退出。
+                // 空缓冲（只按了模式键、无已转换前缀）：新增分支——commit 模式上屏模式键符号本身
+                // （原样不转换，如 `）；clear 模式放弃退出（同原空缓冲行为）。
+                if state.temp_pinyin_buffer.is_empty() && state.committed_text.is_empty() {
+                    if self.rt().config.input.enter_behavior != "clear"
+                        && !state.temp_pinyin_prefix.is_empty()
+                    {
+                        let sym = state.temp_pinyin_prefix.clone();
+                        self.record_commit(
+                            &sym,
+                            0,
+                            -1,
+                            wind_store::stats::CommitSource::Punctuation,
+                        );
+                        self.exit_temp_pinyin(state);
+                        self.notify_ui_hide();
+                        return Self::commit_action(sym, true);
+                    }
+                    self.exit_temp_pinyin(state);
+                    self.notify_ui_hide();
+                    return KeyAction::ClearComposition;
+                }
+                // 非空缓冲：上屏「已转换前缀 + 剩余拼音原码」（原行为不变，如 `nihao → nihao）。
                 // committed 段已在选词时记过，此处只记剩余拼音原码避免重复。
                 self.record_commit(
                     &state.temp_pinyin_buffer,
@@ -233,8 +254,10 @@ impl Coordinator {
                     -1,
                     wind_store::stats::CommitSource::TempPinyin,
                 );
-                let out = format!("{}{}", state.committed_text, state.temp_pinyin_buffer);
-                let out = self.maybe_s2t(state, &out);
+                let out = self.maybe_s2t(
+                    state,
+                    &format!("{}{}", state.committed_text, state.temp_pinyin_buffer),
+                );
                 self.exit_temp_pinyin(state);
                 self.notify_ui_hide();
                 if out.is_empty() {
