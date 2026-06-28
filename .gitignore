@@ -2,6 +2,7 @@ target/
 build_dev/
 build/
 dist/
+temp/
 .cache/
 scripts/deploy.local
 scripts/deploy.local.ps1
