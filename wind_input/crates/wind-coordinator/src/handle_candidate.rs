@@ -131,24 +131,29 @@ impl Coordinator {
         limit: usize,
     ) -> (usize, InputOutcome) {
         // 分段上屏进行中（committed 前缀非空 ⟺ 来自拼音选词——五笔候选 consumed_length=0
-        // 永不部分匹配）：剩余编码强制按拼音方案转换，避免混输让五笔抢首选（你↑选后 hao→虚）。
-        let result = if !state.committed_text.is_empty()
-            && !self.rt().config.schema.primary_pinyin.is_empty()
-        {
-            self.engine_mgr.convert_with(
-                &self.rt().config.schema.primary_pinyin,
-                &state.input_buffer,
-                limit,
-            )
+        // 永不部分匹配）：剩余编码强制按混输方案的拼音子方案转换，避免混输让五笔抢首选
+        // （你↑选后 hao→虚）。拼音方案 id 取当前混输方案的 [engine.mixed].secondary_schema
+        // （如 wubi86_pinyin → "pinyin"）。注意不用全局 primary_pinyin——那是给「临时拼音↔
+        // 临时双拼」切换用的，对混输不适用。
+        let pinyin_schema = if !state.committed_text.is_empty() {
+            let active = self.engine_mgr.active_schema_id();
+            self.engine_mgr
+                .schema_merged(&active)
+                .map(|s| s.engine.mixed.secondary_schema.clone())
+                .filter(|s| !s.is_empty())
         } else {
-            self.engine_mgr.convert(&state.input_buffer, limit)
+            None
         };
-        // 组合区只显示输入码/拼音
-        state.preedit = if result.preedit_display.is_empty() {
-            state.input_buffer.clone()
-        } else {
-            result.preedit_display
+        let result = match pinyin_schema {
+            Some(ps) if self.engine_mgr.ensure_schema(&ps) => {
+                self.engine_mgr.convert_with(&ps, &state.input_buffer, limit)
+            }
+            _ => self.engine_mgr.convert(&state.input_buffer, limit),
         };
+        // 拼音音节拆分形态（供「混输高亮跟随」按高亮候选类型选择显示原始码 / 拆分串）。
+        // 码表 / 无拼音 → 空串（恒原始码）。state.preedit 本身由 sync_preedit_to_highlight
+        // 按高亮重算（见 update_candidates 末尾 / apply_nav_key）。
+        state.preedit_split_body = result.preedit_pinyin.clone();
         let engine_count = result.candidates.len();
         // 引擎给出的全码自动上屏意向（基于引擎候选；下方 shadow 后复核存活性）。
         let auto_commit = if result.should_commit && !result.commit_text.is_empty() {
@@ -302,6 +307,7 @@ impl Coordinator {
     pub(crate) fn update_candidates(&self, state: &mut State) -> InputOutcome {
         state.candidates.clear();
         state.preedit = state.input_buffer.clone();
+        state.preedit_split_body.clear();
         if state.input_buffer.is_empty() {
             state.has_more = false;
             state.candidate_input.clear();
@@ -325,10 +331,6 @@ impl Coordinator {
                 },
             );
         }
-        // 拼音逐步转换：组合区 = 已转换前缀 + 剩余拼音显示（前缀恒空于码表模式，无副作用）。
-        if !state.committed_text.is_empty() {
-            state.preedit = format!("{}{}", state.committed_text, state.preedit);
-        }
         state.candidate_input = state.input_buffer.clone();
         state.candidate_limit = limit;
         // 引擎返回数达到上限 → 可能还有更多未加载
@@ -337,6 +339,8 @@ impl Coordinator {
         state.current_page = 0;
         state.selected_index = 0;
         state.hover_index = -1;
+        // 组合区按高亮候选类型重算（混输高亮跟随；含已转换前缀拼接）。
+        self.sync_preedit_to_highlight(state);
         outcome
     }
 
@@ -386,7 +390,9 @@ impl Coordinator {
         }
         state.candidate_limit = new_limit;
         state.has_more = engine_count >= new_limit;
-        // 保持当前页/高亮不变（build_candidates 未改动它们）
+        // 保持当前页/高亮不变（build_candidates 未改动它们）；按当前高亮重算组合区
+        // （输入/高亮未变 → 形态不变，仅防御性同步）。
+        self.sync_preedit_to_highlight(state);
     }
 
     /// 若 key_code 是配置的二/三候选键，返回页内候选偏移（1=次选/第2项，2=三选/第3项）。
@@ -424,6 +430,45 @@ impl Coordinator {
     pub(crate) fn highlighted_global_index(&self, state: &State) -> usize {
         let (start, _) = self.page_range(state);
         start + state.selected_index
+    }
+
+    /// 组合区「正文」形态选择（不含已转换前缀）：对齐微软五笔——按**当前高亮候选**的类型决定。
+    /// - 无拆分形态（码表/无拼音，preedit_split_body 空）→ 恒原始码（input_buffer）。
+    /// - 高亮候选为拼音来源 → 音节拆分串（preedit_split_body，如 baoan 的拼音 / saaa 的 sa'a'a）。
+    /// - 高亮候选为码表/五笔（或短语等非拼音）→ 原始码（input_buffer，如 saaa 选「模式」时不拆）。
+    fn effective_preedit_body<'a>(&self, state: &'a State) -> &'a str {
+        if state.preedit_split_body.is_empty() {
+            return &state.input_buffer;
+        }
+        // 分段上屏进行中（committed 前缀非空）：剩余编码已被 build_candidates 强制走拼音方案
+        // 转换，故恒按拼音拆分显示，不再按候选来源切换——否则高权重短语候选顶到首位时，
+        // 后段会被显示成原始码形态（看似「又以五笔处理」）。与 build_candidates 强制拼音对齐。
+        if !state.committed_text.is_empty() {
+            return &state.preedit_split_body;
+        }
+        let hi = self.highlighted_global_index(state);
+        let want_split = state
+            .candidates
+            .get(hi)
+            .map(|c| c.source == wind_candidate::CandidateSource::Pinyin)
+            // 无候选（极少见）：有拆分形态则倾向拆分（纯拼音空候选边界）。
+            .unwrap_or(true);
+        if want_split {
+            &state.preedit_split_body
+        } else {
+            &state.input_buffer
+        }
+    }
+
+    /// 按当前高亮候选类型重算 `state.preedit`（混输高亮跟随）。含已转换前缀（逐步转换）拼接。
+    /// 仅普通模式（active==None）有意义；覆盖层模式各自维护 preedit，不应调用此方法。
+    pub(crate) fn sync_preedit_to_highlight(&self, state: &mut State) {
+        let body = self.effective_preedit_body(state).to_string();
+        state.preedit = if state.committed_text.is_empty() {
+            body
+        } else {
+            format!("{}{}", state.committed_text, body)
+        };
     }
 
     /// overlay 候选模式的导航分派：码表型（特殊/临拼，及不含 quick_input 的 mix）`-`/`=` 作翻页；

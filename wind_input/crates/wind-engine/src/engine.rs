@@ -19,6 +19,10 @@ pub struct ConvertResult {
     pub candidates: Vec<Candidate>,
     /// 预编辑显示文本（拼音：含音节分隔；码表：原始编码）
     pub preedit_display: String,
+    /// 拼音音节拆分形态（供「混输高亮跟随」：高亮拼音候选时显示此拆分串，高亮码表/五笔
+    /// 候选时显示原始码）。拼音引擎 = preedit_display；混输引擎 = 拼音子引擎的音节拆分
+    /// （≥2 音节时，否则空）；码表/无拼音引擎 = 空串（恒原始码）。
+    pub preedit_pinyin: String,
     /// 已完成音节（拼音 UI 高亮用）
     pub completed_syllables: Vec<String>,
     /// 末尾未完成音节（拼音）

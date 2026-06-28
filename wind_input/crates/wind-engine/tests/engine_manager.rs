@@ -291,12 +291,19 @@ fn test_mixed_multisyllable_pinyin_preedit_separated() {
     }
     let cfg = make_config(&["wubi86_pinyin"]);
     let mgr = EngineManager::new(&cfg, Some(&dir));
-    // 多音节拼音：组合区应带音节分隔（"ni hao"），而非连写。
+    // 多音节拼音：组合区应带音节分隔（"ni'hao"），而非连写。
     let r = mgr.convert("nihao", 9);
     assert!(
-        r.preedit_display.contains(' '),
+        r.preedit_display.contains('\''),
         "多音节拼音组合区应有音节分隔，实际 preedit: {:?}",
         r.preedit_display
+    );
+    // 混输高亮跟随：拼音拆分形态须单独留存（供协调器在高亮拼音候选时取用、高亮五笔候选时
+    // 改回原始码）。多音节拼音应填充且含 ' 分隔。
+    assert!(
+        r.preedit_pinyin.contains('\''),
+        "混输应留存拼音拆分形态 preedit_pinyin，实际: {:?}",
+        r.preedit_pinyin
     );
 }
 

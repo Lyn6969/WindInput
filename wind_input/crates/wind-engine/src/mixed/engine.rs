@@ -139,7 +139,9 @@ impl Engine for MixedEngine {
         let is_empty = merged.is_empty();
         Ok(ConvertResult {
             candidates: merged,
-            // 组合区：多音节拼音用音节分隔（ni hao），否则原始码（五笔为主，简明）。
+            // 组合区：多音节拼音用音节分隔（ni'hao），否则原始码（五笔为主，简明）。
+            // 拼音拆分形态单独留存，供协调器「按高亮候选类型」选择显示原始码 / 拆分串。
+            preedit_pinyin: pinyin_preedit.clone().unwrap_or_default(),
             preedit_display: pinyin_preedit.unwrap_or_else(|| input.to_string()),
             is_empty,
             should_commit,

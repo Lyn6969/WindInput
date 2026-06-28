@@ -284,9 +284,13 @@ pub(crate) struct State {
     pub(crate) ime_active: bool,
     pub(crate) caps_lock: bool,
     pub(crate) input_buffer: String,
-    /// 组合区显示文本（拼音含音节分隔 "ni hao"；码表为原始编码）。
+    /// 组合区显示文本（拼音含音节分隔 "ni'hao"；码表为原始编码）。
     /// 仅显示输入码/拼音，绝不包含候选列表。
     pub(crate) preedit: String,
+    /// 拼音音节拆分形态（不含已转换前缀）。供「混输高亮跟随」：高亮拼音候选 → preedit 用此
+    /// 拆分串；高亮码表/五笔候选 → 用原始码（input_buffer）。空串 = 无拆分形态（码表/无拼音，
+    /// 恒原始码）。每次 build_candidates 重置；非普通模式（active!=None）不读取。
+    pub(crate) preedit_split_body: String,
     pub(crate) candidates: Vec<Candidate>,
     /// 当前页内高亮候选下标（0-based，相对当前页）——键盘选中项，空格上屏的目标
     pub(crate) selected_index: usize,
@@ -772,6 +776,7 @@ impl Coordinator {
                 caps_lock: false,
                 input_buffer: String::new(),
                 preedit: String::new(),
+                preedit_split_body: String::new(),
                 candidates: Vec::new(),
                 selected_index: 0,
                 hover_index: -1,
@@ -1186,7 +1191,32 @@ impl Coordinator {
             keymap::NavAction::PageNext => self.page_next(state),
         };
         if changed {
+            // 混输高亮跟随：普通模式下高亮在五笔↔拼音候选间移动可能切换 preedit 形态
+            // （原始码 ↔ 音节拆分）。重算 preedit；若形态变化且嵌入编码（app_inline），须回传
+            // 组合串使宿主内联编码同步；候选窗模式仅 notify_ui_update 刷新即可。
+            // 门控：仅普通模式（active==None）且存在拆分形态——纯五笔(无拆分)/纯拼音(全拼音
+            // 候选→形态恒定)均不触发，零回归。
+            let mut composed: Option<KeyAction> = None;
+            if state.active.is_none() && !state.preedit_split_body.is_empty() {
+                let before = state.preedit.clone();
+                self.sync_preedit_to_highlight(state);
+                if state.preedit != before {
+                    let in_app = self
+                        .preedit_display
+                        .lock()
+                        .map(|m| m.in_app())
+                        .unwrap_or(true);
+                    if in_app {
+                        let text = state.preedit.clone();
+                        let caret_pos = text.chars().count() as u32;
+                        composed = Some(KeyAction::UpdateComposition { text, caret_pos });
+                    }
+                }
+            }
             self.notify_ui_update(state);
+            if let Some(act) = composed {
+                return Some(act);
+            }
         }
         Some(KeyAction::Consumed)
     }
@@ -1214,6 +1244,7 @@ impl Coordinator {
         state.committed_segs.clear();
         state.input_buffer.clear();
         state.preedit.clear();
+        state.preedit_split_body.clear();
         state.candidates.clear();
         state.current_page = 0;
         state.selected_index = 0;
@@ -2548,7 +2579,7 @@ impl MessageHandler for Coordinator {
                 let display = state.preedit.clone();
                 self.notify_ui_update(&state);
                 KeyAction::UpdateComposition {
-                    // 光标按显示串字符数（拼音 preedit 含分词空格，与原始字节长不同）。
+                    // 光标按显示串字符数（拼音 preedit 含 ' 分隔符，与原始字节长不同）。
                     caret_pos: display.chars().count() as u32,
                     text: display,
                 }

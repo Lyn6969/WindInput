@@ -106,9 +106,11 @@ fn main() {
         "release"
     };
     info!(
-        "WindInput service starting (v{}, {} variant)",
+        "WindInput service starting (v{}, {} variant, build {} git:{})",
         env!("CARGO_PKG_VERSION"),
-        variant
+        variant,
+        env!("WIND_BUILD_TIME"),
+        env!("WIND_GIT_HASH"),
     );
 
     // 2. 单例检查（与 Go 版 checkSingleton 对齐）

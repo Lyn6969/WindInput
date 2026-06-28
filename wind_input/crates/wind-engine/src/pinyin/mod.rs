@@ -136,10 +136,10 @@ impl PinyinEngine {
             String::new()
         };
 
-        let mut preedit = syllables.join(" ");
+        let mut preedit = syllables.join("'");
         if !partial.is_empty() {
             if !preedit.is_empty() {
-                preedit.push(' ');
+                preedit.push('\'');
             }
             preedit.push_str(&partial);
         }
@@ -236,7 +236,7 @@ impl PinyinEngine {
 /// Fix A：用双拼原始按键重建 preedit（按音节边界以空格分隔）。
 /// 依次取每个已完成音节在原始输入中的字节区间 `raw[sp_start..sp_end]`；
 /// 若有 partial，把最后一个完成音节之后的剩余原始字节作为 partial 段追加。
-/// 分隔符与全拼自动分词一致用空格（`'` 保留给将来的手动拆分，见全拼处理）。
+/// 分隔符与全拼自动分词一致用 `'`（更省空间、观感更好）。
 /// 双拼键均为 ASCII，字节切片安全。
 fn build_raw_preedit(raw_input: &str, sp: &shuangpin::SpConvertResult) -> String {
     if raw_input.is_empty() {
@@ -255,7 +255,7 @@ fn build_raw_preedit(raw_input: &str, sp: &shuangpin::SpConvertResult) -> String
         // 无 syllables 且无 partial：原样返回（如无匹配键对等边界）。
         return raw_input.to_string();
     }
-    segments.join(" ")
+    segments.join("'")
 }
 
 impl Engine for PinyinEngine {
@@ -517,6 +517,8 @@ impl Engine for PinyinEngine {
 
         Ok(ConvertResult {
             candidates,
+            // 拼音恒为拆分形态（供混输高亮跟随：高亮拼音候选时取此串）。
+            preedit_pinyin: preedit_display.clone(),
             preedit_display,
             completed_syllables,
             partial_syllable,
@@ -692,11 +694,11 @@ mod tests {
         let conv = ShuangpinConverter::new(layout);
         let eng = PinyinEngine::new(Config::default(), dict).with_shuangpin(conv);
 
-        // 完整双音节：preedit 为原始键按音节空格分隔 "ni hc"（而非全拼 "ni hao"）
+        // 完整双音节：preedit 为原始键按音节 ' 分隔 "ni'hc"（而非全拼 "ni'hao"）
         let r = eng.convert("nihc", 10).unwrap();
         assert_eq!(
-            r.preedit_display, "ni hc",
-            "双拼 preedit 应显示原始按键并按音节空格分隔，实际: {:?}",
+            r.preedit_display, "ni'hc",
+            "双拼 preedit 应显示原始按键并按音节 ' 分隔，实际: {:?}",
             r.preedit_display
         );
         // 候选仍走全拼语义，含「你好」
@@ -710,11 +712,11 @@ mod tests {
         let r2 = eng.convert("ni", 10).unwrap();
         assert_eq!(r2.preedit_display, "ni", "单音节 preedit 应为 \"ni\"");
 
-        // 含 partial：nih（ni 完成 + h 未配对）→ "ni h"
+        // 含 partial：nih（ni 完成 + h 未配对）→ "ni'h"
         let r3 = eng.convert("nih", 10).unwrap();
         assert_eq!(
-            r3.preedit_display, "ni h",
-            "含 partial 的双拼 preedit 应为 \"ni h\"，实际: {:?}",
+            r3.preedit_display, "ni'h",
+            "含 partial 的双拼 preedit 应为 \"ni'h\"，实际: {:?}",
             r3.preedit_display
         );
     }

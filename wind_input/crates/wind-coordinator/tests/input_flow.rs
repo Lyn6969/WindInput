@@ -355,8 +355,8 @@ fn test_pinyin_basic_input() {
     let preedit = action_text(&last).expect("应返回 UpdateComposition");
     // 拼音组合区显示音节分隔的拼音串，不含候选
     assert_eq!(
-        preedit, "ni hao",
-        "拼音组合区应显示 'ni hao'，实际: {}",
+        preedit, "ni'hao",
+        "拼音组合区应显示 'ni'hao'，实际: {}",
         preedit
     );
 
