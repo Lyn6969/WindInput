@@ -29,10 +29,10 @@ impl Coordinator {
         let weak = Arc::downgrade(self);
         let mut svc = Services::new();
         svc.ime = Some(Arc::new(CoordIme(weak.clone())));
-        svc.dict = Some(Arc::new(CoordDict(weak)));
+        svc.dict = Some(Arc::new(CoordDict(weak.clone())));
         // 无需 coordinator 回调的能力：进程启动、打开 URL/文件、写剪贴板（纯平台/std）。
-        svc.proc = Some(Arc::new(StdProc));
-        svc.open = Some(Arc::new(ShellOpener));
+        svc.proc = Some(Arc::new(CoordProc(weak.clone())));
+        svc.open = Some(Arc::new(CoordOpener(weak.clone())));
         svc.clip = Some(Arc::new(SysClip));
         svc.keys = Some(Arc::new(wind_keys::key_inject::SysKeys));
         // search/config/setting：经 open 默认可用 / 配置能力待补，留 None。
@@ -190,12 +190,14 @@ impl DictService for CoordDict {
     }
 }
 
-/// 进程启动（std，跨平台，无需 coordinator）：proc.run / proc.shell。
-struct StdProc;
+/// 进程启动：proc.run 经 TSF 侧执行（前台权限）；proc.shell 仍走本地 shell。
+struct CoordProc(Weak<Coordinator>);
 
-impl ProcessRunner for StdProc {
+impl ProcessRunner for CoordProc {
     fn run(&self, cmd: &str, args: &[String]) -> anyhow::Result<()> {
-        Command::new(cmd).args(args).spawn()?;
+        if let Some(c) = self.0.upgrade() {
+            c.push_shell_exec(cmd, &args.join(" "));
+        }
         Ok(())
     }
     fn shell(&self, cmdline: &str) -> anyhow::Result<()> {
@@ -219,12 +221,14 @@ fn shell_spawn(cmdline: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// 打开 URL / 程序 / 文件（系统外壳，跨平台）：open / web.search 默认通路。
-struct ShellOpener;
+/// 打开 URL / 程序 / 文件：经 TSF 侧 ShellExecuteW 在前台应用进程中执行。
+struct CoordOpener(Weak<Coordinator>);
 
-impl UrlOpener for ShellOpener {
+impl UrlOpener for CoordOpener {
     fn open(&self, target: &str) -> anyhow::Result<()> {
-        open::that(target)?;
+        if let Some(c) = self.0.upgrade() {
+            c.push_shell_exec(target, "");
+        }
         Ok(())
     }
 }

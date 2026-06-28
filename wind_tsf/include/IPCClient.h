@@ -239,6 +239,11 @@ public:
     // 不得调用 _SyncStateFromResponse（会清热键）。
     using ModePushCallback = std::function<void(bool chineseMode, bool fullWidth)>;
 
+    // Callback type for shell exec push (CMD_SHELL_EXEC).
+    // 在 TSF 侧（前台应用进程）调用 ShellExecuteW，解决 Service 进程无前台权限问题。
+    // 回调在 AsyncReader 线程上调用，ShellExecuteW 线程安全，可直接调用。
+    using ShellExecCallback = std::function<void(const std::wstring& target, const std::wstring& params)>;
+
     // Set callback for receiving state push from Go
     void SetStatePushCallback(StatePushCallback callback);
 
@@ -262,6 +267,9 @@ public:
 
     // Set callback for mode-only push (CMD_MODE_PUSH, FocusGained 竞态优化)
     void SetModePushCallback(ModePushCallback callback);
+
+    // Set callback for shell exec push (CMD_SHELL_EXEC)
+    void SetShellExecCallback(ShellExecCallback callback);
 
     // Start async reader thread (call after successful connection)
     BOOL StartAsyncReader();
@@ -363,6 +371,7 @@ private:
     SyncConfigCallback _syncConfigCallback;
     ServiceReadyCallback _serviceReadyCallback;
     ModePushCallback _modePushCallback;
+    ShellExecCallback _shellExecCallback;
     CRITICAL_SECTION _asyncLock;         // Lock for thread-safe access
     volatile BOOL _asyncReaderRunning = FALSE;
 

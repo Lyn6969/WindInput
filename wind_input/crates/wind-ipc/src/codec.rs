@@ -249,6 +249,25 @@ pub fn encode_mode_push(chinese_mode: bool, full_width: bool) -> Vec<u8> {
     out
 }
 
+/// 编码 ShellExec 推送（CMD_SHELL_EXEC 0x020E）：让 TSF DLL 在前台应用进程中执行 ShellExecuteW。
+///
+/// 格式: target_len(u32 LE) + target(UTF-8) + params_len(u32 LE) + params(UTF-8)
+/// - open(url/file): target = url, params = ""
+/// - proc.run(cmd, args): target = cmd, params = args joined with space
+pub fn encode_shell_exec(target: &str, params: &str) -> Vec<u8> {
+    let t = target.as_bytes();
+    let p = params.as_bytes();
+    let payload_len = 4 + t.len() + 4 + p.len();
+    let mut buf = Vec::with_capacity(IpcHeader::SIZE + payload_len);
+    let ipc = IpcHeader::new(CMD_SHELL_EXEC, payload_len as u32);
+    buf.extend_from_slice(&ipc.to_bytes());
+    buf.extend_from_slice(&(t.len() as u32).to_le_bytes());
+    buf.extend_from_slice(t);
+    buf.extend_from_slice(&(p.len() as u32).to_le_bytes());
+    buf.extend_from_slice(p);
+    buf
+}
+
 /// 编码 PassThrough 响应
 pub fn encode_pass_through() -> Vec<u8> {
     let ipc = IpcHeader::new(CMD_PASS_THROUGH, 0);

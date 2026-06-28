@@ -2992,6 +2992,14 @@ BOOL CTextService::_InitIPCClient()
                               fullWidth ? TRUE : FALSE);
     });
 
+    // Set up shell exec callback (CMD_SHELL_EXEC)
+    // 在前台应用进程中调用 ShellExecuteW，拥有前台权限，打开的窗口可正确置顶。
+    // 回调在 AsyncReader 线程执行，ShellExecuteW 是线程安全的，无需切换到 TSF 主线程。
+    _pIPCClient->SetShellExecCallback([](const std::wstring& target, const std::wstring& params) {
+        const wchar_t* pParams = params.empty() ? nullptr : params.c_str();
+        ::ShellExecuteW(nullptr, L"open", target.c_str(), pParams, nullptr, SW_SHOWNORMAL);
+    });
+
     // Set up state push callback
     _pIPCClient->SetStatePushCallback([pThis](const ServiceResponse& response) {
         // This callback is called from the async reader thread

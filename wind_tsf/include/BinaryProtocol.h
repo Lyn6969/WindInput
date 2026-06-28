@@ -67,6 +67,9 @@ constexpr uint16_t CMD_ACTIVATION_STATUS_PUSH = 0x020C;
 // 载荷：4 字节 flags（位定义同 STATUS_CHINESE_MODE/STATUS_FULL_WIDTH）。
 // DLL 侧仅 InterlockedExchange _bChineseMode/_bFullWidth，不调用 _SyncStateFromResponse，不影响热键白名单。
 constexpr uint16_t CMD_MODE_PUSH              = 0x020D;
+// CMD_SHELL_EXEC：在 TSF 侧（前台应用进程）执行 ShellExecuteW，解决 Service 进程无前台权限问题。
+// 载荷：target_len(u32 LE) + target(UTF-8) + params_len(u32 LE) + params(UTF-8)
+constexpr uint16_t CMD_SHELL_EXEC             = 0x020E;
 constexpr uint16_t CMD_SYNC_HOTKEYS       = 0x0301; // Sync hotkey whitelist
 constexpr uint16_t CMD_SYNC_CONFIG        = 0x0303; // Sync config key/value (generic)
 constexpr uint16_t CMD_CONSUMED           = 0x0401; // Key consumed

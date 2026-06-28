@@ -1745,6 +1745,13 @@ void CIPCClient::SetModePushCallback(ModePushCallback callback)
     LeaveCriticalSection(&_asyncLock);
 }
 
+void CIPCClient::SetShellExecCallback(ShellExecCallback callback)
+{
+    EnterCriticalSection(&_asyncLock);
+    _shellExecCallback = callback;
+    LeaveCriticalSection(&_asyncLock);
+}
+
 BOOL CIPCClient::StartAsyncReader()
 {
     if (_asyncReaderRunning)
@@ -2151,6 +2158,41 @@ void CIPCClient::_AsyncReaderLoop()
                     {
                         mpCallback(chineseMode, fullWidth);
                     }
+                }
+            }
+            else if (header.command == CMD_SHELL_EXEC)
+            {
+                // TSF 侧在前台应用进程执行 ShellExecuteW（打开 URL / 启动程序）。
+                // 载荷：target_len(u32 LE) + target(UTF-8) + params_len(u32 LE) + params(UTF-8)
+                const uint8_t* p = buffer.data() + sizeof(IpcHeader);
+                size_t avail = bytesRead - sizeof(IpcHeader);
+                if (avail >= 4)
+                {
+                    uint32_t tLen = static_cast<uint32_t>(p[0]) | (static_cast<uint32_t>(p[1]) << 8)
+                                  | (static_cast<uint32_t>(p[2]) << 16) | (static_cast<uint32_t>(p[3]) << 24);
+                    p += 4; avail -= 4;
+                    std::string targetUtf8;
+                    if (tLen <= avail) { targetUtf8.assign(reinterpret_cast<const char*>(p), tLen); p += tLen; avail -= tLen; }
+                    uint32_t pLen = 0;
+                    std::string paramsUtf8;
+                    if (avail >= 4)
+                    {
+                        pLen = static_cast<uint32_t>(p[0]) | (static_cast<uint32_t>(p[1]) << 8)
+                             | (static_cast<uint32_t>(p[2]) << 16) | (static_cast<uint32_t>(p[3]) << 24);
+                        p += 4; avail -= 4;
+                        if (pLen <= avail) paramsUtf8.assign(reinterpret_cast<const char*>(p), pLen);
+                    }
+                    int tWLen = MultiByteToWideChar(CP_UTF8, 0, targetUtf8.c_str(), -1, nullptr, 0);
+                    int pWLen = MultiByteToWideChar(CP_UTF8, 0, paramsUtf8.c_str(), -1, nullptr, 0);
+                    std::wstring targetW(tWLen > 0 ? tWLen - 1 : 0, L'\0');
+                    std::wstring paramsW(pWLen > 0 ? pWLen - 1 : 0, L'\0');
+                    if (tWLen > 0) MultiByteToWideChar(CP_UTF8, 0, targetUtf8.c_str(), -1, targetW.data(), tWLen);
+                    if (pWLen > 0) MultiByteToWideChar(CP_UTF8, 0, paramsUtf8.c_str(), -1, paramsW.data(), pWLen);
+                    _LogInfo(L"Async reader: CMD_SHELL_EXEC target=%s params=%s", targetW.c_str(), paramsW.c_str());
+                    EnterCriticalSection(&_asyncLock);
+                    ShellExecCallback seCallback = _shellExecCallback;
+                    LeaveCriticalSection(&_asyncLock);
+                    if (seCallback) seCallback(targetW, paramsW);
                 }
             }
             else if (header.command == CMD_SERVICE_READY)

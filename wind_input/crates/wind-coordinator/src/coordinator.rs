@@ -1811,6 +1811,11 @@ impl Coordinator {
         self.push_server.push_to_active(&encoded);
     }
 
+    pub(crate) fn push_shell_exec(&self, target: &str, params: &str) {
+        let encoded = wind_ipc::codec::encode_shell_exec(target, params);
+        self.push_server.push_to_active(&encoded);
+    }
+
     pub(crate) fn push_state_update(&self) {
         let s = self.build_status();
         let encoded = wind_ipc::codec::encode_state_push(

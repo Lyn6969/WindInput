@@ -78,6 +78,9 @@ pub const CMD_ACTIVATION_STATUS_PUSH: u16 = 0x020C;
 /// DLL 在 OnSetFocus 内同步等本响应，首键前写好 _bChineseMode，根治"切应用首键上屏英文"
 /// 竞态；同时解除 DLL 的同步等待（否则无响应会卡到 READ_TIMEOUT_MS）。位定义同 STATUS_*。
 pub const CMD_MODE_PUSH: u16 = 0x020D;
+/// TSF 侧在前台应用进程中执行 ShellExecute（打开 URL / 启动程序），解决 Service 进程无前台权限的问题。
+/// 载荷：target_len(u32 LE) + target(UTF-8) + params_len(u32 LE) + params(UTF-8)
+pub const CMD_SHELL_EXEC: u16 = 0x020E;
 pub const CMD_SYNC_CONFIG: u16 = 0x0303;
 
 // 消费确认
