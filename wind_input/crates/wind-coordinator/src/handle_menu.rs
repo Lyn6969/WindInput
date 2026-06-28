@@ -340,9 +340,6 @@ impl Coordinator {
     /// 否则下发 HideToolbar。所有调用点（启动/切模式/切方案/激活/失活）经此单点决策，
     /// 不再各自直接显示，根治“工具栏总是显示、切走输入法不隐藏”。
     pub(crate) fn notify_toolbar(&self) {
-        let schema_label = self
-            .engine_mgr
-            .schema_name(&self.engine_mgr.active_schema_id());
         // 前台应用全屏时隐藏工具栏（ui.toolbar.hide_in_fullscreen，对齐 Go）。
         let hide_fullscreen =
             self.rt().config.ui.toolbar.hide_in_fullscreen && crate::is_foreground_fullscreen();
@@ -352,9 +349,24 @@ impl Coordinator {
             let _ = self.ui_tx.send(UiCommand::HideToolbar);
             return;
         }
+        let (chinese_mode, caps_lock) = (s.chinese_mode, s.caps_lock);
+        drop(s);
+        // 有效中文：中文模式且大写锁定未开（对齐 Go effectiveChinese）。
+        let effective_chinese = chinese_mode && !caps_lock;
+        let icon_label = if effective_chinese {
+            let id = self.engine_mgr.active_schema_id();
+            let lbl = self.engine_mgr.schema_icon_label(&id);
+            if lbl.is_empty() { "中".to_string() } else { lbl }
+        } else if caps_lock {
+            "A".to_string()
+        } else {
+            "英".to_string()
+        };
+        let s = self.state.lock().unwrap_or_else(|e| e.into_inner());
         let tb = ToolbarState {
-            chinese_mode: s.chinese_mode,
-            schema_label,
+            chinese_mode,
+            icon_label,
+            caps_lock,
             full_width: s.full_width,
             chinese_punct: s.chinese_punct,
             s2t_enabled: s.s2t_enabled,

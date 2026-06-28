@@ -1764,18 +1764,28 @@ impl Coordinator {
     }
 
     fn build_status(&self) -> StatusUpdateData {
-        let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        let (chinese_mode, full_width, chinese_punct, toolbar_visible, caps_lock) = {
+            let s = self.state.lock().unwrap_or_else(|e| e.into_inner());
+            (s.chinese_mode, s.full_width, s.chinese_punct, s.toolbar_visible, s.caps_lock)
+        };
+        // 有效中文：中文模式且大写锁定未开（对齐 Go effectiveChinese = chineseMode && !capsLockOn）。
+        let effective_chinese = chinese_mode && !caps_lock;
+        let icon_label = if effective_chinese {
+            let id = self.engine_mgr.active_schema_id();
+            let lbl = self.engine_mgr.schema_icon_label(&id);
+            if lbl.is_empty() { "中".to_string() } else { lbl }
+        } else if caps_lock {
+            "A".to_string()
+        } else {
+            "英".to_string()
+        };
         StatusUpdateData {
-            chinese_mode: state.chinese_mode,
-            full_width: state.full_width,
-            chinese_punct: state.chinese_punct,
-            toolbar_visible: state.toolbar_visible,
-            caps_lock: state.caps_lock,
-            icon_label: if state.chinese_mode {
-                "中".into()
-            } else {
-                "英".into()
-            },
+            chinese_mode,
+            full_width,
+            chinese_punct,
+            toolbar_visible,
+            caps_lock,
+            icon_label,
             key_down_hotkeys: self.rt().compiled_hotkeys.key_down_tsf_hashes(),
             key_up_hotkeys: self.rt().compiled_hotkeys.key_up_tsf_hashes(),
         }

@@ -23,8 +23,10 @@ use crate::window::{LayeredWindow, WindowMouse};
 #[derive(Debug, Clone)]
 pub struct ToolbarState {
     pub chinese_mode: bool,
-    /// 方案友好名（如 "五笔" / "拼音"），与中英状态合并显示在同一格
-    pub schema_label: String,
+    /// 有效显示标签：中文模式取方案 icon_label（如 "拼"/"五"），无则 "中"；
+    /// 英文小写为 "英"，大写锁定为 "A"（由协调器预计算后填入）。
+    pub icon_label: String,
+    pub caps_lock: bool,
     pub full_width: bool,
     pub chinese_punct: bool,
     /// 简繁转换当前是否启用（格内显示 "繁" 并高亮）
@@ -37,7 +39,8 @@ impl Default for ToolbarState {
     fn default() -> Self {
         Self {
             chinese_mode: true,
-            schema_label: "五笔".to_string(),
+            icon_label: "中".to_string(),
+            caps_lock: false,
             full_width: false,
             chinese_punct: true,
             s2t_enabled: false,
@@ -167,13 +170,15 @@ impl Toolbar {
     /// 根据状态构建单元格序列。
     /// 布局：拖动条 | 中英状态（含方案名）| 符号 | 全半角 | [简繁] | 设置图标
     fn cells(state: &ToolbarState) -> Vec<Cell> {
-        // 中英状态：方案已统一并入此格，仅显示中/英（方案切换走右键菜单）。
-        let mode_text = if state.chinese_mode { "中" } else { "英" };
+        // 有效中文：中文模式且大写锁定未开（对齐 Go effectiveChinese = chineseMode && !capsLockOn）。
+        let effective_chinese = state.chinese_mode && !state.caps_lock;
+        // 显示标签由协调器预计算存入 icon_label；此处直接使用。
+        let mode_text = &state.icon_label;
 
         let mut cells = vec![
             Cell {
                 text: mode_text.to_string(),
-                highlight: state.chinese_mode,
+                highlight: effective_chinese,
                 dim: false,
                 action: ToolbarAction::ToggleMode,
             },
