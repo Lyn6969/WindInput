@@ -17,6 +17,8 @@ mod imp {
         SWP_NOACTIVATE, SWP_NOSIZE, SWP_NOZORDER, SetCursor, SetWindowPos, ShowWindow,
         WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_RBUTTONDOWN, WM_SETCURSOR,
     };
+    // WM_MOUSELEAVE 不在 WindowsAndMessaging 模块内，直接以字面量定义（与 Win32 一致）。
+    pub const WM_MOUSELEAVE: u32 = 0x02A3;
 }
 
 #[cfg(not(windows))]
@@ -69,6 +71,7 @@ mod imp {
     pub const WM_MOUSEMOVE: u32 = 0x0200;
     pub const WM_MOUSEWHEEL: u32 = 0x020A;
     pub const WM_SETCURSOR: u32 = 0x0020;
+    pub const WM_MOUSELEAVE: u32 = 0x02A3;
 
     // ---- 光标/窗口 API（mock：无副作用）----
     /// # Safety

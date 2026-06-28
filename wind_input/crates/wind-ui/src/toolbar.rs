@@ -12,8 +12,8 @@ use crate::manager::{ToolbarAction, UiEvent};
 use crate::sys::{
     GetCursorPos, GetWindowRect, HWND, HWND_TOPMOST, IDC_ARROW, IDC_SIZEALL, LPARAM, LRESULT,
     LoadCursorW, POINT, RECT, ReleaseCapture, SWP_NOACTIVATE, SWP_NOSIZE, SWP_NOZORDER, SetCapture,
-    SetCursor, SetWindowPos, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_RBUTTONDOWN,
-    WM_SETCURSOR, WPARAM,
+    SetCursor, SetWindowPos, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSELEAVE, WM_MOUSEMOVE,
+    WM_RBUTTONDOWN, WM_SETCURSOR, WPARAM,
 };
 use crate::text::dwrite::TextRenderer;
 use crate::view::Rect;
@@ -54,6 +54,18 @@ struct Cell {
     action: ToolbarAction,
 }
 
+// 标点状态图标：外部 SVG 文件（res/icons/）编译期嵌入（include_str!）。
+// SVG 仅作 alpha 蒙版（形状黑色填充即可），颜色由工具栏按主题 tint；位置精确、不受字体基线影响。
+// 要调整符号样式，直接编辑这两个 svg 文件即可（无需改 Rust 代码）。
+/// 全角（中文）标点 。，
+const PUNCT_FULL_SVG: &str = include_str!("../res/icons/punct_full.svg");
+/// 半角（英文）标点 .,
+const PUNCT_HALF_SVG: &str = include_str!("../res/icons/punct_half.svg");
+/// 全角宽度：满月（实心圆）—— 对齐微软五笔全/半角月亮状态。
+const WIDTH_FULL_SVG: &str = include_str!("../res/icons/width_full.svg");
+/// 半角宽度：月牙（弯月）。
+const WIDTH_HALF_SVG: &str = include_str!("../res/icons/width_half.svg");
+
 /// 工具栏窗口
 pub struct Toolbar {
     window: LayeredWindow,
@@ -70,13 +82,17 @@ pub struct Toolbar {
     sep: [u8; 4],
     grip: [u8; 4],
     settings_icon: [u8; 4],
+    hover_bg: [u8; 4],
+    /// 最近一次状态（供 hover 变化时本地重绘，无需协调器往返）
+    last_state: Option<ToolbarState>,
+    /// 已渲染的悬停格下标（-1=无）；tick 检测光标位置变化后据此决定是否重绘
+    rendered_hover: i32,
 }
 
 impl Toolbar {
     // 视觉常量（逻辑像素，随 DPI 缩放）
     const HEIGHT: f32 = 30.0;
     const GRIP_W: f32 = 12.0;
-    const CELL_PAD_X: f32 = 9.0;
     const MIN_CELL_W: f32 = 26.0;
     const FONT_PX: f32 = 15.0;
 
@@ -88,6 +104,7 @@ impl Toolbar {
     const SEP: [u8; 4] = [214, 214, 220, 255];       // 浅灰分隔线
     const GRIP: [u8; 4] = [186, 186, 194, 255];      // 拖动点
     const SETTINGS_ICON: [u8; 4] = [140, 140, 148, 255]; // 设置图标（比普通文字更淡）
+    const HOVER_BG: [u8; 4] = [0, 0, 0, 13];         // 鼠标悬停高亮（极淡，~5% 黑）
 
     pub fn new(events: Sender<UiEvent>) -> Result<Self, String> {
         let scale = Self::dpi_scale();
@@ -102,6 +119,8 @@ impl Toolbar {
             dragging: false,
             anchor: (0, 0),
             origin: (0, 0),
+            hover_idx: -1,
+            dirty: false,
         }));
         window.register_mouse(mouse.clone());
         Ok(Self {
@@ -117,6 +136,9 @@ impl Toolbar {
             sep: Self::SEP,
             grip: Self::GRIP,
             settings_icon: Self::SETTINGS_ICON,
+            hover_bg: Self::HOVER_BG,
+            last_state: None,
+            rendered_hover: -1,
         })
     }
 
@@ -129,6 +151,7 @@ impl Toolbar {
         self.sep = theme.color("toolbar_border", self.sep);
         self.grip = theme.color("toolbar_grip", self.grip);
         self.settings_icon = theme.color("toolbar_settings_icon", self.settings_icon);
+        self.hover_bg = theme.color("toolbar_hover", self.hover_bg);
     }
 
     /// 设置工具栏位置（启动恢复持久化位置）；钳制到工作区内。
@@ -144,11 +167,8 @@ impl Toolbar {
     /// 根据状态构建单元格序列。
     /// 布局：拖动条 | 中英状态（含方案名）| 符号 | 全半角 | [简繁] | 设置图标
     fn cells(state: &ToolbarState) -> Vec<Cell> {
-        // 中英状态：模式 + 方案首字合并为单格（"中·五" / "英·五"）
         // 中英状态：方案已统一并入此格，仅显示中/英（方案切换走右键菜单）。
         let mode_text = if state.chinese_mode { "中" } else { "英" };
-        let punct = if state.chinese_punct { "，。" } else { ",." };
-        let width = if state.full_width { "全" } else { "半" };
 
         let mut cells = vec![
             Cell {
@@ -157,16 +177,18 @@ impl Toolbar {
                 dim: false,
                 action: ToolbarAction::ToggleMode,
             },
+            // 标点格：文本留空，渲染时按全/半角矢量绘制句号+逗号（不依赖字体字形定位）。
             Cell {
-                text: punct.to_string(),
+                text: String::new(),
                 highlight: false,
                 dim: false,
                 action: ToolbarAction::TogglePunct,
             },
+            // 全/半角格：文本留空，渲染时按状态画月亮 SVG（满月=全角 / 弯月=半角，对齐微软五笔）。
             Cell {
-                text: width.to_string(),
+                text: String::new(),
                 highlight: false,
-                dim: !state.full_width, // 半角为次要默认态，淡显
+                dim: false,
                 action: ToolbarAction::ToggleWidth,
             },
         ];
@@ -181,9 +203,9 @@ impl Toolbar {
             });
         }
 
-        // 设置图标（始终显示在末尾）。
+        // 设置（始终显示在末尾）：文本留空，渲染时画矢量齿轮（不依赖字体字形）。
         cells.push(Cell {
-            text: "⚙".to_string(),
+            text: String::new(),
             highlight: false,
             dim: false,
             action: ToolbarAction::OpenSettings,
@@ -203,24 +225,28 @@ impl Toolbar {
         }
     }
 
-    /// 更新状态并重绘（首次会计算位置并显示）
+    /// 更新状态并重绘（首次会计算位置并显示）。缓存状态以便 hover 变化时本地重绘。
     pub fn update(&mut self, state: &ToolbarState) {
+        self.last_state = Some(state.clone());
+        let hover = self.rendered_hover;
+        self.render(state, hover);
+    }
+
+    /// 实际渲染（hover_idx=当前悬停格下标，-1 无）。update 与 tick 均经此单点渲染。
+    fn render(&mut self, state: &ToolbarState, hover_idx: i32) {
         self.ensure_scale();
         let s = self.scale;
         let height = (Self::HEIGHT * s).ceil();
         let grip_w = (Self::GRIP_W * s).ceil();
-        let pad_x = Self::CELL_PAD_X * s;
         let min_cell = Self::MIN_CELL_W * s;
 
         let cells = Self::cells(state);
 
-        // 逐格量宽
-        let mut cell_widths = Vec::with_capacity(cells.len());
-        for c in &cells {
-            let m = self.renderer.measure_text(&c.text);
-            cell_widths.push((m.width + pad_x * 2.0).max(min_cell).ceil());
-        }
-        let total_w: f32 = grip_w + cell_widths.iter().sum::<f32>();
+        // 所有状态格统一方形（宽=高，下限 min_cell）：标点/简繁等图标与文字均居中于等宽方格，
+        // 状态切换不改变单元格宽度，工具栏整体宽度稳定不抖动。
+        let cell_w = height.max(min_cell);
+        let cell_widths: Vec<f32> = cells.iter().map(|_| cell_w).collect();
+        let total_w: f32 = grip_w + cell_w * cells.len() as f32;
         let w = total_w.ceil() as u32;
         let h = height as u32;
 
@@ -268,48 +294,74 @@ impl Toolbar {
             if i == 0 || is_settings {
                 draw_vsep(self.window.buffer_mut(), w, h, x as u32, self.sep, s);
             }
-            // 高亮底（中文模式格）
-            if c.highlight {
+            // 高亮底（激活态：中文模式格 / 简繁启用）+ 悬停底（鼠标移入，非激活格才画，避免叠加）。
+            let cell_bg = if c.highlight {
+                Some(self.hl_bg)
+            } else if (i as i32) == hover_idx {
+                Some(self.hover_bg)
+            } else {
+                None
+            };
+            if let Some(bgc) = cell_bg {
                 let inset = (4.0 * s) as u32;
                 let hx = x as u32 + inset / 2;
                 let hy = inset;
                 let hw = (cw as u32).saturating_sub(inset);
                 let hh = h.saturating_sub(inset * 2);
                 let hr = (hh as f32 * 0.3) as u32;
-                fill_rounded(
+                fill_rounded(self.window.buffer_mut(), w, h, hx, hy, hw, hh, bgc, hr);
+            }
+            if is_settings {
+                // 设置：矢量齿轮，单元格内精确居中（不依赖字体度量 → 与文字格完全对齐）。
+                // 中心孔用工具栏底色（不透明）→ 视觉镂空。
+                let gcx = x + cw * 0.5;
+                let gcy = h as f32 * 0.5;
+                let gear_r = (font_h * 0.42).max(5.0);
+                let hole = [self.bg[0], self.bg[1], self.bg[2], 255];
+                crate::view::fill_gear(
                     self.window.buffer_mut(),
                     w,
                     h,
-                    hx,
-                    hy,
-                    hw,
-                    hh,
-                    self.hl_bg,
-                    hr,
+                    gcx,
+                    gcy,
+                    gear_r,
+                    self.settings_icon,
+                    hole,
+                );
+            } else if matches!(c.action, ToolbarAction::TogglePunct | ToolbarAction::ToggleWidth) {
+                // 标点 / 全半角：按状态渲染内联 SVG 图标，主题色 tint，居中于方格。
+                let svg = match (c.action, state.chinese_punct, state.full_width) {
+                    (ToolbarAction::TogglePunct, true, _) => PUNCT_FULL_SVG,
+                    (ToolbarAction::TogglePunct, false, _) => PUNCT_HALF_SVG,
+                    (ToolbarAction::ToggleWidth, _, true) => WIDTH_FULL_SVG,
+                    _ => WIDTH_HALF_SVG,
+                };
+                let size = (h as f32).min(cw);
+                let dx = x + (cw - size) * 0.5;
+                let dy = (h as f32 - size) * 0.5;
+                crate::view::draw_svg_icon(self.window.buffer_mut(), w, h, svg, dx, dy, size, self.fg);
+            } else {
+                // 居中文字
+                let m = self.renderer.measure_text(&c.text);
+                let tx = x + (cw - m.width) * 0.5;
+                let ty = (h as f32 - font_h) * 0.5;
+                let fg = if c.highlight {
+                    self.hl_fg
+                } else if c.dim {
+                    dim_color(self.fg)
+                } else {
+                    self.fg
+                };
+                let _ = self.renderer.draw_text(
+                    self.window.buffer_mut(),
+                    w,
+                    h,
+                    tx.max(x),
+                    ty.max(0.0),
+                    &c.text,
+                    fg,
                 );
             }
-            // 居中文字
-            let m = self.renderer.measure_text(&c.text);
-            let tx = x + (cw - m.width) * 0.5;
-            let ty = (h as f32 - font_h) * 0.5;
-            let fg = if c.highlight {
-                self.hl_fg
-            } else if is_settings {
-                self.settings_icon
-            } else if c.dim {
-                dim_color(self.fg)
-            } else {
-                self.fg
-            };
-            let _ = self.renderer.draw_text(
-                self.window.buffer_mut(),
-                w,
-                h,
-                tx.max(x),
-                ty.max(0.0),
-                &c.text,
-                fg,
-            );
             x += cw;
         }
         if let Err(e) = self.window.update() {
@@ -328,6 +380,30 @@ impl Toolbar {
         };
         self.window.show(px, py);
         self.visible = true;
+        self.rendered_hover = hover_idx;
+    }
+
+    /// UI 循环每轮调用：消费鼠标处理器的悬停脏标记（由 WM_MOUSEMOVE/WM_MOUSELEAVE 事件置位），
+    /// 仅在悬停格变化时本地重绘（无需协调器往返、不轮询光标）。与菜单 dirty→tick 重绘模式一致。
+    pub fn tick(&mut self) {
+        if !self.visible {
+            return;
+        }
+        let (dirty, hov) = {
+            let m = self.mouse.borrow();
+            (m.dirty, m.hover_idx)
+        };
+        if !dirty {
+            return;
+        }
+        self.mouse.borrow_mut().dirty = false;
+        if hov != self.rendered_hover {
+            if let Some(state) = self.last_state.clone() {
+                self.render(&state, hov);
+            } else {
+                self.rendered_hover = hov;
+            }
+        }
     }
 
     pub fn show(&mut self) {
@@ -344,6 +420,7 @@ impl Toolbar {
     pub fn hide(&mut self) {
         self.window.hide();
         self.visible = false;
+        self.rendered_hover = -1; // 重新显示时按光标位置重算悬停
     }
 
     /// 工作区右下角位置（避开任务栏），右/下各留 12px 边距
@@ -405,6 +482,10 @@ pub struct ToolbarMouse {
     anchor: (i32, i32),
     /// 拖动起点：窗口屏幕坐标
     origin: (i32, i32),
+    /// 当前悬停格下标（-1=无）；由 WM_MOUSEMOVE/WM_MOUSELEAVE 事件更新
+    hover_idx: i32,
+    /// 悬停态有变更、待 Toolbar::tick 重绘
+    dirty: bool,
 }
 
 impl ToolbarMouse {
@@ -413,6 +494,32 @@ impl ToolbarMouse {
             .iter()
             .find(|(_, r)| r.contains(x, y))
             .map(|(a, _)| *a)
+    }
+
+    /// 命中格下标（-1=无）。用于悬停高亮。
+    fn hover_at(&self, x: f32, y: f32) -> i32 {
+        self.hits
+            .iter()
+            .position(|(_, r)| r.contains(x, y))
+            .map(|i| i as i32)
+            .unwrap_or(-1)
+    }
+
+    /// 注册一次性 WM_MOUSELEAVE 通知（光标移出窗口时收到），以便清除悬停。
+    fn arm_leave(&self) {
+        #[cfg(windows)]
+        unsafe {
+            use windows::Win32::UI::Input::KeyboardAndMouse::{
+                TME_LEAVE, TRACKMOUSEEVENT, TrackMouseEvent,
+            };
+            let mut t = TRACKMOUSEEVENT {
+                cbSize: std::mem::size_of::<TRACKMOUSEEVENT>() as u32,
+                dwFlags: TME_LEAVE,
+                hwndTrack: self.hwnd,
+                dwHoverTime: 0,
+            };
+            let _ = TrackMouseEvent(&mut t);
+        }
     }
 }
 
@@ -438,6 +545,10 @@ impl WindowMouse for ToolbarMouse {
                     self.anchor = (p.x, p.y);
                     self.origin = self.pos.unwrap_or((p.x, p.y));
                     self.dragging = true;
+                    if self.hover_idx != -1 {
+                        self.hover_idx = -1; // 拖动中不显示悬停
+                        self.dirty = true;
+                    }
                     unsafe {
                         SetCapture(self.hwnd);
                     }
@@ -475,6 +586,22 @@ impl WindowMouse for ToolbarMouse {
                             SWP_NOSIZE | SWP_NOACTIVATE | SWP_NOZORDER,
                         );
                     }
+                } else {
+                    // 非拖动：更新悬停格（变化置脏，由 Toolbar::tick 重绘）+ 注册移出通知。
+                    let hov = self.hover_at(cx, cy);
+                    if hov != self.hover_idx {
+                        self.hover_idx = hov;
+                        self.dirty = true;
+                    }
+                    self.arm_leave();
+                }
+                Some(LRESULT(0))
+            }
+            WM_MOUSELEAVE => {
+                // 光标移出工具栏 → 清除悬停高亮。
+                if self.hover_idx != -1 {
+                    self.hover_idx = -1;
+                    self.dirty = true;
                 }
                 Some(LRESULT(0))
             }
@@ -496,20 +623,35 @@ impl WindowMouse for ToolbarMouse {
                     self.pos = Some((x, y));
                     let _ = self.events.send(UiEvent::ToolbarMoved { x, y });
                 } else if let Some(action) = self.cell_at(cx, cy) {
-                    // 单元格：按下未拖动 → 抬起时触发切换
-                    let _ = self.events.send(UiEvent::Toolbar(action));
+                    if matches!(action, ToolbarAction::OpenSettings) {
+                        // 设置键 = 弹出功能主菜单（工具栏上方，避免遮挡）。
+                        let (mx, my) = self.pos.unwrap_or((0, 0));
+                        let _ = self.events.send(UiEvent::RequestMainMenu {
+                            x: mx,
+                            y: my,
+                            above: true,
+                        });
+                    } else {
+                        // 其它单元格：按下未拖动 → 抬起时触发切换
+                        let _ = self.events.send(UiEvent::Toolbar(action));
+                    }
                 }
                 Some(LRESULT(0))
             }
             WM_RBUTTONDOWN => {
-                // 右键工具栏 → 功能主菜单（屏幕光标定位）
-                let mut p = POINT::default();
-                unsafe {
-                    let _ = GetCursorPos(&mut p);
-                }
-                let _ = self
-                    .events
-                    .send(UiEvent::RequestMainMenu { x: p.x, y: p.y });
+                // 右键工具栏 → 功能主菜单，在工具栏上方弹出（避免遮挡工具栏）。
+                let (mx, my) = self.pos.unwrap_or_else(|| {
+                    let mut p = POINT::default();
+                    unsafe {
+                        let _ = GetCursorPos(&mut p);
+                    }
+                    (p.x, p.y)
+                });
+                let _ = self.events.send(UiEvent::RequestMainMenu {
+                    x: mx,
+                    y: my,
+                    above: true,
+                });
                 Some(LRESULT(0))
             }
             WM_SETCURSOR => {

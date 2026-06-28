@@ -873,13 +873,17 @@ impl CandidateWindow {
         // 嵌入模式：编码作为候选行首单元内联（无独立背景，与候选间留白分隔），对齐 Go buildEmbeddedPreedit。
         // 横排右留白、竖排下留白。
         if self.preedit_embedded && !self.preedit.is_empty() {
+            // 左缩进与独立条模式一致：取 preedit_bar.padding.left，避免编码贴窗口左缘。
+            let pe_left = edges_or(&v.preedit_bar.padding, [3.0, 8.0, 3.0, 8.0]).l;
             let sep = if list_vertical {
                 Edges {
+                    l: pe_left,
                     b: 6.0 * s,
                     ..Edges::default()
                 }
             } else {
                 Edges {
+                    l: pe_left,
                     r: 16.0 * s,
                     ..Edges::default()
                 }
@@ -1063,6 +1067,8 @@ impl CandidateWindow {
             let disabled = t.color("text_hint", [180, 180, 185, 255]);
             let marker_c = t.color("text_dim", [140, 140, 145, 255]);
             let accent = col(v.accent_bar.bg_color, [66, 133, 244, 255]);
+            // 文字箭头启用色：优先 footer_bar.text_color，回退 accent。
+            let arrow_on = col(v.footer_bar.text_color, accent);
             let footer_fs = node_fs(&v.footer_bar);
             let prev_on = self.page > 1;
             let next_on = self.page < self.total_pages;
@@ -1089,7 +1095,9 @@ impl CandidateWindow {
                                     .fixed_h(footer_fs)
                                     .bg_image(vi),
                             ),
-                        None => View::leaf(txt, if enabled { accent } else { disabled })
+                        // 文字箭头启用色：优先 footer_bar.text_color（清风主题设为 text_hint → 细小淡 ‹›），
+                        // 未配置则回退 accent（旧主题保持原样）。
+                        None => View::leaf(txt, if enabled { arrow_on } else { disabled })
                             .font_size(footer_fs)
                             .fixed_w(arrow_w)
                             .fixed_h(row_h)
@@ -1330,7 +1338,11 @@ impl WindowMouse for CandidateMouse {
                     });
                 } else {
                     // 空白处 → 功能主菜单
-                    let _ = self.events.send(UiEvent::RequestMainMenu { x: sx, y: sy });
+                    let _ = self.events.send(UiEvent::RequestMainMenu {
+                        x: sx,
+                        y: sy,
+                        above: false,
+                    });
                 }
                 Some(LRESULT(0))
             }

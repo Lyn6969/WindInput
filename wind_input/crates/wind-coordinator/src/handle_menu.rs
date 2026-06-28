@@ -105,7 +105,8 @@ impl Coordinator {
     /// 循环切换到下一个主题，重绘并持久化选择。
     /// 构建并显示功能主菜单（对齐 Go 统一菜单：方案/主题子菜单 + 勾选态）。
     /// x/y 为屏幕坐标；i32::MIN 表示由 UI 取光标位置。
-    pub(crate) fn show_main_menu(&self, x: i32, y: i32) {
+    /// above=true：菜单在 (x,y) 上方弹出（工具栏触发，避免遮挡工具栏）。
+    pub(crate) fn show_main_menu(&self, x: i32, y: i32, above: bool) {
         use wind_ui::manager::MenuItemSpec as M;
         let (chinese, punct, full, s2t, filter_mode, toolbar_vis) = {
             let s = self.state.lock().unwrap_or_else(|e| e.into_inner());
@@ -195,7 +196,7 @@ impl Coordinator {
         }
         let _ = self
             .ui_tx
-            .send(UiCommand::ShowCandidateMenu { items, x, y });
+            .send(UiCommand::ShowCandidateMenu { items, x, y, above });
     }
 
     pub(crate) fn is_menu_open(&self) -> bool {
@@ -274,9 +275,13 @@ impl Coordinator {
             state.menu_target_page_local = page_local;
             state.menu_target_text = word;
         }
-        let _ = self
-            .ui_tx
-            .send(UiCommand::ShowCandidateMenu { items, x, y });
+        // 候选右键菜单在光标处向下弹出（above=false）。
+        let _ = self.ui_tx.send(UiCommand::ShowCandidateMenu {
+            items,
+            x,
+            y,
+            above: false,
+        });
     }
 
     /// 读取当前光标所在显示器对应的工具栏位置。

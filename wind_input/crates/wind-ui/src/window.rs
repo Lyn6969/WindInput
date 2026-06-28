@@ -261,6 +261,7 @@ mod platform {
                     | WM_LBUTTONUP
                     | WM_RBUTTONDOWN
                     | WM_MOUSEMOVE
+                    | crate::sys::WM_MOUSELEAVE
                     | WM_MOUSEWHEEL
                     | WM_SETCURSOR
             ) {

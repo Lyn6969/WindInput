@@ -1649,7 +1649,7 @@ impl Coordinator {
             UiEvent::RequestCandidateMenu { page_local, x, y } => {
                 self.show_candidate_menu(page_local, x, y)
             }
-            UiEvent::RequestMainMenu { x, y } => self.show_main_menu(x, y),
+            UiEvent::RequestMainMenu { x, y, above } => self.show_main_menu(x, y, above),
             UiEvent::MenuAction(kind) => self.menu_action(kind),
             UiEvent::MenuClose => self.menu_close(),
         }
@@ -2120,7 +2120,7 @@ impl MessageHandler for Coordinator {
     }
 
     fn handle_show_context_menu(&self, x: i32, y: i32) {
-        self.show_main_menu(x, y);
+        self.show_main_menu(x, y, false);
     }
 
     fn handle_english_stats(&self, chars: u32, digits: u32, puncts: u32, spaces: u32) {

@@ -11,7 +11,7 @@ use crate::text::dwrite::TextRenderer;
 use std::cell::RefCell;
 use tiny_skia::{
     Color, FillRule, FilterQuality, GradientStop, LinearGradient, Paint, PathBuilder, Pattern,
-    PixmapMut, Point, RadialGradient, SpreadMode, Transform,
+    PixmapMut, PixmapPaint, Point, RadialGradient, SpreadMode, Transform,
 };
 use wind_theme::schema::Dim;
 
@@ -850,6 +850,91 @@ pub fn fill_circle(
         &path,
         &paint,
         FillRule::Winding,
+        Transform::identity(),
+        None,
+    );
+}
+
+/// 绘制齿轮图标（工具栏设置按钮）：8 齿平顶 cog 多边形（`color` 齿轮体）+ 中心孔（`hole` 色）。
+/// 纯矢量绘制，不依赖字体度量 → 在单元格内精确居中、与文字格对齐。
+/// `(cx,cy)` 中心，`r` 外径（齿尖半径）。color/hole 为 [R,G,B,A]，缓冲预乘 BGRA（同 fill_rounded 换 R/B）。
+pub fn fill_gear(
+    buf: &mut [u8],
+    buf_w: u32,
+    buf_h: u32,
+    cx: f32,
+    cy: f32,
+    r: f32,
+    color: [u8; 4],
+    hole: [u8; 4],
+) {
+    if color[3] == 0 || r <= 0.0 || buf_w == 0 || buf_h == 0 {
+        return;
+    }
+    let teeth = 8usize;
+    let r_in = r * 0.72; // 齿根半径
+    let seg = std::f32::consts::TAU / teeth as f32;
+    let tip = seg * 0.28; // 齿尖半角（平顶齿）
+    let mut pb = PathBuilder::new();
+    for i in 0..teeth {
+        let c = i as f32 * seg;
+        // 每齿 4 顶点：根-起 → 尖-起 → 尖-止 → 根-止，形成平顶梯形齿。
+        let verts = [
+            (r_in, c - seg * 0.5),
+            (r, c - tip),
+            (r, c + tip),
+            (r_in, c + seg * 0.5),
+        ];
+        for (j, (rad, ang)) in verts.iter().enumerate() {
+            let x = cx + rad * ang.cos();
+            let y = cy + rad * ang.sin();
+            if i == 0 && j == 0 {
+                pb.move_to(x, y);
+            } else {
+                pb.line_to(x, y);
+            }
+        }
+    }
+    pb.close();
+    if let Some(path) = pb.finish() {
+        if let Some(mut pm) = PixmapMut::from_bytes(buf, buf_w, buf_h) {
+            let mut paint = Paint::default();
+            paint.anti_alias = true;
+            paint.set_color(Color::from_rgba8(color[2], color[1], color[0], color[3]));
+            pm.fill_path(&path, &paint, FillRule::Winding, Transform::identity(), None);
+        }
+    }
+    // 中心孔：在齿轮体上叠画一个小圆（hole 色，通常取工具栏底色 → 视觉镂空）。
+    fill_circle(buf, buf_w, buf_h, cx, cy, r * 0.34, hole);
+}
+
+/// 绘制内联 SVG 图标到 BGRA 缓冲（工具栏图标用）：按 `color` 单色 tint（SVG 仅作 alpha 蒙版），
+/// 栅格化到 `size`×`size` 后以 src-over 合成到 `(dx,dy)`（左上角）。不依赖字体度量 → 位置精确、形状灵活。
+pub fn draw_svg_icon(
+    buf: &mut [u8],
+    buf_w: u32,
+    buf_h: u32,
+    svg: &str,
+    dx: f32,
+    dy: f32,
+    size: f32,
+    color: [u8; 4],
+) {
+    if color[3] == 0 {
+        return;
+    }
+    let s = size.round().max(1.0) as u32;
+    let Some(icon) = crate::image_cache::rasterize_svg_str_tinted(svg, s, s, color) else {
+        return;
+    };
+    let Some(mut pm) = PixmapMut::from_bytes(buf, buf_w, buf_h) else {
+        return;
+    };
+    pm.draw_pixmap(
+        dx.round() as i32,
+        dy.round() as i32,
+        icon.as_ref(),
+        &PixmapPaint::default(),
         Transform::identity(),
         None,
     );

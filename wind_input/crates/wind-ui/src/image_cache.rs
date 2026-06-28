@@ -45,6 +45,31 @@ fn rasterize_svg(path: &str, w: u32, h: u32) -> Option<Vec<u8>> {
     Some(pm.data().to_vec())
 }
 
+/// 栅格化**内联 SVG 字符串** → tint 后的 BGRA 预乘 Pixmap（工具栏图标用，不走文件缓存）。
+/// SVG 仅作 alpha 覆盖蒙版，用 `tint` 单色填充 → 图标颜色随主题。w/h 为目标像素（方形图标传等值）。
+pub fn rasterize_svg_str_tinted(svg: &str, w: u32, h: u32, tint: [u8; 4]) -> Option<Pixmap> {
+    if w == 0 || h == 0 {
+        return None;
+    }
+    let tree = resvg::usvg::Tree::from_data(svg.as_bytes(), &resvg::usvg::Options::default()).ok()?;
+    let size = tree.size();
+    let mut rpm = resvg::tiny_skia::Pixmap::new(w, h)?;
+    let sx = w as f32 / size.width().max(1.0);
+    let sy = h as f32 / size.height().max(1.0);
+    resvg::render(
+        &tree,
+        resvg::tiny_skia::Transform::from_scale(sx, sy),
+        &mut rpm.as_mut(),
+    );
+    let rgba = rpm.data();
+    let mut pm = Pixmap::new(w, h)?;
+    for (i, p) in pm.pixels_mut().iter_mut().enumerate() {
+        let b = i * 4;
+        *p = compose(rgba[b], rgba[b + 1], rgba[b + 2], rgba[b + 3], tint, true);
+    }
+    Some(pm)
+}
+
 /// 填充模式码：0=stretch（默认）1=nine_slice 2=tile 3=center。
 pub fn mode_code(mode: &str) -> u8 {
     match mode {

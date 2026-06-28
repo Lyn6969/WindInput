@@ -411,14 +411,14 @@ impl PopupMenu {
     }
 
     /// 显示菜单（顶层 items）于屏幕坐标 (x,y)。i32::MIN → 取光标位。
-    pub fn show(&mut self, items: Vec<MenuItemSpec>, x: i32, y: i32) {
+    pub fn show(&mut self, items: Vec<MenuItemSpec>, x: i32, y: i32, above: bool) {
         if items.is_empty() {
             return;
         }
         if self.ensure_windows(1).is_err() {
             return;
         }
-        let (ax, ay) = if x == i32::MIN || y == i32::MIN {
+        let (ax, mut ay) = if x == i32::MIN || y == i32::MIN {
             let mut p = POINT::default();
             unsafe {
                 let _ = GetCursorPos(&mut p);
@@ -431,6 +431,10 @@ impl PopupMenu {
         self.ensure_scale(ax, ay);
         // 先测量根面板尺寸以钳制锚点（选中态不影响尺寸，传无选中即可）。
         let (_root, w, h, _hits) = self.build_view(&items, NONE_SEL);
+        // above：菜单底边对齐 (x,y) 向上展开（工具栏菜单用，避免遮挡工具栏）。
+        if above {
+            ay -= h as i32;
+        }
         self.anchor = clamp_to_work_area(ax, ay, w, h);
         {
             let mut st = self.state.borrow_mut();
