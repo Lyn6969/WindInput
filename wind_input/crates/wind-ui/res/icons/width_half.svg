@@ -1,6 +1,10 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24">
-  <!-- 半角：修长弯月（外圆 r6.5 减去右偏同半径圆，得月牙），开口朝左上。 -->
-  <!-- 基形开口朝右：外弧=外圆左缘，内弧=右偏圆左缘（凹口）；再 rotate -135° 把开口转到左上。 -->
-  <!-- 调月牙粗细：内圆右偏量（horn 的 x 越大越细）；调大小：r6.5；调开口方向：rotate 角度。 -->
-  <path fill="#000" transform="rotate(-135 12 12)" d="M13.75 5.74 A6.5 6.5 0 1 0 13.75 18.26 A6.5 6.5 0 0 1 13.75 5.74 Z"/>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" width="200" height="200">
+  <defs>
+    <mask id="moon-mask">
+      <rect width="24" height="24" fill="white" />
+      <circle cx="16.5" cy="12" r="6.5" fill="black" />
+    </mask>
+  </defs>
+
+  <circle cx="12" cy="12" r="6.5" fill="#000" mask="url(#moon-mask)" transform="rotate(-135 12 12)" />
 </svg>
