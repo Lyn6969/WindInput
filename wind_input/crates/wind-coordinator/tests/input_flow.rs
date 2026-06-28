@@ -853,6 +853,87 @@ fn test_semicolon_still_selects_second_candidate_with_candidates() {
     }
 }
 
+// ───── 模式键空缓冲回车上屏触发符号本身（仅空缓冲场景，补输被模式键占用的符号）─────
+
+#[test]
+fn test_quick_input_empty_enter_outputs_trigger_symbol() {
+    if !has_schemas() {
+        return;
+    }
+    let coord = Coordinator::new_headless(config_with("wubi86"), Some(&data_dir()));
+    // 分号进入快捷输入（空缓冲），随即按回车 → 原样上屏触发符号 ;（不按中英标点转换）
+    let act = coord.handle_key_event(&key_event(0xBA, EVENT_KEY_DOWN)); // ;
+    assert_eq!(action_text(&act).unwrap(), ";", "分号应进入快捷输入");
+    match coord.handle_key_event(&key_event(0x0D, EVENT_KEY_DOWN)) {
+        KeyAction::InsertText { text, .. } => {
+            assert_eq!(text, ";", "空缓冲回车应原样上屏触发符号 ;（非中文 ；）");
+        }
+        other => panic!("空缓冲回车应上屏触发符号，实际: {:?}", other),
+    }
+    // 退出后五笔输入恢复正常
+    let act = press_letter(&coord, 'a');
+    assert_eq!(action_text(&act).unwrap(), "a", "回车上屏后应已退出快捷输入");
+}
+
+#[test]
+fn test_temp_pinyin_empty_enter_outputs_trigger_symbol() {
+    if !has_schemas() {
+        return;
+    }
+    let coord = Coordinator::new_headless(config_with("wubi86"), Some(&data_dir()));
+    // 反引号进入临时拼音（空缓冲），随即按回车 → 原样上屏触发符号 `
+    let act = coord.handle_key_event(&key_event(0xC0, EVENT_KEY_DOWN)); // `
+    assert_eq!(action_text(&act).unwrap(), "`", "反引号应进入临时拼音");
+    match coord.handle_key_event(&key_event(0x0D, EVENT_KEY_DOWN)) {
+        KeyAction::InsertText { text, .. } => {
+            assert_eq!(text, "`", "空缓冲回车应原样上屏触发符号 `");
+        }
+        other => panic!("空缓冲回车应上屏触发符号，实际: {:?}", other),
+    }
+    let act = press_letter(&coord, 'a');
+    assert_eq!(action_text(&act).unwrap(), "a", "回车上屏后应已退出临时拼音");
+}
+
+#[test]
+fn test_quick_input_empty_enter_clear_behavior_discards() {
+    if !has_schemas() {
+        return;
+    }
+    // enter_behavior=clear：空缓冲回车放弃退出，不上屏任何符号（严格遵循配置）
+    let mut cfg = config_with("wubi86");
+    cfg.input.enter_behavior = "clear".into();
+    let coord = Coordinator::new_headless(cfg, Some(&data_dir()));
+    coord.handle_key_event(&key_event(0xBA, EVENT_KEY_DOWN)); // ; 进入
+    match coord.handle_key_event(&key_event(0x0D, EVENT_KEY_DOWN)) {
+        KeyAction::ClearComposition => {}
+        other => panic!("clear 模式空缓冲回车应清空退出，实际: {:?}", other),
+    }
+}
+
+#[test]
+fn test_mix_letter_trigger_empty_enter_no_symbol() {
+    if !has_schemas() {
+        return;
+    }
+    // 字母触发键无 prefix 符号：空缓冲回车不应误输出字母，安全清空退出。
+    let mut cfg = config_with("wubi86");
+    cfg.schema.mix_modes = vec![wind_config::config::MixModeConfig {
+        id: "mix_z".into(),
+        name: "测试".into(),
+        short_name: "测".into(),
+        trigger_keys: vec!["z".into()],
+        members: vec!["quick_input".into()],
+    }];
+    let coord = Coordinator::new_headless(cfg, Some(&data_dir()));
+    // 按 z(0x5A) 进入 mix（字母触发键，mix_prefix 为空）
+    coord.handle_key_event(&key_event(0x5A, EVENT_KEY_DOWN));
+    // 空缓冲回车：prefix 为空 → 走清空退出（而非上屏 z）。若误入五笔，则会上屏/提交 z 而非清空。
+    match coord.handle_key_event(&key_event(0x0D, EVENT_KEY_DOWN)) {
+        KeyAction::ClearComposition => {}
+        other => panic!("字母触发键空缓冲回车应清空退出（不输出字母），实际: {:?}", other),
+    }
+}
+
 #[test]
 fn test_phrase_date_expansion() {
     if !has_schemas() {
