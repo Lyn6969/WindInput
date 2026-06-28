@@ -16,6 +16,21 @@ impl Coordinator {
     /// 重启服务进程：隐藏 UI 后向 main 发重启信号（main 释放单例并重拉自身）。
     pub(crate) fn restart_service(&self) {
         info!("Restart service requested from menu");
+        // 若有活跃 composition（拼音输入中/独占模式），先清空内部状态并通知 TSF 清除 composition，
+        // 避免服务退出后 TSF 持有孤儿 composition 导致残留。
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        let has_composition = !state.input_buffer.is_empty()
+            || !state.preedit.is_empty()
+            || !state.committed_text.is_empty()
+            || state.active.is_some();
+        if has_composition {
+            self.reset_exclusive_modes(&mut state);
+        }
+        drop(state);
+        if has_composition {
+            let encoded = wind_ipc::codec::encode_clear_composition();
+            self.push_server.push_to_active(&encoded);
+        }
         self.notify_ui_hide();
         let _ = self.ui_tx.send(UiCommand::HideToolbar);
         crate::request_restart();
