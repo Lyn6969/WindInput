@@ -455,12 +455,20 @@ mod tests {
     use super::*;
     use crate::schema::Dim;
 
-    fn themes_dir() -> std::path::PathBuf {
+    fn data_dir() -> std::path::PathBuf {
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../../data/themes")
+    }
+
+    fn testdata_dir() -> std::path::PathBuf {
         Path::new(env!("CARGO_MANIFEST_DIR")).join("testdata/themes")
     }
 
     fn load(name: &str, is_dark: bool) -> Resolved {
-        load_resolved_dirs(&[themes_dir()], name, is_dark).unwrap()
+        load_resolved_dirs(&[data_dir()], name, is_dark).unwrap()
+    }
+
+    fn load_jidian(is_dark: bool) -> Resolved {
+        load_resolved_dirs(&[testdata_dir(), data_dir()], "jidian-classic", is_dark).unwrap()
     }
 
     #[test]
@@ -486,7 +494,7 @@ mod tests {
 
     #[test]
     fn test_jidian_classic_rvnode() {
-        let r = load("jidian-classic", false);
+        let r = load_jidian(false);
         // window 九宫格背景图
         let bg = r.views.window.bg_image.as_ref().expect("window bg image");
         assert_eq!(bg.reference, "panel");
@@ -512,7 +520,7 @@ mod tests {
         assert!(panel.ends_with("panel.png"), "got {panel}");
         assert!(Path::new(panel).is_absolute(), "应为绝对路径: {panel}");
         // 暗色选 dark 变体
-        let d = load("jidian-classic", true);
+        let d = load_jidian(true);
         assert!(
             d.resources
                 .get("panel")
@@ -527,13 +535,12 @@ mod tests {
 
     #[test]
     fn test_read_meta_and_multidir_base() {
-        let dir = themes_dir();
-        let dirs = vec![dir.clone()];
+        let dirs = vec![testdata_dir(), data_dir()];
         // 显示名 / order 取自主题自身 meta（不 base 合并）。
         let m = crate::theme::read_meta(&dirs, "jidian-classic").expect("jidian meta");
         assert_eq!(m.name, "极点经典(位图)");
         assert_eq!(m.order, 2);
-        let dm = crate::theme::read_meta(&dirs, "default").expect("default meta");
+        let dm = crate::theme::read_meta(&[data_dir()], "default").expect("default meta");
         assert_eq!(dm.name, "清风·蓝");
         // 多目录加载：jidian `base: _base` 跨目录解析正常（resources/views 出来）。
         let r = load_resolved_dirs(&dirs, "jidian-classic", false).expect("resolve jidian");
@@ -544,7 +551,7 @@ mod tests {
         assert!(r.resources.contains_key("panel"));
 
         // 资产链：default 经 _qingfeng → _base，链中应含 _base 目录（_base 的 chevron.svg 可被继承解析）。
-        let d = load_resolved_dirs(&dirs, "default", false).expect("resolve default");
+        let d = load_resolved_dirs(&[data_dir()], "default", false).expect("resolve default");
         assert!(
             d.asset_dirs.iter().any(|p| p.ends_with("_base")),
             "default 资产链应含 _base 目录"

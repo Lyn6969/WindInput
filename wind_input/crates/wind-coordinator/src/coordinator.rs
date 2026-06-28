@@ -460,8 +460,8 @@ pub struct Coordinator {
     pub(crate) themes_dir: Option<std::path::PathBuf>,
     /// 当前主题名
     pub(crate) theme_name: Mutex<String>,
-    /// 主题暗色模式
-    pub(crate) theme_dark: Mutex<bool>,
+    /// 主题颜色风格：0=跟随系统 1=亮色 2=暗色
+    pub(crate) theme_style: Mutex<u8>,
     /// 命令栏（cmdbar）服务束（ime/config/dict 等动作后端），构造后由 init_cmdbar 装配。
     pub(crate) cmdbar_services: std::sync::OnceLock<wind_cmdbar::Services>,
     /// 自身 Weak 引用：$CC 命令在独立线程异步执行（避免持 state 锁回调自锁方法致死锁）。
@@ -744,7 +744,11 @@ impl Coordinator {
             "default".to_string()
         };
         // 初始明暗：config.ui.theme.style == "dark"(否则亮/跟随系统按亮处理)。修启动不应用风格。
-        let theme_dark_init = config.ui.theme.style.eq_ignore_ascii_case("dark");
+        let theme_style_init: u8 = match config.ui.theme.style.to_lowercase().as_str() {
+            "light" => 1,
+            "dark" => 2,
+            _ => 0,
+        };
 
         // 标点转换器：注入自定义映射（四状态）。
         let mut punct_conv = PunctuationConverter::new();
@@ -837,7 +841,7 @@ impl Coordinator {
             active_compat: Mutex::new((0, false)),
             themes_dir,
             theme_name: Mutex::new(initial_theme),
-            theme_dark: Mutex::new(theme_dark_init),
+            theme_style: Mutex::new(theme_style_init),
             cmdbar_services: std::sync::OnceLock::new(),
             self_weak: std::sync::OnceLock::new(),
             recent_commits: Mutex::new(std::collections::VecDeque::new()),
@@ -934,8 +938,12 @@ impl Coordinator {
                         *self.theme_name.lock().unwrap_or_else(|e| e.into_inner()) =
                             name.to_string();
                     }
-                    *self.theme_dark.lock().unwrap_or_else(|e| e.into_inner()) =
-                        new_cfg.ui.theme.style.eq_ignore_ascii_case("dark");
+                    *self.theme_style.lock().unwrap_or_else(|e| e.into_inner()) =
+                        match new_cfg.ui.theme.style.to_lowercase().as_str() {
+                            "light" => 1,
+                            "dark" => 2,
+                            _ => 0,
+                        };
                 }
                 // 同步工具栏显隐:设置页改 ui.toolbar.visible 后运行时态跟随,再刷新工具栏。
                 {

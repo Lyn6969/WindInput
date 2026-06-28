@@ -28,7 +28,7 @@ impl Coordinator {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .clone();
-        let dark = *self.theme_dark.lock().unwrap_or_else(|e| e.into_inner());
+        let dark = *self.theme_style.lock().unwrap_or_else(|e| e.into_inner()) == 2;
         self.push_theme(&name, dark);
         // 不再弹「已重载」气泡：热重载统一由 reload_user_config 的 toast 通知，避免重复。
     }

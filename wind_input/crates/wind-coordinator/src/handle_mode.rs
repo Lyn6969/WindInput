@@ -245,7 +245,7 @@ impl Coordinator {
         }
         let (id, name) = list[index].clone();
         *self.theme_name.lock().unwrap_or_else(|e| e.into_inner()) = id.clone();
-        let dark = *self.theme_dark.lock().unwrap_or_else(|e| e.into_inner());
+        let dark = *self.theme_style.lock().unwrap_or_else(|e| e.into_inner()) == 2;
         self.push_theme(&id, dark);
         self.persist_theme(&id);
         self.show_tip(&format!("主题: {}", name));
@@ -254,7 +254,7 @@ impl Coordinator {
     /// 设置主题明暗（0 跟随/1 亮/2 暗），用当前主题重解析,并持久化到 config.ui.theme.style。
     pub(crate) fn set_theme_style(&self, style: u8) {
         let dark = style == 2;
-        *self.theme_dark.lock().unwrap_or_else(|e| e.into_inner()) = dark;
+        *self.theme_style.lock().unwrap_or_else(|e| e.into_inner()) = style;
         let style_str = match style {
             1 => "light",
             2 => "dark",
@@ -267,7 +267,12 @@ impl Coordinator {
             .unwrap_or_else(|e| e.into_inner())
             .clone();
         self.push_theme(&name, dark);
-        self.show_tip(if dark { "暗色" } else { "亮色" });
+        let tip = match style {
+            1 => "亮色",
+            2 => "暗色",
+            _ => "跟随系统",
+        };
+        self.show_tip(tip);
     }
 
     /// 持久化主题选择。config.ui.theme.name 为单一源（设置页/右键统一，reload 据此应用）。
@@ -303,41 +308,75 @@ impl Coordinator {
         }
     }
 
-    /// 列出可用主题：(id, 显示名)。扫用户+安装目录，含 theme.toml、非 `_` 前缀；
-    /// 显示名取 meta.name（缺则用 id），按 (meta.order, id) 排序。
+    /// 列出可用主题：(id, 显示名)。程序目录主题优先（按 order/id 排序），
+    /// 用户目录独有主题排后（忽略 order，按 id 排序）。
     pub(crate) fn list_themes(&self) -> Vec<(String, String)> {
-        let dirs = self.theme_search_dirs();
-        let mut seen = std::collections::HashSet::new();
-        let mut rows: Vec<(String, String, i32)> = Vec::new();
-        for dir in &dirs {
-            let Ok(rd) = std::fs::read_dir(dir) else {
-                continue;
-            };
-            for e in rd.filter_map(|e| e.ok()) {
-                if !e.path().is_dir() {
-                    continue;
+        let all_dirs = self.theme_search_dirs();
+        let user_dir = Config::user_config_dir().map(|d| d.join("themes"));
+
+        // 扫描程序目录主题，按 (order, id) 排序
+        let mut prog_rows: Vec<(String, String, i32)> = Vec::new();
+        if let Some(dir) = &self.themes_dir {
+            if let Ok(rd) = std::fs::read_dir(dir) {
+                for e in rd.filter_map(|e| e.ok()) {
+                    if !e.path().is_dir() {
+                        continue;
+                    }
+                    let Ok(id) = e.file_name().into_string() else {
+                        continue;
+                    };
+                    if id.starts_with('_') || !dir.join(&id).join("theme.toml").exists() {
+                        continue;
+                    }
+                    let meta = wind_theme::read_meta(&all_dirs, &id);
+                    let name = meta
+                        .as_ref()
+                        .map(|m| m.name.clone())
+                        .filter(|s| !s.is_empty())
+                        .unwrap_or_else(|| id.clone());
+                    let order = meta.as_ref().map(|m| m.order).unwrap_or(0);
+                    prog_rows.push((id, name, order));
                 }
-                let Ok(id) = e.file_name().into_string() else {
-                    continue;
-                };
-                if id.starts_with('_') || !dir.join(&id).join("theme.toml").exists() {
-                    continue;
-                }
-                if !seen.insert(id.clone()) {
-                    continue;
-                }
-                let meta = wind_theme::read_meta(&dirs, &id);
-                let name = meta
-                    .as_ref()
-                    .map(|m| m.name.clone())
-                    .filter(|s| !s.is_empty())
-                    .unwrap_or_else(|| id.clone());
-                let order = meta.as_ref().map(|m| m.order).unwrap_or(0);
-                rows.push((id, name, order));
             }
+            prog_rows.sort_by(|a, b| a.2.cmp(&b.2).then_with(|| a.0.cmp(&b.0)));
         }
-        rows.sort_by(|a, b| a.2.cmp(&b.2).then_with(|| a.0.cmp(&b.0)));
-        rows.into_iter().map(|(id, name, _)| (id, name)).collect()
+
+        let prog_ids: std::collections::HashSet<String> =
+            prog_rows.iter().map(|(id, _, _)| id.clone()).collect();
+
+        // 扫描用户目录独有主题（与程序目录不重叠），按 id 排序，忽略 order
+        let mut user_rows: Vec<(String, String)> = Vec::new();
+        if let Some(udir) = &user_dir {
+            if let Ok(rd) = std::fs::read_dir(udir) {
+                for e in rd.filter_map(|e| e.ok()) {
+                    if !e.path().is_dir() {
+                        continue;
+                    }
+                    let Ok(id) = e.file_name().into_string() else {
+                        continue;
+                    };
+                    if id.starts_with('_') || !udir.join(&id).join("theme.toml").exists() {
+                        continue;
+                    }
+                    if prog_ids.contains(&id) {
+                        continue;
+                    }
+                    let meta = wind_theme::read_meta(&all_dirs, &id);
+                    let name = meta
+                        .as_ref()
+                        .map(|m| m.name.clone())
+                        .filter(|s| !s.is_empty())
+                        .unwrap_or_else(|| id.clone());
+                    user_rows.push((id, name));
+                }
+            }
+            user_rows.sort_by(|a, b| a.0.cmp(&b.0));
+        }
+
+        let mut result: Vec<(String, String)> =
+            prog_rows.into_iter().map(|(id, name, _)| (id, name)).collect();
+        result.extend(user_rows);
+        result
     }
 
     /// 方案显示名（友好名优先，未知回退 id）

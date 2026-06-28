@@ -145,7 +145,7 @@ impl Coordinator {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .clone();
-        let dark = *self.theme_dark.lock().unwrap_or_else(|e| e.into_inner());
+        let style = *self.theme_style.lock().unwrap_or_else(|e| e.into_inner());
         let mut theme_children = Vec::new();
         for (i, (id, name)) in themes.iter().enumerate() {
             theme_children.push(M::leaf(
@@ -158,8 +158,9 @@ impl Coordinator {
         if !theme_children.is_empty() {
             theme_children.push(M::separator());
         }
-        theme_children.push(M::leaf("亮色", cmd(MenuCmd::ThemeStyle(1)), true, !dark));
-        theme_children.push(M::leaf("暗色", cmd(MenuCmd::ThemeStyle(2)), true, dark));
+        theme_children.push(M::leaf("跟随系统", cmd(MenuCmd::ThemeStyle(0)), true, style == 0));
+        theme_children.push(M::leaf("亮色", cmd(MenuCmd::ThemeStyle(1)), true, style == 1));
+        theme_children.push(M::leaf("暗色", cmd(MenuCmd::ThemeStyle(2)), true, style == 2));
 
         // 检索范围子菜单：过滤模式单选
         let filter_children: Vec<_> = FILTER_MODES

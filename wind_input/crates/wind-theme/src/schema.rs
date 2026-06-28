@@ -421,10 +421,14 @@ pub struct Theme {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::theme::load_typed;
+    use crate::theme::{load_typed, load_typed_dirs};
     use std::path::Path;
 
-    fn themes_dir() -> std::path::PathBuf {
+    fn data_dir() -> std::path::PathBuf {
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../../data/themes")
+    }
+
+    fn testdata_dir() -> std::path::PathBuf {
         Path::new(env!("CARGO_MANIFEST_DIR")).join("testdata/themes")
     }
 
@@ -465,7 +469,7 @@ mod tests {
 
     #[test]
     fn test_all_builtin_themes_typecheck() {
-        let dir = themes_dir();
+        let dir = data_dir();
         for name in ["_base", "default", "msime"] {
             let t = load_typed(&dir, name).unwrap_or_else(|e| panic!("load {name}: {e}"));
             assert!(t.views.is_some(), "{name} 应有 views");
@@ -475,7 +479,7 @@ mod tests {
 
     #[test]
     fn test_jidian_classic_rich_features() {
-        let t = load_typed(&themes_dir(), "jidian-classic").expect("load jidian-classic");
+        let t = load_typed_dirs(&[testdata_dir(), data_dir()], "jidian-classic").expect("load jidian-classic");
         // base 继承 _base → colors 合并进来
         assert!(t.colors.is_some(), "应从 _base 继承 colors");
         // resources：panel/sel 双变体 + mark 标量

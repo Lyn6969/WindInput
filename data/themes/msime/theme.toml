@@ -7,7 +7,7 @@ base = "_base"
 name = "微软风格"
 version = "3.0"
 author = "清风输入法"
-order = 1
+order = 10
 
 [behavior]
 always_show_pager = false

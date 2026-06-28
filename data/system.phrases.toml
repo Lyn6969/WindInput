@@ -411,12 +411,6 @@ weight = 2000
 position = 1
 
 [[phrases]]
-code = 'coss'
-text = '$CC("设置(Web)", setting.web(""))'
-weight = 2000
-position = 2
-
-[[phrases]]
 code = 'cost'
 text = '$CC("切简繁", ime.toggle("s2t"))'
 weight = 2000
