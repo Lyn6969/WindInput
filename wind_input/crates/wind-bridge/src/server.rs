@@ -5,7 +5,7 @@
 
 use crate::handler::*;
 use std::sync::Arc;
-use tracing::{debug, error, info, warn};
+use tracing::{debug, error, info, trace, warn};
 
 /// Bridge 服务器配置
 pub struct BridgeConfig {
@@ -143,7 +143,7 @@ fn run_pipe_server(pipe_name: &str, handler: Arc<dyn MessageHandler>, timeout_ms
             }
         }
 
-        info!("Client connected to bridge pipe");
+        debug!("Client connected to bridge pipe");
 
         // 为每个连接启动独立线程
         let handler = handler.clone();
@@ -181,13 +181,10 @@ fn handle_client(pipe: PipeHandle, handler: Arc<dyn MessageHandler>, _timeout_ms
             if last_err == windows::Win32::Foundation::ERROR_MORE_DATA
                 && bytes_read as usize == IpcHeader::SIZE
             {
-                // 读到了完整的 header，继续处理（payload 会在后续读取）
-                info!(
-                    "ReadFile returned ERROR_MORE_DATA but got full header ({} bytes), continuing",
-                    bytes_read
-                );
+                // 读到了完整的 header，继续处理（payload 会在后续读取）。
+                // 这是消息模式下的预期行为，不记日志。
             } else {
-                info!(
+                debug!(
                     "Client disconnected from bridge pipe (read failed, bytes_read={}, last_err={:?})",
                     bytes_read, last_err
                 );
@@ -196,7 +193,7 @@ fn handle_client(pipe: PipeHandle, handler: Arc<dyn MessageHandler>, _timeout_ms
         }
 
         if bytes_read as usize != IpcHeader::SIZE {
-            info!(
+            debug!(
                 "Client disconnected from bridge pipe (incomplete header: {} bytes)",
                 bytes_read
             );
@@ -213,7 +210,7 @@ fn handle_client(pipe: PipeHandle, handler: Arc<dyn MessageHandler>, _timeout_ms
 
         let cmd = header.command;
         let len = header.length;
-        info!(
+        trace!(
             "Received command: 0x{:04X}, payload: {} bytes, async: {}",
             cmd,
             len,
@@ -239,7 +236,7 @@ fn handle_client(pipe: PipeHandle, handler: Arc<dyn MessageHandler>, _timeout_ms
                 let last_err = unsafe { windows::Win32::Foundation::GetLastError() };
                 if last_err == windows::Win32::Foundation::ERROR_MORE_DATA {
                     // ERROR_MORE_DATA 表示消息比请求的字节数多，但已读到请求的字节数
-                    info!(
+                    trace!(
                         "ReadFile payload: ERROR_MORE_DATA but got {} bytes (requested {})",
                         bytes_read, payload_len
                     );
@@ -268,7 +265,7 @@ fn handle_client(pipe: PipeHandle, handler: Arc<dyn MessageHandler>, _timeout_ms
 
         // 写入响应（异步命令返回 None，不写入）
         if let Some(resp) = response {
-            info!(
+            trace!(
                 "Sending response: {} bytes for cmd 0x{:04X}",
                 resp.len(),
                 cmd
@@ -279,9 +276,6 @@ fn handle_client(pipe: PipeHandle, handler: Arc<dyn MessageHandler>, _timeout_ms
                 warn!("Failed to write response for cmd 0x{:04X}", cmd);
                 break;
             }
-            info!("Response sent: {} bytes written", bytes_written);
-        } else {
-            info!("No response for cmd 0x{:04X} (async)", cmd);
         }
 
         // FOCUS_GAINED 重型段延后到响应写出之后（对齐 Go runActivationHandlerAndPush）：

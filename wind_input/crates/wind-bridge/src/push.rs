@@ -209,7 +209,7 @@ fn run_push_pipe_server(pipe_name: &str, clients: Arc<Mutex<Vec<PushClient>>>) {
             }
         }
 
-        info!("Push client connected to push pipe");
+        debug!("Push client connected to push pipe");
 
         // 与 Go 版对齐：先发送 CMD_SERVICE_READY，再读取 token。
         // Go 的 push pipe 在 ConnectNamedPipe 后立即写 SERVICE_READY，
@@ -258,7 +258,7 @@ fn run_push_pipe_server(pipe_name: &str, clients: Arc<Mutex<Vec<PushClient>>>) {
         }
 
         let token = u64::from_le_bytes(token_buf);
-        info!("Push client token: 0x{:016X}", token);
+        debug!("Push client token: 0x{:016X}", token);
 
         // 创建发送通道
         let (tx, rx) = std::sync::mpsc::channel::<Vec<u8>>();
