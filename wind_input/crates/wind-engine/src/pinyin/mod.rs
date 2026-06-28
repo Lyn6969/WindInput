@@ -292,6 +292,9 @@ impl Engine for PinyinEngine {
             if text.is_empty() || cands.iter().any(|c| c.text == text) {
                 return;
             }
+            // 子短语候选：code 是输入的真前缀（比输入短，如 baoan 的「报」(bao)）。
+            // Viterbi 整句走 insert(0) 不经此闭包，故无需 weight 启发式即可排除整句。
+            let is_partial = !is_prefix && code.len() < input.len() && input.starts_with(&code);
             cands.push(Candidate {
                 text,
                 code,
@@ -300,6 +303,7 @@ impl Engine for PinyinEngine {
                 source: CandidateSource::Pinyin,
                 is_fuzzy,
                 is_prefix,
+                is_partial,
                 ..Default::default()
             });
         };
@@ -457,18 +461,25 @@ impl Engine for PinyinEngine {
                     continue;
                 }
                 c.source = CandidateSource::Pinyin;
+                // 与 push_unique 一致：store 层的前缀子码命中也是子短语，降到完整匹配之后。
+                c.is_partial =
+                    !c.is_prefix && c.code.len() < input.len() && input.starts_with(&c.code);
                 candidates.push(c);
             }
         }
 
-        // 引擎内部排序（层级对齐 Go：Exact >> Partial/Prefix >> Fuzzy）：
-        // ① 非模糊优先于模糊（is_fuzzy=false 在前）；② 同模糊层内精确(code==输入)优先于
-        // 前缀补全(is_prefix=false 在前)；③ 同层内按权重降序、自然序升序。
-        // 使输入 si 时：精确单字「四/死」> 前缀补全「思考/似乎」> 模糊命中「是」。
+        // 引擎内部排序（层级对齐 Go：完整匹配 >> 子短语 >> 前缀补全 >> 模糊）：
+        // ① 非模糊优先于模糊（is_fuzzy=false 在前）；② 完整匹配/子短语(is_prefix=false)优先于
+        // 前缀补全(is_prefix=true)；③ 完整匹配(is_partial=false)优先于子短语(is_partial=true)
+        // ——对齐 Go coverage 分层，避免高频单字「报/宝」插进完整词「保安」「报案」之间；
+        // ④ 同层内按权重降序、自然序升序。
+        // 使输入 si 时：精确单字「四/死」> 前缀补全「思考/似乎」> 模糊命中「是」；
+        // 输入 baoan 时：完整词「保安」「报案」> 子短语单字「报/宝」。
         candidates.sort_by(|a, b| {
             a.is_fuzzy
                 .cmp(&b.is_fuzzy)
                 .then(a.is_prefix.cmp(&b.is_prefix))
+                .then(a.is_partial.cmp(&b.is_partial))
                 .then(b.weight.cmp(&a.weight))
                 .then(a.natural_order.cmp(&b.natural_order))
         });
@@ -802,15 +813,19 @@ mod tests {
         );
     }
 
-    /// 回归 TDD：子词组（code 比输入短，如 nihao 的「你」）不是前缀补全，不可降权——
-    /// 否则罕见全长精确词「拟好」(code==nihao,低权重) 会压过常用子词组「你」(高权重)。
-    /// 输入 "nihao"：「你」必须排在「拟好」之前(同层按权重)。
+    /// 完整匹配优先于子短语（对齐 Go coverage 分层）：输入完整音节 "nihao" 时，
+    /// 全长精确词「拟好」(code==nihao) 即便权重远低于子短语「你」(code=ni)，也应排在「你」之前。
+    /// 「你」只覆盖部分输入(ni)，是分段上屏候选(is_partial)，整体降到完整词之后。
+    ///
+    /// 注：此前 `subphrase_not_demoted_below_rare_exact` 断言相反（子词组不降权 → 你 > 拟好），
+    /// 那是刻意偏离 Go 的旧设计，正是 baoan→报案 被高频单字埋没的根因。现改为对齐 Go：
+    /// `score = exp(词频) + initialQuality + coverage`，完整词(cov=1,iq=4) 恒先于子短语单字(cov=.5,iq=2.5)。
     #[test]
-    fn subphrase_not_demoted_below_rare_exact() {
+    fn full_word_ranks_above_subphrase_singlechar() {
         let mut raw = CodetableDict::empty();
         raw.merge_single("nihao".to_string(), "你好".to_string(), 200, 0);
         raw.merge_single("nihao".to_string(), "拟好".to_string(), 10, 1); // 罕见全长精确词
-        raw.merge_single("ni".to_string(), "你".to_string(), 5000, 0); // 常用子词组
+        raw.merge_single("ni".to_string(), "你".to_string(), 5000, 0); // 常用子短语
         let dict = CachedDict::Memory(raw);
         let eng = PinyinEngine::new(Config::default(), dict);
 
@@ -820,16 +835,40 @@ mod tests {
         let pos_nihao_rare = texts.iter().position(|t| *t == "拟好");
         assert!(
             pos_ni.is_some() && pos_nihao_rare.is_some(),
-            "候选缺失: {texts:?}"
+            "候选缺失（子短语「你」仍应存在，供分段上屏）: {texts:?}"
         );
         assert!(
-            pos_ni < pos_nihao_rare,
-            "常用子词组「你」应优先于罕见全长精确词「拟好」(同层按权重)，实际: {texts:?}"
+            pos_nihao_rare < pos_ni,
+            "完整词「拟好」应优先于子短语单字「你」(对齐 Go coverage 分层)，实际: {texts:?}"
         );
-        // 「你」是子词组，不应被标记为前缀补全
+        // 「你」是子短语(is_partial)，不是前缀补全(is_prefix)——分段上屏机制不受影响
+        let ni = &r.candidates[pos_ni.unwrap()];
+        assert!(!ni.is_prefix, "子短语「你」不应是前缀补全");
+        assert!(ni.is_partial, "子短语「你」应标记 is_partial");
+    }
+
+    /// baoan 回归（用户报告场景）：输入 "baoan" 时，完整 bao'an 词「保安」「报案」必须
+    /// 聚集在前，不被高频子短语单字「报」(bao) 插开。修复前「报」(高权重) 会塞进
+    /// 「保安」「报案」之间，把「报案」挤到后面几页。
+    #[test]
+    fn baoan_full_words_group_above_subphrase() {
+        let mut raw = CodetableDict::empty();
+        raw.merge_single("baoan".to_string(), "保安".to_string(), 3513, 0);
+        raw.merge_single("baoan".to_string(), "报案".to_string(), 1374, 1);
+        raw.merge_single("bao".to_string(), "报".to_string(), 9000, 0); // 高频单字，权重高于「报案」
+        raw.merge_single("an".to_string(), "安".to_string(), 5000, 0);
+        let dict = CachedDict::Memory(raw);
+        let eng = PinyinEngine::new(Config::default(), dict);
+
+        let r = eng.convert("baoan", 20).unwrap();
+        let texts: Vec<&String> = r.candidates.iter().map(|c| &c.text).collect();
+        let pos = |t: &str| texts.iter().position(|x| *x == t);
+        let p_baoan = pos("保安").expect("「保安」应存在");
+        let p_baoan2 = pos("报案").expect("「报案」应存在");
+        let p_bao = pos("报").expect("子短语「报」应存在（供分段上屏）");
         assert!(
-            !r.candidates[pos_ni.unwrap()].is_prefix,
-            "子词组「你」不应是前缀补全"
+            p_baoan < p_bao && p_baoan2 < p_bao,
+            "完整词「保安」({p_baoan})「报案」({p_baoan2}) 都应排在高频子短语单字「报」({p_bao}) 之前，实际: {texts:?}"
         );
     }
 

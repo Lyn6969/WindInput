@@ -69,6 +69,11 @@ pub struct Candidate {
     /// 排序时前缀补全整体降到精确匹配（code==输入）之后，使等长精确候选优先
     /// （如输入 si 时单字「四」优先于补全词「思考」），对齐 Go 的 Exact>>Partial 层级。
     pub is_prefix: bool,
+    /// 是否为子短语候选（候选编码是输入的真前缀、比输入短，如输入 baoan 时「报」(bao)）。
+    /// 供分段上屏（你好→你）使用，但排序时整体降到完整匹配之后，避免高频单字插进
+    /// 完整词之间（如 baoan 时「报/宝」塞在「保安」「报案」之间）。对齐 Go 的 coverage
+    /// 分层：完整覆盖输入的词恒先于只覆盖部分输入的子短语单字。
+    pub is_partial: bool,
     pub consumed_length: usize,
     pub source: CandidateSource,
     pub phrase_template: String,
@@ -100,6 +105,7 @@ impl Default for Candidate {
             is_command: false,
             is_fuzzy: false,
             is_prefix: false,
+            is_partial: false,
             consumed_length: 0,
             source: CandidateSource::None,
             phrase_template: String::new(),

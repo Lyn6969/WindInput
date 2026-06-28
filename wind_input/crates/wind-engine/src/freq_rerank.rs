@@ -125,6 +125,16 @@ pub fn rerank_pinyin_decay(
                 Ordering::Less
             };
         }
+        // ①.7 子短语层级：完整匹配整体优先于子短语（部分覆盖输入的前缀词）。词频不得把
+        //     子短语单字提到完整词之上（如 baoan 时，被频繁使用的「报」也不能压过完整词「报案」）。
+        //     与引擎排序的 is_partial 维度一致，对齐 Go coverage 硬分层。
+        if a.is_partial != b.is_partial {
+            return if a.is_partial {
+                Ordering::Greater
+            } else {
+                Ordering::Less
+            };
+        }
         // ②③ 非整句、同层级：阈值褪色 + 衰减分降序
         let (pa, pb) = (score(a), score(b));
         let ua = pa >= PINYIN_FREQ_EPSILON;
