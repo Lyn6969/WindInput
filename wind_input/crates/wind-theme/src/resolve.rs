@@ -468,16 +468,20 @@ mod tests {
         let r = load("default", false);
         // window bg = bg light = 白
         assert_eq!(r.window_bg(), Some([255, 255, 255, 255]));
-        // default override：序号圆圈 = accent 底 + on_accent 白字
-        assert_eq!(r.views.index.bg_color, Some([0x42, 0x85, 0xF4, 255]));
-        assert_eq!(r.views.index.text_color, Some([255, 255, 255, 255]));
-        // 行为：default 单页不显翻页区、显示页码
+        // v4 设计基线：序号为淡色纯数字。shape="none" → 不画圆圈（bg_color 兜底 accent 但不渲染）。
+        assert_eq!(r.views.index.bg_shape, "none");
+        assert_eq!(r.views.index.bg_color, Some([0x3b, 0x82, 0xf6, 255])); // accent 兜底(因 shape=none 不绘制)
+        assert_eq!(r.views.index.text_color, Some([0x9A, 0xA0, 0xAE, 255])); // text_hint light
+        // 选中候选文字用 accent 高亮（[text.selected].color = accent_text light）。
+        let sel = r.views.text.selected.as_ref().expect("text.selected patch");
+        assert_eq!(sel.text_color, Some([0x25, 0x63, 0xeb, 255]));
+        // 行为：default 单页不显翻页区；清风设计默认不显页码数字（保持整洁）。
         assert!(!r.behavior.always_show_pager);
-        assert!(r.behavior.show_page_number);
+        assert!(!r.behavior.show_page_number);
         assert_eq!(r.behavior.font_size, 18);
-        // 暗色 bg 不同
+        // 暗色 bg = 深蓝灰（设计稿暗色面板基调 #121826）
         let d = load("default", true);
-        assert_eq!(d.window_bg(), Some([0x2D, 0x2D, 0x2D, 255]));
+        assert_eq!(d.window_bg(), Some([0x12, 0x18, 0x26, 255]));
     }
 
     #[test]
@@ -530,7 +534,7 @@ mod tests {
         assert_eq!(m.name, "极点经典(位图)");
         assert_eq!(m.order, 2);
         let dm = crate::theme::read_meta(&dirs, "default").expect("default meta");
-        assert_eq!(dm.name, "默认主题");
+        assert_eq!(dm.name, "清风·蓝");
         // 多目录加载：jidian `base: _base` 跨目录解析正常（resources/views 出来）。
         let r = load_resolved_dirs(&dirs, "jidian-classic", false).expect("resolve jidian");
         assert!(
@@ -539,21 +543,20 @@ mod tests {
         );
         assert!(r.resources.contains_key("panel"));
 
-        // 资产链：default 继承 _base，链中应含 _base 目录（footer chevron.svg 在 _base）。
+        // 资产链：default 经 _qingfeng → _base，链中应含 _base 目录（_base 的 chevron.svg 可被继承解析）。
         let d = load_resolved_dirs(&dirs, "default", false).expect("resolve default");
         assert!(
             d.asset_dirs.iter().any(|p| p.ends_with("_base")),
             "default 资产链应含 _base 目录"
         );
-        // footer 翻页箭头继承自 _base（chevron SVG + tint）。
+        // 清风设计把 _base 的 chevron 覆盖为空 ref（回退细小文字 ‹ › 翻页箭头）。
         let prev = d
             .views
             .footer_bar
             .prev_image
             .as_ref()
             .expect("footer prev_image");
-        assert_eq!(prev.reference, "chevron_prev.svg");
-        assert!(prev.tint.is_some(), "chevron 应有 tint(${{accent}})");
+        assert_eq!(prev.reference, "", "清风主题应覆盖 chevron 为空 → 文字箭头");
     }
 
     #[test]
