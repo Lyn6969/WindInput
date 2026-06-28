@@ -224,30 +224,9 @@ struct ShellOpener;
 
 impl UrlOpener for ShellOpener {
     fn open(&self, target: &str) -> anyhow::Result<()> {
-        open_target(target)
+        open::that(target)?;
+        Ok(())
     }
-}
-
-#[cfg(windows)]
-fn open_target(target: &str) -> anyhow::Result<()> {
-    // cmd start：第一个引号参数是窗口标题（留空），其后为目标。
-    Command::new("cmd")
-        .args(["/C", "start", "", target])
-        .spawn()?;
-    Ok(())
-}
-
-#[cfg(target_os = "macos")]
-fn open_target(target: &str) -> anyhow::Result<()> {
-    // macOS 用 `open` 打开 URL/文件/应用。
-    Command::new("open").arg(target).spawn()?;
-    Ok(())
-}
-
-#[cfg(not(any(windows, target_os = "macos")))]
-fn open_target(target: &str) -> anyhow::Result<()> {
-    Command::new("xdg-open").arg(target).spawn()?;
-    Ok(())
 }
 
 /// 系统剪贴板写入（clip.copy）。读/粘贴需平台读剪贴板或按键注入。
