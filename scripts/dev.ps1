@@ -36,8 +36,9 @@
 #   build/ build_dev/  全构建产物(gitignore); 内容即部署到目标目录的内容
 
 param(
-    [Parameter(Position = 0)] [string]$Command = "",
-    [Parameter(Position = 1)] [string]$Arg = ""
+    # 支持连续命令: .\dev.ps1 d1 pd1 (前者失败则后者不执行)
+    # repl 命令后接数据路径: .\dev.ps1 r build_dev/data
+    [Parameter(Position = 0, ValueFromRemainingArguments)] [string[]]$Commands = @()
 )
 
 $ErrorActionPreference = "Stop"
@@ -404,23 +405,33 @@ function Deploy-TargetForCmd ([string]$cmd) {
 
 # 系统安装(注册 COM/icacls/字体)始终需管理员。非管理员执行部署命令时自动 UAC 提权。
 # 返回三态: "skip" = 非部署命令/已是管理员 (调用方本地执行);
-#           "done" = 已成功拉起管理员窗口 (调用方退出, 不再本地执行);
+#           "done" = 提权进程已执行完毕, 输出已在当前窗口显示 (调用方直接继续);
 #           "fail" = 提权被取消/失败 (调用方报错并以非零码退出)。
 function Invoke-Elevated ([string]$cmd, [string]$arg) {
     if (-not (Deploy-TargetForCmd $cmd)) { return "skip" }   # 非部署命令
     if (Test-Admin) { return "skip" }
     Warn "系统安装需要管理员权限, 正在请求 UAC 提升..."
     $host_exe = (Get-Process -Id $PID).Path   # pwsh.exe 或 powershell.exe
-    if (-not $host_exe) { $host_exe = "powershell.exe" }
-    # 提权窗口内重新执行同一命令, 完成后停留以便查看输出/错误。
-    $inner = "& '$PSCommandPath' $cmd $arg; Write-Host ''; Write-Host '操作结束, 按回车关闭' -NoNewline; Read-Host"
+    if (-not $host_exe) { $host_exe = "pwsh.exe" }
+    # 临时日志文件捕获提权子进程的全部输出流 (*>), 执行后读回在本窗口显示。
+    $TmpLog = Join-Path $env:TEMP "wind_deploy_$(Get-Random -Maximum 99999999).log"
+    $argPart = if ($arg) { " `"$arg`"" } else { "" }
+    $innerCmd = "& `"$PSCommandPath`" `"$cmd`"$argPart *> `"$TmpLog`""
+    $encodedCmd = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($innerCmd))
     try {
-        # -ErrorAction Stop 确保 UAC 被取消 (用户点否) 时抛出可捕获的终止错误。
-        Start-Process -FilePath $host_exe -Verb RunAs -ErrorAction Stop `
-            -ArgumentList "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", $inner | Out-Null
-        Say "已在管理员窗口执行 '$cmd'; 请在新窗口查看结果。"
+        # -PassThru 取得进程对象; 用 WaitForExit() 替代 -Wait 以确保子进程真正退出后再读日志。
+        # (-Verb RunAs + -Wait 在部分 PS5.1 版本下存在不可靠的竞争问题)
+        $proc = Start-Process -FilePath $host_exe -Verb RunAs -PassThru -ErrorAction Stop `
+            -ArgumentList "-NoProfile", "-ExecutionPolicy", "Bypass", "-WindowStyle", "Hidden", "-EncodedCommand", $encodedCmd
+        $proc.WaitForExit()
+        if (Test-Path $TmpLog) {
+            Get-Content $TmpLog | ForEach-Object { Write-Host $_ }
+            Remove-Item $TmpLog -ErrorAction SilentlyContinue
+        }
+        if ($proc.ExitCode -ne 0) { return "fail" }
         return "done"
     } catch {
+        if (Test-Path $TmpLog) { Remove-Item $TmpLog -ErrorAction SilentlyContinue }
         ErrMsg "提权失败或被取消: $($_.Exception.Message)"
         ErrMsg "可【以管理员身份】重开 PowerShell 再运行本脚本。"
         return "fail"
@@ -924,39 +935,78 @@ function Dispatch ([string]$cmd, [string]$arg) {
 function Menu-Loop {
     while ($true) {
         Show-Menu
-        $choice = (Read-Host "`n请输入选项").Trim().ToLower()
-        if ($choice -eq "q") { return }
-        if (-not $choice) { continue }
-        $el = Invoke-Elevated $choice ""               # 受保护目标 → UAC 提权
-        if ($el -ne "skip") {                          # done/fail 都不本地执行
-            Write-Host ""; Write-Host "按回车继续..." -NoNewline; Read-Host | Out-Null; continue
+        $raw = (Read-Host "`n请输入选项").Trim()
+        if (-not $raw) { continue }
+        if ($raw.ToLower() -eq "q") { return }
+
+        # 支持空格分隔的连续命令: "d1 pd1" → 依次执行, 前者失败则停止
+        $tokens = $raw.ToLower() -split '\s+' | Where-Object { $_ -ne "" }
+        $i = 0
+        $anyFailed = $false
+        $needPause = $false   # UAC 成功时输出已内联显示, 无需额外暂停
+        while ($i -lt $tokens.Count -and -not $anyFailed) {
+            $choice = $tokens[$i]
+            $choiceArg = ""
+            # repl 命令后一个 token 为数据路径 (非命令)
+            if ($choice -in "r", "repl") {
+                $i++
+                if ($i -lt $tokens.Count) { $choiceArg = $tokens[$i] }
+            }
+            $el = Invoke-Elevated $choice $choiceArg
+            if ($el -eq "skip") {
+                $needPause = $true   # 普通命令在当前窗口产生输出, 需暂停让用户阅读
+                $rc = Dispatch $choice $choiceArg
+                if ($rc -eq 127) { ErrMsg "无效选项: $choice"; $anyFailed = $true }
+                elseif ($rc -ne 0) { ErrMsg "`n命令 '$choice' 失败 (退出码 $rc)"; $anyFailed = $true }
+            } elseif ($el -eq "fail") {
+                $needPause = $true   # 提权失败/被取消, 需暂停让用户看到错误
+                $anyFailed = $true
+            }
+            # $el -eq "done": UAC 提权成功, 输出已内联显示, 不额外暂停
+            $i++
         }
-        $rc = Dispatch $choice ""
-        if ($rc -eq 127) { ErrMsg "无效选项: $choice"; Start-Sleep -Seconds 1 }
-        else {
-            if ($rc -ne 0) { ErrMsg "`n命令 '$choice' 失败 (退出码 $rc)" }
-            Write-Host ""; Write-Host "按回车继续..." -NoNewline; Read-Host | Out-Null
-        }
+        if ($needPause) { Write-Host ""; Write-Host "按回车继续..." -NoNewline; Read-Host | Out-Null }
     }
 }
 
 # ---------- 入口 ----------
-$cmd = $Command.Trim().ToLower()
-switch ($cmd) {
-    { $_ -in "", "menu" } { Menu-Loop }
-    { $_ -in "-h", "--help", "help" } {
-        Get-Content $PSCommandPath | Where-Object { $_ -match '^#' } | ForEach-Object { $_ -replace '^# ?', '' }
-    }
-    default {
-        $el = Invoke-Elevated $cmd $Arg   # 受保护目标 → UAC 提权
-        if ($el -eq "done") { exit 0 }
-        if ($el -eq "fail") { exit 1 }
-        $rc = Dispatch $cmd $Arg
-        if ($rc -eq 127) {
-            ErrMsg "未知命令: $Command"
-            Write-Host "运行 '.\scripts\dev.ps1 --help' 查看可用命令"
-            exit 1
-        }
-        exit $rc
-    }
+$allCmds = @($Commands | Where-Object { $_ -ne "" })
+
+# 无参数 → 交互菜单
+if ($allCmds.Count -eq 0) { Menu-Loop; return }
+
+$firstCmd = $allCmds[0].Trim().ToLower()
+
+# help
+if ($firstCmd -in "-h", "--help", "help") {
+    Get-Content $PSCommandPath | Where-Object { $_ -match '^#' } | ForEach-Object { $_ -replace '^# ?', '' }
+    return
 }
+
+# menu (显式)
+if ($firstCmd -in "menu") { Menu-Loop; return }
+
+# 按序执行所有命令; repl 后一个参数为数据路径
+$i = 0
+while ($i -lt $allCmds.Count) {
+    $cmd = $allCmds[$i].Trim().ToLower()
+    $arg = ""
+    if ($cmd -in "r", "repl") {
+        $i++
+        if ($i -lt $allCmds.Count) { $arg = $allCmds[$i] }
+    }
+
+    $el = Invoke-Elevated $cmd $arg
+    if ($el -eq "done") { $i++; continue }
+    if ($el -eq "fail") { exit 1 }
+
+    $rc = Dispatch $cmd $arg
+    if ($rc -eq 127) {
+        ErrMsg "未知命令: $cmd"
+        Write-Host "运行 '.\scripts\dev.ps1 --help' 查看可用命令"
+        exit 1
+    }
+    if ($rc -ne 0) { exit $rc }
+    $i++
+}
+exit 0
