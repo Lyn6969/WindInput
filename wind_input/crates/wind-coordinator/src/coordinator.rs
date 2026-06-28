@@ -479,6 +479,9 @@ pub struct Coordinator {
     pub(crate) stat_collector: Option<StatCollector>,
     /// 本次按键是否已被具体上屏路径记录统计（AtomicBool，避免与 state 锁冲突致死锁）。
     pub(crate) stat_recorded: std::sync::atomic::AtomicBool,
+    /// 全屏状态缓存：由 notify_toolbar_async 在后台线程异步刷新，notify_toolbar 直接读取，
+    /// 消除 bridge handler 线程上的 SHQueryUserNotificationState 阻塞。
+    pub(crate) fullscreen_cached: std::sync::atomic::AtomicBool,
 }
 
 /// 短语候选权重基准（高于普通候选，使短语展开排在前列）
@@ -850,6 +853,7 @@ impl Coordinator {
             candidate_vertical: Mutex::new(candidate_vertical_init),
             stat_collector,
             stat_recorded: std::sync::atomic::AtomicBool::new(false),
+            fullscreen_cached: std::sync::atomic::AtomicBool::new(false),
         });
         // 命令栏：装配 Services（ime/config/dict 后端）+ 自身 Weak 引用。
         coordinator.init_cmdbar();
@@ -2781,7 +2785,7 @@ impl MessageHandler for Coordinator {
         self.update_active_compat(data.client_token);
         let status = self.build_status();
         self.push_activation_status();
-        self.notify_toolbar(); // 激活态 → 工具栏显示
+        self.notify_toolbar_async(); // 激活态 → 工具栏显示（异步，避免 is_foreground_fullscreen 阻塞 bridge 线程）
         self.show_persistent_status_if_always(); // 常驻模式:获焦即显示状态
         Some(status)
     }
@@ -2801,7 +2805,7 @@ impl MessageHandler for Coordinator {
             s.menu_open = false; // 复位菜单态，否则下一个键被 forward_menu_key 吞掉
             self.reset_exclusive_modes(&mut s); // 失焦丢弃临时英文/拼音/快捷输入残留
         }
-        self.notify_toolbar(); // 隐藏工具栏（防抖）
+        self.notify_toolbar_async(); // 隐藏工具栏（防抖，异步避免阻塞 bridge 线程）
         self.notify_ui_hide(); // 隐藏候选窗 + 弹出菜单（HideCandidates 连带关菜单）
         self.hide_tip(); // 失焦隐藏状态提示（常驻模式尤需）
     }
@@ -2824,7 +2828,7 @@ impl MessageHandler for Coordinator {
             .ime_active = true;
         let status = self.build_status();
         self.push_activation_status();
-        self.notify_toolbar(); // 激活态 → 工具栏显示
+        self.notify_toolbar_async(); // 激活态 → 工具栏显示（异步，避免 is_foreground_fullscreen 阻塞 bridge 线程）
         self.show_persistent_status_if_always(); // 常驻模式:激活即显示状态
         Some(status)
     }
@@ -2841,7 +2845,7 @@ impl MessageHandler for Coordinator {
             s.menu_open = false;
             self.reset_exclusive_modes(&mut s); // 切走本输入法时丢弃独占模式残留
         }
-        self.notify_toolbar(); // 非激活态 → notify_toolbar 内部下发 HideToolbar
+        self.notify_toolbar_async(); // 非激活态 → notify_toolbar 内部下发 HideToolbar（异步）
         self.notify_ui_hide(); // 隐藏候选窗 + 弹出菜单
         self.hide_tip(); // 切走本输入法隐藏状态提示
     }

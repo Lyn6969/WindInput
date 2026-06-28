@@ -334,15 +334,39 @@ impl Coordinator {
         self.notify_toolbar();
     }
 
+    /// 焦点/激活切换路径专用：先用缓存值立即同步通知（无阻塞），
+    /// 再后台刷新全屏缓存，若状态变化则再次通知。
+    /// 保证 bridge handler 线程立即返回，缓存刷新在独立线程完成。
+    /// 非焦点路径（模式切换/菜单操作）直接调 notify_toolbar()，缓存值仍然有效。
+    pub(crate) fn notify_toolbar_async(&self) {
+        // 立即用缓存值通知，bridge 线程无阻塞
+        self.notify_toolbar();
+        // hide_in_fullscreen 关闭时缓存永远为 false，无需后台刷新
+        if !self.rt().config.ui.toolbar.hide_in_fullscreen {
+            return;
+        }
+        let Some(weak) = self.self_weak.get().cloned() else { return; };
+        std::thread::spawn(move || {
+            let is_fs = crate::is_foreground_fullscreen();
+            if let Some(c) = weak.upgrade() {
+                let prev = c.fullscreen_cached.swap(is_fs, std::sync::atomic::Ordering::Relaxed);
+                if prev != is_fs {
+                    // 全屏态发生变化，用新值重新通知
+                    c.notify_toolbar();
+                }
+            }
+        });
+    }
+
     /// 推送当前状态到常驻工具栏（中英/方案/标点/全半角）
     /// 工具栏可见性单点决策 + 内容刷新。对齐 Go toolbar_reducer 的合取公式：
     /// 仅当 `ime_active && toolbar_visible` 时显示（UpdateToolbar 会刷内容+定位+显示），
     /// 否则下发 HideToolbar。所有调用点（启动/切模式/切方案/激活/失活）经此单点决策，
-    /// 不再各自直接显示，根治“工具栏总是显示、切走输入法不隐藏”。
+    /// 不再各自直接显示，根治”工具栏总是显示、切走输入法不隐藏”。
     pub(crate) fn notify_toolbar(&self) {
-        // 前台应用全屏时隐藏工具栏（ui.toolbar.hide_in_fullscreen，对齐 Go）。
-        let hide_fullscreen =
-            self.rt().config.ui.toolbar.hide_in_fullscreen && crate::is_foreground_fullscreen();
+        // 前台应用全屏时隐藏工具栏（读缓存，由 notify_toolbar_async 后台刷新，无阻塞）。
+        let hide_fullscreen = self.rt().config.ui.toolbar.hide_in_fullscreen
+            && self.fullscreen_cached.load(std::sync::atomic::Ordering::Relaxed);
         let s = self.state.lock().unwrap_or_else(|e| e.into_inner());
         if !(s.ime_active && s.toolbar_visible) || hide_fullscreen {
             drop(s);
