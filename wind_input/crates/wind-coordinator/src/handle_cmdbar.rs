@@ -195,8 +195,9 @@ struct CoordProc(Weak<Coordinator>);
 
 impl ProcessRunner for CoordProc {
     fn run(&self, cmd: &str, args: &[String]) -> anyhow::Result<()> {
-        if let Some(c) = self.0.upgrade() {
-            c.push_shell_exec(cmd, &args.join(" "));
+        match self.0.upgrade() {
+            Some(c) => c.push_shell_exec(cmd, &shell_quote_args(args)),
+            None => warn!("proc.run: coordinator 已释放，跳过执行 {cmd:?}"),
         }
         Ok(())
     }
@@ -207,6 +208,20 @@ impl ProcessRunner for CoordProc {
         // flags(term/pwsh)暂未区分，统一走默认 shell（待平台 shell 选择补齐）。
         shell_spawn(cmdline)
     }
+}
+
+/// 将 argv 列表拼成 ShellExecuteW lpParameters 字符串，含空格/引号的参数加双引号。
+fn shell_quote_args(args: &[String]) -> String {
+    args.iter()
+        .map(|a| {
+            if a.contains(' ') || a.contains('"') {
+                format!("\"{}\"", a.replace('"', "\\\""))
+            } else {
+                a.clone()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 #[cfg(windows)]
@@ -226,8 +241,9 @@ struct CoordOpener(Weak<Coordinator>);
 
 impl UrlOpener for CoordOpener {
     fn open(&self, target: &str) -> anyhow::Result<()> {
-        if let Some(c) = self.0.upgrade() {
-            c.push_shell_exec(target, "");
+        match self.0.upgrade() {
+            Some(c) => c.push_shell_exec(target, ""),
+            None => warn!("open: coordinator 已释放，跳过执行 {target:?}"),
         }
         Ok(())
     }

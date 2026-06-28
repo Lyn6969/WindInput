@@ -2997,7 +2997,9 @@ BOOL CTextService::_InitIPCClient()
     // 回调在 AsyncReader 线程执行，ShellExecuteW 是线程安全的，无需切换到 TSF 主线程。
     _pIPCClient->SetShellExecCallback([](const std::wstring& target, const std::wstring& params) {
         const wchar_t* pParams = params.empty() ? nullptr : params.c_str();
-        ::ShellExecuteW(nullptr, L"open", target.c_str(), pParams, nullptr, SW_SHOWNORMAL);
+        HINSTANCE ret = ::ShellExecuteW(nullptr, L"open", target.c_str(), pParams, nullptr, SW_SHOWNORMAL);
+        if (reinterpret_cast<INT_PTR>(ret) <= 32)
+            WIND_LOG_ERROR_FMT(L"ShellExecuteW failed: target=%s code=%d", target.c_str(), static_cast<int>(reinterpret_cast<INT_PTR>(ret)));
     });
 
     // Set up state push callback

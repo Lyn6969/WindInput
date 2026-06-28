@@ -2165,23 +2165,27 @@ void CIPCClient::_AsyncReaderLoop()
                 // TSF 侧在前台应用进程执行 ShellExecuteW（打开 URL / 启动程序）。
                 // 载荷：target_len(u32 LE) + target(UTF-8) + params_len(u32 LE) + params(UTF-8)
                 const uint8_t* p = buffer.data() + sizeof(IpcHeader);
-                size_t avail = bytesRead - sizeof(IpcHeader);
-                if (avail >= 4)
-                {
+                // 以 header.length 为权威边界，防止 bytesRead 与声明长度不一致。
+                size_t avail = (header.length <= bytesRead - sizeof(IpcHeader))
+                             ? header.length : bytesRead - sizeof(IpcHeader);
+                std::string targetUtf8, paramsUtf8;
+                do {
+                    if (avail < 4) break;
                     uint32_t tLen = static_cast<uint32_t>(p[0]) | (static_cast<uint32_t>(p[1]) << 8)
                                   | (static_cast<uint32_t>(p[2]) << 16) | (static_cast<uint32_t>(p[3]) << 24);
                     p += 4; avail -= 4;
-                    std::string targetUtf8;
-                    if (tLen <= avail) { targetUtf8.assign(reinterpret_cast<const char*>(p), tLen); p += tLen; avail -= tLen; }
-                    uint32_t pLen = 0;
-                    std::string paramsUtf8;
-                    if (avail >= 4)
-                    {
-                        pLen = static_cast<uint32_t>(p[0]) | (static_cast<uint32_t>(p[1]) << 8)
-                             | (static_cast<uint32_t>(p[2]) << 16) | (static_cast<uint32_t>(p[3]) << 24);
-                        p += 4; avail -= 4;
-                        if (pLen <= avail) paramsUtf8.assign(reinterpret_cast<const char*>(p), pLen);
-                    }
+                    if (tLen > avail) break;  // 截断载荷，放弃本消息
+                    targetUtf8.assign(reinterpret_cast<const char*>(p), tLen);
+                    p += tLen; avail -= tLen;
+                    if (avail < 4) break;
+                    uint32_t pLen = static_cast<uint32_t>(p[0]) | (static_cast<uint32_t>(p[1]) << 8)
+                                  | (static_cast<uint32_t>(p[2]) << 16) | (static_cast<uint32_t>(p[3]) << 24);
+                    p += 4; avail -= 4;
+                    if (pLen <= avail) paramsUtf8.assign(reinterpret_cast<const char*>(p), pLen);
+                } while (false);
+
+                if (!targetUtf8.empty())
+                {
                     int tWLen = MultiByteToWideChar(CP_UTF8, 0, targetUtf8.c_str(), -1, nullptr, 0);
                     int pWLen = MultiByteToWideChar(CP_UTF8, 0, paramsUtf8.c_str(), -1, nullptr, 0);
                     std::wstring targetW(tWLen > 0 ? tWLen - 1 : 0, L'\0');
@@ -2193,6 +2197,10 @@ void CIPCClient::_AsyncReaderLoop()
                     ShellExecCallback seCallback = _shellExecCallback;
                     LeaveCriticalSection(&_asyncLock);
                     if (seCallback) seCallback(targetW, paramsW);
+                }
+                else
+                {
+                    _LogError(L"Async reader: CMD_SHELL_EXEC 载荷截断或 target 为空，已跳过");
                 }
             }
             else if (header.command == CMD_SERVICE_READY)
