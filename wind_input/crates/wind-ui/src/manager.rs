@@ -614,6 +614,7 @@ impl UiManager {
                         let t = *theme;
                         if let Some(tb) = &mut toolbar {
                             tb.set_theme(&t);
+                            tb.repaint();
                         }
                         if let Some(m) = &mut popup_menu {
                             m.set_theme(&t);
@@ -625,6 +626,9 @@ impl UiManager {
                             to.set_theme(&t);
                         }
                         candidate_window.set_theme(t); // 同时更新其 tooltip
+                        if candidate_window.is_visible() {
+                            candidate_window.show();
+                        }
                     }
                     UiCommand::SetCandidateLayout(vertical) => {
                         candidate_window.set_vertical(vertical);

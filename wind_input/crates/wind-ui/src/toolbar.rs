@@ -232,6 +232,14 @@ impl Toolbar {
         self.render(state, hover);
     }
 
+    /// 用缓存状态原地重绘（主题切换后刷新外观，无需重新传状态）。
+    pub fn repaint(&mut self) {
+        if let Some(state) = self.last_state.clone() {
+            let hover = self.rendered_hover;
+            self.render(&state, hover);
+        }
+    }
+
     /// 实际渲染（hover_idx=当前悬停格下标，-1 无）。update 与 tick 均经此单点渲染。
     fn render(&mut self, state: &ToolbarState, hover_idx: i32) {
         self.ensure_scale();
