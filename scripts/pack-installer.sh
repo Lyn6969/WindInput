@@ -91,7 +91,7 @@ export XWIN_ACCEPT_LICENSE="${XWIN_ACCEPT_LICENSE:-1}"
   # stub/uninstaller 交叉编 MSVC(+crt-static 自包含);packer 原生编(纯 IO,跑在主机)
   RUSTFLAGS="-C target-feature=+crt-static" \
     cargo xwin build --release --target "$TARGET" --bin wind-installer --bin wind-uninstaller
-  cargo build --release --bin wind-packer
+  cargo build --release --bin wind-packer --features packer
 )
 
 STUB="$INSTALLER_DIR/target/$TARGET/release/wind-installer.exe"
