@@ -411,7 +411,9 @@ impl PopupMenu {
     }
 
     /// 显示菜单（顶层 items）于屏幕坐标 (x,y)。i32::MIN → 取光标位。
-    pub fn show(&mut self, items: Vec<MenuItemSpec>, x: i32, y: i32, above: bool) {
+    /// `y_bottom`：锚点区域下边界（工具栏底边）；`above=true` 时优先向上展开，
+    /// 上方工作区空间不足则改为从 `y_bottom` 向下弹出。
+    pub fn show(&mut self, items: Vec<MenuItemSpec>, x: i32, y: i32, y_bottom: i32, above: bool) {
         if items.is_empty() {
             return;
         }
@@ -432,8 +434,17 @@ impl PopupMenu {
         // 先测量根面板尺寸以钳制锚点（选中态不影响尺寸，传无选中即可）。
         let (_root, w, h, _hits) = self.build_view(&items, NONE_SEL);
         // above：菜单底边对齐 (x,y) 向上展开（工具栏菜单用，避免遮挡工具栏）。
+        // 若向上展开后顶边低于工作区上边界，则翻转为从 y_bottom 向下弹出。
         if above {
-            ay -= h as i32;
+            let tentative = ay - h as i32;
+            let has_space = work_area_of(ax, ay)
+                .map(|(_, top, _, _)| tentative >= top)
+                .unwrap_or(true);
+            if has_space {
+                ay = tentative;
+            } else {
+                ay = y_bottom; // 上方空间不足，改为向下弹出
+            }
         }
         self.anchor = clamp_to_work_area(ax, ay, w, h);
         {

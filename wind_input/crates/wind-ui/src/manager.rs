@@ -91,11 +91,13 @@ pub enum UiCommand {
     /// 拆字字根字体路径（PUA 字根字符渲染）。空=不设。
     SetTooltipChaiziFont(String),
     /// 显示菜单（候选右键菜单 / 功能主菜单；UI 自管导航与子菜单）。
-    /// above=true：菜单底边对齐 (x,y) 向上展开（工具栏菜单用，避免遮挡工具栏）。
+    /// above=true：菜单底边对齐 (x,y) 向上展开（工具栏菜单用，避免遮挡工具栏）；
+    /// y_bottom 为锚点区域下边界，上方空间不足时改为从 y_bottom 向下弹出。
     ShowCandidateMenu {
         items: Vec<MenuItemSpec>,
         x: i32,
         y: i32,
+        y_bottom: i32,
         above: bool,
     },
     /// 转发键给打开的菜单（方向键/回车/ESC/空格）；菜单窗无焦点，键由协调器转发
@@ -266,8 +268,14 @@ pub enum UiEvent {
     /// 右键候选请求弹出菜单（页内下标 + 屏幕坐标）；协调器据此构建菜单项回送
     RequestCandidateMenu { page_local: usize, x: i32, y: i32 },
     /// 请求功能主菜单（屏幕坐标）；来自候选窗空白/工具栏右键或设置键。
-    /// above=true：菜单在 (x,y) 上方弹出（工具栏触发，避免遮挡工具栏）。
-    RequestMainMenu { x: i32, y: i32, above: bool },
+    /// above=true：菜单在 (x,y) 上方弹出（工具栏触发，避免遮挡工具栏）；
+    /// y_bottom 为工具栏底边，上方空间不足时改为从 y_bottom 向下弹出。
+    RequestMainMenu {
+        x: i32,
+        y: i32,
+        y_bottom: i32,
+        above: bool,
+    },
     /// 菜单项激活（携带动作）：UI 自管导航/子菜单，仅把最终动作回送协调器
     MenuAction(MenuKind),
     /// 关闭菜单（点击菜单外 / ESC / 右键）
@@ -516,10 +524,16 @@ impl UiManager {
                             m.hide();
                         }
                     }
-                    UiCommand::ShowCandidateMenu { items, x, y, above } => {
+                    UiCommand::ShowCandidateMenu {
+                        items,
+                        x,
+                        y,
+                        y_bottom,
+                        above,
+                    } => {
                         debug!("UI: ShowMenu ({} items) at ({},{})", items.len(), x, y);
                         if let Some(m) = &mut popup_menu {
-                            m.show(items, x, y, above);
+                            m.show(items, x, y, y_bottom, above);
                         }
                     }
                     UiCommand::MenuKey(key) => {

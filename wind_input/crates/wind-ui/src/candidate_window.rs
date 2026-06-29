@@ -1375,6 +1375,7 @@ impl WindowMouse for CandidateMouse {
                     let _ = self.events.send(UiEvent::RequestMainMenu {
                         x: sx,
                         y: sy,
+                        y_bottom: sy,
                         above: false,
                     });
                 }

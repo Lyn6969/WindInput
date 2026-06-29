@@ -671,9 +671,11 @@ impl WindowMouse for ToolbarMouse {
                     if matches!(action, ToolbarAction::OpenSettings) {
                         // 设置键 = 弹出功能主菜单（工具栏上方，避免遮挡）。
                         let (mx, my) = self.pos.unwrap_or((0, 0));
+                        let my_bottom = toolbar_bottom(self.hwnd, my);
                         let _ = self.events.send(UiEvent::RequestMainMenu {
                             x: mx,
                             y: my,
+                            y_bottom: my_bottom,
                             above: true,
                         });
                     } else {
@@ -692,9 +694,11 @@ impl WindowMouse for ToolbarMouse {
                     }
                     (p.x, p.y)
                 });
+                let my_bottom = toolbar_bottom(self.hwnd, my);
                 let _ = self.events.send(UiEvent::RequestMainMenu {
                     x: mx,
                     y: my,
+                    y_bottom: my_bottom,
                     above: true,
                 });
                 Some(LRESULT(0))
@@ -830,4 +834,17 @@ fn draw_grip(buf: &mut [u8], buf_w: u32, buf_h: u32, grip_w: u32, color: [u8; 4]
 fn fill_dot(buf: &mut [u8], buf_w: u32, buf_h: u32, cx: f32, cy: f32, r: f32, color: [u8; 4]) {
     // 抗锯齿圆点（tiny-skia），与其它形状统一
     crate::view::fill_circle(buf, buf_w, buf_h, cx, cy, r, color);
+}
+
+/// 取工具栏窗口的底边屏幕坐标（GetWindowRect），失败时以 top + 30 估算。
+fn toolbar_bottom(hwnd: HWND, top: i32) -> i32 {
+    #[cfg(windows)]
+    unsafe {
+        let mut r = RECT::default();
+        if GetWindowRect(hwnd, &mut r).is_ok() {
+            return r.bottom;
+        }
+    }
+    let _ = hwnd;
+    top + 30
 }
