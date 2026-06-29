@@ -986,6 +986,14 @@ impl Coordinator {
         });
     }
 
+    /// 触发截图所有可见 UI 窗口，保存到用户配置目录下的 screenshots/ 子目录。
+    pub(crate) fn trigger_screenshot(&self) {
+        if let Some(dir) = wind_config::Config::user_config_dir() {
+            let dir = dir.join("screenshots").display().to_string();
+            let _ = self.ui_tx.send(UiCommand::TakeScreenshot { dir });
+        }
+    }
+
     /// 按当前配置（bundle）重新下发外观相关 UI 指令并同步运行时态。
     /// 热重载用：候选排列方向 / 编码显示方式 / 候选窗显隐 改动即时生效（无需重启）。
     /// 与命令栏 ime.toggle 共写同一组运行时 Mutex；以 config 为准重置（config 为持久化真相源）。
@@ -1823,7 +1831,10 @@ impl Coordinator {
 
     pub(crate) fn push_shell_exec(&self, target: &str, params: &str) {
         let encoded = wind_ipc::codec::encode_shell_exec(target, params);
-        self.push_server.push_to_active(&encoded);
+        // 带副作用操作（启动/激活外部程序）只投给活跃（前台）客户端，与 push_commit 语义一致。
+        // 若广播全部客户端，多个后台 TSF 进程会竞相 ShellExecuteW，非前台进程启动的 wind_setting
+        // 第二实例无前台权限，其 SetForegroundWindow 失败，导致窗口有较大概率停在后台。
+        self.push_server.push_commit_to_active(&encoded);
     }
 
     pub(crate) fn push_state_update(&self) {
@@ -1992,6 +2003,10 @@ impl Coordinator {
             }
             "open_settings" => {
                 self.open_settings(None);
+                true
+            }
+            "take_screenshot" => {
+                self.trigger_screenshot();
                 true
             }
             _ => {
