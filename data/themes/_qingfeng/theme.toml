@@ -80,7 +80,7 @@ padding = 5
 radius = 12
 border = { width = "1px", color = "${border}" }
 background = "${bg}"
-shadow = { offset = [0, 4], blur = 16, color = "${shadow}" }
+shadow = { offset = [0, 4], blur = 8, color = "${shadow}" }
 
 # 预编辑行：透明底（与窗口同色），靠下方分隔线（引擎按 separator 色绘制）与候选区分。
 # padding 左值即编码左缩进（candidate_top 独立条与 candidate_inline 内联模式都生效）。
@@ -126,8 +126,7 @@ font_size = -4
 [footer_bar]
 font_size = -4
 margin = { left = 8 }
-# 翻页箭头 / 页码用淡色（细小、不突兀，对齐设计稿小 ‹ ›）。
-color = "${text_hint}"
+# 翻页箭头：启用态用 accent（可点击感），禁用态代码侧固定用 text_hint（灰显区分）。
 # 覆盖 _base 的 chevron SVG（ref="" → 解析为空 → 回退到细小文字 ‹ › 符号）。
 prev_image = { ref = "" }
 next_image = { ref = "" }
