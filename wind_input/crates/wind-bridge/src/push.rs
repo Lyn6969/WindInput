@@ -56,6 +56,11 @@ impl PushServer {
         self.active_token.store(token, Ordering::Relaxed);
     }
 
+    /// 是否有已连接的 TSF 客户端（用于决定是否经 IPC 让宿主执行前台操作）
+    pub fn has_clients(&self) -> bool {
+        !self.clients.lock().unwrap().is_empty()
+    }
+
     /// 获取推送管道名称
     ///
     /// 必须与 Go/TSF 一致：后缀插在 `wind_input` 与 `_push` 之间。

@@ -156,12 +156,17 @@ impl ImeController for CoordIme {
         }
         Ok(())
     }
-    fn open_setting(&self, _page: &str) -> anyhow::Result<()> {
-        warn!("setting.open: Rust 端设置应用待补");
+    fn open_setting(&self, page: &str) -> anyhow::Result<()> {
+        if let Some(c) = self.0.upgrade() {
+            c.open_settings(if page.is_empty() { None } else { Some(page) });
+        }
         Ok(())
     }
-    fn open_setting_web(&self, _page: &str) -> anyhow::Result<()> {
-        warn!("setting.web: Rust 端设置应用待补");
+    fn open_setting_web(&self, page: &str) -> anyhow::Result<()> {
+        // web 配置已废弃，降级到 native 设置
+        if let Some(c) = self.0.upgrade() {
+            c.open_settings(if page.is_empty() { None } else { Some(page) });
+        }
         Ok(())
     }
     fn set_schema(&self, id: &str) -> anyhow::Result<()> {

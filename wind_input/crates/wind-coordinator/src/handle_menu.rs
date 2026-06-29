@@ -74,16 +74,27 @@ impl Coordinator {
     /// （`--page <name>`，name ∈ general/input/hotkey/appearance/dictionary/advanced/about/stats）；
     /// 找不到桌面应用再回退到内嵌 web 配置（签发 token 构造 URL，page 以 `#<name>` 片段附加）。
     /// page=None 打开默认页。设置/词库管理/关于等菜单项统一经此函数。
+    ///
+    /// 执行路径：有 TSF 连接时经 IPC 让宿主进程执行 ShellExecuteW（有前台权限，能拉窗口到前面）；
+    /// 无 TSF 连接时回退到服务进程侧直接启动。
     pub(crate) fn open_settings(&self, page: Option<&str>) {
         if let Some(app) = crate::coordinator::settings_app_path() {
             let args = page.map(|p| format!("--page {p}")).unwrap_or_default();
-            let _ = self.ui_tx.send(UiCommand::OpenApp { path: app, args });
+            if self.push_server.has_clients() {
+                self.push_shell_exec(&app, &args);
+            } else {
+                let _ = self.ui_tx.send(UiCommand::OpenApp { path: app, args });
+            }
         } else if let Some(url) = crate::coordinator::settings_url() {
             let url = match page {
                 Some(p) => format!("{url}#{p}"),
                 None => url,
             };
-            let _ = self.ui_tx.send(UiCommand::OpenPath(url));
+            if self.push_server.has_clients() {
+                self.push_shell_exec(&url, "");
+            } else {
+                let _ = self.ui_tx.send(UiCommand::OpenPath(url));
+            }
         } else {
             tracing::warn!("打开设置失败：未找到 wind_setting 程序，web 服务也未就绪");
         }
