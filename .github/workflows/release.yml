@@ -84,7 +84,7 @@ jobs:
 
       - name: 打包安装程序 (cross stub + native packer，免 wine)
         working-directory: WindInput
-        run: ./scripts/pack-installer.sh --version "$BUILD_VERSION" --compression zstd
+        run: ./scripts/pack-installer.sh --version "$BUILD_VERSION" --compression lzma
 
       - name: 创建草稿 Release (仅 tag 触发)
         if: github.ref_type == 'tag'

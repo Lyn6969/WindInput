@@ -24,7 +24,7 @@ TARGET="x86_64-pc-windows-msvc"   # cargo-xwin 交叉编译 stub/uninstaller;pac
 
 # ---- 默认值 ----
 VERSION="${WIND_VERSION:-}"
-COMPRESSION="${WIND_COMPRESSION:-zstd}"
+COMPRESSION="${WIND_COMPRESSION:-lzma}"
 BUILD_DIR="${WIND_BUILD_DIR:-$PRODUCT_ROOT/build}"
 INSTALLER_DIR="${WIND_INSTALLER_DIR:-$PRODUCT_ROOT/../wind-installer}"
 OUTPUT=""
@@ -108,7 +108,8 @@ done
 mkdir -p "$DIST_DIR"
 
 # ---- 组装干净 staging 目录(只含分发文件,排除 obj/ 等 TSF 中间产物)----
-# pack --source 会递归打包整个目录,故不能直接打 BUILD_DIR(含 obj/)。
+# wind-packer pack 从 app.toml 的 source_dir 读取源目录,不接受 --source CLI 参数,
+# 故先 staging 再 patch app.toml,而非直接打 BUILD_DIR(含 obj/)。
 STAGE="$DIST_DIR/stage"
 rm -rf "$STAGE"; mkdir -p "$STAGE"
 cleanup() { rm -rf "$STAGE"; }
@@ -125,8 +126,23 @@ else
 fi
 
 # ---- 阶段一:压缩打包 ----
+# wind-packer pack 的 source_dir/compression 由 app.toml 控制，无对应 CLI 参数；
+# 临时 patch app.toml，用 EXIT trap 兜底还原。
 echo ">>> 阶段一:pack(算法 $COMPRESSION)..."
-"$PACKER" pack --source "$STAGE" --output "$ARCHIVE" --compression "$COMPRESSION"
+STAGE_REL="$(python3 -c "import os; print(os.path.relpath('$STAGE', '$INSTALLER_DIR'))")"
+cp "$INSTALLER_DIR/app.toml" "$INSTALLER_DIR/app.toml.bak"
+restore_toml() { mv "$INSTALLER_DIR/app.toml.bak" "$INSTALLER_DIR/app.toml" 2>/dev/null || true; }
+trap 'cleanup; restore_toml' EXIT
+python3 - "$INSTALLER_DIR/app.toml" "$STAGE_REL" "$COMPRESSION" << 'PYEOF'
+import re, sys
+path, src_rel, comp = sys.argv[1], sys.argv[2], sys.argv[3]
+content = open(path).read()
+content = re.sub(r'(source_dir\s*=\s*)"[^"]*"', rf'\1"{src_rel}"', content)
+content = re.sub(r'(compression\s*=\s*)"[^"]*"', rf'\1"{comp}"', content)
+open(path, 'w').write(content)
+PYEOF
+(cd "$INSTALLER_DIR" && "$PACKER" pack --output "$ARCHIVE")
+restore_toml
 
 # ---- 阶段二:拼接 stub + archive ----
 echo ">>> 阶段二:bundle ..."
