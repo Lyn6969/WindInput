@@ -465,8 +465,10 @@ impl CandidateWindow {
         }
     }
 
-    /// 悬停时在该候选下方显示其编码（反查）；无悬停或无编码则隐藏。
+    /// 悬停时显示候选编码（反查）；无悬停或无编码则隐藏。
     /// `(wx, wy)` 为候选窗口屏幕原点（命中矩形坐标的基准）。
+    /// 横排：tooltip 在候选行下方（不足时上翻）。
+    /// 竖排：tooltip 在候选窗右侧（不足时左侧），纵向对齐悬停候选行，避免遮挡下方候选。
     fn update_tooltip(&mut self, wx: i32, wy: i32) {
         let hover = self.hover;
         // 仅候选项（非翻页器 tag）显示反查提示
@@ -487,12 +489,26 @@ impl CandidateWindow {
         };
         if let Some(tip) = self.tooltip.as_mut() {
             match info {
-                Some((code, r)) => tip.show(
-                    &code,
-                    wx + r.x as i32,
-                    wy + r.y as i32,         // 候选行上边界
-                    wy + (r.y + r.h) as i32, // 候选行下边界
-                ),
+                Some((code, r)) => {
+                    if self.vertical {
+                        // 竖排：显示在候选窗右侧（不足时左侧），纵向对齐候选行
+                        let win_w = self.window.size().0 as i32;
+                        tip.show_beside(
+                            &code,
+                            wx,             // 窗口左边界
+                            wx + win_w,     // 窗口右边界
+                            wy + r.y as i32,
+                            wy + (r.y + r.h) as i32,
+                        );
+                    } else {
+                        tip.show(
+                            &code,
+                            wx + r.x as i32,
+                            wy + r.y as i32,
+                            wy + (r.y + r.h) as i32,
+                        );
+                    }
+                }
                 None => tip.hide(),
             }
         }

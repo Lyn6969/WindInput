@@ -8,7 +8,7 @@
 //! - 拼音：`pinyin_map.txt`（pinyin-data 格式：`U+4E00: yī  # 一`，多音字逗号分隔）
 //!   由 wind-tools `gen_pinyin` 从 mozillazg/pinyin-data 合并生成。
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
 /// 悬停提示生成选项（对齐 Go `ui.tooltip.*` provider 开关）。
@@ -49,6 +49,109 @@ pub struct ReverseLookup {
     /// 字 → 拼音读音（多音字按常用频率排序，最常用在前）
     pinyin: HashMap<char, Vec<String>>,
 }
+
+// ── 内部 Section 结构（对齐 Go tooltip.Section）──────────────────────────────
+
+struct Section {
+    label: String,
+    lines: Vec<String>,
+    /// 强制多行展开格式（即使只有 1 行内容）
+    always_expand: bool,
+}
+
+/// 格式化 sections → 最终文本（对齐 Go `FormatContent`）。
+/// 单行 section：`标签: 内容`；多行或 always_expand：`[标签]` + 逐行。
+fn format_sections(sections: Vec<Section>) -> String {
+    let mut parts: Vec<String> = Vec::new();
+    for sec in sections {
+        if sec.lines.is_empty() {
+            continue;
+        }
+        if sec.lines.len() == 1 && !sec.always_expand {
+            let line = sec.lines.into_iter().next().unwrap();
+            if sec.label.is_empty() {
+                parts.push(line);
+            } else {
+                parts.push(format!("{}: {}", sec.label, line));
+            }
+        } else {
+            if !sec.label.is_empty() {
+                parts.push(format!("[{}]", sec.label));
+            }
+            parts.extend(sec.lines);
+        }
+    }
+    parts.join("\n")
+}
+
+/// 当 sections 中同时包含"拆字"和"拼音"时，按字合并为"拆字 / 拼音" section。
+/// 合并行格式：`<拆字行>\t<拼音读音>`（渲染层可按 \t 做列对齐）。
+/// 对齐 Go `tooltip.MergeChaiziPinyin`。
+fn merge_chaizi_pinyin(sections: Vec<Section>) -> Vec<Section> {
+    let ci = sections.iter().position(|s| s.label == "拆字");
+    let pi = sections.iter().position(|s| s.label == "拼音");
+    let (Some(ci), Some(pi)) = (ci, pi) else {
+        return sections;
+    };
+
+    // 建拼音 map：rune → 读音（剥离"字："前缀，避免合并行重复出现汉字）
+    const FULL_COLON: char = '：';
+    let flen = FULL_COLON.len_utf8();
+    let mut pin_map: HashMap<char, String> = HashMap::new();
+    let mut pin_full: HashMap<char, String> = HashMap::new();
+    let mut pin_order: Vec<char> = Vec::new();
+    for line in &sections[pi].lines {
+        if let Some(head) = line.chars().next() {
+            pin_full.insert(head, line.clone());
+            let reading = line
+                .find(FULL_COLON)
+                .map(|i| line[i + flen..].to_string())
+                .unwrap_or_else(|| line.clone());
+            pin_map.insert(head, reading);
+            pin_order.push(head);
+        }
+    }
+
+    // 合并拆字行 + 拼音读音（\t 分隔）
+    let mut used: HashSet<char> = HashSet::new();
+    let mut merged: Vec<String> = Vec::new();
+    for cz in &sections[ci].lines {
+        match cz.chars().next() {
+            Some(h) if pin_map.contains_key(&h) => {
+                used.insert(h);
+                merged.push(format!("{}\t{}", cz, pin_map[&h]));
+            }
+            _ => merged.push(cz.clone()),
+        }
+    }
+    // 拼音独有字（拆字库未收录）补在末尾，保留"字：读音"完整格式
+    for &r in &pin_order {
+        if !used.contains(&r) {
+            merged.push(pin_full[&r].clone());
+        }
+    }
+
+    let combined = Section {
+        label: "拆字 / 拼音".to_string(),
+        lines: merged,
+        always_expand: true,
+    };
+    // 用合并 section 替换拆字位置，删除拼音 section
+    let mut combined_opt = Some(combined);
+    let mut out: Vec<Section> = Vec::with_capacity(sections.len() - 1);
+    for (i, s) in sections.into_iter().enumerate() {
+        if i == pi {
+            // skip 拼音 section
+        } else if i == ci {
+            out.push(combined_opt.take().unwrap());
+        } else {
+            out.push(s);
+        }
+    }
+    out
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 
 impl ReverseLookup {
     pub fn load(data_dir: Option<&Path>) -> Self {
@@ -179,7 +282,13 @@ impl ReverseLookup {
     }
 
     /// 为候选文本生成反查提示，按 `opts` 门控各 provider，分段输出（对齐 Go tooltip）。
-    /// 段序：拼音 / 拆字 / 编码，每段含标题行 + 逐字「字：内容」。无可用信息返回空串。
+    ///
+    /// 格式规则（对齐 Go `FormatContent`）：
+    /// - 单行 section → `标签: 内容`（行内标签，无 []）
+    /// - 多行或 always_expand → `[标签]` 标题行 + 逐行内容
+    ///
+    /// 拆字+拼音同时开启时融合为 `[拆字 / 拼音]`，每行用 `\t` 分隔两列。
+    /// 编码段：仅当拆字关闭时显示，以整词维度（不逐字拆）单行输出。
     pub fn tooltip_for(&self, text: &str, opts: &TooltipOptions) -> String {
         if self.is_empty() {
             return String::new();
@@ -188,9 +297,9 @@ impl ReverseLookup {
         if chars.is_empty() {
             return String::new();
         }
-        let mut sections: Vec<String> = Vec::new();
+        let mut sections: Vec<Section> = Vec::new();
 
-        // 拼音段
+        // 拼音段（逐字，always_expand）
         if opts.pinyin {
             let mut lines = Vec::new();
             for &c in &chars {
@@ -209,10 +318,15 @@ impl ReverseLookup {
                 }
             }
             if !lines.is_empty() {
-                sections.push(format!("拼音\n{}", lines.join("\n")));
+                sections.push(Section {
+                    label: "拼音".into(),
+                    lines,
+                    always_expand: true,
+                });
             }
         }
-        // 拆字段（字根 [编码]）
+
+        // 拆字段（字根 [编码]，always_expand；对齐 Go ChaiziProvider）
         if opts.chaizi {
             let mut lines = Vec::new();
             for &c in &chars {
@@ -225,22 +339,32 @@ impl ReverseLookup {
                 }
             }
             if !lines.is_empty() {
-                sections.push(format!("拆字\n{}", lines.join("\n")));
+                sections.push(Section {
+                    label: "拆字".into(),
+                    lines,
+                    always_expand: true,
+                });
             }
         }
-        // 编码段
-        if opts.code {
-            let mut lines = Vec::new();
-            for &c in &chars {
-                if let Some(code) = self.code.get(&c) {
-                    lines.push(format!("{c}：{code}"));
-                }
-            }
-            if !lines.is_empty() {
-                sections.push(format!("编码\n{}", lines.join("\n")));
+
+        // 编码段：整词维度，不逐字拆（对齐用户需求）。
+        // 拆字开启时编码已内嵌于拆字行（字：字根 [编码]），不再单独显示。
+        if opts.code && !opts.chaizi {
+            let filtered: String = chars.iter().collect();
+            let code = self.wubi_word_code(&filtered);
+            if !code.is_empty() {
+                sections.push(Section {
+                    label: "编码".into(),
+                    lines: vec![code],
+                    always_expand: false, // 单行 → "编码: xxxx"
+                });
             }
         }
-        sections.join("\n")
+
+        // 拆字+拼音融合（对齐 Go MergeChaiziPinyin）
+        let sections = merge_chaizi_pinyin(sections);
+
+        format_sections(sections)
     }
 }
 
@@ -304,14 +428,22 @@ mod tests {
     fn test_tooltip_default_pinyin_and_code() {
         let rl = sample_rl();
         let t = rl.tooltip_for("好人", &TooltipOptions::default());
-        // 默认：拼音段 + 编码段，无拆字段
-        assert!(t.contains("拼音"), "{t}");
+        // [拼音] 标题行
+        assert!(t.contains("[拼音]"), "应有 [拼音] 标题: {t}");
         assert!(t.contains("好：hǎo/hào"), "默认 heteronyms 显示全读音: {t}");
-        assert!(t.contains("编码"), "{t}");
-        assert!(t.contains("好：vbg"), "{t}");
+        // 编码为整词维度（2字取各前2码：vb+w=vbw）
+        assert!(t.contains("编码: vbw"), "整词编码单行: {t}");
         assert!(!t.contains("拆字"), "默认不含拆字: {t}");
         // 纯 ASCII 无反查
         assert_eq!(rl.tooltip_for("abc", &TooltipOptions::default()), "");
+    }
+
+    #[test]
+    fn test_tooltip_single_char_code() {
+        let rl = sample_rl();
+        let t = rl.tooltip_for("好", &TooltipOptions::default());
+        // 单字编码=全码
+        assert!(t.contains("编码: vbg"), "单字编码: {t}");
     }
 
     #[test]
@@ -361,7 +493,44 @@ mod tests {
             ..Default::default()
         };
         let t = rl.tooltip_for("好", &opts);
-        assert_eq!(t, "拆字\n好：女子 [vbg]", "拆字段含字根+编码: {t}");
+        // 多行 always_expand → [拆字] 标题 + 内容行
+        assert_eq!(t, "[拆字]\n好：女子 [vbg]", "拆字段含字根+编码: {t}");
+    }
+
+    #[test]
+    fn test_tooltip_chaizi_embeds_code() {
+        let rl = sample_rl();
+        // 拆字开启时，编码段不单独显示（已内嵌于拆字行）
+        let opts = TooltipOptions {
+            code: true,
+            pinyin: false,
+            chaizi: true,
+            ..Default::default()
+        };
+        let t = rl.tooltip_for("好", &opts);
+        assert!(t.contains("[拆字]"), "拆字标题: {t}");
+        assert!(t.contains("好：女子 [vbg]"), "编码内嵌于拆字行: {t}");
+        // 不应有独立的"编码: "行
+        assert!(!t.contains("编码: "), "拆字开时无独立编码段: {t}");
+    }
+
+    #[test]
+    fn test_tooltip_merge_chaizi_pinyin() {
+        let rl = sample_rl();
+        let opts = TooltipOptions {
+            code: false,
+            pinyin: true,
+            chaizi: true,
+            ..Default::default()
+        };
+        let t = rl.tooltip_for("好", &opts);
+        // 拆字+拼音融合为 [拆字 / 拼音]
+        assert!(t.contains("[拆字 / 拼音]"), "融合标题: {t}");
+        // 拆字行 + \t + 拼音读音（剥离"字："前缀）
+        assert!(t.contains("好：女子 [vbg]\thǎo/hào"), "融合行含拆字+拼音: {t}");
+        // 不应有独立的拼音或拆字标题
+        assert!(!t.contains("[拼音]"), "无独立拼音段: {t}");
+        assert!(!t.contains("[拆字]"), "无独立拆字段: {t}");
     }
 
     #[test]

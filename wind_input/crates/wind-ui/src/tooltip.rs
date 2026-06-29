@@ -108,15 +108,9 @@ impl Tooltip {
         }
     }
 
-    /// 显示提示，左上角对齐 (x,y)（屏幕坐标）
-    /// 在候选行下方显示提示；下方放不下则上翻到候选行**上方**（让出整行高度，不遮候选）。
-    /// `anchor_top`/`anchor_bottom` 为候选行的屏幕上/下边界。
-    pub fn show(&mut self, text: &str, x: i32, anchor_top: i32, anchor_bottom: i32) {
-        if text.is_empty() {
-            self.hide();
-            return;
-        }
-        self.ensure_scale(x, anchor_bottom);
+    /// 渲染文本到窗口缓冲，返回内容尺寸和阴影 margin。
+    /// 返回 `(cw, ch, ml, mt, mr, mb)`；失败返回 None（text 为空时调用方已拦截）。
+    fn render_to_window(&mut self, text: &str) -> (u32, u32, u32, u32, u32, u32) {
         let s = self.scale;
         let mut tip = View::leaf(text, self.fg)
             .bg(self.bg)
@@ -133,7 +127,6 @@ impl Tooltip {
             tip = tip.layers(self.layers.clone());
         }
 
-        // 软投影四向扩边：内容布局起点移到 (ml, mt)，窗口位置左上回移。
         let (ml, mt, mr, mb) = self
             .shadow
             .as_ref()
@@ -152,23 +145,40 @@ impl Tooltip {
             let n = (w * h * 4) as usize;
             buf[..n].fill(0);
             if let Some(sh) = &self.shadow {
-                sh.paint(
-                    buf,
-                    w,
-                    h,
-                    ml as f32,
-                    mt as f32,
-                    cw as f32,
-                    ch as f32,
-                    tip.corner_radius,
-                );
+                sh.paint(buf, w, h, ml as f32, mt as f32, cw as f32, ch as f32, tip.corner_radius);
             }
             tip.paint(buf, w, h, &self.renderer);
         }
         let _ = self.window.update();
+        (cw, ch, ml, mt, mr, mb)
+    }
 
+    /// 横排模式：在候选行下方显示提示，下方不足时上翻到候选行上方。
+    /// `anchor_top`/`anchor_bottom` 为候选行的屏幕上/下边界。
+    pub fn show(&mut self, text: &str, x: i32, anchor_top: i32, anchor_bottom: i32) {
+        if text.is_empty() {
+            self.hide();
+            return;
+        }
+        self.ensure_scale(x, anchor_bottom);
+        let (cw, ch, ml, mt, ..) = self.render_to_window(text);
         // 内容盒按工作区钳位（下方优先，不足上翻到候选行上方）；窗口原点 = 内容锚点 − 左/上 margin。
         let (px, py) = clamp_to_work_area(x, anchor_top, anchor_bottom, cw, ch);
+        self.window.show(px - ml as i32, py - mt as i32);
+        self.visible = true;
+    }
+
+    /// 竖排模式：在候选窗右侧显示提示，右侧空间不足时改显示在左侧。
+    /// `win_left`/`win_right` 为候选窗左右边界（含阴影）屏幕坐标。
+    /// `row_top`/`row_bottom` 为悬停候选行的屏幕上/下边界，tooltip 纵向对齐候选行。
+    pub fn show_beside(&mut self, text: &str, win_left: i32, win_right: i32, row_top: i32, row_bottom: i32) {
+        if text.is_empty() {
+            self.hide();
+            return;
+        }
+        self.ensure_scale(win_right, row_top);
+        let (cw, ch, ml, mt, ..) = self.render_to_window(text);
+        let (px, py) = clamp_beside(win_left, win_right, row_top, row_bottom, cw, ch);
         self.window.show(px - ml as i32, py - mt as i32);
         self.visible = true;
     }
@@ -197,6 +207,50 @@ fn dpi_scale() -> f32 {
     {
         1.0
     }
+}
+
+/// 竖排模式：tooltip 显示在候选窗**右侧**（空间不足时改左侧），纵向对齐悬停候选行。
+/// `win_left`/`win_right` 为候选窗左右边界（含阴影）；`row_top`/`row_bottom` 为候选行上下边界。
+#[cfg_attr(not(windows), allow(unused_variables))]
+fn clamp_beside(win_left: i32, win_right: i32, row_top: i32, _row_bottom: i32, w: u32, h: u32) -> (i32, i32) {
+    let gap = 4;
+    let (mut px, mut py) = (win_right + gap, row_top);
+    #[cfg(windows)]
+    {
+        use windows::Win32::Foundation::POINT;
+        use windows::Win32::Graphics::Gdi::{
+            GetMonitorInfoW, MONITOR_DEFAULTTONEAREST, MONITORINFO, MonitorFromPoint,
+        };
+        unsafe {
+            let pt = POINT { x: win_right, y: row_top };
+            let mon = MonitorFromPoint(pt, MONITOR_DEFAULTTONEAREST);
+            let mut mi = MONITORINFO {
+                cbSize: std::mem::size_of::<MONITORINFO>() as u32,
+                ..Default::default()
+            };
+            if GetMonitorInfoW(mon, &mut mi).as_bool() {
+                let wa = mi.rcWork;
+                let (wi, hi) = (w as i32, h as i32);
+                // 右侧放不下则改左侧
+                if px + wi > wa.right {
+                    px = win_left - gap - wi;
+                }
+                // 左侧也越界则贴左边
+                if px < wa.left {
+                    px = wa.left;
+                }
+                // 纵向：对齐候选行顶，下方越界时上移
+                if py + hi > wa.bottom {
+                    py = wa.bottom - hi;
+                }
+                if py < wa.top {
+                    py = wa.top;
+                }
+                return (px, py);
+            }
+        }
+    }
+    (px, py)
 }
 
 /// 钳位 tooltip 到工作区：默认候选行下方（anchor_bottom + gap）；下方放不下则上翻到候选行
