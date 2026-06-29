@@ -69,11 +69,6 @@ impl Dict {
         Self::parse(&data)
     }
 
-    fn key_of(&self, i: usize) -> &[u8] {
-        let e = &self.entries[i];
-        &self.strings[e.key_off as usize..e.key_off as usize + e.key_len as usize]
-    }
-
     fn val_of(&self, i: usize) -> &[u8] {
         let e = &self.entries[i];
         &self.strings[e.val_off as usize..e.val_off as usize + e.val_len as usize]

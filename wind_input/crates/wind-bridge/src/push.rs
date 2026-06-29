@@ -233,7 +233,7 @@ fn run_push_pipe_server(pipe_name: &str, clients: Arc<Mutex<Vec<PushClient>>>) {
             if write_ok.is_err() {
                 warn!("Failed to send SERVICE_READY to push client");
                 unsafe {
-                    DisconnectNamedPipe(pipe_handle);
+                    let _ = DisconnectNamedPipe(pipe_handle);
                     let _ = CloseHandle(pipe_handle);
                 }
                 continue;
@@ -256,7 +256,7 @@ fn run_push_pipe_server(pipe_name: &str, clients: Arc<Mutex<Vec<PushClient>>>) {
         if read_ok.is_err() || bytes_read != 8 {
             warn!("Failed to read push client token");
             unsafe {
-                DisconnectNamedPipe(pipe_handle);
+                let _ = DisconnectNamedPipe(pipe_handle);
                 let _ = CloseHandle(pipe_handle);
             }
             continue;
@@ -320,7 +320,7 @@ fn push_writer_loop(
     }
 
     unsafe {
-        windows::Win32::System::Pipes::DisconnectNamedPipe(pipe);
+        let _ = windows::Win32::System::Pipes::DisconnectNamedPipe(pipe);
         let _ = CloseHandle(pipe);
     }
 

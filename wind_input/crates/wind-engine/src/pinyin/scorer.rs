@@ -52,7 +52,7 @@ impl AbbrevMatcher {
     ///       第 2 个字的拼音以 z 开头，第 3 个字的拼音以 d 开头。
     pub fn find_candidates(
         input: &str,
-        trie: &SyllableTrie,
+        _trie: &SyllableTrie,
         dict: &CachedDict,
         limit: usize,
     ) -> Vec<AbbrevCandidate> {

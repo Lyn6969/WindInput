@@ -74,6 +74,7 @@ impl Default for CandidateWindowConfig {
 
 impl CandidateWindowConfig {
     /// 序号标签颜色（比正文淡）
+    #[allow(dead_code)]
     fn marker_color(&self) -> [u8; 4] {
         [140, 140, 145, 255]
     }
@@ -100,6 +101,7 @@ impl CandidateWindowConfig {
 /// 候选窗口
 pub struct CandidateWindow {
     window: LayeredWindow,
+    #[allow(dead_code)]
     config: CandidateWindowConfig,
     candidates: Vec<CandidateItem>,
     preedit: String,

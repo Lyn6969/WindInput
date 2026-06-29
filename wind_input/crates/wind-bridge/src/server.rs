@@ -164,7 +164,6 @@ fn handle_client(pipe: PipeHandle, handler: Arc<dyn MessageHandler>, _timeout_ms
     use wind_ipc::protocol::*;
     use windows::Win32::Foundation::*;
     use windows::Win32::Storage::FileSystem::*;
-    use windows::Win32::System::Pipes::*;
 
     let pipe = pipe.0;
     let mut header_buf = [0u8; IpcHeader::SIZE];
@@ -298,7 +297,7 @@ fn handle_client(pipe: PipeHandle, handler: Arc<dyn MessageHandler>, _timeout_ms
     }
 
     unsafe {
-        windows::Win32::System::Pipes::DisconnectNamedPipe(pipe);
+        let _ = windows::Win32::System::Pipes::DisconnectNamedPipe(pipe);
         let _ = CloseHandle(pipe);
     }
     debug!("Client disconnected from bridge pipe");

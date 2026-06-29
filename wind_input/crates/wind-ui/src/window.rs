@@ -200,8 +200,8 @@ mod platform {
                 );
 
                 SelectObject(hdc_mem, old_bmp);
-                DeleteObject(hbitmap);
-                DeleteDC(hdc_mem);
+                let _ = DeleteObject(hbitmap);
+                let _ = DeleteDC(hdc_mem);
                 ReleaseDC(HWND::default(), hdc_screen);
 
                 if result.is_err() {
@@ -283,7 +283,7 @@ mod platform {
                     }
                 }
             }
-            DefWindowProcW(hwnd, msg, wparam, lparam)
+            unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
         }
     }
 

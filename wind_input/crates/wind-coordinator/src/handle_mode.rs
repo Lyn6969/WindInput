@@ -9,7 +9,6 @@ use tracing::{debug, info, warn};
 use wind_bridge::handler::KeyAction;
 use wind_config::Config;
 use wind_ui::manager::UiCommand;
-use wind_ui::toast::{ToastKind, ToastPosition};
 
 use crate::coordinator::{printable_char, punct_char};
 use wind_bridge::handler::KeyEventData;

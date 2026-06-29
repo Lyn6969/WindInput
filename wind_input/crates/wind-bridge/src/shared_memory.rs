@@ -2,8 +2,6 @@
 //!
 //! 与 Go 版本 `wind_input/internal/bridge/shared_memory.go` 对齐。
 
-use wind_ipc::protocol::SharedRenderHeader;
-
 /// 共享内存管理器
 pub struct SharedMemoryManager {
     suffix: String,

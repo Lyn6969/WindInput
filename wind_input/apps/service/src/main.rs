@@ -18,13 +18,6 @@ use wind_bridge::server::{BridgeConfig, BridgeServer};
 
 mod config_cli;
 
-/// 获取管道名称后缀（debug 变体使用 "_debug"）
-#[cfg(feature = "debug_variant")]
-const PIPE_SUFFIX: &str = "_debug";
-
-#[cfg(not(feature = "debug_variant"))]
-const PIPE_SUFFIX: &str = "";
-
 /// GUI 子系统（release profile，`windows_subsystem="windows"`）下进程不附着控制台，
 /// 故 CLI 子命令的 `println!` 无处可写。此函数把进程附着到**父控制台**（调用它的 cmd/PowerShell），
 /// 并把 `CONOUT$/CONIN$` 设回标准句柄，让 stdout/stderr/stdin 直达该终端。
