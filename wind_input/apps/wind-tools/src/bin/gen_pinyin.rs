@@ -8,9 +8,12 @@
 //! 数据源：https://github.com/mozillazg/pinyin-data
 //! 优先级（从高到低）：
 //!  1. overwrite.txt      — 手工纠正，最终权威（可选）
-//!  2. kXHC1983.txt       — 现代新华字典多音字（最常用音在前）
-//!  3. kTGHZ2013.txt      — 通用规范汉字多音字（补 XHC 遗漏）
-//!  4. kMandarin_8105.txt — 8105 标准汉字首音（迭代字集 + fallback）
+//!  2. kMandarin_8105.txt — 8105 规范首音决定读音顺序（经语委审定，代表最常用音）
+//!  3. kTGHZ2013.txt      — 通用规范汉字，补充 8105 未收录的额外读音
+//!  4. kXHC1983.txt       — 新华字典，收录极全（含古音/罕用音），最后补充
+//!
+//! 注：kXHC1983 / kTGHZ2013 多音字顺序按汉语拼音字母序排列，并非按使用频率，
+//! 故不作为排序依据，只用于补充 8105 遗漏的读音。
 //!
 //! 刻意排除 kHanyuPinyin.txt（汉语大字典，含大量古音/方言音）。
 //!
@@ -50,18 +53,23 @@ fn main() -> anyhow::Result<()> {
         } else {
             let mut seen: HashMap<&str, ()> = HashMap::new();
             let mut readings: Vec<String> = Vec::new();
-            for py in xhc.get(code).into_iter().flatten() {
+            // 8105 规范首音优先确定顺序
+            for py in primary.iter() {
                 if seen.insert(py.as_str(), ()).is_none() {
                     readings.push(py.clone());
                 }
             }
+            // kTGHZ2013 补充 8105 未收录的读音
             for py in tghz.get(code).into_iter().flatten() {
                 if seen.insert(py.as_str(), ()).is_none() {
                     readings.push(py.clone());
                 }
             }
-            if readings.is_empty() {
-                readings = primary.clone();
+            // kXHC1983 最后补充（收录极全，含古音/罕用音）
+            for py in xhc.get(code).into_iter().flatten() {
+                if seen.insert(py.as_str(), ()).is_none() {
+                    readings.push(py.clone());
+                }
             }
             readings
         };
