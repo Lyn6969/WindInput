@@ -235,6 +235,9 @@ impl Coordinator {
         self.notify_toolbar();
         self.notify_ui_hide();
         self.show_status();
+        if let Err(e) = Config::set_user_string(&["schema", "active"], &id) {
+            warn!("select_schema: 持久化 schema.active 失败: {}", e);
+        }
     }
 
     /// 选择第 N 个主题。
@@ -483,6 +486,9 @@ impl Coordinator {
             self.show_status();
             self.notify_toolbar();
             info!("Cycled to schema: {}", next);
+            if let Err(e) = Config::set_user_string(&["schema", "active"], &next) {
+                warn!("cycle_schema: 持久化 schema.active 失败: {}", e);
+            }
         }
     }
 
