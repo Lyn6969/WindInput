@@ -22,7 +22,9 @@ impl TooltipMouse {
     #[cfg(windows)]
     fn arm_leave(&self) {
         unsafe {
-            use windows::Win32::UI::Input::KeyboardAndMouse::{TME_LEAVE, TRACKMOUSEEVENT, TrackMouseEvent};
+            use windows::Win32::UI::Input::KeyboardAndMouse::{
+                TME_LEAVE, TRACKMOUSEEVENT, TrackMouseEvent,
+            };
             let mut t = TRACKMOUSEEVENT {
                 cbSize: std::mem::size_of::<TRACKMOUSEEVENT>() as u32,
                 dwFlags: TME_LEAVE,
@@ -37,7 +39,13 @@ impl TooltipMouse {
 }
 
 impl WindowMouse for TooltipMouse {
-    fn on_message(&mut self, _hwnd: HWND, msg: u32, _wparam: WPARAM, _lparam: LPARAM) -> Option<LRESULT> {
+    fn on_message(
+        &mut self,
+        _hwnd: HWND,
+        msg: u32,
+        _wparam: WPARAM,
+        _lparam: LPARAM,
+    ) -> Option<LRESULT> {
         match msg {
             WM_MOUSEMOVE => {
                 self.mouse_over.set(true);
