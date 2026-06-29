@@ -191,6 +191,29 @@ impl StatusTip {
         self.window.show(fx - ml as i32, fy - mt as i32);
     }
 
+    /// 将当前渲染帧保存为 PNG 文件（截图用）。
+    pub fn capture_to_file(&self, path: &std::path::Path) -> Result<(), String> {
+        self.window.capture_to_file(path)
+    }
+
+    /// 窗口当前是否可见（查询 Win32 IsWindowVisible）。
+    pub fn is_visible(&self) -> bool {
+        #[cfg(windows)]
+        unsafe {
+            windows::Win32::UI::WindowsAndMessaging::IsWindowVisible(self.window.hwnd()).as_bool()
+        }
+        #[cfg(not(windows))]
+        {
+            false
+        }
+    }
+
+    /// 返回状态提示窗口句柄（截图用）。
+    #[cfg(windows)]
+    pub fn hwnd(&self) -> windows::Win32::Foundation::HWND {
+        self.window.hwnd()
+    }
+
     pub fn hide(&self) {
         self.window.hide();
     }

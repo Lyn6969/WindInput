@@ -716,6 +716,20 @@ impl PopupMenu {
     pub fn is_visible(&self) -> bool {
         self.visible
     }
+
+    /// 返回根菜单窗口句柄（截图用；菜单不可见时返回 None）。
+    #[cfg(windows)]
+    pub fn hwnd(&self) -> Option<windows::Win32::Foundation::HWND> {
+        self.windows.first().map(|w| w.hwnd())
+    }
+
+    /// 将根菜单当前渲染帧保存为 PNG 文件（截图用）。
+    pub fn capture_to_file(&self, path: &std::path::Path) -> Result<(), String> {
+        self.windows
+            .first()
+            .ok_or_else(|| "no menu window".to_string())?
+            .capture_to_file(path)
+    }
 }
 
 /// 勾选标记（占独立固定宽列，保证标签对齐）。

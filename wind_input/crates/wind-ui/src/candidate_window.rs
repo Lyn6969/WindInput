@@ -1191,6 +1191,16 @@ impl CandidateWindow {
     pub fn hwnd(&self) -> HWND {
         self.window.hwnd()
     }
+
+    /// 将当前渲染帧保存为 PNG 文件（截图用）。
+    pub fn capture_to_file(&self, path: &std::path::Path) -> Result<(), String> {
+        self.window.capture_to_file(path)
+    }
+
+    /// 将当前渲染帧复制到剪贴板（截图用）。
+    pub fn capture_to_clipboard(&self) -> Result<(), String> {
+        self.window.capture_to_clipboard()
+    }
 }
 
 /// 候选窗鼠标处理器：命中候选→选词，悬停→高亮，滚轮→翻页。

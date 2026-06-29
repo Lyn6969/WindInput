@@ -108,6 +108,10 @@ pub enum UiCommand {
     OpenPath(String),
     /// 启动应用程序并传参（如 wind_setting.exe `--page dictionary`）。
     OpenApp { path: String, args: String },
+    /// 截图所有可见 UI 窗口，保存到 dir 目录（由协调器根据 config 确定）。
+    TakeScreenshot { dir: String },
+    /// 将候选窗口截图复制到剪贴板（候选不可见则提示）。
+    ScreenshotCandidateToClipboard,
     /// 关闭 UI
     Shutdown,
 }
@@ -181,6 +185,10 @@ pub enum MenuCmd {
     OpenSettings,
     /// 关于（暂兜底）
     OpenAbout,
+    /// 截图所有可见 UI 窗口到文件（高级菜单）
+    TakeScreenshot,
+    /// 截图候选窗口到剪贴板（高级菜单）
+    ScreenshotCandidateToClipboard,
 }
 
 /// 菜单项的动作类型（右键候选菜单 + 功能主菜单共用）
@@ -537,6 +545,110 @@ impl UiManager {
                     }
                     UiCommand::OpenApp { path, args } => {
                         open_app(&path, &args);
+                    }
+                    UiCommand::TakeScreenshot { dir } => {
+                        let ts = crate::screenshot::timestamp();
+                        let dir = std::path::PathBuf::from(&dir);
+                        let mut saved = 0usize;
+                        let mut candidate_to_clipboard = false;
+
+                        // 候选窗口：保存文件 + 同时复制到剪贴板（与 Go 对齐）
+                        if candidate_window.is_visible() {
+                            let path = dir.join(format!("candidate_{ts}.png"));
+                            match candidate_window.capture_to_file(&path) {
+                                Ok(_) => {
+                                    saved += 1;
+                                    info!("Screenshot saved: {:?}", path);
+                                    match candidate_window.capture_to_clipboard() {
+                                        Ok(_) => candidate_to_clipboard = true,
+                                        Err(e) => tracing::warn!("Screenshot clipboard: {}", e),
+                                    }
+                                }
+                                Err(e) => tracing::warn!("Screenshot candidate: {}", e),
+                            }
+                        }
+                        // 工具栏
+                        if let Some(tb) = &toolbar {
+                            if tb.is_visible() {
+                                let path = dir.join(format!("toolbar_{ts}.png"));
+                                match tb.capture_to_file(&path) {
+                                    Ok(_) => { saved += 1; info!("Screenshot saved: {:?}", path); }
+                                    Err(e) => tracing::warn!("Screenshot toolbar: {}", e),
+                                }
+                            }
+                        }
+                        // 状态提示
+                        if let Some(st) = &status_tip {
+                            if st.is_visible() {
+                                let path = dir.join(format!("status_tip_{ts}.png"));
+                                match st.capture_to_file(&path) {
+                                    Ok(_) => { saved += 1; info!("Screenshot saved: {:?}", path); }
+                                    Err(e) => tracing::warn!("Screenshot status_tip: {}", e),
+                                }
+                            }
+                        }
+                        // 右键菜单
+                        if let Some(pm) = &popup_menu {
+                            if pm.is_visible() {
+                                let path = dir.join(format!("popup_menu_{ts}.png"));
+                                match pm.capture_to_file(&path) {
+                                    Ok(_) => { saved += 1; info!("Screenshot saved: {:?}", path); }
+                                    Err(e) => tracing::warn!("Screenshot popup_menu: {}", e),
+                                }
+                            }
+                        }
+                        // Toast（通常不可见，有则顺带保存）
+                        if let Some(t) = &toast {
+                            if t.is_visible() {
+                                let path = dir.join(format!("toast_{ts}.png"));
+                                match t.capture_to_file(&path) {
+                                    Ok(_) => { saved += 1; info!("Screenshot saved: {:?}", path); }
+                                    Err(e) => tracing::warn!("Screenshot toast: {}", e),
+                                }
+                            }
+                        }
+                        info!("UI screenshots taken: {}, dir: {:?}", saved, dir);
+                        // 结果 toast
+                        if let Some(t) = &mut toast {
+                            let msg = if saved > 0 {
+                                if candidate_to_clipboard {
+                                    format!("已保存 {} 张截图（候选已复制到剪贴板）\n{}", saved, dir.display())
+                                } else {
+                                    format!("已保存 {} 张截图\n{}", saved, dir.display())
+                                }
+                            } else {
+                                "没有可见的 UI 窗口可截图".to_string()
+                            };
+                            let kind = if saved > 0 { ToastKind::Success } else { ToastKind::Info };
+                            t.show(&msg, ToastPosition::BottomRight, kind);
+                            toast_hide_at = Some(
+                                std::time::Instant::now()
+                                    + std::time::Duration::from_millis(4000),
+                            );
+                        }
+                    }
+                    UiCommand::ScreenshotCandidateToClipboard => {
+                        let (msg, kind) = if candidate_window.is_visible() {
+                            match candidate_window.capture_to_clipboard() {
+                                Ok(_) => {
+                                    info!("Candidate screenshot copied to clipboard");
+                                    ("候选窗口已截图到剪贴板".to_string(), ToastKind::Success)
+                                }
+                                Err(e) => {
+                                    tracing::warn!("Screenshot to clipboard failed: {}", e);
+                                    (format!("截图到剪贴板失败：{}", e), ToastKind::Error)
+                                }
+                            }
+                        } else {
+                            ("候选窗口未显示，无法截图".to_string(), ToastKind::Info)
+                        };
+                        if let Some(t) = &mut toast {
+                            t.show(&msg, ToastPosition::BottomRight, kind);
+                            toast_hide_at = Some(
+                                std::time::Instant::now()
+                                    + std::time::Duration::from_millis(3000),
+                            );
+                        }
                     }
                     UiCommand::ShowStatusTip {
                         text,

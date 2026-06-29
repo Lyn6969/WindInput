@@ -105,6 +105,7 @@ impl Compiler {
             ("toggle_full_width", &h.toggle_full_width),
             ("toggle_toolbar", &h.toggle_toolbar),
             ("open_settings", &h.open_settings),
+            ("take_screenshot", &h.take_screenshot),
         ] {
             if let Some(raw) = parse_hotkey(value) {
                 result.key_down.push(HotkeyEntry {

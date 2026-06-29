@@ -60,6 +60,14 @@ impl Coordinator {
             MenuCmd::OpenSettings => self.open_settings(None),
             MenuCmd::OpenDictionary => self.open_settings(Some("dictionary")),
             MenuCmd::OpenAbout => self.open_settings(Some("about")),
+            MenuCmd::TakeScreenshot => {
+                if let Some(dir) = screenshots_dir() {
+                    let _ = self.ui_tx.send(UiCommand::TakeScreenshot { dir });
+                }
+            }
+            MenuCmd::ScreenshotCandidateToClipboard => {
+                let _ = self.ui_tx.send(UiCommand::ScreenshotCandidateToClipboard);
+            }
             MenuCmd::OpenConfigDir => {
                 if let Some(d) = Config::user_config_dir() {
                     let _ = self
@@ -182,6 +190,12 @@ impl Coordinator {
             })
             .collect();
 
+        // 高级子菜单：截图等不常用功能
+        let advanced_children = vec![
+            M::leaf("截图所有窗口到文件", cmd(MenuCmd::TakeScreenshot), true, false),
+            M::leaf("截图候选窗口到剪贴板", cmd(MenuCmd::ScreenshotCandidateToClipboard), true, false),
+        ];
+
         let items = vec![
             M::submenu("输入方案", schema_children),
             M::leaf("全角", cmd(MenuCmd::ToggleWidth), true, full),
@@ -194,6 +208,8 @@ impl Coordinator {
             M::separator(),
             M::leaf("重载配置", cmd(MenuCmd::ReloadConfig), true, false),
             M::leaf("重启服务", cmd(MenuCmd::RestartService), true, false),
+            M::separator(),
+            M::submenu("高级", advanced_children),
             M::separator(),
             M::leaf("词库管理...", cmd(MenuCmd::OpenDictionary), true, false),
             M::leaf("设置...", cmd(MenuCmd::OpenSettings), true, false),
@@ -451,4 +467,11 @@ fn monitor_key_from_point(x: i32, y: i32) -> String {
     }
     #[cfg(not(target_os = "windows"))]
     { "0,0".to_string() }
+}
+
+/// 截图保存目录：用户配置目录下的 `screenshots/` 子目录。
+/// 返回 None 表示无法确定用户目录（portable 模式但找不到 exe 路径等极罕见情况）。
+fn screenshots_dir() -> Option<String> {
+    Config::user_config_dir()
+        .map(|d| d.join("screenshots").display().to_string())
 }

@@ -636,6 +636,8 @@ pub struct KeysConfig {
     pub pin_candidate: String,
     #[serde(default = "default_delete_candidate")]
     pub delete_candidate: String,
+    #[serde(default = "default_take_screenshot")]
+    pub take_screenshot: String,
     #[serde(default)]
     pub global_hotkeys: Vec<String>,
     // ── 选择/导航键（原 input.*）──
@@ -673,6 +675,9 @@ fn default_add_word() -> String {
 fn default_toggle_s2t() -> String {
     "ctrl+shift+j".to_string()
 }
+fn default_take_screenshot() -> String {
+    "ctrl+shift+f11".to_string()
+}
 fn default_activate_ime() -> String {
     "ctrl+shift+[".to_string()
 }
@@ -707,6 +712,7 @@ impl Default for KeysConfig {
             activate_ime: default_activate_ime(),
             pin_candidate: default_pin_candidate(),
             delete_candidate: default_delete_candidate(),
+            take_screenshot: default_take_screenshot(),
             global_hotkeys: Vec::new(),
             select_key_groups: default_select_key_groups(),
             page_keys: default_page_keys(),

@@ -240,6 +240,16 @@ mod platform {
             (self.width, self.height)
         }
 
+        /// 将当前 BGRA buffer 保存为 PNG 文件（截图用）。
+        pub fn capture_to_file(&self, path: &std::path::Path) -> Result<(), String> {
+            crate::screenshot::save_bgra_to_png(&self.buffer, self.width, self.height, path)
+        }
+
+        /// 将当前 BGRA buffer 复制到剪贴板（截图用）。
+        pub fn capture_to_clipboard(&self) -> Result<(), String> {
+            crate::screenshot::copy_bgra_to_clipboard(&self.buffer, self.width, self.height)
+        }
+
         unsafe extern "system" fn wnd_proc(
             hwnd: HWND,
             msg: u32,
