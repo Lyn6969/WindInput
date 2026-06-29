@@ -1388,6 +1388,11 @@ impl Coordinator {
         // 延迟首次显示：新组合首帧若非经授权（reflow 后权威坐标 / 兜底 timer）则不立即显示，
         // 改 arm 兜底 timer，待 handle_caret_update 的权威坐标或超时再首显。避免在 reflow 前的
         // 陈旧坐标处先显示、reflow 后再跳（根治"上屏后立即输入候选窗错位约一个上屏宽度"）。
+        // 例外：仅显示模式标记（无候选/无编码）时跳过延迟——进入模式时缓冲为空、无刚上屏文字，
+        // 光标无 reflow 跳动风险，强制延迟只会让状态提示迟钝。
+        let only_mode_label = !mode_label.is_empty()
+            && state.candidates.is_empty()
+            && state.input_buffer.is_empty();
         let authorized = self
             .show_authorized
             .swap(false, std::sync::atomic::Ordering::Relaxed);
@@ -1396,6 +1401,7 @@ impl Coordinator {
                 .candidate_shown
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
+            && !only_mode_label
         {
             self.arm_pending_first_show();
             return;
