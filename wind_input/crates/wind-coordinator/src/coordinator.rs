@@ -2140,6 +2140,7 @@ impl MessageHandler for Coordinator {
                     s.full_width = !s.full_width;
                 }
                 self.push_state_update();
+                self.show_status();
                 Some(self.build_status())
             }
             "toggle_punct" => {
@@ -2148,6 +2149,7 @@ impl MessageHandler for Coordinator {
                     s.chinese_punct = !s.chinese_punct;
                 }
                 self.push_state_update();
+                self.show_status();
                 Some(self.build_status())
             }
             "switch_engine" => {
@@ -2155,12 +2157,11 @@ impl MessageHandler for Coordinator {
                 Some(self.build_status())
             }
             "toggle_s2t" => {
-                let on = {
+                {
                     let mut s = self.state.lock().unwrap_or_else(|e| e.into_inner());
                     s.s2t_enabled = !s.s2t_enabled;
-                    s.s2t_enabled
-                };
-                self.show_tip(if on { "繁" } else { "简" });
+                }
+                self.show_status();
                 Some(self.build_status())
             }
             _ => None,
