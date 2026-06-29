@@ -384,6 +384,18 @@ impl Default for PunctConfig {
     }
 }
 
+/// 智能符号替换方案。
+/// - `DeleteReplace`：press1 直接提交中文符号，press2 删改（当前方案，部分 Chromium 应用光标偏移）。
+/// - `HoldComposition`：press1 开启 TSF 组合态展示中文符号，press2 替换组合提交英文；
+///   超时（smart_timeout_ms）后自动提交中文，无删改操作（推荐）。
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum SmartMethod {
+    DeleteReplace,
+    #[default]
+    HoldComposition,
+}
+
 /// 智能符号配置（[input.symbol]）：同一中文标点在时限内连按两次，删前一字符替换为英文。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SymbolConfig {
@@ -396,6 +408,9 @@ pub struct SymbolConfig {
     /// 参与智能符号转换的中文标点集合（子串包含匹配，含成对/多字符标点）。
     #[serde(default = "default_smart_symbol_chars")]
     pub smart_chars: String,
+    /// 替换方案：`delete_replace`（删改）或 `hold_composition`（保持组合态，默认）。
+    #[serde(default)]
+    pub smart_method: SmartMethod,
 }
 
 impl Default for SymbolConfig {
@@ -404,6 +419,7 @@ impl Default for SymbolConfig {
             smart_mode: false,
             smart_timeout_ms: default_smart_symbol_timeout_ms(),
             smart_chars: default_smart_symbol_chars(),
+            smart_method: SmartMethod::default(),
         }
     }
 }
@@ -1753,5 +1769,29 @@ mod tests {
         assert_eq!(cfg.schema.active, "wubi86");
         // 佐证 L1 确实为空，覆盖来自 config.toml
         assert!(Config::default().compat.host_render_processes.is_empty());
+    }
+
+    #[test]
+    fn test_smart_method_default() {
+        let cfg = SymbolConfig::default();
+        assert_eq!(cfg.smart_method, SmartMethod::HoldComposition);
+    }
+
+    #[test]
+    fn test_smart_method_serde_round_trip() {
+        let toml = r#"
+smart_mode = true
+smart_method = "delete_replace"
+"#;
+        let cfg: SymbolConfig = toml::from_str(toml).unwrap();
+        assert_eq!(cfg.smart_method, SmartMethod::DeleteReplace);
+        assert!(cfg.smart_mode);
+    }
+
+    #[test]
+    fn test_smart_method_default_when_absent() {
+        let toml = r#"smart_mode = true"#;
+        let cfg: SymbolConfig = toml::from_str(toml).unwrap();
+        assert_eq!(cfg.smart_method, SmartMethod::HoldComposition);
     }
 }

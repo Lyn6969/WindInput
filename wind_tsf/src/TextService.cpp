@@ -3317,6 +3317,10 @@ static LONG s_lastCaretY = 0;
 static LONG s_lastCaretHeight = 20;
 static BOOL s_hasLastCaretPos = FALSE;
 
+// HoldComposition 计时器回调使用的 thread_local 实例指针。
+// SetTimer(NULL,...) 的回调在 TSF UI 线程上触发，thread_local 保证线程安全。
+static thread_local CTextService* g_holdTimerInstance = nullptr;
+
 // Get caret position using TSF APIs (for browsers and modern apps)
 BOOL CTextService::GetCaretPositionFromTSF(LONG* px, LONG* py, LONG* pHeight)
 {
@@ -4262,6 +4266,9 @@ void CTextService::UpdateFullStatus(BOOL bChineseMode, BOOL bFullWidth, BOOL bCh
 // ITfCompositionSink implementation
 STDAPI CTextService::OnCompositionTerminated(TfEditCookie ecWrite, ITfComposition* pComposition)
 {
+    // 组合被强制终止时（焦点切换、宿主 EndComposition 等），取消 HoldComposition 计时器。
+    CancelHoldTimer();
+
     WIND_LOG_DEBUG(L"OnCompositionTerminated called\n");
 
     // Clear composition text cache
@@ -4632,6 +4639,10 @@ BOOL CTextService::ReplacePrecedingChars(int count, const std::wstring& text)
 // text that was inserted by a subsequent synchronous InsertText.
 BOOL CTextService::CommitText(const std::wstring& text)
 {
+    // 如果 HoldComposition 计时器活跃（智能符号等待 press2），先取消，
+    // 防止 timeout 与此次 commit 竞争。
+    CancelHoldTimer();
+
     LARGE_INTEGER startTime, endTime, freq;
     QueryPerformanceCounter(&startTime);
     QueryPerformanceFrequency(&freq);
@@ -4938,4 +4949,75 @@ void CTextService::_UninitDisplayAttribute()
 {
     // Reset the GUID atom
     _gaDisplayAttributeInput = TF_INVALID_GUIDATOM;
+}
+
+// ─── HoldComposition ─────────────────────────────────────────────────────────
+
+BOOL CTextService::HoldComposition(const std::wstring& text, UINT timeoutMs)
+{
+    WIND_LOG_DEBUG_FMT(L"HoldComposition: text=%s timeoutMs=%u\n",
+                       text.c_str(), timeoutMs);
+
+    // 取消可能残留的旧计时器
+    CancelHoldTimer();
+
+    // 将中文符号放入 TSF 组合态（caretPos = 文本长度，光标置末）
+    if (!UpdateComposition(text, static_cast<int>(text.length())))
+    {
+        WIND_LOG_ERROR(L"HoldComposition: UpdateComposition failed\n");
+        return FALSE;
+    }
+
+    _heldCompositionText = text;
+    g_holdTimerInstance  = this;
+    _hHoldTimer = SetTimer(NULL, 0, timeoutMs, HoldTimerProc);
+
+    if (_hHoldTimer == 0)
+    {
+        WIND_LOG_ERROR(L"HoldComposition: SetTimer failed\n");
+        g_holdTimerInstance  = nullptr;
+        _heldCompositionText.clear();
+        return FALSE;
+    }
+
+    WIND_LOG_DEBUG_FMT(L"HoldComposition: timer started id=%llu\n",
+                       static_cast<unsigned long long>(_hHoldTimer));
+    return TRUE;
+}
+
+void CTextService::CancelHoldTimer()
+{
+    if (_hHoldTimer == 0)
+        return;
+
+    KillTimer(NULL, _hHoldTimer);
+    WIND_LOG_DEBUG_FMT(L"CancelHoldTimer: killed timer id=%llu\n",
+                       static_cast<unsigned long long>(_hHoldTimer));
+    _hHoldTimer          = 0;
+    _heldCompositionText.clear();
+    g_holdTimerInstance  = nullptr;
+}
+
+// static
+VOID CALLBACK CTextService::HoldTimerProc(HWND /*hwnd*/, UINT /*uMsg*/,
+                                           UINT_PTR idEvent, DWORD /*dwTime*/)
+{
+    if (g_holdTimerInstance != nullptr
+        && idEvent == g_holdTimerInstance->_hHoldTimer)
+    {
+        g_holdTimerInstance->OnHoldTimerExpired();
+    }
+}
+
+void CTextService::OnHoldTimerExpired()
+{
+    WIND_LOG_DEBUG(L"OnHoldTimerExpired: timeout, committing chinese text\n");
+
+    UINT_PTR timerId = _hHoldTimer;
+    std::wstring textToCommit = std::move(_heldCompositionText);
+    _hHoldTimer         = 0;
+    g_holdTimerInstance = nullptr;
+    KillTimer(NULL, timerId);
+
+    CommitText(textToCommit);
 }

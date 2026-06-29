@@ -91,6 +91,9 @@ struct ServiceResponse
     // targeted instance renders a frame; siblings in the same process hide. 0 = unset.
     uint32_t hostRenderInstanceId = 0;
 
+    // For HoldComposition
+    uint32_t holdTimeoutMs = 0;
+
     // Error
     std::wstring error;
 

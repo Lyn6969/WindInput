@@ -377,6 +377,9 @@ pub(crate) struct SmartSymbolArm {
     pub(crate) str: String,
     /// 武装时刻（None=未武装）；用于时限判定
     pub(crate) at: Option<std::time::Instant>,
+    /// HoldComposition 模式下 press1 进入组合态的中文文本（用于 disarm 时清理）。
+    /// DeleteReplace 模式下始终为 None。
+    pub(crate) held_text: Option<String>,
 }
 
 /// 配置 + 其轻量派生缓存的不可变快照；运行时整体原子替换以支持热重载。

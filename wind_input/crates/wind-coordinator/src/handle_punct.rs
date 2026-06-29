@@ -7,6 +7,7 @@
 use crate::coordinator::{Coordinator, State};
 use tracing::debug;
 use wind_bridge::handler::KeyAction;
+use wind_config::config::SmartMethod;
 
 impl Coordinator {
     /// 数字后智能标点：在中文标点模式下，若 ch 在智能标点列表且光标前一字符为数字，
@@ -113,10 +114,11 @@ impl Coordinator {
         if !self.rt().config.input.symbol.smart_mode {
             return None;
         }
+        let method = self.rt().config.input.symbol.smart_method.clone();
+        let timeout_ms = self.smart_symbol_timeout().as_millis() as u32;
         let mut arm = self.smart_symbol.lock().unwrap_or_else(|e| e.into_inner());
 
-        // press2 触发：仍在中文标点模式 + 已武装 + 同键 + 时限内 + 光标前字符为武装串末位 rune。
-        // 匹配的是 press1 的产物，故引号（“→”）也能命中。
+        // ── press2 判定 ──────────────────────────────────────────────────────────
         if arm.armed
             && ch == arm.key
             && state.chinese_punct
@@ -125,48 +127,100 @@ impl Coordinator {
                 .map(|t| t.elapsed() < self.smart_symbol_timeout())
                 .unwrap_or(false)
         {
-            let armed_runes: Vec<char> = arm.str.chars().collect();
-            if let Some(&last) = armed_runes.last()
-                && last as u32 == prev_char as u32
-                && let Some(rep) = self.compute_punct_str_pure(state, ch, false)
-            {
-                arm.armed = false;
-                // 吃掉一个引号后回退引号交替状态，使下次同引号仍从左引号开始。
-                if ch == '\'' || ch == '"' {
-                    self.punct
-                        .lock()
-                        .unwrap_or_else(|e| e.into_inner())
-                        .revert_last_quote(ch);
+            match method {
+                SmartMethod::HoldComposition => {
+                    // 组合态内 press2 无需 prev_char 验证：组合内容已知，直接提交英文。
+                    if let Some(rep) = self.compute_punct_str_pure(state, ch, false) {
+                        arm.armed = false;
+                        arm.held_text = None;
+                        if ch == '\'' || ch == '"' {
+                            self.punct
+                                .lock()
+                                .unwrap_or_else(|e| e.into_inner())
+                                .revert_last_quote(ch);
+                        }
+                        debug!(
+                            "SmartSymbol(HoldComposition): press2, commit english: {}",
+                            rep
+                        );
+                        return Some(KeyAction::InsertText {
+                            text: rep,
+                            new_composition: None,
+                            mode_changed: false,
+                            chinese_mode: state.chinese_mode,
+                            has_new_composition: false,
+                        });
+                    }
                 }
-                debug!(
-                    "SmartSymbol: replace prev chinese punct with english (count={})",
-                    armed_runes.len()
-                );
-                return Some(KeyAction::ReplaceBackward {
-                    count: armed_runes.len() as u32,
-                    text: rep,
-                });
+                SmartMethod::DeleteReplace => {
+                    // 原逻辑：光标前字符须与武装串末位匹配。
+                    let armed_runes: Vec<char> = arm.str.chars().collect();
+                    if let Some(&last) = armed_runes.last()
+                        && last as u32 == prev_char as u32
+                        && let Some(rep) = self.compute_punct_str_pure(state, ch, false)
+                    {
+                        arm.armed = false;
+                        if ch == '\'' || ch == '"' {
+                            self.punct
+                                .lock()
+                                .unwrap_or_else(|e| e.into_inner())
+                                .revert_last_quote(ch);
+                        }
+                        debug!(
+                            "SmartSymbol(DeleteReplace): replace prev chinese punct with english, count={}",
+                            armed_runes.len()
+                        );
+                        return Some(KeyAction::ReplaceBackward {
+                            count: armed_runes.len() as u32,
+                            text: rep,
+                        });
+                    }
+                }
             }
         }
 
-        // 未触发：尝试以本次按键的中文产物武装，等待下次同键快速重复。
+        // ── press1：尝试武装 ─────────────────────────────────────────────────────
         match self.smart_symbol_arm_str(state, ch, prev_char) {
             Some(cn) => {
-                arm.armed = true;
                 arm.key = ch;
-                arm.str = cn;
+                arm.str = cn.clone();
                 arm.at = Some(std::time::Instant::now());
+
+                match method {
+                    SmartMethod::HoldComposition => {
+                        arm.armed = true;
+                        arm.held_text = Some(cn.clone());
+                        debug!(
+                            "SmartSymbol(HoldComposition): press1, hold composition: {}, timeout={}ms",
+                            cn, timeout_ms
+                        );
+                        // 短路返回：由 C++ 端负责开启组合态和计时，不走普通标点流程
+                        return Some(KeyAction::HoldComposition {
+                            text: cn,
+                            timeout_ms,
+                        });
+                    }
+                    SmartMethod::DeleteReplace => {
+                        arm.armed = true;
+                        arm.held_text = None;
+                        // 返回 None：调用方继续普通标点流程（CommitText "，"）
+                    }
+                }
             }
-            None => arm.armed = false,
+            None => {
+                arm.armed = false;
+                arm.held_text = None;
+            }
         }
         None
     }
 
     /// 解除智能符号待命态（焦点变化/模式切换等的防御性复位）。
     pub(crate) fn disarm_smart_symbol(&self) {
-        self.smart_symbol
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .armed = false;
+        let mut arm = self.smart_symbol.lock().unwrap_or_else(|e| e.into_inner());
+        arm.armed = false;
+        arm.held_text = None;
+        // 注：HoldComposition 模式下若组合尚未提交，C++ 端的 SetTimer 计时器会在 timeout
+        // 到期后自动提交中文符号，或在焦点切换时由 OnCompositionTerminated 自然结束。
     }
 }

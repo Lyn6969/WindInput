@@ -95,6 +95,10 @@ static REGISTRY: &[ConfigField] = &[
     f("input.symbol.smart_mode", Bool),
     f("input.symbol.smart_timeout_ms", Int),
     f("input.symbol.smart_chars", Str),
+    f(
+        "input.symbol.smart_method",
+        Enum(&["delete_replace", "hold_composition"]),
+    ),
     f("input.auto_pair.chinese", Bool),
     f("input.auto_pair.english", Bool),
     f("input.auto_pair.chinese_pairs", StrList),

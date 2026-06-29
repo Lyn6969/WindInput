@@ -1742,6 +1742,18 @@ BOOL CKeyEventSink::_HandleServiceResponse()
         }
         return TRUE;
 
+    case ResponseType::HoldComposition:
+        {
+            // 智能符号 HoldComposition 方案：press1 将中文符号放入 TSF 组合态，
+            // 由 TextService 启动 500ms 计时器自动提交；press2 将直接发 CommitText。
+            WIND_LOG_DEBUG_FMT(L"Processing HoldComposition response: text=%ls timeoutMs=%u\n",
+                               response.text.c_str(), response.holdTimeoutMs);
+            _pTextService->HoldComposition(response.text, response.holdTimeoutMs);
+            _isComposing = TRUE;
+            _hasCandidates = FALSE;
+        }
+        return TRUE;
+
     default:
         WIND_LOG_ERROR(L"Unknown response type from service");
         return TRUE;

@@ -77,6 +77,7 @@ constexpr uint16_t CMD_COMMIT_TEXT_WITH_CURSOR = 0x0106; // Commit text with cur
 constexpr uint16_t CMD_MOVE_CURSOR             = 0x0107; // Move cursor (smart skip)
 constexpr uint16_t CMD_DELETE_PAIR             = 0x0108; // Delete pair (smart backspace)
 constexpr uint16_t CMD_REPLACE_BACKWARD        = 0x0109; // Replace preceding char(s): delete N before caret + insert text
+constexpr uint16_t CMD_HOLD_COMPOSITION         = 0x010A; // Hold composition: open composition + auto-commit after timeout_ms
 constexpr uint16_t CMD_HOST_RENDER_SETUP  = 0x0501; // Host render setup (shared memory + event names)
 constexpr uint16_t CMD_BATCH_RESPONSE     = 0x0F02; // Batch response container
 
@@ -230,6 +231,15 @@ struct ReplaceBackwardPayload
     // Followed by UTF-8 text
 };
 static_assert(sizeof(ReplaceBackwardPayload) == 8, "ReplaceBackwardPayload must be 8 bytes");
+
+// HoldComposition payload (smart symbol: open composition with text, auto-commit after timeoutMs)
+struct HoldCompositionPayload
+{
+    uint32_t timeoutMs;  // Auto-commit timeout in milliseconds
+    uint32_t textLength; // Length of composition text (UTF-8)
+    // Followed by UTF-8 text
+};
+static_assert(sizeof(HoldCompositionPayload) == 8, "HoldCompositionPayload must be 8 bytes");
 
 // Commit text flags
 constexpr uint32_t COMMIT_FLAG_MODE_CHANGED       = 0x0001;
@@ -463,6 +473,7 @@ enum class ResponseType
     MoveCursorRight,      // Move cursor right (smart skip)
     DeletePair,           // Delete left + right char (smart delete)
     ReplaceBackward,      // Delete N chars before caret + insert text (smart symbol)
+    HoldComposition,      // Open composition with text + start auto-commit timer (smart symbol)
     HostRenderSetup, // Host render setup (shared memory info)
     Error
 };
@@ -491,6 +502,9 @@ struct ParsedResponse
     // For SyncHotkeys / StatusUpdate
     std::vector<uint32_t> keyDownHotkeys;
     std::vector<uint32_t> keyUpHotkeys;
+
+    // For HoldComposition
+    uint32_t holdTimeoutMs = 0;
 
     // Helper methods
     bool IsChineseMode() const { return (statusFlags & STATUS_CHINESE_MODE) != 0; }

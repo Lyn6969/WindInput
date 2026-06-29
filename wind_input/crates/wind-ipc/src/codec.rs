@@ -515,6 +515,23 @@ pub fn encode_replace_backward(count: u32, text: &str) -> Vec<u8> {
     buf
 }
 
+/// 编码 HoldComposition 响应 (CMD_HOLD_COMPOSITION 0x010A)
+///
+/// 格式：timeout_ms(4) + text_len(4) + UTF-8 text
+/// C++ 端开启组合显示 text，timeout_ms 毫秒后自动提交（智能符号 HoldComposition 方案）。
+pub fn encode_hold_composition(timeout_ms: u32, text: &str) -> Vec<u8> {
+    let text_bytes = text.as_bytes();
+    let payload_len = 8 + text_bytes.len();
+    let mut buf = Vec::with_capacity(IpcHeader::SIZE + payload_len);
+
+    let ipc = IpcHeader::new(CMD_HOLD_COMPOSITION, payload_len as u32);
+    buf.extend_from_slice(&ipc.to_bytes());
+    buf.extend_from_slice(&timeout_ms.to_le_bytes());
+    buf.extend_from_slice(&(text_bytes.len() as u32).to_le_bytes());
+    buf.extend_from_slice(text_bytes);
+    buf
+}
+
 /// 编码 HostRenderSetup 响应 (CMD_HOST_RENDER_SETUP 0x0501)
 ///
 /// 格式: entryCount(u32) + entries...
@@ -537,4 +554,28 @@ pub fn encode_host_render_setup(entries: &[(u32, String, String)]) -> Vec<u8> {
     buf.extend_from_slice(&ipc.to_bytes());
     buf.extend_from_slice(&payload);
     buf
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_encode_hold_composition_layout() {
+        let buf = encode_hold_composition(500, "，");
+        // IpcHeader: 8 bytes (cmd u16 LE + version u16 LE + payload_len u32 LE)
+        // payload: timeout_ms(4) + text_len(4) + "，"(3 UTF-8 bytes) = 11 bytes
+        assert_eq!(buf.len(), 8 + 11);
+        // cmd = 0x010A LE (at offset 2-4)
+        assert_eq!(buf[2], 0x0A);
+        assert_eq!(buf[3], 0x01);
+        // payload_len = 11 LE (at offset 4-8)
+        assert_eq!(u32::from_le_bytes([buf[4], buf[5], buf[6], buf[7]]), 11);
+        // timeout_ms = 500 LE (at offset 8-12)
+        assert_eq!(u32::from_le_bytes([buf[8], buf[9], buf[10], buf[11]]), 500);
+        // text_len = 3 LE (at offset 12-16)
+        assert_eq!(u32::from_le_bytes([buf[12], buf[13], buf[14], buf[15]]), 3);
+        // UTF-8 bytes of "，" = [0xEF, 0xBC, 0x8C] (at offset 16+)
+        assert_eq!(&buf[16..], "，".as_bytes());
+    }
 }

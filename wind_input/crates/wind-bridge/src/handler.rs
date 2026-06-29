@@ -93,6 +93,10 @@ pub enum KeyAction {
     DeletePair,
     /// 删除光标前 count 个字符并插入文本（智能符号替换）
     ReplaceBackward { count: u32, text: String },
+    /// 持有组合态（智能符号 HoldComposition 方案）：
+    /// C++ 端开启组合显示 text，在 timeout_ms 毫秒后自动提交中文；
+    /// press2 到来时直接用英文文本替换组合（通过普通 InsertText / CommitText 提交）。
+    HoldComposition { text: String, timeout_ms: u32 },
 }
 
 impl KeyAction {

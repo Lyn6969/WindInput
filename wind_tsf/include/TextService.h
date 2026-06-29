@@ -220,6 +220,13 @@ public:
     // iconLabel: display text from Go service for taskbar icon (e.g., "中", "英", "A", "拼")
     void UpdateFullStatus(BOOL bChineseMode, BOOL bFullWidth, BOOL bChinesePunct, BOOL bToolbarVisible, BOOL bCapsLock, const wchar_t* iconLabel = nullptr);
 
+    // HoldComposition: 开启组合显示 text，timeoutMs 毫秒后自动提交中文（智能符号方案）。
+    // press2 到来前的任何 CommitText 调用会先通过 CancelHoldTimer 取消定时器。
+    BOOL HoldComposition(const std::wstring& text, UINT timeoutMs);
+
+    // 取消 HoldComposition 计时器（若活跃）。安全：_hHoldTimer==0 时为空操作。
+    void CancelHoldTimer();
+
 private:
     LONG _refCount;
     ITfThreadMgr* _pThreadMgr;
@@ -345,6 +352,12 @@ private:
     // 真实的中英文模式由本 compartment 暴露。
     DWORD _dwConversionSinkCookie;
     BOOL _bInConversionChange;  // Guard against re-entrant OnChange for conversion compartment
+
+    // HoldComposition 计时器状态（智能符号 HoldComposition 方案）
+    UINT_PTR       _hHoldTimer = 0;           // SetTimer 返回的计时器 ID；0 表示无活跃计时器
+    std::wstring   _heldCompositionText;      // press1 进入组合态的中文文本
+    void           OnHoldTimerExpired();      // 计时器到期时提交中文符号
+    static VOID CALLBACK HoldTimerProc(HWND hwnd, UINT uMsg, UINT_PTR idEvent, DWORD dwTime);
 
     BOOL _InitConversionCompartment();
     void _UninitConversionCompartment();

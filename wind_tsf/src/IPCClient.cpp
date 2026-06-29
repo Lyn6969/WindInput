@@ -1406,6 +1406,33 @@ BOOL CIPCClient::_ParseResponse(const IpcHeader& header, const std::vector<uint8
         }
         break;
 
+    case CMD_HOLD_COMPOSITION:
+        {
+            response.type = ResponseType::HoldComposition;
+            if (payload.size() < sizeof(HoldCompositionPayload))
+            {
+                _LogError(L"HoldComposition payload too short");
+                return FALSE;
+            }
+            const HoldCompositionPayload* p =
+                reinterpret_cast<const HoldCompositionPayload*>(payload.data());
+            response.holdTimeoutMs = p->timeoutMs;
+            if (p->textLength > 0)
+            {
+                // 减法形式防 32 位加法回绕（同 CMD_REPLACE_BACKWARD 注释）。
+                size_t textOffset = sizeof(HoldCompositionPayload);
+                if (p->textLength <= payload.size() - textOffset)
+                {
+                    response.text = _Utf8ToWide(
+                        reinterpret_cast<const char*>(payload.data() + textOffset),
+                        p->textLength);
+                }
+            }
+            _LogDebug(L"Response: HoldComposition timeoutMs=%u, textLen=%zu",
+                      response.holdTimeoutMs, response.text.length());
+        }
+        break;
+
     case CMD_HOST_RENDER_SETUP:
         {
             response.type = ResponseType::HostRenderSetup;

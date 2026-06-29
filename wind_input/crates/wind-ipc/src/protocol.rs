@@ -68,6 +68,9 @@ pub const CMD_MOVE_CURSOR: u16 = 0x0107;
 pub const CMD_DELETE_PAIR: u16 = 0x0108;
 /// 删除光标前 N 个字符并插入文本（智能符号替换）。
 pub const CMD_REPLACE_BACKWARD: u16 = 0x0109;
+/// HoldComposition 响应 (0x010A)：开启组合显示 text，在 timeout_ms 毫秒后自动提交。
+/// 载荷：timeout_ms(u32 LE) + text_len(u32 LE) + UTF-8 text
+pub const CMD_HOLD_COMPOSITION: u16 = 0x010A;
 
 // 状态
 pub const CMD_STATUS_UPDATE: u16 = 0x0202;
