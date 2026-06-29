@@ -68,6 +68,8 @@ const PUNCT_HALF_SVG: &str = include_str!("../res/icons/punct_half.svg");
 const WIDTH_FULL_SVG: &str = include_str!("../res/icons/width_full.svg");
 /// 半角宽度：月牙（弯月）。
 const WIDTH_HALF_SVG: &str = include_str!("../res/icons/width_half.svg");
+/// 设置齿轮图标。
+const SETTING_SVG: &str = include_str!("../res/icons/setting.svg");
 
 /// 工具栏窗口
 pub struct Toolbar {
@@ -307,10 +309,8 @@ impl Toolbar {
             if i == 0 || is_settings {
                 draw_vsep(self.window.buffer_mut(), w, h, x as u32, self.sep, s);
             }
-            // 高亮底（激活态：中文模式格 / 简繁启用）+ 悬停底（鼠标移入，非激活格才画，避免叠加）。
-            let cell_bg = if c.highlight {
-                Some(self.hl_bg)
-            } else if (i as i32) == hover_idx {
+            // 悬停底（激活格不画底色，仅靠文字颜色区分）。
+            let cell_bg = if (i as i32) == hover_idx {
                 Some(self.hover_bg)
             } else {
                 None
@@ -325,21 +325,18 @@ impl Toolbar {
                 fill_rounded(self.window.buffer_mut(), w, h, hx, hy, hw, hh, bgc, hr);
             }
             if is_settings {
-                // 设置：矢量齿轮，单元格内精确居中（不依赖字体度量 → 与文字格完全对齐）。
-                // 中心孔用工具栏底色（不透明）→ 视觉镂空。
-                let gcx = x + cw * 0.5;
-                let gcy = h as f32 * 0.5;
-                let gear_r = (font_h * 0.42).max(5.0);
-                let hole = [self.bg[0], self.bg[1], self.bg[2], 255];
-                crate::view::fill_gear(
+                let size = font_h * 0.80;
+                let dx = x + (cw - size) * 0.5;
+                let dy = (h as f32 - size) * 0.5;
+                crate::view::draw_svg_icon(
                     self.window.buffer_mut(),
                     w,
                     h,
-                    gcx,
-                    gcy,
-                    gear_r,
+                    SETTING_SVG,
+                    dx,
+                    dy,
+                    size,
                     self.settings_icon,
-                    hole,
                 );
             } else if matches!(c.action, ToolbarAction::TogglePunct | ToolbarAction::ToggleWidth) {
                 // 标点 / 全半角：按状态渲染内联 SVG 图标，主题色 tint，居中于方格。
@@ -349,7 +346,7 @@ impl Toolbar {
                     (ToolbarAction::ToggleWidth, _, true) => WIDTH_FULL_SVG,
                     _ => WIDTH_HALF_SVG,
                 };
-                let size = (h as f32).min(cw);
+                let size = font_h * 0.80;
                 let dx = x + (cw - size) * 0.5;
                 let dy = (h as f32 - size) * 0.5;
                 crate::view::draw_svg_icon(self.window.buffer_mut(), w, h, svg, dx, dy, size, self.fg);
