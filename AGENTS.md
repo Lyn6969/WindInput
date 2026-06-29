@@ -2,9 +2,36 @@
 
 > 给在本仓工作的 AI/人类协作者。Rust 核心在 `wind_input/`（cargo workspace）。
 
+## Crate 索引
+
+> workspace 共 18 个 crate（均在 `wind_input/crates/`）。复杂 crate 已配 crate 级 `AGENTS.md`，改动前先读对应文档；新增/重构 crate 时参照同结构补文档。
+
+| Crate | 职责 | crate 文档 |
+|---|---|---|
+| `wind-coordinator` | 输入法“大脑”：按键路由、状态机、候选与模式切换的中央协调器 | [AGENTS.md](wind_input/crates/wind-coordinator/AGENTS.md) |
+| `wind-engine` | Schema 驱动的引擎工厂：拼音/码表/混输三类引擎的构建、切换与候选分发 | [AGENTS.md](wind_input/crates/wind-engine/AGENTS.md) |
+| `wind-ui` | 所有浮层窗口（候选窗/工具栏/菜单/状态泡/Toast/Tooltip）的渲染与鼠标交互 | [AGENTS.md](wind_input/crates/wind-ui/AGENTS.md) |
+| `wind-cmdbar` | 命令直通车：短语解析 → AST 求值 → 动作执行（纯逻辑） | [AGENTS.md](wind_input/crates/wind-cmdbar/AGENTS.md) |
+| `wind-dict` | 多层复合词典引擎：DictLayer/CompositeDict 查询 + wdat mmap 二进制词库 | [AGENTS.md](wind_input/crates/wind-dict/AGENTS.md) |
+| `wind-store` | 基于 redb 的用户数据持久化：按方案隔离用户词/词频/Shadow，全局存短语 | [AGENTS.md](wind_input/crates/wind-store/AGENTS.md) |
+| `wind-rpc` | core ↔ 设置端 JSON-RPC IPC 双通道（ctrl 请求-响应 + events 广播） | [AGENTS.md](wind_input/crates/wind-rpc/AGENTS.md) |
+| `wind-config` | 配置系统：TOML 三层合并、字段注册表 SSOT、热键编译、变体探测、运行时状态 | [AGENTS.md](wind_input/crates/wind-config/AGENTS.md) |
+| `wind-theme` | 加载并求值 v3 主题，输出调色板 + 盒模型树供 wind-ui 渲染 | [AGENTS.md](wind_input/crates/wind-theme/AGENTS.md) |
+| `wind-bridge` | Named Pipe 服务器 + Push 管道，桥接 Rust 服务与 C++ TSF DLL | [AGENTS.md](wind_input/crates/wind-bridge/AGENTS.md) |
+| `wind-ipc` | IPC 协议定义与编解码（TSF 二进制协议 + JSON-RPC） | — |
+| `wind-keys` | 键名/VK 映射、导航键分类（纯逻辑）+ 按键注入（平台层）；**VK 常量 SSOT** | — |
+| `wind-candidate` | 候选词数据类型、排序与过滤 | — |
+| `wind-phrase` | 短语系统：静态/动态模板展开 + cmdbar 双路径 | — |
+| `wind-quick-input` | 快捷输入提供器：日期 / 计算器（纯逻辑） | — |
+| `wind-reverse` | 候选反查：五笔编码/拆字/拼音读音（悬停 tooltip） | — |
+| `wind-punct` | 标点转换纯逻辑（中英标点/全半角/数字后智能） | — |
+| `wind-transform` | 文本变换：标点、全角、自动配对、简繁 | — |
+
+`—` = 暂无独立 `AGENTS.md`（多为纯逻辑/工具 crate，职责单一，看 `src/lib.rs` 顶部模块注释即可）。
+
 ## 虚拟键码（VK）—— 用常量，禁止裸十六进制
 
-所有 Windows 虚拟键码统一在 `wind_input/crates/wind-coordinator/src/keymap.rs` 定义为
+所有 Windows 虚拟键码统一在 `wind_input/crates/wind-keys/src/keymap.rs` 定义为
 `pub const VK_*`（`VK_ESCAPE`/`VK_BACK`/`VK_SPACE`/`VK_RETURN`/`VK_PRIOR`/`VK_NEXT`/
 `VK_UP`/`VK_DOWN`/`VK_A..VK_Z`/`VK_0..VK_9`/`VK_SEMICOLON` 等）。
 
