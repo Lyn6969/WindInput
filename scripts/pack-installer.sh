@@ -79,10 +79,14 @@ fi
 
 # ---- 编译安装器 stub(cargo-xwin/MSVC 交叉)+ packer(原生)----
 echo ">>> 交叉编译 wind-installer stub (cargo-xwin/MSVC) + 原生 wind-packer ..."
-# clang-cl 软链(cargo-xwin 需要;clang 改名调用,幂等)
+# 对齐 dev.sh setup_xwin_env:clang→clang-cl/lld-link/llvm-rc/llvm-lib/llvm-dlltool 全套软链
 XWIN_BIN="$HOME/.local/xwin-bin"
-if ! command -v clang-cl >/dev/null 2>&1 && command -v clang >/dev/null 2>&1; then
-  mkdir -p "$XWIN_BIN"; ln -sf "$(command -v clang)" "$XWIN_BIN/clang-cl"
+if command -v clang >/dev/null 2>&1; then
+  mkdir -p "$XWIN_BIN"
+  CLANG="$(command -v clang)"
+  for name in clang-cl lld-link llvm-rc llvm-lib llvm-dlltool; do
+    command -v "$name" >/dev/null 2>&1 || ln -sf "$CLANG" "$XWIN_BIN/$name"
+  done
   export PATH="$XWIN_BIN:$PATH"
 fi
 export XWIN_ACCEPT_LICENSE="${XWIN_ACCEPT_LICENSE:-1}"
