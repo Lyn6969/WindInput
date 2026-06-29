@@ -1,0 +1,55 @@
+# ============================================================================
+#  WindInput 安装器清单（供 wind-packer 使用）
+# ============================================================================
+#  本文件归属 WindInput 仓库，描述清风输入法的完整安装配置。
+#
+#  动态字段由构建脚本通过 CLI 参数注入，无需修改本文件：
+#    wind-packer build \
+#      --config config/app.toml \
+#      --version <VERSION>      # 覆盖 app.version
+#      --source-dir <DIR>       # 覆盖 package.source_dir
+#      --stub wind-installer.exe
+# ============================================================================
+
+[app]
+id              = "WindInput"
+display_name    = "清风输入法"
+version         = "0.0.0"           # 构建时由 --version 覆盖，此处为占位
+publisher       = "清风输入法 项目"
+description     = "轻量开源输入法"
+main_exe        = "wind_input.exe"
+setting_exe     = "wind_setting.exe"
+start_menu_folder = "清风输入法"
+window_title    = "清风输入法 安装向导"
+url_protocol    = "windinput"
+agreement_url   = ""
+portable_marker = "portable_mode"
+acl_dlls        = ["wind_tsf.dll", "wind_tsf_x86.dll"]
+legacy_files    = ["wind_dwrite.dll"]
+legacy_dirs     = []
+
+[ui]
+install_win   = { w = 520, h = 420 }
+uninstall_win = { w = 480, h = 420 }
+
+[ime]
+clsid        = "{99C2EE30-5C57-45A2-9C63-FB54B34FD90A}"
+profile_guid = "{99C2EE31-5C57-45A2-9C63-FB54B34FD90A}"
+lang_id      = "0804"
+dll_x64      = "wind_tsf.dll"
+dll_x86      = "wind_tsf_x86.dll"
+
+[[font]]
+file         = "HeiTiZiGen.ttf"
+display_name = "黑体字根 (TrueType)"
+source_rel   = "data/schemas/wubi86/HeiTiZiGen.ttf"
+
+# ── 打包参数 ──────────────────────────────────────────────────────────────────
+# source_dir 和 version 由构建脚本通过 CLI 覆盖；此处为本地开发默认值。
+[package]
+compression = "lzma"
+source_dir  = "../build"            # 相对本文件：WindInput/build/（本地默认）
+output_name = "WindInput-Setup"
+output_dir  = "../../wind-installer/dist"
+logo        = "../../wind-installer/assets/logo.png"
+icon        = "../../wind-installer/assets/installer.ico"

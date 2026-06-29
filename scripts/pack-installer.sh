@@ -51,8 +51,8 @@ if [[ -z "$VERSION" ]]; then
 fi
 
 DIST_DIR="$INSTALLER_DIR/dist"
+APP_CONFIG="$PRODUCT_ROOT/config/app.toml"
 [[ -z "$OUTPUT" ]] && OUTPUT="$DIST_DIR/WindInput-${VERSION}-Setup.exe"
-ARCHIVE="$DIST_DIR/WindInput-${VERSION}.bin"
 
 echo "================================================"
 echo "  WindInput 安装程序打包"
@@ -108,8 +108,6 @@ done
 mkdir -p "$DIST_DIR"
 
 # ---- 组装干净 staging 目录(只含分发文件,排除 obj/ 等 TSF 中间产物)----
-# wind-packer pack 从 app.toml 的 source_dir 读取源目录,不接受 --source CLI 参数,
-# 故先 staging 再 patch app.toml,而非直接打 BUILD_DIR(含 obj/)。
 STAGE="$DIST_DIR/stage"
 rm -rf "$STAGE"; mkdir -p "$STAGE"
 cleanup() { rm -rf "$STAGE"; }
@@ -125,30 +123,18 @@ cp -f  "$UNINSTALLER"                "$STAGE/uninstall.exe"
 else
 fi
 
-# ---- 阶段一:压缩打包 ----
-# wind-packer pack 的 source_dir/compression 由 app.toml 控制，无对应 CLI 参数；
-# 临时 patch app.toml，用 EXIT trap 兜底还原。
-echo ">>> 阶段一:pack(算法 $COMPRESSION)..."
-STAGE_REL="$(python3 -c "import os; print(os.path.relpath('$STAGE', '$INSTALLER_DIR'))")"
-cp "$INSTALLER_DIR/app.toml" "$INSTALLER_DIR/app.toml.bak"
-restore_toml() { mv "$INSTALLER_DIR/app.toml.bak" "$INSTALLER_DIR/app.toml" 2>/dev/null || true; }
-trap 'cleanup; restore_toml' EXIT
-python3 - "$INSTALLER_DIR/app.toml" "$STAGE_REL" "$COMPRESSION" << 'PYEOF'
-import re, sys
-path, src_rel, comp = sys.argv[1], sys.argv[2], sys.argv[3]
-content = open(path).read()
-content = re.sub(r'(source_dir\s*=\s*)"[^"]*"', rf'\1"{src_rel}"', content)
-content = re.sub(r'(compression\s*=\s*)"[^"]*"', rf'\1"{comp}"', content)
-open(path, 'w').write(content)
-PYEOF
-(cd "$INSTALLER_DIR" && "$PACKER" pack --output "$ARCHIVE")
-restore_toml
+# ---- 打包:wind-packer build（pack + bundle 一步）----
+# config/app.toml 由 WindInput 持有；version/source-dir/compression 通过 CLI 注入，
+# 不修改任何文件。
+echo ">>> 打包安装程序 (算法 $COMPRESSION)..."
+"$PACKER" build \
+  --config  "$APP_CONFIG" \
+  --version "$VERSION" \
+  --source-dir "$STAGE" \
+  --compression "$COMPRESSION" \
+  --stub    "$STUB" \
+  --output  "$OUTPUT"
 
-# ---- 阶段二:拼接 stub + archive ----
-echo ">>> 阶段二:bundle ..."
-"$PACKER" bundle --stub "$STUB" --archive "$ARCHIVE" --output "$OUTPUT"
-
-rm -f "$ARCHIVE"
 cleanup; trap - EXIT
 
 SIZE="$(du -h --apparent-size "$OUTPUT" | cut -f1)"
