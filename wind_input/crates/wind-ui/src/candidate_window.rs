@@ -497,12 +497,12 @@ impl CandidateWindow {
             match info {
                 Some((code, r)) => {
                     if self.vertical {
-                        // 竖排：显示在候选窗右侧（不足时左侧），纵向对齐候选行
-                        let win_w = self.window.size().0 as i32;
+                        // 竖排：以悬停候选项自身宽度为锚点（hit rect 已含阴影偏移，wx+r.x 即屏幕坐标）。
+                        // tooltip 显示在候选项右侧，空间不足时改左侧，不遮挡下方候选。
                         tip.show_beside(
                             &code,
-                            wx,         // 窗口左边界
-                            wx + win_w, // 窗口右边界
+                            wx + r.x as i32,         // 候选项左边界
+                            wx + (r.x + r.w) as i32, // 候选项右边界
                             wy + r.y as i32,
                             wy + (r.y + r.h) as i32,
                         );

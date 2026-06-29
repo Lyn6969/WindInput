@@ -3,9 +3,65 @@
 //! 与 Go 版本 `wind_input/internal/ui/tooltip.go` 对齐（简化版）。
 //! 深色圆角小气泡 + DirectWrite 文本。
 
+use std::cell::{Cell, RefCell};
+use std::rc::Rc;
+
+use crate::sys::{HWND, LPARAM, LRESULT, WM_MOUSELEAVE, WM_MOUSEMOVE, WPARAM};
 use crate::text::dwrite::TextRenderer;
 use crate::view::{Align, Edges, View, ViewImage, ViewLayer};
-use crate::window::LayeredWindow;
+use crate::window::{LayeredWindow, WindowMouse};
+
+/// 鼠标跟踪器：检测鼠标是否悬停在 tooltip 上（WM_MOUSELEAVE 触发时直接隐藏窗口）。
+struct TooltipMouse {
+    hwnd: HWND,
+    mouse_over: Rc<Cell<bool>>,
+    tracking: bool,
+}
+
+impl TooltipMouse {
+    #[cfg(windows)]
+    fn arm_leave(&self) {
+        unsafe {
+            use windows::Win32::UI::Input::KeyboardAndMouse::{TME_LEAVE, TRACKMOUSEEVENT, TrackMouseEvent};
+            let mut t = TRACKMOUSEEVENT {
+                cbSize: std::mem::size_of::<TRACKMOUSEEVENT>() as u32,
+                dwFlags: TME_LEAVE,
+                hwndTrack: self.hwnd,
+                dwHoverTime: 0,
+            };
+            let _ = TrackMouseEvent(&mut t);
+        }
+    }
+    #[cfg(not(windows))]
+    fn arm_leave(&self) {}
+}
+
+impl WindowMouse for TooltipMouse {
+    fn on_message(&mut self, _hwnd: HWND, msg: u32, _wparam: WPARAM, _lparam: LPARAM) -> Option<LRESULT> {
+        match msg {
+            WM_MOUSEMOVE => {
+                self.mouse_over.set(true);
+                if !self.tracking {
+                    self.tracking = true;
+                    self.arm_leave();
+                }
+                None
+            }
+            WM_MOUSELEAVE => {
+                self.mouse_over.set(false);
+                self.tracking = false;
+                // 鼠标离开时直接隐藏（对齐 Go TooltipWindow WM_MOUSELEAVE 行为）
+                #[cfg(windows)]
+                unsafe {
+                    use windows::Win32::UI::WindowsAndMessaging::{SW_HIDE, ShowWindow};
+                    let _ = ShowWindow(self.hwnd, SW_HIDE);
+                }
+                None
+            }
+            _ => None,
+        }
+    }
+}
 
 const FONT_PX: f32 = 13.0;
 const BG: [u8; 4] = [60, 60, 64, 240]; // 深灰底（RGBA）
@@ -28,6 +84,9 @@ pub struct Tooltip {
     radius: Option<f32>,
     /// 已应用主题（DPI 变化时按新缩放重解析几何）。
     theme: Option<wind_theme::Resolved>,
+    /// 鼠标是否正悬停在 tooltip 上（由 TooltipMouse 更新）。
+    /// hide() 遇到此标志时推迟隐藏，待 WM_MOUSELEAVE 自动触发后真正隐藏。
+    mouse_over: Rc<Cell<bool>>,
 }
 
 impl Tooltip {
@@ -35,6 +94,13 @@ impl Tooltip {
         let scale = dpi_scale();
         let window = LayeredWindow::create(None, 120, 40, "WindInputTooltip")?;
         let renderer = TextRenderer::new("Microsoft YaHei UI", FONT_PX * scale)?;
+        let mouse_over = Rc::new(Cell::new(false));
+        // 注册鼠标跟踪：鼠标进入 tooltip 时保持可见；WM_MOUSELEAVE 触发时自动隐藏。
+        window.register_mouse(Rc::new(RefCell::new(TooltipMouse {
+            hwnd: window.hwnd(),
+            mouse_over: mouse_over.clone(),
+            tracking: false,
+        })));
         Ok(Self {
             window,
             renderer,
@@ -48,6 +114,7 @@ impl Tooltip {
             border: None,
             radius: None,
             theme: None,
+            mouse_over,
         })
     }
 
@@ -200,6 +267,10 @@ impl Tooltip {
     }
 
     pub fn hide(&mut self) {
+        if self.mouse_over.get() {
+            // 鼠标正悬停在 tooltip 上，不立即隐藏；WM_MOUSELEAVE 触发后 TooltipMouse 会自动隐藏窗口。
+            return;
+        }
         if self.visible {
             self.window.hide();
             self.visible = false;

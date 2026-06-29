@@ -365,6 +365,14 @@ mod platform {
         pub fn size(&self) -> (u32, u32) {
             (self.width, self.height)
         }
+
+        pub fn capture_to_file(&self, path: &std::path::Path) -> Result<(), String> {
+            crate::screenshot::save_bgra_to_png(&self.buffer, self.width, self.height, path)
+        }
+
+        pub fn capture_to_clipboard(&self) -> Result<(), String> {
+            crate::screenshot::copy_bgra_to_clipboard(&self.buffer, self.width, self.height)
+        }
     }
 }
 
