@@ -256,6 +256,8 @@ impl Toolbar {
         let min_cell = Self::MIN_CELL_W * s;
 
         let cells = Self::cells(state);
+        // 英文模式下标点固定显示半角，无需看 chinese_punct。
+        let effective_chinese = state.chinese_mode && !state.caps_lock;
 
         // 所有状态格统一方形（宽=高，下限 min_cell）：标点/简繁等图标与文字均居中于等宽方格，
         // 状态切换不改变单元格宽度，工具栏整体宽度稳定不抖动。
@@ -340,7 +342,8 @@ impl Toolbar {
                 );
             } else if matches!(c.action, ToolbarAction::TogglePunct | ToolbarAction::ToggleWidth) {
                 // 标点 / 全半角：按状态渲染内联 SVG 图标，主题色 tint，居中于方格。
-                let svg = match (c.action, state.chinese_punct, state.full_width) {
+                // 英文模式下标点固定半角（不可切换），无论 chinese_punct 状态如何。
+                let svg = match (c.action, effective_chinese && state.chinese_punct, state.full_width) {
                     (ToolbarAction::TogglePunct, true, _) => PUNCT_FULL_SVG,
                     (ToolbarAction::TogglePunct, false, _) => PUNCT_HALF_SVG,
                     (ToolbarAction::ToggleWidth, _, true) => WIDTH_FULL_SVG,

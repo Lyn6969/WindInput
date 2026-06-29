@@ -1936,8 +1936,9 @@ impl Coordinator {
                 label
             });
         }
-        // 标点（总显示）
-        parts.push(if punct_cn { "。".into() } else { ".".into() });
+        // 标点（总显示）：英文模式（含大写锁定）下固定显示半角，不看内部 punct_cn 状态。
+        let effective_chinese = chinese && !caps;
+        parts.push(if effective_chinese && punct_cn { "。".into() } else { ".".into() });
         // 全角（仅全角时）
         if full {
             parts.push("全".into());
@@ -1976,13 +1977,19 @@ impl Coordinator {
                 true
             }
             "toggle_punct" => {
-                {
-                    let mut s = self.state.lock().unwrap_or_else(|e| e.into_inner());
-                    s.chinese_punct = !s.chinese_punct;
+                let effective_chinese = {
+                    let s = self.state.lock().unwrap_or_else(|e| e.into_inner());
+                    s.chinese_mode && !s.caps_lock
+                };
+                if effective_chinese {
+                    {
+                        let mut s = self.state.lock().unwrap_or_else(|e| e.into_inner());
+                        s.chinese_punct = !s.chinese_punct;
+                    }
+                    self.push_state_update();
+                    self.show_status();
+                    self.notify_toolbar();
                 }
-                self.push_state_update();
-                self.show_status();
-                self.notify_toolbar();
                 true
             }
             "toggle_s2t" => {
@@ -2144,12 +2151,18 @@ impl MessageHandler for Coordinator {
                 Some(self.build_status())
             }
             "toggle_punct" => {
-                {
-                    let mut s = self.state.lock().unwrap_or_else(|e| e.into_inner());
-                    s.chinese_punct = !s.chinese_punct;
+                let effective_chinese = {
+                    let s = self.state.lock().unwrap_or_else(|e| e.into_inner());
+                    s.chinese_mode && !s.caps_lock
+                };
+                if effective_chinese {
+                    {
+                        let mut s = self.state.lock().unwrap_or_else(|e| e.into_inner());
+                        s.chinese_punct = !s.chinese_punct;
+                    }
+                    self.push_state_update();
+                    self.show_status();
                 }
-                self.push_state_update();
-                self.show_status();
                 Some(self.build_status())
             }
             "switch_engine" => {
@@ -2235,6 +2248,42 @@ impl MessageHandler for Coordinator {
         // 于 keyUp 转发该键事件（_SendKeyToService(..., KEY_EVENT_UP)）。因此服务端
         // 收到 toggle 键的 keyUp 即应直接切换，无需 keydown/pending（对齐 Go HandleKeyEvent）。
         if data.event_type == EVENT_KEY_UP {
+            // CapsLock 单独处理：C++ 侧总是发送此 key_up（不经 key_up_tsf_hashes 过滤），
+            // 故须先于 is_toggle_mode_keycode 检查。同步真实大写锁定状态，不翻转 chinese_mode
+            // （对齐 Go handleCapsLockStateNoLock：capsLockOn 跟随 data.toggles & 0x01）。
+            if data.key_code == 0x14 /* VK_CAPITAL */ {
+                let caps_lock_on = (data.toggles & 0x01) != 0;
+                debug!("CapsLock state notification: on={}", caps_lock_on);
+                let had_pending = {
+                    let s = self.state.lock().unwrap_or_else(|e| e.into_inner());
+                    !s.input_buffer.is_empty()
+                        || !s.committed_text.is_empty()
+                        || !s.candidates.is_empty()
+                };
+                let commit_text = {
+                    let mut s = self.state.lock().unwrap_or_else(|e| e.into_inner());
+                    // 切大写时按"切英文"语义处理待输入（commit_on_switch）；切回小写时直接丢弃。
+                    let text = self.take_input_on_mode_switch(&mut s, !caps_lock_on);
+                    s.caps_lock = caps_lock_on;
+                    text
+                };
+                self.punct.lock().unwrap_or_else(|e| e.into_inner()).reset();
+                self.push_state_update();
+                self.show_status();
+                self.notify_toolbar();
+                self.notify_ui_hide();
+                if !commit_text.is_empty() || had_pending {
+                    let chinese_mode = self.state.lock().unwrap_or_else(|e| e.into_inner()).chinese_mode;
+                    return KeyAction::InsertText {
+                        text: commit_text,
+                        new_composition: None,
+                        mode_changed: false,
+                        chinese_mode,
+                        has_new_composition: false,
+                    };
+                }
+                return KeyAction::StatusUpdate(self.build_status());
+            }
             if self.is_toggle_mode_keycode(data.key_code) {
                 debug!("toggle_mode key_up: code=0x{:02X}", data.key_code);
                 // 切换前是否有未上屏的编码/候选（决定是否需要结束应用 composition）。
