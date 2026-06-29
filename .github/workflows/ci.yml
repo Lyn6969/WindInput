@@ -50,5 +50,6 @@ jobs:
 
       - name: 交叉编译 TSF DLL (x64 + x86)
         run: |
-          make -C wind_tsf VERSION="${GITHUB_SHA::8}"
-          make -C wind_tsf x86 VERSION="${GITHUB_SHA::8}"
+          V="$(tr -d '[:space:]' < docs/VERSION)"
+          make -C wind_tsf VERSION="$V"
+          make -C wind_tsf x86 VERSION="$V"
