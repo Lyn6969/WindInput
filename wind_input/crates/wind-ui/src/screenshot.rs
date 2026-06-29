@@ -41,10 +41,18 @@ fn trim_transparent(buf: &[u8], w: u32, h: u32) -> (Vec<u8>, u32, u32) {
         for x in 0..w {
             let alpha = buf[y as usize * stride + x as usize * 4 + 3];
             if alpha > ALPHA_THRESHOLD {
-                if y < top { top = y; }
-                if y + 1 > bottom { bottom = y + 1; }
-                if x < left { left = x; }
-                if x + 1 > right { right = x + 1; }
+                if y < top {
+                    top = y;
+                }
+                if y + 1 > bottom {
+                    bottom = y + 1;
+                }
+                if x < left {
+                    left = x;
+                }
+                if x + 1 > right {
+                    right = x + 1;
+                }
             }
         }
     }
@@ -95,7 +103,7 @@ pub fn copy_bgra_to_clipboard(buffer: &[u8], width: u32, height: u32) -> Result<
     use windows::Win32::System::DataExchange::{
         CloseClipboard, EmptyClipboard, OpenClipboard, SetClipboardData,
     };
-    use windows::Win32::System::Memory::{GlobalAlloc, GlobalLock, GlobalUnlock, GMEM_MOVEABLE};
+    use windows::Win32::System::Memory::{GMEM_MOVEABLE, GlobalAlloc, GlobalLock, GlobalUnlock};
 
     const CF_DIB: u32 = 8;
 
@@ -112,7 +120,12 @@ pub fn copy_bgra_to_clipboard(buffer: &[u8], width: u32, height: u32) -> Result<
         .flat_map(|px| {
             let (b, g, r, a) = (px[0], px[1], px[2], px[3]);
             let inv = 255u8.saturating_sub(a);
-            [b.saturating_add(inv), g.saturating_add(inv), r.saturating_add(inv), 255u8]
+            [
+                b.saturating_add(inv),
+                g.saturating_add(inv),
+                r.saturating_add(inv),
+                255u8,
+            ]
         })
         .collect();
 

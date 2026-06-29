@@ -901,7 +901,13 @@ pub fn fill_gear(
             let mut paint = Paint::default();
             paint.anti_alias = true;
             paint.set_color(Color::from_rgba8(color[2], color[1], color[0], color[3]));
-            pm.fill_path(&path, &paint, FillRule::Winding, Transform::identity(), None);
+            pm.fill_path(
+                &path,
+                &paint,
+                FillRule::Winding,
+                Transform::identity(),
+                None,
+            );
         }
     }
     // 中心孔：在齿轮体上叠画一个小圆（hole 色，通常取工具栏底色 → 视觉镂空）。

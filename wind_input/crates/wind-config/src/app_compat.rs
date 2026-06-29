@@ -135,7 +135,9 @@ mod tests {
         let compat = AppCompat::from_rules(file.apps);
 
         // 进程名匹配不区分大小写。
-        let rule = compat.get_rule("weixin.exe").expect("应命中 Weixin.exe 规则");
+        let rule = compat
+            .get_rule("weixin.exe")
+            .expect("应命中 Weixin.exe 规则");
         assert!(rule.caret_use_top);
         assert!(compat.get_rule("WEIXIN.EXE").unwrap().caret_use_top);
         // 未配置的进程无规则。

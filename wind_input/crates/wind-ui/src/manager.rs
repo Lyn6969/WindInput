@@ -516,12 +516,7 @@ impl UiManager {
                             m.hide();
                         }
                     }
-                    UiCommand::ShowCandidateMenu {
-                        items,
-                        x,
-                        y,
-                        above,
-                    } => {
+                    UiCommand::ShowCandidateMenu { items, x, y, above } => {
                         debug!("UI: ShowMenu ({} items) at ({},{})", items.len(), x, y);
                         if let Some(m) = &mut popup_menu {
                             m.show(items, x, y, above);
@@ -572,7 +567,10 @@ impl UiManager {
                             if tb.is_visible() {
                                 let path = dir.join(format!("toolbar_{ts}.png"));
                                 match tb.capture_to_file(&path) {
-                                    Ok(_) => { saved += 1; info!("Screenshot saved: {:?}", path); }
+                                    Ok(_) => {
+                                        saved += 1;
+                                        info!("Screenshot saved: {:?}", path);
+                                    }
                                     Err(e) => tracing::warn!("Screenshot toolbar: {}", e),
                                 }
                             }
@@ -582,7 +580,10 @@ impl UiManager {
                             if st.is_visible() {
                                 let path = dir.join(format!("status_tip_{ts}.png"));
                                 match st.capture_to_file(&path) {
-                                    Ok(_) => { saved += 1; info!("Screenshot saved: {:?}", path); }
+                                    Ok(_) => {
+                                        saved += 1;
+                                        info!("Screenshot saved: {:?}", path);
+                                    }
                                     Err(e) => tracing::warn!("Screenshot status_tip: {}", e),
                                 }
                             }
@@ -592,7 +593,10 @@ impl UiManager {
                             if pm.is_visible() {
                                 let path = dir.join(format!("popup_menu_{ts}.png"));
                                 match pm.capture_to_file(&path) {
-                                    Ok(_) => { saved += 1; info!("Screenshot saved: {:?}", path); }
+                                    Ok(_) => {
+                                        saved += 1;
+                                        info!("Screenshot saved: {:?}", path);
+                                    }
                                     Err(e) => tracing::warn!("Screenshot popup_menu: {}", e),
                                 }
                             }
@@ -602,7 +606,10 @@ impl UiManager {
                             if t.is_visible() {
                                 let path = dir.join(format!("toast_{ts}.png"));
                                 match t.capture_to_file(&path) {
-                                    Ok(_) => { saved += 1; info!("Screenshot saved: {:?}", path); }
+                                    Ok(_) => {
+                                        saved += 1;
+                                        info!("Screenshot saved: {:?}", path);
+                                    }
                                     Err(e) => tracing::warn!("Screenshot toast: {}", e),
                                 }
                             }
@@ -612,18 +619,25 @@ impl UiManager {
                         if let Some(t) = &mut toast {
                             let msg = if saved > 0 {
                                 if candidate_to_clipboard {
-                                    format!("已保存 {} 张截图（候选已复制到剪贴板）\n{}", saved, dir.display())
+                                    format!(
+                                        "已保存 {} 张截图（候选已复制到剪贴板）\n{}",
+                                        saved,
+                                        dir.display()
+                                    )
                                 } else {
                                     format!("已保存 {} 张截图\n{}", saved, dir.display())
                                 }
                             } else {
                                 "没有可见的 UI 窗口可截图".to_string()
                             };
-                            let kind = if saved > 0 { ToastKind::Success } else { ToastKind::Info };
+                            let kind = if saved > 0 {
+                                ToastKind::Success
+                            } else {
+                                ToastKind::Info
+                            };
                             t.show(&msg, ToastPosition::BottomRight, kind);
                             toast_hide_at = Some(
-                                std::time::Instant::now()
-                                    + std::time::Duration::from_millis(4000),
+                                std::time::Instant::now() + std::time::Duration::from_millis(4000),
                             );
                         }
                     }
@@ -645,8 +659,7 @@ impl UiManager {
                         if let Some(t) = &mut toast {
                             t.show(&msg, ToastPosition::BottomRight, kind);
                             toast_hide_at = Some(
-                                std::time::Instant::now()
-                                    + std::time::Duration::from_millis(3000),
+                                std::time::Instant::now() + std::time::Duration::from_millis(3000),
                             );
                         }
                     }

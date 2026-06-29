@@ -177,9 +177,24 @@ impl Coordinator {
         if !theme_children.is_empty() {
             theme_children.push(M::separator());
         }
-        theme_children.push(M::leaf("跟随系统", cmd(MenuCmd::ThemeStyle(0)), true, style == 0));
-        theme_children.push(M::leaf("亮色", cmd(MenuCmd::ThemeStyle(1)), true, style == 1));
-        theme_children.push(M::leaf("暗色", cmd(MenuCmd::ThemeStyle(2)), true, style == 2));
+        theme_children.push(M::leaf(
+            "跟随系统",
+            cmd(MenuCmd::ThemeStyle(0)),
+            true,
+            style == 0,
+        ));
+        theme_children.push(M::leaf(
+            "亮色",
+            cmd(MenuCmd::ThemeStyle(1)),
+            true,
+            style == 1,
+        ));
+        theme_children.push(M::leaf(
+            "暗色",
+            cmd(MenuCmd::ThemeStyle(2)),
+            true,
+            style == 2,
+        ));
 
         // 检索范围子菜单：过滤模式单选
         let filter_children: Vec<_> = FILTER_MODES
@@ -192,8 +207,18 @@ impl Coordinator {
 
         // 高级子菜单：截图等不常用功能
         let advanced_children = vec![
-            M::leaf("截图所有窗口到文件", cmd(MenuCmd::TakeScreenshot), true, false),
-            M::leaf("截图候选窗口到剪贴板", cmd(MenuCmd::ScreenshotCandidateToClipboard), true, false),
+            M::leaf(
+                "截图所有窗口到文件",
+                cmd(MenuCmd::TakeScreenshot),
+                true,
+                false,
+            ),
+            M::leaf(
+                "截图候选窗口到剪贴板",
+                cmd(MenuCmd::ScreenshotCandidateToClipboard),
+                true,
+                false,
+            ),
         ];
 
         let items = vec![
@@ -316,7 +341,10 @@ impl Coordinator {
     pub(crate) fn toolbar_pos_for_cursor(&self) -> Option<(i32, i32)> {
         let (cx, cy) = cursor_pos();
         let key = monitor_key_from_point(cx, cy);
-        let map = self.toolbar_positions.lock().unwrap_or_else(|e| e.into_inner());
+        let map = self
+            .toolbar_positions
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         map.get(&key).copied()
     }
 
@@ -325,11 +353,17 @@ impl Coordinator {
         let (cx, cy) = cursor_pos();
         let key = monitor_key_from_point(cx, cy);
         {
-            let mut map = self.toolbar_positions.lock().unwrap_or_else(|e| e.into_inner());
+            let mut map = self
+                .toolbar_positions
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
             map.insert(key, (x, y));
         }
         if let Some(state_dir) = Config::state_dir() {
-            let map = self.toolbar_positions.lock().unwrap_or_else(|e| e.into_inner());
+            let map = self
+                .toolbar_positions
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
             let mut rs = wind_config::RuntimeState::load(&state_dir);
             rs.toolbar_positions = map.clone();
             let _ = rs.save(&state_dir);
@@ -372,11 +406,15 @@ impl Coordinator {
         if !self.rt().config.ui.toolbar.hide_in_fullscreen {
             return;
         }
-        let Some(weak) = self.self_weak.get().cloned() else { return; };
+        let Some(weak) = self.self_weak.get().cloned() else {
+            return;
+        };
         std::thread::spawn(move || {
             let is_fs = crate::is_foreground_fullscreen();
             if let Some(c) = weak.upgrade() {
-                let prev = c.fullscreen_cached.swap(is_fs, std::sync::atomic::Ordering::Relaxed);
+                let prev = c
+                    .fullscreen_cached
+                    .swap(is_fs, std::sync::atomic::Ordering::Relaxed);
                 if prev != is_fs {
                     // 全屏态发生变化，用新值重新通知
                     c.notify_toolbar();
@@ -393,7 +431,9 @@ impl Coordinator {
     pub(crate) fn notify_toolbar(&self) {
         // 前台应用全屏时隐藏工具栏（读缓存，由 notify_toolbar_async 后台刷新，无阻塞）。
         let hide_fullscreen = self.rt().config.ui.toolbar.hide_in_fullscreen
-            && self.fullscreen_cached.load(std::sync::atomic::Ordering::Relaxed);
+            && self
+                .fullscreen_cached
+                .load(std::sync::atomic::Ordering::Relaxed);
         let s = self.state.lock().unwrap_or_else(|e| e.into_inner());
         if !(s.ime_active && s.toolbar_visible) || hide_fullscreen {
             drop(s);
@@ -407,7 +447,11 @@ impl Coordinator {
         let icon_label = if effective_chinese {
             let id = self.engine_mgr.active_schema_id();
             let lbl = self.engine_mgr.schema_icon_label(&id);
-            if lbl.is_empty() { "中".to_string() } else { lbl }
+            if lbl.is_empty() {
+                "中".to_string()
+            } else {
+                lbl
+            }
         } else if caps_lock {
             "A".to_string()
         } else {
@@ -437,11 +481,15 @@ fn cursor_pos() -> (i32, i32) {
         use windows::Win32::Foundation::POINT;
         use windows::Win32::UI::WindowsAndMessaging::GetCursorPos;
         let mut pt: POINT = unsafe { zeroed() };
-        unsafe { let _ = GetCursorPos(&mut pt); }
+        unsafe {
+            let _ = GetCursorPos(&mut pt);
+        }
         (pt.x, pt.y)
     }
     #[cfg(not(target_os = "windows"))]
-    { (0, 0) }
+    {
+        (0, 0)
+    }
 }
 
 /// 根据屏幕坐标计算显示器 key（工作区右下角："workRight,workBottom"）。
@@ -452,7 +500,7 @@ fn monitor_key_from_point(x: i32, y: i32) -> String {
         use std::mem::{size_of, zeroed};
         use windows::Win32::Foundation::POINT;
         use windows::Win32::Graphics::Gdi::{
-            GetMonitorInfoW, MONITORINFO, MONITOR_DEFAULTTONEAREST, MonitorFromPoint,
+            GetMonitorInfoW, MONITOR_DEFAULTTONEAREST, MONITORINFO, MonitorFromPoint,
         };
         unsafe {
             let pt = POINT { x, y };
@@ -466,12 +514,13 @@ fn monitor_key_from_point(x: i32, y: i32) -> String {
         "0,0".to_string()
     }
     #[cfg(not(target_os = "windows"))]
-    { "0,0".to_string() }
+    {
+        "0,0".to_string()
+    }
 }
 
 /// 截图保存目录：用户配置目录下的 `screenshots/` 子目录。
 /// 返回 None 表示无法确定用户目录（portable 模式但找不到 exe 路径等极罕见情况）。
 fn screenshots_dir() -> Option<String> {
-    Config::user_config_dir()
-        .map(|d| d.join("screenshots").display().to_string())
+    Config::user_config_dir().map(|d| d.join("screenshots").display().to_string())
 }

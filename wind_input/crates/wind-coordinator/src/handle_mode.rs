@@ -375,8 +375,10 @@ impl Coordinator {
             user_rows.sort_by(|a, b| a.0.cmp(&b.0));
         }
 
-        let mut result: Vec<(String, String)> =
-            prog_rows.into_iter().map(|(id, name, _)| (id, name)).collect();
+        let mut result: Vec<(String, String)> = prog_rows
+            .into_iter()
+            .map(|(id, name, _)| (id, name))
+            .collect();
         result.extend(user_rows);
         result
     }
@@ -770,8 +772,10 @@ impl Coordinator {
                     -1,
                     wind_store::stats::CommitSource::Mix,
                 );
-                let out =
-                    self.maybe_s2t(state, &format!("{}{}", state.committed_text, state.mix_buffer));
+                let out = self.maybe_s2t(
+                    state,
+                    &format!("{}{}", state.committed_text, state.mix_buffer),
+                );
                 commit_text(self, state, out)
             }
             _ => {

@@ -527,7 +527,10 @@ mod tests {
         // 拆字+拼音融合为 [拆字 / 拼音]
         assert!(t.contains("[拆字 / 拼音]"), "融合标题: {t}");
         // 拆字行 + \t + 拼音读音（剥离"字："前缀）
-        assert!(t.contains("好：女子 [vbg]\thǎo/hào"), "融合行含拆字+拼音: {t}");
+        assert!(
+            t.contains("好：女子 [vbg]\thǎo/hào"),
+            "融合行含拆字+拼音: {t}"
+        );
         // 不应有独立的拼音或拆字标题
         assert!(!t.contains("[拼音]"), "无独立拼音段: {t}");
         assert!(!t.contains("[拆字]"), "无独立拆字段: {t}");

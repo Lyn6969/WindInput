@@ -371,8 +371,14 @@ impl CandidateWindow {
         // 从而 (1) 输入缓冲变化致尺寸变化时按需重定位、不溢出屏幕；(2) 上方显示以底边贴光标为参考；
         // (3) 已显示后宿主 caret 微抖动(<4px)不跳，位置保护；显著变化(换行/reflow 修正)才跟随；
         // (4) 一旦上翻则粘滞上方。新组合首显已由协调器延迟到 reflow 后的权威坐标，故首帧即落在正确处。
-        let (px0, py0, above) =
-            Self::place_window(self.x, self.y, self.caret_height, content_w, content_h, self.placed_above);
+        let (px0, py0, above) = Self::place_window(
+            self.x,
+            self.y,
+            self.caret_height,
+            content_w,
+            content_h,
+            self.placed_above,
+        );
         self.placed_above = above;
         // 位置稳定性：窗口已显示且新位置与上次内容锚点微移(<4px*scale)→保持原位，吞掉 caret 微抖。
         let (px, py) = match self.last_content_pos {
@@ -495,8 +501,8 @@ impl CandidateWindow {
                         let win_w = self.window.size().0 as i32;
                         tip.show_beside(
                             &code,
-                            wx,             // 窗口左边界
-                            wx + win_w,     // 窗口右边界
+                            wx,         // 窗口左边界
+                            wx + win_w, // 窗口右边界
                             wy + r.y as i32,
                             wy + (r.y + r.h) as i32,
                         );

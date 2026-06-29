@@ -872,7 +872,11 @@ fn test_quick_input_empty_enter_outputs_trigger_symbol() {
     }
     // 退出后五笔输入恢复正常
     let act = press_letter(&coord, 'a');
-    assert_eq!(action_text(&act).unwrap(), "a", "回车上屏后应已退出快捷输入");
+    assert_eq!(
+        action_text(&act).unwrap(),
+        "a",
+        "回车上屏后应已退出快捷输入"
+    );
 }
 
 #[test]
@@ -891,7 +895,11 @@ fn test_temp_pinyin_empty_enter_outputs_trigger_symbol() {
         other => panic!("空缓冲回车应上屏触发符号，实际: {:?}", other),
     }
     let act = press_letter(&coord, 'a');
-    assert_eq!(action_text(&act).unwrap(), "a", "回车上屏后应已退出临时拼音");
+    assert_eq!(
+        action_text(&act).unwrap(),
+        "a",
+        "回车上屏后应已退出临时拼音"
+    );
 }
 
 #[test]
@@ -930,7 +938,10 @@ fn test_mix_letter_trigger_empty_enter_no_symbol() {
     // 空缓冲回车：prefix 为空 → 走清空退出（而非上屏 z）。若误入五笔，则会上屏/提交 z 而非清空。
     match coord.handle_key_event(&key_event(0x0D, EVENT_KEY_DOWN)) {
         KeyAction::ClearComposition => {}
-        other => panic!("字母触发键空缓冲回车应清空退出（不输出字母），实际: {:?}", other),
+        other => panic!(
+            "字母触发键空缓冲回车应清空退出（不输出字母），实际: {:?}",
+            other
+        ),
     }
 }
 

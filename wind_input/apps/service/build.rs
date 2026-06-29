@@ -118,11 +118,7 @@ fn git_describe() -> String {
         .filter(|o| o.status.success())
         .map(|o| !o.stdout.is_empty())
         .unwrap_or(false);
-    if dirty {
-        format!("{hash}-dirty")
-    } else {
-        hash
-    }
+    if dirty { format!("{hash}-dirty") } else { hash }
 }
 
 /// 把 Unix 时间戳（秒）格式化为 `YYYY-MM-DDTHH:MM:SSZ`（UTC，无第三方依赖）。

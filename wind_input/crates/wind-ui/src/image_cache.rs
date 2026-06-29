@@ -51,7 +51,8 @@ pub fn rasterize_svg_str_tinted(svg: &str, w: u32, h: u32, tint: [u8; 4]) -> Opt
     if w == 0 || h == 0 {
         return None;
     }
-    let tree = resvg::usvg::Tree::from_data(svg.as_bytes(), &resvg::usvg::Options::default()).ok()?;
+    let tree =
+        resvg::usvg::Tree::from_data(svg.as_bytes(), &resvg::usvg::Options::default()).ok()?;
     let size = tree.size();
     let mut rpm = resvg::tiny_skia::Pixmap::new(w, h)?;
     let sx = w as f32 / size.width().max(1.0);

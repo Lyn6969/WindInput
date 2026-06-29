@@ -479,7 +479,8 @@ mod tests {
 
     #[test]
     fn test_jidian_classic_rich_features() {
-        let t = load_typed_dirs(&[testdata_dir(), data_dir()], "jidian-classic").expect("load jidian-classic");
+        let t = load_typed_dirs(&[testdata_dir(), data_dir()], "jidian-classic")
+            .expect("load jidian-classic");
         // base 继承 _base → colors 合并进来
         assert!(t.colors.is_some(), "应从 _base 继承 colors");
         // resources：panel/sel 双变体 + mark 标量

@@ -18,13 +18,13 @@
 //!   manager 的 Win32 消息泵。这些在非 Windows 是空实现，其测试仅验证 mock 的 API 契约。
 
 pub mod candidate_window;
-pub mod screenshot;
 pub mod debounce;
 pub mod dpi;
 pub mod image_cache;
 pub mod manager;
 pub mod popup_menu;
 pub mod renderer;
+pub mod screenshot;
 pub mod status;
 pub mod status_tip;
 pub mod sys;

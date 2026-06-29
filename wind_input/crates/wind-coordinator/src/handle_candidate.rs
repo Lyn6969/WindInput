@@ -146,7 +146,8 @@ impl Coordinator {
         };
         let result = match pinyin_schema {
             Some(ps) if self.engine_mgr.ensure_schema(&ps) => {
-                self.engine_mgr.convert_with(&ps, &state.input_buffer, limit)
+                self.engine_mgr
+                    .convert_with(&ps, &state.input_buffer, limit)
             }
             _ => self.engine_mgr.convert(&state.input_buffer, limit),
         };

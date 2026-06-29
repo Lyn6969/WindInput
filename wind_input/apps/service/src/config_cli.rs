@@ -195,7 +195,11 @@ fn apply_items(items: Vec<(String, toml::Value)>) -> i32 {
         })
         .collect();
 
-    match wind_rpc::client::call(wind_config::variant::pipe_suffix(), "config.setItems", json!({ "items": json_items })) {
+    match wind_rpc::client::call(
+        wind_config::variant::pipe_suffix(),
+        "config.setItems",
+        json!({ "items": json_items }),
+    ) {
         Ok(res) => {
             let restart = res
                 .get("needsRestart")

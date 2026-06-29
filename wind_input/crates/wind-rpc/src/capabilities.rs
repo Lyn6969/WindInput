@@ -87,7 +87,11 @@ mod tests {
         let keys: std::collections::BTreeSet<&str> =
             arr.iter().map(|e| e["key"].as_str().unwrap()).collect();
         for f in config_schema::registry() {
-            assert!(keys.contains(f.key), "capability 缺 registry key: {}", f.key);
+            assert!(
+                keys.contains(f.key),
+                "capability 缺 registry key: {}",
+                f.key
+            );
         }
         assert_eq!(
             keys.len(),
@@ -106,7 +110,10 @@ mod tests {
             .find(|e| e["key"] == "ui.candidate.layout")
             .expect("应含 ui.candidate.layout");
         assert_eq!(entry["type"], "enum");
-        assert_eq!(entry["values"], serde_json::json!(["horizontal", "vertical"]));
+        assert_eq!(
+            entry["values"],
+            serde_json::json!(["horizontal", "vertical"])
+        );
     }
 
     #[test]
@@ -125,6 +132,9 @@ mod tests {
             serde_json::json!(["SearchHost.exe"])
         );
         // 普通默认值
-        assert_eq!(find("ui.candidate.per_page")["default"], serde_json::json!(7));
+        assert_eq!(
+            find("ui.candidate.per_page")["default"],
+            serde_json::json!(7)
+        );
     }
 }

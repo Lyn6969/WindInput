@@ -47,8 +47,8 @@ const CARET_USE_TOP_MIN_LINE_H: i32 = 18;
 fn process_name(pid: u32) -> String {
     use windows::Win32::Foundation::{CloseHandle, MAX_PATH};
     use windows::Win32::System::Threading::{
-        OpenProcess, QueryFullProcessImageNameW, PROCESS_NAME_FORMAT,
-        PROCESS_QUERY_LIMITED_INFORMATION,
+        OpenProcess, PROCESS_NAME_FORMAT, PROCESS_QUERY_LIMITED_INFORMATION,
+        QueryFullProcessImageNameW,
     };
     if pid == 0 {
         return String::new();
@@ -672,8 +672,7 @@ impl Coordinator {
         let engine_mgr = EngineManager::with_store(&config, data_dir, store.clone());
         // 应用兼容规则：系统层(data/compat.toml) + 用户层覆盖。供焦点进程按名查规则
         // （如微信 caret_use_top）。
-        let app_compat =
-            wind_config::app_compat::AppCompat::load(data_dir, user_dir.as_deref());
+        let app_compat = wind_config::app_compat::AppCompat::load(data_dir, user_dir.as_deref());
         // 配置的轻量派生缓存集中到 ConfigBundle（支持运行时热替换）。
         let bundle = ConfigBundle::build(config.clone());
         info!(
@@ -1398,9 +1397,8 @@ impl Coordinator {
         // 陈旧坐标处先显示、reflow 后再跳（根治"上屏后立即输入候选窗错位约一个上屏宽度"）。
         // 例外：仅显示模式标记（无候选/无编码）时跳过延迟——进入模式时缓冲为空、无刚上屏文字，
         // 光标无 reflow 跳动风险，强制延迟只会让状态提示迟钝。
-        let only_mode_label = !mode_label.is_empty()
-            && state.candidates.is_empty()
-            && state.input_buffer.is_empty();
+        let only_mode_label =
+            !mode_label.is_empty() && state.candidates.is_empty() && state.input_buffer.is_empty();
         let authorized = self
             .show_authorized
             .swap(false, std::sync::atomic::Ordering::Relaxed);
@@ -1784,14 +1782,24 @@ impl Coordinator {
     fn build_status(&self) -> StatusUpdateData {
         let (chinese_mode, full_width, chinese_punct, toolbar_visible, caps_lock) = {
             let s = self.state.lock().unwrap_or_else(|e| e.into_inner());
-            (s.chinese_mode, s.full_width, s.chinese_punct, s.toolbar_visible, s.caps_lock)
+            (
+                s.chinese_mode,
+                s.full_width,
+                s.chinese_punct,
+                s.toolbar_visible,
+                s.caps_lock,
+            )
         };
         // 有效中文：中文模式且大写锁定未开（对齐 Go effectiveChinese = chineseMode && !capsLockOn）。
         let effective_chinese = chinese_mode && !caps_lock;
         let icon_label = if effective_chinese {
             let id = self.engine_mgr.active_schema_id();
             let lbl = self.engine_mgr.schema_icon_label(&id);
-            if lbl.is_empty() { "中".to_string() } else { lbl }
+            if lbl.is_empty() {
+                "中".to_string()
+            } else {
+                lbl
+            }
         } else if caps_lock {
             "A".to_string()
         } else {
@@ -1938,7 +1946,11 @@ impl Coordinator {
         }
         // 标点（总显示）：英文模式（含大写锁定）下固定显示半角，不看内部 punct_cn 状态。
         let effective_chinese = chinese && !caps;
-        parts.push(if effective_chinese && punct_cn { "。".into() } else { ".".into() });
+        parts.push(if effective_chinese && punct_cn {
+            "。".into()
+        } else {
+            ".".into()
+        });
         // 全角（仅全角时）
         if full {
             parts.push("全".into());
@@ -2251,7 +2263,9 @@ impl MessageHandler for Coordinator {
             // CapsLock 单独处理：C++ 侧总是发送此 key_up（不经 key_up_tsf_hashes 过滤），
             // 故须先于 is_toggle_mode_keycode 检查。同步真实大写锁定状态，不翻转 chinese_mode
             // （对齐 Go handleCapsLockStateNoLock：capsLockOn 跟随 data.toggles & 0x01）。
-            if data.key_code == 0x14 /* VK_CAPITAL */ {
+            if data.key_code == 0x14
+            /* VK_CAPITAL */
+            {
                 let caps_lock_on = (data.toggles & 0x01) != 0;
                 debug!("CapsLock state notification: on={}", caps_lock_on);
                 let had_pending = {
@@ -2273,7 +2287,11 @@ impl MessageHandler for Coordinator {
                 self.notify_toolbar();
                 self.notify_ui_hide();
                 if !commit_text.is_empty() || had_pending {
-                    let chinese_mode = self.state.lock().unwrap_or_else(|e| e.into_inner()).chinese_mode;
+                    let chinese_mode = self
+                        .state
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .chinese_mode;
                     return KeyAction::InsertText {
                         text: commit_text,
                         new_composition: None,
@@ -3017,7 +3035,8 @@ impl MessageHandler for Coordinator {
         state.caret_x = data.x;
         state.caret_y = data.y;
         state.caret_height = data.height;
-        let now_valid = !(data.x == 0 && data.y == 0) && data.x.abs() < 32000 && data.y.abs() < 32000;
+        let now_valid =
+            !(data.x == 0 && data.y == 0) && data.x.abs() < 32000 && data.y.abs() < 32000;
         if !now_valid {
             return;
         }

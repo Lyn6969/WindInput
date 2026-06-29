@@ -145,7 +145,16 @@ impl Tooltip {
             let n = (w * h * 4) as usize;
             buf[..n].fill(0);
             if let Some(sh) = &self.shadow {
-                sh.paint(buf, w, h, ml as f32, mt as f32, cw as f32, ch as f32, tip.corner_radius);
+                sh.paint(
+                    buf,
+                    w,
+                    h,
+                    ml as f32,
+                    mt as f32,
+                    cw as f32,
+                    ch as f32,
+                    tip.corner_radius,
+                );
             }
             tip.paint(buf, w, h, &self.renderer);
         }
@@ -171,7 +180,14 @@ impl Tooltip {
     /// 竖排模式：在候选窗右侧显示提示，右侧空间不足时改显示在左侧。
     /// `win_left`/`win_right` 为候选窗左右边界（含阴影）屏幕坐标。
     /// `row_top`/`row_bottom` 为悬停候选行的屏幕上/下边界，tooltip 纵向对齐候选行。
-    pub fn show_beside(&mut self, text: &str, win_left: i32, win_right: i32, row_top: i32, row_bottom: i32) {
+    pub fn show_beside(
+        &mut self,
+        text: &str,
+        win_left: i32,
+        win_right: i32,
+        row_top: i32,
+        row_bottom: i32,
+    ) {
         if text.is_empty() {
             self.hide();
             return;
@@ -212,7 +228,14 @@ fn dpi_scale() -> f32 {
 /// 竖排模式：tooltip 显示在候选窗**右侧**（空间不足时改左侧），纵向对齐悬停候选行。
 /// `win_left`/`win_right` 为候选窗左右边界（含阴影）；`row_top`/`row_bottom` 为候选行上下边界。
 #[cfg_attr(not(windows), allow(unused_variables))]
-fn clamp_beside(win_left: i32, win_right: i32, row_top: i32, _row_bottom: i32, w: u32, h: u32) -> (i32, i32) {
+fn clamp_beside(
+    win_left: i32,
+    win_right: i32,
+    row_top: i32,
+    _row_bottom: i32,
+    w: u32,
+    h: u32,
+) -> (i32, i32) {
     let gap = 4;
     let (mut px, mut py) = (win_right + gap, row_top);
     #[cfg(windows)]
@@ -222,7 +245,10 @@ fn clamp_beside(win_left: i32, win_right: i32, row_top: i32, _row_bottom: i32, w
             GetMonitorInfoW, MONITOR_DEFAULTTONEAREST, MONITORINFO, MonitorFromPoint,
         };
         unsafe {
-            let pt = POINT { x: win_right, y: row_top };
+            let pt = POINT {
+                x: win_right,
+                y: row_top,
+            };
             let mon = MonitorFromPoint(pt, MONITOR_DEFAULTTONEAREST);
             let mut mi = MONITORINFO {
                 cbSize: std::mem::size_of::<MONITORINFO>() as u32,

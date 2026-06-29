@@ -351,7 +351,10 @@ mod tests {
             r.get("configKeys").and_then(|v| v.as_array()).is_some(),
             "capabilities 应含 configKeys 数组"
         );
-        assert!(r.get("appVersion").is_some(), "capabilities 应含 appVersion");
+        assert!(
+            r.get("appVersion").is_some(),
+            "capabilities 应含 appVersion"
+        );
     }
 
     #[test]

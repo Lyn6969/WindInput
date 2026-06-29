@@ -102,14 +102,14 @@ impl Toolbar {
     const FONT_PX: f32 = 15.0;
 
     // 默认浅色配色（主题加载后由 set_theme 覆盖，以下为无主题时的兜底值）
-    const BG: [u8; 4] = [255, 255, 255, 245];      // 白色半透明底
-    const FG: [u8; 4] = [72, 72, 78, 255];           // 正常文字深灰
-    const HL_BG: [u8; 4] = [66, 133, 244, 255];      // 高亮蓝（中文模式 / 简繁启用）
+    const BG: [u8; 4] = [255, 255, 255, 245]; // 白色半透明底
+    const FG: [u8; 4] = [72, 72, 78, 255]; // 正常文字深灰
+    const HL_BG: [u8; 4] = [66, 133, 244, 255]; // 高亮蓝（中文模式 / 简繁启用）
     const HL_FG: [u8; 4] = [255, 255, 255, 255];
-    const SEP: [u8; 4] = [214, 214, 220, 255];       // 浅灰分隔线
-    const GRIP: [u8; 4] = [186, 186, 194, 255];      // 拖动点
+    const SEP: [u8; 4] = [214, 214, 220, 255]; // 浅灰分隔线
+    const GRIP: [u8; 4] = [186, 186, 194, 255]; // 拖动点
     const SETTINGS_ICON: [u8; 4] = [140, 140, 148, 255]; // 设置图标（比普通文字更淡）
-    const HOVER_BG: [u8; 4] = [0, 0, 0, 13];         // 鼠标悬停高亮（极淡，~5% 黑）
+    const HOVER_BG: [u8; 4] = [0, 0, 0, 13]; // 鼠标悬停高亮（极淡，~5% 黑）
 
     pub fn new(events: Sender<UiEvent>) -> Result<Self, String> {
         let scale = Self::dpi_scale();
@@ -340,10 +340,17 @@ impl Toolbar {
                     size,
                     self.settings_icon,
                 );
-            } else if matches!(c.action, ToolbarAction::TogglePunct | ToolbarAction::ToggleWidth) {
+            } else if matches!(
+                c.action,
+                ToolbarAction::TogglePunct | ToolbarAction::ToggleWidth
+            ) {
                 // 标点 / 全半角：按状态渲染内联 SVG 图标，主题色 tint，居中于方格。
                 // 英文模式下标点固定半角（不可切换），无论 chinese_punct 状态如何。
-                let svg = match (c.action, effective_chinese && state.chinese_punct, state.full_width) {
+                let svg = match (
+                    c.action,
+                    effective_chinese && state.chinese_punct,
+                    state.full_width,
+                ) {
                     (ToolbarAction::TogglePunct, true, _) => PUNCT_FULL_SVG,
                     (ToolbarAction::TogglePunct, false, _) => PUNCT_HALF_SVG,
                     (ToolbarAction::ToggleWidth, _, true) => WIDTH_FULL_SVG,
@@ -352,7 +359,16 @@ impl Toolbar {
                 let size = font_h * 0.80;
                 let dx = x + (cw - size) * 0.5;
                 let dy = (h as f32 - size) * 0.5;
-                crate::view::draw_svg_icon(self.window.buffer_mut(), w, h, svg, dx, dy, size, self.fg);
+                crate::view::draw_svg_icon(
+                    self.window.buffer_mut(),
+                    w,
+                    h,
+                    svg,
+                    dx,
+                    dy,
+                    size,
+                    self.fg,
+                );
             } else {
                 // 居中文字
                 let m = self.renderer.measure_text(&c.text);
