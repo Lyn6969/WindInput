@@ -3167,7 +3167,7 @@ fn debug_tooltip_section(c: &Candidate) -> String {
     if lines.is_empty() {
         String::new()
     } else {
-        format!("调试\n{}", lines.join("\n"))
+        format!("[调试]\n{}", lines.join("\n"))
     }
 }
 
