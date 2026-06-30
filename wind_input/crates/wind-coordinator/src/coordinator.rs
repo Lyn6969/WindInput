@@ -380,6 +380,9 @@ pub(crate) struct SmartSymbolArm {
     /// HoldComposition 模式下 press1 进入组合态的中文文本（用于 disarm 时清理）。
     /// DeleteReplace 模式下始终为 None。
     pub(crate) held_text: Option<String>,
+    /// HoldComposition + has_input 时 press1 设为 true：已武装但调用方须先顶屏上屏候选，
+    /// 再开 HoldComposition；coordinator 标点分支检测此标志并生成 CommitAndHoldComposition。
+    pub(crate) hold_pending_commit: bool,
 }
 
 /// 配置 + 其轻量派生缓存的不可变快照；运行时整体原子替换以支持热重载。
@@ -2393,6 +2396,31 @@ impl MessageHandler for Coordinator {
             return KeyAction::PassThrough;
         }
 
+        // CapsLock 开：大写语义，不进中文输入流。
+        // 全角开：将按键转为正确大小写的英文字符再做全角转换后上屏。
+        // 全角关：TSF 层在无 session 时已透传；有 session（切换前残留）时由此兜底 PassThrough。
+        // Ctrl/Alt 组合不拦截（让下方热键/清空逻辑处理）。
+        if state.caps_lock && data.modifiers & (MOD_CTRL | MOD_ALT) == 0 {
+            if state.full_width {
+                let shift = data.modifiers & MOD_SHIFT != 0;
+                let is_letter = (keymap::VK_A..=keymap::VK_Z).contains(&data.key_code);
+                // CapsLock 对字母大小写取反：CapsLock ON + no Shift → 大写；Shift → 小写。
+                // printable_char 以 shift=true 产生大写，故字母键时翻转 shift。
+                let effective_shift = if is_letter { !shift } else { shift };
+                if let Some(ch) = printable_char(data.key_code, effective_shift) {
+                    // 经完整标点转换流水线（自定义映射"英全"列 → 全半角），
+                    // 而非直接 to_full_width，确保用户自定义映射生效。
+                    // 临时置 chinese_punct=false 对应"英全"状态（不走中文标点转换）。
+                    let saved_punct = state.chinese_punct;
+                    state.chinese_punct = false;
+                    let text = self.convert_punct_char(&state, ch);
+                    state.chinese_punct = saved_punct;
+                    return Self::commit_action(text, true);
+                }
+            }
+            return KeyAction::PassThrough;
+        }
+
         // 统一夺取回退：夺取式模式（URL/后续 z 临拼）中，退到夺取边界再按退格 →
         // 撤销夺取、把快照回放回正常码表输入流（而非停在无候选的独占模式）。
         // 须先于下方单点分派，否则退格会被模式处理器按普通删字符消费。
@@ -2795,6 +2823,54 @@ impl MessageHandler for Coordinator {
                         if !punct_commit {
                             return KeyAction::Consumed;
                         }
+                        // HoldComposition + has_input：arm 已设 hold_pending_commit，
+                        // 顶屏上屏候选后开 HoldComposition 放入中文标点。
+                        let hold_info = {
+                            let arm = self.smart_symbol.lock().unwrap_or_else(|e| e.into_inner());
+                            if arm.armed && arm.hold_pending_commit {
+                                Some((
+                                    arm.str.clone(),
+                                    self.smart_symbol_timeout().as_millis() as u32,
+                                ))
+                            } else {
+                                None
+                            }
+                        };
+                        if let Some((hold_text, timeout_ms)) = hold_info {
+                            let committed = self.take_committed(&mut state);
+                            let mut commit_text = self.maybe_s2t(&state, &committed);
+                            if !state.candidates.is_empty() {
+                                let (start, _) = self.page_range(&state);
+                                let idx =
+                                    (start + state.selected_index).min(state.candidates.len() - 1);
+                                let t = state.candidates[idx].text.clone();
+                                self.record_selection(&state.input_buffer, &t);
+                                self.record_commit(
+                                    &t,
+                                    state.input_buffer.len() as u32,
+                                    (idx - start) as i32,
+                                    CommitSource::Candidate,
+                                );
+                                commit_text.push_str(&self.maybe_s2t(&state, &t));
+                            } else if !state.input_buffer.is_empty() {
+                                commit_text.push_str(&state.input_buffer);
+                            }
+                            state.input_buffer.clear();
+                            state.candidates.clear();
+                            {
+                                let mut arm =
+                                    self.smart_symbol.lock().unwrap_or_else(|e| e.into_inner());
+                                arm.held_text = Some(hold_text.clone());
+                                arm.hold_pending_commit = false;
+                            }
+                            self.record_commit(&hold_text, 0, -1, CommitSource::Punctuation);
+                            self.notify_ui_hide();
+                            return KeyAction::CommitAndHoldComposition {
+                                commit_text,
+                                hold_text,
+                                timeout_ms,
+                            };
+                        }
                     }
                     // 标点/符号键：先上屏已转换前缀 + 首选候选（若有输入），再追加（转换后的）标点
                     let committed = self.take_committed(&mut state);
@@ -2821,8 +2897,20 @@ impl MessageHandler for Coordinator {
                     state.input_buffer.clear();
                     state.candidates.clear();
 
+                    // CapsLock + 无待提交内容：TSF 层应已透传此键，coordinator 不应收到；
+                    // 防御性兜底——直接透传让系统产生原始 WM_KEYDOWN + WM_CHAR。
+                    if state.caps_lock && !had_input {
+                        return KeyAction::PassThrough;
+                    }
+
                     // 标点单点流水线：自定义映射 > 数字后智能 > 中文标点 > 全半角。
+                    // CapsLock 开时大写语义等同英文模式，临时关闭中文标点转换。
+                    let saved_chinese_punct = state.chinese_punct;
+                    if state.caps_lock {
+                        state.chinese_punct = false;
+                    }
                     let piece = self.convert_punct(&state, ch, data.prev_char);
+                    state.chinese_punct = saved_chinese_punct;
                     out.push_str(&piece);
                     // 标点字符（候选部分已在标点前顶屏候选处记 Candidate；标点候选已 set
                     // stat_recorded，故此处必须显式记标点，否则顶层 fallback 会跳过它）。
@@ -3275,5 +3363,171 @@ mod caret_compat_tests {
         let token = (4321u64 << 32) | 7;
         c.update_active_compat(token);
         assert_eq!(c.active_compat.lock().unwrap().0, 4321);
+    }
+}
+
+#[cfg(test)]
+mod capslock_tests {
+    //! CapsLock 大写模式路由验证（不需要词典文件）。
+    //! 覆盖三条路径：字母透传 / 标点透传 / 全角提交。
+    use super::*;
+
+    fn coord_cn() -> Arc<Coordinator> {
+        let mut cfg = Config::default();
+        cfg.input.default.chinese_mode = true;
+        // 关闭智能符号，避免 CommitAndHoldComposition 干扰标点断言
+        cfg.input.symbol.smart_mode = false;
+        Coordinator::new_headless(cfg, None)
+    }
+
+    /// 构造最简按键事件
+    fn kev(key_code: u32, event_type: u8) -> KeyEventData {
+        KeyEventData {
+            key_code,
+            scan_code: 0,
+            modifiers: 0,
+            event_type,
+            toggles: 0,
+            event_seq: 0,
+            prev_char: 0,
+        }
+    }
+
+    /// 向 coordinator 注入 CapsLock 状态（模拟 C++ 端发 key_up + toggles 位）。
+    fn set_caps_lock(c: &Coordinator, on: bool) {
+        let mut ev = kev(0x14 /* VK_CAPITAL */, EVENT_KEY_UP);
+        ev.toggles = if on { 0x01 } else { 0x00 };
+        c.handle_key_event(&ev);
+    }
+
+    // ── 字母透传 ────────────────────────────────────────────────────────────
+
+    #[test]
+    fn capslock_on_letter_passthrough() {
+        let c = coord_cn();
+        set_caps_lock(&c, true);
+        // 字母 A：中文 + CapsLock + 无 session → 系统产生大写 A，coordinator 不介入
+        let action = c.handle_key_event(&kev(0x41, EVENT_KEY_DOWN));
+        assert!(
+            matches!(action, KeyAction::PassThrough),
+            "中文+CapsLock+字母应透传，实际: {:?}",
+            action
+        );
+    }
+
+    #[test]
+    fn capslock_off_letter_enters_chinese_flow() {
+        let c = coord_cn();
+        // CapsLock 关：字母进入中文输入流
+        let action = c.handle_key_event(&kev(0x41, EVENT_KEY_DOWN));
+        assert!(
+            matches!(action, KeyAction::UpdateComposition { .. }),
+            "CapsLock关+字母应进输入流，实际: {:?}",
+            action
+        );
+    }
+
+    // ── 标点透传（无 input session）──────────────────────────────────────────
+
+    #[test]
+    fn capslock_on_punct_no_session_passthrough() {
+        let c = coord_cn();
+        set_caps_lock(&c, true);
+        // VK 0xBC = ','，无 input_buffer → 透传给系统
+        let action = c.handle_key_event(&kev(0xBC, EVENT_KEY_DOWN));
+        assert!(
+            matches!(action, KeyAction::PassThrough),
+            "中文+CapsLock+无session+标点应透传，实际: {:?}",
+            action
+        );
+    }
+
+    #[test]
+    fn capslock_off_punct_commits_chinese_punct() {
+        let c = coord_cn();
+        let action = c.handle_key_event(&kev(0xBC, EVENT_KEY_DOWN));
+        // CapsLock 关 + 中文标点：',' → "，"
+        let text = match &action {
+            KeyAction::InsertText { text, .. } => text.clone(),
+            other => panic!("CapsLock关+逗号应上屏中文标点，实际: {:?}", other),
+        };
+        assert_eq!(text, "，", "实际文本: {:?}", text);
+    }
+
+    // ── 全角模式：提交全角字符 ───────────────────────────────────────────────
+
+    #[test]
+    fn capslock_on_fullwidth_letter_commits_uppercase_fullwidth() {
+        let c = coord_cn();
+        c.state.lock().unwrap().full_width = true;
+        set_caps_lock(&c, true);
+        // CapsLock ON + 无 Shift + 字母 A → 大写 A → 全角 "Ａ"
+        let action = c.handle_key_event(&kev(0x41, EVENT_KEY_DOWN));
+        match &action {
+            KeyAction::InsertText { text, .. } => {
+                assert_eq!(
+                    text, "Ａ",
+                    "CapsLock+全角+A应输出全角大写，实际: {:?}",
+                    text
+                );
+            }
+            other => panic!("CapsLock+全角+字母应上屏，实际: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn capslock_on_fullwidth_shift_letter_commits_lowercase_fullwidth() {
+        let c = coord_cn();
+        c.state.lock().unwrap().full_width = true;
+        set_caps_lock(&c, true);
+        // CapsLock ON + Shift + 字母 A → 翻转大小写 → 小写 a → 全角 "ａ"
+        let mut ev = kev(0x41, EVENT_KEY_DOWN);
+        ev.modifiers = MOD_SHIFT;
+        let action = c.handle_key_event(&ev);
+        match &action {
+            KeyAction::InsertText { text, .. } => {
+                assert_eq!(
+                    text, "ａ",
+                    "CapsLock+Shift+全角+A应输出全角小写，实际: {:?}",
+                    text
+                );
+            }
+            other => panic!("CapsLock+Shift+全角+字母应上屏，实际: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn capslock_on_fullwidth_punct_commits_fullwidth() {
+        let c = coord_cn();
+        c.state.lock().unwrap().full_width = true;
+        set_caps_lock(&c, true);
+        // ',' 经英全列转换后上屏（不透传）
+        let action = c.handle_key_event(&kev(0xBC, EVENT_KEY_DOWN));
+        assert!(
+            matches!(action, KeyAction::InsertText { .. }),
+            "CapsLock+全角+标点应上屏，实际: {:?}",
+            action
+        );
+    }
+
+    // ── CapsLock 状态切换正确传播 ────────────────────────────────────────────
+
+    #[test]
+    fn capslock_toggle_updates_state() {
+        let c = coord_cn();
+        assert!(
+            !c.state.lock().unwrap().caps_lock,
+            "初始 CapsLock 应为 false"
+        );
+        set_caps_lock(&c, true);
+        assert!(
+            c.state.lock().unwrap().caps_lock,
+            "set_caps_lock(true) 后应为 true"
+        );
+        set_caps_lock(&c, false);
+        assert!(
+            !c.state.lock().unwrap().caps_lock,
+            "set_caps_lock(false) 后应为 false"
+        );
     }
 }

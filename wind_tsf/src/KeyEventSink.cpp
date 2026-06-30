@@ -509,6 +509,18 @@ STDAPI CKeyEventSink::OnTestKeyDown(ITfContext* pContext, WPARAM wParam, LPARAM 
         }
         else if (keyType == HotkeyType::Punctuation)
         {
+            // 中文 + CapsLock ON + 非全角 + 无 input session：标点与字母键对齐，直接透传。
+            // 设计软件（CAD/EDA 等）通过 WM_KEYDOWN 触发快捷功能；CommitText 仅产生
+            // WM_CHAR，不会激活依赖原始键值的功能。同时避免输出中文标点。
+            // 有 input session 时仍须拦截：让 coordinator 先提交候选再处理标点。
+            if (!hasInputSession && !_pTextService->IsFullWidth() &&
+                (GetKeyState(VK_CAPITAL) & 0x0001))
+            {
+                _LogKeyDecision(L"test_down", _pTextService->GetFocusSessionId(), wParam, modifiers, keyType,
+                                isChineseMode, hasComposition, _hasCandidates, hasInputSession, FALSE,
+                                L"chinese_capslock_punct_passthrough");
+                return S_OK; // pfEaten 保持 FALSE → 同步透传
+            }
             // Punctuation: always eat in Chinese mode.
             // Go always handles punctuation (returns InsertText), so the
             // OnTestKeyDown(TRUE) + OnKeyDown(TRUE) path is safe.
@@ -886,6 +898,14 @@ STDAPI CKeyEventSink::OnKeyDown(ITfContext* pContext, WPARAM wParam, LPARAM lPar
         (wParam >= 'A' && wParam <= 'Z') && !(modifiers & (KEYMOD_CTRL | KEYMOD_ALT)) &&
         (GetKeyState(VK_CAPITAL) & 0x0001);
 
+    // 与字母键对称：中文 + CapsLock ON + 非全角 + 无 session 的标点也同步透传。
+    // 设计软件依赖原始 WM_KEYDOWN 激活功能，CommitText 只产生 WM_CHAR 无法触发。
+    BOOL capsLockPunctPassthrough =
+        isChineseMode && !hasInputSession && !_pTextService->IsFullWidth() &&
+        !(modifiers & (KEYMOD_CTRL | KEYMOD_ALT)) &&
+        (CHotkeyManager::ClassifyInputKey(wParam, modifiers) == HotkeyType::Punctuation) &&
+        (GetKeyState(VK_CAPITAL) & 0x0001);
+
     // Track whether this is a Ctrl/Alt combo that needs cleanup-then-passthrough
     BOOL isCtrlAltCleanup = FALSE;
 
@@ -919,8 +939,8 @@ STDAPI CKeyEventSink::OnKeyDown(ITfContext* pContext, WPARAM wParam, LPARAM lPar
             }
             else
             {
-                // CapsLock 字母透传场景不视为输入键（保持 pfEaten=FALSE 同步透传，不发 Go）
-                isInputKey = capsLockLetterPassthrough ? FALSE : (keyType != HotkeyType::None);
+                // CapsLock 字母/标点透传场景不视为输入键（保持 pfEaten=FALSE 同步透传，不发 Go）
+                isInputKey = (capsLockLetterPassthrough || capsLockPunctPassthrough) ? FALSE : (keyType != HotkeyType::None);
             }
         }
     }
@@ -1193,9 +1213,17 @@ STDAPI CKeyEventSink::OnKeyTraceDown(WPARAM wParam, LPARAM lParam)
     if (_pTextService == nullptr || _pTextService->IsKeyboardDisabled())
         return S_OK;
 
-    // Only record in English mode. Chinese mode stats are handled by recordCommit in Go.
+    // 中文模式下统计由 Go recordCommit 负责；但 CapsLock 透传键（无 input session、
+    // 非全角）直接透传给系统，不经过 Go，需在此统计为英文输入。
+    bool capsLockPassthrough = false;
     if (_pTextService->IsChineseMode())
-        return S_OK;
+    {
+        bool capsLockOn = (GetKeyState(VK_CAPITAL) & 0x0001) != 0;
+        bool hasSession = _pTextService->HasActiveComposition() || _hasCandidates;
+        if (!capsLockOn || hasSession || _pTextService->IsFullWidth())
+            return S_OK;
+        capsLockPassthrough = true;
+    }
 
     // Check if stats are enabled
     if (!_statsEnabled || !_statsTrackEnglish)
@@ -1217,27 +1245,31 @@ STDAPI CKeyEventSink::OnKeyTraceDown(WPARAM wParam, LPARAM lParam)
     // Optimization: avoid double counting.
     // If a key is intercepted by OnTestKeyDown in English mode (for full-width or auto-pair),
     // it will be sent to Go and recorded there. We should not count it here.
-    // 1. English auto-pair check
-    if (_englishPairEngine.IsEnabled())
+    // CapsLock 透传键直接到系统、不经 Go recordCommit，跳过下方去重检查。
+    if (!capsLockPassthrough)
     {
-        bool hasShift = (modifiers & KEYMOD_SHIFT) != 0;
-        wchar_t pairChar = _MapVkToEnglishPairChar(wParam, hasShift);
-        if (pairChar != 0 && (_englishPairEngine.IsLeft(pairChar) || _englishPairEngine.IsRight(pairChar)))
+        // 1. English auto-pair check
+        if (_englishPairEngine.IsEnabled())
         {
-            // This key will be eaten by OnTestKeyDown for auto-pairing.
-            return S_OK;
+            bool hasShift = (modifiers & KEYMOD_SHIFT) != 0;
+            wchar_t pairChar = _MapVkToEnglishPairChar(wParam, hasShift);
+            if (pairChar != 0 && (_englishPairEngine.IsLeft(pairChar) || _englishPairEngine.IsRight(pairChar)))
+            {
+                // This key will be eaten by OnTestKeyDown for auto-pairing.
+                return S_OK;
+            }
         }
-    }
 
-    // 2. Full-width mode check
-    if (_pTextService->IsFullWidth())
-    {
-        HotkeyType keyType = CHotkeyManager::ClassifyInputKey(wParam, modifiers);
-        if (keyType == HotkeyType::Letter || keyType == HotkeyType::Number ||
-            keyType == HotkeyType::Punctuation || keyType == HotkeyType::Space)
+        // 2. Full-width mode check
+        if (_pTextService->IsFullWidth())
         {
-            // This key will be eaten by OnTestKeyDown for full-width conversion.
-            return S_OK;
+            HotkeyType keyType = CHotkeyManager::ClassifyInputKey(wParam, modifiers);
+            if (keyType == HotkeyType::Letter || keyType == HotkeyType::Number ||
+                keyType == HotkeyType::Punctuation || keyType == HotkeyType::Space)
+            {
+                // This key will be eaten by OnTestKeyDown for full-width conversion.
+                return S_OK;
+            }
         }
     }
 
