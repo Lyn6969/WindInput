@@ -917,8 +917,10 @@ impl Coordinator {
                 // 方案相关项（活跃/可用方案、全局上屏策略）是否变化：变了才热重建引擎，
                 // 避免每次保存都丢词典缓存（拼音合并/unigram 重建开销大）。
                 let old = self.rt();
+                // schema 段已含全局 codetable/pinyin/mix（上屏策略/调频等）；temp_pinyin 在 input 段，
+                // 引擎按需缓存，故一并纳入脏判定。
                 let schema_dirty = old.config.schema != cfg.schema
-                    || old.config.input.code_commit != cfg.input.code_commit;
+                    || old.config.input.temp_pinyin != cfg.input.temp_pinyin;
                 drop(old);
 
                 let bundle = std::sync::Arc::new(ConfigBundle::build(cfg));
@@ -2845,11 +2847,8 @@ impl MessageHandler for Coordinator {
                     if has_input {
                         let punct_commit = match self.engine_mgr.current_engine_type() {
                             Some(wind_engine::EngineType::Pinyin) => true,
-                            _ => self
-                                .engine_mgr
-                                .schema_merged(&self.engine_mgr.active_schema_id())
-                                .map(|s| s.engine.codetable.punct_commit)
-                                .unwrap_or(false),
+                            // 码表/混输：读有效码表配置（全局 schema.codetable + 方案 override）。
+                            _ => self.engine_mgr.codetable_settings().punct_commit,
                         };
                         if !punct_commit {
                             return KeyAction::Consumed;

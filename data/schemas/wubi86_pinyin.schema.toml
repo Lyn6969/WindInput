@@ -8,27 +8,14 @@ description = "五笔86+拼音混合输入方案，五笔优先，拼音补充"
 
 [engine]
 type = "mixed"
-filter_mode = "smart"
 
+# 仅引擎固定参数（方案构成 + 内部权重基线）；融合策略已上移至全局 [schema.mix]。
 [engine.mixed]
 primary_schema = "wubi86"
 secondary_schema = "pinyin"
-min_pinyin_length = 2
 codetable_weight_boost = 10000000
-show_source_hint = false
-z_key_repeat = true
 
 # 用户数据从引用方案继承：
 #   shadow/userdict → 主方案 (wubi86)
 #   userfreq → 拼音方案 (pinyin)
-
-[learning]
-temp_max_entries = 5000
-temp_promote_count = 0
-
-[learning.auto_learn]
-enabled = false
-
-[learning.freq]
-enabled = true
-protect_top_n = 1
+# 调频/造词走子方案的全局 [schema.codetable] / [schema.pinyin] 配置。

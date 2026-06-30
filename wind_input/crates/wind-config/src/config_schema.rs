@@ -48,6 +48,9 @@ use FieldType::{Bool, Enum, Float, Int, Map, Str, StrList, StructList};
 /// 候选无效按键三策（number_key/select_key/select_char_key 共用）。
 const OVERFLOW_VALUES: &[&str] = &["ignore", "commit", "commit_and_input"];
 
+/// 码表词频应用策略。
+const FREQ_STRATEGY_VALUES: &[&str] = &["top", "step"];
+
 /// 全部配置字段声明（单一真相源）。与 [`Config`] 经测试反向对照，保证零漂移。
 /// 域划分见 `docs/config-key-migration.md`（不做向后兼容，旧键已弃）。
 static REGISTRY: &[ConfigField] = &[
@@ -56,9 +59,33 @@ static REGISTRY: &[ConfigField] = &[
     f("schema.available", StrList),
     f("schema.primary_codetable", Str),
     f("schema.primary_pinyin", Str),
+    // 全局码表（公共基线；方案经 schema_overrides 覆盖）
+    f("schema.codetable.top_code_commit", Bool),
+    f("schema.codetable.clear_on_empty_max", Bool),
+    f("schema.codetable.auto_commit_at_full", Bool),
+    f("schema.codetable.auto_commit_min_len", Int),
+    f("schema.codetable.punct_commit", Bool),
+    f("schema.codetable.show_code_hint", Bool),
+    f("schema.codetable.single_code_input", Bool),
+    f("schema.codetable.single_code_complete", Bool),
+    f("schema.codetable.z_key_repeat", Bool),
+    f("schema.codetable.frequency.enabled", Bool),
+    f("schema.codetable.frequency.protect_top_n", Int),
+    f(
+        "schema.codetable.frequency.strategy",
+        Enum(FREQ_STRATEGY_VALUES),
+    ),
+    f("schema.codetable.auto_phrase.enabled", Bool),
+    f("schema.codetable.auto_phrase.min_phrase_len", Int),
+    f("schema.codetable.auto_phrase.max_phrase_len", Int),
+    f("schema.codetable.auto_phrase.add_weight", Int),
+    f("schema.codetable.auto_phrase.weight_delta", Int),
+    f("schema.codetable.auto_phrase.count_threshold", Int),
+    f("schema.codetable.auto_phrase.idle_timeout_ms", Int),
+    f("schema.codetable.auto_phrase.promote_count", Int),
+    // 全局拼音
     f("schema.pinyin.show_code_hint", Bool),
     f("schema.pinyin.use_smart_compose", Bool),
-    f("schema.pinyin.candidate_order", Str),
     f("schema.pinyin.separator", Str),
     f("schema.pinyin.fuzzy.enabled", Bool),
     f("schema.pinyin.fuzzy.zh_z", Bool),
@@ -72,6 +99,23 @@ static REGISTRY: &[ConfigField] = &[
     f("schema.pinyin.fuzzy.in_ing", Bool),
     f("schema.pinyin.fuzzy.ian_iang", Bool),
     f("schema.pinyin.fuzzy.uan_uang", Bool),
+    f("schema.pinyin.frequency.enabled", Bool),
+    f("schema.pinyin.frequency.half_life", Float),
+    f("schema.pinyin.frequency.base_scale", Float),
+    f("schema.pinyin.frequency.recency_peak", Float),
+    f("schema.pinyin.auto_learn.enabled", Bool),
+    f("schema.pinyin.auto_learn.count_threshold", Int),
+    f("schema.pinyin.auto_learn.min_word_length", Int),
+    f("schema.pinyin.auto_learn.weight_delta", Int),
+    f("schema.pinyin.auto_learn.add_weight", Int),
+    f("schema.pinyin.auto_learn.promote_count", Int),
+    // 全局混输（融合策略）
+    f("schema.mix.show_source_hint", Bool),
+    f("schema.mix.enable_english", Bool),
+    f("schema.mix.pinyin_only_overflow", Bool),
+    f("schema.mix.top_code_override_pinyin", Bool),
+    f("schema.mix.auto_commit_block_on_pinyin", Bool),
+    f("schema.mix.min_pinyin_length", Int),
     f("schema.quick_input.enabled", Bool),
     f("schema.quick_input.decimal_places", Int),
     f("schema.quick_input.force_vertical", Bool),
@@ -113,14 +157,11 @@ static REGISTRY: &[ConfigField] = &[
     f("input.temp_english.allow_symbols", Bool),
     f("input.temp_english.space_as_input", Bool),
     f("input.capslock.cancel_on_mode_switch", Bool),
+    f("input.temp_pinyin.enabled", Bool),
+    f("input.temp_pinyin.schema", Str),
     f("input.temp_pinyin.trigger_keys", StrList),
     f("input.url.enabled", Bool),
     f("input.url.prefixes", StrList),
-    f("input.code_commit.auto_commit_at_full", Bool),
-    f("input.code_commit.auto_commit_min_len", Int),
-    f("input.code_commit.clear_on_empty_max", Bool),
-    f("input.code_commit.top_code_commit", Bool),
-    f("input.code_commit.auto_commit_block_on_pinyin", Bool),
     f("input.s2t.enabled", Bool),
     f("input.s2t.variant", Str),
     f("input.cmdbar.enabled", Bool),

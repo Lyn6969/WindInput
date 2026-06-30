@@ -18,8 +18,6 @@ pub struct Schema {
     #[serde(default)]
     pub dictionaries: Vec<DictSpec>,
     #[serde(default)]
-    pub learning: LearningSpec,
-    #[serde(default)]
     pub encoder: Option<EncoderSpec>,
 }
 
@@ -47,8 +45,6 @@ pub struct EngineSpec {
     #[serde(rename = "type", default)]
     pub engine_type: String,
     #[serde(default)]
-    pub filter_mode: String,
-    #[serde(default)]
     pub codetable: CodeTableSpec,
     #[serde(default)]
     pub pinyin: PinyinSpec,
@@ -56,88 +52,20 @@ pub struct EngineSpec {
     pub mixed: MixedSpec,
 }
 
-/// 码表引擎配置（[engine.codetable]）
+/// 码表引擎配置（[engine.codetable]）。**仅引擎固定参数**；
+/// 行为/调频/造词/临时拼音等用户可配项已上移至全局 `schema.codetable` 与 `schema_overrides`
+/// （见 docs/redesign/schema-config-layering.md）。
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct CodeTableSpec {
     /// 最大码长（0=未设置，构建时回退 4）
     #[serde(default)]
     pub max_code_length: usize,
-    /// 满码唯一精确时自动上屏（tri-state；未设置时回退 legacy auto_commit_unique）
-    #[serde(default)]
-    pub auto_commit_at_full: Option<bool>,
-    /// 自动上屏最短码长（0=跟随 max_code_length）
-    #[serde(default)]
-    pub auto_commit_min_len: usize,
-    /// 混输时有拼音候选则否决自动上屏
-    #[serde(default)]
-    pub auto_commit_block_on_pinyin: Option<bool>,
-    /// 满码无候选时清空（tri-state；未设置时回退全局 input.code_commit）
-    #[serde(default)]
-    pub clear_on_empty_max: Option<bool>,
-    /// 五码顶字上屏（tri-state；未设置时回退全局 input.code_commit）
-    #[serde(default)]
-    pub top_code_commit: Option<bool>,
-    /// 标点触发上屏
-    #[serde(default)]
-    pub punct_commit: bool,
-    /// 显示编码提示
-    #[serde(default)]
-    pub show_code_hint: bool,
-    /// 精确匹配模式（关闭前缀）
-    #[serde(default)]
-    pub single_code_input: bool,
-    /// 精确模式空码补全
-    #[serde(default)]
-    pub single_code_complete: bool,
-    /// Z 键重复上屏
-    #[serde(default)]
-    pub z_key_repeat: bool,
-    /// 临时拼音（码表方案下触发键临时切拼音反查）
-    #[serde(default)]
-    pub temp_pinyin: TempPinyinSpec,
-
-    // ── 排序（两层，见 docs/redesign/frequency.md）──
-    /// 基础排序："weight"（默认）/ "natural"（字根序/inner_order）
+    /// 基础排序："weight"（默认）/ "natural"（字根序/inner_order）。见 docs/redesign/frequency.md。
     #[serde(default)]
     pub base_sort: String,
-    /// 用户词频开关（叠加在 base_sort 之上）
-    #[serde(default)]
-    pub user_frequency: bool,
-    /// 词频应用策略："top"（置前，默认）/ "step"（逐次前进，预留未实现）
-    #[serde(default)]
-    pub freq_strategy: String,
-
-    // ── 码元字符集（见 docs/redesign/config-schema.md §3b）──
     /// 输入码字符集，如 "a-x" / "a-x/" / "a-z"。空=回退全局/默认。
     #[serde(default)]
     pub input_chars: String,
-
-    // ── 前缀/权重（未来阶段 B 接入，对齐 engine.md §2）──
-    #[serde(default)]
-    pub weight_mode: String,
-    #[serde(default)]
-    pub prefix_mode: String,
-    #[serde(default)]
-    pub charset_preference: String,
-    #[serde(default)]
-    pub short_code_first: Option<bool>,
-
-    /// legacy：旧版满码唯一上屏开关（被 auto_commit_at_full 取代，仅作回退读取）
-    #[serde(default)]
-    pub auto_commit_unique: bool,
-    /// legacy：旧版单一排序模式（被 base_sort+user_frequency 取代，仅作回退读取）
-    #[serde(default)]
-    pub candidate_sort_mode: String,
-}
-
-/// 临时拼音（[engine.codetable.temp_pinyin]）
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub struct TempPinyinSpec {
-    #[serde(default)]
-    pub enabled: bool,
-    /// 目标拼音方案 id（空=回退 "pinyin"）
-    #[serde(default)]
-    pub schema: String,
 }
 
 /// 拼音引擎配置（[engine.pinyin]）。
@@ -150,6 +78,10 @@ pub struct PinyinSpec {
     /// 双拼布局 id（引用 data/schemas/shuangpin/<layout>.toml）
     #[serde(default)]
     pub shuangpin: ShuangpinSpec,
+    /// unigram 语言模型路径（相对 schemas 目录），拼音长句 Viterbi 打分用。
+    /// 属解码/引擎职责（非用户学习），故置于 [engine.pinyin] 而非 [learning]。
+    #[serde(default)]
+    pub unigram_path: String,
 }
 
 /// 双拼布局（[engine.pinyin.shuangpin]）
@@ -162,29 +94,17 @@ pub struct ShuangpinSpec {
     pub layout: String,
 }
 
-/// 混输引擎配置（[engine.mixed]）
+/// 混输引擎配置（[engine.mixed]）。**仅引擎固定参数**（方案构成 + 内部权重基线）；
+/// 融合策略（show_source_hint/enable_english/min_pinyin_length 等）已上移至全局 `schema.mix`。
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct MixedSpec {
     #[serde(default)]
     pub primary_schema: String,
     #[serde(default)]
     pub secondary_schema: String,
-    /// 拼音生效最小输入长度（0=未设置，构建时回退 2）
-    #[serde(default)]
-    pub min_pinyin_length: usize,
     /// 码表精确匹配提权基线（0=未设置，构建时回退 10_000_000）
     #[serde(default)]
     pub codetable_weight_boost: i32,
-    #[serde(default)]
-    pub show_source_hint: bool,
-    #[serde(default)]
-    pub z_key_repeat: bool,
-    #[serde(default)]
-    pub enable_english: Option<bool>,
-    #[serde(default)]
-    pub pinyin_only_overflow: Option<bool>,
-    #[serde(default)]
-    pub top_code_override_pinyin: Option<bool>,
 }
 
 /// 词库规格（[[dictionaries]]）
@@ -234,77 +154,6 @@ pub struct WeightSpec {
     pub target: i64,
 }
 
-/// 学习配置（[learning]）
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub struct LearningSpec {
-    /// unigram 语言模型路径（相对 schemas 目录），拼音长句打分用
-    #[serde(default)]
-    pub unigram_path: String,
-    #[serde(default)]
-    pub temp_max_entries: usize,
-    #[serde(default)]
-    pub temp_promote_count: usize,
-    #[serde(default)]
-    pub auto_learn: AutoLearnSpec,
-    #[serde(default)]
-    pub auto_phrase: AutoPhraseSpec,
-    #[serde(default)]
-    pub freq: FreqSpec,
-}
-
-/// 自动造词（拼音，[learning.auto_learn]）
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub struct AutoLearnSpec {
-    #[serde(default)]
-    pub enabled: bool,
-    #[serde(default)]
-    pub count_threshold: u32,
-    #[serde(default)]
-    pub min_word_length: usize,
-    #[serde(default)]
-    pub weight_delta: i32,
-    #[serde(default)]
-    pub add_weight: i32,
-}
-
-/// 自动造词（码表连续单字，[learning.auto_phrase]）
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub struct AutoPhraseSpec {
-    #[serde(default)]
-    pub enabled: bool,
-    #[serde(default)]
-    pub min_phrase_len: usize,
-    #[serde(default)]
-    pub max_phrase_len: usize,
-    #[serde(default)]
-    pub add_weight: i32,
-    #[serde(default)]
-    pub weight_delta: i32,
-    #[serde(default)]
-    pub count_threshold: u32,
-    #[serde(default)]
-    pub idle_timeout_ms: u64,
-}
-
-/// 用户词频（[learning.freq]，见 docs/redesign/frequency.md——衰减参数，拼音用）
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub struct FreqSpec {
-    #[serde(default)]
-    pub enabled: bool,
-    /// 锁定码表原始前 N 位（仅纯码表生效）
-    #[serde(default)]
-    pub protect_top_n: usize,
-    /// 半衰期（小时，拼音衰减；0=用 store 默认）
-    #[serde(default)]
-    pub half_life: f64,
-    /// base 系数（0=用 store 默认）
-    #[serde(default)]
-    pub base_scale: f64,
-    /// 最近使用峰值（0=用 store 默认）
-    #[serde(default)]
-    pub recency_peak: f64,
-}
-
 /// 造词编码规则（[encoder]）
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct EncoderSpec {
@@ -328,6 +177,52 @@ pub struct EncoderRule {
     /// 拆字公式，如 "AaAbBaBb"
     #[serde(default)]
     pub formula: String,
+}
+
+/// 方案覆盖（`schema_overrides/{id}.toml` 中的**行为覆盖段**）。
+///
+/// 仅码表方案有行为覆盖；拼音、混输无 override。词库启停（`[[dictionaries]] enabled`）与
+/// 双拼布局（`[engine.pinyin.shuangpin] layout`）继续走 `Schema` 深合并，不在此结构。
+/// 见 docs/redesign/schema-config-layering.md §3/§4。
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct SchemeOverride {
+    #[serde(default)]
+    pub codetable: Option<CodetableOverride>,
+}
+
+/// 码表方案行为覆盖（`schema_overrides/{id}.toml` 的 `[codetable]` 段）。
+///
+/// `enabled` 为**总开关**：为 false 或缺省时整段忽略，逐字段回落全局 `schema.codetable`；
+/// 为 true 时各 `Some(_)` 字段覆盖全局，`None` 仍回落全局。
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct CodetableOverride {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default)]
+    pub top_code_commit: Option<bool>,
+    #[serde(default)]
+    pub clear_on_empty_max: Option<bool>,
+    #[serde(default)]
+    pub auto_commit_at_full: Option<bool>,
+    #[serde(default)]
+    pub auto_commit_min_len: Option<usize>,
+    #[serde(default)]
+    pub punct_commit: Option<bool>,
+    #[serde(default)]
+    pub show_code_hint: Option<bool>,
+    #[serde(default)]
+    pub single_code_input: Option<bool>,
+    #[serde(default)]
+    pub single_code_complete: Option<bool>,
+    #[serde(default)]
+    pub z_key_repeat: Option<bool>,
+}
+
+impl SchemeOverride {
+    /// 从 `schema_overrides/{id}.toml` 的 TOML 值解析行为覆盖段（容错：解析失败返回默认空覆盖）。
+    pub fn from_toml(value: &toml::Value) -> Self {
+        value.clone().try_into().unwrap_or_default()
+    }
 }
 
 impl Schema {

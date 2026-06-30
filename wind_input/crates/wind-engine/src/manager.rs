@@ -36,9 +36,9 @@ pub enum FreqStrategy {
 /// 按方案解析后缓存，避免每键读盘（frequency.md §8）。
 #[derive(Debug, Clone, Copy)]
 pub struct FreqSettings {
-    /// 词频维度主开关（learning.freq.enabled）；关则完全不重排。
+    /// 词频维度主开关（全局 schema.{codetable,pinyin}.frequency.enabled）；关则完全不重排。
     pub enabled: bool,
-    /// used-first 内的排序策略（engine.codetable.freq_strategy）。
+    /// used-first 内的排序策略（全局 schema.codetable.frequency.strategy；仅码表用）。
     pub strategy: FreqStrategy,
 }
 
@@ -64,9 +64,13 @@ pub struct EngineManager {
     data_dir: Option<std::path::PathBuf>,
     /// redb 持久化存储（用户词/临时词层；None=无持久化，如纯测试/REPL）
     store: Option<Arc<wind_store::Store>>,
-    /// 全码/空码上屏策略全局默认（方案级 tri-state 未设时回退至此）。
+    /// 全局码表配置（公共基线；方案经 schema_overrides 的 [codetable] 段逐字段覆盖）。
     /// Mutex 以支持热重载（变更后清空引擎缓存按新策略重建）。
-    code_commit: Mutex<wind_config::CodeCommitConfig>,
+    codetable: Mutex<wind_config::CodetableGlobal>,
+    /// 全局混输配置（融合策略；全局唯一，无方案级 override）。Mutex 以支持热重载。
+    mix: Mutex<wind_config::MixGlobal>,
+    /// 全局临时拼音配置（码表方案下临时切拼音反查；全局唯一）。Mutex 以支持热重载。
+    temp_pinyin: Mutex<wind_config::config::TempPinyinConfig>,
     /// 词频排序设置缓存（schema_id -> FreqSettings；按需解析、避免每键读盘）
     freq_cache: Mutex<HashMap<String, FreqSettings>>,
     /// 方案显示名缓存（schema_id -> schema.name；缺则回退 id）。按需读盘一次。
@@ -196,7 +200,9 @@ impl EngineManager {
             available: Mutex::new(available),
             data_dir: data_dir.map(|d| d.to_path_buf()),
             store,
-            code_commit: Mutex::new(config.input.code_commit.clone()),
+            codetable: Mutex::new(config.schema.codetable.clone()),
+            mix: Mutex::new(config.schema.mix.clone()),
+            temp_pinyin: Mutex::new(config.input.temp_pinyin.clone()),
             freq_cache: Mutex::new(HashMap::new()),
             name_cache: Mutex::new(HashMap::new()),
             override_dir,
@@ -404,11 +410,12 @@ impl EngineManager {
         if self.is_loaded(schema_id) {
             return true;
         }
-        let commit = self
-            .code_commit
+        let codetable_cfg = self
+            .codetable
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .clone();
+        let mix_cfg = self.mix.lock().unwrap_or_else(|e| e.into_inner()).clone();
         let pinyin_cfg = self
             .pinyin
             .lock()
@@ -418,7 +425,8 @@ impl EngineManager {
             schema_id,
             self.data_dir.as_deref(),
             self.store.clone(),
-            &commit,
+            &codetable_cfg,
+            &mix_cfg,
             self.override_dir.as_deref(),
             &pinyin_cfg,
         ) {
@@ -739,8 +747,10 @@ impl EngineManager {
         // 主码表可能变更:失效反查索引,下次按新主码表重建。
         *self.reverse_index.lock().unwrap_or_else(|e| e.into_inner()) = None;
         *self.available.lock().unwrap_or_else(|e| e.into_inner()) = available;
-        *self.code_commit.lock().unwrap_or_else(|e| e.into_inner()) =
-            config.input.code_commit.clone();
+        *self.codetable.lock().unwrap_or_else(|e| e.into_inner()) = config.schema.codetable.clone();
+        *self.mix.lock().unwrap_or_else(|e| e.into_inner()) = config.schema.mix.clone();
+        *self.temp_pinyin.lock().unwrap_or_else(|e| e.into_inner()) =
+            config.input.temp_pinyin.clone();
         // 全局拼音配置变更：更新缓存，引擎缓存随下方 clear() 一起失效，下次按新配置重建。
         *self.pinyin.lock().unwrap_or_else(|e| e.into_inner()) = config.schema.pinyin.clone();
         // 丢弃缓存：引擎按新上屏策略/词典重建，名称/词频按新方案重读。
@@ -829,13 +839,14 @@ impl EngineManager {
         self.active_engine()?.handle_top_code(input)
     }
 
-    /// 当前活跃方案（须为码表类型）的临时拼音目标方案 id。
+    /// 临时拼音目标方案 id（读全局 input.temp_pinyin；不再读方案级配置）。
     /// 启用且目标方案可加载时返回 Some(target)，否则 None。
     pub fn temp_pinyin_target(&self) -> Option<String> {
-        let id = self.active_schema_id();
-        let schema =
-            Self::read_schema(&id, self.data_dir.as_deref(), self.override_dir.as_deref())?;
-        let tp = &schema.engine.codetable.temp_pinyin;
+        let tp = self
+            .temp_pinyin
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
         if !tp.enabled {
             return None;
         }
@@ -851,22 +862,58 @@ impl EngineManager {
         }
     }
 
-    /// 活跃方案的词频排序设置（frequency.md §3/§8）。按方案解析后缓存，避免每键读盘。
-    /// 读盘失败回退默认（enabled=false → 不重排）。
-    pub fn freq_settings(&self) -> FreqSettings {
+    /// 活跃方案的**有效**码表行为配置：全局 `schema.codetable` 经该方案
+    /// `schema_overrides/{id}.toml` 的 `[codetable]` 段（带开关）解析。供 coordinator 读
+    /// punct_commit / z_key_repeat 等行为字段（取代旧的直接读 schema 字段）。
+    pub fn codetable_settings(&self) -> wind_config::CodetableGlobal {
         let id = self.active_schema_id();
-        if let Some(s) = self
-            .freq_cache
+        let global = self
+            .codetable
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .get(&id)
+            .clone();
+        Self::resolve_codetable(&id, &global, self.override_dir.as_deref())
+    }
+
+    /// 解析某方案的有效码表配置：全局基线 + `[codetable]` override（开关开启时逐字段覆盖）。
+    fn resolve_codetable(
+        schema_id: &str,
+        global: &wind_config::CodetableGlobal,
+        override_dir: Option<&Path>,
+    ) -> wind_config::CodetableGlobal {
+        let ov = override_dir
+            .and_then(|d| Self::read_override_value(schema_id, d))
+            .map(|v| wind_config::schema::SchemeOverride::from_toml(&v))
+            .and_then(|so| so.codetable);
+        global.resolved(ov.as_ref())
+    }
+
+    /// 活跃方案的词频排序设置（frequency.md §3/§8）。**全局唯一、按引擎类型分**：
+    /// 码表/混输取 `schema.codetable.frequency`，拼音取 `schema.pinyin.frequency`。
+    /// 按 id 缓存（reload 时清空），避免每键重算。
+    pub fn freq_settings(&self) -> FreqSettings {
+        let id = self.active_schema_id();
         {
-            return *s;
+            let cache = self.freq_cache.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(s) = cache.get(&id) {
+                return *s;
+            }
         }
-        let settings =
-            Self::read_schema(&id, self.data_dir.as_deref(), self.override_dir.as_deref())
-                .map(|sc| Self::parse_freq_settings(&sc))
-                .unwrap_or_default();
+        let is_pinyin = matches!(self.schema_engine_type(&id).as_deref(), Some("pinyin"));
+        let settings = if is_pinyin {
+            let pf = self.pinyin.lock().unwrap_or_else(|e| e.into_inner());
+            // 拼音 strategy 字段不参与（仅码表 used-first 排序用），取默认。
+            FreqSettings {
+                enabled: pf.frequency.enabled,
+                strategy: FreqStrategy::Step,
+            }
+        } else {
+            let ct = self.codetable.lock().unwrap_or_else(|e| e.into_inner());
+            FreqSettings {
+                enabled: ct.frequency.enabled,
+                strategy: Self::parse_freq_strategy(&ct.frequency.strategy),
+            }
+        };
         self.freq_cache
             .lock()
             .unwrap_or_else(|e| e.into_inner())
@@ -874,15 +921,11 @@ impl EngineManager {
         settings
     }
 
-    /// 从方案解析词频排序设置（纯映射，便于单测）。
-    fn parse_freq_settings(sc: &Schema) -> FreqSettings {
-        let strategy = match sc.engine.codetable.freq_strategy.as_str() {
+    /// 词频策略字符串 → 枚举（纯映射，便于单测）。
+    fn parse_freq_strategy(s: &str) -> FreqStrategy {
+        match s {
             "top" => FreqStrategy::Top,
             _ => FreqStrategy::Step,
-        };
-        FreqSettings {
-            enabled: sc.learning.freq.enabled,
-            strategy,
         }
     }
 
@@ -987,7 +1030,8 @@ impl EngineManager {
         schema_id: &str,
         data_dir: Option<&Path>,
         store: Option<Arc<wind_store::Store>>,
-        commit: &wind_config::CodeCommitConfig,
+        codetable_cfg: &wind_config::CodetableGlobal,
+        mix_cfg: &wind_config::MixGlobal,
         override_dir: Option<&Path>,
         pinyin_cfg: &wind_config::config::PinyinGlobalConfig,
     ) -> Option<Box<dyn Engine>> {
@@ -1006,7 +1050,8 @@ impl EngineManager {
                 &m.primary_schema,
                 Some(data_dir),
                 store.clone(),
-                commit,
+                codetable_cfg,
+                mix_cfg,
                 override_dir,
                 pinyin_cfg,
             )?;
@@ -1017,7 +1062,8 @@ impl EngineManager {
                     &m.secondary_schema,
                     Some(data_dir),
                     store.clone(),
-                    commit,
+                    codetable_cfg,
+                    mix_cfg,
                     override_dir,
                     pinyin_cfg,
                 )
@@ -1027,16 +1073,13 @@ impl EngineManager {
             } else {
                 10_000_000
             };
-            let min_py = if m.min_pinyin_length > 0 {
-                m.min_pinyin_length
+            // 融合策略走全局 schema.mix（无方案级 override）。
+            let min_py = if mix_cfg.min_pinyin_length > 0 {
+                mix_cfg.min_pinyin_length
             } else {
                 2
             };
-            // 拼音守护：主码表方案 tri-state > 全局 input.code_commit。
-            let block_on_pinyin =
-                Self::read_schema(&m.primary_schema, Some(data_dir), override_dir)
-                    .and_then(|s| s.engine.codetable.auto_commit_block_on_pinyin)
-                    .unwrap_or(commit.auto_commit_block_on_pinyin);
+            let block_on_pinyin = mix_cfg.auto_commit_block_on_pinyin;
             info!(
                 "Built mixed engine {} (primary={}, secondary={})",
                 schema_id, m.primary_schema, m.secondary_schema
@@ -1060,10 +1103,10 @@ impl EngineManager {
             };
             // 加载 unigram 语言模型（长句 Viterbi 打分）：mmap 零拷贝，失败回退词典权重。
             let unigram: Option<Arc<dyn crate::pinyin::lm::UnigramLookup>> =
-                if schema.learning.unigram_path.is_empty() {
+                if schema.engine.pinyin.unigram_path.is_empty() {
                     None
                 } else {
-                    let ug_txt = schemas.join(&schema.learning.unigram_path);
+                    let ug_txt = schemas.join(&schema.engine.pinyin.unigram_path);
                     Self::load_unigram_mmap(&ug_txt)
                 };
             // 从全局拼音配置构建引擎配置和模糊音（Task 1.4：修 fuzzy 从未生效 bug）。
@@ -1084,9 +1127,7 @@ impl EngineManager {
             };
             let pcfg = PinyinConfig {
                 show_code_hint: pg.show_code_hint,
-                filter_mode: schema.engine.filter_mode.clone(),
                 use_smart_compose: pg.use_smart_compose,
-                candidate_order: pg.candidate_order.clone(),
             };
             let mut engine =
                 PinyinEngine::with_unigram(pcfg, dict, unigram).with_fuzzy(fuzzy.clone());
@@ -1135,22 +1176,14 @@ impl EngineManager {
             } else {
                 4
             };
-            // 上屏策略解析（tri-state 继承）：方案级 Some > 全局 input.code_commit > 内置默认。
-            // auto_commit_at_full 额外兼容 legacy auto_commit_unique（方案显式 true 优先于全局）。
-            let ct = &schema.engine.codetable;
+            // 上屏策略：全局 schema.codetable 基线 + 该方案 [codetable] override（带开关）解析。
+            let eff = Self::resolve_codetable(schema_id, codetable_cfg, override_dir);
             let commit_opts = crate::codetable::CommitOptions {
-                auto_commit_at_full: ct
-                    .auto_commit_at_full
-                    .or(ct.auto_commit_unique.then_some(true))
-                    .unwrap_or(commit.auto_commit_at_full),
-                auto_commit_min_len: if ct.auto_commit_min_len > 0 {
-                    ct.auto_commit_min_len
-                } else {
-                    commit.auto_commit_min_len
-                },
-                clear_on_empty_max: ct.clear_on_empty_max.unwrap_or(commit.clear_on_empty_max),
-                top_code_commit: ct.top_code_commit.unwrap_or(commit.top_code_commit),
-                show_code_hint: ct.show_code_hint,
+                auto_commit_at_full: eff.auto_commit_at_full,
+                auto_commit_min_len: eff.auto_commit_min_len,
+                clear_on_empty_max: eff.clear_on_empty_max,
+                top_code_commit: eff.top_code_commit,
+                show_code_hint: eff.show_code_hint,
             };
             // 码表引擎经 DictManager(CompositeDict) 查询。系统词库不再合并成单个 combined，
             // 而是主库 + 每个扩展（含禁用）各自一个 System 层，查询期由 composite 合并去重。
@@ -1616,42 +1649,51 @@ impl EngineManager {
 mod tests {
     use super::*;
 
-    fn parse(toml: &str) -> FreqSettings {
-        let sc: Schema = toml::from_str(toml).expect("schema toml");
-        EngineManager::parse_freq_settings(&sc)
+    #[test]
+    fn freq_strategy_top_parsed() {
+        assert_eq!(EngineManager::parse_freq_strategy("top"), FreqStrategy::Top);
     }
 
     #[test]
-    fn freq_settings_defaults_disabled_step() {
-        // 空方案：主开关默认关、策略默认 step。
-        let s = parse("");
-        assert!(!s.enabled, "默认应关闭词频维度");
-        assert_eq!(s.strategy, FreqStrategy::Step, "默认策略应为 step");
-    }
-
-    #[test]
-    fn freq_settings_enabled_top() {
-        let s =
-            parse("[engine.codetable]\nfreq_strategy = \"top\"\n[learning.freq]\nenabled = true\n");
-        assert!(s.enabled);
+    fn freq_strategy_step_and_unknown_fallback() {
         assert_eq!(
-            s.strategy,
-            FreqStrategy::Top,
-            "freq_strategy=top 应解析为 Top"
+            EngineManager::parse_freq_strategy("step"),
+            FreqStrategy::Step
+        );
+        // 未知策略值回退 step（稳健默认）。
+        assert_eq!(
+            EngineManager::parse_freq_strategy("bogus"),
+            FreqStrategy::Step,
+            "未知策略应回退 step"
         );
     }
 
     #[test]
-    fn freq_settings_step_explicit_and_unknown_fallback() {
-        let s = parse(
-            "[engine.codetable]\nfreq_strategy = \"step\"\n[learning.freq]\nenabled = true\n",
+    fn codetable_override_resolves_over_global() {
+        // 全局基线 + override（开关开启）逐字段覆盖。
+        let global = wind_config::CodetableGlobal {
+            top_code_commit: false,
+            z_key_repeat: false,
+            ..Default::default()
+        };
+        let ov = wind_config::schema::CodetableOverride {
+            enabled: true,
+            top_code_commit: Some(true),
+            ..Default::default()
+        };
+        let eff = global.resolved(Some(&ov));
+        assert!(eff.top_code_commit, "override 开启时 Some 字段应覆盖");
+        assert!(!eff.z_key_repeat, "override 未给的字段应回落全局");
+        // 开关关闭：整段忽略。
+        let ov_off = wind_config::schema::CodetableOverride {
+            enabled: false,
+            top_code_commit: Some(true),
+            ..Default::default()
+        };
+        assert!(
+            !global.resolved(Some(&ov_off)).top_code_commit,
+            "开关关闭时应回落全局"
         );
-        assert_eq!(s.strategy, FreqStrategy::Step);
-        // 未知策略值回退 step（稳健默认）。
-        let u = parse(
-            "[engine.codetable]\nfreq_strategy = \"bogus\"\n[learning.freq]\nenabled = true\n",
-        );
-        assert_eq!(u.strategy, FreqStrategy::Step, "未知策略应回退 step");
     }
 
     #[test]

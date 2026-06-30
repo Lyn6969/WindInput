@@ -8,10 +8,10 @@ description = "全拼输入方案"
 
 [engine]
 type = "pinyin"
-filter_mode = "smart"
 
 [engine.pinyin]
 scheme = "full"
+unigram_path = "pinyin/unigram.txt"
 
 [[dictionaries]]
 id = "pinyin_main"
@@ -24,13 +24,3 @@ median = 200
 max = 19260817
 mode = "log"
 
-[learning]
-unigram_path = "pinyin/unigram.txt"
-temp_max_entries = 5000
-temp_promote_count = 0
-
-[learning.auto_learn]
-enabled = false
-
-[learning.freq]
-enabled = true

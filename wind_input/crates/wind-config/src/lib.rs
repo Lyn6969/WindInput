@@ -11,7 +11,8 @@ pub mod schema;
 pub mod variant;
 
 pub use config::{
-    CodeCommitConfig, Config, ModeIndicatorStyle, PinyinFuzzy, PinyinGlobalConfig, PreeditDisplay,
+    CodetableGlobal, Config, MixGlobal, ModeIndicatorStyle, PinyinFuzzy, PinyinGlobalConfig,
+    PreeditDisplay,
 };
 pub use runtime_state::RuntimeState;
 pub use schema::Schema;

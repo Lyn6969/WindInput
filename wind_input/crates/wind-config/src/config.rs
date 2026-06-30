@@ -97,7 +97,7 @@ impl Default for InputDefaultConfig {
 
 // ───────────────────────── schema（方案 + 拼音 + 模式）─────────────────────────
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct SchemaConfig {
     #[serde(default)]
     pub active: String,
@@ -107,9 +107,15 @@ pub struct SchemaConfig {
     pub primary_codetable: String,
     #[serde(default)]
     pub primary_pinyin: String,
+    /// 全局码表配置（所有码表方案公共基线；方案经 schema_overrides 覆盖）。
+    #[serde(default)]
+    pub codetable: CodetableGlobal,
     /// 全局拼音配置（所有拼音类方案共用：全拼/双拼/混输拼音子方案/临时拼音反查）。
     #[serde(default)]
     pub pinyin: PinyinGlobalConfig,
+    /// 全局混输配置（融合策略；全局唯一）。
+    #[serde(default)]
+    pub mix: MixGlobal,
     /// 快捷输入（日期/计算等内置类方案）配置。将随"英文/快捷做成方案"一并重构。
     #[serde(default)]
     pub quick_input: QuickInputConfig,
@@ -128,7 +134,9 @@ impl Default for SchemaConfig {
             available: Vec::new(),
             primary_codetable: String::new(),
             primary_pinyin: String::new(),
+            codetable: CodetableGlobal::default(),
             pinyin: PinyinGlobalConfig::default(),
+            mix: MixGlobal::default(),
             quick_input: QuickInputConfig::default(),
             special_modes: Vec::new(),
             mix_modes: default_mix_modes(),
@@ -136,24 +144,24 @@ impl Default for SchemaConfig {
     }
 }
 
-/// 全局拼音配置（[schema.pinyin]）。
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+/// 全局拼音配置（[schema.pinyin]）。所有拼音类方案共用，无方案级 override。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct PinyinGlobalConfig {
     #[serde(default = "default_true")]
     pub show_code_hint: bool,
     #[serde(default = "default_true")]
     pub use_smart_compose: bool,
-    #[serde(default = "default_candidate_order")]
-    pub candidate_order: String,
     /// 拼音分隔策略（"auto" 等）。原 input.pinyin_separator 收拢至此。
     #[serde(default = "default_pinyin_separator")]
     pub separator: String,
     #[serde(default)]
     pub fuzzy: PinyinFuzzy,
-}
-
-fn default_candidate_order() -> String {
-    "smart".to_string()
+    /// 拼音调频（衰减参数；全局唯一，按引擎分——见 docs/redesign/schema-config-layering.md §3.4）。
+    #[serde(default)]
+    pub frequency: PinyinFrequency,
+    /// 拼音自动造词（全局唯一）。
+    #[serde(default)]
+    pub auto_learn: AutoLearnConfig,
 }
 
 impl Default for PinyinGlobalConfig {
@@ -161,9 +169,225 @@ impl Default for PinyinGlobalConfig {
         Self {
             show_code_hint: true,
             use_smart_compose: true,
-            candidate_order: "smart".to_string(),
             separator: default_pinyin_separator(),
             fuzzy: PinyinFuzzy::default(),
+            frequency: PinyinFrequency::default(),
+            auto_learn: AutoLearnConfig::default(),
+        }
+    }
+}
+
+/// 全局码表配置（[schema.codetable]）。所有码表方案的公共基线，方案可经
+/// `schema_overrides/{id}.toml` 的 `[codetable]` 段（带 enabled 总开关）逐字段覆盖。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct CodetableGlobal {
+    /// 顶码上屏（超满码长取前 N 码首选上屏）。
+    #[serde(default)]
+    pub top_code_commit: bool,
+    /// 满码无候选时清空缓冲。
+    #[serde(default)]
+    pub clear_on_empty_max: bool,
+    /// 满码唯一精确时自动上屏。
+    #[serde(default)]
+    pub auto_commit_at_full: bool,
+    /// 自动上屏最短码长（隐藏参数；0=等于全码长，不在设置 UI 暴露）。
+    #[serde(default)]
+    pub auto_commit_min_len: usize,
+    /// 标点触发上屏。
+    #[serde(default)]
+    pub punct_commit: bool,
+    /// 显示编码提示。
+    #[serde(default = "default_true")]
+    pub show_code_hint: bool,
+    /// 精确匹配模式（关闭前缀匹配）。
+    #[serde(default)]
+    pub single_code_input: bool,
+    /// 精确匹配空码补全（无候选时从更长编码取首选）。
+    #[serde(default)]
+    pub single_code_complete: bool,
+    /// z 键重复输入。
+    #[serde(default)]
+    pub z_key_repeat: bool,
+    /// 码表调频（统一开关，取代旧 user_frequency）。
+    #[serde(default)]
+    pub frequency: CodetableFrequency,
+    /// 码表自动造词（连续单字）。
+    #[serde(default)]
+    pub auto_phrase: AutoPhraseConfig,
+}
+
+impl Default for CodetableGlobal {
+    fn default() -> Self {
+        Self {
+            top_code_commit: false,
+            clear_on_empty_max: false,
+            auto_commit_at_full: false,
+            auto_commit_min_len: 0,
+            punct_commit: false,
+            show_code_hint: true,
+            single_code_input: false,
+            single_code_complete: false,
+            z_key_repeat: false,
+            frequency: CodetableFrequency::default(),
+            auto_phrase: AutoPhraseConfig::default(),
+        }
+    }
+}
+
+impl CodetableGlobal {
+    /// 应用方案行为 override：`enabled` 开启时各 `Some(_)` 字段覆盖全局基线，
+    /// 否则原样返回全局副本。`None` 字段始终回落全局。见 schema-config-layering.md §4。
+    pub fn resolved(&self, ov: Option<&crate::schema::CodetableOverride>) -> CodetableGlobal {
+        let mut out = self.clone();
+        let Some(o) = ov.filter(|o| o.enabled) else {
+            return out;
+        };
+        if let Some(v) = o.top_code_commit {
+            out.top_code_commit = v;
+        }
+        if let Some(v) = o.clear_on_empty_max {
+            out.clear_on_empty_max = v;
+        }
+        if let Some(v) = o.auto_commit_at_full {
+            out.auto_commit_at_full = v;
+        }
+        if let Some(v) = o.auto_commit_min_len {
+            out.auto_commit_min_len = v;
+        }
+        if let Some(v) = o.punct_commit {
+            out.punct_commit = v;
+        }
+        if let Some(v) = o.show_code_hint {
+            out.show_code_hint = v;
+        }
+        if let Some(v) = o.single_code_input {
+            out.single_code_input = v;
+        }
+        if let Some(v) = o.single_code_complete {
+            out.single_code_complete = v;
+        }
+        if let Some(v) = o.z_key_repeat {
+            out.z_key_repeat = v;
+        }
+        out
+    }
+}
+
+/// 码表调频（[schema.codetable.frequency]）。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CodetableFrequency {
+    #[serde(default)]
+    pub enabled: bool,
+    /// 锁定码表原始前 N 位（仅纯码表生效）。
+    #[serde(default)]
+    pub protect_top_n: usize,
+    /// 词频应用策略："top"（一次到顶 MRU）/ "step"（逐次提升）。原 freq_strategy 迁入。
+    #[serde(default = "default_freq_strategy")]
+    pub strategy: String,
+}
+
+fn default_freq_strategy() -> String {
+    "step".to_string()
+}
+
+impl Default for CodetableFrequency {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            protect_top_n: 0,
+            strategy: default_freq_strategy(),
+        }
+    }
+}
+
+/// 拼音调频（[schema.pinyin.frequency]）。衰减参数（0=用 store 默认）。
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct PinyinFrequency {
+    #[serde(default)]
+    pub enabled: bool,
+    /// 半衰期（小时）。
+    #[serde(default)]
+    pub half_life: f64,
+    /// base 系数。
+    #[serde(default)]
+    pub base_scale: f64,
+    /// 最近使用峰值。
+    #[serde(default)]
+    pub recency_peak: f64,
+}
+
+/// 码表自动造词（[schema.codetable.auto_phrase]）。
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AutoPhraseConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default)]
+    pub min_phrase_len: usize,
+    #[serde(default)]
+    pub max_phrase_len: usize,
+    #[serde(default)]
+    pub add_weight: i32,
+    #[serde(default)]
+    pub weight_delta: i32,
+    #[serde(default)]
+    pub count_threshold: u32,
+    #[serde(default)]
+    pub idle_timeout_ms: u64,
+    /// 临时词晋升所需使用次数（原 learning.temp_promote_count）。
+    #[serde(default)]
+    pub promote_count: usize,
+}
+
+/// 拼音自动造词（[schema.pinyin.auto_learn]）。
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AutoLearnConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default)]
+    pub count_threshold: u32,
+    #[serde(default)]
+    pub min_word_length: usize,
+    #[serde(default)]
+    pub weight_delta: i32,
+    #[serde(default)]
+    pub add_weight: i32,
+    /// 临时词晋升所需使用次数（原 learning.temp_promote_count）。
+    #[serde(default)]
+    pub promote_count: usize,
+}
+
+/// 全局混输配置（[schema.mix]）。融合策略；全局唯一，无方案级 override。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct MixGlobal {
+    /// 显示候选来源标记。
+    #[serde(default)]
+    pub show_source_hint: bool,
+    /// 启用英文候选。
+    #[serde(default)]
+    pub enable_english: bool,
+    /// 超码长时仅查拼音。
+    #[serde(default)]
+    pub pinyin_only_overflow: bool,
+    /// 顶码偏好（顶码覆盖拼音）。
+    #[serde(default)]
+    pub top_code_override_pinyin: bool,
+    /// 满码上屏遇拼音候选则否决（保护拼音用户）。
+    #[serde(default = "default_true")]
+    pub auto_commit_block_on_pinyin: bool,
+    /// 拼音最小触发长度（0=回退 2）。
+    #[serde(default)]
+    pub min_pinyin_length: usize,
+}
+
+impl Default for MixGlobal {
+    fn default() -> Self {
+        Self {
+            show_source_hint: false,
+            enable_english: false,
+            pinyin_only_overflow: false,
+            top_code_override_pinyin: false,
+            auto_commit_block_on_pinyin: true,
+            min_pinyin_length: 0,
         }
     }
 }
@@ -313,9 +537,6 @@ pub struct InputConfig {
     /// 网址输入模式。
     #[serde(default)]
     pub url: UrlConfig,
-    /// 全码/空码上屏策略的全局默认（方案级 [engine.codetable] 的 tri-state 字段未设时回退至此）。
-    #[serde(default)]
-    pub code_commit: CodeCommitConfig,
     /// 简繁转换（上屏文字变换）。原 features.s2t。
     #[serde(default)]
     pub s2t: S2TConfig,
@@ -342,7 +563,6 @@ impl Default for InputConfig {
             capslock: CapslockConfig::default(),
             temp_pinyin: TempPinyinConfig::default(),
             url: UrlConfig::default(),
-            code_commit: CodeCommitConfig::default(),
             s2t: S2TConfig::default(),
             cmdbar: CmdbarConfig::default(),
             phrase: PhraseConfig::default(),
@@ -501,9 +721,15 @@ pub struct CapslockConfig {
     pub cancel_on_mode_switch: bool,
 }
 
-/// 临时拼音配置（[input.temp_pinyin]）。
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// 临时拼音配置（[input.temp_pinyin]）。码表方案下临时切到拼音反查。全局唯一。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct TempPinyinConfig {
+    /// 总开关（原方案级 [engine.codetable.temp_pinyin].enabled 上移至此）。
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    /// 目标拼音方案 id（空=回退 "pinyin"）。原方案级 schema 字段上移。
+    #[serde(default)]
+    pub schema: String,
     /// 触发键（如 "backtick" / "z" / "semicolon"），默认反引号
     #[serde(default = "default_temp_pinyin_triggers")]
     pub trigger_keys: Vec<String>,
@@ -516,6 +742,8 @@ fn default_temp_pinyin_triggers() -> Vec<String> {
 impl Default for TempPinyinConfig {
     fn default() -> Self {
         Self {
+            enabled: true,
+            schema: String::new(),
             trigger_keys: default_temp_pinyin_triggers(),
         }
     }
@@ -547,38 +775,6 @@ impl Default for UrlConfig {
         Self {
             enabled: false,
             prefixes: default_url_prefixes(),
-        }
-    }
-}
-
-/// 全码/空码上屏策略全局默认（对齐方案级 [engine.codetable] 同名字段）。
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct CodeCommitConfig {
-    /// 全码自动上屏（唯一精确 + 无更长后继时直接上屏）
-    #[serde(default)]
-    pub auto_commit_at_full: bool,
-    /// 自动上屏最短码长（0 跟随方案 max_code_length）
-    #[serde(default)]
-    pub auto_commit_min_len: usize,
-    /// 满码无候选时清空缓冲
-    #[serde(default)]
-    pub clear_on_empty_max: bool,
-    /// 超过满码长时取前 N 码顶字上屏
-    #[serde(default)]
-    pub top_code_commit: bool,
-    /// 混输全码上屏时，存在拼音候选则否决（保护拼音用户）
-    #[serde(default = "default_true")]
-    pub auto_commit_block_on_pinyin: bool,
-}
-
-impl Default for CodeCommitConfig {
-    fn default() -> Self {
-        Self {
-            auto_commit_at_full: false,
-            auto_commit_min_len: 0,
-            clear_on_empty_max: false,
-            top_code_commit: false,
-            auto_commit_block_on_pinyin: true,
         }
     }
 }
@@ -1687,7 +1883,6 @@ mod tests {
         let c = Config::default();
         assert!(c.schema.pinyin.show_code_hint);
         assert!(c.schema.pinyin.use_smart_compose);
-        assert_eq!(c.schema.pinyin.candidate_order, "smart");
         assert_eq!(c.schema.pinyin.separator, "auto");
         assert!(!c.schema.pinyin.fuzzy.enabled);
         assert!(!c.schema.pinyin.fuzzy.zh_z);
@@ -1713,8 +1908,8 @@ mod tests {
             "use_smart_compose 未覆盖，应保留默认 true"
         );
         assert_eq!(
-            c.schema.pinyin.candidate_order, "smart",
-            "candidate_order 未覆盖，应保留默认 smart"
+            c.schema.pinyin.separator, "auto",
+            "separator 未覆盖，应保留默认 auto"
         );
     }
 

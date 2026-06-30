@@ -8,32 +8,17 @@ description = "五笔86版输入方案（基于rime-wubi86-jidian增加词频生
 
 [engine]
 type = "codetable"
-filter_mode = "smart"
 
 [engine.chaizi]
 db_path = "wubi86/wubi86_chaizi.txt"
 font_family = "wubi86/HeiTiZiGen.ttf"
 font_dw_name = "黑体字根"
 
+# 仅引擎固定参数；行为/调频/造词/临时拼音等用户可配项已上移至全局 [schema.codetable]
+# 与 schema_overrides（见 docs/redesign/schema-config-layering.md）。
 [engine.codetable]
 max_code_length = 4
-auto_commit_unique = false
-clear_on_empty_max = false
-top_code_commit = true
-punct_commit = true
-show_code_hint = true
-single_code_input = false
-single_code_complete = true
-candidate_sort_mode = "frequency"
-# 排序两层（docs/redesign/frequency.md §3）：base_sort 基底 + 用户词频
 base_sort = "weight"
-user_frequency = true
-freq_strategy = "step"   # 逐次提升（count 优先）；"top"=一次到顶（MRU）
-z_key_repeat = true
-
-[engine.codetable.temp_pinyin]
-enabled = true
-schema = "pinyin"
 
 [[dictionaries]]
 id = "wubi86_main"
@@ -69,15 +54,6 @@ path = "wubi86/wubi86_jidian_extra_district.dict.yaml"
 type = "rime_codetable"
 default_enabled = false
 weight_as_order = true
-
-[learning]
-
-[learning.auto_learn]
-enabled = false
-
-[learning.freq]
-enabled = true
-protect_top_n = 1
 
 [encoder]
 max_word_length = 10

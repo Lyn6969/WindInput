@@ -8,10 +8,10 @@ description = "双拼输入方案，每个汉字固定两键输入，支持多�
 
 [engine]
 type = "pinyin"
-filter_mode = "smart"
 
 [engine.pinyin]
 scheme = "shuangpin"
+unigram_path = "pinyin/unigram.txt"
 
 [engine.pinyin.shuangpin]
 layout = "xiaohe"
@@ -26,12 +26,3 @@ default = true
 median = 200
 max = 19260817
 mode = "log"
-
-[learning]
-unigram_path = "pinyin/unigram.txt"
-
-[learning.auto_learn]
-enabled = false
-
-[learning.freq]
-enabled = false

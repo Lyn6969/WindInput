@@ -44,9 +44,7 @@ const SENTENCE_WEIGHT_BASE: i32 = 30_000_000;
 #[derive(Debug, Clone, Default)]
 pub struct Config {
     pub show_code_hint: bool,
-    pub filter_mode: String,
     pub use_smart_compose: bool,
-    pub candidate_order: String,
 }
 
 /// 拼音引擎

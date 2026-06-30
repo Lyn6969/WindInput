@@ -13,15 +13,53 @@ available = ["wubi86", "wubi86_pinyin"]
 primary_codetable = ""
 primary_pinyin = ""
 
+# 全局码表配置：所有码表方案公共基线（出厂取主力码表 wubi86 偏好）。
+# 方案个性覆盖走 %APPDATA%/WindInput/schema_overrides/{id}.toml 的 [codetable] 段（带 enabled 开关）。
+[schema.codetable]
+top_code_commit = true
+clear_on_empty_max = false
+auto_commit_at_full = false
+punct_commit = true
+show_code_hint = true
+single_code_input = false
+single_code_complete = true
+z_key_repeat = true
+
+# 码表调频（全局唯一；strategy: top=一次到顶 MRU / step=逐次提升）。
+[schema.codetable.frequency]
+enabled = true
+protect_top_n = 1
+strategy = "step"
+
+# 码表自动造词（连续单字）。
+[schema.codetable.auto_phrase]
+enabled = false
+
 # 全局拼音配置：所有拼音类方案（全拼/双拼/混输拼音子方案/临时拼音反查）共用一份。
 [schema.pinyin]
 show_code_hint = true
 use_smart_compose = true
-candidate_order = "smart"
 separator = "auto"
 
 [schema.pinyin.fuzzy]
 enabled = false
+
+# 拼音调频（衰减参数；0=用 store 默认）。
+[schema.pinyin.frequency]
+enabled = true
+
+# 拼音自动造词。
+[schema.pinyin.auto_learn]
+enabled = false
+
+# 全局混输配置（融合策略；全局唯一，无方案级 override）。
+[schema.mix]
+show_source_hint = false
+enable_english = false
+pinyin_only_overflow = false
+top_code_override_pinyin = false
+auto_commit_block_on_pinyin = true
+min_pinyin_length = 2
 
 [schema.quick_input]
 # 注：; 由内置 mix「快捷」融合接管（quick_input 作为其成员，同时支持日期/计算/拼音/英文）。
@@ -68,6 +106,8 @@ space_as_input = false
 cancel_on_mode_switch = false
 
 [input.temp_pinyin]
+enabled = true
+schema = "pinyin"
 trigger_keys = ["backtick"]
 
 [input.auto_pair]
@@ -85,14 +125,6 @@ prefixes = ["www.", "http", "https", "ftp."]
 [input.s2t]
 enabled = false
 variant = "s2t"
-
-# 全码/空码上屏策略全局默认（方案级 [engine.codetable] tri-state 字段未设时回退至此）
-[input.code_commit]
-auto_commit_at_full = false
-auto_commit_block_on_pinyin = true
-auto_commit_min_len = 0
-top_code_commit = false
-clear_on_empty_max = false
 
 [input.cmdbar]
 enabled = false
