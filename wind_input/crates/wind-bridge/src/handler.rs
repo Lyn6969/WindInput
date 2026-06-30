@@ -97,6 +97,14 @@ pub enum KeyAction {
     /// C++ 端开启组合显示 text，在 timeout_ms 毫秒后自动提交中文；
     /// press2 到来时直接用英文文本替换组合（通过普通 InsertText / CommitText 提交）。
     HoldComposition { text: String, timeout_ms: u32 },
+    /// 顶屏后开 HoldComposition（has_input + 智能符号 HoldComposition 组合路径）：
+    /// 先提交 commit_text（候选/前缀），再将 hold_text（中文标点）放入 TSF 组合态，
+    /// timeout_ms 后自动提交中文；press2 与普通 HoldComposition press2 路径一致。
+    CommitAndHoldComposition {
+        commit_text: String,
+        hold_text: String,
+        timeout_ms: u32,
+    },
 }
 
 impl KeyAction {

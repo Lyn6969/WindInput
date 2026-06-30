@@ -1637,6 +1637,7 @@ BOOL CKeyEventSink::_HandleServiceResponse()
     case ResponseType::PassThrough:
         // PassThrough means key was NOT handled, pass to system
         WIND_LOG_DEBUG(L"PassThrough: key not handled, passing to system\n");
+        _pTextService->FlushHoldCompositionIfActive();
         return FALSE;
 
     case ResponseType::CommitText:
@@ -1693,6 +1694,9 @@ BOOL CKeyEventSink::_HandleServiceResponse()
             QueryPerformanceCounter(&ucStart);
 
             WIND_LOG_TRACE(L"Received UpdateComposition from service\n");
+            // 若 HoldComposition 计时器活跃（中文符号待提交），先提交符号再开新组合，
+            // 防止 timer 超时后用旧文本覆盖掉新输入内容。
+            _pTextService->FlushHoldCompositionIfActive();
             _isComposing = TRUE;
             _hasCandidates = TRUE;
             _pTextService->NotifyCandidatesVisibilityChanged(TRUE);
@@ -1783,6 +1787,21 @@ BOOL CKeyEventSink::_HandleServiceResponse()
             _pTextService->HoldComposition(response.text, response.holdTimeoutMs);
             _isComposing = TRUE;
             _hasCandidates = FALSE;
+        }
+        return TRUE;
+
+    case ResponseType::CommitAndHold:
+        {
+            // 标点顶屏 + 智能符号 HoldComposition：先提交候选文本，再开 HoldComposition 放入中文符号。
+            WIND_LOG_DEBUG_FMT(L"Processing CommitAndHold: commit=%ls hold=%ls timeoutMs=%u\n",
+                               response.text.c_str(), response.newComposition.c_str(),
+                               response.holdTimeoutMs);
+            _pTextService->CommitText(response.text);
+            _isComposing = FALSE;
+            _hasCandidates = FALSE;
+            _pTextService->NotifyCandidatesVisibilityChanged(FALSE);
+            _pTextService->HoldComposition(response.newComposition, response.holdTimeoutMs);
+            _isComposing = TRUE;
         }
         return TRUE;
 

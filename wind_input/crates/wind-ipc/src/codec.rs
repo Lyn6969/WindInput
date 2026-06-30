@@ -515,6 +515,26 @@ pub fn encode_replace_backward(count: u32, text: &str) -> Vec<u8> {
     buf
 }
 
+/// 编码 CommitAndHoldComposition 响应 (CMD_COMMIT_AND_HOLD 0x010B)
+///
+/// 格式：timeout_ms(4) + commit_len(4) + hold_len(4) + commit_utf8 + hold_utf8
+/// C++ 端先提交 commit_text（候选），再开 HoldComposition 放入 hold_text（中文标点）。
+pub fn encode_commit_and_hold(timeout_ms: u32, commit_text: &str, hold_text: &str) -> Vec<u8> {
+    let commit_bytes = commit_text.as_bytes();
+    let hold_bytes = hold_text.as_bytes();
+    let payload_len = 12 + commit_bytes.len() + hold_bytes.len();
+    let mut buf = Vec::with_capacity(IpcHeader::SIZE + payload_len);
+
+    let ipc = IpcHeader::new(CMD_COMMIT_AND_HOLD, payload_len as u32);
+    buf.extend_from_slice(&ipc.to_bytes());
+    buf.extend_from_slice(&timeout_ms.to_le_bytes());
+    buf.extend_from_slice(&(commit_bytes.len() as u32).to_le_bytes());
+    buf.extend_from_slice(&(hold_bytes.len() as u32).to_le_bytes());
+    buf.extend_from_slice(commit_bytes);
+    buf.extend_from_slice(hold_bytes);
+    buf
+}
+
 /// 编码 HoldComposition 响应 (CMD_HOLD_COMPOSITION 0x010A)
 ///
 /// 格式：timeout_ms(4) + text_len(4) + UTF-8 text

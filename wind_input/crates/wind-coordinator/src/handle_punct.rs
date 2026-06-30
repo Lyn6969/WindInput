@@ -129,27 +129,53 @@ impl Coordinator {
         {
             match method {
                 SmartMethod::HoldComposition => {
-                    // 组合态内 press2 无需 prev_char 验证：组合内容已知，直接提交英文。
-                    if let Some(rep) = self.compute_punct_str_pure(state, ch, false) {
-                        arm.armed = false;
-                        arm.held_text = None;
-                        if ch == '\'' || ch == '"' {
-                            self.punct
-                                .lock()
-                                .unwrap_or_else(|e| e.into_inner())
-                                .revert_last_quote(ch);
+                    if arm.held_text.is_some() {
+                        // 正常 hold 路径：press1 时无活跃编码，组合态内无需 prev_char 验证，直接提交英文。
+                        if let Some(rep) = self.compute_punct_str_pure(state, ch, false) {
+                            arm.armed = false;
+                            arm.held_text = None;
+                            if ch == '\'' || ch == '"' {
+                                self.punct
+                                    .lock()
+                                    .unwrap_or_else(|e| e.into_inner())
+                                    .revert_last_quote(ch);
+                            }
+                            debug!(
+                                "SmartSymbol(HoldComposition): press2, commit english: {}",
+                                rep
+                            );
+                            return Some(KeyAction::InsertText {
+                                text: rep,
+                                new_composition: None,
+                                mode_changed: false,
+                                chinese_mode: state.chinese_mode,
+                                has_new_composition: false,
+                            });
                         }
-                        debug!(
-                            "SmartSymbol(HoldComposition): press2, commit english: {}",
-                            rep
-                        );
-                        return Some(KeyAction::InsertText {
-                            text: rep,
-                            new_composition: None,
-                            mode_changed: false,
-                            chinese_mode: state.chinese_mode,
-                            has_new_composition: false,
-                        });
+                    } else {
+                        // press1 时有活跃编码，中文标点已作文本顶屏提交，非组合态 → 降级走
+                        // DeleteReplace 路径：检查 prev_char 再 ReplaceBackward。
+                        let armed_runes: Vec<char> = arm.str.chars().collect();
+                        if let Some(&last) = armed_runes.last()
+                            && last as u32 == prev_char as u32
+                            && let Some(rep) = self.compute_punct_str_pure(state, ch, false)
+                        {
+                            arm.armed = false;
+                            if ch == '\'' || ch == '"' {
+                                self.punct
+                                    .lock()
+                                    .unwrap_or_else(|e| e.into_inner())
+                                    .revert_last_quote(ch);
+                            }
+                            debug!(
+                                "SmartSymbol(HoldComposition->fallback): press2, replace chinese punct with english, count={}",
+                                armed_runes.len()
+                            );
+                            return Some(KeyAction::ReplaceBackward {
+                                count: armed_runes.len() as u32,
+                                text: rep,
+                            });
+                        }
                     }
                 }
                 SmartMethod::DeleteReplace => {
@@ -188,17 +214,27 @@ impl Coordinator {
 
                 match method {
                     SmartMethod::HoldComposition => {
+                        let has_input =
+                            !state.input_buffer.is_empty() || !state.committed_text.is_empty();
                         arm.armed = true;
-                        arm.held_text = Some(cn.clone());
-                        debug!(
-                            "SmartSymbol(HoldComposition): press1, hold composition: {}, timeout={}ms",
-                            cn, timeout_ms
-                        );
-                        // 短路返回：由 C++ 端负责开启组合态和计时，不走普通标点流程
-                        return Some(KeyAction::HoldComposition {
-                            text: cn,
-                            timeout_ms,
-                        });
+                        if has_input {
+                            // 有活跃编码时，不短路进入 hold composition——让调用方的标点分支
+                            // 检测 hold_pending_commit 并生成 CommitAndHoldComposition：先顶屏
+                            // 上屏候选，再开 HoldComposition 放入中文标点。
+                            arm.held_text = None;
+                            arm.hold_pending_commit = true;
+                        } else {
+                            arm.held_text = Some(cn.clone());
+                            debug!(
+                                "SmartSymbol(HoldComposition): press1, hold composition: {}, timeout={}ms",
+                                cn, timeout_ms
+                            );
+                            // 短路返回：由 C++ 端负责开启组合态和计时，不走普通标点流程
+                            return Some(KeyAction::HoldComposition {
+                                text: cn,
+                                timeout_ms,
+                            });
+                        }
                     }
                     SmartMethod::DeleteReplace => {
                         arm.armed = true;
@@ -220,6 +256,7 @@ impl Coordinator {
         let mut arm = self.smart_symbol.lock().unwrap_or_else(|e| e.into_inner());
         arm.armed = false;
         arm.held_text = None;
+        arm.hold_pending_commit = false;
         // 注：HoldComposition 模式下若组合尚未提交，C++ 端的 SetTimer 计时器会在 timeout
         // 到期后自动提交中文符号，或在焦点切换时由 OnCompositionTerminated 自然结束。
     }

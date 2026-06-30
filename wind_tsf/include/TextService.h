@@ -227,6 +227,9 @@ public:
     // 取消 HoldComposition 计时器（若活跃）。安全：_hHoldTimer==0 时为空操作。
     void CancelHoldTimer();
 
+    // 若 HoldComposition 计时器活跃，立即提交中文符号（宿主中断组合时调用，如 PassThrough 键）。
+    void FlushHoldCompositionIfActive();
+
 private:
     LONG _refCount;
     ITfThreadMgr* _pThreadMgr;

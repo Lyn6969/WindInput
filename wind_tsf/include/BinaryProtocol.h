@@ -78,6 +78,7 @@ constexpr uint16_t CMD_MOVE_CURSOR             = 0x0107; // Move cursor (smart s
 constexpr uint16_t CMD_DELETE_PAIR             = 0x0108; // Delete pair (smart backspace)
 constexpr uint16_t CMD_REPLACE_BACKWARD        = 0x0109; // Replace preceding char(s): delete N before caret + insert text
 constexpr uint16_t CMD_HOLD_COMPOSITION         = 0x010A; // Hold composition: open composition + auto-commit after timeout_ms
+constexpr uint16_t CMD_COMMIT_AND_HOLD          = 0x010B; // Commit text then hold composition (punct_commit + smart symbol)
 constexpr uint16_t CMD_HOST_RENDER_SETUP  = 0x0501; // Host render setup (shared memory + event names)
 constexpr uint16_t CMD_BATCH_RESPONSE     = 0x0F02; // Batch response container
 
@@ -240,6 +241,16 @@ struct HoldCompositionPayload
     // Followed by UTF-8 text
 };
 static_assert(sizeof(HoldCompositionPayload) == 8, "HoldCompositionPayload must be 8 bytes");
+
+// CommitAndHold payload (punct_commit + smart symbol: commit text, then open composition with hold text)
+struct CommitAndHoldPayload
+{
+    uint32_t timeoutMs;    // Auto-commit timeout for hold composition (milliseconds)
+    uint32_t commitLength; // Length of commit text (UTF-8)
+    uint32_t holdLength;   // Length of hold composition text (UTF-8)
+    // Followed by commitLength bytes of UTF-8 commit_text, then holdLength bytes of UTF-8 hold_text
+};
+static_assert(sizeof(CommitAndHoldPayload) == 12, "CommitAndHoldPayload must be 12 bytes");
 
 // Commit text flags
 constexpr uint32_t COMMIT_FLAG_MODE_CHANGED       = 0x0001;
@@ -474,6 +485,7 @@ enum class ResponseType
     DeletePair,           // Delete left + right char (smart delete)
     ReplaceBackward,      // Delete N chars before caret + insert text (smart symbol)
     HoldComposition,      // Open composition with text + start auto-commit timer (smart symbol)
+    CommitAndHold,        // Commit text then open composition with hold text + start timer
     HostRenderSetup, // Host render setup (shared memory info)
     Error
 };

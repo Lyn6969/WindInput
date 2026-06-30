@@ -2249,6 +2249,22 @@ impl MessageHandler for Coordinator {
     fn handle_key_event_policed(&self, data: &KeyEventData) -> KeyAction {
         let action = self.handle_key_event(data);
         self.record_input_stats(&action);
+        // PassThrough / UpdateComposition 时 C++ 侧会调 FlushHoldCompositionIfActive 提交旧符号；
+        // coordinator 需同步清除 held_text，防止后续标点的 pre_held_text 捡到已提交的旧值
+        // 而造成二次提交（"。。="）。仅在 held_text 非空时操作，避免干扰无 Hold 状态的武装态。
+        match &action {
+            KeyAction::PassThrough
+            | KeyAction::NotHandled
+            | KeyAction::UpdateComposition { .. } => {
+                let mut arm = self.smart_symbol.lock().unwrap_or_else(|e| e.into_inner());
+                if arm.held_text.is_some() {
+                    arm.held_text = None;
+                    arm.armed = false;
+                    arm.hold_pending_commit = false;
+                }
+            }
+            _ => {}
+        }
         if self.preedit_uses_placeholder() {
             action.with_composition_placeholder()
         } else {
@@ -2798,6 +2814,21 @@ impl MessageHandler for Coordinator {
                     }
                 }
                 if let Some(ch) = punct_char(data.key_code, shift) {
+                    // 快照 held_text：非参与集合的标点会在 try_smart_symbol_replace 中解除武装
+                    // 并清空 held_text，须在此前保存，以便下方普通标点流程将旧符号纳入 CommitText。
+                    // 加超时防护：若 arm.at 已超出 timeout，说明 C++ timer 已自然触发提交，
+                    // held_text 已过期——不再使用，防止二次提交（"。" → 等待 >500ms → "=" → "。。="）。
+                    let pre_held_text = {
+                        let arm = self.smart_symbol.lock().unwrap_or_else(|e| e.into_inner());
+                        let timeout = self.smart_symbol_timeout();
+                        let still_in_window =
+                            arm.at.map(|t| t.elapsed() < timeout).unwrap_or(false);
+                        if still_in_window {
+                            arm.held_text.clone()
+                        } else {
+                            None
+                        }
+                    };
                     // 智能符号模式：同键连按删中文标点改英文（press2 短路返回）。
                     // 须在候选提交逻辑之前：press2 时无待输入，依赖光标前字符匹配武装态。
                     if let Some(act) = self.try_smart_symbol_replace(&state, ch, data.prev_char) {
@@ -2875,6 +2906,12 @@ impl MessageHandler for Coordinator {
                     // 标点/符号键：先上屏已转换前缀 + 首选候选（若有输入），再追加（转换后的）标点
                     let committed = self.take_committed(&mut state);
                     let mut out = self.maybe_s2t(&state, &committed);
+                    // 若此前有 HoldComposition 残留（非参与集合标点令 arm 解除武装），
+                    // 将旧符号纳入 out 首部：CommitText 原子替换 TSF 组合态，timer 被 CancelHoldTimer
+                    // 取消，旧符号不会二次提交，也不会因组合态被覆盖而丢失。
+                    if let Some(ref held) = pre_held_text {
+                        out = format!("{}{}", held, out);
+                    }
                     if !state.candidates.is_empty() {
                         let (start, _) = self.page_range(&state);
                         let idx = (start + state.selected_index).min(state.candidates.len() - 1);
@@ -3095,6 +3132,10 @@ impl MessageHandler for Coordinator {
         // 但若不清 menu_open，下一个键会被 forward_menu_key 当作菜单键吞掉（首字符失效）。
         state.menu_open = false;
         drop(state);
+        // 此回调仅在 TSF 意外终止组合时触发（焦点切换、宿主强制 EndComposition 等）；
+        // 我们自己的 CommitText 不触发（_pComposition 已提前置 nullptr，走"Already released"分支）。
+        // 因此在此 disarm 是安全的：意外中断必然使 HoldComposition 失效，旧 held_text 不可再用。
+        self.disarm_smart_symbol();
         self.notify_ui_hide();
     }
 

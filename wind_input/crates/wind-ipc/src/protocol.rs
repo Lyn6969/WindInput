@@ -71,6 +71,9 @@ pub const CMD_REPLACE_BACKWARD: u16 = 0x0109;
 /// HoldComposition 响应 (0x010A)：开启组合显示 text，在 timeout_ms 毫秒后自动提交。
 /// 载荷：timeout_ms(u32 LE) + text_len(u32 LE) + UTF-8 text
 pub const CMD_HOLD_COMPOSITION: u16 = 0x010A;
+/// CommitAndHoldComposition 响应 (0x010B)：先提交 commit_text，再开 HoldComposition 放入 hold_text。
+/// 载荷：timeout_ms(u32 LE) + commit_len(u32 LE) + hold_len(u32 LE) + commit_utf8 + hold_utf8
+pub const CMD_COMMIT_AND_HOLD: u16 = 0x010B;
 
 // 状态
 pub const CMD_STATUS_UPDATE: u16 = 0x0202;

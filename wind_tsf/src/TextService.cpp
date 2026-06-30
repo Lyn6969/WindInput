@@ -4958,8 +4958,8 @@ BOOL CTextService::HoldComposition(const std::wstring& text, UINT timeoutMs)
     WIND_LOG_DEBUG_FMT(L"HoldComposition: text=%s timeoutMs=%u\n",
                        text.c_str(), timeoutMs);
 
-    // 取消可能残留的旧计时器
-    CancelHoldTimer();
+    // 若有残留的旧计时器，先提交旧符号再开启新组合（直接 Cancel 会丢失旧符号）。
+    FlushHoldCompositionIfActive();
 
     // 将中文符号放入 TSF 组合态（caretPos = 文本长度，光标置末）
     if (!UpdateComposition(text, static_cast<int>(text.length())))
@@ -4983,6 +4983,12 @@ BOOL CTextService::HoldComposition(const std::wstring& text, UINT timeoutMs)
     WIND_LOG_DEBUG_FMT(L"HoldComposition: timer started id=%llu\n",
                        static_cast<unsigned long long>(_hHoldTimer));
     return TRUE;
+}
+
+void CTextService::FlushHoldCompositionIfActive()
+{
+    if (_hHoldTimer != 0)
+        OnHoldTimerExpired();
 }
 
 void CTextService::CancelHoldTimer()

@@ -1433,6 +1433,38 @@ BOOL CIPCClient::_ParseResponse(const IpcHeader& header, const std::vector<uint8
         }
         break;
 
+    case CMD_COMMIT_AND_HOLD:
+        {
+            response.type = ResponseType::CommitAndHold;
+            if (payload.size() < sizeof(CommitAndHoldPayload))
+            {
+                _LogError(L"CommitAndHold payload too short");
+                return FALSE;
+            }
+            const CommitAndHoldPayload* p =
+                reinterpret_cast<const CommitAndHoldPayload*>(payload.data());
+            response.holdTimeoutMs = p->timeoutMs;
+            size_t commitOffset = sizeof(CommitAndHoldPayload);
+            if (p->commitLength > 0 && p->commitLength <= payload.size() - commitOffset)
+            {
+                response.text = _Utf8ToWide(
+                    reinterpret_cast<const char*>(payload.data() + commitOffset),
+                    p->commitLength);
+            }
+            size_t holdOffset = commitOffset + p->commitLength;
+            if (p->holdLength > 0 && holdOffset <= payload.size()
+                && p->holdLength <= payload.size() - holdOffset)
+            {
+                response.newComposition = _Utf8ToWide(
+                    reinterpret_cast<const char*>(payload.data() + holdOffset),
+                    p->holdLength);
+            }
+            _LogDebug(L"Response: CommitAndHold timeoutMs=%u commitLen=%zu holdLen=%zu",
+                      response.holdTimeoutMs, response.text.length(),
+                      response.newComposition.length());
+        }
+        break;
+
     case CMD_HOST_RENDER_SETUP:
         {
             response.type = ResponseType::HostRenderSetup;

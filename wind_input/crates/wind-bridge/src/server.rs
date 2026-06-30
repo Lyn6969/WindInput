@@ -688,6 +688,11 @@ fn encode_key_action(action: &KeyAction) -> Vec<u8> {
         KeyAction::HoldComposition { text, timeout_ms } => {
             encode_hold_composition(*timeout_ms, text)
         }
+        KeyAction::CommitAndHoldComposition {
+            commit_text,
+            hold_text,
+            timeout_ms,
+        } => encode_commit_and_hold(*timeout_ms, commit_text, hold_text),
     }
 }
 
