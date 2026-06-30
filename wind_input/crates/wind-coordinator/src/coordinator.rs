@@ -2740,7 +2740,11 @@ impl MessageHandler for Coordinator {
                             // E. 越界：记下触发键字符，延后到模式触发判定之后再按 overflow 策略处理
                             // （对齐 Go decideBufferedTrigger——次/三选键越界时 overflow 排在
                             // 模式激活之后，故 `;` 候选不足时优先进快捷输入而非 overflow）。
-                            select_overflow = punct_char(data.key_code, false);
+                            // 仅在有 input session 时才标记越界；空缓冲+空候选（完全空闲态）
+                            // 应回落到下方普通标点流程，否则 ' / ; 在中文空闲模式下永远被吞。
+                            if !state.input_buffer.is_empty() || !state.candidates.is_empty() {
+                                select_overflow = punct_char(data.key_code, false);
+                            }
                         }
                     }
                     // D. 模式触发键 → 顶屏高亮候选 + 进模式。
