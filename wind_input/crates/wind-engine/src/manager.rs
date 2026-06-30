@@ -888,6 +888,25 @@ impl EngineManager {
         global.resolved(ov.as_ref())
     }
 
+    /// 主码表方案的拆字配置（`[engine.chaizi]`：db/font 路径 + DWrite 家族名）。
+    /// 拆字反查表与字根字体随主码表方案下发；无配置返回 None。路径相对 `data/schemas/`。
+    pub fn chaizi_spec(&self) -> Option<wind_config::schema::ChaiziSpec> {
+        let primary = self
+            .primary_codetable
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        let id = if primary.is_empty() {
+            self.active_schema_id()
+        } else {
+            primary
+        };
+        let schema =
+            Self::read_schema(&id, self.data_dir.as_deref(), self.override_dir.as_deref())?;
+        let c = schema.engine.chaizi;
+        c.is_configured().then_some(c)
+    }
+
     /// 活跃方案的词频排序设置（frequency.md §3/§8）。**全局唯一、按引擎类型分**：
     /// 码表/混输取 `schema.codetable.frequency`，拼音取 `schema.pinyin.frequency`。
     /// 按 id 缓存（reload 时清空），避免每键重算。

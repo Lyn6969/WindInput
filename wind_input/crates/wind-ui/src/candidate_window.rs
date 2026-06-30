@@ -272,10 +272,10 @@ impl CandidateWindow {
         self.mouse.borrow_mut().engage_delay_ms = delay_ms.max(0) as u64;
     }
 
-    /// 设置拆字字根字体路径（PUA 字根字符渲染）。转发给悬停提示窗。
-    pub fn set_tooltip_chaizi_font(&mut self, path: &str) {
+    /// 设置拆字字根字体（TTF 路径 + DWrite 家族名）。转发给悬停提示窗。
+    pub fn set_tooltip_chaizi_font(&mut self, path: &str, family: &str) {
         if let Some(t) = self.tooltip.as_mut() {
-            t.set_chaizi_font(path);
+            t.set_chaizi_font(path, family);
         }
     }
 

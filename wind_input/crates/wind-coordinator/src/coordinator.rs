@@ -624,13 +624,17 @@ impl Coordinator {
         let _ = coordinator
             .ui_tx
             .send(UiCommand::SetTooltipDelay(rt0.config.ui.tooltip.delay));
-        // 拆字字根字体（PUA 字根渲染）：随安装数据目录下发，存在才发。
-        if let Some(dir) = data_dir.as_deref() {
-            let font = dir.join("schemas/wubi86/HeiTiZiGen.ttf");
+        // 拆字字根字体（PUA 字根渲染）：路径 + DWrite 家族名取自主码表方案 [engine.chaizi]，存在才发。
+        if let (Some(dir), Some(chaizi)) =
+            (data_dir.as_deref(), coordinator.engine_mgr.chaizi_spec())
+            && !chaizi.font_path.is_empty()
+        {
+            let font = dir.join("schemas").join(&chaizi.font_path);
             if font.is_file() {
-                let _ = coordinator.ui_tx.send(UiCommand::SetTooltipChaiziFont(
-                    font.to_string_lossy().into_owned(),
-                ));
+                let _ = coordinator.ui_tx.send(UiCommand::SetTooltipChaiziFont {
+                    path: font.to_string_lossy().into_owned(),
+                    family: chaizi.font_family.clone(),
+                });
             }
         }
         // 统一应用外观项（幂等）：补齐上面手动块未含的候选字体族 / 翻页栏 / 页码 / 字号跟随主题，
@@ -731,8 +735,12 @@ impl Coordinator {
             info!("Loaded common chars table");
         }
 
-        // 候选反查表（拆字/拼音）
-        let reverse = wind_reverse::ReverseLookup::load(data_dir);
+        // 候选反查表（拆字/拼音）：拆字库路径取自主码表方案 [engine.chaizi].db_path（相对 schemas/）。
+        let chaizi_db = engine_mgr
+            .chaizi_spec()
+            .filter(|c| !c.db_path.is_empty())
+            .and_then(|c| data_dir.map(|d| d.join("schemas").join(&c.db_path)));
+        let reverse = wind_reverse::ReverseLookup::load(data_dir, chaizi_db.as_deref());
         if !reverse.is_empty() {
             info!("Loaded reverse-lookup (chaizi/pinyin)");
         }

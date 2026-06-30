@@ -88,8 +88,8 @@ pub enum UiCommand {
     SetPagerDisplay(String),
     /// 页码文字显示覆盖（""跟随主题/"show"/"hide"）。来自 ui.candidate.page_number_display。
     SetPageNumberDisplay(String),
-    /// 拆字字根字体路径（PUA 字根字符渲染）。空=不设。
-    SetTooltipChaiziFont(String),
+    /// 拆字字根字体（PUA 字根字符渲染）：TTF 文件路径 + DWrite 家族名（取自方案 [engine.chaizi]）。
+    SetTooltipChaiziFont { path: String, family: String },
     /// 显示菜单（候选右键菜单 / 功能主菜单；UI 自管导航与子菜单）。
     /// above=true：菜单底边对齐 (x,y) 向上展开（工具栏菜单用，避免遮挡工具栏）；
     /// y_bottom 为锚点区域下边界，上方空间不足时改为从 y_bottom 向下弹出。
@@ -793,8 +793,8 @@ impl UiManager {
                     UiCommand::SetPageNumberDisplay(mode) => {
                         candidate_window.set_page_number_display(mode);
                     }
-                    UiCommand::SetTooltipChaiziFont(path) => {
-                        candidate_window.set_tooltip_chaizi_font(&path);
+                    UiCommand::SetTooltipChaiziFont { path, family } => {
+                        candidate_window.set_tooltip_chaizi_font(&path, &family);
                     }
                     UiCommand::Shutdown => {
                         info!("UI: Shutdown");

@@ -154,10 +154,14 @@ fn merge_chaizi_pinyin(sections: Vec<Section>) -> Vec<Section> {
 // ─────────────────────────────────────────────────────────────────────────────
 
 impl ReverseLookup {
-    pub fn load(data_dir: Option<&Path>) -> Self {
+    /// 加载反查表：拆字库路径由调用方从方案 `[engine.chaizi].db_path` 解析后传入（无则跳过）；
+    /// 拼音读音表 `pinyin_map.txt` 是全局资源，仍按 data_dir 定位。
+    pub fn load(data_dir: Option<&Path>, chaizi_path: Option<&Path>) -> Self {
         let mut rl = Self::default();
+        if let Some(p) = chaizi_path {
+            rl.load_chaizi(p);
+        }
         if let Some(dir) = data_dir {
-            rl.load_chaizi(&dir.join("schemas/wubi86/wubi86_chaizi.txt"));
             rl.load_pinyin(&dir.join("pinyin_map.txt"));
         }
         rl

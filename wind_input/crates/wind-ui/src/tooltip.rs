@@ -138,9 +138,9 @@ impl Tooltip {
         }
     }
 
-    /// 加载拆字字根字体（PUA 字根字符渲染）。失败仅日志，不影响普通提示。
-    pub fn set_chaizi_font(&mut self, path: &str) {
-        if let Err(e) = self.renderer.set_chaizi_font(path) {
+    /// 加载拆字字根字体（PUA 字根字符渲染）。`family` 为 DWrite 家族名。失败仅日志，不影响普通提示。
+    pub fn set_chaizi_font(&mut self, path: &str, family: &str) {
+        if let Err(e) = self.renderer.set_chaizi_font(path, family) {
             tracing::warn!("加载拆字字根字体失败 ({path}): {e}");
         }
     }

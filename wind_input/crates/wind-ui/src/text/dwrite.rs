@@ -111,8 +111,9 @@ mod imp {
         }
 
         /// 加载拆字字根字体（TTF）建自定义字体集，后续渲染中 PUA 码位字符回退到它。
+        /// `family` 为方案配置的 DWrite 家族名（空则回退默认 `CHAIZI_FAMILY`）。
         /// 失败返回 Err（不影响普通文本渲染）。
-        pub fn set_chaizi_font(&mut self, path: &str) -> Result<(), String> {
+        pub fn set_chaizi_font(&mut self, path: &str, family: &str) -> Result<(), String> {
             unsafe {
                 let f3: IDWriteFactory3 = self
                     .factory
@@ -136,7 +137,12 @@ mod imp {
                 let collection = f3
                     .CreateFontCollectionFromFontSet(&set)
                     .map_err(|e| format!("CreateFontCollectionFromFontSet: {e}"))?;
-                let family: Vec<u16> = CHAIZI_FAMILY
+                let family_name = if family.is_empty() {
+                    CHAIZI_FAMILY
+                } else {
+                    family
+                };
+                let family: Vec<u16> = family_name
                     .encode_utf16()
                     .chain(std::iter::once(0))
                     .collect();
@@ -708,7 +714,7 @@ mod imp {
 
         pub fn set_font_family(&mut self, _font_family: &str) {}
 
-        pub fn set_chaizi_font(&mut self, _path: &str) -> Result<(), String> {
+        pub fn set_chaizi_font(&mut self, _path: &str, _family: &str) -> Result<(), String> {
             Ok(())
         }
 

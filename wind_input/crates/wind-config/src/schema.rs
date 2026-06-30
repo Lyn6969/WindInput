@@ -50,6 +50,31 @@ pub struct EngineSpec {
     pub pinyin: PinyinSpec,
     #[serde(default)]
     pub mixed: MixedSpec,
+    /// 拆字（字根分解）反查与字根字体（码表方案的悬停提示用）。
+    #[serde(default)]
+    pub chaizi: ChaiziSpec,
+}
+
+/// 拆字配置（[engine.chaizi]）。供悬停提示的"如何输入"反查与 PUA 字根字符渲染。
+/// 路径相对 `data/schemas/`。三字段全空=该方案无拆字提示。
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ChaiziSpec {
+    /// 拆字库路径（`字\t字根\t编码` 文本），相对 schemas 目录。
+    #[serde(default)]
+    pub db_path: String,
+    /// 字根字体 TTF 文件路径，相对 schemas 目录（注册进 DirectWrite 自定义字体集）。
+    #[serde(default)]
+    pub font_path: String,
+    /// 字根字体的 DirectWrite 家族名（取自 TTF name 表，如 "黑体字根"）；渲染时按此名引用。
+    #[serde(default)]
+    pub font_family: String,
+}
+
+impl ChaiziSpec {
+    /// 是否配置了拆字（至少有库或字体路径）。
+    pub fn is_configured(&self) -> bool {
+        !self.db_path.is_empty() || !self.font_path.is_empty()
+    }
 }
 
 /// 码表引擎配置（[engine.codetable]）。**仅引擎固定参数**；
