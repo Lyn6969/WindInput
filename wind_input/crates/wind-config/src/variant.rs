@@ -46,7 +46,7 @@ pub fn app_dir_name() -> &'static str {
 }
 
 /// 便携模式标记文件名。
-pub const PORTABLE_MARKER_NAME: &str = "portable_mode";
+pub const PORTABLE_MARKER_NAME: &str = "wind_portable_mode";
 
 /// 用 OnceLock 缓存，进程内只检测一次。
 pub fn is_portable() -> bool {

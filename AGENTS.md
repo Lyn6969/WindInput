@@ -103,6 +103,7 @@ log_level = "debug"   # 或 "trace"
 - 路径（变体感知）：
   - 正常安装 release：`%LOCALAPPDATA%\WindInput\logs\`
   - 正常安装 dev：`%LOCALAPPDATA%\WindInputDev\logs\`
+  - 便携模式：`<exe目录>\userdata\logs\`（以 exe 同目录存在 `wind_portable_mode` 文件为标记）
 - 可通过 `RUST_LOG` 环境变量覆盖级别（优先级最高，仅用于开发排查）
 
 ### 写日志准则

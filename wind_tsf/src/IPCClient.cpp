@@ -365,6 +365,7 @@ BOOL CIPCClient::_StartService()
         {
             WCHAR markerPath[MAX_PATH];
             wcsncpy_s(markerPath, dllPath, (lastSlash - dllPath + 1));
+            wcscat_s(markerPath, MAX_PATH, L"wind_portable_mode");
 
             HANDLE hFile = CreateFileW(
                 markerPath,
