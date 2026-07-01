@@ -257,6 +257,8 @@ impl Coordinator {
         });
     }
 
+    // macOS 用 IMK 原生菜单, 不走协调器弹出菜单键转发 (见 coordinator handle_key_event 门控)。
+    #[cfg_attr(target_os = "macos", allow(dead_code))]
     pub(crate) fn is_menu_open(&self) -> bool {
         self.state
             .lock()
@@ -275,6 +277,7 @@ impl Coordinator {
     }
 
     /// 菜单打开时转发导航键给菜单窗口；返回 true 表示已消费。
+    #[cfg_attr(target_os = "macos", allow(dead_code))]
     pub(crate) fn forward_menu_key(&self, key_code: u32) -> bool {
         if !self.is_menu_open() {
             return false;

@@ -1,6 +1,7 @@
 target/
 build_dev/
 build/
+build_mac/
 dist/
 temp/
 .cache/
@@ -9,3 +10,8 @@ scripts/deploy.local.ps1
 /.remote/
 .superpowers/
 .claude/
+
+# Swift 构建产物
+wind_macos/.build/
+.swiftpm/
+build_debug/

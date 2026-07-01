@@ -36,6 +36,10 @@ pub const CMD_COMPOSITION_TERMINATED: u16 = 0x0209;
 pub const CMD_SHOW_CONTEXT_MENU: u16 = 0x020A;
 pub const CMD_SYSTEM_MODE_SWITCH: u16 = 0x020B;
 
+// darwin .app 上行（请求 socket）：鼠标候选交互。方向与下行 0x020D/0x020E 由 dispatch 上下文区分。
+pub const CMD_CANDIDATE_SELECT: u16 = 0x020D; // payload: pageLocalIndex u32 LE
+pub const CMD_CANDIDATE_HOVER: u16 = 0x020E; // payload: pageLocalIndex i32 LE (-1=无)
+
 // 光标 & 选区
 pub const CMD_CARET_UPDATE: u16 = 0x0301;
 pub const CMD_SELECTION_CHANGED: u16 = 0x0302;
@@ -43,6 +47,20 @@ pub const CMD_CARET_PENDING: u16 = 0x0303;
 
 // Host Render
 pub const CMD_HOST_RENDER_REQUEST: u16 = 0x0501;
+
+// darwin 专用 host-render push 帧（方向与上行 0x05xx 由 push 通道语义区分）。
+// 字节布局须与 Swift wind_macos/.../BinaryCodec.swift decoder 及 Go binary_codec.go 一致。
+pub const CMD_HOST_RENDER_FRAME: u16 = 0x0502; // SHM 新帧就绪通知 (seq+几何+flags+scale, 28B)
+pub const CMD_CANDIDATE_RECTS: u16 = 0x0503; // 候选命中矩形 (panel-local)
+pub const CMD_MODE_STATUS: u16 = 0x0504; // 输入模式状态 (菜单栏指示器)
+pub const CMD_CANDIDATE_MENU_FLAGS: u16 = 0x0505; // 每候选右键菜单禁用位
+pub const CMD_MENU_SHOW: u16 = 0x0506; // 统一菜单树 (响应 CmdShowContextMenu)
+pub const CMD_TOOLTIP_SHOW: u16 = 0x0508; // 候选悬停 tooltip
+pub const CMD_TOOLTIP_HIDE: u16 = 0x0509;
+pub const CMD_STATUS_SHOW: u16 = 0x050A; // 模式状态气泡
+pub const CMD_STATUS_HIDE: u16 = 0x050B;
+pub const CMD_TOAST_SHOW: u16 = 0x050C; // Toast 通知
+pub const CMD_TOAST_HIDE: u16 = 0x050D;
 
 // 批处理
 pub const CMD_BATCH_EVENTS: u16 = 0x0F01;
@@ -83,6 +101,8 @@ pub const CMD_ACTIVATION_STATUS_PUSH: u16 = 0x020C;
 /// FocusGained 同步路径的轻量模式回传（仅 chineseMode+fullWidth，4 字节 flags）。
 /// DLL 在 OnSetFocus 内同步等本响应，首键前写好 _bChineseMode，根治"切应用首键上屏英文"
 /// 竞态；同时解除 DLL 的同步等待（否则无响应会卡到 READ_TIMEOUT_MS）。位定义同 STATUS_*。
+// 注：0x020D 双用途——下行此 CMD_MODE_PUSH（service→client push，仅编码）；
+// 上行 CMD_CANDIDATE_SELECT（client→service 请求，仅 dispatch）。方向区分，勿在 dispatch 加 MODE_PUSH 臂。
 pub const CMD_MODE_PUSH: u16 = 0x020D;
 /// TSF 侧在前台应用进程中执行 ShellExecute（打开 URL / 启动程序），解决 Service 进程无前台权限的问题。
 /// 载荷：target_len(u32 LE) + target(UTF-8) + params_len(u32 LE) + params(UTF-8)
@@ -364,7 +384,11 @@ pub struct SharedRenderHeader {
     pub height: u32,
     pub stride: u32,
     pub data_size: u32,
-    pub reserved: [u32; 6],
+    pub rect_count: u32,           // @40 候选 hit 矩形数
+    pub rects_offset: u32,         // @44 hit 矩形表相对 SHM 基址偏移
+    pub rendered_hover_index: i32, // @48 高亮候选索引（-1 无 / -2,-3 翻页）
+    pub target_instance_id: u32,   // @52 darwin 忽略
+    pub reserved: [u32; 2],        // @56..64
 }
 
 impl SharedRenderHeader {
@@ -386,7 +410,11 @@ impl SharedRenderHeader {
             height,
             stride,
             data_size,
-            reserved: [0; 6],
+            rect_count: 0,
+            rects_offset: 0,
+            rendered_hover_index: -1,
+            target_instance_id: 0,
+            reserved: [0; 2],
         }
     }
 
@@ -445,3 +473,30 @@ pub const COMMIT_FLAG_CHINESE_MODE: u16 = 0x0004;
 
 pub const EVENT_KEY_DOWN: u8 = 0;
 pub const EVENT_KEY_UP: u8 = 1;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn shared_render_header_field_offsets_match_go_swift() {
+        // 对齐 Swift SharedMemoryReader.swift / Go binary_protocol.go 的命名字段偏移
+        let mut h = SharedRenderHeader::new(
+            0x11223344, 0x55667788, 0x99AABBCC, 0xDDEE0011, 0x22334455, 0x66778899,
+        );
+        h.sequence = 0xA1A2A3A4;
+        h.rect_count = 0xB1B2B3B4;
+        h.rects_offset = 0xC1C2C3C4;
+        h.rendered_hover_index = -3;
+        h.target_instance_id = 0xE1E2E3E4;
+        let b = h.to_bytes();
+        assert_eq!(b.len(), 64);
+        assert_eq!(SharedRenderHeader::SIZE, 64);
+        assert_eq!(&b[8..12], &0xA1A2A3A4u32.to_le_bytes()); // sequence @8
+        assert_eq!(&b[40..44], &0xB1B2B3B4u32.to_le_bytes()); // rect_count @40
+        assert_eq!(&b[44..48], &0xC1C2C3C4u32.to_le_bytes()); // rects_offset @44
+        assert_eq!(&b[48..52], &(-3i32).to_le_bytes()); // rendered_hover_index @48
+        assert_eq!(&b[52..56], &0xE1E2E3E4u32.to_le_bytes()); // target_instance_id @52
+        assert_eq!(&b[56..64], &[0u8; 8]); // reserved[2] @56..64 = 0
+    }
+}

@@ -32,7 +32,10 @@ use wind_store::stats::CommitSource;
 use wind_transform::fullwidth::to_full_width;
 use wind_transform::punctuation::PunctuationConverter;
 use wind_ui::candidate_window::CandidateItem;
-use wind_ui::manager::{UiCommand, UiEvent, UiManager};
+use wind_ui::manager::{UiCommand, UiEvent};
+// UiManager 仅 Windows LayeredWindow 路径用；macOS 走 host-render forwarder。
+#[cfg(not(target_os = "macos"))]
+use wind_ui::manager::UiManager;
 use wind_ui::toast::{ToastKind, ToastPosition};
 
 /// caret_use_top 兼容下保留给「上方显示」避让正文的最小行高（物理像素）。微信 reflow 后的
@@ -510,7 +513,24 @@ impl Coordinator {
         let config = Config::load(data_dir.as_deref()).unwrap_or_default();
         info!("Active schema: {}", config.active_schema());
 
-        // UI 管理器（候选窗口线程）
+        // UI 管理器（候选窗口线程）。
+        // macOS 无进程内窗口：把 UiCommand 喂给 host-render forwarder，光栅化进 POSIX SHM
+        // 再经 push 管道推帧给 .app。其余平台走 Windows LayeredWindow 的 UiManager。
+        #[cfg(target_os = "macos")]
+        let (ui_tx, event_rx) = {
+            let (tx, rx) = std::sync::mpsc::channel::<UiCommand>();
+            let sink: Arc<dyn wind_bridge::HostRenderSink> = push_server.clone();
+            let suffix = push_server.suffix().to_string();
+            if let Err(e) = std::thread::Builder::new()
+                .name("ui-forwarder-macos".into())
+                .spawn(move || wind_ui::manager_macos::forwarder_thread(rx, sink, suffix))
+            {
+                warn!("Failed to spawn macOS host-render forwarder: {}", e);
+            }
+            // mac 侧候选交互经 push/bridge 协议回流，无进程内 UiEvent 源。
+            (tx, None::<std::sync::mpsc::Receiver<UiEvent>>)
+        };
+        #[cfg(not(target_os = "macos"))]
         let (ui_tx, event_rx) = match UiManager::new() {
             Ok(mut ui) => {
                 let tx = ui.sender();
@@ -2215,7 +2235,15 @@ impl MessageHandler for Coordinator {
     }
 
     fn handle_show_context_menu(&self, x: i32, y: i32) {
+        // 弹出菜单窗口 (popup_menu.rs / ShowCandidateMenu·MenuKey·HideMenu UiCommand) 是
+        // Windows 专有；macOS 由 IMK 原生 NSMenu 渲染菜单 (InputController.menu())。
+        // macOS 上 IMK 频繁调 menu() → Swift 发 CMD_SHOW_CONTEXT_MENU 仅为「查询菜单项」，
+        // 若在此调 show_main_menu 会把协调器置 menu_open=true 并经 forward_menu_key 吞掉后续
+        // 所有按键，而 macOS 无弹窗、永不回 MenuClose → 输入被永久卡死 (打字无响应)。
+        #[cfg(not(target_os = "macos"))]
         self.show_main_menu(x, y, y, false);
+        #[cfg(target_os = "macos")]
+        let _ = (x, y);
     }
 
     fn handle_english_stats(&self, chars: u32, digits: u32, puncts: u32, spaces: u32) {
@@ -2374,6 +2402,9 @@ impl MessageHandler for Coordinator {
         }
 
         // ── 右键菜单打开时：方向键/回车/ESC 由菜单消费（优先于一切）──
+        // 仅非 macOS：弹出菜单窗口是 Windows 专有，macOS 用 IMK 原生菜单自行消费键，
+        // 协调器不应吞键 (否则 menu_open 一旦被置真会永久卡死输入，见 handle_show_context_menu)。
+        #[cfg(not(target_os = "macos"))]
         if self.is_menu_open() && self.forward_menu_key(data.key_code) {
             return KeyAction::Consumed;
         }
@@ -3147,6 +3178,12 @@ impl MessageHandler for Coordinator {
     }
 
     fn handle_caret_update(&self, data: &CaretData) {
+        tracing::debug!(
+            "handle_caret_update: x={} y={} h={}",
+            data.x,
+            data.y,
+            data.height
+        );
         // height==0：宿主尚未 reflow，GetTextExt 返回退化矩形，坐标不可靠 → 跳过（不更新缓存、
         // 不触发显示），等 OnLayoutChange 后的有效坐标（对齐 Go HandleCaretUpdate）。
         if data.height == 0 {

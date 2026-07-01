@@ -233,6 +233,12 @@ pub trait MessageHandler: Send + Sync {
     /// 对齐 Go `RecordTSFEnglish`。默认空实现（无统计的 handler 静默忽略）。
     fn handle_english_stats(&self, _chars: u32, _digits: u32, _puncts: u32, _spaces: u32) {}
 
+    /// darwin: .app 鼠标点选候选（页内下标）。默认空。
+    fn handle_candidate_select(&self, _page_local_index: u32) {}
+
+    /// darwin: .app 鼠标 hover 候选（页内下标，-1=无）。默认空。
+    fn handle_candidate_hover(&self, _page_local_index: i32) {}
+
     /// 返回当前权威模式 (chinese_mode, full_width)，供 FocusGained 同步路径回传 ModePush。
     /// 必须极轻量（仅锁+读两字段），不得有任何阻塞/跨进程调用——DLL 正同步阻塞等本值。
     /// 与 Go `MessageHandler.GetCurrentMode` 对齐。默认返回中文模式（安全默认）。

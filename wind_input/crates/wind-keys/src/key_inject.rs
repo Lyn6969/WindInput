@@ -127,6 +127,89 @@ fn tap_combo(mods: &[u32], vk: u32) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Win32 虚拟键码 → macOS ANSI CGKeyCode（Carbon HIToolbox `kVK_*` 值）。
+///
+/// `parse_combo` 产出的是 Win32 VK，而 macOS CGEvent 用 ANSI 虚拟键位码（与 VK 不同），
+/// 故注入前需经此表换算。覆盖 `parse_key` 能产出的全部键（修饰键 / 功能键 / F1-F12 /
+/// 字母 / 数字）；未覆盖的 VK（如 OEM 符号键 0xBA..）返回 `None`，由调用方降级处理（不 panic）。
+pub(crate) fn vk_to_cgkeycode(vk: u32) -> Option<u16> {
+    let code: u16 = match vk {
+        // 修饰键
+        0x10 => 56, // VK_SHIFT   -> kVK_Shift
+        0x11 => 59, // VK_CONTROL -> kVK_Control
+        0x12 => 58, // VK_MENU    -> kVK_Option (Alt)
+        0x5B => 55, // VK_LWIN    -> kVK_Command
+        // 功能 / 编辑 / 导航键
+        0x0D => 36,  // Enter      -> kVK_Return
+        0x09 => 48,  // Tab        -> kVK_Tab
+        0x1B => 53,  // Esc        -> kVK_Escape
+        0x20 => 49,  // Space      -> kVK_Space
+        0x08 => 51,  // Backspace  -> kVK_Delete
+        0x2E => 117, // Delete     -> kVK_ForwardDelete
+        0x24 => 115, // Home       -> kVK_Home
+        0x23 => 119, // End        -> kVK_End
+        0x21 => 116, // PageUp     -> kVK_PageUp
+        0x22 => 121, // PageDown   -> kVK_PageDown
+        0x25 => 123, // Left       -> kVK_LeftArrow
+        0x26 => 126, // Up         -> kVK_UpArrow
+        0x27 => 124, // Right      -> kVK_RightArrow
+        0x28 => 125, // Down       -> kVK_DownArrow
+        // F1-F12（CGKeyCode 不连续，按 kVK_F1..F12 表）
+        0x70 => 122, // F1
+        0x71 => 120, // F2
+        0x72 => 99,  // F3
+        0x73 => 118, // F4
+        0x74 => 96,  // F5
+        0x75 => 97,  // F6
+        0x76 => 98,  // F7
+        0x77 => 100, // F8
+        0x78 => 101, // F9
+        0x79 => 109, // F10
+        0x7A => 103, // F11
+        0x7B => 111, // F12
+        // 字母 A-Z（0x41-0x5A）→ ANSI 键位码
+        0x41 => 0,  // A
+        0x42 => 11, // B
+        0x43 => 8,  // C
+        0x44 => 2,  // D
+        0x45 => 14, // E
+        0x46 => 3,  // F
+        0x47 => 5,  // G
+        0x48 => 4,  // H
+        0x49 => 34, // I
+        0x4A => 38, // J
+        0x4B => 40, // K
+        0x4C => 37, // L
+        0x4D => 46, // M
+        0x4E => 45, // N
+        0x4F => 31, // O
+        0x50 => 35, // P
+        0x51 => 12, // Q
+        0x52 => 15, // R
+        0x53 => 1,  // S
+        0x54 => 17, // T
+        0x55 => 32, // U
+        0x56 => 9,  // V
+        0x57 => 13, // W
+        0x58 => 7,  // X
+        0x59 => 16, // Y
+        0x5A => 6,  // Z
+        // 数字 0-9（0x30-0x39）→ ANSI 数字键位码
+        0x30 => 29, // 0
+        0x31 => 18, // 1
+        0x32 => 19, // 2
+        0x33 => 20, // 3
+        0x34 => 21, // 4
+        0x35 => 23, // 5
+        0x36 => 22, // 6
+        0x37 => 26, // 7
+        0x38 => 28, // 8
+        0x39 => 25, // 9
+        _ => return None,
+    };
+    Some(code)
+}
+
 // ───────────────────────── Win32 SendInput（仅 windows）─────────────────────────
 
 #[cfg(windows)]
@@ -192,24 +275,44 @@ fn type_unicode(text: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
-// ───────────────────────── macOS 预留（待接入 Core Graphics）─────────────────────────
-// macOS 按键注入用 Core Graphics 事件：
-//   - send_key → `CGEventCreateKeyboardEvent(src, keycode, keydown)` + `CGEventPost(kCGHIDEventTap, ev)`
-//     注意 macOS 用的是 CGKeyCode（ANSI 键位码），与此处的 Win32 VK 不同，需要一张 VK→CGKeyCode
-//     映射表（或改用 keymap 直接产出 CGKeyCode）。
-//   - type_unicode → `CGEventKeyboardSetUnicodeString(ev, len, buf)` 直接发 UTF-16。
-// 接入时把下面两个桩替换为 `#[cfg(target_os = "macos")]` 的真实现（依赖 `core-graphics` crate）。
+// ───────────────────────── macOS Core Graphics（CGEvent）─────────────────────────
+// macOS 用 ANSI CGKeyCode（≠ Win32 VK），经 `vk_to_cgkeycode` 换算后发 CGEvent：
+//   - send_key → `CGEvent::new_keyboard_event(src, keycode, keydown)` + `event.post(HID)`
+//   - type_unicode → 基础键盘事件上 `event.set_string(text)`（CGEventKeyboardSetUnicodeString 封装）
+//     按下/抬起各发一次。
+// `CGEventSource`/`CGEvent` 为 foreign_type（非 Clone），每次按下/抬起重建 source。
+// 需「辅助功能」授权（系统设置 → 隐私与安全性 → 辅助功能）事件方能投递，否则被系统静默吞掉。
 
 #[cfg(target_os = "macos")]
-fn send_key(_vk: u32, _up: bool) -> anyhow::Result<()> {
-    // TODO(macos): CGEventCreateKeyboardEvent + CGEventPost（需 VK→CGKeyCode 映射）。
-    anyhow::bail!("key 注入：macOS 待接入 Core Graphics（CGEvent）")
+fn send_key(vk: u32, up: bool) -> anyhow::Result<()> {
+    use core_graphics::event::{CGEvent, CGEventTapLocation};
+    use core_graphics::event_source::{CGEventSource, CGEventSourceStateID};
+
+    let keycode = vk_to_cgkeycode(vk)
+        .ok_or_else(|| anyhow::anyhow!("key 注入：vk={vk:#x} 无 macOS CGKeyCode 映射"))?;
+    let src = CGEventSource::new(CGEventSourceStateID::HIDSystemState)
+        .map_err(|_| anyhow::anyhow!("CGEventSource 创建失败"))?;
+    let event = CGEvent::new_keyboard_event(src, keycode, !up)
+        .map_err(|_| anyhow::anyhow!("CGEvent 键盘事件创建失败 (vk={vk:#x}, up={up})"))?;
+    event.post(CGEventTapLocation::HID);
+    Ok(())
 }
 
 #[cfg(target_os = "macos")]
-fn type_unicode(_text: &str) -> anyhow::Result<()> {
-    // TODO(macos): CGEventKeyboardSetUnicodeString。
-    anyhow::bail!("key.type：macOS 待接入 Core Graphics（CGEvent）")
+fn type_unicode(text: &str) -> anyhow::Result<()> {
+    use core_graphics::event::{CGEvent, CGEventTapLocation};
+    use core_graphics::event_source::{CGEventSource, CGEventSourceStateID};
+
+    for down in [true, false] {
+        let src = CGEventSource::new(CGEventSourceStateID::HIDSystemState)
+            .map_err(|_| anyhow::anyhow!("CGEventSource 创建失败"))?;
+        // keycode=0 占位；实际字符由 set_string 注入（CGEventKeyboardSetUnicodeString）。
+        let event = CGEvent::new_keyboard_event(src, 0, down)
+            .map_err(|_| anyhow::anyhow!("CGEvent 键盘事件创建失败 (type_unicode)"))?;
+        event.set_string(text);
+        event.post(CGEventTapLocation::HID);
+    }
+    Ok(())
 }
 
 // 其他 Unix（Linux 等）：无统一按键注入通道，保持 no-op 桩。
@@ -258,5 +361,75 @@ mod tests {
         assert_eq!(parse_combo("Bogus+X"), None); // 未知修饰键
         assert_eq!(parse_combo(""), None);
         assert_eq!(parse_combo("nonsuchkey"), None);
+    }
+
+    #[test]
+    fn vk_to_cgkeycode_modifiers() {
+        assert_eq!(vk_to_cgkeycode(0x10), Some(56)); // Shift
+        assert_eq!(vk_to_cgkeycode(0x11), Some(59)); // Control
+        assert_eq!(vk_to_cgkeycode(0x12), Some(58)); // Option(Alt)
+        assert_eq!(vk_to_cgkeycode(0x5B), Some(55)); // Command(LWin)
+    }
+
+    #[test]
+    fn vk_to_cgkeycode_function_keys() {
+        assert_eq!(vk_to_cgkeycode(0x0D), Some(36)); // Return
+        assert_eq!(vk_to_cgkeycode(0x09), Some(48)); // Tab
+        assert_eq!(vk_to_cgkeycode(0x1B), Some(53)); // Escape
+        assert_eq!(vk_to_cgkeycode(0x20), Some(49)); // Space
+        assert_eq!(vk_to_cgkeycode(0x08), Some(51)); // Backspace -> Delete
+        assert_eq!(vk_to_cgkeycode(0x2E), Some(117)); // Delete -> ForwardDelete
+        assert_eq!(vk_to_cgkeycode(0x24), Some(115)); // Home
+        assert_eq!(vk_to_cgkeycode(0x23), Some(119)); // End
+        assert_eq!(vk_to_cgkeycode(0x21), Some(116)); // PageUp
+        assert_eq!(vk_to_cgkeycode(0x22), Some(121)); // PageDown
+        assert_eq!(vk_to_cgkeycode(0x25), Some(123)); // Left
+        assert_eq!(vk_to_cgkeycode(0x26), Some(126)); // Up
+        assert_eq!(vk_to_cgkeycode(0x27), Some(124)); // Right
+        assert_eq!(vk_to_cgkeycode(0x28), Some(125)); // Down
+    }
+
+    #[test]
+    fn vk_to_cgkeycode_f_keys() {
+        assert_eq!(vk_to_cgkeycode(0x70), Some(122)); // F1
+        assert_eq!(vk_to_cgkeycode(0x71), Some(120)); // F2
+        assert_eq!(vk_to_cgkeycode(0x72), Some(99)); // F3
+        assert_eq!(vk_to_cgkeycode(0x73), Some(118)); // F4
+        assert_eq!(vk_to_cgkeycode(0x74), Some(96)); // F5
+        assert_eq!(vk_to_cgkeycode(0x75), Some(97)); // F6
+        assert_eq!(vk_to_cgkeycode(0x76), Some(98)); // F7
+        assert_eq!(vk_to_cgkeycode(0x77), Some(100)); // F8
+        assert_eq!(vk_to_cgkeycode(0x78), Some(101)); // F9
+        assert_eq!(vk_to_cgkeycode(0x79), Some(109)); // F10
+        assert_eq!(vk_to_cgkeycode(0x7A), Some(103)); // F11
+        assert_eq!(vk_to_cgkeycode(0x7B), Some(111)); // F12
+    }
+
+    #[test]
+    fn vk_to_cgkeycode_letters() {
+        assert_eq!(vk_to_cgkeycode(0x41), Some(0)); // A
+        assert_eq!(vk_to_cgkeycode(0x53), Some(1)); // S
+        assert_eq!(vk_to_cgkeycode(0x5A), Some(6)); // Z
+        assert_eq!(vk_to_cgkeycode(0x4D), Some(46)); // M
+        assert_eq!(vk_to_cgkeycode(0x51), Some(12)); // Q
+        assert_eq!(vk_to_cgkeycode(0x50), Some(35)); // P
+    }
+
+    #[test]
+    fn vk_to_cgkeycode_digits() {
+        assert_eq!(vk_to_cgkeycode(0x31), Some(18)); // 1
+        assert_eq!(vk_to_cgkeycode(0x32), Some(19)); // 2
+        assert_eq!(vk_to_cgkeycode(0x35), Some(23)); // 5
+        assert_eq!(vk_to_cgkeycode(0x36), Some(22)); // 6
+        assert_eq!(vk_to_cgkeycode(0x37), Some(26)); // 7
+        assert_eq!(vk_to_cgkeycode(0x39), Some(25)); // 9
+        assert_eq!(vk_to_cgkeycode(0x30), Some(29)); // 0
+    }
+
+    #[test]
+    fn vk_to_cgkeycode_unknown() {
+        assert_eq!(vk_to_cgkeycode(0xFFFF), None);
+        assert_eq!(vk_to_cgkeycode(0xBA), None); // OEM_1 ; 未覆盖
+        assert_eq!(vk_to_cgkeycode(0x00), None);
     }
 }

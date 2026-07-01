@@ -599,3 +599,259 @@ mod tests {
         assert_eq!(&buf[16..], "，".as_bytes());
     }
 }
+
+// ── darwin host-render push 帧编码器 (W4) ──
+// 字节布局对照 Swift wind_macos/.../BinaryCodec.swift decoder。均小端，返回完整帧。
+
+/// 追加一个长度前缀(u32 LE)的 UTF-8 字符串
+fn push_string(out: &mut Vec<u8>, s: &str) {
+    out.extend_from_slice(&(s.len() as u32).to_le_bytes());
+    out.extend_from_slice(s.as_bytes());
+}
+
+/// 组帧：IpcHeader(cmd,len) + payload
+fn frame(cmd: u16, payload: Vec<u8>) -> Vec<u8> {
+    let mut out = Vec::with_capacity(IpcHeader::SIZE + payload.len());
+    out.extend_from_slice(&IpcHeader::new(cmd, payload.len() as u32).to_bytes());
+    out.extend_from_slice(&payload);
+    out
+}
+
+/// CmdHostRenderFrame (0x0502): seq:u32 + x:i32 + y:i32 + w:u32 + h:u32 + flags:u32 + scale:u32 (28B)
+pub fn encode_host_render_frame(
+    seq: u32,
+    x: i32,
+    y: i32,
+    w: u32,
+    h: u32,
+    flags: u32,
+    scale: u32,
+) -> Vec<u8> {
+    let mut p = Vec::with_capacity(28);
+    p.extend_from_slice(&seq.to_le_bytes());
+    p.extend_from_slice(&x.to_le_bytes());
+    p.extend_from_slice(&y.to_le_bytes());
+    p.extend_from_slice(&w.to_le_bytes());
+    p.extend_from_slice(&h.to_le_bytes());
+    p.extend_from_slice(&flags.to_le_bytes());
+    p.extend_from_slice(&scale.to_le_bytes());
+    frame(CMD_HOST_RENDER_FRAME, p)
+}
+
+/// CmdCandidateRects (0x0503): count:u32 + count×(index,x,y,w,h 各 i32 LE)。
+/// index<0 为翻页按钮 (-1=上页 -2=下页)。坐标为 panel-local。
+pub fn encode_candidate_rects(rects: &[(i32, i32, i32, i32, i32)]) -> Vec<u8> {
+    let mut p = Vec::with_capacity(4 + rects.len() * 20);
+    p.extend_from_slice(&(rects.len() as u32).to_le_bytes());
+    for (idx, x, y, w, h) in rects {
+        for v in [idx, x, y, w, h] {
+            p.extend_from_slice(&v.to_le_bytes());
+        }
+    }
+    frame(CMD_CANDIDATE_RECTS, p)
+}
+
+/// CmdModeStatus (0x0504): flags:u32 + effective_mode:u32 + labelLen:u32 + label(UTF-8)
+pub fn encode_mode_status(flags: u32, effective_mode: u32, label: &str) -> Vec<u8> {
+    let mut p = Vec::new();
+    p.extend_from_slice(&flags.to_le_bytes());
+    p.extend_from_slice(&effective_mode.to_le_bytes());
+    push_string(&mut p, label);
+    frame(CMD_MODE_STATUS, p)
+}
+
+/// CmdCandidateMenuFlags (0x0505): count:u32 + count×(1 字节禁用位)
+pub fn encode_candidate_menu_flags(per_cand: &[u8]) -> Vec<u8> {
+    let mut p = Vec::with_capacity(4 + per_cand.len());
+    p.extend_from_slice(&(per_cand.len() as u32).to_le_bytes());
+    p.extend_from_slice(per_cand);
+    frame(CMD_CANDIDATE_MENU_FLAGS, p)
+}
+
+/// CmdTooltipShow (0x0508): textLen+text + bgLen+bg + fgLen+fg + fontPathLen+fontPath
+pub fn encode_tooltip_show(text: &str, bg: &str, fg: &str, font_path: &str) -> Vec<u8> {
+    let mut p = Vec::new();
+    for s in [text, bg, fg, font_path] {
+        push_string(&mut p, s);
+    }
+    frame(CMD_TOOLTIP_SHOW, p)
+}
+
+/// CmdTooltipHide (0x0509): 空 payload
+pub fn encode_tooltip_hide() -> Vec<u8> {
+    frame(CMD_TOOLTIP_HIDE, Vec::new())
+}
+
+/// CmdStatusShow (0x050A): textLen+text + bgLen+bg + fgLen+fg + x:i32 + y:i32 + duration_ms:i32
+pub fn encode_status_show(
+    text: &str,
+    bg: &str,
+    fg: &str,
+    x: i32,
+    y: i32,
+    duration_ms: i32,
+) -> Vec<u8> {
+    let mut p = Vec::new();
+    for s in [text, bg, fg] {
+        push_string(&mut p, s);
+    }
+    p.extend_from_slice(&x.to_le_bytes());
+    p.extend_from_slice(&y.to_le_bytes());
+    p.extend_from_slice(&duration_ms.to_le_bytes());
+    frame(CMD_STATUS_SHOW, p)
+}
+
+/// CmdStatusHide (0x050B): 空 payload
+pub fn encode_status_hide() -> Vec<u8> {
+    frame(CMD_STATUS_HIDE, Vec::new())
+}
+
+/// CmdToastShow (0x050C): 六段长度前缀串 (title+message+bg+fg+accent+position) + duration_ms:i32 + max_width:i32
+#[allow(clippy::too_many_arguments)]
+pub fn encode_toast_show(
+    title: &str,
+    message: &str,
+    bg: &str,
+    fg: &str,
+    accent: &str,
+    position: &str,
+    duration_ms: i32,
+    max_width: i32,
+) -> Vec<u8> {
+    let mut p = Vec::new();
+    for s in [title, message, bg, fg, accent, position] {
+        push_string(&mut p, s);
+    }
+    p.extend_from_slice(&duration_ms.to_le_bytes());
+    p.extend_from_slice(&max_width.to_le_bytes());
+    frame(CMD_TOAST_SHOW, p)
+}
+
+/// CmdToastHide (0x050D): 空 payload
+pub fn encode_toast_hide() -> Vec<u8> {
+    frame(CMD_TOAST_HIDE, Vec::new())
+}
+
+#[cfg(test)]
+mod darwin_push_tests {
+    use super::*;
+
+    fn cmd_of(frame: &[u8]) -> u16 {
+        u16::from_le_bytes([frame[2], frame[3]])
+    }
+
+    #[test]
+    fn host_render_frame_layout_is_28_bytes_le() {
+        let f = encode_host_render_frame(7, -3, 20, 100, 40, 0x3, 2);
+        assert_eq!(f.len(), 8 + 28);
+        assert_eq!(cmd_of(&f), CMD_HOST_RENDER_FRAME);
+        let p = &f[8..];
+        assert_eq!(u32::from_le_bytes(p[0..4].try_into().unwrap()), 7);
+        assert_eq!(i32::from_le_bytes(p[4..8].try_into().unwrap()), -3);
+        assert_eq!(i32::from_le_bytes(p[8..12].try_into().unwrap()), 20);
+        assert_eq!(u32::from_le_bytes(p[12..16].try_into().unwrap()), 100);
+        assert_eq!(u32::from_le_bytes(p[16..20].try_into().unwrap()), 40);
+        assert_eq!(u32::from_le_bytes(p[20..24].try_into().unwrap()), 0x3);
+        assert_eq!(u32::from_le_bytes(p[24..28].try_into().unwrap()), 2);
+    }
+
+    #[test]
+    fn candidate_rects_layout_count_then_5xi32() {
+        let f = encode_candidate_rects(&[(0, 1, 2, 30, 24), (-1, 5, 6, 12, 12)]);
+        assert_eq!(cmd_of(&f), CMD_CANDIDATE_RECTS);
+        let p = &f[8..];
+        assert_eq!(u32::from_le_bytes(p[0..4].try_into().unwrap()), 2);
+        assert_eq!(i32::from_le_bytes(p[4..8].try_into().unwrap()), 0);
+        assert_eq!(i32::from_le_bytes(p[8..12].try_into().unwrap()), 1);
+        assert_eq!(i32::from_le_bytes(p[24..28].try_into().unwrap()), -1);
+    }
+
+    #[test]
+    fn mode_status_label_utf8_length_prefixed() {
+        let f = encode_mode_status(0x5, 1, "五笔");
+        assert_eq!(cmd_of(&f), CMD_MODE_STATUS);
+        let p = &f[8..];
+        assert_eq!(u32::from_le_bytes(p[0..4].try_into().unwrap()), 0x5);
+        assert_eq!(u32::from_le_bytes(p[4..8].try_into().unwrap()), 1);
+        let n = u32::from_le_bytes(p[8..12].try_into().unwrap()) as usize;
+        assert_eq!(n, "五笔".len());
+        assert_eq!(&p[12..12 + n], "五笔".as_bytes());
+    }
+
+    #[test]
+    fn tooltip_show_four_length_prefixed_strings() {
+        let f = encode_tooltip_show("abc", "#fff", "#000", "/p.ttf");
+        assert_eq!(cmd_of(&f), CMD_TOOLTIP_SHOW);
+        let p = &f[8..];
+        let mut off = 0usize;
+        for s in ["abc", "#fff", "#000", "/p.ttf"] {
+            let n = u32::from_le_bytes(p[off..off + 4].try_into().unwrap()) as usize;
+            assert_eq!(n, s.len());
+            assert_eq!(&p[off + 4..off + 4 + n], s.as_bytes());
+            off += 4 + n;
+        }
+        assert_eq!(off, p.len());
+    }
+
+    #[test]
+    fn status_show_three_strings_then_three_i32() {
+        let f = encode_status_show("中 ，", "#111", "#eee", 50, 80, 1000);
+        assert_eq!(cmd_of(&f), CMD_STATUS_SHOW);
+        let p = &f[8..];
+        let mut off = 0usize;
+        for s in ["中 ，", "#111", "#eee"] {
+            let n = u32::from_le_bytes(p[off..off + 4].try_into().unwrap()) as usize;
+            assert_eq!(&p[off + 4..off + 4 + n], s.as_bytes());
+            off += 4 + n;
+        }
+        assert_eq!(i32::from_le_bytes(p[off..off + 4].try_into().unwrap()), 50);
+        assert_eq!(
+            i32::from_le_bytes(p[off + 4..off + 8].try_into().unwrap()),
+            80
+        );
+        assert_eq!(
+            i32::from_le_bytes(p[off + 8..off + 12].try_into().unwrap()),
+            1000
+        );
+    }
+
+    #[test]
+    fn empty_payload_frames_are_header_only() {
+        assert_eq!(encode_tooltip_hide().len(), 8);
+        assert_eq!(encode_status_hide().len(), 8);
+        assert_eq!(encode_toast_hide().len(), 8);
+        assert_eq!(cmd_of(&encode_tooltip_hide()), CMD_TOOLTIP_HIDE);
+        assert_eq!(cmd_of(&encode_status_hide()), CMD_STATUS_HIDE);
+        assert_eq!(cmd_of(&encode_toast_hide()), CMD_TOAST_HIDE);
+    }
+
+    #[test]
+    fn candidate_menu_flags_count_then_bytes() {
+        let f = encode_candidate_menu_flags(&[0x01, 0x10, 0x00]);
+        assert_eq!(cmd_of(&f), CMD_CANDIDATE_MENU_FLAGS);
+        let p = &f[8..];
+        assert_eq!(u32::from_le_bytes(p[0..4].try_into().unwrap()), 3);
+        assert_eq!(&p[4..7], &[0x01, 0x10, 0x00]);
+    }
+
+    #[test]
+    fn toast_show_six_strings_then_two_i32() {
+        let f = encode_toast_show("标题", "正文", "#1", "#2", "#3", "bottom_right", 5000, 320);
+        assert_eq!(cmd_of(&f), CMD_TOAST_SHOW);
+        let p = &f[8..];
+        let mut off = 0usize;
+        for s in ["标题", "正文", "#1", "#2", "#3", "bottom_right"] {
+            let n = u32::from_le_bytes(p[off..off + 4].try_into().unwrap()) as usize;
+            assert_eq!(&p[off + 4..off + 4 + n], s.as_bytes());
+            off += 4 + n;
+        }
+        assert_eq!(
+            i32::from_le_bytes(p[off..off + 4].try_into().unwrap()),
+            5000
+        );
+        assert_eq!(
+            i32::from_le_bytes(p[off + 4..off + 8].try_into().unwrap()),
+            320
+        );
+    }
+}

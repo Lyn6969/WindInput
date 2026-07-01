@@ -27,11 +27,11 @@ impl Default for PushConfig {
 }
 
 /// 客户端连接信息
-struct PushClient {
-    /// 客户端 token（PID << 32 | instance_counter）
-    token: u64,
+pub(crate) struct PushClient {
+    /// 客户端 token（PID << 32 | instance_counter；unix 端由服务端发号）
+    pub(crate) token: u64,
     /// 发送通道（writer 线程独占管道句柄）
-    tx: std::sync::mpsc::Sender<Vec<u8>>,
+    pub(crate) tx: std::sync::mpsc::Sender<Vec<u8>>,
 }
 
 /// 推送管道服务器
@@ -59,6 +59,11 @@ impl PushServer {
     /// 是否有已连接的 TSF 客户端（用于决定是否经 IPC 让宿主执行前台操作）
     pub fn has_clients(&self) -> bool {
         !self.clients.lock().unwrap().is_empty()
+    }
+
+    /// 管道/SHM 后缀（变体隔离）。macOS forwarder 据此派生 SHM 名，须与 .app 读端一致。
+    pub fn suffix(&self) -> &str {
+        &self.config.suffix
     }
 
     /// 获取推送管道名称
@@ -89,10 +94,28 @@ impl PushServer {
         Ok(())
     }
 
-    #[cfg(not(windows))]
+    /// 启动 UDS 推送服务器（macOS / Linux）
+    #[cfg(unix)]
     pub async fn start(&self) -> anyhow::Result<()> {
-        warn!("Push pipe server not supported on this platform");
+        let path = crate::endpoint::push_socket_path(&self.config.suffix);
+        info!("Push UDS server starting on {:?}", path);
+        let clients = self.clients.clone();
+        std::thread::Builder::new()
+            .name("push-server".into())
+            .spawn(move || crate::push_unix::run_uds_push_server(path, clients))?;
         Ok(())
+    }
+
+    #[cfg(not(any(windows, unix)))]
+    pub async fn start(&self) -> anyhow::Result<()> {
+        warn!("Push server not supported on this platform");
+        Ok(())
+    }
+
+    /// 仅供测试：返回 clients Arc 克隆，允许测试向 push_unix 注入并断言 fanout。
+    #[cfg(test)]
+    pub(crate) fn clients_for_test(&self) -> Arc<Mutex<Vec<PushClient>>> {
+        self.clients.clone()
     }
 
     /// 向所有连接客户端广播消息（用于状态/激活同步，幂等无副作用）
@@ -149,6 +172,13 @@ impl PushServer {
             label,
         );
         self.push_to_active(&resp);
+    }
+}
+
+/// host-render 帧 sink：forwarder 把候选/状态帧广播给已连接 push 客户端（macOS .app）。
+impl crate::host_render_sink::HostRenderSink for PushServer {
+    fn push_frame(&self, frame: &[u8]) {
+        self.push_to_active(frame);
     }
 }
 

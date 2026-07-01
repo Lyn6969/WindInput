@@ -18,6 +18,27 @@ use crate::view::{Align, Edges, Layout, Rect, View, ViewImage, ViewLayer};
 use crate::window::{LayeredWindow, WindowMouse};
 use std::time::{Duration, Instant};
 
+/// macOS host-render：`render_frame()` 产出的离屏帧（forwarder 写 SHM + push 用）。
+#[cfg(target_os = "macos")]
+pub struct RenderedFrame {
+    /// 图像屏幕左上角 X（已含软影 margin 回移）
+    pub screen_x: i32,
+    /// 图像屏幕左上角 Y
+    pub screen_y: i32,
+    /// 图像宽（设备像素，已乘 scale）
+    pub width: u32,
+    /// 图像高（设备像素）
+    pub height: u32,
+    /// 渲染缩放（Retina=2）；.app 按 logical=像素/scale 显示，根治模糊
+    pub scale: f32,
+    /// 是否含软件高斯阴影（影响 .app 落位/裁切）
+    pub software_shadow: bool,
+    /// 候选命中矩形（窗口缓冲坐标，内容起点 (ml,mt)）：(index, Rect)
+    pub hit_rects: Vec<(i32, crate::view::Rect)>,
+    /// 预乘 BGRA 像素缓冲（width×height×4）
+    pub buf: Vec<u8>,
+}
+
 /// 候选词数据
 #[derive(Debug, Clone)]
 pub struct CandidateItem {
@@ -471,7 +492,120 @@ impl CandidateWindow {
         }
     }
 
-    /// 悬停时显示候选编码（反查）；无悬停或无编码则隐藏。
+    /// macOS host-render：把当前候选状态渲染到一块独立 BGRA 缓冲区并返回，
+    /// 不依赖 Win32 Layered Window（forwarder 取此 buffer 写 POSIX SHM + push 给 .app）。
+    /// 镜像 `show()` 的 build/layout/place/flip/paint 流程，但 paint 到自有 Vec。
+    /// 返回 None 表示应隐藏候选窗（无候选 / 无 preedit / 无模式标记）。
+    #[cfg(target_os = "macos")]
+    pub fn render_frame(&mut self) -> Option<RenderedFrame> {
+        if self.candidates.is_empty() && self.preedit.is_empty() && self.mode_label.is_empty() {
+            return None;
+        }
+
+        // DPI：按光标所在屏取缩放（Retina=2），几何/字号由 self.scale 派生。
+        let new_scale = crate::dpi::scale_for_point(self.x, self.y);
+        if (new_scale - self.scale).abs() > 0.01 {
+            self.scale = new_scale;
+            self.text_renderer
+                .set_base_size((self.theme.behavior.font_size as f32) * new_scale);
+        }
+
+        let mut root = self.build_tree(false);
+        let shadow = self.shadow_params();
+        let (ml, mt, mr, mb) = match &shadow {
+            Some(s) => s.margins(),
+            None => (0, 0, 0, 0),
+        };
+        root.layout(ml as f32, mt as f32, &self.text_renderer);
+        let (w_f, h_f) = root.measured_size();
+        let mut content_w = (w_f.ceil() as u32).max(40);
+        if self.vertical && !self.candidates.is_empty() {
+            let vmax = self.theme.behavior.vertical_max_width;
+            if vmax > 0 {
+                let vmax_px = ((vmax as f32 * self.scale).ceil() as u32).max(40);
+                content_w = content_w.min(vmax_px);
+            }
+        }
+        let content_h = (h_f.ceil() as u32).max(24);
+        let width = content_w + ml + mr;
+        let height = content_h + mt + mb;
+
+        // 定位：据光标 + 内容尺寸算锚点。place_window 约定 caret_y 为光标【底端】（下方锚点=
+        // 底端+gap），但 macOS .app 的 caretRectToWire 发的是光标行【顶端】(top-left)，故这里
+        // 把行高补上传光标底端 = self.y + self.caret_height，候选窗才落在光标行下方、不遮挡输入。
+        let (px0, py0, above) = Self::place_window(
+            self.x,
+            self.y + self.caret_height,
+            self.caret_height,
+            content_w,
+            content_h,
+            self.placed_above,
+        );
+        self.placed_above = above;
+        let (px, py) = match self.last_content_pos {
+            Some((lx, ly)) if self.visible => {
+                let thr = (4.0 * self.scale).round().max(1.0) as i32;
+                if (px0 - lx).abs() < thr && (py0 - ly).abs() < thr {
+                    (lx, ly)
+                } else {
+                    (px0, py0)
+                }
+            }
+            _ => (px0, py0),
+        };
+        self.last_content_pos = Some((px, py));
+        if self.flip_when_above && self.placed_above {
+            root = self.build_tree(true);
+            root.layout(ml as f32, mt as f32, &self.text_renderer);
+        }
+
+        // 命中矩形（窗口缓冲坐标，内容起点 (ml,mt)），同步给鼠标处理器。
+        self.hit_rects.clear();
+        root.collect_hits(&mut self.hit_rects);
+        {
+            let mut m = self.mouse.borrow_mut();
+            m.hit_rects = self.hit_rects.clone();
+            m.last_hover = -1;
+        }
+
+        // 绘制到独立 BGRA 缓冲（透明清屏 → 软影 → 内容）。
+        let mut buf = vec![0u8; (width * height * 4) as usize];
+        if let Some(s) = &shadow {
+            let radius = self
+                .theme
+                .views
+                .window
+                .border_radius
+                .map(|d| d.resolve(self.scale, 0.0))
+                .unwrap_or(8.0 * self.scale);
+            s.paint(
+                &mut buf,
+                width,
+                height,
+                ml as f32,
+                mt as f32,
+                content_w as f32,
+                content_h as f32,
+                radius,
+            );
+        }
+        root.paint(&mut buf, width, height, &self.text_renderer);
+
+        self.visible = true;
+        Some(RenderedFrame {
+            // 图像含四向 margin，其屏幕左上 = 内容锚点 − 左/上 margin（与 show() 一致）。
+            screen_x: px - ml as i32,
+            screen_y: py - mt as i32,
+            width,
+            height,
+            scale: self.scale,
+            software_shadow: shadow.is_some(),
+            hit_rects: self.hit_rects.clone(),
+            buf,
+        })
+    }
+
+    /// 悬停时在该候选下方显示其编码（反查）；无悬停或无编码则隐藏。
     /// `(wx, wy)` 为候选窗口屏幕原点（命中矩形坐标的基准）。
     /// 横排：tooltip 在候选行下方（不足时上翻）。
     /// 竖排：tooltip 在候选窗右侧（不足时左侧），纵向对齐悬停候选行，避免遮挡下方候选。

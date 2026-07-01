@@ -16,3 +16,4 @@ windows = { workspace = true }
 
 [target.'cfg(unix)'.dependencies]
 tokio = { version = "1", features = ["net", "sync"] }
+libc = "0.2"

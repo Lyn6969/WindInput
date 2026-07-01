@@ -1419,9 +1419,10 @@ mod geom_tests {
     }
 }
 
-/// 盒模型布局测试。断言含文本尺寸，依赖非 Windows 的 mock 文本测量
-/// （`measure_text_sized` = 字符数 × 字号 × 0.6，行高 = 字号 × 1.2），故 gate 到 not(windows)。
-#[cfg(all(test, not(windows)))]
+/// 盒模型布局测试。断言含文本尺寸，依赖 mock 文本测量
+/// （`measure_text_sized` = 字符数 × 字号 × 0.6，行高 = 字号 × 1.2）。
+/// macOS 文本后端为真 CoreText（mock 失效），故同 Windows 一并 gate 出。
+#[cfg(all(test, not(windows), not(target_os = "macos")))]
 mod layout_tests {
     use super::*;
     use crate::text::dwrite::TextRenderer;

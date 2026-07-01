@@ -59,10 +59,22 @@ impl BridgeServer {
         Ok(())
     }
 
-    /// 启动 Named Pipe 服务器（非 Windows 平台的占位实现）
-    #[cfg(not(windows))]
+    /// 启动 UDS 请求服务器（macOS / Linux）
+    #[cfg(unix)]
     pub async fn start(&self) -> anyhow::Result<()> {
-        warn!("Named Pipe server not supported on this platform");
+        let path = crate::endpoint::request_socket_path(&self.config.suffix);
+        info!("Bridge UDS server starting on {:?}", path);
+        let handler = self.handler.clone();
+        std::thread::Builder::new()
+            .name("bridge-server".into())
+            .spawn(move || crate::server_unix::run_uds_server(path, handler))?;
+        Ok(())
+    }
+
+    /// 其余平台占位实现
+    #[cfg(not(any(windows, unix)))]
+    pub async fn start(&self) -> anyhow::Result<()> {
+        warn!("Bridge server not supported on this platform");
         Ok(())
     }
 }
@@ -310,7 +322,7 @@ fn handle_client(pipe: PipeHandle, handler: Arc<dyn MessageHandler>, _timeout_ms
 /// - 异步命令返回 None（不写响应）
 /// - FOCUS_GAINED：同步命令，回 CMD_MODE_PUSH（权威 chinese/full）；重型 push 延后到
 ///   handle_client 写出响应之后（见该处）。IME_ACTIVATED 仍异步，状态由 handler 经 push pipe 回送。
-fn dispatch_command(
+pub(crate) fn dispatch_command(
     handler: &Arc<dyn MessageHandler>,
     command: u16,
     is_async: bool,
@@ -393,10 +405,13 @@ fn dispatch_command(
             }
         }
 
-        // ── 焦点丢失（异步） ──
+        // ── 焦点丢失 ──
+        // macOS IMKit `deactivateServer` 同步 send+readFrame 等 ack（sendEmpty）；不回则
+        // readFrame 永久阻塞 → 切换/失焦卡死。Windows TSF fire-and-forget（is_async）不读，
+        // 回了反而污染管道 → 仅 !is_async 回 ack（对齐 feat / 历史 fix 803f7fa）。
         CMD_FOCUS_LOST => {
             handler.handle_focus_lost();
-            None
+            if is_async { None } else { Some(encode_ack()) }
         }
 
         // ── IME 激活（异步） ──
@@ -517,9 +532,20 @@ fn dispatch_command(
                                 },
                             ),
                         )
+                    } else if payload.len() >= 12 {
+                        // macOS .app 的 CmdCaretUpdate 默认只发 12 字节 (x,y,height i32 LE，
+                        // 无 composition_start)。main 原解码器只认 20 字节 → 12 字节被拒、
+                        // handle_caret_update 永不调用 → 候选窗 caret 恒 (0,0,0) 卡屏幕左上。
+                        Ok(wind_ipc::protocol::CaretPayload {
+                            x: i32::from_le_bytes(payload[0..4].try_into().unwrap()),
+                            y: i32::from_le_bytes(payload[4..8].try_into().unwrap()),
+                            height: i32::from_le_bytes(payload[8..12].try_into().unwrap()),
+                            composition_start_x: 0,
+                            composition_start_y: 0,
+                        })
                     } else {
                         Err(wind_ipc::codec::CodecError::BufferTooShort {
-                            need: 20,
+                            need: 12,
                             got: payload.len(),
                         })
                     }
@@ -533,7 +559,10 @@ fn dispatch_command(
                     composition_start_y: caret.composition_start_y,
                 });
             }
-            None
+            // macOS IMKit sendCaretUpdateIfAvailable 同步 send+readFrame（注释「服务端一律返
+            // ack」）；每键组字/模式切换都发，不回 ack → readFrame 永久阻塞 → 每键卡死、无法输入。
+            // Windows TSF fire-and-forget（is_async）不读，回了污染管道 → 仅 !is_async 回 ack。
+            if is_async { None } else { Some(encode_ack()) }
         }
 
         // ── 选区变化（异步） ──
@@ -565,6 +594,25 @@ fn dispatch_command(
                 (i32::MIN, i32::MIN)
             };
             handler.handle_show_context_menu(x, y);
+            Some(encode_ack())
+        }
+
+        // ── darwin .app 鼠标点选候选（页内下标 u32 LE，上行）──
+        // 0x020D 双用途：下行 CMD_MODE_PUSH（仅编码），上行 CMD_CANDIDATE_SELECT（仅 dispatch）。
+        CMD_CANDIDATE_SELECT => {
+            if payload.len() >= 4 {
+                let idx = u32::from_le_bytes(payload[0..4].try_into().unwrap());
+                handler.handle_candidate_select(idx);
+            }
+            Some(encode_ack())
+        }
+
+        // ── darwin .app 鼠标 hover 候选（页内下标 i32 LE，-1=无，上行）──
+        CMD_CANDIDATE_HOVER => {
+            if payload.len() >= 4 {
+                let idx = i32::from_le_bytes(payload[0..4].try_into().unwrap());
+                handler.handle_candidate_hover(idx);
+            }
             Some(encode_ack())
         }
 

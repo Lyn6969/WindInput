@@ -686,12 +686,17 @@ mod imp {
     }
 } // mod imp (windows)
 
-#[cfg(not(windows))]
+// macOS：真字形渲染走 CoreText（text/coretext.rs），re-export 为本模块的 TextRenderer。
+#[cfg(target_os = "macos")]
+pub use crate::text::coretext::TextRenderer;
+
+// Linux 等其余非 Windows 平台：保留 mock 桩（仅供编译/测试，无真实字形）。
+#[cfg(all(not(windows), not(target_os = "macos")))]
 pub use imp::TextRenderer;
 
-/// 非 Windows mock：测量用等宽近似（字符数 × 字号 × 0.6），绘制为空操作。
+/// 非 Windows/非 macOS mock：测量用等宽近似（字符数 × 字号 × 0.6），绘制为空操作。
 /// 让候选窗/工具栏/菜单等布局逻辑能在 Linux 上编译与跑测试。
-#[cfg(not(windows))]
+#[cfg(all(not(windows), not(target_os = "macos")))]
 mod imp {
     use super::TextMetrics;
 
@@ -798,7 +803,7 @@ mod imp {
 // 非 Windows mock 文本渲染器的冒烟测试：验证 mock 的等宽近似测量契约
 // （字符数 × 字号 × 0.6）与 draw_text 空操作。
 // 边界：真实字形宽度/渲染由 Windows + DirectWrite 决定，**不在此覆盖，须 Windows 实测**。
-#[cfg(all(test, not(windows)))]
+#[cfg(all(test, not(windows), not(target_os = "macos")))]
 mod tests {
     use super::TextRenderer;
 
