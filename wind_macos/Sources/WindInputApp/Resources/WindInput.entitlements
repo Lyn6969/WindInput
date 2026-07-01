@@ -1,0 +1,24 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <!--
+        WindInput.entitlements
+
+        M2.1 阶段保守配置:
+        - App Sandbox 关闭. IMKit `.app` 装在 /Library/Input Methods/ 不强制沙盒,
+          一旦开启沙盒, Go 服务的 UDS (位于 ~/Library/Application Support/WindInput/)
+          需要 com.apple.security.temporary-exception.files.absolute-path.read-write
+          才能访问, 给用户带来额外摩擦. 后续 PR-A.5 M6 上架签名时再单独评估.
+        - hardened runtime 开启 (codesign 默认), 这里不放任何 disable-* 例外.
+    -->
+    <key>com.apple.security.app-sandbox</key>
+    <false/>
+
+    <!--
+        IMKit `.app` 默认会被系统作为代理拉起, 不需要 com.apple.security.network.client
+        (UDS 走文件系统不算网络). 如果未来 IMKit 进程需要查询 HTTPS (如 schema 更新),
+        在这里追加.
+    -->
+</dict>
+</plist>

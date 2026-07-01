@@ -1,0 +1,11 @@
+/* 本地化字符串 — 中文(简体).
+   系统设置 → 键盘 → 输入法 列表与 IME 菜单显示的名称都从这里取.
+   键名:
+     - CFBundleName / CFBundleDisplayName: Finder 与设置面板里的应用名
+     - <mode-id>: ComponentInputModeDict 中每个 mode 在 IME 切换菜单里的显示名
+*/
+
+CFBundleName        = "清风输入法";
+CFBundleDisplayName = "清风输入法";
+
+"to.feng.inputmethod.WindInput.mode" = "清风输入法";

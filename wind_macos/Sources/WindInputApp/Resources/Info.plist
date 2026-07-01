@@ -1,0 +1,151 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <!--
+        WithoutModes 结构 (镜像 ensan-hcl/macOS_IMKitSample_2021):
+        macOS 26 周期性 watchdog 只对"含 ComponentInputModeDict sub-mode 的 IME"
+        强制 Notarization 校验, 非 Notarized 会被静默清掉. WithoutModes (整个 IME
+        作为单一输入源) 放行 self-signed / ad-hoc / Personal Team Apple Development.
+        PR-A M2 只需一个输入模式, 中英切换在 IME 进程内部状态机做, 不用 IMK sub-mode.
+    -->
+
+    <key>CFBundleIdentifier</key>
+    <string>to.feng.inputmethod.WindInput</string>
+
+    <!-- CFBundleName 用中文「清风输入法」: 也是 .pkg 装包器向导标题的来源
+         (component pkg 标题取自主 bundle 的 CFBundleName + 版本). 不影响 IMK 注册
+         (连接名走 InputMethodConnectionName, 输入源名走 mode 的 TISIconLabels). -->
+    <key>CFBundleName</key>
+    <string>清风输入法</string>
+
+    <key>CFBundleDisplayName</key>
+    <string>清风输入法</string>
+
+    <key>CFBundleExecutable</key>
+    <string>WindInput</string>
+
+    <!-- 应用图标 (Finder / 安装器 / 关于面板). 由 wind_setting/build/appicon.png 经
+         sips+iconutil 生成 Resources/AppIcon.icns; 重生成命令见 scripts_mac/build/app.sh.
+         注: 菜单栏输入法图标另走 tsInputMethodIconFileKey (单色 PDF), 与此无关. -->
+    <key>CFBundleIconFile</key>
+    <string>AppIcon</string>
+
+    <key>CFBundlePackageType</key>
+    <string>APPL</string>
+
+    <key>CFBundleSignature</key>
+    <string>????</string>
+
+    <key>CFBundleShortVersionString</key>
+    <string>0.0.0</string>
+
+    <key>CFBundleVersion</key>
+    <string>0.0.0</string>
+
+    <key>CFBundleInfoDictionaryVersion</key>
+    <string>6.0</string>
+
+    <key>CFBundleDevelopmentRegion</key>
+    <string>zh-Hans</string>
+
+    <key>CFBundleLocalizations</key>
+    <array>
+        <string>zh-Hans</string>
+        <string>en</string>
+    </array>
+
+    <key>LSMinimumSystemVersion</key>
+    <string>12.0</string>
+
+    <!-- IMKit 后台 IME, 不显示 Dock 图标, 但能开 NSPanel (候选框).
+         不能设 LSBackgroundOnly: 它会切断窗口服务器连接, 导致候选框 NSPanel
+         无法显示 (参考 Squirrel 只设 LSUIElement). -->
+    <key>LSUIElement</key>
+    <true/>
+
+    <key>NSPrincipalClass</key>
+    <string>NSApplication</string>
+
+    <key>NSHumanReadableCopyright</key>
+    <string>Copyright © 2026 huanfeng</string>
+
+    <!--
+        IMKit 三必备字段:
+        - InputMethodConnectionName 必须等于 "$(CFBundleIdentifier)_Connection"
+          (Big Sur+ XPC handshake 强制约定)
+        - InputMethodServerControllerClass 是 IMKInputController 子类的 @objc 名
+        - tsInputMethodCharacterRepertoireKey 必须用 ISO 15924 四字母脚本码
+    -->
+    <key>InputMethodConnectionName</key>
+    <string>to.feng.inputmethod.WindInput_Connection</string>
+
+    <key>InputMethodServerControllerClass</key>
+    <string>WindInputController</string>
+
+    <key>tsInputMethodCharacterRepertoireKey</key>
+    <array>
+        <string>Hans</string>
+        <string>Latn</string>
+    </array>
+
+    <!--
+        顶层菜单栏图标 (Big Sur+). 单色 PDF 模板, 系统按浅/深色菜单栏自动反色.
+        Resources/ 同时提供 menu_icon_15.pdf (15pt 主), menu_icon_26.pdf (26pt Retina),
+        menu_icon.pdf (升级兼容, 等于 15pt). 参考 fcitx5-macos assets/CMakeLists.txt.
+    -->
+    <key>tsInputMethodIconFileKey</key>
+    <string>menu_icon.pdf</string>
+
+    <!--
+        ComponentInputModeDict (sub-mode) 结构: 系统设置 UI 只显示带 mode 的 IME
+        (Apple 自带 + 主流第三方都是 ModeEnabled+Mode, 不显示 WithoutModes 类型).
+
+        *不要* 在 mode 里写 tsInputModeDefaultStateKey=true (踩过的坑):
+        该键会让 mode 一注册就被标成「已启用」, 但这个启用态只活在运行期 TIS, 从不落进
+        用户的 AppleEnabledInputSources; 结果是「+ 添加输入法」列表(只列未启用项)把它过滤掉,
+        而主列表里也没有它 → 中英文分组下两头都看不见 (Tahoe 实测; Sequoia 旧版对此更宽松).
+        去掉该键后 mode 注册为「未启用」态, 正常出现在「+」列表里供用户手动添加.
+        (对照 fcitx5-macos assets: 其 mode dict 同样不带 default-state.)
+    -->
+    <key>ComponentInputModeDict</key>
+    <dict>
+        <key>tsInputModeListKey</key>
+        <dict>
+            <key>to.feng.inputmethod.WindInput.mode</key>
+            <dict>
+                <key>TISInputSourceID</key>
+                <string>to.feng.inputmethod.WindInput.mode</string>
+                <key>TISIntendedLanguage</key>
+                <string>zh-Hans</string>
+                <key>tsInputModeCharacterRepertoireKey</key>
+                <array>
+                    <string>Hans</string>
+                    <string>Latn</string>
+                </array>
+                <key>tsInputModeScriptKey</key>
+                <string>smUnicodeScript</string>
+                <key>tsInputModePrimaryInScriptKey</key>
+                <true/>
+                <key>tsInputModeKeyEquivalentModifiersKey</key>
+                <integer>0</integer>
+                <key>tsInputModeIsVisibleKey</key>
+                <true/>
+                <key>tsInputModeMenuIconFileKey</key>
+                <string>menu_icon.pdf</string>
+                <key>tsInputModeAlternateMenuIconFileKey</key>
+                <string>menu_icon.pdf</string>
+                <key>TISIconLabels</key>
+                <dict>
+                    <key>Primary</key>
+                    <string>清风输入法</string>
+                </dict>
+            </dict>
+        </dict>
+        <key>tsVisibleInputModeOrderedArrayKey</key>
+        <array>
+            <string>to.feng.inputmethod.WindInput.mode</string>
+        </array>
+    </dict>
+</dict>
+</plist>

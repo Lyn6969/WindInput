@@ -1,0 +1,463 @@
+import Cocoa
+import InputMethodKit
+import WindInputKit
+import Carbon.HIToolbox // IsSecureEventInputEnabled (密码框/安全输入检测)
+
+// InputController — IMKit 为每个文本框/会话实例化一个本类对象 (PR-1 设计 方案 A).
+//
+// M2.2-C/D 实装范围:
+//   - init 时连 bridge.sock (BridgeClient.connect, 失败仅 log 不抛)
+//   - handle(_:client:) 把 NSEvent 翻译成 KeyEvent 帧, 同步发送, 等响应
+//   - applyResponse 路由 Go 返回的 cmd, 真调 IMKTextInput 协议方法:
+//       * CmdCommitText (0x0101)        → client.insertText
+//       * CmdUpdateComposition (0x0102) → client.setMarkedText
+//       * CmdClearComposition (0x0103)  → setMarkedText("") + 状态清零
+//       * CmdCommitTextWithCursor (0x0106) → insertText + 光标偏移
+//       * CmdConsumed / CmdPassThrough / CmdAck → 控制流路由
+//   - CompositionState 跟踪本端最新 marked text + caret
+//
+// Commit 触发键路径 (M2.2-D, 与 Win 端 barrier 设计不同):
+//   Win TSF DLL 用 CmdCommitRequest (0x0104) 异步 barrier 解决 TSF race condition
+//   (用户在 IME 处理中快速按 commit 键导致 commit 文本与下一键错位).
+//   darwin IMKit handle 是同步的, 没有 race, **不需要 barrier 机制**, server_darwin.go
+//   dispatch 也没处理 CmdCommitRequest. 所以 darwin 上 Space/Enter/数字 1-9 选词
+//   直接走 CmdKeyEvent: Go HandleKeyEvent 识别 VK_SPACE/VK_RETURN/0x31-0x39 时
+//   直接返 CmdCommitText, 由 applyResponse 调 insertText. KeyHandler 已覆盖这些键
+//   的翻译 (NSEvent.keyCode 0x12-0x19 / 0x1D → VK 0x30-0x39, 0x24 → VK_RETURN,
+//   0x31 → VK_SPACE, 0x35 → VK_ESCAPE).
+//
+// 线程模型: IMKit 在主线程调用 handle, BridgeClient 阻塞 socket I/O.
+//   UDS roundtrip < 1ms, 用户感知不到. 未来改 async + barrier seq.
+@objc(WindInputController)
+public class InputController: IMKInputController {
+
+    // request 连接 I/O 超时 (毫秒): 服务卡死/重启时避免同步 readFrame 在 IMKit 主线程
+    // 无限阻塞 (表现为输入法整体无响应)。正常 UDS roundtrip <1ms; 超时后 catch →
+    // reconnect, 下一键用新连接自愈。push 连接不设此超时 (见 BridgeClient.ioTimeoutMs)。
+    private static let requestIOTimeoutMs = 2000
+
+    private var bridge: BridgeClient?
+    private var keySeq: UInt16 = 0
+    private let router = BridgeResponseRouter()
+    // 系统输入菜单 (点击菜单栏输入源图标弹出) 的统一菜单构建器。须持有 (虽 IMK 模式
+    // target=nil, 但每次 menu() 重建依赖此实例存活)。
+    private let imkMenuBuilder = UnifiedMenuBuilder()
+    private var composition: CompositionState { router.composition }
+    // 当前焦点 IMKit client, 供鼠标选词 push commit 路由 (见 applyPushResponse)。
+    private weak var currentClient: (IMKTextInput & NSObjectProtocol)?
+
+    // 修饰键单击 (tap) 检测: 按下某修饰键 → 抬起且其间无其它键 = tap, 发对应 VK 给
+    // Go 触发模式切换 (如 lshift 切中英)。macOS 修饰键走 .flagsChanged, 不是 keyDown。
+    private var pendingModVK: UInt32?    // 当前按住、待判定的修饰键 Win VK (nil=无)
+    private var pendingModSawOther = false // 修饰键按住期间是否出现过其它键 (→ 非 tap)
+
+    // 上次随 focusGained 上报给 Go 的系统安全输入(密码框)状态。handle 每键与系统实时值
+    // 比对, 翻转即补发 focusGained —— 补偿同一 IMKit client 内字段切换不触发 activateServer
+    // 的盲区(见 syncSecureInputIfChanged)。
+    private var lastReportedSecureInput = false
+
+    public override init!(server: IMKServer!, delegate: Any!, client inputClient: Any!) {
+        super.init(server: server, delegate: delegate, client: inputClient)
+
+        // 智能配对的宿主光标移动: kit 层 router 把意图上抛, 这里用 CGEvent 合成方向键。
+        // 主线程 async 执行, 确保排在本轮 insertText (宿主已处理) 之后再发方向键。
+        // 需辅助功能授权 (同命令直通车按键合成); 未授权则静默不动 (降级为不回退光标)。
+        router.moveHostCursor = { move in
+            DispatchQueue.main.async {
+                let (key, count): (String, Int)
+                switch move {
+                case .left(let n): (key, count) = ("left", n)
+                case .right(let n): (key, count) = ("right", n)
+                }
+                let combo = KeyComboPayload(key: key, modifiers: [])
+                for _ in 0..<max(0, min(count, 64)) {
+                    KeySynthesizer.tap(combo)
+                }
+            }
+        }
+
+        let path = BridgeEndpoints.requestSocket
+        do {
+            bridge = try BridgeClient(socketPath: path, ioTimeoutMs: Self.requestIOTimeoutMs)
+            NSLog("WindInput[InputController] bridge connected path=\(path)")
+        } catch {
+            NSLog("WindInput[InputController] bridge connect FAILED path=\(path) err=\(error)")
+            bridge = nil
+        }
+    }
+
+    deinit {
+        bridge?.close()
+    }
+
+    // MARK: - IMKit 生命周期 (激活/失活)
+
+    /// IME 获得某 client 焦点时由系统调用。发 FocusGained 让 Go 端置 imeActivated=true,
+    /// 从而驱动工具栏 reducer 显示模式指示器 (CmdModeStatus → 菜单栏)。
+    public override func activateServer(_ sender: Any!) {
+        super.activateServer(sender)
+        currentClient = sender as? (IMKTextInput & NSObjectProtocol)
+        CandidatePanelHost.shared.activeResponder = self
+        // 激活即确保连上 (装完首次激活 / 重启后并发竞态时 init 那次可能没连上)。
+        ensureConnected()
+        sendFocusGained()
+    }
+
+    /// IME 失去焦点 (切到别的输入法/应用) 时由系统调用。发 FocusLost 让 Go 端
+    /// 置 imeActivated=false, reducer 隐藏指示器。
+    public override func deactivateServer(_ sender: Any!) {
+        // 失焦即清干净: 若仍有嵌入编码 (marked text) 未提交, 主动抹掉残留并清本端
+        // composition 状态。否则切到别的文本框时旧 marked text 会残留 (macOS 不会
+        // 像 Win TSF 那样自动收回), 且与 Go 端不一致 (HandleFocusLost 对普通焦点切换
+        // 已 clearState 清空 inputBuffer)。两端一致后, 切回该文本框是全新一轮输入。
+        // 必须在 super.deactivateServer 之前做: 此时 sender client 仍可接收 setMarkedText。
+        if !composition.isEmpty {
+            let imkClient = sender as? IMKTextInput
+            let adapter = imkClient.map { IMKClientAdapter(imkClient: $0) }
+            router.applyClearComposition(client: adapter)
+        }
+        sendEmpty(UpstreamCmd.focusLost)
+        super.deactivateServer(sender)
+    }
+
+    /// 发 FocusGained 帧, 携带 InputScope bitmask。读掉 ack, 失败仅 log。
+    ///
+    /// 密码框适配 (对齐 Win 36614ae): macOS 焦点进入密码框/NSSecureTextField 时, AppKit
+    /// 会启用系统"安全输入" (IsSecureEventInputEnabled 返回真; 浏览器 <input type=password>
+    /// 同样置位)。命中即把 InputScope 置上 IS_PASSWORD 位 (TSF 枚举 31), Go 端 coordinator
+    /// 据此对密码框强制英文半角直通 (sensitiveFieldActive), 与 Win 端共用同一套判定逻辑。
+    /// 非密码框时 mask=0, 行为与原空帧一致。
+    private func sendFocusGained() {
+        guard let bridge = bridge, bridge.isConnected else { return }
+        // 读系统安全输入状态并记录, 供 handle 每键比对 (见 syncSecureInputIfChanged)。
+        let secure = IsSecureEventInputEnabled()
+        lastReportedSecureInput = secure
+        let mask: UInt64 = secure ? Self.inputScopePasswordBit : 0
+        do {
+            try bridge.send(BinaryCodec.encodeFocusGainedFrame(inputScopeMask: mask))
+            _ = try bridge.readFrame()
+        } catch {
+            NSLog("WindInput[sendFocusGained] io error: \(error)")
+            reconnect()
+        }
+    }
+
+    /// IS_PASSWORD 位 (TSF InputScope 枚举 31) 的 bitmask, 与 Go coordinator 的
+    /// inputScopePassword 常量对齐。
+    private static let inputScopePasswordBit: UInt64 = UInt64(1) << 31
+
+    /// 每键检测系统安全输入(密码框)状态是否相对上次上报发生翻转, 变化则补发一帧
+    /// focusGained 同步 Go 端 sensitiveFieldActive。
+    ///
+    /// 为何需要: macOS IMKit 的 activateServer 是「输入法 ↔ 某 client」级别的激活, 而浏览器
+    /// 整个网页是单个 client —— 网页内普通框 ↔ 密码框的字段切换**不**触发 activateServer,
+    /// 只在激活时检测会漏掉(表现: 第二次进密码框不再抑制)。IsSecureEventInputEnabled 是
+    /// 全局实时状态, 随密码框聚焦翻转, 故在每个 keyDown 前比对补偿。轻量系统调用, 每键一次。
+    private func syncSecureInputIfChanged() {
+        if IsSecureEventInputEnabled() != lastReportedSecureInput {
+            sendFocusGained()
+        }
+    }
+
+    /// 发一个无 payload 的上行帧 (focusLost/toggleMode 等), 读掉 ack。失败仅 log。
+    private func sendEmpty(_ cmd: UInt16) {
+        guard let bridge = bridge, bridge.isConnected else { return }
+        do {
+            try bridge.send(BinaryCodec.encodeEmptyFrame(cmd: cmd))
+            _ = try bridge.readFrame()
+        } catch {
+            NSLog("WindInput[sendEmpty] cmd=\(cmd) io error: \(error)")
+            reconnect()
+        }
+    }
+
+    // MARK: - 修饰键 tap (Shift/Ctrl 单击切换模式)
+
+    /// 处理 .flagsChanged: 修饰键按下记录待判定; 抬起且其间无其它键 = tap, 发 VK 给 Go。
+    private func handleFlagsChanged(_ event: NSEvent, client sender: Any!) {
+        guard let (vk, mask) = Self.modifierInfo(forKeyCode: event.keyCode) else {
+            pendingModVK = nil
+            return
+        }
+        let pressed = (event.modifierFlags.rawValue & mask) != 0
+        if pressed {
+            pendingModVK = vk
+            pendingModSawOther = false
+        } else {
+            if pendingModVK == vk && !pendingModSawOther {
+                sendModifierTap(vk, sender: sender)
+            }
+            pendingModVK = nil
+        }
+    }
+
+    /// mac keyCode → (Win VK, NSEvent.ModifierFlags 掩码)。仅可作模式切换的修饰键。
+    private static func modifierInfo(forKeyCode kc: UInt16) -> (UInt32, UInt)? {
+        switch kc {
+        case 56: return (0xA0, NSEvent.ModifierFlags.shift.rawValue)   // 左 Shift → VK_LSHIFT
+        case 60: return (0xA1, NSEvent.ModifierFlags.shift.rawValue)   // 右 Shift → VK_RSHIFT
+        case 59: return (0xA2, NSEvent.ModifierFlags.control.rawValue) // 左 Ctrl → VK_LCONTROL
+        case 62: return (0xA3, NSEvent.ModifierFlags.control.rawValue) // 右 Ctrl → VK_RCONTROL
+        default: return nil
+        }
+    }
+
+    /// 发一个修饰键 VK 的 KeyEvent (eventType=down) 给 Go, 触发模式切换; 应用其响应。
+    private func sendModifierTap(_ vk: UInt32, sender: Any!) {
+        guard let bridge = bridge, bridge.isConnected else { return }
+        // 模式切换 (Shift/Ctrl tap) 通常无 composition, 先刷新 caret 让状态气泡锚到当前
+        // 插入点 (否则会显示在上一次组字的旧位置)。
+        sendCaretUpdateIfAvailable(client: sender as? IMKTextInput)
+        keySeq &+= 1
+        let frame = BinaryCodec.encodeKeyEventFrame(KeyEventPayload(
+            keyCode: vk, scanCode: 0, modifiers: 0, eventType: .down, eventSeq: keySeq, prevChar: 0))
+        do {
+            try bridge.send(frame)
+            let resp = try bridge.readFrame()
+            _ = applyResponse(resp, sender: sender)
+        } catch {
+            NSLog("WindInput[modTap] vk=\(vk) io error: \(error)")
+            reconnect()
+        }
+    }
+
+    // MARK: - IMKit hook
+
+    /// 告诉 IMKit 本输入法要接收哪些事件。默认只有 keyDown; 必须显式加 flagsChanged
+    /// 才能收到修饰键 (Shift/Ctrl) 变化, 做单击切换检测。
+    public override func recognizedEvents(_ sender: Any!) -> Int {
+        return Int(NSEvent.EventTypeMask.keyDown.rawValue | NSEvent.EventTypeMask.flagsChanged.rawValue)
+    }
+
+    // MARK: - 系统输入菜单 (点击菜单栏输入源图标弹出)
+
+    /// IMKit 在「文本输入菜单」需要绘制时调用 (每次打开都会问一次, 故可动态反映当前状态)。
+    /// 返回的菜单项会被系统追加到输入源列表下方 —— 这是标准 Mac 输入法的菜单接入方式
+    /// (Rime/Squirrel、搜狗等同此), 复用与候选框右键、菜单栏指示器完全一致的统一菜单树。
+    ///
+    /// 派发: 系统输入菜单由 IMK 在另一上下文绘制, 选中项经 doCommandBySelector 回到本进程,
+    /// 故菜单项 target=nil + action=imkMenuCommand:, 菜单 id 经 NSMenuItem.tag 回传。
+    public override func menu() -> NSMenu! {
+        guard let items = CandidatePanelHost.shared.unifiedMenuItems(), !items.isEmpty else {
+            return imkFallbackMenu()
+        }
+        return imkMenuBuilder.build(items, dispatch: .imkCommand(action: #selector(imkMenuCommand(_:))))
+    }
+
+    /// 统一菜单项被选中: IMK 经 doCommandBySelector 调用本方法, sender 是 infoDictionary
+    /// (含 kIMKCommandMenuItemName = 被点的 NSMenuItem)。读其 tag (统一菜单 id) 回发
+    /// CmdMenuAction, 由 Go 端 handleUnifiedMenuAction 派发, 与其它两处菜单同一路径。
+    @objc public func imkMenuCommand(_ sender: Any!) {
+        guard let info = sender as? NSDictionary,
+              let item = info[kIMKCommandMenuItemName as Any] as? NSMenuItem else { return }
+        CandidatePanelHost.shared.sendMenuAction(item.tag)
+    }
+
+    /// 服务不可达时的兜底菜单: 仅「设置…」(直接拉起设置应用, 不依赖 Go)。避免空菜单。
+    private func imkFallbackMenu() -> NSMenu {
+        let menu = NSMenu()
+        menu.autoenablesItems = false
+        let item = NSMenuItem(title: "设置…", action: #selector(imkOpenSettings(_:)), keyEquivalent: "")
+        item.target = nil
+        menu.addItem(item)
+        return menu
+    }
+
+    @objc public func imkOpenSettings(_ sender: Any!) {
+        ModeStatusController.shared.openSettings(page: "")
+    }
+
+    public override func handle(_ event: NSEvent!, client sender: Any!) -> Bool {
+        guard let event = event else { return false }
+
+        // 记录当前焦点 client + 把自己登记为 active responder, 让鼠标选词的
+        // push 通道 commit (CandidatePanelHost 收到) 能路由回这个文本框。
+        currentClient = sender as? (IMKTextInput & NSObjectProtocol)
+        CandidatePanelHost.shared.activeResponder = self
+
+        // 修饰键变化 (Shift/Ctrl 等): 做 tap 检测, 不消费事件本身。
+        if event.type == .flagsChanged {
+            handleFlagsChanged(event, client: sender)
+            return false
+        }
+        guard event.type == .keyDown else { return false }
+        // 任意真实按键出现 → 取消当前修饰键 tap 判定 (Shift+X 不算 tap)。
+        pendingModSawOther = true
+        guard ensureConnected(), let bridge = bridge else {
+            NSLog("WindInput[handle] bridge not connected (重连失败), pass through")
+            return false
+        }
+
+        // 密码框实时跟随: 在发本键前同步系统安全输入状态(同一 client 内字段切换补偿),
+        // 让 Go 处理本键时 sensitiveFieldActive 已最新(密码框→英文直通 / 普通框→恢复中文)。
+        // 同连接串行: 补发的 focusGained 必先于本 keyEvent 被 Go 处理, 顺序正确。
+        syncSecureInputIfChanged()
+
+        keySeq &+= 1
+        guard let frame = KeyHandler.encodeKeyEvent(event, seq: keySeq) else {
+            return false
+        }
+
+        // 无 composition 时本端 caret 可能是上一次组字的旧位置 (换行/移动光标后未更新)。
+        // 处理本键前先刷新一次, 让 Go 的状态气泡/首帧候选锚到当前真实插入点。
+        // 组字中 caret 由下方 (composition 非空) 分支持续更新, 无需在此重复。
+        if composition.isEmpty {
+            sendCaretUpdateIfAvailable(client: sender as? IMKTextInput)
+        }
+
+        do {
+            return try sendAndApply(frame, on: bridge, sender: sender)
+        } catch {
+            // 服务重启/卡死后这条连接已死 (write→EPIPE 或 read→EOF/超时)。重连到新服务
+            // 并**用新连接重试当前键一次**, 让服务重启后第一个键就自愈, 不丢字、不需手动
+            // 重启前端。重连或重试仍失败 (如服务尚在重启窗口未就绪) 才透传, 下一键再试。
+            NSLog("WindInput[handle] bridge io error: \(error), 重连后重试本键")
+            reconnect()
+            // 注意: 上方 guard 把属性 bridge 遮蔽为非可选局部量, 这里须取重连后的 self.bridge。
+            guard let fresh = self.bridge else { return false }
+            do {
+                return try sendAndApply(frame, on: fresh, sender: sender)
+            } catch {
+                NSLog("WindInput[handle] 重连后重试仍失败: \(error)")
+                return false
+            }
+        }
+    }
+
+    /// 在指定连接上发一帧、读响应并应用; composition 非空时上报 caret。
+    /// 抽出供 handle 的「首发 + 重连重试」两条路径共用。
+    private func sendAndApply(_ frame: Data, on bridge: BridgeClient, sender: Any?) throws -> Bool {
+        try bridge.send(frame)
+        let resp = try bridge.readFrame()
+        let consumed = applyResponse(resp, sender: sender)
+        // M2.2-E: composition 启动/更新后, 上报当前 caret 屏幕位置给 Go,
+        // 让候选框/Toast/光标跟随有正确锚点. 仅在 marked text 非空时发。
+        if !composition.isEmpty {
+            sendCaretUpdateIfAvailable(client: sender as? IMKTextInput)
+        }
+        return consumed
+    }
+
+    // MARK: - Caret update (M2.2-E)
+
+    /// 从 IMKTextInput 拿 caret 屏幕坐标, 转换为 wire top-left 坐标后发 CmdCaretUpdate.
+    /// 不抛错, 失败仅 log.
+    internal func sendCaretUpdateIfAvailable(client: IMKTextInput?) {
+        guard let client = client, let bridge = bridge, bridge.isConnected else { return }
+
+        // 优先取真实光标所在行 rect（markedRange 组字中 / selectedRange 非组字）。
+        var rect = NSRect.zero
+        let markedRange = client.markedRange()
+        let loc: Int
+        if markedRange.location != NSNotFound {
+            loc = markedRange.location
+        } else {
+            let sel = client.selectedRange()
+            loc = sel.location != NSNotFound ? sel.location : 0
+        }
+        _ = client.attributes(forCharacterIndex: loc, lineHeightRectangle: &rect)
+
+        // 备用 1: 部分 app 仅支持 index=0 查询（如某些 NSTextField 实现）。
+        if rect.size.height == 0 && loc != 0 {
+            _ = client.attributes(forCharacterIndex: 0, lineHeightRectangle: &rect)
+        }
+        // 备用 2: attributes API 完全不可用时，用鼠标光标位置近似 caret 位置。
+        // 比固定 (0,0) 好：至少候选框不会卡在屏幕左上角。
+        if rect.size.height == 0 {
+            let mouse = NSEvent.mouseLocation  // Cocoa bottom-left 屏幕坐标
+            rect = NSRect(x: mouse.x, y: mouse.y, width: 1, height: 16)
+        }
+
+        let screen = NSScreen.main ?? NSScreen.screens.first
+        let screenHeight = screen?.frame.height ?? 0
+        guard screenHeight > 0 else { return }
+
+        let (x, y, h) = CaretCoords.caretRectToWire(rect, screenHeight: screenHeight)
+        let frame = BinaryCodec.encodeCaretUpdateFrame(x: x, y: y, height: h)
+        do {
+            try bridge.send(frame)
+            _ = try bridge.readFrame()   // 服务端一律返 ack，必须读掉避免堆积
+        } catch {
+            NSLog("WindInput[caretUpdate] send/read error: \(error)")
+        }
+    }
+
+    // MARK: - Response routing
+
+    /// 把 Go 返回的 bridge 帧路由到 IMKTextInput 协议方法. 委托给 BridgeResponseRouter
+    /// (在 WindInputKit 里, 不依赖 IMKit, 便于 swift test 用 mock 驱动).
+    internal func applyResponse(_ frame: Frame, sender: Any?) -> Bool {
+        let imkClient = sender as? IMKTextInput
+        let adapter = imkClient.map { IMKClientAdapter(imkClient: $0) }
+        return router.apply(frame, to: adapter)
+    }
+
+    /// 应用 push 通道帧 (鼠标选词的 commit/composition 异步到达, 非 KeyEvent 同步响应)。
+    /// 路由到当前焦点 client。在主线程调用 (CandidatePanelHost 已 dispatch)。
+    public func applyPushResponse(_ frame: Frame) {
+        guard let client = currentClient else {
+            NSLog("WindInput[applyPushResponse] no current client, drop cmd=\(frame.cmd)")
+            return
+        }
+        _ = router.apply(frame, to: IMKClientAdapter(imkClient: client))
+        if !composition.isEmpty {
+            sendCaretUpdateIfAvailable(client: client)
+        }
+    }
+
+    // MARK: - IMKit Adapter (把 IMKTextInput 桥接到 TextInputClient)
+
+    /// IMKTextInput → TextInputClient 的适配器, 让 BridgeResponseRouter (在
+    /// WindInputKit 不依赖 IMKit 的子库里) 也能调到 IMKit 真客户端.
+    private final class IMKClientAdapter: TextInputClient {
+        let imkClient: IMKTextInput
+        init(imkClient: IMKTextInput) { self.imkClient = imkClient }
+
+        func insertText(_ text: String, replacementRange: NSRange) {
+            imkClient.insertText(text, replacementRange: replacementRange)
+        }
+        func setMarkedText(_ text: String, selectionRange: NSRange, replacementRange: NSRange) {
+            imkClient.setMarkedText(text, selectionRange: selectionRange, replacementRange: replacementRange)
+        }
+        func selectedRange() -> NSRange {
+            imkClient.selectedRange()
+        }
+    }
+
+    // MARK: - Reconnect
+
+    /// 确保 bridge 已连接; 未连/断开则尝试 (重)连, 返回是否已连。
+    ///
+    /// 必要性 (实测): IME 的 InputController 在 Go 服务 socket 就绪前被创建 (装完首次激活,
+    /// 尤其重启后 IME 随登录自启与服务 LaunchAgent RunAtLoad 并发) 时, init() 那次连接会
+    /// 失败 → bridge=nil → 此后该实例所有按键直通英文且不重试 (得切走再切回让 IMKit 新建
+    /// 实例才会重连)。这里在 activate/handle 入口懒重连让同一实例自愈, 免去手动切换。
+    /// 已连时是廉价 no-op, 不影响正常路径。
+    @discardableResult
+    private func ensureConnected() -> Bool {
+        if let b = bridge, b.isConnected { return true }
+        bridge?.close()
+        do {
+            bridge = try BridgeClient(socketPath: BridgeEndpoints.requestSocket, ioTimeoutMs: Self.requestIOTimeoutMs)
+            NSLog("WindInput[ensureConnected] bridge (重)连成功")
+            return true
+        } catch {
+            bridge = nil
+            return false
+        }
+    }
+
+    private func reconnect() {
+        bridge?.close()
+        bridge = nil
+        do {
+            bridge = try BridgeClient(socketPath: BridgeEndpoints.requestSocket, ioTimeoutMs: Self.requestIOTimeoutMs)
+            NSLog("WindInput[reconnect] bridge reconnected")
+        } catch {
+            NSLog("WindInput[reconnect] still down: \(error)")
+        }
+    }
+}
+
+// PushResponder: 让 CandidatePanelHost 能把 push 通道 commit 路由到此 controller。
+extension InputController: PushResponder {}
