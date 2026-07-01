@@ -17,7 +17,7 @@
 #   m1 / dm1     仅 tsf (x64+x86)            release / dev
 #   m2 / dm2     仅 wind_input (核心 exe)     release / dev
 #   p1 / pd1     系统安装全部 (release / dev): 复制 + 注册 TSF + 开机自启 + 启动服务
-#   u1 / ud1     系统卸载全部 (release / dev): 反注册 + 移出输入法列表 + 移除自启 + 删目录
+#   u1/u / ud1/ud  系统卸载全部 (release / dev): 反注册 + 移出输入法列表 + 移除自启 + 删目录
 #   pm1 / pm2    系统安装单模块 (tsf / 核心, release)
 #   pdm1 / pdm2  系统安装单模块 (dev)
 #   8  / d8      生成安装包 (release / dev): 全构建 + wind-installer 打包 → dist\*-Setup.exe
@@ -396,11 +396,9 @@ function Test-Admin {
 
 # 部署命令 → 目标安装目录; 非部署命令返回 $null (兼作"是否部署命令"判断)。
 function Deploy-TargetForCmd ([string]$cmd) {
-    switch ($cmd) {
-        { $_ -in "p1", "pm1", "pm2", "u1" }    { $DeployDirRelease; break }
-        { $_ -in "pd1", "pdm1", "pdm2", "ud1" } { $DeployDirDev;   break }
-        default { $null }
-    }
+    if (@("p1","pm1","pm2","u1","u") -contains $cmd)           { return $DeployDirRelease }
+    if (@("pd1","pdm1","pdm2","ud1","ud") -contains $cmd)      { return $DeployDirDev }
+    return $null
 }
 
 # 系统安装(注册 COM/icacls/字体)始终需管理员。非管理员执行部署命令时自动 UAC 提权。
@@ -879,7 +877,7 @@ function Show-Menu {
     Write-Host "`n  系统安装 / 卸载 (注册 TSF + 开机自启 + 默认启用, 自动提权):" -ForegroundColor Yellow
     Write-Host "    p1   安装全部 (release)        pd1   安装全部 (dev)"
     Write-Host "    pm1/pm2  安装模块(tsf/核心)    pdm1/pdm2 (dev)"
-    Write-Host "    u1   卸载全部 (release)        ud1   卸载全部 (dev)"
+    Write-Host "    u1/u  卸载全部 (release)        ud1/ud  卸载全部 (dev)"
     Write-Host "      release → $DeployDirRelease" -ForegroundColor DarkGray
     Write-Host "      dev     → $DeployDirDev" -ForegroundColor DarkGray
     Write-Host "`n  安装包 (调用兄弟项目 wind-installer 打包):" -ForegroundColor Yellow
@@ -899,8 +897,8 @@ function Show-Menu {
 # 返回 127 = 未知命令 (区别于命令执行失败)。
 function Dispatch ([string]$cmd, [string]$arg) {
     switch ($cmd) {
-        { $_ -in "1", "release" }      { if (Do-Full release) { 0 } else { 1 }; break }
-        { $_ -in "d1", "dev" }       { if (Do-Full dev)   { 0 } else { 1 }; break }
+        { $_ -in @("1", "release") }        { if (Do-Full release) { 0 } else { 1 }; break }
+        { $_ -in @("d1", "dev") }           { if (Do-Full dev)   { 0 } else { 1 }; break }
         "m1"   { if (Build-TsfAll   release) { 0 } else { 1 }; break }
         "dm1"  { if (Build-TsfAll   dev)   { 0 } else { 1 }; break }
         "m2"   { if (Build-Core     release) { 0 } else { 1 }; break }
@@ -913,21 +911,23 @@ function Dispatch ([string]$cmd, [string]$arg) {
         "pm2"  { if (Deploy-Module release core) { 0 } else { 1 }; break }
         "pdm1" { if (Deploy-Module dev tsf)    { 0 } else { 1 }; break }
         "pdm2" { if (Deploy-Module dev core)   { 0 } else { 1 }; break }
+        "u"    { if (Uninstall-Full release) { 0 } else { 1 }; break }
         "u1"   { if (Uninstall-Full release) { 0 } else { 1 }; break }
+        "ud"   { if (Uninstall-Full dev)   { 0 } else { 1 }; break }
         "ud1"  { if (Uninstall-Full dev)   { 0 } else { 1 }; break }
-        { $_ -in "8", "installer" }     { if (Do-Installer release $false) { 0 } else { 1 }; break }
-        "8s"                            { if (Do-Installer release $true)  { 0 } else { 1 }; break }
-        { $_ -in "d8", "installer-dev" } { if (Do-Installer dev $false)   { 0 } else { 1 }; break }
-        "d8s"                           { if (Do-Installer dev $true)     { 0 } else { 1 }; break }
-        { $_ -in "k", "check" }   { Do-Check;  $LASTEXITCODE; break }
-        { $_ -in "l", "clippy" }  { Do-Clippy; $LASTEXITCODE; break }
-        { $_ -in "t", "test" }    { Do-Test;   $LASTEXITCODE; break }
-        { $_ -in "f", "fmt" }     { Do-Fmt;    $LASTEXITCODE; break }
-        "fmt-check"               { Do-FmtCheck; $LASTEXITCODE; break }
-        "ci"                      { if (Do-Ci) { 0 } else { 1 }; break }
-        "clean"                   { Do-Clean;  $LASTEXITCODE; break }
-        { $_ -in "gd", "gen-data" } { if (Do-GenData) { 0 } else { 1 }; break }
-        { $_ -in "r", "repl" }    { Do-Repl $arg; 0; break }
+        { $_ -in @("8", "installer") }       { if (Do-Installer release $false) { 0 } else { 1 }; break }
+        "8s"                                 { if (Do-Installer release $true)  { 0 } else { 1 }; break }
+        { $_ -in @("d8", "installer-dev") }  { if (Do-Installer dev $false)   { 0 } else { 1 }; break }
+        "d8s"                                { if (Do-Installer dev $true)     { 0 } else { 1 }; break }
+        { $_ -in @("k", "check") }   { Do-Check;  $LASTEXITCODE; break }
+        { $_ -in @("l", "clippy") }  { Do-Clippy; $LASTEXITCODE; break }
+        { $_ -in @("t", "test") }    { Do-Test;   $LASTEXITCODE; break }
+        { $_ -in @("f", "fmt") }     { Do-Fmt;    $LASTEXITCODE; break }
+        "fmt-check"                  { Do-FmtCheck; $LASTEXITCODE; break }
+        "ci"                         { if (Do-Ci) { 0 } else { 1 }; break }
+        "clean"                      { Do-Clean;  $LASTEXITCODE; break }
+        { $_ -in @("gd", "gen-data") }  { if (Do-GenData) { 0 } else { 1 }; break }
+        { $_ -in @("r", "repl") }       { Do-Repl $arg; 0; break }
         default { 127 }
     }
 }
@@ -940,7 +940,8 @@ function Menu-Loop {
         if ($raw.ToLower() -eq "q") { return }
 
         # 支持空格分隔的连续命令: "d1 pd1" → 依次执行, 前者失败则停止
-        $tokens = $raw.ToLower() -split '\s+' | Where-Object { $_ -ne "" }
+        # @() 强制包装: 单 token 时 Where-Object 返回标量字符串, 索引会取字符而非词
+        $tokens = @($raw.ToLower() -split '\s+' | Where-Object { $_ -ne "" })
         $i = 0
         $anyFailed = $false
         $needPause = $false   # UAC 成功时输出已内联显示, 无需额外暂停
@@ -948,7 +949,7 @@ function Menu-Loop {
             $choice = $tokens[$i]
             $choiceArg = ""
             # repl 命令后一个 token 为数据路径 (非命令)
-            if ($choice -in "r", "repl") {
+            if ($choice -eq "r" -or $choice -eq "repl") {
                 $i++
                 if ($i -lt $tokens.Count) { $choiceArg = $tokens[$i] }
             }
@@ -958,11 +959,12 @@ function Menu-Loop {
                 $rc = Dispatch $choice $choiceArg
                 if ($rc -eq 127) { ErrMsg "无效选项: $choice"; $anyFailed = $true }
                 elseif ($rc -ne 0) { ErrMsg "`n命令 '$choice' 失败 (退出码 $rc)"; $anyFailed = $true }
+            } elseif ($el -eq "done") {
+                $needPause = $true   # UAC 子进程输出已内联显示, 暂停让用户阅读
             } elseif ($el -eq "fail") {
                 $needPause = $true   # 提权失败/被取消, 需暂停让用户看到错误
                 $anyFailed = $true
             }
-            # $el -eq "done": UAC 提权成功, 输出已内联显示, 不额外暂停
             $i++
         }
         if ($needPause) { Write-Host ""; Write-Host "按回车继续..." -NoNewline; Read-Host | Out-Null }
@@ -978,20 +980,20 @@ if ($allCmds.Count -eq 0) { Menu-Loop; return }
 $firstCmd = $allCmds[0].Trim().ToLower()
 
 # help
-if ($firstCmd -in "-h", "--help", "help") {
+if ($firstCmd -eq "-h" -or $firstCmd -eq "--help" -or $firstCmd -eq "help") {
     Get-Content $PSCommandPath | Where-Object { $_ -match '^#' } | ForEach-Object { $_ -replace '^# ?', '' }
     return
 }
 
 # menu (显式)
-if ($firstCmd -in "menu") { Menu-Loop; return }
+if ($firstCmd -eq "menu") { Menu-Loop; return }
 
 # 按序执行所有命令; repl 后一个参数为数据路径
 $i = 0
 while ($i -lt $allCmds.Count) {
     $cmd = $allCmds[$i].Trim().ToLower()
     $arg = ""
-    if ($cmd -in "r", "repl") {
+    if ($cmd -eq "r" -or $cmd -eq "repl") {
         $i++
         if ($i -lt $allCmds.Count) { $arg = $allCmds[$i] }
     }
