@@ -317,25 +317,38 @@ pub struct PinyinFrequency {
 }
 
 /// 码表自动造词（[schema.codetable.auto_phrase]）。
-#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct AutoPhraseConfig {
     #[serde(default)]
     pub enabled: bool,
-    #[serde(default)]
+    /// 造词最小字数（默认 2；设置页隐藏）。
+    #[serde(default = "default_phrase_min_len")]
     pub min_phrase_len: usize,
-    #[serde(default)]
+    /// 造词最大字数（默认 10；设置页隐藏）。
+    #[serde(default = "default_phrase_max_len")]
     pub max_phrase_len: usize,
-    #[serde(default)]
-    pub add_weight: i32,
-    #[serde(default)]
-    pub weight_delta: i32,
-    #[serde(default)]
-    pub count_threshold: u32,
-    #[serde(default)]
-    pub idle_timeout_ms: u64,
     /// 临时词晋升所需使用次数（原 learning.temp_promote_count）。
     #[serde(default)]
     pub promote_count: usize,
+}
+
+fn default_phrase_min_len() -> usize {
+    2
+}
+
+fn default_phrase_max_len() -> usize {
+    10
+}
+
+impl Default for AutoPhraseConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            min_phrase_len: default_phrase_min_len(),
+            max_phrase_len: default_phrase_max_len(),
+            promote_count: 0,
+        }
+    }
 }
 
 /// 拼音自动造词（[schema.pinyin.auto_learn]）。
@@ -343,14 +356,9 @@ pub struct AutoPhraseConfig {
 pub struct AutoLearnConfig {
     #[serde(default)]
     pub enabled: bool,
-    #[serde(default)]
-    pub count_threshold: u32,
+    /// 造词最小字数（默认 0=回退 2）。
     #[serde(default)]
     pub min_word_length: usize,
-    #[serde(default)]
-    pub weight_delta: i32,
-    #[serde(default)]
-    pub add_weight: i32,
     /// 临时词晋升所需使用次数（原 learning.temp_promote_count）。
     #[serde(default)]
     pub promote_count: usize,

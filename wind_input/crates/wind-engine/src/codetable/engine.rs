@@ -157,6 +157,18 @@ impl Engine for CodeTableEngine {
         EngineType::CodeTable
     }
 
+    fn max_code_length(&self) -> usize {
+        self.max_code_length
+    }
+
+    fn has_full_input_match(&self, input: &str) -> bool {
+        CodeTableEngine::has_full_input_match(self, input)
+    }
+
+    fn has_longer_code(&self, input: &str) -> bool {
+        CodeTableEngine::has_longer_code(self, input)
+    }
+
     /// 顶码上屏（对齐 Go HandleTopCode）：超过满码长 + 整串无精确匹配 + 无更长后继时，
     /// 取前 max_code_length 码的首选上屏，返回 (上屏文本, 剩余编码)。
     fn handle_top_code(&self, input: &str) -> Option<(String, String)> {

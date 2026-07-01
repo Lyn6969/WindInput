@@ -39,6 +39,18 @@ impl Coordinator {
         if state.committed_segs.len() < 2 {
             return;
         }
+        // 自动造词闸门：拼音方案读 [pinyin.auto_learn]，码表/混输读有效 [codetable.auto_phrase]
+        // （混输继承主码表行为）。开关关闭直接跳过；min_len 为造词最小字数（0 回退 2）。
+        let (enabled, min_len) = if self.engine_mgr.is_pinyin() {
+            let al = self.engine_mgr.auto_learn_settings();
+            (al.enabled, al.min_word_length)
+        } else {
+            let ap = self.engine_mgr.codetable_settings().auto_phrase;
+            (ap.enabled, ap.min_phrase_len)
+        };
+        if !enabled {
+            return;
+        }
         let code: String = state
             .committed_segs
             .iter()
@@ -49,7 +61,8 @@ impl Coordinator {
             .iter()
             .map(|(_, t)| t.as_str())
             .collect();
-        if text.chars().count() < 2 || code.is_empty() {
+        let min_len = if min_len == 0 { 2 } else { min_len };
+        if text.chars().count() < min_len || code.is_empty() {
             return;
         }
         let Some(store) = &self.store else { return };

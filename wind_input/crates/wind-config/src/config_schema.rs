@@ -78,10 +78,6 @@ static REGISTRY: &[ConfigField] = &[
     f("schema.codetable.auto_phrase.enabled", Bool),
     f("schema.codetable.auto_phrase.min_phrase_len", Int),
     f("schema.codetable.auto_phrase.max_phrase_len", Int),
-    f("schema.codetable.auto_phrase.add_weight", Int),
-    f("schema.codetable.auto_phrase.weight_delta", Int),
-    f("schema.codetable.auto_phrase.count_threshold", Int),
-    f("schema.codetable.auto_phrase.idle_timeout_ms", Int),
     f("schema.codetable.auto_phrase.promote_count", Int),
     // 全局拼音
     f("schema.pinyin.show_code_hint", Bool),
@@ -104,10 +100,7 @@ static REGISTRY: &[ConfigField] = &[
     f("schema.pinyin.frequency.base_scale", Float),
     f("schema.pinyin.frequency.recency_peak", Float),
     f("schema.pinyin.auto_learn.enabled", Bool),
-    f("schema.pinyin.auto_learn.count_threshold", Int),
     f("schema.pinyin.auto_learn.min_word_length", Int),
-    f("schema.pinyin.auto_learn.weight_delta", Int),
-    f("schema.pinyin.auto_learn.add_weight", Int),
     f("schema.pinyin.auto_learn.promote_count", Int),
     // 全局混输（融合策略）
     f("schema.mix.show_source_hint", Bool),

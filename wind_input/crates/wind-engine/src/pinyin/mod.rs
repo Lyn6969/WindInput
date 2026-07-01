@@ -121,6 +121,23 @@ impl PinyinEngine {
         self.dict.len()
     }
 
+    /// 从起始位置贪心切出连续完整音节（每步取最长匹配），返回 (音节序列, 结束字节位置)。
+    /// 对齐 Go `ContiguousCompletedFromStart`：遇到无完整音节即停（残缺尾部不计入）。
+    fn contiguous_completed_from_start(&self, prefix: &str) -> (Vec<String>, usize) {
+        let mut syllables = Vec::new();
+        let mut pos = 0;
+        while pos < prefix.len() {
+            // match_at 返回该位置所有完整音节，最长优先；取最长贪心推进。
+            let matches = self.trie.match_at(prefix, pos);
+            let Some(syl) = matches.into_iter().next() else {
+                break;
+            };
+            pos += syl.len();
+            syllables.push(syl);
+        }
+        (syllables, pos)
+    }
+
     /// 计算 preedit 显示与音节信息。
     /// `full_pinyin` 必须已是全拼串（调用方负责转换），本方法不再内部做双拼→全拼转换。
     fn compute_composition(&self, full_pinyin: &str) -> (String, Vec<String>, String) {
@@ -542,6 +559,40 @@ impl Engine for PinyinEngine {
             .get_or_init(|| CharPinyinIndex::build(&self.dict));
         generate::generate_word_pinyin(&self.dict, idx, word)
     }
+
+    fn is_possible_pinyin_sequence(&self, prefix: &str) -> bool {
+        // 条件1：整个前缀本身是某合法音节的前缀（如 zhon→zhong），长度 >=2 过滤单字母简拼。
+        if prefix.len() >= 2 && self.trie.is_prefix(prefix) {
+            return true;
+        }
+        // 条件2：从起始连续完整音节 + 合法尾部前缀。首音节须非单字母。
+        let (completed, end_pos) = self.contiguous_completed_from_start(prefix);
+        if completed.is_empty() || completed[0].len() < 2 {
+            return false;
+        }
+        if end_pos >= prefix.len() {
+            return true;
+        }
+        self.trie.is_prefix(&prefix[end_pos..])
+    }
+
+    fn is_whole_syllable_pinyin(&self, prefix: &str) -> bool {
+        // 整体即单个完整音节（wang/shen 等填满码长的场景）。
+        if self.trie.is_syllable(prefix) {
+            return true;
+        }
+        // 多音节：连续完整音节恰好覆盖整个前缀，且首音节非单字母简拼。
+        let (completed, end_pos) = self.contiguous_completed_from_start(prefix);
+        if completed.is_empty() || completed[0].len() < 2 {
+            return false;
+        }
+        end_pos == prefix.len()
+    }
+
+    fn has_non_initial_single_letter_syllable(&self, prefix: &str) -> bool {
+        let (completed, _) = self.contiguous_completed_from_start(prefix);
+        completed.iter().skip(1).any(|s| s.len() == 1)
+    }
 }
 
 #[cfg(test)]
@@ -556,6 +607,42 @@ mod tests {
             Config::default(),
             CachedDict::Memory(CodetableDict::empty()),
         )
+    }
+
+    // ── 音节分析（顶码歧义裁决用；对齐 Go isPossiblePinyinSequence / isWholeSyllablePinyin /
+    //    hasNonInitialSingleLetterSyllable）。trie 为封闭标准音节集，不依赖词典。──
+
+    #[test]
+    fn possible_pinyin_sequence_matches_go_cases() {
+        let e = empty_engine();
+        // 完整音节 / 音节前缀 / 完整音节+尾部前缀 → true
+        assert!(e.is_possible_pinyin_sequence("wang")); // 单完整音节
+        assert!(e.is_possible_pinyin_sequence("zhon")); // zhong 的前缀
+        assert!(e.is_possible_pinyin_sequence("yans")); // yan + 尾部前缀 s
+        assert!(e.is_possible_pinyin_sequence("naap")); // na + a + 前缀 p
+        // 非拼音 / 首音节单字母 → false
+        assert!(!e.is_possible_pinyin_sequence("rcqn")); // 无完整音节也非前缀
+        assert!(!e.is_possible_pinyin_sequence("gggg")); // g 非合法音节/前缀
+        assert!(!e.is_possible_pinyin_sequence("abcd")); // 首音节 a 为单字母
+    }
+
+    #[test]
+    fn whole_syllable_pinyin_matches_go_cases() {
+        let e = empty_engine();
+        assert!(e.is_whole_syllable_pinyin("wang")); // 单完整音节
+        assert!(e.is_whole_syllable_pinyin("aipu")); // ai+pu 恰好覆盖
+        assert!(!e.is_whole_syllable_pinyin("zhon")); // 残缺前缀（非完整音节）
+        assert!(!e.is_whole_syllable_pinyin("yans")); // yan + 残缺 s
+        assert!(!e.is_whole_syllable_pinyin("abcd")); // 首音节单字母简拼
+    }
+
+    #[test]
+    fn non_initial_single_letter_syllable_matches_go_cases() {
+        let e = empty_engine();
+        assert!(e.has_non_initial_single_letter_syllable("naap")); // na + a（第二音节单字母）
+        assert!(!e.has_non_initial_single_letter_syllable("yans")); // yan + 残缺 s（残缺不计）
+        assert!(!e.has_non_initial_single_letter_syllable("aipu")); // ai + pu 皆双字母
+        assert!(!e.has_non_initial_single_letter_syllable("abcd")); // 首位单字母不算「非首位」
     }
 
     fn tmp_store(name: &str) -> Arc<Store> {

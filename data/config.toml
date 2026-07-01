@@ -29,7 +29,7 @@ z_key_repeat = true
 [schema.codetable.frequency]
 enabled = true
 protect_top_n = 1
-strategy = "step"
+strategy = "top"
 
 # 码表自动造词（连续单字）。
 [schema.codetable.auto_phrase]
@@ -50,13 +50,13 @@ enabled = true
 
 # 拼音自动造词。
 [schema.pinyin.auto_learn]
-enabled = false
+enabled = true
 
 # 全局混输配置（融合策略；全局唯一，无方案级 override）。
 [schema.mix]
 show_source_hint = false
 enable_english = false
-pinyin_only_overflow = false
+pinyin_only_overflow = true
 top_code_override_pinyin = false
 auto_commit_block_on_pinyin = true
 min_pinyin_length = 2

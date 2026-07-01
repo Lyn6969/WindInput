@@ -872,7 +872,43 @@ impl EngineManager {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .clone();
-        Self::resolve_codetable(&id, &global, self.override_dir.as_deref())
+        // 混输方案自身无独立 codetable 配置，override 从其 primary_schema（主码表方案）读取
+        let resolve_id = if matches!(self.current_engine_type(), Some(EngineType::Mixed)) {
+            Self::read_schema(&id, self.data_dir.as_deref(), self.override_dir.as_deref())
+                .map(|s| s.engine.mixed.primary_schema)
+                .filter(|s| !s.is_empty())
+                .unwrap_or_else(|| id.clone())
+        } else {
+            id
+        };
+        Self::resolve_codetable(&resolve_id, &global, self.override_dir.as_deref())
+    }
+
+    /// 拼音自动造词配置（[schema.pinyin.auto_learn]）。
+    pub fn auto_learn_settings(&self) -> wind_config::config::AutoLearnConfig {
+        self.pinyin
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .auto_learn
+            .clone()
+    }
+
+    /// 拼音词频衰减参数（用户配置；0 表示使用 store 默认值）。
+    pub fn pinyin_freq_profile(&self) -> wind_store::freq::FreqProfile {
+        let pf = self.pinyin.lock().unwrap_or_else(|e| e.into_inner());
+        let def = wind_store::freq::FreqProfile::default();
+        wind_store::freq::FreqProfile {
+            base_scale: if pf.frequency.base_scale > 0.0 {
+                pf.frequency.base_scale
+            } else {
+                def.base_scale
+            },
+            half_life_hours: if pf.frequency.half_life > 0.0 {
+                pf.frequency.half_life
+            } else {
+                def.half_life_hours
+            },
+        }
     }
 
     /// 解析某方案的有效码表配置：全局基线 + `[codetable]` override（开关开启时逐字段覆盖）。
@@ -1109,6 +1145,8 @@ impl EngineManager {
                 min_py,
                 boost,
                 block_on_pinyin,
+                mix_cfg.pinyin_only_overflow,
+                mix_cfg.top_code_override_pinyin,
             )));
         }
 

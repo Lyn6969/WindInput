@@ -69,6 +69,40 @@ pub trait Engine: Send + Sync {
     fn set_dict_enabled(&self, _dict_id: &str, _enabled: bool) -> bool {
         false
     }
+
+    /// 最大编码长度（码表引擎返回其码长；拼音等无意义返回 0）。
+    /// 供混输引擎的超长分支（pinyin_only_overflow）与顶码裁决判断输入是否溢出。
+    fn max_code_length(&self) -> usize {
+        0
+    }
+
+    /// `input` 是否存在精确（code==input）匹配（码表引擎实现；其余默认 false）。
+    fn has_full_input_match(&self, _input: &str) -> bool {
+        false
+    }
+
+    /// 是否存在比 `input` 更长的后继编码（码表引擎实现；其余默认 false）。
+    fn has_longer_code(&self, _input: &str) -> bool {
+        false
+    }
+
+    /// 前缀是否构成「合法拼音序列」（含残缺尾音节前缀，用于保护正在输入的拼音）。
+    /// 拼音引擎实现（对齐 Go isPossiblePinyinSequence）；其余默认 false。
+    fn is_possible_pinyin_sequence(&self, _prefix: &str) -> bool {
+        false
+    }
+
+    /// 前缀是否「恰好由完整拼音音节构成」（切在音节边界、无残缺尾音节）。
+    /// 拼音引擎实现（对齐 Go isWholeSyllablePinyin）；其余默认 false。
+    fn is_whole_syllable_pinyin(&self, _prefix: &str) -> bool {
+        false
+    }
+
+    /// 前缀的连续完整音节解析中是否存在「非首位单字母音节」（a/e/o，退化解析特征）。
+    /// 拼音引擎实现（对齐 Go hasNonInitialSingleLetterSyllable）；其余默认 false。
+    fn has_non_initial_single_letter_syllable(&self, _prefix: &str) -> bool {
+        false
+    }
 }
 
 /// 扩展引擎接口（码表引擎特有）

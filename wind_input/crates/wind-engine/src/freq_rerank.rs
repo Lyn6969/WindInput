@@ -84,9 +84,9 @@ pub fn rerank_pinyin_decay(
     candidates: &mut [Candidate],
     recs: &HashMap<String, FreqRecord>,
     now: i64,
+    profile: FreqProfile,
 ) {
     use std::cmp::Ordering;
-    let profile = FreqProfile::default();
     let score = |c: &Candidate| -> f64 {
         recs.get(&c.text)
             .map(|r| profile.pinyin_score(r, now))
@@ -205,7 +205,7 @@ mod tests {
             pin("拟", 1000),
         ];
         let r = recs(&[("你好", 20, NOW)]);
-        rerank_pinyin_decay(&mut cands, &r, NOW);
+        rerank_pinyin_decay(&mut cands, &r, NOW, FreqProfile::default());
         assert_eq!(cands[0].text, "你好世界", "整句必须锚定首位");
         assert_eq!(cands[1].text, "你好", "近用词软置前于未用词");
         assert_eq!(cands[2].text, "拟");
@@ -216,7 +216,7 @@ mod tests {
     fn pinyin_recent_use_floats_above_higher_weight() {
         let mut cands = vec![pin("低频高权", 5000), pin("近用低权", 100)];
         let r = recs(&[("近用低权", 8, NOW)]);
-        rerank_pinyin_decay(&mut cands, &r, NOW);
+        rerank_pinyin_decay(&mut cands, &r, NOW, FreqProfile::default());
         assert_eq!(cands[0].text, "近用低权", "近期使用应软置前");
     }
 
@@ -236,7 +236,7 @@ mod tests {
             pin("四", 100),        // 精确命中，低权重，未使用
         ];
         let r = recs(&[("是", 4, NOW)]); // 「是」有使用记录（模拟 si→是 count=4）
-        rerank_pinyin_decay(&mut cands, &r, NOW);
+        rerank_pinyin_decay(&mut cands, &r, NOW, FreqProfile::default());
         assert_eq!(
             cands[0].text,
             "四",
@@ -252,7 +252,7 @@ mod tests {
         let long_ago = NOW - 365 * 24 * 3600; // 一年前用过一次 → 衰减远小于 ε
         let mut cands = vec![pin("高权未用", 5000), pin("陈旧低权", 100)];
         let r = recs(&[("陈旧低权", 1, long_ago)]);
-        rerank_pinyin_decay(&mut cands, &r, NOW);
+        rerank_pinyin_decay(&mut cands, &r, NOW, FreqProfile::default());
         assert_eq!(cands[0].text, "高权未用", "褪色词应落回权重序，高权在前");
     }
 
