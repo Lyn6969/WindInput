@@ -6,7 +6,9 @@
 #   (dev.bat 已转发 %*, 故 dev.bat release / dev.bat m2 等价)
 #
 # 本机 (Windows) 原生构建:
-#   - Rust(wind_input/portable): cargo build --release (host = x86_64-pc-windows-msvc)
+#   - Rust(wind_input): cargo build --release (host = x86_64-pc-windows-msvc)
+#   - Rust(../wind-portable): 独立仓库, 不存在则跳过便携启动器
+#   - Rust(../wind-setting):  独立仓库, 不存在则跳过设置程序
 #   - C++ TSF: CMake + "Visual Studio 17 2022" 生成器 (x64 + Win32, 自动定位 MSVC)
 #   - 词库数据: 下载 rime-frost/pinyin-data/OpenCC + 生成 unigram/pinyin_map + 编 octrie
 #   - 全构建产物落【产品根】build/(release) 或 build_dev/(dev); 内容 == 安装内容
@@ -16,6 +18,8 @@
 #   d1           Dev 全构建 → build_dev/
 #   m1 / dm1     仅 tsf (x64+x86)            release / dev
 #   m2 / dm2     仅 wind_input (核心 exe)     release / dev
+#   m3 / dm3     仅 wind_setting (../wind-setting)              release / dev (不存在则跳过)
+#   m4 / dm4     仅 wind_portable (绿色版, ../wind-portable)   release / dev (不存在则跳过)
 #   p1 / pd1     系统安装全部 (release / dev): 复制 + 注册 TSF + 开机自启 + 启动服务
 #   u1/u / ud1/ud  系统卸载全部 (release / dev): 反注册 + 移出输入法列表 + 移除自启 + 删目录
 #   pm1 / pm2    系统安装单模块 (tsf / 核心, release)
@@ -52,6 +56,8 @@ $ScriptDir     = $PSScriptRoot
 $ProductRoot   = Split-Path $ScriptDir -Parent
 $ProjectRoot   = "$ProductRoot\wind_input"
 $TsfDir        = "$ProductRoot\wind_tsf"      # C++ TSF 核心层 (CMake/MSVC)
+$SettingDir    = [System.IO.Path]::GetFullPath("$ProductRoot\..\wind-setting")  # 设置程序 (独立仓库)
+$PortableDir   = [System.IO.Path]::GetFullPath("$ProductRoot\..\wind-portable") # 绿色版启动器 (独立仓库)
 $Version       = (Get-Content "$ProductRoot\docs\VERSION" -Raw).Trim()
 $BuildDir      = "$ProductRoot\build"
 $BuildDevDir = "$ProductRoot\build_dev"
@@ -137,7 +143,7 @@ function Build-TsfAll ([string]$profile = "release", [string]$outdir = $null) {
         if ($LASTEXITCODE -ne 0) { ErrMsg "TSF $($a.A) 构建失败!"; return $false }
         # CMakeLists 输出到 $outdir\wind_tsf$suffix.dll; x86 需改名加 _x86
         $produced = "$outdir\wind_tsf$suffix.dll"
-        # 末尾化: 架构后缀在前, 变体后缀在后 → wind_tsf_x86_dev.dll (与 Register-Tsf/portable/Makefile 一致)
+        # 末尾化: 架构后缀在前, 变体后缀在后 → wind_tsf_x86_dev.dll
         $final    = "$outdir\wind_tsf$($a.Sfx)$suffix.dll"
         if ((Test-Path $produced) -and ($produced -ne $final)) {
             Move-Item $produced $final -Force
@@ -150,14 +156,45 @@ function Build-TsfAll ([string]$profile = "release", [string]$outdir = $null) {
     return $true
 }
 
-# 纯 Rust 单一二进制, 运行时自辨 dev/release 变体; dev/release 产出同一份 exe。
+# ---------- 构建: wind-setting (设置程序) ----------
+# 独立仓库; 不存在时跳过。dev 变体产物重命名为 wind_setting_dev.exe。
+function Build-Setting ([string]$profile = "release", [string]$outdir = $null) {
+    if (-not $outdir) { $outdir = Out-For $profile }
+    if (-not (Test-Path $SettingDir)) { Warn "../wind-setting 仓库不存在, 跳过设置程序。"; return $true }
+    $suffix = ""; $targetDir = "release"
+    if ($profile -eq "dev") { $suffix = "_dev"; $targetDir = "debug" }
+    New-Item -ItemType Directory -Path $outdir -Force | Out-Null
+    Say "`n[setting] 构建 wind_setting ($profile)..."
+    Push-Location $SettingDir
+    try {
+        if ($profile -eq "dev") { cargo build } else { cargo build --release }
+        if ($LASTEXITCODE -ne 0) { ErrMsg "wind_setting 构建失败!"; return $false }
+    } finally { Pop-Location }
+    $exe = "$SettingDir\target\$targetDir\wind_setting.exe"
+    if (-not (Test-Path $exe)) { ErrMsg "未找到产物: $exe"; return $false }
+    Copy-Item $exe "$outdir\wind_setting$suffix.exe" -Force
+    $sz = [math]::Round((Get-Item "$outdir\wind_setting$suffix.exe").Length / 1MB, 1)
+    Gray "已构建: wind_setting$suffix.exe (${sz}MB)"
+    return $true
+}
+
+# ---------- 构建: wind-portable (绿色版便携启动器) ----------
+# 独立仓库; 不存在时跳过。dev/release 产出同一份 exe。
 function Build-Portable ([string]$profile = "release", [string]$outdir = $null) {
     if (-not $outdir) { $outdir = Out-For $profile }
+    if (-not (Test-Path $PortableDir)) { Warn "../wind-portable 仓库不存在, 跳过便携启动器。"; return $true }
     New-Item -ItemType Directory -Path $outdir -Force | Out-Null
+    Say "`n[portable] 构建 wind_portable ($profile → 单一二进制)..."
+    Push-Location $PortableDir
     try {
         cargo build --release
+        if ($LASTEXITCODE -ne 0) { ErrMsg "wind_portable 构建失败!"; return $false }
     } finally { Pop-Location }
+    $exe = "$PortableDir\target\release\wind_portable.exe"
     if (-not (Test-Path $exe)) { ErrMsg "未找到产物: $exe"; return $false }
+    Copy-Item $exe "$outdir\wind_portable.exe" -Force
+    $sz = [math]::Round((Get-Item "$outdir\wind_portable.exe").Length / 1MB, 1)
+    Gray "已构建: wind_portable.exe (${sz}MB)"
     return $true
 }
 
@@ -378,6 +415,8 @@ function Do-Full ([string]$profile = "release") {
     New-Item -ItemType Directory -Path $outdir -Force | Out-Null
     if (-not (Build-Core     $profile $outdir)) { return $false }   # wind_input[_dev].exe
     if (-not (Build-TsfAll   $profile $outdir)) { return $false }   # wind_tsf[_x86][_dev].dll
+    if (-not (Build-Setting  $profile $outdir)) { return $false }   # wind_setting[_dev].exe (可选)
+    if (-not (Build-Portable $profile $outdir)) { return $false }   # wind_portable.exe (可选)
     if (-not (Do-GenData     $outdir))          { return $false }   # data/
     if (-not (Verify-DistData $outdir))         { return $false }   # 硬门禁
     Say "`n========== 全构建完成 ($profile) → $outdir =========="
@@ -553,8 +592,7 @@ function Copy-Replace ([string]$targetDir, [string]$fileName, [string]$srcPath) 
 }
 
 function Stop-WindService ([string]$suffix) {
-        Get-Process -Name $p -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
-    }
+    Get-Process -Name "wind_input$suffix" -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
     Start-Sleep -Milliseconds 600
 }
 
@@ -577,6 +615,8 @@ function Deploy-Full ([string]$profile = "release") {
     foreach ($dll in (Get-ChildItem "$outdir\wind_tsf*.dll" -ErrorAction SilentlyContinue)) {
         Copy-Replace $targetDir $dll.Name $dll.FullName
     }
+    if (Test-Path "$outdir\wind_setting$suffix.exe") { Copy-Replace $targetDir "wind_setting$suffix.exe" "$outdir\wind_setting$suffix.exe" }
+    if (Test-Path "$outdir\wind_portable.exe")       { Copy-Replace $targetDir "wind_portable.exe"       "$outdir\wind_portable.exe" }
     if (Test-Path "$outdir\data") {
         $td = Join-Path $targetDir "data"
         if (Test-Path $td) { Remove-Item $td -Recurse -Force -ErrorAction SilentlyContinue }
@@ -734,12 +774,14 @@ function New-InstallerConfig ([string]$profile, [string]$outdir, [string]$cfgPat
     if ($profile -eq "dev") {
         $id = "WindInputDev"; $disp = "清风输入法 (开发版)"; $mainExe = "wind_input_dev.exe"
         $menu = "清风输入法 (开发版)"; $title = "清风输入法 (开发版) 安装向导"; $proto = "windinputdev"
+        $procs = '["wind_portable", "wind_input_dev"]'
         $acl   = '["wind_tsf_dev.dll", "wind_tsf_x86_dev.dll"]'
         $clsid = "{99C2DEB0-5C57-45A2-9C63-FB54B34FD90A}"; $prof = "{99C2DEB1-5C57-45A2-9C63-FB54B34FD90A}"
         $dllX64 = "wind_tsf_dev.dll"; $dllX86 = "wind_tsf_x86_dev.dll"; $outName = "WindInputDev-Setup"
     } else {
         $id = "WindInput"; $disp = "清风输入法"; $mainExe = "wind_input.exe"
         $menu = "清风输入法"; $title = "清风输入法 安装向导"; $proto = "windinput"
+        $procs = '["wind_portable", "wind_input"]'
         $acl   = '["wind_tsf.dll", "wind_tsf_x86.dll"]'
         $clsid = "{99C2EE30-5C57-45A2-9C63-FB54B34FD90A}"; $prof = "{99C2EE31-5C57-45A2-9C63-FB54B34FD90A}"
         $dllX64 = "wind_tsf.dll"; $dllX86 = "wind_tsf_x86.dll"; $outName = "WindInput-Setup"
@@ -872,8 +914,10 @@ function Show-Menu {
     Write-Host "    1    Release 全构建: wind_input + tsf(x64/x86) + portable + 词库"
     Write-Host "    d1   Dev 全构建 (→ build_dev/)"
     Write-Host "`n  单模块构建 (前缀 d = dev):" -ForegroundColor Yellow
-    Write-Host "    m1   仅 tsf (x64+x86)        dm1"
-    Write-Host "    m2   仅 wind_input (核心)     dm2"
+    Write-Host "    m1   仅 tsf (x64+x86)                dm1"
+    Write-Host "    m2   仅 wind_input (核心)             dm2"
+    Write-Host "    m3   仅 wind_setting (../wind-setting)  dm3"
+    Write-Host "    m4   仅 wind_portable (../wind-portable) dm4"
     Write-Host "`n  系统安装 / 卸载 (注册 TSF + 开机自启 + 默认启用, 自动提权):" -ForegroundColor Yellow
     Write-Host "    p1   安装全部 (release)        pd1   安装全部 (dev)"
     Write-Host "    pm1/pm2  安装模块(tsf/核心)    pdm1/pdm2 (dev)"
@@ -903,6 +947,8 @@ function Dispatch ([string]$cmd, [string]$arg) {
         "dm1"  { if (Build-TsfAll   dev)   { 0 } else { 1 }; break }
         "m2"   { if (Build-Core     release) { 0 } else { 1 }; break }
         "dm2"  { if (Build-Core     dev)   { 0 } else { 1 }; break }
+        "m3"   { if (Build-Setting  release) { 0 } else { 1 }; break }
+        "dm3"  { if (Build-Setting  dev)   { 0 } else { 1 }; break }
         "m4"   { if (Build-Portable release) { 0 } else { 1 }; break }
         "dm4"  { if (Build-Portable dev)   { 0 } else { 1 }; break }
         "p1"   { if (Deploy-Full release) { 0 } else { 1 }; break }

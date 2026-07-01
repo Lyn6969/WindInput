@@ -119,10 +119,6 @@ cp -f  "$BUILD_DIR/wind_tsf_x86.dll" "$STAGE/"
 cp -rf "$BUILD_DIR/data"             "$STAGE/"
 cp -f  "$UNINSTALLER"                "$STAGE/uninstall.exe"
 
-# 单一二进制，运行时自辨变体；不存在仅告警(运行 'dev.sh m4' 构建到 build/)。
-else
-fi
-
 # ---- 打包:wind-packer build（pack + bundle 一步）----
 # config/app.toml 由 WindInput 持有；version/source-dir/compression 通过 CLI 注入，
 # 不修改任何文件。

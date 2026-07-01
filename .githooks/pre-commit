@@ -13,11 +13,4 @@ if ! cargo fmt --all -- --check 2>/dev/null; then
     exit 1
 fi
 
-    if ! cargo fmt --all -- --check 2>/dev/null; then
-        echo ""
-        echo ""
-        exit 1
-    fi
-fi
-
 echo "[pre-commit] fmt OK"

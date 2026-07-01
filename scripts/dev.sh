@@ -196,11 +196,6 @@ do_ci() {
     say "\nCI 全部通过 ✓"
 }
 
-# fmt-check + 纯逻辑 test(host) + clippy(Windows 目标，cargo-xwin)。
-    ( cd "$PORTABLE_DIR" && cargo fmt --all -- --check && cargo test ) \
-    ( cd "$PORTABLE_DIR" && cargo_xwin clippy --target "$TARGET" ) \
-}
-
 # 模块二：C++ TSF DLL（x64 + x86；clang/MSVC 交叉编译）。
 # obj 中间产物落 .cache，保持 outdir 干净（== 安装内容）。dev → _dev 后缀。
 build_tsf_all() {
@@ -710,17 +705,6 @@ do_installer() {
     fi
     say "\n=== 打包安装程序 ==="
     "$SCRIPT_DIR/pack-installer.sh" --version "$VERSION" || return 1
-}
-
-
-# (扫描旁置的 wind_input_dev.exe)。故 release/dev 两种 profile 产出同一份 exe，
-# 同时拷到 build/ 与 build_dev/，变体在目标机由布局决定。
-    local profile="${1:-release}" outdir="${2:-$(out_for "$1")}"
-    mkdir -p "$outdir"
-    (
-        cd "$PORTABLE_DIR" || exit 1
-        cargo_xwin build --release --target "$TARGET" || exit 1
-    [ -f "$exe" ] || { err "未找到产物: $exe"; return 1; }
 }
 
 show_menu() {
