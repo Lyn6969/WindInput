@@ -3,7 +3,7 @@ name: Release
 # 全 Linux 交叉编译 + 打包。两种触发:
 #   - push tag v*    → 产出草稿 Release(附 Setup.exe + .sha256)
 #   - workflow_dispatch → 产出可测 artifact(不发 Release),供合并前 Windows 实测
-# 产物:WindInput-<版本>-Setup.exe(自解压安装程序,含 x64/x86 TSF + 词库)。
+# 产物:WindInput-<版本>-Setup.exe(自解压安装程序,含 x64/x86 TSF + 设置程序 + 便携启动器 + 词库)。
 on:
   push:
     tags: ['v*']
@@ -16,7 +16,7 @@ jobs:
   release:
     runs-on: ubuntu-latest
     steps:
-      # 三个仓库需为同级目录:wind-installer 依赖 ../wind-ui-rust;
+      # 多仓库需为同级目录:wind-setting 依赖 ../wind-ui-rust 和 ../WindInput;
       # pack-installer.sh 用 ../wind-installer。均 checkout 到 $GITHUB_WORKSPACE 下。
       - name: 检出 WindInput
         uses: actions/checkout@v4
@@ -35,6 +35,20 @@ jobs:
         with:
           repository: huanfeng/wind-ui-rust
           path: wind-ui-rust
+          token: ${{ secrets.WIND_REPOS_TOKEN }}
+      - name: 检出 wind-setting
+        uses: actions/checkout@v4
+        with:
+          repository: huanfeng/wind-setting
+          path: wind-setting
+          # 私有仓库无权限时必须失败，避免发布包缺少设置程序。
+          token: ${{ secrets.WIND_REPOS_TOKEN }}
+      - name: 检出 wind-portable
+        uses: actions/checkout@v4
+        with:
+          repository: huanfeng/wind-portable
+          path: wind-portable
+          # 私有仓库无权限时必须失败，避免发布包缺少便携启动器。
           token: ${{ secrets.WIND_REPOS_TOKEN }}
 
       # 统一 MSVC 工具链:clang-19(C++ TSF 需 clang≥19)+ lld-19 + llvm-19;
@@ -64,6 +78,9 @@ jobs:
           workspaces: |
             WindInput/wind_input
             wind-installer
+            wind-ui-rust
+            wind-setting
+            wind-portable
 
       # tag 为发布版本的唯一真值源；docs/VERSION 仅为开发占位。把 tag 版本写入
       # docs/VERSION，让下游(build.rs 资源版本 / dev.sh release / pack-installer)统一取到。
@@ -79,11 +96,14 @@ jobs:
           echo "build version = $V"
           echo "BUILD_VERSION=$V" >> "$GITHUB_ENV"
 
+      - name: 构建发布产物
         working-directory: WindInput
         run: ./scripts/dev.sh release
 
       - name: 打包安装程序 (cross stub + native packer，免 wine)
         working-directory: WindInput
+        env:
+          WIND_REQUIRE_COMPANIONS: "1"
         run: ./scripts/pack-installer.sh --version "$BUILD_VERSION" --compression lzma
 
       - name: 创建草稿 Release (仅 tag 触发)

@@ -5,7 +5,8 @@
 # 全 Linux 流水线:交叉编译 wind-installer stub(x86_64-pc-windows-gnu)+ 原生
 # 构建 wind-packer(纯 IO,无需 wine),再 pack→bundle 出单文件 Setup.exe。
 #
-# 前置:BUILD_DIR 内已含 wind_input.exe / wind_tsf.dll / wind_tsf_x86.dll / data/
+# 前置:BUILD_DIR 内已含 wind_input.exe / wind_tsf.dll / wind_tsf_x86.dll / data/。
+#      Release workflow 还要求 wind_setting.exe / wind_portable.exe。
 #      (由 dev.sh release + build_tsf + assemble_data 产出)。
 #
 # 用法:
@@ -15,6 +16,7 @@
 #
 # 环境变量(等价覆盖,命令行参数优先):
 #   WIND_VERSION / WIND_COMPRESSION / WIND_BUILD_DIR / WIND_INSTALLER_DIR
+#   WIND_REQUIRE_COMPANIONS=1 时强制要求 wind_setting.exe / wind_portable.exe
 # ============================================================================
 set -euo pipefail
 
@@ -27,6 +29,7 @@ VERSION="${WIND_VERSION:-}"
 COMPRESSION="${WIND_COMPRESSION:-lzma}"
 BUILD_DIR="${WIND_BUILD_DIR:-$PRODUCT_ROOT/build}"
 INSTALLER_DIR="${WIND_INSTALLER_DIR:-$PRODUCT_ROOT/../wind-installer}"
+REQUIRE_COMPANIONS="${WIND_REQUIRE_COMPANIONS:-0}"
 OUTPUT=""
 
 # ---- 解析参数 ----
@@ -65,6 +68,10 @@ echo "================================================"
 
 # ---- 校验构建产物 ----
 required=(wind_input.exe wind_tsf.dll wind_tsf_x86.dll)
+companions=(wind_setting.exe wind_portable.exe)
+if [[ "$REQUIRE_COMPANIONS" == "1" || "$REQUIRE_COMPANIONS" == "true" ]]; then
+  required+=("${companions[@]}")
+fi
 missing=()
 for f in "${required[@]}"; do
   [[ -f "$BUILD_DIR/$f" ]] || missing+=("$f")
@@ -72,7 +79,7 @@ done
 [[ -d "$BUILD_DIR/data" ]] || missing+=("data/")
 if [[ ${#missing[@]} -gt 0 ]]; then
   echo "[ERROR] BUILD_DIR 缺少产物: ${missing[*]}" >&2
-  echo "        请先运行 dev.sh(release + build_tsf + build_tsf x86 + assemble_data)" >&2
+  echo "        请先运行 ./scripts/dev.sh release 生成完整发布目录" >&2
   exit 1
 fi
 [[ -d "$INSTALLER_DIR" ]] || { echo "[ERROR] 找不到 wind-installer: $INSTALLER_DIR" >&2; exit 1; }
@@ -117,6 +124,9 @@ cp -f  "$BUILD_DIR/wind_input.exe"   "$STAGE/"
 cp -f  "$BUILD_DIR/wind_tsf.dll"     "$STAGE/"
 cp -f  "$BUILD_DIR/wind_tsf_x86.dll" "$STAGE/"
 cp -rf "$BUILD_DIR/data"             "$STAGE/"
+for f in "${companions[@]}"; do
+  [[ -f "$BUILD_DIR/$f" ]] && cp -f "$BUILD_DIR/$f" "$STAGE/"
+done
 cp -f  "$UNINSTALLER"                "$STAGE/uninstall.exe"
 
 # ---- 打包:wind-packer build（pack + bundle 一步）----

@@ -82,7 +82,13 @@ impl Coordinator {
         // 词频重排归属 engine 排序层（frequency.md §5/§7）：本协调器只负责取词频记录、按引擎
         // 类型分流到纯函数。码表/混输永久 used-first（§3），纯拼音衰减软置前（§4）。
         if self.engine_mgr.is_pinyin() {
-            wind_engine::freq_rerank::rerank_pinyin_decay(candidates, &recs, now_unix_secs());
+            let profile = self.engine_mgr.pinyin_freq_profile();
+            wind_engine::freq_rerank::rerank_pinyin_decay(
+                candidates,
+                &recs,
+                now_unix_secs(),
+                profile,
+            );
         } else {
             wind_engine::freq_rerank::rerank_codetable_usedfirst(
                 candidates,

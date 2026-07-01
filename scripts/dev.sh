@@ -7,15 +7,19 @@
 #
 # 本机 (Linux) 交叉编译为 Windows (MSVC) 可执行文件:
 #   - Rust(wind_input): cargo-xwin → x86_64-pc-windows-msvc (+crt-static 自包含)
+#   - Rust(../wind-setting): 独立仓库, 不存在则跳过设置程序
+#   - Rust(../wind-portable): 独立仓库, 不存在则跳过便携启动器
 #   - C++ TSF: clang + lld-link + llvm-rc + cargo-xwin 的 MSVC SDK (x64 + x86)
 #   - 依赖: cargo-xwin + clang-19/lld-19/llvm-19 (MSVC STL 要 clang≥19)
 #   - 全构建产物落【项目根】build/(release) 或 build_dev/(dev)，内容 == 安装内容
 #
 # 命令（菜单与命令行直调同一套；前缀 d=dev, p=push, m=单模块）:
-#   1            Release 全构建: wind_input + tsf(x64/x86) + 词库数据 → build/
+#   1            Release 全构建: wind_input + tsf(x64/x86) + setting + portable + 词库数据 → build/
 #   d1           Debug 全构建 → build_dev/
 #   m1 / dm1     仅 tsf (x64+x86)            release / dev
 #   m2 / dm2     仅 wind_input (核心 exe)     release / dev
+#   m3 / dm3     仅 wind_setting (../wind-setting)              release / dev (不存在则跳过)
+#   m4 / dm4     仅 wind_portable (../wind-portable)            release / dev (不存在则跳过)
 #   8            生成安装包 (= 1 + 打包 → Setup.exe + sha256)
 #   8s           跳过编译，直接打包现有 build/
 #   p1 / pd1     push 全部 build[_dev]/ → Windows 安装目录 (release / dev)
@@ -50,6 +54,8 @@ PRODUCT_ROOT="$(dirname "$SCRIPT_DIR")"
 PROJECT_ROOT="$PRODUCT_ROOT/wind_input"
 # C++ TSF 核心层（clang/MSVC 交叉编译，见 wind_tsf/Makefile）
 TSF_DIR="$PRODUCT_ROOT/wind_tsf"
+SETTING_DIR="$(cd "$PRODUCT_ROOT/.." && pwd)/wind-setting"
+PORTABLE_DIR="$(cd "$PRODUCT_ROOT/.." && pwd)/wind-portable"
 VERSION="$(tr -d '[:space:]' < "$PRODUCT_ROOT/docs/VERSION" 2>/dev/null || echo '?')"
 # 发布产物目录在【项目根】（内容 == 安装到 Program Files 的内容，无中间产物）
 BUILD_DIR="$PRODUCT_ROOT/build"
@@ -157,6 +163,53 @@ build_core() {
     [ -f "$PROJECT_ROOT/scripts/wind_cli.bat" ] && cp -f "$PROJECT_ROOT/scripts/wind_cli.bat" "$outdir/wind_cli.bat" && gray "已复制: wind_cli.bat"
 }
 
+# 模块二：wind-setting 设置程序。
+# 独立兄弟仓库；本地开发缺仓库时跳过。GitHub Release workflow 会先强制 checkout，
+# 无权限或缺产物会在 workflow/pack 阶段失败。
+build_setting() {
+    local profile="${1:-release}" outdir="${2:-$(out_for "$1")}"
+    if [ ! -d "$SETTING_DIR" ]; then
+        warn "../wind-setting 仓库不存在, 跳过设置程序。"
+        return 0
+    fi
+
+    local suffix="" cargo_args=(build --target "$TARGET") target_dir="debug"
+    if [ "$profile" != dev ]; then
+        cargo_args+=(--release)
+        target_dir="release"
+    else
+        suffix="_dev"
+    fi
+
+    mkdir -p "$outdir"; cd "$SETTING_DIR" || return 1
+    say "\n[setting] 交叉编译 wind_setting ($profile, $TARGET)..."
+    cargo_xwin "${cargo_args[@]}" || { err "wind_setting 构建失败!"; return 1; }
+
+    local src="$SETTING_DIR/target/$TARGET/$target_dir/wind_setting.exe"
+    [ -f "$src" ] || { err "未找到产物: $src"; return 1; }
+    cp -f "$src" "$outdir/wind_setting${suffix}.exe"
+    gray "已构建: wind_setting${suffix}.exe ($(du -h "$outdir/wind_setting${suffix}.exe" | cut -f1))"
+}
+
+# 模块三：wind-portable 便携启动器。
+# 独立兄弟仓库；dev/release 均产出同一份 release 二进制。
+build_portable() {
+    local profile="${1:-release}" outdir="${2:-$(out_for "$1")}"
+    if [ ! -d "$PORTABLE_DIR" ]; then
+        warn "../wind-portable 仓库不存在, 跳过便携启动器。"
+        return 0
+    fi
+
+    mkdir -p "$outdir"; cd "$PORTABLE_DIR" || return 1
+    say "\n[portable] 交叉编译 wind_portable ($profile → 单一二进制, $TARGET)..."
+    cargo_xwin build --release --target "$TARGET" || { err "wind_portable 构建失败!"; return 1; }
+
+    local src="$PORTABLE_DIR/target/$TARGET/release/wind_portable.exe"
+    [ -f "$src" ] || { err "未找到产物: $src"; return 1; }
+    cp -f "$src" "$outdir/wind_portable.exe"
+    gray "已构建: wind_portable.exe ($(du -h "$outdir/wind_portable.exe" | cut -f1))"
+}
+
 do_check() {
     say "\n正在运行 cargo check ($TARGET, 全工作区)..."
     cd "$PROJECT_ROOT" && cargo_xwin check --target "$TARGET" --workspace
@@ -196,7 +249,7 @@ do_ci() {
     say "\nCI 全部通过 ✓"
 }
 
-# 模块二：C++ TSF DLL（x64 + x86；clang/MSVC 交叉编译）。
+# 模块四：C++ TSF DLL（x64 + x86；clang/MSVC 交叉编译）。
 # obj 中间产物落 .cache，保持 outdir 干净（== 安装内容）。dev → _dev 后缀。
 build_tsf_all() {
     local profile="${1:-release}" outdir="${2:-$(out_for "$1")}"
@@ -684,6 +737,8 @@ do_full() {
     rm -rf "$outdir"; mkdir -p "$outdir"
     build_core    "$profile" "$outdir" || return 1   # wind_input[_dev].exe
     build_tsf_all "$profile" "$outdir" || return 1   # wind_tsf[_x86][_dev].dll
+    build_setting "$profile" "$outdir" || return 1   # wind_setting[_dev].exe (可选)
+    build_portable "$profile" "$outdir" || return 1  # wind_portable.exe (可选)
     do_gen_data   "$outdir"            || return 1   # data/(下载词库 + unigram/pinyin + opencc)
     verify_dist_data "$outdir"         || return 1   # 硬门禁:词库/模型完整
     say "\n========== 全构建完成 ($profile) → $outdir =========="
@@ -713,11 +768,13 @@ show_menu() {
     printf '%b  WindInput 开发菜单  v%s  (Linux→Win, MSVC)%b\n' "$C_CYAN" "$VERSION" "$C_RESET"
     printf '%b============================================%b\n\n' "$C_CYAN" "$C_RESET"
     printf '%b  全构建 (→ 项目根 build/，内容 == 安装到 Program Files):%b\n' "$C_YELLOW" "$C_RESET"
-    echo  "    1    Release 全构建: wind_input + tsf(x64/x86) + 词库数据"
+    echo  "    1    Release 全构建: wind_input + tsf(x64/x86) + setting + portable + 词库数据"
     echo  "    d1   Debug 全构建 (→ build_dev/)"
     printf '\n%b  单模块构建 (前缀 d = dev):%b\n' "$C_YELLOW" "$C_RESET"
     echo  "    m1   仅 tsf (x64+x86)        dm1"
     echo  "    m2   仅 wind_input (核心)     dm2"
+    echo  "    m3   仅 wind_setting (../wind-setting)    dm3"
+    echo  "    m4   仅 wind_portable (../wind-portable)  dm4"
     printf '\n%b  安装包:%b\n' "$C_YELLOW" "$C_RESET"
     echo  "    8    生成安装包 (= 1 + 打包 → Setup.exe + sha256)"
     echo  "    8s   跳过编译, 直接打包现有 build/"
@@ -744,6 +801,10 @@ dispatch() {
         dm1)              build_tsf_all dev ;;
         m2)               build_core release ;;
         dm2)              build_core dev ;;
+        m3)               build_setting release ;;
+        dm3)              build_setting dev ;;
+        m4)               build_portable release ;;
+        dm4)              build_portable dev ;;
         8|installer|pack) do_installer ;;
         8s|installer-skip) do_installer skip ;;
         p1)               do_push_full release ;;
