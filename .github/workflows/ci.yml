@@ -53,3 +53,44 @@ jobs:
           V="$(tr -d '[:space:]' < docs/VERSION)"
           make -C wind_tsf VERSION="$V"
           make -C wind_tsf x86 VERSION="$V"
+
+  # 门控: 仅当 macOS 相关路径改动时才触发 macOS 编译校验。
+  # GitHub 不支持 per-job paths, 故用一个 ubuntu 廉价 job 输出是否命中, macos-check 据此 if 短路。
+  changes:
+    name: Detect macOS-related changes
+    runs-on: ubuntu-latest
+    outputs:
+      macos: ${{ steps.filter.outputs.macos }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dorny/paths-filter@v3
+        id: filter
+        with:
+          filters: |
+            macos:
+              - 'wind_macos/**'
+              - 'wind_input/**'
+              - 'scripts/mac/**'
+
+  # 轻量 macOS 编译校验: swift build + cargo check(darwin), 不打包 .app。
+  macos-check:
+    name: macOS Build Check
+    needs: changes
+    if: needs.changes.outputs.macos == 'true'
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: wind_input
+
+      - name: Build wind_macos (Swift IMKit)
+        working-directory: wind_macos
+        run: swift build
+
+      - name: Check wind_input (Rust core, darwin)
+        working-directory: wind_input
+        run: cargo check --workspace
