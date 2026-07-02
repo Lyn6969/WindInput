@@ -171,7 +171,8 @@ impl Coordinator {
         let should_clear = result.should_clear;
 
         let mut candidates = result.candidates;
-        if !self.phrases.is_empty() {
+        let phrases = self.phrases.read().unwrap_or_else(|e| e.into_inner());
+        if !phrases.is_empty() {
             let recent = self.recent_commits_snapshot();
             let max_disp = self.rt().config.input.phrase.max_display_chars;
             // 剪贴板读取回调注入 wind-phrase（其不依赖平台 UI 层）：精确码命令 display
@@ -186,7 +187,7 @@ impl Coordinator {
                     String::new()
                 }
             };
-            for hit in self.phrases.lookup(&state.input_buffer, &recent, &clip) {
+            for hit in phrases.lookup(&state.input_buffer, &recent, &clip) {
                 let is_command = hit.command_src.is_some();
                 candidates.push(Candidate {
                     text: Self::clamp_candidate_display(&hit.text, max_disp),
@@ -203,10 +204,7 @@ impl Coordinator {
             // marker 短语。**$CC 命令** → is_command（选中直接执行，group_code 作执行输入
             // 上下文）；**$SS/$AA 组** → is_group（选中补全到完整码再展开成员，二级选择）。
             let min_prefix = self.rt().config.input.phrase.min_prefix;
-            for hit in self
-                .phrases
-                .lookup_prefix(&state.input_buffer, &recent, min_prefix)
-            {
+            for hit in phrases.lookup_prefix(&state.input_buffer, &recent, min_prefix) {
                 let code = hit.nav_code.unwrap_or_default();
                 let text = Self::clamp_candidate_display(&hit.text, max_disp);
                 if let Some(src) = hit.command_src {
@@ -234,6 +232,7 @@ impl Coordinator {
                 }
             }
         }
+        drop(phrases);
         // 候选层级排序（与引擎一致，对齐 Go：Exact >> Prefix >> Fuzzy）：
         // ① 非模糊优先于模糊；② 同模糊层内精确(code==输入)优先于前缀补全；
         // ③ 同层内按权重降序、自然序升序。使输入 si 时精确单字「四」优先于

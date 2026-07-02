@@ -434,8 +434,8 @@ pub struct Coordinator {
     pub(crate) punct: Mutex<PunctuationConverter>,
     /// 智能符号模式待命态（同键连按删中文标点改英文）
     pub(crate) smart_symbol: Mutex<SmartSymbolArm>,
-    /// 短语层（system.phrases.toml；$Y$M$D 模板）
-    pub(crate) phrases: wind_phrase::PhraseLayer,
+    /// 短语层（系统+用户，来自 store，仅 enabled）。变更后可 rebuild_phrases 重建。
+    pub(crate) phrases: std::sync::RwLock<wind_phrase::PhraseLayer>,
     /// 简繁转换器（OpenCC；None=数据缺失不可用）。变体由配置 features.s2t.variant 决定，
     /// 启动时加载；菜单仅提供开/关。置于 Mutex 兼容 reload 时整体替换。
     pub(crate) s2t: Mutex<Option<wind_transform::s2t::Converter>>,
@@ -718,17 +718,42 @@ impl Coordinator {
             bundle.compiled_hotkeys.key_up.len()
         );
 
-        // 短语层：从 data 目录加载 system.phrases.toml
-        let phrases = match data_dir {
-            Some(d) => {
-                let p = d.join("system.phrases.toml");
-                let layer = wind_phrase::PhraseLayer::load(&p);
-                if !layer.is_empty() {
-                    info!("Loaded phrases from {}", p.display());
+        // 短语层（方案 B）：TOML 变更时同步进 store，再从 store（仅 enabled）建层。
+        let phrases = {
+            if let Some(store) = store.as_ref() {
+                if let Some(d) = data_dir {
+                    let p = d.join("system.phrases.toml");
+                    let entries = wind_phrase::PhraseLayer::parse_system_entries(&p);
+                    // 内容哈希：条目稳定序列化后哈希
+                    let hash = phrase_entries_hash(&entries);
+                    if store.phrase_sys_hash().ok().flatten().as_deref() != Some(hash.as_str()) {
+                        let sys: Vec<wind_store::phrases::SystemPhrase> = entries
+                            .iter()
+                            .map(|e| wind_store::phrases::SystemPhrase {
+                                code: e.code.clone(),
+                                text: e.text.clone(),
+                                weight: e.weight,
+                                position: e.position,
+                            })
+                            .collect();
+                        if let Ok(st) = store.sync_system_phrases(&sys) {
+                            info!(
+                                "Synced system phrases: +{} ~{} -{}",
+                                st.added, st.updated, st.removed
+                            );
+                            let _ = store.set_phrase_sys_hash(&hash);
+                        }
+                    }
                 }
-                layer
+                let recs = store
+                    .enabled_phrases_for_input()
+                    .unwrap_or_default()
+                    .into_iter()
+                    .map(|p| (p.code, p.text, p.weight, p.position));
+                std::sync::RwLock::new(wind_phrase::PhraseLayer::from_records(recs))
+            } else {
+                std::sync::RwLock::new(wind_phrase::PhraseLayer::default())
             }
-            None => wind_phrase::PhraseLayer::default(),
         };
 
         // 简繁转换器：从 data/opencc 加载（变体来自配置，默认 s2t）
@@ -2251,6 +2276,22 @@ impl Coordinator {
         };
         self.record_commit(text, 0, -1, source);
     }
+
+    /// 从 store 重建短语层（短语类 RPC 改动后调用，使输入期即时生效）。
+    pub(crate) fn rebuild_phrases(&self) {
+        let recs: Vec<(String, String, i32, i32)> = match self.store.as_ref() {
+            Some(store) => store
+                .enabled_phrases_for_input()
+                .unwrap_or_default()
+                .into_iter()
+                .map(|p| (p.code, p.text, p.weight, p.position))
+                .collect(),
+            None => Vec::new(),
+        };
+        if let Ok(mut g) = self.phrases.write() {
+            *g = wind_phrase::PhraseLayer::from_records(recs);
+        }
+    }
 }
 
 impl MessageHandler for Coordinator {
@@ -3494,6 +3535,21 @@ impl MessageHandler for Coordinator {
 
     fn handle_host_render_request(&self) {}
     fn handle_host_render_ready(&self) {}
+}
+
+/// 对 SystemPhraseEntry 列表做稳定内容哈希（用于启动时判断 TOML 是否有变更）。
+/// 使用标准库 DefaultHasher，无新依赖。
+fn phrase_entries_hash(entries: &[wind_phrase::SystemPhraseEntry]) -> String {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    entries.len().hash(&mut h);
+    for e in entries {
+        e.code.hash(&mut h);
+        e.text.hash(&mut h);
+        e.weight.hash(&mut h);
+        e.position.hash(&mut h);
+    }
+    format!("{:016x}", h.finish())
 }
 
 /// 候选调试信息段（tooltip debug provider）：编码/权重/引擎/标记。空候选返回空串。
