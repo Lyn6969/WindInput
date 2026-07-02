@@ -205,9 +205,10 @@ impl Coordinator {
             // 上下文）；**$SS/$AA 组** → is_group（选中补全到完整码再展开成员，二级选择）。
             let min_prefix = self.rt().config.input.phrase.min_prefix;
             for hit in phrases.lookup_prefix(&state.input_buffer, &recent, min_prefix) {
-                let code = hit.nav_code.unwrap_or_default();
                 let text = Self::clamp_candidate_display(&hit.text, max_disp);
                 if let Some(src) = hit.command_src {
+                    // $CC 命令短语：选中直接执行，不二级展开。
+                    let code = hit.nav_code.unwrap_or_default();
                     candidates.push(Candidate {
                         text,
                         weight: PHRASE_WEIGHT_BASE + hit.weight,
@@ -218,7 +219,8 @@ impl Coordinator {
                         comment: hit.comment,
                         ..Default::default()
                     });
-                } else {
+                } else if let Some(code) = hit.nav_code {
+                    // $SS/$AA 组短语：选中补全到完整码再二级展开。
                     candidates.push(Candidate {
                         text: text.clone(),
                         weight: PHRASE_WEIGHT_BASE + hit.weight,
@@ -226,6 +228,16 @@ impl Coordinator {
                         is_group: true,
                         group_code: code,
                         group_name: text,
+                        comment: hit.comment,
+                        ..Default::default()
+                    });
+                } else {
+                    // 静态短语前缀命中（Literal/Template，command_src=None, nav_code=None）。
+                    candidates.push(Candidate {
+                        text,
+                        weight: PHRASE_WEIGHT_BASE + hit.weight,
+                        is_phrase: true,
+                        is_prefix: true,
                         comment: hit.comment,
                         ..Default::default()
                     });

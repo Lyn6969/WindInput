@@ -303,17 +303,22 @@ impl PhraseLayer {
             }
             let suffix = full_code[code.len()..].to_string();
             for e in entries {
-                if !is_cmdbar_grammar(&e.text) {
-                    continue; // 普通字面/模板短语不参与前缀列举
-                }
                 let phrase = match parse(&e.text) {
                     Ok(p) => p,
                     Err(_) => continue,
                 };
                 // prefix 语义：除非显式 `{prefix: false}` 否则都列。
+                // Literal/Template → 普通命中（command_src=None, nav_code=None）；
                 // $SS/$AA → **组** nav（选中补全到码再展开成员，二级选择）；
                 // $CC → **命令** nav（选中**直接执行**，不二级展开），display 经廉价上下文求值。
                 match &phrase {
+                    Phrase::Literal(_) | Phrase::Template(_) => {
+                        let display = match evaluate(&phrase, &ctx, reg) {
+                            Ok(ev) => ev.display,
+                            Err(_) => continue,
+                        };
+                        out.push(PhraseHit::plain(display, e.weight));
+                    }
                     Phrase::Array(ap) => {
                         if ap.modifiers.get_bool("prefix") == Some(false) {
                             continue;
@@ -341,7 +346,6 @@ impl PhraseLayer {
                             suffix.clone(),
                         ));
                     }
-                    _ => continue, // Literal / Template 不列
                 }
             }
         }
@@ -834,8 +838,8 @@ mod tests {
     }
 
     #[test]
-    fn test_prefix_nav_skips_literal_template() {
-        // 普通模板短语（无 marker）不参与前缀列举，维持精确匹配语义。
+    fn test_prefix_nav_includes_literal_template() {
+        // 静态/旧模板短语（无 marker）现在参与前缀列举，以字面文本出现在候选中。
         let mut map: HashMap<String, Vec<PhraseEntry>> = HashMap::new();
         map.insert(
             "rq".into(),
@@ -846,7 +850,12 @@ mod tests {
             }],
         );
         let layer = PhraseLayer { map };
-        assert!(layer.lookup_prefix_at("r", fixed(), &[], 1).is_empty());
+        let got = layer.lookup_prefix_at("r", fixed(), &[], 1);
+        // $Y-$MM-$DD 不含 cmdbar 语法，parse 返回 Literal，直接以原文出现。
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].text, "$Y-$MM-$DD");
+        assert!(got[0].command_src.is_none());
+        assert!(got[0].nav_code.is_none());
     }
 
     #[test]
@@ -890,5 +899,44 @@ mod tests {
         assert_eq!(small_int_chinese(20), "二十");
         assert_eq!(small_int_chinese(25), "二十五");
         assert_eq!(small_int_chinese(31), "三十一");
+    }
+
+    #[test]
+    fn lookup_prefix_lists_static_phrases() {
+        // 静态字面短语（Literal）应出现在前缀结果中，command_src=None，nav_code=None。
+        let mut map: HashMap<String, Vec<PhraseEntry>> = HashMap::new();
+        // 静态短语：码 yx，文本 user@example.com
+        map.insert(
+            "yx".into(),
+            vec![PhraseEntry {
+                text: "user@example.com".into(),
+                weight: 800,
+                position: 0,
+            }],
+        );
+        // $CC 命令短语：码 yxbd，保证命令短语仍正常工作
+        map.insert(
+            "yxbd".into(),
+            vec![PhraseEntry {
+                text: r#"$CC("百度", open("https://baidu.com"))"#.into(),
+                weight: 500,
+                position: 0,
+            }],
+        );
+        let layer = PhraseLayer { map };
+        let got = layer.lookup_prefix_at("y", fixed(), &[], 1);
+        // 静态短语应出现
+        let static_hit = got.iter().find(|h| h.text == "user@example.com");
+        assert!(static_hit.is_some(), "静态短语应出现在前缀结果中");
+        let sh = static_hit.unwrap();
+        assert!(sh.command_src.is_none(), "静态短语 command_src 应为 None");
+        assert!(sh.nav_code.is_none(), "静态短语 nav_code 应为 None");
+        // $CC 命令短语仍正常工作
+        let cmd_hit = got.iter().find(|h| h.text == "百度");
+        assert!(cmd_hit.is_some(), "$CC 命令短语应仍出现在前缀结果中");
+        assert!(
+            cmd_hit.unwrap().command_src.is_some(),
+            "$CC 命令短语 command_src 应非 None"
+        );
     }
 }
