@@ -323,6 +323,43 @@ impl Store {
         Ok(n)
     }
 
+    /// 导出全部用户短语为 wdict 文本。
+    pub fn export_user_phrases_wdict(&self, exported_at: &str) -> anyhow::Result<String> {
+        let rows: Vec<crate::wdict::PhraseIo> = self
+            .list_phrases()?
+            .into_iter()
+            .filter(|p| !p.is_system)
+            .map(|p| crate::wdict::PhraseIo {
+                code: p.code,
+                text: p.text,
+                weight: p.weight,
+                position: p.position,
+                enabled: p.enabled,
+            })
+            .collect();
+        Ok(crate::wdict::export_phrases_wdict(&rows, exported_at))
+    }
+
+    /// 导入用户短语（合并 upsert，is_system=false）。返回 (导入条数, 跳过条数)。
+    pub fn import_user_phrases_wdict(&self, text: &str) -> anyhow::Result<(usize, usize)> {
+        let (rows, skipped) =
+            crate::wdict::parse_phrases_wdict(text).map_err(|e| anyhow::anyhow!(e))?;
+        let imported = rows.len();
+        for r in rows {
+            self.put_phrase(
+                &r.code,
+                &r.text,
+                PhraseValue {
+                    weight: r.weight,
+                    position: r.position,
+                    enabled: r.enabled,
+                    is_system: false,
+                },
+            )?;
+        }
+        Ok((imported, skipped))
+    }
+
     /// 重置为默认：清空全部用户短语，返回删除条数。
     pub fn reset_phrases(&self) -> anyhow::Result<usize> {
         self.with_db(|db| {
@@ -554,6 +591,67 @@ mod tests {
         // 重置清空
         assert_eq!(s.reset_phrases().unwrap(), 1);
         assert_eq!(s.list_phrases().unwrap().len(), 0);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn export_import_user_phrases_roundtrip() {
+        let path = tmp("wind_phrases_io.redb");
+        let s = Store::open(&path).unwrap();
+        s.add_phrase("bj", "北京", 0, 1000).unwrap();
+        s.add_phrase("ml", "多行\n内容", 2, 500).unwrap();
+        let text = s
+            .export_user_phrases_wdict("2026-07-02T00:00:00+08:00")
+            .unwrap();
+        // 清空后再导入
+        s.reset_user_phrases().unwrap();
+        assert_eq!(s.list_user_phrases_paged(None, 0, 99).unwrap().1, 0);
+        let (imported, skipped) = s.import_user_phrases_wdict(&text).unwrap();
+        assert_eq!((imported, skipped), (2, 0));
+        let (rows, total) = s.list_user_phrases_paged(None, 0, 99).unwrap();
+        assert_eq!(total, 2);
+        assert!(
+            rows.iter()
+                .any(|p| p.code == "ml" && p.text == "多行\n内容"),
+            "多行往返无损"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn import_upsert_merges() {
+        let path = tmp("wind_phrases_import_merge.redb");
+        let s = Store::open(&path).unwrap();
+        s.add_phrase("bj", "北京", 0, 1).unwrap();
+        // 导入含同键(权重不同)+新键
+        let text = crate::wdict::export_phrases_wdict(
+            &[
+                crate::wdict::PhraseIo {
+                    code: "bj".into(),
+                    text: "北京".into(),
+                    weight: 9,
+                    position: 0,
+                    enabled: true,
+                },
+                crate::wdict::PhraseIo {
+                    code: "sh".into(),
+                    text: "上海".into(),
+                    weight: 1,
+                    position: 0,
+                    enabled: true,
+                },
+            ],
+            "t",
+        );
+        let (imported, _) = s.import_user_phrases_wdict(&text).unwrap();
+        assert_eq!(imported, 2);
+        let (rows, total) = s.list_user_phrases_paged(None, 0, 99).unwrap();
+        assert_eq!(total, 2, "同键合并不新增行");
+        assert_eq!(
+            rows.iter().find(|p| p.code == "bj").unwrap().weight,
+            9,
+            "同键更新权重"
+        );
         let _ = std::fs::remove_file(&path);
     }
 }
