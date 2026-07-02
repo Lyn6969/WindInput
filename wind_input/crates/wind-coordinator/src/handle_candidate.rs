@@ -31,6 +31,7 @@ impl Coordinator {
         }
         if let Some(store) = &self.store {
             let schema = self.engine_mgr.active_schema_id();
+            let schema = self.engine_mgr.data_schema_id(&schema); // 拼音族折叠到 "pinyin"
             if let Err(e) = store.record_freq(&schema, code, text) {
                 warn!("record_freq failed: {}", e);
             }
@@ -59,6 +60,7 @@ impl Coordinator {
             return;
         }
         let schema = self.engine_mgr.active_schema_id();
+        let schema = self.engine_mgr.data_schema_id(&schema); // 拼音族折叠到 "pinyin"，读写一致
         let input_len = code.len();
         // 取每个"消费整串"候选的词频记录。分段子候选（consumed_length < 整串，如「nihao」里的「你」
         // 只消费「ni」）的词频归属其自身前缀码，不能被整串码的历史计数上浮——否则单字会浮到整句

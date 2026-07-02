@@ -196,6 +196,7 @@ impl Coordinator {
 
     fn web_dict_list_paged(&self, params: &Value) -> anyhow::Result<Value> {
         let schema = str_param(params, "schemaId")?;
+        let schema = self.engine_mgr.data_schema_id(schema); // 拼音族折叠到 "pinyin"
         let prefix = params
             .get("prefix")
             .and_then(|v| v.as_str())
@@ -207,7 +208,7 @@ impl Coordinator {
             .store
             .as_ref()
             .ok_or_else(|| anyhow::anyhow!("无持久化存储"))?;
-        let all = store.search_user_words_prefix(schema, prefix, 0)?;
+        let all = store.search_user_words_prefix(&schema, prefix, 0)?;
         let total = all.len();
         let items: Vec<Value> = all
             .into_iter()
@@ -220,6 +221,7 @@ impl Coordinator {
 
     fn web_dict_search(&self, params: &Value) -> anyhow::Result<Value> {
         let schema = str_param(params, "schemaId")?;
+        let schema = self.engine_mgr.data_schema_id(schema); // 拼音族折叠到 "pinyin"
         let query = str_param(params, "query").unwrap_or("");
         let limit = usize_param(params, "limit", 50);
         let store = self
@@ -227,7 +229,7 @@ impl Coordinator {
             .as_ref()
             .ok_or_else(|| anyhow::anyhow!("无持久化存储"))?;
         let items: Vec<Value> = store
-            .search_user_words_prefix(schema, query, limit)?
+            .search_user_words_prefix(&schema, query, limit)?
             .into_iter()
             .map(word_item)
             .collect();
@@ -235,62 +237,57 @@ impl Coordinator {
     }
 
     fn web_dict_add(&self, params: &Value) -> anyhow::Result<Value> {
-        let (schema, code, text) = (
-            str_param(params, "schemaId")?,
-            str_param(params, "code")?,
-            str_param(params, "text")?,
-        );
+        let schema = str_param(params, "schemaId")?;
+        let schema = self.engine_mgr.data_schema_id(schema); // 拼音族折叠到 "pinyin"
+        let (code, text) = (str_param(params, "code")?, str_param(params, "text")?);
         let weight = i32_param(params, "weight");
         let store = self
             .store
             .as_ref()
             .ok_or_else(|| anyhow::anyhow!("无持久化存储"))?;
-        store.add_user_word(schema, code, text, weight)?;
+        store.add_user_word(&schema, code, text, weight)?;
         Ok(json!({ "ok": true }))
     }
 
     fn web_dict_update(&self, params: &Value) -> anyhow::Result<Value> {
-        let (schema, code, text) = (
-            str_param(params, "schemaId")?,
-            str_param(params, "code")?,
-            str_param(params, "text")?,
-        );
+        let schema = str_param(params, "schemaId")?;
+        let schema = self.engine_mgr.data_schema_id(schema); // 拼音族折叠到 "pinyin"
+        let (code, text) = (str_param(params, "code")?, str_param(params, "text")?);
         let weight = i32_param(params, "weight");
         let store = self
             .store
             .as_ref()
             .ok_or_else(|| anyhow::anyhow!("无持久化存储"))?;
         // 存在则改权重；不存在则新增（upsert 语义）。
-        if !store.update_user_word_weight(schema, code, text, weight)? {
-            store.add_user_word(schema, code, text, weight)?;
+        if !store.update_user_word_weight(&schema, code, text, weight)? {
+            store.add_user_word(&schema, code, text, weight)?;
         }
         Ok(json!({ "ok": true }))
     }
 
     fn web_dict_remove(&self, params: &Value) -> anyhow::Result<Value> {
-        let (schema, code, text) = (
-            str_param(params, "schemaId")?,
-            str_param(params, "code")?,
-            str_param(params, "text")?,
-        );
+        let schema = str_param(params, "schemaId")?;
+        let schema = self.engine_mgr.data_schema_id(schema); // 拼音族折叠到 "pinyin"
+        let (code, text) = (str_param(params, "code")?, str_param(params, "text")?);
         let store = self
             .store
             .as_ref()
             .ok_or_else(|| anyhow::anyhow!("无持久化存储"))?;
-        store.remove_user_word(schema, code, text)?;
+        store.remove_user_word(&schema, code, text)?;
         Ok(json!({ "ok": true }))
     }
 
     fn web_dict_clear(&self, params: &Value) -> anyhow::Result<Value> {
         let schema = str_param(params, "schemaId")?;
+        let schema = self.engine_mgr.data_schema_id(schema); // 拼音族折叠到 "pinyin"
         let store = self
             .store
             .as_ref()
             .ok_or_else(|| anyhow::anyhow!("无持久化存储"))?;
-        let all = store.search_user_words_prefix(schema, "", 0)?;
+        let all = store.search_user_words_prefix(&schema, "", 0)?;
         let n = all.len();
         for r in all {
-            store.remove_user_word(schema, &r.code, &r.text)?;
+            store.remove_user_word(&schema, &r.code, &r.text)?;
         }
         Ok(json!(n))
     }
@@ -454,6 +451,7 @@ impl Coordinator {
 
     fn web_freq_list_paged(&self, params: &Value) -> anyhow::Result<Value> {
         let schema = str_param(params, "schemaId")?;
+        let schema = self.engine_mgr.data_schema_id(schema); // 拼音族折叠到 "pinyin"
         let prefix = params.get("prefix").and_then(|v| v.as_str()).unwrap_or("");
         let offset = usize_param(params, "offset", 0);
         let limit = usize_param(params, "limit", 50);
@@ -461,7 +459,7 @@ impl Coordinator {
             .store
             .as_ref()
             .ok_or_else(|| anyhow::anyhow!("无持久化存储"))?;
-        let (page, total) = store.list_freq_paged(schema, prefix, offset, limit)?;
+        let (page, total) = store.list_freq_paged(&schema, prefix, offset, limit)?;
         let items: Vec<Value> = page
             .into_iter()
             .map(|(code, text, rec)| {
@@ -472,26 +470,25 @@ impl Coordinator {
     }
 
     fn web_freq_delete(&self, params: &Value) -> anyhow::Result<Value> {
-        let (schema, code, text) = (
-            str_param(params, "schemaId")?,
-            str_param(params, "code")?,
-            str_param(params, "text")?,
-        );
+        let schema = str_param(params, "schemaId")?;
+        let schema = self.engine_mgr.data_schema_id(schema); // 拼音族折叠到 "pinyin"
+        let (code, text) = (str_param(params, "code")?, str_param(params, "text")?);
         let store = self
             .store
             .as_ref()
             .ok_or_else(|| anyhow::anyhow!("无持久化存储"))?;
-        store.delete_freq(schema, code, text)?;
+        store.delete_freq(&schema, code, text)?;
         Ok(json!({ "ok": true }))
     }
 
     fn web_freq_clear(&self, params: &Value) -> anyhow::Result<Value> {
         let schema = str_param(params, "schemaId")?;
+        let schema = self.engine_mgr.data_schema_id(schema); // 拼音族折叠到 "pinyin"
         let store = self
             .store
             .as_ref()
             .ok_or_else(|| anyhow::anyhow!("无持久化存储"))?;
-        Ok(json!(store.clear_freq(schema)?))
+        Ok(json!(store.clear_freq(&schema)?))
     }
 
     fn web_shadow_list(&self, params: &Value) -> anyhow::Result<Value> {
@@ -591,12 +588,13 @@ impl Coordinator {
 
     fn web_temp_list(&self, params: &Value) -> anyhow::Result<Value> {
         let schema = str_param(params, "schemaId")?;
+        let schema = self.engine_mgr.data_schema_id(schema); // 拼音族折叠到 "pinyin"
         let store = self
             .store
             .as_ref()
             .ok_or_else(|| anyhow::anyhow!("无持久化存储"))?;
         let items: Vec<Value> = store
-            .search_temp_words_prefix(schema, "", 0)?
+            .search_temp_words_prefix(&schema, "", 0)?
             .into_iter()
             .map(|r| json!({ "code": r.code, "text": r.text, "count": r.count }))
             .collect();
@@ -604,42 +602,39 @@ impl Coordinator {
     }
 
     fn web_temp_promote(&self, params: &Value) -> anyhow::Result<Value> {
-        let (schema, code, text) = (
-            str_param(params, "schemaId")?,
-            str_param(params, "code")?,
-            str_param(params, "text")?,
-        );
+        let schema = str_param(params, "schemaId")?;
+        let schema = self.engine_mgr.data_schema_id(schema); // 拼音族折叠到 "pinyin"
+        let (code, text) = (str_param(params, "code")?, str_param(params, "text")?);
         let store = self
             .store
             .as_ref()
             .ok_or_else(|| anyhow::anyhow!("无持久化存储"))?;
-        store.promote_temp_word(schema, code, text)?;
+        store.promote_temp_word(&schema, code, text)?;
         Ok(json!({ "ok": true }))
     }
 
     fn web_temp_remove(&self, params: &Value) -> anyhow::Result<Value> {
-        let (schema, code, text) = (
-            str_param(params, "schemaId")?,
-            str_param(params, "code")?,
-            str_param(params, "text")?,
-        );
+        let schema = str_param(params, "schemaId")?;
+        let schema = self.engine_mgr.data_schema_id(schema); // 拼音族折叠到 "pinyin"
+        let (code, text) = (str_param(params, "code")?, str_param(params, "text")?);
         let store = self
             .store
             .as_ref()
             .ok_or_else(|| anyhow::anyhow!("无持久化存储"))?;
-        store.remove_temp_word(schema, code, text)?;
+        store.remove_temp_word(&schema, code, text)?;
         Ok(json!({ "ok": true }))
     }
 
     fn web_temp_promote_all(&self, params: &Value) -> anyhow::Result<Value> {
         let schema = str_param(params, "schemaId")?;
+        let schema = self.engine_mgr.data_schema_id(schema); // 拼音族折叠到 "pinyin"
         let store = self
             .store
             .as_ref()
             .ok_or_else(|| anyhow::anyhow!("无持久化存储"))?;
         let mut n = 0u64;
-        for r in store.search_temp_words_prefix(schema, "", 0)? {
-            if store.promote_temp_word(schema, &r.code, &r.text)? {
+        for r in store.search_temp_words_prefix(&schema, "", 0)? {
+            if store.promote_temp_word(&schema, &r.code, &r.text)? {
                 n += 1;
             }
         }
@@ -648,14 +643,15 @@ impl Coordinator {
 
     fn web_temp_clear(&self, params: &Value) -> anyhow::Result<Value> {
         let schema = str_param(params, "schemaId")?;
+        let schema = self.engine_mgr.data_schema_id(schema); // 拼音族折叠到 "pinyin"
         let store = self
             .store
             .as_ref()
             .ok_or_else(|| anyhow::anyhow!("无持久化存储"))?;
-        let all = store.search_temp_words_prefix(schema, "", 0)?;
+        let all = store.search_temp_words_prefix(&schema, "", 0)?;
         let n = all.len();
         for r in all {
-            store.remove_temp_word(schema, &r.code, &r.text)?;
+            store.remove_temp_word(&schema, &r.code, &r.text)?;
         }
         Ok(json!(n))
     }
@@ -1665,5 +1661,49 @@ mod tests {
         });
         let day = c.stat_collector.as_ref().unwrap().get_today_stat();
         assert_eq!(day.commit_count, 1, "已记录则 fallback 跳过");
+    }
+
+    /// Task 2：拼音类方案（pinyin_simp / double_pinyin）写入共享 "pinyin" 存储，
+    /// 跨方案 id 互读能取到同一份用户词。
+    #[test]
+    fn pinyin_and_shuangpin_share_userdict() {
+        use std::io::Write;
+        // 写两个拼音类方案 schema.toml，让 data_schema_id 折叠到 "pinyin"
+        let base_dir = std::env::temp_dir().join("wind_coord_share_userdict_test");
+        let schemas = base_dir.join("schemas");
+        std::fs::create_dir_all(&schemas).unwrap();
+        for name in ["pinyin_simp", "double_pinyin"] {
+            let mut f = std::fs::File::create(schemas.join(format!("{name}.schema.toml"))).unwrap();
+            write!(f, "[engine]\ntype = \"pinyin\"\n").unwrap();
+        }
+
+        let db_path = std::env::temp_dir().join("wind_coord_share_userdict.redb");
+        let _ = std::fs::remove_file(&db_path);
+        let store = Arc::new(Store::open(&db_path).unwrap());
+        let c = Coordinator::new_headless_with_store(
+            Config::default(),
+            Some(base_dir.as_path()),
+            Arc::clone(&store),
+        );
+
+        // 用拼音方案加词
+        c.web_data_rpc(
+            "dict.add",
+            &json!({ "schemaId": "pinyin_simp", "code": "nihao", "text": "你好", "weight": 5 }),
+        )
+        .unwrap();
+
+        // 用双拼方案读，应读到同一条（共享 "pinyin" 存储键）
+        let list = c
+            .web_data_rpc(
+                "dict.listPaged",
+                &json!({ "schemaId": "double_pinyin", "offset": 0, "limit": 100 }),
+            )
+            .unwrap();
+        let items = list["items"].as_array().unwrap();
+        assert!(
+            items.iter().any(|it| it["text"] == "你好"),
+            "双拼应读到拼音下加的词（data_schema_id 共享）"
+        );
     }
 }
