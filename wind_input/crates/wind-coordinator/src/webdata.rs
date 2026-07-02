@@ -647,6 +647,7 @@ impl Coordinator {
                     "position": p.position,
                     "weight": p.weight,
                     "enabled": p.enabled,
+                    "isSystem": p.is_system,
                 })
             })
             .collect();
