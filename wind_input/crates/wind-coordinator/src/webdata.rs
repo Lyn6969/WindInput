@@ -136,6 +136,7 @@ impl Coordinator {
             "shadow.pin" => self.web_shadow_pin(params),
             "shadow.delete" => self.web_shadow_delete(params),
             "shadow.removeRule" => self.web_shadow_remove_rule(params),
+            "shadow.addRule" => self.web_shadow_add_rule(params),
 
             // ── phrase.*（用户短语，全局，redb 持久化）──────────
             "phrase.list" => self.web_phrase_list(),
@@ -563,6 +564,28 @@ impl Coordinator {
             .as_ref()
             .ok_or_else(|| anyhow::anyhow!("无持久化存储"))?;
         store.remove_shadow_rule(schema, code, word)?;
+        Ok(json!({ "ok": true }))
+    }
+
+    /// 候选调整手动添加：type="hide" 转屏蔽；否则（pin）按 position 置顶。
+    /// 匹配设置端候选调整对话框契约。
+    fn web_shadow_add_rule(&self, params: &Value) -> anyhow::Result<Value> {
+        let (schema, code, word) = (
+            str_param(params, "schemaId")?,
+            str_param(params, "code")?,
+            str_param(params, "word")?,
+        );
+        let kind = params.get("type").and_then(|v| v.as_str()).unwrap_or("pin");
+        let store = self
+            .store
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("无持久化存储"))?;
+        if kind == "hide" {
+            store.delete_shadow(schema, code, word)?;
+        } else {
+            let position = usize_param(params, "position", 0);
+            store.pin_shadow(schema, code, word, None, position)?;
+        }
         Ok(json!({ "ok": true }))
     }
 
@@ -1304,6 +1327,39 @@ mod tests {
             .web_data_rpc("shadow.list", &json!({ "schemaId": "wb" }))
             .unwrap();
         assert_eq!(list2.as_array().unwrap().len(), 0, "removeRule 后应清空");
+    }
+
+    #[test]
+    fn shadow_add_rule_routes_pin_and_hide() {
+        let c = coord("shadow_add_rule");
+        // pin：带 position
+        c.web_data_rpc(
+            "shadow.addRule",
+            &json!({ "schemaId": "wb", "code": "aaaa", "word": "恭恭敬敬", "type": "pin", "position": 2 }),
+        )
+        .unwrap();
+        let list = c
+            .web_data_rpc("shadow.list", &json!({ "schemaId": "wb" }))
+            .unwrap();
+        let arr = list.as_array().unwrap();
+        // aaaa 应有一条 pin，position=2
+        assert!(arr.iter().any(|e| e["code"] == "aaaa"));
+        // hide：转为 delete
+        c.web_data_rpc(
+            "shadow.addRule",
+            &json!({ "schemaId": "wb", "code": "bbbb", "word": "某词", "type": "hide" }),
+        )
+        .unwrap();
+        let list2 = c
+            .web_data_rpc("shadow.list", &json!({ "schemaId": "wb" }))
+            .unwrap();
+        assert!(
+            list2
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|e| e["code"] == "bbbb")
+        );
     }
 
     #[test]
