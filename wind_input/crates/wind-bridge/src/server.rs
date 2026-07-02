@@ -593,7 +593,39 @@ pub(crate) fn dispatch_command(
             } else {
                 (i32::MIN, i32::MIN)
             };
-            handler.handle_show_context_menu(x, y);
+            // macOS：`.app` 用此请求「查询菜单项」以构建原生 NSMenu，返回统一菜单树帧。
+            // 其它平台：进程内弹出菜单窗口（Windows popup_menu），仅回 ack。
+            #[cfg(target_os = "macos")]
+            {
+                let _ = (x, y);
+                Some(handler.query_main_menu_encoded())
+            }
+            #[cfg(not(target_os = "macos"))]
+            {
+                handler.handle_show_context_menu(x, y);
+                Some(encode_ack())
+            }
+        }
+
+        // ── darwin .app 统一菜单项被选中（菜单 id i32 LE，上行）──
+        CMD_MENU_ACTION => {
+            if payload.len() >= 4 {
+                let id = i32::from_le_bytes(payload[0..4].try_into().unwrap());
+                handler.handle_menu_action_id(id);
+            }
+            Some(encode_ack())
+        }
+
+        // ── darwin .app 候选右键上下文菜单动作（index i32 + actionLen u32 + action UTF-8，上行）──
+        CMD_CANDIDATE_CONTEXT_MENU => {
+            if payload.len() >= 8 {
+                let index = i32::from_le_bytes(payload[0..4].try_into().unwrap());
+                let action_len = u32::from_le_bytes(payload[4..8].try_into().unwrap()) as usize;
+                if payload.len() >= 8 + action_len {
+                    let action = std::str::from_utf8(&payload[8..8 + action_len]).unwrap_or("");
+                    handler.handle_candidate_context_menu(index, action);
+                }
+            }
             Some(encode_ack())
         }
 

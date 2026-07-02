@@ -668,6 +668,40 @@ pub fn encode_candidate_menu_flags(per_cand: &[u8]) -> Vec<u8> {
     frame(CMD_CANDIDATE_MENU_FLAGS, p)
 }
 
+/// 统一菜单树的线格式节点（wind-ipc 本地类型，避免反向依赖 wind-ui）。
+/// 上游（coordinator）把 `MenuItemSpec` 映射为此结构后编码。
+#[derive(Debug, Clone, Default)]
+pub struct MenuNode {
+    /// 菜单 id（macOS .app 经 NSMenuItem.tag 回传；分隔线/子菜单父项为 0）。
+    pub id: i32,
+    pub separator: bool,
+    pub checked: bool,
+    pub disabled: bool,
+    pub label: String,
+    pub children: Vec<MenuNode>,
+}
+
+/// CmdMenuShow (0x0506): 统一菜单树（响应 CmdShowContextMenu）。
+/// 递归布局，与 Swift `BinaryCodec.decodeMenuItems` 对齐：
+///   count:u32 + count×item；item = id:i32 + flags:u8 + labelLen:u32 + label(UTF-8) + children(递归)
+///   flags 位：bit0=separator bit1=checked bit2=disabled
+pub fn encode_menu_show(items: &[MenuNode]) -> Vec<u8> {
+    let mut p = Vec::new();
+    push_menu_items(&mut p, items);
+    frame(CMD_MENU_SHOW, p)
+}
+
+fn push_menu_items(out: &mut Vec<u8>, items: &[MenuNode]) {
+    out.extend_from_slice(&(items.len() as u32).to_le_bytes());
+    for it in items {
+        out.extend_from_slice(&it.id.to_le_bytes());
+        let flags = (it.separator as u8) | ((it.checked as u8) << 1) | ((it.disabled as u8) << 2);
+        out.push(flags);
+        push_string(out, &it.label);
+        push_menu_items(out, &it.children);
+    }
+}
+
 /// CmdTooltipShow (0x0508): textLen+text + bgLen+bg + fgLen+fg + fontPathLen+fontPath
 pub fn encode_tooltip_show(text: &str, bg: &str, fg: &str, font_path: &str) -> Vec<u8> {
     let mut p = Vec::new();
@@ -776,6 +810,93 @@ mod darwin_push_tests {
         let n = u32::from_le_bytes(p[8..12].try_into().unwrap()) as usize;
         assert_eq!(n, "五笔".len());
         assert_eq!(&p[12..12 + n], "五笔".as_bytes());
+    }
+
+    // 递归解码器：镜像 Swift BinaryCodec.decodeMenuItems，作为 encode_menu_show 的规范验证。
+    struct DecodedItem {
+        id: i32,
+        flags: u8,
+        label: String,
+        children: Vec<DecodedItem>,
+    }
+    fn decode_menu_items(p: &[u8], off: &mut usize) -> Vec<DecodedItem> {
+        let n = u32::from_le_bytes(p[*off..*off + 4].try_into().unwrap()) as usize;
+        *off += 4;
+        let mut out = Vec::with_capacity(n);
+        for _ in 0..n {
+            let id = i32::from_le_bytes(p[*off..*off + 4].try_into().unwrap());
+            *off += 4;
+            let flags = p[*off];
+            *off += 1;
+            let ln = u32::from_le_bytes(p[*off..*off + 4].try_into().unwrap()) as usize;
+            *off += 4;
+            let label = String::from_utf8(p[*off..*off + ln].to_vec()).unwrap();
+            *off += ln;
+            let children = decode_menu_items(p, off);
+            out.push(DecodedItem {
+                id,
+                flags,
+                label,
+                children,
+            });
+        }
+        out
+    }
+
+    #[test]
+    fn menu_show_roundtrips_nested_tree_le() {
+        let tree = vec![
+            MenuNode {
+                id: 100,
+                label: "英文".into(),
+                checked: true,
+                ..Default::default()
+            },
+            MenuNode {
+                id: 0,
+                label: "主题".into(),
+                children: vec![
+                    MenuNode {
+                        id: 2000,
+                        label: "默认".into(),
+                        checked: true,
+                        ..Default::default()
+                    },
+                    MenuNode {
+                        separator: true,
+                        ..Default::default()
+                    },
+                    MenuNode {
+                        id: 4001,
+                        label: "亮色".into(),
+                        disabled: true,
+                        ..Default::default()
+                    },
+                ],
+                ..Default::default()
+            },
+        ];
+        let f = encode_menu_show(&tree);
+        assert_eq!(cmd_of(&f), CMD_MENU_SHOW);
+        let p = &f[8..];
+        let mut off = 0usize;
+        let top = decode_menu_items(p, &mut off);
+        assert_eq!(off, p.len(), "整帧应被消费完（无游离字节）");
+        assert_eq!(top.len(), 2);
+        assert_eq!(top[0].id, 100);
+        assert_eq!(top[0].flags & 0x02, 0x02); // checked
+        assert_eq!(top[0].label, "英文");
+        assert!(top[0].children.is_empty());
+        // 子菜单父项 id=0、无勾选，含 3 子项
+        assert_eq!(top[1].label, "主题");
+        assert_eq!(top[1].id, 0);
+        let sub = &top[1].children;
+        assert_eq!(sub.len(), 3);
+        assert_eq!(sub[0].id, 2000);
+        assert_eq!(sub[0].flags & 0x02, 0x02); // checked
+        assert_eq!(sub[1].flags & 0x01, 0x01); // separator
+        assert_eq!(sub[2].id, 4001);
+        assert_eq!(sub[2].flags & 0x04, 0x04); // disabled
     }
 
     #[test]

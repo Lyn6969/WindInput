@@ -239,6 +239,19 @@ pub trait MessageHandler: Send + Sync {
     /// darwin: .app 鼠标 hover 候选（页内下标，-1=无）。默认空。
     fn handle_candidate_hover(&self, _page_local_index: i32) {}
 
+    /// darwin: 查询功能主菜单，返回已编码的 `CmdMenuShow` 帧字节（响应 `CmdShowContextMenu`）。
+    /// `.app` 端解码为原生 NSMenu。默认返回空 `Vec`（无菜单的 handler）。
+    fn query_main_menu_encoded(&self) -> Vec<u8> {
+        Vec::new()
+    }
+
+    /// darwin: .app 回传统一菜单项选择（菜单 id）。默认空。
+    fn handle_menu_action_id(&self, _id: i32) {}
+
+    /// darwin: .app 候选右键上下文菜单动作（页内下标 + 动作串）。
+    /// action ∈ {move_top, move_up, move_down, delete, reset_default, copy}。默认空。
+    fn handle_candidate_context_menu(&self, _page_local_index: i32, _action: &str) {}
+
     /// 返回当前权威模式 (chinese_mode, full_width)，供 FocusGained 同步路径回传 ModePush。
     /// 必须极轻量（仅锁+读两字段），不得有任何阻塞/跨进程调用——DLL 正同步阻塞等本值。
     /// 与 Go `MessageHandler.GetCurrentMode` 对齐。默认返回中文模式（安全默认）。

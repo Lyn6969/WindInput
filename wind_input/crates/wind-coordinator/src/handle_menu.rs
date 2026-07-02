@@ -127,6 +127,25 @@ impl Coordinator {
     /// above=true：菜单在 (x,y) 上方弹出（工具栏触发，避免遮挡工具栏）；
     /// y_bottom 为工具栏底边，上方空间不足时改为从 y_bottom 向下弹出。
     pub(crate) fn show_main_menu(&self, x: i32, y: i32, y_bottom: i32, above: bool) {
+        let items = self.build_main_menu_items();
+        {
+            let mut s = self.state.lock().unwrap_or_else(|e| e.into_inner());
+            s.menu_open = true;
+            s.menu_target_page_local = 0;
+            s.menu_target_text = String::new();
+        }
+        let _ = self.ui_tx.send(UiCommand::ShowCandidateMenu {
+            items,
+            x,
+            y,
+            y_bottom,
+            above,
+        });
+    }
+
+    /// 构建功能主菜单项树（纯构建，不改状态/不弹窗）。
+    /// Windows 经 `show_main_menu` 进程内渲染；macOS 经 `query_main_menu_encoded` 序列化下发给 `.app` 原生 NSMenu。
+    pub(crate) fn build_main_menu_items(&self) -> Vec<wind_ui::manager::MenuItemSpec> {
         use wind_ui::manager::MenuItemSpec as M;
         let (chinese, punct, full, s2t, filter_mode, toolbar_vis) = {
             let s = self.state.lock().unwrap_or_else(|e| e.into_inner());
@@ -242,19 +261,25 @@ impl Coordinator {
             M::separator(),
             M::leaf("关于", cmd(MenuCmd::OpenAbout), true, false),
         ];
-        {
-            let mut s = self.state.lock().unwrap_or_else(|e| e.into_inner());
-            s.menu_open = true;
-            s.menu_target_page_local = 0;
-            s.menu_target_text = String::new();
-        }
-        let _ = self.ui_tx.send(UiCommand::ShowCandidateMenu {
-            items,
-            x,
-            y,
-            y_bottom,
-            above,
-        });
+        items
+    }
+
+    /// 把 `MenuItemSpec` 树映射为线格式 `MenuNode` 树（id 由 `MenuKind::to_menu_id` 派生）。
+    pub(crate) fn menu_items_to_nodes(
+        items: &[wind_ui::manager::MenuItemSpec],
+    ) -> Vec<wind_ipc::codec::MenuNode> {
+        use wind_ui::manager::MenuKind;
+        items
+            .iter()
+            .map(|it| wind_ipc::codec::MenuNode {
+                id: it.kind.to_menu_id(),
+                separator: matches!(it.kind, MenuKind::Separator),
+                checked: it.checked,
+                disabled: !it.enabled,
+                label: it.label.clone(),
+                children: Self::menu_items_to_nodes(&it.children),
+            })
+            .collect()
     }
 
     // macOS 用 IMK 原生菜单, 不走协调器弹出菜单键转发 (见 coordinator handle_key_event 门控)。

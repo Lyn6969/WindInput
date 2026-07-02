@@ -39,6 +39,8 @@ pub const CMD_SYSTEM_MODE_SWITCH: u16 = 0x020B;
 // darwin .app 上行（请求 socket）：鼠标候选交互。方向与下行 0x020D/0x020E 由 dispatch 上下文区分。
 pub const CMD_CANDIDATE_SELECT: u16 = 0x020D; // payload: pageLocalIndex u32 LE
 pub const CMD_CANDIDATE_HOVER: u16 = 0x020E; // payload: pageLocalIndex i32 LE (-1=无)
+pub const CMD_CANDIDATE_CONTEXT_MENU: u16 = 0x020F; // 上行：候选右键动作 (payload: index i32 + actionLen u32 + action UTF-8)
+pub const CMD_MENU_ACTION: u16 = 0x0210; // 上行：统一菜单项被选中 (payload: 菜单 id i32 LE)
 
 // 光标 & 选区
 pub const CMD_CARET_UPDATE: u16 = 0x0301;

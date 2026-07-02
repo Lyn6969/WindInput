@@ -1601,11 +1601,49 @@ impl Coordinator {
             .candidate_shown
             .lock()
             .unwrap_or_else(|e| e.into_inner()) = true;
+        // macOS：把当前页候选右键菜单的禁用位随候选更新一并推给 `.app`，供其右键即时灰显。
+        // Windows 的右键菜单在进程内 `show_candidate_menu` 实时算 enabled，不走此推送。
+        #[cfg(target_os = "macos")]
+        self.push_candidate_menu_flags(state, start, end);
         tracing::debug!(
             "notify_ui_update: build+send {:?} (n={})",
             t_nu.elapsed(),
             n_items
         );
+    }
+
+    /// macOS：计算当前页每候选的右键菜单禁用位并经 push 通道下发（CmdCandidateMenuFlags 0x0505）。
+    /// 位定义与 Swift CandidatePanel 对齐：0x01 上移 / 0x02 下移 / 0x04 置顶 / 0x08 删除 / 0x10 恢复默认。
+    /// 语义对齐进程内 `show_candidate_menu`：置顶恒可用；首项禁上移、末项禁下移；单字禁删除；无 shadow 规则禁恢复默认。
+    #[cfg(target_os = "macos")]
+    pub(crate) fn push_candidate_menu_flags(&self, state: &State, start: usize, end: usize) {
+        if !self.push_server.has_clients() || start >= end {
+            return;
+        }
+        let schema = self.engine_mgr.active_schema_id();
+        let code = &state.input_buffer;
+        let total = state.candidates.len();
+        let mut flags = Vec::with_capacity(end - start);
+        for idx in start..end.min(total) {
+            let word = &state.candidates[idx].text;
+            let mut f = 0u8;
+            if idx == 0 {
+                f |= 0x01; // 首项：禁上移
+            }
+            if idx + 1 >= total {
+                f |= 0x02; // 末项：禁下移
+            }
+            // 0x04 置顶恒可用
+            if word.chars().count() <= 1 {
+                f |= 0x08; // 单字：禁删除（对齐 candidate_op 的单字保护）
+            }
+            if code.is_empty() || !self.shadow_has_rule(&schema, code, word) {
+                f |= 0x10; // 无 shadow 规则：禁恢复默认
+            }
+            flags.push(f);
+        }
+        self.push_server
+            .push_to_active(&wind_ipc::codec::encode_candidate_menu_flags(&flags));
     }
 
     pub(crate) fn notify_ui_hide(&self) {
@@ -2232,6 +2270,67 @@ impl MessageHandler for Coordinator {
             }
             _ => None,
         }
+    }
+
+    /// macOS `.app` 查询功能主菜单：构建菜单树并编码为 `CmdMenuShow` 帧字节。
+    /// Windows 走进程内 `show_main_menu` 渲染，不用此路径（返回空帧亦无害）。
+    fn query_main_menu_encoded(&self) -> Vec<u8> {
+        let items = self.build_main_menu_items();
+        let nodes = Self::menu_items_to_nodes(&items);
+        wind_ipc::codec::encode_menu_show(&nodes)
+    }
+
+    /// macOS `.app` 回传统一菜单选择：由菜单 id 还原动作并派发。
+    fn handle_menu_action_id(&self, id: i32) {
+        if let Some(kind) = wind_ui::manager::MenuKind::from_menu_id(id) {
+            self.menu_action(kind);
+        } else {
+            tracing::debug!("handle_menu_action_id: 未知菜单 id {}", id);
+        }
+    }
+
+    /// macOS `.app` 鼠标 hover 候选：复用 Windows 进程内路径的 `mouse_hover`
+    /// （置 hover_index + 重绘带高亮的候选帧）。
+    fn handle_candidate_hover(&self, page_local_index: i32) {
+        self.mouse_hover(page_local_index);
+    }
+
+    /// macOS `.app` 候选右键动作：动作串 → 词条操作/复制，作用于页内下标候选。
+    fn handle_candidate_context_menu(&self, page_local_index: i32, action: &str) {
+        use wind_ui::manager::{CandidateOp, UiCommand};
+        if page_local_index < 0 {
+            return;
+        }
+        let page_local = page_local_index as usize;
+        let op = match action {
+            "move_top" => CandidateOp::MoveTop,
+            "move_up" => CandidateOp::MoveUp,
+            "move_down" => CandidateOp::MoveDown,
+            "delete" => CandidateOp::Delete,
+            "reset_default" => CandidateOp::Reset,
+            "copy" => {
+                // 解析页内下标对应候选文本，交 UI 侧写剪贴板（macOS 走 popup_menu::set_clipboard_text）。
+                let text = {
+                    let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+                    let (start, end) = self.page_range(&state);
+                    let idx = start + page_local;
+                    if idx < end && idx < state.candidates.len() {
+                        state.candidates[idx].text.clone()
+                    } else {
+                        String::new()
+                    }
+                };
+                if !text.is_empty() {
+                    let _ = self.ui_tx.send(UiCommand::CopyToClipboard(text));
+                }
+                return;
+            }
+            other => {
+                tracing::debug!("handle_candidate_context_menu: 未知动作 {}", other);
+                return;
+            }
+        };
+        self.candidate_op(op, page_local);
     }
 
     fn handle_show_context_menu(&self, x: i32, y: i32) {

@@ -208,6 +208,76 @@ pub enum MenuKind {
     Separator,
 }
 
+impl MenuKind {
+    /// 稳定菜单 id：macOS `.app` 把它写进 `NSMenuItem.tag`，选中后经 `CmdMenuAction`
+    /// 原样回传，Rust 据此还原动作。构建菜单树（下发）与处理回传（还原）共用此映射，
+    /// 二者必须一致。`Submenu`/`Separator` 不回传，恒为 0。
+    /// id 区间：1 复制｜10-19 词条操作｜100-199 固定命令｜1000+ 方案｜2000+ 主题｜3000+ 过滤｜4000+ 明暗。
+    pub fn to_menu_id(self) -> i32 {
+        match self {
+            MenuKind::Separator | MenuKind::Submenu => 0,
+            MenuKind::Copy => 1,
+            MenuKind::Op(op) => match op {
+                CandidateOp::MoveTop => 10,
+                CandidateOp::MoveUp => 11,
+                CandidateOp::MoveDown => 12,
+                CandidateOp::Delete => 13,
+                CandidateOp::Reset => 14,
+            },
+            MenuKind::Command(cmd) => match cmd {
+                MenuCmd::SchemaEnglish => 100,
+                MenuCmd::TogglePunct => 101,
+                MenuCmd::ToggleWidth => 102,
+                MenuCmd::ToggleS2t => 103,
+                MenuCmd::ToggleToolbar => 104,
+                MenuCmd::ReloadConfig => 105,
+                MenuCmd::RestartService => 106,
+                MenuCmd::OpenConfigDir => 107,
+                MenuCmd::OpenDictionary => 108,
+                MenuCmd::OpenSettings => 109,
+                MenuCmd::OpenAbout => 110,
+                MenuCmd::TakeScreenshot => 111,
+                MenuCmd::ScreenshotCandidateToClipboard => 112,
+                MenuCmd::SchemaSelect(i) => 1000 + i as i32,
+                MenuCmd::ThemeSelect(i) => 2000 + i as i32,
+                MenuCmd::FilterMode(i) => 3000 + i as i32,
+                MenuCmd::ThemeStyle(s) => 4000 + s as i32,
+            },
+        }
+    }
+
+    /// 由回传的菜单 id 还原动作；未知 id / 不可点击项返回 None。
+    pub fn from_menu_id(id: i32) -> Option<MenuKind> {
+        let cmd = match id {
+            1 => return Some(MenuKind::Copy),
+            10 => return Some(MenuKind::Op(CandidateOp::MoveTop)),
+            11 => return Some(MenuKind::Op(CandidateOp::MoveUp)),
+            12 => return Some(MenuKind::Op(CandidateOp::MoveDown)),
+            13 => return Some(MenuKind::Op(CandidateOp::Delete)),
+            14 => return Some(MenuKind::Op(CandidateOp::Reset)),
+            100 => MenuCmd::SchemaEnglish,
+            101 => MenuCmd::TogglePunct,
+            102 => MenuCmd::ToggleWidth,
+            103 => MenuCmd::ToggleS2t,
+            104 => MenuCmd::ToggleToolbar,
+            105 => MenuCmd::ReloadConfig,
+            106 => MenuCmd::RestartService,
+            107 => MenuCmd::OpenConfigDir,
+            108 => MenuCmd::OpenDictionary,
+            109 => MenuCmd::OpenSettings,
+            110 => MenuCmd::OpenAbout,
+            111 => MenuCmd::TakeScreenshot,
+            112 => MenuCmd::ScreenshotCandidateToClipboard,
+            1000..=1999 => MenuCmd::SchemaSelect((id - 1000) as usize),
+            2000..=2999 => MenuCmd::ThemeSelect((id - 2000) as usize),
+            3000..=3999 => MenuCmd::FilterMode((id - 3000) as usize),
+            4000..=4999 => MenuCmd::ThemeStyle((id - 4000) as u8),
+            _ => return None,
+        };
+        Some(MenuKind::Command(cmd))
+    }
+}
+
 /// 菜单项规格（由协调器构建）。支持勾选态与子菜单。
 #[derive(Debug, Clone)]
 pub struct MenuItemSpec {
