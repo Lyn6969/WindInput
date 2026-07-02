@@ -7,8 +7,11 @@ use crate::candidate::Candidate;
 
 /// 对 `candidates` 应用 shadow 规则：
 ///   1. 删除 `deleted` 中出现的词（按 text 匹配）；
-///   2. 按 `position` 升序把 `pinned`（词, 目标位置）重新就位——升序保证后插入项
-///      考虑前面已就位的项，位置越界时钳到末尾。
+///   2. 把 `pinned`（词, 目标位置）重新就位：
+///      - 按 `position` 升序处理，保证后续插入考虑前面已就位的项；
+///      - 同一 `position` 内按"最新在前"排列——`pinned` 契约为最新在前（index 0 最近），
+///        排序键 `(position 升序, 原始索引降序)` 使较老项先 insert、最新项最后 insert 停在最前；
+///      - 位置越界时钳到末尾。
 ///
 /// `pinned` 用 `(String, usize)` 元组而非 store 的 ShadowPin，使本 crate 不依赖 wind-store。
 pub fn apply_shadow(
@@ -19,10 +22,13 @@ pub fn apply_shadow(
     if !deleted.is_empty() {
         candidates.retain(|c| !deleted.iter().any(|d| d == &c.text));
     }
-    // 按 position 升序应用，使后续插入考虑前面已就位的项。
-    let mut pins: Vec<&(String, usize)> = pinned.iter().collect();
-    pins.sort_by_key(|p| p.1);
-    for (word, position) in pins {
+    // 按 position 升序应用；同一 position 内按"最新在前"（入参 index 小者更近）就位。
+    // 契约：pinned 为最新在前（store apply_pin insert(0) + coordinator 原序传入）。
+    // 排序键 (position 升序, 原始索引降序)：同 position 内让较老项先 insert，
+    // 最新项最后 insert 停在最前，得到"后添加者靠前"。
+    let mut idx: Vec<(usize, &(String, usize))> = pinned.iter().enumerate().collect();
+    idx.sort_by(|a, b| a.1.1.cmp(&b.1.1).then(b.0.cmp(&a.0)));
+    for (_, (word, position)) in idx {
         if let Some(cur) = candidates.iter().position(|c| &c.text == word) {
             let cand = candidates.remove(cur);
             let at = (*position).min(candidates.len());
@@ -93,5 +99,31 @@ mod tests {
         let mut c = cands(&["甲", "乙"]);
         apply_shadow(&mut c, &[], &[("不存在".to_string(), 0)]);
         assert_eq!(texts(&c), ["甲", "乙"]);
+    }
+
+    #[test]
+    fn same_position_latest_first() {
+        // pinned 为"最新在前"：乙(index0=最近) 与 甲(index1) 都 → pos0。
+        let mut c = cands(&["甲", "乙", "丙", "丁"]);
+        apply_shadow(&mut c, &[], &[("乙".to_string(), 0), ("甲".to_string(), 0)]);
+        // 后固定的乙应在最前：[乙, 甲, 丙, 丁]
+        assert_eq!(texts(&c), ["乙", "甲", "丙", "丁"]);
+    }
+
+    #[test]
+    fn three_same_position_latest_first() {
+        // 最新在前：丙(最近) > 乙 > 甲(最早)，都 → pos0。
+        let mut c = cands(&["甲", "乙", "丙", "丁"]);
+        apply_shadow(
+            &mut c,
+            &[],
+            &[
+                ("丙".to_string(), 0),
+                ("乙".to_string(), 0),
+                ("甲".to_string(), 0),
+            ],
+        );
+        // 期望最近的排最前：[丙, 乙, 甲, 丁]
+        assert_eq!(texts(&c), ["丙", "乙", "甲", "丁"]);
     }
 }
