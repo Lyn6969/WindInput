@@ -569,6 +569,16 @@ impl EngineManager {
         .map(|s| s.engine.engine_type.to_lowercase())
     }
 
+    /// 存储归属 id：拼音引擎方案统一为 "pinyin"（拼音/双拼共享一份用户词/临时/词频）；
+    /// 其余方案（码表/混输/未知）用自身 id。仅影响存储键，不影响引擎行为。
+    pub fn data_schema_id(&self, schema_id: &str) -> String {
+        if self.schema_engine_type(schema_id).as_deref() == Some("pinyin") {
+            "pinyin".to_string()
+        } else {
+            schema_id.to_string()
+        }
+    }
+
     /// 方案基础定义（不含 override 层）——设置页计算 saveConfig 稀疏 diff 的基准。
     pub fn schema_base(&self, schema_id: &str) -> Option<Schema> {
         Self::read_schema(schema_id, self.data_dir.as_deref(), None)
@@ -1214,15 +1224,16 @@ impl EngineManager {
             }
             // 注入 redb Store 时挂用户词/临时词层（L 造词显现）：让拼音造的词进候选合并。
             // 仅含 User/Temp 层（系统词典仍由引擎自身的 CachedDict 承担 Viterbi/前缀）。
+            // 存储归属统一为 "pinyin"，使全拼/双拼方案共享同一份用户词与临时词。
             if let Some(store) = &store {
                 let dm = wind_dict::DictManager::new();
                 dm.register_layer(Box::new(wind_dict::StoreUserLayer::new(
                     store.clone(),
-                    schema_id,
+                    "pinyin",
                 )));
                 dm.register_layer(Box::new(wind_dict::StoreTempLayer::new(
                     store.clone(),
-                    schema_id,
+                    "pinyin",
                 )));
                 engine = engine.with_store_layers(Arc::new(dm));
             }
@@ -2086,6 +2097,75 @@ mod tests {
         assert_eq!(
             installed, sorted,
             "installed_schemas 应按字典序排序且无重复"
+        );
+
+        let _ = std::fs::remove_dir_all(&base_dir);
+        let _ = std::fs::remove_dir_all(&ov_dir);
+    }
+
+    /// Task 1：data_schema_id 拼音族折叠 + 未知方案返回自身 id。
+    ///
+    /// 策略：用 temp 目录写最小 schema TOML（与既有测试同模式）：
+    ///   - "py_test"：engine.type="pinyin" → data_schema_id 应返回 "pinyin"
+    ///   - "ct_test"：engine.type="codetable" → 返回自身 "ct_test"
+    ///   - "nonexistent"：无此 schema 文件 → schema_engine_type=None → 返回自身
+    #[test]
+    fn data_schema_id_folds_pinyin_and_returns_self() {
+        use std::io::Write;
+
+        let base_dir = std::env::temp_dir().join("wind_eng_data_schema_id_test");
+        let schemas = base_dir.join("schemas");
+        std::fs::create_dir_all(&schemas).unwrap();
+
+        // 拼音方案
+        {
+            let mut f = std::fs::File::create(schemas.join("py_test.schema.toml")).unwrap();
+            write!(
+                f,
+                "[schema]\nid = \"py_test\"\n[engine]\ntype = \"pinyin\"\n"
+            )
+            .unwrap();
+        }
+
+        // 码表方案
+        {
+            let mut f = std::fs::File::create(schemas.join("ct_test.schema.toml")).unwrap();
+            write!(
+                f,
+                "[schema]\nid = \"ct_test\"\n[engine]\ntype = \"codetable\"\n"
+            )
+            .unwrap();
+        }
+
+        let mut cfg = Config::default();
+        cfg.schema.active = "ct_test".into();
+        cfg.schema.available = vec!["ct_test".into(), "py_test".into()];
+
+        let ov_dir = std::env::temp_dir().join("wind_eng_data_schema_id_ov");
+        let _ = std::fs::remove_dir_all(&ov_dir);
+
+        let mgr =
+            EngineManager::with_store_override(&cfg, Some(&base_dir), None, Some(ov_dir.clone()));
+
+        // 拼音方案折叠为 "pinyin"
+        assert_eq!(
+            mgr.data_schema_id("py_test"),
+            "pinyin",
+            "拼音方案 data_schema_id 应返回 pinyin"
+        );
+
+        // 码表方案返回自身 id
+        assert_eq!(
+            mgr.data_schema_id("ct_test"),
+            "ct_test",
+            "码表方案 data_schema_id 应返回自身 id"
+        );
+
+        // 未知方案（schema_engine_type=None）返回自身 id
+        assert_eq!(
+            mgr.data_schema_id("nonexistent"),
+            "nonexistent",
+            "未知方案 data_schema_id 应返回自身 id"
         );
 
         let _ = std::fs::remove_dir_all(&base_dir);
