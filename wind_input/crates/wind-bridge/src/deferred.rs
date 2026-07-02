@@ -70,12 +70,20 @@ impl MessageHandler for DeferredHandler {
         self.with_handler((), |h| h.handle_show_context_menu(x, y))
     }
 
-    fn query_main_menu_encoded(&self) -> Vec<u8> {
-        self.with_handler(Vec::new(), |h| h.query_main_menu_encoded())
+    fn query_menu_encoded(&self, simplified: bool) -> Vec<u8> {
+        self.with_handler(Vec::new(), |h| h.query_menu_encoded(simplified))
     }
 
     fn handle_menu_action_id(&self, id: i32) {
         self.with_handler((), |h| h.handle_menu_action_id(id))
+    }
+
+    fn handle_candidate_select(&self, page_local_index: u32) {
+        self.with_handler((), |h| h.handle_candidate_select(page_local_index))
+    }
+
+    fn handle_candidate_hover(&self, page_local_index: i32) {
+        self.with_handler((), |h| h.handle_candidate_hover(page_local_index))
     }
 
     fn handle_candidate_context_menu(&self, page_local_index: i32, action: &str) {

@@ -1,7 +1,8 @@
 //! 文本渲染后端（CoreText 实现，macOS）。
 //!
 //! 与 Windows 版 `text/dwrite.rs` 对外契约逐方法对齐：
-//! 颜色 `[u8;4]` 是 `[B, G, R, A]`，`buf` 是预乘 BGRA、已含背景、原地叠加绘制。
+//! 颜色 `[u8;4]` 是 `[R, G, B, A]`（与 palette/View 叶子色一致）；`buf` 是预乘 BGRA、
+//! 已含背景、原地叠加绘制（CGBitmapContext 声明 BGRA 内存序，CoreGraphics 自行落位）。
 //!
 //! 管线：CTFont（按取整 px 缓存，可级联拆字字根字体）
 //!      → 测量：CFAttributedString + CTLine::get_typographic_bounds
@@ -226,10 +227,11 @@ impl TextRenderer {
             return Err("buffer too small".into());
         }
         let font = self.font_styled(size, weight, family);
+        // color 为 [R,G,B,A]（与 palette/View 叶子色约定一致）；给 CGColor 真 R/G/B。
         let cg_color = CGColor::rgb(
-            color[2] as f64 / 255.0,
-            color[1] as f64 / 255.0,
             color[0] as f64 / 255.0,
+            color[1] as f64 / 255.0,
+            color[2] as f64 / 255.0,
             color[3] as f64 / 255.0,
         );
         let line = make_line(text, &font, Some(&cg_color));
@@ -331,11 +333,12 @@ impl TextRenderer {
         }
 
         let font = self.font_for(size);
-        // 文本前景色：buf 是 [B,G,R,A]，CGColor 取 R=color[2], G=color[1], B=color[0]。
+        // 文本前景色：入参 color 为 [R,G,B,A]（与 palette/View 叶子色约定一致，非 BGRA）。
+        // CGBitmapContext 声明为 BGRA 内存序，CoreGraphics 据 bitmapInfo 自行落位，故这里给真 R/G/B。
         let cg_color = CGColor::rgb(
-            color[2] as f64 / 255.0,
-            color[1] as f64 / 255.0,
             color[0] as f64 / 255.0,
+            color[1] as f64 / 255.0,
+            color[2] as f64 / 255.0,
             color[3] as f64 / 255.0,
         );
         let line = make_line(text, &font, Some(&cg_color));

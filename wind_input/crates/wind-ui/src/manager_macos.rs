@@ -108,10 +108,22 @@ impl Forwarder {
                             f.scale,
                             f.software_shadow,
                         );
+                        // 翻页器命中矩形的内部 tag(HOVER_PAGE_PREV/NEXT=100000/100001)重映射为
+                        // Swift/Go 约定的 -1(上页)/-2(下页)，否则 100000>=0 会被 .app 误当候选选中
+                        // (index 100000) → 翻页失效；候选 tag(>=0)原样。对齐 Go forwarder_darwin。
                         let rects: Vec<(i32, i32, i32, i32, i32)> = f
                             .hit_rects
                             .iter()
-                            .map(|(i, r)| (*i, r.x as i32, r.y as i32, r.w as i32, r.h as i32))
+                            .map(|(i, r)| {
+                                let wire = if *i == crate::manager::HOVER_PAGE_PREV {
+                                    -1
+                                } else if *i == crate::manager::HOVER_PAGE_NEXT {
+                                    -2
+                                } else {
+                                    *i
+                                };
+                                (wire, r.x as i32, r.y as i32, r.w as i32, r.h as i32)
+                            })
                             .collect();
                         let buf = f.buf;
                         // 先写 SHM 像素并取 seq；shm 建失败则整帧放弃——
@@ -178,19 +190,21 @@ impl Forwarder {
                 text,
                 x,
                 y,
+                caret_height,
                 offset_x,
                 offset_y,
                 duration_ms,
                 fixed,
                 fixed_x,
                 fixed_y,
-                ..
             } => {
-                // wire 仅传最终屏幕 (x,y)；fixed/offset 在此算定（caret_height 由 .app 不需要）。
+                // wire 仅传最终屏幕 (x,y)；fixed/offset 在此算定。
+                // 跟随光标时 y 是 caret 顶端，须 +caret_height 落到 caret 底端下方，否则气泡
+                // 贴在 caret 顶端盖住输入位（与候选窗 render_frame 的 y+caret_height 对齐）。
                 let (fx, fy) = if fixed {
                     (fixed_x, fixed_y)
                 } else {
-                    (x + offset_x, y + offset_y)
+                    (x + offset_x, y + offset_y + caret_height)
                 };
                 self.sink.push_frame(&encode_status_show(
                     &text,

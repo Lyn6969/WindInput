@@ -511,7 +511,10 @@ impl CandidateWindow {
         }
 
         let mut root = self.build_tree(false);
-        let shadow = self.shadow_params();
+        // macOS 改用系统原生 NSPanel 阴影（.app 端 panel.hasShadow + invalidateShadow，自动沿
+        // 圆角内容形状投影），位图内【不画软件阴影】：margin 归零 → 定位精确贴 caret、无偏移，
+        // 观感也更 native。software_shadow=false → Swift 侧启用系统窗口阴影。
+        let shadow: Option<crate::view::SoftShadow> = None;
         let (ml, mt, mr, mb) = match &shadow {
             Some(s) => s.margins(),
             None => (0, 0, 0, 0),
@@ -592,10 +595,25 @@ impl CandidateWindow {
         root.paint(&mut buf, width, height, &self.text_renderer);
 
         self.visible = true;
+        // 关键单位换算：ml/mt/blur 都是 device px（含 scale），而 screen_x/y 是 .app 使用的【逻辑点】
+        // （图像按 scale 显示）。故补偿前必须 /scale 换回逻辑点，否则 Retina(×2) 下会多减一截 →
+        // 候选窗偏左、偏上盖住 caret（正是截图现象）。no-shadow(margin=0)→0，无变化。
+        let scale = self.scale.max(1.0);
+        let ml_l = (ml as f32 / scale).round() as i32;
+        let mt_l = (mt as f32 / scale).round() as i32;
+        // 软阴影上边距是完整 3σ 高斯尾(多为透明)；内容紧贴 caret 时上方约一个 blur 高的【可见浓阴影】
+        // 会盖住 caret。故内容较锚点再下移「可见浓阴影」高度(≈blur，换算逻辑点)，使浓阴影恰落 caret
+        // 下方、透明尾不碍观感。above(上翻)不额外下移。
+        let clear_l = if above {
+            0
+        } else {
+            (shadow.as_ref().map(|s| s.blur).unwrap_or(0.0) / scale).round() as i32
+        };
         Some(RenderedFrame {
-            // 图像含四向 margin，其屏幕左上 = 内容锚点 − 左/上 margin（与 show() 一致）。
-            screen_x: px - ml as i32,
-            screen_y: py - mt as i32,
+            // 图像含四向 margin(device)，其屏幕左上(逻辑点) = 内容锚点 − 左/上 margin/scale
+            //（纵向再 +可见浓阴影下移，让阴影落在 caret 下方）。
+            screen_x: px - ml_l,
+            screen_y: py - mt_l + clear_l,
             width,
             height,
             scale: self.scale,

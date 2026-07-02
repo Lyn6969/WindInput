@@ -594,11 +594,13 @@ pub(crate) fn dispatch_command(
                 (i32::MIN, i32::MIN)
             };
             // macOS：`.app` 用此请求「查询菜单项」以构建原生 NSMenu，返回统一菜单树帧。
+            // payload 为 1 字节 [1] → IMK 输入源菜单(精简树)；否则(空/坐标) → 完整树(候选右键)。
             // 其它平台：进程内弹出菜单窗口（Windows popup_menu），仅回 ack。
             #[cfg(target_os = "macos")]
             {
                 let _ = (x, y);
-                Some(handler.query_main_menu_encoded())
+                let simplified = payload.len() == 1 && payload[0] == 1;
+                Some(handler.query_menu_encoded(simplified))
             }
             #[cfg(not(target_os = "macos"))]
             {

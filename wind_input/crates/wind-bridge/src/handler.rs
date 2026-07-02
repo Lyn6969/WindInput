@@ -239,9 +239,10 @@ pub trait MessageHandler: Send + Sync {
     /// darwin: .app 鼠标 hover 候选（页内下标，-1=无）。默认空。
     fn handle_candidate_hover(&self, _page_local_index: i32) {}
 
-    /// darwin: 查询功能主菜单，返回已编码的 `CmdMenuShow` 帧字节（响应 `CmdShowContextMenu`）。
-    /// `.app` 端解码为原生 NSMenu。默认返回空 `Vec`（无菜单的 handler）。
-    fn query_main_menu_encoded(&self) -> Vec<u8> {
+    /// darwin: 查询功能菜单，返回已编码的 `CmdMenuShow` 帧字节（响应 `CmdShowContextMenu`）。
+    /// `simplified=true` 为 IMK 输入源菜单用的精简树(无子菜单)，false 为候选框右键/菜单栏
+    /// 指示器用的完整树(带子菜单)。`.app` 端解码为原生 NSMenu。默认返回空 `Vec`。
+    fn query_menu_encoded(&self, _simplified: bool) -> Vec<u8> {
         Vec::new()
     }
 

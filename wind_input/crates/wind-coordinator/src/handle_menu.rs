@@ -143,6 +143,49 @@ impl Coordinator {
         });
     }
 
+    /// macOS 精简功能菜单（IMK 输入源菜单 + 候选框右键空白菜单共用）。
+    /// 相比 Windows 完整菜单，只保留必要项、且【无子菜单】（IMK 输入源菜单无法可靠处理嵌套子菜单）：
+    ///   组1 输入方案（展开）：英文 + 各方案单选
+    ///   组2 中文标点 / 全角 / 简入繁出
+    ///   组3 重启服务
+    ///   设置…
+    /// 主题/工具栏/检索范围/重载配置/高级/词库/关于 移除（配置类交由设置应用）。
+    #[cfg(target_os = "macos")]
+    pub(crate) fn build_menu_items_macos(&self) -> Vec<wind_ui::manager::MenuItemSpec> {
+        use wind_ui::manager::MenuItemSpec as M;
+        let (chinese, punct, full, s2t) = {
+            let s = self.state.lock().unwrap_or_else(|e| e.into_inner());
+            (s.chinese_mode, s.chinese_punct, s.full_width, s.s2t_enabled)
+        };
+        let cmd = |c: MenuCmd| MenuKind::Command(c);
+        let active = self.engine_mgr.active_schema_id();
+        let schemas = self.engine_mgr.available_schemas().to_vec();
+
+        let mut items = vec![M::leaf("英文", cmd(MenuCmd::SchemaEnglish), true, !chinese)];
+        for (i, id) in schemas.iter().enumerate() {
+            items.push(M::leaf(
+                self.engine_mgr.schema_name(id),
+                cmd(MenuCmd::SchemaSelect(i)),
+                true,
+                chinese && *id == active,
+            ));
+        }
+        items.push(M::separator());
+        items.push(M::leaf("中文标点", cmd(MenuCmd::TogglePunct), true, punct));
+        items.push(M::leaf("全角", cmd(MenuCmd::ToggleWidth), true, full));
+        items.push(M::leaf("简入繁出", cmd(MenuCmd::ToggleS2t), true, s2t));
+        items.push(M::separator());
+        items.push(M::leaf(
+            "重启服务",
+            cmd(MenuCmd::RestartService),
+            true,
+            false,
+        ));
+        items.push(M::separator());
+        items.push(M::leaf("设置…", cmd(MenuCmd::OpenSettings), true, false));
+        items
+    }
+
     /// 构建功能主菜单项树（纯构建，不改状态/不弹窗）。
     /// Windows 经 `show_main_menu` 进程内渲染；macOS 经 `query_main_menu_encoded` 序列化下发给 `.app` 原生 NSMenu。
     pub(crate) fn build_main_menu_items(&self) -> Vec<wind_ui::manager::MenuItemSpec> {
@@ -265,6 +308,7 @@ impl Coordinator {
     }
 
     /// 把 `MenuItemSpec` 树映射为线格式 `MenuNode` 树（id 由 `MenuKind::to_menu_id` 派生）。
+    #[cfg(target_os = "macos")]
     pub(crate) fn menu_items_to_nodes(
         items: &[wind_ui::manager::MenuItemSpec],
     ) -> Vec<wind_ipc::codec::MenuNode> {

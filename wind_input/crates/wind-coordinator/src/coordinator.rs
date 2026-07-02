@@ -2274,10 +2274,24 @@ impl MessageHandler for Coordinator {
 
     /// macOS `.app` 查询功能主菜单：构建菜单树并编码为 `CmdMenuShow` 帧字节。
     /// Windows 走进程内 `show_main_menu` 渲染，不用此路径（返回空帧亦无害）。
-    fn query_main_menu_encoded(&self) -> Vec<u8> {
-        let items = self.build_main_menu_items();
-        let nodes = Self::menu_items_to_nodes(&items);
-        wind_ipc::codec::encode_menu_show(&nodes)
+    fn query_menu_encoded(&self, simplified: bool) -> Vec<u8> {
+        #[cfg(target_os = "macos")]
+        {
+            // IMK 输入源菜单用精简树(无子菜单)；候选框右键/菜单栏指示器用完整树(带子菜单，
+            // 经 inProcess 直接投递，AppKit 能正确处理嵌套子菜单)。
+            let items = if simplified {
+                self.build_menu_items_macos()
+            } else {
+                self.build_main_menu_items()
+            };
+            let nodes = Self::menu_items_to_nodes(&items);
+            wind_ipc::codec::encode_menu_show(&nodes)
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            let _ = simplified;
+            Vec::new()
+        }
     }
 
     /// macOS `.app` 回传统一菜单选择：由菜单 id 还原动作并派发。
@@ -2289,10 +2303,23 @@ impl MessageHandler for Coordinator {
         }
     }
 
-    /// macOS `.app` 鼠标 hover 候选：复用 Windows 进程内路径的 `mouse_hover`
+    /// macOS `.app` 鼠标左键点选候选：复用 Windows 进程内路径的 `mouse_select`（提交页内第 N 个候选）。
+    fn handle_candidate_select(&self, page_local_index: u32) {
+        self.mouse_select(page_local_index as usize);
+    }
+
+    /// macOS `.app` 鼠标 hover 候选/翻页器：复用 Windows 进程内路径的 `mouse_hover`
     /// （置 hover_index + 重绘带高亮的候选帧）。
+    /// `.app` 传：候选页内下标 ≥0；翻页器 -1(上页)/-2(下页)；无悬停 i32::MIN 哨兵。
+    /// 翻页器 tag 映射回内部 `HOVER_PAGE_PREV/NEXT`，其余负值均视为无悬停(-1)。
     fn handle_candidate_hover(&self, page_local_index: i32) {
-        self.mouse_hover(page_local_index);
+        let target = match page_local_index {
+            -1 => wind_ui::manager::HOVER_PAGE_PREV,
+            -2 => wind_ui::manager::HOVER_PAGE_NEXT,
+            v if v >= 0 => v,
+            _ => -1,
+        };
+        self.mouse_hover(target);
     }
 
     /// macOS `.app` 候选右键动作：动作串 → 词条操作/复制，作用于页内下标候选。
