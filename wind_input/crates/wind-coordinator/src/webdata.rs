@@ -748,7 +748,7 @@ impl Coordinator {
 
     fn web_phrase_reset(&self) -> anyhow::Result<Value> {
         if let Some(store) = self.store.as_ref() {
-            store.reset_phrases()?;
+            store.reset_user_phrases()?;
         }
         self.rebuild_phrases();
         Ok(json!({ "ok": true }))
@@ -1506,6 +1506,49 @@ mod tests {
             0
         );
         c.web_data_rpc("phrase.resetDefault", &json!({})).unwrap();
+    }
+
+    /// 回归：phrase.resetDefault 只删用户短语，系统短语必须保留。
+    #[test]
+    fn phrase_reset_default_keeps_system() {
+        use wind_store::phrases::SystemPhrase;
+
+        let path = std::env::temp_dir().join("wind_webdata_phrase_reset_keeps_system.redb");
+        let _ = std::fs::remove_file(&path);
+        let store = Arc::new(Store::open(&path).unwrap());
+
+        // 先同步一条系统短语（is_system=true）
+        store
+            .sync_system_phrases(&[SystemPhrase {
+                code: "rq".into(),
+                text: "$date".into(),
+                weight: 1000,
+                position: 0,
+            }])
+            .unwrap();
+
+        // 构造 coordinator（共享同一个 Arc<Store>）
+        let c = Coordinator::new_headless_with_store(Config::default(), None, Arc::clone(&store));
+
+        // 加一条用户短语
+        c.web_data_rpc(
+            "phrase.add",
+            &json!({ "code": "me", "text": "自定义", "position": 0, "weight": 1 }),
+        )
+        .unwrap();
+
+        // 执行用户"清空"操作
+        c.web_data_rpc("phrase.resetDefault", &json!({})).unwrap();
+
+        // 系统短语应保留
+        let sys = c.web_data_rpc("phrase.listSystem", &json!({})).unwrap();
+        let sys_arr = sys.as_array().expect("listSystem 应返回数组");
+        assert_eq!(sys_arr.len(), 1, "系统短语应保留，不应被 resetDefault 删除");
+        assert_eq!(sys_arr[0]["code"], json!("rq"));
+
+        // 用户短语应为 0
+        let user = c.web_data_rpc("phrase.listUser", &json!({})).unwrap();
+        assert_eq!(user["total"], json!(0), "用户短语应被 resetDefault 清空");
     }
 
     #[test]
