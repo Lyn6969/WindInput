@@ -822,8 +822,26 @@ pub fn set_clipboard_text(text: &str) {
     }
 }
 
-/// 写剪贴板（非 Windows mock：暂不接入平台剪贴板，空操作）。
-#[cfg(not(windows))]
+/// 写剪贴板（macOS：经 `pbcopy` 子进程，无需 AppKit/主线程，服务进程即可用；对齐 Go clipboard_darwin）。
+#[cfg(target_os = "macos")]
+pub fn set_clipboard_text(text: &str) {
+    use std::io::Write;
+    use std::process::{Command, Stdio};
+    let mut child = match Command::new("/usr/bin/pbcopy")
+        .stdin(Stdio::piped())
+        .spawn()
+    {
+        Ok(c) => c,
+        Err(_) => return,
+    };
+    if let Some(stdin) = child.stdin.as_mut() {
+        let _ = stdin.write_all(text.as_bytes());
+    }
+    let _ = child.wait();
+}
+
+/// 写剪贴板（其它非 Windows mock：暂不接入平台剪贴板，空操作）。
+#[cfg(all(not(windows), not(target_os = "macos")))]
 pub fn set_clipboard_text(_text: &str) {}
 
 /// 读剪贴板文本（CF_UNICODETEXT）。失败/无文本返回空串。
@@ -853,8 +871,18 @@ pub fn get_clipboard_text() -> String {
     }
 }
 
-/// 读剪贴板文本（非 Windows mock：返回空串）。
-#[cfg(not(windows))]
+/// 读剪贴板文本（macOS：经 `pbpaste` 子进程）。失败/无文本返回空串。
+#[cfg(target_os = "macos")]
+pub fn get_clipboard_text() -> String {
+    use std::process::Command;
+    match Command::new("/usr/bin/pbpaste").output() {
+        Ok(o) => String::from_utf8_lossy(&o.stdout).into_owned(),
+        Err(_) => String::new(),
+    }
+}
+
+/// 读剪贴板文本（其它非 Windows mock：返回空串）。
+#[cfg(all(not(windows), not(target_os = "macos")))]
 pub fn get_clipboard_text() -> String {
     String::new()
 }

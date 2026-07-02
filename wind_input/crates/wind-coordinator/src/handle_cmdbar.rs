@@ -254,38 +254,43 @@ impl UrlOpener for CoordOpener {
     }
 }
 
-/// 系统剪贴板写入（clip.copy）。读/粘贴需平台读剪贴板或按键注入。
+/// 系统剪贴板服务（clip.copy / clip.get / clip.paste）。
 ///
-/// **macOS 预留**：set_text/get_text 接 `NSPasteboard`（`general` → `setString:forType:` /
-/// `stringForType:`，类型 `NSPasteboardTypeString`，可用 `objc2`/`cocoa` crate）；paste 用
-/// 合成 ⌘V（见下方 cfg 分支）。
+/// set/get 复用 `wind_ui::popup_menu`：Windows 走 CF_UNICODETEXT，macOS 走 `pbcopy`/`pbpaste`
+/// 子进程（无需 AppKit/主线程，服务进程即可用）；其它 Unix 暂无统一通道。
+/// paste 经按键注入合成粘贴热键。
 struct SysClip;
 
 impl ClipboardService for SysClip {
     fn set_text(&self, text: &str) -> anyhow::Result<()> {
-        #[cfg(windows)]
+        #[cfg(any(windows, target_os = "macos"))]
         {
             wind_ui::popup_menu::set_clipboard_text(text);
             Ok(())
         }
-        #[cfg(not(windows))]
+        #[cfg(not(any(windows, target_os = "macos")))]
         {
-            // TODO(macos): NSPasteboard general setString。其他 Unix 暂无统一通道。
             let _ = text;
-            anyhow::bail!("clip.copy: 当前平台暂未支持（macOS 待接 NSPasteboard）")
+            anyhow::bail!("clip.copy: 当前平台暂未支持")
         }
     }
     fn get_text(&self) -> anyhow::Result<String> {
-        // TODO(macos): NSPasteboard general stringForType。
-        anyhow::bail!("clip get: 暂未支持（待平台读剪贴板）")
+        #[cfg(any(windows, target_os = "macos"))]
+        {
+            Ok(wind_ui::popup_menu::get_clipboard_text())
+        }
+        #[cfg(not(any(windows, target_os = "macos")))]
+        {
+            anyhow::bail!("clip.get: 当前平台暂未支持")
+        }
     }
     fn paste(&self) -> anyhow::Result<()> {
         // 经按键注入合成粘贴热键：Windows/Linux Ctrl+V，macOS ⌘V（Cmd 经 vk:0x37 LeftCmd）。
         use wind_cmdbar::KeyInjector;
         #[cfg(target_os = "macos")]
         {
-            // TODO(macos): 待 key 注入接入 CGEvent 后，用 Cmd+V（此处先占位组合）。
-            wind_keys::key_inject::SysKeys.tap("vk:0x37+v")
+            // macOS 经 CGEvent 合成 ⌘V（"cmd" → VK_LWIN → kVK_Command）。
+            wind_keys::key_inject::SysKeys.tap("Cmd+v")
         }
         #[cfg(not(target_os = "macos"))]
         {
