@@ -41,6 +41,9 @@ pub const CMD_CANDIDATE_SELECT: u16 = 0x020D; // payload: pageLocalIndex u32 LE
 pub const CMD_CANDIDATE_HOVER: u16 = 0x020E; // payload: pageLocalIndex i32 LE (-1=无)
 pub const CMD_CANDIDATE_CONTEXT_MENU: u16 = 0x020F; // 上行：候选右键动作 (payload: index i32 + actionLen u32 + action UTF-8)
 pub const CMD_MENU_ACTION: u16 = 0x0210; // 上行：统一菜单项被选中 (payload: 菜单 id i32 LE)
+// darwin .app 上报前台上下文（命令直通车 app()/title()/sel() 取值）：
+// payload = appLen u32 + app(UTF-8) + titleLen u32 + title + selLen u32 + sel，均 LE 长度前缀。
+pub const CMD_FRONT_CONTEXT: u16 = 0x0211;
 
 // 光标 & 选区
 pub const CMD_CARET_UPDATE: u16 = 0x0301;
@@ -57,12 +60,21 @@ pub const CMD_CANDIDATE_RECTS: u16 = 0x0503; // 候选命中矩形 (panel-local)
 pub const CMD_MODE_STATUS: u16 = 0x0504; // 输入模式状态 (菜单栏指示器)
 pub const CMD_CANDIDATE_MENU_FLAGS: u16 = 0x0505; // 每候选右键菜单禁用位
 pub const CMD_MENU_SHOW: u16 = 0x0506; // 统一菜单树 (响应 CmdShowContextMenu)
+pub const CMD_OPEN_SETTINGS: u16 = 0x0507; // 请求 .app 打开设置应用 (payload: page 裸 UTF-8, 空=默认页)
 pub const CMD_TOOLTIP_SHOW: u16 = 0x0508; // 候选悬停 tooltip
 pub const CMD_TOOLTIP_HIDE: u16 = 0x0509;
 pub const CMD_STATUS_SHOW: u16 = 0x050A; // 模式状态气泡
 pub const CMD_STATUS_HIDE: u16 = 0x050B;
 pub const CMD_TOAST_SHOW: u16 = 0x050C; // Toast 通知
 pub const CMD_TOAST_HIDE: u16 = 0x050D;
+// 命令直通车按键合成（darwin 下行）：服务进程无辅助功能授权无法 post CGEvent，
+// 故把 key.tap/seq/hold/release/type 推给 .app 侧 KeySynthesizer 合成（.app 有授权）。
+// combo 载荷：keyLen u32 + key + modCount u32 + modCount×(modLen u32 + mod)，key/mod 均 UTF-8。
+pub const CMD_KEY_TAP: u16 = 0x050E; // 单个 combo
+pub const CMD_KEY_SEQ: u16 = 0x050F; // comboCount u32 + comboCount×combo
+pub const CMD_KEY_HOLD: u16 = 0x0510; // 单个 combo（按下保持）
+pub const CMD_KEY_RELEASE: u16 = 0x0511; // 单个 combo（抬起）
+pub const CMD_KEY_TYPE: u16 = 0x0512; // 整段 UTF-8 文本（无长度前缀），.app 走 insertText 上屏
 
 // 批处理
 pub const CMD_BATCH_EVENTS: u16 = 0x0F01;

@@ -33,8 +33,17 @@ impl Coordinator {
         // 无需 coordinator 回调的能力：进程启动、打开 URL/文件、写剪贴板（纯平台/std）。
         svc.proc = Some(Arc::new(CoordProc(weak.clone())));
         svc.open = Some(Arc::new(CoordOpener(weak.clone())));
-        svc.clip = Some(Arc::new(SysClip));
-        svc.keys = Some(Arc::new(wind_keys::key_inject::SysKeys));
+        svc.clip = Some(Arc::new(SysClip(weak.clone())));
+        // 按键合成：macOS 服务进程（LaunchAgent）无辅助功能授权无法 post CGEvent，改推 IPC 帧
+        // 给 .app 侧 KeySynthesizer 合成（见 handle_cmdbar_macos）；其它平台进程内 SendInput/CGEvent。
+        #[cfg(target_os = "macos")]
+        {
+            svc.keys = Some(crate::handle_cmdbar_macos::make_keys(weak.clone()));
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            svc.keys = Some(Arc::new(wind_keys::key_inject::SysKeys));
+        }
         // search/config/setting：经 open 默认可用 / 配置能力待补，留 None。
         let _ = self.cmdbar_services.set(svc);
     }
@@ -47,10 +56,14 @@ impl Coordinator {
         let Some(services) = self.cmdbar_services.get() else {
             return;
         };
+        let (front_app, front_title, front_sel) = self.front_ctx_snapshot();
         let ctx = CmdbarCtx {
             input: input.to_string(),
             now: Local::now(),
             last: self.recent_commits_snapshot(),
+            front_app,
+            front_title,
+            front_sel,
             services,
         };
         let reg = wind_cmdbar::default_registry();
@@ -102,6 +115,11 @@ struct CmdbarCtx<'a> {
     now: DateTime<Local>,
     /// 上屏历史快照（index 0 = 最近一次），触发命令时冻结。
     last: Vec<String>,
+    /// 前台上下文快照（app/title/sel），darwin 经 CMD_FRONT_CONTEXT 于聚焦时上报；
+    /// 其它平台为空。触发命令时冻结。
+    front_app: String,
+    front_title: String,
+    front_sel: String,
     services: &'a Services,
 }
 
@@ -116,24 +134,25 @@ impl EvalContext for CmdbarCtx<'_> {
         self.last.get((n - 1) as usize).cloned().unwrap_or_default()
     }
     fn clip(&self, _n: i64) -> String {
-        // 仅当前剪贴板（n>1 历史栈未实现）。
-        #[cfg(windows)]
+        // 仅当前剪贴板（n>1 历史栈未实现）。macOS 走 pbpaste（与 SysClip::get_text 一致），
+        // 让 clip() 取值与 clip.copy 写入对称——此前 macOS 硬编码返回空是 bug。
+        #[cfg(any(windows, target_os = "macos"))]
         {
             wind_ui::popup_menu::get_clipboard_text()
         }
-        #[cfg(not(windows))]
+        #[cfg(not(any(windows, target_os = "macos")))]
         {
             String::new()
         }
     }
     fn sel(&self) -> String {
-        String::new()
+        self.front_sel.clone()
     }
     fn app(&self) -> String {
-        String::new()
+        self.front_app.clone()
     }
     fn title(&self) -> String {
-        String::new()
+        self.front_title.clone()
     }
     fn env(&self, name: &str) -> String {
         std::env::var(name).unwrap_or_default()
@@ -200,11 +219,20 @@ struct CoordProc(Weak<Coordinator>);
 
 impl ProcessRunner for CoordProc {
     fn run(&self, cmd: &str, args: &[String]) -> anyhow::Result<()> {
-        match self.0.upgrade() {
-            Some(c) => c.push_shell_exec(cmd, &shell_quote_args(args)),
-            None => warn!("proc.run: coordinator 已释放，跳过执行 {cmd:?}"),
+        // macOS：进程内直接 spawn（无需 IPC 转 TSF）；其它平台经 push_shell_exec 借前台权限。
+        #[cfg(target_os = "macos")]
+        {
+            let _ = &self.0;
+            crate::handle_cmdbar_macos::run_native(cmd, args)
         }
-        Ok(())
+        #[cfg(not(target_os = "macos"))]
+        {
+            match self.0.upgrade() {
+                Some(c) => c.push_shell_exec(cmd, &shell_quote_args(args)),
+                None => warn!("proc.run: coordinator 已释放，跳过执行 {cmd:?}"),
+            }
+            Ok(())
+        }
     }
     fn shell(&self, cmdline: &str) -> anyhow::Result<()> {
         shell_spawn(cmdline)
@@ -216,6 +244,8 @@ impl ProcessRunner for CoordProc {
 }
 
 /// 将 argv 列表拼成 ShellExecuteW lpParameters 字符串，含空格/引号的参数加双引号。
+/// 仅非 macOS（经 push_shell_exec 转 TSF 侧 ShellExecuteW）路径使用。
+#[cfg(not(target_os = "macos"))]
 fn shell_quote_args(args: &[String]) -> String {
     args.iter()
         .map(|a| {
@@ -246,11 +276,20 @@ struct CoordOpener(Weak<Coordinator>);
 
 impl UrlOpener for CoordOpener {
     fn open(&self, target: &str) -> anyhow::Result<()> {
-        match self.0.upgrade() {
-            Some(c) => c.push_shell_exec(target, ""),
-            None => warn!("open: coordinator 已释放，跳过执行 {target:?}"),
+        // macOS：进程内经 `open` CLI 拉起（无需 IPC 转 TSF）；其它平台经 push_shell_exec。
+        #[cfg(target_os = "macos")]
+        {
+            let _ = &self.0;
+            crate::handle_cmdbar_macos::open_native(target)
         }
-        Ok(())
+        #[cfg(not(target_os = "macos"))]
+        {
+            match self.0.upgrade() {
+                Some(c) => c.push_shell_exec(target, ""),
+                None => warn!("open: coordinator 已释放，跳过执行 {target:?}"),
+            }
+            Ok(())
+        }
     }
 }
 
@@ -258,8 +297,8 @@ impl UrlOpener for CoordOpener {
 ///
 /// set/get 复用 `wind_ui::popup_menu`：Windows 走 CF_UNICODETEXT，macOS 走 `pbcopy`/`pbpaste`
 /// 子进程（无需 AppKit/主线程，服务进程即可用）；其它 Unix 暂无统一通道。
-/// paste 经按键注入合成粘贴热键。
-struct SysClip;
+/// paste 经按键注入合成粘贴热键（macOS 推 CmdKeyTap 给 .app，见 [`SysClip::paste`]）。
+struct SysClip(Weak<Coordinator>);
 
 impl ClipboardService for SysClip {
     fn set_text(&self, text: &str) -> anyhow::Result<()> {
@@ -285,15 +324,17 @@ impl ClipboardService for SysClip {
         }
     }
     fn paste(&self) -> anyhow::Result<()> {
-        // 经按键注入合成粘贴热键：Windows/Linux Ctrl+V，macOS ⌘V（Cmd 经 vk:0x37 LeftCmd）。
-        use wind_cmdbar::KeyInjector;
+        // macOS：不合成 ⌘V，经 IMKit insertText 上屏剪贴板文本（见 handle_cmdbar_macos::paste_via_ime）。
         #[cfg(target_os = "macos")]
         {
-            // macOS 经 CGEvent 合成 ⌘V（"cmd" → VK_LWIN → kVK_Command）。
-            wind_keys::key_inject::SysKeys.tap("Cmd+v")
+            crate::handle_cmdbar_macos::paste_via_ime(&self.0);
+            Ok(())
         }
+        // Windows/Linux：沿用进程内合成 Ctrl+V（有 HID 层修饰键状态，直接生效；且保留富文本粘贴）。
         #[cfg(not(target_os = "macos"))]
         {
+            let _ = &self.0;
+            use wind_cmdbar::KeyInjector;
             wind_keys::key_inject::SysKeys.tap("Ctrl+v")
         }
     }

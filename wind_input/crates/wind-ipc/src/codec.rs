@@ -702,6 +702,59 @@ fn push_menu_items(out: &mut Vec<u8>, items: &[MenuNode]) {
     }
 }
 
+/// CmdOpenSettings (0x0507): 请求 .app 打开设置应用。payload = page 裸 UTF-8（无长度前缀），
+/// 空串=默认页。与 Swift `CandidatePanelHost` 的 `String(data:encoding:.utf8)` 解码对齐。
+pub fn encode_open_settings(page: &str) -> Vec<u8> {
+    frame(CMD_OPEN_SETTINGS, page.as_bytes().to_vec())
+}
+
+/// 写单个按键 combo：keyLen u32 + key + modCount u32 + modCount×(modLen u32 + mod)。
+/// 与 Swift `BinaryCodec.decodeCombo` 对齐。
+fn push_key_combo(out: &mut Vec<u8>, key: &str, mods: &[String]) {
+    push_string(out, key);
+    out.extend_from_slice(&(mods.len() as u32).to_le_bytes());
+    for m in mods {
+        push_string(out, m);
+    }
+}
+
+/// CmdKeyTap (0x050E): 单个 combo。key 为 canonical 键名（如 "v"/"enter"/"left"），
+/// mods 为 {"ctrl","shift","alt","win"} 子集（win 在 .app 侧映射 Command）。
+pub fn encode_key_tap(key: &str, mods: &[String]) -> Vec<u8> {
+    let mut p = Vec::new();
+    push_key_combo(&mut p, key, mods);
+    frame(CMD_KEY_TAP, p)
+}
+
+/// CmdKeyHold (0x0510): 单个 combo（按下保持）。
+pub fn encode_key_hold(key: &str, mods: &[String]) -> Vec<u8> {
+    let mut p = Vec::new();
+    push_key_combo(&mut p, key, mods);
+    frame(CMD_KEY_HOLD, p)
+}
+
+/// CmdKeyRelease (0x0511): 单个 combo（抬起）。
+pub fn encode_key_release(key: &str, mods: &[String]) -> Vec<u8> {
+    let mut p = Vec::new();
+    push_key_combo(&mut p, key, mods);
+    frame(CMD_KEY_RELEASE, p)
+}
+
+/// CmdKeySeq (0x050F): comboCount u32 + comboCount×combo。
+pub fn encode_key_seq(combos: &[(String, Vec<String>)]) -> Vec<u8> {
+    let mut p = Vec::new();
+    p.extend_from_slice(&(combos.len() as u32).to_le_bytes());
+    for (key, mods) in combos {
+        push_key_combo(&mut p, key, mods);
+    }
+    frame(CMD_KEY_SEQ, p)
+}
+
+/// CmdKeyType (0x0512): 整段 UTF-8 文本（无长度前缀），.app 走 insertText 上屏。
+pub fn encode_key_type(text: &str) -> Vec<u8> {
+    frame(CMD_KEY_TYPE, text.as_bytes().to_vec())
+}
+
 /// CmdTooltipShow (0x0508): textLen+text + bgLen+bg + fgLen+fg + fontPathLen+fontPath
 pub fn encode_tooltip_show(text: &str, bg: &str, fg: &str, font_path: &str) -> Vec<u8> {
     let mut p = Vec::new();

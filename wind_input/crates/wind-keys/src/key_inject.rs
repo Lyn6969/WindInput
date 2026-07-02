@@ -114,7 +114,42 @@ impl KeyInjector for SysKeys {
     }
 }
 
+/// macOS：修饰键经 CGEvent flags 表达，而非单独 post 修饰键 keyDown。
+///
+/// macOS 应用识别组合键读的是**事件自带的 flags 字段**——单独 post 一个 kVK_Command
+/// keyDown 不会让紧随其后新建的主键事件带上 Command 位，目标应用只会看到裸 `v`，
+/// 导致 `key.tap("Cmd+v")`（clip.paste）等被当作普通字符而非快捷键（⌘V/⌘C 全失效）。
+/// 故把 mods 折叠成 flags 设到主键 keyDown/keyUp 上，成对投递。
+#[cfg(target_os = "macos")]
+fn tap_combo(mods: &[u32], vk: u32) -> anyhow::Result<()> {
+    use core_graphics::event::{CGEvent, CGEventFlags, CGEventTapLocation};
+    use core_graphics::event_source::{CGEventSource, CGEventSourceStateID};
+
+    let keycode = vk_to_cgkeycode(vk)
+        .ok_or_else(|| anyhow::anyhow!("key 注入：vk={vk:#x} 无 macOS CGKeyCode 映射"))?;
+    let mut flags = CGEventFlags::CGEventFlagNull;
+    for m in mods {
+        flags |= match *m {
+            VK_LWIN => CGEventFlags::CGEventFlagCommand,
+            VK_SHIFT => CGEventFlags::CGEventFlagShift,
+            VK_CONTROL => CGEventFlags::CGEventFlagControl,
+            VK_MENU => CGEventFlags::CGEventFlagAlternate,
+            _ => CGEventFlags::CGEventFlagNull,
+        };
+    }
+    for down in [true, false] {
+        let src = CGEventSource::new(CGEventSourceStateID::HIDSystemState)
+            .map_err(|_| anyhow::anyhow!("CGEventSource 创建失败"))?;
+        let event = CGEvent::new_keyboard_event(src, keycode, down)
+            .map_err(|_| anyhow::anyhow!("CGEvent 键盘事件创建失败 (vk={vk:#x})"))?;
+        event.set_flags(flags);
+        event.post(CGEventTapLocation::HID);
+    }
+    Ok(())
+}
+
 /// 模拟单次组合：修饰键按下 → 主键按下抬起 → 修饰键反序抬起。
+#[cfg(not(target_os = "macos"))]
 fn tap_combo(mods: &[u32], vk: u32) -> anyhow::Result<()> {
     for m in mods {
         send_key(*m, false)?;

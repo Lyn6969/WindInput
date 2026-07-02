@@ -254,6 +254,8 @@ pub fn set_settings_url_provider(f: Box<dyn Fn() -> Option<String> + Send + Sync
 }
 
 /// 取「设置」网页配置 URL（None=未注入或服务未就绪）。
+/// macOS 经 CmdOpenSettings(0x0507) 让 .app 直接启动设置应用，不走 URL/exe 路径，故仅非 macOS。
+#[cfg(not(target_os = "macos"))]
 pub(crate) fn settings_url() -> Option<String> {
     SETTINGS_URL_PROVIDER.get().and_then(|f| f())
 }
@@ -261,6 +263,8 @@ pub(crate) fn settings_url() -> Option<String> {
 /// 取同目录下 wind_setting 设置应用的可执行路径（None=不存在）。
 /// 由当前 exe 名推导变体：wind_input[_dev].exe → wind_setting[_dev].exe，
 /// 故无需感知编译期变体，正式/dev 版自动对应。
+/// macOS 经 CmdOpenSettings(0x0507) 由 .app 按 bundleID 启动设置应用，不需可执行路径，故仅非 macOS。
+#[cfg(not(target_os = "macos"))]
 pub(crate) fn settings_app_path() -> Option<String> {
     let exe = std::env::current_exe().ok()?;
     let dir = exe.parent()?;
@@ -465,6 +469,9 @@ pub struct Coordinator {
     /// 时按 client_token 高 32 位的 PID 解析进程名并缓存，避免每次 caret 更新重复 OpenProcess。
     /// 微信等 WebView 应用置 caret_use_top=true，handle_caret_update 据此把候选窗从 bottom 改锚 top。
     active_compat: Mutex<(u32, bool)>,
+    /// 前台上下文快照 `(app, title, sel)`，供命令直通车 app()/title()/sel() 取值。
+    /// darwin `.app` 经 CMD_FRONT_CONTEXT 于聚焦时上报；其它平台暂空。
+    front_ctx: Mutex<(String, String, String)>,
     /// 主题目录（data/themes）
     pub(crate) themes_dir: Option<std::path::PathBuf>,
     /// 当前主题名
@@ -875,6 +882,7 @@ impl Coordinator {
             composition_start: Mutex::new((0, 0, false)),
             app_compat,
             active_compat: Mutex::new((0, false)),
+            front_ctx: Mutex::new((String::new(), String::new(), String::new())),
             themes_dir,
             theme_name: Mutex::new(initial_theme),
             theme_style: Mutex::new(theme_style_init),
@@ -903,6 +911,14 @@ impl Coordinator {
             .iter()
             .cloned()
             .collect()
+    }
+
+    /// 前台上下文快照 `(app, title, sel)`，供命令栏 `app()/title()/sel()` 读取。
+    pub(crate) fn front_ctx_snapshot(&self) -> (String, String, String) {
+        self.front_ctx
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
     }
 
     /// 取当前「配置 + 派生缓存」快照（Arc 克隆，开销低）。所有配置读取经此。
@@ -1916,6 +1932,16 @@ impl Coordinator {
         self.push_server.push_to_active(&encoded);
     }
 
+    /// macOS：把命令直通车按键合成帧（CmdKeyTap/Seq/Hold/Release/Type）推给活跃 `.app`。
+    /// 服务进程（LaunchAgent）无辅助功能授权无法 post CGEvent，改由 `.app` 侧 KeySynthesizer
+    /// 合成（`.app` 有授权）。只投活跃前台客户端，与 commit 同队列保证与 type() 上屏文本的顺序。
+    #[cfg(target_os = "macos")]
+    pub(crate) fn push_cmdbar_key_frame(&self, encoded: &[u8]) {
+        self.push_server.push_commit_to_active(encoded);
+    }
+
+    /// macOS 的 open/proc.run/设置均改为进程内执行或 CmdOpenSettings，不再经此 IPC，故仅非 macOS。
+    #[cfg(not(target_os = "macos"))]
     pub(crate) fn push_shell_exec(&self, target: &str, params: &str) {
         let encoded = wind_ipc::codec::encode_shell_exec(target, params);
         // 带副作用操作（启动/激活外部程序）只投给活跃（前台）客户端，与 push_commit 语义一致。
@@ -2301,6 +2327,12 @@ impl MessageHandler for Coordinator {
         } else {
             tracing::debug!("handle_menu_action_id: 未知菜单 id {}", id);
         }
+    }
+
+    /// macOS `.app` 上报前台上下文（聚焦时快照）：缓存 app/title/sel 供命令直通车取值。
+    fn handle_front_context(&self, app: &str, title: &str, sel: &str) {
+        let mut fc = self.front_ctx.lock().unwrap_or_else(|e| e.into_inner());
+        *fc = (app.to_string(), title.to_string(), sel.to_string());
     }
 
     /// macOS `.app` 鼠标左键点选候选：复用 Windows 进程内路径的 `mouse_select`（提交页内第 N 个候选）。

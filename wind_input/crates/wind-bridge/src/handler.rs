@@ -253,6 +253,10 @@ pub trait MessageHandler: Send + Sync {
     /// action ∈ {move_top, move_up, move_down, delete, reset_default, copy}。默认空。
     fn handle_candidate_context_menu(&self, _page_local_index: i32, _action: &str) {}
 
+    /// darwin: .app 上报前台上下文（app bundle id / 窗口标题 / 选中文本），供命令直通车
+    /// app()/title()/sel() 取值。聚焦时快照，缺 AX/IMKit 支持的字段为空串。默认空实现。
+    fn handle_front_context(&self, _app: &str, _title: &str, _sel: &str) {}
+
     /// 返回当前权威模式 (chinese_mode, full_width)，供 FocusGained 同步路径回传 ModePush。
     /// 必须极轻量（仅锁+读两字段），不得有任何阻塞/跨进程调用——DLL 正同步阻塞等本值。
     /// 与 Go `MessageHandler.GetCurrentMode` 对齐。默认返回中文模式（安全默认）。

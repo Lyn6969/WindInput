@@ -6,6 +6,8 @@ pub mod coordinator;
 pub mod handle_addword;
 pub mod handle_candidate;
 pub mod handle_cmdbar;
+#[cfg(target_os = "macos")]
+pub mod handle_cmdbar_macos;
 pub mod handle_config;
 pub mod handle_key;
 pub mod handle_lifecycle;

@@ -92,6 +92,10 @@ impl MessageHandler for DeferredHandler {
         })
     }
 
+    fn handle_front_context(&self, app: &str, title: &str, sel: &str) {
+        self.with_handler((), |h| h.handle_front_context(app, title, sel))
+    }
+
     fn handle_ime_activated(&self, client_token: u64) -> Option<StatusUpdateData> {
         self.with_handler(None, |h| h.handle_ime_activated(client_token))
     }

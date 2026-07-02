@@ -618,6 +618,29 @@ pub(crate) fn dispatch_command(
             Some(encode_ack())
         }
 
+        // ── darwin .app 上报前台上下文（appLen+app + titleLen+title + selLen+sel，上行）──
+        // 供命令直通车 app()/title()/sel() 取值；聚焦时快照。
+        CMD_FRONT_CONTEXT => {
+            let mut off = 0usize;
+            let mut take = || -> Option<String> {
+                if payload.len() < off + 4 {
+                    return None;
+                }
+                let n = u32::from_le_bytes(payload[off..off + 4].try_into().unwrap()) as usize;
+                off += 4;
+                if payload.len() < off + n {
+                    return None;
+                }
+                let s = String::from_utf8_lossy(&payload[off..off + n]).into_owned();
+                off += n;
+                Some(s)
+            };
+            if let (Some(app), Some(title), Some(sel)) = (take(), take(), take()) {
+                handler.handle_front_context(&app, &title, &sel);
+            }
+            Some(encode_ack())
+        }
+
         // ── darwin .app 候选右键上下文菜单动作（index i32 + actionLen u32 + action UTF-8，上行）──
         CMD_CANDIDATE_CONTEXT_MENU => {
             if payload.len() >= 8 {

@@ -86,6 +86,16 @@ impl Coordinator {
     /// 执行路径：有 TSF 连接时经 IPC 让宿主进程执行 ShellExecuteW（有前台权限，能拉窗口到前面）；
     /// 无 TSF 连接时回退到服务进程侧直接启动。
     pub(crate) fn open_settings(&self, page: Option<&str>) {
+        // macOS：经 CmdOpenSettings(0x0507) 让 .app 用 LaunchServices 按 bundleID 启动/激活
+        // 设置应用（app 侧 ModeStatusController.openSettings 已实现）。settings_app_path 拼 .exe，
+        // macOS 恒为 None，旧路径会误落到已废弃的 web 分支并 WARN 失败，故此处直接短路。
+        #[cfg(target_os = "macos")]
+        {
+            let encoded = wind_ipc::codec::encode_open_settings(page.unwrap_or(""));
+            self.push_server.push_to_active(&encoded);
+            return;
+        }
+        #[cfg(not(target_os = "macos"))]
         if let Some(app) = crate::coordinator::settings_app_path() {
             let args = page.map(|p| format!("--page {p}")).unwrap_or_default();
             if self.push_server.has_clients() {
