@@ -62,8 +62,21 @@ impl Coordinator {
         if !settings.enabled {
             return;
         }
-        let schema = self.engine_mgr.active_schema_id();
-        let schema = self.engine_mgr.data_schema_id(&schema); // 拼音族折叠到 "pinyin"，读写一致
+        let active = self.engine_mgr.active_schema_id();
+        // 归属方案解析：非混输单次折叠（现行为，零回归）；混输预解析两个子方案归属 id，
+        // 循环内按候选来源选用（热路径纪律：非混输不走逐候选分支）。
+        let is_mixed = self.engine_mgr.schema_engine_type(&active).as_deref() == Some("mixed");
+        let schema = self.engine_mgr.data_schema_id(&active); // 非混输：拼音族折叠到 "pinyin"
+        let (ct_id, py_id) = if is_mixed {
+            (
+                self.engine_mgr
+                    .write_data_schema_id(&active, CandidateSource::CodeTable),
+                self.engine_mgr
+                    .write_data_schema_id(&active, CandidateSource::Pinyin),
+            )
+        } else {
+            (None, None)
+        };
         let input_len = code.len();
         // 取每个"消费整串"候选的词频记录。分段子候选（consumed_length < 整串，如「nihao」里的「你」
         // 只消费「ni」）的词频归属其自身前缀码，不能被整串码的历史计数上浮——否则单字会浮到整句
@@ -75,7 +88,17 @@ impl Coordinator {
                 if !consumes_all {
                     return None;
                 }
-                match store.get_freq(&schema, code, &c.text) {
+                // 混输按候选来源读子方案键空间（无法归因跳过）；非混输用统一 schema。
+                let sid: &str = if is_mixed {
+                    match c.source {
+                        CandidateSource::CodeTable => ct_id.as_deref()?,
+                        CandidateSource::Pinyin => py_id.as_deref()?,
+                        _ => return None,
+                    }
+                } else {
+                    &schema
+                };
+                match store.get_freq(sid, code, &c.text) {
                     Ok(Some(r)) if r.count > 0 => Some((c.text.clone(), r)),
                     _ => None,
                 }

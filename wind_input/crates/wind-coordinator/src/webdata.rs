@@ -1810,6 +1810,8 @@ mod tests {
         let mut cfg = Config::default();
         cfg.schema.active = "mx_test".into();
         cfg.schema.available = vec!["mx_test".into(), "ct_test".into(), "py_test".into()];
+        // 开启码表词频，供 apply_freq_rerank 测试生效（混输走码表 used-first 路径）。
+        cfg.schema.codetable.frequency.enabled = true;
 
         let db_path = std::env::temp_dir().join(format!("wind_coord_p2d_{tag}.redb"));
         let _ = std::fs::remove_file(&db_path);
@@ -1885,5 +1887,43 @@ mod tests {
             store.get_freq("pinyin", "nihao", "你好").unwrap().is_some(),
             "拼音方案忽略 source，落 pinyin"
         );
+    }
+
+    /// P2d Task 3：混输 active 下 apply_freq_rerank 按候选来源读子方案词频。
+    /// 码表候选读 primary(ct_test)、拼音候选读 "pinyin"；命中记录者档内提权。
+    /// （若读侧仍走 mx_test 单一归属，则两处预置的记录都读不到，无提权 → 测试失败。）
+    #[test]
+    fn mixed_freq_rerank_reads_sub_schema() {
+        use wind_candidate::{Candidate, CandidateSource};
+        let (c, store) = mixed_coord("freq_rerank");
+        // 预置：ct_test 名下「工」、pinyin 名下「好」各一条词频。
+        store.record_freq("ct_test", "aaaa", "工").unwrap();
+        store.record_freq("pinyin", "nihao", "好").unwrap();
+
+        let mk = |t: &str, code: &str, s: CandidateSource| Candidate {
+            text: t.to_string(),
+            code: code.to_string(),
+            source: s,
+            ..Default::default()
+        };
+
+        // 码表档（tier 0，同 source 同码）：「工」有 ct_test 记录 → 浮到「他」前。
+        let mut ct_cands = vec![
+            mk("他", "aaaa", CandidateSource::CodeTable),
+            mk("工", "aaaa", CandidateSource::CodeTable),
+        ];
+        c.apply_freq_rerank(&mut ct_cands, "aaaa");
+        assert_eq!(
+            ct_cands[0].text, "工",
+            "码表候选应按 primary(ct_test) 词频提权"
+        );
+
+        // 拼音档（tier 3，同 source）：「好」有 pinyin 记录 → 浮到「你」前。
+        let mut py_cands = vec![
+            mk("你", "nihao", CandidateSource::Pinyin),
+            mk("好", "nihao", CandidateSource::Pinyin),
+        ];
+        c.apply_freq_rerank(&mut py_cands, "nihao");
+        assert_eq!(py_cands[0].text, "好", "拼音候选应按 pinyin 词频提权");
     }
 }
