@@ -12,5 +12,6 @@ pub mod stats;
 pub mod store;
 pub mod temp_words;
 pub mod user_words;
+pub mod wdict;
 
 pub use store::Store;
