@@ -110,6 +110,17 @@ impl Coordinator {
             .len()
     }
 
+    /// 全部候选文本列表（不分页；测试/诊断用）
+    pub fn debug_all_candidate_texts(&self) -> Vec<String> {
+        self.state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .candidates
+            .iter()
+            .map(|c| c.text.clone())
+            .collect()
+    }
+
     /// 候选词条操作（测试/诊断用）
     pub fn debug_candidate_op(&self, op: CandidateOp, page_local: usize) {
         self.candidate_op(op, page_local);

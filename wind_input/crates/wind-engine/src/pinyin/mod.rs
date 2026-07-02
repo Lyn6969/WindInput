@@ -995,6 +995,47 @@ mod tests {
         );
     }
 
+    /// Bug 复现：双拼下用户词（存储在 "pinyin" 共享 schema）应出现在候选中。
+    /// 小鹤双拼 "dabologe" → 全拼 "daboluoge"；store 中有该用户词时应能命中。
+    #[test]
+    fn shuangpin_store_user_word_appears_in_candidates() {
+        let store = tmp_store("sp_userdict");
+        store
+            .add_user_word("pinyin", "daboluoge", "大菠萝哥", 0)
+            .unwrap();
+
+        let dm = DictManager::new();
+        dm.register_layer(Box::new(wind_dict::StoreUserLayer::new(
+            store.clone(),
+            "pinyin",
+        )));
+
+        let schema_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../../data/schemas/shuangpin");
+        let layout = Layout::from_toml(&schema_dir.join("xiaohe.toml")).expect("加载小鹤布局失败");
+        let conv = ShuangpinConverter::new(layout);
+
+        // 先确认转换正确：dabologe → daboluoge
+        let sp_result = conv.convert("dabologe");
+        assert_eq!(
+            sp_result.full_pinyin(),
+            "daboluoge",
+            "小鹤双拼 dabologe 应转换为全拼 daboluoge，实际: {:?}",
+            sp_result.full_pinyin()
+        );
+
+        let eng = empty_engine()
+            .with_shuangpin(conv)
+            .with_store_layers(Arc::new(dm));
+
+        let r = eng.convert("dabologe", 20).unwrap();
+        assert!(
+            r.candidates.iter().any(|c| c.text == "大菠萝哥"),
+            "双拼输入 \"dabologe\" 应命中用户词「大菠萝哥」，实际候选: {:?}",
+            r.candidates.iter().map(|c| &c.text).collect::<Vec<_>>()
+        );
+    }
+
     /// Task 4.1 TDD Step 1：双拼端到端——装配小鹤双拼 converter 后，
     /// 输入双拼键 "ni" 应返回含「你」的候选。
     #[test]

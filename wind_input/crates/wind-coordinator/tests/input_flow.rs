@@ -1801,3 +1801,45 @@ fn test_temp_english_trigger_key_enter_empty_commits_prefix() {
         "空缓冲回车应上屏触发键字符 /"
     );
 }
+
+/// Bug 复现（协调层）：双拼模式下，存储在 "pinyin" 域的用户词应出现在候选中。
+/// 小鹤双拼输入 "dabologe" → 全拼 "daboluoge"，store 中有该用户词，候选应包含「大菠萝哥」。
+#[test]
+fn test_shuangpin_userword_appears_in_candidates() {
+    let d = data_dir();
+    let sp_schema = d.join("schemas/shuangpin.schema.toml");
+    if !sp_schema.exists() {
+        eprintln!("跳过：缺少 shuangpin.schema.toml");
+        return;
+    }
+
+    // 构造带用户词的 store
+    let store_path = std::env::temp_dir().join("wind_sp_userword_test.redb");
+    let _ = std::fs::remove_file(&store_path);
+    let store = std::sync::Arc::new(wind_store::Store::open(&store_path).unwrap());
+    // 用户词存在 "pinyin" 域（拼音族共享存储的规范 schema_id）
+    store
+        .add_user_word("pinyin", "daboluoge", "大菠萝哥", 0)
+        .expect("add_user_word 失败");
+
+    // 创建双拼方案协调器并注入 store
+    let mut cfg = Config::default();
+    cfg.schema.available = vec!["shuangpin".into()];
+    cfg.schema.active = "shuangpin".into();
+    cfg.input.default.chinese_mode = true;
+    let coord = Coordinator::new_headless_with_store(cfg, Some(&d), store);
+
+    // 输入小鹤双拼 "dabologe" → 应转换为全拼 "daboluoge"
+    for c in "dabologe".chars() {
+        press_letter(&coord, c);
+    }
+
+    let all = coord.debug_all_candidate_texts();
+    assert!(
+        all.iter().any(|t| t == "大菠萝哥"),
+        "双拼输入 \"dabologe\" 经转换后应命中用户词「大菠萝哥」，实际候选: {:?}",
+        all
+    );
+
+    let _ = std::fs::remove_file(&store_path);
+}
