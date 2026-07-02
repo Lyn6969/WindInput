@@ -11,6 +11,23 @@ use crate::store::{PHRASES, Store};
 use redb::ReadableTable;
 use serde::{Deserialize, Serialize};
 
+/// 待同步的系统短语（来自 TOML，已做 platform 过滤）。
+#[derive(Debug, Clone)]
+pub struct SystemPhrase {
+    pub code: String,
+    pub text: String,
+    pub weight: i32,
+    pub position: i32,
+}
+
+/// 系统短语同步统计。
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SyncStats {
+    pub added: usize,
+    pub updated: usize,
+    pub removed: usize,
+}
+
 /// 短语记录（code/text 来自 key，其余来自 value）。
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct PhraseRecord {
@@ -179,6 +196,65 @@ impl Store {
         self.put_phrase(code, text, cur)
     }
 
+    /// TOML 内容哈希标记（判断是否需要重新同步系统短语）。
+    pub fn phrase_sys_hash(&self) -> anyhow::Result<Option<String>> {
+        self.meta_get("phrase_sys_hash")
+    }
+
+    pub fn set_phrase_sys_hash(&self, h: &str) -> anyhow::Result<()> {
+        self.meta_set("phrase_sys_hash", h)
+    }
+
+    /// 把系统短语同步进 PHRASES 表（is_system=true）：
+    /// 已存在 (code,text) → 更新 weight/position，保留 enabled；不存在 → 插入 enabled=true；
+    /// 表内 is_system=true 但不在本次列表的 → 删除。用户短语(is_system=false)不动。
+    pub fn sync_system_phrases(&self, entries: &[SystemPhrase]) -> anyhow::Result<SyncStats> {
+        use std::collections::HashSet;
+        let mut stats = SyncStats::default();
+        let wanted: HashSet<(String, String)> = entries
+            .iter()
+            .map(|e| (e.code.clone(), e.text.clone()))
+            .collect();
+
+        // 1. 删除过时系统短语
+        let existing = self.list_phrases()?;
+        for p in &existing {
+            if p.is_system && !wanted.contains(&(p.code.clone(), p.text.clone())) {
+                self.remove_phrase(&p.code, &p.text)?;
+                stats.removed += 1;
+            }
+        }
+        // 2. upsert
+        for e in entries {
+            match self.get_phrase(&e.code, &e.text)? {
+                Some(cur) => {
+                    let val = PhraseValue {
+                        weight: e.weight,
+                        position: e.position,
+                        enabled: cur.enabled, // 保留开关
+                        is_system: true,
+                    };
+                    self.put_phrase(&e.code, &e.text, val)?;
+                    stats.updated += 1;
+                }
+                None => {
+                    self.put_phrase(
+                        &e.code,
+                        &e.text,
+                        PhraseValue {
+                            weight: e.weight,
+                            position: e.position,
+                            enabled: true,
+                            is_system: true,
+                        },
+                    )?;
+                    stats.added += 1;
+                }
+            }
+        }
+        Ok(stats)
+    }
+
     /// 重置为默认：清空全部用户短语，返回删除条数。
     pub fn reset_phrases(&self) -> anyhow::Result<usize> {
         self.with_db(|db| {
@@ -212,6 +288,89 @@ mod tests {
         let p = std::env::temp_dir().join(name);
         let _ = std::fs::remove_file(&p);
         p
+    }
+
+    #[test]
+    fn sync_system_phrases_add_update_remove() {
+        let path = tmp("wind_phrases_sync.redb");
+        let s = Store::open(&path).unwrap();
+        // 首轮：加两条系统短语
+        let v1 = vec![
+            SystemPhrase {
+                code: "rq".into(),
+                text: "$date".into(),
+                weight: 1000,
+                position: 0,
+            },
+            SystemPhrase {
+                code: "em".into(),
+                text: "（＾＿＾）".into(),
+                weight: 1000,
+                position: 0,
+            },
+        ];
+        let st = s.sync_system_phrases(&v1).unwrap();
+        assert_eq!((st.added, st.updated, st.removed), (2, 0, 0));
+        // 用户关掉一条系统短语
+        s.set_phrase_enabled("em", "（＾＿＾）", false).unwrap();
+        // 次轮：em 改权重 + 删 rq + 加新 nn；em 的 enabled 应保留 false
+        let v2 = vec![
+            SystemPhrase {
+                code: "em".into(),
+                text: "（＾＿＾）".into(),
+                weight: 500,
+                position: 0,
+            },
+            SystemPhrase {
+                code: "nn".into(),
+                text: "你好".into(),
+                weight: 1000,
+                position: 0,
+            },
+        ];
+        let st2 = s.sync_system_phrases(&v2).unwrap();
+        assert_eq!((st2.added, st2.updated, st2.removed), (1, 1, 1));
+        let list = s.list_phrases().unwrap();
+        let em = list.iter().find(|p| p.code == "em").unwrap();
+        assert_eq!(em.weight, 500, "内容更新");
+        assert!(!em.enabled, "开关保留");
+        assert!(em.is_system);
+        assert!(!list.iter().any(|p| p.code == "rq"), "过时系统短语删除");
+        assert!(list.iter().any(|p| p.code == "nn"));
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn sync_keeps_user_phrases() {
+        let path = tmp("wind_phrases_sync_user.redb");
+        let s = Store::open(&path).unwrap();
+        s.add_phrase("me", "自定义", 0, 1).unwrap(); // 用户短语 is_system=false
+        s.sync_system_phrases(&[SystemPhrase {
+            code: "sys".into(),
+            text: "系统".into(),
+            weight: 1,
+            position: 0,
+        }])
+        .unwrap();
+        // 再同步（sys 消失）应删 sys 但保留用户 me
+        s.sync_system_phrases(&[]).unwrap();
+        let list = s.list_phrases().unwrap();
+        assert!(
+            list.iter().any(|p| p.code == "me"),
+            "用户短语不受系统同步影响"
+        );
+        assert!(!list.iter().any(|p| p.code == "sys"));
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn phrase_sys_hash_persist() {
+        let path = tmp("wind_phrases_hash.redb");
+        let s = Store::open(&path).unwrap();
+        assert_eq!(s.phrase_sys_hash().unwrap(), None);
+        s.set_phrase_sys_hash("abc123").unwrap();
+        assert_eq!(s.phrase_sys_hash().unwrap().as_deref(), Some("abc123"));
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]

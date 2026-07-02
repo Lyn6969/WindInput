@@ -108,6 +108,29 @@ impl Store {
         })
     }
 
+    /// 读 META 表的字符串值（UTF-8）。
+    pub(crate) fn meta_get(&self, key: &str) -> anyhow::Result<Option<String>> {
+        self.with_db(|db| {
+            let txn = db.begin_read()?;
+            let t = txn.open_table(META)?;
+            Ok(t.get(key)?
+                .map(|g| String::from_utf8_lossy(g.value()).into_owned()))
+        })
+    }
+
+    /// 写 META 表的字符串值。
+    pub(crate) fn meta_set(&self, key: &str, val: &str) -> anyhow::Result<()> {
+        self.with_db(|db| {
+            let txn = db.begin_write()?;
+            {
+                let mut t = txn.open_table(META)?;
+                t.insert(key, val.as_bytes())?;
+            }
+            txn.commit()?;
+            Ok(())
+        })
+    }
+
     fn set_version(&self, v: u32) -> anyhow::Result<()> {
         self.with_db(|db| {
             let txn = db.begin_write()?;
