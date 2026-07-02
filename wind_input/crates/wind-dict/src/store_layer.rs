@@ -9,12 +9,13 @@ use wind_candidate::{Candidate, better};
 use wind_store::Store;
 use wind_store::user_words::UserWordRecord;
 
-/// 把用户/临时词记录映射为候选；`is_temp` 决定 meta 标记。
-fn record_to_candidate(r: UserWordRecord, is_temp: bool) -> Candidate {
+/// 把用户/临时词记录映射为候选；`is_temp` 决定 meta 标记，`is_prefix` 标记前缀补全。
+fn record_to_candidate(r: UserWordRecord, is_temp: bool, is_prefix: bool) -> Candidate {
     let mut c = Candidate {
         text: r.text,
         code: r.code,
         weight: r.weight,
+        is_prefix,
         ..Default::default()
     };
     c.meta.raw_weight = r.weight;
@@ -69,7 +70,7 @@ impl DictLayer for StoreUserLayer {
             .unwrap_or_default();
         let cands = recs
             .into_iter()
-            .map(|r| record_to_candidate(r, false))
+            .map(|r| record_to_candidate(r, false, false))
             .collect();
         sort_trunc(cands, limit)
     }
@@ -81,7 +82,7 @@ impl DictLayer for StoreUserLayer {
             .unwrap_or_default();
         let cands = recs
             .into_iter()
-            .map(|r| record_to_candidate(r, false))
+            .map(|r| record_to_candidate(r, false, true))
             .collect();
         sort_trunc(cands, limit)
     }
@@ -122,7 +123,7 @@ impl DictLayer for StoreTempLayer {
             .unwrap_or_default();
         let cands = recs
             .into_iter()
-            .map(|r| record_to_candidate(r, true))
+            .map(|r| record_to_candidate(r, true, false))
             .collect();
         sort_trunc(cands, limit)
     }
@@ -134,7 +135,7 @@ impl DictLayer for StoreTempLayer {
             .unwrap_or_default();
         let cands = recs
             .into_iter()
-            .map(|r| record_to_candidate(r, true))
+            .map(|r| record_to_candidate(r, true, true))
             .collect();
         sort_trunc(cands, limit)
     }
@@ -164,6 +165,49 @@ mod tests {
         assert!(exact[0].meta.is_user_dict);
         // 前缀 "a" 命中 a / abc
         assert_eq!(layer.search_prefix("a", 10).len(), 2);
+    }
+
+    #[test]
+    fn test_is_prefix_flag_search_vs_search_prefix() {
+        // TDD: 验证 search 返回 is_prefix=false，search_prefix 返回 is_prefix=true
+        let s = store("is_prefix_flag");
+        s.add_user_word("wb", "abc", "啊吧次", 50).unwrap();
+        let layer = StoreUserLayer::new(s.clone(), "wb");
+
+        // 精确匹配：is_prefix 应为 false
+        let exact = layer.search("abc", 10);
+        assert_eq!(exact.len(), 1);
+        assert!(
+            !exact[0].is_prefix,
+            "search() 返回的候选 is_prefix 应为 false"
+        );
+
+        // 前缀匹配：is_prefix 应为 true
+        let prefix = layer.search_prefix("ab", 10);
+        assert_eq!(prefix.len(), 1);
+        assert!(
+            prefix[0].is_prefix,
+            "search_prefix() 返回的候选 is_prefix 应为 true"
+        );
+    }
+
+    #[test]
+    fn test_temp_layer_is_prefix_flag() {
+        // StoreTempLayer 的 search_prefix 同样应标记 is_prefix=true
+        let s = store("temp_is_prefix_flag");
+        s.learn_temp_word("wb", "xyz", "某词", 100, 0).unwrap();
+        let layer = StoreTempLayer::new(s.clone(), "wb");
+
+        let exact = layer.search("xyz", 10);
+        assert_eq!(exact.len(), 1);
+        assert!(!exact[0].is_prefix, "临时层 search() is_prefix 应为 false");
+
+        let prefix = layer.search_prefix("xy", 10);
+        assert_eq!(prefix.len(), 1);
+        assert!(
+            prefix[0].is_prefix,
+            "临时层 search_prefix() is_prefix 应为 true"
+        );
     }
 
     #[test]
