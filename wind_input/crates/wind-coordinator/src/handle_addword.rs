@@ -29,6 +29,7 @@ impl Coordinator {
             anyhow::bail!("dict.add: code 为空（Rust 端暂未支持自动推导编码）");
         }
         let schema = self.engine_mgr.active_schema_id();
+        let schema = self.engine_mgr.data_schema_id(&schema); // 拼音族折叠到 "pinyin"，与 record_freq 写读一致
         store.add_user_word(&schema, code, text, 100)?;
         Ok(())
     }
@@ -67,6 +68,7 @@ impl Coordinator {
         }
         let Some(store) = &self.store else { return };
         let schema = self.engine_mgr.active_schema_id();
+        let schema = self.engine_mgr.data_schema_id(&schema); // 拼音族折叠到 "pinyin"，与 record_freq 写读一致
         // add_weight/delta 取保守默认；晋升计数阈值由临时层累积达成（后续可接入 schema.learning 配置）。
         if let Err(e) =
             store.learn_temp_word(&schema, &code, &text, LEARN_ADD_WEIGHT, LEARN_WEIGHT_DELTA)
@@ -187,6 +189,7 @@ impl Coordinator {
         }
         if let Some(store) = &self.store {
             let schema = self.engine_mgr.active_schema_id();
+            let schema = self.engine_mgr.data_schema_id(&schema); // 拼音族折叠到 "pinyin"，与 record_freq 写读一致
             match store.add_user_word(&schema, &code, &word, ADD_WORD_WEIGHT) {
                 Ok(_) => {
                     // 注：dict.changed 广播在 RPC dispatch 层（EventSink），协调器不持有该 sink，
@@ -426,6 +429,7 @@ mod tests {
         assert!(!st.add_word_active, "确认后应退出加词模式");
         drop(st);
         let schema = c.engine_mgr.active_schema_id();
+        let schema = c.engine_mgr.data_schema_id(&schema); // 与写入路径一致
         let store = c.store.as_ref().unwrap();
         // 编码为空时不应写任何用户词；遍历常见空码均无记录。
         assert!(store.get_user_words(&schema, "").unwrap().is_empty());
@@ -442,6 +446,7 @@ mod tests {
         assert!(!st.add_word_active);
         drop(st);
         let schema = c.engine_mgr.active_schema_id();
+        let schema = c.engine_mgr.data_schema_id(&schema); // 与写入路径一致（拼音族→"pinyin"；headless 下 ""→""）
         let store = c.store.as_ref().unwrap();
         let recs = store.get_user_words(&schema, "nihao").unwrap();
         assert_eq!(recs.len(), 1, "应写入 1 条用户词");
