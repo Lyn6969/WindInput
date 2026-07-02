@@ -1812,6 +1812,8 @@ mod tests {
         cfg.schema.available = vec!["mx_test".into(), "ct_test".into(), "py_test".into()];
         // 开启码表词频，供 apply_freq_rerank 测试生效（混输走码表 used-first 路径）。
         cfg.schema.codetable.frequency.enabled = true;
+        // 开启码表自动造词，供 learn_phrase_on_commit 测试生效（混输继承主码表 auto_phrase）。
+        cfg.schema.codetable.auto_phrase.enabled = true;
 
         let db_path = std::env::temp_dir().join(format!("wind_coord_p2d_{tag}.redb"));
         let _ = std::fs::remove_file(&db_path);
@@ -1925,5 +1927,116 @@ mod tests {
         ];
         c.apply_freq_rerank(&mut py_cands, "nihao");
         assert_eq!(py_cands[0].text, "好", "拼音候选应按 pinyin 词频提权");
+    }
+
+    /// P2d Task 4：混输自动造词按"全段同源"路由——全段同源落该源归属，混源跳过。
+    #[test]
+    fn mixed_learn_phrase_same_source_only() {
+        use wind_candidate::CandidateSource;
+        let (c, store) = mixed_coord("learn_phrase");
+
+        // 全段拼音 → 临时词落 "pinyin"。
+        {
+            let mut st = c.state.lock().unwrap();
+            st.committed_segs.clear();
+            st.committed_segs
+                .push(("ni".into(), "你".into(), CandidateSource::Pinyin));
+            st.committed_segs
+                .push(("hao".into(), "好".into(), CandidateSource::Pinyin));
+            c.learn_phrase_on_commit(&st);
+        }
+        assert!(
+            store
+                .get_temp_words("pinyin", "nihao")
+                .unwrap()
+                .iter()
+                .any(|w| w.text == "你好"),
+            "全段拼音应落 pinyin 临时词"
+        );
+
+        // 混源（一码表一拼音）→ 三处键空间均无临时词。
+        {
+            let mut st = c.state.lock().unwrap();
+            st.committed_segs.clear();
+            st.committed_segs
+                .push(("aaaa".into(), "工".into(), CandidateSource::CodeTable));
+            st.committed_segs
+                .push(("hao".into(), "好".into(), CandidateSource::Pinyin));
+            c.learn_phrase_on_commit(&st);
+        }
+        for schema in ["ct_test", "pinyin", "mx_test"] {
+            assert!(
+                store.get_temp_words(schema, "aaaahao").unwrap().is_empty(),
+                "混源不应落任何临时词（{schema}）"
+            );
+        }
+
+        // 全段码表 → 临时词落 primary "ct_test"。
+        {
+            let mut st = c.state.lock().unwrap();
+            st.committed_segs.clear();
+            st.committed_segs
+                .push(("aa".into(), "工".into(), CandidateSource::CodeTable));
+            st.committed_segs
+                .push(("bb".into(), "人".into(), CandidateSource::CodeTable));
+            c.learn_phrase_on_commit(&st);
+        }
+        assert!(
+            store
+                .get_temp_words("ct_test", "aabb")
+                .unwrap()
+                .iter()
+                .any(|w| w.text == "工人"),
+            "全段码表应落 primary ct_test 临时词"
+        );
+    }
+
+    /// P2d Task 4 回归：非混输（码表方案）自动造词维持现行为，不看段来源，落自身 id。
+    /// （用码表而非拼音方案：无头最小 schema 无引擎数据，is_pinyin() 依赖已加载引擎会退化，
+    /// 码表分支只读配置不依赖引擎，可稳定验证"非混输不看段来源"。）
+    #[test]
+    fn codetable_learn_phrase_ignores_source() {
+        use std::io::Write;
+        use wind_candidate::CandidateSource;
+        let base_dir = std::env::temp_dir().join("wind_coord_p2d_ct_learn");
+        let schemas = base_dir.join("schemas");
+        let _ = std::fs::remove_dir_all(&base_dir);
+        std::fs::create_dir_all(&schemas).unwrap();
+        {
+            let mut f = std::fs::File::create(schemas.join("ct_test.schema.toml")).unwrap();
+            write!(
+                f,
+                "[schema]\nid = \"ct_test\"\n[engine]\ntype = \"codetable\"\n"
+            )
+            .unwrap();
+        }
+        let mut cfg = Config::default();
+        cfg.schema.active = "ct_test".into();
+        cfg.schema.available = vec!["ct_test".into()];
+        cfg.schema.codetable.auto_phrase.enabled = true;
+        let db_path = std::env::temp_dir().join("wind_coord_p2d_ct_learn.redb");
+        let _ = std::fs::remove_file(&db_path);
+        let store = Arc::new(Store::open(&db_path).unwrap());
+        let c =
+            Coordinator::new_headless_with_store(cfg, Some(base_dir.as_path()), Arc::clone(&store));
+
+        // 非混输：即使段标注混源（None/Pinyin），也不影响归属，仍落自身 id "ct_test"。
+        {
+            let mut st = c.state.lock().unwrap();
+            st.committed_segs.clear();
+            st.committed_segs
+                .push(("aa".into(), "工".into(), CandidateSource::None));
+            st.committed_segs
+                .push(("bb".into(), "人".into(), CandidateSource::Pinyin));
+            c.learn_phrase_on_commit(&st);
+        }
+        assert!(
+            store
+                .get_temp_words("ct_test", "aabb")
+                .unwrap()
+                .iter()
+                .any(|w| w.text == "工人"),
+            "码表方案忽略段来源，落自身 id"
+        );
     }
 }

@@ -12,7 +12,7 @@ use wind_ui::manager::UiCommand;
 
 use crate::coordinator::{printable_char, punct_char};
 use wind_bridge::handler::KeyEventData;
-use wind_candidate::{Candidate, CandidateSource};
+use wind_candidate::Candidate;
 use wind_ipc::protocol::MOD_SHIFT;
 use wind_keys::keymap;
 
@@ -547,7 +547,9 @@ impl Coordinator {
                 page_offset as i32,
                 wind_store::stats::CommitSource::Mix,
             );
-            state.committed_segs.push((code, cand.text.clone()));
+            state
+                .committed_segs
+                .push((code, cand.text.clone(), cand.source));
             state.committed_text.push_str(&cand.text);
             state.mix_buffer = state.mix_buffer[consumed..].to_string();
             self.update_mix_candidates(state);
@@ -567,7 +569,9 @@ impl Coordinator {
             if !numeric {
                 let code = Self::cand_code(&state.mix_buffer, &cand);
                 self.record_selection(&code, &cand.text, cand.source);
-                state.committed_segs.push((code, cand.text.clone()));
+                state
+                    .committed_segs
+                    .push((code, cand.text.clone(), cand.source));
                 self.learn_phrase_on_commit(state);
             }
             // 输入统计：混合模式上屏（计算结果 code_len=0；选词用候选码长）。
@@ -706,11 +710,11 @@ impl Coordinator {
             }
             keymap::VK_BACK => {
                 // 分步撤销：文本透镜有已转换段先退回最后一段（你→ni，码并回缓冲前部）。
-                if let Some((code, _)) = state.committed_segs.pop() {
+                if let Some((code, _, _)) = state.committed_segs.pop() {
                     state.committed_text = state
                         .committed_segs
                         .iter()
-                        .map(|(_, t)| t.as_str())
+                        .map(|(_, t, _)| t.as_str())
                         .collect();
                     state.mix_buffer = format!("{}{}", code, state.mix_buffer);
                     return refresh(self, state);

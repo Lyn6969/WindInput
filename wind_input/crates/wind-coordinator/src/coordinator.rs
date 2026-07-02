@@ -316,8 +316,9 @@ pub(crate) struct State {
     /// 全部转换完才整体上屏）。内部存简体原文，输出时再 s2t。仅拼音/临拼/混输文本透镜使用，
     /// 码表（五笔）选词消费整串、绝不进入此态。见 docs/redesign/pinyin-composition-enhance.md。
     pub(crate) committed_text: String,
-    /// 已转换前缀的分段记录 (消费码, 汉字)：供退格逐段回退与完整上屏时自动造词。
-    pub(crate) committed_segs: Vec<(String, String)>,
+    /// 已转换前缀的分段记录 (消费码, 汉字, 候选来源)：供退格逐段回退与完整上屏时自动造词。
+    /// 来源用于混输自动造词的"全段同源"归属路由（P2d）。
+    pub(crate) committed_segs: Vec<(String, String, CandidateSource)>,
     /// 当前激活的独占输入模式（临时拼音/快捷输入/临时英文）。`None` = 普通输入。
     /// 单点决策的唯一真相源：结构上保证同一时刻至多一个独占模式（见 `pipeline.rs`）。
     pub(crate) active: Option<ModeKind>,
@@ -2866,11 +2867,11 @@ impl MessageHandler for Coordinator {
                 // Backspace：分步撤销——有已转换段则先把最后一段退回拼音（你→ni，码并回剩余
                 // 缓冲前部、重转），否则删剩余拼音末字符。
                 if !state.committed_segs.is_empty() {
-                    let (code, _) = state.committed_segs.pop().unwrap();
+                    let (code, _, _) = state.committed_segs.pop().unwrap();
                     state.committed_text = state
                         .committed_segs
                         .iter()
-                        .map(|(_, t)| t.as_str())
+                        .map(|(_, t, _)| t.as_str())
                         .collect();
                     state.input_buffer = format!("{}{}", code, state.input_buffer);
                     self.update_candidates(&mut state);

@@ -55,20 +55,33 @@ impl Coordinator {
         let code: String = state
             .committed_segs
             .iter()
-            .map(|(c, _)| c.as_str())
+            .map(|(c, _, _)| c.as_str())
             .collect();
         let text: String = state
             .committed_segs
             .iter()
-            .map(|(_, t)| t.as_str())
+            .map(|(_, t, _)| t.as_str())
             .collect();
         let min_len = if min_len == 0 { 2 } else { min_len };
         if text.chars().count() < min_len || code.is_empty() {
             return;
         }
         let Some(store) = &self.store else { return };
-        let schema = self.engine_mgr.active_schema_id();
-        let schema = self.engine_mgr.data_schema_id(&schema); // 拼音族折叠到 "pinyin"，与 record_freq 写读一致
+        let active = self.engine_mgr.active_schema_id();
+        // 归属方案：非混输维持折叠自身/拼音（不看段来源，现行为）；
+        // 混输仅当全段同源时用该源归属 id（混源/无法归因跳过，混合码写给谁都无意义）。
+        let schema = if self.engine_mgr.schema_engine_type(&active).as_deref() == Some("mixed") {
+            let first = state.committed_segs[0].2; // len>=2 已保证非空
+            if state.committed_segs.iter().any(|(_, _, s)| *s != first) {
+                return; // 混源：跳过自动造词
+            }
+            match self.engine_mgr.write_data_schema_id(&active, first) {
+                Some(sid) => sid,
+                None => return, // 无法归因来源
+            }
+        } else {
+            self.engine_mgr.data_schema_id(&active) // 拼音族折叠到 "pinyin"，与 record_freq 写读一致
+        };
         // add_weight/delta 取保守默认；晋升计数阈值由临时层累积达成（后续可接入 schema.learning 配置）。
         if let Err(e) =
             store.learn_temp_word(&schema, &code, &text, LEARN_ADD_WEIGHT, LEARN_WEIGHT_DELTA)

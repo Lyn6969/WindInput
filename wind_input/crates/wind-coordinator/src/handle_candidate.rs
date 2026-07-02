@@ -627,7 +627,9 @@ impl Coordinator {
             wind_store::stats::CommitSource::Candidate,
         );
         if partial {
-            state.committed_segs.push((code, cand.text.clone()));
+            state
+                .committed_segs
+                .push((code, cand.text.clone(), cand.source));
             state.committed_text.push_str(&cand.text);
             state.input_buffer = state.input_buffer[consumed..].to_string();
             let _ = self.update_candidates(state); // preedit 已含前缀（update_candidates 内拼接）
@@ -638,7 +640,9 @@ impl Coordinator {
                 text: display,
             }
         } else {
-            state.committed_segs.push((code, cand.text.clone()));
+            state
+                .committed_segs
+                .push((code, cand.text.clone(), cand.source));
             let final_simplified = format!("{}{}", state.committed_text, cand.text);
             self.learn_phrase_on_commit(state); // 自动造词（多段组成的词）
             let out = self.maybe_s2t(state, &final_simplified);
