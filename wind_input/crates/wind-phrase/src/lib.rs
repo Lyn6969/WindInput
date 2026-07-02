@@ -78,6 +78,15 @@ impl PhraseHit {
     }
 }
 
+/// TOML 系统短语原始条目（platform 过滤后），供上层同步入库。
+#[derive(Debug, Clone)]
+pub struct SystemPhraseEntry {
+    pub code: String,
+    pub text: String,
+    pub weight: i32,
+    pub position: i32,
+}
+
 /// 短语层：code → 多条短语
 #[derive(Debug, Default)]
 pub struct PhraseLayer {
@@ -129,6 +138,54 @@ impl PhraseLayer {
                 text: r.text,
                 weight: r.weight.unwrap_or(1000),
                 position: r.position.unwrap_or(0),
+            });
+        }
+        for v in map.values_mut() {
+            v.sort_by(|a, b| b.weight.cmp(&a.weight).then(a.position.cmp(&b.position)));
+        }
+        Self { map }
+    }
+
+    /// 解析 system.phrases.toml 为原始条目（platform 过滤，默认 weight=1000/position=0）。
+    /// 供 coordinator 同步进 store；文件缺失/解析失败 → 空。
+    pub fn parse_system_entries(path: &std::path::Path) -> Vec<SystemPhraseEntry> {
+        let content = match std::fs::read_to_string(path) {
+            Ok(c) => c,
+            Err(_) => return Vec::new(),
+        };
+        let parsed: PhrasesFile = match toml::from_str(&content) {
+            Ok(p) => p,
+            Err(e) => {
+                warn!("Parse phrases failed {}: {}", path.display(), e);
+                return Vec::new();
+            }
+        };
+        let mut out = Vec::new();
+        for r in parsed.phrases {
+            if let Some(p) = &r.platform {
+                let p = p.to_lowercase();
+                if !p.is_empty() && p != "all" && p != "windows" {
+                    continue;
+                }
+            }
+            out.push(SystemPhraseEntry {
+                code: r.code,
+                text: r.text,
+                weight: r.weight.unwrap_or(1000),
+                position: r.position.unwrap_or(0),
+            });
+        }
+        out
+    }
+
+    /// 从 (code,text,weight,position) 记录构建短语层（调用方只传 enabled 项）。
+    pub fn from_records(records: impl IntoIterator<Item = (String, String, i32, i32)>) -> Self {
+        let mut map: HashMap<String, Vec<PhraseEntry>> = HashMap::new();
+        for (code, text, weight, position) in records {
+            map.entry(code).or_default().push(PhraseEntry {
+                text,
+                weight,
+                position,
             });
         }
         for v in map.values_mut() {
@@ -810,6 +867,19 @@ mod tests {
         assert_eq!(got.len(), 1);
         assert_eq!(got[0].text, "上次内容"); // display = last() 显示上次上屏
         assert!(got[0].command_src.is_some()); // 仍是命令（选中执行 type(last())）
+    }
+
+    #[test]
+    fn from_records_builds_lookup() {
+        let layer = PhraseLayer::from_records([
+            ("bj".to_string(), "北京".to_string(), 1000, 0),
+            ("bj".to_string(), "北京市".to_string(), 500, 1),
+        ]);
+        let hits = layer.lookup("bj", &[], &|_| String::new());
+        // 两条同码，按 weight 降序
+        assert_eq!(hits.len(), 2);
+        assert_eq!(hits[0].text, "北京");
+        assert_eq!(hits[1].text, "北京市");
     }
 
     #[test]
