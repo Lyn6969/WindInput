@@ -814,12 +814,7 @@ impl Coordinator {
     }
 
     fn web_phrase_reset_system(&self) -> anyhow::Result<Value> {
-        let store = self
-            .store
-            .as_ref()
-            .ok_or_else(|| anyhow::anyhow!("无持久化存储"))?;
-        let n = store.reset_system_enabled()?;
-        self.rebuild_phrases();
+        let n = self.restore_system_phrases();
         Ok(json!({ "ok": true, "changed": n }))
     }
 

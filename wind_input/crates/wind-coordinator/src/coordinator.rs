@@ -436,6 +436,8 @@ pub struct Coordinator {
     pub(crate) smart_symbol: Mutex<SmartSymbolArm>,
     /// 短语层（系统+用户，来自 store，仅 enabled）。变更后可 rebuild_phrases 重建。
     pub(crate) phrases: std::sync::RwLock<wind_phrase::PhraseLayer>,
+    /// 启动时解析的系统短语条目（供"恢复默认"重新同步入库，无需重读文件）。
+    pub(crate) system_phrase_entries: Vec<wind_phrase::SystemPhraseEntry>,
     /// 简繁转换器（OpenCC；None=数据缺失不可用）。变体由配置 features.s2t.variant 决定，
     /// 启动时加载；菜单仅提供开/关。置于 Mutex 兼容 reload 时整体替换。
     pub(crate) s2t: Mutex<Option<wind_transform::s2t::Converter>>,
@@ -719,6 +721,8 @@ impl Coordinator {
         );
 
         // 短语层（方案 B）：TOML 变更时同步进 store，再从 store（仅 enabled）建层。
+        // 启动解析的系统短语条目缓存进结构体，供"恢复默认"重新同步入库（无需重读文件）。
+        let mut system_phrase_entries: Vec<wind_phrase::SystemPhraseEntry> = Vec::new();
         let phrases = {
             if let Some(store) = store.as_ref() {
                 if let Some(d) = data_dir {
@@ -726,7 +730,15 @@ impl Coordinator {
                     let entries = wind_phrase::PhraseLayer::parse_system_entries(&p);
                     // 内容哈希：条目稳定序列化后哈希
                     let hash = phrase_entries_hash(&entries);
-                    if store.phrase_sys_hash().ok().flatten().as_deref() != Some(hash.as_str()) {
+                    // 自愈：哈希不一致（TOML 改动）或表内系统短语为空（被删/未初始化）时才同步。
+                    // 仅凭哈希会漏掉"系统短语从表中丢失但 TOML 未变"的场景。
+                    let sys_empty = store
+                        .list_system_phrases()
+                        .map(|v| v.is_empty())
+                        .unwrap_or(false);
+                    if store.phrase_sys_hash().ok().flatten().as_deref() != Some(hash.as_str())
+                        || sys_empty
+                    {
                         let sys: Vec<wind_store::phrases::SystemPhrase> = entries
                             .iter()
                             .map(|e| wind_store::phrases::SystemPhrase {
@@ -744,6 +756,7 @@ impl Coordinator {
                             let _ = store.set_phrase_sys_hash(&hash);
                         }
                     }
+                    system_phrase_entries = entries;
                 }
                 let recs = store
                     .enabled_phrases_for_input()
@@ -894,6 +907,7 @@ impl Coordinator {
             punct: Mutex::new(punct_conv),
             smart_symbol: Mutex::new(SmartSymbolArm::default()),
             phrases,
+            system_phrase_entries,
             s2t: Mutex::new(s2t),
             common_chars,
             toolbar_positions: Mutex::new(toolbar_positions_init),
@@ -2293,6 +2307,30 @@ impl Coordinator {
             e.into_inner()
         });
         *g = wind_phrase::PhraseLayer::from_records(recs);
+    }
+
+    /// 恢复默认系统短语：从缓存条目强制重新同步入库 + 全部启用 + 重建输入层。
+    pub(crate) fn restore_system_phrases(&self) -> usize {
+        let Some(store) = self.store.as_ref() else {
+            return 0;
+        };
+        if self.system_phrase_entries.is_empty() {
+            return 0;
+        }
+        let sys: Vec<wind_store::phrases::SystemPhrase> = self
+            .system_phrase_entries
+            .iter()
+            .map(|e| wind_store::phrases::SystemPhrase {
+                code: e.code.clone(),
+                text: e.text.clone(),
+                weight: e.weight,
+                position: e.position,
+            })
+            .collect();
+        let _ = store.sync_system_phrases(&sys);
+        let n = store.reset_system_enabled().unwrap_or(0);
+        self.rebuild_phrases();
+        self.system_phrase_entries.len().max(n)
     }
 }
 
