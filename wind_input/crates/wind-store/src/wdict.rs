@@ -48,9 +48,176 @@ pub fn parse_bool(s: &str) -> bool {
     s == "1" || s.eq_ignore_ascii_case("true")
 }
 
+/// wdict phrases 段的一行（导入导出用；不含 is_system——导出仅用户短语）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PhraseIo {
+    pub code: String,
+    pub text: String,
+    pub weight: i32,
+    pub position: i32,
+    pub enabled: bool,
+}
+
+const PHRASE_COLUMNS: &[&str] = &["code", "text", "weight", "position", "enabled"];
+
+/// 导出 phrases 为 wdict 文本（YAML 头 + `--- !phrases` TSV 段）。
+pub fn export_phrases_wdict(rows: &[PhraseIo], exported_at: &str) -> String {
+    let mut s = String::new();
+    s.push_str("# WindInput 用户数据文件\n");
+    s.push_str("wind_dict:\n");
+    s.push_str("  version: 1\n");
+    s.push_str("  generator: WindInput\n");
+    s.push_str(&format!("  exported_at: {exported_at}\n"));
+    s.push_str("  sections:\n");
+    s.push_str("    phrases:\n");
+    s.push_str(&format!("      columns: [{}]\n", PHRASE_COLUMNS.join(", ")));
+    s.push_str("\n--- !phrases\n");
+    for r in rows {
+        s.push_str(&format!(
+            "{}\t{}\t{}\t{}\t{}\n",
+            escape_field(&r.code),
+            escape_field(&r.text),
+            r.weight,
+            r.position,
+            format_bool(r.enabled),
+        ));
+    }
+    s
+}
+
+/// 解析 wdict 文本的 phrases 段。返回 (行, 跳过的非法行数)。
+/// 只认 version==1；无 phrases 段返回空。列按 header 声明顺序解析，缺 header 用默认列。
+pub fn parse_phrases_wdict(text: &str) -> Result<(Vec<PhraseIo>, usize), String> {
+    // 1. 头部 = 第一个 "\n---" 之前
+    let header = text.split("\n---").next().unwrap_or("");
+    if !header.contains("wind_dict:") {
+        return Err("不是 WindDict 文件（缺 wind_dict 头）".into());
+    }
+    // version 校验（简单行扫描，避免引入 yaml 依赖）
+    let version_ok = header.lines().any(|l| {
+        let t = l.trim();
+        t.starts_with("version:") && t.trim_start_matches("version:").trim() == "1"
+    });
+    if !version_ok {
+        return Err("不支持的 WindDict 版本（需 version: 1）".into());
+    }
+    // 2. 定位 phrases 段：`--- !phrases` 之后到下一个 `\n---` 之前
+    let Some(after_tag) = find_section_body(text, "phrases") else {
+        return Ok((Vec::new(), 0));
+    };
+    // 3. 逐行 TSV
+    let cols = phrase_columns_from_header(header);
+    let mut rows = Vec::new();
+    let mut skipped = 0usize;
+    for line in after_tag.lines() {
+        if line.trim().is_empty() {
+            continue;
+        }
+        let fields: Vec<&str> = line.split('\t').collect();
+        if fields.len() < cols.len() {
+            skipped += 1;
+            continue;
+        }
+        let get = |name: &str| -> &str {
+            cols.iter()
+                .position(|c| c == name)
+                .map(|i| fields[i])
+                .unwrap_or("")
+        };
+        rows.push(PhraseIo {
+            code: unescape_field(get("code")),
+            text: unescape_field(get("text")),
+            weight: get("weight").trim().parse().unwrap_or(0),
+            position: get("position").trim().parse().unwrap_or(0),
+            enabled: parse_bool(get("enabled").trim()),
+        });
+    }
+    Ok((rows, skipped))
+}
+
+/// 从头部读 phrases 段列定义（`columns: [a, b, ...]`）；缺则默认列。
+fn phrase_columns_from_header(header: &str) -> Vec<String> {
+    for l in header.lines() {
+        let t = l.trim();
+        if let Some(rest) = t.strip_prefix("columns:") {
+            let inner = rest.trim().trim_start_matches('[').trim_end_matches(']');
+            let cols: Vec<String> = inner
+                .split(',')
+                .map(|x| x.trim().to_string())
+                .filter(|x| !x.is_empty())
+                .collect();
+            if !cols.is_empty() {
+                return cols;
+            }
+        }
+    }
+    PHRASE_COLUMNS.iter().map(|s| s.to_string()).collect()
+}
+
+/// 返回 `--- !<tag>\n` 之后、下一个 `\n---` 之前的正文。
+fn find_section_body<'a>(text: &'a str, tag: &str) -> Option<&'a str> {
+    let marker = format!("--- !{tag}");
+    let start = text.find(&marker)? + marker.len();
+    // 跳到该行行尾之后
+    let after = &text[start..];
+    let body_start = after
+        .find('\n')
+        .map(|i| start + i + 1)
+        .unwrap_or(text.len());
+    let body = &text[body_start..];
+    // 到下一个 "\n---" 为止
+    match body.find("\n---") {
+        Some(i) => Some(&body[..i]),
+        None => Some(body),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn phrases_wdict_roundtrip() {
+        let rows = vec![
+            PhraseIo {
+                code: "bj".into(),
+                text: "北京".into(),
+                weight: 1000,
+                position: 0,
+                enabled: true,
+            },
+            PhraseIo {
+                code: "ml".into(),
+                text: "多行\n第二行\t带制表".into(),
+                weight: 500,
+                position: 2,
+                enabled: false,
+            },
+        ];
+        let s = export_phrases_wdict(&rows, "2026-07-02T00:00:00+08:00");
+        assert!(s.contains("wind_dict:"));
+        assert!(s.contains("--- !phrases"));
+        let (parsed, skipped) = parse_phrases_wdict(&s).unwrap();
+        assert_eq!(skipped, 0);
+        assert_eq!(parsed, rows, "导出→解析应无损往返（含换行/制表）");
+    }
+
+    #[test]
+    fn parse_rejects_bad_version() {
+        let bad = "wind_dict:\n  version: 2\n  sections:\n    phrases:\n      columns: [code, text, weight, position, enabled]\n\n--- !phrases\nx\t词\t1\t0\t1\n";
+        assert!(parse_phrases_wdict(bad).is_err(), "version!=1 应拒绝");
+    }
+
+    #[test]
+    fn parse_tolerates_bad_lines() {
+        let s = "wind_dict:\n  version: 1\n  sections:\n    phrases:\n      columns: [code, text, weight, position, enabled]\n\n--- !phrases\nok\t好\t1000\t0\t1\nbadline_no_tabs\nkw\t坏权重\tNaN\t0\t1\n";
+        let (rows, skipped) = parse_phrases_wdict(s).unwrap();
+        // 第 2 行列数不足跳过；第 3 行权重非数字 → 回退 0，仍收（不算跳过）
+        assert_eq!(rows.len(), 2);
+        assert_eq!(skipped, 1);
+        assert_eq!(rows[0].code, "ok");
+        assert_eq!(rows[1].weight, 0, "非法数字回退 0");
+    }
 
     #[test]
     fn escape_roundtrip() {
