@@ -1774,4 +1774,116 @@ mod tests {
             "双拼方案 scheme 应为 shuangpin"
         );
     }
+
+    /// P2d：构造带混输方案（primary=ct_test、secondary=py_test）的无头 Coordinator，
+    /// active=mx_test；返回 (coord, store) 供直查断言。
+    fn mixed_coord(tag: &str) -> (Arc<Coordinator>, Arc<Store>) {
+        use std::io::Write;
+        let base_dir = std::env::temp_dir().join(format!("wind_coord_p2d_{tag}"));
+        let schemas = base_dir.join("schemas");
+        let _ = std::fs::remove_dir_all(&base_dir);
+        std::fs::create_dir_all(&schemas).unwrap();
+        {
+            let mut f = std::fs::File::create(schemas.join("py_test.schema.toml")).unwrap();
+            write!(
+                f,
+                "[schema]\nid = \"py_test\"\n[engine]\ntype = \"pinyin\"\n"
+            )
+            .unwrap();
+        }
+        {
+            let mut f = std::fs::File::create(schemas.join("ct_test.schema.toml")).unwrap();
+            write!(
+                f,
+                "[schema]\nid = \"ct_test\"\n[engine]\ntype = \"codetable\"\n"
+            )
+            .unwrap();
+        }
+        {
+            let mut f = std::fs::File::create(schemas.join("mx_test.schema.toml")).unwrap();
+            write!(
+                f,
+                "[schema]\nid = \"mx_test\"\n[engine]\ntype = \"mixed\"\n[engine.mixed]\nprimary_schema = \"ct_test\"\nsecondary_schema = \"py_test\"\n"
+            )
+            .unwrap();
+        }
+        let mut cfg = Config::default();
+        cfg.schema.active = "mx_test".into();
+        cfg.schema.available = vec!["mx_test".into(), "ct_test".into(), "py_test".into()];
+
+        let db_path = std::env::temp_dir().join(format!("wind_coord_p2d_{tag}.redb"));
+        let _ = std::fs::remove_file(&db_path);
+        let store = Arc::new(Store::open(&db_path).unwrap());
+        let c =
+            Coordinator::new_headless_with_store(cfg, Some(base_dir.as_path()), Arc::clone(&store));
+        (c, store)
+    }
+
+    /// P2d Task 2：混输 active 下 record_selection 按候选来源落子方案键空间；无法归因跳过。
+    #[test]
+    fn mixed_record_selection_routes_by_source() {
+        use wind_candidate::CandidateSource;
+        let (c, store) = mixed_coord("record_selection");
+
+        // 码表候选 → 落 primary "ct_test"
+        c.record_selection("aaaa", "工", CandidateSource::CodeTable);
+        assert!(
+            store.get_freq("ct_test", "aaaa", "工").unwrap().is_some(),
+            "码表候选应落 primary ct_test 键空间"
+        );
+        assert!(
+            store.get_freq("mx_test", "aaaa", "工").unwrap().is_none(),
+            "不应落混输自身 id"
+        );
+        assert!(
+            store.get_freq("pinyin", "aaaa", "工").unwrap().is_none(),
+            "不应落 pinyin"
+        );
+
+        // 拼音候选 → 落 "pinyin"
+        c.record_selection("nihao", "你好", CandidateSource::Pinyin);
+        assert!(
+            store.get_freq("pinyin", "nihao", "你好").unwrap().is_some(),
+            "拼音候选应落 pinyin 共享键空间"
+        );
+
+        // 无法归因 → 三处键空间均无写入
+        c.record_selection("x", "y", CandidateSource::None);
+        assert!(store.get_freq("ct_test", "x", "y").unwrap().is_none());
+        assert!(store.get_freq("mx_test", "x", "y").unwrap().is_none());
+        assert!(store.get_freq("pinyin", "x", "y").unwrap().is_none());
+    }
+
+    /// P2d Task 2 回归：拼音方案 active 下 record_selection 忽略 source，仍折叠落 "pinyin"。
+    #[test]
+    fn pinyin_record_selection_ignores_source() {
+        use std::io::Write;
+        use wind_candidate::CandidateSource;
+        let base_dir = std::env::temp_dir().join("wind_coord_p2d_pinyin_active");
+        let schemas = base_dir.join("schemas");
+        let _ = std::fs::remove_dir_all(&base_dir);
+        std::fs::create_dir_all(&schemas).unwrap();
+        {
+            let mut f = std::fs::File::create(schemas.join("py_test.schema.toml")).unwrap();
+            write!(
+                f,
+                "[schema]\nid = \"py_test\"\n[engine]\ntype = \"pinyin\"\n"
+            )
+            .unwrap();
+        }
+        let mut cfg = Config::default();
+        cfg.schema.active = "py_test".into();
+        cfg.schema.available = vec!["py_test".into()];
+        let db_path = std::env::temp_dir().join("wind_coord_p2d_pinyin_active.redb");
+        let _ = std::fs::remove_file(&db_path);
+        let store = Arc::new(Store::open(&db_path).unwrap());
+        let c =
+            Coordinator::new_headless_with_store(cfg, Some(base_dir.as_path()), Arc::clone(&store));
+
+        c.record_selection("nihao", "你好", CandidateSource::None);
+        assert!(
+            store.get_freq("pinyin", "nihao", "你好").unwrap().is_some(),
+            "拼音方案忽略 source，落 pinyin"
+        );
+    }
 }

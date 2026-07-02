@@ -18,7 +18,7 @@ use wind_keys::keymap;
 
 use wind_bridge::handler::*;
 use wind_bridge::push::{PushConfig, PushServer};
-use wind_candidate::Candidate;
+use wind_candidate::{Candidate, CandidateSource};
 use wind_config::Config;
 use wind_config::PreeditDisplay;
 use wind_config::hotkey::{self, CompiledHotkeys};
@@ -2821,7 +2821,7 @@ impl MessageHandler for Coordinator {
                         .highlighted_global_index(&state)
                         .min(state.candidates.len() - 1);
                     let t = state.candidates[idx].text.clone();
-                    self.record_selection(&state.input_buffer, &t);
+                    self.record_selection(&state.input_buffer, &t, state.candidates[idx].source);
                     out.push_str(&self.maybe_s2t(&state, &t));
                 }
                 state.input_buffer.clear();
@@ -2991,7 +2991,8 @@ impl MessageHandler for Coordinator {
                 {
                     let buf = state.input_buffer.clone();
                     let prefix = &buf[..buf.len().saturating_sub(remainder.len())];
-                    self.record_selection(prefix, &top_text);
+                    // 顶码上屏是码表机制，归属码表来源。
+                    self.record_selection(prefix, &top_text, CandidateSource::CodeTable);
                     // 顶码即上屏首选（pos=0），code_len=被顶出的前缀码长。
                     self.record_commit(&top_text, prefix.len() as u32, 0, CommitSource::Candidate);
                     state.input_buffer = remainder.clone();
@@ -3015,7 +3016,13 @@ impl MessageHandler for Coordinator {
                 // 全码自动上屏 / 满码空码清空（schema.auto_commit_at_full / clear_on_empty_max）。
                 match self.update_candidates(&mut state) {
                     InputOutcome::AutoCommit(text) => {
-                        let out = self.commit_candidate(&mut state, &text);
+                        // 自动上屏文本取自首候选（handle_candidate.rs 构造 AutoCommit 时同源）。
+                        let source = state
+                            .candidates
+                            .first()
+                            .map(|c| c.source)
+                            .unwrap_or_default();
+                        let out = self.commit_candidate(&mut state, &text, source);
                         self.notify_ui_hide();
                         return Self::commit_action(out, true);
                     }
@@ -3155,7 +3162,11 @@ impl MessageHandler for Coordinator {
                                 let idx =
                                     (start + state.selected_index).min(state.candidates.len() - 1);
                                 let t = state.candidates[idx].text.clone();
-                                self.record_selection(&state.input_buffer, &t);
+                                self.record_selection(
+                                    &state.input_buffer,
+                                    &t,
+                                    state.candidates[idx].source,
+                                );
                                 self.record_commit(
                                     &t,
                                     state.input_buffer.len() as u32,
@@ -3196,7 +3207,11 @@ impl MessageHandler for Coordinator {
                         let (start, _) = self.page_range(&state);
                         let idx = (start + state.selected_index).min(state.candidates.len() - 1);
                         let t = state.candidates[idx].text.clone();
-                        self.record_selection(&state.input_buffer, &t);
+                        self.record_selection(
+                            &state.input_buffer,
+                            &t,
+                            state.candidates[idx].source,
+                        );
                         // 标点上屏前先记被顶出的高亮候选（来源候选）。
                         self.record_commit(
                             &t,
@@ -3541,29 +3556,33 @@ impl MessageHandler for Coordinator {
             return None;
         }
         let tk = data.trigger_key as u32; // 协议为 u16，统一按 VK(u32) 比对
-        let text = if tk == keymap::VK_SPACE {
+        // 取上屏文本与其来源：命中候选取候选 source，退回原码分支为 None（不可归因）。
+        let (text, source) = if tk == keymap::VK_SPACE {
             if !state.candidates.is_empty() {
-                state.candidates[0].text.clone()
+                (state.candidates[0].text.clone(), state.candidates[0].source)
             } else {
-                state.input_buffer.clone()
+                (state.input_buffer.clone(), CandidateSource::None)
             }
         } else if tk == keymap::VK_RETURN {
-            state.input_buffer.clone()
+            (state.input_buffer.clone(), CandidateSource::None)
         } else if (keymap::VK_1..=keymap::VK_9).contains(&tk) {
             let idx = (tk - keymap::VK_1) as usize;
             if idx < state.candidates.len() {
-                state.candidates[idx].text.clone()
+                (
+                    state.candidates[idx].text.clone(),
+                    state.candidates[idx].source,
+                )
             } else {
-                state.input_buffer.clone()
+                (state.input_buffer.clone(), CandidateSource::None)
             }
         } else {
-            state.input_buffer.clone()
+            (state.input_buffer.clone(), CandidateSource::None)
         };
         let code = state.input_buffer.clone(); // 清空前捕获输入码，供词频记录
         state.input_buffer.clear();
         state.candidates.clear();
         // 与 handle_key_event 的选词路径保持一致：记录词频用于学习排序
-        self.record_selection(&code, &text);
+        self.record_selection(&code, &text, source);
         // 上屏即组合结束：复位首显延迟状态，使下一组合首帧重新延迟到 reflow 后的权威坐标，
         // 避免其锁定到本组合旧坐标（"上屏后立即输入候选窗错位"主场景）。
         self.reset_first_show();

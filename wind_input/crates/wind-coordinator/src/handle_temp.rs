@@ -8,7 +8,7 @@ use crate::coordinator::{
 };
 use crate::pipeline::ModeKind;
 use wind_bridge::handler::{KeyAction, KeyEventData};
-use wind_candidate::Candidate;
+use wind_candidate::{Candidate, CandidateSource};
 use wind_ipc::protocol::{MOD_ALT, MOD_CTRL, MOD_SHIFT};
 use wind_keys::keymap;
 use wind_transform::fullwidth::to_full_width;
@@ -110,7 +110,7 @@ impl Coordinator {
         let code = Self::cand_code(&state.temp_pinyin_buffer, cand);
         let partial =
             consumed > 0 && consumed < total && state.temp_pinyin_buffer.is_char_boundary(consumed);
-        self.record_selection(&code, &cand.text);
+        self.record_selection(&code, &cand.text, cand.source);
         // 输入统计：每次临拼选词记一段（来源临时拼音）。
         self.record_commit(
             &cand.text,
@@ -524,7 +524,7 @@ impl Coordinator {
             let (start, _) = self.page_range(state);
             let idx = (start + state.selected_index).min(state.candidates.len() - 1);
             let t = state.candidates[idx].text.clone();
-            self.record_selection(&state.input_buffer, &t);
+            self.record_selection(&state.input_buffer, &t, state.candidates[idx].source);
             // 进入临时拼音前顶屏高亮候选（来源候选；prefix 段已在选词时记过）。
             self.record_commit(
                 &t,

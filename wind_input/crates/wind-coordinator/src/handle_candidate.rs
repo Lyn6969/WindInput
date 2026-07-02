@@ -6,7 +6,7 @@ use crate::coordinator::{Coordinator, InputOutcome, PHRASE_WEIGHT_BASE, State, n
 use crate::pipeline::ModeKind;
 use tracing::{debug, warn};
 use wind_bridge::handler::{KeyAction, KeyEventData};
-use wind_candidate::Candidate;
+use wind_candidate::{Candidate, CandidateSource};
 use wind_config::hotkey;
 use wind_store::freq::FreqRecord;
 use wind_ui::manager::CandidateOp;
@@ -14,7 +14,7 @@ use wind_ui::manager::CandidateOp;
 impl Coordinator {
     /// 记录一次选词到 redb FREQ（词频维度：count+1、last_used=now，按 schema+code+text）。
     /// 词频是与权重解耦的独立维度（frequency.md），仅记真实使用数据；redb 事务即时持久。
-    pub(crate) fn record_selection(&self, code: &str, text: &str) {
+    pub(crate) fn record_selection(&self, code: &str, text: &str, source: CandidateSource) {
         if text.is_empty() {
             return;
         }
@@ -31,7 +31,10 @@ impl Coordinator {
         }
         if let Some(store) = &self.store {
             let schema = self.engine_mgr.active_schema_id();
-            let schema = self.engine_mgr.data_schema_id(&schema); // 拼音族折叠到 "pinyin"
+            // 归属 id：非混输折叠自身/拼音；混输按候选来源分流，无法归因则跳过本次记频。
+            let Some(schema) = self.engine_mgr.write_data_schema_id(&schema, source) else {
+                return;
+            };
             if let Err(e) = store.record_freq(&schema, code, text) {
                 warn!("record_freq failed: {}", e);
             }
@@ -507,8 +510,13 @@ impl Coordinator {
     }
 
     /// 提交某个候选（记录原始简体词频后清空状态），返回上屏文本（按需简繁转换）。
-    pub(crate) fn commit_candidate(&self, state: &mut State, text: &str) -> String {
-        self.record_selection(&state.input_buffer, text);
+    pub(crate) fn commit_candidate(
+        &self,
+        state: &mut State,
+        text: &str,
+        source: CandidateSource,
+    ) -> String {
+        self.record_selection(&state.input_buffer, text, source);
         let out = self.maybe_s2t(state, text);
         state.input_buffer.clear();
         state.preedit.clear();
@@ -586,7 +594,7 @@ impl Coordinator {
         let partial =
             consumed > 0 && consumed < total && state.input_buffer.is_char_boundary(consumed);
         // 词频按候选实际编码记账（分段时为前缀码，如「ni」而非整串「nihao」）。
-        self.record_selection(&code, &cand.text);
+        self.record_selection(&code, &cand.text, cand.source);
         // 输入统计：每次选词记一段（分段逐字选各段各记一次，不重复整串）；
         // 在 partial 分支之前，两分支都经此处一次。
         self.record_commit(
@@ -745,7 +753,7 @@ impl Coordinator {
         // 仅普通候选（无副作用命令 Action）才学（对齐 Go len(cand.Actions)==0）。
         if cand.actions.is_empty() {
             let code = Self::cand_code(&state.input_buffer, &cand);
-            self.record_selection(&code, &runes[char_index].to_string());
+            self.record_selection(&code, &runes[char_index].to_string(), cand.source);
         }
         // 拼接已确认段前缀 + 选中单字，整体按简繁模式转换（与 commit_selected 一致）。
         let combined = format!("{}{}", state.committed_text, runes[char_index]);
@@ -1015,8 +1023,9 @@ impl Coordinator {
             return;
         }
         let text = state.candidates[idx].text.clone();
+        let source = state.candidates[idx].source;
         let chinese_mode = state.chinese_mode;
-        let out = self.commit_candidate(&mut state, &text);
+        let out = self.commit_candidate(&mut state, &text, source);
         // 鼠标提交后彻底复位各输入模式，避免遗留状态
         state.active = None;
         state.temp_pinyin_buffer.clear();

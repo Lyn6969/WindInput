@@ -12,7 +12,7 @@ use wind_ui::manager::UiCommand;
 
 use crate::coordinator::{printable_char, punct_char};
 use wind_bridge::handler::KeyEventData;
-use wind_candidate::Candidate;
+use wind_candidate::{Candidate, CandidateSource};
 use wind_ipc::protocol::MOD_SHIFT;
 use wind_keys::keymap;
 
@@ -134,7 +134,7 @@ impl Coordinator {
                 .highlighted_global_index(state)
                 .min(state.candidates.len() - 1);
             let t = state.candidates[i].text.clone();
-            self.record_selection(&state.input_buffer, &t);
+            self.record_selection(&state.input_buffer, &t, state.candidates[i].source);
             Some(format!("{prefix}{t}"))
         } else if !prefix.is_empty() {
             Some(prefix)
@@ -540,7 +540,7 @@ impl Coordinator {
             && state.mix_buffer.is_char_boundary(consumed);
         if partial {
             let code = Self::cand_code(&state.mix_buffer, &cand);
-            self.record_selection(&code, &cand.text);
+            self.record_selection(&code, &cand.text, cand.source);
             self.record_commit(
                 &cand.text,
                 code.len() as u32,
@@ -566,7 +566,7 @@ impl Coordinator {
             };
             if !numeric {
                 let code = Self::cand_code(&state.mix_buffer, &cand);
-                self.record_selection(&code, &cand.text);
+                self.record_selection(&code, &cand.text, cand.source);
                 state.committed_segs.push((code, cand.text.clone()));
                 self.learn_phrase_on_commit(state);
             }
