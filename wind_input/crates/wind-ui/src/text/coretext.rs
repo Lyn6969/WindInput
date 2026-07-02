@@ -37,6 +37,19 @@ const FALLBACK_FAMILY: &str = "Helvetica";
 /// 否则汉字渲染成方框 □。与 Go `forwarder_darwin.go` 的候选链一致。
 const CJK_FALLBACK: &[&str] = &["PingFang SC", "Hiragino Sans GB", "STHeiti", "Songti SC"];
 
+/// 字形级级联回退族链：base 字体缺字时按序解析。覆盖 UI 标记符号、CJK 备选、
+/// 彩色 emoji（sbix）。拆字字根字体（PUA）若已加载则置于本链之前。
+/// 与 Go `font_fallback_darwin.go` 的候选链一致——尤其 Apple Color Emoji 提供 emoji
+/// 词库层候选的彩色位图字形（缺它则 emoji 渲染成方框/单色）。
+const CASCADE_FALLBACK: &[&str] = &[
+    "Apple Symbols",     // ✓ ▸ ◂ 等 UI 标记符号（换主字体后回归的符号靠它兜底）
+    "PingFang SC",       // CJK 主力（base 已是它时 CoreText 自动去重）
+    "Hiragino Sans GB",  // 冬青黑简
+    "STHeiti",           // 华文黑体
+    "Songti SC",         // 宋体
+    "Apple Color Emoji", // emoji 彩色字形（sbix）
+];
+
 /// 文本渲染器（CoreText）。
 pub struct TextRenderer {
     /// 字体族名
@@ -105,27 +118,36 @@ impl TextRenderer {
             .unwrap_or_else(|_| core_text::font::new_from_name("Menlo", pt).unwrap())
     }
 
-    /// 给 base 字体注入拆字字根级联（若已设置 chaizi）。
-    fn apply_chaizi(&self, base: CTFont, pt: f64) -> CTFont {
-        match &self.chaizi {
-            Some(chaizi_desc) => {
-                // 主字体 descriptor 注入 kCTFontCascadeListAttribute（拆字字根 descriptor 数组），
-                // 使 PUA 等主字体缺字的码位级联回退到拆字字体。
-                let cascade =
-                    CFArray::from_CFTypes(std::slice::from_ref(chaizi_desc)).into_untyped();
-                let key_attr =
-                    unsafe { CFString::wrap_under_get_rule(kCTFontCascadeListAttribute) };
-                let attrs =
-                    CFDictionary::from_CFType_pairs(&[(key_attr.as_CFType(), cascade.as_CFType())]);
-                match base
-                    .copy_descriptor()
-                    .create_copy_with_attributes(attrs.into_untyped())
-                {
-                    Ok(merged) => core_text::font::new_from_descriptor(&merged, pt),
-                    Err(_) => base,
-                }
+    /// 给 base 字体注入字形级级联回退（kCTFontCascadeListAttribute）：
+    /// 拆字字根（PUA，若已加载）→ 符号 → CJK 备选 → 彩色 emoji。
+    ///
+    /// 必须显式构链而非依赖系统默认级联：一旦设过拆字字体，若只放拆字 descriptor 会
+    /// **覆盖**系统默认级联，导致 emoji/符号丢失（渲染成方框）。故这里把符号 / CJK /
+    /// Apple Color Emoji 一并纳入 cascade，使这些码位都能解析到对应字形。
+    fn apply_cascade(&self, base: CTFont, pt: f64) -> CTFont {
+        let mut descs: Vec<CTFontDescriptor> = Vec::new();
+        // 拆字字根优先（PUA 私用区码位专属）。
+        if let Some(chaizi_desc) = &self.chaizi {
+            descs.push(chaizi_desc.clone());
+        }
+        // 符号 / CJK / 彩色 emoji 回退族。
+        for fam in CASCADE_FALLBACK {
+            if let Ok(f) = core_text::font::new_from_name(fam, pt) {
+                descs.push(f.copy_descriptor());
             }
-            None => base,
+        }
+        if descs.is_empty() {
+            return base;
+        }
+        let cascade = CFArray::from_CFTypes(&descs).into_untyped();
+        let key_attr = unsafe { CFString::wrap_under_get_rule(kCTFontCascadeListAttribute) };
+        let attrs = CFDictionary::from_CFType_pairs(&[(key_attr.as_CFType(), cascade.as_CFType())]);
+        match base
+            .copy_descriptor()
+            .create_copy_with_attributes(attrs.into_untyped())
+        {
+            Ok(merged) => core_text::font::new_from_descriptor(&merged, pt),
+            Err(_) => base,
         }
     }
 
@@ -137,7 +159,7 @@ impl TextRenderer {
         }
         let pt = key as f64;
         let base = Self::resolve_base(&self.family, pt);
-        let font = self.apply_chaizi(base, pt);
+        let font = self.apply_cascade(base, pt);
         self.fonts.borrow_mut().insert(key, font.clone());
         font
     }
@@ -151,7 +173,7 @@ impl TextRenderer {
             Some(fam) => {
                 let pt = size.max(1.0).round() as f64;
                 let base = Self::resolve_base(fam, pt);
-                self.apply_chaizi(base, pt)
+                self.apply_cascade(base, pt)
             }
         }
     }
