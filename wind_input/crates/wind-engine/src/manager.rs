@@ -24,6 +24,10 @@ use wind_dict::cached::CachedDict;
 // 方案定义已统一到 wind_config::schema::Schema（取代此前的私有 SchemaFile）。
 // 引擎只消费该共享类型；构建逻辑（build_engine）保持不变。
 
+/// 拼音族共享数据归属命名空间：所有拼音引擎方案（全拼/双拼）的用户词/临时词/词频
+/// 统一落此键空间（P2c）。区别于恰好同名的真实方案 id "pinyin"（如临时拼音默认目标）。
+pub const PINYIN_DATA_SCHEMA: &str = "pinyin";
+
 /// 码表词频应用策略（见 docs/redesign/frequency.md §3）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FreqStrategy {
@@ -574,7 +578,7 @@ impl EngineManager {
     /// 其余方案（码表/混输/未知）用自身 id。仅影响存储键，不影响引擎行为。
     pub fn data_schema_id(&self, schema_id: &str) -> String {
         if self.schema_engine_type(schema_id).as_deref() == Some("pinyin") {
-            "pinyin".to_string()
+            PINYIN_DATA_SCHEMA.to_string()
         } else {
             schema_id.to_string()
         }
@@ -605,7 +609,7 @@ impl EngineManager {
             CandidateSource::CodeTable => self
                 .mixed_primary_schema(schema_id)
                 .map(|p| self.data_schema_id(&p)),
-            CandidateSource::Pinyin => Some("pinyin".to_string()),
+            CandidateSource::Pinyin => Some(PINYIN_DATA_SCHEMA.to_string()),
             _ => None,
         }
     }
@@ -1260,11 +1264,11 @@ impl EngineManager {
                 let dm = wind_dict::DictManager::new();
                 dm.register_layer(Box::new(wind_dict::StoreUserLayer::new(
                     store.clone(),
-                    "pinyin",
+                    PINYIN_DATA_SCHEMA,
                 )));
                 dm.register_layer(Box::new(wind_dict::StoreTempLayer::new(
                     store.clone(),
-                    "pinyin",
+                    PINYIN_DATA_SCHEMA,
                 )));
                 engine = engine.with_store_layers(Arc::new(dm));
             }
