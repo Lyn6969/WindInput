@@ -5,6 +5,7 @@
 use crate::coordinator::{Coordinator, LEARN_ADD_WEIGHT, LEARN_WEIGHT_DELTA, State};
 use tracing::{debug, warn};
 use wind_bridge::handler::{KeyAction, KeyEventData};
+use wind_candidate::CandidateSource;
 use wind_ipc::protocol::MOD_CTRL;
 use wind_keys::keymap;
 use wind_ui::candidate_window::CandidateItem;
@@ -28,8 +29,14 @@ impl Coordinator {
         if code.is_empty() {
             anyhow::bail!("dict.add: code 为空（Rust 端暂未支持自动推导编码）");
         }
-        let schema = self.engine_mgr.active_schema_id();
-        let schema = self.engine_mgr.data_schema_id(&schema); // 拼音族折叠到 "pinyin"，与 record_freq 写读一致
+        let active = self.engine_mgr.active_schema_id();
+        // 手动加词是码表语义（显式 code）；混输落主码表方案，primary 缺失则报错不静默写孤儿。
+        let Some(schema) = self
+            .engine_mgr
+            .write_data_schema_id(&active, CandidateSource::CodeTable)
+        else {
+            anyhow::bail!("dict.add: 混输方案主码表缺失，无法归属加词");
+        };
         store.add_user_word(&schema, code, text, 100)?;
         Ok(())
     }
@@ -201,8 +208,16 @@ impl Coordinator {
             return KeyAction::ClearComposition;
         }
         if let Some(store) = &self.store {
-            let schema = self.engine_mgr.active_schema_id();
-            let schema = self.engine_mgr.data_schema_id(&schema); // 拼音族折叠到 "pinyin"，与 record_freq 写读一致
+            let active = self.engine_mgr.active_schema_id();
+            // 手动造词是码表语义（编码来自码表反查）；混输落主码表方案，primary 缺失则 warn 跳过。
+            let Some(schema) = self
+                .engine_mgr
+                .write_data_schema_id(&active, CandidateSource::CodeTable)
+            else {
+                warn!("addword: 混输方案主码表缺失，跳过加词 word={}", word);
+                self.exit_add_word_mode(state);
+                return KeyAction::ClearComposition;
+            };
             match store.add_user_word(&schema, &code, &word, ADD_WORD_WEIGHT) {
                 Ok(_) => {
                     // 注：dict.changed 广播在 RPC dispatch 层（EventSink），协调器不持有该 sink，

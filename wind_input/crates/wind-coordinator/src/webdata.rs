@@ -2039,4 +2039,51 @@ mod tests {
             "码表方案忽略段来源，落自身 id"
         );
     }
+
+    /// P2d Task 5：混输 active 下手动加词（RPC dict.add）落主码表方案；primary 缺失则报错不 panic。
+    #[test]
+    fn mixed_manual_addword_goes_to_primary() {
+        let (c, store) = mixed_coord("manual_addword");
+        // 手动加词是码表语义 → 落 primary "ct_test"。
+        c.cmd_dict_add("工", "aaaa").unwrap();
+        assert!(
+            store
+                .get_user_words("ct_test", "aaaa")
+                .unwrap()
+                .iter()
+                .any(|w| w.text == "工"),
+            "混输手动加词应落 primary ct_test"
+        );
+        assert!(
+            store.get_user_words("mx_test", "aaaa").unwrap().is_empty(),
+            "不应落混输自身 id"
+        );
+
+        // primary 缺失的坏配置 → 返回 Err，不 panic，不写库。
+        use std::io::Write;
+        let base_dir = std::env::temp_dir().join("wind_coord_p2d_addword_bad");
+        let schemas = base_dir.join("schemas");
+        let _ = std::fs::remove_dir_all(&base_dir);
+        std::fs::create_dir_all(&schemas).unwrap();
+        {
+            let mut f = std::fs::File::create(schemas.join("mx_bad.schema.toml")).unwrap();
+            // 混输但未配 primary_schema。
+            write!(f, "[schema]\nid = \"mx_bad\"\n[engine]\ntype = \"mixed\"\n").unwrap();
+        }
+        let mut cfg = Config::default();
+        cfg.schema.active = "mx_bad".into();
+        cfg.schema.available = vec!["mx_bad".into()];
+        let db_path = std::env::temp_dir().join("wind_coord_p2d_addword_bad.redb");
+        let _ = std::fs::remove_file(&db_path);
+        let bad_store = Arc::new(Store::open(&db_path).unwrap());
+        let bc = Coordinator::new_headless_with_store(
+            cfg,
+            Some(base_dir.as_path()),
+            Arc::clone(&bad_store),
+        );
+        assert!(
+            bc.cmd_dict_add("工", "aaaa").is_err(),
+            "混输 primary 缺失应返回 Err"
+        );
+    }
 }
