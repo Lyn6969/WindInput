@@ -183,6 +183,13 @@ impl Coordinator {
                     "id": id,
                     "name": self.engine_mgr.schema_name(id),
                     "engineType": merged.as_ref().map(resolve_engine_type),
+                    "scheme": merged.as_ref().map(|s| {
+                        if resolve_engine_type(s) == "pinyin" {
+                            s.engine.pinyin.scheme.clone()
+                        } else {
+                            String::new()
+                        }
+                    }).unwrap_or_default(),
                     "builtin": true,
                     "description": info.map(|i| i.description.clone()).unwrap_or_default(),
                     "version": info.map(|i| i.version.clone()).unwrap_or_default(),
@@ -1704,6 +1711,67 @@ mod tests {
         assert!(
             items.iter().any(|it| it["text"] == "你好"),
             "双拼应读到拼音下加的词（data_schema_id 共享）"
+        );
+    }
+
+    /// Task 3：schema.list 每个拼音方案应携带 scheme 字段（full/shuangpin），非拼音方案为空串。
+    #[test]
+    fn schema_list_exposes_scheme() {
+        use std::io::Write;
+        let base_dir = std::env::temp_dir().join("wind_coord_schema_list_scheme_test");
+        let schemas = base_dir.join("schemas");
+        std::fs::create_dir_all(&schemas).unwrap();
+        // 创建全拼方案
+        {
+            let mut f = std::fs::File::create(schemas.join("pinyin_full.schema.toml")).unwrap();
+            write!(
+                f,
+                "[engine]\ntype = \"pinyin\"\n[engine.pinyin]\nscheme = \"full\"\n"
+            )
+            .unwrap();
+        }
+        // 创建双拼方案
+        {
+            let mut f =
+                std::fs::File::create(schemas.join("double_pinyin_sp.schema.toml")).unwrap();
+            write!(
+                f,
+                "[engine]\ntype = \"pinyin\"\n[engine.pinyin]\nscheme = \"shuangpin\"\n"
+            )
+            .unwrap();
+        }
+        let db_path = std::env::temp_dir().join("wind_webdata_schema_list_scheme.redb");
+        let _ = std::fs::remove_file(&db_path);
+        let store = Arc::new(Store::open(&db_path).unwrap());
+        let c = Coordinator::new_headless_with_store(
+            Config::default(),
+            Some(base_dir.as_path()),
+            Arc::clone(&store),
+        );
+
+        let list = c.web_data_rpc("schema.list", &json!({})).unwrap();
+        let arr = list.as_array().unwrap();
+
+        // 必须有方案
+        assert!(!arr.is_empty(), "schema.list 应返回非空数组");
+        // 每项都应有 scheme 键
+        for item in arr.iter() {
+            assert!(
+                item.get("scheme").is_some(),
+                "每个方案项应有 scheme 字段，缺失于: {item}"
+            );
+        }
+        // 全拼方案 scheme="full"
+        let full = arr.iter().find(|s| s["id"] == "pinyin_full");
+        assert!(full.is_some(), "应有 pinyin_full 方案");
+        assert_eq!(full.unwrap()["scheme"], "full", "全拼方案 scheme 应为 full");
+        // 双拼方案 scheme="shuangpin"
+        let sp = arr.iter().find(|s| s["id"] == "double_pinyin_sp");
+        assert!(sp.is_some(), "应有 double_pinyin_sp 方案");
+        assert_eq!(
+            sp.unwrap()["scheme"],
+            "shuangpin",
+            "双拼方案 scheme 应为 shuangpin"
         );
     }
 }
