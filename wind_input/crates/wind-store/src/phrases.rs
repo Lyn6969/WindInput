@@ -228,6 +228,12 @@ impl Store {
         for e in entries {
             match self.get_phrase(&e.code, &e.text)? {
                 Some(cur) => {
+                    // 用户行（is_system=false）优先：跳过，让用户行遮蔽同键的系统条目。
+                    // 若强制改写为 is_system=true，一旦该系统条目从 TOML 移除，
+                    // 删除过时系统项的路径会把这条用户短语一并静默删除。
+                    if !cur.is_system {
+                        continue;
+                    }
                     let val = PhraseValue {
                         weight: e.weight,
                         position: e.position,
@@ -591,6 +597,38 @@ mod tests {
         // 重置清空
         assert_eq!(s.reset_phrases().unwrap(), 1);
         assert_eq!(s.list_phrases().unwrap().len(), 0);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn sync_does_not_overwrite_user_row() {
+        let path = tmp("wind_phrases_no_overwrite_user.redb");
+        let s = Store::open(&path).unwrap();
+        // 先建用户行 (bj, 北京)，is_system=false
+        s.add_phrase("bj", "北京", 0, 1).unwrap();
+        // 同步含同键的系统条目
+        s.sync_system_phrases(&[SystemPhrase {
+            code: "bj".into(),
+            text: "北京".into(),
+            weight: 9,
+            position: 0,
+        }])
+        .unwrap();
+        // 用户行应保持 is_system=false，不被系统化
+        let row = s
+            .list_phrases()
+            .unwrap()
+            .into_iter()
+            .find(|p| p.code == "bj")
+            .unwrap();
+        assert!(!row.is_system, "用户行不应被系统短语覆写为 is_system=true");
+        // 模拟系统条目移除（sync 空列表）：用户行不应被删
+        s.sync_system_phrases(&[]).unwrap();
+        let list = s.list_phrases().unwrap();
+        assert!(
+            list.iter().any(|p| p.code == "bj" && !p.is_system),
+            "系统条目移除后用户行不应被静默删除"
+        );
         let _ = std::fs::remove_file(&path);
     }
 

@@ -2288,9 +2288,11 @@ impl Coordinator {
                 .collect(),
             None => Vec::new(),
         };
-        if let Ok(mut g) = self.phrases.write() {
-            *g = wind_phrase::PhraseLayer::from_records(recs);
-        }
+        let mut g = self.phrases.write().unwrap_or_else(|e| {
+            warn!("phrases 写锁中毒，恢复后重建");
+            e.into_inner()
+        });
+        *g = wind_phrase::PhraseLayer::from_records(recs);
     }
 }
 
