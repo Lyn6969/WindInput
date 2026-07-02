@@ -77,7 +77,8 @@ public final class CandidatePanelHost {
     /// 同步取统一菜单树 (与候选框空白处右键、菜单栏指示器菜单同一 IPC 请求路径)。
     /// 主线程调用 (菜单将要绘制时), 失败返回 nil。
     public func unifiedMenuItems() -> [MenuItemData]? {
-        return requestUnifiedMenu()
+        // IMK 输入源菜单：请求【精简】树(无子菜单，IMK 无法可靠处理嵌套)。
+        return requestUnifiedMenu(simplified: true)
     }
 
     /// 回发统一菜单项点击 (CmdMenuAction)。三处菜单共用同一发送路径。
@@ -226,8 +227,9 @@ public final class CandidatePanelHost {
 
     /// 空白处右键 / 菜单栏指示器 / 系统输入菜单: 向 Go 请求统一菜单树
     /// (CmdShowContextMenu → CmdMenuShow 响应)。只读查询, 连接陈旧自动重试一次; 失败返回 nil。
-    private func requestUnifiedMenu() -> [MenuItemData]? {
-        guard let resp = requestResponseIdempotent(BinaryCodec.encodeEmptyFrame(cmd: UpstreamCmd.showContextMenu)),
+    private func requestUnifiedMenu(simplified: Bool = false) -> [MenuItemData]? {
+        // simplified=true 仅 IMK 输入源菜单用(精简树)；候选框右键/菜单栏指示器用完整树(默认 false)。
+        guard let resp = requestResponseIdempotent(BinaryCodec.encodeShowContextMenuFrame(simplified: simplified)),
               resp.cmd == DownstreamCmd.menuShow else { return nil }
         return try? BinaryCodec.decodeUnifiedMenuPayload(resp.payload)
     }

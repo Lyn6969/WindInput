@@ -202,7 +202,9 @@ public class InputController: IMKInputController {
         }
     }
 
-    /// 发一个修饰键 VK 的 KeyEvent (eventType=down) 给 Go, 触发模式切换; 应用其响应。
+    /// 发一个修饰键 VK 的 KeyEvent (eventType=up) 给服务, 触发模式切换; 应用其响应。
+    /// 用 key-up: 协调器的 toggle 键(Shift/Ctrl 单击切中英)仅在 EVENT_KEY_UP 分支处理
+    /// (对齐 TSF「仅 keyUp 转发 toggle 键」约定); 发 .down 会落不进该分支 → 不切换。
     private func sendModifierTap(_ vk: UInt32, sender: Any!) {
         guard let bridge = bridge, bridge.isConnected else { return }
         // 模式切换 (Shift/Ctrl tap) 通常无 composition, 先刷新 caret 让状态气泡锚到当前
@@ -210,7 +212,7 @@ public class InputController: IMKInputController {
         sendCaretUpdateIfAvailable(client: sender as? IMKTextInput)
         keySeq &+= 1
         let frame = BinaryCodec.encodeKeyEventFrame(KeyEventPayload(
-            keyCode: vk, scanCode: 0, modifiers: 0, eventType: .down, eventSeq: keySeq, prevChar: 0))
+            keyCode: vk, scanCode: 0, modifiers: 0, eventType: .up, eventSeq: keySeq, prevChar: 0))
         do {
             try bridge.send(frame)
             let resp = try bridge.readFrame()
@@ -241,7 +243,31 @@ public class InputController: IMKInputController {
         guard let items = CandidatePanelHost.shared.unifiedMenuItems(), !items.isEmpty else {
             return imkFallbackMenu()
         }
-        return imkMenuBuilder.build(items, dispatch: .imkCommand(action: #selector(imkMenuCommand(_:))))
+        // IMK 输入源菜单必须 target=nil 走 IMK doCommandBySelector 路由（菜单在 IMK 独立上下文
+        // 渲染，直接 AppKit target-action 投递不到本进程对象 → 整菜单失效）。而 IMK 对【嵌套子菜单】
+        // 叶子回传的是子菜单首项 tag（点五笔切英文/点微软切默认）。故拍平为顶层带「父·」前缀项，
+        // 各项 tag 即真实菜单 id，IMK 顶层项回传可靠——这是 IMK 输入源菜单的固有约束（无法保留子菜单）。
+        // 候选框右键/菜单栏指示器走 inProcess 直接投递，仍用原始嵌套树，不受影响。
+        return imkMenuBuilder.build(flattenForIMK(items), dispatch: .imkCommand(action: #selector(imkMenuCommand(_:))))
+    }
+
+    /// 把统一菜单树拍平供 IMK 输入源菜单用：子菜单父项的子项提升到顶层，标签加「父·」前缀；
+    /// 分隔线原样保留。递归处理多级子菜单。
+    private func flattenForIMK(_ items: [MenuItemData], prefix: String = "") -> [MenuItemData] {
+        var out: [MenuItemData] = []
+        for it in items {
+            if !it.children.isEmpty {
+                let childPrefix = prefix.isEmpty ? it.label : "\(prefix)·\(it.label)"
+                out.append(contentsOf: flattenForIMK(it.children, prefix: childPrefix))
+            } else if it.separator {
+                out.append(it)
+            } else {
+                let label = prefix.isEmpty ? it.label : "\(prefix)·\(it.label)"
+                out.append(MenuItemData(id: it.id, label: label, separator: false,
+                                        checked: it.checked, disabled: it.disabled, children: []))
+            }
+        }
+        return out
     }
 
     /// 统一菜单项被选中: IMK 经 doCommandBySelector 调用本方法, sender 是 infoDictionary

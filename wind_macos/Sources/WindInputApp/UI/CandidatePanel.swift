@@ -18,7 +18,9 @@ import WindInputKit
 final class CandidateContentView: NSView {
     private var image: NSImage?
     private var hitRects: [CandidateHitRect] = []
-    private var lastHover: Int = -1
+    /// 无悬停哨兵：须区别于翻页器 hover(-1 上页 / -2 下页)，故不能复用 -1。
+    static let noHover = Int(Int32.min)
+    private var lastHover: Int = CandidateContentView.noHover
     private var ctxIndex: Int = -1     // 当前右键菜单针对的候选页内索引
     private var menuFlags: [UInt8] = [] // 每候选右键菜单禁用位 (0x01上移 0x02下移 0x04置顶 0x08删除 0x10恢复默认)
     var onSelect: ((Int) -> Void)?
@@ -121,14 +123,14 @@ final class CandidateContentView: NSView {
     }
 
     override func mouseMoved(with event: NSEvent) {
-        // 仅对候选 (index>=0) 报悬停; 翻页按钮 (index<0) 与空白都视为无悬停。
-        let idx = hitIndex(event) ?? -1
-        let report = idx >= 0 ? idx : -1
+        // 命中即上报：候选(index≥0) / 翻页器(-1 上页 / -2 下页) 均高亮；空白→无悬停哨兵。
+        let report = hitIndex(event) ?? CandidateContentView.noHover
         if report != lastHover { lastHover = report; onHover?(report) }
     }
 
     override func mouseExited(with event: NSEvent) {
-        if lastHover != -1 { lastHover = -1; onHover?(-1) }
+        let none = CandidateContentView.noHover
+        if lastHover != none { lastHover = none; onHover?(none) }
     }
 }
 
@@ -208,6 +210,9 @@ final class CandidatePanel: NSPanel {
 
         self.setFrameOrigin(NSPoint(x: originX, y: originY))
         self.orderFrontRegardless()
+        // 系统原生窗口阴影按内容 alpha 形状计算且会缓存；内容/尺寸变化后必须 invalidate，
+        // 否则阴影残留旧形状或退化为矩形（候选窗为透明背景 + 圆角位图，需据新形状重算）。
+        if self.hasShadow { self.invalidateShadow() }
     }
 
     /// 更新命中矩形 (CmdCandidateRects 帧晚于 render 帧到达)。

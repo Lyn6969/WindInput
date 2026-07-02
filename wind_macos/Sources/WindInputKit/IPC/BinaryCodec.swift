@@ -121,6 +121,17 @@ public enum BinaryCodec {
         return encodeHeader(cmd: cmd, payloadLen: 0, async: async)
     }
 
+    /// 编码 CmdShowContextMenu 请求。simplified=true → 追加 1 字节 [1]（服务端据此返回 IMK
+    /// 精简菜单，无子菜单）；false → 空 payload（完整菜单，带子菜单，供候选框右键/菜单栏指示器）。
+    public static func encodeShowContextMenuFrame(simplified: Bool) -> Data {
+        if !simplified {
+            return encodeEmptyFrame(cmd: UpstreamCmd.showContextMenu)
+        }
+        var out = encodeHeader(cmd: UpstreamCmd.showContextMenu, payloadLen: 1)
+        out.append(1)
+        return out
+    }
+
     /// 编码 CmdFocusGained (0x0201 upstream) 帧, 携带 InputScope bitmask (darwin)。
     /// 布局: header(8) + payload {
     ///   pid:u32 (4)            // darwin 无 PID 概念, 恒 0 占位 (与 Win 端 [0:4]=pid 约定对齐)
