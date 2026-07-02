@@ -2327,7 +2327,10 @@ impl Coordinator {
                 position: e.position,
             })
             .collect();
-        let _ = store.sync_system_phrases(&sys);
+        if let Err(e) = store.sync_system_phrases(&sys) {
+            warn!("恢复默认：系统短语同步失败: {e}");
+            return 0;
+        }
         let n = store.reset_system_enabled().unwrap_or(0);
         self.rebuild_phrases();
         self.system_phrase_entries.len().max(n)
