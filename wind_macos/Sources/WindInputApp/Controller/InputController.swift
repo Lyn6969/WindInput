@@ -2,6 +2,7 @@ import Cocoa
 import InputMethodKit
 import WindInputKit
 import Carbon.HIToolbox // IsSecureEventInputEnabled (密码框/安全输入检测)
+import ApplicationServices // AXUIElement (前台窗口标题, 命令直通车 title())
 
 // InputController — IMKit 为每个文本框/会话实例化一个本类对象 (PR-1 设计 方案 A).
 //
@@ -101,6 +102,7 @@ public class InputController: IMKInputController {
         // 激活即确保连上 (装完首次激活 / 重启后并发竞态时 init 那次可能没连上)。
         ensureConnected()
         sendFocusGained()
+        sendFrontContext()
     }
 
     /// IME 失去焦点 (切到别的输入法/应用) 时由系统调用。发 FocusLost 让 Go 端
@@ -140,6 +142,49 @@ public class InputController: IMKInputController {
             NSLog("WindInput[sendFocusGained] io error: \(error)")
             reconnect()
         }
+    }
+
+    /// 发前台上下文帧 (CmdFrontContext 0x0211): client app bundle id / 聚焦窗口标题 / 选中文本,
+    /// 供命令直通车 app()/title()/sel() 取值。聚焦时快照 —— app()/title() 稳定; sel() 反映聚焦
+    /// 时选区 (best-effort, 部分 app 不支持取选中文本, 选区随后变化不会刷新)。读掉 ack, 失败仅 log。
+    private func sendFrontContext() {
+        guard let bridge = bridge, bridge.isConnected else { return }
+        let app = currentClient?.bundleIdentifier() ?? ""
+        let title = frontmostWindowTitle()
+        let sel = selectedClientText()
+        do {
+            try bridge.send(BinaryCodec.encodeFrontContextFrame(app: app, title: title, sel: sel))
+            _ = try bridge.readFrame()
+        } catch {
+            NSLog("WindInput[sendFrontContext] io error: \(error)")
+            reconnect()
+        }
+    }
+
+    /// 取当前 client 选中文本 (IMKit selectedRange + attributedSubstring); 无选区/不支持返回空。
+    private func selectedClientText() -> String {
+        guard let client = currentClient else { return "" }
+        let range = client.selectedRange()
+        guard range.length > 0, range.location != NSNotFound else { return "" }
+        if let attr = client.attributedSubstring(from: range) {
+            return attr.string
+        }
+        return ""
+    }
+
+    /// 取前台应用聚焦窗口标题 (AX)。需辅助功能授权 (本 IME 已为合成按键/移动光标申请);
+    /// 未授权/取不到返回空, 不弹授权框。
+    private func frontmostWindowTitle() -> String {
+        guard let app = NSWorkspace.shared.frontmostApplication else { return "" }
+        let axApp = AXUIElementCreateApplication(app.processIdentifier)
+        var winRef: CFTypeRef?
+        guard AXUIElementCopyAttributeValue(axApp, kAXFocusedWindowAttribute as CFString, &winRef) == .success,
+              let win = winRef else { return "" }
+        // swiftlint:disable:next force_cast
+        var titleRef: CFTypeRef?
+        guard AXUIElementCopyAttributeValue(win as! AXUIElement, kAXTitleAttribute as CFString, &titleRef) == .success
+        else { return "" }
+        return (titleRef as? String) ?? ""
     }
 
     /// IS_PASSWORD 位 (TSF InputScope 枚举 31) 的 bitmask, 与 Go coordinator 的

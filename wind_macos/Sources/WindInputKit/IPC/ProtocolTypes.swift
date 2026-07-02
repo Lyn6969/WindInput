@@ -30,6 +30,7 @@ public enum UpstreamCmd {
     public static let candidateHover: UInt16   = 0x020E   // NSPanel 鼠标悬停候选 (payload: pageLocalIndex i32, -1=无)
     public static let candidateContextMenu: UInt16 = 0x020F // NSPanel 右键菜单动作 (payload: index i32 + actionLen u32 + action UTF-8)
     public static let menuAction: UInt16       = 0x0210   // 统一菜单项被选中 (payload: id i32)
+    public static let frontContext: UInt16     = 0x0211   // 前台上下文快照 (payload: appLen+app + titleLen+title + selLen+sel)
     public static let caretUpdate: UInt16     = 0x0301
     public static let selectionChanged: UInt16 = 0x0302
     public static let caretPending: UInt16    = 0x0303

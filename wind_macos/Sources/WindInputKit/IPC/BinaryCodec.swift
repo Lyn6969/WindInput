@@ -520,6 +520,22 @@ public enum BinaryCodec {
         return out
     }
 
+    /// 编码 CmdFrontContext (0x0211 upstream): appLen u32 + app + titleLen u32 + title + selLen u32 + sel。
+    /// 均 UTF-8、LE 长度前缀。与 Rust `wind-bridge` server.rs 的 CMD_FRONT_CONTEXT 解码对齐。
+    public static func encodeFrontContextFrame(app: String, title: String, sel: String) -> Data {
+        var payload = Data()
+        for s in [app, title, sel] {
+            let bytes = Array(s.utf8)
+            var lenField = Data(count: 4)
+            lenField.writeUInt32LE(UInt32(bytes.count), at: 0)
+            payload.append(lenField)
+            payload.append(contentsOf: bytes)
+        }
+        var out = encodeHeader(cmd: UpstreamCmd.frontContext, payloadLen: UInt32(payload.count))
+        out.append(payload)
+        return out
+    }
+
     /// 解 CmdCandidateMenuFlags (0x0505): count(u32) + count×(1 字节禁用位)。
     /// 禁用位: 0x01 上移, 0x02 下移, 0x04 置顶, 0x08 删除, 0x10 恢复默认。
     public static func decodeCandidateMenuFlagsPayload(_ buf: Data) throws -> [UInt8] {
