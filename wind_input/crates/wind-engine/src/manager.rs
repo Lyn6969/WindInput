@@ -16,6 +16,7 @@ use std::collections::HashMap;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 use tracing::{info, warn};
+use wind_candidate::CandidateSource;
 use wind_config::Config;
 use wind_config::schema::{DictSpec, Schema};
 use wind_dict::cached::CachedDict;
@@ -576,6 +577,36 @@ impl EngineManager {
             "pinyin".to_string()
         } else {
             schema_id.to_string()
+        }
+    }
+
+    /// 混输方案的主码表方案 id（`[engine.mixed].primary_schema`）；非混输/未知/未配置返回 None。
+    pub fn mixed_primary_schema(&self, schema_id: &str) -> Option<String> {
+        if self.schema_engine_type(schema_id).as_deref() != Some("mixed") {
+            return None;
+        }
+        Self::read_schema(
+            schema_id,
+            self.data_dir.as_deref(),
+            self.override_dir.as_deref(),
+        )
+        .map(|s| s.engine.mixed.primary_schema)
+        .filter(|p| !p.is_empty())
+    }
+
+    /// 写入/词频归属 id：非混输 = `data_schema_id(自身)`（source 无关，零回归）；
+    /// 混输按候选来源分流（码表→主方案自身 id、拼音→"pinyin"）；
+    /// 无法归因（None/English/Phrase 或 primary 缺失）返回 None，调用方跳过本次读写。
+    pub fn write_data_schema_id(&self, schema_id: &str, source: CandidateSource) -> Option<String> {
+        if self.schema_engine_type(schema_id).as_deref() != Some("mixed") {
+            return Some(self.data_schema_id(schema_id));
+        }
+        match source {
+            CandidateSource::CodeTable => self
+                .mixed_primary_schema(schema_id)
+                .map(|p| self.data_schema_id(&p)),
+            CandidateSource::Pinyin => Some("pinyin".to_string()),
+            _ => None,
         }
     }
 
@@ -2166,6 +2197,114 @@ mod tests {
             mgr.data_schema_id("nonexistent"),
             "nonexistent",
             "未知方案 data_schema_id 应返回自身 id"
+        );
+
+        let _ = std::fs::remove_dir_all(&base_dir);
+        let _ = std::fs::remove_dir_all(&ov_dir);
+    }
+
+    /// P2d Task 1：write_data_schema_id 混输按候选来源分流；非混输忽略 source。
+    #[test]
+    fn write_data_schema_id_routes_mixed_by_source() {
+        use std::io::Write;
+
+        let base_dir = std::env::temp_dir().join("wind_eng_write_data_schema_id_test");
+        let schemas = base_dir.join("schemas");
+        let _ = std::fs::remove_dir_all(&base_dir);
+        std::fs::create_dir_all(&schemas).unwrap();
+
+        // 拼音方案
+        {
+            let mut f = std::fs::File::create(schemas.join("py_test.schema.toml")).unwrap();
+            write!(
+                f,
+                "[schema]\nid = \"py_test\"\n[engine]\ntype = \"pinyin\"\n"
+            )
+            .unwrap();
+        }
+        // 码表方案
+        {
+            let mut f = std::fs::File::create(schemas.join("ct_test.schema.toml")).unwrap();
+            write!(
+                f,
+                "[schema]\nid = \"ct_test\"\n[engine]\ntype = \"codetable\"\n"
+            )
+            .unwrap();
+        }
+        // 混输方案
+        {
+            let mut f = std::fs::File::create(schemas.join("mx_test.schema.toml")).unwrap();
+            write!(
+                f,
+                "[schema]\nid = \"mx_test\"\n[engine]\ntype = \"mixed\"\n[engine.mixed]\nprimary_schema = \"ct_test\"\nsecondary_schema = \"py_test\"\n"
+            )
+            .unwrap();
+        }
+
+        let mut cfg = Config::default();
+        cfg.schema.active = "mx_test".into();
+        cfg.schema.available = vec!["mx_test".into(), "ct_test".into(), "py_test".into()];
+
+        let ov_dir = std::env::temp_dir().join("wind_eng_write_data_schema_id_ov");
+        let _ = std::fs::remove_dir_all(&ov_dir);
+
+        let mgr =
+            EngineManager::with_store_override(&cfg, Some(&base_dir), None, Some(ov_dir.clone()));
+
+        // 非混输：忽略 source，等价 data_schema_id
+        assert_eq!(
+            mgr.write_data_schema_id("py_test", CandidateSource::None),
+            Some("pinyin".to_string()),
+            "拼音方案忽略 source，折叠为 pinyin"
+        );
+        assert_eq!(
+            mgr.write_data_schema_id("ct_test", CandidateSource::Pinyin),
+            Some("ct_test".to_string()),
+            "码表方案忽略 source，返回自身 id"
+        );
+
+        // 混输：按来源分流
+        assert_eq!(
+            mgr.write_data_schema_id("mx_test", CandidateSource::CodeTable),
+            Some("ct_test".to_string()),
+            "混输 + CodeTable → 主码表方案 id"
+        );
+        assert_eq!(
+            mgr.write_data_schema_id("mx_test", CandidateSource::Pinyin),
+            Some("pinyin".to_string()),
+            "混输 + Pinyin → pinyin"
+        );
+        assert_eq!(
+            mgr.write_data_schema_id("mx_test", CandidateSource::None),
+            None,
+            "混输 + None → 无法归因，跳过"
+        );
+        assert_eq!(
+            mgr.write_data_schema_id("mx_test", CandidateSource::Phrase),
+            None,
+            "混输 + Phrase → 无法归因，跳过"
+        );
+        assert_eq!(
+            mgr.write_data_schema_id("mx_test", CandidateSource::English),
+            None,
+            "混输 + English → 无法归因，跳过"
+        );
+
+        // mixed_primary_schema
+        assert_eq!(
+            mgr.mixed_primary_schema("mx_test"),
+            Some("ct_test".to_string()),
+            "混输方案的主码表方案 id"
+        );
+        assert_eq!(
+            mgr.mixed_primary_schema("ct_test"),
+            None,
+            "非混输方案 mixed_primary_schema 返回 None"
+        );
+        assert_eq!(
+            mgr.mixed_primary_schema("nonexistent"),
+            None,
+            "未知方案 mixed_primary_schema 返回 None"
         );
 
         let _ = std::fs::remove_dir_all(&base_dir);
