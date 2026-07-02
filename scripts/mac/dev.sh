@@ -1,52 +1,73 @@
 #!/usr/bin/env bash
-# WindInput macOS 开发一站式脚本 (原生构建, 对齐 Windows 的 scripts/dev.ps1)。
+# WindInput macOS 开发一站式脚本 (原生构建, 命令面对齐 Windows 的 scripts/dev.ps1)。
 #
-# 解决的痛点: 旧 app.sh / install_app.sh / install_service.sh 各管一段且默认不编译,
-# 容易装上旧二进制 (service 才是渲染/定位/上屏的真身)。本脚本把「编译 + 安装」串成
-# 一条命令, 一律先编再装, 杜绝旧二进制。原先散落的 app.sh / install_app.sh /
-# install_service.sh / setup_signing.sh / pkg.sh 已全部内联进本脚本成为函数。
+# 与 Windows 的映射: Windows 的「C++ TSF DLL (m1)」在 macOS 上对应「app 层 (WindInput.app,
+# Swift/IMKit)」, 「核心 exe (m2)」对应「Rust 服务 (wind_service → wind_input 二进制)」。
+# 服务才是渲染/定位/上屏的真身; app 只是 IMKit 壳。本脚本把「编译 + 生成数据 + 部署」串成
+# 一套命令, 一律先编再装, 杜绝装上旧二进制。
 #
 # 用法:
-#   scripts/mac/dev.sh <命令> [--debug]
+#   scripts/mac/dev.sh              # 交互式菜单 (对齐 dev.ps1)
+#   scripts/mac/dev.sh <命令> ...   # 非交互直调, 支持空格分隔连续命令 (前者失败即停)
+#   scripts/mac/dev.sh menu         # 显式进菜单
+#   scripts/mac/dev.sh -h|--help    # 本帮助
 #
-# 命令 (前缀缩写均可):
-#   install | i      编译 + 安装 service(Rust) + app(Swift)  ← 改完代码就跑它
-#   service | svc    编译 + 安装 service (改 Rust 渲染/协议/引擎时)
-#   app     | a      编译 + 安装 app     (改 Swift 显示/IMKit 时)
-#   build   | b      只编译两端 (service + .app bundle + codesign), 不安装
-#   run     | r      重启 service (kickstart, 不重编)
-#   logs    | l      跟踪 service + IME 日志
-#   status  | st     诊断: service pid / socket / 签名 / 进程
-#   data    | gd     把当前已装的 data/ 快照到 build_mac/data (作安装数据源)
-#   uninstall | rm   卸载 service + app
-#   sign-setup       命令行创建自签 Code Signing 证书 "WindInput Dev" (需 sudo + 钥匙串交互)
-#                    可带子命令: sign-setup [create|check|grant|remove]
-#   pkg              打 .pkg 安装器 (终端用户分发); pkg --build 先构建再打包
+# 命令 (菜单与命令行直调同一套; 前缀 d=dev, p=部署, m=单模块):
+#   1  / release      Release 全构建: service + app + gen-data 组装 + 数据校验
+#   d1 / dev          Dev 全构建 (WIND_VARIANT=dev 身份)
+#   m1 / dm1          仅构建 app   (WindInput.app / WindInputDev.app)  release/dev  [= Win m1 tsf]
+#   m2 / dm2          仅构建 service (cargo build -p wind_service)     release/dev  [= Win m2 core]
+#   m3 / dm3          仅构建 wind_setting (../wind-setting, 不存在则跳过) release/dev
+#   p1 / pd1          系统安装全部 (service LaunchAgent + app 到 ~/Library/Input Methods/)
+#   pm1 / pdm1        仅装 app 模块     pm2 / pdm2   仅装 service 模块
+#   u/u1 / ud/ud1     系统卸载 release / dev (撤销 app+service+LaunchAgent, 保留用户数据)
+#   8  / d8           生成 .pkg 安装包 (release / dev): 全构建后打包
+#   8s / d8s          生成 .pkg (跳过重建, 直接用现有产物打包)
+#   k=check  l=clippy  t=test  f=fmt  fmt-check  ci(=fmt-check+clippy+test)  clean
+#   gd=gen-data       下载词库 + 生成 unigram/pinyin_map + 组装 data/ → build_mac/data + 校验
+#   r=repl            候选 REPL (cargo run -p wind-repl -- <data>; data 默认 build_mac/data)
 #
-# 选项:
-#   --debug          debug 变体 (WindInputDebug + target/debug + debug_variant 特性,
-#                    与 release 变体可共存; 默认 release = WindInput)。
-#   --data <dir>     指定词库数据源目录 (默认见下「数据解析」)。
+# macOS 专属便利命令:
+#   run               重启 service (launchctl kickstart, 不重编)
+#   logs              跟踪 service + IME 日志
+#   status            诊断: service pid / socket / 签名 / 进程
+#   data              把当前已装的 data/ 快照到 build_mac/data
+#   sign-setup        命令行建自签证书 "WindInput Dev" (子命令: create|check|grant|remove)
+#   pkg               = 8 (release .pkg); 透传 --build 等参数
 #
-# 数据解析顺序 (install_service 需要 data/): --data > build_mac/data > 当前已装的
-#   service/data (自动快照到 build_mac/data) > 报错提示先组装数据。
-# 完整词库 (重新下载/生成 unigram/opencc) 仍走 Linux 的 scripts/dev.sh gen-data;
-# mac 日常开发数据稳定, 复用已装的即可。
+# 全局选项:
+#   --data <dir>      指定词库数据源目录 (覆盖 build_mac/data 自动解析)。
+#
+# 变体身份 (跨 Rust/Swift 对齐, 错了 dev 变体就连不通):
+#   release: app=WindInput.app  bundleID=to.feng.inputmethod.WindInput
+#            数据目录=~/Library/Application Support/WindInput  LaunchAgent=to.feng.windinput.service
+#   dev    : app=WindInputDev.app  bundleID=to.feng.inputmethod.WindInputDev (以 "Dev" 结尾)
+#            数据目录=~/Library/Application Support/WindInputDev  LaunchAgent=to.feng.windinput.service.dev
+#            LaunchAgent plist 注入 WIND_VARIANT=dev (Rust 服务据此选 WindInputDev 数据目录;
+#            服务二进制用中文显示名, 文件名不以 _dev 结尾, 故必须靠环境变量声明 dev 身份)。
+#
+# 数据目录说明:
+#   data/          源文件(入库): configs、五笔/双拼方案、主题等手工维护文件
+#   .cache/        外部下载/生成(gitignore): rime-frost、opencc、pinyin-data、unigram 等
+#   build_mac/     macOS 组装的运行时 data/ (gitignore); 作 service 安装数据源
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_DIR="$(cd "$SCRIPT_DIR/../.." && pwd)"
 RUST_DIR="$REPO_DIR/wind_input"
 MACOS_DIR="$REPO_DIR/wind_macos"
-DATA_SNAPSHOT="$REPO_DIR/build_mac/data"
+DATA_SRC="$REPO_DIR/data"               # 源文件 (入库), 组装数据的基底
+CACHE_DIR="$REPO_DIR/.cache"            # 外部下载/生成 (gitignore)
+DATA_SNAPSHOT="$REPO_DIR/build_mac/data"  # 组装后的运行时 data/ (gitignore); 安装数据源
+SETTING_DIR="$REPO_DIR/../wind-setting"   # 设置程序 (独立项目, 不存在则跳过)
 
-# 变体派生
-VARIANT="release"          # release | debug
-CARGO_PROFILE_FLAG="--release"
-CARGO_FEATURES=()
-APP_VARIANT_FLAG=()        # 传给内联的 app_build / install_* 函数
+# 变体派生 (由 apply_variant 按 release/dev 设置)。
+VARIANT="release"
+CARGO_BUILD_ARGS=(--release)      # release → --release; dev → --profile dev-variant
+APP_VARIANT_FLAG=()               # release → (); dev → (--dev)
 APP_SUPPORT="$HOME/Library/Application Support/WindInput"
 LABEL="to.feng.windinput.service"
+INSTALLED_DATA="$APP_SUPPORT/service/data"
 DATA_OVERRIDE=""
 
 # 固定自签证书签名: macOS 26 的 IME 必须真 Authority (纯 ad-hoc 装上能切但 IMK 不拉起
@@ -59,41 +80,82 @@ info() { printf "  %s\n" "$*"; }
 warn() { printf "\033[33m  %s\033[0m\n" "$*"; }
 err()  { printf "\033[31m[错误] %s\033[0m\n" "$*" >&2; }
 
-# ───────────────────────── 子步骤 ─────────────────────────
+# 按变体设置全局派生量。dev 服务二进制文件名不带 _dev (中文显示名), 身份靠 plist 里
+# WIND_VARIANT=dev 声明; release/dev 数据目录/LaunchAgent label 均隔离, 可共存。
+apply_variant() {
+    local p="${1:-release}"
+    if [[ "$p" == dev ]]; then
+        VARIANT="dev"
+        CARGO_BUILD_ARGS=(--profile dev-variant)   # 对齐 Windows Build-Core 的 dev-variant profile
+        APP_VARIANT_FLAG=(--dev)
+        APP_SUPPORT="$HOME/Library/Application Support/WindInputDev"
+        LABEL="to.feng.windinput.service.dev"
+    else
+        VARIANT="release"
+        CARGO_BUILD_ARGS=(--release)
+        APP_VARIANT_FLAG=()
+        APP_SUPPORT="$HOME/Library/Application Support/WindInput"
+        LABEL="to.feng.windinput.service"
+    fi
+    INSTALLED_DATA="$APP_SUPPORT/service/data"
+}
+
+# 变体对应的 .app 目录名 (WindInput / WindInputDev)。
+app_name_for_variant() { [[ "$VARIANT" == dev ]] && echo "WindInputDev" || echo "WindInput"; }
+
+# 服务(重)启后踢掉本变体的 IME app 控制器进程，让 IMK 按需重拉新实例并重连到刚起的服务。
+# 背景: 服务重启会断开 app 侧的请求 socket; app 不会自动重连该通道 (仅 push 通道靠
+# SERVICE_READY 重连), 不重拉则表现为「装完/重启服务后按键无响应」。Windows 侧 TSF DLL
+# 由各宿主进程自动重连, macOS 的 IMKit .app 常驻进程需显式踢一下。
+# 只杀控制器实例, 保留 --register-input-source 守护 (维持 TIS 注册); IME 非当前输入源时
+# 无控制器进程在跑, pgrep 落空即静默跳过。
+kick_ime_app() {
+    local appname pids pid args killed=0
+    appname="$(app_name_for_variant)"
+    pids=$(pgrep -f "$appname.app/Contents/MacOS/WindInput" 2>/dev/null) || return 0
+    for pid in $pids; do
+        args=$(ps -o args= -p "$pid" 2>/dev/null || true)
+        case "$args" in
+            *--register-input-source*) ;;                # 保留注册守护
+            *) kill "$pid" 2>/dev/null && killed=1 ;;     # 只杀控制器实例
+        esac
+    done
+    [[ $killed -eq 1 ]] && info "已重启 IME app ($appname) 控制器 — IMK 将按需重拉并重连新服务"
+    return 0
+}
+
+# ───────────────────────── 子步骤: 编译 ─────────────────────────
 
 build_service() {
     bold "==> 编译 Rust service ($VARIANT)"
-    ( cd "$RUST_DIR" && cargo build $CARGO_PROFILE_FLAG ${CARGO_FEATURES[@]+"${CARGO_FEATURES[@]}"} -p wind_service )
+    ( cd "$RUST_DIR" && cargo build "${CARGO_BUILD_ARGS[@]}" -p wind_service )
 }
 
-# ───────────── app_build (原 app.sh: 拼装 WindInput.app bundle) ─────────────
-# build_macos_app.sh — 拼装 WindInput.app bundle (PR-A M2).
-#
+# ───────────── app_build (拼装 WindInput[Dev].app bundle) ─────────────
 # SwiftPM 不直接产 .app, 这里:
-#   1. swift build --product wind-input-app  (release, arm64)
+#   1. swift build --product wind-input-app  (release/debug, arm64)
 #   2. 按标准 macOS .app 结构拼 Contents/{MacOS, Resources, Info.plist}
-#   3. codesign --force --sign - (ad-hoc 签名, 让本机能加载; 上架走 PR-A.5 M6)
-#
-# 输出: wind_macos/build/WindInput.app
+#   3. codesign (自签证书或 ad-hoc, 让本机能加载)
+# 输出: wind_macos/build/WindInput[Dev].app
 #
 # 用法:
-#   scripts/mac/dev.sh build            # release build + 签名
-#   app_build --debug                   # debug build (swift build -c debug)
-#   app_build --no-sign                 # 不 codesign (调试用)
-#   app_build --universal               # arm64+x86_64 通用二进制 (分发/CI 用)
-#   WIND_MAC_UNIVERSAL=1 ...            # 同上 (CI 走环境变量统一开关)
+#   app_build                  # release build + 签名
+#   app_build --dev            # dev build (swift build -c debug + WindInputDev 身份)
+#   app_build --no-sign        # 不 codesign (调试用)
+#   app_build --universal      # arm64+x86_64 通用二进制 (分发/CI 用)
+#   WIND_MAC_UNIVERSAL=1 ...    # 同上 (CI 走环境变量统一开关)
 app_build() {
-    # 变体: release → APP_NAME=WindInput; debug → APP_NAME=WindInputDebug (--debug 设置)。
+    # 变体: release → APP_NAME=WindInput; dev → APP_NAME=WindInputDev (--dev)。
     # .app 目录名/bundleID 按变体区分以支持共存; 可执行名 EXE_NAME 恒为 WindInput
     # (= CFBundleExecutable, 两变体同名, 仅所在 .app 路径不同)。
     local APP_BASE="WindInput"
-    local VARIANT_SUFFIX=""        # debug 时 "Debug"
+    local VARIANT_SUFFIX=""        # dev 时 "Dev"
     local EXE_NAME="$APP_BASE"
 
     local SWIFT_CONFIG="release"
     local DO_SIGN=1
     # universal: arm64+x86_64 通用二进制. 环境变量 WIND_MAC_UNIVERSAL=1 或 --universal 开启.
-    # 默认本机单架构 (本地/VM 快). CI 在 job 级设环境变量, 三件套脚本统一继承同一开关.
+    # 默认本机单架构 (本地/VM 快). CI 在 job 级设环境变量, 统一继承同一开关.
     local UNIVERSAL="${WIND_MAC_UNIVERSAL:-0}"
     # 默认 ad-hoc (-). 真实证书:
     #   SIGN_IDENTITY="WindInput Dev" scripts/mac/dev.sh build
@@ -104,14 +166,14 @@ app_build() {
     local arg
     for arg in "$@"; do
         case "$arg" in
-            --debug)     SWIFT_CONFIG="debug"; VARIANT_SUFFIX="Debug" ;;
+            --dev)       SWIFT_CONFIG="debug"; VARIANT_SUFFIX="Dev" ;;
             --no-sign)   DO_SIGN=0 ;;
             --universal) UNIVERSAL=1 ;;
             *) echo "[错误] 未知参数: $arg" >&2; exit 1 ;;
         esac
     done
 
-    # 变体派生: APP_NAME = .app 目录名 + bundleID 后缀 (WindInput / WindInputDebug)。
+    # 变体派生: APP_NAME = .app 目录名 + bundleID 后缀 (WindInput / WindInputDev)。
     local APP_NAME="${APP_BASE}${VARIANT_SUFFIX}"
     local APP_BUNDLE="$MACOS_DIR/build/$APP_NAME.app"
 
@@ -154,14 +216,15 @@ app_build() {
     # Info.plist
     cp "$MACOS_DIR/Sources/WindInputApp/Resources/Info.plist" "$APP_BUNDLE/Contents/Info.plist"
 
-    # 变体注入 (debug): 全局把 bundleID 串换成 debug 变体 —— 一并改写 CFBundleIdentifier /
+    # 变体注入 (dev): 全局把 bundleID 串换成 dev 变体 —— 一并改写 CFBundleIdentifier /
     # InputMethodConnectionName / ComponentInputModeDict 的 mode-id (作 dict key + TISInputSourceID
     # 值 + 有序数组项)。再把显示名 (CFBundleName/DisplayName/TISIconLabels) 加「开发版」。
-    # 这样 debug .app 注册为独立输入源, 与 release 共存。
+    # 这样 dev .app 注册为独立输入源, 与 release 共存; 且 bundleID 以 "Dev" 结尾, Swift 的
+    # BridgeEndpoints.variantSuffix 返回 "Dev" → runtimeDir=WindInputDev, 与 Rust 数据目录对齐。
     if [[ -n "$VARIANT_SUFFIX" ]]; then
-        bold "==> 变体注入 (debug): bundleID/mode/连接名/显示名 → $APP_NAME"
+        bold "==> 变体注入 (dev): bundleID/mode/连接名/显示名 → $APP_NAME"
         sed -i '' \
-            -e 's/to\.feng\.inputmethod\.WindInput/to.feng.inputmethod.WindInputDebug/g' \
+            -e 's/to\.feng\.inputmethod\.WindInput/to.feng.inputmethod.WindInputDev/g' \
             -e 's/清风输入法/清风输入法开发版/g' \
             "$APP_BUNDLE/Contents/Info.plist"
     fi
@@ -188,12 +251,12 @@ app_build() {
         lang=$(basename "$lproj")
         mkdir -p "$APP_BUNDLE/Contents/Resources/$lang"
         cp -R "$lproj"/* "$APP_BUNDLE/Contents/Resources/$lang/"
-        # 变体注入 (debug): mode-id 键对齐 + 本地化显示名加「开发版」/「Debug」。
+        # 变体注入 (dev): mode-id 键对齐 + 本地化显示名加「开发版」/「Dev」。
         if [[ -n "$VARIANT_SUFFIX" && -f "$APP_BUNDLE/Contents/Resources/$lang/InfoPlist.strings" ]]; then
             sed -i '' \
-                -e 's/to\.feng\.inputmethod\.WindInput/to.feng.inputmethod.WindInputDebug/g' \
+                -e 's/to\.feng\.inputmethod\.WindInput/to.feng.inputmethod.WindInputDev/g' \
                 -e 's/"清风输入法"/"清风输入法开发版"/g' \
-                -e 's/"WindInput"/"WindInputDebug"/g' \
+                -e 's/"WindInput"/"WindInputDev"/g' \
                 "$APP_BUNDLE/Contents/Resources/$lang/InfoPlist.strings"
         fi
         info "lproj: $lang"
@@ -262,8 +325,7 @@ app_build() {
 
     bold "==> Done"
     info "Bundle: $APP_BUNDLE"
-    info "下一步: scripts/mac/dev.sh app"
-    info "       (会把 .app 复制到 ~/Library/Input Methods/ 并 killall 旧实例)"
+    info "下一步: scripts/mac/dev.sh ${APP_VARIANT_FLAG[*]:+dm1}${APP_VARIANT_FLAG[*]:-pm1}  (装 app 模块)"
 }
 
 build_app() {
@@ -271,41 +333,207 @@ build_app() {
     app_build ${APP_VARIANT_FLAG[@]+"${APP_VARIANT_FLAG[@]}"}
 }
 
-# 解析安装用的 data 目录; 必要时快照已装数据到 build_mac/data。
+# wind_setting: macOS 上是独立 native 项目; 对齐 dev.ps1 的 skip-if-absent 桩。
+build_setting() {
+    if [[ -d "$SETTING_DIR" ]]; then
+        warn "wind_setting: 独立设置项目 ($SETTING_DIR) 尚未接入 macOS 自动构建, 跳过"
+    else
+        warn "wind_setting: ../wind-setting 不存在, 跳过 (对齐 dev.ps1 skip-if-absent)"
+    fi
+    return 0
+}
+
+# ───────────────────────── gen-data (原生, 对齐 dev.ps1) ─────────────────────────
+
+# 下载单个词库文件到 .cache/ (已存在则跳过; curl 重试 3 次; 失败告警但不硬断, 交 verify 兜底)。
+get_dict() {
+    local url="$1" dst="$2" desc="${3:-}"
+    if [[ -f "$dst" ]]; then info "[skip] $(basename "$dst") 已存在"; return 0; fi
+    info "[get ] $(basename "$dst") $desc"
+    mkdir -p "$(dirname "$dst")"
+    if curl -fsSL --retry 3 -o "$dst" "$url"; then return 0; fi
+    rm -f "$dst"
+    warn "下载失败: $url"
+    return 0
+}
+
+# 下载 rime-frost / pinyin-data / OpenCC 词库 → .cache/。
+download_dicts() {
+    bold "==> 下载外部词库 → $CACHE_DIR"
+    local rime="$CACHE_DIR/rime-frost" f
+    local frost="https://raw.githubusercontent.com/gaboolic/rime-frost/master"
+    info "rime-frost (拼音):"
+    get_dict "$frost/rime_frost.dict.yaml" "$rime/rime_frost.dict.yaml" "词库入口"
+    for f in 8105 41448 base ext others corrections tencent; do
+        get_dict "$frost/cn_dicts/$f.dict.yaml" "$rime/cn_dicts/$f.dict.yaml"
+    done
+    info "rime-frost (英文):"
+    for f in en en_ext; do get_dict "$frost/en_dicts/$f.dict.yaml" "$rime/en_dicts/$f.dict.yaml"; done
+
+    local py="$CACHE_DIR/pinyin-data"
+    local pybase="https://raw.githubusercontent.com/mozillazg/pinyin-data/master"
+    info "pinyin-data (汉字拼音反查):"
+    for f in kXHC1983 kTGHZ2013 kMandarin_8105 overwrite; do get_dict "$pybase/$f.txt" "$py/$f.txt"; done
+
+    local oc="$CACHE_DIR/opencc/dictionaries"
+    local ocbase="https://raw.githubusercontent.com/BYVoid/OpenCC/master/data/dictionary"
+    info "OpenCC 简繁词典:"
+    for f in STCharacters STPhrases TWVariants TWPhrases HKVariants; do get_dict "$ocbase/$f.txt" "$oc/$f.txt"; done
+    return 0
+}
+
+# 从 data/(源) + .cache/(下载/生成) 组装完整运行时数据到 build_mac/data。
+assemble_data() {
+    local data="$DATA_SNAPSHOT"
+    local pinyin="$data/schemas/pinyin"
+    local pinyin_cn="$pinyin/cn_dicts"
+    local english="$data/schemas/english"
+    local rime="$CACHE_DIR/rime-frost"
+    local f
+
+    bold "==> 组装 data/ → $data"
+    [[ -d "$DATA_SRC" ]] || { err "源数据目录不存在: $DATA_SRC"; return 1; }
+    # 先清空目标再组装, 保证内容干净且包含仓库 data/ 里最新的 schemas/shuangpin/*.toml 与 toml 主题。
+    rm -rf "$data"
+    mkdir -p "$(dirname "$data")"
+
+    # 1. 复制 data/ 源文件 (configs、五笔/双拼方案、主题等)。
+    cp -R "$DATA_SRC" "$data"
+
+    # 1b. 合并 wind_input/data/settings/ (manifest.toml 等 RPC 元数据; 存在才合并)。
+    if [[ -d "$RUST_DIR/data/settings" ]]; then
+        mkdir -p "$data/settings"
+        cp -R "$RUST_DIR/data/settings/." "$data/settings/"
+    fi
+
+    # 2. rime-frost 拼音词库。
+    mkdir -p "$pinyin_cn"
+    if [[ -f "$rime/rime_frost.dict.yaml" ]]; then
+        cp -f "$rime/rime_frost.dict.yaml" "$pinyin/"
+        for f in 8105 41448 base ext others corrections; do
+            [[ -f "$rime/cn_dicts/$f.dict.yaml" ]] && cp -f "$rime/cn_dicts/$f.dict.yaml" "$pinyin_cn/"
+        done
+    else
+        warn "缺 .cache/rime-frost/, 拼音词库不可用 (先跑 gd 下载)"
+    fi
+
+    # 3. 英文词库。
+    mkdir -p "$english"
+    for f in en en_ext; do
+        [[ -f "$rime/en_dicts/$f.dict.yaml" ]] && cp -f "$rime/en_dicts/$f.dict.yaml" "$english/"
+    done
+
+    # 4. Unigram 语言模型。
+    local unigram="$CACHE_DIR/pinyin-frost/unigram.txt"
+    if [[ -f "$unigram" ]]; then cp -f "$unigram" "$pinyin/unigram.txt"; else warn "缺 unigram.txt (先跑 gd 生成)"; fi
+
+    # 4b. 汉字拼音反查表。
+    local pmap="$CACHE_DIR/pinyin-data/pinyin_map.txt"
+    if [[ -f "$pmap" ]]; then cp -f "$pmap" "$data/pinyin_map.txt"; else warn "缺 pinyin_map.txt (先跑 gd 生成)"; fi
+
+    # 5. OpenCC 编译 .octrie (Rust 工具 gen_opencc)。
+    mkdir -p "$data/opencc"
+    if ls "$CACHE_DIR/opencc/dictionaries"/*.txt >/dev/null 2>&1; then
+        info "编译 OpenCC → .octrie ..."
+        ( cd "$RUST_DIR" && cargo run -q -p wind-tools --bin gen_opencc -- --src "$CACHE_DIR/opencc/dictionaries" --out "$data/opencc" ) \
+            || warn "OpenCC 编译失败 (简繁转换不可用)"
+    else
+        warn "缺 .cache/opencc/, OpenCC 不可用 (先跑 gd 下载)"
+    fi
+
+    info "data/ 组装完成 ($(find "$data" -type f | wc -l | tr -d ' ') 文件)"
+    return 0
+}
+
+# 下载外部词库 + 生成 unigram/pinyin_map + 组装 data/ → build_mac/data。
+do_gendata() {
+    bold "========== gen-data (下载 + 生成 + 组装) → $DATA_SNAPSHOT =========="
+    download_dicts
+
+    # 生成 Unigram 语言模型 (Rust 工具 gen_unigram)。
+    local unigram="$CACHE_DIR/pinyin-frost/unigram.txt"
+    mkdir -p "$(dirname "$unigram")"
+    if [[ ! -f "$unigram" ]]; then
+        bold "==> 生成 Unigram 语言模型"
+        ( cd "$RUST_DIR" && cargo run -q -p wind-tools --bin gen_unigram -- --rime "$CACHE_DIR/rime-frost/cn_dicts" --out "$unigram" ) \
+            || warn "Unigram 生成失败 (智能组句不可用)"
+    else
+        info "Unigram 已缓存"
+    fi
+
+    # 生成汉字拼音反查表 (Rust 工具 gen_pinyin)。
+    local pmap="$CACHE_DIR/pinyin-data/pinyin_map.txt"
+    if [[ -f "$CACHE_DIR/pinyin-data/kMandarin_8105.txt" ]]; then
+        bold "==> 生成汉字拼音反查表"
+        ( cd "$RUST_DIR" && cargo run -q -p wind-tools --bin gen_pinyin -- --src "$CACHE_DIR/pinyin-data" --out "$pmap" ) \
+            || warn "拼音反查表生成失败 (候选拼音提示不可用)"
+    else
+        warn "缺 .cache/pinyin-data/kMandarin_8105.txt, 拼音反查表不可用"
+    fi
+
+    assemble_data
+    bold "==> gen-data 完成 → $DATA_SNAPSHOT"
+    return 0
+}
+
+# 发布前硬门禁: 校验关键运行时数据完整 (缺失/过小即失败)。对齐 dev.ps1 Verify-DistData。
+verify_dist_data() {
+    local data="$DATA_SNAPSHOT" ok=1
+    bold "==> 校验发布数据完整性 → $data"
+    _check_min() {
+        local rel="$1" min="$2" p="$data/$1" sz
+        if [[ ! -f "$p" ]]; then err "  ✗ 缺失: $rel"; ok=0; return; fi
+        sz=$(stat -f%z "$p" 2>/dev/null || echo 0)
+        if (( sz < min )); then err "  ✗ 过小 (${sz}B < 期望 ${min}B): $rel"; ok=0
+        else info "  ✓ $rel ($((sz / 1024))KB)"; fi
+    }
+    _check_min "schemas/pinyin/unigram.txt"            1000000
+    _check_min "schemas/pinyin/cn_dicts/base.dict.yaml" 1000000
+    _check_min "schemas/pinyin/cn_dicts/8105.dict.yaml" 10000
+    _check_min "schemas/english/en.dict.yaml"           1000
+    _check_min "pinyin_map.txt"                         10000
+    local oc; oc=$(ls "$data/opencc"/*.octrie 2>/dev/null | wc -l | tr -d ' ')
+    if (( oc < 1 )); then err "  ✗ 缺失: opencc/*.octrie (简繁转换编译失败)"; ok=0
+    else info "  ✓ opencc/*.octrie ($oc 个)"; fi
+
+    if (( ok == 0 )); then
+        err "发布数据校验失败! 上述文件缺失或异常会导致功能残缺。"
+        err "请排查 gd 的下载/生成 (词库源、网络、gen_unigram/gen_opencc)。"
+        return 1
+    fi
+    bold "==> 发布数据校验通过"
+    return 0
+}
+
+# ───────────── 数据解析 (安装 service 需要 data/) ─────────────
+# 顺序: --data > build_mac/data > 当前已装 service/data (自动快照到 build_mac/data) > 报错。
 resolve_data() {
     if [[ -n "$DATA_OVERRIDE" ]]; then echo "$DATA_OVERRIDE"; return; fi
     if [[ -d "$DATA_SNAPSHOT" ]]; then echo "$DATA_SNAPSHOT"; return; fi
     if [[ -d "$INSTALLED_DATA" ]]; then
         mkdir -p "$DATA_SNAPSHOT"
         cp -R "$INSTALLED_DATA/." "$DATA_SNAPSHOT/"
-        warn "已把当前已装 data/ 快照到 build_mac/data (后续复用; 词库更新请重跑 data 命令)" >&2
+        warn "已把当前已装 data/ 快照到 build_mac/data (后续复用; 词库更新请重跑 gd)" >&2
         echo "$DATA_SNAPSHOT"; return
     fi
     err "找不到词库数据源 (--data / build_mac/data / 已装 service/data 均无)。"
-    err "先用 Linux 的 scripts/dev.sh gen-data 组装, 或 --data 指定。"
+    err "先跑 scripts/mac/dev.sh gd 组装数据, 或 --data 指定。"
     exit 1
 }
 
-# ───────────── app_install (原 install_app.sh: 装 .app 到 ~/Library/Input Methods/) ─────────────
-# install_macos_app.sh — 把 WindInput.app 装到 ~/Library/Input Methods/ (用户域).
-#
-# 不需要 sudo (用户域安装). 装完后用户去 系统设置 → 键盘 → 文本输入 → 编辑 → + 号
-# → 简体中文 → WindInput 添加一次, 后续就能在状态栏 IME 切换菜单看到.
-#
-# 为何用户域 (~/Library) 而非系统域 (/Library): 实测在 macOS 26 (Tahoe) 上, 用户域 +
-# ad-hoc 签名的 IME 能正常进「可添加列表」(与 Fcitx5 一致); 且无需 sudo, 也避开了
-# /Library 下 root 拥有 + spctl 策略的一堆坑.
+# ───────────── app_install (装 .app 到 ~/Library/Input Methods/) ─────────────
+# 用户域安装 (不需 sudo). 装完后系统设置 → 键盘 → 文本输入 → 编辑 → + → 简体中文 → 选 WindInput[开发版]。
 #
 # 参数:
 #   (无)            装 release build
-#   --debug         装 debug build (路径同)
+#   --dev           装 dev build (WindInputDev.app)
 #   --build         先 build 再装
 #   --uninstall     卸载
 #   --from <dir>    从指定目录装 (内含 <APP_NAME>.app), 供 .pkg postinstall 等离仓库场景.
 app_install() {
-    # 变体: release → WindInput; debug → WindInputDebug (--debug)。两变体可作为独立输入法共存。
+    # 变体: release → WindInput; dev → WindInputDev (--dev)。两变体可作为独立输入法共存。
     # EXE_NAME 恒为 WindInput (= CFBundleExecutable): 两变体进程同名, 必须按 .app 路径定位进程,
-    # 否则装/卸 debug 会误杀正在使用的 release (反之亦然)。
+    # 否则装/卸 dev 会误杀正在使用的 release (反之亦然)。
     local APP_NAME="WindInput"
     local EXE_NAME="WindInput"
     local BUNDLE_ID="to.feng.inputmethod.WindInput"
@@ -318,7 +546,7 @@ app_install() {
     while [[ $# -gt 0 ]]; do
         case "$1" in
             --build) DO_BUILD=1 ;;
-            --debug) BUILD_ARGS+=("--debug"); APP_NAME="WindInputDebug"; BUNDLE_ID="to.feng.inputmethod.WindInputDebug" ;;
+            --dev) BUILD_ARGS+=("--dev"); APP_NAME="WindInputDev"; BUNDLE_ID="to.feng.inputmethod.WindInputDev" ;;
             --uninstall) DO_UNINSTALL=1 ;;
             # --from <dir>: 从指定目录装 (内含 <APP_NAME>.app), 供 .pkg postinstall 等离仓库场景.
             --from) shift; SRC_DIR="${1:-}"; [[ -n "$SRC_DIR" ]] || { echo "[错误] --from 缺目录参数" >&2; exit 1; } ;;
@@ -327,7 +555,7 @@ app_install() {
         shift
     done
 
-    # 变体派生 (在 --debug/--from 解析后, 不依赖参数顺序)。
+    # 变体派生 (在 --dev/--from 解析后, 不依赖参数顺序)。
     local APP_BUNDLE="${SRC_DIR:-$MACOS_DIR/build}/$APP_NAME.app"
     local INSTALL_APP="$INSTALL_DIR/$APP_NAME.app"
 
@@ -340,8 +568,7 @@ app_install() {
 
     # -------- uninstall (完整清理) --------
     # 仅 rm .app 是不够的: register 守护进程残留 / HIToolbox plist 启用项 / TIS LS DB
-    # 缓存 / Caches & Application Support 都可能残留, 导致系统设置里出现幽灵条目.
-    # 这里一次清干净.
+    # 缓存 / Caches & Application Support 都可能残留, 导致系统设置里出现幽灵条目. 一次清干净.
     if [[ $DO_UNINSTALL -eq 1 ]]; then
         bold "==> Uninstall $APP_NAME (full purge)"
 
@@ -390,11 +617,11 @@ else:
     print("    (no HIToolbox entries matched)")
 PY
 
-        # 4. 清缓存 / state (变体目录: debug 用 Caches/WindInputDebug + App Support/WindInput_debug,
-        #    与 Go buildvariant AppName()/Suffix() 对齐; release 用不带后缀的)。
+        # 4. 清缓存 / state (变体目录: dev 用 Caches/WindInputDev + App Support/WindInputDev,
+        #    与 Rust variant::app_dir_name() 对齐; release 用不带后缀的)。
         local PURGE_DIRS d
-        if [[ "$APP_NAME" == "WindInputDebug" ]]; then
-            PURGE_DIRS=("$HOME/Library/Caches/WindInputDebug" "$HOME/Library/Application Support/WindInput_debug")
+        if [[ "$APP_NAME" == "WindInputDev" ]]; then
+            PURGE_DIRS=("$HOME/Library/Caches/WindInputDev" "$HOME/Library/Application Support/WindInputDev")
         else
             PURGE_DIRS=("$HOME/Library/Caches/WindInput" "$HOME/Library/Application Support/WindInput")
         fi
@@ -434,7 +661,7 @@ PY
         app_build ${BUILD_ARGS[@]+"${BUILD_ARGS[@]}"}
     fi
 
-    [[ -d "$APP_BUNDLE" ]] || { err "未找到 $APP_BUNDLE, 先跑 scripts/mac/dev.sh build"; exit 1; }
+    [[ -d "$APP_BUNDLE" ]] || { err "未找到 $APP_BUNDLE, 先跑 scripts/mac/dev.sh ${BUILD_ARGS[*]:+dm1}${BUILD_ARGS[*]:-m1}"; exit 1; }
 
     # -------- install --------
     bold "==> Install $APP_BUNDLE -> $INSTALL_APP"
@@ -463,8 +690,7 @@ PY
     # 检测须用 --verbose=2: 默认 -dv (verbose=1) 不打印 "Signature=adhoc" 行 (踩过的坑).
     # 判据: CodeDirectory flags 里含 adhoc / 或 Signature=adhoc; 真证书则有 Authority=Developer ID.
     # SIGN_IDENTITY 非空: 用固定自签证书重签 (csreq 基于证书身份而非 cdhash, 重新部署 .app
-    #   后辅助功能/TCC 授权不失效; 证书由 sign-setup 在本机创建)。
-    #   去 hardened-runtime (Sequoia 上 ad-hoc 路径一致行为), 仅换签名身份。
+    #   后辅助功能/TCC 授权不失效; 证书由 sign-setup 在本机创建)。去 hardened-runtime, 仅换签名身份。
     # 注意: 不要给 IME 加 --options runtime。旧 Go 仓实测「带 runtime 的 ad-hoc」反而异常;
     #   能稳定被 IMK 拉起控制器的是纯 ad-hoc/无 runtime (与 Fcitx5 一致)。多数「装上、列表里有、
     #   能切但无法输入」的根因不是签名, 而是 TIS 注册缓存污染 → 需注销重登做一次全量重扫。
@@ -485,19 +711,10 @@ PY
     fi
     codesign -dv --verbose=2 "$INSTALL_APP" 2>&1 | grep -E "Authority|flags|Signature" | sed 's/^/    /'
 
-    # 3a. (已移除 spctl --add 白名单步骤 — 踩过的坑 + 证伪)
-    #     早期以为 ad-hoc IME 被 spctl reject 会导致 TIS 不收录, 故加 spctl --add 白名单.
-    #     实测证伪: Fcitx5 同为 ad-hoc + `spctl -a` rejected, 仍能正常进可添加列表; 而
-    #     macOS 26 (Tahoe) 已移除该能力 (`spctl --add` 报 "This operation is no longer
-    #     supported"). 真正决定能否进列表的是 Info.plist 不再带 tsInputModeDefaultStateKey
-    #     (见 wind_macos .../Resources/Info.plist 内说明), 与签名 / spctl 无关. 不再做 spctl 操作.
-
     # 4. 让系统重新发现 IME bundle.
     #    macOS 改 IME plist 后, 仅 cp 进 Input Methods/ 不足以让系统刷新 "输入源" 列表 ——
     #    LaunchServices 用 ChangeCount 缓存 bundle 信息, 不会因为 .app 替换而主动失效.
     #    必须显式跑 lsregister -f 强制重读, 才能让新字段 (ComponentInputModeDict 等) 进入索引.
-    #    这是 Big Sur+ 上很多自打包 IME 装完看不见的真因.
-
     local LSREGISTER="/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister"
 
     # 4a. 强制 lsregister 重读本 bundle 元数据 (LaunchServices DB).
@@ -522,7 +739,6 @@ PY
     # 4d. 调本 .app 自身 binary 的 --register-input-source 立即注册 (免重启即可在 picker 出现).
     #     macOS Tahoe (26) 起 TIS 仅接受来自 IME 自身进程的 TISRegisterInputSource 调用
     #     (校验 codesign identity 匹配 bundleID), 外部 swift CLI 调 silently no-op.
-    #     (用户域无 sudo, 直接以当前用户跑.)
     local APP_EXEC="$INSTALL_APP/Contents/MacOS/WindInput"
     local REGISTER_PID
     if [[ -x "$APP_EXEC" ]]; then
@@ -540,8 +756,8 @@ PY
     cat <<EOF
 
   下一步:
-    1. 打开 系统设置 → 键盘 → 文本输入 → 编辑 → 添加 (+) → 简体中文 → 选 WindInput
-       如果列表里看不到 WindInput, 按下面顺序排查:
+    1. 打开 系统设置 → 键盘 → 文本输入 → 编辑 → 添加 (+) → 简体中文 → 选 $APP_NAME
+       如果列表里看不到, 按下面顺序排查:
          a) ls -la "$INSTALL_APP" 看 .app 是否真的在
          b) /usr/libexec/PlistBuddy -c "Print" "$INSTALL_APP/Contents/Info.plist" | head -40
             必须有 InputMethodConnectionName / InputMethodServerControllerClass /
@@ -549,56 +765,48 @@ PY
             *不应* 出现 tsInputModeDefaultStateKey (有的话该 mode 会被「+」列表过滤掉)
          c) codesign -dv "$INSTALL_APP" 应输出 adhoc 签名信息 (flags 不含 runtime)
          d) 注销重登一次系统 (最暴力但有效, 让 TextInputSources 全量重扫)
-    2. 切到 WindInput (Ctrl+Space 或菜单栏 IME 切换)
+    2. 切到 $APP_NAME (Ctrl+Space 或菜单栏 IME 切换)
     3. 在任意文本框敲一个字母键, 然后:
-
-         tail -F "\$HOME/Library/Logs/WindInput/wind_input.log"
          log stream --predicate 'process == "WindInput"' --info --debug
 
-       应看到:
-         Go 端 : "bridge client connected connID=N"
-         IME 端: "WindInput[InputController] bridge connected"
-                "WindInput[handle] ..." 或 PassThrough/Consumed 路径
-
-  卸载:    scripts/mac/dev.sh uninstall
+  卸载:    scripts/mac/dev.sh $([[ "$APP_NAME" == WindInputDev ]] && echo ud || echo u)
 
 EOF
 }
 
-# ───────────── service_install (原 install_service.sh: 装 Rust 服务 + LaunchAgent) ─────────────
-# install_service.sh — 把 Rust 服务 (wind_input + data/) 装到 per-user 目录,
-# 并以 LaunchAgent 形式注册为开机自启常驻进程 (移植自旧 Go 仓 scripts_mac/deploy)。
+# ───────────── service_install (装 Rust 服务 + LaunchAgent) ─────────────
+# 把 Rust 服务 (wind_input + data/) 装到 per-user 目录, 以 LaunchAgent 形式注册为开机自启常驻进程。
 #
-# 服务定位词库用 exeDir/data (见 wind-config Config::data_dir = current_exe()/data),
+# 服务定位词库用 exeDir/data (wind-config Config::data_dir = current_exe()/data),
 # 所以二进制和 data/ 必须同目录 (本函数装到 INSTALL_ROOT 与 INSTALL_ROOT/data)。
 # 用户数据 (config.toml / userdata.redb / socket) 走运行时目录
-# (~/Library/Application Support/WindInput{_debug}), 与 service/ 子目录互不干扰。
+# (~/Library/Application Support/WindInput{Dev}), 与 service/ 子目录互不干扰。
 #
 # 以普通用户运行 (LaunchAgent 是 per-user gui domain, 不要 sudo)。
 #
 # 参数:
 #   (无)            装 release 产物 (target/release)
-#   --debug         装 debug 产物 (target/debug, 需 debug_variant 特性构建)
-#   --data <dir>    指定 data/ 源目录 (默认 build_debug/data)
+#   --dev           装 dev 产物 (target/dev-variant); plist 注入 WIND_VARIANT=dev
+#   --data <dir>    指定 data/ 源目录 (默认 SRC_DIR/data 或 build_mac/data)
 #   --from <dir>    从指定目录装 (内含 wind_input + data), 供 .pkg postinstall 等场景
 #   --uninstall     卸载服务 (保留用户数据)
 #
-# 注: release .app (bundleID …WindInput) 连 release 服务 (suffix=""); debug .app
-#     (…WindInputDebug) 连 debug 服务 (suffix="_debug")。debug 服务二进制须用
-#     `cargo build --features debug_variant` 构建, 否则 suffix 仍为空、连不上 debug .app。
+# 变体身份 (务必对齐 Rust): dev 服务二进制用中文显示名 (文件名不带 _dev), 故 Rust 的
+# variant::is_dev() 无法从 exe 文件名判定 → 必须靠 plist 里 WIND_VARIANT=dev 声明,
+# Rust 才会用 WindInputDev 数据目录 + _dev 管道后缀, 与 dev .app (bundleID …Dev) 连通。
 service_install() {
     local RUST_TARGET="$REPO_DIR/wind_input/target"
     local LOG_DIR="$HOME/Library/Logs"
     local GUI_DOMAIN="gui/$(id -u)"
 
-    local DEBUG_VARIANT=0
+    local DEV_VARIANT=0
     local DO_UNINSTALL=0
     local SRC_DIR=""
     local DATA_DIR=""
     local EXE_NAME="wind_input"
     while [[ $# -gt 0 ]]; do
         case "$1" in
-            --debug)     DEBUG_VARIANT=1 ;;
+            --dev)       DEV_VARIANT=1 ;;
             --uninstall) DO_UNINSTALL=1 ;;
             --data)      shift; DATA_DIR="${1:-}"; [[ -n "$DATA_DIR" ]] || { echo "[错误] --data 缺目录参数" >&2; exit 1; } ;;
             --from)      shift; SRC_DIR="${1:-}"; [[ -n "$SRC_DIR" ]] || { echo "[错误] --from 缺目录参数" >&2; exit 1; } ;;
@@ -607,18 +815,20 @@ service_install() {
         shift
     done
 
-    # 变体派生: debug 用独立 LaunchAgent label + 运行时目录 (WindInput_debug, 与
-    # wind-config debug_variant 的 PIPE_SUFFIX 及 .app BridgeEndpoints.runtimeDir 对齐),
-    # 让 debug/release 两套服务共存, 各连各自的 .app socket。
+    # 变体派生: dev 用独立 LaunchAgent label + 运行时目录 (WindInputDev, 与 Rust
+    # variant::app_dir_name() 对齐), 让 dev/release 两套服务共存, 各连各自的 .app socket。
     # 安装后可执行名装为中文名: macOS 后台列表 (BTM) 对无 Developer ID 的 legacy agent
     # 直接显示可执行文件名 (AssociatedBundleIdentifiers 被忽略)。二进制改名不影响功能。
-    local LABEL APP_SUPPORT SVC_EXE_NAME ASSOC_BUNDLE LOG_TAG
-    if [[ $DEBUG_VARIANT -eq 1 ]]; then
-        LABEL="to.feng.windinput.service.debug"
-        APP_SUPPORT="$HOME/Library/Application Support/WindInput_debug"
+    local LABEL APP_SUPPORT SVC_EXE_NAME ASSOC_BUNDLE LOG_TAG ENV_BLOCK
+    ENV_BLOCK=""
+    if [[ $DEV_VARIANT -eq 1 ]]; then
+        LABEL="to.feng.windinput.service.dev"
+        APP_SUPPORT="$HOME/Library/Application Support/WindInputDev"
         SVC_EXE_NAME="清风输入法服务开发版"
-        ASSOC_BUNDLE="to.feng.inputmethod.WindInputDebug"
-        LOG_TAG="windinput_debug"
+        ASSOC_BUNDLE="to.feng.inputmethod.WindInputDev"
+        LOG_TAG="windinput_dev"
+        # dev 服务二进制文件名不带 _dev, 靠此环境变量向 Rust 声明 dev 身份 (选 WindInputDev 数据目录)。
+        ENV_BLOCK=$'    <key>EnvironmentVariables</key>\n    <dict>\n        <key>WIND_VARIANT</key>\n        <string>dev</string>\n    </dict>\n'
     else
         LABEL="to.feng.windinput.service"
         APP_SUPPORT="$HOME/Library/Application Support/WindInput"
@@ -656,19 +866,19 @@ service_install() {
 
     # -------- 解析源目录 --------
     if [[ -z "$SRC_DIR" ]]; then
-        if [[ $DEBUG_VARIANT -eq 1 ]]; then
-            SRC_DIR="$RUST_TARGET/debug"
+        if [[ $DEV_VARIANT -eq 1 ]]; then
+            SRC_DIR="$RUST_TARGET/dev-variant"
         else
             SRC_DIR="$RUST_TARGET/release"
         fi
     fi
     local SRC_EXE="$SRC_DIR/$EXE_NAME"
-    # data 源: 优先 --data; 否则 SRC_DIR/data (与二进制同目录); 再否则 build_debug/data (dev.sh gen-data 产物)。
+    # data 源: 优先 --data; 否则 SRC_DIR/data (与二进制同目录); 再否则 build_mac/data (gd 产物)。
     if [[ -z "$DATA_DIR" ]]; then
-        if [[ -d "$SRC_DIR/data" ]]; then DATA_DIR="$SRC_DIR/data"; else DATA_DIR="$REPO_DIR/build_debug/data"; fi
+        if [[ -d "$SRC_DIR/data" ]]; then DATA_DIR="$SRC_DIR/data"; else DATA_DIR="$DATA_SNAPSHOT"; fi
     fi
 
-    [[ -f "$SRC_EXE" ]]  || { err "未找到二进制 $SRC_EXE, 先跑 cargo build$([[ $DEBUG_VARIANT -eq 0 ]] && echo ' --release') -p wind_service"; exit 1; }
+    [[ -f "$SRC_EXE" ]]  || { err "未找到二进制 $SRC_EXE, 先跑 scripts/mac/dev.sh $([[ $DEV_VARIANT -eq 1 ]] && echo dm2 || echo m2)"; exit 1; }
     [[ -d "$DATA_DIR" ]] || { err "未找到词库目录 $DATA_DIR, 先跑 scripts/mac/dev.sh gd 组装 data"; exit 1; }
 
     # -------- install --------
@@ -715,7 +925,7 @@ service_install() {
     fi
     info "已复制 服务二进制 + data/ ($(find "$INSTALL_ROOT/data" -type f | wc -l | tr -d ' ') 个数据文件)"
 
-    # 3. 写 LaunchAgent plist (RunAtLoad 开机自启 + KeepAlive 崩溃自拉起)。
+    # 3. 写 LaunchAgent plist (RunAtLoad 开机自启 + KeepAlive 崩溃自拉起; dev 注入 WIND_VARIANT=dev)。
     cat > "$PLIST" <<PLIST_EOF
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -735,14 +945,14 @@ service_install() {
     <true/>
     <key>ProcessType</key>
     <string>Interactive</string>
-    <key>StandardOutPath</key>
+${ENV_BLOCK}    <key>StandardOutPath</key>
     <string>$OUT_LOG</string>
     <key>StandardErrorPath</key>
     <string>$ERR_LOG</string>
 </dict>
 </plist>
 PLIST_EOF
-    info "已写 $PLIST"
+    info "已写 $PLIST$([[ $DEV_VARIANT -eq 1 ]] && echo ' (含 WIND_VARIANT=dev)')"
 
     # 4. 加载 + 启用 + 启动。
     launchctl bootstrap "$GUI_DOMAIN" "$PLIST" 2>/dev/null || {
@@ -776,6 +986,9 @@ PLIST_EOF
         info "✓ err.log 为空"
     fi
 
+    # 6. 服务已(重)起, 踢一下正在运行的本变体 IME app 让其重连 (否则旧连接失效=按键无响应)。
+    kick_ime_app
+
     bold "==> Done"
     cat <<EOF
 
@@ -783,10 +996,11 @@ PLIST_EOF
   状态: launchctl print $GUI_DOMAIN/$LABEL | grep -E 'state|pid'
   重启: launchctl kickstart -k $GUI_DOMAIN/$LABEL
   日志: $OUT_LOG / $ERR_LOG
-  卸载: scripts/mac/dev.sh uninstall
+  卸载: scripts/mac/dev.sh $([[ $DEV_VARIANT -eq 1 ]] && echo ud || echo u)
 EOF
 }
 
+# ───────────── 组合: 编 + 装 ─────────────
 install_service() {
     build_service
     local data; data="$(resolve_data)"
@@ -801,8 +1015,8 @@ install_app() {
     # 防复发: 删掉 build/ 里的 .app 并注销其 LS 登记。它与 ~/Library 里的真身同 bundle-ID,
     # 留着会被 LaunchServices 自动登记成「重复输入源」, TIS 可能错指向它(尤其路径后被删=
     # 幽灵)→ 控制器拉不起 → 无法输入。真身已装在 ~/Library, build/ 仅中间产物, 可删。
-    local appname="WindInput"; [[ "$VARIANT" == debug ]] && appname="WindInputDebug"
-    local built="$REPO_DIR/wind_macos/build/$appname.app"
+    local appname; appname="$(app_name_for_variant)"
+    local built="$MACOS_DIR/build/$appname.app"
     if [[ -d "$built" ]]; then
         local lsreg="/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister"
         [[ -x "$lsreg" ]] && "$lsreg" -u "$built" 2>/dev/null || true
@@ -811,28 +1025,48 @@ install_app() {
     fi
 }
 
+install_all() {
+    install_service
+    install_app
+    bold "==> 系统安装完成 ($VARIANT) — 切到 $(app_name_for_variant) 试输入"
+}
+
+do_full() {
+    bold "========== 全构建 ($VARIANT) =========="
+    build_service
+    build_app
+    do_gendata
+    verify_dist_data
+    bold "========== 全构建完成 ($VARIANT) =========="
+    info "产物: service=target/$([[ $VARIANT == dev ]] && echo dev-variant || echo release)/wind_input  app=$MACOS_DIR/build/$(app_name_for_variant).app  data=$DATA_SNAPSHOT"
+    info "下一步: scripts/mac/dev.sh $([[ $VARIANT == dev ]] && echo pd1 || echo p1)  (系统安装)"
+}
+
 do_run() {
     bold "==> 重启 service ($LABEL)"
     launchctl kickstart -k "gui/$(id -u)/$LABEL" && info "kickstart 完成" || err "kickstart 失败 (service 未安装?)"
+    # 服务已重启, 踢一下 IME app 让其重连新服务 (否则按键无响应)。
+    kick_ime_app
 }
 
 do_logs() {
-    bold "==> 跟踪日志 (Ctrl-C 退出)"
-    info "service: ~/Library/Logs/windinput.out.log | IME: log stream process==WindInput"
+    local tag="windinput"; [[ "$VARIANT" == dev ]] && tag="windinput_dev"
+    local pn; pn="$(app_name_for_variant)"
+    bold "==> 跟踪日志 ($VARIANT, Ctrl-C 退出)"
+    info "service: ~/Library/Logs/$tag.out.log | IME: log stream process==$pn"
     # 同时跟 service 文件日志 + IME 系统日志 (renderFrame/forwarder)。
-    ( log stream --predicate 'process == "WindInput"' --info 2>/dev/null | grep --line-buffered -E 'renderFrame|forwarder|bridge|handle|caret' & )
-    tail -F "$HOME/Library/Logs/windinput.out.log"
+    ( log stream --predicate "process == \"$pn\"" --info 2>/dev/null | grep --line-buffered -E 'renderFrame|forwarder|bridge|handle|caret' & )
+    tail -F "$HOME/Library/Logs/$tag.out.log"
 }
 
 do_status() {
-    bold "==> service 状态"
+    bold "==> service 状态 ($VARIANT)"
     launchctl print "gui/$(id -u)/$LABEL" 2>/dev/null | grep -E 'state =|pid =' | head || warn "service 未注册"
     info "二进制: $(ls -la "$APP_SUPPORT/service/"*服务* 2>/dev/null | awk '{print $6,$7,$8}' | head -1)"
     info "push socket: $([[ -S "$APP_SUPPORT/bridge_push.sock" ]] && echo 存在 || echo 缺失)"
-    local app="$HOME/Library/Input Methods/WindInput.app"
-    [[ "$VARIANT" == debug ]] && app="$HOME/Library/Input Methods/WindInputDebug.app"
+    local app="$HOME/Library/Input Methods/$(app_name_for_variant).app"
     info ".app 签名: $(codesign -dv --verbose=2 "$app" 2>&1 | grep -E 'flags=' | sed 's/.*flags/flags/' || echo 未装)"
-    info "IME 进程: $(pgrep -fl 'Input Methods/WindInput' | head -1 || echo 未运行)"
+    info "IME 进程: $(pgrep -fl "Input Methods/$(app_name_for_variant)" | head -1 || echo 未运行)"
 }
 
 do_data() {
@@ -849,18 +1083,21 @@ do_uninstall() {
     ( app_install     ${APP_VARIANT_FLAG[@]+"${APP_VARIANT_FLAG[@]}"} --uninstall ) || true
 }
 
-# ───────────── sign_setup (原 setup_signing.sh: 命令行建自签证书) ─────────────
-# setup_signing.sh — 命令行创建自签 Code Signing 证书并 import 到 login keychain.
-# 用 openssl + security cli, 完全跳过 Keychain Access GUI.
-#
-# 输出: 一个名为 "WindInput Dev" 的可用于 codesign 的本机证书.
-# 用法: scripts/mac/dev.sh sign-setup        # 创建
-#       scripts/mac/dev.sh sign-setup check  # 仅检查现状
-#       scripts/mac/dev.sh sign-setup grant  # 授权 codesign 非交互访问私钥
-#       scripts/mac/dev.sh sign-setup remove # 删掉证书
+# 候选 REPL (本机)。
+do_repl() {
+    local data="${1:-}"
+    [[ -z "$data" ]] && data="$DATA_SNAPSHOT"
+    [[ -d "$data" ]] || warn "词库数据不存在 ($data); 先跑 gd 生成"
+    bold "==> 启动候选 REPL (data=$data)"
+    ( cd "$RUST_DIR" && WIND_DATA="$data" cargo run --release -p wind-repl -- "$data" )
+}
+
+# ───────────── sign_setup (命令行建自签证书) ─────────────
+# 用 openssl + security cli, 完全跳过 Keychain Access GUI. 输出可用于 codesign 的本机证书 "WindInput Dev".
+# 用法: scripts/mac/dev.sh sign-setup [create|check|grant|remove]
 sign_setup() {
-    # 原 setup_signing.sh 用 `set -uo pipefail` (无 errexit): 多处依赖命令失败继续
-    # (find/delete 探测、清理循环)。这里在函数内关掉 errexit 以原样保留其控制流。
+    # 原逻辑用 `set -uo pipefail` (无 errexit): 多处依赖命令失败继续 (find/delete 探测、清理循环)。
+    # 这里在函数内关掉 errexit 以原样保留其控制流。
     set +e
 
     local CERT_NAME="WindInput Dev"
@@ -871,10 +1108,7 @@ sign_setup() {
     local P12_FILE="$WORK_DIR/cert.p12"
     local P12_PASS="windinput-dev"
 
-    # purge_cert — 删除所有同名证书, 带次数上限防死循环。
-    # 关键: 残留可能在 System keychain (如某次 add-trusted-cert 部分成功留下 cert),
-    # 普通 delete-certificate 删不掉受保护的 System keychain 条目 → 原先 while 会死循环。
-    # 这里 login + System (sudo) 都试, 且 20 次封顶。
+    # purge_cert — 删除所有同名证书, 带次数上限防死循环。login + System (sudo) 都试, 20 次封顶。
     purge_cert() {
         local i=0
         while security find-certificate -c "$CERT_NAME" >/dev/null 2>&1; do
@@ -898,9 +1132,7 @@ sign_setup() {
     fi
 
     # ---------------- grant ----------------
-    # 授权 codesign 非交互访问私钥 (set-key-partition-list)。import -A 仍不足以让
-    # codesign 在无 GUI 授权上下文 (如 ssh 部署会话) 访问私钥 → errSecInternalComponent;
-    # 设 partition-list 后 apple/codesign 工具可免授权使用, 无头 ssh 部署才能用证书签名。
+    # 授权 codesign 非交互访问私钥 (set-key-partition-list)。无头 ssh 部署才能用证书签名。
     if [[ "$SUB" == "grant" ]]; then
         local KEYCHAIN="$HOME/Library/Keychains/login.keychain-db"
         bold "授权 codesign 非交互访问 \"$CERT_NAME\" 私钥"
@@ -922,7 +1154,6 @@ sign_setup() {
     if [[ "$SUB" == "remove" ]]; then
         bold "删 \"$CERT_NAME\" 证书 (所有同名条目, 含 System keychain)"
         purge_cert
-        # 删 trust 设置 (admin trust 与 user trust)
         sudo security remove-trusted-cert -d -p codeSign 2>/dev/null || true
         bold "remove 完成"
         exit 0
@@ -932,8 +1163,7 @@ sign_setup() {
     command -v openssl  >/dev/null || { err "openssl 未安装"; exit 1; }
     command -v security >/dev/null || { err "security cli 未安装"; exit 1; }
 
-    # 清理已有同名证书 (踩过的坑: 失败的 import 也会留条目, 重复后 codesign ambiguous;
-    # 残留可能在 System keychain 需 sudo 删, 普通 delete 删不掉会死循环, 见 purge_cert)
+    # 清理已有同名证书 (失败的 import 也会留条目, 重复后 codesign ambiguous)。
     if security find-certificate -c "$CERT_NAME" >/dev/null 2>&1; then
         bold "发现已有 \"$CERT_NAME\" 证书, 清掉重建"
         purge_cert
@@ -969,10 +1199,8 @@ EOF
     [[ -f "$CRT_FILE" ]] || { err "openssl 生成失败"; exit 1; }
 
     bold "3. 打成 PKCS12 (.p12, legacy 格式) 以便 security import"
-    # OpenSSL 3.x 默认 PBES2 (PBKDF2 + AES) macOS security import 不识别, 必须 -legacy
-    # 回退老的 PKCS12 RC2-40 + SHA-1 (本地用安全够了)。
-    # 但 macOS 自带 LibreSSL 不认识 -legacy 标志 (会报错且不生成 p12), 且其默认就是老格式 →
-    # 仅对 OpenSSL 3.x 加 -legacy。不加引号: 空时不产生空参数 (兼容 bash 3.2 + set -u)。
+    # OpenSSL 3.x 默认 PBES2 macOS security import 不识别, 必须 -legacy 回退老格式;
+    # 但 macOS 自带 LibreSSL 不认识 -legacy (且默认就是老格式) → 仅对 OpenSSL 3.x 加 -legacy。
     local P12_LEGACY=""
     if openssl version 2>/dev/null | grep -qi "^OpenSSL 3"; then
         P12_LEGACY="-legacy"
@@ -989,16 +1217,12 @@ EOF
     }
 
     bold "4b. import 到 login keychain (允许 codesign 直接用)"
-    # -T /usr/bin/codesign: 把 codesign 加入私钥 ACL, 后续 codesign 不再弹框
-    # -A: 允许所有应用使用此私钥 (开发期方便, 否则每次 codesign 都要点 Always Allow)
+    # -T /usr/bin/codesign: 把 codesign 加入私钥 ACL; -A: 允许所有应用使用此私钥 (开发期方便)。
     security import "$P12_FILE" -k "$KEYCHAIN" \
         -P "$P12_PASS" -A 2>&1 | sed 's/^/  /'
 
     bold "5. 把证书加为 trusted code-signing root (这一步要 sudo)"
-    # 没有 trust, codesign 用上后系统仍判 CSSMERR_TP_NOT_TRUSTED 等同 ad-hoc, IME 注册照样拒
-    # -d: 加到 admin trust domain (System keychain)
-    # -r trustRoot: 当 root CA trust
-    # -p codeSign: 仅信任此 cert 的 code signing 用途, 不开成全能 root
+    # 没有 trust, codesign 用上后系统仍判 CSSMERR_TP_NOT_TRUSTED 等同 ad-hoc, IME 注册照样拒。
     sudo security add-trusted-cert -d -r trustRoot -p codeSign \
         -k "/Library/Keychains/System.keychain" "$CRT_FILE" 2>&1 | sed 's/^/  /'
 
@@ -1008,9 +1232,8 @@ EOF
     if security find-identity -v -p codesigning | grep -q "\"$CERT_NAME\""; then
         bold "成功"
         info "现在跑:"
-        info "  SIGN_IDENTITY=\"$CERT_NAME\" scripts/mac/dev.sh build"
-        info "  scripts/mac/dev.sh uninstall"
-        info "  SIGN_IDENTITY=\"$CERT_NAME\" scripts/mac/dev.sh app"
+        info "  SIGN_IDENTITY=\"$CERT_NAME\" scripts/mac/dev.sh 1     # 全构建 (会用此证书签 app)"
+        info "  SIGN_IDENTITY=\"$CERT_NAME\" scripts/mac/dev.sh p1    # 系统安装"
     else
         err "证书仍未 valid. 看上面 add-trusted-cert 输出"
         exit 1
@@ -1019,37 +1242,38 @@ EOF
     rm -rf "$WORK_DIR"
 }
 
-# ───────────── pkg_build (原 pkg.sh: 打 .pkg 安装器) ─────────────
-# pkg.sh — 把 IME (.app) + Rust 服务 (wind_input + data) [+ 可选 设置 app] 打成单个
-# .pkg 安装器 (面向终端用户分发)。移植自旧 Go 仓 scripts_mac/build/pkg.sh。
+# ───────────── pkg_build (打 .pkg 安装器) ─────────────
+# 把 IME (.app) + Rust 服务 (wind_input + data) [+ 可选 设置 app] 打成单个 .pkg 安装器。
+# postinstall 复用 payload 内 install_*.sh 薄包装 (re-exec dev.sh __app_install / __service_install)。
 #
-# 为何 .pkg: 多组件 (输入法 + 后台服务 LaunchAgent [+ 设置 app]) 装到多个 per-user 目录,
-# .pkg 的 payload + postinstall 是标准方案; postinstall 复用本脚本内联的 install_*.
-#
-# 产物: wind_macos/dist/WindInput-<版本>-macOS.pkg
+# 产物: wind_macos/dist/WindInput[Dev]-<版本>-macOS.pkg
 #
 # 用法:
-#   scripts/mac/dev.sh pkg             # 用现有构建产物打包 (需先备齐 .app + release 服务 + data)
-#   scripts/mac/dev.sh pkg --build     # 先构建 (cargo release + dev.sh gd + app_build) 再打包
-#
-# 设置 app (wind_setting.app) 可选: 存在则纳入并装到 ~/Applications, 不存在则跳过。
-#
-# 注意 (未公证版): .pkg 未签名 → Gatekeeper 首启拦截需绕过; macOS 26 Tahoe 对非公证
-# IME 有系统设置 UI 硬墙, 真正可分发需 Developer ID + 公证 (下方预留环境变量)。
+#   pkg_build [release|dev]            # 用现有构建产物打包 (缺 .app 自动转构建)
+#   pkg_build [release|dev] --build    # 先构建 (cargo + gen-data + app_build) 再打包
 #
 # 公证 (预留): 配齐则 productbuild 后自动 productsign + notarytool + staple:
 #   MACOS_DEVELOPER_ID_INSTALLER / MACOS_NOTARY_APPLE_ID / MACOS_NOTARY_PASSWORD / MACOS_NOTARY_TEAM_ID
 pkg_build() {
-    local DEPLOY_DIR="$SCRIPT_DIR"   # 安装脚本/postinstall 资源与本脚本同目录 (scripts/mac)
+    local PROFILE="release"
+    case "${1:-}" in release|dev) PROFILE="$1"; shift ;; esac
+    apply_variant "$PROFILE"
 
-    local APP_BUNDLE="$MACOS_DIR/build/WindInput.app"
+    local DEPLOY_DIR="$SCRIPT_DIR"   # 安装脚本/postinstall 资源与本脚本同目录 (scripts/mac)
+    local SUFFIX=""; [[ "$PROFILE" == dev ]] && SUFFIX="Dev"
+    local APP_NAME="WindInput$SUFFIX"
+    local APP_BUNDLE="$MACOS_DIR/build/$APP_NAME.app"
+    local SVC_SUBDIR="release"; [[ "$PROFILE" == dev ]] && SVC_SUBDIR="dev-variant"
+    local SERVICE_BIN="$RUST_DIR/target/$SVC_SUBDIR/wind_input"
+    local SERVICE_DATA="$DATA_SNAPSHOT"                                     # gd 产物 (变体无关)
     local SETTING_APP="$REPO_DIR/wind_setting/build/bin/wind_setting.app"   # 可选
-    local SERVICE_BIN="$REPO_DIR/wind_input/target/release/wind_input"
-    local SERVICE_DATA="$REPO_DIR/build_debug/data"                        # dev.sh gd 产物 (变体无关)
 
     local DIST_DIR="$MACOS_DIR/dist"
-    local PKG_ID="to.feng.windinput.installer"
+    local PKG_ID="to.feng.windinput.installer$([[ "$PROFILE" == dev ]] && echo .dev)"
+    # postinstall 硬编码 STAGE=…/WindInputInstaller, 故两变体共用同一暂存名 (装机时一次一个, 装完即清)。
     local STAGE_REL="Library/Application Support/WindInputInstaller"
+    # dev 变体: 生成的 install_*.sh 包装脚本注入 --dev, 让 service/app 装成 dev 身份。
+    local WRAP_VFLAG=""; [[ "$PROFILE" == dev ]] && WRAP_VFLAG=" --dev"
 
     local DO_BUILD=0
     local arg
@@ -1060,10 +1284,10 @@ pkg_build() {
         esac
     done
 
-    # install/app 装完会删 build/WindInput.app（防 LaunchServices 重复登记），故 pkg 多半
-    # 找不到现成 .app。缺 .app 时自动转构建模式（发行包本就应全新构建），免去手动 --build。
-    if [[ $DO_BUILD -eq 0 && ! -d "$MACOS_DIR/build/WindInput.app" ]]; then
-        info "未找到 build/WindInput.app → 自动构建 (等同 pkg --build)"
+    # install/app 装完会删 build/*.app（防 LaunchServices 重复登记），故 pkg 多半找不到现成 .app。
+    # 缺 .app 时自动转构建模式（发行包本就应全新构建），免去手动 --build。
+    if [[ $DO_BUILD -eq 0 && ! -d "$APP_BUNDLE" ]]; then
+        info "未找到 build/$APP_NAME.app → 自动构建 (等同 --build)"
         DO_BUILD=1
     fi
 
@@ -1071,10 +1295,10 @@ pkg_build() {
 
     # -------- (可选) 构建 --------
     if [[ $DO_BUILD -eq 1 ]]; then
-        bold "==> 构建 IME + 服务 + 词库"
-        ( cd "$REPO_DIR" && cargo build --release --manifest-path wind_input/Cargo.toml -p wind_service )
-        "$REPO_DIR/scripts/dev.sh" gd          # 组装 data/ → build_debug/data
-        app_build                              # IME .app
+        bold "==> 构建 IME + 服务 + 词库 ($PROFILE)"
+        ( cd "$RUST_DIR" && cargo build "${CARGO_BUILD_ARGS[@]}" -p wind_service )
+        do_gendata                             # 组装 data/ → build_mac/data
+        app_build ${APP_VARIANT_FLAG[@]+"${APP_VARIANT_FLAG[@]}"}   # IME .app
     fi
 
     # -------- 校验必备产物 (设置 app 可选) --------
@@ -1082,19 +1306,18 @@ pkg_build() {
     for p in "$APP_BUNDLE" "$SERVICE_BIN" "$SERVICE_DATA"; do
         [[ -e "$p" ]] || { err "缺产物: $p"; miss=1; }
     done
-    [[ $miss -eq 0 ]] || { err "请先跑 scripts/mac/dev.sh pkg --build (或手动构建各组件)"; exit 1; }
+    [[ $miss -eq 0 ]] || { err "请先跑 scripts/mac/dev.sh $([[ "$PROFILE" == dev ]] && echo d8 || echo 8) (或手动构建各组件)"; exit 1; }
     local HAVE_SETTING=0
     [[ -e "$SETTING_APP" ]] && HAVE_SETTING=1 || info "(无 wind_setting.app, 跳过设置组件)"
 
     local VERSION
     VERSION=$(/usr/libexec/PlistBuddy -c "Print CFBundleShortVersionString" "$APP_BUNDLE/Contents/Info.plist" 2>/dev/null || echo "0.0.0")
-    local PKG_PATH="$DIST_DIR/WindInput-${VERSION}-macOS.pkg"
+    local PKG_PATH="$DIST_DIR/$APP_NAME-${VERSION}-macOS.pkg"
 
     # -------- 组 payload root --------
-    bold "==> 组装 payload (版本 $VERSION)"
-    # 不用 local：EXIT trap 在 pkg_build 返回后、脚本退出时才触发，若是 local 则那时已出
-    # 作用域 → set -u 报 "PKGROOT: unbound variable"（产物其实已生成，仅清理时报错）。
-    # 设为脚本级全局，trap 退出时仍可引用、正常清理临时暂存目录。
+    bold "==> 组装 payload ($PROFILE, 版本 $VERSION)"
+    # 不用 local：EXIT trap 在 pkg_build 返回后、脚本退出时才触发，若是 local 则那时已出作用域
+    # → set -u 报 "PKGROOT: unbound variable"（产物其实已生成，仅清理时报错）。设为脚本级全局。
     PKGROOT=$(mktemp -d)
     SCRIPTS=$(mktemp -d)
     trap 'rm -rf "${PKGROOT:-}" "${SCRIPTS:-}" 2>/dev/null || true' EXIT
@@ -1104,30 +1327,28 @@ pkg_build() {
     cp -R "$APP_BUNDLE"   "$DEST/"
     cp    "$SERVICE_BIN"  "$DEST/service/wind_input"
     cp -R "$SERVICE_DATA" "$DEST/service/data"
-    # 安装脚本: 原 install_app.sh / install_service.sh 已合并进 dev.sh。把 dev.sh 本身放进
-    # payload, 再生成两个薄包装脚本 (postinstall 仍按 install_app.sh / install_service.sh
-    # 这两个名字调用)。包装脚本 re-exec dev.sh 的内部入口 __app_install / __service_install,
-    # 绕过 dev.sh 面向交互的 flag 解析, 完整保留原 install_* 的 --from/--data/--uninstall 行为。
-    # 包装里把 SIGN_IDENTITY 默认设为空 (终端用户机无自签证书 → 走 ad-hoc 路径, 不继承
-    # dev.sh 顶部的 "WindInput Dev" 默认; 若打包方在环境里显式设了证书则照常继承)。
+    # 安装脚本: 把 dev.sh 本身放进 payload, 再生成两个薄包装脚本 (postinstall 仍按
+    # install_app.sh / install_service.sh 这两个名字调用)。包装脚本 re-exec dev.sh 的内部入口
+    # __app_install / __service_install, 绕过面向交互的 flag 解析, 保留原 install_* 行为。
+    # dev 变体在包装里注入 --dev (让服务/IME 装成 dev 身份, plist 含 WIND_VARIANT=dev)。
+    # SIGN_IDENTITY 默认设空 (终端用户机无自签证书 → 走 ad-hoc; 打包方显式设了则照常继承)。
     cp "$DEPLOY_DIR/dev.sh" "$DEST/dev.sh"
-    cat > "$DEST/install_service.sh" <<'WRAP'
+    cat > "$DEST/install_service.sh" <<WRAP
 #!/bin/bash
-export SIGN_IDENTITY="${SIGN_IDENTITY-}"
-exec "$(cd "$(dirname "$0")" && pwd)/dev.sh" __service_install "$@"
+export SIGN_IDENTITY="\${SIGN_IDENTITY-}"
+exec "\$(cd "\$(dirname "\$0")" && pwd)/dev.sh" __service_install${WRAP_VFLAG} "\$@"
 WRAP
-    cat > "$DEST/install_app.sh" <<'WRAP'
+    cat > "$DEST/install_app.sh" <<WRAP
 #!/bin/bash
-export SIGN_IDENTITY="${SIGN_IDENTITY-}"
-exec "$(cd "$(dirname "$0")" && pwd)/dev.sh" __app_install "$@"
+export SIGN_IDENTITY="\${SIGN_IDENTITY-}"
+exec "\$(cd "\$(dirname "\$0")" && pwd)/dev.sh" __app_install${WRAP_VFLAG} "\$@"
 WRAP
-    local INSTALL_SCRIPTS="install_app.sh install_service.sh"
     if [[ $HAVE_SETTING -eq 1 ]]; then
         cp -R "$SETTING_APP" "$DEST/"
-        [[ -f "$DEPLOY_DIR/install_setting.sh" ]] && { cp "$DEPLOY_DIR/install_setting.sh" "$DEST/"; INSTALL_SCRIPTS="$INSTALL_SCRIPTS install_setting.sh"; }
+        [[ -f "$DEPLOY_DIR/install_setting.sh" ]] && cp "$DEPLOY_DIR/install_setting.sh" "$DEST/"
     fi
     chmod +x "$DEST"/*.sh "$DEST/service/wind_input"
-    info "payload: WindInput.app + service(wind_input+data)$([[ $HAVE_SETTING -eq 1 ]] && echo ' + wind_setting.app') + 安装脚本"
+    info "payload: $APP_NAME.app + service(wind_input+data)$([[ $HAVE_SETTING -eq 1 ]] && echo ' + wind_setting.app') + 安装脚本"
 
     # -------- postinstall --------
     cp "$SCRIPT_DIR/pkg_resources/postinstall" "$SCRIPTS/postinstall"
@@ -1155,7 +1376,7 @@ PY
     local HOST_ARCHS="arm64"   # 本机单架构; universal 分发需自行扩展为 arm64,x86_64
     info "hostArchitectures: $HOST_ARCHS"
 
-    local COMPONENT_PKG="$SCRIPTS/WindInput-component.pkg"
+    local COMPONENT_PKG="$SCRIPTS/$APP_NAME-component.pkg"
     pkgbuild \
         --root "$PKGROOT" \
         --component-plist "$COMP" \
@@ -1165,15 +1386,16 @@ PY
         --install-location "/" \
         "$COMPONENT_PKG"
 
+    local TITLE="清风输入法$([[ "$PROFILE" == dev ]] && echo '开发版') $VERSION"
     local DIST_XML="$SCRIPTS/distribution.xml"
     cat > "$DIST_XML" <<XML
 <?xml version="1.0" encoding="utf-8"?>
 <installer-gui-script minSpecVersion="2">
-    <title>清风输入法 $VERSION</title>
+    <title>$TITLE</title>
     <options customize="never" require-scripts="true" hostArchitectures="$HOST_ARCHS"/>
     <domains enable_anywhere="false" enable_currentUserHome="false" enable_localSystem="true"/>
     <choices-outline><line choice="default"/></choices-outline>
-    <choice id="default" title="清风输入法"><pkg-ref id="$PKG_ID"/></choice>
+    <choice id="default" title="$TITLE"><pkg-ref id="$PKG_ID"/></choice>
     <pkg-ref id="$PKG_ID" version="$VERSION" onConclusion="none">$(basename "$COMPONENT_PKG")</pkg-ref>
 </installer-gui-script>
 XML
@@ -1212,86 +1434,172 @@ XML
     if [[ $NOTARIZED -eq 0 ]]; then
         info "(未公证版首启需 右键→打开 绕过 Gatekeeper; Tahoe 系统设置 UI 硬墙需公证才解)"
     fi
+    if [[ "$PROFILE" == dev ]]; then
+        warn "注: dev .pkg 的 payload/安装脚本已是 dev 身份, 但 postinstall 生成的桌面卸载器仍按 release 清理;"
+        warn "    卸载 dev 请用 scripts/mac/dev.sh ud。"
+    fi
 }
 
-usage() {
-    cat <<'EOF'
-WindInput macOS 开发一站式脚本
-
-用法: scripts/mac/dev.sh <命令> [--debug] [--data <dir>]
-
-命令 (前缀缩写均可):
-  install | i      编译 + 安装 service(Rust) + app(Swift)  ← 改完代码就跑它
-  service | svc    编译 + 安装 service (改 Rust 渲染/协议/引擎时)
-  app     | a      编译 + 安装 app     (改 Swift 显示/IMKit 时)
-  build   | b      只编译两端 (service + .app bundle + codesign), 不安装
-  run     | r      重启 service (kickstart, 不重编)
-  logs    | l      跟踪 service + IME 日志
-  status  | st     诊断: service pid / socket / 签名 / 进程
-  data    | gd     把当前已装的 data/ 快照到 build_mac/data (作安装数据源)
-  uninstall | rm   卸载 service + app
-  sign-setup       命令行建自签证书 "WindInput Dev" (需 sudo + 钥匙串交互)
-                   子命令: sign-setup [create|check|grant|remove]
-  pkg              打 .pkg 安装器 (终端用户分发); pkg --build 先构建再打包
-  help             显示本帮助
-
-选项:
-  --debug          debug 变体 (WindInputDebug + target/debug + debug_variant 特性,
-                   与 release 共存; 默认 release = WindInput)。
-  --data <dir>     指定词库数据源目录。
-
-环境变量:
-  SIGN_IDENTITY    codesign 身份 (默认 "WindInput Dev"; 设空则回退纯 ad-hoc)。
-  WIND_MAC_UNIVERSAL=1   构建 arm64+x86_64 通用二进制 (分发/CI)。
-  SIGN_KEYCHAIN_PW       无头 ssh 部署解锁 login keychain 用。
-  MACOS_DEVELOPER_ID_INSTALLER / MACOS_NOTARY_*   pkg 签名 + 公证 (预留)。
-EOF
+# ───────────────────────── 菜单 ─────────────────────────
+show_menu() {
+    printf "\033[36m============================================\033[0m\n"
+    printf "\033[36m  WindInput 开发菜单 (macOS 原生)\033[0m\n"
+    printf "\033[36m============================================\033[0m\n"
+    printf "\033[33m  全构建 (service + app + gen-data + 校验):\033[0m\n"
+    echo   "    1    Release 全构建            d1   Dev 全构建"
+    printf "\033[33m  单模块构建 (前缀 d = dev):\033[0m\n"
+    echo   "    m1   仅 app  (WindInput.app)    dm1"
+    echo   "    m2   仅 service (wind_service)  dm2"
+    echo   "    m3   仅 wind_setting (可选)     dm3"
+    printf "\033[33m  系统安装 / 卸载:\033[0m\n"
+    echo   "    p1   安装全部 (release)         pd1   安装全部 (dev)"
+    echo   "    pm1/pm2  安装模块(app/service)  pdm1/pdm2 (dev)"
+    echo   "    u/u1 卸载全部 (release)         ud/ud1 卸载全部 (dev)"
+    printf "\033[33m  安装包 (.pkg):\033[0m\n"
+    echo   "    8    生成安装包 (release)        d8    生成安装包 (dev)"
+    echo   "    8s   跳过重建直接打包 (release)  d8s   跳过重建直接打包 (dev)"
+    printf "\033[33m  代码质量:\033[0m\n"
+    echo   "    k=check  l=clippy  t=test  f=fmt  fmt-check  ci  clean"
+    printf "\033[33m  数据 / 实测:\033[0m\n"
+    echo   "    gd=gen-data  r=repl(本机)"
+    printf "\033[33m  macOS 便利命令:\033[0m\n"
+    echo   "    run  logs  status  data  sign-setup  pkg"
+    echo   "    q=退出"
+    printf "\033[36m============================================\033[0m\n"
 }
 
-# .pkg postinstall 经 payload 内的 install_app.sh / install_service.sh 薄包装脚本
-# re-exec 本脚本时走这里: 原样把参数 (--from/--data/--uninstall) 交给内联函数, 绕过下方
-# 面向交互的 flag 解析 (尤其全局 --data), 完整保留原 install_* 的参数行为。
+# ───────────── 统一分发 (菜单与命令行直调共用) ─────────────
+# 返回 127 = 未知命令 (区别于命令执行失败)。
+dispatch() {
+    case "$1" in
+        1|release) apply_variant release; do_full ;;
+        d1|dev)    apply_variant dev;     do_full ;;
+        m1)   apply_variant release; build_app ;;
+        dm1)  apply_variant dev;     build_app ;;
+        m2)   apply_variant release; build_service ;;
+        dm2)  apply_variant dev;     build_service ;;
+        m3)   apply_variant release; build_setting ;;
+        dm3)  apply_variant dev;     build_setting ;;
+        p1)   apply_variant release; install_all ;;
+        pd1)  apply_variant dev;     install_all ;;
+        pm1)  apply_variant release; install_app ;;
+        pdm1) apply_variant dev;     install_app ;;
+        pm2)  apply_variant release; install_service ;;
+        pdm2) apply_variant dev;     install_service ;;
+        u|u1)   apply_variant release; do_uninstall ;;
+        ud|ud1) apply_variant dev;     do_uninstall ;;
+        8)    pkg_build release --build ;;
+        8s)   pkg_build release ;;
+        d8)   pkg_build dev --build ;;
+        d8s)  pkg_build dev ;;
+        k|check)   do_cargo check ;;
+        l|clippy)  do_cargo clippy ;;
+        t|test)    do_cargo test ;;
+        f|fmt)     ( cd "$RUST_DIR" && bold "==> cargo fmt" && cargo fmt ) ;;
+        fmt-check) ( cd "$RUST_DIR" && bold "==> cargo fmt --check" && cargo fmt --all -- --check ) ;;
+        ci)        do_ci ;;
+        clean)     do_cargo clean ;;
+        gd|gen-data) apply_variant release; do_gendata && verify_dist_data ;;
+        run)       apply_variant release; do_run ;;
+        logs|log)  apply_variant release; do_logs ;;
+        status|st) apply_variant release; do_status ;;
+        data)      apply_variant release; do_data ;;
+        *) return 127 ;;
+    esac
+}
+
+do_cargo() { bold "==> cargo $1 --workspace"; ( cd "$RUST_DIR" && cargo "$1" --workspace ); }
+
+do_ci() {
+    ( cd "$RUST_DIR" && bold "==> cargo fmt --check" && cargo fmt --all -- --check ) || return $?
+    do_cargo clippy || return $?
+    do_cargo test   || return $?
+    bold "==> CI 全部通过 ✓"
+}
+
+# 顺序执行一串命令 token (空格分隔); 前者失败即停。每个命令在子 shell 里跑, 保留内联函数的
+# `exit` 语义又不终止整个脚本, 且子 shell 继承 set -e → 命令内部失败会以其退出码中止。
+run_tokens() {
+    local toks=("$@") n=$# i=0 cmd rc
+    while (( i < n )); do
+        cmd="${toks[$i]}"
+        case "$cmd" in
+            r|repl)
+                local d=""
+                if (( i + 1 < n )); then d="${toks[$((i + 1))]}"; ((i++)); fi
+                rc=0; ( do_repl "$d" ) || rc=$?
+                (( rc != 0 )) && { err "命令 '$cmd' 失败 (退出码 $rc)"; return "$rc"; }
+                ;;
+            sign-setup)
+                local sub=""
+                if (( i + 1 < n )); then sub="${toks[$((i + 1))]}"; ((i++)); fi
+                rc=0; ( sign_setup ${sub:+"$sub"} ) || rc=$?
+                (( rc != 0 )) && { err "命令 '$cmd' 失败 (退出码 $rc)"; return "$rc"; }
+                ;;
+            pkg)
+                local pargs=()
+                while (( i + 1 < n )); do ((i++)); pargs+=("${toks[$i]}"); done
+                rc=0; ( pkg_build release ${pargs[@]+"${pargs[@]}"} ) || rc=$?
+                (( rc != 0 )) && { err "命令 '$cmd' 失败 (退出码 $rc)"; return "$rc"; }
+                ;;
+            *)
+                rc=0; ( dispatch "$cmd" ) || rc=$?
+                if (( rc == 127 )); then err "未知命令: $cmd (试 'scripts/mac/dev.sh help')"; return 1; fi
+                (( rc != 0 )) && { err "命令 '$cmd' 失败 (退出码 $rc)"; return "$rc"; }
+                ;;
+        esac
+        ((i++))
+    done
+    return 0
+}
+
+menu_loop() {
+    local raw toks
+    while true; do
+        show_menu
+        printf "\n请输入选项 (可空格分隔连续命令): "
+        read -r raw || return 0
+        raw="$(printf '%s' "$raw" | tr -d '\r')"
+        [[ -z "$raw" ]] && continue
+        case "$raw" in q|Q) return 0 ;; esac
+        read -ra toks <<< "$raw"
+        [[ "${toks[0]}" == menu ]] && continue
+        run_tokens "${toks[@]}" || true
+        printf "\n按回车继续..."; read -r _ || true
+    done
+}
+
+print_help() {
+    # 打印顶部 # 注释块 (对齐 dev.ps1 的 --help)。排除 shebang (#!)。
+    grep -E '^#( |$)' "${BASH_SOURCE[0]}" | sed -E 's/^# ?//'
+}
+
+# ───────────────────────── 入口 ─────────────────────────
+# .pkg postinstall 经 payload 内 install_app.sh / install_service.sh 薄包装 re-exec 本脚本时
+# 走这里: 原样把参数 (--from/--data/--uninstall/--dev) 交给内联函数, 绕过下方 token 分发。
 case "${1:-}" in
     __service_install) shift; service_install "$@"; exit $? ;;
     __app_install)     shift; app_install "$@"; exit $? ;;
 esac
 
-CMD=""
-PASS_ARGS=()
-# 解析: 第一个非选项参数为命令; 全局 --debug/--data 任意位置生效; 其余参数 (如 pkg --build,
-# sign-setup check) 收进 PASS_ARGS 透传给对应子命令函数。
+# 解析全局 --data, 其余收进 token 列表 (命令 + 子参数)。
+TOKENS=()
 while [[ $# -gt 0 ]]; do
     case "$1" in
-        --debug)
-            VARIANT="debug"
-            CARGO_PROFILE_FLAG=""               # debug = 默认 profile
-            CARGO_FEATURES=(--features debug_variant)
-            APP_VARIANT_FLAG=(--debug)
-            APP_SUPPORT="$HOME/Library/Application Support/WindInput_debug"
-            LABEL="to.feng.windinput.service.debug"
-            ;;
         --data) shift; DATA_OVERRIDE="${1:-}"; [[ -n "$DATA_OVERRIDE" ]] || { err "--data 缺目录"; exit 1; } ;;
-        -h|--help) CMD="help" ;;
-        *)  if [[ -z "$CMD" ]]; then CMD="$1"; else PASS_ARGS+=("$1"); fi ;;
+        *) TOKENS+=("$1") ;;
     esac
     shift
 done
 
-INSTALLED_DATA="$APP_SUPPORT/service/data"
+# 无参数 → 交互菜单
+if [[ ${#TOKENS[@]} -eq 0 ]]; then menu_loop; exit 0; fi
 
-# ───────────────────────── 分发 ─────────────────────────
-case "$CMD" in
-    install|i)        install_service; install_app; bold "==> 完成 — 切到 WindInput 试输入" ;;
-    service|svc|s)    install_service; do_run; bold "==> service 已更新重启" ;;
-    app|a)            install_app; bold "==> app 已更新 (若 IMKit 未刷新, 切走再切回)" ;;
-    build|b)          build_service; build_app; bold "==> 仅编译完成 (未安装)" ;;
-    run|r)            do_run ;;
-    logs|log|l)       do_logs ;;
-    status|st)        do_status ;;
-    data|gd)          do_data ;;
-    uninstall|rm)     do_uninstall ;;
-    sign-setup)       sign_setup ${PASS_ARGS[@]+"${PASS_ARGS[@]}"} ;;
-    pkg)              pkg_build ${PASS_ARGS[@]+"${PASS_ARGS[@]}"} ;;
-    help|"")          usage ;;
-    *)                err "未知命令: $CMD"; usage; exit 1 ;;
+case "${TOKENS[0]}" in
+    -h|--help|help) print_help; exit 0 ;;
+    menu)           menu_loop; exit 0 ;;
 esac
+
+rc=0
+run_tokens "${TOKENS[@]}" || rc=$?
+exit "$rc"

@@ -304,11 +304,12 @@ public enum IPCError: Error, Equatable {
 // MARK: - 默认运行时路径
 
 public enum BridgeEndpoints {
-    /// 变体后缀: debug 变体的 .app (bundleID 以 "Debug" 结尾) 用 "_debug", 与 Go
-    /// buildvariant.Suffix() 对齐, 让 debug/release 两套 .app + 服务各用独立运行时目录
-    /// (socket/config) 共存 —— 可同时注册为两个输入法, 日常用正式版、旁边测开发版。
+    /// 变体后缀: dev 变体的 .app (bundleID 以 "Dev" 结尾) 用 "Dev", 与 Rust
+    /// wind_config::variant::app_dir_name() 对齐 (release=WindInput, dev=WindInputDev),
+    /// 让 dev/release 两套 .app + 服务各用独立运行时目录 (socket/config) 共存 ——
+    /// 可同时注册为两个输入法, 日常用正式版、旁边测开发版。
     public static var variantSuffix: String {
-        (Bundle.main.bundleIdentifier?.hasSuffix("Debug") ?? false) ? "_debug" : ""
+        (Bundle.main.bundleIdentifier?.hasSuffix("Dev") ?? false) ? "Dev" : ""
     }
 
     public static var runtimeDir: String {
