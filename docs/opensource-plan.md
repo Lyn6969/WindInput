@@ -76,8 +76,13 @@ CLA 尤其值得保留，继续用 CLA Assistant 机器人流程。
 2. **仓库 Secrets**：确认 `WIND_REPOS_TOKEN`（Release 用）与 `CLA_TOKEN`
    （CLA Assistant 用）已配置。
 3. **仓库更名**：旧名 → WindInput（GitHub 自动重定向旧 URL）；
-   原 Go 仓库先更名为 WindInput-Go 腾出名字。产物命名中的 "WindInput"
-   （release.yml、pack-installer.sh、config/app.toml 等）随后统一改为 WindInput。
+   原 Go 仓库先更名为 WindInput-Go 腾出名字。仓库内的旧名字样
+   （release.yml、pack-installer.sh、config/app.toml、scripts、日志文案、docs 现行文档）
+   已统一替换为 WindInput（历史文档 docs/archive/、docs/superpowers/ 刻意保留原文）。
+   **跨仓库同步（必须与本地目录改名同时做）**：`wind-setting` 的 `Cargo.toml`
+   （`wind-ipc = { path = "../WindInput/..." }`）与 `build.rs` 引用需改为
+   `../WindInput`；在其同步前，Release workflow（checkout path 已改为 WindInput）
+   打 tag 会构建失败。
 4. **GitHub 仓库设置**：description、topics（ime / input-method / tsf / rust /
    wubi / pinyin）、启用 Discussions（issue 模板 config.yml 已链接）、
    branch protection（main 需 PR + CLA 检查）。
