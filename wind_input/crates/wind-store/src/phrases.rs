@@ -255,6 +255,74 @@ impl Store {
         Ok(stats)
     }
 
+    /// 系统短语（is_system=true），按 key 升序，不分页。
+    pub fn list_system_phrases(&self) -> anyhow::Result<Vec<PhraseRecord>> {
+        Ok(self
+            .list_phrases()?
+            .into_iter()
+            .filter(|p| p.is_system)
+            .collect())
+    }
+
+    /// 用户短语分页（is_system=false）。prefix 非空时按 code/text 包含过滤后再分页。
+    /// 返回 (页内行, 过滤后总数)。
+    pub fn list_user_phrases_paged(
+        &self,
+        prefix: Option<&str>,
+        offset: usize,
+        limit: usize,
+    ) -> anyhow::Result<(Vec<PhraseRecord>, usize)> {
+        let mut all: Vec<PhraseRecord> = self
+            .list_phrases()?
+            .into_iter()
+            .filter(|p| !p.is_system)
+            .collect();
+        if let Some(q) = prefix {
+            let q = q.trim();
+            if !q.is_empty() {
+                all.retain(|p| p.code.contains(q) || p.text.contains(q));
+            }
+        }
+        let total = all.len();
+        let page = all.into_iter().skip(offset).take(limit).collect();
+        Ok((page, total))
+    }
+
+    /// 输入期短语集：全部 enabled 短语（系统+用户）。
+    pub fn enabled_phrases_for_input(&self) -> anyhow::Result<Vec<PhraseRecord>> {
+        Ok(self
+            .list_phrases()?
+            .into_iter()
+            .filter(|p| p.enabled)
+            .collect())
+    }
+
+    /// 系统"恢复默认"：is_system=true 行全部 enabled=true。返回改动条数。
+    pub fn reset_system_enabled(&self) -> anyhow::Result<usize> {
+        let mut n = 0;
+        for p in self.list_phrases()? {
+            if p.is_system && !p.enabled {
+                self.set_phrase_enabled(&p.code, &p.text, true)?;
+                n += 1;
+            }
+        }
+        Ok(n)
+    }
+
+    /// 用户"清空"：删 is_system=false 行。返回删除条数。
+    pub fn reset_user_phrases(&self) -> anyhow::Result<usize> {
+        let users: Vec<PhraseRecord> = self
+            .list_phrases()?
+            .into_iter()
+            .filter(|p| !p.is_system)
+            .collect();
+        let n = users.len();
+        for p in users {
+            self.remove_phrase(&p.code, &p.text)?;
+        }
+        Ok(n)
+    }
+
     /// 重置为默认：清空全部用户短语，返回删除条数。
     pub fn reset_phrases(&self) -> anyhow::Result<usize> {
         self.with_db(|db| {
@@ -370,6 +438,87 @@ mod tests {
         assert_eq!(s.phrase_sys_hash().unwrap(), None);
         s.set_phrase_sys_hash("abc123").unwrap();
         assert_eq!(s.phrase_sys_hash().unwrap().as_deref(), Some("abc123"));
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn list_system_and_user_split() {
+        let path = tmp("wind_phrases_split.redb");
+        let s = Store::open(&path).unwrap();
+        s.sync_system_phrases(&[
+            SystemPhrase {
+                code: "a".into(),
+                text: "甲".into(),
+                weight: 1,
+                position: 0,
+            },
+            SystemPhrase {
+                code: "b".into(),
+                text: "乙".into(),
+                weight: 1,
+                position: 0,
+            },
+        ])
+        .unwrap();
+        s.add_phrase("u1", "用户一", 0, 1).unwrap();
+        s.add_phrase("u2", "用户二", 0, 1).unwrap();
+        assert_eq!(s.list_system_phrases().unwrap().len(), 2);
+        let (page, total) = s.list_user_phrases_paged(None, 0, 10).unwrap();
+        assert_eq!(total, 2);
+        assert_eq!(page.len(), 2);
+        assert!(page.iter().all(|p| !p.is_system));
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn user_paging_and_prefix() {
+        let path = tmp("wind_phrases_page.redb");
+        let s = Store::open(&path).unwrap();
+        for i in 0..5 {
+            s.add_phrase(&format!("c{i}"), &format!("词{i}"), 0, 1)
+                .unwrap();
+        }
+        let (p0, total) = s.list_user_phrases_paged(None, 0, 2).unwrap();
+        assert_eq!(total, 5);
+        assert_eq!(p0.len(), 2);
+        let (p2, _) = s.list_user_phrases_paged(None, 4, 2).unwrap();
+        assert_eq!(p2.len(), 1, "末页不足一页");
+        // prefix 过滤
+        let (pf, tf) = s.list_user_phrases_paged(Some("c3"), 0, 10).unwrap();
+        assert_eq!(tf, 1);
+        assert_eq!(pf[0].code, "c3");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn enabled_for_input_and_resets() {
+        let path = tmp("wind_phrases_enabled.redb");
+        let s = Store::open(&path).unwrap();
+        s.sync_system_phrases(&[SystemPhrase {
+            code: "a".into(),
+            text: "甲".into(),
+            weight: 1,
+            position: 0,
+        }])
+        .unwrap();
+        s.add_phrase("u", "用户", 0, 1).unwrap();
+        s.set_phrase_enabled("a", "甲", false).unwrap(); // 禁用系统
+        let inp = s.enabled_phrases_for_input().unwrap();
+        assert!(inp.iter().all(|p| p.enabled));
+        assert!(!inp.iter().any(|p| p.code == "a"), "禁用项不入输入集");
+        assert!(inp.iter().any(|p| p.code == "u"));
+        // 系统恢复默认：全部重新启用
+        let n = s.reset_system_enabled().unwrap();
+        assert_eq!(n, 1);
+        assert!(
+            s.enabled_phrases_for_input()
+                .unwrap()
+                .iter()
+                .any(|p| p.code == "a")
+        );
+        // 用户清空
+        assert_eq!(s.reset_user_phrases().unwrap(), 1);
+        assert!(!s.list_phrases().unwrap().iter().any(|p| !p.is_system));
         let _ = std::fs::remove_file(&path);
     }
 
