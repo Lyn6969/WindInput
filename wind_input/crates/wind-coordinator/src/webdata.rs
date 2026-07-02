@@ -144,6 +144,11 @@ impl Coordinator {
             "phrase.remove" => self.web_phrase_remove(params),
             "phrase.setEnabled" => self.web_phrase_set_enabled(params),
             "phrase.resetDefault" => self.web_phrase_reset(),
+            "phrase.listSystem" => self.web_phrase_list_system(),
+            "phrase.listUser" => self.web_phrase_list_user(params),
+            "phrase.export" => self.web_phrase_export(),
+            "phrase.import" => self.web_phrase_import(params),
+            "phrase.resetSystem" => self.web_phrase_reset_system(),
 
             // ── stats.*（输入统计，redb 每日聚合）────────────────
             "stats.summary" => self.web_stats_summary(),
@@ -663,6 +668,7 @@ impl Coordinator {
             .as_ref()
             .ok_or_else(|| anyhow::anyhow!("无持久化存储"))?;
         store.add_phrase(code, text, position, weight)?;
+        self.rebuild_phrases();
         Ok(json!({ "ok": true }))
     }
 
@@ -687,6 +693,7 @@ impl Coordinator {
         if let Some(en) = params.get("enabled").and_then(|v| v.as_bool()) {
             store.set_phrase_enabled(new_code.unwrap_or(code), new_text.unwrap_or(text), en)?;
         }
+        self.rebuild_phrases();
         Ok(json!({ "ok": true }))
     }
 
@@ -697,6 +704,7 @@ impl Coordinator {
             .as_ref()
             .ok_or_else(|| anyhow::anyhow!("无持久化存储"))?;
         store.remove_phrase(code, text)?;
+        self.rebuild_phrases();
         Ok(json!({ "ok": true }))
     }
 
@@ -711,6 +719,7 @@ impl Coordinator {
             .as_ref()
             .ok_or_else(|| anyhow::anyhow!("无持久化存储"))?;
         store.set_phrase_enabled(code, text, enabled)?;
+        self.rebuild_phrases();
         Ok(json!({ "ok": true }))
     }
 
@@ -718,7 +727,77 @@ impl Coordinator {
         if let Some(store) = self.store.as_ref() {
             store.reset_phrases()?;
         }
+        self.rebuild_phrases();
         Ok(json!({ "ok": true }))
+    }
+
+    fn web_phrase_list_system(&self) -> anyhow::Result<Value> {
+        let store = self
+            .store
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("无持久化存储"))?;
+        let items: Vec<Value> = store
+            .list_system_phrases()?
+            .into_iter()
+            .map(|p| {
+                json!({
+                    "code": p.code, "text": p.text, "weight": p.weight,
+                    "position": p.position, "enabled": p.enabled, "isSystem": true,
+                })
+            })
+            .collect();
+        Ok(json!(items))
+    }
+
+    fn web_phrase_list_user(&self, params: &Value) -> anyhow::Result<Value> {
+        let store = self
+            .store
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("无持久化存储"))?;
+        let prefix = params.get("prefix").and_then(|v| v.as_str());
+        let offset = params.get("offset").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+        let limit = params.get("limit").and_then(|v| v.as_u64()).unwrap_or(100) as usize;
+        let (rows, total) = store.list_user_phrases_paged(prefix, offset, limit)?;
+        let items: Vec<Value> = rows
+            .into_iter()
+            .map(|p| {
+                json!({
+                    "code": p.code, "text": p.text, "weight": p.weight,
+                    "position": p.position, "enabled": p.enabled, "isSystem": false,
+                })
+            })
+            .collect();
+        Ok(json!({ "items": items, "total": total }))
+    }
+
+    fn web_phrase_export(&self) -> anyhow::Result<Value> {
+        let store = self
+            .store
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("无持久化存储"))?;
+        let content = store.export_user_phrases_wdict("")?;
+        Ok(json!({ "content": content }))
+    }
+
+    fn web_phrase_import(&self, params: &Value) -> anyhow::Result<Value> {
+        let store = self
+            .store
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("无持久化存储"))?;
+        let content = str_param(params, "content")?;
+        let (imported, skipped) = store.import_user_phrases_wdict(content)?;
+        self.rebuild_phrases();
+        Ok(json!({ "imported": imported, "skipped": skipped }))
+    }
+
+    fn web_phrase_reset_system(&self) -> anyhow::Result<Value> {
+        let store = self
+            .store
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("无持久化存储"))?;
+        let n = store.reset_system_enabled()?;
+        self.rebuild_phrases();
+        Ok(json!({ "ok": true, "changed": n }))
     }
 
     fn web_stats_summary(&self) -> anyhow::Result<Value> {
