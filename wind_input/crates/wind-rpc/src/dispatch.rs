@@ -105,9 +105,12 @@ fn handle(state: &DispatchState, method: &str, params: &Value) -> anyhow::Result
             Ok(serde_json::to_value(cfg)?)
         }
         "config.getDefaults" => {
-            // 全部顶层字段带 #[serde(default)]，空 TOML 即得纯代码默认配置。
-            let cfg: wind_config::Config = toml::from_str("")?;
-            Ok(serde_json::to_value(cfg)?)
+            // 出厂默认 = 系统预置（代码默认 L1 ⊕ data/config.toml L2），与 capability
+            // 的 default 同源（system_preset_value）。不可用 toml::from_str("") 的纯 L1：
+            // 顶码上屏/拼音自动学习等键出厂经 L2 置开、L1 为关，二者分叉会让设置端
+            // 「恢复默认」把这些项误关。
+            let v = Config::system_preset_value(Config::data_dir().as_deref())?;
+            Ok(serde_json::to_value(v)?)
         }
         "config.setItems" => set_items(state, params),
         // 配置字段注册表（key+type+enum options）：CLI/设置端据此校验与补全。

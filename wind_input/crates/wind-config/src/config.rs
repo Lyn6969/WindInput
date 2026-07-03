@@ -875,8 +875,9 @@ pub struct KeysConfig {
 }
 
 // 热键默认值对齐 Go 版 DefaultConfig.Hotkeys（wind_input/pkg/config/config.go）。
-// 关键：config.getDefaults 走 toml::from_str("")，[keys] 整表缺失时用 Default::default()，
-// 故必须手写 Default（而非 derive 的空值），否则设置页"开关后默认键丢失"。
+// 关键：config.getDefaults 以 Config::default() 为 L1 基线（再叠 data/config.toml），
+// [keys] 整表在 L2 缺失时用 Default::default()，故必须手写 Default（而非 derive 的
+// 空值），否则设置页"开关后默认键丢失"。
 fn default_toggle_mode_keys() -> Vec<String> {
     vec!["lshift".to_string(), "rshift".to_string()]
 }
