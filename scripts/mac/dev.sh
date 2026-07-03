@@ -17,11 +17,11 @@
 #   d1 / dev          Dev 全构建 (WIND_VARIANT=dev 身份)
 #   m1 / dm1          仅构建 app   (WindInput.app / WindInputDev.app)  release/dev  [= Win m1 tsf]
 #   m2 / dm2          仅构建 service (cargo build -p wind_service)     release/dev  [= Win m2 core]
-#   m3 / dm3          仅构建 wind_setting (../wind-setting, 不存在则跳过) release/dev
-#   p1 / pd1          系统安装全部 (service LaunchAgent + app 到 ~/Library/Input Methods/)
-#   pm1 / pdm1        仅装 app 模块     pm2 / pdm2   仅装 service 模块
-#   u/u1 / ud/ud1     系统卸载 release / dev (撤销 app+service+LaunchAgent, 保留用户数据)
-#   8  / d8           生成 .pkg 安装包 (release / dev): 全构建后打包
+#   m3 / dm3          仅构建 wind_setting.app (../wind-setting, 不存在则跳过) release/dev
+#   p1 / pd1          系统安装全部 (service LaunchAgent + IME app + 设置 app)
+#   pm1 / pdm1        仅装 app 模块   pm2 / pdm2  仅装 service   pm3 / pdm3  仅装 设置 app
+#   u/u1 / ud/ud1     系统卸载 release / dev (撤销 app+service+设置+LaunchAgent, 保留用户数据)
+#   8  / d8           生成 .pkg 安装包 (release / dev): 全构建后打包 (含设置 app)
 #   8s / d8s          生成 .pkg (跳过重建, 直接用现有产物打包)
 #   k=check  l=clippy  t=test  f=fmt  fmt-check  ci(=fmt-check+clippy+test)  clean
 #   gd=gen-data       下载词库 + 生成 unigram/pinyin_map + 组装 data/ → build_mac/data + 校验
@@ -333,14 +333,236 @@ build_app() {
     app_build ${APP_VARIANT_FLAG[@]+"${APP_VARIANT_FLAG[@]}"}
 }
 
-# wind_setting: macOS 上是独立 native 项目; 对齐 dev.ps1 的 skip-if-absent 桩。
+# ───────────── build_setting (拼装 清风输入法设置[开发版].app) ─────────────
+# wind_setting 是独立 Rust 项目 (../wind-setting, windui GUI 框架); 原生 cargo build 产 bare
+# 二进制, 这里按标准 macOS .app 结构拼壳 (Info.plist + AppIcon.icns + codesign)。所有资源
+# (品牌图标/manifest/svg/png) 已在二进制内 include_bytes! 嵌入, 故壳内只需 二进制 + plist + icns。
+#
+# IME 经 LaunchServices 按 bundleID 拉起设置 app (见 Swift ModeStatusController.openSettings):
+#   release IME → com.wails.wind_setting        release 设置 app
+#   dev     IME → com.wails.wind_setting_debug  dev 设置 app  (Swift 判 bundleID 以 "Dev" 结尾)
+# 故壳的 CFBundleIdentifier 必须与之对齐, 否则 IME 的'设置…'找不到程序。
+#
+# 变体身份 (连对服务): dev 壳的 CFBundleExecutable/二进制名带 _dev 后缀 → wind_setting 的
+#   mode::detect 规则3 (exe 名 _dev) 命中 → 连 WindInputDev 服务 (无需注入 WIND_VARIANT);
+#   与 Windows 的 wind_setting_dev.exe 模型一致。release 壳用 wind_setting → 连正式服务。
+#   两变体 bundleID/文件名/壳名均隔离, 可共存。
+#
+# 独立仓库不存在 → 告警跳过 (返回 0, 对齐 dev.ps1 Build-Setting 的 skip-if-absent);
+# cargo 构建失败 → 返回 1 (显式 m3/dm3 报错; do_full/install_all 以 best-effort 包裹不中断)。
+# 输出: wind_macos/build/<APP_NAME>.app  (APP_NAME = 清风输入法设置 / 清风输入法设置开发版)
 build_setting() {
-    if [[ -d "$SETTING_DIR" ]]; then
-        warn "wind_setting: 独立设置项目 ($SETTING_DIR) 尚未接入 macOS 自动构建, 跳过"
-    else
+    if [[ ! -d "$SETTING_DIR" ]]; then
         warn "wind_setting: ../wind-setting 不存在, 跳过 (对齐 dev.ps1 skip-if-absent)"
+        return 0
     fi
+    command -v codesign >/dev/null || { err "codesign 未安装 (装 Xcode CLT)"; return 1; }
+
+    # 变体派生。
+    local disp exe_name bid cargo_sub
+    local cargo_flags=()
+    if [[ "$VARIANT" == dev ]]; then
+        disp="清风输入法设置开发版"; exe_name="wind_setting_dev"
+        bid="com.wails.wind_setting_debug"; cargo_sub="debug"; cargo_flags=()
+    else
+        disp="清风输入法设置"; exe_name="wind_setting"
+        bid="com.wails.wind_setting"; cargo_sub="release"; cargo_flags=(--release)
+    fi
+    local APP_BUNDLE="$MACOS_DIR/build/$disp.app"
+
+    # 1. 原生 cargo build (wind_setting package → target/<sub>/wind_setting)。
+    bold "==> 编译 wind_setting ($VARIANT, native)"
+    ( cd "$SETTING_DIR" && cargo build ${cargo_flags[@]+"${cargo_flags[@]}"} ) || {
+        err "wind_setting 构建失败 (见上; 非致命, 设置 app 将缺失)"; return 1
+    }
+    local BIN_PATH="$SETTING_DIR/target/$cargo_sub/wind_setting"
+    [[ -x "$BIN_PATH" ]] || { err "未找到 wind_setting 二进制: $BIN_PATH"; return 1; }
+    info "binary: $BIN_PATH ($(stat -f%z "$BIN_PATH") bytes)"
+
+    # 2. 组 .app 壳。
+    bold "==> Assemble $APP_BUNDLE"
+    rm -rf "$APP_BUNDLE"
+    mkdir -p "$APP_BUNDLE/Contents/MacOS" "$APP_BUNDLE/Contents/Resources"
+    cp "$BIN_PATH" "$APP_BUNDLE/Contents/MacOS/$exe_name"
+    chmod +x "$APP_BUNDLE/Contents/MacOS/$exe_name"
+
+    # 版本: 仓库根 docs/VERSION (无则 0.0.0), 与 IME app / pkg 版本贯通。
+    local ver="0.0.0"
+    if [[ -f "$REPO_DIR/docs/VERSION" ]]; then
+        local v; v=$(tr -d '\xef\xbb\xbf \t\r\n' < "$REPO_DIR/docs/VERSION"); [[ -n "$v" ]] && ver="$v"
+    fi
+
+    # Info.plist (窗口应用: 不设 LSUIElement; NSPrincipalClass=NSApplication)。
+    cat > "$APP_BUNDLE/Contents/Info.plist" <<PLIST_EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>CFBundleName</key>
+    <string>$disp</string>
+    <key>CFBundleDisplayName</key>
+    <string>$disp</string>
+    <key>CFBundleIdentifier</key>
+    <string>$bid</string>
+    <key>CFBundleExecutable</key>
+    <string>$exe_name</string>
+    <key>CFBundlePackageType</key>
+    <string>APPL</string>
+    <key>CFBundleShortVersionString</key>
+    <string>$ver</string>
+    <key>CFBundleVersion</key>
+    <string>$ver</string>
+    <key>CFBundleIconFile</key>
+    <string>AppIcon</string>
+    <key>LSMinimumSystemVersion</key>
+    <string>11.0</string>
+    <key>NSHighResolutionCapable</key>
+    <true/>
+    <key>NSPrincipalClass</key>
+    <string>NSApplication</string>
+</dict>
+</plist>
+PLIST_EOF
+    plutil -lint "$APP_BUNDLE/Contents/Info.plist" >/dev/null
+    printf "APPL????" > "$APP_BUNDLE/Contents/PkgInfo"
+
+    # 3. AppIcon.icns (从 res/wind_setting_icon.png 256² 生成; 缺 png/工具则跳过图标, 非致命)。
+    local ICON_PNG="$SETTING_DIR/res/wind_setting_icon.png"
+    if [[ -f "$ICON_PNG" ]] && command -v iconutil >/dev/null; then
+        local ICONSET_ROOT; ICONSET_ROOT="$(mktemp -d)"
+        local ICONSET="$ICONSET_ROOT/AppIcon.iconset"; mkdir -p "$ICONSET"
+        local s
+        for s in 16 32 128 256; do
+            sips -z "$s" "$s" "$ICON_PNG" --out "$ICONSET/icon_${s}x${s}.png" >/dev/null 2>&1 || true
+            if (( s * 2 <= 256 )); then
+                sips -z "$((s*2))" "$((s*2))" "$ICON_PNG" --out "$ICONSET/icon_${s}x${s}@2x.png" >/dev/null 2>&1 || true
+            fi
+        done
+        if iconutil -c icns "$ICONSET" -o "$APP_BUNDLE/Contents/Resources/AppIcon.icns" 2>/dev/null; then
+            info "icon: AppIcon.icns (源 res/wind_setting_icon.png)"
+        else
+            warn "AppIcon.icns 生成失败 (无图标, 非致命)"
+        fi
+        rm -rf "$ICONSET_ROOT"
+    else
+        warn "缺 $ICON_PNG 或 iconutil, 跳过应用图标 (非致命)"
+    fi
+
+    # 4. 签名 (与 IME/服务同策略: SIGN_IDENTITY 用固定证书, 否则纯 ad-hoc)。
+    #    设置 app 非 IME, 无 TIS 注册顾虑, 不需 hardened runtime。
+    if [[ -n "${SIGN_IDENTITY:-}" ]]; then
+        bold "==> codesign with identity \"$SIGN_IDENTITY\""
+        codesign --force --sign "$SIGN_IDENTITY" --timestamp=none "$APP_BUNDLE" 2>&1 | sed 's/^/    /' | head -6 || true
+    else
+        bold "==> codesign ad-hoc"
+        codesign --force --sign - --timestamp=none "$APP_BUNDLE" 2>&1 | sed 's/^/    /' | head -6 || true
+    fi
+
+    bold "==> Done"
+    info "Bundle: $APP_BUNDLE  (bundleID=$bid, exec=$exe_name)"
     return 0
+}
+
+# ───────────── setting_install (装 设置 .app 到 ~/Applications) ─────────────
+# 用户域安装 (不需 sudo)。装完 lsregister 强制重读, 使 IME 的 NSWorkspace 按 bundleID 秒查到。
+# 两变体 bundleID/壳名不同, 可共存。best-effort: 壳不存在 (设置仓缺/未构建) → 告警跳过, 不失败。
+#
+# 参数:
+#   (无)          装 release 设置 app
+#   --dev         装 dev 设置 app (清风输入法设置开发版.app)
+#   --uninstall   卸载
+#   --from <dir>  从指定目录装 (内含 <APP_NAME>.app), 供 .pkg postinstall 场景
+setting_install() {
+    local dev=0 do_uninstall=0 src_dir=""
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --dev)       dev=1 ;;
+            --uninstall) do_uninstall=1 ;;
+            --from)      shift; src_dir="${1:-}"; [[ -n "$src_dir" ]] || { echo "[错误] --from 缺目录参数" >&2; exit 1; } ;;
+            *) echo "[错误] 未知参数: $1" >&2; exit 1 ;;
+        esac
+        shift
+    done
+
+    local disp exe_name bid
+    if [[ $dev -eq 1 ]]; then
+        disp="清风输入法设置开发版"; exe_name="wind_setting_dev"; bid="com.wails.wind_setting_debug"
+    else
+        disp="清风输入法设置"; exe_name="wind_setting"; bid="com.wails.wind_setting"
+    fi
+    local APP_NAME="$disp.app"
+    local INSTALL_DIR="$HOME/Applications"
+    local DST="$INSTALL_DIR/$APP_NAME"
+    local SRC="${src_dir:-$MACOS_DIR/build}/$APP_NAME"
+    local LSREGISTER="/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister"
+
+    if [[ $EUID -eq 0 ]]; then
+        err "请以普通用户运行 (用户域 ~/Applications 安装, 不要 sudo)。"
+        exit 1
+    fi
+
+    # -------- uninstall --------
+    if [[ $do_uninstall -eq 1 ]]; then
+        bold "==> Uninstall $APP_NAME"
+        # 按壳内可执行路径精确匹配 (壳名带 .app 分隔, 不误杀另一变体)。
+        pkill -9 -f "$APP_NAME/Contents/MacOS/$exe_name" 2>/dev/null || true
+        if [[ -d "$DST" ]]; then
+            [[ -x "$LSREGISTER" ]] && "$LSREGISTER" -u "$DST" 2>/dev/null || true
+            rm -rf "$DST" && info "removed $DST"
+        else
+            info "(未安装 $DST)"
+        fi
+        return 0
+    fi
+
+    # -------- install --------
+    if [[ ! -d "$SRC" ]]; then
+        warn "未找到设置 app: $SRC (wind_setting 仓缺失或未构建), 跳过设置安装 (非致命)"
+        return 0
+    fi
+    bold "==> Install $SRC -> $DST"
+    # 停旧实例 (按壳内可执行路径, 避免误杀另一变体)。
+    pkill -9 -f "$APP_NAME/Contents/MacOS/$exe_name" 2>/dev/null && sleep 0.3 || true
+    mkdir -p "$INSTALL_DIR"
+    rm -rf "$DST"
+    cp -R "$SRC" "$INSTALL_DIR/"
+    info "已复制 $DST"
+    # 原地重签 (跨机/同路径 cdhash 缓存失配防护; ad-hoc 幂等)。
+    if command -v codesign >/dev/null; then
+        if [[ -n "${SIGN_IDENTITY:-}" ]]; then
+            [[ -n "${SIGN_KEYCHAIN_PW:-}" ]] && security unlock-keychain -p "$SIGN_KEYCHAIN_PW" "$HOME/Library/Keychains/login.keychain-db" 2>/dev/null || true
+            codesign --force --sign "$SIGN_IDENTITY" --deep "$DST" 2>/dev/null && info "固定证书重签: \"$SIGN_IDENTITY\"" || info "codesign 重签跳过 (非致命)"
+        else
+            codesign --force --sign - --deep "$DST" 2>/dev/null && info "ad-hoc 重签" || info "codesign 重签跳过 (非致命)"
+        fi
+    fi
+    # lsregister 强制重读, 让 IME 的 urlForApplication(bundleID=$bid) 立即命中。
+    if [[ -x "$LSREGISTER" ]]; then
+        "$LSREGISTER" -f -R "$DST" 2>/dev/null || true
+        info "lsregister -f -R (bundleID=$bid 可被 LaunchServices 查到)"
+    fi
+    bold "==> Done"
+    info "设置 app 已装: $DST"
+    info "IME 菜单'设置…'/候选栏会经 bundleID ($bid) 拉起它。"
+    return 0
+}
+
+# 组合: 编 + 装 设置 app (best-effort: 构建失败/仓缺失不中断上层安装)。
+install_setting() {
+    build_setting || warn "wind_setting 构建失败/跳过 (设置 app 可能缺失)"
+    bold "==> 安装 设置 app ($VARIANT)"
+    setting_install ${APP_VARIANT_FLAG[@]+"${APP_VARIANT_FLAG[@]}"}
+    # 防复发: 清 build/ 里的设置壳并注销其 LS 登记 (与 install_app 同策略)。它与 ~/Applications
+    # 里的真身同 bundleID, 留着会被 LaunchServices 重复登记; 若日后 build/ 被清则成幽灵路径。
+    # 真身已装到 ~/Applications, build/ 仅中间产物 (pkg 打包会即时重建), 可删。
+    local disp="清风输入法设置"; [[ "$VARIANT" == dev ]] && disp="清风输入法设置开发版"
+    local built="$MACOS_DIR/build/$disp.app"
+    if [[ -d "$built" ]]; then
+        local lsreg="/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister"
+        [[ -x "$lsreg" ]] && "$lsreg" -u "$built" 2>/dev/null || true
+        rm -rf "$built"
+        info "已清理 build/ 重复设置壳 (防 LS 重复登记)"
+    fi
 }
 
 # ───────────────────────── gen-data (原生, 对齐 dev.ps1) ─────────────────────────
@@ -1028,6 +1250,7 @@ install_app() {
 install_all() {
     install_service
     install_app
+    install_setting   # best-effort: 设置仓缺失/构建失败不影响 IME 安装
     bold "==> 系统安装完成 ($VARIANT) — 切到 $(app_name_for_variant) 试输入"
 }
 
@@ -1035,10 +1258,12 @@ do_full() {
     bold "========== 全构建 ($VARIANT) =========="
     build_service
     build_app
+    build_setting || warn "wind_setting 构建跳过/失败 (非致命, 设置 app 缺失)"
     do_gendata
     verify_dist_data
     bold "========== 全构建完成 ($VARIANT) =========="
-    info "产物: service=target/$([[ $VARIANT == dev ]] && echo dev-variant || echo release)/wind_input  app=$MACOS_DIR/build/$(app_name_for_variant).app  data=$DATA_SNAPSHOT"
+    local setting_disp="清风输入法设置"; [[ $VARIANT == dev ]] && setting_disp="清风输入法设置开发版"
+    info "产物: service=target/$([[ $VARIANT == dev ]] && echo dev-variant || echo release)/wind_input  app=$MACOS_DIR/build/$(app_name_for_variant).app  setting=$MACOS_DIR/build/$setting_disp.app  data=$DATA_SNAPSHOT"
     info "下一步: scripts/mac/dev.sh $([[ $VARIANT == dev ]] && echo pd1 || echo p1)  (系统安装)"
 }
 
@@ -1077,10 +1302,11 @@ do_data() {
 }
 
 do_uninstall() {
-    bold "==> 卸载 service + app ($VARIANT)"
-    # 内联函数在卸载分支用 `exit 0` 终止; 放进子 shell 以免终止整个 dev.sh (此处需顺序卸两端)。
+    bold "==> 卸载 service + app + 设置 ($VARIANT)"
+    # 内联函数在卸载分支用 `exit 0` 终止; 放进子 shell 以免终止整个 dev.sh (此处需顺序卸多端)。
     ( service_install ${APP_VARIANT_FLAG[@]+"${APP_VARIANT_FLAG[@]}"} --uninstall ) || true
     ( app_install     ${APP_VARIANT_FLAG[@]+"${APP_VARIANT_FLAG[@]}"} --uninstall ) || true
+    ( setting_install ${APP_VARIANT_FLAG[@]+"${APP_VARIANT_FLAG[@]}"} --uninstall ) || true
 }
 
 # 候选 REPL (本机)。
@@ -1266,7 +1492,9 @@ pkg_build() {
     local SVC_SUBDIR="release"; [[ "$PROFILE" == dev ]] && SVC_SUBDIR="dev-variant"
     local SERVICE_BIN="$RUST_DIR/target/$SVC_SUBDIR/wind_input"
     local SERVICE_DATA="$DATA_SNAPSHOT"                                     # gd 产物 (变体无关)
-    local SETTING_APP="$REPO_DIR/wind_setting/build/bin/wind_setting.app"   # 可选
+    # 设置 app: build_setting 组装的壳 (变体名不同); 可选 (设置仓缺失则跳过)。
+    local SETTING_DISP="清风输入法设置"; [[ "$PROFILE" == dev ]] && SETTING_DISP="清风输入法设置开发版"
+    local SETTING_APP="$MACOS_DIR/build/$SETTING_DISP.app"
 
     local DIST_DIR="$MACOS_DIR/dist"
     local PKG_ID="to.feng.windinput.installer$([[ "$PROFILE" == dev ]] && echo .dev)"
@@ -1295,10 +1523,11 @@ pkg_build() {
 
     # -------- (可选) 构建 --------
     if [[ $DO_BUILD -eq 1 ]]; then
-        bold "==> 构建 IME + 服务 + 词库 ($PROFILE)"
+        bold "==> 构建 IME + 服务 + 词库 + 设置 ($PROFILE)"
         ( cd "$RUST_DIR" && cargo build "${CARGO_BUILD_ARGS[@]}" -p wind_service )
         do_gendata                             # 组装 data/ → build_mac/data
         app_build ${APP_VARIANT_FLAG[@]+"${APP_VARIANT_FLAG[@]}"}   # IME .app
+        build_setting || warn "wind_setting 构建跳过/失败 (非致命, .pkg 将不含设置 app)"   # 设置 .app (可选)
     fi
 
     # -------- 校验必备产物 (设置 app 可选) --------
@@ -1345,7 +1574,13 @@ exec "\$(cd "\$(dirname "\$0")" && pwd)/dev.sh" __app_install${WRAP_VFLAG} "\$@"
 WRAP
     if [[ $HAVE_SETTING -eq 1 ]]; then
         cp -R "$SETTING_APP" "$DEST/"
-        [[ -f "$DEPLOY_DIR/install_setting.sh" ]] && cp "$DEPLOY_DIR/install_setting.sh" "$DEST/"
+        # 生成设置安装薄包装 (postinstall 按 install_setting.sh --from <STAGE> 调用):
+        # re-exec dev.sh __setting_install, 从 STAGE 找同名 <设置>.app 装到用户 ~/Applications。
+        cat > "$DEST/install_setting.sh" <<WRAP
+#!/bin/bash
+export SIGN_IDENTITY="\${SIGN_IDENTITY-}"
+exec "\$(cd "\$(dirname "\$0")" && pwd)/dev.sh" __setting_install${WRAP_VFLAG} "\$@"
+WRAP
     fi
     chmod +x "$DEST"/*.sh "$DEST/service/wind_input"
     info "payload: $APP_NAME.app + service(wind_input+data)$([[ $HAVE_SETTING -eq 1 ]] && echo ' + wind_setting.app') + 安装脚本"
@@ -1450,10 +1685,10 @@ show_menu() {
     printf "\033[33m  单模块构建 (前缀 d = dev):\033[0m\n"
     echo   "    m1   仅 app  (WindInput.app)    dm1"
     echo   "    m2   仅 service (wind_service)  dm2"
-    echo   "    m3   仅 wind_setting (可选)     dm3"
+    echo   "    m3   仅 设置 app (wind_setting) dm3"
     printf "\033[33m  系统安装 / 卸载:\033[0m\n"
     echo   "    p1   安装全部 (release)         pd1   安装全部 (dev)"
-    echo   "    pm1/pm2  安装模块(app/service)  pdm1/pdm2 (dev)"
+    echo   "    pm1/pm2/pm3  装模块(app/svc/设置)  pdm1/pdm2/pdm3 (dev)"
     echo   "    u/u1 卸载全部 (release)         ud/ud1 卸载全部 (dev)"
     printf "\033[33m  安装包 (.pkg):\033[0m\n"
     echo   "    8    生成安装包 (release)        d8    生成安装包 (dev)"
@@ -1486,6 +1721,8 @@ dispatch() {
         pdm1) apply_variant dev;     install_app ;;
         pm2)  apply_variant release; install_service ;;
         pdm2) apply_variant dev;     install_service ;;
+        pm3)  apply_variant release; install_setting ;;
+        pdm3) apply_variant dev;     install_setting ;;
         u|u1)   apply_variant release; do_uninstall ;;
         ud|ud1) apply_variant dev;     do_uninstall ;;
         8)    pkg_build release --build ;;
@@ -1580,6 +1817,7 @@ print_help() {
 case "${1:-}" in
     __service_install) shift; service_install "$@"; exit $? ;;
     __app_install)     shift; app_install "$@"; exit $? ;;
+    __setting_install) shift; setting_install "$@"; exit $? ;;
 esac
 
 # 解析全局 --data, 其余收进 token 列表 (命令 + 子参数)。

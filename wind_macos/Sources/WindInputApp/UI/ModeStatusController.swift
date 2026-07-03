@@ -128,10 +128,12 @@ public final class ModeStatusController: NSObject, NSMenuDelegate {
             DispatchQueue.main.async { [weak self] in self?.openSettings(page: page) }
             return
         }
-        // 设置应用按本 IME 变体启动: debug IME → debug 设置应用 (连 WindInput_debug/rpc.sock),
+        // 设置应用按本 IME 变体启动: dev IME → dev 设置应用 (连 WindInputDev 服务 rpc.sock),
         // release IME → 正式设置应用, 实现配置分离 (各编辑各自服务的配置)。
-        let isDebug = Bundle.main.bundleIdentifier?.hasSuffix("Debug") ?? false
-        let bundleID = isDebug ? "com.wails.wind_setting_debug" : "com.wails.wind_setting"
+        // 判据用 bundleID 后缀 "Dev": dev IME bundleID = to.feng.inputmethod.WindInputDev,
+        // 对应 dev 设置 app bundleID = com.wails.wind_setting_debug (见 scripts/mac/dev.sh build_setting)。
+        let isDev = Bundle.main.bundleIdentifier?.hasSuffix("Dev") ?? false
+        let bundleID = isDev ? "com.wails.wind_setting_debug" : "com.wails.wind_setting"
         let ws = NSWorkspace.shared
         if let url = ws.urlForApplication(withBundleIdentifier: bundleID) {
             let cfg = NSWorkspace.OpenConfiguration()
