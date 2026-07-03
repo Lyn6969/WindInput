@@ -20,6 +20,28 @@ const ADD_WORD_MAX_LEN: usize = 20;
 /// 手动加词默认权重（略高于系统词库归一化中位 1000，对齐 Go addWordMaxWeight）
 const ADD_WORD_WEIGHT: i32 = 1200;
 
+/// 自动造词超长裁剪：从尾部保留整段（最近输入优先）使合并字数 ≤ max_chars。
+/// 返回保留区间的起始段索引；max_chars=0 不限（返回 0）。
+fn trim_segs_start(
+    segs: &[(String, String, wind_candidate::CandidateSource)],
+    max_chars: usize,
+) -> usize {
+    if max_chars == 0 {
+        return 0;
+    }
+    let mut total = 0;
+    let mut start = segs.len();
+    for (i, (_, t, _)) in segs.iter().enumerate().rev() {
+        let n = t.chars().count();
+        if total + n > max_chars {
+            break;
+        }
+        total += n;
+        start = i;
+    }
+    start
+}
+
 impl Coordinator {
     /// 加词到用户层（code 为空时暂不支持自动推导编码）。
     pub(crate) fn cmd_dict_add(&self, text: &str, code: &str) -> anyhow::Result<()> {
@@ -49,26 +71,30 @@ impl Coordinator {
         }
         // 自动造词闸门：拼音方案读 [pinyin.auto_learn]，码表/混输读有效 [codetable.auto_phrase]
         // （混输继承主码表行为）。开关关闭直接跳过；min_len 为造词最小字数（0 回退 2）。
-        let (enabled, min_len) = if self.engine_mgr.is_pinyin() {
+        // max_len：拼音路径不限（0）；码表路径取 max_phrase_len，0 回退 10。
+        let (enabled, min_len, max_len, promote_count) = if self.engine_mgr.is_pinyin() {
             let al = self.engine_mgr.auto_learn_settings();
-            (al.enabled, al.min_word_length)
+            (al.enabled, al.min_word_length, 0, al.promote_count)
         } else {
             let ap = self.engine_mgr.codetable_settings().auto_phrase;
-            (ap.enabled, ap.min_phrase_len)
+            let max = if ap.max_phrase_len == 0 {
+                10
+            } else {
+                ap.max_phrase_len
+            };
+            (ap.enabled, ap.min_phrase_len, max, ap.promote_count)
         };
         if !enabled {
             return;
         }
-        let code: String = state
-            .committed_segs
-            .iter()
-            .map(|(c, _, _)| c.as_str())
-            .collect();
-        let text: String = state
-            .committed_segs
-            .iter()
-            .map(|(_, t, _)| t.as_str())
-            .collect();
+        // 超长裁剪：从尾部保留整段使合并字数 ≤ max_len（最近输入优先）。
+        let start = trim_segs_start(&state.committed_segs, max_len);
+        let segs = &state.committed_segs[start..];
+        if segs.len() < 2 {
+            return;
+        }
+        let code: String = segs.iter().map(|(c, _, _)| c.as_str()).collect();
+        let text: String = segs.iter().map(|(_, t, _)| t.as_str()).collect();
         let min_len = if min_len == 0 { 2 } else { min_len };
         if text.chars().count() < min_len || code.is_empty() {
             return;
@@ -77,9 +103,10 @@ impl Coordinator {
         let active = self.engine_mgr.active_schema_id();
         // 归属方案：非混输维持折叠自身/拼音（不看段来源，现行为）；
         // 混输仅当全段同源时用该源归属 id（混源/无法归因跳过，混合码写给谁都无意义）。
+        // 注：混源判定使用截后 segs，截掉的段不参与归属判断。
         let schema = if self.engine_mgr.schema_engine_type(&active).as_deref() == Some("mixed") {
-            let first = state.committed_segs[0].2; // len>=2 已保证非空
-            if state.committed_segs.iter().any(|(_, _, s)| *s != first) {
+            let first = segs[0].2; // segs.len()>=2 已保证非空
+            if segs.iter().any(|(_, _, s)| *s != first) {
                 return; // 混源：跳过自动造词
             }
             match self.engine_mgr.write_data_schema_id(&active, first) {
@@ -89,13 +116,36 @@ impl Coordinator {
         } else {
             self.engine_mgr.data_schema_id(&active) // 拼音族折叠到 "pinyin"，与 record_freq 写读一致
         };
-        // add_weight/delta 取保守默认；晋升计数阈值由临时层累积达成（后续可接入 schema.learning 配置）。
-        if let Err(e) =
-            store.learn_temp_word(&schema, &code, &text, LEARN_ADD_WEIGHT, LEARN_WEIGHT_DELTA)
-        {
-            warn!("learn_temp_word failed: {}", e);
-        } else {
-            debug!("auto-learned phrase: {} -> {}", code, text);
+        // add_weight/delta 取保守默认；达 promote_count 阈值时晋升入用户词库。
+        match store.learn_temp_word(&schema, &code, &text, LEARN_ADD_WEIGHT, LEARN_WEIGHT_DELTA) {
+            Ok(count) => {
+                debug!(
+                    "auto-learned phrase: {} -> {} (count={})",
+                    code, text, count
+                );
+                self.maybe_promote_temp(store, &schema, &code, &text, count, promote_count);
+            }
+            Err(e) => warn!("learn_temp_word failed: {}", e),
+        }
+    }
+
+    /// 临时词晋升判定：promote_count>0 且累积 count 达阈 → 移入用户词库。0=禁用（对齐 Go 语义）。
+    pub(crate) fn maybe_promote_temp(
+        &self,
+        store: &wind_store::Store,
+        schema: &str,
+        code: &str,
+        text: &str,
+        count: u32,
+        promote_count: usize,
+    ) {
+        if promote_count == 0 || (count as usize) < promote_count {
+            return;
+        }
+        match store.promote_temp_word(schema, code, text) {
+            Ok(true) => debug!("temp word promoted: {} -> {}", code, text),
+            Ok(false) => {}
+            Err(e) => warn!("promote_temp_word failed: {}", e),
         }
     }
 
@@ -364,6 +414,7 @@ mod tests {
     //! 快捷加词状态机单元测试：无头 Coordinator + 临时 store，覆盖纯逻辑
     //! （字符还原/词长调整/确认写库）。编码计算依赖引擎，headless 下为空，
     //! 故写库测试手动注入 add_word_code。
+    use super::trim_segs_start;
     use crate::coordinator::Coordinator;
     use std::sync::Arc;
     use wind_config::Config;
@@ -382,6 +433,63 @@ mod tests {
         for it in items {
             h.push_front(it.to_string());
         }
+    }
+
+    /// learn_phrase_on_commit 6a 晋升路径：promote_count=2，造词两次达阈值 → 自动晋升。
+    #[test]
+    fn learn_phrase_promotes_at_threshold_via_6a() {
+        use wind_candidate::CandidateSource as CS;
+        use wind_store::Store;
+        let path = std::env::temp_dir().join("wind_addword_promote6a.redb");
+        let _ = std::fs::remove_file(&path);
+        let store = Arc::new(Store::open(&path).unwrap());
+
+        // 开启自动造词 + 晋升阈值=2（码表路径）
+        let mut cfg = Config::default();
+        cfg.schema.codetable.auto_phrase.enabled = true;
+        cfg.schema.codetable.auto_phrase.promote_count = 2;
+
+        let c = Coordinator::new_headless_with_store(cfg, None, store.clone());
+
+        // 辅助：构造含 2 段的 State 并调用 learn_phrase_on_commit
+        let make_state_with_segs = || {
+            let mut st = c.state.lock().unwrap();
+            st.committed_segs = vec![
+                ("aa".to_string(), "工".to_string(), CS::CodeTable),
+                ("bb".to_string(), "人".to_string(), CS::CodeTable),
+            ];
+            drop(st);
+        };
+
+        // 第 1 次造词 → temp count=1，未达阈值
+        make_state_with_segs();
+        {
+            let st = c.state.lock().unwrap();
+            c.learn_phrase_on_commit(&st);
+        }
+
+        let active = c.engine_mgr.active_schema_id();
+        let schema = c.engine_mgr.data_schema_id(&active);
+        let count1 = store.get_temp_word(&schema, "aabb", "工人").unwrap();
+        assert_eq!(count1, Some(1), "第 1 次造词后临时层 count 应为 1");
+
+        // 第 2 次造词 → temp count=2，达阈值 → 自动晋升
+        make_state_with_segs();
+        {
+            let st = c.state.lock().unwrap();
+            c.learn_phrase_on_commit(&st);
+        }
+
+        // 临时层应已删除
+        let count2 = store.get_temp_word(&schema, "aabb", "工人").unwrap();
+        assert_eq!(count2, None, "晋升后临时层应删除");
+        // 用户词层应含晋升的词
+        let user = store.get_user_words(&schema, "aabb").unwrap();
+        assert!(
+            user.iter().any(|r| r.text == "工人"),
+            "用户词层应含晋升的词"
+        );
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]
@@ -494,5 +602,18 @@ mod tests {
         assert!(st.add_word_chars.is_empty());
         assert_eq!(st.add_word_len, 0);
         assert!(st.add_word_code.is_empty());
+    }
+
+    #[test]
+    fn trim_segs_keeps_tail_within_max() {
+        use wind_candidate::CandidateSource as S;
+        let seg = |c: &str, t: &str| (c.to_string(), t.to_string(), S::CodeTable);
+        let segs = vec![seg("aa", "工人"), seg("bb", "们"), seg("cc", "好的")];
+        // 总 5 字，max=3 → 从尾部保留 "们"(1)+"好的"(2)=3 字，起始索引 1
+        assert_eq!(trim_segs_start(&segs, 3), 1);
+        // max=0 不限
+        assert_eq!(trim_segs_start(&segs, 0), 0);
+        // max=1 装不下末段(2字) → 起始=len（全部裁掉，调用方跳过）
+        assert_eq!(trim_segs_start(&segs, 1), 3);
     }
 }

@@ -24,6 +24,10 @@ pub struct CommitOptions {
     pub top_code_commit: bool,
     /// 显示编码提示：码表方案下,给前缀候选标注「剩余编码」(候选全码去掉已输入前缀)。
     pub show_code_hint: bool,
+    /// 精确匹配模式（关闭前缀匹配，对齐 Go SingleCodeInput）。
+    pub single_code_input: bool,
+    /// 精确匹配空码补全：精确无候选且未满码时，从更长编码取首选（对齐 Go SingleCodeComplete）。
+    pub single_code_complete: bool,
 }
 
 /// 码表引擎
@@ -108,9 +112,27 @@ impl Engine for CodeTableEngine {
             }
         }
 
-        // 前缀匹配补充
-        for mut c in self.dm.search_prefix(input, limit) {
-            if seen.insert(c.text.clone()) {
+        // 前缀匹配补充（精确匹配模式下跳过）
+        if !self.opts.single_code_input {
+            for mut c in self.dm.search_prefix(input, limit) {
+                if seen.insert(c.text.clone()) {
+                    c.source = CandidateSource::CodeTable;
+                    candidates.push(c);
+                }
+            }
+        } else if self.opts.single_code_complete
+            && candidates.is_empty()
+            && input.chars().count() < self.max_code_length
+        {
+            // 空码补全：从更长编码取首个候选作提示（对齐 Go 仅取 1 个）。
+            // limit=8：仅需第一个 code != input 者，取 8 条留少量余量以跳过与输入同码项，
+            // 避免全量前缀扫描开销。
+            if let Some(mut c) = self
+                .dm
+                .search_prefix(input, 8)
+                .into_iter()
+                .find(|c| c.code != input)
+            {
                 c.source = CandidateSource::CodeTable;
                 candidates.push(c);
             }
@@ -340,5 +362,52 @@ mod tests {
         let e = engine_with(&[("aaaa", "工", 100)], false, 4);
         let r = e.convert("aaaa", 50).unwrap();
         assert!(!r.should_commit);
+    }
+
+    #[test]
+    fn single_code_input_disables_prefix() {
+        // 词典：精确 "aa"→"式"，更长 "aab"→"想"。开启精确匹配后 "aa" 只应出 "式"。
+        let e = engine_opts(
+            &[("aa", "式", 100), ("aab", "想", 90)],
+            CommitOptions {
+                single_code_input: true,
+                ..Default::default()
+            },
+        );
+        let r = e.convert("aa", 50).unwrap();
+        assert_eq!(r.candidates.len(), 1, "精确匹配模式不应含前缀候选");
+        assert_eq!(r.candidates[0].text, "式");
+    }
+
+    #[test]
+    fn single_code_complete_fills_from_longer_code() {
+        // 无 "ab" 精确项；补全应从 "abc"→"你" 取首选，且仅一个。
+        let e = engine_opts(
+            &[("abc", "你", 100), ("abd", "他", 90)],
+            CommitOptions {
+                single_code_input: true,
+                single_code_complete: true,
+                show_code_hint: true,
+                ..Default::default()
+            },
+        );
+        let r = e.convert("ab", 50).unwrap();
+        assert_eq!(r.candidates.len(), 1, "空码补全仅取首选");
+        assert_eq!(r.candidates[0].text, "你");
+        assert_eq!(r.candidates[0].comment, "c", "补全候选应标注剩余编码");
+        assert!(!r.should_commit, "补全候选不应触发自动上屏");
+    }
+
+    #[test]
+    fn single_code_complete_off_yields_empty() {
+        let e = engine_opts(
+            &[("abc", "你", 100)],
+            CommitOptions {
+                single_code_input: true,
+                ..Default::default()
+            },
+        );
+        let r = e.convert("ab", 50).unwrap();
+        assert!(r.is_empty, "补全关闭时无精确匹配应为空");
     }
 }

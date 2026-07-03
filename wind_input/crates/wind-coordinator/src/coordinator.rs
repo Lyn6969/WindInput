@@ -3181,6 +3181,42 @@ impl MessageHandler for Coordinator {
                     KeyAction::Consumed
                 }
             }
+            keymap::VK_QUOTE | keymap::VK_BACKTICK
+                if data.modifiers & MOD_SHIFT == 0
+                    && !state.input_buffer.is_empty()
+                    && self.pinyin_separator_key(data.key_code) =>
+            {
+                // 拼音手动音节分隔符：把 `'` 压入缓冲作硬边界（引擎按 `'` 强制切分、查询前剥除、
+                // preedit 原样保留含末尾 `'`）。走与字母键一致的候选刷新路径。
+                // 置于选词/标点分派（`_` 臂）之前：分隔符模式下该键优先作分隔符而非三选键——
+                // auto 模式仅在 `'` 未被占作选择键时才拦截 `'`（见 pinyin_separator_key）。
+                state.input_buffer.push('\'');
+                match self.update_candidates(&mut state) {
+                    InputOutcome::AutoCommit(text) => {
+                        let source = state
+                            .candidates
+                            .first()
+                            .map(|c| c.source)
+                            .unwrap_or_default();
+                        let out = self.commit_candidate(&mut state, &text, source);
+                        self.notify_ui_hide();
+                        return Self::commit_action(out, true);
+                    }
+                    InputOutcome::Clear => {
+                        state.input_buffer.clear();
+                        state.candidates.clear();
+                        self.notify_ui_hide();
+                        return KeyAction::ClearComposition;
+                    }
+                    InputOutcome::Normal => {}
+                }
+                let display = state.preedit.clone();
+                self.notify_ui_update(&state);
+                KeyAction::UpdateComposition {
+                    caret_pos: display.chars().count() as u32,
+                    text: display,
+                }
+            }
             _ => {
                 let shift = data.modifiers & MOD_SHIFT != 0;
                 // 触发键优先级链（对齐 Go decideBufferedTrigger，缓冲非空/有候选时）：

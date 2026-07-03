@@ -45,6 +45,9 @@ pub struct FreqSettings {
     pub enabled: bool,
     /// used-first 内的排序策略（全局 schema.codetable.frequency.strategy；仅码表用）。
     pub strategy: FreqStrategy,
+    /// 呈现层前 N 位保护（全局 schema.codetable.frequency.protect_top_n；仅码表用）。
+    /// 重排前记录基础序前 N 个候选，重排后原序回填——优先级高于词频，默认 0 = 空保护集。
+    pub protect_top_n: usize,
 }
 
 impl Default for FreqSettings {
@@ -52,6 +55,7 @@ impl Default for FreqSettings {
         Self {
             enabled: false,
             strategy: FreqStrategy::Step,
+            protect_top_n: 0,
         }
     }
 }
@@ -231,6 +235,41 @@ impl EngineManager {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .show_code_hint
+    }
+
+    /// 拼音分隔符模式（auto/quote/backtick/none）的原始配置值。
+    /// 分隔符键的最终判定（含 auto 动态避让候选选择键）在协调器侧完成——
+    /// 因「`'` 是否为选择键」需读 `select_key_groups`（协调器配置），引擎无该信息。
+    pub fn pinyin_separator_mode(&self) -> String {
+        self.pinyin
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .separator
+            .clone()
+    }
+
+    /// 当前活跃拼音方案是否为双拼（`engine.pinyin.scheme == "shuangpin"`）。
+    /// 双拼不支持手动音节分隔符（`'` 会进 buffer 但引擎 convert 前剥除，致 buffer 与 preedit
+    /// 发散、Backspace 删不可见字符），供协调器 gate。复用韵母键集缓存（Some 即双拼），
+    /// 与 `shuangpin_final_key` 同源、方案切换/reload 自动失效。
+    pub fn pinyin_is_shuangpin(&self) -> bool {
+        let active_id = self.active_schema_id();
+        {
+            let cache = self
+                .shuangpin_finals_cache
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            if cache.0 == active_id {
+                return cache.1.is_some();
+            }
+        }
+        let finals_set = self.build_shuangpin_finals(&active_id);
+        let is_sp = finals_set.is_some();
+        *self
+            .shuangpin_finals_cache
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = (active_id, finals_set);
+        is_sp
     }
 
     /// 活跃方案为双拼且 `key`（ASCII 字节）是其布局的韵母键时返回 true，否则 false。
@@ -953,6 +992,7 @@ impl EngineManager {
             } else {
                 def.half_life_hours
             },
+            recency_peak: pf.frequency.recency_peak.max(0.0),
         }
     }
 
@@ -1002,16 +1042,18 @@ impl EngineManager {
         let is_pinyin = matches!(self.schema_engine_type(&id).as_deref(), Some("pinyin"));
         let settings = if is_pinyin {
             let pf = self.pinyin.lock().unwrap_or_else(|e| e.into_inner());
-            // 拼音 strategy 字段不参与（仅码表 used-first 排序用），取默认。
+            // 拼音 strategy/protect_top_n 字段不参与（仅码表 used-first 排序用），取默认。
             FreqSettings {
                 enabled: pf.frequency.enabled,
                 strategy: FreqStrategy::Step,
+                protect_top_n: 0,
             }
         } else {
             let ct = self.codetable.lock().unwrap_or_else(|e| e.into_inner());
             FreqSettings {
                 enabled: ct.frequency.enabled,
                 strategy: Self::parse_freq_strategy(&ct.frequency.strategy),
+                protect_top_n: ct.frequency.protect_top_n,
             }
         };
         self.freq_cache
@@ -1192,6 +1234,7 @@ impl EngineManager {
                 block_on_pinyin,
                 mix_cfg.pinyin_only_overflow,
                 mix_cfg.top_code_override_pinyin,
+                mix_cfg.show_source_hint,
             )));
         }
 
@@ -1287,6 +1330,8 @@ impl EngineManager {
                 clear_on_empty_max: eff.clear_on_empty_max,
                 top_code_commit: eff.top_code_commit,
                 show_code_hint: eff.show_code_hint,
+                single_code_input: eff.single_code_input,
+                single_code_complete: eff.single_code_complete,
             };
             // 码表引擎经 DictManager(CompositeDict) 查询。系统词库不再合并成单个 combined，
             // 而是主库 + 每个扩展（含禁用）各自一个 System 层，查询期由 composite 合并去重。

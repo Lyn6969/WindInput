@@ -10,7 +10,7 @@
 //! 后置：英文候选、简拼长度惩罚（HasFullSyllable）、convertMixedOverflow 精细档。
 
 use crate::engine::{ConvertResult, Engine, EngineType};
-use wind_candidate::Candidate;
+use wind_candidate::{Candidate, CandidateSource};
 
 /// 短语候选提权（高于拼音、低于码表词）
 const PHRASE_WEIGHT_BOOST: i32 = 1_000_000;
@@ -39,6 +39,9 @@ pub struct MixedEngine {
     top_code_override_pinyin: bool,
     /// 主码表最大码长（构建期由 primary.max_code_length() 注入；0 表示未知/不启用溢出分支）。
     max_code_len: usize,
+    /// 候选来源标记（对齐 Go addSourceHints）：true 时给拼音候选 comment 加「拼」前缀，
+    /// 帮助用户区分混输候选来源。默认 false（零回归）。
+    show_source_hint: bool,
 }
 
 impl MixedEngine {
@@ -51,6 +54,7 @@ impl MixedEngine {
         auto_commit_block_on_pinyin: bool,
         pinyin_only_overflow: bool,
         top_code_override_pinyin: bool,
+        show_source_hint: bool,
     ) -> Self {
         let max_code_len = primary.max_code_length();
         Self {
@@ -62,6 +66,7 @@ impl MixedEngine {
             pinyin_only_overflow,
             top_code_override_pinyin,
             max_code_len,
+            show_source_hint,
         }
     }
 
@@ -116,6 +121,19 @@ impl MixedEngine {
         }
     }
 
+    /// 来源标记（对齐 Go addSourceHints）：给拼音候选 comment 加「拼」前缀，助用户区分混输来源。
+    fn add_source_hints(candidates: &mut [Candidate]) {
+        for c in candidates.iter_mut() {
+            if c.source == CandidateSource::Pinyin {
+                if c.comment.is_empty() {
+                    c.comment = "拼".to_string();
+                } else {
+                    c.comment = format!("拼|{}", c.comment);
+                }
+            }
+        }
+    }
+
     /// 超长输入（input_len > max_code_len）分支：按 pinyin_only_overflow 分流。
     /// - true（默认）：仅查拼音；长码特例下（完整 input 有精确/更长后继）追加码表候选。
     /// - false：码表取前 N 码（+ 长码特例追加完整 input）+ 拼音完整输入，混合竞争。
@@ -135,7 +153,7 @@ impl MixedEngine {
             let pinyin_preedit = Self::pinyin_preedit_of(&py);
             let mut pinyin = py.candidates;
             // 长码特例：完整 input 在码表有精确/更长后继 → 追加码表候选，拼音归一化降档避免档位重叠。
-            let merged = if has_full_or_longer {
+            let mut merged = if has_full_or_longer {
                 Self::normalize_pinyin(&mut pinyin);
                 let mut ct = self
                     .primary
@@ -147,6 +165,9 @@ impl MixedEngine {
             } else {
                 pinyin
             };
+            if self.show_source_hint {
+                Self::add_source_hints(&mut merged);
+            }
             let is_empty = merged.is_empty();
             ConvertResult {
                 candidates: merged,
@@ -175,7 +196,10 @@ impl MixedEngine {
             let pinyin_preedit = Self::pinyin_preedit_of(&py);
             let mut pinyin = py.candidates;
             Self::normalize_pinyin(&mut pinyin);
-            let merged = Self::merge_sort_dedup(codetable, pinyin, max_candidates);
+            let mut merged = Self::merge_sort_dedup(codetable, pinyin, max_candidates);
+            if self.show_source_hint {
+                Self::add_source_hints(&mut merged);
+            }
             let is_empty = merged.is_empty();
             ConvertResult {
                 candidates: merged,
@@ -262,6 +286,9 @@ impl Engine for MixedEngine {
         let mut seen = std::collections::HashSet::new();
         merged.retain(|c| seen.insert(c.text.clone()));
         merged.truncate(max_candidates);
+        if self.show_source_hint {
+            Self::add_source_hints(&mut merged);
+        }
 
         // 全码自动上屏重评（对齐 Go recheckAutoCommit）：取主码表意向，
         // 但若开启拼音守护且存在拼音候选则否决（输入可能是拼音，留给用户选）；
@@ -363,7 +390,7 @@ mod tests {
     fn mixed_propagates_auto_commit_without_pinyin() {
         // 主码表唯一全码自动上屏；无次引擎 → 无拼音候选 → 放行。
         let primary = ct_engine(&[("aaaa", "工", 100)], true);
-        let e = MixedEngine::new(primary, None, 2, 10_000_000, true, true, false);
+        let e = MixedEngine::new(primary, None, 2, 10_000_000, true, true, false, false);
         let r = e.convert("aaaa", 50).unwrap();
         assert!(r.should_commit, "无拼音候选时应放行全码上屏");
         assert_eq!(r.commit_text, "工");
@@ -374,7 +401,16 @@ mod tests {
         // 次引擎对同一输入也产出候选（模拟拼音命中）+ 守护开 → 否决上屏。
         let primary = ct_engine(&[("aaaa", "工", 100)], true);
         let secondary = ct_engine(&[("aaaa", "啊啊", 50)], false);
-        let e = MixedEngine::new(primary, Some(secondary), 2, 10_000_000, true, true, false);
+        let e = MixedEngine::new(
+            primary,
+            Some(secondary),
+            2,
+            10_000_000,
+            true,
+            true,
+            false,
+            false,
+        );
         let r = e.convert("aaaa", 50).unwrap();
         assert!(!r.should_commit, "有拼音候选且守护开时应否决全码上屏");
     }
@@ -384,7 +420,16 @@ mod tests {
         // 守护关 → 即便有拼音候选也放行。
         let primary = ct_engine(&[("aaaa", "工", 100)], true);
         let secondary = ct_engine(&[("aaaa", "啊啊", 50)], false);
-        let e = MixedEngine::new(primary, Some(secondary), 2, 10_000_000, false, true, false);
+        let e = MixedEngine::new(
+            primary,
+            Some(secondary),
+            2,
+            10_000_000,
+            false,
+            true,
+            false,
+            false,
+        );
         let r = e.convert("aaaa", 50).unwrap();
         assert!(r.should_commit, "守护关时应放行");
         assert_eq!(r.commit_text, "工");
@@ -425,12 +470,39 @@ mod tests {
             true,
             true,
             false,
+            false,
         );
         assert_eq!(
             e.handle_top_code("wangb"),
             None,
             "override 关时应抑制顶码（拼音保护）"
         );
+    }
+
+    #[test]
+    fn source_hint_marks_pinyin_candidates() {
+        let mut cands = vec![
+            Candidate {
+                text: "工".into(),
+                source: CandidateSource::CodeTable,
+                ..Default::default()
+            },
+            Candidate {
+                text: "你好".into(),
+                source: CandidateSource::Pinyin,
+                ..Default::default()
+            },
+            Candidate {
+                text: "拟".into(),
+                source: CandidateSource::Pinyin,
+                comment: "ni".into(),
+                ..Default::default()
+            },
+        ];
+        MixedEngine::add_source_hints(&mut cands);
+        assert_eq!(cands[0].comment, "", "码表候选不标记");
+        assert_eq!(cands[1].comment, "拼");
+        assert_eq!(cands[2].comment, "拼|ni", "已有 comment 时前置拼接");
     }
 
     #[test]
@@ -445,6 +517,7 @@ mod tests {
             true,
             true,
             true,
+            false,
         );
         assert_eq!(
             e.handle_top_code("wangb"),

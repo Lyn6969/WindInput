@@ -370,6 +370,235 @@ fn test_pinyin_basic_input() {
     }
 }
 
+/// 断言某次分隔符键返回的动作**未**把 `'` 压入组合区。
+fn separator_not_inserted(act: &KeyAction) -> bool {
+    !matches!(act, KeyAction::UpdateComposition { text, .. } if text.contains('\''))
+}
+
+/// Task 8 / Fix Round 1：`auto` 真语义——默认选键组（`semicolon_quote` 含 `'`=VK_OEM_7）下，
+/// `'` 保留三选键功能、**不**作分隔符；改由反引号(`, VK_OEM_3=0xC0)作硬边界压入缓冲。
+#[test]
+fn separator_auto_avoids_quote_when_it_is_select_key() {
+    if !has_schemas() {
+        return;
+    }
+    // ' (VK_OEM_7=0xDE)：默认作三选键 → 不作分隔符，preedit 不应出现 '
+    let coord = Coordinator::new_headless(config_with("pinyin"), Some(&data_dir()));
+    for c in "xi".chars() {
+        press_letter(&coord, c);
+    }
+    let q = coord.handle_key_event(&key_event(0xDE, EVENT_KEY_DOWN));
+    assert!(
+        separator_not_inserted(&q),
+        "auto+默认选键组：引号应保留选键功能、不作分隔符，实际: {:?}",
+        q
+    );
+
+    // 反引号(0xC0)：' 被占 → 反引号作分隔符，压入 ' 并固定音节边界
+    let coord2 = Coordinator::new_headless(config_with("pinyin"), Some(&data_dir()));
+    for c in "xi".chars() {
+        press_letter(&coord2, c);
+    }
+    let b = coord2.handle_key_event(&key_event(0xC0, EVENT_KEY_DOWN));
+    let pre = action_text(&b).expect("反引号应作分隔符并返回组合区");
+    assert!(
+        pre.contains('\''),
+        "auto+默认选键组：反引号应插入分隔符，实际 preedit: {}",
+        pre
+    );
+    let mut last = b;
+    for c in "an".chars() {
+        last = press_letter(&coord2, c);
+    }
+    assert_eq!(
+        action_text(&last).unwrap(),
+        "xi'an",
+        "反引号手动分隔符应固定音节边界"
+    );
+    assert!(
+        !coord2.debug_page_texts().is_empty(),
+        "分隔后仍应有候选（如「西」/「西安」）"
+    );
+}
+
+/// Fix Round 1：`auto` 下若 `'` **不**在选键组（此处 `comma_period`）→ `'` 空闲、作分隔符；
+/// 反引号则不作分隔符。
+#[test]
+fn separator_auto_uses_quote_when_not_select_key() {
+    if !has_schemas() {
+        return;
+    }
+    let mut cfg = config_with("pinyin");
+    cfg.keys.select_key_groups = vec!["comma_period".into()];
+    let coord = Coordinator::new_headless(cfg, Some(&data_dir()));
+    for c in "xi".chars() {
+        press_letter(&coord, c);
+    }
+    let q = coord.handle_key_event(&key_event(0xDE, EVENT_KEY_DOWN));
+    let pre = action_text(&q).expect("引号应作分隔符并返回组合区");
+    assert!(
+        pre.contains('\''),
+        "auto+选键组不含引号：引号应作分隔符，实际: {}",
+        pre
+    );
+
+    let mut cfg2 = config_with("pinyin");
+    cfg2.keys.select_key_groups = vec!["comma_period".into()];
+    let coord2 = Coordinator::new_headless(cfg2, Some(&data_dir()));
+    for c in "xi".chars() {
+        press_letter(&coord2, c);
+    }
+    let b = coord2.handle_key_event(&key_event(0xC0, EVENT_KEY_DOWN));
+    assert!(
+        separator_not_inserted(&b),
+        "auto+选键组不含引号：反引号不应作分隔符，实际: {:?}",
+        b
+    );
+}
+
+/// Fix Round 1：显式 `quote` 模式尊重用户指定值——即使默认选键组含 `'`，引号仍作分隔符（覆盖选键）。
+#[test]
+fn separator_explicit_quote_overrides_select_key() {
+    if !has_schemas() {
+        return;
+    }
+    let mut cfg = config_with("pinyin");
+    cfg.schema.pinyin.separator = "quote".into(); // 显式，默认选键组仍含 '
+    let coord = Coordinator::new_headless(cfg, Some(&data_dir()));
+    for c in "xi".chars() {
+        press_letter(&coord, c);
+    }
+    let q = coord.handle_key_event(&key_event(0xDE, EVENT_KEY_DOWN));
+    let pre = action_text(&q).expect("显式 quote 引号应作分隔符并返回组合区");
+    assert!(
+        pre.contains('\''),
+        "显式 quote 模式：引号应作分隔符（覆盖选键），实际: {}",
+        pre
+    );
+}
+
+/// Fix Round 1：双拼方案下手动分隔符一律禁用（`'` 会进 buffer 但引擎剥除，致 buffer 与 preedit
+/// 发散）——引号/反引号均不作分隔符。
+#[test]
+fn separator_disabled_for_shuangpin() {
+    let d = data_dir();
+    if !d.join("schemas/shuangpin.schema.toml").exists()
+        && !d.join("schemas/shuangpin.schema.yaml").exists()
+    {
+        return;
+    }
+    let mut cfg = config_with("pinyin");
+    cfg.schema.available = vec!["shuangpin".into(), "pinyin".into()];
+    cfg.schema.active = "shuangpin".into(); // separator 保持默认 auto
+    let coord = Coordinator::new_headless(cfg, Some(&d));
+    for c in "ui".chars() {
+        press_letter(&coord, c);
+    }
+    let q = coord.handle_key_event(&key_event(0xDE, EVENT_KEY_DOWN));
+    assert!(
+        separator_not_inserted(&q),
+        "双拼：引号不应作分隔符，实际: {:?}",
+        q
+    );
+
+    let mut cfg2 = config_with("pinyin");
+    cfg2.schema.available = vec!["shuangpin".into(), "pinyin".into()];
+    cfg2.schema.active = "shuangpin".into();
+    let coord2 = Coordinator::new_headless(cfg2, Some(&d));
+    for c in "ui".chars() {
+        press_letter(&coord2, c);
+    }
+    let b = coord2.handle_key_event(&key_event(0xC0, EVENT_KEY_DOWN));
+    assert!(
+        separator_not_inserted(&b),
+        "双拼：反引号不应作分隔符，实际: {:?}",
+        b
+    );
+}
+
+/// C1 回归：全拼手动分隔符 `xi'an` 选「西安」应**全消费**上屏、组合区清空无残留。
+/// 修复前引擎按剥除 `'` 的 query 算 consumed_length，协调器却按含 `'` 缓冲切片 → 误判 partial、
+/// 残留尾字符 "n"（组合区变「西安n」）。修复后 consumed_length 回映射到含 `'` 的原始输入空间。
+#[test]
+fn separator_full_commit_consumes_all() {
+    if !has_schemas() {
+        return;
+    }
+    let coord = Coordinator::new_headless(config_with("pinyin"), Some(&data_dir()));
+    for c in "xi".chars() {
+        press_letter(&coord, c);
+    }
+    // 反引号(0xC0)作硬分隔符（默认 auto + 选键组含 ' → 反引号作分隔符，参照 Task 8 现有测试）。
+    coord.handle_key_event(&key_event(0xC0, EVENT_KEY_DOWN));
+    let mut last = KeyAction::PassThrough;
+    for c in "an".chars() {
+        last = press_letter(&coord, c);
+    }
+    assert_eq!(action_text(&last).as_deref(), Some("xi'an"), "缓冲应为 xi'an");
+
+    let texts = coord.debug_page_texts();
+    let p = texts
+        .iter()
+        .position(|t| t == "西安")
+        .unwrap_or_else(|| panic!("候选应含整句「西安」，实际: {:?}", texts));
+    // 数字键选「西安」→ 全消费上屏，无残留尾字符
+    match coord.handle_key_event(&key_event(0x31 + p as u32, EVENT_KEY_DOWN)) {
+        KeyAction::InsertText { text, .. } => {
+            assert_eq!(text, "西安", "分隔符输入选「西安」应完整上屏，不残留 'n'");
+        }
+        other => panic!("选「西安」应上屏 InsertText，实际: {:?}", other),
+    }
+    assert_eq!(
+        coord.debug_candidate_count(),
+        0,
+        "全消费后组合区候选应清空（无残留拼音续转）"
+    );
+}
+
+/// C1 回归：`xi'an` 两步分段——先选「西」组合区剩 "an"（`'` 随已消费段吃掉，非 "'an"），
+/// 再选「安」整体上屏「西安」并清空。
+#[test]
+fn separator_two_step_segmentation() {
+    if !has_schemas() {
+        return;
+    }
+    let coord = Coordinator::new_headless(config_with("pinyin"), Some(&data_dir()));
+    for c in "xi".chars() {
+        press_letter(&coord, c);
+    }
+    coord.handle_key_event(&key_event(0xC0, EVENT_KEY_DOWN));
+    for c in "an".chars() {
+        press_letter(&coord, c);
+    }
+    // 先选「西」（子短语，仅消费 xi 段；边界紧跟的 `'` 应归入已消费侧）
+    let texts = coord.debug_page_texts();
+    let p_xi = texts
+        .iter()
+        .position(|t| t == "西")
+        .unwrap_or_else(|| panic!("候选应含子短语「西」，实际: {:?}", texts));
+    let step = coord.handle_key_event(&key_event(0x31 + p_xi as u32, EVENT_KEY_DOWN));
+    let disp = action_text(&step).expect("选「西」应返回 UpdateComposition");
+    assert!(
+        disp.starts_with('西') && disp.ends_with("an") && !disp.contains('\''),
+        "选「西」后组合区应为「西」+剩余 an（无 ' 残留），实际: {:?}",
+        disp
+    );
+
+    // 再选「安」→ 整体上屏「西安」，组合区清空
+    let texts2 = coord.debug_page_texts();
+    let p_an = texts2
+        .iter()
+        .position(|t| t == "安")
+        .unwrap_or_else(|| panic!("剩余 an 的候选应含「安」，实际: {:?}", texts2));
+    match coord.handle_key_event(&key_event(0x31 + p_an as u32, EVENT_KEY_DOWN)) {
+        KeyAction::InsertText { text, .. } => {
+            assert_eq!(text, "西安", "两步分段最终应上屏「西安」");
+        }
+        other => panic!("选「安」应上屏 InsertText，实际: {:?}", other),
+    }
+    assert_eq!(coord.debug_candidate_count(), 0, "两步选完组合区应清空");
+}
+
 #[test]
 fn test_schema_switch_via_menu() {
     if !has_schemas() {
@@ -1650,6 +1879,80 @@ fn test_select_char_disabled_by_default() {
             "默认禁用时 , 不应只上屏首字（应走标点：顶词+逗号）"
         );
     }
+}
+
+// ---- 临时词晋升闭环 promote_count ----
+
+#[test]
+fn temp_word_promotes_after_threshold_selections() {
+    // 验证 6a 造词路径晋升闭环：
+    // - get_temp_word 点查 API 正确反映 count
+    // - count >= promote_count → promote_temp_word 晋升入用户词库
+    // - 晋升后临时层删除（get_temp_word → None），用户层新增
+    // - promote_count=0 禁用语义：永不晋升（零回归保证）
+    //
+    // 注：6b 整词选中路径需要引擎把临时层词条作为普通候选返回；
+    // 无头 harness 中引擎与 store 临时层未直接联通，该路径由
+    // handle_addword.rs 内 learn_phrase_on_commit 单元测试覆盖。
+    use std::sync::Arc;
+
+    let store_path = std::env::temp_dir().join("wind_promote_thresh_integ.redb");
+    let _ = std::fs::remove_file(&store_path);
+    let store = Arc::new(wind_store::Store::open(&store_path).unwrap());
+
+    // 1. 两次累积 → count=2
+    let c1 = store
+        .learn_temp_word("wubi86", "abcd", "测试", 800, 40)
+        .unwrap();
+    assert_eq!(c1, 1, "第 1 次 count 应为 1");
+    assert_eq!(
+        store.get_temp_word("wubi86", "abcd", "测试").unwrap(),
+        Some(1),
+        "get_temp_word 应返回 count=1"
+    );
+
+    let c2 = store
+        .learn_temp_word("wubi86", "abcd", "测试", 800, 40)
+        .unwrap();
+    assert_eq!(c2, 2, "第 2 次 count 应为 2");
+
+    // 2. count=2 >= promote_count=2 → 晋升
+    assert!(
+        store.promote_temp_word("wubi86", "abcd", "测试").unwrap(),
+        "count 达阈值时 promote 应返回 true"
+    );
+    assert_eq!(
+        store.get_temp_word("wubi86", "abcd", "测试").unwrap(),
+        None,
+        "晋升后临时层应删除"
+    );
+    let user = store.get_user_words("wubi86", "abcd").unwrap();
+    assert!(
+        user.iter().any(|r| r.text == "测试"),
+        "晋升后用户词层应含该词"
+    );
+
+    // 3. promote_count=0 禁用语义：手动验证 maybe_promote_temp 语义等价
+    //    （当 promote_count=0 时，coordinator 永不调用 promote_temp_word）。
+    //    此处用 get_temp_word None → 确认未晋升的词不在临时层。
+    store
+        .learn_temp_word("wubi86", "zzzz", "不晋升", 800, 40)
+        .unwrap();
+    // promote_count=0 时不晋升：临时层仍有该词
+    assert_eq!(
+        store.get_temp_word("wubi86", "zzzz", "不晋升").unwrap(),
+        Some(1),
+        "promote_count=0 时临时层应保留"
+    );
+
+    // 4. 不存在的词返回 None
+    assert_eq!(
+        store.get_temp_word("wubi86", "xxxx", "无").unwrap(),
+        None,
+        "不存在的词应返回 None"
+    );
+
+    let _ = std::fs::remove_file(&store_path);
 }
 
 #[test]

@@ -30,6 +30,8 @@ pub struct FreqProfile {
     pub base_scale: f64,
     /// 衰减半衰期（小时）
     pub half_life_hours: f64,
+    /// 近用峰值加成：与使用次数无关，随半衰期自然消退；=0 退化为原公式
+    pub recency_peak: f64,
 }
 
 impl Default for FreqProfile {
@@ -37,12 +39,14 @@ impl Default for FreqProfile {
         Self {
             base_scale: 100.0,
             half_life_hours: 72.0,
+            recency_peak: 0.0,
         }
     }
 }
 
 impl FreqProfile {
-    /// 拼音词频衰减分（frequency.md §4）：`base_scale * log2(count+1) * exp(-ln2*age/half_life)`。
+    /// 拼音词频衰减分（frequency.md §4）：
+    /// `(base_scale * log2(count+1) + recency_peak) * exp(-ln2*age/half_life)`。
     /// 最近+高频 → 分高；久未用 → 衰减回落。count=0 返回 0。
     pub fn pinyin_score(&self, rec: &FreqRecord, now: i64) -> f64 {
         if rec.count == 0 {
@@ -50,7 +54,7 @@ impl FreqProfile {
         }
         let age_hours = (now - rec.last_used).max(0) as f64 / 3600.0;
         let decay = (-std::f64::consts::LN_2 * age_hours / self.half_life_hours).exp();
-        self.base_scale * ((rec.count + 1) as f64).log2() * decay
+        (self.base_scale * ((rec.count + 1) as f64).log2() + self.recency_peak) * decay
     }
 }
 
@@ -373,6 +377,36 @@ mod tests {
         assert_eq!(s.list_freq_paged("py", "", 0, 0).unwrap().1, 0);
         assert_eq!(s.list_freq_paged("wb", "", 0, 0).unwrap().1, 1);
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn recency_peak_boosts_fresh_record() {
+        let base = FreqProfile {
+            base_scale: 100.0,
+            half_life_hours: 72.0,
+            recency_peak: 0.0,
+        };
+        let peaked = FreqProfile {
+            recency_peak: 500.0,
+            ..base
+        };
+        let now = 1_000_000i64;
+        let fresh = FreqRecord {
+            count: 1,
+            last_used: now,
+        };
+        let diff = peaked.pinyin_score(&fresh, now) - base.pinyin_score(&fresh, now);
+        assert!(
+            (diff - 500.0).abs() < 1e-6,
+            "刚用过的记录应获得完整峰值加成，got {diff}"
+        );
+
+        let stale = FreqRecord {
+            count: 1,
+            last_used: now - 30 * 24 * 3600,
+        };
+        let stale_diff = peaked.pinyin_score(&stale, now) - base.pinyin_score(&stale, now);
+        assert!(stale_diff < 1.0, "峰值加成应随衰减消退，got {stale_diff}");
     }
 
     #[test]

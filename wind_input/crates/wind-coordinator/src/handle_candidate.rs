@@ -2,7 +2,10 @@
 //!
 //! 从 coordinator.rs 拆出（同 crate 内 `impl Coordinator` 块，组织性重构，无逻辑变更）。
 
-use crate::coordinator::{Coordinator, InputOutcome, PHRASE_WEIGHT_BASE, State, now_unix_secs};
+use crate::coordinator::{
+    Coordinator, InputOutcome, LEARN_ADD_WEIGHT, LEARN_WEIGHT_DELTA, PHRASE_WEIGHT_BASE, State,
+    now_unix_secs,
+};
 use crate::pipeline::ModeKind;
 use tracing::{debug, warn};
 use wind_bridge::handler::{KeyAction, KeyEventData};
@@ -123,6 +126,7 @@ impl Coordinator {
                 &recs,
                 code,
                 settings.strategy,
+                settings.protect_top_n,
             );
         }
     }
@@ -456,6 +460,38 @@ impl Coordinator {
         None
     }
 
+    /// 拼音手动音节分隔符判定的单一入口：`key_code` 是否应作为分隔符 `'` 压入缓冲。
+    ///
+    /// 每次按键实时求值（不缓存），使 `separator` 或 `select_key_groups` 热更新即时生效。
+    /// 规则（对齐 Go `pinyin_mode_shared.go` 真 `auto` 语义）：
+    /// - 非拼音引擎 / 双拼方案 → 恒 false（双拼 buffer 会与 preedit 发散）。
+    /// - `none` → false；`quote` → 仅引号键(VK_QUOTE)；`backtick` → 仅反引号键(VK_BACKTICK)。
+    ///   显式模式尊重用户指定值，不做动态判定（显式 quote 即用户自选覆盖选键行为）。
+    /// - `auto`（默认/未知值）→ 动态避让候选选择键：若 `'`(VK_QUOTE) 当前展开为候选选择键
+    ///   （`select_key_offset` 命中，默认 `semicolon_quote` 即含 `'`），则保留其选键功能、
+    ///   改用反引号键作分隔符；否则 `'` 空闲，作分隔符（此时反引号不作分隔符）。
+    ///
+    /// 缓冲是否为空由调用方判定（空缓冲维持标点路径）。
+    pub(crate) fn pinyin_separator_key(&self, key_code: u32) -> bool {
+        use wind_keys::keymap::{VK_BACKTICK, VK_QUOTE};
+        if !self.engine_mgr.is_pinyin() || self.engine_mgr.pinyin_is_shuangpin() {
+            return false;
+        }
+        match self.engine_mgr.pinyin_separator_mode().as_str() {
+            "none" => false,
+            "quote" => key_code == VK_QUOTE,
+            "backtick" => key_code == VK_BACKTICK,
+            // auto（及其它未知值兜底）：' 被占作选择键 → 反引号作分隔符；否则 ' 作分隔符。
+            _ => {
+                if self.select_key_offset(VK_QUOTE).is_some() {
+                    key_code == VK_BACKTICK
+                } else {
+                    key_code == VK_QUOTE
+                }
+            }
+        }
+    }
+
     /// 若 key_code 是配置的以词定字键，返回取字下标（0=取第 1 字，1=取第 2 字）。
     /// 默认 `select_char_keys` 为空 → 恒返回 None（功能禁用，零回归）。
     pub(crate) fn select_char_index(&self, key_code: u32) -> Option<usize> {
@@ -647,9 +683,46 @@ impl Coordinator {
         } else {
             state
                 .committed_segs
-                .push((code, cand.text.clone(), cand.source));
+                .push((code.clone(), cand.text.clone(), cand.source));
             let final_simplified = format!("{}{}", state.committed_text, cand.text);
             self.learn_phrase_on_commit(state); // 自动造词（多段组成的词）
+            // 6b: 临时词使用累积（对齐 Go LearnWord-on-commit）：选中临时层候选也推进晋升计数。
+            // 点查代替候选层标记：一次 redb 读，未命中即非临时词，零成本略过。
+            // is_group/is_command 已在 commit_selected 入口提前返回；is_phrase 由本条件显式过滤
+            //（短语无临时词晋升语义），此处均为普通候选。
+            if !cand.is_phrase
+                && let Some(store) = &self.store
+            {
+                let active = self.engine_mgr.active_schema_id();
+                if let Some(schema) = self.engine_mgr.write_data_schema_id(&active, cand.source)
+                    && let Ok(Some(_)) = store.get_temp_word(&schema, &code, &cand.text)
+                {
+                    let promote_count = if self.engine_mgr.is_pinyin() {
+                        self.engine_mgr.auto_learn_settings().promote_count
+                    } else {
+                        self.engine_mgr
+                            .codetable_settings()
+                            .auto_phrase
+                            .promote_count
+                    };
+                    if let Ok(count) = store.learn_temp_word(
+                        &schema,
+                        &code,
+                        &cand.text,
+                        LEARN_ADD_WEIGHT,
+                        LEARN_WEIGHT_DELTA,
+                    ) {
+                        self.maybe_promote_temp(
+                            store,
+                            &schema,
+                            &code,
+                            &cand.text,
+                            count,
+                            promote_count,
+                        );
+                    }
+                }
+            }
             let out = self.maybe_s2t(state, &final_simplified);
             self.reset_pinyin_composition(state);
             self.notify_ui_hide();

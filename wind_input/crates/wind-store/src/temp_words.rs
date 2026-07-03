@@ -44,6 +44,23 @@ impl Store {
         })
     }
 
+    /// 点查临时词当前累积 count（无记录返回 None）。供协调器选词路径判断晋升。
+    pub fn get_temp_word(
+        &self,
+        schema: &str,
+        code: &str,
+        text: &str,
+    ) -> anyhow::Result<Option<u32>> {
+        let key = enc_key(schema, code, text);
+        self.with_db(|db| {
+            let txn = db.begin_read()?;
+            let t = txn.open_table(TEMP_WORDS)?;
+            Ok(t.get(key.as_str())?
+                .and_then(|g| dec_val(g.value()))
+                .map(|(_, c, _)| c))
+        })
+    }
+
     /// 仅当已存在时计数 +1、权重 +delta（不创建新条目）。返回 (是否存在, 新count)。
     pub fn increment_temp_if_exists(
         &self,
@@ -233,6 +250,32 @@ mod tests {
         let p = std::env::temp_dir().join(name);
         let _ = std::fs::remove_file(&p);
         p
+    }
+
+    #[test]
+    fn learn_count_reaches_threshold_then_promote() {
+        let path = tmp("wind_tw_promote_thresh.redb");
+        let s = Store::open(&path).unwrap();
+        for i in 1..=3u32 {
+            let n = s
+                .learn_temp_word("wubi86", "abcd", "测试", 100, 10)
+                .unwrap();
+            assert_eq!(n, i);
+        }
+        assert_eq!(
+            s.get_temp_word("wubi86", "abcd", "测试").unwrap(),
+            Some(3),
+            "3 次学习后 count 应为 3"
+        );
+        assert!(s.promote_temp_word("wubi86", "abcd", "测试").unwrap());
+        assert_eq!(
+            s.get_temp_word("wubi86", "abcd", "测试").unwrap(),
+            None,
+            "晋升后临时层应删除"
+        );
+        // 不存在的词返回 None
+        assert_eq!(s.get_temp_word("wubi86", "xxxx", "无").unwrap(), None);
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]
