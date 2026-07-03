@@ -3,6 +3,8 @@
 //! 与 Go 版本 `wind_input/internal/coordinator/` 对齐。
 
 pub mod coordinator;
+#[cfg(windows)]
+pub mod direct_switch;
 pub mod handle_addword;
 pub mod handle_candidate;
 pub mod handle_cmdbar;

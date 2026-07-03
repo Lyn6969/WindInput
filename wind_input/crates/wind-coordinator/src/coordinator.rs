@@ -43,6 +43,30 @@ use wind_ui::toast::{ToastKind, ToastPosition};
 /// 保证上方候选窗底边抬到正文之上而不遮挡。偏大只是多留空隙，故取一个稳妥的正文行高量级。
 const CARET_USE_TOP_MIN_LINE_H: i32 = 18;
 
+/// wind 修饰位（SHIFT=0x1/CTRL=0x2/ALT=0x4/WIN=0x8，见 wind-ipc MOD_*）→ Win32 位序
+/// （ALT=0x1/CTRL=0x2/SHIFT=0x4/WIN=0x8，即 ALT 与 SHIFT 互换）。
+/// RegisterHotKey 的 fsModifiers 与 DirectSwitchHotkeys 的 Modifiers 低位（TF_MOD_*）同用此位序。
+fn wind_mods_to_win32(mods: u32) -> u32 {
+    const WIN32_MOD_ALT: u32 = 0x0001;
+    const WIN32_MOD_CONTROL: u32 = 0x0002;
+    const WIN32_MOD_SHIFT: u32 = 0x0004;
+    const WIN32_MOD_WIN: u32 = 0x0008;
+    let mut win = 0u32;
+    if mods & MOD_SHIFT != 0 {
+        win |= WIN32_MOD_SHIFT;
+    }
+    if mods & MOD_CTRL != 0 {
+        win |= WIN32_MOD_CONTROL;
+    }
+    if mods & MOD_ALT != 0 {
+        win |= WIN32_MOD_ALT;
+    }
+    if mods & MOD_WIN != 0 {
+        win |= WIN32_MOD_WIN;
+    }
+    win
+}
+
 /// 取进程 ID 对应的可执行文件名（如 "Weixin.exe"）。对齐 Go `bridge.GetProcessName`：
 /// OpenProcess(QUERY_LIMITED_INFORMATION) + QueryFullProcessImageNameW，取末段文件名。
 /// 失败（进程已退出/权限不足）返回空串。
@@ -597,6 +621,11 @@ impl Coordinator {
         // 不依赖 IME 激活——全局热键的语义就是在本输入法未激活时也生效。
         coordinator.sync_global_hotkeys();
 
+        // 同步 activate_ime 到 DirectSwitchHotkeys 注册表：同样启动即同步（该热键的
+        // 语义就是在本输入法未激活时切换过来），且不依赖 UI 线程创建成功
+        // （Go 版把同步放在 UI 回调装配里，UI 创建失败会静默跳过——已规避）。
+        coordinator.sync_direct_switch_hotkey();
+
         // 后台预热：提前构建其余方案的引擎与缓存（拼音 merged/unigram、码表 per-dict），
         // 避免首次切换到拼音/临时拼音/码表时同步重熔大词库造成几十秒卡顿。
         // single-flight 构建锁保证预热与用户切换不重复构建；按方案顺序逐个建（后台低频）。
@@ -1053,6 +1082,7 @@ impl Coordinator {
                 self.reload_config(); // 刷新主题/工具栏（候选窗下次输入按新配置）
                 self.notify_toolbar(); // 工具栏显隐(visible/全屏)按新配置即时刷新
                 self.sync_global_hotkeys(); // keys.global_hotkeys 增删/改键即时生效
+                self.sync_direct_switch_hotkey(); // keys.activate_ime 改键/清空即时生效
                 self.show_toast(
                     "设置已更新",
                     ToastPosition::BottomCenter,
@@ -2202,11 +2232,6 @@ impl Coordinator {
     /// 对齐 Go buildGlobalHotkeyEntries：仅支持无需按键上下文的动作；
     /// activate_ime 不在此列（走 DirectSwitchHotkeys 注册表，不经 RegisterHotKey）。
     fn build_global_hotkey_entries(&self) -> Vec<GlobalHotkeyEntry> {
-        // Win32 RegisterHotKey 修饰位（与 wind-ipc MOD_* 位序不同：ALT 与 SHIFT 互换）
-        const WIN32_MOD_ALT: u32 = 0x0001;
-        const WIN32_MOD_CONTROL: u32 = 0x0002;
-        const WIN32_MOD_SHIFT: u32 = 0x0004;
-        const WIN32_MOD_WIN: u32 = 0x0008;
         let rt = self.rt();
         let k = &rt.config.keys;
         let supported: [(&str, &str); 7] = [
@@ -2230,22 +2255,9 @@ impl Coordinator {
             };
             // key_hash 布局 = (wind 修饰位 << 16) | vk（见 wind-config hotkey.rs）
             let (mods, vk) = (hash >> 16, hash & 0xFFFF);
-            let mut win_mods = 0u32;
-            if mods & MOD_SHIFT != 0 {
-                win_mods |= WIN32_MOD_SHIFT;
-            }
-            if mods & MOD_CTRL != 0 {
-                win_mods |= WIN32_MOD_CONTROL;
-            }
-            if mods & MOD_ALT != 0 {
-                win_mods |= WIN32_MOD_ALT;
-            }
-            if mods & MOD_WIN != 0 {
-                win_mods |= WIN32_MOD_WIN;
-            }
             entries.push(GlobalHotkeyEntry {
                 id: entries.len() as i32 + 1,
-                modifiers: win_mods,
+                modifiers: wind_mods_to_win32(mods),
                 vk,
                 action: name.clone(),
             });
@@ -2258,6 +2270,32 @@ impl Coordinator {
         let entries = self.build_global_hotkey_entries();
         debug!("sync_global_hotkeys: {} entries", entries.len());
         let _ = self.ui_tx.send(UiCommand::RegisterGlobalHotkeys(entries));
+    }
+
+    /// 同步 activate_ime 到 Windows DirectSwitchHotkeys 注册表（启动与配置热重载时调用）。
+    /// 该热键由 ctfmon 原生处理（per-app 切换到本输入法），本进程不参与按键分发；
+    /// 未配置/解析失败 → 仅清理注册表旧条目。非 Windows 平台为空操作。
+    pub(crate) fn sync_direct_switch_hotkey(&self) {
+        #[cfg(windows)]
+        {
+            let hotkey = self.rt().config.keys.activate_ime.trim().to_string();
+            let entry = if hotkey.is_empty() || hotkey.eq_ignore_ascii_case("none") {
+                None
+            } else {
+                match hotkey::parse_hotkey(&hotkey) {
+                    // DirectSwitch Modifiers 低位与 Win32 RegisterHotKey 同位序（TF_MOD_*）
+                    Some(hash) => Some((wind_mods_to_win32(hash >> 16), hash & 0xFFFF)),
+                    None => {
+                        warn!(
+                            "activate_ime 热键 {:?} 解析失败，仅清理注册表旧条目",
+                            hotkey
+                        );
+                        None
+                    }
+                }
+            };
+            crate::direct_switch::sync(&hotkey, entry);
+        }
     }
 
     /// 切换中英文时取消当前输入：清空缓冲/候选/preedit，并按 `hotkeys.commit_on_switch`

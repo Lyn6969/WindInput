@@ -31,6 +31,8 @@ fontdb = "0.22"
 
 [target.'cfg(windows)'.dependencies]
 windows = { workspace = true }
+# DirectSwitchHotkeys 注册表同步（direct_switch.rs）
+winreg = "0.52"
 
 [dev-dependencies]
 wind-config = { path = "../wind-config" }
