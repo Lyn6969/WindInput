@@ -237,6 +237,37 @@ impl EngineManager {
             .show_code_hint
     }
 
+    /// 拼音分隔符模式（auto/quote/backtick/none）。auto 在 Rust 等价 quote
+    /// （无「引号作第 3 选择键」的联动功能，故不做 Go 版 auto 的动态切换）。
+    pub fn pinyin_separator_mode(&self) -> String {
+        self.pinyin
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .separator
+            .clone()
+    }
+
+    /// 当前是否应把 `key_code` 作为拼音手动音节分隔符接受进组合。
+    /// 条件：活跃引擎为拼音类型，且分隔符模式与按键匹配——
+    /// `quote`/`auto` 对应引号键(VK_OEM_7=0xDE)，`backtick` 对应反引号键(VK_OEM_3=0xC0)，
+    /// `none` 恒 false。缓冲是否为空由协调器判定（空缓冲维持标点路径）。
+    ///
+    /// 注：混输方案暂不启用（保守，避免与码表候选/选词键冲突）；双拼方案虽为拼音类型，
+    /// 但引擎在 convert 前剥除 `'`，分隔符对双拼实际不生效（见 mod.rs 说明）。
+    pub fn pinyin_accepts_separator(&self, key_code: u32) -> bool {
+        if !self.is_pinyin() {
+            return false;
+        }
+        const VK_QUOTE: u32 = 0xDE; // ' " VK_OEM_7
+        const VK_BACKTICK: u32 = 0xC0; // ` ~ VK_OEM_3
+        match self.pinyin_separator_mode().as_str() {
+            "none" => false,
+            "backtick" => key_code == VK_BACKTICK,
+            // quote / auto（auto 等价 quote）/ 其它未知值 → 引号键
+            _ => key_code == VK_QUOTE,
+        }
+    }
+
     /// 活跃方案为双拼且 `key`（ASCII 字节）是其布局的韵母键时返回 true，否则 false。
     /// 供选词热键避让：正在输入双拼时，韵母键优先作编码输入而非触发选词（对齐 Go IsShuangpinFinalKey）。
     /// 内部按活跃方案 id 缓存韵母键集合，方案切换/reload/invalidate 时自动失效。

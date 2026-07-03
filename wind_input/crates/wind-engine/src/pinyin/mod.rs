@@ -148,7 +148,32 @@ impl PinyinEngine {
 
     /// 计算 preedit 显示与音节信息。
     /// `full_pinyin` 必须已是全拼串（调用方负责转换），本方法不再内部做双拼→全拼转换。
+    ///
+    /// 含手动分隔符 `'` 时：按 `'` 分段各自组合，段间以 `'` 重新连接——保留全部手动边界
+    /// （含开头 / 结尾 / 连续 `''`），使末尾 `'` 立即可见。段内仍走自动分词。
     fn compute_composition(&self, full_pinyin: &str) -> (String, Vec<String>, String) {
+        if !full_pinyin.contains('\'') {
+            return self.compose_segment(full_pinyin);
+        }
+        let mut all_syllables: Vec<String> = Vec::new();
+        let mut last_partial = String::new();
+        let mut rendered: Vec<String> = Vec::new();
+        for seg in full_pinyin.split('\'') {
+            if seg.is_empty() {
+                rendered.push(String::new());
+                continue;
+            }
+            let (seg_pre, seg_syls, seg_partial) = self.compose_segment(seg);
+            rendered.push(seg_pre);
+            all_syllables.extend(seg_syls);
+            last_partial = seg_partial;
+        }
+        let preedit = rendered.join("'");
+        (preedit, all_syllables, last_partial)
+    }
+
+    /// 对单个「无分隔符」片段做自动分词并组合 preedit（原 compute_composition 逻辑）。
+    fn compose_segment(&self, full_pinyin: &str) -> (String, Vec<String>, String) {
         let input = full_pinyin;
         let dag = Dag::build(input, &self.trie);
         let syllables = dag.maximum_match();
@@ -170,6 +195,20 @@ impl PinyinEngine {
             preedit = input.to_string();
         }
         (preedit, syllables, partial)
+    }
+
+    /// 尊重手动分隔符 `'` 的音节分段：按 `'` 切段、各段独立 DAG 最大匹配，
+    /// 拼接为纯音节序列（不含 `'`）。`'` 为硬边界，任何音节不得跨越。
+    /// 段内未成音节的残码（partial）不计入（仅用于 completed 音节序列）。
+    fn segment_with_separators(&self, input: &str) -> Vec<String> {
+        let mut syllables = Vec::new();
+        for seg in input.split('\'') {
+            if seg.is_empty() {
+                continue;
+            }
+            syllables.extend(Dag::build(seg, &self.trie).maximum_match());
+        }
+        syllables
     }
 
     /// 带模糊拼音扩展的词库查找（对齐 Go lookupWithFuzzy）。
@@ -256,6 +295,26 @@ impl PinyinEngine {
     }
 }
 
+/// 候选码 `code` 是否恰好落在前 k 个音节的边界上（`syllables[..k].join("") == code`）。
+/// 命中返回 `Some(k)`（k>=1）；不落任何边界（如前缀补全的超长码）返回 `None`。
+/// 供手动分隔符边界过滤：判断候选字数是否与所跨音节数一致。
+fn syllable_span(syllables: &[String], code: &str) -> Option<usize> {
+    if code.is_empty() {
+        return None;
+    }
+    let mut acc = String::new();
+    for (i, s) in syllables.iter().enumerate() {
+        acc.push_str(s);
+        if acc.len() > code.len() {
+            break;
+        }
+        if acc == code {
+            return Some(i + 1);
+        }
+    }
+    None
+}
+
 /// Fix A：用双拼原始按键重建 preedit（按音节边界以空格分隔）。
 /// 依次取每个已完成音节在原始输入中的字节区间 `raw[sp_start..sp_end]`；
 /// 若有 partial，把最后一个完成音节之后的剩余原始字节作为 partial 段追加。
@@ -287,6 +346,16 @@ impl Engine for PinyinEngine {
             return Ok(ConvertResult::default());
         }
 
+        // 双拼方案不支持手动音节分隔符 `'`：若含 `'` 先整体剥除，保持双拼转换/preedit 原语义。
+        // 手动分隔符仅在全拼路径（shuangpin=None）生效。
+        let sp_stripped: String;
+        let input: &str = if self.shuangpin.is_some() && input.contains('\'') {
+            sp_stripped = input.chars().filter(|&c| c != '\'').collect();
+            &sp_stripped
+        } else {
+            input
+        };
+
         // Fix A：在任何 shadow 之前保存用户实际输入的原始字符（双拼键序列或全拼）。
         // 仅用于重建 preedit_display（显示原始按键），不影响候选/消费语义。
         let raw_input = input;
@@ -300,6 +369,28 @@ impl Engine for PinyinEngine {
             None => input.to_string(),
         };
         let input = full_owned.as_str();
+
+        // 手动音节分隔符 `'` 支持（全拼路径）：
+        // - `has_sep`：输入含手动分隔符，走边界感知分词 + 剥除查询。
+        // - `query`：剥除 `'` 后的纯拼音串（词典查询用）；音节边界信息来自带 `'` 的分段。
+        let has_sep = input.contains('\'');
+        let query_owned: String = if has_sep {
+            input.chars().filter(|&c| c != '\'').collect()
+        } else {
+            String::new()
+        };
+        let query: &str = if has_sep { query_owned.as_str() } else { input };
+
+        // 纯分隔符输入（如 `'` / `''`）：无可查询拼音，仅回显分隔符，不产候选。
+        if has_sep && query.is_empty() {
+            let (preedit, _, _) = self.compute_composition(input);
+            return Ok(ConvertResult {
+                preedit_pinyin: preedit.clone(),
+                preedit_display: preedit,
+                is_empty: true,
+                ..Default::default()
+            });
+        }
 
         let dict = &self.dict;
         let trie = &self.trie;
@@ -317,7 +408,8 @@ impl Engine for PinyinEngine {
             }
             // 子短语候选：code 是输入的真前缀（比输入短，如 baoan 的「报」(bao)）。
             // Viterbi 整句走 insert(0) 不经此闭包，故无需 weight 启发式即可排除整句。
-            let is_partial = !is_prefix && code.len() < input.len() && input.starts_with(&code);
+            // 注：以剥除分隔符后的 query 为基准（无分隔符时 query==input，行为不变）。
+            let is_partial = !is_prefix && code.len() < query.len() && query.starts_with(&code);
             cands.push(Candidate {
                 text,
                 code,
@@ -332,15 +424,19 @@ impl Engine for PinyinEngine {
         };
 
         // DAG 分词提前到 step1 之前：lookup_with_fuzzy 需要音节列表生成模糊变体。
-        let dag = Dag::build(input, trie);
-        let syllables = dag.maximum_match();
+        // 含手动分隔符时按 `'` 分段独立分词（`'` 为硬边界，音节不得跨越），否则整串 DAG。
+        let syllables = if has_sep {
+            self.segment_with_separators(input)
+        } else {
+            Dag::build(input, trie).maximum_match()
+        };
 
-        // 1. 精确查找（完整匹配，含模糊扩展，对齐 Go lookupWithFuzzy）。code==input → 精确层级。
-        for (text, weight, order, is_fuzzy) in self.lookup_with_fuzzy(input, &syllables) {
+        // 1. 精确查找（完整匹配，含模糊扩展，对齐 Go lookupWithFuzzy）。code==query → 精确层级。
+        for (text, weight, order, is_fuzzy) in self.lookup_with_fuzzy(query, &syllables) {
             push_unique(
                 &mut candidates,
                 text,
-                input.to_string(),
+                query.to_string(),
                 weight,
                 order,
                 is_fuzzy,
@@ -351,7 +447,14 @@ impl Engine for PinyinEngine {
         // 完成音节覆盖的连续前缀（从起点算）。尾部不成音节的残码（如「nihaom」的「m」）
         // 不参与整句解码——否则 lattice 到不了残码末端、Viterbi 失败、整句退化成单字（bug①）。
         let completed_len: usize = syllables.iter().map(|s| s.len()).sum();
-        let completed: &str = &input[..completed_len];
+        // 含分隔符时用音节直接拼接（避免 `'` 字节位错位）；无分隔符时 query==input，等价原切片。
+        let completed_owned: String;
+        let completed: &str = if has_sep {
+            completed_owned = syllables.join("");
+            &completed_owned
+        } else {
+            &query[..completed_len]
+        };
 
         // 2. Viterbi 长句解码（>=2 音节，仅在完成音节前缀上跑；use_smart_compose=false 时跳过）
         if self.config.use_smart_compose && syllables.len() >= 2 {
@@ -418,7 +521,7 @@ impl Engine for PinyinEngine {
         if syllables.len() >= 2 {
             for end in 1..syllables.len().min(6) {
                 let code: String = syllables[..end].join("");
-                if code == input {
+                if code == query {
                     continue;
                 }
                 // 子词组 code 是输入的真前缀（比输入*短*，如 nihao 的「你」(ni)），是合法的
@@ -441,19 +544,19 @@ impl Engine for PinyinEngine {
         }
 
         // 4. 前缀查找（补全词，code 比输入长，如 si→思考）→ 前缀层级，降到精确之后。
-        for (code, text, weight, order) in dict.search_prefix(input, 30) {
+        for (code, text, weight, order) in dict.search_prefix(query, 30) {
             push_unique(&mut candidates, text, code, weight, order, false, true);
         }
 
         // 5. 简拼匹配（声母缩写，如 nh→你好）：查 wdat 预存的独立 AbbrevSection。
         //    仅当输入像简拼时才查（is_abbreviation：每字母均为某音节首字母、且非完整音节序列），
         //    避免对全拼输入做无谓查找。natural_order=999999 让简拼候选默认排在全拼之后。
-        if AbbrevMatcher::is_abbreviation(input, trie) {
-            for (text, weight, _order) in dict.search_abbrev(input, 10) {
+        if AbbrevMatcher::is_abbreviation(query, trie) {
+            for (text, weight, _order) in dict.search_abbrev(query, 10) {
                 push_unique(
                     &mut candidates,
                     text,
-                    input.to_string(),
+                    query.to_string(),
                     weight,
                     999999,
                     false,
@@ -468,17 +571,17 @@ impl Engine for PinyinEngine {
         //    随后统一按 weight 排序；词频上浮交协调器 apply_freq_rerank（衰减软置前，frequency.md §4）。
         if let Some(store_dm) = &self.store_layers {
             let limit = max_candidates.max(50);
-            let mut store_cands: Vec<Candidate> = store_dm.search(input, limit);
+            let mut store_cands: Vec<Candidate> = store_dm.search(query, limit);
             if syllables.len() >= 2 {
                 for end in 1..syllables.len().min(6) {
                     let code: String = syllables[..end].join("");
-                    if code == input {
+                    if code == query {
                         continue;
                     }
                     store_cands.extend(store_dm.search(&code, limit));
                 }
             }
-            store_cands.extend(store_dm.search_prefix(input, limit));
+            store_cands.extend(store_dm.search_prefix(query, limit));
             for mut c in store_cands {
                 if c.text.is_empty() || candidates.iter().any(|x| x.text == c.text) {
                     continue;
@@ -486,9 +589,21 @@ impl Engine for PinyinEngine {
                 c.source = CandidateSource::Pinyin;
                 // 与 push_unique 一致：store 层的前缀子码命中也是子短语，降到完整匹配之后。
                 c.is_partial =
-                    !c.is_prefix && c.code.len() < input.len() && input.starts_with(&c.code);
+                    !c.is_prefix && c.code.len() < query.len() && query.starts_with(&c.code);
                 candidates.push(c);
             }
+        }
+
+        // 手动分隔符边界过滤：用户以 `'` 强制音节边界后，凡「码恰好落在某音节边界、但字数
+        // 与所跨音节数不符」的候选被剔除——如 xi'an 强制 [xi,an]，则单字「先」(code=xian,
+        // 跨 2 音节却仅 1 字) 不该出现；「西」(code=xi,1 字 1 音节)、整句「西安」(2 字 2 音节) 保留。
+        // 码不落在任何边界的候选（如前缀补全）不受影响。
+        if has_sep {
+            let syls = &syllables;
+            candidates.retain(|c| match syllable_span(syls, &c.code) {
+                Some(k) if k >= 1 => c.text.chars().count() == k,
+                _ => true,
+            });
         }
 
         // 引擎内部排序（层级对齐 Go：完整匹配 >> 子短语 >> 前缀补全 >> 模糊）：
@@ -514,10 +629,11 @@ impl Engine for PinyinEngine {
         // 双拼激活时：全拼字节数需通过 map_consumed_length 回算为双拼原始键数，
         // 否则变长音节（2键→3字节，如 zh/ch/sh）会错误消费/越界双拼键缓冲区。
         for c in candidates.iter_mut() {
-            let fp_consumed = if !c.code.is_empty() && input.starts_with(&c.code) {
+            // 以剥除分隔符后的 query 为基准计算消费长度（无分隔符时 query==input）。
+            let fp_consumed = if !c.code.is_empty() && query.starts_with(&c.code) {
                 c.code.len()
             } else {
-                input.len()
+                query.len()
             };
             c.consumed_length = match &sp_result {
                 Some(r) => r.map_consumed_length(fp_consumed),
@@ -651,6 +767,75 @@ mod tests {
         assert!(!e.has_non_initial_single_letter_syllable("yans")); // yan + 残缺 s（残缺不计）
         assert!(!e.has_non_initial_single_letter_syllable("aipu")); // ai + pu 皆双字母
         assert!(!e.has_non_initial_single_letter_syllable("abcd")); // 首位单字母不算「非首位」
+    }
+
+    /// 构造含指定 (code, text) 词条的最小拼音引擎（每条 weight=100，order 递增）。
+    fn engine_with_words(words: &[(&str, &str)]) -> PinyinEngine {
+        let mut raw = CodetableDict::empty();
+        for (i, (code, text)) in words.iter().enumerate() {
+            raw.merge_single(code.to_string(), text.to_string(), 100, i as i32);
+        }
+        PinyinEngine::new(Config::default(), CachedDict::Memory(raw))
+    }
+
+    /// Task 8 Step 2：手动分隔符强制音节硬边界。
+    /// 词典含 "xian"→"先" 与 "xi"/"an" 单字；带分隔符 xi'an 强制切分 [xi,an]，
+    /// 跨界单音节词「先」(code=xian 却仅 1 字) 不得出现；preedit 保留手动 `'`。
+    #[test]
+    fn separator_forces_syllable_boundary() {
+        let e = engine_with_words(&[("xian", "先"), ("xi", "西"), ("an", "安")]);
+        let r = e.convert("xi'an", 50).unwrap();
+        assert!(
+            !r.candidates.iter().any(|c| c.text == "先"),
+            "分隔符应阻止跨界音节 xian 匹配，实际: {:?}",
+            r.candidates.iter().map(|c| &c.text).collect::<Vec<_>>()
+        );
+        assert!(
+            r.preedit_display.contains('\''),
+            "preedit 应保留手动分隔符，实际: {:?}",
+            r.preedit_display
+        );
+        assert!(
+            !r.candidates.is_empty(),
+            "分隔符切分后仍应有候选（如「西」）"
+        );
+    }
+
+    /// Task 8 Step 2：末尾分隔符必须立即显示，且不清空候选。
+    #[test]
+    fn trailing_separator_kept_in_preedit() {
+        let e = engine_with_words(&[("ni", "你")]);
+        let r = e.convert("ni'", 50).unwrap();
+        assert!(
+            r.preedit_display.ends_with('\''),
+            "末尾分隔符必须立即显示，实际: {:?}",
+            r.preedit_display
+        );
+        assert!(!r.candidates.is_empty(), "末尾分隔符不应清空候选");
+    }
+
+    /// Task 8 自审：五个边界（空段/开头 '/连续 ''/纯 '/末尾 '）均不 panic，
+    /// 且手动分隔符在 preedit 中原样保留。
+    #[test]
+    fn separator_edge_cases_no_panic() {
+        let e = engine_with_words(&[("ni", "你"), ("hao", "好"), ("xi", "西"), ("an", "安")]);
+
+        // 开头 '：xi 段仍应产候选，preedit 以 ' 起头
+        let r = e.convert("'xi", 20).unwrap();
+        assert!(r.preedit_display.starts_with('\''), "开头分隔符应保留");
+        assert!(r.candidates.iter().any(|c| c.text == "西"));
+
+        // 连续 ''：等价单边界，preedit 保留双分隔符
+        let r = e.convert("ni''hao", 20).unwrap();
+        assert!(r.preedit_display.contains("''"), "连续分隔符应原样保留");
+        assert!(r.candidates.iter().any(|c| c.text == "你"));
+
+        // 纯 ' / 连续纯 '：无拼音可查，无候选、仅回显分隔符，不 panic
+        for pure in ["'", "''", "'''"] {
+            let r = e.convert(pure, 20).unwrap();
+            assert!(r.candidates.is_empty(), "纯分隔符输入 {pure:?} 不应有候选");
+            assert_eq!(r.preedit_display, pure, "纯分隔符应原样回显");
+        }
     }
 
     fn tmp_store(name: &str) -> Arc<Store> {
