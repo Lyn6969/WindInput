@@ -16,7 +16,7 @@
 | 仓库边界 | 本仓库只含 `wind_input/`（18 crate）、`wind_tsf/`、`wind_macos/`、`data/`、`scripts/`、`docs/`；三个闭源组件一直是 `../wind-setting` 等**兄弟独立仓库** | 无需拆分，边界天然成立 |
 | 构建脚本 | `dev.sh` / `dev.ps1` 对闭源仓库是「不存在则跳过」；`pack-installer.sh` 依赖 `../wind-installer`，缺失时报错退出 | 开源用户可构建核心，打不出安装包，符合预期 |
 | CI / Release | `.github/workflows/` 已有完整 CI（ubuntu 交叉编译，`dev.sh ci` + TSF make）与 Release（tag 触发，经 `WIND_REPOS_TOKEN` PAT 检出私有兄弟仓库打完整安装包） | 开源后照常工作；secret 不会暴露给 fork PR |
-| git 历史 | `.claude/` `.superpowers/` `.remember/` `scripts/deploy.local`（真实配置）从未入库，只有 `.example` 入库 | **历史干净，可直接转 public，无需重建仓库或改写历史** |
+| git 历史 | `.claude/` `.superpowers/` `.remember/` `scripts/deploy.local`（真实配置）从未入库，只有 `.example` 入库 | 历史干净；后续已用 filter-repo 从全历史移除 `docs/superpowers/`（转为本地任务指引，gitignore）与过时的 `CHANGELOG.md`，**推送需 force-push** |
 | LICENSE | 已存在，MIT，`Copyright (c) 2026 WindInput Contributors`，与原项目一致 | 不用动 |
 | 远程仓库 | `github.com/huanfeng/WindInput`，当前 PRIVATE | 补文件 → 审计 → 更名为 WindInput → 转 public |
 
@@ -78,7 +78,8 @@ CLA 尤其值得保留，继续用 CLA Assistant 机器人流程。
 3. **仓库更名**：旧名 → WindInput（GitHub 自动重定向旧 URL）；
    原 Go 仓库先更名为 WindInput-Go 腾出名字。仓库内的旧名字样
    （release.yml、pack-installer.sh、config/app.toml、scripts、日志文案、docs 现行文档）
-   已统一替换为 WindInput（历史文档 docs/archive/、docs/superpowers/ 刻意保留原文）。
+   已统一替换为 WindInput（历史文档 docs/archive/ 刻意保留原文；docs/superpowers/
+   已从仓库与历史中移除，转为本地任务指引）。
    **跨仓库同步（必须与本地目录改名同时做）**：`wind-setting` 的 `Cargo.toml`
    （`wind-ipc = { path = "../WindInput/..." }`）与 `build.rs` 引用需改为
    `../WindInput`；在其同步前，Release workflow（checkout path 已改为 WindInput）
@@ -90,7 +91,7 @@ CLA 尤其值得保留，继续用 CLA Assistant 机器人流程。
 
 ### 开源后逐步完善
 
-6. 维护面向用户的 `CHANGELOG.md` 发布说明。
+6. 新写面向用户的 `CHANGELOG.md` 发布说明（旧 Go 时代版本已连同历史移除）。
 7. Cargo workspace 补 `license` / `repository` 元数据（可选）。
 
 ## 四、文档站（WindInputDocs）
