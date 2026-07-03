@@ -1287,6 +1287,8 @@ impl EngineManager {
                 clear_on_empty_max: eff.clear_on_empty_max,
                 top_code_commit: eff.top_code_commit,
                 show_code_hint: eff.show_code_hint,
+                single_code_input: eff.single_code_input,
+                single_code_complete: eff.single_code_complete,
             };
             // 码表引擎经 DictManager(CompositeDict) 查询。系统词库不再合并成单个 combined，
             // 而是主库 + 每个扩展（含禁用）各自一个 System 层，查询期由 composite 合并去重。

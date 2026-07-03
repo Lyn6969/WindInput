@@ -3,7 +3,7 @@
 > 状态：**已实现并通过全量测试**（wind-config/engine/coordinator 改造 + data 清理；build/test/clippy/fmt 绿）。
 > 本项目未发布，**不考虑旧配置迁移**。
 > 实现补记：`temp_max_entries` 经核查为**完全未接入的死配置**（`evict_temp_words` 无生产调用方），
-> 故仅从配置删除，store 侧无需常量化；`single_code_input/complete` 同为未接入，作前瞻配置保留于 `schema.codetable`。
+> 故仅从配置删除，store 侧无需常量化；`single_code_input/complete` 已接入 `wind-engine` 码表引擎。
 > 关联：`docs/redesign/config-schema.md`（配置总览）、`docs/redesign/frequency.md`（调频）、
 > `wind-config/src/{config,schema,config_schema}.rs`、`wind-engine/src/manager.rs`。
 
