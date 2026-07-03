@@ -125,6 +125,8 @@ impl Engine for CodeTableEngine {
             && input.chars().count() < self.max_code_length
         {
             // 空码补全：从更长编码取首个候选作提示（对齐 Go 仅取 1 个）。
+            // limit=8：仅需第一个 code != input 者，取 8 条留少量余量以跳过与输入同码项，
+            // 避免全量前缀扫描开销。
             if let Some(mut c) = self
                 .dm
                 .search_prefix(input, 8)

@@ -683,7 +683,8 @@ impl Coordinator {
             self.learn_phrase_on_commit(state); // 自动造词（多段组成的词）
             // 6b: 临时词使用累积（对齐 Go LearnWord-on-commit）：选中临时层候选也推进晋升计数。
             // 点查代替候选层标记：一次 redb 读，未命中即非临时词，零成本略过。
-            // is_phrase/is_command/is_group 已在 commit_selected 入口提前返回，此处均为普通候选。
+            // is_group/is_command 已在 commit_selected 入口提前返回；is_phrase 由本条件显式过滤
+            //（短语无临时词晋升语义），此处均为普通候选。
             if !cand.is_phrase
                 && let Some(store) = &self.store
             {

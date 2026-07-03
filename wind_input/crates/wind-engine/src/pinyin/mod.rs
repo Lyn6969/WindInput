@@ -315,6 +315,33 @@ fn syllable_span(syllables: &[String], code: &str) -> Option<usize> {
     None
 }
 
+/// 把「剥除分隔符 `'` 后的 query 空间」消费字节数回映射到「含 `'` 的原始输入空间」字节数。
+/// 引擎按剥除 `'` 的 query 计算 consumed_length，而协调器按含 `'` 的原始缓冲切片提交，
+/// 二者失配会致分隔符后残留尾字符（xi'an 选「西安」残 "n"、两步流残 "'an"）。此函数补偿
+/// `'` 偏移，使 consumed_length 语义统一为「原始输入空间」（与双拼 map_consumed_length 同域）。
+///
+/// 规则：消费边界紧跟分隔符时，`'` 归入已消费侧（两步流残留 "an" 而非 "'an"）；连续 `''` 一并
+/// 吸收。无 `'` 输入时恒等（零回归）。`'` 与拼音键均为 ASCII，按字节处理安全。
+fn map_consumed_over_separators(input: &str, fp_consumed: usize) -> usize {
+    if fp_consumed == 0 {
+        return 0;
+    }
+    let bytes = input.as_bytes();
+    let mut non_sep = 0usize; // 已跨过的非分隔符字节数（query 空间计数）
+    let mut i = 0usize;
+    while i < bytes.len() && non_sep < fp_consumed {
+        if bytes[i] != b'\'' {
+            non_sep += 1;
+        }
+        i += 1;
+    }
+    // 消费边界紧跟的分隔符并入已消费侧（连续 `''` 一并吸收），使已消费段带走其后的手动边界。
+    while i < bytes.len() && bytes[i] == b'\'' {
+        i += 1;
+    }
+    i
+}
+
 /// Fix A：用双拼原始按键重建 preedit（按音节边界以空格分隔）。
 /// 依次取每个已完成音节在原始输入中的字节区间 `raw[sp_start..sp_end]`；
 /// 若有 partial，把最后一个完成音节之后的剩余原始字节作为 partial 段追加。
@@ -637,6 +664,9 @@ impl Engine for PinyinEngine {
             };
             c.consumed_length = match &sp_result {
                 Some(r) => r.map_consumed_length(fp_consumed),
+                // 全拼含手动分隔符：query 是剥除 `'` 的串，需回映射到含 `'` 的原始输入空间，
+                // 否则协调器按含 `'` 缓冲切片时会残留尾字符（xi'an 选「西安」残 "n"）。
+                None if has_sep => map_consumed_over_separators(input, fp_consumed),
                 None => fp_consumed,
             };
         }
@@ -908,6 +938,29 @@ mod tests {
             "nihao".len(),
             "应只消费前缀 nihao"
         );
+    }
+
+    /// C1：query→原始输入空间的 consumed 回映射。无 `'` 恒等；边界紧跟 `'` 归入已消费侧；
+    /// 连续 `''` 一并吸收；越过分隔符时正确计数；nih'ao 段内残码边界不 panic。
+    #[test]
+    fn map_consumed_over_separators_cases() {
+        use super::map_consumed_over_separators as m;
+        // 无分隔符：恒等（零回归红线）
+        assert_eq!(m("nihao", 0), 0);
+        assert_eq!(m("nihao", 2), 2);
+        assert_eq!(m("nihao", 5), 5);
+        // xi'an：西安 code="xian" 消费 query 4 → 含 ' 的原始空间 5（全消费）
+        assert_eq!(m("xi'an", 4), 5);
+        // xi'an：西 code="xi" 消费 query 2 → 边界紧跟 ' 归入已消费侧 → 3（残留 "an" 而非 "'an"）
+        assert_eq!(m("xi'an", 2), 3);
+        // 连续 '' 一并吸收：ni''hao 消费 "ni"(2) → 吃掉两个 ' → 4（残留 "hao"）
+        assert_eq!(m("ni''hao", 2), 4);
+        // 末尾 '：ni' 全消费 query 2 → 吸收尾部 ' → 3
+        assert_eq!(m("ni'", 2), 3);
+        // nih'ao：段内残码 h 不成音节；消费 "ni"(2) 时 h 非分隔符不吸收 → 2，残留 "h'ao"（不 panic）
+        assert_eq!(m("nih'ao", 2), 2);
+        // nih'ao 全 query 消费 5 → 覆盖到末尾 6
+        assert_eq!(m("nih'ao", 5), 6);
     }
 
     /// Task 1.4 TDD：with_fuzzy builder 注入的配置应被引擎持有（探针验证）。

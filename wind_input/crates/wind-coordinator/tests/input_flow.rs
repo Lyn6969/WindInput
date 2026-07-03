@@ -516,6 +516,89 @@ fn separator_disabled_for_shuangpin() {
     );
 }
 
+/// C1 回归：全拼手动分隔符 `xi'an` 选「西安」应**全消费**上屏、组合区清空无残留。
+/// 修复前引擎按剥除 `'` 的 query 算 consumed_length，协调器却按含 `'` 缓冲切片 → 误判 partial、
+/// 残留尾字符 "n"（组合区变「西安n」）。修复后 consumed_length 回映射到含 `'` 的原始输入空间。
+#[test]
+fn separator_full_commit_consumes_all() {
+    if !has_schemas() {
+        return;
+    }
+    let coord = Coordinator::new_headless(config_with("pinyin"), Some(&data_dir()));
+    for c in "xi".chars() {
+        press_letter(&coord, c);
+    }
+    // 反引号(0xC0)作硬分隔符（默认 auto + 选键组含 ' → 反引号作分隔符，参照 Task 8 现有测试）。
+    coord.handle_key_event(&key_event(0xC0, EVENT_KEY_DOWN));
+    let mut last = KeyAction::PassThrough;
+    for c in "an".chars() {
+        last = press_letter(&coord, c);
+    }
+    assert_eq!(action_text(&last).as_deref(), Some("xi'an"), "缓冲应为 xi'an");
+
+    let texts = coord.debug_page_texts();
+    let p = texts
+        .iter()
+        .position(|t| t == "西安")
+        .unwrap_or_else(|| panic!("候选应含整句「西安」，实际: {:?}", texts));
+    // 数字键选「西安」→ 全消费上屏，无残留尾字符
+    match coord.handle_key_event(&key_event(0x31 + p as u32, EVENT_KEY_DOWN)) {
+        KeyAction::InsertText { text, .. } => {
+            assert_eq!(text, "西安", "分隔符输入选「西安」应完整上屏，不残留 'n'");
+        }
+        other => panic!("选「西安」应上屏 InsertText，实际: {:?}", other),
+    }
+    assert_eq!(
+        coord.debug_candidate_count(),
+        0,
+        "全消费后组合区候选应清空（无残留拼音续转）"
+    );
+}
+
+/// C1 回归：`xi'an` 两步分段——先选「西」组合区剩 "an"（`'` 随已消费段吃掉，非 "'an"），
+/// 再选「安」整体上屏「西安」并清空。
+#[test]
+fn separator_two_step_segmentation() {
+    if !has_schemas() {
+        return;
+    }
+    let coord = Coordinator::new_headless(config_with("pinyin"), Some(&data_dir()));
+    for c in "xi".chars() {
+        press_letter(&coord, c);
+    }
+    coord.handle_key_event(&key_event(0xC0, EVENT_KEY_DOWN));
+    for c in "an".chars() {
+        press_letter(&coord, c);
+    }
+    // 先选「西」（子短语，仅消费 xi 段；边界紧跟的 `'` 应归入已消费侧）
+    let texts = coord.debug_page_texts();
+    let p_xi = texts
+        .iter()
+        .position(|t| t == "西")
+        .unwrap_or_else(|| panic!("候选应含子短语「西」，实际: {:?}", texts));
+    let step = coord.handle_key_event(&key_event(0x31 + p_xi as u32, EVENT_KEY_DOWN));
+    let disp = action_text(&step).expect("选「西」应返回 UpdateComposition");
+    assert!(
+        disp.starts_with('西') && disp.ends_with("an") && !disp.contains('\''),
+        "选「西」后组合区应为「西」+剩余 an（无 ' 残留），实际: {:?}",
+        disp
+    );
+
+    // 再选「安」→ 整体上屏「西安」，组合区清空
+    let texts2 = coord.debug_page_texts();
+    let p_an = texts2
+        .iter()
+        .position(|t| t == "安")
+        .unwrap_or_else(|| panic!("剩余 an 的候选应含「安」，实际: {:?}", texts2));
+    match coord.handle_key_event(&key_event(0x31 + p_an as u32, EVENT_KEY_DOWN)) {
+        KeyAction::InsertText { text, .. } => {
+            assert_eq!(text, "西安", "两步分段最终应上屏「西安」");
+        }
+        other => panic!("选「安」应上屏 InsertText，实际: {:?}", other),
+    }
+    assert_eq!(coord.debug_candidate_count(), 0, "两步选完组合区应清空");
+}
+
 #[test]
 fn test_schema_switch_via_menu() {
     if !has_schemas() {
