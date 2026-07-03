@@ -82,10 +82,10 @@ pub fn rerank_codetable_usedfirst(
     });
 
     for (i, text) in protected.iter().enumerate() {
-        if let Some(pos) = candidates.iter().position(|c| &c.text == text) {
-            if pos > i {
-                candidates[i..=pos].rotate_right(1);
-            }
+        if let Some(pos) = candidates.iter().position(|c| &c.text == text)
+            && pos > i
+        {
+            candidates[i..=pos].rotate_right(1);
         }
     }
 }

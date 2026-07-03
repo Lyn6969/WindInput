@@ -401,7 +401,16 @@ mod tests {
         // 次引擎对同一输入也产出候选（模拟拼音命中）+ 守护开 → 否决上屏。
         let primary = ct_engine(&[("aaaa", "工", 100)], true);
         let secondary = ct_engine(&[("aaaa", "啊啊", 50)], false);
-        let e = MixedEngine::new(primary, Some(secondary), 2, 10_000_000, true, true, false, false);
+        let e = MixedEngine::new(
+            primary,
+            Some(secondary),
+            2,
+            10_000_000,
+            true,
+            true,
+            false,
+            false,
+        );
         let r = e.convert("aaaa", 50).unwrap();
         assert!(!r.should_commit, "有拼音候选且守护开时应否决全码上屏");
     }
@@ -411,7 +420,16 @@ mod tests {
         // 守护关 → 即便有拼音候选也放行。
         let primary = ct_engine(&[("aaaa", "工", 100)], true);
         let secondary = ct_engine(&[("aaaa", "啊啊", 50)], false);
-        let e = MixedEngine::new(primary, Some(secondary), 2, 10_000_000, false, true, false, false);
+        let e = MixedEngine::new(
+            primary,
+            Some(secondary),
+            2,
+            10_000_000,
+            false,
+            true,
+            false,
+            false,
+        );
         let r = e.convert("aaaa", 50).unwrap();
         assert!(r.should_commit, "守护关时应放行");
         assert_eq!(r.commit_text, "工");

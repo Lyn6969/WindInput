@@ -45,12 +45,19 @@ impl Store {
     }
 
     /// 点查临时词当前累积 count（无记录返回 None）。供协调器选词路径判断晋升。
-    pub fn get_temp_word(&self, schema: &str, code: &str, text: &str) -> anyhow::Result<Option<u32>> {
+    pub fn get_temp_word(
+        &self,
+        schema: &str,
+        code: &str,
+        text: &str,
+    ) -> anyhow::Result<Option<u32>> {
         let key = enc_key(schema, code, text);
         self.with_db(|db| {
             let txn = db.begin_read()?;
             let t = txn.open_table(TEMP_WORDS)?;
-            Ok(t.get(key.as_str())?.and_then(|g| dec_val(g.value())).map(|(_, c, _)| c))
+            Ok(t.get(key.as_str())?
+                .and_then(|g| dec_val(g.value()))
+                .map(|(_, c, _)| c))
         })
     }
 
@@ -250,7 +257,9 @@ mod tests {
         let path = tmp("wind_tw_promote_thresh.redb");
         let s = Store::open(&path).unwrap();
         for i in 1..=3u32 {
-            let n = s.learn_temp_word("wubi86", "abcd", "测试", 100, 10).unwrap();
+            let n = s
+                .learn_temp_word("wubi86", "abcd", "测试", 100, 10)
+                .unwrap();
             assert_eq!(n, i);
         }
         assert_eq!(

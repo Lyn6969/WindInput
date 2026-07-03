@@ -77,7 +77,11 @@ impl Coordinator {
             (al.enabled, al.min_word_length, 0, al.promote_count)
         } else {
             let ap = self.engine_mgr.codetable_settings().auto_phrase;
-            let max = if ap.max_phrase_len == 0 { 10 } else { ap.max_phrase_len };
+            let max = if ap.max_phrase_len == 0 {
+                10
+            } else {
+                ap.max_phrase_len
+            };
             (ap.enabled, ap.min_phrase_len, max, ap.promote_count)
         };
         if !enabled {
@@ -89,14 +93,8 @@ impl Coordinator {
         if segs.len() < 2 {
             return;
         }
-        let code: String = segs
-            .iter()
-            .map(|(c, _, _)| c.as_str())
-            .collect();
-        let text: String = segs
-            .iter()
-            .map(|(_, t, _)| t.as_str())
-            .collect();
+        let code: String = segs.iter().map(|(c, _, _)| c.as_str()).collect();
+        let text: String = segs.iter().map(|(_, t, _)| t.as_str()).collect();
         let min_len = if min_len == 0 { 2 } else { min_len };
         if text.chars().count() < min_len || code.is_empty() {
             return;
@@ -121,7 +119,10 @@ impl Coordinator {
         // add_weight/delta 取保守默认；达 promote_count 阈值时晋升入用户词库。
         match store.learn_temp_word(&schema, &code, &text, LEARN_ADD_WEIGHT, LEARN_WEIGHT_DELTA) {
             Ok(count) => {
-                debug!("auto-learned phrase: {} -> {} (count={})", code, text, count);
+                debug!(
+                    "auto-learned phrase: {} -> {} (count={})",
+                    code, text, count
+                );
                 self.maybe_promote_temp(store, &schema, &code, &text, count, promote_count);
             }
             Err(e) => warn!("learn_temp_word failed: {}", e),

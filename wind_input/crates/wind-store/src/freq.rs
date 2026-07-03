@@ -381,14 +381,30 @@ mod tests {
 
     #[test]
     fn recency_peak_boosts_fresh_record() {
-        let base = FreqProfile { base_scale: 100.0, half_life_hours: 72.0, recency_peak: 0.0 };
-        let peaked = FreqProfile { recency_peak: 500.0, ..base };
+        let base = FreqProfile {
+            base_scale: 100.0,
+            half_life_hours: 72.0,
+            recency_peak: 0.0,
+        };
+        let peaked = FreqProfile {
+            recency_peak: 500.0,
+            ..base
+        };
         let now = 1_000_000i64;
-        let fresh = FreqRecord { count: 1, last_used: now };
+        let fresh = FreqRecord {
+            count: 1,
+            last_used: now,
+        };
         let diff = peaked.pinyin_score(&fresh, now) - base.pinyin_score(&fresh, now);
-        assert!((diff - 500.0).abs() < 1e-6, "刚用过的记录应获得完整峰值加成，got {diff}");
+        assert!(
+            (diff - 500.0).abs() < 1e-6,
+            "刚用过的记录应获得完整峰值加成，got {diff}"
+        );
 
-        let stale = FreqRecord { count: 1, last_used: now - 30 * 24 * 3600 };
+        let stale = FreqRecord {
+            count: 1,
+            last_used: now - 30 * 24 * 3600,
+        };
         let stale_diff = peaked.pinyin_score(&stale, now) - base.pinyin_score(&stale, now);
         assert!(stale_diff < 1.0, "峰值加成应随衰减消退，got {stale_diff}");
     }
