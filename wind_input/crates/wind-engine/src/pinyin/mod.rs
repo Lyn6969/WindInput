@@ -41,16 +41,24 @@ use wind_dict::cached::CachedDict;
 const SENTENCE_WEIGHT_BASE: i32 = 30_000_000;
 
 /// 拼音引擎配置
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct Config {
     pub show_code_hint: bool,
     pub use_smart_compose: bool,
 }
 
+impl Default for Config {
+    fn default() -> Self {
+        Self {
+            show_code_hint: false,
+            use_smart_compose: true,
+        }
+    }
+}
+
 /// 拼音引擎
 pub struct PinyinEngine {
-    /// 引擎配置（show_code_hint / filter_mode 等，后续阶段接入）
-    #[allow(dead_code)]
+    /// 引擎配置（show_code_hint / use_smart_compose 等）
     config: Config,
     dict: CachedDict,
     trie: SyllableTrie,
@@ -345,8 +353,8 @@ impl Engine for PinyinEngine {
         let completed_len: usize = syllables.iter().map(|s| s.len()).sum();
         let completed: &str = &input[..completed_len];
 
-        // 2. Viterbi 长句解码（>=2 音节，仅在完成音节前缀上跑）
-        if syllables.len() >= 2 {
+        // 2. Viterbi 长句解码（>=2 音节，仅在完成音节前缀上跑；use_smart_compose=false 时跳过）
+        if self.config.use_smart_compose && syllables.len() >= 2 {
             let lattice_nodes = self.lattice_builder.build(
                 completed,
                 trie,
@@ -1033,6 +1041,64 @@ mod tests {
             r.candidates.iter().any(|c| c.text == "大菠萝哥"),
             "双拼输入 \"dabologe\" 应命中用户词「大菠萝哥」，实际候选: {:?}",
             r.candidates.iter().map(|c| &c.text).collect::<Vec<_>>()
+        );
+    }
+
+    // ── use_smart_compose 开关 ──────────────────────────────────────────────────
+
+    /// 构造带单字词典的拼音引擎（供整句/Viterbi 相关测试使用）：
+    /// 词典含 "ni"→"你"、"hao"→"好"，但无 "nihao"→"你好" 整词。
+    /// 任何 "你好" 候选只能来自 Viterbi 整句路径。
+    fn engine_for_sentence_tests(config: Config) -> PinyinEngine {
+        let mut raw = CodetableDict::empty();
+        raw.merge_single("ni".to_string(), "你".to_string(), 100, 0);
+        raw.merge_single("hao".to_string(), "好".to_string(), 100, 1);
+        PinyinEngine::new(config, CachedDict::Memory(raw))
+    }
+
+    /// 判断候选是否为 Viterbi 合成整句（权重达到 SENTENCE_WEIGHT_BASE 档）。
+    fn is_viterbi_sentence(c: &Candidate) -> bool {
+        c.weight >= super::SENTENCE_WEIGHT_BASE
+    }
+
+    /// TDD：use_smart_compose=false 时多音节输入不产生 Viterbi 合成整句候选。
+    #[test]
+    fn smart_compose_off_skips_viterbi_sentence() {
+        let e = engine_for_sentence_tests(Config {
+            use_smart_compose: false,
+            ..Config::default()
+        });
+        let r = e.convert("nihao", 50).unwrap();
+        assert!(
+            !r.candidates.iter().any(|c| {
+                c.text.chars().count() >= 2
+                    && c.source == CandidateSource::Pinyin
+                    && is_viterbi_sentence(c)
+            }),
+            "关闭智能组句后不应有 Viterbi 合成整句，实际候选: {:?}",
+            r.candidates
+                .iter()
+                .map(|c| (&c.text, c.weight))
+                .collect::<Vec<_>>()
+        );
+    }
+
+    /// 回归：use_smart_compose=true（默认）时整句候选仍产生。
+    #[test]
+    fn smart_compose_on_produces_viterbi_sentence() {
+        let e = engine_for_sentence_tests(Config::default()); // use_smart_compose 默认 true
+        let r = e.convert("nihao", 50).unwrap();
+        assert!(
+            r.candidates.iter().any(|c| {
+                c.text.chars().count() >= 2
+                    && c.source == CandidateSource::Pinyin
+                    && is_viterbi_sentence(c)
+            }),
+            "启用智能组句时应有 Viterbi 合成整句，实际候选: {:?}",
+            r.candidates
+                .iter()
+                .map(|c| (&c.text, c.weight))
+                .collect::<Vec<_>>()
         );
     }
 
