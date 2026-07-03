@@ -42,6 +42,16 @@ fn usize_param(p: &Value, key: &str, default: usize) -> usize {
         .unwrap_or(default)
 }
 
+/// 解析排序参数。sortBy 在 valid_fields 中时返回 (字段名, is_desc)，否则返回 None（保持原顺序）。
+fn parse_sort<'a>(params: &'a Value, valid_fields: &[&str]) -> Option<(&'a str, bool)> {
+    let by = params.get("sortBy")?.as_str()?;
+    if !valid_fields.contains(&by) {
+        return None;
+    }
+    let desc = params.get("sortOrder").and_then(|v| v.as_str()) == Some("desc");
+    Some((by, desc))
+}
+
 /// 本地今天日期 "YYYY-MM-DD"（统计摘要的参照点）。
 fn today_str() -> String {
     chrono::Local::now()
@@ -215,8 +225,19 @@ impl Coordinator {
             .store
             .as_ref()
             .ok_or_else(|| anyhow::anyhow!("无持久化存储"))?;
-        let all = store.search_user_words_prefix(&schema, prefix, 0)?;
+        let mut all = store.search_user_words_prefix(&schema, prefix, 0)?;
         let total = all.len();
+        // 有 sortBy 时在切片前排序，实现跨页全局排序
+        if let Some((by, desc)) = parse_sort(params, &["code", "text", "weight"]) {
+            all.sort_by(|a, b| {
+                let ord = match by {
+                    "weight" => a.weight.cmp(&b.weight),
+                    "text" => a.text.cmp(&b.text),
+                    _ => a.code.cmp(&b.code),
+                };
+                if desc { ord.reverse() } else { ord }
+            });
+        }
         let items: Vec<Value> = all
             .into_iter()
             .skip(offset)
@@ -466,7 +487,24 @@ impl Coordinator {
             .store
             .as_ref()
             .ok_or_else(|| anyhow::anyhow!("无持久化存储"))?;
-        let (page, total) = store.list_freq_paged(&schema, prefix, offset, limit)?;
+        // 带 sortBy 时全量拉取 → 排序 → 内存切片；否则走 store 分页路径
+        let (page, total) =
+            if let Some((by, desc)) = parse_sort(params, &["code", "text", "count", "lastUsed"]) {
+                let (mut all, total) = store.list_freq_paged(&schema, prefix, 0, 0)?;
+                all.sort_by(|(ca, ta, ra), (cb, tb, rb)| {
+                    let ord = match by {
+                        "count" => ra.count.cmp(&rb.count),
+                        "lastUsed" => ra.last_used.cmp(&rb.last_used),
+                        "text" => ta.cmp(tb),
+                        _ => ca.cmp(cb),
+                    };
+                    if desc { ord.reverse() } else { ord }
+                });
+                let page = all.into_iter().skip(offset).take(limit).collect();
+                (page, total)
+            } else {
+                store.list_freq_paged(&schema, prefix, offset, limit)?
+            };
         let items: Vec<Value> = page
             .into_iter()
             .map(|(code, text, rec)| {
@@ -783,7 +821,26 @@ impl Coordinator {
         let prefix = params.get("prefix").and_then(|v| v.as_str());
         let offset = params.get("offset").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
         let limit = params.get("limit").and_then(|v| v.as_u64()).unwrap_or(100) as usize;
-        let (rows, total) = store.list_user_phrases_paged(prefix, offset, limit)?;
+        // 带 sortBy 时全量拉取 → 排序 → 内存切片；否则走 store 分页路径
+        let (rows, total) = if let Some((by, desc)) =
+            parse_sort(params, &["code", "text", "weight", "position", "enabled"])
+        {
+            let (mut all, total) = store.list_user_phrases_paged(prefix, 0, usize::MAX)?;
+            all.sort_by(|a, b| {
+                let ord = match by {
+                    "weight" => a.weight.cmp(&b.weight),
+                    "position" => a.position.cmp(&b.position),
+                    "enabled" => a.enabled.cmp(&b.enabled),
+                    "text" => a.text.cmp(&b.text),
+                    _ => a.code.cmp(&b.code),
+                };
+                if desc { ord.reverse() } else { ord }
+            });
+            let page = all.into_iter().skip(offset).take(limit).collect();
+            (page, total)
+        } else {
+            store.list_user_phrases_paged(prefix, offset, limit)?
+        };
         let items: Vec<Value> = rows
             .into_iter()
             .map(|p| {
@@ -2085,5 +2142,153 @@ mod tests {
             bc.cmd_dict_add("工", "aaaa").is_err(),
             "混输 primary 缺失应返回 Err"
         );
+    }
+
+    #[test]
+    fn dict_list_paged_sort() {
+        let c = coord("dict_sort");
+        for (code, text, weight) in [("ab", "B词", 10i32), ("aa", "A词", 30), ("ac", "C词", 5)] {
+            c.web_data_rpc(
+                "dict.add",
+                &json!({ "schemaId": "wb", "code": code, "text": text, "weight": weight }),
+            )
+            .unwrap();
+        }
+        // weight asc：5 → 10 → 30
+        let r = c
+            .web_data_rpc(
+                "dict.listPaged",
+                &json!({ "schemaId": "wb", "offset": 0, "limit": 10,
+                          "sortBy": "weight", "sortOrder": "asc" }),
+            )
+            .unwrap();
+        let items = r["items"].as_array().unwrap();
+        assert_eq!(items[0]["weight"], 5, "asc 首项应为最小权重");
+        assert_eq!(items[2]["weight"], 30, "asc 末项应为最大权重");
+        // weight desc：30 → 10 → 5
+        let r2 = c
+            .web_data_rpc(
+                "dict.listPaged",
+                &json!({ "schemaId": "wb", "offset": 0, "limit": 10,
+                          "sortBy": "weight", "sortOrder": "desc" }),
+            )
+            .unwrap();
+        assert_eq!(r2["items"][0]["weight"], 30, "desc 首项应为最大权重");
+        // 跨页切片：asc offset=1 limit=1 取排序后第 2 条（weight=10）
+        let r3 = c
+            .web_data_rpc(
+                "dict.listPaged",
+                &json!({ "schemaId": "wb", "offset": 1, "limit": 1,
+                          "sortBy": "weight", "sortOrder": "asc" }),
+            )
+            .unwrap();
+        assert_eq!(r3["total"], 3, "跨页切片 total 不变");
+        assert_eq!(r3["items"][0]["weight"], 10, "offset=1 asc 应取 weight=10");
+        // 不传 sortBy 行为不变（total 正确）
+        let r4 = c
+            .web_data_rpc(
+                "dict.listPaged",
+                &json!({ "schemaId": "wb", "offset": 0, "limit": 10 }),
+            )
+            .unwrap();
+        assert_eq!(r4["total"], 3, "不传 sortBy 应保持原有行为");
+    }
+
+    #[test]
+    fn freq_list_paged_sort() {
+        let c = coord("freq_sort");
+        let store = c.store.as_ref().unwrap();
+        // de=1次, ta=2次, shi=3次
+        store.record_freq("py", "de", "的").unwrap();
+        store.record_freq("py", "ta", "他").unwrap();
+        store.record_freq("py", "ta", "他").unwrap();
+        store.record_freq("py", "shi", "是").unwrap();
+        store.record_freq("py", "shi", "是").unwrap();
+        store.record_freq("py", "shi", "是").unwrap();
+        // count asc：1 → 2 → 3
+        let r = c
+            .web_data_rpc(
+                "freq.listPaged",
+                &json!({ "schemaId": "py", "offset": 0, "limit": 10,
+                          "sortBy": "count", "sortOrder": "asc" }),
+            )
+            .unwrap();
+        let items = r["items"].as_array().unwrap();
+        assert_eq!(items[0]["count"], 1, "asc 首项应为 count=1");
+        assert_eq!(items[2]["count"], 3, "asc 末项应为 count=3");
+        // count desc：3 → 2 → 1
+        let r2 = c
+            .web_data_rpc(
+                "freq.listPaged",
+                &json!({ "schemaId": "py", "offset": 0, "limit": 10,
+                          "sortBy": "count", "sortOrder": "desc" }),
+            )
+            .unwrap();
+        assert_eq!(r2["items"][0]["count"], 3, "desc 首项应为 count=3");
+        // 跨页切片：asc offset=1 limit=1 取第 2 条（count=2）
+        let r3 = c
+            .web_data_rpc(
+                "freq.listPaged",
+                &json!({ "schemaId": "py", "offset": 1, "limit": 1,
+                          "sortBy": "count", "sortOrder": "asc" }),
+            )
+            .unwrap();
+        assert_eq!(r3["total"], 3, "跨页切片 total 不变");
+        assert_eq!(r3["items"][0]["count"], 2, "offset=1 asc 应取 count=2");
+        // 不传 sortBy 行为不变
+        let r4 = c
+            .web_data_rpc(
+                "freq.listPaged",
+                &json!({ "schemaId": "py", "offset": 0, "limit": 10 }),
+            )
+            .unwrap();
+        assert_eq!(r4["total"], 3, "不传 sortBy 应保持原有行为");
+    }
+
+    #[test]
+    fn phrase_list_user_sort() {
+        let c = coord("phrase_sort");
+        for (code, text, weight) in [("b", "乙", 20i32), ("a", "甲", 50), ("c", "丙", 5)] {
+            c.web_data_rpc(
+                "phrase.add",
+                &json!({ "code": code, "text": text, "position": 0, "weight": weight }),
+            )
+            .unwrap();
+        }
+        // weight asc：5 → 20 → 50
+        let r = c
+            .web_data_rpc(
+                "phrase.listUser",
+                &json!({ "offset": 0, "limit": 10,
+                          "sortBy": "weight", "sortOrder": "asc" }),
+            )
+            .unwrap();
+        let items = r["items"].as_array().unwrap();
+        assert_eq!(items[0]["weight"], 5, "asc 首项应为 weight=5");
+        assert_eq!(items[2]["weight"], 50, "asc 末项应为 weight=50");
+        // weight desc：50 → 20 → 5
+        let r2 = c
+            .web_data_rpc(
+                "phrase.listUser",
+                &json!({ "offset": 0, "limit": 10,
+                          "sortBy": "weight", "sortOrder": "desc" }),
+            )
+            .unwrap();
+        assert_eq!(r2["items"][0]["weight"], 50, "desc 首项应为 weight=50");
+        // 跨页切片：asc offset=1 limit=1 取第 2 条（weight=20）
+        let r3 = c
+            .web_data_rpc(
+                "phrase.listUser",
+                &json!({ "offset": 1, "limit": 1,
+                          "sortBy": "weight", "sortOrder": "asc" }),
+            )
+            .unwrap();
+        assert_eq!(r3["total"], 3, "跨页切片 total 不变");
+        assert_eq!(r3["items"][0]["weight"], 20, "offset=1 asc 应取 weight=20");
+        // 不传 sortBy 行为不变
+        let r4 = c
+            .web_data_rpc("phrase.listUser", &json!({ "offset": 0, "limit": 10 }))
+            .unwrap();
+        assert_eq!(r4["total"], 3, "不传 sortBy 应保持原有行为");
     }
 }
