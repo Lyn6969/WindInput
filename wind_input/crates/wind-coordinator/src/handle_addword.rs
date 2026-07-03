@@ -20,6 +20,28 @@ const ADD_WORD_MAX_LEN: usize = 20;
 /// 手动加词默认权重（略高于系统词库归一化中位 1000，对齐 Go addWordMaxWeight）
 const ADD_WORD_WEIGHT: i32 = 1200;
 
+/// 自动造词超长裁剪：从尾部保留整段（最近输入优先）使合并字数 ≤ max_chars。
+/// 返回保留区间的起始段索引；max_chars=0 不限（返回 0）。
+fn trim_segs_start(
+    segs: &[(String, String, wind_candidate::CandidateSource)],
+    max_chars: usize,
+) -> usize {
+    if max_chars == 0 {
+        return 0;
+    }
+    let mut total = 0;
+    let mut start = segs.len();
+    for (i, (_, t, _)) in segs.iter().enumerate().rev() {
+        let n = t.chars().count();
+        if total + n > max_chars {
+            break;
+        }
+        total += n;
+        start = i;
+    }
+    start
+}
+
 impl Coordinator {
     /// 加词到用户层（code 为空时暂不支持自动推导编码）。
     pub(crate) fn cmd_dict_add(&self, text: &str, code: &str) -> anyhow::Result<()> {
@@ -49,23 +71,29 @@ impl Coordinator {
         }
         // 自动造词闸门：拼音方案读 [pinyin.auto_learn]，码表/混输读有效 [codetable.auto_phrase]
         // （混输继承主码表行为）。开关关闭直接跳过；min_len 为造词最小字数（0 回退 2）。
-        let (enabled, min_len) = if self.engine_mgr.is_pinyin() {
+        // max_len：拼音路径不限（0）；码表路径取 max_phrase_len，0 回退 10。
+        let (enabled, min_len, max_len) = if self.engine_mgr.is_pinyin() {
             let al = self.engine_mgr.auto_learn_settings();
-            (al.enabled, al.min_word_length)
+            (al.enabled, al.min_word_length, 0)
         } else {
             let ap = self.engine_mgr.codetable_settings().auto_phrase;
-            (ap.enabled, ap.min_phrase_len)
+            let max = if ap.max_phrase_len == 0 { 10 } else { ap.max_phrase_len };
+            (ap.enabled, ap.min_phrase_len, max)
         };
         if !enabled {
             return;
         }
-        let code: String = state
-            .committed_segs
+        // 超长裁剪：从尾部保留整段使合并字数 ≤ max_len（最近输入优先）。
+        let start = trim_segs_start(&state.committed_segs, max_len);
+        let segs = &state.committed_segs[start..];
+        if segs.len() < 2 {
+            return;
+        }
+        let code: String = segs
             .iter()
             .map(|(c, _, _)| c.as_str())
             .collect();
-        let text: String = state
-            .committed_segs
+        let text: String = segs
             .iter()
             .map(|(_, t, _)| t.as_str())
             .collect();
@@ -77,9 +105,10 @@ impl Coordinator {
         let active = self.engine_mgr.active_schema_id();
         // 归属方案：非混输维持折叠自身/拼音（不看段来源，现行为）；
         // 混输仅当全段同源时用该源归属 id（混源/无法归因跳过，混合码写给谁都无意义）。
+        // 注：混源判定使用截后 segs，截掉的段不参与归属判断。
         let schema = if self.engine_mgr.schema_engine_type(&active).as_deref() == Some("mixed") {
-            let first = state.committed_segs[0].2; // len>=2 已保证非空
-            if state.committed_segs.iter().any(|(_, _, s)| *s != first) {
+            let first = segs[0].2; // segs.len()>=2 已保证非空
+            if segs.iter().any(|(_, _, s)| *s != first) {
                 return; // 混源：跳过自动造词
             }
             match self.engine_mgr.write_data_schema_id(&active, first) {
@@ -364,6 +393,7 @@ mod tests {
     //! 快捷加词状态机单元测试：无头 Coordinator + 临时 store，覆盖纯逻辑
     //! （字符还原/词长调整/确认写库）。编码计算依赖引擎，headless 下为空，
     //! 故写库测试手动注入 add_word_code。
+    use super::trim_segs_start;
     use crate::coordinator::Coordinator;
     use std::sync::Arc;
     use wind_config::Config;
@@ -494,5 +524,18 @@ mod tests {
         assert!(st.add_word_chars.is_empty());
         assert_eq!(st.add_word_len, 0);
         assert!(st.add_word_code.is_empty());
+    }
+
+    #[test]
+    fn trim_segs_keeps_tail_within_max() {
+        use wind_candidate::CandidateSource as S;
+        let seg = |c: &str, t: &str| (c.to_string(), t.to_string(), S::CodeTable);
+        let segs = vec![seg("aa", "工人"), seg("bb", "们"), seg("cc", "好的")];
+        // 总 5 字，max=3 → 从尾部保留 "们"(1)+"好的"(2)=3 字，起始索引 1
+        assert_eq!(trim_segs_start(&segs, 3), 1);
+        // max=0 不限
+        assert_eq!(trim_segs_start(&segs, 0), 0);
+        // max=1 装不下末段(2字) → 起始=len（全部裁掉，调用方跳过）
+        assert_eq!(trim_segs_start(&segs, 1), 3);
     }
 }
