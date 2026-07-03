@@ -953,6 +953,7 @@ impl EngineManager {
             } else {
                 def.half_life_hours
             },
+            recency_peak: pf.frequency.recency_peak.max(0.0),
         }
     }
 

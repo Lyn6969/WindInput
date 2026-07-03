@@ -49,10 +49,11 @@ Go 的做法：记录使用次数 → 以**加权方式把 boost 加到词的 we
 ## 4. 拼音方案：次数 + 最近时间 + 衰减
 拼音候选多、有整句组合，**不宜硬 used-first**（会破坏长句质量）。词频按**衰减分**参与排序：
 ```
-age_hours = (now - last_used) / 3600
-freq_score = base_scale * log2(count + 1) * decay
-decay      = exp(-ln2 * age_hours / half_life)     // 半衰期衰减，最近用过≈1，久未用→0
+age_hours   = (now - last_used) / 3600
+decay       = exp(-ln2 * age_hours / half_life)     // 半衰期衰减，最近用过≈1，久未用→0
+freq_score  = (base_scale * log2(count + 1) + recency_peak) * decay
 ```
+- `recency_peak`（默认 0）：与使用次数无关的"刚用过"峰值加成，随半衰期同步衰减；=0 时完全退化为旧公式，向后兼容。
 - 最近+高频 → freq_score 高，候选上浮；久未用 → 衰减回落，自然让位。
 - **关键差异（相对 Go）**：freq_score 在**归一化分数层**与引擎基础质量分结合，**不是加到原始大 weight 上**。引擎 RimeScorer 的基础质量分本就是受控小范围（见 engine.md §1.2），freq_score 按可比量级叠加 → **真正能重排**。
 - 组合方式：`final = base_quality + freq_score`（base_quality 来自 RimeScorer 的词库质量分，与 LM/initialQuality 同源、同量级）。具体系数实现期调参，目标是"高频近用词稳定靠前、但不压垮整句最优解"。
@@ -93,6 +94,7 @@ decay      = exp(-ln2 * age_hours / half_life)     // 半衰期衰减，最近�
   - shipped schema（wubi86 / wubi86_pinyin）设 `[learning.freq] enabled = true`，`engine.codetable.freq_strategy = "step"`（默认）。
 - **词频重排下沉 engine 排序层（§5/§7）**：重排纯函数移入 `wind-engine::freq_rerank`（`rerank_codetable_usedfirst` / `rerank_pinyin_decay` + `freq_tier`），coordinator 的 `apply_freq_rerank` 只负责取词频记录、按 `is_pinyin()` 分流调用。两路均有原生单测（wind-engine `freq_rerank::tests`，6 例）。
 - **F2 拼音衰减**：已完成。`rerank_pinyin_decay` 按 §4 实现 —— ① 整句/短语豁免（`weight ≥ PINYIN_SENTENCE_FLOOR=20M` 锚定顶部，介于词权重上限~19M 与整句基准 30M 之间）；② 非整句按 `FreqProfile::pinyin_score`（半衰期衰减）软置前；③ 阈值褪色（衰减分 `< PINYIN_FREQ_EPSILON=10.0` → 落回引擎权重序）。`now` 由 coordinator 注入便于测试。
+- **recency_peak 近用峰值加成**：已完成。`FreqProfile` 新增 `recency_peak: f64`（默认 0.0），`pinyin_score` 公式改为 `(base_scale * log2(count+1) + recency_peak) * decay`；`EngineManager::pinyin_freq_profile()` 从配置 `frequency.recency_peak` 读取（非负截断）。`=0` 时完全向后兼容。
 - **L 造词显现**：已完成。`PinyinEngine` 新增可选 `store_layers`（`with_store_layers`），`EngineManager::build_engine` 拼音分支在有 Store 时挂 `StoreUserLayer/StoreTempLayer`（按 schema 隔离）。convert 第 6 步按相同码（整串精确 + 各前缀子码 + 前缀补全）并入用户/临时造词，dedup by text、source=Pinyin、consumed_length 据前缀标注（部分消费分段上屏）。原生单测见 wind-engine `pinyin::tests`（3 例）。
   - 注：混输的 pinyin 子引擎按 secondary schema id 挂层；混输造词键于 mixed schema id，故混输 L 不在此生效（无回归，待混输专项）。
 - **protect_top_n**：字段保留，本阶段不实现（与 `top` 语义冲突，默认 0）。
