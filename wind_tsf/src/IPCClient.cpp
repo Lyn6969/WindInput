@@ -549,8 +549,59 @@ void CIPCClient::Disconnect()
 // Binary message sending
 // ============================================================================
 
+void CIPCClient::_DrainStaleData()
+{
+    if (_hPipe == INVALID_HANDLE_VALUE)
+        return;
+
+    DWORD avail = 0;
+    if (!PeekNamedPipe(_hPipe, nullptr, 0, nullptr, &avail, nullptr) || avail == 0)
+        return;
+
+    // Stale bytes = a late response from a previous timed-out request. If left in
+    // the pipe, the next ReceiveResponse would consume it as the reply to the NEW
+    // request, shifting every subsequent response off by one (symptom: space needs
+    // a second press to commit, persisting until the connection is rebuilt).
+    _LogError(L"Stale response data in pipe before send (%d bytes), draining", avail);
+
+    for (int drained = 0; drained < 16; drained++)
+    {
+        std::vector<uint8_t> discard(IPCConfig::PIPE_BUFFER_SIZE);
+        DWORD bytesRead = 0;
+        if (!_ReadWithTimeout(discard.data(), static_cast<DWORD>(discard.size()), &bytesRead, 50))
+        {
+            _LogError(L"Drain read failed, disconnecting to reset pipe");
+            Disconnect();
+            return;
+        }
+
+        if (!PeekNamedPipe(_hPipe, nullptr, 0, nullptr, &avail, nullptr))
+        {
+            Disconnect();
+            return;
+        }
+        if (avail == 0)
+        {
+            _LogInfo(L"Drained %d stale message(s) from pipe", drained + 1);
+            return;
+        }
+    }
+
+    // Still data after the drain cap: pathological state, hard-reset the connection.
+    _LogError(L"Pipe still has %d stale bytes after drain cap, disconnecting", avail);
+    Disconnect();
+}
+
 BOOL CIPCClient::_SendBinaryMessage(uint16_t command, const void* payload, uint32_t payloadSize, bool async)
 {
+    // A late response from a previous timed-out request must never be paired with
+    // this new request — drain (or reset the connection) before sending.
+    _DrainStaleData();
+    if (_hPipe == INVALID_HANDLE_VALUE && !Connect())
+    {
+        return FALSE;
+    }
+
     // Build header
     IpcHeader header;
     header.version = async ? (PROTOCOL_VERSION | ASYNC_FLAG) : PROTOCOL_VERSION;
@@ -926,6 +977,7 @@ BOOL CIPCClient::_ReceiveBinaryMessage(IpcHeader& header, std::vector<uint8_t>& 
     {
         _LogError(L"Protocol version mismatch: got 0x%04X, expected 0x%04X", header.version, PROTOCOL_VERSION);
         _RecordFailure();
+        Disconnect(); // stream is untrustworthy — reset so no misaligned data survives
         return FALSE;
     }
 
@@ -933,6 +985,7 @@ BOOL CIPCClient::_ReceiveBinaryMessage(IpcHeader& header, std::vector<uint8_t>& 
     {
         _LogError(L"Invalid payload length: %d", header.length);
         _RecordFailure();
+        Disconnect(); // stream is untrustworthy — reset so no misaligned data survives
         return FALSE;
     }
 

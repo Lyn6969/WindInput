@@ -342,6 +342,10 @@ private:
     BOOL _WriteWithTimeout(const void* data, DWORD size, DWORD timeoutMs);
     BOOL _ReadWithTimeout(void* buffer, DWORD size, DWORD* bytesRead, DWORD timeoutMs);
 
+    // Drain stale (late) responses left in the pipe by a previous timed-out request,
+    // so request/response pairing cannot shift off-by-one. Called before every send.
+    void _DrainStaleData();
+
     // Circuit breaker helpers
     void _RecordSuccess();
     void _RecordFailure();
