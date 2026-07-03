@@ -68,14 +68,28 @@ impl Coordinator {
             MenuCmd::ScreenshotCandidateToClipboard => {
                 let _ = self.ui_tx.send(UiCommand::ScreenshotCandidateToClipboard);
             }
-            MenuCmd::OpenConfigDir => {
-                if let Some(d) = Config::user_config_dir() {
-                    let _ = self
-                        .ui_tx
-                        .send(UiCommand::OpenPath(d.display().to_string()));
-                }
-            }
+            MenuCmd::OpenConfigDir => self.open_dir(Config::user_config_dir()),
+            MenuCmd::OpenAppDir => self.open_dir(
+                std::env::current_exe()
+                    .ok()
+                    .and_then(|p| p.parent().map(|d| d.to_path_buf())),
+            ),
+            MenuCmd::OpenLogDir => self.open_dir(Config::log_dir()),
         }
+    }
+
+    /// 在文件管理器中打开目录（高级菜单「打开…目录」共用）。
+    /// 目录可能尚未创建（如日志目录在首条日志前不存在），先 best-effort 建目录，
+    /// 否则资源管理器会弹「找不到路径」。
+    fn open_dir(&self, dir: Option<std::path::PathBuf>) {
+        let Some(d) = dir else {
+            tracing::warn!("open_dir: 目录不可用");
+            return;
+        };
+        let _ = std::fs::create_dir_all(&d);
+        let _ = self
+            .ui_tx
+            .send(UiCommand::OpenPath(d.display().to_string()));
     }
 
     /// 统一的「打开设置」入口：优先启动同目录的 wind_setting 桌面应用并跳转到指定页
@@ -279,7 +293,7 @@ impl Coordinator {
             })
             .collect();
 
-        // 高级子菜单：截图等不常用功能
+        // 高级子菜单：截图等不常用功能 + 打开各数据目录（分隔线独立成组）
         let advanced_children = vec![
             M::leaf(
                 "截图所有窗口到文件",
@@ -293,6 +307,10 @@ impl Coordinator {
                 true,
                 false,
             ),
+            M::separator(),
+            M::leaf("打开应用程序目录", cmd(MenuCmd::OpenAppDir), true, false),
+            M::leaf("打开用户数据目录", cmd(MenuCmd::OpenConfigDir), true, false),
+            M::leaf("打开日志目录", cmd(MenuCmd::OpenLogDir), true, false),
         ];
 
         let items = vec![
@@ -380,10 +398,14 @@ impl Coordinator {
     }
 
     /// 构建右键候选菜单项并下发给 UI 显示。
+    /// 词条操作的启用态/删除文案按候选来源动态化（对齐 Go window_mouse 菜单状态规则）：
+    /// - 置顶/前移：首项禁用；后移：末项禁用；拼音普通候选禁全部调位（无稳定位置语义）。
+    /// - 删除：短语→「禁用短语」（软删可恢复）；用户词/临时词→真删；系统词→「隐藏候选」（shadow）。
+    /// - overlay 模式（临拼/临英/特殊等，编码不在 input_buffer）：仅提供复制。
     pub(crate) fn show_candidate_menu(&self, page_local: usize, x: i32, y: i32) {
         use wind_ui::manager::MenuItemSpec as M;
         let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
-        if state.candidates.is_empty() || state.input_buffer.is_empty() {
+        if state.candidates.is_empty() {
             return;
         }
         let (start, end) = self.page_range(&state);
@@ -391,25 +413,45 @@ impl Coordinator {
         if idx >= end || idx >= state.candidates.len() {
             return;
         }
-        let word = state.candidates[idx].text.clone();
+        let cand = state.candidates[idx].clone();
+        let word = cand.text.clone();
         let code = state.input_buffer.clone();
         let total = state.candidates.len();
+        let overlay = state.active.is_some();
         drop(state);
 
-        let schema = self.engine_mgr.active_schema_id();
-        let has_rule = self.shadow_has_rule(&schema, &code, &word);
-        let multi_char = word.chars().count() > 1;
         let op = |o: CandidateOp| MenuKind::Op(o);
+        // overlay 模式编码不走 input_buffer（临拼等各持独立缓冲），shadow/词库操作无处落键——
+        // 仅保留复制，不再整个菜单拒开；调整/删除待各 overlay 语义定型后接入。
+        let items = if overlay || code.is_empty() {
+            vec![M::leaf("复制", MenuKind::Copy, true, false)]
+        } else {
+            let schema = self.engine_mgr.active_schema_id();
+            let has_rule = self.shadow_has_rule(&schema, &code, &word);
+            // 拼音普通候选禁调位：动态权重 + 衰减软置前与 pin 位置语义冲突；命令候选仍可调。
+            let is_pinyin = matches!(
+                self.engine_mgr.current_engine_type(),
+                Some(wind_engine::EngineType::Pinyin)
+            );
+            let group_member = candidate_is_group_member(&cand);
+            let movable = !(is_pinyin && !cand.is_command) && !group_member;
+            let (delete_label, delete_enabled) = candidate_delete_menu(&cand);
 
-        let items = vec![
-            M::leaf("置顶", op(CandidateOp::MoveTop), true, false),
-            M::leaf("前移", op(CandidateOp::MoveUp), idx > 0, false),
-            M::leaf("后移", op(CandidateOp::MoveDown), idx + 1 < total, false),
-            M::leaf("删除", op(CandidateOp::Delete), multi_char, false),
-            M::leaf("恢复默认", op(CandidateOp::Reset), has_rule, false),
-            M::separator(),
-            M::leaf("复制", MenuKind::Copy, true, false),
-        ];
+            vec![
+                M::leaf("置顶", op(CandidateOp::MoveTop), movable && idx > 0, false),
+                M::leaf("前移", op(CandidateOp::MoveUp), movable && idx > 0, false),
+                M::leaf(
+                    "后移",
+                    op(CandidateOp::MoveDown),
+                    movable && idx + 1 < total,
+                    false,
+                ),
+                M::leaf(delete_label, op(CandidateOp::Delete), delete_enabled, false),
+                M::leaf("恢复默认", op(CandidateOp::Reset), has_rule, false),
+                M::separator(),
+                M::leaf("复制", MenuKind::Copy, true, false),
+            ]
+        };
         {
             let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
             state.menu_open = true;
@@ -559,6 +601,36 @@ impl Coordinator {
         };
         drop(s);
         let _ = self.ui_tx.send(UiCommand::UpdateToolbar(tb));
+    }
+}
+
+/// 是否 $SS/$AA 展开后的组成员候选：顺序/成员由短语定义决定，禁一切调整
+/// （改动走编辑短语路径，不允许 shadow 双轨漂移；对齐 Go isGroupMember 规则）。
+/// 组导航候选本身（is_group，text 是组名）不算成员：可禁用整组。
+pub(crate) fn candidate_is_group_member(cand: &wind_candidate::Candidate) -> bool {
+    cand.is_phrase
+        && !cand.is_group
+        && (cand.phrase_template.starts_with("$SS") || cand.phrase_template.starts_with("$AA"))
+}
+
+/// 右键「删除」菜单项的动态文案与可用性（按候选来源，对齐 Go computeDeleteMenuLabel）：
+/// 短语→禁用短语（软删可恢复）；用户词/临时词→真删；系统词→shadow 隐藏。
+/// 单字同样允许隐藏（旧版的单字保护已取消：shadow 按 code+word 键控，只隐藏该编码下的
+/// 该字，其它编码仍可打出，且设置页可恢复，不存在"某字彻底打不出"）。
+/// Windows 菜单构建与 macOS 禁用位推送共用，避免两处规则漂移。
+pub(crate) fn candidate_delete_menu(cand: &wind_candidate::Candidate) -> (&'static str, bool) {
+    if candidate_is_group_member(cand) {
+        ("删除词条", false)
+    } else if cand.is_phrase {
+        // 静态短语前缀命中（is_prefix 且无完整码）定位不到 store 记录 → 暂禁。
+        ("禁用短语", !cand.is_prefix || !cand.group_code.is_empty())
+    } else if cand.meta.is_user_dict {
+        ("删除用户词", true)
+    } else if cand.meta.is_temp_dict {
+        ("删除临时词", true)
+    } else {
+        // 系统词（码表/拼音）：shadow 软隐藏。
+        ("隐藏候选", true)
     }
 }
 

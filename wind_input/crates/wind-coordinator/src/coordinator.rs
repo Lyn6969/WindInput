@@ -1705,7 +1705,9 @@ impl Coordinator {
 
     /// macOS：计算当前页每候选的右键菜单禁用位并经 push 通道下发（CmdCandidateMenuFlags 0x0505）。
     /// 位定义与 Swift CandidatePanel 对齐：0x01 上移 / 0x02 下移 / 0x04 置顶 / 0x08 删除 / 0x10 恢复默认。
-    /// 语义对齐进程内 `show_candidate_menu`：置顶恒可用；首项禁上移、末项禁下移；单字禁删除；无 shadow 规则禁恢复默认。
+    /// 语义对齐进程内 `show_candidate_menu`（共用 candidate_delete_menu 判定）：首项禁上移/置顶、
+    /// 末项禁下移；拼音普通候选禁全部调位；删除按候选来源判定；无 shadow 规则禁恢复默认。
+    /// 注：macOS 端「删除」文案固定，来源动态文案（禁用短语/删除用户词…）待协议扩展后接入。
     #[cfg(target_os = "macos")]
     pub(crate) fn push_candidate_menu_flags(&self, state: &State, start: usize, end: usize) {
         if !self.push_server.has_clients() || start >= end {
@@ -1714,19 +1716,28 @@ impl Coordinator {
         let schema = self.engine_mgr.active_schema_id();
         let code = &state.input_buffer;
         let total = state.candidates.len();
+        let is_pinyin = matches!(
+            self.engine_mgr.current_engine_type(),
+            Some(wind_engine::EngineType::Pinyin)
+        );
         let mut flags = Vec::with_capacity(end - start);
         for idx in start..end.min(total) {
-            let word = &state.candidates[idx].text;
+            let cand = &state.candidates[idx];
+            let word = &cand.text;
             let mut f = 0u8;
             if idx == 0 {
-                f |= 0x01; // 首项：禁上移
+                f |= 0x01 | 0x04; // 首项：禁上移 + 禁置顶（已在首位，置顶是冗余规则）
             }
             if idx + 1 >= total {
                 f |= 0x02; // 末项：禁下移
             }
-            // 0x04 置顶恒可用
-            if word.chars().count() <= 1 {
-                f |= 0x08; // 单字：禁删除（对齐 candidate_op 的单字保护）
+            // 拼音普通候选：禁全部调位（无稳定位置语义）；命令候选例外。
+            if is_pinyin && !cand.is_command {
+                f |= 0x01 | 0x02 | 0x04;
+            }
+            let (_, deletable) = crate::handle_menu::candidate_delete_menu(cand);
+            if !deletable {
+                f |= 0x08;
             }
             if code.is_empty() || !self.shadow_has_rule(&schema, code, word) {
                 f |= 0x10; // 无 shadow 规则：禁恢复默认

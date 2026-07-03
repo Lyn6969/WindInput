@@ -1298,7 +1298,7 @@ fn test_candidate_op_move_top_and_delete() {
     let after = coord.debug_page_texts();
     assert_eq!(after.first(), Some(&second), "置顶后第二项应排首位");
 
-    // 删除一个多字候选（绕过单字保护）→ 应从候选中消失
+    // 删除一个多字候选 → 应从候选中消失
     if let Some((pl, w)) = after
         .iter()
         .enumerate()
@@ -1312,17 +1312,22 @@ fn test_candidate_op_move_top_and_delete() {
 }
 
 #[test]
-fn test_candidate_op_delete_single_char_protected() {
+fn test_candidate_op_delete_single_char_hides() {
     if !has_schemas() {
         return;
     }
     use wind_ui::manager::CandidateOp;
-    let coord = Coordinator::new_headless(config_with("pinyin"), Some(&data_dir()));
+    // 单字保护已取消：隐藏候选对单字同样生效（shadow 按 code+word 键控，
+    // 仅该编码下隐藏，设置页可恢复）。
+    let store_path = std::env::temp_dir().join("wind_candidate_op_single_test.redb");
+    let _ = std::fs::remove_file(&store_path);
+    let store = std::sync::Arc::new(wind_store::Store::open(&store_path).unwrap());
+    let coord =
+        Coordinator::new_headless_with_store(config_with("pinyin"), Some(&data_dir()), store);
     for c in "shi".chars() {
         press_letter(&coord, c);
     }
     let before = coord.debug_page_texts();
-    // 找一个单字候选，删除应被拒绝（仍在列表）
     if let Some((pl, w)) = before
         .iter()
         .enumerate()
@@ -1331,7 +1336,7 @@ fn test_candidate_op_delete_single_char_protected() {
     {
         coord.debug_candidate_op(CandidateOp::Delete, pl);
         let after = coord.debug_page_texts();
-        assert!(after.contains(&w), "单字 '{}' 删除应被保护", w);
+        assert!(!after.contains(&w), "单字 '{}' 隐藏后不应再出现", w);
     }
 }
 

@@ -234,8 +234,10 @@ impl Coordinator {
                     is_phrase: true,
                     // $CC 命令短语：标记 is_command，phrase_template 暂存命令源；
                     // 选中时由 commit_selected 拦截，执行动作而非上屏 display 标签。
+                    // 非命令短语 phrase_template 存原始记录文本（source_text，模板未展开），
+                    // 供右键「禁用短语」按 (code, 原文) 定位 store 记录（对齐 Go PhraseTemplate）。
                     is_command,
-                    phrase_template: hit.command_src.unwrap_or_default(),
+                    phrase_template: hit.command_src.unwrap_or(hit.source_text),
                     ..Default::default()
                 });
             }
@@ -260,6 +262,7 @@ impl Coordinator {
                     });
                 } else if let Some(code) = hit.nav_code {
                     // $SS/$AA 组短语：选中补全到完整码再二级展开。
+                    // phrase_template 存原始记录文本：右键「禁用短语」按 (group_code, 原文) 定位。
                     candidates.push(Candidate {
                         text: text.clone(),
                         weight: PHRASE_WEIGHT_BASE + hit.weight,
@@ -268,6 +271,7 @@ impl Coordinator {
                         group_code: code,
                         group_name: text,
                         comment: hit.comment,
+                        phrase_template: hit.source_text,
                         ..Default::default()
                     });
                 } else {
@@ -278,6 +282,7 @@ impl Coordinator {
                         is_phrase: true,
                         is_prefix: true,
                         comment: hit.comment,
+                        phrase_template: hit.source_text,
                         ..Default::default()
                     });
                 }
@@ -913,6 +918,8 @@ impl Coordinator {
 
     /// 候选词条操作（右键菜单）：调整 Shadow 规则并即时重排重绘。
     /// code 取当前输入码（state.input_buffer）；按方案隔离。
+    /// 删除按候选来源分流（对齐 Go handleCandidateDelete）：短语软禁用 / 用户词・临时词真删 /
+    /// 系统词 shadow 隐藏。菜单已按同规则灰显，此处判定为 defensive（热键路径也经此）。
     pub(crate) fn candidate_op(&self, op: CandidateOp, page_local: usize) {
         let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
         if state.candidates.is_empty() || state.input_buffer.is_empty() {
@@ -923,13 +930,31 @@ impl Coordinator {
         if idx >= end || idx >= state.candidates.len() {
             return;
         }
-        let word = state.candidates[idx].text.clone();
+        let cand = state.candidates[idx].clone();
+        let word = cand.text.clone();
         let code = state.input_buffer.clone();
         let schema = self.engine_mgr.active_schema_id();
 
-        // 单字无规则保护：避免把某个单字彻底锁死（在写规则前判定）
-        if matches!(op, CandidateOp::Delete) && word.chars().count() <= 1 {
-            debug!("candidate_op: 拒绝删除单字 '{}'", word);
+        // $SS/$AA 展开成员：顺序/成员由短语定义决定，拒绝一切 shadow/删除双轨漂移。
+        if crate::handle_menu::candidate_is_group_member(&cand) {
+            return;
+        }
+        let is_move = matches!(
+            op,
+            CandidateOp::MoveTop | CandidateOp::MoveUp | CandidateOp::MoveDown
+        );
+        // 拼音普通候选禁调位（无稳定位置语义，pin 与衰减软置前冲突）；命令候选例外。
+        if is_move
+            && !cand.is_command
+            && matches!(
+                self.engine_mgr.current_engine_type(),
+                Some(wind_engine::EngineType::Pinyin)
+            )
+        {
+            return;
+        }
+        // 已在首位：置顶是冗余规则，直接忽略（菜单已灰显，热键路径 defensive）。
+        if matches!(op, CandidateOp::MoveTop) && idx == 0 {
             return;
         }
         let last = state.candidates.len().saturating_sub(1);
@@ -943,17 +968,68 @@ impl Coordinator {
                 CandidateOp::MoveDown => {
                     store.pin_shadow(&schema, &code, &word, None, (idx + 1).min(last))
                 }
-                CandidateOp::Delete => store.delete_shadow(&schema, &code, &word),
+                CandidateOp::Delete => self.delete_candidate_by_source(&schema, &code, &cand),
                 CandidateOp::Reset => store.remove_shadow_rule(&schema, &code, &word),
             };
             if let Err(e) = r {
-                warn!("shadow op failed: {}", e);
+                warn!("candidate op failed: {}", e);
             }
         }
 
         // 重新构建候选（会重新应用 Shadow）并重绘
         self.update_candidates(&mut state);
         self.notify_ui_update(&state);
+    }
+
+    /// 右键「删除」按候选来源分流：
+    /// - 短语 → `set_phrase_enabled(false)` 软禁用（设置页可恢复）+ 重建短语层即时生效；
+    ///   code 优先取导航完整码 `group_code`，text 用原始记录文本 `phrase_template`（display
+    ///   可能是模板展开后文本，直接用会在 store 里 miss）。
+    /// - 用户词/临时词 → store 真删；schema 取写归属 id（混输按来源分流、拼音族折叠共享），
+    ///   code 优先取候选自带存储码（双拼下 input_buffer 是双拼串、存储码是全拼）。
+    /// - 其它（系统码表/拼音）→ shadow 软隐藏；单字同样允许（旧版单字保护已取消：
+    ///   shadow 按 code+word 键控，仅该编码下隐藏，设置页可恢复）。
+    fn delete_candidate_by_source(
+        &self,
+        schema: &str,
+        code: &str,
+        cand: &Candidate,
+    ) -> anyhow::Result<()> {
+        let Some(store) = &self.store else {
+            return Ok(());
+        };
+        if cand.is_phrase {
+            let raw = if cand.phrase_template.is_empty() {
+                cand.text.as_str()
+            } else {
+                cand.phrase_template.as_str()
+            };
+            let pcode = if cand.group_code.is_empty() {
+                code
+            } else {
+                cand.group_code.as_str()
+            };
+            store.set_phrase_enabled(pcode, raw, false)?;
+            self.rebuild_phrases();
+            return Ok(());
+        }
+        if cand.meta.is_user_dict || cand.meta.is_temp_dict {
+            let Some(sid) = self.engine_mgr.write_data_schema_id(schema, cand.source) else {
+                debug!("delete_candidate: 无法归因存储方案，跳过 '{}'", cand.text);
+                return Ok(());
+            };
+            let dcode = if cand.code.is_empty() {
+                code
+            } else {
+                cand.code.as_str()
+            };
+            return if cand.meta.is_user_dict {
+                store.remove_user_word(&sid, dcode, &cand.text)
+            } else {
+                store.remove_temp_word(&sid, dcode, &cand.text)
+            };
+        }
+        store.delete_shadow(schema, code, &cand.text)
     }
 
     /// 候选词操作热键匹配（对齐 Go matchCandidateActionKey，但 `0` 扩展为第 10 候选）。
@@ -1011,7 +1087,7 @@ impl Coordinator {
                 return None;
             }
         }
-        // candidate_op 自行重新加锁并做页范围/单字保护校验。
+        // candidate_op 自行重新加锁并做页范围/来源分流校验。
         self.candidate_op(op, num - 1);
         Some(KeyAction::Consumed)
     }

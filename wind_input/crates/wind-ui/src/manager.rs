@@ -197,8 +197,12 @@ pub enum MenuCmd {
     ReloadConfig,
     /// 重启服务进程
     RestartService,
-    /// 打开配置目录
+    /// 打开用户数据目录（配置/词库等用户数据所在目录）
     OpenConfigDir,
+    /// 打开应用程序目录（exe 所在目录，高级菜单）
+    OpenAppDir,
+    /// 打开日志文件目录（高级菜单）
+    OpenLogDir,
     /// 词库管理（暂兜底为打开配置目录）
     OpenDictionary,
     /// 设置（暂兜底为打开配置目录）
@@ -256,6 +260,8 @@ impl MenuKind {
                 MenuCmd::OpenAbout => 110,
                 MenuCmd::TakeScreenshot => 111,
                 MenuCmd::ScreenshotCandidateToClipboard => 112,
+                MenuCmd::OpenAppDir => 113,
+                MenuCmd::OpenLogDir => 114,
                 MenuCmd::SchemaSelect(i) => 1000 + i as i32,
                 MenuCmd::ThemeSelect(i) => 2000 + i as i32,
                 MenuCmd::FilterMode(i) => 3000 + i as i32,
@@ -286,6 +292,8 @@ impl MenuKind {
             110 => MenuCmd::OpenAbout,
             111 => MenuCmd::TakeScreenshot,
             112 => MenuCmd::ScreenshotCandidateToClipboard,
+            113 => MenuCmd::OpenAppDir,
+            114 => MenuCmd::OpenLogDir,
             1000..=1999 => MenuCmd::SchemaSelect((id - 1000) as usize),
             2000..=2999 => MenuCmd::ThemeSelect((id - 2000) as usize),
             3000..=3999 => MenuCmd::FilterMode((id - 3000) as usize),

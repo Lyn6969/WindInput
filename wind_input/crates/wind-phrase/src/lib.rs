@@ -41,6 +41,9 @@ pub struct PhraseHit {
     pub command_src: Option<String>,
     pub nav_code: Option<String>,
     pub comment: String,
+    /// 原始记录文本（store 里的 `PhraseEntry.text`，模板/命令未展开）。
+    /// 右键「禁用短语」按 (code, source_text) 定位 store 记录（display 可能是展开后文本）。
+    pub source_text: String,
 }
 
 impl PhraseHit {
@@ -51,7 +54,14 @@ impl PhraseHit {
             command_src: None,
             nav_code: None,
             comment: String::new(),
+            source_text: String::new(),
         }
+    }
+
+    /// 附上原始记录文本（构造点统一经此填充，测试用 `plain` 直构不填）。
+    fn with_source(mut self, src: &str) -> Self {
+        self.source_text = src.to_string();
+        self
     }
 
     /// 前缀导航——**组**候选（`$SS`/`$AA`）：`code` 为补全目标完整码，选中后补全展开。
@@ -62,6 +72,7 @@ impl PhraseHit {
             command_src: None,
             nav_code: Some(code),
             comment,
+            source_text: String::new(),
         }
     }
 
@@ -74,6 +85,7 @@ impl PhraseHit {
             command_src: Some(src),
             nav_code: Some(code),
             comment,
+            source_text: String::new(),
         }
     }
 }
@@ -237,7 +249,7 @@ impl PhraseLayer {
                 match evaluate_phrase(&e.text, &ctx, default_registry()) {
                     // 无动作（literal/template，如 {date()}）→ 显示即上屏文本。
                     Ok(PhraseEval::Single { display, actions }) if actions.is_empty() => {
-                        out.push(PhraseHit::plain(display, e.weight))
+                        out.push(PhraseHit::plain(display, e.weight).with_source(&e.text))
                     }
                     // $CC 命令短语（有动作）：携带命令源，选中时由 coordinator 执行动作。
                     Ok(PhraseEval::Single { display, .. }) => out.push(PhraseHit {
@@ -246,19 +258,22 @@ impl PhraseLayer {
                         command_src: Some(e.text.clone()),
                         nav_code: None,
                         comment: String::new(),
+                        source_text: e.text.clone(),
                     }),
                     Ok(PhraseEval::Array(arr)) => {
                         for el in arr.elements {
                             // 仅显现无动作的字面元素（符号等）；带动作的嵌入 $CC 需元素级源，后续补。
                             if el.actions.is_empty() {
-                                out.push(PhraseHit::plain(el.display, e.weight));
+                                out.push(
+                                    PhraseHit::plain(el.display, e.weight).with_source(&e.text),
+                                );
                             }
                         }
                     }
                     Err(err) => warn!("cmdbar phrase eval failed ({:?}): {}", e.text, err),
                 }
             } else if let Some(text) = expand_template(&e.text, &now) {
-                out.push(PhraseHit::plain(text, e.weight));
+                out.push(PhraseHit::plain(text, e.weight).with_source(&e.text));
             }
         }
         out
@@ -317,18 +332,21 @@ impl PhraseLayer {
                             Ok(ev) => ev.display,
                             Err(_) => continue,
                         };
-                        out.push(PhraseHit::plain(display, e.weight));
+                        out.push(PhraseHit::plain(display, e.weight).with_source(&e.text));
                     }
                     Phrase::Array(ap) => {
                         if ap.modifiers.get_bool("prefix") == Some(false) {
                             continue;
                         }
-                        out.push(PhraseHit::nav(
-                            ap.name.clone(),
-                            e.weight,
-                            full_code.clone(),
-                            suffix.clone(),
-                        ));
+                        out.push(
+                            PhraseHit::nav(
+                                ap.name.clone(),
+                                e.weight,
+                                full_code.clone(),
+                                suffix.clone(),
+                            )
+                            .with_source(&e.text),
+                        );
                     }
                     Phrase::Command(cp) => {
                         if cp.modifiers.get_bool("prefix") == Some(false) {
@@ -338,13 +356,16 @@ impl PhraseLayer {
                             Ok(ev) => ev.display,
                             Err(_) => continue,
                         };
-                        out.push(PhraseHit::command_nav(
-                            display,
-                            e.weight,
-                            e.text.clone(),
-                            full_code.clone(),
-                            suffix.clone(),
-                        ));
+                        out.push(
+                            PhraseHit::command_nav(
+                                display,
+                                e.weight,
+                                e.text.clone(),
+                                full_code.clone(),
+                                suffix.clone(),
+                            )
+                            .with_source(&e.text),
+                        );
                     }
                 }
             }
@@ -658,19 +679,18 @@ mod tests {
         );
         let layer = PhraseLayer { map };
         let now = fixed();
-        assert_eq!(
-            layer.lookup_at("rq", now, &[], &no_clip()),
-            vec![PhraseHit::plain("2026-06-14".into(), 1000)]
-        );
-        assert_eq!(
-            layer.lookup_at("js", now, &[], &no_clip()),
-            vec![PhraseHit::plain("7".into(), 900)]
-        );
-        // 旧简单模板路径仍工作
-        assert_eq!(
-            layer.lookup_at("old", now, &[], &no_clip()),
-            vec![PhraseHit::plain("2026-06-14".into(), 800)]
-        );
+        let rq = layer.lookup_at("rq", now, &[], &no_clip());
+        assert_eq!(rq.len(), 1);
+        assert_eq!(rq[0].text, "2026-06-14");
+        assert_eq!(rq[0].weight, 1000);
+        let js = layer.lookup_at("js", now, &[], &no_clip());
+        assert_eq!(js.len(), 1);
+        assert_eq!(js[0].text, "7");
+        // 旧简单模板路径仍工作；source_text 保留未展开原文（右键禁用短语用）。
+        let old = layer.lookup_at("old", now, &[], &no_clip());
+        assert_eq!(old.len(), 1);
+        assert_eq!(old[0].text, "2026-06-14");
+        assert_eq!(old[0].source_text, "$Y-$MM-$DD");
         // 命令短语：display 为标签，携带命令源（选中时执行动作）。
         let cmd = layer.lookup_at("cmd", now, &[], &no_clip());
         assert_eq!(cmd.len(), 1);
@@ -694,11 +714,12 @@ mod tests {
         );
         let layer = PhraseLayer { map };
         let got = layer.lookup_at("fh", fixed(), &[], &no_clip());
+        let src = r#"$SS("符号", "（）", "【】")"#;
         assert_eq!(
             got,
             vec![
-                PhraseHit::plain("（）".into(), 500),
-                PhraseHit::plain("【】".into(), 500)
+                PhraseHit::plain("（）".into(), 500).with_source(src),
+                PhraseHit::plain("【】".into(), 500).with_source(src),
             ]
         );
     }
@@ -717,12 +738,13 @@ mod tests {
         );
         let layer = PhraseLayer { map };
         let got = layer.lookup_at("zzsz", fixed(), &[], &no_clip());
+        let src = r#"$AA("数字", "①②③")"#;
         assert_eq!(
             got,
             vec![
-                PhraseHit::plain("①".into(), 500),
-                PhraseHit::plain("②".into(), 500),
-                PhraseHit::plain("③".into(), 500),
+                PhraseHit::plain("①".into(), 500).with_source(src),
+                PhraseHit::plain("②".into(), 500).with_source(src),
+                PhraseHit::plain("③".into(), 500).with_source(src),
             ]
         );
     }
