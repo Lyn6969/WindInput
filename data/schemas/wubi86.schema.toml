@@ -4,7 +4,7 @@ name = "五笔"
 icon_label = "五"
 version = "1.0"
 author = "内置"
-description = "五笔86版输入方案（基于rime-wubi86-jidian增加词频生成）"
+description = "五笔86版输入方案"
 
 [engine]
 type = "codetable"

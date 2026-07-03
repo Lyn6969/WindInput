@@ -27,7 +27,7 @@ z_key_repeat = true
 
 # 码表调频（全局唯一；strategy: top=一次到顶 MRU / step=逐次提升）。
 [schema.codetable.frequency]
-enabled = true
+enabled = false
 protect_top_n = 1
 strategy = "top"
 
@@ -58,7 +58,7 @@ show_source_hint = false
 enable_english = false
 pinyin_only_overflow = true
 top_code_override_pinyin = false
-auto_commit_block_on_pinyin = true
+auto_commit_block_on_pinyin = false
 min_pinyin_length = 2
 
 [schema.quick_input]

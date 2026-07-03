@@ -4,7 +4,7 @@ name = "双拼"
 icon_label = "双"
 version = "1.0"
 author = "内置"
-description = "双拼输入方案，每个汉字固定两键输入，支持多种键位布局"
+description = "双拼输入方案"
 
 [engine]
 type = "pinyin"
