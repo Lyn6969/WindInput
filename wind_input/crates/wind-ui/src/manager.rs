@@ -114,8 +114,26 @@ pub enum UiCommand {
     TakeScreenshot { dir: String },
     /// 将候选窗口截图复制到剪贴板（候选不可见则提示）。
     ScreenshotCandidateToClipboard,
+    /// 注册全局热键（Win32 RegisterHotKey，线程级）。覆盖式：先反注册旧列表再注册新列表，
+    /// 空列表 = 仅清除已注册项。来自 keys.global_hotkeys（协调器构建，启动/配置重载时下发）。
+    RegisterGlobalHotkeys(Vec<GlobalHotkeyEntry>),
     /// 关闭 UI
     Shutdown,
+}
+
+/// 全局热键条目（协调器按 keys.global_hotkeys 构建，UI 线程经 Win32 RegisterHotKey 注册）。
+/// `modifiers` 为 Win32 RegisterHotKey 修饰位（MOD_ALT=0x1/MOD_CONTROL=0x2/MOD_SHIFT=0x4/
+/// MOD_WIN=0x8），与 wind-ipc 的 MOD_* 位序不同（ALT/SHIFT 互换），转换在协调器侧完成。
+#[derive(Debug, Clone)]
+pub struct GlobalHotkeyEntry {
+    /// RegisterHotKey 热键 ID（UI 线程内唯一即可）
+    pub id: i32,
+    /// Win32 修饰位
+    pub modifiers: u32,
+    /// Windows 虚拟键码
+    pub vk: u32,
+    /// 触发后回送协调器的热键动作名（与 dispatch_hotkey 的 action 一致）
+    pub action: String,
 }
 
 /// 翻页器命中/悬停 tag（远高于候选下标，避免冲突）
@@ -350,6 +368,8 @@ pub enum UiEvent {
     MenuAction(MenuKind),
     /// 关闭菜单（点击菜单外 / ESC / 右键）
     MenuClose,
+    /// 全局热键触发（线程级 RegisterHotKey 的 WM_HOTKEY），携带热键动作名
+    GlobalHotkey(String),
 }
 
 /// UI 管理器（在独立线程中运行）
@@ -458,6 +478,11 @@ impl UiManager {
             }
         };
 
+        // 已注册的全局热键（RegisterHotKey hwnd=NULL 绑定本线程；WM_HOTKEY 落线程消息队列，
+        // 无目标窗口，DispatchMessage 不路由，须在下方消息泵中直接截获）。
+        #[cfg(windows)]
+        let mut global_hotkeys: Vec<GlobalHotkeyEntry> = Vec::new();
+
         // Win32 消息循环 + 通道接收
         // 待处理命令队列：每轮排空通道并合并连续候选更新（只渲染最新一帧），
         // 避免长按翻页/连按方向键时 UpdateCandidates 堆积、松键后仍继续刷新。
@@ -495,6 +520,15 @@ impl UiManager {
             unsafe {
                 let mut msg = MSG::default();
                 while PeekMessageW(&mut msg, HWND::default(), 0, 0, PM_REMOVE).as_bool() {
+                    // 线程级全局热键：WM_HOTKEY 无目标窗口，须在泵中截获并回送协调器
+                    if msg.message == WM_HOTKEY {
+                        let id = msg.wParam.0 as i32;
+                        if let Some(e) = global_hotkeys.iter().find(|e| e.id == id) {
+                            debug!("UI: global hotkey triggered: {}", e.action);
+                            let _ = event_tx.send(UiEvent::GlobalHotkey(e.action.clone()));
+                        }
+                        continue;
+                    }
                     let _ = TranslateMessage(&msg);
                     DispatchMessageW(&msg);
                 }
@@ -865,6 +899,38 @@ impl UiManager {
                     }
                     UiCommand::SetTooltipChaiziFont { path, family } => {
                         candidate_window.set_tooltip_chaizi_font(&path, &family);
+                    }
+                    UiCommand::RegisterGlobalHotkeys(entries) => {
+                        #[cfg(windows)]
+                        {
+                            use windows::Win32::UI::Input::KeyboardAndMouse::{
+                                HOT_KEY_MODIFIERS, MOD_NOREPEAT, RegisterHotKey, UnregisterHotKey,
+                            };
+                            // 覆盖式：先反注册旧列表（配置重载可能改键/删项），再注册新列表
+                            for e in &global_hotkeys {
+                                let _ = unsafe { UnregisterHotKey(HWND::default(), e.id) };
+                            }
+                            for e in &entries {
+                                let mods = HOT_KEY_MODIFIERS(e.modifiers | MOD_NOREPEAT.0);
+                                match unsafe { RegisterHotKey(HWND::default(), e.id, mods, e.vk) } {
+                                    Ok(()) => debug!(
+                                        "UI: registered global hotkey {} (mods=0x{:X} vk=0x{:02X})",
+                                        e.action, e.modifiers, e.vk
+                                    ),
+                                    // 失败（组合被其它程序占用等）仅告警，不影响其余热键
+                                    Err(err) => tracing::warn!(
+                                        "UI: register global hotkey {} failed: {}",
+                                        e.action,
+                                        err
+                                    ),
+                                }
+                            }
+                            global_hotkeys = entries;
+                        }
+                        #[cfg(not(windows))]
+                        {
+                            let _ = entries;
+                        }
                     }
                     UiCommand::Shutdown => {
                         info!("UI: Shutdown");

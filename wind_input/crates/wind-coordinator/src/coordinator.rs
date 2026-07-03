@@ -24,7 +24,7 @@ use wind_config::PreeditDisplay;
 use wind_config::hotkey::{self, CompiledHotkeys};
 use wind_engine::EngineManager;
 use wind_ipc::protocol::{
-    EVENT_KEY_DOWN, EVENT_KEY_UP, MOD_ALT, MOD_CTRL, MOD_SHIFT, calc_key_hash,
+    EVENT_KEY_DOWN, EVENT_KEY_UP, MOD_ALT, MOD_CTRL, MOD_SHIFT, MOD_WIN, calc_key_hash,
 };
 use wind_store::Store;
 use wind_store::stat_collector::{StatCollector, StatEvent};
@@ -32,7 +32,7 @@ use wind_store::stats::CommitSource;
 use wind_transform::fullwidth::to_full_width;
 use wind_transform::punctuation::PunctuationConverter;
 use wind_ui::candidate_window::CandidateItem;
-use wind_ui::manager::{UiCommand, UiEvent};
+use wind_ui::manager::{GlobalHotkeyEntry, UiCommand, UiEvent};
 // UiManager 仅 Windows LayeredWindow 路径用；macOS 走 host-render forwarder。
 #[cfg(not(target_os = "macos"))]
 use wind_ui::manager::UiManager;
@@ -593,6 +593,10 @@ impl Coordinator {
             });
         }
 
+        // 注册 keys.global_hotkeys 全局热键（RegisterHotKey）：启动即注册，
+        // 不依赖 IME 激活——全局热键的语义就是在本输入法未激活时也生效。
+        coordinator.sync_global_hotkeys();
+
         // 后台预热：提前构建其余方案的引擎与缓存（拼音 merged/unigram、码表 per-dict），
         // 避免首次切换到拼音/临时拼音/码表时同步重熔大词库造成几十秒卡顿。
         // single-flight 构建锁保证预热与用户切换不重复构建；按方案顺序逐个建（后台低频）。
@@ -1048,6 +1052,7 @@ impl Coordinator {
                 self.apply_ui_config(); // 外观项（候选排列/编码显示/候选窗显隐）即时生效
                 self.reload_config(); // 刷新主题/工具栏（候选窗下次输入按新配置）
                 self.notify_toolbar(); // 工具栏显隐(visible/全屏)按新配置即时刷新
+                self.sync_global_hotkeys(); // keys.global_hotkeys 增删/改键即时生效
                 self.show_toast(
                     "设置已更新",
                     ToastPosition::BottomCenter,
@@ -1811,6 +1816,7 @@ impl Coordinator {
             } => self.show_main_menu(x, y, y_bottom, above),
             UiEvent::MenuAction(kind) => self.menu_action(kind),
             UiEvent::MenuClose => self.menu_close(),
+            UiEvent::GlobalHotkey(action) => self.handle_global_hotkey(&action),
         }
     }
 
@@ -2165,6 +2171,10 @@ impl Coordinator {
                 self.show_status();
                 true
             }
+            "toggle_toolbar" => {
+                self.toggle_toolbar();
+                true
+            }
             "open_settings" => {
                 self.open_settings(None);
                 true
@@ -2178,6 +2188,76 @@ impl Coordinator {
                 false
             }
         }
+    }
+
+    /// 全局热键触发（Win32 RegisterHotKey 的 WM_HOTKEY，UI 线程回送）：统一走 dispatch_hotkey。
+    /// 此路径无 TSF 按键上下文，需要 composition 的动作（add_word）不参与全局注册
+    /// （见 build_global_hotkey_entries），直接复用分发即可。
+    fn handle_global_hotkey(&self, action: &str) {
+        debug!("Global hotkey: {}", action);
+        self.dispatch_hotkey(action);
+    }
+
+    /// 从 keys.global_hotkeys（动作名列表）构建 Win32 RegisterHotKey 条目。
+    /// 对齐 Go buildGlobalHotkeyEntries：仅支持无需按键上下文的动作；
+    /// activate_ime 不在此列（走 DirectSwitchHotkeys 注册表，不经 RegisterHotKey）。
+    fn build_global_hotkey_entries(&self) -> Vec<GlobalHotkeyEntry> {
+        // Win32 RegisterHotKey 修饰位（与 wind-ipc MOD_* 位序不同：ALT 与 SHIFT 互换）
+        const WIN32_MOD_ALT: u32 = 0x0001;
+        const WIN32_MOD_CONTROL: u32 = 0x0002;
+        const WIN32_MOD_SHIFT: u32 = 0x0004;
+        const WIN32_MOD_WIN: u32 = 0x0008;
+        let rt = self.rt();
+        let k = &rt.config.keys;
+        let supported: [(&str, &str); 7] = [
+            ("switch_engine", k.switch_engine.as_str()),
+            ("toggle_full_width", k.toggle_full_width.as_str()),
+            ("toggle_punct", k.toggle_punct.as_str()),
+            ("toggle_toolbar", k.toggle_toolbar.as_str()),
+            ("open_settings", k.open_settings.as_str()),
+            ("take_screenshot", k.take_screenshot.as_str()),
+            ("toggle_s2t", k.toggle_s2t.as_str()),
+        ];
+        let mut entries: Vec<GlobalHotkeyEntry> = Vec::new();
+        for name in &k.global_hotkeys {
+            let Some((_, value)) = supported.iter().find(|(n, _)| *n == name.as_str()) else {
+                warn!("global_hotkeys: 不支持的动作 {:?}，忽略", name);
+                continue;
+            };
+            let Some(hash) = hotkey::parse_hotkey(value) else {
+                warn!("global_hotkeys: {} 的热键 {:?} 解析失败，忽略", name, value);
+                continue;
+            };
+            // key_hash 布局 = (wind 修饰位 << 16) | vk（见 wind-config hotkey.rs）
+            let (mods, vk) = (hash >> 16, hash & 0xFFFF);
+            let mut win_mods = 0u32;
+            if mods & MOD_SHIFT != 0 {
+                win_mods |= WIN32_MOD_SHIFT;
+            }
+            if mods & MOD_CTRL != 0 {
+                win_mods |= WIN32_MOD_CONTROL;
+            }
+            if mods & MOD_ALT != 0 {
+                win_mods |= WIN32_MOD_ALT;
+            }
+            if mods & MOD_WIN != 0 {
+                win_mods |= WIN32_MOD_WIN;
+            }
+            entries.push(GlobalHotkeyEntry {
+                id: entries.len() as i32 + 1,
+                modifiers: win_mods,
+                vk,
+                action: name.clone(),
+            });
+        }
+        entries
+    }
+
+    /// 注册/刷新全局热键（启动与配置热重载时调用）。空列表也下发，用于清除旧注册。
+    pub(crate) fn sync_global_hotkeys(&self) {
+        let entries = self.build_global_hotkey_entries();
+        debug!("sync_global_hotkeys: {} entries", entries.len());
+        let _ = self.ui_tx.send(UiCommand::RegisterGlobalHotkeys(entries));
     }
 
     /// 切换中英文时取消当前输入：清空缓冲/候选/preedit，并按 `hotkeys.commit_on_switch`
