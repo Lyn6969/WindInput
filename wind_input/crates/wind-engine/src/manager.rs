@@ -1192,6 +1192,7 @@ impl EngineManager {
                 block_on_pinyin,
                 mix_cfg.pinyin_only_overflow,
                 mix_cfg.top_code_override_pinyin,
+                mix_cfg.show_source_hint,
             )));
         }
 
