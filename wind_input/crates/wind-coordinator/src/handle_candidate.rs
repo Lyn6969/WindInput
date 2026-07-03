@@ -2,7 +2,10 @@
 //!
 //! 从 coordinator.rs 拆出（同 crate 内 `impl Coordinator` 块，组织性重构，无逻辑变更）。
 
-use crate::coordinator::{Coordinator, InputOutcome, PHRASE_WEIGHT_BASE, State, now_unix_secs};
+use crate::coordinator::{
+    Coordinator, InputOutcome, LEARN_ADD_WEIGHT, LEARN_WEIGHT_DELTA, PHRASE_WEIGHT_BASE, State,
+    now_unix_secs,
+};
 use crate::pipeline::ModeKind;
 use tracing::{debug, warn};
 use wind_bridge::handler::{KeyAction, KeyEventData};
@@ -642,9 +645,44 @@ impl Coordinator {
         } else {
             state
                 .committed_segs
-                .push((code, cand.text.clone(), cand.source));
+                .push((code.clone(), cand.text.clone(), cand.source));
             let final_simplified = format!("{}{}", state.committed_text, cand.text);
             self.learn_phrase_on_commit(state); // 自动造词（多段组成的词）
+            // 6b: 临时词使用累积（对齐 Go LearnWord-on-commit）：选中临时层候选也推进晋升计数。
+            // 点查代替候选层标记：一次 redb 读，未命中即非临时词，零成本略过。
+            // is_phrase/is_command/is_group 已在 commit_selected 入口提前返回，此处均为普通候选。
+            if !cand.is_phrase {
+                if let Some(store) = &self.store {
+                    let active = self.engine_mgr.active_schema_id();
+                    if let Some(schema) =
+                        self.engine_mgr.write_data_schema_id(&active, cand.source)
+                    {
+                        if let Ok(Some(_)) = store.get_temp_word(&schema, &code, &cand.text) {
+                            let promote_count = if self.engine_mgr.is_pinyin() {
+                                self.engine_mgr.auto_learn_settings().promote_count
+                            } else {
+                                self.engine_mgr.codetable_settings().auto_phrase.promote_count
+                            };
+                            if let Ok(count) = store.learn_temp_word(
+                                &schema,
+                                &code,
+                                &cand.text,
+                                LEARN_ADD_WEIGHT,
+                                LEARN_WEIGHT_DELTA,
+                            ) {
+                                self.maybe_promote_temp(
+                                    store,
+                                    &schema,
+                                    &code,
+                                    &cand.text,
+                                    count,
+                                    promote_count,
+                                );
+                            }
+                        }
+                    }
+                }
+            }
             let out = self.maybe_s2t(state, &final_simplified);
             self.reset_pinyin_composition(state);
             self.notify_ui_hide();

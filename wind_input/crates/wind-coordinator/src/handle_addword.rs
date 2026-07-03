@@ -72,13 +72,13 @@ impl Coordinator {
         // 自动造词闸门：拼音方案读 [pinyin.auto_learn]，码表/混输读有效 [codetable.auto_phrase]
         // （混输继承主码表行为）。开关关闭直接跳过；min_len 为造词最小字数（0 回退 2）。
         // max_len：拼音路径不限（0）；码表路径取 max_phrase_len，0 回退 10。
-        let (enabled, min_len, max_len) = if self.engine_mgr.is_pinyin() {
+        let (enabled, min_len, max_len, promote_count) = if self.engine_mgr.is_pinyin() {
             let al = self.engine_mgr.auto_learn_settings();
-            (al.enabled, al.min_word_length, 0)
+            (al.enabled, al.min_word_length, 0, al.promote_count)
         } else {
             let ap = self.engine_mgr.codetable_settings().auto_phrase;
             let max = if ap.max_phrase_len == 0 { 10 } else { ap.max_phrase_len };
-            (ap.enabled, ap.min_phrase_len, max)
+            (ap.enabled, ap.min_phrase_len, max, ap.promote_count)
         };
         if !enabled {
             return;
@@ -118,13 +118,33 @@ impl Coordinator {
         } else {
             self.engine_mgr.data_schema_id(&active) // 拼音族折叠到 "pinyin"，与 record_freq 写读一致
         };
-        // add_weight/delta 取保守默认；晋升计数阈值由临时层累积达成（后续可接入 schema.learning 配置）。
-        if let Err(e) =
-            store.learn_temp_word(&schema, &code, &text, LEARN_ADD_WEIGHT, LEARN_WEIGHT_DELTA)
-        {
-            warn!("learn_temp_word failed: {}", e);
-        } else {
-            debug!("auto-learned phrase: {} -> {}", code, text);
+        // add_weight/delta 取保守默认；达 promote_count 阈值时晋升入用户词库。
+        match store.learn_temp_word(&schema, &code, &text, LEARN_ADD_WEIGHT, LEARN_WEIGHT_DELTA) {
+            Ok(count) => {
+                debug!("auto-learned phrase: {} -> {} (count={})", code, text, count);
+                self.maybe_promote_temp(store, &schema, &code, &text, count, promote_count);
+            }
+            Err(e) => warn!("learn_temp_word failed: {}", e),
+        }
+    }
+
+    /// 临时词晋升判定：promote_count>0 且累积 count 达阈 → 移入用户词库。0=禁用（对齐 Go 语义）。
+    pub(crate) fn maybe_promote_temp(
+        &self,
+        store: &wind_store::Store,
+        schema: &str,
+        code: &str,
+        text: &str,
+        count: u32,
+        promote_count: usize,
+    ) {
+        if promote_count == 0 || (count as usize) < promote_count {
+            return;
+        }
+        match store.promote_temp_word(schema, code, text) {
+            Ok(true) => debug!("temp word promoted: {} -> {}", code, text),
+            Ok(false) => {}
+            Err(e) => warn!("promote_temp_word failed: {}", e),
         }
     }
 
@@ -412,6 +432,63 @@ mod tests {
         for it in items {
             h.push_front(it.to_string());
         }
+    }
+
+    /// learn_phrase_on_commit 6a 晋升路径：promote_count=2，造词两次达阈值 → 自动晋升。
+    #[test]
+    fn learn_phrase_promotes_at_threshold_via_6a() {
+        use wind_candidate::CandidateSource as CS;
+        use wind_store::Store;
+        let path = std::env::temp_dir().join("wind_addword_promote6a.redb");
+        let _ = std::fs::remove_file(&path);
+        let store = Arc::new(Store::open(&path).unwrap());
+
+        // 开启自动造词 + 晋升阈值=2（码表路径）
+        let mut cfg = Config::default();
+        cfg.schema.codetable.auto_phrase.enabled = true;
+        cfg.schema.codetable.auto_phrase.promote_count = 2;
+
+        let c = Coordinator::new_headless_with_store(cfg, None, store.clone());
+
+        // 辅助：构造含 2 段的 State 并调用 learn_phrase_on_commit
+        let make_state_with_segs = || {
+            let mut st = c.state.lock().unwrap();
+            st.committed_segs = vec![
+                ("aa".to_string(), "工".to_string(), CS::CodeTable),
+                ("bb".to_string(), "人".to_string(), CS::CodeTable),
+            ];
+            drop(st);
+        };
+
+        // 第 1 次造词 → temp count=1，未达阈值
+        make_state_with_segs();
+        {
+            let st = c.state.lock().unwrap();
+            c.learn_phrase_on_commit(&st);
+        }
+
+        let active = c.engine_mgr.active_schema_id();
+        let schema = c.engine_mgr.data_schema_id(&active);
+        let count1 = store.get_temp_word(&schema, "aabb", "工人").unwrap();
+        assert_eq!(count1, Some(1), "第 1 次造词后临时层 count 应为 1");
+
+        // 第 2 次造词 → temp count=2，达阈值 → 自动晋升
+        make_state_with_segs();
+        {
+            let st = c.state.lock().unwrap();
+            c.learn_phrase_on_commit(&st);
+        }
+
+        // 临时层应已删除
+        let count2 = store.get_temp_word(&schema, "aabb", "工人").unwrap();
+        assert_eq!(count2, None, "晋升后临时层应删除");
+        // 用户词层应含晋升的词
+        let user = store.get_user_words(&schema, "aabb").unwrap();
+        assert!(
+            user.iter().any(|r| r.text == "工人"),
+            "用户词层应含晋升的词"
+        );
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]
