@@ -689,6 +689,15 @@ private:
                 if (SUCCEEDED(pCompRange->Clone(&pStartRange)) && pStartRange != nullptr)
                 {
                     pStartRange->Collapse(ec, TF_ANCHOR_START);
+                    // 组合头部若有待提交前缀（顶码聚合），上报的组合起点须偏移到
+                    // 余码段起点——候选窗锚点跟随余码而非已顶出的文字。
+                    LONG prefixLen = (LONG)_pTextService->GetPendingCommitPrefixLength();
+                    if (prefixLen > 0)
+                    {
+                        LONG moved = 0;
+                        pStartRange->ShiftEnd(ec, prefixLen, &moved, nullptr);
+                        pStartRange->ShiftStart(ec, prefixLen, &moved, nullptr);
+                    }
                     RECT compStartRect = {};
                     BOOL clipped = FALSE;
                     if (SUCCEEDED(pContextView->GetTextExt(ec, pStartRange, &compStartRect, &clipped)))
@@ -727,19 +736,43 @@ private:
             return;
         }
 
-        // Set the display attribute on the composition range
         VARIANT var;
         var.vt = VT_I4;
         var.lVal = gaDisplayAttr;
 
-        HRESULT hr = pDisplayAttrProp->SetValue(ec, pRange, &var);
+        // 分段显示属性（对齐微软 IME）：组合头部的待提交前缀（顶码已顶出的字）
+        // 不带下划线——先 Clear 整段，再只对余码段 SetValue。前缀为 0 时即整段。
+        pDisplayAttrProp->Clear(ec, pRange);
+
+        LONG prefixLen = (LONG)_pTextService->GetPendingCommitPrefixLength();
+        ITfRange* pAttrRange = nullptr;
+        if (prefixLen > 0)
+        {
+            if (SUCCEEDED(pRange->Clone(&pAttrRange)) && pAttrRange != nullptr)
+            {
+                LONG moved = 0;
+                pAttrRange->ShiftStart(ec, prefixLen, &moved, nullptr);
+            }
+        }
+        else
+        {
+            pAttrRange = pRange;
+            pAttrRange->AddRef();
+        }
+
+        HRESULT hr = E_FAIL;
+        if (pAttrRange != nullptr)
+        {
+            hr = pDisplayAttrProp->SetValue(ec, pAttrRange, &var);
+            pAttrRange->Release();
+        }
         if (FAILED(hr))
         {
             WIND_LOG_DEBUG(L"Failed to set display attribute\n");
         }
         else
         {
-            WIND_LOG_DEBUG(L"Display attribute set successfully\n");
+            WIND_LOG_DEBUG_FMT(L"Display attribute set (prefixLen=%ld)\n", prefixLen);
         }
 
         pDisplayAttrProp->Release();
@@ -750,222 +783,6 @@ private:
     CTextService* _pTextService;
     ITfContext* _pContext;
     std::wstring _text;
-};
-
-// EditSession for inserting text and starting new composition (for top code commit)
-class CInsertAndComposeEditSession : public ITfEditSession
-{
-public:
-    // pOldComposition ownership is transferred (may be nullptr)
-    CInsertAndComposeEditSession(CTextService* pTextService, ITfContext* pContext,
-                                  ITfComposition* pOldComposition,
-                                  const std::wstring& insertText, const std::wstring& newComposition)
-        : _refCount(1), _pTextService(pTextService), _pContext(pContext),
-          _pOldComposition(pOldComposition), _insertText(insertText), _newComposition(newComposition)
-    {
-        _pTextService->AddRef();
-        _pContext->AddRef();
-    }
-
-    ~CInsertAndComposeEditSession()
-    {
-        _pTextService->Release();
-        _pContext->Release();
-        if (_pOldComposition != nullptr)
-        {
-            WIND_LOG_DEBUG(L"~CInsertAndComposeEditSession: Releasing orphaned old composition\n");
-            _pOldComposition->Release();
-            _pOldComposition = nullptr;
-        }
-    }
-
-    // IUnknown
-    STDMETHODIMP QueryInterface(REFIID riid, void** ppvObj)
-    {
-        if (ppvObj == nullptr) return E_INVALIDARG;
-        *ppvObj = nullptr;
-        if (IsEqualIID(riid, IID_IUnknown) || IsEqualIID(riid, IID_ITfEditSession))
-        {
-            *ppvObj = (ITfEditSession*)this;
-            AddRef();
-            return S_OK;
-        }
-        return E_NOINTERFACE;
-    }
-
-    STDMETHODIMP_(ULONG) AddRef() { return InterlockedIncrement(&_refCount); }
-    STDMETHODIMP_(ULONG) Release()
-    {
-        LONG cr = InterlockedDecrement(&_refCount);
-        if (cr == 0) delete this;
-        return cr;
-    }
-
-    // ITfEditSession
-    STDMETHODIMP DoEditSession(TfEditCookie ec)
-    {
-        HRESULT hr = S_OK;
-
-        WIND_LOG_DEBUG_FMT(L"InsertAndCompose: insert='%s', newComp='%s'\n",
-                     _insertText.c_str(), _newComposition.c_str());
-
-        // 0. End old composition (if present) — 与 CCommitTextEditSession 一致采用
-        // "SetText(最终文字) + EndComposition" 模式, 让宿主感知到一次完整 IME 上屏
-        // 而非"取消 composition + 旁路 Insert"。光标自动落在插入文字之后, 作为新
-        // composition 的起点。原子性由单一 EditSession 保证, 浏览器异步竞态修复不
-        // 受影响 (历史 02a753f)。
-        bool insertedViaOldComposition = false;
-        if (_pOldComposition != nullptr)
-        {
-            ITfRange* pRange = nullptr;
-            if (SUCCEEDED(_pOldComposition->GetRange(&pRange)))
-            {
-                // _insertText 为空也允许 (语义=清空旧 composition 后另起新 composition)。
-                pRange->SetText(ec, TF_ST_CORRECTION, _insertText.c_str(), (LONG)_insertText.length());
-                pRange->Collapse(ec, TF_ANCHOR_END);
-                TF_SELECTION sel = {};
-                sel.range = pRange;
-                sel.style.ase = TF_AE_NONE;
-                sel.style.fInterimChar = FALSE;
-                _pContext->SetSelection(ec, 1, &sel);
-                pRange->Release();
-                insertedViaOldComposition = true;
-            }
-            _pOldComposition->EndComposition(ec);
-            _pOldComposition->Release();
-            _pOldComposition = nullptr;
-            WIND_LOG_DEBUG(L"InsertAndCompose: Old composition ended via SetText + EndComposition\n");
-        }
-
-        // 1. Get current selection to anchor new composition
-        TF_SELECTION tfSelection;
-        ULONG cFetched;
-        if (FAILED(_pContext->GetSelection(ec, TF_DEFAULT_SELECTION, 1, &tfSelection, &cFetched)) || cFetched != 1)
-        {
-            WIND_LOG_DEBUG(L"InsertAndCompose: Failed to get selection\n");
-            return E_FAIL;
-        }
-
-        // 2. 仅在无旧 composition 的回退路径下才需要在 selection 处插入文字
-        // (旧 composition 路径已经在第 0 步通过 SetText 写入并把光标移到了文本末)。
-        if (!insertedViaOldComposition && !_insertText.empty())
-        {
-            hr = tfSelection.range->SetText(ec, 0, _insertText.c_str(), (LONG)_insertText.length());
-            if (FAILED(hr))
-            {
-                WIND_LOG_DEBUG(L"InsertAndCompose: Failed to insert text\n");
-                tfSelection.range->Release();
-                return hr;
-            }
-            WIND_LOG_DEBUG(L"InsertAndCompose: Text inserted at selection (fallback path)\n");
-
-            // Collapse range to end (after inserted text)
-            tfSelection.range->Collapse(ec, TF_ANCHOR_END);
-        }
-
-        // 3. Now start a new composition for the new input
-        // Always start composition (even when _newComposition is empty = non-inline placeholder mode)
-        {
-            ITfContextComposition* pContextComp = nullptr;
-            if (FAILED(_pContext->QueryInterface(IID_ITfContextComposition, (void**)&pContextComp)))
-            {
-                WIND_LOG_DEBUG(L"InsertAndCompose: Failed to get ITfContextComposition\n");
-                tfSelection.range->Release();
-                return E_FAIL;
-            }
-
-            // Start new composition at current position (after inserted text)
-            hr = pContextComp->StartComposition(
-                ec,
-                tfSelection.range,
-                (ITfCompositionSink*)_pTextService,
-                &_pTextService->_pComposition);
-
-            pContextComp->Release();
-
-            if (FAILED(hr) || _pTextService->_pComposition == nullptr)
-            {
-                WIND_LOG_DEBUG(L"InsertAndCompose: Failed to start new composition\n");
-                tfSelection.range->Release();
-                return E_FAIL;
-            }
-
-            WIND_LOG_DEBUG(L"InsertAndCompose: New composition started\n");
-            // Weasel 模式：与 CUpdateCompositionEditSession 一致，标记延迟首次 IPC。
-            _pTextService->_compositionJustStarted = TRUE;
-
-            // 4. Set the composition text
-            // Non-inline preedit: _newComposition is empty → use space placeholder (same as
-            // CUpdateCompositionEditSession), cursor positioned BEFORE the placeholder so
-            // GetTextExt returns valid coordinates without showing any visible text.
-            BOOL isPlaceholder = _newComposition.empty();
-            static const wchar_t PLACEHOLDER[] = L" ";
-            const wchar_t* textPtr = isPlaceholder ? PLACEHOLDER : _newComposition.c_str();
-            LONG textLen = isPlaceholder ? 1 : (LONG)_newComposition.length();
-
-            ITfRange* pCompRange = nullptr;
-            if (SUCCEEDED(_pTextService->_pComposition->GetRange(&pCompRange)))
-            {
-                hr = pCompRange->SetText(ec, TF_ST_CORRECTION, textPtr, textLen);
-                if (SUCCEEDED(hr))
-                {
-                    if (!isPlaceholder)
-                        _SetDisplayAttribute(ec, pCompRange);
-
-                    ITfRange* pRangeForSel = nullptr;
-                    if (SUCCEEDED(_pTextService->_pComposition->GetRange(&pRangeForSel)))
-                    {
-                        if (isPlaceholder)
-                        {
-                            // Placeholder: position cursor BEFORE the space (same as UpdateComposition placeholder logic)
-                            pRangeForSel->Collapse(ec, TF_ANCHOR_START);
-                        }
-                        else
-                        {
-                            // Inline preedit: cursor at end of composition text
-                            pRangeForSel->Collapse(ec, TF_ANCHOR_END);
-                        }
-                        TF_SELECTION sel = {};
-                        sel.range = pRangeForSel;
-                        sel.style.ase = TF_AE_NONE;
-                        sel.style.fInterimChar = FALSE;
-                        _pContext->SetSelection(ec, 1, &sel);
-                        pRangeForSel->Release();
-                    }
-                    WIND_LOG_DEBUG_FMT(L"InsertAndCompose: Composition text set (placeholder=%d)\n", isPlaceholder);
-                }
-                pCompRange->Release();
-            }
-        }
-
-        tfSelection.range->Release();
-        return S_OK;
-    }
-
-private:
-    ITfComposition* _pOldComposition;  // Owned old composition pointer
-
-    void _SetDisplayAttribute(TfEditCookie ec, ITfRange* pRange)
-    {
-        TfGuidAtom gaDisplayAttr = _pTextService->GetDisplayAttributeInputAtom();
-        if (gaDisplayAttr == TF_INVALID_GUIDATOM) return;
-
-        ITfProperty* pDisplayAttrProp = nullptr;
-        if (FAILED(_pContext->GetProperty(GUID_PROP_ATTRIBUTE, &pDisplayAttrProp))) return;
-
-        VARIANT var;
-        var.vt = VT_I4;
-        var.lVal = gaDisplayAttr;
-        pDisplayAttrProp->SetValue(ec, pRange, &var);
-        pDisplayAttrProp->Release();
-    }
-
-private:
-    LONG _refCount;
-    CTextService* _pTextService;
-    ITfContext* _pContext;
-    std::wstring _insertText;
-    std::wstring _newComposition;
 };
 
 static const LONG DEFAULT_CARET_HEIGHT = 20;
@@ -3966,7 +3783,8 @@ BOOL CTextService::GetCompositionStartPosition(LONG* px, LONG* py)
     RECT caretRect = {}, compStartRect = {};
     BOOL hasCompStart = FALSE;
     BOOL result = CCaretEditSession::GetCaretAndCompositionStartRect(
-        pContext, _tfClientId, _pComposition, &caretRect, &compStartRect, &hasCompStart);
+        pContext, _tfClientId, _pComposition, &caretRect, &compStartRect, &hasCompStart,
+        (LONG)GetPendingCommitPrefixLength());
     pContext->Release();
 
     if (result && hasCompStart)
@@ -4490,13 +4308,17 @@ void CTextService::_UnadviseTextEditSink()
 // Update composition text
 BOOL CTextService::UpdateComposition(const std::wstring& text, int caretPos)
 {
-    WIND_LOG_DEBUG_FMT(L"UpdateComposition called, textLen=%zu, _pComposition=%p\n",
-                 text.length(), _pComposition);
+    // 顶码聚合（微软 IME 行为）：组合实际显示 = 待提交前缀 + 引擎组合文本，
+    // 光标位置随前缀偏移。前缀为空时与原行为完全一致。
+    std::wstring full = _pendingCommitPrefix + text;
+    int fullCaret = (caretPos >= 0) ? (int)(_pendingCommitPrefix.length() + caretPos) : caretPos;
 
-    // OPTIMIZATION: Skip if both composition text AND caret position are the same as last time
-    // This avoids unnecessary TSF RequestEditSession calls which can be slow in some apps
-    // Note: must compare caretPos too, otherwise cursor movement (left/right arrow) gets skipped
-    if (text == _lastCompositionText && caretPos == _lastCaretPos && _pComposition != nullptr)
+    WIND_LOG_DEBUG_FMT(L"UpdateComposition called, textLen=%zu, prefixLen=%zu, _pComposition=%p\n",
+                 text.length(), _pendingCommitPrefix.length(), _pComposition);
+
+    // 优化：文本与光标都与上次相同则跳过，避免多余的 RequestEditSession
+    //（必须同时比较光标，否则左右移动光标会被跳过）
+    if (full == _lastCompositionText && fullCaret == _lastCaretPos && _pComposition != nullptr)
     {
         WIND_LOG_DEBUG(L"UpdateComposition: Skipping duplicate (same text and caret)\n");
         return TRUE;
@@ -4520,7 +4342,7 @@ BOOL CTextService::UpdateComposition(const std::wstring& text, int caretPos)
         return FALSE;
     }
 
-    CUpdateCompositionEditSession* pEditSession = new CUpdateCompositionEditSession(this, pContext, text, caretPos);
+    CUpdateCompositionEditSession* pEditSession = new CUpdateCompositionEditSession(this, pContext, full, fullCaret);
 
     // Timing: measure RequestEditSession duration
     LARGE_INTEGER startTime, endTime, freq;
@@ -4542,11 +4364,11 @@ BOOL CTextService::UpdateComposition(const std::wstring& text, int caretPos)
     pEditSession->Release();
     pContext->Release();
 
-    // Update cache on success
+    // 成功后更新去重缓存（缓存的是含前缀的完整显示文本）
     if (SUCCEEDED(hr))
     {
-        _lastCompositionText = text;
-        _lastCaretPos = caretPos;
+        _lastCompositionText = full;
+        _lastCaretPos = fullCaret;
     }
 
     return SUCCEEDED(hr);
@@ -4643,6 +4465,10 @@ BOOL CTextService::CommitText(const std::wstring& text)
     // 防止 timeout 与此次 commit 竞争。
     CancelHoldTimer();
 
+    // 顶码聚合：真正提交 = 待提交前缀 + 本次文本（微软 IME 的延迟提交在此收口）。
+    std::wstring full = _pendingCommitPrefix + text;
+    _pendingCommitPrefix.clear();
+
     LARGE_INTEGER startTime, endTime, freq;
     QueryPerformanceCounter(&startTime);
     QueryPerformanceFrequency(&freq);
@@ -4655,7 +4481,7 @@ BOOL CTextService::CommitText(const std::wstring& text)
     ITfComposition* pCompToEnd = _pComposition;
     _pComposition = nullptr;
 
-    if (text.empty() && pCompToEnd == nullptr)
+    if (full.empty() && pCompToEnd == nullptr)
     {
         WIND_LOG_DEBUG(L"CommitText: Nothing to do (no text, no composition)\n");
         return TRUE;
@@ -4682,7 +4508,7 @@ BOOL CTextService::CommitText(const std::wstring& text)
             goto fallback;
         }
 
-        CCommitTextEditSession* pEditSession = new CCommitTextEditSession(this, pContext, pCompToEnd, text);
+        CCommitTextEditSession* pEditSession = new CCommitTextEditSession(this, pContext, pCompToEnd, full);
         // pCompToEnd ownership transferred to pEditSession
 
         HRESULT hrSession;
@@ -4706,18 +4532,18 @@ BOOL CTextService::CommitText(const std::wstring& text)
     }
 
 fallback:
-    // Fallback: Use SendInput (same as InsertText fallback path)
-    if (text.empty())
+    // 兜底：用 SendInput 注入（与 InsertText 的兜底路径一致）
+    if (full.empty())
     {
         return TRUE;
     }
 
-    WIND_LOG_DEBUG_FMT(L"CommitText: Using SendInput fallback for textLen=%zu\n", text.length());
+    WIND_LOG_DEBUG_FMT(L"CommitText: Using SendInput fallback for textLen=%zu\n", full.length());
 
     std::vector<INPUT> inputs;
-    inputs.reserve(text.length() * 2);
+    inputs.reserve(full.length() * 2);
 
-    for (wchar_t ch : text)
+    for (wchar_t ch : full)
     {
         INPUT inputDown = {};
         inputDown.type = INPUT_KEYBOARD;
@@ -4749,6 +4575,17 @@ fallback:
 // so that HasActiveComposition() returns FALSE and new compositions can start.
 void CTextService::EndComposition(ITfDocumentMgr* pDocMgrHint)
 {
+    // 顶码聚合中（组合头部有待提交前缀）：不能按「放弃组合」处理——引擎已把
+    // 顶出的字按上屏记账（词频/统计）。转为提交前缀、丢弃余码（CommitText 的
+    // EditSession 会 SetText(前缀)+EndComposition）。
+    // 注：此路径使用当前焦点 context 提交；失焦竞态下可能落到兜底 SendInput。
+    if (!_pendingCommitPrefix.empty() && _pComposition != nullptr)
+    {
+        WIND_LOG_DEBUG(L"EndComposition: flushing pending top-code prefix as commit\n");
+        CommitText(L"");
+        return;
+    }
+
     LARGE_INTEGER startTime, endTime, freq;
     QueryPerformanceCounter(&startTime);
     QueryPerformanceFrequency(&freq);
@@ -4756,6 +4593,9 @@ void CTextService::EndComposition(ITfDocumentMgr* pDocMgrHint)
     // Clear composition text cache
     _lastCompositionText.clear();
     _lastCaretPos = -1;
+
+    // 无组合但有残留前缀（异常路径）：直接丢弃，防止污染下一次组合。
+    _pendingCommitPrefix.clear();
 
     // If there's no active composition, nothing to do
     if (_pComposition == nullptr)
@@ -4840,49 +4680,20 @@ void CTextService::ResetComposingState()
 // Insert text and start new composition (for top code commit)
 BOOL CTextService::InsertTextAndStartComposition(const std::wstring& insertText, const std::wstring& newComposition)
 {
-    WIND_LOG_DEBUG_FMT(L"InsertTextAndStartComposition: insert='%s', newComp='%s', _pComposition=%p\n",
-                 insertText.c_str(), newComposition.c_str(), _pComposition);
+    WIND_LOG_DEBUG_FMT(L"InsertTextAndStartComposition: insert='%s', newComp='%s', prefixLen=%zu, _pComposition=%p\n",
+                 insertText.c_str(), newComposition.c_str(), _pendingCommitPrefix.length(), _pComposition);
 
-    // Clear composition text cache
-    _lastCompositionText.clear();
-    _lastCaretPos = -1;
-
-    // Transfer ownership of old composition to EditSession (will be ended atomically inside DoEditSession)
-    ITfComposition* pOldComp = _pComposition;
-    _pComposition = nullptr;
-
-    // Need a document manager
-    ITfDocumentMgr* pDocMgr = nullptr;
-    if (_pThreadMgr == nullptr || FAILED(_pThreadMgr->GetFocus(&pDocMgr)) || pDocMgr == nullptr)
-    {
-        WIND_LOG_ERROR(L"InsertTextAndStartComposition: Failed to get DocMgr\n");
-        if (pOldComp != nullptr) pOldComp->Release();
-        return FALSE;
-    }
-
-    ITfContext* pContext = nullptr;
-    HRESULT hr = pDocMgr->GetTop(&pContext);
-    pDocMgr->Release();
-
-    if (FAILED(hr) || pContext == nullptr)
-    {
-        WIND_LOG_ERROR(L"InsertTextAndStartComposition: Failed to get Context\n");
-        if (pOldComp != nullptr) pOldComp->Release();
-        return FALSE;
-    }
-
-    CInsertAndComposeEditSession* pEditSession = new CInsertAndComposeEditSession(this, pContext, pOldComp, insertText, newComposition);
-
-    HRESULT hrSession;
-    // Use TF_ES_SYNC to ensure synchronous execution
-    hr = pContext->RequestEditSession(_tfClientId, pEditSession, TF_ES_SYNC | TF_ES_READWRITE, &hrSession);
-
-    WIND_LOG_DEBUG_FMT(L"InsertTextAndStartComposition: RequestEditSession hr=0x%08X, hrSession=0x%08X\n", hr, hrSession);
-
-    pEditSession->Release();
-    pContext->Release();
-
-    return SUCCEEDED(hr) && SUCCEEDED(hrSession);
+    // 顶码聚合（微软 IME 行为，经 Chrome 事件探针实测微软五笔确认）：顶出的文本
+    // 不立即提交文档，而是累入待提交前缀、留在组合头部显示（无下划线段），真正的
+    // 提交推迟到最终上屏（CommitText）一次完成。宿主全程只看到 compositionupdate、
+    // 最后一次 compositionend —— 与微软五笔事件流完全一致，快照式宿主（tabby/
+    // xterm.js 读 textarea 快照）与 diff 式宿主（Chromium TSFTextStore）都不会
+    // 把余码并入提交（此前 EndComposition→StartComposition 各种拆法均双写余码）。
+    //
+    // 有活动组合：纯组合内容更新（'skce' → '可能y'）；无活动组合（罕见）：
+    // UpdateComposition 会新建组合并显示 前缀+余码。
+    _pendingCommitPrefix += insertText;
+    return UpdateComposition(newComposition, (int)newComposition.length());
 }
 
 // ============================================================================

@@ -25,21 +25,27 @@ public:
     static BOOL GetCaretRect(ITfContext* pContext, TfClientId tfClientId, RECT* prc);
 
     // Execute the session and get both caret position and composition start position
+    // compStartOffset: 组合起点偏移（wchar 数），见 SetCompositionStartOffset
     static BOOL GetCaretAndCompositionStartRect(ITfContext* pContext, TfClientId tfClientId,
                                                  ITfComposition* pComposition,
-                                                 RECT* pCaretRect, RECT* pCompStartRect, BOOL* pHasCompStart);
+                                                 RECT* pCaretRect, RECT* pCompStartRect, BOOL* pHasCompStart,
+                                                 LONG compStartOffset = 0);
 
     // Get the result after DoEditSession is called
     BOOL GetResult(RECT* prc);
 
     // Set composition to also query its start position
     void SetComposition(ITfComposition* pComposition) { _pComposition = pComposition; }
+    // 组合起点偏移（wchar 数）：组合头部有顶码待提交前缀时，上报的组合起点
+    // 应指向余码段起点（候选窗锚点跟随余码，而非已顶出的文字）。
+    void SetCompositionStartOffset(LONG offset) { _compStartOffset = offset; }
     BOOL GetCompositionStartResult(RECT* prc);
 
 private:
     LONG _refCount;
     ITfContext* _pContext;
     ITfComposition* _pComposition;
+    LONG _compStartOffset;
     RECT _caretRect;
     RECT _compositionStartRect;
     BOOL _hasCompositionStart;

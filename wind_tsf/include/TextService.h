@@ -34,7 +34,6 @@ class CTextService : public ITfTextInputProcessorEx,
     friend class CEndCompositionEditSession;
     friend class CCommitTextEditSession;
     friend class CReplaceBackwardEditSession;
-    friend class CInsertAndComposeEditSession;
     friend class CInsertTextEditSession;
 public:
     CTextService();
@@ -152,8 +151,15 @@ public:
     // Reset KeyEventSink composing state (called after push pipe commit/clear)
     void ResetComposingState();
 
-    // Insert text and start new composition (for top code commit)
+    // Top-code commit: accumulate the committed text into the pending prefix and
+    // keep it INSIDE the composition (Microsoft IME behavior — the real document
+    // commit is deferred to the final CommitText). See _pendingCommitPrefix.
     BOOL InsertTextAndStartComposition(const std::wstring& insertText, const std::wstring& newComposition);
+
+    // Length (in wchars) of the pending top-code commit prefix shown at the head
+    // of the composition. Used to segment display attributes and to offset the
+    // composition-start coordinate reported to the engine (candidate anchor).
+    size_t GetPendingCommitPrefixLength() const { return _pendingCommitPrefix.length(); }
 
     // Get and consume cached character before caret (set by ITfTextEditSink::OnEndEdit).
     // Returns the cached value and clears it to prevent stale values persisting across
@@ -282,6 +288,11 @@ private:
 
     // Composition
     ITfComposition* _pComposition;
+    // Top-code committed text kept at the head of the composition, not yet
+    // committed to the document (Microsoft IME defers the real commit to the
+    // final confirmation — verified via Chrome IME event probe: MS Wubi sends
+    // compositionupdate '可能y' on top-code, compositionend only at the end).
+    std::wstring _pendingCommitPrefix;
     std::wstring _lastCompositionText;  // Cache to skip redundant updates
     int _lastCaretPos = -1;             // Cache caret position to detect cursor movement
     BOOL _asyncEdit;  // Track if last RequestEditSession returned TF_S_ASYNC (Weasel optimization)

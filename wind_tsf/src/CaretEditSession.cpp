@@ -6,6 +6,7 @@ CCaretEditSession::CCaretEditSession(ITfContext* pContext)
     : _refCount(1)
     , _pContext(pContext)
     , _pComposition(nullptr)
+    , _compStartOffset(0)
     , _hasCompositionStart(FALSE)
     , _succeeded(FALSE)
 {
@@ -117,6 +118,13 @@ STDAPI CCaretEditSession::DoEditSession(TfEditCookie ec)
                 if (SUCCEEDED(hr) && pStartRange != nullptr)
                 {
                     pStartRange->Collapse(ec, TF_ANCHOR_START);
+                    // 有顶码待提交前缀时，组合起点偏移到余码段起点
+                    if (_compStartOffset > 0)
+                    {
+                        LONG moved = 0;
+                        pStartRange->ShiftEnd(ec, _compStartOffset, &moved, nullptr);
+                        pStartRange->ShiftStart(ec, _compStartOffset, &moved, nullptr);
+                    }
                     BOOL clippedComp = FALSE;
                     hr = pContextView->GetTextExt(ec, pStartRange, &_compositionStartRect, &clippedComp);
                     if (SUCCEEDED(hr))
@@ -214,7 +222,8 @@ BOOL CCaretEditSession::GetCaretRect(ITfContext* pContext, TfClientId tfClientId
 // Static method to get both caret rect and composition start rect
 BOOL CCaretEditSession::GetCaretAndCompositionStartRect(ITfContext* pContext, TfClientId tfClientId,
                                                          ITfComposition* pComposition,
-                                                         RECT* pCaretRect, RECT* pCompStartRect, BOOL* pHasCompStart)
+                                                         RECT* pCaretRect, RECT* pCompStartRect, BOOL* pHasCompStart,
+                                                         LONG compStartOffset)
 {
     if (pContext == nullptr || pCaretRect == nullptr)
     {
@@ -228,6 +237,7 @@ BOOL CCaretEditSession::GetCaretAndCompositionStartRect(ITfContext* pContext, Tf
     }
 
     pEditSession->SetComposition(pComposition);
+    pEditSession->SetCompositionStartOffset(compStartOffset);
 
     HRESULT hrSession = S_OK;
     HRESULT hr = pContext->RequestEditSession(
