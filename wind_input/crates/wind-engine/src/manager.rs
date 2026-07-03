@@ -237,8 +237,9 @@ impl EngineManager {
             .show_code_hint
     }
 
-    /// 拼音分隔符模式（auto/quote/backtick/none）。auto 在 Rust 等价 quote
-    /// （无「引号作第 3 选择键」的联动功能，故不做 Go 版 auto 的动态切换）。
+    /// 拼音分隔符模式（auto/quote/backtick/none）的原始配置值。
+    /// 分隔符键的最终判定（含 auto 动态避让候选选择键）在协调器侧完成——
+    /// 因「`'` 是否为选择键」需读 `select_key_groups`（协调器配置），引擎无该信息。
     pub fn pinyin_separator_mode(&self) -> String {
         self.pinyin
             .lock()
@@ -247,25 +248,28 @@ impl EngineManager {
             .clone()
     }
 
-    /// 当前是否应把 `key_code` 作为拼音手动音节分隔符接受进组合。
-    /// 条件：活跃引擎为拼音类型，且分隔符模式与按键匹配——
-    /// `quote`/`auto` 对应引号键(VK_OEM_7=0xDE)，`backtick` 对应反引号键(VK_OEM_3=0xC0)，
-    /// `none` 恒 false。缓冲是否为空由协调器判定（空缓冲维持标点路径）。
-    ///
-    /// 注：混输方案暂不启用（保守，避免与码表候选/选词键冲突）；双拼方案虽为拼音类型，
-    /// 但引擎在 convert 前剥除 `'`，分隔符对双拼实际不生效（见 mod.rs 说明）。
-    pub fn pinyin_accepts_separator(&self, key_code: u32) -> bool {
-        if !self.is_pinyin() {
-            return false;
+    /// 当前活跃拼音方案是否为双拼（`engine.pinyin.scheme == "shuangpin"`）。
+    /// 双拼不支持手动音节分隔符（`'` 会进 buffer 但引擎 convert 前剥除，致 buffer 与 preedit
+    /// 发散、Backspace 删不可见字符），供协调器 gate。复用韵母键集缓存（Some 即双拼），
+    /// 与 `shuangpin_final_key` 同源、方案切换/reload 自动失效。
+    pub fn pinyin_is_shuangpin(&self) -> bool {
+        let active_id = self.active_schema_id();
+        {
+            let cache = self
+                .shuangpin_finals_cache
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            if cache.0 == active_id {
+                return cache.1.is_some();
+            }
         }
-        const VK_QUOTE: u32 = 0xDE; // ' " VK_OEM_7
-        const VK_BACKTICK: u32 = 0xC0; // ` ~ VK_OEM_3
-        match self.pinyin_separator_mode().as_str() {
-            "none" => false,
-            "backtick" => key_code == VK_BACKTICK,
-            // quote / auto（auto 等价 quote）/ 其它未知值 → 引号键
-            _ => key_code == VK_QUOTE,
-        }
+        let finals_set = self.build_shuangpin_finals(&active_id);
+        let is_sp = finals_set.is_some();
+        *self
+            .shuangpin_finals_cache
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = (active_id, finals_set);
+        is_sp
     }
 
     /// 活跃方案为双拼且 `key`（ASCII 字节）是其布局的韵母键时返回 true，否则 false。

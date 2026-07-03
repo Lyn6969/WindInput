@@ -3173,11 +3173,12 @@ impl MessageHandler for Coordinator {
             keymap::VK_QUOTE | keymap::VK_BACKTICK
                 if data.modifiers & MOD_SHIFT == 0
                     && !state.input_buffer.is_empty()
-                    && self.engine_mgr.pinyin_accepts_separator(data.key_code) =>
+                    && self.pinyin_separator_key(data.key_code) =>
             {
                 // 拼音手动音节分隔符：把 `'` 压入缓冲作硬边界（引擎按 `'` 强制切分、查询前剥除、
                 // preedit 原样保留含末尾 `'`）。走与字母键一致的候选刷新路径。
-                // 置于选词/标点分派（`_` 臂）之前：分隔符模式下引号/反引号优先作分隔符而非三选键。
+                // 置于选词/标点分派（`_` 臂）之前：分隔符模式下该键优先作分隔符而非三选键——
+                // auto 模式仅在 `'` 未被占作选择键时才拦截 `'`（见 pinyin_separator_key）。
                 state.input_buffer.push('\'');
                 match self.update_candidates(&mut state) {
                     InputOutcome::AutoCommit(text) => {

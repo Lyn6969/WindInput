@@ -370,53 +370,149 @@ fn test_pinyin_basic_input() {
     }
 }
 
-/// Task 8：拼音手动音节分隔符接线。
-/// 默认 separator="auto" → 引号键在非空拼音组合中作硬边界压入缓冲（preedit 保留 `'`）；
-/// separator="none" → 引号键不作分隔符（回落选词/标点路径，不进组合）。
+/// 断言某次分隔符键返回的动作**未**把 `'` 压入组合区。
+fn separator_not_inserted(act: &KeyAction) -> bool {
+    !matches!(act, KeyAction::UpdateComposition { text, .. } if text.contains('\''))
+}
+
+/// Task 8 / Fix Round 1：`auto` 真语义——默认选键组（`semicolon_quote` 含 `'`=VK_OEM_7）下，
+/// `'` 保留三选键功能、**不**作分隔符；改由反引号(`, VK_OEM_3=0xC0)作硬边界压入缓冲。
 #[test]
-fn quote_key_inserts_separator_in_pinyin_composition() {
+fn separator_auto_avoids_quote_when_it_is_select_key() {
     if !has_schemas() {
         return;
     }
-    // ── auto（默认）：引号作分隔符 ──
+    // ' (VK_OEM_7=0xDE)：默认作三选键 → 不作分隔符，preedit 不应出现 '
     let coord = Coordinator::new_headless(config_with("pinyin"), Some(&data_dir()));
     for c in "xi".chars() {
         press_letter(&coord, c);
     }
-    // 引号(', VK_OEM_7=0xDE)：非空缓冲 + 拼音 → 压入 `'` 作分隔符
-    let act = coord.handle_key_event(&key_event(0xDE, EVENT_KEY_DOWN));
-    let pre = action_text(&act).expect("引号应作分隔符并返回组合区");
+    let q = coord.handle_key_event(&key_event(0xDE, EVENT_KEY_DOWN));
     assert!(
-        pre.contains('\''),
-        "auto 模式引号应插入分隔符，实际 preedit: {}",
-        pre
-    );
-    // 继续输入 an：手动边界固定为 [xi, an]，preedit 原样保留手动 `'`
-    let mut last = act;
-    for c in "an".chars() {
-        last = press_letter(&coord, c);
-    }
-    let pre = action_text(&last).unwrap();
-    assert_eq!(pre, "xi'an", "手动分隔符应固定音节边界，实际: {}", pre);
-    assert!(
-        !coord.debug_page_texts().is_empty(),
-        "分隔后仍应有候选（如「西」/「西安」）"
+        separator_not_inserted(&q),
+        "auto+默认选键组：引号应保留选键功能、不作分隔符，实际: {:?}",
+        q
     );
 
-    // ── none：引号不作分隔符 ──
-    let mut cfg = config_with("pinyin");
-    cfg.schema.pinyin.separator = "none".into();
-    let coord2 = Coordinator::new_headless(cfg, Some(&data_dir()));
+    // 反引号(0xC0)：' 被占 → 反引号作分隔符，压入 ' 并固定音节边界
+    let coord2 = Coordinator::new_headless(config_with("pinyin"), Some(&data_dir()));
     for c in "xi".chars() {
         press_letter(&coord2, c);
     }
-    let act2 = coord2.handle_key_event(&key_event(0xDE, EVENT_KEY_DOWN));
-    let inserted_sep =
-        matches!(&act2, KeyAction::UpdateComposition { text, .. } if text.contains('\''));
+    let b = coord2.handle_key_event(&key_event(0xC0, EVENT_KEY_DOWN));
+    let pre = action_text(&b).expect("反引号应作分隔符并返回组合区");
     assert!(
-        !inserted_sep,
-        "none 模式引号不应插入分隔符（应回落选词/标点路径），实际: {:?}",
-        act2
+        pre.contains('\''),
+        "auto+默认选键组：反引号应插入分隔符，实际 preedit: {}",
+        pre
+    );
+    let mut last = b;
+    for c in "an".chars() {
+        last = press_letter(&coord2, c);
+    }
+    assert_eq!(
+        action_text(&last).unwrap(),
+        "xi'an",
+        "反引号手动分隔符应固定音节边界"
+    );
+    assert!(
+        !coord2.debug_page_texts().is_empty(),
+        "分隔后仍应有候选（如「西」/「西安」）"
+    );
+}
+
+/// Fix Round 1：`auto` 下若 `'` **不**在选键组（此处 `comma_period`）→ `'` 空闲、作分隔符；
+/// 反引号则不作分隔符。
+#[test]
+fn separator_auto_uses_quote_when_not_select_key() {
+    if !has_schemas() {
+        return;
+    }
+    let mut cfg = config_with("pinyin");
+    cfg.keys.select_key_groups = vec!["comma_period".into()];
+    let coord = Coordinator::new_headless(cfg, Some(&data_dir()));
+    for c in "xi".chars() {
+        press_letter(&coord, c);
+    }
+    let q = coord.handle_key_event(&key_event(0xDE, EVENT_KEY_DOWN));
+    let pre = action_text(&q).expect("引号应作分隔符并返回组合区");
+    assert!(
+        pre.contains('\''),
+        "auto+选键组不含引号：引号应作分隔符，实际: {}",
+        pre
+    );
+
+    let mut cfg2 = config_with("pinyin");
+    cfg2.keys.select_key_groups = vec!["comma_period".into()];
+    let coord2 = Coordinator::new_headless(cfg2, Some(&data_dir()));
+    for c in "xi".chars() {
+        press_letter(&coord2, c);
+    }
+    let b = coord2.handle_key_event(&key_event(0xC0, EVENT_KEY_DOWN));
+    assert!(
+        separator_not_inserted(&b),
+        "auto+选键组不含引号：反引号不应作分隔符，实际: {:?}",
+        b
+    );
+}
+
+/// Fix Round 1：显式 `quote` 模式尊重用户指定值——即使默认选键组含 `'`，引号仍作分隔符（覆盖选键）。
+#[test]
+fn separator_explicit_quote_overrides_select_key() {
+    if !has_schemas() {
+        return;
+    }
+    let mut cfg = config_with("pinyin");
+    cfg.schema.pinyin.separator = "quote".into(); // 显式，默认选键组仍含 '
+    let coord = Coordinator::new_headless(cfg, Some(&data_dir()));
+    for c in "xi".chars() {
+        press_letter(&coord, c);
+    }
+    let q = coord.handle_key_event(&key_event(0xDE, EVENT_KEY_DOWN));
+    let pre = action_text(&q).expect("显式 quote 引号应作分隔符并返回组合区");
+    assert!(
+        pre.contains('\''),
+        "显式 quote 模式：引号应作分隔符（覆盖选键），实际: {}",
+        pre
+    );
+}
+
+/// Fix Round 1：双拼方案下手动分隔符一律禁用（`'` 会进 buffer 但引擎剥除，致 buffer 与 preedit
+/// 发散）——引号/反引号均不作分隔符。
+#[test]
+fn separator_disabled_for_shuangpin() {
+    let d = data_dir();
+    if !d.join("schemas/shuangpin.schema.toml").exists()
+        && !d.join("schemas/shuangpin.schema.yaml").exists()
+    {
+        return;
+    }
+    let mut cfg = config_with("pinyin");
+    cfg.schema.available = vec!["shuangpin".into(), "pinyin".into()];
+    cfg.schema.active = "shuangpin".into(); // separator 保持默认 auto
+    let coord = Coordinator::new_headless(cfg, Some(&d));
+    for c in "ui".chars() {
+        press_letter(&coord, c);
+    }
+    let q = coord.handle_key_event(&key_event(0xDE, EVENT_KEY_DOWN));
+    assert!(
+        separator_not_inserted(&q),
+        "双拼：引号不应作分隔符，实际: {:?}",
+        q
+    );
+
+    let mut cfg2 = config_with("pinyin");
+    cfg2.schema.available = vec!["shuangpin".into(), "pinyin".into()];
+    cfg2.schema.active = "shuangpin".into();
+    let coord2 = Coordinator::new_headless(cfg2, Some(&d));
+    for c in "ui".chars() {
+        press_letter(&coord2, c);
+    }
+    let b = coord2.handle_key_event(&key_event(0xC0, EVENT_KEY_DOWN));
+    assert!(
+        separator_not_inserted(&b),
+        "双拼：反引号不应作分隔符，实际: {:?}",
+        b
     );
 }
 
