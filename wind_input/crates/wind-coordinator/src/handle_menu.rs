@@ -58,7 +58,7 @@ impl Coordinator {
             }
             MenuCmd::RestartService => self.restart_service(),
             MenuCmd::OpenSettings => self.open_settings(None),
-            MenuCmd::OpenDictionary => self.open_settings(Some("dictionary")),
+            MenuCmd::OpenDictionary => self.open_settings(Some("dict")),
             MenuCmd::OpenAbout => self.open_settings(Some("about")),
             MenuCmd::TakeScreenshot => {
                 if let Some(dir) = screenshots_dir() {
@@ -79,7 +79,8 @@ impl Coordinator {
     }
 
     /// 统一的「打开设置」入口：优先启动同目录的 wind_setting 桌面应用并跳转到指定页
-    /// （`--page <name>`，name ∈ general/input/hotkey/appearance/dictionary/advanced/about/stats）；
+    /// （`--page <name>`，name 为 wind_setting cli 的规范页 id：
+    /// schema/input/keys/ui/dict/advanced/about，旧 web 别名如 dictionary 不被识别）；
     /// 找不到桌面应用再回退到内嵌 web 配置（签发 token 构造 URL，page 以 `#<name>` 片段附加）。
     /// page=None 打开默认页。设置/词库管理/关于等菜单项统一经此函数。
     ///

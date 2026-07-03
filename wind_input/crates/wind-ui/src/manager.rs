@@ -108,7 +108,7 @@ pub enum UiCommand {
     CopyToClipboard(String),
     /// 用资源管理器打开路径（菜单"打开配置目录"）
     OpenPath(String),
-    /// 启动应用程序并传参（如 wind_setting.exe `--page dictionary`）。
+    /// 启动应用程序并传参（如 wind_setting.exe `--page dict`）。
     OpenApp { path: String, args: String },
     /// 截图所有可见 UI 窗口，保存到 dir 目录（由协调器根据 config 确定）。
     TakeScreenshot { dir: String },
