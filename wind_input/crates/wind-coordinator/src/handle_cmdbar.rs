@@ -302,16 +302,9 @@ struct SysClip(Weak<Coordinator>);
 
 impl ClipboardService for SysClip {
     fn set_text(&self, text: &str) -> anyhow::Result<()> {
-        #[cfg(any(windows, target_os = "macos"))]
-        {
-            wind_ui::popup_menu::set_clipboard_text(text);
-            Ok(())
-        }
-        #[cfg(not(any(windows, target_os = "macos")))]
-        {
-            let _ = text;
-            anyhow::bail!("clip.copy: 当前平台暂未支持")
-        }
+        // try 版传播失败（OpenClipboard 被占用重试后仍失败等），run_actions 记 warn；
+        // 菜单"复制"等 best-effort 路径仍用无返回值的 set_clipboard_text。
+        wind_ui::popup_menu::try_set_clipboard_text(text)
     }
     fn get_text(&self) -> anyhow::Result<String> {
         #[cfg(any(windows, target_os = "macos"))]

@@ -95,19 +95,16 @@ impl KeyInjector for SysKeys {
     fn hold(&self, combo: &str) -> anyhow::Result<()> {
         let (mods, vk) =
             parse_combo(combo).ok_or_else(|| anyhow::anyhow!("无法解析按键组合 {:?}", combo))?;
-        for m in &mods {
-            send_key(*m, false)?;
-        }
-        send_key(vk, false)
+        let mut events: Vec<(u32, bool)> = mods.iter().map(|m| (*m, false)).collect();
+        events.push((vk, false));
+        send_key_events(&events)
     }
     fn release(&self, combo: &str) -> anyhow::Result<()> {
         let (mods, vk) =
             parse_combo(combo).ok_or_else(|| anyhow::anyhow!("无法解析按键组合 {:?}", combo))?;
-        send_key(vk, true)?;
-        for m in mods.iter().rev() {
-            send_key(*m, true)?;
-        }
-        Ok(())
+        let mut events: Vec<(u32, bool)> = vec![(vk, true)];
+        events.extend(mods.iter().rev().map(|m| (*m, true)));
+        send_key_events(&events)
     }
     fn type_text(&self, text: &str) -> anyhow::Result<()> {
         type_unicode(text)
@@ -149,17 +146,15 @@ fn tap_combo(mods: &[u32], vk: u32) -> anyhow::Result<()> {
 }
 
 /// 模拟单次组合：修饰键按下 → 主键按下抬起 → 修饰键反序抬起。
+/// 整组事件一次提交（见 [`send_key_events`]），避免被并发的真实输入穿插。
 #[cfg(not(target_os = "macos"))]
 fn tap_combo(mods: &[u32], vk: u32) -> anyhow::Result<()> {
-    for m in mods {
-        send_key(*m, false)?;
-    }
-    send_key(vk, false)?;
-    send_key(vk, true)?;
-    for m in mods.iter().rev() {
-        send_key(*m, true)?;
-    }
-    Ok(())
+    let mut events: Vec<(u32, bool)> = Vec::with_capacity(mods.len() * 2 + 2);
+    events.extend(mods.iter().map(|m| (*m, false)));
+    events.push((vk, false));
+    events.push((vk, true));
+    events.extend(mods.iter().rev().map(|m| (*m, true)));
+    send_key_events(&events)
 }
 
 /// Win32 虚拟键码 → macOS ANSI CGKeyCode（Carbon HIToolbox `kVK_*` 值）。
@@ -247,32 +242,65 @@ pub(crate) fn vk_to_cgkeycode(vk: u32) -> Option<u16> {
 
 // ───────────────────────── Win32 SendInput（仅 windows）─────────────────────────
 
+/// 扩展键判定（KEYEVENTF_EXTENDEDKEY）：导航区（PgUp/PgDn/End/Home/方向键）、
+/// Ins/Del、Win/Apps、NumLock、小键盘除号、右 Ctrl/右 Alt。
+/// 不带该标志时依赖扫描码的应用（终端/游戏）会把它们误判为小键盘键（受 NumLock 影响）。
 #[cfg(windows)]
-fn send_key(vk: u32, up: bool) -> anyhow::Result<()> {
+fn is_extended_key(vk: u32) -> bool {
+    matches!(
+        vk,
+        0x21..=0x28 | 0x2D | 0x2E | 0x5B | 0x5C | 0x5D | 0x6F | 0x90 | 0xA3 | 0xA5
+    )
+}
+
+/// 把一组 (vk, up) 事件构建为 INPUT 数组并**一次 SendInput 提交**。
+/// 批量提交保证事件在系统输入流中连续插入、不被并发的真实键鼠输入穿插
+/// （对齐 Go sendKeys；逐事件调用时用户此刻的物理按键可能插进修饰键与主键之间）。
+#[cfg(windows)]
+fn send_key_events(events: &[(u32, bool)]) -> anyhow::Result<()> {
     use windows::Win32::UI::Input::KeyboardAndMouse::{
-        INPUT, INPUT_0, INPUT_KEYBOARD, KEYBD_EVENT_FLAGS, KEYBDINPUT, KEYEVENTF_KEYUP, SendInput,
-        VIRTUAL_KEY,
+        INPUT, INPUT_0, INPUT_KEYBOARD, KEYBD_EVENT_FLAGS, KEYBDINPUT, KEYEVENTF_EXTENDEDKEY,
+        KEYEVENTF_KEYUP, SendInput, VIRTUAL_KEY,
     };
-    let flags = if up {
-        KEYEVENTF_KEYUP
-    } else {
-        KEYBD_EVENT_FLAGS(0)
-    };
-    let input = INPUT {
-        r#type: INPUT_KEYBOARD,
-        Anonymous: INPUT_0 {
-            ki: KEYBDINPUT {
-                wVk: VIRTUAL_KEY(vk as u16),
-                wScan: 0,
-                dwFlags: flags,
-                time: 0,
-                dwExtraInfo: 0,
-            },
-        },
-    };
-    let sent = unsafe { SendInput(&[input], std::mem::size_of::<INPUT>() as i32) };
-    if sent == 0 {
-        anyhow::bail!("SendInput 失败 (vk={vk:#x}, up={up})");
+    if events.is_empty() {
+        return Ok(());
+    }
+    let inputs: Vec<INPUT> = events
+        .iter()
+        .map(|&(vk, up)| {
+            let mut flags = KEYBD_EVENT_FLAGS(0);
+            if up {
+                flags |= KEYEVENTF_KEYUP;
+            }
+            if is_extended_key(vk) {
+                flags |= KEYEVENTF_EXTENDEDKEY;
+            }
+            INPUT {
+                r#type: INPUT_KEYBOARD,
+                Anonymous: INPUT_0 {
+                    ki: KEYBDINPUT {
+                        wVk: VIRTUAL_KEY(vk as u16),
+                        wScan: 0,
+                        dwFlags: flags,
+                        time: 0,
+                        dwExtraInfo: 0,
+                    },
+                },
+            }
+        })
+        .collect();
+    let sent = unsafe { SendInput(&inputs, std::mem::size_of::<INPUT>() as i32) };
+    if sent as usize != inputs.len() {
+        anyhow::bail!("SendInput 失败 (sent={} want={})", sent, inputs.len());
+    }
+    Ok(())
+}
+
+/// 非 Windows：逐事件投递（macOS CGEvent 本身逐事件 post；其它平台 send_key 返回不支持）。
+#[cfg(not(windows))]
+fn send_key_events(events: &[(u32, bool)]) -> anyhow::Result<()> {
+    for &(vk, up) in events {
+        send_key(vk, up)?;
     }
     Ok(())
 }
@@ -283,28 +311,43 @@ fn type_unicode(text: &str) -> anyhow::Result<()> {
         INPUT, INPUT_0, INPUT_KEYBOARD, KEYBDINPUT, KEYEVENTF_KEYUP, KEYEVENTF_UNICODE, SendInput,
         VIRTUAL_KEY,
     };
-    for unit in text.encode_utf16() {
-        for up in [false, true] {
-            let mut flags = KEYEVENTF_UNICODE;
-            if up {
-                flags |= KEYEVENTF_KEYUP;
-            }
-            let input = INPUT {
-                r#type: INPUT_KEYBOARD,
-                Anonymous: INPUT_0 {
-                    ki: KEYBDINPUT {
-                        wVk: VIRTUAL_KEY(0),
-                        wScan: unit,
-                        dwFlags: flags,
-                        time: 0,
-                        dwExtraInfo: 0,
-                    },
+    let make = |unit: u16, up: bool| {
+        let mut flags = KEYEVENTF_UNICODE;
+        if up {
+            flags |= KEYEVENTF_KEYUP;
+        }
+        INPUT {
+            r#type: INPUT_KEYBOARD,
+            Anonymous: INPUT_0 {
+                ki: KEYBDINPUT {
+                    wVk: VIRTUAL_KEY(0),
+                    wScan: unit,
+                    dwFlags: flags,
+                    time: 0,
+                    dwExtraInfo: 0,
                 },
-            };
-            let sent = unsafe { SendInput(&[input], std::mem::size_of::<INPUT>() as i32) };
-            if sent == 0 {
-                anyhow::bail!("SendInput(unicode) 失败");
-            }
+            },
+        }
+    };
+    // 按码点分组一次提交：BMP 字符 2 事件，代理对 4 事件（高低位按下正序、抬起反序，
+    // 对齐 Go TypeText）——保证代理对不被并发真实输入拆散产生坏字符。
+    let mut units: [u16; 2] = [0; 2];
+    for ch in text.chars() {
+        let enc = ch.encode_utf16(&mut units);
+        let mut inputs: Vec<INPUT> = Vec::with_capacity(enc.len() * 2);
+        for u in enc.iter() {
+            inputs.push(make(*u, false));
+        }
+        for u in enc.iter().rev() {
+            inputs.push(make(*u, true));
+        }
+        let sent = unsafe { SendInput(&inputs, std::mem::size_of::<INPUT>() as i32) };
+        if sent as usize != inputs.len() {
+            anyhow::bail!(
+                "SendInput(unicode) 失败 (sent={} want={})",
+                sent,
+                inputs.len()
+            );
         }
     }
     Ok(())

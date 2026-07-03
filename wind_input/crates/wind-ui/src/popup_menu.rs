@@ -19,13 +19,15 @@ use crate::text::dwrite::TextRenderer;
 use crate::view::{Align, Edges, Layout, Rect, View};
 use crate::window::{LayeredWindow, WindowMouse};
 #[cfg(windows)]
-use windows::Win32::Foundation::{HANDLE, HGLOBAL};
+use windows::Win32::Foundation::{GlobalFree, HANDLE, HGLOBAL};
 #[cfg(windows)]
 use windows::Win32::System::DataExchange::{
     CloseClipboard, EmptyClipboard, GetClipboardData, OpenClipboard, SetClipboardData,
 };
 #[cfg(windows)]
-use windows::Win32::System::Memory::{GMEM_MOVEABLE, GlobalAlloc, GlobalLock, GlobalUnlock};
+use windows::Win32::System::Memory::{
+    GMEM_MOVEABLE, GlobalAlloc, GlobalLock, GlobalSize, GlobalUnlock,
+};
 #[cfg(windows)]
 use windows::Win32::System::Ole::CF_UNICODETEXT;
 
@@ -797,68 +799,130 @@ impl WindowMouse for MenuState {
     }
 }
 
-/// 写剪贴板（CF_UNICODETEXT）
+/// 写剪贴板（CF_UNICODETEXT）。失败仅记 warn（菜单"复制"等 best-effort 调用方用）；
+/// 需要感知失败的调用方（cmdbar clip.copy）用 [`try_set_clipboard_text`]。
 #[cfg(windows)]
 pub fn set_clipboard_text(text: &str) {
-    if text.is_empty() {
-        return;
+    if let Err(e) = try_set_clipboard_text(text) {
+        tracing::warn!("写剪贴板失败: {}", e);
     }
-    unsafe {
-        if OpenClipboard(HWND::default()).is_err() {
-            return;
+}
+
+/// OpenClipboard 带重试：剪贴板是全局竞争资源，其它进程（剪贴板管理器/Office 等）
+/// 短暂持有时会瞬时失败，稍候重试即可成功。
+#[cfg(windows)]
+fn open_clipboard_retry() -> anyhow::Result<()> {
+    const ATTEMPTS: u32 = 5;
+    for i in 0..ATTEMPTS {
+        if unsafe { OpenClipboard(HWND::default()) }.is_ok() {
+            return Ok(());
         }
+        if i + 1 < ATTEMPTS {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+    }
+    anyhow::bail!(
+        "OpenClipboard 失败（重试 {} 次后仍被其它进程占用）",
+        ATTEMPTS
+    )
+}
+
+/// 写剪贴板（CF_UNICODETEXT），失败返回错误。空文本为空操作（语义：不清空剪贴板）。
+#[cfg(windows)]
+pub fn try_set_clipboard_text(text: &str) -> anyhow::Result<()> {
+    if text.is_empty() {
+        return Ok(());
+    }
+    open_clipboard_retry()?;
+    // 此后所有路径都必须 CloseClipboard 再返回。
+    let result = unsafe {
         let _ = EmptyClipboard();
         let wide: Vec<u16> = text.encode_utf16().chain(std::iter::once(0)).collect();
         let bytes = wide.len() * std::mem::size_of::<u16>();
-        if let Ok(hmem) = GlobalAlloc(GMEM_MOVEABLE, bytes) {
-            let ptr = GlobalLock(hmem) as *mut u16;
-            if !ptr.is_null() {
-                std::ptr::copy_nonoverlapping(wide.as_ptr(), ptr, wide.len());
-                let _ = GlobalUnlock(hmem);
-                let _ = SetClipboardData(CF_UNICODETEXT.0 as u32, HANDLE(hmem.0));
+        match GlobalAlloc(GMEM_MOVEABLE, bytes) {
+            Ok(hmem) => {
+                let ptr = GlobalLock(hmem) as *mut u16;
+                if ptr.is_null() {
+                    let _ = GlobalFree(hmem);
+                    Err(anyhow::anyhow!("GlobalLock 失败"))
+                } else {
+                    std::ptr::copy_nonoverlapping(wide.as_ptr(), ptr, wide.len());
+                    let _ = GlobalUnlock(hmem);
+                    match SetClipboardData(CF_UNICODETEXT.0 as u32, HANDLE(hmem.0)) {
+                        // 成功后 hmem 所有权归系统，不能 GlobalFree
+                        Ok(_) => Ok(()),
+                        Err(e) => {
+                            let _ = GlobalFree(hmem);
+                            Err(anyhow::anyhow!("SetClipboardData 失败: {}", e))
+                        }
+                    }
+                }
             }
+            Err(e) => Err(anyhow::anyhow!("GlobalAlloc 失败: {}", e)),
         }
+    };
+    unsafe {
         let _ = CloseClipboard();
     }
+    result
 }
 
 /// 写剪贴板（macOS：经 `pbcopy` 子进程，无需 AppKit/主线程，服务进程即可用；对齐 Go clipboard_darwin）。
 #[cfg(target_os = "macos")]
 pub fn set_clipboard_text(text: &str) {
+    if let Err(e) = try_set_clipboard_text(text) {
+        tracing::warn!("写剪贴板失败: {}", e);
+    }
+}
+
+/// 写剪贴板（macOS pbcopy），失败返回错误。
+#[cfg(target_os = "macos")]
+pub fn try_set_clipboard_text(text: &str) -> anyhow::Result<()> {
     use std::io::Write;
     use std::process::{Command, Stdio};
-    let mut child = match Command::new("/usr/bin/pbcopy")
+    let mut child = Command::new("/usr/bin/pbcopy")
         .stdin(Stdio::piped())
         .spawn()
-    {
-        Ok(c) => c,
-        Err(_) => return,
-    };
+        .map_err(|e| anyhow::anyhow!("pbcopy 启动失败: {}", e))?;
     if let Some(stdin) = child.stdin.as_mut() {
-        let _ = stdin.write_all(text.as_bytes());
+        stdin
+            .write_all(text.as_bytes())
+            .map_err(|e| anyhow::anyhow!("pbcopy 写入失败: {}", e))?;
     }
-    let _ = child.wait();
+    let status = child.wait()?;
+    if !status.success() {
+        anyhow::bail!("pbcopy 退出码非零: {}", status);
+    }
+    Ok(())
 }
 
 /// 写剪贴板（其它非 Windows mock：暂不接入平台剪贴板，空操作）。
 #[cfg(all(not(windows), not(target_os = "macos")))]
 pub fn set_clipboard_text(_text: &str) {}
 
+/// 写剪贴板（其它非 Windows mock）：明确报不支持。
+#[cfg(all(not(windows), not(target_os = "macos")))]
+pub fn try_set_clipboard_text(_text: &str) -> anyhow::Result<()> {
+    anyhow::bail!("写剪贴板：当前平台暂未支持")
+}
+
 /// 读剪贴板文本（CF_UNICODETEXT）。失败/无文本返回空串。
 #[cfg(windows)]
 pub fn get_clipboard_text() -> String {
+    if open_clipboard_retry().is_err() {
+        return String::new();
+    }
     unsafe {
-        if OpenClipboard(HWND::default()).is_err() {
-            return String::new();
-        }
         let mut out = String::new();
         if let Ok(h) = GetClipboardData(CF_UNICODETEXT.0 as u32) {
             let hglobal = HGLOBAL(h.0);
             let ptr = GlobalLock(hglobal) as *const u16;
             if !ptr.is_null() {
-                // 读到 NUL 结尾的宽字符串。
+                // 读到 NUL 结尾的宽字符串；以 GlobalSize 为上界，防异常生产者
+                // 未写 NUL 时越界读（CF_UNICODETEXT 规范要求 NUL 结尾，此为防御）。
+                let max_len = GlobalSize(hglobal) / std::mem::size_of::<u16>();
                 let mut len = 0usize;
-                while *ptr.add(len) != 0 {
+                while len < max_len && *ptr.add(len) != 0 {
                     len += 1;
                 }
                 let slice = std::slice::from_raw_parts(ptr, len);
