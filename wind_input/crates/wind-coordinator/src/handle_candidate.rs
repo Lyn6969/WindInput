@@ -126,6 +126,7 @@ impl Coordinator {
                 &recs,
                 code,
                 settings.strategy,
+                settings.protect_top_n,
             );
         }
     }

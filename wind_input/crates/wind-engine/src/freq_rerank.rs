@@ -48,7 +48,15 @@ pub fn rerank_codetable_usedfirst(
     recs: &HashMap<String, FreqRecord>,
     code: &str,
     strategy: FreqStrategy,
+    protect_top_n: usize,
 ) {
+    // 呈现层保护：记录基础序前 N 位，重排后原序回填（不动 weight，见 frequency.md §8）。
+    let protected: Vec<String> = candidates
+        .iter()
+        .take(protect_top_n)
+        .map(|c| c.text.clone())
+        .collect();
+
     use std::cmp::Ordering;
     candidates.sort_by(|a, b| {
         let ta = freq_tier(a, code);
@@ -72,6 +80,14 @@ pub fn rerank_codetable_usedfirst(
             },
         }
     });
+
+    for (i, text) in protected.iter().enumerate() {
+        if let Some(pos) = candidates.iter().position(|c| &c.text == text) {
+            if pos > i {
+                candidates[i..=pos].rotate_right(1);
+            }
+        }
+    }
 }
 
 /// 拼音词频重排（§4）：衰减软置前 + 整句豁免 + 阈值褪色。
@@ -265,7 +281,7 @@ mod tests {
             ct("aaaa", "啊", 80),
         ];
         let r = recs(&[("戈", 5, NOW), ("工", 2, NOW)]);
-        rerank_codetable_usedfirst(&mut cands, &r, "aaaa", FreqStrategy::Step);
+        rerank_codetable_usedfirst(&mut cands, &r, "aaaa", FreqStrategy::Step, 0);
         assert_eq!(cands[0].text, "戈", "step：count 高者置前");
         assert_eq!(cands[1].text, "工");
         assert_eq!(cands[2].text, "啊", "未用词维持权重序殿后");
@@ -277,7 +293,7 @@ mod tests {
         let mut cands = vec![ct("aaaa", "工", 100), ct("aaaa", "戈", 90)];
         // 工 用 10 次但很久前；戈 仅 1 次但刚用
         let r = recs(&[("工", 10, NOW - 10_000), ("戈", 1, NOW)]);
-        rerank_codetable_usedfirst(&mut cands, &r, "aaaa", FreqStrategy::Top);
+        rerank_codetable_usedfirst(&mut cands, &r, "aaaa", FreqStrategy::Top, 0);
         assert_eq!(cands[0].text, "戈", "top：最近使用者置首");
     }
 
@@ -287,7 +303,29 @@ mod tests {
         let mut cands = vec![ct("aaaa", "工", 100), pin("啊", 5000)];
         // 拼音「啊」高频近用，但档位 3 低于码表精确全码档位 0
         let r = recs(&[("啊", 50, NOW)]);
-        rerank_codetable_usedfirst(&mut cands, &r, "aaaa", FreqStrategy::Step);
+        rerank_codetable_usedfirst(&mut cands, &r, "aaaa", FreqStrategy::Step, 0);
         assert_eq!(cands[0].text, "工", "码表精确全码档位最高，拼音不得反超");
+    }
+
+    /// protect_top_n=1：重排后基础序首位被回填锁定，高词频候选在保护位之后正常上浮。
+    #[test]
+    fn protect_top_n_pins_original_head() {
+        // 基础序：甲(高weight) 乙 丙；"丙"有词频记录本应浮首。
+        let mut cands = vec![
+            ct("abcd", "甲", 300),
+            ct("abcd", "乙", 200),
+            ct("abcd", "丙", 100),
+        ];
+        let mut recs_map = HashMap::new();
+        recs_map.insert(
+            "丙".to_string(),
+            FreqRecord {
+                count: 9,
+                last_used: 1000,
+            },
+        );
+        rerank_codetable_usedfirst(&mut cands, &recs_map, "abcd", FreqStrategy::Step, 1);
+        assert_eq!(cands[0].text, "甲", "protect_top_n=1 应锁定原首位");
+        assert_eq!(cands[1].text, "丙", "词频候选在保护位之后正常上浮");
     }
 }

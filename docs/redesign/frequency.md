@@ -97,4 +97,4 @@ freq_score  = (base_scale * log2(count + 1) + recency_peak) * decay
 - **recency_peak 近用峰值加成**：已完成。`FreqProfile` 新增 `recency_peak: f64`（默认 0.0），`pinyin_score` 公式改为 `(base_scale * log2(count+1) + recency_peak) * decay`；`EngineManager::pinyin_freq_profile()` 从配置 `frequency.recency_peak` 读取（非负截断）。`=0` 时完全向后兼容。
 - **L 造词显现**：已完成。`PinyinEngine` 新增可选 `store_layers`（`with_store_layers`），`EngineManager::build_engine` 拼音分支在有 Store 时挂 `StoreUserLayer/StoreTempLayer`（按 schema 隔离）。convert 第 6 步按相同码（整串精确 + 各前缀子码 + 前缀补全）并入用户/临时造词，dedup by text、source=Pinyin、consumed_length 据前缀标注（部分消费分段上屏）。原生单测见 wind-engine `pinyin::tests`（3 例）。
   - 注：混输的 pinyin 子引擎按 secondary schema id 挂层；混输造词键于 mixed schema id，故混输 L 不在此生效（无回归，待混输专项）。
-- **protect_top_n**：字段保留，本阶段不实现（与 `top` 语义冲突，默认 0）。
+- **protect_top_n**：呈现层前 N 位保护，已实现。语义定稿：重排**前**记录引擎基础序（base_sort 输出）的前 N 个候选，重排**后**按原相对序回填到前 N 位；其余候选相对序不变。优先级高于词频——即使某候选词频极高，只要它不在保护集内，就不能占据前 N 位。默认 `0` = 空保护集，行为与不启用完全一致（零回归）。不修改任何候选 weight；引擎层 auto_commit 决策在词频重排之前完成，天然不受影响（无 Go 版 ProtectTopN 致顶码与 UI 不一致的隐患）。与 `top`/`step` 策略正交——两种策略均在保护回填之前完成排序。仅码表/混输路径（`rerank_codetable_usedfirst`）生效，拼音路径 `protect_top_n` 固定为 0。
