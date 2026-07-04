@@ -150,8 +150,8 @@ impl MessageHandler for DeferredHandler {
         self.with_handler((), |h| h.handle_host_render_ready())
     }
 
-    fn get_current_mode(&self) -> (bool, bool) {
+    fn get_current_mode(&self, client_token: u64) -> (bool, bool) {
         // 未就绪时回中文模式（安全默认）；就绪后委派真实处理器读权威模式。
-        self.with_handler((true, false), |h| h.get_current_mode())
+        self.with_handler((true, false), |h| h.get_current_mode(client_token))
     }
 }

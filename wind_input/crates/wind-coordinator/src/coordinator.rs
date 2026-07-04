@@ -11,6 +11,7 @@
 //! 候选生成委托给 [`EngineManager`]，运行时词频 boost + 最终排序在本层应用。
 
 use crate::pipeline::{ModeKind, Rewind};
+use std::collections::HashMap;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 use tracing::{debug, info, warn};
@@ -496,6 +497,15 @@ pub struct Coordinator {
     /// 时按 client_token 高 32 位的 PID 解析进程名并缓存，避免每次 caret 更新重复 OpenProcess。
     /// 微信等 WebView 应用置 caret_use_top=true，handle_caret_update 据此把候选窗从 bottom 改锚 top。
     active_compat: Mutex<(u32, bool)>,
+    /// pid → 进程名（小写）缓存，`update_active_compat` 填充，会话级只增不清。
+    /// 供 FOCUS_GAINED 同步路径（`get_current_mode`）免 OpenProcess 查询进程名。
+    pid_names: Mutex<HashMap<u32, String>>,
+    /// 按应用独立中英状态表（`input.default.state_scope = "app"` 时启用）：
+    /// 进程名（小写）→ chinese_mode，会话级记忆（服务重启即清，见计划决策）。
+    mode_states: Mutex<HashMap<String, bool>>,
+    /// 用户最后一次主动切换后的 (中英, 全半角, 中英标点) 内存镜像；
+    /// remember_last_state=true 时随切换同步落盘 state.toml（`record_last_state`）。
+    runtime_last: Mutex<(bool, bool, bool)>,
     /// 前台上下文快照 `(app, title, sel)`，供命令直通车 app()/title()/sel() 取值。
     /// darwin `.app` 经 CMD_FRONT_CONTEXT 于聚焦时上报；其它平台暂空。
     front_ctx: Mutex<(String, String, String)>,
@@ -883,11 +893,22 @@ impl Coordinator {
 
         // 统计采集器：与 store 共享 Arc，内存聚合 + 后台定时 flush。
         let stat_collector = store.clone().map(StatCollector::new);
+        // 启动初始状态：remember_last_state=true 时从 state.toml 恢复上次三态，否则用配置默认。
+        let d = &config.input.default;
+        let (init_chinese, init_full, init_punct) = if d.remember_last_state {
+            (
+                runtime_state.last_chinese_mode,
+                runtime_state.last_full_width,
+                runtime_state.last_chinese_punct,
+            )
+        } else {
+            (d.chinese_mode, d.full_width, d.chinese_punct)
+        };
         let coordinator = Arc::new(Self {
             state: Mutex::new(State {
-                chinese_mode: config.input.default.chinese_mode,
-                full_width: config.input.default.full_width,
-                chinese_punct: config.input.default.chinese_punct,
+                chinese_mode: init_chinese,
+                full_width: init_full,
+                chinese_punct: init_punct,
                 s2t_enabled: config.input.s2t.enabled,
                 filter_mode: wind_candidate::FilterMode::from_str(&config.input.filter_mode),
                 toolbar_visible: config.ui.toolbar.visible, // 启动初值来自配置(运行时可菜单切换)
@@ -955,6 +976,9 @@ impl Coordinator {
             composition_start: Mutex::new((0, 0, false)),
             app_compat,
             active_compat: Mutex::new((0, false)),
+            pid_names: Mutex::new(HashMap::new()),
+            mode_states: Mutex::new(HashMap::new()),
+            runtime_last: Mutex::new((init_chinese, init_full, init_punct)),
             front_ctx: Mutex::new((String::new(), String::new(), String::new())),
             themes_dir,
             theme_name: Mutex::new(initial_theme),
@@ -1021,6 +1045,122 @@ impl Coordinator {
             debug!("Compat rule matched: process={name} caret_use_top=true");
         }
         *ac = (pid, use_top);
+        drop(ac);
+        // 顺带填 pid→进程名缓存，供 FOCUS_GAINED 同步路径免 OpenProcess 查询（per-app 状态）。
+        if !name.is_empty() {
+            self.pid_names
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .insert(pid, name.to_lowercase());
+        }
+    }
+
+    /// 按 client_token 高 32 位的 PID 查已缓存的进程名（小写）。未缓存返回空串。
+    /// 仅 HashMap 查询，可用于 DLL 同步阻塞路径。
+    fn cached_proc_name(&self, client_token: u64) -> String {
+        let pid = (client_token >> 32) as u32;
+        if pid == 0 {
+            return String::new();
+        }
+        self.pid_names
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&pid)
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    /// 决策进程 `proc_name` 的中英初始状态（初始状态语义的单一内聚点）。
+    /// 顺序：per-app 记忆表 →（预留：按应用规则表）→ 全局记忆 / 配置默认。
+    fn initial_chinese_mode_for(&self, proc_name: &str) -> bool {
+        let bundle = self.rt();
+        let d = &bundle.config.input.default;
+        if d.per_app_scope()
+            && !proc_name.is_empty()
+            && let Some(&m) = self
+                .mode_states
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .get(proc_name)
+        {
+            return m;
+        }
+        // TODO(app_rules): 未来在此查按应用规则表（input.default.app_rules：进程名 → 初始中/英，
+        // 优先级高于下方全局记忆/默认；配置形态对齐 input.punct.custom_mappings 的 Map 先例）。
+        if d.remember_last_state {
+            self.runtime_last.lock().unwrap_or_else(|e| e.into_inner()).0
+        } else {
+            d.chinese_mode
+        }
+    }
+
+    /// 用户主动切换中英/全半角/标点后记录"最后状态"镜像；
+    /// remember_last_state=true 时同步落盘 state.toml（复用 toolbar_positions 的 load-modify-save 模式）。
+    /// 必须在释放 state 锁后调用。
+    fn record_last_state(&self) {
+        let (c, f, p) = {
+            let s = self.state.lock().unwrap_or_else(|e| e.into_inner());
+            (s.chinese_mode, s.full_width, s.chinese_punct)
+        };
+        *self.runtime_last.lock().unwrap_or_else(|e| e.into_inner()) = (c, f, p);
+        if self.rt().config.input.default.remember_last_state
+            && let Some(dir) = Config::state_dir()
+        {
+            let mut rs = wind_config::RuntimeState::load(&dir);
+            rs.last_chinese_mode = c;
+            rs.last_full_width = f;
+            rs.last_chinese_punct = p;
+            let _ = rs.save(&dir);
+        }
+    }
+
+    /// state_scope="app" 时把中英状态写回当前前台进程的记忆表（进程名取自 pid 缓存）。
+    fn record_app_mode(&self, chinese: bool) {
+        if !self.rt().config.input.default.per_app_scope() {
+            return;
+        }
+        let pid = self
+            .active_compat
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .0;
+        let name = self
+            .pid_names
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&pid)
+            .cloned()
+            .unwrap_or_default();
+        if !name.is_empty() {
+            self.mode_states
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .insert(name, chinese);
+        }
+    }
+
+    /// IME 激活 / 焦点切换（重型段）时按配置矩阵落地初始状态。
+    /// `reset_aux`＝激活场景：remember=false 时同时重置全半角/标点为配置默认
+    /// （焦点切换场景不重置——同一激活期内切窗口不动全半角/标点）。
+    /// 需在未持有 state 锁时调用。
+    fn apply_initial_mode(&self, client_token: u64, reset_aux: bool) {
+        let bundle = self.rt();
+        let d = &bundle.config.input.default;
+        let proc = self.cached_proc_name(client_token);
+        let chinese = self.initial_chinese_mode_for(&proc);
+        let follow = bundle.config.input.punct.follow_mode;
+        let mut s = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        if reset_aux && !d.remember_last_state {
+            s.full_width = d.full_width;
+            s.chinese_punct = d.chinese_punct;
+        }
+        if s.chinese_mode != chinese {
+            s.chinese_mode = chinese;
+            // 标点随中英文切换（对齐 handle_toggle_mode/handle_system_mode_switch）。
+            if follow {
+                s.chinese_punct = chinese;
+            }
+        }
     }
 
     /// 热重载用户配置：从磁盘重读 Config 并原子替换 bundle（轻量设置即时生效），
@@ -2175,6 +2315,7 @@ impl Coordinator {
                     let mut s = self.state.lock().unwrap_or_else(|e| e.into_inner());
                     s.full_width = !s.full_width;
                 }
+                self.record_last_state();
                 self.push_state_update();
                 self.show_status();
                 self.notify_toolbar();
@@ -2190,6 +2331,7 @@ impl Coordinator {
                         let mut s = self.state.lock().unwrap_or_else(|e| e.into_inner());
                         s.chinese_punct = !s.chinese_punct;
                     }
+                    self.record_last_state();
                     self.push_state_update();
                     self.show_status();
                     self.notify_toolbar();
@@ -2477,6 +2619,7 @@ impl MessageHandler for Coordinator {
                     let mut s = self.state.lock().unwrap_or_else(|e| e.into_inner());
                     s.full_width = !s.full_width;
                 }
+                self.record_last_state();
                 self.push_state_update();
                 self.show_status();
                 Some(self.build_status())
@@ -2491,6 +2634,7 @@ impl MessageHandler for Coordinator {
                         let mut s = self.state.lock().unwrap_or_else(|e| e.into_inner());
                         s.chinese_punct = !s.chinese_punct;
                     }
+                    self.record_last_state();
                     self.push_state_update();
                     self.show_status();
                 }
@@ -3470,6 +3614,12 @@ impl MessageHandler for Coordinator {
         // 解析焦点进程的 caret 兼容态（微信 caret_use_top 等）。本段为 FOCUS_GAINED 的重型
         // 后置段（DLL 阻塞响应已写出），同步 OpenProcess 不影响首键延迟。
         self.update_active_compat(data.client_token);
+        // per-app 状态：进程名已入缓存，按记忆表/默认值切换本应用中英状态。若与同步段
+        // get_current_mode 回传值不同（该进程首次聚焦），随后的 push_activation_status 推送修正。
+        // global 作用域下焦点切换不动状态（激活重置只发生在 IME_ACTIVATED）。
+        if self.rt().config.input.default.per_app_scope() {
+            self.apply_initial_mode(data.client_token, false);
+        }
         let status = self.build_status();
         self.push_activation_status();
         self.notify_toolbar_async(); // 激活态 → 工具栏显示（异步，避免 is_foreground_fullscreen 阻塞 bridge 线程）
@@ -3497,8 +3647,33 @@ impl MessageHandler for Coordinator {
         self.hide_tip(); // 失焦隐藏状态提示（常驻模式尤需）
     }
 
-    fn get_current_mode(&self) -> (bool, bool) {
-        // FocusGained 同步路径回传 ModePush：仅锁+读两字段，DLL 正同步阻塞等本值。
+    fn get_current_mode(&self, client_token: u64) -> (bool, bool) {
+        // FocusGained 同步路径回传 ModePush：DLL 正同步阻塞等本值，仅允许锁+HashMap 查询，
+        // 严禁 OpenProcess 等跨进程调用。
+        // state_scope="app"：pid 已入缓存且记忆表命中 → 先切到该应用的记忆状态再回传，
+        // 消除首键竞态；未命中（进程首次聚焦）保持现状，由重型段 handle_focus_gained 修正。
+        if self.rt().config.input.default.per_app_scope() {
+            let proc = self.cached_proc_name(client_token);
+            if !proc.is_empty() {
+                let remembered = self
+                    .mode_states
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .get(&proc)
+                    .copied();
+                if let Some(chinese) = remembered {
+                    let follow = self.rt().config.input.punct.follow_mode;
+                    let mut s = self.state.lock().unwrap_or_else(|e| e.into_inner());
+                    if s.chinese_mode != chinese {
+                        s.chinese_mode = chinese;
+                        if follow {
+                            s.chinese_punct = chinese;
+                        }
+                    }
+                    return (s.chinese_mode, s.full_width);
+                }
+            }
+        }
         let s = self.state.lock().unwrap_or_else(|e| e.into_inner());
         (s.chinese_mode, s.full_width)
     }
@@ -3509,6 +3684,10 @@ impl MessageHandler for Coordinator {
         }
         // 切回本输入法时同样刷新焦点进程的 caret 兼容态（异步段，不阻塞 DLL）。
         self.update_active_compat(client_token);
+        // 激活初始状态矩阵：remember=false 重置为配置默认（含全半角/标点）；
+        // remember=true 保持全局记忆；state_scope="app" 恢复该应用的会话记忆。
+        // 同时构成对 compartment 脏事件污染的自愈兜底（详见 TextService.cpp 门卫修复）。
+        self.apply_initial_mode(client_token, true);
         self.state
             .lock()
             .unwrap_or_else(|e| e.into_inner())
@@ -3540,13 +3719,17 @@ impl MessageHandler for Coordinator {
     fn handle_mode_notify(&self, flags: u32) {
         let chinese_mode = (flags & wind_ipc::protocol::STATUS_CHINESE_MODE) != 0;
         let clear_input = (flags & wind_ipc::protocol::STATUS_MODE_CHANGED) != 0;
-        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
-        state.chinese_mode = chinese_mode;
-        if clear_input {
-            state.input_buffer.clear();
-            state.candidates.clear();
-            self.reset_exclusive_modes(&mut state); // 系统模式切换时丢弃独占模式残留
+        {
+            let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+            state.chinese_mode = chinese_mode;
+            if clear_input {
+                state.input_buffer.clear();
+                state.candidates.clear();
+                self.reset_exclusive_modes(&mut state); // 系统模式切换时丢弃独占模式残留
+            }
         }
+        self.record_app_mode(chinese_mode);
+        self.record_last_state();
     }
 
     fn handle_toggle_mode(&self) -> (Option<StatusUpdateData>, String) {
@@ -3559,6 +3742,8 @@ impl MessageHandler for Coordinator {
         }
         let commit_text = self.take_input_on_mode_switch(&mut state, chinese);
         drop(state);
+        self.record_app_mode(chinese);
+        self.record_last_state();
         self.punct.lock().unwrap_or_else(|e| e.into_inner()).reset();
         self.disarm_smart_symbol();
         self.push_state_update();
@@ -3577,9 +3762,12 @@ impl MessageHandler for Coordinator {
         }
         let commit_text = self.take_input_on_mode_switch(&mut state, chinese_mode);
         drop(state);
+        self.record_app_mode(chinese_mode);
+        self.record_last_state();
         self.punct.lock().unwrap_or_else(|e| e.into_inner()).reset();
         self.disarm_smart_symbol();
         self.push_state_update();
+        self.show_status(); // 与 Shift 切换（handle_toggle_mode）统一：Ctrl+Space/外部切换也显示中/英提示
         self.notify_toolbar();
         self.notify_ui_hide(); // 取消输入：隐藏候选窗
         (Some(self.build_status()), commit_text)
@@ -3890,6 +4078,143 @@ mod caret_compat_tests {
         let token = (4321u64 << 32) | 7;
         c.update_active_compat(token);
         assert_eq!(c.active_compat.lock().unwrap().0, 4321);
+    }
+}
+
+#[cfg(test)]
+mod initial_mode_tests {
+    //! 初始状态语义矩阵验证：激活重置 / 全局记忆 / per-app 独立（均纯内存，无词典/UI 依赖）。
+    use super::*;
+
+    fn coord_with(f: impl FnOnce(&mut Config)) -> Arc<Coordinator> {
+        let mut cfg = Config::default();
+        f(&mut cfg);
+        Coordinator::new_headless(cfg, None)
+    }
+
+    /// 注入焦点进程（headless 下 OpenProcess 取不到真实进程名，手动填缓存）。
+    fn set_focus_proc(c: &Arc<Coordinator>, pid: u32, name: &str) {
+        c.active_compat.lock().unwrap().0 = pid;
+        c.pid_names
+            .lock()
+            .unwrap()
+            .insert(pid, name.to_string());
+    }
+
+    fn token(pid: u32) -> u64 {
+        ((pid as u64) << 32) | 1
+    }
+
+    /// global + remember=false（默认）：状态被污染成英文后，激活时重置回配置默认（中文），
+    /// 全半角/标点一并重置——本 bug 的核心修复。
+    #[test]
+    fn activation_resets_to_default_when_not_remembering() {
+        let c = coord_with(|cfg| {
+            cfg.input.default.remember_last_state = false;
+            cfg.input.default.chinese_mode = true;
+            cfg.input.default.full_width = false;
+            cfg.input.default.chinese_punct = true;
+        });
+        {
+            let mut s = c.state.lock().unwrap();
+            s.chinese_mode = false; // 模拟 compartment 脏事件污染
+            s.full_width = true;
+            s.chinese_punct = false;
+        }
+        c.apply_initial_mode(token(100), true);
+        let s = c.state.lock().unwrap();
+        assert!(s.chinese_mode);
+        assert!(!s.full_width);
+        assert!(s.chinese_punct);
+    }
+
+    /// global + remember=true：激活时保持用户最后一次主动切换的状态，不重置。
+    #[test]
+    fn activation_keeps_last_state_when_remembering() {
+        let c = coord_with(|cfg| {
+            cfg.input.default.remember_last_state = true;
+            cfg.input.default.chinese_mode = true;
+        });
+        {
+            let mut s = c.state.lock().unwrap();
+            s.chinese_mode = false; // 用户切到英文
+            s.full_width = true;
+        }
+        // 直接注入"最后状态"内存镜像（不调 record_last_state，避免测试写真实 state.toml）。
+        *c.runtime_last.lock().unwrap() = (false, true, true);
+        c.apply_initial_mode(token(100), true);
+        let s = c.state.lock().unwrap();
+        assert!(!s.chinese_mode, "remember=true 激活不得重置回默认");
+        assert!(s.full_width);
+    }
+
+    /// scope=app：首见进程用配置默认；record_app_mode 写表后按进程恢复各自状态。
+    #[test]
+    fn per_app_scope_remembers_mode_per_process() {
+        let c = coord_with(|cfg| {
+            cfg.input.default.state_scope = "app".into();
+            cfg.input.default.chinese_mode = true;
+        });
+        // 游戏进程：首见 → 默认中文；用户切英文 → 写表。
+        set_focus_proc(&c, 100, "game.exe");
+        assert!(c.initial_chinese_mode_for("game.exe"), "首见进程应为配置默认");
+        c.state.lock().unwrap().chinese_mode = false;
+        c.record_app_mode(false);
+        // 切到聊天进程：首见 → 默认中文。
+        set_focus_proc(&c, 200, "chat.exe");
+        c.apply_initial_mode(token(200), false);
+        assert!(c.state.lock().unwrap().chinese_mode);
+        // 切回游戏进程：恢复英文记忆。
+        set_focus_proc(&c, 100, "game.exe");
+        c.apply_initial_mode(token(100), false);
+        assert!(!c.state.lock().unwrap().chinese_mode);
+    }
+
+    /// scope=app：FOCUS_GAINED 同步路径（get_current_mode）命中记忆表时先切换再回传；
+    /// 未入缓存的进程保持现状（由重型段修正）。
+    #[test]
+    fn get_current_mode_switches_per_app_on_cache_hit() {
+        let c = coord_with(|cfg| {
+            cfg.input.default.state_scope = "app".into();
+            cfg.input.default.chinese_mode = true;
+        });
+        set_focus_proc(&c, 100, "game.exe");
+        c.mode_states
+            .lock()
+            .unwrap()
+            .insert("game.exe".to_string(), false);
+        // 当前全局是中文，焦点到 game.exe → 同步切英文并回传。
+        let (chinese, _) = c.get_current_mode(token(100));
+        assert!(!chinese);
+        assert!(!c.state.lock().unwrap().chinese_mode);
+        // 未缓存的 pid（首次聚焦）：保持现状不误切。
+        let (chinese, _) = c.get_current_mode(token(999));
+        assert!(!chinese, "未知进程应回传当前状态");
+    }
+
+    /// global（默认作用域）：get_current_mode 不做 per-app 切换，直接回权威状态。
+    #[test]
+    fn get_current_mode_global_scope_passthrough() {
+        let c = coord_with(|_| {});
+        c.state.lock().unwrap().chinese_mode = false;
+        let (chinese, _) = c.get_current_mode(token(100));
+        assert!(!chinese);
+    }
+
+    /// 决策顺序：per-app 表命中优先于全局默认。
+    #[test]
+    fn initial_mode_decision_order() {
+        let c = coord_with(|cfg| {
+            cfg.input.default.state_scope = "app".into();
+            cfg.input.default.chinese_mode = true;
+        });
+        c.mode_states
+            .lock()
+            .unwrap()
+            .insert("x.exe".to_string(), false);
+        assert!(!c.initial_chinese_mode_for("x.exe"), "表命中优先");
+        assert!(c.initial_chinese_mode_for("y.exe"), "未命中落默认");
+        assert!(c.initial_chinese_mode_for(""), "空进程名落默认");
     }
 }
 

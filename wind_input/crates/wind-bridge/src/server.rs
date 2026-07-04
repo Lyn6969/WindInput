@@ -400,7 +400,10 @@ pub(crate) fn dispatch_command(
             if is_async {
                 None
             } else {
-                let (chinese_mode, full_width) = handler.get_current_mode();
+                let token = decode_focus_gained(payload)
+                    .map(|fg| fg.client_token)
+                    .unwrap_or(0);
+                let (chinese_mode, full_width) = handler.get_current_mode(token);
                 Some(encode_mode_push(chinese_mode, full_width))
             }
         }
