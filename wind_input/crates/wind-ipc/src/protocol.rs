@@ -130,6 +130,7 @@ pub const CMD_SYNC_CONFIG: u16 = 0x0303;
 pub const CMD_CONSUMED: u16 = 0x0401;
 
 // Host Render
+/// 仅 Windows 使用；darwin 端 SHM 名固定（endpoint::shm_name），无 setup 握手。
 pub const CMD_HOST_RENDER_SETUP: u16 = 0x0501;
 
 /// Host 窗口种类（与 C++ HostWindowKind 对齐，BinaryProtocol.h:359-365）

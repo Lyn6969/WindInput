@@ -161,14 +161,20 @@ C++ 端零改动：`target_instance_id` 不匹配即隐藏是现有行为，`0` 
 按 `docs/superpowers/plans/2026-07-02-macos-migration-gaps.md` Group 1 执行，此处只
 锁定归属与顺序，任务细节以该文档为准：
 
-1. **1a 统一菜单树下发**：`build_unified_menu_tree()` 纯构建函数 +
-   `encode_menu_show` + server macOS 分支回菜单树（替代 ack）。
-2. **1b 菜单命令 id 映射**：统一菜单 id ↔ `handle_menu_command` 可解析值核对。
-3. **1c hover/点选/右键**：coordinator 覆写 `handle_candidate_hover`（置 hover_index +
-   重渲染推帧）；`encode_candidate_menu_flags` 按候选下发禁用位；点选链路真机验证。
-4. **darwin `CMD_HOST_RENDER_SETUP` 握手时机闭环**：现状 Swift 端按固定
-   `endpoint::shm_name(suffix)` 打开 SHM 且已工作 → 正式决策为「darwin 无需 setup
-   握手」，在协议注释中写明 0x0501 为 Windows 专用，关闭 W4 遗留待办。
+> **核验结论（Task 10，2026-07-04）：Group 1 四项全部已实现，无真实缺口，待 macOS 真机验证。**
+
+1. ✅ **1a 统一菜单树下发**：`coordinator.rs:2577 query_menu_encoded` 已覆写；
+   `wind-bridge/src/server.rs:720-724` macOS `CMD_SHOW_CONTEXT_MENU` 分支返回菜单树帧（非 ack）。
+   待 macOS 真机验证。
+2. ✅ **1b 菜单命令 id 映射**：`MenuKind::to_menu_id`（manager.rs:255）与
+   `from_menu_id`（:291）完全对称；构建树 `handle_menu.rs:348` 与还原 `coordinator.rs:2598`
+   共用同一映射表，id 空间一致，无不一致缺口。待真机验证。
+3. ✅ **1c hover/点选/右键**：`handle_candidate_select`（:2613）、`handle_candidate_hover`（:2621）、
+   `handle_candidate_context_menu`（:2632）均已覆写；`encode_candidate_menu_flags`（codec.rs:707）
+   有生产调用方 `coordinator.rs:1803`，禁用位真实下发。待真机验证。
+4. ✅ **darwin `CMD_HOST_RENDER_SETUP` 握手时机闭环**：`protocol.rs:133` 已追加注释
+   「仅 Windows 使用；darwin 端 SHM 名固定（endpoint::shm_name），无 setup 握手。」
+   W4 遗留待办正式关闭。
 
 ## 8. 配置
 
