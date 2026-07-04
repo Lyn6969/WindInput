@@ -716,17 +716,12 @@ impl Coordinator {
     /// 注入 host-render 管理器（Windows）。服务入口在构造 `BridgeServer` 后调用一次，
     /// 与其共享同一 `Arc` 实例。重复注入静默忽略（`OnceLock` 语义）。
     #[cfg(windows)]
-    pub fn set_host_render(
-        &self,
-        mgr: Arc<wind_bridge::host_render_windows::HostRenderManager>,
-    ) {
+    pub fn set_host_render(&self, mgr: Arc<wind_bridge::host_render_windows::HostRenderManager>) {
         let _ = self.host_render.set(mgr.clone());
         // 把同一 Arc 传给 UI 线程，使其在消息循环中激活 SHM 分流路径（Task 7）。
-        let _ = self
-            .ui_tx
-            .send(wind_ui::manager::UiCommand::SetHostRender(
-                wind_ui::manager::HostRenderArc(mgr),
-            ));
+        let _ = self.ui_tx.send(wind_ui::manager::UiCommand::SetHostRender(
+            wind_ui::manager::HostRenderArc(mgr),
+        ));
     }
 
     /// 取已注入的 host-render 管理器（Windows）；未注入返回 None。供 Task 6/7 写帧/隐藏。
@@ -2061,8 +2056,10 @@ impl Coordinator {
             s.chinese_mode, s.key_down_hotkeys, s.key_up_hotkeys
         );
         #[cfg(windows)]
-        let host_render_avail =
-            self.host_render().map(|m| m.focused_whitelisted()).unwrap_or(false);
+        let host_render_avail = self
+            .host_render()
+            .map(|m| m.focused_whitelisted())
+            .unwrap_or(false);
         #[cfg(not(windows))]
         let host_render_avail = false;
         let encoded = wind_ipc::codec::encode_activation_status_push(

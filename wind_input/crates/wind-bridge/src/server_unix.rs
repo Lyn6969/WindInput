@@ -3,7 +3,7 @@
 //! 与 Go `internal/bridge/server_darwin.go` 对齐：每连接一线程，
 //! 阻塞读 8 字节 header + payload，dispatch_command 复用平台无关逻辑。
 use crate::handler::*;
-use crate::server::{dispatch_command, ClientCtx};
+use crate::server::{ClientCtx, dispatch_command};
 use std::io::{Read, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::PathBuf;

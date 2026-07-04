@@ -7,12 +7,12 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
-use anyhow::{bail, Context};
+use anyhow::{Context, bail};
 use tracing::info;
 use tracing::warn;
 use wind_ipc::protocol::{
-    HostRenderSetupEntry, HOST_WINDOW_CANDIDATE, HOST_WINDOW_KIND_COUNT, HOST_WINDOW_STATUS,
-    HOST_WINDOW_TOOLTIP, MAX_SHARED_RENDER_SIZE,
+    HOST_WINDOW_CANDIDATE, HOST_WINDOW_KIND_COUNT, HOST_WINDOW_STATUS, HOST_WINDOW_TOOLTIP,
+    HostRenderSetupEntry, MAX_SHARED_RENDER_SIZE,
 };
 
 use crate::named_event::NamedEvent;
@@ -21,8 +21,11 @@ use crate::shared_render_frame::FrameParams;
 
 // kind → SHM/Event 名称后缀
 const KIND_SUFFIXES: [&str; HOST_WINDOW_KIND_COUNT] = ["", "_TIP", "_STS"];
-const ALL_KINDS: [u32; HOST_WINDOW_KIND_COUNT] =
-    [HOST_WINDOW_CANDIDATE, HOST_WINDOW_TOOLTIP, HOST_WINDOW_STATUS];
+const ALL_KINDS: [u32; HOST_WINDOW_KIND_COUNT] = [
+    HOST_WINDOW_CANDIDATE,
+    HOST_WINDOW_TOOLTIP,
+    HOST_WINDOW_STATUS,
+];
 
 /// HostRender 渲染目标（活跃实例）
 #[derive(Clone, Debug)]
@@ -38,9 +41,9 @@ struct ClientState {
 }
 
 struct Inner {
-    shms: HashMap<u32, WindowsSharedMemory>,  // kind → 全局段（懒建）
-    clients: HashMap<u32, ClientState>,       // conn_id → 状态
-    setup_seq: u64,                           // 单调递增
+    shms: HashMap<u32, WindowsSharedMemory>, // kind → 全局段（懒建）
+    clients: HashMap<u32, ClientState>,      // conn_id → 状态
+    setup_seq: u64,                          // 单调递增
     visible_owner: HashMap<u32, (u32, u32)>, // kind → (pid, conn_id)
     whitelist: Vec<String>,                  // 进程名通配模式（大小写不敏感）
     active: Option<(u32, u32)>,              // (conn_id, pid) 最近焦点
@@ -103,18 +106,22 @@ fn wildcard_match(pattern: &str, text: &str) -> bool {
 fn query_process_filename(pid: u32) -> Option<String> {
     use windows::Win32::Foundation::CloseHandle;
     use windows::Win32::System::Threading::{
-        OpenProcess, QueryFullProcessImageNameW, PROCESS_NAME_WIN32,
-        PROCESS_QUERY_LIMITED_INFORMATION,
+        OpenProcess, PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION,
+        QueryFullProcessImageNameW,
     };
     use windows::core::PWSTR;
 
-    let handle =
-        unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid).ok()? };
+    let handle = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid).ok()? };
 
     let mut buf = [0u16; 1024];
     let mut size = buf.len() as u32;
     let ok = unsafe {
-        QueryFullProcessImageNameW(handle, PROCESS_NAME_WIN32, PWSTR(buf.as_mut_ptr()), &mut size)
+        QueryFullProcessImageNameW(
+            handle,
+            PROCESS_NAME_WIN32,
+            PWSTR(buf.as_mut_ptr()),
+            &mut size,
+        )
     };
     unsafe {
         let _ = CloseHandle(handle);
@@ -212,7 +219,14 @@ impl HostRenderManager {
             });
         }
 
-        inner.clients.insert(conn_id, ClientState { pid, setup_seq: seq, events });
+        inner.clients.insert(
+            conn_id,
+            ClientState {
+                pid,
+                setup_seq: seq,
+                events,
+            },
+        );
         info!("host_render setup: conn_id={conn_id} pid={pid} seq={seq}");
         Ok((conn_id, entries))
     }
@@ -243,7 +257,10 @@ impl HostRenderManager {
         inner
             .clients
             .contains_key(&conn_id)
-            .then_some(HostRenderTarget { pid, instance_id: conn_id })
+            .then_some(HostRenderTarget {
+                pid,
+                instance_id: conn_id,
+            })
     }
 
     /// 写帧到全局 SHM，登记 visible_owner，唤醒目标 pid 全部实例（锁外 SetEvent）
@@ -278,12 +295,13 @@ impl HostRenderManager {
                 target_instance_id: target.instance_id,
                 software_shadow: p.software_shadow,
             };
-            shm.write_frame(&modified).map_err(|_| {
-                anyhow::anyhow!("write_frame_for_kind: 帧过大 kind={kind}")
-            })?;
+            shm.write_frame(&modified)
+                .map_err(|_| anyhow::anyhow!("write_frame_for_kind: 帧过大 kind={kind}"))?;
 
             // 登记 visible_owner
-            inner.visible_owner.insert(kind, (target.pid, target.instance_id));
+            inner
+                .visible_owner
+                .insert(kind, (target.pid, target.instance_id));
 
             // 收集目标 pid 全部实例该 kind 的 event（锁内克隆 Arc，锁外 signal）
             inner
@@ -438,7 +456,7 @@ impl HostRenderManager {
 #[cfg(all(test, windows))]
 mod tests {
     use super::*;
-    use wind_ipc::protocol::{HostRenderHitRect, SharedRenderHeader, HOST_WINDOW_CANDIDATE};
+    use wind_ipc::protocol::{HOST_WINDOW_CANDIDATE, HostRenderHitRect, SharedRenderHeader};
 
     /// 构造测试专用 manager（suffix 含 tag + pid 防并发冲突）
     fn make_mgr(tag: &str) -> Arc<HostRenderManager> {
@@ -456,7 +474,11 @@ mod tests {
         assert_eq!(entries.len(), 3, "should return entries for all 3 kinds");
         let mut kinds: Vec<u32> = entries.iter().map(|e| e.window_kind).collect();
         kinds.sort_unstable();
-        assert_eq!(kinds, vec![0, 1, 2], "should cover CANDIDATE/TOOLTIP/STATUS");
+        assert_eq!(
+            kinds,
+            vec![0, 1, 2],
+            "should cover CANDIDATE/TOOLTIP/STATUS"
+        );
         for entry in &entries {
             assert!(
                 entry.event_name.contains("_C1"),
@@ -500,7 +522,13 @@ mod tests {
         assert_eq!(target.instance_id, instance_id);
 
         let bgra = vec![0xAAu8; 4 * 4 * 4];
-        let rects = [HostRenderHitRect { index: 0, x: 0, y: 0, w: 4, h: 4 }];
+        let rects = [HostRenderHitRect {
+            index: 0,
+            x: 0,
+            y: 0,
+            w: 4,
+            h: 4,
+        }];
         let frame = FrameParams {
             sequence: 0,
             x: 0,
@@ -537,7 +565,10 @@ mod tests {
         mgr.hide_kind(HOST_WINDOW_CANDIDATE);
         let seq_after_first = {
             let inner = mgr.inner.lock().unwrap();
-            let shm = inner.shms.get(&HOST_WINDOW_CANDIDATE).expect("SHM 仍应存在");
+            let shm = inner
+                .shms
+                .get(&HOST_WINDOW_CANDIDATE)
+                .expect("SHM 仍应存在");
             let (hdr, _) = shm.read_back();
             assert_eq!(
                 { hdr.flags } & SharedRenderHeader::FLAG_VISIBLE,
@@ -636,7 +667,7 @@ mod tests {
     fn open_and_wait0(name: &str) -> bool {
         use windows::Win32::Foundation::{CloseHandle, WAIT_OBJECT_0};
         use windows::Win32::System::Threading::{
-            OpenEventW, WaitForSingleObject, SYNCHRONIZATION_ACCESS_RIGHTS,
+            OpenEventW, SYNCHRONIZATION_ACCESS_RIGHTS, WaitForSingleObject,
         };
         let name_w: Vec<u16> = name.encode_utf16().chain(std::iter::once(0)).collect();
         let handle = unsafe {
@@ -648,7 +679,9 @@ mod tests {
         }
         .expect("OpenEventW failed");
         let result = unsafe { WaitForSingleObject(handle, 0) };
-        unsafe { let _ = CloseHandle(handle); }
+        unsafe {
+            let _ = CloseHandle(handle);
+        }
         result == WAIT_OBJECT_0
     }
 
@@ -681,7 +714,13 @@ mod tests {
         mgr.note_focus(1, pid);
         let target = mgr.active_target().expect("active_target");
         let bgra = vec![0xCCu8; 4 * 4 * 4];
-        let rects = [wind_ipc::protocol::HostRenderHitRect { index: 0, x: 0, y: 0, w: 4, h: 4 }];
+        let rects = [wind_ipc::protocol::HostRenderHitRect {
+            index: 0,
+            x: 0,
+            y: 0,
+            w: 4,
+            h: 4,
+        }];
         let frame = FrameParams {
             sequence: 0,
             x: 0,
@@ -698,9 +737,15 @@ mod tests {
             .expect("write_frame");
 
         // conn1 的 event 应已置信号
-        assert!(open_and_wait0(&evt1_name), "conn1 的 CANDIDATE event 应被置信号");
+        assert!(
+            open_and_wait0(&evt1_name),
+            "conn1 的 CANDIDATE event 应被置信号"
+        );
         // conn2（同 pid）的 event 也应已置信号
-        assert!(open_and_wait0(&evt2_name), "conn2（同 pid）的 CANDIDATE event 也应被置信号");
+        assert!(
+            open_and_wait0(&evt2_name),
+            "conn2（同 pid）的 CANDIDATE event 也应被置信号"
+        );
     }
 
     /// cleanup_client 不得误隐藏已被新 conn 接管的帧
@@ -716,7 +761,13 @@ mod tests {
         mgr.note_focus(1, pid);
         let target1 = mgr.active_target().expect("active_target conn1");
         let bgra = vec![0xAAu8; 4 * 4 * 4];
-        let rects = [wind_ipc::protocol::HostRenderHitRect { index: 0, x: 0, y: 0, w: 4, h: 4 }];
+        let rects = [wind_ipc::protocol::HostRenderHitRect {
+            index: 0,
+            x: 0,
+            y: 0,
+            w: 4,
+            h: 4,
+        }];
         let frame = FrameParams {
             sequence: 0,
             x: 0,

@@ -127,9 +127,7 @@ pub enum UiCommand {
 
 /// `HostRenderManager` 不派生 Debug，包一层使 UiCommand 可 derive Debug。
 #[cfg(windows)]
-pub struct HostRenderArc(
-    pub std::sync::Arc<wind_bridge::host_render_windows::HostRenderManager>,
-);
+pub struct HostRenderArc(pub std::sync::Arc<wind_bridge::host_render_windows::HostRenderManager>);
 
 #[cfg(windows)]
 impl std::fmt::Debug for HostRenderArc {

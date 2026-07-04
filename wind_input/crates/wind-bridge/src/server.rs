@@ -968,7 +968,7 @@ mod tests {
     use super::*;
     use std::sync::atomic::{AtomicU32, Ordering};
     use wind_ipc::protocol::{
-        IpcHeader, CMD_ACK, CMD_HOST_RENDER_FAILED, CMD_HOST_RENDER_REQUEST, CMD_HOST_RENDER_SETUP,
+        CMD_ACK, CMD_HOST_RENDER_FAILED, CMD_HOST_RENDER_REQUEST, CMD_HOST_RENDER_SETUP, IpcHeader,
     };
 
     /// 最小测试 handler：仅记录 host_render_failed 的 reason，其余方法返回安全默认值。

@@ -371,8 +371,7 @@ impl CandidateWindow {
                 self.window.resize(frame.width, frame.height);
                 {
                     let buf = self.window.buffer_mut();
-                    buf[..(frame.width * frame.height * 4) as usize]
-                        .copy_from_slice(&frame.buf);
+                    buf[..(frame.width * frame.height * 4) as usize].copy_from_slice(&frame.buf);
                 }
                 if let Err(e) = self.window.update() {
                     tracing::warn!("CandidateWindow update failed: {}", e);

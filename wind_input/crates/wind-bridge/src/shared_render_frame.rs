@@ -26,7 +26,8 @@ pub fn encode_frame_into(dst: &mut [u8], p: &FrameParams) -> Result<(), FrameToo
     if total > dst.len() {
         return Err(FrameTooLarge);
     }
-    let mut hdr = SharedRenderHeader::new(p.x, p.y, p.width, p.height, p.width * 4, data_size as u32);
+    let mut hdr =
+        SharedRenderHeader::new(p.x, p.y, p.width, p.height, p.width * 4, data_size as u32);
     hdr.sequence = p.sequence;
     if p.software_shadow {
         hdr.flags |= SharedRenderHeader::FLAG_SOFTWARE_SHADOW;
@@ -71,15 +72,31 @@ mod tests {
     #[test]
     fn frame_layout_header_pixels_rects() {
         let bgra = vec![0xAAu8; 2 * 2 * 4];
-        let rects = [HostRenderHitRect { index: 0, x: 1, y: 2, w: 3, h: 4 }];
+        let rects = [HostRenderHitRect {
+            index: 0,
+            x: 1,
+            y: 2,
+            w: 3,
+            h: 4,
+        }];
         let mut dst = vec![0u8; 4096];
-        encode_frame_into(&mut dst, &FrameParams {
-            sequence: 5, x: 10, y: 20, width: 2, height: 2,
-            bgra: &bgra, rects: &rects, rendered_hover_index: -1,
-            target_instance_id: 7, software_shadow: false,
-        }).unwrap();
-        let hdr: SharedRenderHeader =
-            unsafe { std::ptr::read_unaligned(dst.as_ptr() as *const _) };
+        encode_frame_into(
+            &mut dst,
+            &FrameParams {
+                sequence: 5,
+                x: 10,
+                y: 20,
+                width: 2,
+                height: 2,
+                bgra: &bgra,
+                rects: &rects,
+                rendered_hover_index: -1,
+                target_instance_id: 7,
+                software_shadow: false,
+            },
+        )
+        .unwrap();
+        let hdr: SharedRenderHeader = unsafe { std::ptr::read_unaligned(dst.as_ptr() as *const _) };
         assert_eq!({ hdr.magic }, 0x57494E44);
         assert_eq!({ hdr.sequence }, 5);
         assert_eq!({ hdr.target_instance_id }, 7);
@@ -97,8 +114,7 @@ mod tests {
     fn hidden_frame_broadcast_target_zero() {
         let mut dst = vec![0u8; 128];
         encode_hidden_into(&mut dst, 9, 0);
-        let hdr: SharedRenderHeader =
-            unsafe { std::ptr::read_unaligned(dst.as_ptr() as *const _) };
+        let hdr: SharedRenderHeader = unsafe { std::ptr::read_unaligned(dst.as_ptr() as *const _) };
         assert_eq!({ hdr.flags } & SharedRenderHeader::FLAG_VISIBLE, 0);
         assert_eq!({ hdr.sequence }, 9);
         assert_eq!({ hdr.target_instance_id }, 0);
@@ -109,11 +125,24 @@ mod tests {
     fn frame_too_large_rejected() {
         let bgra = vec![0u8; 256];
         let mut dst = vec![0u8; 128]; // 64 头 + 64 容量 < 256 像素
-        assert!(encode_frame_into(&mut dst, &FrameParams {
-            sequence: 1, x: 0, y: 0, width: 8, height: 8,
-            bgra: &bgra, rects: &[], rendered_hover_index: -1,
-            target_instance_id: 1, software_shadow: false,
-        }).is_err());
+        assert!(
+            encode_frame_into(
+                &mut dst,
+                &FrameParams {
+                    sequence: 1,
+                    x: 0,
+                    y: 0,
+                    width: 8,
+                    height: 8,
+                    bgra: &bgra,
+                    rects: &[],
+                    rendered_hover_index: -1,
+                    target_instance_id: 1,
+                    software_shadow: false,
+                }
+            )
+            .is_err()
+        );
     }
 
     #[test]

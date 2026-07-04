@@ -23,10 +23,10 @@ pub mod shared_memory_posix;
 
 // Windows：命名 SHM 写端 + 命名 Event（带 AppContainer SDDL）+ HostRenderManager
 #[cfg(windows)]
+pub mod host_render_windows;
+#[cfg(windows)]
 pub mod named_event;
 #[cfg(windows)]
 pub mod shared_memory_windows;
-#[cfg(windows)]
-pub mod host_render_windows;
 
 pub use host_render_sink::HostRenderSink;

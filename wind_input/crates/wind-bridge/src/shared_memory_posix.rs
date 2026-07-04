@@ -6,7 +6,7 @@ use std::io;
 use std::os::unix::ffi::OsStrExt;
 use wind_ipc::protocol::SharedRenderHeader;
 
-use crate::shared_render_frame::{encode_frame_into, encode_hidden_into, FrameParams};
+use crate::shared_render_frame::{FrameParams, encode_frame_into, encode_hidden_into};
 
 pub struct PosixSharedMemory {
     fd: libc::c_int,
@@ -80,18 +80,21 @@ impl PosixSharedMemory {
     pub fn write_frame(&mut self, x: i32, y: i32, width: u32, height: u32, bgra: &[u8]) -> u32 {
         self.sequence += 1;
         let dst = unsafe { std::slice::from_raw_parts_mut(self.ptr as *mut u8, self.size) };
-        let _ = encode_frame_into(dst, &FrameParams {
-            sequence: self.sequence,
-            x,
-            y,
-            width,
-            height,
-            bgra,
-            rects: &[],
-            rendered_hover_index: -1,
-            target_instance_id: 0,
-            software_shadow: false,
-        });
+        let _ = encode_frame_into(
+            dst,
+            &FrameParams {
+                sequence: self.sequence,
+                x,
+                y,
+                width,
+                height,
+                bgra,
+                rects: &[],
+                rendered_hover_index: -1,
+                target_instance_id: 0,
+                software_shadow: false,
+            },
+        );
         self.sequence
     }
 

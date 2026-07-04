@@ -603,20 +603,32 @@ mod tests {
         assert_eq!(u32::from_le_bytes(p[4..8].try_into().unwrap()), 1);
         // entry header 16B: kind + maxBufferSize + shmNameLen + eventNameLen
         assert_eq!(u32::from_le_bytes(p[8..12].try_into().unwrap()), 0);
-        assert_eq!(u32::from_le_bytes(p[12..16].try_into().unwrap()), 4 * 1024 * 1024);
+        assert_eq!(
+            u32::from_le_bytes(p[12..16].try_into().unwrap()),
+            4 * 1024 * 1024
+        );
         assert_eq!(u32::from_le_bytes(p[16..20].try_into().unwrap()), 11);
         assert_eq!(u32::from_le_bytes(p[20..24].try_into().unwrap()), 11);
         assert_eq!(&p[24..35], b"Local\\W_SHM");
         assert_eq!(&p[35..46], b"Local\\W_EVT");
         assert_eq!(p.len(), 46);
         // payload_len 一致
-        assert_eq!(u32::from_le_bytes(buf[4..8].try_into().unwrap()) as usize, 46);
+        assert_eq!(
+            u32::from_le_bytes(buf[4..8].try_into().unwrap()) as usize,
+            46
+        );
     }
 
     #[test]
     fn test_host_render_hit_rect_layout() {
         use crate::protocol::HostRenderHitRect;
-        let r = HostRenderHitRect { index: -1, x: 1, y: 2, w: 3, h: 4 };
+        let r = HostRenderHitRect {
+            index: -1,
+            x: 1,
+            y: 2,
+            w: 3,
+            h: 4,
+        };
         let b = r.to_bytes();
         assert_eq!(b.len(), 20);
         assert_eq!(i32::from_le_bytes(b[0..4].try_into().unwrap()), -1);

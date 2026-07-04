@@ -54,7 +54,10 @@ impl NamedEvent {
         }
         .map_err(|_| io::Error::last_os_error())?;
 
-        Ok(Self { handle, name: name.to_owned() })
+        Ok(Self {
+            handle,
+            name: name.to_owned(),
+        })
     }
 
     /// 置信号（SetEvent）

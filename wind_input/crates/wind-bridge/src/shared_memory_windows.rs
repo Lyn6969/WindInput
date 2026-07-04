@@ -11,11 +11,13 @@ use std::{io, mem};
 use windows::Win32::Foundation::{CloseHandle, HANDLE, INVALID_HANDLE_VALUE};
 use windows::Win32::Security::SECURITY_ATTRIBUTES;
 use windows::Win32::System::Memory::{
-    CreateFileMappingW, FILE_MAP_ALL_ACCESS, MapViewOfFile, MEMORY_MAPPED_VIEW_ADDRESS,
+    CreateFileMappingW, FILE_MAP_ALL_ACCESS, MEMORY_MAPPED_VIEW_ADDRESS, MapViewOfFile,
     PAGE_READWRITE, UnmapViewOfFile,
 };
 
-use crate::shared_render_frame::{encode_frame_into, encode_hidden_into, FrameParams, FrameTooLarge};
+use crate::shared_render_frame::{
+    FrameParams, FrameTooLarge, encode_frame_into, encode_hidden_into,
+};
 
 #[cfg(test)]
 use wind_ipc::protocol::SharedRenderHeader;
@@ -73,7 +75,9 @@ impl WindowsSharedMemory {
         let view = unsafe { MapViewOfFile(handle, FILE_MAP_ALL_ACCESS, 0, 0, size) };
         if view.Value.is_null() {
             let e = io::Error::last_os_error();
-            unsafe { let _ = CloseHandle(handle); }
+            unsafe {
+                let _ = CloseHandle(handle);
+            }
             return Err(e);
         }
 
@@ -136,8 +140,8 @@ impl WindowsSharedMemory {
     pub fn read_back(&self) -> (SharedRenderHeader, Vec<u8>) {
         let hdr: SharedRenderHeader =
             unsafe { std::ptr::read_unaligned(self.ptr as *const SharedRenderHeader) };
-        let n = ({ hdr.data_size } as usize)
-            .min(self.size.saturating_sub(SharedRenderHeader::SIZE));
+        let n =
+            ({ hdr.data_size } as usize).min(self.size.saturating_sub(SharedRenderHeader::SIZE));
         let slice = unsafe { std::slice::from_raw_parts(self.ptr, self.size) };
         let pixels = slice[SharedRenderHeader::SIZE..SharedRenderHeader::SIZE + n].to_vec();
         (hdr, pixels)
@@ -147,7 +151,9 @@ impl WindowsSharedMemory {
 impl Drop for WindowsSharedMemory {
     fn drop(&mut self) {
         unsafe {
-            let _ = UnmapViewOfFile(MEMORY_MAPPED_VIEW_ADDRESS { Value: self.ptr as *mut _ });
+            let _ = UnmapViewOfFile(MEMORY_MAPPED_VIEW_ADDRESS {
+                Value: self.ptr as *mut _,
+            });
             let _ = CloseHandle(self.handle);
         }
     }
@@ -183,10 +189,9 @@ mod tests {
         let hdr: SharedRenderHeader =
             unsafe { std::ptr::read_unaligned(base as *const SharedRenderHeader) };
         let data_size = { hdr.data_size } as usize;
-        let pixels = unsafe {
-            std::slice::from_raw_parts(base.add(SharedRenderHeader::SIZE), data_size)
-        }
-        .to_vec();
+        let pixels =
+            unsafe { std::slice::from_raw_parts(base.add(SharedRenderHeader::SIZE), data_size) }
+                .to_vec();
 
         unsafe {
             let _ = UnmapViewOfFile(view);
@@ -199,7 +204,7 @@ mod tests {
     fn open_and_wait0(name: &str) -> bool {
         use windows::Win32::Foundation::{CloseHandle, WAIT_OBJECT_0};
         use windows::Win32::System::Threading::{
-            OpenEventW, WaitForSingleObject, SYNCHRONIZATION_ACCESS_RIGHTS,
+            OpenEventW, SYNCHRONIZATION_ACCESS_RIGHTS, WaitForSingleObject,
         };
 
         let name_w: Vec<u16> = name.encode_utf16().chain(std::iter::once(0)).collect();
@@ -214,7 +219,9 @@ mod tests {
         .expect("OpenEventW failed");
 
         let result = unsafe { WaitForSingleObject(handle, 0) };
-        unsafe { let _ = CloseHandle(handle); }
+        unsafe {
+            let _ = CloseHandle(handle);
+        }
         result == WAIT_OBJECT_0
     }
 
@@ -228,7 +235,13 @@ mod tests {
         let name = format!("Local\\WindTestShm{}", std::process::id());
         let mut shm = WindowsSharedMemory::create(&name, 1 << 20).unwrap();
         let bgra = vec![0x7Fu8; 4 * 4 * 4];
-        let rects = [HostRenderHitRect { index: 1, x: 0, y: 0, w: 4, h: 4 }];
+        let rects = [HostRenderHitRect {
+            index: 1,
+            x: 0,
+            y: 0,
+            w: 4,
+            h: 4,
+        }];
         let seq = shm
             .write_frame(&FrameParams {
                 sequence: 0,
