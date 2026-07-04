@@ -298,6 +298,7 @@ pub fn encode_status_update(
     chinese_punct: bool,
     toolbar_visible: bool,
     caps_lock: bool,
+    host_render_avail: bool,
     key_down_hashes: &[u32],
     key_up_hashes: &[u32],
     icon_label: &str,
@@ -309,7 +310,7 @@ pub fn encode_status_update(
         chinese_punct,
         toolbar_visible,
         caps_lock,
-        false, // host_render_avail
+        host_render_avail,
         key_down_hashes,
         key_up_hashes,
         icon_label,
@@ -552,23 +553,28 @@ pub fn encode_hold_composition(timeout_ms: u32, text: &str) -> Vec<u8> {
     buf
 }
 
-/// 编码 HostRenderSetup 响应 (CMD_HOST_RENDER_SETUP 0x0501)
+/// 编码 HostRenderSetup 响应 (CMD_HOST_RENDER_SETUP 0x0501，Windows)
 ///
-/// 格式: entryCount(u32) + entries...
-/// 每个 entry: kind(u32) + shmNameLen(u32) + shmName(UTF-8) + eventNameLen(u32) + eventName(UTF-8)
-pub fn encode_host_render_setup(entries: &[(u32, String, String)]) -> Vec<u8> {
+/// 线格式（对齐 C++ IPCClient.cpp:1524 解码端 / BinaryProtocol.h HostRenderSetupEntryHeader）：
+/// instanceId(u32) + entryCount(u32) + N × { kind(u32) + maxBufferSize(u32)
+///   + shmNameLen(u32) + eventNameLen(u32) + shmName(UTF-8) + eventName(UTF-8) }
+pub fn encode_host_render_setup(
+    instance_id: u32,
+    entries: &[crate::protocol::HostRenderSetupEntry],
+) -> Vec<u8> {
     let mut payload = Vec::new();
+    payload.extend_from_slice(&instance_id.to_le_bytes());
     payload.extend_from_slice(&(entries.len() as u32).to_le_bytes());
-    for (kind, shm_name, event_name) in entries {
-        let shm_bytes = shm_name.as_bytes();
-        let evt_bytes = event_name.as_bytes();
-        payload.extend_from_slice(&kind.to_le_bytes());
-        payload.extend_from_slice(&(shm_bytes.len() as u32).to_le_bytes());
-        payload.extend_from_slice(shm_bytes);
-        payload.extend_from_slice(&(evt_bytes.len() as u32).to_le_bytes());
-        payload.extend_from_slice(evt_bytes);
+    for e in entries {
+        let shm = e.shm_name.as_bytes();
+        let evt = e.event_name.as_bytes();
+        payload.extend_from_slice(&e.window_kind.to_le_bytes());
+        payload.extend_from_slice(&e.max_buffer_size.to_le_bytes());
+        payload.extend_from_slice(&(shm.len() as u32).to_le_bytes());
+        payload.extend_from_slice(&(evt.len() as u32).to_le_bytes());
+        payload.extend_from_slice(shm);
+        payload.extend_from_slice(evt);
     }
-
     let mut buf = Vec::with_capacity(IpcHeader::SIZE + payload.len());
     let ipc = IpcHeader::new(CMD_HOST_RENDER_SETUP, payload.len() as u32);
     buf.extend_from_slice(&ipc.to_bytes());
@@ -579,6 +585,43 @@ pub fn encode_host_render_setup(entries: &[(u32, String, String)]) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_encode_host_render_setup_layout_matches_cpp() {
+        use crate::protocol::HostRenderSetupEntry;
+        let entries = vec![HostRenderSetupEntry {
+            window_kind: 0,
+            max_buffer_size: 4 * 1024 * 1024,
+            shm_name: "Local\\W_SHM".to_string(),   // 11 B
+            event_name: "Local\\W_EVT".to_string(), // 11 B
+        }];
+        let buf = encode_host_render_setup(7, &entries);
+        // IpcHeader 8B: version u16 + command u16 + payload_len u32（以现有 IpcHeader::to_bytes 为准）
+        let p = &buf[8..];
+        // instanceId(4) + entryCount(4)
+        assert_eq!(u32::from_le_bytes(p[0..4].try_into().unwrap()), 7);
+        assert_eq!(u32::from_le_bytes(p[4..8].try_into().unwrap()), 1);
+        // entry header 16B: kind + maxBufferSize + shmNameLen + eventNameLen
+        assert_eq!(u32::from_le_bytes(p[8..12].try_into().unwrap()), 0);
+        assert_eq!(u32::from_le_bytes(p[12..16].try_into().unwrap()), 4 * 1024 * 1024);
+        assert_eq!(u32::from_le_bytes(p[16..20].try_into().unwrap()), 11);
+        assert_eq!(u32::from_le_bytes(p[20..24].try_into().unwrap()), 11);
+        assert_eq!(&p[24..35], b"Local\\W_SHM");
+        assert_eq!(&p[35..46], b"Local\\W_EVT");
+        assert_eq!(p.len(), 46);
+        // payload_len 一致
+        assert_eq!(u32::from_le_bytes(buf[4..8].try_into().unwrap()) as usize, 46);
+    }
+
+    #[test]
+    fn test_host_render_hit_rect_layout() {
+        use crate::protocol::HostRenderHitRect;
+        let r = HostRenderHitRect { index: -1, x: 1, y: 2, w: 3, h: 4 };
+        let b = r.to_bytes();
+        assert_eq!(b.len(), 20);
+        assert_eq!(i32::from_le_bytes(b[0..4].try_into().unwrap()), -1);
+        assert_eq!(i32::from_le_bytes(b[16..20].try_into().unwrap()), 4);
+    }
 
     #[test]
     fn test_encode_hold_composition_layout() {

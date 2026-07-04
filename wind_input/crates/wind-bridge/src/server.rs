@@ -810,6 +810,7 @@ fn encode_status_update_from_data(status: &StatusUpdateData) -> Vec<u8> {
         status.chinese_punct,
         status.toolbar_visible,
         status.caps_lock,
+        false, // host_render_avail: Task 6 接线真值
         &status.key_down_hotkeys,
         &status.key_up_hotkeys,
         &status.icon_label,
