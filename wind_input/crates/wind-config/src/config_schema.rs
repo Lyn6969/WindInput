@@ -108,6 +108,7 @@ static REGISTRY: &[ConfigField] = &[
     f("schema.mix.pinyin_only_overflow", Bool),
     f("schema.mix.top_code_override_pinyin", Bool),
     f("schema.mix.auto_commit_block_on_pinyin", Bool),
+    f("schema.mix.auto_commit_block_on_english", Bool),
     f("schema.mix.min_pinyin_length", Int),
     f("schema.mix.min_english_length", Int),
     f("schema.quick_input.enabled", Bool),
@@ -233,6 +234,8 @@ static REGISTRY: &[ConfigField] = &[
     f("ui.status.custom_y", Int),
     f("ui.toolbar.visible", Bool),
     f("ui.toolbar.hide_in_fullscreen", Bool),
+    f("ui.toolbar.auto_hide", Bool),
+    f("ui.toolbar.auto_hide_delay", Int),
     // -- stats（统计，原 features.stats 升顶级）--
     f("stats.enabled", Bool),
     f("stats.track_english", Bool),

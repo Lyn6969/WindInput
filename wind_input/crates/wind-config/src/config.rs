@@ -398,6 +398,9 @@ pub struct MixGlobal {
     /// 满码上屏遇拼音候选则否决（保护拼音用户）。
     #[serde(default = "default_true")]
     pub auto_commit_block_on_pinyin: bool,
+    /// 满码上屏遇英文候选则否决（保护正在输入英文词的用户；仅 enable_english 开时有意义）。
+    #[serde(default)]
+    pub auto_commit_block_on_english: bool,
     /// 拼音最小触发长度（0=回退 2）。
     #[serde(default)]
     pub min_pinyin_length: usize,
@@ -414,6 +417,7 @@ impl Default for MixGlobal {
             pinyin_only_overflow: false,
             top_code_override_pinyin: false,
             auto_commit_block_on_pinyin: true,
+            auto_commit_block_on_english: false,
             min_pinyin_length: 0,
             min_english_length: 0,
         }
@@ -1033,6 +1037,12 @@ pub struct ToolbarConfig {
     /// 前台应用全屏时自动隐藏工具栏（默认 true）。
     #[serde(default = "default_true")]
     pub hide_in_fullscreen: bool,
+    /// 自动隐藏：显示后超时无交互则淡出（默认关）。
+    #[serde(default)]
+    pub auto_hide: bool,
+    /// 自动隐藏超时（秒，默认 5；下限 1 由协调器钳制）。
+    #[serde(default = "default_toolbar_auto_hide_delay")]
+    pub auto_hide_delay: u32,
 }
 
 impl Default for ToolbarConfig {
@@ -1040,8 +1050,14 @@ impl Default for ToolbarConfig {
         Self {
             visible: true,
             hide_in_fullscreen: true,
+            auto_hide: false,
+            auto_hide_delay: 5,
         }
     }
+}
+
+fn default_toolbar_auto_hide_delay() -> u32 {
+    5
 }
 
 /// 状态提示气泡配置（[ui.status]，对齐 Go）：中英/标点/全半角/方案切换的瞬时气泡。
@@ -2039,5 +2055,16 @@ smart_method = "delete_replace"
         let toml = r#"smart_mode = true"#;
         let cfg: SymbolConfig = toml::from_str(toml).unwrap();
         assert_eq!(cfg.smart_method, SmartMethod::HoldComposition);
+    }
+
+    /// 工具栏自动隐藏：默认关、超时 5 秒；空表反序列化与 Default 一致。
+    #[test]
+    fn toolbar_auto_hide_defaults() {
+        let tb: ToolbarConfig = toml::from_str("").unwrap();
+        assert!(!tb.auto_hide);
+        assert_eq!(tb.auto_hide_delay, 5);
+        let d = ToolbarConfig::default();
+        assert!(!d.auto_hide);
+        assert_eq!(d.auto_hide_delay, 5);
     }
 }

@@ -1275,6 +1275,7 @@ impl EngineManager {
                 mix_cfg.show_source_hint,
                 english,
                 min_en,
+                mix_cfg.auto_commit_block_on_english,
             )));
         }
 

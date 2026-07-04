@@ -52,6 +52,8 @@ pub struct MixedEngine {
     english: Option<Box<dyn Engine>>,
     /// 英文最小触发长度：输入短于此值时不查英文（2 字符以内不匹配 → 默认 3）。
     min_english_length: usize,
+    /// 满码自动上屏时若存在英文候选（含前缀）则否决（保护正在输入英文词的用户）。
+    auto_commit_block_on_english: bool,
 }
 
 impl MixedEngine {
@@ -67,6 +69,7 @@ impl MixedEngine {
         show_source_hint: bool,
         english: Option<Box<dyn Engine>>,
         min_english_length: usize,
+        auto_commit_block_on_english: bool,
     ) -> Self {
         let max_code_len = primary.max_code_length();
         Self {
@@ -81,6 +84,7 @@ impl MixedEngine {
             show_source_hint,
             english,
             min_english_length,
+            auto_commit_block_on_english,
         }
     }
 
@@ -342,12 +346,18 @@ impl Engine for MixedEngine {
             Self::add_source_hints(&mut merged);
         }
 
+        // 英文守护（对齐拼音守护）：满码上屏时若存在英文候选（含前缀），说明用户可能正在
+        // 输入更长的英文词，否决自动上屏留给用户选择。仅 auto_commit_block_on_english 开时生效。
+        let has_english = self.auto_commit_block_on_english
+            && merged.iter().any(|c| c.source == CandidateSource::English);
+
         // 全码自动上屏重评（对齐 Go recheckAutoCommit）：取主码表意向，
-        // 但若开启拼音守护且存在拼音候选则否决（输入可能是拼音，留给用户选）；
+        // 但若开启拼音/英文守护且存在对应候选则否决（输入可能是拼音/英文，留给用户选）；
         // 并复核上屏目标在合并结果中仍存活。
         let (should_commit, commit_text) = if ct_should_commit
             && !ct_commit_text.is_empty()
             && !(self.auto_commit_block_on_pinyin && has_pinyin)
+            && !has_english
             && merged.iter().any(|c| c.text == ct_commit_text)
         {
             (true, ct_commit_text)
@@ -442,7 +452,7 @@ mod tests {
     fn mixed_propagates_auto_commit_without_pinyin() {
         // 主码表唯一全码自动上屏；无次引擎 → 无拼音候选 → 放行。
         let primary = ct_engine(&[("aaaa", "工", 100)], true);
-        let e = MixedEngine::new(primary, None, 2, 10_000_000, true, true, false, false, None, 2);
+        let e = MixedEngine::new(primary, None, 2, 10_000_000, true, true, false, false, None, 2, false);
         let r = e.convert("aaaa", 50).unwrap();
         assert!(r.should_commit, "无拼音候选时应放行全码上屏");
         assert_eq!(r.commit_text, "工");
@@ -464,6 +474,7 @@ mod tests {
             false,
             None,
             2,
+            false,
         );
         let r = e.convert("aaaa", 50).unwrap();
         assert!(!r.should_commit, "有拼音候选且守护开时应否决全码上屏");
@@ -485,6 +496,7 @@ mod tests {
             false,
             None,
             2,
+            false,
         );
         let r = e.convert("aaaa", 50).unwrap();
         assert!(r.should_commit, "守护关时应放行");
@@ -529,6 +541,7 @@ mod tests {
             false,
             None,
             2,
+            false,
         );
         assert_eq!(
             e.handle_top_code("wangb"),
@@ -578,6 +591,7 @@ mod tests {
             false,
             None,
             2,
+            false,
         );
         assert_eq!(
             e.handle_top_code("wangb"),
@@ -614,6 +628,7 @@ mod tests {
             false,
             Some(english),
             2,
+            false,
         );
         let r = e.convert("hel", 50).unwrap();
         assert!(
@@ -634,7 +649,7 @@ mod tests {
     fn mixed_no_english_when_disabled() {
         // english=None：不混入英文候选（零回归）。
         let primary = ct_engine(&[("hao", "好", 100)], false);
-        let e = MixedEngine::new(primary, None, 2, 10_000_000, false, true, false, false, None, 2);
+        let e = MixedEngine::new(primary, None, 2, 10_000_000, false, true, false, false, None, 2, false);
         let r = e.convert("hel", 50).unwrap();
         assert!(
             !r.candidates.iter().any(|c| c.text == "hello"),
@@ -658,6 +673,7 @@ mod tests {
             false,
             Some(english),
             3,
+            false,
         );
         let r2 = e.convert("he", 50).unwrap();
         assert!(
@@ -669,5 +685,34 @@ mod tests {
             r3.candidates.iter().any(|c| c.text == "hello"),
             "3 字符（>= min 3）应出英文候选"
         );
+    }
+
+    #[test]
+    fn mixed_blocks_auto_commit_when_english_present() {
+        // 主码表唯一全码本会自动上屏；开英文守护 + 有英文候选 → 否决（留给用户选英文）。
+        let primary = ct_engine(&[("good", "工", 100)], true);
+        let english = english_engine(&[("good", "good", 50), ("goodbye", "goodbye", 40)]);
+        let e = MixedEngine::new(
+            primary, None, 2, 10_000_000, false, true, false, false, Some(english), 2, true,
+        );
+        let r = e.convert("good", 50).unwrap();
+        assert!(!r.should_commit, "开英文守护且有英文候选时应否决全码上屏");
+        assert!(
+            r.candidates.iter().any(|c| c.text == "good"),
+            "应含英文候选 good"
+        );
+    }
+
+    #[test]
+    fn mixed_allows_auto_commit_when_english_guard_off() {
+        // 英文守护关 → 即便有英文候选也放行全码上屏（零回归）。
+        let primary = ct_engine(&[("good", "工", 100)], true);
+        let english = english_engine(&[("good", "good", 50)]);
+        let e = MixedEngine::new(
+            primary, None, 2, 10_000_000, false, true, false, false, Some(english), 2, false,
+        );
+        let r = e.convert("good", 50).unwrap();
+        assert!(r.should_commit, "英文守护关时应放行全码上屏");
+        assert_eq!(r.commit_text, "工");
     }
 }
