@@ -197,11 +197,11 @@ impl HostRenderManager {
 
         for &kind in &ALL_KINDS {
             // 懒建全局 SHM
-            if !inner.shms.contains_key(&kind) {
+            if let std::collections::hash_map::Entry::Vacant(e) = inner.shms.entry(kind) {
                 let name = shm_name_for(&self.suffix, kind);
                 let shm = WindowsSharedMemory::create(&name, MAX_SHARED_RENDER_SIZE)
                     .with_context(|| format!("create SHM kind={kind}"))?;
-                inner.shms.insert(kind, shm);
+                e.insert(shm);
             }
             let shm_name = inner.shms[&kind].name().to_owned();
 
@@ -274,11 +274,11 @@ impl HostRenderManager {
             let mut inner = self.inner.lock().unwrap();
 
             // 懒建全局 SHM
-            if !inner.shms.contains_key(&kind) {
+            if let std::collections::hash_map::Entry::Vacant(e) = inner.shms.entry(kind) {
                 let name = shm_name_for(&self.suffix, kind);
                 let shm = WindowsSharedMemory::create(&name, MAX_SHARED_RENDER_SIZE)
                     .with_context(|| format!("create SHM kind={kind}"))?;
-                inner.shms.insert(kind, shm);
+                e.insert(shm);
             }
 
             // 以 target.instance_id 覆盖 p.target_instance_id
@@ -437,7 +437,7 @@ impl HostRenderManager {
             }
         }
         inner.clients.remove(&conn_id);
-        if inner.active.map_or(false, |(cid, _)| cid == conn_id) {
+        if inner.active.is_some_and(|(cid, _)| cid == conn_id) {
             inner.active = None;
         }
         info!("cleanup_client: 已清理 conn_id={conn_id}");

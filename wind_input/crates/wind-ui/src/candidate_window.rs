@@ -1626,14 +1626,14 @@ impl CandidateMouse {
         if self.engaged {
             return; // 已激活：悬停在 on_message 内即时发出
         }
-        if let Some(at) = self.engage_at {
-            if Instant::now() >= at {
-                self.engaged = true;
-                self.engage_at = None;
-                if self.pending_raw != self.last_hover {
-                    self.last_hover = self.pending_raw;
-                    let _ = self.events.send(UiEvent::Hover(self.pending_raw));
-                }
+        if let Some(at) = self.engage_at
+            && Instant::now() >= at
+        {
+            self.engaged = true;
+            self.engage_at = None;
+            if self.pending_raw != self.last_hover {
+                self.last_hover = self.pending_raw;
+                let _ = self.events.send(UiEvent::Hover(self.pending_raw));
             }
         }
     }

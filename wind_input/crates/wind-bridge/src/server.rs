@@ -892,10 +892,10 @@ fn handle_batch_events(
                 )
             }
         };
-        if !sub_header.is_async() {
-            if let Some(resp) = sub_resp {
-                responses.push(resp);
-            }
+        if !sub_header.is_async()
+            && let Some(resp) = sub_resp
+        {
+            responses.push(resp);
         }
     }
 

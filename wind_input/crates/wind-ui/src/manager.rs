@@ -580,62 +580,59 @@ impl UiManager {
             }
 
             // 推进状态提示防抖（稳定后才真正显示气泡）
-            if let Some((text, x, y, ch, ox, oy, dur, fixed, fx, fy)) = tip_debounce.poll() {
-                if let Some(t) = &mut status_tip {
-                    // host-render 分流：有活跃目标且写帧成功 → SHM + 本地隐藏；否则本地显示。
-                    let mut host_ok = false;
-                    #[cfg(windows)]
-                    if let Some(hr) = &host_render {
-                        if let Some(target) = hr.active_target() {
-                            use wind_bridge::shared_render_frame::FrameParams;
-                            use wind_ipc::protocol::HOST_WINDOW_STATUS;
-                            let fo = if fixed {
-                                t.render_frame_fixed(&text, fx, fy)
-                            } else {
-                                t.render_frame(&text, x, y, ch, ox, oy)
-                            };
-                            if let Some((bgra, w, h, sx, sy, sw)) = fo {
-                                let p = FrameParams {
-                                    sequence: 0,
-                                    x: sx,
-                                    y: sy,
-                                    width: w,
-                                    height: h,
-                                    bgra: &bgra,
-                                    rects: &[],
-                                    rendered_hover_index: -1,
-                                    target_instance_id: 0,
-                                    software_shadow: sw,
-                                };
-                                match hr.write_frame_for_kind(HOST_WINDOW_STATUS, &target, &p) {
-                                    Ok(()) => {
-                                        t.hide();
-                                        host_ok = true;
-                                    }
-                                    Err(e) => {
-                                        tracing::warn!(
-                                            "host render 写 status 帧失败，回退本地: {}",
-                                            e
-                                        );
-                                    }
-                                }
+            if let Some((text, x, y, ch, ox, oy, dur, fixed, fx, fy)) = tip_debounce.poll()
+                && let Some(t) = &mut status_tip
+            {
+                // host-render 分流：有活跃目标且写帧成功 → SHM + 本地隐藏；否则本地显示。
+                let mut host_ok = false;
+                #[cfg(windows)]
+                if let Some(hr) = &host_render
+                    && let Some(target) = hr.active_target()
+                {
+                    use wind_bridge::shared_render_frame::FrameParams;
+                    use wind_ipc::protocol::HOST_WINDOW_STATUS;
+                    let fo = if fixed {
+                        t.render_frame_fixed(&text, fx, fy)
+                    } else {
+                        t.render_frame(&text, x, y, ch, ox, oy)
+                    };
+                    if let Some((bgra, w, h, sx, sy, sw)) = fo {
+                        let p = FrameParams {
+                            sequence: 0,
+                            x: sx,
+                            y: sy,
+                            width: w,
+                            height: h,
+                            bgra: &bgra,
+                            rects: &[],
+                            rendered_hover_index: -1,
+                            target_instance_id: 0,
+                            software_shadow: sw,
+                        };
+                        match hr.write_frame_for_kind(HOST_WINDOW_STATUS, &target, &p) {
+                            Ok(()) => {
+                                t.hide();
+                                host_ok = true;
+                            }
+                            Err(e) => {
+                                tracing::warn!("host render 写 status 帧失败，回退本地: {}", e);
                             }
                         }
                     }
-                    if !host_ok {
-                        if fixed {
-                            t.show_fixed(&text, fx, fy);
-                        } else {
-                            t.show(&text, x, y, ch, ox, oy);
-                        }
-                    }
-                    // dur==0 → 常驻(always):不设隐藏时刻;否则按配置时长自动隐藏。
-                    tip_hide_at = if dur == 0 {
-                        None
-                    } else {
-                        Some(std::time::Instant::now() + std::time::Duration::from_millis(dur))
-                    };
                 }
+                if !host_ok {
+                    if fixed {
+                        t.show_fixed(&text, fx, fy);
+                    } else {
+                        t.show(&text, x, y, ch, ox, oy);
+                    }
+                }
+                // dur==0 → 常驻(always):不设隐藏时刻;否则按配置时长自动隐藏。
+                tip_hide_at = if dur == 0 {
+                    None
+                } else {
+                    Some(std::time::Instant::now() + std::time::Duration::from_millis(dur))
+                };
             }
 
             // 排空通道：合并连续候选更新（只保留最新一条），其它命令保序
@@ -698,10 +695,10 @@ impl UiManager {
                         // host-render 分流：有活跃目标时渲染到 SHM，本地窗口互斥隐藏。
                         // 无目标或 host-render 未注入时落本地 LayeredWindow 路径（零改动）。
                         #[cfg(windows)]
-                        if let Some(hr) = &host_render {
-                            if try_host_render_candidates(hr, &mut candidate_window) {
-                                continue; // 跳过本地 show()，分流完成
-                            }
+                        if let Some(hr) = &host_render
+                            && try_host_render_candidates(hr, &mut candidate_window)
+                        {
+                            continue; // 跳过本地 show()，分流完成
                         }
                         candidate_window.show();
                     }
