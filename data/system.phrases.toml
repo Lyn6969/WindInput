@@ -230,6 +230,16 @@ text = '$AA("注音符号", "ㄅㄆㄇㄈㄉㄊㄋㄌㄍㄎㄏㄐㄑㄒㄓㄔㄕ
 weight = 1010
 
 [[phrases]]
+code = 'zzsb'
+text = '$AA("上标", "¹²³⁴⁵⁶⁷⁸⁰⁺⁻⁼⁽⁾ⁿᵃᵇᶜᵈᵉᶠᵍʰⁱʲᵏˡᵐⁿᵒᵖʳˢᵗᵘᵛʷˣʸᶻ")'
+weight = 1009
+
+[[phrases]]
+code = 'zzxb'
+text = '$AA("下标", "₁₂₃₄₅₆₇₈₉₀₊₋₌₍₎ₐₑₕᵢⱼₖₗₘₙₒₚᵣₛₜᵤᵥₓ")'
+weight = 1008
+
+[[phrases]]
 code = 'zzrq'
 text = '$Y年$M月$D日'
 weight = 1000
