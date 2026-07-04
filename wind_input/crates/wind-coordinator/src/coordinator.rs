@@ -720,7 +720,13 @@ impl Coordinator {
         &self,
         mgr: Arc<wind_bridge::host_render_windows::HostRenderManager>,
     ) {
-        let _ = self.host_render.set(mgr);
+        let _ = self.host_render.set(mgr.clone());
+        // 把同一 Arc 传给 UI 线程，使其在消息循环中激活 SHM 分流路径（Task 7）。
+        let _ = self
+            .ui_tx
+            .send(wind_ui::manager::UiCommand::SetHostRender(
+                wind_ui::manager::HostRenderArc(mgr),
+            ));
     }
 
     /// 取已注入的 host-render 管理器（Windows）；未注入返回 None。供 Task 6/7 写帧/隐藏。
