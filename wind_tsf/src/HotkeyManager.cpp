@@ -238,9 +238,11 @@ uint32_t CHotkeyManager::GetCurrentModifiers()
     if ((GetAsyncKeyState(VK_RCONTROL) & 0x8000) || (GetKeyState(VK_RCONTROL) & 0x8000))
         modifiers |= KEYMOD_RCTRL;
 
-    // Check CapsLock state
-    if (GetKeyState(VK_CAPITAL) & 0x0001)
-        modifiers |= KEYMOD_CAPSLOCK;
+    // 注意：不并入 CapsLock 锁定态。CapsLock 不是组合修饰键——把它混进 modifiers 会让
+    // 大写锁定期间所有热键哈希与白名单失配（服务端编译的热键 hash 不含此位），表现为
+    // CapsLock 开着时 Shift 中英切换、Ctrl+Shift+E 切方案等全部失效（被当普通键透传）。
+    // 「CapsLock 配置为切换键」的匹配用显式 CalcKeyHash(KEYMOD_CAPSLOCK, VK_CAPITAL)
+    // （OnKeyUp 的 VK_CAPITAL 分支），与服务端 hotkey.rs 编译约定对应，不经本函数。
 
     return modifiers;
 }
@@ -250,8 +252,8 @@ uint32_t CHotkeyManager::GetCurrentModifiers()
 // This is used for matching function hotkeys like Ctrl+` where we don't care about left/right Ctrl
 uint32_t CHotkeyManager::NormalizeModifiers(uint32_t modifiers)
 {
-    // Keep only generic modifiers and CapsLock
-    return modifiers & (KEYMOD_SHIFT | KEYMOD_CTRL | KEYMOD_ALT | KEYMOD_CAPSLOCK);
+    // Keep only generic modifiers（CapsLock 锁定态不参与热键匹配，见 GetCurrentModifiers 注释）
+    return modifiers & (KEYMOD_SHIFT | KEYMOD_CTRL | KEYMOD_ALT);
 }
 
 void CHotkeyManager::LogConfig() const
