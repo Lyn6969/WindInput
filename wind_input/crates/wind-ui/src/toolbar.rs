@@ -486,6 +486,8 @@ impl Toolbar {
             self.mouse.borrow_mut().pos = Some((cx, cy));
             self.window.show(cx, cy);
             self.visible = true;
+            // 显示路径同 render()：重置自动隐藏计时（未启用时 on_shown 为 no-op）。
+            self.auto_hide.on_shown(std::time::Instant::now());
         }
     }
 
