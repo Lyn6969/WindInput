@@ -4144,6 +4144,8 @@ void CTextService::UpdateFullStatus(BOOL bChineseMode, BOOL bFullWidth, BOOL bCh
 STDAPI CTextService::OnCompositionTerminated(TfEditCookie ecWrite, ITfComposition* pComposition)
 {
     // 组合被强制终止时（焦点切换、宿主 EndComposition 等），取消 HoldComposition 计时器。
+    // 先记住 hold 是否活跃：活跃说明组合内容是智能符号（预上屏语义），下方须保留而非清空。
+    BOOL holdWasActive = (_hHoldTimer != 0);
     CancelHoldTimer();
 
     WIND_LOG_DEBUG(L"OnCompositionTerminated called\n");
@@ -4163,6 +4165,18 @@ STDAPI CTextService::OnCompositionTerminated(TfEditCookie ecWrite, ITfCompositio
         //
         // We MUST clear the composition text to prevent it from leaking to the document
         // as plain text (which would cause the "d being committed directly" bug)
+        //
+        // 例外：智能符号 hold 中被宿主终止（切窗口等）。组合内容（prefix+held 符号）
+        // 语义上是"预上屏"，宿主终止组合时文本默认 finalize 留在文档——不清空即等于
+        // 提交，正是"切窗口应直接提交符号"的期望行为；照常清空反而丢字。
+        if (holdWasActive)
+        {
+            // 文本已随 finalize 留在文档，prefix 记账必须清，防下次 CommitText 双写。
+            _pendingCommitPrefix.clear();
+            WIND_LOG_DEBUG(L"OnCompositionTerminated: hold active, keeping composition text (finalized as committed)\n");
+        }
+        else
+        {
         ITfRange* pRange = nullptr;
         if (SUCCEEDED(pComposition->GetRange(&pRange)) && pRange != nullptr)
         {
@@ -4177,6 +4191,7 @@ STDAPI CTextService::OnCompositionTerminated(TfEditCookie ecWrite, ITfCompositio
                 WIND_LOG_ERROR_FMT(L"OnCompositionTerminated: SetText failed hr=0x%08X\n", hr);
             }
             pRange->Release();
+        }
         }
 
         WIND_LOG_DEBUG(L"OnCompositionTerminated: Releasing composition\n");
@@ -4634,6 +4649,16 @@ fallback:
 // so that HasActiveComposition() returns FALSE and new compositions can start.
 void CTextService::EndComposition(ITfDocumentMgr* pDocMgrHint)
 {
+    // 智能符号 hold 中（符号预上屏观感，语义=待提交）：主动结束组合（失焦/Deactivate
+    // 等）时转为提交而非放弃，模拟标准输入流程——切换窗口时符号应直接上屏而不是清空。
+    // CommitText 内 full = prefix + held，聚合定格的旧符号一并收口。
+    if (_hHoldTimer != 0 && _pComposition != nullptr)
+    {
+        WIND_LOG_DEBUG(L"EndComposition: flushing held smart symbol as commit\n");
+        FlushHoldCompositionIfActive();
+        return;
+    }
+
     // 顶码聚合中（组合头部有待提交前缀）：不能按「放弃组合」处理——引擎已把
     // 顶出的字按上屏记账（词频/统计）。转为提交前缀、丢弃余码（CommitText 的
     // EditSession 会 SetText(前缀)+EndComposition）。
@@ -4828,10 +4853,14 @@ BOOL CTextService::HoldComposition(const std::wstring& text, UINT timeoutMs)
     WIND_LOG_DEBUG_FMT(L"HoldComposition: text=%s timeoutMs=%u\n",
                        text.c_str(), timeoutMs);
 
-    // 若有残留的旧计时器，先提交旧符号再开启新组合（直接 Cancel 会丢失旧符号）。
-    FlushHoldCompositionIfActive();
+    // 旧 held 符号定格并入 prefix（不 commit、不动文档），与新符号在同一次
+    // UpdateComposition（单一 EditSession）内完成显示更新。曾用「先 CommitText 旧符号
+    // 再开新组合」——Chromium TSFTextStore（微信等）按整锁 diff 会把 commit 与紧随的
+    // 新组合合并解读成替换、WPS 同步锁失败走 SendInput 乱序，表现为后一个符号顶掉
+    // 前一个（与顶码双写 7f616c2 同根，同用聚合方案修复）。
+    AbsorbHeldIntoPrefix();
 
-    // 将中文符号放入 TSF 组合态（caretPos = 文本长度，光标置末）。
+    // 将中文符号放入 TSF 组合态（caretPos = 文本长度，光标置末；显示 = prefix + text）。
     // noUnderline：符号观感与已上屏一致（预上屏），实际仍在组合态内可替换。
     if (!UpdateComposition(text, static_cast<int>(text.length()), TRUE))
     {
@@ -4860,6 +4889,26 @@ void CTextService::FlushHoldCompositionIfActive()
 {
     if (_hHoldTimer != 0)
         OnHoldTimerExpired();
+}
+
+// 把当前 held 的智能符号定格并入 _pendingCommitPrefix（不 commit、不动文档）。
+// 用于「定格旧符号 + 立即更新/开启组合」场景（连续智能符号、符号后快速输入）：
+// 宿主只见组合文本更新，最终由 CommitText 一次收口（full = prefix + text），
+// 规避「commit + 立即重启组合」在 Chromium/WPS 下的替换误读。
+// 定格后的符号不可再被 press2 替换——语义上已承诺提交，与服务端状态机一致
+// （press2 只作用于最新 armed 的符号）。
+void CTextService::AbsorbHeldIntoPrefix()
+{
+    if (_hHoldTimer == 0)
+        return;
+
+    _pendingCommitPrefix += _heldCompositionText;
+    KillTimer(NULL, _hHoldTimer);
+    _hHoldTimer          = 0;
+    _heldCompositionText.clear();
+    g_holdTimerInstance  = nullptr;
+    WIND_LOG_DEBUG_FMT(L"AbsorbHeldIntoPrefix: held symbol pinned, prefixLen=%zu\n",
+                       _pendingCommitPrefix.length());
 }
 
 void CTextService::CancelHoldTimer()

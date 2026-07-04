@@ -1698,9 +1698,11 @@ BOOL CKeyEventSink::_HandleServiceResponse()
             QueryPerformanceCounter(&ucStart);
 
             WIND_LOG_TRACE(L"Received UpdateComposition from service\n");
-            // 若 HoldComposition 计时器活跃（中文符号待提交），先提交符号再开新组合，
-            // 防止 timer 超时后用旧文本覆盖掉新输入内容。
-            _pTextService->FlushHoldCompositionIfActive();
+            // 若 HoldComposition 计时器活跃（中文符号待提交），把符号定格并入 prefix，
+            // 与新组合内容在同一次 UpdateComposition 内显示（符号无下划线、新内容有，
+            // 复用顶码聚合分段）。曾用 Flush（CommitText+立即开新组合）——WPS/微信下
+            // 该模式被误读成替换，符号被新输入顶掉（与顶码双写同根）。
+            _pTextService->AbsorbHeldIntoPrefix();
             _isComposing = TRUE;
             _hasCandidates = TRUE;
             _pTextService->NotifyCandidatesVisibilityChanged(TRUE);

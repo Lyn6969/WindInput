@@ -242,6 +242,12 @@ public:
     // 若 HoldComposition 计时器活跃，立即提交中文符号（宿主中断组合时调用，如 PassThrough 键）。
     void FlushHoldCompositionIfActive();
 
+    // 若 HoldComposition 计时器活跃，把 held 符号定格并入 _pendingCommitPrefix（不 commit、
+    // 不动文档），供"定格旧符号 + 立即更新/开启组合"场景（连续智能符号、符号后快速输入）
+    // 在单一 EditSession 内完成显示更新——规避「commit+立即重启组合」在 Chromium/WPS
+    // 下被整锁 diff 误读成替换（与顶码聚合 7f616c2 同思路）。最终 CommitText 一次收口。
+    void AbsorbHeldIntoPrefix();
+
 private:
     LONG _refCount;
     ITfThreadMgr* _pThreadMgr;
