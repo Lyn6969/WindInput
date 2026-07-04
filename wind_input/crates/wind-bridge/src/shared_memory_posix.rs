@@ -6,6 +6,8 @@ use std::io;
 use std::os::unix::ffi::OsStrExt;
 use wind_ipc::protocol::SharedRenderHeader;
 
+use crate::shared_render_frame::{encode_frame_into, encode_hidden_into, FrameParams};
+
 pub struct PosixSharedMemory {
     fd: libc::c_int,
     ptr: *mut libc::c_void,
@@ -77,18 +79,19 @@ impl PosixSharedMemory {
 
     pub fn write_frame(&mut self, x: i32, y: i32, width: u32, height: u32, bgra: &[u8]) -> u32 {
         self.sequence += 1;
-        let stride = width * 4;
-        let mut hdr = SharedRenderHeader::new(x, y, width, height, stride, bgra.len() as u32);
-        hdr.sequence = self.sequence;
-        let hbytes = hdr.to_bytes();
-        unsafe {
-            std::ptr::copy_nonoverlapping(hbytes.as_ptr(), self.ptr as *mut u8, hbytes.len());
-            let pix_dst = (self.ptr as *mut u8).add(SharedRenderHeader::SIZE);
-            let n = bgra
-                .len()
-                .min(self.size.saturating_sub(SharedRenderHeader::SIZE));
-            std::ptr::copy_nonoverlapping(bgra.as_ptr(), pix_dst, n);
-        }
+        let dst = unsafe { std::slice::from_raw_parts_mut(self.ptr as *mut u8, self.size) };
+        let _ = encode_frame_into(dst, &FrameParams {
+            sequence: self.sequence,
+            x,
+            y,
+            width,
+            height,
+            bgra,
+            rects: &[],
+            rendered_hover_index: -1,
+            target_instance_id: 0,
+            software_shadow: false,
+        });
         self.sequence
     }
 
@@ -96,13 +99,8 @@ impl PosixSharedMemory {
     /// 与 Go host_render_darwin.go 的 hide 路径对齐（候选窗隐藏时通知 .app 撤帧）。
     pub fn write_hidden(&mut self) -> u32 {
         self.sequence += 1;
-        let mut hdr = SharedRenderHeader::new(0, 0, 0, 0, 0, 0);
-        hdr.flags = 0;
-        hdr.sequence = self.sequence;
-        let hbytes = hdr.to_bytes();
-        unsafe {
-            std::ptr::copy_nonoverlapping(hbytes.as_ptr(), self.ptr as *mut u8, hbytes.len());
-        }
+        let dst = unsafe { std::slice::from_raw_parts_mut(self.ptr as *mut u8, self.size) };
+        encode_hidden_into(dst, self.sequence, 0);
         self.sequence
     }
 

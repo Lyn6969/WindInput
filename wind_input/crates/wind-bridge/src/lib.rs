@@ -10,6 +10,7 @@ pub mod push;
 pub mod security;
 pub mod server;
 pub mod shared_memory;
+pub mod shared_render_frame;
 
 // macOS / Linux：UDS 请求/推送服务器 + POSIX SHM hostrender 写端。
 // Windows 路径仍内联在 server.rs / push.rs（cfg(windows)），不引入 *_windows.rs。
