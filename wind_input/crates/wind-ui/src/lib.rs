@@ -17,6 +17,7 @@
 //!   （UpdateLayeredWindow/消息分发）、[`text::dwrite`] 的实际字形渲染、popup_menu 剪贴板、
 //!   manager 的 Win32 消息泵。这些在非 Windows 是空实现，其测试仅验证 mock 的 API 契约。
 
+pub mod auto_hide;
 pub mod candidate_window;
 pub mod debounce;
 pub mod dpi;
