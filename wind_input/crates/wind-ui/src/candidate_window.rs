@@ -1576,6 +1576,12 @@ impl CandidateWindow {
         self.visible
     }
 
+    /// 当前鼠标悬停项（页内下标；翻页器 tag 或 -1=无）。host 分流写帧时作 rendered_hover_index。
+    #[cfg(windows)]
+    pub fn hover(&self) -> i32 {
+        self.hover
+    }
+
     pub fn candidates(&self) -> &[CandidateItem] {
         &self.candidates
     }
