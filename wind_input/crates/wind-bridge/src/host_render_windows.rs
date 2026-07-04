@@ -51,9 +51,8 @@ pub struct HostRenderManager {
     suffix: String,
 }
 
-// SAFETY: 全部可变访问经 Mutex<Inner> 序列化；SHM/Event 原语本身为线程安全
-unsafe impl Send for HostRenderManager {}
-unsafe impl Sync for HostRenderManager {}
+// HostRenderManager 包含 Mutex<Inner>，Inner 中字段均实现 Send，
+// 故 HostRenderManager 自动推导为 Send + Sync，无需手写 unsafe impl。
 
 // ---------- 命名辅助 ----------
 
@@ -318,6 +317,40 @@ impl HostRenderManager {
         }
     }
 
+    /// 内部方法：单临界区内校验 visible_owner 仍是 conn_id 才执行隐藏。
+    ///
+    /// 用于 cleanup_client 步骤2，防止在锁外窗口期被新连接的帧误隐藏。
+    fn hide_kind_if_owner(&self, kind: u32, conn_id: u32) {
+        let events_to_signal: Vec<Arc<NamedEvent>> = {
+            let mut inner = self.inner.lock().unwrap();
+
+            // 校验 visible_owner 的 instance 仍是 conn_id
+            let Some(&(owner_pid, owner_conn)) = inner.visible_owner.get(&kind) else {
+                return; // 无 owner，no-op
+            };
+            if owner_conn != conn_id {
+                return; // 已被新 conn 接管，不操作
+            }
+
+            inner.visible_owner.remove(&kind);
+            if let Some(shm) = inner.shms.get_mut(&kind) {
+                shm.write_hidden(0);
+            }
+
+            // 收集 owner_pid 全部实例该 kind 的 event
+            inner
+                .clients
+                .iter()
+                .filter(|(_, cs)| cs.pid == owner_pid)
+                .filter_map(|(_, cs)| cs.events.get(&kind).cloned())
+                .collect()
+        };
+
+        for evt in events_to_signal {
+            evt.signal();
+        }
+    }
+
     /// 取 conn_id 的 setup_seq（断线时记录，配合 cleanup_client SetupSeq 守卫）
     pub fn setup_seq_of(&self, conn_id: u32) -> u64 {
         self.inner
@@ -330,8 +363,8 @@ impl HostRenderManager {
 
     /// 断线清理（SetupSeq 守卫防旧清理误删新状态）
     pub fn cleanup_client(&self, conn_id: u32, expected_seq: u64) {
-        // 步骤1：seq 守卫，收集需要 hide 的 kind
-        let kinds_to_hide: Vec<u32> = {
+        // 步骤1：seq 守卫，收集需要 hide 的 kind，记录 actual_seq 供步骤3用
+        let (kinds_to_hide, actual_seq): (Vec<u32>, u64) = {
             let inner = self.inner.lock().unwrap();
             let Some(state) = inner.clients.get(&conn_id) else {
                 return;
@@ -344,25 +377,28 @@ impl HostRenderManager {
                 );
                 return;
             }
-            inner
+            let actual_seq = state.setup_seq;
+            let kinds = inner
                 .visible_owner
                 .iter()
                 .filter(|(_, (_, cid))| *cid == conn_id)
                 .map(|(kind, _)| *kind)
-                .collect()
+                .collect();
+            (kinds, actual_seq)
         };
 
-        // 步骤2：hide 必达（清理前先熄灯）
+        // 步骤2：单临界区身份校验 hide（防竞态：锁外窗口期新 conn 成为 owner 时不误隐藏）
         for kind in kinds_to_hide {
-            self.hide_kind(kind);
+            self.hide_kind_if_owner(kind, conn_id);
         }
 
-        // 步骤3：重新获锁，再次检查 seq（防 hide 期间发生重连），然后移除
+        // 步骤3：单临界区内校验 actual_seq（覆盖 expected_seq==0 的力清场景），
+        //        防 hide 期间重连的新 client 被误删。
         let mut inner = self.inner.lock().unwrap();
         match inner.clients.get(&conn_id) {
             None => return, // 已被其他路径清理
             Some(state) => {
-                if expected_seq != 0 && state.setup_seq != expected_seq {
+                if state.setup_seq != actual_seq {
                     // hide 期间发生了重连，新 setup 已就绪，不再移除
                     return;
                 }
@@ -578,6 +614,146 @@ mod tests {
         let (instance_id, _) = mgr.setup(1, pid).expect("setup(1, ..) 应成功");
         assert_eq!(instance_id, 1);
         assert_ne!(instance_id, 0);
+    }
+
+    // ---------- OpenEventW + WaitForSingleObject(0) 辅助 ----------
+
+    /// 以 OpenEventW + WaitForSingleObject(timeout=0) 验证 Event 已置信号（消费一次）
+    fn open_and_wait0(name: &str) -> bool {
+        use windows::Win32::Foundation::{CloseHandle, WAIT_OBJECT_0};
+        use windows::Win32::System::Threading::{
+            OpenEventW, WaitForSingleObject, SYNCHRONIZATION_ACCESS_RIGHTS,
+        };
+        let name_w: Vec<u16> = name.encode_utf16().chain(std::iter::once(0)).collect();
+        let handle = unsafe {
+            OpenEventW(
+                SYNCHRONIZATION_ACCESS_RIGHTS(0x0010_0000u32),
+                false,
+                windows::core::PCWSTR(name_w.as_ptr()),
+            )
+        }
+        .expect("OpenEventW failed");
+        let result = unsafe { WaitForSingleObject(handle, 0) };
+        unsafe { let _ = CloseHandle(handle); }
+        result == WAIT_OBJECT_0
+    }
+
+    /// 同一 pid 两个 conn：write_frame_for_kind 应唤醒该 pid 全部实例的 event
+    #[test]
+    fn wake_all_instances_of_same_pid() {
+        let mgr = make_mgr("W1");
+        let pid = std::process::id();
+
+        // conn1 和 conn2 同 pid
+        let (_, entries1) = mgr.setup(1, pid).expect("setup conn1");
+        let (_, entries2) = mgr.setup(2, pid).expect("setup conn2");
+
+        // 取 conn1 的 CANDIDATE event 名称
+        let evt1_name = entries1
+            .iter()
+            .find(|e| e.window_kind == HOST_WINDOW_CANDIDATE)
+            .expect("entries1 应含 CANDIDATE")
+            .event_name
+            .clone();
+        // 取 conn2 的 CANDIDATE event 名称
+        let evt2_name = entries2
+            .iter()
+            .find(|e| e.window_kind == HOST_WINDOW_CANDIDATE)
+            .expect("entries2 应含 CANDIDATE")
+            .event_name
+            .clone();
+
+        // 以 conn1 为 target 写帧
+        mgr.note_focus(1, pid);
+        let target = mgr.active_target().expect("active_target");
+        let bgra = vec![0xCCu8; 4 * 4 * 4];
+        let rects = [wind_ipc::protocol::HostRenderHitRect { index: 0, x: 0, y: 0, w: 4, h: 4 }];
+        let frame = FrameParams {
+            sequence: 0,
+            x: 0,
+            y: 0,
+            width: 4,
+            height: 4,
+            bgra: &bgra,
+            rects: &rects,
+            rendered_hover_index: -1,
+            target_instance_id: 0,
+            software_shadow: false,
+        };
+        mgr.write_frame_for_kind(HOST_WINDOW_CANDIDATE, &target, &frame)
+            .expect("write_frame");
+
+        // conn1 的 event 应已置信号
+        assert!(open_and_wait0(&evt1_name), "conn1 的 CANDIDATE event 应被置信号");
+        // conn2（同 pid）的 event 也应已置信号
+        assert!(open_and_wait0(&evt2_name), "conn2（同 pid）的 CANDIDATE event 也应被置信号");
+    }
+
+    /// cleanup_client 不得误隐藏已被新 conn 接管的帧
+    #[test]
+    fn cleanup_does_not_hide_newer_owner() {
+        let mgr = make_mgr("W2");
+        let pid = std::process::id();
+        use wind_ipc::protocol::SharedRenderHeader;
+
+        // conn1 setup 并写帧 → 成为 CANDIDATE owner
+        mgr.setup(1, pid).expect("setup conn1");
+        let seq1 = mgr.setup_seq_of(1);
+        mgr.note_focus(1, pid);
+        let target1 = mgr.active_target().expect("active_target conn1");
+        let bgra = vec![0xAAu8; 4 * 4 * 4];
+        let rects = [wind_ipc::protocol::HostRenderHitRect { index: 0, x: 0, y: 0, w: 4, h: 4 }];
+        let frame = FrameParams {
+            sequence: 0,
+            x: 0,
+            y: 0,
+            width: 4,
+            height: 4,
+            bgra: &bgra,
+            rects: &rects,
+            rendered_hover_index: -1,
+            target_instance_id: 0,
+            software_shadow: false,
+        };
+        mgr.write_frame_for_kind(HOST_WINDOW_CANDIDATE, &target1, &frame)
+            .expect("write_frame conn1");
+
+        // conn2 setup 并写帧 → 抢占 CANDIDATE owner（target_instance_id == 2）
+        mgr.setup(2, pid).expect("setup conn2");
+        mgr.note_focus(2, pid);
+        let target2 = mgr.active_target().expect("active_target conn2");
+        assert_eq!(target2.instance_id, 2);
+        mgr.write_frame_for_kind(HOST_WINDOW_CANDIDATE, &target2, &frame)
+            .expect("write_frame conn2");
+
+        // SHM 应记录 conn2 为 owner
+        {
+            let inner = mgr.inner.lock().unwrap();
+            let (hdr, _) = inner.shms[&HOST_WINDOW_CANDIDATE].read_back();
+            assert_eq!({ hdr.target_instance_id }, 2, "写帧后 target 应为 conn2");
+        }
+
+        // cleanup conn1（正确 seq）→ 步骤2应识别 owner 已是 conn2，跳过 hide
+        mgr.cleanup_client(1, seq1);
+
+        // SHM 应仍然 VISIBLE，target 仍为 2
+        {
+            let inner = mgr.inner.lock().unwrap();
+            let (hdr, _) = inner.shms[&HOST_WINDOW_CANDIDATE].read_back();
+            assert_ne!(
+                { hdr.flags } & SharedRenderHeader::FLAG_VISIBLE,
+                0,
+                "cleanup conn1 不应隐藏 conn2 的帧（SHM 仍应 VISIBLE）"
+            );
+            assert_eq!(
+                { hdr.target_instance_id },
+                2,
+                "cleanup conn1 不应改变 target（仍应为 conn2）"
+            );
+        }
+
+        // conn2 状态仍在
+        assert_ne!(mgr.setup_seq_of(2), 0, "conn2 仍应在 clients 中");
     }
 
     // ---------- wildcard_match 纯逻辑测试（不需要 Windows 原语） ----------
