@@ -738,7 +738,9 @@ impl Coordinator {
     }
 
     /// 当前是否处于 host-render 受限宿主模式（SearchHost.exe / 开始菜单搜索框等）。
-    /// `active_target()` 每次现查（无缓存），避免跨帧持有失效目标。
+    /// `active_target()` 每次现查（无缓存），避免跨帧持有失效目标；它仅在 active 连接
+    /// **已完成 setup** 时返回 Some，而 setup 会拒绝白名单外进程——故此判定天然经过
+    /// 白名单过滤，且比 `focused_whitelisted()` 更准确（追踪「确实在 host 渲染」）。
     /// 非 Windows 编译始终返回 false，零开销。
     pub(crate) fn host_render_active(&self) -> bool {
         #[cfg(windows)]
@@ -3649,6 +3651,8 @@ impl MessageHandler for Coordinator {
         // Rust 版无 last_key_time 竞态窗口（对照 Go handle_lifecycle.go:559-572），
         // host-render 激活时直接忽略清缓冲动作以保留输入状态与候选，
         // 下一按键的 UpdateComposition 会自动重建 composition。
+        // （host_render_active() 仅在 active 连接已通过白名单 setup 时为 true，
+        //   不会误伤白名单外的普通宿主。）
         if self.host_render_active() {
             return;
         }
