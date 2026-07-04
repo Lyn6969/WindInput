@@ -173,11 +173,16 @@ impl Toolbar {
             }
         }
         if enabled && self.visible {
+            // 淡出中重新配置：先恢复不透明再重新计时（configure(true) 不返回 was_fading）。
+            if let Err(e) = self.window.update_with_alpha(255) {
+                tracing::warn!("Toolbar restore alpha: {}", e);
+            }
             self.auto_hide.on_shown(std::time::Instant::now());
         }
     }
 
     /// 设置工具栏位置（启动恢复持久化位置）；钳制到工作区内。
+    /// 仅启动时调用（淡出尚不可能发生），故不做 alpha 恢复/计时重置。
     pub fn set_pos(&mut self, x: i32, y: i32) {
         let (w, h) = self.window.size();
         let (cx, cy) = clamp_to_work_area(x, y, w, h);

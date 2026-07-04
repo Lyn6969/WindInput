@@ -107,6 +107,12 @@ impl AutoHide {
     }
 }
 
+impl Default for AutoHide {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -235,6 +241,29 @@ mod tests {
         assert_eq!(
             ah.tick_at(t0 + Duration::from_millis(500), false, false),
             AutoHideAction::None
+        );
+    }
+
+    #[test]
+    fn reconfigure_enabled_mid_fade_keeps_fading_until_shown() {
+        let (mut ah, t0) = armed();
+        assert_eq!(
+            ah.tick_at(t0 + 5 * SEC, false, false),
+            AutoHideAction::Fade(255)
+        );
+        // 淡出中以 enabled=true 改配置：configure 不打断淡出（返回 false）
+        assert!(!ah.configure(true, 8000));
+        assert!(ah.is_active());
+        // 调用方（set_auto_hide）随后 on_shown：取消淡出、按新 delay 重新计时
+        ah.on_shown(t0 + 5 * SEC + Duration::from_millis(300));
+        assert_eq!(
+            ah.tick_at(t0 + 12 * SEC, false, false),
+            AutoHideAction::None
+        );
+        // 新 deadline = t0+5.3s+8s = t0+13.3s
+        assert_eq!(
+            ah.tick_at(t0 + 14 * SEC, false, false),
+            AutoHideAction::Fade(255)
         );
     }
 }
