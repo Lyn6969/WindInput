@@ -1410,10 +1410,18 @@ impl Default for StatsConfig {
 
 // ───────────────────────── compat / debug ─────────────────────────
 
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CompatConfig {
     #[serde(default)]
     pub host_render_processes: Vec<String>,
+}
+
+impl Default for CompatConfig {
+    fn default() -> Self {
+        Self {
+            host_render_processes: vec!["SearchHost.exe".to_string()],
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1971,8 +1979,11 @@ mod tests {
             vec!["SearchHost.exe".to_string()]
         );
         assert_eq!(cfg.schema.active, "wubi86");
-        // 佐证 L1 确实为空，覆盖来自 config.toml
-        assert!(Config::default().compat.host_render_processes.is_empty());
+        // L1 code default 也含 SearchHost.exe；config.toml 的 L2 与之相同，合并后值不变。
+        assert_eq!(
+            Config::default().compat.host_render_processes,
+            vec!["SearchHost.exe".to_string()]
+        );
     }
 
     #[test]

@@ -725,7 +725,6 @@ impl Coordinator {
 
     /// 取已注入的 host-render 管理器（Windows）；未注入返回 None。供 Task 6/7 写帧/隐藏。
     #[cfg(windows)]
-    #[allow(dead_code)]
     pub(crate) fn host_render(
         &self,
     ) -> Option<&Arc<wind_bridge::host_render_windows::HostRenderManager>> {
@@ -1111,6 +1110,10 @@ impl Coordinator {
                 self.notify_toolbar(); // 工具栏显隐(visible/全屏)按新配置即时刷新
                 self.sync_global_hotkeys(); // keys.global_hotkeys 增删/改键即时生效
                 self.sync_direct_switch_hotkey(); // keys.activate_ime 改键/清空即时生效
+                #[cfg(windows)]
+                if let Some(mgr) = self.host_render() {
+                    mgr.set_whitelist(new_cfg.compat.host_render_processes.clone());
+                }
                 self.show_toast(
                     "设置已更新",
                     ToastPosition::BottomCenter,
@@ -2033,13 +2036,18 @@ impl Coordinator {
             "push_activation_status: chinese={} key_down={:?} key_up={:?}",
             s.chinese_mode, s.key_down_hotkeys, s.key_up_hotkeys
         );
+        #[cfg(windows)]
+        let host_render_avail =
+            self.host_render().map(|m| m.focused_whitelisted()).unwrap_or(false);
+        #[cfg(not(windows))]
+        let host_render_avail = false;
         let encoded = wind_ipc::codec::encode_activation_status_push(
             s.chinese_mode,
             s.full_width,
             s.chinese_punct,
             s.toolbar_visible,
             s.caps_lock,
-            false,
+            host_render_avail,
             &s.key_down_hotkeys,
             &s.key_up_hotkeys,
             &s.icon_label,
