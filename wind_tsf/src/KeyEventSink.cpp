@@ -722,6 +722,7 @@ STDAPI CKeyEventSink::OnKeyDown(ITfContext* pContext, WPARAM wParam, LPARAM lPar
         if (wParam == VK_CAPITAL)
         {
             // Just consume the KeyDown, let OnKeyUp handle it
+            _pTextService->NoteCapsLockKeyActivity(); // 供 OPENCLOSE 联动噪声抑制
             *pfEaten = TRUE;
             return S_OK;
         }
@@ -1104,6 +1105,7 @@ STDAPI CKeyEventSink::OnTestKeyUp(ITfContext* pContext, WPARAM wParam, LPARAM lP
     // Also handle Caps Lock for indicator
     if (wParam == VK_CAPITAL)
     {
+        _pTextService->NoteCapsLockKeyActivity(); // 供 OPENCLOSE 联动噪声抑制
         *pfEaten = TRUE;
         return S_OK;
     }
@@ -1154,6 +1156,8 @@ STDAPI CKeyEventSink::OnKeyUp(ITfContext* pContext, WPARAM wParam, LPARAM lParam
     // Handle Caps Lock key release
     if (wParam == VK_CAPITAL)
     {
+        _pTextService->NoteCapsLockKeyActivity(); // 供 OPENCLOSE 联动噪声抑制
+
         CHotkeyManager* pHotkeyMgr = _pTextService->GetHotkeyManager();
 
         // Calculate hash for CapsLock

@@ -820,6 +820,7 @@ CTextService::CTextService()
     , _pHostWindow{}
     , _bChineseMode(TRUE)
     , _bFullWidth(FALSE)
+    , _lastCapsKeyTick(0)
     , _focusSessionId(0)
     , _hasFocus(FALSE)
     , _hasTextInputContext(FALSE)
@@ -2445,6 +2446,30 @@ STDAPI CTextService::OnChange(REFGUID rguid)
     BOOL bOpen = (var.lVal != 0);
     WIND_LOG_INFO_FMT(L"Compartment OPENCLOSE changed: %d (current mode: %s)\n",
         bOpen, _bChineseMode ? L"Chinese" : L"English");
+
+    // CapsLock 联动噪声抑制：Windows 输入系统在 CapsLock 状态变化（物理按键或服务端
+    // cancel_on_mode_switch 的注入取消）后会异步联动写 OPENCLOSE compartment（实测
+    // 延迟 0.5~1s）。这不是用户的 Ctrl+Space 切换请求——若照常 toggle 并上报服务，
+    // 会与服务端的 CapsLock 注入形成「注入→联动→切换→再注入」振荡回路（模式每拍
+    // 翻转、大写灯乱闪）。短窗口内只把 compartment 拉回 OPEN，不 toggle 不上报。
+    //
+    // 例外（勿删）：用户「开大写后立刻按 Ctrl+Space」的真实切换与系统联动落在同一
+    // 时间窗（都是 caps 活动后 0.5~1s），纯时间窗口会误吞真实请求（实测复现）。
+    // 判据：系统热键触发的 OPENCLOSE 变化发生在 Ctrl 按住期间（Space down 即触发，
+    // Ctrl 尚未释放）；系统的 CapsLock 联动写入则无任何伴随按键。Ctrl 按住 → 放行。
+    if (GetTickCount64() - _lastCapsKeyTick < 1500)
+    {
+        BOOL ctrlHeld = (GetAsyncKeyState(VK_CONTROL) & 0x8000) || (GetKeyState(VK_CONTROL) & 0x8000);
+        if (!ctrlHeld)
+        {
+            WIND_LOG_INFO(L"Compartment OPENCLOSE changed right after CapsLock activity (no Ctrl held), suppressed (re-open only)\n");
+            _bInCompartmentChange = TRUE;
+            _SetOpenCloseCompartment(TRUE);
+            _bInCompartmentChange = FALSE;
+            return S_OK;
+        }
+        WIND_LOG_INFO(L"Compartment OPENCLOSE changed within CapsLock window but Ctrl held -> treat as user toggle\n");
+    }
 
     // The system alternates compartment between 0 and 1 each Ctrl+Space press.
     // We always re-open to 1 after handling, but _SetOpenCloseCompartment may fail

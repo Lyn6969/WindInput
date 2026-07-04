@@ -184,6 +184,10 @@ public:
     BOOL IsFullWidth() { return _bFullWidth; }
     BOOL IsKeyboardDisabled() { return _bKeyboardDisabled; }
     ULONGLONG GetFocusSessionId() const { return _focusSessionId; }
+    // 记录 CapsLock 按键活动时刻（物理按键或服务端 cancel_on_mode_switch 的注入）。
+    // Windows 输入系统会在 CapsLock 状态变化后联动写 OPENCLOSE compartment；
+    // OnCompartmentChange 据此时间戳抑制该联动噪声，防止被误判为用户模式切换。
+    void NoteCapsLockKeyActivity() { _lastCapsKeyTick = GetTickCount64(); }
     // 当前实例是否持有输入焦点（OnSetFocus 最后一次收到非 null 的 pDocMgrFocus）。
     // 用于服务重启时避免对无焦点实例触发工具栏显示。
     BOOL HasFocus() const { return _hasFocus; }
@@ -351,6 +355,7 @@ private:
     // Compartment event sink (GUID_COMPARTMENT_KEYBOARD_OPENCLOSE)
     DWORD _dwOpenCloseSinkCookie;
     BOOL _bInCompartmentChange;  // Guard against re-entrant OnChange
+    ULONGLONG _lastCapsKeyTick;  // 最近一次 CapsLock 按键活动（GetTickCount64），见 NoteCapsLockKeyActivity
 
     BOOL _InitOpenCloseCompartment();
     void _UninitOpenCloseCompartment();
