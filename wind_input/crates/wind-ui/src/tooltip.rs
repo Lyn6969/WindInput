@@ -183,9 +183,12 @@ impl Tooltip {
         }
     }
 
-    /// 渲染文本到窗口缓冲，返回内容尺寸和阴影 margin。
-    /// 返回 `(cw, ch, ml, mt, mr, mb)`；失败返回 None（text 为空时调用方已拦截）。
-    fn render_to_window(&mut self, text: &str) -> (u32, u32, u32, u32, u32, u32) {
+    /// 渲染到 BGRA Vec（离屏化，不依赖 LayeredWindow）。
+    /// 返回 `(bgra, w, h, cw, ch, ml, mt, mr, mb, has_shadow)`。
+    fn render_to_bgra(
+        &mut self,
+        text: &str,
+    ) -> (Vec<u8>, u32, u32, u32, u32, u32, u32, u32, u32, bool) {
         let s = self.scale;
         let mut tip = View::leaf(text, self.fg)
             .bg(self.bg)
@@ -201,7 +204,6 @@ impl Tooltip {
         if !self.layers.is_empty() {
             tip = tip.layers(self.layers.clone());
         }
-
         let (ml, mt, mr, mb) = self
             .shadow
             .as_ref()
@@ -213,25 +215,33 @@ impl Tooltip {
         let ch = (h_f.ceil() as u32).max(20);
         let w = cw + ml + mr;
         let h = ch + mt + mb;
+        let n = (w * h * 4) as usize;
+        let mut buf = vec![0u8; n];
+        if let Some(sh) = &self.shadow {
+            sh.paint(
+                &mut buf,
+                w,
+                h,
+                ml as f32,
+                mt as f32,
+                cw as f32,
+                ch as f32,
+                tip.corner_radius,
+            );
+        }
+        tip.paint(&mut buf, w, h, &self.renderer);
+        let has_shadow = self.shadow.is_some();
+        (buf, w, h, cw, ch, ml, mt, mr, mb, has_shadow)
+    }
 
+    /// 渲染文本到窗口缓冲，返回内容尺寸和阴影 margin。
+    /// 返回 `(cw, ch, ml, mt, mr, mb)`；失败返回 None（text 为空时调用方已拦截）。
+    fn render_to_window(&mut self, text: &str) -> (u32, u32, u32, u32, u32, u32) {
+        let (buf, w, h, cw, ch, ml, mt, mr, mb, _) = self.render_to_bgra(text);
         self.window.resize(w, h);
         {
-            let buf = self.window.buffer_mut();
-            let n = (w * h * 4) as usize;
-            buf[..n].fill(0);
-            if let Some(sh) = &self.shadow {
-                sh.paint(
-                    buf,
-                    w,
-                    h,
-                    ml as f32,
-                    mt as f32,
-                    cw as f32,
-                    ch as f32,
-                    tip.corner_radius,
-                );
-            }
-            tip.paint(buf, w, h, &self.renderer);
+            let wbuf = self.window.buffer_mut();
+            wbuf[..(w * h * 4) as usize].copy_from_slice(&buf);
         }
         let _ = self.window.update();
         (cw, ch, ml, mt, mr, mb)
@@ -283,6 +293,44 @@ impl Tooltip {
             self.window.hide();
             self.visible = false;
         }
+    }
+
+    /// 横排 host-render：渲染到 BGRA buffer + 计算屏幕坐标，不操作 LayeredWindow。
+    /// 返回 `(bgra, w, h, screen_x, screen_y, software_shadow)`；text 为空返回 None。
+    #[cfg(windows)]
+    pub fn render_frame(
+        &mut self,
+        text: &str,
+        x: i32,
+        anchor_top: i32,
+        anchor_bottom: i32,
+    ) -> Option<(Vec<u8>, u32, u32, i32, i32, bool)> {
+        if text.is_empty() {
+            return None;
+        }
+        self.ensure_scale(x, anchor_bottom);
+        let (buf, w, h, cw, ch, ml, mt, _mr, _mb, has_shadow) = self.render_to_bgra(text);
+        let (px, py) = clamp_to_work_area(x, anchor_top, anchor_bottom, cw, ch);
+        Some((buf, w, h, px - ml as i32, py - mt as i32, has_shadow))
+    }
+
+    /// 竖排 host-render：渲染到 BGRA buffer + 计算候选窗右侧/左侧坐标，不操作 LayeredWindow。
+    #[cfg(windows)]
+    pub fn render_frame_beside(
+        &mut self,
+        text: &str,
+        win_left: i32,
+        win_right: i32,
+        row_top: i32,
+        row_bottom: i32,
+    ) -> Option<(Vec<u8>, u32, u32, i32, i32, bool)> {
+        if text.is_empty() {
+            return None;
+        }
+        self.ensure_scale(win_right, row_top);
+        let (buf, w, h, cw, ch, ml, mt, _mr, _mb, has_shadow) = self.render_to_bgra(text);
+        let (px, py) = clamp_beside(win_left, win_right, row_top, row_bottom, cw, ch);
+        Some((buf, w, h, px - ml as i32, py - mt as i32, has_shadow))
     }
 }
 

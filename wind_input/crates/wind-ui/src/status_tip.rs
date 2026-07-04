@@ -110,11 +110,13 @@ impl StatusTip {
         }
     }
 
-    /// 渲染气泡到窗口缓冲并 update。返回 (内容宽 cw, 内容高 ch, 左 margin ml, 上 margin mt)。
-    /// 供 show(跟随光标) 与 show_fixed(固定坐标) 复用，只在定位上分叉。
-    fn render_bubble(&mut self, text: &str) -> (u32, u32, u32, u32) {
+    /// 渲染气泡到 BGRA Vec（离屏化，不依赖 LayeredWindow）。
+    /// 返回 `(bgra, w, h, cw, ch, ml, mt, has_shadow)`。
+    fn render_bubble_to_bgra(
+        &mut self,
+        text: &str,
+    ) -> (Vec<u8>, u32, u32, u32, u32, u32, u32, bool) {
         let s = self.scale;
-        // 单个 View 叶子即气泡：背景 + 圆角 + 内边距 + 居中文字。
         let mut tip = View::leaf(text, self.fg)
             .bg(self.bg)
             .pad(Edges::xy(10.0 * s, 5.0 * s))
@@ -131,7 +133,6 @@ impl StatusTip {
         if !self.layers.is_empty() {
             tip = tip.layers(self.layers.clone());
         }
-        // 软投影四向扩边：内容布局起点移到 (ml, mt)，窗口位置左上回移，阴影四面溢出。
         let (ml, mt, mr, mb) = self
             .shadow
             .as_ref()
@@ -143,24 +144,31 @@ impl StatusTip {
         let ch = (h_f.ceil() as u32).max(24);
         let w = cw + ml + mr;
         let h = ch + mt + mb;
+        let mut buf = vec![0u8; (w * h * 4) as usize];
+        if let Some(sh) = &self.shadow {
+            sh.paint(
+                &mut buf,
+                w,
+                h,
+                ml as f32,
+                mt as f32,
+                cw as f32,
+                ch as f32,
+                tip.corner_radius,
+            );
+        }
+        tip.paint(&mut buf, w, h, &self.renderer);
+        (buf, w, h, cw, ch, ml, mt, self.shadow.is_some())
+    }
+
+    /// 渲染气泡到窗口缓冲并 update。返回 (内容宽 cw, 内容高 ch, 左 margin ml, 上 margin mt)。
+    /// 供 show(跟随光标) 与 show_fixed(固定坐标) 复用，只在定位上分叉。
+    fn render_bubble(&mut self, text: &str) -> (u32, u32, u32, u32) {
+        let (buf, w, h, cw, ch, ml, mt, _) = self.render_bubble_to_bgra(text);
         self.window.resize(w, h);
         {
-            let buf = self.window.buffer_mut();
-            let n = (w * h * 4) as usize;
-            buf[..n].fill(0);
-            if let Some(sh) = &self.shadow {
-                sh.paint(
-                    buf,
-                    w,
-                    h,
-                    ml as f32,
-                    mt as f32,
-                    cw as f32,
-                    ch as f32,
-                    tip.corner_radius,
-                );
-            }
-            tip.paint(buf, w, h, &self.renderer);
+            let wbuf = self.window.buffer_mut();
+            wbuf[..(w * h * 4) as usize].copy_from_slice(&buf);
         }
         if let Err(e) = self.window.update() {
             tracing::warn!("StatusTip update failed: {}", e);
@@ -216,6 +224,48 @@ impl StatusTip {
 
     pub fn hide(&self) {
         self.window.hide();
+    }
+
+    /// host-render：将状态气泡渲染到 BGRA buffer 并计算屏幕坐标（光标下方/上方）。
+    /// 返回 `(bgra, w, h, screen_x, screen_y, software_shadow)`；text 为空返回 None。
+    #[cfg(windows)]
+    pub fn render_frame(
+        &mut self,
+        text: &str,
+        cx: i32,
+        cy: i32,
+        caret_h: i32,
+        off_x: i32,
+        off_y: i32,
+    ) -> Option<(Vec<u8>, u32, u32, i32, i32, bool)> {
+        if text.is_empty() {
+            return None;
+        }
+        self.ensure_scale(cx, cy);
+        let s = self.scale;
+        let (buf, w, h, cw, ch, ml, mt, has_shadow) = self.render_bubble_to_bgra(text);
+        let gap = (4.0 * s).round() as i32;
+        let x = cx - (cw as i32) / 2 + off_x;
+        let y = cy + gap + off_y;
+        let (px, py) = clamp_below_or_above(x, y, cw, ch, cy, caret_h, gap);
+        Some((buf, w, h, px - ml as i32, py - mt as i32, has_shadow))
+    }
+
+    /// host-render：固定坐标模式，直接用 (fx, fy) 作内容左上屏幕坐标。
+    /// 返回 `(bgra, w, h, screen_x, screen_y, software_shadow)`；text 为空返回 None。
+    #[cfg(windows)]
+    pub fn render_frame_fixed(
+        &mut self,
+        text: &str,
+        fx: i32,
+        fy: i32,
+    ) -> Option<(Vec<u8>, u32, u32, i32, i32, bool)> {
+        if text.is_empty() {
+            return None;
+        }
+        self.ensure_scale(fx, fy);
+        let (buf, w, h, _cw, _ch, ml, mt, has_shadow) = self.render_bubble_to_bgra(text);
+        Some((buf, w, h, fx - ml as i32, fy - mt as i32, has_shadow))
     }
 }
 
