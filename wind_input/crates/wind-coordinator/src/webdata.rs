@@ -101,6 +101,7 @@ impl Coordinator {
         match method {
             // ── schema.* ─────────────────────────────────────────
             "schema.list" => self.web_schema_list(),
+            "schema.layouts" => self.web_schema_layouts(),
             "schema.active" => Ok(json!({ "id": self.engine_mgr.active_schema_id() })),
             "schema.setActive" => {
                 let ok = self.engine_mgr.switch_schema(str_param(params, "id")?);
@@ -207,6 +208,18 @@ impl Coordinator {
                     "author": info.map(|i| i.author.clone()).unwrap_or_default(),
                 })
             })
+            .collect();
+        Ok(json!(items))
+    }
+
+    /// 双拼布局清单：合并扫描安装目录与用户目录的 `schemas/shuangpin/*.toml`，
+    /// 返回 `[{id, name}]`，供设置页"双拼布局"下拉动态取值（取代前端硬编码）。
+    fn web_schema_layouts(&self) -> anyhow::Result<Value> {
+        let items: Vec<Value> = self
+            .engine_mgr
+            .shuangpin_layouts()
+            .into_iter()
+            .map(|(id, name)| json!({ "id": id, "name": name }))
             .collect();
         Ok(json!(items))
     }

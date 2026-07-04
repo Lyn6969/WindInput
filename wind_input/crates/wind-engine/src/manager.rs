@@ -317,10 +317,9 @@ impl EngineManager {
         } else {
             schema.engine.pinyin.shuangpin.layout.clone()
         };
-        let lp = data_dir
-            .join("schemas")
-            .join("shuangpin")
-            .join(format!("{layout_id}.toml"));
+        // 用户目录优先（resolve_schema_file）：%APPDATA%/…/schemas/shuangpin/<id>.toml
+        // 存在即覆盖安装目录，使用户自带/覆盖的双拼布局生效。
+        let lp = Self::resolve_schema_file(&format!("shuangpin/{layout_id}.toml"), data_dir);
         crate::pinyin::shuangpin::Layout::from_toml(&lp)
             .map(|lay| lay.final_key_set())
             .ok()
@@ -551,23 +550,37 @@ impl EngineManager {
         let Some(data_dir) = self.data_dir.as_deref() else {
             return self.available_schemas();
         };
-        let schemas_dir = data_dir.join("schemas");
         let mut ids: Vec<String> = self.available_schemas();
+        let ov = self.override_dir.as_deref();
 
-        if let Ok(entries) = std::fs::read_dir(&schemas_dir) {
+        // 合并扫描：安装目录 data/schemas 与用户目录 %APPDATA%/…/schemas，
+        // 两处的 *.schema.toml 都算"已安装"——用户目录可新增第三方方案（read_schema
+        // 走 resolve_schema_file，本就用户目录优先，故用户方案能被读出并通过过滤）。
+        // 注：此处扫描顺序无关紧要（靠 !ids.contains 去重，两目录都贡献 id）；与
+        // shuangpin_layouts 的"用户优先覆盖"语义不同——那里靠前目录同名 stem 胜出。
+        let mut scan_dirs: Vec<std::path::PathBuf> = vec![data_dir.join("schemas")];
+        if let Some(user) = Config::user_config_dir() {
+            let ud = user.join("schemas");
+            if ud != scan_dirs[0] {
+                scan_dirs.push(ud);
+            }
+        }
+
+        for dir in &scan_dirs {
+            let Ok(entries) = std::fs::read_dir(dir) else {
+                continue;
+            };
             for entry in entries.flatten() {
                 let fname = entry.file_name();
                 let fname_str = fname.to_string_lossy();
                 if let Some(id) = fname_str.strip_suffix(".schema.toml") {
                     let id = id.to_string();
-                    if !ids.contains(&id) {
+                    if !ids.contains(&id)
                         // 只加入受支持且非隐藏的方案（隐藏方案如 english 仅供懒加载引用）
-                        let ov = self.override_dir.as_deref();
-                        if Self::schema_supported(&id, Some(data_dir), ov)
-                            && !Self::schema_hidden(&id, Some(data_dir), ov)
-                        {
-                            ids.push(id);
-                        }
+                        && Self::schema_supported(&id, Some(data_dir), ov)
+                        && !Self::schema_hidden(&id, Some(data_dir), ov)
+                    {
+                        ids.push(id);
                     }
                 }
             }
@@ -576,6 +589,71 @@ impl EngineManager {
         ids.sort();
         ids.dedup();
         ids
+    }
+
+    /// 枚举可选的双拼布局：合并扫描 [用户目录, 安装目录] 的
+    /// `schemas/shuangpin/*.toml`，用户目录同名（按文件名 stem）覆盖安装目录。
+    ///
+    /// 返回 `(id, 显示名)`：**id 取文件名 stem**（与加载路径 `{layout}.toml` 一致，
+    /// 保证"能选=能加载"），显示名取布局 `[meta].name`；解析失败（如缺 `[finals]`）
+    /// 的布局跳过并告警。供设置页"双拼布局"下拉动态取值，取代前端硬编码清单。
+    ///
+    /// `data_dir` 为 None（纯测试）时返回空。
+    pub fn shuangpin_layouts(&self) -> Vec<(String, String)> {
+        let Some(data_dir) = self.data_dir.as_deref() else {
+            return Vec::new();
+        };
+        let mut dirs: Vec<std::path::PathBuf> = Vec::new();
+        if let Some(user) = Config::user_config_dir() {
+            dirs.push(user.join("schemas").join("shuangpin"));
+        }
+        dirs.push(data_dir.join("schemas").join("shuangpin"));
+        Self::scan_shuangpin_layouts(&dirs)
+    }
+
+    /// 纯扫描逻辑（可测）：按 `dirs` 顺序扫描 `*.toml`，靠前目录优先，
+    /// 以文件名 stem 去重；输出按 id 字典序稳定排序。
+    fn scan_shuangpin_layouts(dirs: &[std::path::PathBuf]) -> Vec<(String, String)> {
+        let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut out: Vec<(String, String)> = Vec::new();
+        for dir in dirs {
+            let Ok(entries) = std::fs::read_dir(dir) else {
+                continue;
+            };
+            for entry in entries.flatten() {
+                // 只收普通文件：忽略名字恰好以 .toml 结尾的子目录等。
+                if !entry.file_type().map(|t| t.is_file()).unwrap_or(false) {
+                    continue;
+                }
+                let fname = entry.file_name();
+                let fname_str = fname.to_string_lossy();
+                let Some(stem) = fname_str.strip_suffix(".toml") else {
+                    continue;
+                };
+                let id = stem.to_string();
+                if !seen.insert(id.clone()) {
+                    continue; // 靠前目录已收录，跳过后续同名
+                }
+                match crate::pinyin::shuangpin::Layout::from_toml(&entry.path()) {
+                    Ok(lay) => {
+                        // id 以文件名 stem 为准（加载路径 {layout}.toml）；[meta].id 仅作校验。
+                        if !lay.id.is_empty() && lay.id != id {
+                            warn!(
+                                "双拼布局文件名 {} 与 [meta].id=\"{}\" 不符，以文件名为准",
+                                id, lay.id
+                            );
+                        }
+                        let name = if lay.name.is_empty() { id.clone() } else { lay.name };
+                        out.push((id, name));
+                    }
+                    Err(e) => {
+                        warn!("双拼布局枚举跳过 {}: {}", entry.path().display(), e);
+                    }
+                }
+            }
+        }
+        out.sort_by(|a, b| a.0.cmp(&b.0));
+        out
     }
 
     /// 方案显示名（schema.name 优先，缺/读不到回退 id）。带缓存避免重复读盘。
@@ -1359,7 +1437,8 @@ impl EngineManager {
                 } else {
                     schema.engine.pinyin.shuangpin.layout.clone()
                 };
-                let lp = schemas.join("shuangpin").join(format!("{layout_id}.toml"));
+                // 用户目录优先（见 resolve_schema_file）：用户自带/覆盖布局生效。
+                let lp = Self::resolve_schema_file(&format!("shuangpin/{layout_id}.toml"), data_dir);
                 match crate::pinyin::shuangpin::Layout::from_toml(&lp) {
                     Ok(layout) => {
                         let mut conv = crate::pinyin::shuangpin::ShuangpinConverter::new(layout);
@@ -2252,6 +2331,52 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(&base_dir);
         let _ = std::fs::remove_dir_all(&ov_dir);
+    }
+
+    /// scan_shuangpin_layouts：合并扫描多目录、靠前目录（用户）优先、
+    /// 跳过解析失败（缺 [finals]）的布局、按 id 字典序排序。
+    #[test]
+    fn scan_shuangpin_layouts_merges_user_priority() {
+        use std::io::Write;
+
+        let base = std::env::temp_dir().join("wind_eng_sp_layouts_test");
+        let _ = std::fs::remove_dir_all(&base);
+        let install = base.join("install");
+        let user = base.join("user");
+        std::fs::create_dir_all(&install).unwrap();
+        std::fs::create_dir_all(&user).unwrap();
+
+        let write_layout =
+            |dir: &std::path::Path, file: &str, id: &str, name: &str, finals: bool| {
+                let mut f = std::fs::File::create(dir.join(file)).unwrap();
+                let finals_sec = if finals { "[finals]\na = [\"a\"]\n" } else { "" };
+                write!(f, "[meta]\nid = \"{id}\"\nname = \"{name}\"\n{finals_sec}").unwrap();
+            };
+
+        // 安装目录：xiaohe、mspy
+        write_layout(&install, "xiaohe.toml", "xiaohe", "小鹤双拼", true);
+        write_layout(&install, "mspy.toml", "mspy", "微软双拼", true);
+        // 用户目录：新增 shoudao + 同名覆盖 xiaohe（改显示名）
+        write_layout(&user, "shoudao.toml", "shoudao", "手道双拼", true);
+        write_layout(&user, "xiaohe.toml", "xiaohe", "小鹤(用户版)", true);
+        // 用户目录：损坏布局（缺 [finals]）应被跳过
+        write_layout(&user, "broken.toml", "broken", "坏的", false);
+
+        // dirs 顺序：用户优先
+        let dirs = vec![user.clone(), install.clone()];
+        let got = EngineManager::scan_shuangpin_layouts(&dirs);
+
+        assert_eq!(
+            got,
+            vec![
+                ("mspy".to_string(), "微软双拼".to_string()),
+                ("shoudao".to_string(), "手道双拼".to_string()),
+                ("xiaohe".to_string(), "小鹤(用户版)".to_string()),
+            ],
+            "布局枚举应合并、用户优先、跳过损坏、按 id 排序，实际={got:?}"
+        );
+
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     /// Task 1：data_schema_id 拼音族折叠 + 未知方案返回自身 id。
