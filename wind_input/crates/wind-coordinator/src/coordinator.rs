@@ -737,6 +737,19 @@ impl Coordinator {
         self.host_render.get()
     }
 
+    /// 当前是否处于 host-render 受限宿主模式（SearchHost.exe / 开始菜单搜索框等）。
+    /// `active_target()` 每次现查（无缓存），避免跨帧持有失效目标。
+    /// 非 Windows 编译始终返回 false，零开销。
+    pub(crate) fn host_render_active(&self) -> bool {
+        #[cfg(windows)]
+        return self
+            .host_render()
+            .map(|m| m.active_target().is_some())
+            .unwrap_or(false);
+        #[cfg(not(windows))]
+        return false;
+    }
+
     /// 无头构造器（测试用）：跳过 UI 线程，不做词频持久化（避免污染真实文件）。
     pub fn new_headless(config: Config, data_dir: Option<&Path>) -> Arc<Self> {
         // 无头模式无 UI 消费端：丢弃 rx，notify_ui_* 的 send 会静默失败（已用 `let _ =` 忽略）
@@ -1559,8 +1572,10 @@ impl Coordinator {
         // 延迟首次显示：新组合首帧若非经授权（reflow 后权威坐标 / 兜底 timer）则不立即显示，
         // 改 arm 兜底 timer，待 handle_caret_update 的权威坐标或超时再首显。避免在 reflow 前的
         // 陈旧坐标处先显示、reflow 后再跳（根治"上屏后立即输入候选窗错位约一个上屏宽度"）。
-        // 例外：仅显示模式标记（无候选/无编码）时跳过延迟——进入模式时缓冲为空、无刚上屏文字，
+        // 例外①：仅显示模式标记（无候选/无编码）时跳过延迟——进入模式时缓冲为空、无刚上屏文字，
         // 光标无 reflow 跳动风险，强制延迟只会让状态提示迟钝。
+        // 例外②：host-render 受限宿主（SearchHost.exe / 开始菜单搜索框）：候选窗由服务端直接绘制
+        // 到 SHM，无需等宿主 reflow；首帧直显，跳过 pending_first_show 等待。
         let only_mode_label =
             !mode_label.is_empty() && state.candidates.is_empty() && state.input_buffer.is_empty();
         let authorized = self
@@ -1572,6 +1587,7 @@ impl Coordinator {
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
             && !only_mode_label
+            && !self.host_render_active()
         {
             self.arm_pending_first_show();
             return;
@@ -3628,6 +3644,14 @@ impl MessageHandler for Coordinator {
     }
 
     fn handle_composition_terminated(&self) {
+        // SearchHost.exe / 开始菜单等受限宿主：搜索框不支持 TSF composition，
+        // DLL 每次设置 composition 后宿主立即终止，属伪终止事件。
+        // Rust 版无 last_key_time 竞态窗口（对照 Go handle_lifecycle.go:559-572），
+        // host-render 激活时直接忽略清缓冲动作以保留输入状态与候选，
+        // 下一按键的 UpdateComposition 会自动重建 composition。
+        if self.host_render_active() {
+            return;
+        }
         let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
         state.input_buffer.clear();
         state.candidates.clear();

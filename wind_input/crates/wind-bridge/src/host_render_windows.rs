@@ -217,7 +217,15 @@ impl HostRenderManager {
         Ok((conn_id, entries))
     }
 
-    /// 记录最近焦点实例（焦点/激活时调）
+    /// 记录最近焦点实例（焦点/激活时调）。
+    ///
+    /// **焦点抖动免疫不变量**：本方法仅在 FOCUS_GAINED / IME_ACTIVATED 时调用，
+    /// FOCUS_LOST **不清除** active。原因：同进程内 SearchHost.exe 等受限宿主会在
+    /// FOCUS_LOST 后立即发出 FOCUS_GAINED（焦点抖动），两次事件之间若清除 active
+    /// 会导致写帧目标短暂丢失；旧 active 保留至下一次 GAINED 覆盖是安全的，
+    /// 因为写帧路径（coordinator 的 notify_ui_update / notify_ui_hide）仅在候选可见
+    /// 时才读取 active_target()，不可见期间的滞留目标不会被错误写帧。
+    /// 此语义由 server.rs CMD_FOCUS_LOST 分支不调用 note_focus 保证。
     pub fn note_focus(&self, conn_id: u32, pid: u32) {
         self.inner.lock().unwrap().active = Some((conn_id, pid));
     }
