@@ -69,6 +69,9 @@ pub enum UiCommand {
     HideToolbar,
     /// 设置工具栏位置（启动时恢复持久化位置）
     SetToolbarPos { x: i32, y: i32 },
+    /// 工具栏自动隐藏配置（开关 + 超时毫秒）。来自 ui.toolbar.auto_hide / auto_hide_delay，
+    /// 协调器 apply_ui_config（启动 + 配置重载）下发。
+    SetToolbarAutoHide { enabled: bool, delay_ms: u64 },
     /// 应用主题（协调器加载解析后下发）
     SetTheme(Box<wind_theme::Resolved>),
     /// 候选布局方向（true=竖排）。来自 ui.candidate.layout。
@@ -858,6 +861,12 @@ impl UiManager {
                         debug!("UI: SetToolbarPos ({},{})", x, y);
                         if let Some(t) = &mut toolbar {
                             t.set_pos(x, y);
+                        }
+                    }
+                    UiCommand::SetToolbarAutoHide { enabled, delay_ms } => {
+                        debug!("UI: SetToolbarAutoHide enabled={} delay={}ms", enabled, delay_ms);
+                        if let Some(t) = &mut toolbar {
+                            t.set_auto_hide(enabled, delay_ms);
                         }
                     }
                     UiCommand::SetTheme(theme) => {

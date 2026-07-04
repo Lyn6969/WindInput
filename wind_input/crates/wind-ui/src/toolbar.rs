@@ -8,6 +8,7 @@ use std::cell::RefCell;
 use std::rc::Rc;
 use std::sync::mpsc::Sender;
 
+use crate::auto_hide::{AutoHide, AutoHideAction};
 use crate::manager::{ToolbarAction, UiEvent};
 use crate::sys::{
     GetCursorPos, GetWindowRect, HWND, HWND_TOPMOST, IDC_ARROW, IDC_SIZEALL, LPARAM, LRESULT,
@@ -92,6 +93,8 @@ pub struct Toolbar {
     last_state: Option<ToolbarState>,
     /// 已渲染的悬停格下标（-1=无）；tick 检测光标位置变化后据此决定是否重绘
     rendered_hover: i32,
+    /// 自动隐藏状态机（默认关闭；SetToolbarAutoHide 命令配置）
+    auto_hide: AutoHide,
 }
 
 impl Toolbar {
@@ -126,6 +129,7 @@ impl Toolbar {
             origin: (0, 0),
             hover_idx: -1,
             dirty: false,
+            cursor_inside: false,
         }));
         window.register_mouse(mouse.clone());
         Ok(Self {
@@ -144,6 +148,7 @@ impl Toolbar {
             hover_bg: Self::HOVER_BG,
             last_state: None,
             rendered_hover: -1,
+            auto_hide: AutoHide::new(),
         })
     }
 
@@ -157,6 +162,19 @@ impl Toolbar {
         self.grip = theme.color("toolbar_grip", self.grip);
         self.settings_icon = theme.color("toolbar_settings_icon", self.settings_icon);
         self.hover_bg = theme.color("toolbar_hover", self.hover_bg);
+    }
+
+    /// 配置自动隐藏（启动/配置重载时经 SetToolbarAutoHide 下发）。
+    /// 淡出中关闭开关 → 恢复不透明；开启且当前可见 → 立即起表。
+    pub fn set_auto_hide(&mut self, enabled: bool, delay_ms: u64) {
+        if self.auto_hide.configure(enabled, delay_ms) {
+            if let Err(e) = self.window.update_with_alpha(255) {
+                tracing::warn!("Toolbar restore alpha: {}", e);
+            }
+        }
+        if enabled && self.visible {
+            self.auto_hide.on_shown(std::time::Instant::now());
+        }
     }
 
     /// 设置工具栏位置（启动恢复持久化位置）；钳制到工作区内。
@@ -410,6 +428,9 @@ impl Toolbar {
         self.window.show(px, py);
         self.visible = true;
         self.rendered_hover = hover_idx;
+        // 任何显示/状态刷新（render 是所有显示路径的单点）都重置自动隐藏计时。
+        // window.update() 以 alpha=255 提交，天然恢复不透明。
+        self.auto_hide.on_shown(std::time::Instant::now());
     }
 
     /// UI 循环每轮调用：消费鼠标处理器的悬停脏标记（由 WM_MOUSEMOVE/WM_MOUSELEAVE 事件置位），
@@ -422,15 +443,37 @@ impl Toolbar {
             let m = self.mouse.borrow();
             (m.dirty, m.hover_idx)
         };
-        if !dirty {
-            return;
+        if dirty {
+            self.mouse.borrow_mut().dirty = false;
+            if hov != self.rendered_hover {
+                if let Some(state) = self.last_state.clone() {
+                    self.render(&state, hov);
+                } else {
+                    self.rendered_hover = hov;
+                }
+            }
         }
-        self.mouse.borrow_mut().dirty = false;
-        if hov != self.rendered_hover {
-            if let Some(state) = self.last_state.clone() {
-                self.render(&state, hov);
-            } else {
-                self.rendered_hover = hov;
+        // 自动隐藏推进。快速路径：未启用/无活动计时时 is_active()=false 直接跳过，
+        // 不取 Instant::now()、无系统调用（开关关闭时零开销的硬约束）。
+        if self.auto_hide.is_active() {
+            let (inside, dragging) = {
+                let m = self.mouse.borrow();
+                (m.cursor_inside, m.dragging)
+            };
+            let now = std::time::Instant::now();
+            match self.auto_hide.tick_at(now, inside, dragging) {
+                AutoHideAction::None => {}
+                AutoHideAction::Fade(a) => {
+                    if let Err(e) = self.window.update_with_alpha(a) {
+                        tracing::warn!("Toolbar fade: {}", e);
+                    }
+                }
+                AutoHideAction::Restore => {
+                    if let Err(e) = self.window.update_with_alpha(255) {
+                        tracing::warn!("Toolbar fade restore: {}", e);
+                    }
+                }
+                AutoHideAction::Hide => self.hide(),
             }
         }
     }
@@ -466,6 +509,7 @@ impl Toolbar {
         self.window.hide();
         self.visible = false;
         self.rendered_hover = -1; // 重新显示时按光标位置重算悬停
+        self.auto_hide.on_hidden();
     }
 
     /// 工作区右下角位置（避开任务栏），右/下各留 12px 边距
@@ -531,6 +575,9 @@ pub struct ToolbarMouse {
     hover_idx: i32,
     /// 悬停态有变更、待 Toolbar::tick 重绘
     dirty: bool,
+    /// 光标是否在工具栏窗口内（WM_MOUSEMOVE 置 true / WM_MOUSELEAVE 置 false）；
+    /// 自动隐藏顺延判据——不能用 hover_idx（拖动柄区为 -1 但光标仍在窗内）。
+    cursor_inside: bool,
 }
 
 impl ToolbarMouse {
@@ -601,6 +648,7 @@ impl WindowMouse for ToolbarMouse {
                 Some(LRESULT(0))
             }
             WM_MOUSEMOVE => {
+                self.cursor_inside = true;
                 if self.dragging {
                     let mut p = POINT::default();
                     unsafe {
@@ -644,6 +692,7 @@ impl WindowMouse for ToolbarMouse {
             }
             WM_MOUSELEAVE => {
                 // 光标移出工具栏 → 清除悬停高亮。
+                self.cursor_inside = false;
                 if self.hover_idx != -1 {
                     self.hover_idx = -1;
                     self.dirty = true;
