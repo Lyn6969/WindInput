@@ -477,11 +477,28 @@ impl Coordinator {
 
     pub(crate) fn cycle_schema(&self) {
         if let Some(next) = self.engine_mgr.cycle_schema() {
+            // 「切换模式时取消大小写锁定」延伸：切方案的意图是用新方案输中文，
+            // 配置开启时取消 CapsLock，且若当前为英文模式一并归位中文。
+            let caps_cancelled = self.cancel_caps_on_switch();
+            let bundle = self.rt();
+            let cancel_cfg = bundle.config.input.capslock.cancel_on_mode_switch;
+            let follow = bundle.config.input.punct.follow_mode;
             let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+            let to_chinese = cancel_cfg && !state.chinese_mode;
+            if caps_cancelled || to_chinese {
+                state.chinese_mode = true;
+                if follow {
+                    state.chinese_punct = true;
+                }
+            }
             state.input_buffer.clear();
             state.candidates.clear();
             state.preedit.clear();
             drop(state);
+            if caps_cancelled || to_chinese {
+                self.record_app_mode(true);
+                self.record_last_state();
+            }
             self.notify_ui_hide();
             self.push_state_update();
             self.show_status();

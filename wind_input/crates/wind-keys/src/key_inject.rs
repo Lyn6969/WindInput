@@ -111,6 +111,13 @@ impl KeyInjector for SysKeys {
     }
 }
 
+/// 敲击 CapsLock（VK_CAPITAL 0x14，down+up）以取消系统大写锁定。
+/// 供「切换模式时取消大小写锁定」（input.capslock.cancel_on_mode_switch）使用；
+/// 非 Windows 平台无 CGKeyCode 映射时返回错误由调用方降级。
+pub fn tap_caps_lock() -> anyhow::Result<()> {
+    tap_combo(&[], 0x14)
+}
+
 /// macOS：修饰键经 CGEvent flags 表达，而非单独 post 修饰键 keyDown。
 ///
 /// macOS 应用识别组合键读的是**事件自带的 flags 字段**——单独 post 一个 kVK_Command

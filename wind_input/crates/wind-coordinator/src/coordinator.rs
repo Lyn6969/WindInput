@@ -506,6 +506,8 @@ pub struct Coordinator {
     /// 用户最后一次主动切换后的 (中英, 全半角, 中英标点) 内存镜像；
     /// remember_last_state=true 时随切换同步落盘 state.toml（`record_last_state`）。
     runtime_last: Mutex<(bool, bool, bool)>,
+    /// 最近一次 CapsLock 取消注入的时刻（`cancel_caps_on_switch` 冷却，防振荡回路放大）。
+    last_caps_inject: Mutex<Option<std::time::Instant>>,
     /// 前台上下文快照 `(app, title, sel)`，供命令直通车 app()/title()/sel() 取值。
     /// darwin `.app` 经 CMD_FRONT_CONTEXT 于聚焦时上报；其它平台暂空。
     front_ctx: Mutex<(String, String, String)>,
@@ -979,6 +981,7 @@ impl Coordinator {
             pid_names: Mutex::new(HashMap::new()),
             mode_states: Mutex::new(HashMap::new()),
             runtime_last: Mutex::new((init_chinese, init_full, init_punct)),
+            last_caps_inject: Mutex::new(None),
             front_ctx: Mutex::new((String::new(), String::new(), String::new())),
             themes_dir,
             theme_name: Mutex::new(initial_theme),
@@ -1097,7 +1100,7 @@ impl Coordinator {
     /// 用户主动切换中英/全半角/标点后记录"最后状态"镜像；
     /// remember_last_state=true 时同步落盘 state.toml（复用 toolbar_positions 的 load-modify-save 模式）。
     /// 必须在释放 state 锁后调用。
-    fn record_last_state(&self) {
+    pub(crate) fn record_last_state(&self) {
         let (c, f, p) = {
             let s = self.state.lock().unwrap_or_else(|e| e.into_inner());
             (s.chinese_mode, s.full_width, s.chinese_punct)
@@ -1115,7 +1118,7 @@ impl Coordinator {
     }
 
     /// state_scope="app" 时把中英状态写回当前前台进程的记忆表（进程名取自 pid 缓存）。
-    fn record_app_mode(&self, chinese: bool) {
+    pub(crate) fn record_app_mode(&self, chinese: bool) {
         if !self.rt().config.input.default.per_app_scope() {
             return;
         }
@@ -1137,6 +1140,52 @@ impl Coordinator {
                 .unwrap_or_else(|e| e.into_inner())
                 .insert(name, chinese);
         }
+    }
+
+    /// 「切换模式时取消大小写锁定」（input.capslock.cancel_on_mode_switch）：
+    /// CapsLock 开着时 `effective_chinese = chinese_mode && !caps_lock` 恒为英文大写，
+    /// 切中英/切方案"看似无效"。开启该配置后，切换动作先物理敲击 CapsLock 取消系统
+    /// 锁定并同步镜像，让切换真正生效。返回是否执行了取消（供调用方决定归位语义）。
+    /// 需在未持有 state 锁时调用。
+    pub(crate) fn cancel_caps_on_switch(&self) -> bool {
+        if !self.rt().config.input.capslock.cancel_on_mode_switch {
+            return false;
+        }
+        {
+            let s = self.state.lock().unwrap_or_else(|e| e.into_inner());
+            if !s.caps_lock {
+                return false;
+            }
+        }
+        // 防抖：同一轮切换动作内不重复注入（一次注入的系统回环在几十 ms 内完成）。
+        // 振荡回路的主熔断在 C++ 侧（OPENCLOSE 的 CapsLock 联动抑制 + Ctrl 判据），
+        // 此处窗口必须远小于用户连续两轮「开大写→切换」的最短间隔——曾设 1500ms，
+        // 实测会吞掉快节奏的第二轮合法请求（表现为"有时要按两次"），勿再调大。
+        {
+            let mut last = self
+                .last_caps_inject
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            if let Some(t) = *last
+                && t.elapsed() < std::time::Duration::from_millis(300)
+            {
+                debug!("cancel_on_mode_switch: 注入防抖期内，跳过");
+                return false;
+            }
+            *last = Some(std::time::Instant::now());
+        }
+        // SendInput 敲击 VK_CAPITAL；失败（非 Windows/注入受限）不动镜像，行为退回未配置。
+        if let Err(e) = wind_keys::key_inject::tap_caps_lock() {
+            warn!("cancel_on_mode_switch: 注入 CapsLock 失败: {e}");
+            return false;
+        }
+        // 乐观同步镜像（后续按键立即按新状态处理）；注入回环的 CapsLock key_up
+        // 状态通知（toggles bit=0）随后到达时与此幂等。
+        self.state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .caps_lock = false;
+        true
     }
 
     /// IME 激活 / 焦点切换（重型段）时按配置矩阵落地初始状态。
@@ -2836,6 +2885,20 @@ impl MessageHandler for Coordinator {
             data.event_type, data.key_code, data.modifiers
         );
 
+        // 用每键携带的 toggles 快照（C++ 前台线程 GetKeyState 实时采集）校准 CapsLock 镜像。
+        // 专门的 VK_CAPITAL key_up 状态通知在英文模式（TSF 不吃该键）或用户于其它应用/
+        // 输入法期间切换大写时不会到达，镜像会陈旧——表现为 cancel_on_mode_switch 在
+        // "英文+大写"场景读到 caps_lock=false 而跳过取消。服务进程自身 GetKeyState 的
+        // toggle 位跨线程不可靠，故以事件快照为权威。
+        {
+            let caps_now = (data.toggles & 0x01) != 0;
+            let mut s = self.state.lock().unwrap_or_else(|e| e.into_inner());
+            if s.caps_lock != caps_now {
+                debug!("CapsLock mirror recalibrated from key toggles: {}", caps_now);
+                s.caps_lock = caps_now;
+            }
+        }
+
         // ── key_up：toggle 模式键（Shift/Ctrl/CapsLock）直接切换 ──
         // 关键：TSF 对 toggle 键会"吃掉 keydown 不转发"，仅在 C++ 侧判定为干净单击后
         // 于 keyUp 转发该键事件（_SendKeyToService(..., KEY_EVENT_UP)）。因此服务端
@@ -3733,8 +3796,16 @@ impl MessageHandler for Coordinator {
     }
 
     fn handle_toggle_mode(&self) -> (Option<StatusUpdateData>, String) {
+        // 「切换模式时取消大小写锁定」：CapsLock 开时按切换键，语义是"回到可输入中文
+        // 的状态"（对齐搜狗）——取消锁定并归位中文，而非翻转 chinese_mode；否则
+        // chinese_mode 原本为 true（被 CapsLock 压制）时翻转反而落到英文，切换仍然无效。
+        let caps_cancelled = self.cancel_caps_on_switch();
         let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
-        state.chinese_mode = !state.chinese_mode;
+        state.chinese_mode = if caps_cancelled {
+            true
+        } else {
+            !state.chinese_mode
+        };
         let chinese = state.chinese_mode;
         // 标点随中英文切换（对齐 Go）：开启 punct_follow_mode 时，标点中/英跟随当前模式。
         if self.rt().config.input.punct.follow_mode {
@@ -3754,6 +3825,9 @@ impl MessageHandler for Coordinator {
     }
 
     fn handle_system_mode_switch(&self, chinese_mode: bool) -> (Option<StatusUpdateData>, String) {
+        // 「切换模式时取消大小写锁定」：目标模式由外部指定（Ctrl+Space/KBLSwitch），
+        // 仅取消 CapsLock 让目标模式真正生效，不改写目标。
+        let _ = self.cancel_caps_on_switch();
         let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
         state.chinese_mode = chinese_mode;
         // 标点随中英文切换（对齐 Go）：开启 punct_follow_mode 时，标点跟随模式。
@@ -4201,6 +4275,33 @@ mod initial_mode_tests {
         assert!(!chinese);
     }
 
+    /// cancel_on_mode_switch=false（默认）：CapsLock 开着按切换键，保持翻转语义、不动 CapsLock。
+    /// （注入路径涉及真实 SendInput，不在单测覆盖，真机验证。）
+    #[test]
+    fn toggle_mode_keeps_caps_when_cancel_disabled() {
+        let c = coord_with(|_| {});
+        {
+            let mut s = c.state.lock().unwrap();
+            s.caps_lock = true;
+            s.chinese_mode = true;
+        }
+        c.handle_toggle_mode();
+        let s = c.state.lock().unwrap();
+        assert!(s.caps_lock, "配置关不得动 CapsLock");
+        assert!(!s.chinese_mode, "配置关保持原翻转语义");
+    }
+
+    /// cancel_on_mode_switch=true 但 CapsLock 未开：不注入、正常翻转。
+    #[test]
+    fn toggle_mode_normal_flip_when_caps_off() {
+        let c = coord_with(|cfg| cfg.input.capslock.cancel_on_mode_switch = true);
+        c.state.lock().unwrap().chinese_mode = false;
+        c.handle_toggle_mode();
+        let s = c.state.lock().unwrap();
+        assert!(s.chinese_mode, "caps 未开时应正常翻转");
+        assert!(!s.caps_lock);
+    }
+
     /// 决策顺序：per-app 表命中优先于全局默认。
     #[test]
     fn initial_mode_decision_order() {
@@ -4252,6 +4353,29 @@ mod capslock_tests {
         c.handle_key_event(&ev);
     }
 
+    /// CapsLock 开启期间的按键事件：真实 C++ 每键都带 toggles 快照（GetKeyState 实时值），
+    /// caps 开着时 bit0=1。handle_key_event 入口会按此快照校准镜像，故必须如实构造。
+    fn kev_caps(key_code: u32, event_type: u8) -> KeyEventData {
+        let mut ev = kev(key_code, event_type);
+        ev.toggles = 0x01;
+        ev
+    }
+
+    /// 每键 toggles 快照校准镜像：英文模式（TSF 不吃 VK_CAPITAL）或在其它应用/输入法
+    /// 期间切换大写时，专门的状态通知不会到达、镜像陈旧——此校准是 cancel_on_mode_switch
+    /// 在"英文+大写"场景能生效的前提（真机回归：切方案取消不了 CapsLock 的根因）。
+    #[test]
+    fn key_event_toggles_recalibrates_caps_mirror() {
+        let c = coord_cn();
+        assert!(!c.state.lock().unwrap().caps_lock);
+        // 未收到过 VK_CAPITAL 通知，但按键快照显示 caps 已开 → 入口校准。
+        c.handle_key_event(&kev_caps(0x41, EVENT_KEY_DOWN));
+        assert!(
+            c.state.lock().unwrap().caps_lock,
+            "入口应按 toggles 快照校准 CapsLock 镜像"
+        );
+    }
+
     // ── 字母透传 ────────────────────────────────────────────────────────────
 
     #[test]
@@ -4259,7 +4383,7 @@ mod capslock_tests {
         let c = coord_cn();
         set_caps_lock(&c, true);
         // 字母 A：中文 + CapsLock + 无 session → 系统产生大写 A，coordinator 不介入
-        let action = c.handle_key_event(&kev(0x41, EVENT_KEY_DOWN));
+        let action = c.handle_key_event(&kev_caps(0x41, EVENT_KEY_DOWN));
         assert!(
             matches!(action, KeyAction::PassThrough),
             "中文+CapsLock+字母应透传，实际: {:?}",
@@ -4286,7 +4410,7 @@ mod capslock_tests {
         let c = coord_cn();
         set_caps_lock(&c, true);
         // VK 0xBC = ','，无 input_buffer → 透传给系统
-        let action = c.handle_key_event(&kev(0xBC, EVENT_KEY_DOWN));
+        let action = c.handle_key_event(&kev_caps(0xBC, EVENT_KEY_DOWN));
         assert!(
             matches!(action, KeyAction::PassThrough),
             "中文+CapsLock+无session+标点应透传，实际: {:?}",
@@ -4314,7 +4438,7 @@ mod capslock_tests {
         c.state.lock().unwrap().full_width = true;
         set_caps_lock(&c, true);
         // CapsLock ON + 无 Shift + 字母 A → 大写 A → 全角 "Ａ"
-        let action = c.handle_key_event(&kev(0x41, EVENT_KEY_DOWN));
+        let action = c.handle_key_event(&kev_caps(0x41, EVENT_KEY_DOWN));
         match &action {
             KeyAction::InsertText { text, .. } => {
                 assert_eq!(
@@ -4333,7 +4457,7 @@ mod capslock_tests {
         c.state.lock().unwrap().full_width = true;
         set_caps_lock(&c, true);
         // CapsLock ON + Shift + 字母 A → 翻转大小写 → 小写 a → 全角 "ａ"
-        let mut ev = kev(0x41, EVENT_KEY_DOWN);
+        let mut ev = kev_caps(0x41, EVENT_KEY_DOWN);
         ev.modifiers = MOD_SHIFT;
         let action = c.handle_key_event(&ev);
         match &action {
@@ -4354,7 +4478,7 @@ mod capslock_tests {
         c.state.lock().unwrap().full_width = true;
         set_caps_lock(&c, true);
         // ',' 经英全列转换后上屏（不透传）
-        let action = c.handle_key_event(&kev(0xBC, EVENT_KEY_DOWN));
+        let action = c.handle_key_event(&kev_caps(0xBC, EVENT_KEY_DOWN));
         assert!(
             matches!(action, KeyAction::InsertText { .. }),
             "CapsLock+全角+标点应上屏，实际: {:?}",
