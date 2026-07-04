@@ -331,7 +331,16 @@ impl Coordinator {
             M::leaf("词库管理...", cmd(MenuCmd::OpenDictionary), true, false),
             M::leaf("设置...", cmd(MenuCmd::OpenSettings), true, false),
             M::separator(),
-            M::leaf("关于", cmd(MenuCmd::OpenAbout), true, false),
+            M::leaf(
+                format!(
+                    "关于 v{}{}",
+                    env!("WIND_APP_VERSION"),
+                    if wind_config::variant::is_dev() { " (Dev)" } else { "" }
+                ),
+                cmd(MenuCmd::OpenAbout),
+                true,
+                false,
+            ),
         ];
         items
     }

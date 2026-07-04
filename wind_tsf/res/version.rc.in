@@ -22,13 +22,13 @@ BEGIN
     BEGIN
         BLOCK "080404b0"
         BEGIN
-            VALUE "CompanyName",      "@APP_DISPLAY_NAME@"
-            VALUE "FileDescription",  "@APP_DISPLAY_NAME@ TSF 框架模块"
+            VALUE "CompanyName",      "清风输入法"
+            VALUE "FileDescription",  "清风输入法 TSF 模块"
             VALUE "FileVersion",      "@APP_VERSION_STR@.@APP_VERSION_BUILD@"
             VALUE "InternalName",     "wind_tsf"
-            VALUE "LegalCopyright",   "Copyright © 2026 @APP_DISPLAY_NAME@"
+            VALUE "LegalCopyright",   "Copyright © 清风输入法"
             VALUE "OriginalFilename", "wind_tsf.dll"
-            VALUE "ProductName",      "@APP_DISPLAY_NAME@"
+            VALUE "ProductName",      "清风输入法"
             VALUE "ProductVersion",   "@APP_VERSION_STR@"
         END
     END

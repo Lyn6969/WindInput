@@ -165,6 +165,7 @@ function Build-Setting ([string]$profile = "release", [string]$outdir = $null) {
     if ($profile -eq "dev") { $suffix = "_dev"; $targetDir = "debug" }
     New-Item -ItemType Directory -Path $outdir -Force | Out-Null
     Say "`n[setting] 构建 wind_setting ($profile)..."
+    $env:WIND_APP_VERSION = $Version   # 版本注入: docs/VERSION → wind-setting (与主仓统一)
     Push-Location $SettingDir
     try {
         if ($profile -eq "dev") { cargo build } else { cargo build --release }
@@ -185,6 +186,7 @@ function Build-Portable ([string]$profile = "release", [string]$outdir = $null) 
     if (-not (Test-Path $PortableDir)) { Warn "../wind-portable 仓库不存在, 跳过便携启动器。"; return $true }
     New-Item -ItemType Directory -Path $outdir -Force | Out-Null
     Say "`n[portable] 构建 wind_portable ($profile → 单一二进制)..."
+    $env:WIND_APP_VERSION = $Version   # 版本注入: docs/VERSION → wind-portable (与主仓统一)
     Push-Location $PortableDir
     try {
         cargo build --release
@@ -408,8 +410,43 @@ function Verify-DistData ([string]$outdir = $BuildDir) {
 # ---------- 全构建 (1 / d1) ----------
 # 全部模块 + 数据落到【产品根】build/(release) 或 build_dev/(dev)。
 # 先清空输出目录, 确保内容 == 部署到目标目录的内容, 无任何中间产物。
+# ---------- 版本变化侦测: 版本号变更时强制重建关键产物 (确定性保险) ----------
+# 产品版本唯一真源是 docs/VERSION。cargo 的 rerun-if-env-changed 与 CMake -D 已能在
+# 版本变化时自动重建; 此处再加一道保险: 记录上次构建版本, 一旦变化即清理最终产物
+# (Rust 最终二进制包 + TSF 的 CMake 缓存目录), 强制重新写入版本资源。仅版本真变时付代价。
+function Sync-VersionStamp {
+    $stampFile = "$CacheDir\.last_build_version"
+    $lastVer = if (Test-Path $stampFile) { (Get-Content $stampFile -Raw).Trim() } else { "" }
+    if ($lastVer -eq $Version) { return }   # 版本未变 → 走增量, 不清理
+
+    if ($lastVer) { Say "`n[version] 版本变化 $lastVer -> $Version, 清理关键产物强制刷新版本号..." }
+    else          { Say "`n[version] 首次记录版本 $Version, 清理关键产物确保版本号写入..." }
+
+    # 1. Rust: 仅清最终二进制包 (依赖库保留, 秒级); build.rs 随之重跑注入新版本资源。
+    # 注意: $ProjectRoot 已是 wind_input 目录 (见路径定义), 勿再拼 \wind_input。
+    Push-Location $ProjectRoot
+    try { cargo clean -p wind_service 2>&1 | Out-Null } catch {} finally { Pop-Location }
+    if (Test-Path $SettingDir) {
+        Push-Location $SettingDir
+        try { cargo clean -p wind_setting 2>&1 | Out-Null } catch {} finally { Pop-Location }
+    }
+    if (Test-Path $PortableDir) {
+        Push-Location $PortableDir
+        try { cargo clean -p wind_portable 2>&1 | Out-Null } catch {} finally { Pop-Location }
+    }
+
+    # 2. TSF: 删 CMake 缓存目录, 强制 configure_file 重新生成 version.rc。
+    $tsfCache = "$CacheDir\tsf-cmake"
+    if (Test-Path $tsfCache) { Remove-Item -Recurse -Force $tsfCache -ErrorAction SilentlyContinue }
+
+    # 记录当前版本, 避免下次重复清理。
+    New-Item -ItemType Directory -Path $CacheDir -Force | Out-Null
+    Set-Content -Path $stampFile -Value $Version -NoNewline
+}
+
 function Do-Full ([string]$profile = "release") {
     $outdir = Out-For $profile
+    Sync-VersionStamp   # 版本号变化则强制重建关键产物 (确定性保险)
     Say "`n========== 全构建 ($profile) → $outdir =========="
     if (Test-Path $outdir) { Remove-Item -Recurse -Force $outdir }
     New-Item -ItemType Directory -Path $outdir -Force | Out-Null

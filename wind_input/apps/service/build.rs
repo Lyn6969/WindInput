@@ -10,24 +10,30 @@ fn main() {
     // 必须在 windows-only 早返回之前，使非 Windows 目标也能解析 env!。
     emit_build_stamp();
 
-    if std::env::var("CARGO_CFG_TARGET_OS").as_deref() != Ok("windows") {
-        return;
-    }
-
     let manifest_dir = PathBuf::from(std::env::var("CARGO_MANIFEST_DIR").unwrap());
     // wind_input/apps/service → 仓库根 WindInput
     let product_root = manifest_dir.join("..").join("..").join("..");
-    let icon = product_root.join("wind_tsf/res/wind_input.ico");
     let version_file = product_root.join("docs/VERSION");
 
     println!("cargo:rerun-if-changed=build.rs");
     println!("cargo:rerun-if-changed={}", version_file.display());
-    println!("cargo:rerun-if-changed={}", icon.display());
 
-    // 版本号：X.Y.Z[-suffix] → 数值 FIXEDFILEINFO + 原始字符串
+    // 产品版本 X.Y.Z[-suffix]：取 docs/VERSION 注入 WIND_APP_VERSION，供 main.rs 启动日志等
+    // 运行时使用。env! 对全平台求值，故在 windows-only 早返回之前发出。
     let ver_str = std::fs::read_to_string(&version_file)
         .map(|s| s.trim().to_string())
         .unwrap_or_else(|_| "0.0.0".to_string());
+    println!("cargo:rustc-env=WIND_APP_VERSION={ver_str}");
+
+    if std::env::var("CARGO_CFG_TARGET_OS").as_deref() != Ok("windows") {
+        return;
+    }
+
+    // 图标资源（仅 Windows）。
+    let icon = product_root.join("wind_tsf/res/wind_input.ico");
+    println!("cargo:rerun-if-changed={}", icon.display());
+
+    // 数值 FIXEDFILEINFO
     let core = ver_str.split('-').next().unwrap_or("0.0.0");
     let mut it = core.split('.').map(|s| s.parse::<u16>().unwrap_or(0));
     let (maj, min, pat) = (
@@ -70,10 +76,10 @@ fn main() {
     res.set_icon(icon.to_str().expect("icon 路径含非 UTF-8"));
     res.set("ProductName", product_name);
     res.set("CompanyName", "清风输入法");
-    res.set("FileDescription", "清风输入法服务进程");
+    res.set("FileDescription", "清风输入法服务");
     res.set("InternalName", "wind_input");
     res.set("OriginalFilename", original_filename);
-    res.set("LegalCopyright", "Copyright © 2026 清风输入法");
+    res.set("LegalCopyright", "Copyright © 清风输入法");
     res.set("ProductVersion", &ver_str);
     res.set("FileVersion", &ver_str);
     res.set_version_info(winresource::VersionInfo::FILEVERSION, ver_u64);

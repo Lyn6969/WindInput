@@ -183,6 +183,7 @@ build_setting() {
 
     mkdir -p "$outdir"; cd "$SETTING_DIR" || return 1
     say "\n[setting] 交叉编译 wind_setting ($profile, $TARGET)..."
+    export WIND_APP_VERSION="$VERSION"   # 版本注入: docs/VERSION → wind-setting (与主仓统一)
     cargo_xwin "${cargo_args[@]}" || { err "wind_setting 构建失败!"; return 1; }
 
     local src="$SETTING_DIR/target/$TARGET/$target_dir/wind_setting.exe"
@@ -202,6 +203,7 @@ build_portable() {
 
     mkdir -p "$outdir"; cd "$PORTABLE_DIR" || return 1
     say "\n[portable] 交叉编译 wind_portable ($profile → 单一二进制, $TARGET)..."
+    export WIND_APP_VERSION="$VERSION"   # 版本注入: docs/VERSION → wind-portable (与主仓统一)
     cargo_xwin build --release --target "$TARGET" || { err "wind_portable 构建失败!"; return 1; }
 
     local src="$PORTABLE_DIR/target/$TARGET/release/wind_portable.exe"
@@ -731,9 +733,37 @@ verify_dist_data() {
 # 全部模块 + 数据落到【项目根】build/(release) 或 build_dev/(dev)。
 # 先清空输出目录，确保内容 == 安装到 Program Files 的内容，无任何中间产物。
 #   do_full [release|dev]
+# 版本变化侦测: 版本号变更时强制重建关键产物 (确定性保险)。
+# 产品版本唯一真源是 docs/VERSION; cargo 的 rerun-if-env-changed 已能自动重建, 此处
+# 再加保险: 记录上次构建版本, 一旦变化即清理最终产物 (Rust 最终包 + TSF obj),
+# 强制重新写入版本资源。仅版本真变时付代价。
+sync_version_stamp() {
+    local stamp="$CACHE_DIR/.last_build_version" last=""
+    [ -f "$stamp" ] && last="$(tr -d '[:space:]' < "$stamp")"
+    [ "$last" = "$VERSION" ] && return 0   # 版本未变 → 走增量, 不清理
+
+    if [ -n "$last" ]; then say "\n[version] 版本变化 $last -> $VERSION, 清理关键产物强制刷新版本号..."
+    else say "\n[version] 首次记录版本 $VERSION, 清理关键产物确保版本号写入..."; fi
+
+    # Rust: 仅清最终二进制包 (依赖库保留); build.rs 随之重跑注入新版本资源。
+    ( cd "$PRODUCT_ROOT/wind_input" && cargo clean -p wind_service >/dev/null 2>&1 ) || true
+    if [ -d "$SETTING_DIR" ]; then
+        ( cd "$SETTING_DIR" && cargo clean -p wind_setting >/dev/null 2>&1 ) || true
+    fi
+    if [ -d "$PORTABLE_DIR" ]; then
+        ( cd "$PORTABLE_DIR" && cargo clean -p wind_portable >/dev/null 2>&1 ) || true
+    fi
+    # TSF: 删交叉编译对象目录, 强制重新生成含新版本的资源。
+    rm -rf "$CACHE_DIR/tsf-obj"
+
+    mkdir -p "$CACHE_DIR"
+    printf '%s' "$VERSION" > "$stamp"
+}
+
 do_full() {
     local profile="${1:-release}" outdir; outdir="$(out_for "$profile")"
     say "\n========== 全构建 ($profile) → $outdir =========="
+    sync_version_stamp   # 版本号变化则强制重建关键产物 (确定性保险)
     rm -rf "$outdir"; mkdir -p "$outdir"
     build_core    "$profile" "$outdir" || return 1   # wind_input[_dev].exe
     build_tsf_all "$profile" "$outdir" || return 1   # wind_tsf[_x86][_dev].dll

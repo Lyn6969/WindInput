@@ -46,12 +46,10 @@ ifeq ($(DEV_VARIANT),1)
   OUTDIR   ?= build_dev
   VARFLAGS := -DWIND_DEV_VARIANT
   DBGSUFFIX := _dev
-  DISPLAY_NAME := 清风输入法开发版
 else
   OUTDIR   ?= build
   VARFLAGS :=
   DBGSUFFIX :=
-  DISPLAY_NAME := 清风输入法
 endif
 # 命名顺序对齐 Go 版：base + _x86 + _dev（如 wind_tsf_x86_dev.dll）
 TARGET := wind_tsf$(ARCHSUFFIX)$(DBGSUFFIX)
@@ -127,8 +125,7 @@ $(VERRC): res/version.rc.in | $(OBJDIR)
 	    -e 's/@APP_VERSION_MINOR@/$(VER_MINOR)/g' \
 	    -e 's/@APP_VERSION_PATCH@/$(VER_PATCH)/g' \
 	    -e 's/@APP_VERSION_BUILD@/0/g' \
-	    -e 's/@APP_VERSION_STR@/$(VERSION)/g' \
-	    -e 's/@APP_DISPLAY_NAME@/$(DISPLAY_NAME)/g' $< > $@
+	    -e 's/@APP_VERSION_STR@/$(VERSION)/g' $< > $@
 
 # 资源编译（llvm-rc → .res）
 $(RESOBJ): res/resource.rc | $(OBJDIR)

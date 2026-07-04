@@ -10,7 +10,9 @@ use serde_json::{Value, json};
 use wind_config::Config;
 use wind_ipc::rpc::{Request, Response};
 
-pub(crate) const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
+// 产品版本取 build.rs 从 docs/VERSION 注入的 WIND_APP_VERSION（= 0.100.0），
+// 而非 workspace 的 CARGO_PKG_VERSION（兜底 0.x）。上报进 system_info.version / engine / appVersion。
+pub(crate) const APP_VERSION: &str = env!("WIND_APP_VERSION");
 
 /// 由宿主（service）注入的运行时状态来源（传输无关）。
 ///

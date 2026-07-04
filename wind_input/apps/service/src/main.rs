@@ -100,7 +100,7 @@ fn main() {
     };
     info!(
         "WindInput service starting (v{}, {} variant, build {} git:{})",
-        env!("CARGO_PKG_VERSION"),
+        env!("WIND_APP_VERSION"),
         variant,
         env!("WIND_BUILD_TIME"),
         env!("WIND_GIT_HASH"),
