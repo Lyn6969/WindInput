@@ -1264,18 +1264,18 @@ impl EngineManager {
                 m.secondary_schema,
                 english.is_some()
             );
+            let cfg = crate::mixed::MixConfig {
+                min_pinyin_length: min_py,
+                codetable_weight_boost: boost,
+                auto_commit_block_on_pinyin: block_on_pinyin,
+                pinyin_only_overflow: mix_cfg.pinyin_only_overflow,
+                top_code_override_pinyin: mix_cfg.top_code_override_pinyin,
+                show_source_hint: mix_cfg.show_source_hint,
+                min_english_length: min_en,
+                auto_commit_block_on_english: mix_cfg.auto_commit_block_on_english,
+            };
             return Some(Box::new(crate::mixed::MixedEngine::new(
-                primary,
-                secondary,
-                min_py,
-                boost,
-                block_on_pinyin,
-                mix_cfg.pinyin_only_overflow,
-                mix_cfg.top_code_override_pinyin,
-                mix_cfg.show_source_hint,
-                english,
-                min_en,
-                mix_cfg.auto_commit_block_on_english,
+                primary, secondary, english, cfg,
             )));
         }
 

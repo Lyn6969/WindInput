@@ -24,6 +24,35 @@ const ENGLISH_EXACT_BOOST: i32 = 500_000;
 /// 避免短前缀（如「d」）刷屏。真机若仍偏高可继续下调。
 const ENGLISH_PREFIX_BOOST: i32 = 0;
 
+/// 混输引擎的标量配置（融合策略参数）。引擎部件 primary/secondary/english 单独传入 `new`；
+/// 此处仅聚合可配开关/阈值，避免 `new` 参数膨胀。字段语义见 [`MixedEngine`] 同名字段。
+#[derive(Debug, Clone)]
+pub struct MixConfig {
+    pub min_pinyin_length: usize,
+    pub codetable_weight_boost: i32,
+    pub auto_commit_block_on_pinyin: bool,
+    pub pinyin_only_overflow: bool,
+    pub top_code_override_pinyin: bool,
+    pub show_source_hint: bool,
+    pub min_english_length: usize,
+    pub auto_commit_block_on_english: bool,
+}
+
+impl Default for MixConfig {
+    fn default() -> Self {
+        Self {
+            min_pinyin_length: 2,
+            codetable_weight_boost: 10_000_000,
+            auto_commit_block_on_pinyin: true,
+            pinyin_only_overflow: true,
+            top_code_override_pinyin: false,
+            show_source_hint: false,
+            min_english_length: 2,
+            auto_commit_block_on_english: false,
+        }
+    }
+}
+
 /// 混合引擎
 pub struct MixedEngine {
     /// 主引擎（码表，如五笔）
@@ -57,34 +86,28 @@ pub struct MixedEngine {
 }
 
 impl MixedEngine {
-    #[allow(clippy::too_many_arguments)]
+    /// 构造混输引擎：primary（码表主）/ secondary（拼音次）/ english（英文词库，可空）为引擎部件，
+    /// 其余融合策略参数经 [`MixConfig`] 传入。
     pub fn new(
         primary: Box<dyn Engine>,
         secondary: Option<Box<dyn Engine>>,
-        min_pinyin_length: usize,
-        codetable_weight_boost: i32,
-        auto_commit_block_on_pinyin: bool,
-        pinyin_only_overflow: bool,
-        top_code_override_pinyin: bool,
-        show_source_hint: bool,
         english: Option<Box<dyn Engine>>,
-        min_english_length: usize,
-        auto_commit_block_on_english: bool,
+        cfg: MixConfig,
     ) -> Self {
         let max_code_len = primary.max_code_length();
         Self {
             primary,
             secondary,
-            min_pinyin_length,
-            codetable_weight_boost,
-            auto_commit_block_on_pinyin,
-            pinyin_only_overflow,
-            top_code_override_pinyin,
+            min_pinyin_length: cfg.min_pinyin_length,
+            codetable_weight_boost: cfg.codetable_weight_boost,
+            auto_commit_block_on_pinyin: cfg.auto_commit_block_on_pinyin,
+            pinyin_only_overflow: cfg.pinyin_only_overflow,
+            top_code_override_pinyin: cfg.top_code_override_pinyin,
             max_code_len,
-            show_source_hint,
+            show_source_hint: cfg.show_source_hint,
             english,
-            min_english_length,
-            auto_commit_block_on_english,
+            min_english_length: cfg.min_english_length,
+            auto_commit_block_on_english: cfg.auto_commit_block_on_english,
         }
     }
 
@@ -452,7 +475,7 @@ mod tests {
     fn mixed_propagates_auto_commit_without_pinyin() {
         // 主码表唯一全码自动上屏；无次引擎 → 无拼音候选 → 放行。
         let primary = ct_engine(&[("aaaa", "工", 100)], true);
-        let e = MixedEngine::new(primary, None, 2, 10_000_000, true, true, false, false, None, 2, false);
+        let e = MixedEngine::new(primary, None, None, MixConfig::default());
         let r = e.convert("aaaa", 50).unwrap();
         assert!(r.should_commit, "无拼音候选时应放行全码上屏");
         assert_eq!(r.commit_text, "工");
@@ -463,19 +486,7 @@ mod tests {
         // 次引擎对同一输入也产出候选（模拟拼音命中）+ 守护开 → 否决上屏。
         let primary = ct_engine(&[("aaaa", "工", 100)], true);
         let secondary = ct_engine(&[("aaaa", "啊啊", 50)], false);
-        let e = MixedEngine::new(
-            primary,
-            Some(secondary),
-            2,
-            10_000_000,
-            true,
-            true,
-            false,
-            false,
-            None,
-            2,
-            false,
-        );
+        let e = MixedEngine::new(primary, Some(secondary), None, MixConfig::default());
         let r = e.convert("aaaa", 50).unwrap();
         assert!(!r.should_commit, "有拼音候选且守护开时应否决全码上屏");
     }
@@ -488,15 +499,11 @@ mod tests {
         let e = MixedEngine::new(
             primary,
             Some(secondary),
-            2,
-            10_000_000,
-            false,
-            true,
-            false,
-            false,
             None,
-            2,
-            false,
+            MixConfig {
+                auto_commit_block_on_pinyin: false,
+                ..Default::default()
+            },
         );
         let r = e.convert("aaaa", 50).unwrap();
         assert!(r.should_commit, "守护关时应放行");
@@ -530,19 +537,7 @@ mod tests {
     fn topcode_suppressed_for_pinyin_prefix_when_override_off() {
         // "wang" 前缀既是完整拼音又是唯一五笔全码；override 关 → 抑制顶码，保护拼音。
         let primary = ct_engine_topcode(&[("wang", "王", 100)]);
-        let e = MixedEngine::new(
-            primary,
-            Some(pinyin_secondary()),
-            2,
-            10_000_000,
-            true,
-            true,
-            false,
-            false,
-            None,
-            2,
-            false,
-        );
+        let e = MixedEngine::new(primary, Some(pinyin_secondary()), None, MixConfig::default());
         assert_eq!(
             e.handle_top_code("wangb"),
             None,
@@ -583,15 +578,11 @@ mod tests {
         let e = MixedEngine::new(
             primary,
             Some(pinyin_secondary()),
-            2,
-            10_000_000,
-            true,
-            true,
-            true,
-            false,
             None,
-            2,
-            false,
+            MixConfig {
+                top_code_override_pinyin: true,
+                ..Default::default()
+            },
         );
         assert_eq!(
             e.handle_top_code("wangb"),
@@ -620,15 +611,11 @@ mod tests {
         let e = MixedEngine::new(
             primary,
             None,
-            2,
-            10_000_000,
-            false,
-            true,
-            false,
-            false,
             Some(english),
-            2,
-            false,
+            MixConfig {
+                auto_commit_block_on_pinyin: false,
+                ..Default::default()
+            },
         );
         let r = e.convert("hel", 50).unwrap();
         assert!(
@@ -649,7 +636,15 @@ mod tests {
     fn mixed_no_english_when_disabled() {
         // english=None：不混入英文候选（零回归）。
         let primary = ct_engine(&[("hao", "好", 100)], false);
-        let e = MixedEngine::new(primary, None, 2, 10_000_000, false, true, false, false, None, 2, false);
+        let e = MixedEngine::new(
+            primary,
+            None,
+            None,
+            MixConfig {
+                auto_commit_block_on_pinyin: false,
+                ..Default::default()
+            },
+        );
         let r = e.convert("hel", 50).unwrap();
         assert!(
             !r.candidates.iter().any(|c| c.text == "hello"),
@@ -665,15 +660,12 @@ mod tests {
         let e = MixedEngine::new(
             primary,
             None,
-            2,
-            10_000_000,
-            false,
-            true,
-            false,
-            false,
             Some(english),
-            3,
-            false,
+            MixConfig {
+                auto_commit_block_on_pinyin: false,
+                min_english_length: 3,
+                ..Default::default()
+            },
         );
         let r2 = e.convert("he", 50).unwrap();
         assert!(
@@ -693,7 +685,14 @@ mod tests {
         let primary = ct_engine(&[("good", "工", 100)], true);
         let english = english_engine(&[("good", "good", 50), ("goodbye", "goodbye", 40)]);
         let e = MixedEngine::new(
-            primary, None, 2, 10_000_000, false, true, false, false, Some(english), 2, true,
+            primary,
+            None,
+            Some(english),
+            MixConfig {
+                auto_commit_block_on_pinyin: false,
+                auto_commit_block_on_english: true,
+                ..Default::default()
+            },
         );
         let r = e.convert("good", 50).unwrap();
         assert!(!r.should_commit, "开英文守护且有英文候选时应否决全码上屏");
@@ -709,7 +708,13 @@ mod tests {
         let primary = ct_engine(&[("good", "工", 100)], true);
         let english = english_engine(&[("good", "good", 50)]);
         let e = MixedEngine::new(
-            primary, None, 2, 10_000_000, false, true, false, false, Some(english), 2, false,
+            primary,
+            None,
+            Some(english),
+            MixConfig {
+                auto_commit_block_on_pinyin: false,
+                ..Default::default()
+            },
         );
         let r = e.convert("good", 50).unwrap();
         assert!(r.should_commit, "英文守护关时应放行全码上屏");

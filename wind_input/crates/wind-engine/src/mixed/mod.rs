@@ -4,4 +4,4 @@
 
 pub mod engine;
 
-pub use engine::MixedEngine;
+pub use engine::{MixConfig, MixedEngine};
