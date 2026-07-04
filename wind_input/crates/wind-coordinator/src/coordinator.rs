@@ -1366,6 +1366,13 @@ impl Coordinator {
         let _ = self
             .ui_tx
             .send(UiCommand::SetTooltipDelay(bundle.config.ui.tooltip.delay));
+        // 工具栏自动隐藏（ui.toolbar.auto_hide / auto_hide_delay 秒→毫秒；下限 1 秒防误设 0 即隐）。
+        // apply_ui_config 为启动(:717)与配置重载(:1270)共用单点，设置页改动即时生效。
+        let tb = &bundle.config.ui.toolbar;
+        let _ = self.ui_tx.send(UiCommand::SetToolbarAutoHide {
+            enabled: tb.auto_hide,
+            delay_ms: u64::from(tb.auto_hide_delay.max(1)) * 1000,
+        });
     }
 
     /// 当前活跃方案 ID（测试/诊断用）
