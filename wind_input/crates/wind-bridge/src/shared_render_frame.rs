@@ -52,6 +52,10 @@ pub fn encode_frame_into(dst: &mut [u8], p: &FrameParams) -> Result<(), FrameToo
 }
 
 pub fn encode_hidden_into(dst: &mut [u8], sequence: u32, target_instance_id: u32) {
+    assert!(
+        dst.len() >= SharedRenderHeader::SIZE,
+        "encode_hidden_into: dst 小于 SharedRenderHeader::SIZE"
+    );
     let mut hdr = SharedRenderHeader::new(0, 0, 0, 0, 0, 0);
     hdr.flags = 0;
     hdr.sequence = sequence;
@@ -110,5 +114,12 @@ mod tests {
             bgra: &bgra, rects: &[], rendered_hover_index: -1,
             target_instance_id: 1, software_shadow: false,
         }).is_err());
+    }
+
+    #[test]
+    #[should_panic(expected = "encode_hidden_into")]
+    fn hidden_into_undersized_dst_panics_with_contract_message() {
+        let mut dst = vec![0u8; 32];
+        encode_hidden_into(&mut dst, 1, 0);
     }
 }
