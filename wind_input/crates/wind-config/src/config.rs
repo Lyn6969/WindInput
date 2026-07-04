@@ -1412,14 +1412,18 @@ impl Default for StatsConfig {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CompatConfig {
-    #[serde(default)]
+    #[serde(default = "default_host_render_processes")]
     pub host_render_processes: Vec<String>,
+}
+
+fn default_host_render_processes() -> Vec<String> {
+    vec!["SearchHost.exe".to_string()]
 }
 
 impl Default for CompatConfig {
     fn default() -> Self {
         Self {
-            host_render_processes: vec!["SearchHost.exe".to_string()],
+            host_render_processes: default_host_render_processes(),
         }
     }
 }
@@ -2008,5 +2012,38 @@ smart_method = "delete_replace"
         let toml = r#"smart_mode = true"#;
         let cfg: SymbolConfig = toml::from_str(toml).unwrap();
         assert_eq!(cfg.smart_method, SmartMethod::HoldComposition);
+    }
+
+    #[test]
+    fn test_compat_host_render_processes_serde_default() {
+        // 验证反序列化时缺少 host_render_processes 字段时，使用具名默认函数
+        let cfg: CompatConfig = toml::from_str("").unwrap();
+        assert_eq!(
+            cfg.host_render_processes,
+            vec!["SearchHost.exe".to_string()],
+            "缺少 host_render_processes 时应返回默认值 [\"SearchHost.exe\"]"
+        );
+    }
+
+    #[test]
+    fn test_compat_host_render_processes_missing_in_merged_config() {
+        // 验证在三层合并中，缺少 [compat] 段时反序列化得到正确的默认值
+        let cfg = merged_with("");
+        assert_eq!(
+            cfg.compat.host_render_processes,
+            vec!["SearchHost.exe".to_string()],
+            "合并时缺少 [compat] 段时应保留默认值"
+        );
+    }
+
+    #[test]
+    fn test_compat_host_render_processes_explicit_in_merged_config() {
+        // 验证显式指定 host_render_processes 时的覆盖
+        let cfg = merged_with("[compat]\nhost_render_processes = [\"test.exe\"]\n");
+        assert_eq!(
+            cfg.compat.host_render_processes,
+            vec!["test.exe".to_string()],
+            "显式指定时应覆盖默认值"
+        );
     }
 }
