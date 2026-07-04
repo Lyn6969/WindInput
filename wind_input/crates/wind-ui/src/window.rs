@@ -140,6 +140,13 @@ mod platform {
         }
 
         pub fn update(&self) -> Result<(), String> {
+            self.update_with_alpha(255)
+        }
+
+        /// 以整窗常数 alpha 提交当前 buffer（淡出动画用）：
+        /// SourceConstantAlpha 与每像素 alpha（AC_SRC_ALPHA）按 UpdateLayeredWindow 语义叠乘，
+        /// 圆角/半透明背景不受影响；无需重绘像素。
+        pub fn update_with_alpha(&self, alpha: u8) -> Result<(), String> {
             unsafe {
                 let hdc_screen = GetDC(HWND::default());
                 let hdc_mem = CreateCompatibleDC(hdc_screen);
@@ -183,7 +190,7 @@ mod platform {
                 let blend = BLENDFUNCTION {
                     BlendOp: AC_SRC_OVER as u8,
                     BlendFlags: 0,
-                    SourceConstantAlpha: 255,
+                    SourceConstantAlpha: alpha,
                     AlphaFormat: AC_SRC_ALPHA as u8,
                 };
 
@@ -351,6 +358,10 @@ mod platform {
         }
 
         pub fn update(&self) -> Result<(), String> {
+            Ok(())
+        }
+
+        pub fn update_with_alpha(&self, _alpha: u8) -> Result<(), String> {
             Ok(())
         }
 
