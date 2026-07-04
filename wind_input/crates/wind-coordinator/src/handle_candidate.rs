@@ -494,9 +494,11 @@ impl Coordinator {
 
     /// 若 key_code 是配置的以词定字键，返回取字下标（0=取第 1 字，1=取第 2 字）。
     /// 默认 `select_char_keys` 为空 → 恒返回 None（功能禁用，零回归）。
+    /// 键组须用 select_char_vks 解析（支持 comma_period/minus_equal/brackets）；
+    /// select_key_vks 是次/三选键组（不含 brackets），误用会使 brackets 配置静默失效。
     pub(crate) fn select_char_index(&self, key_code: u32) -> Option<usize> {
         for group in &self.rt().config.keys.select_char_keys {
-            let vks = hotkey::select_key_vks(group);
+            let vks = hotkey::select_char_vks(group);
             if let Some(pos) = vks.iter().position(|vk| *vk == key_code) {
                 return Some(pos);
             }

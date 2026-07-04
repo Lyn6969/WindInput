@@ -1858,6 +1858,47 @@ fn test_select_char_first_and_second() {
 }
 
 #[test]
+fn test_select_char_brackets_group() {
+    if !has_schemas() {
+        return;
+    }
+    // 回归：select_char_index 曾误用选词键组解析（select_key_vks 不识别 brackets），
+    // 致配置 brackets 后 `[`/`]` 直接走标点流水线上屏【】。brackets 仅存在于
+    // select_char_vks，须用它解析。`[`(VK_OEM_4=0xDB) 取第 1 字，`]`(VK_OEM_6=0xDD) 取第 2 字。
+    let mut cfg = config_with("pinyin");
+    cfg.keys.select_char_keys = vec!["brackets".into()];
+    let coord = Coordinator::new_headless(cfg, Some(&data_dir()));
+    for c in "nihao".chars() {
+        press_letter(&coord, c);
+    }
+    let texts = coord.debug_page_texts();
+    if texts.is_empty() {
+        return;
+    }
+    let word: Vec<char> = texts[0].chars().collect();
+    if word.len() < 2 {
+        return; // 需高亮词 ≥ 2 字方能测第 1/第 2 字
+    }
+    // `[` → 取第 1 字
+    match coord.handle_key_event(&key_event(0xDB, EVENT_KEY_DOWN)) {
+        KeyAction::InsertText { text, .. } => {
+            assert_eq!(text, word[0].to_string(), "[ 应上屏高亮词第 1 字");
+        }
+        other => panic!("[ 应以词定字上屏第 1 字，实际: {:?}", other),
+    }
+    // 重新输入，`]` → 取第 2 字
+    for c in "nihao".chars() {
+        press_letter(&coord, c);
+    }
+    match coord.handle_key_event(&key_event(0xDD, EVENT_KEY_DOWN)) {
+        KeyAction::InsertText { text, .. } => {
+            assert_eq!(text, word[1].to_string(), "] 应上屏高亮词第 2 字");
+        }
+        other => panic!("] 应以词定字上屏第 2 字，实际: {:?}", other),
+    }
+}
+
+#[test]
 fn test_select_char_disabled_by_default() {
     if !has_schemas() {
         return;
