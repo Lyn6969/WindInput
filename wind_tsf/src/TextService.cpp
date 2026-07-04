@@ -481,8 +481,8 @@ private:
 class CUpdateCompositionEditSession : public ITfEditSession
 {
 public:
-    CUpdateCompositionEditSession(CTextService* pTextService, ITfContext* pContext, const std::wstring& text, int caretPos = -1)
-        : _refCount(1), _pTextService(pTextService), _pContext(pContext), _text(text), _caretPos(caretPos)
+    CUpdateCompositionEditSession(CTextService* pTextService, ITfContext* pContext, const std::wstring& text, int caretPos = -1, BOOL noUnderline = FALSE)
+        : _refCount(1), _pTextService(pTextService), _pContext(pContext), _text(text), _caretPos(caretPos), _noUnderline(noUnderline)
     {
         _pTextService->AddRef();
         _pContext->AddRef();
@@ -646,7 +646,8 @@ public:
     }
 
 private:
-    int _caretPos;  // Cursor position within composition (-1 = at end)
+    int _caretPos;         // Cursor position within composition (-1 = at end)
+    BOOL _noUnderline;     // 整段不设下划线属性（智能符号 HoldComposition 观感对齐已上屏）
 
     void _CacheCaretPosition(TfEditCookie ec)
     {
@@ -743,6 +744,15 @@ private:
         // 分段显示属性（对齐微软 IME）：组合头部的待提交前缀（顶码已顶出的字）
         // 不带下划线——先 Clear 整段，再只对余码段 SetValue。前缀为 0 时即整段。
         pDisplayAttrProp->Clear(ec, pRange);
+
+        // 整段无下划线模式（智能符号 HoldComposition）：中文符号留在组合态等待
+        // press2 替换/超时提交，但观感上应与已上屏文本一致——Clear 后不再设值。
+        if (_noUnderline)
+        {
+            WIND_LOG_DEBUG(L"Display attribute cleared (noUnderline mode)\n");
+            pDisplayAttrProp->Release();
+            return;
+        }
 
         LONG prefixLen = (LONG)_pTextService->GetPendingCommitPrefixLength();
         ITfRange* pAttrRange = nullptr;
@@ -4306,7 +4316,7 @@ void CTextService::_UnadviseTextEditSink()
 }
 
 // Update composition text
-BOOL CTextService::UpdateComposition(const std::wstring& text, int caretPos)
+BOOL CTextService::UpdateComposition(const std::wstring& text, int caretPos, BOOL noUnderline)
 {
     // 顶码聚合（微软 IME 行为）：组合实际显示 = 待提交前缀 + 引擎组合文本，
     // 光标位置随前缀偏移。前缀为空时与原行为完全一致。
@@ -4342,7 +4352,7 @@ BOOL CTextService::UpdateComposition(const std::wstring& text, int caretPos)
         return FALSE;
     }
 
-    CUpdateCompositionEditSession* pEditSession = new CUpdateCompositionEditSession(this, pContext, full, fullCaret);
+    CUpdateCompositionEditSession* pEditSession = new CUpdateCompositionEditSession(this, pContext, full, fullCaret, noUnderline);
 
     // Timing: measure RequestEditSession duration
     LARGE_INTEGER startTime, endTime, freq;
@@ -4772,8 +4782,9 @@ BOOL CTextService::HoldComposition(const std::wstring& text, UINT timeoutMs)
     // 若有残留的旧计时器，先提交旧符号再开启新组合（直接 Cancel 会丢失旧符号）。
     FlushHoldCompositionIfActive();
 
-    // 将中文符号放入 TSF 组合态（caretPos = 文本长度，光标置末）
-    if (!UpdateComposition(text, static_cast<int>(text.length())))
+    // 将中文符号放入 TSF 组合态（caretPos = 文本长度，光标置末）。
+    // noUnderline：符号观感与已上屏一致（预上屏），实际仍在组合态内可替换。
+    if (!UpdateComposition(text, static_cast<int>(text.length()), TRUE))
     {
         WIND_LOG_ERROR(L"HoldComposition: UpdateComposition failed\n");
         return FALSE;

@@ -132,7 +132,9 @@ public:
     BOOL InsertText(const std::wstring& text);
 
     // Update composition text (Inline Composition)
-    BOOL UpdateComposition(const std::wstring& text, int caretPos);
+    // noUnderline: 整段不设下划线显示属性（智能符号 HoldComposition 用，
+    // 观感与已上屏文本一致；文本仍在组合态内，可被 press2 替换/超时提交）。
+    BOOL UpdateComposition(const std::wstring& text, int caretPos, BOOL noUnderline = FALSE);
 
     // Commit text atomically (end composition + insert text in one EditSession)
     BOOL CommitText(const std::wstring& text);
