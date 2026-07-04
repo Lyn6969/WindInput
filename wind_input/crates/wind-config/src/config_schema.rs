@@ -121,6 +121,7 @@ static REGISTRY: &[ConfigField] = &[
     f("input.numpad_behavior", Str),
     // 启动默认状态（原 general 域）
     f("input.default.remember_last_state", Bool),
+    f("input.default.state_scope", Enum(&["global", "app"])),
     f("input.default.chinese_mode", Bool),
     f("input.default.full_width", Bool),
     f("input.default.chinese_punct", Bool),

@@ -74,7 +74,8 @@ pub struct Config {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct InputDefaultConfig {
-    #[serde(default = "default_true")]
+    /// 记忆前次状态：true=启动/激活时恢复上次的中英/全半角/标点；false=每次激活重置为下方默认值。
+    #[serde(default)]
     pub remember_last_state: bool,
     #[serde(default = "default_true")]
     pub chinese_mode: bool,
@@ -82,6 +83,20 @@ pub struct InputDefaultConfig {
     pub full_width: bool,
     #[serde(default = "default_true")]
     pub chinese_punct: bool,
+    /// 中英状态作用域："global"（全局统一，默认）| "app"（按应用独立记忆，会话级）。
+    #[serde(default = "default_state_scope")]
+    pub state_scope: String,
+}
+
+fn default_state_scope() -> String {
+    "global".to_string()
+}
+
+impl InputDefaultConfig {
+    /// 中英状态是否按应用独立记忆（state_scope == "app"）。
+    pub fn per_app_scope(&self) -> bool {
+        self.state_scope.eq_ignore_ascii_case("app")
+    }
 }
 
 impl Default for InputDefaultConfig {
@@ -91,6 +106,7 @@ impl Default for InputDefaultConfig {
             chinese_mode: true,
             full_width: false,
             chinese_punct: true,
+            state_scope: default_state_scope(),
         }
     }
 }
@@ -1706,6 +1722,23 @@ impl Config {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// input.default 新增项与既有语义：state_scope 默认 global、remember 默认 false。
+    #[test]
+    fn input_default_state_scope_defaults() {
+        let d = InputDefaultConfig::default();
+        assert_eq!(d.state_scope, "global");
+        assert!(!d.per_app_scope());
+        assert!(!d.remember_last_state);
+        // 缺字段的旧 config.toml 反序列化与 Default 一致。
+        let parsed: InputDefaultConfig = toml::from_str("").unwrap();
+        assert_eq!(parsed.state_scope, "global");
+        assert!(!parsed.remember_last_state);
+        assert!(parsed.chinese_mode);
+        // scope 解析大小写不敏感。
+        let parsed: InputDefaultConfig = toml::from_str("state_scope = \"App\"").unwrap();
+        assert!(parsed.per_app_scope());
+    }
 
     #[test]
     fn set_nested_creates_overwrites_and_preserves() {

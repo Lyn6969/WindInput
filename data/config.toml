@@ -79,6 +79,8 @@ remember_last_state = false
 chinese_mode = true
 full_width = false
 chinese_punct = true
+# 中英状态作用域："global"=所有应用共享（默认）；"app"=每个应用各自记忆中英文（会话级）
+state_scope = "global"
 
 # 标点：随中英、数字后智能英文标点、自定义映射
 [input.punct]
