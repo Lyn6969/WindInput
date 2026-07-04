@@ -142,12 +142,8 @@ impl MessageHandler for DeferredHandler {
         self.with_handler(None, |h| h.handle_commit_request(data))
     }
 
-    fn handle_host_render_request(&self) {
-        self.with_handler((), |h| h.handle_host_render_request())
-    }
-
-    fn handle_host_render_ready(&self) {
-        self.with_handler((), |h| h.handle_host_render_ready())
+    fn handle_host_render_failed(&self, reason: u32) {
+        self.with_handler((), |h| h.handle_host_render_failed(reason))
     }
 
     fn get_current_mode(&self) -> (bool, bool) {

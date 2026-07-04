@@ -145,7 +145,18 @@ fn main() {
         suffix: pipe_suffix.to_string(),
         request_timeout_ms: 1000,
     };
+    // host-render 管理器（Windows）：白名单取自 compat.host_render_processes。
+    // 同一 Arc 实例同时注入 BridgeServer（连接循环 setup/清理）与 Coordinator（写帧/隐藏）。
+    #[cfg(windows)]
+    let host_render = {
+        let whitelist = wind_config::Config::load(wind_config::Config::data_dir().as_deref())
+            .map(|c| c.compat.host_render_processes)
+            .unwrap_or_default();
+        wind_bridge::host_render_windows::HostRenderManager::new(pipe_suffix, whitelist)
+    };
     let bridge = BridgeServer::new(bridge_config, deferred.clone());
+    #[cfg(windows)]
+    let bridge = bridge.with_host_render(host_render.clone());
 
     // 7. 启动 Bridge 服务器
     runtime.block_on(async {
@@ -160,6 +171,9 @@ fn main() {
 
     // 9. 创建中央协调器（传入 PushServer 用于激活状态推送）
     let coordinator = wind_coordinator::Coordinator::new(push_server.clone());
+    // 注入 host-render 管理器（与 BridgeServer 共享同一实例），供后续写帧/隐藏使用。
+    #[cfg(windows)]
+    coordinator.set_host_render(host_render.clone());
     let coord_for_web = coordinator.clone();
     deferred.set_ready(coordinator);
 

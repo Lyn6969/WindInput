@@ -218,11 +218,10 @@ pub trait MessageHandler: Send + Sync {
     /// 处理提交请求（barrier 机制）
     fn handle_commit_request(&self, data: &CommitRequestData) -> Option<CommitResultData>;
 
-    /// 处理 Host Render 请求
-    fn handle_host_render_request(&self);
-
-    /// Host Render 就绪回调
-    fn handle_host_render_ready(&self);
+    /// 处理 Host Render 失败上报（DLL 侧初始化/SHM 映射失败等，reason 为失败码）。
+    /// setup 应答与断线清理由 bridge 服务器直接经 HostRenderManager 完成，不经此 trait；
+    /// 此回调仅用于让协调器记录/告警。默认空实现。
+    fn handle_host_render_failed(&self, _reason: u32) {}
 
     /// 显示功能主菜单（任务栏输入法指示右键）。x/y 为屏幕坐标；
     /// i32::MIN 表示坐标缺失（由 UI 取光标位置）。默认空实现。

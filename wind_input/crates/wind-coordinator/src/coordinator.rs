@@ -525,6 +525,13 @@ pub struct Coordinator {
     /// 全屏状态缓存：由 notify_toolbar_async 在后台线程异步刷新，notify_toolbar 直接读取，
     /// 消除 bridge handler 线程上的 SHQueryUserNotificationState 阻塞。
     pub(crate) fullscreen_cached: std::sync::atomic::AtomicBool,
+    /// host-render 管理器（Windows）：与 `BridgeServer` 共享同一 `Arc` 实例。
+    /// 服务入口经 `set_host_render` 注入一次；Task 6/7 据此写候选/工具提示/状态帧并隐藏。
+    /// 采用 `OnceLock`（与 `self_weak`/`cmdbar_services` 同一构造后注入惯例），
+    /// 避免为其贯穿 `new`/`new_headless` 等构造器签名。
+    #[cfg(windows)]
+    #[allow(dead_code)] // Task 6/7 接线写帧/隐藏后即被读取
+    host_render: std::sync::OnceLock<Arc<wind_bridge::host_render_windows::HostRenderManager>>,
 }
 
 /// 短语候选权重基准（高于普通候选，使短语展开排在前列）
@@ -704,6 +711,25 @@ impl Coordinator {
         // 使首次启动即按 config 应用（与 reload_user_config 同一路径）。
         coordinator.apply_ui_config();
         coordinator
+    }
+
+    /// 注入 host-render 管理器（Windows）。服务入口在构造 `BridgeServer` 后调用一次，
+    /// 与其共享同一 `Arc` 实例。重复注入静默忽略（`OnceLock` 语义）。
+    #[cfg(windows)]
+    pub fn set_host_render(
+        &self,
+        mgr: Arc<wind_bridge::host_render_windows::HostRenderManager>,
+    ) {
+        let _ = self.host_render.set(mgr);
+    }
+
+    /// 取已注入的 host-render 管理器（Windows）；未注入返回 None。供 Task 6/7 写帧/隐藏。
+    #[cfg(windows)]
+    #[allow(dead_code)]
+    pub(crate) fn host_render(
+        &self,
+    ) -> Option<&Arc<wind_bridge::host_render_windows::HostRenderManager>> {
+        self.host_render.get()
     }
 
     /// 无头构造器（测试用）：跳过 UI 线程，不做词频持久化（避免污染真实文件）。
@@ -968,6 +994,8 @@ impl Coordinator {
             stat_collector,
             stat_recorded: std::sync::atomic::AtomicBool::new(false),
             fullscreen_cached: std::sync::atomic::AtomicBool::new(false),
+            #[cfg(windows)]
+            host_render: std::sync::OnceLock::new(),
         });
         // 命令栏：装配 Services（ime/config/dict 后端）+ 自身 Weak 引用。
         coordinator.init_cmdbar();
@@ -3761,8 +3789,10 @@ impl MessageHandler for Coordinator {
         })
     }
 
-    fn handle_host_render_request(&self) {}
-    fn handle_host_render_ready(&self) {}
+    fn handle_host_render_failed(&self, reason: u32) {
+        // DLL 侧 host-render 初始化/映射失败：记录告警。后续（Task 6/7）可据此回退渲染路径。
+        warn!("host-render 失败上报 reason={reason}（DLL 退回进程内渲染）");
+    }
 }
 
 /// 对 SystemPhraseEntry 列表做稳定内容哈希（用于启动时判断 TOML 是否有变更）。
