@@ -109,9 +109,11 @@ static REGISTRY: &[ConfigField] = &[
     f("schema.mix.top_code_override_pinyin", Bool),
     f("schema.mix.auto_commit_block_on_pinyin", Bool),
     f("schema.mix.min_pinyin_length", Int),
+    f("schema.mix.min_english_length", Int),
     f("schema.quick_input.enabled", Bool),
     f("schema.quick_input.decimal_places", Int),
     f("schema.quick_input.force_vertical", Bool),
+    f("schema.quick_input.enable_english", Bool),
     f("schema.special_modes", StructList),
     f("schema.mix_modes", StructList),
     // -- input（输入行为）--

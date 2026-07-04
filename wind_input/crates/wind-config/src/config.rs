@@ -401,6 +401,9 @@ pub struct MixGlobal {
     /// 拼音最小触发长度（0=回退 2）。
     #[serde(default)]
     pub min_pinyin_length: usize,
+    /// 英文最小触发长度（0=回退 3，即 2 字符以内不查英文；预留可配）。
+    #[serde(default)]
+    pub min_english_length: usize,
 }
 
 impl Default for MixGlobal {
@@ -412,6 +415,7 @@ impl Default for MixGlobal {
             top_code_override_pinyin: false,
             auto_commit_block_on_pinyin: true,
             min_pinyin_length: 0,
+            min_english_length: 0,
         }
     }
 }
@@ -455,6 +459,10 @@ pub struct QuickInputConfig {
     /// 强制竖排显示：进入快捷输入时切竖排候选，退出恢复原布局。
     #[serde(default)]
     pub force_vertical: bool,
+    /// 快捷（融合）模式是否混入英文候选（english 成员）。默认开启（低优先级排在拼音后）。
+    /// 独立于混输的 schema.mix.enable_english。
+    #[serde(default = "default_true")]
+    pub enable_english: bool,
 }
 
 fn default_decimal_places() -> i32 {
@@ -467,6 +475,7 @@ impl Default for QuickInputConfig {
             enabled: true,
             decimal_places: default_decimal_places(),
             force_vertical: false,
+            enable_english: true,
         }
     }
 }

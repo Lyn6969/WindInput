@@ -1,0 +1,32 @@
+[schema]
+id = "english"
+name = "英文"
+icon_label = "英"
+version = "1.0"
+author = "内置"
+description = "英文词库（临时英文 / 融合英文候选用，非独立可切换方案）"
+# 隐藏方案：不在设置页「方案管理」列出，也不进循环切换；仅供懒加载引用。
+hidden = true
+
+[engine]
+type = "english"
+
+[engine.codetable]
+# 英文词最长安全上界（前缀匹配用；english 引擎不触发顶码/自动上屏）。
+max_code_length = 32
+
+# 词库数据由构建 assemble 从 .cache/rime-frost/en_dicts 注入 english/，不进 git。
+# type = "english"：code 列小写化，大小写不敏感前缀匹配（输入 hel → hello/help）。
+[[dictionaries]]
+id = "en_main"
+label = "英文主词库"
+path = "english/en.dict.yaml"
+type = "english"
+default = true
+
+[[dictionaries]]
+id = "en_ext"
+label = "英文扩展词库"
+path = "english/en_ext.dict.yaml"
+type = "english"
+default_enabled = true

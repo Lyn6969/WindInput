@@ -55,6 +55,8 @@ impl Coordinator {
     /// mix 模式可加载的成员方案列表（过滤空/不可加载）。
     /// mix 可用的真实方案成员（过滤空 / 不可加载 / 内置 quick_input）。
     pub(crate) fn mix_members(&self, idx: u8) -> Vec<String> {
+        // 快捷英文候选关时，english 成员不计入（与 update_mix_candidates 一致，读快捷开关）。
+        let enable_english = self.rt().config.schema.quick_input.enable_english;
         self.rt()
             .config
             .schema
@@ -64,7 +66,10 @@ impl Coordinator {
                 m.members
                     .iter()
                     .filter(|s| {
-                        !s.is_empty() && *s != "quick_input" && self.engine_mgr.ensure_schema(s)
+                        !s.is_empty()
+                            && *s != "quick_input"
+                            && (*s != "english" || enable_english)
+                            && self.engine_mgr.ensure_schema(s)
                     })
                     .cloned()
                     .collect()
@@ -630,6 +635,9 @@ impl Coordinator {
             .get(state.mix_id as usize)
             .map(|m| m.members.clone())
             .unwrap_or_default();
+        // 快捷英文候选开关（schema.quick_input.enable_english）：关时快捷/融合不纳入 english 成员。
+        // 独立于混输的 schema.mix.enable_english（那个控制 MixedEngine 码表+拼音混输）。
+        let enable_english = self.rt().config.schema.quick_input.enable_english;
         let mut cands: Vec<Candidate> = Vec::new();
         let mut seen = std::collections::HashSet::new();
         // 文本透镜：取首个真实方案的 preedit_display（拼音含音节分隔 "ni hao"）作组合区显示。
@@ -651,6 +659,9 @@ impl Coordinator {
             } else {
                 if numeric {
                     continue; // 数字模式跳过真实方案（表达式无拼音/英文意义）
+                }
+                if member == "english" && !enable_english {
+                    continue; // 英文候选总开关关：跳过 english 成员
                 }
                 if !self.engine_mgr.ensure_schema(member) {
                     continue;

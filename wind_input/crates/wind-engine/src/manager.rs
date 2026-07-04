@@ -410,6 +410,17 @@ impl EngineManager {
         }
     }
 
+    /// 读取 schema 的隐藏标志（[schema].hidden）：隐藏方案不在设置页「方案管理」列出。
+    fn schema_hidden(
+        schema_id: &str,
+        data_dir: Option<&Path>,
+        override_dir: Option<&Path>,
+    ) -> bool {
+        Self::read_schema(schema_id, data_dir, override_dir)
+            .map(|s| s.schema.hidden)
+            .unwrap_or(false)
+    }
+
     /// 确保指定方案引擎已加载；返回是否可用
     /// 某方案引擎是否已加载（已就绪，切换即时无构建）。
     pub fn is_loaded(&self, schema_id: &str) -> bool {
@@ -550,8 +561,10 @@ impl EngineManager {
                 if let Some(id) = fname_str.strip_suffix(".schema.toml") {
                     let id = id.to_string();
                     if !ids.contains(&id) {
-                        // 只加入受支持的方案
-                        if Self::schema_supported(&id, Some(data_dir), self.override_dir.as_deref())
+                        // 只加入受支持且非隐藏的方案（隐藏方案如 english 仅供懒加载引用）
+                        let ov = self.override_dir.as_deref();
+                        if Self::schema_supported(&id, Some(data_dir), ov)
+                            && !Self::schema_hidden(&id, Some(data_dir), ov)
                         {
                             ids.push(id);
                         }
@@ -1222,9 +1235,34 @@ impl EngineManager {
                 2
             };
             let block_on_pinyin = mix_cfg.auto_commit_block_on_pinyin;
+            // 英文候选（schema.mix.enable_english）：开启时懒加载 english 词库引擎混入混输候选。
+            // 走 build_engine("english") → EnglishEngine（词库缺失则 None，静默退化为无英文）。
+            // 开关热切换经 reload_from_config 的 engines.clear() 重建混输引擎自然生效。
+            let english = if mix_cfg.enable_english {
+                Self::build_engine(
+                    "english",
+                    Some(data_dir),
+                    store.clone(),
+                    codetable_cfg,
+                    mix_cfg,
+                    override_dir,
+                    pinyin_cfg,
+                )
+            } else {
+                None
+            };
+            // 英文最小触发长度（0=回退 3，即 2 字符以内不查英文）。
+            let min_en = if mix_cfg.min_english_length > 0 {
+                mix_cfg.min_english_length
+            } else {
+                3
+            };
             info!(
-                "Built mixed engine {} (primary={}, secondary={})",
-                schema_id, m.primary_schema, m.secondary_schema
+                "Built mixed engine {} (primary={}, secondary={}, english={})",
+                schema_id,
+                m.primary_schema,
+                m.secondary_schema,
+                english.is_some()
             );
             return Some(Box::new(crate::mixed::MixedEngine::new(
                 primary,
@@ -1235,6 +1273,38 @@ impl EngineManager {
                 mix_cfg.pinyin_only_overflow,
                 mix_cfg.top_code_override_pinyin,
                 mix_cfg.show_source_hint,
+                english,
+                min_en,
+            )));
+        }
+
+        // 英文方案：复用码表词典加载 + 前缀查询，但包成独立 EnglishEngine（EngineType::English）。
+        // 关闭自动上屏 / 顶码 / 编码提示（英文词变长，无满码顶字语义）；词库以 type="english"
+        // 声明（code 列小写化，大小写不敏感前缀匹配）。供临时英文 / 融合英文候选懒加载。
+        if schema.engine.engine_type.eq_ignore_ascii_case("english") {
+            let layers = Self::load_codetable_layers(&schema, &schemas);
+            if layers.is_empty() {
+                warn!("No usable english dictionary for schema {}", schema_id);
+                return None;
+            }
+            // 英文暂不挂用户词 / 临时词层（无造词学习），仅系统词库层。
+            let dm = wind_dict::DictManager::new();
+            for (name, dict, enabled) in layers {
+                dm.register_layer(Box::new(wind_dict::SystemDictLayer::with_enabled(
+                    dict, name, enabled,
+                )));
+            }
+            // 英文最大码长取词库最长词的安全上界（前缀匹配用，不触发顶码/自动上屏）。
+            let mcl = if schema.engine.codetable.max_code_length > 0 {
+                schema.engine.codetable.max_code_length
+            } else {
+                32
+            };
+            // 全 false：无自动上屏 / 顶码 / 编码提示，纯前缀查词。
+            let commit_opts = crate::codetable::CommitOptions::default();
+            info!("Built english engine {}", schema_id);
+            return Some(Box::new(crate::english::EnglishEngine::new(
+                CodeTableEngine::new(mcl, commit_opts, Arc::new(dm)),
             )));
         }
 

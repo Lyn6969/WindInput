@@ -36,6 +36,10 @@ pub struct SchemaInfo {
     pub author: String,
     #[serde(default)]
     pub description: String,
+    /// 隐藏方案：不在设置页「方案管理」列出，也不进循环切换。
+    /// 用于内部 / 被引用的词库配置方案（如 english——仅供临时英文 / 融合英文候选懒加载）。
+    #[serde(default)]
+    pub hidden: bool,
 }
 
 /// 引擎配置（[engine]）

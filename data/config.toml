@@ -60,12 +60,16 @@ pinyin_only_overflow = true
 top_code_override_pinyin = false
 auto_commit_block_on_pinyin = false
 min_pinyin_length = 2
+# 英文最小触发长度（2 字符以内不查英文；0=回退 3）。
+min_english_length = 3
 
 [schema.quick_input]
 # 注：; 由内置 mix「快捷」融合接管（quick_input 作为其成员，同时支持日期/计算/拼音/英文）。
 enabled = true
 force_vertical = true
 decimal_places = 6
+# 快捷（融合）模式混入英文候选（低优先级排在拼音后）；独立于 schema.mix.enable_english。
+enable_english = true
 
 [input]
 filter_mode = "smart"

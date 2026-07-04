@@ -18,6 +18,11 @@ const PHRASE_WEIGHT_BOOST: i32 = 1_000_000;
 const PARTIAL_MATCH_BOOST: i32 = 500_000;
 /// 拼音候选归一化系数（÷ 后落入低档）
 const PINYIN_TIER_SCALE: i32 = 100;
+/// 英文精确匹配（整词 code==input）提权：完整英文词可靠前，但低于码表精确/短语档。
+const ENGLISH_EXACT_BOOST: i32 = 500_000;
+/// 英文前缀补全提权：不额外提权（保留词库原始权重），使前缀英文沉在码表/拼音候选之后，
+/// 避免短前缀（如「d」）刷屏。真机若仍偏高可继续下调。
+const ENGLISH_PREFIX_BOOST: i32 = 0;
 
 /// 混合引擎
 pub struct MixedEngine {
@@ -42,6 +47,11 @@ pub struct MixedEngine {
     /// 候选来源标记（对齐 Go addSourceHints）：true 时给拼音候选 comment 加「拼」前缀，
     /// 帮助用户区分混输候选来源。默认 false（零回归）。
     show_source_hint: bool,
+    /// 英文词库引擎（schema.mix.enable_english 开且 english 方案可加载时为 Some）。
+    /// 混输各路径按精确/前缀加权混入英文候选；None = 关闭（零开销）。
+    english: Option<Box<dyn Engine>>,
+    /// 英文最小触发长度：输入短于此值时不查英文（2 字符以内不匹配 → 默认 3）。
+    min_english_length: usize,
 }
 
 impl MixedEngine {
@@ -55,6 +65,8 @@ impl MixedEngine {
         pinyin_only_overflow: bool,
         top_code_override_pinyin: bool,
         show_source_hint: bool,
+        english: Option<Box<dyn Engine>>,
+        min_english_length: usize,
     ) -> Self {
         let max_code_len = primary.max_code_length();
         Self {
@@ -67,6 +79,8 @@ impl MixedEngine {
             top_code_override_pinyin,
             max_code_len,
             show_source_hint,
+            english,
+            min_english_length,
         }
     }
 
@@ -134,6 +148,33 @@ impl MixedEngine {
         }
     }
 
+    /// 英文候选（enable_english 开时）：查英文词库，按精确(整词)/前缀独立加权，供混入合并。
+    /// 英文档独立于拼音（不被 ÷100 降档）：精确 +5e6、前缀 +1e6（对齐 Go）。
+    /// `english` 为 None（关闭）时返回空。输入小写化以匹配英文词库（code 列已小写化）。
+    fn english_candidates(&self, input: &str, max_candidates: usize) -> Vec<Candidate> {
+        let Some(eng) = &self.english else {
+            return Vec::new();
+        };
+        // 英文最小长度：短输入（默认 2 字符以内）不查英文，避免短前缀刷屏（对齐拼音 min 思路）。
+        if input.chars().count() < self.min_english_length {
+            return Vec::new();
+        }
+        let lower = input.to_lowercase();
+        let Ok(r) = eng.convert(&lower, max_candidates) else {
+            return Vec::new();
+        };
+        let mut out = r.candidates;
+        for c in &mut out {
+            let boost = if c.code == lower {
+                ENGLISH_EXACT_BOOST
+            } else {
+                ENGLISH_PREFIX_BOOST
+            };
+            c.weight = c.weight.saturating_add(boost);
+        }
+        out
+    }
+
     /// 超长输入（input_len > max_code_len）分支：按 pinyin_only_overflow 分流。
     /// - true（默认）：仅查拼音；长码特例下（完整 input 有精确/更长后继）追加码表候选。
     /// - false：码表取前 N 码（+ 长码特例追加完整 input）+ 拼音完整输入，混合竞争。
@@ -152,6 +193,8 @@ impl MixedEngine {
             let py = sec.convert(input, max_candidates).unwrap_or_default();
             let pinyin_preedit = Self::pinyin_preedit_of(&py);
             let mut pinyin = py.candidates;
+            // 英文候选（enable_english 开时）：独立加权档，与拼音/码表统一混入（对齐 Go 各路径处理英文）。
+            let english = self.english_candidates(input, max_candidates);
             // 长码特例：完整 input 在码表有精确/更长后继 → 追加码表候选，拼音归一化降档避免档位重叠。
             let mut merged = if has_full_or_longer {
                 Self::normalize_pinyin(&mut pinyin);
@@ -161,7 +204,12 @@ impl MixedEngine {
                     .unwrap_or_default()
                     .candidates;
                 self.boost_codetable(&mut ct, input);
+                ct.extend(english);
                 Self::merge_sort_dedup(ct, pinyin, max_candidates)
+            } else if !english.is_empty() {
+                // 纯拼音 + 英文：拼音归一化降档，英文独立档排前。
+                Self::normalize_pinyin(&mut pinyin);
+                Self::merge_sort_dedup(english, pinyin, max_candidates)
             } else {
                 pinyin
             };
@@ -192,6 +240,8 @@ impl MixedEngine {
                 codetable.extend(full.candidates);
             }
             self.boost_codetable(&mut codetable, &prefix);
+            // 英文候选（enable_english 开时）：独立加权档并入码表位，与拼音一同竞争。
+            codetable.extend(self.english_candidates(input, max_candidates));
             let py = sec.convert(input, max_candidates).unwrap_or_default();
             let pinyin_preedit = Self::pinyin_preedit_of(&py);
             let mut pinyin = py.candidates;
@@ -274,10 +324,12 @@ impl Engine for MixedEngine {
             }
         }
 
-        // 3. 合并（码表在前，拼音在后）→ 按权重稳定排序 → 按文本去重
+        // 3. 合并（码表在前，拼音在后，英文独立档混入）→ 按权重稳定排序 → 按文本去重
         let has_pinyin = !pinyin.is_empty();
         let mut merged = codetable;
         merged.extend(pinyin);
+        // 英文候选（enable_english 开时）：独立加权档混入，与码表/拼音一同竞争排序。
+        merged.extend(self.english_candidates(input, max_candidates));
         merged.sort_by(|a, b| {
             b.weight
                 .cmp(&a.weight)
@@ -390,7 +442,7 @@ mod tests {
     fn mixed_propagates_auto_commit_without_pinyin() {
         // 主码表唯一全码自动上屏；无次引擎 → 无拼音候选 → 放行。
         let primary = ct_engine(&[("aaaa", "工", 100)], true);
-        let e = MixedEngine::new(primary, None, 2, 10_000_000, true, true, false, false);
+        let e = MixedEngine::new(primary, None, 2, 10_000_000, true, true, false, false, None, 2);
         let r = e.convert("aaaa", 50).unwrap();
         assert!(r.should_commit, "无拼音候选时应放行全码上屏");
         assert_eq!(r.commit_text, "工");
@@ -410,6 +462,8 @@ mod tests {
             true,
             false,
             false,
+            None,
+            2,
         );
         let r = e.convert("aaaa", 50).unwrap();
         assert!(!r.should_commit, "有拼音候选且守护开时应否决全码上屏");
@@ -429,6 +483,8 @@ mod tests {
             true,
             false,
             false,
+            None,
+            2,
         );
         let r = e.convert("aaaa", 50).unwrap();
         assert!(r.should_commit, "守护关时应放行");
@@ -471,6 +527,8 @@ mod tests {
             true,
             false,
             false,
+            None,
+            2,
         );
         assert_eq!(
             e.handle_top_code("wangb"),
@@ -518,11 +576,98 @@ mod tests {
             true,
             true,
             false,
+            None,
+            2,
         );
         assert_eq!(
             e.handle_top_code("wangb"),
             Some(("王".to_string(), "b".to_string())),
             "override 开 + 整音节歧义全码应放行顶码"
+        );
+    }
+
+    /// 内存英文引擎（EnglishEngine 包码表；code=小写英文词，前缀匹配）。
+    fn english_engine(entries: &[(&str, &str, i32)]) -> Box<dyn Engine> {
+        let mut d = CodetableDict::empty();
+        for (i, (code, text, w)) in entries.iter().enumerate() {
+            d.merge_single(code.to_string(), text.to_string(), *w, i as i32);
+        }
+        let dm = DictManager::new();
+        dm.register_layer(Box::new(SystemDictLayer::new(CachedDict::Memory(d), "en")));
+        let ct = CodeTableEngine::new(32, CommitOptions::default(), Arc::new(dm));
+        Box::new(crate::english::EnglishEngine::new(ct))
+    }
+
+    #[test]
+    fn mixed_mixes_english_when_enabled() {
+        // enable_english（english=Some）：混输主路径应混入英文词库候选（前缀匹配）。
+        let primary = ct_engine(&[("hao", "好", 100)], false);
+        let english = english_engine(&[("hello", "hello", 50), ("help", "help", 40)]);
+        let e = MixedEngine::new(
+            primary,
+            None,
+            2,
+            10_000_000,
+            false,
+            true,
+            false,
+            false,
+            Some(english),
+            2,
+        );
+        let r = e.convert("hel", 50).unwrap();
+        assert!(
+            r.candidates.iter().any(|c| c.text == "hello"),
+            "开启英文时混输应含英文候选 hello，实际: {:?}",
+            r.candidates.iter().map(|c| &c.text).collect::<Vec<_>>()
+        );
+        assert!(
+            r.candidates
+                .iter()
+                .filter(|c| c.text == "hello" || c.text == "help")
+                .all(|c| c.source == CandidateSource::English),
+            "英文候选来源应标记 English"
+        );
+    }
+
+    #[test]
+    fn mixed_no_english_when_disabled() {
+        // english=None：不混入英文候选（零回归）。
+        let primary = ct_engine(&[("hao", "好", 100)], false);
+        let e = MixedEngine::new(primary, None, 2, 10_000_000, false, true, false, false, None, 2);
+        let r = e.convert("hel", 50).unwrap();
+        assert!(
+            !r.candidates.iter().any(|c| c.text == "hello"),
+            "关闭英文时不应有英文候选"
+        );
+    }
+
+    #[test]
+    fn mixed_english_respects_min_length() {
+        // min_english_length=3：2 字符以内不查英文，3 字符起才混入。
+        let primary = ct_engine(&[("x", "叉", 100)], false);
+        let english = english_engine(&[("hello", "hello", 50)]);
+        let e = MixedEngine::new(
+            primary,
+            None,
+            2,
+            10_000_000,
+            false,
+            true,
+            false,
+            false,
+            Some(english),
+            3,
+        );
+        let r2 = e.convert("he", 50).unwrap();
+        assert!(
+            !r2.candidates.iter().any(|c| c.text == "hello"),
+            "2 字符（< min 3）不应出英文候选"
+        );
+        let r3 = e.convert("hel", 50).unwrap();
+        assert!(
+            r3.candidates.iter().any(|c| c.text == "hello"),
+            "3 字符（>= min 3）应出英文候选"
         );
     }
 }

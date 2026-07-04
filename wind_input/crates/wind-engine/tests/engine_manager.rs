@@ -23,6 +23,53 @@ fn schema_exists(dir: &std::path::Path, id: &str) -> bool {
         || dir.join(format!("schemas/{}.schema.yaml", id)).exists()
 }
 
+/// english 方案（隐藏，懒加载）：ensure_schema 应可加载，convert_with 前缀查词命中，
+/// 候选来源标记为 English，且无自动上屏。词库/schema 缺失时跳过。
+#[test]
+fn test_english_schema_lazy_loads_and_converts() {
+    // build_dev 可能位于 wind_input/build_dev（data_dir()）或产品仓根 build_dev；两处都试。
+    let dir = [
+        data_dir(),
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../../build_dev/data"),
+    ]
+    .into_iter()
+    .find(|d| d.join("schemas/english/en.dict.yaml").exists())
+    .unwrap_or_else(data_dir);
+    if !schema_exists(&dir, "english") || !dir.join("schemas/english/en.dict.yaml").exists() {
+        eprintln!("跳过：english schema/词库不存在");
+        return;
+    }
+    // 活跃方案用 wubi86；english 仅作隐藏方案懒加载（不在 available）。
+    let cfg = make_config(&["wubi86"]);
+    let mgr = EngineManager::new(&cfg, Some(&dir));
+
+    assert!(mgr.ensure_schema("english"), "english 方案应可懒加载");
+
+    let result = mgr.convert_with("english", "hel", 50);
+    assert!(!result.candidates.is_empty(), "english 'hel' 应产出前缀候选");
+    assert!(
+        result
+            .candidates
+            .iter()
+            .any(|c| c.text.eq_ignore_ascii_case("hello")),
+        "应包含 hello，实际前几个: {:?}",
+        result
+            .candidates
+            .iter()
+            .take(5)
+            .map(|c| &c.text)
+            .collect::<Vec<_>>()
+    );
+    assert!(
+        result
+            .candidates
+            .iter()
+            .all(|c| c.source == wind_candidate::CandidateSource::English),
+        "english 候选来源应全部标记为 English"
+    );
+    assert!(!result.should_commit, "english 不应自动上屏");
+}
+
 #[test]
 fn test_wubi_engine_candidates() {
     let dir = data_dir();

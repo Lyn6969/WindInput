@@ -4,6 +4,7 @@
 
 pub mod codetable;
 pub mod engine;
+pub mod english;
 pub mod freq_rerank;
 pub mod manager;
 pub mod mixed;
@@ -11,5 +12,6 @@ pub mod pinyin;
 
 pub use codetable::CodeTableEngine;
 pub use engine::{ConvertResult, Engine, EngineType, ExtendedEngine};
+pub use english::EnglishEngine;
 pub use manager::{EngineManager, FreqSettings, FreqStrategy};
 pub use pinyin::PinyinEngine;

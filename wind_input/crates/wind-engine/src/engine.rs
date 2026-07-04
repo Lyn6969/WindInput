@@ -10,6 +10,8 @@ pub enum EngineType {
     Pinyin,
     CodeTable,
     Mixed,
+    /// 英文引擎（复用码表查询，独立类型便于英文专属路由/演化）。
+    English,
 }
 
 /// 引擎转换结果
