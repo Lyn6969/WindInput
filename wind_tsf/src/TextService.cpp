@@ -1080,6 +1080,13 @@ STDAPI CTextService::Deactivate()
 {
     WIND_LOG_INFO(L"TextService::Deactivate called\n");
 
+    // 最先注销 compartment sinks：系统在输入法切换过程中会写 OPENCLOSE/CONVERSION
+    // compartment，若 sink 仍挂着会被 OnChange 当作用户切换请求上报服务，
+    // 把服务端权威中英状态污染成英文（表现为"切换输入法后默认变英文"）。
+    _UninitOpenCloseCompartment();
+    _UninitKeyboardDisabledCompartment();
+    _UninitConversionCompartment();
+
     if (_pKeyEventSink != nullptr)
     {
         _pKeyEventSink->FlushEnglishStats();
@@ -2327,6 +2334,15 @@ STDAPI CTextService::OnChange(REFGUID rguid)
         if (_bInConversionChange)
             return S_OK;  // 自身写入引起的通知，跳过
 
+        // 无焦点时的 compartment 变化只能是系统切换输入法等噪声（用户 Ctrl+Space 必有
+        // 前台焦点；KBLSwitch 也按前台应用写入）——忽略，防止污染服务端权威模式。
+        // 下次聚焦/激活会从服务同步权威值。
+        if (!_hasFocus)
+        {
+            WIND_LOG_INFO(L"Compartment CONVERSION changed without focus, ignored\n");
+            return S_OK;
+        }
+
         ITfCompartmentMgr* pCompMgr = nullptr;
         HRESULT hr = _pThreadMgr->QueryInterface(IID_ITfCompartmentMgr, (void**)&pCompMgr);
         if (FAILED(hr) || pCompMgr == nullptr)
@@ -2396,6 +2412,14 @@ STDAPI CTextService::OnChange(REFGUID rguid)
     // Avoid re-entrant handling when we set the compartment ourselves
     if (_bInCompartmentChange)
         return S_OK;
+
+    // 无焦点时的 OPENCLOSE 变化是系统切换输入法等噪声（本路径任何变化都被视为 toggle，
+    // 误报会直接翻转服务端权威模式）——忽略，下次聚焦/激活从服务同步权威值。
+    if (!_hasFocus)
+    {
+        WIND_LOG_INFO(L"Compartment OPENCLOSE changed without focus, ignored\n");
+        return S_OK;
+    }
 
     // Read current compartment value
     ITfCompartmentMgr* pCompMgr = nullptr;
