@@ -27,6 +27,8 @@ pub struct NamedEvent {
 
 // SAFETY: HANDLE 线程间传递安全（SetEvent/CloseHandle 自身是线程安全的）
 unsafe impl Send for NamedEvent {}
+// SAFETY: signal() 仅调用 SetEvent，SetEvent 是线程安全的；Arc<NamedEvent> 需要 Sync
+unsafe impl Sync for NamedEvent {}
 
 impl NamedEvent {
     /// 创建命名 Event（auto-reset, initial=false，带 AppContainer SDDL）。
