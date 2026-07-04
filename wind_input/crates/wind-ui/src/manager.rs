@@ -525,6 +525,11 @@ impl UiManager {
                     if let Some(t) = &status_tip {
                         t.hide();
                     }
+                    #[cfg(windows)]
+                    if let Some(hr) = &host_render {
+                        use wind_ipc::protocol::HOST_WINDOW_STATUS;
+                        hr.hide_kind(HOST_WINDOW_STATUS);
+                    }
                     tip_hide_at = None;
                 }
             }
@@ -579,10 +584,52 @@ impl UiManager {
             // 推进状态提示防抖（稳定后才真正显示气泡）
             if let Some((text, x, y, ch, ox, oy, dur, fixed, fx, fy)) = tip_debounce.poll() {
                 if let Some(t) = &mut status_tip {
-                    if fixed {
-                        t.show_fixed(&text, fx, fy);
-                    } else {
-                        t.show(&text, x, y, ch, ox, oy);
+                    // host-render 分流：有活跃目标且写帧成功 → SHM + 本地隐藏；否则本地显示。
+                    let mut host_ok = false;
+                    #[cfg(windows)]
+                    if let Some(hr) = &host_render {
+                        if let Some(target) = hr.active_target() {
+                            use wind_bridge::shared_render_frame::FrameParams;
+                            use wind_ipc::protocol::HOST_WINDOW_STATUS;
+                            let fo = if fixed {
+                                t.render_frame_fixed(&text, fx, fy)
+                            } else {
+                                t.render_frame(&text, x, y, ch, ox, oy)
+                            };
+                            if let Some((bgra, w, h, sx, sy, sw)) = fo {
+                                let p = FrameParams {
+                                    sequence: 0,
+                                    x: sx,
+                                    y: sy,
+                                    width: w,
+                                    height: h,
+                                    bgra: &bgra,
+                                    rects: &[],
+                                    rendered_hover_index: -1,
+                                    target_instance_id: 0,
+                                    software_shadow: sw,
+                                };
+                                match hr.write_frame_for_kind(HOST_WINDOW_STATUS, &target, &p) {
+                                    Ok(()) => {
+                                        t.hide();
+                                        host_ok = true;
+                                    }
+                                    Err(e) => {
+                                        tracing::warn!(
+                                            "host render 写 status 帧失败，回退本地: {}",
+                                            e
+                                        );
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    if !host_ok {
+                        if fixed {
+                            t.show_fixed(&text, fx, fy);
+                        } else {
+                            t.show(&text, x, y, ch, ox, oy);
+                        }
                     }
                     // dur==0 → 常驻(always):不设隐藏时刻;否则按配置时长自动隐藏。
                     tip_hide_at = if dur == 0 {
@@ -655,7 +702,9 @@ impl UiManager {
                         #[cfg(windows)]
                         if let Some(hr) = &host_render {
                             use wind_bridge::shared_render_frame::FrameParams;
-                            use wind_ipc::protocol::{HOST_WINDOW_CANDIDATE, HostRenderHitRect};
+                            use wind_ipc::protocol::{
+                                HOST_WINDOW_CANDIDATE, HOST_WINDOW_TOOLTIP, HostRenderHitRect,
+                            };
                             if let Some(target) = hr.active_target() {
                                 match candidate_window.render_frame() {
                                     Some(frame) => {
@@ -688,7 +737,48 @@ impl UiManager {
                                             &params,
                                         ) {
                                             Ok(()) => {
-                                                candidate_window.hide();
+                                                candidate_window.hide_local_window_only();
+                                                // 写 tooltip 帧（有悬停）或隐藏（无悬停）
+                                                match candidate_window.render_tooltip_frame(
+                                                    frame.screen_x,
+                                                    frame.screen_y,
+                                                ) {
+                                                    Some((
+                                                        tt_buf,
+                                                        tt_w,
+                                                        tt_h,
+                                                        tt_x,
+                                                        tt_y,
+                                                        tt_shadow,
+                                                    )) => {
+                                                        let tt_params = FrameParams {
+                                                            sequence: 0,
+                                                            x: tt_x,
+                                                            y: tt_y,
+                                                            width: tt_w,
+                                                            height: tt_h,
+                                                            bgra: &tt_buf,
+                                                            rects: &[],
+                                                            rendered_hover_index: -1,
+                                                            target_instance_id: 0,
+                                                            software_shadow: tt_shadow,
+                                                        };
+                                                        if let Err(e) = hr.write_frame_for_kind(
+                                                            HOST_WINDOW_TOOLTIP,
+                                                            &target,
+                                                            &tt_params,
+                                                        ) {
+                                                            tracing::warn!(
+                                                                "host render 写 tooltip 帧失败: {}",
+                                                                e
+                                                            );
+                                                            hr.hide_kind(HOST_WINDOW_TOOLTIP);
+                                                        }
+                                                    }
+                                                    None => {
+                                                        hr.hide_kind(HOST_WINDOW_TOOLTIP);
+                                                    }
+                                                }
                                                 continue; // 跳过本地 show()，分流完成
                                             }
                                             Err(e) => {
@@ -703,6 +793,7 @@ impl UiManager {
                                     None => {
                                         // 无内容可渲染：隐藏 host 侧 + 本地侧，幂等
                                         hr.hide_kind(HOST_WINDOW_CANDIDATE);
+                                        hr.hide_kind(HOST_WINDOW_TOOLTIP);
                                         candidate_window.hide();
                                         continue;
                                     }
@@ -716,8 +807,9 @@ impl UiManager {
                         // host-render 侧先 hide（hide 必达，幂等双发）
                         #[cfg(windows)]
                         if let Some(hr) = &host_render {
-                            use wind_ipc::protocol::HOST_WINDOW_CANDIDATE;
+                            use wind_ipc::protocol::{HOST_WINDOW_CANDIDATE, HOST_WINDOW_TOOLTIP};
                             hr.hide_kind(HOST_WINDOW_CANDIDATE);
+                            hr.hide_kind(HOST_WINDOW_TOOLTIP);
                         }
                         candidate_window.hide();
                         if let Some(m) = &mut popup_menu {
@@ -909,6 +1001,11 @@ impl UiManager {
                         tip_debounce.cancel();
                         if let Some(t) = &status_tip {
                             t.hide();
+                        }
+                        #[cfg(windows)]
+                        if let Some(hr) = &host_render {
+                            use wind_ipc::protocol::HOST_WINDOW_STATUS;
+                            hr.hide_kind(HOST_WINDOW_STATUS);
                         }
                         tip_hide_at = None;
                     }

@@ -359,6 +359,32 @@ impl CandidateWindow {
         &self.hit_rects
     }
 
+    /// Windows：show 直接复用 render_frame() 渲染结果，blit 到本地 LayeredWindow。
+    /// 与 host-render 路径共用单一渲染逻辑，确保几何完全一致。
+    #[cfg(windows)]
+    pub fn show(&mut self) {
+        match self.render_frame() {
+            None => {
+                self.hide();
+            }
+            Some(frame) => {
+                self.window.resize(frame.width, frame.height);
+                {
+                    let buf = self.window.buffer_mut();
+                    buf[..(frame.width * frame.height * 4) as usize]
+                        .copy_from_slice(&frame.buf);
+                }
+                if let Err(e) = self.window.update() {
+                    tracing::warn!("CandidateWindow update failed: {}", e);
+                }
+                // render_frame() 已设 visible=true；screen_x/y 为窗口左上（含阴影偏移）。
+                self.window.show(frame.screen_x, frame.screen_y);
+                self.update_tooltip(frame.screen_x, frame.screen_y);
+            }
+        }
+    }
+
+    #[cfg(not(windows))]
     pub fn show(&mut self) {
         // mode_label 非空表示已进入临时模式：即使暂无候选/preedit 也要弹窗显示模式标记。
         if self.candidates.is_empty() && self.preedit.is_empty() && self.mode_label.is_empty() {
@@ -798,6 +824,56 @@ impl CandidateWindow {
                 }
                 None => tip.hide(),
             }
+        }
+    }
+
+    /// host-render 专用：渲染当前悬停 tooltip 到 BGRA buffer。
+    /// `(wx, wy)` 为候选窗口屏幕原点（与 render_frame 的 screen_x/y 一致）。
+    /// 返回 `(bgra, w, h, screen_x, screen_y, software_shadow)`；无悬停/无文本返回 None。
+    #[cfg(windows)]
+    pub fn render_tooltip_frame(
+        &mut self,
+        wx: i32,
+        wy: i32,
+    ) -> Option<(Vec<u8>, u32, u32, i32, i32, bool)> {
+        let hover = self.hover;
+        let info = if (0..TAG_PAGE_PREV).contains(&hover) {
+            let code = self
+                .candidates
+                .get(hover as usize)
+                .map(|c| c.tooltip.clone())
+                .unwrap_or_default();
+            self.hit_rects
+                .iter()
+                .find(|(t, _)| *t == hover)
+                .map(|(_, r)| *r)
+                .filter(|_| !code.is_empty())
+                .map(|r| (code, r))
+        } else {
+            None
+        };
+
+        let tip = self.tooltip.as_mut()?;
+        match info {
+            Some((code, r)) => {
+                if self.vertical {
+                    tip.render_frame_beside(
+                        &code,
+                        wx + r.x as i32,
+                        wx + (r.x + r.w) as i32,
+                        wy + r.y as i32,
+                        wy + (r.y + r.h) as i32,
+                    )
+                } else {
+                    tip.render_frame(
+                        &code,
+                        wx + r.x as i32,
+                        wy + r.y as i32,
+                        wy + (r.y + r.h) as i32,
+                    )
+                }
+            }
+            None => None,
         }
     }
 
@@ -1475,6 +1551,17 @@ impl CandidateWindow {
         self.last_content_pos = None; // 组合结束，下次显示重新落位
         self.placed_above = false; // 清除上方粘滞，下次组合按下方默认重新判定
         self.mouse.borrow_mut().reset_hover();
+        if let Some(t) = self.tooltip.as_mut() {
+            t.hide();
+        }
+    }
+
+    /// host-render 分流专用：仅隐藏本地 Win32 窗口与 tooltip 窗口，
+    /// 不清除 visible / last_content_pos / placed_above 落位状态。
+    /// render_frame() 已维护这些状态，host 模式内容确实可见，保持 visible=true 更正确。
+    #[cfg(windows)]
+    pub fn hide_local_window_only(&mut self) {
+        self.window.hide();
         if let Some(t) = self.tooltip.as_mut() {
             t.hide();
         }
