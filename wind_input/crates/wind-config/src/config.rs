@@ -407,6 +407,13 @@ pub struct MixGlobal {
     /// 英文最小触发长度（0=回退 3，即 2 字符以内不查英文；预留可配）。
     #[serde(default)]
     pub min_english_length: usize,
+    /// 拼音歧义拦截（词强度启发式）：整串是强拼音词时否决五笔自动/顶码上屏，让拼音赢
+    /// （如 wangba→网吧；aipu 无强词则放行落实）。默认开；独立于 auto_commit_block_on_pinyin。
+    #[serde(default = "default_true")]
+    pub block_commit_on_pinyin_word: bool,
+    /// 拼音歧义拦截的词强度权重阈值（0=仅结构判据：≥2 汉字且消费整串；预留真机调）。
+    #[serde(default)]
+    pub pinyin_word_min_weight: i32,
 }
 
 impl Default for MixGlobal {
@@ -420,6 +427,8 @@ impl Default for MixGlobal {
             auto_commit_block_on_english: false,
             min_pinyin_length: 0,
             min_english_length: 0,
+            block_commit_on_pinyin_word: true,
+            pinyin_word_min_weight: 0,
         }
     }
 }

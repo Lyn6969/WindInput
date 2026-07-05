@@ -64,6 +64,11 @@ auto_commit_block_on_english = false
 min_pinyin_length = 2
 # 英文最小触发长度（2 字符以内不查英文；0=回退 3）。
 min_english_length = 3
+# 拼音歧义拦截（词强度）：整串是强拼音词时否决五笔自动/顶码上屏，让拼音赢
+# （wangba→网吧 拦；aipu→落实 无强词放行）。独立于 auto_commit_block_on_pinyin。
+block_commit_on_pinyin_word = true
+# 词强度权重阈值（0=仅结构判据：拼音首选须≥2汉字且消费整串；预留真机调）。
+pinyin_word_min_weight = 0
 
 [schema.quick_input]
 # 注：; 由内置 mix「快捷」融合接管（quick_input 作为其成员，同时支持日期/计算/拼音/英文）。

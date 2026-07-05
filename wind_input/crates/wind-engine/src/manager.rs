@@ -1014,6 +1014,16 @@ impl EngineManager {
         self.active_engine()?.handle_top_code(input)
     }
 
+    /// 满码自动上屏「显示态」复评（透传到活跃引擎）：据已过滤/重排/shadow 的显示候选复评，
+    /// 引擎按未过滤候选因生僻同码字判不唯一而否决时，智能过滤后剩唯一精确全码则放行上屏。
+    pub fn recheck_auto_commit(
+        &self,
+        input: &str,
+        candidates: &[wind_candidate::Candidate],
+    ) -> Option<String> {
+        self.active_engine()?.recheck_auto_commit(input, candidates)
+    }
+
     /// 临时拼音目标方案 id（读全局 input.temp_pinyin；不再读方案级配置）。
     /// 启用且目标方案可加载时返回 Some(target)，否则 None。
     pub fn temp_pinyin_target(&self) -> Option<String> {
@@ -1351,6 +1361,8 @@ impl EngineManager {
                 show_source_hint: mix_cfg.show_source_hint,
                 min_english_length: min_en,
                 auto_commit_block_on_english: mix_cfg.auto_commit_block_on_english,
+                block_commit_on_pinyin_word: mix_cfg.block_commit_on_pinyin_word,
+                pinyin_word_min_weight: mix_cfg.pinyin_word_min_weight,
             };
             return Some(Box::new(crate::mixed::MixedEngine::new(
                 primary, secondary, english, cfg,

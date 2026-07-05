@@ -313,14 +313,24 @@ impl Coordinator {
         // Shadow 规则：删除过滤 + 置顶/移动重排（优先级最高，排序后应用）
         self.apply_shadow(&mut candidates, &state.input_buffer);
         state.candidates = candidates;
+        // 满码自动上屏「显示态」复评：引擎按未过滤候选判唯一（生僻同码字致不唯一被否决），
+        // 但智能过滤后可能只剩唯一精确全码码表候选 → 据显示候选复评放行（逻辑与显示一致）。
+        // 惰性：仅在引擎未给出上屏意向时复评。
+        let auto_commit = auto_commit
+            .or_else(|| self.engine_mgr.recheck_auto_commit(&state.input_buffer, &state.candidates));
         // 复核：仅当上屏目标在最终候选中仍存在（未被 shadow 删除）才放行自动上屏。
         let outcome = match auto_commit.filter(|t| state.candidates.iter().any(|c| &c.text == t)) {
             Some(_) => {
                 // 一致性：自动上屏文本取「实际显示的首候选」，与空格/点选同源，杜绝
                 // "显示藏、全码上屏駏"的漂移（首候选已由档位排序保证是五笔精确全码）。
+                // 守护：仅当显示首选是**码表来源**时才自动上屏；若显示首选是拼音/英文（被 shadow
+                // 置顶，或码表精确字被智能过滤后仅剩拼音），则不自动上屏——上屏须与显示一致、
+                // 非码表类不上屏，留给用户继续选。
                 match state.candidates.first() {
-                    Some(c) => InputOutcome::AutoCommit(c.text.clone()),
-                    None => InputOutcome::Normal,
+                    Some(c) if c.source == CandidateSource::CodeTable => {
+                        InputOutcome::AutoCommit(c.text.clone())
+                    }
+                    _ => InputOutcome::Normal,
                 }
             }
             None if should_clear => InputOutcome::Clear,

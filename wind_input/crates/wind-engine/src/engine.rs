@@ -105,6 +105,21 @@ pub trait Engine: Send + Sync {
     fn has_non_initial_single_letter_syllable(&self, _prefix: &str) -> bool {
         false
     }
+
+    /// 前缀从起始连续解析出的完整拼音音节数（拼音引擎实现；其余默认 0）。
+    /// 拼音词否决用：前缀恰 1 个完整音节（如 wang）多为「正在打拼音词的中途」→ 保护拼音；
+    /// ≥2 音节（如 aipu=ai+pu）已是完整多音节单元 → 多为恰好像拼音的五笔码。
+    fn completed_syllable_count(&self, _prefix: &str) -> usize {
+        0
+    }
+
+    /// 满码自动上屏「显示态」复评（对齐 Go recheckAutoCommit）：给定已过滤/重排/shadow 的
+    /// 显示候选，若满码上屏开、存在唯一精确全码码表候选且无更长后继 → 返回上屏文本。
+    /// 引擎按未过滤候选判唯一时可能因生僻同码字被否决，智能过滤后据显示候选复评放行。
+    /// 码表/混输引擎实现；其余默认 None。
+    fn recheck_auto_commit(&self, _input: &str, _candidates: &[Candidate]) -> Option<String> {
+        None
+    }
 }
 
 /// 扩展引擎接口（码表引擎特有）

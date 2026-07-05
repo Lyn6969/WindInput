@@ -36,6 +36,8 @@ pub struct MixConfig {
     pub show_source_hint: bool,
     pub min_english_length: usize,
     pub auto_commit_block_on_english: bool,
+    pub block_commit_on_pinyin_word: bool,
+    pub pinyin_word_min_weight: i32,
 }
 
 impl Default for MixConfig {
@@ -49,6 +51,8 @@ impl Default for MixConfig {
             show_source_hint: false,
             min_english_length: 2,
             auto_commit_block_on_english: false,
+            block_commit_on_pinyin_word: true,
+            pinyin_word_min_weight: 0,
         }
     }
 }
@@ -83,6 +87,11 @@ pub struct MixedEngine {
     min_english_length: usize,
     /// 满码自动上屏时若存在英文候选（含前缀）则否决（保护正在输入英文词的用户）。
     auto_commit_block_on_english: bool,
+    /// 拼音歧义拦截（词强度）：整串是强拼音词时否决五笔自动/顶码上屏，让拼音赢
+    /// （wangba→网吧；aipu 无强词则放行落实）。默认开；独立于 auto_commit_block_on_pinyin。
+    block_commit_on_pinyin_word: bool,
+    /// 词强度权重阈值（0=仅结构判据：拼音首选须 ≥2 汉字且消费整串；预留真机调）。
+    pinyin_word_min_weight: i32,
 }
 
 impl MixedEngine {
@@ -108,7 +117,58 @@ impl MixedEngine {
             english,
             min_english_length: cfg.min_english_length,
             auto_commit_block_on_english: cfg.auto_commit_block_on_english,
+            block_commit_on_pinyin_word: cfg.block_commit_on_pinyin_word,
+            pinyin_word_min_weight: cfg.pinyin_word_min_weight,
         }
+    }
+
+    /// 拼音词否决判据（`block_commit_on_pinyin_word` 开时生效；满码/顶码共用）。命中任一即判为
+    /// 「用户意图是拼音（词）」→ 否决五笔上屏。`secondary` 为 None / 开关关时恒 false。
+    ///
+    /// **(b) 单音节前缀（中途态）**：前 N 码前缀恰是「1 个完整拼音音节」（如 wang）→ 用户多在打
+    /// 拼音词的中途（wangb→wangba→网吧），保护拼音。≥2 音节前缀（aipu=ai+pu）已是完整多音节
+    /// 单元、多为恰好像拼音的五笔码 → 不拦（放行落实）。这是区分 wang（拦）/ aipu（放）的关键。
+    ///
+    /// **(a) 整串强拼音词**：整串是完整拼音音节序列、且拼音首选是「≥2 汉字、消费整串」的真实词
+    /// （权重 ≥ `pinyin_word_min_weight`）——借拼音引擎自身排序识别（真词排 #1 且消费整串）。
+    fn is_ambiguous_pinyin_word(&self, input: &str) -> bool {
+        if !self.block_commit_on_pinyin_word {
+            return false;
+        }
+        let Some(sec) = &self.secondary else {
+            return false;
+        };
+        // (b) 前 N 码前缀是单个完整拼音音节 → 中途打拼音词，保护拼音。
+        let plen = self.max_code_len.min(input.chars().count());
+        if plen >= 1 {
+            let prefix: String = input.chars().take(plen).collect();
+            if sec.is_whole_syllable_pinyin(&prefix) && sec.completed_syllable_count(&prefix) == 1 {
+                return true;
+            }
+        }
+        // (a) 整串是完整拼音强词。
+        if !sec.is_whole_syllable_pinyin(input) {
+            return false;
+        }
+        let Ok(r) = sec.convert(input, 8) else {
+            return false;
+        };
+        let Some(top) = r.candidates.first() else {
+            return false;
+        };
+        let input_len = input.chars().count();
+        // consumed_length==0 表示引擎未标注（视为整串匹配）。
+        let consumes_all = top.consumed_length == 0 || top.consumed_length >= input_len;
+        top.text.chars().count() >= 2 && consumes_all && top.weight >= self.pinyin_word_min_weight
+    }
+
+    /// 五笔上屏拼音否决（**满码全码自动上屏 / 顶码上屏共用同一套**，保证两条通路一致）：
+    /// - ① `auto_commit_block_on_pinyin` 且存在拼音候选（`has_pinyin`）→ 否决（有拼音就让路，粗粒度）；
+    /// - ② `block_commit_on_pinyin_word` 且整串是强拼音词（词强度）→ 否决。
+    ///
+    /// `has_pinyin` 由调用方按各自可见的候选给出（满码=引擎合并前的拼音候选；顶码=对整串查拼音）。
+    fn pinyin_vetoes_commit(&self, input: &str, has_pinyin: bool) -> bool {
+        (self.auto_commit_block_on_pinyin && has_pinyin) || self.is_ambiguous_pinyin_word(input)
     }
 
     /// 码表候选按混输策略提权（短语独立档 +1M / 精确 +boost / 前缀补全 +500K）。
@@ -374,13 +434,14 @@ impl Engine for MixedEngine {
         let has_english = self.auto_commit_block_on_english
             && merged.iter().any(|c| c.source == CandidateSource::English);
 
-        // 全码自动上屏重评（对齐 Go recheckAutoCommit）：取主码表意向，
-        // 但若开启拼音/英文守护且存在对应候选则否决（输入可能是拼音/英文，留给用户选）；
-        // 并复核上屏目标在合并结果中仍存活。
+        // 全码自动上屏重评（对齐 Go recheckAutoCommit）：取主码表意向，但若英文守护命中、或
+        // 拼音否决①②命中（`pinyin_vetoes_commit`，与顶码同一套）则否决（输入可能是拼音/英文，
+        // 留给用户选）；并复核上屏目标在合并结果中仍存活。
+        // `pinyin_vetoes_commit` 经短路仅在码表确有满码上屏意向时求值（避免每键多跑一次转换）。
         let (should_commit, commit_text) = if ct_should_commit
             && !ct_commit_text.is_empty()
-            && !(self.auto_commit_block_on_pinyin && has_pinyin)
             && !has_english
+            && !self.pinyin_vetoes_commit(input, has_pinyin)
             && merged.iter().any(|c| c.text == ct_commit_text)
         {
             (true, ct_commit_text)
@@ -417,27 +478,51 @@ impl Engine for MixedEngine {
         EngineType::Mixed
     }
 
-    /// 顶码裁决（对齐 Go HandleTopCode）：超码长时先做拼音保护，未命中或被开关放行才委托主码表。
+    /// 满码自动上屏「显示态」复评：先按**与 should_commit 同一套**拼音①②/英文守护否决
+    /// （避免复评绕过否决——修"满码全码唯一自动上屏时不否决"），再在**码表来源**候选中判唯一
+    /// 精确全码（拼音/英文不参与满码上屏）委托主码表复评。智能过滤掉生僻同码字后剩唯一精确全码
+    /// 时放行。`has_pinyin`/`has_english` 按显示候选来源判定（与所见一致）。
+    fn recheck_auto_commit(&self, input: &str, candidates: &[Candidate]) -> Option<String> {
+        let has_pinyin = candidates
+            .iter()
+            .any(|c| c.source == CandidateSource::Pinyin);
+        let has_english = self.auto_commit_block_on_english
+            && candidates
+                .iter()
+                .any(|c| c.source == CandidateSource::English);
+        if has_english || self.pinyin_vetoes_commit(input, has_pinyin) {
+            return None;
+        }
+        let ct: Vec<Candidate> = candidates
+            .iter()
+            .filter(|c| c.source == CandidateSource::CodeTable)
+            .cloned()
+            .collect();
+        self.primary.recheck_auto_commit(input, &ct)
+    }
+
+    /// 顶码裁决（对齐 Go HandleTopCode）：超码长时**用与满码全码自动上屏完全相同的拼音①②否决**
+    /// （`pinyin_vetoes_commit`），未被否决才委托主码表顶码。两条上屏通路同一套判据，杜绝
+    /// "满码不否决、顶码却否决"的不一致。
     ///
-    /// 前 N 码构成合法拼音序列 → 默认抑制顶码（用户可能在打拼音，如 yans→颜色）。仅当
-    /// `top_code_override_pinyin` 开启 + 前缀为「终止性精确五笔全码」+ 拼音读法「非真实拼音」
-    /// （整音节歧义 wang/aipu，或含非首位单字母音节的退化解析 naap/buap）时放行顶码倒向五笔。
+    /// - ① `auto_commit_block_on_pinyin` 且整串有拼音候选 → 抑制顶码（打开时 wangba/aipu 等含拼音
+    ///   读法的串都让路拼音）；
+    /// - ② `block_commit_on_pinyin_word` 且整串是强拼音词（wangba→网吧）→ 抑制顶码；
+    /// - `top_code_override_pinyin` 开启 = 顶码优先，**无视**拼音否决强制倒向五笔。
     fn handle_top_code(&self, input: &str) -> Option<(String, String)> {
         let input_len = input.chars().count();
         if self.max_code_len == 0 || input_len <= self.max_code_len {
             return self.primary.handle_top_code(input);
         }
-        let prefix: String = input.chars().take(self.max_code_len).collect();
-        if let Some(sec) = &self.secondary {
-            if sec.is_possible_pinyin_sequence(&prefix) {
-                // 终止性精确五笔全码：前缀恰是唯一全码（精确匹配 + 无更长后继）。
-                let is_terminal_exact = self.primary.has_full_input_match(&prefix)
-                    && !self.primary.has_longer_code(&prefix);
-                let override_topcode = self.top_code_override_pinyin
-                    && is_terminal_exact
-                    && (sec.is_whole_syllable_pinyin(&prefix)
-                        || sec.has_non_initial_single_letter_syllable(&prefix));
-                if !override_topcode {
+        // 顶码优先开关关闭时，应用与满码同一套拼音①②否决。
+        if !self.top_code_override_pinyin {
+            if let Some(sec) = &self.secondary {
+                // ①的 has_pinyin：整串是否有拼音候选（与满码"合并前拼音候选非空"同义）。
+                let has_pinyin = sec
+                    .convert(input, 1)
+                    .map(|r| !r.candidates.is_empty())
+                    .unwrap_or(false);
+                if self.pinyin_vetoes_commit(input, has_pinyin) {
                     return None;
                 }
             }
@@ -525,24 +610,266 @@ mod tests {
         Box::new(CodeTableEngine::new(4, opts, Arc::new(dm)))
     }
 
-    /// 真实拼音次引擎（空词典；音节分析只依赖标准音节 trie）。
-    fn pinyin_secondary() -> Box<dyn Engine> {
-        Box::new(crate::pinyin::PinyinEngine::new(
-            crate::pinyin::Config::default(),
-            CachedDict::Memory(CodetableDict::empty()),
-        ))
+    /// 可配假拼音引擎：`word`="" 表示无候选（has_pinyin=false）；`syllables` 同时驱动
+    /// is_whole_syllable_pinyin(=`syllables>0`) 与 completed_syllable_count(=`syllables`)——
+    /// 用于单测顶码/满码共用的拼音①②否决（含 ②(b) 单音节前缀保护）。
+    struct FakePinyin {
+        word: &'static str,
+        syllables: usize,
+    }
+    impl Engine for FakePinyin {
+        fn convert(&self, input: &str, _max: usize) -> anyhow::Result<ConvertResult> {
+            let candidates = if self.word.is_empty() {
+                vec![]
+            } else {
+                vec![Candidate {
+                    text: self.word.to_string(),
+                    code: input.to_string(),
+                    weight: 1000,
+                    consumed_length: input.chars().count(),
+                    source: CandidateSource::Pinyin,
+                    ..Default::default()
+                }]
+            };
+            Ok(ConvertResult {
+                candidates,
+                ..Default::default()
+            })
+        }
+        fn reset(&self) {}
+        fn engine_type(&self) -> EngineType {
+            EngineType::Pinyin
+        }
+        fn is_whole_syllable_pinyin(&self, _prefix: &str) -> bool {
+            self.syllables > 0
+        }
+        fn completed_syllable_count(&self, _prefix: &str) -> usize {
+            self.syllables
+        }
+    }
+
+    // ── 顶码上屏：与满码全码自动上屏**共用同一套**拼音①②否决 ──
+
+    #[test]
+    fn topcode_vetoed_by_pinyin_candidate() {
+        // ① auto_commit_block_on_pinyin 开（默认）+ 整串有拼音候选 → 抑制顶码。
+        let primary = ct_engine_topcode(&[("wang", "王", 100)]);
+        let e = MixedEngine::new(
+            primary,
+            Some(Box::new(FakePinyin {
+                word: "网",
+                syllables: 0,
+            })),
+            None,
+            MixConfig::default(),
+        );
+        assert_eq!(e.handle_top_code("wangb"), None, "① 开 + 有拼音候选应抑制顶码");
     }
 
     #[test]
-    fn topcode_suppressed_for_pinyin_prefix_when_override_off() {
-        // "wang" 前缀既是完整拼音又是唯一五笔全码；override 关 → 抑制顶码，保护拼音。
+    fn topcode_allowed_when_no_pinyin_candidate() {
+        // 纯五笔溢出（整串无拼音候选）→ 顶码正常上屏（即便 ①② 默认开）。
+        let primary = ct_engine_topcode(&[("aaaa", "工", 100)]);
+        let e = MixedEngine::new(
+            primary,
+            Some(Box::new(FakePinyin {
+                word: "",
+                syllables: 0,
+            })),
+            None,
+            MixConfig::default(),
+        );
+        assert_eq!(
+            e.handle_top_code("aaaab"),
+            Some(("工".to_string(), "b".to_string())),
+            "无拼音候选时顶码应正常上屏"
+        );
+    }
+
+    #[test]
+    fn topcode_vetoed_by_pinyin_word_when_block_on_pinyin_off() {
+        // ① 关、② 开：整串是强拼音词（网吧）→ 仍抑制顶码。
         let primary = ct_engine_topcode(&[("wang", "王", 100)]);
-        let e = MixedEngine::new(primary, Some(pinyin_secondary()), None, MixConfig::default());
+        let e = MixedEngine::new(
+            primary,
+            Some(Box::new(FakePinyin {
+                word: "网吧",
+                syllables: 2,
+            })),
+            None,
+            MixConfig {
+                auto_commit_block_on_pinyin: false,
+                ..Default::default()
+            },
+        );
+        assert_eq!(e.handle_top_code("wangba"), None, "② 强拼音词应抑制顶码");
+    }
+
+    #[test]
+    fn topcode_allowed_when_both_guards_off() {
+        // ①② 都关：即便整串像拼音也顶码倒向五笔（王 + 余码 ba）。
+        let primary = ct_engine_topcode(&[("wang", "王", 100)]);
+        let e = MixedEngine::new(
+            primary,
+            Some(Box::new(FakePinyin {
+                word: "网吧",
+                syllables: 2,
+            })),
+            None,
+            MixConfig {
+                auto_commit_block_on_pinyin: false,
+                block_commit_on_pinyin_word: false,
+                ..Default::default()
+            },
+        );
+        assert_eq!(
+            e.handle_top_code("wangba"),
+            Some(("王".to_string(), "ba".to_string())),
+            "①② 都关时顶码倒向五笔"
+        );
+    }
+
+    #[test]
+    fn topcode_override_ignores_pinyin_veto() {
+        // top_code_override_pinyin 开 = 顶码优先，无视拼音①②否决，强制倒向五笔。
+        let primary = ct_engine_topcode(&[("wang", "王", 100)]);
+        let e = MixedEngine::new(
+            primary,
+            Some(Box::new(FakePinyin {
+                word: "网吧",
+                syllables: 2,
+            })),
+            None,
+            MixConfig {
+                top_code_override_pinyin: true,
+                ..Default::default()
+            },
+        );
+        assert_eq!(
+            e.handle_top_code("wangba"),
+            Some(("王".to_string(), "ba".to_string())),
+            "顶码优先应无视拼音否决"
+        );
+    }
+
+    #[test]
+    fn topcode_vetoed_by_single_syllable_prefix_when_block_on_pinyin_off() {
+        // ① 关、② 开：前缀 "wang" 是单个完整拼音音节（中途打拼音词 wangba）→ 抑制顶码，
+        // 即便 "wangb" 尚未构成完整拼音词（用户实测：① 关时 wangb 仍顶 佢 的 bug）。
+        let primary = ct_engine_topcode(&[("wang", "王", 100)]);
+        let e = MixedEngine::new(
+            primary,
+            Some(Box::new(FakePinyin {
+                word: "网",
+                syllables: 1,
+            })),
+            None,
+            MixConfig {
+                auto_commit_block_on_pinyin: false,
+                ..Default::default()
+            },
+        );
         assert_eq!(
             e.handle_top_code("wangb"),
             None,
-            "override 关时应抑制顶码（拼音保护）"
+            "① 关 + ② 开：单音节前缀（中途打拼音词）应抑制顶码"
         );
+    }
+
+    #[test]
+    fn topcode_allowed_for_multi_syllable_prefix_when_block_on_pinyin_off() {
+        // ① 关、② 开：前缀 "aipu"=ai+pu 是完整多音节单元、无强词 → 放行顶码倒向五笔（落实）。
+        let primary = ct_engine_topcode(&[("aipu", "落实", 100)]);
+        let e = MixedEngine::new(
+            primary,
+            Some(Box::new(FakePinyin {
+                word: "矮",
+                syllables: 2,
+            })),
+            None,
+            MixConfig {
+                auto_commit_block_on_pinyin: false,
+                ..Default::default()
+            },
+        );
+        assert_eq!(
+            e.handle_top_code("aipux"),
+            Some(("落实".to_string(), "x".to_string())),
+            "① 关 + ② 开：多音节前缀无强词应放行顶码"
+        );
+    }
+
+    #[test]
+    fn mixed_recheck_auto_commit_after_filter() {
+        // 引擎按未过滤候选（含生僻同码字）判不唯一而否决满码上屏；智能过滤后只剩唯一精确
+        // 全码码表候选 → 复评据显示候选放行（bug: 显示只剩一个却不上屏）。
+        let primary = ct_engine(&[("hhnu", "X", 100), ("hhnu", "愳", 1)], true);
+        let e = MixedEngine::new(primary, None, None, MixConfig::default());
+        // 原始转换：两个精确 hhnu → 不唯一，引擎不给上屏意向。
+        let r = e.convert("hhnu", 50).unwrap();
+        assert!(!r.should_commit, "两个精确同码候选时引擎不自动上屏");
+        // 模拟智能过滤后仅剩一个码表精确全码候选 → 复评放行。
+        let filtered = vec![Candidate {
+            text: "X".into(),
+            code: "hhnu".into(),
+            source: CandidateSource::CodeTable,
+            ..Default::default()
+        }];
+        assert_eq!(
+            e.recheck_auto_commit("hhnu", &filtered),
+            Some("X".to_string()),
+            "过滤后唯一精确全码应复评放行"
+        );
+        // 拼音/英文来源不参与满码自动上屏：即便过滤后剩一个拼音候选也不放行。
+        let py_only = vec![Candidate {
+            text: "往".into(),
+            code: "hhnu".into(),
+            source: CandidateSource::Pinyin,
+            ..Default::default()
+        }];
+        assert_eq!(e.recheck_auto_commit("hhnu", &py_only), None);
+    }
+
+    #[test]
+    fn mixed_blocks_auto_commit_when_pinyin_word() {
+        // 主码表 mama 唯一全码本会自动上屏；① 关但整串是强拼音词 妈妈（②）→ 否决满码上屏。
+        let primary = ct_engine(&[("mama", "X", 100)], true);
+        let e = MixedEngine::new(
+            primary,
+            Some(Box::new(FakePinyin {
+                word: "妈妈",
+                syllables: 2,
+            })),
+            None,
+            MixConfig {
+                auto_commit_block_on_pinyin: false,
+                ..Default::default()
+            },
+        );
+        let r = e.convert("mama", 50).unwrap();
+        assert!(!r.should_commit, "整串是强拼音词时应否决满码上屏");
+    }
+
+    #[test]
+    fn mixed_allows_auto_commit_when_pinyin_word_guard_off() {
+        // ①② 都关 → 即便整串是强拼音词也放行满码上屏（零回归）。
+        let primary = ct_engine(&[("mama", "X", 100)], true);
+        let e = MixedEngine::new(
+            primary,
+            Some(Box::new(FakePinyin {
+                word: "妈妈",
+                syllables: 2,
+            })),
+            None,
+            MixConfig {
+                auto_commit_block_on_pinyin: false,
+                block_commit_on_pinyin_word: false,
+                ..Default::default()
+            },
+        );
+        let r = e.convert("mama", 50).unwrap();
+        assert!(r.should_commit, "①② 都关时应放行满码上屏");
+        assert_eq!(r.commit_text, "X");
     }
 
     #[test]
@@ -569,26 +896,6 @@ mod tests {
         assert_eq!(cands[0].comment, "", "码表候选不标记");
         assert_eq!(cands[1].comment, "拼");
         assert_eq!(cands[2].comment, "拼|ni", "已有 comment 时前置拼接");
-    }
-
-    #[test]
-    fn topcode_released_for_ambiguous_prefix_when_override_on() {
-        // override 开 + 终止性精确全码 + 整音节歧义（wang）→ 放行顶码倒向五笔。
-        let primary = ct_engine_topcode(&[("wang", "王", 100)]);
-        let e = MixedEngine::new(
-            primary,
-            Some(pinyin_secondary()),
-            None,
-            MixConfig {
-                top_code_override_pinyin: true,
-                ..Default::default()
-            },
-        );
-        assert_eq!(
-            e.handle_top_code("wangb"),
-            Some(("王".to_string(), "b".to_string())),
-            "override 开 + 整音节歧义全码应放行顶码"
-        );
     }
 
     /// 内存英文引擎（EnglishEngine 包码表；code=小写英文词，前缀匹配）。

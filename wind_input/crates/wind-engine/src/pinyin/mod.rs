@@ -747,6 +747,10 @@ impl Engine for PinyinEngine {
         let (completed, _) = self.contiguous_completed_from_start(prefix);
         completed.iter().skip(1).any(|s| s.len() == 1)
     }
+
+    fn completed_syllable_count(&self, prefix: &str) -> usize {
+        self.contiguous_completed_from_start(prefix).0.len()
+    }
 }
 
 #[cfg(test)]

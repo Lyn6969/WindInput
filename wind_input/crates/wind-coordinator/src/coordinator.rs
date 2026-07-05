@@ -3335,35 +3335,64 @@ impl MessageHandler for Coordinator {
             keymap::VK_A..=keymap::VK_Z => {
                 // A-Z 字母累积
                 let ch = (b'a' + (data.key_code - 0x41) as u8) as char;
+                // 顶码前记住「即将成为前缀」的缓冲及其显示首选：顶码上屏文本须与用户实际所见的
+                // 首候选一致——调频置顶 / shadow 在协调器层重排（apply_freq_rerank/apply_shadow），
+                // 引擎 handle_top_code 内部 convert 看不到，会顶出权重首选而非显示首选（对齐 Go
+                // 复用 ConvertEx 取 Candidates[0] 的一致性修复）。顶码绝大多数发生在「满码+1」，
+                // 此时前缀恰为顶码前缓冲，state.candidates 正是其显示候选。
+                let pre_buf = state.input_buffer.clone();
+                // 顶码上屏文本 = 用户实际所见的**码表首选**：顶码是码表机制，只上屏显示列表里排在
+                // 首位且为码表来源的候选。取顶码前缓冲（即将成为前缀）的显示首候选——它已过
+                // 智能过滤 / 词频重排 / shadow，正是用户所见；仅当其为码表来源时保留。
+                // 若显示首选是拼音/英文（拼音本就排首，或智能过滤掉生僻码表字后仅剩拼音，如
+                // 「wang」只有生僻字「佢」被过滤、显示全是拼音），则**无可顶的码表候选** → None，
+                // 下方放弃顶码、继续组合（对齐「上屏须与显示一致 + 非码表类不上屏」）。
+                let pre_display_first = state
+                    .candidates
+                    .first()
+                    .filter(|c| c.source == CandidateSource::CodeTable)
+                    .map(|c| c.text.clone());
                 state.input_buffer.push(ch);
 
                 // 顶码上屏：缓冲超过满码长且整串无匹配 → 顶前 N 码首选，余码续打
                 // （schema.top_code_commit；置于候选刷新前，对齐 Go handleAlphaKey）。
-                if let Some((top_text, remainder)) =
+                if let Some((engine_top, remainder)) =
                     self.engine_mgr.handle_top_code(&state.input_buffer)
                 {
                     let buf = state.input_buffer.clone();
-                    let prefix = &buf[..buf.len().saturating_sub(remainder.len())];
-                    // 顶码上屏是码表机制，归属码表来源。
-                    self.record_selection(prefix, &top_text, CandidateSource::CodeTable);
-                    // 顶码即上屏首选（pos=0），code_len=被顶出的前缀码长。
-                    self.record_commit(&top_text, prefix.len() as u32, 0, CommitSource::Candidate);
-                    state.input_buffer = remainder.clone();
-                    let _ = self.update_candidates(&mut state); // 余码候选（不再消费其结局）
-                    let preedit = state.preedit.clone();
-                    // 顶码上屏 = 部分上屏 + 余码续组合：宿主光标因 top_text 插入而前移，余码组合的起点已变。
-                    // 复位首显延迟状态，使余码候选窗重新延迟到 reflow 后的新坐标首显、重锁组合起点，
-                    // 避免停留在顶码前的旧位置（候选窗保持上一帧显示直到新坐标到达，对齐 Go）。
-                    self.reset_first_show();
-                    self.notify_ui_update(&state);
-                    let has_comp = !remainder.is_empty();
-                    return KeyAction::InsertText {
-                        text: top_text,
-                        new_composition: has_comp.then_some(preedit),
-                        mode_changed: false,
-                        chinese_mode: true,
-                        has_new_composition: has_comp,
+                    let prefix: String = buf[..buf.len().saturating_sub(remainder.len())].to_string();
+                    // 顶码文本决策：
+                    // - 前缀==顶码前缓冲（满码+1，最常见）：只上屏显示码表首选；显示首选非码表 →
+                    //   None → 放弃顶码（不上屏被过滤/隐藏的候选，继续组合让用户选拼音）。
+                    // - 否则（多级溢出，罕见 wubi 场景）：回退引擎码表顶码文本。
+                    let top_text = if prefix == pre_buf {
+                        pre_display_first.clone()
+                    } else {
+                        Some(engine_top)
                     };
+                    if let Some(top_text) = top_text {
+                        // 顶码上屏是码表机制，归属码表来源。
+                        self.record_selection(&prefix, &top_text, CandidateSource::CodeTable);
+                        // 顶码即上屏首选（pos=0），code_len=被顶出的前缀码长。
+                        self.record_commit(&top_text, prefix.len() as u32, 0, CommitSource::Candidate);
+                        state.input_buffer = remainder.clone();
+                        let _ = self.update_candidates(&mut state); // 余码候选（不再消费其结局）
+                        let preedit = state.preedit.clone();
+                        // 顶码上屏 = 部分上屏 + 余码续组合：宿主光标因 top_text 插入而前移，余码组合的起点已变。
+                        // 复位首显延迟状态，使余码候选窗重新延迟到 reflow 后的新坐标首显、重锁组合起点，
+                        // 避免停留在顶码前的旧位置（候选窗保持上一帧显示直到新坐标到达，对齐 Go）。
+                        self.reset_first_show();
+                        self.notify_ui_update(&state);
+                        let has_comp = !remainder.is_empty();
+                        return KeyAction::InsertText {
+                            text: top_text,
+                            new_composition: has_comp.then_some(preedit),
+                            mode_changed: false,
+                            chinese_mode: true,
+                            has_new_composition: has_comp,
+                        };
+                    }
+                    // top_text None（显示首选非码表）→ 放弃顶码，落到下方正常候选刷新继续组合。
                 }
 
                 // 全码自动上屏 / 满码空码清空（schema.auto_commit_at_full / clear_on_empty_max）。

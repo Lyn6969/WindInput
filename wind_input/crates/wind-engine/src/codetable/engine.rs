@@ -193,6 +193,16 @@ impl Engine for CodeTableEngine {
 
     /// 顶码上屏（对齐 Go HandleTopCode）：超过满码长 + 整串无精确匹配 + 无更长后继时，
     /// 取前 max_code_length 码的首选上屏，返回 (上屏文本, 剩余编码)。
+    fn recheck_auto_commit(&self, input: &str, candidates: &[Candidate]) -> Option<String> {
+        decide_auto_commit(
+            self.opts.auto_commit_at_full,
+            self.opts.auto_commit_min_len,
+            input,
+            candidates,
+            self.has_longer_code(input),
+        )
+    }
+
     fn handle_top_code(&self, input: &str) -> Option<(String, String)> {
         if !self.opts.top_code_commit {
             return None;
@@ -362,6 +372,24 @@ mod tests {
         let e = engine_with(&[("aaaa", "工", 100)], false, 4);
         let r = e.convert("aaaa", 50).unwrap();
         assert!(!r.should_commit);
+    }
+
+    #[test]
+    fn recheck_auto_commit_unique_after_filter() {
+        // 同码两个精确候选（"hhnu"→X 常用 / 愳 生僻）：引擎按未过滤候选判不唯一 → 不上屏。
+        let e = engine_with(&[("hhnu", "X", 100), ("hhnu", "愳", 1)], true, 4);
+        let r = e.convert("hhnu", 50).unwrap();
+        assert!(!r.should_commit, "两个精确同码候选不自动上屏");
+        // 模拟智能过滤后仅剩一个精确全码候选 → 复评放行。
+        let filtered = [cand("hhnu", "X")];
+        assert_eq!(
+            e.recheck_auto_commit("hhnu", &filtered),
+            Some("X".to_string()),
+            "过滤后唯一精确全码应复评放行"
+        );
+        // 满码上屏开关关闭时复评不放行。
+        let e_off = engine_with(&[("hhnu", "X", 100), ("hhnu", "愳", 1)], false, 4);
+        assert_eq!(e_off.recheck_auto_commit("hhnu", &filtered), None);
     }
 
     #[test]
