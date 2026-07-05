@@ -1858,6 +1858,34 @@ fn test_select_char_first_and_second() {
 }
 
 #[test]
+fn test_fullwidth_space_on_empty_buffer() {
+    if !has_schemas() {
+        return;
+    }
+    // 全角态空缓冲按空格 → 上屏全角空格 U+3000（对齐设置端展示基线与微软拼音行为）。
+    // 回归：空格键先于标点流水线被 VK_SPACE 分支截获，空缓冲曾恒 PassThrough 半角空格，
+    // 全角转换（fullwidth.rs 已支持 ' '→U+3000）与自定义映射「空格」行均够不着。
+    let mut cfg = config_with("pinyin");
+    cfg.input.default.full_width = true;
+    let coord = Coordinator::new_headless(cfg, Some(&data_dir()));
+    match coord.handle_key_event(&key_event(0x20, EVENT_KEY_DOWN)) {
+        KeyAction::InsertText { text, .. } => {
+            assert_eq!(text, "\u{3000}", "全角态空格应上屏全角空格");
+        }
+        other => panic!("全角态空缓冲空格应上屏全角空格，实际: {:?}", other),
+    }
+    // 半角态（默认）维持透传，保留宿主对空格键的原生语义。
+    let coord2 = Coordinator::new_headless(config_with("pinyin"), Some(&data_dir()));
+    assert!(
+        matches!(
+            coord2.handle_key_event(&key_event(0x20, EVENT_KEY_DOWN)),
+            KeyAction::PassThrough
+        ),
+        "半角态空缓冲空格应透传"
+    );
+}
+
+#[test]
 fn test_select_char_brackets_group() {
     if !has_schemas() {
         return;

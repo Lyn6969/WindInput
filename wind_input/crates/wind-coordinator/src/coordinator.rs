@@ -3275,7 +3275,16 @@ impl MessageHandler for Coordinator {
                     self.notify_ui_hide();
                     Self::commit_action(text, true)
                 } else {
-                    KeyAction::PassThrough
+                    // 空缓冲空格：经标点流水线转换（自定义映射「空格」行四态可覆盖；
+                    // 内建默认仅全角态转全角空格 U+3000，对齐设置端展示基线与微软拼音）。
+                    // 流水线原样返回 " " 时（半角态无自定义）维持透传，保留宿主对
+                    // 空格键的原生语义（如网页滚动）。
+                    let text = self.convert_punct(&state, ' ', data.prev_char);
+                    if text == " " {
+                        return KeyAction::PassThrough;
+                    }
+                    self.record_commit(&text, 0, -1, CommitSource::Punctuation);
+                    Self::commit_action(text, true)
                 }
             }
             keymap::VK_RETURN => {
