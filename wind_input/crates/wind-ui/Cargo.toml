@@ -19,6 +19,8 @@ tokio = { workspace = true }
 windows = { workspace = true }
 # `#[implement]` 宏展开引用 `::windows_core`，需作为直接依赖（版本随 windows 0.58）。
 windows-core = "0.58"
+# host-render 协议常量（HOST_WINDOW_CANDIDATE）与 HostRenderHitRect。
+wind-ipc = { path = "../wind-ipc" }
 
 # macOS：CoreText 真字形文本后端（text/coretext.rs）；
 # wind-ipc 供 manager_macos forwarder 编码 host-render / 候选命中 / 状态帧。

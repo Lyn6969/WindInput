@@ -122,6 +122,21 @@ pub enum UiCommand {
     RegisterGlobalHotkeys(Vec<GlobalHotkeyEntry>),
     /// 关闭 UI
     Shutdown,
+    /// 注入 host-render 管理器（Windows）；协调器 `set_host_render` 后下发，
+    /// UI 线程收到后在消息循环中激活 SHM 分流路径。
+    #[cfg(windows)]
+    SetHostRender(HostRenderArc),
+}
+
+/// `HostRenderManager` 不派生 Debug，包一层使 UiCommand 可 derive Debug。
+#[cfg(windows)]
+pub struct HostRenderArc(pub std::sync::Arc<wind_bridge::host_render_windows::HostRenderManager>);
+
+#[cfg(windows)]
+impl std::fmt::Debug for HostRenderArc {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("HostRenderManager")
+    }
 }
 
 /// 全局热键条目（协调器按 keys.global_hotkeys 构建，UI 线程经 Win32 RegisterHotKey 注册）。
@@ -494,6 +509,12 @@ impl UiManager {
         #[cfg(windows)]
         let mut global_hotkeys: Vec<GlobalHotkeyEntry> = Vec::new();
 
+        // host-render 管理器（Windows）：由 SetHostRender 命令注入；None = 本地 LayeredWindow 路径。
+        #[cfg(windows)]
+        let mut host_render: Option<
+            std::sync::Arc<wind_bridge::host_render_windows::HostRenderManager>,
+        > = None;
+
         // Win32 消息循环 + 通道接收
         // 待处理命令队列：每轮排空通道并合并连续候选更新（只渲染最新一帧），
         // 避免长按翻页/连按方向键时 UpdateCandidates 堆积、松键后仍继续刷新。
@@ -504,6 +525,11 @@ impl UiManager {
                 if std::time::Instant::now() >= deadline {
                     if let Some(t) = &status_tip {
                         t.hide();
+                    }
+                    #[cfg(windows)]
+                    if let Some(hr) = &host_render {
+                        use wind_ipc::protocol::HOST_WINDOW_STATUS;
+                        hr.hide_kind(HOST_WINDOW_STATUS);
                     }
                     tip_hide_at = None;
                 }
@@ -557,20 +583,59 @@ impl UiManager {
             }
 
             // 推进状态提示防抖（稳定后才真正显示气泡）
-            if let Some((text, x, y, ch, ox, oy, dur, fixed, fx, fy)) = tip_debounce.poll() {
-                if let Some(t) = &mut status_tip {
+            if let Some((text, x, y, ch, ox, oy, dur, fixed, fx, fy)) = tip_debounce.poll()
+                && let Some(t) = &mut status_tip
+            {
+                // host-render 分流：有活跃目标且写帧成功 → SHM + 本地隐藏；否则本地显示。
+                let mut host_ok = false;
+                #[cfg(windows)]
+                if let Some(hr) = &host_render
+                    && let Some(target) = hr.active_target()
+                {
+                    use wind_bridge::shared_render_frame::FrameParams;
+                    use wind_ipc::protocol::HOST_WINDOW_STATUS;
+                    let fo = if fixed {
+                        t.render_frame_fixed(&text, fx, fy)
+                    } else {
+                        t.render_frame(&text, x, y, ch, ox, oy)
+                    };
+                    if let Some((bgra, w, h, sx, sy, sw)) = fo {
+                        let p = FrameParams {
+                            sequence: 0,
+                            x: sx,
+                            y: sy,
+                            width: w,
+                            height: h,
+                            bgra: &bgra,
+                            rects: &[],
+                            rendered_hover_index: -1,
+                            target_instance_id: 0,
+                            software_shadow: sw,
+                        };
+                        match hr.write_frame_for_kind(HOST_WINDOW_STATUS, &target, &p) {
+                            Ok(()) => {
+                                t.hide();
+                                host_ok = true;
+                            }
+                            Err(e) => {
+                                tracing::warn!("host render 写 status 帧失败，回退本地: {}", e);
+                            }
+                        }
+                    }
+                }
+                if !host_ok {
                     if fixed {
                         t.show_fixed(&text, fx, fy);
                     } else {
                         t.show(&text, x, y, ch, ox, oy);
                     }
-                    // dur==0 → 常驻(always):不设隐藏时刻;否则按配置时长自动隐藏。
-                    tip_hide_at = if dur == 0 {
-                        None
-                    } else {
-                        Some(std::time::Instant::now() + std::time::Duration::from_millis(dur))
-                    };
                 }
+                // dur==0 → 常驻(always):不设隐藏时刻;否则按配置时长自动隐藏。
+                tip_hide_at = if dur == 0 {
+                    None
+                } else {
+                    Some(std::time::Instant::now() + std::time::Duration::from_millis(dur))
+                };
             }
 
             // 排空通道：合并连续候选更新（只保留最新一条），其它命令保序
@@ -630,10 +695,25 @@ impl UiManager {
                             total_pages,
                         );
                         candidate_window.set_position(caret_x, caret_y, caret_height, caret_valid);
+                        // host-render 分流：有活跃目标时渲染到 SHM，本地窗口互斥隐藏。
+                        // 无目标或 host-render 未注入时落本地 LayeredWindow 路径（零改动）。
+                        #[cfg(windows)]
+                        if let Some(hr) = &host_render
+                            && try_host_render_candidates(hr, &mut candidate_window)
+                        {
+                            continue; // 跳过本地 show()，分流完成
+                        }
                         candidate_window.show();
                     }
                     UiCommand::HideCandidates => {
                         debug!("UI: HideCandidates");
+                        // host-render 侧先 hide（hide 必达，幂等双发）
+                        #[cfg(windows)]
+                        if let Some(hr) = &host_render {
+                            use wind_ipc::protocol::{HOST_WINDOW_CANDIDATE, HOST_WINDOW_TOOLTIP};
+                            hr.hide_kind(HOST_WINDOW_CANDIDATE);
+                            hr.hide_kind(HOST_WINDOW_TOOLTIP);
+                        }
                         candidate_window.hide();
                         if let Some(m) = &mut popup_menu {
                             m.hide();
@@ -825,6 +905,11 @@ impl UiManager {
                         if let Some(t) = &status_tip {
                             t.hide();
                         }
+                        #[cfg(windows)]
+                        if let Some(hr) = &host_render {
+                            use wind_ipc::protocol::HOST_WINDOW_STATUS;
+                            hr.hide_kind(HOST_WINDOW_STATUS);
+                        }
                         tip_hide_at = None;
                     }
                     UiCommand::ShowToast {
@@ -887,7 +972,18 @@ impl UiManager {
                         }
                         candidate_window.set_theme(t); // 同时更新其 tooltip
                         if candidate_window.is_visible() {
-                            candidate_window.show();
+                            // host 模式下 visible=true 表示「内容在 host 窗口可见」，重绘须走
+                            // host 分流重写 SHM 帧，不得弹本地窗口（否则与 host 窗双显）。
+                            #[cfg(windows)]
+                            let host_handled = match &host_render {
+                                Some(hr) => try_host_render_candidates(hr, &mut candidate_window),
+                                None => false,
+                            };
+                            #[cfg(not(windows))]
+                            let host_handled = false;
+                            if !host_handled {
+                                candidate_window.show();
+                            }
                         }
                     }
                     UiCommand::SetCandidateLayout(vertical) => {
@@ -949,8 +1045,18 @@ impl UiManager {
                             let _ = entries;
                         }
                     }
+                    #[cfg(windows)]
+                    UiCommand::SetHostRender(hr) => {
+                        debug!("UI: SetHostRender");
+                        host_render = Some(hr.0);
+                    }
                     UiCommand::Shutdown => {
                         info!("UI: Shutdown");
+                        // host-render 全部隐藏（Shutdown 必达）
+                        #[cfg(windows)]
+                        if let Some(hr) = &host_render {
+                            hr.hide_all();
+                        }
                         candidate_window.hide();
                         if let Some(t) = &status_tip {
                             t.hide();
@@ -980,6 +1086,90 @@ impl UiManager {
 impl Drop for UiManager {
     fn drop(&mut self) {
         let _ = self.cmd_tx.send(UiCommand::Shutdown);
+    }
+}
+
+/// host-render 候选分流：有活跃目标时渲染候选帧（含悬停 tooltip 帧联动）写 SHM，
+/// 本地窗口互斥隐藏（hide_local_window_only，保留跨帧防抖/粘滞状态）。
+/// 返回 true = 已由 host 路径处理（调用方跳过本地 show）；false = 无目标/写帧失败 → 走本地路径。
+#[cfg(windows)]
+fn try_host_render_candidates(
+    hr: &std::sync::Arc<wind_bridge::host_render_windows::HostRenderManager>,
+    candidate_window: &mut CandidateWindow,
+) -> bool {
+    use wind_bridge::shared_render_frame::FrameParams;
+    use wind_ipc::protocol::{HOST_WINDOW_CANDIDATE, HOST_WINDOW_TOOLTIP, HostRenderHitRect};
+    let Some(target) = hr.active_target() else {
+        return false;
+    };
+    match candidate_window.render_frame() {
+        Some(frame) => {
+            let rects: Vec<HostRenderHitRect> = frame
+                .hit_rects
+                .iter()
+                .map(|(idx, r)| HostRenderHitRect {
+                    index: *idx,
+                    x: r.x as i32,
+                    y: r.y as i32,
+                    w: r.w as i32,
+                    h: r.h as i32,
+                })
+                .collect();
+            let params = FrameParams {
+                sequence: 0,
+                x: frame.screen_x,
+                y: frame.screen_y,
+                width: frame.width,
+                height: frame.height,
+                bgra: &frame.buf,
+                rects: &rects,
+                rendered_hover_index: candidate_window.hover(),
+                target_instance_id: 0,
+                software_shadow: frame.software_shadow,
+            };
+            match hr.write_frame_for_kind(HOST_WINDOW_CANDIDATE, &target, &params) {
+                Ok(()) => {
+                    candidate_window.hide_local_window_only();
+                    // 悬停 tooltip 帧联动：有悬停写帧，无悬停隐藏（幂等）。
+                    match candidate_window.render_tooltip_frame(frame.screen_x, frame.screen_y) {
+                        Some((tt_buf, tt_w, tt_h, tt_x, tt_y, tt_shadow)) => {
+                            let tt_params = FrameParams {
+                                sequence: 0,
+                                x: tt_x,
+                                y: tt_y,
+                                width: tt_w,
+                                height: tt_h,
+                                bgra: &tt_buf,
+                                rects: &[],
+                                rendered_hover_index: -1,
+                                target_instance_id: 0,
+                                software_shadow: tt_shadow,
+                            };
+                            if let Err(e) =
+                                hr.write_frame_for_kind(HOST_WINDOW_TOOLTIP, &target, &tt_params)
+                            {
+                                tracing::warn!("host render 写 tooltip 帧失败: {}", e);
+                                hr.hide_kind(HOST_WINDOW_TOOLTIP);
+                            }
+                        }
+                        None => hr.hide_kind(HOST_WINDOW_TOOLTIP),
+                    }
+                    true
+                }
+                Err(e) => {
+                    // 写帧失败必须回退本地窗口，不得静默丢帧
+                    tracing::warn!("host render 写帧失败，回退本地窗口: {}", e);
+                    false
+                }
+            }
+        }
+        None => {
+            // 无内容可渲染：隐藏 host 侧 + 本地侧，幂等
+            hr.hide_kind(HOST_WINDOW_CANDIDATE);
+            hr.hide_kind(HOST_WINDOW_TOOLTIP);
+            candidate_window.hide();
+            true
+        }
     }
 }
 

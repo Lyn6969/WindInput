@@ -3,7 +3,7 @@
 //! 与 Go `internal/bridge/server_darwin.go` 对齐：每连接一线程，
 //! 阻塞读 8 字节 header + payload，dispatch_command 复用平台无关逻辑。
 use crate::handler::*;
-use crate::server::dispatch_command;
+use crate::server::{ClientCtx, dispatch_command};
 use std::io::{Read, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::PathBuf;
@@ -53,7 +53,9 @@ fn handle_uds_client(mut stream: UnixStream, handler: Arc<dyn MessageHandler>) {
         if payload_len > 0 && stream.read_exact(&mut payload).is_err() {
             break;
         }
-        let response = dispatch_command(&handler, header.command, header.is_async(), &payload);
+        // unix 无连接身份语义（host-render 仅 Windows），传 {0,0} 占位。
+        let ctx = ClientCtx { conn_id: 0, pid: 0 };
+        let response = dispatch_command(&handler, header.command, header.is_async(), &payload, ctx);
         if let Some(resp) = response {
             if stream.write_all(&resp).is_err() {
                 break;
@@ -141,8 +143,6 @@ mod tests {
         fn handle_commit_request(&self, _data: &CommitRequestData) -> Option<CommitResultData> {
             None
         }
-        fn handle_host_render_request(&self) {}
-        fn handle_host_render_ready(&self) {}
     }
 
     #[test]

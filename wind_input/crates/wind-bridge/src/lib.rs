@@ -10,6 +10,7 @@ pub mod push;
 pub mod security;
 pub mod server;
 pub mod shared_memory;
+pub mod shared_render_frame;
 
 // macOS / Linux：UDS 请求/推送服务器 + POSIX SHM hostrender 写端。
 // Windows 路径仍内联在 server.rs / push.rs（cfg(windows)），不引入 *_windows.rs。
@@ -19,5 +20,13 @@ pub mod push_unix;
 pub mod server_unix;
 #[cfg(unix)]
 pub mod shared_memory_posix;
+
+// Windows：命名 SHM 写端 + 命名 Event（带 AppContainer SDDL）+ HostRenderManager
+#[cfg(windows)]
+pub mod host_render_windows;
+#[cfg(windows)]
+pub mod named_event;
+#[cfg(windows)]
+pub mod shared_memory_windows;
 
 pub use host_render_sink::HostRenderSink;

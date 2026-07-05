@@ -537,6 +537,13 @@ pub struct Coordinator {
     /// 全屏状态缓存：由 notify_toolbar_async 在后台线程异步刷新，notify_toolbar 直接读取，
     /// 消除 bridge handler 线程上的 SHQueryUserNotificationState 阻塞。
     pub(crate) fullscreen_cached: std::sync::atomic::AtomicBool,
+    /// host-render 管理器（Windows）：与 `BridgeServer` 共享同一 `Arc` 实例。
+    /// 服务入口经 `set_host_render` 注入一次；Task 6/7 据此写候选/工具提示/状态帧并隐藏。
+    /// 采用 `OnceLock`（与 `self_weak`/`cmdbar_services` 同一构造后注入惯例），
+    /// 避免为其贯穿 `new`/`new_headless` 等构造器签名。
+    #[cfg(windows)]
+    #[allow(dead_code)] // Task 6/7 接线写帧/隐藏后即被读取
+    host_render: std::sync::OnceLock<Arc<wind_bridge::host_render_windows::HostRenderManager>>,
 }
 
 /// 短语候选权重基准（高于普通候选，使短语展开排在前列）
@@ -716,6 +723,40 @@ impl Coordinator {
         // 使首次启动即按 config 应用（与 reload_user_config 同一路径）。
         coordinator.apply_ui_config();
         coordinator
+    }
+
+    /// 注入 host-render 管理器（Windows）。服务入口在构造 `BridgeServer` 后调用一次，
+    /// 与其共享同一 `Arc` 实例。重复注入静默忽略（`OnceLock` 语义）。
+    #[cfg(windows)]
+    pub fn set_host_render(&self, mgr: Arc<wind_bridge::host_render_windows::HostRenderManager>) {
+        let _ = self.host_render.set(mgr.clone());
+        // 把同一 Arc 传给 UI 线程，使其在消息循环中激活 SHM 分流路径（Task 7）。
+        let _ = self.ui_tx.send(wind_ui::manager::UiCommand::SetHostRender(
+            wind_ui::manager::HostRenderArc(mgr),
+        ));
+    }
+
+    /// 取已注入的 host-render 管理器（Windows）；未注入返回 None。供 Task 6/7 写帧/隐藏。
+    #[cfg(windows)]
+    pub(crate) fn host_render(
+        &self,
+    ) -> Option<&Arc<wind_bridge::host_render_windows::HostRenderManager>> {
+        self.host_render.get()
+    }
+
+    /// 当前是否处于 host-render 受限宿主模式（SearchHost.exe / 开始菜单搜索框等）。
+    /// `active_target()` 每次现查（无缓存），避免跨帧持有失效目标；它仅在 active 连接
+    /// **已完成 setup** 时返回 Some，而 setup 会拒绝白名单外进程——故此判定天然经过
+    /// 白名单过滤，且比 `focused_whitelisted()` 更准确（追踪「确实在 host 渲染」）。
+    /// 非 Windows 编译始终返回 false，零开销。
+    pub(crate) fn host_render_active(&self) -> bool {
+        #[cfg(windows)]
+        return self
+            .host_render()
+            .map(|m| m.active_target().is_some())
+            .unwrap_or(false);
+        #[cfg(not(windows))]
+        return false;
     }
 
     /// 无头构造器（测试用）：跳过 UI 线程，不做词频持久化（避免污染真实文件）。
@@ -995,6 +1036,8 @@ impl Coordinator {
             stat_collector,
             stat_recorded: std::sync::atomic::AtomicBool::new(false),
             fullscreen_cached: std::sync::atomic::AtomicBool::new(false),
+            #[cfg(windows)]
+            host_render: std::sync::OnceLock::new(),
         });
         // 命令栏：装配 Services（ime/config/dict 后端）+ 自身 Weak 引用。
         coordinator.init_cmdbar();
@@ -1272,6 +1315,10 @@ impl Coordinator {
                 self.notify_toolbar(); // 工具栏显隐(visible/全屏)按新配置即时刷新
                 self.sync_global_hotkeys(); // keys.global_hotkeys 增删/改键即时生效
                 self.sync_direct_switch_hotkey(); // keys.activate_ime 改键/清空即时生效
+                #[cfg(windows)]
+                if let Some(mgr) = self.host_render() {
+                    mgr.set_whitelist(new_cfg.compat.host_render_processes.clone());
+                }
                 self.show_toast(
                     "设置已更新",
                     ToastPosition::BottomCenter,
@@ -1718,8 +1765,10 @@ impl Coordinator {
         // 延迟首次显示：新组合首帧若非经授权（reflow 后权威坐标 / 兜底 timer）则不立即显示，
         // 改 arm 兜底 timer，待 handle_caret_update 的权威坐标或超时再首显。避免在 reflow 前的
         // 陈旧坐标处先显示、reflow 后再跳（根治"上屏后立即输入候选窗错位约一个上屏宽度"）。
-        // 例外：仅显示模式标记（无候选/无编码）时跳过延迟——进入模式时缓冲为空、无刚上屏文字，
+        // 例外①：仅显示模式标记（无候选/无编码）时跳过延迟——进入模式时缓冲为空、无刚上屏文字，
         // 光标无 reflow 跳动风险，强制延迟只会让状态提示迟钝。
+        // 例外②：host-render 受限宿主（SearchHost.exe / 开始菜单搜索框）：候选窗由服务端直接绘制
+        // 到 SHM，无需等宿主 reflow；首帧直显，跳过 pending_first_show 等待。
         let only_mode_label =
             !mode_label.is_empty() && state.candidates.is_empty() && state.input_buffer.is_empty();
         let authorized = self
@@ -1731,6 +1780,7 @@ impl Coordinator {
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
             && !only_mode_label
+            && !self.host_render_active()
         {
             self.arm_pending_first_show();
             return;
@@ -2201,13 +2251,20 @@ impl Coordinator {
             "push_activation_status: chinese={} key_down={:?} key_up={:?}",
             s.chinese_mode, s.key_down_hotkeys, s.key_up_hotkeys
         );
+        #[cfg(windows)]
+        let host_render_avail = self
+            .host_render()
+            .map(|m| m.focused_whitelisted())
+            .unwrap_or(false);
+        #[cfg(not(windows))]
+        let host_render_avail = false;
         let encoded = wind_ipc::codec::encode_activation_status_push(
             s.chinese_mode,
             s.full_width,
             s.chinese_punct,
             s.toolbar_visible,
             s.caps_lock,
-            false,
+            host_render_avail,
             &s.key_down_hotkeys,
             &s.key_up_hotkeys,
             &s.icon_label,
@@ -3893,6 +3950,16 @@ impl MessageHandler for Coordinator {
     }
 
     fn handle_composition_terminated(&self) {
+        // SearchHost.exe / 开始菜单等受限宿主：搜索框不支持 TSF composition，
+        // DLL 每次设置 composition 后宿主立即终止，属伪终止事件。
+        // Rust 版无 last_key_time 竞态窗口（对照 Go handle_lifecycle.go:559-572），
+        // host-render 激活时直接忽略清缓冲动作以保留输入状态与候选，
+        // 下一按键的 UpdateComposition 会自动重建 composition。
+        // （host_render_active() 仅在 active 连接已通过白名单 setup 时为 true，
+        //   不会误伤白名单外的普通宿主。）
+        if self.host_render_active() {
+            return;
+        }
         let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
         state.input_buffer.clear();
         state.candidates.clear();
@@ -4068,8 +4135,10 @@ impl MessageHandler for Coordinator {
         })
     }
 
-    fn handle_host_render_request(&self) {}
-    fn handle_host_render_ready(&self) {}
+    fn handle_host_render_failed(&self, reason: u32) {
+        // DLL 侧 host-render 初始化/映射失败：记录告警。后续（Task 6/7）可据此回退渲染路径。
+        warn!("host-render 失败上报 reason={reason}（DLL 退回进程内渲染）");
+    }
 }
 
 /// 对 SystemPhraseEntry 列表做稳定内容哈希（用于启动时判断 TOML 是否有变更）。

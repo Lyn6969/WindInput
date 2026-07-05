@@ -534,7 +534,11 @@ fn separator_full_commit_consumes_all() {
     for c in "an".chars() {
         last = press_letter(&coord, c);
     }
-    assert_eq!(action_text(&last).as_deref(), Some("xi'an"), "缓冲应为 xi'an");
+    assert_eq!(
+        action_text(&last).as_deref(),
+        Some("xi'an"),
+        "缓冲应为 xi'an"
+    );
 
     let texts = coord.debug_page_texts();
     let p = texts

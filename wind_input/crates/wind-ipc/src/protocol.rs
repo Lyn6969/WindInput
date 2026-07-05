@@ -44,6 +44,9 @@ pub const CMD_MENU_ACTION: u16 = 0x0210; // 上行：统一菜单项被选中 (p
 // darwin .app 上报前台上下文（命令直通车 app()/title()/sel() 取值）：
 // payload = appLen u32 + app(UTF-8) + titleLen u32 + title + selLen u32 + sel，均 LE 长度前缀。
 pub const CMD_FRONT_CONTEXT: u16 = 0x0211;
+/// Host render: DLL 侧 Band 窗口创建失败（异步上行，payload = reason u32）。
+/// 服务端收到后记日志并让 UI 回退本地窗口。与 C++ BinaryProtocol.h:36 对齐。
+pub const CMD_HOST_RENDER_FAILED: u16 = 0x0212;
 
 // 光标 & 选区
 pub const CMD_CARET_UPDATE: u16 = 0x0301;
@@ -127,7 +130,46 @@ pub const CMD_SYNC_CONFIG: u16 = 0x0303;
 pub const CMD_CONSUMED: u16 = 0x0401;
 
 // Host Render
+/// 仅 Windows 使用；darwin 端 SHM 名固定（endpoint::shm_name），无 setup 握手。
 pub const CMD_HOST_RENDER_SETUP: u16 = 0x0501;
+
+/// Host 窗口种类（与 C++ HostWindowKind 对齐，BinaryProtocol.h:359-365）
+pub const HOST_WINDOW_CANDIDATE: u32 = 0;
+pub const HOST_WINDOW_TOOLTIP: u32 = 1;
+pub const HOST_WINDOW_STATUS: u32 = 2;
+pub const HOST_WINDOW_KIND_COUNT: usize = 3;
+
+/// CMD_HOST_RENDER_SETUP 响应的单条通道描述（Windows；对齐 C++ HostRenderSetupEntryHeader）
+#[derive(Clone, Debug)]
+pub struct HostRenderSetupEntry {
+    pub window_kind: u32,
+    pub max_buffer_size: u32,
+    pub shm_name: String,
+    pub event_name: String,
+}
+
+/// SHM 内 hit-rect 表条目（20B，对齐 C++ HostRenderHitRect；index<0 为翻页按钮）
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct HostRenderHitRect {
+    pub index: i32,
+    pub x: i32,
+    pub y: i32,
+    pub w: i32,
+    pub h: i32,
+}
+
+impl HostRenderHitRect {
+    pub const SIZE: usize = 20;
+    pub fn to_bytes(&self) -> [u8; Self::SIZE] {
+        let mut b = [0u8; Self::SIZE];
+        b[0..4].copy_from_slice(&self.index.to_le_bytes());
+        b[4..8].copy_from_slice(&self.x.to_le_bytes());
+        b[8..12].copy_from_slice(&self.y.to_le_bytes());
+        b[12..16].copy_from_slice(&self.w.to_le_bytes());
+        b[16..20].copy_from_slice(&self.h.to_le_bytes());
+        b
+    }
+}
 
 // ──────────────────────────────────────────────
 // IPC Header (8 bytes, little-endian)

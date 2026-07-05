@@ -39,6 +39,27 @@ pub struct RenderedFrame {
     pub buf: Vec<u8>,
 }
 
+/// Windows host-render：`render_frame()` 产出的离屏帧（写 SHM + Event 触发用）。
+#[cfg(windows)]
+pub struct RenderedFrame {
+    /// 图像屏幕左上角 X（已含软影 margin 回移）
+    pub screen_x: i32,
+    /// 图像屏幕左上角 Y
+    pub screen_y: i32,
+    /// 图像宽（设备像素）
+    pub width: u32,
+    /// 图像高（设备像素）
+    pub height: u32,
+    /// 渲染缩放（DPI/96.0）
+    pub scale: f32,
+    /// 是否含软件高斯阴影
+    pub software_shadow: bool,
+    /// 候选命中矩形（窗口缓冲坐标，内容起点 (ml,mt)）：(index, Rect)
+    pub hit_rects: Vec<(i32, crate::view::Rect)>,
+    /// 预乘 BGRA 像素缓冲（width×height×4）
+    pub buf: Vec<u8>,
+}
+
 /// 候选词数据
 #[derive(Debug, Clone)]
 pub struct CandidateItem {
@@ -338,6 +359,31 @@ impl CandidateWindow {
         &self.hit_rects
     }
 
+    /// Windows：show 直接复用 render_frame() 渲染结果，blit 到本地 LayeredWindow。
+    /// 与 host-render 路径共用单一渲染逻辑，确保几何完全一致。
+    #[cfg(windows)]
+    pub fn show(&mut self) {
+        match self.render_frame() {
+            None => {
+                self.hide();
+            }
+            Some(frame) => {
+                self.window.resize(frame.width, frame.height);
+                {
+                    let buf = self.window.buffer_mut();
+                    buf[..(frame.width * frame.height * 4) as usize].copy_from_slice(&frame.buf);
+                }
+                if let Err(e) = self.window.update() {
+                    tracing::warn!("CandidateWindow update failed: {}", e);
+                }
+                // render_frame() 已设 visible=true；screen_x/y 为窗口左上（含阴影偏移）。
+                self.window.show(frame.screen_x, frame.screen_y);
+                self.update_tooltip(frame.screen_x, frame.screen_y);
+            }
+        }
+    }
+
+    #[cfg(not(windows))]
     pub fn show(&mut self) {
         // mode_label 非空表示已进入临时模式：即使暂无候选/preedit 也要弹窗显示模式标记。
         if self.candidates.is_empty() && self.preedit.is_empty() && self.mode_label.is_empty() {
@@ -623,6 +669,114 @@ impl CandidateWindow {
         })
     }
 
+    /// Windows host-render：把当前候选状态渲染到一块独立 BGRA 缓冲区并返回，
+    /// 供 host-render 管理器写 SHM + 触发 Event，DLL 侧 HostWindow 读取并显示。
+    /// 镜像 `show()` 的 build/layout/place/collect_hits/paint 流程，但 paint 到自有 Vec，
+    /// 不调 Win32 LayeredWindow API（写 SHM 路径不需要本地窗口）。
+    /// 返回 None 表示应隐藏候选窗（无候选 / 无 preedit / 无模式标记）。
+    #[cfg(windows)]
+    pub fn render_frame(&mut self) -> Option<RenderedFrame> {
+        if self.candidates.is_empty() && self.preedit.is_empty() && self.mode_label.is_empty() {
+            return None;
+        }
+
+        let new_scale = crate::dpi::scale_for_point(self.x, self.y);
+        if (new_scale - self.scale).abs() > 0.01 {
+            self.scale = new_scale;
+            self.text_renderer
+                .set_base_size((self.theme.behavior.font_size as f32) * new_scale);
+        }
+
+        let mut root = self.build_tree(false);
+        let shadow = self.shadow_params();
+        let (ml, mt, mr, mb) = match &shadow {
+            Some(s) => s.margins(),
+            None => (0, 0, 0, 0),
+        };
+        root.layout(ml as f32, mt as f32, &self.text_renderer);
+        let (w_f, h_f) = root.measured_size();
+        let mut content_w = (w_f.ceil() as u32).max(40);
+        if self.vertical && !self.candidates.is_empty() {
+            let vmax = self.theme.behavior.vertical_max_width;
+            if vmax > 0 {
+                let vmax_px = ((vmax as f32 * self.scale).ceil() as u32).max(40);
+                content_w = content_w.min(vmax_px);
+            }
+        }
+        let content_h = (h_f.ceil() as u32).max(24);
+        let width = content_w + ml + mr;
+        let height = content_h + mt + mb;
+
+        // Windows 的 self.y 已是光标底端（与 show() 语义一致），直接传入。
+        let (px0, py0, above) = Self::place_window(
+            self.x,
+            self.y,
+            self.caret_height,
+            content_w,
+            content_h,
+            self.placed_above,
+        );
+        self.placed_above = above;
+        let (px, py) = match self.last_content_pos {
+            Some((lx, ly)) if self.visible => {
+                let thr = (4.0 * self.scale).round().max(1.0) as i32;
+                if (px0 - lx).abs() < thr && (py0 - ly).abs() < thr {
+                    (lx, ly)
+                } else {
+                    (px0, py0)
+                }
+            }
+            _ => (px0, py0),
+        };
+        self.last_content_pos = Some((px, py));
+        if self.flip_when_above && self.placed_above {
+            root = self.build_tree(true);
+            root.layout(ml as f32, mt as f32, &self.text_renderer);
+        }
+
+        self.hit_rects.clear();
+        root.collect_hits(&mut self.hit_rects);
+        {
+            let mut m = self.mouse.borrow_mut();
+            m.hit_rects = self.hit_rects.clone();
+            m.last_hover = -1;
+        }
+
+        let mut buf = vec![0u8; (width * height * 4) as usize];
+        if let Some(s) = &shadow {
+            let radius = self
+                .theme
+                .views
+                .window
+                .border_radius
+                .map(|d| d.resolve(self.scale, 0.0))
+                .unwrap_or(8.0 * self.scale);
+            s.paint(
+                &mut buf,
+                width,
+                height,
+                ml as f32,
+                mt as f32,
+                content_w as f32,
+                content_h as f32,
+                radius,
+            );
+        }
+        root.paint(&mut buf, width, height, &self.text_renderer);
+
+        self.visible = true;
+        Some(RenderedFrame {
+            screen_x: px - ml as i32,
+            screen_y: py - mt as i32,
+            width,
+            height,
+            scale: self.scale,
+            software_shadow: shadow.is_some(),
+            hit_rects: self.hit_rects.clone(),
+            buf,
+        })
+    }
+
     /// 悬停时在该候选下方显示其编码（反查）；无悬停或无编码则隐藏。
     /// `(wx, wy)` 为候选窗口屏幕原点（命中矩形坐标的基准）。
     /// 横排：tooltip 在候选行下方（不足时上翻）。
@@ -669,6 +823,56 @@ impl CandidateWindow {
                 }
                 None => tip.hide(),
             }
+        }
+    }
+
+    /// host-render 专用：渲染当前悬停 tooltip 到 BGRA buffer。
+    /// `(wx, wy)` 为候选窗口屏幕原点（与 render_frame 的 screen_x/y 一致）。
+    /// 返回 `(bgra, w, h, screen_x, screen_y, software_shadow)`；无悬停/无文本返回 None。
+    #[cfg(windows)]
+    pub fn render_tooltip_frame(
+        &mut self,
+        wx: i32,
+        wy: i32,
+    ) -> Option<(Vec<u8>, u32, u32, i32, i32, bool)> {
+        let hover = self.hover;
+        let info = if (0..TAG_PAGE_PREV).contains(&hover) {
+            let code = self
+                .candidates
+                .get(hover as usize)
+                .map(|c| c.tooltip.clone())
+                .unwrap_or_default();
+            self.hit_rects
+                .iter()
+                .find(|(t, _)| *t == hover)
+                .map(|(_, r)| *r)
+                .filter(|_| !code.is_empty())
+                .map(|r| (code, r))
+        } else {
+            None
+        };
+
+        let tip = self.tooltip.as_mut()?;
+        match info {
+            Some((code, r)) => {
+                if self.vertical {
+                    tip.render_frame_beside(
+                        &code,
+                        wx + r.x as i32,
+                        wx + (r.x + r.w) as i32,
+                        wy + r.y as i32,
+                        wy + (r.y + r.h) as i32,
+                    )
+                } else {
+                    tip.render_frame(
+                        &code,
+                        wx + r.x as i32,
+                        wy + r.y as i32,
+                        wy + (r.y + r.h) as i32,
+                    )
+                }
+            }
+            None => None,
         }
     }
 
@@ -1351,6 +1555,17 @@ impl CandidateWindow {
         }
     }
 
+    /// host-render 分流专用：仅隐藏本地 Win32 窗口与 tooltip 窗口，
+    /// 不清除 visible / last_content_pos / placed_above 落位状态。
+    /// render_frame() 已维护这些状态，host 模式内容确实可见，保持 visible=true 更正确。
+    #[cfg(windows)]
+    pub fn hide_local_window_only(&mut self) {
+        self.window.hide();
+        if let Some(t) = self.tooltip.as_mut() {
+            t.hide();
+        }
+    }
+
     /// UI 循环每轮调用：推进悬停防抖（稳定后才发出 Hover 事件）。
     pub fn tick(&self) {
         self.mouse.borrow_mut().flush();
@@ -1358,6 +1573,12 @@ impl CandidateWindow {
 
     pub fn is_visible(&self) -> bool {
         self.visible
+    }
+
+    /// 当前鼠标悬停项（页内下标；翻页器 tag 或 -1=无）。host 分流写帧时作 rendered_hover_index。
+    #[cfg(windows)]
+    pub fn hover(&self) -> i32 {
+        self.hover
     }
 
     pub fn candidates(&self) -> &[CandidateItem] {
@@ -1405,14 +1626,14 @@ impl CandidateMouse {
         if self.engaged {
             return; // 已激活：悬停在 on_message 内即时发出
         }
-        if let Some(at) = self.engage_at {
-            if Instant::now() >= at {
-                self.engaged = true;
-                self.engage_at = None;
-                if self.pending_raw != self.last_hover {
-                    self.last_hover = self.pending_raw;
-                    let _ = self.events.send(UiEvent::Hover(self.pending_raw));
-                }
+        if let Some(at) = self.engage_at
+            && Instant::now() >= at
+        {
+            self.engaged = true;
+            self.engage_at = None;
+            if self.pending_raw != self.last_hover {
+                self.last_hover = self.pending_raw;
+                let _ = self.events.send(UiEvent::Hover(self.pending_raw));
             }
         }
     }

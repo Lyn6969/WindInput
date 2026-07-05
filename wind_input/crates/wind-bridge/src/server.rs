@@ -4,8 +4,21 @@
 //! 每个客户端连接在独立线程中处理（对应 Go 的 goroutine）。
 
 use crate::handler::*;
+#[cfg(windows)]
+use crate::host_render_windows::HostRenderManager;
 use std::sync::Arc;
 use tracing::{debug, error, info, trace, warn};
+
+/// 单条客户端连接的身份（每连接唯一）。
+///
+/// `conn_id` 由服务器从 1 起单调分配（0 保留为 host-render 广播 target）；
+/// `pid` 为管道对端进程 ID（`GetNamedPipeClientProcessId`）。host-render 的
+/// setup/note_focus/cleanup 均以此对定位实例。unix 路径不含身份语义，传 {0,0}。
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct ClientCtx {
+    pub conn_id: u32,
+    pub pid: u32,
+}
 
 /// Bridge 服务器配置
 pub struct BridgeConfig {
@@ -28,11 +41,28 @@ impl Default for BridgeConfig {
 pub struct BridgeServer {
     config: BridgeConfig,
     handler: Arc<dyn MessageHandler>,
+    /// host-render 管理器（Windows）：命名管道连接循环据此为每连接分配实例、
+    /// 应答 HostRenderSetup、断线清理。未注入（None）时 HOST_RENDER_REQUEST 仅回 ACK。
+    #[cfg(windows)]
+    host_render: Option<Arc<HostRenderManager>>,
 }
 
 impl BridgeServer {
     pub fn new(config: BridgeConfig, handler: Arc<dyn MessageHandler>) -> Self {
-        Self { config, handler }
+        Self {
+            config,
+            handler,
+            #[cfg(windows)]
+            host_render: None,
+        }
+    }
+
+    /// 注入 host-render 管理器（Windows）。与 Coordinator 共享同一 `Arc` 实例，
+    /// 使 setup（连接循环）与 write_frame/hide（协调器）作用于同一状态。
+    #[cfg(windows)]
+    pub fn with_host_render(mut self, mgr: Arc<HostRenderManager>) -> Self {
+        self.host_render = Some(mgr);
+        self
     }
 
     /// 获取管道名称
@@ -48,12 +78,13 @@ impl BridgeServer {
 
         let handler = self.handler.clone();
         let timeout_ms = self.config.request_timeout_ms;
+        let host_render = self.host_render.clone();
 
         // 在独立线程中运行阻塞的 Named Pipe 循环
         std::thread::Builder::new()
             .name("bridge-server".into())
             .spawn(move || {
-                run_pipe_server(&pipe_name, handler, timeout_ms);
+                run_pipe_server(&pipe_name, handler, timeout_ms, host_render);
             })?;
 
         Ok(())
@@ -90,11 +121,19 @@ unsafe impl Sync for PipeHandle {}
 
 /// Windows Named Pipe 服务器主循环
 #[cfg(windows)]
-fn run_pipe_server(pipe_name: &str, handler: Arc<dyn MessageHandler>, timeout_ms: u64) {
+fn run_pipe_server(
+    pipe_name: &str,
+    handler: Arc<dyn MessageHandler>,
+    timeout_ms: u64,
+    host_render: Option<Arc<HostRenderManager>>,
+) {
     use std::ffi::CString;
     use windows::Win32::Foundation::*;
     use windows::Win32::Storage::FileSystem::*;
     use windows::Win32::System::Pipes::*;
+
+    // 连接身份计数器：从 1 起单调递增（0 保留为 host-render 广播 target）。
+    let mut next_conn_id: u32 = 1;
 
     let pipe_name_c = match CString::new(pipe_name) {
         Ok(s) => s,
@@ -157,13 +196,26 @@ fn run_pipe_server(pipe_name: &str, handler: Arc<dyn MessageHandler>, timeout_ms
 
         debug!("Client connected to bridge pipe");
 
+        // 分配连接身份：conn_id 单调递增（回绕跳过 0），pid 取对端进程。
+        let conn_id = next_conn_id;
+        next_conn_id = next_conn_id.wrapping_add(1);
+        if next_conn_id == 0 {
+            next_conn_id = 1;
+        }
+        let mut pid: u32 = 0;
+        if unsafe { GetNamedPipeClientProcessId(pipe_handle, &mut pid) }.is_err() {
+            debug!("GetNamedPipeClientProcessId failed for conn_id={}", conn_id);
+        }
+        let ctx = ClientCtx { conn_id, pid };
+
         // 为每个连接启动独立线程
         let handler = handler.clone();
+        let host_render = host_render.clone();
         let pipe = PipeHandle(pipe_handle);
         std::thread::Builder::new()
             .name("bridge-client".into())
             .spawn(move || {
-                handle_client(pipe, handler, timeout_ms);
+                handle_client(pipe, handler, timeout_ms, ctx, host_render);
             })
             .ok();
     }
@@ -171,7 +223,13 @@ fn run_pipe_server(pipe_name: &str, handler: Arc<dyn MessageHandler>, timeout_ms
 
 /// 处理单个客户端连接
 #[cfg(windows)]
-fn handle_client(pipe: PipeHandle, handler: Arc<dyn MessageHandler>, _timeout_ms: u64) {
+fn handle_client(
+    pipe: PipeHandle,
+    handler: Arc<dyn MessageHandler>,
+    _timeout_ms: u64,
+    ctx: ClientCtx,
+    host_render: Option<Arc<HostRenderManager>>,
+) {
     use wind_ipc::codec::*;
     use wind_ipc::protocol::*;
     use windows::Win32::Foundation::*;
@@ -272,7 +330,14 @@ fn handle_client(pipe: PipeHandle, handler: Arc<dyn MessageHandler>, _timeout_ms
         };
 
         // 分发命令到处理器
-        let response = dispatch_command(&handler, header.command, header.is_async(), payload);
+        let response = dispatch_command(
+            &handler,
+            header.command,
+            header.is_async(),
+            payload,
+            ctx,
+            host_render.as_ref(),
+        );
 
         // 写入响应（异步命令返回 None，不写入）
         if let Some(resp) = response {
@@ -308,6 +373,13 @@ fn handle_client(pipe: PipeHandle, handler: Arc<dyn MessageHandler>, _timeout_ms
         }
     }
 
+    // 断线清理：连接彻底消失，移除其 host-render 实例状态并（若为可见 owner）隐藏其帧。
+    // conn_id 单调不复用，故用当前 setup_seq 作 expected_seq（未 setup 时为 0 → 早退，无害）。
+    if let Some(mgr) = host_render.as_ref() {
+        let seq = mgr.setup_seq_of(ctx.conn_id);
+        mgr.cleanup_client(ctx.conn_id, seq);
+    }
+
     unsafe {
         let _ = windows::Win32::System::Pipes::DisconnectNamedPipe(pipe);
         let _ = CloseHandle(pipe);
@@ -327,9 +399,15 @@ pub(crate) fn dispatch_command(
     command: u16,
     is_async: bool,
     payload: &[u8],
+    ctx: ClientCtx,
+    #[cfg(windows)] host_render: Option<&Arc<HostRenderManager>>,
 ) -> Option<Vec<u8>> {
     use wind_ipc::codec::*;
     use wind_ipc::protocol::*;
+
+    // ctx 目前仅 Windows host-render 路径消费；非 Windows 读取两字段以免 dead_code 告警。
+    #[cfg(not(windows))]
+    let _ = (ctx.conn_id, ctx.pid);
 
     match command {
         // ── 按键事件（同步） ──
@@ -384,6 +462,11 @@ pub(crate) fn dispatch_command(
         //   表现为切应用卡顿）。重型 handle_focus_gained（build_status + push 完整激活状态）
         //   延后到 handle_client 写出响应之后再跑，不在 DLL 阻塞路径上（见 handle_client）。
         CMD_FOCUS_GAINED => {
+            // 记录最近焦点实例（host-render 写帧目标）。已 setup 才在 active_target 生效。
+            #[cfg(windows)]
+            if let Some(mgr) = host_render {
+                mgr.note_focus(ctx.conn_id, ctx.pid);
+            }
             if let Ok(fg) = decode_focus_gained(payload) {
                 // 同步 caret（首键前必须就绪，纯字段写入，对齐 Go applyFocusGainedCaret）
                 handler.handle_caret_update(&CaretData {
@@ -426,6 +509,11 @@ pub(crate) fn dispatch_command(
             } else {
                 0
             };
+            // 记录最近焦点实例（host-render 写帧目标）。已 setup 才在 active_target 生效。
+            #[cfg(windows)]
+            if let Some(mgr) = host_render {
+                mgr.note_focus(ctx.conn_id, ctx.pid);
+            }
             // handler 内部完成 activation + push ActivationStatusPush
             handler.handle_ime_activated(token);
             None // 异步命令不返回响应
@@ -509,12 +597,45 @@ pub(crate) fn dispatch_command(
             None
         }
 
-        // ── Host Render 请求（同步） ──
-        // TODO: 返回 EncodeHostRenderSetup（共享内存名称+事件名），当前仅 ACK
+        // ── Host Render 请求（同步，0x0501 == CMD_HOST_RENDER_SETUP） ──
+        // Windows：向管理器注册本连接实例，命中白名单则回 HostRenderSetup（instanceId +
+        // 三 kind 的 SHM/Event 名），否则（未命中白名单/未注入管理器）回 ACK（DLL 退回进程内渲染）。
+        // 非 Windows：host-render 不可用，回 ACK。
         CMD_HOST_RENDER_REQUEST => {
-            handler.handle_host_render_request();
-            handler.handle_host_render_ready();
-            Some(encode_ack())
+            #[cfg(windows)]
+            {
+                if let Some(mgr) = host_render {
+                    match mgr.setup(ctx.conn_id, ctx.pid) {
+                        Ok((instance_id, entries)) => {
+                            return Some(encode_host_render_setup(instance_id, &entries));
+                        }
+                        Err(e) => {
+                            debug!(
+                                "host_render setup 拒绝 conn_id={} pid={}: {}",
+                                ctx.conn_id, ctx.pid, e
+                            );
+                            return Some(encode_ack());
+                        }
+                    }
+                }
+                Some(encode_ack())
+            }
+            #[cfg(not(windows))]
+            {
+                Some(encode_ack())
+            }
+        }
+
+        // ── Host Render 失败上报（DLL 侧初始化/映射失败，异步通知） ──
+        // 载荷首 4 字节为 reason（u32 LE）；交处理器记录（协调器打 WARN）。不回响应。
+        CMD_HOST_RENDER_FAILED => {
+            let reason = if payload.len() >= 4 {
+                u32::from_le_bytes(payload[0..4].try_into().unwrap())
+            } else {
+                0
+            };
+            handler.handle_host_render_failed(reason);
+            None
         }
 
         // ── 光标更新（异步） ──
@@ -677,7 +798,16 @@ pub(crate) fn dispatch_command(
         }
 
         // ── 批处理事件 ──
-        CMD_BATCH_EVENTS => handle_batch_events(handler, payload),
+        CMD_BATCH_EVENTS => {
+            #[cfg(windows)]
+            {
+                handle_batch_events(handler, payload, ctx, host_render)
+            }
+            #[cfg(not(windows))]
+            {
+                handle_batch_events(handler, payload, ctx)
+            }
+        }
 
         // ── 输入统计（异步，TSF 侧英文模式上报）──
         // InputStatsPayload: englishChars(4) + englishDigits(4) + englishPuncts(4)
@@ -706,7 +836,12 @@ pub(crate) fn dispatch_command(
 }
 
 /// 处理批处理事件
-fn handle_batch_events(handler: &Arc<dyn MessageHandler>, payload: &[u8]) -> Option<Vec<u8>> {
+fn handle_batch_events(
+    handler: &Arc<dyn MessageHandler>,
+    payload: &[u8],
+    ctx: ClientCtx,
+    #[cfg(windows)] host_render: Option<&Arc<HostRenderManager>>,
+) -> Option<Vec<u8>> {
     use wind_ipc::codec::*;
     use wind_ipc::protocol::*;
 
@@ -735,24 +870,35 @@ fn handle_batch_events(handler: &Arc<dyn MessageHandler>, payload: &[u8]) -> Opt
         let sub_payload = &payload[offset..offset + sub_payload_len];
         offset += sub_payload_len;
 
-        // Go: 只收集同步命令的响应
-        if !sub_header.is_async() {
-            if let Some(resp) = dispatch_command(
-                handler,
-                sub_header.command,
-                sub_header.is_async(),
-                sub_payload,
-            ) {
-                responses.push(resp);
+        // 分发子命令（cfg-split 转发 host_render）；异步命令仍分发（如 caret update）
+        // 以产生副作用，仅同步命令收集响应（对齐 Go）。
+        let sub_resp = {
+            #[cfg(windows)]
+            {
+                dispatch_command(
+                    handler,
+                    sub_header.command,
+                    sub_header.is_async(),
+                    sub_payload,
+                    ctx,
+                    host_render,
+                )
             }
-        } else {
-            // 异步命令仍需分发（如 caret update），但不收集响应
-            dispatch_command(
-                handler,
-                sub_header.command,
-                sub_header.is_async(),
-                sub_payload,
-            );
+            #[cfg(not(windows))]
+            {
+                dispatch_command(
+                    handler,
+                    sub_header.command,
+                    sub_header.is_async(),
+                    sub_payload,
+                    ctx,
+                )
+            }
+        };
+        if !sub_header.is_async()
+            && let Some(resp) = sub_resp
+        {
+            responses.push(resp);
         }
     }
 
@@ -813,8 +959,158 @@ fn encode_status_update_from_data(status: &StatusUpdateData) -> Vec<u8> {
         status.chinese_punct,
         status.toolbar_visible,
         status.caps_lock,
+        false, // host_render_avail: 此响应路径无法访问 HostRenderManager；C++ 在 activation push 已获得真值
         &status.key_down_hotkeys,
         &status.key_up_hotkeys,
         &status.icon_label,
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicU32, Ordering};
+    use wind_ipc::protocol::{
+        CMD_ACK, CMD_HOST_RENDER_FAILED, CMD_HOST_RENDER_REQUEST, CMD_HOST_RENDER_SETUP, IpcHeader,
+    };
+
+    /// 最小测试 handler：仅记录 host_render_failed 的 reason，其余方法返回安全默认值。
+    #[derive(Default)]
+    struct RecordingHandler {
+        last_failed_reason: AtomicU32,
+    }
+
+    impl MessageHandler for RecordingHandler {
+        fn handle_key_event(&self, _d: &KeyEventData) -> KeyAction {
+            KeyAction::PassThrough
+        }
+        fn handle_focus_gained(&self, _data: &FocusData) -> Option<StatusUpdateData> {
+            None
+        }
+        fn handle_focus_lost(&self) {}
+        fn handle_ime_activated(&self, _client_token: u64) -> Option<StatusUpdateData> {
+            None
+        }
+        fn handle_ime_deactivated(&self) {}
+        fn handle_mode_notify(&self, _flags: u32) {}
+        fn handle_toggle_mode(&self) -> (Option<StatusUpdateData>, String) {
+            (None, String::new())
+        }
+        fn handle_system_mode_switch(
+            &self,
+            _chinese_mode: bool,
+        ) -> (Option<StatusUpdateData>, String) {
+            (None, String::new())
+        }
+        fn handle_menu_command(&self, _command: &str) -> Option<StatusUpdateData> {
+            None
+        }
+        fn handle_composition_terminated(&self) {}
+        fn handle_caret_update(&self, _data: &CaretData) {}
+        fn handle_caret_pending(&self) {}
+        fn handle_selection_changed(&self, _prev_char: u16) {}
+        fn handle_commit_request(&self, _data: &CommitRequestData) -> Option<CommitResultData> {
+            None
+        }
+        fn handle_host_render_failed(&self, reason: u32) {
+            self.last_failed_reason.store(reason, Ordering::SeqCst);
+        }
+    }
+
+    /// 命中白名单（`*`）的连接请求应回 HostRenderSetup（含 instanceId + 三 kind 条目）。
+    #[cfg(windows)]
+    #[test]
+    fn host_render_request_returns_setup_payload() {
+        let pid = std::process::id();
+        let suffix = format!("_srv_setup_{}", pid);
+        let mgr = HostRenderManager::new(&suffix, vec!["*".to_string()]);
+        let handler: Arc<dyn MessageHandler> = Arc::new(RecordingHandler::default());
+        let ctx = ClientCtx { conn_id: 1, pid };
+
+        let resp = dispatch_command(
+            &handler,
+            CMD_HOST_RENDER_REQUEST,
+            false,
+            &[],
+            ctx,
+            Some(&mgr),
+        )
+        .expect("同步命令应有响应");
+
+        let hdr_arr: [u8; IpcHeader::SIZE] = resp[..IpcHeader::SIZE].try_into().unwrap();
+        let header = IpcHeader::from_bytes(&hdr_arr);
+        let cmd = header.command;
+        assert_eq!(cmd, CMD_HOST_RENDER_SETUP, "应回 HostRenderSetup 帧");
+        let p = &resp[IpcHeader::SIZE..];
+        assert_eq!(
+            u32::from_le_bytes(p[0..4].try_into().unwrap()),
+            1,
+            "instanceId 应等于 conn_id"
+        );
+        assert_eq!(
+            u32::from_le_bytes(p[4..8].try_into().unwrap()),
+            3,
+            "应含三 kind 条目"
+        );
+    }
+
+    /// 未命中白名单的连接请求应回 ACK（DLL 退回进程内渲染）。
+    #[cfg(windows)]
+    #[test]
+    fn host_render_request_not_whitelisted_returns_ack() {
+        let pid = std::process::id();
+        let suffix = format!("_srv_reject_{}", pid);
+        // 白名单仅含 notepad.exe，当前测试进程不匹配。
+        let mgr = HostRenderManager::new(&suffix, vec!["notepad.exe".to_string()]);
+        let handler: Arc<dyn MessageHandler> = Arc::new(RecordingHandler::default());
+        let ctx = ClientCtx { conn_id: 1, pid };
+
+        let resp = dispatch_command(
+            &handler,
+            CMD_HOST_RENDER_REQUEST,
+            false,
+            &[],
+            ctx,
+            Some(&mgr),
+        )
+        .expect("同步命令应有响应");
+
+        let hdr_arr: [u8; IpcHeader::SIZE] = resp[..IpcHeader::SIZE].try_into().unwrap();
+        let header = IpcHeader::from_bytes(&hdr_arr);
+        let cmd = header.command;
+        assert_eq!(cmd, CMD_ACK, "未命中白名单应回 ACK");
+    }
+
+    /// HOST_RENDER_FAILED 应把 reason 路由到 handler（跨平台，不涉及管理器）。
+    #[test]
+    fn host_render_failed_routes_reason_to_handler() {
+        let handler = Arc::new(RecordingHandler::default());
+        let dyn_handler: Arc<dyn MessageHandler> = handler.clone();
+        let ctx = ClientCtx { conn_id: 0, pid: 0 };
+        let payload = 42u32.to_le_bytes();
+
+        let resp = {
+            #[cfg(windows)]
+            {
+                dispatch_command(
+                    &dyn_handler,
+                    CMD_HOST_RENDER_FAILED,
+                    true,
+                    &payload,
+                    ctx,
+                    None,
+                )
+            }
+            #[cfg(not(windows))]
+            {
+                dispatch_command(&dyn_handler, CMD_HOST_RENDER_FAILED, true, &payload, ctx)
+            }
+        };
+        assert!(resp.is_none(), "失败通知为异步命令，不应有响应");
+        assert_eq!(
+            handler.last_failed_reason.load(Ordering::SeqCst),
+            42,
+            "reason 应路由到 handler"
+        );
+    }
 }
