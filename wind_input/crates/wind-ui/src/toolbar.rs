@@ -334,8 +334,11 @@ impl Toolbar {
             if i == 0 || is_settings {
                 draw_vsep(self.window.buffer_mut(), w, h, x as u32, self.sep, s);
             }
-            // 悬停底（激活格不画底色，仅靠文字颜色区分）。
-            let cell_bg = if (i as i32) == hover_idx {
+            // 激活格（中文模式）画主题色底 + 高亮文字；悬停格画极淡底。
+            // hl_bg 成对配合 hl_fg（如 msime 白字蓝底），缺底色时白字在亮色工具栏上不可见。
+            let cell_bg = if c.highlight {
+                Some(self.hl_bg)
+            } else if (i as i32) == hover_idx {
                 Some(self.hover_bg)
             } else {
                 None
