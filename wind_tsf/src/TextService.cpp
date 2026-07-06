@@ -452,6 +452,20 @@ public:
             return hr;
         }
 
+        // 诊断用：SetText 报成功后，回读同一 range 的实际内容核对是否真的等于 _text。
+        // 部分宿主（Chromium/Qt 内嵌 TSFTextStore）对 SetText 报 S_OK 但实际渲染结果
+        // 与 TSF 内部模型不一致（自身的编辑事务/diff 机制未正确落地），此时回读仍会
+        // "看起来正确"——用于区分是我们这边 range 算错了，还是宿主渲染层的问题。
+        {
+            WCHAR readback[64] = {};
+            ULONG readbackLen = 0;
+            HRESULT hrRead = pRange->GetText(ec, 0, readback, 63, &readbackLen);
+            std::wstring readbackStr(readback, readbackLen);
+            WIND_LOG_DEBUG_FMT(L"CReplaceBackwardEditSession: readback hr=0x%08X text='%s' expected='%s' match=%d\n",
+                               hrRead, readbackStr.c_str(), _text.c_str(),
+                               (SUCCEEDED(hrRead) && readbackStr == _text) ? 1 : 0);
+        }
+
         // 光标定位到替换文本之后。
         pRange->Collapse(ec, TF_ANCHOR_END);
         TF_SELECTION newSel = {};
@@ -3154,6 +3168,10 @@ BOOL CTextService::InsertText(const std::wstring& text)
 
     for (wchar_t ch : text)
     {
+        // 标记为自生成，避免被自己的 OnTestKeyDown 钩子当成真实按键二次处理
+        // （同 ReplacePrecedingChars 兜底路径，见其注释）。
+        if (_pKeyEventSink != nullptr) _pKeyEventSink->MarkSyntheticKey(VK_PACKET);
+
         INPUT inputDown = {};
         inputDown.type = INPUT_KEYBOARD;
         inputDown.ki.wVk = 0;
@@ -4449,9 +4467,23 @@ BOOL CTextService::UpdateComposition(const std::wstring& text, int caretPos, BOO
 }
 
 // 把光标前 count 个已上屏字符替换为 text（智能符号纠错替换）。
-// 优先走 TSF 同步 EditSession（原子、不受输入队列时序 / 修饰键影响）；失败时回退到
-// SendInput（count 次 Backspace + Unicode 注入 text，两者同入输入队列，顺序一致：
-// 先退格删旧字符，再插入新字符，避免"TSF 同步提交 + 队列退格"的时序倒错）。
+//
+// 默认优先走 TSF 同步范围替换（CReplaceBackwardEditSession：ShiftStart+SetText，
+// 原子、不发任何按键）——这是通用性最好的方案，不依赖修饰键是否松开：用户按住
+// Shift 连续输入多个符号（如连按 Shift+1 多次）也不受影响。失败才回退到真实合成
+// 按键（Backspace × count + Unicode 注入 text，已通过 MarkSyntheticKey 防止被自己
+// 的 OnTestKeyDown 钩子二次处理）。
+//
+// 已知例外（2026-07 实测，Tabby/微信）：这两个宿主自制的 TSFTextStore（Chromium
+// 内嵌 / Qt）会对 ShiftStart+SetText 全程报告成功（hr、hrSession、GetSuccess() 皆
+// S_OK），但实际画面上旧符号没删掉、新符号又插入了一份——不是我们这边 range 算错，
+// 是宿主自己的 TSFTextStore 跟它真实渲染的内容对不上，靠更严格检查 TSF 返回码也
+// 识别不出来。反过来，全局默认改用合成按键又会在 EverEdit 这类应用里撞上 Shift
+// 类标点的发键抑制问题（Shift 还按着时发退格，被宿主解读成别的操作，同样表现为
+// 重复上屏），且用户连续按住 Shift 输入多个符号时无法排队处理。两条路径互有短板，
+// 目前没有对所有宿主都成立的通用方案，因此保留 TSF 优先作为默认（覆盖面更广），
+// Tabby/微信类宿主的问题如果后续真机测试仍然存在，再按宿主进程名特判走合成按键
+// （kTryTsfRangeReplace 换成按 host 判断），而不是全局切换。
 BOOL CTextService::ReplacePrecedingChars(int count, const std::wstring& text)
 {
     if (count <= 0)
@@ -4463,45 +4495,55 @@ BOOL CTextService::ReplacePrecedingChars(int count, const std::wstring& text)
     _lastCompositionText.clear();
     _lastCaretPos = -1;
 
-    ITfDocumentMgr* pDocMgr = nullptr;
-    if (_pThreadMgr != nullptr && SUCCEEDED(_pThreadMgr->GetFocus(&pDocMgr)) && pDocMgr != nullptr)
+    constexpr bool kTryTsfRangeReplace = true;
+    if (kTryTsfRangeReplace)
     {
-        ITfContext* pContext = nullptr;
-        HRESULT hr = pDocMgr->GetTop(&pContext);
-        pDocMgr->Release();
-
-        if (SUCCEEDED(hr) && pContext != nullptr)
+        ITfDocumentMgr* pDocMgr = nullptr;
+        if (_pThreadMgr != nullptr && SUCCEEDED(_pThreadMgr->GetFocus(&pDocMgr)) && pDocMgr != nullptr)
         {
-            CReplaceBackwardEditSession* pEditSession =
-                new CReplaceBackwardEditSession(this, pContext, count, text);
+            ITfContext* pContext = nullptr;
+            HRESULT hr = pDocMgr->GetTop(&pContext);
+            pDocMgr->Release();
 
-            HRESULT hrSession;
-            hr = pContext->RequestEditSession(_tfClientId, pEditSession,
-                                              TF_ES_SYNC | TF_ES_READWRITE, &hrSession);
-            BOOL success = pEditSession->GetSuccess();
-            pEditSession->Release();
-            pContext->Release();
-
-            // 同 CommitText：只信 GetSuccess()，不要求外层 hr/hrSession 也成功。
-            // 部分终端模拟器的 TSF 支持不完整，RequestEditSession 外层可能报告失败，
-            // 但 DoEditSession 里的 ShiftStart+SetText 其实已经原子替换成功；若仍
-            // 按 hr/hrSession 判失败去做 SendInput 退格+重打兜底，就会在已经替换
-            // 正确的文字上再删再打一遍，表现为"文字被复制"。
-            if (success)
+            if (SUCCEEDED(hr) && pContext != nullptr)
             {
-                WIND_LOG_DEBUG_FMT(L"ReplacePrecedingChars: TSF range replace succeeded count=%d\n", count);
-                return TRUE;
+                CReplaceBackwardEditSession* pEditSession =
+                    new CReplaceBackwardEditSession(this, pContext, count, text);
+
+                HRESULT hrSession;
+                hr = pContext->RequestEditSession(_tfClientId, pEditSession,
+                                                  TF_ES_SYNC | TF_ES_READWRITE, &hrSession);
+                BOOL success = pEditSession->GetSuccess();
+                pEditSession->Release();
+                pContext->Release();
+
+                // 同 CommitText：只信 GetSuccess()，不要求外层 hr/hrSession 也成功。
+                // 部分终端模拟器的 TSF 支持不完整，RequestEditSession 外层可能报告失败，
+                // 但 DoEditSession 里的 ShiftStart+SetText 其实已经原子替换成功；若仍
+                // 按 hr/hrSession 判失败去做 SendInput 退格+重打兜底，就会在已经替换
+                // 正确的文字上再删再打一遍，表现为"文字被复制"。
+                if (success)
+                {
+                    WIND_LOG_DEBUG_FMT(L"ReplacePrecedingChars: TSF range replace succeeded count=%d\n", count);
+                    return TRUE;
+                }
+                WIND_LOG_DEBUG_FMT(L"ReplacePrecedingChars: TSF failed (hr=0x%08X, hrSession=0x%08X), falling back to SendInput\n",
+                                   hr, hrSession);
             }
-            WIND_LOG_DEBUG_FMT(L"ReplacePrecedingChars: TSF failed (hr=0x%08X, hrSession=0x%08X), falling back to SendInput\n",
-                               hr, hrSession);
         }
     }
 
-    // 兜底：SendInput count 次 Backspace + Unicode 注入 text。
+    // 真实合成按键：count 次 Backspace + Unicode 注入 text。
+    // 注入前须把每个键标记为"自生成"（MarkSyntheticKey），否则这些合成按键会被
+    // 自己的 OnTestKeyDown 钩子当成真实用户按键二次处理：在 TSF EditSession 本身
+    // 就走不通的宿主（终端模拟器/微信/部分纯文本编辑器）里，退格没被真正放行、
+    // 新字符又被当作"新按键"重新走一遍输入流程，表现为替换后的符号重复上屏。
     std::vector<INPUT> inputs;
     inputs.reserve((size_t)count * 2 + text.length() * 2);
     for (int i = 0; i < count; i++)
     {
+        if (_pKeyEventSink != nullptr) _pKeyEventSink->MarkSyntheticKey(VK_BACK);
+
         INPUT down = {};
         down.type = INPUT_KEYBOARD;
         down.ki.wVk = VK_BACK;
@@ -4515,6 +4557,8 @@ BOOL CTextService::ReplacePrecedingChars(int count, const std::wstring& text)
     }
     for (wchar_t ch : text)
     {
+        if (_pKeyEventSink != nullptr) _pKeyEventSink->MarkSyntheticKey(VK_PACKET);
+
         INPUT down = {};
         down.type = INPUT_KEYBOARD;
         down.ki.wScan = ch;
@@ -4630,6 +4674,10 @@ fallback:
 
     for (wchar_t ch : full)
     {
+        // 标记为自生成，避免被自己的 OnTestKeyDown 钩子当成真实按键二次处理
+        // （同 ReplacePrecedingChars 兜底路径，见其注释）。
+        if (_pKeyEventSink != nullptr) _pKeyEventSink->MarkSyntheticKey(VK_PACKET);
+
         INPUT inputDown = {};
         inputDown.type = INPUT_KEYBOARD;
         inputDown.ki.wVk = 0;

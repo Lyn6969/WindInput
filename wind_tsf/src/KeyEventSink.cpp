@@ -1774,9 +1774,13 @@ BOOL CKeyEventSink::_HandleServiceResponse()
 
     case ResponseType::ReplaceBackward:
         {
-            // 智能符号：删除光标前 N 个字符并插入替换文本（同步 TSF 范围替换，
-            // 失败时内部回退 SendInput）。不走 _SimulatePairKey，避免"TSF 同步提交 +
-            // 队列退格"的时序倒错，以及 Shift 类标点的发键抑制问题。
+            // 智能符号：删除光标前 N 个字符并插入替换文本。默认走 TSF 同步范围替换
+            // （见 TextService::ReplacePrecedingChars），不发合成按键——不依赖修饰键
+            // 是否松开，用户按住 Shift 连续输入多个符号也不受影响；只有 TSF 失败时
+            // 才回退到 SendInput，那种情况下才可能受 Shift 类标点的发键抑制问题影响
+            // （已知 Chromium/Qt 部分宿主的 TSFTextStore 会谎报替换成功，届时若仍需要
+            // 兼容，走按宿主进程名特判，而不是默认全局改用合成按键——见
+            // ReplacePrecedingChars 里 kTryTsfRangeReplace 的取舍说明）。
             WIND_LOG_DEBUG(L"Processing ReplaceBackward response (smart symbol)\n");
             _pTextService->ReplacePrecedingChars(response.replaceCount, response.text);
             _isComposing = FALSE;
