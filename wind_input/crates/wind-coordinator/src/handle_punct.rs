@@ -155,9 +155,14 @@ impl Coordinator {
                     } else {
                         // press1 时有活跃编码，中文标点已作文本顶屏提交，非组合态 → 降级走
                         // DeleteReplace 路径：检查 prev_char 再 ReplaceBackward。
+                        // prev_char==0 视为"宿主读不回文档"（微信/Windows Terminal 等 Qt/
+                        // ConPTY 宿主的 TSF OnEndEdit 里 GetSelection/GetText 经常拿不到内容），
+                        // 而不是"确定不匹配"——press2 时光标前必然至少有 press1 刚提交的符号，
+                        // 真读到 0 只可能是读失败。此时退回只信服务端自己的武装态
+                        // （armed+key+timeout，与文档内容无关），否则永远判定不是 press2。
                         let armed_runes: Vec<char> = arm.str.chars().collect();
                         if let Some(&last) = armed_runes.last()
-                            && last as u32 == prev_char as u32
+                            && (prev_char == 0 || last as u32 == prev_char as u32)
                             && let Some(rep) = self.compute_punct_str_pure(state, ch, false)
                         {
                             arm.armed = false;
@@ -179,10 +184,11 @@ impl Coordinator {
                     }
                 }
                 SmartMethod::DeleteReplace => {
-                    // 原逻辑：光标前字符须与武装串末位匹配。
+                    // 光标前字符须与武装串末位匹配；prev_char==0 视为宿主读不回文档
+                    // （见上面 HoldComposition->fallback 分支的同类注释），退回只信武装态。
                     let armed_runes: Vec<char> = arm.str.chars().collect();
                     if let Some(&last) = armed_runes.last()
-                        && last as u32 == prev_char as u32
+                        && (prev_char == 0 || last as u32 == prev_char as u32)
                         && let Some(rep) = self.compute_punct_str_pure(state, ch, false)
                     {
                         arm.armed = false;
