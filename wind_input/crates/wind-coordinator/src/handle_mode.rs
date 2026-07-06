@@ -737,8 +737,9 @@ impl Coordinator {
         // 必须前置于下方数字透镜——否则 ; 等会被 printable_char 当表达式字符吞进缓冲。
         if state.mix_buffer.is_empty()
             && state.committed_text.is_empty()
+            && data.modifiers & MOD_SHIFT == 0
             && self.match_mix_trigger(data.key_code) == Some(state.mix_id)
-            && let Some(ch) = punct_char(data.key_code, data.modifiers & MOD_SHIFT != 0)
+            && let Some(ch) = punct_char(data.key_code, false)
         {
             let out = self.convert_punct_char(state, ch);
             self.record_commit(&out, 0, -1, wind_store::stats::CommitSource::Punctuation);

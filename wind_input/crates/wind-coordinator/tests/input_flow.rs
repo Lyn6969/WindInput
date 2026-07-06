@@ -1051,6 +1051,25 @@ fn test_quick_input_double_semicolon_outputs_literal() {
     assert_eq!(action_text(&act).unwrap(), "a");
 }
 
+
+#[test]
+fn test_quick_input_colon_enters_numeric_symbol_lens() {
+    if !has_schemas() {
+        return;
+    }
+    let coord = Coordinator::new_headless(config_with("wubi86"), Some(&data_dir()));
+    coord.handle_key_event(&key_event(0xBA, EVENT_KEY_DOWN)); // ; 进入快捷输入
+
+    // 冒号与分号共用 VK_OEM_1，但带 Shift；它应作为数字/符号输入进入 mix 缓冲，
+    // 不应被误判为“触发键二次按下”而直接上屏中文冒号。
+    match press_vk(&coord, 0xBA, true) {
+        KeyAction::UpdateComposition { text, .. } => {
+            assert_eq!(text, ";:", "冒号应进入快捷输入数字/符号模式");
+        }
+        other => panic!("冒号应更新快捷输入组合区，实际: {:?}", other),
+    }
+}
+
 #[test]
 fn test_quick_input_esc_exits() {
     if !has_schemas() {
