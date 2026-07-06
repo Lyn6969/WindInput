@@ -17,6 +17,7 @@ use wind_ui::manager::CandidateOp;
 impl Coordinator {
     /// 记录一次选词到 redb FREQ（词频维度：count+1、last_used=now，按 schema+code+text）。
     /// 词频是与权重解耦的独立维度（frequency.md），仅记真实使用数据；redb 事务即时持久。
+    /// 未开启「自动调频」（`schema.codetable/pinyin.frequency.enabled`）时不记录，避免关闭功能后仍写库。
     pub(crate) fn record_selection(&self, code: &str, text: &str, source: CandidateSource) {
         if text.is_empty() {
             return;
@@ -33,6 +34,10 @@ impl Coordinator {
             }
         }
         if let Some(store) = &self.store {
+            // 未开启「自动调频」则不记录（配置说关、代码却记的潜在 bug，对齐 apply_freq_rerank 的开关检查）。
+            if !self.engine_mgr.freq_settings().enabled {
+                return;
+            }
             let schema = self.engine_mgr.active_schema_id();
             // 归属 id：非混输折叠自身/拼音；混输按候选来源分流，无法归因则跳过本次记频。
             let Some(schema) = self.engine_mgr.write_data_schema_id(&schema, source) else {
