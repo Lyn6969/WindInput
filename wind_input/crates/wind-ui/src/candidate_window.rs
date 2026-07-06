@@ -1152,7 +1152,9 @@ impl CandidateWindow {
                         self.preedit.clone(),
                         col(v.preedit_bar.text_color, [100, 100, 100, 255]),
                     )
-                    .font_size(preedit_fs),
+                    .font_size(preedit_fs)
+                    .font_weight(v.preedit_bar.font_weight)
+                    .font_family(v.preedit_bar.font_family.clone()),
                 );
             if let Some(vi) = self.rv_image(v.preedit_bar.bg_image.as_ref()) {
                 band = band.bg_image(vi);
@@ -1176,6 +1178,8 @@ impl CandidateWindow {
                     col(v.mode_label.text_color, [120, 120, 128, 255]),
                 )
                 .font_size(ml_fs)
+                .font_weight(v.mode_label.font_weight)
+                .font_family(v.mode_label.font_family.clone())
                 .margin(Edges {
                     l: 12.0 * s,
                     ..Edges::default()
@@ -1274,6 +1278,8 @@ impl CandidateWindow {
                     col(v.preedit_bar.text_color, [100, 100, 100, 255]),
                 )
                 .font_size(preedit_fs)
+                .font_weight(v.preedit_bar.font_weight)
+                .font_family(v.preedit_bar.font_family.clone())
                 .margin(sep),
             );
         }
@@ -1300,6 +1306,8 @@ impl CandidateWindow {
                 col(v.mode_label.text_color, [120, 120, 128, 255]),
             )
             .font_size(ml_fs)
+            .font_weight(v.mode_label.font_weight)
+            .font_family(v.mode_label.font_family.clone())
             .margin(sep);
             // 主题为 mode_label 配了底色 → 渲染为小徽标（圆角 + 内边距）以更醒目。
             if let Some(bg) = v.mode_label.bg_color {

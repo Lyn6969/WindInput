@@ -517,6 +517,9 @@ pub struct Coordinator {
     pub(crate) theme_name: Mutex<String>,
     /// 主题颜色风格：0=跟随系统 1=亮色 2=暗色
     pub(crate) theme_style: Mutex<u8>,
+    /// 当前主题定义的序号槽位字符（views.index.labels）；push_theme 载入时刷新。
+    /// 序号优先级：用户配置 index_labels > 本字段 > 默认数字。
+    pub(crate) theme_index_labels: Mutex<Vec<String>>,
     /// 命令栏（cmdbar）服务束（ime/config/dict 等动作后端），构造后由 init_cmdbar 装配。
     pub(crate) cmdbar_services: std::sync::OnceLock<wind_cmdbar::Services>,
     /// 自身 Weak 引用：$CC 命令在独立线程异步执行（避免持 state 锁回调自锁方法致死锁）。
@@ -1027,6 +1030,7 @@ impl Coordinator {
             themes_dir,
             theme_name: Mutex::new(initial_theme),
             theme_style: Mutex::new(theme_style_init),
+            theme_index_labels: Mutex::new(Vec::new()),
             cmdbar_services: std::sync::OnceLock::new(),
             self_weak: std::sync::OnceLock::new(),
             recent_commits: Mutex::new(std::collections::VecDeque::new()),
@@ -1738,6 +1742,30 @@ impl Coordinator {
         });
     }
 
+    /// 第 `i` 个候选（0 基）的序号标签，按「用户配置 > 主题 > 默认数字」裁决：
+    /// ① 用户 `ui.candidate.index_labels` 显式设了该槽位 → 用之；
+    /// ② 否则当前主题 `views.index.labels` 有非空槽位 → 用之；
+    /// ③ 否则回退默认 (i+1)。
+    fn resolve_index_label(
+        &self,
+        cand_cfg: &wind_config::config::UiCandidateConfig,
+        i: usize,
+    ) -> String {
+        if let Some(s) = cand_cfg.user_index_label(i) {
+            return s;
+        }
+        if let Some(s) = self
+            .theme_index_labels
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(i)
+            .filter(|s| !s.is_empty())
+        {
+            return s.clone();
+        }
+        (i + 1).to_string()
+    }
+
     pub(crate) fn notify_ui_update(&self, state: &State) {
         // 模式指示标记（拼/双/快/英/符）：仅在候选为空时显示（进入模式/无候选阶段），
         // 一旦有候选即隐藏，减少干扰。必须纳入下方"空则隐藏"守卫——否则进入模式时
@@ -1849,7 +1877,7 @@ impl Coordinator {
                     label: if alpha {
                         ((b'a' + i as u8) as char).to_string()
                     } else {
-                        cand_cfg.index_label(i)
+                        self.resolve_index_label(cand_cfg, i)
                     },
                     tooltip,
                     // 编码提示:码表候选的剩余编码由码表引擎在 convert 时已填入 c.comment(故 !empty 时保留);

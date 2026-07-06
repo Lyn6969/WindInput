@@ -140,6 +140,10 @@ pub struct RvViews {
     /// 弹出菜单容器（menu.root）：背景图/层 + 容器色。item/separator 颜色仍走 palette。
     pub menu_root: Option<RvNode>,
 
+    /// 仅 index：主题定义的序号槽位字符（≤10）。空槽/越界回退。
+    /// 优先级由协调器裁决：用户配置 index_labels > 本字段 > 默认数字。
+    pub index_labels: Vec<String>,
+
     // 列表级几何（V3-D 属性归位：从 candidate_list / window / accent_bar 节点读取）。
     pub item_spacing: Option<Dim>,
     pub window_gap: Option<Dim>,

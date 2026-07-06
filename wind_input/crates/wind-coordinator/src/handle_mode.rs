@@ -309,6 +309,11 @@ impl Coordinator {
         match wind_theme::load_resolved_dirs(&dirs, name, is_dark) {
             Ok(t) => {
                 info!("Loaded theme: {} (dark={})", name, is_dark);
+                // 记录主题定义的序号槽位，供 index_label 裁决「用户 > 主题 > 默认」。
+                *self
+                    .theme_index_labels
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner()) = t.views.index_labels.clone();
                 let _ = self.ui_tx.send(UiCommand::SetTheme(Box::new(t)));
             }
             Err(e) => warn!("Failed to load theme {}: {}", name, e),

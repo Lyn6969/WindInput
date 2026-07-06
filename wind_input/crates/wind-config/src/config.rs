@@ -1319,6 +1319,12 @@ impl UiCandidateConfig {
         (i + 1).to_string()
     }
 
+    /// 用户配置的第 `i` 个序号槽位（0 基）：仅当用户显式设置了 index_labels 且槽位存在
+    /// 时返回该字符，否则 None。供协调器裁决「用户 > 主题 > 默认」优先级（主题层在 None 时接手）。
+    pub fn user_index_label(&self, i: usize) -> Option<String> {
+        self.index_labels.chars().nth(i).map(|c| c.to_string())
+    }
+
     /// 按 max_chars 截断候选显示文本（0=不限）。超出时截断（不加省略号，对齐 Go）。
     pub fn truncate_display(&self, text: &str) -> String {
         if self.max_chars == 0 {
@@ -1965,6 +1971,19 @@ mod tests {
             "截断到 4 字"
         );
         assert_eq!(c.truncate_display("一二"), "一二", "不足不截");
+    }
+
+    #[test]
+    fn test_user_index_label_optional() {
+        // 用户显式设置：已配槽位返回 Some，越界返回 None（主题层可接手）。
+        let cfg = merged_with("[ui.candidate]\nindex_labels = \"asdf\"\n");
+        let c = cfg.ui.candidate;
+        assert_eq!(c.user_index_label(0), Some("a".to_string()));
+        assert_eq!(c.user_index_label(3), Some("f".to_string()));
+        assert_eq!(c.user_index_label(4), None, "越界→None（让位主题/默认）");
+        // 未配置：全 None，优先级完全交给主题/默认。
+        let d = merged_with("").ui.candidate;
+        assert_eq!(d.user_index_label(0), None);
     }
 
     #[test]

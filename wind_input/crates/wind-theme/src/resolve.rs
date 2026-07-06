@@ -393,6 +393,8 @@ fn resolve_views(v: &Views, palette: &HashMap<String, Rgba>, is_dark: bool) -> R
         resolve_state(v.comment.selected.as_deref(), palette, is_dark, None, None);
     rv.comment.hover = resolve_state(v.comment.hover.as_deref(), palette, is_dark, None, None);
 
+    // 序号槽位字符（index 节点）：透传到 Resolved，协调器裁决优先级（用户 > 主题 > 默认）。
+    rv.index_labels = v.index.labels.clone();
     // 列表级几何（candidate_list 节点）。
     rv.item_spacing = v.candidate_list.gap;
     rv.window_gap = v.candidate_list.band_gap;
@@ -469,6 +471,21 @@ mod tests {
 
     fn load_jidian(is_dark: bool) -> Resolved {
         load_resolved_dirs(&[testdata_dir(), data_dir()], "jidian-classic", is_dark).unwrap()
+    }
+
+    #[test]
+    fn test_index_labels_survive_resolve() {
+        // 主题 [index] labels 经 normalize→typed→resolve 全链路存活到 Resolved.views.index_labels。
+        // 协调器据此裁决「用户 > 主题 > 默认」；此测只验证主题层承载不丢。
+        let text = "[index]\nlabels = [\"①\", \"②\", \"③\"]\n";
+        let value: toml::Value = toml::from_str(text).unwrap();
+        let normalized = crate::normalize::normalize_theme(value);
+        let theme: Theme = normalized.try_into().unwrap();
+        let r = resolve(&theme, false, &[data_dir()]);
+        assert_eq!(
+            r.views.index_labels,
+            vec!["①".to_string(), "②".to_string(), "③".to_string()],
+        );
     }
 
     #[test]
