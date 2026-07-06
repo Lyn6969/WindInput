@@ -139,7 +139,20 @@ impl Engine for CodeTableEngine {
         }
 
         candidates.sort_by(better);
-        candidates.truncate(max_candidates);
+        // 截断保护精确匹配：单字母等短输入下前缀候选可达数百，若纯按权重截断，低权重的精确
+        // 全码（code==input，如五笔一/二级简码）会被高权重前缀词组挤出配额而丢失（此后协调器
+        // 再排也找不回）。仅在超额时做一次「精确优先」稳定分区截断——精确候选必留、其余按 better
+        // 序填满剩余配额——再恢复 better 显示序。不持久化 is_prefix：跨来源权重档位（混输码表
+        // ÷100 拼音等）不受影响，纯码表显示序也维持权重主导。
+        if candidates.len() > max_candidates {
+            candidates.sort_by(|a, b| {
+                (a.code != input)
+                    .cmp(&(b.code != input))
+                    .then_with(|| better(a, b))
+            });
+            candidates.truncate(max_candidates);
+            candidates.sort_by(better);
+        }
 
         // 编码提示(码表自身):前缀候选标注「剩余编码」=候选全码去掉已输入前缀(对齐 Go codetable.go)。
         // 精确候选(code==input)剩余为空 → 不标注。已有 comment 的候选不覆盖。
@@ -153,7 +166,16 @@ impl Engine for CodeTableEngine {
         }
 
         let is_empty = candidates.is_empty();
-        let (should_commit, commit_text) = match self.should_auto_commit(input, &candidates) {
+        // has_longer 一次求值复用：自动上屏判定与满码空码清空共用同一「更长后继」前缀扫描，
+        // 避免每次按键各查一次 search_prefix（此前经 should_auto_commit + should_clear 两次）。
+        let has_longer = self.has_longer_code(input);
+        let (should_commit, commit_text) = match decide_auto_commit(
+            self.opts.auto_commit_at_full,
+            self.opts.auto_commit_min_len,
+            input,
+            &candidates,
+            has_longer,
+        ) {
             Some(text) => (true, text),
             None => (false, String::new()),
         };
@@ -161,7 +183,7 @@ impl Engine for CodeTableEngine {
         let should_clear = is_empty
             && self.opts.clear_on_empty_max
             && input.chars().count() >= self.max_code_length
-            && !self.has_longer_code(input);
+            && !has_longer;
         Ok(ConvertResult {
             candidates,
             preedit_display: input.to_string(),
@@ -424,6 +446,33 @@ mod tests {
         assert_eq!(r.candidates[0].text, "你");
         assert_eq!(r.candidates[0].comment, "c", "补全候选应标注剩余编码");
         assert!(!r.should_commit, "补全候选不应触发自动上屏");
+    }
+
+    #[test]
+    fn truncate_protects_low_weight_exact_match() {
+        // 精确全码 "aa"→式(权重 1) + 5 个高权重前缀词(code="aab".."aaf",权重 1000)。
+        // max_candidates=3：纯按权重截断会把低权重精确「式」挤出配额丢失；分区保护须保留它。
+        let e = engine_opts(
+            &[
+                ("aa", "式", 1),
+                ("aab", "A", 1000),
+                ("aac", "B", 1000),
+                ("aad", "C", 1000),
+                ("aae", "D", 1000),
+                ("aaf", "E", 1000),
+            ],
+            CommitOptions::default(),
+        );
+        let r = e.convert("aa", 3).unwrap();
+        assert_eq!(r.candidates.len(), 3, "应截断到 3 条");
+        assert!(
+            r.candidates.iter().any(|c| c.text == "式"),
+            "低权重精确全码不应被高权重前缀词截断挤出，实际: {:?}",
+            r.candidates
+                .iter()
+                .map(|c| c.text.as_str())
+                .collect::<Vec<_>>()
+        );
     }
 
     #[test]
