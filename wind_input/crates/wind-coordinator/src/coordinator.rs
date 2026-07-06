@@ -1456,6 +1456,13 @@ impl Coordinator {
         (s.current_page, s.selected_index, self.total_pages(&s))
     }
 
+    /// 将统计采集器内存数据落库（测试/诊断用；生产由后台线程定时 flush）。
+    pub fn debug_flush_stats(&self) {
+        if let Some(c) = self.stat_collector.as_ref() {
+            c.flush();
+        }
+    }
+
     /// 当前页候选文本列表（内部简体；测试/诊断用）
     pub fn debug_page_texts(&self) -> Vec<String> {
         let s = self.state.lock().unwrap_or_else(|e| e.into_inner());

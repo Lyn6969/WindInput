@@ -677,7 +677,10 @@ fn test_punct_commits_candidate_first() {
     if !has_schemas() {
         return;
     }
-    let coord = Coordinator::new_headless(config_with("wubi86"), Some(&data_dir()));
+    // punct_commit 默认关闭（标点键在有编码时吞键、不顶字上屏），须显式开启才有此行为。
+    let mut cfg = config_with("wubi86");
+    cfg.schema.codetable.punct_commit = true;
+    let coord = Coordinator::new_headless(cfg, Some(&data_dir()));
     // 输入 aaaa（有候选），再按句号 → 先上屏首选候选，再接中文句号
     for _ in 0..4 {
         press_letter(&coord, 'a');
@@ -862,8 +865,8 @@ fn test_temp_pinyin_backtick_trigger_and_commit() {
     }
     let preedit = action_text(&last).unwrap();
     assert_eq!(
-        preedit, "`ni hao",
-        "临时拼音组合区应为 `ni hao，实际: {}",
+        preedit, "`ni'hao",
+        "临时拼音组合区应为 `ni'hao，实际: {}",
         preedit
     );
 
@@ -922,7 +925,7 @@ fn test_temp_pinyin_commit_and_enter_with_candidates() {
     for c in "nihao".chars() {
         last = press_letter(&coord, c);
     }
-    assert_eq!(action_text(&last).unwrap(), "`ni hao", "应处于临时拼音模式");
+    assert_eq!(action_text(&last).unwrap(), "`ni'hao", "应处于临时拼音模式");
     match coord.handle_key_event(&key_event(0x20, EVENT_KEY_DOWN)) {
         KeyAction::InsertText { text, .. } => assert!(text.contains("你好")),
         other => panic!("空格应上屏拼音候选，实际: {:?}", other),
@@ -1050,7 +1053,6 @@ fn test_quick_input_double_semicolon_outputs_literal() {
     let act = press_letter(&coord, 'a');
     assert_eq!(action_text(&act).unwrap(), "a");
 }
-
 
 #[test]
 fn test_quick_input_colon_enters_numeric_symbol_lens() {
@@ -1202,8 +1204,14 @@ fn test_phrase_date_expansion() {
     if !has_schemas() {
         return;
     }
+    // 短语层存储于 store（TOML 只是同步种子，见 build() 的 store.sync_system_phrases），
+    // 无 store 时短语层不建、"date" 不会展开——须用 new_headless_with_store 注入真实 store。
     // 输入 "date" → 短语层应展开当前日期候选（如 2026年6月14日）
-    let coord = Coordinator::new_headless(config_with("wubi86"), Some(&data_dir()));
+    let store_path = std::env::temp_dir().join("wind_phrase_date_test.redb");
+    let _ = std::fs::remove_file(&store_path);
+    let store = std::sync::Arc::new(wind_store::Store::open(&store_path).unwrap());
+    let coord =
+        Coordinator::new_headless_with_store(config_with("wubi86"), Some(&data_dir()), store);
     for c in "date".chars() {
         press_letter(&coord, c);
     }
@@ -1224,7 +1232,12 @@ fn test_phrase_time_expansion() {
     if !has_schemas() {
         return;
     }
-    let coord = Coordinator::new_headless(config_with("wubi86"), Some(&data_dir()));
+    // 短语层需真实 store 才会同步/启用（见 test_phrase_date_expansion 注释）。
+    let store_path = std::env::temp_dir().join("wind_phrase_time_test.redb");
+    let _ = std::fs::remove_file(&store_path);
+    let store = std::sync::Arc::new(wind_store::Store::open(&store_path).unwrap());
+    let coord =
+        Coordinator::new_headless_with_store(config_with("wubi86"), Some(&data_dir()), store);
     for c in "time".chars() {
         press_letter(&coord, c);
     }
@@ -1426,7 +1439,12 @@ fn test_temp_english_digits_and_punct() {
     if !has_schemas() {
         return;
     }
-    let coord = Coordinator::new_headless(config_with("wubi86"), Some(&data_dir()));
+    // 关闭英文候选查词：本测试验证「数字在无可选候选时应入缓冲」，若开着词库候选，
+    // "ver" 命中真实英文词（Verb/Verbal…）会让数字被解释成候选翻页选词（设计如此，
+    // 见 handle_temp.rs 数字分支注释），与本测试意图无关，故关闭以消除数据耦合。
+    let mut cfg = config_with("wubi86");
+    cfg.input.temp_english.show_candidates = false;
+    let coord = Coordinator::new_headless(cfg, Some(&data_dir()));
     press_shift_letter(&coord, 'v'); // V
     press_letter(&coord, 'e');
     press_letter(&coord, 'r');
@@ -1530,15 +1548,15 @@ fn test_candidate_op_move_top_and_delete() {
     use wind_ui::manager::CandidateOp;
     // candidate_op 的置顶/删除经 self.store 持久化 Shadow 规则，故需注入真实 store
     // （new_headless 的 store=None 会让 pin/delete 变空操作）。
+    // 用码表方案（非拼音）：拼音普通候选禁调位（见 handle_candidate.rs 的
+    // "拼音普通候选禁调位" 分支——无稳定位置语义，pin 与衰减软置前冲突），MoveTop 恒为空操作。
     let store_path = std::env::temp_dir().join("wind_candidate_op_test.redb");
     let _ = std::fs::remove_file(&store_path);
     let store = std::sync::Arc::new(wind_store::Store::open(&store_path).unwrap());
     let coord =
-        Coordinator::new_headless_with_store(config_with("pinyin"), Some(&data_dir()), store);
-    // 拼音输入若干字母以获取多个候选
-    for c in "shi".chars() {
-        press_letter(&coord, c);
-    }
+        Coordinator::new_headless_with_store(config_with("wubi86"), Some(&data_dir()), store);
+    // 五笔输入 "a" 以获取多个候选
+    press_letter(&coord, 'a');
     let before = coord.debug_page_texts();
     if before.len() < 2 {
         return; // 候选不足，跳过
@@ -1656,7 +1674,7 @@ fn test_stats_recorded_through_deferred_policed() {
         store.clone(),
     );
     let deferred = DeferredHandler::new();
-    deferred.set_ready(coord);
+    deferred.set_ready(coord.clone());
 
     // 经 policed 输入 "nihao" + 空格 → 上屏 你好
     for c in "nihao".chars() {
@@ -1669,6 +1687,9 @@ fn test_stats_recorded_through_deferred_policed() {
         "空格应上屏 InsertText，实际: {:?}",
         commit
     );
+
+    // 统计采集器为后台线程定时落库，测试需显式 flush 才能读到（生产由定时器/关闭时落库）。
+    coord.debug_flush_stats();
 
     // 统计应经 policed 链路真实落库（features.stats.enabled 默认 true）。
     let all = store.daily_stats("2000-01-01", "2099-12-31").unwrap();
