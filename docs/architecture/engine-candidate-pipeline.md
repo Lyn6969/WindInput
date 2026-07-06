@@ -136,10 +136,15 @@ DAT 从已排序编码列表 BFS 直接构建，峰值内存仅 base/check 两�
  ├─ ② 前缀匹配   dm.search_prefix(input)    仅 !single_code_input 时；按 text 与①去重
  └─ ③ 空码补全   search_prefix(input, 8) 取首个 code≠input 的候选
                   仅 single_code_complete 且①②为空且未满码时
- → better() 排序 → truncate
+ → better() 排序 → truncate（截断保护精确匹配，见下）
  → show_code_hint 时前缀候选 comment 标注剩余编码
- → 自动上屏判定 / 满码空码清空
+ → 自动上屏判定 / 满码空码清空（has_longer_code 单次求值复用）
 ```
+
+**截断保护精确匹配**：短输入（如单字母）前缀候选可达数百，纯按权重 `truncate` 会把低权重的精确
+全码（五笔一/二级简码等 `code==input`）挤出配额丢失。超额时改为「精确优先」稳定分区截断——精确
+候选必留、其余按 `better` 序填满剩余配额——再恢复 `better` 显示序。**不持久化 `is_prefix`**：跨来源
+权重档位（混输拼音 ÷100 等）与纯码表显示序均不受影响。
 
 ### 3.2 上屏策略（CommitOptions，:14-31）
 
@@ -185,7 +190,7 @@ DAT 从已排序编码列表 BFS 直接构建，峰值内存仅 base/check 两�
 
 | 步骤 | 内容 | 标志 |
 |---|---|---|
-| ① 精确查找 | `lookup_with_fuzzy(整串)` | — |
+| ① 精确查找 | `lookup_with_fuzzy(completed)`——以**完成音节前缀**（去尾部残码）为查询码与存储 code | — |
 | ② Viterbi 整句 | `use_smart_compose` 且 ≥2 音节：LatticeBuilder 建词图（max_word_len=6，模糊变体 -0.5 惩罚）→ ViterbiDecoder DP 最优路径；权重 = `SENTENCE_WEIGHT_BASE(30M) + clamp(log_prob×1000)`，置顶 | 整句候选 insert(0) |
 | ③ DAG 子短语 | 前 6 音节的各前缀子段查词（分段上屏候选） | `is_partial` |
 | ④ 前缀补全 | `search_prefix(query, 30)` | `is_prefix` |
@@ -194,6 +199,12 @@ DAT 从已排序编码列表 BFS 直接构建，峰值内存仅 base/check 两�
 
 节点打分（lattice.rs `score_node()`）：unigram log_prob 为基础，叠加单字实词惩罚(-3.0)/虚词加成(+2.0)/
 多字词典词加成(+3.0×√字数×freq_factor)/OOV 字符均值(-2.0) 等调整。
+
+> **尾部残码不破坏整句/精确**（step ①/② 均以 `completed` 为准）：输入尾带未完成音节（`nihaom` 的
+> `m`）时，若 step ① 用含残码的 query 查询，`lookup_with_fuzzy` 的 `expand_code`「全原音节」组合会命中
+> `completed` 的精确匹配、但因 `alt_code == code` 守卫按 query 失配而误标 `is_fuzzy=true`，被数百个
+> 单字挤后遭 `truncate` 截断。改用 `completed` 后守卫恢复生效（精确 `is_fuzzy=false` 置前），
+> `consumed_length` 也只覆盖完成音节（`nihao` 消费 5 留 `m` 续输）。
 
 ### 4.3 分隔符边界过滤
 
