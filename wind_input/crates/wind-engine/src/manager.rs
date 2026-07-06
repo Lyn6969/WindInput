@@ -643,7 +643,11 @@ impl EngineManager {
                                 id, lay.id
                             );
                         }
-                        let name = if lay.name.is_empty() { id.clone() } else { lay.name };
+                        let name = if lay.name.is_empty() {
+                            id.clone()
+                        } else {
+                            lay.name
+                        };
                         out.push((id, name));
                     }
                     Err(e) => {
@@ -681,8 +685,11 @@ impl EngineManager {
         name
     }
 
-    /// 指定方案的图标短称（schema.icon_label）；未配置返回空串。
-    /// 用于状态气泡 short 模式（对齐 Go GetSchemaDisplayInfo 的 iconLabel）。
+    /// 指定方案的图标短称（schema.icon_label 的首字符）；未配置返回空串。
+    /// 用于状态气泡/工具栏 short 模式（对齐 Go GetSchemaDisplayInfo 的 iconLabel）。
+    ///
+    /// 只取第一个字符：第三方方案可能配置多字符 label，在单字符宽度的工具栏格内
+    /// 会触发换行/截断，影响渲染。此处统一截断，保证显示稳定。
     pub fn schema_icon_label(&self, schema_id: &str) -> String {
         Self::read_schema(
             schema_id,
@@ -690,6 +697,7 @@ impl EngineManager {
             self.override_dir.as_deref(),
         )
         .map(|s| s.schema.icon_label)
+        .map(|label| label.chars().next().map(|c| c.to_string()).unwrap_or_default())
         .unwrap_or_default()
     }
 
@@ -1450,7 +1458,8 @@ impl EngineManager {
                     schema.engine.pinyin.shuangpin.layout.clone()
                 };
                 // 用户目录优先（见 resolve_schema_file）：用户自带/覆盖布局生效。
-                let lp = Self::resolve_schema_file(&format!("shuangpin/{layout_id}.toml"), data_dir);
+                let lp =
+                    Self::resolve_schema_file(&format!("shuangpin/{layout_id}.toml"), data_dir);
                 match crate::pinyin::shuangpin::Layout::from_toml(&lp) {
                     Ok(layout) => {
                         let mut conv = crate::pinyin::shuangpin::ShuangpinConverter::new(layout);
@@ -2361,7 +2370,11 @@ mod tests {
         let write_layout =
             |dir: &std::path::Path, file: &str, id: &str, name: &str, finals: bool| {
                 let mut f = std::fs::File::create(dir.join(file)).unwrap();
-                let finals_sec = if finals { "[finals]\na = [\"a\"]\n" } else { "" };
+                let finals_sec = if finals {
+                    "[finals]\na = [\"a\"]\n"
+                } else {
+                    ""
+                };
                 write!(f, "[meta]\nid = \"{id}\"\nname = \"{name}\"\n{finals_sec}").unwrap();
             };
 
