@@ -458,21 +458,9 @@ impl Engine for PinyinEngine {
             Dag::build(input, trie).maximum_match()
         };
 
-        // 1. 精确查找（完整匹配，含模糊扩展，对齐 Go lookupWithFuzzy）。code==query → 精确层级。
-        for (text, weight, order, is_fuzzy) in self.lookup_with_fuzzy(query, &syllables) {
-            push_unique(
-                &mut candidates,
-                text,
-                query.to_string(),
-                weight,
-                order,
-                is_fuzzy,
-                false,
-            );
-        }
-
         // 完成音节覆盖的连续前缀（从起点算）。尾部不成音节的残码（如「nihaom」的「m」）
-        // 不参与整句解码——否则 lattice 到不了残码末端、Viterbi 失败、整句退化成单字（bug①）。
+        // 不参与精确匹配/整句解码——否则 lattice 到不了残码末端、Viterbi 失败、整句退化成单字，
+        // 且精确层会把「nihao」当模糊变体误标 is_fuzzy 沉底被截断（bug①）。
         let completed_len: usize = syllables.iter().map(|s| s.len()).sum();
         // 含分隔符时用音节直接拼接（避免 `'` 字节位错位）；无分隔符时 query==input，等价原切片。
         let completed_owned: String;
@@ -482,6 +470,25 @@ impl Engine for PinyinEngine {
         } else {
             &query[..completed_len]
         };
+
+        // 1. 精确查找（完整匹配，含模糊扩展，对齐 Go lookupWithFuzzy）。
+        //    以 completed（完成音节前缀）而非 query（可能含尾部残码）为查询码与存储 code：
+        //    残码存在时（nihaom）query 非合法音节序列，search(query) 为空，而 lookup_with_fuzzy
+        //    的 expand_code「全原音节」组合会命中 completed 的精确匹配——但因 `alt_code == code`
+        //    守卫按 query 比较而失配，被误标 is_fuzzy=true 沉底、遭 truncate 截断（bug①）。
+        //    传 completed 后守卫正确跳过全原组合（精确匹配 is_fuzzy=false）；code 存 completed 使
+        //    残码输入的 consumed_length 只覆盖完成音节（nihao 消费 5 留 m 续输）。
+        for (text, weight, order, is_fuzzy) in self.lookup_with_fuzzy(completed, &syllables) {
+            push_unique(
+                &mut candidates,
+                text,
+                completed.to_string(),
+                weight,
+                order,
+                is_fuzzy,
+                false,
+            );
+        }
 
         // 2. Viterbi 长句解码（>=2 音节，仅在完成音节前缀上跑；use_smart_compose=false 时跳过）
         if self.config.use_smart_compose && syllables.len() >= 2 {
