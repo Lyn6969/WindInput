@@ -1,6 +1,11 @@
 # HostRender Windows 移植设计（Rust 服务侧）+ macOS W9 接线
 
-- 分支：`worktree-host-render-rust`
+> **状态（2026-07-06）：✅ 已实现并合并 main，真机验证通过。**
+> 本文 §2–§10 为实施前设计快照（保留作决策记录）；§2 现状表的 ❌/⚠️ 项均已完成，
+> §5 中「首帧直显」「composition 500ms 放宽」两条**未按原设计落地**，实际实现见文末
+> **§11 实现偏差与真机修复**（改代码前以 §11 为准）。
+
+- 分支：`worktree-host-render-rust`（已合并，worktree 已清理）
 - 对照基准（Go 版，同级 `../WindInput-Go`）：
   - `wind_input/internal/bridge/host_render.go` —— HostRenderManager / SharedMemory / NamedEvent
   - `wind_input/internal/bridge/shared_memory.go` —— Windows 共享内存写端（WriteFrame/WriteHide）
@@ -126,8 +131,8 @@ struct ClientState {
 | Go 经验 | Rust 落点 |
 |---|---|
 | hostRenderFunc 绑定进程级，焦点抖动不得清除；showUI 前重评估 | coordinator 在**每次候选显示前**调 `update_host_render_target()`：焦点 PID 命中白名单且该 client 已 setup → `SetHostRenderTarget(Some)`；否则 `None`。FocusLost 不主动清目标 |
-| SearchHost composition 不工作（`TF_E_NOLOCK`、立即终止） | host-render 目标激活时：跳过依赖 TSF composition 的逻辑；composition 终止竞态窗口由 100ms 放宽至 500ms（对照 `handle_lifecycle.go:559-572`） |
-| pendingFirstShow 首帧延迟 | host-render 激活时跳过候选窗首次定位 debounce，直接显示 |
+| SearchHost composition 不工作（`TF_E_NOLOCK`、立即终止） | host-render 目标激活时：跳过依赖 TSF composition 的逻辑。**实际落地**（§11）：Rust 无 `last_key_time` 竞态窗口，改为 host-render 激活时直接忽略 `handle_composition_terminated` 的清缓冲/隐藏动作（非 500ms 放宽） |
+| pendingFirstShow 首帧延迟 | ~~host-render 激活时跳过候选窗首次定位 debounce，直接显示~~ **此条已被真机修复撤销**（§11-4）：跳过会用陈旧 caret 首显后跳位；受限宿主与普通宿主一样走 `pending_first_show`，靠兜底 timer 首显 |
 | 同进程 band 变化（开始菜单 band=6 ↔ 任务栏搜索 band=13） | C++ 端 `UpdateBand` 已处理，服务端无需感知；保留 |
 | WriteFrame 失败回退 | manager_windows 分流处失败 → 清目标 + 走本地窗口 + WARN 日志（不含用户输入内容） |
 
@@ -215,3 +220,51 @@ host_render_processes = ["SearchHost.exe"]  # 进程名白名单，支持 * / ? 
 | `host_render_avail` 位翻转时机与 DLL `_EnsureHostRenderSetup` 的交互竞态 | 对照 Go server 的置位逻辑逐行核对；真机断线重连验证 |
 | manager_windows 分流触碰 Windows 主渲染路径 | 无 host-render 目标时走原路径零分支副作用；白名单默认仅 SearchHost.exe，爆炸半径受控 |
 | 多实例 hide 广播误伤「另一实例正要显示」 | 显示帧总在 hide 之后由目标实例的新 Event 触发重画（sequence 递增），最终状态收敛于最后一帧 |
+
+## 11. 实现偏差与真机修复（2026-07-06，权威）
+
+设计落地后两轮真机测试（SearchHost.exe 开始菜单搜索）暴露的问题与修复。**改 host-render
+代码前以本节为准**，它覆盖 §5 的两条过时描述。
+
+### 11.1 关键值域约定（三套，勿混）
+翻页按钮在三层各有不同值域，写帧时必须重映射（`wind-ui/src/manager.rs`）：
+- **Rust 内部 tag**：`HOVER_PAGE_PREV/NEXT = 100000/100001`（`wind-ui/src/manager.rs`）。
+- **SHM hit-rect 表 & `CMD_CANDIDATE_SELECT` 上行**：`-1 上页 / -2 下页`（C++ `HostWindow.cpp::_HitTest`）。
+- **`CMD_CANDIDATE_HOVER` 上行**：`-1 无 / -2 上页 / -3 下页`（hover 需独立的「无」，故整体平移一位）。
+- 帧头 `rendered_hover_index` 用 C++ hover 值域（-2/-3）。
+- **鼠标命令一律 i32、负值有语义**；DLL `SendAsync` 不读响应，dispatch 臂 `if is_async { None }`。
+
+### 11.2 avail 位与 push 投递（销毁重建循环根治）
+- `hostRenderAvail` 位按**事件源 client_token 高 32 位 PID** 查白名单（`push_activation_status(client_token)`），
+  不用全局焦点槽——开始菜单弹出会连带激活 StartMenuExperienceHost 等兄弟进程，其激活事件
+  污染全局槽会把 avail=0 推给 SearchHost，触发 DLL「flag missing after reconnect」销毁重建死循环。
+- activation status 必须用 `PushServer::push_to_token`（**精确投递、命中失败即丢弃、无广播兜底**）。
+  `push_to_active` 名为 active 实为广播，会把按别的进程算的 avail 位污染给无关客户端。
+- 删除了误导性的 `focused_whitelisted()`（全局槽模式载体）。
+
+### 11.3 重连补推握手 + 键事件刷新焦点
+- SearchHost 等 locked/transient DocMgr 宿主重连后**不发 focus_gained（DLL `OnSetFocus` 跳过）
+  也不重发 IME_ACTIVATED** → 永无 activation push → DLL 挂死 SHM 不重新 setup（服务重启后概率
+  停留普通渲染）。解法：`PushServer::set_client_connected_hook`，push token 握手后回调
+  `Coordinator::on_push_client_connected`，白名单 pid 定向补推 activation（avail=1）触发
+  C++ `_EnsureHostRenderSetup(forceRefresh)` 重新握手 setup。
+- 同类宿主二次聚焦时 focus_gained/IME_ACTIVATED 均缺席，`CMD_KEY_EVENT` 分发时 `note_focus`
+  是唯一可靠焦点信号（否则 `active_target` 滞留旧进程 → 二次输入回退本地渲染）。
+
+### 11.4 首帧不跳过 pending_first_show（撤销 §5 该条）
+`pending_first_show` 的意义就是「防陈旧坐标首显再跳位」。host-render 曾以「服务端直绘 SHM
+无需等 reflow」为由跳过，结果首帧用陈旧 caret 显示后跳位。已撤销：受限宿主与普通宿主一样
+走该机制，caret 事件缺席时靠自带兜底 timer 超时首显，无「永不显示」风险。
+
+### 11.5 composition 终止（落地方式，替代 §5「500ms 放宽」）
+Rust 无 Go 的 `last_key_time` 竞态窗口，改为 `host_render_active()` 时直接 early-return 忽略
+`handle_composition_terminated` 的清缓冲/隐藏动作（对照 Go `handle_lifecycle.go:559-572`）。
+
+### 11.6 死代码清理
+移植期遗留的 Go 对齐骨架/未接线重复实现已删：`shared_memory.rs`（`SharedMemoryManager`
+零使用，被 `shared_memory_windows.rs` 取代）、`push_windows.rs` / `server_windows.rs`
+（孤儿文件，无 mod 声明不参与编译，活的实现内联在 `push.rs`/`server.rs`）。
+
+### 提交
+- `0d1efb5` 第一轮（翻页 i32 解码 / avail 按事件源 PID / 键事件 note_focus）
+- `dfccc8e` 第二轮（翻页 rect 重映射 / push_to_token 定向投递 / 重连补推 / 首帧不跳过）

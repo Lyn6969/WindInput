@@ -9,11 +9,11 @@ pub mod host_render_sink;
 pub mod push;
 pub mod security;
 pub mod server;
-pub mod shared_memory;
 pub mod shared_render_frame;
 
 // macOS / Linux：UDS 请求/推送服务器 + POSIX SHM hostrender 写端。
-// Windows 路径仍内联在 server.rs / push.rs（cfg(windows)），不引入 *_windows.rs。
+// Windows 的请求/推送管道主循环内联在 server.rs / push.rs（cfg(windows)）；
+// host-render 专属写端拆到独立 *_windows 模块（见下）。
 #[cfg(unix)]
 pub mod push_unix;
 #[cfg(unix)]

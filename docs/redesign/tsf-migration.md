@@ -138,11 +138,11 @@ IMMERSIVESUPPORT / SYSTRAYSUPPORT / UIELEMENTENABLED / SECUREMODE / INPUTMODECOM
 （`protocol.rs`/`codec.rs`）互为镜像。命令码、Header、KeyPayload(18B)、CaretPayload(20B)、
 FocusGainedPayload(36B) 等核心结构两端一致（已核对）。
 
-> **⚠️ 已知差异（非本次迁移引入，属 Rust 侧待跟进）**：`SharedRenderHeader`（host-render 共享内存头，64B）
-> 两端总长一致，但 C++ 侧尾部 24 字节定义为 `rectCount / rectsOffset / renderedHoverIndex / targetInstanceId`
-> （候选框鼠标命中矩形表 + 多实例定向），Rust 侧 `protocol.rs` 仍是 `reserved[6]`。
-> 这会影响**开始菜单 band 窗口候选框的鼠标交互与多 TextService 实例定向**。
-> 待 Rust `wind-ui`/host-render 跟进时按 C++ 定义补齐字段。`BinaryProtocol.h` 是该协议的权威定义。
+> **✅ 已解决（2026-07，host-render Windows 移植）**：`SharedRenderHeader`（64B）Rust 侧
+> `protocol.rs` 已按 C++ 补齐尾部字段 `rect_count / rects_offset / rendered_hover_index /
+> target_instance_id`（+ `reserved[2]`），开始菜单 band 窗口候选框的鼠标交互（点选/翻页/悬停）
+> 与多实例定向均已实现并真机验证。`BinaryProtocol.h` 仍是该协议的权威定义，改动须同步。
+> 详见 `docs/redesign/host-render-windows-port.md`。
 
 注释中残留的 "Go 服务" 字样为历史协议镜像说明（功能无害）；权威对端现为 Rust 服务。
 

@@ -47,11 +47,14 @@ WindInput/
 │   ├── wind-bridge/              # Named Pipe 服务器 + 共享内存
 │   │   ├── src/
 │   │   │   ├── lib.rs
-│   │   │   ├── server.rs         # 请求-响应管道服务
-│   │   │   ├── push.rs           # 推送管道服务
-│   │   │   ├── shared_memory.rs  # Host Render 共享内存
-│   │   │   ├── handler.rs        # MessageHandler trait
-│   │   │   └── deferred.rs       # 延迟处理器
+│   │   │   ├── server.rs                 # 请求-响应管道服务
+│   │   │   ├── push.rs                    # 推送管道服务
+│   │   │   ├── host_render_windows.rs     # Host Render 管理器（Windows）
+│   │   │   ├── shared_memory_windows.rs   # Host Render 命名 SHM 写端
+│   │   │   ├── shared_render_frame.rs     # 跨平台编帧逻辑
+│   │   │   ├── named_event.rs             # 命名 Event（Windows）
+│   │   │   ├── handler.rs                 # MessageHandler trait
+│   │   │   └── deferred.rs                # 延迟处理器
 │   │   └── Cargo.toml
 │   │
 │   ├── wind-config/              # 配置系统
@@ -236,7 +239,7 @@ WindInput/
 ### Phase 1: 协议层（第 1-2 周）
 - [ ] `wind-ipc` — 完整协议定义 + 编解码（从 Go 的 `ipc/` 和 `rpcapi/` 移植）
 - [ ] `wind-bridge` — Named Pipe 服务器（tokio 异步）
-- [ ] `wind-bridge` — 共享内存 Host Render
+- [x] `wind-bridge` — 共享内存 Host Render（✅ 2026-07，合并 main + 真机验证）
 - [ ] 与现有 TSF DLL 联调验证
 
 ### Phase 2: 数据层（第 2-3 周）
@@ -266,7 +269,7 @@ WindInput/
 - [ ] `wind-ui/viewbox` — tiny-skia 三阶段绘制
 - [ ] `wind-ui` — 候选窗口 + Layered Window
 - [ ] `wind-ui` — Toolbar / Tooltip / Status / Toast / PopupMenu
-- [ ] `wind-ui` — Host Render 路径（写入共享内存）
+- [x] `wind-ui` — Host Render 路径（写入共享内存）（✅ 2026-07）
 
 ### Phase 5: 业务逻辑（第 7-9 周）
 - [ ] `wind-cmdbar` — 词法/语法/AST
