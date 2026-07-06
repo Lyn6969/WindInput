@@ -535,8 +535,11 @@ impl Engine for PinyinEngine {
                     let weight = SENTENCE_WEIGHT_BASE.saturating_add(log_offset);
                     if let Some(existing) = candidates.iter_mut().find(|c| c.text == sentence) {
                         // 整句与已有候选（如精确匹配 你好）同文：提升其权重置顶，
-                        // 否则单字（如 你）会因词频更高反超整句词。
+                        // 同时抹去 is_partial（step1 标了 true，但整句是完整解读并非子短语），
+                        // 否则残码场景下 is_partial=true 会在排序时被 is_partial=false 的前缀补全
+                        // （如「你好吗」）压下去——后者经 trailing_partial 优化也是 false。
                         existing.weight = existing.weight.max(weight);
+                        existing.is_partial = false;
                     } else {
                         candidates.insert(
                             0,
@@ -585,8 +588,25 @@ impl Engine for PinyinEngine {
         }
 
         // 4. 前缀查找（补全词，code 比输入长，如 si→思考）→ 前缀层级，降到精确之后。
+        //
+        // 尾部残码存在时（如 meiy 的 "y" 未成音节，completed="mei" ⊂ query="meiy"）：**不标
+        // is_prefix**。若标 is_prefix=true，协调器 build_candidates 重排 is_prefix asc 会把
+        // 前缀补全候选压到全部精确匹配（is_prefix=false）之后，数百条单字「没/每/美/…」
+        // 会淹掉「没有」（用户翻 15+ 页才见，与 "不处理" 无异）。不标后 is_prefix=false，
+        // 同时 code("meiyou") 长于 query("meiy") → is_partial=false（由 push_unique 自动计算），
+        // is_partial asc 让他们浮到 is_partial=true 的精确子串（没/每）之前。
+        // 无残码时（meiyou）保持 is_prefix=true，前缀补全沉在精确匹配之后（正常行为）。
+        let trailing_partial = completed != query;
         for (code, text, weight, order) in dict.search_prefix(query, 30) {
-            push_unique(&mut candidates, text, code, weight, order, false, true);
+            push_unique(
+                &mut candidates,
+                text,
+                code,
+                weight,
+                order,
+                false,
+                !trailing_partial, // 有残码时不标 is_prefix，让候选上浮
+            );
         }
 
         // 5. 简拼匹配（声母缩写，如 nh→你好）：查 wdat 预存的独立 AbbrevSection。

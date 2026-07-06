@@ -46,7 +46,10 @@ fn test_english_schema_lazy_loads_and_converts() {
     assert!(mgr.ensure_schema("english"), "english 方案应可懒加载");
 
     let result = mgr.convert_with("english", "hel", 50);
-    assert!(!result.candidates.is_empty(), "english 'hel' 应产出前缀候选");
+    assert!(
+        !result.candidates.is_empty(),
+        "english 'hel' 应产出前缀候选"
+    );
     assert!(
         result
             .candidates
@@ -420,6 +423,43 @@ fn test_pinyin_bare_initial_prefers_single_char() {
                 c.text
             );
         }
+    }
+}
+
+#[test]
+fn test_pinyin_trailing_partial_prefix_floats_above_exact() {
+    let dir = data_dir();
+    if !schema_exists(&dir, "pinyin") {
+        eprintln!("跳过：pinyin schema 不存在");
+        return;
+    }
+    let cfg = make_config(&["pinyin"]);
+    let mgr = EngineManager::new(&cfg, Some(&dir));
+
+    // meiy 尾部 "y" 未成音节：前缀补全「没有」应排在精确子串单字「没」之前。
+    // 若标 is_prefix=true 会被协调器/引擎排序压到数百条 is_prefix=false 之后而不可见，
+    // 修复（不标 is_prefix）使 prefix 补全经 is_partial=false 浮到 is_partial=true 之上。
+    let r = mgr.convert("meiy", 400);
+    let pos_meiyou = r.candidates.iter().position(|c| c.text == "没有");
+    let pos_mei = r.candidates.iter().position(|c| c.text == "没");
+    assert!(pos_meiyou.is_some(), "没有 应产出");
+    assert!(pos_mei.is_some(), "没 应产出");
+    let top: Vec<&str> = r
+        .candidates
+        .iter()
+        .take(15)
+        .map(|c| c.text.as_str())
+        .collect();
+    assert!(
+        pos_meiyou.unwrap() < pos_mei.unwrap(),
+        "前缀补全 没有 应在上层、排在精确子串 没 之前，实际前15: {top:?}"
+    );
+    // meiyou（无残码）保持现状：整句 没有 首位，前缀补全沉在精确匹配之后。
+    let r_full = mgr.convert("meiyou", 400);
+    let pos_prefix_after = r_full.candidates.iter().position(|c| c.is_prefix);
+    let pos_exact_last = r_full.candidates.iter().rposition(|c| !c.is_prefix);
+    if let (Some(pp), Some(pe)) = (pos_prefix_after, pos_exact_last) {
+        assert!(pp > pe, "无残码时前缀补全应排在精确匹配之后");
     }
 }
 
