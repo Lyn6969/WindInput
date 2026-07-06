@@ -131,6 +131,9 @@ pub const CMD_MODE_PUSH: u16 = 0x020D;
 pub const CMD_SHELL_EXEC: u16 = 0x020E;
 pub const CMD_SYNC_CONFIG: u16 = 0x0303;
 
+/// 配置同步键名（对齐 C++ BinaryProtocol.h CONFIG_KEY_*）
+pub const CONFIG_KEY_ENGLISH_PAIRS: &str = "en_pairs";
+
 // 消费确认
 pub const CMD_CONSUMED: u16 = 0x0401;
 

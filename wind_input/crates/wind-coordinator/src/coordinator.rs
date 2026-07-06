@@ -1319,6 +1319,8 @@ impl Coordinator {
                 self.notify_toolbar(); // 工具栏显隐(visible/全屏)按新配置即时刷新
                 self.sync_global_hotkeys(); // keys.global_hotkeys 增删/改键即时生效
                 self.sync_direct_switch_hotkey(); // keys.activate_ime 改键/清空即时生效
+                // 推送英文自动配对配置到 TSF 客户端（client_token=0 = 广播到所有活跃客户端）
+                self.push_english_pair_config(0);
                 #[cfg(windows)]
                 if let Some(mgr) = self.host_render() {
                     mgr.set_whitelist(new_cfg.compat.host_render_processes.clone());
@@ -2338,6 +2340,11 @@ impl Coordinator {
         if pid == 0 {
             return;
         }
+
+        // 推送英文自动配对配置到新连接的客户端（不受 host-render 白名单限制，
+        // 所有 TSF 实例都需要收到此配置才能在英文模式下正确处理标点配对）。
+        self.push_english_pair_config(client_token);
+
         let Some(mgr) = self.host_render() else {
             return;
         };
@@ -2346,6 +2353,23 @@ impl Coordinator {
         }
         tracing::info!("push 客户端注册补推 activation（host-render 白名单宿主）pid={pid}");
         self.push_activation_status(client_token);
+    }
+
+    /// 推送英文自动配对配置到指定客户端（或广播到所有活跃客户端）。
+    pub fn push_english_pair_config(&self, client_token: u64) {
+        let rt = self.rt();
+        let enabled = rt.config.input.auto_pair.english;
+        let value =
+            wind_ipc::codec::encode_english_pairs_value(enabled, &rt.en_pairs);
+        let msg = wind_ipc::codec::encode_sync_config(
+            wind_ipc::protocol::CONFIG_KEY_ENGLISH_PAIRS,
+            &value,
+        );
+        if client_token != 0 {
+            self.push_server.push_to_token(client_token, &msg);
+        } else {
+            self.push_server.push_to_active(&msg);
+        }
     }
 
     /// macOS：把命令直通车按键合成帧（CmdKeyTap/Seq/Hold/Release/Type）推给活跃 `.app`。

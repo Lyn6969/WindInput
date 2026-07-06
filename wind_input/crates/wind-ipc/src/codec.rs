@@ -874,6 +874,34 @@ pub fn encode_toast_hide() -> Vec<u8> {
     frame(CMD_TOAST_HIDE, Vec::new())
 }
 
+/// 编码配置同步消息 (CMD_SYNC_CONFIG 0x0303)
+///
+/// 载荷格式（对齐 TSF IPCClient async reader CONFIG_SYNC handler）：
+/// [keyLen: 2 bytes LE] [valueLen: 4 bytes LE] [key: UTF-8] [value: bytes]
+pub fn encode_sync_config(key: &str, value: &[u8]) -> Vec<u8> {
+    let key_bytes = key.as_bytes();
+    let mut payload = Vec::with_capacity(2 + 4 + key_bytes.len() + value.len());
+    payload.extend_from_slice(&(key_bytes.len() as u16).to_le_bytes());
+    payload.extend_from_slice(&(value.len() as u32).to_le_bytes());
+    payload.extend_from_slice(key_bytes);
+    payload.extend_from_slice(value);
+    frame(CMD_SYNC_CONFIG, payload)
+}
+
+/// 编码英文自动配对配置的值部分（对齐 TSF KeyEventSink::OnSyncConfig CONFIG_KEY_ENGLISH_PAIRS）
+///
+/// 格式：enabled(u8) + count(u8) + [left:u16(LE) + right:u16(LE)]...
+pub fn encode_english_pairs_value(enabled: bool, pairs: &[(char, char)]) -> Vec<u8> {
+    let mut value = Vec::with_capacity(2 + pairs.len() * 4);
+    value.push(enabled as u8);
+    value.push(pairs.len() as u8);
+    for (left, right) in pairs {
+        value.extend_from_slice(&(*left as u16).to_le_bytes());
+        value.extend_from_slice(&(*right as u16).to_le_bytes());
+    }
+    value
+}
+
 #[cfg(test)]
 mod darwin_push_tests {
     use super::*;
