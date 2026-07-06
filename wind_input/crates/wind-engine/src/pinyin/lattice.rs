@@ -114,6 +114,13 @@ fn score_node(word: &str, weight: i32, unigram: Option<&dyn UnigramLookup>) -> f
             log_prob += BASE_CONTENT_WORD_BONUS * (char_count as f64).sqrt() * freq_factor;
         }
     }
+    // Weight ≤ 0 = 字典标记的非标准读音映射（如 那→ne 方言读法 w=0）。其 unigram
+    // 高频不应凌驾字典的显式判断——否则 Viterbi 会在 ne 音节选 那 而非 呢(w=262461)。
+    // -10.0 足够压过典型虚词-实词间的 unigram 差距（~2-8），又留足余量使正确
+    // 但低频的单字（w>0 正常条目）不被误伤。
+    if weight <= 0 {
+        log_prob -= 10.0;
+    }
     log_prob
 }
 
