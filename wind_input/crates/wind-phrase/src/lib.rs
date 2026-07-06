@@ -327,7 +327,16 @@ impl PhraseLayer {
                 // $SS/$AA → **组** nav（选中补全到码再展开成员，二级选择）；
                 // $CC → **命令** nav（选中**直接执行**，不二级展开），display 经廉价上下文求值。
                 match &phrase {
-                    Phrase::Literal(_) | Phrase::Template(_) => {
+                    Phrase::Literal(t) => {
+                        // 旧式简单模板（$Y/$M/$D 等）不含 cmdbar marker/插值，
+                        // parse 后为 Literal；先尝试 expand_template 展开，
+                        // 展开成功用结果，不支持的变量退回原文。
+                        // 对齐 lookup 精确匹配路径的双路径策略。
+                        let display = expand_template(t, &now).unwrap_or_else(|| t.clone());
+                        out.push(PhraseHit::plain(display, e.weight).with_source(&e.text));
+                    }
+                    Phrase::Template(_) => {
+                        // cmdbar 模板（含 {expr} 插值）：经 evaluate 求值。
                         let display = match evaluate(&phrase, &ctx, reg) {
                             Ok(ev) => ev.display,
                             Err(_) => continue,
@@ -861,7 +870,8 @@ mod tests {
 
     #[test]
     fn test_prefix_nav_includes_literal_template() {
-        // 静态/旧模板短语（无 marker）现在参与前缀列举，以字面文本出现在候选中。
+        // 静态/旧模板短语（无 marker）参与前缀列举时，$Y/$MM/$DD 等旧式变量
+        // 应经 expand_template 展开（对齐 lookup 精确匹配路径的双路径策略）。
         let mut map: HashMap<String, Vec<PhraseEntry>> = HashMap::new();
         map.insert(
             "rq".into(),
@@ -873,9 +883,8 @@ mod tests {
         );
         let layer = PhraseLayer { map };
         let got = layer.lookup_prefix_at("r", fixed(), &[], 1);
-        // $Y-$MM-$DD 不含 cmdbar 语法，parse 返回 Literal，直接以原文出现。
         assert_eq!(got.len(), 1);
-        assert_eq!(got[0].text, "$Y-$MM-$DD");
+        assert_eq!(got[0].text, "2026-06-14");
         assert!(got[0].command_src.is_none());
         assert!(got[0].nav_code.is_none());
     }
