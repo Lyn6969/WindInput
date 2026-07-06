@@ -3,25 +3,26 @@
 //! 与 Go 版本 `wind_input/internal/store/temp_words.go` 对齐。复用 user_words 的 key/value 编码。
 //! 权重上限 `TEMP_WORD_MAX_WEIGHT=10000`。淘汰（evict）在**单写事务**内完成（修 Go 的 view→update
 //! TOCTOU，store.md §7.4）。晋升条件（count≥promote_count）由调用方（dict StoreTempLayer）判定。
+//!
+//! 词频重构后 count 与权重解耦：count 只用于晋升判定（不再随复选驱动权重增长），
+//! 临时词权重固定为写入时的初值；晋升进用户词库时统一取 `PROMOTED_WEIGHT`（与已有
+//! 用户词取 max，不覆盖手动加词的更高权重）。
 
 use crate::store::{Store, TEMP_WORDS, USER_WORDS};
 use crate::user_words::{UserWordRecord, dec_val, enc_key, enc_val, now_secs};
 use redb::ReadableTable;
 
-/// 临时词动态权重硬上限
+/// 临时词权重硬上限（仅约束写入时的初值，权重不再随复选累加）
 pub const TEMP_WORD_MAX_WEIGHT: i32 = 10000;
 
+/// 自动学习词晋升入用户词库时的统一权重（与已存在的用户词权重取 max，不覆盖手动加词）
+pub const PROMOTED_WEIGHT: i32 = 1000;
+
 impl Store {
-    /// 学习临时词：新词 weight=min(add_weight,MAX)/count=1；已存在 weight=min(old+delta,MAX)/count++。
-    /// 返回新的 count（调用方据此与 promote_count 比较决定是否晋升）。
-    pub fn learn_temp_word(
-        &self,
-        schema: &str,
-        code: &str,
-        text: &str,
-        add_weight: i32,
-        weight_delta: i32,
-    ) -> anyhow::Result<u32> {
+    /// 学习临时词：新词 weight=min(add_weight,MAX)/count=1；已存在只 count++，权重不变
+    /// （count 只用于晋升判定，不再驱动权重增长）。返回新的 count（调用方据此与
+    /// promote_count 比较决定是否晋升）。
+    pub fn learn_temp_word(&self, schema: &str, code: &str, text: &str, add_weight: i32) -> anyhow::Result<u32> {
         let key = enc_key(schema, code, text);
         self.with_db(|db| {
             let txn = db.begin_write()?;
@@ -29,11 +30,7 @@ impl Store {
             {
                 let mut t = txn.open_table(TEMP_WORDS)?;
                 let (w, c, ca) = match t.get(key.as_str())?.and_then(|g| dec_val(g.value())) {
-                    Some((ow, oc, oca)) => (
-                        ow.saturating_add(weight_delta).min(TEMP_WORD_MAX_WEIGHT),
-                        oc + 1,
-                        oca,
-                    ),
+                    Some((ow, oc, oca)) => (ow, oc + 1, oca),
                     None => (add_weight.min(TEMP_WORD_MAX_WEIGHT), 1, now_secs()),
                 };
                 new_count = c;
@@ -61,13 +58,12 @@ impl Store {
         })
     }
 
-    /// 仅当已存在时计数 +1、权重 +delta（不创建新条目）。返回 (是否存在, 新count)。
+    /// 仅当已存在时计数 +1（不创建新条目、权重不变）。返回 (是否存在, 新count)。
     pub fn increment_temp_if_exists(
         &self,
         schema: &str,
         code: &str,
         text: &str,
-        weight_delta: i32,
     ) -> anyhow::Result<(bool, u32)> {
         let key = enc_key(schema, code, text);
         self.with_db(|db| {
@@ -79,8 +75,7 @@ impl Store {
                 match existing {
                     Some((w, c, ca)) => {
                         let nc = c + 1;
-                        let nw = w.saturating_add(weight_delta).min(TEMP_WORD_MAX_WEIGHT);
-                        t.insert(key.as_str(), enc_val(nw, nc, ca).as_slice())?;
+                        t.insert(key.as_str(), enc_val(w, nc, ca).as_slice())?;
                         result = (true, nc);
                     }
                     None => result = (false, 0),
@@ -205,8 +200,9 @@ impl Store {
         })
     }
 
-    /// 晋升：把临时词移入用户词库（合并权重/计数），并从临时库删除。返回是否发生晋升。
-    /// 合并：weight=min(temp+user,MAX)，count=temp+user，created_at 优先保留 user 旧值。
+    /// 晋升：把临时词移入用户词库，并从临时库删除。返回是否发生晋升。
+    /// 权重统一取 `PROMOTED_WEIGHT`（与已存在的用户词权重取 max，不覆盖手动加词的更高权重，
+    /// 不再沿用临时词自身权重）；count=temp+user，created_at 优先保留 user 旧值。
     pub fn promote_temp_word(&self, schema: &str, code: &str, text: &str) -> anyhow::Result<bool> {
         let key = enc_key(schema, code, text);
         self.with_db(|db| {
@@ -217,17 +213,13 @@ impl Store {
                 let temp = temp_t.get(key.as_str())?.and_then(|g| dec_val(g.value()));
                 match temp {
                     None => promoted = false,
-                    Some((tw, tc, tca)) => {
+                    Some((_tw, tc, tca)) => {
                         {
                             let mut user_t = txn.open_table(USER_WORDS)?;
                             let (nw, nc, nca) =
                                 match user_t.get(key.as_str())?.and_then(|g| dec_val(g.value())) {
-                                    Some((uw, uc, uca)) => (
-                                        tw.saturating_add(uw).min(TEMP_WORD_MAX_WEIGHT),
-                                        tc + uc,
-                                        uca,
-                                    ),
-                                    None => (tw.min(TEMP_WORD_MAX_WEIGHT), tc, tca),
+                                    Some((uw, uc, uca)) => (uw.max(PROMOTED_WEIGHT), tc + uc, uca),
+                                    None => (PROMOTED_WEIGHT, tc, tca),
                                 };
                             user_t.insert(key.as_str(), enc_val(nw, nc, nca).as_slice())?;
                         }
@@ -257,9 +249,7 @@ mod tests {
         let path = tmp("wind_tw_promote_thresh.redb");
         let s = Store::open(&path).unwrap();
         for i in 1..=3u32 {
-            let n = s
-                .learn_temp_word("wubi86", "abcd", "测试", 100, 10)
-                .unwrap();
+            let n = s.learn_temp_word("wubi86", "abcd", "测试", 100).unwrap();
             assert_eq!(n, i);
         }
         assert_eq!(
@@ -279,16 +269,16 @@ mod tests {
     }
 
     #[test]
-    fn test_learn_and_cap() {
+    fn test_learn_count_only_weight_unchanged() {
         let path = tmp("wind_tw_learn.redb");
         let s = Store::open(&path).unwrap();
-        assert_eq!(s.learn_temp_word("wb", "a", "工", 800, 40).unwrap(), 1);
-        assert_eq!(s.learn_temp_word("wb", "a", "工", 800, 40).unwrap(), 2);
+        assert_eq!(s.learn_temp_word("wb", "a", "工", 800).unwrap(), 1);
+        assert_eq!(s.learn_temp_word("wb", "a", "工", 800).unwrap(), 2);
         let r = s.get_temp_words("wb", "a").unwrap();
         assert_eq!(r[0].count, 2);
-        assert_eq!(r[0].weight, 840, "800 + 40");
-        // 权重上限
-        let _ = s.learn_temp_word("wb", "b", "戈", 99999, 0).unwrap();
+        assert_eq!(r[0].weight, 800, "权重不再随复选累加，保持写入初值");
+        // 初值上限
+        let _ = s.learn_temp_word("wb", "b", "戈", 99999).unwrap();
         assert_eq!(
             s.get_temp_words("wb", "b").unwrap()[0].weight,
             TEMP_WORD_MAX_WEIGHT
@@ -301,13 +291,18 @@ mod tests {
         let path = tmp("wind_tw_inc.redb");
         let s = Store::open(&path).unwrap();
         assert_eq!(
-            s.increment_temp_if_exists("wb", "a", "工", 10).unwrap(),
+            s.increment_temp_if_exists("wb", "a", "工").unwrap(),
             (false, 0)
         );
-        s.learn_temp_word("wb", "a", "工", 100, 10).unwrap();
+        s.learn_temp_word("wb", "a", "工", 100).unwrap();
         assert_eq!(
-            s.increment_temp_if_exists("wb", "a", "工", 10).unwrap(),
+            s.increment_temp_if_exists("wb", "a", "工").unwrap(),
             (true, 2)
+        );
+        assert_eq!(
+            s.get_temp_words("wb", "a").unwrap()[0].weight,
+            100,
+            "计数不再驱动权重变化"
         );
         let _ = std::fs::remove_file(&path);
     }
@@ -316,9 +311,9 @@ mod tests {
     fn test_evict_lowest_weight() {
         let path = tmp("wind_tw_evict.redb");
         let s = Store::open(&path).unwrap();
-        s.learn_temp_word("wb", "a", "低", 10, 0).unwrap();
-        s.learn_temp_word("wb", "b", "中", 50, 0).unwrap();
-        s.learn_temp_word("wb", "c", "高", 90, 0).unwrap();
+        s.learn_temp_word("wb", "a", "低", 10).unwrap();
+        s.learn_temp_word("wb", "b", "中", 50).unwrap();
+        s.learn_temp_word("wb", "c", "高", 90).unwrap();
         // 保留 2 → 删除权重最低的 1 条（"低"）
         assert_eq!(s.evict_temp_words("wb", 2).unwrap(), 1);
         assert!(s.get_temp_words("wb", "a").unwrap().is_empty());
@@ -327,19 +322,23 @@ mod tests {
     }
 
     #[test]
-    fn test_promote_merges_into_user() {
+    fn test_promote_uses_fixed_weight() {
         let path = tmp("wind_tw_promote.redb");
         let s = Store::open(&path).unwrap();
-        s.add_user_word("wb", "a", "工", 100).unwrap();
-        s.learn_temp_word("wb", "a", "工", 800, 0).unwrap();
-        s.learn_temp_word("wb", "a", "工", 800, 50).unwrap(); // count=2, weight=850
+        s.learn_temp_word("wb", "a", "工", 800).unwrap();
+        s.learn_temp_word("wb", "a", "工", 800).unwrap(); // count=2
         assert!(s.promote_temp_word("wb", "a", "工").unwrap());
         // 临时库已删
         assert!(s.get_temp_words("wb", "a").unwrap().is_empty());
-        // 用户库合并：weight=min(850+100,1e4)=950, count=2+0=2
+        // 晋升权重统一取 PROMOTED_WEIGHT（不沿用临时权重），count 累计保留
         let u = s.get_user_words("wb", "a").unwrap();
-        assert_eq!(u[0].weight, 950);
+        assert_eq!(u[0].weight, PROMOTED_WEIGHT);
         assert_eq!(u[0].count, 2);
+        // 已存在更高权重的手动加词：晋升不应下调，取 max
+        s.add_user_word("wb", "b", "戈", 1200).unwrap();
+        s.learn_temp_word("wb", "b", "戈", 800).unwrap();
+        assert!(s.promote_temp_word("wb", "b", "戈").unwrap());
+        assert_eq!(s.get_user_words("wb", "b").unwrap()[0].weight, 1200);
         // 不存在的临时词晋升返回 false
         assert!(!s.promote_temp_word("wb", "z", "无").unwrap());
         let _ = std::fs::remove_file(&path);

@@ -229,9 +229,10 @@ pub(crate) fn printable_char(key_code: u32, shift: bool) -> Option<char> {
 /// 引擎一次转换请求的候选上限（boost 重排后截断到 9）
 pub(crate) const ENGINE_MAX_CANDIDATES: usize = 50;
 
-/// 自动造词（L）写入临时层的初始权重与每次复选增量（保守默认；后续可接 schema.learning 配置）。
+/// 自动造词（L）写入临时层的初始权重（保守默认，低于手动加词；后续可接 schema.learning 配置）。
+/// 复选次数只用于晋升判定（见 `Store::learn_temp_word`），不再驱动权重增长——
+/// 晋升入用户词库时统一取 `wind_store::temp_words::PROMOTED_WEIGHT`。
 pub(crate) const LEARN_ADD_WEIGHT: i32 = 800;
-pub(crate) const LEARN_WEIGHT_DELTA: i32 = 40;
 
 /// 当前 unix 秒（拼音衰减分以此对 last_used 计龄；与 store record_freq 同口径）。
 pub(crate) fn now_unix_secs() -> i64 {

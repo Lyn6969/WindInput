@@ -1975,7 +1975,7 @@ fn temp_word_promotes_after_threshold_selections() {
 
     // 1. 两次累积 → count=2
     let c1 = store
-        .learn_temp_word("wubi86", "abcd", "测试", 800, 40)
+        .learn_temp_word("wubi86", "abcd", "测试", 800)
         .unwrap();
     assert_eq!(c1, 1, "第 1 次 count 应为 1");
     assert_eq!(
@@ -1985,7 +1985,7 @@ fn temp_word_promotes_after_threshold_selections() {
     );
 
     let c2 = store
-        .learn_temp_word("wubi86", "abcd", "测试", 800, 40)
+        .learn_temp_word("wubi86", "abcd", "测试", 800)
         .unwrap();
     assert_eq!(c2, 2, "第 2 次 count 应为 2");
 
@@ -2009,7 +2009,7 @@ fn temp_word_promotes_after_threshold_selections() {
     //    （当 promote_count=0 时，coordinator 永不调用 promote_temp_word）。
     //    此处用 get_temp_word None → 确认未晋升的词不在临时层。
     store
-        .learn_temp_word("wubi86", "zzzz", "不晋升", 800, 40)
+        .learn_temp_word("wubi86", "zzzz", "不晋升", 800)
         .unwrap();
     // promote_count=0 时不晋升：临时层仍有该词
     assert_eq!(

@@ -2,7 +2,7 @@
 //!
 //! 从 coordinator.rs 拆出（同 crate 内 `impl Coordinator` 块，组织性重构，无逻辑变更）。
 
-use crate::coordinator::{Coordinator, LEARN_ADD_WEIGHT, LEARN_WEIGHT_DELTA, State};
+use crate::coordinator::{Coordinator, LEARN_ADD_WEIGHT, State};
 use tracing::{debug, warn};
 use wind_bridge::handler::{KeyAction, KeyEventData};
 use wind_candidate::CandidateSource;
@@ -59,7 +59,7 @@ impl Coordinator {
         else {
             anyhow::bail!("dict.add: 混输方案主码表缺失，无法归属加词");
         };
-        store.add_user_word(&schema, code, text, 100)?;
+        store.add_user_word(&schema, code, text, ADD_WORD_WEIGHT)?;
         Ok(())
     }
 
@@ -116,8 +116,8 @@ impl Coordinator {
         } else {
             self.engine_mgr.data_schema_id(&active) // 拼音族折叠到 "pinyin"，与 record_freq 写读一致
         };
-        // add_weight/delta 取保守默认；达 promote_count 阈值时晋升入用户词库。
-        match store.learn_temp_word(&schema, &code, &text, LEARN_ADD_WEIGHT, LEARN_WEIGHT_DELTA) {
+        // add_weight 取保守默认；达 promote_count 阈值时晋升入用户词库（权重统一为 PROMOTED_WEIGHT）。
+        match store.learn_temp_word(&schema, &code, &text, LEARN_ADD_WEIGHT) {
             Ok(count) => {
                 debug!(
                     "auto-learned phrase: {} -> {} (count={})",

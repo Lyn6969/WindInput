@@ -3,8 +3,7 @@
 //! 从 coordinator.rs 拆出（同 crate 内 `impl Coordinator` 块，组织性重构，无逻辑变更）。
 
 use crate::coordinator::{
-    Coordinator, InputOutcome, LEARN_ADD_WEIGHT, LEARN_WEIGHT_DELTA, PHRASE_WEIGHT_BASE, State,
-    now_unix_secs,
+    Coordinator, InputOutcome, LEARN_ADD_WEIGHT, PHRASE_WEIGHT_BASE, State, now_unix_secs,
 };
 use crate::pipeline::ModeKind;
 use tracing::{debug, warn};
@@ -726,13 +725,8 @@ impl Coordinator {
                             .auto_phrase
                             .promote_count
                     };
-                    if let Ok(count) = store.learn_temp_word(
-                        &schema,
-                        &code,
-                        &cand.text,
-                        LEARN_ADD_WEIGHT,
-                        LEARN_WEIGHT_DELTA,
-                    ) {
+                    if let Ok(count) = store.learn_temp_word(&schema, &code, &cand.text, LEARN_ADD_WEIGHT)
+                    {
                         self.maybe_promote_temp(
                             store,
                             &schema,

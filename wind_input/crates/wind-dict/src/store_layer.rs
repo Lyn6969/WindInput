@@ -195,7 +195,7 @@ mod tests {
     fn test_temp_layer_is_prefix_flag() {
         // StoreTempLayer 的 search_prefix 同样应标记 is_prefix=true
         let s = store("temp_is_prefix_flag");
-        s.learn_temp_word("wb", "xyz", "某词", 100, 0).unwrap();
+        s.learn_temp_word("wb", "xyz", "某词", 100).unwrap();
         let layer = StoreTempLayer::new(s.clone(), "wb");
 
         let exact = layer.search("xyz", 10);
@@ -214,7 +214,7 @@ mod tests {
     fn test_temp_layer_and_composite() {
         let s = store("temp_composite");
         s.add_user_word("wb", "ni", "你", 100).unwrap();
-        s.learn_temp_word("wb", "ni", "拟", 800, 0).unwrap();
+        s.learn_temp_word("wb", "ni", "拟", 800).unwrap();
         let composite = CompositeDict::new();
         composite.register_layer(Box::new(StoreUserLayer::new(s.clone(), "wb")));
         composite.register_layer(Box::new(StoreTempLayer::new(s.clone(), "wb")));

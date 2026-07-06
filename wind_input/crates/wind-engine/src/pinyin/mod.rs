@@ -965,7 +965,7 @@ mod tests {
         let store = tmp_store("layer_show");
         store.add_user_word("pinyin", "nihao", "你好", 500).unwrap();
         store
-            .learn_temp_word("pinyin", "lanshou", "蓝瘦", 800, 0)
+            .learn_temp_word("pinyin", "lanshou", "蓝瘦", 800)
             .unwrap();
         let dm = DictManager::new();
         dm.register_layer(Box::new(wind_dict::StoreUserLayer::new(
@@ -1034,7 +1034,7 @@ mod tests {
             .add_user_word("pinyin", "cainiaoyizhan", "菜鸟驿站", 500)
             .unwrap();
         store
-            .learn_temp_word("pinyin", "lanshoubing", "蓝瘦蘑菇", 800, 0)
+            .learn_temp_word("pinyin", "lanshoubing", "蓝瘦蘑菇", 800)
             .unwrap();
         let dm = DictManager::new();
         dm.register_layer(Box::new(wind_dict::StoreUserLayer::new(
