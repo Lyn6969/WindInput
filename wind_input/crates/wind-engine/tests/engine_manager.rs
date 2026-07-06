@@ -384,6 +384,46 @@ fn test_pinyin_trailing_partial_keeps_sentence() {
 }
 
 #[test]
+fn test_pinyin_bare_initial_prefers_single_char() {
+    let dir = data_dir();
+    if !schema_exists(&dir, "pinyin") {
+        eprintln!("跳过：pinyin schema 不存在");
+        return;
+    }
+    let cfg = make_config(&["pinyin"]);
+    let mgr = EngineManager::new(&cfg, Some(&dir));
+
+    // 裸声母 "m"（无完整音节，候选全为前缀补全词）：单字候选（吗/么）应优先于多字词
+    // （没有/目前），对齐主流输入法首字优先。断言首候选为单字，且单字全部聚于多字词之前。
+    let r = mgr.convert("m", 10);
+    assert!(!r.candidates.is_empty(), "m 应产出候选");
+    let top: Vec<&str> = r
+        .candidates
+        .iter()
+        .take(10)
+        .map(|c| c.text.as_str())
+        .collect();
+    assert_eq!(
+        r.candidates[0].text.chars().count(),
+        1,
+        "裸声母 m 首候选应为单字，实际: {top:?}"
+    );
+    // 单字聚前：一旦出现多字词，其后不应再有单字（引擎层无 freq 重排，严格成立）。
+    let mut seen_multi = false;
+    for c in &r.candidates {
+        if c.text.chars().count() > 1 {
+            seen_multi = true;
+        } else {
+            assert!(
+                !seen_multi,
+                "单字 {:?} 出现在多字词之后，单字优先未生效: {top:?}",
+                c.text
+            );
+        }
+    }
+}
+
+#[test]
 fn test_schema_cycle() {
     let dir = data_dir();
     if !schema_exists(&dir, "wubi86") || !schema_exists(&dir, "pinyin") {

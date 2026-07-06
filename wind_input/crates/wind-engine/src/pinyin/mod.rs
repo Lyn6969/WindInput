@@ -40,6 +40,13 @@ use wind_dict::cached::CachedDict;
 /// 整句候选权重基准（高于拼音词频上限 ~19260817，确保整句置顶且不被截断）
 const SENTENCE_WEIGHT_BASE: i32 = 30_000_000;
 
+/// 裸声母（无完整音节，如 "m"）单字提权：使单字候选（吗/么）排在多字前缀补全词
+/// （没有/目前）之前——对齐主流输入法「首字优先」。取 1e7：高于常规词频（单字基础权重上限
+/// ~2e6），稳压多字词；又低于整句底线 PINYIN_SENTENCE_FLOOR(2e7)，不会被 freq_rerank 误当整句
+/// 锚定。提权改的是 weight，故能穿过协调器按权重的重排（否则引擎内单字优先会被 build_candidates
+/// 重排冲掉）。仅裸声母（syllables 为空）时应用——完整音节输入的单字已靠 is_prefix 层级就位。
+const BARE_INITIAL_SINGLE_CHAR_BOOST: i32 = 10_000_000;
+
 /// 拼音引擎配置
 #[derive(Debug, Clone)]
 pub struct Config {
@@ -638,6 +645,18 @@ impl Engine for PinyinEngine {
                 Some(k) if k >= 1 => c.text.chars().count() == k,
                 _ => true,
             });
+        }
+
+        // 裸声母（无完整音节，如 "m"/"zh"）单字优先：候选全为前缀补全词（is_prefix=true），
+        // 纯按词频排会让高频多字词（没有/目前）压过单字（吗/么）——不合直觉。给单字提权使其
+        // 排在多字词之前（对齐主流输入法首字优先，见 BARE_INITIAL_SINGLE_CHAR_BOOST）。
+        // 仅此情形——完整音节输入的单字已靠精确层级(is_prefix=false)就位，无需提权。
+        if syllables.is_empty() {
+            for c in candidates.iter_mut() {
+                if c.text.chars().count() == 1 {
+                    c.weight = c.weight.saturating_add(BARE_INITIAL_SINGLE_CHAR_BOOST);
+                }
+            }
         }
 
         // 引擎内部排序（层级对齐 Go：完整匹配 >> 子短语 >> 前缀补全 >> 模糊）：
