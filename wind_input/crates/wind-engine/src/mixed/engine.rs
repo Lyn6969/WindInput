@@ -45,7 +45,7 @@ impl Default for MixConfig {
         Self {
             min_pinyin_length: 2,
             codetable_weight_boost: 10_000_000,
-            auto_commit_block_on_pinyin: true,
+            auto_commit_block_on_pinyin: false,
             pinyin_only_overflow: true,
             top_code_override_pinyin: false,
             show_source_hint: false,
@@ -67,7 +67,9 @@ pub struct MixedEngine {
     min_pinyin_length: usize,
     /// 码表精确匹配提权
     codetable_weight_boost: i32,
-    /// 全码自动上屏时，若存在拼音候选则否决（保护拼音用户，对齐 Go AutoCommitBlockOnPinyin）
+    /// 全码自动上屏时，若存在拼音候选则否决（保护拼音用户，对齐 Go AutoCommitBlockOnPinyin）。
+    /// 默认关（与 data/config.toml 一致）：粗粒度一票否决太激进，细粒度拦截由
+    /// `block_commit_on_pinyin_word`（默认开）承担。
     auto_commit_block_on_pinyin: bool,
     /// 输入超过码表最大码长时仅查拼音（主流混输行为，对齐 Go PinyinOnlyOverflow）。
     /// false 时走「码表前 N 码 + 拼音完整输入」混合 overflow。
@@ -236,7 +238,7 @@ impl MixedEngine {
     }
 
     /// 英文候选（enable_english 开时）：查英文词库，按精确(整词)/前缀独立加权，供混入合并。
-    /// 英文档独立于拼音（不被 ÷100 降档）：精确 +5e6、前缀 +1e6（对齐 Go）。
+    /// 英文档独立于拼音（不被 ÷100 降档）：精确 +ENGLISH_EXACT_BOOST(500K)、前缀 +0（保留原始权重）。
     /// `english` 为 None（关闭）时返回空。输入小写化以匹配英文词库（code 列已小写化）。
     fn english_candidates(&self, input: &str, max_candidates: usize) -> Vec<Candidate> {
         let Some(eng) = &self.english else {
@@ -568,10 +570,18 @@ mod tests {
 
     #[test]
     fn mixed_blocks_auto_commit_when_pinyin_present() {
-        // 次引擎对同一输入也产出候选（模拟拼音命中）+ 守护开 → 否决上屏。
+        // 次引擎对同一输入也产出候选（模拟拼音命中）+ 守护①显式开 → 否决上屏。
         let primary = ct_engine(&[("aaaa", "工", 100)], true);
         let secondary = ct_engine(&[("aaaa", "啊啊", 50)], false);
-        let e = MixedEngine::new(primary, Some(secondary), None, MixConfig::default());
+        let e = MixedEngine::new(
+            primary,
+            Some(secondary),
+            None,
+            MixConfig {
+                auto_commit_block_on_pinyin: true,
+                ..Default::default()
+            },
+        );
         let r = e.convert("aaaa", 50).unwrap();
         assert!(!r.should_commit, "有拼音候选且守护开时应否决全码上屏");
     }
@@ -652,7 +662,7 @@ mod tests {
 
     #[test]
     fn topcode_vetoed_by_pinyin_candidate() {
-        // ① auto_commit_block_on_pinyin 开（默认）+ 整串有拼音候选 → 抑制顶码。
+        // ① auto_commit_block_on_pinyin 显式开（默认关）+ 整串有拼音候选 → 抑制顶码。
         let primary = ct_engine_topcode(&[("wang", "王", 100)]);
         let e = MixedEngine::new(
             primary,
@@ -661,14 +671,21 @@ mod tests {
                 syllables: 0,
             })),
             None,
-            MixConfig::default(),
+            MixConfig {
+                auto_commit_block_on_pinyin: true,
+                ..Default::default()
+            },
         );
-        assert_eq!(e.handle_top_code("wangb"), None, "① 开 + 有拼音候选应抑制顶码");
+        assert_eq!(
+            e.handle_top_code("wangb"),
+            None,
+            "① 开 + 有拼音候选应抑制顶码"
+        );
     }
 
     #[test]
     fn topcode_allowed_when_no_pinyin_candidate() {
-        // 纯五笔溢出（整串无拼音候选）→ 顶码正常上屏（即便 ①② 默认开）。
+        // 纯五笔溢出（整串无拼音候选）→ 顶码正常上屏（② 默认开也不拦）。
         let primary = ct_engine_topcode(&[("aaaa", "工", 100)]);
         let e = MixedEngine::new(
             primary,
