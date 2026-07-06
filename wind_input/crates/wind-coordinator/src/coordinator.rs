@@ -747,7 +747,7 @@ impl Coordinator {
     /// 当前是否处于 host-render 受限宿主模式（SearchHost.exe / 开始菜单搜索框等）。
     /// `active_target()` 每次现查（无缓存），避免跨帧持有失效目标；它仅在 active 连接
     /// **已完成 setup** 时返回 Some，而 setup 会拒绝白名单外进程——故此判定天然经过
-    /// 白名单过滤，且比 `focused_whitelisted()` 更准确（追踪「确实在 host 渲染」）。
+    /// 白名单过滤，语义为「确实在 host 渲染」（比按事件源 pid 查白名单更严格）。
     /// 非 Windows 编译始终返回 false，零开销。
     pub(crate) fn host_render_active(&self) -> bool {
         #[cfg(windows)]
@@ -2245,19 +2245,32 @@ impl Coordinator {
         }
     }
 
-    fn push_activation_status(&self) {
+    /// `client_token` = 触发本次 activation 的客户端 token（高 32 位 = PID，
+    /// BinaryProtocol.h PushTokenHandshake 约定）。hostRenderAvail 位**必须**按
+    /// 事件源 PID 查白名单（对齐 Go PushActivationStatusToActiveClient(status, processID)）——
+    /// 不能用全局焦点槽：开始菜单弹出会连带激活 StartMenuExperienceHost 等兄弟进程，
+    /// 其激活事件若污染全局槽，推给 SearchHost 的 avail 位会错置 0，触发 DLL
+    /// 「flag missing after reconnect」销毁重建循环（真机踩坑）。
+    fn push_activation_status(&self, client_token: u64) {
         let s = self.build_status();
         debug!(
             "push_activation_status: chinese={} key_down={:?} key_up={:?}",
             s.chinese_mode, s.key_down_hotkeys, s.key_up_hotkeys
         );
         #[cfg(windows)]
-        let host_render_avail = self
-            .host_render()
-            .map(|m| m.focused_whitelisted())
-            .unwrap_or(false);
+        let host_render_avail = {
+            let pid = (client_token >> 32) as u32;
+            pid != 0
+                && self
+                    .host_render()
+                    .map(|m| m.is_process_whitelisted(pid))
+                    .unwrap_or(false)
+        };
         #[cfg(not(windows))]
-        let host_render_avail = false;
+        let host_render_avail = {
+            let _ = client_token;
+            false
+        };
         let encoded = wind_ipc::codec::encode_activation_status_push(
             s.chinese_mode,
             s.full_width,
@@ -2806,9 +2819,17 @@ impl MessageHandler for Coordinator {
         *fc = (app.to_string(), title.to_string(), sel.to_string());
     }
 
-    /// macOS `.app` 鼠标左键点选候选：复用 Windows 进程内路径的 `mouse_select`（提交页内第 N 个候选）。
-    fn handle_candidate_select(&self, page_local_index: u32) {
-        self.mouse_select(page_local_index as usize);
+    /// 鼠标左键点选候选（macOS `.app` / Windows host-render DLL）：
+    /// ≥0 复用 `mouse_select`（提交页内第 N 个候选）；负值为翻页按钮
+    /// （-1 上页 / -2 下页，对齐 Go HandleCandidateSelect 的分流），复用本地窗口
+    /// 点击翻页的 `mouse_page` 路径（翻页后经 notify_ui_update 重推帧）。
+    fn handle_candidate_select(&self, page_local_index: i32) {
+        match page_local_index {
+            -1 => self.mouse_page(-1),
+            -2 => self.mouse_page(1),
+            v if v >= 0 => self.mouse_select(v as usize),
+            _ => {}
+        }
     }
 
     /// macOS `.app` 鼠标 hover 候选/翻页器：复用 Windows 进程内路径的 `mouse_hover`
@@ -3786,7 +3807,7 @@ impl MessageHandler for Coordinator {
             self.apply_initial_mode(data.client_token, false);
         }
         let status = self.build_status();
-        self.push_activation_status();
+        self.push_activation_status(data.client_token);
         self.notify_toolbar_async(); // 激活态 → 工具栏显示（异步，避免 is_foreground_fullscreen 阻塞 bridge 线程）
         self.show_persistent_status_if_always(); // 常驻模式:获焦即显示状态
         Some(status)
@@ -3858,7 +3879,7 @@ impl MessageHandler for Coordinator {
             .unwrap_or_else(|e| e.into_inner())
             .ime_active = true;
         let status = self.build_status();
-        self.push_activation_status();
+        self.push_activation_status(client_token);
         self.notify_toolbar_async(); // 激活态 → 工具栏显示（异步，避免 is_foreground_fullscreen 阻塞 bridge 线程）
         self.show_persistent_status_if_always(); // 常驻模式:激活即显示状态
         Some(status)

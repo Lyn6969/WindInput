@@ -244,11 +244,10 @@ impl HostRenderManager {
         self.inner.lock().unwrap().active = Some((conn_id, pid));
     }
 
-    /// 当前焦点进程是否在白名单中（note_focus 存的 pid 过白名单；查进程名在锁外执行）
-    pub fn focused_whitelisted(&self) -> bool {
-        let pid = self.inner.lock().unwrap().active.map(|(_, pid)| pid);
-        pid.map(|p| self.is_process_whitelisted(p)).unwrap_or(false)
-    }
+    // 注意：不要基于全局 active 槽计算 hostRenderAvail 位（曾有 focused_whitelisted()，
+    // 已删除）。avail 位必须按「事件源客户端的 PID」查白名单（对齐 Go
+    // PushActivationStatusToActiveClient(status, processID)），否则兄弟进程
+    // （StartMenuExperienceHost 等）的激活事件会污染推送、触发 DLL 销毁重建循环。
 
     /// 活跃实例（已 setup 才返回 Some）
     pub fn active_target(&self) -> Option<HostRenderTarget> {
@@ -855,32 +854,4 @@ mod tests {
         assert!(wildcard_match("NOTEPAD.EXE", "notepad.exe"));
     }
 
-    // ── focused_whitelisted ──────────────────────────────────────────────
-    #[test]
-    fn focused_whitelisted_returns_true_when_active_pid_matches() {
-        let pid = std::process::id();
-        let suffix = format!("_FW1_{}", pid);
-        // 当前测试进程名以 .exe 结尾，用通配符匹配
-        let mgr = HostRenderManager::new(&suffix, vec!["*.exe".to_string()]);
-        mgr.note_focus(1, pid);
-        assert!(mgr.focused_whitelisted(), "白名单命中时应返回 true");
-    }
-
-    #[test]
-    fn focused_whitelisted_returns_false_when_no_focus() {
-        let suffix = format!("_FW2_{}", std::process::id());
-        let mgr = HostRenderManager::new(&suffix, vec!["*.exe".to_string()]);
-        // 未调用 note_focus
-        assert!(!mgr.focused_whitelisted(), "无焦点时应返回 false");
-    }
-
-    #[test]
-    fn focused_whitelisted_returns_false_when_not_whitelisted() {
-        let pid = std::process::id();
-        let suffix = format!("_FW3_{}", pid);
-        // 不可能匹配的模式
-        let mgr = HostRenderManager::new(&suffix, vec!["NoSuchProcess_XYZ.exe".to_string()]);
-        mgr.note_focus(1, pid);
-        assert!(!mgr.focused_whitelisted(), "白名单未命中时应返回 false");
-    }
 }

@@ -36,11 +36,16 @@ pub const CMD_COMPOSITION_TERMINATED: u16 = 0x0209;
 pub const CMD_SHOW_CONTEXT_MENU: u16 = 0x020A;
 pub const CMD_SYSTEM_MODE_SWITCH: u16 = 0x020B;
 
-// darwin .app 上行（请求 socket）：鼠标候选交互。方向与下行 0x020D/0x020E 由 dispatch 上下文区分。
-pub const CMD_CANDIDATE_SELECT: u16 = 0x020D; // payload: pageLocalIndex u32 LE
-pub const CMD_CANDIDATE_HOVER: u16 = 0x020E; // payload: pageLocalIndex i32 LE (-1=无)
+// 上行（darwin .app / Windows host-render DLL）：鼠标候选交互。方向与下行 0x020D/0x020E 由 dispatch 上下文区分。
+pub const CMD_CANDIDATE_SELECT: u16 = 0x020D; // payload: pageLocalIndex i32 LE；<0 为翻页按钮（-1 上页 / -2 下页，与 SHM 命中矩形约定一致）
+pub const CMD_CANDIDATE_HOVER: u16 = 0x020E; // payload: pageLocalIndex i32 LE (-1=无；Windows 另带 anchorX/belowY/aboveY 三个 i32，当前仅取 index)
 pub const CMD_CANDIDATE_CONTEXT_MENU: u16 = 0x020F; // 上行：候选右键动作 (payload: index i32 + actionLen u32 + action UTF-8)
 pub const CMD_MENU_ACTION: u16 = 0x0210; // 上行：统一菜单项被选中 (payload: 菜单 id i32 LE)
+// ⚠️ 0x0211 平台双语义（历史遗留，dispatch 按 cfg 分臂，两侧上行方向平台互斥）：
+// - Windows DLL 上行 = CANDIDATE_SCROLL（Go/C++ BinaryProtocol.h 原始定义）；
+// - macOS .app 上行 = FRONT_CONTEXT（macOS 移植期新增时误复用了该码位，Swift BinaryCodec 已固化）。
+// 若未来需要在同一平台同时使用两者，须迁移 FRONT_CONTEXT 到空闲码位并同步 Swift 端。
+pub const CMD_CANDIDATE_SCROLL: u16 = 0x0211; // Windows 上行：host 候选框滚轮 (payload: delta i32，WHEEL_DELTA 倍数，正=上滚)；服务端统一决策（默认不翻页，对齐 Go）
 // darwin .app 上报前台上下文（命令直通车 app()/title()/sel() 取值）：
 // payload = appLen u32 + app(UTF-8) + titleLen u32 + title + selLen u32 + sel，均 LE 长度前缀。
 pub const CMD_FRONT_CONTEXT: u16 = 0x0211;

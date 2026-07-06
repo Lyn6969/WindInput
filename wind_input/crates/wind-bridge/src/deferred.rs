@@ -78,8 +78,12 @@ impl MessageHandler for DeferredHandler {
         self.with_handler((), |h| h.handle_menu_action_id(id))
     }
 
-    fn handle_candidate_select(&self, page_local_index: u32) {
+    fn handle_candidate_select(&self, page_local_index: i32) {
         self.with_handler((), |h| h.handle_candidate_select(page_local_index))
+    }
+
+    fn handle_candidate_scroll(&self, delta: i32) {
+        self.with_handler((), |h| h.handle_candidate_scroll(delta))
     }
 
     fn handle_candidate_hover(&self, page_local_index: i32) {

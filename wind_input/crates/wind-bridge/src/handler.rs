@@ -232,8 +232,14 @@ pub trait MessageHandler: Send + Sync {
     /// 对齐 Go `RecordTSFEnglish`。默认空实现（无统计的 handler 静默忽略）。
     fn handle_english_stats(&self, _chars: u32, _digits: u32, _puncts: u32, _spaces: u32) {}
 
-    /// darwin: .app 鼠标点选候选（页内下标）。默认空。
-    fn handle_candidate_select(&self, _page_local_index: u32) {}
+    /// 鼠标点选候选（darwin .app / Windows host-render DLL，页内下标）。
+    /// 负值为翻页按钮：-1 上页 / -2 下页（与 SHM 命中矩形及 C++ _OnMouseClick 约定一致）。默认空。
+    fn handle_candidate_select(&self, _page_local_index: i32) {}
+
+    /// host 候选框鼠标滚轮（delta 为 WHEEL_DELTA 倍数，正=上滚）。
+    /// 对齐 Go HandleCandidateScroll：默认不做任何动作（本地候选窗无滚轮翻页），
+    /// 统一接入点便于后续按配置实现滚轮行为。默认空。
+    fn handle_candidate_scroll(&self, _delta: i32) {}
 
     /// darwin: .app 鼠标 hover 候选（页内下标，-1=无）。默认空。
     fn handle_candidate_hover(&self, _page_local_index: i32) {}

@@ -412,6 +412,14 @@ pub(crate) fn dispatch_command(
     match command {
         // ── 按键事件（同步） ──
         CMD_KEY_EVENT => {
+            // 键事件是「该实例正在输入」的最强焦点证据：SearchHost 等 locked/transient
+            // DocMgr 宿主二次聚焦时 DLL 会跳过 focus_gained（OnSetFocus 见 TextService.cpp），
+            // IME_ACTIVATED 也不重发——若不在此刷新 active，host-render 目标会停留在
+            // 上一个前台进程，导致第二次在开始菜单输入时回退本地渲染（真机踩坑）。
+            #[cfg(windows)]
+            if let Some(mgr) = host_render {
+                mgr.note_focus(ctx.conn_id, ctx.pid);
+            }
             let key_payload = match decode_key_payload(payload) {
                 Ok(p) => p,
                 Err(e) => {
@@ -744,6 +752,9 @@ pub(crate) fn dispatch_command(
 
         // ── darwin .app 上报前台上下文（appLen+app + titleLen+title + selLen+sel，上行）──
         // 供命令直通车 app()/title()/sel() 取值；聚焦时快照。
+        // 0x0211 与 Windows 的 CMD_CANDIDATE_SCROLL 平台双语义（见 protocol.rs 注释），
+        // 本臂仅非 Windows 编译，Windows 由下方 SCROLL 臂接管。
+        #[cfg(not(windows))]
         CMD_FRONT_CONTEXT => {
             let mut off = 0usize;
             let mut take = || -> Option<String> {
@@ -778,23 +789,38 @@ pub(crate) fn dispatch_command(
             Some(encode_ack())
         }
 
-        // ── darwin .app 鼠标点选候选（页内下标 u32 LE，上行）──
+        // ── 鼠标点选候选（页内下标 i32 LE，上行；darwin .app 同步 / Windows host DLL SendAsync）──
         // 0x020D 双用途：下行 CMD_MODE_PUSH（仅编码），上行 CMD_CANDIDATE_SELECT（仅 dispatch）。
+        // 负值为翻页按钮（-1 上页 / -2 下页），对齐 Go handleHostCandidateSelect 的 int32 解码——
+        // 按 u32 解码会把翻页点击变成巨大下标被 coordinator 丢弃（真机踩坑：翻页点击无效）。
+        // Windows DLL fire-and-forget（is_async）不读响应，回 ack 会污染管道 → 仅 !is_async 回 ack。
         CMD_CANDIDATE_SELECT => {
             if payload.len() >= 4 {
-                let idx = u32::from_le_bytes(payload[0..4].try_into().unwrap());
+                let idx = i32::from_le_bytes(payload[0..4].try_into().unwrap());
                 handler.handle_candidate_select(idx);
             }
-            Some(encode_ack())
+            if is_async { None } else { Some(encode_ack()) }
         }
 
-        // ── darwin .app 鼠标 hover 候选（页内下标 i32 LE，-1=无，上行）──
+        // ── 鼠标 hover 候选（页内下标 i32 LE，-1=无，上行）──
+        // Windows host DLL 载荷另带 anchorX/belowY/aboveY（tooltip 锚点），当前仅取 index。
         CMD_CANDIDATE_HOVER => {
             if payload.len() >= 4 {
                 let idx = i32::from_le_bytes(payload[0..4].try_into().unwrap());
                 handler.handle_candidate_hover(idx);
             }
-            Some(encode_ack())
+            if is_async { None } else { Some(encode_ack()) }
+        }
+
+        // ── host 候选框鼠标滚轮（delta i32，WHEEL_DELTA 倍数，Windows DLL SendAsync）──
+        // 0x0211 平台双语义：Windows=SCROLL / darwin=FRONT_CONTEXT（见 protocol.rs 注释）。
+        #[cfg(windows)]
+        CMD_CANDIDATE_SCROLL => {
+            if payload.len() >= 4 {
+                let delta = i32::from_le_bytes(payload[0..4].try_into().unwrap());
+                handler.handle_candidate_scroll(delta);
+            }
+            if is_async { None } else { Some(encode_ack()) }
         }
 
         // ── 批处理事件 ──
@@ -971,13 +997,17 @@ mod tests {
     use super::*;
     use std::sync::atomic::{AtomicU32, Ordering};
     use wind_ipc::protocol::{
-        CMD_ACK, CMD_HOST_RENDER_FAILED, CMD_HOST_RENDER_REQUEST, CMD_HOST_RENDER_SETUP, IpcHeader,
+        CMD_ACK, CMD_CANDIDATE_SCROLL, CMD_CANDIDATE_SELECT, CMD_HOST_RENDER_FAILED,
+        CMD_HOST_RENDER_REQUEST, CMD_HOST_RENDER_SETUP, CMD_KEY_EVENT, IpcHeader,
     };
 
-    /// 最小测试 handler：仅记录 host_render_failed 的 reason，其余方法返回安全默认值。
+    /// 最小测试 handler：记录 host_render_failed 的 reason 与鼠标 select/scroll 值，
+    /// 其余方法返回安全默认值。
     #[derive(Default)]
     struct RecordingHandler {
         last_failed_reason: AtomicU32,
+        last_select: std::sync::atomic::AtomicI32,
+        last_scroll: std::sync::atomic::AtomicI32,
     }
 
     impl MessageHandler for RecordingHandler {
@@ -1015,6 +1045,122 @@ mod tests {
         fn handle_host_render_failed(&self, reason: u32) {
             self.last_failed_reason.store(reason, Ordering::SeqCst);
         }
+        fn handle_candidate_select(&self, page_local_index: i32) {
+            self.last_select.store(page_local_index, Ordering::SeqCst);
+        }
+        fn handle_candidate_scroll(&self, delta: i32) {
+            self.last_scroll.store(delta, Ordering::SeqCst);
+        }
+    }
+
+    /// dispatch_command 的跨平台调用包装（Windows 多一个 host_render 参数）。
+    fn dispatch_for_test(
+        handler: &Arc<dyn MessageHandler>,
+        cmd: u16,
+        is_async: bool,
+        payload: &[u8],
+        ctx: ClientCtx,
+    ) -> Option<Vec<u8>> {
+        #[cfg(windows)]
+        {
+            dispatch_command(handler, cmd, is_async, payload, ctx, None)
+        }
+        #[cfg(not(windows))]
+        {
+            dispatch_command(handler, cmd, is_async, payload, ctx)
+        }
+    }
+
+    /// host 模式翻页按钮点击：DLL SendAsync 发负 index（-1 上页 / -2 下页），
+    /// 必须按 i32 路由到 handler（u32 解码会丢弃翻页，真机踩坑），且异步不回响应
+    /// （回 ack 会污染管道，DLL 不读响应）。
+    #[test]
+    fn candidate_select_negative_pager_routed_async_silent() {
+        let handler = Arc::new(RecordingHandler::default());
+        let dyn_handler: Arc<dyn MessageHandler> = handler.clone();
+        let ctx = ClientCtx { conn_id: 0, pid: 0 };
+
+        let resp = dispatch_for_test(
+            &dyn_handler,
+            CMD_CANDIDATE_SELECT,
+            true,
+            &(-1i32).to_le_bytes(),
+            ctx,
+        );
+        assert!(resp.is_none(), "异步 select 不得回响应（防管道污染）");
+        assert_eq!(handler.last_select.load(Ordering::SeqCst), -1, "上页按钮应路由 -1");
+
+        let resp = dispatch_for_test(
+            &dyn_handler,
+            CMD_CANDIDATE_SELECT,
+            true,
+            &(-2i32).to_le_bytes(),
+            ctx,
+        );
+        assert!(resp.is_none());
+        assert_eq!(handler.last_select.load(Ordering::SeqCst), -2, "下页按钮应路由 -2");
+    }
+
+    /// darwin 同步点选（非负下标）行为不变：路由 + 回 ACK。
+    #[test]
+    fn candidate_select_sync_nonnegative_returns_ack() {
+        let handler = Arc::new(RecordingHandler::default());
+        let dyn_handler: Arc<dyn MessageHandler> = handler.clone();
+        let ctx = ClientCtx { conn_id: 0, pid: 0 };
+
+        let resp = dispatch_for_test(
+            &dyn_handler,
+            CMD_CANDIDATE_SELECT,
+            false,
+            &3i32.to_le_bytes(),
+            ctx,
+        )
+        .expect("同步 select 应回响应");
+        let hdr_arr: [u8; IpcHeader::SIZE] = resp[..IpcHeader::SIZE].try_into().unwrap();
+        let cmd = IpcHeader::from_bytes(&hdr_arr).command;
+        assert_eq!(cmd, CMD_ACK);
+        assert_eq!(handler.last_select.load(Ordering::SeqCst), 3);
+    }
+
+    /// host 候选框滚轮（DLL SendAsync）应路由 delta 且不回响应。
+    /// Windows-only：0x0211 在非 Windows 是 FRONT_CONTEXT 臂（平台双语义）。
+    #[cfg(windows)]
+    #[test]
+    fn candidate_scroll_routed_async_silent() {
+        let handler = Arc::new(RecordingHandler::default());
+        let dyn_handler: Arc<dyn MessageHandler> = handler.clone();
+        let ctx = ClientCtx { conn_id: 0, pid: 0 };
+
+        let resp = dispatch_for_test(
+            &dyn_handler,
+            CMD_CANDIDATE_SCROLL,
+            true,
+            &(-120i32).to_le_bytes(),
+            ctx,
+        );
+        assert!(resp.is_none(), "异步 scroll 不得回响应");
+        assert_eq!(handler.last_scroll.load(Ordering::SeqCst), -120);
+    }
+
+    /// 键事件必须刷新 host-render 活跃实例：SearchHost 等 transient DocMgr 宿主二次聚焦时
+    /// focus_gained 被 DLL 跳过、IME_ACTIVATED 不重发，键事件是唯一可靠的焦点信号
+    /// （否则 active 停留在别的进程 → 二次输入回退本地渲染，真机踩坑）。
+    #[cfg(windows)]
+    #[test]
+    fn key_event_notes_focus_for_host_render() {
+        let pid = std::process::id();
+        let suffix = format!("_srv_keyfocus_{}", pid);
+        let mgr = HostRenderManager::new(&suffix, vec!["*".to_string()]);
+        let handler: Arc<dyn MessageHandler> = Arc::new(RecordingHandler::default());
+        let ctx = ClientCtx { conn_id: 7, pid };
+
+        // 空 payload 解码失败也应先记焦点（note_focus 在解码之前）
+        let _ = dispatch_command(&handler, CMD_KEY_EVENT, false, &[], ctx, Some(&mgr));
+
+        // setup 后 active_target 应指向键事件来源的 conn 7
+        mgr.setup(7, pid).expect("setup 应成功");
+        let target = mgr.active_target().expect("键事件应已刷新 active");
+        assert_eq!(target.instance_id, 7, "active 实例应为键事件来源连接");
     }
 
     /// 命中白名单（`*`）的连接请求应回 HostRenderSetup（含 instanceId + 三 kind 条目）。
