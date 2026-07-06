@@ -1948,6 +1948,8 @@ mod tests {
         let mut cfg = Config::default();
         cfg.schema.active = "py_test".into();
         cfg.schema.available = vec!["py_test".into()];
+        // 开启拼音调频，供 record_selection 写入测试生效（默认关闭不落库）。
+        cfg.schema.pinyin.frequency.enabled = true;
         let db_path = std::env::temp_dir().join("wind_coord_p2d_pinyin_active.redb");
         let _ = std::fs::remove_file(&db_path);
         let store = Arc::new(Store::open(&db_path).unwrap());

@@ -218,6 +218,19 @@ impl PinyinEngine {
         syllables
     }
 
+    /// 由全拼码现算简拼（各音节声母拼接），供用户/临时造词层动态简拼匹配。
+    /// 系统词库规模大，离线预建 AbbrevSection 索引（性能考量）；用户词库规模小，
+    /// 现场切分+取声母足够快，无需为其单独建索引/维护写入时的双写一致性。
+    /// 切分未完全覆盖 code（残码/非法拼音）时返回 None，不参与简拼匹配。
+    fn abbrev_of_code(&self, code: &str) -> Option<String> {
+        let syllables = self.segment_with_separators(code);
+        let consumed: usize = syllables.iter().map(|s| s.len()).sum();
+        if syllables.is_empty() || consumed != code.len() {
+            return None;
+        }
+        Some(syllables.iter().filter_map(|s| s.chars().next()).collect())
+    }
+
     /// 带模糊拼音扩展的词库查找（对齐 Go lookupWithFuzzy）。
     /// `code` 为待查询的全拼码（整串或前缀子码）；`syllables` 为该码对应的音节切分，
     /// 用于生成模糊变体。返回与 `dict.search` 相同的 `(text, weight, order)`。
@@ -653,6 +666,28 @@ impl Engine for PinyinEngine {
                     !c.is_prefix && c.code.len() < query.len() && query.starts_with(&c.code);
                 candidates.push(c);
             }
+
+            // 简拼匹配（用户/临时造词层）：用户词写入时只存全拼码，不像系统词库那样离线
+            // 预建 AbbrevSection——规模小，现算即可（枚举该 schema 下全部用户/临时词，
+            // 现场切分各词全拼码取声母比对，见 abbrev_of_code）。natural_order 对齐
+            // step5 系统简拼候选，同样排在全拼之后。
+            if AbbrevMatcher::is_abbreviation(query, trie) {
+                for mut c in store_dm.search_prefix("", 0) {
+                    if c.text.is_empty() || candidates.iter().any(|x| x.text == c.text) {
+                        continue;
+                    }
+                    if self.abbrev_of_code(&c.code).as_deref() != Some(query) {
+                        continue;
+                    }
+                    c.source = CandidateSource::Pinyin;
+                    c.code = query.to_string();
+                    c.is_prefix = false;
+                    c.is_partial = false;
+                    c.is_fuzzy = true;
+                    c.natural_order = 999999;
+                    candidates.push(c);
+                }
+            }
         }
 
         // 手动分隔符边界过滤：用户以 `'` 强制音节边界后，凡「码恰好落在某音节边界、但字数
@@ -988,6 +1023,45 @@ mod tests {
             "nihao".len(),
             "应只消费前缀 nihao"
         );
+    }
+
+    /// 用户造词的简拼应可命中（现算，非离线索引）：用户新增「菜鸟驿站」（全拼
+    /// cainiaoyizhan），键入简拼 cnyz 应能查到；临时词同理。
+    #[test]
+    fn store_layer_words_match_abbreviation() {
+        let store = tmp_store("layer_abbrev");
+        store
+            .add_user_word("pinyin", "cainiaoyizhan", "菜鸟驿站", 500)
+            .unwrap();
+        store
+            .learn_temp_word("pinyin", "lanshoubing", "蓝瘦蘑菇", 800, 0)
+            .unwrap();
+        let dm = DictManager::new();
+        dm.register_layer(Box::new(wind_dict::StoreUserLayer::new(
+            store.clone(),
+            "pinyin",
+        )));
+        dm.register_layer(Box::new(wind_dict::StoreTempLayer::new(
+            store.clone(),
+            "pinyin",
+        )));
+        let engine = empty_engine().with_store_layers(Arc::new(dm));
+
+        let r = engine.convert("cnyz", 20).unwrap();
+        assert!(
+            r.candidates.iter().any(|c| c.text == "菜鸟驿站"),
+            "简拼 cnyz 应命中用户造词「菜鸟驿站」"
+        );
+
+        let r2 = engine.convert("lsb", 20).unwrap();
+        assert!(
+            r2.candidates.iter().any(|c| c.text == "蓝瘦蘑菇"),
+            "简拼 lsb 应命中临时造词「蓝瘦蘑菇」"
+        );
+
+        // 全拼整串输入仍应正常命中（无回归）
+        let r3 = engine.convert("cainiaoyizhan", 20).unwrap();
+        assert!(r3.candidates.iter().any(|c| c.text == "菜鸟驿站"));
     }
 
     /// C1：query→原始输入空间的 consumed 回映射。无 `'` 恒等；边界紧跟 `'` 归入已消费侧；
