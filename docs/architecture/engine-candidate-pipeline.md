@@ -216,6 +216,13 @@ DAT 从已排序编码列表 BFS 直接构建，峰值内存仅 base/check 两�
 `is_fuzzy asc（非模糊优先）→ is_prefix asc（完整/子短语优先于补全）→ is_partial asc（完整优先于子短语）
 → weight desc → natural_order asc`，再截断。
 
+**裸声母单字优先**：打单个声母（`m`/`n`/`h`/`zh` 等，`syllables` 为空、无完整音节）时候选全为前缀
+补全词，纯按词频排会让高频多字词（没有/目前）压过单字（吗/么），不合主流输入法直觉。故裸声母时
+给**单字候选**加 `BARE_INITIAL_SINGLE_CHAR_BOOST`(1e7)——高于常规词频、低于整句底线
+`PINYIN_SENTENCE_FLOOR`(2e7，不被 freq_rerank 误锚定）。**经 weight 表达**（非引擎排序），才能穿过
+协调器 `build_candidates` 按 `(is_fuzzy, is_prefix, weight)` 的重排。仅裸声母生效——完整音节输入的
+单字已靠 `is_prefix` 精确层级就位（`nihao` 仍 `你好` 优先）。
+
 ### 4.5 consumed_length（分段上屏）
 
 code 是 query 前缀 → 只消费前缀长度，剩余拼音继续转换；否则消费整串。
