@@ -34,12 +34,18 @@ pub(crate) struct PushClient {
     pub(crate) tx: std::sync::mpsc::Sender<Vec<u8>>,
 }
 
+/// push 客户端完成 token 握手注册后的回调（参数 = 客户端 token，高 32 位为 PID）。
+/// Windows 用于 host-render 白名单宿主的重连补推握手（见 coordinator）。
+pub type ClientConnectedHook = Box<dyn Fn(u64) + Send + Sync>;
+
 /// 推送管道服务器
 pub struct PushServer {
     config: PushConfig,
     clients: Arc<Mutex<Vec<PushClient>>>,
     /// 当前活动（有焦点）客户端 token；commit 仅投递给它，避免广播多发
     active_token: Arc<AtomicU64>,
+    /// 客户端注册回调（可选，服务侧后置注入）
+    connected_hook: Arc<Mutex<Option<ClientConnectedHook>>>,
 }
 
 impl PushServer {
@@ -48,6 +54,26 @@ impl PushServer {
             config,
             clients: Arc::new(Mutex::new(Vec::new())),
             active_token: Arc::new(AtomicU64::new(0)),
+            connected_hook: Arc::new(Mutex::new(None)),
+        }
+    }
+
+    /// 注入客户端注册回调（幂等覆盖）。回调在 push accept 线程执行，须自身线程安全且轻量。
+    pub fn set_client_connected_hook(&self, hook: ClientConnectedHook) {
+        *self.connected_hook.lock().unwrap() = Some(hook);
+    }
+
+    /// 定向投递给指定 token 的客户端（精确匹配，无兜底无广播）。返回是否命中。
+    /// 「按事件源计算」的帧（如 activation status 的 hostRenderAvail 位）必须走此方法——
+    /// 广播会把按别的进程计算的位污染给无关客户端（真机踩坑：SearchHost 收到兄弟进程的
+    /// avail=0 推送后陷入 Band 窗口销毁重建循环）。
+    pub fn push_to_token(&self, token: u64, data: &[u8]) -> bool {
+        let clients = self.clients.lock().unwrap();
+        if let Some(c) = clients.iter().find(|c| c.token == token) {
+            let _ = c.tx.send(data.to_vec());
+            true
+        } else {
+            false
         }
     }
 
@@ -84,11 +110,12 @@ impl PushServer {
         info!("Push server starting on {:?}", pipe_name);
 
         let clients = self.clients.clone();
+        let hook = self.connected_hook.clone();
 
         std::thread::Builder::new()
             .name("push-server".into())
             .spawn(move || {
-                run_push_pipe_server(&pipe_name, clients);
+                run_push_pipe_server(&pipe_name, clients, hook);
             })?;
 
         Ok(())
@@ -184,7 +211,11 @@ impl crate::host_render_sink::HostRenderSink for PushServer {
 
 /// 推送管道服务器主循环
 #[cfg(windows)]
-fn run_push_pipe_server(pipe_name: &str, clients: Arc<Mutex<Vec<PushClient>>>) {
+fn run_push_pipe_server(
+    pipe_name: &str,
+    clients: Arc<Mutex<Vec<PushClient>>>,
+    connected_hook: Arc<Mutex<Option<ClientConnectedHook>>>,
+) {
     use std::ffi::CString;
     use windows::Win32::Foundation::*;
     use windows::Win32::Storage::FileSystem::*;
@@ -317,6 +348,14 @@ fn run_push_pipe_server(pipe_name: &str, clients: Arc<Mutex<Vec<PushClient>>>) {
                 push_writer_loop(pipe, rx, token, clients_clone);
             })
             .ok();
+
+        // 注册完成后回调（发送经 tx 入队，writer 线程稍后写出，顺序安全）。
+        // 用途：host-render 白名单宿主（transient DocMgr，如 SearchHost）服务重启重连时
+        // 既不发 focus_gained 也不重发 IME_ACTIVATED，无任何 activation push 会到达 →
+        // DLL 永不重新 setup。由 coordinator 在此回调中定向补推握手帧。
+        if let Some(hook) = connected_hook.lock().unwrap().as_ref() {
+            hook(token);
+        }
     }
 }
 
@@ -378,5 +417,25 @@ mod tests {
             write_timeout_ms: 30_000,
         });
         assert_eq!(release.pipe_name(), r"\\.\pipe\wind_input_push");
+    }
+
+    /// push_to_token 必须精确匹配、无兜底：activation push 的 hostRenderAvail 位按事件源
+    /// 计算，错发给别的客户端会触发 Band 窗口销毁重建循环（真机踩坑）。
+    #[test]
+    fn push_to_token_exact_match_no_fallback() {
+        let srv = PushServer::new(PushConfig::default());
+        let (tx, rx) = std::sync::mpsc::channel::<Vec<u8>>();
+        srv.clients_for_test()
+            .lock()
+            .unwrap()
+            .push(PushClient { token: 0xAA_0000_0001, tx });
+
+        // 命中：精确 token 投递
+        assert!(srv.push_to_token(0xAA_0000_0001, &[1, 2, 3]));
+        assert_eq!(rx.try_recv().unwrap(), vec![1, 2, 3]);
+
+        // 未命中：即使只有一个客户端也不得兜底投递
+        assert!(!srv.push_to_token(0xBB_0000_0002, &[9]));
+        assert!(rx.try_recv().is_err(), "不匹配的 token 不得收到任何帧");
     }
 }

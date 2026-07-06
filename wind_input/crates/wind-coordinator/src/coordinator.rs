@@ -1767,8 +1767,10 @@ impl Coordinator {
         // 陈旧坐标处先显示、reflow 后再跳（根治"上屏后立即输入候选窗错位约一个上屏宽度"）。
         // 例外①：仅显示模式标记（无候选/无编码）时跳过延迟——进入模式时缓冲为空、无刚上屏文字，
         // 光标无 reflow 跳动风险，强制延迟只会让状态提示迟钝。
-        // 例外②：host-render 受限宿主（SearchHost.exe / 开始菜单搜索框）：候选窗由服务端直接绘制
-        // 到 SHM，无需等宿主 reflow；首帧直显，跳过 pending_first_show 等待。
+        // 注：host-render 受限宿主**不**跳过首帧延迟——曾以「服务端直绘 SHM 无需等 reflow」
+        // 为由直显，结果首帧用的是陈旧 caret（SearchHost 的 caret 事件在首键后才到），
+        // 显示后再跳位（真机踩坑）。本机制自带兜底 timer，受限宿主 caret 事件缺席时
+        // 也会超时首显，不存在「永不显示」风险。
         let only_mode_label =
             !mode_label.is_empty() && state.candidates.is_empty() && state.input_buffer.is_empty();
         let authorized = self
@@ -1780,7 +1782,6 @@ impl Coordinator {
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
             && !only_mode_label
-            && !self.host_render_active()
         {
             self.arm_pending_first_show();
             return;
@@ -2282,7 +2283,41 @@ impl Coordinator {
             &s.key_up_hotkeys,
             &s.icon_label,
         );
-        self.push_server.push_to_active(&encoded);
+        // 定向投递给事件源客户端（精确 token 匹配）。push_to_active 实为广播——广播会把
+        // 按别的进程计算的 hostRenderAvail 位污染给无关客户端（真机踩坑：开始菜单弹出时
+        // StartMenuExperienceHost 等兄弟实例的激活推送被 SearchHost 收到，avail=0 触发
+        // Band 窗口销毁重建循环）。事件源无 push 连接时丢弃，绝不兜底转发。
+        if client_token != 0 {
+            if !self.push_server.push_to_token(client_token, &encoded) {
+                debug!("activation push: 事件源 token 无 push 连接，丢弃（防污染不广播）");
+            }
+        } else {
+            // 无 token 的旧路径（不应出现于当前 DLL）：保持原广播行为
+            self.push_server.push_to_active(&encoded);
+        }
+    }
+
+    /// push 客户端完成 token 握手后的补推握手（仅 Windows；由 main.rs 注册到 PushServer）。
+    /// 场景：服务重启后，白名单受限宿主（SearchHost 等 locked/transient DocMgr）重连时
+    /// 既不发 focus_gained（被 DLL OnSetFocus 跳过）也不重发 IME_ACTIVATED——没有任何
+    /// activation push 会到达，DLL 的 host 窗口挂着死 SHM 永不重新 setup（真机踩坑：
+    /// 服务重启后概率性停留普通渲染）。此处对白名单 pid 定向补推一帧 activation status
+    /// （avail=1），触发 C++ ApplyActivationStatusResponse → _EnsureHostRenderSetup
+    /// （forceRefresh）→ 重新握手 setup。非白名单进程不推，零影响。
+    #[cfg(windows)]
+    pub fn on_push_client_connected(&self, client_token: u64) {
+        let pid = (client_token >> 32) as u32;
+        if pid == 0 {
+            return;
+        }
+        let Some(mgr) = self.host_render() else {
+            return;
+        };
+        if !mgr.is_process_whitelisted(pid) {
+            return;
+        }
+        tracing::info!("push 客户端注册补推 activation（host-render 白名单宿主）pid={pid}");
+        self.push_activation_status(client_token);
     }
 
     /// macOS：把命令直通车按键合成帧（CmdKeyTap/Seq/Hold/Release/Type）推给活跃 `.app`。
@@ -2832,11 +2867,20 @@ impl MessageHandler for Coordinator {
         }
     }
 
-    /// macOS `.app` 鼠标 hover 候选/翻页器：复用 Windows 进程内路径的 `mouse_hover`
-    /// （置 hover_index + 重绘带高亮的候选帧）。
-    /// `.app` 传：候选页内下标 ≥0；翻页器 -1(上页)/-2(下页)；无悬停 i32::MIN 哨兵。
-    /// 翻页器 tag 映射回内部 `HOVER_PAGE_PREV/NEXT`，其余负值均视为无悬停(-1)。
+    /// 鼠标 hover 候选/翻页器：复用进程内路径的 `mouse_hover`（置 hover_index + 重绘高亮帧）。
+    /// 两端线约定不同（按编译平台分支，事件源平台互斥）：
+    /// - macOS `.app`：候选 ≥0；翻页器 -1(上页)/-2(下页)；无悬停 i32::MIN 哨兵。
+    /// - Windows host DLL（HostWindow.cpp `_OnMouseMove`）：候选 ≥0；无悬停 -1；
+    ///   翻页器 -2(上页)/-3(下页)——rect 表的 -1/-2 因 hover 需要独立的「无」被平移一位。
     fn handle_candidate_hover(&self, page_local_index: i32) {
+        #[cfg(windows)]
+        let target = match page_local_index {
+            -2 => wind_ui::manager::HOVER_PAGE_PREV,
+            -3 => wind_ui::manager::HOVER_PAGE_NEXT,
+            v if v >= 0 => v,
+            _ => -1,
+        };
+        #[cfg(not(windows))]
         let target = match page_local_index {
             -1 => wind_ui::manager::HOVER_PAGE_PREV,
             -2 => wind_ui::manager::HOVER_PAGE_NEXT,

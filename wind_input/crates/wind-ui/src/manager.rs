@@ -1108,7 +1108,15 @@ fn try_host_render_candidates(
                 .hit_rects
                 .iter()
                 .map(|(idx, r)| HostRenderHitRect {
-                    index: *idx,
+                    // 翻页按钮的内部 tag（HOVER_PAGE_PREV/NEXT = 100000/100001）重映射为
+                    // SHM/C++ 线约定（-1 上页 / -2 下页，HostWindow.cpp _HitTest）——与
+                    // manager_macos.rs 的 darwin 重映射对齐。正数 tag 会被 C++ 当候选索引，
+                    // 点击翻页变成 mouse_select(100000) 被丢弃（真机踩坑：翻页点击无效）。
+                    index: match *idx {
+                        i if i == HOVER_PAGE_PREV => -1,
+                        i if i == HOVER_PAGE_NEXT => -2,
+                        i => i,
+                    },
                     x: r.x as i32,
                     y: r.y as i32,
                     w: r.w as i32,
@@ -1123,7 +1131,13 @@ fn try_host_render_candidates(
                 height: frame.height,
                 bgra: &frame.buf,
                 rects: &rects,
-                rendered_hover_index: candidate_window.hover(),
+                // C++ 以此为 hover 去重基线（_UpdateHitRects → _lastHoverIndex），值域是
+                // C++ hover 约定（-1 无 / -2 上页 / -3 下页）——内部 tag 须同步重映射。
+                rendered_hover_index: match candidate_window.hover() {
+                    i if i == HOVER_PAGE_PREV => -2,
+                    i if i == HOVER_PAGE_NEXT => -3,
+                    i => i,
+                },
                 target_instance_id: 0,
                 software_shadow: frame.software_shadow,
             };

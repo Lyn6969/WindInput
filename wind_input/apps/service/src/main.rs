@@ -174,6 +174,15 @@ fn main() {
     // 注入 host-render 管理器（与 BridgeServer 共享同一实例），供后续写帧/隐藏使用。
     #[cfg(windows)]
     coordinator.set_host_render(host_render.clone());
+    // push 客户端注册回调：host-render 白名单受限宿主（SearchHost 等 transient DocMgr）
+    // 服务重启重连时不发任何激活事件，由此回调补推 activation 握手使 DLL 重新 setup。
+    #[cfg(windows)]
+    {
+        let coord = coordinator.clone();
+        push_server.set_client_connected_hook(Box::new(move |token| {
+            coord.on_push_client_connected(token);
+        }));
+    }
     let coord_for_web = coordinator.clone();
     deferred.set_ready(coordinator);
 
