@@ -322,7 +322,18 @@ impl Coordinator {
 
     /// 列出可用主题：(id, 显示名)。程序目录主题优先（按 order/id 排序），
     /// 用户目录独有主题排后（忽略 order，按 id 排序）。
+    ///
+    /// 唯一排序实现：右键菜单与 RPC `theme.list`（[`Self::web_theme_list`]）
+    /// 均基于此结果，避免两处各自扫描目录导致顺序不一致。
     pub(crate) fn list_themes(&self) -> Vec<(String, String)> {
+        self.list_themes_full()
+            .into_iter()
+            .map(|(id, name, _builtin)| (id, name))
+            .collect()
+    }
+
+    /// [`Self::list_themes`] 的完整版本，附带是否内置（程序目录）标记。
+    pub(crate) fn list_themes_full(&self) -> Vec<(String, String, bool)> {
         let all_dirs = self.theme_search_dirs();
         let user_dir = Config::user_config_dir().map(|d| d.join("themes"));
 
@@ -385,11 +396,11 @@ impl Coordinator {
             user_rows.sort_by(|a, b| a.0.cmp(&b.0));
         }
 
-        let mut result: Vec<(String, String)> = prog_rows
+        let mut result: Vec<(String, String, bool)> = prog_rows
             .into_iter()
-            .map(|(id, name, _)| (id, name))
+            .map(|(id, name, _order)| (id, name, true))
             .collect();
-        result.extend(user_rows);
+        result.extend(user_rows.into_iter().map(|(id, name)| (id, name, false)));
         result
     }
 

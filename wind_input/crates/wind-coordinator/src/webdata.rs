@@ -1210,51 +1210,22 @@ impl Coordinator {
     }
 
     fn web_theme_list(&self) -> anyhow::Result<Value> {
-        // 与右键菜单 list_themes 同源:扫用户+安装多目录(theme_search_dirs),含 theme.toml、
-        // 过滤 `_` 前缀(_base 等)、用户优先去重;读 meta(名称/作者/版本/排序)。修列表不一致 (#5/主题)。
+        // 复用右键菜单的 list_themes_full 顺序，保证与菜单一致 (#5/主题)。
         let dirs = self.theme_search_dirs();
-        let mut seen = std::collections::HashSet::new();
-        let mut rows: Vec<(i32, String, Value)> = Vec::new();
-        for (i, dir) in dirs.iter().enumerate() {
-            let builtin = i > 0; // theme_search_dirs[0] 为用户目录
-            let Ok(rd) = std::fs::read_dir(dir) else {
-                continue;
-            };
-            for e in rd.flatten() {
-                if !e.path().is_dir() {
-                    continue;
-                }
-                let Some(id) = e.file_name().to_str().map(|s| s.to_string()) else {
-                    continue;
-                };
-                if id.starts_with('_') || !dir.join(&id).join("theme.toml").exists() {
-                    continue;
-                }
-                if !seen.insert(id.clone()) {
-                    continue;
-                }
+        let out: Vec<Value> = self
+            .list_themes_full()
+            .into_iter()
+            .map(|(id, display, builtin)| {
                 let meta = wind_theme::read_meta(&dirs, &id);
-                let display = meta
-                    .as_ref()
-                    .map(|m| m.name.clone())
-                    .filter(|s| !s.is_empty())
-                    .unwrap_or_else(|| id.clone());
-                let order = meta.as_ref().map(|m| m.order).unwrap_or(0);
-                rows.push((
-                    order,
-                    display.clone(),
-                    json!({
-                        "name": id,
-                        "display_name": display,
-                        "author": meta.as_ref().map(|m| m.author.clone()).unwrap_or_default(),
-                        "version": meta.as_ref().map(|m| m.version.clone()).unwrap_or_default(),
-                        "builtin": builtin,
-                    }),
-                ));
-            }
-        }
-        rows.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
-        let out: Vec<Value> = rows.into_iter().map(|(_, _, v)| v).collect();
+                json!({
+                    "name": id,
+                    "display_name": display,
+                    "author": meta.as_ref().map(|m| m.author.clone()).unwrap_or_default(),
+                    "version": meta.as_ref().map(|m| m.version.clone()).unwrap_or_default(),
+                    "builtin": builtin,
+                })
+            })
+            .collect();
         Ok(json!(out))
     }
 }
