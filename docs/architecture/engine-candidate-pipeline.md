@@ -380,8 +380,10 @@ convert(input):
 ② 短语注入（wind-phrase lookup + lookup_prefix）：
      静态/模板短语、$CC 命令（is_command）、$SS/$AA 组（is_group 二级展开）
      weight = PHRASE_WEIGHT_BASE + hit.weight
-③ 层级排序：is_fuzzy asc → is_prefix asc → weight desc → natural_order asc
-     （Exact >> Prefix >> Fuzzy：输入 si 时精确「四」> 补全「思考」> 模糊「是」）
+③ 层级排序：is_fuzzy asc → **is_partial asc** → is_prefix asc → weight desc → natural_order asc
+     （Fuzzy＜子短语＜前缀补全＜完整匹配：与 PinyinEngine 内部排序一致。缺 `is_partial` 时混输 ÷100
+     压缩权重后，高权重子串单字会靠 weight 反超低权重精确词组——如 `pingtan` 在混输下
+     平(w=58 part=true)＞平摊(w=4 part=false)，前者插到词组前）
 ④ 按 text 去重（HashSet 保留首个）
 ⑤ apply_filter：填充 is_common（常用字表；短语豁免）→ wind_candidate::filter_candidates
 ⑥ apply_freq_rerank：用户词频重排（独立维度，绝不改 weight）

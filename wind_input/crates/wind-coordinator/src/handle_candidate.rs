@@ -293,14 +293,18 @@ impl Coordinator {
             }
         }
         drop(phrases);
-        // 候选层级排序（与引擎一致，对齐 Go：Exact >> Prefix >> Fuzzy）：
-        // ① 非模糊优先于模糊；② 同模糊层内精确(code==输入)优先于前缀补全；
-        // ③ 同层内按权重降序、自然序升序。使输入 si 时精确单字「四」优先于
-        // 前缀补全「思考」、再优先于模糊命中「是」（即便后者词频更高）。
+        // 候选层级排序（与 PinyinEngine 内部排序完全一致）：
+        // ① 非模糊优先于模糊；② 精确优先于前缀补全（is_prefix）；
+        // ③ 完整匹配优先于子短语（is_partial）；④ 同层内按权重降序、自然序升序。
+        // is_partial 不可少：混输 ÷100 压缩权重后，高权重子串单字（平 w=58
+        // is_partial=true）会靠 weight 反超低权重精确词组（平摊 w=4 is_partial=false）。
+        // is_partial 必须在 is_prefix 之后：与 PinyinEngine 对齐。
+        // 排序规则：Exact >> Sub-phrase >> Prefix >> Fuzzy
         candidates.sort_by(|a, b| {
             a.is_fuzzy
                 .cmp(&b.is_fuzzy)
                 .then(a.is_prefix.cmp(&b.is_prefix))
+                .then(a.is_partial.cmp(&b.is_partial))
                 .then(b.weight.cmp(&a.weight))
                 .then(a.natural_order.cmp(&b.natural_order))
         });
