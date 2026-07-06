@@ -4482,7 +4482,12 @@ BOOL CTextService::ReplacePrecedingChars(int count, const std::wstring& text)
             pEditSession->Release();
             pContext->Release();
 
-            if (SUCCEEDED(hr) && SUCCEEDED(hrSession) && success)
+            // 同 CommitText：只信 GetSuccess()，不要求外层 hr/hrSession 也成功。
+            // 部分终端模拟器的 TSF 支持不完整，RequestEditSession 外层可能报告失败，
+            // 但 DoEditSession 里的 ShiftStart+SetText 其实已经原子替换成功；若仍
+            // 按 hr/hrSession 判失败去做 SendInput 退格+重打兜底，就会在已经替换
+            // 正确的文字上再删再打一遍，表现为"文字被复制"。
+            if (success)
             {
                 WIND_LOG_DEBUG_FMT(L"ReplacePrecedingChars: TSF range replace succeeded count=%d\n", count);
                 return TRUE;
@@ -4595,7 +4600,13 @@ BOOL CTextService::CommitText(const std::wstring& text)
         QueryPerformanceCounter(&endTime);
         int durationMs = (int)((endTime.QuadPart - startTime.QuadPart) * 1000 / freq.QuadPart);
 
-        if (SUCCEEDED(hr) && SUCCEEDED(hrSession) && success)
+        // 只信 DoEditSession 内部的 GetSuccess()——它只在 SetText/EndComposition 真正
+        // 执行完毕后才置 TRUE，是文档是否已被修改的唯一可信信号。外层 hr/hrSession 在
+        // 部分宿主（如 Word 在 SetTimer 回调而非按键同步上下文里请求 TF_ES_SYNC）会
+        // 出现"编辑其实已经执行、但外层返回码不达标"的情况；若仍要求三者同时成功，
+        // 会误判为失败并接着走 SendInput 兜底，在已经正确写入的文字后面再打一遍，
+        // 造成 Office 等宿主里"符号 500ms 后又上屏一次"的重复。
+        if (success)
         {
             WIND_LOG_DEBUG_FMT(L"CommitText: TSF atomic commit succeeded, duration=%dms\n", durationMs);
             return TRUE;
