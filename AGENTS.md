@@ -9,7 +9,7 @@
 | Crate | 职责 | crate 文档 |
 |---|---|---|
 | `wind-coordinator` | 输入法“大脑”：按键路由、状态机、候选与模式切换的中央协调器 | [AGENTS.md](wind_input/crates/wind-coordinator/AGENTS.md) |
-| `wind-engine` | Schema 驱动的引擎工厂：拼音/码表/混输三类引擎的构建、切换与候选分发 | [AGENTS.md](wind_input/crates/wind-engine/AGENTS.md) |
+| `wind-engine` | Schema 驱动的引擎工厂：拼音/码表/混输/英文四类引擎的构建、切换与候选分发 | [AGENTS.md](wind_input/crates/wind-engine/AGENTS.md) |
 | `wind-ui` | 所有浮层窗口（候选窗/工具栏/菜单/状态泡/Toast/Tooltip）的渲染与鼠标交互 | [AGENTS.md](wind_input/crates/wind-ui/AGENTS.md) |
 | `wind-cmdbar` | 命令直通车：短语解析 → AST 求值 → 动作执行（纯逻辑） | [AGENTS.md](wind_input/crates/wind-cmdbar/AGENTS.md) |
 | `wind-dict` | 多层复合词典引擎：DictLayer/CompositeDict 查询 + wdat mmap 二进制词库 | [AGENTS.md](wind_input/crates/wind-dict/AGENTS.md) |
@@ -28,6 +28,10 @@
 | `wind-transform` | 文本变换：标点、全角、自动配对、简繁 | — |
 
 `—` = 暂无独立 `AGENTS.md`（多为纯逻辑/工具 crate，职责单一，看 `src/lib.rs` 顶部模块注释即可）。
+
+核心输入链路（词库 → 五类引擎 → 候选后处理）的**现状架构文档**见
+[docs/architecture/engine-candidate-pipeline.md](docs/architecture/engine-candidate-pipeline.md)
+（含混输拼音否决、顶码/满码一致性、各模式流程对比）；改引擎/候选逻辑时同步更新该文档。
 
 ## 虚拟键码（VK）—— 用常量，禁止裸十六进制
 

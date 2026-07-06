@@ -1,5 +1,8 @@
 # 重设计差分：engine（输入引擎）
 
+> ⚠️ 本文的「Rust 现状」记录于 2026-06-15，已大幅过时（混输/双拼/打分等差距项多数已实现）。
+> **当前实现的权威整理见 [architecture/engine-candidate-pipeline.md](../architecture/engine-candidate-pipeline.md)**（2026-07-06）。
+>
 > 阶段 A 产物。基于 2026-06-15 对两侧 engine 的真实代码核查（Go 侧由 4 个只读 agent 提取、
 > 关键论断已用 grep 抽验 file:line 属实；Rust 侧由本人直接通读）。
 > 方法：Go 设计要点 / Rust 现状 / 差距 / **Go 坏设计（不照搬）** / **Rust 目标边界（决策）**。
