@@ -80,6 +80,9 @@ git commit -m "style(fmt): cargo fmt 统一格式化"
 - **逻辑修改** 和 **fmt 修改** 必须分开提交，不能混在同一个 commit。
 - 不要用 `git add -A`：只 stage 本次逻辑改动涉及的文件 + 对应 fmt 文件。
 - `cargo fmt` 对整个 workspace 生效，若其他 crate 也被格式化，一并纳入 fmt 提交。
+- 多会话协作下格式漂移容易累积（上一会话改完忘记提交 fmt 结果）：开始新一轮工作前，
+  先跑一次 `git status` + `cargo fmt`，确认没有遗留的纯格式改动混入本次工作区，
+  避免和自己本次的逻辑改动绞在一起难以拆分提交。
 
 ## 日志规范
 
