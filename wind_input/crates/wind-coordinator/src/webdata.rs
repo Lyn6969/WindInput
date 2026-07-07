@@ -182,6 +182,7 @@ impl Coordinator {
             // ── theme.* ──────────────────────────────────────────
             "theme.list" => self.web_theme_list(),
             "theme.preview" => self.web_theme_preview(params),
+            "theme.getText" => self.web_theme_get_text(params),
             "theme.delete" => self.web_theme_delete(params),
             "theme.importFromText" => self.web_theme_import_text(params),
             "theme.importFromUrl" => {
@@ -1472,6 +1473,22 @@ impl Coordinator {
         let merged = wind_theme::load_merged_dirs(&dirs, name, 0)?;
         let normalized = wind_theme::normalize::normalize_theme(merged);
         Ok(serde_json::to_value(&normalized)?)
+    }
+
+    fn web_theme_get_text(&self, params: &Value) -> anyhow::Result<Value> {
+        let slug = str_param(params, "slug")?;
+        if slug.is_empty() || slug.contains('/') || slug.contains('\\') || slug.contains("..") {
+            anyhow::bail!("非法主题 slug");
+        }
+        for dir in self.theme_dirs() {
+            let path = dir.join(slug).join("theme.toml");
+            if path.is_file() {
+                let toml = std::fs::read_to_string(&path)
+                    .map_err(|e| anyhow::anyhow!("读取主题失败：{e}"))?;
+                return Ok(json!({ "slug": slug, "toml": toml }));
+            }
+        }
+        anyhow::bail!("主题不存在")
     }
 
     fn web_theme_delete(&self, params: &Value) -> anyhow::Result<Value> {
