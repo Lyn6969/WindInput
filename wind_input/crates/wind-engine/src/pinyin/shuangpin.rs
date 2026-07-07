@@ -15,6 +15,8 @@ pub struct Layout {
     initials: HashMap<u8, String>,
     finals: HashMap<u8, Vec<String>>,
     zero_initials: HashMap<u8, Vec<String>>,
+    /// 显式零声母键对映射（如 `ue → "e"`），优先于 zero_initials 三层查找。
+    zero_pairs: HashMap<[u8; 2], String>,
 }
 
 #[derive(Deserialize)]
@@ -26,6 +28,8 @@ struct RawLayout {
     finals: HashMap<String, Vec<String>>,
     #[serde(default)]
     zero_initials: HashMap<String, Vec<String>>,
+    #[serde(default)]
+    zero_pairs: HashMap<String, String>,
 }
 
 #[derive(Deserialize)]
@@ -69,6 +73,14 @@ impl Layout {
         for (k, v) in raw.zero_initials {
             zero_initials.insert(key_byte(&k)?, v);
         }
+        let mut zero_pairs = HashMap::new();
+        for (k, v) in raw.zero_pairs {
+            let kb = k.as_bytes();
+            if kb.len() != 2 {
+                anyhow::bail!("zero_pairs 键必须为两字符: {:?}", k);
+            }
+            zero_pairs.insert([kb[0], kb[1]], v);
+        }
         if finals.is_empty() {
             anyhow::bail!("双拼布局 {} 缺少 [finals]", raw.meta.id);
         }
@@ -78,6 +90,7 @@ impl Layout {
             initials,
             finals,
             zero_initials,
+            zero_pairs,
         })
     }
 
@@ -95,6 +108,12 @@ impl Layout {
     }
     pub fn is_final_key(&self, key: u8) -> bool {
         self.finals.contains_key(&key)
+    }
+    pub fn has_zero_pairs(&self) -> bool {
+        !self.zero_pairs.is_empty()
+    }
+    pub fn zero_pair(&self, key1: u8, key2: u8) -> Option<&str> {
+        self.zero_pairs.get(&[key1, key2]).map(|s| s.as_str())
     }
 
     /// 返回所有韵母键的集合（供 EngineManager 缓存，对齐 Go IsShuangpinFinalKey）。
@@ -239,40 +258,49 @@ impl ShuangpinConverter {
     fn convert_pair(&self, key1: u8, key2: u8) -> Vec<String> {
         let mut results: Vec<String> = Vec::new();
 
-        // 1. 零声母
-        let zero_syllables = self.layout.zero_of(key1);
-        if !zero_syllables.is_empty() {
-            // a) FinalMap 路径：仅接受同时在 zeroSyllables 中允许的合法音节。
-            for f in self.layout.finals_of(key2) {
-                if !self.is_valid(f) {
-                    continue;
-                }
-                if !zero_syllables.iter().any(|zs| zs == f) {
-                    continue;
-                }
-                if !results.iter().any(|r| r == f) {
-                    results.push(f.clone());
+        if self.layout.has_zero_pairs() {
+            // 显式零声母键对映射（优先路径，与旧 zero_initials 互斥）。
+            if let Some(syl) = self.layout.zero_pair(key1, key2) {
+                if self.is_valid(syl) && !results.iter().any(|r| r == syl) {
+                    results.push(syl.to_string());
                 }
             }
-
-            // b) 字面匹配：仅在 FinalMap 路径无命中时生效。
-            if results.is_empty() {
-                let literal = format!("{}{}", key1 as char, key2 as char);
-                for syllable in zero_syllables {
-                    if *syllable == literal && self.is_valid(syllable) {
-                        results.push(syllable.clone());
-                        break;
+        } else {
+            // 1. 零声母（旧路径：三子路径查找）
+            let zero_syllables = self.layout.zero_of(key1);
+            if !zero_syllables.is_empty() {
+                // a) FinalMap 路径：仅接受同时在 zeroSyllables 中允许的合法音节。
+                for f in self.layout.finals_of(key2) {
+                    if !self.is_valid(f) {
+                        continue;
+                    }
+                    if !zero_syllables.iter().any(|zs| zs == f) {
+                        continue;
+                    }
+                    if !results.iter().any(|r| r == f) {
+                        results.push(f.clone());
                     }
                 }
-            }
 
-            // c) matchesFinal 路径：兜底，处理方案特殊映射。
-            for syllable in zero_syllables {
-                if results.iter().any(|r| r == syllable) {
-                    continue;
+                // b) 字面匹配：仅在 FinalMap 路径无命中时生效。
+                if results.is_empty() {
+                    let literal = format!("{}{}", key1 as char, key2 as char);
+                    for syllable in zero_syllables {
+                        if *syllable == literal && self.is_valid(syllable) {
+                            results.push(syllable.clone());
+                            break;
+                        }
+                    }
                 }
-                if self.matches_final(syllable, key2) {
-                    results.push(syllable.clone());
+
+                // c) matchesFinal 路径：兜底，处理方案特殊映射。
+                for syllable in zero_syllables {
+                    if results.iter().any(|r| r == syllable) {
+                        continue;
+                    }
+                    if self.matches_final(syllable, key2) {
+                        results.push(syllable.clone());
+                    }
                 }
             }
         }
@@ -293,11 +321,13 @@ impl ShuangpinConverter {
             }
         }
 
-        // 3. 零声母特殊处理：单韵母重复键（aa→a, oo→o, ee→e）。
-        if key1 == key2 {
-            let single = (key1 as char).to_string();
-            if self.is_valid(&single) && !results.iter().any(|r| *r == single) {
-                results.push(single);
+        if !self.layout.has_zero_pairs() {
+            // 3. 零声母特殊处理：单韵母重复键（aa→a, oo→o, ee→e）。
+            if key1 == key2 {
+                let single = (key1 as char).to_string();
+                if self.is_valid(&single) && !results.iter().any(|r| *r == single) {
+                    results.push(single);
+                }
             }
         }
 
@@ -544,7 +574,7 @@ k = ["ao"]
     fn builtin_layouts_load() {
         let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("../../../data/schemas/shuangpin");
-        for id in ["xiaohe", "ziranma", "mspy", "sogou", "abc", "ziguang"] {
+        for id in ["xiaohe", "ziranma", "mspy", "sogou", "abc", "ziguang", "shoudao"] {
             let p = dir.join(format!("{id}.toml"));
             let lay = Layout::from_toml(&p).unwrap_or_else(|e| panic!("加载 {id} 失败: {e}"));
             assert_eq!(lay.id, id, "{id} 的 meta.id 不匹配");
@@ -622,6 +652,40 @@ k = ["ao"]
             zg.finals_of(b';'),
             &["ing".to_string()],
             "紫光 finals[;] 应为 ing"
+        );
+
+        // 首道双拼：e=sh，使用 zero_pairs 而非 zero_initials
+        let sd = Layout::from_toml(&dir.join("shoudao.toml")).unwrap();
+        assert_eq!(sd.initial_of(b'e'), Some("sh"), "首道 initials[e] 应为 sh");
+        assert!(sd.has_zero_pairs(), "首道双拼应使用 zero_pairs");
+        assert_eq!(sd.zero_pair(b'u', b'e'), Some("e"), "首道 ue → e");
+        assert_eq!(sd.zero_pair(b'u', b'i'), Some("ei"), "首道 ui → ei");
+        assert_eq!(sd.zero_pair(b'u', b'f'), Some("eng"), "首道 uf → eng");
+        assert_eq!(sd.zero_pair(b'a', b'a'), Some("a"), "首道 aa → a");
+        assert_eq!(sd.zero_pair(b'o', b'o'), Some("o"), "首道 oo → o");
+        assert!(
+            sd.zero_of(b'a').is_empty(),
+            "首道使用 zero_pairs 时 zero_initials 应为空"
+        );
+    }
+
+    #[test]
+    fn zero_pairs_invalid_key_length() {
+        let bad = r#"
+[meta]
+id = "bad"
+name = "bad"
+[finals]
+k = ["ao"]
+[zero_pairs]
+abc = "a"
+"#;
+        let result = Layout::from_str(bad);
+        assert!(result.is_err(), "zero_pairs 三字符键应被拒绝");
+        let err_msg = format!("{}", result.unwrap_err());
+        assert!(
+            err_msg.contains("两字符"),
+            "错误信息应提及两字符: {err_msg}"
         );
     }
 }
@@ -922,5 +986,136 @@ mod converter_tests {
         assert_eq!(r2.syllables.len(), 2);
         assert_eq!(r2.syllables[0].pinyin, "ning");
         assert_eq!(r2.syllables[1].pinyin, "ni");
+    }
+
+    // ===== 首道双拼（zero_pairs）=====
+
+    // 零声母：12 条显式映射全覆盖
+    #[test]
+    fn shoudao_zero_pairs_all() {
+        let c = conv("shoudao");
+        let cases = [
+            ("aa", "a"),
+            ("ai", "ai"),
+            ("an", "an"),
+            ("ay", "ang"),
+            ("ao", "ao"),
+            ("ue", "e"),
+            ("ui", "ei"),
+            ("en", "en"),
+            ("uf", "eng"),
+            ("er", "er"),
+            ("oo", "o"),
+            ("ou", "ou"),
+        ];
+        for (input, want) in cases {
+            assert_eq!(
+                c.convert(input).full_pinyin(),
+                want,
+                "首道 convert({input:?})"
+            );
+        }
+    }
+
+    // 常规声母+韵母不受 zero_pairs 影响
+    #[test]
+    fn shoudao_regular_initials() {
+        let c = conv("shoudao");
+        let cases = [
+            ("vs", "zhou"),  // v=zh, s=ou
+            ("ef", "sheng"), // e=sh, f=eng
+            ("id", "chao"),  // i=ch, d=ao
+            ("ni", "ni"),    // n=n, i=i
+            ("hd", "hao"),   // h=h, d=ao
+        ];
+        for (input, want) in cases {
+            assert_eq!(
+                c.convert(input).full_pinyin(),
+                want,
+                "首道 convert({input:?})"
+            );
+        }
+    }
+
+    // ef 只产出 sheng，不应有零声母 eng 污染
+    #[test]
+    fn shoudao_ef_no_eng_pollution() {
+        let c = conv("shoudao");
+        let results = c.convert_pair(b'e', b'f');
+        assert_eq!(results, vec!["sheng"], "ef 应仅产出 sheng: {results:?}");
+    }
+
+    // ee 走常规路径 sh+e=she，不产出零声母 e
+    #[test]
+    fn shoudao_ee_is_she() {
+        let c = conv("shoudao");
+        assert_eq!(c.convert("ee").full_pinyin(), "she", "首道 ee → she");
+    }
+
+    // 多音节混合
+    #[test]
+    fn shoudao_multi_syllable() {
+        let c = conv("shoudao");
+        // ni + ue(→e) → nie? no: ni=ni, ue=e → "nie"? Let me think...
+        // convert processes in pairs: (n,i)=ni, (u,e)=e → "nie"
+        let r = c.convert("niue");
+        assert_eq!(r.full_pinyin(), "nie", "首道 niue → ni+e");
+        assert_eq!(r.syllables.len(), 2);
+        assert_eq!(r.syllables[0].pinyin, "ni");
+        assert_eq!(r.syllables[1].pinyin, "e");
+
+        // hd + uf(→eng) → hao+eng
+        let r2 = c.convert("hduf");
+        assert_eq!(r2.full_pinyin(), "haoeng", "首道 hduf → hao+eng");
+        assert_eq!(r2.syllables.len(), 2);
+    }
+
+    // 奇数尾键 partial
+    #[test]
+    fn shoudao_partial() {
+        let c = conv("shoudao");
+        let r = c.convert("aal");
+        assert_eq!(r.syllables.len(), 1);
+        assert_eq!(r.syllables[0].pinyin, "a");
+        assert!(r.has_partial);
+        assert_eq!(r.partial_initial.as_deref(), Some("l"));
+    }
+
+    // consumed_length 回映射
+    #[test]
+    fn shoudao_consumed_length() {
+        let c = conv("shoudao");
+        // ue → "e"（全拼 1 字节 → 双拼 2 字节）
+        let r = c.convert("ue");
+        assert_eq!(r.map_consumed_length(1), 2);
+
+        // aa + ue → "a" + "e"（全拼各 1 字节）
+        let r2 = c.convert("aaue");
+        assert_eq!(r2.map_consumed_length(1), 2); // "a" 消耗双拼 2 字节
+        assert_eq!(r2.map_consumed_length(2), 4); // "ae" 消耗双拼 4 字节
+    }
+
+    // 旧方案 zero_initials 不受影响（回归）
+    #[test]
+    fn xiaohe_zero_initials_unchanged() {
+        let c = conv("xiaohe");
+        let layout = c.layout();
+        assert!(!layout.has_zero_pairs(), "小鹤不应有 zero_pairs");
+        let cases = [
+            ("aa", "a"),
+            ("oo", "o"),
+            ("ee", "e"),
+            ("ac", "ao"),
+            ("ah", "ang"),
+            ("ew", "ei"),
+            ("ef", "en"),
+        ];
+        for (input, want) in cases {
+            assert_eq!(
+                c.convert(input).full_pinyin(),
+                want,
+                "小鹤 convert({input:?}) 回归"
+            );
+        }
     }
 }
