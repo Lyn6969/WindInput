@@ -324,8 +324,10 @@ impl Coordinator {
         // 满码自动上屏「显示态」复评：引擎按未过滤候选判唯一（生僻同码字致不唯一被否决），
         // 但智能过滤后可能只剩唯一精确全码码表候选 → 据显示候选复评放行（逻辑与显示一致）。
         // 惰性：仅在引擎未给出上屏意向时复评。
-        let auto_commit = auto_commit
-            .or_else(|| self.engine_mgr.recheck_auto_commit(&state.input_buffer, &state.candidates));
+        let auto_commit = auto_commit.or_else(|| {
+            self.engine_mgr
+                .recheck_auto_commit(&state.input_buffer, &state.candidates)
+        });
         // 复核：仅当上屏目标在最终候选中仍存在（未被 shadow 删除）才放行自动上屏。
         let outcome = match auto_commit.filter(|t| state.candidates.iter().any(|c| &c.text == t)) {
             Some(_) => {
@@ -725,7 +727,8 @@ impl Coordinator {
                             .auto_phrase
                             .promote_count
                     };
-                    if let Ok(count) = store.learn_temp_word(&schema, &code, &cand.text, LEARN_ADD_WEIGHT)
+                    if let Ok(count) =
+                        store.learn_temp_word(&schema, &code, &cand.text, LEARN_ADD_WEIGHT)
                     {
                         self.maybe_promote_temp(
                             store,

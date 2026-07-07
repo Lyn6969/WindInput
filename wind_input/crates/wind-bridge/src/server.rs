@@ -1088,7 +1088,11 @@ mod tests {
             ctx,
         );
         assert!(resp.is_none(), "异步 select 不得回响应（防管道污染）");
-        assert_eq!(handler.last_select.load(Ordering::SeqCst), -1, "上页按钮应路由 -1");
+        assert_eq!(
+            handler.last_select.load(Ordering::SeqCst),
+            -1,
+            "上页按钮应路由 -1"
+        );
 
         let resp = dispatch_for_test(
             &dyn_handler,
@@ -1098,7 +1102,11 @@ mod tests {
             ctx,
         );
         assert!(resp.is_none());
-        assert_eq!(handler.last_select.load(Ordering::SeqCst), -2, "下页按钮应路由 -2");
+        assert_eq!(
+            handler.last_select.load(Ordering::SeqCst),
+            -2,
+            "下页按钮应路由 -2"
+        );
     }
 
     /// darwin 同步点选（非负下标）行为不变：路由 + 回 ACK。

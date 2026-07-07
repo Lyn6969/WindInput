@@ -949,7 +949,10 @@ impl UiManager {
                         }
                     }
                     UiCommand::SetToolbarAutoHide { enabled, delay_ms } => {
-                        debug!("UI: SetToolbarAutoHide enabled={} delay={}ms", enabled, delay_ms);
+                        debug!(
+                            "UI: SetToolbarAutoHide enabled={} delay={}ms",
+                            enabled, delay_ms
+                        );
                         if let Some(t) = &mut toolbar {
                             t.set_auto_hide(enabled, delay_ms);
                         }

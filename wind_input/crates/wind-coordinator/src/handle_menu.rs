@@ -335,7 +335,11 @@ impl Coordinator {
                 format!(
                     "关于 v{}{}",
                     env!("WIND_APP_VERSION"),
-                    if wind_config::variant::is_dev() { " (Dev)" } else { "" }
+                    if wind_config::variant::is_dev() {
+                        " (Dev)"
+                    } else {
+                        ""
+                    }
                 ),
                 cmd(MenuCmd::OpenAbout),
                 true,

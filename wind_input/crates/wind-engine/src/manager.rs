@@ -697,7 +697,13 @@ impl EngineManager {
             self.override_dir.as_deref(),
         )
         .map(|s| s.schema.icon_label)
-        .map(|label| label.chars().next().map(|c| c.to_string()).unwrap_or_default())
+        .map(|label| {
+            label
+                .chars()
+                .next()
+                .map(|c| c.to_string())
+                .unwrap_or_default()
+        })
         .unwrap_or_default()
     }
 

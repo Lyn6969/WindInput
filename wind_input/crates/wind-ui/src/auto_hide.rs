@@ -186,10 +186,7 @@ mod tests {
             other => panic!("expected Fade, got {other:?}"),
         }
         // 1 秒后 → 隐藏并清空
-        assert_eq!(
-            ah.tick_at(t0 + 6 * SEC, false, false),
-            AutoHideAction::Hide
-        );
+        assert_eq!(ah.tick_at(t0 + 6 * SEC, false, false), AutoHideAction::Hide);
         assert!(!ah.is_active());
     }
 

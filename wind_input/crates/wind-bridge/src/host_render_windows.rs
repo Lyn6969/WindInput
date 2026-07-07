@@ -853,5 +853,4 @@ mod tests {
         assert!(wildcard_match("SearchHost.exe", "searchhost.exe"));
         assert!(wildcard_match("NOTEPAD.EXE", "notepad.exe"));
     }
-
 }

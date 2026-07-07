@@ -22,7 +22,13 @@ impl Store {
     /// 学习临时词：新词 weight=min(add_weight,MAX)/count=1；已存在只 count++，权重不变
     /// （count 只用于晋升判定，不再驱动权重增长）。返回新的 count（调用方据此与
     /// promote_count 比较决定是否晋升）。
-    pub fn learn_temp_word(&self, schema: &str, code: &str, text: &str, add_weight: i32) -> anyhow::Result<u32> {
+    pub fn learn_temp_word(
+        &self,
+        schema: &str,
+        code: &str,
+        text: &str,
+        add_weight: i32,
+    ) -> anyhow::Result<u32> {
         let key = enc_key(schema, code, text);
         self.with_db(|db| {
             let txn = db.begin_write()?;

@@ -1139,7 +1139,10 @@ impl Coordinator {
         // TODO(app_rules): 未来在此查按应用规则表（input.default.app_rules：进程名 → 初始中/英，
         // 优先级高于下方全局记忆/默认；配置形态对齐 input.punct.custom_mappings 的 Map 先例）。
         if d.remember_last_state {
-            self.runtime_last.lock().unwrap_or_else(|e| e.into_inner()).0
+            self.runtime_last
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .0
         } else {
             d.chinese_mode
         }
@@ -2367,8 +2370,7 @@ impl Coordinator {
     pub fn push_english_pair_config(&self, client_token: u64) {
         let rt = self.rt();
         let enabled = rt.config.input.auto_pair.english;
-        let value =
-            wind_ipc::codec::encode_english_pairs_value(enabled, &rt.en_pairs);
+        let value = wind_ipc::codec::encode_english_pairs_value(enabled, &rt.en_pairs);
         let msg = wind_ipc::codec::encode_sync_config(
             wind_ipc::protocol::CONFIG_KEY_ENGLISH_PAIRS,
             &value,
@@ -3083,7 +3085,10 @@ impl MessageHandler for Coordinator {
             let caps_now = (data.toggles & 0x01) != 0;
             let mut s = self.state.lock().unwrap_or_else(|e| e.into_inner());
             if s.caps_lock != caps_now {
-                debug!("CapsLock mirror recalibrated from key toggles: {}", caps_now);
+                debug!(
+                    "CapsLock mirror recalibrated from key toggles: {}",
+                    caps_now
+                );
                 s.caps_lock = caps_now;
             }
         }
@@ -3542,7 +3547,8 @@ impl MessageHandler for Coordinator {
                     self.engine_mgr.handle_top_code(&state.input_buffer)
                 {
                     let buf = state.input_buffer.clone();
-                    let prefix: String = buf[..buf.len().saturating_sub(remainder.len())].to_string();
+                    let prefix: String =
+                        buf[..buf.len().saturating_sub(remainder.len())].to_string();
                     // 顶码文本决策：
                     // - 前缀==顶码前缓冲（满码+1，最常见）：只上屏显示码表首选；显示首选非码表 →
                     //   None → 放弃顶码（不上屏被过滤/隐藏的候选，继续组合让用户选拼音）。
@@ -3556,7 +3562,12 @@ impl MessageHandler for Coordinator {
                         // 顶码上屏是码表机制，归属码表来源。
                         self.record_selection(&prefix, &top_text, CandidateSource::CodeTable);
                         // 顶码即上屏首选（pos=0），code_len=被顶出的前缀码长。
-                        self.record_commit(&top_text, prefix.len() as u32, 0, CommitSource::Candidate);
+                        self.record_commit(
+                            &top_text,
+                            prefix.len() as u32,
+                            0,
+                            CommitSource::Candidate,
+                        );
                         state.input_buffer = remainder.clone();
                         let _ = self.update_candidates(&mut state); // 余码候选（不再消费其结局）
                         let preedit = state.preedit.clone();
@@ -4408,10 +4419,7 @@ mod initial_mode_tests {
     /// 注入焦点进程（headless 下 OpenProcess 取不到真实进程名，手动填缓存）。
     fn set_focus_proc(c: &Arc<Coordinator>, pid: u32, name: &str) {
         c.active_compat.lock().unwrap().0 = pid;
-        c.pid_names
-            .lock()
-            .unwrap()
-            .insert(pid, name.to_string());
+        c.pid_names.lock().unwrap().insert(pid, name.to_string());
     }
 
     fn token(pid: u32) -> u64 {
@@ -4470,7 +4478,10 @@ mod initial_mode_tests {
         });
         // 游戏进程：首见 → 默认中文；用户切英文 → 写表。
         set_focus_proc(&c, 100, "game.exe");
-        assert!(c.initial_chinese_mode_for("game.exe"), "首见进程应为配置默认");
+        assert!(
+            c.initial_chinese_mode_for("game.exe"),
+            "首见进程应为配置默认"
+        );
         c.state.lock().unwrap().chinese_mode = false;
         c.record_app_mode(false);
         // 切到聊天进程：首见 → 默认中文。

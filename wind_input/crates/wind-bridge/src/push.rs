@@ -425,10 +425,10 @@ mod tests {
     fn push_to_token_exact_match_no_fallback() {
         let srv = PushServer::new(PushConfig::default());
         let (tx, rx) = std::sync::mpsc::channel::<Vec<u8>>();
-        srv.clients_for_test()
-            .lock()
-            .unwrap()
-            .push(PushClient { token: 0xAA_0000_0001, tx });
+        srv.clients_for_test().lock().unwrap().push(PushClient {
+            token: 0xAA_0000_0001,
+            tx,
+        });
 
         // 命中：精确 token 投递
         assert!(srv.push_to_token(0xAA_0000_0001, &[1, 2, 3]));
