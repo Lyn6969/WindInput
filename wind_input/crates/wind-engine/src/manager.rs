@@ -656,7 +656,16 @@ impl EngineManager {
                 }
             }
         }
-        out.sort_by(|a, b| a.0.cmp(&b.0));
+        // 内置方案固定顺序（按流行度），其余按 id 字母序排到末尾。
+        const BUILTIN_ORDER: &[&str] = &["xiaohe", "ziranma", "sogou", "mspy", "abc", "ziguang"];
+        let rank = |id: &str| -> (usize, String) {
+            let pos = BUILTIN_ORDER
+                .iter()
+                .position(|&s| s == id)
+                .unwrap_or(usize::MAX);
+            (pos, id.to_string())
+        };
+        out.sort_by(|a, b| rank(&a.0).cmp(&rank(&b.0)));
         out
     }
 
@@ -2400,11 +2409,11 @@ mod tests {
         assert_eq!(
             got,
             vec![
+                ("xiaohe".to_string(), "小鹤(用户版)".to_string()),
                 ("mspy".to_string(), "微软双拼".to_string()),
                 ("shoudao".to_string(), "手道双拼".to_string()),
-                ("xiaohe".to_string(), "小鹤(用户版)".to_string()),
             ],
-            "布局枚举应合并、用户优先、跳过损坏、按 id 排序，实际={got:?}"
+            "布局枚举应合并、用户优先、跳过损坏、内置方案按流行度排序，实际={got:?}"
         );
 
         let _ = std::fs::remove_dir_all(&base);
