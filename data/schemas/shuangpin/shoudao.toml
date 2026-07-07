@@ -1,0 +1,50 @@
+[meta]
+id = "shoudao"
+name = "首道双拼"
+
+[initials]
+v = "zh"
+i = "ch"
+e = "sh"
+
+[finals]
+a = ["a"]
+o = ["uo", "o"]
+e = ["e"]
+i = ["i"]
+u = ["u"]
+v = ["ui", "v"]
+b = ["ve"]
+c = ["in"]
+d = ["ao"]
+f = ["eng"]
+g = ["uai", "ing"]
+h = ["ong", "iong"]
+j = ["an"]
+k = ["en", "ia"]
+l = ["ai", "ue"]
+m = ["ei"]
+n = ["ian"]
+p = ["iao"]
+q = ["iu"]
+r = ["ie", "er"]
+s = ["ou"]
+t = ["uan"]
+w = ["ua"]
+x = ["iang", "uang"]
+y = ["ang"]
+z = ["un"]
+
+[zero_pairs]
+aa = "a"
+ai = "ai"
+an = "an"
+ay = "ang"
+ao = "ao"
+ue = "e"
+ui = "ei"
+en = "en"
+uf = "eng"
+er = "er"
+oo = "o"
+ou = "ou"
