@@ -54,3 +54,13 @@ output_name = "WindInput-Setup"
 output_dir  = "../../wind-installer/dist"
 logo        = "../../wind-installer/assets/logo.png"
 icon        = "../../wind-installer/assets/installer.ico"
+
+# ── PE 资源版本信息（供 wind-packer 在打包期注入安装程序/卸载程序的详细信息）──
+[package.version_info]
+company_name      = "清风输入法项目"
+file_description  = "清风输入法安装程序"
+# file_version      = "0.0.0.0"       # 缺省时自动读取 app.version (会被 CLI --version 覆盖并格式化为4位)
+product_name      = "清风输入法"
+# product_version   = "0.0.0.0"       # 缺省时自动读取 app.version (会被 CLI --version 覆盖并格式化为4位)
+copyright         = "Copyright (C) 清风输入法"
+# original_filename = "WindInput-Setup.exe" # 缺省时自动生成
