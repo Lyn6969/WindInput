@@ -114,6 +114,10 @@ pub const CMD_HOLD_COMPOSITION: u16 = 0x010A;
 /// CommitAndHoldComposition 响应 (0x010B)：先提交 commit_text，再开 HoldComposition 放入 hold_text。
 /// 载荷：timeout_ms(u32 LE) + commit_len(u32 LE) + hold_len(u32 LE) + commit_utf8 + hold_utf8
 pub const CMD_COMMIT_AND_HOLD: u16 = 0x010B;
+/// CommitThenDeferComposition 响应 (0x010C)：先真提交 commit_text，
+/// 余码新组合 deferred_composition 延迟到触发键 keyup（或 timeout_ms 兜底）才开。
+/// 载荷：timeout_ms(u32 LE) + commit_len(u32 LE) + defer_len(u32 LE) + commit_utf8 + defer_utf8
+pub const CMD_COMMIT_THEN_DEFER: u16 = 0x010C;
 
 // 状态
 pub const CMD_STATUS_UPDATE: u16 = 0x0202;

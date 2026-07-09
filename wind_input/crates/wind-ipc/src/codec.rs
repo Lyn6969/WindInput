@@ -536,6 +536,26 @@ pub fn encode_commit_and_hold(timeout_ms: u32, commit_text: &str, hold_text: &st
     buf
 }
 
+/// 编码 CommitThenDeferComposition 响应 (CMD_COMMIT_THEN_DEFER 0x010C)
+///
+/// 格式：timeout_ms(4) + commit_len(4) + defer_len(4) + commit_utf8 + defer_utf8
+/// C++ 端先真提交 commit_text，余码 deferred_composition 延迟到触发键 keyup 才开新组合。
+pub fn encode_commit_then_defer(timeout_ms: u32, commit_text: &str, deferred_composition: &str) -> Vec<u8> {
+    let commit_bytes = commit_text.as_bytes();
+    let defer_bytes = deferred_composition.as_bytes();
+    let payload_len = 12 + commit_bytes.len() + defer_bytes.len();
+    let mut buf = Vec::with_capacity(IpcHeader::SIZE + payload_len);
+
+    let ipc = IpcHeader::new(CMD_COMMIT_THEN_DEFER, payload_len as u32);
+    buf.extend_from_slice(&ipc.to_bytes());
+    buf.extend_from_slice(&timeout_ms.to_le_bytes());
+    buf.extend_from_slice(&(commit_bytes.len() as u32).to_le_bytes());
+    buf.extend_from_slice(&(defer_bytes.len() as u32).to_le_bytes());
+    buf.extend_from_slice(commit_bytes);
+    buf.extend_from_slice(defer_bytes);
+    buf
+}
+
 /// 编码 HoldComposition 响应 (CMD_HOLD_COMPOSITION 0x010A)
 ///
 /// 格式：timeout_ms(4) + text_len(4) + UTF-8 text
@@ -652,6 +672,23 @@ mod tests {
         assert_eq!(u32::from_le_bytes([buf[12], buf[13], buf[14], buf[15]]), 3);
         // UTF-8 bytes of "，" = [0xEF, 0xBC, 0x8C] (at offset 16+)
         assert_eq!(&buf[16..], "，".as_bytes());
+    }
+
+    #[test]
+    fn test_encode_commit_then_defer_layout() {
+        let buf = encode_commit_then_defer(150, "可能", "y");
+        let commit = "可能".as_bytes(); // 6 字节
+        let defer = "y".as_bytes(); // 1 字节
+        // header + timeout(4) + commit_len(4) + defer_len(4) + commit + defer
+        assert_eq!(buf.len(), IpcHeader::SIZE + 12 + commit.len() + defer.len());
+        // 命令码在 header 内
+        let cmd = u16::from_le_bytes([buf[2], buf[3]]);
+        assert_eq!(cmd, CMD_COMMIT_THEN_DEFER);
+        // payload 起始处 timeout_ms
+        let p = IpcHeader::SIZE;
+        assert_eq!(u32::from_le_bytes([buf[p], buf[p+1], buf[p+2], buf[p+3]]), 150);
+        assert_eq!(u32::from_le_bytes([buf[p+4], buf[p+5], buf[p+6], buf[p+7]]), commit.len() as u32);
+        assert_eq!(u32::from_le_bytes([buf[p+8], buf[p+9], buf[p+10], buf[p+11]]), defer.len() as u32);
     }
 }
 
