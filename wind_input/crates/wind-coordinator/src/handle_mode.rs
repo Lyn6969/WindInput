@@ -10,7 +10,7 @@ use wind_bridge::handler::KeyAction;
 use wind_config::Config;
 use wind_ui::manager::UiCommand;
 
-use crate::coordinator::{printable_char, punct_char};
+use crate::coordinator::{numpad_char, printable_char, punct_char};
 use wind_bridge::handler::KeyEventData;
 use wind_candidate::Candidate;
 use wind_ipc::protocol::MOD_SHIFT;
@@ -706,7 +706,10 @@ impl Coordinator {
         if (keymap::VK_A..=keymap::VK_Z).contains(&key_code) {
             None // 字母在数字 lens 作选词，不输入
         } else {
-            printable_char(key_code, shift) // 数字 + 任意符号（含 = + - * / . 等）入缓冲
+            // 数字 + 任意符号（含 = + - * / . 等）入缓冲；小键盘键回退 numpad_char，
+            // 使小键盘数字/运算符与主键盘区在数字透镜里表达式输入一致（问题：快捷输入下
+            // 小键盘不生效）。
+            printable_char(key_code, shift).or_else(|| numpad_char(key_code))
         }
     }
 
@@ -833,8 +836,12 @@ impl Coordinator {
                 // 首字符确定 lens：非字母可打印字符（数字/符号）→ 数字 lens。
                 if state.mix_buffer.is_empty() {
                     let is_letter = (keymap::VK_A..=keymap::VK_Z).contains(&data.key_code);
-                    state.mix_numeric =
-                        calc && !is_letter && printable_char(data.key_code, shift).is_some();
+                    // 首字符判定数字透镜：主键盘可打印字符或小键盘键（0x60-0x6F）均可触发，
+                    // 使小键盘数字/运算符也能进入快捷输入表达式。
+                    state.mix_numeric = calc
+                        && !is_letter
+                        && (printable_char(data.key_code, shift).is_some()
+                            || numpad_char(data.key_code).is_some());
                 }
                 let numeric = calc && state.mix_numeric;
 
@@ -895,5 +902,26 @@ impl Coordinator {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod mix_numpad_tests {
+    use crate::coordinator::Coordinator;
+
+    #[test]
+    fn numpad_keys_feed_numeric_lens() {
+        // 小键盘数字 / 运算符 → 表达式字符（此前只认主键盘区，快捷输入下小键盘被吞）。
+        assert_eq!(Coordinator::mix_numeric_input_char(0x60, false), Some('0')); // Numpad0
+        assert_eq!(Coordinator::mix_numeric_input_char(0x69, false), Some('9')); // Numpad9
+        assert_eq!(Coordinator::mix_numeric_input_char(0x6B, false), Some('+')); // Numpad +
+        assert_eq!(Coordinator::mix_numeric_input_char(0x6D, false), Some('-')); // Numpad -
+        assert_eq!(Coordinator::mix_numeric_input_char(0x6A, false), Some('*')); // Numpad *
+        assert_eq!(Coordinator::mix_numeric_input_char(0x6F, false), Some('/')); // Numpad /
+        assert_eq!(Coordinator::mix_numeric_input_char(0x6E, false), Some('.')); // Numpad .
+        // 主键盘区数字仍正常（回归保护）。
+        assert_eq!(Coordinator::mix_numeric_input_char(0x31, false), Some('1')); // VK_1
+        // 字母在数字透镜里作选词，不作输入。
+        assert_eq!(Coordinator::mix_numeric_input_char(0x41, false), None); // 'A'
     }
 }
