@@ -251,6 +251,13 @@ public:
     // 下被整锁 diff 误读成替换（与顶码聚合 7f616c2 同思路）。最终 CommitText 一次收口。
     void AbsorbHeldIntoPrefix();
 
+    // direct_commit 顶码：真提交后，余码新组合延迟到触发键 keyup（或兜底定时器）才开。
+    // 与 HoldComposition 计时器状态并列、互不干扰。见 top-commit-mode 设计文档 §5。
+    void StashDeferredComposition(const std::wstring& composition, UINT fallbackMs);
+    void StartDeferredCompositionIfPending();   // keyup / 兜底定时器 / flush 统一入口
+    void CancelDeferredComposition();
+    BOOL HasDeferredComposition() const { return !_deferredCompText.empty(); }
+
 private:
     LONG _refCount;
     ITfThreadMgr* _pThreadMgr;
@@ -392,6 +399,12 @@ private:
     // 确保与后续透传字符的先后顺序正确。
     void           OnHoldTimerExpired(BOOL fromTimerCallback = FALSE);
     static VOID CALLBACK HoldTimerProc(HWND hwnd, UINT uMsg, UINT_PTR idEvent, DWORD dwTime);
+
+    // direct_commit 顶码：真提交后，余码新组合延迟到触发键 keyup（或兜底定时器）才开。
+    // 与 HoldComposition 计时器状态并列、互不干扰。见 top-commit-mode 设计文档 §5。
+    std::wstring   _deferredCompText;        // 待重开的余码组合；空=无待重开
+    UINT_PTR       _hDeferredTimer = 0;      // keyup 兜底定时器 id；0=无
+    static VOID CALLBACK DeferredTimerProc(HWND, UINT, UINT_PTR idEvent, DWORD);
 
     BOOL _InitConversionCompartment();
     void _UninitConversionCompartment();

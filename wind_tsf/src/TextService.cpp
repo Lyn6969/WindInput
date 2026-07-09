@@ -5040,3 +5040,59 @@ void CTextService::OnHoldTimerExpired(BOOL fromTimerCallback)
     // Flush 路径（PassThrough/失焦）在按键同步上下文，保持同步以确保收口先于后续字符。
     CommitText(textToCommit, fromTimerCallback);
 }
+
+// ─── DeferredComposition（direct_commit 顶码，延迟到 keyup 才开新组合）───────────
+
+// 延迟组合（direct_commit 顶码）定时器的 thread_local 实例指针。
+static thread_local CTextService* g_deferredTimerInstance = nullptr;
+
+void CTextService::StashDeferredComposition(const std::wstring& composition, UINT fallbackMs)
+{
+    // 异常保护：若已有待重开的余码，先把旧的落定，避免丢失。
+    StartDeferredCompositionIfPending();
+
+    _deferredCompText = composition;
+    g_deferredTimerInstance = this;
+    _hDeferredTimer = SetTimer(NULL, 0, fallbackMs, DeferredTimerProc);
+    WIND_LOG_DEBUG_FMT(L"StashDeferredComposition: text=%s fallbackMs=%u timer=%llu\n",
+                       composition.c_str(), fallbackMs,
+                       static_cast<unsigned long long>(_hDeferredTimer));
+}
+
+void CTextService::StartDeferredCompositionIfPending()
+{
+    if (_deferredCompText.empty())
+    {
+        // 仅残留定时器（理论不达）也一并清掉。
+        if (_hDeferredTimer != 0) { KillTimer(NULL, _hDeferredTimer); _hDeferredTimer = 0; }
+        g_deferredTimerInstance = nullptr;
+        return;
+    }
+    std::wstring text = std::move(_deferredCompText);
+    _deferredCompText.clear();
+    if (_hDeferredTimer != 0) { KillTimer(NULL, _hDeferredTimer); _hDeferredTimer = 0; }
+    g_deferredTimerInstance = nullptr;
+
+    WIND_LOG_DEBUG_FMT(L"StartDeferredComposition: opening new composition text=%s\n", text.c_str());
+    // 此刻 CommitText 已结束旧组合、_pComposition 为空 → UpdateComposition 新建组合并显示余码
+    //（有下划线的正常编码态）。对齐真实输入法 compositionstart@keyup。
+    UpdateComposition(text, static_cast<int>(text.length()));
+}
+
+void CTextService::CancelDeferredComposition()
+{
+    if (_hDeferredTimer != 0) { KillTimer(NULL, _hDeferredTimer); _hDeferredTimer = 0; }
+    _deferredCompText.clear();
+    g_deferredTimerInstance = nullptr;
+}
+
+// static
+VOID CALLBACK CTextService::DeferredTimerProc(HWND, UINT, UINT_PTR idEvent, DWORD)
+{
+    if (g_deferredTimerInstance != nullptr
+        && idEvent == g_deferredTimerInstance->_hDeferredTimer)
+    {
+        WIND_LOG_DEBUG(L"DeferredTimerProc: keyup 未达，兜底开余码组合\n");
+        g_deferredTimerInstance->StartDeferredCompositionIfPending();
+    }
+}
