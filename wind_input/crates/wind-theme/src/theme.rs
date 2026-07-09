@@ -163,6 +163,31 @@ mod tests {
     }
 
     #[test]
+    fn load_typed_dirs_rejects_missing_base() {
+        // 派生主题引用不存在的 base：load_merged_dirs_at 的 find_theme_dir 应报错，
+        // 供导入链路（web_theme_import_text）据此判定依赖校验失败并回滚。
+        let dir = std::env::temp_dir().join(format!(
+            "wind_theme_missing_base_{}",
+            std::process::id()
+        ));
+        let theme_dir = dir.join("derived");
+        std::fs::create_dir_all(&theme_dir).unwrap();
+        std::fs::write(
+            theme_dir.join(THEME_FILE),
+            "base = \"no-such-base\"\n[meta]\nname = \"derived\"\n",
+        )
+        .unwrap();
+
+        let err = load_typed_dirs(&[dir.clone()], "derived").unwrap_err();
+        assert!(
+            err.to_string().contains("no-such-base"),
+            "错误信息应指出缺失的 base 主题名: {err}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn merge_deep_overrides() {
         let base: Value = toml::from_str("[window]\npadding = 8\nradius = 4\n").unwrap();
         let over: Value = toml::from_str("[window]\nradius = 6\n").unwrap();

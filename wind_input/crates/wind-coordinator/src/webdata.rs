@@ -1187,7 +1187,7 @@ impl Coordinator {
             .get("force")
             .and_then(|v| v.as_bool())
             .unwrap_or(false);
-        // 校验可解析为合法主题。
+        // 校验可解析为合法主题（仅自身，未校验 base 依赖链）。
         wind_theme::validate_text(text)?;
         let meta = wind_theme::meta_from_text(text)
             .ok_or_else(|| anyhow::anyhow!("主题缺少 meta.name"))?;
@@ -1198,14 +1198,37 @@ impl Coordinator {
             .user_themes_dir()
             .ok_or_else(|| anyhow::anyhow!("无用户主题目录"))?;
         let target = user_dir.join(&meta.name);
-        if target.join("theme.toml").exists() && !force {
+        let file = target.join("theme.toml");
+        let existed_before = file.exists();
+        if existed_before && !force {
             anyhow::bail!("主题已存在（force=false）: {}", meta.name);
         }
+        // 覆盖已存在主题前备份原文本，供依赖链校验失败时回滚。
+        let backup = if existed_before {
+            std::fs::read(&file).ok()
+        } else {
+            None
+        };
         std::fs::create_dir_all(&target)?;
-        let file = target.join("theme.toml");
         let tmp = file.with_extension("toml.tmp");
         std::fs::write(&tmp, text.as_bytes())?;
         std::fs::rename(&tmp, &file)?;
+
+        // 依赖链校验：写入后按真实主题目录做完整 base 链合并求值，
+        // 捕获「base 引用的基础主题不存在」「继承成环」「合并后结构非法」等 validate_text 单文件校验
+        // 无法发现的问题。校验失败则回滚（新写入的删除目录；覆盖的恢复原文本）。
+        let dirs = self.theme_dirs();
+        if let Err(e) = wind_theme::theme::load_typed_dirs(&dirs, &meta.name) {
+            match backup {
+                Some(bytes) => {
+                    let _ = std::fs::write(&file, bytes);
+                }
+                None => {
+                    let _ = std::fs::remove_dir_all(&target);
+                }
+            }
+            anyhow::bail!("主题依赖校验失败：{}（请检查 base 引用的基础主题是否存在）", e);
+        }
         Ok(json!({ "ok": true }))
     }
 
