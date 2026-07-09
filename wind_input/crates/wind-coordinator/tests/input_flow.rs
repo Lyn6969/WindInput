@@ -2264,3 +2264,57 @@ fn test_shuangpin_userword_appears_in_candidates() {
 
     let _ = std::fs::remove_file(&store_path);
 }
+
+// 顶码触发序列：wubi86 下 skce 满码，第 5 键 y 溢出 → 顶码上屏，余码 y。
+fn drive_top_code(coord: &Coordinator) -> KeyAction {
+    for ch in ['s', 'k', 'c', 'e'] {
+        press_letter(coord, ch);
+    }
+    // 'y' = VK 0x59
+    coord.handle_key_event(&key_event(0x59, EVENT_KEY_DOWN))
+}
+
+#[test]
+fn top_code_pre_confirm_returns_insert_text() {
+    if !has_schemas() {
+        return;
+    }
+    let mut cfg = config_with("wubi86");
+    cfg.schema.codetable.punct_commit = true;
+    cfg.schema.codetable.top_code_commit = true;
+    cfg.input.top_commit_mode = wind_config::TopCommitMode::PreConfirm;
+    let coord = Coordinator::new_headless(cfg, Some(&data_dir()));
+    match drive_top_code(&coord) {
+        KeyAction::InsertText {
+            has_new_composition,
+            ..
+        } => {
+            assert!(has_new_composition, "顶码应带余码新组合");
+        }
+        other => panic!("pre_confirm 顶码应返回 InsertText，实际: {:?}", other),
+    }
+}
+
+#[test]
+fn top_code_direct_commit_returns_commit_then_defer() {
+    if !has_schemas() {
+        return;
+    }
+    let mut cfg = config_with("wubi86");
+    cfg.schema.codetable.punct_commit = true;
+    cfg.schema.codetable.top_code_commit = true;
+    cfg.input.top_commit_mode = wind_config::TopCommitMode::DirectCommit;
+    let coord = Coordinator::new_headless(cfg, Some(&data_dir()));
+    match drive_top_code(&coord) {
+        KeyAction::CommitThenDeferComposition {
+            commit_text,
+            deferred_composition,
+            timeout_ms,
+        } => {
+            assert!(!commit_text.is_empty(), "应有顶出文本");
+            assert!(!deferred_composition.is_empty(), "应有余码新组合");
+            assert_eq!(timeout_ms, 150);
+        }
+        other => panic!("direct_commit 顶码应返回 CommitThenDeferComposition，实际: {:?}", other),
+    }
+}

@@ -105,6 +105,14 @@ pub enum KeyAction {
         hold_text: String,
         timeout_ms: u32,
     },
+    /// 顶码 direct_commit：先真提交 commit_text（顶出文本），余码新组合 deferred_composition
+    /// 延迟到 C++ 端触发键 keyup（或 timeout_ms 兜底定时器）才开——照抄真实输入法
+    /// commit@keydown/restart@keyup 时序，靠隔一拍消息泵躲开 diff 式宿主整锁合并。
+    CommitThenDeferComposition {
+        commit_text: String,
+        deferred_composition: String,
+        timeout_ms: u32,
+    },
 }
 
 impl KeyAction {

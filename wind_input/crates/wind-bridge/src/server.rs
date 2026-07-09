@@ -973,6 +973,11 @@ fn encode_key_action(action: &KeyAction) -> Vec<u8> {
             hold_text,
             timeout_ms,
         } => encode_commit_and_hold(*timeout_ms, commit_text, hold_text),
+        KeyAction::CommitThenDeferComposition {
+            commit_text,
+            deferred_composition,
+            timeout_ms,
+        } => encode_commit_then_defer(*timeout_ms, commit_text, deferred_composition),
     }
 }
 

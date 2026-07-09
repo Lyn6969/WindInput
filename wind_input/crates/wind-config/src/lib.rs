@@ -12,7 +12,7 @@ pub mod variant;
 
 pub use config::{
     CodetableGlobal, Config, MixGlobal, ModeIndicatorStyle, PinyinFuzzy, PinyinGlobalConfig,
-    PreeditDisplay,
+    PreeditDisplay, TopCommitMode,
 };
 pub use runtime_state::RuntimeState;
 pub use schema::Schema;

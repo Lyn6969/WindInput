@@ -44,6 +44,9 @@ use wind_ui::toast::{ToastKind, ToastPosition};
 /// 保证上方候选窗底边抬到正文之上而不遮挡。偏大只是多留空隙，故取一个稳妥的正文行高量级。
 const CARET_USE_TOP_MIN_LINE_H: i32 = 18;
 
+/// direct_commit 顶码余码新组合的 keyup 兜底定时器时长（ms）。见 top-commit-mode 设计文档 §5。
+const DEFERRED_COMPOSITION_FALLBACK_MS: u32 = 150;
+
 /// wind 修饰位（SHIFT=0x1/CTRL=0x2/ALT=0x4/WIN=0x8，见 wind-ipc MOD_*）→ Win32 位序
 /// （ALT=0x1/CTRL=0x2/SHIFT=0x4/WIN=0x8，即 ALT 与 SHIFT 互换）。
 /// RegisterHotKey 的 fsModifiers 与 DirectSwitchHotkeys 的 Modifiers 低位（TF_MOD_*）同用此位序。
@@ -3577,6 +3580,18 @@ impl MessageHandler for Coordinator {
                         self.reset_first_show();
                         self.notify_ui_update(&state);
                         let has_comp = !remainder.is_empty();
+                        // direct_commit：真提交顶出文本，余码新组合延迟到触发键 keyup 才开。
+                        // 仅在有余码时分叉（无余码退化为普通提交，与 pre_confirm 一致）。
+                        if has_comp
+                            && self.rt().config.input.top_commit_mode
+                                == wind_config::TopCommitMode::DirectCommit
+                        {
+                            return KeyAction::CommitThenDeferComposition {
+                                commit_text: top_text,
+                                deferred_composition: preedit,
+                                timeout_ms: DEFERRED_COMPOSITION_FALLBACK_MS,
+                            };
+                        }
                         return KeyAction::InsertText {
                             text: top_text,
                             new_composition: has_comp.then_some(preedit),
