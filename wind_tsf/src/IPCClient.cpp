@@ -1519,6 +1519,38 @@ BOOL CIPCClient::_ParseResponse(const IpcHeader& header, const std::vector<uint8
         }
         break;
 
+    case CMD_COMMIT_THEN_DEFER:
+        {
+            response.type = ResponseType::CommitThenDefer;
+            if (payload.size() < sizeof(CommitThenDeferPayload))
+            {
+                _LogError(L"CommitThenDefer payload too short");
+                return FALSE;
+            }
+            const CommitThenDeferPayload* p =
+                reinterpret_cast<const CommitThenDeferPayload*>(payload.data());
+            response.holdTimeoutMs = p->timeoutMs;
+            size_t commitOffset = sizeof(CommitThenDeferPayload);
+            if (p->commitLength > 0 && p->commitLength <= payload.size() - commitOffset)
+            {
+                response.text = _Utf8ToWide(
+                    reinterpret_cast<const char*>(payload.data() + commitOffset),
+                    p->commitLength);
+            }
+            size_t deferOffset = commitOffset + p->commitLength;
+            if (p->deferLength > 0 && deferOffset <= payload.size()
+                && p->deferLength <= payload.size() - deferOffset)
+            {
+                response.newComposition = _Utf8ToWide(
+                    reinterpret_cast<const char*>(payload.data() + deferOffset),
+                    p->deferLength);
+            }
+            _LogDebug(L"Response: CommitThenDefer timeoutMs=%u commitLen=%zu deferLen=%zu",
+                      response.holdTimeoutMs, response.text.length(),
+                      response.newComposition.length());
+        }
+        break;
+
     case CMD_HOST_RENDER_SETUP:
         {
             response.type = ResponseType::HostRenderSetup;

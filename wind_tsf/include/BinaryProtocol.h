@@ -79,6 +79,7 @@ constexpr uint16_t CMD_DELETE_PAIR             = 0x0108; // Delete pair (smart b
 constexpr uint16_t CMD_REPLACE_BACKWARD        = 0x0109; // Replace preceding char(s): delete N before caret + insert text
 constexpr uint16_t CMD_HOLD_COMPOSITION         = 0x010A; // Hold composition: open composition + auto-commit after timeout_ms
 constexpr uint16_t CMD_COMMIT_AND_HOLD          = 0x010B; // Commit text then hold composition (punct_commit + smart symbol)
+constexpr uint16_t CMD_COMMIT_THEN_DEFER         = 0x010C; // 真提交 commit 后，余码 defer 组合延迟到 keyup 才开
 constexpr uint16_t CMD_HOST_RENDER_SETUP  = 0x0501; // Host render setup (shared memory + event names)
 constexpr uint16_t CMD_BATCH_RESPONSE     = 0x0F02; // Batch response container
 
@@ -251,6 +252,16 @@ struct CommitAndHoldPayload
     // Followed by commitLength bytes of UTF-8 commit_text, then holdLength bytes of UTF-8 hold_text
 };
 static_assert(sizeof(CommitAndHoldPayload) == 12, "CommitAndHoldPayload must be 12 bytes");
+
+// CommitThenDefer payload (真提交 commit 后，余码 defer 组合延迟到 keyup 才开)
+struct CommitThenDeferPayload
+{
+    uint32_t timeoutMs;    // Deferred composition auto-commit timeout (milliseconds)
+    uint32_t commitLength; // Length of commit text (UTF-8)
+    uint32_t deferLength;  // Length of deferred composition text (UTF-8)
+    // Followed by commitLength bytes of UTF-8 commit_text, then deferLength bytes of UTF-8 defer_text
+};
+static_assert(sizeof(CommitThenDeferPayload) == 12, "CommitThenDeferPayload must be 12 bytes");
 
 // Commit text flags
 constexpr uint32_t COMMIT_FLAG_MODE_CHANGED       = 0x0001;
@@ -486,6 +497,7 @@ enum class ResponseType
     ReplaceBackward,      // Delete N chars before caret + insert text (smart symbol)
     HoldComposition,      // Open composition with text + start auto-commit timer (smart symbol)
     CommitAndHold,        // Commit text then open composition with hold text + start timer
+    CommitThenDefer,      // Commit text now, defer new composition (余码) to trigger-key keyup
     HostRenderSetup, // Host render setup (shared memory info)
     Error
 };
