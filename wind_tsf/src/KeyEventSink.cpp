@@ -987,6 +987,12 @@ STDAPI CKeyEventSink::OnKeyDown(ITfContext* pContext, WPARAM wParam, LPARAM lPar
         return S_OK;
     }
 
+    // 有待重开的余码组合而用户已按下新键（快打）：先把余码组合开出来，避免与后续输入错序。
+    if (_pTextService->HasDeferredComposition())
+    {
+        _pTextService->StartDeferredCompositionIfPending();
+    }
+
     // Update caret position before sending key event
     // This ensures the candidate window appears at the correct position
     _pTextService->SendCaretPositionUpdate();
@@ -1081,6 +1087,16 @@ STDAPI CKeyEventSink::OnTestKeyUp(ITfContext* pContext, WPARAM wParam, LPARAM lP
     if (_pTextService->IsKeyboardDisabled())
         return S_OK;
 
+    // direct_commit 顶码：余码新组合在触发键 keyup 才开（下一个 keyup 即触发键 keyup）。
+    // 先到者开组合，另一处 HasDeferredComposition()==FALSE 后自然 no-op。
+    if (_pTextService->HasDeferredComposition())
+    {
+        _pTextService->StartDeferredCompositionIfPending();
+        _isComposing = TRUE;
+        _hasCandidates = TRUE;
+        _pTextService->NotifyCandidatesVisibilityChanged(TRUE);
+    }
+
     // Intercept modifier release if we have a pending auto-pair action
     if (_pendingPairAction.active)
     {
@@ -1116,6 +1132,16 @@ STDAPI CKeyEventSink::OnTestKeyUp(ITfContext* pContext, WPARAM wParam, LPARAM lP
 STDAPI CKeyEventSink::OnKeyUp(ITfContext* pContext, WPARAM wParam, LPARAM lParam, BOOL* pfEaten)
 {
     *pfEaten = FALSE;
+
+    // direct_commit 顶码：余码新组合在触发键 keyup 才开（下一个 keyup 即触发键 keyup）。
+    // 先到者开组合，另一处 HasDeferredComposition()==FALSE 后自然 no-op。
+    if (_pTextService->HasDeferredComposition())
+    {
+        _pTextService->StartDeferredCompositionIfPending();
+        _isComposing = TRUE;
+        _hasCandidates = TRUE;
+        _pTextService->NotifyCandidatesVisibilityChanged(TRUE);
+    }
 
     // Update modifier state machine for this KeyUp event
     _UpdateModsOnKeyUp(wParam);
@@ -1642,6 +1668,8 @@ BOOL CKeyEventSink::_HandleServiceResponse()
         // PassThrough means key was NOT handled, pass to system
         WIND_LOG_DEBUG(L"PassThrough: key not handled, passing to system\n");
         _pTextService->FlushHoldCompositionIfActive();
+        if (_pTextService->HasDeferredComposition())
+            _pTextService->StartDeferredCompositionIfPending();
         return FALSE;
 
     case ResponseType::CommitText:
@@ -1812,6 +1840,22 @@ BOOL CKeyEventSink::_HandleServiceResponse()
             _pTextService->NotifyCandidatesVisibilityChanged(FALSE);
             _pTextService->HoldComposition(response.newComposition, response.holdTimeoutMs);
             _isComposing = TRUE;
+        }
+        return TRUE;
+
+    case ResponseType::CommitThenDefer:
+        {
+            // direct_commit 顶码：立即真提交顶出文本（keydown 内，对齐 compositionend@keydown），
+            // 余码新组合暂存、延迟到本键 keyup（或兜底定时器）才开——隔一拍消息泵躲开
+            // diff 式宿主整锁合并。见 top-commit-mode 设计文档。
+            WIND_LOG_DEBUG_FMT(L"Processing CommitThenDefer: commit=%ls defer=%ls timeoutMs=%u\n",
+                               response.text.c_str(), response.newComposition.c_str(),
+                               response.holdTimeoutMs);
+            _pTextService->CommitText(response.text);
+            _isComposing = FALSE;
+            _hasCandidates = FALSE;
+            _pTextService->NotifyCandidatesVisibilityChanged(FALSE);
+            _pTextService->StashDeferredComposition(response.newComposition, response.holdTimeoutMs);
         }
         return TRUE;
 

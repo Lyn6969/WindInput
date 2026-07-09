@@ -4165,6 +4165,8 @@ STDAPI CTextService::OnCompositionTerminated(TfEditCookie ecWrite, ITfCompositio
     // 先记住 hold 是否活跃：活跃说明组合内容是智能符号（预上屏语义），下方须保留而非清空。
     BOOL holdWasActive = (_hHoldTimer != 0);
     CancelHoldTimer();
+    // 宿主已强杀组合：待重开的余码暂存作废，避免野定时器回调开一个无主组合。
+    CancelDeferredComposition();
 
     WIND_LOG_DEBUG(L"OnCompositionTerminated called\n");
 
@@ -4738,6 +4740,10 @@ fallback:
 // so that HasActiveComposition() returns FALSE and new compositions can start.
 void CTextService::EndComposition(ITfDocumentMgr* pDocMgrHint)
 {
+    // direct_commit 顶码：失焦/强制收口前，先把待重开的余码组合落定，语义与下方
+    // HoldComposition flush 一致——收口时不能让余码组合悬空未开。
+    StartDeferredCompositionIfPending();
+
     // 智能符号 hold 中（符号预上屏观感，语义=待提交）：主动结束组合（失焦/Deactivate
     // 等）时转为提交而非放弃，模拟标准输入流程——切换窗口时符号应直接上屏而不是清空。
     // CommitText 内 full = prefix + held，聚合定格的旧符号一并收口。
