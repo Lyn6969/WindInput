@@ -6,7 +6,8 @@
 use crate::coordinator::{
     Coordinator, ENGINE_MAX_CANDIDATES, EnCase, State, adapt_en_case, detect_en_case, punct_char,
 };
-use crate::pipeline::ModeKind;
+use crate::pipeline::{ModeKind, Rewind};
+use tracing::debug;
 use wind_bridge::handler::{KeyAction, KeyEventData};
 use wind_candidate::Candidate;
 use wind_ipc::protocol::{MOD_ALT, MOD_CTRL, MOD_SHIFT};
@@ -14,7 +15,9 @@ use wind_keys::keymap;
 use wind_transform::fullwidth::to_full_width;
 
 impl Coordinator {
-    /// 触发键名 → VK（统一映射，见 `keymap`；不含 z，z 混合模式后置实现）
+    /// 触发键名 → VK（**符号**触发键统一映射，见 `keymap`）。字母触发键（z）刻意不经此——
+    /// 走独立的 [`Self::matched_letter_temp_trigger`] + 三重身份裁决（对齐 Go `matchTempPinyinTrigger`
+    /// 排除 z + `judgeZFirstTrigger`），避免 z 在符号语义路径（如缓冲非空顶屏进临拼）被误触发。
     pub(crate) fn temp_pinyin_trigger_vk(key: &str) -> Option<u32> {
         keymap::key_name_to_vk(key)
     }
@@ -24,7 +27,7 @@ impl Coordinator {
         keymap::vk_to_prefix_char(key_code).unwrap_or('`')
     }
 
-    /// 当前按键是否匹配配置的临时拼音触发键
+    /// 当前按键是否匹配配置的**符号**临时拼音触发键（字母触发键见 `matched_letter_temp_trigger`）
     pub(crate) fn is_temp_pinyin_trigger(&self, key_code: u32) -> bool {
         self.rt()
             .config
@@ -34,6 +37,100 @@ impl Coordinator {
             .iter()
             .filter_map(|k| Self::temp_pinyin_trigger_vk(k))
             .any(|vk| vk == key_code)
+    }
+
+    /// 临时拼音「字母触发键」（如 z）匹配：当前键是字母、且该字母在 `trigger_keys` 中配置时返回
+    /// 该字母（小写）。与符号触发键分开——符号键无条件触发，字母键需经三重身份裁决
+    /// （repeat / 正常码字母 / 临时拼音），对齐 Go `judgeZFirstTrigger`。
+    pub(crate) fn matched_letter_temp_trigger(&self, key_code: u32) -> Option<char> {
+        if !(keymap::VK_A..=keymap::VK_Z).contains(&key_code) {
+            return None;
+        }
+        let ch = (b'a' + (key_code - keymap::VK_A) as u8) as char;
+        let hit = self
+            .rt()
+            .config
+            .input
+            .temp_pinyin
+            .trigger_keys
+            .iter()
+            .any(|k| {
+                let k = k.trim().to_lowercase();
+                k.len() == 1 && k.as_bytes()[0] == ch as u8
+            });
+        hit.then_some(ch)
+    }
+
+    /// z 三重身份裁决的「活码前缀」判据（对齐 Go `HasPrefix`）：码表引擎候选（含 BFS 前缀扫描）
+    /// 或短语层存在以 `code` 开头的条目 → true。用于区分 z 作正常码字母（有前缀，如自定义 `zhang`）
+    /// vs 临时拼音触发（死前缀，如标准五笔 86 的 z）。
+    pub(crate) fn has_code_prefix(&self, code: &str) -> bool {
+        if code.is_empty() {
+            return false;
+        }
+        // 码表 / 用户词（convert 内含前缀扫描）。
+        if !self.engine_mgr.convert(code, 1).candidates.is_empty() {
+            return true;
+        }
+        // 短语层：精确或前缀命中。
+        let phrases = self.phrases.read().unwrap_or_else(|e| e.into_inner());
+        if phrases.is_empty() {
+            return false;
+        }
+        let recent = self.recent_commits_snapshot();
+        let clip = |_n: i64| String::new();
+        !phrases.lookup(code, &recent, &clip).is_empty()
+            || !phrases.lookup_prefix(code, &recent, 1).is_empty()
+    }
+
+    /// z-fallback 夺取（对齐 Go `decideEngineDefaultZFallback` + `enterTempPinyinFromZBuffer`）：
+    /// **码表引擎** + 缓冲以 z 开头 + z 配为字母触发键，且缓冲加新键 `ch` 后 `z…` 不再是活码前缀，
+    /// 则判定首 z 实为拼音触发键——抛弃首 z，`buffer[1:]+ch` 作临时拼音编码切入，并武装退格 rewind
+    /// （首次退格还原到正常码表输入流 `buffer+ch`）。返回 `Some` 表示已夺取，`None` 表示不夺取。
+    /// 混输引擎排除（避免 `zhang` 丢首字母，对齐 Go 门禁）。
+    pub(crate) fn try_z_fallback(&self, state: &mut State, ch: char) -> Option<KeyAction> {
+        if !matches!(
+            self.engine_mgr.current_engine_type(),
+            Some(wind_engine::EngineType::CodeTable)
+        ) {
+            return None;
+        }
+        if !state.input_buffer.starts_with('z') {
+            return None;
+        }
+        // z 必须配为字母触发键。
+        if self.matched_letter_temp_trigger(keymap::VK_Z).is_none() {
+            return None;
+        }
+        let combined = format!("{}{}", state.input_buffer, ch);
+        // 加新键后仍是活码前缀（如 zhang 存在时的 "zh"）→ 不夺取，继续正常码表。
+        if self.has_code_prefix(&combined) {
+            return None;
+        }
+        let target = self.engine_mgr.temp_pinyin_target()?;
+        // residual = 去掉首 z + 新键；snapshot = 正常码流（combined），供退格 rewind 还原。
+        let residual = format!("{}{}", &state.input_buffer[1..], ch);
+        state.active = Some(ModeKind::TempPinyin);
+        state.temp_pinyin_schema = target;
+        state.temp_pinyin_buffer = residual.clone();
+        state.temp_pinyin_prefix = "z".to_string();
+        state.rewind = Some(Rewind {
+            snapshot: combined,
+            host_text: residual,
+        });
+        state.input_buffer.clear();
+        state.candidates.clear();
+        self.update_temp_pinyin_candidates(state);
+        let display = state.preedit.clone();
+        self.notify_ui_update(state);
+        debug!(
+            "z-fallback: hijacked to temp pinyin (buffer={})",
+            state.temp_pinyin_buffer
+        );
+        Some(KeyAction::UpdateComposition {
+            text: display.clone(),
+            caret_pos: display.chars().count() as u32,
+        })
     }
 
     /// 当前按键是否匹配配置的临时英文触发键

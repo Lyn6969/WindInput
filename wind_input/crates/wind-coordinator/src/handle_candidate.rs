@@ -493,7 +493,7 @@ impl Coordinator {
 
     /// Z 键重复上屏：当前方案（码表/混输）启用 z_key_repeat 时返回最近一次上屏文本，否则 None。
     /// 混输继承主码表行为，故码表/混输统一读有效码表配置（全局 schema.codetable + 方案 override）。
-    fn z_key_repeat_text(&self) -> Option<String> {
+    pub(crate) fn z_key_repeat_text(&self) -> Option<String> {
         let enabled = match self.engine_mgr.current_engine_type() {
             Some(wind_engine::EngineType::CodeTable) | Some(wind_engine::EngineType::Mixed) => {
                 self.engine_mgr.codetable_settings().z_key_repeat

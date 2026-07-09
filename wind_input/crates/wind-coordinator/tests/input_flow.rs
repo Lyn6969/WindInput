@@ -370,6 +370,50 @@ fn test_pinyin_basic_input() {
     }
 }
 
+/// z 作字母触发键：`znihao` 应经临时拼音上屏「你好」，不含字面 z。
+/// 无论 z 在方案里是死码（首键即进临拼，身份③）还是活码前缀（后续字母处 z-fallback 夺取，
+/// 身份②→③），都收敛到临拼编码「nihao」——故对 schema 细节鲁棒。
+#[test]
+fn test_z_letter_trigger_temp_pinyin() {
+    if !has_schemas() {
+        return;
+    }
+    let mut cfg = config_with("wubi86");
+    cfg.input.temp_pinyin.enabled = true;
+    cfg.input.temp_pinyin.trigger_keys = vec!["z".into()];
+    let coord = Coordinator::new_headless(cfg, Some(&data_dir()));
+    for c in "znihao".chars() {
+        press_letter(&coord, c);
+    }
+    let commit = coord.handle_key_event(&key_event(0x20, EVENT_KEY_DOWN));
+    match commit {
+        KeyAction::InsertText { text, .. } => {
+            assert!(text.contains("你好"), "znihao 应经临拼上屏 你好，实际: {}", text);
+            assert!(!text.contains('z'), "上屏不应含字面 z，实际: {}", text);
+        }
+        other => panic!("空格应上屏 InsertText，实际: {:?}", other),
+    }
+}
+
+/// z 未配为触发键时：znihao 走正常五笔，不进临拼（回归保护——不误触发）。
+#[test]
+fn test_z_not_trigger_stays_normal() {
+    if !has_schemas() {
+        return;
+    }
+    // 默认 trigger_keys 不含 z（默认 ["backtick"]）。
+    let coord = Coordinator::new_headless(config_with("wubi86"), Some(&data_dir()));
+    let a = press_letter(&coord, 'z');
+    // 正常五笔：z 进缓冲（组合区含 z）或作码，绝不进临拼前缀语义。
+    if let Some(disp) = action_text(&a) {
+        assert!(
+            disp.starts_with('z') || disp.is_empty(),
+            "z 未配触发键应作正常码累积，实际组合区: {}",
+            disp
+        );
+    }
+}
+
 /// 断言某次分隔符键返回的动作**未**把 `'` 压入组合区。
 fn separator_not_inserted(act: &KeyAction) -> bool {
     !matches!(act, KeyAction::UpdateComposition { text, .. } if text.contains('\''))

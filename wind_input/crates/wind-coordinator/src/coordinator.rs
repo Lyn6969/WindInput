@@ -3529,6 +3529,11 @@ impl MessageHandler for Coordinator {
             keymap::VK_A..=keymap::VK_Z => {
                 // A-Z 字母累积
                 let ch = (b'a' + (data.key_code - 0x41) as u8) as char;
+                // z-fallback 夺取：缓冲以 z 开头且加此键后 z… 破活码前缀 → 首 z 实为拼音触发键，
+                // 抛弃首 z、residual 进临时拼音（对齐 Go decideEngineDefaultZFallback）。须先于顶码/累积。
+                if let Some(act) = self.try_z_fallback(&mut state, ch) {
+                    return act;
+                }
                 // 顶码前记住「即将成为前缀」的缓冲及其显示首选：顶码上屏文本须与用户实际所见的
                 // 首候选一致——调频置顶 / shadow 在协调器层重排（apply_freq_rerank/apply_shadow），
                 // 引擎 handle_top_code 内部 convert 看不到，会顶出权重首选而非显示首选（对齐 Go

@@ -58,7 +58,9 @@ impl Coordinator {
     pub(crate) fn active_hijack_buffer<'a>(&self, state: &'a State) -> Option<&'a str> {
         match state.active {
             Some(ModeKind::Url) => Some(&state.url_buffer),
-            // z 临拼夺取（后续 S3/S4 接入）：Some(&state.temp_pinyin_buffer)
+            // z 临拼夺取：仅 try_z_fallback 会同时武装 state.rewind，故 can_rewind 只对夺取式临拼
+            // 成立（符号/字母首键进入的临拼 rewind=None，不会误回退）。
+            Some(ModeKind::TempPinyin) => Some(&state.temp_pinyin_buffer),
             _ => None,
         }
     }
@@ -74,9 +76,10 @@ impl Coordinator {
     /// 执行夺取回退：撤销夺取，把快照回放到正常码表输入流并重算候选。
     pub(crate) fn rewind_hijack(&self, state: &mut State) -> KeyAction {
         let snapshot = state.rewind.take().map(|r| r.snapshot).unwrap_or_default();
-        // 退出当前夺取式模式（目前仅 URL；z 临拼接入后在此扩展 match）。
+        // 退出当前夺取式模式：URL / z-fallback 临时拼音。
         match state.active {
             Some(ModeKind::Url) => self.exit_url_mode(state),
+            Some(ModeKind::TempPinyin) => self.exit_temp_pinyin(state),
             _ => self.reset_exclusive_modes(state),
         }
         state.input_buffer = snapshot;

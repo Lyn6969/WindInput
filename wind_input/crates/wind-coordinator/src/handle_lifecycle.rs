@@ -139,6 +139,41 @@ impl Coordinator {
             });
         }
 
+        // 临时拼音「字母触发键」（z）三重身份裁决（对齐 Go judgeZFirstTrigger；符号触发键在上方
+        // is_temp_pinyin_trigger 分支处理，此处专司字母键）：码表引擎 + 空缓冲 + 无修饰键 +
+        // 配置了该字母触发键。
+        // ① z_key_repeat 开且有上屏历史 → 不进临拼（z 作 repeat，落普通输入由 update_candidates 注入
+        //    重复候选）；② 该字母是活码前缀（码表/短语有以其开头的条目，如自定义 zhang）→ 不进临拼
+        //    （作正常码字母）；③ 否则（死前缀 + 无 repeat，如标准五笔 z）→ 进临时拼音。
+        if state.input_buffer.is_empty()
+            && data.modifiers & (MOD_CTRL | MOD_ALT | MOD_SHIFT) == 0
+            && matches!(
+                self.engine_mgr.current_engine_type(),
+                Some(wind_engine::EngineType::CodeTable)
+            )
+            && let Some(letter) = self.matched_letter_temp_trigger(data.key_code)
+            && let Some(target) = self.engine_mgr.temp_pinyin_target()
+        {
+            let repeat_active = self.z_key_repeat_text().is_some();
+            if !repeat_active && !self.has_code_prefix(&letter.to_string()) {
+                state.active = Some(ModeKind::TempPinyin);
+                state.temp_pinyin_schema = target;
+                state.temp_pinyin_buffer.clear();
+                state.temp_pinyin_prefix = letter.to_string();
+                state.rewind = None; // 首键进入非夺取式，作废任何旧回退登记
+                self.update_temp_pinyin_candidates(state);
+                let display = state.preedit.clone();
+                self.notify_ui_update(state);
+                debug!("Entered temp pinyin via letter trigger '{}'", letter);
+                return Some(KeyAction::UpdateComposition {
+                    text: display.clone(),
+                    caret_pos: display.chars().count() as u32,
+                });
+            }
+            // ①/②：返回 None，z 落普通输入路径（buffer 变 "z"，repeat 注入 / 正常码累积；
+            // 后续按字母若 z… 破前缀，由 try_z_fallback 夺取进临拼）。
+        }
+
         // 特殊模式：空缓冲 + 无候选 + 无修饰键 + 引导键匹配（优先级最低）。
         // 码表不可用时不拦截该键，返回 None 继续普通流程。
         if state.input_buffer.is_empty()
