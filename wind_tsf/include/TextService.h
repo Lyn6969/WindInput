@@ -166,6 +166,12 @@ public:
     // composition-start coordinate reported to the engine (candidate anchor).
     size_t GetPendingCommitPrefixLength() const { return _pendingCommitPrefix.length(); }
 
+    // 把「已决定要提交」的文本并入待提交前缀，但不结束组合、不真提交（真提交推迟到
+    // 最终 CommitText）。用于智能标点顶屏的聚合：候选并入 prefix、中文符号仍作 held 放
+    // 同一组合，规避「真提交+立即重开组合」被 diff 式宿主（微信/Tabby/终端）误读吞字。
+    // 只并入承诺提交的候选——held 符号勿并入（press2 要替换它，见 CommitAndHold 处注释）。
+    void PinCommitTextToPrefix(const std::wstring& text) { _pendingCommitPrefix += text; }
+
     // Get and consume cached character before caret (set by ITfTextEditSink::OnEndEdit).
     // Returns the cached value and clears it to prevent stale values persisting across
     // key events in apps where OnEndEdit fires late or not at all (e.g., WeChat).

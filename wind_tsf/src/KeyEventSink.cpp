@@ -1830,12 +1830,18 @@ BOOL CKeyEventSink::_HandleServiceResponse()
 
     case ResponseType::CommitAndHold:
         {
-            // 标点顶屏 + 智能符号 HoldComposition：先提交候选文本，再开 HoldComposition 放入中文符号。
-            WIND_LOG_DEBUG_FMT(L"Processing CommitAndHold: commit=%ls hold=%ls timeoutMs=%u\n",
+            // 标点顶屏 + 智能符号 HoldComposition：**聚合式**——候选文本并入 _pendingCommitPrefix
+            // （不真提交、留组合内），中文符号作为 held 放入同一组合，最终一次 CommitText 收口
+            // （超时→可能。/ press2→可能.）。曾用「CommitText 候选 + 立即 HoldComposition」——
+            // 真提交+同位置重开组合被 diff 式宿主（微信 Qt / Tabby·终端 Chromium 内嵌）误读成
+            // 替换而吞掉已提交候选（TSF 全程报成功、渲染却丢字）。改聚合后全程只有
+            // compositionupdate、无中途 EndComposition，与顶码 pre_confirm / 连续符号同一套路。
+            // 只把候选（承诺提交、不可撤回）并入 prefix；中文符号仍作 held——press2 要替换它成
+            // 英文，进 prefix 会中英都上屏（见 project_tsf_desync_analysis 教训）。
+            WIND_LOG_DEBUG_FMT(L"Processing CommitAndHold(aggregate): commit=%ls hold=%ls timeoutMs=%u\n",
                                response.text.c_str(), response.newComposition.c_str(),
                                response.holdTimeoutMs);
-            _pTextService->CommitText(response.text);
-            _isComposing = FALSE;
+            _pTextService->PinCommitTextToPrefix(response.text);
             _hasCandidates = FALSE;
             _pTextService->NotifyCandidatesVisibilityChanged(FALSE);
             _pTextService->HoldComposition(response.newComposition, response.holdTimeoutMs);
