@@ -137,7 +137,10 @@ public:
     BOOL UpdateComposition(const std::wstring& text, int caretPos, BOOL noUnderline = FALSE);
 
     // Commit text atomically (end composition + insert text in one EditSession)
-    BOOL CommitText(const std::wstring& text);
+    // fromHoldTimer=TRUE：来自智能符号 HoldComposition 超时收口（裸 WM_TIMER 回调）——
+    // 改用异步编辑会话（TF_ES_ASYNCDONTCARE）且不走 SendInput 兜底，规避 Word 在
+    // 计时器上下文拒发同步会话（TS_E_SYNCHRONOUS）导致的重复上屏。见 .cpp 注释。
+    BOOL CommitText(const std::wstring& text, BOOL fromHoldTimer = FALSE);
 
     // 把光标前 count 个已上屏字符替换为 text（智能符号纠错替换）。
     // 优先走 TSF 同步 EditSession（原子、不受输入队列时序/修饰键影响）；
@@ -383,7 +386,11 @@ private:
     // HoldComposition 计时器状态（智能符号 HoldComposition 方案）
     UINT_PTR       _hHoldTimer = 0;           // SetTimer 返回的计时器 ID；0 表示无活跃计时器
     std::wstring   _heldCompositionText;      // press1 进入组合态的中文文本
-    void           OnHoldTimerExpired();      // 计时器到期时提交中文符号
+    // 提交 held 中文符号收口。fromTimerCallback=TRUE 仅用于真正的 WM_TIMER 回调
+    // （HoldTimerProc）——此上下文拿不到同步编辑会话，须走异步收口；Flush 路径
+    // （PassThrough 透传、失焦 EndComposition）在按键同步上下文里调用，保持同步以
+    // 确保与后续透传字符的先后顺序正确。
+    void           OnHoldTimerExpired(BOOL fromTimerCallback = FALSE);
     static VOID CALLBACK HoldTimerProc(HWND hwnd, UINT uMsg, UINT_PTR idEvent, DWORD dwTime);
 
     BOOL _InitConversionCompartment();

@@ -4582,10 +4582,11 @@ BOOL CTextService::ReplacePrecedingChars(int count, const std::wstring& text)
 // Commit text atomically: end composition + insert text in a single EditSession.
 // This avoids race conditions in browsers where async EndComposition could clear
 // text that was inserted by a subsequent synchronous InsertText.
-BOOL CTextService::CommitText(const std::wstring& text)
+BOOL CTextService::CommitText(const std::wstring& text, BOOL fromHoldTimer)
 {
     // 如果 HoldComposition 计时器活跃（智能符号等待 press2），先取消，
-    // 防止 timeout 与此次 commit 竞争。
+    // 防止 timeout 与此次 commit 竞争。fromHoldTimer 时计时器已在 OnHoldTimerExpired
+    // 里清零，这里是无副作用的 no-op。
     CancelHoldTimer();
 
     // 顶码聚合：真正提交 = 待提交前缀 + 本次文本（微软 IME 的延迟提交在此收口）。
@@ -4634,30 +4635,59 @@ BOOL CTextService::CommitText(const std::wstring& text)
         CCommitTextEditSession* pEditSession = new CCommitTextEditSession(this, pContext, pCompToEnd, full);
         // pCompToEnd ownership transferred to pEditSession
 
-        HRESULT hrSession;
-        hr = pContext->RequestEditSession(_tfClientId, pEditSession, TF_ES_SYNC | TF_ES_READWRITE, &hrSession);
-
-        BOOL success = pEditSession->GetSuccess();
-        pEditSession->Release();
-        pContext->Release();
-
-        QueryPerformanceCounter(&endTime);
-        int durationMs = (int)((endTime.QuadPart - startTime.QuadPart) * 1000 / freq.QuadPart);
-
-        // 只信 DoEditSession 内部的 GetSuccess()——它只在 SetText/EndComposition 真正
-        // 执行完毕后才置 TRUE，是文档是否已被修改的唯一可信信号。外层 hr/hrSession 在
-        // 部分宿主（如 Word 在 SetTimer 回调而非按键同步上下文里请求 TF_ES_SYNC）会
-        // 出现"编辑其实已经执行、但外层返回码不达标"的情况；若仍要求三者同时成功，
-        // 会误判为失败并接着走 SendInput 兜底，在已经正确写入的文字后面再打一遍，
-        // 造成 Office 等宿主里"符号 500ms 后又上屏一次"的重复。
-        if (success)
+        if (fromHoldTimer)
         {
-            WIND_LOG_DEBUG_FMT(L"CommitText: TSF atomic commit succeeded, duration=%dms\n", durationMs);
-            return TRUE;
-        }
+            // 智能符号 HoldComposition 超时收口跑在裸 WM_TIMER 回调里，不在按键/编辑
+            // 上下文中。Word 对此校验严格，会拒发同步会话（hrSession=TS_E_SYNCHRONOUS
+            // 0x80040208），DoEditSession 根本不执行 → 组合被当孤儿 Release（Word 默认把
+            // 组合里已显示的符号 finalize 落进文档）→ 旧逻辑再见 GetSuccess()==FALSE 就走
+            // SendInput 兜底又打一遍，造成"符号 500ms 后重复上屏"（d5d5815 只治了"谎报
+            // 失败"，治不了这里的"真拒绝同步"）。
+            //
+            // 改用异步会话：超时时最终文字已在组合态里显示，交给 TSF 在能拿到锁时原地
+            // SetText+EndComposition 落定即可，绝不 SendInput。TF_ES_ASYNCDONTCARE 在能立即
+            // 给锁的宿主（如 Tabby）会同步执行、行为不变；Word 则延后到可授予锁时执行。
+            // 异步下 pEditSession 由 TSF 保活至 DoEditSession 运行，pCompToEnd 随之正确收尾。
+            HRESULT hrSession = S_OK;
+            hr = pContext->RequestEditSession(_tfClientId, pEditSession,
+                                              TF_ES_ASYNCDONTCARE | TF_ES_READWRITE, &hrSession);
+            pEditSession->Release();
+            pContext->Release();
 
-        WIND_LOG_DEBUG_FMT(L"CommitText: TSF method failed (hr=0x%08X, hrSession=0x%08X), falling back to SendInput, duration=%dms\n",
-                     hr, hrSession, durationMs);
+            if (SUCCEEDED(hr))
+            {
+                WIND_LOG_DEBUG_FMT(L"CommitText(holdTimer): async commit requested, hrSession=0x%08X\n", hrSession);
+                return TRUE;
+            }
+            // 极少数：异步请求本身就被拒（组合已随会话析构释放）。落到 SendInput 末路兜底。
+            WIND_LOG_DEBUG_FMT(L"CommitText(holdTimer): async request rejected hr=0x%08X, falling back to SendInput\n", hr);
+        }
+        else
+        {
+            HRESULT hrSession;
+            hr = pContext->RequestEditSession(_tfClientId, pEditSession, TF_ES_SYNC | TF_ES_READWRITE, &hrSession);
+
+            BOOL success = pEditSession->GetSuccess();
+            pEditSession->Release();
+            pContext->Release();
+
+            QueryPerformanceCounter(&endTime);
+            int durationMs = (int)((endTime.QuadPart - startTime.QuadPart) * 1000 / freq.QuadPart);
+
+            // 只信 DoEditSession 内部的 GetSuccess()——它只在 SetText/EndComposition 真正
+            // 执行完毕后才置 TRUE，是文档是否已被修改的唯一可信信号。外层 hr/hrSession 在
+            // 部分宿主里会出现"编辑其实已经执行、但外层返回码不达标"的情况；若仍要求三者
+            // 同时成功，会误判为失败并接着走 SendInput 兜底，在已经正确写入的文字后面再打
+            // 一遍。（Word 超时路径的"真拒绝同步"另见上面 fromHoldTimer 分支。）
+            if (success)
+            {
+                WIND_LOG_DEBUG_FMT(L"CommitText: TSF atomic commit succeeded, duration=%dms\n", durationMs);
+                return TRUE;
+            }
+
+            WIND_LOG_DEBUG_FMT(L"CommitText: TSF method failed (hr=0x%08X, hrSession=0x%08X), falling back to SendInput, duration=%dms\n",
+                         hr, hrSession, durationMs);
+        }
     }
 
 fallback:
@@ -4990,13 +5020,15 @@ VOID CALLBACK CTextService::HoldTimerProc(HWND /*hwnd*/, UINT /*uMsg*/,
     if (g_holdTimerInstance != nullptr
         && idEvent == g_holdTimerInstance->_hHoldTimer)
     {
-        g_holdTimerInstance->OnHoldTimerExpired();
+        // 真正的 WM_TIMER 回调：拿不到同步编辑会话，须异步收口。
+        g_holdTimerInstance->OnHoldTimerExpired(TRUE);
     }
 }
 
-void CTextService::OnHoldTimerExpired()
+void CTextService::OnHoldTimerExpired(BOOL fromTimerCallback)
 {
-    WIND_LOG_DEBUG(L"OnHoldTimerExpired: timeout, committing chinese text\n");
+    WIND_LOG_DEBUG_FMT(L"OnHoldTimerExpired: committing chinese text, fromTimerCallback=%d\n",
+                       fromTimerCallback);
 
     UINT_PTR timerId = _hHoldTimer;
     std::wstring textToCommit = std::move(_heldCompositionText);
@@ -5004,5 +5036,7 @@ void CTextService::OnHoldTimerExpired()
     g_holdTimerInstance = nullptr;
     KillTimer(NULL, timerId);
 
-    CommitText(textToCommit);
+    // 仅 WM_TIMER 回调路径走异步会话收口（不走 SendInput 兜底，见 CommitText 内注释）；
+    // Flush 路径（PassThrough/失焦）在按键同步上下文，保持同步以确保收口先于后续字符。
+    CommitText(textToCommit, fromTimerCallback);
 }
