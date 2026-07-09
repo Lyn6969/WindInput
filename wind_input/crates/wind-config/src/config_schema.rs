@@ -168,6 +168,8 @@ static REGISTRY: &[ConfigField] = &[
     // 短语前缀列举（原 dict.phrase）
     f("input.phrase.min_prefix", Int),
     f("input.phrase.max_display_chars", Int),
+    // 顶码上屏策略
+    f("input.top_commit_mode", Enum(&["pre_confirm", "direct_commit"])),
     // -- keys（全部按键，扁平；overflow 保留一层）--
     f("keys.toggle_mode_keys", StrList),
     f("keys.commit_on_switch", Bool),

@@ -593,6 +593,9 @@ pub struct InputConfig {
     /// 短语前缀列举（含命令栏 $CC/$SS/$AA）。原 dict.phrase / Go input.phrase。
     #[serde(default)]
     pub phrase: PhraseConfig,
+    /// 顶码上屏策略（内部/实验，默认 pre_confirm 保持既有行为）。
+    #[serde(default)]
+    pub top_commit_mode: TopCommitMode,
 }
 
 impl Default for InputConfig {
@@ -613,6 +616,7 @@ impl Default for InputConfig {
             s2t: S2TConfig::default(),
             cmdbar: CmdbarConfig::default(),
             phrase: PhraseConfig::default(),
+            top_commit_mode: TopCommitMode::default(),
         }
     }
 }
@@ -661,6 +665,20 @@ pub enum SmartMethod {
     DeleteReplace,
     #[default]
     HoldComposition,
+}
+
+/// 顶码/顶屏的宿主上屏策略。影响顶码上屏时「已确认文字」如何落到宿主：
+/// - PreConfirm：留在 TSF 组合态（_pendingCommitPrefix 聚合），延迟到最终 CommitText 才真提交。
+///   diff 式宿主（终端/Chromium）不双写，但部分宿主整段画下划线、WPS 智能标点顶屏会清空。
+/// - DirectCommit：顶码时真提交，余码新组合延迟到触发键 keyup 才开（照抄真实输入法时序），
+///   靠隔一拍消息泵躲开 diff 合并；真提交无下划线歧义、WPS 不清空。
+/// TODO(per-app)：后续可按宿主进程名 override（当前仅全局默认）。
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, Default, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum TopCommitMode {
+    #[default]
+    PreConfirm,
+    DirectCommit,
 }
 
 /// 智能符号配置（[input.symbol]）：同一中文标点在时限内连按两次，删前一字符替换为英文。
@@ -2099,6 +2117,25 @@ smart_method = "delete_replace"
         let toml = r#"smart_mode = true"#;
         let cfg: SymbolConfig = toml::from_str(toml).unwrap();
         assert_eq!(cfg.smart_method, SmartMethod::HoldComposition);
+    }
+
+    #[test]
+    fn top_commit_mode_default_is_pre_confirm() {
+        let c = InputConfig::default();
+        assert_eq!(c.top_commit_mode, TopCommitMode::PreConfirm);
+    }
+
+    #[test]
+    fn top_commit_mode_serde_round_trip() {
+        let toml = r#"top_commit_mode = "direct_commit""#;
+        let cfg: InputConfig = toml::from_str(toml).unwrap();
+        assert_eq!(cfg.top_commit_mode, TopCommitMode::DirectCommit);
+    }
+
+    #[test]
+    fn top_commit_mode_absent_defaults_pre_confirm() {
+        let cfg: InputConfig = toml::from_str("").unwrap();
+        assert_eq!(cfg.top_commit_mode, TopCommitMode::PreConfirm);
     }
 
     /// 工具栏自动隐藏：默认关、超时 5 秒；空表反序列化与 Default 一致。
