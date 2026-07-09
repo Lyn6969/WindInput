@@ -218,6 +218,67 @@ impl Coordinator {
         let should_clear = result.should_clear;
 
         let mut candidates = result.candidates;
+        // 词库候选 value 内嵌特殊语法（$CC 命令 / $Y 模板 / $AA·$SS 组）：与短语、Go
+        // dict.ValueExpander 一致——候选后处理统一展开。$CC 标记 is_command（选中由
+        // commit_selected、顶屏由 top_commit_command_guard 执行动作，而非上屏原文）；模板 / 花括号
+        // 插值直接以展开文本上屏；$AA/$SS 一对多炸开。普通候选（不含 $ 与 {）经廉价预检零开销跳过。
+        if candidates
+            .iter()
+            .any(|c| !c.is_phrase && !c.is_command && (c.text.contains('$') || c.text.contains('{')))
+        {
+            let now = chrono::Local::now();
+            let recent = self.recent_commits_snapshot();
+            let clip = |_n: i64| -> String {
+                #[cfg(windows)]
+                {
+                    wind_ui::popup_menu::get_clipboard_text()
+                }
+                #[cfg(not(windows))]
+                {
+                    String::new()
+                }
+            };
+            let mut expanded: Vec<Candidate> = Vec::with_capacity(candidates.len());
+            for cand in candidates.into_iter() {
+                if cand.is_phrase || cand.is_command {
+                    expanded.push(cand);
+                    continue;
+                }
+                match wind_phrase::expand_dict_value(
+                    &cand.text,
+                    &state.input_buffer,
+                    now,
+                    &recent,
+                    &clip,
+                ) {
+                    wind_phrase::DictExpansion::None => expanded.push(cand),
+                    wind_phrase::DictExpansion::Single {
+                        display,
+                        command_src,
+                    } => {
+                        let mut c = cand;
+                        c.text = display;
+                        if let Some(src) = command_src {
+                            c.phrase_template = src;
+                            c.is_command = true;
+                        }
+                        expanded.push(c);
+                    }
+                    wind_phrase::DictExpansion::Many(items) => {
+                        for (display, command_src) in items {
+                            let mut c = cand.clone();
+                            c.text = display;
+                            if let Some(src) = command_src {
+                                c.phrase_template = src;
+                                c.is_command = true;
+                            }
+                            expanded.push(c);
+                        }
+                    }
+                }
+            }
+            candidates = expanded;
+        }
         let phrases = self.phrases.read().unwrap_or_else(|e| e.into_inner());
         if !phrases.is_empty() {
             let recent = self.recent_commits_snapshot();

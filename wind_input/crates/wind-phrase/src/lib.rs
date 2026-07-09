@@ -395,6 +395,92 @@ impl PhraseLayer {
 /// 命令栏 display 侧的 [`wind_cmdbar::EvalContext`] 适配器（短语候选生成用）。
 /// 提供 input/now/env + 上屏历史 last + 剪贴板 clip（供 `coll`/`coad` 等命令的 display
 /// 标签显示 `last()`/`clip()`）；sel/app/title 与副作用服务侧留空（生成阶段不跑动作）。
+/// 词库候选 value 的展开结果（供 coordinator 候选后处理复用短语 / cmdbar 的统一展开逻辑）。
+#[derive(Debug, Clone, PartialEq)]
+pub enum DictExpansion {
+    /// 非特殊语法：候选保持原样。
+    None,
+    /// 单候选替换：`display` 替换候选文本；`command_src = Some` 表示 `$CC` 命令
+    /// （选中 / 顶屏时执行动作，display 仅作展示）。
+    Single {
+        display: String,
+        command_src: Option<String>,
+    },
+    /// 一对多炸开（`$AA` 逐字符 / `$SS` 字面组）：每个元素一个候选 `(display, command_src)`。
+    Many(Vec<(String, Option<String>)>),
+}
+
+/// 展开一条**词库候选 value**（对齐 Go `dict.ValueExpander.Expand`/`ExpandToCandidates`）：
+/// 判定顺序——cmdbar marker（`$CC(`/`$SS(`/`$AA(` 或顶层 `{..}` 插值）优先，其次简单模板变量
+/// （`$Y/$M/$D/...`），都不含则 [`DictExpansion::None`]。让**普通用户 / 系统词库码表词条**也能
+/// 像短语一样内嵌命令 / 模板 / 组，而非把 value 原文当文本上屏。
+///
+/// `input` 供 cmdbar 语法内 `input()` 求值；`now/last/clip` 为 display 上下文。
+pub fn expand_dict_value(
+    text: &str,
+    input: &str,
+    now: DateTime<Local>,
+    last: &[String],
+    clip: &dyn Fn(i64) -> String,
+) -> DictExpansion {
+    // 快路径：无 `$` 与 `{` 一律非特殊语法（普通词条零开销）。
+    if !text.contains('$') && !text.contains('{') {
+        return DictExpansion::None;
+    }
+    if is_cmdbar_grammar(text) {
+        let ctx = PhraseCtx {
+            input: input.to_string(),
+            now,
+            last,
+            clip,
+        };
+        match evaluate_phrase(text, &ctx, default_registry()) {
+            // 纯 literal/template（如 {date()}）：display 即上屏文本。
+            Ok(PhraseEval::Single { display, actions }) if actions.is_empty() => {
+                DictExpansion::Single {
+                    display,
+                    command_src: None,
+                }
+            }
+            // $CC 命令（有动作）：携命令源，选中 / 顶屏执行动作。
+            Ok(PhraseEval::Single { display, .. }) => DictExpansion::Single {
+                display,
+                command_src: Some(text.to_string()),
+            },
+            // $AA/$SS 组：炸开为多个候选（仅显现无动作的字面元素，与短语 lookup_at 一致；
+            // 带动作的嵌入 $CC 需元素级源，后续补）。
+            Ok(PhraseEval::Array(arr)) => {
+                let items: Vec<(String, Option<String>)> = arr
+                    .elements
+                    .into_iter()
+                    .filter(|el| el.actions.is_empty())
+                    .map(|el| (el.display, None))
+                    .collect();
+                if items.is_empty() {
+                    DictExpansion::None
+                } else {
+                    DictExpansion::Many(items)
+                }
+            }
+            Err(err) => {
+                warn!("cmdbar 词库候选求值失败 ({:?}): {}", text, err);
+                DictExpansion::None
+            }
+        }
+    } else if let Some(expanded) = expand_template(text, &now)
+        && expanded != text
+    {
+        // 简单模板变量（$Y年$M月$D日 等）：确有展开才替换（对齐 Go Changed 语义；
+        // 含 $ 但非模板变量的普通文本如「价格$5」原样保留 → None）。
+        DictExpansion::Single {
+            display: expanded,
+            command_src: None,
+        }
+    } else {
+        DictExpansion::None
+    }
+}
+
 struct PhraseCtx<'a> {
     input: String,
     now: DateTime<Local>,
@@ -708,6 +794,50 @@ mod tests {
             cmd[0].command_src.as_deref(),
             Some(r#"$CC("切简繁", ime.toggle("s2t"))"#)
         );
+    }
+
+    #[test]
+    fn test_expand_dict_value_reuse() {
+        // 词库候选复用短语 / cmdbar 的统一展开（对齐 Go dict.ValueExpander）。
+        let now = fixed();
+        let clip = no_clip();
+        // 简单模板变量 $Y年$M月$D日 → 展开为日期（用户 now 词条 bug 的正解）。
+        assert_eq!(
+            expand_dict_value("$Y年$M月$D日", "now", now, &[], &clip),
+            DictExpansion::Single {
+                display: "2026年6月14日".into(),
+                command_src: None,
+            }
+        );
+        // 花括号插值 {date()} → display，无命令源。
+        assert_eq!(
+            expand_dict_value(r#"{date("YYYY-MM-DD")}"#, "rq", now, &[], &clip),
+            DictExpansion::Single {
+                display: "2026-06-14".into(),
+                command_src: None,
+            }
+        );
+        // $CC 命令 → display + 命令源。
+        assert_eq!(
+            expand_dict_value(r#"$CC("切简繁", ime.toggle("s2t"))"#, "co", now, &[], &clip),
+            DictExpansion::Single {
+                display: "切简繁".into(),
+                command_src: Some(r#"$CC("切简繁", ime.toggle("s2t"))"#.into()),
+            }
+        );
+        // $AA 字符组 → 一对多炸开为逐字符候选。
+        assert_eq!(
+            expand_dict_value(r#"$AA("数字", "①②③")"#, "sz", now, &[], &clip),
+            DictExpansion::Many(vec![
+                ("①".into(), None),
+                ("②".into(), None),
+                ("③".into(), None),
+            ])
+        );
+        // 普通词库文本（无 $ 与 {）→ None，零干预。
+        assert_eq!(expand_dict_value("你好", "nh", now, &[], &clip), DictExpansion::None);
+        // 含 $ 但非模板变量（如 价格$5）→ None，不误展开。
+        assert_eq!(expand_dict_value("价格$5", "jg", now, &[], &clip), DictExpansion::None);
     }
 
     #[test]
