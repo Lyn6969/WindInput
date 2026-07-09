@@ -5060,6 +5060,15 @@ void CTextService::StashDeferredComposition(const std::wstring& composition, UIN
     _deferredCompText = composition;
     g_deferredTimerInstance = this;
     _hDeferredTimer = SetTimer(NULL, 0, fallbackMs, DeferredTimerProc);
+
+    if (_hDeferredTimer == 0)
+    {
+        WIND_LOG_ERROR(L"StashDeferredComposition: SetTimer failed\n");
+        g_deferredTimerInstance = nullptr;
+        _deferredCompText.clear();
+        return;
+    }
+
     WIND_LOG_DEBUG_FMT(L"StashDeferredComposition: text=%s fallbackMs=%u timer=%llu\n",
                        composition.c_str(), fallbackMs,
                        static_cast<unsigned long long>(_hDeferredTimer));
