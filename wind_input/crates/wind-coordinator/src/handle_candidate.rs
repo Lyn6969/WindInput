@@ -987,6 +987,28 @@ impl Coordinator {
         KeyAction::ClearComposition
     }
 
+    /// 顶屏点统一命令分流：若当前高亮候选是 $CC 命令，执行命令（异步，语义与按空格
+    /// `commit_selected` 一致——上屏命令动作结果而非 display 标签），返回 `Some(action)`；
+    /// 否则返回 `None`，调用方按普通候选顶屏。
+    ///
+    /// 用于标点 / 运算符 / 智能符号 Hold / 进其它模式等所有「顶高亮候选」路径，修复命令候选被
+    /// 顶屏时错把 display 文本当普通文本上屏的问题（这些路径绕过了 `commit_selected` 的命令守卫）。
+    /// 命令候选被顶屏时按「执行命令」处理，触发键（标点 / 模式键）字符不再单独上屏——与空格选中
+    /// 命令候选行为一致（命令占据整段缓冲，无独立前缀）。
+    pub(crate) fn top_commit_command_guard(&self, state: &mut State) -> Option<KeyAction> {
+        if state.candidates.is_empty() {
+            return None;
+        }
+        let idx = self
+            .highlighted_global_index(state)
+            .min(state.candidates.len() - 1);
+        if !state.candidates[idx].is_command {
+            return None;
+        }
+        let cand = state.candidates[idx].clone();
+        Some(self.commit_command(state, &cand))
+    }
+
     /// 在独立线程执行命令源（解析→求值→按序跑动作；type 文本经 push 提交、其余为副作用）。
     pub(crate) fn spawn_command(&self, src: String, input: String) {
         let Some(this) = self.self_weak.get().and_then(std::sync::Weak::upgrade) else {

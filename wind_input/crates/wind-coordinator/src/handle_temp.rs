@@ -523,6 +523,10 @@ impl Coordinator {
         key_code: u32,
         target: String,
     ) -> KeyAction {
+        // 命令候选顶屏 → 执行命令（与按空格一致），不进模式、不上屏 display 标签。
+        if let Some(act) = self.top_commit_command_guard(state) {
+            return act;
+        }
         let prefix = self.take_committed(state); // 拼音逐步转换的已转换前缀一并上屏
         let committed = if !state.candidates.is_empty() {
             let (start, _) = self.page_range(state);

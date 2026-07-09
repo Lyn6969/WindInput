@@ -3347,6 +3347,10 @@ impl MessageHandler for Coordinator {
                     let num = if d == 0 { 10 } else { d as usize };
                     return self.handle_number_key_select(&mut state, num);
                 }
+                // 命令候选顶屏 → 执行命令（与按空格一致），不上屏 display 标签、不追加该字符。
+                if let Some(act) = self.top_commit_command_guard(&mut state) {
+                    return act;
+                }
                 // 运算符 / 小数点：等同主键盘标点——有组合先顶字上屏高亮候选，再输出该字符。
                 let committed = self.take_committed(&mut state);
                 let mut out = self.maybe_s2t(&state, &committed);
@@ -3781,6 +3785,10 @@ impl MessageHandler for Coordinator {
                             }
                         };
                         if let Some((hold_text, timeout_ms)) = hold_info {
+                            // 命令候选顶屏 → 执行命令（与按空格一致），不走智能符号 Hold。
+                            if let Some(act) = self.top_commit_command_guard(&mut state) {
+                                return act;
+                            }
                             let committed = self.take_committed(&mut state);
                             let mut commit_text = self.maybe_s2t(&state, &committed);
                             if !state.candidates.is_empty() {
@@ -3819,6 +3827,10 @@ impl MessageHandler for Coordinator {
                                 timeout_ms,
                             };
                         }
+                    }
+                    // 命令候选顶屏 → 执行命令（与按空格一致），不上屏 display 标签、不追加标点。
+                    if let Some(act) = self.top_commit_command_guard(&mut state) {
+                        return act;
                     }
                     // 标点/符号键：先上屏已转换前缀 + 首选候选（若有输入），再追加（转换后的）标点
                     let committed = self.take_committed(&mut state);
