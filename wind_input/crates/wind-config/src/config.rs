@@ -905,6 +905,8 @@ pub struct KeysConfig {
     pub open_settings: String,
     #[serde(default = "default_add_word")]
     pub add_word: String,
+    #[serde(default = "default_open_add_word_dialog")]
+    pub open_add_word_dialog: String,
     #[serde(default = "default_toggle_s2t")]
     pub toggle_s2t: String,
     #[serde(default = "default_activate_ime")]
@@ -950,6 +952,9 @@ fn default_toggle_punct() -> String {
 fn default_add_word() -> String {
     "ctrl+equal".to_string()
 }
+fn default_open_add_word_dialog() -> String {
+    "ctrl+shift+equal".to_string()
+}
 fn default_toggle_s2t() -> String {
     "ctrl+shift+j".to_string()
 }
@@ -986,6 +991,7 @@ impl Default for KeysConfig {
             toggle_toolbar: default_toggle_toolbar(),
             open_settings: default_open_settings(),
             add_word: default_add_word(),
+            open_add_word_dialog: default_open_add_word_dialog(),
             toggle_s2t: default_toggle_s2t(),
             activate_ime: default_activate_ime(),
             pin_candidate: default_pin_candidate(),
