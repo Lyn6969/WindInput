@@ -856,7 +856,7 @@ impl Coordinator {
                     .enabled_phrases_for_input()
                     .unwrap_or_default()
                     .into_iter()
-                    .map(|p| (p.code, p.text, p.weight, p.position));
+                    .map(|p| (p.code, p.text, p.weight, p.position, p.is_system));
                 std::sync::RwLock::new(wind_phrase::PhraseLayer::from_records(recs))
             } else {
                 std::sync::RwLock::new(wind_phrase::PhraseLayer::default())
@@ -1859,6 +1859,12 @@ impl Coordinator {
             max_readings: tip_cfg.pinyin_max_readings,
             chaizi: tip_cfg.chaizi_enabled,
         };
+        // 调试提示上下文：仅开启调试段时解析一次（mixed 归属 / 方案 id），循环内按候选来源选用。
+        let dbg_ctx = if tip_cfg.debug_enabled {
+            Some(self.build_debug_schema_ctx())
+        } else {
+            None
+        };
         let items: Vec<CandidateItem> = state.candidates[start..end]
             .iter()
             .enumerate()
@@ -1866,17 +1872,14 @@ impl Coordinator {
                 // 反查提示用完整文本（截断只影响显示，不影响"如何输入"提示）
                 let full = self.maybe_s2t(state, &c.text);
                 let mut tooltip = self.reverse.tooltip_for(&full, &tip_opts);
-                if tip_cfg.debug_enabled {
-                    let dbg = debug_tooltip_section(c);
-                    if !dbg.is_empty() {
-                        if !tooltip.is_empty() {
-                            tooltip.push('\n');
-                        }
-                        tooltip.push_str(&dbg);
+                // 调试段：独立一行 [调试] + 来源/方案/编码/权重/序/词频。全关时不再兜底回填编码
+                // （tooltip 各 provider 全关即真正为空，不显示气泡）。
+                if let Some(ctx) = &dbg_ctx {
+                    let dbg = self.debug_tooltip_section(c, &state.input_buffer, ctx);
+                    if !tooltip.is_empty() {
+                        tooltip.push('\n');
                     }
-                }
-                if tooltip.is_empty() && !c.code.is_empty() {
-                    tooltip = c.code.clone();
+                    tooltip.push_str(&dbg);
                 }
                 CandidateItem {
                     // 开启简繁时显示也转繁体（内部候选仍存简体，用于词频/匹配）；按 max_chars 截断显示。
@@ -2827,12 +2830,12 @@ impl Coordinator {
 
     /// 从 store 重建短语层（短语类 RPC 改动后调用，使输入期即时生效）。
     pub(crate) fn rebuild_phrases(&self) {
-        let recs: Vec<(String, String, i32, i32)> = match self.store.as_ref() {
+        let recs: Vec<(String, String, i32, i32, bool)> = match self.store.as_ref() {
             Some(store) => store
                 .enabled_phrases_for_input()
                 .unwrap_or_default()
                 .into_iter()
-                .map(|p| (p.code, p.text, p.weight, p.position))
+                .map(|p| (p.code, p.text, p.weight, p.position, p.is_system))
                 .collect(),
             None => Vec::new(),
         };
@@ -4365,21 +4368,136 @@ fn phrase_entries_hash(entries: &[wind_phrase::SystemPhraseEntry]) -> String {
     format!("{:016x}", h.finish())
 }
 
-/// 候选调试信息段（tooltip debug provider）：编码/权重/引擎/标记。空候选返回空串。
-fn debug_tooltip_section(c: &Candidate) -> String {
-    let mut lines = Vec::new();
-    if !c.code.is_empty() {
-        lines.push(format!("编码: {}", c.code));
+/// 悬停调试段的方案归属上下文（每次候选推送解析一次，镜像 `apply_freq_rerank` 的方案解析）。
+struct DebugSchemaCtx {
+    /// 是否混输方案（英文/码表/拼音候选各归子方案）。
+    is_mixed: bool,
+    /// 非混输统一方案 id（拼音族折叠为 "pinyin"）。
+    schema: String,
+    /// 混输码表子方案 id（英文候选亦归此）。
+    ct_id: Option<String>,
+    /// 混输拼音子方案 id。
+    py_id: Option<String>,
+}
+
+impl Coordinator {
+    /// 解析当前活跃方案的调试归属上下文。
+    fn build_debug_schema_ctx(&self) -> DebugSchemaCtx {
+        use wind_candidate::CandidateSource as S;
+        let active = self.engine_mgr.active_schema_id();
+        let is_mixed = self.engine_mgr.schema_engine_type(&active).as_deref() == Some("mixed");
+        let schema = self.engine_mgr.data_schema_id(&active);
+        let (ct_id, py_id) = if is_mixed {
+            (
+                self.engine_mgr.write_data_schema_id(&active, S::CodeTable),
+                self.engine_mgr.write_data_schema_id(&active, S::Pinyin),
+            )
+        } else {
+            (None, None)
+        };
+        DebugSchemaCtx {
+            is_mixed,
+            schema,
+            ct_id,
+            py_id,
+        }
     }
-    lines.push(format!("权重: {}", c.weight));
-    lines.push(format!("引擎: {:?}", c.source));
-    if c.has_shadow {
-        lines.push("标记: 已调整".to_string());
+
+    /// 候选归属的方案 id（混输按来源取子方案，非混输取统一方案）。
+    fn debug_schema_id_for(&self, c: &Candidate, ctx: &DebugSchemaCtx) -> String {
+        use wind_candidate::CandidateSource as S;
+        if ctx.is_mixed {
+            match c.source {
+                S::CodeTable | S::English => ctx.ct_id.clone().unwrap_or_default(),
+                S::Pinyin => ctx.py_id.clone().unwrap_or_default(),
+                _ => ctx.schema.clone(),
+            }
+        } else {
+            ctx.schema.clone()
+        }
     }
-    if lines.is_empty() {
-        String::new()
-    } else {
-        format!("[调试]\n{}", lines.join("\n"))
+
+    /// 候选来源标签：短语（系统/用户 + 组/成员）优先，其次用户/临时词库，再按来源 + 方案名。
+    /// 混输下英文候选归码表体系。
+    fn debug_source_label(&self, c: &Candidate, ctx: &DebugSchemaCtx) -> String {
+        use wind_candidate::CandidateSource as S;
+        if c.is_phrase {
+            let kind = if c.meta.is_system_phrase {
+                "系统短语"
+            } else {
+                "用户短语"
+            };
+            if c.is_group {
+                return format!("{kind}·组");
+            }
+            if c.phrase_template.starts_with("$SS") || c.phrase_template.starts_with("$AA") {
+                return format!("{kind}·成员");
+            }
+            return kind.to_string();
+        }
+        if c.meta.is_user_dict {
+            return "用户词库".to_string();
+        }
+        if c.meta.is_temp_dict {
+            return "临时词库".to_string();
+        }
+        match c.source {
+            S::CodeTable => format!(
+                "码表·{}",
+                Self::schema_display_name(&self.debug_schema_id_for(c, ctx))
+            ),
+            S::English => "码表·英文".to_string(),
+            S::Pinyin => {
+                let sid = self.debug_schema_id_for(c, ctx);
+                if sid.is_empty() || sid == "pinyin" {
+                    "拼音".to_string()
+                } else {
+                    format!("拼音·{}", Self::schema_display_name(&sid))
+                }
+            }
+            S::Phrase => "短语".to_string(),
+            S::None => "系统词".to_string(),
+        }
+    }
+
+    /// 候选词频使用次数（按候选归属方案点查 redb FREQ；无 store/无记录 → 0）。
+    fn debug_freq_count(&self, c: &Candidate, input_code: &str, ctx: &DebugSchemaCtx) -> u32 {
+        let Some(store) = &self.store else {
+            return 0;
+        };
+        let sid = self.debug_schema_id_for(c, ctx);
+        if sid.is_empty() || input_code.is_empty() {
+            return 0;
+        }
+        store
+            .get_freq(&sid, input_code, &c.text)
+            .ok()
+            .flatten()
+            .map(|r| r.count)
+            .unwrap_or(0)
+    }
+
+    /// 候选调试信息段：`[调试]` 独占一行 + 来源行 + 合并的（编码/权重/序/词频/标记）行。
+    /// 保持约 3 行；来源区分系统/用户短语、用户/临时词库、码表(方案)、拼音、英文。
+    fn debug_tooltip_section(
+        &self,
+        c: &Candidate,
+        input_code: &str,
+        ctx: &DebugSchemaCtx,
+    ) -> String {
+        let source = self.debug_source_label(c, ctx);
+        let count = self.debug_freq_count(c, input_code, ctx);
+        let mut parts: Vec<String> = Vec::new();
+        if !c.code.is_empty() {
+            parts.push(format!("码 {}", c.code));
+        }
+        parts.push(format!("权 {}", c.weight));
+        parts.push(format!("序 {}", c.natural_order));
+        parts.push(format!("用 {count}次"));
+        if c.has_shadow {
+            parts.push("✎已调整".to_string());
+        }
+        format!("[调试]\n来源: {source}\n{}", parts.join(" · "))
     }
 }
 

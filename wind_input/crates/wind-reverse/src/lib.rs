@@ -303,6 +303,21 @@ impl ReverseLookup {
         }
         let mut sections: Vec<Section> = Vec::new();
 
+        // 编码段（整词维度，不逐字拆）：置于最前——编码是核心「如何输入」信息。
+        // 以 `[编码]` 标题格式独立成段（always_expand）。只要开启编码就显示整词码，
+        // 与拆字互不影响（拆字段另按字给出「字根 [逐字编码]」，二者粒度不同、可并存）。
+        if opts.code {
+            let filtered: String = chars.iter().collect();
+            let code = self.wubi_word_code(&filtered);
+            if !code.is_empty() {
+                sections.push(Section {
+                    label: "编码".into(),
+                    lines: vec![code],
+                    always_expand: true, // 强制 [编码] 标题行
+                });
+            }
+        }
+
         // 拼音段（逐字，always_expand）
         if opts.pinyin {
             let mut lines = Vec::new();
@@ -347,20 +362,6 @@ impl ReverseLookup {
                     label: "拆字".into(),
                     lines,
                     always_expand: true,
-                });
-            }
-        }
-
-        // 编码段：整词维度，不逐字拆（对齐用户需求）。
-        // 拆字开启时编码已内嵌于拆字行（字：字根 [编码]），不再单独显示。
-        if opts.code && !opts.chaizi {
-            let filtered: String = chars.iter().collect();
-            let code = self.wubi_word_code(&filtered);
-            if !code.is_empty() {
-                sections.push(Section {
-                    label: "编码".into(),
-                    lines: vec![code],
-                    always_expand: false, // 单行 → "编码: xxxx"
                 });
             }
         }
@@ -435,8 +436,11 @@ mod tests {
         // [拼音] 标题行
         assert!(t.contains("[拼音]"), "应有 [拼音] 标题: {t}");
         assert!(t.contains("好：hǎo/hào"), "默认 heteronyms 显示全读音: {t}");
-        // 编码为整词维度（2字取各前2码：vb+w=vbw）
-        assert!(t.contains("编码: vbw"), "整词编码单行: {t}");
+        // 编码为整词维度（2字取各前2码：vb+w=vbw），以 [编码] 标题格式独立成段
+        assert!(
+            t.contains("[编码]") && t.contains("vbw"),
+            "整词编码带标题: {t}"
+        );
         assert!(!t.contains("拆字"), "默认不含拆字: {t}");
         // 纯 ASCII 无反查
         assert_eq!(rl.tooltip_for("abc", &TooltipOptions::default()), "");
@@ -446,8 +450,11 @@ mod tests {
     fn test_tooltip_single_char_code() {
         let rl = sample_rl();
         let t = rl.tooltip_for("好", &TooltipOptions::default());
-        // 单字编码=全码
-        assert!(t.contains("编码: vbg"), "单字编码: {t}");
+        // 单字编码=全码，以 [编码] 标题格式独立成段
+        assert!(
+            t.contains("[编码]") && t.contains("vbg"),
+            "单字编码带标题: {t}"
+        );
     }
 
     #[test]
@@ -502,9 +509,9 @@ mod tests {
     }
 
     #[test]
-    fn test_tooltip_chaizi_embeds_code() {
+    fn test_tooltip_code_and_chaizi_coexist() {
         let rl = sample_rl();
-        // 拆字开启时，编码段不单独显示（已内嵌于拆字行）
+        // 编码 + 拆字同开：整词 [编码] 段显示（置顶），拆字行另含逐字编码，二者并存。
         let opts = TooltipOptions {
             code: true,
             pinyin: false,
@@ -512,10 +519,14 @@ mod tests {
             ..Default::default()
         };
         let t = rl.tooltip_for("好", &opts);
+        assert!(t.contains("[编码]"), "整词编码段应显示: {t}");
         assert!(t.contains("[拆字]"), "拆字标题: {t}");
-        assert!(t.contains("好：女子 [vbg]"), "编码内嵌于拆字行: {t}");
-        // 不应有独立的"编码: "行
-        assert!(!t.contains("编码: "), "拆字开时无独立编码段: {t}");
+        assert!(t.contains("好：女子 [vbg]"), "逐字编码内嵌于拆字行: {t}");
+        // [编码] 段置于拆字之前（编码是核心「如何输入」信息）
+        assert!(
+            t.find("[编码]") < t.find("[拆字]"),
+            "编码段应在拆字段之前: {t}"
+        );
     }
 
     #[test]

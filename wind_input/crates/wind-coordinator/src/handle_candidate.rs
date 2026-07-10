@@ -8,7 +8,7 @@ use crate::coordinator::{
 use crate::pipeline::ModeKind;
 use tracing::{debug, warn};
 use wind_bridge::handler::{KeyAction, KeyEventData};
-use wind_candidate::{Candidate, CandidateSource};
+use wind_candidate::{Candidate, CandidateMeta, CandidateSource};
 use wind_config::hotkey;
 use wind_store::freq::FreqRecord;
 use wind_ui::manager::CandidateOp;
@@ -296,6 +296,7 @@ impl Coordinator {
             };
             for hit in phrases.lookup(&state.input_buffer, &recent, &clip) {
                 let is_command = hit.command_src.is_some();
+                let is_system = hit.is_system;
                 candidates.push(Candidate {
                     text: Self::clamp_candidate_display(&hit.text, max_disp),
                     weight: PHRASE_WEIGHT_BASE + hit.weight,
@@ -306,6 +307,10 @@ impl Coordinator {
                     // 供右键「禁用短语」按 (code, 原文) 定位 store 记录（对齐 Go PhraseTemplate）。
                     is_command,
                     phrase_template: hit.command_src.unwrap_or(hit.source_text),
+                    meta: CandidateMeta {
+                        is_system_phrase: is_system,
+                        ..Default::default()
+                    },
                     ..Default::default()
                 });
             }
@@ -315,6 +320,11 @@ impl Coordinator {
             let min_prefix = self.rt().config.input.phrase.min_prefix;
             for hit in phrases.lookup_prefix(&state.input_buffer, &recent, min_prefix) {
                 let text = Self::clamp_candidate_display(&hit.text, max_disp);
+                let is_system = hit.is_system;
+                let phrase_meta = || CandidateMeta {
+                    is_system_phrase: is_system,
+                    ..Default::default()
+                };
                 if let Some(src) = hit.command_src {
                     // $CC 命令短语：选中直接执行，不二级展开。
                     let code = hit.nav_code.unwrap_or_default();
@@ -326,6 +336,7 @@ impl Coordinator {
                         phrase_template: src,
                         group_code: code,
                         comment: hit.comment,
+                        meta: phrase_meta(),
                         ..Default::default()
                     });
                 } else if let Some(code) = hit.nav_code {
@@ -340,6 +351,7 @@ impl Coordinator {
                         group_name: text,
                         comment: hit.comment,
                         phrase_template: hit.source_text,
+                        meta: phrase_meta(),
                         ..Default::default()
                     });
                 } else {
@@ -351,6 +363,7 @@ impl Coordinator {
                         is_prefix: true,
                         comment: hit.comment,
                         phrase_template: hit.source_text,
+                        meta: phrase_meta(),
                         ..Default::default()
                     });
                 }

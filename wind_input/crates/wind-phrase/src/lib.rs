@@ -21,11 +21,13 @@ use wind_cmdbar::{
 };
 
 /// 一条短语（同 code 下按 weight 降序、position 升序排列）
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct PhraseEntry {
     pub text: String,
     pub weight: i32,
     pub position: i32,
+    /// 是否系统短语（来自 system.phrases.toml / store `is_system=true`）；false=用户短语。
+    pub is_system: bool,
 }
 
 /// 一条短语命中：展开后的候选文本 + 权重 + 可选命令源 / 前缀导航目标。
@@ -44,6 +46,8 @@ pub struct PhraseHit {
     /// 原始记录文本（store 里的 `PhraseEntry.text`，模板/命令未展开）。
     /// 右键「禁用短语」按 (code, source_text) 定位 store 记录（display 可能是展开后文本）。
     pub source_text: String,
+    /// 是否系统短语（`is_system=true`）；false=用户短语。调试提示区分来源用。
+    pub is_system: bool,
 }
 
 impl PhraseHit {
@@ -55,6 +59,7 @@ impl PhraseHit {
             nav_code: None,
             comment: String::new(),
             source_text: String::new(),
+            is_system: false,
         }
     }
 
@@ -73,6 +78,7 @@ impl PhraseHit {
             nav_code: Some(code),
             comment,
             source_text: String::new(),
+            is_system: false,
         }
     }
 
@@ -86,6 +92,7 @@ impl PhraseHit {
             nav_code: Some(code),
             comment,
             source_text: String::new(),
+            is_system: false,
         }
     }
 }
@@ -150,6 +157,8 @@ impl PhraseLayer {
                 text: r.text,
                 weight: r.weight.unwrap_or(1000),
                 position: r.position.unwrap_or(0),
+                // system.phrases.toml 内均为系统短语。
+                is_system: true,
             });
         }
         for v in map.values_mut() {
@@ -190,14 +199,17 @@ impl PhraseLayer {
         out
     }
 
-    /// 从 (code,text,weight,position) 记录构建短语层（调用方只传 enabled 项）。
-    pub fn from_records(records: impl IntoIterator<Item = (String, String, i32, i32)>) -> Self {
+    /// 从 (code,text,weight,position,is_system) 记录构建短语层（调用方只传 enabled 项）。
+    pub fn from_records(
+        records: impl IntoIterator<Item = (String, String, i32, i32, bool)>,
+    ) -> Self {
         let mut map: HashMap<String, Vec<PhraseEntry>> = HashMap::new();
-        for (code, text, weight, position) in records {
+        for (code, text, weight, position, is_system) in records {
             map.entry(code).or_default().push(PhraseEntry {
                 text,
                 weight,
                 position,
+                is_system,
             });
         }
         for v in map.values_mut() {
@@ -238,6 +250,7 @@ impl PhraseLayer {
         };
         let mut out = Vec::new();
         for e in entries {
+            let sys_start = out.len();
             if is_cmdbar_grammar(&e.text) {
                 // 命令栏路径：display 求值（纯函数 + last/clip 上下文，无副作用服务）。
                 let ctx = PhraseCtx {
@@ -259,6 +272,7 @@ impl PhraseLayer {
                         nav_code: None,
                         comment: String::new(),
                         source_text: e.text.clone(),
+                        is_system: false,
                     }),
                     Ok(PhraseEval::Array(arr)) => {
                         for el in arr.elements {
@@ -274,6 +288,10 @@ impl PhraseLayer {
                 }
             } else if let Some(text) = expand_template(&e.text, &now) {
                 out.push(PhraseHit::plain(text, e.weight).with_source(&e.text));
+            }
+            // 本条 entry 产出的所有 hit 继承其系统/用户归属。
+            for h in out[sys_start..].iter_mut() {
+                h.is_system = e.is_system;
             }
         }
         out
@@ -318,6 +336,7 @@ impl PhraseLayer {
             }
             let suffix = full_code[code.len()..].to_string();
             for e in entries {
+                let sys_start = out.len();
                 let phrase = match parse(&e.text) {
                     Ok(p) => p,
                     Err(_) => continue,
@@ -376,6 +395,10 @@ impl PhraseLayer {
                             .with_source(&e.text),
                         );
                     }
+                }
+                // 本条 entry 产出的所有导航 hit 继承其系统/用户归属。
+                for h in out[sys_start..].iter_mut() {
+                    h.is_system = e.is_system;
                 }
             }
         }
@@ -745,6 +768,7 @@ mod tests {
                 text: r#"{date("YYYY-MM-DD")}"#.into(),
                 weight: 1000,
                 position: 0,
+                is_system: false,
             }],
         );
         map.insert(
@@ -753,6 +777,7 @@ mod tests {
                 text: "{calc(\"1+2*3\")}".into(),
                 weight: 900,
                 position: 0,
+                is_system: false,
             }],
         );
         map.insert(
@@ -761,6 +786,7 @@ mod tests {
                 text: "$Y-$MM-$DD".into(),
                 weight: 800,
                 position: 0,
+                is_system: false,
             }],
         );
         // $CC 命令短语（有动作）：暂不显现（待动作执行通路），避免误上屏 display 标签。
@@ -770,6 +796,7 @@ mod tests {
                 text: r#"$CC("切简繁", ime.toggle("s2t"))"#.into(),
                 weight: 700,
                 position: 0,
+                is_system: false,
             }],
         );
         let layer = PhraseLayer { map };
@@ -849,6 +876,7 @@ mod tests {
                 text: r#"$SS("符号", "（）", "【】")"#.into(),
                 weight: 500,
                 position: 0,
+                is_system: false,
             }],
         );
         let layer = PhraseLayer { map };
@@ -873,6 +901,7 @@ mod tests {
                 text: r#"$AA("数字", "①②③")"#.into(),
                 weight: 500,
                 position: 0,
+                is_system: false,
             }],
         );
         let layer = PhraseLayer { map };
@@ -898,6 +927,7 @@ mod tests {
                 text: r#"$AA("标点", "、。")"#.into(),
                 weight: 500,
                 position: 0,
+                is_system: false,
             }],
         );
         map.insert(
@@ -906,6 +936,7 @@ mod tests {
                 text: r#"$AA("数字", "①②")"#.into(),
                 weight: 500,
                 position: 0,
+                is_system: false,
             }],
         );
         map.insert(
@@ -914,6 +945,7 @@ mod tests {
                 text: "无关".into(),
                 weight: 500,
                 position: 0,
+                is_system: false,
             }],
         );
         let layer = PhraseLayer { map };
@@ -937,6 +969,7 @@ mod tests {
                 text: r#"$AA("标点", "、。")"#.into(),
                 weight: 500,
                 position: 0,
+                is_system: false,
             }],
         );
         let layer = PhraseLayer { map };
@@ -957,6 +990,7 @@ mod tests {
                 text: r#"$CC("百度", open("https://baidu.com"))"#.into(),
                 weight: 500,
                 position: 0,
+                is_system: false,
             }],
         );
         map.insert(
@@ -965,6 +999,7 @@ mod tests {
                 text: r#"$CC("退出", type("x"), {prefix: false})"#.into(),
                 weight: 500,
                 position: 0,
+                is_system: false,
             }],
         );
         let layer = PhraseLayer { map };
@@ -989,6 +1024,7 @@ mod tests {
                 text: r#"$CC("剪贴板加词:{clip()}", type("x"))"#.into(),
                 weight: 500,
                 position: 0,
+                is_system: false,
             }],
         );
         let layer = PhraseLayer { map };
@@ -1009,6 +1045,7 @@ mod tests {
                 text: "$Y-$MM-$DD".into(),
                 weight: 500,
                 position: 0,
+                is_system: false,
             }],
         );
         let layer = PhraseLayer { map };
@@ -1029,6 +1066,7 @@ mod tests {
                 text: "$CC(last(), type(last()))".into(),
                 weight: 2000,
                 position: 0,
+                is_system: false,
             }],
         );
         let layer = PhraseLayer { map };
@@ -1042,8 +1080,8 @@ mod tests {
     #[test]
     fn from_records_builds_lookup() {
         let layer = PhraseLayer::from_records([
-            ("bj".to_string(), "北京".to_string(), 1000, 0),
-            ("bj".to_string(), "北京市".to_string(), 500, 1),
+            ("bj".to_string(), "北京".to_string(), 1000, 0, false),
+            ("bj".to_string(), "北京市".to_string(), 500, 1, true),
         ]);
         let hits = layer.lookup("bj", &[], &|_| String::new());
         // 两条同码，按 weight 降序
@@ -1073,6 +1111,7 @@ mod tests {
                 text: "user@example.com".into(),
                 weight: 800,
                 position: 0,
+                is_system: false,
             }],
         );
         // $CC 命令短语：码 yxbd，保证命令短语仍正常工作
@@ -1082,6 +1121,7 @@ mod tests {
                 text: r#"$CC("百度", open("https://baidu.com"))"#.into(),
                 weight: 500,
                 position: 0,
+                is_system: false,
             }],
         );
         let layer = PhraseLayer { map };

@@ -33,6 +33,10 @@ pub struct CandidateMeta {
     pub is_temp_dict: bool,
     pub raw_weight: i32,
     pub freq_boost: i32,
+    /// 短语来源归属：`is_phrase` 候选时有意义，true=系统短语，false=用户短语。
+    /// 仅供悬停调试提示区分来源（`wind_phrase::PhraseHit::is_system` 透传而来）。
+    #[serde(default)]
+    pub is_system_phrase: bool,
 }
 
 /// 命令栏动作
