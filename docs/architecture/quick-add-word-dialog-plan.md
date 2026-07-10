@@ -86,10 +86,11 @@ git commit -m "feat(addword): 新增 open_add_word_dialog 热键配置（默认 
 
 **Files:**
 - Modify: `wind_input/crates/wind-config/src/hotkey.rs`（CHINESE_ONLY key_down 组，约 119-131）
+- Modify: `wind_input/crates/wind-config/src/config_schema.rs`（keys 字段登记表，`keys.add_word` 约 181）
 
 **Interfaces:**
 - Consumes: `KeysConfig.open_add_word_dialog`（Task 1）。
-- Produces: action 串 `"open_add_word_dialog"` 注册进 key_down（`HOTKEY_POLICY_CHINESE_ONLY`）。
+- Produces: action 串 `"open_add_word_dialog"` 注册进 key_down（`HOTKEY_POLICY_CHINESE_ONLY`）；config_schema 登记 `keys.open_add_word_dialog`（供 schema 校验/设置页清单识别，与 `keys.add_word` 一致）。
 
 - [ ] **Step 1: 写失败测试**（hotkey.rs 末尾 `#[cfg(test)] mod tests` 内；若无则新建）
 
@@ -130,11 +131,25 @@ Expected: FAIL（action 未注册）。
 Run: `cd wind_input && cargo test -p wind-config open_add_word_dialog_registered`
 Expected: PASS。
 
-- [ ] **Step 5: 提交**
+- [ ] **Step 5: 登记 config_schema 字段**（config_schema.rs，`f("keys.add_word", Str),` 那行之后，约 181）
+
+```rust
+    f("keys.add_word", Str),
+    f("keys.open_add_word_dialog", Str),
+```
+
+> 与 `keys.add_word` 同类型（`Str`）。此登记让新字段被 schema 校验识别、并在设置「按键」页清单中可见（与原 Go「打开加词界面」项对齐）。
+
+- [ ] **Step 6: 编译验证**
+
+Run: `cd wind_input && cargo build -p wind-config`
+Expected: 编译通过。
+
+- [ ] **Step 7: 提交**
 
 ```bash
-git add wind_input/crates/wind-config/src/hotkey.rs
-git commit -m "feat(addword): open_add_word_dialog 编译进 chinese-only 热键组"
+git add wind_input/crates/wind-config/src/hotkey.rs wind_input/crates/wind-config/src/config_schema.rs
+git commit -m "feat(addword): open_add_word_dialog 编译进 chinese-only 热键组 + config_schema 登记"
 ```
 
 ---
