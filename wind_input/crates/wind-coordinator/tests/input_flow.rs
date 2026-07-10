@@ -414,6 +414,117 @@ fn test_z_not_trigger_stays_normal() {
     }
 }
 
+/// z 临拼模式下切中英文：应遵循 keys.commit_on_switch —— 开启（默认）时把拼音原码上屏，
+/// 而非无条件清空（回归保护：此前 take_input_on_mode_switch 独占分支对临拼恒返回空串）。
+#[test]
+fn test_temp_pinyin_commit_on_mode_switch() {
+    if !has_schemas() {
+        return;
+    }
+    let mut cfg = config_with("wubi86");
+    cfg.input.temp_pinyin.enabled = true;
+    cfg.input.temp_pinyin.trigger_keys = vec!["z".into()];
+    cfg.keys.commit_on_switch = true;
+    let coord = Coordinator::new_headless(cfg, Some(&data_dir()));
+    // 进入 z 临拼，缓冲拼音码 nihao（不选词、不上屏）。
+    for c in "znihao".chars() {
+        press_letter(&coord, c);
+    }
+    // 左 Shift 释放：中→英切换，commit_on_switch=true → 应上屏拼音原码 nihao。
+    let act = coord.handle_key_event(&key_event(0xA0, EVENT_KEY_UP));
+    let text = action_text(&act).unwrap_or_default();
+    assert_eq!(
+        text, "nihao",
+        "临拼切英文应按 commit_on_switch 上屏原码 nihao，实际: {:?}",
+        act
+    );
+    assert!(!coord.is_chinese_mode(), "左 Shift 应切到英文");
+}
+
+/// 关闭 commit_on_switch 时：临拼切中英文应清空，不上屏原码。
+#[test]
+fn test_temp_pinyin_no_commit_on_mode_switch_when_disabled() {
+    if !has_schemas() {
+        return;
+    }
+    let mut cfg = config_with("wubi86");
+    cfg.input.temp_pinyin.enabled = true;
+    cfg.input.temp_pinyin.trigger_keys = vec!["z".into()];
+    cfg.keys.commit_on_switch = false;
+    let coord = Coordinator::new_headless(cfg, Some(&data_dir()));
+    for c in "znihao".chars() {
+        press_letter(&coord, c);
+    }
+    let act = coord.handle_key_event(&key_event(0xA0, EVENT_KEY_UP));
+    let text = action_text(&act).unwrap_or_default();
+    assert!(
+        text.is_empty(),
+        "commit_on_switch=false 时临拼切换应清空，实际上屏: {:?}",
+        text
+    );
+}
+
+/// 只按了模式进入符（缓冲空）时切英文：应像回车一样原样上屏该前缀符号，而非清空。
+/// commit_on_switch=on（上屏编码选项）时对齐回车空缓冲上屏语义。
+#[test]
+fn test_temp_pinyin_prefix_only_commits_symbol_on_switch() {
+    if !has_schemas() {
+        return;
+    }
+    let mut cfg = config_with("wubi86");
+    cfg.keys.commit_on_switch = true;
+    let coord = Coordinator::new_headless(cfg, Some(&data_dir()));
+    // 只按反引号进入临拼（缓冲空，只有前缀 `）。
+    coord.handle_key_event(&key_event(0xC0, EVENT_KEY_DOWN));
+    // 左 Shift 释放切英文：应上屏前缀符号 `（与回车空缓冲上屏一致）。
+    let act = coord.handle_key_event(&key_event(0xA0, EVENT_KEY_UP));
+    let text = action_text(&act).unwrap_or_default();
+    assert_eq!(
+        text, "`",
+        "只按进入符切英文应上屏该符号 `，实际: {:?}",
+        act
+    );
+    assert!(!coord.is_chinese_mode(), "左 Shift 应切到英文");
+}
+
+/// 快捷输入只按进入符 ; 时切英文：应像回车一样原样上屏 ;（非中文 ；）。
+#[test]
+fn test_quick_input_prefix_only_commits_symbol_on_switch() {
+    if !has_schemas() {
+        return;
+    }
+    let mut cfg = config_with("wubi86");
+    cfg.keys.commit_on_switch = true;
+    let coord = Coordinator::new_headless(cfg, Some(&data_dir()));
+    coord.handle_key_event(&key_event(0xBA, EVENT_KEY_DOWN)); // ; 进入快捷输入（空缓冲）
+    let act = coord.handle_key_event(&key_event(0xA0, EVENT_KEY_UP));
+    let text = action_text(&act).unwrap_or_default();
+    assert_eq!(
+        text, ";",
+        "只按进入符 ; 切英文应原样上屏 ;，实际: {:?}",
+        act
+    );
+}
+
+/// 关闭 commit_on_switch 时：只按进入符切英文应清空，不上屏符号。
+#[test]
+fn test_prefix_only_no_commit_on_switch_when_disabled() {
+    if !has_schemas() {
+        return;
+    }
+    let mut cfg = config_with("wubi86");
+    cfg.keys.commit_on_switch = false;
+    let coord = Coordinator::new_headless(cfg, Some(&data_dir()));
+    coord.handle_key_event(&key_event(0xC0, EVENT_KEY_DOWN)); // ` 进入临拼（空缓冲）
+    let act = coord.handle_key_event(&key_event(0xA0, EVENT_KEY_UP));
+    let text = action_text(&act).unwrap_or_default();
+    assert!(
+        text.is_empty(),
+        "commit_on_switch=false 时只按进入符切英文应清空，实际上屏: {:?}",
+        text
+    );
+}
+
 /// 断言某次分隔符键返回的动作**未**把 `'` 压入组合区。
 fn separator_not_inserted(act: &KeyAction) -> bool {
     !matches!(act, KeyAction::UpdateComposition { text, .. } if text.contains('\''))
@@ -1014,6 +1125,53 @@ fn press_vk(coord: &Coordinator, vk: u32, shift: bool) -> KeyAction {
         ev.modifiers = 0x0001;
     }
     coord.handle_key_event(&ev)
+}
+
+/// 快捷输入模式下切中英文：与临拼一致，遵循 keys.commit_on_switch —— 开启（默认）时把
+/// 剩余原码上屏（前缀 ; 不输出），而非无条件清空（回归保护：独占分支曾对 mix 恒返回空串）。
+#[test]
+fn test_quick_input_commit_on_mode_switch() {
+    if !has_schemas() {
+        return;
+    }
+    let mut cfg = config_with("wubi86");
+    cfg.keys.commit_on_switch = true;
+    let coord = Coordinator::new_headless(cfg, Some(&data_dir()));
+    coord.handle_key_event(&key_event(0xBA, EVENT_KEY_DOWN)); // ; 进入快捷输入
+    press_vk(&coord, 0x31, false); // 1
+    press_vk(&coord, 0xBB, true); // +
+    press_vk(&coord, 0x32, false); // 2
+    // 左 Shift 释放：中→英切换，commit_on_switch=true → 上屏原码 1+2（前缀 ; 不输出）。
+    let act = coord.handle_key_event(&key_event(0xA0, EVENT_KEY_UP));
+    let text = action_text(&act).unwrap_or_default();
+    assert_eq!(
+        text, "1+2",
+        "快捷输入切英文应按 commit_on_switch 上屏原码 1+2，实际: {:?}",
+        act
+    );
+    assert!(!coord.is_chinese_mode(), "左 Shift 应切到英文");
+}
+
+/// 关闭 commit_on_switch 时：快捷输入切中英文应清空，不上屏原码。
+#[test]
+fn test_quick_input_no_commit_on_mode_switch_when_disabled() {
+    if !has_schemas() {
+        return;
+    }
+    let mut cfg = config_with("wubi86");
+    cfg.keys.commit_on_switch = false;
+    let coord = Coordinator::new_headless(cfg, Some(&data_dir()));
+    coord.handle_key_event(&key_event(0xBA, EVENT_KEY_DOWN)); // ; 进入快捷输入
+    press_vk(&coord, 0x31, false); // 1
+    press_vk(&coord, 0xBB, true); // +
+    press_vk(&coord, 0x32, false); // 2
+    let act = coord.handle_key_event(&key_event(0xA0, EVENT_KEY_UP));
+    let text = action_text(&act).unwrap_or_default();
+    assert!(
+        text.is_empty(),
+        "commit_on_switch=false 时快捷输入切换应清空，实际上屏: {:?}",
+        text
+    );
 }
 
 #[test]

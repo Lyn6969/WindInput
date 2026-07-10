@@ -2680,7 +2680,12 @@ impl Coordinator {
     /// 切换中英文时取消当前输入：清空缓冲/候选/preedit，并按 `hotkeys.commit_on_switch`
     /// 决定是否把已输入的原始编码上屏（仅在切到英文且有待输入时）。返回待上屏文本。
     fn take_input_on_mode_switch(&self, state: &mut State, chinese: bool) -> String {
-        // 独占模式优先：临时英文残留按“模式切换上屏”语义提交，临时拼音/快捷输入丢弃。
+        // 独占模式的「模式切换上屏」策略：
+        // - 临时英文：残留缓冲按模式切换语义无条件提交（英文原文，可全角）。
+        // - 临时拼音 / mix（含快捷输入）：与下方普通组合一致，遵循 keys.commit_on_switch——
+        //   切英文且有待输入且开关开时上屏「已转换前缀 committed_text + 剩余原码缓冲」，否则
+        //   清空；触发键前缀（`/;）不输出，与各自回车上屏一致。
+        // - 其余独占模式（网址）：丢弃。
         // 独占模式下 input_buffer 必为空，与下方普通组合分支互斥，故在此提前返回。
         if state.active.is_some() {
             let text = if state.active == Some(ModeKind::TempEnglish)
@@ -2690,6 +2695,37 @@ impl Coordinator {
                     to_full_width(&state.temp_english_buffer)
                 } else {
                     state.temp_english_buffer.clone()
+                }
+            } else if let Some((buf, prefix)) = match state.active {
+                Some(ModeKind::TempPinyin) => {
+                    Some((state.temp_pinyin_buffer.clone(), state.temp_pinyin_prefix.clone()))
+                }
+                Some(ModeKind::Mix(_)) => {
+                    Some((state.mix_buffer.clone(), state.mix_prefix.clone()))
+                }
+                _ => None,
+            } {
+                // 临拼 / mix：镜像普通组合的 commit_on_switch，且对齐各自的回车上屏语义。
+                let has_pending = !buf.is_empty() || !state.committed_text.is_empty();
+                if !chinese && self.rt().config.keys.commit_on_switch {
+                    if has_pending {
+                        // 有待输入：上屏「已转换前缀 committed_text + 剩余原码」；触发键前缀不输出。
+                        // committed 段已在选词时记过，此处只记剩余原码（来源模式切换）。
+                        self.record_commit(&buf, buf.len() as u32, -1, CommitSource::ModeSwitch);
+                        let raw = format!("{}{}", state.committed_text, buf);
+                        self.maybe_s2t(state, &raw)
+                    } else if !prefix.is_empty()
+                        && self.rt().config.input.enter_behavior != "clear"
+                    {
+                        // 只按了模式进入符（缓冲空）：原样上屏该前缀符号本身，与回车空缓冲上屏一致
+                        // （enter_behavior=clear 时回车也不上屏，故一并放弃）。
+                        self.record_commit(&prefix, 0, -1, CommitSource::Punctuation);
+                        prefix
+                    } else {
+                        String::new()
+                    }
+                } else {
+                    String::new()
                 }
             } else {
                 String::new()
