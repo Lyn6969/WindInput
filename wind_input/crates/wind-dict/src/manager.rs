@@ -61,6 +61,8 @@ pub struct SystemDictLayer {
     dict: CachedDict,
     name: String,
     enabled: std::sync::atomic::AtomicBool,
+    /// natural_order 层基偏移（见 DictLayer::base_order）。设计者经 [[dictionaries]].base_order 配置。
+    base_order: i32,
 }
 
 impl SystemDictLayer {
@@ -75,7 +77,14 @@ impl SystemDictLayer {
             dict,
             name: name.into(),
             enabled: std::sync::atomic::AtomicBool::new(enabled),
+            base_order: 0,
         }
+    }
+
+    /// 链式设置层基偏移（`[[dictionaries]].base_order`）。默认 0。
+    pub fn with_base_order(mut self, base_order: i32) -> Self {
+        self.base_order = base_order;
+        self
     }
 
     /// 系统层条目总数（日志/调试用）。
@@ -104,6 +113,10 @@ impl DictLayer for SystemDictLayer {
     fn set_enabled(&self, enabled: bool) {
         self.enabled
             .store(enabled, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    fn base_order(&self) -> i32 {
+        self.base_order
     }
 
     fn search(&self, code: &str, limit: usize) -> Vec<Candidate> {

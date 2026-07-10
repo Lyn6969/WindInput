@@ -1,8 +1,12 @@
-# 码表候选排序：基础排序全局化 + 中英文/字词分组 + 词库基序
+# 码表候选排序：出现序全局化 + base_sort 接线 + 词库基序 base_order
 
+> **最终交付状态见 §12（权威）。** §3–§11 是设计探索记录，其中的 `sort_grouping`/`group_rank`/
+> `dict_base_order`/`category_rank` 等方案**未采纳**——中英文/字词分组（G4）已砍掉，词库基序改为
+> `[[dictionaries]].base_order` 显式配置。以 §12 为准。
+>
 > 本文是 `docs/redesign/frequency.md`（词频/排序权威设计）**第一层"基础排序 `base_sort`"的细化与修订**。
-> frequency.md 定义了两层关系：第一层 `base_sort`（weight | natural）、第二层用户词频 `user_frequency`。
-> 本文只处理**第一层基础排序**的三个缺陷与增强，不改动第二层词频语义（`freq_rerank` / `protect_top_n` 照旧）。
+> frequency.md 定义两层：第一层 `base_sort`（weight | natural）、第二层用户词频 `user_frequency`。
+> 本文只处理**第一层基础排序**，不改动第二层词频语义（`freq_rerank` / `protect_top_n` 照旧）。
 
 ## 1. 问题陈述（用户诉求）
 
@@ -15,8 +19,8 @@
 
 ### 2.1 运行期排序链路（权威路径）
 
-码表方案的真实运行期引擎是 `CodeTableEngine`（`wind-engine/src/codetable/engine.rs`），持有 `Arc<DictManager>`。
-（注：`wind-engine/src/codetable/mod.rs` 中另有一个用 `weight_sort_key` 的 `CodetableEngine`，是旁支/历史实现，运行期码表方案不走它。）
+码表方案的运行期引擎是 `CodeTableEngine`（`wind-engine/src/codetable/engine.rs`），持有 `Arc<DictManager>`。
+`codetable/` 模块仅含 `mod.rs` + `engine.rs`——排序权威就是 `candidate::better` 与 `convert()` 里的 `sort_by`。
 
 ```
 方案配置 [[dictionaries]]（主库 default=true，扩展库 default_enabled）
@@ -235,10 +239,23 @@ weight_as_order = true      # 该库无真实权重，weight 列即同码内序�
 - 回归测试 `datformat::tests::prefix_no_weight_sorts_by_global_order_not_code`：构造 order 与字母序相反、同权，断言前缀查询按出现序（Z,M,A）而非字母序（A,M,Z）。
 - 验证：wind-dict 28+2、wind-engine 119+17 测试全绿；整 workspace 编译通过。
 
-### 阶段二：词库基序（G3 扩展在基础后）— ✅ 基本已具备（既有机制 + 阶段一强化）
-- **关键发现**：`CompositeDict::merge_search` 早已实现 `PER_LAYER_NO_OFFSET` 每层 natural_order 偏移（composite.rs），`load_codetable_layers` 主库置首、扩展库其后注册，故等权/无权时扩展恒在基础之后——需求②的核心已由既有层序机制满足（已有测试 `composite::tests::distinct_text_kept_and_layer_order_breaks_ties` 覆盖）。
-- 阶段一把 `natural_order` 从"叶内序号"升级为"全局文件序（0..数百万）"后，`PER_LAYER_NO_OFFSET` 由 `1e7 → 1e8`，避免超大词库层内序溢出到相邻层带。
-- 故**无需**新增 `Candidate.group_rank` 字段与 `dict_base_order` 配置（原阶段二计划取消）；当前实现等价于"弱基序"（层序在等权时生效，不硬压扩展库高频词）。若日后需要"强基序"（扩展恒在基础全部之后，无视权重），再引入显式配置。
+### 阶段二：`base_sort` 接线（G4「基础排序」）— ✅ 已完成
+- **发现**：`base_sort` 原为**死配置**（schema.rs 定义、全代码零消费），`base_sort="natural"` 从未生效。
+- `wind-candidate/candidate.rs`：新增 `by_natural` 比较器——纯按 `natural_order`（出现序）升序、**忽略权重**，code/text 兜底（区别于 `better_natural` 的"精确优先+权重兜底"）。
+- `codetable/engine.rs`：新增 `BaseSort { Weight(默认) | Natural }` 枚举（`parse` 解析配置串）+ `CommitOptions.base_sort`；`convert()` 的三处 `sort_by` 改用 `base_sort.cmp()` 选择的比较器。
+- `wind-engine/manager.rs`：`CommitOptions` 构造处从 `schema.engine.codetable.base_sort` 解析注入。
+- 测试 `base_sort_natural_ignores_weight_uses_appearance_order` / `base_sort_parse_maps_strings`。
+- 语义：`weight`（默认，零回归）= 现 `better()`；`natural` = 纯出现序、忽略权重（"设计者按文件顺序排"）。
 
-### 阶段三：中英文/单字·词分组（G4）— ⏳ 待实现
-- 仍需在 `convert()` 排序前计算 `category_rank` 并接入比较器 + `schema.rs` 配置（`sort_grouping`/`group_order`）。这是尚未落地的增量，待决策点 §11-②（判定粒度：`source=English` vs `text` 脚本判定）后实施。
+### 阶段三：词库基序 `base_order`（G3 扩展在基础后）— ✅ 已完成（重设计）
+- **按用户定稿**：**删除** `PER_LAYER_NO_OFFSET`（旧的"按注册位置 × 常量"太死板），改为 `[[dictionaries]]` 显式配置 `base_order`（如 `base_order = 50000`），设计者自定层偏移。
+- `DictSpec.base_order: i32`（默认 0）；`DictLayer::base_order()`（默认 0）；`SystemDictLayer` 加字段 + `with_base_order` builder；`CompositeDict::merge_search` 用 `layer.base_order()` 作 `natural_order += offset`（取代 `layer_idx * PER_LAYER_NO_OFFSET`）。
+- `load_codetable_layers` 返回并透传各库 `base_order`（主库 + 扩展 + english 路径均接线）。
+- 测试 `composite::tests::distinct_text_kept_and_base_order_breaks_ties`（文本序与期望相反，证明由 base_order 而非文本决定）。
+- **回归提示**：删 `PER_LAYER_NO_OFFSET` 后，**默认（不配 base_order）扩展库不再自动排在基础库之后**，按 natural_order 与基础库交错。现有依赖"自动靠后"的多词库方案需给扩展库显式补 `base_order`。这是"从自动改为显式"的有意变更（用户已确认）。
+
+### G4「中英文/单字·词分组」— ✂️ 已砍掉
+- **决策（用户）**：分组无存在理由。同一码表内**不区分中英文、只按设计顺序**；跨库先后由 `base_order` 显式控制。设计者用"文件出现序（阶段一保证）+ base_order（阶段三）+ base_sort=natural（阶段二）"已能完全掌控排序，分组反而与之打架。仅当需要"跨库强制把某类候选统一提前"（文件序表达不了的正交桶排序）才需要——当前无此场景，故不实现。
+
+### 校勘
+- 本文早期版本（工具异常期）曾提及 `weight.rs`/`weight_sort_key`/`segment.rs`/`prefix_scan.rs`/`mod.rs` 中的 `CodetableEngine` 等——经核实**均不存在**（`codetable/` 仅 `mod.rs` + `engine.rs`），系误记，已更正。排序权威唯 `candidate::better`/`by_natural` + `CodeTableEngine::convert`。

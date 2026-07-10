@@ -165,6 +165,11 @@ pub struct DictSpec {
     /// 权重归一化参数（[dictionaries.weight_spec]）
     #[serde(default)]
     pub weight_spec: Option<WeightSpec>,
+    /// 该词库候选的 natural_order **基偏移**：合并时 `natural_order += base_order`。等权/
+    /// `base_sort=natural` 时决定库间先后。设计者显式配置（如 50000 把该扩展库整体压到基础库后）。
+    /// 默认 0 = 不偏移（未配置时各库不强制分带，取代旧的按注册顺序自动偏移）。
+    #[serde(default)]
+    pub base_order: i32,
 }
 
 /// 权重归一化（[dictionaries.weight_spec]）

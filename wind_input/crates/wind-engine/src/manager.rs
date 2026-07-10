@@ -1403,10 +1403,11 @@ impl EngineManager {
             }
             // 英文暂不挂用户词 / 临时词层（无造词学习），仅系统词库层。
             let dm = wind_dict::DictManager::new();
-            for (name, dict, enabled) in layers {
-                dm.register_layer(Box::new(wind_dict::SystemDictLayer::with_enabled(
-                    dict, name, enabled,
-                )));
+            for (name, dict, enabled, base_order) in layers {
+                dm.register_layer(Box::new(
+                    wind_dict::SystemDictLayer::with_enabled(dict, name, enabled)
+                        .with_base_order(base_order),
+                ));
             }
             // 英文最大码长取词库最长词的安全上界（前缀匹配用，不触发顶码/自动上屏）。
             let mcl = if schema.engine.codetable.max_code_length > 0 {
@@ -1518,6 +1519,8 @@ impl EngineManager {
                 show_code_hint: eff.show_code_hint,
                 single_code_input: eff.single_code_input,
                 single_code_complete: eff.single_code_complete,
+                // 基础排序：[engine.codetable].base_sort（"natural" → 纯出现序、忽略权重；默认 weight）。
+                base_sort: crate::codetable::BaseSort::parse(&schema.engine.codetable.base_sort),
             };
             // 码表引擎经 DictManager(CompositeDict) 查询。系统词库不再合并成单个 combined，
             // 而是主库 + 每个扩展（含禁用）各自一个 System 层，查询期由 composite 合并去重。
@@ -1540,10 +1543,12 @@ impl EngineManager {
                 )));
             }
             // 主库优先注册（在 load_codetable_layers 中已置首），扩展库其后。
-            for (name, dict, enabled) in layers {
-                dm.register_layer(Box::new(wind_dict::SystemDictLayer::with_enabled(
-                    dict, name, enabled,
-                )));
+            // base_order（[[dictionaries]].base_order）决定等权/natural 排序时的库间基序。
+            for (name, dict, enabled, base_order) in layers {
+                dm.register_layer(Box::new(
+                    wind_dict::SystemDictLayer::with_enabled(dict, name, enabled)
+                        .with_base_order(base_order),
+                ));
             }
             Some(Box::new(CodeTableEngine::new(
                 mcl,
@@ -1598,7 +1603,7 @@ impl EngineManager {
     fn load_codetable_layers(
         schema: &Schema,
         schemas_dir: &Path,
-    ) -> Vec<(String, CachedDict, bool)> {
+    ) -> Vec<(String, CachedDict, bool, i32)> {
         let resolve = |rel: &str| -> std::path::PathBuf {
             if let Some(u) = Config::user_config_dir() {
                 let p = u.join("schemas").join(rel);
@@ -1633,7 +1638,7 @@ impl EngineManager {
             }
         };
 
-        let mut out: Vec<(String, CachedDict, bool)> = Vec::new();
+        let mut out: Vec<(String, CachedDict, bool, i32)> = Vec::new();
         // 主库优先注册。加载失败 → 无系统层可用，放弃整方案（避免无候选）。
         match load_one(usable[main_idx]) {
             Some(d) => {
@@ -1642,7 +1647,12 @@ impl EngineManager {
                     usable[main_idx].path,
                     d.len()
                 );
-                out.push(("codetable-system".to_string(), d, true));
+                out.push((
+                    "codetable-system".to_string(),
+                    d,
+                    true,
+                    usable[main_idx].base_order,
+                ));
             }
             None => return Vec::new(),
         }
@@ -1660,7 +1670,7 @@ impl EngineManager {
                     enabled,
                     d.len()
                 );
-                out.push((format!("codetable-extra-{}", e.id), d, enabled));
+                out.push((format!("codetable-extra-{}", e.id), d, enabled, e.base_order));
             }
         }
         out

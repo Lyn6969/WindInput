@@ -40,6 +40,16 @@ pub trait DictLayer: Send + Sync {
     /// 运行时启停该层（支持热插拔的层覆盖此方法；默认 no-op）。
     /// 取 `&self`（内部用原子标志），故无需重建引擎即可即时生效。
     fn set_enabled(&self, _enabled: bool) {}
+
+    /// 该层候选的 `natural_order` **基偏移**：合并各层时 `natural_order += base_order()`。
+    /// 等权重（或 `base_sort = "natural"`）时决定**层间先后**——设计者在 `[[dictionaries]]`
+    /// 配 `base_order`（如 50000 把某扩展库整体压到基础库之后）。默认 0 = 不偏移。
+    ///
+    /// 取代旧的 `PER_LAYER_NO_OFFSET`（按注册位置 × 常量）机制：偏移量由设计者显式配置，
+    /// 不再依赖词库的注册/出现顺序。默认 0 意味着**未配置时各库不强制分带**（可能交错）。
+    fn base_order(&self) -> i32 {
+        0
+    }
 }
 
 /// 可变词典层接口

@@ -154,6 +154,19 @@ pub fn better_natural(a: &Candidate, b: &Candidate) -> std::cmp::Ordering {
     }
 }
 
+/// 比较两个候选词的**纯自然序**优先级（`base_sort = "natural"` 用）：**完全忽略权重**，
+/// 只按 `natural_order`（词库出现序，含 base_order 层偏移）升序，再以 code/text 作稳定兜底。
+///
+/// 与 `better_natural` 的区别：后者精确匹配优先且以 `better`（权重）兜底；本函数不看权重，
+/// 纯按设计者在词库文件里的排列顺序呈现（对齐用户"只按设计顺序"的诉求）。
+pub fn by_natural(a: &Candidate, b: &Candidate) -> std::cmp::Ordering {
+    a.natural_order
+        .cmp(&b.natural_order)
+        .then(a.code.cmp(&b.code))
+        .then(a.consumed_length.cmp(&b.consumed_length).reverse())
+        .then(a.text.cmp(&b.text))
+}
+
 /// 排序候选词列表（权重降序）
 pub fn sort_candidates(candidates: &mut [Candidate]) {
     candidates.sort_by(better);

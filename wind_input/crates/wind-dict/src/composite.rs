@@ -7,15 +7,6 @@ use std::collections::HashMap;
 use std::sync::RwLock;
 use wind_candidate::Candidate;
 
-/// 每层 natural_order 偏移：等权重时让**声明序更靠前的层**(主库先于扩展、用户先于系统)
-/// 的候选排在前。取值需大于单层内最大 natural_order，使「层序」优先于「层内序」。
-/// 与 Go composite.go `perLayerNOOffset` 同义。
-///
-/// 取 1e8：wdat v3 起 natural_order = 词库**全局出现序**（0..单库条目数），超大词库可达数百万，
-/// 故偏移须显著大于单库最大条目数（旧值 1e7 对百万级词库余量不足，会溢出到相邻层带）。
-/// i32 上限 ~2.1e9 ÷ 1e8 ≈ 21 层，远超实际层数（主库+扩展+用户+临时）。
-const PER_LAYER_NO_OFFSET: i32 = 100_000_000;
-
 /// 多层复合词典
 #[derive(Default)]
 pub struct CompositeDict {
@@ -71,16 +62,16 @@ impl CompositeDict {
     ///   - 保留**高优先级层**(先出现)的词条信息(code/natural_order)；
     ///   - 但**继承后续层中同 text 的更高权重**(用户词不因低权重丢失码表词的自然排序位)；
     ///   - 前缀查询时，同 text 多码取**最短码**(离输入最近)及其更小 natural_order；
-    ///   - 每层叠加 `layer_idx * PER_LAYER_NO_OFFSET`，使无权重差时按层序排列。
+    ///   - 每层叠加该层 `base_order()`（设计者经 [[dictionaries]].base_order 配置），
+    ///     使等权/`base_sort=natural` 时按设计者指定的层间基序排列（取代旧的按注册位置偏移）。
     /// 与 Go composite.go `searchInternal` 对齐。
     fn merge_search(&self, query: &str, limit: usize, is_prefix: bool) -> Vec<Candidate> {
         let layers = self.layers.read().unwrap();
         let mut results: Vec<Candidate> = Vec::new();
         let mut seen: HashMap<String, usize> = HashMap::new();
 
-        for (layer_idx, layer) in layers.iter().enumerate() {
-            // 禁用层（如关闭的码表扩展词库）跳过；layer_idx 仍按位置计，
-            // 保持启用层之间的层序偏移稳定。
+        for layer in layers.iter() {
+            // 禁用层（如关闭的码表扩展词库）跳过。
             if !layer.enabled() {
                 continue;
             }
@@ -89,7 +80,8 @@ impl CompositeDict {
             } else {
                 layer.search(query, limit)
             };
-            let offset = (layer_idx as i32).saturating_mul(PER_LAYER_NO_OFFSET);
+            // 层基偏移：设计者显式配置的 base_order（默认 0）。
+            let offset = layer.base_order();
             for mut cand in layer_results {
                 cand.natural_order = cand.natural_order.saturating_add(offset);
                 if let Some(&idx) = seen.get(&cand.text) {
@@ -189,23 +181,51 @@ mod tests {
     }
 
     #[test]
-    fn distinct_text_kept_and_layer_order_breaks_ties() {
+    fn distinct_text_kept_and_base_order_breaks_ties() {
+        // 两层各一条不同 text、同权重、同层内 natural_order：由 base_order 决定层间先后。
+        // 文本序故意与期望相反（"主" < "扩"），以证明是 base_order 而非文本兜底决定顺序。
+        struct L {
+            name: String,
+            items: Vec<Candidate>,
+            base_order: i32,
+        }
+        impl DictLayer for L {
+            fn name(&self) -> &str {
+                &self.name
+            }
+            fn layer_type(&self) -> LayerType {
+                LayerType::System
+            }
+            fn base_order(&self) -> i32 {
+                self.base_order
+            }
+            fn search(&self, code: &str, _l: usize) -> Vec<Candidate> {
+                self.items.iter().filter(|c| c.code == code).cloned().collect()
+            }
+            fn search_prefix(&self, p: &str, _l: usize) -> Vec<Candidate> {
+                self.items
+                    .iter()
+                    .filter(|c| c.code.starts_with(p))
+                    .cloned()
+                    .collect()
+            }
+        }
         let c = CompositeDict::new();
-        // 两层各一条不同 text、同权重：靠前层(先注册)的应排前(natural_order 偏移更小)
-        c.register_layer(Box::new(MockLayer {
-            name: "system-main".into(),
-            ltype: LayerType::System,
-            items: vec![cand("主", "x", 100, 0)],
-        }));
-        c.register_layer(Box::new(MockLayer {
-            name: "system-extra".into(),
-            ltype: LayerType::System,
+        // 主库 base_order 0、文本"扩"（文本序更大）；扩展库 base_order 1000、文本"主"（文本序更小）。
+        c.register_layer(Box::new(L {
+            name: "main".into(),
+            base_order: 0,
             items: vec![cand("扩", "x", 100, 0)],
+        }));
+        c.register_layer(Box::new(L {
+            name: "extra".into(),
+            base_order: 1000,
+            items: vec![cand("主", "x", 100, 0)],
         }));
         let r = c.search("x", 10);
         assert_eq!(r.len(), 2);
-        assert_eq!(r[0].text, "主", "等权重时靠前层优先");
-        assert_eq!(r[1].text, "扩");
+        assert_eq!(r[0].text, "扩", "base_order 更小的主库应排前，即便其文本序更大");
+        assert_eq!(r[1].text, "主");
     }
 
     #[test]

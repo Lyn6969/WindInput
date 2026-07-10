@@ -8,8 +8,38 @@
 use crate::engine::{ConvertResult, Engine, EngineType, ExtendedEngine};
 use std::collections::HashSet;
 use std::sync::Arc;
-use wind_candidate::{Candidate, CandidateSource, better};
+use wind_candidate::{Candidate, CandidateSource, better, by_natural};
 use wind_dict::DictManager;
+
+/// 基础排序（`[engine.codetable].base_sort`）：候选**主排序维度**。
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum BaseSort {
+    /// 按词库权重降序（默认；等权回退 natural_order）。行为 = `candidate::better`。
+    #[default]
+    Weight,
+    /// 纯按 natural_order（词库出现序，含 base_order 层偏移）升序，**忽略权重**。
+    /// 行为 = `candidate::by_natural`。用于"设计者按文件顺序排、不用权重"的词库。
+    Natural,
+}
+
+impl BaseSort {
+    /// 解析配置字符串：`"natural"` → Natural，其余（含空/`"weight"`）→ Weight。
+    pub fn parse(s: &str) -> Self {
+        if s.eq_ignore_ascii_case("natural") {
+            Self::Natural
+        } else {
+            Self::Weight
+        }
+    }
+
+    /// 该模式对应的候选比较器。
+    fn cmp(self) -> fn(&Candidate, &Candidate) -> std::cmp::Ordering {
+        match self {
+            Self::Weight => better,
+            Self::Natural => by_natural,
+        }
+    }
+}
 
 /// 码表上屏策略配置（schema 的 [engine.codetable] 相关开关）。
 #[derive(Clone, Copy, Debug, Default)]
@@ -28,6 +58,8 @@ pub struct CommitOptions {
     pub single_code_input: bool,
     /// 精确匹配空码补全：精确无候选且未满码时，从更长编码取首选（对齐 Go SingleCodeComplete）。
     pub single_code_complete: bool,
+    /// 基础排序维度（weight 降序 / natural 出现序）。见 [`BaseSort`]。
+    pub base_sort: BaseSort,
 }
 
 /// 码表引擎
@@ -138,20 +170,22 @@ impl Engine for CodeTableEngine {
             }
         }
 
-        candidates.sort_by(better);
-        // 截断保护精确匹配：单字母等短输入下前缀候选可达数百，若纯按权重截断，低权重的精确
-        // 全码（code==input，如五笔一/二级简码）会被高权重前缀词组挤出配额而丢失（此后协调器
-        // 再排也找不回）。仅在超额时做一次「精确优先」稳定分区截断——精确候选必留、其余按 better
-        // 序填满剩余配额——再恢复 better 显示序。不持久化 is_prefix：跨来源权重档位（混输码表
-        // ÷100 拼音等）不受影响，纯码表显示序也维持权重主导。
+        // 基础排序维度：weight（默认，better）或 natural（by_natural，纯出现序、忽略权重）。
+        let base_cmp = self.opts.base_sort.cmp();
+        candidates.sort_by(base_cmp);
+        // 截断保护精确匹配：单字母等短输入下前缀候选可达数百，若纯按基础序截断，靠后的精确
+        // 全码（code==input，如五笔一/二级简码）会被前缀词组挤出配额而丢失（此后协调器
+        // 再排也找不回）。仅在超额时做一次「精确优先」稳定分区截断——精确候选必留、其余按
+        // base_cmp 序填满剩余配额——再恢复 base_cmp 显示序。不持久化 is_prefix：跨来源权重档位
+        // （混输码表 ÷100 拼音等）不受影响，纯码表显示序也维持基础排序主导。
         if candidates.len() > max_candidates {
             candidates.sort_by(|a, b| {
                 (a.code != input)
                     .cmp(&(b.code != input))
-                    .then_with(|| better(a, b))
+                    .then_with(|| base_cmp(a, b))
             });
             candidates.truncate(max_candidates);
-            candidates.sort_by(better);
+            candidates.sort_by(base_cmp);
         }
 
         // 编码提示(码表自身):前缀候选标注「剩余编码」=候选全码去掉已输入前缀(对齐 Go codetable.go)。
@@ -486,5 +520,46 @@ mod tests {
         );
         let r = e.convert("ab", 50).unwrap();
         assert!(r.is_empty, "补全关闭时无精确匹配应为空");
+    }
+
+    #[test]
+    fn base_sort_natural_ignores_weight_uses_appearance_order() {
+        // 同码 "aa" 两候选：低权重"低"先出现（order 0）、高权重"高"后出现（order 1）。
+        let entries = &[("aa", "低", 1), ("aa", "高", 100)];
+        // natural：忽略权重，按出现序 → 低、高。
+        let e = engine_opts(
+            entries,
+            CommitOptions {
+                base_sort: BaseSort::Natural,
+                ..Default::default()
+            },
+        );
+        let t: Vec<String> = e
+            .convert("aa", 50)
+            .unwrap()
+            .candidates
+            .into_iter()
+            .map(|c| c.text)
+            .collect();
+        assert_eq!(t, vec!["低", "高"], "natural 应按出现序、忽略权重");
+        // weight（默认）：高权重在前 → 高、低。
+        let e2 = engine_opts(entries, CommitOptions::default());
+        let t2: Vec<String> = e2
+            .convert("aa", 50)
+            .unwrap()
+            .candidates
+            .into_iter()
+            .map(|c| c.text)
+            .collect();
+        assert_eq!(t2, vec!["高", "低"], "weight 应按权重降序");
+    }
+
+    #[test]
+    fn base_sort_parse_maps_strings() {
+        assert_eq!(BaseSort::parse("natural"), BaseSort::Natural);
+        assert_eq!(BaseSort::parse("Natural"), BaseSort::Natural);
+        assert_eq!(BaseSort::parse("weight"), BaseSort::Weight);
+        assert_eq!(BaseSort::parse(""), BaseSort::Weight);
+        assert_eq!(BaseSort::parse("xyz"), BaseSort::Weight);
     }
 }
