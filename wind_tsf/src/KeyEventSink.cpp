@@ -396,8 +396,10 @@ STDAPI CKeyEventSink::OnTestKeyDown(ITfContext* pContext, WPARAM wParam, LPARAM 
     // _needsCompositionResync: 上次 IPC 失败后强行视作有会话, 让 ENTER/ESC 也能发给 Go 重握手。
     BOOL hasInputSession = hasComposition || _hasCandidates || _IsResyncActive();
 
-    // English auto-pair: intercept bracket keys in English mode
-    if (!isChineseMode && _englishPairEngine.IsEnabled())
+    // English auto-pair: intercept bracket keys in English mode.
+    // Ctrl/Alt 组合留给热键/宿主（如 Ctrl+Shift+] open_settings），不做配对。
+    if (!isChineseMode && _englishPairEngine.IsEnabled()
+        && !(modifiers & (KEYMOD_CTRL | KEYMOD_ALT)))
     {
         bool hasShift = (modifiers & KEYMOD_SHIFT) != 0;
         wchar_t pairChar = _MapVkToEnglishPairChar(wParam, hasShift);
@@ -604,59 +606,65 @@ STDAPI CKeyEventSink::OnKeyDown(ITfContext* pContext, WPARAM wParam, LPARAM lPar
     // Check barrier timeout
     _CheckBarrierTimeout();
 
-    // English auto-pair handling (before toggle key detection and Go IPC)
+    // English auto-pair handling (before toggle key detection and Go IPC).
+    // 必须跳过 Ctrl/Alt 组合：否则 Ctrl+Shift+] 等功能热键在 OnTestKeyDown 已按
+    // 白名单吃键后，OnKeyDown 会被 auto-pair 当成 '}' 直接 InsertText，永远发不到 core
+    // （表现为英文模式上屏 }，中文正常；Ctrl+Shift+E / \ 不受影响因非配对字符）。
     if (!_pTextService->IsChineseMode() && _englishPairEngine.IsEnabled())
     {
         uint32_t mods = CHotkeyManager::GetCurrentModifiers();
-        bool hasShift = (mods & KEYMOD_SHIFT) != 0;
-        wchar_t pairChar = _MapVkToEnglishPairChar(wParam, hasShift);
-
-        if (pairChar != 0)
+        if (!(mods & (KEYMOD_CTRL | KEYMOD_ALT)))
         {
-            // Smart skip: right bracket matches stack top
-            if (_englishPairEngine.IsRight(pairChar))
+            bool hasShift = (mods & KEYMOD_SHIFT) != 0;
+            wchar_t pairChar = _MapVkToEnglishPairChar(wParam, hasShift);
+
+            if (pairChar != 0)
             {
-                PairEngine::Entry entry;
-                if (_englishPairEngine.Peek(entry) && entry.right == pairChar)
+                // Smart skip: right bracket matches stack top
+                if (_englishPairEngine.IsRight(pairChar))
                 {
-                    _englishPairEngine.Pop(entry);
-                    WIND_LOG_DEBUG_FMT(L"English auto-pair: smart skip '%c'\n", pairChar);
-                    _SimulatePairKey(VK_RIGHT);
+                    PairEngine::Entry entry;
+                    if (_englishPairEngine.Peek(entry) && entry.right == pairChar)
+                    {
+                        _englishPairEngine.Pop(entry);
+                        WIND_LOG_DEBUG_FMT(L"English auto-pair: smart skip '%c'\n", pairChar);
+                        _SimulatePairKey(VK_RIGHT);
+                        *pfEaten = TRUE;
+                        return S_OK;
+                    }
+                    // Stack doesn't match — clear and let the char through
+                    _englishPairEngine.Clear();
+                    // Fall through to insert the right bracket normally
+                }
+
+                // Auto-pair: left bracket
+                if (_englishPairEngine.IsLeft(pairChar))
+                {
+                    wchar_t rightChar = _englishPairEngine.GetRight(pairChar);
+                    if (rightChar != 0)
+                    {
+                        std::wstring pairText;
+                        pairText += pairChar;
+                        pairText += rightChar;
+
+                        WIND_LOG_DEBUG_FMT(L"English auto-pair: insert pair '%c%c'\n", pairChar, rightChar);
+                        _pTextService->CommitText(pairText);
+                        _SimulatePairKey(VK_LEFT);
+                        _englishPairEngine.Push(pairChar, rightChar);
+
+                        *pfEaten = TRUE;
+                        return S_OK;
+                    }
+                }
+
+                // Right bracket with no stack match: insert the character normally
+                if (_englishPairEngine.IsRight(pairChar))
+                {
+                    std::wstring ch(1, pairChar);
+                    _pTextService->InsertText(ch);
                     *pfEaten = TRUE;
                     return S_OK;
                 }
-                // Stack doesn't match — clear and let the char through
-                _englishPairEngine.Clear();
-                // Fall through to insert the right bracket normally
-            }
-
-            // Auto-pair: left bracket
-            if (_englishPairEngine.IsLeft(pairChar))
-            {
-                wchar_t rightChar = _englishPairEngine.GetRight(pairChar);
-                if (rightChar != 0)
-                {
-                    std::wstring pairText;
-                    pairText += pairChar;
-                    pairText += rightChar;
-
-                    WIND_LOG_DEBUG_FMT(L"English auto-pair: insert pair '%c%c'\n", pairChar, rightChar);
-                    _pTextService->CommitText(pairText);
-                    _SimulatePairKey(VK_LEFT);
-                    _englishPairEngine.Push(pairChar, rightChar);
-
-                    *pfEaten = TRUE;
-                    return S_OK;
-                }
-            }
-
-            // Right bracket with no stack match: insert the character normally
-            if (_englishPairEngine.IsRight(pairChar))
-            {
-                std::wstring ch(1, pairChar);
-                _pTextService->InsertText(ch);
-                *pfEaten = TRUE;
-                return S_OK;
             }
         }
     }
@@ -1278,8 +1286,9 @@ STDAPI CKeyEventSink::OnKeyTraceDown(WPARAM wParam, LPARAM lParam)
     // CapsLock 透传键直接到系统、不经 Go recordCommit，跳过下方去重检查。
     if (!capsLockPassthrough)
     {
-        // 1. English auto-pair check
-        if (_englishPairEngine.IsEnabled())
+        // 1. English auto-pair check（与 OnTestKeyDown/OnKeyDown 一致：Ctrl/Alt 不走配对）
+        if (_englishPairEngine.IsEnabled()
+            && !(modifiers & (KEYMOD_CTRL | KEYMOD_ALT)))
         {
             bool hasShift = (modifiers & KEYMOD_SHIFT) != 0;
             wchar_t pairChar = _MapVkToEnglishPairChar(wParam, hasShift);
