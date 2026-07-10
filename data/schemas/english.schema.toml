@@ -23,6 +23,7 @@ label = "英文主词库"
 path = "english/en.dict.yaml"
 type = "english"
 default = true
+base_order = 0
 
 [[dictionaries]]
 id = "en_ext"
@@ -30,3 +31,4 @@ label = "英文扩展词库"
 path = "english/en_ext.dict.yaml"
 type = "english"
 default_enabled = true
+base_order = 1

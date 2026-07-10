@@ -61,8 +61,12 @@ pub struct SystemDictLayer {
     dict: CachedDict,
     name: String,
     enabled: std::sync::atomic::AtomicBool,
-    /// natural_order 层基偏移（见 DictLayer::base_order）。设计者经 [[dictionaries]].base_order 配置。
+    /// 层级基序档位（见 DictLayer::base_order）。设计者经 [[dictionaries]].base_order 配置。
     base_order: i32,
+    /// 默认权重（`[[dictionaries]].default_weight`）：Some(w) 时**覆盖**本库所有条目的权重为 w。
+    /// 用于**无权重的附加库**——与带权重主库合并、按权重排序时，让其条目落在设计者选定的权重档，
+    /// 而非因 weight=0 全部沉底。None = 用词库自身权重。
+    default_weight: Option<i32>,
 }
 
 impl SystemDictLayer {
@@ -78,12 +82,19 @@ impl SystemDictLayer {
             name: name.into(),
             enabled: std::sync::atomic::AtomicBool::new(enabled),
             base_order: 0,
+            default_weight: None,
         }
     }
 
-    /// 链式设置层基偏移（`[[dictionaries]].base_order`）。默认 0。
+    /// 链式设置层基序档位（`[[dictionaries]].base_order`）。默认 0。
     pub fn with_base_order(mut self, base_order: i32) -> Self {
         self.base_order = base_order;
+        self
+    }
+
+    /// 链式设置默认权重（`[[dictionaries]].default_weight`）。Some(w) 覆盖本库所有条目权重。
+    pub fn with_default_weight(mut self, default_weight: Option<i32>) -> Self {
+        self.default_weight = default_weight;
         self
     }
 
@@ -120,6 +131,7 @@ impl DictLayer for SystemDictLayer {
     }
 
     fn search(&self, code: &str, limit: usize) -> Vec<Candidate> {
+        let dw = self.default_weight;
         let mut v: Vec<Candidate> = self
             .dict
             .search(code)
@@ -127,7 +139,7 @@ impl DictLayer for SystemDictLayer {
             .map(|(text, weight, order)| Candidate {
                 text,
                 code: code.to_string(),
-                weight,
+                weight: dw.unwrap_or(weight),
                 natural_order: order,
                 source: CandidateSource::None,
                 ..Default::default()
@@ -141,6 +153,7 @@ impl DictLayer for SystemDictLayer {
     }
 
     fn search_prefix(&self, prefix: &str, limit: usize) -> Vec<Candidate> {
+        let dw = self.default_weight;
         let mut v: Vec<Candidate> = self
             .dict
             .search_prefix(prefix, limit)
@@ -148,7 +161,7 @@ impl DictLayer for SystemDictLayer {
             .map(|(code, text, weight, order)| Candidate {
                 text,
                 code,
-                weight,
+                weight: dw.unwrap_or(weight),
                 natural_order: order,
                 source: CandidateSource::None,
                 ..Default::default()
@@ -184,5 +197,22 @@ mod tests {
         assert_eq!(exact[0].text, "工", "权重高者在前");
         // 前缀 a → a/aa
         assert!(dm.search_prefix("a", 10).len() >= 3);
+    }
+
+    #[test]
+    fn default_weight_overrides_all_entry_weights() {
+        // 无权重附加库场景：default_weight 覆盖本库所有条目权重，同权后按 natural_order 排。
+        let mut d = CodetableDict::empty();
+        d.merge_single("a".into(), "甲".into(), 5, 0); // order 0
+        d.merge_single("a".into(), "乙".into(), 999, 1); // order 1（权重更高，但会被覆盖）
+        let layer = SystemDictLayer::new(CachedDict::Memory(d), "ext").with_default_weight(Some(100));
+        let r = layer.search("a", 10);
+        assert_eq!(r.len(), 2);
+        assert!(
+            r.iter().all(|c| c.weight == 100),
+            "default_weight 应覆盖所有条目权重"
+        );
+        assert_eq!(r[0].text, "甲", "覆盖同权后按 natural_order 出现序");
+        assert_eq!(r[1].text, "乙");
     }
 }

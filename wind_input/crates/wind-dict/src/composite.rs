@@ -80,10 +80,10 @@ impl CompositeDict {
             } else {
                 layer.search(query, limit)
             };
-            // 层基偏移：设计者显式配置的 base_order（默认 0）。
-            let offset = layer.base_order();
+            // 层级基序档位：写入候选的 base_order 字段（独立排序层级，不折进 natural_order）。
+            let layer_base_order = layer.base_order();
             for mut cand in layer_results {
-                cand.natural_order = cand.natural_order.saturating_add(offset);
+                cand.base_order = layer_base_order;
                 if let Some(&idx) = seen.get(&cand.text) {
                     // 同 text 已存在：继承更高权重。注意 weight 可能来自后续低优先级层，而
                     // code/natural_order 仍保留首个出现层（高优先层）的值——跨层取值，刻意为之
@@ -226,6 +226,26 @@ mod tests {
         assert_eq!(r.len(), 2);
         assert_eq!(r[0].text, "扩", "base_order 更小的主库应排前，即便其文本序更大");
         assert_eq!(r[1].text, "主");
+    }
+
+    #[test]
+    fn layer_type_default_base_order_puts_nonsystem_before_system() {
+        // 默认 base_order 按层类型分带：等权时用户/临时层恒排在系统词库层之前。
+        let c = CompositeDict::new();
+        c.register_layer(Box::new(MockLayer {
+            name: "sys".into(),
+            ltype: LayerType::System,
+            items: vec![cand("系统", "x", 100, 0)],
+        }));
+        c.register_layer(Box::new(MockLayer {
+            name: "user".into(),
+            ltype: LayerType::User,
+            items: vec![cand("用户", "x", 100, 0)],
+        }));
+        let r = c.search("x", 10);
+        assert_eq!(r.len(), 2);
+        assert_eq!(r[0].text, "用户", "等权时用户层(默认带)应排在系统层前");
+        assert_eq!(r[1].text, "系统");
     }
 
     #[test]

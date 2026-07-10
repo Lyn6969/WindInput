@@ -247,12 +247,20 @@ weight_as_order = true      # 该库无真实权重，weight 列即同码内序�
 - 测试 `base_sort_natural_ignores_weight_uses_appearance_order` / `base_sort_parse_maps_strings`。
 - 语义：`weight`（默认，零回归）= 现 `better()`；`natural` = 纯出现序、忽略权重（"设计者按文件顺序排"）。
 
-### 阶段三：词库基序 `base_order`（G3 扩展在基础后）— ✅ 已完成（重设计）
-- **按用户定稿**：**删除** `PER_LAYER_NO_OFFSET`（旧的"按注册位置 × 常量"太死板），改为 `[[dictionaries]]` 显式配置 `base_order`（如 `base_order = 50000`），设计者自定层偏移。
-- `DictSpec.base_order: i32`（默认 0）；`DictLayer::base_order()`（默认 0）；`SystemDictLayer` 加字段 + `with_base_order` builder；`CompositeDict::merge_search` 用 `layer.base_order()` 作 `natural_order += offset`（取代 `layer_idx * PER_LAYER_NO_OFFSET`）。
-- `load_codetable_layers` 返回并透传各库 `base_order`（主库 + 扩展 + english 路径均接线）。
-- 测试 `composite::tests::distinct_text_kept_and_base_order_breaks_ties`（文本序与期望相反，证明由 base_order 而非文本决定）。
-- **回归提示**：删 `PER_LAYER_NO_OFFSET` 后，**默认（不配 base_order）扩展库不再自动排在基础库之后**，按 natural_order 与基础库交错。现有依赖"自动靠后"的多词库方案需给扩展库显式补 `base_order`。这是"从自动改为显式"的有意变更（用户已确认）。
+### 阶段三：词库基序 `base_order`（独立层级）+ `default_weight` — ✅ 已完成（重设计）
+
+**核心：base_order 是独立排序层级，不再加进 natural_order。** 排序键（字典序多级）：
+- `weight` 模式：`weight 降 → base_order 升 → natural_order 升 → code → text`
+- `natural` 模式：`base_order 升 → natural_order 升 → code → text`（忽略权重）
+
+- **删除** `PER_LAYER_NO_OFFSET`（旧的"按注册位置 × 1e8 常量"太死板）。原先曾把 `base_order` **加进** `natural_order`——但那要求 `base_order > 词库条目数`才有效（否则被大 natural_order 淹没），且重新引入魔法数。改为 base_order 作**独立层级**后，**小整数即可**分档（`base_order=1` 就排在 `0` 后，与条目数无关）。
+- `Candidate` 新增 `base_order: i32` 字段；`better`/`by_natural` 各加 base_order 级（**默认 0 时空操作** → 拼音/混输等不设 base_order 的路径零回归）。
+- `DictSpec.base_order: i32`（默认 0，小整数）；`DictLayer::base_order()` 默认按**层类型**给小整数档（Logic -4 / User -3 / Temp -2 / Cell -1 / System 0，非系统层恒在系统层前）；`SystemDictLayer.with_base_order` 覆盖为配置值；`CompositeDict::merge_search` 写 `cand.base_order = layer.base_order()`（不折进 natural_order）。
+- **`default_weight`**（新）：`[[dictionaries]].default_weight: Option<i32>`，Some(w) 时覆盖本库所有条目权重。用于**无权重的附加库**——与带权重主库按权重排序时，让其条目落在设计者选定的权重档而非 `weight=0` 沉底（`SystemDictLayer.with_default_weight` + search 中 `dw.unwrap_or(weight)`）。
+- `load_codetable_layers` 透传各库 `(base_order, default_weight)`（主库/扩展/english 路径均接线）。
+- 测试：`composite::distinct_text_kept_and_base_order_breaks_ties`、`composite::layer_type_default_base_order_puts_nonsystem_before_system`、`manager::default_weight_overrides_all_entry_weights`。
+- **回归提示**：默认（不配 base_order）扩展库不再自动排在基础库之后（需显式配 `base_order`）；非系统层（用户/临时词）仍靠层类型默认档排在系统词前。
+- **shipped schemas**：5 个方案的所有 `[[dictionaries]]` 均已补显式 `base_order`（主库 0、扩展 1/2/3）。`default_weight` 属 UX 调优，留给方案维护者按需配（如 district 库解析后无权重、启用后会沉底）。
 
 ### G4「中英文/单字·词分组」— ✂️ 已砍掉
 - **决策（用户）**：分组无存在理由。同一码表内**不区分中英文、只按设计顺序**；跨库先后由 `base_order` 显式控制。设计者用"文件出现序（阶段一保证）+ base_order（阶段三）+ base_sort=natural（阶段二）"已能完全掌控排序，分组反而与之打架。仅当需要"跨库强制把某类候选统一提前"（文件序表达不了的正交桶排序）才需要——当前无此场景，故不实现。

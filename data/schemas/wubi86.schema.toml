@@ -27,6 +27,7 @@ description = "极点五笔基础词库，含单字与高频词组"
 path = "wubi86/wubi86_jidian.dict.yaml"
 type = "rime_codetable"
 default = true
+base_order = 0
 
 [[dictionaries]]
 id = "wubi86_extra"
@@ -36,6 +37,7 @@ path = "wubi86/wubi86_jidian_extra.dict.yaml"
 type = "rime_codetable"
 default_enabled = true
 weight_as_order = true
+base_order = 1
 
 [[dictionaries]]
 id = "wubi86_emoji"
@@ -45,6 +47,7 @@ path = "wubi86/wubi86_jidian_emoji.dict.yaml"
 type = "rime_codetable"
 default_enabled = true
 weight_as_order = true
+base_order = 2
 
 [[dictionaries]]
 id = "wubi86_xzqy"
@@ -53,6 +56,8 @@ description = "省市县区等地名词条"
 path = "wubi86/wubi86_jidian_extra_district.dict.yaml"
 type = "rime_codetable"
 default_enabled = false
+base_order = 3
+# 注：该库经解析权重为 0（无权重）。启用后如需让地名落在特定权重档而非沉底，配 default_weight。
 weight_as_order = true
 
 [encoder]

@@ -21,6 +21,7 @@ id = "pinyin_main"
 path = "pinyin/rime_frost.dict.yaml"
 type = "rime_pinyin"
 default = true
+base_order = 0
 
 [dictionaries.weight_spec]
 median = 200

@@ -57,6 +57,10 @@ pub struct Candidate {
     pub pinyin: String,
     pub code: String,
     pub weight: i32,
+    /// 词库**层级基序档位**（`[[dictionaries]].base_order`，默认 0）。排序时作为**独立层级**：
+    /// weight 之后、natural_order 之前（见 `better`/`by_natural`）。小整数即可把整库排到另一库
+    /// 前/后，与 natural_order 大小无关（不同于把偏移加进 natural_order 的旧做法）。
+    pub base_order: i32,
     pub natural_order: i32,
     pub comment: String,
     pub is_common: bool,
@@ -98,6 +102,7 @@ impl Default for Candidate {
             pinyin: String::new(),
             code: String::new(),
             weight: 0,
+            base_order: 0,
             natural_order: 0,
             comment: String::new(),
             is_common: false,
@@ -129,9 +134,12 @@ impl Default for Candidate {
 ///
 /// 与 Go 版本 `candidate.Better` 对齐。
 pub fn better(a: &Candidate, b: &Candidate) -> std::cmp::Ordering {
+    // 层级：weight 降 → base_order 升（词库档位）→ natural_order 升（出现序）→ code → text。
+    // base_order 默认 0 时该级为空操作，故不设 base_order 的路径（拼音/混输等）行为不变。
     a.weight
         .cmp(&b.weight)
         .reverse()
+        .then(a.base_order.cmp(&b.base_order))
         .then(a.natural_order.cmp(&b.natural_order))
         .then(a.code.cmp(&b.code))
         .then(a.consumed_length.cmp(&b.consumed_length).reverse())
@@ -160,8 +168,10 @@ pub fn better_natural(a: &Candidate, b: &Candidate) -> std::cmp::Ordering {
 /// 与 `better_natural` 的区别：后者精确匹配优先且以 `better`（权重）兜底；本函数不看权重，
 /// 纯按设计者在词库文件里的排列顺序呈现（对齐用户"只按设计顺序"的诉求）。
 pub fn by_natural(a: &Candidate, b: &Candidate) -> std::cmp::Ordering {
-    a.natural_order
-        .cmp(&b.natural_order)
+    // 忽略权重：base_order 升（词库档位）→ natural_order 升（出现序）→ code → text。
+    a.base_order
+        .cmp(&b.base_order)
+        .then(a.natural_order.cmp(&b.natural_order))
         .then(a.code.cmp(&b.code))
         .then(a.consumed_length.cmp(&b.consumed_length).reverse())
         .then(a.text.cmp(&b.text))

@@ -41,14 +41,21 @@ pub trait DictLayer: Send + Sync {
     /// 取 `&self`（内部用原子标志），故无需重建引擎即可即时生效。
     fn set_enabled(&self, _enabled: bool) {}
 
-    /// 该层候选的 `natural_order` **基偏移**：合并各层时 `natural_order += base_order()`。
-    /// 等权重（或 `base_sort = "natural"`）时决定**层间先后**——设计者在 `[[dictionaries]]`
-    /// 配 `base_order`（如 50000 把某扩展库整体压到基础库之后）。默认 0 = 不偏移。
+    /// 该层候选的**层级基序档位**：排序时 `base_order` 作为独立层级（weight 之后、
+    /// natural_order 之前，见 `candidate::better`/`by_natural`），值越小越靠前。
     ///
-    /// 取代旧的 `PER_LAYER_NO_OFFSET`（按注册位置 × 常量）机制：偏移量由设计者显式配置，
-    /// 不再依赖词库的注册/出现顺序。默认 0 意味着**未配置时各库不强制分带**（可能交错）。
+    /// 默认按**层类型**给小整数档位：非系统层（命令/用户词/临时词/单元）恒排在系统词库层
+    /// 之前（等权时）。因是独立排序层级（非加进 natural_order），**小整数即可**分档——`-1`
+    /// 就能排在 `0` 前，与 natural_order 大小无关，无需魔法常量。系统层默认 0，由
+    /// `SystemDictLayer` 覆盖为 `[[dictionaries]].base_order`（设计者配 0/1/2… 小整数）。
     fn base_order(&self) -> i32 {
-        0
+        match self.layer_type() {
+            LayerType::Logic => -4,
+            LayerType::User => -3,
+            LayerType::Temp => -2,
+            LayerType::Cell => -1,
+            LayerType::System => 0,
+        }
     }
 }
 

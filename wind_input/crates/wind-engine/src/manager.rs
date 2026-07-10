@@ -1403,10 +1403,11 @@ impl EngineManager {
             }
             // 英文暂不挂用户词 / 临时词层（无造词学习），仅系统词库层。
             let dm = wind_dict::DictManager::new();
-            for (name, dict, enabled, base_order) in layers {
+            for (name, dict, enabled, base_order, default_weight) in layers {
                 dm.register_layer(Box::new(
                     wind_dict::SystemDictLayer::with_enabled(dict, name, enabled)
-                        .with_base_order(base_order),
+                        .with_base_order(base_order)
+                        .with_default_weight(default_weight),
                 ));
             }
             // 英文最大码长取词库最长词的安全上界（前缀匹配用，不触发顶码/自动上屏）。
@@ -1543,11 +1544,12 @@ impl EngineManager {
                 )));
             }
             // 主库优先注册（在 load_codetable_layers 中已置首），扩展库其后。
-            // base_order（[[dictionaries]].base_order）决定等权/natural 排序时的库间基序。
-            for (name, dict, enabled, base_order) in layers {
+            // base_order 决定等权/natural 排序的库间档位；default_weight 覆盖无权重库的权重档。
+            for (name, dict, enabled, base_order, default_weight) in layers {
                 dm.register_layer(Box::new(
                     wind_dict::SystemDictLayer::with_enabled(dict, name, enabled)
-                        .with_base_order(base_order),
+                        .with_base_order(base_order)
+                        .with_default_weight(default_weight),
                 ));
             }
             Some(Box::new(CodeTableEngine::new(
@@ -1603,7 +1605,7 @@ impl EngineManager {
     fn load_codetable_layers(
         schema: &Schema,
         schemas_dir: &Path,
-    ) -> Vec<(String, CachedDict, bool, i32)> {
+    ) -> Vec<(String, CachedDict, bool, i32, Option<i32>)> {
         let resolve = |rel: &str| -> std::path::PathBuf {
             if let Some(u) = Config::user_config_dir() {
                 let p = u.join("schemas").join(rel);
@@ -1638,7 +1640,7 @@ impl EngineManager {
             }
         };
 
-        let mut out: Vec<(String, CachedDict, bool, i32)> = Vec::new();
+        let mut out: Vec<(String, CachedDict, bool, i32, Option<i32>)> = Vec::new();
         // 主库优先注册。加载失败 → 无系统层可用，放弃整方案（避免无候选）。
         match load_one(usable[main_idx]) {
             Some(d) => {
@@ -1652,6 +1654,7 @@ impl EngineManager {
                     d,
                     true,
                     usable[main_idx].base_order,
+                    usable[main_idx].default_weight,
                 ));
             }
             None => return Vec::new(),
@@ -1670,7 +1673,13 @@ impl EngineManager {
                     enabled,
                     d.len()
                 );
-                out.push((format!("codetable-extra-{}", e.id), d, enabled, e.base_order));
+                out.push((
+                    format!("codetable-extra-{}", e.id),
+                    d,
+                    enabled,
+                    e.base_order,
+                    e.default_weight,
+                ));
             }
         }
         out
