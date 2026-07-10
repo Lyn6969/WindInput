@@ -299,6 +299,21 @@ impl Coordinator {
         KeyAction::ClearComposition
     }
 
+    /// 加词目标方案 id（设置端出码/入库用）。混输方案自身无用户词库，解析到其主码表
+    /// 方案的**真实 id**（供设置端 `dict.encode` 正确判引擎类型、`dict.add` 落到码表用户词库）；
+    /// 非混输保持真实 active id（拼音族的存储折叠由 `web_dict_add` 内部 `data_schema_id` 处理，
+    /// 此处不能提前折叠成 "pinyin"，否则出码会误判为码表）。
+    fn add_word_target_schema(&self) -> String {
+        let active = self.engine_mgr.active_schema_id();
+        if self.engine_mgr.schema_engine_type(&active).as_deref() == Some("mixed") {
+            self.engine_mgr
+                .mixed_primary_schema(&active)
+                .unwrap_or(active)
+        } else {
+            active
+        }
+    }
+
     /// 拉起设置端加词界面（预填 word/code/schema）。两条入口共用。
     pub(crate) fn open_add_word_dialog_with(
         &self,
@@ -322,7 +337,7 @@ impl Coordinator {
         } else {
             (String::new(), String::new())
         };
-        let schema = self.engine_mgr.active_schema_id();
+        let schema = self.add_word_target_schema();
         self.exit_add_word_mode(state);
         self.open_add_word_dialog_with(&word, &code, &schema)
     }
@@ -344,7 +359,7 @@ impl Coordinator {
         } else {
             (String::new(), String::new())
         };
-        let schema = self.engine_mgr.active_schema_id();
+        let schema = self.add_word_target_schema();
         self.open_add_word_dialog_with(&word, &code, &schema)
     }
 
@@ -363,7 +378,7 @@ impl Coordinator {
     /// 拼音方案走引擎词级消歧，无果回退逐字反查表；码表方案走五笔词组取码（逐字反查组合，
     /// 支持词库中尚不存在的新词）。
     fn calc_add_word_code(&self, word: &str) -> String {
-        let schema = self.engine_mgr.active_schema_id();
+        let schema = self.add_word_target_schema();
         let is_pinyin = self
             .engine_mgr
             .schema_engine_type(&schema)
