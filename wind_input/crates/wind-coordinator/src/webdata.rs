@@ -1227,7 +1227,10 @@ impl Coordinator {
                     let _ = std::fs::remove_dir_all(&target);
                 }
             }
-            anyhow::bail!("主题依赖校验失败：{}（请检查 base 引用的基础主题是否存在）", e);
+            anyhow::bail!(
+                "主题依赖校验失败：{}（请检查 base 引用的基础主题是否存在）",
+                e
+            );
         }
         Ok(json!({ "ok": true }))
     }

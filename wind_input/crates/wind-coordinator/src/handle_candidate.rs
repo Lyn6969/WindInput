@@ -222,10 +222,9 @@ impl Coordinator {
         // dict.ValueExpander 一致——候选后处理统一展开。$CC 标记 is_command（选中由
         // commit_selected、顶屏由 top_commit_command_guard 执行动作，而非上屏原文）；模板 / 花括号
         // 插值直接以展开文本上屏；$AA/$SS 一对多炸开。普通候选（不含 $ 与 {）经廉价预检零开销跳过。
-        if candidates
-            .iter()
-            .any(|c| !c.is_phrase && !c.is_command && (c.text.contains('$') || c.text.contains('{')))
-        {
+        if candidates.iter().any(|c| {
+            !c.is_phrase && !c.is_command && (c.text.contains('$') || c.text.contains('{'))
+        }) {
             let now = chrono::Local::now();
             let recent = self.recent_commits_snapshot();
             let clip = |_n: i64| -> String {

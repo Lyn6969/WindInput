@@ -388,7 +388,11 @@ fn test_z_letter_trigger_temp_pinyin() {
     let commit = coord.handle_key_event(&key_event(0x20, EVENT_KEY_DOWN));
     match commit {
         KeyAction::InsertText { text, .. } => {
-            assert!(text.contains("你好"), "znihao 应经临拼上屏 你好，实际: {}", text);
+            assert!(
+                text.contains("你好"),
+                "znihao 应经临拼上屏 你好，实际: {}",
+                text
+            );
             assert!(!text.contains('z'), "上屏不应含字面 z，实际: {}", text);
         }
         other => panic!("空格应上屏 InsertText，实际: {:?}", other),
@@ -479,11 +483,7 @@ fn test_temp_pinyin_prefix_only_commits_symbol_on_switch() {
     // 左 Shift 释放切英文：应上屏前缀符号 `（与回车空缓冲上屏一致）。
     let act = coord.handle_key_event(&key_event(0xA0, EVENT_KEY_UP));
     let text = action_text(&act).unwrap_or_default();
-    assert_eq!(
-        text, "`",
-        "只按进入符切英文应上屏该符号 `，实际: {:?}",
-        act
-    );
+    assert_eq!(text, "`", "只按进入符切英文应上屏该符号 `，实际: {:?}", act);
     assert!(!coord.is_chinese_mode(), "左 Shift 应切到英文");
 }
 
@@ -2517,6 +2517,9 @@ fn top_code_direct_commit_returns_commit_then_defer() {
             assert!(!deferred_composition.is_empty(), "应有余码新组合");
             assert_eq!(timeout_ms, 150);
         }
-        other => panic!("direct_commit 顶码应返回 CommitThenDeferComposition，实际: {:?}", other),
+        other => panic!(
+            "direct_commit 顶码应返回 CommitThenDeferComposition，实际: {:?}",
+            other
+        ),
     }
 }
