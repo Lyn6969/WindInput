@@ -3241,6 +3241,11 @@ impl MessageHandler for Coordinator {
                 if state.chinese_mode {
                     return self.enter_add_word_mode(&mut state);
                 }
+            } else if action == "open_add_word_dialog" {
+                let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+                if state.chinese_mode {
+                    return self.open_add_word_from_history(&mut state);
+                }
             } else if self.dispatch_hotkey(&action) {
                 return KeyAction::StatusUpdate(self.build_status());
             }
