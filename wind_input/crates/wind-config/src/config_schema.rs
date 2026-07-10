@@ -169,7 +169,10 @@ static REGISTRY: &[ConfigField] = &[
     f("input.phrase.min_prefix", Int),
     f("input.phrase.max_display_chars", Int),
     // 顶码上屏策略
-    f("input.top_commit_mode", Enum(&["pre_confirm", "direct_commit"])),
+    f(
+        "input.top_commit_mode",
+        Enum(&["pre_confirm", "direct_commit"]),
+    ),
     // -- keys（全部按键，扁平；overflow 保留一层）--
     f("keys.toggle_mode_keys", StrList),
     f("keys.commit_on_switch", Bool),
@@ -179,6 +182,7 @@ static REGISTRY: &[ConfigField] = &[
     f("keys.toggle_toolbar", Str),
     f("keys.open_settings", Str),
     f("keys.add_word", Str),
+    f("keys.open_add_word_dialog", Str),
     f("keys.toggle_s2t", Str),
     f("keys.activate_ime", Str),
     f("keys.pin_candidate", Str),

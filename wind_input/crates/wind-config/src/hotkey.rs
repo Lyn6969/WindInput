@@ -120,6 +120,7 @@ impl Compiler {
         for (name, value) in [
             ("toggle_punct", &h.toggle_punct),
             ("add_word", &h.add_word),
+            ("open_add_word_dialog", &h.open_add_word_dialog),
             ("toggle_s2t", &h.toggle_s2t),
         ] {
             if let Some(raw) = parse_hotkey(value) {
@@ -505,5 +506,20 @@ mod tests {
             Some("switch_engine")
         );
         assert_eq!(compiled.key_up.len(), 2);
+    }
+
+    #[test]
+    fn open_add_word_dialog_registered_chinese_only() {
+        let mut cfg = Config::default();
+        cfg.keys.open_add_word_dialog = "ctrl+shift+equal".to_string();
+        let compiled = Compiler::new(cfg).compile();
+        // action 串应出现在 key_down 组
+        assert!(
+            compiled
+                .key_down
+                .iter()
+                .any(|e| e.action == "open_add_word_dialog"),
+            "open_add_word_dialog 应注册进 key_down"
+        );
     }
 }
