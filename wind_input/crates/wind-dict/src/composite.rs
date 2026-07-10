@@ -10,7 +10,11 @@ use wind_candidate::Candidate;
 /// 每层 natural_order 偏移：等权重时让**声明序更靠前的层**(主库先于扩展、用户先于系统)
 /// 的候选排在前。取值需大于单层内最大 natural_order，使「层序」优先于「层内序」。
 /// 与 Go composite.go `perLayerNOOffset` 同义。
-const PER_LAYER_NO_OFFSET: i32 = 10_000_000;
+///
+/// 取 1e8：wdat v3 起 natural_order = 词库**全局出现序**（0..单库条目数），超大词库可达数百万，
+/// 故偏移须显著大于单库最大条目数（旧值 1e7 对百万级词库余量不足，会溢出到相邻层带）。
+/// i32 上限 ~2.1e9 ÷ 1e8 ≈ 21 层，远超实际层数（主库+扩展+用户+临时）。
+const PER_LAYER_NO_OFFSET: i32 = 100_000_000;
 
 /// 多层复合词典
 #[derive(Default)]

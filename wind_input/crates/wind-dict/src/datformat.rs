@@ -9,7 +9,7 @@
 //! [Header 48B]
 //! [DAT Base: dat_size*4][DAT Check: dat_size*4]
 //! [LeafTable: leaf_count*8]   每条 {entry_off u32, entry_len u16, _ u16}
-//! [EntryRecords: entry_count*10]  每条 {text_off u32, text_len u16, weight i32}
+//! [EntryRecords: entry_count*14]  每条 {text_off u32, text_len u16, weight i32, order u32}
 //! [StringPool]
 //! [CharMap 1028B]  {max_code i32, char_map[256] i32}
 //! [Meta(可选) 4B len + bytes]
@@ -23,10 +23,12 @@ use std::path::Path;
 use tracing::info;
 
 const MAGIC: [u8; 4] = [b'W', b'D', b'A', b'T'];
-const VERSION: u32 = 2;
+// v3：EntryRecord 增加 order u32（全局自然序，10→14B），跨编码等权时按词库出现顺序排序，
+// 不再退化为叶内序号致编码字母序。旧 v2 缓存 mtime/指纹不匹配自动重建。
+const VERSION: u32 = 3;
 const HEADER_SIZE: usize = 48;
 const LEAF_SIZE: usize = 8;
-const ENTRY_SIZE: usize = 10;
+const ENTRY_SIZE: usize = 14;
 const CHARMAP_SIZE: usize = 4 + 256 * 4; // 1028
 
 /// 原子写临时文件序号（同 binformat，进程内防 tmp 撞名）。
@@ -211,20 +213,20 @@ impl StringPool {
 /// 从排序后的 (code,entries) 构建一段独立 DAT：返回 (DAT, leaves, entries)，文本入共享池。
 /// 主表与简拼表各调一次（共用同一 StringPool 去重）。
 fn build_section(
-    sorted: &[&(String, Vec<(String, i32)>)],
+    sorted: &[&(String, Vec<(String, i32, u32)>)],
     pool: &mut StringPool,
-) -> (Dat, Vec<(u32, u16)>, Vec<(u32, u16, i32)>) {
+) -> (Dat, Vec<(u32, u16)>, Vec<(u32, u16, i32, u32)>) {
     let mut leaves: Vec<(u32, u16)> = Vec::with_capacity(sorted.len());
-    let mut entries: Vec<(u32, u16, i32)> = Vec::new();
+    let mut entries: Vec<(u32, u16, i32, u32)> = Vec::new();
     let mut codes: Vec<&str> = Vec::with_capacity(sorted.len());
     let mut entry_byte_off = 0u32;
     for kv in sorted {
         let (code, ents) = (&kv.0, &kv.1);
         codes.push(code.as_str());
         leaves.push((entry_byte_off, ents.len() as u16));
-        for (text, weight) in ents {
+        for (text, weight, order) in ents {
             let text_off = pool.add(text);
-            entries.push((text_off, text.len() as u16, *weight));
+            entries.push((text_off, text.len() as u16, *weight, *order));
         }
         entry_byte_off += (ents.len() * ENTRY_SIZE) as u32;
     }
@@ -234,9 +236,19 @@ fn build_section(
 /// wdat 写入器：与 binformat::DictWriter 同样接口（add(code, entries)），输出 DAT 格式。
 /// `add_abbrev` 追加简拼（声母缩写）表，写入独立 AbbrevSection（与全拼查询互不污染）。
 pub struct WdatWriter {
-    keys: Vec<(String, Vec<(String, i32)>)>,
-    abbrevs: Vec<(String, Vec<(String, i32)>)>,
+    keys: Vec<(String, Vec<(String, i32, u32)>)>,
+    abbrevs: Vec<(String, Vec<(String, i32, u32)>)>,
     meta: Option<Vec<u8>>,
+}
+
+/// 把 `(text, weight)` 列表补上 order：order = 该 code 内的条目序号（0,1,2…）。
+/// 复现 v2「叶内序号」语义，供未显式提供全局序的调用方（combined 合并、测试）向后兼容。
+fn with_local_order(entries: Vec<(String, i32)>) -> Vec<(String, i32, u32)> {
+    entries
+        .into_iter()
+        .enumerate()
+        .map(|(i, (t, w))| (t, w, i as u32))
+        .collect()
 }
 
 impl WdatWriter {
@@ -248,16 +260,27 @@ impl WdatWriter {
         }
     }
 
+    /// 追加一个 code 的候选（`(text, weight)`）。order 按 code 内序号自动补全（向后兼容旧语义）。
+    /// 需要**跨编码全局自然序**（无权重按词库出现顺序）时改用 [`add_with_order`]。
     pub fn add(&mut self, code: String, entries: Vec<(String, i32)>) {
+        if !entries.is_empty() {
+            self.keys.push((code, with_local_order(entries)));
+        }
+    }
+
+    /// 追加一个 code 的候选，携带**显式全局 order**（`(text, weight, order)`）。
+    /// order 为词库文件内的全局出现序（跨编码单调），使等权候选跨编码按出现顺序排列。
+    /// order 须 < `composite::PER_LAYER_NO_OFFSET`（1e7），否则会溢出到层序偏移带。
+    pub fn add_with_order(&mut self, code: String, entries: Vec<(String, i32, u32)>) {
         if !entries.is_empty() {
             self.keys.push((code, entries));
         }
     }
 
-    /// 追加简拼条目（abbrev=声母序列，如 "nh"→你好）。空条目忽略。
+    /// 追加简拼条目（abbrev=声母序列，如 "nh"→你好）。空条目忽略。order 按 code 内序号补全。
     pub fn add_abbrev(&mut self, abbrev: String, entries: Vec<(String, i32)>) {
         if !entries.is_empty() {
-            self.abbrevs.push((abbrev, entries));
+            self.abbrevs.push((abbrev, with_local_order(entries)));
         }
     }
 
@@ -275,9 +298,9 @@ impl WdatWriter {
         let path = path.as_ref();
 
         // 按 code 排序（确定性 + DAT key 唯一）。排序**引用**而非克隆全量数据，省一份大拷贝。
-        let mut sorted: Vec<&(String, Vec<(String, i32)>)> = self.keys.iter().collect();
+        let mut sorted: Vec<&(String, Vec<(String, i32, u32)>)> = self.keys.iter().collect();
         sorted.sort_by(|a, b| a.0.cmp(&b.0));
-        let mut sorted_ab: Vec<&(String, Vec<(String, i32)>)> = self.abbrevs.iter().collect();
+        let mut sorted_ab: Vec<&(String, Vec<(String, i32, u32)>)> = self.abbrevs.iter().collect();
         sorted_ab.sort_by(|a, b| a.0.cmp(&b.0));
         let has_abbrev = !sorted_ab.is_empty();
 
@@ -356,7 +379,7 @@ impl WdatWriter {
         let write_dat_section = |f: &mut std::io::BufWriter<std::fs::File>,
                                  dat: &Dat,
                                  leaves: &[(u32, u16)],
-                                 entries: &[(u32, u16, i32)]|
+                                 entries: &[(u32, u16, i32, u32)]|
          -> std::io::Result<()> {
             for v in &dat.base {
                 f.write_all(&v.to_le_bytes())?;
@@ -369,10 +392,11 @@ impl WdatWriter {
                 f.write_all(&elen.to_le_bytes())?;
                 f.write_all(&0u16.to_le_bytes())?;
             }
-            for (toff, tlen, w) in entries {
+            for (toff, tlen, w, order) in entries {
                 f.write_all(&toff.to_le_bytes())?;
                 f.write_all(&tlen.to_le_bytes())?;
                 f.write_all(&w.to_le_bytes())?;
+                f.write_all(&order.to_le_bytes())?;
             }
             Ok(())
         };
@@ -470,7 +494,12 @@ impl WdatReader {
         }
         let file_len = mmap.len();
         let rd = |off: usize| u32::from_le_bytes(mmap[off..off + 4].try_into().unwrap());
-        let _version = rd(4);
+        // 版本必须匹配：v2→v3 EntryRecord 由 10→14B，旧缓存若按新步长解析会读到错乱候选。
+        // 校验失败即 bail，调用方（cached/load_merged_dicts）捕获 Err 后回退重建，自动升级缓存。
+        let version = rd(4);
+        if version != VERSION {
+            anyhow::bail!("wdat version mismatch: file={version}, expected={VERSION} (需重建缓存)");
+        }
         let dat_size = rd(8);
         let leaf_count = rd(12);
         let dat_off = rd(16) as usize;
@@ -628,8 +657,8 @@ impl WdatReader {
         std::str::from_utf8(&self.mmap[start..end]).unwrap_or("")
     }
 
-    /// 流式读某叶的所有候选：逐条回调 f(text, weight, order)。order=叶内序号 i（对齐 Go）。
-    /// 不分配中间 Vec，供全量遍历(for_each_entry)流式使用，避免堆起大数组。
+    /// 流式读某叶的所有候选：逐条回调 f(text, weight, order)。order=写入时携带的全局自然序
+    /// （v3；无权重时跨编码按词库出现顺序排列）。不分配中间 Vec，供全量遍历流式使用。
     fn read_leaf_entries(&self, v: &DatView, leaf_idx: u32, f: &mut dyn FnMut(&str, i32, i32)) {
         let (eoff, elen) = self.read_leaf(v, leaf_idx);
         let base = v.entry_off + eoff as usize;
@@ -641,7 +670,8 @@ impl WdatReader {
             let text_off = u32::from_le_bytes(self.mmap[o..o + 4].try_into().unwrap());
             let text_len = u16::from_le_bytes(self.mmap[o + 4..o + 6].try_into().unwrap());
             let weight = i32::from_le_bytes(self.mmap[o + 6..o + 10].try_into().unwrap());
-            f(self.read_string(text_off, text_len), weight, i as i32);
+            let order = u32::from_le_bytes(self.mmap[o + 10..o + 14].try_into().unwrap());
+            f(self.read_string(text_off, text_len), weight, order as i32);
         }
     }
 
@@ -856,6 +886,45 @@ mod tests {
         // limit 截断。
         assert_eq!(r.search_prefix("ni", 2).len(), 2);
         let _ = std::fs::remove_file(&p);
+    }
+
+    /// 回归（wdat v3）：无权重（全同权）时，跨编码前缀查询应按**全局 order（词库出现顺序）**
+    /// 排列，而非退化为编码字母序。构造 order 与字母序相反以区分两者。
+    #[test]
+    fn prefix_no_weight_sorts_by_global_order_not_code() {
+        let p = std::env::temp_dir().join("wdat_global_order_test.wdat");
+        let mut w = WdatWriter::new();
+        // 出现顺序 za → ma → aa（order 0,1,2），编码字母序则相反 aa < ma < za；权重全 0。
+        w.add_with_order("za".to_string(), vec![("Z".to_string(), 0, 0)]);
+        w.add_with_order("ma".to_string(), vec![("M".to_string(), 0, 1)]);
+        w.add_with_order("aa".to_string(), vec![("A".to_string(), 0, 2)]);
+        w.write(&p).expect("write wdat");
+        let r = WdatReader::open(&p).unwrap();
+        let res = r.search_prefix("", 10);
+        let texts: Vec<&str> = res.iter().map(|e| e.text.as_str()).collect();
+        assert_eq!(
+            texts,
+            vec!["Z", "M", "A"],
+            "无权重应按全局 order（出现序）排序而非编码字母序，实际: {texts:?}"
+        );
+        // 单编码多条同权：前缀查询（会按 weight desc、order asc 排序）亦按 order 升序恢复出现序。
+        // （精确 search 不排序、返回叶内存储序——生产路径写入前已预排序，故存储序即展示序。）
+        let mut w2 = WdatWriter::new();
+        w2.add_with_order(
+            "aa".to_string(),
+            vec![
+                ("三".to_string(), 0, 2),
+                ("一".to_string(), 0, 0),
+                ("二".to_string(), 0, 1),
+            ],
+        );
+        let p2 = std::env::temp_dir().join("wdat_global_order_test2.wdat");
+        w2.write(&p2).expect("write wdat");
+        let r2 = WdatReader::open(&p2).unwrap();
+        let t2: Vec<String> = r2.search_prefix("aa", 10).into_iter().map(|e| e.text).collect();
+        assert_eq!(t2, vec!["一", "二", "三"], "同码同权前缀查询应按 order 升序");
+        let _ = std::fs::remove_file(&p);
+        let _ = std::fs::remove_file(&p2);
     }
 
     #[test]

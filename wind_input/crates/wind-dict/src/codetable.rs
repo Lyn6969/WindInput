@@ -201,11 +201,15 @@ impl CodetableDict {
     }
 
     /// 同 [`export_to_writer`]，导出到 wdat（DAT）写入器。
+    /// 携带每条的全局 `order`（词库文件出现序）：使无权重候选跨编码按出现顺序排序，
+    /// 而非退化为编码字母序（对应 wdat v3 的 order 字段，见 datformat.rs）。
     pub fn export_to_wdat(&self, writer: &mut crate::datformat::WdatWriter) {
         for (code, entries) in &self.entries {
-            let entries_data: Vec<(String, i32)> =
-                entries.iter().map(|e| (e.text.clone(), e.weight)).collect();
-            writer.add(code.clone(), entries_data);
+            let entries_data: Vec<(String, i32, u32)> = entries
+                .iter()
+                .map(|e| (e.text.clone(), e.weight, e.order.max(0) as u32))
+                .collect();
+            writer.add_with_order(code.clone(), entries_data);
         }
     }
 
