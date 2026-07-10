@@ -1,0 +1,169 @@
+# 快捷加词界面设计（--page add-word）
+
+## 背景与目标
+
+清风输入法核心（Rust core）已实现「快捷加词模式」：`Ctrl+=` 从最近上屏字符中取末尾 N 字组词，
+在候选窗内以 `↑↓` 调整词长、`Enter` 直接写库、`Esc` 取消。核心里也已有 `open_add_word_dialog`
+（加词模式内按 `Ctrl+Enter`）会构造 `add-word --text=… --code=… --schema=…` 并调用 `open_settings`
+拉起设置端——**但设置端（wind-setting）没有对应的 `add-word` 界面，也不解析这些参数**，属于断头路。
+
+本设计补齐两端，对齐原 Go 项目（`WindInput-Go`）：
+
+1. **wind-setting**：新增 `--page add-word` 参数方式，拉起一个**独立的加词小窗**，复用词库页现有的
+   加词对话框与提交逻辑，支持 `--text/--code/--schema` 预填。
+2. **core**：
+   - `Ctrl+=` 加词模式内 `Ctrl+Enter` → 打开加词界面（**已实现**，等设置端接住）。
+   - 新增独立热键 `Ctrl+Shift+=` → **不进加词模式**，直接取最近输入预填、拉起加词界面
+     （对齐 Go 的 `openAddWordDialogFromHistory`）。
+
+## 参考实现（原 Go 项目）
+
+- `wind_input/internal/coordinator/handle_addword.go`
+  - `openAddWordDialog()` — 加词模式内 `Ctrl+Enter`，用当前预览的词/编码打开对话框。
+  - `openAddWordDialogFromHistory()` — 独立快捷键直接打开，不进加词模式，仅取最近输入预填。
+  - `openAddWordDialogWith(word, code, schemaID)` — 二者共用，构造 `add-word --text=… --code=… --schema=…`。
+- `wind_input/pkg/config/config.go` — 热键 `add_word = "ctrl+equal"`、`open_add_word_dialog = "none"`（默认）。
+- `wind_setting/frontend/src/pages/AddWordPage.vue` — 加词对话框：词/编码（自动出码，可手改）/权重（默认 1200）/
+  连续添加；独立窗口模式关闭即 `Quit()`。
+
+> 与 Go 的差异（按本次需求）：`open_add_word_dialog` **默认绑定 `ctrl+shift+equal`**（Go 默认 none）；
+> 加词界面**复用 wind-setting 词库页现有对话框**而非新写；**暂不做**连续添加；编码**不自动重算**（仅"出码"按钮手动触发）。
+
+## 架构总览
+
+两条入口最终汇到同一个 `open_settings("add-word …")`：
+
+```
+Ctrl+=  → enter_add_word_mode（候选窗）→ Ctrl+Enter → open_add_word_dialog ┐
+                                                                          ├→ open_settings("add-word --text=词 --code=码 --schema=id")
+Ctrl+Shift+= → open_add_word_from_history（不进加词模式，取最近输入预填）  ┘
+                              ↓
+   wind-setting 起「独立加词小窗」（独立单例 app_id）
+        → 复用词库加词对话框（预填 / 出码 / 确定）
+        → dict.add → toast → 关窗即退出进程
+```
+
+## Part A — core（wind-config + wind-coordinator）
+
+### A-1 配置字段（wind-config `config.rs`）
+- `Hotkeys` 结构体新增 `open_add_word_dialog: String`，`#[serde(default = "default_open_add_word_dialog")]`。
+- `default_open_add_word_dialog()` 返回 `"ctrl+shift+equal"`。
+- `Default for Hotkeys` 补 `open_add_word_dialog: default_open_add_word_dialog()`。
+- `data/config.toml` 的 `[hotkeys]` 段补 `open_add_word_dialog = "ctrl+shift+equal"`（紧邻 `add_word`）。
+- 热键冲突清单补标签「打开加词界面」（对齐 Go `config_hotkey.go` 的 `add(c.Hotkeys.OpenAddWordDialog, "打开加词界面")`）。
+
+### A-2 热键编译（wind-config `hotkey.rs`）
+- 在 CHINESE_ONLY 的 key_down 组注册 `open_add_word_dialog`（与 `add_word` 并列，同 `HOTKEY_POLICY_CHINESE_ONLY`），
+  action 串 = `"open_add_word_dialog"`。
+- 编译测试断言该 action 进入 chinese-only 组。
+
+### A-3 加词处理（wind-coordinator `handle_addword.rs`）
+- 抽出公共构造 `open_add_word_dialog_with(&self, word: &str, code: &str, schema: &str) -> KeyAction`
+  （对齐 Go `openAddWordDialogWith`）：拼 `add-word` + 非空的 `--text/--code/--schema` → `open_settings` → `ClearComposition`。
+- 现有 `open_add_word_dialog`（`Ctrl+Enter`）改为取当前预览词/编码/方案后调 `open_add_word_dialog_with`。
+- 新增 `open_add_word_from_history(&self, state: &mut State) -> KeyAction`（对齐 Go `openAddWordDialogFromHistory`）：
+  1. 有未上屏输入先清理（`reset_*` + `notify_ui_hide`），避免残留 composition。
+  2. 取最近字符（`add_word_recent_chars(ADD_WORD_MAX_LEN)`），默认词长 `ADD_WORD_DEFAULT_LEN`（夹到可用长度）。
+  3. `calc_add_word_code` 算码。
+  4. 取 `data_schema_id(active)`。
+  5. 调 `open_add_word_dialog_with(word, code, schema)`。
+  - **不**进加词模式、**不**改候选窗布局、**不**发占位 composition。
+
+### A-4 热键分派（wind-coordinator `coordinator.rs`，key_down 匹配处，约 3239 行）
+- 与既有 `add_word` 特判并列，新增：
+  ```
+  else if action == "open_add_word_dialog" {
+      let mut state = self.state.lock()…;
+      if state.chinese_mode {
+          return self.open_add_word_from_history(&mut state);
+      }
+  }
+  ```
+- 仅中文模式响应（与 `add_word` 一致）。
+
+## Part B — wind-setting（独立加词小窗 + 复用词库逻辑）
+
+### B-1 参数解析（`cli.rs`）
+- 新增 `AddWordParams { text: String, code: String, schema: String }`。
+- 新增 `parse_add_word(argv) -> Option<AddWordParams>`：当 argv 含 `--page add-word` / `--page=add-word` / `--add-word`
+  时，解析 `--text/-text=`、`--code/-code=`、`--schema/-schema=` 两种形式（对齐 Go `parseAddWordParams`）。
+- `parse_target` 对 `add-word` 返回 `None`（它不是 Tab；`PAGES` 不加 `add-word`）。
+- 单元测试覆盖 `--text=` 与 `--text ` 两形式、schema 缺省、仅 `--page add-word` 无预填。
+
+### B-2 独立小窗分支（`main.rs`）
+- `main()` 早分支：`if let Some(params) = cli::parse_add_word(&args) { run_add_word_window(params); return; }`
+  （在常规设置 App 构建之前，**不落入** `LoadedState::fetch()` / `shell::build` 分支）。
+- `run_add_word_window(params)`：
+  - 构建独立 `App`：较小尺寸（约 460×300）、`frameless()`、`centered()`、独立 `app_id = format!("wind_setting_addword{}", mode::pipe_suffix())`。
+  - content = 复用的词库加词对话框（见 B-3），初始 `edit_visible = true`。
+  - `single_instance(addword_app_id, closure)`：二次启动 argv 若为 add-word → 重新 `parse_add_word` → 重新预填并置顶
+    （不新起进程 → 加词窗恒定封顶 1 个）。
+  - 关窗即退出进程（单窗应用默认行为）；`edit_visible` 翻回 false（确定成功或取消）时请求关闭窗口。
+
+### B-3 复用词库加词逻辑（`pages/dict/state.rs` + `dialogs.rs`）
+- 新增 `DictManagerState::open_add_word_prefilled(&self, text: &str, code: &str, schema: &str)`：
+  1. 按 `schema` 在 `folded_domains()` 里做别名匹配（双拼族 rep_schema_id 归一为 `pinyin`），设置 `domain`（≥1）+ `sub_tab = 0`（用户词库）。
+  2. 预填 `edit_code`、`edit_text`、`edit_weight = "1200"`，`editing_orig = None`（新增模式）。
+  3. 设置 `edit_title`/`edit_l_code`/`edit_l_text`（用户词库文案），`edit_visible = true`。
+- **完全复用**：
+  - 界面 = `dialogs::build_edit_dialog`（编码 + 「出码」按钮 + 词条 + 权重 + 确定/取消）。
+  - 「出码」= `encode_current`（`dict.encode`，**手动**触发，符合"点击再次生成、不自动重算"）。
+  - 「确定」= `submit_word` → `save_calls` 的 `UserDict / None` 分支 → `dict.add`（code/text/weight）+ `reload` + toast。
+- 加词小窗启动只做**最小 RPC**：拉一次启用方案列表（解析 schema 别名 + 引擎类型给出码用）；出码/提交按需调用。
+  **不**调用整页的 `LoadedState::fetch()`。
+
+### B-4 单例隔离（满足"不与完整设置窗单例冲突"）
+- 主设置窗 app_id：`wind_setting{suffix}`（现状不变）。
+- 加词小窗 app_id：`wind_setting_addword{suffix}`（独立）。
+- 效果：
+  - 设置窗已开 + `Ctrl+Shift+=` → 加词参数走 addword 单例 → 独立小窗，**不劫持**设置窗 Tab。
+  - 加词窗已开 + 再按 `Ctrl+Shift+=` → addword 单例转发 → 复用同一小窗重新预填，**不新起进程**。
+  - 加词窗已开 + 从菜单开完整设置 → 不同 app_id → 各自独立。
+
+### B-5 IPC 连接约束（满足"控制 IPC 连接数量"）
+- wind-setting RPC 为**按调用短连接**（连接→发一帧→读一帧→关闭，`rpc.rs`），无持久连接、无 push 订阅。
+- 加词窗自身单例 → 至多 1 个加词进程；叠加主设置窗至多 1 个 → 对 core 的**瞬时并发连接封顶 2 个进程**。
+- 加词分支跳过重量级全量 fetch，仅最小 RPC → 启动连接风暴最小化。
+
+## 数据流（端到端）
+
+**Ctrl+= → Ctrl+Enter 路径：**
+```
+Ctrl+= → enter_add_word_mode（候选窗：↑↓/Enter/Ctrl+Enter/Esc）
+  → Ctrl+Enter → open_add_word_dialog → open_add_word_dialog_with(词,码,方案)
+  → open_settings("add-word --text=… --code=… --schema=…")
+  → wind-setting 起加词小窗（预填）→ 出码/编辑 → 确定 → dict.add → toast → 关窗退出
+```
+
+**Ctrl+Shift+= 路径：**
+```
+Ctrl+Shift+= → open_add_word_from_history（不进加词模式，取最近输入预填）
+  → open_add_word_dialog_with(词,码,方案) → open_settings("add-word …")
+  → 同一加词小窗
+```
+
+## 测试策略
+
+### core
+- `open_add_word_from_history`：headless coord + 手动注入 code，断言构造的 page 串含正确 word/code/schema、且未进入加词模式（`add_word_active == false`、候选窗布局未改）。
+- `open_add_word_dialog_with`：空 word/code/schema 时对应 `--text/--code/--schema` 不出现。
+- `hotkey.rs`：编译测试断言 `open_add_word_dialog` 进 chinese-only key_down 组。
+
+### wind-setting
+- `parse_add_word`：`--text=`/`--text ` 两形式、`--schema` 缺省、仅 `--page add-word` 无预填、非 add-word argv 返回 None。
+- `open_add_word_prefilled`：按 schema 别名选中正确 domain（含双拼族归一），edit_* 预填正确、weight = "1200"、editing_orig = None。
+- `save_calls`（已有）：UserDict/None → `dict.add`（复用，无需新测）。
+
+## 风险与开放点
+
+- **紧凑独立窗可行性**：需确认 windui `App` 支持"非 shell 的替代 content + 关窗即退进程"。`main.rs` 现已按 args 分支
+  尺寸/主题，`run_add_word_window` 走独立 App 构建路径可行；关窗退出是单窗应用默认行为。
+- **schema 别名匹配**：复用词库页 `folded_domains` 的 `rep_schema_id` + 别名归一逻辑（双拼→pinyin），
+  与 Go `AddWordPage.vue` 的 `aliasIds` 匹配一致。
+- **真机验证清单**（实现后手测）：
+  - `Ctrl+=` → `Ctrl+Enter` 拉起加词小窗且预填正确。
+  - `Ctrl+Shift+=` 直接拉起、不改候选窗、预填最近输入。
+  - 设置窗已开时 `Ctrl+Shift+=` 不劫持设置窗、开独立小窗。
+  - 连按 `Ctrl+Shift+=` 只复用同一小窗。
+  - 出码按钮、确定写库、toast、关窗退出。
+  - 非中文模式下 `Ctrl+Shift+=` 不触发。
