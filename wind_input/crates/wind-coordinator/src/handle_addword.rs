@@ -42,6 +42,24 @@ fn trim_segs_start(
     start
 }
 
+/// 构造设置端加词界面参数串（对齐 Go openAddWordDialogWith）：非空字段才附带。
+fn build_add_word_page(word: &str, code: &str, schema: &str) -> String {
+    let mut page = String::from("add-word");
+    if !word.is_empty() {
+        page.push_str(" --text=");
+        page.push_str(word);
+    }
+    if !code.is_empty() {
+        page.push_str(" --code=");
+        page.push_str(code);
+    }
+    if !schema.is_empty() {
+        page.push_str(" --schema=");
+        page.push_str(schema);
+    }
+    page
+}
+
 impl Coordinator {
     /// 加词到用户层（code 为空时暂不支持自动推导编码）。
     pub(crate) fn cmd_dict_add(&self, text: &str, code: &str) -> anyhow::Result<()> {
@@ -281,7 +299,18 @@ impl Coordinator {
         KeyAction::ClearComposition
     }
 
-    /// Ctrl+Enter：转到设置端加词编辑界面，预填当前 词/编码/方案。
+    /// 拉起设置端加词界面（预填 word/code/schema）。两条入口共用。
+    pub(crate) fn open_add_word_dialog_with(
+        &self,
+        word: &str,
+        code: &str,
+        schema: &str,
+    ) -> KeyAction {
+        self.open_settings(Some(&build_add_word_page(word, code, schema)));
+        KeyAction::ClearComposition
+    }
+
+    /// Ctrl+Enter：从加词模式转到设置端加词界面，预填当前 词/编码/方案。
     pub(crate) fn open_add_word_dialog(&self, state: &mut State) -> KeyAction {
         let (word, code) = if state.add_word_len >= ADD_WORD_MIN_LEN
             && state.add_word_chars.len() >= ADD_WORD_MIN_LEN
@@ -295,22 +324,28 @@ impl Coordinator {
         };
         let schema = self.engine_mgr.active_schema_id();
         self.exit_add_word_mode(state);
+        self.open_add_word_dialog_with(&word, &code, &schema)
+    }
 
-        let mut page = String::from("add-word");
-        if !word.is_empty() {
-            page.push_str(" --text=");
-            page.push_str(&word);
-        }
-        if !code.is_empty() {
-            page.push_str(" --code=");
-            page.push_str(&code);
-        }
-        if !schema.is_empty() {
-            page.push_str(" --schema=");
-            page.push_str(&schema);
-        }
-        self.open_settings(Some(&page));
-        KeyAction::ClearComposition
+    /// Ctrl+Shift+=：不进加词模式，直接取最近输入预填并拉起加词界面
+    /// （对齐 Go openAddWordDialogFromHistory）。
+    pub(crate) fn open_add_word_from_history(&self, state: &mut State) -> KeyAction {
+        // 清理未上屏输入/候选/独占残留，避免残留 composition
+        self.reset_exclusive_modes(state);
+        self.reset_pinyin_composition(state);
+        self.notify_ui_hide();
+
+        let chars = self.add_word_recent_chars(ADD_WORD_MAX_LEN);
+        let (word, code) = if chars.len() >= ADD_WORD_MIN_LEN {
+            let len = ADD_WORD_DEFAULT_LEN.min(chars.len());
+            let word: String = chars[chars.len() - len..].iter().collect();
+            let code = self.calc_add_word_code(&word);
+            (word, code)
+        } else {
+            (String::new(), String::new())
+        };
+        let schema = self.engine_mgr.active_schema_id();
+        self.open_add_word_dialog_with(&word, &code, &schema)
     }
 
     /// 更新当前加词的编码（按方案：拼音生成 / 码表反查）。
@@ -615,5 +650,30 @@ mod tests {
         assert_eq!(trim_segs_start(&segs, 0), 0);
         // max=1 装不下末段(2字) → 起始=len（全部裁掉，调用方跳过）
         assert_eq!(trim_segs_start(&segs, 1), 3);
+    }
+
+    #[test]
+    fn build_page_omits_empty_fields() {
+        use super::build_add_word_page;
+        assert_eq!(
+            build_add_word_page("你好", "nihao", "pinyin"),
+            "add-word --text=你好 --code=nihao --schema=pinyin"
+        );
+        assert_eq!(build_add_word_page("", "", ""), "add-word");
+        assert_eq!(
+            build_add_word_page("你好", "", "wubi"),
+            "add-word --text=你好 --schema=wubi"
+        );
+    }
+
+    #[test]
+    fn from_history_does_not_enter_add_word_mode() {
+        let c = coord("fromhist");
+        push_commits(&c, &["你", "好"]);
+        let mut st = c.state.lock().unwrap();
+        c.open_add_word_from_history(&mut st);
+        // 直开路径不得进入加词模式、不得改候选窗布局占位
+        assert!(!st.add_word_active, "直开加词界面不应进入加词模式");
+        assert!(st.add_word_chars.is_empty(), "不应填充加词字符池");
     }
 }
