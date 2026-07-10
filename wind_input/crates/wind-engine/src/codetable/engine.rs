@@ -562,4 +562,67 @@ mod tests {
         assert_eq!(BaseSort::parse(""), BaseSort::Weight);
         assert_eq!(BaseSort::parse("xyz"), BaseSort::Weight);
     }
+
+    /// 构造双层码表引擎（贴近真实多词库方案）：
+    /// - 主库 `codetable-system`（base_order 0，**带权重**）：同码 "aa" 两条——"主低"(w10,出现序0)、
+    ///   "主高"(w100,出现序1)，故权重序与出现序**相反**（用于区分 weight/natural）。
+    /// - 扩展库 `codetable-extra-x`（base_order 1，**无权重**，default_weight=50）：同码 "aa" 一条 "扩"。
+    fn engine_two_layers(opts: CommitOptions) -> CodeTableEngine {
+        let mut main = CodetableDict::empty();
+        main.merge_single("aa".into(), "主低".into(), 10, 0);
+        main.merge_single("aa".into(), "主高".into(), 100, 1);
+        let mut ext = CodetableDict::empty();
+        ext.merge_single("aa".into(), "扩".into(), 0, 0);
+
+        let dm = DictManager::new();
+        dm.register_layer(Box::new(SystemDictLayer::new(
+            CachedDict::Memory(main),
+            "codetable-system",
+        )));
+        dm.register_layer(Box::new(
+            SystemDictLayer::with_enabled(CachedDict::Memory(ext), "codetable-extra-x", true)
+                .with_base_order(1)
+                .with_default_weight(Some(50)),
+        ));
+        CodeTableEngine::new(4, opts, Arc::new(dm))
+    }
+
+    fn texts_of(e: &CodeTableEngine, input: &str) -> Vec<String> {
+        e.convert(input, 50)
+            .unwrap()
+            .candidates
+            .into_iter()
+            .map(|c| c.text)
+            .collect()
+    }
+
+    #[test]
+    fn multi_layer_weight_mode_weight_primary_default_weight_places_ext() {
+        // weight 模式（默认）：权重主导 → 主高(100) > 扩(50, 由 default_weight) > 主低(10)。
+        // 证明：① 权重优先于 base_order（主低虽 base_order 0 却因低权重沉底）；
+        //       ② default_weight 让无权重扩展库落在 50 档（介于 100 与 10 之间）。
+        let e = engine_two_layers(CommitOptions::default());
+        assert_eq!(
+            texts_of(&e, "aa"),
+            vec!["主高", "扩", "主低"],
+            "weight 模式应权重主导 + default_weight 定档"
+        );
+    }
+
+    #[test]
+    fn multi_layer_natural_mode_base_order_tiers_dicts_ignores_weight() {
+        // natural 模式：忽略权重，按 base_order 档位分组、组内按出现序。
+        // → 主库(base_order 0)整组在前：主低(出现序0)、主高(出现序1)；扩展库(base_order 1)在后：扩。
+        // 证明：① base_order 分档把整个扩展库排到主库之后（与条目权重无关）；
+        //       ② 组内忽略权重按出现序（主低虽权重低却因出现序靠前而在主高之前）。
+        let e = engine_two_layers(CommitOptions {
+            base_sort: BaseSort::Natural,
+            ..Default::default()
+        });
+        assert_eq!(
+            texts_of(&e, "aa"),
+            vec!["主低", "主高", "扩"],
+            "natural 模式应按 base_order 分档 + 组内出现序、忽略权重"
+        );
+    }
 }
