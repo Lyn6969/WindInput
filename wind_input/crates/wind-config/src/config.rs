@@ -593,7 +593,7 @@ pub struct InputConfig {
     /// 短语前缀列举（含命令栏 $CC/$SS/$AA）。原 dict.phrase / Go input.phrase。
     #[serde(default)]
     pub phrase: PhraseConfig,
-    /// 顶码上屏策略（内部/实验，默认 pre_confirm 保持既有行为）。
+    /// 顶码上屏策略（内部/实验，默认 direct_commit 真提交时序，躲开 diff 合并与整段下划线）。
     #[serde(default)]
     pub top_commit_mode: TopCommitMode,
 }
@@ -676,8 +676,8 @@ pub enum SmartMethod {
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, Default, PartialEq)]
 #[serde(rename_all = "snake_case")]
 pub enum TopCommitMode {
-    #[default]
     PreConfirm,
+    #[default]
     DirectCommit,
 }
 
@@ -2120,9 +2120,9 @@ smart_method = "delete_replace"
     }
 
     #[test]
-    fn top_commit_mode_default_is_pre_confirm() {
+    fn top_commit_mode_default_is_direct_commit() {
         let c = InputConfig::default();
-        assert_eq!(c.top_commit_mode, TopCommitMode::PreConfirm);
+        assert_eq!(c.top_commit_mode, TopCommitMode::DirectCommit);
     }
 
     #[test]
@@ -2133,9 +2133,9 @@ smart_method = "delete_replace"
     }
 
     #[test]
-    fn top_commit_mode_absent_defaults_pre_confirm() {
+    fn top_commit_mode_absent_defaults_direct_commit() {
         let cfg: InputConfig = toml::from_str("").unwrap();
-        assert_eq!(cfg.top_commit_mode, TopCommitMode::PreConfirm);
+        assert_eq!(cfg.top_commit_mode, TopCommitMode::DirectCommit);
     }
 
     /// 工具栏自动隐藏：默认关、超时 5 秒；空表反序列化与 Default 一致。

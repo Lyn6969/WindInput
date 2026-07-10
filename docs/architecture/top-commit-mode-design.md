@@ -39,8 +39,8 @@ keyup(同一键)                            ← +70~100ms（= keydown→keyup �
 
 **目标**
 - 给**顶码上屏**加一个内部配置 `input.top_commit_mode`，可在两种上屏策略间切换，用于按宿主 A/B 对比：
-  - `pre_confirm`（预确认，默认）：当前 `_pendingCommitPrefix` 聚合行为。
-  - `direct_commit`（直接提交）：真提交 + keyup 延迟重开新组合。
+  - `pre_confirm`（预确认）：当前 `_pendingCommitPrefix` 聚合行为。
+  - `direct_commit`（直接提交，**默认**）：真提交 + keyup 延迟重开新组合。
 
 **非目标（本期不做）**
 - 智能标点顶屏（`CommitAndHold` 路径，即 WPS 清空那条）——留作后续，复用本期的「commit + keyup 延迟重开」原语。
@@ -61,8 +61,8 @@ keyup(同一键)                            ← +70~100ms（= keydown→keyup �
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, Default, PartialEq)]
 #[serde(rename_all = "snake_case")]
 pub enum TopCommitMode {
-    #[default]
     PreConfirm,
+    #[default]
     DirectCommit,
 }
 ```
@@ -72,13 +72,13 @@ pub enum TopCommitMode {
 ```rust
 pub struct InputConfig {
     // …既有字段…
-    /// 顶码上屏策略（内部/实验，默认 pre_confirm 保持既有行为）。
+    /// 顶码上屏策略（内部/实验，默认 direct_commit 真提交时序）。
     #[serde(default)]
     pub top_commit_mode: TopCommitMode,
 }
 ```
 
-- 默认 `PreConfirm` = 当前行为，**零回归**。
+- 默认 `DirectCommit` = 真提交时序，躲开 diff 合并与整段下划线；需回退旧行为显式设 `pre_confirm`。
 - serde `snake_case` → TOML 值 `pre_confirm` / `direct_commit`。
 
 ## 4. 数据流（direct_commit 下的顶码）
@@ -126,15 +126,15 @@ pub struct InputConfig {
 | keyup 与定时器竞态 | 先到者开组合并清暂存，后到者见暂存空即 no-op |
 | 暂存期间来新按键（快打） | 先 flush 余码组合，再处理新键（防错序） |
 | 暂存期间失焦/宿主强杀组合 | flush 或按 EndComposition 语义收口；余码组合已在服务端 buffer，flush 后正常续打 |
-| `pre_confirm`（默认） | 完全走现有路径，行为不变，零回归 |
+| `pre_confirm`（回退旧行为） | 完全走现有路径，行为不变，零回归 |
 
 ## 7. 测试计划
 
 - **Rust 单测**（wind-coordinator）：
   - `top_commit_mode=direct_commit` 时顶码返回 `CommitThenDeferComposition{commit_text, deferred_composition=余码}`。
-  - `top_commit_mode=pre_confirm`（默认）时顶码维持 `InsertText{has_new_composition}`。
+  - `top_commit_mode=pre_confirm` 时顶码维持 `InsertText{has_new_composition}`。
   - 余码为空时退化为普通 CommitText。
-  - config serde round-trip（`pre_confirm`/`direct_commit`）+ 缺省默认 `pre_confirm`。
+  - config serde round-trip（`pre_confirm`/`direct_commit`）+ 缺省默认 `direct_commit`。
 - **C++**：本机 MSVC `/Zs` 语法检查（TextService.cpp / KeyEventSink.cpp）。
 - **真机 A/B**（两模式各测）：终端(Tabby/WT) 不双写 · WPS 顶屏不清空 · 记事本正常 · 已确认文字无下划线歧义。
 
@@ -142,4 +142,4 @@ pub struct InputConfig {
 
 - 智能标点顶屏（`CommitAndHold`）复用本原语：把「CommitText + 立即 HoldComposition」改为「CommitText + keyup 延迟重开 held 符号」，根治 WPS 清空。
 - per-app 自动分流：按宿主进程名选 `top_commit_mode`（如 WPS/Office→direct_commit、终端→按对比结果定），接入统一 app_rules 机制。
-- 若 direct_commit 全面胜出，考虑设为默认并逐步下线 pre_confirm 分段显示属性伪装逻辑。
+- direct_commit 已设为默认；后续视真机反馈逐步下线 pre_confirm 分段显示属性伪装逻辑。
