@@ -1150,9 +1150,11 @@ impl Coordinator {
         } else {
             String::new()
         };
-        // 抑制：命中密码 InputScope 位 且 策略开关开 → 强制英文。
-        let suppress =
-            crate::input_diag::is_password_scope(mask) && self.password_suppress_enabled.load(Relaxed);
+        // 抑制：命中密码 InputScope 位 且 compartment 未禁用（禁用态 DLL 已放行所有键，引擎收不到键，
+        // 抑制是 moot 的——见设计 D 节）且 策略开关开 → 强制英文。
+        let suppress = crate::input_diag::is_password_scope(mask)
+            && !disabled
+            && self.password_suppress_enabled.load(Relaxed);
         self.password_suppress.store(suppress, Relaxed);
         {
             let mut d = self
@@ -4105,6 +4107,10 @@ impl MessageHandler for Coordinator {
             s.menu_open = false; // 复位菜单态，否则下一个键被 forward_menu_key 吞掉
             self.reset_exclusive_modes(&mut s); // 失焦丢弃临时英文/拼音/快捷输入残留
         }
+        // 失焦即清抑制态：密码框失焦到下次 focus_gained 之间无控件收键，suppress 残留虽不可利用，
+        // 但属状态卫生隐患——独立 atomic，无锁依赖，不与上面的 state 锁冲突。
+        self.password_suppress
+            .store(false, std::sync::atomic::Ordering::Relaxed);
         self.notify_toolbar_async(); // 隐藏工具栏（防抖，异步避免阻塞 bridge 线程）
         self.notify_ui_hide(); // 隐藏候选窗 + 弹出菜单（HideCandidates 连带关菜单）
         self.hide_tip(); // 失焦隐藏状态提示（常驻模式尤需）
@@ -5144,5 +5150,39 @@ mod input_diag_tests {
         assert!(c.password_suppress_enabled.load(Relaxed)); // 默认开
         c.toggle_password_suppress();
         assert!(!c.password_suppress_enabled.load(Relaxed));
+    }
+
+    #[test]
+    fn focus_lost_clears_password_suppress() {
+        use std::sync::atomic::Ordering::Relaxed;
+        let c = test_coordinator();
+        c.apply_input_diag(1234, false, 2, 1 << 31);
+        assert!(
+            c.password_suppress.load(Relaxed),
+            "前置条件：密码框抑制应已置位"
+        );
+        c.handle_focus_lost();
+        assert!(
+            !c.password_suppress.load(Relaxed),
+            "失焦后应清除密码框抑制态，避免残留到下次 focus_gained 之前"
+        );
+    }
+
+    #[test]
+    fn compartment_disabled_does_not_set_suppress() {
+        use std::sync::atomic::Ordering::Relaxed;
+        let c = test_coordinator();
+        // disabled=true 且 mask 含密码位：compartment 已禁用，DLL 放行所有键，suppress 应为 moot。
+        c.apply_input_diag(1, true, 1, 1 << 31);
+        assert!(
+            !c.password_suppress.load(Relaxed),
+            "compartment 禁用态不应冗余置位 suppress"
+        );
+        let d = c.last_input_diag.lock().unwrap();
+        assert_eq!(
+            d.reason,
+            InputDiagReason::CompartmentDisabled,
+            "reason 不受 suppress 判据变化影响"
+        );
     }
 }
