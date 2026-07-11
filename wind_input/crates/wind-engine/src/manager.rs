@@ -537,6 +537,14 @@ impl EngineManager {
             .unwrap_or(false)
     }
 
+    /// 活跃引擎的最大编码长度（码表返回其码长；拼音/无意义引擎返回 0）。
+    /// 供协调器判定短语前缀补全是否"未满码"（镜像码表引擎 single_code_complete 的 `input < max` 条件）。
+    pub fn active_max_code_length(&self) -> usize {
+        self.active_engine()
+            .map(|e| e.max_code_length())
+            .unwrap_or(0)
+    }
+
     /// 可用方案列表（快照拷贝）。
     pub fn available_schemas(&self) -> Vec<String> {
         self.available

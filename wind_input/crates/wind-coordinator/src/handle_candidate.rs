@@ -341,15 +341,21 @@ impl Coordinator {
             // marker 短语。**$CC 命令** → is_command（选中直接执行，group_code 作执行输入
             // 上下文）；**$SS/$AA 组** → is_group（选中补全到完整码再展开成员，二级选择）。
             let min_prefix = self.rt().config.input.phrase.min_prefix;
-            // 精确匹配模式（`single_code_input`，仅纯码表方案）：抑制短语前缀枚举，只保留上面的
-            // 精确码短语（`lookup`）——与码表引擎跳过 `search_prefix` 的行为对齐。混输不适用：
-            // 其拼音半边恒前缀匹配，切精确会与拼音割裂（见 `EngineManager::is_codetable`）。
-            let prefix_hits = if self.engine_mgr.is_codetable()
-                && self.engine_mgr.codetable_settings().single_code_input
-            {
-                Vec::new()
-            } else {
+            // 精确匹配模式（`single_code_input`，仅纯码表方案）：默认抑制短语前缀枚举，只保留上面的
+            // 精确码短语（`lookup`）——与码表引擎跳过 `search_prefix` 的行为对齐。混输不适用：其拼音半边
+            // 恒前缀匹配，切精确会与拼音割裂（见 `EngineManager::is_codetable`）。
+            // 例外——镜像码表引擎 `single_code_complete`：当前无任何候选（码表 + 精确短语均空）且未满码时，
+            // 放行一次前缀枚举作补全，避免精确模式下彻底无候选（对齐引擎"精确空码取更长首选"语义）。
+            let ct = self.engine_mgr.codetable_settings();
+            let allow_prefix = !(self.engine_mgr.is_codetable() && ct.single_code_input)
+                || (ct.single_code_complete
+                    && candidates.is_empty()
+                    && state.input_buffer.chars().count()
+                        < self.engine_mgr.active_max_code_length());
+            let prefix_hits = if allow_prefix {
                 phrases.lookup_prefix(&state.input_buffer, &recent, min_prefix)
+            } else {
+                Vec::new()
             };
             for hit in prefix_hits {
                 let text = Self::clamp_candidate_display(&hit.text, max_disp);
