@@ -1182,9 +1182,28 @@ impl Coordinator {
             .load(std::sync::atomic::Ordering::Relaxed)
     }
 
-    /// HUD 推送占位：Task 6 填实现（按 `input_diag_hud_visible` 决定是否经 host-render/UI
-    /// 推送 `last_input_diag` 快照）。本任务仅接线调用点，避免跨任务编译断裂。
-    fn push_input_diag_hud_if_visible(&self) {}
+    /// HUD 推送：`input_diag_hud_visible` 开启时，把 `last_input_diag` 快照经 UI 通道
+    /// 下发 `ShowInputDiag`（UI 线程惰性创建 HUD 窗口并显示/更新）。关闭时不推送。
+    fn push_input_diag_hud_if_visible(&self) {
+        use std::sync::atomic::Ordering::Relaxed;
+        if !self.input_diag_hud_visible.load(Relaxed) {
+            return;
+        }
+        let d = self
+            .last_input_diag
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let view = wind_ui::manager::InputDiagView {
+            process_name: d.process_name.clone(),
+            pid: d.pid,
+            disabled: d.disabled,
+            reason_text: crate::input_diag::reason_label(d.reason).to_string(),
+            mask: d.mask,
+        };
+        let _ = self
+            .ui_tx
+            .send(wind_ui::manager::UiCommand::ShowInputDiag(view));
+    }
 
     /// 决策进程 `proc_name` 的中英初始状态（初始状态语义的单一内聚点）。
     /// 顺序：per-app 记忆表 →（预留：按应用规则表）→ 全局记忆 / 配置默认。

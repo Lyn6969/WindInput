@@ -5,6 +5,9 @@
 
 use crate::candidate_window::{CandidateItem, CandidateWindow, CandidateWindowConfig};
 use crate::toast::{ToastKind, ToastPosition};
+
+/// re-export：使协调器以 `wind_ui::manager::InputDiagView` 统一引用。
+pub use crate::input_diag_hud::InputDiagView;
 use std::sync::mpsc;
 use tracing::{debug, error, info};
 #[cfg(windows)]
@@ -63,6 +66,10 @@ pub enum UiCommand {
     },
     /// 隐藏状态提示气泡（常驻模式失焦/切走输入法时）。
     HideStatusTip,
+    /// 显示/更新输入诊断 HUD（右键「高级」开）。惰性创建，可拖动，双击复制。
+    ShowInputDiag(crate::input_diag_hud::InputDiagView),
+    /// 隐藏输入诊断 HUD。
+    HideInputDiag,
     /// 更新常驻工具栏状态（中英/方案/标点/全半角）
     UpdateToolbar(crate::toolbar::ToolbarState),
     /// 隐藏工具栏
@@ -456,6 +463,9 @@ impl UiManager {
             }
         };
         let mut tip_hide_at: Option<std::time::Instant> = None;
+
+        // 输入诊断 HUD（惰性创建：首次 ShowInputDiag 时构造，best-effort）
+        let mut input_diag_hud: Option<crate::input_diag_hud::InputDiagHud> = None;
 
         // 一次性通知 toast（best-effort）
         let mut toast = match crate::toast::Toast::new() {
@@ -911,6 +921,23 @@ impl UiManager {
                             hr.hide_kind(HOST_WINDOW_STATUS);
                         }
                         tip_hide_at = None;
+                    }
+                    UiCommand::ShowInputDiag(v) => {
+                        // 惰性创建：失败仅记 error，不影响其它窗口。
+                        if input_diag_hud.is_none() {
+                            match crate::input_diag_hud::InputDiagHud::new() {
+                                Ok(h) => input_diag_hud = Some(h),
+                                Err(e) => error!("Failed to create input diag HUD: {}", e),
+                            }
+                        }
+                        if let Some(h) = input_diag_hud.as_mut() {
+                            h.show_or_update(&v);
+                        }
+                    }
+                    UiCommand::HideInputDiag => {
+                        if let Some(h) = input_diag_hud.as_mut() {
+                            h.hide();
+                        }
                     }
                     UiCommand::ShowToast {
                         text,
