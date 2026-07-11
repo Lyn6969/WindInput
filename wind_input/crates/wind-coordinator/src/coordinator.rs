@@ -1184,7 +1184,7 @@ impl Coordinator {
 
     /// HUD 推送：`input_diag_hud_visible` 开启时，把 `last_input_diag` 快照经 UI 通道
     /// 下发 `ShowInputDiag`（UI 线程惰性创建 HUD 窗口并显示/更新）。关闭时不推送。
-    fn push_input_diag_hud_if_visible(&self) {
+    pub(crate) fn push_input_diag_hud_if_visible(&self) {
         use std::sync::atomic::Ordering::Relaxed;
         if !self.input_diag_hud_visible.load(Relaxed) {
             return;
@@ -5124,5 +5124,25 @@ mod input_diag_tests {
             "解除抑制后字母键应进入中文组词流，不应透传，实际: {:?}",
             action
         );
+    }
+
+    #[test]
+    fn toggle_hud_flips_visibility() {
+        use std::sync::atomic::Ordering::Relaxed;
+        let c = test_coordinator();
+        assert!(!c.input_diag_hud_visible.load(Relaxed));
+        c.toggle_input_diag_hud();
+        assert!(c.input_diag_hud_visible.load(Relaxed));
+        c.toggle_input_diag_hud();
+        assert!(!c.input_diag_hud_visible.load(Relaxed));
+    }
+
+    #[test]
+    fn toggle_password_suppress_flips_enabled() {
+        use std::sync::atomic::Ordering::Relaxed;
+        let c = test_coordinator();
+        assert!(c.password_suppress_enabled.load(Relaxed)); // 默认开
+        c.toggle_password_suppress();
+        assert!(!c.password_suppress_enabled.load(Relaxed));
     }
 }

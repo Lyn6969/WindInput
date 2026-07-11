@@ -238,6 +238,10 @@ pub enum MenuCmd {
     TakeScreenshot,
     /// 截图候选窗口到剪贴板（高级菜单）
     ScreenshotCandidateToClipboard,
+    /// 切换输入诊断 HUD 显隐（高级菜单）
+    ToggleInputDiagnostics,
+    /// 切换密码框强制英文（高级菜单，临时测试入口）
+    TogglePasswordSuppress,
 }
 
 /// 菜单项的动作类型（右键候选菜单 + 功能主菜单共用）
@@ -287,6 +291,8 @@ impl MenuKind {
                 MenuCmd::ScreenshotCandidateToClipboard => 112,
                 MenuCmd::OpenAppDir => 113,
                 MenuCmd::OpenLogDir => 114,
+                MenuCmd::ToggleInputDiagnostics => 120,
+                MenuCmd::TogglePasswordSuppress => 121,
                 MenuCmd::SchemaSelect(i) => 1000 + i as i32,
                 MenuCmd::ThemeSelect(i) => 2000 + i as i32,
                 MenuCmd::FilterMode(i) => 3000 + i as i32,
@@ -319,6 +325,8 @@ impl MenuKind {
             112 => MenuCmd::ScreenshotCandidateToClipboard,
             113 => MenuCmd::OpenAppDir,
             114 => MenuCmd::OpenLogDir,
+            120 => MenuCmd::ToggleInputDiagnostics,
+            121 => MenuCmd::TogglePasswordSuppress,
             1000..=1999 => MenuCmd::SchemaSelect((id - 1000) as usize),
             2000..=2999 => MenuCmd::ThemeSelect((id - 2000) as usize),
             3000..=3999 => MenuCmd::FilterMode((id - 3000) as usize),

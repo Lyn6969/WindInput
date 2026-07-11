@@ -75,6 +75,30 @@ impl Coordinator {
                     .and_then(|p| p.parent().map(|d| d.to_path_buf())),
             ),
             MenuCmd::OpenLogDir => self.open_dir(Config::log_dir()),
+            MenuCmd::ToggleInputDiagnostics => self.toggle_input_diag_hud(),
+            MenuCmd::TogglePasswordSuppress => self.toggle_password_suppress(),
+        }
+    }
+
+    /// 切换输入诊断 HUD 显隐（高级菜单）：开启时立即推送当前快照，关闭时下发隐藏。
+    pub(crate) fn toggle_input_diag_hud(&self) {
+        use std::sync::atomic::Ordering::Relaxed;
+        let now = !self.input_diag_hud_visible.load(Relaxed);
+        self.input_diag_hud_visible.store(now, Relaxed);
+        if now {
+            self.push_input_diag_hud_if_visible();
+        } else {
+            let _ = self.ui_tx.send(UiCommand::HideInputDiag);
+        }
+    }
+
+    /// 切换密码框强制英文抑制策略（高级菜单，临时测试入口）：关闭时立即解除当前生效的强制英文。
+    pub(crate) fn toggle_password_suppress(&self) {
+        use std::sync::atomic::Ordering::Relaxed;
+        let now = !self.password_suppress_enabled.load(Relaxed);
+        self.password_suppress_enabled.store(now, Relaxed);
+        if !now {
+            self.password_suppress.store(false, Relaxed);
         }
     }
 
@@ -311,6 +335,21 @@ impl Coordinator {
             M::leaf("打开应用程序目录", cmd(MenuCmd::OpenAppDir), true, false),
             M::leaf("打开用户数据目录", cmd(MenuCmd::OpenConfigDir), true, false),
             M::leaf("打开日志目录", cmd(MenuCmd::OpenLogDir), true, false),
+            M::separator(),
+            M::leaf(
+                "输入诊断 HUD",
+                cmd(MenuCmd::ToggleInputDiagnostics),
+                true,
+                self.input_diag_hud_visible
+                    .load(std::sync::atomic::Ordering::Relaxed),
+            ),
+            M::leaf(
+                "密码框强制英文",
+                cmd(MenuCmd::TogglePasswordSuppress),
+                true,
+                self.password_suppress_enabled
+                    .load(std::sync::atomic::Ordering::Relaxed),
+            ),
         ];
 
         let items = vec![
