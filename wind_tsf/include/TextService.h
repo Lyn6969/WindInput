@@ -3,6 +3,8 @@
 #include "Globals.h"
 #include "BinaryProtocol.h" // HostWindowKind / HOST_WINDOW_KIND_COUNT for the host window array
 #include <string>
+#include <vector>
+#include <utility>
 
 // Forward declarations
 class CKeyEventSink;
@@ -282,6 +284,13 @@ private:
     HWND  _hHotkeyWnd;                // 隐藏消息窗口，接收 WM_HOTKEY
     ATOM  _hotkeyWndClass;            // RegisterClassEx 返回的窗口类原子
     BOOL  _hotkeysActive;             // 当前是否已 RegisterHotKey 候选热键（Ctrl+0..9 / Ctrl+Shift+0..9）
+    // 加词热键（Ctrl+= 等）全局拦截：门卫比候选热键更严——中文模式 + 焦点在可编辑文本框 +
+    // 非密码框 + 持有 thread focus 才注册，让抢占面积最小化，不干扰非文本框处的宿主快捷键。
+    BOOL  _addWordHotkeysActive;      // 当前是否已 RegisterHotKey 加词热键
+    bool  _focusIsPassword;           // 当前焦点是否密码框（KEYBOARD_DISABLED）；密码框不注册加词热键
+    // 已注册的加词热键 (RegisterHotKey id, raw hash)。raw hash 高16位=KEYMOD、低16位=VK，
+    // 供 UnregisterHotKey 与 WM_HOTKEY 分发反解。最多两项（add_word / open_add_word_dialog）。
+    std::vector<std::pair<int, uint32_t>> _addWordHotkeyIds;
     // 线程焦点门控：RegisterHotKey 在每个进程内对同一组合键独占。
     // 多进程 IME 实例同时尝试注册会导致 ERROR_HOTKEY_ALREADY_REGISTERED (1409)，
     // 让前台应用拿不到 WM_HOTKEY，反而让残留的后台进程吃掉。
@@ -293,6 +302,15 @@ private:
     void _UninitHotkeyWindow();       // 反向清理
     void _RegisterCandidateHotkeys(); // 注册 Ctrl+0..9 + Ctrl+Shift+0..9（候选可见时）
     void _UnregisterCandidateHotkeys();
+    // 加词热键：Reevaluate 可从任意线程调用（内部 PostMessage 到 _hHotkeyWnd 保证在
+    // 拥有该窗口的线程执行 RegisterHotKey）；_DoReevaluate/_Register/_Unregister 仅主线程。
+    void _ReevaluateAddWordHotkey();   // 线程安全入口：post 消息触发重新评估
+    void _DoReevaluateAddWordHotkey(); // 主线程：按门卫条件注册/注销
+    void _RegisterAddWordHotkeys();
+    void _UnregisterAddWordHotkeys();
+    // 中英模式集中 setter：赋值 _bChineseMode 并触发加词热键重评（模式变化是门卫条件之一）。
+    // 可从 async reader 线程调用（reeval 内部 post 到窗口线程）。
+    void _SetChineseMode(BOOL v);
     static LRESULT CALLBACK _HotkeyWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam);
     DWORD _activateFlags;  // ActivateEx flags (TF_TMAE_SECUREMODE, etc.)
 

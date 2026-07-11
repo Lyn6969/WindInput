@@ -24,6 +24,10 @@ pub const MOD_GENERIC_MASK: u32 = MOD_SHIFT | MOD_CTRL | MOD_ALT | MOD_WIN;
 /// 热键策略位（高位，发给 TSF；与 Go ipc.HotkeyPolicy* / TSF HOTKEY_POLICY_* 对齐）
 const HOTKEY_POLICY_CHINESE_ONLY: u32 = 0x40000000;
 const HOTKEY_POLICY_SESSION: u32 = 0x80000000;
+/// 全局拦截位（正交标记，与 CHINESE_ONLY 叠加）：TSF 侧在「中文模式 + 焦点在文本框」
+/// 时用 Win32 RegisterHotKey 把这些键注册为系统级热键，让 OS 在 WM_KEYDOWN 派发前
+/// 直接消费，规避 QQNT / Tabby 等 Chromium 类宿主无视 TSF pfEaten 契约的加速键双处理。
+const HOTKEY_POLICY_GLOBAL: u32 = 0x20000000;
 
 /// Windows 虚拟键码（toggle / select / page 用）
 const VK_LSHIFT: u32 = 0xA0;
@@ -124,8 +128,16 @@ impl Compiler {
             ("toggle_s2t", &h.toggle_s2t),
         ] {
             if let Some(raw) = parse_hotkey(value) {
+                // 加词类热键额外叠加 GLOBAL 位：TSF 侧在中文+文本框时 RegisterHotKey 全局拦截，
+                // 规避 Chromium 类宿主（QQNT/Tabby）的加速键双处理。其余 chinese-only 键不拦截，
+                // 避免不必要地抢占宿主快捷键。
+                let policy = if matches!(name, "add_word" | "open_add_word_dialog") {
+                    HOTKEY_POLICY_CHINESE_ONLY | HOTKEY_POLICY_GLOBAL
+                } else {
+                    HOTKEY_POLICY_CHINESE_ONLY
+                };
                 result.key_down.push(HotkeyEntry {
-                    tsf_hash: raw | HOTKEY_POLICY_CHINESE_ONLY,
+                    tsf_hash: raw | policy,
                     match_hash: raw,
                     action: name.to_string(),
                 });
@@ -521,5 +533,43 @@ mod tests {
                 .any(|e| e.action == "open_add_word_dialog"),
             "open_add_word_dialog 应注册进 key_down"
         );
+    }
+
+    #[test]
+    fn add_word_hotkeys_carry_global_policy() {
+        let mut cfg = Config::default();
+        cfg.keys.add_word = "ctrl+equal".to_string();
+        cfg.keys.open_add_word_dialog = "ctrl+shift+equal".to_string();
+        cfg.keys.toggle_punct = "ctrl+period".to_string();
+        let compiled = Compiler::new(cfg).compile();
+
+        let find = |a: &str| compiled.key_down.iter().find(|e| e.action == a).unwrap().clone();
+
+        // 加词两键：CHINESE_ONLY + GLOBAL 叠加
+        for a in ["add_word", "open_add_word_dialog"] {
+            let e = find(a);
+            assert!(
+                e.tsf_hash & HOTKEY_POLICY_GLOBAL != 0,
+                "{a} 的 tsf_hash 应带 GLOBAL 位"
+            );
+            assert!(
+                e.tsf_hash & HOTKEY_POLICY_CHINESE_ONLY != 0,
+                "{a} 的 tsf_hash 应仍带 CHINESE_ONLY 位"
+            );
+            // match_hash 是规范化的原始 hash，不含任何 policy 位
+            assert_eq!(
+                e.match_hash & (HOTKEY_POLICY_CHINESE_ONLY | HOTKEY_POLICY_GLOBAL),
+                0,
+                "{a} 的 match_hash 不应含 policy 位"
+            );
+        }
+
+        // 其它 chinese-only 键（toggle_punct）不该被全局拦截，避免多抢宿主快捷键
+        let tp = find("toggle_punct");
+        assert!(
+            tp.tsf_hash & HOTKEY_POLICY_GLOBAL == 0,
+            "toggle_punct 不应带 GLOBAL 位"
+        );
+        assert!(tp.tsf_hash & HOTKEY_POLICY_CHINESE_ONLY != 0);
     }
 }

@@ -17,6 +17,7 @@ void CHotkeyManager::UpdateHotkeys(const std::vector<uint32_t>& keyDownHotkeys,
     _keyDownHotkeys.clear();
     _keyDownChineseOnly.clear();
     _keyDownSession.clear();
+    _globalHotkeys.clear();
     _keyUpHotkeys.clear();
 
     // Add KeyDown hotkeys — 按 policy 位分流到三个 set
@@ -34,6 +35,11 @@ void CHotkeyManager::UpdateHotkeys(const std::vector<uint32_t>& keyDownHotkeys,
         else
         {
             _keyDownHotkeys.insert(rawHash);
+        }
+        // GLOBAL 是正交标记（与上面三选一叠加）：额外收进 _globalHotkeys 供 RegisterHotKey。
+        if (hash & HOTKEY_POLICY_GLOBAL)
+        {
+            _globalHotkeys.insert(rawHash);
         }
     }
 

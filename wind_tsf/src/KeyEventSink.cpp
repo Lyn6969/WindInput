@@ -1507,9 +1507,11 @@ BOOL CKeyEventSink::_IsMatchingKeyUp(WPARAM wParam, uint32_t pendingKey)
 BOOL CKeyEventSink::DispatchHotkey(uint32_t vk, uint32_t mods)
 {
     // 走与 OnKeyDown 同一通路：send + handle response。
-    // 仅用于 Pin/Delete 候选热键（Ctrl+0..9 / Ctrl+Shift+0..9），它们操作的是
-    // 已经显示的候选，不依赖 caret / composition 状态。AddWord (Ctrl+=) 走
-    // OnKeyDown 通路以确保 TSF composition 能正常建立。
+    // 用于经 WM_HOTKEY（RegisterHotKey 全局拦截）到达的热键：
+    //   - Pin/Delete 候选热键（Ctrl+0..9 / Ctrl+Shift+0..9）：操作已显示候选，不依赖 caret。
+    //   - AddWord（Ctrl+= 等）：中文+文本框时经全局拦截规避 Chromium 宿主双处理。
+    //     composition 由 _HandleServiceResponse 处理 UpdateComposition 建立；caret 定位
+    //     由 WM_HOTKEY 分发处先行 SendCaretPositionUpdate 补齐（见 TextService WndProc）。
     if (!_SendKeyToService(vk, mods, KEY_EVENT_DOWN))
     {
         WIND_LOG_ERROR_FMT(L"DispatchHotkey: _SendKeyToService failed vk=0x%02X mods=0x%04X\n", vk, mods);

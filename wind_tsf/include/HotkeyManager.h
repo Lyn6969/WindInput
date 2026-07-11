@@ -84,7 +84,13 @@ public:
     // 按 bit 把哈希分流到 _keyDownHotkeys / _keyDownChineseOnly / _keyDownSession.
     static constexpr uint32_t HOTKEY_POLICY_CHINESE_ONLY = 0x40000000;
     static constexpr uint32_t HOTKEY_POLICY_SESSION      = 0x80000000;
-    static constexpr uint32_t HOTKEY_POLICY_MASK         = HOTKEY_POLICY_CHINESE_ONLY | HOTKEY_POLICY_SESSION;
+    // 全局拦截位（正交，与 CHINESE_ONLY 叠加）：TSF 在中文+文本框时用 RegisterHotKey
+    // 把这些键注册为系统级热键，规避 Chromium 类宿主的加速键双处理。
+    static constexpr uint32_t HOTKEY_POLICY_GLOBAL       = 0x20000000;
+    static constexpr uint32_t HOTKEY_POLICY_MASK         = HOTKEY_POLICY_CHINESE_ONLY | HOTKEY_POLICY_SESSION | HOTKEY_POLICY_GLOBAL;
+
+    // 需全局拦截的热键 raw hash（GLOBAL 位命中，已剥 policy）。供 RegisterHotKey 反解 (mods,vk)。
+    const std::unordered_set<uint32_t>& GlobalHotkeys() const { return _globalHotkeys; }
 
 private:
     // Hotkey whitelist (KeyDown triggered) — 两模式都吃
@@ -95,6 +101,9 @@ private:
 
     // 仅中文模式 + 有 session 吃
     std::unordered_set<uint32_t> _keyDownSession;
+
+    // 需全局拦截（RegisterHotKey）的热键 raw hash，与 _keyDownChineseOnly 叠加（正交标记）
+    std::unordered_set<uint32_t> _globalHotkeys;
 
     // Hotkey whitelist (KeyUp triggered - for toggle mode keys)
     std::unordered_set<uint32_t> _keyUpHotkeys;
