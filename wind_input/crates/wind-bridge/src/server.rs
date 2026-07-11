@@ -368,8 +368,16 @@ fn handle_client(
                 composition_start_y: fg.caret.composition_start_y,
                 client_token: fg.client_token,
                 input_scope_mask: fg.input_scope_mask,
+                disabled: fg.disabled != 0,
+                reason: fg.reason,
             };
             handler.handle_focus_gained(&data);
+        }
+
+        if cmd == CMD_INPUT_STATE_REPORT
+            && let Ok(r) = decode_input_state_report(payload)
+        {
+            handler.handle_input_state_report(r.pid, r.disabled != 0, r.reason, r.input_scope_mask);
         }
     }
 
