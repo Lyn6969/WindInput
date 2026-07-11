@@ -35,6 +35,7 @@ pub const CMD_MENU_COMMAND: u16 = 0x0208;
 pub const CMD_COMPOSITION_TERMINATED: u16 = 0x0209;
 pub const CMD_SHOW_CONTEXT_MENU: u16 = 0x020A;
 pub const CMD_SYSTEM_MODE_SWITCH: u16 = 0x020B;
+pub const CMD_INPUT_STATE_REPORT: u16 = 0x0213;
 
 // 上行（darwin .app / Windows host-render DLL）：鼠标候选交互。方向与下行 0x020D/0x020E 由 dispatch 上下文区分。
 pub const CMD_CANDIDATE_SELECT: u16 = 0x020D; // payload: pageLocalIndex i32 LE；<0 为翻页按钮（-1 上页 / -2 下页，与 SHM 命中矩形约定一致）
@@ -342,22 +343,25 @@ impl CaretPayload {
 }
 
 // ──────────────────────────────────────────────
-// Focus Gained Payload (36 bytes)
+// Focus Gained Payload (38 bytes: 旧 36 + disabled(1) + reason(1))
 // ──────────────────────────────────────────────
 
-/// 焦点获取载荷 (36 bytes)
+/// 焦点获取载荷 (38 bytes: 旧 36 + disabled(1) + reason(1))
 #[derive(Clone, Copy, Debug)]
 pub struct FocusGainedPayload {
     pub caret: CaretPayload,
     pub client_token: u64,
     pub input_scope_mask: u64,
+    pub disabled: u8,
+    pub reason: u8,
 }
 
 impl FocusGainedPayload {
-    pub const SIZE: usize = 36;
+    pub const SIZE: usize = 38;
 
     pub fn from_bytes(buf: &[u8]) -> Option<Self> {
-        if buf.len() < Self::SIZE {
+        // 向后兼容：至少要有旧 36 字节；disabled/reason 缺省 0
+        if buf.len() < 36 {
             return None;
         }
         let caret = CaretPayload::from_bytes(&buf[0..20])?;
@@ -367,10 +371,52 @@ impl FocusGainedPayload {
         let input_scope_mask = u64::from_le_bytes([
             buf[28], buf[29], buf[30], buf[31], buf[32], buf[33], buf[34], buf[35],
         ]);
+        let disabled = if buf.len() >= 37 { buf[36] } else { 0 };
+        let reason = if buf.len() >= 38 { buf[37] } else { 0 };
         Some(Self {
             caret,
             client_token,
             input_scope_mask,
+            disabled,
+            reason,
+        })
+    }
+}
+
+// ──────────────────────────────────────────────
+// Input State Report Payload (14 bytes)
+// ──────────────────────────────────────────────
+
+/// compartment 变更时的最新输入态上报载荷 (14 bytes)
+#[derive(Clone, Copy, Debug)]
+pub struct InputStateReportPayload {
+    pub pid: u32,
+    pub disabled: u8,
+    pub reason: u8,
+    pub input_scope_mask: u64,
+}
+
+impl InputStateReportPayload {
+    pub const SIZE: usize = 14;
+
+    pub fn to_bytes(&self) -> [u8; Self::SIZE] {
+        let mut b = [0u8; Self::SIZE];
+        b[0..4].copy_from_slice(&self.pid.to_le_bytes());
+        b[4] = self.disabled;
+        b[5] = self.reason;
+        b[6..14].copy_from_slice(&self.input_scope_mask.to_le_bytes());
+        b
+    }
+
+    pub fn from_bytes(buf: &[u8]) -> Option<Self> {
+        if buf.len() < Self::SIZE {
+            return None;
+        }
+        Some(Self {
+            pid: u32::from_le_bytes(buf[0..4].try_into().ok()?),
+            disabled: buf[4],
+            reason: buf[5],
+            input_scope_mask: u64::from_le_bytes(buf[6..14].try_into().ok()?),
         })
     }
 }
@@ -541,6 +587,46 @@ pub const COMMIT_FLAG_CHINESE_MODE: u16 = 0x0004;
 
 pub const EVENT_KEY_DOWN: u8 = 0;
 pub const EVENT_KEY_UP: u8 = 1;
+
+#[cfg(test)]
+mod input_diag_wire_tests {
+    use super::*;
+
+    #[test]
+    fn focus_gained_backward_compat_36_bytes() {
+        // 旧 36 字节载荷（无 disabled/reason）仍可解，新字段默认 0
+        let mut buf = vec![0u8; 36];
+        buf[20..28].copy_from_slice(&7u64.to_le_bytes()); // client_token
+        buf[28..36].copy_from_slice(&(1u64 << 31).to_le_bytes()); // input_scope_mask
+        let p = FocusGainedPayload::from_bytes(&buf).unwrap();
+        assert_eq!(p.client_token, 7);
+        assert_eq!(p.input_scope_mask, 1 << 31);
+        assert_eq!(p.disabled, 0);
+        assert_eq!(p.reason, 0);
+    }
+
+    #[test]
+    fn focus_gained_reads_new_fields_38_bytes() {
+        let mut buf = vec![0u8; 38];
+        buf[36] = 1; // disabled
+        buf[37] = 2; // reason
+        let p = FocusGainedPayload::from_bytes(&buf).unwrap();
+        assert_eq!(p.disabled, 1);
+        assert_eq!(p.reason, 2);
+    }
+
+    #[test]
+    fn input_state_report_roundtrip() {
+        let r = InputStateReportPayload { pid: 4242, disabled: 1, reason: 1, input_scope_mask: 1 << 31 };
+        let bytes = r.to_bytes();
+        assert_eq!(bytes.len(), InputStateReportPayload::SIZE);
+        let d = InputStateReportPayload::from_bytes(&bytes).unwrap();
+        assert_eq!(d.pid, 4242);
+        assert_eq!(d.disabled, 1);
+        assert_eq!(d.reason, 1);
+        assert_eq!(d.input_scope_mask, 1 << 31);
+    }
+}
 
 #[cfg(test)]
 mod tests {
