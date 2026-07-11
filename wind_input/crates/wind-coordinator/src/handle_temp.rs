@@ -203,6 +203,17 @@ impl Coordinator {
         cand: &Candidate,
         candidate_pos: i32,
     ) -> KeyAction {
+        // $AA/$SS 组折叠候选：补全编码到完整码并重查展开（二级选择，不上屏组名）。
+        if cand.is_group {
+            state.temp_pinyin_buffer = cand.group_code.clone();
+            self.update_temp_pinyin_candidates(state);
+            let display = state.preedit.clone();
+            self.notify_ui_update(state);
+            return KeyAction::UpdateComposition {
+                caret_pos: display.chars().count() as u32,
+                text: display,
+            };
+        }
         // $CC 命令候选：执行动作（退出临拼后异步跑），不走文本/分段上屏。
         let cmd_code = state.temp_pinyin_buffer.clone();
         if let Some(act) =

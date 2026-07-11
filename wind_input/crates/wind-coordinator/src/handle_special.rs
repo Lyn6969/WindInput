@@ -109,10 +109,22 @@ impl Coordinator {
         None
     }
 
-    /// 特殊模式选中某候选（全局下标 `gi`）：`$CC` 命令候选 → 执行动作（退出后异步跑，触发键码不上屏）；
-    /// 否则文本上屏。统一空格 / 数字键 / 二三候选键的选中入口，保证命令候选选中即执行。
+    /// 特殊模式选中某候选（全局下标 `gi`）：`$AA`/`$SS` 组折叠候选 → 补全编码到完整码重查展开（二级选择）；
+    /// `$CC` 命令候选 → 执行动作（退出后异步跑，触发键码不上屏）；否则文本上屏。
+    /// 统一空格 / 数字键 / 二三候选键的选中入口，保证组/命令候选选中行为一致。
     fn commit_special_candidate(&self, state: &mut State, gi: usize) -> KeyAction {
         let cand = state.candidates[gi].clone();
+        // $AA/$SS 组折叠候选：补全编码到完整码并重查展开（不上屏组名）。
+        if cand.is_group {
+            state.special_buffer = cand.group_code.clone();
+            self.update_special_candidates(state);
+            let display = state.preedit.clone();
+            self.notify_ui_update(state);
+            return KeyAction::UpdateComposition {
+                text: display.clone(),
+                caret_pos: display.chars().count() as u32,
+            };
+        }
         let code = state.special_buffer.clone();
         if let Some(act) =
             self.overlay_commit_command(state, &cand, &code, |s, st| s.exit_special_mode(st))
@@ -269,17 +281,12 @@ impl Coordinator {
                                 .min(state.candidates.len() - 1),
                         )
                     };
-                    // 高亮候选为 $CC 命令：执行命令，触发标点不单独上屏（语义同 top_commit_command_guard）。
-                    if let Some(idx) = hi {
-                        let cand = state.candidates[idx].clone();
-                        let code = state.special_buffer.clone();
-                        if let Some(act) =
-                            self.overlay_commit_command(state, &cand, &code, |s, st| {
-                                s.exit_special_mode(st)
-                            })
-                        {
-                            return act;
-                        }
+                    // 高亮候选为组/命令：走统一选中（组→展开重查，命令→执行动作），
+                    // 触发标点不单独上屏（语义同 top_commit_command_guard）。
+                    if let Some(idx) = hi
+                        && (state.candidates[idx].is_group || state.candidates[idx].is_command)
+                    {
+                        return self.commit_special_candidate(state, idx);
                     }
                     let committed = hi
                         .map(|idx| state.candidates[idx].text.clone())

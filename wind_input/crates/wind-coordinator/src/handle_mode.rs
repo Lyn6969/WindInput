@@ -573,6 +573,17 @@ impl Coordinator {
             return KeyAction::Consumed;
         }
         let cand = state.candidates[gi].clone();
+        // $AA/$SS 组折叠候选：补全编码到完整码并重查展开（二级选择，不上屏组名）。
+        if cand.is_group {
+            state.mix_buffer = cand.group_code.clone();
+            self.update_mix_candidates(state);
+            let display = state.preedit.clone();
+            self.notify_ui_update(state);
+            return KeyAction::UpdateComposition {
+                caret_pos: display.chars().count() as u32,
+                text: display,
+            };
+        }
         // $CC 命令候选：执行动作（退出混输后异步跑），不走文本/分段上屏。
         let code = state.mix_buffer.clone();
         if let Some(act) =
@@ -896,19 +907,14 @@ impl Coordinator {
 
                 // ⑤ 其它标点：顶屏「已转换前缀 + 当前高亮候选」+ 转换后标点，退出
                 if let Some(ch) = punct_char(data.key_code, shift) {
-                    // 高亮候选为 $CC 命令：执行命令，触发标点不单独上屏（语义同 top_commit_command_guard）。
+                    // 高亮候选为组/命令：走统一选中（组→展开重查，命令→执行动作），标点不单独上屏。
                     if !state.candidates.is_empty() {
+                        let (start, _) = self.page_range(state);
                         let idx = self
                             .highlighted_global_index(state)
                             .min(state.candidates.len() - 1);
-                        let cand = state.candidates[idx].clone();
-                        let code = state.mix_buffer.clone();
-                        if let Some(act) =
-                            self.overlay_commit_command(state, &cand, &code, |s, st| {
-                                s.exit_mix_mode(st)
-                            })
-                        {
-                            return act;
+                        if state.candidates[idx].is_group || state.candidates[idx].is_command {
+                            return self.mix_select(state, idx - start);
                         }
                     }
                     let head = if !state.candidates.is_empty() {

@@ -47,6 +47,18 @@ pub(crate) fn finalize_candidates(
 `state.candidates = self.finalize_candidates(state, raw, buf)`。次序恒为：
 引擎取候选 → 各路径自有的去重/排序 → **finalize 展开** → 写入。
 
+**`$AA`/`$SS` 组的前缀折叠 / 精确展开**（与短语前缀分组一致）：`expand_dict_value` 对数组
+返回 `DictExpansion::Group { name, items }`（携组名）。`finalize_candidates` 按**候选自身码
+`cand.code` 相对当前输入 `input`** 决定呈现：
+
+- **精确码**（`cand.code == input`，或引擎未给码 `cand.code` 为空）→ 逐成员炸开（← ↑ → ↓）。
+- **前缀**（`cand.code` 比 `input` 长，即输入是其真前缀）→ 折叠为**单个组名候选**：
+  `is_group = true`、`group_code = cand.code`（完整码）、`text = name`（组名）。
+
+选中折叠组候选时，经 `complete_to_group_code`（正常路径）/ 各 overlay 的「设缓冲=`group_code`
++ 重查」补全输入到完整码 → 此时 `code == input` → 精确展开成员（二级选择）。`cand.code` 由码表
+引擎填充（`engine.rs` 内即以 `c.code == input` 判精确），信号现成。
+
 ### ② 提交侧 `select_candidate` + `ModeCommit`
 
 ```rust

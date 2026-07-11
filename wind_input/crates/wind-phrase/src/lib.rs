@@ -429,8 +429,13 @@ pub enum DictExpansion {
         display: String,
         command_src: Option<String>,
     },
-    /// 一对多炸开（`$AA` 逐字符 / `$SS` 字面组）：每个元素一个候选 `(display, command_src)`。
-    Many(Vec<(String, Option<String>)>),
+    /// `$AA`/`$SS` 组：携组名 + 成员列表。由调用方按"精确码展开 / 前缀折叠为组名"决定呈现
+    /// （见 coordinator `finalize_candidates`）——精确码时逐成员炸开，前缀时折叠为单个组名候选
+    /// （选中补全到完整码再展开，二级选择，与短语前缀分组一致）。
+    Group {
+        name: String,
+        items: Vec<(String, Option<String>)>,
+    },
 }
 
 /// 展开一条**词库候选 value**（对齐 Go `dict.ValueExpander.Expand`/`ExpandToCandidates`）：
@@ -473,6 +478,7 @@ pub fn expand_dict_value(
             // $AA/$SS 组：炸开为多个候选（仅显现无动作的字面元素，与短语 lookup_at 一致；
             // 带动作的嵌入 $CC 需元素级源，后续补）。
             Ok(PhraseEval::Array(arr)) => {
+                let name = arr.name.clone();
                 let items: Vec<(String, Option<String>)> = arr
                     .elements
                     .into_iter()
@@ -482,7 +488,7 @@ pub fn expand_dict_value(
                 if items.is_empty() {
                     DictExpansion::None
                 } else {
-                    DictExpansion::Many(items)
+                    DictExpansion::Group { name, items }
                 }
             }
             Err(err) => {
@@ -852,19 +858,24 @@ mod tests {
                 command_src: Some(r#"$CC("切简繁", ime.toggle("s2t"))"#.into()),
             }
         );
-        // $AA 字符组 → 一对多炸开为逐字符候选。
+        // $AA 字符组 → Group（组名 + 成员）；由调用方按精确/前缀决定展开或折叠。
         assert_eq!(
             expand_dict_value(r#"$AA("数字", "①②③")"#, "sz", now, &[], &clip),
-            DictExpansion::Many(vec![
-                ("①".into(), None),
-                ("②".into(), None),
-                ("③".into(), None),
-            ])
+            DictExpansion::Group {
+                name: "数字".into(),
+                items: vec![("①".into(), None), ("②".into(), None), ("③".into(), None),],
+            }
         );
         // 普通词库文本（无 $ 与 {）→ None，零干预。
-        assert_eq!(expand_dict_value("你好", "nh", now, &[], &clip), DictExpansion::None);
+        assert_eq!(
+            expand_dict_value("你好", "nh", now, &[], &clip),
+            DictExpansion::None
+        );
         // 含 $ 但非模板变量（如 价格$5）→ None，不误展开。
-        assert_eq!(expand_dict_value("价格$5", "jg", now, &[], &clip), DictExpansion::None);
+        assert_eq!(
+            expand_dict_value("价格$5", "jg", now, &[], &clip),
+            DictExpansion::None
+        );
     }
 
     #[test]

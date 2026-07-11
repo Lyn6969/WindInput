@@ -184,7 +184,10 @@ impl Coordinator {
     /// `dict.ValueExpander`；见 docs/redesign/unified-candidate-value-expansion.md）。
     ///
     /// - `$CC` → 标 `is_command`（选中由 `select_candidate`、顶屏由 `top_commit_command_guard` 执行动作）；
-    /// - `$AA`/`$SS` → 一对多炸开；模板 / 花括号插值 → 直接以展开文本上屏；
+    /// - `$AA`/`$SS` 组 → **精确码**（候选码 == 当前输入）时逐成员炸开；**前缀**（候选码更长）时折叠为
+    ///   单个组名候选（`is_group`，`group_code` = 完整码），选中经 `complete_to_group_code` 补全到完整码
+    ///   重查 → 精确 → 展开（二级选择，与短语前缀分组一致）；
+    /// - 模板 / 花括号插值 → 直接以展开文本上屏；
     /// - 普通候选（不含 `$` 与 `{`）经廉价预检零开销原样返回。
     ///
     /// `input` 为该路径当前编码缓冲（供 cmdbar 语法内 `input()` 求值）。已是 `is_phrase`/`is_command`
@@ -228,15 +231,27 @@ impl Coordinator {
                     }
                     expanded.push(c);
                 }
-                wind_phrase::DictExpansion::Many(items) => {
-                    for (display, command_src) in items {
-                        let mut c = cand.clone();
-                        c.text = display;
-                        if let Some(src) = command_src {
-                            c.phrase_template = src;
-                            c.is_command = true;
+                wind_phrase::DictExpansion::Group { name, items } => {
+                    // 精确码（候选码 == 输入，或引擎未给码信息）→ 逐成员炸开；
+                    // 前缀（候选码更长）→ 折叠为组名候选，选中补全到完整码再展开。
+                    if cand.code.is_empty() || cand.code == input {
+                        for (display, command_src) in items {
+                            let mut c = cand.clone();
+                            c.text = display;
+                            if let Some(src) = command_src {
+                                c.phrase_template = src;
+                                c.is_command = true;
+                            }
+                            expanded.push(c);
                         }
-                        expanded.push(c);
+                    } else {
+                        let mut g = cand;
+                        g.group_code = g.code.clone();
+                        g.group_name = name.clone();
+                        g.group_template = g.text.clone(); // 源 $AA/$SS(..) 备查
+                        g.text = name;
+                        g.is_group = true;
+                        expanded.push(g);
                     }
                 }
             }
@@ -1401,13 +1416,46 @@ mod finalize_candidates_tests {
         }
     }
 
+    fn cand_code(text: &str, code: &str) -> Candidate {
+        Candidate {
+            text: text.to_string(),
+            code: code.to_string(),
+            ..Default::default()
+        }
+    }
+
     #[test]
-    fn expands_aa_group_to_many_char_candidates() {
+    fn aa_group_expands_inline_when_code_absent() {
         let c = coord();
+        // 无码信息（code 空）→ 视为精确，逐成员炸开。
         let out = c.finalize_candidates(vec![cand(r#"$AA("数字", "①②③")"#)], "sz");
         let texts: Vec<&str> = out.iter().map(|c| c.text.as_str()).collect();
         assert_eq!(texts, vec!["①", "②", "③"], "$AA 应一对多炸开为逐字符候选");
-        assert!(out.iter().all(|c| !c.is_command), "$AA 成员非命令");
+        assert!(out.iter().all(|c| !c.is_command && !c.is_group));
+    }
+
+    #[test]
+    fn aa_group_expands_inline_at_exact_code() {
+        let c = coord();
+        // 精确码（候选码 == 输入 "arrx"）→ 逐成员炸开。
+        let out = c.finalize_candidates(vec![cand_code(r#"$AA("箭头", "←↑→↓")"#, "arrx")], "arrx");
+        let texts: Vec<&str> = out.iter().map(|c| c.text.as_str()).collect();
+        assert_eq!(texts, vec!["←", "↑", "→", "↓"]);
+    }
+
+    #[test]
+    fn aa_group_collapses_to_name_at_prefix() {
+        let c = coord();
+        // 前缀（候选码 "arrx" 长于输入 "arr"）→ 折叠为组名候选，不炸开。
+        let out = c.finalize_candidates(vec![cand_code(r#"$AA("箭头", "←↑→↓")"#, "arrx")], "arr");
+        assert_eq!(out.len(), 1, "前缀应折叠为单个组名候选");
+        assert_eq!(out[0].text, "箭头", "折叠候选显示组名");
+        assert!(out[0].is_group, "折叠候选标 is_group");
+        assert_eq!(
+            out[0].group_code, "arrx",
+            "group_code 为完整码，选中补全后重查展开"
+        );
+        assert!(!out[0].is_command);
     }
 
     #[test]
