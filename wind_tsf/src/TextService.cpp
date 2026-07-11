@@ -3010,11 +3010,19 @@ void CTextService::TryRecoverFocusState()
     // 异步化：SendFocusGained 现在是 fire-and-forget。状态由 push pipe 经
     // CMD_ACTIVATION_STATUS_PUSH 异步送达，AsyncReader 线程的回调走 PostMessage
     // 到 TSF 线程的 WM_ACTIVATION_STATUS, 最终触发 ApplyActivationStatusResponse。
-    // 沿用上次 OnSetFocus 已判定的 _focusIsPassword（此路径未重新查询 InputScope mask，
-    // 传 0 保持与此前行为一致；disabled/reason 仍据 _focusIsPassword 上报，避免 HUD 在
-    // 恢复路径上误报"未禁用"）。
-    uint8_t recoveryReason = ComputeInputReason(_focusIsPassword, 0);
-    if (_pIPCClient->SendFocusGained((int)caretX, (int)caretY, (int)caretHeight, 0, _focusIsPassword, recoveryReason))
+    // 输入诊断 HUD（Task 7）：与 OnSetFocus / compartment OnChange 一致，重新查询当前
+    // 焦点 DocMgr 的 InputScope mask，避免恢复路径硬编码 mask=0 让 HUD 误显示
+    // "原因: 无"。若此刻拿不到焦点 DocMgr（理论上不应发生，仅作防御），mask 退化为 0，
+    // reason 仍据 _focusIsPassword 计算，与旧行为一致。
+    UINT64 recoveryMask = 0;
+    ITfDocumentMgr* pDocMgrRecover = nullptr;
+    if (_pThreadMgr != nullptr && SUCCEEDED(_pThreadMgr->GetFocus(&pDocMgrRecover)) && pDocMgrRecover != nullptr)
+    {
+        recoveryMask = _QueryInputScopeMask(pDocMgrRecover);
+        pDocMgrRecover->Release();
+    }
+    uint8_t recoveryReason = ComputeInputReason(_focusIsPassword, recoveryMask);
+    if (_pIPCClient->SendFocusGained((int)caretX, (int)caretY, (int)caretHeight, recoveryMask, _focusIsPassword, recoveryReason))
     {
         _needsFocusRecovery = FALSE;
         _pIPCClient->ClearNeedsSyncFlag();
