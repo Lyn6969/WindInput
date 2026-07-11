@@ -71,6 +71,14 @@ pub fn decode_focus_gained(payload: &[u8]) -> Result<FocusGainedPayload, CodecEr
     })
 }
 
+/// 从载荷字节解码 InputStateReportPayload（CMD_INPUT_STATE_REPORT 0x0213）
+pub fn decode_input_state_report(payload: &[u8]) -> Result<InputStateReportPayload, CodecError> {
+    InputStateReportPayload::from_bytes(payload).ok_or(CodecError::BufferTooShort {
+        need: InputStateReportPayload::SIZE,
+        got: payload.len(),
+    })
+}
+
 /// 编码 CommitText 响应 (CMD_COMMIT_TEXT 0x0101)
 ///
 /// 格式: CommitTextHeader(12) + UTF-8 text + optional newComposition
