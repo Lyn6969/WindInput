@@ -341,7 +341,17 @@ impl Coordinator {
             // marker 短语。**$CC 命令** → is_command（选中直接执行，group_code 作执行输入
             // 上下文）；**$SS/$AA 组** → is_group（选中补全到完整码再展开成员，二级选择）。
             let min_prefix = self.rt().config.input.phrase.min_prefix;
-            for hit in phrases.lookup_prefix(&state.input_buffer, &recent, min_prefix) {
+            // 精确匹配模式（`single_code_input`，仅纯码表方案）：抑制短语前缀枚举，只保留上面的
+            // 精确码短语（`lookup`）——与码表引擎跳过 `search_prefix` 的行为对齐。混输不适用：
+            // 其拼音半边恒前缀匹配，切精确会与拼音割裂（见 `EngineManager::is_codetable`）。
+            let prefix_hits = if self.engine_mgr.is_codetable()
+                && self.engine_mgr.codetable_settings().single_code_input
+            {
+                Vec::new()
+            } else {
+                phrases.lookup_prefix(&state.input_buffer, &recent, min_prefix)
+            };
+            for hit in prefix_hits {
                 let text = Self::clamp_candidate_display(&hit.text, max_disp);
                 let is_system = hit.is_system;
                 let phrase_meta = || CandidateMeta {
