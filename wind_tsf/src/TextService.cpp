@@ -19,6 +19,17 @@ static const GUID kGuidPropInputScope =
 // InputScope bit 常量（与 Go 端、inputscope.h 一致）
 static const UINT64 kScopeBitPassword = 1ULL << 31; // IS_PASSWORD
 
+// 输入诊断 HUD（Task 7）：由 disabled + InputScope mask 计算上报 reason，语义与 Rust
+// coordinator 侧 reason_from 完全一致。reason: 0 None / 1 CompartmentDisabled /
+// 2 InputScopePassword / 3 NumericPassword。disabled（compartment 命中）优先级最高。
+static inline uint8_t ComputeInputReason(bool disabled, UINT64 mask)
+{
+    if (disabled) return 1;
+    if (mask & (1ULL << 63)) return 3; // IS_NUMERIC_PASSWORD
+    if (mask & (1ULL << 31)) return 2; // IS_PASSWORD
+    return 0;
+}
+
 // TSF 标准 compartment GUID（本地定义，避免链接 TSF GUID 静态库产生 LNK2019）。
 // 宿主（含 Chromium 系浏览器密码框）会在 context 上置 KEYBOARD_DISABLED 表示"禁用输入法"；
 // 这是比 InputScope 更可靠的密码框信号（小狼毫/Weasel 即用此判定），且无痕普通框不会置位。
@@ -2054,7 +2065,8 @@ STDAPI CTextService::OnSetFocus(ITfDocumentMgr* pDocMgrFocus, ITfDocumentMgr* pD
         // Lazy connect: 服务在 TSF 加载之后才启动也能覆盖（SendFocusGained 内部已处理）。
         else if (_pIPCClient != nullptr)
         {
-            if (_pIPCClient->SendFocusGained(caretX, caretY, caretHeight, inputScopeMask))
+            uint8_t inputReason = ComputeInputReason(_focusIsPassword, inputScopeMask);
+            if (_pIPCClient->SendFocusGained(caretX, caretY, caretHeight, inputScopeMask, _focusIsPassword, inputReason))
             {
                 WIND_LOG_DEBUG_FMT(L"FocusGained sent (async) focusSession=%llu", _focusSessionId);
                 _needsFocusRecovery = FALSE;
@@ -2483,6 +2495,23 @@ STDAPI CTextService::OnChange(REFGUID rguid)
         // Update language bar to show disabled state
         if (_pLangBarItemButton != nullptr)
             _pLangBarItemButton->UpdateKeyboardDisabled(bDisabled);
+
+        // 输入诊断 HUD（Task 7）：compartment 变更是"焦点未变但禁用态翻转"的场景（如 SPA 内
+        // 原地跳转到密码框），不会触发新的 OnSetFocus/focus_gained，因此单独上报一次
+        // input_state_report 让 HUD 即时刷新。mask 用当前焦点 DocMgr 重新查询（可能与
+        // OnSetFocus 时不同一个 DocMgr），仅算一次避免重复同步读锁。
+        if (_pIPCClient != nullptr && _pIPCClient->IsConnected())
+        {
+            ITfDocumentMgr* pDocMgrCur = nullptr;
+            UINT64 curMask = 0;
+            if (SUCCEEDED(_pThreadMgr->GetFocus(&pDocMgrCur)) && pDocMgrCur != nullptr)
+            {
+                curMask = _QueryInputScopeMask(pDocMgrCur);
+                pDocMgrCur->Release();
+            }
+            uint8_t curReason = ComputeInputReason(bDisabled != FALSE, curMask);
+            _pIPCClient->SendInputStateReport(GetCurrentProcessId(), bDisabled != FALSE, curReason, curMask);
+        }
 
         return S_OK;
     }
@@ -2981,7 +3010,11 @@ void CTextService::TryRecoverFocusState()
     // 异步化：SendFocusGained 现在是 fire-and-forget。状态由 push pipe 经
     // CMD_ACTIVATION_STATUS_PUSH 异步送达，AsyncReader 线程的回调走 PostMessage
     // 到 TSF 线程的 WM_ACTIVATION_STATUS, 最终触发 ApplyActivationStatusResponse。
-    if (_pIPCClient->SendFocusGained((int)caretX, (int)caretY, (int)caretHeight))
+    // 沿用上次 OnSetFocus 已判定的 _focusIsPassword（此路径未重新查询 InputScope mask，
+    // 传 0 保持与此前行为一致；disabled/reason 仍据 _focusIsPassword 上报，避免 HUD 在
+    // 恢复路径上误报"未禁用"）。
+    uint8_t recoveryReason = ComputeInputReason(_focusIsPassword, 0);
+    if (_pIPCClient->SendFocusGained((int)caretX, (int)caretY, (int)caretHeight, 0, _focusIsPassword, recoveryReason))
     {
         _needsFocusRecovery = FALSE;
         _pIPCClient->ClearNeedsSyncFlag();

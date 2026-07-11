@@ -767,7 +767,8 @@ BOOL CIPCClient::SendCompositionTerminated()
     return _SendBinaryMessage(CMD_COMPOSITION_TERMINATED, nullptr, 0, true /* async */);
 }
 
-BOOL CIPCClient::SendFocusGained(int caretX, int caretY, int caretHeight, UINT64 inputScopeMask)
+BOOL CIPCClient::SendFocusGained(int caretX, int caretY, int caretHeight, UINT64 inputScopeMask,
+                                  bool disabled, uint8_t reason)
 {
     if (!_ShouldAttemptOperation())
     {
@@ -779,7 +780,9 @@ BOOL CIPCClient::SendFocusGained(int caretX, int caretY, int caretHeight, UINT64
         return FALSE;
     }
 
-    _LogDebug(L"Sending focus_gained (sync) with caret: x=%d, y=%d, h=%d, inputScope=0x%016llX, token=0x%016llX", caretX, caretY, caretHeight, (unsigned long long)inputScopeMask, (unsigned long long)_clientToken);
+    _LogDebug(L"Sending focus_gained (sync) with caret: x=%d, y=%d, h=%d, inputScope=0x%016llX, token=0x%016llX, disabled=%d, reason=%u",
+              caretX, caretY, caretHeight, (unsigned long long)inputScopeMask, (unsigned long long)_clientToken,
+              disabled ? 1 : 0, (unsigned)reason);
 
     FocusGainedPayload payload = {};
     payload.caret.x = caretX;
@@ -787,6 +790,8 @@ BOOL CIPCClient::SendFocusGained(int caretX, int caretY, int caretHeight, UINT64
     payload.caret.height = caretHeight;
     payload.clientToken = _clientToken;
     payload.inputScopeMask = inputScopeMask;
+    payload.disabled = disabled ? 1 : 0;
+    payload.reason = reason;
 
     // 同步发送（首次按键模式竞态根治，见 server_handler.go::CmdFocusGained 注释）：
     // Go 端在响应里回传权威模式（仅读内存两字段，无等待 / 无回调进本进程 → 无死锁可能），
@@ -812,6 +817,27 @@ BOOL CIPCClient::SendFocusGained(int caretX, int caretY, int caretHeight, UINT64
         }
     }
     return TRUE;
+}
+
+BOOL CIPCClient::SendInputStateReport(uint32_t pid, bool disabled, uint8_t reason, uint64_t inputScopeMask)
+{
+    if (!IsConnected())
+    {
+        return FALSE;
+    }
+
+    _LogDebug(L"Sending input_state_report (async): pid=%u disabled=%d reason=%u inputScope=0x%016llX",
+              pid, disabled ? 1 : 0, (unsigned)reason, (unsigned long long)inputScopeMask);
+
+    InputStateReportPayload payload = {};
+    payload.pid = pid;
+    payload.disabled = disabled ? 1 : 0;
+    payload.reason = reason;
+    payload.inputScopeMask = inputScopeMask;
+
+    // Async fire-and-forget push, mirroring SendCompositionTerminated/SendIMEDeactivated:
+    // this is a diagnostics-only notification, no response expected.
+    return _SendBinaryMessage(CMD_INPUT_STATE_REPORT, &payload, sizeof(payload), true /* async */);
 }
 
 BOOL CIPCClient::SendIMEDeactivated()
