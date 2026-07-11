@@ -68,17 +68,20 @@
 ### C. HUD 浮窗（wind-ui）
 
 - 新增 `InputDiagHud`，仿 `StatusTip`（`wind-ui/src/status_tip.rs`）：`LayeredWindow` + `TextRenderer`（View 盒模型 + DirectWrite），深色半透明圆角底。
-- 窗口样式追加 `WS_EX_NOACTIVATE`，置顶；固定屏角（默认右下，避让全屏检测 `is_foreground_fullscreen`）。
+- 窗口样式追加 `WS_EX_NOACTIVATE`，置顶；初始屏角默认右下（避让全屏检测 `is_foreground_fullscreen`）。
+- **可拖动改位置**：鼠标按住拖动即可移动。非激活窗口拖动不会抢走应用 X 的焦点（点击不激活）。拖动经手动 `WM_LBUTTONDOWN` + 移动实现（或 `WM_NCHITTEST` 返回 `HTCAPTION`），需与「复制」区分——见下。
 - **不自动隐藏**（区别于 StatusTip 的 ~1s 自隐）；由菜单开关控制显隐。
 - 显示内容（多行）：
   - `进程名 (pid)`
   - `禁用态: 是 / 否`
   - `原因: compartment / 密码 / 数字密码 / 无`
   - `InputScope: 0x…（解码位名）`
-  - 底部提示：`点击复制当前诊断`（写剪贴板，满足「用户可上报」）
+- 交互：**单击/拖动 = 移动窗口**；**双击 = 复制当前诊断到剪贴板**（满足「用户可上报」，避免与拖动冲突）。
 - 每次 `last_input_diag` 更新且 HUD 可见 → 重绘，保证实时。
 
 ### D. 抑制策略（P0#1 接线）
+
+> 定性：密码框强制英文**是用户功能，不是诊断功能**。最终归宿是**设置程序**（`wind-setting` 独立仓）里的一个用户可见选项。本次先把引擎侧逻辑接通，并临时挂在「高级」菜单开关上用于测试（见 E 节），后续再迁移到设置界面。
 
 - `handle_focus_gained` 与 compartment 上报处：解码 `input_scope_mask`，命中 IS_PASSWORD / IS_NUMERIC_PASSWORD → 置瞬态 `password_suppress` 标志。
 - 效果 = **强制英文、图标不变**（对齐 Go `applyPasswordFieldPolicyNoLock`，参考 Go `handle_lifecycle.go` 约 440 行 IS_PASSWORD=31 / IS_NUMERIC_PASSWORD=63 判定）。实现为：`password_suppress` 为真时，键处理走英文直通，不改 `state.chinese_mode` 的持久值与工具栏图标。
@@ -89,15 +92,14 @@
 
 不新增 config flag、不新增全局热键。在右键菜单「高级」子菜单（`handle_menu.rs:297 advanced_children`）新增两个可勾选项：
 
-| 菜单项 | MenuCmd | 默认 | 勾选态 |
-|---|---|---|---|
-| 输入诊断 HUD | `MenuCmd::ToggleInputDiagnostics` | 关 | HUD 是否可见 |
-| 密码框强制英文 | `MenuCmd::TogglePasswordSuppress` | 开 | 抑制策略是否启用 |
+| 菜单项 | MenuCmd | 默认 | 勾选态 | 性质 |
+|---|---|---|---|---|
+| 输入诊断 HUD | `MenuCmd::ToggleInputDiagnostics` | 关 | HUD 是否可见 | 诊断，长期保留 |
+| 密码框强制英文 | `MenuCmd::TogglePasswordSuppress` | 开 | 抑制策略是否启用 | **临时测试入口**，后续迁至设置程序 |
 
-- `run_menu_cmd`（`handle_menu.rs:32`）新增两分支：前者切换 HUD 显隐并触发重绘；后者切换抑制启用标志（关闭时 `password_suppress` 逻辑短路，作为「误伤」安全阀）。
-- 两个开关的启用态存于 coordinator 运行时（会话级；是否持久化到 config 由实现阶段决定，倾向不持久化——诊断/安全阀性质，重启回默认）。
-
-> 决策备注：「密码框强制英文」开关是否要加，源于此前对抑制误伤的担忧。放进「高级」菜单而非 config，契合「开关走右键菜单」的约定，同时保留安全阀。若认为多余可在评审时去掉，抑制则恒开。
+- `run_menu_cmd`（`handle_menu.rs:32`）新增两分支：前者切换 HUD 显隐并触发重绘；后者切换抑制启用标志（关闭时 `password_suppress` 逻辑短路）。
+- 两个开关的启用态**存于 coordinator 运行时（会话级，不持久化）**，重启回默认。
+- 「密码框强制英文」是用户功能（见 D 节定性），这里的「高级」菜单开关仅为本阶段测试便利；正式版应移到设置程序作为用户可见选项，届时可从「高级」菜单撤下。
 
 ## 数据流
 
@@ -141,8 +143,12 @@ Rust 单测：
 - 网页内点密码框（不换窗）：compartment 上报即时刷新 HUD。
 - 密码框强制英文生效 + 离开恢复原中英态；「高级」关闭抑制后不再强制。
 
+## 已定决策（本轮评审）
+
+1. 「密码框强制英文」是**用户功能**，非诊断；本次先接通逻辑 + 临时挂「高级」菜单测试，正式版迁至设置程序。
+2. HUD **可鼠标拖动**改位置，初始默认右下角；不做屏角配置项。
+3. 两个「高级」开关**不持久化**，会话级，重启回默认。
+
 ## 未决/评审点
 
-1. 「密码框强制英文」菜单开关是否保留（见 E 决策备注）。
-2. HUD 屏角位置是否需可配（暂定固定右下）。
-3. 两个开关是否持久化到 config（暂定不持久化）。
+1. 后续把「密码框强制英文」迁到设置程序时的选项文案与位置（属 `wind-setting` 仓，另行处理）。
