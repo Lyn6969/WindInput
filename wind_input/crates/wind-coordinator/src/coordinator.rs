@@ -553,7 +553,8 @@ pub struct Coordinator {
     host_render: std::sync::OnceLock<Arc<wind_bridge::host_render_windows::HostRenderManager>>,
     /// 最近一次输入诊断快照（compartment 禁用态 / InputScope 密码位），供 Task 6 HUD 展示。
     pub(crate) last_input_diag: Mutex<crate::input_diag::InputDiagState>,
-    /// 密码框强制英文抑制态：命中密码 InputScope 时置 true，`effective_chinese` 据此拒绝中文。
+    /// 密码框强制英文抑制态：命中密码 InputScope 时置 true，输入闸据此强制英文透传
+    /// （不改 `chinese_mode` 持久值，图标保持不变）。
     pub(crate) password_suppress: std::sync::atomic::AtomicBool,
     /// 密码框抑制策略开关（默认 true）；关闭时 `apply_input_diag` 不再置位 `password_suppress`。
     pub(crate) password_suppress_enabled: std::sync::atomic::AtomicBool,
@@ -1141,6 +1142,8 @@ impl Coordinator {
     pub(crate) fn apply_input_diag(&self, pid: u32, disabled: bool, reason_byte: u8, mask: u64) {
         use std::sync::atomic::Ordering::Relaxed;
         let reason = crate::input_diag::reason_from(disabled, mask);
+        // 本地一律以 mask/disabled 经 reason_from 推导 reason 作准；上报的 reason_byte
+        // 仅供展示/日志参考，不参与本地决策（避免"双重来源"歧义）。
         let _ = reason_byte; // 上游已按 mask/disabled 推导 reason；保留形参对齐上报字段序。
         let name = if pid != 0 {
             self.cached_proc_name((pid as u64) << 32)
@@ -1165,12 +1168,6 @@ impl Coordinator {
             };
         }
         self.push_input_diag_hud_if_visible();
-    }
-
-    /// 有效中文态：中文模式 且 未锁大写 且 未被密码框抑制。三处判定统一入口，
-    /// 避免密码框抑制遗漏任一分支（对齐 CapsLock 既有语义，仅新增抑制维度）。
-    pub(crate) fn effective_chinese(&self, s: &State) -> bool {
-        s.chinese_mode && !s.caps_lock && !self.password_suppress.load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// 密码框抑制策略是否开启（Task 6/7 设置面板读取）。
@@ -2321,7 +2318,7 @@ impl Coordinator {
     }
 
     fn build_status(&self) -> StatusUpdateData {
-        let (chinese_mode, full_width, chinese_punct, toolbar_visible, caps_lock, effective_chinese) = {
+        let (chinese_mode, full_width, chinese_punct, toolbar_visible, caps_lock) = {
             let s = self.state.lock().unwrap_or_else(|e| e.into_inner());
             (
                 s.chinese_mode,
@@ -2329,11 +2326,10 @@ impl Coordinator {
                 s.chinese_punct,
                 s.toolbar_visible,
                 s.caps_lock,
-                self.effective_chinese(&s),
             )
         };
-        // 有效中文：中文模式且大写锁定未开且未被密码框强制英文抑制（对齐 Go effectiveChinese =
-        // chineseMode && !capsLockOn，新增抑制维度）。
+        // 有效中文：中文模式且大写锁定未开（对齐 Go effectiveChinese = chineseMode && !capsLockOn）。
+        let effective_chinese = chinese_mode && !caps_lock;
         let icon_label = if effective_chinese {
             let id = self.engine_mgr.active_schema_id();
             let lbl = self.engine_mgr.schema_icon_label(&id);
@@ -2619,7 +2615,7 @@ impl Coordinator {
             "toggle_punct" => {
                 let effective_chinese = {
                     let s = self.state.lock().unwrap_or_else(|e| e.into_inner());
-                    self.effective_chinese(&s)
+                    s.chinese_mode && !s.caps_lock
                 };
                 if effective_chinese {
                     {
@@ -2958,7 +2954,7 @@ impl MessageHandler for Coordinator {
             "toggle_punct" => {
                 let effective_chinese = {
                     let s = self.state.lock().unwrap_or_else(|e| e.into_inner());
-                    self.effective_chinese(&s)
+                    s.chinese_mode && !s.caps_lock
                 };
                 if effective_chinese {
                     {
@@ -3335,7 +3331,10 @@ impl MessageHandler for Coordinator {
         }
 
         // 英文模式：直接透传
-        if !state.chinese_mode {
+        // 密码框强制英文抑制：透传（不改 chinese_mode 持久值/图标；设计"图标不变"）
+        if !state.chinese_mode
+            || self.password_suppress.load(std::sync::atomic::Ordering::Relaxed)
+        {
             return KeyAction::PassThrough;
         }
 
@@ -5056,5 +5055,55 @@ mod input_diag_tests {
             .store(false, std::sync::atomic::Ordering::Relaxed);
         c.apply_input_diag(1, false, 2, 1 << 31);
         assert!(!c.password_suppress.load(std::sync::atomic::Ordering::Relaxed));
+    }
+
+    /// 构造最简按键事件（对齐 capslock_tests::kev 的写法）。
+    fn kev(key_code: u32, event_type: u8) -> KeyEventData {
+        KeyEventData {
+            key_code,
+            scan_code: 0,
+            modifiers: 0,
+            event_type,
+            toggles: 0,
+            event_seq: 0,
+            prev_char: 0,
+        }
+    }
+
+    /// 真实输入路径验证：密码框抑制期间字母键必须透传（强制英文），
+    /// 解除抑制后同一按键应回到中文组词流——防止「只改图标不拦输入」的回归。
+    #[test]
+    fn password_suppress_forces_english_passthrough() {
+        let mut cfg = Config::default();
+        cfg.input.default.chinese_mode = true;
+        let c = Coordinator::new_headless(cfg, None);
+        assert!(c.state.lock().unwrap().chinese_mode, "前置条件：应处于中文模式");
+
+        let pid = 4321u32;
+        c.apply_input_diag(pid, false, 2, 1 << 31);
+        assert!(
+            c.password_suppress.load(std::sync::atomic::Ordering::Relaxed),
+            "前置条件：密码框抑制应已置位"
+        );
+        let action = c.handle_key_event(&kev(0x41 /* VK_A */, EVENT_KEY_DOWN));
+        assert!(
+            matches!(action, KeyAction::PassThrough),
+            "密码框抑制期间字母键应强制透传（英文），实际: {:?}",
+            action
+        );
+        assert!(
+            c.state.lock().unwrap().chinese_mode,
+            "抑制不应改动 chinese_mode 持久值（图标保持不变）"
+        );
+
+        // 解除抑制：mask 清零。
+        c.apply_input_diag(pid, false, 0, 0);
+        assert!(!c.password_suppress.load(std::sync::atomic::Ordering::Relaxed));
+        let action = c.handle_key_event(&kev(0x41 /* VK_A */, EVENT_KEY_DOWN));
+        assert!(
+            !matches!(action, KeyAction::PassThrough),
+            "解除抑制后字母键应进入中文组词流，不应透传，实际: {:?}",
+            action
+        );
     }
 }
