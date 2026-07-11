@@ -191,7 +191,8 @@ impl Coordinator {
                 .then(a.natural_order.cmp(&b.natural_order))
         });
         candidates.truncate(ENGINE_MAX_CANDIDATES);
-        state.candidates = candidates;
+        // 统一展开汇聚点：临时拼音词库候选内 `$` 特殊语法在此展开（见 finalize_candidates）。
+        state.candidates = self.finalize_candidates(candidates, &state.temp_pinyin_buffer);
     }
 
     /// 临时拼音选词 —— 组合区逐步转换（C）。部分匹配并入 committed 前缀留模式内（不上屏）；
@@ -202,6 +203,13 @@ impl Coordinator {
         cand: &Candidate,
         candidate_pos: i32,
     ) -> KeyAction {
+        // $CC 命令候选：执行动作（退出临拼后异步跑），不走文本/分段上屏。
+        let cmd_code = state.temp_pinyin_buffer.clone();
+        if let Some(act) =
+            self.overlay_commit_command(state, cand, &cmd_code, |s, st| s.exit_temp_pinyin(st))
+        {
+            return act;
+        }
         let total = state.temp_pinyin_buffer.len();
         let consumed = cand.consumed_length;
         let code = Self::cand_code(&state.temp_pinyin_buffer, cand);
@@ -467,7 +475,16 @@ impl Coordinator {
                 });
             }
         }
-        state.candidates = cands;
+        // 统一展开汇聚点：临时英文词库候选内 `$` 特殊语法在此展开（见 finalize_candidates）。
+        state.candidates = self.finalize_candidates(cands, &buf);
+    }
+
+    /// 临英选中候选（全局下标 `gi`）的命令前置守卫：`$CC` 命令候选 → 执行动作（退出临英后异步跑），
+    /// 返回 `Some(action)`；非命令 → `None`，调用方按各自文本上屏语义继续。
+    fn temp_english_try_command(&self, state: &mut State, gi: usize) -> Option<KeyAction> {
+        let cand = state.candidates[gi].clone();
+        let code = state.temp_english_buffer.clone();
+        self.overlay_commit_command(state, &cand, &code, |s, st| s.exit_temp_english(st))
     }
 
     /// 临时英文模式按键处理（首版：缓冲累积 + 空格/回车/标点上屏，暂无词库候选）
@@ -528,11 +545,14 @@ impl Coordinator {
                     state.temp_english_buffer.push(' ');
                     refresh(self, state)
                 } else {
-                    // 空格：上屏当前高亮候选（首候选=原始输入）
+                    // 空格：上屏当前高亮候选（首候选=原始输入）；命令候选执行动作
                     let text = if !state.candidates.is_empty() {
                         let idx = self
                             .highlighted_global_index(state)
                             .min(state.candidates.len() - 1);
+                        if let Some(act) = self.temp_english_try_command(state, idx) {
+                            return act;
+                        }
                         state.candidates[idx].text.clone()
                     } else {
                         state.temp_english_buffer.clone()
@@ -565,6 +585,9 @@ impl Coordinator {
                 let (start, end) = self.page_range(state);
                 let gi = start + (data.key_code - 0x31) as usize;
                 if state.candidates.len() > 1 && gi < end {
+                    if let Some(act) = self.temp_english_try_command(state, gi) {
+                        return act;
+                    }
                     let text = state.candidates[gi].text.clone();
                     commit_text(self, state, text)
                 } else {
@@ -590,6 +613,9 @@ impl Coordinator {
                         let idx = self
                             .highlighted_global_index(state)
                             .min(state.candidates.len() - 1);
+                        if let Some(act) = self.temp_english_try_command(state, idx) {
+                            return act;
+                        }
                         state.candidates[idx].text.clone()
                     } else {
                         state.temp_english_buffer.clone()

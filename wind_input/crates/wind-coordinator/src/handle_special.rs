@@ -93,7 +93,8 @@ impl Coordinator {
         let result = self
             .engine_mgr
             .convert_with(&schema, &state.special_buffer, 100);
-        state.candidates = result.candidates;
+        // 统一展开汇聚点：快符表内 `$AA/$SS/$CC` 等特殊语法在此炸开/标命令（见 finalize_candidates）。
+        state.candidates = self.finalize_candidates(result.candidates, &state.special_buffer);
         // 自动上屏由方案码表引擎的 should_auto_commit 决定（prefix_free≈全码唯一、fixed_length 等
         // 映射到该方案的 [engine.codetable] 配置）；复核上屏目标仍在候选中。
         if result.should_commit
@@ -106,6 +107,27 @@ impl Coordinator {
             return Some(result.commit_text);
         }
         None
+    }
+
+    /// 特殊模式选中某候选（全局下标 `gi`）：`$CC` 命令候选 → 执行动作（退出后异步跑，触发键码不上屏）；
+    /// 否则文本上屏。统一空格 / 数字键 / 二三候选键的选中入口，保证命令候选选中即执行。
+    fn commit_special_candidate(&self, state: &mut State, gi: usize) -> KeyAction {
+        let cand = state.candidates[gi].clone();
+        let code = state.special_buffer.clone();
+        if let Some(act) =
+            self.overlay_commit_command(state, &cand, &code, |s, st| s.exit_special_mode(st))
+        {
+            return act;
+        }
+        self.record_commit(
+            &cand.text,
+            state.special_buffer.len() as u32,
+            -1,
+            wind_store::stats::CommitSource::SpecialMode,
+        );
+        self.exit_special_mode(state);
+        self.notify_ui_hide();
+        Self::commit_action(cand.text, true)
     }
 
     /// 特殊模式按键处理：编码累积 + 候选选择 + 三档自动上屏；空格选高亮、回车上屏编码原文。
@@ -149,21 +171,12 @@ impl Coordinator {
                 }
             }
             keymap::VK_SPACE => {
-                // 空格：有候选选高亮上屏；无候选退出
+                // 空格：有候选选高亮上屏（命令候选执行动作）；无候选退出
                 if !state.candidates.is_empty() {
                     let idx = self
                         .highlighted_global_index(state)
                         .min(state.candidates.len() - 1);
-                    let text = state.candidates[idx].text.clone();
-                    self.record_commit(
-                        &text,
-                        state.special_buffer.len() as u32,
-                        -1,
-                        wind_store::stats::CommitSource::SpecialMode,
-                    );
-                    self.exit_special_mode(state);
-                    self.notify_ui_hide();
-                    Self::commit_action(text, true)
+                    self.commit_special_candidate(state, idx)
                 } else {
                     self.exit_special_mode(state);
                     self.notify_ui_hide();
@@ -205,20 +218,11 @@ impl Coordinator {
                 Self::commit_action(text, true)
             }
             keymap::VK_1..=keymap::VK_9 => {
-                // 数字 1-9 选当前页候选
+                // 数字 1-9 选当前页候选（命令候选执行动作）
                 let (start, end) = self.page_range(state);
                 let gi = start + (data.key_code - 0x31) as usize;
                 if gi < end {
-                    let text = state.candidates[gi].text.clone();
-                    self.record_commit(
-                        &text,
-                        state.special_buffer.len() as u32,
-                        -1,
-                        wind_store::stats::CommitSource::SpecialMode,
-                    );
-                    self.exit_special_mode(state);
-                    self.notify_ui_hide();
-                    Self::commit_action(text, true)
+                    self.commit_special_candidate(state, gi)
                 } else {
                     KeyAction::Consumed
                 }
@@ -247,33 +251,39 @@ impl Coordinator {
             }
             _ => {
                 let shift = data.modifiers & MOD_SHIFT != 0;
-                // 二三候选键 → 选候选
+                // 二三候选键 → 选候选（命令候选执行动作）
                 if !shift && let Some(offset) = self.select_key_offset(data.key_code) {
                     let (start, end) = self.page_range(state);
                     let gi = start + offset;
                     if gi < end {
-                        let text = state.candidates[gi].text.clone();
-                        self.record_commit(
-                            &text,
-                            state.special_buffer.len() as u32,
-                            -1,
-                            wind_store::stats::CommitSource::SpecialMode,
-                        );
-                        self.exit_special_mode(state);
-                        self.notify_ui_hide();
-                        return Self::commit_action(text, true);
+                        return self.commit_special_candidate(state, gi);
                     }
                 }
                 // 其它可打印标点：顶屏当前高亮候选 + 转换后标点，退出
                 if let Some(ch) = punct_char(data.key_code, shift) {
-                    let committed = if !state.candidates.is_empty() {
-                        let idx = self
-                            .highlighted_global_index(state)
-                            .min(state.candidates.len() - 1);
-                        state.candidates[idx].text.clone()
+                    let hi = if state.candidates.is_empty() {
+                        None
                     } else {
-                        String::new()
+                        Some(
+                            self.highlighted_global_index(state)
+                                .min(state.candidates.len() - 1),
+                        )
                     };
+                    // 高亮候选为 $CC 命令：执行命令，触发标点不单独上屏（语义同 top_commit_command_guard）。
+                    if let Some(idx) = hi {
+                        let cand = state.candidates[idx].clone();
+                        let code = state.special_buffer.clone();
+                        if let Some(act) =
+                            self.overlay_commit_command(state, &cand, &code, |s, st| {
+                                s.exit_special_mode(st)
+                            })
+                        {
+                            return act;
+                        }
+                    }
+                    let committed = hi
+                        .map(|idx| state.candidates[idx].text.clone())
+                        .unwrap_or_default();
                     let punct = self.convert_punct_char(state, ch);
                     self.record_commit(
                         &committed,

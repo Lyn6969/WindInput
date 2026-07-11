@@ -573,6 +573,13 @@ impl Coordinator {
             return KeyAction::Consumed;
         }
         let cand = state.candidates[gi].clone();
+        // $CC 命令候选：执行动作（退出混输后异步跑），不走文本/分段上屏。
+        let code = state.mix_buffer.clone();
+        if let Some(act) =
+            self.overlay_commit_command(state, &cand, &code, |s, st| s.exit_mix_mode(st))
+        {
+            return act;
+        }
         let numeric = self.mix_has_quick_input(state.mix_id) && state.mix_numeric;
         let total = state.mix_buffer.len();
         let consumed = cand.consumed_length;
@@ -701,7 +708,8 @@ impl Coordinator {
         if let Some(disp) = text_display {
             state.preedit = format!("{}{}{}", state.mix_prefix, state.committed_text, disp);
         }
-        state.candidates = cands;
+        // 统一展开汇聚点：混输成员词库候选内 `$` 特殊语法在此展开（见 finalize_candidates）。
+        state.candidates = self.finalize_candidates(cands, &state.mix_buffer);
     }
 
     /// 数字 lens（计算/表达式）：数字与符号（含 `=`）作输入，字母作选词。
@@ -888,6 +896,21 @@ impl Coordinator {
 
                 // ⑤ 其它标点：顶屏「已转换前缀 + 当前高亮候选」+ 转换后标点，退出
                 if let Some(ch) = punct_char(data.key_code, shift) {
+                    // 高亮候选为 $CC 命令：执行命令，触发标点不单独上屏（语义同 top_commit_command_guard）。
+                    if !state.candidates.is_empty() {
+                        let idx = self
+                            .highlighted_global_index(state)
+                            .min(state.candidates.len() - 1);
+                        let cand = state.candidates[idx].clone();
+                        let code = state.mix_buffer.clone();
+                        if let Some(act) =
+                            self.overlay_commit_command(state, &cand, &code, |s, st| {
+                                s.exit_mix_mode(st)
+                            })
+                        {
+                            return act;
+                        }
+                    }
                     let head = if !state.candidates.is_empty() {
                         let idx = self
                             .highlighted_global_index(state)

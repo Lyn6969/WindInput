@@ -178,6 +178,72 @@ impl Coordinator {
     /// 返回引擎候选数（不含短语），供判断 has_more。不复位翻页/高亮。
     /// 返回 (引擎候选数, 输入结局)。结局含全码自动上屏 / 满码空码清空；自动上屏文本经
     /// shadow 复核后才放行，避免上屏被置顶删词移除的候选。调用方仅在「正向输入字母」时消费。
+    /// 词库候选 value 内嵌特殊语法（`$CC` 命令 / `$Y` 模板 / `$AA`·`$SS` 组 / `{..}` 插值）的
+    /// **统一展开汇聚点**。所有候选生成路径（正常 / 特殊模式 / 混输 overlay / 临拼 / 临英）在写入
+    /// `state.candidates` 前均须过此点，保证 `$` 语法在全部输入方案一致生效（对齐 Go
+    /// `dict.ValueExpander`；见 docs/redesign/unified-candidate-value-expansion.md）。
+    ///
+    /// - `$CC` → 标 `is_command`（选中由 `select_candidate`、顶屏由 `top_commit_command_guard` 执行动作）；
+    /// - `$AA`/`$SS` → 一对多炸开；模板 / 花括号插值 → 直接以展开文本上屏；
+    /// - 普通候选（不含 `$` 与 `{`）经廉价预检零开销原样返回。
+    ///
+    /// `input` 为该路径当前编码缓冲（供 cmdbar 语法内 `input()` 求值）。已是 `is_phrase`/`is_command`
+    /// 的候选（短语命中）跳过二次展开。
+    pub(crate) fn finalize_candidates(&self, raw: Vec<Candidate>, input: &str) -> Vec<Candidate> {
+        // 快路径：无任一候选含特殊语法（普通词库/拼音结果）→ 零拷贝原样返回。
+        if !raw.iter().any(|c| {
+            !c.is_phrase && !c.is_command && (c.text.contains('$') || c.text.contains('{'))
+        }) {
+            return raw;
+        }
+        let now = chrono::Local::now();
+        let recent = self.recent_commits_snapshot();
+        let clip = |_n: i64| -> String {
+            #[cfg(windows)]
+            {
+                wind_ui::popup_menu::get_clipboard_text()
+            }
+            #[cfg(not(windows))]
+            {
+                String::new()
+            }
+        };
+        let mut expanded: Vec<Candidate> = Vec::with_capacity(raw.len());
+        for cand in raw.into_iter() {
+            if cand.is_phrase || cand.is_command {
+                expanded.push(cand);
+                continue;
+            }
+            match wind_phrase::expand_dict_value(&cand.text, input, now, &recent, &clip) {
+                wind_phrase::DictExpansion::None => expanded.push(cand),
+                wind_phrase::DictExpansion::Single {
+                    display,
+                    command_src,
+                } => {
+                    let mut c = cand;
+                    c.text = display;
+                    if let Some(src) = command_src {
+                        c.phrase_template = src;
+                        c.is_command = true;
+                    }
+                    expanded.push(c);
+                }
+                wind_phrase::DictExpansion::Many(items) => {
+                    for (display, command_src) in items {
+                        let mut c = cand.clone();
+                        c.text = display;
+                        if let Some(src) = command_src {
+                            c.phrase_template = src;
+                            c.is_command = true;
+                        }
+                        expanded.push(c);
+                    }
+                }
+            }
+        }
+        expanded
+    }
+
     pub(crate) fn build_candidates(
         &self,
         state: &mut State,
@@ -217,67 +283,9 @@ impl Coordinator {
         };
         let should_clear = result.should_clear;
 
-        let mut candidates = result.candidates;
-        // 词库候选 value 内嵌特殊语法（$CC 命令 / $Y 模板 / $AA·$SS 组）：与短语、Go
-        // dict.ValueExpander 一致——候选后处理统一展开。$CC 标记 is_command（选中由
-        // commit_selected、顶屏由 top_commit_command_guard 执行动作，而非上屏原文）；模板 / 花括号
-        // 插值直接以展开文本上屏；$AA/$SS 一对多炸开。普通候选（不含 $ 与 {）经廉价预检零开销跳过。
-        if candidates.iter().any(|c| {
-            !c.is_phrase && !c.is_command && (c.text.contains('$') || c.text.contains('{'))
-        }) {
-            let now = chrono::Local::now();
-            let recent = self.recent_commits_snapshot();
-            let clip = |_n: i64| -> String {
-                #[cfg(windows)]
-                {
-                    wind_ui::popup_menu::get_clipboard_text()
-                }
-                #[cfg(not(windows))]
-                {
-                    String::new()
-                }
-            };
-            let mut expanded: Vec<Candidate> = Vec::with_capacity(candidates.len());
-            for cand in candidates.into_iter() {
-                if cand.is_phrase || cand.is_command {
-                    expanded.push(cand);
-                    continue;
-                }
-                match wind_phrase::expand_dict_value(
-                    &cand.text,
-                    &state.input_buffer,
-                    now,
-                    &recent,
-                    &clip,
-                ) {
-                    wind_phrase::DictExpansion::None => expanded.push(cand),
-                    wind_phrase::DictExpansion::Single {
-                        display,
-                        command_src,
-                    } => {
-                        let mut c = cand;
-                        c.text = display;
-                        if let Some(src) = command_src {
-                            c.phrase_template = src;
-                            c.is_command = true;
-                        }
-                        expanded.push(c);
-                    }
-                    wind_phrase::DictExpansion::Many(items) => {
-                        for (display, command_src) in items {
-                            let mut c = cand.clone();
-                            c.text = display;
-                            if let Some(src) = command_src {
-                                c.phrase_template = src;
-                                c.is_command = true;
-                            }
-                            expanded.push(c);
-                        }
-                    }
-                }
-            }
-            candidates = expanded;
-        }
+        // 词库候选 value 内嵌特殊语法统一展开（汇聚点：所有路径共用，见
+        // finalize_candidates / docs/redesign/unified-candidate-value-expansion.md）。
+        let mut candidates = self.finalize_candidates(result.candidates, &state.input_buffer);
         let phrases = self.phrases.read().unwrap_or_else(|e| e.into_inner());
         if !phrases.is_empty() {
             let recent = self.recent_commits_snapshot();
@@ -1043,7 +1051,6 @@ impl Coordinator {
     /// 仍持 state 锁（std::sync::Mutex 非可重入），同线程重入即死锁——交独立线程待本次按键
     /// 处理释放锁后再跑（对齐 Go「不在 SearchCommand 持锁路径里再 Lock」的约束）。
     pub(crate) fn commit_command(&self, state: &mut State, cand: &Candidate) -> KeyAction {
-        let src = cand.phrase_template.clone();
         // 命令 nav（从前缀列举选中）携完整码 group_code，用它作执行输入上下文
         // （让 code()/input() 等按完整码求值）；精确码命令 group_code 空 → 用当前缓冲。
         let input = if cand.group_code.is_empty() {
@@ -1052,12 +1059,45 @@ impl Coordinator {
             cand.group_code.clone()
         };
         self.reset_pinyin_composition(state);
+        self.spawn_command_action(cand, input)
+    }
+
+    /// `$CC` 命令执行核心：隐藏 UI + 把命令源放独立线程异步执行，返回 `ClearComposition`。
+    /// **不做**任何缓冲/模式状态重置——调用方须在调用前完成本路径的退出（正常路径经
+    /// `commit_command` 的 `reset_pinyin_composition`；overlay 路径经各自 `exit_*`）。
+    /// `input` 为命令 `input()`/`code()` 求值上下文（正常路径=输入缓冲；overlay=其编码缓冲，
+    /// 须在退出前捕获）。异步执行的死锁规避见 [`Self::spawn_command`]。
+    pub(crate) fn spawn_command_action(&self, cand: &Candidate, input: String) -> KeyAction {
+        let src = cand.phrase_template.clone();
         self.notify_ui_hide();
         self.spawn_command(src, input);
         // ClearComposition 而非 Consumed：清掉应用里已输入的命令码（如 "coen"），
         // 否则 composition 残留（Consumed 仅吞键、不结束 composition）。type() 的上屏文本
         // 由命令线程经 push 管道单独提交。
         KeyAction::ClearComposition
+    }
+
+    /// overlay 路径（特殊模式/临拼/临英/混输）选中候选的**命令前置守卫**：
+    /// 若 `cand` 是 `$CC` 命令候选 → 先以 `code`（该 overlay 的编码缓冲）为上下文捕获，
+    /// 执行退出闭包清 overlay 状态，再异步执行动作，返回 `Some(action)`；非命令 → `None`，
+    /// 调用方按各自文本上屏语义继续。统一所有 overlay 的 `$CC` 选中执行入口。
+    pub(crate) fn overlay_commit_command(
+        &self,
+        state: &mut State,
+        cand: &Candidate,
+        code: &str,
+        exit: impl FnOnce(&Self, &mut State),
+    ) -> Option<KeyAction> {
+        if !cand.is_command {
+            return None;
+        }
+        let input = if cand.group_code.is_empty() {
+            code.to_string()
+        } else {
+            cand.group_code.clone()
+        };
+        exit(self, state);
+        Some(self.spawn_command_action(cand, input))
     }
 
     /// 顶屏点统一命令分流：若当前高亮候选是 $CC 命令，执行命令（异步，语义与按空格
@@ -1340,5 +1380,65 @@ impl Coordinator {
             chinese_mode,
             has_new_composition: false,
         }
+    }
+}
+
+#[cfg(test)]
+mod finalize_candidates_tests {
+    //! 候选值展开汇聚点 `finalize_candidates`：所有输入方案共用，保证 `$` 语法一致生效。
+    use super::*;
+    use std::sync::Arc;
+    use wind_config::config::Config;
+
+    fn coord() -> Arc<Coordinator> {
+        Coordinator::new_headless(Config::default(), None)
+    }
+
+    fn cand(text: &str) -> Candidate {
+        Candidate {
+            text: text.to_string(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn expands_aa_group_to_many_char_candidates() {
+        let c = coord();
+        let out = c.finalize_candidates(vec![cand(r#"$AA("数字", "①②③")"#)], "sz");
+        let texts: Vec<&str> = out.iter().map(|c| c.text.as_str()).collect();
+        assert_eq!(texts, vec!["①", "②", "③"], "$AA 应一对多炸开为逐字符候选");
+        assert!(out.iter().all(|c| !c.is_command), "$AA 成员非命令");
+    }
+
+    #[test]
+    fn marks_cc_command_and_keeps_source() {
+        let c = coord();
+        let src = r#"$CC("切简繁", ime.toggle("s2t"))"#;
+        let out = c.finalize_candidates(vec![cand(src)], "co");
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].text, "切简繁", "$CC display 作候选文本");
+        assert!(out[0].is_command, "$CC 应标 is_command");
+        assert_eq!(out[0].phrase_template, src, "命令源留存供选中执行");
+    }
+
+    #[test]
+    fn plain_candidates_pass_through_unchanged() {
+        let c = coord();
+        // 普通词 + 含 $ 但非语法文本（价格$5）：均原样保留，零干预。
+        let out = c.finalize_candidates(vec![cand("你好"), cand("价格$5")], "nh");
+        let texts: Vec<&str> = out.iter().map(|c| c.text.as_str()).collect();
+        assert_eq!(texts, vec!["你好", "价格$5"]);
+        assert!(out.iter().all(|c| !c.is_command));
+    }
+
+    #[test]
+    fn already_command_candidate_is_not_re_expanded() {
+        let c = coord();
+        // 已是 is_command 的候选（短语命中）：跳过二次展开，原样保留。
+        let mut pre = cand(r#"$AA("x","ab")"#);
+        pre.is_command = true;
+        let out = c.finalize_candidates(vec![pre], "x");
+        assert_eq!(out.len(), 1, "已标命令不应被再炸开");
+        assert!(out[0].is_command);
     }
 }
