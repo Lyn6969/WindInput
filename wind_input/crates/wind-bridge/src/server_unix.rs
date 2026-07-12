@@ -72,6 +72,8 @@ fn handle_uds_client(mut stream: UnixStream, handler: Arc<dyn MessageHandler>) {
                     composition_start_y: fg.caret.composition_start_y,
                     client_token: fg.client_token,
                     input_scope_mask: fg.input_scope_mask,
+                    disabled: fg.disabled != 0,
+                    reason: fg.reason,
                 });
             }
         }

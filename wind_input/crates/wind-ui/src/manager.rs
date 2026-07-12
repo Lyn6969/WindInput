@@ -5,6 +5,9 @@
 
 use crate::candidate_window::{CandidateItem, CandidateWindow, CandidateWindowConfig};
 use crate::toast::{ToastKind, ToastPosition};
+
+/// re-export：使协调器以 `wind_ui::manager::InputDiagView` 统一引用。
+pub use crate::input_diag_hud::InputDiagView;
 use std::sync::mpsc;
 use tracing::{debug, error, info};
 #[cfg(windows)]
@@ -63,6 +66,10 @@ pub enum UiCommand {
     },
     /// 隐藏状态提示气泡（常驻模式失焦/切走输入法时）。
     HideStatusTip,
+    /// 显示/更新输入诊断 HUD（右键「高级」开）。惰性创建，可拖动，双击复制。
+    ShowInputDiag(crate::input_diag_hud::InputDiagView),
+    /// 隐藏输入诊断 HUD。
+    HideInputDiag,
     /// 更新常驻工具栏状态（中英/方案/标点/全半角）
     UpdateToolbar(crate::toolbar::ToolbarState),
     /// 隐藏工具栏
@@ -231,6 +238,10 @@ pub enum MenuCmd {
     TakeScreenshot,
     /// 截图候选窗口到剪贴板（高级菜单）
     ScreenshotCandidateToClipboard,
+    /// 切换输入诊断 HUD 显隐（高级菜单）
+    ToggleInputDiagnostics,
+    /// 切换密码框强制英文（高级菜单，临时测试入口）
+    TogglePasswordSuppress,
 }
 
 /// 菜单项的动作类型（右键候选菜单 + 功能主菜单共用）
@@ -280,6 +291,8 @@ impl MenuKind {
                 MenuCmd::ScreenshotCandidateToClipboard => 112,
                 MenuCmd::OpenAppDir => 113,
                 MenuCmd::OpenLogDir => 114,
+                MenuCmd::ToggleInputDiagnostics => 120,
+                MenuCmd::TogglePasswordSuppress => 121,
                 MenuCmd::SchemaSelect(i) => 1000 + i as i32,
                 MenuCmd::ThemeSelect(i) => 2000 + i as i32,
                 MenuCmd::FilterMode(i) => 3000 + i as i32,
@@ -312,6 +325,8 @@ impl MenuKind {
             112 => MenuCmd::ScreenshotCandidateToClipboard,
             113 => MenuCmd::OpenAppDir,
             114 => MenuCmd::OpenLogDir,
+            120 => MenuCmd::ToggleInputDiagnostics,
+            121 => MenuCmd::TogglePasswordSuppress,
             1000..=1999 => MenuCmd::SchemaSelect((id - 1000) as usize),
             2000..=2999 => MenuCmd::ThemeSelect((id - 2000) as usize),
             3000..=3999 => MenuCmd::FilterMode((id - 3000) as usize),
@@ -456,6 +471,9 @@ impl UiManager {
             }
         };
         let mut tip_hide_at: Option<std::time::Instant> = None;
+
+        // 输入诊断 HUD（惰性创建：首次 ShowInputDiag 时构造，best-effort）
+        let mut input_diag_hud: Option<crate::input_diag_hud::InputDiagHud> = None;
 
         // 一次性通知 toast（best-effort）
         let mut toast = match crate::toast::Toast::new() {
@@ -911,6 +929,23 @@ impl UiManager {
                             hr.hide_kind(HOST_WINDOW_STATUS);
                         }
                         tip_hide_at = None;
+                    }
+                    UiCommand::ShowInputDiag(v) => {
+                        // 惰性创建：失败仅记 error，不影响其它窗口。
+                        if input_diag_hud.is_none() {
+                            match crate::input_diag_hud::InputDiagHud::new() {
+                                Ok(h) => input_diag_hud = Some(h),
+                                Err(e) => error!("Failed to create input diag HUD: {}", e),
+                            }
+                        }
+                        if let Some(h) = input_diag_hud.as_mut() {
+                            h.show_or_update(&v);
+                        }
+                    }
+                    UiCommand::HideInputDiag => {
+                        if let Some(h) = input_diag_hud.as_mut() {
+                            h.hide();
+                        }
                     }
                     UiCommand::ShowToast {
                         text,

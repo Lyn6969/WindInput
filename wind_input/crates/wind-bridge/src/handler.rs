@@ -155,6 +155,8 @@ pub struct FocusData {
     pub composition_start_y: i32,
     pub client_token: u64,
     pub input_scope_mask: u64,
+    pub disabled: bool,
+    pub reason: u8,
 }
 
 /// 光标位置数据
@@ -277,4 +279,7 @@ pub trait MessageHandler: Send + Sync {
     fn get_current_mode(&self, _client_token: u64) -> (bool, bool) {
         (true, false)
     }
+
+    /// compartment 禁用态变更（不换焦点）上报。默认空实现。
+    fn handle_input_state_report(&self, _pid: u32, _disabled: bool, _reason: u8, _mask: u64) {}
 }

@@ -35,6 +35,11 @@ constexpr uint16_t CMD_CANDIDATE_HOVER       = 0x020E; // Host render: mouse hov
 constexpr uint16_t CMD_CANDIDATE_SCROLL      = 0x0211; // Host render: mouse wheel over candidate box (payload: delta i32, WHEEL_DELTA multiple, >0 = up); Go decides (no paging by default)
 constexpr uint16_t CMD_HOST_RENDER_FAILED    = 0x0212; // Host render: band window creation failed in DLL (async, payload: reason u32). Go logs + notifies user the candidate fell back to its local window
 constexpr uint32_t HOST_RENDER_FAIL_WINDOW_CREATE = 1; // CreateWindowInBand failed at target band and band=0
+// Input state report (C++ -> Go, async): compartment-driven disabled/reason change outside
+// of a fresh focus_gained (e.g. GUID_COMPARTMENT_KEYBOARD_DISABLED flips while focus stays
+// on the same control, such as clicking a password field inside the same web page).
+// Payload: InputStateReportPayload (14 bytes). Rust side: InputStateReportPayload (Task 2).
+constexpr uint16_t CMD_INPUT_STATE_REPORT    = 0x0213;
 constexpr uint16_t CMD_COMPOSITION_TERMINATED = 0x0209; // Composition unexpectedly terminated (e.g., user clicked in input field)
 constexpr uint16_t CMD_CARET_UPDATE     = 0x0301; // Caret position update
 constexpr uint16_t CMD_SELECTION_CHANGED = 0x0302; // Selection/caret changed without composition (from ITfTextEditSink)
@@ -409,7 +414,8 @@ struct IMEActivatedPayload
 };
 static_assert(sizeof(IMEActivatedPayload) == 8, "IMEActivatedPayload must be 8 bytes");
 
-// CMD_FOCUS_GAINED extended payload (36 bytes = CaretPayload + clientToken + inputScopeMask)
+// CMD_FOCUS_GAINED extended payload (38 bytes = CaretPayload + clientToken + inputScopeMask
+// + disabled + reason)
 struct FocusGainedPayload
 {
     CaretPayload caret;          // 20 bytes: caret position
@@ -418,8 +424,27 @@ struct FocusGainedPayload
     // （如 IS_PASSWORD=31 → bit 31）。枚举值 < 0 或 >= 64 的项被忽略。Go 端据此决策
     // 密码框强制英文等行为（见 coordinator 的 inputScope 常量）。0 表示未知/默认（IS_DEFAULT）。
     uint64_t     inputScopeMask; // 8 bytes: InputScope bitmask
+    // 输入诊断 HUD（Task 7）：焦点控件当前是否被判定为"禁用中文"及原因，随 focus_gained
+    // 一并上报，避免 HUD 首次落座需要等待单独的状态上报。字段顺序/含义与 Rust
+    // FocusGainedPayload（disabled u8 + reason u8）严格一致。
+    uint8_t      disabled;       // 1 byte: 0/1 - GUID_COMPARTMENT_KEYBOARD_DISABLED 命中
+    // reason: 0 None / 1 CompartmentDisabled / 2 InputScopePassword / 3 NumericPassword
+    uint8_t      reason;         // 1 byte
 };
-static_assert(sizeof(FocusGainedPayload) == 36, "FocusGainedPayload must be 36 bytes");
+static_assert(sizeof(FocusGainedPayload) == 38, "FocusGainedPayload must be 38 bytes");
+
+// CMD_INPUT_STATE_REPORT payload (14 bytes). Sent standalone (not tied to a focus_gained)
+// when the disabled/reason state changes for the currently focused control, e.g. a
+// compartment flip without a new OnSetFocus (SPA navigating into a password field).
+// Field order/meaning mirrors Rust InputStateReportPayload exactly.
+struct InputStateReportPayload
+{
+    uint32_t pid;             // 4 bytes LE, offset 0..4: GetCurrentProcessId() of the host process
+    uint8_t  disabled;        // 1 byte, offset 4
+    uint8_t  reason;          // 1 byte, offset 5
+    uint64_t inputScopeMask;  // 8 bytes LE, offset 6..14
+};
+static_assert(sizeof(InputStateReportPayload) == 14, "InputStateReportPayload must be 14 bytes");
 
 // Input stats payload (from C++ to Go, async)
 // Counts of characters typed in English mode (not intercepted by Go)

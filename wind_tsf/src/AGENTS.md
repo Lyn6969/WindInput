@@ -78,7 +78,8 @@ C++ implementation files for the TSF DLL。所有文件编译链接进唯一目�
 - `SendKeyEvent()` - Send key event with binary protocol
 - `SendCommitRequest()` - Send commit request with barrier
 - `SendCaretUpdate()` - Send caret position to Go service
-- `SendFocusGained()` / `SendFocusLost()` - Focus notifications。FocusGained 为**同步**命令：Go 在响应里回传 CMD_MODE_PUSH（权威 chineseMode/fullWidth），本端在 OnSetFocus 内同步写入 `_bChineseMode`，消除首次按键上屏英文竞态；重型状态（工具栏/热键/hostRender）仍由 push pipe CMD_ACTIVATION_STATUS_PUSH 异步回送。FocusLost 仍 async。FocusGainedPayload 现为 36 字节，末尾 8 字节是 InputScope bitmask（密码框等语义供 Go 决策）
+- `SendFocusGained()` / `SendFocusLost()` - Focus notifications。FocusGained 为**同步**命令：Go 在响应里回传 CMD_MODE_PUSH（权威 chineseMode/fullWidth），本端在 OnSetFocus 内同步写入 `_bChineseMode`，消除首次按键上屏英文竞态；重型状态（工具栏/热键/hostRender）仍由 push pipe CMD_ACTIVATION_STATUS_PUSH 异步回送。FocusLost 仍 async。FocusGainedPayload 现为 38 字节，末尾依次是 8 字节 InputScope bitmask（密码框等语义供 Go 决策）+ disabled(1B) + reason(1B)（输入诊断 HUD，Task 7）
+- `SendInputStateReport()` - 输入诊断 HUD（Task 7）：async 上报 `CMD_INPUT_STATE_REPORT`（14 字节：pid u32 + disabled u8 + reason u8 + inputScopeMask u64），用于 compartment 变更但焦点未变（不触发新 OnSetFocus）时让 HUD 即时刷新；调用点为 `TextService::OnChange` 的 `GUID_COMPARTMENT_KEYBOARD_DISABLED` 分支
 - `SendIMEActivated()` / `SendIMEDeactivated()` - IME state notifications（IMEActivated 已改 async；同上）
 - `SendModeNotify()` - Notify mode change (TSF local toggle, async)
 - `SendToggleMode()` - Toggle mode request from UI (sync)

@@ -551,6 +551,15 @@ pub struct Coordinator {
     #[cfg(windows)]
     #[allow(dead_code)] // Task 6/7 接线写帧/隐藏后即被读取
     host_render: std::sync::OnceLock<Arc<wind_bridge::host_render_windows::HostRenderManager>>,
+    /// 最近一次输入诊断快照（compartment 禁用态 / InputScope 密码位），供 Task 6 HUD 展示。
+    pub(crate) last_input_diag: Mutex<crate::input_diag::InputDiagState>,
+    /// 密码框强制英文抑制态：命中密码 InputScope 时置 true，输入闸据此强制英文透传
+    /// （不改 `chinese_mode` 持久值，图标保持不变）。
+    pub(crate) password_suppress: std::sync::atomic::AtomicBool,
+    /// 密码框抑制策略开关（默认 true）；关闭时 `apply_input_diag` 不再置位 `password_suppress`。
+    pub(crate) password_suppress_enabled: std::sync::atomic::AtomicBool,
+    /// 输入诊断 HUD 是否可见（Task 6/7 接线；本任务先占位默认 false）。
+    pub(crate) input_diag_hud_visible: std::sync::atomic::AtomicBool,
 }
 
 /// 短语候选权重基准（高于普通候选，使短语展开排在前列）
@@ -1046,6 +1055,10 @@ impl Coordinator {
             fullscreen_cached: std::sync::atomic::AtomicBool::new(false),
             #[cfg(windows)]
             host_render: std::sync::OnceLock::new(),
+            last_input_diag: Mutex::new(Default::default()),
+            password_suppress: std::sync::atomic::AtomicBool::new(false),
+            password_suppress_enabled: std::sync::atomic::AtomicBool::new(true),
+            input_diag_hud_visible: std::sync::atomic::AtomicBool::new(false),
         });
         // 命令栏：装配 Services（ime/config/dict 后端）+ 自身 Weak 引用。
         coordinator.init_cmdbar();
@@ -1122,6 +1135,76 @@ impl Coordinator {
             .get(&pid)
             .cloned()
             .unwrap_or_default()
+    }
+
+    /// 消费一次输入诊断上报（compartment 禁用态 + InputScope 掩码）：更新 `last_input_diag`
+    /// 快照，并按 `password_suppress_enabled` 开关决定是否强制英文抑制（密码框场景）。
+    pub(crate) fn apply_input_diag(&self, pid: u32, disabled: bool, reason_byte: u8, mask: u64) {
+        use std::sync::atomic::Ordering::Relaxed;
+        let reason = crate::input_diag::reason_from(disabled, mask);
+        // 本地一律以 mask/disabled 经 reason_from 推导 reason 作准；上报的 reason_byte
+        // 仅供展示/日志参考，不参与本地决策（避免"双重来源"歧义）。
+        let _ = reason_byte; // 上游已按 mask/disabled 推导 reason；保留形参对齐上报字段序。
+        let name = if pid != 0 {
+            self.cached_proc_name((pid as u64) << 32)
+        } else {
+            String::new()
+        };
+        // 抑制：命中密码 InputScope 位 且 compartment 未禁用（禁用态 DLL 已放行所有键，引擎收不到键，
+        // 抑制是 moot 的——见设计 D 节）且 策略开关开 → 强制英文。
+        let suppress = crate::input_diag::is_password_scope(mask)
+            && !disabled
+            && self.password_suppress_enabled.load(Relaxed);
+        self.password_suppress.store(suppress, Relaxed);
+        {
+            let mut d = self
+                .last_input_diag
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            *d = crate::input_diag::InputDiagState {
+                pid,
+                process_name: name,
+                disabled,
+                reason,
+                mask,
+            };
+        }
+        self.push_input_diag_hud_if_visible();
+    }
+
+    /// 密码框抑制策略是否开启（Task 6/7 设置面板读取）。
+    pub(crate) fn password_suppress_enabled(&self) -> bool {
+        self.password_suppress_enabled
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// 输入诊断 HUD 当前是否可见（Task 6/7 设置面板读取）。
+    pub(crate) fn input_diag_hud_visible(&self) -> bool {
+        self.input_diag_hud_visible
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// HUD 推送：`input_diag_hud_visible` 开启时，把 `last_input_diag` 快照经 UI 通道
+    /// 下发 `ShowInputDiag`（UI 线程惰性创建 HUD 窗口并显示/更新）。关闭时不推送。
+    pub(crate) fn push_input_diag_hud_if_visible(&self) {
+        use std::sync::atomic::Ordering::Relaxed;
+        if !self.input_diag_hud_visible.load(Relaxed) {
+            return;
+        }
+        let d = self
+            .last_input_diag
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let view = wind_ui::manager::InputDiagView {
+            process_name: d.process_name.clone(),
+            pid: d.pid,
+            disabled: d.disabled,
+            reason_text: crate::input_diag::reason_label(d.reason).to_string(),
+            mask: d.mask,
+        };
+        let _ = self
+            .ui_tx
+            .send(wind_ui::manager::UiCommand::ShowInputDiag(view));
     }
 
     /// 决策进程 `proc_name` 的中英初始状态（初始状态语义的单一内聚点）。
@@ -3269,7 +3352,10 @@ impl MessageHandler for Coordinator {
         }
 
         // 英文模式：直接透传
-        if !state.chinese_mode {
+        // 密码框强制英文抑制：透传（不改 chinese_mode 持久值/图标；设计"图标不变"）
+        if !state.chinese_mode
+            || self.password_suppress.load(std::sync::atomic::Ordering::Relaxed)
+        {
             return KeyAction::PassThrough;
         }
 
@@ -4001,6 +4087,8 @@ impl MessageHandler for Coordinator {
         self.push_activation_status(data.client_token);
         self.notify_toolbar_async(); // 激活态 → 工具栏显示（异步，避免 is_foreground_fullscreen 阻塞 bridge 线程）
         self.show_persistent_status_if_always(); // 常驻模式:获焦即显示状态
+        let pid = (data.client_token >> 32) as u32;
+        self.apply_input_diag(pid, data.disabled, data.reason, data.input_scope_mask);
         Some(status)
     }
 
@@ -4019,6 +4107,10 @@ impl MessageHandler for Coordinator {
             s.menu_open = false; // 复位菜单态，否则下一个键被 forward_menu_key 吞掉
             self.reset_exclusive_modes(&mut s); // 失焦丢弃临时英文/拼音/快捷输入残留
         }
+        // 失焦即清抑制态：密码框失焦到下次 focus_gained 之间无控件收键，suppress 残留虽不可利用，
+        // 但属状态卫生隐患——独立 atomic，无锁依赖，不与上面的 state 锁冲突。
+        self.password_suppress
+            .store(false, std::sync::atomic::Ordering::Relaxed);
         self.notify_toolbar_async(); // 隐藏工具栏（防抖，异步避免阻塞 bridge 线程）
         self.notify_ui_hide(); // 隐藏候选窗 + 弹出菜单（HideCandidates 连带关菜单）
         self.hide_tip(); // 失焦隐藏状态提示（常驻模式尤需）
@@ -4350,6 +4442,10 @@ impl MessageHandler for Coordinator {
     fn handle_host_render_failed(&self, reason: u32) {
         // DLL 侧 host-render 初始化/映射失败：记录告警。后续（Task 6/7）可据此回退渲染路径。
         warn!("host-render 失败上报 reason={reason}（DLL 退回进程内渲染）");
+    }
+
+    fn handle_input_state_report(&self, pid: u32, disabled: bool, reason: u8, mask: u64) {
+        self.apply_input_diag(pid, disabled, reason, mask);
     }
 }
 
@@ -4945,6 +5041,148 @@ mod capslock_tests {
         assert!(
             !c.state.lock().unwrap().caps_lock,
             "set_caps_lock(false) 后应为 false"
+        );
+    }
+}
+
+#[cfg(test)]
+mod input_diag_tests {
+    //! last_input_diag 存储 + 密码框强制英文抑制。
+    use super::*;
+    use crate::input_diag::InputDiagReason;
+
+    fn test_coordinator() -> Arc<Coordinator> {
+        Coordinator::new_headless(Config::default(), None)
+    }
+
+    #[test]
+    fn password_scope_sets_suppress_and_state() {
+        let c = test_coordinator();
+        c.apply_input_diag(1234, false, /*reason*/ 2, 1 << 31);
+        assert!(c.password_suppress.load(std::sync::atomic::Ordering::Relaxed));
+        let d = c.last_input_diag.lock().unwrap();
+        assert_eq!(d.reason, InputDiagReason::InputScopePassword);
+        assert_eq!(d.pid, 1234);
+    }
+
+    #[test]
+    fn suppress_cleared_when_mask_clears() {
+        let c = test_coordinator();
+        c.apply_input_diag(1, false, 2, 1 << 31);
+        c.apply_input_diag(1, false, 0, 0);
+        assert!(!c.password_suppress.load(std::sync::atomic::Ordering::Relaxed));
+    }
+
+    #[test]
+    fn disabled_policy_no_suppress_when_off() {
+        let c = test_coordinator();
+        c.password_suppress_enabled
+            .store(false, std::sync::atomic::Ordering::Relaxed);
+        c.apply_input_diag(1, false, 2, 1 << 31);
+        assert!(!c.password_suppress.load(std::sync::atomic::Ordering::Relaxed));
+    }
+
+    /// 构造最简按键事件（对齐 capslock_tests::kev 的写法）。
+    fn kev(key_code: u32, event_type: u8) -> KeyEventData {
+        KeyEventData {
+            key_code,
+            scan_code: 0,
+            modifiers: 0,
+            event_type,
+            toggles: 0,
+            event_seq: 0,
+            prev_char: 0,
+        }
+    }
+
+    /// 真实输入路径验证：密码框抑制期间字母键必须透传（强制英文），
+    /// 解除抑制后同一按键应回到中文组词流——防止「只改图标不拦输入」的回归。
+    #[test]
+    fn password_suppress_forces_english_passthrough() {
+        let mut cfg = Config::default();
+        cfg.input.default.chinese_mode = true;
+        let c = Coordinator::new_headless(cfg, None);
+        assert!(c.state.lock().unwrap().chinese_mode, "前置条件：应处于中文模式");
+
+        let pid = 4321u32;
+        c.apply_input_diag(pid, false, 2, 1 << 31);
+        assert!(
+            c.password_suppress.load(std::sync::atomic::Ordering::Relaxed),
+            "前置条件：密码框抑制应已置位"
+        );
+        let action = c.handle_key_event(&kev(0x41 /* VK_A */, EVENT_KEY_DOWN));
+        assert!(
+            matches!(action, KeyAction::PassThrough),
+            "密码框抑制期间字母键应强制透传（英文），实际: {:?}",
+            action
+        );
+        assert!(
+            c.state.lock().unwrap().chinese_mode,
+            "抑制不应改动 chinese_mode 持久值（图标保持不变）"
+        );
+
+        // 解除抑制：mask 清零。
+        c.apply_input_diag(pid, false, 0, 0);
+        assert!(!c.password_suppress.load(std::sync::atomic::Ordering::Relaxed));
+        let action = c.handle_key_event(&kev(0x41 /* VK_A */, EVENT_KEY_DOWN));
+        assert!(
+            !matches!(action, KeyAction::PassThrough),
+            "解除抑制后字母键应进入中文组词流，不应透传，实际: {:?}",
+            action
+        );
+    }
+
+    #[test]
+    fn toggle_hud_flips_visibility() {
+        use std::sync::atomic::Ordering::Relaxed;
+        let c = test_coordinator();
+        assert!(!c.input_diag_hud_visible.load(Relaxed));
+        c.toggle_input_diag_hud();
+        assert!(c.input_diag_hud_visible.load(Relaxed));
+        c.toggle_input_diag_hud();
+        assert!(!c.input_diag_hud_visible.load(Relaxed));
+    }
+
+    #[test]
+    fn toggle_password_suppress_flips_enabled() {
+        use std::sync::atomic::Ordering::Relaxed;
+        let c = test_coordinator();
+        assert!(c.password_suppress_enabled.load(Relaxed)); // 默认开
+        c.toggle_password_suppress();
+        assert!(!c.password_suppress_enabled.load(Relaxed));
+    }
+
+    #[test]
+    fn focus_lost_clears_password_suppress() {
+        use std::sync::atomic::Ordering::Relaxed;
+        let c = test_coordinator();
+        c.apply_input_diag(1234, false, 2, 1 << 31);
+        assert!(
+            c.password_suppress.load(Relaxed),
+            "前置条件：密码框抑制应已置位"
+        );
+        c.handle_focus_lost();
+        assert!(
+            !c.password_suppress.load(Relaxed),
+            "失焦后应清除密码框抑制态，避免残留到下次 focus_gained 之前"
+        );
+    }
+
+    #[test]
+    fn compartment_disabled_does_not_set_suppress() {
+        use std::sync::atomic::Ordering::Relaxed;
+        let c = test_coordinator();
+        // disabled=true 且 mask 含密码位：compartment 已禁用，DLL 放行所有键，suppress 应为 moot。
+        c.apply_input_diag(1, true, 1, 1 << 31);
+        assert!(
+            !c.password_suppress.load(Relaxed),
+            "compartment 禁用态不应冗余置位 suppress"
+        );
+        let d = c.last_input_diag.lock().unwrap();
+        assert_eq!(
+            d.reason,
+            InputDiagReason::CompartmentDisabled,
+            "reason 不受 suppress 判据变化影响"
         );
     }
 }

@@ -154,8 +154,16 @@ public:
     // Send focus lost notification
     BOOL SendFocusLost();
 
-    // Send focus gained notification (with optional caret position and InputScope bitmask)
-    BOOL SendFocusGained(int caretX = 0, int caretY = 0, int caretHeight = 0, UINT64 inputScopeMask = 0);
+    // Send focus gained notification (with optional caret position and InputScope bitmask).
+    // disabled/reason: input diagnostics HUD state for the newly focused control (Task 7).
+    // reason: 0 None / 1 CompartmentDisabled / 2 InputScopePassword / 3 NumericPassword.
+    BOOL SendFocusGained(int caretX = 0, int caretY = 0, int caretHeight = 0, UINT64 inputScopeMask = 0,
+                         bool disabled = false, uint8_t reason = 0);
+
+    // Send input state report (async, fire-and-forget): standalone disabled/reason change
+    // for the currently focused control, e.g. a GUID_COMPARTMENT_KEYBOARD_DISABLED flip that
+    // happens without a new OnSetFocus (SPA navigating into a password field in-place).
+    BOOL SendInputStateReport(uint32_t pid, bool disabled, uint8_t reason, uint64_t inputScopeMask);
 
     // Send composition unexpectedly terminated notification
     // (e.g., user clicked in input field to change cursor position)

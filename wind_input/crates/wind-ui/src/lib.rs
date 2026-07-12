@@ -22,6 +22,7 @@ pub mod candidate_window;
 pub mod debounce;
 pub mod dpi;
 pub mod image_cache;
+pub mod input_diag_hud;
 pub mod manager;
 /// macOS host-render forwarder：把 UiCommand 光栅化进 POSIX SHM + push 推帧给 .app。
 #[cfg(target_os = "macos")]
