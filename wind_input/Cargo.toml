@@ -10,6 +10,7 @@ members = [
     "crates/wind-candidate",
     "crates/wind-transform",
     "crates/wind-theme",
+    "crates/wind-transfer",
     "crates/wind-ui",
     "crates/wind-cmdbar",
     "crates/wind-phrase",

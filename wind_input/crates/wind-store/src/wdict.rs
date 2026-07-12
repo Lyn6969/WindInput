@@ -154,6 +154,101 @@ fn phrase_columns_from_header(header: &str) -> Vec<String> {
     PHRASE_COLUMNS.iter().map(|s| s.to_string()).collect()
 }
 
+/// wdict words 段的一行（用户词导入导出）。count/created_at 属个人数据，不随导出流转。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WordIo {
+    pub code: String,
+    pub text: String,
+    pub weight: i32,
+}
+
+const WORD_COLUMNS: &[&str] = &["code", "text", "weight"];
+
+/// 导出 words 为 wdict 文本（YAML 头 + `--- !words` TSV 段）。
+pub fn export_words_wdict(rows: &[WordIo], exported_at: &str) -> String {
+    let mut s = String::new();
+    s.push_str("# WindInput 用户数据文件\n");
+    s.push_str("wind_dict:\n");
+    s.push_str("  version: 1\n");
+    s.push_str("  generator: WindInput\n");
+    s.push_str(&format!("  exported_at: {exported_at}\n"));
+    s.push_str("  sections:\n");
+    s.push_str("    words:\n");
+    s.push_str(&format!("      columns: [{}]\n", WORD_COLUMNS.join(", ")));
+    s.push_str("\n--- !words\n");
+    for r in rows {
+        s.push_str(&format!(
+            "{}\t{}\t{}\n",
+            escape_field(&r.code),
+            escape_field(&r.text),
+            r.weight,
+        ));
+    }
+    s
+}
+
+/// 解析 wdict 文本的 words 段。返回 (行, 跳过的非法行数)。只认 version==1。
+pub fn parse_words_wdict(text: &str) -> Result<(Vec<WordIo>, usize), String> {
+    let header = text.split("\n---").next().unwrap_or("");
+    if !header.contains("wind_dict:") {
+        return Err("不是 WindDict 文件（缺 wind_dict 头）".into());
+    }
+    let version_ok = header.lines().any(|l| {
+        let t = l.trim();
+        t.starts_with("version:") && t.trim_start_matches("version:").trim() == "1"
+    });
+    if !version_ok {
+        return Err("不支持的 WindDict 版本（需 version: 1）".into());
+    }
+    let Some(after_tag) = find_section_body(text, "words") else {
+        return Ok((Vec::new(), 0));
+    };
+    let cols = words_columns_from_header(header);
+    let mut rows = Vec::new();
+    let mut skipped = 0usize;
+    for line in after_tag.lines() {
+        if line.trim().is_empty() {
+            continue;
+        }
+        let fields: Vec<&str> = line.split('\t').collect();
+        if fields.len() < cols.len() {
+            skipped += 1;
+            continue;
+        }
+        let get = |name: &str| -> &str {
+            cols.iter()
+                .position(|c| c == name)
+                .map(|i| fields[i])
+                .unwrap_or("")
+        };
+        rows.push(WordIo {
+            code: unescape_field(get("code")),
+            text: unescape_field(get("text")),
+            weight: get("weight").trim().parse().unwrap_or(0),
+        });
+    }
+    Ok((rows, skipped))
+}
+
+/// 从头部读 words 段列定义；缺则默认列。
+fn words_columns_from_header(header: &str) -> Vec<String> {
+    for l in header.lines() {
+        let t = l.trim();
+        if let Some(rest) = t.strip_prefix("columns:") {
+            let inner = rest.trim().trim_start_matches('[').trim_end_matches(']');
+            let cols: Vec<String> = inner
+                .split(',')
+                .map(|x| x.trim().to_string())
+                .filter(|x| !x.is_empty())
+                .collect();
+            if !cols.is_empty() {
+                return cols;
+            }
+        }
+    }
+    WORD_COLUMNS.iter().map(|s| s.to_string()).collect()
+}
+
 /// 返回 `--- !<tag>\n` 之后、下一个 `\n---` 之前的正文。
 fn find_section_body<'a>(text: &'a str, tag: &str) -> Option<&'a str> {
     let marker = format!("--- !{tag}");
@@ -239,5 +334,42 @@ mod tests {
         assert!(parse_bool("1"));
         assert!(!parse_bool("0"));
         assert!(!parse_bool(""));
+    }
+
+    #[test]
+    fn words_wdict_roundtrip() {
+        let rows = vec![
+            WordIo {
+                code: "a".into(),
+                text: "工".into(),
+                weight: 100,
+            },
+            WordIo {
+                code: "ml".into(),
+                text: "多行\n带\t制表".into(),
+                weight: 0,
+            },
+        ];
+        let s = export_words_wdict(&rows, "2026-07-11T00:00:00+08:00");
+        assert!(s.contains("wind_dict:"));
+        assert!(s.contains("--- !words"));
+        let (parsed, skipped) = parse_words_wdict(&s).unwrap();
+        assert_eq!(skipped, 0);
+        assert_eq!(parsed, rows, "导出→解析应无损往返(含换行/制表)");
+    }
+
+    #[test]
+    fn words_parse_rejects_bad_version() {
+        let bad = "wind_dict:\n  version: 2\n\n--- !words\na\t工\t1\n";
+        assert!(parse_words_wdict(bad).is_err(), "version!=1 应拒绝");
+    }
+
+    #[test]
+    fn words_parse_tolerates_bad_lines() {
+        let s = "wind_dict:\n  version: 1\n  sections:\n    words:\n      columns: [code, text, weight]\n\n--- !words\nok\t好\t10\nbadline_no_tabs\nkw\t坏权重\tNaN\n";
+        let (rows, skipped) = parse_words_wdict(s).unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(skipped, 1, "列数不足的行跳过");
+        assert_eq!(rows[1].weight, 0, "非法数字回退 0");
     }
 }

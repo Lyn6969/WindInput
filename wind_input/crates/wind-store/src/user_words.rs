@@ -7,6 +7,7 @@
 //! key 编码：`"{schema}\0{code}\0{text}"`（store.md §2）。
 
 use crate::store::{Store, USER_WORDS};
+use crate::wdict;
 use redb::ReadableTable;
 use serde::{Deserialize, Serialize};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -227,6 +228,40 @@ impl Store {
             Ok(())
         })
     }
+
+    /// 导出某方案的全部用户词为 wdict 文本(仅 code/text/weight,不含个人 count/created_at)。
+    pub fn export_user_words_wdict(
+        &self,
+        schema: &str,
+        exported_at: &str,
+    ) -> anyhow::Result<String> {
+        let recs = self.search_user_words_prefix(schema, "", 0)?;
+        let rows: Vec<wdict::WordIo> = recs
+            .into_iter()
+            .map(|r| wdict::WordIo {
+                code: r.code,
+                text: r.text,
+                weight: r.weight,
+            })
+            .collect();
+        Ok(wdict::export_words_wdict(&rows, exported_at))
+    }
+
+    /// 从 wdict 文本导入用户词到某方案(Merge:add_user_word 的 max-weight upsert)。
+    /// 返回 (imported, skipped)。
+    pub fn import_user_words_wdict(
+        &self,
+        schema: &str,
+        text: &str,
+    ) -> anyhow::Result<(usize, usize)> {
+        let (rows, skipped) = wdict::parse_words_wdict(text).map_err(|e| anyhow::anyhow!(e))?;
+        let mut imported = 0usize;
+        for r in &rows {
+            self.add_user_word(schema, &r.code, &r.text, r.weight)?;
+            imported += 1;
+        }
+        Ok((imported, skipped))
+    }
 }
 
 #[cfg(test)]
@@ -294,6 +329,54 @@ mod tests {
         let r = s.get_user_words("wb", "a").unwrap();
         assert_eq!(r[0].count, 3);
         assert_eq!(r[0].weight, 500, "第 3 次达阈值 +500");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn export_import_user_words_roundtrip() {
+        let path = tmp("wind_uw_io.redb");
+        let s = Store::open(&path).unwrap();
+        s.add_user_word("wb", "a", "工", 100).unwrap();
+        s.add_user_word("wb", "ml", "多行\n带\t制表", 5).unwrap();
+        let text = s
+            .export_user_words_wdict("wb", "2026-07-11T00:00:00+08:00")
+            .unwrap();
+        assert!(text.contains("--- !words"));
+
+        // 导入到新库应还原
+        let path2 = tmp("wind_uw_io2.redb");
+        let s2 = Store::open(&path2).unwrap();
+        let (imported, skipped) = s2.import_user_words_wdict("wb", &text).unwrap();
+        assert_eq!(skipped, 0);
+        assert_eq!(imported, 2);
+        let got = s2.get_user_words("wb", "a").unwrap();
+        assert_eq!(got[0].text, "工");
+        assert_eq!(got[0].weight, 100);
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(&path2);
+    }
+
+    #[test]
+    fn import_user_words_merges_max_weight() {
+        let path = tmp("wind_uw_merge.redb");
+        let s = Store::open(&path).unwrap();
+        s.add_user_word("wb", "a", "工", 100).unwrap();
+        // 导入同词更低权重 → 保持 max(100)
+        let text = crate::wdict::export_words_wdict(
+            &[crate::wdict::WordIo {
+                code: "a".into(),
+                text: "工".into(),
+                weight: 30,
+            }],
+            "2026-07-11T00:00:00+08:00",
+        );
+        let (imported, _) = s.import_user_words_wdict("wb", &text).unwrap();
+        assert_eq!(imported, 1);
+        assert_eq!(
+            s.get_user_words("wb", "a").unwrap()[0].weight,
+            100,
+            "Merge 取 max"
+        );
         let _ = std::fs::remove_file(&path);
     }
 }
