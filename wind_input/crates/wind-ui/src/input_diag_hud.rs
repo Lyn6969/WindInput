@@ -184,7 +184,8 @@ pub struct InputDiagHud {
     scale: f32,
     /// 拖动/双击状态（注册进 `wnd_proc`）。show_or_update 刷新其 copy_text。
     state: std::rc::Rc<std::cell::RefCell<DragState>>,
-    /// 当前窗口左上角屏幕坐标（首次为右下角；拖动后由 wnd_proc 移动，此值仅作 show 定位兜底）。
+    /// 最近一次 show 使用的窗口左上角屏幕坐标：首次为右下角，之后每次刷新从窗口实际位置
+    /// 同步（尊重用户拖动）；仅当被拖出屏幕外时复位回右下角。
     pos: (i32, i32),
     /// 是否已定位过（避免每次 update 都重置到右下角，尊重用户拖动）。
     positioned: bool,
@@ -240,10 +241,18 @@ impl InputDiagHud {
         if let Err(e) = self.window.update() {
             tracing::warn!("InputDiagHud update failed: {}", e);
         }
-        // 首次定位到右下角；之后不覆盖（尊重用户拖动后的位置）。
+        // 定位：首次落右下角；之后保持窗口当前实际位置以尊重用户拖动，
+        // 仅当窗口被拖出屏幕外（可见部分不足）时才复位到右下角。
         if !self.positioned {
             self.pos = initial_bottom_right(w, h, self.scale);
             self.positioned = true;
+        } else {
+            let (cx, cy) = window_origin(self.window.hwnd());
+            self.pos = if window_visible_on_screen(cx, cy, w as i32, h as i32) {
+                (cx, cy)
+            } else {
+                initial_bottom_right(w, h, self.scale)
+            };
         }
         self.window.show(self.pos.0, self.pos.1);
     }
@@ -295,9 +304,69 @@ fn initial_bottom_right(w: u32, h: u32, scale: f32) -> (i32, i32) {
     }
 }
 
+/// 窗口矩形与屏幕虚拟区域的可见交集在两个方向上是否都 ≥ `min`（纯几何，可单测）。
+/// 用"可见余量"而非"任意相交"：只露极少（如 1px）也视为屏外，保证用户能重新抓到窗口。
+fn rect_visible(x: i32, y: i32, w: i32, h: i32, vx: i32, vy: i32, vw: i32, vh: i32, min: i32) -> bool {
+    let overlap_w = (x + w).min(vx + vw) - x.max(vx);
+    let overlap_h = (y + h).min(vy + vh) - y.max(vy);
+    overlap_w >= min && overlap_h >= min
+}
+
+/// 窗口是否"在屏幕内"（拖出屏外判据）：与虚拟屏（多显示器合并区域）可见交集 ≥ 24px。
+#[cfg_attr(not(windows), allow(unused_variables))]
+fn window_visible_on_screen(x: i32, y: i32, w: i32, h: i32) -> bool {
+    #[cfg(windows)]
+    {
+        use windows::Win32::UI::WindowsAndMessaging::{
+            GetSystemMetrics, SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN,
+            SM_YVIRTUALSCREEN,
+        };
+        unsafe {
+            let vx = GetSystemMetrics(SM_XVIRTUALSCREEN);
+            let vy = GetSystemMetrics(SM_YVIRTUALSCREEN);
+            let vw = GetSystemMetrics(SM_CXVIRTUALSCREEN);
+            let vh = GetSystemMetrics(SM_CYVIRTUALSCREEN);
+            // 指标异常（0）时保守视为屏内，避免误复位用户拖动的位置。
+            if vw <= 0 || vh <= 0 {
+                return true;
+            }
+            rect_visible(x, y, w, h, vx, vy, vw, vh, 24)
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        true
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rect_visible_keeps_fully_and_partially_onscreen() {
+        // 完全在屏内
+        assert!(rect_visible(100, 100, 240, 120, 0, 0, 1920, 1080, 24));
+        // 部分露出但可见余量充足（左侧被切到只剩 100px 宽仍可见）
+        assert!(rect_visible(1820, 100, 240, 120, 0, 0, 1920, 1080, 24));
+    }
+
+    #[test]
+    fn rect_visible_resets_when_offscreen() {
+        // 拖到顶部外，仅剩 10px 高可见 < 24 → 判定屏外
+        assert!(!rect_visible(100, -110, 240, 120, 0, 0, 1920, 1080, 24));
+        // 完全拖到右侧屏外
+        assert!(!rect_visible(1920, 100, 240, 120, 0, 0, 1920, 1080, 24));
+        // 完全拖到左侧屏外（负坐标）
+        assert!(!rect_visible(-240, 100, 240, 120, 0, 0, 1920, 1080, 24));
+    }
+
+    #[test]
+    fn rect_visible_multi_monitor_left_virtual_origin() {
+        // 副屏在主屏左侧：虚拟屏原点为负；窗口在副屏内应判定屏内
+        assert!(rect_visible(-1800, 200, 240, 120, -1920, 0, 3840, 1080, 24));
+    }
+
     #[test]
     fn format_lines_shape() {
         let v = InputDiagView {
