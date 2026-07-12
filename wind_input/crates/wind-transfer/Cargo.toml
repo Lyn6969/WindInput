@@ -1,0 +1,15 @@
+[package]
+name = "wind-transfer"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+wind-store = { path = "../wind-store" }
+wind-config = { path = "../wind-config" }
+anyhow = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+zip = "2"
+
+[dev-dependencies]
+tempfile = "3"
