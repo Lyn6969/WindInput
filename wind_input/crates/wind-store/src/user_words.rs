@@ -23,6 +23,14 @@ pub struct UserWordRecord {
     pub created_at: i64,
 }
 
+/// 批量导入的分类计数(P2:added=新键 / updated=权重严格更大 / unchanged=权重≤现有不落盘)。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct WordsImportCounts {
+    pub added: usize,
+    pub updated: usize,
+    pub unchanged: usize,
+}
+
 /// 当前 unix 秒
 pub(crate) fn now_secs() -> i64 {
     SystemTime::now()
@@ -229,6 +237,107 @@ impl Store {
         })
     }
 
+    /// 清空某 schema 的全部用户词(单写事务),返回删除条数。
+    pub fn clear_user_words(&self, schema: &str) -> anyhow::Result<usize> {
+        let prefix = format!("{schema}\u{0}");
+        self.with_db(|db| {
+            let txn = db.begin_write()?;
+            let n;
+            {
+                let mut t = txn.open_table(USER_WORDS)?;
+                let keys: Vec<String> = {
+                    let mut ks = Vec::new();
+                    for item in t.range(prefix.as_str()..)? {
+                        let (k, _) = item?;
+                        let key = k.value();
+                        if !key.starts_with(&prefix) {
+                            break;
+                        }
+                        ks.push(key.to_string());
+                    }
+                    ks
+                };
+                n = keys.len();
+                for k in &keys {
+                    t.remove(k.as_str())?;
+                }
+            }
+            txn.commit()?;
+            Ok(n)
+        })
+    }
+
+    /// 批量导入用户词(单写事务,Merge 语义与 add_user_word 一致):
+    /// 新键 → added(count=0, created_at=now);导入权重 > 现有 → updated(保留 count/created_at);
+    /// 否则 → unchanged(不写)。dry-run 见 preview_import_user_words,两者分类必须一致。
+    pub fn import_user_words(
+        &self,
+        schema: &str,
+        rows: &[wdict::WordIo],
+    ) -> anyhow::Result<WordsImportCounts> {
+        self.with_db(|db| {
+            let txn = db.begin_write()?;
+            let mut c = WordsImportCounts::default();
+            {
+                let mut t = txn.open_table(USER_WORDS)?;
+                for r in rows {
+                    let key = enc_key(schema, &r.code, &r.text);
+                    let existing = t.get(key.as_str())?.and_then(|g| dec_val(g.value()));
+                    match existing {
+                        None => {
+                            t.insert(key.as_str(), enc_val(r.weight, 0, now_secs()).as_slice())?;
+                            c.added += 1;
+                        }
+                        Some((w, cnt, ca)) if r.weight > w => {
+                            t.insert(key.as_str(), enc_val(r.weight, cnt, ca).as_slice())?;
+                            c.updated += 1;
+                        }
+                        Some(_) => c.unchanged += 1,
+                    }
+                }
+            }
+            txn.commit()?;
+            Ok(c)
+        })
+    }
+
+    /// 导入 dry-run(只读):分类规则与 import_user_words 完全一致;
+    /// samples 取前 5 个会落盘行(added/updated)的 "code text"。
+    pub fn preview_import_user_words(
+        &self,
+        schema: &str,
+        rows: &[wdict::WordIo],
+    ) -> anyhow::Result<(WordsImportCounts, Vec<String>)> {
+        self.with_db(|db| {
+            let txn = db.begin_read()?;
+            let t = txn.open_table(USER_WORDS)?;
+            let mut c = WordsImportCounts::default();
+            let mut samples = Vec::new();
+            for r in rows {
+                let key = enc_key(schema, &r.code, &r.text);
+                let existing = t.get(key.as_str())?.and_then(|g| dec_val(g.value()));
+                let will_write = match existing {
+                    None => {
+                        c.added += 1;
+                        true
+                    }
+                    Some((w, _, _)) if r.weight > w => {
+                        c.updated += 1;
+                        true
+                    }
+                    Some(_) => {
+                        c.unchanged += 1;
+                        false
+                    }
+                };
+                if will_write && samples.len() < 5 {
+                    samples.push(format!("{} {}", r.code, r.text));
+                }
+            }
+            Ok((c, samples))
+        })
+    }
+
     /// 导出某方案的全部用户词为 wdict 文本(仅 code/text/weight,不含个人 count/created_at)。
     pub fn export_user_words_wdict(
         &self,
@@ -247,20 +356,16 @@ impl Store {
         Ok(wdict::export_words_wdict(&rows, exported_at))
     }
 
-    /// 从 wdict 文本导入用户词到某方案(Merge:add_user_word 的 max-weight upsert)。
-    /// 返回 (imported, skipped)。
+    /// 从 wdict 文本导入用户词到某方案(Merge:max-weight upsert)。
+    /// 返回 (imported, skipped)。imported=解析成功的行数(含 unchanged);细分类见 import_user_words。
     pub fn import_user_words_wdict(
         &self,
         schema: &str,
         text: &str,
     ) -> anyhow::Result<(usize, usize)> {
         let (rows, skipped) = wdict::parse_words_wdict(text).map_err(|e| anyhow::anyhow!(e))?;
-        let mut imported = 0usize;
-        for r in &rows {
-            self.add_user_word(schema, &r.code, &r.text, r.weight)?;
-            imported += 1;
-        }
-        Ok((imported, skipped))
+        self.import_user_words(schema, &rows)?;
+        Ok((rows.len(), skipped))
     }
 }
 
@@ -376,6 +481,95 @@ mod tests {
             s.get_user_words("wb", "a").unwrap()[0].weight,
             100,
             "Merge 取 max"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn import_user_words_classifies_added_updated_unchanged() {
+        let path = tmp("wind_uw_batch.redb");
+        let s = Store::open(&path).unwrap();
+        s.add_user_word("wb", "a", "工", 100).unwrap();
+        let rows = vec![
+            // 已有且权重更低 → unchanged(P2 约束 1:不落盘)
+            crate::wdict::WordIo {
+                code: "a".into(),
+                text: "工".into(),
+                weight: 30,
+            },
+            // 新键 → added
+            crate::wdict::WordIo {
+                code: "b".into(),
+                text: "了".into(),
+                weight: 5,
+            },
+        ];
+        let c = s.import_user_words("wb", &rows).unwrap();
+        assert_eq!((c.added, c.updated, c.unchanged), (1, 0, 1));
+        assert_eq!(
+            s.get_user_words("wb", "a").unwrap()[0].weight,
+            100,
+            "unchanged 不改权重"
+        );
+
+        // 权重严格更大 → updated,取导入值
+        let rows2 = vec![crate::wdict::WordIo {
+            code: "a".into(),
+            text: "工".into(),
+            weight: 200,
+        }];
+        let c2 = s.import_user_words("wb", &rows2).unwrap();
+        assert_eq!((c2.added, c2.updated, c2.unchanged), (0, 1, 0));
+        assert_eq!(s.get_user_words("wb", "a").unwrap()[0].weight, 200);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn preview_import_is_readonly_and_matches_import() {
+        let path = tmp("wind_uw_preview.redb");
+        let s = Store::open(&path).unwrap();
+        s.add_user_word("wb", "a", "工", 100).unwrap();
+        let rows = vec![
+            crate::wdict::WordIo {
+                code: "a".into(),
+                text: "工".into(),
+                weight: 30,
+            },
+            crate::wdict::WordIo {
+                code: "b".into(),
+                text: "了".into(),
+                weight: 5,
+            },
+            crate::wdict::WordIo {
+                code: "a".into(),
+                text: "工".into(),
+                weight: 300,
+            },
+        ];
+        let (c, samples) = s.preview_import_user_words("wb", &rows).unwrap();
+        assert_eq!((c.added, c.updated, c.unchanged), (1, 1, 1));
+        assert_eq!(samples.len(), 2, "samples 只含会落盘的行(added+updated)");
+        assert!(samples.iter().any(|x| x.contains("了")));
+        // 只读:预览后库里仍只有原 1 条、权重未动
+        assert_eq!(s.get_user_words("wb", "a").unwrap()[0].weight, 100);
+        assert!(s.get_user_words("wb", "b").unwrap().is_empty());
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn clear_user_words_only_target_schema() {
+        let path = tmp("wind_uw_clear.redb");
+        let s = Store::open(&path).unwrap();
+        s.add_user_word("wb", "a", "工", 1).unwrap();
+        s.add_user_word("wb", "b", "了", 1).unwrap();
+        s.add_user_word("py", "ni", "你", 1).unwrap();
+        let n = s.clear_user_words("wb").unwrap();
+        assert_eq!(n, 2);
+        assert!(s.search_user_words_prefix("wb", "", 0).unwrap().is_empty());
+        assert_eq!(
+            s.search_user_words_prefix("py", "", 0).unwrap().len(),
+            1,
+            "其它 schema 不受影响"
         );
         let _ = std::fs::remove_file(&path);
     }
