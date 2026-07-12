@@ -125,7 +125,7 @@ themes/<用户主题...>
 | 域 | 方法 | 入参 | 返回 |
 |---|---|---|---|
 | 词库 | `dict.export` | `{schemaId}` | `{content}` |
-| | `dict.import` | `{schemaId, content, strategy}` | `{imported, updated, skipped}` |
+| | `dict.import` | `{schemaId, content, strategy}` | `{added, updated, skipped}` |
 | | `dict.previewImport` | `{schemaId, content}` | `{willAdd, willUpdate, willConflict, unchanged, samples}` |
 | 方案 | `scheme.exportPackage` | `{id, path}` | `{path}` |
 | | `scheme.importPackage` | `{path, strategy}` | `{imported, conflicts}` |

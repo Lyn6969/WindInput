@@ -129,6 +129,9 @@ impl Coordinator {
                 let text = str_param(params, "text")?;
                 Ok(json!(self.gen_pinyin_word(text)))
             }
+            "dict.export" => self.web_dict_export(params),
+            "dict.import" => self.web_dict_import(params),
+            "dict.previewImport" => self.web_dict_preview_import(params),
 
             // ── temp.*（临时词，redb）─────────────────────────────
             "temp.list" => self.web_temp_list(params),
@@ -325,12 +328,69 @@ impl Coordinator {
             .store
             .as_ref()
             .ok_or_else(|| anyhow::anyhow!("无持久化存储"))?;
-        let all = store.search_user_words_prefix(&schema, "", 0)?;
-        let n = all.len();
-        for r in all {
-            store.remove_user_word(&schema, &r.code, &r.text)?;
-        }
+        let n = store.clear_user_words(&schema)?;
         Ok(json!(n))
+    }
+
+    fn web_dict_export(&self, params: &Value) -> anyhow::Result<Value> {
+        let schema = str_param(params, "schemaId")?;
+        let schema = self.engine_mgr.data_schema_id(schema); // 拼音族折叠到 "pinyin"
+        let store = self
+            .store
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("无持久化存储"))?;
+        let content = store.export_user_words_wdict(&schema, &chrono::Local::now().to_rfc3339())?;
+        Ok(json!({ "content": content }))
+    }
+
+    fn web_dict_import(&self, params: &Value) -> anyhow::Result<Value> {
+        use wind_transfer::merge::{ImportOutcome, Strategy};
+        let schema = str_param(params, "schemaId")?;
+        let schema = self.engine_mgr.data_schema_id(schema); // 拼音族折叠到 "pinyin"
+        let content = str_param(params, "content")?;
+        let strategy = Strategy::from_param(
+            params
+                .get("strategy")
+                .and_then(|v| v.as_str())
+                .unwrap_or(""),
+        );
+        let store = self
+            .store
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("无持久化存储"))?;
+        let (rows, skipped) =
+            wind_store::wdict::parse_words_wdict(content).map_err(|e| anyhow::anyhow!(e))?;
+        if strategy == Strategy::Replace {
+            store.clear_user_words(&schema)?;
+        }
+        let c = store.import_user_words(&schema, &rows)?;
+        Ok(serde_json::to_value(ImportOutcome {
+            added: c.added,
+            updated: c.updated,
+            skipped,
+        })?)
+    }
+
+    fn web_dict_preview_import(&self, params: &Value) -> anyhow::Result<Value> {
+        use wind_transfer::merge::ImportPreview;
+        let schema = str_param(params, "schemaId")?;
+        let schema = self.engine_mgr.data_schema_id(schema); // 拼音族折叠到 "pinyin"
+        let content = str_param(params, "content")?;
+        let store = self
+            .store
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("无持久化存储"))?;
+        let (rows, _skipped) =
+            wind_store::wdict::parse_words_wdict(content).map_err(|e| anyhow::anyhow!(e))?;
+        let (c, samples) = store.preview_import_user_words(&schema, &rows)?;
+        // 按 Merge 语义预览(与设计 RPC 表一致,不收 strategy);willConflict 词库域恒 0,字段保留。
+        Ok(serde_json::to_value(ImportPreview {
+            will_add: c.added,
+            will_update: c.updated,
+            will_conflict: 0,
+            unchanged: c.unchanged,
+            samples,
+        })?)
     }
 
     fn web_dict_stats(&self) -> anyhow::Result<Value> {
@@ -1343,6 +1403,93 @@ mod tests {
         let _ = std::fs::remove_file(&path);
         let store = Arc::new(Store::open(&path).unwrap());
         Coordinator::new_headless_with_store(Config::default(), None, store)
+    }
+
+    #[test]
+    fn dict_export_import_preview_contract() {
+        let c = coord("dictio");
+        c.web_data_rpc(
+            "dict.add",
+            &json!({ "schemaId": "wb", "code": "a", "text": "工", "weight": 100 }),
+        )
+        .unwrap();
+
+        // export → {content} 且是 wdict words 文本
+        let exp = c
+            .web_data_rpc("dict.export", &json!({ "schemaId": "wb" }))
+            .unwrap();
+        let content = exp
+            .get("content")
+            .and_then(|v| v.as_str())
+            .expect("content 字符串");
+        assert!(content.contains("--- !words"));
+
+        // preview 到空 schema:全 willAdd,camelCase 键
+        let prev = c
+            .web_data_rpc(
+                "dict.previewImport",
+                &json!({ "schemaId": "wb2", "content": content }),
+            )
+            .unwrap();
+        assert_eq!(prev.get("willAdd").and_then(|v| v.as_u64()), Some(1));
+        assert_eq!(prev.get("willUpdate").and_then(|v| v.as_u64()), Some(0));
+        assert_eq!(prev.get("willConflict").and_then(|v| v.as_u64()), Some(0));
+        assert_eq!(prev.get("unchanged").and_then(|v| v.as_u64()), Some(0));
+        assert!(prev.get("samples").and_then(|v| v.as_array()).is_some());
+
+        // import(缺省 merge)→ {added, updated, skipped}
+        let out = c
+            .web_data_rpc(
+                "dict.import",
+                &json!({ "schemaId": "wb2", "content": content }),
+            )
+            .unwrap();
+        assert_eq!(out.get("added").and_then(|v| v.as_u64()), Some(1));
+        assert_eq!(out.get("skipped").and_then(|v| v.as_u64()), Some(0));
+
+        // 同内容再 import:权重相等 ⇒ 全 unchanged(P2 约束 1),added=updated=0
+        let out2 = c
+            .web_data_rpc(
+                "dict.import",
+                &json!({ "schemaId": "wb2", "content": content }),
+            )
+            .unwrap();
+        assert_eq!(out2.get("added").and_then(|v| v.as_u64()), Some(0));
+        assert_eq!(out2.get("updated").and_then(|v| v.as_u64()), Some(0));
+        // preview 同内容 ⇒ unchanged=1,与落盘一致
+        let prev2 = c
+            .web_data_rpc(
+                "dict.previewImport",
+                &json!({ "schemaId": "wb2", "content": content }),
+            )
+            .unwrap();
+        assert_eq!(prev2.get("unchanged").and_then(|v| v.as_u64()), Some(1));
+
+        // replace:先加一条杂词,replace 导入后只剩导入内容(P2 约束 2)
+        c.web_data_rpc(
+            "dict.add",
+            &json!({ "schemaId": "wb2", "code": "x", "text": "另", "weight": 1 }),
+        )
+        .unwrap();
+        let out3 = c
+            .web_data_rpc(
+                "dict.import",
+                &json!({ "schemaId": "wb2", "content": content, "strategy": "replace" }),
+            )
+            .unwrap();
+        assert_eq!(
+            out3.get("added").and_then(|v| v.as_u64()),
+            Some(1),
+            "清空后全部计 added"
+        );
+        let listed = c
+            .web_data_rpc("dict.listPaged", &json!({ "schemaId": "wb2", "limit": 10 }))
+            .unwrap();
+        assert_eq!(
+            listed.get("total").and_then(|v| v.as_u64()),
+            Some(1),
+            "replace 应清掉 x"
+        );
     }
 
     #[test]

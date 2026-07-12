@@ -2527,6 +2527,7 @@ dependencies = [
  "wind-reverse",
  "wind-store",
  "wind-theme",
+ "wind-transfer",
  "wind-transform",
  "wind-ui",
  "windows",

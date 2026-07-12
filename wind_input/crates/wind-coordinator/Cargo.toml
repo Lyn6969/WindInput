@@ -8,6 +8,7 @@ wind-ipc = { path = "../wind-ipc" }
 wind-bridge = { path = "../wind-bridge" }
 wind-config = { path = "../wind-config" }
 wind-store = { path = "../wind-store" }
+wind-transfer = { path = "../wind-transfer" }
 wind-dict = { path = "../wind-dict" }
 wind-engine = { path = "../wind-engine" }
 wind-candidate = { path = "../wind-candidate" }
