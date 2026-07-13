@@ -23,6 +23,7 @@ pub struct BackupResult {
 
 /// 递归收集目录下全部文件的 (zip条目名, 绝对路径)；条目名 = prefix + 目录相对路径（`/`分隔）。
 fn walk_dir(dir: &Path, prefix: &str) -> anyhow::Result<Vec<(String, PathBuf)>> {
+    debug_assert!(prefix.ends_with('/'), "prefix 须带尾斜杠(如 schemas/)");
     let mut out = Vec::new();
     let mut stack = vec![dir.to_path_buf()];
     while let Some(d) = stack.pop() {
