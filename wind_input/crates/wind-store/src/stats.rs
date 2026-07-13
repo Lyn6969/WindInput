@@ -251,6 +251,15 @@ impl Store {
         text: &str,
         overwrite: bool,
     ) -> anyhow::Result<(usize, usize)> {
+        // 非覆盖模式先一次性收集已存在日期，避免逐行开读事务（备份可跨数年 daily）。
+        let mut existing: std::collections::HashSet<String> = if overwrite {
+            Default::default()
+        } else {
+            self.daily_stats("0000-01-01", "9999-12-31")?
+                .into_iter()
+                .map(|(d, _)| d)
+                .collect()
+        };
         let mut imported = 0usize;
         let mut skipped = 0usize;
         for line in text.lines() {
@@ -270,10 +279,11 @@ impl Store {
                 continue;
             };
             if !overwrite {
-                let existing = self.daily_stats(date, date)?;
-                if !existing.is_empty() {
+                if existing.contains(date) {
                     continue;
                 }
+                // 批内重复日期同样"先到者胜"，与逐行判存的原语义一致。
+                existing.insert(date.to_string());
             }
             self.put_daily_stat(date, &stat)?;
             imported += 1;

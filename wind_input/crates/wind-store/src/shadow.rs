@@ -285,7 +285,8 @@ impl Store {
                 skipped += 1;
                 continue;
             };
-            for p in &rec.pinned {
+            // 存储序 index 0 = 最新（apply_pin LIFO 插队首），反向重放才能还原原顺序。
+            for p in rec.pinned.iter().rev() {
                 self.pin_shadow(schema, code, &p.word, p.cand_id.as_deref(), p.position)?;
                 imported += 1;
             }
@@ -365,6 +366,7 @@ mod tests {
         let path = tmp("wind_sh_io.redb");
         let s = Store::open(&path).unwrap();
         s.pin_shadow("wb", "aaaa", "恭", Some("c1"), 0).unwrap();
+        s.pin_shadow("wb", "aaaa", "敬", None, 1).unwrap(); // 后置顶 → 存储序 index 0
         s.delete_shadow("wb", "bbbb", "删词").unwrap();
         let text = s.export_shadow_jsonl("wb").unwrap();
         assert_eq!(text.lines().count(), 2);
@@ -373,12 +375,16 @@ mod tests {
         let s2 = Store::open(&path2).unwrap();
         let (imported, skipped) = s2.import_shadow_jsonl("wb", &text).unwrap();
         assert_eq!(skipped, 0);
-        assert!(imported >= 2);
+        assert!(imported >= 3);
         let rules = s2.list_shadow_rules("wb").unwrap();
         assert_eq!(rules.len(), 2);
         let pinned = rules.iter().find(|(c, _)| c == "aaaa").unwrap();
-        assert_eq!(pinned.1.pinned[0].word, "恭");
-        assert_eq!(pinned.1.pinned[0].position, 0);
+        // round-trip 保序：LIFO 存储序（最新在前）导入后不反转
+        assert_eq!(pinned.1.pinned.len(), 2);
+        assert_eq!(pinned.1.pinned[0].word, "敬");
+        assert_eq!(pinned.1.pinned[0].position, 1);
+        assert_eq!(pinned.1.pinned[1].word, "恭");
+        assert_eq!(pinned.1.pinned[1].position, 0);
 
         assert_eq!(s.clear_shadow("wb").unwrap(), 2);
         assert!(s.list_shadow_rules("wb").unwrap().is_empty());
