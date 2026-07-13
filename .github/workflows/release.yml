@@ -112,6 +112,13 @@ jobs:
         with:
           draft: true                          # 人工审核 Release Notes 后再发布
           generate_release_notes: true
+          # user-facing 标记块：发布前把面向用户的更新说明填进标记内，
+          # 文档仓 scripts/sync_release_notes.py 按此标记同步到官网更新记录；
+          # 保持"暂未填写"占位则跳过同步。自动生成的 PR 列表会附在本模板之后。
+          body: |
+            <!-- user-facing:start -->
+            > 暂未填写
+            <!-- user-facing:end -->
           files: |
             wind-installer/dist/WindInput-*-Setup.exe
             wind-installer/dist/WindInput-*-Setup.exe.sha256
