@@ -182,6 +182,136 @@ pub fn export_package(
     })
 }
 
+/// 校验 zip 条目名并转为 schemas 根相对路径:必须 `schemas/` 前缀、无 `..`、非绝对。
+fn entry_rel(name: &str) -> anyhow::Result<&str> {
+    let rel = name
+        .strip_prefix("schemas/")
+        .ok_or_else(|| anyhow::anyhow!("非法条目(缺 schemas/ 前缀): {name}"))?;
+    if rel.is_empty()
+        || Path::new(rel).is_absolute()
+        || rel.split(['/', '\\']).any(|seg| seg == "..")
+    {
+        anyhow::bail!("非法条目(路径穿越): {name}");
+    }
+    Ok(rel)
+}
+
+/// 从 manifest 取有载荷条目(schema/resource),校验条目名合法性。
+fn payload_entries(manifest: &Manifest) -> anyhow::Result<Vec<(String, String)>> {
+    let mut out = Vec::new();
+    for e in &manifest.contents {
+        if e.r#type == "schema" || e.r#type == "resource" {
+            let rel = entry_rel(&e.path)?;
+            out.push((e.path.clone(), rel.to_string()));
+        }
+    }
+    Ok(out)
+}
+
+/// 导入预览(只读):按 manifest 载荷条目对目标目录做存在性检查。
+pub struct SchemeImportPreview {
+    pub manifest: Manifest,
+    pub will_add: Vec<String>,
+    pub conflicts: Vec<String>,
+    pub system_refs: Vec<String>,
+    pub missing: Vec<String>,
+}
+
+pub fn preview_import(package: &Path, user_dir: &Path) -> anyhow::Result<SchemeImportPreview> {
+    let manifest = crate::bundle::read_manifest(package)?;
+    if manifest.kind != BundleKind::Scheme {
+        anyhow::bail!("不是方案包(kind={:?})", manifest.kind);
+    }
+    let entries = payload_entries(&manifest)?;
+    let mut will_add = Vec::new();
+    let mut conflicts = Vec::new();
+    for (name, rel) in &entries {
+        if user_dir.join(rel).exists() {
+            conflicts.push(name.clone());
+        } else {
+            will_add.push(name.clone());
+        }
+    }
+    let system_refs = manifest
+        .contents
+        .iter()
+        .filter(|e| e.r#type == "system_ref")
+        .map(|e| e.path.clone())
+        .collect();
+    let missing = manifest
+        .contents
+        .iter()
+        .filter(|e| e.r#type == "missing")
+        .map(|e| e.path.clone())
+        .collect();
+    Ok(SchemeImportPreview {
+        manifest,
+        will_add,
+        conflicts,
+        system_refs,
+        missing,
+    })
+}
+
+/// 导入结果。
+pub struct SchemeImportResult {
+    pub imported: Vec<String>,
+    pub conflicts: Vec<String>,
+    pub schema_ids: Vec<String>,
+}
+
+/// 导入方案包到用户 schemas 目录。先全部读入内存(校验期零落盘),再逐文件 tmp+rename。
+/// Merge=已存在跳过(计 conflicts);Replace=覆盖。
+pub fn import_package(
+    package: &Path,
+    user_dir: &Path,
+    strategy: crate::merge::Strategy,
+) -> anyhow::Result<SchemeImportResult> {
+    let manifest = crate::bundle::read_manifest(package)?;
+    if manifest.kind != BundleKind::Scheme {
+        anyhow::bail!("不是方案包(kind={:?})", manifest.kind);
+    }
+    let entries = payload_entries(&manifest)?;
+    // 读取阶段:全部载荷入内存,任何缺条目/坏条目在写盘前失败。
+    let mut staged: Vec<(String, String, Vec<u8>)> = Vec::new(); // (zip名, rel, bytes)
+    for (name, rel) in &entries {
+        let bytes = crate::bundle::extract_entry(package, name)?;
+        staged.push((name.clone(), rel.clone(), bytes));
+    }
+    // 写入阶段:tmp+rename,Merge 跳过已存在。
+    let mut imported = Vec::new();
+    let mut conflicts = Vec::new();
+    for (name, rel, bytes) in &staged {
+        let target = user_dir.join(rel);
+        if target.exists() && strategy == crate::merge::Strategy::Merge {
+            conflicts.push(name.clone());
+            continue;
+        }
+        if let Some(parent) = target.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let tmp = target.with_extension("windinput.tmp");
+        std::fs::write(&tmp, bytes)?;
+        // Windows: rename 到已存在目标会失败,Replace 先移除旧文件。
+        if target.exists() {
+            std::fs::remove_file(&target)?;
+        }
+        std::fs::rename(&tmp, &target)?;
+        imported.push(name.clone());
+    }
+    let schema_ids = manifest
+        .contents
+        .iter()
+        .filter(|e| e.r#type == "schema")
+        .filter_map(|e| e.meta.get("id").and_then(|v| v.as_str()).map(String::from))
+        .collect();
+    Ok(SchemeImportResult {
+        imported,
+        conflicts,
+        schema_ids,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -306,5 +436,89 @@ secondary_schema = "pinyin"
         );
         let bytes = crate::bundle::extract_entry(&out, "schemas/my/main.dict.yaml").unwrap();
         assert_eq!(bytes, b"d");
+    }
+
+    #[test]
+    fn import_roundtrip_into_fresh_dir() {
+        let t = tempfile::tempdir().unwrap();
+        let (user, system) = (t.path().join("u"), t.path().join("s"));
+        fixture(&user, &system);
+        let out = t.path().join("my.zip");
+        export_package("my", &user, Some(&system), &out, "1.0.0", "windows", "t").unwrap();
+
+        let dest = t.path().join("dest");
+        std::fs::create_dir_all(&dest).unwrap();
+        let prev = preview_import(&out, &dest).unwrap();
+        assert_eq!(prev.will_add.len(), 3);
+        assert!(prev.conflicts.is_empty());
+        assert_eq!(prev.system_refs.len(), 1);
+
+        let r = import_package(&out, &dest, crate::merge::Strategy::Merge).unwrap();
+        assert_eq!(r.imported.len(), 3);
+        assert!(r.conflicts.is_empty());
+        assert_eq!(r.schema_ids, vec!["my"]);
+        assert!(dest.join("my.schema.toml").is_file());
+        assert_eq!(std::fs::read(dest.join("my/main.dict.yaml")).unwrap(), b"d");
+    }
+
+    #[test]
+    fn import_merge_skips_existing_replace_overwrites() {
+        let t = tempfile::tempdir().unwrap();
+        let (user, system) = (t.path().join("u"), t.path().join("s"));
+        fixture(&user, &system);
+        let out = t.path().join("my.zip");
+        export_package("my", &user, Some(&system), &out, "1.0.0", "windows", "t").unwrap();
+
+        let dest = t.path().join("dest");
+        std::fs::create_dir_all(dest.join("my")).unwrap();
+        std::fs::write(dest.join("my/main.dict.yaml"), b"OLD").unwrap();
+
+        // preview 报冲突
+        let prev = preview_import(&out, &dest).unwrap();
+        assert_eq!(prev.conflicts, vec!["schemas/my/main.dict.yaml"]);
+
+        // Merge:跳过已存在,内容保持 OLD
+        let r = import_package(&out, &dest, crate::merge::Strategy::Merge).unwrap();
+        assert_eq!(r.conflicts, vec!["schemas/my/main.dict.yaml"]);
+        assert_eq!(r.imported.len(), 2);
+        assert_eq!(
+            std::fs::read(dest.join("my/main.dict.yaml")).unwrap(),
+            b"OLD"
+        );
+
+        // Replace:覆盖为包内内容
+        let r2 = import_package(&out, &dest, crate::merge::Strategy::Replace).unwrap();
+        assert_eq!(r2.imported.len(), 3);
+        assert!(r2.conflicts.is_empty());
+        assert_eq!(std::fs::read(dest.join("my/main.dict.yaml")).unwrap(), b"d");
+    }
+
+    #[test]
+    fn import_rejects_path_traversal() {
+        // 手工构造带非法条目名的包
+        let t = tempfile::tempdir().unwrap();
+        let bad = t.path().join("bad.zip");
+        let manifest = crate::bundle::Manifest::new(
+            crate::bundle::BundleKind::Scheme,
+            "1.0.0",
+            "windows",
+            "t",
+        );
+        let mut w = crate::bundle::BundleWriter::new(&bad, manifest).unwrap();
+        w.add_bytes_with(
+            "schemas/../evil.toml",
+            b"x",
+            "resource",
+            serde_json::Value::Null,
+        )
+        .unwrap();
+        w.finish().unwrap();
+        let dest = t.path().join("dest");
+        std::fs::create_dir_all(&dest).unwrap();
+        assert!(preview_import(&bad, &dest).is_err(), "含 .. 条目应拒绝");
+        assert!(
+            import_package(&bad, &dest, crate::merge::Strategy::Merge).is_err(),
+            "导入同样拒绝"
+        );
     }
 }
