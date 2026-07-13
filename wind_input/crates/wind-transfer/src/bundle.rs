@@ -80,17 +80,37 @@ impl BundleWriter {
         })
     }
 
-    /// 写入一个条目,并在 manifest.contents 里登记(type 由调用方后续细化;P1 记 path)。
+    /// 写入一个条目,并在 manifest.contents 里登记(type 由调用方后续细化;空 type 为 P1 兼容)。
     pub fn add_bytes(&mut self, name: &str, data: &[u8]) -> anyhow::Result<()> {
+        self.add_bytes_with(name, data, "", serde_json::Value::Null)
+    }
+
+    /// 写入条目并按给定 type/meta 登记(P3:schema/resource 等类型化条目)。
+    pub fn add_bytes_with(
+        &mut self,
+        name: &str,
+        data: &[u8],
+        r#type: &str,
+        meta: serde_json::Value,
+    ) -> anyhow::Result<()> {
         self.writer
             .start_file(name, zip::write::SimpleFileOptions::default())?;
         self.writer.write_all(data)?;
         self.manifest.contents.push(ContentEntry {
-            r#type: String::new(),
+            r#type: r#type.to_string(),
             path: name.to_string(),
-            meta: serde_json::Value::Null,
+            meta,
         });
         Ok(())
+    }
+
+    /// 只登记 manifest 的引用条目,不写 zip 载荷(system_ref/missing 等)。
+    pub fn add_ref(&mut self, r#type: &str, path: &str, meta: serde_json::Value) {
+        self.manifest.contents.push(ContentEntry {
+            r#type: r#type.to_string(),
+            path: path.to_string(),
+            meta,
+        });
     }
 
     /// 收尾:写入 manifest.json 并关闭。
@@ -198,5 +218,41 @@ mod tests {
         w.write_all(b"x").unwrap();
         w.finish().unwrap();
         assert!(read_manifest(&bad).is_err(), "缺 manifest.json 应报错");
+    }
+
+    #[test]
+    fn typed_entries_and_refs_in_manifest() {
+        let dir = tempfile::tempdir().unwrap();
+        let zip_path = dir.path().join("typed.zip");
+        let manifest = Manifest::new(BundleKind::Scheme, "1.0.0", "windows", "t");
+        let mut w = BundleWriter::new(&zip_path, manifest).unwrap();
+        w.add_bytes_with(
+            "schemas/my.schema.toml",
+            b"[schema]\nid=\"my\"\n",
+            "schema",
+            serde_json::json!({ "id": "my" }),
+        )
+        .unwrap();
+        w.add_ref(
+            "system_ref",
+            "wubi86/wubi86_jidian.dict.yaml",
+            serde_json::Value::Null,
+        );
+        w.finish().unwrap();
+
+        let m = read_manifest(&zip_path).unwrap();
+        assert_eq!(m.contents.len(), 2);
+        let schema_entry = &m.contents[0];
+        assert_eq!(schema_entry.r#type, "schema");
+        assert_eq!(
+            schema_entry.meta.get("id").and_then(|v| v.as_str()),
+            Some("my")
+        );
+        let ref_entry = &m.contents[1];
+        assert_eq!(ref_entry.r#type, "system_ref");
+        // ref 条目无 zip 载荷
+        assert!(extract_entry(&zip_path, "wubi86/wubi86_jidian.dict.yaml").is_err());
+        // 带载荷条目可取
+        assert!(extract_entry(&zip_path, "schemas/my.schema.toml").is_ok());
     }
 }
