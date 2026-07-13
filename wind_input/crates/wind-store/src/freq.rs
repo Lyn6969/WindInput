@@ -152,6 +152,63 @@ impl Store {
         })
     }
 
+    /// 导出某方案全部词频为 jsonl（每行 {"code","text","count","last_used"}）。
+    pub fn export_freq_jsonl(&self, schema: &str) -> anyhow::Result<String> {
+        let (rows, _total) = self.list_freq_paged(schema, "", 0, 0)?;
+        let mut out = String::new();
+        for (code, text, rec) in rows {
+            out.push_str(&serde_json::to_string(&serde_json::json!({
+                "code": code, "text": text, "count": rec.count, "last_used": rec.last_used,
+            }))?);
+            out.push('\n');
+        }
+        Ok(out)
+    }
+
+    /// 从 jsonl 导入词频（单写事务；Merge=已存在取 max(count)/max(last_used)）。
+    /// 返回 (imported, skipped)；非法行跳过计数。
+    pub fn import_freq_jsonl(&self, schema: &str, text: &str) -> anyhow::Result<(usize, usize)> {
+        let mut rows: Vec<(String, String, u32, i64)> = Vec::new();
+        let mut skipped = 0usize;
+        for line in text.lines() {
+            if line.trim().is_empty() {
+                continue;
+            }
+            let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else {
+                skipped += 1;
+                continue;
+            };
+            let (Some(code), Some(word)) = (
+                v.get("code").and_then(|x| x.as_str()),
+                v.get("text").and_then(|x| x.as_str()),
+            ) else {
+                skipped += 1;
+                continue;
+            };
+            let count = v.get("count").and_then(|x| x.as_u64()).unwrap_or(0) as u32;
+            let last_used = v.get("last_used").and_then(|x| x.as_i64()).unwrap_or(0);
+            rows.push((code.to_string(), word.to_string(), count, last_used));
+        }
+        let imported = rows.len();
+        self.with_db(|db| {
+            let txn = db.begin_write()?;
+            {
+                let mut t = txn.open_table(FREQ)?;
+                for (code, word, count, last_used) in &rows {
+                    let key = enc_key(schema, code, word);
+                    let merged = match t.get(key.as_str())?.and_then(|g| dec_freq(g.value())) {
+                        Some(old) => (old.count.max(*count), old.last_used.max(*last_used)),
+                        None => (*count, *last_used),
+                    };
+                    t.insert(key.as_str(), enc_freq(merged.0, merged.1).as_slice())?;
+                }
+            }
+            txn.commit()?;
+            Ok(())
+        })?;
+        Ok((imported, skipped))
+    }
+
     /// 删除一条词频（不存在静默成功）。
     pub fn delete_freq(&self, schema: &str, code: &str, text: &str) -> anyhow::Result<()> {
         let key = enc_key(schema, code, text);
@@ -333,6 +390,42 @@ mod tests {
         let p = std::env::temp_dir().join(name);
         let _ = std::fs::remove_file(&p);
         p
+    }
+
+    #[test]
+    fn freq_jsonl_roundtrip_merge_max() {
+        let path = tmp("wind_freq_io.redb");
+        let s = Store::open(&path).unwrap();
+        s.record_freq("wb", "a", "工").unwrap();
+        s.record_freq("wb", "a", "工").unwrap(); // count=2
+        let text = s.export_freq_jsonl("wb").unwrap();
+        assert!(text.contains("\"count\":2"));
+
+        // 导入到已有更高 count 的库：Merge 取 max，不回退
+        let path2 = tmp("wind_freq_io2.redb");
+        let s2 = Store::open(&path2).unwrap();
+        for _ in 0..5 {
+            s2.record_freq("wb", "a", "工").unwrap(); // count=5
+        }
+        let (imported, skipped) = s2.import_freq_jsonl("wb", &text).unwrap();
+        assert_eq!((imported, skipped), (1, 0));
+        assert_eq!(
+            s2.get_freq("wb", "a", "工").unwrap().unwrap().count,
+            5,
+            "max 合并不回退"
+        );
+
+        // 导入到空库：原值落库
+        let path3 = tmp("wind_freq_io3.redb");
+        let s3 = Store::open(&path3).unwrap();
+        s3.import_freq_jsonl("wb", &text).unwrap();
+        assert_eq!(s3.get_freq("wb", "a", "工").unwrap().unwrap().count, 2);
+        // 坏行跳过
+        let (_, sk) = s3.import_freq_jsonl("wb", "not json\n").unwrap();
+        assert_eq!(sk, 1);
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(&path2);
+        let _ = std::fs::remove_file(&path3);
     }
 
     #[test]

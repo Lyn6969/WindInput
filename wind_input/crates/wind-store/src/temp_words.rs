@@ -10,6 +10,7 @@
 
 use crate::store::{Store, TEMP_WORDS, USER_WORDS};
 use crate::user_words::{UserWordRecord, dec_val, enc_key, enc_val, now_secs};
+use crate::wdict;
 use redb::ReadableTable;
 
 /// 临时词权重硬上限（仅约束写入时的初值，权重不再随复选累加）
@@ -192,6 +193,67 @@ impl Store {
         })
     }
 
+    /// 导出某方案全部临时词为 wdict 文本（code/text/weight；count 属晋升进度不流转）。
+    pub fn export_temp_words_wdict(
+        &self,
+        schema: &str,
+        exported_at: &str,
+    ) -> anyhow::Result<String> {
+        let recs = self.search_temp_words_prefix(schema, "", 0)?;
+        let rows: Vec<wdict::WordIo> = recs
+            .into_iter()
+            .map(|r| wdict::WordIo {
+                code: r.code,
+                text: r.text,
+                weight: r.weight,
+            })
+            .collect();
+        Ok(wdict::export_words_wdict(&rows, exported_at))
+    }
+
+    /// 从 wdict 文本导入临时词（Merge：learn_temp_word，已存在 count++）。返回 (imported, skipped)。
+    pub fn import_temp_words_wdict(
+        &self,
+        schema: &str,
+        text: &str,
+    ) -> anyhow::Result<(usize, usize)> {
+        let (rows, skipped) = wdict::parse_words_wdict(text).map_err(|e| anyhow::anyhow!(e))?;
+        for r in &rows {
+            self.learn_temp_word(schema, &r.code, &r.text, r.weight)?;
+        }
+        Ok((rows.len(), skipped))
+    }
+
+    /// 清空某方案全部临时词（单写事务），返回删除条数。
+    pub fn clear_temp_words(&self, schema: &str) -> anyhow::Result<usize> {
+        let prefix = format!("{schema}\u{0}");
+        self.with_db(|db| {
+            let txn = db.begin_write()?;
+            let n;
+            {
+                let mut t = txn.open_table(TEMP_WORDS)?;
+                let keys: Vec<String> = {
+                    let mut ks = Vec::new();
+                    for item in t.range(prefix.as_str()..)? {
+                        let (k, _) = item?;
+                        let key = k.value();
+                        if !key.starts_with(&prefix) {
+                            break;
+                        }
+                        ks.push(key.to_string());
+                    }
+                    ks
+                };
+                n = keys.len();
+                for k in &keys {
+                    t.remove(k.as_str())?;
+                }
+            }
+            txn.commit()?;
+            Ok(n)
+        })
+    }
+
     /// 删除临时词（不存在静默成功）。
     pub fn remove_temp_word(&self, schema: &str, code: &str, text: &str) -> anyhow::Result<()> {
         let key = enc_key(schema, code, text);
@@ -248,6 +310,32 @@ mod tests {
         let p = std::env::temp_dir().join(name);
         let _ = std::fs::remove_file(&p);
         p
+    }
+
+    #[test]
+    fn temp_words_wdict_roundtrip_and_clear() {
+        let path = tmp("wind_tw_io.redb");
+        let s = Store::open(&path).unwrap();
+        s.learn_temp_word("wb", "ab", "临时", 50).unwrap();
+        s.learn_temp_word("py", "ni", "你", 10).unwrap();
+        let text = s.export_temp_words_wdict("wb", "t").unwrap();
+        assert!(text.contains("--- !words"));
+
+        let path2 = tmp("wind_tw_io2.redb");
+        let s2 = Store::open(&path2).unwrap();
+        let (imported, skipped) = s2.import_temp_words_wdict("wb", &text).unwrap();
+        assert_eq!((imported, skipped), (1, 0));
+        assert_eq!(s2.get_temp_word("wb", "ab", "临时").unwrap(), Some(1));
+
+        assert_eq!(s.clear_temp_words("wb").unwrap(), 1);
+        assert!(s.search_temp_words_prefix("wb", "", 0).unwrap().is_empty());
+        assert_eq!(
+            s.search_temp_words_prefix("py", "", 0).unwrap().len(),
+            1,
+            "其它 schema 不受影响"
+        );
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(&path2);
     }
 
     #[test]
