@@ -545,6 +545,14 @@ impl EngineManager {
             .unwrap_or(0)
     }
 
+    /// 活跃引擎的候选排序是否忽略权重（`base_sort = "natural"`）。供协调器合并短语后按同一维度
+    /// 重排（natural 模式丢弃 weight，对齐引擎 `candidate::by_natural`）；未加载/其余引擎为 false。
+    pub fn active_base_sort_ignores_weight(&self) -> bool {
+        self.active_engine()
+            .map(|e| e.base_sort_ignores_weight())
+            .unwrap_or(false)
+    }
+
     /// 可用方案列表（快照拷贝）。
     pub fn available_schemas(&self) -> Vec<String> {
         self.available

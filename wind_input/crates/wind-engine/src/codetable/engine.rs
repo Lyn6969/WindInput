@@ -239,6 +239,11 @@ impl Engine for CodeTableEngine {
         self.max_code_length
     }
 
+    /// natural 模式（`base_sort = "natural"`）忽略权重：协调器据此对齐 `by_natural` 重排。
+    fn base_sort_ignores_weight(&self) -> bool {
+        matches!(self.opts.base_sort, BaseSort::Natural)
+    }
+
     fn has_full_input_match(&self, input: &str) -> bool {
         CodeTableEngine::has_full_input_match(self, input)
     }

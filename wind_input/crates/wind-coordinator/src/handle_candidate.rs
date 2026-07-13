@@ -13,6 +13,37 @@ use wind_config::hotkey;
 use wind_store::freq::FreqRecord;
 use wind_ui::manager::CandidateOp;
 
+/// 候选统一层级排序（合并引擎候选 + 短语后的呈现序，与所选 `base_sort` 模式**同维度**）：
+/// ① 非模糊优先于模糊；② 精确优先于前缀补全（`is_prefix`）；③ 完整匹配优先于子短语（`is_partial`）；
+/// ④ 同层内按权重降序（`ignore_weight` 时跳过）；⑤ 词库基序（`base_order`）升序；⑥ 自然序升序。
+///
+/// - `is_partial` 不可少：混输 ÷100 压缩权重后，高权重子串单字（平 w=58 is_partial=true）会靠
+///   weight 反超低权重精确词组（平摊 w=4 is_partial=false）；且须在 `is_prefix` 之后（对齐 PinyinEngine）。
+/// - `base_order` 不可少：与引擎 `candidate::better`/`by_natural` 一致——`natural_order` 是**每库局部
+///   出现序**（各库从 0 起），只能在同 `base_order` 档内当 tiebreaker；跨库直接比会让小库靠前词条
+///   （如一简次选库「有时」no=24）反超主库深处词条（如「一」no=57285）。`base_order` 隔离这种跨库
+///   比较，必须排在 `natural_order` 之前（对齐引擎 weight→base_order→natural_order 分层）。
+/// - `ignore_weight`：`base_sort = "natural"` 时为 true——引擎的 `by_natural` **完全忽略权重**，纯按
+///   base_order→natural_order 呈现；协调器须同样跳过 weight 维度，否则合并短语后重排会与引擎发散
+///   （如 natural 模式下高权重次选库条目仍会靠 weight 反超低权重主库条目）。此时短语仍靠其
+///   base_order/natural_order 默认 0 浮于顶部。
+///
+/// 排序规则：Exact >> Sub-phrase >> Prefix >> Fuzzy。
+fn candidate_display_order(a: &Candidate, b: &Candidate, ignore_weight: bool) -> std::cmp::Ordering {
+    let by_weight = if ignore_weight {
+        std::cmp::Ordering::Equal
+    } else {
+        b.weight.cmp(&a.weight)
+    };
+    a.is_fuzzy
+        .cmp(&b.is_fuzzy)
+        .then(a.is_prefix.cmp(&b.is_prefix))
+        .then(a.is_partial.cmp(&b.is_partial))
+        .then(by_weight)
+        .then(a.base_order.cmp(&b.base_order))
+        .then(a.natural_order.cmp(&b.natural_order))
+}
+
 impl Coordinator {
     /// 记录一次选词到 redb FREQ（词频维度：count+1、last_used=now，按 schema+code+text）。
     /// 词频是与权重解耦的独立维度（frequency.md），仅记真实使用数据；redb 事务即时持久。
@@ -409,21 +440,10 @@ impl Coordinator {
             }
         }
         drop(phrases);
-        // 候选层级排序（与 PinyinEngine 内部排序完全一致）：
-        // ① 非模糊优先于模糊；② 精确优先于前缀补全（is_prefix）；
-        // ③ 完整匹配优先于子短语（is_partial）；④ 同层内按权重降序、自然序升序。
-        // is_partial 不可少：混输 ÷100 压缩权重后，高权重子串单字（平 w=58
-        // is_partial=true）会靠 weight 反超低权重精确词组（平摊 w=4 is_partial=false）。
-        // is_partial 必须在 is_prefix 之后：与 PinyinEngine 对齐。
-        // 排序规则：Exact >> Sub-phrase >> Prefix >> Fuzzy
-        candidates.sort_by(|a, b| {
-            a.is_fuzzy
-                .cmp(&b.is_fuzzy)
-                .then(a.is_prefix.cmp(&b.is_prefix))
-                .then(a.is_partial.cmp(&b.is_partial))
-                .then(b.weight.cmp(&a.weight))
-                .then(a.natural_order.cmp(&b.natural_order))
-        });
+        // 候选层级排序：合并引擎候选 + 短语后按统一层级重排（见 `candidate_display_order`）。
+        // base_sort=natural 时忽略权重，对齐引擎 by_natural（否则合并短语后重排会与引擎发散）。
+        let ignore_weight = self.engine_mgr.active_base_sort_ignores_weight();
+        candidates.sort_by(|a, b| candidate_display_order(a, b, ignore_weight));
         let mut seen = std::collections::HashSet::new();
         candidates.retain(|c| seen.insert(c.text.clone()));
         // 检索范围过滤（填充常用标志后按模式过滤；对齐 Go 引擎内过滤）
@@ -1504,5 +1524,52 @@ mod finalize_candidates_tests {
         let out = c.finalize_candidates(vec![pre], "x");
         assert_eq!(out.len(), 1, "已标命令不应被再炸开");
         assert!(out[0].is_command);
+    }
+
+    fn cand_ordered(text: &str, base_order: i32, natural_order: i32, weight: i32) -> Candidate {
+        Candidate {
+            text: text.into(),
+            code: "y".into(),
+            base_order,
+            natural_order,
+            weight,
+            ..Default::default()
+        }
+    }
+
+    /// 回归：跨词库排序须以 `base_order` 隔离，`natural_order` 只在同档内当 tiebreaker。
+    /// 复刻 flypy「y」现场——主库「一」(base_order=0, natural_order 大) vs 一简次选库「有时」
+    /// (base_order=2, natural_order 小)：修复前协调器仅按 natural_order 升序会把「有时」拉到首位，
+    /// 修复后「一」（更小 base_order）应稳居首位。两种模式（含/不含权重）都成立（此处权重均 0）。
+    #[test]
+    fn base_order_wins_over_cross_dict_natural_order() {
+        let yi = cand_ordered("一", 0, 57285, 0);
+        let youshi = cand_ordered("有时", 2, 24, 0);
+        for ignore_weight in [false, true] {
+            // 故意以「有时」在前的顺序放入，确保是排序而非原序决定结果。
+            let mut cands = vec![youshi.clone(), yi.clone()];
+            cands.sort_by(|a, b| candidate_display_order(a, b, ignore_weight));
+            assert_eq!(
+                cands[0].text, "一",
+                "base_order=0 主库候选应排在 base_order=2 次选库候选之前（ignore_weight={ignore_weight}）"
+            );
+            assert_eq!(cands[1].text, "有时");
+        }
+    }
+
+    /// natural 模式忽略权重：主库低权重条目（base_order 0）须排在次选库高权重条目（base_order 1）
+    /// 之前，与引擎 `by_natural` 一致；weight 模式则相反（高权重靠前）。证明 ignore_weight 生效。
+    #[test]
+    fn natural_mode_ignores_weight_weight_mode_respects_it() {
+        let main_low = cand_ordered("主低", 0, 100, 1); // 主库、低权重
+        let extra_high = cand_ordered("扩高", 1, 5, 999); // 次选库、高权重
+        // weight 模式：权重降序主导 → 扩高(999) 在前。
+        let mut w = vec![main_low.clone(), extra_high.clone()];
+        w.sort_by(|a, b| candidate_display_order(a, b, false));
+        assert_eq!(w[0].text, "扩高", "weight 模式高权重应靠前");
+        // natural 模式：忽略权重 → base_order 升序主导，主库(0) 在前。
+        let mut n = vec![main_low, extra_high];
+        n.sort_by(|a, b| candidate_display_order(a, b, true));
+        assert_eq!(n[0].text, "主低", "natural 模式忽略权重、按 base_order 升序，主库应靠前");
     }
 }

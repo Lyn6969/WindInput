@@ -78,6 +78,14 @@ pub trait Engine: Send + Sync {
         0
     }
 
+    /// 候选排序是否**忽略权重**（`[engine.codetable].base_sort = "natural"`）：码表引擎在 natural
+    /// 模式下返回 true。供协调器合并短语后按**同一维度**重排——否则协调器仍以 weight 优先，会与
+    /// 引擎的 `candidate::by_natural`（纯 base_order→natural_order、忽略权重）发散。其余引擎默认
+    /// false（按权重排，对齐 `candidate::better`）。
+    fn base_sort_ignores_weight(&self) -> bool {
+        false
+    }
+
     /// `input` 是否存在精确（code==input）匹配（码表引擎实现；其余默认 false）。
     fn has_full_input_match(&self, _input: &str) -> bool {
         false
