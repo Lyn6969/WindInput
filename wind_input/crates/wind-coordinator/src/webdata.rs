@@ -228,7 +228,10 @@ impl Coordinator {
             .map(|id| {
                 // 取合并后 Schema 一次，带出方案元信息（备注/版本/图标/作者），供设置页方案列表与详情显示。
                 let merged = self.engine_mgr.schema_merged(id);
-                let engine_type = merged.as_ref().map(resolve_engine_type).unwrap_or("codetable");
+                let engine_type = merged
+                    .as_ref()
+                    .map(resolve_engine_type)
+                    .unwrap_or("codetable");
                 let info = merged.as_ref().map(|s| &s.schema);
                 let item = json!({
                     "id": id,
@@ -241,7 +244,8 @@ impl Coordinator {
                             String::new()
                         }
                     }).unwrap_or_default(),
-                    "builtin": true,
+                    // 用户目录存在同名 schema.toml 即视为用户方案（可删除）；否则内置。
+                    "builtin": !self.engine_mgr.is_user_schema(id),
                     "description": info.map(|i| i.description.clone()).unwrap_or_default(),
                     "version": info.map(|i| i.version.clone()).unwrap_or_default(),
                     "icon_label": info.map(|i| i.icon_label.clone()).unwrap_or_default(),

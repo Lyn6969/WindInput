@@ -878,6 +878,18 @@ impl EngineManager {
         Ok(removed)
     }
 
+    /// 是否为用户目录方案（%APPDATA%/…/schemas/{id}.schema.toml 存在）。
+    /// 与 [`Self::delete_user_schema`] 的可删判定同源；仅安装目录的内置方案返回 false。
+    pub fn is_user_schema(&self, schema_id: &str) -> bool {
+        Config::user_config_dir()
+            .map(|d| {
+                d.join("schemas")
+                    .join(format!("{schema_id}.schema.toml"))
+                    .is_file()
+            })
+            .unwrap_or(false)
+    }
+
     /// 删除用户自定义方案：仅当方案文件存在于用户目录（非内置 data 目录）时允许。
     /// 同时清除其 override 并从可用列表移除。返回是否删除。内置方案返回 Err。
     pub fn delete_user_schema(&self, schema_id: &str) -> anyhow::Result<bool> {
