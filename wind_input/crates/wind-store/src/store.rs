@@ -199,7 +199,6 @@ impl Store {
     /// 枚举四张按 schema 前缀编码的表（user/temp/freq/shadow）里出现过的全部 schema id。
     /// 备份用：确保有数据但未在当前配置启用的方案也被覆盖。
     pub fn list_data_schemas(&self) -> anyhow::Result<Vec<String>> {
-        use redb::ReadableTable;
         let mut set = std::collections::BTreeSet::new();
         self.with_db(|db| {
             let txn = db.begin_read()?;
