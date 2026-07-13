@@ -114,6 +114,9 @@ impl Coordinator {
             "schema.setDictEnabled" => self.web_schema_set_dict_enabled(params),
             "schema.delete" => self.web_schema_delete(params),
             "schema.references" => Ok(json!({})), // 引用关系（删除安全检查）：暂返空，前端宽松消费
+            "scheme.exportPackage" => self.web_scheme_export_package(params),
+            "scheme.importPackage" => self.web_scheme_import_package(params),
+            "scheme.previewImport" => self.web_scheme_preview_import(params),
 
             // ── dict.*（用户词库，redb 持久化）────────────────────
             "dict.listPaged" => self.web_dict_list_paged(params),
@@ -518,6 +521,79 @@ impl Coordinator {
         let id = str_param(params, "id")?;
         self.engine_mgr.delete_user_schema(id)?;
         Ok(json!({ "ok": true }))
+    }
+
+    /// 用户 schemas 根目录(%APPDATA%/WindInput/schemas),不存在则创建。
+    fn user_schemas_dir() -> anyhow::Result<std::path::PathBuf> {
+        let dir = wind_config::Config::user_config_dir()
+            .ok_or_else(|| anyhow::anyhow!("无用户配置目录"))?
+            .join("schemas");
+        std::fs::create_dir_all(&dir)?;
+        Ok(dir)
+    }
+
+    /// 系统 schemas 根目录(<exe>/data/schemas),可能不存在(如测试环境)。
+    fn system_schemas_dir() -> Option<std::path::PathBuf> {
+        wind_config::Config::data_dir()
+            .map(|d| d.join("schemas"))
+            .filter(|d| d.is_dir())
+    }
+
+    fn web_scheme_export_package(&self, params: &Value) -> anyhow::Result<Value> {
+        let id = str_param(params, "id")?;
+        let out = str_param(params, "path")?;
+        let user = Self::user_schemas_dir()?;
+        let system = Self::system_schemas_dir();
+        let r = wind_transfer::scheme::export_package(
+            id,
+            &user,
+            system.as_deref(),
+            std::path::Path::new(out),
+            env!("CARGO_PKG_VERSION"),
+            std::env::consts::OS,
+            &chrono::Local::now().to_rfc3339(),
+        )?;
+        Ok(json!({
+            "path": r.path.to_string_lossy(),
+            "packed": r.packed,
+            "systemRefs": r.system_refs,
+            "missing": r.missing,
+        }))
+    }
+
+    fn web_scheme_import_package(&self, params: &Value) -> anyhow::Result<Value> {
+        use wind_transfer::merge::Strategy;
+        let path = str_param(params, "path")?;
+        let strategy = Strategy::from_param(
+            params
+                .get("strategy")
+                .and_then(|v| v.as_str())
+                .unwrap_or(""),
+        );
+        let user = Self::user_schemas_dir()?;
+        let r = wind_transfer::scheme::import_package(std::path::Path::new(path), &user, strategy)?;
+        // 覆盖已加载方案时失效缓存(新方案为安全 no-op);列表可见性由 installed_schemas 实时扫盘天然生效。
+        for id in &r.schema_ids {
+            self.engine_mgr.invalidate_schema(id);
+        }
+        Ok(json!({
+            "imported": r.imported,
+            "conflicts": r.conflicts,
+            "schemaIds": r.schema_ids,
+        }))
+    }
+
+    fn web_scheme_preview_import(&self, params: &Value) -> anyhow::Result<Value> {
+        let path = str_param(params, "path")?;
+        let user = Self::user_schemas_dir()?;
+        let p = wind_transfer::scheme::preview_import(std::path::Path::new(path), &user)?;
+        Ok(json!({
+            "manifest": serde_json::to_value(&p.manifest)?,
+            "willAdd": p.will_add,
+            "conflicts": p.conflicts,
+            "systemRefs": p.system_refs,
+            "missing": p.missing,
+        }))
     }
 
     fn web_dict_encode(&self, params: &Value) -> anyhow::Result<Value> {
@@ -2449,5 +2525,68 @@ mod tests {
             .web_data_rpc("phrase.listUser", &json!({ "offset": 0, "limit": 10 }))
             .unwrap();
         assert_eq!(r4["total"], 3, "不传 sortBy 应保持原有行为");
+    }
+
+    #[test]
+    fn scheme_package_rpc_contract() {
+        let c = coord("schemepkg");
+        // exportPackage:不存在的方案 id → 错误
+        assert!(
+            c.web_data_rpc(
+                "scheme.exportPackage",
+                &json!({ "id": "zz_no_such_schema", "path": std::env::temp_dir().join("zz_no.zip").to_string_lossy() }),
+            )
+            .is_err(),
+            "不存在的方案应报错"
+        );
+        // previewImport:不存在的包路径 → 错误
+        assert!(
+            c.web_data_rpc(
+                "scheme.previewImport",
+                &json!({ "path": std::env::temp_dir().join("zz_no_such_pkg.zip").to_string_lossy() }),
+            )
+            .is_err()
+        );
+        // previewImport:真实构造的包 → 只读预览成功,形状正确
+        let t = std::env::temp_dir().join("wind_schemepkg_test");
+        let _ = std::fs::remove_dir_all(&t);
+        let (user, system) = (t.join("u"), t.join("s"));
+        std::fs::create_dir_all(user.join("my")).unwrap();
+        std::fs::create_dir_all(&system).unwrap();
+        std::fs::write(
+            user.join("my.schema.toml"),
+            "[schema]\nid=\"my\"\n[[dictionaries]]\npath=\"my/d.yaml\"\n",
+        )
+        .unwrap();
+        std::fs::write(user.join("my/d.yaml"), "d").unwrap();
+        let pkg = t.join("my.zip");
+        wind_transfer::scheme::export_package(
+            "my",
+            &user,
+            Some(&system),
+            &pkg,
+            "1.0.0",
+            "windows",
+            "t",
+        )
+        .unwrap();
+        let prev = c
+            .web_data_rpc(
+                "scheme.previewImport",
+                &json!({ "path": pkg.to_string_lossy() }),
+            )
+            .unwrap();
+        assert!(prev.get("manifest").is_some());
+        assert!(prev.get("willAdd").and_then(|v| v.as_array()).is_some());
+        assert!(prev.get("conflicts").and_then(|v| v.as_array()).is_some());
+        let _ = std::fs::remove_dir_all(&t);
+        // importPackage:不存在的包路径 → 错误
+        assert!(
+            c.web_data_rpc(
+                "scheme.importPackage",
+                &json!({ "path": std::env::temp_dir().join("zz_no_such_pkg.zip").to_string_lossy() }),
+            )
+            .is_err()
+        );
     }
 }

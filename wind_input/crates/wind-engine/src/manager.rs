@@ -891,6 +891,7 @@ impl EngineManager {
     }
 
     /// 使某方案的引擎与解析缓存失效（override/词典变更后，下次构建按新定义重建）。
+    /// pub:方案包导入后由 RPC 层调用,失效已加载缓存(未加载时安全 no-op)。
     pub fn invalidate_schema(&self, schema_id: &str) {
         self.engines
             .lock()
