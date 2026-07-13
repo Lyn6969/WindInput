@@ -185,6 +185,185 @@ pub fn create_backup(
     })
 }
 
+pub struct RestoreTargets<'a> {
+    pub user_config_file: Option<&'a Path>,
+    pub user_schemas_dir: Option<&'a Path>,
+    pub user_themes_dir: Option<&'a Path>,
+    pub state_file: Option<&'a Path>,
+}
+
+pub struct RestoreResult {
+    pub restored: Vec<String>,
+    pub conflicts: Vec<String>,
+    pub schemas_touched: Vec<String>,
+}
+
+/// 条目 type → section 名（sections 过滤用）。
+fn section_of(ty: &str) -> &str {
+    match ty {
+        "schema_file" => "schemas",
+        "theme_file" => "themes",
+        "stats_meta" => "stats",
+        other => other,
+    }
+}
+
+/// 写单个文件（tmp+rename；Merge 已存在→false 表示冲突跳过；Replace 先删旧）。
+fn write_file(
+    target: &Path,
+    bytes: &[u8],
+    strategy: crate::merge::Strategy,
+) -> anyhow::Result<bool> {
+    if target.exists() && strategy == crate::merge::Strategy::Merge {
+        return Ok(false);
+    }
+    if let Some(parent) = target.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let tmp = target.with_extension("windinput.tmp");
+    std::fs::write(&tmp, bytes)?;
+    if target.exists() {
+        std::fs::remove_file(target)?;
+    }
+    std::fs::rename(&tmp, target)?;
+    Ok(true)
+}
+
+/// 还原整机备份。sections=None 还原全部；数据域 Replace 先清对应表，文件域 Merge 跳过已存在。
+pub fn restore_backup(
+    package: &Path,
+    store: &Store,
+    targets: &RestoreTargets,
+    strategy: crate::merge::Strategy,
+    sections: Option<&[String]>,
+) -> anyhow::Result<RestoreResult> {
+    let manifest = crate::bundle::read_manifest(package)?;
+    if manifest.kind != BundleKind::Backup {
+        anyhow::bail!("不是整机备份(kind={:?})", manifest.kind);
+    }
+    let wanted = |ty: &str| -> bool {
+        match sections {
+            None => true,
+            Some(ss) => ss.iter().any(|s| s == section_of(ty)),
+        }
+    };
+    let replace = strategy == crate::merge::Strategy::Replace;
+    let mut restored = Vec::new();
+    let mut conflicts = Vec::new();
+    let mut schemas_touched: std::collections::BTreeSet<String> = Default::default();
+    // Replace 的数据域清库只做一次（phrases/stats 全局；四表按 schema 首次遇到时清）。
+    let mut cleared: std::collections::HashSet<String> = Default::default();
+
+    for e in &manifest.contents {
+        if !wanted(&e.r#type) {
+            continue;
+        }
+        let bytes = crate::bundle::extract_entry(package, &e.path)?;
+        let text = || String::from_utf8_lossy(&bytes).into_owned();
+        let schema = e.meta.get("schema").and_then(|v| v.as_str()).unwrap_or("");
+        match e.r#type.as_str() {
+            "config" => {
+                if let Some(target) = targets.user_config_file {
+                    if write_file(target, &bytes, strategy)? {
+                        restored.push(e.path.clone());
+                    } else {
+                        conflicts.push(e.path.clone());
+                    }
+                }
+            }
+            "state" => {
+                if let Some(target) = targets.state_file {
+                    if write_file(target, &bytes, strategy)? {
+                        restored.push(e.path.clone());
+                    } else {
+                        conflicts.push(e.path.clone());
+                    }
+                }
+            }
+            "dict" if !schema.is_empty() => {
+                if replace && cleared.insert(format!("dict:{schema}")) {
+                    store.clear_user_words(schema)?;
+                }
+                store.import_user_words_wdict(schema, &text())?;
+                schemas_touched.insert(schema.to_string());
+                restored.push(e.path.clone());
+            }
+            "temp" if !schema.is_empty() => {
+                if replace && cleared.insert(format!("temp:{schema}")) {
+                    store.clear_temp_words(schema)?;
+                }
+                store.import_temp_words_wdict(schema, &text())?;
+                schemas_touched.insert(schema.to_string());
+                restored.push(e.path.clone());
+            }
+            "freq" if !schema.is_empty() => {
+                if replace && cleared.insert(format!("freq:{schema}")) {
+                    store.clear_freq(schema)?;
+                }
+                store.import_freq_jsonl(schema, &text())?;
+                schemas_touched.insert(schema.to_string());
+                restored.push(e.path.clone());
+            }
+            "shadow" if !schema.is_empty() => {
+                if replace && cleared.insert(format!("shadow:{schema}")) {
+                    store.clear_shadow(schema)?;
+                }
+                store.import_shadow_jsonl(schema, &text())?;
+                schemas_touched.insert(schema.to_string());
+                restored.push(e.path.clone());
+            }
+            "phrase" => {
+                if replace && cleared.insert("phrase".into()) {
+                    store.reset_user_phrases()?;
+                }
+                store.import_user_phrases_wdict(&text())?;
+                restored.push(e.path.clone());
+            }
+            "stats" => {
+                if replace && cleared.insert("stats".into()) {
+                    store.clear_stats()?;
+                }
+                store.import_stats_jsonl(&text(), replace)?;
+                restored.push(e.path.clone());
+            }
+            "stats_meta" => {
+                if replace {
+                    let meta: wind_store::stats::StatsMeta = serde_json::from_slice(&bytes)?;
+                    store.put_stats_meta(&meta)?;
+                    restored.push(e.path.clone());
+                }
+                // Merge：保留本地 meta（streak 等本机累积），跳过不计冲突。
+            }
+            "schema_file" => {
+                if let Some(dir) = targets.user_schemas_dir {
+                    let rel = crate::bundle::validate_entry_rel(&e.path, "schemas/")?;
+                    if write_file(&dir.join(rel), &bytes, strategy)? {
+                        restored.push(e.path.clone());
+                    } else {
+                        conflicts.push(e.path.clone());
+                    }
+                }
+            }
+            "theme_file" => {
+                if let Some(dir) = targets.user_themes_dir {
+                    let rel = crate::bundle::validate_entry_rel(&e.path, "themes/")?;
+                    if write_file(&dir.join(rel), &bytes, strategy)? {
+                        restored.push(e.path.clone());
+                    } else {
+                        conflicts.push(e.path.clone());
+                    }
+                }
+            }
+            _ => {} // 未知/空 schema 条目：静默忽略（向前兼容）
+        }
+    }
+    Ok(RestoreResult {
+        restored,
+        conflicts,
+        schemas_touched: schemas_touched.into_iter().collect(),
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -266,6 +445,168 @@ mod tests {
         let bytes = crate::bundle::extract_entry(&out, "config/config.toml").unwrap();
         assert_eq!(bytes, b"[ui]\n");
         assert!(!r.entries.is_empty());
+    }
+
+    #[test]
+    fn restore_roundtrip_full() {
+        let t = tempfile::tempdir().unwrap();
+        let s = seed_store(t.path());
+        let cfg = t.path().join("config.toml");
+        std::fs::write(&cfg, "[ui]\n").unwrap();
+        let out = t.path().join("b.zip");
+        let src = BackupSources {
+            user_config_file: Some(&cfg),
+            user_schemas_dir: None,
+            user_themes_dir: None,
+            state_file: None,
+        };
+        create_backup(
+            &s,
+            &src,
+            &out,
+            "1.0.0",
+            "windows",
+            "t",
+            &BackupOptions {
+                include_stats: true,
+                include_state: false,
+            },
+        )
+        .unwrap();
+
+        // 全新目标环境
+        let t2 = tempfile::tempdir().unwrap();
+        let s2 = wind_store::store::Store::open(t2.path().join("t2.redb")).unwrap();
+        let cfg2 = t2.path().join("config.toml");
+        let targets = RestoreTargets {
+            user_config_file: Some(&cfg2),
+            user_schemas_dir: None,
+            user_themes_dir: None,
+            state_file: None,
+        };
+        let r = restore_backup(&out, &s2, &targets, crate::merge::Strategy::Merge, None).unwrap();
+        assert!(r.conflicts.is_empty());
+        assert!(r.schemas_touched.contains(&"wb".to_string()));
+        assert_eq!(std::fs::read(&cfg2).unwrap(), b"[ui]\n");
+        assert_eq!(s2.get_user_words("wb", "a").unwrap()[0].weight, 100);
+        assert_eq!(s2.get_temp_word("wb", "ab", "临").unwrap(), Some(1));
+        assert_eq!(s2.get_freq("wb", "a", "工").unwrap().unwrap().count, 1);
+        assert_eq!(s2.list_shadow_rules("wb").unwrap().len(), 1);
+        assert!(s2.list_phrases().unwrap().iter().any(|p| p.code == "bj"));
+    }
+
+    #[test]
+    fn restore_sections_filter_and_merge_conflict() {
+        let t = tempfile::tempdir().unwrap();
+        let s = seed_store(t.path());
+        let cfg = t.path().join("config.toml");
+        std::fs::write(&cfg, "[ui]\n").unwrap();
+        let out = t.path().join("b.zip");
+        let src = BackupSources {
+            user_config_file: Some(&cfg),
+            user_schemas_dir: None,
+            user_themes_dir: None,
+            state_file: None,
+        };
+        create_backup(
+            &s,
+            &src,
+            &out,
+            "1.0.0",
+            "windows",
+            "t",
+            &BackupOptions {
+                include_stats: false,
+                include_state: false,
+            },
+        )
+        .unwrap();
+
+        let t2 = tempfile::tempdir().unwrap();
+        let s2 = wind_store::store::Store::open(t2.path().join("t2.redb")).unwrap();
+        let cfg2 = t2.path().join("config.toml");
+        std::fs::write(&cfg2, "LOCAL").unwrap();
+        let targets = RestoreTargets {
+            user_config_file: Some(&cfg2),
+            user_schemas_dir: None,
+            user_themes_dir: None,
+            state_file: None,
+        };
+        // 只还原 config；Merge 下本地已存在 → conflict，内容不变
+        let sections = vec!["config".to_string()];
+        let r = restore_backup(
+            &out,
+            &s2,
+            &targets,
+            crate::merge::Strategy::Merge,
+            Some(&sections),
+        )
+        .unwrap();
+        assert_eq!(r.conflicts, vec!["config/config.toml"]);
+        assert_eq!(std::fs::read(&cfg2).unwrap(), b"LOCAL");
+        assert!(
+            s2.get_user_words("wb", "a").unwrap().is_empty(),
+            "dict 未在 sections，不还原"
+        );
+        // Replace 覆盖
+        let r2 = restore_backup(
+            &out,
+            &s2,
+            &targets,
+            crate::merge::Strategy::Replace,
+            Some(&sections),
+        )
+        .unwrap();
+        assert!(r2.conflicts.is_empty());
+        assert_eq!(std::fs::read(&cfg2).unwrap(), b"[ui]\n");
+    }
+
+    #[test]
+    fn restore_replace_clears_data_domain() {
+        let t = tempfile::tempdir().unwrap();
+        let s = seed_store(t.path());
+        let out = t.path().join("b.zip");
+        let src = BackupSources {
+            user_config_file: None,
+            user_schemas_dir: None,
+            user_themes_dir: None,
+            state_file: None,
+        };
+        create_backup(
+            &s,
+            &src,
+            &out,
+            "1.0.0",
+            "windows",
+            "t",
+            &BackupOptions {
+                include_stats: false,
+                include_state: false,
+            },
+        )
+        .unwrap();
+
+        let t2 = tempfile::tempdir().unwrap();
+        let s2 = wind_store::store::Store::open(t2.path().join("t2.redb")).unwrap();
+        s2.add_user_word("wb", "zz", "杂", 1).unwrap(); // 本地杂词
+        let targets = RestoreTargets {
+            user_config_file: None,
+            user_schemas_dir: None,
+            user_themes_dir: None,
+            state_file: None,
+        };
+        let sections = vec!["dict".to_string()];
+        restore_backup(
+            &out,
+            &s2,
+            &targets,
+            crate::merge::Strategy::Replace,
+            Some(&sections),
+        )
+        .unwrap();
+        let all = s2.search_user_words_prefix("wb", "", 0).unwrap();
+        assert_eq!(all.len(), 1, "Replace 清掉杂词只剩备份内容");
+        assert_eq!(all[0].code, "a");
     }
 
     #[test]
