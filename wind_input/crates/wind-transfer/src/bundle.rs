@@ -124,6 +124,26 @@ impl BundleWriter {
     }
 }
 
+/// 校验归档条目名并返回剥去前缀的相对路径：必须 `required_prefix` 前缀、非空，
+/// 且（`\`归一为`/`后）所有路径段均为普通段——components 白名单，
+/// 拦 `..`/绝对/盘符相对（`C:foo`）/UNC/`.`，段内禁 `:`（NTFS ADS 防御）。
+pub fn validate_entry_rel<'a>(name: &'a str, required_prefix: &str) -> anyhow::Result<&'a str> {
+    let rel = name
+        .strip_prefix(required_prefix)
+        .ok_or_else(|| anyhow::anyhow!("非法条目(缺 {required_prefix} 前缀): {name}"))?;
+    if rel.is_empty() {
+        anyhow::bail!("非法条目(空路径): {name}");
+    }
+    let normalized = rel.replace('\\', "/");
+    let ok = Path::new(&normalized).components().all(
+        |c| matches!(c, std::path::Component::Normal(seg) if !seg.to_string_lossy().contains(':')),
+    );
+    if !ok {
+        anyhow::bail!("非法条目(路径穿越): {name}");
+    }
+    Ok(rel)
+}
+
 /// 免全解压读取并校验 manifest.json。
 pub fn read_manifest(path: &Path) -> anyhow::Result<Manifest> {
     let file = std::fs::File::open(path)?;

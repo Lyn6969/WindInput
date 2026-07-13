@@ -118,6 +118,11 @@ impl Coordinator {
             "scheme.importPackage" => self.web_scheme_import_package(params),
             "scheme.previewImport" => self.web_scheme_preview_import(params),
 
+            // ── backup.*（整机备份，wind-transfer::backup）───────
+            "backup.create" => self.web_backup_create(params),
+            "backup.inspect" => self.web_backup_inspect(params),
+            "backup.restore" => self.web_backup_restore(params),
+
             // ── dict.*（用户词库，redb 持久化）────────────────────
             "dict.listPaged" => self.web_dict_list_paged(params),
             "dict.search" => self.web_dict_search(params),
@@ -593,6 +598,124 @@ impl Coordinator {
             "conflicts": p.conflicts,
             "systemRefs": p.system_refs,
             "missing": p.missing,
+        }))
+    }
+
+    fn web_backup_create(&self, params: &Value) -> anyhow::Result<Value> {
+        use wind_transfer::backup::{BackupOptions, BackupSources, create_backup};
+        let out = str_param(params, "path")?;
+        let include_stats = params
+            .get("includeStats")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        let include_state = params
+            .get("includeState")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        let store = self
+            .store
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("无持久化存储"))?;
+        let user_dir = wind_config::Config::user_config_dir();
+        let cfg_file = user_dir.as_ref().map(|d| d.join("config.toml"));
+        let schemas_dir = user_dir.as_ref().map(|d| d.join("schemas"));
+        let themes_dir = user_dir.as_ref().map(|d| d.join("themes"));
+        let state_file = wind_config::Config::local_dir().map(|d| d.join("state.toml"));
+        let src = BackupSources {
+            user_config_file: cfg_file.as_deref(),
+            user_schemas_dir: schemas_dir.as_deref(),
+            user_themes_dir: themes_dir.as_deref(),
+            state_file: state_file.as_deref(),
+        };
+        let r = create_backup(
+            store,
+            &src,
+            std::path::Path::new(out),
+            env!("CARGO_PKG_VERSION"),
+            std::env::consts::OS,
+            &chrono::Local::now().to_rfc3339(),
+            &BackupOptions {
+                include_stats,
+                include_state,
+            },
+        )?;
+        let manifest = wind_transfer::bundle::read_manifest(&r.path)?;
+        Ok(json!({
+            "path": r.path.to_string_lossy(),
+            "manifest": serde_json::to_value(&manifest)?,
+        }))
+    }
+
+    fn web_backup_inspect(&self, params: &Value) -> anyhow::Result<Value> {
+        let path = str_param(params, "path")?;
+        let manifest = wind_transfer::bundle::read_manifest(std::path::Path::new(path))?;
+        Ok(json!({ "manifest": serde_json::to_value(&manifest)? }))
+    }
+
+    fn web_backup_restore(&self, params: &Value) -> anyhow::Result<Value> {
+        use wind_transfer::backup::{RestoreTargets, restore_backup};
+        use wind_transfer::merge::Strategy;
+        let path = str_param(params, "path")?;
+        let strategy = Strategy::from_param(
+            params
+                .get("strategy")
+                .and_then(|v| v.as_str())
+                .unwrap_or(""),
+        );
+        let sections: Option<Vec<String>> = params.get("sections").and_then(|v| {
+            v.as_array().map(|a| {
+                a.iter()
+                    .filter_map(|x| x.as_str().map(String::from))
+                    .collect()
+            })
+        });
+        let store = self
+            .store
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("无持久化存储"))?;
+        let user_dir = wind_config::Config::user_config_dir();
+        let cfg_file = user_dir.as_ref().map(|d| d.join("config.toml"));
+        let schemas_dir = user_dir.as_ref().map(|d| d.join("schemas"));
+        let themes_dir = user_dir.as_ref().map(|d| d.join("themes"));
+        let state_file = wind_config::Config::local_dir().map(|d| d.join("state.toml"));
+        let targets = RestoreTargets {
+            user_config_file: cfg_file.as_deref(),
+            user_schemas_dir: schemas_dir.as_deref(),
+            user_themes_dir: themes_dir.as_deref(),
+            state_file: state_file.as_deref(),
+        };
+        let r = restore_backup(
+            std::path::Path::new(path),
+            store,
+            &targets,
+            strategy,
+            sections.as_deref(),
+        )?;
+        // 刷新:config 域生效、短语重建、涉及方案失效缓存(未加载时安全 no-op)。
+        let touched_config = r.restored.iter().any(|p| p.starts_with("config/"));
+        let touched_phrase = r.restored.iter().any(|p| p == "userdata/phrases.wdict");
+        for id in &r.schemas_touched {
+            self.engine_mgr.invalidate_schema(id);
+        }
+        for p in &r.restored {
+            if let Some(rel) = p.strip_prefix("schemas/") {
+                if let Some(id) = rel.strip_suffix(".schema.toml") {
+                    if !id.contains('/') {
+                        self.engine_mgr.invalidate_schema(id);
+                    }
+                }
+            }
+        }
+        if touched_phrase {
+            self.rebuild_phrases();
+        }
+        if touched_config {
+            self.reload_user_config();
+        }
+        Ok(json!({
+            "restored": r.restored,
+            "conflicts": r.conflicts,
+            "schemasTouched": r.schemas_touched,
         }))
     }
 
@@ -2588,5 +2711,64 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    #[test]
+    fn backup_rpc_contract() {
+        let c = coord("backuprpc");
+        // 种一条数据,create 到临时路径(coord 的 store 是临时 redb;文件域目录真实但只读不写:
+        // create 只读取 config/schemas/themes,不写入它们)
+        c.web_data_rpc(
+            "dict.add",
+            &json!({ "schemaId": "wb", "code": "a", "text": "工", "weight": 100 }),
+        )
+        .unwrap();
+        let out = std::env::temp_dir().join("wind_backup_rpc_test.zip");
+        let _ = std::fs::remove_file(&out);
+        let r = c
+            .web_data_rpc(
+                "backup.create",
+                &json!({ "path": out.to_string_lossy(), "includeStats": false }),
+            )
+            .unwrap();
+        assert!(r.get("manifest").is_some());
+        // inspect
+        let ins = c
+            .web_data_rpc("backup.inspect", &json!({ "path": out.to_string_lossy() }))
+            .unwrap();
+        assert_eq!(
+            ins.get("manifest")
+                .and_then(|m| m.get("kind"))
+                .and_then(|v| v.as_str()),
+            Some("backup")
+        );
+        // inspect 不存在的包 → 错误
+        assert!(
+            c.web_data_rpc(
+                "backup.inspect",
+                &json!({ "path": std::env::temp_dir().join("zz_no.zip").to_string_lossy() }),
+            )
+            .is_err()
+        );
+        // restore 仅数据域 sections(dict):写临时 store,不碰真实用户文件
+        c.web_data_rpc("dict.clear", &json!({ "schemaId": "wb" }))
+            .unwrap();
+        let rr = c
+            .web_data_rpc(
+                "backup.restore",
+                &json!({ "path": out.to_string_lossy(), "sections": ["dict"] }),
+            )
+            .unwrap();
+        assert!(
+            rr.get("restored")
+                .and_then(|v| v.as_array())
+                .map(|a| !a.is_empty())
+                .unwrap_or(false)
+        );
+        let listed = c
+            .web_data_rpc("dict.listPaged", &json!({ "schemaId": "wb", "limit": 10 }))
+            .unwrap();
+        assert_eq!(listed.get("total").and_then(|v| v.as_u64()), Some(1));
+        let _ = std::fs::remove_file(&out);
     }
 }

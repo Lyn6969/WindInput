@@ -91,19 +91,22 @@ schemas/shuangpin/<布局>.toml     (若引用自定义双拼布局)
 
 ```
 manifest.json
-config/config.toml
-userdata/user_words.wdict
-userdata/temp_words.wdict
-userdata/phrases.wdict
-userdata/freq.jsonl
-userdata/shadow.jsonl
-userdata/stats.jsonl          (可选,用户勾选)
-schemas/<用户方案...>          (复用 schema/ 布局,可多方案)
-themes/<用户主题...>
+config/config.toml                     type="config"
+userdata/user_words/<schema>.wdict     type="dict"       meta={"schema"}
+userdata/temp_words/<schema>.wdict     type="temp"       meta={"schema"}
+userdata/phrases.wdict                 type="phrase"
+userdata/freq/<schema>.jsonl           type="freq"       meta={"schema"}
+userdata/shadow/<schema>.jsonl         type="shadow"     meta={"schema"}
+userdata/stats.jsonl                   type="stats"      (include_stats)
+userdata/stats_meta.json               type="stats_meta" (include_stats)
+schemas/<schemas根相对路径>             type="schema_file"(用户方案目录整树)
+themes/<themes根相对路径>              type="theme_file" (用户主题目录整树)
+state/state.toml                       type="state"      (include_state)
 ```
 
 - **排除**:`cache/`、`logs/`(可重建/无价值);`state.toml`(本机相关,默认排除,`includeState` 可选包含)。
 - 用户方案与主题复用方案包的 `schema/` 布局与主题目录结构。
+- 用户数据按方案拆分子目录(`userdata/user_words/<schema>.wdict` 等),manifest 条目以 type+meta.schema 标注归属;stats_meta 随 include_stats 一并导出。backup 域无独立 preview,由 `backup.inspect`(manifest 清单)承担还原前概览。
 
 ## 合并引擎(所有导入统一)
 

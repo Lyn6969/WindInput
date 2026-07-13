@@ -185,22 +185,7 @@ pub fn export_package(
 /// 校验 zip 条目名并转为 schemas 根相对路径:必须 `schemas/` 前缀,
 /// 且所有路径段均为普通段(components 白名单,拦 `..`/绝对/盘符相对如 `C:foo`/UNC/`.`)。
 fn entry_rel(name: &str) -> anyhow::Result<&str> {
-    let rel = name
-        .strip_prefix("schemas/")
-        .ok_or_else(|| anyhow::anyhow!("非法条目(缺 schemas/ 前缀): {name}"))?;
-    if rel.is_empty() {
-        anyhow::bail!("非法条目(空路径): {name}");
-    }
-    // 反斜杠统一按分隔符处理后再做组件白名单(zip 规范用 /,防御性兼容 \)。
-    let normalized = rel.replace('\\', "/");
-    let ok = !normalized.is_empty()
-        && Path::new(&normalized)
-            .components()
-            .all(|c| matches!(c, std::path::Component::Normal(seg) if !seg.to_string_lossy().contains(':')));
-    if !ok {
-        anyhow::bail!("非法条目(路径穿越): {name}");
-    }
-    Ok(rel)
+    crate::bundle::validate_entry_rel(name, "schemas/")
 }
 
 /// 从 manifest 取有载荷条目(schema/resource),校验条目名合法性。

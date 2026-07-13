@@ -251,6 +251,83 @@ impl Store {
         })
     }
 
+    /// 导出某方案全部 shadow 规则为 jsonl（每行 {"code","rec"}）。
+    pub fn export_shadow_jsonl(&self, schema: &str) -> anyhow::Result<String> {
+        let rules = self.list_shadow_rules(schema)?;
+        let mut out = String::new();
+        for (code, rec) in rules {
+            out.push_str(&serde_json::to_string(
+                &serde_json::json!({ "code": code, "rec": rec }),
+            )?);
+            out.push('\n');
+        }
+        Ok(out)
+    }
+
+    /// 从 jsonl 导入 shadow 规则（逐条 replay pin/delete，天然 upsert）。
+    /// 返回 (imported=重放的规则条数, skipped=非法行数)。
+    pub fn import_shadow_jsonl(&self, schema: &str, text: &str) -> anyhow::Result<(usize, usize)> {
+        let mut imported = 0usize;
+        let mut skipped = 0usize;
+        for line in text.lines() {
+            if line.trim().is_empty() {
+                continue;
+            }
+            let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else {
+                skipped += 1;
+                continue;
+            };
+            let (Some(code), Some(rec)) = (
+                v.get("code").and_then(|x| x.as_str()),
+                v.get("rec")
+                    .and_then(|x| serde_json::from_value::<ShadowRecord>(x.clone()).ok()),
+            ) else {
+                skipped += 1;
+                continue;
+            };
+            // 存储序 index 0 = 最新（apply_pin LIFO 插队首），反向重放才能还原原顺序。
+            for p in rec.pinned.iter().rev() {
+                self.pin_shadow(schema, code, &p.word, p.cand_id.as_deref(), p.position)?;
+                imported += 1;
+            }
+            for w in &rec.deleted {
+                self.delete_shadow(schema, code, w)?;
+                imported += 1;
+            }
+        }
+        Ok((imported, skipped))
+    }
+
+    /// 清空某方案全部 shadow 规则（单写事务），返回删除键数。
+    pub fn clear_shadow(&self, schema: &str) -> anyhow::Result<usize> {
+        let prefix = format!("{schema}\u{0}");
+        self.with_db(|db| {
+            let txn = db.begin_write()?;
+            let n;
+            {
+                let mut t = txn.open_table(SHADOW)?;
+                let keys: Vec<String> = {
+                    let mut ks = Vec::new();
+                    for item in t.range(prefix.as_str()..)? {
+                        let (k, _) = item?;
+                        let key = k.value();
+                        if !key.starts_with(&prefix) {
+                            break;
+                        }
+                        ks.push(key.to_string());
+                    }
+                    ks
+                };
+                n = keys.len();
+                for k in &keys {
+                    t.remove(k.as_str())?;
+                }
+            }
+            txn.commit()?;
+            Ok(n)
+        })
+    }
+
     /// 列举某方案下所有 code 的 Shadow 规则（设置页用）。返回 (code, 规则) 列表。
     pub fn list_shadow_rules(&self, schema: &str) -> anyhow::Result<Vec<(String, ShadowRecord)>> {
         let prefix = format!("{schema}\u{0}");
@@ -277,6 +354,43 @@ impl Store {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn tmp(name: &str) -> std::path::PathBuf {
+        let p = std::env::temp_dir().join(name);
+        let _ = std::fs::remove_file(&p);
+        p
+    }
+
+    #[test]
+    fn shadow_jsonl_roundtrip_and_clear() {
+        let path = tmp("wind_sh_io.redb");
+        let s = Store::open(&path).unwrap();
+        s.pin_shadow("wb", "aaaa", "恭", Some("c1"), 0).unwrap();
+        s.pin_shadow("wb", "aaaa", "敬", None, 1).unwrap(); // 后置顶 → 存储序 index 0
+        s.delete_shadow("wb", "bbbb", "删词").unwrap();
+        let text = s.export_shadow_jsonl("wb").unwrap();
+        assert_eq!(text.lines().count(), 2);
+
+        let path2 = tmp("wind_sh_io2.redb");
+        let s2 = Store::open(&path2).unwrap();
+        let (imported, skipped) = s2.import_shadow_jsonl("wb", &text).unwrap();
+        assert_eq!(skipped, 0);
+        assert!(imported >= 3);
+        let rules = s2.list_shadow_rules("wb").unwrap();
+        assert_eq!(rules.len(), 2);
+        let pinned = rules.iter().find(|(c, _)| c == "aaaa").unwrap();
+        // round-trip 保序：LIFO 存储序（最新在前）导入后不反转
+        assert_eq!(pinned.1.pinned.len(), 2);
+        assert_eq!(pinned.1.pinned[0].word, "敬");
+        assert_eq!(pinned.1.pinned[0].position, 1);
+        assert_eq!(pinned.1.pinned[1].word, "恭");
+        assert_eq!(pinned.1.pinned[1].position, 0);
+
+        assert_eq!(s.clear_shadow("wb").unwrap(), 2);
+        assert!(s.list_shadow_rules("wb").unwrap().is_empty());
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(&path2);
+    }
 
     #[test]
     fn test_pin_delete_reset() {

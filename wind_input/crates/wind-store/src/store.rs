@@ -195,11 +195,46 @@ impl Store {
     pub fn path(&self) -> &Path {
         &self.path
     }
+
+    /// 枚举四张按 schema 前缀编码的表（user/temp/freq/shadow）里出现过的全部 schema id。
+    /// 备份用：确保有数据但未在当前配置启用的方案也被覆盖。
+    pub fn list_data_schemas(&self) -> anyhow::Result<Vec<String>> {
+        let mut set = std::collections::BTreeSet::new();
+        self.with_db(|db| {
+            let txn = db.begin_read()?;
+            for table in [USER_WORDS, TEMP_WORDS, FREQ, SHADOW] {
+                let t = txn.open_table(table)?;
+                for item in t.range::<&str>(..)? {
+                    let (k, _) = item?;
+                    if let Some((schema, _rest)) = k.value().split_once('\u{0}') {
+                        set.insert(schema.to_string());
+                    }
+                }
+            }
+            Ok(())
+        })?;
+        Ok(set.into_iter().collect())
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn list_data_schemas_across_tables() {
+        let path = std::env::temp_dir().join("wind_store_schemas_test.redb");
+        let _ = std::fs::remove_file(&path);
+        let s = Store::open(&path).unwrap();
+        s.add_user_word("wb", "a", "工", 1).unwrap();
+        s.learn_temp_word("py", "ni", "你", 1).unwrap();
+        s.record_freq("sp", "x", "词").unwrap();
+        s.pin_shadow("wb", "aa", "恭", None, 0).unwrap();
+        let mut got = s.list_data_schemas().unwrap();
+        got.sort();
+        assert_eq!(got, vec!["py", "sp", "wb"]);
+        let _ = std::fs::remove_file(&path);
+    }
 
     #[test]
     fn test_open_version_persist_and_reopen() {
