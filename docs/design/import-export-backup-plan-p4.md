@@ -54,7 +54,7 @@
   - `Store::export_freq_jsonl(&self, schema:&str) -> Result<String>`(每行 `{"code":..,"text":..,"count":..,"last_used":..}`)
   - `Store::import_freq_jsonl(&self, schema:&str, text:&str) -> Result<(usize,usize)>`(imported, skipped;Merge=已存在取 max(count)/max(last_used);单写事务)
 
-- [ ] **Step 1: 写失败测试**
+- [x] **Step 1: 写失败测试**
 
 `temp_words.rs` tests 追加:
 
@@ -120,12 +120,12 @@ fn freq_jsonl_roundtrip_merge_max() {
 
 (freq.rs 的 tests 模块若无 `tmp` 辅助,按 user_words.rs 的 `tmp(name)` 同款补一份。)
 
-- [ ] **Step 2: 跑测试确认失败**
+- [x] **Step 2: 跑测试确认失败**
 
 Run: `cd wind_input && cargo test -p wind-store temp_words::tests::temp_words_wdict freq::tests::freq_jsonl`
 Expected: 编译错误,新方法未定义。
 
-- [ ] **Step 3: 实现**
+- [x] **Step 3: 实现**
 
 `temp_words.rs` 的 `impl Store` 追加(文件顶部补 `use crate::wdict;`;若已有 USER 词的 use 则并入):
 
@@ -251,12 +251,12 @@ Expected: 编译错误,新方法未定义。
     }
 ```
 
-- [ ] **Step 4: 跑测试确认通过(含既有回归)**
+- [x] **Step 4: 跑测试确认通过(含既有回归)**
 
 Run: `cd wind_input && cargo test -p wind-store temp_words freq`
 Expected: PASS。
 
-- [ ] **Step 5: 格式化并提交**
+- [x] **Step 5: 格式化并提交**
 
 ```bash
 cd wind_input && cargo fmt -p wind-store
@@ -285,7 +285,7 @@ git commit -m "feat(store): 临时词 wdict/词频 jsonl 导出导入 + clear_te
   - `Store::list_data_schemas(&self) -> Result<Vec<String>>`(扫 USER_WORDS/TEMP_WORDS/FREQ/SHADOW 四表,distinct schema 前缀,排序)
   - `Store::clear_user_phrases(&self) -> Result<usize>`(删全部非 system 短语)
 
-- [ ] **Step 1: 写失败测试**
+- [x] **Step 1: 写失败测试**
 
 `shadow.rs` tests 追加:
 
@@ -393,12 +393,12 @@ fn stats_jsonl_roundtrip_skip_existing() {
 
 > 注:`SystemPhrase` 字段与 `add_phrase` 参数以 phrases.rs 实况签名为准微调(测试意图:一条系统短语 + 一条用户短语,clear 后只剩系统)。
 
-- [ ] **Step 2: 跑测试确认失败**
+- [x] **Step 2: 跑测试确认失败**
 
 Run: `cd wind_input && cargo test -p wind-store shadow_jsonl stats_jsonl list_data_schemas clear_user_phrases`
 Expected: 编译错误,新方法未定义。
 
-- [ ] **Step 3: 实现**
+- [x] **Step 3: 实现**
 
 `shadow.rs` 的 `impl Store` 追加:
 
@@ -570,12 +570,12 @@ Expected: 编译错误,新方法未定义。
     }
 ```
 
-- [ ] **Step 4: 跑测试确认通过(全 crate 回归)**
+- [x] **Step 4: 跑测试确认通过(全 crate 回归)**
 
 Run: `cd wind_input && cargo test -p wind-store`
 Expected: PASS 全绿。
 
-- [ ] **Step 5: 格式化并提交**
+- [x] **Step 5: 格式化并提交**
 
 ```bash
 cd wind_input && cargo fmt -p wind-store
@@ -603,7 +603,7 @@ git commit -m "feat(store): shadow/stats jsonl 导出导入 + list_data_schemas 
     - `pub struct BackupResult { pub path: PathBuf, pub entries: Vec<String> }`
     - `pub fn create_backup(store: &wind_store::store::Store, src: &BackupSources, out_path: &Path, app_version: &str, platform: &str, created_at: &str, opts: &BackupOptions) -> anyhow::Result<BackupResult>`(schema 清单内部取 `store.list_data_schemas()`)
 
-- [ ] **Step 1: 守卫下沉(先改不新增行为,既有测试守护)**
+- [x] **Step 1: 守卫下沉(先改不新增行为,既有测试守护)**
 
 bundle.rs 追加:
 
@@ -643,7 +643,7 @@ fn entry_rel(name: &str) -> anyhow::Result<&str> {
 Run: `cd wind_input && cargo test -p wind-transfer scheme bundle`
 Expected: 全部既有测试(含穿越用例)仍绿——守卫语义零变化的证明。
 
-- [ ] **Step 2: 写 backup 导出失败测试**
+- [x] **Step 2: 写 backup 导出失败测试**
 
 `lib.rs` 追加 `pub mod backup;`。创建 `backup.rs`,tests:
 
@@ -739,12 +739,12 @@ mod tests {
 
 > 注:`add_phrase` 参数序以 phrases.rs 实况为准;seed 里的调用若签名不符,按实况微调(意图:各表各有一条数据)。
 
-- [ ] **Step 3: 跑测试确认失败**
+- [x] **Step 3: 跑测试确认失败**
 
 Run: `cd wind_input && cargo test -p wind-transfer backup`
 Expected: 编译错误,`create_backup` 等未定义。
 
-- [ ] **Step 4: 实现导出侧**
+- [x] **Step 4: 实现导出侧**
 
 `backup.rs` 顶部(tests 之上):
 
@@ -882,12 +882,12 @@ pub fn create_backup(
 
 (闭包借用 `entries` 与 `w` 若打架,改为普通函数或直接内联三行——以编译通过的最小调整为准,语义不变。)
 
-- [ ] **Step 5: 跑测试确认通过**
+- [x] **Step 5: 跑测试确认通过**
 
 Run: `cd wind_input && cargo test -p wind-transfer`
 Expected: PASS(backup 2 个 + 既有全部)。
 
-- [ ] **Step 6: 格式化并提交**
+- [x] **Step 6: 格式化并提交**
 
 ```bash
 cd wind_input && cargo fmt -p wind-transfer
@@ -910,7 +910,7 @@ git commit -m "feat(transfer): 穿越守卫下沉共享 + 整机备份导出"
   - `pub fn restore_backup(package: &Path, store: &Store, targets: &RestoreTargets, strategy: crate::merge::Strategy, sections: Option<&[String]>) -> anyhow::Result<RestoreResult>`
   - type→section 映射函数 `fn section_of(ty: &str) -> &str`(schema_file→schemas、theme_file→themes、stats_meta→stats,其余原名)
 
-- [ ] **Step 1: 写失败测试**
+- [x] **Step 1: 写失败测试**
 
 `backup.rs` tests 追加:
 
@@ -1013,12 +1013,12 @@ git commit -m "feat(transfer): 穿越守卫下沉共享 + 整机备份导出"
     }
 ```
 
-- [ ] **Step 2: 跑测试确认失败**
+- [x] **Step 2: 跑测试确认失败**
 
 Run: `cd wind_input && cargo test -p wind-transfer backup::tests::restore`
 Expected: 编译错误,`restore_backup` 未定义。
 
-- [ ] **Step 3: 实现还原侧**
+- [x] **Step 3: 实现还原侧**
 
 `backup.rs` 追加(create_backup 之后、tests 之前):
 
@@ -1205,12 +1205,12 @@ pub fn restore_backup(
 
 (`wind_store::stats::StatsMeta` 的模块路径以实况为准——若 stats.rs 类型从 crate 根 re-export 则用相应路径。)
 
-- [ ] **Step 4: 跑测试确认通过**
+- [x] **Step 4: 跑测试确认通过**
 
 Run: `cd wind_input && cargo test -p wind-transfer`
 Expected: PASS(backup 5 个 + 既有全部)。
 
-- [ ] **Step 5: 格式化并提交**
+- [x] **Step 5: 格式化并提交**
 
 ```bash
 cd wind_input && cargo fmt -p wind-transfer
@@ -1233,7 +1233,7 @@ git commit -m "feat(transfer): 整机备份还原(sections 过滤 + Merge/Replac
   - `backup.inspect {path}` → `{manifest}`
   - `backup.restore {path, strategy?, sections?}` → `{restored, conflicts, schemasTouched}`
 
-- [ ] **Step 1: 写失败契约测试**
+- [x] **Step 1: 写失败契约测试**
 
 `webdata.rs` tests 追加(happy path 的 create/restore 会读写真实用户目录,契约测试只走 store 数据域为主的临时环境 + 错误路径;文件域 happy path 由 wind-transfer 单测覆盖):
 
@@ -1292,12 +1292,12 @@ fn backup_rpc_contract() {
 
 > 注:`backup.create` 会读取真实 `Config::user_config_dir()` 下的 config/schemas/themes(只读),并把 store 数据域(临时 redb)入包——安全。`backup.restore` 限定 `sections:["dict"]` 只写临时 store。
 
-- [ ] **Step 2: 跑测试确认失败**
+- [x] **Step 2: 跑测试确认失败**
 
 Run: `cd wind_input && cargo test -p wind-coordinator backup_rpc -- --nocapture`
 Expected: FAIL,`unknown method: backup.create`。
 
-- [ ] **Step 3: 实现 dispatch 与 handlers**
+- [x] **Step 3: 实现 dispatch 与 handlers**
 
 dispatch 中 `"scheme.previewImport"` 分支之后追加:
 
@@ -1416,16 +1416,16 @@ handlers 区追加(紧邻 scheme handlers 之后;复用 P3 的 `Self::user_schem
 
 (`reload_user_config`/`rebuild_phrases` 为同 crate `impl Coordinator` 方法可直接调;若签名带返回值,忽略即可。)
 
-- [ ] **Step 4: 跑测试确认通过(含既有 webdata 回归)**
+- [x] **Step 4: 跑测试确认通过(含既有 webdata 回归)**
 
 Run: `cd wind_input && cargo test -p wind-coordinator webdata`
 Expected: PASS。
 
-- [ ] **Step 5: 设计文档布局更新**
+- [x] **Step 5: 设计文档布局更新**
 
 `docs/design/import-export-backup-design.md` 的「整机备份 `.zip`(kind=backup)」布局代码块替换为 Global Constraints 中的实际布局(多方案子目录化),并在该小节末尾追加:`用户数据按方案拆分子目录(userdata/user_words/<schema>.wdict 等),manifest 条目以 type+meta.schema 标注归属;stats_meta 随 include_stats 一并导出。backup 域无独立 preview,由 backup.inspect(manifest 清单)承担还原前概览。`
 
-- [ ] **Step 6: 格式化并提交**
+- [x] **Step 6: 格式化并提交**
 
 ```bash
 cd wind_input && cargo fmt -p wind-coordinator
@@ -1437,9 +1437,9 @@ git commit -m "feat(rpc): backup.create/inspect/restore 整机备份三件套"
 
 ## P4 收尾验证
 
-- [ ] `cd wind_input && cargo test -p wind-store -p wind-transfer -p wind-coordinator` 全绿。
-- [ ] `cd wind_input && cargo build` 成功。
-- [ ] `cd wind_input && cargo fmt -p wind-store -p wind-transfer -p wind-coordinator -- --check` 干净(不含既有漂移文件)。
+- [x] `cd wind_input && cargo test -p wind-store -p wind-transfer -p wind-coordinator` 全绿。
+- [x] `cd wind_input && cargo build` 成功。
+- [x] `cd wind_input && cargo fmt -p wind-store -p wind-transfer -p wind-coordinator -- --check` 干净(不含既有漂移文件)。
 
 ## P4 交付物
 
