@@ -126,3 +126,19 @@ log_level = "debug"   # 或 "trace"
   `cargo test -p <crate>` 运行；**`wind-coordinator` 传递依赖 `windows` crate，不能在 host 跑测试**
   （其纯逻辑单测如 `keymap` 仅交叉编译期编译，靠设备/CI 验证）。
 - 部署调试版到 Windows：`scripts/dev.sh push debug`（配置见 `scripts/deploy.local`）。
+
+## Agent skills
+
+> 供 Matt Pocock 系列工程技能（`to-tickets` / `triage` / `to-spec` / `qa` / `wayfinder` 等）读取的仓级约定。改动这些约定改对应 `docs/agents/*.md`，无需重跑安装技能。
+
+### Issue tracker
+
+本地 markdown：issue 与 spec 存于 `.scratch/<feature>/`（一 feature 一目录，`issues/NN-<slug>.md` 一票一文件）。详见 `docs/agents/issue-tracker.md`。
+
+### Triage labels
+
+五个规范角色标签，标签名与角色名一致（`needs-triage` / `needs-info` / `ready-for-agent` / `ready-for-human` / `wontfix`），本地追踪器下写作 issue 文件顶部的 `Status:` 行。详见 `docs/agents/triage-labels.md`。
+
+### Domain docs
+
+单上下文：根 `CONTEXT.md` + `docs/adr/`（均按需惰性生成，缺失时静默跳过）；本仓另有 `AGENTS.md` 与 `docs/architecture/` 作为现状架构文档。详见 `docs/agents/domain.md`。
