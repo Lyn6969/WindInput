@@ -1952,9 +1952,13 @@ impl Coordinator {
             .iter()
             .enumerate()
             .map(|(i, c)| {
-                // 反查提示用完整文本（截断只影响显示，不影响"如何输入"提示）
                 let full = self.maybe_s2t(state, &c.text);
-                let mut tooltip = self.reverse.tooltip_for(&full, &tip_opts);
+                // 显示截断（超长加 …）：短语与普通候选统一按用户可配的 ui.candidate.max_chars。
+                // 短语 text 在生成层已存完整原文（仅一行化），此处仅裁显示——上屏仍用完整原文。
+                let disp = cand_cfg.truncate_display(&full);
+                // 反查提示按截断后文本生成：超长候选（如长短语）逐字反查会撑爆气泡且显示不全，
+                // 只提示实际显示出的字（… 为非 CJK，tooltip_for 自动滤除，不影响反查内容）。
+                let mut tooltip = self.reverse.tooltip_for(&disp, &tip_opts);
                 // 调试段：独立一行 [调试] + 来源/方案/编码/权重/序/词频。全关时不再兜底回填编码
                 // （tooltip 各 provider 全关即真正为空，不显示气泡）。
                 if let Some(ctx) = &dbg_ctx {
@@ -1965,15 +1969,11 @@ impl Coordinator {
                     tooltip.push_str(&dbg);
                 }
                 CandidateItem {
-                    // 开启简繁时显示也转繁体（内部候选仍存简体，用于词频/匹配）；按 max_chars 截断显示。
                     // 命令候选加前缀标注（截断后再加,保证前缀不被截掉）。
-                    text: {
-                        let disp = cand_cfg.truncate_display(&full);
-                        if c.is_command && !cmd_prefix.is_empty() {
-                            format!("{cmd_prefix}{disp}")
-                        } else {
-                            disp
-                        }
+                    text: if c.is_command && !cmd_prefix.is_empty() {
+                        format!("{cmd_prefix}{disp}")
+                    } else {
+                        disp
                     },
                     code: c.code.clone(),
                     label: if alpha {

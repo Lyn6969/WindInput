@@ -68,7 +68,6 @@
 | `features.cmdbar.enabled` | `input.cmdbar.enabled` |
 | `features.cmdbar.candidate_prefix` | `input.cmdbar.candidate_prefix` |
 | `input.phrase.min_prefix_length` | `input.phrase.min_prefix` |
-| `input.phrase.max_display_chars` | `input.phrase.max_display_chars` |
 
 ## keys（20，扁平；overflow 保留一层因是真·分组配置）
 

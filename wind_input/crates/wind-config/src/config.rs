@@ -1358,7 +1358,8 @@ impl UiCandidateConfig {
         self.index_labels.chars().nth(i).map(|c| c.to_string())
     }
 
-    /// 按 max_chars 截断候选显示文本（0=不限）。超出时截断（不加省略号，对齐 Go）。
+    /// 按 max_chars 截断候选显示文本（0=不限）。超出时截断并加省略号 `…`
+    /// 提示"过长"（仅影响显示；上屏用完整原文，见 coordinator 候选下发）。
     pub fn truncate_display(&self, text: &str) -> String {
         if self.max_chars == 0 {
             return text.to_string();
@@ -1367,7 +1368,8 @@ impl UiCandidateConfig {
         if chars.len() <= self.max_chars {
             text.to_string()
         } else {
-            chars[..self.max_chars].iter().collect()
+            let head: String = chars[..self.max_chars].iter().collect();
+            format!("{head}…")
         }
     }
 }
@@ -1457,26 +1459,18 @@ pub struct PhraseConfig {
     /// 触发前缀导航列举的最小输入长度（原 min_prefix_length）。默认 2。
     #[serde(default = "default_phrase_min_prefix")]
     pub min_prefix: usize,
-    /// 短语/命令候选显示文本的最大字符数（超出截断加省略号）。0 表示不限制。默认 30。
-    #[serde(default = "default_phrase_max_display_chars")]
-    pub max_display_chars: usize,
 }
 
 impl Default for PhraseConfig {
     fn default() -> Self {
         Self {
             min_prefix: default_phrase_min_prefix(),
-            max_display_chars: default_phrase_max_display_chars(),
         }
     }
 }
 
 fn default_phrase_min_prefix() -> usize {
     2
-}
-
-fn default_phrase_max_display_chars() -> usize {
-    30
 }
 
 // ───────────────────────── stats（统计）─────────────────────────
@@ -2000,8 +1994,8 @@ mod tests {
         assert_eq!(c.index_label(9), "10", "槽位不足回退数字");
         assert_eq!(
             c.truncate_display("一二三四五六"),
-            "一二三四",
-            "截断到 4 字"
+            "一二三四…",
+            "截断到 4 字并加省略号"
         );
         assert_eq!(c.truncate_display("一二"), "一二", "不足不截");
     }

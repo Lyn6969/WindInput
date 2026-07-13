@@ -146,7 +146,6 @@ candidate_prefix = "⚡"
 # 短语前缀列举（原 [dict.phrase]）
 [input.phrase]
 min_prefix = 2
-max_display_chars = 30
 
 [keys]
 toggle_mode_keys = ["lshift", "rshift"]

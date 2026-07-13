@@ -168,7 +168,6 @@ static REGISTRY: &[ConfigField] = &[
     f("input.cmdbar.candidate_prefix", Str),
     // 短语前缀列举（原 dict.phrase）
     f("input.phrase.min_prefix", Int),
-    f("input.phrase.max_display_chars", Int),
     // 顶码上屏策略
     f(
         "input.top_commit_mode",

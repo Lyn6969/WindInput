@@ -335,7 +335,6 @@ impl Coordinator {
         let phrases = self.phrases.read().unwrap_or_else(|e| e.into_inner());
         if !phrases.is_empty() {
             let recent = self.recent_commits_snapshot();
-            let max_disp = self.rt().config.input.phrase.max_display_chars;
             // 剪贴板读取回调注入 wind-phrase（其不依赖平台 UI 层）：精确码命令 display
             // 含 {clip()}（如 coad）时按需读取；非 windows 返回空。
             let clip = |_n: i64| -> String {
@@ -352,7 +351,9 @@ impl Coordinator {
                 let is_command = hit.command_src.is_some();
                 let is_system = hit.is_system;
                 candidates.push(Candidate {
-                    text: Self::clamp_candidate_display(&hit.text, max_disp),
+                    // text 存完整原文（仅一行化，不截断）——上屏须用原始文本，超长省略号截断
+                    // 移到 UI 下发层（见 coordinator 候选映射）。传 0 表示不限长度。
+                    text: Self::clamp_candidate_display(&hit.text, 0),
                     weight: PHRASE_WEIGHT_BASE + hit.weight,
                     is_phrase: true,
                     // $CC 命令短语：标记 is_command，phrase_template 暂存命令源；
@@ -389,7 +390,8 @@ impl Coordinator {
                 Vec::new()
             };
             for hit in prefix_hits {
-                let text = Self::clamp_candidate_display(&hit.text, max_disp);
+                // 完整原文（仅一行化，不截断）：上屏用原始文本，截断加省略号由 UI 下发层负责。
+                let text = Self::clamp_candidate_display(&hit.text, 0);
                 let is_system = hit.is_system;
                 let phrase_meta = || CandidateMeta {
                     is_system_phrase: is_system,
@@ -757,8 +759,9 @@ impl Coordinator {
     /// 部分匹配（候选只消费缓冲前缀）：把汉字并入 `committed_text` 前缀、裁剪缓冲、重转剩余，
     /// **留在组合区不上屏到应用**，返回 UpdateComposition。
     /// 完整匹配（消费整串）：整体上屏 `committed_text + 候选` 到应用，触发自动造词（L），清空。
-    /// 规整短语/命令候选显示文本：换行/制表 → 空格（杜绝多行候选），超长截断加省略号。
-    /// `max` 为最大字符数（`input.phrase.max_display_chars`），0 表示不限制。
+    /// 规整候选显示文本：换行/制表 → 空格（杜绝多行候选），`max`>0 时超长截断加省略号。
+    /// 短语生成层以 `max=0` 调用（仅一行化、不截断，`text` 存完整原文供上屏）；
+    /// 显示层长度截断由 `UiCandidateConfig::truncate_display`（`ui.candidate.max_chars`）负责。
     pub(crate) fn clamp_candidate_display(s: &str, max: usize) -> String {
         let one_line: String = s
             .chars()
