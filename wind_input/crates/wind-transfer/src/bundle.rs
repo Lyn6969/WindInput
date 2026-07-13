@@ -16,7 +16,8 @@ pub enum BundleKind {
 pub struct ContentEntry {
     pub r#type: String,
     pub path: String,
-    #[serde(default)]
+    // TOML 无 null:Null 序列化时省略;反序列化缺省回落 Null(serde_json::Value 的默认值)。
+    #[serde(default, skip_serializing_if = "serde_json::Value::is_null")]
     pub meta: serde_json::Value,
 }
 
@@ -61,7 +62,7 @@ impl Manifest {
     }
 }
 
-const MANIFEST_NAME: &str = "manifest.json";
+const MANIFEST_NAME: &str = "manifest.toml";
 
 pub struct BundleWriter {
     writer: zip::ZipWriter<std::fs::File>,
@@ -113,12 +114,12 @@ impl BundleWriter {
         });
     }
 
-    /// 收尾:写入 manifest.json 并关闭。
+    /// 收尾:写入 manifest.toml 并关闭。
     pub fn finish(mut self) -> anyhow::Result<()> {
-        let json = serde_json::to_vec_pretty(&self.manifest)?;
+        let text = toml::to_string_pretty(&self.manifest)?;
         self.writer
             .start_file(MANIFEST_NAME, zip::write::SimpleFileOptions::default())?;
-        self.writer.write_all(&json)?;
+        self.writer.write_all(text.as_bytes())?;
         self.writer.finish()?;
         Ok(())
     }
@@ -144,7 +145,7 @@ pub fn validate_entry_rel<'a>(name: &'a str, required_prefix: &str) -> anyhow::R
     Ok(rel)
 }
 
-/// 免全解压读取并校验 manifest.json。
+/// 免全解压读取并校验 manifest.toml。
 pub fn read_manifest(path: &Path) -> anyhow::Result<Manifest> {
     let file = std::fs::File::open(path)?;
     let mut archive = zip::ZipArchive::new(file)?;
@@ -153,7 +154,7 @@ pub fn read_manifest(path: &Path) -> anyhow::Result<Manifest> {
         .map_err(|_| anyhow::anyhow!("归档缺少 {}", MANIFEST_NAME))?;
     let mut buf = String::new();
     entry.read_to_string(&mut buf)?;
-    let manifest: Manifest = serde_json::from_str(&buf)?;
+    let manifest: Manifest = toml::from_str(&buf)?;
     manifest.validate()?;
     Ok(manifest)
 }
@@ -230,14 +231,14 @@ mod tests {
     fn read_manifest_rejects_bad_bundle() {
         let dir = tempfile::tempdir().unwrap();
         let bad = dir.path().join("bad.zip");
-        // 手写一个不含 manifest.json 的 zip
+        // 手写一个不含 manifest.toml 的 zip
         let mut w = zip::ZipWriter::new(std::fs::File::create(&bad).unwrap());
         w.start_file("foo.txt", zip::write::SimpleFileOptions::default())
             .unwrap();
         use std::io::Write;
         w.write_all(b"x").unwrap();
         w.finish().unwrap();
-        assert!(read_manifest(&bad).is_err(), "缺 manifest.json 应报错");
+        assert!(read_manifest(&bad).is_err(), "缺 manifest.toml 应报错");
     }
 
     #[test]

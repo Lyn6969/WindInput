@@ -49,48 +49,67 @@ Go 版 WindInput 提供三类数据流转能力:方案的导入导出、用户�
 | 方案包导入导出 | ✅ | ✅(导入) | ✅ |
 | 整机备份/还原 | ✅ | ✅(还原) | ✅ |
 
-## Bundle 归档格式
+## 归档格式
 
-### manifest.json(方案包与备份共用)
+### manifest.toml(整机备份用;方案包 v2 不再走 Bundle 层)
 
-```json
-{
-  "format": "windinput-bundle",
-  "kind": "scheme",
-  "spec_version": 1,
-  "app_version": "x.y.z",
-  "platform": "windows",
-  "created_at": "2026-07-11T21:00:00+08:00",
-  "contents": [
-    { "type": "schema", "path": "schema/wubi86.schema.toml", "meta": { "id": "wubi86" } }
-  ]
-}
+```toml
+format = "windinput-bundle"
+kind = "backup"
+spec_version = 1
+app_version = "x.y.z"
+platform = "windows"
+created_at = "2026-07-13T21:00:00+08:00"
+
+[[contents]]
+type = "dict"
+path = "userdata/user_words/wubi86.wdict"
+[contents.meta]
+schema = "wubi86"
 ```
 
-- `kind`: `"scheme"` | `"backup"`。
+- 原 JSON 清单已统一为 TOML;条目 meta 为 null 时省略(TOML 无 null)。
 - `spec_version`: 归档格式版本(当前 1)。还原时更高版本 → 拒绝并提示升级;更低版本 → 按迁移规则读(首版仅 1)。
 - `platform`: 来源平台(`"windows"` | `"darwin"`)。还原到不同平台时,对平台专属项(热键、`app_rules` 路径)由 UI 依据 manifest 提示;核心首版整体导入 + 标注,不做自动转换。
-- `contents`: 内容清单,供 `*.inspect`/`*.previewImport` 免解压概览。
+- `contents`: 内容清单,供 `backup.inspect` 免解压概览。
 
-### 方案包 `.zip`(kind=scheme)
+### 方案包 `.zip`(v2 简化格式)
 
-不含个人用户词/词频。布局:
+不含个人用户词/词频。zip 条目名 = schemas 根相对路径(零目录前缀),导入零改写:
 
 ```
-manifest.json
-schemas/<id>.schema.toml
-schemas/<引用资源,保留 schemas 根相对路径,如 wubi86/xx.dict.yaml>
-schemas/shuangpin/<布局>.toml     (若引用自定义双拼布局)
+package.toml                      可选元信息(导出恒写;导入不强制——兼容手工打包)
+<id>.schema.toml                  方案文件(根条目,识别方案 id 的依据)
+<引用资源,如 wubi86/xx.dict.yaml>
+shuangpin/<布局>.toml             (若引用自定义双拼布局)
 ```
 
-- 资源收集:解析 `schema.toml` 中对码表、词典、双拼布局、拆字表、字体等的引用路径,凡指向用户目录(非系统 `data/`)的文件一并纳入;指向系统种子的引用只记路径不打包(导入端若缺失再提示)。zip 内条目保留 schemas 根相对路径(而非按类型重排目录),使 schema.toml 的相对引用免改写、导入即用;系统种子引用与缺失文件以 manifest 的 system_ref/missing 条目记录。
+`package.toml`(TOML):
+
+```toml
+[package]
+app_version = "x.y.z"
+platform = "windows"
+created_at = "2026-07-13T21:00:00+08:00"
+
+[schema]
+id = "wubi86"
+version = "1.2"          # 取自根 schema.toml,未标注则空
+
+[refs]
+system = ["wubi86/wubi86_jidian.dict.yaml"]   # 系统种子引用,不打包
+missing = []                                   # 导出时即缺失的引用
+```
+
+- 资源收集:解析 `schema.toml` 中对码表、词典、双拼布局、拆字表、字体等的引用路径,凡指向用户目录(非系统 `data/`)的文件一并纳入;指向系统种子的引用只记路径不打包(导入端若缺失再提示)。zip 内条目保留 schemas 根相对路径,使 schema.toml 的相对引用免改写、导入即用。
+- 导入识别:根下 `*.schema.toml` 即方案(无 package.toml 也可导入);根下无任何 schema.toml → 拒绝;含 `manifest.toml`/`manifest.json` → 提示误选了备份包/旧格式归档。
 
 ### 整机备份 `.zip`(kind=backup)
 
 逐表文本承载用户数据。布局:
 
 ```
-manifest.json
+manifest.toml
 config/config.toml                     type="config"
 userdata/user_words/<schema>.wdict     type="dict"       meta={"schema"}
 userdata/temp_words/<schema>.wdict     type="temp"       meta={"schema"}
@@ -105,7 +124,7 @@ state/state.toml                       type="state"      (include_state)
 ```
 
 - **排除**:`cache/`、`logs/`(可重建/无价值);`state.toml`(本机相关,默认排除,`includeState` 可选包含)。
-- 用户方案与主题复用方案包的 `schema/` 布局与主题目录结构。
+- 用户方案与主题按整目录树打包(`schemas/`、`themes/` 前缀;与方案包 v2 的零前缀布局无关)。
 - 用户数据按方案拆分子目录(`userdata/user_words/<schema>.wdict` 等),manifest 条目以 type+meta.schema 标注归属;stats_meta 随 include_stats 一并导出。backup 域无独立 preview,由 `backup.inspect`(manifest 清单)承担还原前概览。
 
 ## 合并引擎(所有导入统一)
@@ -131,7 +150,7 @@ state/state.toml                       type="state"      (include_state)
 | | `dict.previewImport` | `{schemaId, content}` | `{willAdd, willUpdate, willConflict, unchanged, samples}` |
 | 方案 | `scheme.exportPackage` | `{id, path}` | `{path}` |
 | | `scheme.importPackage` | `{path, strategy}` | `{imported, conflicts}` |
-| | `scheme.previewImport` | `{path}` | `{manifest, willConflict, ...}` |
+| | `scheme.previewImport` | `{path}` | `{package, willAdd, conflicts, systemRefs, missing}` |
 | 备份 | `backup.create` | `{path, includeStats?, includeState?}` | `{path, manifest}` |
 | | `backup.inspect` | `{path}` | `{manifest}` |
 | | `backup.restore` | `{path, strategy, sections?}` | `{restored, conflicts}` |

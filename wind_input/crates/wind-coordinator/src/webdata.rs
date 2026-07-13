@@ -640,7 +640,8 @@ impl Coordinator {
         let user = Self::user_schemas_dir()?;
         let p = wind_transfer::scheme::preview_import(std::path::Path::new(path), &user)?;
         Ok(json!({
-            "manifest": serde_json::to_value(&p.manifest)?,
+            // v2:包元信息来自可选 package.toml(缺失时各字段为空串,前端显示"未知")。
+            "package": serde_json::to_value(&p.meta)?,
             "willAdd": p.will_add,
             "conflicts": p.conflicts,
             "systemRefs": p.system_refs,
@@ -2746,7 +2747,14 @@ mod tests {
                 &json!({ "path": pkg.to_string_lossy() }),
             )
             .unwrap();
-        assert!(prev.get("manifest").is_some());
+        assert_eq!(
+            prev.get("package")
+                .and_then(|p| p.get("schema"))
+                .and_then(|s| s.get("id"))
+                .and_then(|v| v.as_str()),
+            Some("my"),
+            "v2 预览返回 package 元信息"
+        );
         assert!(prev.get("willAdd").and_then(|v| v.as_array()).is_some());
         assert!(prev.get("conflicts").and_then(|v| v.as_array()).is_some());
         let _ = std::fs::remove_dir_all(&t);

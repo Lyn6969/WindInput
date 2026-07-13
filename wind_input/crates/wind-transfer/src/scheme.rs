@@ -1,16 +1,70 @@
-//! 方案包(scheme package)导出/导入:方案 .schema.toml + 引用资源打包为自描述 zip。
-//! 路径规则:zip 条目名 = "schemas/" + schemas 根相对路径,导入零改写。
-//! 三分类:用户目录命中→打包;系统目录命中→system_ref(只记引用);均无→missing。
-use crate::bundle::{BundleKind, BundleWriter, Manifest};
+//! 方案包(scheme package)导出/导入 —— v2 简化格式。
+//!
+//! zip 条目名 = schemas 根相对路径(无目录前缀),导入零改写:
+//! ```text
+//! package.toml        可选元信息(TOML;导出恒写,导入不强制——兼容手工打包)
+//! my.schema.toml      方案文件(根条目,识别方案 id 的依据)
+//! my/main.dict.yaml   引用资源
+//! ```
+//! 三分类:用户目录命中→打包;系统目录命中→记 system 引用;均无→记 missing。
+//! 不再使用 bundle 层 manifest(方案文件自身已含 id/版本等大部分信息)。
 use std::collections::HashSet;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 
-/// 收集计划:待打包文件(zip 名, 源绝对路径)、系统引用、缺失、涉及的方案 id(根在前)。
+use serde::{Deserialize, Serialize};
+
+/// 包内元信息文件名(可选条目)。
+pub const PACKAGE_META_NAME: &str = "package.toml";
+
+/// 方案包元信息(package.toml)。全部字段可缺省——导入端拿不到就显示"未知"。
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct PackageMeta {
+    #[serde(default)]
+    pub package: PackageInfo,
+    #[serde(default)]
+    pub schema: PackageSchemaInfo,
+    #[serde(default)]
+    pub refs: PackageRefs,
+}
+
+/// 导出环境信息。
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct PackageInfo {
+    #[serde(default)]
+    pub app_version: String,
+    #[serde(default)]
+    pub platform: String,
+    #[serde(default)]
+    pub created_at: String,
+}
+
+/// 根方案标识(与 zip 内 .schema.toml 冗余,便于免解压显示)。
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct PackageSchemaInfo {
+    #[serde(default)]
+    pub id: String,
+    #[serde(default)]
+    pub version: String,
+}
+
+/// 引用清单:系统种子引用(不打包)与导出时即缺失的引用。
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct PackageRefs {
+    #[serde(default)]
+    pub system: Vec<String>,
+    #[serde(default)]
+    pub missing: Vec<String>,
+}
+
+/// 收集计划:待打包文件(schemas 相对路径, 源绝对路径)、系统引用、缺失、
+/// 涉及的方案 id(根在前)、根方案版本(schema.toml 未标注则空)。
 pub struct CollectPlan {
     pub pack: Vec<(String, PathBuf)>,
     pub system_refs: Vec<String>,
     pub missing: Vec<String>,
     pub schema_ids: Vec<String>,
+    pub root_version: String,
 }
 
 /// 单个相对路径的三分类结果。
@@ -70,6 +124,7 @@ pub fn collect_package_files(
         system_refs: Vec::new(),
         missing: Vec::new(),
         schema_ids: Vec::new(),
+        root_version: String::new(),
     };
     let mut visited: HashSet<String> = HashSet::new();
     collect_into(id, true, user_dir, system_dir, &mut plan, &mut visited)?;
@@ -108,15 +163,17 @@ fn collect_into(
         }
     };
     plan.schema_ids.push(id.to_string());
-    plan.pack
-        .push((format!("schemas/{schema_rel}"), schema_abs.clone()));
+    plan.pack.push((schema_rel, schema_abs.clone()));
 
     let text = std::fs::read_to_string(&schema_abs)?;
     let schema: wind_config::schema::Schema = toml::from_str(&text)?;
+    if is_root {
+        plan.root_version = schema.schema.version.clone();
+    }
 
     for rel in resource_rels(&schema) {
         match locate(&rel, user_dir, system_dir) {
-            Located::User(p) => plan.pack.push((format!("schemas/{rel}"), p)),
+            Located::User(p) => plan.pack.push((rel, p)),
             Located::System => plan.system_refs.push(rel),
             Located::Missing => plan.missing.push(rel),
         }
@@ -131,7 +188,7 @@ fn collect_into(
     Ok(())
 }
 
-/// 导出结果(RPC 直接序列化消费)。
+/// 导出结果(RPC 直接序列化消费)。packed 为 schemas 相对路径。
 pub struct SchemeExportResult {
     pub path: PathBuf,
     pub packed: Vec<String>,
@@ -139,7 +196,7 @@ pub struct SchemeExportResult {
     pub missing: Vec<String>,
 }
 
-/// 导出方案包:收集 → 写 zip(schema/resource 载荷条目 + system_ref/missing 引用条目)。
+/// 导出方案包:收集 → 写 zip(package.toml 元信息 + 各文件按 schemas 相对路径直存)。
 pub fn export_package(
     id: &str,
     user_dir: &Path,
@@ -150,28 +207,35 @@ pub fn export_package(
     created_at: &str,
 ) -> anyhow::Result<SchemeExportResult> {
     let plan = collect_package_files(id, user_dir, system_dir)?;
-    let manifest = Manifest::new(BundleKind::Scheme, app_version, platform, created_at);
-    let mut w = BundleWriter::new(out_path, manifest)?;
+    let meta = PackageMeta {
+        package: PackageInfo {
+            app_version: app_version.to_string(),
+            platform: platform.to_string(),
+            created_at: created_at.to_string(),
+        },
+        schema: PackageSchemaInfo {
+            id: id.to_string(),
+            version: plan.root_version.clone(),
+        },
+        refs: PackageRefs {
+            system: plan.system_refs.clone(),
+            missing: plan.missing.clone(),
+        },
+    };
+
+    if let Some(parent) = out_path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let file = std::fs::File::create(out_path)?;
+    let mut w = zip::ZipWriter::new(file);
+    let opts = zip::write::SimpleFileOptions::default();
+    w.start_file(PACKAGE_META_NAME, opts)?;
+    w.write_all(toml::to_string_pretty(&meta)?.as_bytes())?;
     let mut packed = Vec::new();
-    for (name, src) in &plan.pack {
-        let data = std::fs::read(src)?;
-        // .schema.toml 条目带 id 元数据,其余为 resource。
-        let (ty, meta) = if name.ends_with(".schema.toml") {
-            let id = name
-                .trim_start_matches("schemas/")
-                .trim_end_matches(".schema.toml");
-            ("schema", serde_json::json!({ "id": id }))
-        } else {
-            ("resource", serde_json::Value::Null)
-        };
-        w.add_bytes_with(name, &data, ty, meta)?;
-        packed.push(name.clone());
-    }
-    for r in &plan.system_refs {
-        w.add_ref("system_ref", r, serde_json::Value::Null);
-    }
-    for m in &plan.missing {
-        w.add_ref("missing", m, serde_json::Value::Null);
+    for (rel, src) in &plan.pack {
+        w.start_file(rel, opts)?;
+        w.write_all(&std::fs::read(src)?)?;
+        packed.push(rel.clone());
     }
     w.finish()?;
     Ok(SchemeExportResult {
@@ -182,27 +246,54 @@ pub fn export_package(
     })
 }
 
-/// 校验 zip 条目名并转为 schemas 根相对路径:必须 `schemas/` 前缀,
-/// 且所有路径段均为普通段(components 白名单,拦 `..`/绝对/盘符相对如 `C:foo`/UNC/`.`)。
-fn entry_rel(name: &str) -> anyhow::Result<&str> {
-    crate::bundle::validate_entry_rel(name, "schemas/")
-}
-
-/// 从 manifest 取有载荷条目(schema/resource),校验条目名合法性。
-fn payload_entries(manifest: &Manifest) -> anyhow::Result<Vec<(String, String)>> {
-    let mut out = Vec::new();
-    for e in &manifest.contents {
-        if e.r#type == "schema" || e.r#type == "resource" {
-            let rel = entry_rel(&e.path)?;
-            out.push((e.path.clone(), rel.to_string()));
+/// 枚举包内载荷条目(排除 package.toml、目录项),逐条过穿越守卫。
+/// 校验根下至少一个 `*.schema.toml`;对备份包/旧格式给出针对性错误。
+fn list_payload_entries(package: &Path) -> anyhow::Result<Vec<String>> {
+    let file = std::fs::File::open(package)?;
+    let archive = zip::ZipArchive::new(file)?;
+    let mut rels = Vec::new();
+    let mut has_root_schema = false;
+    for name in archive.file_names() {
+        if name == PACKAGE_META_NAME || name.ends_with('/') {
+            continue;
         }
+        if name == "manifest.toml" || name == "manifest.json" {
+            anyhow::bail!("该文件是整机备份包或旧格式归档,不是方案包");
+        }
+        let rel = crate::bundle::validate_entry_rel(name, "")?;
+        if !rel.contains('/') && rel.ends_with(".schema.toml") {
+            has_root_schema = true;
+        }
+        rels.push(rel.to_string());
     }
-    Ok(out)
+    if !has_root_schema {
+        anyhow::bail!("不是有效的方案包(根目录缺少 *.schema.toml)");
+    }
+    rels.sort();
+    Ok(rels)
 }
 
-/// 导入预览(只读):按 manifest 载荷条目对目标目录做存在性检查。
+/// 读取包内可选元信息(缺失/解析失败均回落默认值——导入不强制 package.toml)。
+pub fn read_package_meta(package: &Path) -> PackageMeta {
+    crate::bundle::extract_entry(package, PACKAGE_META_NAME)
+        .ok()
+        .and_then(|bytes| toml::from_str(&String::from_utf8_lossy(&bytes)).ok())
+        .unwrap_or_default()
+}
+
+/// 从条目清单提取方案 id(根下 `*.schema.toml` 的文件名主干)。
+fn schema_ids_of(rels: &[String]) -> Vec<String> {
+    rels.iter()
+        .filter(|r| !r.contains('/'))
+        .filter_map(|r| r.strip_suffix(".schema.toml"))
+        .map(String::from)
+        .collect()
+}
+
+/// 导入预览(只读):按包内条目对目标目录做存在性检查。
+#[derive(Debug)]
 pub struct SchemeImportPreview {
-    pub manifest: Manifest,
+    pub meta: PackageMeta,
     pub will_add: Vec<String>,
     pub conflicts: Vec<String>,
     pub system_refs: Vec<String>,
@@ -210,34 +301,21 @@ pub struct SchemeImportPreview {
 }
 
 pub fn preview_import(package: &Path, user_dir: &Path) -> anyhow::Result<SchemeImportPreview> {
-    let manifest = crate::bundle::read_manifest(package)?;
-    if manifest.kind != BundleKind::Scheme {
-        anyhow::bail!("不是方案包(kind={:?})", manifest.kind);
-    }
-    let entries = payload_entries(&manifest)?;
+    let rels = list_payload_entries(package)?;
+    let meta = read_package_meta(package);
     let mut will_add = Vec::new();
     let mut conflicts = Vec::new();
-    for (name, rel) in &entries {
+    for rel in &rels {
         if user_dir.join(rel).exists() {
-            conflicts.push(name.clone());
+            conflicts.push(rel.clone());
         } else {
-            will_add.push(name.clone());
+            will_add.push(rel.clone());
         }
     }
-    let system_refs = manifest
-        .contents
-        .iter()
-        .filter(|e| e.r#type == "system_ref")
-        .map(|e| e.path.clone())
-        .collect();
-    let missing = manifest
-        .contents
-        .iter()
-        .filter(|e| e.r#type == "missing")
-        .map(|e| e.path.clone())
-        .collect();
+    let system_refs = meta.refs.system.clone();
+    let missing = meta.refs.missing.clone();
     Ok(SchemeImportPreview {
-        manifest,
+        meta,
         will_add,
         conflicts,
         system_refs,
@@ -259,24 +337,20 @@ pub fn import_package(
     user_dir: &Path,
     strategy: crate::merge::Strategy,
 ) -> anyhow::Result<SchemeImportResult> {
-    let manifest = crate::bundle::read_manifest(package)?;
-    if manifest.kind != BundleKind::Scheme {
-        anyhow::bail!("不是方案包(kind={:?})", manifest.kind);
-    }
-    let entries = payload_entries(&manifest)?;
+    let rels = list_payload_entries(package)?;
     // 读取阶段:全部载荷入内存,任何缺条目/坏条目在写盘前失败。
-    let mut staged: Vec<(String, String, Vec<u8>)> = Vec::new(); // (zip名, rel, bytes)
-    for (name, rel) in &entries {
-        let bytes = crate::bundle::extract_entry(package, name)?;
-        staged.push((name.clone(), rel.clone(), bytes));
+    let mut staged: Vec<(String, Vec<u8>)> = Vec::new();
+    for rel in &rels {
+        let bytes = crate::bundle::extract_entry(package, rel)?;
+        staged.push((rel.clone(), bytes));
     }
     // 写入阶段:tmp+rename,Merge 跳过已存在。
     let mut imported = Vec::new();
     let mut conflicts = Vec::new();
-    for (name, rel, bytes) in &staged {
+    for (rel, bytes) in &staged {
         let target = user_dir.join(rel);
         if target.exists() && strategy == crate::merge::Strategy::Merge {
-            conflicts.push(name.clone());
+            conflicts.push(rel.clone());
             continue;
         }
         if let Some(parent) = target.parent() {
@@ -289,18 +363,12 @@ pub fn import_package(
             std::fs::remove_file(&target)?;
         }
         std::fs::rename(&tmp, &target)?;
-        imported.push(name.clone());
+        imported.push(rel.clone());
     }
-    let schema_ids = manifest
-        .contents
-        .iter()
-        .filter(|e| e.r#type == "schema")
-        .filter_map(|e| e.meta.get("id").and_then(|v| v.as_str()).map(String::from))
-        .collect();
     Ok(SchemeImportResult {
         imported,
         conflicts,
-        schema_ids,
+        schema_ids: schema_ids_of(&rels),
     })
 }
 
@@ -318,6 +386,7 @@ mod tests {
             r#"
 [schema]
 id = "my"
+version = "1.2"
 [engine]
 type = "codetable"
 [engine.chaizi]
@@ -337,6 +406,17 @@ path = "my/ghost.dict.yaml"
         // my/ghost.dict.yaml 故意不创建 → missing
     }
 
+    /// 手工写一个 zip(测试守卫/识别用)。
+    fn write_zip(path: &std::path::Path, entries: &[(&str, &[u8])]) {
+        let mut w = zip::ZipWriter::new(std::fs::File::create(path).unwrap());
+        for (name, data) in entries {
+            w.start_file(*name, zip::write::SimpleFileOptions::default())
+                .unwrap();
+            w.write_all(data).unwrap();
+        }
+        w.finish().unwrap();
+    }
+
     #[test]
     fn collect_classifies_pack_ref_missing() {
         let t = tempfile::tempdir().unwrap();
@@ -344,15 +424,13 @@ path = "my/ghost.dict.yaml"
         fixture(&user, &system);
         let plan = collect_package_files("my", &user, Some(&system)).unwrap();
         let names: Vec<&str> = plan.pack.iter().map(|(n, _)| n.as_str()).collect();
-        assert!(
-            names.contains(&"schemas/my.schema.toml"),
-            "根方案文件必打包"
-        );
-        assert!(names.contains(&"schemas/my/main.dict.yaml"));
-        assert!(names.contains(&"schemas/my/chaizi.txt"));
+        assert!(names.contains(&"my.schema.toml"), "根方案文件必打包");
+        assert!(names.contains(&"my/main.dict.yaml"));
+        assert!(names.contains(&"my/chaizi.txt"));
         assert_eq!(plan.system_refs, vec!["sys/shared.dict.yaml"]);
         assert_eq!(plan.missing, vec!["my/ghost.dict.yaml"]);
         assert_eq!(plan.schema_ids, vec!["my"]);
+        assert_eq!(plan.root_version, "1.2", "根方案版本从 schema.toml 提取");
     }
 
     #[test]
@@ -360,8 +438,8 @@ path = "my/ghost.dict.yaml"
         let t = tempfile::tempdir().unwrap();
         let (user, system) = (t.path().join("u"), t.path().join("s"));
         fixture(&user, &system);
-        // mixed 方案引用用户方案 my + 系统方案 pinyin(不存在于两目录 → 系统引用按方案文件算 missing?
-        // 规则:引用方案文件在用户目录→打包递归;在系统目录→system_ref;均无→missing)
+        // mixed 方案引用用户方案 my + 系统方案 pinyin(引用方案文件在用户目录→打包递归;
+        // 在系统目录→system_ref;均无→missing)
         fs::write(
             user.join("mix.schema.toml"),
             r#"
@@ -382,15 +460,9 @@ secondary_schema = "pinyin"
         .unwrap();
         let plan = collect_package_files("mix", &user, Some(&system)).unwrap();
         let names: Vec<&str> = plan.pack.iter().map(|(n, _)| n.as_str()).collect();
-        assert!(names.contains(&"schemas/mix.schema.toml"));
-        assert!(
-            names.contains(&"schemas/my.schema.toml"),
-            "用户引用方案递归打包"
-        );
-        assert!(
-            names.contains(&"schemas/my/main.dict.yaml"),
-            "递归方案的资源也打包"
-        );
+        assert!(names.contains(&"mix.schema.toml"));
+        assert!(names.contains(&"my.schema.toml"), "用户引用方案递归打包");
+        assert!(names.contains(&"my/main.dict.yaml"), "递归方案的资源也打包");
         assert!(
             plan.system_refs.contains(&"pinyin.schema.toml".to_string()),
             "系统引用方案只记引用"
@@ -399,7 +471,7 @@ secondary_schema = "pinyin"
     }
 
     #[test]
-    fn export_package_roundtrip_manifest() {
+    fn export_package_writes_flat_layout_and_meta() {
         let t = tempfile::tempdir().unwrap();
         let (user, system) = (t.path().join("u"), t.path().join("s"));
         fixture(&user, &system);
@@ -409,25 +481,17 @@ secondary_schema = "pinyin"
         assert_eq!(r.packed.len(), 3);
         assert_eq!(r.system_refs.len(), 1);
         assert_eq!(r.missing.len(), 1);
-        let m = crate::bundle::read_manifest(&out).unwrap();
-        assert_eq!(m.kind, crate::bundle::BundleKind::Scheme);
-        assert_eq!(
-            m.contents.iter().filter(|e| e.r#type == "schema").count(),
-            1
-        );
-        assert_eq!(
-            m.contents
-                .iter()
-                .filter(|e| e.r#type == "system_ref")
-                .count(),
-            1
-        );
-        assert_eq!(
-            m.contents.iter().filter(|e| e.r#type == "missing").count(),
-            1
-        );
-        let bytes = crate::bundle::extract_entry(&out, "schemas/my/main.dict.yaml").unwrap();
+        // 零层级布局:条目名即 schemas 相对路径
+        let bytes = crate::bundle::extract_entry(&out, "my/main.dict.yaml").unwrap();
         assert_eq!(bytes, b"d");
+        assert!(crate::bundle::extract_entry(&out, "my.schema.toml").is_ok());
+        // package.toml 元信息完备
+        let meta = read_package_meta(&out);
+        assert_eq!(meta.package.app_version, "1.0.0");
+        assert_eq!(meta.schema.id, "my");
+        assert_eq!(meta.schema.version, "1.2");
+        assert_eq!(meta.refs.system, vec!["sys/shared.dict.yaml"]);
+        assert_eq!(meta.refs.missing, vec!["my/ghost.dict.yaml"]);
     }
 
     #[test]
@@ -444,12 +508,17 @@ secondary_schema = "pinyin"
         assert_eq!(prev.will_add.len(), 3);
         assert!(prev.conflicts.is_empty());
         assert_eq!(prev.system_refs.len(), 1);
+        assert_eq!(prev.meta.schema.id, "my");
 
         let r = import_package(&out, &dest, crate::merge::Strategy::Merge).unwrap();
         assert_eq!(r.imported.len(), 3);
         assert!(r.conflicts.is_empty());
         assert_eq!(r.schema_ids, vec!["my"]);
         assert!(dest.join("my.schema.toml").is_file());
+        assert!(
+            !dest.join(PACKAGE_META_NAME).exists(),
+            "package.toml 是元信息,不落盘"
+        );
         assert_eq!(std::fs::read(dest.join("my/main.dict.yaml")).unwrap(), b"d");
     }
 
@@ -467,11 +536,11 @@ secondary_schema = "pinyin"
 
         // preview 报冲突
         let prev = preview_import(&out, &dest).unwrap();
-        assert_eq!(prev.conflicts, vec!["schemas/my/main.dict.yaml"]);
+        assert_eq!(prev.conflicts, vec!["my/main.dict.yaml"]);
 
         // Merge:跳过已存在,内容保持 OLD
         let r = import_package(&out, &dest, crate::merge::Strategy::Merge).unwrap();
-        assert_eq!(r.conflicts, vec!["schemas/my/main.dict.yaml"]);
+        assert_eq!(r.conflicts, vec!["my/main.dict.yaml"]);
         assert_eq!(r.imported.len(), 2);
         assert_eq!(
             std::fs::read(dest.join("my/main.dict.yaml")).unwrap(),
@@ -486,54 +555,75 @@ secondary_schema = "pinyin"
     }
 
     #[test]
-    fn import_rejects_path_traversal() {
-        // 手工构造带非法条目名的包
+    fn import_without_package_meta_still_works() {
+        // 手工打包(无 package.toml)也能导入——方案文件本身即信息源。
         let t = tempfile::tempdir().unwrap();
-        let bad = t.path().join("bad.zip");
-        let manifest = crate::bundle::Manifest::new(
-            crate::bundle::BundleKind::Scheme,
-            "1.0.0",
-            "windows",
-            "t",
+        let pkg = t.path().join("hand.zip");
+        write_zip(
+            &pkg,
+            &[
+                ("hand.schema.toml", b"[schema]\nid=\"hand\"\n".as_slice()),
+                ("hand/d.dict.yaml", b"d".as_slice()),
+            ],
         );
-        let mut w = crate::bundle::BundleWriter::new(&bad, manifest).unwrap();
-        w.add_bytes_with(
-            "schemas/../evil.toml",
-            b"x",
-            "resource",
-            serde_json::Value::Null,
-        )
-        .unwrap();
-        w.finish().unwrap();
         let dest = t.path().join("dest");
         std::fs::create_dir_all(&dest).unwrap();
-        assert!(preview_import(&bad, &dest).is_err(), "含 .. 条目应拒绝");
-        assert!(
-            import_package(&bad, &dest, crate::merge::Strategy::Merge).is_err(),
-            "导入同样拒绝"
+        let prev = preview_import(&pkg, &dest).unwrap();
+        assert_eq!(prev.will_add.len(), 2);
+        assert!(prev.meta.package.created_at.is_empty(), "无元信息回落默认");
+        let r = import_package(&pkg, &dest, crate::merge::Strategy::Merge).unwrap();
+        assert_eq!(r.schema_ids, vec!["hand"]);
+        assert!(dest.join("hand.schema.toml").is_file());
+    }
+
+    #[test]
+    fn import_rejects_path_traversal_and_wrong_kind() {
+        let t = tempfile::tempdir().unwrap();
+        let dest = t.path().join("dest");
+        std::fs::create_dir_all(&dest).unwrap();
+
+        // 含 .. 条目应拒绝
+        let bad = t.path().join("bad.zip");
+        write_zip(
+            &bad,
+            &[
+                ("my.schema.toml", b"x".as_slice()),
+                ("../evil.toml", b"x".as_slice()),
+            ],
         );
+        assert!(preview_import(&bad, &dest).is_err(), "含 .. 条目应拒绝");
+        assert!(import_package(&bad, &dest, crate::merge::Strategy::Merge).is_err());
 
         // Windows 盘符相对路径(C:foo):is_absolute()==false 但 join 会丢 base,必须拦。
         let bad2 = t.path().join("bad2.zip");
-        let manifest2 = crate::bundle::Manifest::new(
-            crate::bundle::BundleKind::Scheme,
-            "1.0.0",
-            "windows",
-            "t",
+        write_zip(
+            &bad2,
+            &[
+                ("my.schema.toml", b"x".as_slice()),
+                ("C:evil.toml", b"x".as_slice()),
+            ],
         );
-        let mut w2 = crate::bundle::BundleWriter::new(&bad2, manifest2).unwrap();
-        w2.add_bytes_with(
-            "schemas/C:evil.toml",
-            b"x",
-            "resource",
-            serde_json::Value::Null,
-        )
-        .unwrap();
-        w2.finish().unwrap();
         assert!(preview_import(&bad2, &dest).is_err(), "盘符相对路径应拒绝");
-        assert!(
-            import_package(&bad2, &dest, crate::merge::Strategy::Merge).is_err(),
-            "导入同样拒绝"
+        assert!(import_package(&bad2, &dest, crate::merge::Strategy::Merge).is_err());
+
+        // 根下无 *.schema.toml → 不是方案包
+        let notpkg = t.path().join("not.zip");
+        write_zip(&notpkg, &[("readme.txt", b"x".as_slice())]);
+        assert!(preview_import(&notpkg, &dest).is_err());
+
+        // 备份包(含 manifest.toml)→ 针对性报错
+        let backup = t.path().join("backup.zip");
+        write_zip(
+            &backup,
+            &[
+                (
+                    "manifest.toml",
+                    b"format = \"windinput-bundle\"\n".as_slice(),
+                ),
+                ("config/config.toml", b"x".as_slice()),
+            ],
         );
+        let err = preview_import(&backup, &dest).unwrap_err().to_string();
+        assert!(err.contains("备份包"), "误选备份包应有针对性提示: {err}");
     }
 }
