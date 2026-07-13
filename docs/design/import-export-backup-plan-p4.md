@@ -1452,4 +1452,6 @@ git commit -m "feat(rpc): backup.create/inspect/restore 整机备份三件套"
 - 方案导出 override 布局已知限制(P3 遗留,用户已决策)。
 - `web_schema_list` builtin 恒 true。
 - 还原文件域的多文件覆盖回滚。
+- **数据域还原非原子**(P4 审查产出,与上一条文件域回滚是不同的面):restore 逐条目独立事务,多 schema Replace 还原中途失败(如坏 jsonl)会留下"部分域已清已导、当前域已清未导"的中间态且无回滚;若要原子性需把数据域整体包进单个写事务(改造量大)。当前定性为已知限制。
+- restore 循环对确定 no-op 的条目(Merge 下的 stats_meta、目标为 None 的 config/state)仍先解压载荷,属无用 I/O,可把 extract_entry 下推到分支内。
 - 真机验证:备份→还原→重启全链路;跨机还原(平台标注提示)。
