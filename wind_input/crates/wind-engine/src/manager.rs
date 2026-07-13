@@ -901,13 +901,19 @@ impl EngineManager {
             }
             _ => anyhow::bail!("内置方案不可删除: {}", schema_id),
         }
+        self.forget_deleted_schema(schema_id);
+        Ok(true)
+    }
+
+    /// 方案文件已被外部删除(方案包级联删除)后的引擎侧收尾:
+    /// 清 override、移出可用列表、失效解析/引擎缓存。不触碰文件系统里的方案文件。
+    pub fn forget_deleted_schema(&self, schema_id: &str) {
         let _ = self.delete_schema_override(schema_id);
         self.available
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .retain(|s| s != schema_id);
         self.invalidate_schema(schema_id);
-        Ok(true)
     }
 
     /// 使某方案的引擎与解析缓存失效（override/词典变更后，下次构建按新定义重建）。

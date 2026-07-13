@@ -372,6 +372,72 @@ pub fn import_package(
     })
 }
 
+/// 删除结果。rel 均为 schemas 根相对路径。
+pub struct SchemeDeleteResult {
+    /// 实际删除的文件。
+    pub deleted: Vec<String>,
+    /// 因被其它方案共享而保留的文件。
+    pub kept_shared: Vec<String>,
+    /// 方案文件被实际删除的方案 id(根在前;共享保留的子方案不计)。
+    pub schema_ids: Vec<String>,
+}
+
+/// 删除用户方案 —— 镜像导入的收集逻辑:方案文件 + 引用资源 + 递归引用的用户方案。
+/// 被 `keep_ids` 中任一现存方案引用的文件保留(共享检查,如混输共用的子方案/码表);
+/// 系统目录文件永不删;删除后自底向上清理空目录(至 user_dir 止)。
+pub fn delete_package(
+    id: &str,
+    user_dir: &Path,
+    system_dir: Option<&Path>,
+    keep_ids: &[String],
+) -> anyhow::Result<SchemeDeleteResult> {
+    let plan = collect_package_files(id, user_dir, system_dir)?;
+    // 其余现存方案引用的文件集合(单个方案收集失败不阻断删除,跳过即可)。
+    let mut kept: HashSet<String> = HashSet::new();
+    for kid in keep_ids {
+        if kid == id {
+            continue;
+        }
+        if let Ok(p) = collect_package_files(kid, user_dir, system_dir) {
+            kept.extend(p.pack.into_iter().map(|(rel, _)| rel));
+        }
+    }
+    let mut deleted = Vec::new();
+    let mut kept_shared = Vec::new();
+    let mut deleted_rels: HashSet<String> = HashSet::new();
+    for (rel, src) in &plan.pack {
+        if !src.starts_with(user_dir) {
+            continue; // 系统目录文件(如内置根方案)永不删
+        }
+        if kept.contains(rel) {
+            kept_shared.push(rel.clone());
+            continue;
+        }
+        std::fs::remove_file(src)?;
+        deleted_rels.insert(rel.clone());
+        deleted.push(rel.clone());
+        // 自底向上清理空目录(remove_dir 对非空目录失败即停)。
+        let mut dir = src.parent();
+        while let Some(d) = dir {
+            if d == user_dir || std::fs::remove_dir(d).is_err() {
+                break;
+            }
+            dir = d.parent();
+        }
+    }
+    let schema_ids = plan
+        .schema_ids
+        .iter()
+        .filter(|sid| deleted_rels.contains(&format!("{sid}.schema.toml")))
+        .cloned()
+        .collect();
+    Ok(SchemeDeleteResult {
+        deleted,
+        kept_shared,
+        schema_ids,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -574,6 +640,111 @@ secondary_schema = "pinyin"
         let r = import_package(&pkg, &dest, crate::merge::Strategy::Merge).unwrap();
         assert_eq!(r.schema_ids, vec!["hand"]);
         assert!(dest.join("hand.schema.toml").is_file());
+    }
+
+    #[test]
+    fn delete_package_removes_exclusive_keeps_shared() {
+        let t = tempfile::tempdir().unwrap();
+        let (user, system) = (t.path().join("u"), t.path().join("s"));
+        fixture(&user, &system); // my: my/main.dict.yaml + my/chaizi.txt 独享
+        // other 方案与 my 共享一个码表文件
+        fs::create_dir_all(user.join("shared")).unwrap();
+        fs::write(user.join("shared/common.dict.yaml"), "common").unwrap();
+        fs::write(
+            user.join("other.schema.toml"),
+            "[schema]\nid=\"other\"\n[engine]\ntype=\"codetable\"\n[[dictionaries]]\npath=\"shared/common.dict.yaml\"\n",
+        )
+        .unwrap();
+        // my 也引用 shared/common:追加进 my 的 dictionaries
+        let my_toml = fs::read_to_string(user.join("my.schema.toml")).unwrap();
+        fs::write(
+            user.join("my.schema.toml"),
+            format!("{my_toml}[[dictionaries]]\npath = \"shared/common.dict.yaml\"\n"),
+        )
+        .unwrap();
+
+        let keep = vec!["other".to_string()];
+        let r = delete_package("my", &user, Some(&system), &keep).unwrap();
+        assert!(r.deleted.contains(&"my.schema.toml".to_string()));
+        assert!(r.deleted.contains(&"my/main.dict.yaml".to_string()));
+        assert!(
+            r.kept_shared
+                .contains(&"shared/common.dict.yaml".to_string()),
+            "共享文件保留"
+        );
+        assert_eq!(r.schema_ids, vec!["my"]);
+        assert!(!user.join("my.schema.toml").exists());
+        assert!(!user.join("my").exists(), "独享资源目录删空后应移除");
+        assert!(
+            user.join("shared/common.dict.yaml").is_file(),
+            "共享文件仍在"
+        );
+        assert!(user.join("other.schema.toml").is_file(), "其它方案不受影响");
+    }
+
+    #[test]
+    fn delete_package_mixed_recurses_and_never_touches_system() {
+        let t = tempfile::tempdir().unwrap();
+        let (user, system) = (t.path().join("u"), t.path().join("s"));
+        fixture(&user, &system);
+        fs::write(
+            user.join("mix.schema.toml"),
+            "[schema]\nid=\"mix\"\n[engine]\ntype=\"mixed\"\n[engine.mixed]\nprimary_schema=\"my\"\nsecondary_schema=\"pinyin\"\n",
+        )
+        .unwrap();
+        fs::write(
+            system.join("pinyin.schema.toml"),
+            "[schema]\nid=\"pinyin\"\n",
+        )
+        .unwrap();
+
+        // 无其它方案共享 → mix 及其递归引用的用户方案 my 一并删除
+        let r = delete_package("mix", &user, Some(&system), &[]).unwrap();
+        assert!(r.deleted.contains(&"mix.schema.toml".to_string()));
+        assert!(
+            r.deleted.contains(&"my.schema.toml".to_string()),
+            "递归引用的用户方案一并删"
+        );
+        assert_eq!(r.schema_ids, vec!["mix", "my"]);
+        assert!(!user.join("my").exists());
+        assert!(
+            system.join("pinyin.schema.toml").is_file(),
+            "系统目录文件永不删"
+        );
+        assert!(
+            system.join("sys/shared.dict.yaml").is_file(),
+            "系统资源永不删"
+        );
+    }
+
+    #[test]
+    fn delete_package_keeps_subschema_shared_by_other_mixed() {
+        let t = tempfile::tempdir().unwrap();
+        let (user, system) = (t.path().join("u"), t.path().join("s"));
+        fixture(&user, &system);
+        // 两个混输方案都引用用户方案 my:删 mix1 时 my 因被 mix2 共享而保留
+        for m in ["mix1", "mix2"] {
+            fs::write(
+                user.join(format!("{m}.schema.toml")),
+                format!(
+                    "[schema]\nid=\"{m}\"\n[engine]\ntype=\"mixed\"\n[engine.mixed]\nprimary_schema=\"my\"\n"
+                ),
+            )
+            .unwrap();
+        }
+        let keep = vec!["mix2".to_string()];
+        let r = delete_package("mix1", &user, Some(&system), &keep).unwrap();
+        assert!(r.deleted.contains(&"mix1.schema.toml".to_string()));
+        assert!(
+            r.kept_shared.contains(&"my.schema.toml".to_string()),
+            "被 mix2 共享的子方案保留"
+        );
+        assert_eq!(r.schema_ids, vec!["mix1"], "只有 mix1 计入被删方案");
+        assert!(user.join("my.schema.toml").is_file());
+        assert!(
+            user.join("my/main.dict.yaml").is_file(),
+            "共享子方案的资源保留"
+        );
     }
 
     #[test]

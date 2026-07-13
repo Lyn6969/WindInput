@@ -572,8 +572,41 @@ impl Coordinator {
 
     fn web_schema_delete(&self, params: &Value) -> anyhow::Result<Value> {
         let id = str_param(params, "id")?;
-        self.engine_mgr.delete_user_schema(id)?;
-        Ok(json!({ "ok": true }))
+        if !self.engine_mgr.is_user_schema(id) {
+            anyhow::bail!("内置方案不可删除: {id}");
+        }
+        let user = Self::user_schemas_dir()?;
+        let system = Self::system_schemas_dir();
+        // 共享检查基准 = 其余已安装方案(含内置——混输可能引用用户资源)。
+        let keep: Vec<String> = self
+            .engine_mgr
+            .installed_schemas()
+            .into_iter()
+            .filter(|s| s != id)
+            .collect();
+        // 镜像导入的收集逻辑删文件:方案文件+引用资源+递归引用的用户方案,共享保留。
+        let r = wind_transfer::scheme::delete_package(id, &user, system.as_deref(), &keep)?;
+        // 级联清词库数据:仅清数据域=方案自身的(拼音族数据在共享 pinyin 域,
+        // data_schema_id≠自身时跳过;文件已删读不到类型时回落自身,清空域无害)。
+        if let Some(store) = self.store.as_ref() {
+            for sid in &r.schema_ids {
+                if self.engine_mgr.data_schema_id(sid) == *sid {
+                    store.clear_user_words(sid)?;
+                    store.clear_temp_words(sid)?;
+                    store.clear_freq(sid)?;
+                    store.clear_shadow(sid)?;
+                }
+            }
+        }
+        for sid in &r.schema_ids {
+            self.engine_mgr.forget_deleted_schema(sid);
+        }
+        Ok(json!({
+            "ok": true,
+            "deleted": r.deleted,
+            "keptShared": r.kept_shared,
+            "schemaIds": r.schema_ids,
+        }))
     }
 
     /// 用户 schemas 根目录(%APPDATA%/WindInput/schemas),不存在则创建。
