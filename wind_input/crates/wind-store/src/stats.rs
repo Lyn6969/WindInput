@@ -231,6 +231,56 @@ impl Store {
         })
     }
 
+    /// 导出全部每日统计为 jsonl（每行 {"date","stat"}）。
+    pub fn export_stats_jsonl(&self) -> anyhow::Result<String> {
+        let all = self.daily_stats("0000-01-01", "9999-12-31")?;
+        let mut out = String::new();
+        for (date, stat) in all {
+            out.push_str(&serde_json::to_string(
+                &serde_json::json!({ "date": date, "stat": stat }),
+            )?);
+            out.push('\n');
+        }
+        Ok(out)
+    }
+
+    /// 从 jsonl 导入每日统计。overwrite=false 时已存在日跳过（以本地为准）。
+    /// 返回 (imported, skipped_bad_lines)。
+    pub fn import_stats_jsonl(
+        &self,
+        text: &str,
+        overwrite: bool,
+    ) -> anyhow::Result<(usize, usize)> {
+        let mut imported = 0usize;
+        let mut skipped = 0usize;
+        for line in text.lines() {
+            if line.trim().is_empty() {
+                continue;
+            }
+            let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else {
+                skipped += 1;
+                continue;
+            };
+            let (Some(date), Some(stat)) = (
+                v.get("date").and_then(|x| x.as_str()),
+                v.get("stat")
+                    .and_then(|x| serde_json::from_value::<DailyStats>(x.clone()).ok()),
+            ) else {
+                skipped += 1;
+                continue;
+            };
+            if !overwrite {
+                let existing = self.daily_stats(date, date)?;
+                if !existing.is_empty() {
+                    continue;
+                }
+            }
+            self.put_daily_stat(date, &stat)?;
+            imported += 1;
+        }
+        Ok((imported, skipped))
+    }
+
     /// 读取统计全局元数据（无则零值）。
     pub fn get_stats_meta(&self) -> anyhow::Result<StatsMeta> {
         self.with_db(|db| {
@@ -473,6 +523,33 @@ mod tests {
         let p = std::env::temp_dir().join(name);
         let _ = std::fs::remove_file(&p);
         p
+    }
+
+    #[test]
+    fn stats_jsonl_roundtrip_skip_existing() {
+        let path = tmp("wind_st_io.redb");
+        let s = Store::open(&path).unwrap();
+        let mut d = DailyStats::default();
+        d.chinese = 42;
+        s.put_daily_stat("2026-07-01", &d).unwrap();
+        let text = s.export_stats_jsonl().unwrap();
+        assert!(text.contains("2026-07-01"));
+
+        let path2 = tmp("wind_st_io2.redb");
+        let s2 = Store::open(&path2).unwrap();
+        let mut local = DailyStats::default();
+        local.chinese = 7;
+        s2.put_daily_stat("2026-07-01", &local).unwrap();
+        // overwrite=false：已存在日跳过
+        let (imp, _) = s2.import_stats_jsonl(&text, false).unwrap();
+        assert_eq!(imp, 0);
+        assert_eq!(s2.get_daily_stat("2026-07-01").unwrap().chinese, 7);
+        // overwrite=true：覆盖
+        let (imp2, _) = s2.import_stats_jsonl(&text, true).unwrap();
+        assert_eq!(imp2, 1);
+        assert_eq!(s2.get_daily_stat("2026-07-01").unwrap().chinese, 42);
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(&path2);
     }
 
     #[test]
