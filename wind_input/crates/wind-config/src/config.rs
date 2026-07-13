@@ -547,6 +547,10 @@ pub struct SpecialModeConfig {
     /// 引用的方案 id（其 .schema.toml 提供码表与全码策略；不进 schema.available，仅 overlay 触发懒加载）
     #[serde(default)]
     pub schema: String,
+    /// 专用直达热键（如 "ctrl+shift+u"，空串=不注册）。与 `trigger_keys` 引导键共存；
+    /// 热键进入时组合区不写引导符（见 docs/design/special-mode-entry-hotkey.md）。
+    #[serde(default)]
+    pub hotkey: String,
 }
 
 // ───────────────────────── input（输入行为）─────────────────────────
@@ -798,6 +802,10 @@ pub struct TempPinyinConfig {
     /// 触发键（如 "backtick" / "z" / "semicolon"），默认反引号
     #[serde(default = "default_temp_pinyin_triggers")]
     pub trigger_keys: Vec<String>,
+    /// 专用直达热键（如 "ctrl+shift+p"，空串=不注册）。与 `trigger_keys` 引导键共存；
+    /// 热键进入时组合区不写引导符（见 docs/design/special-mode-entry-hotkey.md）。
+    #[serde(default)]
+    pub hotkey: String,
 }
 
 fn default_temp_pinyin_triggers() -> Vec<String> {
@@ -810,6 +818,7 @@ impl Default for TempPinyinConfig {
             enabled: true,
             schema: String::new(),
             trigger_keys: default_temp_pinyin_triggers(),
+            hotkey: String::new(),
         }
     }
 }

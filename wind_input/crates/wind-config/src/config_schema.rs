@@ -159,6 +159,7 @@ static REGISTRY: &[ConfigField] = &[
     f("input.temp_pinyin.enabled", Bool),
     f("input.temp_pinyin.schema", Str),
     f("input.temp_pinyin.trigger_keys", StrList),
+    f("input.temp_pinyin.hotkey", Str),
     f("input.url.enabled", Bool),
     f("input.url.prefixes", StrList),
     f("input.s2t.enabled", Bool),

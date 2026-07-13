@@ -144,6 +144,31 @@ impl Compiler {
             }
         }
 
+        // ── KeyDown：特殊模式 / 临拼 直达热键（CHINESE_ONLY | GLOBAL，与加词键同策略） ──
+        // 与引导键（trigger_keys）共存：热键路径进入时组合区不写引导符（分发点传 key_code=0）。
+        // GLOBAL 位使 TSF 在「中文 + 文本框」时 RegisterHotKey 全局拦截，穿透 QQNT/Tabby 等
+        // Chromium 宿主的加速键双处理。id 为空的特殊模式跳过（分发点无法按 id 定位）。
+        let mode_policy = HOTKEY_POLICY_CHINESE_ONLY | HOTKEY_POLICY_GLOBAL;
+        for m in &self.config.schema.special_modes {
+            if m.id.is_empty() {
+                continue;
+            }
+            if let Some(raw) = parse_hotkey(&m.hotkey) {
+                result.key_down.push(HotkeyEntry {
+                    tsf_hash: raw | mode_policy,
+                    match_hash: raw,
+                    action: format!("enter_special:{}", m.id),
+                });
+            }
+        }
+        if let Some(raw) = parse_hotkey(&self.config.input.temp_pinyin.hotkey) {
+            result.key_down.push(HotkeyEntry {
+                tsf_hash: raw | mode_policy,
+                match_hash: raw,
+                action: "enter_temp_pinyin".to_string(),
+            });
+        }
+
         // ── KeyDown：数字模板展开（PinCandidate / DeleteCandidate，session policy） ──
         for tmpl in [&h.pin_candidate, &h.delete_candidate] {
             for entry in compile_number_hotkey(tmpl) {
@@ -571,5 +596,75 @@ mod tests {
             "toggle_punct 不应带 GLOBAL 位"
         );
         assert!(tp.tsf_hash & HOTKEY_POLICY_CHINESE_ONLY != 0);
+    }
+
+    #[test]
+    fn special_mode_hotkey_compiles_with_global_policy() {
+        use crate::config::SpecialModeConfig;
+        let mut cfg = Config::default();
+        cfg.schema.special_modes = vec![SpecialModeConfig {
+            id: "rare".to_string(),
+            hotkey: "ctrl+shift+u".to_string(),
+            ..Default::default()
+        }];
+        let compiled = Compiler::new(cfg).compile();
+        let e = compiled
+            .key_down
+            .iter()
+            .find(|e| e.action == "enter_special:rare")
+            .expect("special_modes[].hotkey 应编出 enter_special:<id>");
+        // 与加词键同策略：CHINESE_ONLY | GLOBAL；match_hash 不含任何 policy 位
+        assert!(e.tsf_hash & HOTKEY_POLICY_GLOBAL != 0);
+        assert!(e.tsf_hash & HOTKEY_POLICY_CHINESE_ONLY != 0);
+        assert_eq!(
+            e.match_hash & (HOTKEY_POLICY_CHINESE_ONLY | HOTKEY_POLICY_GLOBAL),
+            0
+        );
+    }
+
+    #[test]
+    fn temp_pinyin_hotkey_compiles_with_global_policy() {
+        let mut cfg = Config::default();
+        cfg.input.temp_pinyin.hotkey = "ctrl+shift+p".to_string();
+        let compiled = Compiler::new(cfg).compile();
+        let e = compiled
+            .key_down
+            .iter()
+            .find(|e| e.action == "enter_temp_pinyin")
+            .expect("temp_pinyin.hotkey 应编出 enter_temp_pinyin");
+        assert!(e.tsf_hash & HOTKEY_POLICY_GLOBAL != 0);
+        assert!(e.tsf_hash & HOTKEY_POLICY_CHINESE_ONLY != 0);
+        assert_eq!(
+            e.match_hash & (HOTKEY_POLICY_CHINESE_ONLY | HOTKEY_POLICY_GLOBAL),
+            0
+        );
+    }
+
+    #[test]
+    fn empty_or_idless_mode_hotkey_produces_no_entry() {
+        use crate::config::SpecialModeConfig;
+        let mut cfg = Config::default();
+        // 空 hotkey（默认）+ 空 id 的特殊模式：都不该产生条目
+        cfg.schema.special_modes = vec![
+            SpecialModeConfig {
+                id: String::new(),
+                hotkey: "ctrl+shift+u".to_string(), // 有键但 id 空 → 跳过
+                ..Default::default()
+            },
+            SpecialModeConfig {
+                id: "empty_hk".to_string(),
+                hotkey: String::new(), // 有 id 但键空 → 跳过
+                ..Default::default()
+            },
+        ];
+        // temp_pinyin.hotkey 默认空 → 无条目
+        let compiled = Compiler::new(cfg).compile();
+        assert!(
+            !compiled
+                .key_down
+                .iter()
+                .any(|e| e.action.starts_with("enter_special:") || e.action == "enter_temp_pinyin"),
+            "空 hotkey / 空 id 不应产生直达热键条目"
+        );
     }
 }

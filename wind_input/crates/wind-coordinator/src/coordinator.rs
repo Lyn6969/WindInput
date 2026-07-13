@@ -3332,6 +3332,33 @@ impl MessageHandler for Coordinator {
                 if state.chinese_mode {
                     return self.open_add_word_from_history(&mut state);
                 }
+            } else if action == "enter_temp_pinyin" {
+                // 临拼直达热键：进入前先上屏半成品（commit_and_enter_temp_pinyin 内含），
+                // 传 key_code=0 → 组合区无引导符。已在临拼态则幂等；中文模式下一律吞键
+                // （不放行，避免把该组合键泄漏给宿主）。
+                let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+                if state.chinese_mode {
+                    if state.active != Some(ModeKind::TempPinyin)
+                        && let Some(target) = self.engine_mgr.temp_pinyin_target()
+                    {
+                        return self.commit_and_enter_temp_pinyin(&mut state, 0, target);
+                    }
+                    return KeyAction::Consumed;
+                }
+            } else if let Some(id) = action.strip_prefix("enter_special:") {
+                // 特殊模式直达热键：按 id 定位配置序 idx（与 match_special_trigger 下标语义一致）。
+                // 已在该模式则幂等；未知 id / 方案不可加载均安全吞键（不放行以免误触）。
+                let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+                if state.chinese_mode {
+                    if let Some(idx) = self.special_mode_idx(id)
+                        && state.active != Some(ModeKind::Special(idx))
+                        && let Some(schema) = self.special_schema(idx)
+                        && self.engine_mgr.ensure_schema(&schema)
+                    {
+                        return self.commit_and_enter_special_mode(&mut state, idx);
+                    }
+                    return KeyAction::Consumed;
+                }
             } else if self.dispatch_hotkey(&action) {
                 return KeyAction::StatusUpdate(self.build_status());
             }

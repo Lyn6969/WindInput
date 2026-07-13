@@ -686,7 +686,13 @@ impl Coordinator {
         state.active = Some(ModeKind::TempPinyin);
         state.temp_pinyin_schema = target;
         state.temp_pinyin_buffer.clear();
-        state.temp_pinyin_prefix = Self::temp_pinyin_prefix_for(key_code).to_string();
+        // key_code == 0 是直达热键哨兵：不写引导符（temp_pinyin_prefix_for 对未映射键会兜底
+        // 反引号，故此处显式取空，对齐 enter_special_mode 的 key_code=0 语义）。
+        state.temp_pinyin_prefix = if key_code == 0 {
+            String::new()
+        } else {
+            Self::temp_pinyin_prefix_for(key_code).to_string()
+        };
         self.update_temp_pinyin_candidates(state);
         self.notify_ui_update(state);
         let prefix = state.temp_pinyin_prefix.clone();

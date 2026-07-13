@@ -32,6 +32,60 @@ impl Coordinator {
         None
     }
 
+    /// 按 id 在 `schema.special_modes` 配置序中定位下标（与 `match_special_trigger` 的 u8 下标语义
+    /// 一致，最多 256 项）。供直达热键 `enter_special:<id>` 分发定位；未找到返回 None。
+    pub(crate) fn special_mode_idx(&self, id: &str) -> Option<u8> {
+        self.rt()
+            .config
+            .schema
+            .special_modes
+            .iter()
+            .take(u8::MAX as usize + 1)
+            .position(|m| m.id == id)
+            .map(|i| i as u8)
+    }
+
+    /// 直达热键进入特殊模式：先把当前普通输入的半成品上屏（复用 `take_committed` + 高亮候选），
+    /// 再 `enter_special_mode(idx, key_code=0)`。key_code=0 是哨兵：`vk_to_prefix_char(0)` 返回 None
+    /// → `special_prefix` 为空，满足「热键进入不写引导符」。方案须可加载（调用方 `ensure_schema` 保证）。
+    pub(crate) fn commit_and_enter_special_mode(&self, state: &mut State, idx: u8) -> KeyAction {
+        // 命令候选顶屏 → 执行命令（与按空格一致），不进模式。
+        if let Some(act) = self.top_commit_command_guard(state) {
+            return act;
+        }
+        let prefix = self.take_committed(state); // 拼音逐步转换的已转换前缀一并上屏
+        let committed = if !state.candidates.is_empty() {
+            let i = self
+                .highlighted_global_index(state)
+                .min(state.candidates.len() - 1);
+            let t = state.candidates[i].text.clone();
+            self.record_selection(&state.input_buffer, &t, state.candidates[i].source);
+            Some(format!("{prefix}{t}"))
+        } else if !prefix.is_empty() {
+            Some(prefix)
+        } else {
+            None
+        };
+        // enter_special_mode 内部清空 input_buffer/candidates、建组合区（key_code=0 → 前缀空）、刷 UI。
+        let enter = self.enter_special_mode(state, idx, 0);
+        match committed {
+            Some(text) => {
+                let new_comp = match &enter {
+                    KeyAction::UpdateComposition { text, .. } => text.clone(),
+                    _ => state.preedit.clone(),
+                };
+                KeyAction::InsertText {
+                    text,
+                    new_composition: Some(new_comp),
+                    mode_changed: false,
+                    chinese_mode: true,
+                    has_new_composition: true,
+                }
+            }
+            None => enter,
+        }
+    }
+
     /// 特殊模式引用的方案 id（features.special_modes[idx].schema）。
     pub(crate) fn special_schema(&self, idx: u8) -> Option<String> {
         self.rt()
@@ -307,5 +361,100 @@ impl Coordinator {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    //! 直达热键进入特殊模式/临拼的单元测试（无头 Coordinator + 临时 store）。
+    //! headless 下无引擎，故只覆盖不依赖引擎查询的行为：id→idx 定位、空前缀进入、半成品上屏。
+    use super::*;
+    use crate::coordinator::Coordinator;
+    use std::sync::Arc;
+    use wind_candidate::Candidate;
+    use wind_config::Config;
+    use wind_config::config::SpecialModeConfig;
+    use wind_store::Store;
+
+    fn coord_with(tag: &str, cfg: Config) -> Arc<Coordinator> {
+        let path = std::env::temp_dir().join(format!("wind_special_hk_{tag}.redb"));
+        let _ = std::fs::remove_file(&path);
+        let store = Arc::new(Store::open(&path).unwrap());
+        Coordinator::new_headless_with_store(cfg, None, store)
+    }
+
+    fn cfg_with_modes(ids: &[&str]) -> Config {
+        let mut cfg = Config::default();
+        cfg.schema.special_modes = ids
+            .iter()
+            .map(|id| SpecialModeConfig {
+                id: (*id).to_string(),
+                ..Default::default()
+            })
+            .collect();
+        cfg
+    }
+
+    #[test]
+    fn special_mode_idx_locates_by_config_order() {
+        let c = coord_with("idx", cfg_with_modes(&["rare", "sym", "cjk"]));
+        assert_eq!(c.special_mode_idx("rare"), Some(0));
+        assert_eq!(c.special_mode_idx("sym"), Some(1));
+        assert_eq!(c.special_mode_idx("cjk"), Some(2));
+        // 未知 id → None（分发点据此安全吞键，不 panic）
+        assert_eq!(c.special_mode_idx("nope"), None);
+    }
+
+    #[test]
+    fn commit_and_enter_special_writes_no_guide_prefix() {
+        let c = coord_with("enter_empty", cfg_with_modes(&["rare"]));
+        let mut st = c.state.lock().unwrap();
+        st.chinese_mode = true;
+        // 空缓冲进入：无半成品可上屏 → 返回 UpdateComposition，组合区无引导符。
+        let act = c.commit_and_enter_special_mode(&mut st, 0);
+        assert_eq!(st.active, Some(ModeKind::Special(0)));
+        assert!(
+            st.special_prefix.is_empty(),
+            "热键进入不应写引导符（special_prefix 应空）"
+        );
+        assert!(matches!(act, KeyAction::UpdateComposition { .. }));
+    }
+
+    #[test]
+    fn commit_and_enter_special_commits_pending_candidate() {
+        let c = coord_with("enter_commit", cfg_with_modes(&["rare"]));
+        let mut st = c.state.lock().unwrap();
+        st.chinese_mode = true;
+        // 模拟普通输入半成品：编码 + 高亮候选。
+        st.input_buffer = "aa".to_string();
+        st.candidates = vec![Candidate {
+            text: "工".to_string(),
+            ..Default::default()
+        }];
+        st.selected_index = 0;
+        st.current_page = 0;
+        let act = c.commit_and_enter_special_mode(&mut st, 0);
+        // 进入前的高亮候选应作为 InsertText 上屏，随后进入目标模式、组合区无引导符。
+        match act {
+            KeyAction::InsertText { text, .. } => assert_eq!(text, "工"),
+            other => panic!("应上屏半成品并进入模式，实际 {other:?}"),
+        }
+        assert_eq!(st.active, Some(ModeKind::Special(0)));
+        assert!(st.special_prefix.is_empty());
+        assert!(st.candidates.is_empty());
+    }
+
+    #[test]
+    fn commit_and_enter_temp_pinyin_zero_keycode_has_no_prefix() {
+        let c = coord_with("temp_zero", Config::default());
+        let mut st = c.state.lock().unwrap();
+        st.chinese_mode = true;
+        // key_code=0 哨兵：进入临拼但组合区无引导符（对齐特殊模式）。
+        let _ = c.commit_and_enter_temp_pinyin(&mut st, 0, "pinyin".to_string());
+        assert_eq!(st.active, Some(ModeKind::TempPinyin));
+        assert!(
+            st.temp_pinyin_prefix.is_empty(),
+            "直达热键（key_code=0）进入临拼不应写引导符"
+        );
     }
 }
