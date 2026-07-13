@@ -182,15 +182,22 @@ pub fn export_package(
     })
 }
 
-/// 校验 zip 条目名并转为 schemas 根相对路径:必须 `schemas/` 前缀、无 `..`、非绝对。
+/// 校验 zip 条目名并转为 schemas 根相对路径:必须 `schemas/` 前缀,
+/// 且所有路径段均为普通段(components 白名单,拦 `..`/绝对/盘符相对如 `C:foo`/UNC/`.`)。
 fn entry_rel(name: &str) -> anyhow::Result<&str> {
     let rel = name
         .strip_prefix("schemas/")
         .ok_or_else(|| anyhow::anyhow!("非法条目(缺 schemas/ 前缀): {name}"))?;
-    if rel.is_empty()
-        || Path::new(rel).is_absolute()
-        || rel.split(['/', '\\']).any(|seg| seg == "..")
-    {
+    if rel.is_empty() {
+        anyhow::bail!("非法条目(空路径): {name}");
+    }
+    // 反斜杠统一按分隔符处理后再做组件白名单(zip 规范用 /,防御性兼容 \)。
+    let normalized = rel.replace('\\', "/");
+    let ok = !normalized.is_empty()
+        && Path::new(&normalized)
+            .components()
+            .all(|c| matches!(c, std::path::Component::Normal(seg) if !seg.to_string_lossy().contains(':')));
+    if !ok {
         anyhow::bail!("非法条目(路径穿越): {name}");
     }
     Ok(rel)
@@ -518,6 +525,29 @@ secondary_schema = "pinyin"
         assert!(preview_import(&bad, &dest).is_err(), "含 .. 条目应拒绝");
         assert!(
             import_package(&bad, &dest, crate::merge::Strategy::Merge).is_err(),
+            "导入同样拒绝"
+        );
+
+        // Windows 盘符相对路径(C:foo):is_absolute()==false 但 join 会丢 base,必须拦。
+        let bad2 = t.path().join("bad2.zip");
+        let manifest2 = crate::bundle::Manifest::new(
+            crate::bundle::BundleKind::Scheme,
+            "1.0.0",
+            "windows",
+            "t",
+        );
+        let mut w2 = crate::bundle::BundleWriter::new(&bad2, manifest2).unwrap();
+        w2.add_bytes_with(
+            "schemas/C:evil.toml",
+            b"x",
+            "resource",
+            serde_json::Value::Null,
+        )
+        .unwrap();
+        w2.finish().unwrap();
+        assert!(preview_import(&bad2, &dest).is_err(), "盘符相对路径应拒绝");
+        assert!(
+            import_package(&bad2, &dest, crate::merge::Strategy::Merge).is_err(),
             "导入同样拒绝"
         );
     }
