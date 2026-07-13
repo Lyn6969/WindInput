@@ -193,15 +193,44 @@ impl Coordinator {
     }
 
     fn web_schema_list(&self) -> anyhow::Result<Value> {
-        let items: Vec<Value> = self
+        use std::collections::HashMap;
+
+        // 设置页方案下拉的显示顺序（三段式，段间固定先后）：
+        //   ① 已启用的拼音方案（数量少、最常用，置顶）
+        //   ② 其余已启用方案，按 config.schema.available 配置顺序
+        //   ③ 未启用方案（磁盘扫到但不在 available），按类型分组「拼音→码表→混输」，组内按 id 字典序
+        // 底层 installed_schemas() 仍返回 id 字典序全集（做稳定去重锚点），排序只在此展示层重排。
+
+        // 已启用方案 → 配置位置索引，供段①②保持配置顺序。
+        let available = self.engine_mgr.available_schemas();
+        let avail_pos: HashMap<&str, usize> = available
+            .iter()
+            .enumerate()
+            .map(|(i, s)| (s.as_str(), i))
+            .collect();
+
+        // 未启用段的类型分组顺序：拼音→码表→混输。
+        fn type_rank(t: &str) -> i64 {
+            match t {
+                "pinyin" => 0,
+                "codetable" => 1,
+                "mixed" => 2,
+                _ => 3,
+            }
+        }
+
+        // 复合排序键 (段号, 段内主键, id)：段号先分档；段内主键在启用段是配置位置、
+        // 在未启用段是类型档；id 仅在未启用段做字典序 tiebreak（启用段位置唯一，不参与）。
+        let mut rows: Vec<((u8, i64, String), Value)> = self
             .engine_mgr
             .installed_schemas()
             .iter()
             .map(|id| {
                 // 取合并后 Schema 一次，带出方案元信息（备注/版本/图标/作者），供设置页方案列表与详情显示。
                 let merged = self.engine_mgr.schema_merged(id);
+                let engine_type = merged.as_ref().map(resolve_engine_type).unwrap_or("codetable");
                 let info = merged.as_ref().map(|s| &s.schema);
-                json!({
+                let item = json!({
                     "id": id,
                     "name": self.engine_mgr.schema_name(id),
                     "engineType": merged.as_ref().map(resolve_engine_type),
@@ -217,9 +246,23 @@ impl Coordinator {
                     "version": info.map(|i| i.version.clone()).unwrap_or_default(),
                     "icon_label": info.map(|i| i.icon_label.clone()).unwrap_or_default(),
                     "author": info.map(|i| i.author.clone()).unwrap_or_default(),
-                })
+                });
+
+                let key = match avail_pos.get(id.as_str()) {
+                    // 已启用：拼音置顶(段0)，其余(段1)，段内按配置位置。
+                    Some(&pos) => {
+                        let seg = if engine_type == "pinyin" { 0 } else { 1 };
+                        (seg, pos as i64, String::new())
+                    }
+                    // 未启用(段2)：按类型档 + id 字典序。
+                    None => (2, type_rank(engine_type), id.clone()),
+                };
+                (key, item)
             })
             .collect();
+
+        rows.sort_by(|a, b| a.0.cmp(&b.0));
+        let items: Vec<Value> = rows.into_iter().map(|(_, item)| item).collect();
         Ok(json!(items))
     }
 
