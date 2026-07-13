@@ -78,13 +78,12 @@ Go 版 WindInput 提供三类数据流转能力:方案的导入导出、用户�
 
 ```
 manifest.json
-schema/<id>.schema.toml
-schema/dicts/<引用的码表/词典源文件>
-schema/shuangpin/<自定义布局>.toml     (若方案引用了自定义双拼布局)
-schema/assets/<拆字表 / 图标 / 字体等引用资源>
+schemas/<id>.schema.toml
+schemas/<引用资源,保留 schemas 根相对路径,如 wubi86/xx.dict.yaml>
+schemas/shuangpin/<布局>.toml     (若引用自定义双拼布局)
 ```
 
-- 资源收集:解析 `schema.toml` 中对码表、词典、双拼布局、拆字表、字体等的引用路径,凡指向用户目录(非系统 `data/`)的文件一并纳入;指向系统种子的引用只记路径不打包(导入端若缺失再提示)。
+- 资源收集:解析 `schema.toml` 中对码表、词典、双拼布局、拆字表、字体等的引用路径,凡指向用户目录(非系统 `data/`)的文件一并纳入;指向系统种子的引用只记路径不打包(导入端若缺失再提示)。zip 内条目保留 schemas 根相对路径(而非按类型重排目录),使 schema.toml 的相对引用免改写、导入即用;系统种子引用与缺失文件以 manifest 的 system_ref/missing 条目记录。
 
 ### 整机备份 `.zip`(kind=backup)
 
