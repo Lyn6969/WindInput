@@ -4,6 +4,7 @@
 //! 使用 redb 替代 bbolt，保持相同的 bucket 语义。
 
 pub mod freq;
+pub mod import_formats;
 pub mod migration;
 pub mod phrases;
 pub mod shadow;

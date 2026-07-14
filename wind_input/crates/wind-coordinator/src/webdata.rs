@@ -302,8 +302,10 @@ impl Coordinator {
         // 前缀项走 redb 有序前缀扫描；内容项需全量扫描，仅在有搜索词时才付出该代价。
         if !prefix.is_empty() {
             let q = prefix.to_lowercase();
-            let seen: std::collections::HashSet<(String, String)> =
-                all.iter().map(|w| (w.code.clone(), w.text.clone())).collect();
+            let seen: std::collections::HashSet<(String, String)> = all
+                .iter()
+                .map(|w| (w.code.clone(), w.text.clone()))
+                .collect();
             for w in store.search_user_words_prefix(&schema, "", 0)? {
                 if w.text.to_lowercase().contains(&q)
                     && !seen.contains(&(w.code.clone(), w.text.clone()))
@@ -428,8 +430,9 @@ impl Coordinator {
             .store
             .as_ref()
             .ok_or_else(|| anyhow::anyhow!("无持久化存储"))?;
-        let (rows, skipped) =
-            wind_store::wdict::parse_words_wdict(content).map_err(|e| anyhow::anyhow!(e))?;
+        // 格式按内容自动识别(WindDict/Rime/TSV),解析后统一走 import_user_words 管线。
+        let (_fmt, rows, skipped) = wind_store::import_formats::parse_words_auto(content)
+            .map_err(|e| anyhow::anyhow!(e))?;
         if strategy == Strategy::Replace {
             store.clear_user_words(&schema)?;
         }
@@ -450,17 +453,23 @@ impl Coordinator {
             .store
             .as_ref()
             .ok_or_else(|| anyhow::anyhow!("无持久化存储"))?;
-        let (rows, _skipped) =
-            wind_store::wdict::parse_words_wdict(content).map_err(|e| anyhow::anyhow!(e))?;
+        let (fmt, rows, skipped) = wind_store::import_formats::parse_words_auto(content)
+            .map_err(|e| anyhow::anyhow!(e))?;
         let (c, samples) = store.preview_import_user_words(&schema, &rows)?;
         // 按 Merge 语义预览(与设计 RPC 表一致,不收 strategy);willConflict 词库域恒 0,字段保留。
-        Ok(serde_json::to_value(ImportPreview {
+        let mut v = serde_json::to_value(ImportPreview {
             will_add: c.added,
             will_update: c.updated,
             will_conflict: 0,
             unchanged: c.unchanged,
             samples,
-        })?)
+        })?;
+        // 附加识别信息:格式标识 + 解析期跳过行数(UI 预览提示用)。
+        if let Some(o) = v.as_object_mut() {
+            o.insert("format".into(), json!(fmt.as_str()));
+            o.insert("skipped".into(), json!(skipped));
+        }
+        Ok(v)
     }
 
     fn web_dict_stats(&self) -> anyhow::Result<Value> {
@@ -1820,6 +1829,68 @@ mod tests {
     }
 
     #[test]
+    fn dict_import_rime_and_tsv_auto_detect() {
+        let c = coord("dictio_fmt");
+
+        // Rime:默认列 [text, code, weight],拼音码去空格;preview 回报 format
+        let rime = "# Rime dictionary\n---\nname: demo\nversion: \"1.0\"\n...\n你好\tni hao\t100\n世界\tshi jie\t50\n";
+        let prev = c
+            .web_data_rpc(
+                "dict.previewImport",
+                &json!({ "schemaId": "pinyin", "content": rime }),
+            )
+            .unwrap();
+        assert_eq!(prev.get("format").and_then(|v| v.as_str()), Some("rime"));
+        assert_eq!(prev.get("willAdd").and_then(|v| v.as_u64()), Some(2));
+        assert_eq!(prev.get("skipped").and_then(|v| v.as_u64()), Some(0));
+        let out = c
+            .web_data_rpc(
+                "dict.import",
+                &json!({ "schemaId": "pinyin", "content": rime }),
+            )
+            .unwrap();
+        assert_eq!(out.get("added").and_then(|v| v.as_u64()), Some(2));
+        let listed = c
+            .web_data_rpc(
+                "dict.listPaged",
+                &json!({ "schemaId": "pinyin", "prefix": "nihao", "limit": 10 }),
+            )
+            .unwrap();
+        assert_eq!(
+            listed.get("total").and_then(|v| v.as_u64()),
+            Some(1),
+            "拼音码应去空格入库(ni hao→nihao)"
+        );
+
+        // TSV:code\ttext\t[weight];坏行计入 skipped
+        let tsv = "a\t工\t10\nbadline\nab\t好\n";
+        let prev = c
+            .web_data_rpc(
+                "dict.previewImport",
+                &json!({ "schemaId": "wb", "content": tsv }),
+            )
+            .unwrap();
+        assert_eq!(prev.get("format").and_then(|v| v.as_str()), Some("tsv"));
+        assert_eq!(prev.get("willAdd").and_then(|v| v.as_u64()), Some(2));
+        assert_eq!(prev.get("skipped").and_then(|v| v.as_u64()), Some(1));
+        let out = c
+            .web_data_rpc("dict.import", &json!({ "schemaId": "wb", "content": tsv }))
+            .unwrap();
+        assert_eq!(out.get("added").and_then(|v| v.as_u64()), Some(2));
+        assert_eq!(out.get("skipped").and_then(|v| v.as_u64()), Some(1));
+
+        // 不可识别内容 → 错误
+        assert!(
+            c.web_data_rpc(
+                "dict.previewImport",
+                &json!({ "schemaId": "wb", "content": "没有制表符的纯文本\n" }),
+            )
+            .is_err(),
+            "未知格式应报错"
+        );
+    }
+
+    #[test]
     fn shadow_roundtrip_shape() {
         let c = coord("shadow");
         // pin + delete 两条规则
@@ -2734,8 +2805,11 @@ mod tests {
     #[test]
     fn dict_list_paged_text_query() {
         let c = coord("dict_text_query");
-        for (code, text, weight) in [("wghg", "程序", 3i32), ("ggkg", "王中", 5), ("aaaa", "工", 0)]
-        {
+        for (code, text, weight) in [
+            ("wghg", "程序", 3i32),
+            ("ggkg", "王中", 5),
+            ("aaaa", "工", 0),
+        ] {
             c.web_data_rpc(
                 "dict.add",
                 &json!({ "schemaId": "wb", "code": code, "text": text, "weight": weight }),
