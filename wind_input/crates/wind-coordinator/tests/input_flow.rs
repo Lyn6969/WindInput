@@ -2632,6 +2632,38 @@ fn top_code_phrase_code_no_codetable_char_still_commits() {
 }
 
 #[test]
+fn phrase_auto_commit_unique_exact_no_longer() {
+    if !has_schemas() {
+        return;
+    }
+    // 开启「全码唯一自动上屏」时，唯一精确码短语（无更长后继）应自动上屏。
+    // 引擎 decide_auto_commit 只认码表候选（短语 code 空、且在引擎 convert 后追加），故短语原不进
+    // 判据；phrase_auto_commit 补齐。注入短语码 kkkkx（五笔码表 4 码封顶，5 码处必无码表候选，
+    // 短语成唯一候选）；kkkk 处有多个码表候选（非唯一）→ 第 4 键不会提前自动上屏。
+    let store_path = std::env::temp_dir().join("wind_phrase_autocommit.redb");
+    let _ = std::fs::remove_file(&store_path);
+    let store = std::sync::Arc::new(wind_store::Store::open(&store_path).unwrap());
+    store.add_phrase("kkkkx", "唯一测试短语", 0, 100).unwrap();
+    let mut cfg = config_with("wubi86");
+    cfg.schema.codetable.auto_commit_at_full = true;
+    let coord = Coordinator::new_headless_with_store(cfg, Some(&data_dir()), store);
+    for ch in ['k', 'k', 'k', 'k'] {
+        press_letter(&coord, ch);
+    }
+    // 第 5 键 'x'(VK 0x58) → 只剩注入短语 kkkkx 唯一 + 无更长后继 → 自动上屏
+    match coord.handle_key_event(&key_event(0x58, EVENT_KEY_DOWN)) {
+        KeyAction::InsertText { text, .. } => {
+            assert_eq!(text, "唯一测试短语", "唯一精确码短语应自动上屏其文本");
+        }
+        other => panic!(
+            "短语全码唯一应自动上屏(InsertText)，实际: {:?}(未触发自动上屏?)",
+            other
+        ),
+    }
+    let _ = std::fs::remove_file(&store_path);
+}
+
+#[test]
 fn top_code_plain_phrase_direct_commit_defers() {
     if !has_schemas() {
         return;

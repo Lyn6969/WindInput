@@ -1090,6 +1090,14 @@ impl EngineManager {
         self.active_engine()?.recheck_auto_commit(input, candidates)
     }
 
+    /// 活跃引擎是否存在比 `input` 更长的后继编码（码表前缀扫描；拼音等默认 false）。
+    /// 供短语自动上屏的「无更长后继」判据（码表侧），与短语层 `has_longer_code` 并用。
+    pub fn has_longer_code(&self, input: &str) -> bool {
+        self.active_engine()
+            .map(|e| e.has_longer_code(input))
+            .unwrap_or(false)
+    }
+
     /// 临时拼音目标方案 id（读全局 input.temp_pinyin；不再读方案级配置）。
     /// 启用且目标方案可加载时返回 Some(target)，否则 None。
     pub fn temp_pinyin_target(&self) -> Option<String> {

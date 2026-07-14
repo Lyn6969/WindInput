@@ -297,6 +297,18 @@ impl PhraseLayer {
         out
     }
 
+    /// 是否存在「码以 `code` 开头且严格更长」的短语（含普通字面/模板与 marker，全量扫描）。
+    /// 供短语自动上屏的「无更长后继」判据——避免短码短语（如 `ab`）在还能续打成更长短语
+    /// （`abc`）时被自动上屏、打断输入。码表侧的更长后继由引擎 `has_longer_code` 判。
+    pub fn has_longer_code(&self, code: &str) -> bool {
+        if code.is_empty() {
+            return false;
+        }
+        self.map
+            .keys()
+            .any(|k| k.len() > code.len() && k.starts_with(code))
+    }
+
     /// 前缀导航：敲 `code`（长度 ≥ `min_len`）时，列出所有**码以 `code` 开头但更长**的
     /// marker 短语（`$CC`/`$SS`/`$AA`，未显式 `{prefix: false}`），每条出一个导航候选——
     /// `text` 为组名/命令显示名，`comment` 为码后缀。选中后由 coordinator 补全到完整码再展开。
@@ -718,6 +730,19 @@ fn small_int_chinese(n: u32) -> String {
 mod tests {
     use super::*;
     use chrono::TimeZone;
+
+    #[test]
+    fn has_longer_code_detects_strict_prefix() {
+        let layer = PhraseLayer::from_records([
+            ("date".to_string(), "X".to_string(), 0, 0, false),
+            ("dates".to_string(), "Y".to_string(), 0, 0, false),
+        ]);
+        assert!(layer.has_longer_code("dat"), "date/dates 都比 dat 长");
+        assert!(layer.has_longer_code("date"), "存在更长码 dates");
+        assert!(!layer.has_longer_code("dates"), "dates 已最长，无更长后继");
+        assert!(!layer.has_longer_code("zzz"), "无以 zzz 为前缀的短语");
+        assert!(!layer.has_longer_code(""), "空码不算");
+    }
 
     fn fixed() -> DateTime<Local> {
         // 2026-06-14 09:05:07 周日

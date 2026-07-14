@@ -481,7 +481,62 @@ impl Coordinator {
             None if should_clear => InputOutcome::Clear,
             None => InputOutcome::Normal,
         };
+        // 短语自动上屏：码表未给出上屏意向（Normal）时，补齐短语侧——引擎判据看不到短语，
+        // 唯一精确码短语 + 无更长后继时也应自动上屏（与码表「全码唯一自动上屏」对齐）。
+        let outcome = match outcome {
+            InputOutcome::Normal => self
+                .phrase_auto_commit(state)
+                .unwrap_or(InputOutcome::Normal),
+            other => other,
+        };
         (engine_count, outcome)
+    }
+
+    /// 短语自动上屏（`schema.codetable.auto_commit_at_full` 开启时）：当前输入的**唯一**候选是
+    /// 精确码短语，且**无更长后继**（码表前缀扫描 + 短语码前缀扫描）→ 自动上屏。引擎的
+    /// `decide_auto_commit` 只认码表候选（短语在引擎 convert 后由协调器追加、且候选 `code` 为空），
+    /// 故短语从不进码表判据；此处补齐短语侧，判据与码表「全码唯一自动上屏」同构。
+    ///
+    /// - 普通短语 → 直接上屏其文本；
+    /// - 纯文本命令（`$CC` 仅 `type` 文本、无副作用）→ 同步求值上屏其文本（与顶码 `eval_command_text_only` 同路）；
+    /// - 含副作用命令 / `$SS`·`$AA` 组 / 前缀枚举短语 → 排除（不自动上屏，避免误执行/误展开/打断输入）。
+    ///
+    /// 门槛为「唯一 + 无更长后继（含短语）」，不设最短码长——短码短语仅在无任何更长续接时才上屏。
+    pub(crate) fn phrase_auto_commit(&self, state: &State) -> Option<InputOutcome> {
+        if !self.engine_mgr.codetable_settings().auto_commit_at_full {
+            return None;
+        }
+        // 唯一候选。
+        let [c] = &state.candidates[..] else {
+            return None;
+        };
+        // 精确码短语（非前缀枚举 / 非组）。命令留待下方按纯文本/副作用分流。
+        if !c.is_phrase || c.is_prefix || c.is_group {
+            return None;
+        }
+        let input = &state.input_buffer;
+        // 无更长后继：码表 + 短语两侧前缀扫描（避免短码短语打断更长输入）。
+        if self.engine_mgr.has_longer_code(input) {
+            return None;
+        }
+        if self
+            .phrases
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .has_longer_code(input)
+        {
+            return None;
+        }
+        // 纯文本命令 → 同步求值（含副作用 → None，不自动上屏）；普通短语 → 直接文本。
+        let text = if c.is_command {
+            self.eval_command_text_only(&c.phrase_template, input)?
+        } else {
+            c.text.clone()
+        };
+        if text.is_empty() {
+            return None;
+        }
+        Some(InputOutcome::AutoCommit(text))
     }
 
     /// 按当前检索范围过滤候选：先填充 is_common（常用字表），再按模式过滤。
