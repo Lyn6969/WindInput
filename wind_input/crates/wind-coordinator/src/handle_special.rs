@@ -6,6 +6,7 @@ use crate::coordinator::{Coordinator, State, punct_char};
 use crate::pipeline::ModeKind;
 use tracing::debug;
 use wind_bridge::handler::{KeyAction, KeyEventData};
+use wind_candidate::Candidate;
 use wind_ipc::protocol::MOD_SHIFT;
 use wind_keys::keymap;
 
@@ -134,8 +135,9 @@ impl Coordinator {
     }
 
     /// 按当前编码缓冲刷新特殊模式候选（经其引用方案的引擎查询，复用方案 CodeTableSpec 全码策略）。
-    /// 返回 Some(text) 表示该方案的全码策略请求自动上屏。
-    pub(crate) fn update_special_candidates(&self, state: &mut State) -> Option<String> {
+    /// 返回 Some(候选) 表示该方案的全码策略请求自动上屏该候选（`$CC` 命令候选由调用方
+    /// 走命令执行路径，普通候选上屏其文本）。
+    pub(crate) fn update_special_candidates(&self, state: &mut State) -> Option<Candidate> {
         state.candidates.clear();
         state.current_page = 0;
         state.selected_index = 0;
@@ -151,15 +153,16 @@ impl Coordinator {
         // 统一展开汇聚点：快符表内 `$AA/$SS/$CC` 等特殊语法在此炸开/标命令（见 finalize_candidates）。
         state.candidates = self.finalize_candidates(result.candidates, &state.special_buffer);
         // 自动上屏由方案码表引擎的 should_auto_commit 决定（prefix_free≈全码唯一、fixed_length 等
-        // 映射到该方案的 [engine.codetable] 配置）；复核上屏目标仍在候选中。
-        if result.should_commit
-            && !result.commit_text.is_empty()
-            && state
+        // 映射到该方案的 [engine.codetable] 配置）；复核上屏目标仍在候选中。`$CC` 命令词条经
+        // finalize_candidates 展开后 text 已改写为 display 标签，而引擎意向 commit_text 是原始
+        // `$CC` 源 → 按 phrase_template 补匹配，返回命中候选整条供调用方按命令/文本分流。
+        if result.should_commit && !result.commit_text.is_empty() {
+            let t = &result.commit_text;
+            return state
                 .candidates
                 .iter()
-                .any(|c| c.text == result.commit_text)
-        {
-            return Some(result.commit_text);
+                .find(|c| &c.text == t || (c.is_command && &c.phrase_template == t))
+                .cloned();
         }
         None
     }
@@ -298,16 +301,23 @@ impl Coordinator {
                 // 字母：小写归一累积编码
                 let ch = (b'a' + (data.key_code - 0x41) as u8) as char;
                 state.special_buffer.push(ch);
-                if let Some(text) = self.update_special_candidates(state) {
+                if let Some(cand) = self.update_special_candidates(state) {
+                    // $CC 命令候选自动命中：与手动选中同路（退出模式 + 异步执行动作）。
+                    let code = state.special_buffer.clone();
+                    if let Some(act) = self.overlay_commit_command(state, &cand, &code, |s, st| {
+                        s.exit_special_mode(st)
+                    }) {
+                        return act;
+                    }
                     self.record_commit(
-                        &text,
+                        &cand.text,
                         state.special_buffer.len() as u32,
                         -1,
                         wind_store::stats::CommitSource::SpecialMode,
                     );
                     self.exit_special_mode(state);
                     self.notify_ui_hide();
-                    return Self::commit_action(text, true);
+                    return Self::commit_action(cand.text, true);
                 }
                 let display = state.preedit.clone();
                 self.notify_ui_update(state);

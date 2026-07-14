@@ -468,7 +468,14 @@ impl Coordinator {
                 .recheck_auto_commit(&state.input_buffer, &state.candidates)
         });
         // 复核：仅当上屏目标在最终候选中仍存在（未被 shadow 删除）才放行自动上屏。
-        let outcome = match auto_commit.filter(|t| state.candidates.iter().any(|c| &c.text == t)) {
+        // 词库 `$CC` 命令词条经 finalize_candidates 展开后 text 已改写为 display 标签，而引擎
+        // 意向 commit_text 是原始 `$CC` 源 → 按 phrase_template 补匹配（否则意向恒被误否决）。
+        let outcome = match auto_commit.filter(|t| {
+            state
+                .candidates
+                .iter()
+                .any(|c| &c.text == t || (c.is_command && &c.phrase_template == t))
+        }) {
             Some(_) => {
                 // 一致性：自动上屏文本取「实际显示的首候选」，与空格/点选同源，杜绝
                 // "显示藏、全码上屏駏"的漂移（首候选已由档位排序保证是五笔精确全码）。
@@ -476,6 +483,10 @@ impl Coordinator {
                 // 置顶，或码表精确字被智能过滤后仅剩拼音），则不自动上屏——上屏须与显示一致、
                 // 非码表类不上屏，留给用户继续选。
                 match state.candidates.first() {
+                    // 词库 `$CC` 命令词条：纯文本求值上屏 / 含副作用异步执行（与短语命令同分流）。
+                    Some(c) if c.is_command && c.source == CandidateSource::CodeTable => {
+                        self.command_auto_outcome(c, &state.input_buffer)
+                    }
                     Some(c) if c.source == CandidateSource::CodeTable => {
                         InputOutcome::AutoCommit(c.text.clone())
                     }
@@ -506,7 +517,8 @@ impl Coordinator {
     ///
     /// - 普通短语 → 直接上屏其文本；
     /// - 纯文本命令（`$CC` 仅 `type` 文本、无副作用）→ 同步求值上屏其文本（与顶码 `eval_command_text_only` 同路）；
-    /// - 含副作用命令 / `$SS`·`$AA` 组 / 前缀枚举短语 → 排除（不自动上屏，避免误执行/误展开/打断输入）。
+    /// - 含副作用命令 → [`InputOutcome::AutoCommand`]：清组合并异步执行（与空格选中命令同语义）；
+    /// - `$SS`·`$AA` 组 / 前缀枚举短语 → 排除（不自动上屏，避免误展开/打断输入）。
     ///
     /// 门槛为「唯一 + 无更长后继（含短语）」，不设最短码长——短码短语仅在无任何更长续接时才上屏。
     pub(crate) fn phrase_auto_commit(&self, state: &State) -> Option<InputOutcome> {
@@ -534,16 +546,27 @@ impl Coordinator {
         {
             return None;
         }
-        // 纯文本命令 → 同步求值（含副作用 → None，不自动上屏）；普通短语 → 直接文本。
-        let text = if c.is_command {
-            self.eval_command_text_only(&c.phrase_template, input)?
-        } else {
-            c.text.clone()
-        };
-        if text.is_empty() {
+        // 命令 → 统一分流（纯文本求值上屏 / 含副作用异步执行）；普通短语 → 直接文本。
+        if c.is_command {
+            return Some(self.command_auto_outcome(c, input));
+        }
+        if c.text.is_empty() {
             return None;
         }
-        Some(InputOutcome::AutoCommit(text))
+        Some(InputOutcome::AutoCommit(c.text.clone()))
+    }
+
+    /// `$CC` 命令候选的自动上屏结局分流（短语命令 / 词库命令词条共用）：
+    /// - 纯文本命令（动作链全 Text）→ 同步求值其文本 [`InputOutcome::AutoCommit`]；
+    /// - 含副作用命令 → [`InputOutcome::AutoCommand`]（消费点经 `commit_command` 清组合 +
+    ///   独立线程异步执行——Effect 回调 coordinator 自锁方法，此刻持 state 锁不可同步跑）；
+    /// - 求值文本为空 → Normal（无可上屏内容，继续组合）。
+    pub(crate) fn command_auto_outcome(&self, c: &Candidate, input: &str) -> InputOutcome {
+        match self.eval_command_text_only(&c.phrase_template, input) {
+            Some(t) if !t.is_empty() => InputOutcome::AutoCommit(t),
+            Some(_) => InputOutcome::Normal,
+            None => InputOutcome::AutoCommand(Box::new(c.clone())),
+        }
     }
 
     /// 按当前检索范围过滤候选：先填充 is_common（常用字表），再按模式过滤。

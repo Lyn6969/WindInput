@@ -571,6 +571,9 @@ pub(crate) enum InputOutcome {
     Normal,
     /// 全码自动上屏该文本。
     AutoCommit(String),
+    /// 全码唯一命中含副作用 `$CC` 命令：清组合并异步执行（无同步上屏文本，
+    /// 语义与空格选中命令一致，见 `commit_command`）。
+    AutoCommand(Box<Candidate>),
     /// 满码空码：清空缓冲。
     Clear,
 }
@@ -3785,6 +3788,10 @@ impl MessageHandler for Coordinator {
                         self.notify_ui_hide();
                         return Self::commit_action(out, true);
                     }
+                    // 含副作用命令自动命中：与空格选中命令同路（清组合 + 异步执行）。
+                    InputOutcome::AutoCommand(cand) => {
+                        return self.commit_command(&mut state, &cand);
+                    }
                     InputOutcome::Clear => {
                         state.input_buffer.clear();
                         state.candidates.clear();
@@ -3830,6 +3837,10 @@ impl MessageHandler for Coordinator {
                         let out = self.commit_candidate(&mut state, &text, source);
                         self.notify_ui_hide();
                         return Self::commit_action(out, true);
+                    }
+                    // 含副作用命令自动命中：与空格选中命令同路（清组合 + 异步执行）。
+                    InputOutcome::AutoCommand(cand) => {
+                        return self.commit_command(&mut state, &cand);
                     }
                     InputOutcome::Clear => {
                         state.input_buffer.clear();

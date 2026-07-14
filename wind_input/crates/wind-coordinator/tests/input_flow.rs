@@ -2708,6 +2708,139 @@ fn phrase_auto_commit_unique_exact_no_longer() {
 }
 
 #[test]
+fn phrase_auto_commit_effect_command_executes() {
+    if !has_schemas() {
+        return;
+    }
+    // 含副作用 $CC 命令（Effect 动作）作唯一精确码短语：不再被自动上屏排除，
+    // 应清组合并异步执行（与空格选中命令同语义 → ClearComposition）。
+    // ask() 为未实现 Effect（异步执行仅 warn 降级），测试无真实副作用。
+    let store_path = std::env::temp_dir().join("wind_phrase_autocmd_effect.redb");
+    let _ = std::fs::remove_file(&store_path);
+    let store = std::sync::Arc::new(wind_store::Store::open(&store_path).unwrap());
+    store
+        .add_phrase("kkkkx", r#"$CC("标签", ask("x"))"#, 0, 100)
+        .unwrap();
+    let mut cfg = config_with("wubi86");
+    cfg.schema.codetable.auto_commit_at_full = true;
+    let coord = Coordinator::new_headless_with_store(cfg, Some(&data_dir()), store);
+    for ch in ['k', 'k', 'k', 'k'] {
+        press_letter(&coord, ch);
+    }
+    // 第 5 键 'x' → 唯一含副作用命令候选 + 无更长后继 → 清组合 + 异步执行
+    match coord.handle_key_event(&key_event(0x58, EVENT_KEY_DOWN)) {
+        KeyAction::ClearComposition => {}
+        other => panic!(
+            "含副作用命令全码唯一应清组合并异步执行(ClearComposition)，实际: {:?}",
+            other
+        ),
+    }
+    assert!(
+        coord.debug_all_candidate_texts().is_empty(),
+        "命令自动执行后候选应已清空"
+    );
+    let _ = std::fs::remove_file(&store_path);
+}
+
+// 码表用户词库值内嵌 $CC 命令（用户真机场景 bccc=$CC(...)）自动上屏测试基建：
+// 注入 5 码用户词 kkkkx（五笔 4 码封顶，5 码处必无码表候选 → 唯一 + 无更长后继，
+// 与短语侧同构造）。原三重漏判：引擎意向 commit_text=原始 $CC 源 vs 展开后候选
+// text=display 标签 → 复核不匹配被否决；recheck 因意向已 Some 不跑；phrase_auto_commit
+// 只认 is_phrase。修复=复核按 phrase_template 补匹配 + 首选命令分流(command_auto_outcome)。
+fn coord_with_dict_command(template: &str, tag: &str) -> std::sync::Arc<Coordinator> {
+    let store_path = std::env::temp_dir().join(format!("wind_dict_autocmd_{tag}.redb"));
+    let _ = std::fs::remove_file(&store_path);
+    let store = std::sync::Arc::new(wind_store::Store::open(&store_path).unwrap());
+    store.add_user_word("wubi86", "kkkkx", template, 0).unwrap();
+    let mut cfg = config_with("wubi86");
+    cfg.schema.codetable.auto_commit_at_full = true;
+    Coordinator::new_headless_with_store(cfg, Some(&data_dir()), store)
+}
+
+#[test]
+fn dict_effect_command_auto_commit_executes() {
+    if !has_schemas() {
+        return;
+    }
+    // 含副作用 $CC 命令用户词条：全码唯一自动命中应清组合并异步执行（ClearComposition）。
+    let coord = coord_with_dict_command(r#"$CC("《》", ask("x"))"#, "effect");
+    for ch in ['k', 'k', 'k', 'k'] {
+        press_letter(&coord, ch);
+    }
+    match coord.handle_key_event(&key_event(0x58, EVENT_KEY_DOWN)) {
+        KeyAction::ClearComposition => {}
+        other => panic!(
+            "含副作用命令词条全码唯一应清组合异步执行(ClearComposition)，实际: {:?}",
+            other
+        ),
+    }
+}
+
+#[test]
+fn dict_text_command_auto_commit_evaluates() {
+    if !has_schemas() {
+        return;
+    }
+    // 纯文本 $CC 命令用户词条：全码唯一自动命中应同步求值上屏其文本（而非 display 标签）。
+    let coord = coord_with_dict_command(r#"$CC("标签", type("命令文本"))"#, "text");
+    for ch in ['k', 'k', 'k', 'k'] {
+        press_letter(&coord, ch);
+    }
+    match coord.handle_key_event(&key_event(0x58, EVENT_KEY_DOWN)) {
+        KeyAction::InsertText { text, .. } => {
+            assert_eq!(text, "命令文本", "纯文本命令词条应自动上屏求值文本");
+        }
+        other => panic!(
+            "纯文本命令词条全码唯一应自动上屏(InsertText)，实际: {:?}",
+            other
+        ),
+    }
+}
+
+#[test]
+fn special_mode_effect_command_auto_commit_executes() {
+    if !has_schemas() {
+        return;
+    }
+    // 快符特殊模式（引用 wubi86 方案）：编码命中唯一含副作用 $CC 词条时，
+    // 自动上屏应走命令执行路径（退出模式 + 异步执行 → ClearComposition），
+    // 而非因引擎意向(原始 $CC 源)与展开后 display 文本复核不匹配而静默不触发。
+    let store_path = std::env::temp_dir().join("wind_special_autocmd_effect.redb");
+    let _ = std::fs::remove_file(&store_path);
+    let store = std::sync::Arc::new(wind_store::Store::open(&store_path).unwrap());
+    store
+        .add_user_word("wubi86", "kkkkx", r#"$CC("《》", ask("x"))"#, 0)
+        .unwrap();
+    let mut cfg = config_with("wubi86");
+    cfg.schema.codetable.auto_commit_at_full = true;
+    cfg.schema.special_modes = vec![wind_config::config::SpecialModeConfig {
+        id: "sym".into(),
+        trigger_keys: vec!["backslash".into()],
+        schema: "wubi86".into(),
+        ..Default::default()
+    }];
+    let coord = Coordinator::new_headless_with_store(cfg, Some(&data_dir()), store);
+    // 空缓冲按 \ 进入特殊模式
+    let act = coord.handle_key_event(&key_event(0xDC, EVENT_KEY_DOWN));
+    assert!(
+        matches!(act, KeyAction::UpdateComposition { .. }),
+        "\\ 应进入特殊模式，实际: {:?}",
+        act
+    );
+    for ch in ['k', 'k', 'k', 'k'] {
+        press_letter(&coord, ch);
+    }
+    match coord.handle_key_event(&key_event(0x58, EVENT_KEY_DOWN)) {
+        KeyAction::ClearComposition => {}
+        other => panic!(
+            "特殊模式命中唯一含副作用命令词条应清组合异步执行(ClearComposition)，实际: {:?}",
+            other
+        ),
+    }
+    let _ = std::fs::remove_file(&store_path);
+}
+
+#[test]
 fn clear_on_empty_max_keeps_phrase_candidate() {
     if !has_schemas() {
         return;
