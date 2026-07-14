@@ -1593,7 +1593,18 @@ impl Coordinator {
         let user_dir = self
             .user_themes_dir()
             .ok_or_else(|| anyhow::anyhow!("无用户主题目录"))?;
-        let target = user_dir.join(&meta.name);
+        // 目标目录 id：以调用方传入的 slug（主题唯一 id）为准——
+        //   传了 slug：目录已存在则就地写回（不新建），否则以 slug 建目录（id 与目录名一致）；
+        //   未传 slug（兼容旧客户端）：退回按 meta.name 建目录。
+        let slug = params
+            .get("slug")
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .filter(|s| {
+                !s.is_empty() && !s.contains('/') && !s.contains('\\') && !s.contains("..")
+            });
+        let theme_id = slug.unwrap_or(meta.name.as_str()).to_string();
+        let target = user_dir.join(&theme_id);
         let file = target.join("theme.toml");
         let existed_before = file.exists();
         if existed_before && !force {
@@ -1614,7 +1625,7 @@ impl Coordinator {
         // 捕获「base 引用的基础主题不存在」「继承成环」「合并后结构非法」等 validate_text 单文件校验
         // 无法发现的问题。校验失败则回滚（新写入的删除目录；覆盖的恢复原文本）。
         let dirs = self.theme_dirs();
-        if let Err(e) = wind_theme::theme::load_typed_dirs(&dirs, &meta.name) {
+        if let Err(e) = wind_theme::theme::load_typed_dirs(&dirs, &theme_id) {
             match backup {
                 Some(bytes) => {
                     let _ = std::fs::write(&file, bytes);
@@ -1628,7 +1639,7 @@ impl Coordinator {
                 e
             );
         }
-        Ok(json!({ "ok": true }))
+        Ok(json!({ "ok": true, "slug": theme_id, "display_name": meta.name }))
     }
 
     fn web_theme_list(&self) -> anyhow::Result<Value> {
