@@ -22,6 +22,8 @@ pub struct ResolvedBehavior {
     pub show_page_number: bool,
     pub hide_pager: bool,
     pub vertical_max_width: i32,
+    /// 独立翻页栏行水平对齐：left/center/right（默认 center）。
+    pub pager_align: String,
 }
 
 impl Default for ResolvedBehavior {
@@ -33,6 +35,7 @@ impl Default for ResolvedBehavior {
             show_page_number: true,
             hide_pager: false,
             vertical_max_width: 600,
+            pager_align: String::from("center"),
         }
     }
 }
@@ -342,6 +345,9 @@ fn merge_behavior(theme: &Theme) -> ResolvedBehavior {
         }
         if let Some(v) = ov.vertical_max_width {
             b.vertical_max_width = v;
+        }
+        if let Some(v) = &ov.pager_align {
+            b.pager_align = v.clone();
         }
     }
     b

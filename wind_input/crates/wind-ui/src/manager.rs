@@ -94,6 +94,10 @@ pub enum UiCommand {
     SetTooltipDelay(i32),
     /// 候选窗在光标上方时反转候选顺序。来自 ui.candidate.flip_when_above。
     SetCandidateFlipWhenAbove(bool),
+    /// 候选窗在光标上方时交换编码栏与候选栏位置。来自 ui.candidate.swap_preedit_when_above。
+    SetCandidateSwapWhenAbove(bool),
+    /// 翻页栏并入编码栏行右对齐显示。来自 ui.candidate.pager_in_preedit。
+    SetPagerInPreedit(bool),
     /// 翻页栏显示覆盖（""跟随主题/"hide"/"auto"/"always"）。来自 ui.candidate.pager_bar_display。
     SetPagerDisplay(String),
     /// 页码文字显示覆盖（""跟随主题/"show"/"hide"）。来自 ui.candidate.page_number_display。
@@ -1041,6 +1045,12 @@ impl UiManager {
                     }
                     UiCommand::SetCandidateFlipWhenAbove(flip) => {
                         candidate_window.set_flip_when_above(flip);
+                    }
+                    UiCommand::SetCandidateSwapWhenAbove(swap) => {
+                        candidate_window.set_swap_preedit_when_above(swap);
+                    }
+                    UiCommand::SetPagerInPreedit(on) => {
+                        candidate_window.set_pager_in_preedit(on);
                     }
                     UiCommand::SetPagerDisplay(mode) => {
                         candidate_window.set_pager_display(mode);

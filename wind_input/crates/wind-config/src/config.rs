@@ -1252,6 +1252,12 @@ pub struct UiCandidateConfig {
     /// 候选窗在光标上方时反转候选排列顺序。
     #[serde(default)]
     pub flip_when_above: bool,
+    /// 候选窗在光标上方时交换编码栏与候选栏位置（编码区沉底贴光标）。与 flip_when_above 正交，可叠加。
+    #[serde(default)]
+    pub swap_preedit_when_above: bool,
+    /// 翻页栏并入编码栏行、右对齐显示（竖排省一行）。仅"非嵌入编码"（有独立编码栏）时生效。
+    #[serde(default)]
+    pub pager_in_preedit: bool,
 }
 
 fn default_preedit_display() -> String {
@@ -1332,6 +1338,8 @@ impl Default for UiCandidateConfig {
             max_chars: 16,
             index_labels: String::new(),
             flip_when_above: false,
+            swap_preedit_when_above: false,
+            pager_in_preedit: false,
         }
     }
 }

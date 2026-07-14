@@ -257,6 +257,8 @@ impl Forwarder {
             UiCommand::SetCandidateFontFamily(f) => self.win.set_font_family(&f),
             UiCommand::SetTooltipDelay(d) => self.win.set_tooltip_delay(d),
             UiCommand::SetCandidateFlipWhenAbove(v) => self.win.set_flip_when_above(v),
+            UiCommand::SetCandidateSwapWhenAbove(v) => self.win.set_swap_preedit_when_above(v),
+            UiCommand::SetPagerInPreedit(v) => self.win.set_pager_in_preedit(v),
             UiCommand::SetPagerDisplay(m) => self.win.set_pager_display(m),
             UiCommand::SetPageNumberDisplay(m) => self.win.set_page_number_display(m),
             UiCommand::SetTooltipChaiziFont { path, family } => {

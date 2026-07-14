@@ -190,6 +190,12 @@ pub struct CandidateWindow {
     pager_display: String,
     /// 页码文字显示覆盖（""跟随主题/"show"/"hide"）。来自 ui.candidate.page_number_display。
     page_number_display: String,
+    /// 候选窗在光标上方时交换编码栏与候选栏位置（编码区整体沉底贴光标）。
+    /// 与 flip_when_above 正交：可单独或叠加使用。来自 ui.candidate.swap_preedit_when_above。
+    swap_preedit_when_above: bool,
+    /// 翻页栏并入编码栏行、右对齐显示（竖排省一行）。仅"非嵌入编码"（有独立编码栏）时生效。
+    /// 来自 ui.candidate.pager_in_preedit。
+    pager_in_preedit: bool,
 }
 
 impl CandidateWindow {
@@ -236,6 +242,8 @@ impl CandidateWindow {
             placed_above: false,
             pager_display: String::new(),
             page_number_display: String::new(),
+            swap_preedit_when_above: false,
+            pager_in_preedit: false,
         })
     }
 
@@ -268,6 +276,16 @@ impl CandidateWindow {
     /// 设置"上方时反转候选顺序"。来自 ui.candidate.flip_when_above。
     pub fn set_flip_when_above(&mut self, flip: bool) {
         self.flip_when_above = flip;
+    }
+
+    /// 设置"上方时交换编码栏与候选栏位置"。来自 ui.candidate.swap_preedit_when_above。
+    pub fn set_swap_preedit_when_above(&mut self, swap: bool) {
+        self.swap_preedit_when_above = swap;
+    }
+
+    /// 设置"翻页栏并入编码栏行"。来自 ui.candidate.pager_in_preedit。
+    pub fn set_pager_in_preedit(&mut self, on: bool) {
+        self.pager_in_preedit = on;
     }
 
     /// 设置翻页栏显示覆盖。来自 ui.candidate.pager_bar_display。
@@ -461,7 +479,7 @@ impl CandidateWindow {
         };
         self.last_content_pos = Some((px, py));
         // 上方显示且启用 → 逆序重建候选树（项数/尺寸/位置不变，仅排列翻转）
-        if self.flip_when_above && self.placed_above {
+        if self.placed_above && (self.flip_when_above || self.swap_preedit_when_above) {
             root = self.build_tree(true);
             root.layout(ml as f32, mt as f32, &self.text_renderer);
         }
@@ -603,7 +621,7 @@ impl CandidateWindow {
             _ => (px0, py0),
         };
         self.last_content_pos = Some((px, py));
-        if self.flip_when_above && self.placed_above {
+        if self.placed_above && (self.flip_when_above || self.swap_preedit_when_above) {
             root = self.build_tree(true);
             root.layout(ml as f32, mt as f32, &self.text_renderer);
         }
@@ -729,7 +747,7 @@ impl CandidateWindow {
             _ => (px0, py0),
         };
         self.last_content_pos = Some((px, py));
-        if self.flip_when_above && self.placed_above {
+        if self.placed_above && (self.flip_when_above || self.swap_preedit_when_above) {
             root = self.build_tree(true);
             root.layout(ml as f32, mt as f32, &self.text_renderer);
         }
@@ -1021,13 +1039,27 @@ impl CandidateWindow {
 
     /// 按当前状态构建候选视图树（横向布局）。
     /// T3：从 RVNode 树（`Resolved.views`）取色/几何，颜色 None→兜底（与旧 ResolvedTheme 默认等值，零回归）。
-    /// 构建候选 View 树。`flip=true` 时候选按相反顺序排列（上方显示场景），
-    /// 但每项的 tag/序号标签/选中判定仍用原始索引 i，确保命中/选中映射不变。
-    fn build_tree(&self, flip: bool) -> View {
+    /// 构建候选 View 树。`above=true`（窗口上翻到光标上方）时按三个正交开关调整布局：
+    /// 反转候选（flip_when_above）、交换编码/候选区（swap_preedit_when_above）、翻页栏并入编码栏
+    /// （pager_in_preedit，与 above 无关的常驻行为）。任何情形下每项 tag/序号标签/选中判定仍用
+    /// 原始索引 i，确保命中/选中映射不受排列变化影响。
+    fn build_tree(&self, above: bool) -> View {
         use wind_theme::rvnode::{RvEdges, RvNode};
         use wind_theme::schema::Dim;
         let t = &self.theme;
         let v = &t.views;
+        // above=true（窗口被上翻到光标上方）时，据两个正交开关派生上方专属行为：
+        //   flip_cands = 反转候选项排列顺序（ui.candidate.flip_when_above）
+        //   swap_bands = 交换编码区↔候选区上下位置（ui.candidate.swap_preedit_when_above，编码沉底贴光标）
+        // 二者可单独或叠加：叠加时候选块内部反转 + 编码沉底 = 候选1 紧挨编码栏。
+        let flip_cands = above && self.flip_when_above;
+        let swap_bands = above && self.swap_preedit_when_above;
+        // 翻页栏并入编码栏行（右对齐）：需开关开启 + 有独立编码栏（非嵌入）+ 翻页栏本身可见。
+        // 满足时翻页栏随编码区一同装配（swap 时自动跟随沉底）；否则回退候选行尾/竖排底部独立行。
+        let pager_will_inline = self.pager_in_preedit
+            && !self.preedit.is_empty()
+            && !self.preedit_embedded
+            && self.pager_visible();
         let s = self.scale;
         // 字号：base = 用户覆盖(ui.candidate.font_size>0) 否则主题 behavior.font_size（默认 18）× DPI；
         // 序号/注释/预编辑按各节点 font_size（相对主字号的有符号逻辑偏移）调整。
@@ -1141,8 +1173,13 @@ impl CandidateWindow {
         // 预编辑行（主题背景带 + 文本色）。完整渲染 preedit_bar 自身背景：底色 + 位图背景 +
         // z 层 + 边框（此前只画底色，位图主题的 preedit 背景/边框丢失）。
         // 嵌入模式（preedit_embedded）下不画独立条——编码作为候选行首单元内联（见下方 list 构建）。
+        // 【延迟装配】编码栏与分隔线不在此直接 push root，先存入变量；末尾装配段据 swap_bands 决定
+        // 放窗口顶部（正常）或底部（编码沉底贴光标），并据 pager_will_inline 追加翻页栏到栏行右端。
+        let mut preedit_band: Option<View> = None;
+        let mut preedit_sep: Option<View> = None;
         if !self.preedit.is_empty() && !self.preedit_embedded {
             let mut band = View::container(Layout::Row)
+                .cross(Align::Center)
                 .bg(col(v.preedit_bar.bg_color, [240, 240, 240, 255]))
                 .radius(dim(v.item.border_radius, 4.0))
                 .pad(edges_or(&v.preedit_bar.padding, [3.0, 8.0, 3.0, 8.0]))
@@ -1169,8 +1206,13 @@ impl CandidateWindow {
             if let Some(bc) = v.preedit_bar.border_color {
                 band = band.border(bc, dim(v.preedit_bar.border_width, 0.0).max(1.0));
             }
-            // 模式标记：单行 preedit 栏模式下右对齐到栏行末尾。
-            // band 跨轴撑满窗口内容宽 + spacer 吸收中间空白 → 标记贴右；字号取主题 mode_label 配置。
+            // 右对齐区（mode_label / 并入的翻页栏）：band 跨轴撑满窗口内容宽 + spacer 吸收中间空白，
+            // 才能把右侧内容顶到栏行末尾。二者任一存在即启用（排布：[编码] spacer [mode_label] [翻页栏]）。
+            let need_right_align = !self.mode_label.is_empty() || pager_will_inline;
+            if need_right_align {
+                band = band.fill_cross().child(View::spacer());
+            }
+            // 模式标记：右对齐到栏行末尾（在翻页栏之左）；字号取主题 mode_label 配置。
             if !self.mode_label.is_empty() {
                 let ml_fs = node_fs(&v.mode_label);
                 let mut chip = View::leaf(
@@ -1190,18 +1232,19 @@ impl CandidateWindow {
                         .radius(dim(v.item.border_radius, 4.0))
                         .pad(edges_or(&v.mode_label.padding, [1.0, 6.0, 1.0, 6.0]));
                 }
-                band = band.fill_cross().child(View::spacer()).child(chip);
+                band = band.child(chip);
             }
+            // 翻页栏并入（pager_will_inline）：在末尾装配段追加到此 band 末尾（spacer 右侧）。
             // 清风设计主题（定义 separator 色）：预编辑行全宽 + 底部极淡分隔线（与候选区分）；
             // 普通/第三方主题（无 separator）保持原行为（内容宽、无分隔线），尽量减少影响。
             let sep_col = t.color("separator", [0, 0, 0, 0]);
             let preedit_designed = sep_col[3] > 0;
-            if preedit_designed {
+            if preedit_designed && !need_right_align {
                 band = band.fill_cross();
             }
-            root = root.child(band);
+            preedit_band = Some(band);
             if preedit_designed {
-                root = root.child(
+                preedit_sep = Some(
                     View::container(Layout::Row)
                         .bg(sep_col)
                         .fixed_h((1.0 * s).max(1.0))
@@ -1333,7 +1376,7 @@ impl CandidateWindow {
         }
         // 逆序仅改排列顺序；i 仍是原始索引（tag/标签/选中据此）
         let mut order: Vec<(usize, &CandidateItem)> = self.candidates.iter().enumerate().collect();
-        if flip {
+        if flip_cands {
             order.reverse();
         }
         for (i, cand) in order {
@@ -1451,7 +1494,8 @@ impl CandidateWindow {
         }
 
         // 翻页器（多页时）：‹ p/t › —— 箭头可点击翻页，带悬停高亮 + 禁用态
-        let pager = if self.pager_visible() {
+        // mut：末尾装配段据归属（并入编码栏 / 候选行尾 / 竖排底部）用 take() 转移所有权。
+        let mut pager = if self.pager_visible() {
             let disabled = t.color("text_hint", [180, 180, 185, 255]);
             let marker_c = t.color("text_dim", [140, 140, 145, 255]);
             let accent = col(v.accent_bar.bg_color, [66, 133, 244, 255]);
@@ -1464,7 +1508,13 @@ impl CandidateWindow {
             // 命中区 = 整个矩形（与图标实际像素范围解耦），悬停在该矩形内即触发圆角高亮。
             let fpad = edges_or(&v.footer_bar.padding, [0.0, 6.0, 0.0, 6.0]);
             let arrow_w = footer_fs + fpad.l + fpad.r;
-            let row_h = text_fs + item_pad.t + item_pad.b;
+            // 触摸区高度：独立行=候选行高；并入编码栏(pager_will_inline)=编码文字高(自适应)，
+            // 使翻页栏不撑高编码栏（消除有/无翻页栏时的抖动）并与编码在栏内垂直居中。
+            let row_h = if pager_will_inline {
+                preedit_fs.max(footer_fs)
+            } else {
+                text_fs + item_pad.t + item_pad.b
+            };
             // 翻页箭头：主题配了 prev/next_image（如 _base 的 chevron SVG + tint）则用图标，否则回退文字 ‹ ›。
             let prev_icon = self.arrow_icon(v.footer_bar.prev_image.as_ref(), prev_on);
             let next_icon = self.arrow_icon(v.footer_bar.next_image.as_ref(), next_on);
@@ -1537,17 +1587,66 @@ impl CandidateWindow {
             None
         };
 
-        // 装配：横排把翻页器并入候选行尾；竖排把候选列表 + 翻页器纵向堆入窗口。
-        if self.vertical {
-            root = root.child(list);
-            if let Some(p) = pager {
-                root = root.child(p);
+        // ── 装配 ──
+        // 翻页栏归属（按优先级三选一）：
+        //   1) pager_will_inline → 追加到编码栏 band 右端（随编码区一同装配，swap 时自动沉底贴光标）
+        //   2) 横排 → 并入候选行尾（原行为）
+        //   3) 竖排 → 候选区底部独立行（原行为）
+        if pager_will_inline {
+            if let (Some(band), Some(p)) = (preedit_band.take(), pager.take()) {
+                preedit_band = Some(band.child(p));
             }
-        } else {
-            if let Some(p) = pager {
+        } else if !self.vertical {
+            if let Some(p) = pager.take() {
                 list = list.child(p);
             }
+        }
+        // 竖排未并入的翻页栏：候选区独立行（与 list 同属候选区，随 swap 一起移动）。
+        // 独立行按主题 behavior.pager_align（left/center/right，默认 center）水平对齐：包一层
+        // fill_cross 的 Row 用 spacer 顶位。inline 情形已在编码栏内右对齐，不经此。
+        let vertical_bottom_pager = if self.vertical {
+            pager.take().map(|p| {
+                let row = View::container(Layout::Row)
+                    .fill_cross()
+                    .cross(Align::Center);
+                match self.theme.behavior.pager_align.as_str() {
+                    "left" => row.child(p),
+                    "right" => row.child(View::spacer()).child(p),
+                    _ => row.child(View::spacer()).child(p).child(View::spacer()),
+                }
+            })
+        } else {
+            None
+        };
+
+        // 编码区（band + 分隔线）与候选区（list + 竖排底部翻页栏）按 swap_bands 决定上下顺序：
+        //   false（正常）：编码区在上、候选区在下 → [band][sep][候选区]
+        //   true （上翻）：候选区在上、编码区在下 → [候选区][sep][band]（编码沉底贴光标）
+        // 分隔线始终位于编码栏"朝向候选区"的一侧，语义（分隔编码/候选）保持不变。
+        if swap_bands {
+            // 完整上下镜像：正常 [编码][候选][翻页] → 镜像 [翻页][候选][编码]。
+            // 竖排底部翻页栏一并翻到顶部，否则会夹在候选与编码之间，视觉不自然。
+            if let Some(p) = vertical_bottom_pager {
+                root = root.child(p);
+            }
             root = root.child(list);
+            if let Some(sep) = preedit_sep {
+                root = root.child(sep);
+            }
+            if let Some(band) = preedit_band {
+                root = root.child(band);
+            }
+        } else {
+            if let Some(band) = preedit_band {
+                root = root.child(band);
+            }
+            if let Some(sep) = preedit_sep {
+                root = root.child(sep);
+            }
+            root = root.child(list);
+            if let Some(p) = vertical_bottom_pager {
+                root = root.child(p);
+            }
         }
         root
     }

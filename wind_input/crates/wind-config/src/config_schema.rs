@@ -218,6 +218,8 @@ static REGISTRY: &[ConfigField] = &[
     f("ui.candidate.max_chars", Int),
     f("ui.candidate.index_labels", Str),
     f("ui.candidate.flip_when_above", Bool),
+    f("ui.candidate.swap_preedit_when_above", Bool),
+    f("ui.candidate.pager_in_preedit", Bool),
     f("ui.font.family", Str),
     f("ui.font.path", Str),
     f("ui.font.render_mode", Enum(&["directwrite", "gdi"])),

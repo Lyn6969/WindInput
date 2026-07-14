@@ -398,6 +398,9 @@ pub struct Behavior {
     pub show_page_number: Option<bool>,
     pub hide_pager: Option<bool>,
     pub vertical_max_width: Option<i32>,
+    /// 独立翻页栏行的水平对齐：left/center/right（默认 center）。仅竖排独立翻页栏行生效；
+    /// 翻页栏并入编码栏时强制右对齐，不受此项影响。
+    pub pager_align: Option<String>,
 }
 
 /// 经 base 深合并后的「原始 Theme」（未求值）。

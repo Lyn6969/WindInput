@@ -719,6 +719,12 @@ impl Coordinator {
         let _ = coordinator.ui_tx.send(UiCommand::SetCandidateFlipWhenAbove(
             rt0.config.ui.candidate.flip_when_above,
         ));
+        let _ = coordinator.ui_tx.send(UiCommand::SetCandidateSwapWhenAbove(
+            rt0.config.ui.candidate.swap_preedit_when_above,
+        ));
+        let _ = coordinator.ui_tx.send(UiCommand::SetPagerInPreedit(
+            rt0.config.ui.candidate.pager_in_preedit,
+        ));
         let _ = coordinator
             .ui_tx
             .send(UiCommand::SetTooltipDelay(rt0.config.ui.tooltip.delay));
@@ -1501,10 +1507,16 @@ impl Coordinator {
         let _ = self.ui_tx.send(UiCommand::SetPageNumberDisplay(
             cand.page_number_display.clone(),
         ));
-        // 上方时反转候选顺序（ui.candidate.flip_when_above）
+        // 上方时反转候选顺序 / 交换编码候选栏 / 翻页栏并入编码栏
         let _ = self
             .ui_tx
             .send(UiCommand::SetCandidateFlipWhenAbove(cand.flip_when_above));
+        let _ = self.ui_tx.send(UiCommand::SetCandidateSwapWhenAbove(
+            cand.swap_preedit_when_above,
+        ));
+        let _ = self
+            .ui_tx
+            .send(UiCommand::SetPagerInPreedit(cand.pager_in_preedit));
         // 悬停提示延迟（ui.tooltip.delay）
         let _ = self
             .ui_tx
