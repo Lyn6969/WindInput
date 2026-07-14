@@ -401,6 +401,15 @@ STDAPI CKeyEventSink::OnTestKeyDown(ITfContext* pContext, WPARAM wParam, LPARAM 
     if (!isChineseMode && _englishPairEngine.IsEnabled()
         && !(modifiers & (KEYMOD_CTRL | KEYMOD_ALT)))
     {
+        // 配对跳出键：栈非空时吃键，让 OnKeyDown 稳定被调用执行跳出（严格 TSF 宿主
+        // 只有 OnTestKeyDown 吃键才会回调 OnKeyDown）。排除 Shift 组合。
+        if (!_englishPairEngine.IsEmpty() && _IsJumpOutKey((UINT)wParam) && !(modifiers & KEYMOD_SHIFT))
+        {
+            *pfEaten = TRUE;
+            _LogKeyDecision(L"test_down", _pTextService->GetFocusSessionId(), wParam, modifiers, HotkeyType::None,
+                            isChineseMode, hasComposition, _hasCandidates, hasInputSession, TRUE, L"english_pair_jumpout");
+            return S_OK;
+        }
         bool hasShift = (modifiers & KEYMOD_SHIFT) != 0;
         wchar_t pairChar = _MapVkToEnglishPairChar(wParam, hasShift);
         if (pairChar != 0 && (_englishPairEngine.IsLeft(pairChar) || _englishPairEngine.IsRight(pairChar)))
@@ -421,6 +430,19 @@ STDAPI CKeyEventSink::OnTestKeyDown(ITfContext* pContext, WPARAM wParam, LPARAM 
 
     if (hasInputSession || isChineseMode)
     {
+        // 配对跳出键（中文模式）：有待跳出配对时即使无输入会话也吃键，让 OnKeyDown 转发
+        // 给协调器执行跳出。Tab 走下方 session_select_or_page 分支在中文模式本就转发，
+        // 此处专补 Enter 等被 session 门控的键。排除 Ctrl/Alt/Shift 组合。
+        if (_pairPendingDepth > 0 && _IsJumpOutKey((UINT)wParam)
+            && !(modifiers & (KEYMOD_CTRL | KEYMOD_ALT | KEYMOD_SHIFT)))
+        {
+            *pfEaten = TRUE;
+            _LogKeyDecision(L"test_down", _pTextService->GetFocusSessionId(), wParam, modifiers,
+                            CHotkeyManager::ClassifyInputKey(wParam, modifiers),
+                            isChineseMode, hasComposition, _hasCandidates, hasInputSession, TRUE, L"pair_jumpout_forward");
+            return S_OK;
+        }
+
         // Ctrl/Alt combos during active input session: intercept so OnKeyDown can
         // send to Go for state cleanup, then pass through to the host application.
         // This prevents dangling composition state when user presses Ctrl+S, Ctrl+C, etc.
@@ -615,6 +637,18 @@ STDAPI CKeyEventSink::OnKeyDown(ITfContext* pContext, WPARAM wParam, LPARAM lPar
         uint32_t mods = CHotkeyManager::GetCurrentModifiers();
         if (!(mods & (KEYMOD_CTRL | KEYMOD_ALT)))
         {
+            // 配对跳出键（Tab/Enter 等）：英文配对栈非空时按此键 = 越过右符号跳出，
+            // 等效输入右符号。置于 pairChar 映射之前——跳出键本身不是配对字符。
+            // 排除 Shift 组合（Shift+Tab 回退制表 / Shift+Enter 软换行不应被劫持）。
+            if (!_englishPairEngine.IsEmpty() && _IsJumpOutKey((UINT)wParam) && !(mods & KEYMOD_SHIFT))
+            {
+                PairEngine::Entry entry;
+                _englishPairEngine.Pop(entry);
+                WIND_LOG_DEBUG_FMT(L"English auto-pair: jump-out key vk=0x%02X -> VK_RIGHT\n", (uint32_t)wParam);
+                _SimulatePairKey(VK_RIGHT);
+                *pfEaten = TRUE;
+                return S_OK;
+            }
             bool hasShift = (mods & KEYMOD_SHIFT) != 0;
             wchar_t pairChar = _MapVkToEnglishPairChar(wParam, hasShift);
 
@@ -939,9 +973,16 @@ STDAPI CKeyEventSink::OnKeyDown(ITfContext* pContext, WPARAM wParam, LPARAM lPar
         {
             HotkeyType keyType = CHotkeyManager::ClassifyInputKey(wParam, modifiers);
 
+            // 配对跳出键（中文模式）：有待跳出配对时转发给协调器执行跳出，即使无会话
+            // （与 OnTestKeyDown 的 pair_jumpout_forward 对称）。排除 Ctrl/Alt/Shift 组合。
+            if (_pairPendingDepth > 0 && _IsJumpOutKey((UINT)wParam)
+                && !(modifiers & (KEYMOD_CTRL | KEYMOD_ALT | KEYMOD_SHIFT)))
+            {
+                isInputKey = TRUE;
+            }
             // Backspace, Enter, Escape, CursorKey should only be intercepted when there's an active composition or input session
             // Otherwise they should pass through to the application
-            if (keyType == HotkeyType::Backspace || keyType == HotkeyType::Enter ||
+            else if (keyType == HotkeyType::Backspace || keyType == HotkeyType::Enter ||
                 keyType == HotkeyType::Escape || keyType == HotkeyType::CursorKey)
             {
                 isInputKey = hasInputSession;  // Only intercept if we have composition or input session
@@ -1793,6 +1834,10 @@ BOOL CKeyEventSink::_HandleServiceResponse()
             _hasCandidates = FALSE;
             for (int i = 0; i < response.cursorOffset; i++)
                 _SimulatePairKey(VK_LEFT);
+            // 中文模式配对插入：记一层待跳出深度，使后续 Enter 等被会话门控的跳出键
+            // 在无会话时也转发给协调器执行跳出（Tab 本就无条件转发，不依赖此计数）。
+            if (response.cursorOffset > 0)
+                _pairPendingDepth++;
         }
         return TRUE;
 
@@ -1800,6 +1845,8 @@ BOOL CKeyEventSink::_HandleServiceResponse()
         {
             WIND_LOG_DEBUG(L"Processing MoveCursorRight response (smart skip)\n");
             _SimulatePairKey(VK_RIGHT);
+            if (_pairPendingDepth > 0)
+                _pairPendingDepth--;
         }
         return TRUE;
 
@@ -2089,6 +2136,19 @@ void CKeyEventSink::OnSyncConfig(const std::string& key, const std::vector<uint8
         _englishPairEngine.SetEnabled(enabled);
 
         WIND_LOG_INFO_FMT(L"English pair config updated: enabled=%d, pairs=%d\n", enabled, (int)pairs.size());
+    }
+    else if (key == CONFIG_KEY_JUMP_OUT_KEYS)
+    {
+        // 格式：count(u8) + [vk:u16(LE)]...（对齐 Rust encode_jump_out_keys_value）
+        _jumpOutKeys.clear();
+        if (value.empty()) return;
+        uint8_t count = value[0];
+        for (size_t i = 0; i < count && (1 + i * 2 + 2) <= value.size(); i++)
+        {
+            uint16_t vk = *reinterpret_cast<const uint16_t*>(value.data() + 1 + i * 2);
+            _jumpOutKeys.insert((UINT)vk);
+        }
+        WIND_LOG_INFO_FMT(L"Jump-out keys config updated: count=%d\n", (int)_jumpOutKeys.size());
     }
     else if (key == CONFIG_KEY_STATS)
     {

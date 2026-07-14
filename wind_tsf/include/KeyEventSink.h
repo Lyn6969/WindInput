@@ -91,7 +91,7 @@ public:
     // 用于 Excel/WPS cell-select(按数字直通) → cell-edit(按标点) 这种焦点切换
     // 场景的数字后智能标点判断。残留由按键事件路径（_SendKeyToService 非智能
     // 标点目标键清零）和光标 Y 跨行检测兜底，不应在 IME 会话状态重置时一起清。
-    void ResetComposingState() { _isComposing = FALSE; _hasCandidates = FALSE; _needsCompositionResync = FALSE; _resyncDeadline = 0; _resyncFailStreak = 0; _skipKeyCount = 0; _pendingPairAction = {}; _englishPairEngine.Clear(); }
+    void ResetComposingState() { _isComposing = FALSE; _hasCandidates = FALSE; _needsCompositionResync = FALSE; _resyncDeadline = 0; _resyncFailStreak = 0; _skipKeyCount = 0; _pendingPairAction = {}; _englishPairEngine.Clear(); _pairPendingDepth = 0; }
 
     // Flush pending English pass-through stats before focus/mode teardown.
     void FlushEnglishStats();
@@ -133,6 +133,13 @@ private:
     // State
     BOOL _isComposing;
     BOOL _hasCandidates;         // True if there are candidates to select
+    // 配对跳出键（VK 码集合，由 core 经 CONFIG_KEY_JUMP_OUT_KEYS 推送）。英文模式配对直接
+    // 据此跳出；中文模式仅用于「有待跳出配对」时放行 Enter 等被会话门控的键转发给协调器。
+    std::set<UINT> _jumpOutKeys;
+    // 待跳出配对深度：收到 InsertTextWithCursor(配对插入)时 +1，MoveCursorRight(跳出)时 -1，
+    // 会话/焦点复位归零（见 ResetComposingState）。中文模式据此判断 Enter 等键是否该转发。
+    int _pairPendingDepth = 0;
+    bool _IsJumpOutKey(UINT vk) const { return _jumpOutKeys.count(vk) > 0; }
     // IPC 失败后置位：本地 composition 已强制复位，但 Go 侧可能仍持有活跃会话状态。
     // 下一次按键前提下视作"有会话"，让 ENTER/ESC 也能发给 Go 走重握手；
     // 任何一次成功 ReceiveResponse 之后清旗，状态由响应处理路径自然重建。

@@ -466,6 +466,7 @@ static_assert(sizeof(InputStatsPayload) == 20, "InputStatsPayload must be 20 byt
 
 // Config sync keys (must match Go side)
 constexpr const char* CONFIG_KEY_ENGLISH_PAIRS = "en_pairs";
+constexpr const char* CONFIG_KEY_JUMP_OUT_KEYS = "jump_out_keys";
 constexpr const char* CONFIG_KEY_STATS = "stats";
 
 // Calculate key hash for hotkey matching
