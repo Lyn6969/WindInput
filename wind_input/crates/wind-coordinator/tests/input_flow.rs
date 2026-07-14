@@ -2056,6 +2056,49 @@ fn test_semicolon_overflow_falls_to_mix_not_overflow() {
     }
 }
 
+#[test]
+fn test_special_trigger_with_candidates_commits_and_enters() {
+    if !has_schemas() {
+        return;
+    }
+    // 特殊模式引导键在「有候选」时应与 mix/临拼一致：顶屏高亮候选 + 进模式
+    // （此前只有空缓冲入口，有候选时 \ 落标点流程上屏 、）。默认 direct_commit：
+    // 真提交候选、引导符新组合延迟到 keyup 才开。
+    let mut cfg = config_with("wubi86");
+    cfg.schema.special_modes = vec![wind_config::config::SpecialModeConfig {
+        id: "sym".into(),
+        trigger_keys: vec!["backslash".into()],
+        schema: "pinyin".into(),
+        ..Default::default()
+    }];
+    let coord = Coordinator::new_headless(cfg, Some(&data_dir()));
+    press_letter(&coord, 'a');
+    let texts = coord.debug_page_texts();
+    if texts.is_empty() {
+        return;
+    }
+    let highlighted = texts[0].clone();
+    match coord.handle_key_event(&key_event(0xDC, EVENT_KEY_DOWN)) {
+        KeyAction::CommitThenDeferComposition {
+            commit_text,
+            deferred_composition,
+            ..
+        } => {
+            assert_eq!(commit_text, highlighted, "\\ 应顶字真提交当前高亮候选");
+            assert_eq!(deferred_composition, "\\", "进入特殊模式应延迟开引导符组合");
+        }
+        other => panic!("有候选按 \\ 应顶屏+进特殊模式，实际: {:?}", other),
+    }
+    // 已在特殊模式：后续输入走其引用方案，组合区以引导符 \ 开头。
+    let act = press_letter(&coord, 'n');
+    let preedit = action_text(&act).unwrap();
+    assert!(
+        preedit.starts_with('\\'),
+        "顶屏进入后应处于特殊模式（组合区以 \\ 开头），实际: {}",
+        preedit
+    );
+}
+
 // ---- 以词定字（select_char_keys，对齐 Go handleSelectChar/handleSelectCharWithOverflow）----
 // comma_period 组：`,`(VK_OEM_COMMA=0xBC) 取第 1 字，`.`(VK_OEM_PERIOD=0xBE) 取第 2 字。
 

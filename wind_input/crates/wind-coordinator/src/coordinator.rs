@@ -3367,7 +3367,8 @@ impl MessageHandler for Coordinator {
                         && let Some(schema) = self.special_schema(idx)
                         && self.engine_mgr.ensure_schema(&schema)
                     {
-                        return self.commit_and_enter_special_mode(&mut state, idx);
+                        // key_code=0 哨兵：热键进入不写引导符。
+                        return self.commit_and_enter_special_mode(&mut state, idx, 0);
                     }
                     return KeyAction::Consumed;
                 }
@@ -3876,6 +3877,15 @@ impl MessageHandler for Coordinator {
                         }
                     }
                     // D. 模式触发键 → 顶屏高亮候选 + 进模式。
+                    // 特殊模式引导键（判定顺序对齐空缓冲时 handle_lifecycle：special 先于 mix）——
+                    // 方案不可加载则不拦截，落普通流程（与空缓冲进入同守卫）。传真实 key_code
+                    // → 组合区写引导符，与空缓冲进入一致。
+                    if let Some(idx) = self.match_special_trigger(data.key_code)
+                        && let Some(schema) = self.special_schema(idx)
+                        && self.engine_mgr.ensure_schema(&schema)
+                    {
+                        return self.commit_and_enter_special_mode(&mut state, idx, data.key_code);
+                    }
                     // 融合「快捷」（现唯一的快捷输入形态，成员含日期/计算/拼音/英文）——对齐空缓冲
                     // 时 handle_lifecycle 的 enter_mix_mode，使有无候选都进同一融合模式。
                     if let Some(idx) = self.match_mix_trigger(data.key_code)

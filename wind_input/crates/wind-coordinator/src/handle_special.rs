@@ -45,10 +45,17 @@ impl Coordinator {
             .map(|i| i as u8)
     }
 
-    /// 直达热键进入特殊模式：先把当前普通输入的半成品上屏（复用 `take_committed` + 高亮候选），
-    /// 再 `enter_special_mode(idx, key_code=0)`。key_code=0 是哨兵：`vk_to_prefix_char(0)` 返回 None
-    /// → `special_prefix` 为空，满足「热键进入不写引导符」。方案须可加载（调用方 `ensure_schema` 保证）。
-    pub(crate) fn commit_and_enter_special_mode(&self, state: &mut State, idx: u8) -> KeyAction {
+    /// 顶屏当前普通输入的半成品（复用 `take_committed` + 高亮候选）并进入特殊模式，
+    /// 供直达热键与「缓冲非空/有候选时按引导键」两处共用（对齐 mix/临拼的 commit_and_enter）。
+    /// key_code=0 是热键哨兵：`vk_to_prefix_char(0)` 返回 None → `special_prefix` 为空，满足
+    /// 「热键进入不写引导符」；引导键进入传真实 VK，组合区写引导符（与空缓冲进入一致）。
+    /// 方案须可加载（调用方 `ensure_schema` 保证）。
+    pub(crate) fn commit_and_enter_special_mode(
+        &self,
+        state: &mut State,
+        idx: u8,
+        key_code: u32,
+    ) -> KeyAction {
         // 命令候选顶屏 → 执行命令（与按空格一致），不进模式。
         if let Some(act) = self.top_commit_command_guard(state) {
             return act;
@@ -67,7 +74,7 @@ impl Coordinator {
             None
         };
         // enter_special_mode 内部清空 input_buffer/candidates、建组合区（key_code=0 → 前缀空）、刷 UI。
-        let enter = self.enter_special_mode(state, idx, 0);
+        let enter = self.enter_special_mode(state, idx, key_code);
         match committed {
             Some(text) => {
                 let new_comp = match &enter {
@@ -405,7 +412,7 @@ mod tests {
         let mut st = c.state.lock().unwrap();
         st.chinese_mode = true;
         // 空缓冲进入：无半成品可上屏 → 返回 UpdateComposition，组合区无引导符。
-        let act = c.commit_and_enter_special_mode(&mut st, 0);
+        let act = c.commit_and_enter_special_mode(&mut st, 0, 0);
         assert_eq!(st.active, Some(ModeKind::Special(0)));
         assert!(
             st.special_prefix.is_empty(),
@@ -427,7 +434,7 @@ mod tests {
         }];
         st.selected_index = 0;
         st.current_page = 0;
-        let act = c.commit_and_enter_special_mode(&mut st, 0);
+        let act = c.commit_and_enter_special_mode(&mut st, 0, 0);
         // 进入前的高亮候选应作为 InsertText 上屏，随后进入目标模式、组合区无引导符。
         match act {
             KeyAction::InsertText { text, .. } => assert_eq!(text, "工"),
