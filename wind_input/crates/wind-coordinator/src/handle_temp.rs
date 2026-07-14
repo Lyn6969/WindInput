@@ -697,13 +697,7 @@ impl Coordinator {
         self.notify_ui_update(state);
         let prefix = state.temp_pinyin_prefix.clone();
         match committed {
-            Some(text) => KeyAction::InsertText {
-                text,
-                new_composition: Some(prefix),
-                mode_changed: false,
-                chinese_mode: true,
-                has_new_composition: true,
-            },
+            Some(text) => self.commit_then_new_composition(text, prefix),
             None => KeyAction::UpdateComposition {
                 text: prefix.clone(),
                 caret_pos: prefix.chars().count() as u32,

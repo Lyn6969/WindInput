@@ -74,13 +74,7 @@ impl Coordinator {
                     KeyAction::UpdateComposition { text, .. } => text.clone(),
                     _ => state.preedit.clone(),
                 };
-                KeyAction::InsertText {
-                    text,
-                    new_composition: Some(new_comp),
-                    mode_changed: false,
-                    chinese_mode: true,
-                    has_new_composition: true,
-                }
+                self.commit_then_new_composition(text, new_comp)
             }
             None => enter,
         }
@@ -456,5 +450,53 @@ mod tests {
             st.temp_pinyin_prefix.is_empty(),
             "直达热键（key_code=0）进入临拼不应写引导符"
         );
+    }
+
+    /// 「顶屏 + 进模式」收尾按 top_commit_mode 分流（与顶码上屏统一）：
+    /// direct_commit（默认）+ 引导符新组合 → 真提交 + 延迟组合；新组合为空 → 直接真提交；
+    /// pre_confirm → InsertText 聚合。
+    #[test]
+    fn commit_then_new_composition_follows_top_commit_mode() {
+        let c = coord_with("ctnc_direct", Config::default());
+        match c.commit_then_new_composition("可能".to_string(), "`".to_string()) {
+            KeyAction::CommitThenDeferComposition {
+                commit_text,
+                deferred_composition,
+                ..
+            } => {
+                assert_eq!(commit_text, "可能");
+                assert_eq!(deferred_composition, "`");
+            }
+            other => panic!("direct_commit 有新组合应走真提交+延迟组合，实际 {other:?}"),
+        }
+        match c.commit_then_new_composition("可能".to_string(), String::new()) {
+            KeyAction::InsertText {
+                text,
+                new_composition,
+                has_new_composition,
+                ..
+            } => {
+                assert_eq!(text, "可能");
+                assert!(new_composition.is_none() && !has_new_composition);
+            }
+            other => panic!("新组合为空应直接真提交，实际 {other:?}"),
+        }
+
+        let mut cfg = Config::default();
+        cfg.input.top_commit_mode = wind_config::TopCommitMode::PreConfirm;
+        let c = coord_with("ctnc_pre", cfg);
+        match c.commit_then_new_composition("可能".to_string(), "`".to_string()) {
+            KeyAction::InsertText {
+                text,
+                new_composition,
+                has_new_composition,
+                ..
+            } => {
+                assert_eq!(text, "可能");
+                assert_eq!(new_composition.as_deref(), Some("`"));
+                assert!(has_new_composition);
+            }
+            other => panic!("pre_confirm 应走 InsertText 聚合，实际 {other:?}"),
+        }
     }
 }

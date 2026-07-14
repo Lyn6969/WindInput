@@ -1056,21 +1056,16 @@ fn test_temp_pinyin_commit_and_enter_with_candidates() {
     press_letter(&coord, 'a');
     let first = coord.debug_page_texts()[0].clone();
 
-    // 反引号：应上屏当前高亮候选并原子开启临时拼音组合
+    // 反引号：应上屏当前高亮候选并进入临时拼音。默认 top_commit_mode=direct_commit：
+    // 真提交候选、前缀新组合延迟到触发键 keyup 才开（与顶码上屏同一分流）。
     match coord.handle_key_event(&key_event(0xC0, EVENT_KEY_DOWN)) {
-        KeyAction::InsertText {
-            text,
-            new_composition,
-            has_new_composition,
+        KeyAction::CommitThenDeferComposition {
+            commit_text,
+            deferred_composition,
             ..
         } => {
-            assert_eq!(text, first, "应顶屏当前高亮候选");
-            assert!(has_new_composition, "应原子开启新组合");
-            assert_eq!(
-                new_composition.as_deref(),
-                Some("`"),
-                "新组合应为临时拼音前缀"
-            );
+            assert_eq!(commit_text, first, "应真提交当前高亮候选");
+            assert_eq!(deferred_composition, "`", "延迟新组合应为临时拼音前缀");
         }
         other => panic!("有候选按反引号应顶屏+进临时拼音，实际: {:?}", other),
     }
@@ -2005,18 +2000,15 @@ fn test_semicolon_with_candidates_enters_mix_and_accepts_pinyin() {
         return;
     }
     let highlighted = texts[0].clone();
+    // 默认 top_commit_mode=direct_commit：真提交高亮候选、前缀新组合延迟到 keyup 才开。
     match coord.handle_key_event(&key_event(0xBA, EVENT_KEY_DOWN)) {
-        KeyAction::InsertText {
-            text,
-            new_composition,
+        KeyAction::CommitThenDeferComposition {
+            commit_text,
+            deferred_composition,
             ..
         } => {
-            assert_eq!(text, highlighted, "; 应顶字上屏当前高亮候选");
-            assert_eq!(
-                new_composition.as_deref(),
-                Some(";"),
-                "进入融合模式应显示前缀 ;"
-            );
+            assert_eq!(commit_text, highlighted, "; 应顶字真提交当前高亮候选");
+            assert_eq!(deferred_composition, ";", "进入融合模式应延迟开前缀组合 ;");
         }
         other => panic!("有候选按 ; 应顶字+进融合模式，实际: {:?}", other),
     }
@@ -2049,13 +2041,16 @@ fn test_semicolon_overflow_falls_to_mix_not_overflow() {
     }
     let only = texts[0].clone();
     match coord.handle_key_event(&key_event(0xBA, EVENT_KEY_DOWN)) {
-        KeyAction::InsertText {
-            text,
-            new_composition,
+        KeyAction::CommitThenDeferComposition {
+            commit_text,
+            deferred_composition,
             ..
         } => {
-            assert_eq!(text, only, "1 候选时 ; 应顶字上屏该候选");
-            assert_eq!(new_composition.as_deref(), Some(";"), "并进入融合模式");
+            assert_eq!(commit_text, only, "1 候选时 ; 应顶字真提交该候选");
+            assert_eq!(
+                deferred_composition, ";",
+                "并进入融合模式（延迟开前缀组合）"
+            );
         }
         other => panic!("1 候选时 ; 应顶字+进融合，实际: {:?}", other),
     }

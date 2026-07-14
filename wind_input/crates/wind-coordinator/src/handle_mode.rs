@@ -158,13 +158,7 @@ impl Coordinator {
                     KeyAction::UpdateComposition { text, .. } => text.clone(),
                     _ => state.preedit.clone(),
                 };
-                KeyAction::InsertText {
-                    text,
-                    new_composition: Some(new_comp),
-                    mode_changed: false,
-                    chinese_mode: true,
-                    has_new_composition: true,
-                }
+                self.commit_then_new_composition(text, new_comp)
             }
             None => enter,
         }

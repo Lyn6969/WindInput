@@ -1285,6 +1285,38 @@ impl Coordinator {
         }
     }
 
+    /// 「顶屏文本 + 进模式新组合」收尾（进特殊模式 / 临时拼音 / mix 融合共用）：与顶码
+    /// `commit_top_text` 同一 `top_commit_mode` 分流——direct_commit 且有新组合（引导键
+    /// 前缀）→ `CommitThenDeferComposition` 真提交、新组合延迟到触发键 keyup 才开；
+    /// pre_confirm → `InsertText` 聚合（文本并入 TSF `_pendingCommitPrefix`、留组合内）。
+    /// 新组合为空（直达热键进入无引导符）时无组合可重开、无 diff 合并之虞，
+    /// 两种模式都直接真提交（对齐顶码无余码分支）。
+    pub(crate) fn commit_then_new_composition(&self, text: String, new_comp: String) -> KeyAction {
+        if new_comp.is_empty() {
+            return KeyAction::InsertText {
+                text,
+                new_composition: None,
+                mode_changed: false,
+                chinese_mode: true,
+                has_new_composition: false,
+            };
+        }
+        if self.rt().config.input.top_commit_mode == wind_config::TopCommitMode::DirectCommit {
+            return KeyAction::CommitThenDeferComposition {
+                commit_text: text,
+                deferred_composition: new_comp,
+                timeout_ms: DEFERRED_COMPOSITION_FALLBACK_MS,
+            };
+        }
+        KeyAction::InsertText {
+            text,
+            new_composition: Some(new_comp),
+            mode_changed: false,
+            chinese_mode: true,
+            has_new_composition: true,
+        }
+    }
+
     /// 含副作用命令（`$CC` 里带 shell/key/clip 等 Effect）顶码：异步执行动作（消费 prefix 整段、
     /// 无同步上屏文本），余码作为新一轮输入缓冲走标准候选刷新 + 新组合。副作用多为开应用 /
     /// 切设置——前者焦点变化自动取消余码组合（无害），后者不改焦点、余码组合正常续打。
