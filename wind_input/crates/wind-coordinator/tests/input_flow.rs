@@ -2899,3 +2899,74 @@ fn top_code_plain_phrase_direct_commit_defers() {
         ),
     }
 }
+
+/// 配对跳出键：中文配对开 + 配置 Tab 为跳出键。
+/// 输入左括号插入配对后，按 Tab 应等效输入右符号跳出（MoveCursorRight）；
+/// 栈空后再按 Tab 应透传给宿主（不吞正常按键）。
+#[test]
+fn auto_pair_jump_out_key_moves_cursor_right() {
+    if !has_schemas() {
+        return;
+    }
+    let mut cfg = config_with("wubi86");
+    cfg.input.auto_pair.chinese = true; // 中文配对开（默认 chinese_punct=true → 用 cn_pairs）
+    cfg.input.auto_pair.jump_out_keys = vec!["tab".into()];
+    let coord = Coordinator::new_headless(cfg, Some(&data_dir()));
+
+    // 左括号（Shift+9 → '（'）：插入配对，光标置于中间
+    let ins = coord.handle_key_event(&key_event_mods(0x39, EVENT_KEY_DOWN, 0x0001));
+    match ins {
+        KeyAction::InsertTextWithCursor {
+            text,
+            cursor_offset,
+        } => {
+            assert_eq!(text, "（）", "应插入中文配对");
+            assert_eq!(cursor_offset, 1, "光标应落在配对中间");
+        }
+        other => panic!("左括号应插入配对，实际: {:?}", other),
+    }
+
+    // 按 Tab：配对栈非空 → 跳出（光标右移）
+    let jump = coord.handle_key_event(&key_event(0x09, EVENT_KEY_DOWN));
+    assert!(
+        matches!(jump, KeyAction::MoveCursorRight),
+        "Tab 应跳出配对（MoveCursorRight），实际: {:?}",
+        jump
+    );
+
+    // 再按 Tab：栈已空 → 不拦截，透传给宿主
+    let passthrough = coord.handle_key_event(&key_event(0x09, EVENT_KEY_DOWN));
+    assert!(
+        matches!(passthrough, KeyAction::PassThrough),
+        "栈空时 Tab 应透传，实际: {:?}",
+        passthrough
+    );
+}
+
+/// 配对跳出键未配置时：Tab 不被吞（回归保护——默认空集不启用）。
+#[test]
+fn auto_pair_no_jump_out_key_passes_tab_through() {
+    if !has_schemas() {
+        return;
+    }
+    let mut cfg = config_with("wubi86");
+    cfg.input.auto_pair.chinese = true;
+    // jump_out_keys 默认空 → 不启用
+    let coord = Coordinator::new_headless(cfg, Some(&data_dir()));
+
+    // 插入配对
+    let ins = coord.handle_key_event(&key_event_mods(0x39, EVENT_KEY_DOWN, 0x0001));
+    assert!(
+        matches!(ins, KeyAction::InsertTextWithCursor { .. }),
+        "左括号应插入配对，实际: {:?}",
+        ins
+    );
+
+    // 未配置跳出键：Tab 即使栈非空也不跳出，透传
+    let tab = coord.handle_key_event(&key_event(0x09, EVENT_KEY_DOWN));
+    assert!(
+        matches!(tab, KeyAction::PassThrough),
+        "未配置跳出键时 Tab 应透传，实际: {:?}",
+        tab
+    );
+}

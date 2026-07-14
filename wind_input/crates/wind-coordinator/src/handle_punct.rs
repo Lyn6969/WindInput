@@ -266,4 +266,14 @@ impl Coordinator {
         // 注：HoldComposition 模式下若组合尚未提交，C++ 端的 SetTimer 计时器会在 timeout
         // 到期后自动提交中文符号，或在焦点切换时由 OnCompositionTerminated 自然结束。
     }
+
+    /// 清空配对跟踪栈（焦点/模式切换等的防御性复位，与 `disarm_smart_symbol` 并列调用）。
+    /// 焦点/模式一旦切换，旧的「光标紧贴右符号」假设即失效，残留栈会让跳出键/右符号跳出误判，
+    /// 故必须清空。
+    pub(crate) fn clear_pair_tracker(&self) {
+        self.pair_tracker
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear();
+    }
 }

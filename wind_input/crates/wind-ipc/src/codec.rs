@@ -960,6 +960,18 @@ pub fn encode_english_pairs_value(enabled: bool, pairs: &[(char, char)]) -> Vec<
     value
 }
 
+/// 编码配对跳出键的值部分（对齐 TSF KeyEventSink::OnSyncConfig CONFIG_KEY_JUMP_OUT_KEYS）。
+///
+/// 格式：count(u8) + [vk:u16(LE)]...；`vks` 为 VK 码列表（调用方应去重、排序以稳定输出）。
+pub fn encode_jump_out_keys_value(vks: &[u32]) -> Vec<u8> {
+    let mut value = Vec::with_capacity(1 + vks.len() * 2);
+    value.push(vks.len() as u8);
+    for vk in vks {
+        value.extend_from_slice(&(*vk as u16).to_le_bytes());
+    }
+    value
+}
+
 #[cfg(test)]
 mod darwin_push_tests {
     use super::*;

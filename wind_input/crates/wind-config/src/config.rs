@@ -728,6 +728,11 @@ pub struct AutoPairConfig {
     /// 英文配对表（每项 2 字符："()"）
     #[serde(default = "default_english_pairs")]
     pub english_pairs: Vec<String>,
+    /// 跳出配对的按键（键名如 "tab"/"enter"/"space"，可多选）。命中即等效输入右符号跳出：
+    /// 光标越过右符号、弹出配对栈。默认空 → 不启用。仅对协调器跟踪的中文输入态配对生效
+    /// （英文模式配对由 TSF/DLL 侧处理）。
+    #[serde(default)]
+    pub jump_out_keys: Vec<String>,
 }
 
 impl Default for AutoPairConfig {
@@ -737,6 +742,7 @@ impl Default for AutoPairConfig {
             english: false,
             chinese_pairs: default_chinese_pairs(),
             english_pairs: default_english_pairs(),
+            jump_out_keys: Vec::new(),
         }
     }
 }

@@ -126,6 +126,21 @@ fn parse_pairs(list: &[String]) -> Vec<(char, char)> {
         .collect()
 }
 
+/// 解析配对跳出键名 → VK 码集合。支持 tab / enter(return) / space / escape(esc)；
+/// 大小写与首尾空白不敏感，未知名忽略。这些非可打印键不在 keymap 的 KEY_TABLE
+/// （引导/触发用的 OEM 符号键）内，故在此单独映射。
+fn parse_jump_out_keys(list: &[String]) -> std::collections::HashSet<u32> {
+    list.iter()
+        .filter_map(|s| match s.trim().to_lowercase().as_str() {
+            "tab" => Some(keymap::VK_TAB),
+            "enter" | "return" => Some(keymap::VK_RETURN),
+            "space" => Some(keymap::VK_SPACE),
+            "escape" | "esc" => Some(keymap::VK_ESCAPE),
+            _ => None,
+        })
+        .collect()
+}
+
 pub(crate) fn punct_char(key_code: u32, shift: bool) -> Option<char> {
     use keymap::*;
     let (base, shifted) = match key_code {
@@ -430,6 +445,8 @@ pub(crate) struct ConfigBundle {
     pub(crate) nav_keys: keymap::NavKeys,
     pub(crate) cn_pairs: Vec<(char, char)>,
     pub(crate) en_pairs: Vec<(char, char)>,
+    /// 配对跳出键的 VK 码集合（预解析自 `auto_pair.jump_out_keys`，空=不启用）。
+    pub(crate) jump_out_keys: std::collections::HashSet<u32>,
 }
 
 impl ConfigBundle {
@@ -439,12 +456,14 @@ impl ConfigBundle {
             keymap::NavKeys::from_config(&config.keys.page_keys, &config.keys.highlight_keys);
         let cn_pairs = parse_pairs(&config.input.auto_pair.chinese_pairs);
         let en_pairs = parse_pairs(&config.input.auto_pair.english_pairs);
+        let jump_out_keys = parse_jump_out_keys(&config.input.auto_pair.jump_out_keys);
         Self {
             config,
             compiled_hotkeys,
             nav_keys,
             cn_pairs,
             en_pairs,
+            jump_out_keys,
         }
     }
 }
@@ -479,7 +498,7 @@ pub struct Coordinator {
     /// 候选反查（编码/拆字/拼音）供悬停提示
     pub(crate) reverse: wind_reverse::ReverseLookup,
     /// 标点配对跟踪栈（用于智能跳过）；中/英配对表在 rt bundle 内。
-    pair_tracker: Mutex<wind_transform::pair_tracker::PairTracker>,
+    pub(crate) pair_tracker: Mutex<wind_transform::pair_tracker::PairTracker>,
     /// 最近一次有效光标坐标 (x,y,height)；用于无效坐标时回退，避免候选窗跑到左上角
     last_valid_caret: Mutex<(i32, i32, i32)>,
     /// 延迟首次显示：新组合首帧不立即显示候选窗，待 handle_caret_update 收到 reflow 后的权威坐标、
@@ -1420,6 +1439,7 @@ impl Coordinator {
                 self.sync_direct_switch_hotkey(); // keys.activate_ime 改键/清空即时生效
                 // 推送英文自动配对配置到 TSF 客户端（client_token=0 = 广播到所有活跃客户端）
                 self.push_english_pair_config(0);
+                self.push_jump_out_keys_config(0); // 配对跳出键同步（英文模式跳出 + 中文转发放行）
                 #[cfg(windows)]
                 if let Some(mgr) = self.host_render() {
                     mgr.set_whitelist(new_cfg.compat.host_render_processes.clone());
@@ -2459,6 +2479,7 @@ impl Coordinator {
         // 推送英文自动配对配置到新连接的客户端（不受 host-render 白名单限制，
         // 所有 TSF 实例都需要收到此配置才能在英文模式下正确处理标点配对）。
         self.push_english_pair_config(client_token);
+        self.push_jump_out_keys_config(client_token); // 配对跳出键（英文模式跳出 + 中文转发放行）
 
         let Some(mgr) = self.host_render() else {
             return;
@@ -2477,6 +2498,25 @@ impl Coordinator {
         let value = wind_ipc::codec::encode_english_pairs_value(enabled, &rt.en_pairs);
         let msg = wind_ipc::codec::encode_sync_config(
             wind_ipc::protocol::CONFIG_KEY_ENGLISH_PAIRS,
+            &value,
+        );
+        if client_token != 0 {
+            self.push_server.push_to_token(client_token, &msg);
+        } else {
+            self.push_server.push_to_active(&msg);
+        }
+    }
+
+    /// 推送配对跳出键（VK 码集合）到 TSF 客户端。TSF 英文模式配对直接据此跳出；
+    /// 中文模式据此在「有待跳出配对」时放行转发（真正裁决仍在协调器）。
+    pub fn push_jump_out_keys_config(&self, client_token: u64) {
+        let rt = self.rt();
+        // HashSet 迭代序不稳定，排序保证推送字节可复现。
+        let mut vks: Vec<u32> = rt.jump_out_keys.iter().copied().collect();
+        vks.sort_unstable();
+        let value = wind_ipc::codec::encode_jump_out_keys_value(&vks);
+        let msg = wind_ipc::codec::encode_sync_config(
+            wind_ipc::protocol::CONFIG_KEY_JUMP_OUT_KEYS,
             &value,
         );
         if client_token != 0 {
@@ -3568,6 +3608,22 @@ impl MessageHandler for Coordinator {
             return Self::commit_action(out, state.chinese_mode);
         }
 
+        // 配对跳出键：无活跃编码时，命中配置的跳出键（Tab/Enter 等）且配对栈非空，
+        // 等效输入右符号跳出——光标越过右符号、弹栈。栈空则不拦截，让该键落入下方 match
+        // 的空缓冲透传臂正常透传给宿主（Tab 缩进 / Enter 换行）。须置于 match 之前抢先判定，
+        // 仅无编码+无候选时生效，避免吞掉正常编辑/选词按键。
+        if state.input_buffer.is_empty()
+            && state.candidates.is_empty()
+            && data.modifiers & (MOD_CTRL | MOD_ALT | MOD_SHIFT) == 0
+            && self.rt().jump_out_keys.contains(&data.key_code)
+        {
+            let mut tr = self.pair_tracker.lock().unwrap_or_else(|e| e.into_inner());
+            if tr.peek().is_some() {
+                tr.pop();
+                return KeyAction::MoveCursorRight;
+            }
+        }
+
         match data.key_code {
             keymap::VK_ESCAPE => {
                 // Escape：取消整个组合（含已转换前缀），不上屏
@@ -4157,6 +4213,7 @@ impl MessageHandler for Coordinator {
             s.menu_open = false; // 复位菜单态，否则下一个键被 forward_menu_key 吞掉
             self.reset_exclusive_modes(&mut s); // 失焦丢弃临时英文/拼音/快捷输入残留
         }
+        self.clear_pair_tracker(); // 失焦：配对上下文失效，清栈防下次聚焦后跳出键误判
         // 失焦即清抑制态：密码框失焦到下次 focus_gained 之间无控件收键，suppress 残留虽不可利用，
         // 但属状态卫生隐患——独立 atomic，无锁依赖，不与上面的 state 锁冲突。
         self.password_suppress
@@ -4273,6 +4330,7 @@ impl MessageHandler for Coordinator {
         self.record_last_state();
         self.punct.lock().unwrap_or_else(|e| e.into_inner()).reset();
         self.disarm_smart_symbol();
+        self.clear_pair_tracker();
         self.push_state_update();
         self.show_status();
         self.notify_toolbar();
@@ -4296,6 +4354,7 @@ impl MessageHandler for Coordinator {
         self.record_last_state();
         self.punct.lock().unwrap_or_else(|e| e.into_inner()).reset();
         self.disarm_smart_symbol();
+        self.clear_pair_tracker();
         self.push_state_update();
         self.show_status(); // 与 Shift 切换（handle_toggle_mode）统一：Ctrl+Space/外部切换也显示中/英提示
         self.notify_toolbar();
@@ -4325,6 +4384,7 @@ impl MessageHandler for Coordinator {
         // 我们自己的 CommitText 不触发（_pComposition 已提前置 nullptr，走"Already released"分支）。
         // 因此在此 disarm 是安全的：意外中断必然使 HoldComposition 失效，旧 held_text 不可再用。
         self.disarm_smart_symbol();
+        self.clear_pair_tracker(); // 组合意外终止：配对上下文失效，清栈防跳出键误判
         self.notify_ui_hide();
     }
 
@@ -4661,6 +4721,37 @@ mod reload_tests {
         let b = ConfigBundle::build(cfg);
         assert_eq!(b.cn_pairs, vec![('（', '）'), ('【', '】')]);
         assert_eq!(b.en_pairs, vec![('(', ')')]);
+    }
+
+    #[test]
+    fn parse_jump_out_keys_maps_names_to_vk() {
+        // 支持的键名（大小写/空白不敏感），未知名忽略。
+        let set = parse_jump_out_keys(&[
+            " Tab ".into(),
+            "ENTER".into(),
+            "space".into(),
+            "esc".into(),
+            "unknown".into(),
+        ]);
+        assert!(set.contains(&keymap::VK_TAB));
+        assert!(set.contains(&keymap::VK_RETURN)); // enter → VK_RETURN
+        assert!(set.contains(&keymap::VK_SPACE));
+        assert!(set.contains(&keymap::VK_ESCAPE)); // esc → VK_ESCAPE
+        assert_eq!(set.len(), 4); // "unknown" 被忽略
+        // "return" 别名等价 enter
+        assert!(parse_jump_out_keys(&["return".into()]).contains(&keymap::VK_RETURN));
+        // 空配置 → 空集（不启用）
+        assert!(parse_jump_out_keys(&[]).is_empty());
+    }
+
+    #[test]
+    fn config_bundle_parses_jump_out_keys() {
+        let mut cfg = Config::default();
+        cfg.input.auto_pair.jump_out_keys = vec!["tab".into(), "enter".into()];
+        let b = ConfigBundle::build(cfg);
+        assert!(b.jump_out_keys.contains(&keymap::VK_TAB));
+        assert!(b.jump_out_keys.contains(&keymap::VK_RETURN));
+        assert_eq!(b.jump_out_keys.len(), 2);
     }
 
     #[test]
