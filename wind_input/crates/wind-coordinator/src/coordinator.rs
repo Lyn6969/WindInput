@@ -3750,8 +3750,9 @@ impl MessageHandler for Coordinator {
                             // 显示首选是拼音/英文 → 放弃顶码，落到下方正常候选刷新继续组合。
                             None => {}
                         }
-                    } else {
-                        // 多级溢出：引擎码表纯文本顶码。
+                    } else if !engine_top.is_empty() {
+                        // 多级溢出：引擎码表纯文本顶码（码表无字则 engine_top 空 → 放弃顶码，
+                        // 落到下方正常候选刷新继续组合）。
                         return self.commit_top_text(&mut state, &prefix, engine_top, &remainder);
                     }
                 }

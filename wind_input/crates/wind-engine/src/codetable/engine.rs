@@ -277,9 +277,15 @@ impl Engine for CodeTableEngine {
         }
         let prefix: String = input.chars().take(self.max_code_length).collect();
         let remainder: String = input.chars().skip(self.max_code_length).collect();
-        let r = self.convert(&prefix, 1).ok()?;
-        let top = r.candidates.first()?;
-        Some((top.text.clone(), remainder))
+        // 码表首选文本；prefix 码表无字（短语专属码如 date/zzbd）时留空，由上层用显示首选
+        // （短语/命令）兜底顶码。此处**只判定溢出该顶**（超满码长 + 无全码匹配 + 无更长后继），
+        // 「顶什么」交上层——原 `first()?` 短路会让码表无字时顶码整个不触发（短语顶不了）。
+        let top = self
+            .convert(&prefix, 1)
+            .ok()
+            .and_then(|r| r.candidates.first().map(|c| c.text.clone()))
+            .unwrap_or_default();
+        Some((top, remainder))
     }
 }
 
@@ -409,6 +415,25 @@ mod tests {
         // 关闭开关 → None
         let e2 = engine_opts(&[("aaaa", "工", 100)], CommitOptions::default());
         assert_eq!(e2.handle_top_code("aaaab"), None);
+    }
+
+    #[test]
+    fn top_code_overflow_prefix_no_char_returns_empty_top() {
+        // prefix 码表无字（短语专属码场景）：仍判定溢出该顶，返回 Some(("", 余码))——
+        // 「顶什么」交上层用短语显示首选兜底。原 `first()?` 短路会让顶码整个不触发。
+        let e = engine_opts(
+            &[("aaaa", "工", 100)],
+            CommitOptions {
+                top_code_commit: true,
+                ..Default::default()
+            },
+        );
+        // "bbbb" 无字，"bbbbc"(>4，无匹配/无更长后继) → Some(("", "c"))
+        assert_eq!(
+            e.handle_top_code("bbbbc"),
+            Some((String::new(), "c".to_string())),
+            "prefix 码表无字应返回空 top + 余码，而非 None"
+        );
     }
 
     #[test]

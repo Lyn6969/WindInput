@@ -2590,6 +2590,48 @@ fn top_code_text_command_first_commits_evaluated_text() {
 }
 
 #[test]
+fn top_code_phrase_code_no_codetable_char_still_commits() {
+    if !has_schemas() {
+        return;
+    }
+    // 用户真机场景：短语专属码 date（五笔码表无字）敲满码后再敲字符应顶短语 + 余码续打。
+    // 引擎 handle_top_code 原 `first()?` 在 prefix 无字时短路 None → 顶码不触发（datea 累积）；
+    // 修复后返回 Some(("", 余码))，coordinator 用短语显示首选顶码。用内置 date 日期短语验证
+    // （系统短语须真 store 才同步，见 test_phrase_date_expansion）。
+    let store_path = std::env::temp_dir().join("wind_top_code_datecode.redb");
+    let _ = std::fs::remove_file(&store_path);
+    let store = std::sync::Arc::new(wind_store::Store::open(&store_path).unwrap());
+    let mut cfg = config_with("wubi86");
+    cfg.schema.codetable.punct_commit = true;
+    cfg.schema.codetable.top_code_commit = true;
+    cfg.input.top_commit_mode = wind_config::TopCommitMode::PreConfirm;
+    let coord = Coordinator::new_headless_with_store(cfg, Some(&data_dir()), store);
+    for ch in ['d', 'a', 't', 'e'] {
+        press_letter(&coord, ch);
+    }
+    // 'g' = VK 0x47（溢出触发键，dateg=5>满码4 且码表无匹配）→ 顶 date 日期短语，余码 g
+    match coord.handle_key_event(&key_event(0x47, EVENT_KEY_DOWN)) {
+        KeyAction::InsertText {
+            text,
+            has_new_composition,
+            ..
+        } => {
+            assert!(
+                text.contains('年') && text.contains('月') && text.contains('日'),
+                "date 短语码(码表无字)溢出应顶出日期短语，实际: {:?}",
+                text
+            );
+            assert!(has_new_composition, "应带余码 g 新组合");
+        }
+        other => panic!(
+            "date 短语码顶码应返回 InsertText(顶短语)，实际: {:?}(顶码未触发?)",
+            other
+        ),
+    }
+    let _ = std::fs::remove_file(&store_path);
+}
+
+#[test]
 fn top_code_plain_phrase_direct_commit_defers() {
     if !has_schemas() {
         return;
