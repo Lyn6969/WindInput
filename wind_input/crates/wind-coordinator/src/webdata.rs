@@ -298,6 +298,20 @@ impl Coordinator {
             .as_ref()
             .ok_or_else(|| anyhow::anyhow!("无持久化存储"))?;
         let mut all = store.search_user_words_prefix(&schema, prefix, 0)?;
+        // 词条内容搜索：并入 text 包含搜索词的词条（编码前缀 ∪ 词条内容包含，去重）。
+        // 前缀项走 redb 有序前缀扫描；内容项需全量扫描，仅在有搜索词时才付出该代价。
+        if !prefix.is_empty() {
+            let q = prefix.to_lowercase();
+            let seen: std::collections::HashSet<(String, String)> =
+                all.iter().map(|w| (w.code.clone(), w.text.clone())).collect();
+            for w in store.search_user_words_prefix(&schema, "", 0)? {
+                if w.text.to_lowercase().contains(&q)
+                    && !seen.contains(&(w.code.clone(), w.text.clone()))
+                {
+                    all.push(w);
+                }
+            }
+        }
         let total = all.len();
         // 有 sortBy 时在切片前排序，实现跨页全局排序
         if let Some((by, desc)) = parse_sort(params, &["code", "text", "weight"]) {
@@ -841,10 +855,27 @@ impl Coordinator {
             .store
             .as_ref()
             .ok_or_else(|| anyhow::anyhow!("无持久化存储"))?;
-        // 带 sortBy 时全量拉取 → 排序 → 内存切片；否则走 store 分页路径
-        let (page, total) =
-            if let Some((by, desc)) = parse_sort(params, &["code", "text", "count", "lastUsed"]) {
-                let (mut all, total) = store.list_freq_paged(&schema, prefix, 0, 0)?;
+        let sort = parse_sort(params, &["code", "text", "count", "lastUsed"]);
+        // 无搜索且无排序：走 store 分页快路径；否则全量拉取
+        //（编码前缀 ∪ 词条内容包含）→ 排序 → 内存切片。
+        let (page, total) = if prefix.is_empty() && sort.is_none() {
+            store.list_freq_paged(&schema, "", offset, limit)?
+        } else {
+            let (mut all, _) = store.list_freq_paged(&schema, prefix, 0, 0)?;
+            // 词条内容搜索：并入 text 包含搜索词的词条（去重）。
+            if !prefix.is_empty() {
+                let q = prefix.to_lowercase();
+                let seen: std::collections::HashSet<(String, String)> =
+                    all.iter().map(|(c, t, _)| (c.clone(), t.clone())).collect();
+                let (rest, _) = store.list_freq_paged(&schema, "", 0, 0)?;
+                for (c, t, rec) in rest {
+                    if t.to_lowercase().contains(&q) && !seen.contains(&(c.clone(), t.clone())) {
+                        all.push((c, t, rec));
+                    }
+                }
+            }
+            let total = all.len();
+            if let Some((by, desc)) = sort {
                 all.sort_by(|(ca, ta, ra), (cb, tb, rb)| {
                     let ord = match by {
                         "count" => ra.count.cmp(&rb.count),
@@ -854,11 +885,10 @@ impl Coordinator {
                     };
                     if desc { ord.reverse() } else { ord }
                 });
-                let page = all.into_iter().skip(offset).take(limit).collect();
-                (page, total)
-            } else {
-                store.list_freq_paged(&schema, prefix, offset, limit)?
-            };
+            }
+            let page = all.into_iter().skip(offset).take(limit).collect();
+            (page, total)
+        };
         let items: Vec<Value> = page
             .into_iter()
             .map(|(code, text, rec)| {
@@ -2699,6 +2729,63 @@ mod tests {
             )
             .unwrap();
         assert_eq!(r4["total"], 3, "不传 sortBy 应保持原有行为");
+    }
+
+    #[test]
+    fn dict_list_paged_text_query() {
+        let c = coord("dict_text_query");
+        for (code, text, weight) in [("wghg", "程序", 3i32), ("ggkg", "王中", 5), ("aaaa", "工", 0)]
+        {
+            c.web_data_rpc(
+                "dict.add",
+                &json!({ "schemaId": "wb", "code": code, "text": text, "weight": weight }),
+            )
+            .unwrap();
+        }
+        // 按词条内容搜索：编码 "wghg" 不以 "程" 开头，命中应来自 text 包含匹配。
+        let r = c
+            .web_data_rpc(
+                "dict.listPaged",
+                &json!({ "schemaId": "wb", "prefix": "程", "offset": 0, "limit": 10 }),
+            )
+            .unwrap();
+        assert_eq!(r["total"], 1, "词条内容搜索应命中 1 条");
+        assert_eq!(r["items"][0]["text"], "程序", "应按 text 内容命中");
+        // 按编码前缀搜索仍生效。
+        let r2 = c
+            .web_data_rpc(
+                "dict.listPaged",
+                &json!({ "schemaId": "wb", "prefix": "wg", "offset": 0, "limit": 10 }),
+            )
+            .unwrap();
+        assert_eq!(r2["total"], 1, "编码前缀搜索应命中 1 条");
+        assert_eq!(r2["items"][0]["code"], "wghg", "应按 code 前缀命中");
+    }
+
+    #[test]
+    fn freq_list_paged_text_query() {
+        let c = coord("freq_text_query");
+        let store = c.store.as_ref().unwrap();
+        store.record_freq("py", "nihao", "你好").unwrap();
+        store.record_freq("py", "women", "我们").unwrap();
+        // 按词条内容搜索：编码 "nihao" 不以 "你" 开头，命中应来自 text 包含匹配。
+        let r = c
+            .web_data_rpc(
+                "freq.listPaged",
+                &json!({ "schemaId": "py", "prefix": "你", "offset": 0, "limit": 10 }),
+            )
+            .unwrap();
+        assert_eq!(r["total"], 1, "词条内容搜索应命中 1 条");
+        assert_eq!(r["items"][0]["text"], "你好", "应按 text 内容命中");
+        // 按编码前缀搜索仍生效。
+        let r2 = c
+            .web_data_rpc(
+                "freq.listPaged",
+                &json!({ "schemaId": "py", "prefix": "women", "offset": 0, "limit": 10 }),
+            )
+            .unwrap();
+        assert_eq!(r2["total"], 1, "编码前缀搜索应命中 1 条");
+        assert_eq!(r2["items"][0]["text"], "我们", "应按 code 前缀命中对应词条");
     }
 
     #[test]
