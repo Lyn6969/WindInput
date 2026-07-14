@@ -106,6 +106,43 @@ impl Coordinator {
             }
         }
     }
+
+    /// 顶码等同步场景：求值命令源，动作链**全为 Text**（无副作用）时返回拼接文本 `Some(text)`；
+    /// 含任一 Effect（shell/key/clip 等需异步回调 coordinator 锁）返回 `None`，交异步 spawn 执行。
+    ///
+    /// **不跑任何 Effect**——纯文本求值只碰 `CmdbarCtx` 读快照（input/last/clip/now/env），无锁、
+    /// 无副作用，可在持 state 锁的按键线程内安全调用。`$SS` 组 / 求值失败 / services 未装配亦返回 None。
+    pub(crate) fn eval_command_text_only(&self, src: &str, input: &str) -> Option<String> {
+        let services = self.cmdbar_services.get()?;
+        let (front_app, front_title, front_sel) = self.front_ctx_snapshot();
+        let ctx = CmdbarCtx {
+            input: input.to_string(),
+            now: Local::now(),
+            last: self.recent_commits_snapshot(),
+            front_app,
+            front_title,
+            front_sel,
+            services,
+        };
+        let reg = wind_cmdbar::default_registry();
+        let actions = match wind_cmdbar::evaluate_phrase(src, &ctx, reg) {
+            Ok(wind_cmdbar::PhraseEval::Single { actions, .. }) => actions,
+            _ => return None,
+        };
+        // 含副作用 → None（交异步 spawn 执行，见 top_commit_command_with_remainder）。
+        if actions
+            .iter()
+            .any(|a| a.kind != wind_cmdbar::ActionKind::Text)
+        {
+            return None;
+        }
+        // 纯文本：按序拼接（此刻 act.run 只求值文本表达式，不回调 coordinator 锁）。
+        let mut text = String::new();
+        for a in &actions {
+            text.push_str(&a.run(&ctx, reg).ok()?);
+        }
+        Some(text)
+    }
 }
 
 /// 命令栏求值上下文（coordinator 适配）。提供 input/now/env + 上屏历史 last + 剪贴板 clip + services；

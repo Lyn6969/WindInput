@@ -2523,3 +2523,93 @@ fn top_code_direct_commit_returns_commit_then_defer() {
         ),
     }
 }
+
+// 顶码前缓冲 skce 注入短语/命令作首选（短语高权重 PHRASE_WEIGHT_BASE 保证排首），
+// 用于验证顶码上屏对短语(cmdbar)类型生效。
+fn coord_with_skce_phrase(
+    phrase_text: &str,
+    mode: wind_config::TopCommitMode,
+    tag: &str,
+) -> std::sync::Arc<Coordinator> {
+    let store_path = std::env::temp_dir().join(format!("wind_top_code_phrase_{tag}.redb"));
+    let _ = std::fs::remove_file(&store_path);
+    let store = std::sync::Arc::new(wind_store::Store::open(&store_path).unwrap());
+    // build() 构造期读 enabled_phrases_for_input()，故须在建 coordinator 前入库。
+    store.add_phrase("skce", phrase_text, 0, 100).unwrap();
+    let mut cfg = config_with("wubi86");
+    cfg.schema.codetable.punct_commit = true;
+    cfg.schema.codetable.top_code_commit = true;
+    cfg.input.top_commit_mode = mode;
+    Coordinator::new_headless_with_store(cfg, Some(&data_dir()), store)
+}
+
+#[test]
+fn top_code_plain_phrase_first_commits_phrase_text() {
+    if !has_schemas() {
+        return;
+    }
+    // 普通短语作 skce 首选：顶码应上屏短语文本 + 余码 y 续打（pre_confirm）。
+    let coord =
+        coord_with_skce_phrase("顶码短语文本", wind_config::TopCommitMode::PreConfirm, "plain");
+    match drive_top_code(&coord) {
+        KeyAction::InsertText {
+            text,
+            has_new_composition,
+            ..
+        } => {
+            assert_eq!(text, "顶码短语文本", "顶码应上屏短语首选文本");
+            assert!(has_new_composition, "顶码应带余码 y 新组合");
+        }
+        other => panic!("普通短语顶码应返回 InsertText，实际: {:?}", other),
+    }
+}
+
+#[test]
+fn top_code_text_command_first_commits_evaluated_text() {
+    if !has_schemas() {
+        return;
+    }
+    // 纯文本 $CC 命令（type 文本，无副作用）作 skce 首选：顶码同步求值命令文本上屏，
+    // 而非上屏 display 标签「标签」（区分命令求值路径与普通短语路径）。
+    let coord = coord_with_skce_phrase(
+        r#"$CC("标签", type("命令文本"))"#,
+        wind_config::TopCommitMode::PreConfirm,
+        "textcmd",
+    );
+    match drive_top_code(&coord) {
+        KeyAction::InsertText {
+            text,
+            has_new_composition,
+            ..
+        } => {
+            assert_eq!(text, "命令文本", "纯文本命令顶码应上屏求值文本(而非 display 标签)");
+            assert!(has_new_composition, "顶码应带余码 y 新组合");
+        }
+        other => panic!("纯文本命令顶码应返回 InsertText，实际: {:?}", other),
+    }
+}
+
+#[test]
+fn top_code_plain_phrase_direct_commit_defers() {
+    if !has_schemas() {
+        return;
+    }
+    // 普通短语首选 + direct_commit：走成熟 CommitThenDeferComposition 路径，commit_text=短语文本。
+    let coord =
+        coord_with_skce_phrase("顶码短语文本", wind_config::TopCommitMode::DirectCommit, "direct");
+    match drive_top_code(&coord) {
+        KeyAction::CommitThenDeferComposition {
+            commit_text,
+            deferred_composition,
+            timeout_ms,
+        } => {
+            assert_eq!(commit_text, "顶码短语文本", "direct_commit 顶码应真提交短语文本");
+            assert!(!deferred_composition.is_empty(), "应有余码 y 新组合");
+            assert_eq!(timeout_ms, 150);
+        }
+        other => panic!(
+            "普通短语 direct_commit 顶码应返回 CommitThenDeferComposition，实际: {:?}",
+            other
+        ),
+    }
+}

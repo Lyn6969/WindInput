@@ -45,7 +45,7 @@ use wind_ui::toast::{ToastKind, ToastPosition};
 const CARET_USE_TOP_MIN_LINE_H: i32 = 18;
 
 /// direct_commit 顶码余码新组合的 keyup 兜底定时器时长（ms）。见 top-commit-mode 设计文档 §5。
-const DEFERRED_COMPOSITION_FALLBACK_MS: u32 = 150;
+pub(crate) const DEFERRED_COMPOSITION_FALLBACK_MS: u32 = 150;
 
 /// wind 修饰位（SHIFT=0x1/CTRL=0x2/ALT=0x4/WIN=0x8，见 wind-ipc MOD_*）→ Win32 位序
 /// （ALT=0x1/CTRL=0x2/SHIFT=0x4/WIN=0x8，即 ALT 与 SHIFT 互换）。
@@ -2131,7 +2131,7 @@ impl Coordinator {
     }
 
     /// 复位首显延迟状态（候选窗隐藏 / 组合结束）：下次新组合重新延迟首显，并作废未触发的兜底 timer。
-    fn reset_first_show(&self) {
+    pub(crate) fn reset_first_show(&self) {
         *self
             .candidate_shown
             .lock()
@@ -3697,17 +3697,16 @@ impl MessageHandler for Coordinator {
                 // 复用 ConvertEx 取 Candidates[0] 的一致性修复）。顶码绝大多数发生在「满码+1」，
                 // 此时前缀恰为顶码前缓冲，state.candidates 正是其显示候选。
                 let pre_buf = state.input_buffer.clone();
-                // 顶码上屏文本 = 用户实际所见的**码表首选**：顶码是码表机制，只上屏显示列表里排在
-                // 首位且为码表来源的候选。取顶码前缓冲（即将成为前缀）的显示首候选——它已过
-                // 智能过滤 / 词频重排 / shadow，正是用户所见；仅当其为码表来源时保留。
-                // 若显示首选是拼音/英文（拼音本就排首，或智能过滤掉生僻码表字后仅剩拼音，如
-                // 「wang」只有生僻字「佢」被过滤、显示全是拼音），则**无可顶的码表候选** → None，
-                // 下方放弃顶码、继续组合（对齐「上屏须与显示一致 + 非码表类不上屏」）。
-                let pre_display_first = state
-                    .candidates
-                    .first()
-                    .filter(|c| c.source == CandidateSource::CodeTable)
-                    .map(|c| c.text.clone());
+                // 顶码上屏候选 = 用户实际所见的**显示首选**：取顶码前缓冲（即将成为前缀）的显示
+                // 首候选——它已过智能过滤 / 词频重排 / shadow，正是用户所见。保留整条候选（含
+                // is_command / phrase_template / group_code），供顶码分流：码表候选 & 普通短语 →
+                // 文本顶上屏；$CC 命令短语 → 求值执行。短语 source 恒为 None，须靠 is_phrase /
+                // is_command 显式放行；source==None 的拼音/英文（拼音本就排首，或智能过滤掉生僻
+                // 码表字后仅剩拼音，如「wang」只有生僻字「佢」被过滤、显示全是拼音）仍被排除 →
+                // 下方放弃顶码继续组合（对齐「上屏须与显示一致 + 非码表/短语类不上屏」）。
+                let pre_display_first = state.candidates.first().cloned().filter(|c| {
+                    c.source == CandidateSource::CodeTable || c.is_phrase || c.is_command
+                });
                 state.input_buffer.push(ch);
 
                 // 顶码上屏：缓冲超过满码长且整串无匹配 → 顶前 N 码首选，余码续打
@@ -3718,55 +3717,43 @@ impl MessageHandler for Coordinator {
                     let buf = state.input_buffer.clone();
                     let prefix: String =
                         buf[..buf.len().saturating_sub(remainder.len())].to_string();
-                    // 顶码文本决策：
-                    // - 前缀==顶码前缓冲（满码+1，最常见）：只上屏显示码表首选；显示首选非码表 →
-                    //   None → 放弃顶码（不上屏被过滤/隐藏的候选，继续组合让用户选拼音）。
-                    // - 否则（多级溢出，罕见 wubi 场景）：回退引擎码表顶码文本。
-                    let top_text = if prefix == pre_buf {
-                        pre_display_first.clone()
-                    } else {
-                        Some(engine_top)
-                    };
-                    if let Some(top_text) = top_text {
-                        // 顶码上屏是码表机制，归属码表来源。
-                        self.record_selection(&prefix, &top_text, CandidateSource::CodeTable);
-                        // 顶码即上屏首选（pos=0），code_len=被顶出的前缀码长。
-                        self.record_commit(
-                            &top_text,
-                            prefix.len() as u32,
-                            0,
-                            CommitSource::Candidate,
-                        );
-                        state.input_buffer = remainder.clone();
-                        let _ = self.update_candidates(&mut state); // 余码候选（不再消费其结局）
-                        let preedit = state.preedit.clone();
-                        // 顶码上屏 = 部分上屏 + 余码续组合：宿主光标因 top_text 插入而前移，余码组合的起点已变。
-                        // 复位首显延迟状态，使余码候选窗重新延迟到 reflow 后的新坐标首显、重锁组合起点，
-                        // 避免停留在顶码前的旧位置（候选窗保持上一帧显示直到新坐标到达，对齐 Go）。
-                        self.reset_first_show();
-                        self.notify_ui_update(&state);
-                        let has_comp = !remainder.is_empty();
-                        // direct_commit：真提交顶出文本，余码新组合延迟到触发键 keyup 才开。
-                        // 仅在有余码时分叉（无余码退化为普通提交，与 pre_confirm 一致）。
-                        if has_comp
-                            && self.rt().config.input.top_commit_mode
-                                == wind_config::TopCommitMode::DirectCommit
-                        {
-                            return KeyAction::CommitThenDeferComposition {
-                                commit_text: top_text,
-                                deferred_composition: preedit,
-                                timeout_ms: DEFERRED_COMPOSITION_FALLBACK_MS,
-                            };
+                    // 顶码候选决策：
+                    // - prefix==顶码前缓冲（满码+1，最常见）：用显示首选候选（码表/普通短语/命令）；
+                    //   显示首选非码表且非短语 → None → 放弃顶码（继续组合让用户选拼音）。
+                    // - 否则（多级溢出，罕见 wubi 场景）：回退引擎码表顶码纯文本（无命令语义）。
+                    if prefix == pre_buf {
+                        match pre_display_first {
+                            // $CC 命令短语顶码：纯文本命令（≈词条）同步求值文本走标准文本顶码；
+                            // 含副作用命令（开应用/切设置等）异步执行 + 余码走标准流程。
+                            Some(cand) if cand.is_command => {
+                                let input = if cand.group_code.is_empty() {
+                                    prefix.clone()
+                                } else {
+                                    cand.group_code.clone()
+                                };
+                                return match self
+                                    .eval_command_text_only(&cand.phrase_template, &input)
+                                {
+                                    Some(text) => {
+                                        self.commit_top_text(&mut state, &prefix, text, &remainder)
+                                    }
+                                    None => self.top_commit_command_with_remainder(
+                                        &mut state, &cand, &prefix, &remainder,
+                                    ),
+                                };
+                            }
+                            // 码表候选 / 普通短语：文本顶上屏 + 余码续打。
+                            Some(cand) => {
+                                return self
+                                    .commit_top_text(&mut state, &prefix, cand.text, &remainder);
+                            }
+                            // 显示首选是拼音/英文 → 放弃顶码，落到下方正常候选刷新继续组合。
+                            None => {}
                         }
-                        return KeyAction::InsertText {
-                            text: top_text,
-                            new_composition: has_comp.then_some(preedit),
-                            mode_changed: false,
-                            chinese_mode: true,
-                            has_new_composition: has_comp,
-                        };
+                    } else {
+                        // 多级溢出：引擎码表纯文本顶码。
+                        return self.commit_top_text(&mut state, &prefix, engine_top, &remainder);
                     }
-                    // top_text None（显示首选非码表）→ 放弃顶码，落到下方正常候选刷新继续组合。
                 }
 
                 // 全码自动上屏 / 满码空码清空（schema.auto_commit_at_full / clear_on_empty_max）。

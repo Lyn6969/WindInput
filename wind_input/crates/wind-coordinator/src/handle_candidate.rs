@@ -3,7 +3,8 @@
 //! 从 coordinator.rs 拆出（同 crate 内 `impl Coordinator` 块，组织性重构，无逻辑变更）。
 
 use crate::coordinator::{
-    Coordinator, InputOutcome, LEARN_ADD_WEIGHT, PHRASE_WEIGHT_BASE, State, now_unix_secs,
+    Coordinator, DEFERRED_COMPOSITION_FALLBACK_MS, InputOutcome, LEARN_ADD_WEIGHT,
+    PHRASE_WEIGHT_BASE, State, now_unix_secs,
 };
 use crate::pipeline::ModeKind;
 use tracing::{debug, warn};
@@ -1174,6 +1175,95 @@ impl Coordinator {
         }
         let cand = state.candidates[idx].clone();
         Some(self.commit_command(state, &cand))
+    }
+
+    /// 顶码「文本上屏 + 余码续打」收尾（码表候选 / 普通短语 / 纯文本命令 / 引擎回退文本共用）。
+    /// 记账（顶码归属码表来源）→ 设余码为缓冲 → 刷新候选 → 复位首显延迟 → 按 `top_commit_mode`
+    /// 返回 `InsertText`（pre_confirm）或 `CommitThenDeferComposition`（direct_commit，余码
+    /// keyup 延迟重开）。`top_text` 空（理论边界）时跳过记账、仅刷新余码组合。
+    pub(crate) fn commit_top_text(
+        &self,
+        state: &mut State,
+        prefix: &str,
+        top_text: String,
+        remainder: &str,
+    ) -> KeyAction {
+        if !top_text.is_empty() {
+            // 顶码上屏是码表机制，归属码表来源。
+            self.record_selection(prefix, &top_text, CandidateSource::CodeTable);
+            // 顶码即上屏首选（pos=0），code_len=被顶出的前缀码长。
+            self.record_commit(
+                &top_text,
+                prefix.len() as u32,
+                0,
+                wind_store::stats::CommitSource::Candidate,
+            );
+        }
+        state.input_buffer = remainder.to_string();
+        let _ = self.update_candidates(state); // 余码候选（不再消费其结局）
+        let preedit = state.preedit.clone();
+        // 顶码 = 部分上屏 + 余码续组合：宿主光标因 top_text 插入而前移，余码组合起点已变。
+        // 复位首显延迟，使余码候选窗延迟到 reflow 后的新坐标首显、重锁组合起点（对齐 Go）。
+        self.reset_first_show();
+        self.notify_ui_update(state);
+        let has_comp = !remainder.is_empty();
+        // direct_commit：真提交顶出文本，余码新组合延迟到触发键 keyup 才开（仅有余码时分叉）。
+        if has_comp
+            && self.rt().config.input.top_commit_mode
+                == wind_config::TopCommitMode::DirectCommit
+        {
+            return KeyAction::CommitThenDeferComposition {
+                commit_text: top_text,
+                deferred_composition: preedit,
+                timeout_ms: DEFERRED_COMPOSITION_FALLBACK_MS,
+            };
+        }
+        KeyAction::InsertText {
+            text: top_text,
+            new_composition: has_comp.then_some(preedit),
+            mode_changed: false,
+            chinese_mode: true,
+            has_new_composition: has_comp,
+        }
+    }
+
+    /// 含副作用命令（`$CC` 里带 shell/key/clip 等 Effect）顶码：异步执行动作（消费 prefix 整段、
+    /// 无同步上屏文本），余码作为新一轮输入缓冲走标准候选刷新 + 新组合。副作用多为开应用 /
+    /// 切设置——前者焦点变化自动取消余码组合（无害），后者不改焦点、余码组合正常续打。
+    /// 不走 direct_commit 延迟重开（无同步 commit 文本，无 diff 合并之虞）。
+    pub(crate) fn top_commit_command_with_remainder(
+        &self,
+        state: &mut State,
+        cand: &Candidate,
+        prefix: &str,
+        remainder: &str,
+    ) -> KeyAction {
+        // 命令 input：nav 命令携完整码 group_code，否则用被顶出的前缀码 prefix（对齐 commit_command）。
+        let input = if cand.group_code.is_empty() {
+            prefix.to_string()
+        } else {
+            cand.group_code.clone()
+        };
+        // 无余码（理论边界）→ 退化为普通命令选中（清组合，异步执行）。
+        if remainder.is_empty() {
+            self.reset_pinyin_composition(state);
+            return self.spawn_command_action(cand, input);
+        }
+        let src = cand.phrase_template.clone();
+        state.input_buffer = remainder.to_string();
+        let _ = self.update_candidates(state); // 余码标准候选刷新
+        let preedit = state.preedit.clone();
+        self.reset_first_show();
+        self.notify_ui_hide(); // 隐藏命令码 UI（余码候选窗随后由 notify_ui_update 重开）
+        self.spawn_command(src, input); // 异步执行副作用（Effect 回调 coordinator 锁必须异步）
+        self.notify_ui_update(state);
+        KeyAction::InsertText {
+            text: String::new(), // 空上屏：命令占 prefix，无同步文本
+            new_composition: Some(preedit),
+            mode_changed: false,
+            chinese_mode: true,
+            has_new_composition: true,
+        }
     }
 
     /// 在独立线程执行命令源（解析→求值→按序跑动作；type 文本经 push 提交、其余为副作用）。
