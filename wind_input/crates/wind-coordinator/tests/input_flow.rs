@@ -2665,6 +2665,35 @@ fn phrase_auto_commit_unique_exact_no_longer() {
 }
 
 #[test]
+fn clear_on_empty_max_keeps_phrase_candidate() {
+    if !has_schemas() {
+        return;
+    }
+    // 回归：满码空码清空（clear_on_empty_max）开启 + 短语专属码（码表无字，如 zzbd）时，
+    // should_clear 由码表引擎在**追加短语之前**算出 true（仅看码表空候选），但协调器随后追加了
+    // 精确码短语候选 → 不应清空缓冲。原 bug：`None if should_clear => Clear` 未复查叠加短语后的
+    // 最终候选，把短语列表连同缓冲一并误清（handle_candidate.rs）。
+    // 复用 kkkkx（五笔码表 4 码封顶，5 码处必无码表候选 → is_empty 且满码 → should_clear 成立）。
+    let store_path = std::env::temp_dir().join("wind_phrase_clear_empty.redb");
+    let _ = std::fs::remove_file(&store_path);
+    let store = std::sync::Arc::new(wind_store::Store::open(&store_path).unwrap());
+    store.add_phrase("kkkkx", "空码短语文本", 0, 100).unwrap();
+    let mut cfg = config_with("wubi86");
+    cfg.schema.codetable.clear_on_empty_max = true;
+    let coord = Coordinator::new_headless_with_store(cfg, Some(&data_dir()), store);
+    for ch in ['k', 'k', 'k', 'k', 'x'] {
+        press_letter(&coord, ch);
+    }
+    let texts = coord.debug_all_candidate_texts();
+    assert!(
+        texts.iter().any(|t| t == "空码短语文本"),
+        "满码空码清空开启时，短语专属码候选不应被清空，实际候选: {:?}",
+        texts
+    );
+    let _ = std::fs::remove_file(&store_path);
+}
+
+#[test]
 fn top_code_plain_phrase_direct_commit_defers() {
     if !has_schemas() {
         return;

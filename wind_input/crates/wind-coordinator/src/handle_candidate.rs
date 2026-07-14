@@ -482,7 +482,10 @@ impl Coordinator {
                     _ => InputOutcome::Normal,
                 }
             }
-            None if should_clear => InputOutcome::Clear,
+            // 满码空码清空：`should_clear` 由码表引擎在追加短语**之前**计算（仅看码表候选）。
+            // 协调器随后可能追加短语候选（zzbd 等短语专属码：码表无字但短语命中），故此处须以
+            // 叠加短语后的最终候选复查——`state.candidates` 非空即不清，避免误清短语列表。
+            None if should_clear && state.candidates.is_empty() => InputOutcome::Clear,
             None => InputOutcome::Normal,
         };
         // 短语自动上屏：码表未给出上屏意向（Normal）时，补齐短语侧——引擎判据看不到短语，
