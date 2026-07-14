@@ -574,7 +574,9 @@ k = ["ao"]
     fn builtin_layouts_load() {
         let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("../../../data/schemas/shuangpin");
-        for id in ["xiaohe", "ziranma", "mspy", "sogou", "abc", "ziguang", "shoudao"] {
+        for id in [
+            "xiaohe", "ziranma", "mspy", "sogou", "abc", "ziguang", "shoudao",
+        ] {
             let p = dir.join(format!("{id}.toml"));
             let lay = Layout::from_toml(&p).unwrap_or_else(|e| panic!("加载 {id} 失败: {e}"));
             assert_eq!(lay.id, id, "{id} 的 meta.id 不匹配");

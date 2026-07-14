@@ -617,7 +617,12 @@ mod input_diag_wire_tests {
 
     #[test]
     fn input_state_report_roundtrip() {
-        let r = InputStateReportPayload { pid: 4242, disabled: 1, reason: 1, input_scope_mask: 1 << 31 };
+        let r = InputStateReportPayload {
+            pid: 4242,
+            disabled: 1,
+            reason: 1,
+            input_scope_mask: 1 << 31,
+        };
         let bytes = r.to_bytes();
         assert_eq!(bytes.len(), InputStateReportPayload::SIZE);
         let d = InputStateReportPayload::from_bytes(&bytes).unwrap();

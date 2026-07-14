@@ -287,9 +287,7 @@ fn initial_bottom_right(w: u32, h: u32, scale: f32) -> (i32, i32) {
     let margin = (MARGIN as f32 * scale).round() as i32;
     #[cfg(windows)]
     {
-        use windows::Win32::UI::WindowsAndMessaging::{
-            GetSystemMetrics, SM_CXSCREEN, SM_CYSCREEN,
-        };
+        use windows::Win32::UI::WindowsAndMessaging::{GetSystemMetrics, SM_CXSCREEN, SM_CYSCREEN};
         unsafe {
             let sw = GetSystemMetrics(SM_CXSCREEN);
             let sh = GetSystemMetrics(SM_CYSCREEN);
@@ -306,7 +304,17 @@ fn initial_bottom_right(w: u32, h: u32, scale: f32) -> (i32, i32) {
 
 /// 窗口矩形与屏幕虚拟区域的可见交集在两个方向上是否都 ≥ `min`（纯几何，可单测）。
 /// 用"可见余量"而非"任意相交"：只露极少（如 1px）也视为屏外，保证用户能重新抓到窗口。
-fn rect_visible(x: i32, y: i32, w: i32, h: i32, vx: i32, vy: i32, vw: i32, vh: i32, min: i32) -> bool {
+fn rect_visible(
+    x: i32,
+    y: i32,
+    w: i32,
+    h: i32,
+    vx: i32,
+    vy: i32,
+    vw: i32,
+    vh: i32,
+    min: i32,
+) -> bool {
     let overlap_w = (x + w).min(vx + vw) - x.max(vx);
     let overlap_h = (y + h).min(vy + vh) - y.max(vy);
     overlap_w >= min && overlap_h >= min

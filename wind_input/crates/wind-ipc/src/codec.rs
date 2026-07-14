@@ -548,7 +548,11 @@ pub fn encode_commit_and_hold(timeout_ms: u32, commit_text: &str, hold_text: &st
 ///
 /// 格式：timeout_ms(4) + commit_len(4) + defer_len(4) + commit_utf8 + defer_utf8
 /// C++ 端先真提交 commit_text，余码 deferred_composition 延迟到触发键 keyup 才开新组合。
-pub fn encode_commit_then_defer(timeout_ms: u32, commit_text: &str, deferred_composition: &str) -> Vec<u8> {
+pub fn encode_commit_then_defer(
+    timeout_ms: u32,
+    commit_text: &str,
+    deferred_composition: &str,
+) -> Vec<u8> {
     let commit_bytes = commit_text.as_bytes();
     let defer_bytes = deferred_composition.as_bytes();
     let payload_len = 12 + commit_bytes.len() + defer_bytes.len();
@@ -694,9 +698,18 @@ mod tests {
         assert_eq!(cmd, CMD_COMMIT_THEN_DEFER);
         // payload 起始处 timeout_ms
         let p = IpcHeader::SIZE;
-        assert_eq!(u32::from_le_bytes([buf[p], buf[p+1], buf[p+2], buf[p+3]]), 150);
-        assert_eq!(u32::from_le_bytes([buf[p+4], buf[p+5], buf[p+6], buf[p+7]]), commit.len() as u32);
-        assert_eq!(u32::from_le_bytes([buf[p+8], buf[p+9], buf[p+10], buf[p+11]]), defer.len() as u32);
+        assert_eq!(
+            u32::from_le_bytes([buf[p], buf[p + 1], buf[p + 2], buf[p + 3]]),
+            150
+        );
+        assert_eq!(
+            u32::from_le_bytes([buf[p + 4], buf[p + 5], buf[p + 6], buf[p + 7]]),
+            commit.len() as u32
+        );
+        assert_eq!(
+            u32::from_le_bytes([buf[p + 8], buf[p + 9], buf[p + 10], buf[p + 11]]),
+            defer.len() as u32
+        );
     }
 }
 

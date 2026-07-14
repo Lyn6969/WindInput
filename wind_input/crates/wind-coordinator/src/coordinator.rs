@@ -2783,9 +2783,10 @@ impl Coordinator {
                     state.temp_english_buffer.clone()
                 }
             } else if let Some((buf, prefix)) = match state.active {
-                Some(ModeKind::TempPinyin) => {
-                    Some((state.temp_pinyin_buffer.clone(), state.temp_pinyin_prefix.clone()))
-                }
+                Some(ModeKind::TempPinyin) => Some((
+                    state.temp_pinyin_buffer.clone(),
+                    state.temp_pinyin_prefix.clone(),
+                )),
                 Some(ModeKind::Mix(_)) => {
                     Some((state.mix_buffer.clone(), state.mix_prefix.clone()))
                 }
@@ -2800,8 +2801,7 @@ impl Coordinator {
                         self.record_commit(&buf, buf.len() as u32, -1, CommitSource::ModeSwitch);
                         let raw = format!("{}{}", state.committed_text, buf);
                         self.maybe_s2t(state, &raw)
-                    } else if !prefix.is_empty()
-                        && self.rt().config.input.enter_behavior != "clear"
+                    } else if !prefix.is_empty() && self.rt().config.input.enter_behavior != "clear"
                     {
                         // 只按了模式进入符（缓冲空）：原样上屏该前缀符号本身，与回车空缓冲上屏一致
                         // （enter_behavior=clear 时回车也不上屏，故一并放弃）。
@@ -3381,7 +3381,9 @@ impl MessageHandler for Coordinator {
         // 英文模式：直接透传
         // 密码框强制英文抑制：透传（不改 chinese_mode 持久值/图标；设计"图标不变"）
         if !state.chinese_mode
-            || self.password_suppress.load(std::sync::atomic::Ordering::Relaxed)
+            || self
+                .password_suppress
+                .load(std::sync::atomic::Ordering::Relaxed)
         {
             return KeyAction::PassThrough;
         }
@@ -5074,7 +5076,10 @@ mod input_diag_tests {
     fn password_scope_sets_suppress_and_state() {
         let c = test_coordinator();
         c.apply_input_diag(1234, false, /*reason*/ 2, 1 << 31);
-        assert!(c.password_suppress.load(std::sync::atomic::Ordering::Relaxed));
+        assert!(
+            c.password_suppress
+                .load(std::sync::atomic::Ordering::Relaxed)
+        );
         let d = c.last_input_diag.lock().unwrap();
         assert_eq!(d.reason, InputDiagReason::InputScopePassword);
         assert_eq!(d.pid, 1234);
@@ -5085,7 +5090,10 @@ mod input_diag_tests {
         let c = test_coordinator();
         c.apply_input_diag(1, false, 2, 1 << 31);
         c.apply_input_diag(1, false, 0, 0);
-        assert!(!c.password_suppress.load(std::sync::atomic::Ordering::Relaxed));
+        assert!(
+            !c.password_suppress
+                .load(std::sync::atomic::Ordering::Relaxed)
+        );
     }
 
     #[test]
@@ -5094,7 +5102,10 @@ mod input_diag_tests {
         c.password_suppress_enabled
             .store(false, std::sync::atomic::Ordering::Relaxed);
         c.apply_input_diag(1, false, 2, 1 << 31);
-        assert!(!c.password_suppress.load(std::sync::atomic::Ordering::Relaxed));
+        assert!(
+            !c.password_suppress
+                .load(std::sync::atomic::Ordering::Relaxed)
+        );
     }
 
     /// 构造最简按键事件（对齐 capslock_tests::kev 的写法）。
@@ -5117,12 +5128,16 @@ mod input_diag_tests {
         let mut cfg = Config::default();
         cfg.input.default.chinese_mode = true;
         let c = Coordinator::new_headless(cfg, None);
-        assert!(c.state.lock().unwrap().chinese_mode, "前置条件：应处于中文模式");
+        assert!(
+            c.state.lock().unwrap().chinese_mode,
+            "前置条件：应处于中文模式"
+        );
 
         let pid = 4321u32;
         c.apply_input_diag(pid, false, 2, 1 << 31);
         assert!(
-            c.password_suppress.load(std::sync::atomic::Ordering::Relaxed),
+            c.password_suppress
+                .load(std::sync::atomic::Ordering::Relaxed),
             "前置条件：密码框抑制应已置位"
         );
         let action = c.handle_key_event(&kev(0x41 /* VK_A */, EVENT_KEY_DOWN));
@@ -5138,7 +5153,10 @@ mod input_diag_tests {
 
         // 解除抑制：mask 清零。
         c.apply_input_diag(pid, false, 0, 0);
-        assert!(!c.password_suppress.load(std::sync::atomic::Ordering::Relaxed));
+        assert!(
+            !c.password_suppress
+                .load(std::sync::atomic::Ordering::Relaxed)
+        );
         let action = c.handle_key_event(&kev(0x41 /* VK_A */, EVENT_KEY_DOWN));
         assert!(
             !matches!(action, KeyAction::PassThrough),

@@ -568,7 +568,14 @@ mod tests {
         cfg.keys.toggle_punct = "ctrl+period".to_string();
         let compiled = Compiler::new(cfg).compile();
 
-        let find = |a: &str| compiled.key_down.iter().find(|e| e.action == a).unwrap().clone();
+        let find = |a: &str| {
+            compiled
+                .key_down
+                .iter()
+                .find(|e| e.action == a)
+                .unwrap()
+                .clone()
+        };
 
         // 加词两键：CHINESE_ONLY + GLOBAL 叠加
         for a in ["add_word", "open_add_word_dialog"] {

@@ -166,10 +166,8 @@ mod tests {
     fn load_typed_dirs_rejects_missing_base() {
         // 派生主题引用不存在的 base：load_merged_dirs_at 的 find_theme_dir 应报错，
         // 供导入链路（web_theme_import_text）据此判定依赖校验失败并回滚。
-        let dir = std::env::temp_dir().join(format!(
-            "wind_theme_missing_base_{}",
-            std::process::id()
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("wind_theme_missing_base_{}", std::process::id()));
         let theme_dir = dir.join("derived");
         std::fs::create_dir_all(&theme_dir).unwrap();
         std::fs::write(

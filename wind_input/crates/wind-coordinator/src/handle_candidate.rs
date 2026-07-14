@@ -30,7 +30,11 @@ use wind_ui::manager::CandidateOp;
 ///   base_order/natural_order 默认 0 浮于顶部。
 ///
 /// 排序规则：Exact >> Sub-phrase >> Prefix >> Fuzzy。
-fn candidate_display_order(a: &Candidate, b: &Candidate, ignore_weight: bool) -> std::cmp::Ordering {
+fn candidate_display_order(
+    a: &Candidate,
+    b: &Candidate,
+    ignore_weight: bool,
+) -> std::cmp::Ordering {
     let by_weight = if ignore_weight {
         std::cmp::Ordering::Equal
     } else {
@@ -1264,8 +1268,7 @@ impl Coordinator {
         let has_comp = !remainder.is_empty();
         // direct_commit：真提交顶出文本，余码新组合延迟到触发键 keyup 才开（仅有余码时分叉）。
         if has_comp
-            && self.rt().config.input.top_commit_mode
-                == wind_config::TopCommitMode::DirectCommit
+            && self.rt().config.input.top_commit_mode == wind_config::TopCommitMode::DirectCommit
         {
             return KeyAction::CommitThenDeferComposition {
                 commit_text: top_text,
@@ -1718,6 +1721,9 @@ mod finalize_candidates_tests {
         // natural 模式：忽略权重 → base_order 升序主导，主库(0) 在前。
         let mut n = vec![main_low, extra_high];
         n.sort_by(|a, b| candidate_display_order(a, b, true));
-        assert_eq!(n[0].text, "主低", "natural 模式忽略权重、按 base_order 升序，主库应靠前");
+        assert_eq!(
+            n[0].text, "主低",
+            "natural 模式忽略权重、按 base_order 升序，主库应靠前"
+        );
     }
 }

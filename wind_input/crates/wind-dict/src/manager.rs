@@ -205,7 +205,8 @@ mod tests {
         let mut d = CodetableDict::empty();
         d.merge_single("a".into(), "甲".into(), 5, 0); // order 0
         d.merge_single("a".into(), "乙".into(), 999, 1); // order 1（权重更高，但会被覆盖）
-        let layer = SystemDictLayer::new(CachedDict::Memory(d), "ext").with_default_weight(Some(100));
+        let layer =
+            SystemDictLayer::new(CachedDict::Memory(d), "ext").with_default_weight(Some(100));
         let r = layer.search("a", 10);
         assert_eq!(r.len(), 2);
         assert!(

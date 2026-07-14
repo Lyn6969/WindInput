@@ -2549,8 +2549,11 @@ fn top_code_plain_phrase_first_commits_phrase_text() {
         return;
     }
     // 普通短语作 skce 首选：顶码应上屏短语文本 + 余码 y 续打（pre_confirm）。
-    let coord =
-        coord_with_skce_phrase("顶码短语文本", wind_config::TopCommitMode::PreConfirm, "plain");
+    let coord = coord_with_skce_phrase(
+        "顶码短语文本",
+        wind_config::TopCommitMode::PreConfirm,
+        "plain",
+    );
     match drive_top_code(&coord) {
         KeyAction::InsertText {
             text,
@@ -2582,7 +2585,10 @@ fn top_code_text_command_first_commits_evaluated_text() {
             has_new_composition,
             ..
         } => {
-            assert_eq!(text, "命令文本", "纯文本命令顶码应上屏求值文本(而非 display 标签)");
+            assert_eq!(
+                text, "命令文本",
+                "纯文本命令顶码应上屏求值文本(而非 display 标签)"
+            );
             assert!(has_new_composition, "顶码应带余码 y 新组合");
         }
         other => panic!("纯文本命令顶码应返回 InsertText，实际: {:?}", other),
@@ -2669,15 +2675,21 @@ fn top_code_plain_phrase_direct_commit_defers() {
         return;
     }
     // 普通短语首选 + direct_commit：走成熟 CommitThenDeferComposition 路径，commit_text=短语文本。
-    let coord =
-        coord_with_skce_phrase("顶码短语文本", wind_config::TopCommitMode::DirectCommit, "direct");
+    let coord = coord_with_skce_phrase(
+        "顶码短语文本",
+        wind_config::TopCommitMode::DirectCommit,
+        "direct",
+    );
     match drive_top_code(&coord) {
         KeyAction::CommitThenDeferComposition {
             commit_text,
             deferred_composition,
             timeout_ms,
         } => {
-            assert_eq!(commit_text, "顶码短语文本", "direct_commit 顶码应真提交短语文本");
+            assert_eq!(
+                commit_text, "顶码短语文本",
+                "direct_commit 顶码应真提交短语文本"
+            );
             assert!(!deferred_composition.is_empty(), "应有余码 y 新组合");
             assert_eq!(timeout_ms, 150);
         }

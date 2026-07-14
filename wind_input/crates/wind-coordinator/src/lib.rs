@@ -6,7 +6,6 @@ pub mod coordinator;
 #[cfg(windows)]
 pub mod direct_switch;
 pub mod handle_addword;
-pub mod input_diag;
 pub mod handle_candidate;
 pub mod handle_cmdbar;
 #[cfg(target_os = "macos")]
@@ -22,6 +21,7 @@ pub mod handle_temp;
 pub mod handle_tooltip;
 pub mod handle_url;
 pub mod hotkey_match;
+pub mod input_diag;
 pub mod pipeline;
 pub mod stats;
 pub mod watchdog;

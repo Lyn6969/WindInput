@@ -70,13 +70,22 @@ mod tests {
     #[test]
     fn compartment_takes_precedence_over_mask() {
         // disabled=true 一律 CompartmentDisabled，即便 mask 有密码位
-        assert_eq!(reason_from(true, IS_PASSWORD), InputDiagReason::CompartmentDisabled);
+        assert_eq!(
+            reason_from(true, IS_PASSWORD),
+            InputDiagReason::CompartmentDisabled
+        );
     }
 
     #[test]
     fn password_and_numeric_from_mask() {
-        assert_eq!(reason_from(false, IS_PASSWORD), InputDiagReason::InputScopePassword);
-        assert_eq!(reason_from(false, IS_NUMERIC_PASSWORD), InputDiagReason::NumericPassword);
+        assert_eq!(
+            reason_from(false, IS_PASSWORD),
+            InputDiagReason::InputScopePassword
+        );
+        assert_eq!(
+            reason_from(false, IS_NUMERIC_PASSWORD),
+            InputDiagReason::NumericPassword
+        );
     }
 
     #[test]

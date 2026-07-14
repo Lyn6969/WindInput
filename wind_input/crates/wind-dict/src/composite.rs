@@ -200,7 +200,11 @@ mod tests {
                 self.base_order
             }
             fn search(&self, code: &str, _l: usize) -> Vec<Candidate> {
-                self.items.iter().filter(|c| c.code == code).cloned().collect()
+                self.items
+                    .iter()
+                    .filter(|c| c.code == code)
+                    .cloned()
+                    .collect()
             }
             fn search_prefix(&self, p: &str, _l: usize) -> Vec<Candidate> {
                 self.items
@@ -224,7 +228,10 @@ mod tests {
         }));
         let r = c.search("x", 10);
         assert_eq!(r.len(), 2);
-        assert_eq!(r[0].text, "扩", "base_order 更小的主库应排前，即便其文本序更大");
+        assert_eq!(
+            r[0].text, "扩",
+            "base_order 更小的主库应排前，即便其文本序更大"
+        );
         assert_eq!(r[1].text, "主");
     }
 

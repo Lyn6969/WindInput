@@ -921,8 +921,16 @@ mod tests {
         let p2 = std::env::temp_dir().join("wdat_global_order_test2.wdat");
         w2.write(&p2).expect("write wdat");
         let r2 = WdatReader::open(&p2).unwrap();
-        let t2: Vec<String> = r2.search_prefix("aa", 10).into_iter().map(|e| e.text).collect();
-        assert_eq!(t2, vec!["一", "二", "三"], "同码同权前缀查询应按 order 升序");
+        let t2: Vec<String> = r2
+            .search_prefix("aa", 10)
+            .into_iter()
+            .map(|e| e.text)
+            .collect();
+        assert_eq!(
+            t2,
+            vec!["一", "二", "三"],
+            "同码同权前缀查询应按 order 升序"
+        );
         let _ = std::fs::remove_file(&p);
         let _ = std::fs::remove_file(&p2);
     }
