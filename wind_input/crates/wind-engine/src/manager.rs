@@ -89,9 +89,10 @@ pub struct EngineManager {
     override_dir: Option<std::path::PathBuf>,
     /// 主码表方案 id(拼音反查码源):config.schema.primary_codetable 解析后(可空)。构造/重载时更新。
     primary_codetable: Mutex<String>,
-    /// 主码表反查索引缓存:(主码表 id, 汉字/词 → 实际编码)。供拼音方案编码提示按词查实际码。
-    /// 懒建(首次需要时按主码表全量构建),主码表 id 变化时重建,invalidate/reload 时清空。
-    reverse_index: Mutex<Option<(String, Arc<HashMap<String, String>>)>>,
+    /// 码表反查索引缓存:方案 id → (汉字/词 → 实际编码)。供拼音编码提示与悬停 [编码] 段按词查实际码。
+    /// 懒建(首次需要时按方案词库全量构建),invalidate/reload 时清空。
+    /// 内存护栏:每份索引可达数万词条,最多缓存两份(见 `reverse_index_for`)。
+    reverse_index: Mutex<HashMap<String, Arc<HashMap<String, String>>>>,
     /// 全局拼音配置（fuzzy/show_code_hint/...）。Mutex 以支持热重载。
     pinyin: Mutex<wind_config::config::PinyinGlobalConfig>,
     /// 双拼韵母键集缓存：(已缓存的活跃方案 id, Option<HashSet<u8>>)。
@@ -216,7 +217,7 @@ impl EngineManager {
             name_cache: Mutex::new(HashMap::new()),
             override_dir,
             primary_codetable: Mutex::new(primary_codetable),
-            reverse_index: Mutex::new(None),
+            reverse_index: Mutex::new(HashMap::new()),
             pinyin: Mutex::new(config.schema.pinyin.clone()),
             shuangpin_finals_cache: Mutex::new((String::new(), None)),
             build_locks: Mutex::new(HashMap::new()),
@@ -328,37 +329,71 @@ impl EngineManager {
     /// 拼音方案编码提示:返回主码表中 `text` 实际对应的编码(多码取权重/码长/字典序首位),
     /// 不存在返回空。对齐 Go `manager_convert.go` 的 ApplyCodeHintsToCandidates——用主码表
     /// **反向索引**取实际码,而非按字生成码再校验(后者生成码常与码表实际码不一致,导致全被拒)。
-    /// 索引按主码表 id 懒建并缓存,主码表 id 变化时重建,reload/invalidate 时清空。
     pub fn codetable_reverse_hint(&self, text: &str) -> String {
         let primary = self
             .primary_codetable
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .clone();
-        if primary.is_empty() {
-            return String::new();
-        }
-        let idx = {
-            let mut guard = self.reverse_index.lock().unwrap_or_else(|e| e.into_inner());
-            match guard.as_ref() {
-                Some((id, m)) if *id == primary => m.clone(),
-                _ => {
-                    let m = Arc::new(self.build_primary_reverse_index(&primary));
-                    *guard = Some((primary.clone(), m.clone()));
-                    m
-                }
-            }
-        };
-        idx.get(text).cloned().unwrap_or_default()
+        self.word_code_in(&primary, text)
     }
 
-    /// 按主码表方案全量构建反查索引(汉字/词 → 实际编码)。失败返回空表。
-    fn build_primary_reverse_index(&self, primary: &str) -> HashMap<String, String> {
+    /// 悬停提示 [编码] 段的编码来源方案 id:码表方案=自身(显示自己的完整编码);
+    /// 混输=其主码表成员;拼音/其他=全局主码表方案。空=无来源(编码段不显示)。
+    /// 按已加载引擎的内存类型判定,不读盘(此路径每次候选推送都会走)。
+    pub fn tooltip_code_schema(&self) -> String {
+        let active = self.active_schema_id();
+        match self.active_engine().map(|e| e.engine_type()) {
+            Some(EngineType::CodeTable) => active,
+            Some(EngineType::Mixed) => self.mixed_primary_schema(&active).unwrap_or_default(),
+            _ => self
+                .primary_codetable
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .clone(),
+        }
+    }
+
+    /// 查 `schema_id` 方案词库中 `text` 的实际编码(多码取权重/码长/字典序首位);
+    /// 方案 id 为空或词不在词库返回空——不按取码规则生成,生成码常与词库实际码不一致。
+    pub fn word_code_in(&self, schema_id: &str, text: &str) -> String {
+        if schema_id.is_empty() {
+            return String::new();
+        }
+        self.reverse_index_for(schema_id)
+            .get(text)
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    /// 取 `schema_id` 的反查索引,缺则全量构建并缓存。
+    /// 内存护栏:最多保留两份——本次请求方 + 全局主码表(悬停查活跃码表、拼音提示查主码表,
+    /// 两者常为同一方案;方案切换的残留索引随下次构建清退)。
+    fn reverse_index_for(&self, schema_id: &str) -> Arc<HashMap<String, String>> {
+        // primary 在 reverse_index 锁外取,避免嵌套锁。
+        let primary = self
+            .primary_codetable
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        let mut guard = self.reverse_index.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(m) = guard.get(schema_id) {
+            return m.clone();
+        }
+        let m = Arc::new(self.build_reverse_index_for(schema_id));
+        guard.insert(schema_id.to_string(), m.clone());
+        guard.retain(|k, _| k == schema_id || k == &primary);
+        m
+    }
+
+    /// 按方案全量构建反查索引(汉字/词 → 实际编码)。失败返回空表。
+    fn build_reverse_index_for(&self, schema_id: &str) -> HashMap<String, String> {
         let Some(data_dir) = self.data_dir.as_deref() else {
             return HashMap::new();
         };
         let schemas = data_dir.join("schemas");
-        let Some(schema) = Self::read_schema(primary, Some(data_dir), self.override_dir.as_deref())
+        let Some(schema) =
+            Self::read_schema(schema_id, Some(data_dir), self.override_dir.as_deref())
         else {
             return HashMap::new();
         };
@@ -367,7 +402,7 @@ impl EngineManager {
                 let idx = dict.build_reverse_index();
                 info!(
                     "Built code-hint reverse index: {} ({} texts)",
-                    primary,
+                    schema_id,
                     idx.len()
                 );
                 idx
@@ -857,7 +892,10 @@ impl EngineManager {
         let hit = engine.is_some_and(|e| e.set_dict_enabled(dict_id, enabled));
         // 反查索引依赖「启用词库合并」，启用集变了须失效（懒重建）。
         // 注：编码提示开关已改读全局 config.pinyin.show_code_hint，无方案级缓存需失效。
-        *self.reverse_index.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        self.reverse_index
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear();
         hit
     }
 
@@ -932,7 +970,10 @@ impl EngineManager {
             .unwrap_or_else(|e| e.into_inner())
             .remove(schema_id);
         // 主码表(及其词库/override)可能变更:失效反查索引,下次按新内容重建。
-        *self.reverse_index.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        self.reverse_index
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear();
         // 双拼布局可能变更：失效韵母键缓存，下次按新布局重建。
         *self
             .shuangpin_finals_cache
@@ -986,7 +1027,10 @@ impl EngineManager {
             .lock()
             .unwrap_or_else(|e| e.into_inner()) = primary;
         // 主码表可能变更:失效反查索引,下次按新主码表重建。
-        *self.reverse_index.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        self.reverse_index
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear();
         *self.available.lock().unwrap_or_else(|e| e.into_inner()) = available;
         *self.codetable.lock().unwrap_or_else(|e| e.into_inner()) = config.schema.codetable.clone();
         *self.mix.lock().unwrap_or_else(|e| e.into_inner()) = config.schema.mix.clone();

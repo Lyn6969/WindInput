@@ -2048,6 +2048,12 @@ impl Coordinator {
         };
         // 反查表读锁在候选循环外取一次（写方仅 sync_chaizi_assets 的热重载路径）。
         let reverse = self.reverse.read().unwrap_or_else(|e| e.into_inner());
+        // [编码] 段来源方案（循环外解析一次）：码表方案=自身完整编码、混输=其主码表成员、
+        // 拼音=全局主码表。编码按词查方案词库反查索引（word_code_in），不按取码规则生成。
+        let code_schema = tip_cfg
+            .code_enabled
+            .then(|| self.engine_mgr.tooltip_code_schema())
+            .filter(|s| !s.is_empty());
         let items: Vec<CandidateItem> = state.candidates[start..end]
             .iter()
             .enumerate()
@@ -2058,7 +2064,12 @@ impl Coordinator {
                 let disp = cand_cfg.truncate_display(&full);
                 // 反查提示按截断后文本生成：超长候选（如长短语）逐字反查会撑爆气泡且显示不全，
                 // 只提示实际显示出的字（… 为非 CJK，tooltip_for 自动滤除，不影响反查内容）。
-                let mut tooltip = reverse.tooltip_for(&disp, &tip_opts);
+                // [编码] 段按候选**完整原文**查词库（截断/繁化文本词库里没有；查不到=None 不显示）。
+                let word_code = code_schema
+                    .as_deref()
+                    .map(|sid| self.engine_mgr.word_code_in(sid, &c.text))
+                    .filter(|s| !s.is_empty());
+                let mut tooltip = reverse.tooltip_for(&disp, &tip_opts, word_code.as_deref());
                 // 调试段：独立一行 [调试] + 来源/方案/编码/权重/序/词频。全关时不再兜底回填编码
                 // （tooltip 各 provider 全关即真正为空，不显示气泡）。
                 if let Some(ctx) = &dbg_ctx {
