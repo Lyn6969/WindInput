@@ -615,17 +615,39 @@ function Set-AutoStart ([string]$dir, [string]$suffix) {
     } catch { Warn "  - 配置开机自启失败" }
 }
 
-# 复制单个文件, 处理被占用的 DLL/EXE (改名 .old_ 让路再覆盖)。
+# 终止占用目标 exe 的进程 (按镜像名), 等其退出让出文件锁; 仅对 .exe 生效。
+# 背景: Stop-WindService 只杀核心服务 wind_input; 独立打开的设置程序 wind_setting[_dev].exe /
+#       便携版 wind_portable.exe 不随之退出, 覆盖前需先按名杀掉 (对齐 ../wind-setting Do-Copy 的处理)。
+# DLL 由宿主进程加载, 没有独立进程可杀 → 跳过, 仍靠 Copy-Replace 的改名让路兜底。
+function Stop-ProcessForFile ([string]$fileName) {
+    if ($fileName -notmatch '\.exe$') { return }
+    $procName = [System.IO.Path]::GetFileNameWithoutExtension($fileName)
+    $procs = @(Get-Process -Name $procName -ErrorAction SilentlyContinue)
+    if ($procs.Count -gt 0) {
+        Gray "  - 终止运行中的 $fileName ($($procs.Count) 个进程)..."
+        $procs | Stop-Process -Force -ErrorAction SilentlyContinue
+        Start-Sleep -Milliseconds 500
+    }
+}
+
+# 复制单个文件, 处理被占用的 DLL/EXE。
+# 顺序: ① 先杀占用该 exe 的进程 (如独立开着的设置程序) 并等待让出文件锁
+#       ② 尝试覆盖 (= 删旧写新) ③ 仍被锁 (如已加载的 TSF DLL) 则改名到固定 .old 槽让路再写。
 function Copy-Replace ([string]$targetDir, [string]$fileName, [string]$srcPath) {
     $dst = Join-Path $targetDir $fileName
     if (-not (Test-Path $dst)) { Copy-Item $srcPath $dst -Force; Gray "  - $fileName"; return }
+    Stop-ProcessForFile $fileName   # 先判断并杀进程等待, 再尝试覆盖; 覆盖失败才改名让路
     try { Copy-Item $srcPath $dst -Force -ErrorAction Stop; Gray "  - $fileName"; return } catch { }
-    $old = "$fileName.old_$(Get-Random -Maximum 99999999)"
+    # 用固定 .old 后缀 (不带时间戳) 复用同一让路槽, 避免每次部署堆叠 .old_<随机> 垃圾:
+    # 锁定的 DLL 改名后仍无法删除, 若每次生成新后缀会无限累积。已是 .old 则不再追加后缀。
+    # Move-Item -Force 覆盖上次遗留且已释放的 .old (Rename-Item 不能覆盖已存在目标, 故用 Move);
+    # 若上次 .old 仍被锁 (罕见双代同锁) 覆盖失败, 明确提示重启后重试。
+    $old = "$dst.old"
     try {
-        Rename-Item $dst $old -Force -ErrorAction Stop
+        Move-Item $dst $old -Force -ErrorAction Stop
         Copy-Item $srcPath $dst -Force
-        Gray "  - $fileName (旧文件已改名 $old)"
-    } catch { ErrMsg "  [错误] 无法替换 ${fileName}: $_" }
+        Gray "  - $fileName (旧文件已改名 $(Split-Path $old -Leaf))"
+    } catch { ErrMsg "  [错误] 无法替换 ${fileName}: 旧文件被锁定且改名让路失败, 请重启后重试" }
 }
 
 function Stop-WindService ([string]$suffix) {
@@ -667,7 +689,7 @@ function Deploy-Full ([string]$profile = "release") {
     Say "[6/7] 配置开机自启 + 默认启用输入法..."
     Set-AutoStart $targetDir $suffix
     Enable-TsfForUser $profile
-    Get-ChildItem "$targetDir\*.old_*" -ErrorAction SilentlyContinue | Remove-Item -Force -ErrorAction SilentlyContinue
+    Get-ChildItem "$targetDir\*.old*" -ErrorAction SilentlyContinue | Remove-Item -Force -ErrorAction SilentlyContinue
     Say "[7/7] 启动输入法服务..."
     $exe = Join-Path $targetDir "wind_input$suffix.exe"
     Start-Process -FilePath $exe; Gray "  - 已启动 wind_input$suffix.exe"
@@ -706,7 +728,7 @@ function Deploy-Module ([string]$profile, [string]$mod) {
         if (-not (Register-Tsf $targetDir $suffix)) { return $false }
         Enable-TsfForUser $profile
     }
-    Get-ChildItem "$targetDir\*.old_*" -ErrorAction SilentlyContinue | Remove-Item -Force -ErrorAction SilentlyContinue
+    Get-ChildItem "$targetDir\*.old*" -ErrorAction SilentlyContinue | Remove-Item -Force -ErrorAction SilentlyContinue
     Say "[4/4] 启动输入法服务..."
     $exe = Join-Path $targetDir "wind_input$suffix.exe"
     if (Test-Path $exe) { Start-Process -FilePath $exe; Gray "  - 已启动 wind_input$suffix.exe" }
@@ -740,16 +762,18 @@ function Remove-AutoStart ([string]$suffix) {
     Gray "  - 已移除开机自启 ($name)"
 }
 
-# 删除单个文件; 被占用(已加载的 DLL)时改名 .old_ 让路 — NTFS 允许改名在用文件, 仅不可删。
-# 返回 $true=已真正删除; $false=删不掉(已改名让路或失败)。与 Copy-Replace 同一让路策略。
+# 删除单个文件; 被占用(已加载的 DLL)时改名到固定 .old 槽让路 — NTFS 允许改名在用文件, 仅不可删。
+# 返回 $true=已真正删除; $false=删不掉(已改名让路或失败)。与 Copy-Replace 同一固定 .old 让路策略。
 function Remove-OrRename ([string]$path) {
     if (-not (Test-Path $path)) { return $true }
     $leaf = Split-Path $path -Leaf
     try { Remove-Item $path -Force -ErrorAction Stop; Gray "  - 删除 $leaf"; return $true }
     catch {
-        $old = "$path.old_$(Get-Random -Maximum 99999999)"
+        # 固定 .old 让路槽 (不带时间戳): 锁定文件改名后仍删不掉, 复用同名避免堆叠垃圾;
+        # Move-Item -Force 覆盖上次已释放的 .old, 已是 .old 则不再追加后缀。
+        $old = "$path.old"
         try {
-            Rename-Item $path $old -Force -ErrorAction Stop
+            Move-Item $path $old -Force -ErrorAction Stop
             Warn "  - $leaf 被占用, 已改名让路 ($(Split-Path $old -Leaf)); 重启后可清除"
         } catch {
             ErrMsg "  - $leaf 删除/改名均失败: $($_.Exception.Message)"
@@ -777,7 +801,7 @@ function Uninstall-Full ([string]$profile = "release") {
     Say "[5/5] 删除安装文件 (锁定的 DLL 改名让路)..."
     if (Test-Path $targetDir) {
         # 先清掉历史改名残留 (上次卸载留下、此刻或已可删)
-        Get-ChildItem "$targetDir\*.old_*" -Recurse -File -ErrorAction SilentlyContinue | Remove-Item -Force -ErrorAction SilentlyContinue
+        Get-ChildItem "$targetDir\*.old*" -Recurse -File -ErrorAction SilentlyContinue | Remove-Item -Force -ErrorAction SilentlyContinue
         # 逐文件删除; 占用的(TSF DLL 等)改名让路, 不再因单个锁定文件整体失败
         $allGone = $true
         Get-ChildItem $targetDir -Recurse -File -ErrorAction SilentlyContinue | ForEach-Object {
