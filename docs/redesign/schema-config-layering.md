@@ -1,5 +1,15 @@
 # 方案配置分层重构设计
 
+> **2026-07-14 修订（简化）**：码表行为覆盖不再走独立的 `[codetable]` 扁平段 + `SchemeOverride`/
+> `CodetableOverride` 结构与 `enabled` 总开关。改为——行为字段回到 `CodeTableSpec`（`[engine.codetable]`）
+> 作 tri-state `Option`，与引擎固定参数**同段同构**：方案作者可在 `.schema.toml` 内联行为基线；
+> `schema_overrides/{id}.toml` 用**相同的 `[engine.codetable]` 段**（设置页写入）经 `read_schema` 的
+> `merge_toml` 深合并覆盖；最终 `CodetableGlobal::resolved(&CodeTableSpec)` 一次折叠到全局基线
+> （`Some` 覆盖 / `None` 回落）。收益：override 与方案文件格式一致（可直接抄段改值）、隐藏/内置特殊模式
+> 方案（如 `quick_symbols`）行为自包含无需 override 文件、去掉恒为 true 的 `enabled` 仪式。
+> 同时 `[[schema.special_modes]]` 瘦身为 `{ schema, trigger_keys }`，`id/name/short_name` 从被引用方案
+> 文件派生（`schema_name` / `schema_icon_label` / `effective_id`），消除与方案文件的重复。
+>
 > 状态：**已实现并通过全量测试**（wind-config/engine/coordinator 改造 + data 清理；build/test/clippy/fmt 绿）。
 > 本项目未发布，**不考虑旧配置迁移**。
 > 实现补记：`temp_max_entries` 经核查为**完全未接入的死配置**（`evict_temp_words` 无生产调用方），

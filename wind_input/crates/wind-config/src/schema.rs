@@ -81,11 +81,16 @@ impl ChaiziSpec {
     }
 }
 
-/// 码表引擎配置（[engine.codetable]）。**仅引擎固定参数**；
-/// 行为/调频/造词/临时拼音等用户可配项已上移至全局 `schema.codetable` 与 `schema_overrides`
+/// 码表引擎配置（[engine.codetable]）：引擎固定参数 + **方案内联行为覆盖**。
+///
+/// 行为字段为 tri-state `Option`：`None`=回落全局 `schema.codetable`，`Some`=覆盖该字段。
+/// schema 文件与 `schema_overrides/{id}.toml` 用**完全相同的段名/字段**表达行为——前者是作者
+/// 内联基线，后者（设置页写入）经 `read_schema` 的 `merge_toml` 深合并到前者之上，最终由
+/// `CodetableGlobal::resolved` 折叠到全局基线。故不再有独立的 `SchemeOverride` 平行路径
 /// （见 docs/redesign/schema-config-layering.md）。
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct CodeTableSpec {
+    // ── 引擎固定参数 ──
     /// 最大码长（0=未设置，构建时回退 4）
     #[serde(default)]
     pub max_code_length: usize,
@@ -95,6 +100,35 @@ pub struct CodeTableSpec {
     /// 输入码字符集，如 "a-x" / "a-x/" / "a-z"。空=回退全局/默认。
     #[serde(default)]
     pub input_chars: String,
+
+    // ── 方案内联行为覆盖（None=回落全局 schema.codetable；Some=覆盖）──
+    /// 顶码上屏（超满码长取前 N 码首选上屏）。
+    #[serde(default)]
+    pub top_code_commit: Option<bool>,
+    /// 满码无候选时清空缓冲。
+    #[serde(default)]
+    pub clear_on_empty_max: Option<bool>,
+    /// 满码唯一精确时自动上屏。
+    #[serde(default)]
+    pub auto_commit_at_full: Option<bool>,
+    /// 自动上屏最短码长（隐藏参数；0=等于全码长）。
+    #[serde(default)]
+    pub auto_commit_min_len: Option<usize>,
+    /// 标点触发上屏。
+    #[serde(default)]
+    pub punct_commit: Option<bool>,
+    /// 显示编码提示。
+    #[serde(default)]
+    pub show_code_hint: Option<bool>,
+    /// 精确匹配模式（关闭前缀匹配）。
+    #[serde(default)]
+    pub single_code_input: Option<bool>,
+    /// 精确匹配空码补全。
+    #[serde(default)]
+    pub single_code_complete: Option<bool>,
+    /// z 键重复输入。
+    #[serde(default)]
+    pub z_key_repeat: Option<bool>,
 }
 
 /// 拼音引擎配置（[engine.pinyin]）。
@@ -215,52 +249,6 @@ pub struct EncoderRule {
     /// 拆字公式，如 "AaAbBaBb"
     #[serde(default)]
     pub formula: String,
-}
-
-/// 方案覆盖（`schema_overrides/{id}.toml` 中的**行为覆盖段**）。
-///
-/// 仅码表方案有行为覆盖；拼音、混输无 override。词库启停（`[[dictionaries]] enabled`）与
-/// 双拼布局（`[engine.pinyin.shuangpin] layout`）继续走 `Schema` 深合并，不在此结构。
-/// 见 docs/redesign/schema-config-layering.md §3/§4。
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub struct SchemeOverride {
-    #[serde(default)]
-    pub codetable: Option<CodetableOverride>,
-}
-
-/// 码表方案行为覆盖（`schema_overrides/{id}.toml` 的 `[codetable]` 段）。
-///
-/// `enabled` 为**总开关**：为 false 或缺省时整段忽略，逐字段回落全局 `schema.codetable`；
-/// 为 true 时各 `Some(_)` 字段覆盖全局，`None` 仍回落全局。
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub struct CodetableOverride {
-    #[serde(default)]
-    pub enabled: bool,
-    #[serde(default)]
-    pub top_code_commit: Option<bool>,
-    #[serde(default)]
-    pub clear_on_empty_max: Option<bool>,
-    #[serde(default)]
-    pub auto_commit_at_full: Option<bool>,
-    #[serde(default)]
-    pub auto_commit_min_len: Option<usize>,
-    #[serde(default)]
-    pub punct_commit: Option<bool>,
-    #[serde(default)]
-    pub show_code_hint: Option<bool>,
-    #[serde(default)]
-    pub single_code_input: Option<bool>,
-    #[serde(default)]
-    pub single_code_complete: Option<bool>,
-    #[serde(default)]
-    pub z_key_repeat: Option<bool>,
-}
-
-impl SchemeOverride {
-    /// 从 `schema_overrides/{id}.toml` 的 TOML 值解析行为覆盖段（容错：解析失败返回默认空覆盖）。
-    pub fn from_toml(value: &toml::Value) -> Self {
-        value.clone().try_into().unwrap_or_default()
-    }
 }
 
 impl Schema {

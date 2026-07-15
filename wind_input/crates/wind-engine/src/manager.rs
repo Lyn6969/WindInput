@@ -1121,8 +1121,8 @@ impl EngineManager {
         }
     }
 
-    /// 活跃方案的**有效**码表行为配置：全局 `schema.codetable` 经该方案
-    /// `schema_overrides/{id}.toml` 的 `[codetable]` 段（带开关）解析。供 coordinator 读
+    /// 活跃方案的**有效**码表行为配置：全局 `schema.codetable` 经该方案 `.schema.toml` 的
+    /// `[engine.codetable]`（内联 + `schema_overrides` 合并后）行为字段折叠。供 coordinator 读
     /// punct_commit / z_key_repeat 等行为字段（取代旧的直接读 schema 字段）。
     pub fn codetable_settings(&self) -> wind_config::CodetableGlobal {
         let id = self.active_schema_id();
@@ -1140,7 +1140,12 @@ impl EngineManager {
         } else {
             id
         };
-        Self::resolve_codetable(&resolve_id, &global, self.override_dir.as_deref())
+        Self::resolve_codetable(
+            &resolve_id,
+            self.data_dir.as_deref(),
+            &global,
+            self.override_dir.as_deref(),
+        )
     }
 
     /// 拼音自动造词配置（[schema.pinyin.auto_learn]）。
@@ -1171,17 +1176,16 @@ impl EngineManager {
         }
     }
 
-    /// 解析某方案的有效码表配置：全局基线 + `[codetable]` override（开关开启时逐字段覆盖）。
+    /// 解析某方案的有效码表配置：全局基线 + 方案 `[engine.codetable]` 行为（内联 + override
+    /// 已在 `read_schema` 经 `merge_toml` 合并）逐字段折叠。读不到方案时原样返回全局基线。
     fn resolve_codetable(
         schema_id: &str,
+        data_dir: Option<&Path>,
         global: &wind_config::CodetableGlobal,
         override_dir: Option<&Path>,
     ) -> wind_config::CodetableGlobal {
-        let ov = override_dir
-            .and_then(|d| Self::read_override_value(schema_id, d))
-            .map(|v| wind_config::schema::SchemeOverride::from_toml(&v))
-            .and_then(|so| so.codetable);
-        global.resolved(ov.as_ref())
+        let schema = Self::read_schema(schema_id, data_dir, override_dir);
+        global.resolved(schema.as_ref().map(|s| &s.engine.codetable))
     }
 
     /// 主码表方案的拆字配置（`[engine.chaizi]`：db/font 路径 + DWrite 家族名）。
@@ -1561,8 +1565,9 @@ impl EngineManager {
             } else {
                 4
             };
-            // 上屏策略：全局 schema.codetable 基线 + 该方案 [codetable] override（带开关）解析。
-            let eff = Self::resolve_codetable(schema_id, codetable_cfg, override_dir);
+            // 上屏策略：全局 schema.codetable 基线 + 该方案 [engine.codetable] 行为折叠。
+            // schema 已在 read_schema 合并了 schema_overrides，此处直接取其 engine.codetable。
+            let eff = codetable_cfg.resolved(Some(&schema.engine.codetable));
             let commit_opts = crate::codetable::CommitOptions {
                 auto_commit_at_full: eff.auto_commit_at_full,
                 auto_commit_min_len: eff.auto_commit_min_len,
@@ -2073,31 +2078,57 @@ mod tests {
     }
 
     #[test]
-    fn codetable_override_resolves_over_global() {
-        // 全局基线 + override（开关开启）逐字段覆盖。
+    fn codetable_inline_resolves_over_global() {
+        // 全局基线 + 方案 [engine.codetable] 行为逐字段折叠（Some 覆盖 / None 回落）。
         let global = wind_config::CodetableGlobal {
             top_code_commit: false,
             z_key_repeat: false,
             ..Default::default()
         };
-        let ov = wind_config::schema::CodetableOverride {
-            enabled: true,
+        let ov = wind_config::schema::CodeTableSpec {
             top_code_commit: Some(true),
             ..Default::default()
         };
         let eff = global.resolved(Some(&ov));
-        assert!(eff.top_code_commit, "override 开启时 Some 字段应覆盖");
-        assert!(!eff.z_key_repeat, "override 未给的字段应回落全局");
-        // 开关关闭：整段忽略。
-        let ov_off = wind_config::schema::CodetableOverride {
-            enabled: false,
-            top_code_commit: Some(true),
+        assert!(eff.top_code_commit, "Some 字段应覆盖全局");
+        assert!(!eff.z_key_repeat, "None 字段应回落全局");
+        // 无方案行为（None）：整体回落全局。
+        assert!(!global.resolved(None).top_code_commit, "无覆盖时应回落全局");
+    }
+
+    /// Fix 1+2 端到端：方案 `.schema.toml` 内联 `[engine.codetable]` 行为无需 override 文件即生效，
+    /// 且逐字段折叠到全局基线（内联给的覆盖，未给的回落）。
+    #[test]
+    fn resolve_codetable_reads_schema_inline_behavior() {
+        use std::io::Write;
+        let base_dir = std::env::temp_dir().join("wind_eng_inline_data");
+        let schemas = base_dir.join("schemas");
+        std::fs::create_dir_all(&schemas).unwrap();
+        let mut f = std::fs::File::create(schemas.join("qsym.schema.toml")).unwrap();
+        // 内联：自动上屏开、顶码关；z_key_repeat 不写 → 应回落全局。
+        write!(
+            f,
+            "[schema]\nid = \"qsym\"\nhidden = true\n[engine]\ntype = \"codetable\"\n[engine.codetable]\nmax_code_length = 8\nauto_commit_at_full = true\ntop_code_commit = false\n"
+        )
+        .unwrap();
+        drop(f);
+
+        // 全局基线：auto_commit_at_full=false / top_code_commit=true / z_key_repeat=true。
+        let global = wind_config::CodetableGlobal {
+            auto_commit_at_full: false,
+            top_code_commit: true,
+            z_key_repeat: true,
             ..Default::default()
         };
-        assert!(
-            !global.resolved(Some(&ov_off)).top_code_commit,
-            "开关关闭时应回落全局"
-        );
+        // override_dir 指向空目录：证明无 override 文件也能读到内联行为。
+        let ov_dir = std::env::temp_dir().join("wind_eng_inline_empty_ov");
+        let _ = std::fs::remove_dir_all(&ov_dir);
+        let eff = EngineManager::resolve_codetable("qsym", Some(&base_dir), &global, Some(&ov_dir));
+        assert!(eff.auto_commit_at_full, "内联 Some(true) 应覆盖全局 false");
+        assert!(!eff.top_code_commit, "内联 Some(false) 应覆盖全局 true");
+        assert!(eff.z_key_repeat, "内联未给的字段应回落全局 true");
+
+        let _ = std::fs::remove_dir_all(&base_dir);
     }
 
     #[test]

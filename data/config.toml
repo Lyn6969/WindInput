@@ -14,7 +14,9 @@ primary_codetable = ""
 primary_pinyin = ""
 
 # 全局码表配置：所有码表方案公共基线（出厂取主力码表 wubi86 偏好）。
-# 方案个性覆盖走 %APPDATA%/WindInput/schema_overrides/{id}.toml 的 [codetable] 段（带 enabled 开关）。
+# 方案个性覆盖：在方案 .schema.toml 的 [engine.codetable] 内联行为字段（作者基线），或
+# %APPDATA%/WindInput/schema_overrides/{id}.toml 同名的 [engine.codetable] 段（设置页写入，深合并覆盖）；
+# 二者段名/字段与本节一致，字段存在即覆盖、缺省即回落本节。
 [schema.codetable]
 top_code_commit = true
 clear_on_empty_max = false

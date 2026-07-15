@@ -440,10 +440,28 @@ impl Coordinator {
                 Some((full, short))
             }
             ModeKind::Special(i) => {
-                let rt = self.rt();
-                let m = rt.config.schema.special_modes.get(i as usize)?;
-                let full = m.name.clone();
-                let short = Self::short_or_first(&m.short_name, &full);
+                // 瘦身条目只写 schema + trigger_keys：name/short_name 缺省时从被引用方案文件派生
+                // （schema.name / schema.icon_label），避免与方案文件重复。
+                let (name, short_name, schema) = {
+                    let rt = self.rt();
+                    let m = rt.config.schema.special_modes.get(i as usize)?;
+                    (m.name.clone(), m.short_name.clone(), m.schema.clone())
+                };
+                let full = if name.is_empty() {
+                    self.engine_mgr.schema_name(&schema)
+                } else {
+                    name
+                };
+                let short = if short_name.is_empty() {
+                    let icon = self.engine_mgr.schema_icon_label(&schema);
+                    if icon.is_empty() {
+                        Self::short_or_first("", &full)
+                    } else {
+                        icon
+                    }
+                } else {
+                    Self::short_or_first(&short_name, &full)
+                };
                 Some((full, short))
             }
         }

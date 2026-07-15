@@ -42,7 +42,7 @@ impl Coordinator {
             .special_modes
             .iter()
             .take(u8::MAX as usize + 1)
-            .position(|m| m.id == id)
+            .position(|m| m.effective_id() == id)
             .map(|i| i as u8)
     }
 

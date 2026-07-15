@@ -251,11 +251,12 @@ impl Default for CodetableGlobal {
 }
 
 impl CodetableGlobal {
-    /// 应用方案行为 override：`enabled` 开启时各 `Some(_)` 字段覆盖全局基线，
-    /// 否则原样返回全局副本。`None` 字段始终回落全局。见 schema-config-layering.md §4。
-    pub fn resolved(&self, ov: Option<&crate::schema::CodetableOverride>) -> CodetableGlobal {
+    /// 折叠方案 `[engine.codetable]` 的内联/override 行为到全局基线：各 `Some(_)` 字段覆盖，
+    /// `None` 回落全局。schema 内联与 `schema_overrides` 已在 `read_schema` 经 `merge_toml`
+    /// 合并成单个 `CodeTableSpec`，此处只做「方案 → 全局」一次折叠。见 schema-config-layering.md §4。
+    pub fn resolved(&self, ov: Option<&crate::schema::CodeTableSpec>) -> CodetableGlobal {
         let mut out = self.clone();
-        let Some(o) = ov.filter(|o| o.enabled) else {
+        let Some(o) = ov else {
             return out;
         };
         if let Some(v) = o.top_code_commit {
@@ -551,6 +552,18 @@ pub struct SpecialModeConfig {
     /// 热键进入时组合区不写引导符（见 docs/design/special-mode-entry-hotkey.md）。
     #[serde(default)]
     pub hotkey: String,
+}
+
+impl SpecialModeConfig {
+    /// 有效 id：`id` 非空则用之，否则回退 `schema`（瘦身条目只写 `schema` + `trigger_keys`，
+    /// 身份从被引用方案文件派生）。供直达热键 `enter_special:<id>` 定位。
+    pub fn effective_id(&self) -> &str {
+        if self.id.is_empty() {
+            &self.schema
+        } else {
+            &self.id
+        }
+    }
 }
 
 // ───────────────────────── input（输入行为）─────────────────────────

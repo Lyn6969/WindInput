@@ -157,9 +157,11 @@ DAT 从已排序编码列表 BFS 直接构建，峰值内存仅 base/check 两�
 | `single_code_complete` | 精确模式下的空码补全 |
 | `show_code_hint` | 前缀候选标注剩余编码 |
 
-配置来源：全局 `schema.codetable.*` + 方案覆盖 `schema_overrides/{id}.toml [codetable]` 段逐字段覆盖
-（`wind-config/src/schema.rs` CodetableOverride）。方案固定参数 `CodeTableSpec`：`max_code_length` /
-`base_sort`（weight/natural）/ `input_chars`。
+配置来源：全局 `schema.codetable.*` + 方案 `[engine.codetable]` 行为字段逐字段折叠（`Some` 覆盖 /
+`None` 回落全局）。行为与引擎固定参数**同段同结构**收在 `CodeTableSpec`（`wind-config/src/schema.rs`）：
+固定参数 `max_code_length` / `base_sort`（weight/natural）/ `input_chars`，行为参数为 tri-state `Option`。
+方案作者可在 `.schema.toml` 内联行为基线；`schema_overrides/{id}.toml` 用**相同的 `[engine.codetable]` 段**
+（设置页写入）经 `read_schema` 深合并覆盖之。已无独立 `CodetableOverride` 平行路径。
 
 ### 3.3 显示态复评（`recheck_auto_commit`）
 
