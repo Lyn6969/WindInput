@@ -209,6 +209,30 @@ impl Store {
         Ok((imported, skipped))
     }
 
+    /// 从 `FreqIo` 行导入词频（单写事务；Merge=已存在取 max(count)/max(last_used)）。返回导入条数。
+    pub fn import_freq_rows(
+        &self,
+        schema: &str,
+        rows: &[crate::wdict::FreqIo],
+    ) -> anyhow::Result<usize> {
+        self.with_db(|db| {
+            let txn = db.begin_write()?;
+            {
+                let mut t = txn.open_table(FREQ)?;
+                for r in rows {
+                    let key = enc_key(schema, &r.code, &r.text);
+                    let merged = match t.get(key.as_str())?.and_then(|g| dec_freq(g.value())) {
+                        Some(old) => (old.count.max(r.count), old.last_used.max(r.last_used)),
+                        None => (r.count, r.last_used),
+                    };
+                    t.insert(key.as_str(), enc_freq(merged.0, merged.1).as_slice())?;
+                }
+            }
+            txn.commit()?;
+            Ok(rows.len())
+        })
+    }
+
     /// 删除一条词频（不存在静默成功）。
     pub fn delete_freq(&self, schema: &str, code: &str, text: &str) -> anyhow::Result<()> {
         let key = enc_key(schema, code, text);

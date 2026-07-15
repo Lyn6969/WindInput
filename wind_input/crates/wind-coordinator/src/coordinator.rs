@@ -2377,8 +2377,10 @@ impl Coordinator {
         let Some(store) = &self.store else {
             return false;
         };
+        // 折叠到 data_schema_id（与 apply_shadow/candidate_op 一致），拼音族共享。
+        let schema = self.engine_mgr.data_schema_id(schema);
         matches!(
-            store.get_shadow_rules(schema, code),
+            store.get_shadow_rules(&schema, code),
             Ok(Some(rec))
                 if rec.pinned.iter().any(|p| p.word == word) || rec.deleted.iter().any(|d| d == word)
         )

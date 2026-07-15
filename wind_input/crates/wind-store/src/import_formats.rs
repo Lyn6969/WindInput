@@ -122,6 +122,7 @@ pub fn parse_words_rime(text: &str) -> Result<(Vec<WordIo>, usize), String> {
             code: normalize_code(code_raw),
             text: word.to_string(),
             weight: parse_weight(get("weight")),
+            count: 0,
         });
     }
     Ok((rows, skipped))
@@ -183,6 +184,7 @@ pub fn parse_words_tsv(text: &str) -> Result<(Vec<WordIo>, usize), String> {
             code: normalize_code(code_raw),
             text: word.to_string(),
             weight: parse_weight(fields.get(2).map(|s| s.trim()).unwrap_or("")),
+            count: 0,
         });
     }
     Ok((rows, skipped))

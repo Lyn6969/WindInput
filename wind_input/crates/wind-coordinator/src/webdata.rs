@@ -31,6 +31,59 @@ fn str_param<'a>(p: &'a Value, key: &str) -> anyhow::Result<&'a str> {
         .ok_or_else(|| anyhow::anyhow!("缺少参数 {}", key))
 }
 
+/// 读取 `sections` 参数（字符串数组）→ 词库数据段；缺省返回 None（由调用方取引擎默认）。
+fn dict_sections_param(p: &Value) -> Option<Vec<wind_store::dict_export::DictSection>> {
+    let arr = p.get("sections")?.as_array()?;
+    Some(
+        arr.iter()
+            .filter_map(|v| v.as_str())
+            .filter_map(wind_store::dict_export::DictSection::from_key)
+            .collect(),
+    )
+}
+
+/// 引擎类型 → 中文标签（错误/提示文案用）。
+fn engine_type_label(t: &str) -> &'static str {
+    match t {
+        "pinyin" => "拼音",
+        "mixed" => "混输",
+        "codetable" => "码表",
+        _ => "未知",
+    }
+}
+
+/// 按引擎类型的默认适用数据段（与设置页子标签一致：码表四段/拼音三段/混输仅候选调整）。
+fn default_dict_sections(engine_type: &str) -> Vec<wind_store::dict_export::DictSection> {
+    use wind_store::dict_export::DictSection::*;
+    match engine_type {
+        "mixed" => vec![Shadow],
+        "pinyin" => vec![UserWords, TempWords, Freq],
+        _ => vec![UserWords, TempWords, Freq, Shadow],
+    }
+}
+
+/// 多段导入结果 → JSON（`{sections:[{key, added/updated/unchanged | imported, skipped}]}`）。
+fn dict_report_json(rep: &wind_store::dict_export::DictImportReport) -> Value {
+    let sections: Vec<Value> = rep
+        .sections
+        .iter()
+        .map(|s| {
+            let mut o = serde_json::Map::new();
+            o.insert("key".into(), json!(s.key));
+            if let Some(w) = &s.words {
+                o.insert("added".into(), json!(w.added));
+                o.insert("updated".into(), json!(w.updated));
+                o.insert("unchanged".into(), json!(w.unchanged));
+            } else {
+                o.insert("imported".into(), json!(s.imported));
+            }
+            o.insert("skipped".into(), json!(s.skipped));
+            Value::Object(o)
+        })
+        .collect();
+    json!({ "sections": sections })
+}
+
 fn i32_param(p: &Value, key: &str) -> i32 {
     p.get(key).and_then(|v| v.as_i64()).unwrap_or(0) as i32
 }
@@ -404,72 +457,173 @@ impl Coordinator {
         Ok(json!(n))
     }
 
+    /// 导出方案数据为单个多段 wdict 文件。`sections` 参数选类型；缺省按引擎类型取默认适用段。
     fn web_dict_export(&self, params: &Value) -> anyhow::Result<Value> {
-        let schema = str_param(params, "schemaId")?;
-        let schema = self.engine_mgr.data_schema_id(schema); // 拼音族折叠到 "pinyin"
+        let schema_id = str_param(params, "schemaId")?;
+        let data_schema = self.engine_mgr.data_schema_id(schema_id); // 拼音族折叠到 "pinyin"
+        let etype = self
+            .engine_mgr
+            .schema_merged(schema_id)
+            .map(|s| resolve_engine_type(&s))
+            .unwrap_or("codetable");
         let store = self
             .store
             .as_ref()
             .ok_or_else(|| anyhow::anyhow!("无持久化存储"))?;
-        let content = store.export_user_words_wdict(&schema, &chrono::Local::now().to_rfc3339())?;
+        let sections = dict_sections_param(params).unwrap_or_else(|| default_dict_sections(etype));
+        // engine_type 写入文件头部，供导入时校验来源（防五笔词库导入拼音致编码错乱）。
+        let content = store.export_dict_sections_wdict(
+            &data_schema,
+            &sections,
+            &chrono::Local::now().to_rfc3339(),
+            etype,
+        )?;
         Ok(json!({ "content": content }))
     }
 
+    /// 导入。WindDict 多段：`sections` 选要应用的类型（默认文件所含全部段）；
+    /// Rime/TSV：仅用户词库。返回 `{sections:[...]}` 逐段结果。
     fn web_dict_import(&self, params: &Value) -> anyhow::Result<Value> {
-        use wind_transfer::merge::{ImportOutcome, Strategy};
-        let schema = str_param(params, "schemaId")?;
-        let schema = self.engine_mgr.data_schema_id(schema); // 拼音族折叠到 "pinyin"
+        use wind_store::dict_export::DictSection;
+        use wind_transfer::merge::Strategy;
+        let schema_id = str_param(params, "schemaId")?;
+        let data_schema = self.engine_mgr.data_schema_id(schema_id);
         let content = str_param(params, "content")?;
-        let strategy = Strategy::from_param(
+        let replace = Strategy::from_param(
             params
                 .get("strategy")
                 .and_then(|v| v.as_str())
                 .unwrap_or(""),
-        );
+        ) == Strategy::Replace;
         let store = self
             .store
             .as_ref()
             .ok_or_else(|| anyhow::anyhow!("无持久化存储"))?;
-        // 格式按内容自动识别(WindDict/Rime/TSV),解析后统一走 import_user_words 管线。
-        let (_fmt, rows, skipped) = wind_store::import_formats::parse_words_auto(content)
-            .map_err(|e| anyhow::anyhow!(e))?;
-        if strategy == Strategy::Replace {
-            store.clear_user_words(&schema)?;
+        let fmt = wind_store::import_formats::detect_dict_format(content);
+        if fmt == wind_store::import_formats::DictFormat::WindDict {
+            // 校验来源引擎类型：防跨类型误导（如五笔词库导入拼音方案致编码错乱）。
+            let target = self
+                .engine_mgr
+                .schema_merged(schema_id)
+                .map(|s| resolve_engine_type(&s))
+                .unwrap_or("codetable");
+            if let Some(src) = wind_store::wdict::read_header_field(content, "engine_type")
+                && !src.is_empty()
+                && src != target
+            {
+                return Err(anyhow::anyhow!(
+                    "该文件为「{}」类型词库，与当前「{}」方案不一致，导入会导致编码错乱，已阻止。",
+                    engine_type_label(&src),
+                    engine_type_label(target),
+                ));
+            }
+            // 文件实际含的段 ∩ 用户所选（缺省=全部所含段）。
+            let present: Vec<DictSection> = wind_store::wdict::sections_present(content)
+                .iter()
+                .filter_map(|t| DictSection::from_key(t))
+                .collect();
+            let sections: Vec<DictSection> = match dict_sections_param(params) {
+                Some(sel) => sel.into_iter().filter(|s| present.contains(s)).collect(),
+                None => present,
+            };
+            let rep =
+                store.import_dict_sections_wdict(&data_schema, content, &sections, replace)?;
+            Ok(dict_report_json(&rep))
+        } else {
+            // Rime/TSV：仅用户词库。
+            let (_fmt, rows, skipped) = wind_store::import_formats::parse_words_auto(content)
+                .map_err(|e| anyhow::anyhow!(e))?;
+            if replace {
+                store.clear_user_words(&data_schema)?;
+            }
+            let c = store.import_user_words(&data_schema, &rows)?;
+            Ok(json!({ "sections": [ {
+                "key": "userWords",
+                "added": c.added,
+                "updated": c.updated,
+                "unchanged": c.unchanged,
+                "skipped": skipped,
+            } ] }))
         }
-        let c = store.import_user_words(&schema, &rows)?;
-        Ok(serde_json::to_value(ImportOutcome {
-            added: c.added,
-            updated: c.updated,
-            skipped,
-        })?)
     }
 
+    /// 导入预览。回报文件含哪些段及各段计数（用户词库另带 willAdd/willUpdate/unchanged/samples）。
     fn web_dict_preview_import(&self, params: &Value) -> anyhow::Result<Value> {
-        use wind_transfer::merge::ImportPreview;
-        let schema = str_param(params, "schemaId")?;
-        let schema = self.engine_mgr.data_schema_id(schema); // 拼音族折叠到 "pinyin"
+        use wind_store::dict_export::DictSection;
+        let schema_id = str_param(params, "schemaId")?;
+        let data_schema = self.engine_mgr.data_schema_id(schema_id);
         let content = str_param(params, "content")?;
         let store = self
             .store
             .as_ref()
             .ok_or_else(|| anyhow::anyhow!("无持久化存储"))?;
-        let (fmt, rows, skipped) = wind_store::import_formats::parse_words_auto(content)
-            .map_err(|e| anyhow::anyhow!(e))?;
-        let (c, samples) = store.preview_import_user_words(&schema, &rows)?;
-        // 按 Merge 语义预览(与设计 RPC 表一致,不收 strategy);willConflict 词库域恒 0,字段保留。
-        let mut v = serde_json::to_value(ImportPreview {
-            will_add: c.added,
-            will_update: c.updated,
-            will_conflict: 0,
-            unchanged: c.unchanged,
-            samples,
-        })?;
-        // 附加识别信息:格式标识 + 解析期跳过行数(UI 预览提示用)。
-        if let Some(o) = v.as_object_mut() {
-            o.insert("format".into(), json!(fmt.as_str()));
-            o.insert("skipped".into(), json!(skipped));
+        let fmt = wind_store::import_formats::detect_dict_format(content);
+        if fmt == wind_store::import_formats::DictFormat::WindDict {
+            let present = wind_store::wdict::sections_present(content);
+            let mut arr: Vec<Value> = Vec::new();
+            for tag in &present {
+                let Some(sec) = DictSection::from_key(tag) else {
+                    continue;
+                };
+                match sec {
+                    DictSection::UserWords => {
+                        let (rows, sk) = wind_store::wdict::parse_words_wdict(content)
+                            .map_err(|e| anyhow::anyhow!(e))?;
+                        let (c, samples) = store.preview_import_user_words(&data_schema, &rows)?;
+                        arr.push(json!({
+                            "key": "userWords", "count": rows.len(),
+                            "willAdd": c.added, "willUpdate": c.updated, "unchanged": c.unchanged,
+                            "skipped": sk, "samples": samples,
+                        }));
+                    }
+                    DictSection::TempWords => {
+                        let (rows, sk) = wind_store::wdict::parse_temp_words_wdict(content)
+                            .map_err(|e| anyhow::anyhow!(e))?;
+                        arr.push(json!({ "key": "tempWords", "count": rows.len(), "skipped": sk }));
+                    }
+                    DictSection::Freq => {
+                        let (rows, sk) = wind_store::wdict::parse_freq_wdict(content)
+                            .map_err(|e| anyhow::anyhow!(e))?;
+                        arr.push(json!({ "key": "freq", "count": rows.len(), "skipped": sk }));
+                    }
+                    DictSection::Shadow => {
+                        let (rows, sk) = wind_store::wdict::parse_shadow_wdict(content)
+                            .map_err(|e| anyhow::anyhow!(e))?;
+                        arr.push(json!({ "key": "shadow", "count": rows.len(), "skipped": sk }));
+                    }
+                }
+            }
+            // 来源方案/引擎（文件头部）+ 与目标方案的兼容性（引擎类型一致或来源未知）。
+            let target = self
+                .engine_mgr
+                .schema_merged(schema_id)
+                .map(|s| resolve_engine_type(&s))
+                .unwrap_or("codetable");
+            let source_engine =
+                wind_store::wdict::read_header_field(content, "engine_type").unwrap_or_default();
+            let source_schema =
+                wind_store::wdict::read_header_field(content, "schema_id").unwrap_or_default();
+            let compatible = source_engine.is_empty() || source_engine == target;
+            Ok(json!({
+                "format": "winddict", "sections": arr,
+                "sourceSchema": source_schema, "sourceEngine": source_engine,
+                "targetEngine": target, "compatible": compatible,
+            }))
+        } else {
+            let (fmt2, rows, skipped) = wind_store::import_formats::parse_words_auto(content)
+                .map_err(|e| anyhow::anyhow!(e))?;
+            let (c, samples) = store.preview_import_user_words(&data_schema, &rows)?;
+            // Rime/TSV 无来源引擎元信息，兼容性交由用户判断（不拦截）。
+            Ok(json!({
+                "format": fmt2.as_str(),
+                "sections": [ {
+                    "key": "userWords", "count": rows.len(),
+                    "willAdd": c.added, "willUpdate": c.updated, "unchanged": c.unchanged,
+                    "skipped": skipped, "samples": samples,
+                } ],
+                "compatible": true,
+            }))
         }
-        Ok(v)
     }
 
     fn web_dict_stats(&self) -> anyhow::Result<Value> {
@@ -937,12 +1091,13 @@ impl Coordinator {
 
     fn web_shadow_list(&self, params: &Value) -> anyhow::Result<Value> {
         let schema = str_param(params, "schemaId")?;
+        let schema = self.engine_mgr.data_schema_id(schema); // 拼音族折叠到 "pinyin"
         let store = self
             .store
             .as_ref()
             .ok_or_else(|| anyhow::anyhow!("无持久化存储"))?;
         let mut out = Vec::new();
-        for (code, rec) in store.list_shadow_rules(schema)? {
+        for (code, rec) in store.list_shadow_rules(&schema)? {
             for p in rec.pinned {
                 out.push(json!({
                     "code": code,
@@ -972,11 +1127,12 @@ impl Coordinator {
         );
         let cand_id = params.get("candId").and_then(|v| v.as_str());
         let position = usize_param(params, "position", 0);
+        let schema = self.engine_mgr.data_schema_id(schema); // 拼音族折叠到 "pinyin"
         let store = self
             .store
             .as_ref()
             .ok_or_else(|| anyhow::anyhow!("无持久化存储"))?;
-        store.pin_shadow(schema, code, word, cand_id, position)?;
+        store.pin_shadow(&schema, code, word, cand_id, position)?;
         Ok(json!({ "ok": true }))
     }
 
@@ -986,11 +1142,12 @@ impl Coordinator {
             str_param(params, "code")?,
             str_param(params, "word")?,
         );
+        let schema = self.engine_mgr.data_schema_id(schema); // 拼音族折叠到 "pinyin"
         let store = self
             .store
             .as_ref()
             .ok_or_else(|| anyhow::anyhow!("无持久化存储"))?;
-        store.delete_shadow(schema, code, word)?;
+        store.delete_shadow(&schema, code, word)?;
         Ok(json!({ "ok": true }))
     }
 
@@ -1000,11 +1157,12 @@ impl Coordinator {
             str_param(params, "code")?,
             str_param(params, "word")?,
         );
+        let schema = self.engine_mgr.data_schema_id(schema); // 拼音族折叠到 "pinyin"
         let store = self
             .store
             .as_ref()
             .ok_or_else(|| anyhow::anyhow!("无持久化存储"))?;
-        store.remove_shadow_rule(schema, code, word)?;
+        store.remove_shadow_rule(&schema, code, word)?;
         Ok(json!({ "ok": true }))
     }
 
@@ -1017,15 +1175,16 @@ impl Coordinator {
             str_param(params, "word")?,
         );
         let kind = params.get("type").and_then(|v| v.as_str()).unwrap_or("pin");
+        let schema = self.engine_mgr.data_schema_id(schema); // 拼音族折叠到 "pinyin"
         let store = self
             .store
             .as_ref()
             .ok_or_else(|| anyhow::anyhow!("无持久化存储"))?;
         if kind == "hide" {
-            store.delete_shadow(schema, code, word)?;
+            store.delete_shadow(&schema, code, word)?;
         } else {
             let position = usize_param(params, "position", 0);
-            store.pin_shadow(schema, code, word, None, position)?;
+            store.pin_shadow(&schema, code, word, None, position)?;
         }
         Ok(json!({ "ok": true }))
     }
@@ -1758,6 +1917,18 @@ mod tests {
         Coordinator::new_headless_with_store(Config::default(), None, store)
     }
 
+    /// 在 `{sections:[{key,...}]}` 响应里按 key 取某段（无则 Null）。
+    fn sec(v: &Value, key: &str) -> Value {
+        v.get("sections")
+            .and_then(|s| s.as_array())
+            .and_then(|a| {
+                a.iter()
+                    .find(|x| x.get("key").and_then(|k| k.as_str()) == Some(key))
+                    .cloned()
+            })
+            .unwrap_or(Value::Null)
+    }
+
     #[test]
     fn dict_export_import_preview_contract() {
         let c = coord("dictio");
@@ -1777,38 +1948,44 @@ mod tests {
             .expect("content 字符串");
         assert!(content.contains("--- !words"));
 
-        // preview 到空 schema:全 willAdd,camelCase 键
+        // preview 到空 schema:userWords 段全 willAdd
         let prev = c
             .web_data_rpc(
                 "dict.previewImport",
                 &json!({ "schemaId": "wb2", "content": content }),
             )
             .unwrap();
-        assert_eq!(prev.get("willAdd").and_then(|v| v.as_u64()), Some(1));
-        assert_eq!(prev.get("willUpdate").and_then(|v| v.as_u64()), Some(0));
-        assert_eq!(prev.get("willConflict").and_then(|v| v.as_u64()), Some(0));
-        assert_eq!(prev.get("unchanged").and_then(|v| v.as_u64()), Some(0));
-        assert!(prev.get("samples").and_then(|v| v.as_array()).is_some());
+        assert_eq!(
+            prev.get("format").and_then(|v| v.as_str()),
+            Some("winddict")
+        );
+        let uw = sec(&prev, "userWords");
+        assert_eq!(uw.get("willAdd").and_then(|v| v.as_u64()), Some(1));
+        assert_eq!(uw.get("willUpdate").and_then(|v| v.as_u64()), Some(0));
+        assert_eq!(uw.get("unchanged").and_then(|v| v.as_u64()), Some(0));
+        assert!(uw.get("samples").and_then(|v| v.as_array()).is_some());
 
-        // import(缺省 merge)→ {added, updated, skipped}
+        // import(缺省 merge)→ sections[userWords]{added,skipped}
         let out = c
             .web_data_rpc(
                 "dict.import",
                 &json!({ "schemaId": "wb2", "content": content }),
             )
             .unwrap();
-        assert_eq!(out.get("added").and_then(|v| v.as_u64()), Some(1));
-        assert_eq!(out.get("skipped").and_then(|v| v.as_u64()), Some(0));
+        let uw = sec(&out, "userWords");
+        assert_eq!(uw.get("added").and_then(|v| v.as_u64()), Some(1));
+        assert_eq!(uw.get("skipped").and_then(|v| v.as_u64()), Some(0));
 
-        // 同内容再 import:权重相等 ⇒ 全 unchanged(P2 约束 1),added=updated=0
+        // 同内容再 import:权重相等 ⇒ 全 unchanged,added=updated=0
         let out2 = c
             .web_data_rpc(
                 "dict.import",
                 &json!({ "schemaId": "wb2", "content": content }),
             )
             .unwrap();
-        assert_eq!(out2.get("added").and_then(|v| v.as_u64()), Some(0));
-        assert_eq!(out2.get("updated").and_then(|v| v.as_u64()), Some(0));
+        let uw2 = sec(&out2, "userWords");
+        assert_eq!(uw2.get("added").and_then(|v| v.as_u64()), Some(0));
+        assert_eq!(uw2.get("updated").and_then(|v| v.as_u64()), Some(0));
         // preview 同内容 ⇒ unchanged=1,与落盘一致
         let prev2 = c
             .web_data_rpc(
@@ -1816,9 +1993,14 @@ mod tests {
                 &json!({ "schemaId": "wb2", "content": content }),
             )
             .unwrap();
-        assert_eq!(prev2.get("unchanged").and_then(|v| v.as_u64()), Some(1));
+        assert_eq!(
+            sec(&prev2, "userWords")
+                .get("unchanged")
+                .and_then(|v| v.as_u64()),
+            Some(1)
+        );
 
-        // replace:先加一条杂词,replace 导入后只剩导入内容(P2 约束 2)
+        // replace:先加一条杂词,replace 导入后只剩导入内容
         c.web_data_rpc(
             "dict.add",
             &json!({ "schemaId": "wb2", "code": "x", "text": "另", "weight": 1 }),
@@ -1831,7 +2013,9 @@ mod tests {
             )
             .unwrap();
         assert_eq!(
-            out3.get("added").and_then(|v| v.as_u64()),
+            sec(&out3, "userWords")
+                .get("added")
+                .and_then(|v| v.as_u64()),
             Some(1),
             "清空后全部计 added"
         );
@@ -1849,7 +2033,7 @@ mod tests {
     fn dict_import_rime_and_tsv_auto_detect() {
         let c = coord("dictio_fmt");
 
-        // Rime:默认列 [text, code, weight],拼音码去空格;preview 回报 format
+        // Rime:默认列 [text, code, weight],拼音码去空格;preview 回报 format + userWords 段
         let rime = "# Rime dictionary\n---\nname: demo\nversion: \"1.0\"\n...\n你好\tni hao\t100\n世界\tshi jie\t50\n";
         let prev = c
             .web_data_rpc(
@@ -1858,15 +2042,19 @@ mod tests {
             )
             .unwrap();
         assert_eq!(prev.get("format").and_then(|v| v.as_str()), Some("rime"));
-        assert_eq!(prev.get("willAdd").and_then(|v| v.as_u64()), Some(2));
-        assert_eq!(prev.get("skipped").and_then(|v| v.as_u64()), Some(0));
+        let uw = sec(&prev, "userWords");
+        assert_eq!(uw.get("willAdd").and_then(|v| v.as_u64()), Some(2));
+        assert_eq!(uw.get("skipped").and_then(|v| v.as_u64()), Some(0));
         let out = c
             .web_data_rpc(
                 "dict.import",
                 &json!({ "schemaId": "pinyin", "content": rime }),
             )
             .unwrap();
-        assert_eq!(out.get("added").and_then(|v| v.as_u64()), Some(2));
+        assert_eq!(
+            sec(&out, "userWords").get("added").and_then(|v| v.as_u64()),
+            Some(2)
+        );
         let listed = c
             .web_data_rpc(
                 "dict.listPaged",
@@ -1888,13 +2076,15 @@ mod tests {
             )
             .unwrap();
         assert_eq!(prev.get("format").and_then(|v| v.as_str()), Some("tsv"));
-        assert_eq!(prev.get("willAdd").and_then(|v| v.as_u64()), Some(2));
-        assert_eq!(prev.get("skipped").and_then(|v| v.as_u64()), Some(1));
+        let uw = sec(&prev, "userWords");
+        assert_eq!(uw.get("willAdd").and_then(|v| v.as_u64()), Some(2));
+        assert_eq!(uw.get("skipped").and_then(|v| v.as_u64()), Some(1));
         let out = c
             .web_data_rpc("dict.import", &json!({ "schemaId": "wb", "content": tsv }))
             .unwrap();
-        assert_eq!(out.get("added").and_then(|v| v.as_u64()), Some(2));
-        assert_eq!(out.get("skipped").and_then(|v| v.as_u64()), Some(1));
+        let uw = sec(&out, "userWords");
+        assert_eq!(uw.get("added").and_then(|v| v.as_u64()), Some(2));
+        assert_eq!(uw.get("skipped").and_then(|v| v.as_u64()), Some(1));
 
         // 不可识别内容 → 错误
         assert!(
@@ -1904,6 +2094,33 @@ mod tests {
             )
             .is_err(),
             "未知格式应报错"
+        );
+    }
+
+    #[test]
+    fn dict_import_rejects_engine_type_mismatch() {
+        let c = coord("dict_engine");
+        // 手工构造「拼音」来源的 wdict；导入到默认解析为码表的方案 → 应拒绝（防编码错乱）。
+        let content = "# x\nwind_dict:\n  version: 1\n  engine_type: pinyin\n  sections:\n    words:\n      columns: [code, text, weight, count]\n\n--- !words\nnihao\t你好\t0\t0\n";
+        let r = c.web_data_rpc(
+            "dict.import",
+            &json!({ "schemaId": "wb", "content": content }),
+        );
+        assert!(r.is_err(), "拼音来源导入码表方案应被拒绝");
+        // previewImport 回报 compatible=false + 来源引擎，供 UI 提前拦。
+        let prev = c
+            .web_data_rpc(
+                "dict.previewImport",
+                &json!({ "schemaId": "wb", "content": content }),
+            )
+            .unwrap();
+        assert_eq!(
+            prev.get("compatible").and_then(|v| v.as_bool()),
+            Some(false)
+        );
+        assert_eq!(
+            prev.get("sourceEngine").and_then(|v| v.as_str()),
+            Some("pinyin")
         );
     }
 

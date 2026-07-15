@@ -285,14 +285,23 @@ impl Store {
                     let existing = t.get(key.as_str())?.and_then(|g| dec_val(g.value()));
                     match existing {
                         None => {
-                            t.insert(key.as_str(), enc_val(r.weight, 0, now_secs()).as_slice())?;
+                            t.insert(
+                                key.as_str(),
+                                enc_val(r.weight, r.count, now_secs()).as_slice(),
+                            )?;
                             c.added += 1;
                         }
-                        Some((w, cnt, ca)) if r.weight > w => {
-                            t.insert(key.as_str(), enc_val(r.weight, cnt, ca).as_slice())?;
-                            c.updated += 1;
+                        Some((w, cnt, ca)) => {
+                            // weight/count 各取 max；任一变大即写盘为 updated，否则 unchanged。
+                            let nw = w.max(r.weight);
+                            let nc = cnt.max(r.count);
+                            if nw != w || nc != cnt {
+                                t.insert(key.as_str(), enc_val(nw, nc, ca).as_slice())?;
+                                c.updated += 1;
+                            } else {
+                                c.unchanged += 1;
+                            }
                         }
-                        Some(_) => c.unchanged += 1,
                     }
                 }
             }
@@ -321,7 +330,7 @@ impl Store {
                         c.added += 1;
                         true
                     }
-                    Some((w, _, _)) if r.weight > w => {
+                    Some((w, cnt, _)) if r.weight > w || r.count > cnt => {
                         c.updated += 1;
                         true
                     }
@@ -344,16 +353,25 @@ impl Store {
         schema: &str,
         exported_at: &str,
     ) -> anyhow::Result<String> {
+        let rows = self.collect_user_word_rows(schema)?;
+        Ok(wdict::export_words_wdict(&rows, exported_at))
+    }
+
+    /// 收集某方案全部用户词为 wdict WordIo 行(code/text/weight/count)。
+    pub(crate) fn collect_user_word_rows(
+        &self,
+        schema: &str,
+    ) -> anyhow::Result<Vec<wdict::WordIo>> {
         let recs = self.search_user_words_prefix(schema, "", 0)?;
-        let rows: Vec<wdict::WordIo> = recs
+        Ok(recs
             .into_iter()
             .map(|r| wdict::WordIo {
                 code: r.code,
                 text: r.text,
                 weight: r.weight,
+                count: r.count,
             })
-            .collect();
-        Ok(wdict::export_words_wdict(&rows, exported_at))
+            .collect())
     }
 
     /// 从 wdict 文本导入用户词到某方案(Merge:max-weight upsert)。
@@ -366,6 +384,13 @@ impl Store {
         let (rows, skipped) = wdict::parse_words_wdict(text).map_err(|e| anyhow::anyhow!(e))?;
         self.import_user_words(schema, &rows)?;
         Ok((rows.len(), skipped))
+    }
+
+    /// 导出某方案的「用户词 + shadow 规则」为单个 wdict 文本（对齐 Go：一个文件两段）。
+    pub fn export_dict_wdict(&self, schema: &str, exported_at: &str) -> anyhow::Result<String> {
+        let words = self.collect_user_word_rows(schema)?;
+        let shadow = self.export_shadow_actions(schema)?;
+        Ok(wdict::export_dict_wdict(&words, &shadow, exported_at))
     }
 }
 
@@ -472,6 +497,7 @@ mod tests {
                 code: "a".into(),
                 text: "工".into(),
                 weight: 30,
+                count: 0,
             }],
             "2026-07-11T00:00:00+08:00",
         );
@@ -496,12 +522,14 @@ mod tests {
                 code: "a".into(),
                 text: "工".into(),
                 weight: 30,
+                count: 0,
             },
             // 新键 → added
             crate::wdict::WordIo {
                 code: "b".into(),
                 text: "了".into(),
                 weight: 5,
+                count: 0,
             },
         ];
         let c = s.import_user_words("wb", &rows).unwrap();
@@ -517,6 +545,7 @@ mod tests {
             code: "a".into(),
             text: "工".into(),
             weight: 200,
+            count: 0,
         }];
         let c2 = s.import_user_words("wb", &rows2).unwrap();
         assert_eq!((c2.added, c2.updated, c2.unchanged), (0, 1, 0));
@@ -534,16 +563,19 @@ mod tests {
                 code: "a".into(),
                 text: "工".into(),
                 weight: 30,
+                count: 0,
             },
             crate::wdict::WordIo {
                 code: "b".into(),
                 text: "了".into(),
                 weight: 5,
+                count: 0,
             },
             crate::wdict::WordIo {
                 code: "a".into(),
                 text: "工".into(),
                 weight: 300,
+                count: 0,
             },
         ];
         let (c, samples) = s.preview_import_user_words("wb", &rows).unwrap();
@@ -572,5 +604,50 @@ mod tests {
             "其它 schema 不受影响"
         );
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn export_dict_wdict_roundtrips_words_count_and_shadow() {
+        let path = tmp("wind_uw_dict_io.redb");
+        let s = Store::open(&path).unwrap();
+        // 用户词 + 调频次数
+        s.add_user_word("wb", "a", "工", 100).unwrap();
+        s.on_word_selected("wb", "a", "工", 0, 0).unwrap(); // count -> 1
+        s.on_word_selected("wb", "a", "工", 0, 0).unwrap(); // count -> 2
+        // shadow：pin + del
+        s.pin_shadow("wb", "aaaa", "恭", None, 0).unwrap();
+        s.delete_shadow("wb", "bbbb", "见").unwrap();
+
+        let text = s
+            .export_dict_wdict("wb", "2026-07-14T00:00:00+08:00")
+            .unwrap();
+        assert!(text.contains("--- !words"), "含 words 段");
+        assert!(text.contains("--- !shadow"), "含 shadow 段");
+
+        // 导入到新库：words + shadow 均还原
+        let path2 = tmp("wind_uw_dict_io2.redb");
+        let s2 = Store::open(&path2).unwrap();
+        let (imported, skipped) = s2.import_user_words_wdict("wb", &text).unwrap();
+        assert_eq!(skipped, 0);
+        assert_eq!(imported, 1);
+        let got = s2.get_user_words("wb", "a").unwrap();
+        assert_eq!(got[0].weight, 100);
+        assert_eq!(got[0].count, 2, "count(调频)随导出/导入流转");
+
+        let (actions, sk) = crate::wdict::parse_shadow_wdict(&text).unwrap();
+        assert_eq!(sk, 0);
+        let n = s2.import_shadow_actions("wb", &actions).unwrap();
+        assert!(n >= 2, "至少重放 pin + del 两条");
+        assert!(
+            s2.get_shadow_rules("wb", "aaaa").unwrap().is_some(),
+            "pin 规则还原"
+        );
+        assert_eq!(
+            s2.get_shadow_rules("wb", "bbbb").unwrap().unwrap().deleted,
+            vec!["见".to_string()],
+            "del 规则还原"
+        );
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(&path2);
     }
 }

@@ -3,6 +3,7 @@
 //! 与 Go 版本 `wind_input/internal/store/` 对齐。
 //! 使用 redb 替代 bbolt，保持相同的 bucket 语义。
 
+pub mod dict_export;
 pub mod freq;
 pub mod import_formats;
 pub mod migration;

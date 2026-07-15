@@ -206,6 +206,7 @@ impl Store {
                 code: r.code,
                 text: r.text,
                 weight: r.weight,
+                count: 0,
             })
             .collect();
         Ok(wdict::export_words_wdict(&rows, exported_at))
@@ -222,6 +223,33 @@ impl Store {
             self.learn_temp_word(schema, &r.code, &r.text, r.weight)?;
         }
         Ok((rows.len(), skipped))
+    }
+
+    /// 从 wdict `WordIo` 行导入临时词，**保留 count 晋升进度**（Merge：weight 取 max、count 取 max；
+    /// 权重仍受 `TEMP_WORD_MAX_WEIGHT` 约束）。返回导入条数。
+    /// 与 `import_temp_words_wdict`（走 learn_temp_word，count 归 1）不同，本方法用于多段词库导入以保真 count。
+    pub fn import_temp_word_rows(
+        &self,
+        schema: &str,
+        rows: &[wdict::WordIo],
+    ) -> anyhow::Result<usize> {
+        self.with_db(|db| {
+            let txn = db.begin_write()?;
+            {
+                let mut t = txn.open_table(TEMP_WORDS)?;
+                for r in rows {
+                    let key = enc_key(schema, &r.code, &r.text);
+                    let cap = r.weight.min(TEMP_WORD_MAX_WEIGHT);
+                    let (w, c, ca) = match t.get(key.as_str())?.and_then(|g| dec_val(g.value())) {
+                        Some((ow, oc, oca)) => (ow.max(cap), oc.max(r.count), oca),
+                        None => (cap, r.count, now_secs()),
+                    };
+                    t.insert(key.as_str(), enc_val(w, c, ca).as_slice())?;
+                }
+            }
+            txn.commit()?;
+            Ok(rows.len())
+        })
     }
 
     /// 清空某方案全部临时词（单写事务），返回删除条数。

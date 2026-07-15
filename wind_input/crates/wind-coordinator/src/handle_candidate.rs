@@ -594,7 +594,10 @@ impl Coordinator {
         let Some(store) = &self.store else {
             return;
         };
-        let schema = self.engine_mgr.active_schema_id();
+        // 候选调整按 data_schema_id 归属（拼音族折叠共享；码表/混输各自独立）。
+        let schema = self
+            .engine_mgr
+            .data_schema_id(&self.engine_mgr.active_schema_id());
         let rec = match store.get_shadow_rules(&schema, code) {
             Ok(Some(r)) => r,
             _ => return,
@@ -1445,17 +1448,20 @@ impl Coordinator {
         }
         let last = state.candidates.len().saturating_sub(1);
         if let Some(store) = &self.store {
+            // 候选调整按 data_schema_id 归属（拼音族折叠）；Delete 分支仍传原始 schema，
+            // 供 delete_candidate_by_source 对用户词/临时词按来源分流（混输）。
+            let sh_schema = self.engine_mgr.data_schema_id(&schema);
             // None cand_id：码表静态词无动态短语 id。redb 事务持久，无需显式落盘。
             let r = match op {
-                CandidateOp::MoveTop => store.pin_shadow(&schema, &code, &word, None, 0),
+                CandidateOp::MoveTop => store.pin_shadow(&sh_schema, &code, &word, None, 0),
                 CandidateOp::MoveUp => {
-                    store.pin_shadow(&schema, &code, &word, None, idx.saturating_sub(1))
+                    store.pin_shadow(&sh_schema, &code, &word, None, idx.saturating_sub(1))
                 }
                 CandidateOp::MoveDown => {
-                    store.pin_shadow(&schema, &code, &word, None, (idx + 1).min(last))
+                    store.pin_shadow(&sh_schema, &code, &word, None, (idx + 1).min(last))
                 }
                 CandidateOp::Delete => self.delete_candidate_by_source(&schema, &code, &cand),
-                CandidateOp::Reset => store.remove_shadow_rule(&schema, &code, &word),
+                CandidateOp::Reset => store.remove_shadow_rule(&sh_schema, &code, &word),
             };
             if let Err(e) = r {
                 warn!("candidate op failed: {}", e);
@@ -1515,7 +1521,8 @@ impl Coordinator {
                 store.remove_temp_word(&sid, dcode, &cand.text)
             };
         }
-        store.delete_shadow(schema, code, &cand.text)
+        // 候选调整（系统词软隐藏）按 data_schema_id 归属（拼音族折叠）。
+        store.delete_shadow(&self.engine_mgr.data_schema_id(schema), code, &cand.text)
     }
 
     /// 候选词操作热键匹配（对齐 Go matchCandidateActionKey，但 `0` 扩展为第 10 候选）。

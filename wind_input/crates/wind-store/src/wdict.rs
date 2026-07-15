@@ -1,5 +1,5 @@
 //! wdict（.wdict.yaml）格式读写 — 复刻旧 Go pkg/dictio。
-//! 本期仅实现 phrases 段；结构按可扩展写，便于后续 P2c 复用其它 section。
+//! 支持 phrases / words / shadow 三种 section；文件可含多段。
 //!
 //! 文件 = `# 注释` + `wind_dict:` YAML 头 + `\n--- !<tag>\n` 分隔的 TSV 数据段。
 //! TSV 字段转义：`\`→`\\`、换行→`\n`、制表→`\t`；bool→"1"/"0"。
@@ -106,7 +106,7 @@ pub fn parse_phrases_wdict(text: &str) -> Result<(Vec<PhraseIo>, usize), String>
         return Ok((Vec::new(), 0));
     };
     // 3. 逐行 TSV
-    let cols = phrase_columns_from_header(header);
+    let cols = section_columns_from_header(header, "phrases", PHRASE_COLUMNS);
     let mut rows = Vec::new();
     let mut skipped = 0usize;
     for line in after_tag.lines() {
@@ -135,34 +135,20 @@ pub fn parse_phrases_wdict(text: &str) -> Result<(Vec<PhraseIo>, usize), String>
     Ok((rows, skipped))
 }
 
-/// 从头部读 phrases 段列定义（`columns: [a, b, ...]`）；缺则默认列。
-fn phrase_columns_from_header(header: &str) -> Vec<String> {
-    for l in header.lines() {
-        let t = l.trim();
-        if let Some(rest) = t.strip_prefix("columns:") {
-            let inner = rest.trim().trim_start_matches('[').trim_end_matches(']');
-            let cols: Vec<String> = inner
-                .split(',')
-                .map(|x| x.trim().to_string())
-                .filter(|x| !x.is_empty())
-                .collect();
-            if !cols.is_empty() {
-                return cols;
-            }
-        }
-    }
-    PHRASE_COLUMNS.iter().map(|s| s.to_string()).collect()
-}
-
-/// wdict words 段的一行（用户词导入导出）。count/created_at 属个人数据，不随导出流转。
+/// wdict words 段的一行（用户词导入导出）。
+///
+/// count = 选词次数（调频热度）；随导出流转，导入时取 max 合并（见 `import_user_words`）。
+/// created_at 属纯本机数据（创建时间），**不**导出。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WordIo {
     pub code: String,
     pub text: String,
     pub weight: i32,
+    /// 选词次数（调频）。外部格式（Rime/TSV）无此列时为 0。
+    pub count: u32,
 }
 
-const WORD_COLUMNS: &[&str] = &["code", "text", "weight"];
+const WORD_COLUMNS: &[&str] = &["code", "text", "weight", "count"];
 
 /// 导出 words 为 wdict 文本（YAML 头 + `--- !words` TSV 段）。
 pub fn export_words_wdict(rows: &[WordIo], exported_at: &str) -> String {
@@ -178,17 +164,200 @@ pub fn export_words_wdict(rows: &[WordIo], exported_at: &str) -> String {
     s.push_str("\n--- !words\n");
     for r in rows {
         s.push_str(&format!(
-            "{}\t{}\t{}\n",
+            "{}\t{}\t{}\t{}\n",
             escape_field(&r.code),
             escape_field(&r.text),
             r.weight,
+            r.count,
         ));
     }
     s
 }
 
+/// 校验 wdict 头部（含 `wind_dict:` 且 version==1）。各段解析器共用。
+fn check_wdict_header(header: &str) -> Result<(), String> {
+    if !header.contains("wind_dict:") {
+        return Err("不是 WindDict 文件（缺 wind_dict 头）".into());
+    }
+    let version_ok = header.lines().any(|l| {
+        let t = l.trim();
+        t.starts_with("version:") && t.trim_start_matches("version:").trim() == "1"
+    });
+    if !version_ok {
+        return Err("不支持的 WindDict 版本（需 version: 1）".into());
+    }
+    Ok(())
+}
+
 /// 解析 wdict 文本的 words 段。返回 (行, 跳过的非法行数)。只认 version==1。
 pub fn parse_words_wdict(text: &str) -> Result<(Vec<WordIo>, usize), String> {
+    parse_word_rows(text, "words")
+}
+
+/// 解析 wdict 文本的 temp_words 段（临时词库；列与 words 相同 code/text/weight/count）。
+pub fn parse_temp_words_wdict(text: &str) -> Result<(Vec<WordIo>, usize), String> {
+    parse_word_rows(text, "temp_words")
+}
+
+/// words / temp_words 通用行解析（同为 WordIo 列布局，仅段名不同）。无该段返回空。
+fn parse_word_rows(text: &str, tag: &str) -> Result<(Vec<WordIo>, usize), String> {
+    let header = text.split("\n---").next().unwrap_or("");
+    check_wdict_header(header)?;
+    let Some(after_tag) = find_section_body(text, tag) else {
+        return Ok((Vec::new(), 0));
+    };
+    let cols = section_columns_from_header(header, tag, WORD_COLUMNS);
+    let mut rows = Vec::new();
+    let mut skipped = 0usize;
+    for line in after_tag.lines() {
+        if line.trim().is_empty() {
+            continue;
+        }
+        let fields: Vec<&str> = line.split('\t').collect();
+        // 至少要有 code+text 两列；缺的其它列（如新增的 count）回退默认。
+        if fields.len() < 2 {
+            skipped += 1;
+            continue;
+        }
+        let get = |name: &str| -> &str {
+            cols.iter()
+                .position(|c| c == name)
+                .and_then(|i| fields.get(i).copied())
+                .unwrap_or("")
+        };
+        rows.push(WordIo {
+            code: unescape_field(get("code")),
+            text: unescape_field(get("text")),
+            weight: get("weight").trim().parse().unwrap_or(0),
+            count: get("count").trim().parse().unwrap_or(0),
+        });
+    }
+    Ok((rows, skipped))
+}
+
+// ───────────────────────── freq 段（词频，code/text/count/last_used）─────────────────────────
+
+const FREQ_COLUMNS: &[&str] = &["code", "text", "count", "last_used"];
+
+/// wdict freq 段的一行（词频：真实使用数据）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FreqIo {
+    pub code: String,
+    pub text: String,
+    pub count: u32,
+    pub last_used: i64,
+}
+
+/// 解析 wdict 文本的 freq 段。返回 (行, 跳过的非法行数)。无该段返回空。
+pub fn parse_freq_wdict(text: &str) -> Result<(Vec<FreqIo>, usize), String> {
+    let header = text.split("\n---").next().unwrap_or("");
+    check_wdict_header(header)?;
+    let Some(after_tag) = find_section_body(text, "freq") else {
+        return Ok((Vec::new(), 0));
+    };
+    let cols = section_columns_from_header(header, "freq", FREQ_COLUMNS);
+    let mut rows = Vec::new();
+    let mut skipped = 0usize;
+    for line in after_tag.lines() {
+        if line.trim().is_empty() {
+            continue;
+        }
+        let fields: Vec<&str> = line.split('\t').collect();
+        if fields.len() < 2 {
+            skipped += 1;
+            continue;
+        }
+        let get = |name: &str| -> &str {
+            cols.iter()
+                .position(|c| c == name)
+                .and_then(|i| fields.get(i).copied())
+                .unwrap_or("")
+        };
+        rows.push(FreqIo {
+            code: unescape_field(get("code")),
+            text: unescape_field(get("text")),
+            count: get("count").trim().parse().unwrap_or(0),
+            last_used: get("last_used").trim().parse().unwrap_or(0),
+        });
+    }
+    Ok((rows, skipped))
+}
+
+// ───────────────────────── shadow 段（候选调序/删除，动作式）─────────────────────────
+//
+// 对齐旧 Go wind_dict 的 `--- !shadow` 段：每行一个动作（del/pin）。
+// 列 = action, code, word, position, cand_id。
+//   - pin：把 word 固定到 position（页内下标）；cand_id 非空 = 动态短语按 id 精准匹配（Rust 扩展列，Go 无）。
+//   - del：屏蔽 word（position/cand_id 列留空）。
+// 展平/重放的语义（LIFO 存储序、pin/delete 互斥）由 store 层负责，本层只做纯文本编解码。
+
+const SHADOW_COLUMNS: &[&str] = &["action", "code", "word", "position", "cand_id"];
+
+/// wdict shadow 段的一行（动作式）。
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct ShadowActionIo {
+    /// "pin" | "del"
+    pub action: String,
+    pub code: String,
+    pub word: String,
+    /// pin 目标下标；del 忽略（导出为空）。
+    pub position: i32,
+    /// 动态短语稳定 id；无则 None（导出为空列）。
+    pub cand_id: Option<String>,
+}
+
+/// 导出「用户词 + shadow」为单个 wdict 文本（`--- !words` + `--- !shadow` 两段）。
+///
+/// words 段列 = [code, text, weight, count]；shadow 段列 = [action, code, word, position, cand_id]。
+/// 老版本只认 words 段、忽略未知 shadow 段与多余列，故向后兼容。
+pub fn export_dict_wdict(words: &[WordIo], shadow: &[ShadowActionIo], exported_at: &str) -> String {
+    let mut s = String::new();
+    s.push_str("# WindInput 用户数据文件\n");
+    s.push_str("wind_dict:\n");
+    s.push_str("  version: 1\n");
+    s.push_str("  generator: WindInput\n");
+    s.push_str(&format!("  exported_at: {exported_at}\n"));
+    s.push_str("  sections:\n");
+    s.push_str("    words:\n");
+    s.push_str(&format!("      columns: [{}]\n", WORD_COLUMNS.join(", ")));
+    s.push_str("    shadow:\n");
+    s.push_str(&format!("      columns: [{}]\n", SHADOW_COLUMNS.join(", ")));
+    s.push_str("\n--- !words\n");
+    for r in words {
+        s.push_str(&format!(
+            "{}\t{}\t{}\t{}\n",
+            escape_field(&r.code),
+            escape_field(&r.text),
+            r.weight,
+            r.count,
+        ));
+    }
+    s.push_str("\n--- !shadow\n");
+    for r in shadow {
+        // del 行的 position/cand_id 列留空，保持列数一致（对齐 Go）。
+        let (pos, cid) = if r.action == "pin" {
+            (
+                r.position.to_string(),
+                r.cand_id.clone().unwrap_or_default(),
+            )
+        } else {
+            (String::new(), String::new())
+        };
+        s.push_str(&format!(
+            "{}\t{}\t{}\t{}\t{}\n",
+            escape_field(&r.action),
+            escape_field(&r.code),
+            escape_field(&r.word),
+            pos,
+            escape_field(&cid),
+        ));
+    }
+    s
+}
+
+/// 解析 wdict 文本的 shadow 段。返回 (行, 跳过的非法行数)。
+/// 无 shadow 段返回空；version 非 1 报错（与 words 段一致）。
+pub fn parse_shadow_wdict(text: &str) -> Result<(Vec<ShadowActionIo>, usize), String> {
     let header = text.split("\n---").next().unwrap_or("");
     if !header.contains("wind_dict:") {
         return Err("不是 WindDict 文件（缺 wind_dict 头）".into());
@@ -200,10 +369,10 @@ pub fn parse_words_wdict(text: &str) -> Result<(Vec<WordIo>, usize), String> {
     if !version_ok {
         return Err("不支持的 WindDict 版本（需 version: 1）".into());
     }
-    let Some(after_tag) = find_section_body(text, "words") else {
+    let Some(after_tag) = find_section_body(text, "shadow") else {
         return Ok((Vec::new(), 0));
     };
-    let cols = words_columns_from_header(header);
+    let cols = section_columns_from_header(header, "shadow", SHADOW_COLUMNS);
     let mut rows = Vec::new();
     let mut skipped = 0usize;
     for line in after_tag.lines() {
@@ -211,42 +380,64 @@ pub fn parse_words_wdict(text: &str) -> Result<(Vec<WordIo>, usize), String> {
             continue;
         }
         let fields: Vec<&str> = line.split('\t').collect();
-        if fields.len() < cols.len() {
+        if fields.len() < 3 {
             skipped += 1;
             continue;
         }
         let get = |name: &str| -> &str {
             cols.iter()
                 .position(|c| c == name)
-                .map(|i| fields[i])
+                .and_then(|i| fields.get(i).copied())
                 .unwrap_or("")
         };
-        rows.push(WordIo {
-            code: unescape_field(get("code")),
-            text: unescape_field(get("text")),
-            weight: get("weight").trim().parse().unwrap_or(0),
+        let action = unescape_field(get("action").trim());
+        let word = unescape_field(get("word"));
+        let code = unescape_field(get("code"));
+        if (action != "pin" && action != "del") || code.is_empty() || word.is_empty() {
+            skipped += 1;
+            continue;
+        }
+        let cand_id = {
+            let c = unescape_field(get("cand_id"));
+            if c.is_empty() { None } else { Some(c) }
+        };
+        rows.push(ShadowActionIo {
+            action,
+            code,
+            word,
+            position: get("position").trim().parse().unwrap_or(0),
+            cand_id,
         });
     }
     Ok((rows, skipped))
 }
 
-/// 从头部读 words 段列定义；缺则默认列。
-fn words_columns_from_header(header: &str) -> Vec<String> {
+/// 从头部读某 section 的 `columns:` 定义（定位到 `<section>:` 之后的首个 `columns:`）；缺则默认列。
+fn section_columns_from_header(header: &str, section: &str, default: &[&str]) -> Vec<String> {
+    let mut in_section = false;
     for l in header.lines() {
         let t = l.trim();
-        if let Some(rest) = t.strip_prefix("columns:") {
-            let inner = rest.trim().trim_start_matches('[').trim_end_matches(']');
-            let cols: Vec<String> = inner
-                .split(',')
-                .map(|x| x.trim().to_string())
-                .filter(|x| !x.is_empty())
-                .collect();
-            if !cols.is_empty() {
-                return cols;
+        if t.strip_suffix(':') == Some(section) {
+            in_section = true;
+            continue;
+        }
+        if in_section {
+            if let Some(rest) = t.strip_prefix("columns:") {
+                let inner = rest.trim().trim_start_matches('[').trim_end_matches(']');
+                let cols: Vec<String> = inner
+                    .split(',')
+                    .map(|x| x.trim().to_string())
+                    .filter(|x| !x.is_empty())
+                    .collect();
+                if !cols.is_empty() {
+                    return cols;
+                }
+            } else if t.ends_with(':') {
+                break; // 进入下一个 section，本段无 columns 声明
             }
         }
     }
-    WORD_COLUMNS.iter().map(|s| s.to_string()).collect()
+    default.iter().map(|s| s.to_string()).collect()
 }
 
 /// 返回 `--- !<tag>\n` 之后、下一个 `\n---` 之前的正文。
@@ -265,6 +456,148 @@ fn find_section_body<'a>(text: &'a str, tag: &str) -> Option<&'a str> {
         Some(i) => Some(&body[..i]),
         None => Some(body),
     }
+}
+
+// ───────────────────────── 多段组合导出（词库导入导出主入口）─────────────────────────
+
+/// 多段 wdict 导出容器：仅 `Some` 的段写入文件。
+#[derive(Debug, Default, Clone)]
+pub struct DictWdict {
+    pub words: Option<Vec<WordIo>>,
+    pub temp_words: Option<Vec<WordIo>>,
+    pub freq: Option<Vec<FreqIo>>,
+    pub shadow: Option<Vec<ShadowActionIo>>,
+}
+
+fn push_word_row(s: &mut String, r: &WordIo) {
+    s.push_str(&format!(
+        "{}\t{}\t{}\t{}\n",
+        escape_field(&r.code),
+        escape_field(&r.text),
+        r.weight,
+        r.count,
+    ));
+}
+
+fn push_shadow_row(s: &mut String, r: &ShadowActionIo) {
+    let (pos, cid) = if r.action == "pin" {
+        (
+            r.position.to_string(),
+            r.cand_id.clone().unwrap_or_default(),
+        )
+    } else {
+        (String::new(), String::new())
+    };
+    s.push_str(&format!(
+        "{}\t{}\t{}\t{}\t{}\n",
+        escape_field(&r.action),
+        escape_field(&r.code),
+        escape_field(&r.word),
+        pos,
+        escape_field(&cid),
+    ));
+}
+
+/// 导出多段 wdict 文本（用户词库/临时词库/词频/候选调整；仅所选段写入）。
+/// `schema_id` / `engine_type` 写入头部，供导入时校验来源方案与引擎类型（防跨类型误导，
+/// 如五笔词库导入拼音方案致编码错乱）。均可空。
+pub fn export_dict_sections(
+    d: &DictWdict,
+    exported_at: &str,
+    schema_id: &str,
+    engine_type: &str,
+) -> String {
+    let mut s = String::new();
+    s.push_str("# WindInput 用户数据文件\n");
+    s.push_str("wind_dict:\n");
+    s.push_str("  version: 1\n");
+    s.push_str("  generator: WindInput\n");
+    s.push_str(&format!("  exported_at: {exported_at}\n"));
+    if !schema_id.is_empty() {
+        s.push_str(&format!("  schema_id: {schema_id}\n"));
+    }
+    if !engine_type.is_empty() {
+        s.push_str(&format!("  engine_type: {engine_type}\n"));
+    }
+    s.push_str("  sections:\n");
+    if d.words.is_some() {
+        s.push_str("    words:\n");
+        s.push_str(&format!("      columns: [{}]\n", WORD_COLUMNS.join(", ")));
+    }
+    if d.temp_words.is_some() {
+        s.push_str("    temp_words:\n");
+        s.push_str(&format!("      columns: [{}]\n", WORD_COLUMNS.join(", ")));
+    }
+    if d.freq.is_some() {
+        s.push_str("    freq:\n");
+        s.push_str(&format!("      columns: [{}]\n", FREQ_COLUMNS.join(", ")));
+    }
+    if d.shadow.is_some() {
+        s.push_str("    shadow:\n");
+        s.push_str(&format!("      columns: [{}]\n", SHADOW_COLUMNS.join(", ")));
+    }
+    if let Some(rows) = &d.words {
+        s.push_str("\n--- !words\n");
+        for r in rows {
+            push_word_row(&mut s, r);
+        }
+    }
+    if let Some(rows) = &d.temp_words {
+        s.push_str("\n--- !temp_words\n");
+        for r in rows {
+            push_word_row(&mut s, r);
+        }
+    }
+    if let Some(rows) = &d.freq {
+        s.push_str("\n--- !freq\n");
+        for r in rows {
+            s.push_str(&format!(
+                "{}\t{}\t{}\t{}\n",
+                escape_field(&r.code),
+                escape_field(&r.text),
+                r.count,
+                r.last_used,
+            ));
+        }
+    }
+    if let Some(rows) = &d.shadow {
+        s.push_str("\n--- !shadow\n");
+        for r in rows {
+            push_shadow_row(&mut s, r);
+        }
+    }
+    s
+}
+
+/// 读取头部标量字段（`  key: value`，第一个 `\n---` 之前）。用于取 schema_id / engine_type。
+/// 只匹配以 `key:` 打头的行（trim 后），返回其值；无则 None。
+pub fn read_header_field(text: &str, key: &str) -> Option<String> {
+    let header = text.split("\n---").next().unwrap_or("");
+    let prefix = format!("{key}:");
+    for l in header.lines() {
+        let t = l.trim();
+        if let Some(rest) = t.strip_prefix(&prefix) {
+            let v = rest.trim();
+            if !v.is_empty() {
+                return Some(v.to_string());
+            }
+        }
+    }
+    None
+}
+
+/// 文件中实际出现的段标签（`--- !<tag>`），保序去重。用于导入预览"文件含哪些段"。
+pub fn sections_present(text: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    for line in text.lines() {
+        if let Some(rest) = line.strip_prefix("--- !") {
+            let tag = rest.trim().to_string();
+            if !tag.is_empty() && !out.contains(&tag) {
+                out.push(tag);
+            }
+        }
+    }
+    out
 }
 
 #[cfg(test)]
@@ -343,19 +676,33 @@ mod tests {
                 code: "a".into(),
                 text: "工".into(),
                 weight: 100,
+                count: 42,
             },
             WordIo {
                 code: "ml".into(),
                 text: "多行\n带\t制表".into(),
                 weight: 0,
+                count: 0,
             },
         ];
         let s = export_words_wdict(&rows, "2026-07-11T00:00:00+08:00");
         assert!(s.contains("wind_dict:"));
         assert!(s.contains("--- !words"));
+        assert!(s.contains("count"), "列头应含 count");
         let (parsed, skipped) = parse_words_wdict(&s).unwrap();
         assert_eq!(skipped, 0);
-        assert_eq!(parsed, rows, "导出→解析应无损往返(含换行/制表)");
+        assert_eq!(parsed, rows, "导出→解析应无损往返(含换行/制表/count)");
+    }
+
+    #[test]
+    fn words_wdict_reads_legacy_3col() {
+        // 老文件：words 段只声明 3 列、每行 3 字段（无 count）→ count 回退 0，不跳过。
+        let legacy = "wind_dict:\n  version: 1\n  sections:\n    words:\n      columns: [code, text, weight]\n\n--- !words\na\t工\t100\n";
+        let (rows, skipped) = parse_words_wdict(legacy).unwrap();
+        assert_eq!(skipped, 0);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].count, 0, "缺 count 列回退 0");
+        assert_eq!(rows[0].weight, 100);
     }
 
     #[test]
@@ -366,10 +713,82 @@ mod tests {
 
     #[test]
     fn words_parse_tolerates_bad_lines() {
-        let s = "wind_dict:\n  version: 1\n  sections:\n    words:\n      columns: [code, text, weight]\n\n--- !words\nok\t好\t10\nbadline_no_tabs\nkw\t坏权重\tNaN\n";
+        let s = "wind_dict:\n  version: 1\n  sections:\n    words:\n      columns: [code, text, weight, count]\n\n--- !words\nok\t好\t10\t0\nbadline\nkw\t坏权重\tNaN\t0\n";
         let (rows, skipped) = parse_words_wdict(s).unwrap();
         assert_eq!(rows.len(), 2);
-        assert_eq!(skipped, 1, "列数不足的行跳过");
+        assert_eq!(skipped, 1, "单字段行跳过");
         assert_eq!(rows[1].weight, 0, "非法数字回退 0");
+    }
+
+    #[test]
+    fn dict_wdict_roundtrip_words_and_shadow() {
+        let words = vec![WordIo {
+            code: "a".into(),
+            text: "工".into(),
+            weight: 100,
+            count: 7,
+        }];
+        let shadow = vec![
+            ShadowActionIo {
+                action: "pin".into(),
+                code: "xhwp".into(),
+                word: "[小鹤网盘]".into(),
+                position: 0,
+                cand_id: None,
+            },
+            ShadowActionIo {
+                action: "pin".into(),
+                code: "aaaa".into(),
+                word: "日期".into(),
+                position: 1,
+                cand_id: Some("phrase:aaaa:date".into()),
+            },
+            ShadowActionIo {
+                action: "del".into(),
+                code: "j".into(),
+                word: "见".into(),
+                position: 0,
+                cand_id: None,
+            },
+        ];
+        let s = export_dict_wdict(&words, &shadow, "2026-07-14T00:00:00+08:00");
+        assert!(s.contains("--- !words"));
+        assert!(s.contains("--- !shadow"));
+
+        let (pw, sk1) = parse_words_wdict(&s).unwrap();
+        assert_eq!(sk1, 0);
+        assert_eq!(pw, words, "words 段往返无损（含 count）");
+
+        let (ps, sk2) = parse_shadow_wdict(&s).unwrap();
+        assert_eq!(sk2, 0);
+        // del 行 position 归 0（导出留空、解析回退 0）
+        let expected: Vec<ShadowActionIo> = shadow
+            .iter()
+            .cloned()
+            .map(|mut r| {
+                if r.action == "del" {
+                    r.position = 0;
+                }
+                r
+            })
+            .collect();
+        assert_eq!(ps, expected, "shadow 段往返无损（含 cand_id/del）");
+    }
+
+    #[test]
+    fn parse_shadow_skips_unknown_action() {
+        let s = "wind_dict:\n  version: 1\n  sections:\n    shadow:\n      columns: [action, code, word, position, cand_id]\n\n--- !shadow\npin\txhwp\t网盘\t0\t\nbogus\tj\t见\t\t\ndel\tj\t见\t\t\n";
+        let (rows, skipped) = parse_shadow_wdict(s).unwrap();
+        assert_eq!(rows.len(), 2, "pin + del 收，未知 action 跳过");
+        assert_eq!(skipped, 1);
+    }
+
+    #[test]
+    fn parse_shadow_missing_section_is_empty() {
+        // 只有 words 段的老文件：解析 shadow 段返回空，不报错。
+        let s = "wind_dict:\n  version: 1\n\n--- !words\na\t工\t1\t0\n";
+        let (rows, skipped) = parse_shadow_wdict(s).unwrap();
+        assert!(rows.is_empty());
+        assert_eq!(skipped, 0);
     }
 }

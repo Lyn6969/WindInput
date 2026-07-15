@@ -298,6 +298,63 @@ impl Store {
         Ok((imported, skipped))
     }
 
+    /// 导出某方案全部 shadow 规则为动作行（wdict shadow 段用；对齐 Go 的 del/pin）。
+    ///
+    /// pinned 按存储序逆序（LIFO，index 0 = 最新）输出 pin 行，重放时最后 pin 回队首还原原序；
+    /// deleted 输出 del 行。
+    pub fn export_shadow_actions(
+        &self,
+        schema: &str,
+    ) -> anyhow::Result<Vec<crate::wdict::ShadowActionIo>> {
+        let rules = self.list_shadow_rules(schema)?;
+        let mut out = Vec::new();
+        for (code, rec) in rules {
+            for p in rec.pinned.iter().rev() {
+                out.push(crate::wdict::ShadowActionIo {
+                    action: "pin".into(),
+                    code: code.clone(),
+                    word: p.word.clone(),
+                    position: p.position as i32,
+                    cand_id: p.cand_id.clone(),
+                });
+            }
+            for w in &rec.deleted {
+                out.push(crate::wdict::ShadowActionIo {
+                    action: "del".into(),
+                    code: code.clone(),
+                    word: w.clone(),
+                    position: 0,
+                    cand_id: None,
+                });
+            }
+        }
+        Ok(out)
+    }
+
+    /// 从动作行导入 shadow 规则（逐行 replay pin/delete，天然 upsert）。返回重放条数。
+    pub fn import_shadow_actions(
+        &self,
+        schema: &str,
+        actions: &[crate::wdict::ShadowActionIo],
+    ) -> anyhow::Result<usize> {
+        let mut n = 0usize;
+        for a in actions {
+            match a.action.as_str() {
+                "pin" => {
+                    let pos = a.position.max(0) as usize;
+                    self.pin_shadow(schema, &a.code, &a.word, a.cand_id.as_deref(), pos)?;
+                    n += 1;
+                }
+                "del" => {
+                    self.delete_shadow(schema, &a.code, &a.word)?;
+                    n += 1;
+                }
+                _ => {}
+            }
+        }
+        Ok(n)
+    }
+
     /// 清空某方案全部 shadow 规则（单写事务），返回删除键数。
     pub fn clear_shadow(&self, schema: &str) -> anyhow::Result<usize> {
         let prefix = format!("{schema}\u{0}");
