@@ -4,7 +4,8 @@
 //! 为悬停候选提供"如何输入"的提示：五笔编码（拆字）+ 拼音读音。
 //!
 //! 数据源：
-//! - 拆字/五笔码：`schemas/wubi86/wubi86_chaizi.txt`（字\t字根\t五笔编码）
+//! - 拆字/编码：主码表方案 `[engine.chaizi].db_path` 指向的拆字库（字\t字根\t编码），
+//!   路径由调用方解析（用户方案目录优先，回落系统 data/schemas/）
 //! - 拼音：`pinyin_map.txt`（pinyin-data 格式：`U+4E00: yī  # 一`，多音字逗号分隔）
 //!   由 wind-tools `gen_pinyin` 从 mozillazg/pinyin-data 合并生成。
 
@@ -42,12 +43,87 @@ impl Default for TooltipOptions {
 /// 反查表
 #[derive(Default)]
 pub struct ReverseLookup {
-    /// 字 → 五笔编码
-    code: HashMap<char, String>,
-    /// 字 → 字根分解（拆字段用）
-    radicals: HashMap<char, String>,
+    /// 拆字表（字 → 字根/编码），可随主码表方案热重载（`reload_chaizi`）
+    chaizi: ChaiziTable,
     /// 字 → 拼音读音（多音字按常用频率排序，最常用在前）
     pinyin: HashMap<char, Vec<String>>,
+}
+
+/// 拆字表：字 → (字根, 编码)。紧凑存储——按字升序的定长条目数组 + 共享文本 arena，
+/// 相比每字两个 `HashMap<char, String>`（桶空位 + 逐串堆分配），十万字级词库省数倍内存。
+/// 查询走二分：拆字仅用于悬停提示与加词出码，均为低频路径，无需 O(1)。
+#[derive(Default)]
+struct ChaiziTable {
+    /// 按 `ch` 升序。条目文本区间：字根=[start, rad_end)、编码=[rad_end, code_end)，
+    /// start = 前一条目的 code_end（首条为 0）。
+    entries: Vec<ChaiziEntry>,
+    /// 所有字根/编码文本按条目序连续拼接。
+    arena: String,
+}
+
+struct ChaiziEntry {
+    ch: char,
+    rad_end: u32,
+    code_end: u32,
+}
+
+impl ChaiziTable {
+    /// 从 (字, 字根, 编码) 行构建；同字多行取靠后者（与旧 HashMap 覆盖语义一致）。
+    fn build(mut rows: Vec<(char, &str, &str)>) -> Self {
+        rows.sort_by_key(|r| r.0); // 稳定排序保文件序，取每组末条即"后行覆盖"
+        let mut entries = Vec::with_capacity(rows.len());
+        let mut arena = String::with_capacity(rows.iter().map(|r| r.1.len() + r.2.len()).sum());
+        let mut i = 0;
+        while i < rows.len() {
+            let mut j = i;
+            while j + 1 < rows.len() && rows[j + 1].0 == rows[i].0 {
+                j += 1;
+            }
+            let (ch, rad, code) = rows[j];
+            arena.push_str(rad);
+            let rad_end = arena.len() as u32;
+            arena.push_str(code);
+            entries.push(ChaiziEntry {
+                ch,
+                rad_end,
+                code_end: arena.len() as u32,
+            });
+            i = j + 1;
+        }
+        arena.shrink_to_fit();
+        Self { entries, arena }
+    }
+
+    /// 二分查字，返回 (字根, 编码)（可为空串）。
+    fn lookup(&self, c: char) -> Option<(&str, &str)> {
+        let i = self.entries.binary_search_by_key(&c, |e| e.ch).ok()?;
+        let start = if i == 0 {
+            0
+        } else {
+            self.entries[i - 1].code_end as usize
+        };
+        let e = &self.entries[i];
+        Some((
+            &self.arena[start..e.rad_end as usize],
+            &self.arena[e.rad_end as usize..e.code_end as usize],
+        ))
+    }
+
+    fn radicals(&self, c: char) -> Option<&str> {
+        self.lookup(c).map(|(r, _)| r).filter(|s| !s.is_empty())
+    }
+
+    fn code(&self, c: char) -> Option<&str> {
+        self.lookup(c).map(|(_, c)| c).filter(|s| !s.is_empty())
+    }
+
+    fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
+    fn len(&self) -> usize {
+        self.entries.len()
+    }
 }
 
 // ── 内部 Section 结构（对齐 Go tooltip.Section）──────────────────────────────
@@ -168,14 +244,27 @@ impl ReverseLookup {
     }
 
     pub fn is_empty(&self) -> bool {
-        self.code.is_empty() && self.pinyin.is_empty()
+        self.chaizi.is_empty() && self.pinyin.is_empty()
     }
 
-    /// 载入五笔拆字库（字\t字根\t编码）；存编码列 + 字根列。
+    /// 重载拆字表（主码表方案变更时热切换）；`path=None` 清空并释放内存。
+    pub fn reload_chaizi(&mut self, path: Option<&Path>) {
+        self.chaizi = ChaiziTable::default();
+        if let Some(p) = path {
+            self.load_chaizi(p);
+        }
+    }
+
+    /// 载入拆字库（字\t字根\t编码）；存编码列 + 字根列。
     fn load_chaizi(&mut self, path: &Path) {
-        let Ok(content) = std::fs::read_to_string(path) else {
-            return;
+        let content = match std::fs::read_to_string(path) {
+            Ok(c) => c,
+            Err(e) => {
+                tracing::warn!("读取拆字库失败 {}: {}", path.display(), e);
+                return;
+            }
         };
+        let mut rows: Vec<(char, &str, &str)> = Vec::new();
         for line in content.lines() {
             let line = line.trim_end();
             if line.is_empty() || line.starts_with('#') {
@@ -187,20 +276,19 @@ impl ReverseLookup {
             };
             let mut chars = ch.chars();
             if let (Some(c), None) = (chars.next(), chars.next()) {
-                if let Some(code) = code {
-                    let code = code.trim();
-                    if !code.is_empty() {
-                        self.code.insert(c, code.to_string());
-                    }
-                }
-                if let Some(radicals) = radicals {
-                    let radicals = radicals.trim();
-                    if !radicals.is_empty() {
-                        self.radicals.insert(c, radicals.to_string());
-                    }
+                let rad = radicals.map(str::trim).unwrap_or("");
+                let code = code.map(str::trim).unwrap_or("");
+                if !rad.is_empty() || !code.is_empty() {
+                    rows.push((c, rad, code));
                 }
             }
         }
+        self.chaizi = ChaiziTable::build(rows);
+        tracing::info!(
+            "拆字库加载完成 {}: {} 字",
+            path.display(),
+            self.chaizi.len()
+        );
     }
 
     /// 载入拼音表（pinyin-data 格式：`U+4E00: yī  # 一`，多音字逗号分隔）。
@@ -257,14 +345,18 @@ impl ReverseLookup {
     pub fn wubi_word_code(&self, text: &str) -> String {
         let chars: Vec<char> = text.chars().collect();
         let firstn = |c: char, n: usize| -> String {
-            self.code
-                .get(&c)
+            self.chaizi
+                .code(c)
                 .map(|s| s.chars().take(n).collect())
                 .unwrap_or_default()
         };
         match chars.len() {
             0 => String::new(),
-            1 => self.code.get(&chars[0]).cloned().unwrap_or_default(),
+            1 => self
+                .chaizi
+                .code(chars[0])
+                .map(str::to_string)
+                .unwrap_or_default(),
             2 => format!("{}{}", firstn(chars[0], 2), firstn(chars[1], 2)),
             3 => format!(
                 "{}{}{}",
@@ -349,8 +441,8 @@ impl ReverseLookup {
         if opts.chaizi {
             let mut lines = Vec::new();
             for &c in &chars {
-                if let Some(rad) = self.radicals.get(&c) {
-                    let line = match self.code.get(&c) {
+                if let Some(rad) = self.chaizi.radicals(c) {
+                    let line = match self.chaizi.code(c) {
                         Some(code) => format!("{c}：{rad} [{code}]"),
                         None => format!("{c}：{rad}"),
                     };
@@ -390,6 +482,14 @@ fn strip_tone(py: &str) -> String {
 }
 
 #[cfg(test)]
+impl ReverseLookup {
+    /// 测试助手：直接构建拆字表（字, 字根, 编码）。
+    fn set_chaizi(&mut self, rows: Vec<(char, &str, &str)>) {
+        self.chaizi = ChaiziTable::build(rows);
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -403,10 +503,12 @@ mod tests {
     #[test]
     fn test_wubi_word_code_rules() {
         let mut rl = ReverseLookup::default();
-        rl.code.insert('工', "aaaa".into());
-        rl.code.insert('人', "wwww".into());
-        rl.code.insert('大', "dddd".into());
-        rl.code.insert('小', "ihty".into());
+        rl.set_chaizi(vec![
+            ('工', "", "aaaa"),
+            ('人', "", "wwww"),
+            ('大', "", "dddd"),
+            ('小', "", "ihty"),
+        ]);
         // 1字=全码
         assert_eq!(rl.wubi_word_code("工"), "aaaa");
         // 2字=各前2码
@@ -419,14 +521,38 @@ mod tests {
 
     fn sample_rl() -> ReverseLookup {
         let mut rl = ReverseLookup::default();
-        rl.code.insert('好', "vbg".to_string());
+        rl.set_chaizi(vec![('好', "女子", "vbg"), ('人', "人", "w")]);
         rl.pinyin
             .insert('好', vec!["hǎo".to_string(), "hào".to_string()]);
-        rl.radicals.insert('好', "女子".to_string());
-        rl.code.insert('人', "w".to_string());
         rl.pinyin.insert('人', vec!["rén".to_string()]);
-        rl.radicals.insert('人', "人".to_string());
         rl
+    }
+
+    #[test]
+    fn test_chaizi_table_lookup_and_dup_last_wins() {
+        // 乱序输入 + 同字重复：查询按二分命中，重复取文件靠后者（对齐旧 HashMap 覆盖语义）。
+        let t = ChaiziTable::build(vec![
+            ('乙', "乙", "nnll"),
+            ('甲', "田", "old"),
+            ('甲', "田", "lhnh"),
+            ('丙', "", "gmw"),
+        ]);
+        assert_eq!(t.len(), 3, "重复字应合并");
+        assert_eq!(t.lookup('甲'), Some(("田", "lhnh")), "同字取靠后行");
+        assert_eq!(t.code('乙'), Some("nnll"));
+        assert_eq!(t.radicals('丙'), None, "空字根应视为无");
+        assert_eq!(t.code('丙'), Some("gmw"));
+        assert_eq!(t.lookup('丁'), None);
+    }
+
+    #[test]
+    fn test_reload_chaizi_none_clears() {
+        let mut rl = sample_rl();
+        assert!(!rl.chaizi.is_empty());
+        rl.reload_chaizi(None);
+        assert!(rl.chaizi.is_empty(), "None 应清空拆字表");
+        assert!(!rl.pinyin.is_empty(), "拼音表不受影响");
+        assert_eq!(rl.wubi_word_code("好"), "");
     }
 
     #[test]

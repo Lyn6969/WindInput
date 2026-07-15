@@ -2628,6 +2628,9 @@ dependencies = [
 [[package]]
 name = "wind-reverse"
 version = "0.1.0"
+dependencies = [
+ "tracing",
+]
 
 [[package]]
 name = "wind-rpc"

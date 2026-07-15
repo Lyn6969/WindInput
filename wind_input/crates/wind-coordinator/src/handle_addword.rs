@@ -384,12 +384,13 @@ impl Coordinator {
             .schema_engine_type(&schema)
             .map(|t| t == "pinyin")
             .unwrap_or(false);
+        let reverse = self.reverse.read().unwrap_or_else(|e| e.into_inner());
         if is_pinyin {
             self.engine_mgr
                 .generate_word_pinyin(&schema, word)
-                .unwrap_or_else(|| self.reverse.gen_pinyin(word))
+                .unwrap_or_else(|| reverse.gen_pinyin(word))
         } else {
-            self.reverse.wubi_word_code(word)
+            reverse.wubi_word_code(word)
         }
     }
 

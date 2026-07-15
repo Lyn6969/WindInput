@@ -495,8 +495,11 @@ pub struct Coordinator {
     // Shadow 规则已迁至 redb（self.store 的 SHADOW 表）。
     /// 工具栏位置，按显示器 key（"workRight,workBottom"）独立记录。
     pub(crate) toolbar_positions: Mutex<std::collections::HashMap<String, (i32, i32)>>,
-    /// 候选反查（编码/拆字/拼音）供悬停提示
-    pub(crate) reverse: wind_reverse::ReverseLookup,
+    /// 候选反查（编码/拆字/拼音）供悬停提示与加词出码；拆字段随主码表方案
+    /// 热重载（见 `sync_chaizi_assets`），拼音段启动加载后不变。
+    pub(crate) reverse: std::sync::RwLock<wind_reverse::ReverseLookup>,
+    /// 拆字资产当前生效状态（库解析路径 / 已下发字根字体），reload 变更检测用。
+    pub(crate) chaizi_assets: Mutex<ChaiziAssets>,
     /// 标点配对跟踪栈（用于智能跳过）；中/英配对表在 rt bundle 内。
     pub(crate) pair_tracker: Mutex<wind_transform::pair_tracker::PairTracker>,
     /// 最近一次有效光标坐标 (x,y,height)；用于无效坐标时回退，避免候选窗跑到左上角
@@ -579,6 +582,14 @@ pub struct Coordinator {
     pub(crate) password_suppress_enabled: std::sync::atomic::AtomicBool,
     /// 输入诊断 HUD 是否可见（Task 6/7 接线；本任务先占位默认 false）。
     pub(crate) input_diag_hud_visible: std::sync::atomic::AtomicBool,
+}
+
+/// 拆字资产当前生效状态：库的解析后绝对路径 + 已下发的字根字体（路径, DWrite 家族名）。
+/// 变更检测用——库变了才重载反查表，字体变了才重发（渲染端每次 set 都重建字体集）。
+#[derive(Default)]
+pub(crate) struct ChaiziAssets {
+    pub(crate) db: Option<std::path::PathBuf>,
+    pub(crate) font: Option<(String, String)>,
 }
 
 /// 短语候选权重基准（高于普通候选，使短语展开排在前列）
@@ -750,19 +761,9 @@ impl Coordinator {
         let _ = coordinator
             .ui_tx
             .send(UiCommand::SetTooltipDelay(rt0.config.ui.tooltip.delay));
-        // 拆字字根字体（PUA 字根渲染）：路径 + DWrite 家族名取自主码表方案 [engine.chaizi]，存在才发。
-        if let (Some(dir), Some(chaizi)) =
-            (data_dir.as_deref(), coordinator.engine_mgr.chaizi_spec())
-            && !chaizi.font_path.is_empty()
-        {
-            let font = dir.join("schemas").join(&chaizi.font_path);
-            if font.is_file() {
-                let _ = coordinator.ui_tx.send(UiCommand::SetTooltipChaiziFont {
-                    path: font.to_string_lossy().into_owned(),
-                    family: chaizi.font_family.clone(),
-                });
-            }
-        }
+        // 拆字字根字体（PUA 字根渲染）：路径 + DWrite 家族名取自主码表方案 [engine.chaizi]。
+        // 库已在 build 内加载，此处仅补发字体（sync 按变更检测，重复调用幂等）。
+        coordinator.sync_chaizi_assets();
         // 统一应用外观项（幂等）：补齐上面手动块未含的候选字体族 / 翻页栏 / 页码 / 字号跟随主题，
         // 使首次启动即按 config 应用（与 reload_user_config 同一路径）。
         coordinator.apply_ui_config();
@@ -931,11 +932,21 @@ impl Coordinator {
             info!("Loaded common chars table");
         }
 
-        // 候选反查表（拆字/拼音）：拆字库路径取自主码表方案 [engine.chaizi].db_path（相对 schemas/）。
+        // 候选反查表（拆字/拼音）：拆字库路径取自主码表方案 [engine.chaizi].db_path（相对 schemas/，
+        // 用户方案目录优先——第三方方案的拆字库只在用户目录下）。
         let chaizi_db = engine_mgr
             .chaizi_spec()
             .filter(|c| !c.db_path.is_empty())
-            .and_then(|c| data_dir.map(|d| d.join("schemas").join(&c.db_path)));
+            .and_then(|c| {
+                let p = Config::resolve_schema_resource(data_dir, &c.db_path);
+                if p.is_none() {
+                    warn!(
+                        "拆字库不存在（用户/系统 schemas 目录均未找到）: {}",
+                        c.db_path
+                    );
+                }
+                p
+            });
         let reverse = wind_reverse::ReverseLookup::load(data_dir, chaizi_db.as_deref());
         if !reverse.is_empty() {
             info!("Loaded reverse-lookup (chaizi/pinyin)");
@@ -1053,7 +1064,11 @@ impl Coordinator {
             s2t: Mutex::new(s2t),
             common_chars,
             toolbar_positions: Mutex::new(toolbar_positions_init),
-            reverse,
+            reverse: std::sync::RwLock::new(reverse),
+            chaizi_assets: Mutex::new(ChaiziAssets {
+                db: chaizi_db,
+                font: None, // 字体在 new() 经 sync_chaizi_assets 下发（headless 无 UI 不发）
+            }),
             pair_tracker: Mutex::new(wind_transform::pair_tracker::PairTracker::new()),
             last_valid_caret: Mutex::new((0, 0, 0)),
             pending_first_show: Mutex::new(false),
@@ -1382,6 +1397,52 @@ impl Coordinator {
     /// 轻量项（标点/智能符号/候选数/热键/配对/导航键等）即时生效；重型项（引擎/方案/
     /// 词典/字体）当前不在 bundle 内，需重启——为不打断使用，这里统一返回 false，
     /// 由调用方/用户按需重启。
+    /// 同步拆字资产到当前主码表方案（`[engine.chaizi]`）：库路径变了才重载反查表拆字段
+    /// （含变为无配置时清空释放内存），字根字体变了才重发（渲染端每次 set 都重建字体集，
+    /// 勿重复下发）。资源相对路径按「用户方案目录优先、回落系统数据目录」解析（与方案文件同规则）。
+    pub(crate) fn sync_chaizi_assets(&self) {
+        let data_dir = Config::data_dir();
+        let spec = self.engine_mgr.chaizi_spec();
+        let new_db = spec
+            .as_ref()
+            .filter(|c| !c.db_path.is_empty())
+            .and_then(|c| {
+                let p = Config::resolve_schema_resource(data_dir.as_deref(), &c.db_path);
+                if p.is_none() {
+                    warn!(
+                        "拆字库不存在（用户/系统 schemas 目录均未找到）: {}",
+                        c.db_path
+                    );
+                }
+                p
+            });
+        let new_font = spec
+            .as_ref()
+            .filter(|c| !c.font_path.is_empty())
+            .and_then(|c| {
+                Config::resolve_schema_resource(data_dir.as_deref(), &c.font_path)
+                    .map(|p| (p.to_string_lossy().into_owned(), c.font_family.clone()))
+            });
+        let mut assets = self.chaizi_assets.lock().unwrap_or_else(|e| e.into_inner());
+        if assets.db != new_db {
+            self.reverse
+                .write()
+                .unwrap_or_else(|e| e.into_inner())
+                .reload_chaizi(new_db.as_deref());
+            assets.db = new_db;
+        }
+        if new_font != assets.font {
+            // 变为 None 时仅不再重发（字体集无撤销接口；旧字体仅影响 PUA 段渲染，无害）。
+            if let Some((path, family)) = &new_font {
+                let _ = self.ui_tx.send(UiCommand::SetTooltipChaiziFont {
+                    path: path.clone(),
+                    family: family.clone(),
+                });
+            }
+            assets.font = new_font;
+        }
+    }
+
     pub fn reload_user_config(&self) -> bool {
         match Config::load(Config::data_dir().as_deref()) {
             Ok(cfg) => {
@@ -1402,6 +1463,8 @@ impl Coordinator {
                 if schema_dirty {
                     // 热重建方案集：清输入缓冲、刷新工具栏/状态，免重启切换方案。
                     self.engine_mgr.reload_from_config(&new_cfg);
+                    // 主码表可能变更：拆字库/字根字体随之切换（变更检测，未变不动）。
+                    self.sync_chaizi_assets();
                     {
                         let mut s = self.state.lock().unwrap_or_else(|e| e.into_inner());
                         s.input_buffer.clear();
@@ -1983,6 +2046,8 @@ impl Coordinator {
         } else {
             None
         };
+        // 反查表读锁在候选循环外取一次（写方仅 sync_chaizi_assets 的热重载路径）。
+        let reverse = self.reverse.read().unwrap_or_else(|e| e.into_inner());
         let items: Vec<CandidateItem> = state.candidates[start..end]
             .iter()
             .enumerate()
@@ -1993,7 +2058,7 @@ impl Coordinator {
                 let disp = cand_cfg.truncate_display(&full);
                 // 反查提示按截断后文本生成：超长候选（如长短语）逐字反查会撑爆气泡且显示不全，
                 // 只提示实际显示出的字（… 为非 CJK，tooltip_for 自动滤除，不影响反查内容）。
-                let mut tooltip = self.reverse.tooltip_for(&disp, &tip_opts);
+                let mut tooltip = reverse.tooltip_for(&disp, &tip_opts);
                 // 调试段：独立一行 [调试] + 来源/方案/编码/权重/序/词频。全关时不再兜底回填编码
                 // （tooltip 各 provider 全关即真正为空，不显示气泡）。
                 if let Some(ctx) = &dbg_ctx {

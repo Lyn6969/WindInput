@@ -833,13 +833,14 @@ impl Coordinator {
             .schema_engine_type(schema)
             .map(|t| t == "pinyin")
             .unwrap_or(false);
+        let reverse = self.reverse.read().unwrap_or_else(|e| e.into_inner());
         let code = if is_pinyin {
             // 优先词级消歧（多音字按词典权重），引擎无果时回退逐字反查表。
             self.engine_mgr
                 .generate_word_pinyin(schema, text)
-                .unwrap_or_else(|| self.reverse.gen_pinyin(text))
+                .unwrap_or_else(|| reverse.gen_pinyin(text))
         } else {
-            self.reverse.wubi_word_code(text)
+            reverse.wubi_word_code(text)
         };
         Ok(json!(code))
     }
@@ -851,7 +852,12 @@ impl Coordinator {
         self.engine_mgr
             .generate_word_pinyin(&active, text)
             .or_else(|| self.engine_mgr.generate_word_pinyin("pinyin", text))
-            .unwrap_or_else(|| self.reverse.gen_pinyin(text))
+            .unwrap_or_else(|| {
+                self.reverse
+                    .read()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .gen_pinyin(text)
+            })
     }
 
     fn web_freq_list_paged(&self, params: &Value) -> anyhow::Result<Value> {

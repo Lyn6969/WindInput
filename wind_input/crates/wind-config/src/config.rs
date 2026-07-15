@@ -1730,6 +1730,24 @@ impl Config {
         }
     }
 
+    /// 解析方案附属资源（拆字库/字根字体等 `[engine.chaizi]` 相对路径）：与方案文件同规则，
+    /// 用户方案目录（`user_config_dir()/schemas/`）优先，回落系统数据目录 `data_dir/schemas/`。
+    /// 第三方方案装在用户目录，其资源只在用户目录下——只拼 data_dir 会永远找不到。
+    /// 两处均不存在返回 None（调用方自行告警）。
+    pub fn resolve_schema_resource(data_dir: Option<&Path>, rel: &str) -> Option<PathBuf> {
+        if rel.is_empty() {
+            return None;
+        }
+        if let Some(user) = Self::user_config_dir() {
+            let p = user.join("schemas").join(rel);
+            if p.is_file() {
+                return Some(p);
+            }
+        }
+        let p = data_dir?.join("schemas").join(rel);
+        p.is_file().then_some(p)
+    }
+
     /// 把单个配置项**部分合并**写入用户层 `config.toml`（%APPDATA%/WindInput/config.toml）。
     ///
     /// 只改 `path` 指定的项、保留用户文件里其它已有项，**不写入未改动的默认/系统段**——
