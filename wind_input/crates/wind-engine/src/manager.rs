@@ -89,10 +89,10 @@ pub struct EngineManager {
     override_dir: Option<std::path::PathBuf>,
     /// 主码表方案 id(拼音反查码源):config.schema.primary_codetable 解析后(可空)。构造/重载时更新。
     primary_codetable: Mutex<String>,
-    /// 码表反查索引缓存:方案 id → (汉字/词 → 实际编码)。供拼音编码提示与悬停 [编码] 段按词查实际码。
-    /// 懒建(首次需要时按方案词库全量构建),invalidate/reload 时清空。
+    /// 码表反查索引缓存:方案 id → (汉字/词 → 全部编码,码长升序)。供拼音编码提示与悬停
+    /// [编码] 段按词查实际码。懒建(首次需要时按方案词库全量构建),invalidate/reload 时清空。
     /// 内存护栏:每份索引可达数万词条,最多缓存两份(见 `reverse_index_for`)。
-    reverse_index: Mutex<HashMap<String, Arc<HashMap<String, String>>>>,
+    reverse_index: Mutex<HashMap<String, Arc<HashMap<String, Vec<String>>>>>,
     /// 全局拼音配置（fuzzy/show_code_hint/...）。Mutex 以支持热重载。
     pinyin: Mutex<wind_config::config::PinyinGlobalConfig>,
     /// 双拼韵母键集缓存：(已缓存的活跃方案 id, Option<HashSet<u8>>)。
@@ -326,22 +326,29 @@ impl EngineManager {
             .ok()
     }
 
-    /// 拼音方案编码提示:返回主码表中 `text` 实际对应的编码(多码取权重/码长/字典序首位),
-    /// 不存在返回空。对齐 Go `manager_convert.go` 的 ApplyCodeHintsToCandidates——用主码表
-    /// **反向索引**取实际码,而非按字生成码再校验(后者生成码常与码表实际码不一致,导致全被拒)。
+    /// 拼音方案编码提示:返回主码表中 `text` 实际对应的编码(多码取最长者=全码,简码可能
+    /// 被一级简码等占用),不存在返回空。对齐 Go `manager_convert.go` 的
+    /// ApplyCodeHintsToCandidates——用主码表**反向索引**取实际码,而非按字生成码再校验
+    /// (后者生成码常与码表实际码不一致,导致全被拒)。
     pub fn codetable_reverse_hint(&self, text: &str) -> String {
         let primary = self
             .primary_codetable
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .clone();
-        self.word_code_in(&primary, text)
+        if primary.is_empty() {
+            return String::new();
+        }
+        self.reverse_index_for(&primary)
+            .get(text)
+            .and_then(|codes| codes.last().cloned())
+            .unwrap_or_default()
     }
 
-    /// 悬停提示 [编码] 段的编码来源方案 id:码表方案=自身(显示自己的完整编码);
-    /// 混输=其主码表成员;拼音/其他=全局主码表方案。空=无来源(编码段不显示)。
+    /// 编码/拆字的来源方案 id:码表方案=自身(其它方案的编码/拆字对本方案无意义);
+    /// 混输=其主码表成员;拼音/其他=全局主码表方案。空=无来源(编码段/拆字不显示)。
     /// 按已加载引擎的内存类型判定,不读盘(此路径每次候选推送都会走)。
-    pub fn tooltip_code_schema(&self) -> String {
+    pub fn code_source_schema(&self) -> String {
         let active = self.active_schema_id();
         match self.active_engine().map(|e| e.engine_type()) {
             Some(EngineType::CodeTable) => active,
@@ -354,22 +361,23 @@ impl EngineManager {
         }
     }
 
-    /// 查 `schema_id` 方案词库中 `text` 的实际编码(多码取权重/码长/字典序首位);
-    /// 方案 id 为空或词不在词库返回空——不按取码规则生成,生成码常与词库实际码不一致。
-    pub fn word_code_in(&self, schema_id: &str, text: &str) -> String {
+    /// 查 `schema_id` 方案词库中 `text` 的**全部**实际编码,按码长升序以 `/` 连接
+    /// (如 `a/ab/abc`,供悬停 [编码] 段);方案 id 为空或词不在词库返回空——
+    /// 不按取码规则生成,生成码常与词库实际码不一致。
+    pub fn word_codes_in(&self, schema_id: &str, text: &str) -> String {
         if schema_id.is_empty() {
             return String::new();
         }
         self.reverse_index_for(schema_id)
             .get(text)
-            .cloned()
+            .map(|codes| codes.join("/"))
             .unwrap_or_default()
     }
 
     /// 取 `schema_id` 的反查索引,缺则全量构建并缓存。
     /// 内存护栏:最多保留两份——本次请求方 + 全局主码表(悬停查活跃码表、拼音提示查主码表,
     /// 两者常为同一方案;方案切换的残留索引随下次构建清退)。
-    fn reverse_index_for(&self, schema_id: &str) -> Arc<HashMap<String, String>> {
+    fn reverse_index_for(&self, schema_id: &str) -> Arc<HashMap<String, Vec<String>>> {
         // primary 在 reverse_index 锁外取,避免嵌套锁。
         let primary = self
             .primary_codetable
@@ -386,8 +394,8 @@ impl EngineManager {
         m
     }
 
-    /// 按方案全量构建反查索引(汉字/词 → 实际编码)。失败返回空表。
-    fn build_reverse_index_for(&self, schema_id: &str) -> HashMap<String, String> {
+    /// 按方案全量构建反查索引(汉字/词 → 全部编码,码长升序)。失败返回空表。
+    fn build_reverse_index_for(&self, schema_id: &str) -> HashMap<String, Vec<String>> {
         let Some(data_dir) = self.data_dir.as_deref() else {
             return HashMap::new();
         };
@@ -1232,19 +1240,15 @@ impl EngineManager {
         global.resolved(schema.as_ref().map(|s| &s.engine.codetable))
     }
 
-    /// 主码表方案的拆字配置（`[engine.chaizi]`：db/font 路径 + DWrite 家族名）。
-    /// 拆字反查表与字根字体随主码表方案下发；无配置返回 None。路径相对 `data/schemas/`。
+    /// 拆字配置（`[engine.chaizi]`：db/font 路径 + DWrite 家族名）。来源方案与编码段
+    /// 同源（`code_source_schema`）：码表方案只用**自己的**拆字配置——没配置就没有拆字，
+    /// 不回落主码表（看其它方案的拆字对本方案无意义）；拼音回落全局主码表、混输取其
+    /// 主码表成员。无配置返回 None。路径相对 `schemas/`（用户目录优先）。
     pub fn chaizi_spec(&self) -> Option<wind_config::schema::ChaiziSpec> {
-        let primary = self
-            .primary_codetable
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .clone();
-        let id = if primary.is_empty() {
-            self.active_schema_id()
-        } else {
-            primary
-        };
+        let id = self.code_source_schema();
+        if id.is_empty() {
+            return None;
+        }
         let schema =
             Self::read_schema(&id, self.data_dir.as_deref(), self.override_dir.as_deref())?;
         let c = schema.engine.chaizi;

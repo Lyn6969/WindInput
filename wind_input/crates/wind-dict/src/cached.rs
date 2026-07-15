@@ -167,26 +167,23 @@ impl CachedDict {
         }
     }
 
-    /// 构建反查索引:汉字/词 → 实际编码。同一词多码时取「权重降序→码长降序→码字典序升序」
-    /// 首位(对齐 Go `CodeTable.BuildReverseIndex`)。供拼音方案显示「该词在主码表里实际怎么打」,
-    /// 避免按字生成码却在码表中打不出的错配。
-    pub fn build_reverse_index(&self) -> std::collections::HashMap<String, String> {
+    /// 构建反查索引:汉字/词 → 词库中的**全部**编码,按「码长升序→字典序升序」排列并去重。
+    /// 供悬停 [编码] 段显示完整打法列表(如 `a/ab/abc`)与拼音编码提示(取末位=最长码,
+    /// 全码最稳——简码可能被一级简码等占用)。取词库实际码,避免按字生成码却打不出的错配。
+    pub fn build_reverse_index(&self) -> std::collections::HashMap<String, Vec<String>> {
         use std::collections::HashMap;
-        let mut best: HashMap<String, (String, i32)> = HashMap::new();
-        self.for_each_entry(&mut |code, text, weight| {
-            let replace = match best.get(text) {
-                Some((bc, bw)) => {
-                    weight > *bw
-                        || (weight == *bw && code.len() > bc.len())
-                        || (weight == *bw && code.len() == bc.len() && code < bc.as_str())
-                }
-                None => true,
-            };
-            if replace {
-                best.insert(text.to_string(), (code.to_string(), weight));
-            }
+        let mut idx: HashMap<String, Vec<String>> = HashMap::new();
+        self.for_each_entry(&mut |code, text, _weight| {
+            idx.entry(text.to_string())
+                .or_default()
+                .push(code.to_string());
         });
-        best.into_iter().map(|(t, (c, _))| (t, c)).collect()
+        for codes in idx.values_mut() {
+            codes.sort_by(|a, b| a.len().cmp(&b.len()).then_with(|| a.cmp(b)));
+            codes.dedup();
+            codes.shrink_to_fit();
+        }
+        idx
     }
 
     /// 总条目数
@@ -207,23 +204,30 @@ mod tests {
     use super::*;
     use crate::codetable::CodetableDict;
 
-    /// 反查索引选码规则:权重降序 → 码长降序 → 码字典序升序(对齐 Go BuildReverseIndex)。
+    /// 反查索引:同词收集全部码,码长升序 → 字典序升序,去重。
     #[test]
-    fn reverse_index_picks_by_weight_then_len_then_lex() {
+    fn reverse_index_collects_all_codes_sorted_by_len() {
         let mut d = CodetableDict::empty();
-        // 「工」两码同权重 → 取较长码 aaaa。
-        d.merge_single("a".into(), "工".into(), 100, 0);
-        d.merge_single("aaaa".into(), "工".into(), 100, 1);
-        // 「中」唯一码。
+        // 「工」简码+全码 → 短码在前。
+        d.merge_single("aaaa".into(), "工".into(), 100, 0);
+        d.merge_single("a".into(), "工".into(), 100, 1);
+        // 「中」唯一码 + 重复条目去重。
         d.merge_single("k".into(), "中".into(), 50, 2);
-        // 「大」两码不同权重 → 取高权重 ddd(无视码长)。
-        d.merge_single("dd".into(), "大".into(), 10, 3);
-        d.merge_single("ddd".into(), "大".into(), 99, 4);
+        d.merge_single("k".into(), "中".into(), 40, 3);
+        // 「大」同长两码 → 字典序。
+        d.merge_single("de".into(), "大".into(), 10, 4);
+        d.merge_single("dd".into(), "大".into(), 99, 5);
         let cd = CachedDict::Memory(d);
         let idx = cd.build_reverse_index();
-        assert_eq!(idx.get("工").map(String::as_str), Some("aaaa"));
-        assert_eq!(idx.get("中").map(String::as_str), Some("k"));
-        assert_eq!(idx.get("大").map(String::as_str), Some("ddd"));
+        assert_eq!(
+            idx.get("工"),
+            Some(&vec!["a".to_string(), "aaaa".to_string()])
+        );
+        assert_eq!(idx.get("中"), Some(&vec!["k".to_string()]));
+        assert_eq!(
+            idx.get("大"),
+            Some(&vec!["dd".to_string(), "de".to_string()])
+        );
         assert_eq!(idx.get("无"), None);
     }
 }

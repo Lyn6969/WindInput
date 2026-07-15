@@ -1397,9 +1397,11 @@ impl Coordinator {
     /// 轻量项（标点/智能符号/候选数/热键/配对/导航键等）即时生效；重型项（引擎/方案/
     /// 词典/字体）当前不在 bundle 内，需重启——为不打断使用，这里统一返回 false，
     /// 由调用方/用户按需重启。
-    /// 同步拆字资产到当前主码表方案（`[engine.chaizi]`）：库路径变了才重载反查表拆字段
-    /// （含变为无配置时清空释放内存），字根字体变了才重发（渲染端每次 set 都重建字体集，
-    /// 勿重复下发）。资源相对路径按「用户方案目录优先、回落系统数据目录」解析（与方案文件同规则）。
+    /// 同步拆字资产到当前来源方案（`chaizi_spec`：码表=自身、混输=其主码表成员、拼音=全局
+    /// 主码表，与编码段同源）：库路径变了才重载反查表拆字段（含变为无配置时清空释放内存），
+    /// 字根字体变了才重发（渲染端每次 set 都重建字体集，勿重复下发）。调用点=启动、方案切换
+    /// （菜单/循环/设置页）、reload_user_config(schema_dirty)。资源相对路径按「用户方案目录
+    /// 优先、回落系统数据目录」解析（与方案文件同规则）。
     pub(crate) fn sync_chaizi_assets(&self) {
         let data_dir = Config::data_dir();
         let spec = self.engine_mgr.chaizi_spec();
@@ -2048,12 +2050,25 @@ impl Coordinator {
         };
         // 反查表读锁在候选循环外取一次（写方仅 sync_chaizi_assets 的热重载路径）。
         let reverse = self.reverse.read().unwrap_or_else(|e| e.into_inner());
-        // [编码] 段来源方案（循环外解析一次）：码表方案=自身完整编码、混输=其主码表成员、
-        // 拼音=全局主码表。编码按词查方案词库反查索引（word_code_in），不按取码规则生成。
+        // [编码] 段来源方案（循环外解析一次）：码表方案=自身全部编码（码长升序 a/ab/abc）、
+        // 混输=其主码表成员、拼音=全局主码表。编码按词查方案词库反查索引（word_codes_in），
+        // 不按取码规则生成。候选并非用该编码方案直接输入时（来源方案≠活跃方案，或处于
+        // 临时拼音/快捷输入反查模式）标题带来源方案名：[编码(五笔)]。
         let code_schema = tip_cfg
             .code_enabled
-            .then(|| self.engine_mgr.tooltip_code_schema())
+            .then(|| self.engine_mgr.code_source_schema())
             .filter(|s| !s.is_empty());
+        let code_source_name = code_schema.as_deref().and_then(|sid| {
+            let indirect = force_hint || sid != self.engine_mgr.active_schema_id();
+            indirect.then(|| {
+                let name = self.engine_mgr.schema_name(sid);
+                if name.is_empty() {
+                    sid.to_string()
+                } else {
+                    name
+                }
+            })
+        });
         let items: Vec<CandidateItem> = state.candidates[start..end]
             .iter()
             .enumerate()
@@ -2067,9 +2082,14 @@ impl Coordinator {
                 // [编码] 段按候选**完整原文**查词库（截断/繁化文本词库里没有；查不到=None 不显示）。
                 let word_code = code_schema
                     .as_deref()
-                    .map(|sid| self.engine_mgr.word_code_in(sid, &c.text))
+                    .map(|sid| self.engine_mgr.word_codes_in(sid, &c.text))
                     .filter(|s| !s.is_empty());
-                let mut tooltip = reverse.tooltip_for(&disp, &tip_opts, word_code.as_deref());
+                let mut tooltip = reverse.tooltip_for(
+                    &disp,
+                    &tip_opts,
+                    word_code.as_deref(),
+                    code_source_name.as_deref(),
+                );
                 // 调试段：独立一行 [调试] + 来源/方案/编码/权重/序/词频。全关时不再兜底回填编码
                 // （tooltip 各 provider 全关即真正为空，不显示气泡）。
                 if let Some(ctx) = &dbg_ctx {

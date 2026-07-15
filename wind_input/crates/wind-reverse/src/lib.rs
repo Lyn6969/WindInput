@@ -384,14 +384,17 @@ impl ReverseLookup {
     /// - 多行或 always_expand → `[标签]` 标题行 + 逐行内容
     ///
     /// 拆字+拼音同时开启时融合为 `[拆字 / 拼音]`，每行用 `\t` 分隔两列。
-    /// 编码段（`word_code`）由调用方按方案词库反查后传入：码表方案=自身完整编码、
-    /// 拼音/混输=主码表编码；词不在词库时传 None 不显示——本层不按取码规则生成，
-    /// 生成码常与词库实际码不一致（会提示出打不出的码）。
+    /// 编码段（`word_code`）由调用方按方案词库反查后传入：码表方案=自身全部编码
+    /// （码长升序 `/` 连接，如 `a/ab/abc`）、拼音/混输=主码表编码；词不在词库时传
+    /// None 不显示——本层不按取码规则生成，生成码常与词库实际码不一致（会提示出打不出的码）。
+    /// `code_source`：编码来源方案名——候选并非用该编码方案直接输入时（拼音/临时拼音/
+    /// 混输反查主码表）传入，标题显示为 `[编码(五笔)]`；None 显示 `[编码]`。
     pub fn tooltip_for(
         &self,
         text: &str,
         opts: &TooltipOptions,
         word_code: Option<&str>,
+        code_source: Option<&str>,
     ) -> String {
         if self.is_empty() && word_code.is_none() {
             return String::new();
@@ -408,8 +411,12 @@ impl ReverseLookup {
         if opts.code
             && let Some(code) = word_code.filter(|c| !c.is_empty())
         {
+            let label = match code_source.filter(|s| !s.is_empty()) {
+                Some(src) => format!("编码({src})"),
+                None => "编码".to_string(),
+            };
             sections.push(Section {
-                label: "编码".into(),
+                label,
                 lines: vec![code.to_string()],
                 always_expand: true, // 强制 [编码] 标题行
             });
@@ -564,7 +571,7 @@ mod tests {
     fn test_tooltip_default_pinyin_and_code() {
         let rl = sample_rl();
         // 编码由调用方按方案词库反查传入（词级）
-        let t = rl.tooltip_for("好人", &TooltipOptions::default(), Some("vbww"));
+        let t = rl.tooltip_for("好人", &TooltipOptions::default(), Some("vbww"), None);
         // [拼音] 标题行
         assert!(t.contains("[拼音]"), "应有 [拼音] 标题: {t}");
         assert!(t.contains("好：hǎo/hào"), "默认 heteronyms 显示全读音: {t}");
@@ -576,7 +583,7 @@ mod tests {
         assert!(!t.contains("拆字"), "默认不含拆字: {t}");
         // 纯 ASCII 无反查（即使传了编码）
         assert_eq!(
-            rl.tooltip_for("abc", &TooltipOptions::default(), Some("x")),
+            rl.tooltip_for("abc", &TooltipOptions::default(), Some("x"), None),
             ""
         );
     }
@@ -584,14 +591,14 @@ mod tests {
     #[test]
     fn test_tooltip_single_char_code() {
         let rl = sample_rl();
-        let t = rl.tooltip_for("好", &TooltipOptions::default(), Some("vbg"));
+        let t = rl.tooltip_for("好", &TooltipOptions::default(), Some("vbg"), None);
         // 单字编码=词库实际全码，以 [编码] 标题格式独立成段
         assert!(
             t.contains("[编码]") && t.contains("vbg"),
             "单字编码带标题: {t}"
         );
         // 调用方未传编码（词不在方案词库）→ 无编码段，不臆测生成
-        let t2 = rl.tooltip_for("好", &TooltipOptions::default(), None);
+        let t2 = rl.tooltip_for("好", &TooltipOptions::default(), None, None);
         assert!(!t2.contains("[编码]"), "无词库码不显示编码段: {t2}");
     }
 
@@ -606,7 +613,7 @@ mod tests {
             max_readings: 0,
             chaizi: false,
         };
-        let t = rl.tooltip_for("好", &opts, Some("vbg"));
+        let t = rl.tooltip_for("好", &opts, Some("vbg"), None);
         assert!(
             t.contains("拼音") && !t.contains("编码") && !t.contains("拆字"),
             "{t}"
@@ -617,8 +624,22 @@ mod tests {
     fn test_tooltip_code_only_with_empty_tables() {
         // 反查表全空（无拆字库/拼音表）但调用方传入词库码 → 仍显示编码段
         let rl = ReverseLookup::default();
-        let t = rl.tooltip_for("好", &TooltipOptions::default(), Some("vbg"));
+        let t = rl.tooltip_for("好", &TooltipOptions::default(), Some("vbg"), None);
         assert_eq!(t, "[编码]\nvbg", "空表仅编码段: {t}");
+    }
+
+    #[test]
+    fn test_tooltip_code_source_label() {
+        // 编码来源方案名标注：拼音/临时拼音下编码来自主码表 → 标题带方案名
+        let rl = ReverseLookup::default();
+        let t = rl.tooltip_for("好", &TooltipOptions::default(), Some("vbg"), Some("五笔"));
+        assert_eq!(t, "[编码(五笔)]\nvbg", "标题应带来源方案名: {t}");
+        // 多码按长度排列原样显示
+        let t2 = rl.tooltip_for("好", &TooltipOptions::default(), Some("v/vb/vbg"), None);
+        assert_eq!(t2, "[编码]\nv/vb/vbg", "多码列表原样显示: {t2}");
+        // 空来源名等同无标注
+        let t3 = rl.tooltip_for("好", &TooltipOptions::default(), Some("vbg"), Some(""));
+        assert_eq!(t3, "[编码]\nvbg", "空来源名不加括注: {t3}");
     }
 
     #[test]
@@ -629,14 +650,14 @@ mod tests {
             heteronyms: false,
             ..Default::default()
         };
-        let t = rl.tooltip_for("好", &opts, None);
+        let t = rl.tooltip_for("好", &opts, None, None);
         assert!(t.contains("好：hǎo") && !t.contains("hào"), "仅首音: {t}");
         // max_readings=1 → 截断到 1
         let opts2 = TooltipOptions {
             max_readings: 1,
             ..Default::default()
         };
-        let t2 = rl.tooltip_for("好", &opts2, None);
+        let t2 = rl.tooltip_for("好", &opts2, None, None);
         assert!(t2.contains("好：hǎo") && !t2.contains("hào"), "截断: {t2}");
     }
 
@@ -649,7 +670,7 @@ mod tests {
             chaizi: true,
             ..Default::default()
         };
-        let t = rl.tooltip_for("好", &opts, None);
+        let t = rl.tooltip_for("好", &opts, None, None);
         // 多行 always_expand → [拆字] 标题 + 内容行
         assert_eq!(t, "[拆字]\n好：女子 [vbg]", "拆字段含字根+编码: {t}");
     }
@@ -664,7 +685,7 @@ mod tests {
             chaizi: true,
             ..Default::default()
         };
-        let t = rl.tooltip_for("好", &opts, Some("vbg"));
+        let t = rl.tooltip_for("好", &opts, Some("vbg"), None);
         assert!(t.contains("[编码]"), "整词编码段应显示: {t}");
         assert!(t.contains("[拆字]"), "拆字标题: {t}");
         assert!(t.contains("好：女子 [vbg]"), "逐字编码内嵌于拆字行: {t}");
@@ -684,7 +705,7 @@ mod tests {
             chaizi: true,
             ..Default::default()
         };
-        let t = rl.tooltip_for("好", &opts, None);
+        let t = rl.tooltip_for("好", &opts, None, None);
         // 拆字+拼音融合为 [拆字 / 拼音]
         assert!(t.contains("[拆字 / 拼音]"), "融合标题: {t}");
         // 拆字行 + \t + 拼音读音（剥离"字："前缀）
@@ -712,7 +733,7 @@ mod tests {
         let mut rl = ReverseLookup::default();
         rl.pinyin
             .insert('重', vec!["zhòng".to_string(), "chóng".to_string()]);
-        let t = rl.tooltip_for("重", &TooltipOptions::default(), None);
+        let t = rl.tooltip_for("重", &TooltipOptions::default(), None, None);
         assert!(t.contains("zhòng/chóng"), "多音字读音应以 / 连接: {t}");
     }
 

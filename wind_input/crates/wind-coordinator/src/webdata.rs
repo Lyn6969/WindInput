@@ -158,6 +158,9 @@ impl Coordinator {
             "schema.active" => Ok(json!({ "id": self.engine_mgr.active_schema_id() })),
             "schema.setActive" => {
                 let ok = self.engine_mgr.switch_schema(str_param(params, "id")?);
+                if ok {
+                    self.sync_chaizi_assets(); // 拆字库/字根字体随活跃方案切换
+                }
                 Ok(json!({ "ok": ok }))
             }
             // ── 方案配置编辑（三层合并：默认 ← 方案文件 ← override 层）──
