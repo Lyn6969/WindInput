@@ -14,7 +14,7 @@
 #   - 全构建产物落【产品根】build/(release) 或 build_dev/(dev); 内容 == 安装内容
 #
 # 命令 (菜单与命令行直调同一套; 前缀 d=dev, p=push/部署, m=单模块):
-#   1            Release 全构建: wind_input + tsf(x64/x86) + portable + 词库数据 → build/
+#   1            Release 全构建: wind_input + tsf(x64/x86) + setting + portable + 词库数据 → build/
 #   d1           Dev 全构建 → build_dev/
 #   m1 / dm1     仅 tsf (x64+x86)            release / dev
 #   m2 / dm2     仅 wind_input (核心 exe)     release / dev
@@ -836,17 +836,25 @@ function New-InstallerConfig ([string]$profile, [string]$outdir, [string]$cfgPat
     if ($profile -eq "dev") {
         $id = "WindInputDev"; $disp = "清风输入法 (开发版)"; $mainExe = "wind_input_dev.exe"
         $menu = "清风输入法 (开发版)"; $title = "清风输入法 (开发版) 安装向导"; $proto = "windinputdev"
-        $procs = '["wind_portable", "wind_input_dev"]'
+        $settingExe = "wind_setting_dev.exe"
+        $procs = '["wind_setting_dev", "wind_portable", "wind_input_dev"]'
         $acl   = '["wind_tsf_dev.dll", "wind_tsf_x86_dev.dll"]'
         $clsid = "{99C2DEB0-5C57-45A2-9C63-FB54B34FD90A}"; $prof = "{99C2DEB1-5C57-45A2-9C63-FB54B34FD90A}"
         $dllX64 = "wind_tsf_dev.dll"; $dllX86 = "wind_tsf_x86_dev.dll"; $outName = "WindInputDev-Setup"
     } else {
         $id = "WindInput"; $disp = "清风输入法"; $mainExe = "wind_input.exe"
         $menu = "清风输入法"; $title = "清风输入法 安装向导"; $proto = "windinput"
-        $procs = '["wind_portable", "wind_input"]'
+        $settingExe = "wind_setting.exe"
+        $procs = '["wind_setting", "wind_portable", "wind_input"]'
         $acl   = '["wind_tsf.dll", "wind_tsf_x86.dll"]'
         $clsid = "{99C2EE30-5C57-45A2-9C63-FB54B34FD90A}"; $prof = "{99C2EE31-5C57-45A2-9C63-FB54B34FD90A}"
         $dllX64 = "wind_tsf.dll"; $dllX86 = "wind_tsf_x86.dll"; $outName = "WindInput-Setup"
+    }
+    # 设置程序为可选模块: ../wind-setting 不存在时 Build-Setting 会跳过, build/ 里就没有产物。
+    # 此时必须置空 setting_exe, 否则安装器会为不存在的文件建开始菜单快捷方式。
+    if (-not (Test-Path (Join-Path $outdir $settingExe))) {
+        Warn "未找到 $outdir\$settingExe, 本次打包不含设置程序 (setting_exe 置空)"
+        $settingExe = ""
     }
     $srcFwd  = $outdir.Replace('\', '/')
     $distFwd = $DistDir.Replace('\', '/')
@@ -861,7 +869,7 @@ version           = "$Version"
 publisher         = "清风输入法 项目"
 description       = "轻量开源输入法"
 main_exe          = "$mainExe"
-setting_exe       = ""
+setting_exe       = "$settingExe"
 start_menu_folder = "$menu"
 window_title      = "$title"
 url_protocol      = "$proto"
@@ -973,7 +981,7 @@ function Show-Menu {
     Write-Host "  WindInput 开发菜单  v$Version  (Windows/MSVC)" -ForegroundColor Cyan
     Write-Host "============================================`n" -ForegroundColor Cyan
     Write-Host "  全构建 (→ build/, 内容 == 部署内容):" -ForegroundColor Yellow
-    Write-Host "    1    Release 全构建: wind_input + tsf(x64/x86) + portable + 词库"
+    Write-Host "    1    Release 全构建: wind_input + tsf(x64/x86) + setting + portable + 词库"
     Write-Host "    d1   Dev 全构建 (→ build_dev/)"
     Write-Host "`n  单模块构建 (前缀 d = dev):" -ForegroundColor Yellow
     Write-Host "    m1   仅 tsf (x64+x86)                dm1"
