@@ -266,6 +266,7 @@ function Download-Dicts {
 
     $pinyinBase = "https://raw.githubusercontent.com/mozillazg/pinyin-data/master"
     Gray "pinyin-data (汉字拼音反查):"
+    Get-Dict "$pinyinBase/pinyin.txt"         "$pinyinData\pinyin.txt"         "全量底表(官方合成)" | Out-Null
     Get-Dict "$pinyinBase/kXHC1983.txt"       "$pinyinData\kXHC1983.txt"       "新华字典多音字" | Out-Null
     Get-Dict "$pinyinBase/kTGHZ2013.txt"      "$pinyinData\kTGHZ2013.txt"      "通用规范汉字"   | Out-Null
     Get-Dict "$pinyinBase/kMandarin_8105.txt" "$pinyinData\kMandarin_8105.txt" "8105 标准首音"  | Out-Null
@@ -362,7 +363,7 @@ function Do-GenData ([string]$outdir = $BuildDevDir) {
 
     # 生成汉字拼音反查表 (Rust 工具 gen_pinyin)
     $pinyinMap = "$CacheDir\pinyin-data\pinyin_map.txt"
-    if (Test-Path "$CacheDir\pinyin-data\kMandarin_8105.txt") {
+    if (Test-Path "$CacheDir\pinyin-data\pinyin.txt") {
         Say "生成汉字拼音反查表..."
         Push-Location $ProjectRoot
         try {

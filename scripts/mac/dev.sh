@@ -595,7 +595,7 @@ download_dicts() {
     local py="$CACHE_DIR/pinyin-data"
     local pybase="https://raw.githubusercontent.com/mozillazg/pinyin-data/master"
     info "pinyin-data (汉字拼音反查):"
-    for f in kXHC1983 kTGHZ2013 kMandarin_8105 overwrite; do get_dict "$pybase/$f.txt" "$py/$f.txt"; done
+    for f in pinyin kXHC1983 kTGHZ2013 kMandarin_8105 overwrite; do get_dict "$pybase/$f.txt" "$py/$f.txt"; done
 
     local oc="$CACHE_DIR/opencc/dictionaries"
     local ocbase="https://raw.githubusercontent.com/BYVoid/OpenCC/master/data/dictionary"
@@ -685,12 +685,12 @@ do_gendata() {
 
     # 生成汉字拼音反查表 (Rust 工具 gen_pinyin)。
     local pmap="$CACHE_DIR/pinyin-data/pinyin_map.txt"
-    if [[ -f "$CACHE_DIR/pinyin-data/kMandarin_8105.txt" ]]; then
+    if [[ -f "$CACHE_DIR/pinyin-data/pinyin.txt" ]]; then
         bold "==> 生成汉字拼音反查表"
         ( cd "$RUST_DIR" && cargo run -q -p wind-tools --bin gen_pinyin -- --src "$CACHE_DIR/pinyin-data" --out "$pmap" ) \
             || warn "拼音反查表生成失败 (候选拼音提示不可用)"
     else
-        warn "缺 .cache/pinyin-data/kMandarin_8105.txt, 拼音反查表不可用"
+        warn "缺 .cache/pinyin-data/pinyin.txt, 拼音反查表不可用"
     fi
 
     assemble_data

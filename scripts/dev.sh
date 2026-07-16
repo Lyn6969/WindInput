@@ -322,6 +322,7 @@ download_dicts() {
     mkdir -p "$pinyin_data"
     local PINYIN_BASE="https://raw.githubusercontent.com/mozillazg/pinyin-data/master"
     gray "pinyin-data (汉字拼音反查):"
+    download_file "$PINYIN_BASE/pinyin.txt"         "$pinyin_data/pinyin.txt"         "全量底表(官方合成)"
     download_file "$PINYIN_BASE/kXHC1983.txt"       "$pinyin_data/kXHC1983.txt"       "新华字典多音字"
     download_file "$PINYIN_BASE/kTGHZ2013.txt"      "$pinyin_data/kTGHZ2013.txt"      "通用规范汉字"
     download_file "$PINYIN_BASE/kMandarin_8105.txt" "$pinyin_data/kMandarin_8105.txt" "8105 标准首音"
@@ -670,7 +671,7 @@ do_gen_data() {
 
     # 生成汉字拼音反查表（Rust 工具 gen_pinyin）
     local pinyin_map_cache="$CACHE_DIR/pinyin-data/pinyin_map.txt"
-    if [ -f "$CACHE_DIR/pinyin-data/kMandarin_8105.txt" ]; then
+    if [ -f "$CACHE_DIR/pinyin-data/pinyin.txt" ]; then
         say "生成汉字拼音反查表..."
         ( cd "$RUST_WORKSPACE" && cargo run -q --bin gen_pinyin -- \
             --src "$CACHE_DIR/pinyin-data" \
