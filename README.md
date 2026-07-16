@@ -31,13 +31,13 @@
 
 从 [Releases](../../releases) 页面下载：
 
-- **Windows 安装包**：`WindInput-x.x.x-Setup.exe`，双击安装
-- **Windows 便携版**：`WindInput-x.x.x-Portable.zip`，解压即用，数据保存在程序目录
-- **macOS (alpha)**：`WindInput-x.x.x-macOS.pkg`，安装后在「系统设置 → 键盘 → 输入法」中添加
+- **Windows 安装包**：`WindInput-Setup-x.x.x.exe`，双击安装
 
-安装完成后，按 `Win + Space`（Windows）或 `⌃Space`（macOS）切换到清风输入法。
+安装完成后，按 `Win + Space` 切换到清风输入法。
 
-> 当前版本未做数字签名/苹果公证，安装时可能需要在系统安全设置中手动放行。
+> 当前版本未做数字签名，安装时可能需要在系统安全设置中手动放行。
+
+macOS 目前仅支持[从源码构建](#从源码构建)，暂未提供安装包。
 
 ## 仓库范围
 
