@@ -2,8 +2,9 @@
 # ============================================================================
 # pack-installer.sh — 把 WindInput 构建产物打包成自解压安装程序
 # ----------------------------------------------------------------------------
-# 全 Linux 流水线:交叉编译 wind-installer stub(x86_64-pc-windows-gnu)+ 原生
+# 全 Linux 流水线:交叉编译 wind-installer stub(x86_64-pc-windows-msvc)+ 原生
 # 构建 wind-packer(纯 IO,无需 wine),再 pack→bundle 出单文件 Setup.exe。
+# 输出名 WindInput-Setup-<版本>.exe,与 dev.ps1 本地打包口径一致。
 #
 # 前置:BUILD_DIR 内已含 wind_input.exe / wind_tsf.dll / wind_tsf_x86.dll / data/。
 #      Release workflow 还要求 wind_setting.exe / wind_portable.exe。
@@ -55,7 +56,7 @@ fi
 
 DIST_DIR="$INSTALLER_DIR/dist"
 APP_CONFIG="$PRODUCT_ROOT/config/app.toml"
-[[ -z "$OUTPUT" ]] && OUTPUT="$DIST_DIR/WindInput-${VERSION}-Setup.exe"
+[[ -z "$OUTPUT" ]] && OUTPUT="$DIST_DIR/WindInput-Setup-${VERSION}.exe"
 
 echo "================================================"
 echo "  WindInput 安装程序打包"
