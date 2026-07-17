@@ -83,6 +83,7 @@ impl Coordinator {
             _ => self.reset_exclusive_modes(state),
         }
         state.input_buffer = snapshot;
+        state.input_cursor_pos = state.input_buffer.len(); // 夺取回退：光标落到恢复码末尾
         self.update_candidates(state);
         self.notify_ui_update(state);
         let display = state.preedit.clone();

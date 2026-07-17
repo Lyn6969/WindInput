@@ -2970,3 +2970,200 @@ fn auto_pair_no_jump_out_key_passes_tab_through() {
         tab
     );
 }
+
+fn action_caret(action: &KeyAction) -> Option<u32> {
+    match action {
+        KeyAction::UpdateComposition { caret_pos, .. } => Some(*caret_pos),
+        _ => None,
+    }
+}
+
+// ---- 编码区光标（对齐 Go engine_default_cursor_move / engine_default_delete golden）----
+
+const VK_LEFT: u32 = 0x25;
+const VK_RIGHT: u32 = 0x27;
+const VK_HOME: u32 = 0x24;
+const VK_END: u32 = 0x23;
+const VK_DELETE: u32 = 0x2E;
+const VK_BACK: u32 = 0x08;
+
+/// 无修饰键按下（复用文件上方的 `press_vk(coord, vk, shift)`）。
+fn tap(coord: &Coordinator, vk: u32) -> KeyAction {
+    press_vk(coord, vk, false)
+}
+
+fn type_str(coord: &Coordinator, s: &str) -> KeyAction {
+    let mut last = KeyAction::PassThrough;
+    for c in s.chars() {
+        last = press_letter(coord, c);
+    }
+    last
+}
+
+/// 光标左移跨过引擎插入的音节分隔符时，caret 需按**显示串**位置换算（buffer "nihao" 的第 2
+/// 字节 → 显示 "ni'hao" 的第 2 位，一次左移跨两个显示位）。这是 buffer→display 映射的核心用例。
+#[test]
+fn test_pinyin_cursor_maps_through_separator() {
+    if !has_schemas() {
+        return;
+    }
+    let coord = Coordinator::new_headless(config_with("pinyin"), Some(&data_dir()));
+    let last = type_str(&coord, "nihao");
+    assert_eq!(action_text(&last).as_deref(), Some("ni'hao"));
+    assert_eq!(action_caret(&last), Some(6), "初始光标在末尾");
+
+    // ni'ha|o → ni'h|ao：缓冲内左移一字符，显示位同步左移一位
+    assert_eq!(action_caret(&tap(&coord, VK_LEFT)), Some(5));
+    assert_eq!(action_caret(&tap(&coord, VK_LEFT)), Some(4));
+    // ni'h|ao → ni|'hao：缓冲从 "nih|ao" 退到 "ni|hao"，显示上跨过分隔符 '（4 → 2）
+    assert_eq!(action_caret(&tap(&coord, VK_LEFT)), Some(2));
+
+    // Home / End 到两端
+    assert_eq!(action_caret(&tap(&coord, VK_HOME)), Some(0));
+    assert_eq!(action_caret(&tap(&coord, VK_END)), Some(6));
+    // 右移到边界后再右移：无位可动 → 吃掉，不透传给宿主
+    assert!(matches!(tap(&coord, VK_RIGHT), KeyAction::Consumed));
+}
+
+/// 光标移动不改变组合区文本，也不重算候选（光标不参与引擎查询）。
+#[test]
+fn test_cursor_move_keeps_text_and_candidates() {
+    if !has_schemas() {
+        return;
+    }
+    let coord = Coordinator::new_headless(config_with("pinyin"), Some(&data_dir()));
+    let before = action_text(&type_str(&coord, "nihao")).unwrap();
+    let moved = tap(&coord, VK_LEFT);
+    assert_eq!(
+        action_text(&moved).as_deref(),
+        Some(before.as_str()),
+        "左移只改 caret，组合区文本不变"
+    );
+    // 移回末尾后空格上屏，候选与移动前一致（未因光标移动而重算）
+    tap(&coord, VK_END);
+    match coord.handle_key_event(&key_event(0x20, EVENT_KEY_DOWN)) {
+        KeyAction::InsertText { text, .. } => assert!(!text.is_empty()),
+        other => panic!("空格应上屏，实际: {:?}", other),
+    }
+}
+
+/// 光标在中间时字母插到光标处（而非追加末尾），候选按新的完整缓冲重算。
+#[test]
+fn test_insert_at_cursor_position() {
+    if !has_schemas() {
+        return;
+    }
+    let coord = Coordinator::new_headless(config_with("wubi86"), Some(&data_dir()));
+    assert_eq!(action_text(&type_str(&coord, "aa")).as_deref(), Some("aa"));
+    assert_eq!(action_caret(&tap(&coord, VK_LEFT)), Some(1)); // a|a
+    let act = press_letter(&coord, 'b'); // a|a + b → ab|a
+    assert_eq!(action_text(&act).as_deref(), Some("aba"), "应插在光标处");
+    assert_eq!(action_caret(&act), Some(2), "插入后光标随之后移");
+}
+
+/// Delete 删光标后一字符且光标不动；Backspace 删光标前一字符。
+#[test]
+fn test_delete_and_backspace_at_cursor() {
+    if !has_schemas() {
+        return;
+    }
+    let coord = Coordinator::new_headless(config_with("wubi86"), Some(&data_dir()));
+    type_str(&coord, "abc");
+    tap(&coord, VK_HOME); // |abc
+    let act = tap(&coord, VK_DELETE); // 删 'a' → |bc
+    assert_eq!(action_text(&act).as_deref(), Some("bc"));
+    assert_eq!(action_caret(&act), Some(0), "Delete 后光标不动");
+
+    tap(&coord, VK_END); // bc|
+    let act = tap(&coord, VK_BACK); // 删 'c' → b|
+    assert_eq!(action_text(&act).as_deref(), Some("b"));
+    assert_eq!(action_caret(&act), Some(1));
+}
+
+/// 边界三态：无组合 → 透传宿主；有组合但已在边界 → 吃掉（含光标在最左时的 Backspace，
+/// 若透传会让宿主删掉组合区之前的正文）。
+#[test]
+fn test_cursor_boundary_semantics() {
+    if !has_schemas() {
+        return;
+    }
+    let coord = Coordinator::new_headless(config_with("wubi86"), Some(&data_dir()));
+    // 无组合：方向键/Delete 透传给宿主，宿主照常移动文档光标
+    assert!(matches!(tap(&coord, VK_LEFT), KeyAction::PassThrough));
+    assert!(matches!(tap(&coord, VK_RIGHT), KeyAction::PassThrough));
+    assert!(matches!(tap(&coord, VK_HOME), KeyAction::PassThrough));
+    assert!(matches!(tap(&coord, VK_DELETE), KeyAction::PassThrough));
+
+    type_str(&coord, "aa");
+    tap(&coord, VK_HOME); // |aa
+    assert!(
+        matches!(tap(&coord, VK_LEFT), KeyAction::Consumed),
+        "已在最左：吃掉不透传"
+    );
+    assert!(
+        matches!(tap(&coord, VK_BACK), KeyAction::Consumed),
+        "光标在最左时 Backspace 吃掉，不得透传给宿主"
+    );
+    tap(&coord, VK_END); // aa|
+    assert!(
+        matches!(tap(&coord, VK_DELETE), KeyAction::Consumed),
+        "光标在末尾：前删无物，吃掉"
+    );
+}
+
+/// 已转换前缀是**只读**的：光标进不去（Home 只到剩余编码开头），caret 需含前缀的 UTF-16 长度。
+/// Delete 把剩余编码删空时回退最后一段（对齐 Go handleDelete → popConfirmedSegment）。
+#[test]
+fn test_committed_prefix_is_readonly_and_delete_pops_segment() {
+    if !has_schemas() {
+        return;
+    }
+    let coord = Coordinator::new_headless(config_with("pinyin"), Some(&data_dir()));
+    type_str(&coord, "nihao");
+    // 数字键 3 = 分步确认「你」，剩余编码 "hao" 留在组合区
+    let act = tap(&coord, 0x33);
+    assert_eq!(action_text(&act).as_deref(), Some("你hao"));
+    assert_eq!(
+        action_caret(&act),
+        Some(4),
+        "caret = 前缀「你」1 个 UTF-16 单元 + 剩余 \"hao\" 3 个"
+    );
+
+    // Home 只到剩余编码开头（caret=1，即「你」之后），不进只读前缀
+    assert_eq!(action_caret(&tap(&coord, VK_HOME)), Some(1));
+    assert!(
+        matches!(tap(&coord, VK_LEFT), KeyAction::Consumed),
+        "已在剩余编码最左：吃掉，不得退进已转换前缀"
+    );
+
+    // Delete 三次删空 "hao" → 回退段「你」，其码 "ni" 并回缓冲
+    tap(&coord, VK_DELETE);
+    tap(&coord, VK_DELETE);
+    let act = tap(&coord, VK_DELETE);
+    assert_eq!(
+        action_text(&act).as_deref(),
+        Some("ni"),
+        "删空剩余编码应回退已转换段，而非留下空组合区"
+    );
+    assert_eq!(action_caret(&act), Some(2), "回退后光标落在码末尾");
+}
+
+/// Backspace 的段回退**优先于光标**：即便光标在剩余编码最左（Backspace 本该无字符可删），
+/// 有已转换段时仍先回退段（Go handleBackspace 的分支顺序）。
+#[test]
+fn test_backspace_pops_segment_regardless_of_cursor() {
+    if !has_schemas() {
+        return;
+    }
+    let coord = Coordinator::new_headless(config_with("pinyin"), Some(&data_dir()));
+    type_str(&coord, "nihao");
+    tap(&coord, 0x33); // 「你」+ "hao"
+    tap(&coord, VK_HOME); // 光标到剩余编码最左
+    let act = tap(&coord, VK_BACK);
+    assert_eq!(
+        action_text(&act).as_deref(),
+        Some("ni'hao"),
+        "段回退优先：码 \"ni\" 并回缓冲前部，与 \"hao\" 合成 \"nihao\""
+    );
+    assert_eq!(action_caret(&act), Some(6), "回退后光标拉到缓冲末尾");
+}

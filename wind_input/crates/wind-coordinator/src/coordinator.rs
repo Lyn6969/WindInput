@@ -11,6 +11,7 @@
 //! 候选生成委托给 [`EngineManager`]，运行时词频 boost + 最终排序在本层应用。
 
 use crate::pipeline::{ModeKind, Rewind};
+use crate::preedit_cursor;
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
@@ -335,6 +336,11 @@ pub(crate) struct State {
     pub(crate) ime_active: bool,
     pub(crate) caps_lock: bool,
     pub(crate) input_buffer: String,
+    /// 编码区光标：`input_buffer` 内的字节偏移，定义域 `[0, input_buffer.len()]`。
+    /// 恒指向剩余编码内部——已转换前缀（`committed_text`）是只读前缀，光标进不去（Home 只到
+    /// 剩余编码开头）。光标**不参与引擎查询**：`update_candidates` 恒查整串，移动光标不重算
+    /// 候选（对齐 Go `inputCursorPos`）。所有读写走 `preedit_cursor::BufEdit`，勿裸改。
+    pub(crate) input_cursor_pos: usize,
     /// 组合区显示文本（拼音含音节分隔 "ni'hao"；码表为原始编码）。
     /// 仅显示输入码/拼音，绝不包含候选列表。
     pub(crate) preedit: String,
@@ -1013,6 +1019,7 @@ impl Coordinator {
                 ime_active: false, // 启动未激活：工具栏待 IME_ACTIVATED/FocusGained 才显示
                 caps_lock: false,
                 input_buffer: String::new(),
+                input_cursor_pos: 0,
                 preedit: String::new(),
                 preedit_split_body: String::new(),
                 candidates: Vec::new(),
@@ -3731,35 +3738,33 @@ impl MessageHandler for Coordinator {
             }
             keymap::VK_BACK => {
                 // Backspace：分步撤销——有已转换段则先把最后一段退回拼音（你→ni，码并回剩余
-                // 缓冲前部、重转），否则删剩余拼音末字符。
+                // 缓冲前部、重转），否则删光标前一个字符。
+                // 段回退**优先于光标**（不看光标位置，对齐 Go handleBackspace 的分支顺序）。
                 if !state.committed_segs.is_empty() {
-                    let (code, _, _) = state.committed_segs.pop().unwrap();
-                    state.committed_text = state
-                        .committed_segs
-                        .iter()
-                        .map(|(_, t, _)| t.as_str())
-                        .collect();
-                    state.input_buffer = format!("{}{}", code, state.input_buffer);
-                    self.update_candidates(&mut state);
-                    let display = state.preedit.clone();
-                    self.notify_ui_update(&state);
-                    KeyAction::UpdateComposition {
-                        caret_pos: display.chars().count() as u32,
-                        text: display,
-                    }
+                    self.pop_committed_seg(&mut state)
                 } else if !state.input_buffer.is_empty() {
-                    state.input_buffer.pop();
-                    self.update_candidates(&mut state);
-                    if state.input_buffer.is_empty() {
-                        self.notify_ui_hide();
-                        KeyAction::ClearComposition
+                    let st = &mut *state;
+                    let deleted = preedit_cursor::BufEdit::new(
+                        &mut st.input_buffer,
+                        &mut st.input_cursor_pos,
+                    )
+                    .backspace();
+                    if !deleted {
+                        // 缓冲非空但光标已在最左：吃掉不透传，否则宿主会删到组合区之前的正文。
+                        KeyAction::Consumed
                     } else {
-                        let display = state.preedit.clone();
-                        self.notify_ui_update(&state);
-                        KeyAction::UpdateComposition {
-                            // 光标按显示串字符数（拼音 preedit 含分词空格，与原始字节长不同）。
-                            caret_pos: display.chars().count() as u32,
-                            text: display,
+                        self.update_candidates(&mut state);
+                        if state.input_buffer.is_empty() {
+                            self.notify_ui_hide();
+                            KeyAction::ClearComposition
+                        } else {
+                            let display = state.preedit.clone();
+                            let caret_pos = self.composition_caret(&state);
+                            self.notify_ui_update(&state);
+                            KeyAction::UpdateComposition {
+                                caret_pos,
+                                text: display,
+                            }
                         }
                     }
                 } else {
@@ -3879,7 +3884,13 @@ impl MessageHandler for Coordinator {
                 let pre_display_first = state.candidates.first().cloned().filter(|c| {
                     c.source == CandidateSource::CodeTable || c.is_phrase || c.is_command
                 });
-                state.input_buffer.push(ch);
+                // 在光标处插入（光标在末尾时等价于旧的 push）。后续顶码/候选刷新一律按整串
+                // 缓冲判定，与光标位置无关——光标只是编辑位置，不参与引擎查询。
+                {
+                    let st = &mut *state;
+                    preedit_cursor::BufEdit::new(&mut st.input_buffer, &mut st.input_cursor_pos)
+                        .insert(ch);
+                }
 
                 // 顶码上屏：缓冲超过满码长且整串无匹配 → 顶前 N 码首选，余码续打
                 // （schema.top_code_commit；置于候选刷新前，对齐 Go handleAlphaKey）。
@@ -3955,11 +3966,88 @@ impl MessageHandler for Coordinator {
                     InputOutcome::Normal => {}
                 }
                 let display = state.preedit.clone();
+                let caret_pos = self.composition_caret(&state);
                 self.notify_ui_update(&state);
                 KeyAction::UpdateComposition {
-                    // 光标按显示串字符数（拼音 preedit 含 ' 分隔符，与原始字节长不同）。
-                    caret_pos: display.chars().count() as u32,
+                    caret_pos,
                     text: display,
+                }
+            }
+            keymap::VK_LEFT | keymap::VK_RIGHT | keymap::VK_HOME | keymap::VK_END => {
+                // 编码区光标移动（对齐 Go handleCursorLeft/Right/Home/End 的三态语义）：
+                // ① 无组合 → 透传，宿主照常移动文档光标；② 有剩余编码 → 编码区内移动；
+                // ③ 已在边界 / 只剩只读的已转换前缀 → 吃掉不透传（否则宿主光标会跳出组合区）。
+                // 左右键若被用户配成翻页/高亮键，上面的 apply_nav_key 已先行拦截，走不到这里
+                // ——「配了别的功能」即等价于放弃光标移动。
+                if state.input_buffer.is_empty() {
+                    if state.committed_text.is_empty() {
+                        KeyAction::PassThrough
+                    } else {
+                        KeyAction::Consumed
+                    }
+                } else {
+                    let st = &mut *state;
+                    let mut ed = preedit_cursor::BufEdit::new(
+                        &mut st.input_buffer,
+                        &mut st.input_cursor_pos,
+                    );
+                    let moved = match data.key_code {
+                        keymap::VK_LEFT => ed.move_left(),
+                        keymap::VK_RIGHT => ed.move_right(),
+                        keymap::VK_HOME => ed.home(),
+                        _ => ed.end(),
+                    };
+                    if moved {
+                        // 光标移动**不重算候选**（不调 update_candidates）：光标不参与引擎查询，
+                        // 候选与 preedit 文本均不变，只是 caret 位置变了。
+                        let display = state.preedit.clone();
+                        let caret_pos = self.composition_caret(&state);
+                        KeyAction::UpdateComposition {
+                            caret_pos,
+                            text: display,
+                        }
+                    } else {
+                        KeyAction::Consumed
+                    }
+                }
+            }
+            keymap::VK_DELETE => {
+                // 前删（删光标后一个字符，光标不动）。与 Backspace 刻意不对称：Backspace 一上来
+                // 就回退已转换段，Delete 只删剩余编码、不碰前缀（对齐 Go handleDelete）。
+                if state.input_buffer.is_empty() {
+                    if state.committed_text.is_empty() {
+                        KeyAction::PassThrough
+                    } else {
+                        KeyAction::Consumed
+                    }
+                } else {
+                    let st = &mut *state;
+                    let deleted = preedit_cursor::BufEdit::new(
+                        &mut st.input_buffer,
+                        &mut st.input_cursor_pos,
+                    )
+                    .delete();
+                    if !deleted {
+                        // 光标已在末尾，前方无字符可删。
+                        KeyAction::Consumed
+                    } else if state.input_buffer.is_empty() && !state.committed_segs.is_empty() {
+                        // 剩余编码被删空但仍有已转换段：回退最后一段（对齐 Go handleDelete）。
+                        self.pop_committed_seg(&mut state)
+                    } else {
+                        self.update_candidates(&mut state);
+                        if state.input_buffer.is_empty() {
+                            self.notify_ui_hide();
+                            KeyAction::ClearComposition
+                        } else {
+                            let display = state.preedit.clone();
+                            let caret_pos = self.composition_caret(&state);
+                            self.notify_ui_update(&state);
+                            KeyAction::UpdateComposition {
+                                caret_pos,
+                                text: display,
+                            }
+                        }
+                    }
                 }
             }
             keymap::VK_UP | keymap::VK_DOWN | keymap::VK_PRIOR | keymap::VK_NEXT => {
@@ -3980,7 +4068,11 @@ impl MessageHandler for Coordinator {
                 // preedit 原样保留含末尾 `'`）。走与字母键一致的候选刷新路径。
                 // 置于选词/标点分派（`_` 臂）之前：分隔符模式下该键优先作分隔符而非三选键——
                 // auto 模式仅在 `'` 未被占作选择键时才拦截 `'`（见 pinyin_separator_key）。
-                state.input_buffer.push('\'');
+                {
+                    let st = &mut *state;
+                    preedit_cursor::BufEdit::new(&mut st.input_buffer, &mut st.input_cursor_pos)
+                        .insert('\'');
+                }
                 match self.update_candidates(&mut state) {
                     InputOutcome::AutoCommit(text) => {
                         let source = state
@@ -4005,9 +4097,10 @@ impl MessageHandler for Coordinator {
                     InputOutcome::Normal => {}
                 }
                 let display = state.preedit.clone();
+                let caret_pos = self.composition_caret(&state);
                 self.notify_ui_update(&state);
                 KeyAction::UpdateComposition {
-                    caret_pos: display.chars().count() as u32,
+                    caret_pos,
                     text: display,
                 }
             }

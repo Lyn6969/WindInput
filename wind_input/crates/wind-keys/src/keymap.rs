@@ -28,10 +28,13 @@ pub const VK_ESCAPE: u32 = 0x1B;
 pub const VK_SPACE: u32 = 0x20;
 pub const VK_PRIOR: u32 = 0x21; // PageUp
 pub const VK_NEXT: u32 = 0x22; // PageDown
+pub const VK_END: u32 = 0x23;
+pub const VK_HOME: u32 = 0x24;
 pub const VK_LEFT: u32 = 0x25;
 pub const VK_UP: u32 = 0x26;
 pub const VK_RIGHT: u32 = 0x27;
 pub const VK_DOWN: u32 = 0x28;
+pub const VK_DELETE: u32 = 0x2E; // 前删（光标后一字符）
 // 字母 / 数字区间端点（区间用 VK_A..=VK_Z / VK_0..=VK_9 表达，VK 与 ASCII 大写/数字一致）。
 pub const VK_A: u32 = 0x41;
 pub const VK_Z: u32 = 0x5A;

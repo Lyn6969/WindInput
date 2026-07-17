@@ -7,6 +7,7 @@ use crate::coordinator::{
     PHRASE_WEIGHT_BASE, State, now_unix_secs,
 };
 use crate::pipeline::ModeKind;
+use crate::preedit_cursor;
 use tracing::{debug, warn};
 use wind_bridge::handler::{KeyAction, KeyEventData};
 use wind_candidate::{Candidate, CandidateMeta, CandidateSource};
@@ -791,6 +792,45 @@ impl Coordinator {
         }
     }
 
+    /// 回退最后一个已转换段：把它消费的码并回剩余编码**前部**并重转候选。
+    /// Backspace（段回退优先于光标）与 Delete（删空剩余编码后）共用，对齐 Go
+    /// `handleBackspace` / `popConfirmedSegment`。
+    ///
+    /// 光标一律拉到剩余编码末尾：回退的码插在缓冲前部，光标留在原处会落进这段码中间，
+    /// 语义不清。无段可退时（理论边界）吃掉按键，不透传。
+    pub(crate) fn pop_committed_seg(&self, state: &mut State) -> KeyAction {
+        let Some((code, _, _)) = state.committed_segs.pop() else {
+            return KeyAction::Consumed;
+        };
+        state.committed_text = state
+            .committed_segs
+            .iter()
+            .map(|(_, t, _)| t.as_str())
+            .collect();
+        state.input_buffer = format!("{}{}", code, state.input_buffer);
+        state.input_cursor_pos = state.input_buffer.len();
+        self.update_candidates(state);
+        let display = state.preedit.clone();
+        let caret_pos = self.composition_caret(state);
+        self.notify_ui_update(state);
+        KeyAction::UpdateComposition {
+            caret_pos,
+            text: display,
+        }
+    }
+
+    /// 普通模式组合区光标的 TSF 位置（UTF-16 单元），与 `sync_preedit_to_highlight` 同源：
+    /// 二者都以 `committed_text` 为前缀、`effective_preedit_body` 为主体，故 caret 与所发的
+    /// 组合区文本恒对齐（高亮在拼音↔码表候选间移动导致主体在拆分串↔原始码间切换时亦然）。
+    pub(crate) fn composition_caret(&self, state: &State) -> u32 {
+        preedit_cursor::caret_utf16(
+            &state.committed_text,
+            &state.input_buffer,
+            self.effective_preedit_body(state),
+            state.input_cursor_pos,
+        )
+    }
+
     /// 按当前高亮候选类型重算 `state.preedit`（混输高亮跟随）。含已转换前缀（逐步转换）拼接。
     /// 仅普通模式（active==None）有意义；覆盖层模式各自维护 preedit，不应调用此方法。
     pub(crate) fn sync_preedit_to_highlight(&self, state: &mut State) {
@@ -874,6 +914,7 @@ impl Coordinator {
     /// 实现"敲 zz → 选标点 → 展开标点字符"的二级选择。返回新 preedit 显示文本。
     pub(crate) fn complete_to_group_code(&self, state: &mut State, group_code: &str) -> String {
         state.input_buffer = group_code.to_string();
+        state.input_cursor_pos = state.input_buffer.len();
         let _ = self.update_candidates(state);
         self.notify_ui_update(state);
         state.preedit.clone()
@@ -919,11 +960,14 @@ impl Coordinator {
                 .push((code, cand.text.clone(), cand.source));
             state.committed_text.push_str(&cand.text);
             state.input_buffer = state.input_buffer[consumed..].to_string();
+            // 分步确认消费掉前缀码：剩余编码整体左移，光标落到剩余码末尾（对齐 Go）。
+            state.input_cursor_pos = state.input_buffer.len();
             let _ = self.update_candidates(state); // preedit 已含前缀（update_candidates 内拼接）
             let display = state.preedit.clone();
+            let caret_pos = self.composition_caret(state);
             self.notify_ui_update(state);
             KeyAction::UpdateComposition {
-                caret_pos: display.chars().count() as u32,
+                caret_pos,
                 text: display,
             }
         } else {
@@ -1288,6 +1332,7 @@ impl Coordinator {
             );
         }
         state.input_buffer = remainder.to_string();
+        state.input_cursor_pos = state.input_buffer.len(); // 顶码后余码续打，光标在余码末尾
         let _ = self.update_candidates(state); // 余码候选（不再消费其结局）
         let preedit = state.preedit.clone();
         // 顶码 = 部分上屏 + 余码续组合：宿主光标因 top_text 插入而前移，余码组合起点已变。
@@ -1370,6 +1415,7 @@ impl Coordinator {
         }
         let src = cand.phrase_template.clone();
         state.input_buffer = remainder.to_string();
+        state.input_cursor_pos = state.input_buffer.len(); // 顶码后余码续打，光标在余码末尾
         let _ = self.update_candidates(state); // 余码标准候选刷新
         let preedit = state.preedit.clone();
         self.reset_first_show();
