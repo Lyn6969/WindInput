@@ -3489,3 +3489,36 @@ fn test_chinese_halfwidth_digits_still_passthrough() {
         );
     }
 }
+
+#[test]
+fn test_chinese_capslock_fullwidth_space_and_numpad() {
+    if !has_schemas() {
+        return;
+    }
+    // 回归：CapsLock+全角分支原用 printable_char 取字符，而它不含 VK_SPACE(punct_char 无该键)
+    // 也不含小键盘 → 落 PassThrough。但 C++ 在中文全角下对空格(chinese_fullwidth_space)
+    // 与小键盘(chinese_fullwidth_number)都吃键 → 吃了再吐 → 严格 TSF 宿主丢键。
+    // 现由 full_width_source_char 统一收口，保证 Rust 出字集 ⊇ C++ 吃键集。
+    let mut cfg = config_with("pinyin");
+    cfg.input.default.full_width = true;
+    let coord = Coordinator::new_headless(cfg, Some(&data_dir()));
+    for (vk, want, what) in [
+        (0x20_u32, "\u{3000}", "空格"),
+        (0x60, "０", "小键盘 0"),
+        (0x41, "Ａ", "字母(CapsLock 大写)"),
+    ] {
+        let ev = KeyEventData {
+            toggles: 0x01, // CapsLock ON
+            ..key_event(vk, EVENT_KEY_DOWN)
+        };
+        match coord.handle_key_event(&ev) {
+            KeyAction::InsertText { text, .. } => {
+                assert_eq!(text, want, "CapsLock+全角 {} 应上屏全角", what)
+            }
+            other => panic!(
+                "CapsLock+全角 {} 应出字（透传即丢键），实际: {:?}",
+                what, other
+            ),
+        }
+    }
+}

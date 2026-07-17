@@ -194,6 +194,11 @@ public:
     BOOL IsChineseMode() { return _bChineseMode; }
     BOOL IsFullWidth() { return _bFullWidth; }
     BOOL IsKeyboardDisabled() { return _bKeyboardDisabled; }
+    // 密码框强制英文抑制当前是否生效（**镜像** core 的 `apply_input_diag`：命中密码
+    // InputScope 位 + compartment 未禁用 + 策略开关开）。DLL 必须能自行判定：吃键决策在
+    // OnTestKeyDown 完成，早于 IPC，仅靠 core 回 PassThrough 会「吃了再吐」丢键。
+    BOOL IsPasswordSuppressActive() const;
+    void SetPasswordSuppressEnabled(BOOL bEnabled) { _passwordSuppressEnabled = bEnabled; }
     ULONGLONG GetFocusSessionId() const { return _focusSessionId; }
     // 记录 CapsLock 按键活动时刻（物理按键或服务端 cancel_on_mode_switch 的注入）。
     // Windows 输入系统会在 CapsLock 状态变化后联动写 OPENCLOSE compartment；
@@ -288,6 +293,10 @@ private:
     // 非密码框 + 持有 thread focus 才注册，让抢占面积最小化，不干扰非文本框处的宿主快捷键。
     BOOL  _addWordHotkeysActive;      // 当前是否已 RegisterHotKey 加词热键
     bool  _focusIsPassword;           // 当前焦点是否密码框（KEYBOARD_DISABLED）；密码框不注册加词热键
+    // 当前焦点的 InputScope 掩码（与 focus_gained / CMD_INPUT_STATE_REPORT 上报的同值）。
+    // 上报给 core 之外自己也留一份：IsPasswordSuppressActive 的吃键门控须本地可算。
+    UINT64 _focusInputScopeMask;
+    BOOL  _passwordSuppressEnabled;   // 抑制策略开关（core 经 CONFIG_KEY_PASSWORD_SUPPRESS 推；默认开）
     // 已注册的加词热键 (RegisterHotKey id, raw hash)。raw hash 高16位=KEYMOD、低16位=VK，
     // 供 UnregisterHotKey 与 WM_HOTKEY 分发反解。最多两项（add_word / open_add_word_dialog）。
     std::vector<std::pair<int, uint32_t>> _addWordHotkeyIds;

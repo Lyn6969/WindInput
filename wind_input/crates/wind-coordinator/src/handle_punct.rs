@@ -4,7 +4,7 @@
 //! 纯转换逻辑在 wind-punct crate；此处是 coordinator 包装（锁转换器/读状态）+ 智能符号
 //! 连按替换的状态机（武装/触发/解除）。
 
-use crate::coordinator::{Coordinator, State, numpad_char, printable_char};
+use crate::coordinator::{Coordinator, State, full_width_source_char, numpad_char};
 use tracing::debug;
 use wind_bridge::handler::{KeyAction, KeyEventData, MessageHandler};
 use wind_config::config::SmartMethod;
@@ -299,13 +299,8 @@ impl Coordinator {
         } else {
             shift
         };
-        // 空格不在 printable_char 覆盖内（punct_char 无 VK_SPACE），单独接；小键盘也须接——
-        // C++ 把 VK_NUMPAD* 归为 Number，同样在全角吃键集内。
-        let ch = if data.key_code == keymap::VK_SPACE {
-            ' '
-        } else {
-            printable_char(data.key_code, effective_shift).or_else(|| numpad_char(data.key_code))?
-        };
+        // 覆盖面须 ⊇ C++ 全角吃键集（含空格/小键盘），由 full_width_source_char 统一收口。
+        let ch = full_width_source_char(data.key_code, effective_shift)?;
 
         // 「英全」= 英文标点 + 全角（自定义映射四态的列 1）。经完整流水线而非裸 to_full_width，
         // 确保用户自定义中英文符号生效（与 CapsLock+全角 路径同构）。

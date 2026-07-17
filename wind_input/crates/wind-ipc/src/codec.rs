@@ -960,6 +960,12 @@ pub fn encode_english_pairs_value(enabled: bool, pairs: &[(char, char)]) -> Vec<
     value
 }
 
+/// 编码密码框抑制策略开关的值部分（对齐 TSF `OnSyncConfig` 的 CONFIG_KEY_PASSWORD_SUPPRESS）。
+/// 格式：enabled(u8)。DLL 需要它才能在 `OnTestKeyDown` 本地判定是否放行——吃键决策早于 IPC。
+pub fn encode_password_suppress_value(enabled: bool) -> Vec<u8> {
+    vec![enabled as u8]
+}
+
 /// 编码配对跳出键的值部分（对齐 TSF KeyEventSink::OnSyncConfig CONFIG_KEY_JUMP_OUT_KEYS）。
 ///
 /// 格式：count(u8) + [vk:u16(LE)]...；`vks` 为 VK 码列表（调用方应去重、排序以稳定输出）。
