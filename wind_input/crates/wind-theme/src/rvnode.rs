@@ -160,4 +160,11 @@ pub struct RvViews {
     pub shadow_spread_offset_x: Option<Dim>,
     pub shadow_spread_offset_y: Option<Dim>,
     pub shadow_color: Option<Rgba>,
+
+    // 工具栏几何（None→toolbar.rs 内置默认；由主题 [toolbar] 描述，去渲染器硬编码）。
+    pub toolbar_height: Option<Dim>,
+    pub toolbar_grip_width: Option<Dim>,
+    pub toolbar_button_width: Option<Dim>,
+    pub toolbar_button_padding: Option<Dim>,
+    pub toolbar_button_radius: Option<Dim>,
 }

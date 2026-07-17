@@ -444,6 +444,15 @@ fn resolve_views(v: &Views, palette: &HashMap<String, Rgba>, is_dark: bool) -> R
         .as_ref()
         .map(|m| build(&m.root, tk("menu_bg"), tk("menu_border"), tk("menu_text")));
 
+    // 工具栏几何：从 [toolbar] 直读 Dim（None→toolbar.rs 内置默认），供渲染器去硬编码。
+    if let Some(tb) = &v.toolbar {
+        rv.toolbar_height = tb.height;
+        rv.toolbar_grip_width = tb.grip_width;
+        rv.toolbar_button_width = tb.button_width;
+        rv.toolbar_button_padding = tb.button_padding;
+        rv.toolbar_button_radius = tb.button_radius;
+    }
+
     rv
 }
 

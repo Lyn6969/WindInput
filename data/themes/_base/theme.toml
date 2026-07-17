@@ -122,6 +122,12 @@ color = "${toast_text}"
 [toolbar]
 background = "${toolbar_background}"
 border = { color = "${toolbar_border}" }
+# 几何（dp）：整条高、拖动柄宽、每格宽、激活/悬停格高亮内缩。
+# button_radius 未列→引擎按「格内高×0.3」派生（随高自适应）；如需固定圆角可显式配置。
+height = 30
+grip_width = 12
+button_width = 30
+button_padding = 4
 
 [toolbar.grip]
 color = "${toolbar_grip}"

@@ -19,6 +19,7 @@ use crate::sys::{
 use crate::text::dwrite::TextRenderer;
 use crate::view::Rect;
 use crate::window::{LayeredWindow, WindowMouse};
+use wind_theme::schema::Dim;
 
 /// 工具栏状态（由协调器推送）
 #[derive(Debug, Clone)]
@@ -95,13 +96,21 @@ pub struct Toolbar {
     rendered_hover: i32,
     /// 自动隐藏状态机（默认关闭；SetToolbarAutoHide 命令配置）
     auto_hide: AutoHide,
+    // 工具栏几何（主题 [toolbar] 描述；None→render 内置默认，见常量 HEIGHT/GRIP_W 等）。
+    tb_height: Option<Dim>,
+    tb_grip_width: Option<Dim>,
+    tb_button_width: Option<Dim>,
+    tb_button_padding: Option<Dim>,
+    tb_button_radius: Option<Dim>,
 }
 
 impl Toolbar {
-    // 视觉常量（逻辑像素，随 DPI 缩放）
+    // 几何默认值（逻辑像素，随 DPI 缩放）。主题 [toolbar] 未描述时的兜底；
+    // 与 _base/theme.toml [toolbar] 保持一致，改这里也应同步 _base（反之亦然）。
     const HEIGHT: f32 = 30.0;
     const GRIP_W: f32 = 12.0;
-    const MIN_CELL_W: f32 = 26.0;
+    const BUTTON_W: f32 = 30.0; // 每格（按钮槽）宽度，字面值；配 button_width 覆盖
+    const BUTTON_PAD: f32 = 4.0; // 激活/悬停格高亮内缩；配 button_padding 覆盖
     const FONT_PX: f32 = 15.0;
 
     // 默认浅色配色（主题加载后由 set_theme 覆盖，以下为无主题时的兜底值）
@@ -149,6 +158,11 @@ impl Toolbar {
             last_state: None,
             rendered_hover: -1,
             auto_hide: AutoHide::new(),
+            tb_height: None,
+            tb_grip_width: None,
+            tb_button_width: None,
+            tb_button_padding: None,
+            tb_button_radius: None,
         })
     }
 
@@ -162,6 +176,13 @@ impl Toolbar {
         self.grip = theme.color("toolbar_grip", self.grip);
         self.settings_icon = theme.color("toolbar_settings_icon", self.settings_icon);
         self.hover_bg = theme.color("toolbar_hover", self.hover_bg);
+        // 几何：从解析后的 [toolbar] 读取（None→render 用内置默认，行为不变）。
+        let v = &theme.views;
+        self.tb_height = v.toolbar_height;
+        self.tb_grip_width = v.toolbar_grip_width;
+        self.tb_button_width = v.toolbar_button_width;
+        self.tb_button_padding = v.toolbar_button_padding;
+        self.tb_button_radius = v.toolbar_button_radius;
     }
 
     /// 配置自动隐藏（启动/配置重载时经 SetToolbarAutoHide 下发）。
@@ -274,17 +295,20 @@ impl Toolbar {
     fn render(&mut self, state: &ToolbarState, hover_idx: i32) {
         self.ensure_scale();
         let s = self.scale;
-        let height = (Self::HEIGHT * s).ceil();
-        let grip_w = (Self::GRIP_W * s).ceil();
-        let min_cell = Self::MIN_CELL_W * s;
+        // Dim→设备像素（dp×scale）；None→def_logical×scale（同候选窗 dim 闭包）。
+        let dim = |o: Option<Dim>, def_logical: f32| {
+            o.map(|x| x.resolve(s, 0.0)).unwrap_or(def_logical * s)
+        };
+        let height = dim(self.tb_height, Self::HEIGHT).ceil();
+        let grip_w = dim(self.tb_grip_width, Self::GRIP_W).ceil();
 
         let cells = Self::cells(state);
         // 英文模式下标点固定显示半角，无需看 chinese_punct。
         let effective_chinese = state.chinese_mode && !state.caps_lock;
 
-        // 所有状态格统一方形（宽=高，下限 min_cell）：标点/简繁等图标与文字均居中于等宽方格，
-        // 状态切换不改变单元格宽度，工具栏整体宽度稳定不抖动。
-        let cell_w = height.max(min_cell);
+        // 每格等宽（默认 30dp≈方形）：标点/简繁等图标与文字均居中于等宽格，
+        // 状态切换不改变格宽，工具栏整体宽度稳定不抖动。主题可配 button_width 覆盖。
+        let cell_w = dim(self.tb_button_width, Self::BUTTON_W);
         let cell_widths: Vec<f32> = cells.iter().map(|_| cell_w).collect();
         let total_w: f32 = grip_w + cell_w * cells.len() as f32;
         let w = total_w.ceil() as u32;
@@ -344,12 +368,16 @@ impl Toolbar {
                 None
             };
             if let Some(bgc) = cell_bg {
-                let inset = (4.0 * s) as u32;
+                let inset = dim(self.tb_button_padding, Self::BUTTON_PAD) as u32;
                 let hx = x as u32 + inset / 2;
                 let hy = inset;
                 let hw = (cw as u32).saturating_sub(inset);
                 let hh = h.saturating_sub(inset * 2);
-                let hr = (hh as f32 * 0.3) as u32;
+                // 高亮格圆角：主题 button_radius 优先，否则 = 内高×0.3（原派生行为）。
+                let hr = self
+                    .tb_button_radius
+                    .map(|d| d.resolve(s, 0.0))
+                    .unwrap_or(hh as f32 * 0.3) as u32;
                 fill_rounded(self.window.buffer_mut(), w, h, hx, hy, hw, hh, bgc, hr);
             }
             if is_settings {
