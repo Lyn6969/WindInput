@@ -418,22 +418,44 @@ fn syllables_boundary_mask(syllables: &[String], limit_len: usize) -> u64 {
     mask
 }
 
+/// 双拼解释是否**完整覆盖** `full_pinyin`——即不含「无匹配键对原样回写」段。
+///
+/// `convert` 遇到无法匹配的键对时会把两个键原样写进 `full_pinyin`（注释所谓「简拼/无效键对」），
+/// 但**不产生 `ConvertedSyllable`**。这类段的音节归属无从得知，双拼真值就此残缺，
+/// 故切分与边界都必须整体弃用、退回 DAG 把整串当全拼/简拼猜——那正是原样回写的设计意图。
+///
+/// 判据两条，缺一不可：
+/// 1. 音节从 0 起在全拼空间**连续**（挡住回写段夹在音节中间，如 `omni`）；
+/// 2. 最后一个音节之后**只剩 partial 声母**（挡住回写段落在尾部，如 `nihaoya` 的 `oy`+`a`
+///    ——只查第 1 条会误判为完整，导致尾段被静默丢弃）。
+fn sp_fully_covers(sp: &shuangpin::SpConvertResult) -> bool {
+    let mut cursor = 0usize;
+    for s in &sp.syllables {
+        if s.fp_start != cursor {
+            return false;
+        }
+        cursor = s.fp_end;
+    }
+    let tail = sp.full_pinyin.len().saturating_sub(cursor);
+    let partial_len = sp.partial_initial.as_ref().map_or(0, |s| s.len());
+    tail == partial_len
+}
+
 /// 双拼解释给出的音节边界（**全拼空间** bitmask，与候选 `boundary` 同域）。
 ///
 /// 双拼每 2 键 = 1 音节，边界是免费且精确的——这正是双拼相对全拼的信息优势，
 /// 此前却被拼成 `full_pinyin` 后交给 DAG 重新猜。
 ///
-/// 返回 0 = **边界不可信，不参与校验**：
-/// - 无音节；
-/// - 音节在全拼空间不连续（中间有「无匹配键对原样回写」段，如首道双拼的 `om`），
-///   此时回写段没有 `ConvertedSyllable` 记录，其起始位无从得知，宁可整体弃用；
-/// - 越出 64 位 bitmask 表达范围。
+/// 返回 0 = **边界不可信，不参与校验**：无音节、含回写段（见 [`sp_fully_covers`]）、
+/// 或越出 64 位 bitmask 表达范围。
 fn sp_boundary_mask(sp: &shuangpin::SpConvertResult) -> u64 {
+    if !sp_fully_covers(sp) {
+        return 0;
+    }
     let mut mask = 0u64;
     let mut cursor = 0usize;
     for s in &sp.syllables {
-        // 不连续 ⇒ 存在原样回写段 ⇒ 边界不完整，弃用（否则会漏标该段起始位而误杀候选）。
-        if s.fp_start != cursor || s.fp_start >= 64 {
+        if s.fp_start >= 64 {
             return 0;
         }
         mask |= 1u64 << s.fp_start;
@@ -602,19 +624,14 @@ impl Engine for PinyinEngine {
         // 双拼每 2 键 = 1 音节，边界免费且精确。让 DAG 重猜会造成「查询按猜测、校验按真值」
         // 两套切分打架：`hao`(3键) 双拼解释为 ha|o，DAG 却重切成 [hao] 只查了「好」，
         // 随后被真值拒掉，而真正该查的 `ha`（→「哈」）压根没查 → 候选全空。
-        let sp_syllables: Option<Vec<String>> = sp_result.as_ref().and_then(|r| {
-            // 音节须从 0 起在全拼空间连续覆盖：中间若有「无匹配键对原样回写」段（如首道双拼的
-            // om），pinyin 拼接就不等于 full 的前缀，completed_len 会错位切出乱码。此时退回 DAG。
-            let mut cursor = 0usize;
-            for s in &r.syllables {
-                if s.fp_start != cursor {
-                    return None;
-                }
-                cursor = s.fp_end;
-            }
-            // 尾部 partial（未完成音节的声母）不是完成音节，不计入——它由 step4 前缀补全承接。
-            Some(r.syllables.iter().map(|s| s.pinyin.clone()).collect())
-        });
+        // 含「无匹配键对原样回写」段时双拼真值残缺 → 退回 DAG（见 sp_fully_covers）：
+        // 此时 full 是「音节 + 原样键」的混合，pinyin 拼接不等于 full 前缀，completed_len 会
+        // 错位；且回写段本就是留给全拼/简拼兜底的。
+        // 尾部 partial（未完成音节的声母）不是完成音节，不计入——它由 step4 前缀补全承接。
+        let sp_syllables: Option<Vec<String>> = sp_result
+            .as_ref()
+            .filter(|r| sp_fully_covers(r))
+            .map(|r| r.syllables.iter().map(|s| s.pinyin.clone()).collect());
         let syllables = if let Some(v) = sp_syllables {
             v
         } else if has_sep {
@@ -1332,8 +1349,8 @@ mod tests {
         assert!(boundary_compatible(0b101, 0, 5, 5));
     }
 
-    /// 双拼解释的边界：音节在全拼空间不连续（有「无匹配键对回写」段）时须整体弃用，
-    /// 否则会漏标该段起始位而误杀候选。
+    /// 双拼解释的边界：**含「无匹配键对回写」段时须整体弃用**，否则会漏标该段起始位、
+    /// 或把回写段误当音节起点，两者都会错位误杀候选。
     #[test]
     fn sp_boundary_mask_rules() {
         use crate::pinyin::shuangpin::{ConvertedSyllable, SpConvertResult};
@@ -1345,9 +1362,12 @@ mod tests {
             fp_end: fe,
         };
         // ni|ha + partial o → full "nihao"，边界 {0,2,4}
+        // 注：has_partial 与 partial_initial 须同设——真实 convert 二者恒同时写入，
+        // 只设 has_partial 是不可能出现的状态（fixture 造假会绕过覆盖判据）。
         let sp = SpConvertResult {
             syllables: vec![syl("ni", 0, 2), syl("ha", 2, 4)],
             has_partial: true,
+            partial_initial: Some("o".into()),
             full_pinyin: "nihao".into(),
             ..Default::default()
         };
@@ -1360,13 +1380,76 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(sp_boundary_mask(&sp2), 0b101);
-        // 不连续（fp 空隙 = 无匹配回写段）→ 0，不参与校验
+        // 回写段夹在音节**中间**（fp 空隙）→ 0
         let sp3 = SpConvertResult {
             syllables: vec![syl("ni", 2, 4)],
             full_pinyin: "omni".into(),
             ..Default::default()
         };
-        assert_eq!(sp_boundary_mask(&sp3), 0, "有回写段时边界不完整，须弃用");
+        assert_eq!(
+            sp_boundary_mask(&sp3),
+            0,
+            "回写段在中间时边界不完整，须弃用"
+        );
+        // 回写段在**尾部**（nihaoya 的 oy + partial a）→ 0。
+        // 只查「音节间连续」会漏掉这种：ni→ha 确实连续，但其后还剩 "oya" 三字节，
+        // 而 partial 只有 "a" 一字节 —— 差额就是回写段。
+        let sp4 = SpConvertResult {
+            syllables: vec![syl("ni", 0, 2), syl("ha", 2, 4)],
+            has_partial: true,
+            partial_initial: Some("a".into()),
+            full_pinyin: "nihaoya".into(),
+            ..Default::default()
+        };
+        assert_eq!(sp_boundary_mask(&sp4), 0, "回写段在尾部时同样须弃用");
+    }
+
+    /// 覆盖判据本身：两条缺一不可（音节间连续 + 尾部只剩 partial）。
+    #[test]
+    fn sp_fully_covers_rules() {
+        use crate::pinyin::shuangpin::{ConvertedSyllable, SpConvertResult};
+        let syl = |p: &str, fs, fe| ConvertedSyllable {
+            pinyin: p.to_string(),
+            sp_start: 0,
+            sp_end: 0,
+            fp_start: fs,
+            fp_end: fe,
+        };
+        // 完整：音节恰好覆盖 full
+        assert!(sp_fully_covers(&SpConvertResult {
+            syllables: vec![syl("ni", 0, 2), syl("hao", 2, 5)],
+            full_pinyin: "nihao".into(),
+            ..Default::default()
+        }));
+        // 完整：尾部恰好是 partial 声母
+        assert!(sp_fully_covers(&SpConvertResult {
+            syllables: vec![syl("ni", 0, 2), syl("ha", 2, 4)],
+            has_partial: true,
+            partial_initial: Some("o".into()),
+            full_pinyin: "nihao".into(),
+            ..Default::default()
+        }));
+        // 残缺：尾部剩余多于 partial（差额 = 回写段 oy）
+        assert!(!sp_fully_covers(&SpConvertResult {
+            syllables: vec![syl("ni", 0, 2), syl("ha", 2, 4)],
+            has_partial: true,
+            partial_initial: Some("a".into()),
+            full_pinyin: "nihaoya".into(),
+            ..Default::default()
+        }));
+        // 残缺：回写段在中间
+        assert!(!sp_fully_covers(&SpConvertResult {
+            syllables: vec![syl("ni", 2, 4)],
+            full_pinyin: "omni".into(),
+            ..Default::default()
+        }));
+        // 全是回写段（无音节、无 partial）：full 非空而 cursor=0 → 残缺
+        assert!(!sp_fully_covers(&SpConvertResult {
+            full_pinyin: "oy".into(),
+            ..Default::default()
+        }));
+        // 空输入：平凡完整
+        assert!(sp_fully_covers(&SpConvertResult::default()));
     }
 
     /// 回归：无匹配键对（convert 的「原样回写」分支）既不进 syllables 也不置 has_partial，
@@ -1519,6 +1602,56 @@ mod tests {
             r2.candidates.iter().any(|c| c.text == "好"),
             "2 键 hc 解释为 hao，应出「好」，实际: {:?}",
             r2.candidates.iter().map(|c| &c.text).collect::<Vec<_>>()
+        );
+    }
+
+    /// 回归（真机报告）：双拼下 `nihaoya` 只出「你」「你哈」，`oya` 整段不被拆分、不匹配。
+    ///
+    /// 病灶：`oy` 是**无匹配键对**（被 convert 原样回写进 full_pinyin），它之后的内容没有
+    /// ConvertedSyllable 记录。而「双拼解释是否可用」的判据只检查了音节**之间**是否连续
+    /// （ni→ha 确实连续），没检查**最后一个音节之后还剩什么** → 误判为完整，于是
+    /// syllables=["ni","ha"]、completed="niha"，`oya` 被整段丢弃。
+    ///
+    /// 正解：存在回写段时双拼真值不完整（full 是「音节 + 原样键」的混合），应整体降级回
+    /// DAG，把整串当全拼/简拼猜——这正是 convert 里「两个键原样保留（简拼/无效键对）」
+    /// 的设计意图。
+    #[test]
+    fn shuangpin_falls_back_to_dag_when_unmatched_pair_present() {
+        use crate::pinyin::shuangpin::{Layout, ShuangpinConverter};
+        use std::io::Write;
+        let path = std::env::temp_dir().join("wind_sp_writeback_fallback.dict.yaml");
+        {
+            let mut f = std::fs::File::create(&path).unwrap();
+            writeln!(f, "---\nname: py\n...").unwrap();
+            writeln!(f, "你好呀\tni hao ya\t2000").unwrap();
+            writeln!(f, "你好\tni hao\t1500").unwrap();
+            writeln!(f, "你\tni\t900").unwrap();
+        }
+        let dict = CachedDict::Memory(CodetableDict::load(&path).unwrap());
+        let _ = std::fs::remove_file(&path);
+
+        let schema_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../../data/schemas/shuangpin");
+        let layout = Layout::from_toml(&schema_dir.join("xiaohe.toml")).expect("加载小鹤布局失败");
+        let conv = ShuangpinConverter::new(layout);
+
+        // 先确认前提：nihaoya 在小鹤下确有「无匹配键对」（oy），否则本测试没意义。
+        let sp = conv.convert("nihaoya");
+        assert!(
+            !sp_fully_covers(&sp),
+            "前提失效：nihaoya 应含无匹配回写段，实际 syllables={:?} full={:?}",
+            sp.syllables.iter().map(|s| &s.pinyin).collect::<Vec<_>>(),
+            sp.full_pinyin
+        );
+
+        let eng = PinyinEngine::new(Config::default(), dict).with_shuangpin(conv);
+        let r = eng.convert("nihaoya", 20).unwrap();
+        let texts: Vec<&String> = r.candidates.iter().map(|c| &c.text).collect();
+        // 含回写段 → 双拼真值不完整 → 退回 DAG 把 full="nihaoya" 当全拼切 [ni,hao,ya]。
+        // 尾段不该被静默丢弃。
+        assert!(
+            texts.contains(&&"你好呀".to_string()) || texts.contains(&&"你好".to_string()),
+            "含回写段应降级回 DAG 全拼解释，不该丢掉尾段，实际: {texts:?}"
         );
     }
 
