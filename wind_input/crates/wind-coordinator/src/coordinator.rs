@@ -372,8 +372,15 @@ pub(crate) struct State {
     /// 当前激活的独占输入模式（临时拼音/快捷输入/临时英文）。`None` = 普通输入。
     /// 单点决策的唯一真相源：结构上保证同一时刻至多一个独占模式（见 `pipeline.rs`）。
     pub(crate) active: Option<ModeKind>,
+    /// 各 overlay 模式组合区显示主体（= preedit 去掉只读前缀的部分），供光标位置换算。
+    /// 仅临拼 / mix 需要维护——它们的主体是引擎 `preedit_display`（含插入的音节分隔符），
+    /// 与缓冲不同形；临英 / 特殊 / URL 的主体恒等于自身缓冲，直接用缓冲即可（见
+    /// `overlay_caret_parts`）。缓冲空时可能为 stale，但此时光标必为 0、换算不读它，无害。
+    pub(crate) overlay_body: String,
     /// 临时拼音输入缓冲（拼音串）
     pub(crate) temp_pinyin_buffer: String,
+    /// 临时拼音编码区光标（`temp_pinyin_buffer` 内字节偏移）。下同，各 overlay 缓冲各带一个。
+    pub(crate) temp_pinyin_cursor: usize,
     /// 临时拼音目标方案 id（如 "pinyin"）
     pub(crate) temp_pinyin_schema: String,
     /// 临时拼音组合区前缀字符（触发键，如 "`"）
@@ -382,20 +389,29 @@ pub(crate) struct State {
     pub(crate) quick_saved_vertical: Option<bool>,
     /// 临时英文输入缓冲
     pub(crate) temp_english_buffer: String,
+    /// 临时英文编码区光标（`temp_english_buffer` 内字节偏移）
+    pub(crate) temp_english_cursor: usize,
     /// 临时英文前缀字符（触发键符号，如 "/"；触发键进入时非空，Shift+字母进入时为空）
     pub(crate) temp_english_prefix: String,
     /// 网址模式输入缓冲（原样累积的 URL 文本）
     pub(crate) url_buffer: String,
+    /// 网址模式编码区光标（`url_buffer` 内字节偏移）
+    pub(crate) url_cursor: usize,
     /// 统一夺取回退登记（仅在夺取式模式激活时为 Some，见 pipeline::Rewind）
     pub(crate) rewind: Option<Rewind>,
     /// 特殊模式编码缓冲（自带码表的查询码）
     pub(crate) special_buffer: String,
+    /// 特殊模式编码区光标（`special_buffer` 内字节偏移）。
+    /// 注：Go 版特殊模式**不支持**光标（尾加尾删），此处随共享层一并补齐，不再留缺口。
+    pub(crate) special_cursor: usize,
     /// 当前特殊模式下标（= features.special_modes 索引；仅 active==Special 时有效）
     pub(crate) special_id: u8,
     /// 特殊模式显示态前缀（进入键符号，如 "\"；只显示不消费，组合区前缀，对齐临时拼音）
     pub(crate) special_prefix: String,
     /// 临时 mix 编码缓冲
     pub(crate) mix_buffer: String,
+    /// mix 编码区光标（`mix_buffer` 内字节偏移）
+    pub(crate) mix_cursor: usize,
     /// mix 模式显示态前缀（进入键符号，如 ";"；只显示不消费，组合区前缀）
     pub(crate) mix_prefix: String,
     /// 当前 mix 模式下标（= features.mix_modes 索引；仅 active==Mix 时有效）
@@ -1032,18 +1048,24 @@ impl Coordinator {
                 committed_text: String::new(),
                 committed_segs: Vec::new(),
                 active: None,
+                overlay_body: String::new(),
                 temp_pinyin_buffer: String::new(),
+                temp_pinyin_cursor: 0,
                 temp_pinyin_schema: String::new(),
                 temp_pinyin_prefix: String::new(),
                 quick_saved_vertical: None,
                 temp_english_buffer: String::new(),
+                temp_english_cursor: 0,
                 temp_english_prefix: String::new(),
                 url_buffer: String::new(),
+                url_cursor: 0,
                 rewind: None,
                 special_buffer: String::new(),
+                special_cursor: 0,
                 special_id: 0,
                 special_prefix: String::new(),
                 mix_buffer: String::new(),
+                mix_cursor: 0,
                 mix_id: 0,
                 mix_prefix: String::new(),
                 mix_numeric: false,
@@ -1842,6 +1864,7 @@ impl Coordinator {
         state.committed_text.clear();
         state.committed_segs.clear();
         state.input_buffer.clear();
+        state.input_cursor_pos = 0;
         state.preedit.clear();
         state.preedit_split_body.clear();
         state.candidates.clear();

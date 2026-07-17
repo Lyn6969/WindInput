@@ -5,6 +5,7 @@
 
 use crate::coordinator::{Coordinator, State};
 use crate::pipeline::ModeKind;
+use crate::preedit_cursor;
 use tracing::{debug, info, warn};
 use wind_bridge::handler::KeyAction;
 use wind_config::Config;
@@ -95,6 +96,7 @@ impl Coordinator {
         state.active = Some(ModeKind::Mix(idx));
         state.mix_id = idx;
         state.mix_buffer.clear();
+        state.mix_cursor = 0;
         state.mix_numeric = false; // 由首字符（数字/字母）决定
         // 显示态前缀（进入键符号，如 ";"）：只显示不消费，让用户看到按下的键。
         state.mix_prefix = keymap::vk_to_prefix_char(key_code)
@@ -165,9 +167,30 @@ impl Coordinator {
     }
 
     /// 退出 mix 模式并清空相关状态（含逐步转换的已转换前缀）。
+    /// mix：回退最后一个已转换段——把它消费的码并回缓冲**前部**并重转，光标落码末尾
+    /// （理由同主输入的 `pop_committed_seg`）。Backspace（段优先）与 Delete（删空后）共用。
+    fn pop_mix_seg(
+        &self,
+        state: &mut State,
+        refresh: &dyn Fn(&Self, &mut State) -> KeyAction,
+    ) -> KeyAction {
+        let Some((code, _, _)) = state.committed_segs.pop() else {
+            return KeyAction::Consumed;
+        };
+        state.committed_text = state
+            .committed_segs
+            .iter()
+            .map(|(_, t, _)| t.as_str())
+            .collect();
+        state.mix_buffer = format!("{}{}", code, state.mix_buffer);
+        state.mix_cursor = state.mix_buffer.len();
+        refresh(self, state)
+    }
+
     pub(crate) fn exit_mix_mode(&self, state: &mut State) {
         state.active = None;
         state.mix_buffer.clear();
+        state.mix_cursor = 0;
         state.mix_prefix.clear();
         state.committed_text.clear();
         state.committed_segs.clear();
@@ -591,6 +614,7 @@ impl Coordinator {
         // $AA/$SS 组折叠候选：补全编码到完整码并重查展开（二级选择，不上屏组名）。
         if cand.is_group {
             state.mix_buffer = cand.group_code.clone();
+            state.mix_cursor = state.mix_buffer.len(); // 补全到完整码：光标落末尾
             self.update_mix_candidates(state);
             let display = state.preedit.clone();
             self.notify_ui_update(state);
@@ -627,6 +651,8 @@ impl Coordinator {
                 .push((code, cand.text.clone(), cand.source));
             state.committed_text.push_str(&cand.text);
             state.mix_buffer = state.mix_buffer[consumed..].to_string();
+            // 分步确认消费掉前缀码：光标落剩余码末尾
+            state.mix_cursor = state.mix_buffer.len();
             self.update_mix_candidates(state);
             let display = state.preedit.clone();
             self.notify_ui_update(state);
@@ -676,6 +702,8 @@ impl Coordinator {
             "{}{}{}",
             state.mix_prefix, state.committed_text, state.mix_buffer
         );
+        // 默认主体 = 原始缓冲；文本透镜若给出音节分隔显示，下方会覆盖为该显示串。
+        state.overlay_body = state.mix_buffer.clone();
         if state.mix_buffer.is_empty() {
             return;
         }
@@ -733,6 +761,7 @@ impl Coordinator {
         // 文本透镜用音节分隔显示；数字透镜（计算）保持原始表达式。
         if let Some(disp) = text_display {
             state.preedit = format!("{}{}{}", state.mix_prefix, state.committed_text, disp);
+            state.overlay_body = disp; // 供光标换算（含引擎插入的音节分隔符）
         }
         // 统一展开汇聚点：混输成员词库候选内 `$` 特殊语法在此展开（见 finalize_candidates）。
         state.candidates = self.finalize_candidates(cands, &state.mix_buffer);
@@ -756,14 +785,17 @@ impl Coordinator {
     /// （字母输入、数字选词、`-`/`=` 翻页）。每键顺序：控制键 → ①输入字符 → ②翻页/高亮
     /// → ③本 lens 选词键 → ④配置二三候选键 → ⑤其它标点顶屏。
     pub(crate) fn handle_mix_key(&self, state: &mut State, data: &KeyEventData) -> KeyAction {
+        // 编码区光标移动（左右 / Home / End）。注：数字透镜下 -/= 等是输入字符，但方向键
+        // 在两个透镜里都不是输入，故可在分派前统一拦截。
+        if let Some(act) = self.overlay_cursor_key(state, data) {
+            return act;
+        }
         let refresh = |this: &Self, state: &mut State| -> KeyAction {
             this.update_mix_candidates(state);
             let d = state.preedit.clone();
+            let caret_pos = this.overlay_caret(state);
             this.notify_ui_update(state);
-            KeyAction::UpdateComposition {
-                text: d.clone(),
-                caret_pos: d.chars().count() as u32,
-            }
+            KeyAction::UpdateComposition { text: d, caret_pos }
         };
         let commit_text = |this: &Self, state: &mut State, t: String| -> KeyAction {
             this.exit_mix_mode(state);
@@ -794,19 +826,39 @@ impl Coordinator {
                 self.notify_ui_hide();
                 KeyAction::ClearComposition
             }
-            keymap::VK_BACK => {
-                // 分步撤销：文本透镜有已转换段先退回最后一段（你→ni，码并回缓冲前部）。
-                if let Some((code, _, _)) = state.committed_segs.pop() {
-                    state.committed_text = state
-                        .committed_segs
-                        .iter()
-                        .map(|(_, t, _)| t.as_str())
-                        .collect();
-                    state.mix_buffer = format!("{}{}", code, state.mix_buffer);
-                    return refresh(self, state);
+            keymap::VK_BACK | keymap::VK_DELETE => {
+                // Backspace：段回退**优先于光标**（文本透镜有已转换段先退回最后一段，你→ni，
+                // 码并回缓冲前部）；否则删光标前一字符。Delete 只删光标后一字符、删空后才回退段
+                // ——与主输入同构的刻意不对称。缓冲删空则退出。
+                let backward = data.key_code == keymap::VK_BACK;
+                if backward && !state.committed_segs.is_empty() {
+                    return self.pop_mix_seg(state, &refresh);
                 }
-                state.mix_buffer.pop();
                 if state.mix_buffer.is_empty() {
+                    if backward {
+                        self.exit_mix_mode(state);
+                        self.notify_ui_hide();
+                        return KeyAction::ClearComposition;
+                    }
+                    return KeyAction::Consumed; // Delete 且缓冲空：只吃键，不改退出语义
+                }
+                let removed = {
+                    let mut ed =
+                        preedit_cursor::BufEdit::new(&mut state.mix_buffer, &mut state.mix_cursor);
+                    if backward {
+                        ed.backspace()
+                    } else {
+                        ed.delete()
+                    }
+                };
+                if !removed {
+                    // 退格时光标已在最左 / Delete 时已在末尾：吃掉不透传。
+                    return KeyAction::Consumed;
+                }
+                if state.mix_buffer.is_empty() {
+                    if !state.committed_segs.is_empty() {
+                        return self.pop_mix_seg(state, &refresh);
+                    }
                     self.exit_mix_mode(state);
                     self.notify_ui_hide();
                     KeyAction::ClearComposition
@@ -892,7 +944,8 @@ impl Coordinator {
                     None
                 };
                 if let Some(ch) = input {
-                    state.mix_buffer.push(ch);
+                    preedit_cursor::BufEdit::new(&mut state.mix_buffer, &mut state.mix_cursor)
+                        .insert(ch);
                     return refresh(self, state);
                 }
 

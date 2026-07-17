@@ -76,6 +76,8 @@ impl Coordinator {
             }
             state.active = Some(ModeKind::TempEnglish);
             state.temp_english_buffer = ch.to_string();
+            // Shift+字母进入时缓冲已含首字母：光标必须落到其后，否则续打会插到首字母之前。
+            state.temp_english_cursor = state.temp_english_buffer.len();
             state.temp_english_prefix = String::new();
             self.update_temp_english_candidates(state);
             let disp = state.preedit.clone();
@@ -205,16 +207,22 @@ impl Coordinator {
         let dirty = state.active.is_some();
         state.active = None;
         state.temp_english_buffer.clear();
+        state.temp_english_cursor = 0;
         state.temp_english_prefix.clear();
         state.temp_pinyin_buffer.clear();
+        state.temp_pinyin_cursor = 0;
         state.temp_pinyin_prefix.clear();
         state.url_buffer.clear();
+        state.url_cursor = 0;
         state.rewind = None;
         state.special_buffer.clear();
+        state.special_cursor = 0;
         state.mix_buffer.clear();
+        state.mix_cursor = 0;
         state.mix_numeric = false;
         // 清理可能残留的组合显示（临时拼音/快捷输入会产生候选与 preedit）
         state.input_buffer.clear();
+        state.input_cursor_pos = 0;
         state.candidates.clear();
         state.preedit.clear();
         // 拼音逐步转换的已转换前缀一并丢弃（焦点/模式切换不保留半成品组合）。

@@ -12,6 +12,7 @@ use tracing::{debug, warn};
 use wind_bridge::handler::{KeyAction, KeyEventData};
 use wind_candidate::{Candidate, CandidateMeta, CandidateSource};
 use wind_config::hotkey;
+use wind_keys::keymap;
 use wind_store::freq::FreqRecord;
 use wind_ui::manager::CandidateOp;
 
@@ -790,6 +791,112 @@ impl Coordinator {
         } else {
             &state.input_buffer
         }
+    }
+
+    /// 当前 overlay 模式的 (缓冲, 光标) 编辑视图。`None` = 普通输入（用 `input_buffer` 那套）。
+    /// 五个 overlay 各有独立缓冲字段，这里是它们唯一的收敛点——缓冲编辑一律经此，勿裸 push/pop。
+    pub(crate) fn overlay_buf_edit(state: &mut State) -> Option<preedit_cursor::BufEdit<'_>> {
+        let st = state;
+        Some(match st.active? {
+            ModeKind::TempPinyin => {
+                preedit_cursor::BufEdit::new(&mut st.temp_pinyin_buffer, &mut st.temp_pinyin_cursor)
+            }
+            ModeKind::TempEnglish => preedit_cursor::BufEdit::new(
+                &mut st.temp_english_buffer,
+                &mut st.temp_english_cursor,
+            ),
+            ModeKind::Url => preedit_cursor::BufEdit::new(&mut st.url_buffer, &mut st.url_cursor),
+            ModeKind::Special(_) => {
+                preedit_cursor::BufEdit::new(&mut st.special_buffer, &mut st.special_cursor)
+            }
+            ModeKind::Mix(_) => {
+                preedit_cursor::BufEdit::new(&mut st.mix_buffer, &mut st.mix_cursor)
+            }
+        })
+    }
+
+    /// overlay caret 换算的四要素 (只读前缀, 缓冲, 显示主体, 光标)，与各模式
+    /// `update_*_candidates` 的 `state.preedit` 组装同源（preedit = 前缀 + 主体）。
+    ///
+    /// 临拼 / mix 的主体是引擎 `preedit_display`（含插入的音节分隔符，与缓冲不同形），取自
+    /// `overlay_body`；临英 / 特殊 / URL 的主体恒等于自身缓冲，直接用缓冲。
+    fn overlay_caret_parts(state: &State) -> Option<(String, &str, &str, usize)> {
+        Some(match state.active? {
+            ModeKind::TempPinyin => (
+                format!("{}{}", state.temp_pinyin_prefix, state.committed_text),
+                &state.temp_pinyin_buffer,
+                &state.overlay_body,
+                state.temp_pinyin_cursor,
+            ),
+            ModeKind::Mix(_) => (
+                format!("{}{}", state.mix_prefix, state.committed_text),
+                &state.mix_buffer,
+                &state.overlay_body,
+                state.mix_cursor,
+            ),
+            ModeKind::TempEnglish => (
+                state.temp_english_prefix.clone(),
+                &state.temp_english_buffer,
+                &state.temp_english_buffer,
+                state.temp_english_cursor,
+            ),
+            ModeKind::Special(_) => (
+                state.special_prefix.clone(),
+                &state.special_buffer,
+                &state.special_buffer,
+                state.special_cursor,
+            ),
+            ModeKind::Url => (
+                String::new(),
+                &state.url_buffer,
+                &state.url_buffer,
+                state.url_cursor,
+            ),
+        })
+    }
+
+    /// overlay 模式组合区光标的 TSF 位置（UTF-16 单元）。非 overlay 时回退为串尾。
+    pub(crate) fn overlay_caret(&self, state: &State) -> u32 {
+        match Self::overlay_caret_parts(state) {
+            Some((prefix, buffer, body, cursor)) => {
+                preedit_cursor::caret_utf16(&prefix, buffer, body, cursor)
+            }
+            None => state.preedit.chars().count() as u32,
+        }
+    }
+
+    /// overlay 模式的编码区光标移动（左右 / Home / End）。`None` = 该键不是光标移动键，
+    /// 调用方继续分派。
+    ///
+    /// Delete 不在此处：各模式「删空缓冲」的收尾不同（退出模式 / 回退已转换段），故与各自的
+    /// Backspace 臂合并处理。光标移动不重算候选（光标不参与引擎查询），只重发 caret。
+    pub(crate) fn overlay_cursor_key(
+        &self,
+        state: &mut State,
+        data: &KeyEventData,
+    ) -> Option<KeyAction> {
+        if !matches!(
+            data.key_code,
+            keymap::VK_LEFT | keymap::VK_RIGHT | keymap::VK_HOME | keymap::VK_END
+        ) {
+            return None;
+        }
+        let moved = {
+            let mut ed = Self::overlay_buf_edit(state)?;
+            match data.key_code {
+                keymap::VK_LEFT => ed.move_left(),
+                keymap::VK_RIGHT => ed.move_right(),
+                keymap::VK_HOME => ed.home(),
+                _ => ed.end(),
+            }
+        };
+        // 已在边界（含缓冲空、只剩只读前缀）：吃掉不透传，否则宿主光标会跳出组合区。
+        if !moved {
+            return Some(KeyAction::Consumed);
+        }
+        let text = state.preedit.clone();
+        let caret_pos = self.overlay_caret(state);
+        Some(KeyAction::UpdateComposition { caret_pos, text })
     }
 
     /// 回退最后一个已转换段：把它消费的码并回剩余编码**前部**并重转候选。

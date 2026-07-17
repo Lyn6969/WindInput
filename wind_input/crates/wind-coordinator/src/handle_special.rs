@@ -4,6 +4,7 @@
 
 use crate::coordinator::{Coordinator, State, punct_char};
 use crate::pipeline::ModeKind;
+use crate::preedit_cursor;
 use tracing::debug;
 use wind_bridge::handler::{KeyAction, KeyEventData};
 use wind_candidate::Candidate;
@@ -111,6 +112,7 @@ impl Coordinator {
         state.active = Some(ModeKind::Special(idx));
         state.special_id = idx;
         state.special_buffer.clear();
+        state.special_cursor = 0;
         // 显示态前缀（进入键符号，如 "\"）：只显示不消费。
         state.special_prefix = keymap::vk_to_prefix_char(key_code)
             .map(|c| c.to_string())
@@ -129,6 +131,7 @@ impl Coordinator {
     pub(crate) fn exit_special_mode(&self, state: &mut State) {
         state.active = None;
         state.special_buffer.clear();
+        state.special_cursor = 0;
         state.special_prefix.clear();
         state.candidates.clear();
         state.preedit.clear();
@@ -175,12 +178,14 @@ impl Coordinator {
         // $AA/$SS 组折叠候选：补全编码到完整码并重查展开（不上屏组名）。
         if cand.is_group {
             state.special_buffer = cand.group_code.clone();
+            state.special_cursor = state.special_buffer.len(); // 补全到完整码：光标落末尾
             self.update_special_candidates(state);
             let display = state.preedit.clone();
+            let caret_pos = self.overlay_caret(state);
             self.notify_ui_update(state);
             return KeyAction::UpdateComposition {
-                text: display.clone(),
-                caret_pos: display.chars().count() as u32,
+                text: display,
+                caret_pos,
             };
         }
         let code = state.special_buffer.clone();
@@ -205,6 +210,10 @@ impl Coordinator {
         if let Some(act) = self.handle_candidate_nav(state, data) {
             return act;
         }
+        // 编码区光标移动（左右 / Home / End）；置于候选导航之后，导航键优先。
+        if let Some(act) = self.overlay_cursor_key(state, data) {
+            return act;
+        }
         // 进入键二次按下（缓冲空）：按中英标点配置上屏该符号并退出。
         if state.special_buffer.is_empty()
             && self.match_special_trigger(data.key_code) == Some(state.special_id)
@@ -223,21 +232,37 @@ impl Coordinator {
                 self.notify_ui_hide();
                 KeyAction::ClearComposition
             }
-            keymap::VK_BACK => {
-                // 退格：删编码；空则退出。删除时不触发自动上屏。
-                state.special_buffer.pop();
-                if state.special_buffer.is_empty() {
+            keymap::VK_BACK | keymap::VK_DELETE => {
+                // 退格删光标前 / Delete 删光标后；缓冲被删空则退出（本就空缓冲时只有退格退出，
+                // 保持原语义）。删除时不触发自动上屏。
+                let backward = data.key_code == keymap::VK_BACK;
+                let removed = {
+                    let mut ed = preedit_cursor::BufEdit::new(
+                        &mut state.special_buffer,
+                        &mut state.special_cursor,
+                    );
+                    if backward {
+                        ed.backspace()
+                    } else {
+                        ed.delete()
+                    }
+                };
+                if state.special_buffer.is_empty() && (removed || backward) {
                     self.exit_special_mode(state);
                     self.notify_ui_hide();
                     KeyAction::ClearComposition
-                } else {
+                } else if removed {
                     self.update_special_candidates(state);
                     let display = state.preedit.clone();
+                    let caret_pos = self.overlay_caret(state);
                     self.notify_ui_update(state);
                     KeyAction::UpdateComposition {
-                        text: display.clone(),
-                        caret_pos: display.chars().count() as u32,
+                        text: display,
+                        caret_pos,
                     }
+                } else {
+                    // 退格时光标已在最左 / Delete 时已在末尾：吃掉不透传。
+                    KeyAction::Consumed
                 }
             }
             keymap::VK_SPACE => {
@@ -298,9 +323,10 @@ impl Coordinator {
                 }
             }
             keymap::VK_A..=keymap::VK_Z => {
-                // 字母：小写归一累积编码
+                // 字母：小写归一，在光标处插入
                 let ch = (b'a' + (data.key_code - 0x41) as u8) as char;
-                state.special_buffer.push(ch);
+                preedit_cursor::BufEdit::new(&mut state.special_buffer, &mut state.special_cursor)
+                    .insert(ch);
                 if let Some(cand) = self.update_special_candidates(state) {
                     // $CC 命令候选自动命中：与手动选中同路（退出模式 + 异步执行动作）。
                     let code = state.special_buffer.clone();
@@ -320,10 +346,11 @@ impl Coordinator {
                     return Self::commit_action(cand.text, true);
                 }
                 let display = state.preedit.clone();
+                let caret_pos = self.overlay_caret(state);
                 self.notify_ui_update(state);
                 KeyAction::UpdateComposition {
-                    text: display.clone(),
-                    caret_pos: display.chars().count() as u32,
+                    text: display,
+                    caret_pos,
                 }
             }
             _ => {

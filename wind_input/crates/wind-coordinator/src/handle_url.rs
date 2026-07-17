@@ -4,6 +4,7 @@
 
 use crate::coordinator::{Coordinator, State, printable_char};
 use crate::pipeline::{ModeKind, Rewind};
+use crate::preedit_cursor;
 use tracing::debug;
 use wind_bridge::handler::{KeyAction, KeyEventData};
 use wind_ipc::protocol::MOD_SHIFT;
@@ -31,6 +32,7 @@ impl Coordinator {
         state.candidates.clear();
         state.active = Some(ModeKind::Url);
         state.url_buffer = buffer.clone();
+        state.url_cursor = state.url_buffer.len(); // 夺取进入时缓冲已有内容，光标落末尾
         state.preedit = buffer.clone();
         state.rewind = Some(Rewind {
             snapshot,
@@ -50,6 +52,7 @@ impl Coordinator {
     pub(crate) fn exit_url_mode(&self, state: &mut State) {
         state.active = None;
         state.url_buffer.clear();
+        state.url_cursor = 0;
         state.preedit.clear();
         state.rewind = None;
     }
@@ -105,9 +108,13 @@ impl Coordinator {
             this.notify_ui_update(state);
             KeyAction::UpdateComposition {
                 text: state.url_buffer.clone(),
-                caret_pos: state.url_buffer.chars().count() as u32,
+                caret_pos: this.overlay_caret(state),
             }
         };
+        // 编码区光标移动（左右 / Home / End）
+        if let Some(act) = self.overlay_cursor_key(state, data) {
+            return act;
+        }
         match data.key_code {
             keymap::VK_ESCAPE => {
                 // Esc：放弃退出（无上屏）
@@ -115,15 +122,28 @@ impl Coordinator {
                 self.notify_ui_hide();
                 KeyAction::ClearComposition
             }
-            keymap::VK_BACK => {
-                // 退格：删尾字符；删空则退出
-                state.url_buffer.pop();
-                if state.url_buffer.is_empty() {
+            keymap::VK_BACK | keymap::VK_DELETE => {
+                // 退格删光标前 / Delete 删光标后。缓冲被删空 → 退出模式（无论前删后删，否则会
+                // 留下空组合区）；本就空缓冲时只有退格退出（保持原语义），Delete 只吃键。
+                let backward = data.key_code == keymap::VK_BACK;
+                let removed = {
+                    let mut ed =
+                        preedit_cursor::BufEdit::new(&mut state.url_buffer, &mut state.url_cursor);
+                    if backward {
+                        ed.backspace()
+                    } else {
+                        ed.delete()
+                    }
+                };
+                if state.url_buffer.is_empty() && (removed || backward) {
                     self.exit_url_mode(state);
                     self.notify_ui_hide();
                     KeyAction::ClearComposition
-                } else {
+                } else if removed {
                     refresh(self, state)
+                } else {
+                    // 退格时光标已在最左 / Delete 时已在末尾：吃掉不透传。
+                    KeyAction::Consumed
                 }
             }
             keymap::VK_SPACE | keymap::VK_RETURN => {
@@ -141,10 +161,11 @@ impl Coordinator {
             _ => {
                 let shift = data.modifiers & MOD_SHIFT != 0;
                 if let Some(ch) = printable_char(data.key_code, shift) {
-                    state.url_buffer.push(ch);
+                    preedit_cursor::BufEdit::new(&mut state.url_buffer, &mut state.url_cursor)
+                        .insert(ch);
                     refresh(self, state)
                 } else {
-                    // 方向键等非可打印键：消费但不改缓冲（首版不支持光标内编辑）
+                    // 其它非可打印键：消费但不改缓冲
                     KeyAction::Consumed
                 }
             }

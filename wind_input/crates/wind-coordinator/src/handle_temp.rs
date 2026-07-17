@@ -7,6 +7,7 @@ use crate::coordinator::{
     Coordinator, ENGINE_MAX_CANDIDATES, EnCase, State, adapt_en_case, detect_en_case, punct_char,
 };
 use crate::pipeline::{ModeKind, Rewind};
+use crate::preedit_cursor;
 use tracing::debug;
 use wind_bridge::handler::{KeyAction, KeyEventData};
 use wind_candidate::Candidate;
@@ -113,6 +114,7 @@ impl Coordinator {
         state.active = Some(ModeKind::TempPinyin);
         state.temp_pinyin_schema = target;
         state.temp_pinyin_buffer = residual.clone();
+        state.temp_pinyin_cursor = state.temp_pinyin_buffer.len();
         state.temp_pinyin_prefix = "z".to_string();
         state.rewind = Some(Rewind {
             snapshot: combined,
@@ -145,10 +147,34 @@ impl Coordinator {
             .any(|vk| vk == key_code)
     }
 
+    /// 临拼：回退最后一个已转换段——把它消费的码并回缓冲**前部**并重转，光标落码末尾
+    /// （理由同主输入的 `pop_committed_seg`）。Backspace（段优先）与 Delete（删空后）共用。
+    fn pop_temp_pinyin_seg(&self, state: &mut State) -> KeyAction {
+        let Some((code, _, _)) = state.committed_segs.pop() else {
+            return KeyAction::Consumed;
+        };
+        state.committed_text = state
+            .committed_segs
+            .iter()
+            .map(|(_, t, _)| t.as_str())
+            .collect();
+        state.temp_pinyin_buffer = format!("{}{}", code, state.temp_pinyin_buffer);
+        state.temp_pinyin_cursor = state.temp_pinyin_buffer.len();
+        self.update_temp_pinyin_candidates(state);
+        let display = state.preedit.clone();
+        let caret_pos = self.overlay_caret(state);
+        self.notify_ui_update(state);
+        KeyAction::UpdateComposition {
+            caret_pos,
+            text: display,
+        }
+    }
+
     /// 退出临时拼音模式并清空相关状态（含逐步转换的已转换前缀）
     pub(crate) fn exit_temp_pinyin(&self, state: &mut State) {
         state.active = None;
         state.temp_pinyin_buffer.clear();
+        state.temp_pinyin_cursor = 0;
         state.temp_pinyin_schema.clear();
         state.temp_pinyin_prefix.clear();
         state.committed_text.clear();
@@ -171,6 +197,7 @@ impl Coordinator {
         }
         let Some(schema) = self.overlay_engine_schema(state) else {
             state.preedit = format!("{}{}", prefix, state.temp_pinyin_buffer);
+            state.overlay_body = state.temp_pinyin_buffer.clone();
             return;
         };
         let result =
@@ -182,6 +209,7 @@ impl Coordinator {
             result.preedit_display
         };
         state.preedit = format!("{}{}", prefix, display);
+        state.overlay_body = display; // 供光标换算（含引擎插入的音节分隔符，与缓冲不同形）
 
         // 临时拼音候选按词库权重排序（其词频维度涉及特殊模式配置归属，待 S1 引擎层处理）。
         let mut candidates = result.candidates;
@@ -206,11 +234,13 @@ impl Coordinator {
         // $AA/$SS 组折叠候选：补全编码到完整码并重查展开（二级选择，不上屏组名）。
         if cand.is_group {
             state.temp_pinyin_buffer = cand.group_code.clone();
+            state.temp_pinyin_cursor = state.temp_pinyin_buffer.len(); // 补全到完整码：光标落末尾
             self.update_temp_pinyin_candidates(state);
             let display = state.preedit.clone();
+            let caret_pos = self.overlay_caret(state);
             self.notify_ui_update(state);
             return KeyAction::UpdateComposition {
-                caret_pos: display.chars().count() as u32,
+                caret_pos,
                 text: display,
             };
         }
@@ -240,6 +270,8 @@ impl Coordinator {
                 .push((code, cand.text.clone(), cand.source));
             state.committed_text.push_str(&cand.text);
             state.temp_pinyin_buffer = state.temp_pinyin_buffer[consumed..].to_string();
+            // 分步确认消费掉前缀码：光标落剩余码末尾
+            state.temp_pinyin_cursor = state.temp_pinyin_buffer.len();
             self.update_temp_pinyin_candidates(state);
             let display = state.preedit.clone();
             self.notify_ui_update(state);
@@ -269,6 +301,10 @@ impl Coordinator {
         if let Some(act) = self.handle_candidate_nav(state, data) {
             return act;
         }
+        // 编码区光标移动（左右 / Home / End）；置于候选导航之后，导航键优先。
+        if let Some(act) = self.overlay_cursor_key(state, data) {
+            return act;
+        }
         // 进入键二次按下（缓冲空 + 无已转换前缀）：按中英标点配置上屏该符号并退出。
         if state.temp_pinyin_buffer.is_empty()
             && state.committed_text.is_empty()
@@ -294,40 +330,52 @@ impl Coordinator {
                 self.notify_ui_hide();
                 KeyAction::ClearComposition
             }
-            keymap::VK_BACK => {
-                // Backspace：分步撤销——有已转换段先退回最后一段（你→ni，码并回缓冲前部）；
-                // 否则删剩余拼音末字符；皆空则退出。
-                if let Some((code, _, _)) = state.committed_segs.pop() {
-                    state.committed_text = state
-                        .committed_segs
-                        .iter()
-                        .map(|(_, t, _)| t.as_str())
-                        .collect();
-                    state.temp_pinyin_buffer = format!("{}{}", code, state.temp_pinyin_buffer);
-                    self.update_temp_pinyin_candidates(state);
-                    let display = state.preedit.clone();
-                    self.notify_ui_update(state);
-                    return KeyAction::UpdateComposition {
-                        caret_pos: display.chars().count() as u32,
-                        text: display,
-                    };
+            keymap::VK_BACK | keymap::VK_DELETE => {
+                // Backspace：段回退**优先于光标**（有已转换段先退回最后一段，你→ni，码并回缓冲
+                // 前部）；否则删光标前一字符。Delete 只删光标后一字符、删空后才回退段——与主输入
+                // 同构的刻意不对称（见 coordinator.rs 的 VK_DELETE 臂）。皆空则退出。
+                let backward = data.key_code == keymap::VK_BACK;
+                if backward && !state.committed_segs.is_empty() {
+                    return self.pop_temp_pinyin_seg(state);
                 }
                 if state.temp_pinyin_buffer.is_empty() {
-                    self.exit_temp_pinyin(state);
-                    self.notify_ui_hide();
-                    return KeyAction::ClearComposition;
+                    if backward {
+                        self.exit_temp_pinyin(state);
+                        self.notify_ui_hide();
+                        return KeyAction::ClearComposition;
+                    }
+                    // Delete 且剩余拼音已空（只剩只读前缀）：吃掉，不改变退出语义。
+                    return KeyAction::Consumed;
                 }
-                state.temp_pinyin_buffer.pop();
+                let removed = {
+                    let mut ed = preedit_cursor::BufEdit::new(
+                        &mut state.temp_pinyin_buffer,
+                        &mut state.temp_pinyin_cursor,
+                    );
+                    if backward {
+                        ed.backspace()
+                    } else {
+                        ed.delete()
+                    }
+                };
+                if !removed {
+                    // 退格时光标已在最左 / Delete 时已在末尾：吃掉不透传。
+                    return KeyAction::Consumed;
+                }
                 if state.temp_pinyin_buffer.is_empty() {
+                    if !state.committed_segs.is_empty() {
+                        return self.pop_temp_pinyin_seg(state);
+                    }
                     self.exit_temp_pinyin(state);
                     self.notify_ui_hide();
                     return KeyAction::ClearComposition;
                 }
                 self.update_temp_pinyin_candidates(state);
                 let display = state.preedit.clone();
+                let caret_pos = self.overlay_caret(state);
                 self.notify_ui_update(state);
                 KeyAction::UpdateComposition {
-                    caret_pos: display.chars().count() as u32,
+                    caret_pos,
                     text: display,
                 }
             }
@@ -400,13 +448,18 @@ impl Coordinator {
             keymap::VK_A..=keymap::VK_Z if data.modifiers & (MOD_CTRL | MOD_ALT) == 0 => {
                 // 字母累积拼音
                 let ch = (b'a' + (data.key_code - 0x41) as u8) as char;
-                state.temp_pinyin_buffer.push(ch);
+                preedit_cursor::BufEdit::new(
+                    &mut state.temp_pinyin_buffer,
+                    &mut state.temp_pinyin_cursor,
+                )
+                .insert(ch);
                 self.update_temp_pinyin_candidates(state);
                 let display = state.preedit.clone();
+                let caret_pos = self.overlay_caret(state);
                 self.notify_ui_update(state);
                 KeyAction::UpdateComposition {
-                    text: display.clone(),
-                    caret_pos: display.chars().count() as u32,
+                    text: display,
+                    caret_pos,
                 }
             }
             _ => {
@@ -437,9 +490,19 @@ impl Coordinator {
     }
 
     /// 退出临时英文模式并清空状态
+    /// 临英缓冲的光标位插入（字母 / 数字 / 空格 / 符号五个入口共用）。
+    fn temp_english_insert(state: &mut State, ch: char) {
+        preedit_cursor::BufEdit::new(
+            &mut state.temp_english_buffer,
+            &mut state.temp_english_cursor,
+        )
+        .insert(ch);
+    }
+
     pub(crate) fn exit_temp_english(&self, state: &mut State) {
         state.active = None;
         state.temp_english_buffer.clear();
+        state.temp_english_cursor = 0;
         state.temp_english_prefix.clear();
         state.preedit.clear();
         state.candidates.clear();
@@ -508,11 +571,9 @@ impl Coordinator {
         let refresh = |this: &Self, state: &mut State| -> KeyAction {
             this.update_temp_english_candidates(state);
             let d = state.preedit.clone();
+            let caret_pos = this.overlay_caret(state);
             this.notify_ui_update(state);
-            KeyAction::UpdateComposition {
-                text: d.clone(),
-                caret_pos: d.chars().count() as u32,
-            }
+            KeyAction::UpdateComposition { text: d, caret_pos }
         };
         // 上屏文本（可选全角）+ 退出。
         let commit_text = |this: &Self, state: &mut State, t: String| -> KeyAction {
@@ -534,26 +595,44 @@ impl Coordinator {
         if let Some(act) = self.handle_candidate_nav(state, data) {
             return act;
         }
+        // 编码区光标移动（左右 / Home / End）；置于候选导航之后，导航键优先。
+        if let Some(act) = self.overlay_cursor_key(state, data) {
+            return act;
+        }
         match data.key_code {
             keymap::VK_ESCAPE => {
                 self.exit_temp_english(state);
                 self.notify_ui_hide();
                 KeyAction::ClearComposition
             }
-            keymap::VK_BACK => {
-                state.temp_english_buffer.pop();
-                if state.temp_english_buffer.is_empty() {
+            keymap::VK_BACK | keymap::VK_DELETE => {
+                // 退格删光标前 / Delete 删光标后；缓冲被删空则退出（本就空缓冲时只有退格退出）。
+                let backward = data.key_code == keymap::VK_BACK;
+                let removed = {
+                    let mut ed = preedit_cursor::BufEdit::new(
+                        &mut state.temp_english_buffer,
+                        &mut state.temp_english_cursor,
+                    );
+                    if backward {
+                        ed.backspace()
+                    } else {
+                        ed.delete()
+                    }
+                };
+                if state.temp_english_buffer.is_empty() && (removed || backward) {
                     self.exit_temp_english(state);
                     self.notify_ui_hide();
                     KeyAction::ClearComposition
-                } else {
+                } else if removed {
                     refresh(self, state)
+                } else {
+                    KeyAction::Consumed
                 }
             }
             keymap::VK_SPACE => {
                 // space_as_input：空格作为输入字符入缓冲，仅回车上屏（对齐 Go）。
                 if self.rt().config.input.temp_english.space_as_input {
-                    state.temp_english_buffer.push(' ');
+                    Self::temp_english_insert(state, ' ');
                     refresh(self, state)
                 } else {
                     // 空格：上屏当前高亮候选（首候选=原始输入）；命令候选执行动作
@@ -588,7 +667,7 @@ impl Coordinator {
                 } else {
                     (b'a' + base as u8) as char
                 };
-                state.temp_english_buffer.push(ch);
+                Self::temp_english_insert(state, ch);
                 refresh(self, state)
             }
             keymap::VK_1..=keymap::VK_9 if data.modifiers & MOD_SHIFT == 0 => {
@@ -603,12 +682,12 @@ impl Coordinator {
                     commit_text(self, state, text)
                 } else {
                     let ch = (b'0' + (data.key_code - 0x30) as u8) as char;
-                    state.temp_english_buffer.push(ch);
+                    Self::temp_english_insert(state, ch);
                     refresh(self, state)
                 }
             }
             0x30 if data.modifiers & MOD_SHIFT == 0 => {
-                state.temp_english_buffer.push('0');
+                Self::temp_english_insert(state, '0');
                 refresh(self, state)
             }
             _ => {
@@ -617,7 +696,7 @@ impl Coordinator {
                 if let Some(ch) = punct_char(data.key_code, shift) {
                     // allow_symbols：可见符号直接入缓冲累积（如 C++），不上屏退出（对齐 Go）。
                     if self.rt().config.input.temp_english.allow_symbols {
-                        state.temp_english_buffer.push(ch);
+                        Self::temp_english_insert(state, ch);
                         return refresh(self, state);
                     }
                     let base = if !state.candidates.is_empty() {

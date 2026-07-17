@@ -3167,3 +3167,96 @@ fn test_backspace_pops_segment_regardless_of_cursor() {
     );
     assert_eq!(action_caret(&act), Some(6), "回退后光标拉到缓冲末尾");
 }
+
+// ---- overlay 模式的编码区光标 ----
+
+/// 临时英文：Shift+字母进入时缓冲已含首字母，光标须落其后（回归：曾因光标停在 0 而把
+/// 后续字符插到首字母之前，"Hello" 变成 "elloH"）；随后可在编码区内移动并插入。
+#[test]
+fn test_temp_english_cursor_edit() {
+    if !has_schemas() {
+        return;
+    }
+    let coord = Coordinator::new_headless(config_with("wubi86"), Some(&data_dir()));
+    press_shift_letter(&coord, 'h'); // 进入临英，缓冲 "H"
+    let act = type_str(&coord, "ello");
+    assert_eq!(action_text(&act).as_deref(), Some("Hello"));
+    assert_eq!(action_caret(&act), Some(5));
+
+    // He|llo → 插入 'X'
+    tap(&coord, VK_HOME);
+    assert_eq!(action_caret(&tap(&coord, VK_RIGHT)), Some(1));
+    let act = press_letter(&coord, 'x');
+    assert_eq!(action_text(&act).as_deref(), Some("Hxello"), "应插在光标处");
+    assert_eq!(action_caret(&act), Some(2));
+
+    // Delete 删光标后的 'e'
+    let act = tap(&coord, VK_DELETE);
+    assert_eq!(action_text(&act).as_deref(), Some("Hxllo"));
+    assert_eq!(action_caret(&act), Some(2), "Delete 后光标不动");
+}
+
+/// 网址模式：夺取进入时缓冲已含前缀（"www."），光标须落其后；支持光标位编辑。
+#[test]
+fn test_url_mode_cursor_edit() {
+    if !has_schemas() {
+        return;
+    }
+    let mut cfg = config_with("wubi86");
+    cfg.input.url.enabled = true;
+    cfg.input.url.prefixes = vec!["www.".into()];
+    let coord = Coordinator::new_headless(cfg, Some(&data_dir()));
+    for c in ['w', 'w', 'w'] {
+        press_letter(&coord, c);
+    }
+    let enter = coord.handle_key_event(&key_event(0xBE, EVENT_KEY_DOWN)); // '.' 补满前缀
+    assert_eq!(action_text(&enter).as_deref(), Some("www."));
+    let act = type_str(&coord, "ab");
+    assert_eq!(
+        action_text(&act).as_deref(),
+        Some("www.ab"),
+        "续打应追加在前缀之后"
+    );
+    assert_eq!(action_caret(&act), Some(6));
+
+    // www.a|b → 退格删 'a'
+    assert_eq!(action_caret(&tap(&coord, VK_LEFT)), Some(5));
+    let act = tap(&coord, VK_BACK);
+    assert_eq!(action_text(&act).as_deref(), Some("www.b"));
+    assert_eq!(action_caret(&act), Some(4));
+}
+
+/// 临时拼音：与主输入同构——caret 需跨过引擎插入的音节分隔符，且模式引导符（`）作为只读
+/// 前缀计入 caret，光标进不去。
+#[test]
+fn test_temp_pinyin_cursor_maps_through_separator() {
+    if !has_schemas() {
+        return;
+    }
+    let mut cfg = config_with("wubi86");
+    cfg.input.temp_pinyin.enabled = true;
+    cfg.input.temp_pinyin.trigger_keys = vec!["backtick".into()];
+    let coord = Coordinator::new_headless(cfg, Some(&data_dir()));
+    let enter = coord.handle_key_event(&key_event(0xC0, EVENT_KEY_DOWN)); // ` 进入临拼
+    assert_eq!(
+        action_text(&enter).as_deref(),
+        Some("`"),
+        "组合区显示引导符"
+    );
+
+    let act = type_str(&coord, "nihao");
+    assert_eq!(action_text(&act).as_deref(), Some("`ni'hao"));
+    assert_eq!(action_caret(&act), Some(7), "引导符 1 + 显示串 6");
+
+    // 左移三次：`ni'ha|o → `ni'h|ao → `ni|'hao（跨过分隔符，6 → 5 → 3）
+    assert_eq!(action_caret(&tap(&coord, VK_LEFT)), Some(6));
+    assert_eq!(action_caret(&tap(&coord, VK_LEFT)), Some(5));
+    assert_eq!(action_caret(&tap(&coord, VK_LEFT)), Some(3));
+
+    // Home 只到剩余拼音开头（引导符之后），不进只读前缀
+    assert_eq!(action_caret(&tap(&coord, VK_HOME)), Some(1));
+    assert!(
+        matches!(tap(&coord, VK_LEFT), KeyAction::Consumed),
+        "已在最左：吃掉，不得退进引导符"
+    );
+}

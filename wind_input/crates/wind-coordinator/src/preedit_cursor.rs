@@ -65,6 +65,7 @@ impl<'a> BufEdit<'a> {
         Self { buf, cursor }
     }
 
+    #[cfg(test)]
     pub(crate) fn pos(&self) -> usize {
         *self.cursor
     }
