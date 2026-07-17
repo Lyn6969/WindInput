@@ -443,6 +443,12 @@ fn resolve_views(v: &Views, palette: &HashMap<String, Rgba>, is_dark: bool) -> R
         .menu
         .as_ref()
         .map(|m| build(&m.root, tk("menu_bg"), tk("menu_border"), tk("menu_text")));
+    // 菜单项（menu.item）：几何来源（padding/hover 圆角/字号偏移），供 popup_menu 去硬编码。
+    rv.menu_item = v
+        .menu
+        .as_ref()
+        .map(|m| build(&m.item, None, None, tk("menu_text")));
+    rv.menu_min_width = v.menu.as_ref().and_then(|m| m.min_width);
 
     // 工具栏几何：从 [toolbar] 直读 Dim（None→toolbar.rs 内置默认），供渲染器去硬编码。
     if let Some(tb) = &v.toolbar {

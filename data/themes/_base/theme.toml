@@ -148,11 +148,15 @@ hole = "${toolbar_settings_hole}"
 
 [menu.root]
 radius = 6
+padding = 4
 background = "${menu_bg}"
 border = { width = 1, color = "${menu_border}" }
 
 [menu.item]
 color = "${menu_text}"
+# 几何：内边距（上下 4 / 左右 12）、hover 高亮圆角 4。行高由字号×1.9 派生。
+padding = [4, 12]
+radius = 4
 
 [menu.item.hover]
 background = "${menu_hover_bg}"
