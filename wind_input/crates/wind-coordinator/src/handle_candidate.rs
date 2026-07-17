@@ -401,16 +401,29 @@ impl Coordinator {
             // 例外——镜像码表引擎 `single_code_complete`：当前无任何候选（码表 + 精确短语均空）且未满码时，
             // 放行一次前缀枚举作补全，避免精确模式下彻底无候选（对齐引擎"精确空码取更长首选"语义）。
             let ct = self.engine_mgr.codetable_settings();
-            let allow_prefix = !(self.engine_mgr.is_codetable() && ct.single_code_input)
-                || (ct.single_code_complete
-                    && candidates.is_empty()
-                    && state.input_buffer.chars().count()
-                        < self.engine_mgr.active_max_code_length());
-            let prefix_hits = if allow_prefix {
+            let exact_only = self.engine_mgr.is_codetable() && ct.single_code_input;
+            // 空码补全兜底：仅在精确模式抑制了前缀枚举时才可能触发。
+            let complete_fallback = exact_only
+                && ct.single_code_complete
+                && candidates.is_empty()
+                && state.input_buffer.chars().count() < self.engine_mgr.active_max_code_length();
+            let mut prefix_hits = if !exact_only || complete_fallback {
                 phrases.lookup_prefix(&state.input_buffer, &recent, min_prefix)
             } else {
                 Vec::new()
             };
+            if complete_fallback {
+                // 补全**仅取首选一条**：引擎侧同分支只 push 一条（search_prefix().find()，
+                // 见 codetable/engine.rs "空码补全：从更长编码取首个候选作提示"）。短语侧原样
+                // 放行整串前缀命中，致精确模式下空码补全冒出多条「后续」，与码表规格分叉。
+                //
+                // 须先定序再取：lookup_prefix 由 HashMap 遍历产出、顺序不定（见 wind-phrase
+                // lookup_prefix_at），直接 take(1) 取到的是随机一条而非首选。权重降序 + 文本
+                // 兜底保证稳定；协调器后续的整体排序不改变「只有一条」这个事实。
+                prefix_hits
+                    .sort_by(|a, b| b.weight.cmp(&a.weight).then_with(|| a.text.cmp(&b.text)));
+                prefix_hits.truncate(1);
+            }
             for hit in prefix_hits {
                 // 完整原文（仅一行化，不截断）：上屏用原始文本，截断加省略号由 UI 下发层负责。
                 let text = Self::clamp_candidate_display(&hit.text, 0);

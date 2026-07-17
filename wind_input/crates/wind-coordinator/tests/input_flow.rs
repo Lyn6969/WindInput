@@ -2846,6 +2846,68 @@ fn phrase_auto_commit_effect_command_executes() {
     let _ = std::fs::remove_file(&store_path);
 }
 
+/// 精确匹配模式（`single_code_input`）+ 空码补全（`single_code_complete`）下，短语前缀
+/// 补全**只出首选一条**——与码表引擎同分支「从更长编码取首个候选」的规格一致。
+///
+/// 回归：原 `allow_prefix` 在补全分支放行整串前缀命中，致空码补全冒出多条「后续」。
+/// 注入同前缀 zzq 的三条短语（码 zzqa/zzqb/zzqc，五笔无 zzq 精确字 → 触发补全分支）。
+fn coord_with_prefix_phrases(complete: bool) -> std::sync::Arc<Coordinator> {
+    let store_path =
+        std::env::temp_dir().join(format!("wind_phrase_complete_{}.redb", complete as u8));
+    let _ = std::fs::remove_file(&store_path);
+    let store = std::sync::Arc::new(wind_store::Store::open(&store_path).unwrap());
+    // 权重递增：首选应为权重最高的 zzqc。
+    store.add_phrase("zzqa", "短语甲", 0, 10).unwrap();
+    store.add_phrase("zzqb", "短语乙", 0, 20).unwrap();
+    store.add_phrase("zzqc", "短语丙", 0, 30).unwrap();
+    let mut cfg = config_with("wubi86");
+    cfg.schema.codetable.single_code_input = true;
+    cfg.schema.codetable.single_code_complete = complete;
+    cfg.input.phrase.min_prefix = 2;
+    Coordinator::new_headless_with_store(cfg, Some(&data_dir()), store)
+}
+
+#[test]
+fn exact_mode_phrase_complete_yields_single_hit() {
+    if !has_schemas() {
+        return;
+    }
+    let coord = coord_with_prefix_phrases(true);
+    for ch in ['z', 'z', 'q'] {
+        press_letter(&coord, ch);
+    }
+    let texts = coord.debug_all_candidate_texts();
+    let phrase_hits: Vec<&String> = texts.iter().filter(|t| t.starts_with("短语")).collect();
+    assert_eq!(
+        phrase_hits.len(),
+        1,
+        "精确模式空码补全应只出首选一条短语，实际: {:?}",
+        texts
+    );
+    assert_eq!(
+        phrase_hits[0], "短语丙",
+        "补全应取权重最高的首选（HashMap 序不定，须先定序）"
+    );
+}
+
+#[test]
+fn exact_mode_without_complete_suppresses_phrase_prefix() {
+    if !has_schemas() {
+        return;
+    }
+    // 补全关闭：精确模式应彻底抑制短语前缀枚举（证明上一个测试的一条来自补全分支）。
+    let coord = coord_with_prefix_phrases(false);
+    for ch in ['z', 'z', 'q'] {
+        press_letter(&coord, ch);
+    }
+    let texts = coord.debug_all_candidate_texts();
+    assert!(
+        !texts.iter().any(|t| t.starts_with("短语")),
+        "补全关闭时精确模式不应出短语前缀候选，实际: {:?}",
+        texts
+    );
+}
+
 /// 短语自动上屏须过 `auto_commit_min_len` 闸（与码表「满码唯一自动上屏」同规格）。
 ///
 /// 回归：`phrase_auto_commit` 原只判「唯一 + 无更长后继」、不设最短码长，致短码短语
