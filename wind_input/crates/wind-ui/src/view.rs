@@ -147,6 +147,15 @@ pub struct View {
     /// 文本字体族覆盖；None/空=用渲染器全局字体族。
     pub font_family: Option<String>,
     pub text_align: Align,
+    /// 文本内插入符位置（字节偏移，恒在字符边界；`None`=不画）。
+    ///
+    /// **覆盖层语义**：只在 paint 阶段按偏移画一条竖线，**不参与 measure/布局**——文本始终作为
+    /// 整串一次性整形，故宽度与光标位置无关。这是系统 IME 的做法；若改成把文本拆成
+    /// 「前半 + 竖线 + 后半」三节点，`measure(a+b) != measure(a)+measure(b)`（字距在拆分边界
+    /// 丢失、每段各自亚像素舍入），拆分点随光标移动 → 整串宽度抖动 → 字符位移。
+    pub caret_at: Option<usize>,
+    /// 插入符竖线宽度（像素；调用方按 DPI 缩放传入）。
+    pub caret_w: f32,
     /// 左侧强调条 (颜色, 宽度 px)：在节点左缘内绘制竖条（选中候选用）；不占布局空间（落在左内边距内）。
     pub left_bar: Option<([u8; 4], f32)>,
     /// 圆形背景色：在节点中心画真圆（直径=min(w,h)）；序号圆圈用，替代圆角矩形药丸近似。
@@ -182,6 +191,8 @@ impl Default for View {
             fixed_w: None,
             fixed_h: None,
             bg: None,
+            caret_at: None,
+            caret_w: 1.0,
             corner_radius: 0.0,
             border: None,
             text: None,
@@ -273,6 +284,23 @@ impl View {
         self.border = Some((c, w));
         self
     }
+    /// 在文本的 `byte_pos` 处画插入符（覆盖层，不影响布局；见 [`View::caret_at`] 字段说明）。
+    /// 位置自动夹到字符边界——越界截到末尾、落在字符中间退回前一边界，故 paint 的切片恒安全。
+    pub fn caret_at(mut self, byte_pos: usize, width: f32) -> Self {
+        self.caret_at = Some(match &self.text {
+            Some(t) => {
+                let mut p = byte_pos.min(t.len());
+                while p > 0 && !t.is_char_boundary(p) {
+                    p -= 1;
+                }
+                p
+            }
+            None => 0,
+        });
+        self.caret_w = width;
+        self
+    }
+
     pub fn text_align(mut self, a: Align) -> Self {
         self.text_align = a;
         self
@@ -558,6 +586,26 @@ impl View {
                 family,
                 self.text_color,
             );
+            // 插入符：覆盖在已绘文本之上，按前半段宽度定位。前半段单独整形与其在整串中的
+            // 实际推进有极小字距差异，但只偏移竖线自身、不动文本（布局恒用整串 m.width）。
+            if let Some(cp) = self.caret_at {
+                let hw = if cp == 0 {
+                    0.0
+                } else {
+                    tr.measure_text_styled(&t[..cp], size, weight, family).width
+                };
+                fill_rounded(
+                    buf,
+                    buf_w,
+                    buf_h,
+                    tx.max(r.x) + hw,
+                    ty.max(r.y),
+                    self.caret_w,
+                    m.height,
+                    self.text_color,
+                    0.0,
+                );
+            }
         }
         // 子节点
         for c in &self.children {
@@ -1540,6 +1588,50 @@ mod layout_tests {
         root.layout(0.0, 0.0, &tr());
         let r = hit(&root, 0);
         assert_eq!((r.x, r.y), (5.0, 3.0)); // margin 偏移子节点原点
+    }
+
+    /// 插入符是**覆盖层**：改变 caret 位置不得改变文本的布局尺寸。
+    /// 这是回归测试——曾把 preedit 拆成「前半+竖线+后半」三节点，因
+    /// `measure(a+b) != measure(a)+measure(b)` 且拆分点随光标而变，导致移动光标时编码位移。
+    #[test]
+    fn caret_never_affects_measured_size() {
+        let tr = tr();
+        let mut base = View::leaf("nihao", [0, 0, 0, 255]).font_size(20.0);
+        base.layout(0.0, 0.0, &tr);
+        let want = base.measured_size();
+        for caret in 0..=5 {
+            let mut v = View::leaf("nihao", [0, 0, 0, 255])
+                .font_size(20.0)
+                .caret_at(caret, 1.0);
+            v.layout(0.0, 0.0, &tr);
+            assert_eq!(
+                v.measured_size(),
+                want,
+                "caret={caret} 不应改变文本布局尺寸"
+            );
+        }
+    }
+
+    /// caret_at 自夹到字符边界——paint 里 `&t[..cp]` 落在字符中间会 panic。
+    #[test]
+    fn caret_at_clamps_to_char_boundary() {
+        // 「你」占 3 字节：1/2 退回 0，3 是边界；越界截到末尾（"你hao" = 6 字节）
+        assert_eq!(
+            View::leaf("你hao", [0; 4]).caret_at(1, 1.0).caret_at,
+            Some(0)
+        );
+        assert_eq!(
+            View::leaf("你hao", [0; 4]).caret_at(2, 1.0).caret_at,
+            Some(0)
+        );
+        assert_eq!(
+            View::leaf("你hao", [0; 4]).caret_at(3, 1.0).caret_at,
+            Some(3)
+        );
+        assert_eq!(
+            View::leaf("你hao", [0; 4]).caret_at(99, 1.0).caret_at,
+            Some(6)
+        );
     }
 
     #[test]

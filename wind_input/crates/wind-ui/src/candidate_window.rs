@@ -1059,34 +1059,23 @@ impl CandidateWindow {
         c
     }
 
-    /// 编码栏的文本节点序列：按插入符位置把 preedit 拆成「前半 + 竖线 + 后半」。
+    /// 编码栏文本节点（含插入符）。
     ///
-    /// 拆成独立节点而非往文本里塞字符（如 `|`），是为了不改变文本本身的度量与换行——插入符
-    /// 只占 1px 宽，不挤动编码。光标在末尾时竖线落在最后，与文本编辑器直觉一致。
-    fn preedit_views(&self, fs: f32) -> Vec<View> {
+    /// 插入符走 `View::caret_at` 的覆盖层语义：文本作为**整串**一次整形，宽度与光标位置无关，
+    /// 故移动光标不会让编码位移。曾把文本拆成「前半 + 竖线 + 后半」三节点，因
+    /// `measure(a+b) != measure(a)+measure(b)`（字距在拆分边界丢失 + 每段各自舍入）、
+    /// 且拆分点随光标而变，导致整串宽度抖动、字符跟着晃。
+    fn preedit_view(&self, fs: f32) -> View {
         let v = &self.theme.views;
-        let color = v.preedit_bar.text_color.unwrap_or([100, 100, 100, 255]);
-        let mk = |t: &str| {
-            View::leaf(t.to_string(), color)
-                .font_size(fs)
-                .font_weight(v.preedit_bar.font_weight)
-                .font_family(v.preedit_bar.font_family.clone())
-        };
-        // 竖线高度取字号（近似字高），宽度随 DPI 缩放但至少 1px（否则高分屏下会消失）。
-        let caret = View::container(Layout::Row)
-            .fixed_w((self.scale).max(1.0))
-            .fixed_h(fs)
-            .bg(color);
-        let (head, tail) = self.preedit.split_at(self.preedit_caret);
-        let mut out = Vec::new();
-        if !head.is_empty() {
-            out.push(mk(head));
-        }
-        out.push(caret);
-        if !tail.is_empty() {
-            out.push(mk(tail));
-        }
-        out
+        View::leaf(
+            self.preedit.clone(),
+            v.preedit_bar.text_color.unwrap_or([100, 100, 100, 255]),
+        )
+        .font_size(fs)
+        .font_weight(v.preedit_bar.font_weight)
+        .font_family(v.preedit_bar.font_family.clone())
+        // 竖线宽度随 DPI 缩放，但至少 1px（否则高分屏下会消失）。
+        .caret_at(self.preedit_caret, self.scale.max(1.0))
     }
 
     fn build_tree(&self, above: bool) -> View {
@@ -1229,10 +1218,8 @@ impl CandidateWindow {
                 .bg(col(v.preedit_bar.bg_color, [240, 240, 240, 255]))
                 .radius(dim(v.item.border_radius, 4.0))
                 .pad(edges_or(&v.preedit_bar.padding, [3.0, 8.0, 3.0, 8.0]))
-                .margin(edges_or(&v.preedit_bar.margin, [0.0; 4]));
-            for c in self.preedit_views(preedit_fs) {
-                band = band.child(c);
-            }
+                .margin(edges_or(&v.preedit_bar.margin, [0.0; 4]))
+                .child(self.preedit_view(preedit_fs));
             if let Some(vi) = self.rv_image(v.preedit_bar.bg_image.as_ref()) {
                 band = band.bg_image(vi);
             }
@@ -1355,14 +1342,7 @@ impl CandidateWindow {
                     ..Edges::default()
                 }
             };
-            // 拆分出的「前半 + 插入符 + 后半」包一层无样式 Row，使 margin 作用于整组。
-            let mut pe = View::container(Layout::Row)
-                .cross(Align::Center)
-                .margin(sep);
-            for c in self.preedit_views(preedit_fs) {
-                pe = pe.child(c);
-            }
-            list = list.child(pe);
+            list = list.child(self.preedit_view(preedit_fs).margin(sep));
         }
         // 模式标记（拼/双/快/英/符 或全称）：紧随输入缓冲之后、候选之前内联显示。
         // 仅"无独立 preedit 栏"时在此（内联编码 candidate_inline / 内嵌应用 app_inline /
