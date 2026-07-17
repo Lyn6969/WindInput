@@ -23,7 +23,7 @@ const ADD_WORD_WEIGHT: i32 = 1200;
 /// 自动造词超长裁剪：从尾部保留整段（最近输入优先）使合并字数 ≤ max_chars。
 /// 返回保留区间的起始段索引；max_chars=0 不限（返回 0）。
 fn trim_segs_start(
-    segs: &[(String, String, wind_candidate::CandidateSource)],
+    segs: &[(String, String, wind_candidate::CandidateSource, u64)],
     max_chars: usize,
 ) -> usize {
     if max_chars == 0 {
@@ -31,7 +31,7 @@ fn trim_segs_start(
     }
     let mut total = 0;
     let mut start = segs.len();
-    for (i, (_, t, _)) in segs.iter().enumerate().rev() {
+    for (i, (_, t, _, _)) in segs.iter().enumerate().rev() {
         let n = t.chars().count();
         if total + n > max_chars {
             break;
@@ -77,7 +77,8 @@ impl Coordinator {
         else {
             anyhow::bail!("dict.add: 混输方案主码表缺失，无法归属加词");
         };
-        store.add_user_word(&schema, code, text, ADD_WORD_WEIGHT)?;
+        // code 由调用方显式给出（扁平串，无音节边界表达）→ boundary=0，消费方降级回 DAG。
+        store.add_user_word(&schema, code, text, ADD_WORD_WEIGHT, 0)?;
         Ok(())
     }
 
@@ -111,8 +112,22 @@ impl Coordinator {
         if segs.len() < 2 {
             return;
         }
-        let code: String = segs.iter().map(|(c, _, _)| c.as_str()).collect();
-        let text: String = segs.iter().map(|(_, t, _)| t.as_str()).collect();
+        // 拼接各段码，并把**段内**音节边界平移到全局位置。段自身可能是多音节整词
+        // （选「你好」→ 段码 nihao、段内边界 ni|hao），故不能按「一段一音节」记。
+        // 任一段无边界（boundary=0，如码表段/手输码）则整词作废为 0——半截边界比没有更糟。
+        let mut code = String::new();
+        let mut boundary = 0u64;
+        let mut boundary_ok = true;
+        for (c, _, _, b) in segs {
+            if *b == 0 || code.len() + c.len() > 64 {
+                boundary_ok = false;
+            } else {
+                boundary |= b << code.len();
+            }
+            code.push_str(c);
+        }
+        let boundary = if boundary_ok { boundary } else { 0 };
+        let text: String = segs.iter().map(|(_, t, _, _)| t.as_str()).collect();
         let min_len = if min_len == 0 { 2 } else { min_len };
         if text.chars().count() < min_len || code.is_empty() {
             return;
@@ -124,7 +139,7 @@ impl Coordinator {
         // 注：混源判定使用截后 segs，截掉的段不参与归属判断。
         let schema = if self.engine_mgr.schema_engine_type(&active).as_deref() == Some("mixed") {
             let first = segs[0].2; // segs.len()>=2 已保证非空
-            if segs.iter().any(|(_, _, s)| *s != first) {
+            if segs.iter().any(|(_, _, s, _)| *s != first) {
                 return; // 混源：跳过自动造词
             }
             match self.engine_mgr.write_data_schema_id(&active, first) {
@@ -135,7 +150,7 @@ impl Coordinator {
             self.engine_mgr.data_schema_id(&active) // 拼音族折叠到 "pinyin"，与 record_freq 写读一致
         };
         // add_weight 取保守默认；达 promote_count 阈值时晋升入用户词库（权重统一为 PROMOTED_WEIGHT）。
-        match store.learn_temp_word(&schema, &code, &text, LEARN_ADD_WEIGHT) {
+        match store.learn_temp_word(&schema, &code, &text, LEARN_ADD_WEIGHT, boundary) {
             Ok(count) => {
                 debug!(
                     "auto-learned phrase: {} -> {} (count={})",
@@ -219,6 +234,7 @@ impl Coordinator {
         if state.add_word_chars.len() < ADD_WORD_MIN_LEN {
             state.add_word_len = 0;
             state.add_word_code.clear();
+            state.add_word_boundary = 0;
         } else {
             state.add_word_len = ADD_WORD_DEFAULT_LEN.min(state.add_word_chars.len());
             self.update_add_word_code(state);
@@ -239,6 +255,7 @@ impl Coordinator {
         state.add_word_chars.clear();
         state.add_word_len = 0;
         state.add_word_code.clear();
+        state.add_word_boundary = 0;
         if let Some(prev) = state.add_word_saved_vertical.take() {
             let _ = self.ui_tx.send(UiCommand::SetCandidateLayout(prev));
         }
@@ -270,6 +287,7 @@ impl Coordinator {
         }
         let word = self.add_word_current_word(state);
         let code = state.add_word_code.clone();
+        let boundary = state.add_word_boundary;
         if code.is_empty() {
             warn!("addword: 无法计算编码，放弃加词 word={}", word);
             self.exit_add_word_mode(state);
@@ -286,7 +304,7 @@ impl Coordinator {
                 self.exit_add_word_mode(state);
                 return KeyAction::ClearComposition;
             };
-            match store.add_user_word(&schema, &code, &word, ADD_WORD_WEIGHT) {
+            match store.add_user_word(&schema, &code, &word, ADD_WORD_WEIGHT, boundary) {
                 Ok(_) => {
                     // 注：dict.changed 广播在 RPC dispatch 层（EventSink），协调器不持有该 sink，
                     // 故此处不发事件——与现有 web_dict_add 一致；设置端用户词库视图重开时刷新。
@@ -351,10 +369,11 @@ impl Coordinator {
         self.notify_ui_hide();
 
         let chars = self.add_word_recent_chars(ADD_WORD_MAX_LEN);
+        // 设置端对话框只展示/回填扁平 code（参数串无边界表达），故此处丢弃 boundary。
         let (word, code) = if chars.len() >= ADD_WORD_MIN_LEN {
             let len = ADD_WORD_DEFAULT_LEN.min(chars.len());
             let word: String = chars[chars.len() - len..].iter().collect();
-            let code = self.calc_add_word_code(&word);
+            let (code, _boundary) = self.calc_add_word_code(&word);
             (word, code)
         } else {
             (String::new(), String::new())
@@ -363,21 +382,27 @@ impl Coordinator {
         self.open_add_word_dialog_with(&word, &code, &schema)
     }
 
-    /// 更新当前加词的编码（按方案：拼音生成 / 码表反查）。
+    /// 更新当前加词的编码与音节边界（按方案：拼音生成 / 码表反查）。
     fn update_add_word_code(&self, state: &mut State) {
         if state.add_word_len < ADD_WORD_MIN_LEN || state.add_word_chars.len() < state.add_word_len
         {
             state.add_word_code.clear();
+            state.add_word_boundary = 0;
             return;
         }
         let word = self.add_word_current_word(state);
-        state.add_word_code = self.calc_add_word_code(&word);
+        let (code, boundary) = self.calc_add_word_code(&word);
+        state.add_word_code = code;
+        state.add_word_boundary = boundary;
     }
 
     /// 为词计算编码（对齐设置端 `dict.encode` / web_dict_encode）：
     /// 拼音方案走引擎词级消歧，无果回退逐字反查表；码表方案走五笔词组取码（逐字反查组合，
     /// 支持词库中尚不存在的新词）。
-    fn calc_add_word_code(&self, word: &str) -> String {
+    /// 返回 `(code, boundary)`：boundary 见 `wind_dict::binformat::DictEntry::boundary`。
+    /// 只有引擎词级消歧这条路能给出边界（造词本就逐音节拼接）；逐字反查表回退与五笔取码
+    /// 无音节语义，为 0（消费方降级回 DAG）。
+    fn calc_add_word_code(&self, word: &str) -> (String, u64) {
         let schema = self.add_word_target_schema();
         let is_pinyin = self
             .engine_mgr
@@ -388,9 +413,9 @@ impl Coordinator {
         if is_pinyin {
             self.engine_mgr
                 .generate_word_pinyin(&schema, word)
-                .unwrap_or_else(|| reverse.gen_pinyin(word))
+                .unwrap_or_else(|| (reverse.gen_pinyin(word), 0))
         } else {
-            reverse.wubi_word_code(word)
+            (reverse.wubi_word_code(word), 0)
         }
     }
 
@@ -507,8 +532,8 @@ mod tests {
         let make_state_with_segs = || {
             let mut st = c.state.lock().unwrap();
             st.committed_segs = vec![
-                ("aa".to_string(), "工".to_string(), CS::CodeTable),
-                ("bb".to_string(), "人".to_string(), CS::CodeTable),
+                ("aa".to_string(), "工".to_string(), CS::CodeTable, 0),
+                ("bb".to_string(), "人".to_string(), CS::CodeTable, 0),
             ];
             drop(st);
         };
@@ -659,7 +684,7 @@ mod tests {
     #[test]
     fn trim_segs_keeps_tail_within_max() {
         use wind_candidate::CandidateSource as S;
-        let seg = |c: &str, t: &str| (c.to_string(), t.to_string(), S::CodeTable);
+        let seg = |c: &str, t: &str| (c.to_string(), t.to_string(), S::CodeTable, 0u64);
         let segs = vec![seg("aa", "工人"), seg("bb", "们"), seg("cc", "好的")];
         // 总 5 字，max=3 → 从尾部保留 "们"(1)+"好的"(2)=3 字，起始索引 1
         assert_eq!(trim_segs_start(&segs, 3), 1);

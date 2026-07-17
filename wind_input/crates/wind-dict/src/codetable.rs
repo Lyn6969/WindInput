@@ -14,6 +14,31 @@ pub struct CodetableEntry {
     pub text: String,
     pub weight: i32,
     pub order: i32,
+    /// 音节边界 bitmask，见 [`crate::binformat::DictEntry::boundary`]。
+    /// 拼音词库取自源数据空格（`ni hao` → {0,2}）；五笔等无空格码为 0（无边界信息）。
+    pub boundary: u64,
+}
+
+/// 由 rime 的空格分隔码算音节起始位 bitmask：`"ni hao"` → 音节 ni|hao → 起始 {0,2} → `0b101`。
+///
+/// **这个空格就是音节边界的真值来源**——词库作者写下的、无需推断的事实。丢掉它就只能靠 DAG
+/// 反猜切分，而 DAG 只按「覆盖字符数」最大化，`xian` 是 xi'an 还是 xian 它无从分辨。
+///
+/// 返回 0 仅表示「无边界信息」，消费方须降级回 DAG：空码，或拼接后 ≥64 字节的超长码
+/// （bitmask 装不下，宁可整体降级也不给半截错误边界；拼音词长上限远小于此，实际不触发）。
+/// 单音节返回 `0b1` 而非 0——「整串是一个音节」是真实信息，不是「不知道」。
+/// 五笔等非拼音码不走本函数（其 boundary 恒 0），故无「把无空格码误标成单音节」之虞。
+fn syllable_boundary_mask(spaced_code: &str) -> u64 {
+    let mut mask = 0u64;
+    let mut pos = 0usize;
+    for syl in spaced_code.split(' ').filter(|s| !s.is_empty()) {
+        if pos >= 64 {
+            return 0; // 超出 bitmask 表达范围 → 整体降级，不给出半截错误边界
+        }
+        mask |= 1u64 << pos;
+        pos += syl.len();
+    }
+    mask
 }
 
 /// Rime Codetable 词典（内存模式，按 code 分组的 BTreeMap）
@@ -67,13 +92,17 @@ impl CodetableDict {
 
             // 检测格式：第一列是否为 ASCII（五笔码）或中文（拼音文本）
             let first_is_code = parts[0].chars().all(|c| c.is_ascii());
-            let (mut code, text) = if first_is_code {
-                // 五笔格式: code\ttext
-                (parts[0].to_string(), parts[1].to_string())
+            let (mut code, text, boundary) = if first_is_code {
+                // 五笔格式: code\ttext —— 无音节概念，boundary=0。
+                (parts[0].to_string(), parts[1].to_string(), 0u64)
             } else {
-                // 拼音格式: text\tcode（去掉空格，使 "ni hao" -> "nihao"）
-                let code = parts[1].replace(' ', "");
-                (code, parts[0].to_string())
+                // 拼音格式: text\tcode。code 去空格拼平（"ni hao" -> "nihao"）供 key/前缀查询，
+                // 但空格承载的音节边界先留存到 boundary，不再丢弃。
+                (
+                    parts[1].replace(' ', ""),
+                    parts[0].to_string(),
+                    syllable_boundary_mask(parts[1]),
+                )
             };
             if lowercase_code {
                 code = code.to_lowercase();
@@ -89,6 +118,7 @@ impl CodetableDict {
                 text,
                 weight,
                 order,
+                boundary,
             };
 
             entries.entry(code).or_default().push(entry);
@@ -125,6 +155,56 @@ impl CodetableDict {
                     .collect()
             })
             .unwrap_or_default()
+    }
+
+    /// 精确查找，并带出音节边界（内存路径对应 [`crate::cached::CachedDict::search_with_boundary`]）。
+    pub fn search_with_boundary(&self, code: &str) -> Vec<crate::cached::DictHit> {
+        self.entries
+            .get(code)
+            .map(|entries| {
+                entries
+                    .iter()
+                    .map(|e| crate::cached::DictHit {
+                        code: code.to_string(),
+                        text: e.text.clone(),
+                        weight: e.weight,
+                        order: e.order,
+                        boundary: e.boundary,
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// 前缀查找，并带出音节边界（内存路径对应
+    /// [`crate::cached::CachedDict::search_prefix_with_boundary`]）。排序/截断语义同
+    /// [`Self::search_prefix`]。
+    pub fn search_prefix_with_boundary(
+        &self,
+        prefix: &str,
+        limit: usize,
+    ) -> Vec<crate::cached::DictHit> {
+        let mut results: Vec<crate::cached::DictHit> = Vec::new();
+        for (code, entries) in self.entries.range(prefix.to_string()..) {
+            if !code.starts_with(prefix) {
+                break;
+            }
+            for e in entries {
+                results.push(crate::cached::DictHit {
+                    code: code.clone(),
+                    text: e.text.clone(),
+                    weight: e.weight,
+                    order: e.order,
+                    boundary: e.boundary,
+                });
+            }
+            if results.len() >= limit * 2 {
+                break; // 收集足够多后排序截断（同 search_prefix）
+            }
+        }
+        results.sort_by(|a, b| b.weight.cmp(&a.weight).then(a.order.cmp(&b.order)));
+        results.truncate(limit);
+        results
     }
 
     /// 前缀查找
@@ -203,23 +283,26 @@ impl CodetableDict {
     /// 同 [`export_to_writer`]，导出到 wdat（DAT）写入器。
     /// 携带每条的全局 `order`（词库文件出现序）：使无权重候选跨编码按出现顺序排序，
     /// 而非退化为编码字母序（对应 wdat v3 的 order 字段，见 datformat.rs）。
+    /// 一并携带 `boundary`（wdat v4 音节边界；非拼音词库为 0）。
     pub fn export_to_wdat(&self, writer: &mut crate::datformat::WdatWriter) {
         for (code, entries) in &self.entries {
-            let entries_data: Vec<(String, i32, u32)> = entries
+            let entries_data: Vec<(String, i32, u32, u64)> = entries
                 .iter()
-                .map(|e| (e.text.clone(), e.weight, e.order.max(0) as u32))
+                .map(|e| (e.text.clone(), e.weight, e.order.max(0) as u32, e.boundary))
                 .collect();
-            writer.add_with_order(code.clone(), entries_data);
+            writer.add_with_boundary(code.clone(), entries_data);
         }
     }
 
-    /// 合并单个条目（用于从 CachedDict 提取数据）
+    /// 合并单个条目（用于从 CachedDict 提取数据）。
+    /// 入参只有扁平 code，无音节信息 → boundary=0（消费方降级回 DAG）。
     pub fn merge_single(&mut self, code: String, text: String, weight: i32, _order: i32) {
         let existing = self.entries.entry(code).or_default();
         existing.push(CodetableEntry {
             text,
             weight,
             order: existing.len() as i32,
+            boundary: 0,
         });
         self.total_entries += 1;
     }
@@ -236,10 +319,16 @@ impl CodetableDict {
 /// 解析一行 rime 词条 → `(code, abbrev, text, weight)`，格式自适配（五笔 `code\ttext\tweight`
 /// 或拼音 `text\tcode\tweight`）。`abbrev`=简拼（声母缩写）：仅拼音多音节词有，取每个空格
 /// 分隔音节的首字母（如 `ni hao`→`nh`）；五笔/单音节为 None。返回 None 表示跳过该行。
-fn parse_rime_line(
-    line: &str,
-    lowercase_code: bool,
-) -> Option<(String, Option<String>, String, i32)> {
+pub(crate) struct RimeLine {
+    pub code: String,
+    pub abbrev: Option<String>,
+    pub text: String,
+    pub weight: i32,
+    /// 音节边界 bitmask（见 [`syllable_boundary_mask`]）；五笔码为 0。
+    pub boundary: u64,
+}
+
+fn parse_rime_line(line: &str, lowercase_code: bool) -> Option<RimeLine> {
     let line = line.trim();
     if line.is_empty() || line.starts_with('#') {
         return None;
@@ -250,8 +339,8 @@ fn parse_rime_line(
     }
     // 第一列全 ASCII → 五笔(code 在前)；否则拼音(text 在前，code 去空格)。
     let first_is_code = parts[0].chars().all(|c| c.is_ascii());
-    let (mut code, mut abbrev, text) = if first_is_code {
-        (parts[0].to_string(), None, parts[1].to_string())
+    let (mut code, mut abbrev, text, boundary) = if first_is_code {
+        (parts[0].to_string(), None, parts[1].to_string(), 0u64)
     } else {
         // 简拼：2+ 音节时取每个空格分隔音节的首字母（对齐 Go loadRimeFile）。
         let spaced = parts[1];
@@ -266,7 +355,14 @@ fn parse_rime_line(
         } else {
             None
         };
-        (spaced.replace(' ', ""), abbrev, parts[0].to_string())
+        // 同一批空格既供简拼取首字母，也供 boundary 记边界——此前只用了前者，
+        // 转手就 replace(' ',"") 把边界扔了，逼得查询侧用 DAG 猜、造词侧暴力反推。
+        (
+            spaced.replace(' ', ""),
+            abbrev,
+            parts[0].to_string(),
+            syllable_boundary_mask(spaced),
+        )
     };
     if lowercase_code {
         code = code.to_lowercase();
@@ -277,7 +373,13 @@ fn parse_rime_line(
     } else {
         0
     };
-    Some((code, abbrev, text, weight))
+    Some(RimeLine {
+        code,
+        abbrev,
+        text,
+        weight,
+        boundary,
+    })
 }
 
 /// 正文起点：首个（按 `str::lines()` 语义，即剥除 `\r` 后）等于 `...` 的行之后的字节偏移。
@@ -313,7 +415,9 @@ fn rime_body_offset(content: &str) -> Option<usize> {
 /// 多线程解析（行解析是纯 CPU、可完美并行——拼音大词库的主要耗时）。块边界对齐 `\n`
 /// （该字节不会落在 UTF-8 多字节序列内部），故切片始终在合法 char 边界。
 /// 顺序不保证与文件一致：merged 路径会按权重重排，无需稳定顺序。
-type RimeEntries = (Vec<(String, String, i32)>, Vec<(String, String, i32)>);
+/// `(fulls, abbrevs)`；fulls 每条 `(code, text, weight, boundary)`，abbrevs 每条 `(abbrev, text, weight)`。
+/// 简拼码（`nh`）不带 boundary——它是各音节首字母的拼接，本身不构成音节序列，无边界语义。
+type RimeEntries = (Vec<(String, String, i32, u64)>, Vec<(String, String, i32)>);
 
 pub fn parse_rime_entries_parallel(
     path: impl AsRef<Path>,
@@ -330,11 +434,11 @@ pub fn parse_rime_entries_parallel(
         let mut fulls = Vec::new();
         let mut abbrevs = Vec::new();
         for line in chunk.lines() {
-            if let Some((code, abbrev, text, weight)) = parse_rime_line(line, lowercase_code) {
-                if let Some(ab) = abbrev {
-                    abbrevs.push((ab, text.clone(), weight));
+            if let Some(r) = parse_rime_line(line, lowercase_code) {
+                if let Some(ab) = r.abbrev {
+                    abbrevs.push((ab, r.text.clone(), r.weight));
                 }
-                fulls.push((code, text, weight));
+                fulls.push((r.code, r.text, r.weight, r.boundary));
             }
         }
         (fulls, abbrevs)
@@ -372,17 +476,15 @@ pub fn parse_rime_entries_parallel(
         let handles: Vec<_> = chunks
             .iter()
             .map(|chunk| {
-                s.spawn(move || {
+                s.spawn(move || -> RimeEntries {
                     let mut fulls = Vec::new();
                     let mut abbrevs = Vec::new();
                     for line in chunk.lines() {
-                        if let Some((code, abbrev, text, weight)) =
-                            parse_rime_line(line, lowercase_code)
-                        {
-                            if let Some(ab) = abbrev {
-                                abbrevs.push((ab, text.clone(), weight));
+                        if let Some(r) = parse_rime_line(line, lowercase_code) {
+                            if let Some(ab) = r.abbrev {
+                                abbrevs.push((ab, r.text.clone(), r.weight));
                             }
-                            fulls.push((code, text, weight));
+                            fulls.push((r.code, r.text, r.weight, r.boundary));
                         }
                     }
                     (fulls, abbrevs)
@@ -405,6 +507,63 @@ pub fn parse_rime_entries_parallel(
 mod tests {
     use super::*;
     use std::io::Write;
+
+    #[test]
+    fn syllable_boundary_mask_basics() {
+        // 多音节：起始字节位 {0,2}（ni 占 0..2，hao 占 2..5）。
+        assert_eq!(syllable_boundary_mask("ni hao"), 0b101);
+        // 变长音节：zhuang(6B) 起始 0，ni 起始 6。
+        assert_eq!(syllable_boundary_mask("zhuang ni"), 0b1000001);
+        // 单音节：整串一个音节，起始 {0}。是真实信息，不是「未知」。
+        assert_eq!(syllable_boundary_mask("ni"), 0b1);
+        // 空码 → 无信息。
+        assert_eq!(syllable_boundary_mask(""), 0);
+        // 超长码（拼接 ≥64B）：bitmask 装不下 → 整体降级为 0，不给半截错误边界。
+        let long = vec!["zhuang"; 12].join(" "); // 12*6 = 72B
+        assert_eq!(syllable_boundary_mask(&long), 0);
+    }
+
+    /// 端到端：rime 源 → 解析 → wdat 落盘 → mmap 读回，边界必须原样穿过整条链路。
+    /// 这是 v4 的核心契约——此前边界在解析期就被 replace(' ',"") 丢弃，根本到不了磁盘。
+    #[test]
+    fn boundary_survives_wdat_roundtrip() {
+        let dir = std::env::temp_dir().join("wind_boundary_roundtrip");
+        std::fs::create_dir_all(&dir).unwrap();
+        let src = dir.join("py.dict.yaml");
+        {
+            let mut f = std::fs::File::create(&src).unwrap();
+            writeln!(f, "---\nname: py\n...").unwrap();
+            writeln!(f, "你好\tni hao\t1200").unwrap();
+            writeln!(f, "你\tni\t800").unwrap();
+            // 同 code 不同切分：xi'an（西安，2 音节）vs xian（先，1 音节）。
+            // 正是 DAG 无从分辨、必须靠词典真值的场景（两者覆盖字符数相同）。
+            writeln!(f, "西安\txi an\t500").unwrap();
+            writeln!(f, "先\txian\t900").unwrap();
+        }
+        let dict = CodetableDict::load(&src).unwrap();
+
+        let mut w = crate::datformat::WdatWriter::new();
+        dict.export_to_wdat(&mut w);
+        let wdat = dir.join("py.wdat");
+        w.write(&wdat).unwrap();
+
+        let reader = crate::datformat::WdatReader::open(&wdat).unwrap();
+        let find = |code: &str, text: &str| -> Option<u64> {
+            reader
+                .search(code)
+                .into_iter()
+                .find(|e| e.text == text)
+                .map(|e| e.boundary)
+        };
+
+        assert_eq!(find("nihao", "你好"), Some(0b101), "ni|hao 边界应读回");
+        assert_eq!(find("ni", "你"), Some(0b1));
+        // 关键：同一 key "xian" 下两条候选各自带边界，据此可区分 xi|an 与 xian。
+        assert_eq!(find("xian", "西安"), Some(0b101), "xi|an → 起始 {{0,2}}");
+        assert_eq!(find("xian", "先"), Some(0b1), "xian → 单音节，起始 {{0}}");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     /// 英文词库格式 `word<TAB>word`（混合大小写）：load_lowercased 应小写化 code、
     /// 保留 text 原样，使大小写不敏感前缀匹配生效。
@@ -435,12 +594,30 @@ mod tests {
 
     /// 并行解析：拼音格式（text\tcode\tweight，code 去空格）+ 注释/空行跳过，
     /// 小文件走串行分支，结果应完整正确。
-    fn collect(entries: &[(String, String, i32)], text: &str) -> Vec<(String, i32)> {
+    /// 取 fulls（(code, text, weight, boundary)）中某 text 的 (code, weight)。
+    fn collect(entries: &[(String, String, i32, u64)], text: &str) -> Vec<(String, i32)> {
+        entries
+            .iter()
+            .filter(|(_, t, _, _)| t == text)
+            .map(|(c, _, w, _)| (c.clone(), *w))
+            .collect()
+    }
+
+    /// 取 abbrevs（(abbrev, text, weight)，无 boundary）中某 text 的 (abbrev, weight)。
+    fn collect_ab(entries: &[(String, String, i32)], text: &str) -> Vec<(String, i32)> {
         entries
             .iter()
             .filter(|(_, t, _)| t == text)
             .map(|(c, _, w)| (c.clone(), *w))
             .collect()
+    }
+
+    /// 取 fulls 中某 text 的 boundary。
+    fn boundary_of(entries: &[(String, String, i32, u64)], text: &str) -> Option<u64> {
+        entries
+            .iter()
+            .find(|(_, t, _, _)| t == text)
+            .map(|(_, _, _, b)| *b)
     }
 
     #[test]
@@ -460,8 +637,17 @@ mod tests {
         assert_eq!(collect(&e, "你好"), vec![("nihao".to_string(), 1200)]);
         assert_eq!(collect(&e, "你"), vec![("ni".to_string(), 800)]);
         // 简拼：多音节 "ni hao"→"nh"；单音节 "ni" 无简拼。
-        assert_eq!(collect(&ab, "你好"), vec![("nh".to_string(), 1200)]);
-        assert!(collect(&ab, "你").is_empty(), "单音节不产简拼");
+        assert_eq!(collect_ab(&ab, "你好"), vec![("nh".to_string(), 1200)]);
+        assert!(collect_ab(&ab, "你").is_empty(), "单音节不产简拼");
+        // 音节边界（v4）：源数据 "ni hao" 的空格是真值边界，不得随 code 拼平而丢弃。
+        // "nihao" 音节 ni|hao → 起始字节 {0,2} → 0b101。
+        assert_eq!(
+            boundary_of(&e, "你好"),
+            Some(0b101),
+            "「你好」应记住 ni|hao 的边界"
+        );
+        // 单音节：整串一个音节 → 起始 {0} → 0b1（是真实信息，非「未知」）。
+        assert_eq!(boundary_of(&e, "你"), Some(0b1));
     }
 
     /// 跨 1MB 阈值触发并行切块：构造大量行，断言总数与抽样正确、块边界不丢/不重行。
@@ -486,8 +672,10 @@ mod tests {
             collect(&e, "文59999"),
             vec![("code59999".to_string(), 59999)]
         );
+        // 五笔码无音节概念 → boundary 恒 0（消费方据此降级，不会误当拼音边界）。
+        assert_eq!(boundary_of(&e, "文0"), Some(0), "五笔码不应有音节边界");
         // 全部 code 唯一（边界未把某行切成两半）
-        let mut codes: Vec<&str> = e.iter().map(|(c, _, _)| c.as_str()).collect();
+        let mut codes: Vec<&str> = e.iter().map(|(c, _, _, _)| c.as_str()).collect();
         codes.sort_unstable();
         codes.dedup();
         assert_eq!(codes.len(), n, "所有 code 应唯一");

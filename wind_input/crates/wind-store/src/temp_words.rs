@@ -23,12 +23,17 @@ impl Store {
     /// 学习临时词：新词 weight=min(add_weight,MAX)/count=1；已存在只 count++，权重不变
     /// （count 只用于晋升判定，不再驱动权重增长）。返回新的 count（调用方据此与
     /// promote_count 比较决定是否晋升）。
+    ///
+    /// `boundary`：该 code 的音节边界（见 `wind_dict::binformat::DictEntry::boundary`），
+    /// 0=无信息。已存在的记录**沿用旧 boundary**——同 (schema,code,text) 的切分是确定的，
+    /// 不因再次学习而变；且旧值可能来自更可靠的来源。
     pub fn learn_temp_word(
         &self,
         schema: &str,
         code: &str,
         text: &str,
         add_weight: i32,
+        boundary: u64,
     ) -> anyhow::Result<u32> {
         let key = enc_key(schema, code, text);
         self.with_db(|db| {
@@ -36,12 +41,20 @@ impl Store {
             let new_count;
             {
                 let mut t = txn.open_table(TEMP_WORDS)?;
-                let (w, c, ca) = match t.get(key.as_str())?.and_then(|g| dec_val(g.value())) {
-                    Some((ow, oc, oca)) => (ow, oc + 1, oca),
-                    None => (add_weight.min(TEMP_WORD_MAX_WEIGHT), 1, now_secs()),
+                let (w, c, ca, b) = match t.get(key.as_str())?.and_then(|g| dec_val(g.value())) {
+                    // 旧记录 boundary 为 0（v1 遗留）时用新算出的补上，否则沿用。
+                    Some((ow, oc, oca, ob)) => {
+                        (ow, oc + 1, oca, if ob != 0 { ob } else { boundary })
+                    }
+                    None => (
+                        add_weight.min(TEMP_WORD_MAX_WEIGHT),
+                        1,
+                        now_secs(),
+                        boundary,
+                    ),
                 };
                 new_count = c;
-                t.insert(key.as_str(), enc_val(w, c, ca).as_slice())?;
+                t.insert(key.as_str(), enc_val(w, c, ca, b).as_slice())?;
             }
             txn.commit()?;
             Ok(new_count)
@@ -61,7 +74,7 @@ impl Store {
             let t = txn.open_table(TEMP_WORDS)?;
             Ok(t.get(key.as_str())?
                 .and_then(|g| dec_val(g.value()))
-                .map(|(_, c, _)| c))
+                .map(|(_, c, _, _)| c))
         })
     }
 
@@ -80,9 +93,9 @@ impl Store {
                 let mut t = txn.open_table(TEMP_WORDS)?;
                 let existing = t.get(key.as_str())?.and_then(|g| dec_val(g.value()));
                 match existing {
-                    Some((w, c, ca)) => {
+                    Some((w, c, ca, b)) => {
                         let nc = c + 1;
-                        t.insert(key.as_str(), enc_val(w, nc, ca).as_slice())?;
+                        t.insert(key.as_str(), enc_val(w, nc, ca, b).as_slice())?;
                         result = (true, nc);
                     }
                     None => result = (false, 0),
@@ -107,13 +120,14 @@ impl Store {
                     break;
                 }
                 let text = &key[prefix.len()..];
-                if let Some((w, c, ca)) = dec_val(v.value()) {
+                if let Some((w, c, ca, b)) = dec_val(v.value()) {
                     out.push(UserWordRecord {
                         code: code.to_string(),
                         text: text.to_string(),
                         weight: w,
                         count: c,
                         created_at: ca,
+                        boundary: b,
                     });
                 }
             }
@@ -139,7 +153,7 @@ impl Store {
                 if !key.starts_with(&scan) {
                     break;
                 }
-                if let (Some((_, code, text)), Some((w, c, ca))) =
+                if let (Some((_, code, text)), Some((w, c, ca, b))) =
                     (crate::user_words::split_key(key), dec_val(v.value()))
                 {
                     out.push(UserWordRecord {
@@ -148,6 +162,7 @@ impl Store {
                         weight: w,
                         count: c,
                         created_at: ca,
+                        boundary: b,
                     });
                 }
                 if limit > 0 && out.len() >= limit {
@@ -175,7 +190,7 @@ impl Store {
                     if !key.starts_with(&scan) {
                         break;
                     }
-                    let w = dec_val(v.value()).map(|(w, _, _)| w).unwrap_or(0);
+                    let w = dec_val(v.value()).map(|(w, _, _, _)| w).unwrap_or(0);
                     all.push((key.to_string(), w));
                 }
                 // 2) 超出 max_keep 则删除权重最低的若干条
@@ -220,7 +235,8 @@ impl Store {
     ) -> anyhow::Result<(usize, usize)> {
         let (rows, skipped) = wdict::parse_words_wdict(text).map_err(|e| anyhow::anyhow!(e))?;
         for r in &rows {
-            self.learn_temp_word(schema, &r.code, &r.text, r.weight)?;
+            // wdict 是扁平文本（code\ttext\tweight），无音节边界可言 → 0（消费方降级回 DAG）。
+            self.learn_temp_word(schema, &r.code, &r.text, r.weight, 0)?;
         }
         Ok((rows.len(), skipped))
     }
@@ -240,11 +256,13 @@ impl Store {
                 for r in rows {
                     let key = enc_key(schema, &r.code, &r.text);
                     let cap = r.weight.min(TEMP_WORD_MAX_WEIGHT);
-                    let (w, c, ca) = match t.get(key.as_str())?.and_then(|g| dec_val(g.value())) {
-                        Some((ow, oc, oca)) => (ow.max(cap), oc.max(r.count), oca),
-                        None => (cap, r.count, now_secs()),
+                    // wdict 行无边界；已存在则沿用旧 boundary（切分不因导入而变）。
+                    let (w, c, ca, b) = match t.get(key.as_str())?.and_then(|g| dec_val(g.value()))
+                    {
+                        Some((ow, oc, oca, ob)) => (ow.max(cap), oc.max(r.count), oca, ob),
+                        None => (cap, r.count, now_secs(), 0),
                     };
-                    t.insert(key.as_str(), enc_val(w, c, ca).as_slice())?;
+                    t.insert(key.as_str(), enc_val(w, c, ca, b).as_slice())?;
                 }
             }
             txn.commit()?;
@@ -309,15 +327,22 @@ impl Store {
                 let temp = temp_t.get(key.as_str())?.and_then(|g| dec_val(g.value()));
                 match temp {
                     None => promoted = false,
-                    Some((_tw, tc, tca)) => {
+                    Some((_tw, tc, tca, tb)) => {
                         {
                             let mut user_t = txn.open_table(USER_WORDS)?;
-                            let (nw, nc, nca) =
+                            // boundary 随词一起晋升：临时词由造词算得（有边界），用户词侧若已有
+                            // 非 0 值则沿用（同 code/text 的切分确定，且旧值来源未必更差）。
+                            let (nw, nc, nca, nb) =
                                 match user_t.get(key.as_str())?.and_then(|g| dec_val(g.value())) {
-                                    Some((uw, uc, uca)) => (uw.max(PROMOTED_WEIGHT), tc + uc, uca),
-                                    None => (PROMOTED_WEIGHT, tc, tca),
+                                    Some((uw, uc, uca, ub)) => (
+                                        uw.max(PROMOTED_WEIGHT),
+                                        tc + uc,
+                                        uca,
+                                        if ub != 0 { ub } else { tb },
+                                    ),
+                                    None => (PROMOTED_WEIGHT, tc, tca, tb),
                                 };
-                            user_t.insert(key.as_str(), enc_val(nw, nc, nca).as_slice())?;
+                            user_t.insert(key.as_str(), enc_val(nw, nc, nca, nb).as_slice())?;
                         }
                         temp_t.remove(key.as_str())?;
                         promoted = true;
@@ -344,8 +369,8 @@ mod tests {
     fn temp_words_wdict_roundtrip_and_clear() {
         let path = tmp("wind_tw_io.redb");
         let s = Store::open(&path).unwrap();
-        s.learn_temp_word("wb", "ab", "临时", 50).unwrap();
-        s.learn_temp_word("py", "ni", "你", 10).unwrap();
+        s.learn_temp_word("wb", "ab", "临时", 50, 0).unwrap();
+        s.learn_temp_word("py", "ni", "你", 10, 0).unwrap();
         let text = s.export_temp_words_wdict("wb", "t").unwrap();
         assert!(text.contains("--- !words"));
 
@@ -371,7 +396,7 @@ mod tests {
         let path = tmp("wind_tw_promote_thresh.redb");
         let s = Store::open(&path).unwrap();
         for i in 1..=3u32 {
-            let n = s.learn_temp_word("wubi86", "abcd", "测试", 100).unwrap();
+            let n = s.learn_temp_word("wubi86", "abcd", "测试", 100, 0).unwrap();
             assert_eq!(n, i);
         }
         assert_eq!(
@@ -394,13 +419,13 @@ mod tests {
     fn test_learn_count_only_weight_unchanged() {
         let path = tmp("wind_tw_learn.redb");
         let s = Store::open(&path).unwrap();
-        assert_eq!(s.learn_temp_word("wb", "a", "工", 800).unwrap(), 1);
-        assert_eq!(s.learn_temp_word("wb", "a", "工", 800).unwrap(), 2);
+        assert_eq!(s.learn_temp_word("wb", "a", "工", 800, 0).unwrap(), 1);
+        assert_eq!(s.learn_temp_word("wb", "a", "工", 800, 0).unwrap(), 2);
         let r = s.get_temp_words("wb", "a").unwrap();
         assert_eq!(r[0].count, 2);
         assert_eq!(r[0].weight, 800, "权重不再随复选累加，保持写入初值");
         // 初值上限
-        let _ = s.learn_temp_word("wb", "b", "戈", 99999).unwrap();
+        let _ = s.learn_temp_word("wb", "b", "戈", 99999, 0).unwrap();
         assert_eq!(
             s.get_temp_words("wb", "b").unwrap()[0].weight,
             TEMP_WORD_MAX_WEIGHT
@@ -416,7 +441,7 @@ mod tests {
             s.increment_temp_if_exists("wb", "a", "工").unwrap(),
             (false, 0)
         );
-        s.learn_temp_word("wb", "a", "工", 100).unwrap();
+        s.learn_temp_word("wb", "a", "工", 100, 0).unwrap();
         assert_eq!(
             s.increment_temp_if_exists("wb", "a", "工").unwrap(),
             (true, 2)
@@ -433,9 +458,9 @@ mod tests {
     fn test_evict_lowest_weight() {
         let path = tmp("wind_tw_evict.redb");
         let s = Store::open(&path).unwrap();
-        s.learn_temp_word("wb", "a", "低", 10).unwrap();
-        s.learn_temp_word("wb", "b", "中", 50).unwrap();
-        s.learn_temp_word("wb", "c", "高", 90).unwrap();
+        s.learn_temp_word("wb", "a", "低", 10, 0).unwrap();
+        s.learn_temp_word("wb", "b", "中", 50, 0).unwrap();
+        s.learn_temp_word("wb", "c", "高", 90, 0).unwrap();
         // 保留 2 → 删除权重最低的 1 条（"低"）
         assert_eq!(s.evict_temp_words("wb", 2).unwrap(), 1);
         assert!(s.get_temp_words("wb", "a").unwrap().is_empty());
@@ -447,8 +472,8 @@ mod tests {
     fn test_promote_uses_fixed_weight() {
         let path = tmp("wind_tw_promote.redb");
         let s = Store::open(&path).unwrap();
-        s.learn_temp_word("wb", "a", "工", 800).unwrap();
-        s.learn_temp_word("wb", "a", "工", 800).unwrap(); // count=2
+        s.learn_temp_word("wb", "a", "工", 800, 0).unwrap();
+        s.learn_temp_word("wb", "a", "工", 800, 0).unwrap(); // count=2
         assert!(s.promote_temp_word("wb", "a", "工").unwrap());
         // 临时库已删
         assert!(s.get_temp_words("wb", "a").unwrap().is_empty());
@@ -457,8 +482,8 @@ mod tests {
         assert_eq!(u[0].weight, PROMOTED_WEIGHT);
         assert_eq!(u[0].count, 2);
         // 已存在更高权重的手动加词：晋升不应下调，取 max
-        s.add_user_word("wb", "b", "戈", 1200).unwrap();
-        s.learn_temp_word("wb", "b", "戈", 800).unwrap();
+        s.add_user_word("wb", "b", "戈", 1200, 0).unwrap();
+        s.learn_temp_word("wb", "b", "戈", 800, 0).unwrap();
         assert!(s.promote_temp_word("wb", "b", "戈").unwrap());
         assert_eq!(s.get_user_words("wb", "b").unwrap()[0].weight, 1200);
         // 不存在的临时词晋升返回 false

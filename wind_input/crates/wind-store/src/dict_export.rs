@@ -215,10 +215,10 @@ mod tests {
     fn all_sections_roundtrip() {
         let path = tmp("wind_dict_sections_io.redb");
         let s = Store::open(&path).unwrap();
-        s.add_user_word("wb", "a", "工", 100).unwrap();
+        s.add_user_word("wb", "a", "工", 100, 0).unwrap();
         s.on_word_selected("wb", "a", "工", 0, 0).unwrap(); // user count -> 1
-        s.learn_temp_word("wb", "ab", "临时", 50).unwrap();
-        s.learn_temp_word("wb", "ab", "临时", 50).unwrap(); // temp count -> 2
+        s.learn_temp_word("wb", "ab", "临时", 50, 0).unwrap();
+        s.learn_temp_word("wb", "ab", "临时", 50, 0).unwrap(); // temp count -> 2
         s.record_freq("wb", "a", "工").unwrap();
         s.record_freq("wb", "a", "工").unwrap(); // freq count -> 2
         s.pin_shadow("wb", "aaaa", "恭", None, 0).unwrap();
@@ -272,7 +272,7 @@ mod tests {
     fn selective_export_and_present_guard() {
         let path = tmp("wind_dict_sel.redb");
         let s = Store::open(&path).unwrap();
-        s.add_user_word("wb", "a", "工", 100).unwrap();
+        s.add_user_word("wb", "a", "工", 100, 0).unwrap();
         s.record_freq("wb", "a", "工").unwrap();
 
         // 只导词频
@@ -285,7 +285,7 @@ mod tests {
         // 目标库已有用户词；即便选了 UserWords，但文件无 words 段 → replace 也不清空
         let path2 = tmp("wind_dict_sel2.redb");
         let s2 = Store::open(&path2).unwrap();
-        s2.add_user_word("wb", "z", "旧", 9).unwrap();
+        s2.add_user_word("wb", "z", "旧", 9, 0).unwrap();
         let all = [DictSection::UserWords, DictSection::Freq];
         let rep = s2
             .import_dict_sections_wdict("wb", &text, &all, true)

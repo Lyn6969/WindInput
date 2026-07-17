@@ -372,8 +372,8 @@ mod tests {
 
     fn seed_store(dir: &std::path::Path) -> wind_store::store::Store {
         let s = wind_store::store::Store::open(dir.join("t.redb")).unwrap();
-        s.add_user_word("wb", "a", "工", 100).unwrap();
-        s.learn_temp_word("wb", "ab", "临", 5).unwrap();
+        s.add_user_word("wb", "a", "工", 100, 0).unwrap();
+        s.learn_temp_word("wb", "ab", "临", 5, 0).unwrap();
         s.record_freq("wb", "a", "工").unwrap();
         s.pin_shadow("wb", "aa", "恭", None, 0).unwrap();
         s.add_phrase("bj", "北京", 0, 10).unwrap();
@@ -589,7 +589,7 @@ mod tests {
 
         let t2 = tempfile::tempdir().unwrap();
         let s2 = wind_store::store::Store::open(t2.path().join("t2.redb")).unwrap();
-        s2.add_user_word("wb", "zz", "杂", 1).unwrap(); // 本地杂词
+        s2.add_user_word("wb", "zz", "杂", 1, 0).unwrap(); // 本地杂词
         let targets = RestoreTargets {
             user_config_file: None,
             user_schemas_dir: None,

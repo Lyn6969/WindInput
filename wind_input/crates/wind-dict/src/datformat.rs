@@ -9,7 +9,7 @@
 //! [Header 48B]
 //! [DAT Base: dat_size*4][DAT Check: dat_size*4]
 //! [LeafTable: leaf_count*8]   每条 {entry_off u32, entry_len u16, _ u16}
-//! [EntryRecords: entry_count*14]  每条 {text_off u32, text_len u16, weight i32, order u32}
+//! [EntryRecords: entry_count*22]  每条 {text_off u32, text_len u16, weight i32, order u32, boundary u64}
 //! [StringPool]
 //! [CharMap 1028B]  {max_code i32, char_map[256] i32}
 //! [Meta(可选) 4B len + bytes]
@@ -25,10 +25,14 @@ use tracing::info;
 const MAGIC: [u8; 4] = [b'W', b'D', b'A', b'T'];
 // v3：EntryRecord 增加 order u32（全局自然序，10→14B），跨编码等权时按词库出现顺序排序，
 // 不再退化为叶内序号致编码字母序。旧 v2 缓存 mtime/指纹不匹配自动重建。
-const VERSION: u32 = 3;
+// v4：EntryRecord 增加 boundary u64（音节起始位 bitmask，14→22B）。源数据 rime `ni hao` 的
+// 空格本就是音节真值边界，此前在解析期被 replace(' ',"") 丢弃，迫使查询侧用 DAG 重新猜切分
+// （xi'an vs xian 无从分辨）、造词侧靠 410 音节暴力反推。key 仍为扁平串，故 DAT/前缀查询
+// 语义完全不变——边界只作为 entry 侧元数据随查询结果返回。旧缓存同样靠指纹不匹配自动重建。
+const VERSION: u32 = 4;
 const HEADER_SIZE: usize = 48;
 const LEAF_SIZE: usize = 8;
-const ENTRY_SIZE: usize = 14;
+const ENTRY_SIZE: usize = 22;
 const CHARMAP_SIZE: usize = 4 + 256 * 4; // 1028
 
 /// 原子写临时文件序号（同 binformat，进程内防 tmp 撞名）。
@@ -213,20 +217,20 @@ impl StringPool {
 /// 从排序后的 (code,entries) 构建一段独立 DAT：返回 (DAT, leaves, entries)，文本入共享池。
 /// 主表与简拼表各调一次（共用同一 StringPool 去重）。
 fn build_section(
-    sorted: &[&(String, Vec<(String, i32, u32)>)],
+    sorted: &[&(String, Vec<WriteEntry>)],
     pool: &mut StringPool,
-) -> (Dat, Vec<(u32, u16)>, Vec<(u32, u16, i32, u32)>) {
+) -> (Dat, Vec<(u32, u16)>, Vec<(u32, u16, i32, u32, u64)>) {
     let mut leaves: Vec<(u32, u16)> = Vec::with_capacity(sorted.len());
-    let mut entries: Vec<(u32, u16, i32, u32)> = Vec::new();
+    let mut entries: Vec<(u32, u16, i32, u32, u64)> = Vec::new();
     let mut codes: Vec<&str> = Vec::with_capacity(sorted.len());
     let mut entry_byte_off = 0u32;
     for kv in sorted {
         let (code, ents) = (&kv.0, &kv.1);
         codes.push(code.as_str());
         leaves.push((entry_byte_off, ents.len() as u16));
-        for (text, weight, order) in ents {
+        for (text, weight, order, boundary) in ents {
             let text_off = pool.add(text);
-            entries.push((text_off, text.len() as u16, *weight, *order));
+            entries.push((text_off, text.len() as u16, *weight, *order, *boundary));
         }
         entry_byte_off += (ents.len() * ENTRY_SIZE) as u32;
     }
@@ -235,19 +239,24 @@ fn build_section(
 
 /// wdat 写入器：与 binformat::DictWriter 同样接口（add(code, entries)），输出 DAT 格式。
 /// `add_abbrev` 追加简拼（声母缩写）表，写入独立 AbbrevSection（与全拼查询互不污染）。
+/// 写入侧的一条候选：`(text, weight, order, boundary)`。
+/// boundary 见 [`DictEntry::boundary`]（音节起始位 bitmask，0=无边界信息）。
+type WriteEntry = (String, i32, u32, u64);
+
 pub struct WdatWriter {
-    keys: Vec<(String, Vec<(String, i32, u32)>)>,
-    abbrevs: Vec<(String, Vec<(String, i32, u32)>)>,
+    keys: Vec<(String, Vec<WriteEntry>)>,
+    abbrevs: Vec<(String, Vec<WriteEntry>)>,
     meta: Option<Vec<u8>>,
 }
 
 /// 把 `(text, weight)` 列表补上 order：order = 该 code 内的条目序号（0,1,2…）。
 /// 复现 v2「叶内序号」语义，供未显式提供全局序的调用方（combined 合并、测试）向后兼容。
-fn with_local_order(entries: Vec<(String, i32)>) -> Vec<(String, i32, u32)> {
+/// boundary 置 0（无边界信息）——本入口的调用方均非拼音全量构建路径。
+fn with_local_order(entries: Vec<(String, i32)>) -> Vec<WriteEntry> {
     entries
         .into_iter()
         .enumerate()
-        .map(|(i, (t, w))| (t, w, i as u32))
+        .map(|(i, (t, w))| (t, w, i as u32, 0u64))
         .collect()
 }
 
@@ -271,7 +280,23 @@ impl WdatWriter {
     /// 追加一个 code 的候选，携带**显式全局 order**（`(text, weight, order)`）。
     /// order 为词库文件内的全局出现序（跨编码单调），使等权候选跨编码按出现顺序排列。
     /// order 须 < `composite::PER_LAYER_NO_OFFSET`（1e7），否则会溢出到层序偏移带。
+    /// boundary 置 0（无边界信息）；拼音全量构建请用 [`Self::add_with_boundary`]。
     pub fn add_with_order(&mut self, code: String, entries: Vec<(String, i32, u32)>) {
+        if !entries.is_empty() {
+            self.keys.push((
+                code,
+                entries
+                    .into_iter()
+                    .map(|(t, w, o)| (t, w, o, 0u64))
+                    .collect(),
+            ));
+        }
+    }
+
+    /// 追加一个 code 的候选，携带 order **与音节边界**（`(text, weight, order, boundary)`）。
+    /// 供拼音词典构建路径使用——边界取自 rime 源数据 `ni hao` 的空格（真值，非 DAG 猜测）。
+    /// boundary 语义见 [`DictEntry::boundary`]。
+    pub fn add_with_boundary(&mut self, code: String, entries: Vec<WriteEntry>) {
         if !entries.is_empty() {
             self.keys.push((code, entries));
         }
@@ -298,9 +323,9 @@ impl WdatWriter {
         let path = path.as_ref();
 
         // 按 code 排序（确定性 + DAT key 唯一）。排序**引用**而非克隆全量数据，省一份大拷贝。
-        let mut sorted: Vec<&(String, Vec<(String, i32, u32)>)> = self.keys.iter().collect();
+        let mut sorted: Vec<&(String, Vec<WriteEntry>)> = self.keys.iter().collect();
         sorted.sort_by(|a, b| a.0.cmp(&b.0));
-        let mut sorted_ab: Vec<&(String, Vec<(String, i32, u32)>)> = self.abbrevs.iter().collect();
+        let mut sorted_ab: Vec<&(String, Vec<WriteEntry>)> = self.abbrevs.iter().collect();
         sorted_ab.sort_by(|a, b| a.0.cmp(&b.0));
         let has_abbrev = !sorted_ab.is_empty();
 
@@ -379,7 +404,7 @@ impl WdatWriter {
         let write_dat_section = |f: &mut std::io::BufWriter<std::fs::File>,
                                  dat: &Dat,
                                  leaves: &[(u32, u16)],
-                                 entries: &[(u32, u16, i32, u32)]|
+                                 entries: &[(u32, u16, i32, u32, u64)]|
          -> std::io::Result<()> {
             for v in &dat.base {
                 f.write_all(&v.to_le_bytes())?;
@@ -392,11 +417,12 @@ impl WdatWriter {
                 f.write_all(&elen.to_le_bytes())?;
                 f.write_all(&0u16.to_le_bytes())?;
             }
-            for (toff, tlen, w, order) in entries {
+            for (toff, tlen, w, order, boundary) in entries {
                 f.write_all(&toff.to_le_bytes())?;
                 f.write_all(&tlen.to_le_bytes())?;
                 f.write_all(&w.to_le_bytes())?;
                 f.write_all(&order.to_le_bytes())?;
+                f.write_all(&boundary.to_le_bytes())?; // v4：音节边界（22B 中的末 8B）
             }
             Ok(())
         };
@@ -657,9 +683,15 @@ impl WdatReader {
         std::str::from_utf8(&self.mmap[start..end]).unwrap_or("")
     }
 
-    /// 流式读某叶的所有候选：逐条回调 f(text, weight, order)。order=写入时携带的全局自然序
-    /// （v3；无权重时跨编码按词库出现顺序排列）。不分配中间 Vec，供全量遍历流式使用。
-    fn read_leaf_entries(&self, v: &DatView, leaf_idx: u32, f: &mut dyn FnMut(&str, i32, i32)) {
+    /// 流式读某叶的所有候选：逐条回调 f(text, weight, order, boundary)。order=写入时携带的
+    /// 全局自然序（v3；无权重时跨编码按词库出现顺序排列）；boundary=音节起始位 bitmask
+    /// （v4，见 [`DictEntry::boundary`]，0=无边界信息）。不分配中间 Vec，供全量遍历流式使用。
+    fn read_leaf_entries(
+        &self,
+        v: &DatView,
+        leaf_idx: u32,
+        f: &mut dyn FnMut(&str, i32, i32, u64),
+    ) {
         let (eoff, elen) = self.read_leaf(v, leaf_idx);
         let base = v.entry_off + eoff as usize;
         for i in 0..elen as usize {
@@ -671,18 +703,25 @@ impl WdatReader {
             let text_len = u16::from_le_bytes(self.mmap[o + 4..o + 6].try_into().unwrap());
             let weight = i32::from_le_bytes(self.mmap[o + 6..o + 10].try_into().unwrap());
             let order = u32::from_le_bytes(self.mmap[o + 10..o + 14].try_into().unwrap());
-            f(self.read_string(text_off, text_len), weight, order as i32);
+            let boundary = u64::from_le_bytes(self.mmap[o + 14..o + 22].try_into().unwrap());
+            f(
+                self.read_string(text_off, text_len),
+                weight,
+                order as i32,
+                boundary,
+            );
         }
     }
 
     /// 读某叶候选到 out（精确/前缀查找用）。
     fn read_entries(&self, v: &DatView, leaf_idx: u32, code: &str, out: &mut Vec<DictEntry>) {
-        self.read_leaf_entries(v, leaf_idx, &mut |text, weight, order| {
+        self.read_leaf_entries(v, leaf_idx, &mut |text, weight, order, boundary| {
             out.push(DictEntry {
                 code: code.to_string(),
                 text: text.to_string(),
                 weight,
                 order,
+                boundary,
             });
         });
     }
@@ -738,12 +777,13 @@ impl WdatReader {
         let mut out = Vec::new();
         let mut path: Vec<u8> = prefix.as_bytes().to_vec();
         self.for_each_leaf(v, start, &mut path, &mut |code, leaf| {
-            self.read_leaf_entries(v, leaf, &mut |text, weight, order| {
+            self.read_leaf_entries(v, leaf, &mut |text, weight, order, boundary| {
                 out.push(DictEntry {
                     code: code.to_string(),
                     text: text.to_string(),
                     weight,
                     order,
+                    boundary,
                 });
             });
         });
@@ -761,7 +801,7 @@ impl WdatReader {
         let v = &self.main;
         let mut path: Vec<u8> = Vec::new();
         self.for_each_leaf(v, 0, &mut path, &mut |code, leaf| {
-            self.read_leaf_entries(v, leaf, &mut |text, weight, _order| {
+            self.read_leaf_entries(v, leaf, &mut |text, weight, _order, _boundary| {
                 f(code, text, weight);
             });
         });

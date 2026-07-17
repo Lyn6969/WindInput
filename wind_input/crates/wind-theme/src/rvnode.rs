@@ -139,6 +139,10 @@ pub struct RvViews {
     pub toast: Option<RvNode>,
     /// 弹出菜单容器（menu.root）：背景图/层 + 容器色。item/separator 颜色仍走 palette。
     pub menu_root: Option<RvNode>,
+    /// 弹出菜单项（menu.item）：几何（padding/hover 圆角/字号偏移）来源，去 popup_menu.rs 硬编码。
+    pub menu_item: Option<RvNode>,
+    /// 菜单最小宽度（None→渲染层兜底 90）。
+    pub menu_min_width: Option<Dim>,
 
     /// 仅 index：主题定义的序号槽位字符（≤10）。空槽/越界回退。
     /// 优先级由协调器裁决：用户配置 index_labels > 本字段 > 默认数字。

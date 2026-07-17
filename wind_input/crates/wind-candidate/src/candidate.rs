@@ -83,6 +83,18 @@ pub struct Candidate {
     /// 分层：完整覆盖输入的词恒先于只覆盖部分输入的子短语单字。
     pub is_partial: bool,
     pub consumed_length: usize,
+    /// 该候选 `code` 的**音节边界**（各音节起始字节位 bitmask），见
+    /// `wind_dict::binformat::DictEntry::boundary`。`0` = 无边界信息 → 消费方降级回 DAG 猜切分。
+    ///
+    /// 来自词典真值（rime 源数据 `ni hao` 的空格），供双拼按真实边界校验候选：
+    /// 输入 nihao(5键) 双拼解释为 ni|ha|o，而「你好」的 boundary 是 ni|hao，二者不符即拒绝。
+    ///
+    /// **与 `code` 同进同出**：`composite::merge_search` 同 text 去重时 code 取高优先层、
+    /// 换最短码时也换 code，boundary 必须跟着一起换，否则会配出「A 层的 code + B 层的 boundary」。
+    ///
+    /// 引擎内部用，不推送 UI（`serde(skip)`，省 IPC 带宽）。
+    #[serde(skip)]
+    pub boundary: u64,
     pub source: CandidateSource,
     pub phrase_template: String,
     pub is_group: bool,
@@ -116,6 +128,7 @@ impl Default for Candidate {
             is_prefix: false,
             is_partial: false,
             consumed_length: 0,
+            boundary: 0,
             source: CandidateSource::None,
             phrase_template: String::new(),
             is_group: false,

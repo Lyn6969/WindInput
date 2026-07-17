@@ -17,6 +17,7 @@ use crate::sys::{
 };
 use crate::text::dwrite::TextRenderer;
 use crate::view::{Align, Edges, Layout, Rect, View};
+use wind_theme::schema::Dim;
 use crate::window::{LayeredWindow, WindowMouse};
 #[cfg(windows)]
 use windows::Win32::Foundation::{GlobalFree, HANDLE, HGLOBAL};
@@ -609,8 +610,23 @@ impl PopupMenu {
         selected: usize,
     ) -> (View, u32, u32, Vec<(usize, Rect)>) {
         let s = self.scale;
+        // 几何读主题（menu.item / menu.root / menu.min_width），None→内置默认（行为不变）。
+        let views = self.theme.as_ref().map(|t| &t.views);
+        let mi = views.and_then(|v| v.menu_item.as_ref());
+        let mroot = views.and_then(|v| v.menu_root.as_ref());
+        let resolve_dim = |o: Option<Dim>, def: f32| o.map(|x| x.resolve(s, 0.0)).unwrap_or(def * s);
         let item_h = (FONT_PX * 1.9 * s).ceil();
-        let pad = Edges::xy(12.0 * s, 4.0 * s);
+        // item 内边距：menu.item.padding（左→x、上→y）优先，默认 xy(12,4)。
+        let pad = Edges::xy(
+            resolve_dim(mi.and_then(|n| n.padding.left), 12.0),
+            resolve_dim(mi.and_then(|n| n.padding.top), 4.0),
+        );
+        // item 高亮圆角：menu.item.border_radius 优先，默认 4。
+        let hover_radius = resolve_dim(mi.and_then(|n| n.border_radius), 4.0);
+        // root 四边内边距：menu.root.padding（取 left 代表）优先，默认 4。
+        let root_pad = resolve_dim(mroot.and_then(|n| n.padding.left), 4.0);
+        // 内容最小宽：menu.min_width 优先，默认 90。
+        let min_w = resolve_dim(views.and_then(|v| v.menu_min_width), 90.0);
 
         // 统一项宽 = 勾选列 + 最长标签 + 内边距；子菜单项额外预留 ▸ 列宽（右对齐固定到末端）。
         let arrow_w = self.renderer.measure_text(SUBMENU_ARROW).width;
@@ -632,13 +648,13 @@ impl PopupMenu {
                 max_label = max_label.max(w);
             }
         }
-        let item_w = (max_label + pad.l + pad.r).max(90.0 * s);
+        let item_w = (max_label + pad.l + pad.r).max(min_w);
 
         let mut root = View::container(Layout::Column)
             .bg(self.bg)
             .border(self.border, self.border_w)
             .radius(self.radius)
-            .pad(Edges::all(4.0 * s));
+            .pad(Edges::all(root_pad));
         // 主题位图背景 + 层（jidian menu.root 吃九宫格 panel + 角标水印）。
         if let Some(img) = &self.bg_image {
             root = root.bg_image(img.clone());
@@ -671,7 +687,7 @@ impl PopupMenu {
                 .fixed_w(item_w)
                 .fixed_h(item_h)
                 .pad(pad)
-                .radius(4.0 * s)
+                .radius(hover_radius)
                 .cross(Align::Center)
                 .tag(i as i32);
             // 勾选列（固定宽）：✓ 仅勾选项显示，但所有项占同宽 → 标签对齐。

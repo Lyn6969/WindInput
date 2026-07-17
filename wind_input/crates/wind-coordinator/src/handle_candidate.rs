@@ -926,13 +926,13 @@ impl Coordinator {
     /// 光标一律拉到剩余编码末尾：回退的码插在缓冲前部，光标留在原处会落进这段码中间，
     /// 语义不清。无段可退时（理论边界）吃掉按键，不透传。
     pub(crate) fn pop_committed_seg(&self, state: &mut State) -> KeyAction {
-        let Some((code, _, _)) = state.committed_segs.pop() else {
+        let Some((code, _, _, _)) = state.committed_segs.pop() else {
             return KeyAction::Consumed;
         };
         state.committed_text = state
             .committed_segs
             .iter()
-            .map(|(_, t, _)| t.as_str())
+            .map(|(_, t, _, _)| t.as_str())
             .collect();
         state.input_buffer = format!("{}{}", code, state.input_buffer);
         state.input_cursor_pos = state.input_buffer.len();
@@ -1084,7 +1084,7 @@ impl Coordinator {
         if partial {
             state
                 .committed_segs
-                .push((code, cand.text.clone(), cand.source));
+                .push((code, cand.text.clone(), cand.source, cand.boundary));
             state.committed_text.push_str(&cand.text);
             state.input_buffer = state.input_buffer[consumed..].to_string();
             // 分步确认消费掉前缀码：剩余编码整体左移，光标落到剩余码末尾（对齐 Go）。
@@ -1098,9 +1098,12 @@ impl Coordinator {
                 text: display,
             }
         } else {
-            state
-                .committed_segs
-                .push((code.clone(), cand.text.clone(), cand.source));
+            state.committed_segs.push((
+                code.clone(),
+                cand.text.clone(),
+                cand.source,
+                cand.boundary,
+            ));
             let final_simplified = format!("{}{}", state.committed_text, cand.text);
             self.learn_phrase_on_commit(state); // 自动造词（多段组成的词）
             // 6b: 临时词使用累积（对齐 Go LearnWord-on-commit）：选中临时层候选也推进晋升计数。
@@ -1122,9 +1125,15 @@ impl Coordinator {
                             .auto_phrase
                             .promote_count
                     };
-                    if let Ok(count) =
-                        store.learn_temp_word(&schema, &code, &cand.text, LEARN_ADD_WEIGHT)
-                    {
+                    // 选中已存在的临时词：learn_temp_word 内部沿用旧 boundary，仅当旧值为 0
+                    // （v1 遗留/无信息）时用候选自带的边界补上。
+                    if let Ok(count) = store.learn_temp_word(
+                        &schema,
+                        &code,
+                        &cand.text,
+                        LEARN_ADD_WEIGHT,
+                        cand.boundary,
+                    ) {
                         self.maybe_promote_temp(
                             store,
                             &schema,

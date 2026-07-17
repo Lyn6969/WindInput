@@ -368,7 +368,11 @@ pub(crate) struct State {
     pub(crate) committed_text: String,
     /// 已转换前缀的分段记录 (消费码, 汉字, 候选来源)：供退格逐段回退与完整上屏时自动造词。
     /// 来源用于混输自动造词的"全段同源"归属路由（P2d）。
-    pub(crate) committed_segs: Vec<(String, String, CandidateSource)>,
+    /// 已分步上屏的段：`(code, text, source, boundary)`。
+    /// boundary = 该段 code 的音节边界（见 `wind_dict::binformat::DictEntry::boundary`）；
+    /// 段自身可能是多音节整词（选「你好」→ 段码 nihao、段内边界 ni|hao），故自动造词拼接
+    /// 各段时须把段内边界平移到全局位置，不能只按「一段一音节」记。
+    pub(crate) committed_segs: Vec<(String, String, CandidateSource, u64)>,
     /// 当前激活的独占输入模式（临时拼音/快捷输入/临时英文）。`None` = 普通输入。
     /// 单点决策的唯一真相源：结构上保证同一时刻至多一个独占模式（见 `pipeline.rs`）。
     pub(crate) active: Option<ModeKind>,
@@ -436,6 +440,9 @@ pub(crate) struct State {
     pub(crate) add_word_len: usize,
     /// 当前词自动计算的编码（拼音生成 / 码表反查；空 = 无法计算，确认时中止）。
     pub(crate) add_word_code: String,
+    /// `add_word_code` 的音节边界（见 `wind_dict::binformat::DictEntry::boundary`）；
+    /// 0 = 无信息（码表反查/逐字兜底）。与 code 同生同灭，入库时一并写入用户词。
+    pub(crate) add_word_boundary: u64,
     /// 加词模式「强制竖排」时记住进入前的布局（Some(原 vertical) = 已强制，退出恢复）。
     pub(crate) add_word_saved_vertical: Option<bool>,
 }
@@ -1079,6 +1086,7 @@ impl Coordinator {
                 add_word_chars: Vec::new(),
                 add_word_len: 0,
                 add_word_code: String::new(),
+                add_word_boundary: 0,
                 add_word_saved_vertical: None,
             }),
             push_server,
@@ -4597,16 +4605,19 @@ impl MessageHandler for Coordinator {
             return;
         }
         let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
-        state.input_buffer.clear();
-        state.candidates.clear();
+        // 必须整体复位（含 active/temp_pinyin_*/mix_* 等 overlay 状态），不能只清 input_buffer：
+        // 临时拼音/快捷输入的缓冲与前缀不在 input_buffer 里，只清后者会让模式残留——
+        // 真机现象：` 进临拼后点鼠标移光标，候选窗随 notify_ui_hide 消失但模式还在，
+        // 再按 d 仍走 handle_temp_pinyin_key，组合区诡异地显示 `d。
+        // reset_exclusive_modes 内含 disarm_smart_symbol 与强制竖排布局恢复。
+        // 此回调仅在 TSF 意外终止组合时触发（焦点切换、宿主强制 EndComposition 等）；
+        // 我们自己的 CommitText 不触发（_pComposition 已提前置 nullptr，走"Already released"分支）。
+        // 因此在此 disarm 是安全的：意外中断必然使 HoldComposition 失效，旧 held_text 不可再用。
+        self.reset_exclusive_modes(&mut state);
         // 复位菜单状态：点击别处会终止 composition 并经 notify_ui_hide 隐藏菜单窗口，
         // 但若不清 menu_open，下一个键会被 forward_menu_key 当作菜单键吞掉（首字符失效）。
         state.menu_open = false;
         drop(state);
-        // 此回调仅在 TSF 意外终止组合时触发（焦点切换、宿主强制 EndComposition 等）；
-        // 我们自己的 CommitText 不触发（_pComposition 已提前置 nullptr，走"Already released"分支）。
-        // 因此在此 disarm 是安全的：意外中断必然使 HoldComposition 失效，旧 held_text 不可再用。
-        self.disarm_smart_symbol();
         self.clear_pair_tracker(); // 组合意外终止：配对上下文失效，清栈防跳出键误判
         self.notify_ui_hide();
     }

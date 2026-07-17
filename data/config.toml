@@ -9,8 +9,9 @@
 [schema]
 active = "wubi86"
 available = ["wubi86", "wubi86_pinyin"]
-# 主码表/主拼音方案 ID，留空时按 available 顺序自动选第一个对应类型的方案
+# 主码表方案 ID（拼音反查码源），留空时按 available 顺序自动选第一个码表方案
 primary_codetable = ""
+# 主拼音方案 ID（临时拼音的目标方案，如双拼方案 id），留空 = 全拼 "pinyin"
 primary_pinyin = ""
 
 # 全局码表配置：所有码表方案公共基线（出厂取主力码表 wubi86 偏好）。
@@ -122,7 +123,6 @@ cancel_on_mode_switch = false
 
 [input.temp_pinyin]
 enabled = true
-schema = "pinyin"
 trigger_keys = ["backtick"]
 
 [input.auto_pair]

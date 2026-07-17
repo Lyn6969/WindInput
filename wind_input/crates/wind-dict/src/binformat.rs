@@ -89,6 +89,14 @@ pub struct DictEntry {
     pub text: String,
     pub weight: i32,
     pub order: i32,
+    /// 音节边界：`code` 中各音节**起始字节位**的 bitmask（bit i 置位 = 第 i 字节是音节开头）。
+    /// 如「你好」code="nihao"、音节 ni|hao → 起始位 {0,2} → `0b101`。
+    ///
+    /// 语义来自 rime 源数据 `你好\tni hao` 里的空格——那个空格**就是**音节边界，是真值，
+    /// 无需靠 DAG 猜（`xian` 到底是 xi'an 还是 xian，DAG 覆盖数相同、无从分辨，词典知道）。
+    ///
+    /// `0` = **无边界信息**（非拼音码如五笔、code 超 64 字节、旧格式回退），消费方须降级回 DAG。
+    pub boundary: u64,
 }
 
 /// 二进制词典读取器（mmap 零拷贝）
@@ -285,6 +293,8 @@ impl DictReader {
                     text: rec.text,
                     weight: rec.weight,
                     order: rec.order,
+                    // wdb（旧格式，拼音侧已不用）无音节边界字段 → 0 表无信息，消费方降级回 DAG。
+                    boundary: 0,
                 });
             }
         }

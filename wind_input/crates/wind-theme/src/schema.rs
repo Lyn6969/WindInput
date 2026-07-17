@@ -345,6 +345,8 @@ pub struct MenuViews {
     pub item: ViewNode,
     #[serde(default)]
     pub separator: ViewNode,
+    /// 菜单最小宽度（dp；None→渲染层兜底 90）。
+    pub min_width: Option<Dim>,
 }
 
 /// 具名 View 集合（固定骨架）。候选窗各节点 + 其它窗口（status/tooltip/toast/toolbar/menu）。

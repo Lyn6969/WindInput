@@ -226,8 +226,8 @@ mod tests {
         let path = std::env::temp_dir().join("wind_store_schemas_test.redb");
         let _ = std::fs::remove_file(&path);
         let s = Store::open(&path).unwrap();
-        s.add_user_word("wb", "a", "工", 1).unwrap();
-        s.learn_temp_word("py", "ni", "你", 1).unwrap();
+        s.add_user_word("wb", "a", "工", 1, 0).unwrap();
+        s.learn_temp_word("py", "ni", "你", 1, 0).unwrap();
         s.record_freq("sp", "x", "词").unwrap();
         s.pin_shadow("wb", "aa", "恭", None, 0).unwrap();
         let mut got = s.list_data_schemas().unwrap();
