@@ -597,7 +597,27 @@ impl Engine for PinyinEngine {
 
         // DAG 分词提前到 step1 之前：lookup_with_fuzzy 需要音节列表生成模糊变体。
         // 含手动分隔符时按 `'` 分段独立分词（`'` 为硬边界，音节不得跨越），否则整串 DAG。
-        let syllables = if has_sep {
+        //
+        // **双拼激活时用双拼自己的真值切分**，不让 DAG 对拼平后的 full_pinyin 重猜——
+        // 双拼每 2 键 = 1 音节，边界免费且精确。让 DAG 重猜会造成「查询按猜测、校验按真值」
+        // 两套切分打架：`hao`(3键) 双拼解释为 ha|o，DAG 却重切成 [hao] 只查了「好」，
+        // 随后被真值拒掉，而真正该查的 `ha`（→「哈」）压根没查 → 候选全空。
+        let sp_syllables: Option<Vec<String>> = sp_result.as_ref().and_then(|r| {
+            // 音节须从 0 起在全拼空间连续覆盖：中间若有「无匹配键对原样回写」段（如首道双拼的
+            // om），pinyin 拼接就不等于 full 的前缀，completed_len 会错位切出乱码。此时退回 DAG。
+            let mut cursor = 0usize;
+            for s in &r.syllables {
+                if s.fp_start != cursor {
+                    return None;
+                }
+                cursor = s.fp_end;
+            }
+            // 尾部 partial（未完成音节的声母）不是完成音节，不计入——它由 step4 前缀补全承接。
+            Some(r.syllables.iter().map(|s| s.pinyin.clone()).collect())
+        });
+        let syllables = if let Some(v) = sp_syllables {
+            v
+        } else if has_sep {
             self.segment_with_separators(input)
         } else {
             Dag::build(input, trie).maximum_match()
@@ -1449,6 +1469,55 @@ mod tests {
         assert!(
             r2.candidates.iter().any(|c| c.text == "你好"),
             "4 键 nihc 解释为 ni|hao，应出「你好」，实际: {:?}",
+            r2.candidates.iter().map(|c| &c.text).collect::<Vec<_>>()
+        );
+    }
+
+    /// 回归（真机报告）：双拼下 `nihao` 选「你」后，剩余 `hao`(3键) 变成空候选。
+    ///
+    /// 病灶不在校验本身，而在「查询仍按 DAG 的猜测、校验却按双拼的真值」——两套切分打架：
+    /// 双拼解释 `hao` = `ha`+`o`(partial)，而 DAG 把 `full="hao"` 重切成 `[hao]` 只查了
+    /// 「好」，随后被真值 {0,2} 拒掉；而双拼真正该查的 `ha`（→「哈」）压根没被查。
+    /// 于是 DAG 查来的被拒、双拼该查的没查 → 空。
+    #[test]
+    fn shuangpin_uses_own_split_for_lookup_not_dag() {
+        use crate::pinyin::shuangpin::{Layout, ShuangpinConverter};
+        use std::io::Write;
+        let path = std::env::temp_dir().join("wind_sp_lookup_split.dict.yaml");
+        {
+            let mut f = std::fs::File::create(&path).unwrap();
+            writeln!(f, "---\nname: py\n...").unwrap();
+            writeln!(f, "好\thao\t2000").unwrap(); // 单音节，边界 {0}
+            writeln!(f, "哈\tha\t900").unwrap();
+            writeln!(f, "哦\to\t300").unwrap();
+        }
+        let dict = CachedDict::Memory(CodetableDict::load(&path).unwrap());
+        let _ = std::fs::remove_file(&path);
+
+        let schema_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../../data/schemas/shuangpin");
+        let layout = Layout::from_toml(&schema_dir.join("xiaohe.toml")).expect("加载小鹤布局失败");
+        let eng = PinyinEngine::new(Config::default(), dict)
+            .with_shuangpin(ShuangpinConverter::new(layout));
+
+        // 3 键 hao → 双拼 ha|o：应按**双拼自己的切分**去查，出「哈」(ha)。
+        let r = eng.convert("hao", 20).unwrap();
+        let texts: Vec<&String> = r.candidates.iter().map(|c| &c.text).collect();
+        assert!(
+            texts.contains(&&"哈".to_string()),
+            "ha 是双拼解释出的完成音节，应查到「哈」，实际: {texts:?}（空候选=查询仍按 DAG 猜）"
+        );
+        // 「好」的双拼是 2 键 hc，3 键 h/a/o 不该出它。
+        assert!(
+            !texts.contains(&&"好".to_string()),
+            "3 键 hao 解释为 ha|o，不该出「好」（其双拼是 hc），实际: {texts:?}"
+        );
+
+        // 2 键 hc → 双拼 hao 单音节 → 正常出「好」。
+        let r2 = eng.convert("hc", 20).unwrap();
+        assert!(
+            r2.candidates.iter().any(|c| c.text == "好"),
+            "2 键 hc 解释为 hao，应出「好」，实际: {:?}",
             r2.candidates.iter().map(|c| &c.text).collect::<Vec<_>>()
         );
     }
