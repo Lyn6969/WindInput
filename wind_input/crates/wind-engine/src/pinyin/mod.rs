@@ -238,16 +238,28 @@ impl PinyinEngine {
     /// fuzzy 全 false 时 fuzzy_variants 返回空 → 天然退化为纯 `dict.search`（无需 enabled 判断）。
     /// 返回 `(text, weight, order, is_fuzzy)`：原 code 精确命中 is_fuzzy=false；
     /// 模糊变体命中 is_fuzzy=true（供排序时整体降到精确候选之后）。
-    fn lookup_with_fuzzy(&self, code: &str, syllables: &[String]) -> Vec<(String, i32, i32, bool)> {
-        let mut results: Vec<(String, i32, i32, bool)> = self
+    fn lookup_with_fuzzy(&self, code: &str, syllables: &[String]) -> Vec<LookupHit> {
+        // 精确匹配：候选码即查询码 `code`，故词典 boundary 与之同域，可直接采信。
+        // 注意此处必须用 search_with_boundary——拼音引擎直接持有 CachedDict、不经
+        // SystemDictLayer，用 search() 会把边界丢在这里。
+        let mut results: Vec<LookupHit> = self
             .dict
-            .search(code)
+            .search_with_boundary(code)
             .into_iter()
-            .map(|(t, w, o)| (t, w, o, false))
+            .map(|h| LookupHit {
+                text: h.text,
+                weight: h.weight,
+                order: h.order,
+                is_fuzzy: false,
+                boundary: h.boundary,
+            })
             .collect();
         let mut seen: std::collections::HashSet<String> =
-            results.iter().map(|(t, _, _, _)| t.clone()).collect();
+            results.iter().map(|h| h.text.clone()).collect();
 
+        // 模糊变体命中一律 boundary=0（不设防）：词典给的是**变体码**（如 zhongguo）的切分，
+        // 而候选对外的 code 是用户实际输入的原码（zongguo）——两者不同域，位偏移对不上，
+        // 直接采信会错位误杀。模糊音本就是放宽匹配，不校验边界是合理的。
         if syllables.len() <= 1 {
             // 单音节：对该音节（无切分时退化为整码）生成变体逐个查询。
             let syllable: &str = if syllables.len() == 1 {
@@ -258,7 +270,13 @@ impl PinyinEngine {
             for variant in fuzzy::FuzzyMatcher::fuzzy_variants(syllable, &self.fuzzy_config) {
                 for (text, weight, order) in self.dict.search(&variant) {
                     if seen.insert(text.clone()) {
-                        results.push((text, weight, order, true));
+                        results.push(LookupHit {
+                            text,
+                            weight,
+                            order,
+                            is_fuzzy: true,
+                            boundary: 0,
+                        });
                     }
                 }
             }
@@ -270,7 +288,13 @@ impl PinyinEngine {
                 }
                 for (text, weight, order) in self.dict.search(&alt_code) {
                     if seen.insert(text.clone()) {
-                        results.push((text, weight, order, true));
+                        results.push(LookupHit {
+                            text,
+                            weight,
+                            order,
+                            is_fuzzy: true,
+                            boundary: 0,
+                        });
                     }
                 }
             }
@@ -360,6 +384,98 @@ fn map_consumed_over_separators(input: &str, fp_consumed: usize) -> usize {
         i += 1;
     }
     i
+}
+
+/// 词典查询命中（含音节边界），供 `lookup_with_fuzzy` 返回。
+struct LookupHit {
+    text: String,
+    weight: i32,
+    order: i32,
+    is_fuzzy: bool,
+    /// 该候选 code 的音节边界；0=无信息（模糊变体/非拼音词库/旧数据），不参与校验。
+    boundary: u64,
+}
+
+/// 由音节列表算边界 bitmask（全拼空间），只取覆盖前 `limit_len` 字节的部分。
+///
+/// 用于 **DAG 切分出来的**候选（Viterbi 整句、前缀子短语）——它们的 code 是把
+/// `syllables` 拼起来的，故其"边界"就是这份切分本身。这与词典真值边界同域、可直接比对：
+/// 双拼 `nihao` 被 DAG 重切成 `ni|hao` 拼出「你好」时，标上 DAG 的切分，正好会被
+/// 双拼真值 `ni|ha|o` 拒掉——这正是我们要的。
+fn syllables_boundary_mask(syllables: &[String], limit_len: usize) -> u64 {
+    let mut mask = 0u64;
+    let mut pos = 0usize;
+    for s in syllables {
+        if pos >= limit_len {
+            break;
+        }
+        if pos >= 64 {
+            return 0;
+        }
+        mask |= 1u64 << pos;
+        pos += s.len();
+    }
+    mask
+}
+
+/// 双拼解释给出的音节边界（**全拼空间** bitmask，与候选 `boundary` 同域）。
+///
+/// 双拼每 2 键 = 1 音节，边界是免费且精确的——这正是双拼相对全拼的信息优势，
+/// 此前却被拼成 `full_pinyin` 后交给 DAG 重新猜。
+///
+/// 返回 0 = **边界不可信，不参与校验**：
+/// - 无音节；
+/// - 音节在全拼空间不连续（中间有「无匹配键对原样回写」段，如首道双拼的 `om`），
+///   此时回写段没有 `ConvertedSyllable` 记录，其起始位无从得知，宁可整体弃用；
+/// - 越出 64 位 bitmask 表达范围。
+fn sp_boundary_mask(sp: &shuangpin::SpConvertResult) -> u64 {
+    let mut mask = 0u64;
+    let mut cursor = 0usize;
+    for s in &sp.syllables {
+        // 不连续 ⇒ 存在原样回写段 ⇒ 边界不完整，弃用（否则会漏标该段起始位而误杀候选）。
+        if s.fp_start != cursor || s.fp_start >= 64 {
+            return 0;
+        }
+        mask |= 1u64 << s.fp_start;
+        cursor = s.fp_end;
+    }
+    // 尾部 partial（未完成音节的声母，如 nihao 的 o）也占一个音节的起点。
+    if sp.has_partial && cursor < sp.full_pinyin.len() {
+        if cursor >= 64 {
+            return 0;
+        }
+        mask |= 1u64 << cursor;
+    }
+    mask
+}
+
+/// 候选的音节切分是否与双拼解释相容。
+///
+/// 双拼定死了每个音节的边界，候选（词典真值边界）必须与之吻合，否则它根本不是用户打的那串音。
+/// 典型：输入 `nihao`(5键) 双拼解释为 `ni|ha|o`，而「你好」的词典边界是 `ni|hao`——两者不符，
+/// 「你好」应被拒绝（该词的正确双拼是 4 键）。此前因边界信息全丢，只能靠 DAG 把
+/// `nihao` 重新切成 `ni|hao`，于是 5 键也能出「你好」。
+///
+/// 比较窗口取 `min(候选 code 长, 全拼串长)`：
+/// - 候选码更短（子短语，如 `ni`→「你」）→ 只比其覆盖的前缀范围；
+/// - 候选码更长（前缀补全，输入 `ni` 补出「你好」`nihao`）→ 只比已输入的部分，
+///   补全部分尚未键入、无从校验。
+///
+/// 任一侧无边界信息（0）即放行——降级回原有 DAG 行为，不误杀。
+fn boundary_compatible(cand_boundary: u64, sp_mask: u64, code_len: usize, full_len: usize) -> bool {
+    if cand_boundary == 0 || sp_mask == 0 {
+        return true; // 无信息 → 不设防（用户手输码/五笔/超长码/含回写段）
+    }
+    let win = code_len.min(full_len);
+    if win == 0 {
+        return true;
+    }
+    let win_mask = if win >= 64 {
+        u64::MAX
+    } else {
+        (1u64 << win) - 1
+    };
+    cand_boundary & win_mask == sp_mask & win_mask
 }
 
 /// Fix A：用双拼原始按键重建 preedit（按音节边界以 `'` 分隔）。
@@ -456,7 +572,8 @@ impl Engine for PinyinEngine {
                            weight: i32,
                            order: i32,
                            is_fuzzy: bool,
-                           is_prefix: bool| {
+                           is_prefix: bool,
+                           boundary: u64| {
             if text.is_empty() || cands.iter().any(|c| c.text == text) {
                 return;
             }
@@ -473,6 +590,7 @@ impl Engine for PinyinEngine {
                 is_fuzzy,
                 is_prefix,
                 is_partial,
+                boundary,
                 ..Default::default()
             });
         };
@@ -505,15 +623,16 @@ impl Engine for PinyinEngine {
         //    守卫按 query 比较而失配，被误标 is_fuzzy=true 沉底、遭 truncate 截断（bug①）。
         //    传 completed 后守卫正确跳过全原组合（精确匹配 is_fuzzy=false）；code 存 completed 使
         //    残码输入的 consumed_length 只覆盖完成音节（nihao 消费 5 留 m 续输）。
-        for (text, weight, order, is_fuzzy) in self.lookup_with_fuzzy(completed, &syllables) {
+        for h in self.lookup_with_fuzzy(completed, &syllables) {
             push_unique(
                 &mut candidates,
-                text,
+                h.text,
                 completed.to_string(),
-                weight,
-                order,
-                is_fuzzy,
+                h.weight,
+                h.order,
+                h.is_fuzzy,
                 false,
+                h.boundary,
             );
         }
 
@@ -571,6 +690,10 @@ impl Engine for PinyinEngine {
                                 weight,
                                 natural_order: 0,
                                 source: CandidateSource::Pinyin,
+                                // 整句是按 DAG 这份切分拼出来的，其边界即该切分本身。
+                                // 双拼下 DAG 会把 nihao 重切成 ni|hao 拼出「你好」——标上它，
+                                // 才能被双拼真值 ni|ha|o 拒掉（否则 boundary=0 直接放行）。
+                                boundary: syllables_boundary_mask(&syllables, completed.len()),
                                 ..Default::default()
                             },
                         );
@@ -591,17 +714,16 @@ impl Engine for PinyinEngine {
                 // 子词组 code 是输入的真前缀（比输入*短*，如 nihao 的「你」(ni)），是合法的
                 // 分段上屏候选，与精确同层按权重排（不可降权——否则罕见全长词「拟好」会压过
                 // 常用子词组「你」）。只有 code 比输入*长*的补全词(step4)才算前缀补全降权。
-                for (text, weight, order, is_fuzzy) in
-                    self.lookup_with_fuzzy(&code, &syllables[..end])
-                {
+                for h in self.lookup_with_fuzzy(&code, &syllables[..end]) {
                     push_unique(
                         &mut candidates,
-                        text,
+                        h.text,
                         code.clone(),
-                        weight,
-                        order,
-                        is_fuzzy,
+                        h.weight,
+                        h.order,
+                        h.is_fuzzy,
                         false,
+                        h.boundary,
                     );
                 }
             }
@@ -617,15 +739,16 @@ impl Engine for PinyinEngine {
         // is_partial asc 让他们浮到 is_partial=true 的精确子串（没/每）之前。
         // 无残码时（meiyou）保持 is_prefix=true，前缀补全沉在精确匹配之后（正常行为）。
         let trailing_partial = completed != query;
-        for (code, text, weight, order) in dict.search_prefix(query, 30) {
+        for h in dict.search_prefix_with_boundary(query, 30) {
             push_unique(
                 &mut candidates,
-                text,
-                code,
-                weight,
-                order,
+                h.text,
+                h.code,
+                h.weight,
+                h.order,
                 false,
                 !trailing_partial, // 有残码时不标 is_prefix，让候选上浮
+                h.boundary,
             );
         }
 
@@ -642,6 +765,8 @@ impl Engine for PinyinEngine {
                     999999,
                     false,
                     true,
+                    // 简拼码（nh）是各音节首字母的拼接，本身不构成音节序列 → 无边界语义。
+                    0,
                 );
             }
         }
@@ -728,6 +853,18 @@ impl Engine for PinyinEngine {
         // ④ 同层内按权重降序、自然序升序。
         // 使输入 si 时：精确单字「四/死」> 前缀补全「思考/似乎」> 模糊命中「是」；
         // 输入 baoan 时：完整词「保安」「报案」> 子短语单字「报/宝」。
+        // 双拼真值边界校验：双拼把音节边界定死了，候选的词典边界必须与之吻合。
+        // 在排序/截断**之前**过滤——否则会先截断再过滤，把该出的候选挤掉。
+        // 词典无边界信息的候选（用户手输码/五笔/旧数据）boundary=0，一律放行（降级回 DAG 行为）。
+        if let Some(r) = &sp_result {
+            let sp_mask = sp_boundary_mask(r);
+            if sp_mask != 0 {
+                let full_len = r.full_pinyin.len();
+                candidates
+                    .retain(|c| boundary_compatible(c.boundary, sp_mask, c.code.len(), full_len));
+            }
+        }
+
         candidates.sort_by(|a, b| {
             a.is_fuzzy
                 .cmp(&b.is_fuzzy)
@@ -1144,8 +1281,74 @@ mod tests {
         );
     }
 
-    /// Fix A TDD：双拼 preedit 应显示用户实际输入的原始按键（按音节边界以空格分隔，
-    /// 与全拼自动分词一致），而非转换后的全拼。输入小鹤 "nihc"（→全拼 nihao）应显示
+    /// 边界相容判定：双拼定死音节边界，候选的词典边界须与之吻合。
+    #[test]
+    fn boundary_compatible_rules() {
+        // 输入 nihao(5键) 双拼解释 ni|ha|o → 全拼 "nihao"，边界 {0,2,4}
+        let sp = 0b10101u64;
+        // 「你好」词典边界 ni|hao = {0,2}，与解释不符 → 拒绝（这正是 5 键出「你好」的病灶）
+        assert!(
+            !boundary_compatible(0b101, sp, 5, 5),
+            "ni|hao 不该匹配 ni|ha|o"
+        );
+        // 「你」code=ni(2B) 边界 {0} → 只比前 2 字节窗口 → 相容
+        assert!(boundary_compatible(0b1, sp, 2, 5));
+        // 「你哈」code=niha(4B) 边界 {0,2} → 前 4 字节窗口相容
+        assert!(boundary_compatible(0b101, sp, 4, 5));
+
+        // 正确双拼 nihc(4键,小鹤) 解释 ni|hao → 全拼 "nihao"，边界 {0,2}
+        let sp2 = 0b101u64;
+        assert!(
+            boundary_compatible(0b101, sp2, 5, 5),
+            "ni|hao 应匹配 ni|hao"
+        );
+
+        // 前缀补全：输入 ni（全拼串仅 2B），候选「你好」code=nihao(5B) 边界 {0,2}
+        // → 窗口取 min(5,2)=2，只比已输入部分 → 相容（补全部分尚未键入，无从校验）
+        assert!(boundary_compatible(0b101, 0b1, 5, 2));
+
+        // 任一侧无信息 → 放行（用户手输码/五笔/模糊变体/含回写段）
+        assert!(boundary_compatible(0, sp, 5, 5));
+        assert!(boundary_compatible(0b101, 0, 5, 5));
+    }
+
+    /// 双拼解释的边界：音节在全拼空间不连续（有「无匹配键对回写」段）时须整体弃用，
+    /// 否则会漏标该段起始位而误杀候选。
+    #[test]
+    fn sp_boundary_mask_rules() {
+        use crate::pinyin::shuangpin::{ConvertedSyllable, SpConvertResult};
+        let syl = |p: &str, fs, fe| ConvertedSyllable {
+            pinyin: p.to_string(),
+            sp_start: 0,
+            sp_end: 0,
+            fp_start: fs,
+            fp_end: fe,
+        };
+        // ni|ha + partial o → full "nihao"，边界 {0,2,4}
+        let sp = SpConvertResult {
+            syllables: vec![syl("ni", 0, 2), syl("ha", 2, 4)],
+            has_partial: true,
+            full_pinyin: "nihao".into(),
+            ..Default::default()
+        };
+        assert_eq!(sp_boundary_mask(&sp), 0b10101);
+        // ni|hao 无 partial → {0,2}
+        let sp2 = SpConvertResult {
+            syllables: vec![syl("ni", 0, 2), syl("hao", 2, 5)],
+            has_partial: false,
+            full_pinyin: "nihao".into(),
+            ..Default::default()
+        };
+        assert_eq!(sp_boundary_mask(&sp2), 0b101);
+        // 不连续（fp 空隙 = 无匹配回写段）→ 0，不参与校验
+        let sp3 = SpConvertResult {
+            syllables: vec![syl("ni", 2, 4)],
+            full_pinyin: "omni".into(),
+            ..Default::default()
+        };
+        assert_eq!(sp_boundary_mask(&sp3), 0, "有回写段时边界不完整，须弃用");
+    }
+
     /// 回归：无匹配键对（convert 的「原样回写」分支）既不进 syllables 也不置 has_partial，
     /// build_raw_preedit 必须仍覆盖它们，否则编码被静默吞掉。
     /// 真机现象（首道双拼）：nihaom → 显示 niha（om 消失），再按 a → ni'ha'oma 又复现。
@@ -1198,7 +1401,61 @@ mod tests {
         assert_eq!(build_raw_preedit("", &sp), "");
     }
 
-    /// "ni hc"，候选仍含「你好」。
+    /// **双拼真值边界校验（本功能的验收点）**：双拼把音节边界定死了，候选的词典边界必须吻合。
+    ///
+    /// 真机现象：双拼下打 5 键 `nihao` 出「你好」。那是巧合——双拼解释为 `ni|ha|o`，拼成
+    /// `full_pinyin="nihao"` 恰好撞上全拼的 nihao，DAG 再把它重切成 `ni|hao` 查到「你好」。
+    /// 而「你好」的正确双拼是 4 键（`nihc`）。
+    ///
+    /// 注意必须用 rime 源构造词典：`merge_single` 造的条目 boundary 恒 0（无信息→放行），
+    /// 用它根本测不出校验。
+    #[test]
+    fn shuangpin_rejects_mismatched_syllable_split() {
+        use crate::pinyin::shuangpin::{Layout, ShuangpinConverter};
+        use std::io::Write;
+        let path = std::env::temp_dir().join("wind_sp_boundary_check.dict.yaml");
+        {
+            let mut f = std::fs::File::create(&path).unwrap();
+            writeln!(f, "---\nname: py\n...").unwrap();
+            writeln!(f, "你好\tni hao\t2000").unwrap(); // 边界 ni|hao = {0,2}
+            writeln!(f, "你\tni\t900").unwrap();
+            writeln!(f, "哈\tha\t500").unwrap();
+            writeln!(f, "哦\to\t300").unwrap();
+        }
+        let dict = CachedDict::Memory(CodetableDict::load(&path).unwrap());
+        let _ = std::fs::remove_file(&path);
+
+        let schema_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../../data/schemas/shuangpin");
+        let layout = Layout::from_toml(&schema_dir.join("xiaohe.toml")).expect("加载小鹤布局失败");
+        let eng = PinyinEngine::new(Config::default(), dict)
+            .with_shuangpin(ShuangpinConverter::new(layout));
+
+        // 5 键 nihao → 双拼 ni|ha|o（o 为 partial），与「你好」的 ni|hao 不符 → 拒绝。
+        let r = eng.convert("nihao", 20).unwrap();
+        let texts: Vec<&String> = r.candidates.iter().map(|c| &c.text).collect();
+        assert!(
+            !texts.contains(&&"你好".to_string()),
+            "5 键 nihao 解释为 ni|ha|o，不该出「你好」（其双拼是 4 键 nihc），实际: {texts:?}"
+        );
+        // 与解释相容的候选仍在：ni → 「你」
+        assert!(
+            texts.contains(&&"你".to_string()),
+            "「你」(ni) 与 ni|ha|o 的首音节相容，应保留，实际: {texts:?}"
+        );
+
+        // 4 键 nihc → 双拼 ni|hao，与「你好」的词典边界一致 → 正常出。
+        let r2 = eng.convert("nihc", 20).unwrap();
+        assert!(
+            r2.candidates.iter().any(|c| c.text == "你好"),
+            "4 键 nihc 解释为 ni|hao，应出「你好」，实际: {:?}",
+            r2.candidates.iter().map(|c| &c.text).collect::<Vec<_>>()
+        );
+    }
+
+    /// Fix A TDD：双拼 preedit 应显示用户实际输入的原始按键（按音节边界以 `'` 分隔，
+    /// 与全拼自动分词一致），而非转换后的全拼。输入小鹤 "nihc"（→全拼 nihao）应显示
+    /// "ni'hc"，候选仍含「你好」。
     #[test]
     fn shuangpin_preedit_shows_raw_keys() {
         let mut raw = CodetableDict::empty();
