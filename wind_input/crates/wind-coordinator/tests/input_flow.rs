@@ -278,21 +278,32 @@ fn test_numpad_direct_outputs_digit() {
     if !has_schemas() {
         return;
     }
-    // 默认 numpad_behavior 为空 → direct：丢弃编码直接输出小键盘数字。
+    // 默认 numpad_behavior 为空 → direct：不把该键解释为选词，但**已打的码不丢**——
+    // 顶屏当前高亮候选后接着输出小键盘数字（旧契约为「丢弃编码只输出数字」，已废止：
+    // 丢掉用户已打的码是数据丢失，且与主键盘标点键的既有行为不一致）。
     let coord = Coordinator::new_headless(config_with("wubi86"), Some(&data_dir()));
     press_letter(&coord, 'a'); // 产生组合 + 候选
     // 小键盘 5 (VK_NUMPAD5 = 0x65)
     let act = coord.handle_key_event(&key_event(0x65, EVENT_KEY_DOWN));
     match act {
         KeyAction::InsertText { text, .. } => {
-            assert_eq!(
-                text, "5",
-                "direct 模式小键盘应直接输出数字 5，实际: {}",
+            assert!(
+                text.ends_with('5') && text.chars().count() > 1,
+                "direct 小键盘应顶屏候选再接数字 5，实际: {}",
                 text
             );
         }
         other => panic!("direct 小键盘应 InsertText，实际: {:?}", other),
     }
+
+    // 空组合时无候选可顶：仅输出数字本身。
+    let coord = Coordinator::new_headless(config_with("wubi86"), Some(&data_dir()));
+    let act = coord.handle_key_event(&key_event(0x65, EVENT_KEY_DOWN));
+    assert_eq!(
+        action_text(&act).unwrap_or_default(),
+        "5",
+        "空组合 direct 小键盘应只输出数字"
+    );
 }
 
 #[test]
@@ -1698,29 +1709,109 @@ fn test_temp_english_digits_and_punct() {
     }
 }
 
+/// direct（默认）：临英缓冲是文本，小键盘数字/符号直接入缓冲 →「英文数字连输」可用。
 #[test]
-fn test_temp_english_numpad_digits_input() {
+fn test_temp_english_numpad_direct_inputs() {
     if !has_schemas() {
         return;
     }
     // 小键盘数字在临英下曾被静默吃掉（只认主键盘 0x30-0x39，小键盘 0x60-0x69 落标点臂
-    // → punct_char 判 None → Consumed）。此处不关 show_candidates：小键盘恒作输入，
-    // 不受候选存在与否影响（与主键盘数字的选词语义刻意不同）。
+    // → punct_char 判 None → Consumed）。
     let coord = Coordinator::new_headless(config_with("wubi86"), Some(&data_dir()));
     press_shift_letter(&coord, 'v'); // V
     press_letter(&coord, 'e');
     press_letter(&coord, 'r');
-    press_vk(&coord, 0x32, false); // 主键盘 2
     let last = press_vk(&coord, 0x62, false); // 小键盘 2 (VK_NUMPAD2)
     assert_eq!(
         action_text(&last).unwrap(),
-        "Ver22",
+        "Ver2",
         "小键盘数字应入临英缓冲"
     );
-    // 小键盘运算符 / 小数点同样入缓冲。
+    // 小键盘小数点 / 减号同样入缓冲。
     press_vk(&coord, 0x6E, false); // VK_DECIMAL '.'
     let last = press_vk(&coord, 0x6D, false); // VK_SUBTRACT '-'
-    assert_eq!(action_text(&last).unwrap(), "Ver22.-", "小键盘符号应入缓冲");
+    assert_eq!(action_text(&last).unwrap(), "Ver2.-", "小键盘符号应入缓冲");
+}
+
+/// follow_main：入口归一化 → 小键盘键在**所有模式**下与主键盘同键完全一致。
+/// 归一化是唯一实现手段，故本测试即是「所有模式一致」的守护。
+#[test]
+fn test_numpad_follow_main_matches_mainboard_all_modes() {
+    if !has_schemas() {
+        return;
+    }
+    let mut cfg = config_with("wubi86");
+    cfg.input.numpad_behavior = "follow_main".into();
+    // 临英下主键盘数字的语义依赖候选有无，关掉词库候选以固定为「入缓冲」，
+    // 令主/小键盘对照不受真实英文词库数据影响（同 test_temp_english_digits_and_punct）。
+    cfg.input.temp_english.show_candidates = false;
+
+    // ① 临时英文：小键盘 2 ≡ 主键盘 2（无候选 → 入缓冲）
+    let coord = Coordinator::new_headless(cfg.clone(), Some(&data_dir()));
+    press_shift_letter(&coord, 'v');
+    press_letter(&coord, 'e');
+    press_letter(&coord, 'r');
+    let np = press_vk(&coord, 0x62, false); // VK_NUMPAD2
+    let coord2 = Coordinator::new_headless(cfg.clone(), Some(&data_dir()));
+    press_shift_letter(&coord2, 'v');
+    press_letter(&coord2, 'e');
+    press_letter(&coord2, 'r');
+    let main = press_vk(&coord2, 0x32, false); // 主键盘 2
+    assert_eq!(
+        action_text(&np),
+        action_text(&main),
+        "临英：小键盘 2 应与主键盘 2 一致"
+    );
+
+    // ② 普通码表：小键盘 2 ≡ 主键盘 2（有候选 → 选第 2 个候选）
+    let coord = Coordinator::new_headless(cfg.clone(), Some(&data_dir()));
+    press_letter(&coord, 'a');
+    let np = press_vk(&coord, 0x62, false);
+    let coord2 = Coordinator::new_headless(cfg.clone(), Some(&data_dir()));
+    press_letter(&coord2, 'a');
+    let main = press_vk(&coord2, 0x32, false);
+    assert_eq!(
+        action_text(&np),
+        action_text(&main),
+        "普通码表：小键盘 2 应与主键盘 2 一致（同选第 2 候选）"
+    );
+
+    // ③ 运算符须连 Shift 一并归一：小键盘 * ≡ 主键盘 Shift+8
+    let coord = Coordinator::new_headless(cfg.clone(), Some(&data_dir()));
+    press_letter(&coord, 'a');
+    let np = press_vk(&coord, 0x6A, false); // VK_MULTIPLY
+    let coord2 = Coordinator::new_headless(cfg.clone(), Some(&data_dir()));
+    press_letter(&coord2, 'a');
+    let main = press_vk(&coord2, 0x38, true); // Shift+8 = '*'
+    assert_eq!(
+        action_text(&np),
+        action_text(&main),
+        "小键盘 * 应与主键盘 Shift+8 一致"
+    );
+}
+
+/// direct 下编码型模式：不丢已打的码——顶屏当前高亮候选后再输出该数字。
+#[test]
+fn test_numpad_direct_commits_candidate_then_digit() {
+    if !has_schemas() {
+        return;
+    }
+    // 默认 numpad_behavior 为空 → direct。
+    let coord = Coordinator::new_headless(config_with("wubi86"), Some(&data_dir()));
+    press_letter(&coord, 'a'); // 产生候选
+    // 对照组：取此刻首候选文本（direct 应顶屏它）。
+    let expect_head = {
+        let c2 = Coordinator::new_headless(config_with("wubi86"), Some(&data_dir()));
+        press_letter(&c2, 'a');
+        // 空格上屏高亮候选 = direct 应顶屏的同一个候选。
+        action_text(&c2.handle_key_event(&key_event(0x20, EVENT_KEY_DOWN))).unwrap()
+    };
+    let act = press_vk(&coord, 0x62, false); // 小键盘 2
+    assert_eq!(
+        action_text(&act).unwrap(),
+        format!("{}2", expect_head),
+        "direct：应顶屏高亮候选再接小键盘数字（旧行为是丢弃编码只输出数字）"
+    );
 }
 
 #[test]

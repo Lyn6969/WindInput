@@ -171,6 +171,27 @@ pub(crate) fn punct_char(key_code: u32, shift: bool) -> Option<char> {
     Some(if shift { shifted } else { base })
 }
 
+/// 小键盘键 → 主键盘等价键 `(vk, 是否需 Shift)`。非小键盘键返回 None。
+///
+/// `numpad_behavior = follow_main` 的**唯一实现手段**：在分派前把小键盘键重写成主键盘等价键，
+/// 此后全部模式（普通 / 临拼 / 临英 / 特殊 / mix / URL）自动与主键盘一致，无需各 handler
+/// 各自复制一份数字键语义——「各处自行实现」正是小键盘在多数模式下被静默吞掉的成因。
+///
+/// 运算符须连 Shift 一并归一（主键盘 `*` = Shift+8、`+` = Shift+=），归一后 `punct_char`
+/// 自然给出正确字符，且 `if modifiers & MOD_SHIFT == 0` 的选词臂会正确地不匹配。
+pub(crate) fn numpad_to_main(key_code: u32) -> Option<(u32, bool)> {
+    use keymap::*;
+    Some(match key_code {
+        0x60..=0x69 => (key_code - 0x60 + VK_0, false), // Numpad0-9 → 主键盘 0-9
+        0x6A => (0x38, true),                           // * = Shift+8
+        0x6B => (VK_EQUAL, true),                       // + = Shift+=
+        0x6D => (VK_MINUS, false),                      // -
+        0x6E => (VK_PERIOD, false),                     // .
+        0x6F => (VK_SLASH, false),                      // /
+        _ => return None,
+    })
+}
+
 /// 小键盘键码 → 字符（数字 0-9 / 运算符 * + - / / 小数点 .）。非小键盘键返回 None。
 pub(crate) fn numpad_char(key_code: u32) -> Option<char> {
     match key_code {
@@ -1850,6 +1871,40 @@ impl Coordinator {
         Some(KeyAction::Consumed)
     }
 
+    /// 普通模式「顶屏高亮候选 + 输出字符」：把已转换前缀与当前高亮候选一并上屏，再接该字符。
+    /// 小键盘 direct 语义共用此路（编码型缓冲里数字不是合法编码，故终结当前组合而非入缓冲；
+    /// 但**不丢弃**用户已打的码——顶屏它，对齐主键盘标点键的既有行为）。
+    ///
+    /// `has_comp` 由调用方在改动 state 前算好：空组合时无需隐藏候选窗。
+    pub(crate) fn commit_highlight_then_char(
+        &self,
+        state: &mut State,
+        ch: char,
+        has_comp: bool,
+    ) -> KeyAction {
+        let committed = self.take_committed(state);
+        let mut out = self.maybe_s2t(state, &committed);
+        if !state.candidates.is_empty() {
+            let idx = self
+                .highlighted_global_index(state)
+                .min(state.candidates.len() - 1);
+            let t = state.candidates[idx].text.clone();
+            self.record_selection(&state.input_buffer, &t, state.candidates[idx].source);
+            out.push_str(&self.maybe_s2t(state, &t));
+        }
+        state.input_buffer.clear();
+        state.candidates.clear();
+        if has_comp {
+            self.notify_ui_hide();
+        }
+        out.push_str(&if state.full_width {
+            to_full_width(&ch.to_string())
+        } else {
+            ch.to_string()
+        });
+        Self::commit_action(out, state.chinese_mode)
+    }
+
     // ───────────────────────── 临时拼音 ─────────────────────────
 
     // ───────────────────────── 快捷输入 ─────────────────────────
@@ -3394,6 +3449,27 @@ impl MessageHandler for Coordinator {
         // 顶层 record_input_stats 仅在未置位时兜底（对齐 Go handle_key_event 开头 reset）。
         self.stat_recorded
             .store(false, std::sync::atomic::Ordering::Relaxed);
+
+        // ── 小键盘归一化（numpad_behavior = follow_main）──
+        // 「同主键盘区数字」的语义 = 小键盘键就是主键盘键，故在此改写键码后交由既有主键盘
+        // 逻辑接管，一处生效于所有模式。置于最前（仅晚于统计复位）：模式分派、热键、英文
+        // 直通等所有后续判断都应看到归一化后的键。direct 时不改写，各模式走自己的 numpad 臂。
+        let normalized;
+        let data = match numpad_to_main(data.key_code) {
+            Some((vk, need_shift)) if self.rt().config.input.numpad_behavior == "follow_main" => {
+                normalized = KeyEventData {
+                    key_code: vk,
+                    modifiers: if need_shift {
+                        data.modifiers | MOD_SHIFT
+                    } else {
+                        data.modifiers
+                    },
+                    ..data.clone()
+                };
+                &normalized
+            }
+            _ => data,
+        };
         debug!(
             "handle_key_event: type={} code=0x{:02X} mods=0x{:04X}",
             data.event_type, data.key_code, data.modifiers
@@ -3686,69 +3762,18 @@ impl MessageHandler for Coordinator {
             return act;
         }
 
-        // 数字小键盘（对齐 Go）：follow_main 把数字键 1-9 视同主键盘数字（选当前页候选）；
-        // direct（默认）IME 直接输出小键盘字符（先丢弃当前未上屏编码）。仅中文模式到达此处。
+        // 数字小键盘 —— direct（默认）：IME 不把该键解释为选词，但**已打的码不丢**：先顶屏当前
+        // 高亮候选（含逐步转换的已转换前缀），再接着输出该小键盘字符。
+        // follow_main 时键已在 handle_key_event 入口归一化为主键盘等价键，永不到达此处。
         if let Some(npc) = numpad_char(data.key_code) {
-            let follow_main = self.rt().config.input.numpad_behavior == "follow_main";
-            if follow_main {
-                let has_comp = !state.input_buffer.is_empty()
-                    || !state.committed_text.is_empty()
-                    || !state.candidates.is_empty();
-                if let Some(d) = npc.to_digit(10) {
-                    // 数字键：完全等同主键盘数字键——空缓冲透传输出数字，否则选词/越界 overflow。
-                    // `0` 对齐主键盘选第 10 个候选（num=10）。
-                    // 对齐 Go：空缓冲透传前先记录统计（SourcePunctuation）。
-                    if !has_comp {
-                        self.record_commit(&npc.to_string(), 0, -1, CommitSource::Punctuation);
-                        return KeyAction::PassThrough;
-                    }
-                    let num = if d == 0 { 10 } else { d as usize };
-                    return self.handle_number_key_select(&mut state, num);
-                }
-                // 命令候选顶屏 → 执行命令（与按空格一致），不上屏 display 标签、不追加该字符。
-                if let Some(act) = self.top_commit_command_guard(&mut state) {
-                    return act;
-                }
-                // 运算符 / 小数点：等同主键盘标点——有组合先顶字上屏高亮候选，再输出该字符。
-                let committed = self.take_committed(&mut state);
-                let mut out = self.maybe_s2t(&state, &committed);
-                if !state.candidates.is_empty() {
-                    let idx = self
-                        .highlighted_global_index(&state)
-                        .min(state.candidates.len() - 1);
-                    let t = state.candidates[idx].text.clone();
-                    self.record_selection(&state.input_buffer, &t, state.candidates[idx].source);
-                    out.push_str(&self.maybe_s2t(&state, &t));
-                }
-                state.input_buffer.clear();
-                state.candidates.clear();
-                if has_comp {
-                    self.notify_ui_hide();
-                }
-                out.push_str(&if state.full_width {
-                    to_full_width(&npc.to_string())
-                } else {
-                    npc.to_string()
-                });
-                return Self::commit_action(out, state.chinese_mode);
+            // 命令候选顶屏 → 执行命令（与按空格一致），不上屏 display 标签、不追加该字符。
+            if let Some(act) = self.top_commit_command_guard(&mut state) {
+                return act;
             }
-            // direct（默认）：丢弃当前未上屏编码，直接输出小键盘字符。
-            if !state.input_buffer.is_empty()
+            let has_comp = !state.input_buffer.is_empty()
                 || !state.committed_text.is_empty()
-                || !state.candidates.is_empty()
-            {
-                state.committed_text.clear();
-                state.committed_segs.clear();
-                state.input_buffer.clear();
-                state.candidates.clear();
-                self.notify_ui_hide();
-            }
-            let out = if state.full_width {
-                to_full_width(&npc.to_string())
-            } else {
-                npc.to_string()
-            };
-            return Self::commit_action(out, state.chinese_mode);
+                || !state.candidates.is_empty();
+            return self.commit_highlight_then_char(&mut state, npc, has_comp);
         }
 
         // 配对跳出键：无活跃编码时，命中配置的跳出键（Tab/Enter 等）且配对栈非空，

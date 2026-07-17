@@ -996,8 +996,13 @@ impl Coordinator {
                     return self.mix_select(state, offset);
                 }
 
-                // ⑤ 其它标点：顶屏「已转换前缀 + 当前高亮候选」+ 转换后标点，退出
-                if let Some(ch) = punct_char(data.key_code, shift) {
+                // ⑤ 其它标点：顶屏「已转换前缀 + 当前高亮候选」+ 转换后标点，退出。
+                // 小键盘键（direct 语义）回退 numpad_char 复用此路——仅**文本透镜**会走到这里，
+                // 数字透镜的小键盘早在 ① mix_numeric_input_char 作表达式字符入缓冲。
+                // follow_main 时键已在入口归一化为主键盘键。
+                if let Some(ch) =
+                    punct_char(data.key_code, shift).or_else(|| numpad_char(data.key_code))
+                {
                     // 高亮候选为组/命令：走统一选中（组→展开重查，命令→执行动作），标点不单独上屏。
                     if !state.candidates.is_empty() {
                         let (start, _) = self.page_range(state);

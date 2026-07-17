@@ -2,7 +2,7 @@
 //!
 //! 从 coordinator.rs 拆出（同 crate 内 `impl Coordinator` 块，组织性重构，无逻辑变更）。
 
-use crate::coordinator::{Coordinator, State, punct_char};
+use crate::coordinator::{Coordinator, State, numpad_char, punct_char};
 use crate::pipeline::ModeKind;
 use crate::preedit_cursor;
 use tracing::debug;
@@ -363,8 +363,13 @@ impl Coordinator {
                         return self.commit_special_candidate(state, gi);
                     }
                 }
-                // 其它可打印标点：顶屏当前高亮候选 + 转换后标点，退出
-                if let Some(ch) = punct_char(data.key_code, shift) {
+                // 其它可打印标点：顶屏当前高亮候选 + 转换后标点，退出。
+                // 小键盘键（direct 语义）回退 numpad_char 复用此路：特殊模式缓冲是编码，
+                // 数字非法 → 顶屏候选再输出该字符，与主路径 direct 同构。follow_main 时键已在
+                // 入口归一化为主键盘键，走上面的数字选词臂。
+                if let Some(ch) =
+                    punct_char(data.key_code, shift).or_else(|| numpad_char(data.key_code))
+                {
                     let hi = if state.candidates.is_empty() {
                         None
                     } else {

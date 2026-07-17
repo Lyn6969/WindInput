@@ -446,6 +446,42 @@ impl Coordinator {
                     KeyAction::Consumed
                 }
             }
+            k if let Some(ch) = numpad_char(k) => {
+                // 小键盘 direct 语义（follow_main 时键已在入口归一化为主键盘键，走上面的数字
+                // 选词臂）：拼音缓冲是**编码**，数字不是合法拼音 → 顶屏「已转换前缀 + 当前高亮
+                // 候选」再接着输出该字符并退出，已打的码不丢。
+                if !state.candidates.is_empty() {
+                    let idx = self
+                        .highlighted_global_index(state)
+                        .min(state.candidates.len() - 1);
+                    let cand = state.candidates[idx].clone();
+                    let code = state.temp_pinyin_buffer.clone();
+                    // 命令候选：执行命令，不追加字符（与主路径 direct 一致）。
+                    if let Some(act) = self
+                        .overlay_commit_command(state, &cand, &code, |s, st| s.exit_temp_pinyin(st))
+                    {
+                        return act;
+                    }
+                    self.record_selection(&code, &cand.text, cand.source);
+                    self.record_commit(
+                        &cand.text,
+                        code.len() as u32,
+                        (idx - self.page_range(state).0) as i32,
+                        wind_store::stats::CommitSource::TempPinyin,
+                    );
+                    state.committed_text.push_str(&cand.text);
+                }
+                let head = self.maybe_s2t(state, &state.committed_text.clone());
+                let tail = if state.full_width {
+                    to_full_width(&ch.to_string())
+                } else {
+                    ch.to_string()
+                };
+                self.record_commit(&tail, 0, -1, wind_store::stats::CommitSource::Punctuation);
+                self.exit_temp_pinyin(state);
+                self.notify_ui_hide();
+                Self::commit_action(format!("{}{}", head, tail), true)
+            }
             keymap::VK_A..=keymap::VK_Z if data.modifiers & (MOD_CTRL | MOD_ALT) == 0 => {
                 // 字母累积拼音
                 let ch = (b'a' + (data.key_code - 0x41) as u8) as char;
@@ -691,12 +727,12 @@ impl Coordinator {
                 Self::temp_english_insert(state, '0');
                 refresh(self, state)
             }
-            k if numpad_char(k).is_some() => {
-                // 小键盘数字 / 运算符：恒作输入字符（此前只认主键盘区，小键盘落到下方标点臂被
-                // punct_char 判 None 后静默 Consumed，故临英下小键盘数字完全打不出）。
-                // 不参与选词——主键盘数字在临英里有「选词 vs 输入」歧义，小键盘是无歧义的数字
-                // 输入通道，保持直入更贴合「英文数字连输」的用途。
-                Self::temp_english_insert(state, numpad_char(k).unwrap());
+            k if let Some(ch) = numpad_char(k) => {
+                // 小键盘 direct 语义（follow_main 时键已在入口归一化成主键盘键，不到达这里）：
+                // 临英缓冲是**文本**不是编码，数字/运算符都是合法内容 → 直接入缓冲，
+                // 「英文数字连输」得以在默认配置下可用。此前小键盘落到下方标点臂被
+                // punct_char 判 None 后静默 Consumed，故临英下小键盘数字完全打不出。
+                Self::temp_english_insert(state, ch);
                 refresh(self, state)
             }
             _ => {

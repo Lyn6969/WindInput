@@ -2,7 +2,7 @@
 //!
 //! 从 coordinator.rs 拆出（同 crate 内 `impl Coordinator` 块，组织性重构，无逻辑变更）。
 
-use crate::coordinator::{Coordinator, State, printable_char};
+use crate::coordinator::{Coordinator, State, numpad_char, printable_char};
 use crate::pipeline::{ModeKind, Rewind};
 use crate::preedit_cursor;
 use tracing::debug;
@@ -160,7 +160,11 @@ impl Coordinator {
             }
             _ => {
                 let shift = data.modifiers & MOD_SHIFT != 0;
-                if let Some(ch) = printable_char(data.key_code, shift) {
+                // 小键盘键（direct 语义）回退 numpad_char：网址缓冲是文本，数字/`.`/`-`/`/`
+                // 都是合法网址内容 → 与主键盘同样入缓冲（follow_main 时键已在入口归一化）。
+                if let Some(ch) =
+                    printable_char(data.key_code, shift).or_else(|| numpad_char(data.key_code))
+                {
                     preedit_cursor::BufEdit::new(&mut state.url_buffer, &mut state.url_cursor)
                         .insert(ch);
                     refresh(self, state)
