@@ -4029,9 +4029,11 @@ impl MessageHandler for Coordinator {
                     };
                     if moved {
                         // 光标移动**不重算候选**（不调 update_candidates）：光标不参与引擎查询，
-                        // 候选与 preedit 文本均不变，只是 caret 位置变了。
+                        // 候选与 preedit 文本均不变，只是 caret 位置变了。但仍须 notify_ui_update
+                        // ——自绘编码栏要据新 caret 重画插入符（"不重算候选" ≠ "不刷新 UI"）。
                         let display = state.preedit.clone();
                         let caret_pos = self.composition_caret(&state);
+                        self.notify_ui_update(&state);
                         KeyAction::UpdateComposition {
                             caret_pos,
                             text: display,

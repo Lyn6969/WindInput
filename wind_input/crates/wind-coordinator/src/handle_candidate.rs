@@ -914,6 +914,8 @@ impl Coordinator {
         }
         let text = state.preedit.clone();
         let caret_pos = self.overlay_caret(state);
+        // 不重算候选，但仍须刷新 UI：自绘编码栏要据新 caret 重画插入符。
+        self.notify_ui_update(state);
         Some(KeyAction::UpdateComposition { caret_pos, text })
     }
 
