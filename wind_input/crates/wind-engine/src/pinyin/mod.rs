@@ -362,26 +362,33 @@ fn map_consumed_over_separators(input: &str, fp_consumed: usize) -> usize {
     i
 }
 
-/// Fix A：用双拼原始按键重建 preedit（按音节边界以空格分隔）。
-/// 依次取每个已完成音节在原始输入中的字节区间 `raw[sp_start..sp_end]`；
-/// 若有 partial，把最后一个完成音节之后的剩余原始字节作为 partial 段追加。
-/// 分隔符与全拼自动分词一致用 `'`（更省空间、观感更好）。
-/// 双拼键均为 ASCII，字节切片安全。
+/// Fix A：用双拼原始按键重建 preedit（按音节边界以 `'` 分隔）。
+///
+/// **必须完整覆盖 `raw_input` 的每个字节**：已完成音节取其 `[sp_start, sp_end)`，音节之间与尾部
+/// 未被任何音节覆盖的字节原样作独立段。不可只在 `has_partial` 时补尾——无匹配键对（`convert`
+/// 的 else 分支「原样回写」，如首道双拼的 `om`）既不进 `syllables` 也不置 `has_partial`，
+/// 早期实现据此判尾会把它们静默吞掉：`nihaom` → `ni'ha`（om 消失）、再按 `a` 又诡异复现。
+/// 分隔符与全拼自动分词一致用 `'`。双拼键均为 ASCII，字节切片安全。
 fn build_raw_preedit(raw_input: &str, sp: &shuangpin::SpConvertResult) -> String {
     if raw_input.is_empty() {
         return String::new();
     }
     let mut segments: Vec<&str> = Vec::new();
-    let mut last_end = 0usize;
+    let mut cursor = 0usize;
     for s in &sp.syllables {
+        // 音节之前未被覆盖的字节：无匹配键对的原样回写段。
+        if s.sp_start > cursor {
+            segments.push(&raw_input[cursor..s.sp_start]);
+        }
         segments.push(&raw_input[s.sp_start..s.sp_end]);
-        last_end = s.sp_end;
+        cursor = s.sp_end;
     }
-    if sp.has_partial && last_end < raw_input.len() {
-        segments.push(&raw_input[last_end..]);
+    // 尾部剩余：partial 尾键 或 无匹配回写段。
+    if cursor < raw_input.len() {
+        segments.push(&raw_input[cursor..]);
     }
     if segments.is_empty() {
-        // 无 syllables 且无 partial：原样返回（如无匹配键对等边界）。
+        // 无 syllables：原样返回。
         return raw_input.to_string();
     }
     segments.join("'")
@@ -1135,6 +1142,58 @@ mod tests {
 
     /// Fix A TDD：双拼 preedit 应显示用户实际输入的原始按键（按音节边界以空格分隔，
     /// 与全拼自动分词一致），而非转换后的全拼。输入小鹤 "nihc"（→全拼 nihao）应显示
+    /// 回归：无匹配键对（convert 的「原样回写」分支）既不进 syllables 也不置 has_partial，
+    /// build_raw_preedit 必须仍覆盖它们，否则编码被静默吞掉。
+    /// 真机现象（首道双拼）：nihaom → 显示 niha（om 消失），再按 a → ni'ha'oma 又复现。
+    #[test]
+    fn build_raw_preedit_covers_unmatched_pairs() {
+        use crate::pinyin::shuangpin::{ConvertedSyllable, SpConvertResult};
+        let syl = |sp_start, sp_end| ConvertedSyllable {
+            pinyin: String::new(), // build_raw_preedit 只用 sp 区间切原始串，不读 pinyin
+            sp_start,
+            sp_end,
+            fp_start: 0,
+            fp_end: 0,
+        };
+
+        // ① 尾部无匹配键对（om）：has_partial=false，早期实现漏掉尾巴 → "ni'ha"。
+        let sp = SpConvertResult {
+            syllables: vec![syl(0, 2), syl(2, 4)],
+            has_partial: false,
+            ..Default::default()
+        };
+        assert_eq!(
+            build_raw_preedit("nihaom", &sp),
+            "ni'ha'om",
+            "尾部无匹配键对不得被吞"
+        );
+
+        // ② 尾部 partial 单键（o）：has_partial=true，行为与早期实现一致。
+        let sp = SpConvertResult {
+            syllables: vec![syl(0, 2), syl(2, 4)],
+            has_partial: true,
+            ..Default::default()
+        };
+        assert_eq!(build_raw_preedit("nihao", &sp), "ni'ha'o");
+
+        // ③ 无匹配键对在中间（om 在前）：音节前的空隙也须原样保留。
+        let sp = SpConvertResult {
+            syllables: vec![syl(2, 4), syl(4, 6)],
+            has_partial: true,
+            ..Default::default()
+        };
+        assert_eq!(
+            build_raw_preedit("omnihao", &sp),
+            "om'ni'ha'o",
+            "音节之间的无匹配段不得被吞"
+        );
+
+        // ④ 全无音节：原样返回。
+        let sp = SpConvertResult::default();
+        assert_eq!(build_raw_preedit("xq", &sp), "xq");
+        assert_eq!(build_raw_preedit("", &sp), "");
+    }
+
     /// "ni hc"，候选仍含「你好」。
     #[test]
     fn shuangpin_preedit_shows_raw_keys() {
