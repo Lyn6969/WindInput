@@ -2819,13 +2819,17 @@ mod tests {
                 .push(("hao".into(), "好".into(), CandidateSource::Pinyin, 0b1));
             c.learn_phrase_on_commit(&st);
         }
-        assert!(
-            store
-                .get_temp_words("pinyin", "nihao")
-                .unwrap()
-                .iter()
-                .any(|w| w.text == "你好"),
-            "全段拼音应落 pinyin 临时词"
+        let py_words = store.get_temp_words("pinyin", "nihao").unwrap();
+        let nihao = py_words
+            .iter()
+            .find(|w| w.text == "你好")
+            .expect("全段拼音应落 pinyin 临时词");
+        // 自动造词的边界：各段边界平移拼接（ni@0 + hao@2）→ ni|hao = 0b101。
+        // 这条保证用户自造词从诞生起就带边界，而非「空洞」。
+        assert_eq!(
+            nihao.boundary, 0b101,
+            "自动造词应把段边界平移拼接后落库，实际: {:#b}",
+            nihao.boundary
         );
 
         // 混源（一码表一拼音）→ 三处键空间均无临时词。
@@ -2856,13 +2860,14 @@ mod tests {
                 .push(("bb".into(), "人".into(), CandidateSource::CodeTable, 0));
             c.learn_phrase_on_commit(&st);
         }
-        assert!(
-            store
-                .get_temp_words("ct_test", "aabb")
-                .unwrap()
-                .iter()
-                .any(|w| w.text == "工人"),
-            "全段码表应落 primary ct_test 临时词"
+        let ct_words = store.get_temp_words("ct_test", "aabb").unwrap();
+        let gongren = ct_words
+            .iter()
+            .find(|w| w.text == "工人")
+            .expect("全段码表应落 primary ct_test 临时词");
+        assert_eq!(
+            gongren.boundary, 0,
+            "码表段无音节概念 → 整词 boundary 应为 0（消费方据此降级回 DAG）"
         );
     }
 

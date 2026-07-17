@@ -165,6 +165,60 @@ mod tests {
         }
     }
 
+    fn cand_b(text: &str, code: &str, weight: i32, no: i32, boundary: u64) -> Candidate {
+        Candidate {
+            boundary,
+            ..cand(text, code, weight, no)
+        }
+    }
+
+    /// **boundary 必须与 code 同进同出**（合并期的错位陷阱）。
+    /// boundary 描述的是 code 的音节切分，二者是一对；若换了码却留着旧码的边界，
+    /// 就会配出「A 层的 code + B 层的 boundary」这种自相矛盾的候选，
+    /// 下游按错位边界校验会静默误杀候选。
+    #[test]
+    fn boundary_travels_with_code_on_merge() {
+        // ① 同 text 去重：code/boundary 保留**首个出现层**（高优先层），只有 weight 跨层继承。
+        let c = CompositeDict::new();
+        c.register_layer(Box::new(MockLayer {
+            name: "user".into(),
+            ltype: LayerType::User, // 优先级高于 System
+            items: vec![cand_b("你好", "nihao", 100, 0, 0)], // 用户词：手输码，无边界
+        }));
+        c.register_layer(Box::new(MockLayer {
+            name: "system".into(),
+            ltype: LayerType::System,
+            items: vec![cand_b("你好", "nihao", 500, 0, 0b101)], // 系统词：有真值边界
+        }));
+        let r = c.search("nihao", 10);
+        assert_eq!(r.len(), 1);
+        assert_eq!(r[0].weight, 500, "weight 仍跨层继承更高值");
+        assert_eq!(
+            r[0].boundary, 0,
+            "boundary 随 code 保留高优先层（用户层）的值，不可从系统层「借」一个过来"
+        );
+
+        // ② 前缀换最短码：换 code 时 boundary 必须一起换。
+        let c2 = CompositeDict::new();
+        c2.register_layer(Box::new(MockLayer {
+            name: "user".into(),
+            ltype: LayerType::User,
+            items: vec![cand_b("你好", "nihaoaaa", 100, 0, 0b1)], // 长码 + 其边界
+        }));
+        c2.register_layer(Box::new(MockLayer {
+            name: "system".into(),
+            ltype: LayerType::System,
+            items: vec![cand_b("你好", "nihao", 500, 0, 0b101)], // 更短的码 + 其边界
+        }));
+        let r2 = c2.search_prefix("ni", 10);
+        assert_eq!(r2.len(), 1);
+        assert_eq!(r2[0].code, "nihao", "前缀应保留最短码");
+        assert_eq!(
+            r2[0].boundary, 0b101,
+            "换成短码时 boundary 必须换成该码的，不能留着长码的边界"
+        );
+    }
+
     #[test]
     fn dedup_same_text_inherits_higher_weight() {
         let c = CompositeDict::new();

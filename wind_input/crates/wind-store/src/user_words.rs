@@ -436,6 +436,75 @@ mod tests {
         p
     }
 
+    /// **向后兼容契约**（数据安全）：value 从 v1 的 16B 扩到 24B（追加 boundary u64）。
+    /// 旧库里全是 16B 记录，新代码必须能读——且**不可直接切 `b[16..24]`**，那会在旧记录上
+    /// 越界 panic，必须按长度分支。这是惰性升级免 migration 的前提。
+    #[test]
+    fn dec_val_reads_v1_16byte_records() {
+        // 手工拼一条 v1（16B）记录，模拟旧库数据。
+        let mut v1 = [0u8; 16];
+        v1[0..4].copy_from_slice(&123i32.to_le_bytes());
+        v1[4..8].copy_from_slice(&7u32.to_le_bytes());
+        v1[8..16].copy_from_slice(&1_700_000_000i64.to_le_bytes());
+        assert_eq!(
+            dec_val(&v1),
+            Some((123, 7, 1_700_000_000, 0)),
+            "v1 记录须能读出，boundary 取 0（无信息 → 消费方降级回 DAG）"
+        );
+
+        // v2（24B）：boundary 原样读回。
+        let v2 = enc_val(123, 7, 1_700_000_000, 0b101);
+        assert_eq!(v2.len(), 24);
+        assert_eq!(dec_val(&v2), Some((123, 7, 1_700_000_000, 0b101)));
+
+        // 短于 16B 视为损坏 → None（而非 panic）。
+        assert_eq!(dec_val(&[0u8; 15]), None);
+        assert_eq!(dec_val(&[]), None);
+    }
+
+    /// 惰性升级：旧 16B 记录经一次写入后自然补齐为 24B，boundary 从此可用。
+    #[test]
+    fn v1_record_upgrades_on_write() {
+        let path = tmp("wind_uw_v1_upgrade.redb");
+        let s = Store::open(&path).unwrap();
+
+        // 直接以 v1（16B）格式塞一条记录，绕过 add_user_word，模拟旧库。
+        let key = enc_key("py", "nihao", "你好");
+        {
+            let mut v1 = [0u8; 16];
+            v1[0..4].copy_from_slice(&500i32.to_le_bytes());
+            v1[4..8].copy_from_slice(&3u32.to_le_bytes());
+            v1[8..16].copy_from_slice(&1_700_000_000i64.to_le_bytes());
+            s.with_db(|db| {
+                let txn = db.begin_write()?;
+                {
+                    let mut t = txn.open_table(USER_WORDS)?;
+                    t.insert(key.as_str(), v1.as_slice())?;
+                }
+                txn.commit()?;
+                Ok(())
+            })
+            .unwrap();
+        }
+
+        // 旧记录可读，boundary=0。
+        let r = s.get_user_words("py", "nihao").unwrap();
+        assert_eq!(r.len(), 1);
+        assert_eq!(r[0].weight, 500, "旧记录的既有字段不得丢失");
+        assert_eq!(r[0].boundary, 0, "v1 无 boundary");
+
+        // 再次加词（权重取 max）：旧值 boundary=0 → 用新算出的补齐。
+        s.add_user_word("py", "nihao", "你好", 100, 0b101).unwrap();
+        let r2 = s.get_user_words("py", "nihao").unwrap();
+        assert_eq!(r2[0].weight, 500, "权重取 max，不被低值覆盖");
+        assert_eq!(r2[0].boundary, 0b101, "旧记录 boundary=0 时应被新值补齐");
+
+        // 已有非 0 boundary 时沿用，不被后续调用抹掉（切分与 code/text 绑定，不因再加词而变）。
+        s.add_user_word("py", "nihao", "你好", 100, 0).unwrap();
+        let r3 = s.get_user_words("py", "nihao").unwrap();
+        assert_eq!(r3[0].boundary, 0b101, "已有边界不该被 0 覆盖");
+    }
+
     #[test]
     fn test_add_get_user_word() {
         let path = tmp("wind_uw_addget.redb");
