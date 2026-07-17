@@ -147,6 +147,8 @@ pub struct CandidateWindow {
     config: CandidateWindowConfig,
     candidates: Vec<CandidateItem>,
     preedit: String,
+    /// 编码区插入符位置：`preedit` 内字节偏移（恒在字符边界）。== len 表示光标在末尾。
+    preedit_caret: usize,
     /// 模式指示文本（拼/双/快/英/符 或全称）；空=不渲染。
     mode_label: String,
     selected: usize,
@@ -218,6 +220,7 @@ impl CandidateWindow {
             config,
             candidates: Vec::new(),
             preedit: String::new(),
+            preedit_caret: 0,
             mode_label: String::new(),
             selected: 0,
             hover: -1,
@@ -349,6 +352,7 @@ impl CandidateWindow {
     pub fn update(
         &mut self,
         preedit: &str,
+        preedit_caret: usize,
         mode_label: &str,
         candidates: Vec<CandidateItem>,
         selected: usize,
@@ -357,6 +361,7 @@ impl CandidateWindow {
         total_pages: usize,
     ) {
         self.preedit = preedit.to_string();
+        self.preedit_caret = Self::clamp_caret(preedit, preedit_caret);
         self.mode_label = mode_label.to_string();
         self.candidates = candidates;
         self.selected = selected;
@@ -1043,6 +1048,47 @@ impl CandidateWindow {
     /// 反转候选（flip_when_above）、交换编码/候选区（swap_preedit_when_above）、翻页栏并入编码栏
     /// （pager_in_preedit，与 above 无关的常驻行为）。任何情形下每项 tag/序号标签/选中判定仍用
     /// 原始索引 i，确保命中/选中映射不受排列变化影响。
+    /// 把插入符位置夹到合法字符边界。协调器发来的偏移与它自己的 preedit 同源、本应恒合法，
+    /// 但 UI 与协调器是跨线程的两份状态（命令队列还会合并/丢弃），一旦错位 `split_at` 会
+    /// **panic 掉整个 UI 线程**。故在此收口：越界截到末尾，落在字符中间则退到前一个边界。
+    fn clamp_caret(text: &str, caret: usize) -> usize {
+        let mut c = caret.min(text.len());
+        while c > 0 && !text.is_char_boundary(c) {
+            c -= 1;
+        }
+        c
+    }
+
+    /// 编码栏的文本节点序列：按插入符位置把 preedit 拆成「前半 + 竖线 + 后半」。
+    ///
+    /// 拆成独立节点而非往文本里塞字符（如 `|`），是为了不改变文本本身的度量与换行——插入符
+    /// 只占 1px 宽，不挤动编码。光标在末尾时竖线落在最后，与文本编辑器直觉一致。
+    fn preedit_views(&self, fs: f32) -> Vec<View> {
+        let v = &self.theme.views;
+        let color = v.preedit_bar.text_color.unwrap_or([100, 100, 100, 255]);
+        let mk = |t: &str| {
+            View::leaf(t.to_string(), color)
+                .font_size(fs)
+                .font_weight(v.preedit_bar.font_weight)
+                .font_family(v.preedit_bar.font_family.clone())
+        };
+        // 竖线高度取字号（近似字高），宽度随 DPI 缩放但至少 1px（否则高分屏下会消失）。
+        let caret = View::container(Layout::Row)
+            .fixed_w((self.scale).max(1.0))
+            .fixed_h(fs)
+            .bg(color);
+        let (head, tail) = self.preedit.split_at(self.preedit_caret);
+        let mut out = Vec::new();
+        if !head.is_empty() {
+            out.push(mk(head));
+        }
+        out.push(caret);
+        if !tail.is_empty() {
+            out.push(mk(tail));
+        }
+        out
+    }
+
     fn build_tree(&self, above: bool) -> View {
         use wind_theme::rvnode::{RvEdges, RvNode};
         use wind_theme::schema::Dim;
@@ -1183,16 +1229,10 @@ impl CandidateWindow {
                 .bg(col(v.preedit_bar.bg_color, [240, 240, 240, 255]))
                 .radius(dim(v.item.border_radius, 4.0))
                 .pad(edges_or(&v.preedit_bar.padding, [3.0, 8.0, 3.0, 8.0]))
-                .margin(edges_or(&v.preedit_bar.margin, [0.0; 4]))
-                .child(
-                    View::leaf(
-                        self.preedit.clone(),
-                        col(v.preedit_bar.text_color, [100, 100, 100, 255]),
-                    )
-                    .font_size(preedit_fs)
-                    .font_weight(v.preedit_bar.font_weight)
-                    .font_family(v.preedit_bar.font_family.clone()),
-                );
+                .margin(edges_or(&v.preedit_bar.margin, [0.0; 4]));
+            for c in self.preedit_views(preedit_fs) {
+                band = band.child(c);
+            }
             if let Some(vi) = self.rv_image(v.preedit_bar.bg_image.as_ref()) {
                 band = band.bg_image(vi);
             }
@@ -1315,16 +1355,14 @@ impl CandidateWindow {
                     ..Edges::default()
                 }
             };
-            list = list.child(
-                View::leaf(
-                    self.preedit.clone(),
-                    col(v.preedit_bar.text_color, [100, 100, 100, 255]),
-                )
-                .font_size(preedit_fs)
-                .font_weight(v.preedit_bar.font_weight)
-                .font_family(v.preedit_bar.font_family.clone())
-                .margin(sep),
-            );
+            // 拆分出的「前半 + 插入符 + 后半」包一层无样式 Row，使 margin 作用于整组。
+            let mut pe = View::container(Layout::Row)
+                .cross(Align::Center)
+                .margin(sep);
+            for c in self.preedit_views(preedit_fs) {
+                pe = pe.child(c);
+            }
+            list = list.child(pe);
         }
         // 模式标记（拼/双/快/英/符 或全称）：紧随输入缓冲之后、候选之前内联显示。
         // 仅"无独立 preedit 栏"时在此（内联编码 candidate_inline / 内嵌应用 app_inline /
@@ -1877,6 +1915,37 @@ impl WindowMouse for CandidateMouse {
                 Some(LRESULT(1))
             }
             _ => None,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::CandidateWindow;
+
+    /// 插入符位置一律夹到合法字符边界——`split_at` 落在字符中间会 panic 掉 UI 线程。
+    #[test]
+    fn clamp_caret_never_splits_a_char() {
+        assert_eq!(CandidateWindow::clamp_caret("nihao", 3), 3);
+        assert_eq!(CandidateWindow::clamp_caret("nihao", 5), 5, "末尾合法");
+        assert_eq!(CandidateWindow::clamp_caret("nihao", 99), 5, "越界截到末尾");
+        assert_eq!(CandidateWindow::clamp_caret("", 4), 0, "空串恒 0");
+        // 「你」占 3 字节：落在 1/2 时退回 0，落在 3 是边界
+        assert_eq!(CandidateWindow::clamp_caret("你hao", 1), 0);
+        assert_eq!(CandidateWindow::clamp_caret("你hao", 2), 0);
+        assert_eq!(CandidateWindow::clamp_caret("你hao", 3), 3);
+        assert_eq!(CandidateWindow::clamp_caret("你hao", 4), 4);
+    }
+
+    /// clamp 后切分恒安全（本测试的意义在于：若 clamp 失效，split_at 会 panic）。
+    #[test]
+    fn clamped_caret_is_safe_to_split() {
+        for text in ["", "nihao", "你好hao", "·ni'hao"] {
+            for caret in 0..=text.len() + 2 {
+                let c = CandidateWindow::clamp_caret(text, caret);
+                let (head, tail) = text.split_at(c);
+                assert_eq!(format!("{head}{tail}"), text);
+            }
         }
     }
 }

@@ -429,6 +429,7 @@ impl Coordinator {
         };
         let _ = self.ui_tx.send(UiCommand::UpdateCandidates {
             preedit: String::new(),
+            preedit_caret: 0, // 加词面板无编码区
             mode_label: String::new(),
             candidates,
             selected: usize::MAX, // 两行均为提示、非可选候选，不高亮任何行

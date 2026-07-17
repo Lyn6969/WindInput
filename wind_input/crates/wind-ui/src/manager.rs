@@ -21,6 +21,9 @@ pub enum UiCommand {
     /// 更新候选列表
     UpdateCandidates {
         preedit: String,
+        /// 编码区插入符位置：`preedit` 内的**字节**偏移（恒在字符边界）。自绘 preedit 栏据此
+        /// 画竖线；等于 `preedit.len()` 即光标在末尾。
+        preedit_caret: usize,
         /// 模式指示文本（拼/双/快/英/符 或全称）；空=不显示。有 preedit 空间时随候选窗持久显示。
         mode_label: String,
         candidates: Vec<CandidateItem>,
@@ -686,6 +689,7 @@ impl UiManager {
                 match cmd {
                     UiCommand::UpdateCandidates {
                         preedit,
+                        preedit_caret,
                         mode_label,
                         candidates,
                         selected,
@@ -709,6 +713,7 @@ impl UiManager {
                         );
                         candidate_window.update(
                             &preedit,
+                            preedit_caret,
                             &mode_label,
                             candidates,
                             selected,

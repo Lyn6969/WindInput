@@ -865,6 +865,24 @@ impl Coordinator {
         }
     }
 
+    /// 组合区光标在 preedit 显示串内的**字节偏移**，供自绘候选窗画插入符。
+    /// 统一普通输入与 overlay 两条路径（各自的前缀 / 主体来源不同，见两个 `*_caret_parts`）。
+    /// 与 `state.preedit` 同源，故可安全用于 `&state.preedit[..n]` 切片。
+    pub(crate) fn ui_caret_bytes(&self, state: &State) -> usize {
+        match Self::overlay_caret_parts(state) {
+            Some((prefix, buffer, body, cursor)) => {
+                preedit_cursor::caret_display_bytes(&prefix, buffer, body, cursor)
+            }
+            // 普通输入：前缀 = 已转换前缀，主体 = 当前高亮所决定的显示形态。
+            None => preedit_cursor::caret_display_bytes(
+                &state.committed_text,
+                &state.input_buffer,
+                self.effective_preedit_body(state),
+                state.input_cursor_pos,
+            ),
+        }
+    }
+
     /// overlay 模式的编码区光标移动（左右 / Home / End）。`None` = 该键不是光标移动键，
     /// 调用方继续分派。
     ///

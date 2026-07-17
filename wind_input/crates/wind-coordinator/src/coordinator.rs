@@ -2211,9 +2211,16 @@ impl Coordinator {
         } else {
             state.preedit.clone()
         };
+        // 编码区插入符位置（preedit 内字节偏移）。in_app 时组合区由宿主画，无需自绘插入符。
+        let preedit_caret = if in_app {
+            0
+        } else {
+            self.ui_caret_bytes(state).min(preedit.len())
+        };
         // mode_label 已在顶部计算（纳入空则隐藏守卫）：作为候选窗内联标记随候选窗一并显示。
         let _ = self.ui_tx.send(UiCommand::UpdateCandidates {
             preedit,
+            preedit_caret,
             mode_label,
             candidates: items,
             selected,

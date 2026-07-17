@@ -49,6 +49,14 @@ pub(crate) fn caret_utf16(prefix: &str, buffer: &str, body: &str, cursor: usize)
     (prefix.encode_utf16().count() + body[..dpos].encode_utf16().count()) as u32
 }
 
+/// 组合区光标在**显示串内的字节偏移**（`prefix + body` 拼成的串），供自绘候选窗按字节切分
+/// preedit 画插入符。与 [`caret_utf16`] 同源、只是单位不同——TSF 要 UTF-16 偏移，自绘窗要
+/// UTF-8 字节以便 `&s[..n]` 切片（对齐 Go 的 `displayCursorPos` / `uiCursorPos` 之分）。
+pub(crate) fn caret_display_bytes(prefix: &str, buffer: &str, body: &str, cursor: usize) -> usize {
+    let dpos = floor_boundary(body, map_buf_pos_to_display_pos(buffer, body, cursor));
+    prefix.len() + dpos
+}
+
 /// 借用 buffer + cursor 的编辑视图，提供边界安全的编辑原语。
 ///
 /// 所有 cursor 运算封死在此，调用方不做裸 `usize` 加减——这是 5 个 overlay 模式各写各的
