@@ -2056,7 +2056,9 @@ impl EngineManager {
         // 统一按权重重排）。DictWriter::add 不合并同 code 多次调用，故先用 HashMap 聚合，否则
         // wdb 出现重复 KeyIndex，DictReader 二分只命中其一 → 同 code 候选系统性丢失。
         // 全拼按 code 聚合；简拼（声母缩写，如 nh→你好）按简拼码聚合，存进 wdat 独立 AbbrevSection。
-        let mut agg: HashMap<String, Vec<(String, i32)>> = HashMap::new();
+        // 全拼条目携带 boundary（wdat v4 音节边界，取自 rime 源数据 `ni hao` 的空格）；
+        // 简拼码是各音节首字母的拼接、本身不构成音节序列，无边界语义，故 agg_ab 不带。
+        let mut agg: HashMap<String, Vec<(String, i32, u64)>> = HashMap::new();
         let mut agg_ab: HashMap<String, Vec<(String, i32)>> = HashMap::new();
         let mut total_entries = 0usize;
         for sub_path in &sub_paths {
@@ -2071,8 +2073,8 @@ impl EngineManager {
                         abbrevs.len(),
                         sub_path.display()
                     );
-                    for (code, text, weight) in fulls {
-                        agg.entry(code).or_default().push((text, weight));
+                    for (code, text, weight, boundary) in fulls {
+                        agg.entry(code).or_default().push((text, weight, boundary));
                     }
                     for (ab, text, weight) in abbrevs {
                         agg_ab.entry(ab).or_default().push((text, weight));
@@ -2093,7 +2095,14 @@ impl EngineManager {
         for (code, mut entries) in agg {
             // 同 code 下按权重降序，保证候选顺序稳定
             entries.sort_by(|a, b| b.1.cmp(&a.1));
-            writer.add(code, entries);
+            // order 取排序后的叶内序号，与改前 `writer.add`（内部 with_local_order）语义一致；
+            // 额外携带 boundary（v4）。
+            let with_order: Vec<(String, i32, u32, u64)> = entries
+                .into_iter()
+                .enumerate()
+                .map(|(i, (text, weight, boundary))| (text, weight, i as u32, boundary))
+                .collect();
+            writer.add_with_boundary(code, with_order);
         }
         // 简拼表 → 独立 AbbrevSection（与全拼查询互不污染）；同简拼下按权重降序。
         let abbrev_count = agg_ab.len();

@@ -7,6 +7,16 @@ use crate::datformat::{WdatReader, WdatWriter};
 use std::path::Path;
 use tracing::{info, warn};
 
+/// 一条查询命中，含音节边界。由 [`CachedDict::search_with_boundary`] 返回（拼音专用）。
+#[derive(Debug, Clone)]
+pub struct DictHit {
+    pub text: String,
+    pub weight: i32,
+    pub order: i32,
+    /// 音节边界 bitmask，见 [`crate::binformat::DictEntry::boundary`]。0=无边界信息，降级回 DAG。
+    pub boundary: u64,
+}
+
 /// 缓存词典：优先使用 mmap，回退到内存模式
 pub enum CachedDict {
     /// mmap 零拷贝模式（低内存，wdat DAT 格式）
@@ -131,6 +141,28 @@ impl CachedDict {
                 .map(|e| (e.text, e.weight, e.order))
                 .collect(),
             Self::Memory(dict) => dict.search(code),
+        }
+    }
+
+    /// 精确查找，**并返回音节边界**（[`DictHit::boundary`]）。
+    ///
+    /// 与 [`Self::search`] 并存而非替换它：边界只对拼音有意义，而 `search` 的消费方遍布
+    /// 码表/英文/cmdbar/composite 等无音节概念的场景（全仓 60+ 调用点），不应被拼音的
+    /// 需求污染接口。仅拼音引擎改用本方法。
+    pub fn search_with_boundary(&self, code: &str) -> Vec<DictHit> {
+        match self {
+            Self::Mmap(reader) => reader
+                .search(code)
+                .into_iter()
+                .map(|e| DictHit {
+                    text: e.text,
+                    weight: e.weight,
+                    order: e.order,
+                    boundary: e.boundary,
+                })
+                .collect(),
+            // 内存回退（yaml 直载，未走 wdat）：CodetableDict 保有 boundary，一并带出。
+            Self::Memory(dict) => dict.search_with_boundary(code),
         }
     }
 
