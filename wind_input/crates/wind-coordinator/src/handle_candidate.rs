@@ -1768,21 +1768,31 @@ impl Coordinator {
     }
 
     /// 点击选词：提交页内第 N 个候选，经 push 管道异步上屏（对齐 Go PushCommitText）。
+    ///
+    /// 主输入路（`active == None`）复用键盘选词的 [`Self::commit_selected`]，其返回的 KeyAction
+    /// 经 [`Self::push_mouse_action`] 翻译成 push 消息——分步提交（候选只消费缓冲前缀，如
+    /// 「nihao」选「你」）由此与数字键完全一致：组合区留活、剩余码续查候选。此前鼠标独走
+    /// `commit_candidate`（无条件清空缓冲），故点选分段候选会丢弃剩余编码、丢失已确认前缀段，
+    /// 并把词频错记到整串码上。
+    ///
+    /// overlay 模式（临拼/特殊/临英/混输，`active != None`）在键盘侧由各自的专用处理器接管、
+    /// 不经 `commit_selected`（见 coordinator 内 `state.active` 的单点分派），故仍走原
+    /// 「整串提交 + 彻底复位」路径，不向其引入未定义的分段语义。
     pub(crate) fn mouse_select(&self, page_local: usize) {
+        let _ = self.mouse_select_action(page_local);
+    }
+
+    /// [`Self::mouse_select`] 的实现，返回主输入路实际推送的 KeyAction 供测试断言
+    /// （overlay / `$CC` 命令 / 越界等不经 push 的路径返回 None）。
+    fn mouse_select_action(&self, page_local: usize) -> Option<KeyAction> {
         let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
         if state.candidates.is_empty() {
-            return;
+            return None;
         }
         let (start, end) = self.page_range(&state);
         let idx = start + page_local;
         if idx >= end || idx >= state.candidates.len() {
-            return;
-        }
-        // 前缀导航候选：补全输入到完整码并重查展开（二级选择，鼠标点击同键盘选中）。
-        if state.candidates[idx].is_group {
-            let code = state.candidates[idx].group_code.clone();
-            self.complete_to_group_code(&mut state, &code);
-            return;
+            return None;
         }
         // $CC 命令候选：执行动作而非上屏 display 标签（释放锁后异步执行，避免重入死锁）。
         if state.candidates[idx].is_command {
@@ -1798,7 +1808,25 @@ impl Coordinator {
             drop(state);
             self.notify_ui_hide();
             self.spawn_command(src, input);
-            return;
+            return None;
+        }
+        // 主输入路：与数字键同一条提交路径（is_group 的二级选择亦由其内部处理）。
+        if state.active.is_none() {
+            let cand = state.candidates[idx].clone();
+            let chinese_mode = state.chinese_mode;
+            // 鼠标页内位置 = page_local（候选首选率统计，与数字键的 num-1 同义）。
+            let act = self.commit_selected(&mut state, &cand, page_local as i32);
+            drop(state);
+            // commit_selected 已按分支自行 notify_ui_update / notify_ui_hide，此处不再重复。
+            self.push_mouse_action(&act, chinese_mode);
+            return Some(act);
+        }
+        // ── 以下为 overlay 模式（active != None）路径 ──
+        // 前缀导航候选：补全输入到完整码并重查展开（二级选择，鼠标点击同键盘选中）。
+        if state.candidates[idx].is_group {
+            let code = state.candidates[idx].group_code.clone();
+            self.complete_to_group_code(&mut state, &code);
+            return None;
         }
         let text = state.candidates[idx].text.clone();
         let source = state.candidates[idx].source;
@@ -1816,9 +1844,45 @@ impl Coordinator {
         // 仅推给活动客户端，避免广播导致多个 TSF 端重复上屏
         self.push_server.push_commit_to_active(&encoded);
         debug!(
-            "mouse_select: committed '{}' (page_local={})",
+            "mouse_select: overlay 整串提交 '{}' (page_local={})",
             out, page_local
         );
+        None
+    }
+
+    /// 鼠标点选页内第 N 个候选（测试/诊断用）：返回主输入路实际推送的 KeyAction
+    /// （`UpdateComposition` = 分步提交，组合区留活；`InsertText` = 整串上屏）。
+    pub fn debug_mouse_select(&self, page_local: usize) -> Option<KeyAction> {
+        self.mouse_select_action(page_local)
+    }
+
+    /// 鼠标选词产生的 KeyAction → push 管道消息。
+    ///
+    /// 键盘选词把 KeyAction 交回 TSF 按键管线应答，鼠标点击没有按键上下文（不在 OnKeyDown
+    /// 的应答里），只能自行编码经 push 管道投递。仅覆盖 `commit_selected` 的两种返回：
+    /// - `UpdateComposition`（分步提交 / 二级选择）→ `CMD_UPDATE_COMPOSITION`，组合区留活。
+    ///   C++ 侧 IPCClient 异步 reader 与 TextService 的 `SetUpdateCompositionCallback` 自 Go 版
+    ///   起就在位（注释即写 "mouse click partial confirm"），Rust 侧此前从未发过此包。
+    /// - `InsertText`（整串提交）→ `CMD_COMMIT_TEXT`。
+    ///
+    /// 两者均带副作用，故一律 `push_commit_to_active` 定向投递（非广播），避免多个 TSF 端重复。
+    fn push_mouse_action(&self, act: &KeyAction, chinese_mode: bool) {
+        match act {
+            KeyAction::UpdateComposition { text, caret_pos } => {
+                let encoded = wind_ipc::codec::encode_update_composition(text, *caret_pos);
+                self.push_server.push_commit_to_active(&encoded);
+                debug!("mouse_select: 分步提交，组合区留活 preedit='{}'", text);
+            }
+            KeyAction::InsertText { text, .. } => {
+                let encoded =
+                    wind_ipc::codec::encode_commit_text(text, None, false, chinese_mode, false);
+                self.push_server.push_commit_to_active(&encoded);
+                debug!("mouse_select: committed '{}'", text);
+            }
+            other => {
+                debug!("mouse_select: 无需推送的 KeyAction {:?}", other);
+            }
+        }
     }
 
     pub(crate) fn commit_action(text: String, chinese_mode: bool) -> KeyAction {

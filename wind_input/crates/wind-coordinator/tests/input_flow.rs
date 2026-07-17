@@ -758,6 +758,68 @@ fn separator_two_step_segmentation() {
     assert_eq!(coord.debug_candidate_count(), 0, "两步选完组合区应清空");
 }
 
+/// C1 回归（鼠标版）：点选分段候选须与数字键同为分步提交——先点「西」组合区留活剩 "an"、
+/// 候选续查出「安」，再点「安」整体上屏「西安」。
+///
+/// 曾因 `mouse_select` 独走 `commit_candidate`（无条件清缓冲、不看 consumed_length）而：
+/// 剩余码被丢弃、候选窗直接消失，且第二步只上屏「安」丢掉已确认的「西」段。
+#[test]
+fn mouse_select_two_step_segmentation() {
+    if !has_schemas() {
+        return;
+    }
+    let coord = Coordinator::new_headless(config_with("pinyin"), Some(&data_dir()));
+    for c in "xi".chars() {
+        press_letter(&coord, c);
+    }
+    coord.handle_key_event(&key_event(0xC0, EVENT_KEY_DOWN));
+    for c in "an".chars() {
+        press_letter(&coord, c);
+    }
+    // 鼠标点选「西」（子短语，仅消费 xi 段）→ 分步提交，组合区留活
+    let texts = coord.debug_page_texts();
+    let p_xi = texts
+        .iter()
+        .position(|t| t == "西")
+        .unwrap_or_else(|| panic!("候选应含子短语「西」，实际: {:?}", texts));
+    let step = coord
+        .debug_mouse_select(p_xi)
+        .expect("主输入路点选应产生待推送的 KeyAction");
+    let disp = action_text(&step).unwrap_or_else(|| {
+        panic!(
+            "点选「西」应为 UpdateComposition（组合区留活），实际: {:?}",
+            step
+        )
+    });
+    assert!(
+        disp.starts_with('西') && disp.ends_with("an") && !disp.contains('\''),
+        "点选「西」后组合区应为「西」+剩余 an（无 ' 残留），实际: {:?}",
+        disp
+    );
+    // 剩余分词的候选必须还在（原 bug：候选窗直接消失，count 归 0）
+    assert!(
+        coord.debug_candidate_count() > 0,
+        "点选分段候选后应续查剩余码的候选，不应清空"
+    );
+
+    // 再点「安」→ 整体上屏「西安」（含已确认的「西」段），组合区清空
+    let texts2 = coord.debug_page_texts();
+    let p_an = texts2
+        .iter()
+        .position(|t| t == "安")
+        .unwrap_or_else(|| panic!("剩余 an 的候选应含「安」，实际: {:?}", texts2));
+    match coord.debug_mouse_select(p_an) {
+        Some(KeyAction::InsertText { text, .. }) => {
+            assert_eq!(
+                text, "西安",
+                "两步点选最终应上屏「西安」，不得丢失已确认的「西」段"
+            );
+        }
+        other => panic!("点选「安」应上屏 InsertText，实际: {:?}", other),
+    }
+    assert_eq!(coord.debug_candidate_count(), 0, "两步点选完组合区应清空");
+}
+
 #[test]
 fn test_schema_switch_via_menu() {
     if !has_schemas() {
