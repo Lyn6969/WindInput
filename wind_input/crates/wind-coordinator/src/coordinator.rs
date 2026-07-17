@@ -362,7 +362,11 @@ pub(crate) struct State {
     pub(crate) committed_text: String,
     /// 已转换前缀的分段记录 (消费码, 汉字, 候选来源)：供退格逐段回退与完整上屏时自动造词。
     /// 来源用于混输自动造词的"全段同源"归属路由（P2d）。
-    pub(crate) committed_segs: Vec<(String, String, CandidateSource)>,
+    /// 已分步上屏的段：`(code, text, source, boundary)`。
+    /// boundary = 该段 code 的音节边界（见 `wind_dict::binformat::DictEntry::boundary`）；
+    /// 段自身可能是多音节整词（选「你好」→ 段码 nihao、段内边界 ni|hao），故自动造词拼接
+    /// 各段时须把段内边界平移到全局位置，不能只按「一段一音节」记。
+    pub(crate) committed_segs: Vec<(String, String, CandidateSource, u64)>,
     /// 当前激活的独占输入模式（临时拼音/快捷输入/临时英文）。`None` = 普通输入。
     /// 单点决策的唯一真相源：结构上保证同一时刻至多一个独占模式（见 `pipeline.rs`）。
     pub(crate) active: Option<ModeKind>,
@@ -414,6 +418,9 @@ pub(crate) struct State {
     pub(crate) add_word_len: usize,
     /// 当前词自动计算的编码（拼音生成 / 码表反查；空 = 无法计算，确认时中止）。
     pub(crate) add_word_code: String,
+    /// `add_word_code` 的音节边界（见 `wind_dict::binformat::DictEntry::boundary`）；
+    /// 0 = 无信息（码表反查/逐字兜底）。与 code 同生同灭，入库时一并写入用户词。
+    pub(crate) add_word_boundary: u64,
     /// 加词模式「强制竖排」时记住进入前的布局（Some(原 vertical) = 已强制，退出恢复）。
     pub(crate) add_word_saved_vertical: Option<bool>,
 }
@@ -1050,6 +1057,7 @@ impl Coordinator {
                 add_word_chars: Vec::new(),
                 add_word_len: 0,
                 add_word_code: String::new(),
+                add_word_boundary: 0,
                 add_word_saved_vertical: None,
             }),
             push_server,
@@ -3733,11 +3741,11 @@ impl MessageHandler for Coordinator {
                 // Backspace：分步撤销——有已转换段则先把最后一段退回拼音（你→ni，码并回剩余
                 // 缓冲前部、重转），否则删剩余拼音末字符。
                 if !state.committed_segs.is_empty() {
-                    let (code, _, _) = state.committed_segs.pop().unwrap();
+                    let (code, _, _, _) = state.committed_segs.pop().unwrap();
                     state.committed_text = state
                         .committed_segs
                         .iter()
-                        .map(|(_, t, _)| t.as_str())
+                        .map(|(_, t, _, _)| t.as_str())
                         .collect();
                     state.input_buffer = format!("{}{}", code, state.input_buffer);
                     self.update_candidates(&mut state);

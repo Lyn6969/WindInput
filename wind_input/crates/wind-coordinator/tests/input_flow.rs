@@ -2297,7 +2297,7 @@ fn temp_word_promotes_after_threshold_selections() {
 
     // 1. 两次累积 → count=2
     let c1 = store
-        .learn_temp_word("wubi86", "abcd", "测试", 800)
+        .learn_temp_word("wubi86", "abcd", "测试", 800, 0)
         .unwrap();
     assert_eq!(c1, 1, "第 1 次 count 应为 1");
     assert_eq!(
@@ -2307,7 +2307,7 @@ fn temp_word_promotes_after_threshold_selections() {
     );
 
     let c2 = store
-        .learn_temp_word("wubi86", "abcd", "测试", 800)
+        .learn_temp_word("wubi86", "abcd", "测试", 800, 0)
         .unwrap();
     assert_eq!(c2, 2, "第 2 次 count 应为 2");
 
@@ -2331,7 +2331,7 @@ fn temp_word_promotes_after_threshold_selections() {
     //    （当 promote_count=0 时，coordinator 永不调用 promote_temp_word）。
     //    此处用 get_temp_word None → 确认未晋升的词不在临时层。
     store
-        .learn_temp_word("wubi86", "zzzz", "不晋升", 800)
+        .learn_temp_word("wubi86", "zzzz", "不晋升", 800, 0)
         .unwrap();
     // promote_count=0 时不晋升：临时层仍有该词
     assert_eq!(
@@ -2522,7 +2522,7 @@ fn test_shuangpin_userword_appears_in_candidates() {
     let store = std::sync::Arc::new(wind_store::Store::open(&store_path).unwrap());
     // 用户词存在 "pinyin" 域（拼音族共享存储的规范 schema_id）
     store
-        .add_user_word("pinyin", "daboluoge", "大菠萝哥", 0)
+        .add_user_word("pinyin", "daboluoge", "大菠萝哥", 0, 0)
         .expect("add_user_word 失败");
 
     // 创建双拼方案协调器并注入 store
@@ -2793,7 +2793,9 @@ fn coord_with_dict_command(template: &str, tag: &str) -> std::sync::Arc<Coordina
     let store_path = std::env::temp_dir().join(format!("wind_dict_autocmd_{tag}.redb"));
     let _ = std::fs::remove_file(&store_path);
     let store = std::sync::Arc::new(wind_store::Store::open(&store_path).unwrap());
-    store.add_user_word("wubi86", "kkkkx", template, 0).unwrap();
+    store
+        .add_user_word("wubi86", "kkkkx", template, 0, 0)
+        .unwrap();
     let mut cfg = config_with("wubi86");
     cfg.schema.codetable.auto_commit_at_full = true;
     Coordinator::new_headless_with_store(cfg, Some(&data_dir()), store)
@@ -2851,7 +2853,7 @@ fn special_mode_effect_command_auto_commit_executes() {
     let _ = std::fs::remove_file(&store_path);
     let store = std::sync::Arc::new(wind_store::Store::open(&store_path).unwrap());
     store
-        .add_user_word("wubi86", "kkkkx", r#"$CC("《》", ask("x"))"#, 0)
+        .add_user_word("wubi86", "kkkkx", r#"$CC("《》", ask("x"))"#, 0, 0)
         .unwrap();
     let mut cfg = config_with("wubi86");
     cfg.schema.codetable.auto_commit_at_full = true;

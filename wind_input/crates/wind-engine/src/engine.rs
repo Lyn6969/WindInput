@@ -58,10 +58,14 @@ pub trait Engine: Send + Sync {
         None
     }
 
-    /// 为词语生成全拼编码（造词反推读音、多音字消歧）。
+    /// 为词语生成全拼编码**与音节边界**（造词反推读音、多音字消歧）。
     /// 默认不支持（码表/五笔等返回 None）；拼音引擎按词典权重消歧。
     /// 用于加词页自动出码、词库导入。含无读音字符时返回 None。
-    fn generate_word_pinyin(&self, _word: &str) -> Option<String> {
+    ///
+    /// 返回 `(code, boundary)`：boundary 见 `wind_dict::binformat::DictEntry::boundary`，
+    /// 造词本就逐音节拼接、边界白送，带出来使用户自造词从诞生起即有边界（否则用户词
+    /// 是块边界空洞，双拼校验只能对其降级）。
+    fn generate_word_pinyin(&self, _word: &str) -> Option<(String, u64)> {
         None
     }
 

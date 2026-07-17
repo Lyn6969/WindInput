@@ -12,7 +12,7 @@ use redb::ReadableTable;
 use serde::{Deserialize, Serialize};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-/// 用户词记录（code/text 来自 key，weight/count/created_at 来自定长 value）
+/// 用户词记录（code/text 来自 key，weight/count/created_at/boundary 来自定长 value）
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct UserWordRecord {
     pub code: String,
@@ -21,6 +21,11 @@ pub struct UserWordRecord {
     pub count: u32,
     /// 创建时间（unix 秒）
     pub created_at: i64,
+    /// `code` 的音节边界（见 `wind_dict::binformat::DictEntry::boundary`）；0=无信息。
+    /// 造词路径（generate_word_pinyin）算得；手输码/wdict 文本导入无从得知，为 0。
+    /// `serde(default)`：v1 记录与旧客户端 JSON 无此字段，按 0 处理。
+    #[serde(default)]
+    pub boundary: u64,
 }
 
 /// 批量导入的分类计数(P2:added=新键 / updated=权重严格更大 / unchanged=权重≤现有不落盘)。
@@ -50,36 +55,55 @@ pub(crate) fn split_key(key: &str) -> Option<(&str, &str, &str)> {
     Some((it.next()?, it.next()?, it.next()?))
 }
 
-/// value: 定长 16 字节
-pub(crate) fn enc_val(weight: i32, count: u32, created_at: i64) -> [u8; 16] {
-    let mut b = [0u8; 16];
+/// value: 定长 24 字节 —— `weight i32 | count u32 | created_at i64 | boundary u64`
+///
+/// v1 为 16 字节（无 boundary）。**惰性升级、无需 migration**：`dec_val` 按实际长度取值，
+/// 旧的 16B 记录读出 boundary=0（无边界信息，消费方降级回 DAG），下次写入时自然补齐为 24B。
+pub(crate) fn enc_val(weight: i32, count: u32, created_at: i64, boundary: u64) -> [u8; 24] {
+    let mut b = [0u8; 24];
     b[0..4].copy_from_slice(&weight.to_le_bytes());
     b[4..8].copy_from_slice(&count.to_le_bytes());
     b[8..16].copy_from_slice(&created_at.to_le_bytes());
+    b[16..24].copy_from_slice(&boundary.to_le_bytes());
     b
 }
 
-/// 解码 value → (weight, count, created_at)
-pub(crate) fn dec_val(b: &[u8]) -> Option<(i32, u32, i64)> {
+/// 解码 value → (weight, count, created_at, boundary)
+///
+/// 长度守卫刻意宽松（`< 16` 而非 `!= 24`）：旧 16B 记录仍能解出前三项，boundary 取 0。
+/// 直接切 `b[16..24]` 会在旧记录上越界，故必须按长度分支。
+pub(crate) fn dec_val(b: &[u8]) -> Option<(i32, u32, i64, u64)> {
     if b.len() < 16 {
         return None;
     }
+    let boundary = if b.len() >= 24 {
+        u64::from_le_bytes(b[16..24].try_into().ok()?)
+    } else {
+        0 // v1 遗留记录：无边界信息
+    };
     Some((
         i32::from_le_bytes(b[0..4].try_into().ok()?),
         u32::from_le_bytes(b[4..8].try_into().ok()?),
         i64::from_le_bytes(b[8..16].try_into().ok()?),
+        boundary,
     ))
 }
 
 impl Store {
     /// 新增/合并用户词：已存在则权重取 max、保留原 created_at；新词记 created_at=now。
     /// 用户词**无权重上限**（store.md §3）。
+    ///
+    /// `boundary`：该 code 的音节边界（见 `wind_dict::binformat::DictEntry::boundary`）。
+    /// 造词路径（`generate_word_pinyin`）算得；用户手输码/wdict 导入无从得知，传 0
+    /// （消费方降级回 DAG）。已存在且旧值非 0 时沿用旧值——同 (schema,code,text) 的切分是
+    /// 确定的，不因再次加词而变。
     pub fn add_user_word(
         &self,
         schema: &str,
         code: &str,
         text: &str,
         weight: i32,
+        boundary: u64,
     ) -> anyhow::Result<()> {
         let key = enc_key(schema, code, text);
         self.with_db(|db| {
@@ -87,11 +111,13 @@ impl Store {
             {
                 let mut t = txn.open_table(USER_WORDS)?;
                 let existing = t.get(key.as_str())?.and_then(|g| dec_val(g.value()));
-                let (w, c, ca) = match existing {
-                    Some((ow, oc, oca)) => (ow.max(weight), oc, oca),
-                    None => (weight, 0, now_secs()),
+                let (w, c, ca, b) = match existing {
+                    Some((ow, oc, oca, ob)) => {
+                        (ow.max(weight), oc, oca, if ob != 0 { ob } else { boundary })
+                    }
+                    None => (weight, 0, now_secs(), boundary),
                 };
-                t.insert(key.as_str(), enc_val(w, c, ca).as_slice())?;
+                t.insert(key.as_str(), enc_val(w, c, ca, b).as_slice())?;
             }
             txn.commit()?;
             Ok(())
@@ -112,13 +138,14 @@ impl Store {
                     break;
                 }
                 let text = &key[prefix.len()..];
-                if let Some((w, c, ca)) = dec_val(v.value()) {
+                if let Some((w, c, ca, b)) = dec_val(v.value()) {
                     out.push(UserWordRecord {
                         code: code.to_string(),
                         text: text.to_string(),
                         weight: w,
                         count: c,
                         created_at: ca,
+                        boundary: b,
                     });
                 }
             }
@@ -144,7 +171,7 @@ impl Store {
                 if !key.starts_with(&scan) {
                     break;
                 }
-                if let (Some((_, code, text)), Some((w, c, ca))) =
+                if let (Some((_, code, text)), Some((w, c, ca, b))) =
                     (split_key(key), dec_val(v.value()))
                 {
                     out.push(UserWordRecord {
@@ -153,6 +180,7 @@ impl Store {
                         weight: w,
                         count: c,
                         created_at: ca,
+                        boundary: b,
                     });
                 }
                 if limit > 0 && out.len() >= limit {
@@ -193,8 +221,9 @@ impl Store {
                 let mut t = txn.open_table(USER_WORDS)?;
                 let existing = t.get(key.as_str())?.and_then(|g| dec_val(g.value()));
                 match existing {
-                    Some((_, c, ca)) => {
-                        t.insert(key.as_str(), enc_val(new_weight, c, ca).as_slice())?;
+                    // 仅改权重：boundary 沿用（切分与权重无关）。
+                    Some((_, c, ca, b)) => {
+                        t.insert(key.as_str(), enc_val(new_weight, c, ca, b).as_slice())?;
                         updated = true;
                     }
                     None => updated = false,
@@ -220,17 +249,18 @@ impl Store {
             let txn = db.begin_write()?;
             {
                 let mut t = txn.open_table(USER_WORDS)?;
-                let (w, c, ca) = t
+                // 不存在则创建 weight=0 记录（隐性造词路径）：此处只有扁平 code，无边界可算 → 0。
+                let (w, c, ca, b) = t
                     .get(key.as_str())?
                     .and_then(|g| dec_val(g.value()))
-                    .unwrap_or((0, 0, now_secs()));
+                    .unwrap_or((0, 0, now_secs(), 0));
                 let nc = c.saturating_add(1);
                 let nw = if count_threshold > 0 && nc % count_threshold == 0 {
                     w.saturating_add(boost_delta)
                 } else {
                     w
                 };
-                t.insert(key.as_str(), enc_val(nw, nc, ca).as_slice())?;
+                t.insert(key.as_str(), enc_val(nw, nc, ca, b).as_slice())?;
             }
             txn.commit()?;
             Ok(())
@@ -285,18 +315,20 @@ impl Store {
                     let existing = t.get(key.as_str())?.and_then(|g| dec_val(g.value()));
                     match existing {
                         None => {
+                            // wdict 是扁平文本，无音节边界 → 0（消费方降级回 DAG）。
                             t.insert(
                                 key.as_str(),
-                                enc_val(r.weight, r.count, now_secs()).as_slice(),
+                                enc_val(r.weight, r.count, now_secs(), 0).as_slice(),
                             )?;
                             c.added += 1;
                         }
-                        Some((w, cnt, ca)) => {
+                        Some((w, cnt, ca, b)) => {
                             // weight/count 各取 max；任一变大即写盘为 updated，否则 unchanged。
+                            // boundary 沿用旧值：导入行本就无边界，不该把已有的抹掉。
                             let nw = w.max(r.weight);
                             let nc = cnt.max(r.count);
                             if nw != w || nc != cnt {
-                                t.insert(key.as_str(), enc_val(nw, nc, ca).as_slice())?;
+                                t.insert(key.as_str(), enc_val(nw, nc, ca, b).as_slice())?;
                                 c.updated += 1;
                             } else {
                                 c.unchanged += 1;
@@ -330,7 +362,7 @@ impl Store {
                         c.added += 1;
                         true
                     }
-                    Some((w, cnt, _)) if r.weight > w || r.count > cnt => {
+                    Some((w, cnt, _, _)) if r.weight > w || r.count > cnt => {
                         c.updated += 1;
                         true
                     }
@@ -408,14 +440,14 @@ mod tests {
     fn test_add_get_user_word() {
         let path = tmp("wind_uw_addget.redb");
         let s = Store::open(&path).unwrap();
-        s.add_user_word("wb", "a", "工", 100).unwrap();
-        s.add_user_word("wb", "a", "戈", 50).unwrap();
+        s.add_user_word("wb", "a", "工", 100, 0).unwrap();
+        s.add_user_word("wb", "a", "戈", 50, 0).unwrap();
         let mut got = s.get_user_words("wb", "a").unwrap();
         got.sort_by_key(|r| r.text.clone());
         assert_eq!(got.len(), 2);
         assert!(got.iter().any(|r| r.text == "工" && r.weight == 100));
         // add 同词更高权重 → 取 max
-        s.add_user_word("wb", "a", "工", 200).unwrap();
+        s.add_user_word("wb", "a", "工", 200, 0).unwrap();
         let g = s.get_user_words("wb", "a").unwrap();
         assert_eq!(g.iter().find(|r| r.text == "工").unwrap().weight, 200);
         let _ = std::fs::remove_file(&path);
@@ -425,9 +457,9 @@ mod tests {
     fn test_prefix_remove_update() {
         let path = tmp("wind_uw_prefix.redb");
         let s = Store::open(&path).unwrap();
-        s.add_user_word("wb", "ab", "阿", 10).unwrap();
-        s.add_user_word("wb", "abc", "啊", 20).unwrap();
-        s.add_user_word("wb", "x", "西", 30).unwrap();
+        s.add_user_word("wb", "ab", "阿", 10, 0).unwrap();
+        s.add_user_word("wb", "abc", "啊", 20, 0).unwrap();
+        s.add_user_word("wb", "x", "西", 30, 0).unwrap();
         // 前缀 "ab" 命中 ab/abc，不含 x
         let pre = s.search_user_words_prefix("wb", "ab", 0).unwrap();
         assert_eq!(pre.len(), 2);
@@ -466,8 +498,8 @@ mod tests {
     fn export_import_user_words_roundtrip() {
         let path = tmp("wind_uw_io.redb");
         let s = Store::open(&path).unwrap();
-        s.add_user_word("wb", "a", "工", 100).unwrap();
-        s.add_user_word("wb", "ml", "多行\n带\t制表", 5).unwrap();
+        s.add_user_word("wb", "a", "工", 100, 0).unwrap();
+        s.add_user_word("wb", "ml", "多行\n带\t制表", 5, 0).unwrap();
         let text = s
             .export_user_words_wdict("wb", "2026-07-11T00:00:00+08:00")
             .unwrap();
@@ -490,7 +522,7 @@ mod tests {
     fn import_user_words_merges_max_weight() {
         let path = tmp("wind_uw_merge.redb");
         let s = Store::open(&path).unwrap();
-        s.add_user_word("wb", "a", "工", 100).unwrap();
+        s.add_user_word("wb", "a", "工", 100, 0).unwrap();
         // 导入同词更低权重 → 保持 max(100)
         let text = crate::wdict::export_words_wdict(
             &[crate::wdict::WordIo {
@@ -515,7 +547,7 @@ mod tests {
     fn import_user_words_classifies_added_updated_unchanged() {
         let path = tmp("wind_uw_batch.redb");
         let s = Store::open(&path).unwrap();
-        s.add_user_word("wb", "a", "工", 100).unwrap();
+        s.add_user_word("wb", "a", "工", 100, 0).unwrap();
         let rows = vec![
             // 已有且权重更低 → unchanged(P2 约束 1:不落盘)
             crate::wdict::WordIo {
@@ -557,7 +589,7 @@ mod tests {
     fn preview_import_is_readonly_and_matches_import() {
         let path = tmp("wind_uw_preview.redb");
         let s = Store::open(&path).unwrap();
-        s.add_user_word("wb", "a", "工", 100).unwrap();
+        s.add_user_word("wb", "a", "工", 100, 0).unwrap();
         let rows = vec![
             crate::wdict::WordIo {
                 code: "a".into(),
@@ -592,9 +624,9 @@ mod tests {
     fn clear_user_words_only_target_schema() {
         let path = tmp("wind_uw_clear.redb");
         let s = Store::open(&path).unwrap();
-        s.add_user_word("wb", "a", "工", 1).unwrap();
-        s.add_user_word("wb", "b", "了", 1).unwrap();
-        s.add_user_word("py", "ni", "你", 1).unwrap();
+        s.add_user_word("wb", "a", "工", 1, 0).unwrap();
+        s.add_user_word("wb", "b", "了", 1, 0).unwrap();
+        s.add_user_word("py", "ni", "你", 1, 0).unwrap();
         let n = s.clear_user_words("wb").unwrap();
         assert_eq!(n, 2);
         assert!(s.search_user_words_prefix("wb", "", 0).unwrap().is_empty());
@@ -611,7 +643,7 @@ mod tests {
         let path = tmp("wind_uw_dict_io.redb");
         let s = Store::open(&path).unwrap();
         // 用户词 + 调频次数
-        s.add_user_word("wb", "a", "工", 100).unwrap();
+        s.add_user_word("wb", "a", "工", 100, 0).unwrap();
         s.on_word_selected("wb", "a", "工", 0, 0).unwrap(); // count -> 1
         s.on_word_selected("wb", "a", "工", 0, 0).unwrap(); // count -> 2
         // shadow：pin + del

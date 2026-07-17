@@ -237,7 +237,7 @@ impl Coordinator {
         if partial {
             state
                 .committed_segs
-                .push((code, cand.text.clone(), cand.source));
+                .push((code, cand.text.clone(), cand.source, cand.boundary));
             state.committed_text.push_str(&cand.text);
             state.temp_pinyin_buffer = state.temp_pinyin_buffer[consumed..].to_string();
             self.update_temp_pinyin_candidates(state);
@@ -250,7 +250,7 @@ impl Coordinator {
         } else {
             state
                 .committed_segs
-                .push((code, cand.text.clone(), cand.source));
+                .push((code, cand.text.clone(), cand.source, cand.boundary));
             let final_simplified = format!("{}{}", state.committed_text, cand.text);
             self.learn_phrase_on_commit(state);
             let out = self.maybe_s2t(state, &final_simplified);
@@ -297,11 +297,11 @@ impl Coordinator {
             keymap::VK_BACK => {
                 // Backspace：分步撤销——有已转换段先退回最后一段（你→ni，码并回缓冲前部）；
                 // 否则删剩余拼音末字符；皆空则退出。
-                if let Some((code, _, _)) = state.committed_segs.pop() {
+                if let Some((code, _, _, _)) = state.committed_segs.pop() {
                     state.committed_text = state
                         .committed_segs
                         .iter()
-                        .map(|(_, t, _)| t.as_str())
+                        .map(|(_, t, _, _)| t.as_str())
                         .collect();
                     state.temp_pinyin_buffer = format!("{}{}", code, state.temp_pinyin_buffer);
                     self.update_temp_pinyin_candidates(state);

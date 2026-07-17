@@ -165,6 +165,7 @@ impl CodetableDict {
                 entries
                     .iter()
                     .map(|e| crate::cached::DictHit {
+                        code: code.to_string(),
                         text: e.text.clone(),
                         weight: e.weight,
                         order: e.order,
@@ -173,6 +174,37 @@ impl CodetableDict {
                     .collect()
             })
             .unwrap_or_default()
+    }
+
+    /// 前缀查找，并带出音节边界（内存路径对应
+    /// [`crate::cached::CachedDict::search_prefix_with_boundary`]）。排序/截断语义同
+    /// [`Self::search_prefix`]。
+    pub fn search_prefix_with_boundary(
+        &self,
+        prefix: &str,
+        limit: usize,
+    ) -> Vec<crate::cached::DictHit> {
+        let mut results: Vec<crate::cached::DictHit> = Vec::new();
+        for (code, entries) in self.entries.range(prefix.to_string()..) {
+            if !code.starts_with(prefix) {
+                break;
+            }
+            for e in entries {
+                results.push(crate::cached::DictHit {
+                    code: code.clone(),
+                    text: e.text.clone(),
+                    weight: e.weight,
+                    order: e.order,
+                    boundary: e.boundary,
+                });
+            }
+            if results.len() >= limit * 2 {
+                break; // 收集足够多后排序截断（同 search_prefix）
+            }
+        }
+        results.sort_by(|a, b| b.weight.cmp(&a.weight).then(a.order.cmp(&b.order)));
+        results.truncate(limit);
+        results
     }
 
     /// 前缀查找

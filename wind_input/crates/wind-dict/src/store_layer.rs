@@ -155,8 +155,8 @@ mod tests {
     #[test]
     fn test_user_layer_search() {
         let s = store("user_search");
-        s.add_user_word("wb", "a", "工", 100).unwrap();
-        s.add_user_word("wb", "abc", "啊吧次", 50).unwrap();
+        s.add_user_word("wb", "a", "工", 100, 0).unwrap();
+        s.add_user_word("wb", "abc", "啊吧次", 50, 0).unwrap();
         let layer = StoreUserLayer::new(s.clone(), "wb");
         assert_eq!(layer.layer_type(), LayerType::User);
         let exact = layer.search("a", 10);
@@ -171,7 +171,7 @@ mod tests {
     fn test_is_prefix_flag_search_vs_search_prefix() {
         // TDD: 验证 search 返回 is_prefix=false，search_prefix 返回 is_prefix=true
         let s = store("is_prefix_flag");
-        s.add_user_word("wb", "abc", "啊吧次", 50).unwrap();
+        s.add_user_word("wb", "abc", "啊吧次", 50, 0).unwrap();
         let layer = StoreUserLayer::new(s.clone(), "wb");
 
         // 精确匹配：is_prefix 应为 false
@@ -195,7 +195,7 @@ mod tests {
     fn test_temp_layer_is_prefix_flag() {
         // StoreTempLayer 的 search_prefix 同样应标记 is_prefix=true
         let s = store("temp_is_prefix_flag");
-        s.learn_temp_word("wb", "xyz", "某词", 100).unwrap();
+        s.learn_temp_word("wb", "xyz", "某词", 100, 0).unwrap();
         let layer = StoreTempLayer::new(s.clone(), "wb");
 
         let exact = layer.search("xyz", 10);
@@ -213,8 +213,8 @@ mod tests {
     #[test]
     fn test_temp_layer_and_composite() {
         let s = store("temp_composite");
-        s.add_user_word("wb", "ni", "你", 100).unwrap();
-        s.learn_temp_word("wb", "ni", "拟", 800).unwrap();
+        s.add_user_word("wb", "ni", "你", 100, 0).unwrap();
+        s.learn_temp_word("wb", "ni", "拟", 800, 0).unwrap();
         let composite = CompositeDict::new();
         composite.register_layer(Box::new(StoreUserLayer::new(s.clone(), "wb")));
         composite.register_layer(Box::new(StoreTempLayer::new(s.clone(), "wb")));

@@ -132,15 +132,18 @@ impl DictLayer for SystemDictLayer {
 
     fn search(&self, code: &str, limit: usize) -> Vec<Candidate> {
         let dw = self.default_weight;
+        // 用 search_with_boundary 而非 search：把词典的音节真值边界带进候选（wdat v4）。
+        // 非拼音词库（五笔等）与旧格式的 boundary 恒 0，消费方据此降级，行为不变。
         let mut v: Vec<Candidate> = self
             .dict
-            .search(code)
+            .search_with_boundary(code)
             .into_iter()
-            .map(|(text, weight, order)| Candidate {
-                text,
+            .map(|hit| Candidate {
+                text: hit.text,
                 code: code.to_string(),
-                weight: dw.unwrap_or(weight),
-                natural_order: order,
+                weight: dw.unwrap_or(hit.weight),
+                natural_order: hit.order,
+                boundary: hit.boundary,
                 source: CandidateSource::None,
                 ..Default::default()
             })
@@ -156,13 +159,14 @@ impl DictLayer for SystemDictLayer {
         let dw = self.default_weight;
         let mut v: Vec<Candidate> = self
             .dict
-            .search_prefix(prefix, limit)
+            .search_prefix_with_boundary(prefix, limit)
             .into_iter()
-            .map(|(code, text, weight, order)| Candidate {
-                text,
-                code,
-                weight: dw.unwrap_or(weight),
-                natural_order: order,
+            .map(|hit| Candidate {
+                text: hit.text,
+                code: hit.code,
+                weight: dw.unwrap_or(hit.weight),
+                natural_order: hit.order,
+                boundary: hit.boundary,
                 source: CandidateSource::None,
                 ..Default::default()
             })
@@ -179,6 +183,37 @@ impl DictLayer for SystemDictLayer {
 mod tests {
     use super::*;
     use crate::codetable::CodetableDict;
+    use std::io::Write;
+
+    /// 系统层须把词典的音节边界带进候选（精确 + 前缀两条路）。
+    /// 回归防线：boundary 曾在 SystemDictLayer::search 处被 `dict.search()` 三元组截断，
+    /// 使 search_with_boundary 沦为全仓无消费方的死代码。
+    #[test]
+    fn system_layer_carries_boundary_into_candidates() {
+        let path = std::env::temp_dir().join("wind_layer_boundary.dict.yaml");
+        {
+            let mut f = std::fs::File::create(&path).unwrap();
+            writeln!(f, "---\nname: py\n...").unwrap();
+            writeln!(f, "你好\tni hao\t1200").unwrap();
+            writeln!(f, "你\tni\t800").unwrap();
+        }
+        let d = CodetableDict::load(&path).unwrap();
+        let _ = std::fs::remove_file(&path);
+        let layer = SystemDictLayer::new(CachedDict::Memory(d), "py-system");
+
+        let exact = layer.search("nihao", 10);
+        let hao = exact.iter().find(|c| c.text == "你好").expect("应命中你好");
+        assert_eq!(hao.boundary, 0b101, "候选应带 ni|hao 的真值边界");
+
+        // 前缀补全（输入 ni → 补出「你好」）同样要带边界，供双拼校验。
+        let pre = layer.search_prefix("ni", 10);
+        let hao_p = pre
+            .iter()
+            .find(|c| c.text == "你好")
+            .expect("前缀应补出你好");
+        assert_eq!(hao_p.boundary, 0b101, "前缀候选也应带边界");
+        assert_eq!(hao_p.code, "nihao", "前缀候选的 code 应是完整码");
+    }
 
     #[test]
     fn test_system_layer_via_manager() {

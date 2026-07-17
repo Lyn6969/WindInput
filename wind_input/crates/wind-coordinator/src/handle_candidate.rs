@@ -916,7 +916,7 @@ impl Coordinator {
         if partial {
             state
                 .committed_segs
-                .push((code, cand.text.clone(), cand.source));
+                .push((code, cand.text.clone(), cand.source, cand.boundary));
             state.committed_text.push_str(&cand.text);
             state.input_buffer = state.input_buffer[consumed..].to_string();
             let _ = self.update_candidates(state); // preedit 已含前缀（update_candidates 内拼接）
@@ -927,9 +927,12 @@ impl Coordinator {
                 text: display,
             }
         } else {
-            state
-                .committed_segs
-                .push((code.clone(), cand.text.clone(), cand.source));
+            state.committed_segs.push((
+                code.clone(),
+                cand.text.clone(),
+                cand.source,
+                cand.boundary,
+            ));
             let final_simplified = format!("{}{}", state.committed_text, cand.text);
             self.learn_phrase_on_commit(state); // 自动造词（多段组成的词）
             // 6b: 临时词使用累积（对齐 Go LearnWord-on-commit）：选中临时层候选也推进晋升计数。
@@ -951,9 +954,15 @@ impl Coordinator {
                             .auto_phrase
                             .promote_count
                     };
-                    if let Ok(count) =
-                        store.learn_temp_word(&schema, &code, &cand.text, LEARN_ADD_WEIGHT)
-                    {
+                    // 选中已存在的临时词：learn_temp_word 内部沿用旧 boundary，仅当旧值为 0
+                    // （v1 遗留/无信息）时用候选自带的边界补上。
+                    if let Ok(count) = store.learn_temp_word(
+                        &schema,
+                        &code,
+                        &cand.text,
+                        LEARN_ADD_WEIGHT,
+                        cand.boundary,
+                    ) {
                         self.maybe_promote_temp(
                             store,
                             &schema,

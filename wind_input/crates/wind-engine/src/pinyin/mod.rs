@@ -793,9 +793,9 @@ impl Engine for PinyinEngine {
         EngineType::Pinyin
     }
 
-    /// 为词语生成全拼编码（多音字按词典权重消歧）。
+    /// 为词语生成全拼编码与音节边界（多音字按词典权重消歧）。
     /// 单字读音索引按词典懒构建并缓存。含无读音字符时返回 `None`。
-    fn generate_word_pinyin(&self, word: &str) -> Option<String> {
+    fn generate_word_pinyin(&self, word: &str) -> Option<(String, u64)> {
         let idx = self
             .char_pinyin_idx
             .get_or_init(|| CharPinyinIndex::build(&self.dict));
@@ -970,9 +970,11 @@ mod tests {
     #[test]
     fn store_layer_words_appear_in_candidates() {
         let store = tmp_store("layer_show");
-        store.add_user_word("pinyin", "nihao", "你好", 500).unwrap();
         store
-            .learn_temp_word("pinyin", "lanshou", "蓝瘦", 800)
+            .add_user_word("pinyin", "nihao", "你好", 500, 0)
+            .unwrap();
+        store
+            .learn_temp_word("pinyin", "lanshou", "蓝瘦", 800, 0)
             .unwrap();
         let dm = DictManager::new();
         dm.register_layer(Box::new(wind_dict::StoreUserLayer::new(
@@ -1015,7 +1017,9 @@ mod tests {
     #[test]
     fn store_word_prefix_marks_partial_consumption() {
         let store = tmp_store("layer_partial");
-        store.add_user_word("pinyin", "nihao", "你好", 500).unwrap();
+        store
+            .add_user_word("pinyin", "nihao", "你好", 500, 0)
+            .unwrap();
         let dm = DictManager::new();
         dm.register_layer(Box::new(wind_dict::StoreUserLayer::new(
             store.clone(),
@@ -1038,10 +1042,10 @@ mod tests {
     fn store_layer_words_match_abbreviation() {
         let store = tmp_store("layer_abbrev");
         store
-            .add_user_word("pinyin", "cainiaoyizhan", "菜鸟驿站", 500)
+            .add_user_word("pinyin", "cainiaoyizhan", "菜鸟驿站", 500, 0)
             .unwrap();
         store
-            .learn_temp_word("pinyin", "lanshoubing", "蓝瘦蘑菇", 800)
+            .learn_temp_word("pinyin", "lanshoubing", "蓝瘦蘑菇", 800, 0)
             .unwrap();
         let dm = DictManager::new();
         dm.register_layer(Box::new(wind_dict::StoreUserLayer::new(
@@ -1430,7 +1434,7 @@ mod tests {
     fn shuangpin_store_user_word_appears_in_candidates() {
         let store = tmp_store("sp_userdict");
         store
-            .add_user_word("pinyin", "daboluoge", "大菠萝哥", 0)
+            .add_user_word("pinyin", "daboluoge", "大菠萝哥", 0, 0)
             .unwrap();
 
         let dm = DictManager::new();

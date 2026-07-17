@@ -417,8 +417,24 @@ impl Coordinator {
             .store
             .as_ref()
             .ok_or_else(|| anyhow::anyhow!("无持久化存储"))?;
-        store.add_user_word(&schema, code, text, weight)?;
+        let boundary = self.infer_boundary_for(&schema, code, text);
+        store.add_user_word(&schema, code, text, weight, boundary)?;
         Ok(json!({ "ok": true }))
+    }
+
+    /// 为设置端手输的 (code, text) 推断音节边界。
+    ///
+    /// 参数串/RPC/UI 全链路都是扁平 ASCII 码，**用户无从表达音节边界**。但若手输码恰与引擎
+    /// 推导的码逐字相同，其切分就是确定的，可直接借用推导出的边界——多数手动加词用的正是
+    /// 系统给出的码（`dict.encode`），故这条兜底能覆盖大半。
+    ///
+    /// 不一致（用户自定义切分/生僻音）或非拼音方案 → 0，消费方降级回 DAG。
+    fn infer_boundary_for(&self, schema: &str, code: &str, text: &str) -> u64 {
+        self.engine_mgr
+            .generate_word_pinyin(schema, text)
+            .filter(|(derived, _)| derived == code)
+            .map(|(_, b)| b)
+            .unwrap_or(0)
     }
 
     fn web_dict_update(&self, params: &Value) -> anyhow::Result<Value> {
@@ -430,9 +446,10 @@ impl Coordinator {
             .store
             .as_ref()
             .ok_or_else(|| anyhow::anyhow!("无持久化存储"))?;
-        // 存在则改权重；不存在则新增（upsert 语义）。
+        // 存在则改权重（boundary 沿用）；不存在则新增（upsert 语义）。
         if !store.update_user_word_weight(&schema, code, text, weight)? {
-            store.add_user_word(&schema, code, text, weight)?;
+            let boundary = self.infer_boundary_for(&schema, code, text);
+            store.add_user_word(&schema, code, text, weight, boundary)?;
         }
         Ok(json!({ "ok": true }))
     }
@@ -993,8 +1010,11 @@ impl Coordinator {
         let reverse = self.reverse.read().unwrap_or_else(|e| e.into_inner());
         let code = if is_pinyin {
             // 优先词级消歧（多音字按词典权重），引擎无果时回退逐字反查表。
+            // 本 RPC 只回 code 给 UI（契约为裸字符串），边界丢弃——入库时由 web_dict_add
+            // 的 infer_boundary_for 按「手输码 == 推导码」重新取回。
             self.engine_mgr
                 .generate_word_pinyin(schema, text)
+                .map(|(c, _)| c)
                 .unwrap_or_else(|| reverse.gen_pinyin(text))
         } else {
             reverse.wubi_word_code(text)
@@ -1006,9 +1026,11 @@ impl Coordinator {
     /// 都无果时回退逐字反查表（pinyin_map.txt）。用于 dict.genPinyin（无方案上下文）。
     fn gen_pinyin_word(&self, text: &str) -> String {
         let active = self.engine_mgr.active_schema_id();
+        // 本入口只需 code（dict.genPinyin 契约为裸字符串），边界丢弃。
         self.engine_mgr
             .generate_word_pinyin(&active, text)
             .or_else(|| self.engine_mgr.generate_word_pinyin("pinyin", text))
+            .map(|(c, _)| c)
             .unwrap_or_else(|| {
                 self.reverse
                     .read()
@@ -2790,10 +2812,11 @@ mod tests {
         {
             let mut st = c.state.lock().unwrap();
             st.committed_segs.clear();
+            // 段各为单音节（段内边界 0b1）→ 自动造词拼出 nihao 时全局边界应为 ni|hao = 0b101。
             st.committed_segs
-                .push(("ni".into(), "你".into(), CandidateSource::Pinyin));
+                .push(("ni".into(), "你".into(), CandidateSource::Pinyin, 0b1));
             st.committed_segs
-                .push(("hao".into(), "好".into(), CandidateSource::Pinyin));
+                .push(("hao".into(), "好".into(), CandidateSource::Pinyin, 0b1));
             c.learn_phrase_on_commit(&st);
         }
         assert!(
@@ -2809,10 +2832,11 @@ mod tests {
         {
             let mut st = c.state.lock().unwrap();
             st.committed_segs.clear();
+            // 码表段无音节概念（boundary=0）→ 整词边界作废（半截边界比没有更糟）。
             st.committed_segs
-                .push(("aaaa".into(), "工".into(), CandidateSource::CodeTable));
+                .push(("aaaa".into(), "工".into(), CandidateSource::CodeTable, 0));
             st.committed_segs
-                .push(("hao".into(), "好".into(), CandidateSource::Pinyin));
+                .push(("hao".into(), "好".into(), CandidateSource::Pinyin, 0b1));
             c.learn_phrase_on_commit(&st);
         }
         for schema in ["ct_test", "pinyin", "mx_test"] {
@@ -2827,9 +2851,9 @@ mod tests {
             let mut st = c.state.lock().unwrap();
             st.committed_segs.clear();
             st.committed_segs
-                .push(("aa".into(), "工".into(), CandidateSource::CodeTable));
+                .push(("aa".into(), "工".into(), CandidateSource::CodeTable, 0));
             st.committed_segs
-                .push(("bb".into(), "人".into(), CandidateSource::CodeTable));
+                .push(("bb".into(), "人".into(), CandidateSource::CodeTable, 0));
             c.learn_phrase_on_commit(&st);
         }
         assert!(
@@ -2876,9 +2900,9 @@ mod tests {
             let mut st = c.state.lock().unwrap();
             st.committed_segs.clear();
             st.committed_segs
-                .push(("aa".into(), "工".into(), CandidateSource::None));
+                .push(("aa".into(), "工".into(), CandidateSource::None, 0));
             st.committed_segs
-                .push(("bb".into(), "人".into(), CandidateSource::Pinyin));
+                .push(("bb".into(), "人".into(), CandidateSource::Pinyin, 0));
             c.learn_phrase_on_commit(&st);
         }
         assert!(

@@ -75,32 +75,80 @@ impl CharPinyinIndex {
     }
 }
 
-/// 为词语生成全拼编码。含无读音字符时返回 `None`。
+/// 按音节/词段拼接 code，**顺带累积音节边界**。
+///
+/// 造词本就是「逐音节拼起来」，每次拼接前的 `code.len()` 就是该音节的起始字节位——边界是
+/// 白送的，此前只是被 `String::push_str` 丢掉，逼得下游用 DAG 反猜（甚至靠 410 音节暴力反查）。
+///
+/// 溢出（拼接后 >64 字节，bitmask 装不下）时整体作废为 0 = 无边界信息，与
+/// `wind_dict` 侧 `syllable_boundary_mask` 的降级契约一致：宁可不给，不给半截错的。
+struct CodeBuilder {
+    code: String,
+    mask: u64,
+    overflow: bool,
+}
+
+impl CodeBuilder {
+    fn new(cap: usize) -> Self {
+        Self {
+            code: String::with_capacity(cap),
+            mask: 0,
+            overflow: false,
+        }
+    }
+
+    /// 追加一个**已知内部边界**的词段（如整词 "nihao" + 段内 mask ni|hao）。
+    /// 段内 mask 的 bit 是段内偏移，须平移 `base` 到全局位置。
+    fn push_segment(&mut self, s: &str, seg_mask: u64) {
+        let base = self.code.len();
+        // 段内 mask 的置位不会超出 s.len()，故 base+s.len()<=64 即可安全左移。
+        if base + s.len() > 64 {
+            self.overflow = true;
+        } else {
+            self.mask |= seg_mask << base;
+        }
+        self.code.push_str(s);
+    }
+
+    /// 追加一个音节（段内 mask 恒为 `0b1`：段首即音节首）。
+    fn push_syllable(&mut self, s: &str) {
+        self.push_segment(s, 0b1);
+    }
+
+    fn finish(self) -> (String, u64) {
+        (self.code, if self.overflow { 0 } else { self.mask })
+    }
+}
+
+/// 为词语生成全拼编码**与音节边界**。含无读音字符时返回 `None`。
+///
+/// 返回的 boundary 语义同 `wind_dict::binformat::DictEntry::boundary`，供用户自造词从
+/// 诞生起就带上边界（否则用户词是块「边界空洞」，双拼校验只能对其降级）。
 ///
 /// `dict` 为拼音系统词典（提供整词验证的真值表），`index` 为单字读音索引。
 pub fn generate_word_pinyin(
     dict: &CachedDict,
     index: &CharPinyinIndex,
     word: &str,
-) -> Option<String> {
+) -> Option<(String, u64)> {
     let runes: Vec<char> = word.chars().collect();
     if runes.is_empty() {
         return None;
     }
     // 1) 整词命中
-    if let Some(code) = infer_whole_word_code(dict, index, &runes, word) {
-        return Some(code);
+    if let Some(r) = infer_whole_word_code(dict, index, &runes, word) {
+        return Some(r);
     }
     // 2) 子词切分 + 整体读音继承
-    if let Some(code) = infer_by_subword_segmentation(dict, index, &runes) {
-        return Some(code);
+    if let Some(r) = infer_by_subword_segmentation(dict, index, &runes) {
+        return Some(r);
     }
-    // 3) 兜底：逐字代表读音
-    let mut out = String::with_capacity(runes.len() * 4);
+    // 3) 兜底：逐字代表读音（每字一音节，边界即逐字累积）
+    let mut b = CodeBuilder::new(runes.len() * 4);
     for &r in &runes {
-        out.push_str(index.representative(r)?);
+        b.push_syllable(index.representative(r)?);
     }
-    Some(out)
+    Some(b.finish())
 }
 
 /// 用词典真值表为整词推断读音：枚举每字读音笛卡尔积，找到第一个能查回该词的组合。
@@ -111,7 +159,7 @@ fn infer_whole_word_code(
     index: &CharPinyinIndex,
     runes: &[char],
     word: &str,
-) -> Option<String> {
+) -> Option<(String, u64)> {
     if runes.len() < 2 {
         return None;
     }
@@ -132,12 +180,14 @@ fn infer_whole_word_code(
     // 笛卡尔积枚举（按字典序，等价于按权重组合的优先级）
     let mut idxs = vec![0usize; runes.len()];
     loop {
-        let mut code = String::with_capacity(runes.len() * 4);
+        // 每字一音节 → 边界随拼接累积（readings[i][pos] 即第 i 字选中的读音）。
+        let mut b = CodeBuilder::new(runes.len() * 4);
         for (i, &pos) in idxs.iter().enumerate() {
-            code.push_str(&readings[i][pos]);
+            b.push_syllable(&readings[i][pos]);
         }
+        let (code, mask) = b.finish();
         if dict.search(&code).iter().any(|(text, _, _)| text == word) {
-            return Some(code);
+            return Some((code, mask));
         }
         // 递增到下一个组合（低位满则进位）
         let mut k = runes.len();
@@ -161,6 +211,9 @@ struct DpState {
     prev: usize,
     /// 该段为多字子词时的整体读音 code；单字过渡为空。
     seg: String,
+    /// `seg` 的**段内**音节边界（多字子词自身可含多音节，如「你好」→ ni|hao）。
+    /// 回溯拼接时须平移到全局位置，否则长词的段内边界会丢。
+    seg_mask: u64,
     /// 已用多字子词段数（越少越优，同总字数下）。
     multi_segs: usize,
     /// 已用多字子词的总字数（越大越优）。
@@ -182,7 +235,7 @@ fn infer_by_subword_segmentation(
     dict: &CachedDict,
     index: &CharPinyinIndex,
     runes: &[char],
-) -> Option<String> {
+) -> Option<(String, u64)> {
     let n = runes.len();
     if n < 2 {
         return None;
@@ -192,6 +245,7 @@ fn infer_by_subword_segmentation(
     dp[0] = Some(DpState {
         prev: 0,
         seg: String::new(),
+        seg_mask: 0,
         multi_segs: 0,
         total_mul: 0,
     });
@@ -204,10 +258,11 @@ fn infer_by_subword_segmentation(
         let mut l = 2;
         while i + l <= n {
             let sub: String = runes[i..i + l].iter().collect();
-            if let Some(code) = infer_whole_word_code(dict, index, &runes[i..i + l], &sub) {
+            if let Some((code, mask)) = infer_whole_word_code(dict, index, &runes[i..i + l], &sub) {
                 let next = DpState {
                     prev: i,
                     seg: code,
+                    seg_mask: mask,
                     multi_segs: cur.multi_segs + 1,
                     total_mul: cur.total_mul + l,
                 };
@@ -221,6 +276,7 @@ fn infer_by_subword_segmentation(
         let next = DpState {
             prev: i,
             seg: String::new(),
+            seg_mask: 0,
             multi_segs: cur.multi_segs,
             total_mul: cur.total_mul,
         };
@@ -238,6 +294,7 @@ fn infer_by_subword_segmentation(
     struct Span {
         from: usize,
         code: String,
+        mask: u64,
     }
     let mut spans: Vec<Span> = Vec::new();
     let mut cur = n;
@@ -246,21 +303,23 @@ fn infer_by_subword_segmentation(
         spans.push(Span {
             from: s.prev,
             code: s.seg.clone(),
+            mask: s.seg_mask,
         });
         cur = s.prev;
     }
     spans.reverse();
 
-    let mut out = String::with_capacity(n * 4);
+    let mut b = CodeBuilder::new(n * 4);
     for sp in &spans {
         if !sp.code.is_empty() {
-            out.push_str(&sp.code);
+            // 多字子词段：段内自带音节边界（如「你好」→ ni|hao），平移到全局位置。
+            b.push_segment(&sp.code, sp.mask);
         } else {
-            // 单字段：用代表读音
-            out.push_str(index.representative(runes[sp.from])?);
+            // 单字段：用代表读音（本身即一个音节）
+            b.push_syllable(index.representative(runes[sp.from])?);
         }
     }
-    Some(out)
+    Some(b.finish())
 }
 
 #[cfg(test)]
@@ -278,9 +337,60 @@ mod tests {
     }
 
     fn gen_py(entries: &[(&str, &str, i32)], word: &str) -> Option<String> {
+        gen_py_full(entries, word).map(|(c, _)| c)
+    }
+
+    /// 同 `gen_py`，但保留音节边界，供边界相关断言。
+    fn gen_py_full(entries: &[(&str, &str, i32)], word: &str) -> Option<(String, u64)> {
         let dict = dict_from(entries);
         let idx = CharPinyinIndex::build(&dict);
         generate_word_pinyin(&dict, &idx, word)
+    }
+
+    /// 造词须同时产出音节边界——用户自造词的边界从此有来源，不再是「空洞」。
+    /// 三条产码路径（整词消歧 / 子词切分 / 逐字兜底）都要带边界。
+    #[test]
+    fn generate_word_pinyin_carries_boundary() {
+        let entries = &[
+            ("ni", "你", 100),
+            ("hao", "好", 100),
+            ("nihao", "你好", 500),
+            ("chong", "重", 50),
+            ("zhong", "重", 900),
+            ("qing", "庆", 100),
+            ("chongqing", "重庆", 800),
+        ];
+        // 整词命中：ni|hao → 起始 {0,2}
+        assert_eq!(gen_py_full(entries, "你好"), Some(("nihao".into(), 0b101)));
+        // 整词消歧（重庆读 chongqing 而非 zhongqing）：chong|qing → 起始 {0,5}
+        assert_eq!(
+            gen_py_full(entries, "重庆"),
+            Some(("chongqing".into(), 0b100001))
+        );
+        // 单字：整串一个音节 → {0}
+        assert_eq!(gen_py_full(entries, "你"), Some(("ni".into(), 0b1)));
+        // 逐字兜底（整词不在词典）：ni|zhong → 起始 {0,2}
+        assert_eq!(
+            gen_py_full(entries, "你重"),
+            Some(("nizhong".into(), 0b101))
+        );
+    }
+
+    /// 子词切分路径：段自身是多音节整词时，**段内边界须平移到全局**，不能按「一段一音节」记。
+    #[test]
+    fn subword_segmentation_preserves_inner_boundary() {
+        let entries = &[
+            ("ni", "你", 100),
+            ("hao", "好", 100),
+            ("nihao", "你好", 500),
+            ("a", "啊", 100),
+        ];
+        // 「你好啊」整词不在词典 → 子词切分：段「你好」(nihao, 段内 ni|hao) + 单字「啊」(a)。
+        // 全局边界须为 ni|hao|a = 起始 {0,2,5}，而非把 nihao 当单个音节记成 {0,5}。
+        assert_eq!(
+            gen_py_full(entries, "你好啊"),
+            Some(("nihaoa".into(), 0b100101))
+        );
     }
 
     /// 多音字按权重择优：费→fei(1000) 而非 bi(50)，强→qiang(1000) 而非 jiang(80)。
