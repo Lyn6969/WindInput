@@ -510,20 +510,34 @@ pub struct MixModeConfig {
     /// 引导键列表
     #[serde(default)]
     pub trigger_keys: Vec<String>,
-    /// 成员方案 id 列表（按序合并候选；如 ["pinyin", "quick_symbols"]）
+    /// 成员方案 id 列表（按序合并候选；如 ["pinyin", "quick_symbols"]）。
+    /// 支持占位符 [`MIX_MEMBER_PRIMARY_PINYIN`]；字面 id 一律精确解释（"pinyin" 恒为全拼）。
     #[serde(default)]
     pub members: Vec<String>,
 }
 
+/// 内置「快捷」融合 mix 的实例 id（`;` 触发，成员含日期/计算/拼音/英文）。
+/// 设置页只暴露其 trigger_keys；其余字段（尤其 members）为内置默认值。
+pub const QUICK_MIX_ID: &str = "quick_mix";
+
+/// mix 成员占位符：解析期替换为 `schema.primary_pinyin`（空=全拼 "pinyin"）。
+/// 内置「快捷」默认成员用它，使快捷输入的拼音跟随主拼音方案（双拼用户得双拼）。
+/// 与字面 `"pinyin"` 严格区分——后者表示"就要全拼"，永不被替换。
+pub const MIX_MEMBER_PRIMARY_PINYIN: &str = "$primary_pinyin";
+
+/// 主拼音方案缺省回退（`schema.primary_pinyin` 为空时的目标方案）。
+/// 固定全拼，不扫描 available——避免方案列表顺序静默改变拼音行为。
+pub const DEFAULT_PINYIN_SCHEMA: &str = "pinyin";
+
 fn default_mix_modes() -> Vec<MixModeConfig> {
     vec![MixModeConfig {
-        id: "quick_mix".to_string(),
+        id: QUICK_MIX_ID.to_string(),
         name: "快捷".to_string(),
         short_name: "快".to_string(),
         trigger_keys: vec!["semicolon".to_string()],
         members: vec![
             "quick_input".to_string(),
-            "pinyin".to_string(),
+            MIX_MEMBER_PRIMARY_PINYIN.to_string(),
             "english".to_string(),
         ],
     }]
@@ -815,9 +829,6 @@ pub struct TempPinyinConfig {
     /// 总开关（原方案级 [engine.codetable.temp_pinyin].enabled 上移至此）。
     #[serde(default = "default_true")]
     pub enabled: bool,
-    /// 目标拼音方案 id（空=回退 "pinyin"）。原方案级 schema 字段上移。
-    #[serde(default)]
-    pub schema: String,
     /// 触发键（如 "backtick" / "z" / "semicolon"），默认反引号
     #[serde(default = "default_temp_pinyin_triggers")]
     pub trigger_keys: Vec<String>,
@@ -835,7 +846,6 @@ impl Default for TempPinyinConfig {
     fn default() -> Self {
         Self {
             enabled: true,
-            schema: String::new(),
             trigger_keys: default_temp_pinyin_triggers(),
             hotkey: String::new(),
         }
@@ -1711,6 +1721,28 @@ impl Config {
         if self.ui.candidate.per_page == 0 {
             self.ui.candidate.per_page = default_per_page();
         }
+        self.migrate_quick_mix_pinyin_member();
+    }
+
+    /// 存量迁移：内置 `quick_mix` 的字面 `"pinyin"` 成员 → [`MIX_MEMBER_PRIMARY_PINYIN`] 占位符。
+    ///
+    /// 背景：`members` 从未开放给用户（无 UI、data/config.toml 无 mix_modes 段），但设置页改
+    /// 「快捷输入激活键」时会把整个 mix_modes 数组连同 members 写回用户配置。故存量用户配置里的
+    /// 字面 `"pinyin"` 必是旧默认值残留、而非「就要全拼」的用户意图，替换为占位符是安全的。
+    /// 只认内置 quick_mix：用户自定义 mix 的字面 id 一律精确解释，不动。
+    fn migrate_quick_mix_pinyin_member(&mut self) {
+        for m in self
+            .schema
+            .mix_modes
+            .iter_mut()
+            .filter(|m| m.id == QUICK_MIX_ID)
+        {
+            for s in m.members.iter_mut() {
+                if s == DEFAULT_PINYIN_SCHEMA {
+                    *s = MIX_MEMBER_PRIMARY_PINYIN.to_string();
+                }
+            }
+        }
     }
 
     /// 应用数据目录名：正式版 `WindInput`；dev 变体 `WindInputDev`
@@ -1847,6 +1879,63 @@ impl Config {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 内置「快捷」默认成员用占位符，使快捷输入的拼音跟随主拼音方案（而非恒为全拼）。
+    #[test]
+    fn quick_mix_default_members_use_primary_pinyin_placeholder() {
+        let modes = default_mix_modes();
+        let quick = modes
+            .iter()
+            .find(|m| m.id == QUICK_MIX_ID)
+            .expect("应有内置 quick_mix");
+        assert!(
+            quick
+                .members
+                .contains(&MIX_MEMBER_PRIMARY_PINYIN.to_string()),
+            "默认成员应为占位符，实际 {:?}",
+            quick.members
+        );
+        assert!(
+            !quick.members.contains(&DEFAULT_PINYIN_SCHEMA.to_string()),
+            "不应再硬编码字面 pinyin，实际 {:?}",
+            quick.members
+        );
+    }
+
+    /// 存量迁移：改过「快捷输入激活键」的用户配置里，members 被整体写回为字面 pinyin，
+    /// 加载期须迁成占位符，否则这些用户的快捷输入永远是全拼。
+    #[test]
+    fn normalize_migrates_quick_mix_literal_pinyin() {
+        let mut cfg = Config::default();
+        cfg.schema.mix_modes = vec![
+            MixModeConfig {
+                id: QUICK_MIX_ID.to_string(),
+                members: vec![
+                    "quick_input".to_string(),
+                    "pinyin".to_string(),
+                    "english".to_string(),
+                ],
+                ..Default::default()
+            },
+            // 用户自定义 mix：字面 id 精确解释，不迁移。
+            MixModeConfig {
+                id: "my_mix".to_string(),
+                members: vec!["pinyin".to_string()],
+                ..Default::default()
+            },
+        ];
+        cfg.normalize();
+        assert_eq!(
+            cfg.schema.mix_modes[0].members,
+            vec!["quick_input", MIX_MEMBER_PRIMARY_PINYIN, "english"],
+            "内置 quick_mix 的字面 pinyin 应迁为占位符"
+        );
+        assert_eq!(
+            cfg.schema.mix_modes[1].members,
+            vec!["pinyin"],
+            "自定义 mix 的字面 pinyin 应原样保留"
+        );
+    }
 
     /// input.default 新增项与既有语义：state_scope 默认 global、remember 默认 false。
     #[test]

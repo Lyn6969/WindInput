@@ -1105,12 +1105,54 @@ fn test_temp_pinyin_not_triggered_in_pinyin_mode() {
     if !has_schemas() {
         return;
     }
-    // 拼音方案下反引号不应触发临时拼音（仅码表方案启用）
+    // 拼音方案下反引号不应触发临时拼音（仅码表/混输方案启用）。
+    // 注：旧断言是 assert_ne!(txt, "`ni")——进临拼时根本不会产出该串，故恒真、从未真正设防，
+    // 判据缺失（引导键分支无引擎类型检查）多年未被发现。现直接断言"未进入临拼模式"。
     let coord = Coordinator::new_headless(config_with("pinyin"), Some(&data_dir()));
     let act = coord.handle_key_event(&key_event(0xC0, EVENT_KEY_DOWN));
-    // 应作为标点处理（反引号→ 不在中文标点表则原样/全角），不应进入临时拼音前缀
+    assert!(
+        !coord.debug_in_temp_pinyin(),
+        "拼音方案不应进入临时拼音，实际 act={act:?}"
+    );
+    // 且反引号应作标点上屏（不被模式吞掉）。
     let txt = action_text(&act).unwrap_or_default();
-    assert_ne!(txt, "`ni", "拼音方案不应进入临时拼音");
+    assert!(
+        txt.contains('`') || txt.contains('·'),
+        "反引号应作标点输出，实际: {txt:?}"
+    );
+}
+
+/// 组合意外终止（鼠标点击移光标 / 焦点切换 / 宿主强制 EndComposition）必须整体复位
+/// overlay 模式，不能只清 input_buffer——临拼/快捷的缓冲与前缀不在 input_buffer 里。
+/// 真机现象（回归）：` 进临拼后点鼠标移光标，再按 d 组合区显示 `d（模式残留）。
+#[test]
+fn test_composition_terminated_resets_overlay_modes() {
+    if !has_schemas() {
+        return;
+    }
+    let coord = Coordinator::new_headless(config_with("wubi86"), Some(&data_dir()));
+
+    // ` 进入临时拼音
+    coord.handle_key_event(&key_event(0xC0, EVENT_KEY_DOWN));
+    assert!(coord.debug_in_temp_pinyin(), "反引号应进入临时拼音");
+
+    // 宿主终止组合（鼠标点击移光标）
+    coord.handle_composition_terminated();
+    assert!(
+        !coord.debug_in_temp_pinyin(),
+        "组合终止后不应残留临时拼音模式"
+    );
+
+    // 再按 d：应走普通输入（五笔码），而非临拼的 `d
+    let act = press_vk(&coord, 0x44, false);
+    let txt = match &act {
+        KeyAction::UpdateComposition { text, .. } => text.clone(),
+        _ => String::new(),
+    };
+    assert!(
+        !txt.starts_with('`'),
+        "终止后按键不应续在临拼前缀上: {txt:?}"
+    );
 }
 
 /// 按下一个字符键（vk + 可选 shift）

@@ -89,6 +89,10 @@ pub struct EngineManager {
     override_dir: Option<std::path::PathBuf>,
     /// 主码表方案 id(拼音反查码源):config.schema.primary_codetable 解析后(可空)。构造/重载时更新。
     primary_codetable: Mutex<String>,
+    /// 主拼音方案 id(临时拼音目标):config.schema.primary_pinyin 原样(空=全拼 "pinyin",见
+    /// temp_pinyin_target)。不同于 primary_codetable 的 available 扫描——空值定义为固定全拼,
+    /// 避免调整 available 顺序静默改变临时拼音方案。构造/重载时更新。
+    primary_pinyin: Mutex<String>,
     /// 码表反查索引缓存:方案 id → (汉字/词 → 全部编码,码长升序)。供拼音编码提示与悬停
     /// [编码] 段按词查实际码。懒建(首次需要时按方案词库全量构建),invalidate/reload 时清空。
     /// 内存护栏:每份索引可达数万词条,最多缓存两份(见 `reverse_index_for`)。
@@ -217,6 +221,7 @@ impl EngineManager {
             name_cache: Mutex::new(HashMap::new()),
             override_dir,
             primary_codetable: Mutex::new(primary_codetable),
+            primary_pinyin: Mutex::new(config.schema.primary_pinyin.clone()),
             reverse_index: Mutex::new(HashMap::new()),
             pinyin: Mutex::new(config.schema.pinyin.clone()),
             shuangpin_finals_cache: Mutex::new((String::new(), None)),
@@ -1044,6 +1049,10 @@ impl EngineManager {
         *self.mix.lock().unwrap_or_else(|e| e.into_inner()) = config.schema.mix.clone();
         *self.temp_pinyin.lock().unwrap_or_else(|e| e.into_inner()) =
             config.input.temp_pinyin.clone();
+        *self
+            .primary_pinyin
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = config.schema.primary_pinyin.clone();
         // 全局拼音配置变更：更新缓存，引擎缓存随下方 clear() 一起失效，下次按新配置重建。
         *self.pinyin.lock().unwrap_or_else(|e| e.into_inner()) = config.schema.pinyin.clone();
         // 丢弃缓存：引擎按新上屏策略/词典重建，名称/词频按新方案重读。
@@ -1150,22 +1159,52 @@ impl EngineManager {
             .unwrap_or(false)
     }
 
-    /// 临时拼音目标方案 id（读全局 input.temp_pinyin；不再读方案级配置）。
-    /// 启用且目标方案可加载时返回 Some(target)，否则 None。
+    /// 临时拼音目标方案 id 的纯解析（不含可加载性门控，供单测）：
+    /// 关闭 / 当前方案不适用 → None；否则取 primary_pinyin，空则全拼 "pinyin"。
+    ///
+    /// 方案适用范围**仅码表/混输**：拼音方案本身就在打拼音，再叠一层无意义，且会吞掉引导符
+    /// （如 `）本该有的标点输出。混输保留——其拼音子方案由方案自身决定，未必等于主拼音方案，
+    /// 「混输走全拼 + 临时拼音走双拼」是有效用法。
+    fn resolve_temp_pinyin_target(
+        enabled: bool,
+        engine_type: Option<EngineType>,
+        primary_pinyin: &str,
+    ) -> Option<String> {
+        if !enabled {
+            return None;
+        }
+        if !matches!(
+            engine_type,
+            Some(EngineType::CodeTable) | Some(EngineType::Mixed)
+        ) {
+            return None;
+        }
+        Some(if primary_pinyin.is_empty() {
+            wind_config::config::DEFAULT_PINYIN_SCHEMA.to_string()
+        } else {
+            primary_pinyin.to_string()
+        })
+    }
+
+    /// 临时拼音目标方案 id：开关读 input.temp_pinyin.enabled，方案读 schema.primary_pinyin
+    /// （空=全拼 "pinyin"），且仅码表/混输方案适用（见 resolve_temp_pinyin_target）。
+    /// 启用、适用且目标方案可加载时返回 Some(target)，否则 None。
+    ///
+    /// **所有临时拼音进入点的公共门卫**（引导键 / 字母触发 / 直达热键 / 顶屏进模式 /
+    /// z-fallback 均先问它），故适用范围判据必须落在这里，放任一调用点都会漏网。
     pub fn temp_pinyin_target(&self) -> Option<String> {
-        let tp = self
+        let enabled = self
             .temp_pinyin
             .lock()
             .unwrap_or_else(|e| e.into_inner())
+            .enabled;
+        let primary = self
+            .primary_pinyin
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
             .clone();
-        if !tp.enabled {
-            return None;
-        }
-        let target = if tp.schema.is_empty() {
-            "pinyin".to_string()
-        } else {
-            tp.schema.clone()
-        };
+        let target =
+            Self::resolve_temp_pinyin_target(enabled, self.current_engine_type(), &primary)?;
         if self.ensure_loaded(&target) {
             Some(target)
         } else {
@@ -2122,6 +2161,70 @@ mod tests {
             EngineManager::parse_freq_strategy("bogus"),
             FreqStrategy::Step,
             "未知策略应回退 step"
+        );
+    }
+
+    /// 临时拼音目标方案取自 schema.primary_pinyin（空=全拼）。
+    /// 回归防线：该字段一度只被定义/登记而无人读取，导致临时拼音恒为全拼。
+    #[test]
+    fn temp_pinyin_target_follows_primary_pinyin() {
+        let ct = Some(EngineType::CodeTable);
+        assert_eq!(
+            EngineManager::resolve_temp_pinyin_target(true, ct, "shoudao"),
+            Some("shoudao".to_string()),
+            "配置的主拼音方案应作为临时拼音目标"
+        );
+        assert_eq!(
+            EngineManager::resolve_temp_pinyin_target(true, ct, ""),
+            Some("pinyin".to_string()),
+            "primary_pinyin 空应定义为全拼，而非扫描 available"
+        );
+        assert_eq!(
+            EngineManager::resolve_temp_pinyin_target(false, ct, "shoudao"),
+            None,
+            "总开关关闭时不进临时拼音"
+        );
+    }
+
+    /// 临时拼音仅适用码表/混输方案。判据必须在 target 这个公共门卫上——
+    /// 曾只在引导键分支加判据，热键/顶屏进模式等入口直接漏网。
+    #[test]
+    fn temp_pinyin_target_scope_limited_to_codetable_and_mixed() {
+        for ty in [EngineType::CodeTable, EngineType::Mixed] {
+            assert_eq!(
+                EngineManager::resolve_temp_pinyin_target(true, Some(ty), "shoudao"),
+                Some("shoudao".to_string()),
+                "{ty:?} 方案应支持临时拼音"
+            );
+        }
+        // 拼音方案：本身就在打拼音，不再叠一层（引导符须留给标点输出）。
+        assert_eq!(
+            EngineManager::resolve_temp_pinyin_target(true, Some(EngineType::Pinyin), "shoudao"),
+            None,
+            "拼音方案不应进入临时拼音"
+        );
+        assert_eq!(
+            EngineManager::resolve_temp_pinyin_target(true, Some(EngineType::English), "shoudao"),
+            None,
+            "英文引擎不应进入临时拼音"
+        );
+        assert_eq!(
+            EngineManager::resolve_temp_pinyin_target(true, None, "shoudao"),
+            None,
+            "无活跃引擎时不应进入临时拼音"
+        );
+    }
+
+    /// primary_pinyin 经 config 一路传到 manager 缓存（构造期接线防线）。
+    #[test]
+    fn primary_pinyin_wired_from_config() {
+        let mut cfg = Config::default();
+        cfg.schema.primary_pinyin = "shoudao".to_string();
+        let mgr = EngineManager::with_store_override(&cfg, None, None, None);
+        assert_eq!(
+            *mgr.primary_pinyin.lock().unwrap(),
+            "shoudao",
+            "config.schema.primary_pinyin 应在构造期进入 manager"
         );
     }
 

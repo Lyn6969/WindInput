@@ -116,7 +116,9 @@ impl Coordinator {
             });
         }
 
-        // 临时拼音：码表方案 + 空缓冲 + 匹配触发键 + 无修饰键（不要求候选空）
+        // 临时拼音：空缓冲 + 匹配触发键 + 无修饰键（不要求候选空）。
+        // 方案适用范围（仅码表/混输）由 temp_pinyin_target() 统一把关——它是所有进入点的
+        // 公共门卫（引导键/字母触发/热键/顶屏进模式/z-fallback），判据放这里才不会漏网。
         if state.input_buffer.is_empty()
             && data.modifiers & (MOD_CTRL | MOD_ALT | MOD_SHIFT) == 0
             && self.is_temp_pinyin_trigger(data.key_code)

@@ -367,8 +367,9 @@ convert(input):
   consumed_length=0 永不部分匹配）时，剩余编码**强制**按混输方案的 `[engine.mixed].secondary_schema`
   转换（`convert_with`），避免混输让码表抢首选（选「你」后 hao→虚）。注意不用全局 primary_pinyin
   （那是临时拼音↔临时双拼切换用的）。
-- **临时拼音**：`[input.temp_pinyin]`（引导键默认反引号）由协调器 pipeline 层分发，临时切到指定拼音
-  方案，不在 MixedEngine 内。快捷输入 `;` 由内置 mix「快捷」融合方案接管（quick_input 作为成员）。
+- **临时拼音**：`[input.temp_pinyin]`（总开关 + 引导键，默认反引号）由协调器 pipeline 层分发，临时切到
+  目标拼音方案，不在 MixedEngine 内。目标方案取全局 `schema.primary_pinyin`（空=全拼 `"pinyin"`），
+  见 `temp_pinyin_target`。快捷输入 `;` 由内置 mix「快捷」融合方案接管（quick_input 作为成员）。
 - **词库热插拔**：`set_dict_enabled` 转发主/次子引擎（扩展码表层在码表子引擎）。
 
 ---

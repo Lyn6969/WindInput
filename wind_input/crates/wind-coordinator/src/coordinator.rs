@@ -4472,16 +4472,19 @@ impl MessageHandler for Coordinator {
             return;
         }
         let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
-        state.input_buffer.clear();
-        state.candidates.clear();
+        // 必须整体复位（含 active/temp_pinyin_*/mix_* 等 overlay 状态），不能只清 input_buffer：
+        // 临时拼音/快捷输入的缓冲与前缀不在 input_buffer 里，只清后者会让模式残留——
+        // 真机现象：` 进临拼后点鼠标移光标，候选窗随 notify_ui_hide 消失但模式还在，
+        // 再按 d 仍走 handle_temp_pinyin_key，组合区诡异地显示 `d。
+        // reset_exclusive_modes 内含 disarm_smart_symbol 与强制竖排布局恢复。
+        // 此回调仅在 TSF 意外终止组合时触发（焦点切换、宿主强制 EndComposition 等）；
+        // 我们自己的 CommitText 不触发（_pComposition 已提前置 nullptr，走"Already released"分支）。
+        // 因此在此 disarm 是安全的：意外中断必然使 HoldComposition 失效，旧 held_text 不可再用。
+        self.reset_exclusive_modes(&mut state);
         // 复位菜单状态：点击别处会终止 composition 并经 notify_ui_hide 隐藏菜单窗口，
         // 但若不清 menu_open，下一个键会被 forward_menu_key 当作菜单键吞掉（首字符失效）。
         state.menu_open = false;
         drop(state);
-        // 此回调仅在 TSF 意外终止组合时触发（焦点切换、宿主强制 EndComposition 等）；
-        // 我们自己的 CommitText 不触发（_pComposition 已提前置 nullptr，走"Already released"分支）。
-        // 因此在此 disarm 是安全的：意外中断必然使 HoldComposition 失效，旧 held_text 不可再用。
-        self.disarm_smart_symbol();
         self.clear_pair_tracker(); // 组合意外终止：配对上下文失效，清栈防跳出键误判
         self.notify_ui_hide();
     }

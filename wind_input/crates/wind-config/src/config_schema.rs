@@ -158,7 +158,6 @@ static REGISTRY: &[ConfigField] = &[
     f("input.temp_english.space_as_input", Bool),
     f("input.capslock.cancel_on_mode_switch", Bool),
     f("input.temp_pinyin.enabled", Bool),
-    f("input.temp_pinyin.schema", Str),
     f("input.temp_pinyin.trigger_keys", StrList),
     f("input.temp_pinyin.hotkey", Str),
     f("input.url.enabled", Bool),

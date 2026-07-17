@@ -17,6 +17,14 @@ use wind_ipc::protocol::MOD_SHIFT;
 use wind_keys::keymap;
 
 impl Coordinator {
+    /// 当前是否处于临时拼音模式（测试/诊断用）。
+    pub fn debug_in_temp_pinyin(&self) -> bool {
+        matches!(
+            self.state.lock().unwrap_or_else(|e| e.into_inner()).active,
+            Some(ModeKind::TempPinyin)
+        )
+    }
+
     /// 设置简繁开关（测试/诊断用）。返回是否生效（数据缺失则 false）。
     pub fn debug_set_s2t(&self, on: bool) -> bool {
         if self.s2t.lock().unwrap_or_else(|e| e.into_inner()).is_none() {
@@ -52,29 +60,51 @@ impl Coordinator {
         }
     }
 
-    /// mix 模式可加载的成员方案列表（过滤空/不可加载）。
-    /// mix 可用的真实方案成员（过滤空 / 不可加载 / 内置 quick_input）。
-    pub(crate) fn mix_members(&self, idx: u8) -> Vec<String> {
-        // 快捷英文候选关时，english 成员不计入（与 update_mix_candidates 一致，读快捷开关）。
-        let enable_english = self.rt().config.schema.quick_input.enable_english;
-        self.rt()
-            .config
+    /// mix 成员占位符解析：`$primary_pinyin` → `schema.primary_pinyin`（空=全拼）。
+    /// 字面方案 id 原样返回——显式写 "pinyin" 即精确要全拼，永不被替换。
+    /// 关联函数（入参 primary 而非读 self.rt()）：调用方多在已持 rt() 的闭包内，避免嵌套借用。
+    pub(crate) fn resolve_mix_member(member: &str, primary_pinyin: &str) -> String {
+        if member != wind_config::config::MIX_MEMBER_PRIMARY_PINYIN {
+            return member.to_string();
+        }
+        if primary_pinyin.is_empty() {
+            wind_config::config::DEFAULT_PINYIN_SCHEMA.to_string()
+        } else {
+            primary_pinyin.to_string()
+        }
+    }
+
+    /// mix 模式的成员方案 id 列表（占位符已解析，未过滤）。
+    fn mix_members_resolved(&self, idx: u8) -> Vec<String> {
+        let rt = self.rt();
+        let primary = rt.config.schema.primary_pinyin.clone();
+        rt.config
             .schema
             .mix_modes
             .get(idx as usize)
             .map(|m| {
                 m.members
                     .iter()
-                    .filter(|s| {
-                        !s.is_empty()
-                            && *s != "quick_input"
-                            && (*s != "english" || enable_english)
-                            && self.engine_mgr.ensure_schema(s)
-                    })
-                    .cloned()
+                    .map(|s| Self::resolve_mix_member(s, &primary))
                     .collect()
             })
             .unwrap_or_default()
+    }
+
+    /// mix 模式可加载的成员方案列表（过滤空/不可加载）。
+    /// mix 可用的真实方案成员（过滤空 / 不可加载 / 内置 quick_input）。
+    pub(crate) fn mix_members(&self, idx: u8) -> Vec<String> {
+        // 快捷英文候选关时，english 成员不计入（与 update_mix_candidates 一致，读快捷开关）。
+        let enable_english = self.rt().config.schema.quick_input.enable_english;
+        self.mix_members_resolved(idx)
+            .into_iter()
+            .filter(|s| {
+                !s.is_empty()
+                    && s != "quick_input"
+                    && (s != "english" || enable_english)
+                    && self.engine_mgr.ensure_schema(s)
+            })
+            .collect()
     }
 
     /// mix 是否含内置类方案 quick_input（日期/计算）成员——启用「首字符数字/字母决定选词逻辑」。
@@ -680,14 +710,7 @@ impl Coordinator {
             return;
         }
         let numeric = self.mix_has_quick_input(state.mix_id) && state.mix_numeric;
-        let members = self
-            .rt()
-            .config
-            .schema
-            .mix_modes
-            .get(state.mix_id as usize)
-            .map(|m| m.members.clone())
-            .unwrap_or_default();
+        let members = self.mix_members_resolved(state.mix_id);
         // 快捷英文候选开关（schema.quick_input.enable_english）：关时快捷/融合不纳入 english 成员。
         // 独立于混输的 schema.mix.enable_english（那个控制 MixedEngine 码表+拼音混输）。
         let enable_english = self.rt().config.schema.quick_input.enable_english;
@@ -971,5 +994,35 @@ mod mix_numpad_tests {
         assert_eq!(Coordinator::mix_numeric_input_char(0x31, false), Some('1')); // VK_1
         // 字母在数字透镜里作选词，不作输入。
         assert_eq!(Coordinator::mix_numeric_input_char(0x41, false), None); // 'A'
+    }
+
+    /// mix 成员占位符解析：$primary_pinyin 跟随主拼音方案，字面 id 精确解释。
+    #[test]
+    fn resolve_mix_member_placeholder_vs_literal() {
+        use wind_config::config::MIX_MEMBER_PRIMARY_PINYIN as PH;
+        assert_eq!(
+            Coordinator::resolve_mix_member(PH, "shoudao"),
+            "shoudao",
+            "占位符应解析为主拼音方案"
+        );
+        assert_eq!(
+            Coordinator::resolve_mix_member(PH, ""),
+            "pinyin",
+            "主拼音方案为空时占位符回退全拼"
+        );
+        // 字面 id 一律原样——"pinyin" 表示「就要全拼」，不被主拼音方案替换。
+        assert_eq!(
+            Coordinator::resolve_mix_member("pinyin", "shoudao"),
+            "pinyin",
+            "字面 pinyin 不应被替换"
+        );
+        assert_eq!(
+            Coordinator::resolve_mix_member("quick_input", "shoudao"),
+            "quick_input"
+        );
+        assert_eq!(
+            Coordinator::resolve_mix_member("english", "shoudao"),
+            "english"
+        );
     }
 }
