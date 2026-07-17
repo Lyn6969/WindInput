@@ -2846,6 +2846,68 @@ fn phrase_auto_commit_effect_command_executes() {
     let _ = std::fs::remove_file(&store_path);
 }
 
+/// 短语自动上屏须过 `auto_commit_min_len` 闸（与码表「满码唯一自动上屏」同规格）。
+///
+/// 回归：`phrase_auto_commit` 原只判「唯一 + 无更长后继」、不设最短码长，致短码短语
+/// （如 3 码 `ocd` 的 $CC 命令在 4 码方案里）绕过「满码」语义直接上屏/执行。
+///
+/// 复用 kkkkx（5 码，五笔 4 码封顶 → 必无更长后继）隔离出 min_len 单一变量：
+/// 显式设 6 → 5 < 6 应被拦；设 5 → 恰好达标应放行（边界为 >=）。
+fn coord_with_phrase_min_len(min_len: usize, tag: &str) -> std::sync::Arc<Coordinator> {
+    let store_path = std::env::temp_dir().join(format!("wind_phrase_minlen_{tag}.redb"));
+    let _ = std::fs::remove_file(&store_path);
+    let store = std::sync::Arc::new(wind_store::Store::open(&store_path).unwrap());
+    store.add_phrase("kkkkx", "唯一测试短语", 0, 100).unwrap();
+    let mut cfg = config_with("wubi86");
+    cfg.schema.codetable.auto_commit_at_full = true;
+    cfg.schema.codetable.auto_commit_min_len = min_len;
+    Coordinator::new_headless_with_store(cfg, Some(&data_dir()), store)
+}
+
+#[test]
+fn phrase_auto_commit_blocked_below_min_len() {
+    if !has_schemas() {
+        return;
+    }
+    // min_len=6 > 短语码长 5：即便唯一且无更长后继，也不得自动上屏。
+    let coord = coord_with_phrase_min_len(6, "block");
+    for ch in ['k', 'k', 'k', 'k'] {
+        press_letter(&coord, ch);
+    }
+    let act = coord.handle_key_event(&key_event(0x58, EVENT_KEY_DOWN));
+    assert!(
+        !matches!(act, KeyAction::InsertText { .. }),
+        "码长 5 < min_len 6 时短语不得自动上屏，实际: {:?}",
+        act
+    );
+    assert!(
+        coord
+            .debug_all_candidate_texts()
+            .contains(&"唯一测试短语".to_string()),
+        "未达 min_len 应留在候选里等用户选，实际: {:?}",
+        coord.debug_all_candidate_texts()
+    );
+}
+
+#[test]
+fn phrase_auto_commit_at_min_len_boundary() {
+    if !has_schemas() {
+        return;
+    }
+    // min_len=5 == 短语码长 5：边界为 >=，应自动上屏（证明上一个测试拦的是 min_len 本身，
+    // 而非 kkkkx 这个构造本来就不会自动上屏）。
+    let coord = coord_with_phrase_min_len(5, "boundary");
+    for ch in ['k', 'k', 'k', 'k'] {
+        press_letter(&coord, ch);
+    }
+    match coord.handle_key_event(&key_event(0x58, EVENT_KEY_DOWN)) {
+        KeyAction::InsertText { text, .. } => {
+            assert_eq!(text, "唯一测试短语", "码长恰达 min_len 应自动上屏");
+        }
+        other => panic!("码长 5 == min_len 5 应自动上屏，实际: {:?}", other),
+    }
+}
+
 // 码表用户词库值内嵌 $CC 命令（用户真机场景 bccc=$CC(...)）自动上屏测试基建：
 // 注入 5 码用户词 kkkkx（五笔 4 码封顶，5 码处必无码表候选 → 唯一 + 无更长后继，
 // 与短语侧同构造）。原三重漏判：引擎意向 commit_text=原始 $CC 源 vs 展开后候选

@@ -51,6 +51,21 @@ fn candidate_display_order(
         .then(a.natural_order.cmp(&b.natural_order))
 }
 
+/// 自动上屏最短码长的归一（纯函数）：配置 0 = 跟随全码长。
+///
+/// 复刻引擎侧 `CodeTableEngine::new` 的同名归一——那份藏在引擎构造函数里、只作用于其私有
+/// `opts`，协调器取不到，故短语侧须在此重算。两处语义必须一致。
+///
+/// `max_code_length` 为 0（拼音等无「全码」概念的引擎，见 `Engine::max_code_length` 默认实现）
+/// 时结果为 0 → 调用方的 `len < 0` 恒假 → 不设闸，与引擎侧同构降级。
+fn resolve_auto_commit_min_len(configured: usize, max_code_length: usize) -> usize {
+    if configured > 0 {
+        configured
+    } else {
+        max_code_length
+    }
+}
+
 impl Coordinator {
     /// 记录一次选词到 redb FREQ（词频维度：count+1、last_used=now，按 schema+code+text）。
     /// 词频是与权重解耦的独立维度（frequency.md），仅记真实使用数据；redb 事务即时持久。
@@ -522,9 +537,16 @@ impl Coordinator {
     /// - 含副作用命令 → [`InputOutcome::AutoCommand`]：清组合并异步执行（与空格选中命令同语义）；
     /// - `$SS`·`$AA` 组 / 前缀枚举短语 → 排除（不自动上屏，避免误展开/打断输入）。
     ///
-    /// 门槛为「唯一 + 无更长后继（含短语）」，不设最短码长——短码短语仅在无任何更长续接时才上屏。
+    /// 门槛为「最短码长 + 唯一 + 无更长后继（含短语）」四闸串联，与引擎 `decide_auto_commit`
+    /// 同构——两道缺一不可：`min_len` 管「够不够满码」，`has_longer_code` 管「还能不能接着打」。
     pub(crate) fn phrase_auto_commit(&self, state: &State) -> Option<InputOutcome> {
-        if !self.engine_mgr.codetable_settings().auto_commit_at_full {
+        let ct = self.engine_mgr.codetable_settings();
+        if !ct.auto_commit_at_full {
+            return None;
+        }
+        // 最短码长闸：与引擎 decide_auto_commit 的 `input.chars().count() < min_len` 同构。
+        // 短语此前不设此闸，致 3 码短语（如 ocd）在 4 码方案里绕过「满码」语义直接上屏/执行。
+        if state.input_buffer.chars().count() < self.phrase_auto_commit_min_len(&ct) {
             return None;
         }
         // 唯一候选。
@@ -556,6 +578,21 @@ impl Coordinator {
             return None;
         }
         Some(InputOutcome::AutoCommit(c.text.clone()))
+    }
+
+    /// 短语自动上屏的最短码长门槛。
+    ///
+    /// **当前跟随主码表**的 `schema.codetable.auto_commit_min_len`：短语虽是独立体系，但
+    /// 「满码自动上屏」的规格应与主码表一致，否则同一个 `auto_commit_at_full` 开关下短语与
+    /// 码表行为分叉（原 bug：3 码短语在 4 码方案里直接上屏）。
+    ///
+    /// 预留：日后若要给短语独立门槛（如 `schema.phrase.auto_commit_min_len`），只需改本方法
+    /// 的取值来源，`phrase_auto_commit` 的判据结构无需改动。
+    fn phrase_auto_commit_min_len(&self, ct: &wind_config::CodetableGlobal) -> usize {
+        resolve_auto_commit_min_len(
+            ct.auto_commit_min_len,
+            self.engine_mgr.active_max_code_length(),
+        )
     }
 
     /// `$CC` 命令候选的自动上屏结局分流（短语命令 / 词库命令词条共用）：
@@ -1893,6 +1930,30 @@ impl Coordinator {
             chinese_mode,
             has_new_composition: false,
         }
+    }
+}
+
+#[cfg(test)]
+mod auto_commit_min_len_tests {
+    //! 最短码长归一：须与引擎 `CodeTableEngine::new` 的同名归一保持一致。
+    use super::resolve_auto_commit_min_len;
+
+    #[test]
+    fn zero_follows_max_code_length() {
+        // 0 = 跟随全码长（五笔 4 码）。
+        assert_eq!(resolve_auto_commit_min_len(0, 4), 4);
+    }
+
+    #[test]
+    fn explicit_value_wins_over_max_code_length() {
+        assert_eq!(resolve_auto_commit_min_len(2, 4), 2);
+        assert_eq!(resolve_auto_commit_min_len(6, 4), 6);
+    }
+
+    #[test]
+    fn no_max_code_length_disables_gate() {
+        // 拼音等引擎 max_code_length()=0 → 门槛 0 → 调用方 `len < 0` 恒假 → 不设闸。
+        assert_eq!(resolve_auto_commit_min_len(0, 0), 0);
     }
 }
 
