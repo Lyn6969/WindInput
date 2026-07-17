@@ -4,7 +4,8 @@
 //! 触发键判定、进入/退出、候选刷新、按键处理、选词上屏。
 
 use crate::coordinator::{
-    Coordinator, ENGINE_MAX_CANDIDATES, EnCase, State, adapt_en_case, detect_en_case, punct_char,
+    Coordinator, ENGINE_MAX_CANDIDATES, EnCase, State, adapt_en_case, detect_en_case, numpad_char,
+    punct_char,
 };
 use crate::pipeline::{ModeKind, Rewind};
 use crate::preedit_cursor;
@@ -688,6 +689,14 @@ impl Coordinator {
             }
             0x30 if data.modifiers & MOD_SHIFT == 0 => {
                 Self::temp_english_insert(state, '0');
+                refresh(self, state)
+            }
+            k if numpad_char(k).is_some() => {
+                // 小键盘数字 / 运算符：恒作输入字符（此前只认主键盘区，小键盘落到下方标点臂被
+                // punct_char 判 None 后静默 Consumed，故临英下小键盘数字完全打不出）。
+                // 不参与选词——主键盘数字在临英里有「选词 vs 输入」歧义，小键盘是无歧义的数字
+                // 输入通道，保持直入更贴合「英文数字连输」的用途。
+                Self::temp_english_insert(state, numpad_char(k).unwrap());
                 refresh(self, state)
             }
             _ => {

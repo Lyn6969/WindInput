@@ -1699,6 +1699,31 @@ fn test_temp_english_digits_and_punct() {
 }
 
 #[test]
+fn test_temp_english_numpad_digits_input() {
+    if !has_schemas() {
+        return;
+    }
+    // 小键盘数字在临英下曾被静默吃掉（只认主键盘 0x30-0x39，小键盘 0x60-0x69 落标点臂
+    // → punct_char 判 None → Consumed）。此处不关 show_candidates：小键盘恒作输入，
+    // 不受候选存在与否影响（与主键盘数字的选词语义刻意不同）。
+    let coord = Coordinator::new_headless(config_with("wubi86"), Some(&data_dir()));
+    press_shift_letter(&coord, 'v'); // V
+    press_letter(&coord, 'e');
+    press_letter(&coord, 'r');
+    press_vk(&coord, 0x32, false); // 主键盘 2
+    let last = press_vk(&coord, 0x62, false); // 小键盘 2 (VK_NUMPAD2)
+    assert_eq!(
+        action_text(&last).unwrap(),
+        "Ver22",
+        "小键盘数字应入临英缓冲"
+    );
+    // 小键盘运算符 / 小数点同样入缓冲。
+    press_vk(&coord, 0x6E, false); // VK_DECIMAL '.'
+    let last = press_vk(&coord, 0x6D, false); // VK_SUBTRACT '-'
+    assert_eq!(action_text(&last).unwrap(), "Ver22.-", "小键盘符号应入缓冲");
+}
+
+#[test]
 fn test_temp_english_esc_exits() {
     if !has_schemas() {
         return;

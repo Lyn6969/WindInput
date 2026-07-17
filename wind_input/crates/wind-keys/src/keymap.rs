@@ -70,7 +70,7 @@ pub struct NavKeys {
 }
 
 impl NavKeys {
-    /// 从配置组名编译。page 组：pageupdown / minus_equal / brackets / shift_tab；
+    /// 从配置组名编译。page 组：pageupdown / minus_equal / brackets / comma_period / shift_tab；
     /// highlight 组：arrows / tab。未识别组名忽略。
     pub fn from_config(page_groups: &[String], highlight_groups: &[String]) -> Self {
         use NavAction::*;
@@ -96,6 +96,10 @@ impl NavKeys {
                 "brackets" => {
                     push(VK_LBRACKET, false, PagePrev, true);
                     push(VK_RBRACKET, false, PageNext, true);
+                }
+                "comma_period" => {
+                    push(VK_COMMA, false, PagePrev, true);
+                    push(VK_PERIOD, false, PageNext, true);
                 }
                 "shift_tab" => {
                     push(VK_TAB, true, PagePrev, false);
@@ -297,6 +301,24 @@ mod tests {
         );
         assert_eq!(nk.classify(VK_MINUS, false, false), None);
         assert_eq!(nk.classify(VK_EQUAL, false, false), None);
+    }
+
+    #[test]
+    fn comma_period_pages() {
+        // 设置页提供 comma_period 选项，但组名曾未被识别（走 `_ => {}` 静默忽略）→
+        // 无翻页绑定，逗号/句号落到标点臂直接上屏。
+        let nk = NavKeys::from_config(&["comma_period".into()], &[]);
+        assert_eq!(
+            nk.classify(VK_COMMA, false, true),
+            Some(NavAction::PagePrev)
+        );
+        assert_eq!(
+            nk.classify(VK_PERIOD, false, true),
+            Some(NavAction::PageNext)
+        );
+        // 可打印键：文本/表达式模式（临英/快捷输入）里仍作输入字符，不夺为翻页。
+        assert_eq!(nk.classify(VK_COMMA, false, false), None);
+        assert_eq!(nk.classify(VK_PERIOD, false, false), None);
     }
 
     #[test]

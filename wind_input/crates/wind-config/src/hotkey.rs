@@ -187,7 +187,7 @@ impl Compiler {
             }
         }
 
-        // ── KeyDown：翻页键组（pageupdown / minus_equal / brackets / shift_tab） ──
+        // ── KeyDown：翻页键组（pageupdown / minus_equal / brackets / comma_period / shift_tab） ──
         for group in &self.config.keys.page_keys {
             for raw in compile_page_key_group(group) {
                 result.key_down.push(HotkeyEntry {
@@ -297,6 +297,7 @@ fn compile_page_key_group(group: &str) -> Vec<u32> {
         "pageupdown" => vec![key_hash(0, VK_PRIOR), key_hash(0, VK_NEXT)],
         "minus_equal" => vec![key_hash(0, VK_OEM_MINUS), key_hash(0, VK_OEM_PLUS)],
         "brackets" => vec![key_hash(0, VK_OEM_4), key_hash(0, VK_OEM_6)],
+        "comma_period" => vec![key_hash(0, VK_OEM_COMMA), key_hash(0, VK_OEM_PERIOD)],
         "shift_tab" => vec![key_hash(MOD_SHIFT, VK_TAB), key_hash(0, VK_TAB)],
         _ => Vec::new(),
     }
