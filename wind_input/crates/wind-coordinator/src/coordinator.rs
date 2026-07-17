@@ -3577,13 +3577,28 @@ impl MessageHandler for Coordinator {
             return self.handle_add_word_key(&mut state, data);
         }
 
-        // 英文模式：直接透传
-        // 密码框强制英文抑制：透传（不改 chinese_mode 持久值/图标；设计"图标不变"）
-        if !state.chinese_mode
-            || self
-                .password_suppress
-                .load(std::sync::atomic::Ordering::Relaxed)
+        // 密码框强制英文抑制：透传（不改 chinese_mode 持久值/图标；设计"图标不变"）。
+        // 须先于下方全角分支——密码框里不该出全角字符，一律半角透传。
+        // 注：透传要真生效，C++ 侧必须也没吃这个键，否则「吃了再吐」丢键（见 TSF 待办）。
+        if self
+            .password_suppress
+            .load(std::sync::atomic::Ordering::Relaxed)
         {
+            return KeyAction::PassThrough;
+        }
+
+        // 英文模式
+        if !state.chinese_mode {
+            // 全角：键已被 TSF 的 `english_fullwidth` 分支吃下等 Rust 出字，此处必须转换，
+            // 否则 PassThrough 会形成「吃了再吐」→ 严格 TSF 宿主丢键（见 handle_english_full_width）。
+            // Ctrl/Alt 组合不参与：C++ 的 ClassifyInputKey 对其返回 None，本就不吃。
+            if state.full_width
+                && data.modifiers & (MOD_CTRL | MOD_ALT) == 0
+                && let Some(act) = self.handle_english_full_width(&mut state, data)
+            {
+                return act;
+            }
+            // 半角英文：透传，宿主自然出字（保留 WM_KEYDOWN 原生语义）。
             return KeyAction::PassThrough;
         }
 
@@ -3886,13 +3901,22 @@ impl MessageHandler for Coordinator {
                 // 数字键 1-9 选当前页第 N 个候选；越界按 input.overflow.number_key 处理
                 // （ignore 吞键 / commit 上屏高亮 / commit_and_input 顶字+数字，对齐 Go）。
                 let num = (data.key_code - 0x31) as usize + 1; // 1..=9
-                // 无候选时保持透传：纯数字键应输出数字（不拦截空缓冲下的数字）。
-                // 对齐 Go：recordCommit(key, 0, -1, SourcePunctuation) 后再 return nil。
                 if state.candidates.is_empty()
                     && state.input_buffer.is_empty()
                     && state.committed_text.is_empty()
                 {
                     let digit = (b'0' + num as u8) as char;
+                    // 全角：C++ 为此专门在无 session 时也吃数字（`chinese_fullwidth_number`
+                    // 分支），故必须出字——透传会「吃了再吐」→ 严格 TSF 宿主丢键、宽松宿主出
+                    // 半角（旧行为：1-9 各应用表现不一，而 `0` 因无此臂落标点流水线反而正常）。
+                    // 走完整流水线而非裸 to_full_width，与 `0`/小键盘/CapsLock 各路径一致。
+                    if state.full_width {
+                        let text = self.convert_punct(&state, digit, data.prev_char);
+                        self.record_commit(&text, 0, -1, CommitSource::Punctuation);
+                        return Self::commit_action(text, true);
+                    }
+                    // 半角无候选：透传，纯数字键由宿主出字（保留原生按键语义）。
+                    // 对齐 Go：recordCommit(key, 0, -1, SourcePunctuation) 后再 return nil。
                     self.record_commit(&digit.to_string(), 0, -1, CommitSource::Punctuation);
                     return KeyAction::PassThrough;
                 }

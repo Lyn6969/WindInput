@@ -4,10 +4,21 @@
 //! 纯转换逻辑在 wind-punct crate；此处是 coordinator 包装（锁转换器/读状态）+ 智能符号
 //! 连按替换的状态机（武装/触发/解除）。
 
-use crate::coordinator::{Coordinator, State};
+use crate::coordinator::{Coordinator, State, numpad_char, printable_char};
 use tracing::debug;
-use wind_bridge::handler::KeyAction;
+use wind_bridge::handler::{KeyAction, KeyEventData, MessageHandler};
 use wind_config::config::SmartMethod;
+use wind_ipc::protocol::MOD_SHIFT;
+use wind_keys::keymap;
+
+/// 恰好单字符则返回之，否则 None（自定义映射可为多字符串，不能充当配对符）。
+fn single_char(s: &str) -> Option<char> {
+    let mut it = s.chars();
+    match (it.next(), it.next()) {
+        (Some(c), None) => Some(c),
+        _ => None,
+    }
+}
 
 impl Coordinator {
     /// 数字后智能标点：在中文标点模式下，若 ch 在智能标点列表且光标前一字符为数字，
@@ -265,6 +276,118 @@ impl Coordinator {
         arm.hold_pending_commit = false;
         // 注：HoldComposition 模式下若组合尚未提交，C++ 端的 SetTimer 计时器会在 timeout
         // 到期后自动提交中文符号，或在焦点切换时由 OnCompositionTerminated 自然结束。
+    }
+
+    /// 英文模式 + 全角：按键经完整标点流水线转全角后上屏（含自动配对）。
+    ///
+    /// **必须出字**：这些键已被 TSF 在 `OnTestKeyDown` 的 `english_fullwidth` 分支吃下
+    /// （Letter|Number|Punctuation|Space，含小键盘）。此处返回 None → 调用方 PassThrough →
+    /// 形成 `OnTestKeyDown(TRUE)+OnKeyDown(FALSE)` 的「吃了再吐」翻转，而 Chrome/Electron 等
+    /// 严格 TSF 宿主不会回退合成 WM_CHAR，键会直接丢失（半角宿主则表现为出半角）。
+    /// 故此处接住的键集必须覆盖 C++ 的吃键集，二者须同增同减。
+    pub(crate) fn handle_english_full_width(
+        &self,
+        state: &mut State,
+        data: &KeyEventData,
+    ) -> Option<KeyAction> {
+        let shift = data.modifiers & MOD_SHIFT != 0;
+        let is_letter = (keymap::VK_A..=keymap::VK_Z).contains(&data.key_code);
+        // 键被吃下后系统不再代劳大小写，故由 CapsLock 镜像 XOR Shift 定。镜像每键都用事件
+        // 携带的 toggles 快照校准（见 handle_key_event 开头），英文模式下同样可靠。
+        let effective_shift = if is_letter {
+            shift != state.caps_lock
+        } else {
+            shift
+        };
+        // 空格不在 printable_char 覆盖内（punct_char 无 VK_SPACE），单独接；小键盘也须接——
+        // C++ 把 VK_NUMPAD* 归为 Number，同样在全角吃键集内。
+        let ch = if data.key_code == keymap::VK_SPACE {
+            ' '
+        } else {
+            printable_char(data.key_code, effective_shift).or_else(|| numpad_char(data.key_code))?
+        };
+
+        // 「英全」= 英文标点 + 全角（自定义映射四态的列 1）。经完整流水线而非裸 to_full_width，
+        // 确保用户自定义中英文符号生效（与 CapsLock+全角 路径同构）。
+        let saved_punct = state.chinese_punct;
+        state.chinese_punct = false;
+        let piece = self.convert_punct_char(state, ch);
+        let pairs = self.full_width_english_pairs(state);
+        state.chinese_punct = saved_punct;
+
+        // 统计：C++ `OnKeyTraceDown` 在全角态主动跳过计数（注释「will be eaten by
+        // OnTestKeyDown for full-width conversion」），把英文统计让给本路径；不记则恒为 0。
+        self.record_english_key_stat(data.key_code, shift);
+
+        debug!("English full-width: {:?} -> {:?}", ch, piece);
+
+        if let Some(pairs) = pairs {
+            let pch = piece.chars().last().unwrap_or(' ');
+            // 智能跳过：输右符号且栈顶正是它 → 光标右移越过，不重复插入。
+            if pairs.iter().any(|(_, r)| *r == pch) {
+                let mut tr = self.pair_tracker.lock().unwrap_or_else(|e| e.into_inner());
+                if tr.peek().is_some_and(|e| e.right == pch) {
+                    tr.pop();
+                    return Some(KeyAction::MoveCursorRight);
+                }
+                tr.clear();
+            }
+            // 插入配对：左符号 → 补右符号，光标置于其间。
+            if let Some((_, right)) = pairs.iter().find(|(l, _)| *l == pch).copied() {
+                self.pair_tracker
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .push(pch, right);
+                let cursor_offset = piece.encode_utf16().count() as u32;
+                return Some(KeyAction::InsertTextWithCursor {
+                    text: format!("{}{}", piece, right),
+                    cursor_offset,
+                });
+            }
+        }
+        Some(Self::commit_action(piece, false))
+    }
+
+    /// 全角态下的英文配对表：把 `english_pairs` 的左右符号各过一遍**同一条**标点流水线，
+    /// 即「打出什么就配对什么」——用户改「英全」列时配对自动跟随，无需另设配对自定义。
+    ///
+    /// **不可复用 `cn_pairs`**：那是中文标点（【】《》「」），与 ASCII 的全角形并非同一字符
+    /// （`to_full_width('[')` = `［` U+FF3B，而 cn_pairs 里是 `【` U+3010；只有 `（）｛｝`
+    /// 恰好重合）。混用会出现「打 `[` 出 `【` 却配 `］`」的错位。
+    ///
+    /// 调用前须已置 `state.chinese_punct = false`（「英全」列语义）。
+    fn full_width_english_pairs(&self, state: &State) -> Option<Vec<(char, char)>> {
+        let rt = self.rt();
+        if !rt.config.input.auto_pair.english {
+            return None;
+        }
+        let pairs: Vec<(char, char)> = rt
+            .en_pairs
+            .iter()
+            .filter_map(|(l, r)| {
+                let lf = self.convert_punct_char(state, *l);
+                let rf = self.convert_punct_char(state, *r);
+                Some((single_char(&lf)?, single_char(&rf)?))
+            })
+            .collect();
+        (!pairs.is_empty()).then_some(pairs)
+    }
+
+    /// 英文模式按键的统计归类：**镜像** C++ `_RecordEnglishKeyTrace` 的分桶（Shift+数字算标点、
+    /// 小键盘数字算数字…），保证全角/半角两条路径统计口径一致。
+    fn record_english_key_stat(&self, key_code: u32, shift: bool) {
+        let (chars, digits, puncts, spaces) = if (keymap::VK_A..=keymap::VK_Z).contains(&key_code) {
+            (1, 0, 0, 0)
+        } else if (keymap::VK_0..=keymap::VK_9).contains(&key_code) {
+            if shift { (0, 0, 1, 0) } else { (0, 1, 0, 0) }
+        } else if key_code == keymap::VK_SPACE {
+            (0, 0, 0, 1)
+        } else if numpad_char(key_code).is_some_and(|c| c.is_ascii_digit()) {
+            (0, 1, 0, 0)
+        } else {
+            (0, 0, 1, 0)
+        };
+        self.handle_english_stats(chars, digits, puncts, spaces);
     }
 
     /// 清空配对跟踪栈（焦点/模式切换等的防御性复位，与 `disarm_smart_symbol` 并列调用）。

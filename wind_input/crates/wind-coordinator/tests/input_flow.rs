@@ -3304,3 +3304,188 @@ fn test_temp_pinyin_cursor_maps_through_separator() {
         "已在最左：吃掉，不得退进引导符"
     );
 }
+
+// ── 全角（英文模式 / 中文模式数字）─────────────────────────────────────────────
+// 背景：全角横跨两层门控——C++ `OnTestKeyDown` 决定是否吃键转发，Rust 决定是否转全角。
+// 两侧不一致即「吃了再吐」(OnTestKeyDown(TRUE)+OnKeyDown(FALSE))，严格 TSF 宿主直接丢键。
+// 下列用例锁的是 Rust 侧「C++ 吃了就必须出字」的契约。
+
+/// 英文模式 + 全角的配置（C++ `english_fullwidth` 分支会吃 Letter|Number|Punctuation|Space）。
+fn config_english_fullwidth() -> wind_config::Config {
+    let mut cfg = config_with("pinyin");
+    cfg.input.default.chinese_mode = false;
+    cfg.input.default.full_width = true;
+    cfg
+}
+
+#[test]
+fn test_english_fullwidth_letters_digits_space() {
+    if !has_schemas() {
+        return;
+    }
+    // 回归：英文模式曾无条件 PassThrough（从不读 full_width），而 C++ 已为全角吃下这些键
+    // → 吃了再吐 → Chrome/VSCode 等严格宿主里空格/数字/符号完全打不出。
+    let coord = Coordinator::new_headless(config_english_fullwidth(), Some(&data_dir()));
+    let cases = [
+        (0x41_u32, "ａ", "小写字母"),
+        (0x35, "５", "数字"),
+        (0x20, "\u{3000}", "空格"),
+        (0xBD, "－", "标点(减号)"),
+        (0x60, "０", "小键盘数字"),
+    ];
+    for (vk, want, what) in cases {
+        match coord.handle_key_event(&key_event(vk, EVENT_KEY_DOWN)) {
+            KeyAction::InsertText { text, .. } => {
+                assert_eq!(text, want, "英文全角{}应上屏全角", what)
+            }
+            other => panic!("英文全角{}应出字（透传即丢键），实际: {:?}", what, other),
+        }
+    }
+}
+
+#[test]
+fn test_english_fullwidth_shift_and_capslock_case() {
+    if !has_schemas() {
+        return;
+    }
+    // 键被 TSF 吃下后系统不再代劳大小写，须由 Rust 按 CapsLock 镜像 XOR Shift 自行决定。
+    use wind_ipc::protocol::MOD_SHIFT;
+    let coord = Coordinator::new_headless(config_english_fullwidth(), Some(&data_dir()));
+    // Shift+A → 大写全角
+    match coord.handle_key_event(&key_event_mods(0x41, EVENT_KEY_DOWN, MOD_SHIFT)) {
+        KeyAction::InsertText { text, .. } => assert_eq!(text, "Ａ", "Shift+字母应大写全角"),
+        other => panic!("实际: {:?}", other),
+    }
+    // Shift+1 → '!' 的全角（走 punct_char 的 shifted 支）
+    match coord.handle_key_event(&key_event_mods(0x31, EVENT_KEY_DOWN, MOD_SHIFT)) {
+        KeyAction::InsertText { text, .. } => assert_eq!(text, "！", "Shift+1 应出全角叹号"),
+        other => panic!("实际: {:?}", other),
+    }
+    // CapsLock 开（toggles bit0）+ 无 Shift → 大写全角；镜像由每键 toggles 快照校准。
+    let caps = KeyEventData {
+        toggles: 0x01,
+        ..key_event(0x41, EVENT_KEY_DOWN)
+    };
+    match coord.handle_key_event(&caps) {
+        KeyAction::InsertText { text, .. } => assert_eq!(text, "Ａ", "CapsLock 应大写全角"),
+        other => panic!("实际: {:?}", other),
+    }
+    // CapsLock + Shift → 相互抵消回小写
+    let caps_shift = KeyEventData {
+        toggles: 0x01,
+        modifiers: MOD_SHIFT,
+        ..key_event(0x41, EVENT_KEY_DOWN)
+    };
+    match coord.handle_key_event(&caps_shift) {
+        KeyAction::InsertText { text, .. } => assert_eq!(text, "ａ", "CapsLock+Shift 应抵消回小写"),
+        other => panic!("实际: {:?}", other),
+    }
+}
+
+#[test]
+fn test_english_halfwidth_still_passthrough() {
+    if !has_schemas() {
+        return;
+    }
+    // 零回归：英文半角仍须透传（C++ 此时也不吃键），保留宿主 WM_KEYDOWN 原生语义。
+    let mut cfg = config_with("pinyin");
+    cfg.input.default.chinese_mode = false;
+    let coord = Coordinator::new_headless(cfg, Some(&data_dir()));
+    for vk in [0x41_u32, 0x35, 0x20, 0xBD] {
+        assert!(
+            matches!(
+                coord.handle_key_event(&key_event(vk, EVENT_KEY_DOWN)),
+                KeyAction::PassThrough
+            ),
+            "英文半角 vk=0x{:02X} 应透传",
+            vk
+        );
+    }
+}
+
+#[test]
+fn test_english_fullwidth_ctrl_alt_not_intercepted() {
+    if !has_schemas() {
+        return;
+    }
+    // Ctrl/Alt 组合是快捷键：C++ 的 ClassifyInputKey 对其返回 None 本就不吃，
+    // Rust 侧须对称放行，否则会把宿主快捷键（Ctrl+A 等）吞成全角字符。
+    use wind_ipc::protocol::{MOD_ALT, MOD_CTRL};
+    let coord = Coordinator::new_headless(config_english_fullwidth(), Some(&data_dir()));
+    for mods in [MOD_CTRL, MOD_ALT] {
+        assert!(
+            matches!(
+                coord.handle_key_event(&key_event_mods(0x41, EVENT_KEY_DOWN, mods)),
+                KeyAction::PassThrough
+            ),
+            "英文全角下 Ctrl/Alt 组合应透传给宿主"
+        );
+    }
+}
+
+#[test]
+fn test_english_fullwidth_autopair_uses_fullwidth_pairs() {
+    if !has_schemas() {
+        return;
+    }
+    // 配对表须由 english_pairs 逐字符过同一条流水线派生：打 `(` 出 `（` 就配 `）`。
+    // 关键回归：不可复用 cn_pairs——`to_full_width('[')` = `［`(U+FF3B) 而 cn_pairs 是
+    // `【`(U+3010)，混用会「打 [ 出 【 却配 ］」。故此处专测 `[`。
+    let mut cfg = config_english_fullwidth();
+    cfg.input.auto_pair.english = true;
+    let coord = Coordinator::new_headless(cfg, Some(&data_dir()));
+    match coord.handle_key_event(&key_event(0xDB, EVENT_KEY_DOWN)) {
+        KeyAction::InsertTextWithCursor {
+            text,
+            cursor_offset,
+        } => {
+            assert_eq!(text, "［］", "全角 `[` 应配全角 `］`，而非中文的 【】");
+            assert_eq!(cursor_offset, 1, "光标应落在配对之间");
+        }
+        other => panic!("英文全角 `[` 应插入全角配对，实际: {:?}", other),
+    }
+}
+
+#[test]
+fn test_chinese_fullwidth_digits_1_to_9() {
+    if !has_schemas() {
+        return;
+    }
+    // 回归：中文全角空缓冲下 1-9 曾恒 PassThrough（无视 full_width），而 C++ 为全角专门
+    // 在无 session 时也吃数字（`chinese_fullwidth_number`）→ 吃了再吐 → 部分应用丢键、
+    // 部分出半角。`0` 因无该 match 臂、落标点流水线，反而一直正常——本测锁死两者一致。
+    let mut cfg = config_with("pinyin");
+    cfg.input.default.full_width = true;
+    let coord = Coordinator::new_headless(cfg, Some(&data_dir()));
+    for (vk, want) in [
+        (0x31_u32, "１"),
+        (0x35, "５"),
+        (0x39, "９"),
+        (0x30, "０"), // `0` 走另一条路（标点流水线），须与 1-9 结果一致
+    ] {
+        match coord.handle_key_event(&key_event(vk, EVENT_KEY_DOWN)) {
+            KeyAction::InsertText { text, .. } => {
+                assert_eq!(text, want, "中文全角数字 vk=0x{:02X} 应上屏全角", vk)
+            }
+            other => panic!("中文全角数字 vk=0x{:02X} 应出字，实际: {:?}", vk, other),
+        }
+    }
+}
+
+#[test]
+fn test_chinese_halfwidth_digits_still_passthrough() {
+    if !has_schemas() {
+        return;
+    }
+    // 零回归：半角态空缓冲数字仍透传（C++ 此时不吃），保留宿主原生按键语义。
+    let coord = Coordinator::new_headless(config_with("pinyin"), Some(&data_dir()));
+    for vk in [0x31_u32, 0x39] {
+        assert!(
+            matches!(
+                coord.handle_key_event(&key_event(vk, EVENT_KEY_DOWN)),
+                KeyAction::PassThrough
+            ),
+            "中文半角空缓冲数字应透传"
+        );
+    }
+}
