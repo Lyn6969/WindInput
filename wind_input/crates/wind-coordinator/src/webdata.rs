@@ -2442,6 +2442,87 @@ mod tests {
         assert_eq!(user["total"], json!(0), "用户短语应被 resetDefault 清空");
     }
 
+    /// 用一份 system.phrases.toml 起一个带 data_dir 的 headless coordinator。
+    fn coord_with_phrase_toml(tag: &str, toml: &str) -> (Arc<Coordinator>, std::path::PathBuf) {
+        let dir = std::env::temp_dir().join(format!("wind_phrase_reread_{tag}"));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("system.phrases.toml"), toml).unwrap();
+        let store = Arc::new(Store::open(dir.join("store.redb")).unwrap());
+        let c = Coordinator::new_headless_with_store(Config::default(), Some(&dir), store);
+        (c, dir)
+    }
+
+    fn system_codes(c: &Coordinator) -> Vec<(String, String)> {
+        c.web_data_rpc("phrase.listSystem", &json!({}))
+            .unwrap()
+            .as_array()
+            .expect("listSystem 应返回数组")
+            .iter()
+            .map(|v| {
+                (
+                    v["code"].as_str().unwrap().to_string(),
+                    v["text"].as_str().unwrap().to_string(),
+                )
+            })
+            .collect()
+    }
+
+    /// phrase.resetSystem 应重读 TOML：手工编辑后无需重启服务即可生效。
+    #[test]
+    fn phrase_reset_system_rereads_toml() {
+        let (c, dir) = coord_with_phrase_toml(
+            "ok",
+            "[[phrases]]\ncode = 'rq'\ntext = '$date'\n",
+        );
+
+        assert_eq!(system_codes(&c), vec![("rq".into(), "$date".into())]);
+
+        // 手工编辑：改文本 + 增一条
+        std::fs::write(
+            dir.join("system.phrases.toml"),
+            "[[phrases]]\ncode = 'rq'\ntext = '$datetime'\n\n[[phrases]]\ncode = 'xx'\ntext = '新增'\n",
+        )
+        .unwrap();
+
+        c.web_data_rpc("phrase.resetSystem", &json!({})).unwrap();
+
+        let mut got = system_codes(&c);
+        got.sort();
+        assert_eq!(
+            got,
+            vec![
+                ("rq".to_string(), "$datetime".to_string()),
+                ("xx".to_string(), "新增".to_string()),
+            ],
+            "重读后应取到编辑后的文本并含新增条目"
+        );
+    }
+
+    /// TOML 语法错误时必须回退到启动缓存，绝不能把库里系统短语清空。
+    #[test]
+    fn phrase_reset_system_falls_back_on_broken_toml() {
+        let (c, dir) = coord_with_phrase_toml(
+            "broken",
+            "[[phrases]]\ncode = 'rq'\ntext = '$date'\n",
+        );
+
+        // 写坏 TOML（未闭合引号）
+        std::fs::write(
+            dir.join("system.phrases.toml"),
+            "[[phrases]]\ncode = 'rq\ntext = ",
+        )
+        .unwrap();
+
+        c.web_data_rpc("phrase.resetSystem", &json!({})).unwrap();
+
+        assert_eq!(
+            system_codes(&c),
+            vec![("rq".to_string(), "$date".to_string())],
+            "解析失败应沿用启动缓存，不得清空系统短语"
+        );
+    }
+
     #[test]
     fn json_diff_sparse() {
         let base = json!({ "a": 1, "t": { "x": 1, "y": 2 }, "same": "v" });

@@ -551,8 +551,12 @@ pub struct Coordinator {
     pub(crate) smart_symbol: Mutex<SmartSymbolArm>,
     /// 短语层（系统+用户，来自 store，仅 enabled）。变更后可 rebuild_phrases 重建。
     pub(crate) phrases: std::sync::RwLock<wind_phrase::PhraseLayer>,
-    /// 启动时解析的系统短语条目（供"恢复默认"重新同步入库，无需重读文件）。
-    pub(crate) system_phrase_entries: Vec<wind_phrase::SystemPhraseEntry>,
+    /// 最近一次解析的系统短语条目（启动时填充；"恢复默认"重读文件成功后刷新）。
+    /// 作为重读失败（文件缺失/TOML 语法错误）时的回退，避免把库里系统短语清空。
+    pub(crate) system_phrase_entries: std::sync::RwLock<Vec<wind_phrase::SystemPhraseEntry>>,
+    /// system.phrases.toml 路径（None=无 data_dir，如 headless 测试）。
+    /// "恢复默认"据此重读文件，使手工编辑无需重启服务即可生效。
+    pub(crate) system_phrase_path: Option<std::path::PathBuf>,
     /// 简繁转换器（OpenCC；None=数据缺失不可用）。变体由配置 features.s2t.variant 决定，
     /// 启动时加载；菜单仅提供开/关。置于 Mutex 兼容 reload 时整体替换。
     pub(crate) s2t: Mutex<Option<wind_transform::s2t::Converter>>,
@@ -919,13 +923,13 @@ impl Coordinator {
         );
 
         // 短语层（方案 B）：TOML 变更时同步进 store，再从 store（仅 enabled）建层。
-        // 启动解析的系统短语条目缓存进结构体，供"恢复默认"重新同步入库（无需重读文件）。
+        // 启动解析的条目缓存进结构体，作为"恢复默认"重读文件失败时的回退。
         let mut system_phrase_entries: Vec<wind_phrase::SystemPhraseEntry> = Vec::new();
+        let system_phrase_path = data_dir.map(|d| d.join("system.phrases.toml"));
         let phrases = {
             if let Some(store) = store.as_ref() {
-                if let Some(d) = data_dir {
-                    let p = d.join("system.phrases.toml");
-                    let entries = wind_phrase::PhraseLayer::parse_system_entries(&p);
+                if let Some(p) = system_phrase_path.as_ref() {
+                    let entries = wind_phrase::PhraseLayer::parse_system_entries(p);
                     // 内容哈希：条目稳定序列化后哈希
                     let hash = phrase_entries_hash(&entries);
                     // 自愈：哈希不一致（TOML 改动）或表内系统短语为空（被删/未初始化）时才同步。
@@ -1134,7 +1138,8 @@ impl Coordinator {
             punct: Mutex::new(punct_conv),
             smart_symbol: Mutex::new(SmartSymbolArm::default()),
             phrases,
-            system_phrase_entries,
+            system_phrase_entries: std::sync::RwLock::new(system_phrase_entries),
+            system_phrase_path,
             s2t: Mutex::new(s2t),
             common_chars,
             toolbar_positions: Mutex::new(toolbar_positions_init),
@@ -3220,16 +3225,46 @@ impl Coordinator {
         *g = wind_phrase::PhraseLayer::from_records(recs);
     }
 
-    /// 恢复默认系统短语：从缓存条目强制重新同步入库 + 全部启用 + 重建输入层。
+    /// 恢复默认系统短语：重读 system.phrases.toml → 强制同步入库 + 全部启用 + 重建输入层。
+    ///
+    /// 重读使手工编辑 TOML 后无需重启服务。`parse_system_entries` 对"文件缺失"与
+    /// "TOML 语法错误"同样返回空，二者不可区分，故重读为空时回退到启动缓存——
+    /// 否则一个语法错误就会让下面的 sync 把库里系统短语全部删除。
     pub(crate) fn restore_system_phrases(&self) -> usize {
         let Some(store) = self.store.as_ref() else {
             return 0;
         };
-        if self.system_phrase_entries.is_empty() {
+
+        // 重读文件；为空（缺失/语法错误）则沿用启动缓存。
+        let reread = self
+            .system_phrase_path
+            .as_ref()
+            .map(|p| wind_phrase::PhraseLayer::parse_system_entries(p))
+            .unwrap_or_default();
+
+        let entries = if reread.is_empty() {
+            if self.system_phrase_path.is_some() {
+                warn!("恢复默认：重读 system.phrases.toml 为空（文件缺失或语法错误），沿用启动缓存");
+            }
+            self.system_phrase_entries
+                .read()
+                .unwrap_or_else(|e| e.into_inner())
+                .clone()
+        } else {
+            // 重读成功：刷新缓存，后续回退以最新文件内容为准。
+            let mut g = self
+                .system_phrase_entries
+                .write()
+                .unwrap_or_else(|e| e.into_inner());
+            *g = reread.clone();
+            reread
+        };
+
+        if entries.is_empty() {
             return 0;
         }
-        let sys: Vec<wind_store::phrases::SystemPhrase> = self
-            .system_phrase_entries
+
+        let sys: Vec<wind_store::phrases::SystemPhrase> = entries
             .iter()
             .map(|e| wind_store::phrases::SystemPhrase {
                 code: e.code.clone(),
@@ -3242,9 +3277,12 @@ impl Coordinator {
             warn!("恢复默认：系统短语同步失败: {e}");
             return 0;
         }
+        // 哈希随之更新，否则下次启动会因哈希不符再同步一次（无害但多余）。
+        let _ = store.set_phrase_sys_hash(&phrase_entries_hash(&entries));
+
         let n = store.reset_system_enabled().unwrap_or(0);
         self.rebuild_phrases();
-        self.system_phrase_entries.len().max(n)
+        entries.len().max(n)
     }
 }
 
