@@ -860,8 +860,17 @@ function New-InstallerConfig ([string]$profile, [string]$outdir, [string]$cfgPat
     $distFwd = $DistDir.Replace('\', '/')
     $logoFwd = (Join-Path $assetsDir "logo.png").Replace('\', '/')
     $iconFwd = (Join-Path $assetsDir "installer.ico").Replace('\', '/')
-    $toml = @"
-# 本文件由 dev.ps1 (Do-Installer) 自动生成 —— $profile 变体; 请勿手工编辑。
+
+    # 单一真相: 读 config\app.toml, 仅把 [app]/[ime]/[package] 替换为变体/机器相关值;
+    # [[font]]/[autostart]/[[shortcut]]/[startup]/[datadir]/[strings]/[ui] 等能力与文案段原样继承。
+    # 快捷方式用 {setting_exe}/{main_exe}/{display_name} 占位符, 安装器运行期按 [app] 字段替换,
+    # 故一份 config 对 dev/release 通用; {setting_exe} 为空 (无设置程序) 时安装器自动跳过该快捷方式。
+    # 这样 wind-installer 新增能力段时只需改 config\app.toml 一处, 无需同步本脚本 (消除双真相漂移)。
+    $baseCfg = Join-Path $ProductRoot "config\app.toml"
+    if (-not (Test-Path $baseCfg)) { ErrMsg "未找到清单基底: $baseCfg"; throw "缺少 config\app.toml" }
+    $base = Get-Content $baseCfg -Raw
+
+    $appSec = @"
 [app]
 id                = "$id"
 display_name      = "$disp"
@@ -876,19 +885,16 @@ url_protocol      = "$proto"
 portable_marker   = "portable_mode"
 process_names     = $procs
 acl_dlls          = $acl
-
+"@
+    $imeSec = @"
 [ime]
 clsid        = "$clsid"
 profile_guid = "$prof"
 lang_id      = "0804"
 dll_x64      = "$dllX64"
 dll_x86      = "$dllX86"
-
-[[font]]
-file         = "HeiTiZiGen.ttf"
-display_name = "黑体字根 (TrueType)"
-source_rel   = "data/schemas/wubi86/HeiTiZiGen.ttf"
-
+"@
+    $pkgSec = @"
 [package]
 compression = "zstd"
 source_dir  = "$srcFwd"
@@ -897,6 +903,15 @@ output_dir  = "$distFwd"
 logo        = "$logoFwd"
 icon        = "$iconFwd"
 "@
+    # 砍掉 config 的 [package] 及之后 (打包参数按机器生成), 再替换 [app]/[ime] 段。
+    # 用 MatchEvaluator 回调返回字面串, 避免 -replace 把替换文本里的 $ 当分组引用。
+    $head = ($base -split '(?m)^\[package\]', 2)[0]
+    $head = [regex]::Replace($head, '(?ms)^\[app\]\r?\n.*?(?=^\[)', { param($x) $appSec + "`r`n`r`n" })
+    $head = [regex]::Replace($head, '(?ms)^\[ime\]\r?\n.*?(?=^\[)',  { param($x) $imeSec + "`r`n`r`n" })
+    $ai = $head.IndexOf("[app]"); if ($ai -gt 0) { $head = $head.Substring($ai) }
+    $gen = "# 本文件由 dev.ps1 自动生成 —— $profile 变体; [app]/[ime]/[package] 为变体/机器值, 其余段继承 config\app.toml。请勿手工编辑。`r`n"
+    $toml = $gen + $head.TrimEnd() + "`r`n`r`n" + $pkgSec + "`r`n"
+
     # 无 BOM UTF-8 写出 (Rust toml 解析器对前置 BOM 会报错; PS5.1 的 Set-Content -Encoding UTF8 带 BOM)。
     [System.IO.File]::WriteAllText($cfgPath, $toml, (New-Object System.Text.UTF8Encoding($false)))
 }

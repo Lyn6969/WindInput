@@ -45,6 +45,45 @@ file         = "HeiTiZiGen.ttf"
 display_name = "黑体字根 (TrueType)"
 source_rel   = "data/schemas/wubi86/HeiTiZiGen.ttf"
 
+# ── 开机自启动：整段缺省即不注册（输入法必须自启，故必须声明本段）────────────
+#    exe 省略即回退 app.main_exe —— 本段对 dev/release 变体通用（各自 main_exe 不同）
+[autostart]
+enabled = true
+
+# ── 快捷方式：整段缺省即一个都不创建 ─────────────────────────────────────────
+#    target/name 用占位符 {setting_exe}/{main_exe}/{display_name}，安装器运行期按
+#    [app] 字段替换 —— 一份配置对 dev/release 通用。{setting_exe} 未配置时该项自动跳过。
+[[shortcut]]
+target   = "{setting_exe}"
+name     = "{display_name} 设置"
+location = "start_menu"                   # start_menu | desktop
+
+[[shortcut]]
+target   = "uninstall.exe"
+name     = "卸载 {display_name}"
+location = "start_menu"
+
+# ── 安装完成后的启动行为：整段缺省即装完不启动 ───────────────────────────────
+#    exe 省略即回退 app.main_exe
+[startup]
+prestart = true
+
+# ── 用户数据目录配置：整段缺省即不写 ─────────────────────────────────────────
+#    首次安装时把向导中选定的数据目录写入 %LOCALAPPDATA%\WindInput\datadir.conf，
+#    供主程序启动时读取；升级时跳过以保留用户既有配置。
+[datadir]
+conf_file = "datadir.conf"
+
+# ── 界面文案：留空即用中性默认（不含「输入法」「词库」字样）──────────────────
+#    安装器内置默认是领域中性的，输入法专用措辞需在此显式声明
+[strings]
+data_dir_hint       = "词库、配置路径"
+mode_hint           = "标准安装注册输入法到系统；便捷模式仅解压文件，不修改系统"
+agreement_text      = "《用户服务协议》"
+user_data_label     = "删除用户词库和配置数据"
+cache_label         = "清除本地词库缓存"
+delete_data_confirm = "将永久删除 {path} 下的所有词库和配置数据，卸载后无法恢复。\n\n确定要勾选删除吗？"
+
 # ── 打包参数 ──────────────────────────────────────────────────────────────────
 # source_dir 和 version 由构建脚本通过 CLI 覆盖；此处为本地开发默认值。
 [package]
