@@ -29,6 +29,15 @@ namespace WindLog {
         return static_cast<CFileLogger::LogLevel>(level);
     }
 
+    // 该级别是否会真正产生输出（文件/DebugString，或 INFO 及以上进环形缓冲）。
+    // 用于在调用点为「收集实参本身就很贵」的日志加前置闸门：日志宏能延后格式化，
+    // 但挡不住实参位置的函数调用——那是 C++ 求值顺序保证要先做的事。
+    inline bool IsEnabled(int level) {
+        auto fileLevel = _ToFileLevel(level);
+        return fileLevel <= CFileLogger::LogLevel::Info
+            || CFileLogger::Instance().IsEnabled(fileLevel);
+    }
+
     inline void Output(int level, const wchar_t* msg) {
         auto& logger = CFileLogger::Instance();
         auto fileLevel = _ToFileLevel(level);

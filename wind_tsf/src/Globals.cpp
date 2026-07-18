@@ -213,6 +213,13 @@ void WindLogHostProcessInfo(int level, const wchar_t* prefix, const WindHostProc
 
 void WindLogForegroundProcessInfo(int level, const wchar_t* prefix)
 {
+    // 前置闸门：下面的进程信息采集（OpenProcess + 令牌查询 + 映像路径 + GetWindowTextW
+    // 重入宿主窗口过程）代价远高于一条日志，而本函数的调用点在按键路径上。
+    // 缺此闸门时，即便日志级别低于 level、这套查询也照跑不误——日志宏只能延后
+    // 「格式化」，挡不住实参位置的函数调用，那是 C++ 求值顺序保证要先做的事。
+    if (!WindLog::IsEnabled(level))
+        return;
+
     WindHostProcessInfo info;
     HWND hwndForeground = GetForegroundWindow();
     if (WindQueryWindowProcessInfo(hwndForeground, &info))
