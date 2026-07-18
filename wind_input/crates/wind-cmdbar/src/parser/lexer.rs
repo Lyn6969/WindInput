@@ -221,9 +221,11 @@ impl<'a> Lexer<'a> {
                 });
             }
             if c == b'\\' && self.pos + 1 < self.bytes.len() {
-                let next = self.bytes[self.pos + 1];
-                decode_escape_byte(next, &mut lit);
-                self.pos += 2;
+                // 被转义字符可能是多字节（如中文路径 `E:\文档`）：按完整 UTF-8 字符推进，
+                // 否则 `pos += 2` 会落进多字节字符中间，下一轮 str 切片 panic（字节边界）。
+                let esc = self.src[self.pos + 1..].chars().next().unwrap();
+                decode_escape(esc, &mut lit);
+                self.pos += 1 + esc.len_utf8();
                 continue;
             }
             if c == b'{' {
@@ -260,7 +262,7 @@ impl<'a> Lexer<'a> {
             let ch = self.bytes[p];
             if inner != 0 {
                 if ch == b'\\' && p + 1 < self.bytes.len() {
-                    p += 2;
+                    p = skip_escaped(self.bytes, p);
                     continue;
                 }
                 if ch == inner {
@@ -302,17 +304,40 @@ fn flush_lit(parts: &mut Vec<RawStringPart>, lit: &mut String, offset: usize) {
 
 /// 解码字符串内一个转义字符（白名单；未知保留 `\X`，与 Go 宽松策略一致）。
 /// 公开给模板/字面量路径复用（统一转义来源）。
-pub fn decode_escape_byte(next: u8, out: &mut String) {
+///
+/// 取**完整字符**（而非单字节）：中文等多字节字符被转义时（如 `\文`）仍能正确保留，
+/// 不再把多字节 lead 字节当 Latin-1 单字节处理产生乱码 / 后续切片 panic。
+pub fn decode_escape(next: char, out: &mut String) {
     match next {
-        b'\\' | b'"' | b'\'' | b'{' | b'}' | b'(' | b')' => out.push(next as char),
-        b'n' => out.push('\n'),
-        b't' => out.push('\t'),
-        b'r' => out.push('\r'),
+        '\\' | '"' | '\'' | '{' | '}' | '(' | ')' => out.push(next),
+        'n' => out.push('\n'),
+        't' => out.push('\t'),
+        'r' => out.push('\r'),
         _ => {
             out.push('\\');
-            out.push(next as char);
+            out.push(next);
         }
     }
+}
+
+/// UTF-8 lead 字节 → 该字符的字节数（1~4）。
+pub(crate) fn utf8_char_len(lead: u8) -> usize {
+    if lead < 0x80 {
+        1
+    } else if lead < 0xE0 {
+        2
+    } else if lead < 0xF0 {
+        3
+    } else {
+        4
+    }
+}
+
+/// 字节级扫描器遇到反斜杠时的推进：跳过 `\`（1 字节）+ 其后**完整** UTF-8 字符。
+/// `i` 须指向反斜杠且保证 `i + 1 < b.len()`。用固定 `+2` 会在被转义字符为多字节时
+/// 错位地把后续字节误读成引号/括号/逗号等分隔符（边界统计错乱）。
+pub(crate) fn skip_escaped(b: &[u8], i: usize) -> usize {
+    (i + 1 + utf8_char_len(b[i + 1])).min(b.len())
 }
 
 /// 仅判定 ASCII 字节是否为 ident 起始（dispatch 阶段必须字节级判定）。
@@ -413,6 +438,25 @@ mod tests {
             RawStringPart::Lit { text, .. } => assert_eq!(text, "a\\xb"),
             _ => panic!(),
         }
+    }
+
+    #[test]
+    fn escape_before_multibyte_no_panic() {
+        // 回归：反斜杠紧贴多字节字符曾致 `self.pos += 2` 落进字符中间 → 切片 panic。
+        // 未知转义 `\文` 保留反斜杠 + 完整字符；`\\文` 转义反斜杠后中文完整。
+        let toks = Lexer::new(r#""E:\文档\\市""#).tokenize().unwrap();
+        match &toks[0].parts[0] {
+            RawStringPart::Lit { text, .. } => assert_eq!(text, r"E:\文档\市"),
+            _ => panic!("expected lit"),
+        }
+    }
+
+    #[test]
+    fn utf8_char_len_covers_ranges() {
+        assert_eq!(utf8_char_len(b'A'), 1);
+        assert_eq!(utf8_char_len("é".as_bytes()[0]), 2);
+        assert_eq!(utf8_char_len("文".as_bytes()[0]), 3);
+        assert_eq!(utf8_char_len("𝄞".as_bytes()[0]), 4);
     }
 
     #[test]

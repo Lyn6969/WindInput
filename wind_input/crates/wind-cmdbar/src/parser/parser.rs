@@ -9,7 +9,7 @@
 //! 新增 `$` 短语类型的扩展点：在 [`MARKER_TABLE`] 注册 marker，并在 [`parse`] 分派到
 //! 对应解析函数（可复用 [`parse_array_phrase`] 并按 marker 分策略，如 `$AA` 的 rune 炸开）。
 
-use super::lexer::{Lexer, RawStringPart, Token, TokenKind, decode_escape_byte};
+use super::lexer::{Lexer, RawStringPart, Token, TokenKind, decode_escape, skip_escaped};
 use crate::ast::{ArrayPhrase, CommandPhrase, Expr, ModValue, Modifiers, Phrase, StringPart};
 use crate::error::{CmdbarError, Result};
 
@@ -52,7 +52,7 @@ fn find_top_level_marker(src: &str) -> Option<(&'static str, usize, usize)> {
     while i < b.len() {
         let c = b[i];
         if c == b'\\' && i + 1 < b.len() {
-            i += 2;
+            i = skip_escaped(b, i);
             continue;
         }
         if c == b'"' || c == b'\'' {
@@ -60,7 +60,7 @@ fn find_top_level_marker(src: &str) -> Option<(&'static str, usize, usize)> {
             i += 1;
             while i < b.len() {
                 if b[i] == b'\\' && i + 1 < b.len() {
-                    i += 2;
+                    i = skip_escaped(b, i);
                     continue;
                 }
                 if b[i] == q {
@@ -91,7 +91,7 @@ fn has_top_level_brace(src: &str) -> bool {
     while i < b.len() {
         let c = b[i];
         if c == b'\\' && i + 1 < b.len() {
-            i += 2;
+            i = skip_escaped(b, i);
             continue;
         }
         if c == b'{' {
@@ -110,7 +110,7 @@ fn find_matching_paren(src: &str, open_idx: usize) -> Result<usize> {
     while i < b.len() {
         let c = b[i];
         if c == b'\\' && i + 1 < b.len() {
-            i += 2;
+            i = skip_escaped(b, i);
             continue;
         }
         if c == b'"' || c == b'\'' {
@@ -118,7 +118,7 @@ fn find_matching_paren(src: &str, open_idx: usize) -> Result<usize> {
             i += 1;
             while i < b.len() {
                 if b[i] == b'\\' && i + 1 < b.len() {
-                    i += 2;
+                    i = skip_escaped(b, i);
                     continue;
                 }
                 if b[i] == q {
@@ -382,7 +382,7 @@ fn split_array_args(inner: &str, base_off: usize) -> Result<Vec<ArgSpan<'_>>> {
         let c = b[i];
         if in_string != 0 {
             if c == b'\\' && i + 1 < b.len() {
-                i += 2;
+                i = skip_escaped(b, i);
                 continue;
             }
             if c == in_string {
@@ -394,7 +394,7 @@ fn split_array_args(inner: &str, base_off: usize) -> Result<Vec<ArgSpan<'_>>> {
         match c {
             b'"' | b'\'' => in_string = c,
             b'\\' if i + 1 < b.len() => {
-                i += 2;
+                i = skip_escaped(b, i);
                 continue;
             }
             b'(' | b'{' | b'[' => depth += 1,
@@ -491,8 +491,10 @@ fn scan_template_parts(src: &str) -> Result<Vec<RawStringPart>> {
     while i < b.len() {
         let c = b[i];
         if c == b'\\' && i + 1 < b.len() {
-            decode_escape_byte(b[i + 1], &mut lit);
-            i += 2;
+            // 被转义字符可能多字节（中文）：按完整字符解码 + 推进（见 lexer::decode_escape）。
+            let esc = src[i + 1..].chars().next().unwrap();
+            decode_escape(esc, &mut lit);
+            i += 1 + esc.len_utf8();
             continue;
         }
         if c == b'{' {
@@ -539,7 +541,7 @@ fn scan_interp_end(src: &str, start: usize) -> Result<usize> {
         let ch = b[p];
         if inner != 0 {
             if ch == b'\\' && p + 1 < b.len() {
-                p += 2;
+                p = skip_escaped(b, p);
                 continue;
             }
             if ch == inner {
@@ -960,6 +962,54 @@ mod tests {
     #[test]
     fn text_before_marker_rejected() {
         assert!(parse(r#"abc$CC("x")"#).is_err());
+    }
+
+    #[test]
+    fn backslash_before_cjk_does_not_panic() {
+        // 回归：反斜杠紧贴中文（Windows 中文路径 `E:\我的文档\`）曾致字节边界 panic
+        // （lexer `pos += 2` 落进多字节字符中间）。现按完整字符推进。
+        let p = pp(r#"$CC("打开", open("E:\我的文档\x"))"#);
+        match p {
+            Phrase::Command(c) => match &c.actions[0] {
+                Expr::Call { name, args } => {
+                    assert_eq!(name, "open");
+                    // 未知转义 `\我` / `\x` 原样保留（含反斜杠）。
+                    assert_eq!(
+                        args[0],
+                        Expr::StringLit(vec![StringPart::Text(r"E:\我的文档\x".into())])
+                    );
+                }
+                other => panic!("expected open() call, got {other:?}"),
+            },
+            _ => panic!("expected command"),
+        }
+    }
+
+    #[test]
+    fn escaped_backslash_before_cjk() {
+        // `\\` 转义为单反斜杠，随后中文完整保留（不再吞字节 / 乱码）。
+        let p = pp(r#"$CC("打开", open("E:\\我的文档"))"#);
+        match p {
+            Phrase::Command(c) => match &c.actions[0] {
+                Expr::Call { args, .. } => assert_eq!(
+                    args[0],
+                    Expr::StringLit(vec![StringPart::Text(r"E:\我的文档".into())])
+                ),
+                other => panic!("expected call, got {other:?}"),
+            },
+            _ => panic!("expected command"),
+        }
+    }
+
+    #[test]
+    fn cjk_in_ss_array_element_does_not_panic() {
+        // $SS 数组走 split_array_args + parse_array_element 的独立字节扫描路径，
+        // 同样修复反斜杠贴中文。
+        let p = pp(r#"$SS("组", $CC("开", open("D:\目录")))"#);
+        match p {
+            Phrase::Array(a) => assert_eq!(a.elements.len(), 1),
+            _ => panic!("expected array"),
+        }
     }
 
     #[test]
