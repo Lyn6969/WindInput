@@ -3868,3 +3868,24 @@ fn test_chinese_capslock_fullwidth_space_and_numpad() {
         }
     }
 }
+
+#[test]
+fn test_chinese_fullwidth_numpad_direct_no_caps() {
+    if !has_schemas() {
+        return;
+    }
+    // 定位用：中文全角、非 CapsLock、空缓冲、default(direct) numpad_behavior 下，
+    // 小键盘数字应走 numpad direct 分支的 to_full_width 出全角。
+    // 若本测通过而真机仍半角/丢键 → 问题在 C++ 吃键或 full_width 跨进程同步，不在 core 逻辑。
+    let mut cfg = config_with("pinyin");
+    cfg.input.default.full_width = true;
+    let coord = Coordinator::new_headless(cfg, Some(&data_dir()));
+    for (vk, want) in [(0x60_u32, "０"), (0x65, "５"), (0x69, "９")] {
+        match coord.handle_key_event(&key_event(vk, EVENT_KEY_DOWN)) {
+            KeyAction::InsertText { text, .. } => {
+                assert_eq!(text, want, "中文全角小键盘(direct) vk=0x{:02X} 应出全角", vk)
+            }
+            other => panic!("中文全角小键盘 vk=0x{:02X} 应出字，实际: {:?}", vk, other),
+        }
+    }
+}

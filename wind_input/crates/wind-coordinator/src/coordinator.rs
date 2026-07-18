@@ -3792,8 +3792,13 @@ impl MessageHandler for Coordinator {
         }
 
         debug!(
-            "key_event: code=0x{:02X} mods=0x{:04X} chinese={} buf='{}'",
-            data.key_code, data.modifiers, state.chinese_mode, state.input_buffer
+            "key_event: code=0x{:02X} mods=0x{:04X} chinese={} full={} caps={} buf='{}'",
+            data.key_code,
+            data.modifiers,
+            state.chinese_mode,
+            state.full_width,
+            state.caps_lock,
+            state.input_buffer
         );
 
         // 以词定字（select_char）：配置的成对标点键从当前高亮候选词逐字上屏（对齐 Go
