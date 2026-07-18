@@ -131,6 +131,11 @@ mod tests {
             find("compat.host_render_processes")["default"],
             serde_json::json!(["SearchHost.exe"])
         );
+        // 配对跳出键默认只含右符号：设置界面的默认勾选态直接取自这里，漂了就会与内核不一致。
+        assert_eq!(
+            find("input.auto_pair.jump_out_keys")["default"],
+            serde_json::json!(["right_symbol"])
+        );
         // 普通默认值
         assert_eq!(
             find("ui.candidate.per_page")["default"],

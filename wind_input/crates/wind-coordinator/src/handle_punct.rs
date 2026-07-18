@@ -347,7 +347,10 @@ impl Coordinator {
             // 智能跳过：输右符号且栈顶正是它 → 光标右移越过，不重复插入。
             // 对称配对（`＂＂` 等左右同形）除外：按键不携带开/闭这一位，无从判断跳出还是嵌套，
             // 故一律按「开新的一对」处理，跳出交给 `auto_pair.jump_out_keys`。
-            if pairs.iter().any(|(l, r)| *r == pch && *l != *r) {
+            // 非对称配对是否跳出由该列表里的 `right_symbol` 决定。
+            if self.rt().jump_out_on_right_symbol
+                && pairs.iter().any(|(l, r)| *r == pch && *l != *r)
+            {
                 let mut tr = self.pair_tracker.lock().unwrap_or_else(|e| e.into_inner());
                 if tr.peek().is_some_and(|e| e.right == pch) {
                     tr.pop();

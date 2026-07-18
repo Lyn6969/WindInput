@@ -755,10 +755,16 @@ pub struct AutoPairConfig {
     /// 英文配对表（每项 2 字符："()"）
     #[serde(default = "default_english_pairs")]
     pub english_pairs: Vec<String>,
-    /// 跳出配对的按键（键名如 "tab"/"enter"/"space"，可多选）。命中即等效输入右符号跳出：
-    /// 光标越过右符号、弹出配对栈。默认空 → 不启用。仅对协调器跟踪的中文输入态配对生效
-    /// （英文模式配对由 TSF/DLL 侧处理）。
-    #[serde(default)]
+    /// 跳出配对的按键：命中即光标越过右符号、弹出配对栈。可多选。
+    ///
+    /// 取值为键名（`"tab"`/`"enter"`/`"space"`/`"escape"`），外加一个特殊值
+    /// **`"right_symbol"` = 右符号键本身**（打 `）` 跳出已插入的 `（）`）。右符号跳出曾是
+    /// 无条件行为，现收敛为本列表的一项——**列表里没有它就是没有，不做隐式补偿**，故旧配置
+    /// 若只写了 `["tab"]`，右符号跳出即关闭（用户可在设置界面重新勾选）。
+    ///
+    /// 对称配对（引号）**永不参与右符号跳出**，与本项无关：按键不携带「开/闭」这一位，
+    /// 无从判断跳出还是嵌套，故一律开新的一对（见 `pin_quote_left_if_paired`）。
+    #[serde(default = "default_jump_out_keys")]
     pub jump_out_keys: Vec<String>,
 }
 
@@ -769,10 +775,18 @@ impl Default for AutoPairConfig {
             english: false,
             chinese_pairs: default_chinese_pairs(),
             english_pairs: default_english_pairs(),
-            jump_out_keys: Vec::new(),
+            jump_out_keys: default_jump_out_keys(),
         }
     }
 }
+
+/// 默认只启用右符号跳出（保持「打 `）` 跳出」这一长期行为），Tab/Enter 需用户显式勾选。
+fn default_jump_out_keys() -> Vec<String> {
+    vec![JUMP_OUT_RIGHT_SYMBOL.to_string()]
+}
+
+/// `jump_out_keys` 里代表「右符号键本身」的特殊值（非键名，不参与 VK 解析）。
+pub const JUMP_OUT_RIGHT_SYMBOL: &str = "right_symbol";
 
 fn default_chinese_pairs() -> Vec<String> {
     ["（）", "【】", "｛｝", "《》", "〈〉", "「」", "『』"]

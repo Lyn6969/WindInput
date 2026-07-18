@@ -130,6 +130,10 @@ chinese = false
 english = false
 chinese_pairs = ["（）", "【】", "｛｝", "《》", "〈〉"]
 english_pairs = ["()", "[]", "{}", "<>"]
+# 跳出配对的按键，可多选。"right_symbol" = 右符号键本身（打 ） 跳出已插入的 （）），
+# 其余为键名 tab / enter / space / escape。列表里没有就是没有，不做隐式补偿。
+# 引号等对称配对永不参与右符号跳出（按键不带「开/闭」信息），只能靠 tab / enter 跳出。
+jump_out_keys = ["right_symbol"]
 
 # URL 临时输入模式：正常输入下打出完整前缀（如 http / www.）即进入网址输入模式，
 # 模式内自由输入网址字符（不触发上屏），空格或回车上屏。默认关闭。

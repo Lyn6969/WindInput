@@ -140,6 +140,9 @@ private:
     // 会话/焦点复位归零（见 ResetComposingState）。中文模式据此判断 Enter 等键是否该转发。
     int _pairPendingDepth = 0;
     bool _IsJumpOutKey(UINT vk) const { return _jumpOutKeys.count(vk) > 0; }
+    // 输入右符号本身是否跳出（配置 jump_out_keys 里的 `right_symbol` 特殊值）。右符号不是
+    // 固定按键（取决于配对表），故与 _jumpOutKeys 分开存。对称配对（引号）不受此项影响。
+    bool _jumpOutOnRightSymbol = false;
     // IPC 失败后置位：本地 composition 已强制复位，但 Go 侧可能仍持有活跃会话状态。
     // 下一次按键前提下视作"有会话"，让 ENTER/ESC 也能发给 Go 走重握手；
     // 任何一次成功 ReceiveResponse 之后清旗，状态由响应处理路径自然重建。

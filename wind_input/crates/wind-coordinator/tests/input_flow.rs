@@ -3341,7 +3341,7 @@ fn auto_pair_no_jump_out_key_passes_tab_through() {
     }
     let mut cfg = config_with("wubi86");
     cfg.input.auto_pair.chinese = true;
-    // jump_out_keys 默认空 → 不启用
+    // jump_out_keys 默认只含 right_symbol → Tab 不在其中，不该被吞
     let coord = Coordinator::new_headless(cfg, Some(&data_dir()));
 
     // 插入配对
@@ -3358,6 +3358,65 @@ fn auto_pair_no_jump_out_key_passes_tab_through() {
         matches!(tab, KeyAction::PassThrough),
         "未配置跳出键时 Tab 应透传，实际: {:?}",
         tab
+    );
+}
+
+/// `right_symbol` 在跳出列表内：打右括号 → 光标越过已配对的右符号（不重复插入）。
+#[test]
+fn jump_out_right_symbol_enabled_moves_cursor() {
+    if !has_schemas() {
+        return;
+    }
+    let mut cfg = config_with("wubi86");
+    cfg.input.auto_pair.chinese = true;
+    cfg.input.auto_pair.jump_out_keys = vec!["right_symbol".into()];
+    let coord = Coordinator::new_headless(cfg, Some(&data_dir()));
+
+    // Shift+9 → `（`：插入配对
+    let ins = coord.handle_key_event(&key_event_mods(0x39, EVENT_KEY_DOWN, 0x0001));
+    assert!(
+        matches!(ins, KeyAction::InsertTextWithCursor { .. }),
+        "左括号应插入配对，实际: {ins:?}"
+    );
+    // Shift+0 → `）`：栈顶正是它 → 跳出
+    let jump = coord.handle_key_event(&key_event_mods(0x30, EVENT_KEY_DOWN, 0x0001));
+    assert!(
+        matches!(jump, KeyAction::MoveCursorRight),
+        "启用 right_symbol 时右括号应跳出，实际: {jump:?}"
+    );
+}
+
+/// `right_symbol` 不在跳出列表内：打右括号 → **正常上屏该字符，不跳出**。
+/// 回归保护：列表里没有就是没有，不做隐式补偿（用户拍板的语义）。
+#[test]
+fn jump_out_right_symbol_disabled_commits_char() {
+    if !has_schemas() {
+        return;
+    }
+    let mut cfg = config_with("wubi86");
+    cfg.input.auto_pair.chinese = true;
+    cfg.input.auto_pair.jump_out_keys = vec!["tab".into()]; // 只留 Tab，不含 right_symbol
+    let coord = Coordinator::new_headless(cfg, Some(&data_dir()));
+
+    let ins = coord.handle_key_event(&key_event_mods(0x39, EVENT_KEY_DOWN, 0x0001));
+    assert!(
+        matches!(ins, KeyAction::InsertTextWithCursor { .. }),
+        "左括号应插入配对，实际: {ins:?}"
+    );
+    let act = coord.handle_key_event(&key_event_mods(0x30, EVENT_KEY_DOWN, 0x0001));
+    assert!(
+        !matches!(act, KeyAction::MoveCursorRight),
+        "未启用 right_symbol 时右括号不该跳出，实际: {act:?}"
+    );
+    assert!(
+        format!("{act:?}").contains('）'),
+        "应正常上屏右括号，实际: {act:?}"
+    );
+    // Tab 仍可跳出（栈未被右符号消费）
+    let tab = coord.handle_key_event(&key_event(0x09, EVENT_KEY_DOWN));
+    assert!(
+        matches!(tab, KeyAction::MoveCursorRight),
+        "Tab 应仍能跳出，实际: {tab:?}"
     );
 }
 

@@ -137,9 +137,18 @@ fn parse_jump_out_keys(list: &[String]) -> std::collections::HashSet<u32> {
             "enter" | "return" => Some(keymap::VK_RETURN),
             "space" => Some(keymap::VK_SPACE),
             "escape" | "esc" => Some(keymap::VK_ESCAPE),
+            // `right_symbol` 不是键名（右符号是哪个键取决于配对表），由
+            // `parse_jump_out_on_right_symbol` 单独解析成开关。
             _ => None,
         })
         .collect()
+}
+
+/// `jump_out_keys` 是否含「右符号键本身」这一特殊值 → 打 `）` 跳出已插入的 `（）`。
+/// 与 VK 集合分开表示：右符号不是固定按键，取决于当前生效的配对表。
+fn parse_jump_out_on_right_symbol(list: &[String]) -> bool {
+    list.iter()
+        .any(|s| s.trim().to_lowercase() == wind_config::config::JUMP_OUT_RIGHT_SYMBOL)
 }
 
 pub(crate) fn punct_char(key_code: u32, shift: bool) -> Option<char> {
@@ -513,6 +522,8 @@ pub(crate) struct ConfigBundle {
     pub(crate) en_pairs: Vec<(char, char)>,
     /// 配对跳出键的 VK 码集合（预解析自 `auto_pair.jump_out_keys`，空=不启用）。
     pub(crate) jump_out_keys: std::collections::HashSet<u32>,
+    /// 输入右符号本身是否跳出（`jump_out_keys` 含 `right_symbol`）。对称配对不受此项影响。
+    pub(crate) jump_out_on_right_symbol: bool,
 }
 
 impl ConfigBundle {
@@ -523,6 +534,8 @@ impl ConfigBundle {
         let cn_pairs = parse_pairs(&config.input.auto_pair.chinese_pairs);
         let en_pairs = parse_pairs(&config.input.auto_pair.english_pairs);
         let jump_out_keys = parse_jump_out_keys(&config.input.auto_pair.jump_out_keys);
+        let jump_out_on_right_symbol =
+            parse_jump_out_on_right_symbol(&config.input.auto_pair.jump_out_keys);
         Self {
             config,
             compiled_hotkeys,
@@ -530,6 +543,7 @@ impl ConfigBundle {
             cn_pairs,
             en_pairs,
             jump_out_keys,
+            jump_out_on_right_symbol,
         }
     }
 }
@@ -2755,7 +2769,8 @@ impl Coordinator {
         // HashSet 迭代序不稳定，排序保证推送字节可复现。
         let mut vks: Vec<u32> = rt.jump_out_keys.iter().copied().collect();
         vks.sort_unstable();
-        let value = wind_ipc::codec::encode_jump_out_keys_value(&vks);
+        let value =
+            wind_ipc::codec::encode_jump_out_keys_value(rt.jump_out_on_right_symbol, &vks);
         let msg = wind_ipc::codec::encode_sync_config(
             wind_ipc::protocol::CONFIG_KEY_JUMP_OUT_KEYS,
             &value,
@@ -4514,8 +4529,10 @@ impl MessageHandler for Coordinator {
                         // 引号一律不走此路（`quote_paired` 中文引号 / `*l != *r` 对称英文引号）：
                         // 对称配对的按键不携带开/闭这一位，
                         // 无从判断用户想跳出还是想嵌套新的一对，故取消右符号处理、跳出交给跳出键。
+                        // 非对称配对（括号类）则由 `right_symbol` 开关决定是否跳出。
                         if out == piece
                             && !quote_paired
+                            && self.rt().jump_out_on_right_symbol
                             && pairs.iter().any(|(l, r)| *r == pch && *l != *r)
                         {
                             let mut tr =

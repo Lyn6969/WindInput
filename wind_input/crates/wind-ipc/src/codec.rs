@@ -968,9 +968,14 @@ pub fn encode_password_suppress_value(enabled: bool) -> Vec<u8> {
 
 /// 编码配对跳出键的值部分（对齐 TSF KeyEventSink::OnSyncConfig CONFIG_KEY_JUMP_OUT_KEYS）。
 ///
-/// 格式：count(u8) + [vk:u16(LE)]...；`vks` 为 VK 码列表（调用方应去重、排序以稳定输出）。
-pub fn encode_jump_out_keys_value(vks: &[u32]) -> Vec<u8> {
-    let mut value = Vec::with_capacity(1 + vks.len() * 2);
+/// 格式：right_symbol(u8) + count(u8) + [vk:u16(LE)]...
+///
+/// `right_symbol` = 输入右符号本身是否跳出（配置里的 `right_symbol` 特殊值）；它不是键名，
+/// 右符号是哪个键取决于配对表，故与 VK 列表分开编码。`vks` 为 VK 码列表（调用方应去重、
+/// 排序以稳定输出）。
+pub fn encode_jump_out_keys_value(right_symbol: bool, vks: &[u32]) -> Vec<u8> {
+    let mut value = Vec::with_capacity(2 + vks.len() * 2);
+    value.push(right_symbol as u8);
     value.push(vks.len() as u8);
     for vk in vks {
         value.extend_from_slice(&(*vk as u16).to_le_bytes());

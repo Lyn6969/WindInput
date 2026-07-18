@@ -696,7 +696,7 @@ STDAPI CKeyEventSink::OnKeyDown(ITfContext* pContext, WPARAM wParam, LPARAM lPar
                     // 对称配对键落此分支：不做任何右符号判定，直接交给下面的 IsLeft 开新的一对。
                     WIND_LOG_DEBUG_FMT(L"English auto-pair: symmetric pair '%c', always open new pair\n", pairChar);
                 }
-                else if (_englishPairEngine.IsRight(pairChar))
+                else if (_englishPairEngine.IsRight(pairChar) && _jumpOutOnRightSymbol)
                 {
                     PairEngine::Entry entry;
                     if (_englishPairEngine.Peek(entry) && entry.right == pairChar)
@@ -2180,16 +2180,19 @@ void CKeyEventSink::OnSyncConfig(const std::string& key, const std::vector<uint8
     }
     else if (key == CONFIG_KEY_JUMP_OUT_KEYS)
     {
-        // 格式：count(u8) + [vk:u16(LE)]...（对齐 Rust encode_jump_out_keys_value）
+        // 格式：right_symbol(u8) + count(u8) + [vk:u16(LE)]...（对齐 Rust encode_jump_out_keys_value）
         _jumpOutKeys.clear();
-        if (value.empty()) return;
-        uint8_t count = value[0];
-        for (size_t i = 0; i < count && (1 + i * 2 + 2) <= value.size(); i++)
+        _jumpOutOnRightSymbol = false;
+        if (value.size() < 2) return;
+        _jumpOutOnRightSymbol = value[0] != 0;
+        uint8_t count = value[1];
+        for (size_t i = 0; i < count && (2 + i * 2 + 2) <= value.size(); i++)
         {
-            uint16_t vk = *reinterpret_cast<const uint16_t*>(value.data() + 1 + i * 2);
+            uint16_t vk = *reinterpret_cast<const uint16_t*>(value.data() + 2 + i * 2);
             _jumpOutKeys.insert((UINT)vk);
         }
-        WIND_LOG_INFO_FMT(L"Jump-out keys config updated: count=%d\n", (int)_jumpOutKeys.size());
+        WIND_LOG_INFO_FMT(L"Jump-out keys config updated: count=%d, right_symbol=%d\n",
+                          (int)_jumpOutKeys.size(), (int)_jumpOutOnRightSymbol);
     }
     else if (key == CONFIG_KEY_PASSWORD_SUPPRESS)
     {
