@@ -82,6 +82,17 @@ pub struct Candidate {
     /// 完整词之间（如 baoan 时「报/宝」塞在「保安」「报案」之间）。对齐 Go 的 coverage
     /// 分层：完整覆盖输入的词恒先于只覆盖部分输入的子短语单字。
     pub is_partial: bool,
+    /// 是否为**引擎合成的整句解**（Viterbi 多词拼接，或超长词典整词的等价整句分）。
+    ///
+    /// 语义 = "这是引擎对整串输入的最优解读"，词频重排（`freq_rerank`）据此把它连同
+    /// `is_phrase` 一起锚定在顶部，不因用户词频而下沉。
+    ///
+    /// 此前该判定靠 `weight >= 20_000_000` 的数值阈值实现，把"来源语义"编码进了权重数值，
+    /// 导致两类问题：① 任何因别的原因被提权到 20M 以上的候选都会被误锚定，永久失去词频
+    /// 学习能力；② 不相关的提权功能（如 `BARE_INITIAL_SINGLE_CHAR_BOOST`）必须小心避让
+    /// 这条阈值线。改用显式标记后，权重只表达"多重要"，来源语义由本字段表达。
+    #[serde(default)]
+    pub is_sentence: bool,
     pub consumed_length: usize,
     /// 该候选 `code` 的**音节边界**（各音节起始字节位 bitmask），见
     /// `wind_dict::binformat::DictEntry::boundary`。`0` = 无边界信息 → 消费方降级回 DAG 猜切分。
@@ -127,6 +138,7 @@ impl Default for Candidate {
             is_fuzzy: false,
             is_prefix: false,
             is_partial: false,
+            is_sentence: false,
             consumed_length: 0,
             boundary: 0,
             source: CandidateSource::None,

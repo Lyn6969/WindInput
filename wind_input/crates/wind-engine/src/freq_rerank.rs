@@ -13,10 +13,6 @@ use std::collections::HashMap;
 use wind_candidate::Candidate;
 use wind_store::freq::{FreqProfile, FreqRecord};
 
-/// 拼音整句/短语豁免阈值（§4①）：weight ≥ 此值的候选（整句 SENTENCE_WEIGHT_BASE=30M、
-/// 短语 PHRASE_WEIGHT_BASE=40M）视为"引擎最优解"，词频重排恒不下沉。介于词权重上限(~19M)
-/// 与整句基准(30M)之间。
-const PINYIN_SENTENCE_FLOOR: i32 = 20_000_000;
 /// 拼音词频衰减分阈值（§4③ 阈值褪色）：衰减分 < ε 的候选失去 used-first 资格，落回引擎权重序
 /// （拼音"用过"随半衰期褪色，不同于码表的永久 used-first）。
 const PINYIN_FREQ_EPSILON: f64 = 10.0;
@@ -92,8 +88,8 @@ pub fn rerank_codetable_usedfirst(
 
 /// 拼音词频重排（§4）：衰减软置前 + 整句豁免 + 阈值褪色。
 /// 与码表的"永久 used-first"不同——拼音"用过"随半衰期褪色（久未用 → 落回权重序）。
-/// ① 整句/短语豁免：weight ≥ PINYIN_SENTENCE_FLOOR 的候选（Viterbi 整句/自定义短语）恒锚定顶部，
-///    互相维持引擎权重序（稳定排序）。② 非整句：衰减分 ≥ ε 的"近用"候选软置前于其余，按分降序。
+/// ① 整句/短语豁免：`is_sentence`（Viterbi 整句/超长词典整词）或 `is_phrase`（自定义短语）
+///    的候选恒锚定顶部，互相维持引擎权重序（稳定排序）。② 非整句：衰减分 ≥ ε 的"近用"候选软置前于其余，按分降序。
 /// ③ 阈值褪色：衰减分 < ε → 失去 used-first 资格，落回引擎权重序。
 /// `now` 为当前 unix 秒（由调用方注入，便于测试与确定性）。
 pub fn rerank_pinyin_decay(
@@ -109,9 +105,9 @@ pub fn rerank_pinyin_decay(
             .unwrap_or(0.0)
     };
     candidates.sort_by(|a, b| {
-        // ① 整句/短语锚定顶部
-        let sa = a.weight >= PINYIN_SENTENCE_FLOOR;
-        let sb = b.weight >= PINYIN_SENTENCE_FLOOR;
+        // ① 整句/短语锚定顶部（按来源语义判定，不看权重数值——见 Candidate::is_sentence）
+        let sa = a.is_sentence || a.is_phrase;
+        let sb = b.is_sentence || b.is_phrase;
         if sa != sb {
             return if sa {
                 Ordering::Less
@@ -212,11 +208,17 @@ mod tests {
 
     const NOW: i64 = 1_700_000_000;
 
-    /// 整句豁免：高权重整句恒置顶，即使某非整句词被频繁使用也不能反超。
+    fn pin_sentence(text: &str, weight: i32) -> Candidate {
+        let mut c = pin(text, weight);
+        c.is_sentence = true;
+        c
+    }
+
+    /// 整句豁免：整句恒置顶，即使某非整句词被频繁使用也不能反超。
     #[test]
     fn pinyin_sentence_is_anchored_on_top() {
         let mut cands = vec![
-            pin("你好世界", 30_000_000),
+            pin_sentence("你好世界", 30_000_000),
             pin("你好", 2000),
             pin("拟", 1000),
         ];
@@ -225,6 +227,33 @@ mod tests {
         assert_eq!(cands[0].text, "你好世界", "整句必须锚定首位");
         assert_eq!(cands[1].text, "你好", "近用词软置前于未用词");
         assert_eq!(cands[2].text, "拟");
+    }
+
+    /// 锚定按来源语义而非权重数值：高权重但非整句的候选（如别的功能提权到 30M 的词）
+    /// 仍须正常参与词频重排，不得被误当整句锚定而永久失去词频学习能力。
+    /// 这正是把 `weight >= 20M` 阈值换成 `is_sentence` 标记要解决的问题。
+    #[test]
+    fn pinyin_high_weight_non_sentence_still_learns() {
+        let mut cands = vec![pin("高权非整句", 30_000_000), pin("近用低权", 100)];
+        let r = recs(&[("近用低权", 20, NOW)]);
+        rerank_pinyin_decay(&mut cands, &r, NOW, FreqProfile::default());
+        assert_eq!(
+            cands[0].text, "近用低权",
+            "非整句候选无论权重多高都应可被词频重排下沉"
+        );
+    }
+
+    /// 短语（is_phrase）与整句同享锚定豁免。
+    #[test]
+    fn pinyin_phrase_is_anchored_like_sentence() {
+        let mut cands = vec![pin("普通词", 5000), {
+            let mut c = pin("我的邮箱", 40_000_000);
+            c.is_phrase = true;
+            c
+        }];
+        let r = recs(&[("普通词", 30, NOW)]);
+        rerank_pinyin_decay(&mut cands, &r, NOW, FreqProfile::default());
+        assert_eq!(cands[0].text, "我的邮箱", "短语须与整句同享锚定");
     }
 
     /// 衰减软置前：近用词（衰减分 ≥ ε）浮到未用词之上，即使权重更低。

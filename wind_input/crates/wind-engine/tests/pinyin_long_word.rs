@@ -59,9 +59,9 @@ fn test_long_proper_noun_wins_over_fragment_split() {
     }
 }
 
-/// 词图上限内的普通精确整词不得被推进 freq_rerank 的整句锚定区
-/// （PINYIN_SENTENCE_FLOOR = 20_000_000），否则会永久失去词频学习能力。
-/// 「共和」自身是 Viterbi 整句故允许在锚定区；同码的「恭贺」「共贺」不该被带进去。
+/// 词图上限内的普通精确整词不得被授予 `is_sentence` 身份，否则会被 freq_rerank
+/// 锚定在顶部而永久失去词频学习能力。
+/// 「共和」自身是 Viterbi 整句故允许带该标记；同码的「恭贺」「共贺」不该被带进去。
 #[test]
 fn test_short_exact_words_stay_out_of_sentence_anchor() {
     let Some(dir) = data_dir() else {
@@ -75,10 +75,9 @@ fn test_short_exact_words_stay_out_of_sentence_anchor() {
 
     for c in cands.iter().filter(|c| c.text != "共和") {
         assert!(
-            c.weight < 20_000_000,
-            "候选「{}」weight={} 落进了整句锚定区，将失去词频学习",
-            c.text,
-            c.weight
+            !c.is_sentence,
+            "候选「{}」被误标为整句解，将被锚定而失去词频学习",
+            c.text
         );
     }
 }

@@ -42,8 +42,9 @@ const SENTENCE_WEIGHT_BASE: i32 = 30_000_000;
 
 /// 裸声母（无完整音节，如 "m"）单字提权：使单字候选（吗/么）排在多字前缀补全词
 /// （没有/目前）之前——对齐主流输入法「首字优先」。取 1e7：高于常规词频（单字基础权重上限
-/// ~2e6），稳压多字词；又低于整句底线 PINYIN_SENTENCE_FLOOR(2e7)，不会被 freq_rerank 误当整句
-/// 锚定。提权改的是 weight，故能穿过协调器按权重的重排（否则引擎内单字优先会被 build_candidates
+/// ~2e6），稳压多字词。（历史注记：此值原本还须刻意低于 freq_rerank 的 2e7 阈值以免被误当
+/// 整句锚定——该阈值已改为按 `Candidate::is_sentence` 标记判定，此处不必再避让任何数值线。）
+/// 提权改的是 weight，故能穿过协调器按权重的重排（否则引擎内单字优先会被 build_candidates
 /// 重排冲掉）。仅裸声母（syllables 为空）时应用——完整音节输入的单字已靠 is_prefix 层级就位。
 const BARE_INITIAL_SINGLE_CHAR_BOOST: i32 = 10_000_000;
 
@@ -688,8 +689,8 @@ impl Engine for PinyinEngine {
         //
         // 仅限音节数超过词图上限的词。上限内的词 Viterbi 已能作为单节点自行选中（这正是
         // max_word_len 6→10 修好「中华人民共和国」的原因），无需在此干预；若不加这道限制，
-        // 所有精确整词（gonghe 的恭贺/共贺等）都会被推过 PINYIN_SENTENCE_FLOOR(20M)，
-        // 落进 freq_rerank 的整句锚定区而永久失去词频学习能力。
+        // 所有精确整词（gonghe 的恭贺/共贺等）都会被授予 is_sentence 身份而锚定在顶部，
+        // 永久失去词频学习能力——「整句解」应是引擎对整串输入的最优解读，不是"凡精确即整句"。
         //
         // 只在无残码时生效（query == completed）：有残码时精确命中只覆盖完成音节前缀，
         // 本就不该与覆盖全输入的整句同级竞争。
@@ -704,6 +705,10 @@ impl Engine for PinyinEngine {
                 let log_offset =
                     (log_prob * 1000.0).clamp(-(SENTENCE_WEIGHT_BASE as f64), 0.0) as i32;
                 c.weight = c.weight.max(SENTENCE_WEIGHT_BASE.saturating_add(log_offset));
+                // 与整句同量纲即同身份：它是引擎对整串输入的最优解读，只是恰好由一个词典
+                // 整词构成。不标的话 freq_rerank 会把 is_sentence 的拼接整句锚定到它之上，
+                // 「冠状动脉粥样硬化性心脏病」又会被「罐装动脉…」压回去。
+                c.is_sentence = true;
             }
         }
 
@@ -750,6 +755,9 @@ impl Engine for PinyinEngine {
                         // （如「你好吗」）压下去——后者经 trailing_partial 优化也是 false。
                         existing.weight = existing.weight.max(weight);
                         existing.is_partial = false;
+                        // 同文合并后它就是整句解本身，须继承整句身份，
+                        // 否则 freq_rerank 会把它当普通候选而让别的整句锚定到它之上。
+                        existing.is_sentence = true;
                     } else {
                         candidates.insert(
                             0,
@@ -761,6 +769,7 @@ impl Engine for PinyinEngine {
                                 weight,
                                 natural_order: 0,
                                 source: CandidateSource::Pinyin,
+                                is_sentence: true,
                                 // 整句是按 DAG 这份切分拼出来的，其边界即该切分本身。
                                 // 双拼下 DAG 会把 nihao 重切成 ni|hao 拼出「你好」——标上它，
                                 // 才能被双拼真值 ni|ha|o 拒掉（否则 boundary=0 直接放行）。
@@ -1971,9 +1980,9 @@ mod tests {
         PinyinEngine::new(config, CachedDict::Memory(raw))
     }
 
-    /// 判断候选是否为 Viterbi 合成整句（权重达到 SENTENCE_WEIGHT_BASE 档）。
+    /// 判断候选是否为 Viterbi 合成整句（按来源标记，不看权重数值）。
     fn is_viterbi_sentence(c: &Candidate) -> bool {
-        c.weight >= super::SENTENCE_WEIGHT_BASE
+        c.is_sentence
     }
 
     /// TDD：use_smart_compose=false 时多音节输入不产生 Viterbi 合成整句候选。
