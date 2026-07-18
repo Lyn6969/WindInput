@@ -2529,7 +2529,7 @@ impl Coordinator {
     }
 
     /// 当前模式下生效的配对表（按中/英标点 + 各自开关）
-    fn active_pairs(&self, chinese_punct: bool) -> Option<Vec<(char, char)>> {
+    pub(crate) fn active_pairs(&self, chinese_punct: bool) -> Option<Vec<(char, char)>> {
         let rt = self.rt();
         if chinese_punct {
             if rt.config.input.auto_pair.chinese {
@@ -4496,6 +4496,8 @@ impl MessageHandler for Coordinator {
                     if state.caps_lock {
                         state.chinese_punct = false;
                     }
+                    // 引号交替态钉左：开了配对后一次按键即产出完整一对，交替开关不参与决策。
+                    let quote_paired = self.pin_quote_left_if_paired(&state, ch);
                     let piece = self.convert_punct(&state, ch, data.prev_char);
                     state.chinese_punct = saved_chinese_punct;
                     out.push_str(&piece);
@@ -4508,8 +4510,14 @@ impl MessageHandler for Coordinator {
                     // 标点配对（对齐 Go）：插入配对 + 智能跳过
                     let pch = piece.chars().last().unwrap_or(' ');
                     if let Some(pairs) = self.active_pairs(state.chinese_punct) {
-                        // 智能跳过：仅无候选前缀（out 即标点本身）时，输右括号→光标右移
-                        if out == piece && pairs.iter().any(|(_, r)| *r == pch) {
+                        // 智能跳过：仅无候选前缀（out 即标点本身）时，输右括号→光标右移。
+                        // 引号一律不走此路（`quote_paired` 中文引号 / `*l != *r` 对称英文引号）：
+                        // 对称配对的按键不携带开/闭这一位，
+                        // 无从判断用户想跳出还是想嵌套新的一对，故取消右符号处理、跳出交给跳出键。
+                        if out == piece
+                            && !quote_paired
+                            && pairs.iter().any(|(l, r)| *r == pch && *l != *r)
+                        {
                             let mut tr =
                                 self.pair_tracker.lock().unwrap_or_else(|e| e.into_inner());
                             if tr.peek().is_some_and(|e| e.right == pch) {
@@ -4524,6 +4532,14 @@ impl MessageHandler for Coordinator {
                                 .lock()
                                 .unwrap_or_else(|e| e.into_inner())
                                 .push(pch, right);
+                            // 右引号已由本次配对补出，交替开关不该停在「右」——否则一旦中途
+                            // 关掉配对，遗留的右态会让下一个引号直接出闭引号。
+                            if quote_paired {
+                                self.punct
+                                    .lock()
+                                    .unwrap_or_else(|e| e.into_inner())
+                                    .pin_quote_left(ch);
+                            }
                             let cursor_offset = out.encode_utf16().count() as u32;
                             let text = format!("{}{}", out, right);
                             return KeyAction::InsertTextWithCursor {

@@ -686,8 +686,17 @@ STDAPI CKeyEventSink::OnKeyDown(ITfContext* pContext, WPARAM wParam, LPARAM lPar
 
             if (pairChar != 0)
             {
-                // Smart skip: right bracket matches stack top
-                if (_englishPairEngine.IsRight(pairChar))
+                // Smart skip: right bracket matches stack top.
+                // 对称配对（引号 `"` `'`：左右同形，IsLeft/IsRight 同时为真）不走此路——
+                // 按键不携带「开/闭」这一位，无从判断用户想跳出还是想嵌套新的一对，故一律
+                // 按「开新的一对」处理（落到下面的 IsLeft 分支），跳出交给配对跳出键。
+                // 不排除的话会与 core 侧同源的「一次出对、一次出单」交替循环一致地复发。
+                if (_englishPairEngine.IsRight(pairChar) && _englishPairEngine.IsLeft(pairChar))
+                {
+                    // 对称配对键落此分支：不做任何右符号判定，直接交给下面的 IsLeft 开新的一对。
+                    WIND_LOG_DEBUG_FMT(L"English auto-pair: symmetric pair '%c', always open new pair\n", pairChar);
+                }
+                else if (_englishPairEngine.IsRight(pairChar))
                 {
                     PairEngine::Entry entry;
                     if (_englishPairEngine.Peek(entry) && entry.right == pairChar)

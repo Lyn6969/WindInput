@@ -109,6 +109,17 @@ impl PunctuationConverter {
         }
     }
 
+    /// 把某引号的交替态强制置为「左」。**自动配对生效时使用**：右引号由配对补出，
+    /// 一次按键即产出完整一对，交替开关不该随之前进；钉死在左才能保证每次按键都开新的一对。
+    /// 不钉则交替开关与配对栈错位 → 「一次出对、一次出单」循环（见 [`quote_pair`]）。
+    pub fn pin_quote_left(&mut self, c: char) {
+        match c {
+            '\'' => self.single_quote_left = true,
+            '"' => self.double_quote_left = true,
+            _ => {}
+        }
+    }
+
     /// 无状态中文标点映射（非引号部分），供 to_chinese / peek 共用。
     fn static_chinese(c: char) -> Option<String> {
         match c {
@@ -166,6 +177,19 @@ impl PunctuationConverter {
             _ => {}
         }
         Self::static_chinese(c)
+    }
+}
+
+/// 引号键的「左形 / 右形」中文产物，**与当前交替状态无关**；非引号键返回 None。
+///
+/// 引号是唯一的**对称配对键**：同一个物理键既可能产出左引号也可能产出右引号，按键本身
+/// 不携带「这是开还是闭」这一位信息。其它配对符（`（` 与 `）`）是两个不同的键，天然携带。
+/// 故自动配对生效时，引号只能一律按「开一对」处理，跳出交给 `auto_pair.jump_out_keys`。
+pub fn quote_pair(c: char) -> Option<(char, char)> {
+    match c {
+        '\'' => Some(('\u{2018}', '\u{2019}')),
+        '"' => Some(('\u{201C}', '\u{201D}')),
+        _ => None,
     }
 }
 

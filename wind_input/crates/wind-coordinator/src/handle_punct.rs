@@ -51,6 +51,32 @@ impl Coordinator {
         )
     }
 
+    /// 引号 × 自动配对：若 `ch` 是引号、且其左右形在当前生效配对表中构成一对，则把交替态
+    /// **钉回「左」**并返回 true（该引号已由配对接管，按下即开新的一对）。
+    ///
+    /// 不钉的后果就是「一次出对、一次出单」交替循环：`to_chinese` 每次按引号都翻转交替开关，
+    /// 但开了配对后**一次按键已经把左右两个引号都吐出去了**，开关却只前进一格 → 下次按键
+    /// 给出右引号 → 既不是左符号（不插对）、又走右符号分支（跳出或裸提交单个右引号）。
+    /// 两套状态机（交替开关 / 配对栈）就此错位。钉死在左即把引号的左右判定**单一收口**到配对栈。
+    ///
+    /// 须在标点流水线**之前**调用：钉的是本次转换的输入态，兼带清掉历史残留的「右」态。
+    pub(crate) fn pin_quote_left_if_paired(&self, state: &State, ch: char) -> bool {
+        let Some((l, r)) = wind_transform::punctuation::quote_pair(ch) else {
+            return false;
+        };
+        let Some(pairs) = self.active_pairs(state.chinese_punct) else {
+            return false;
+        };
+        if !pairs.iter().any(|p| *p == (l, r)) {
+            return false;
+        }
+        self.punct
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .pin_quote_left(ch);
+        true
+    }
+
     /// 智能符号模式判定时限（非法值回退 500ms）。
     pub(crate) fn smart_symbol_timeout(&self) -> std::time::Duration {
         let ms = self.rt().config.input.symbol.smart_timeout_ms;
@@ -319,7 +345,9 @@ impl Coordinator {
         if let Some(pairs) = pairs {
             let pch = piece.chars().last().unwrap_or(' ');
             // 智能跳过：输右符号且栈顶正是它 → 光标右移越过，不重复插入。
-            if pairs.iter().any(|(_, r)| *r == pch) {
+            // 对称配对（`＂＂` 等左右同形）除外：按键不携带开/闭这一位，无从判断跳出还是嵌套，
+            // 故一律按「开新的一对」处理，跳出交给 `auto_pair.jump_out_keys`。
+            if pairs.iter().any(|(l, r)| *r == pch && *l != *r) {
                 let mut tr = self.pair_tracker.lock().unwrap_or_else(|e| e.into_inner());
                 if tr.peek().is_some_and(|e| e.right == pch) {
                     tr.pop();

@@ -3361,6 +3361,61 @@ fn auto_pair_no_jump_out_key_passes_tab_through() {
     );
 }
 
+/// 引号配对回归：**连按引号键每次都开新的一对**，绝不交替。
+///
+/// 历史 bug：引号是唯一的对称配对键，`PunctuationConverter` 用交替开关决定出左还是出右
+/// （第 1 次 `“`、第 2 次 `”`），而自动配对**一次按键就把左右都吐出去了**、开关却只前进
+/// 一格 → 第 2 次按键给出 `”` → 不是左符号（不插对）、却是右符号（跳出或裸提交单个 `”`）
+/// → 「出对 / 出单」严格交替循环。修法是配对生效时把交替态钉死在「左」，
+/// 左右判定单一收口到配对栈，跳出交给 `jump_out_keys`。
+#[test]
+fn auto_pair_quote_always_opens_new_pair() {
+    if !has_schemas() {
+        return;
+    }
+    let mut cfg = config_with("wubi86");
+    cfg.input.auto_pair.chinese = true;
+    cfg.input.auto_pair.chinese_pairs.push("“”".into());
+    let coord = Coordinator::new_headless(cfg, Some(&data_dir()));
+
+    // Shift+VK_OEM_7(0xDE) = `"` → 中文双引号
+    for round in 1..=3 {
+        let act = coord.handle_key_event(&key_event_mods(0xDE, EVENT_KEY_DOWN, 0x0001));
+        match act {
+            KeyAction::InsertTextWithCursor {
+                text,
+                cursor_offset,
+            } => {
+                assert_eq!(text, "“”", "第 {round} 次按引号应插入完整一对");
+                assert_eq!(cursor_offset, 1, "第 {round} 次光标应落在配对中间");
+            }
+            other => panic!("第 {round} 次按引号应插入配对（不得跳出/裸出单引号），实际: {other:?}"),
+        }
+    }
+}
+
+/// 引号不在配对表内时，保持原生「第一次左、第二次右」交替（不被上面的钉左误伤）。
+#[test]
+fn quote_alternates_when_not_in_pair_table() {
+    if !has_schemas() {
+        return;
+    }
+    let mut cfg = config_with("wubi86");
+    cfg.input.auto_pair.chinese = true; // 配对开，但配对表**不含**引号
+    let coord = Coordinator::new_headless(cfg, Some(&data_dir()));
+
+    let first = coord.handle_key_event(&key_event_mods(0xDE, EVENT_KEY_DOWN, 0x0001));
+    let second = coord.handle_key_event(&key_event_mods(0xDE, EVENT_KEY_DOWN, 0x0001));
+    assert!(
+        format!("{first:?}").contains('“'),
+        "首次应出左引号，实际: {first:?}"
+    );
+    assert!(
+        format!("{second:?}").contains('”'),
+        "第二次应出右引号（原生交替），实际: {second:?}"
+    );
+}
+
 fn action_caret(action: &KeyAction) -> Option<u32> {
     match action {
         KeyAction::UpdateComposition { caret_pos, .. } => Some(*caret_pos),
