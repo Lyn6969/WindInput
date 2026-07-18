@@ -1790,6 +1790,50 @@ fn test_numpad_follow_main_matches_mainboard_all_modes() {
     );
 }
 
+/// 数字键 0 选当前页第 10 个候选（主键盘 / 小键盘 follow_main 一致）。
+/// 主键盘 0 此前落兜底流水线只输出 '0'，不选第 10——「0 = 第10候选」是通行约定，
+/// 也是 follow_main 下 Numpad0「和主键盘一样」的前提。
+#[test]
+fn test_number_zero_selects_tenth_candidate() {
+    if !has_schemas() {
+        return;
+    }
+    // 0 选「当前页第 10 个」，故须每页容量 ≥10（默认 per_page=7 时第 10 越界）。
+    // 拼音 "shi" 候选远多于 10，确保 0 选第 10 而非越界 overflow。
+    let mut cfg = config_with("pinyin");
+    cfg.input.numpad_behavior = "follow_main".into();
+    cfg.ui.candidate.per_page = 10;
+    let type_shi = |c: &Coordinator| {
+        for ch in "shi".chars() {
+            press_letter(c, ch);
+        }
+    };
+
+    let a = Coordinator::new_headless(cfg.clone(), Some(&data_dir()));
+    type_shi(&a);
+    let main0 = action_text(&press_vk(&a, 0x30, false)); // 主键盘 0
+
+    let b = Coordinator::new_headless(cfg.clone(), Some(&data_dir()));
+    type_shi(&b);
+    let np0 = action_text(&press_vk(&b, 0x60, false)); // 小键盘 0 (VK_NUMPAD0, follow_main)
+
+    assert!(
+        main0.as_deref().is_some_and(|t| !t.is_empty()),
+        "主键盘 0 应选中第 10 候选并上屏（shi 候选足够多），实际: {:?}",
+        main0
+    );
+    assert_eq!(np0, main0, "小键盘 0 (follow_main) 应与主键盘 0 选同一候选");
+
+    // 空缓冲下的 0 不进选词臂：输出数字本身，不回归 fullwidth（此处半角态 → '0'）。
+    let c = Coordinator::new_headless(cfg.clone(), Some(&data_dir()));
+    let empty0 = c.handle_key_event(&key_event(0x30, EVENT_KEY_DOWN));
+    assert!(
+        matches!(&empty0, KeyAction::PassThrough) || action_text(&empty0).as_deref() == Some("0"),
+        "空缓冲主键盘 0 应输出数字 0（透传或上屏），实际: {:?}",
+        empty0
+    );
+}
+
 /// direct 下编码型模式：不丢已打的码——顶屏当前高亮候选后再输出该数字。
 #[test]
 fn test_numpad_direct_commits_candidate_then_digit() {

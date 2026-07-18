@@ -3923,6 +3923,18 @@ impl MessageHandler for Coordinator {
                 }
                 self.handle_number_key_select(&mut state, num)
             }
+            keymap::VK_0
+                if data.modifiers & MOD_SHIFT == 0
+                    && !(state.candidates.is_empty()
+                        && state.input_buffer.is_empty()
+                        && state.committed_text.is_empty()) =>
+            {
+                // 数字键 0 选当前页第 10 个候选（对齐通行约定 0=第10；越界按
+                // overflow.number_key 处理）。follow_main 归一化后小键盘 0 走此臂，与主键盘一致。
+                // 空缓冲下的 0 不进此臂（guard 排除）→ 落兜底标点流水线，保持全角态输出全角 ０
+                // 及自定义标点映射——0 曾靠「不在数字选词臂、落兜底」才正确，见 fullwidth 修复。
+                self.handle_number_key_select(&mut state, 10)
+            }
             keymap::VK_A..=keymap::VK_Z => {
                 // A-Z 字母累积
                 let ch = (b'a' + (data.key_code - 0x41) as u8) as char;
