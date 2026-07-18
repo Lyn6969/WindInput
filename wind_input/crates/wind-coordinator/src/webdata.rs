@@ -727,6 +727,29 @@ impl Coordinator {
         Ok(json!({ "ok": true }))
     }
 
+    /// 构造 `dictionaries` 的 override 值：**每库只落 `{id, enabled}` 稀疏项**。
+    ///
+    /// 词库的 path/label/base_order/顺序等结构定义始终以方案文件为准（合并侧见
+    /// `EngineManager::merge_dict_overrides`）。若在此写入完整数组，override 就会冻结整份
+    /// 词库定义——方案后续新增的库透不过来、改过的 path 仍指向旧文件、顺序也停在写快照那一刻。
+    ///
+    /// 入参取合并后的 dictionaries：`enabled.is_some()` 即"该库有显式启用态"，逐条落盘以
+    /// 保留其它库已翻的开关。
+    fn sparse_dict_overrides(dicts: &[wind_config::schema::DictSpec]) -> toml::Value {
+        toml::Value::Array(
+            dicts
+                .iter()
+                .filter(|d| !d.id.is_empty())
+                .filter_map(|d| {
+                    let mut t = toml::value::Table::new();
+                    t.insert("id".to_string(), toml::Value::String(d.id.clone()));
+                    t.insert("enabled".to_string(), toml::Value::Boolean(d.enabled?));
+                    Some(toml::Value::Table(t))
+                })
+                .collect(),
+        )
+    }
+
     fn web_schema_set_dict_enabled(&self, params: &Value) -> anyhow::Result<Value> {
         let id = str_param(params, "id")?;
         let dict_id = str_param(params, "dictId")?;
@@ -748,8 +771,7 @@ impl Coordinator {
         if !found {
             anyhow::bail!("方案 {} 无附加词库 {}", id, dict_id);
         }
-        // override 层写入完整 dictionaries 数组（合并时整体替换），保留其它 override 字段。
-        let dicts_val = toml::Value::try_from(&merged.dictionaries)?;
+        let dicts_val = Self::sparse_dict_overrides(&merged.dictionaries);
         let mut ov = self
             .engine_mgr
             .get_schema_override(id)
@@ -2582,6 +2604,54 @@ mod tests {
         assert!(
             items.iter().any(|it| it["text"] == "你好"),
             "双拼应读到拼音下加的词（data_schema_id 共享）"
+        );
+    }
+
+    /// setDictEnabled 落盘的 override 每库只含 `{id, enabled}`——绝不携带 path/label/base_order
+    /// 等结构字段，否则 override 会冻结整份词库定义（方案升级后新增/改动的库透不过来）。
+    #[test]
+    fn sparse_dict_overrides_carries_only_id_and_enabled() {
+        use wind_config::schema::DictSpec;
+        let dicts = vec![
+            // 有显式启用态 → 落盘
+            DictSpec {
+                id: "ext1".into(),
+                label: "分类词库".into(),
+                path: "flypy/11_fl.dict.yaml".into(),
+                base_order: 1,
+                default_enabled: Some(true),
+                enabled: Some(false),
+                ..Default::default()
+            },
+            // 无显式启用态（用户没翻过）→ 不落盘，继承方案的 default_enabled
+            DictSpec {
+                id: "ext2".into(),
+                path: "flypy/21_yj.dict.yaml".into(),
+                default_enabled: Some(true),
+                enabled: None,
+                ..Default::default()
+            },
+            // 无 id 无法按 id 匹配回方案文件 → 丢弃
+            DictSpec {
+                id: String::new(),
+                path: "flypy/31_fh.dict.yaml".into(),
+                enabled: Some(true),
+                ..Default::default()
+            },
+        ];
+
+        let out = Coordinator::sparse_dict_overrides(&dicts);
+        let arr = out.as_array().expect("应为数组");
+        assert_eq!(arr.len(), 1, "只有 ext1 有显式启用态且带 id");
+
+        let t = arr[0].as_table().unwrap();
+        assert_eq!(t.get("id").unwrap().as_str(), Some("ext1"));
+        assert_eq!(t.get("enabled").unwrap().as_bool(), Some(false));
+        assert_eq!(
+            t.len(),
+            2,
+            "除 id/enabled 外不得携带任何结构字段，实际: {:?}",
+            t.keys().collect::<Vec<_>>()
         );
     }
 

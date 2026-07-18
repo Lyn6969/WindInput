@@ -112,13 +112,20 @@ pub struct EngineManager {
 static CACHE_DIR: std::sync::OnceLock<Option<std::path::PathBuf>> = std::sync::OnceLock::new();
 
 /// 深合并 TOML：`over` 覆盖到 `base` 之上。两侧皆为 table 时逐键递归；否则 over 整体替换。
-/// 数组按整体替换（如 dictionaries 覆盖即替换全表）。
+/// 数组按整体替换（如 encoder.rules 覆盖即替换全表）。
+///
+/// **例外：`dictionaries`** 走 [`merge_dict_overrides`] 的按 id 稀疏合并——词库的
+/// path/label/base_order 等结构定义必须始终以方案文件为准，override 层只表达用户开关。
 fn merge_toml(base: &mut toml::Value, over: toml::Value) {
     match (base, over) {
         (toml::Value::Table(b), toml::Value::Table(o)) => {
             for (k, ov) in o {
                 match b.get_mut(&k) {
+                    Some(bv) if k == "dictionaries" => merge_dict_overrides(bv, &ov),
                     Some(bv) => merge_toml(bv, ov),
+                    // base 无 dictionaries 时不接纳 override 的稀疏项（它们无 path，凭空
+                    // 造不出可用词库）；其余键正常新增。
+                    None if k == "dictionaries" => {}
                     None => {
                         b.insert(k, ov);
                     }
@@ -126,6 +133,37 @@ fn merge_toml(base: &mut toml::Value, over: toml::Value) {
             }
         }
         (b, ov) => *b = ov,
+    }
+}
+
+/// `dictionaries` 的 override 合并：**按 `id` 匹配，且只接受 `enabled` 字段**。
+///
+/// 方案文件是词库结构（顺序/path/label/base_order/type…）的唯一权威，override 层仅记录
+/// 用户在设置页翻的开关。这么定的两个原因：
+/// 1. 数组整体替换会让 override 冻结整份词库定义——方案升级后新增的词库透不过来、
+///    改过的 path 仍指向旧文件、顺序也停在写快照那一刻。
+/// 2. 字段白名单顺带**净化历史遗留的整表快照**：老 override 里那些 path/label 副本
+///    会被直接忽略，无需单独写迁移代码。
+///
+/// override 里 id 在方案文件中找不到（词库已被方案删除）的条目静默丢弃。
+fn merge_dict_overrides(base: &mut toml::Value, over: &toml::Value) {
+    let (Some(base_arr), Some(over_arr)) = (base.as_array_mut(), over.as_array()) else {
+        return;
+    };
+    for ov in over_arr {
+        let (Some(id), Some(enabled)) = (
+            ov.get("id").and_then(|v| v.as_str()),
+            ov.get("enabled").and_then(|v| v.as_bool()),
+        ) else {
+            continue;
+        };
+        for b in base_arr.iter_mut() {
+            if b.get("id").and_then(|v| v.as_str()) == Some(id)
+                && let Some(t) = b.as_table_mut()
+            {
+                t.insert("enabled".to_string(), toml::Value::Boolean(enabled));
+            }
+        }
     }
 }
 
@@ -2301,6 +2339,59 @@ mod tests {
         assert_eq!(t.get("x").unwrap().as_integer(), Some(1), "未覆盖键保留");
         assert_eq!(t.get("y").unwrap().as_integer(), Some(20), "覆盖键替换");
         assert_eq!(t.get("z").unwrap().as_integer(), Some(30), "新增键加入");
+    }
+
+    /// dictionaries 的 override 是**按 id 的稀疏合并**，不是数组整体替换：
+    /// 只有 enabled 会被覆盖，结构定义（顺序/path/label/base_order）恒以方案文件为准。
+    #[test]
+    fn merge_toml_dictionaries_only_overrides_enabled_by_id() {
+        // 方案文件：三个库，其中 ext2 是"方案后续新增"的（override 写入时还不存在）。
+        let mut base: toml::Value = toml::from_str(
+            "[[dictionaries]]\nid = \"main\"\npath = \"a.yaml\"\ndefault = true\nbase_order = 0\n\
+             [[dictionaries]]\nid = \"ext1\"\npath = \"new/b.yaml\"\nlabel = \"新标签\"\nbase_order = 1\n\
+             [[dictionaries]]\nid = \"ext2\"\npath = \"c.yaml\"\nbase_order = 2\n",
+        )
+        .unwrap();
+        // override：老格式整表快照（含 path/label 副本）+ 一个方案已删除的库 gone。
+        let over: toml::Value = toml::from_str(
+            "[[dictionaries]]\nid = \"ext1\"\nenabled = false\npath = \"old/b.yaml\"\nlabel = \"旧标签\"\nbase_order = 99\n\
+             [[dictionaries]]\nid = \"gone\"\nenabled = true\npath = \"gone.yaml\"\n",
+        )
+        .unwrap();
+        merge_toml(&mut base, over);
+
+        let arr = base.get("dictionaries").unwrap().as_array().unwrap();
+        assert_eq!(arr.len(), 3, "方案文件的库集合与顺序不受 override 影响");
+        assert_eq!(arr[2].get("id").unwrap().as_str(), Some("ext2"));
+        assert!(
+            arr[2].get("enabled").is_none(),
+            "override 未提及的库保持无显式 enabled（继承 default_enabled）"
+        );
+
+        let ext1 = &arr[1];
+        assert_eq!(ext1.get("enabled").unwrap().as_bool(), Some(false), "enabled 被覆盖");
+        assert_eq!(
+            ext1.get("path").unwrap().as_str(),
+            Some("new/b.yaml"),
+            "path 以方案文件为准——老快照里的副本必须被忽略"
+        );
+        assert_eq!(ext1.get("label").unwrap().as_str(), Some("新标签"));
+        assert_eq!(ext1.get("base_order").unwrap().as_integer(), Some(1));
+
+        assert!(
+            !arr.iter().any(|d| d.get("id").and_then(|v| v.as_str()) == Some("gone")),
+            "方案已删除的库不因 override 复活"
+        );
+    }
+
+    /// base 侧没有 dictionaries 时，override 的稀疏项无 path、造不出可用词库，应整键忽略。
+    #[test]
+    fn merge_toml_dictionaries_not_created_from_override_alone() {
+        let mut base: toml::Value = toml::from_str("[schema]\nid = \"x\"\n").unwrap();
+        let over: toml::Value =
+            toml::from_str("[[dictionaries]]\nid = \"ext1\"\nenabled = true\n").unwrap();
+        merge_toml(&mut base, over);
+        assert!(base.get("dictionaries").is_none());
     }
 
     #[test]
