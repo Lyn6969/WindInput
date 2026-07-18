@@ -26,6 +26,10 @@ fn main() -> anyhow::Result<()> {
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
         )
+        // 与 service / wind_tsf 一致，用本地时间而非默认的 UTC
+        .with_timer(tracing_subscriber::fmt::time::ChronoLocal::new(
+            "%Y-%m-%d %H:%M:%S%.3f".to_string(),
+        ))
         .with_writer(io::stderr)
         .init();
 

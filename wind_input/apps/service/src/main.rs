@@ -11,6 +11,10 @@ use file_rotate::{ContentLimit, FileRotate};
 use std::sync::Arc;
 use tracing::{error, info};
 use tracing_subscriber::EnvFilter;
+use tracing_subscriber::fmt::time::ChronoLocal;
+
+/// 日志时间戳格式，与 wind_tsf `CFileLogger::_FormatTimestamp` 保持一致。
+const LOG_TIME_FORMAT: &str = "%Y-%m-%d %H:%M:%S%.3f";
 
 use wind_bridge::deferred::DeferredHandler;
 use wind_bridge::push::{PushConfig, PushServer};
@@ -330,11 +334,18 @@ fn init_logger() {
     );
     let (writer, _guard) = tracing_appender::non_blocking(rotate);
 
+    // 时间戳用本地时区，且格式与 wind_tsf 的 FileLogger 完全一致
+    // （`GetLocalTime` → `%04d-%02d-%02d %02d:%02d:%02d.%03d`），
+    // 两份日志才能直接按时间对齐排查。默认的 SystemTime timer 输出 UTC，
+    // 与 TSF 日志差一个时区，务必不要退回默认值。
+    // 注意：不能用 fmt::time::LocalTime —— 它依赖 time crate，
+    // 而 time 在多线程进程中会拒绝获取本地时区偏移，导致时间戳静默变空。
     tracing_subscriber::fmt()
         .with_writer(writer)
         .with_ansi(false)
         .with_target(true)
         .with_thread_ids(true)
+        .with_timer(ChronoLocal::new(LOG_TIME_FORMAT.to_string()))
         .with_env_filter(EnvFilter::new(&level))
         .init();
 
@@ -347,6 +358,8 @@ fn init_logger() {
         max_size_mb = cfg_debug.log_max_size_mb,
         max_files = cfg_debug.log_max_files,
         portable = wind_config::variant::is_portable(),
+        // 时间戳是本地时间；记一次 UTC 偏移，让日志自描述所处时区
+        tz_offset = %chrono::Local::now().format("%:z"),
         "logger initialized"
     );
 }

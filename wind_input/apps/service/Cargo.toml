@@ -30,6 +30,7 @@ tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 tracing-appender = { workspace = true }
 file-rotate = { workspace = true }
+chrono = "0.4"
 anyhow = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
