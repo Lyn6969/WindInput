@@ -100,6 +100,9 @@ impl Coordinator {
         if !now {
             self.password_suppress.store(false, Relaxed);
         }
+        // 同步给 DLL：吃键门控在 TSF 侧本地判定（早于 IPC），不推则开关对 DLL 无效——
+        // 关掉抑制后 DLL 仍会放行所有键，这个「误置位时用来救场」的逃生阀就成了摆设。
+        self.push_password_suppress_config(0);
     }
 
     /// 在文件管理器中打开目录（高级菜单「打开…目录」共用）。

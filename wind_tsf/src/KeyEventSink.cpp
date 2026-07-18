@@ -186,6 +186,14 @@ STDAPI CKeyEventSink::OnTestKeyDown(ITfContext* pContext, WPARAM wParam, LPARAM 
     if (_pTextService->IsKeyboardDisabled())
         return S_OK;
 
+    // 密码框强制英文抑制：与上面的 disabled 同类——全部放行，一个键都不吃。
+    // 必须在此（吃键决策点）判，不能只靠 core 回 PassThrough：那时 pfEaten 已为 TRUE，
+    // 形成 OnTestKeyDown(TRUE)+OnKeyDown(FALSE) 的「吃了再吐」，而 Chrome/Electron 等
+    // 严格宿主不回退合成 WM_CHAR → 密码框里字母被整个吞掉（中文模式下字母恒被吃，见下方
+    // chinese_letter 分支）。判据镜像 core，见 CTextService::IsPasswordSuppressActive。
+    if (_pTextService->IsPasswordSuppressActive())
+        return S_OK;
+
     // First check if the context is read-only (browser non-editable area)
     if (_IsContextReadOnly(pContext))
     {
@@ -398,7 +406,11 @@ STDAPI CKeyEventSink::OnTestKeyDown(ITfContext* pContext, WPARAM wParam, LPARAM 
 
     // English auto-pair: intercept bracket keys in English mode.
     // Ctrl/Alt 组合留给热键/宿主（如 Ctrl+Shift+] open_settings），不做配对。
+    // 全角时本地配对让位给 core：全角下 `(` 要出 `（` 并配 `）`，而本引擎只认半角配对表；
+    // 若在此吃键本地插入，会出半角配对且与 core 的 pair_tracker 双重处理。全角态统一由
+    // core 的 handle_english_full_width 出字+配对（配对表由 english_pairs 过同一条流水线派生）。
     if (!isChineseMode && _englishPairEngine.IsEnabled()
+        && !_pTextService->IsFullWidth()
         && !(modifiers & (KEYMOD_CTRL | KEYMOD_ALT)))
     {
         // 配对跳出键：栈非空时吃键，让 OnKeyDown 稳定被调用执行跳出（严格 TSF 宿主
@@ -477,6 +489,17 @@ STDAPI CKeyEventSink::OnTestKeyDown(ITfContext* pContext, WPARAM wParam, LPARAM 
                 *pfEaten = TRUE;
                 _LogKeyDecision(L"test_down", _pTextService->GetFocusSessionId(), wParam, modifiers, keyType,
                                 isChineseMode, hasComposition, _hasCandidates, hasInputSession, TRUE, L"session_key");
+                return S_OK;
+            }
+            // 中文+全角：无 input session 时也需拦截 Space，让 core 走全角转换（U+3000）。
+            // 与下方 Number 的 chinese_fullwidth_number 例外同源——core 侧空缓冲空格早已
+            // 正确走标点流水线，但此处不吃就永远送不到，故全角空格只在恰好有 session /
+            // resync 窗口内时才灵，表现为「有时全角有时半角」。
+            if (isChineseMode && keyType == HotkeyType::Space && _pTextService->IsFullWidth())
+            {
+                *pfEaten = TRUE;
+                _LogKeyDecision(L"test_down", _pTextService->GetFocusSessionId(), wParam, modifiers, keyType,
+                                isChineseMode, hasComposition, _hasCandidates, hasInputSession, TRUE, L"chinese_fullwidth_space");
                 return S_OK;
             }
         }
@@ -628,11 +651,20 @@ STDAPI CKeyEventSink::OnKeyDown(ITfContext* pContext, WPARAM wParam, LPARAM lPar
     // Check barrier timeout
     _CheckBarrierTimeout();
 
+    // 密码框强制英文抑制：与 OnTestKeyDown 的同款守卫成对。Chrome/QQ 等宿主会无视
+    // OnTestKeyDown 的 pfEaten=FALSE 仍调用本函数（见下方 policy 早期闸门的同类注释），
+    // 此处不挡则按键仍会流进英文配对引擎 / IPC，抑制形同虚设。
+    if (_pTextService->IsPasswordSuppressActive())
+        return S_OK;
+
     // English auto-pair handling (before toggle key detection and Go IPC).
     // 必须跳过 Ctrl/Alt 组合：否则 Ctrl+Shift+] 等功能热键在 OnTestKeyDown 已按
     // 白名单吃键后，OnKeyDown 会被 auto-pair 当成 '}' 直接 InsertText，永远发不到 core
     // （表现为英文模式上屏 }，中文正常；Ctrl+Shift+E / \ 不受影响因非配对字符）。
-    if (!_pTextService->IsChineseMode() && _englishPairEngine.IsEnabled())
+    // 全角时本地配对让位给 core（与 OnTestKeyDown 的同款守卫必须成对，否则该处不吃、
+    // 此处却仍本地插入半角配对，全角配对永远不生效）。
+    if (!_pTextService->IsChineseMode() && _englishPairEngine.IsEnabled()
+        && !_pTextService->IsFullWidth())
     {
         uint32_t mods = CHotkeyManager::GetCurrentModifiers();
         if (!(mods & (KEYMOD_CTRL | KEYMOD_ALT)))
@@ -2149,6 +2181,14 @@ void CKeyEventSink::OnSyncConfig(const std::string& key, const std::vector<uint8
             _jumpOutKeys.insert((UINT)vk);
         }
         WIND_LOG_INFO_FMT(L"Jump-out keys config updated: count=%d\n", (int)_jumpOutKeys.size());
+    }
+    else if (key == CONFIG_KEY_PASSWORD_SUPPRESS)
+    {
+        // 格式：enabled(u8)（对齐 Rust encode_password_suppress_value）
+        if (value.empty()) return;
+        BOOL enabled = value[0] != 0;
+        _pTextService->SetPasswordSuppressEnabled(enabled);
+        WIND_LOG_INFO_FMT(L"Password suppress policy updated: enabled=%d\n", enabled);
     }
     else if (key == CONFIG_KEY_STATS)
     {

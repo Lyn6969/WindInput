@@ -838,6 +838,8 @@ CTextService::CTextService()
     , _hotkeysActive(FALSE)
     , _addWordHotkeysActive(FALSE)
     , _focusIsPassword(false)
+    , _focusInputScopeMask(0)
+    , _passwordSuppressEnabled(TRUE)  // 默认开，与 core 的 password_suppress_enabled 初值一致
     , _hasThreadFocus(FALSE)
     , _activateFlags(0)
     , _pKeyEventSink(nullptr)
@@ -2009,6 +2011,8 @@ STDAPI CTextService::OnSetFocus(ITfDocumentMgr* pDocMgrFocus, ITfDocumentMgr* pD
         _focusIsPassword = (_hasTextInputContext && _IsFocusKeyboardDisabled(pDocMgrFocus)) != FALSE;
         if (_focusIsPassword)
             inputScopeMask |= kScopeBitPassword;
+        // 自留一份：IsPasswordSuppressActive 的吃键门控须在 OnTestKeyDown 本地算出（早于 IPC）。
+        _focusInputScopeMask = inputScopeMask;
 
         // Get caret position for toolbar placement (separate concern from _hasTextInputContext)
         LONG caretX = 0, caretY = 0, caretHeight = 0;
@@ -2119,6 +2123,8 @@ STDAPI CTextService::OnSetFocus(ITfDocumentMgr* pDocMgrFocus, ITfDocumentMgr* pD
         // 离开文本框：清门卫状态，下方 reeval 会注销加词热键，把 Ctrl+= 还给宿主。
         _hasTextInputContext = FALSE;
         _focusIsPassword = false;
+        // 掩码随焦点走：不清会把上个控件的密码位带到新焦点，令抑制门控误放行。
+        _focusInputScopeMask = 0;
     }
 
     // 焦点/文本框上下文变化后重新评估加词热键（gaining/losing 两分支汇合于此）。
@@ -2509,6 +2515,9 @@ STDAPI CTextService::OnChange(REFGUID rguid)
                 curMask = _QueryInputScopeMask(pDocMgrCur);
                 pDocMgrCur->Release();
             }
+            // 与 core 同步更新自留掩码：本路径是「焦点未变但禁用态翻转」（SPA 原地跳到
+            // 密码框），不走 OnSetFocus，不更新则抑制门控会一直用旧焦点的掩码。
+            _focusInputScopeMask = curMask;
             uint8_t curReason = ComputeInputReason(bDisabled != FALSE, curMask);
             _pIPCClient->SendInputStateReport(GetCurrentProcessId(), bDisabled != FALSE, curReason, curMask);
         }
@@ -3563,6 +3572,26 @@ bool CTextService::_IsFocusKeyboardDisabled(ITfDocumentMgr* pDocMgr)
     bool disabled = ReadContextCompartmentBool(pContext, kGuidCompartmentKeyboardDisabled, L"KEYBOARD_DISABLED");
     pContext->Release();
     return disabled;
+}
+
+// 密码框强制英文抑制当前是否生效。**必须镜像** core `apply_input_diag` 的判据：
+//   suppress = is_password_scope(mask) && !disabled && password_suppress_enabled
+// 两侧判据一旦漂移就会重现「吃了再吐」——DLL 吃了键、core 却回 PassThrough → 严格 TSF
+// 宿主（Chrome/Electron）不回退合成 WM_CHAR，键直接丢失（密码框里表现为完全打不出字）。
+//
+// `!disabled`（compartment 未禁用）这条不可省：compartment 置位时 DLL 早在
+// OnTestKeyDown 开头就全放行了，引擎收不到键，抑制无从谈起（core 注释所谓 moot）。
+// Chromium 系密码框走的正是 compartment 那条路；本判据只覆盖「宿主标了 IS_PASSWORD
+// InputScope 但没禁用键盘」的那类宿主——恰恰是此前会丢键的场景。
+BOOL CTextService::IsPasswordSuppressActive() const
+{
+    if (!_passwordSuppressEnabled)
+        return FALSE;
+    if (_focusIsPassword || _bKeyboardDisabled)
+        return FALSE;
+    // IS_PASSWORD=31 / IS_NUMERIC_PASSWORD=63（对齐 core is_password_scope 的两位）
+    const UINT64 kPasswordScopeBits = (1ULL << 31) | (1ULL << 63);
+    return (_focusInputScopeMask & kPasswordScopeBits) != 0;
 }
 
 BOOL CTextService::_DocMgrHasEditableContext(ITfDocumentMgr* pDocMgr, DWORD* pDynFlagsOut)

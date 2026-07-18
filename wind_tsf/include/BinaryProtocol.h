@@ -468,6 +468,10 @@ static_assert(sizeof(InputStatsPayload) == 20, "InputStatsPayload must be 20 byt
 constexpr const char* CONFIG_KEY_ENGLISH_PAIRS = "en_pairs";
 constexpr const char* CONFIG_KEY_JUMP_OUT_KEYS = "jump_out_keys";
 constexpr const char* CONFIG_KEY_STATS = "stats";
+// 密码框强制英文抑制的策略开关（会话级，右键菜单「高级」可关）。DLL 需要它才能在
+// OnTestKeyDown 本地判定是否放行——吃键决策发生在 IPC 之前，仅靠 core 回 PassThrough
+// 已经太晚（会形成「吃了再吐」丢键）。
+constexpr const char* CONFIG_KEY_PASSWORD_SUPPRESS = "password_suppress";
 
 // Calculate key hash for hotkey matching
 // Format: (modifiers << 16) | keyCode

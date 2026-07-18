@@ -769,6 +769,68 @@ fn separator_two_step_segmentation() {
     assert_eq!(coord.debug_candidate_count(), 0, "两步选完组合区应清空");
 }
 
+/// C1 回归（鼠标版）：点选分段候选须与数字键同为分步提交——先点「西」组合区留活剩 "an"、
+/// 候选续查出「安」，再点「安」整体上屏「西安」。
+///
+/// 曾因 `mouse_select` 独走 `commit_candidate`（无条件清缓冲、不看 consumed_length）而：
+/// 剩余码被丢弃、候选窗直接消失，且第二步只上屏「安」丢掉已确认的「西」段。
+#[test]
+fn mouse_select_two_step_segmentation() {
+    if !has_schemas() {
+        return;
+    }
+    let coord = Coordinator::new_headless(config_with("pinyin"), Some(&data_dir()));
+    for c in "xi".chars() {
+        press_letter(&coord, c);
+    }
+    coord.handle_key_event(&key_event(0xC0, EVENT_KEY_DOWN));
+    for c in "an".chars() {
+        press_letter(&coord, c);
+    }
+    // 鼠标点选「西」（子短语，仅消费 xi 段）→ 分步提交，组合区留活
+    let texts = coord.debug_page_texts();
+    let p_xi = texts
+        .iter()
+        .position(|t| t == "西")
+        .unwrap_or_else(|| panic!("候选应含子短语「西」，实际: {:?}", texts));
+    let step = coord
+        .debug_mouse_select(p_xi)
+        .expect("主输入路点选应产生待推送的 KeyAction");
+    let disp = action_text(&step).unwrap_or_else(|| {
+        panic!(
+            "点选「西」应为 UpdateComposition（组合区留活），实际: {:?}",
+            step
+        )
+    });
+    assert!(
+        disp.starts_with('西') && disp.ends_with("an") && !disp.contains('\''),
+        "点选「西」后组合区应为「西」+剩余 an（无 ' 残留），实际: {:?}",
+        disp
+    );
+    // 剩余分词的候选必须还在（原 bug：候选窗直接消失，count 归 0）
+    assert!(
+        coord.debug_candidate_count() > 0,
+        "点选分段候选后应续查剩余码的候选，不应清空"
+    );
+
+    // 再点「安」→ 整体上屏「西安」（含已确认的「西」段），组合区清空
+    let texts2 = coord.debug_page_texts();
+    let p_an = texts2
+        .iter()
+        .position(|t| t == "安")
+        .unwrap_or_else(|| panic!("剩余 an 的候选应含「安」，实际: {:?}", texts2));
+    match coord.debug_mouse_select(p_an) {
+        Some(KeyAction::InsertText { text, .. }) => {
+            assert_eq!(
+                text, "西安",
+                "两步点选最终应上屏「西安」，不得丢失已确认的「西」段"
+            );
+        }
+        other => panic!("点选「安」应上屏 InsertText，实际: {:?}", other),
+    }
+    assert_eq!(coord.debug_candidate_count(), 0, "两步点选完组合区应清空");
+}
+
 #[test]
 fn test_schema_switch_via_menu() {
     if !has_schemas() {
@@ -2944,6 +3006,130 @@ fn phrase_auto_commit_effect_command_executes() {
     let _ = std::fs::remove_file(&store_path);
 }
 
+/// 精确匹配模式（`single_code_input`）+ 空码补全（`single_code_complete`）下，短语前缀
+/// 补全**只出首选一条**——与码表引擎同分支「从更长编码取首个候选」的规格一致。
+///
+/// 回归：原 `allow_prefix` 在补全分支放行整串前缀命中，致空码补全冒出多条「后续」。
+/// 注入同前缀 zzq 的三条短语（码 zzqa/zzqb/zzqc，五笔无 zzq 精确字 → 触发补全分支）。
+fn coord_with_prefix_phrases(complete: bool) -> std::sync::Arc<Coordinator> {
+    let store_path =
+        std::env::temp_dir().join(format!("wind_phrase_complete_{}.redb", complete as u8));
+    let _ = std::fs::remove_file(&store_path);
+    let store = std::sync::Arc::new(wind_store::Store::open(&store_path).unwrap());
+    // 权重递增：首选应为权重最高的 zzqc。
+    store.add_phrase("zzqa", "短语甲", 0, 10).unwrap();
+    store.add_phrase("zzqb", "短语乙", 0, 20).unwrap();
+    store.add_phrase("zzqc", "短语丙", 0, 30).unwrap();
+    let mut cfg = config_with("wubi86");
+    cfg.schema.codetable.single_code_input = true;
+    cfg.schema.codetable.single_code_complete = complete;
+    cfg.input.phrase.min_prefix = 2;
+    Coordinator::new_headless_with_store(cfg, Some(&data_dir()), store)
+}
+
+#[test]
+fn exact_mode_phrase_complete_yields_single_hit() {
+    if !has_schemas() {
+        return;
+    }
+    let coord = coord_with_prefix_phrases(true);
+    for ch in ['z', 'z', 'q'] {
+        press_letter(&coord, ch);
+    }
+    let texts = coord.debug_all_candidate_texts();
+    let phrase_hits: Vec<&String> = texts.iter().filter(|t| t.starts_with("短语")).collect();
+    assert_eq!(
+        phrase_hits.len(),
+        1,
+        "精确模式空码补全应只出首选一条短语，实际: {:?}",
+        texts
+    );
+    assert_eq!(
+        phrase_hits[0], "短语丙",
+        "补全应取权重最高的首选（HashMap 序不定，须先定序）"
+    );
+}
+
+#[test]
+fn exact_mode_without_complete_suppresses_phrase_prefix() {
+    if !has_schemas() {
+        return;
+    }
+    // 补全关闭：精确模式应彻底抑制短语前缀枚举（证明上一个测试的一条来自补全分支）。
+    let coord = coord_with_prefix_phrases(false);
+    for ch in ['z', 'z', 'q'] {
+        press_letter(&coord, ch);
+    }
+    let texts = coord.debug_all_candidate_texts();
+    assert!(
+        !texts.iter().any(|t| t.starts_with("短语")),
+        "补全关闭时精确模式不应出短语前缀候选，实际: {:?}",
+        texts
+    );
+}
+
+/// 短语自动上屏须过 `auto_commit_min_len` 闸（与码表「满码唯一自动上屏」同规格）。
+///
+/// 回归：`phrase_auto_commit` 原只判「唯一 + 无更长后继」、不设最短码长，致短码短语
+/// （如 3 码 `ocd` 的 $CC 命令在 4 码方案里）绕过「满码」语义直接上屏/执行。
+///
+/// 复用 kkkkx（5 码，五笔 4 码封顶 → 必无更长后继）隔离出 min_len 单一变量：
+/// 显式设 6 → 5 < 6 应被拦；设 5 → 恰好达标应放行（边界为 >=）。
+fn coord_with_phrase_min_len(min_len: usize, tag: &str) -> std::sync::Arc<Coordinator> {
+    let store_path = std::env::temp_dir().join(format!("wind_phrase_minlen_{tag}.redb"));
+    let _ = std::fs::remove_file(&store_path);
+    let store = std::sync::Arc::new(wind_store::Store::open(&store_path).unwrap());
+    store.add_phrase("kkkkx", "唯一测试短语", 0, 100).unwrap();
+    let mut cfg = config_with("wubi86");
+    cfg.schema.codetable.auto_commit_at_full = true;
+    cfg.schema.codetable.auto_commit_min_len = min_len;
+    Coordinator::new_headless_with_store(cfg, Some(&data_dir()), store)
+}
+
+#[test]
+fn phrase_auto_commit_blocked_below_min_len() {
+    if !has_schemas() {
+        return;
+    }
+    // min_len=6 > 短语码长 5：即便唯一且无更长后继，也不得自动上屏。
+    let coord = coord_with_phrase_min_len(6, "block");
+    for ch in ['k', 'k', 'k', 'k'] {
+        press_letter(&coord, ch);
+    }
+    let act = coord.handle_key_event(&key_event(0x58, EVENT_KEY_DOWN));
+    assert!(
+        !matches!(act, KeyAction::InsertText { .. }),
+        "码长 5 < min_len 6 时短语不得自动上屏，实际: {:?}",
+        act
+    );
+    assert!(
+        coord
+            .debug_all_candidate_texts()
+            .contains(&"唯一测试短语".to_string()),
+        "未达 min_len 应留在候选里等用户选，实际: {:?}",
+        coord.debug_all_candidate_texts()
+    );
+}
+
+#[test]
+fn phrase_auto_commit_at_min_len_boundary() {
+    if !has_schemas() {
+        return;
+    }
+    // min_len=5 == 短语码长 5：边界为 >=，应自动上屏（证明上一个测试拦的是 min_len 本身，
+    // 而非 kkkkx 这个构造本来就不会自动上屏）。
+    let coord = coord_with_phrase_min_len(5, "boundary");
+    for ch in ['k', 'k', 'k', 'k'] {
+        press_letter(&coord, ch);
+    }
+    match coord.handle_key_event(&key_event(0x58, EVENT_KEY_DOWN)) {
+        KeyAction::InsertText { text, .. } => {
+            assert_eq!(text, "唯一测试短语", "码长恰达 min_len 应自动上屏");
+        }
+        other => panic!("码长 5 == min_len 5 应自动上屏，实际: {:?}", other),
+    }
+}
+
 // 码表用户词库值内嵌 $CC 命令（用户真机场景 bccc=$CC(...)）自动上屏测试基建：
 // 注入 5 码用户词 kkkkx（五笔 4 码封顶，5 码处必无码表候选 → 唯一 + 无更长后继，
 // 与短语侧同构造）。原三重漏判：引擎意向 commit_text=原始 $CC 源 vs 展开后候选
@@ -3463,4 +3649,222 @@ fn test_temp_pinyin_cursor_maps_through_separator() {
         matches!(tap(&coord, VK_LEFT), KeyAction::Consumed),
         "已在最左：吃掉，不得退进引导符"
     );
+}
+
+// ── 全角（英文模式 / 中文模式数字）─────────────────────────────────────────────
+// 背景：全角横跨两层门控——C++ `OnTestKeyDown` 决定是否吃键转发，Rust 决定是否转全角。
+// 两侧不一致即「吃了再吐」(OnTestKeyDown(TRUE)+OnKeyDown(FALSE))，严格 TSF 宿主直接丢键。
+// 下列用例锁的是 Rust 侧「C++ 吃了就必须出字」的契约。
+
+/// 英文模式 + 全角的配置（C++ `english_fullwidth` 分支会吃 Letter|Number|Punctuation|Space）。
+fn config_english_fullwidth() -> wind_config::Config {
+    let mut cfg = config_with("pinyin");
+    cfg.input.default.chinese_mode = false;
+    cfg.input.default.full_width = true;
+    cfg
+}
+
+#[test]
+fn test_english_fullwidth_letters_digits_space() {
+    if !has_schemas() {
+        return;
+    }
+    // 回归：英文模式曾无条件 PassThrough（从不读 full_width），而 C++ 已为全角吃下这些键
+    // → 吃了再吐 → Chrome/VSCode 等严格宿主里空格/数字/符号完全打不出。
+    let coord = Coordinator::new_headless(config_english_fullwidth(), Some(&data_dir()));
+    let cases = [
+        (0x41_u32, "ａ", "小写字母"),
+        (0x35, "５", "数字"),
+        (0x20, "\u{3000}", "空格"),
+        (0xBD, "－", "标点(减号)"),
+        (0x60, "０", "小键盘数字"),
+    ];
+    for (vk, want, what) in cases {
+        match coord.handle_key_event(&key_event(vk, EVENT_KEY_DOWN)) {
+            KeyAction::InsertText { text, .. } => {
+                assert_eq!(text, want, "英文全角{}应上屏全角", what)
+            }
+            other => panic!("英文全角{}应出字（透传即丢键），实际: {:?}", what, other),
+        }
+    }
+}
+
+#[test]
+fn test_english_fullwidth_shift_and_capslock_case() {
+    if !has_schemas() {
+        return;
+    }
+    // 键被 TSF 吃下后系统不再代劳大小写，须由 Rust 按 CapsLock 镜像 XOR Shift 自行决定。
+    use wind_ipc::protocol::MOD_SHIFT;
+    let coord = Coordinator::new_headless(config_english_fullwidth(), Some(&data_dir()));
+    // Shift+A → 大写全角
+    match coord.handle_key_event(&key_event_mods(0x41, EVENT_KEY_DOWN, MOD_SHIFT)) {
+        KeyAction::InsertText { text, .. } => assert_eq!(text, "Ａ", "Shift+字母应大写全角"),
+        other => panic!("实际: {:?}", other),
+    }
+    // Shift+1 → '!' 的全角（走 punct_char 的 shifted 支）
+    match coord.handle_key_event(&key_event_mods(0x31, EVENT_KEY_DOWN, MOD_SHIFT)) {
+        KeyAction::InsertText { text, .. } => assert_eq!(text, "！", "Shift+1 应出全角叹号"),
+        other => panic!("实际: {:?}", other),
+    }
+    // CapsLock 开（toggles bit0）+ 无 Shift → 大写全角；镜像由每键 toggles 快照校准。
+    let caps = KeyEventData {
+        toggles: 0x01,
+        ..key_event(0x41, EVENT_KEY_DOWN)
+    };
+    match coord.handle_key_event(&caps) {
+        KeyAction::InsertText { text, .. } => assert_eq!(text, "Ａ", "CapsLock 应大写全角"),
+        other => panic!("实际: {:?}", other),
+    }
+    // CapsLock + Shift → 相互抵消回小写
+    let caps_shift = KeyEventData {
+        toggles: 0x01,
+        modifiers: MOD_SHIFT,
+        ..key_event(0x41, EVENT_KEY_DOWN)
+    };
+    match coord.handle_key_event(&caps_shift) {
+        KeyAction::InsertText { text, .. } => assert_eq!(text, "ａ", "CapsLock+Shift 应抵消回小写"),
+        other => panic!("实际: {:?}", other),
+    }
+}
+
+#[test]
+fn test_english_halfwidth_still_passthrough() {
+    if !has_schemas() {
+        return;
+    }
+    // 零回归：英文半角仍须透传（C++ 此时也不吃键），保留宿主 WM_KEYDOWN 原生语义。
+    let mut cfg = config_with("pinyin");
+    cfg.input.default.chinese_mode = false;
+    let coord = Coordinator::new_headless(cfg, Some(&data_dir()));
+    for vk in [0x41_u32, 0x35, 0x20, 0xBD] {
+        assert!(
+            matches!(
+                coord.handle_key_event(&key_event(vk, EVENT_KEY_DOWN)),
+                KeyAction::PassThrough
+            ),
+            "英文半角 vk=0x{:02X} 应透传",
+            vk
+        );
+    }
+}
+
+#[test]
+fn test_english_fullwidth_ctrl_alt_not_intercepted() {
+    if !has_schemas() {
+        return;
+    }
+    // Ctrl/Alt 组合是快捷键：C++ 的 ClassifyInputKey 对其返回 None 本就不吃，
+    // Rust 侧须对称放行，否则会把宿主快捷键（Ctrl+A 等）吞成全角字符。
+    use wind_ipc::protocol::{MOD_ALT, MOD_CTRL};
+    let coord = Coordinator::new_headless(config_english_fullwidth(), Some(&data_dir()));
+    for mods in [MOD_CTRL, MOD_ALT] {
+        assert!(
+            matches!(
+                coord.handle_key_event(&key_event_mods(0x41, EVENT_KEY_DOWN, mods)),
+                KeyAction::PassThrough
+            ),
+            "英文全角下 Ctrl/Alt 组合应透传给宿主"
+        );
+    }
+}
+
+#[test]
+fn test_english_fullwidth_autopair_uses_fullwidth_pairs() {
+    if !has_schemas() {
+        return;
+    }
+    // 配对表须由 english_pairs 逐字符过同一条流水线派生：打 `(` 出 `（` 就配 `）`。
+    // 关键回归：不可复用 cn_pairs——`to_full_width('[')` = `［`(U+FF3B) 而 cn_pairs 是
+    // `【`(U+3010)，混用会「打 [ 出 【 却配 ］」。故此处专测 `[`。
+    let mut cfg = config_english_fullwidth();
+    cfg.input.auto_pair.english = true;
+    let coord = Coordinator::new_headless(cfg, Some(&data_dir()));
+    match coord.handle_key_event(&key_event(0xDB, EVENT_KEY_DOWN)) {
+        KeyAction::InsertTextWithCursor {
+            text,
+            cursor_offset,
+        } => {
+            assert_eq!(text, "［］", "全角 `[` 应配全角 `］`，而非中文的 【】");
+            assert_eq!(cursor_offset, 1, "光标应落在配对之间");
+        }
+        other => panic!("英文全角 `[` 应插入全角配对，实际: {:?}", other),
+    }
+}
+
+#[test]
+fn test_chinese_fullwidth_digits_1_to_9() {
+    if !has_schemas() {
+        return;
+    }
+    // 回归：中文全角空缓冲下 1-9 曾恒 PassThrough（无视 full_width），而 C++ 为全角专门
+    // 在无 session 时也吃数字（`chinese_fullwidth_number`）→ 吃了再吐 → 部分应用丢键、
+    // 部分出半角。`0` 因无该 match 臂、落标点流水线，反而一直正常——本测锁死两者一致。
+    let mut cfg = config_with("pinyin");
+    cfg.input.default.full_width = true;
+    let coord = Coordinator::new_headless(cfg, Some(&data_dir()));
+    for (vk, want) in [
+        (0x31_u32, "１"),
+        (0x35, "５"),
+        (0x39, "９"),
+        (0x30, "０"), // `0` 走另一条路（标点流水线），须与 1-9 结果一致
+    ] {
+        match coord.handle_key_event(&key_event(vk, EVENT_KEY_DOWN)) {
+            KeyAction::InsertText { text, .. } => {
+                assert_eq!(text, want, "中文全角数字 vk=0x{:02X} 应上屏全角", vk)
+            }
+            other => panic!("中文全角数字 vk=0x{:02X} 应出字，实际: {:?}", vk, other),
+        }
+    }
+}
+
+#[test]
+fn test_chinese_halfwidth_digits_still_passthrough() {
+    if !has_schemas() {
+        return;
+    }
+    // 零回归：半角态空缓冲数字仍透传（C++ 此时不吃），保留宿主原生按键语义。
+    let coord = Coordinator::new_headless(config_with("pinyin"), Some(&data_dir()));
+    for vk in [0x31_u32, 0x39] {
+        assert!(
+            matches!(
+                coord.handle_key_event(&key_event(vk, EVENT_KEY_DOWN)),
+                KeyAction::PassThrough
+            ),
+            "中文半角空缓冲数字应透传"
+        );
+    }
+}
+
+#[test]
+fn test_chinese_capslock_fullwidth_space_and_numpad() {
+    if !has_schemas() {
+        return;
+    }
+    // 回归：CapsLock+全角分支原用 printable_char 取字符，而它不含 VK_SPACE(punct_char 无该键)
+    // 也不含小键盘 → 落 PassThrough。但 C++ 在中文全角下对空格(chinese_fullwidth_space)
+    // 与小键盘(chinese_fullwidth_number)都吃键 → 吃了再吐 → 严格 TSF 宿主丢键。
+    // 现由 full_width_source_char 统一收口，保证 Rust 出字集 ⊇ C++ 吃键集。
+    let mut cfg = config_with("pinyin");
+    cfg.input.default.full_width = true;
+    let coord = Coordinator::new_headless(cfg, Some(&data_dir()));
+    for (vk, want, what) in [
+        (0x20_u32, "\u{3000}", "空格"),
+        (0x60, "０", "小键盘 0"),
+        (0x41, "Ａ", "字母(CapsLock 大写)"),
+    ] {
+        let ev = KeyEventData {
+            toggles: 0x01, // CapsLock ON
+            ..key_event(vk, EVENT_KEY_DOWN)
+        };
+        match coord.handle_key_event(&ev) {
+            KeyAction::InsertText { text, .. } => {
+                assert_eq!(text, want, "CapsLock+全角 {} 应上屏全角", what)
+            }
+            other => panic!(
+                "CapsLock+全角 {} 应出字（透传即丢键），实际: {:?}",
+                what, other
+            ),
+        }
+    }
 }

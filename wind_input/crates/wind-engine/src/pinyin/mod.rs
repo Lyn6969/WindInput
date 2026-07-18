@@ -418,33 +418,44 @@ fn syllables_boundary_mask(syllables: &[String], limit_len: usize) -> u64 {
     mask
 }
 
-/// 双拼解释给出的音节边界（**全拼空间** bitmask，与候选 `boundary` 同域）。
+/// 双拼给出的**分段边界**（全拼空间 bitmask，与候选 `boundary` 同域）。
 ///
-/// 双拼每 2 键 = 1 音节，边界是免费且精确的——这正是双拼相对全拼的信息优势，
-/// 此前却被拼成 `full_pinyin` 后交给 DAG 重新猜。
+/// 双拼每 2 键 = 1 段，边界免费且精确——这正是双拼相对全拼的信息优势，此前却被拼成
+/// `full_pinyin` 后交给 DAG 重猜。
 ///
-/// 返回 0 = **边界不可信，不参与校验**：
-/// - 无音节；
-/// - 音节在全拼空间不连续（中间有「无匹配键对原样回写」段，如首道双拼的 `om`），
-///   此时回写段没有 `ConvertedSyllable` 记录，其起始位无从得知，宁可整体弃用；
-/// - 越出 64 位 bitmask 表达范围。
+/// **回写段也算一个段起点**。`convert` 拼不出合法音节时会把两个键原样写进 full
+/// （注释所谓「简拼/无效键对」）且不产生 `ConvertedSyllable`——但它照样**占据 full 的一段**、
+/// 用户也确实是当一个单元敲的，故它的起点同样是真值。曾以为这类段"无从表达"而让整个
+/// mask 作废（返回 0 = 不校验），结果 `nihaoya` 的「你好呀」从 step4 前缀补全漏网：
+/// 校验一关，全拼命中就畅通无阻。给回写段标上起点后，`ni|ha|oy…` = {0,2,4} 与词典的
+/// `ni|hao|ya` = {0,2,5} 自然不符，拒绝生效。
+///
+/// 返回 0 仅表示无可用信息（空输入 / 越出 64 位表达范围）。
 fn sp_boundary_mask(sp: &shuangpin::SpConvertResult) -> u64 {
     let mut mask = 0u64;
     let mut cursor = 0usize;
+    let mut mark = |pos: usize, mask: &mut u64| -> bool {
+        if pos >= 64 {
+            return false;
+        }
+        *mask |= 1u64 << pos;
+        true
+    };
     for s in &sp.syllables {
-        // 不连续 ⇒ 存在原样回写段 ⇒ 边界不完整，弃用（否则会漏标该段起始位而误杀候选）。
-        if s.fp_start != cursor || s.fp_start >= 64 {
+        // 音节之前的空隙 = 回写段（如 `omni` 的 om），其起点同样是段边界。
+        if s.fp_start > cursor && !mark(cursor, &mut mask) {
             return 0;
         }
-        mask |= 1u64 << s.fp_start;
+        if !mark(s.fp_start, &mut mask) {
+            return 0;
+        }
         cursor = s.fp_end;
     }
-    // 尾部 partial（未完成音节的声母，如 nihao 的 o）也占一个音节的起点。
-    if sp.has_partial && cursor < sp.full_pinyin.len() {
-        if cursor >= 64 {
-            return 0;
-        }
-        mask |= 1u64 << cursor;
+    // 尾部剩余：partial 声母（nihao 的 o）或回写段（nihaoya 的 oy+a）——两者都开一个新段。
+    // 注：回写段内部可能不止一段（每 2 键一段），但其细分无从得知；只标首个起点即可，
+    // 已足以让「跨越该点的词典切分」失配。
+    if cursor < sp.full_pinyin.len() && !mark(cursor, &mut mask) {
+        return 0;
     }
     mask
 }
@@ -602,18 +613,28 @@ impl Engine for PinyinEngine {
         // 双拼每 2 键 = 1 音节，边界免费且精确。让 DAG 重猜会造成「查询按猜测、校验按真值」
         // 两套切分打架：`hao`(3键) 双拼解释为 ha|o，DAG 却重切成 [hao] 只查了「好」，
         // 随后被真值拒掉，而真正该查的 `ha`（→「哈」）压根没查 → 候选全空。
-        let sp_syllables: Option<Vec<String>> = sp_result.as_ref().and_then(|r| {
-            // 音节须从 0 起在全拼空间连续覆盖：中间若有「无匹配键对原样回写」段（如首道双拼的
-            // om），pinyin 拼接就不等于 full 的前缀，completed_len 会错位切出乱码。此时退回 DAG。
+        // 双拼激活：取**从 0 起连续覆盖**的音节前缀，遇断裂即止。
+        //
+        // 断裂 = 「无匹配键对原样回写」段（convert 的 else 分支，如 `oy`——o 非声母、拼不出
+        // 音节）。它没有 ConvertedSyllable，其后音节的 fp 偏移也已被它污染，故断裂处之后
+        // **不解释**：那本就是用户打错的键，不该产生候选。
+        //
+        // 不可整串退回 DAG——那等于「打错一个键对反而解锁全拼」，与 nihao(5键) 不出「你好」
+        // 自相矛盾。注释里「简拼/无效键对」的**简拼**那半由 AbbrevMatcher 兜底，它走 query、
+        // 不看音节切分，本就不需要 DAG（见 shuangpin_writeback_keeps_abbrev_input_intact）。
+        //
+        // 尾部 partial（未完成音节的声母）不是完成音节，不计入——由 step4 前缀补全承接。
+        let sp_syllables: Option<Vec<String>> = sp_result.as_ref().map(|r| {
+            let mut v = Vec::with_capacity(r.syllables.len());
             let mut cursor = 0usize;
             for s in &r.syllables {
                 if s.fp_start != cursor {
-                    return None;
+                    break; // 断裂：其后 fp 偏移不可信，停止解释
                 }
+                v.push(s.pinyin.clone());
                 cursor = s.fp_end;
             }
-            // 尾部 partial（未完成音节的声母）不是完成音节，不计入——它由 step4 前缀补全承接。
-            Some(r.syllables.iter().map(|s| s.pinyin.clone()).collect())
+            v
         });
         let syllables = if let Some(v) = sp_syllables {
             v
@@ -1332,8 +1353,7 @@ mod tests {
         assert!(boundary_compatible(0b101, 0, 5, 5));
     }
 
-    /// 双拼解释的边界：音节在全拼空间不连续（有「无匹配键对回写」段）时须整体弃用，
-    /// 否则会漏标该段起始位而误杀候选。
+    /// 双拼分段边界：音节、尾部 partial、**以及无匹配键对回写段**，各开一个段起点。
     #[test]
     fn sp_boundary_mask_rules() {
         use crate::pinyin::shuangpin::{ConvertedSyllable, SpConvertResult};
@@ -1345,14 +1365,17 @@ mod tests {
             fp_end: fe,
         };
         // ni|ha + partial o → full "nihao"，边界 {0,2,4}
+        // 注：has_partial 与 partial_initial 须同设——真实 convert 二者恒同时写入，
+        // 只设其一是不可能出现的状态（fixture 造假会测出假结论）。
         let sp = SpConvertResult {
             syllables: vec![syl("ni", 0, 2), syl("ha", 2, 4)],
             has_partial: true,
+            partial_initial: Some("o".into()),
             full_pinyin: "nihao".into(),
             ..Default::default()
         };
         assert_eq!(sp_boundary_mask(&sp), 0b10101);
-        // ni|hao 无 partial → {0,2}
+        // ni|hao 恰好覆盖，无尾部 → {0,2}
         let sp2 = SpConvertResult {
             syllables: vec![syl("ni", 0, 2), syl("hao", 2, 5)],
             has_partial: false,
@@ -1360,13 +1383,44 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(sp_boundary_mask(&sp2), 0b101);
-        // 不连续（fp 空隙 = 无匹配回写段）→ 0，不参与校验
+        // 回写段夹在音节**中间**（omni 的 om 占 0..2）：其起点同样是段边界 → {0,2}
         let sp3 = SpConvertResult {
             syllables: vec![syl("ni", 2, 4)],
             full_pinyin: "omni".into(),
             ..Default::default()
         };
-        assert_eq!(sp_boundary_mask(&sp3), 0, "有回写段时边界不完整，须弃用");
+        assert_eq!(
+            sp_boundary_mask(&sp3),
+            0b101,
+            "回写段在中间时其起点也是边界"
+        );
+        // 回写段在**尾部**（nihaoya 的 oy+a 占 4..7）→ {0,2,4}。
+        // 位 4 的存在正是关键：它让词典的 ni|hao|ya({0,2,5}) 失配。曾在此弃用为 0
+        // （以为回写段"无从表达"），校验被整个关掉，「你好呀」就从 step4 前缀补全漏网。
+        let sp4 = SpConvertResult {
+            syllables: vec![syl("ni", 0, 2), syl("ha", 2, 4)],
+            has_partial: true,
+            partial_initial: Some("a".into()),
+            full_pinyin: "nihaoya".into(),
+            ..Default::default()
+        };
+        assert_eq!(
+            sp_boundary_mask(&sp4),
+            0b10101,
+            "尾部回写段须标起点，否则校验失效"
+        );
+        assert!(
+            !boundary_compatible(0b100101, 0b10101, 7, 7),
+            "词典 ni|hao|ya 应与双拼 ni|ha|oy… 失配"
+        );
+        // 全是回写段（如 oy）→ 仅首段起点 {0}
+        let sp5 = SpConvertResult {
+            full_pinyin: "oy".into(),
+            ..Default::default()
+        };
+        assert_eq!(sp_boundary_mask(&sp5), 0b1);
+        // 空输入 → 无信息
+        assert_eq!(sp_boundary_mask(&SpConvertResult::default()), 0);
     }
 
     /// 回归：无匹配键对（convert 的「原样回写」分支）既不进 syllables 也不置 has_partial，
@@ -1520,6 +1574,86 @@ mod tests {
             "2 键 hc 解释为 hao，应出「好」，实际: {:?}",
             r2.candidates.iter().map(|c| &c.text).collect::<Vec<_>>()
         );
+    }
+
+    /// 含「无匹配键对」时**仍按双拼语义**：取从 0 起连续的音节前缀，断裂处之后不解释。
+    ///
+    /// `oy`（o 非声母，拼不出音节）属 convert 注释里的「无效键对」——用户打错了，
+    /// 它及其后的内容不该产生候选。曾误把这里当成「整串降级回全拼 DAG」，于是 `nihaoya`
+    /// 出了「你好呀」——那与 `nihao`(5键) 不出「你好」自相矛盾：同是双拼下打全拼串，
+    /// 一个拒一个收，反倒是**打错一个键对就解锁了全拼**。
+    ///
+    /// 注释里的「简拼」指的是另一半：`nh` 这种 per-串简拼由 AbbrevMatcher 兜底（走 query，
+    /// 不依赖 syllables），无需退回 DAG 也照常工作——见 shuangpin_abbrev_still_works。
+    #[test]
+    fn shuangpin_keeps_own_semantics_with_unmatched_pair() {
+        use crate::pinyin::shuangpin::{Layout, ShuangpinConverter};
+        use std::io::Write;
+        let path = std::env::temp_dir().join("wind_sp_writeback_strict.dict.yaml");
+        {
+            let mut f = std::fs::File::create(&path).unwrap();
+            writeln!(f, "---\nname: py\n...").unwrap();
+            writeln!(f, "你好呀\tni hao ya\t2000").unwrap();
+            writeln!(f, "你好\tni hao\t1500").unwrap();
+            writeln!(f, "你\tni\t900").unwrap();
+            writeln!(f, "哈\tha\t500").unwrap();
+        }
+        let dict = CachedDict::Memory(CodetableDict::load(&path).unwrap());
+        let _ = std::fs::remove_file(&path);
+
+        let schema_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../../data/schemas/shuangpin");
+        let layout = Layout::from_toml(&schema_dir.join("xiaohe.toml")).expect("加载小鹤布局失败");
+        let conv = ShuangpinConverter::new(layout);
+
+        // 前提：nihaoya 在小鹤下确有「无匹配键对」（oy）——即音节未覆盖到 full 末尾、
+        // 且缺口大于 partial 声母。否则本测试没意义。
+        let sp = conv.convert("nihaoya");
+        let covered: usize = sp.syllables.last().map_or(0, |s| s.fp_end);
+        let partial_len = sp.partial_initial.as_ref().map_or(0, |s| s.len());
+        assert!(
+            sp.full_pinyin.len() - covered > partial_len,
+            "前提失效：nihaoya 应含无匹配回写段，实际 syllables={:?} full={:?}",
+            sp.syllables.iter().map(|s| &s.pinyin).collect::<Vec<_>>(),
+            sp.full_pinyin
+        );
+
+        let eng = PinyinEngine::new(Config::default(), dict).with_shuangpin(conv);
+        let r = eng.convert("nihaoya", 20).unwrap();
+        let texts: Vec<&String> = r.candidates.iter().map(|c| &c.text).collect();
+        // 断裂前的 ni|ha 照常出候选。
+        assert!(
+            texts.contains(&&"你".to_string()),
+            "连续前缀 ni 应出「你」，实际: {texts:?}"
+        );
+        // 不得把整串当全拼——那会与「nihao 不出你好」自相矛盾。
+        assert!(
+            !texts.contains(&&"你好呀".to_string()) && !texts.contains(&&"你好".to_string()),
+            "oy 是无效键对，不该整串降级成全拼解释，实际: {texts:?}"
+        );
+    }
+
+    /// 无匹配键对**原样回写**进 full_pinyin（不产 ConvertedSyllable），输入不被吞——
+    /// 这是简拼兜底的前提：AbbrevMatcher 走 `query`（即 full_pinyin），**不看音节切分**，
+    /// 故双拼真值切分不影响它。
+    ///
+    /// 这也是「含回写段须退回 DAG」的反证：保住简拼根本不需要退回 DAG。
+    /// （简拼表只存在于 wdat AbbrevSection，端到端查询由 wind-dict 侧覆盖。）
+    #[test]
+    fn shuangpin_writeback_keeps_input_intact() {
+        use crate::pinyin::shuangpin::{Layout, ShuangpinConverter};
+        let schema_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../../data/schemas/shuangpin");
+        let layout = Layout::from_toml(&schema_dir.join("xiaohe.toml")).expect("加载小鹤布局失败");
+        let conv = ShuangpinConverter::new(layout);
+        // oy：o 非声母，拼不出合法音节 → 整对原样回写。
+        let sp = conv.convert("oy");
+        assert!(
+            sp.syllables.is_empty(),
+            "oy 拼不出音节，不该产出 ConvertedSyllable，实际 {:?}",
+            sp.syllables.iter().map(|s| &s.pinyin).collect::<Vec<_>>()
+        );
+        assert_eq!(sp.full_pinyin, "oy", "无匹配键对须原样回写，输入不得被吞");
     }
 
     /// Fix A TDD：双拼 preedit 应显示用户实际输入的原始按键（按音节边界以 `'` 分隔，

@@ -51,6 +51,21 @@ fn candidate_display_order(
         .then(a.natural_order.cmp(&b.natural_order))
 }
 
+/// 自动上屏最短码长的归一（纯函数）：配置 0 = 跟随全码长。
+///
+/// 复刻引擎侧 `CodeTableEngine::new` 的同名归一——那份藏在引擎构造函数里、只作用于其私有
+/// `opts`，协调器取不到，故短语侧须在此重算。两处语义必须一致。
+///
+/// `max_code_length` 为 0（拼音等无「全码」概念的引擎，见 `Engine::max_code_length` 默认实现）
+/// 时结果为 0 → 调用方的 `len < 0` 恒假 → 不设闸，与引擎侧同构降级。
+fn resolve_auto_commit_min_len(configured: usize, max_code_length: usize) -> usize {
+    if configured > 0 {
+        configured
+    } else {
+        max_code_length
+    }
+}
+
 impl Coordinator {
     /// 记录一次选词到 redb FREQ（词频维度：count+1、last_used=now，按 schema+code+text）。
     /// 词频是与权重解耦的独立维度（frequency.md），仅记真实使用数据；redb 事务即时持久。
@@ -386,16 +401,29 @@ impl Coordinator {
             // 例外——镜像码表引擎 `single_code_complete`：当前无任何候选（码表 + 精确短语均空）且未满码时，
             // 放行一次前缀枚举作补全，避免精确模式下彻底无候选（对齐引擎"精确空码取更长首选"语义）。
             let ct = self.engine_mgr.codetable_settings();
-            let allow_prefix = !(self.engine_mgr.is_codetable() && ct.single_code_input)
-                || (ct.single_code_complete
-                    && candidates.is_empty()
-                    && state.input_buffer.chars().count()
-                        < self.engine_mgr.active_max_code_length());
-            let prefix_hits = if allow_prefix {
+            let exact_only = self.engine_mgr.is_codetable() && ct.single_code_input;
+            // 空码补全兜底：仅在精确模式抑制了前缀枚举时才可能触发。
+            let complete_fallback = exact_only
+                && ct.single_code_complete
+                && candidates.is_empty()
+                && state.input_buffer.chars().count() < self.engine_mgr.active_max_code_length();
+            let mut prefix_hits = if !exact_only || complete_fallback {
                 phrases.lookup_prefix(&state.input_buffer, &recent, min_prefix)
             } else {
                 Vec::new()
             };
+            if complete_fallback {
+                // 补全**仅取首选一条**：引擎侧同分支只 push 一条（search_prefix().find()，
+                // 见 codetable/engine.rs "空码补全：从更长编码取首个候选作提示"）。短语侧原样
+                // 放行整串前缀命中，致精确模式下空码补全冒出多条「后续」，与码表规格分叉。
+                //
+                // 须先定序再取：lookup_prefix 由 HashMap 遍历产出、顺序不定（见 wind-phrase
+                // lookup_prefix_at），直接 take(1) 取到的是随机一条而非首选。权重降序 + 文本
+                // 兜底保证稳定；协调器后续的整体排序不改变「只有一条」这个事实。
+                prefix_hits
+                    .sort_by(|a, b| b.weight.cmp(&a.weight).then_with(|| a.text.cmp(&b.text)));
+                prefix_hits.truncate(1);
+            }
             for hit in prefix_hits {
                 // 完整原文（仅一行化，不截断）：上屏用原始文本，截断加省略号由 UI 下发层负责。
                 let text = Self::clamp_candidate_display(&hit.text, 0);
@@ -522,9 +550,16 @@ impl Coordinator {
     /// - 含副作用命令 → [`InputOutcome::AutoCommand`]：清组合并异步执行（与空格选中命令同语义）；
     /// - `$SS`·`$AA` 组 / 前缀枚举短语 → 排除（不自动上屏，避免误展开/打断输入）。
     ///
-    /// 门槛为「唯一 + 无更长后继（含短语）」，不设最短码长——短码短语仅在无任何更长续接时才上屏。
+    /// 门槛为「最短码长 + 唯一 + 无更长后继（含短语）」四闸串联，与引擎 `decide_auto_commit`
+    /// 同构——两道缺一不可：`min_len` 管「够不够满码」，`has_longer_code` 管「还能不能接着打」。
     pub(crate) fn phrase_auto_commit(&self, state: &State) -> Option<InputOutcome> {
-        if !self.engine_mgr.codetable_settings().auto_commit_at_full {
+        let ct = self.engine_mgr.codetable_settings();
+        if !ct.auto_commit_at_full {
+            return None;
+        }
+        // 最短码长闸：与引擎 decide_auto_commit 的 `input.chars().count() < min_len` 同构。
+        // 短语此前不设此闸，致 3 码短语（如 ocd）在 4 码方案里绕过「满码」语义直接上屏/执行。
+        if state.input_buffer.chars().count() < self.phrase_auto_commit_min_len(&ct) {
             return None;
         }
         // 唯一候选。
@@ -556,6 +591,21 @@ impl Coordinator {
             return None;
         }
         Some(InputOutcome::AutoCommit(c.text.clone()))
+    }
+
+    /// 短语自动上屏的最短码长门槛。
+    ///
+    /// **当前跟随主码表**的 `schema.codetable.auto_commit_min_len`：短语虽是独立体系，但
+    /// 「满码自动上屏」的规格应与主码表一致，否则同一个 `auto_commit_at_full` 开关下短语与
+    /// 码表行为分叉（原 bug：3 码短语在 4 码方案里直接上屏）。
+    ///
+    /// 预留：日后若要给短语独立门槛（如 `schema.phrase.auto_commit_min_len`），只需改本方法
+    /// 的取值来源，`phrase_auto_commit` 的判据结构无需改动。
+    fn phrase_auto_commit_min_len(&self, ct: &wind_config::CodetableGlobal) -> usize {
+        resolve_auto_commit_min_len(
+            ct.auto_commit_min_len,
+            self.engine_mgr.active_max_code_length(),
+        )
     }
 
     /// `$CC` 命令候选的自动上屏结局分流（短语命令 / 词库命令词条共用）：
@@ -1768,21 +1818,31 @@ impl Coordinator {
     }
 
     /// 点击选词：提交页内第 N 个候选，经 push 管道异步上屏（对齐 Go PushCommitText）。
+    ///
+    /// 主输入路（`active == None`）复用键盘选词的 [`Self::commit_selected`]，其返回的 KeyAction
+    /// 经 [`Self::push_mouse_action`] 翻译成 push 消息——分步提交（候选只消费缓冲前缀，如
+    /// 「nihao」选「你」）由此与数字键完全一致：组合区留活、剩余码续查候选。此前鼠标独走
+    /// `commit_candidate`（无条件清空缓冲），故点选分段候选会丢弃剩余编码、丢失已确认前缀段，
+    /// 并把词频错记到整串码上。
+    ///
+    /// overlay 模式（临拼/特殊/临英/混输，`active != None`）在键盘侧由各自的专用处理器接管、
+    /// 不经 `commit_selected`（见 coordinator 内 `state.active` 的单点分派），故仍走原
+    /// 「整串提交 + 彻底复位」路径，不向其引入未定义的分段语义。
     pub(crate) fn mouse_select(&self, page_local: usize) {
+        let _ = self.mouse_select_action(page_local);
+    }
+
+    /// [`Self::mouse_select`] 的实现，返回主输入路实际推送的 KeyAction 供测试断言
+    /// （overlay / `$CC` 命令 / 越界等不经 push 的路径返回 None）。
+    fn mouse_select_action(&self, page_local: usize) -> Option<KeyAction> {
         let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
         if state.candidates.is_empty() {
-            return;
+            return None;
         }
         let (start, end) = self.page_range(&state);
         let idx = start + page_local;
         if idx >= end || idx >= state.candidates.len() {
-            return;
-        }
-        // 前缀导航候选：补全输入到完整码并重查展开（二级选择，鼠标点击同键盘选中）。
-        if state.candidates[idx].is_group {
-            let code = state.candidates[idx].group_code.clone();
-            self.complete_to_group_code(&mut state, &code);
-            return;
+            return None;
         }
         // $CC 命令候选：执行动作而非上屏 display 标签（释放锁后异步执行，避免重入死锁）。
         if state.candidates[idx].is_command {
@@ -1798,7 +1858,25 @@ impl Coordinator {
             drop(state);
             self.notify_ui_hide();
             self.spawn_command(src, input);
-            return;
+            return None;
+        }
+        // 主输入路：与数字键同一条提交路径（is_group 的二级选择亦由其内部处理）。
+        if state.active.is_none() {
+            let cand = state.candidates[idx].clone();
+            let chinese_mode = state.chinese_mode;
+            // 鼠标页内位置 = page_local（候选首选率统计，与数字键的 num-1 同义）。
+            let act = self.commit_selected(&mut state, &cand, page_local as i32);
+            drop(state);
+            // commit_selected 已按分支自行 notify_ui_update / notify_ui_hide，此处不再重复。
+            self.push_mouse_action(&act, chinese_mode);
+            return Some(act);
+        }
+        // ── 以下为 overlay 模式（active != None）路径 ──
+        // 前缀导航候选：补全输入到完整码并重查展开（二级选择，鼠标点击同键盘选中）。
+        if state.candidates[idx].is_group {
+            let code = state.candidates[idx].group_code.clone();
+            self.complete_to_group_code(&mut state, &code);
+            return None;
         }
         let text = state.candidates[idx].text.clone();
         let source = state.candidates[idx].source;
@@ -1816,9 +1894,45 @@ impl Coordinator {
         // 仅推给活动客户端，避免广播导致多个 TSF 端重复上屏
         self.push_server.push_commit_to_active(&encoded);
         debug!(
-            "mouse_select: committed '{}' (page_local={})",
+            "mouse_select: overlay 整串提交 '{}' (page_local={})",
             out, page_local
         );
+        None
+    }
+
+    /// 鼠标点选页内第 N 个候选（测试/诊断用）：返回主输入路实际推送的 KeyAction
+    /// （`UpdateComposition` = 分步提交，组合区留活；`InsertText` = 整串上屏）。
+    pub fn debug_mouse_select(&self, page_local: usize) -> Option<KeyAction> {
+        self.mouse_select_action(page_local)
+    }
+
+    /// 鼠标选词产生的 KeyAction → push 管道消息。
+    ///
+    /// 键盘选词把 KeyAction 交回 TSF 按键管线应答，鼠标点击没有按键上下文（不在 OnKeyDown
+    /// 的应答里），只能自行编码经 push 管道投递。仅覆盖 `commit_selected` 的两种返回：
+    /// - `UpdateComposition`（分步提交 / 二级选择）→ `CMD_UPDATE_COMPOSITION`，组合区留活。
+    ///   C++ 侧 IPCClient 异步 reader 与 TextService 的 `SetUpdateCompositionCallback` 自 Go 版
+    ///   起就在位（注释即写 "mouse click partial confirm"），Rust 侧此前从未发过此包。
+    /// - `InsertText`（整串提交）→ `CMD_COMMIT_TEXT`。
+    ///
+    /// 两者均带副作用，故一律 `push_commit_to_active` 定向投递（非广播），避免多个 TSF 端重复。
+    fn push_mouse_action(&self, act: &KeyAction, chinese_mode: bool) {
+        match act {
+            KeyAction::UpdateComposition { text, caret_pos } => {
+                let encoded = wind_ipc::codec::encode_update_composition(text, *caret_pos);
+                self.push_server.push_commit_to_active(&encoded);
+                debug!("mouse_select: 分步提交，组合区留活 preedit='{}'", text);
+            }
+            KeyAction::InsertText { text, .. } => {
+                let encoded =
+                    wind_ipc::codec::encode_commit_text(text, None, false, chinese_mode, false);
+                self.push_server.push_commit_to_active(&encoded);
+                debug!("mouse_select: committed '{}'", text);
+            }
+            other => {
+                debug!("mouse_select: 无需推送的 KeyAction {:?}", other);
+            }
+        }
     }
 
     pub(crate) fn commit_action(text: String, chinese_mode: bool) -> KeyAction {
@@ -1829,6 +1943,30 @@ impl Coordinator {
             chinese_mode,
             has_new_composition: false,
         }
+    }
+}
+
+#[cfg(test)]
+mod auto_commit_min_len_tests {
+    //! 最短码长归一：须与引擎 `CodeTableEngine::new` 的同名归一保持一致。
+    use super::resolve_auto_commit_min_len;
+
+    #[test]
+    fn zero_follows_max_code_length() {
+        // 0 = 跟随全码长（五笔 4 码）。
+        assert_eq!(resolve_auto_commit_min_len(0, 4), 4);
+    }
+
+    #[test]
+    fn explicit_value_wins_over_max_code_length() {
+        assert_eq!(resolve_auto_commit_min_len(2, 4), 2);
+        assert_eq!(resolve_auto_commit_min_len(6, 4), 6);
+    }
+
+    #[test]
+    fn no_max_code_length_disables_gate() {
+        // 拼音等引擎 max_code_length()=0 → 门槛 0 → 调用方 `len < 0` 恒假 → 不设闸。
+        assert_eq!(resolve_auto_commit_min_len(0, 0), 0);
     }
 }
 

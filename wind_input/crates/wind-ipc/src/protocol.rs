@@ -141,6 +141,10 @@ pub const CONFIG_KEY_ENGLISH_PAIRS: &str = "en_pairs";
 /// 配对跳出键（VK 码集合）同步键名。TSF 端英文模式配对跳出直接消费；
 /// 中文模式仅用于「有待跳出配对时」放行转发（真正裁决在协调器）。
 pub const CONFIG_KEY_JUMP_OUT_KEYS: &str = "jump_out_keys";
+/// 密码框强制英文抑制的策略开关（会话级，右键菜单「高级」可关）同步键名。
+/// TSF 端据此 + 自身持有的 InputScope 掩码在 `OnTestKeyDown` 本地判定是否放行：
+/// 吃键决策发生在 IPC 之前，协调器回 PassThrough 已太晚（形成「吃了再吐」丢键）。
+pub const CONFIG_KEY_PASSWORD_SUPPRESS: &str = "password_suppress";
 
 // 消费确认
 pub const CMD_CONSUMED: u16 = 0x0401;

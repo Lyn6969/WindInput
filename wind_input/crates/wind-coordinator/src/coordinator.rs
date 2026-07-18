@@ -192,6 +192,22 @@ pub(crate) fn numpad_to_main(key_code: u32) -> Option<(u32, bool)> {
     })
 }
 
+/// 全角态下「TSF 已吃下的键」→ 待转换的源字符。
+///
+/// **覆盖面必须 ⊇ C++ 的全角吃键集**（`KeyEventSink.cpp` 的 `english_fullwidth` /
+/// `chinese_fullwidth_number` / `chinese_fullwidth_space` 三个分支：Letter|Number|
+/// Punctuation|Space，含小键盘）。返回 None 会让调用方 PassThrough → 键已被吃下 →
+/// 「吃了再吐」→ 严格 TSF 宿主(Chrome/Electron)直接丢键。C++ 吃键分支增删时须同步此处。
+///
+/// 空格与小键盘都不在 `printable_char` 覆盖内（`punct_char` 无 VK_SPACE），故在此收口，
+/// 供英文全角与 CapsLock+全角两条路径共用，避免两处各记一套而漂移。
+pub(crate) fn full_width_source_char(key_code: u32, shift: bool) -> Option<char> {
+    if key_code == keymap::VK_SPACE {
+        return Some(' ');
+    }
+    printable_char(key_code, shift).or_else(|| numpad_char(key_code))
+}
+
 /// 小键盘键码 → 字符（数字 0-9 / 运算符 * + - / / 小数点 .）。非小键盘键返回 None。
 pub(crate) fn numpad_char(key_code: u32) -> Option<char> {
     match key_code {
@@ -1563,6 +1579,7 @@ impl Coordinator {
                 // 推送英文自动配对配置到 TSF 客户端（client_token=0 = 广播到所有活跃客户端）
                 self.push_english_pair_config(0);
                 self.push_jump_out_keys_config(0); // 配对跳出键同步（英文模式跳出 + 中文转发放行）
+                self.push_password_suppress_config(0); // 密码框抑制策略（DLL 本地吃键门控）
                 #[cfg(windows)]
                 if let Some(mgr) = self.host_render() {
                     mgr.set_whitelist(new_cfg.compat.host_render_processes.clone());
@@ -2678,6 +2695,7 @@ impl Coordinator {
         // 所有 TSF 实例都需要收到此配置才能在英文模式下正确处理标点配对）。
         self.push_english_pair_config(client_token);
         self.push_jump_out_keys_config(client_token); // 配对跳出键（英文模式跳出 + 中文转发放行）
+        self.push_password_suppress_config(client_token); // 密码框抑制策略（DLL 本地吃键门控）
 
         let Some(mgr) = self.host_render() else {
             return;
@@ -2696,6 +2714,26 @@ impl Coordinator {
         let value = wind_ipc::codec::encode_english_pairs_value(enabled, &rt.en_pairs);
         let msg = wind_ipc::codec::encode_sync_config(
             wind_ipc::protocol::CONFIG_KEY_ENGLISH_PAIRS,
+            &value,
+        );
+        if client_token != 0 {
+            self.push_server.push_to_token(client_token, &msg);
+        } else {
+            self.push_server.push_to_active(&msg);
+        }
+    }
+
+    /// 下发密码框抑制策略开关给 DLL。DLL 据此 + 自身持有的 InputScope 掩码在
+    /// `OnTestKeyDown` 本地判定是否放行；判据两侧必须一致（见 `apply_input_diag` 与
+    /// C++ `IsPasswordSuppressActive`），漂移即「吃了再吐」丢键。
+    /// 开关是会话级运行时态（右键菜单「高级」可切），故握手时与每次切换后都要推。
+    pub fn push_password_suppress_config(&self, client_token: u64) {
+        let enabled = self
+            .password_suppress_enabled
+            .load(std::sync::atomic::Ordering::Relaxed);
+        let value = wind_ipc::codec::encode_password_suppress_value(enabled);
+        let msg = wind_ipc::codec::encode_sync_config(
+            wind_ipc::protocol::CONFIG_KEY_PASSWORD_SUPPRESS,
             &value,
         );
         if client_token != 0 {
@@ -3653,13 +3691,28 @@ impl MessageHandler for Coordinator {
             return self.handle_add_word_key(&mut state, data);
         }
 
-        // 英文模式：直接透传
-        // 密码框强制英文抑制：透传（不改 chinese_mode 持久值/图标；设计"图标不变"）
-        if !state.chinese_mode
-            || self
-                .password_suppress
-                .load(std::sync::atomic::Ordering::Relaxed)
+        // 密码框强制英文抑制：透传（不改 chinese_mode 持久值/图标；设计"图标不变"）。
+        // 须先于下方全角分支——密码框里不该出全角字符，一律半角透传。
+        // 注：透传要真生效，C++ 侧必须也没吃这个键，否则「吃了再吐」丢键（见 TSF 待办）。
+        if self
+            .password_suppress
+            .load(std::sync::atomic::Ordering::Relaxed)
         {
+            return KeyAction::PassThrough;
+        }
+
+        // 英文模式
+        if !state.chinese_mode {
+            // 全角：键已被 TSF 的 `english_fullwidth` 分支吃下等 Rust 出字，此处必须转换，
+            // 否则 PassThrough 会形成「吃了再吐」→ 严格 TSF 宿主丢键（见 handle_english_full_width）。
+            // Ctrl/Alt 组合不参与：C++ 的 ClassifyInputKey 对其返回 None，本就不吃。
+            if state.full_width
+                && data.modifiers & (MOD_CTRL | MOD_ALT) == 0
+                && let Some(act) = self.handle_english_full_width(&mut state, data)
+            {
+                return act;
+            }
+            // 半角英文：透传，宿主自然出字（保留 WM_KEYDOWN 原生语义）。
             return KeyAction::PassThrough;
         }
 
@@ -3674,7 +3727,10 @@ impl MessageHandler for Coordinator {
                 // CapsLock 对字母大小写取反：CapsLock ON + no Shift → 大写；Shift → 小写。
                 // printable_char 以 shift=true 产生大写，故字母键时翻转 shift。
                 let effective_shift = if is_letter { !shift } else { shift };
-                if let Some(ch) = printable_char(data.key_code, effective_shift) {
+                // 用 full_width_source_char 而非 printable_char：C++ 在中文全角下也吃
+                // 空格(chinese_fullwidth_space)与小键盘(chinese_fullwidth_number)，
+                // 而这两者都不在 printable_char 覆盖内 → 曾落下方 PassThrough → 丢键。
+                if let Some(ch) = full_width_source_char(data.key_code, effective_shift) {
                     // 经完整标点转换流水线（自定义映射"英全"列 → 全半角），
                     // 而非直接 to_full_width，确保用户自定义映射生效。
                     // 临时置 chinese_punct=false 对应"英全"状态（不走中文标点转换）。
@@ -3911,13 +3967,22 @@ impl MessageHandler for Coordinator {
                 // 数字键 1-9 选当前页第 N 个候选；越界按 input.overflow.number_key 处理
                 // （ignore 吞键 / commit 上屏高亮 / commit_and_input 顶字+数字，对齐 Go）。
                 let num = (data.key_code - 0x31) as usize + 1; // 1..=9
-                // 无候选时保持透传：纯数字键应输出数字（不拦截空缓冲下的数字）。
-                // 对齐 Go：recordCommit(key, 0, -1, SourcePunctuation) 后再 return nil。
                 if state.candidates.is_empty()
                     && state.input_buffer.is_empty()
                     && state.committed_text.is_empty()
                 {
                     let digit = (b'0' + num as u8) as char;
+                    // 全角：C++ 为此专门在无 session 时也吃数字（`chinese_fullwidth_number`
+                    // 分支），故必须出字——透传会「吃了再吐」→ 严格 TSF 宿主丢键、宽松宿主出
+                    // 半角（旧行为：1-9 各应用表现不一，而 `0` 因无此臂落标点流水线反而正常）。
+                    // 走完整流水线而非裸 to_full_width，与 `0`/小键盘/CapsLock 各路径一致。
+                    if state.full_width {
+                        let text = self.convert_punct(&state, digit, data.prev_char);
+                        self.record_commit(&text, 0, -1, CommitSource::Punctuation);
+                        return Self::commit_action(text, true);
+                    }
+                    // 半角无候选：透传，纯数字键由宿主出字（保留原生按键语义）。
+                    // 对齐 Go：recordCommit(key, 0, -1, SourcePunctuation) 后再 return nil。
                     self.record_commit(&digit.to_string(), 0, -1, CommitSource::Punctuation);
                     return KeyAction::PassThrough;
                 }
