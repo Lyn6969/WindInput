@@ -71,7 +71,10 @@ fn is_particle_suffix(c: char) -> bool {
 
 /// 节点对数概率打分（对齐 Go lattice calcLogProb + 惩罚/加成）。
 /// 无 unigram 时回退到归一化词典权重。
-fn score_node(word: &str, weight: i32, unigram: Option<&dyn UnigramLookup>) -> f64 {
+///
+/// 对 crate 内可见：`PinyinEngine::convert` 用它给「覆盖全部输入的词典精确整词」
+/// 算单节点等价分，使其与 Viterbi 整句在同一量纲比较（见 mod.rs step 1.5）。
+pub(crate) fn score_node(word: &str, weight: i32, unigram: Option<&dyn UnigramLookup>) -> f64 {
     const SINGLE_CHAR_PENALTY: f64 = -3.0;
     const FUNCTION_WORD_BONUS: f64 = 2.0; // 虚词加成（Go 原名 functionWordPenalty，值为正）
     const VERB_PARTICLE_PENALTY: f64 = -1.0;
@@ -142,7 +145,16 @@ pub struct LatticeBuilder {
 
 impl LatticeBuilder {
     pub fn new() -> Self {
-        Self { max_word_len: 6 }
+        // 10 而非 6：6 会把「中华人民共和国」(7 音节) 挡在词图外，却放行它的语义碎片
+        // 「中华人民共和」(freq=2，法律条文名切出来的残片)，于是 Viterbi 只能在
+        // 「中华人民共和」+「过」之类的错误切分里挑最优。上限须覆盖常见长专名。
+        Self { max_word_len: 10 }
+    }
+
+    /// 词图能容纳的最长词（音节数）。超过它的词典整词进不了 Viterbi，
+    /// 需由 `PinyinEngine::convert` 的 step 1.5 单独兜底。
+    pub fn max_word_len(&self) -> usize {
+        self.max_word_len
     }
 
     /// 构建格子

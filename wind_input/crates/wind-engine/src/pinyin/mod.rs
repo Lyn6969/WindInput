@@ -677,6 +677,36 @@ impl Engine for PinyinEngine {
             );
         }
 
+        // 1.5 超长词典整词兜底：与整句同量纲化
+        //
+        // 整句权重 = SENTENCE_WEIGHT_BASE(30M) + 各节点 log_prob 之和；而词典精确命中只带
+        // 原始词频（「中华人民共和国」= 3113）。二者量纲不同却在同一个 weight 维度上比较
+        // （排序键三个布尔位此时全部打平），词典整词必然输给整句——哪怕整句是由语义碎片
+        // 拼出的错误切分。这里按 lattice 的同一个 score_node 公式给它算「单节点等价整句分」，
+        // 使二者公平比较：合理的整句照样赢（冷僻精确词自身 log_prob 很低），词典里确实存在
+        // 的长词不再被结构性埋没。
+        //
+        // 仅限音节数超过词图上限的词。上限内的词 Viterbi 已能作为单节点自行选中（这正是
+        // max_word_len 6→10 修好「中华人民共和国」的原因），无需在此干预；若不加这道限制，
+        // 所有精确整词（gonghe 的恭贺/共贺等）都会被推过 PINYIN_SENTENCE_FLOOR(20M)，
+        // 落进 freq_rerank 的整句锚定区而永久失去词频学习能力。
+        //
+        // 只在无残码时生效（query == completed）：有残码时精确命中只覆盖完成音节前缀，
+        // 本就不该与覆盖全输入的整句同级竞争。
+        // 放在 step 2 之前：整句尚未插入，无需排除整句自身；同文时 step 2 的
+        // `existing.weight.max(weight)` 会自然取二者较高者。
+        if query.len() == completed.len() && syllables.len() > self.lattice_builder.max_word_len() {
+            for c in candidates.iter_mut() {
+                if c.is_fuzzy || c.is_prefix || c.code != completed {
+                    continue;
+                }
+                let log_prob = lattice::score_node(&c.text, c.weight, self.unigram.as_deref());
+                let log_offset =
+                    (log_prob * 1000.0).clamp(-(SENTENCE_WEIGHT_BASE as f64), 0.0) as i32;
+                c.weight = c.weight.max(SENTENCE_WEIGHT_BASE.saturating_add(log_offset));
+            }
+        }
+
         // 2. Viterbi 长句解码（>=2 音节，仅在完成音节前缀上跑；use_smart_compose=false 时跳过）
         if self.config.use_smart_compose && syllables.len() >= 2 {
             let lattice_nodes = self.lattice_builder.build(
