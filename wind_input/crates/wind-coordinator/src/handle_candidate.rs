@@ -31,6 +31,11 @@ use wind_ui::manager::CandidateOp;
 ///   （如 natural 模式下高权重次选库条目仍会靠 weight 反超低权重主库条目）。此时短语仍靠其
 ///   base_order/natural_order 默认 0 浮于顶部。
 ///
+/// - `consumed_length` 末级降序：对齐 `candidate::better`(candidate.rs) 的同名末级。紧随其后的
+///   去重（按 `text` 保留排序后第一条）用的就是本函数的结果——若同文候选的消费长度不同而此级
+///   缺失，留谁将由一个不含该字段的键随机决定，留下「消费整串」那条会让分段上屏把剩余拼音
+///   一并吃掉。该级在 `better` 里早已存在，此前漏抄到本函数。
+///
 /// 排序规则：Exact >> Sub-phrase >> Prefix >> Fuzzy。
 fn candidate_display_order(
     a: &Candidate,
@@ -46,6 +51,7 @@ fn candidate_display_order(
         .then(by_weight)
         .then(a.base_order.cmp(&b.base_order))
         .then(a.natural_order.cmp(&b.natural_order))
+        .then(a.consumed_length.cmp(&b.consumed_length).reverse())
 }
 
 /// 自动上屏最短码长的归一（纯函数）：配置 0 = 跟随全码长。
