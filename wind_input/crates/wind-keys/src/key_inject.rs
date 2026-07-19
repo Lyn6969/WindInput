@@ -169,6 +169,12 @@ fn tap_combo(mods: &[u32], vk: u32) -> anyhow::Result<()> {
 /// `parse_combo` 产出的是 Win32 VK，而 macOS CGEvent 用 ANSI 虚拟键位码（与 VK 不同），
 /// 故注入前需经此表换算。覆盖 `parse_key` 能产出的全部键（修饰键 / 功能键 / F1-F12 /
 /// 字母 / 数字）；未覆盖的 VK（如 OEM 符号键 0xBA..）返回 `None`，由调用方降级处理（不 panic）。
+///
+/// 生产调用点只在 `cfg(target_os = "macos")` 的 `tap_combo` / `send_key_events` 里，但本表是
+/// 纯查表逻辑、跨平台可测，故下方测试不加平台门控（Windows 上照跑）。不能给函数本体加
+/// `cfg(target_os = "macos")`——那会让 Windows 构建下的测试引用不到它、丢掉这份覆盖；
+/// 改用条件 `allow`，只在非 macOS 平台关掉必然触发的 dead_code。
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 pub(crate) fn vk_to_cgkeycode(vk: u32) -> Option<u16> {
     let code: u16 = match vk {
         // 修饰键

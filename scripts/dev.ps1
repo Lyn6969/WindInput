@@ -139,7 +139,12 @@ function Build-TsfAll ([string]$profile = "release", [string]$outdir = $null) {
             "-DAPP_VERSION_MAJOR=$vMaj" "-DAPP_VERSION_MINOR=$vMin" "-DAPP_VERSION_PATCH=$vPat" `
             | Out-Null
         if ($LASTEXITCODE -ne 0) { ErrMsg "TSF $($a.A) CMake 配置失败!"; return $false }
-        cmake --build $bin --config Release | Out-Null
+        # MSBuild 的编译警告走 stdout, 整条 | Out-Null 会连警告一起吞掉 (C++ 侧等于零编译期
+        # 信号)。故只丢进度噪音, 保留 warning/error 行原样打出。Select-String 不改 $LASTEXITCODE
+        # (它由最后一个原生命令 cmake 设定), 下面的失败判定照常成立。
+        cmake --build $bin --config Release |
+            Select-String -Pattern 'warning|error|警告|错误' |
+            ForEach-Object { Warn "  $($_.Line.Trim())" }
         if ($LASTEXITCODE -ne 0) { ErrMsg "TSF $($a.A) 构建失败!"; return $false }
         # CMakeLists 输出到 $outdir\wind_tsf$suffix.dll; x86 需改名加 _x86
         $produced = "$outdir\wind_tsf$suffix.dll"

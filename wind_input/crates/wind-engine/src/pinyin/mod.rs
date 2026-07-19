@@ -453,7 +453,7 @@ fn syllables_boundary_mask(syllables: &[String], limit_len: usize) -> u64 {
 fn sp_boundary_mask(sp: &shuangpin::SpConvertResult) -> u64 {
     let mut mask = 0u64;
     let mut cursor = 0usize;
-    let mut mark = |pos: usize, mask: &mut u64| -> bool {
+    let mark = |pos: usize, mask: &mut u64| -> bool {
         if pos >= 64 {
             return false;
         }

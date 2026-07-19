@@ -1308,18 +1308,6 @@ impl Coordinator {
         self.push_input_diag_hud_if_visible();
     }
 
-    /// 密码框抑制策略是否开启（Task 6/7 设置面板读取）。
-    pub(crate) fn password_suppress_enabled(&self) -> bool {
-        self.password_suppress_enabled
-            .load(std::sync::atomic::Ordering::Relaxed)
-    }
-
-    /// 输入诊断 HUD 当前是否可见（Task 6/7 设置面板读取）。
-    pub(crate) fn input_diag_hud_visible(&self) -> bool {
-        self.input_diag_hud_visible
-            .load(std::sync::atomic::Ordering::Relaxed)
-    }
-
     /// HUD 推送：`input_diag_hud_visible` 开启时，把 `last_input_diag` 快照经 UI 通道
     /// 下发 `ShowInputDiag`（UI 线程惰性创建 HUD 窗口并显示/更新）。关闭时不推送。
     pub(crate) fn push_input_diag_hud_if_visible(&self) {
