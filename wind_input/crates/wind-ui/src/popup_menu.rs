@@ -461,6 +461,15 @@ impl PopupMenu {
         self.reconcile();
         self.visible = true;
         unsafe {
+            // 捕获前先把光标掰正：SetCapture 期间系统不再发 WM_SETCURSOR，光标会
+            // 冻结在捕获瞬间的形状，下方 wnd_proc 的 WM_SETCURSOR 分支收不到消息。
+            // 任务栏语言栏图标触发时，那一刻的光标归宿主 (explorer) 管——服务重启后
+            // 它正忙着刷图标状态（State push → UpdateFullStatus → GetIcon），光标为
+            // 忙碌态，一旦冻结整个菜单期间都在转圈。工具栏触发无此问题：那一刻的光标
+            // 已被我们自己的 WM_SETCURSOR 设成箭头。
+            if let Ok(c) = LoadCursorW(None, IDC_ARROW) {
+                SetCursor(c);
+            }
             SetCapture(self.windows[0].hwnd());
         }
     }
