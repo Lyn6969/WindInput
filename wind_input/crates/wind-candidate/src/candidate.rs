@@ -159,6 +159,23 @@ impl Default for Candidate {
     }
 }
 
+/// 候选「匹配层级」比较——`Exact >> 子短语 >> 前缀补全 >> 模糊` 的**唯一真相**。
+///
+/// ① 非模糊优先于模糊（输入 si 时精确「四」先于模糊命中「是」）；
+/// ② 精确/子短语（`is_prefix=false`）优先于前缀补全（输入 si 时「四」先于补全「思考」）；
+/// ③ 完整匹配优先于子短语（输入 baoan 时「保安」「报案」先于单字「报」「宝」）。
+///
+/// 该层级此前在三处各写了一遍——引擎内部排序、协调器 `candidate_display_order`、
+/// 词频重排 `rerank_pinyin_decay`——三份必须手工保持同步，漏改任何一处都不会编译报错，
+/// 只会让候选顺序在某条路径上静默发散。三处现统一调用本函数，各自的额外维度
+/// （权重/`base_order`/衰减分/整句锚定）在其前后自行追加。
+pub fn cmp_match_layers(a: &Candidate, b: &Candidate) -> std::cmp::Ordering {
+    a.is_fuzzy
+        .cmp(&b.is_fuzzy)
+        .then(a.is_prefix.cmp(&b.is_prefix))
+        .then(a.is_partial.cmp(&b.is_partial))
+}
+
 /// 比较两个候选词的排序优先级（权重降序）
 ///
 /// 与 Go 版本 `candidate.Better` 对齐。

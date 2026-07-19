@@ -118,34 +118,13 @@ pub fn rerank_pinyin_decay(
         if sa {
             return Ordering::Equal; // 均为整句/短语 → 维持引擎权重序
         }
-        // ①.5 模糊层级：非模糊整体优先于模糊命中。词频(used-first)不得把模糊候选
-        //     提到精确候选之上——与 Go 分层评分一致(Exact 2000 >> Fuzzy 800，用户词加成
-        //     也压不过层级差)。否则用户曾在 si 下误选「是」会让模糊「是」永久压过精确「四」。
-        if a.is_fuzzy != b.is_fuzzy {
-            return if a.is_fuzzy {
-                Ordering::Greater
-            } else {
-                Ordering::Less
-            };
-        }
-        // ①.6 前缀补全层级：精确(code==输入)整体优先于前缀补全。词频不得把前缀补全词
-        //     提到精确候选之上（如输入 si 时，被频繁使用的补全「思考」也不能压过精确「四」）。
-        if a.is_prefix != b.is_prefix {
-            return if a.is_prefix {
-                Ordering::Greater
-            } else {
-                Ordering::Less
-            };
-        }
-        // ①.7 子短语层级：完整匹配整体优先于子短语（部分覆盖输入的前缀词）。词频不得把
-        //     子短语单字提到完整词之上（如 baoan 时，被频繁使用的「报」也不能压过完整词「报案」）。
-        //     与引擎排序的 is_partial 维度一致，对齐 Go coverage 硬分层。
-        if a.is_partial != b.is_partial {
-            return if a.is_partial {
-                Ordering::Greater
-            } else {
-                Ordering::Less
-            };
+        // ①.5 匹配层级（模糊/前缀补全/子短语）：与引擎、协调器共用同一比较函数。
+        //     词频 used-first 不得跨层级提拔——用户曾在 si 下误选模糊「是」，不能让它
+        //     永久压过精确「四」；频繁使用的补全「思考」也不能压过精确「四」；baoan 下
+        //     常用单字「报」不能压过完整词「报案」。对齐 Go 的 Exact/coverage 硬分层。
+        let layers = wind_candidate::cmp_match_layers(a, b);
+        if layers != Ordering::Equal {
+            return layers;
         }
         // ②③ 非整句、同层级：阈值褪色 + 衰减分降序
         let (pa, pb) = (score(a), score(b));

@@ -946,10 +946,7 @@ impl Engine for PinyinEngine {
         }
 
         candidates.sort_by(|a, b| {
-            a.is_fuzzy
-                .cmp(&b.is_fuzzy)
-                .then(a.is_prefix.cmp(&b.is_prefix))
-                .then(a.is_partial.cmp(&b.is_partial))
+            wind_candidate::cmp_match_layers(a, b)
                 .then(b.weight.cmp(&a.weight))
                 .then(a.natural_order.cmp(&b.natural_order))
         });

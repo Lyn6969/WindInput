@@ -42,10 +42,7 @@ fn candidate_display_order(
     } else {
         b.weight.cmp(&a.weight)
     };
-    a.is_fuzzy
-        .cmp(&b.is_fuzzy)
-        .then(a.is_prefix.cmp(&b.is_prefix))
-        .then(a.is_partial.cmp(&b.is_partial))
+    wind_candidate::cmp_match_layers(a, b)
         .then(by_weight)
         .then(a.base_order.cmp(&b.base_order))
         .then(a.natural_order.cmp(&b.natural_order))
