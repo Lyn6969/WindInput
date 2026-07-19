@@ -1310,6 +1310,11 @@ static UINT GetRetryHotkeyMessageId()
 static constexpr UINT_PTR kFocusCheckTimerId = 0x57494E44; // 'WIND'
 static constexpr UINT     kFocusCheckIntervalMs = 500;
 
+// 慢焦点探针阈值：超过此值的 OnSetFocus 记一行 WARN。取 20ms 的依据——实测正常
+// 焦点切换（开 DEBUG 日志、含两次进程信息采集）约 5~13ms，关日志后更低；20ms 既
+// 不会被常规切换触发，又能抓住宿主 churn 焦点导致的堆积。
+static constexpr double kSlowFocusWarnMs = 20.0;
+
 // Win32 RegisterHotKey 热键 ID（前置声明给 OnKillThreadFocus 使用）
 // 窗口类名按 Debug / Release 区分（class name 是 per-process 不会跨进程冲突，但
 // 命名约定与 pipe / CLSID 等其他跨进程资源保持一致，便于 Spy++ 等工具区分两版本）。
@@ -1953,6 +1958,17 @@ STDAPI CTextService::OnSetFocus(ITfDocumentMgr* pDocMgrFocus, ITfDocumentMgr* pD
 {
     WIND_LOG_DEBUG_FMT(L"OnSetFocus called focus=0x%p prev=0x%p", pDocMgrFocus, pDocMgrPrevFocus);
 
+    // 慢焦点探针：本函数在宿主 UI 线程上同步做 COM 查询（GetStatus / InputScope 的
+    // TF_ES_SYNC 编辑会话 / GetCaretPosition）外加一次阻塞 IPC 往返——SendFocusGained
+    // 内部是 send + ReceiveResponse，读超时 1500ms（见 IPCClient.cpp 与 IPCConfig）。
+    // 焦点切换罕见时这个取舍是划算的（换来首键模式必然就绪），但宿主若高频 churn 焦点，
+    // 每次都占住 UI 线程，WM_MOUSEMOVE 排其后 → 表现为鼠标光标卡顿。
+    // 记 WARN 而非 DEBUG 的用意：WARN 恒进环形缓冲（见 WindLog::Output 的 ringWorthy），
+    // 用户无需开启文件日志即可用 Ctrl+Shift+F11 导出证据——开 DEBUG 本身会加重卡顿，
+    // 让被测对象因观测而改变。
+    const LONGLONG focusProbeT0 = WindLog::PerfNow();
+    double focusIpcMs = 0.0;
+
     _hasFocus = (pDocMgrFocus != nullptr);
 
     // If gaining focus (pDocMgrFocus is not null)
@@ -1971,10 +1987,9 @@ STDAPI CTextService::OnSetFocus(ITfDocumentMgr* pDocMgrFocus, ITfDocumentMgr* pD
             pContext->Release();
         }
 
-        WindHostProcessInfo currentHost;
-        if (WindQueryCurrentProcessInfo(&currentHost))
-            WindLogHostProcessInfo(4, L"compat.focus.current_host", currentHost);
-
+        // 这两行都在焦点热路径上：采集一次进程信息要 OpenProcess + 令牌查询 +
+        // 映像路径 + GetWindowTextW。必须走带级别闸门的封装，不能裸调采集函数。
+        WindLogCurrentProcessInfo(4, L"compat.focus.current_host");
         WindLogForegroundProcessInfo(4, L"compat.focus.foreground_host");
 
         // Force refresh the language bar button to ensure it's visible
@@ -2059,20 +2074,36 @@ STDAPI CTextService::OnSetFocus(ITfDocumentMgr* pDocMgrFocus, ITfDocumentMgr* pD
                 _focusSessionId);
             if (_pIPCClient != nullptr && _pIPCClient->IsConnected())
             {
+                // 同样计入 focusIpcMs：无可编辑上下文的宿主（CAD 绘图区、浏览器非输入区）
+                // 走的是本分支而非 focus_gained，不计就会在最该测的场景里恒报 0。
+                // SendFocusLost 是 async 写（无响应等待），但写超时仍有 300ms。
+                const LONGLONG lostT0 = WindLog::PerfNow();
                 _pIPCClient->SendFocusLost();
+                focusIpcMs += WindLog::PerfMsSince(lostT0);
             }
             _needsFocusRecovery = FALSE;
         }
-        // 异步化：SendFocusGained 是 fire-and-forget。Go 端立即回 Ack 解除本调用阻塞,
-        // HandleFocusGained 完成后通过 push pipe 推 CMD_ACTIVATION_STATUS_PUSH,
+        // ⚠ SendFocusGained 是**同步**的（send + ReceiveResponse，读超时 1500ms），
+        // 不是 fire-and-forget——此处旧注释曾如此描述，与实现不符，已更正。
+        // 同步是有意为之：Go 在响应里回传权威模式，使首个 OnTestKeyDown 之前模式必然
+        // 就绪，根治「切过来首键上屏英文」（见 IPCClient::SendFocusGained 注释）。
+        // 代价是每次焦点切换都在宿主 UI 线程上做一次 IPC 往返；重型 HandleFocusGained
+        // 仍由 Go 在写响应之后异步执行，再经 push pipe 推 CMD_ACTIVATION_STATUS_PUSH,
         // AsyncReader → WM_ACTIVATION_STATUS → ApplyActivationStatusResponse 完成同步。
         // Lazy connect: 服务在 TSF 加载之后才启动也能覆盖（SendFocusGained 内部已处理）。
         else if (_pIPCClient != nullptr)
         {
             uint8_t inputReason = ComputeInputReason(_focusIsPassword, inputScopeMask);
-            if (_pIPCClient->SendFocusGained(caretX, caretY, caretHeight, inputScopeMask, _focusIsPassword, inputReason))
+            // 单独计时这一段：它是本函数里唯一会阻塞在别的进程上的调用，
+            // 需要能和 COM/日志开销分开归因。
+            const LONGLONG focusIpcT0 = WindLog::PerfNow();
+            const BOOL focusSent = _pIPCClient->SendFocusGained(
+                caretX, caretY, caretHeight, inputScopeMask, _focusIsPassword, inputReason);
+            focusIpcMs += WindLog::PerfMsSince(focusIpcT0);
+            if (focusSent)
             {
-                WIND_LOG_DEBUG_FMT(L"FocusGained sent (async) focusSession=%llu", _focusSessionId);
+                WIND_LOG_DEBUG_FMT(L"FocusGained sent (sync) focusSession=%llu ipc=%.1fms",
+                                   _focusSessionId, focusIpcMs);
                 _needsFocusRecovery = FALSE;
                 _pIPCClient->ClearNeedsSyncFlag();
             }
@@ -2102,7 +2133,9 @@ STDAPI CTextService::OnSetFocus(ITfDocumentMgr* pDocMgrFocus, ITfDocumentMgr* pD
         // Send focus_lost to service (async, no response expected)
         if (_pIPCClient != nullptr && _pIPCClient->IsConnected())
         {
+            const LONGLONG lostT0 = WindLog::PerfNow();
             _pIPCClient->SendFocusLost();
+            focusIpcMs += WindLog::PerfMsSince(lostT0);
         }
 
         // Reset composing state
@@ -2129,6 +2162,18 @@ STDAPI CTextService::OnSetFocus(ITfDocumentMgr* pDocMgrFocus, ITfDocumentMgr* pD
 
     // 焦点/文本框上下文变化后重新评估加词热键（gaining/losing 两分支汇合于此）。
     _ReevaluateAddWordHotkey();
+
+    // 慢焦点探针收口（gaining/losing 两分支都经过这里）。见函数开头的说明。
+    const double focusTotalMs = WindLog::PerfMsSince(focusProbeT0);
+    if (focusTotalMs >= kSlowFocusWarnMs)
+    {
+        // hasTextCtx 决定走 focus_gained(同步往返) 还是 focus_lost(异步写)，
+        // 是归因的关键分支位——CAD 绘图区一类宿主预期为 0。
+        WIND_LOG_WARN_FMT(
+            L"perf.focus.slow total=%.1fms ipc=%.1fms focusSession=%llu gaining=%d hasTextCtx=%d",
+            focusTotalMs, focusIpcMs, _focusSessionId,
+            pDocMgrFocus != nullptr ? 1 : 0, _hasTextInputContext ? 1 : 0);
+    }
 
     return S_OK;
 }

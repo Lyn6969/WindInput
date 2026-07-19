@@ -38,6 +38,21 @@ namespace WindLog {
             || CFileLogger::Instance().IsEnabled(fileLevel);
     }
 
+    // 高精度耗时测量。GetTickCount 分辨率约 15.6ms——用它测个位数毫秒的热点，
+    // 得到的只有 0 或 15 两种值（一个节拍量子），无法区分「很快」与「有点慢」。
+    inline LONGLONG PerfNow() {
+        LARGE_INTEGER c;
+        QueryPerformanceCounter(&c);
+        return c.QuadPart;
+    }
+    inline double PerfMsSince(LONGLONG start) {
+        LARGE_INTEGER f;
+        QueryPerformanceFrequency(&f);
+        if (f.QuadPart == 0)
+            return 0.0;
+        return (double)(PerfNow() - start) * 1000.0 / (double)f.QuadPart;
+    }
+
     inline void Output(int level, const wchar_t* msg) {
         auto& logger = CFileLogger::Instance();
         auto fileLevel = _ToFileLevel(level);
@@ -182,6 +197,12 @@ BOOL WindQueryCurrentProcessInfo(WindHostProcessInfo* info);
 BOOL WindQueryWindowProcessInfo(HWND hwnd, WindHostProcessInfo* info);
 void WindLogHostProcessInfo(int level, const wchar_t* prefix, const WindHostProcessInfo& info);
 void WindLogForegroundProcessInfo(int level, const wchar_t* prefix);
+
+// 采集并记录「当前进程」信息。与 WindLogForegroundProcessInfo 同款前置闸门——
+// 采集本身（OpenProcess + 令牌 + 映像路径）远贵于一条日志，级别关闭时一个 syscall 都不该做。
+// 调用点原本是「裸 WindQueryCurrentProcessInfo + WindLogHostProcessInfo」两步，
+// 闸门只挡得住后一步，前一步照跑。用本函数替换那个两步写法。
+void WindLogCurrentProcessInfo(int level, const wchar_t* prefix);
 
 // COM 工具函数
 template<class T>

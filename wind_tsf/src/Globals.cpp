@@ -211,6 +211,22 @@ void WindLogHostProcessInfo(int level, const wchar_t* prefix, const WindHostProc
     );
 }
 
+void WindLogCurrentProcessInfo(int level, const wchar_t* prefix)
+{
+    if (!WindLog::IsEnabled(level))
+        return;
+
+    WindHostProcessInfo info;
+    if (WindQueryCurrentProcessInfo(&info))
+    {
+        WindLogHostProcessInfo(level, prefix, info);
+        return;
+    }
+
+    WindLog::OutputFmt(level, L"%ls query_failed queryError=%lu",
+                       prefix ? prefix : L"current", info.queryError);
+}
+
 void WindLogForegroundProcessInfo(int level, const wchar_t* prefix)
 {
     // 前置闸门：下面的进程信息采集（OpenProcess + 令牌查询 + 映像路径 + GetWindowTextW
