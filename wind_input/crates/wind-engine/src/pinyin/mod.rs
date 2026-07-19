@@ -48,6 +48,24 @@ const SENTENCE_WEIGHT_BASE: i32 = 30_000_000;
 /// 重排冲掉）。仅裸声母（syllables 为空）时应用——完整音节输入的单字已靠 is_prefix 层级就位。
 const BARE_INITIAL_SINGLE_CHAR_BOOST: i32 = 10_000_000;
 
+/// 残码补全的「近距离」上限（音节数）：补全结果比已完成音节多出不超过此数时，
+/// 视为「补完手头正在输入的这个音节（及紧随的一两个）」，置信度天然高，无条件上浮。
+///
+/// 取 2 而非 1 有实测依据：`beijingd`→「北京大学」、`jisuanjik`→「计算机科学」都是 +2，
+/// 若取 1 会直接干掉这类极常见场景。
+const COMPLETION_NEAR_SYLLABLES: u32 = 2;
+
+/// 远距离补全的权重门槛：超出近距离的补全属于「预测用户尚未输入的内容」，
+/// 需足够高频才配上浮，否则沉回前缀补全层级（仍在候选中，只是排到精确匹配之后）。
+///
+/// 门槛落在实测数据的空隙里——合理项最低是「中国人民解放军」w=252（`zhongguorenm`，距离 +4）
+/// 与「你好吗」w=166（距离 +1，本就走近距离豁免）；噪音项（`zhonghuarenmingongheg` 前缀下
+/// 的「中华人民共和国XXX法」条文名）最高 w=60。60~166 之间取 100，双向都有余量。
+///
+/// 注意不能对近距离补全也套这道门槛：词库 weight_spec 的 median 仅 200，
+/// 一半的词低于它，会误沉大量高频使用但低词频的日常词。
+const COMPLETION_FAR_WEIGHT_FLOOR: i32 = 100;
+
 /// 拼音引擎配置
 #[derive(Debug, Clone)]
 pub struct Config {
@@ -818,8 +836,26 @@ impl Engine for PinyinEngine {
         // 同时 code("meiyou") 长于 query("meiy") → is_partial=false（由 push_unique 自动计算），
         // is_partial asc 让他们浮到 is_partial=true 的精确子串（没/每）之前。
         // 无残码时（meiyou）保持 is_prefix=true，前缀补全沉在精确匹配之后（正常行为）。
+        // 残码时的上浮特权不是无条件的：双拼每 2 键 1 音节，奇数键必然有残码，
+        // 若 30 条补全全部上浮，长输入下候选 2~5 位会被该前缀下的冷僻长词占满
+        // （`zhonghuarenmingongheg` → 一串「中华人民共和国XXX法」w≤60），且随每次
+        // 按键在「整句+单字」与「整句+条文名」两种形态间反复跳动。
+        //
+        // 用「补全距离 + 置信度」约束：近距离（补完手头音节）无条件上浮；远距离属于
+        // 预测未输入内容，需 weight 达门槛。距离**不能单独用**——实测 +4 上既有合理的
+        // 「中国人民解放军」(w=252) 也有噪音「…物权法」(w=21)，判别力全在 weight。
+        //
+        // boundary=0（无边界信息的旧词典/用户手输码）→ 距离算作 0 → 放行，
+        // 与本文件其他位置「无边界信息一律降级放行」的处理一致。
         let trailing_partial = completed != query;
+        let completed_syls = syllables.len() as u32;
         for h in dict.search_prefix_with_boundary(query, 30) {
+            let demote_to_prefix_layer = if trailing_partial {
+                let distance = h.boundary.count_ones().saturating_sub(completed_syls);
+                distance > COMPLETION_NEAR_SYLLABLES && h.weight < COMPLETION_FAR_WEIGHT_FLOOR
+            } else {
+                true // 无残码：正常前缀补全，沉在精确匹配之后
+            };
             push_unique(
                 &mut candidates,
                 h.text,
@@ -827,7 +863,7 @@ impl Engine for PinyinEngine {
                 h.weight,
                 h.order,
                 false,
-                !trailing_partial, // 有残码时不标 is_prefix，让候选上浮
+                demote_to_prefix_layer,
                 h.boundary,
             );
         }
