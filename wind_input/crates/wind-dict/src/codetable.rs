@@ -96,11 +96,65 @@ fn trim_line_end(line: &str) -> &str {
     line.trim_end()
 }
 
+/// librime 的注释开关指令：**整行恰好**等于它时，其后所有 `#` 开头的行按**数据**解析。
+/// 这是 Rime 让 `#` 本身能当编码或词条用的唯一途径（`entry_collector.cc`）。
+const NO_COMMENT_DIRECTIVE: &str = "# no comment";
+
+/// 在正文中定位 [`NO_COMMENT_DIRECTIVE`] 所在行的起始字节偏移。
+///
+/// 先用子串搜索快速定位（大词库上这是一次 memmem，代价可忽略），再校验它**独占一行**——
+/// `# no commentX` 或行中间出现的同名子串都不算。
+///
+/// **行尾空白按 [`trim_line_end`] 剥除后再判定**：librime 是先 `trim_right` 整行、
+/// 再与本指令做相等比较，故 `# no comment ` 这类带尾随空格的写法它同样认。
+/// 数据行走的也是同一套行尾规则，一个文件里不该有两种行尾语义。
+///
+/// 之所以要预先求出这个偏移：该指令是**跨行有状态**的，而正文解析会按字节切块并行，
+/// 每块无从知道自己之前有没有出现过它。先在全局求出偏移，各块便可按「本行起始偏移是否
+/// 越过它」独立判定，不必引入跨线程状态。
+fn find_no_comment_directive(body: &str) -> Option<usize> {
+    let mut from = 0usize;
+    while let Some(rel) = body[from..].find(NO_COMMENT_DIRECTIVE) {
+        let start = from + rel;
+        let end = start + NO_COMMENT_DIRECTIVE.len();
+        let at_line_start = start == 0 || body.as_bytes()[start - 1] == b'\n';
+        // 取到本行末尾（下一个 \n 之前），剥掉行尾空白后须一无所剩，才算独占一行。
+        let rest = &body[end..];
+        let tail = rest.split('\n').next().unwrap_or(rest);
+        let at_line_end = trim_line_end(tail).is_empty();
+        if at_line_start && at_line_end {
+            return Some(start);
+        }
+        from = end;
+    }
+    None
+}
+
+/// 按行遍历正文（或其中一块），产出 `(行内容, 本行的 `#` 是否仍作注释)`。
+///
+/// `base` 是本切片在整篇正文中的起始偏移，`cutoff` 是 [`find_no_comment_directive`] 的结果。
+/// 指令行自身仍按注释跳过（`start <= cutoff`），其后各行才转为数据。
+fn body_lines(
+    slice: &str,
+    base: usize,
+    cutoff: Option<usize>,
+) -> impl Iterator<Item = (&str, bool)> {
+    let mut off = base;
+    slice.split_inclusive('\n').map(move |raw| {
+        let start = off;
+        off += raw.len();
+        // 与 str::lines() 同语义：剥掉行尾 \n 及其前的 \r
+        let line = raw.strip_suffix('\n').unwrap_or(raw);
+        let line = line.strip_suffix('\r').unwrap_or(line);
+        (line, cutoff.is_none_or(|c| start <= c))
+    })
+}
+
 /// 单行投票。仅当两列中**恰有一列**像码时才给结论；两列都像（英文词库 `abandon\tabandon`）
 /// 或都不像时弃权——弃权比瞎猜安全，多数票和默认值会兜住。
-fn vote_layout(line: &str) -> Option<ColumnLayout> {
+fn vote_layout(line: &str, comments_on: bool) -> Option<ColumnLayout> {
     let line = trim_line_end(line);
-    if line.is_empty() || line.starts_with('#') {
+    if line.is_empty() || (comments_on && line.starts_with('#')) {
         return None;
     }
     let parts: Vec<&str> = line.split('\t').collect();
@@ -121,10 +175,10 @@ const LAYOUT_SAMPLE_VOTES: usize = 32;
 
 /// 按正文前若干行投票判列序，返回 `(列序, text优先票数, code优先票数)`。
 /// 平票或零票 → [`ColumnLayout::TextFirst`]（默认）。
-fn detect_layout(body: &str) -> (ColumnLayout, usize, usize) {
+fn detect_layout(body: &str, cutoff: Option<usize>) -> (ColumnLayout, usize, usize) {
     let (mut text_first, mut code_first) = (0usize, 0usize);
-    for line in body.lines().take(LAYOUT_SAMPLE_LINES) {
-        match vote_layout(line) {
+    for (line, comments_on) in body_lines(body, 0, cutoff).take(LAYOUT_SAMPLE_LINES) {
+        match vote_layout(line, comments_on) {
             Some(ColumnLayout::TextFirst) => text_first += 1,
             Some(ColumnLayout::CodeFirst) => code_first += 1,
             None => {}
@@ -282,16 +336,16 @@ fn parse_columns_header(header: &str) -> ColumnsDecl {
 }
 
 /// 判定 code 列是否承载音节语义。见 [`ColumnSpec::has_syllables`] 对两条判据的说明。
-fn detect_syllables(body: &str, text_col: usize, code_col: usize) -> bool {
+fn detect_syllables(body: &str, text_col: usize, code_col: usize, cutoff: Option<usize>) -> bool {
     // text 在 code 之前 → 拼音惯例（五笔类惯例是编码在前）。无空格时靠它兜底。
     if text_col < code_col {
         return true;
     }
     // 编码在前，但采样到空格 → 仍是拼音（音节分隔的正面证据胜过列顺序惯例）。
     let need = text_col.max(code_col) + 1;
-    for line in body.lines().take(LAYOUT_SAMPLE_LINES) {
+    for (line, comments_on) in body_lines(body, 0, cutoff).take(LAYOUT_SAMPLE_LINES) {
         let line = trim_line_end(line);
-        if line.is_empty() || line.starts_with('#') {
+        if line.is_empty() || (comments_on && line.starts_with('#')) {
             continue;
         }
         let parts: Vec<&str> = line.split('\t').collect();
@@ -309,11 +363,16 @@ fn detect_syllables(body: &str, text_col: usize, code_col: usize) -> bool {
 /// 也不静默灌进错位数据）。
 ///
 /// 优先级：头部 `columns:` 声明 → 无声明则探测正文列序并 WARN 建议补声明。
-fn resolve_columns(content: &str, body: &str, path: &Path) -> Option<ColumnSpec> {
+fn resolve_columns(
+    content: &str,
+    body: &str,
+    path: &Path,
+    cutoff: Option<usize>,
+) -> Option<ColumnSpec> {
     let header = &content[..content.len() - body.len()];
     match parse_columns_header(header) {
         ColumnsDecl::Usable(mut spec) => {
-            spec.has_syllables = detect_syllables(body, spec.text_col, spec.code_col);
+            spec.has_syllables = detect_syllables(body, spec.text_col, spec.code_col, cutoff);
             Some(spec)
         }
         ColumnsDecl::MissingCode => {
@@ -333,7 +392,7 @@ fn resolve_columns(content: &str, body: &str, path: &Path) -> Option<ColumnSpec>
             None
         }
         ColumnsDecl::Absent => {
-            let (layout, text_first, code_first) = detect_layout(body);
+            let (layout, text_first, code_first) = detect_layout(body, cutoff);
             let (c1, c2) = layout.column_names();
             let basis = if text_first + code_first == 0 {
                 "无一行给出有效判据，直接采用默认列序"
@@ -362,7 +421,7 @@ fn resolve_columns(content: &str, body: &str, path: &Path) -> Option<ColumnSpec>
                 ColumnLayout::TextFirst => (0, 1),
                 ColumnLayout::CodeFirst => (1, 0),
             };
-            let has_syllables = detect_syllables(body, text_col, code_col);
+            let has_syllables = detect_syllables(body, text_col, code_col, cutoff);
             Some(ColumnSpec::from_layout(layout, has_syllables))
         }
     }
@@ -445,9 +504,11 @@ impl CodetableDict {
                 ""
             }
         };
+        // `# no comment` 指令位置：其后各行的 `#` 转为数据。先于列判定求出，供全程共用。
+        let cutoff = find_no_comment_directive(body);
         // 列规格判定一次、全文固定——不再逐行猜（见 [`ColumnLayout`]）。
         // None = 声明残缺，整库跳过（已在 resolve_columns 内 error! 说明原因）。
-        let Some(spec) = resolve_columns(&content, body, path) else {
+        let Some(spec) = resolve_columns(&content, body, path, cutoff) else {
             return Ok(Self {
                 entries: BTreeMap::new(),
                 total_entries: 0,
@@ -455,8 +516,9 @@ impl CodetableDict {
         };
         let mut stats = ParseStats::default();
 
-        for line in body.lines() {
-            let Some(parsed) = parse_rime_line(line, lowercase_code, spec, &mut stats) else {
+        for (line, comments_on) in body_lines(body, 0, cutoff) {
+            let Some(parsed) = parse_rime_line(line, comments_on, lowercase_code, spec, &mut stats)
+            else {
                 continue;
             };
 
@@ -664,6 +726,7 @@ pub(crate) struct RimeLine {
 
 fn parse_rime_line(
     line: &str,
+    comments_on: bool,
     lowercase_code: bool,
     spec: ColumnSpec,
     stats: &mut ParseStats,
@@ -671,7 +734,8 @@ fn parse_rime_line(
     // 只剥行尾：词条内容可能以空白开头（「全角空格」这个词条本身就是 U+3000），
     // 前导 trim 会把它当缩进削掉、导致整行字段左移。见 [`trim_line_end`]。
     let line = trim_line_end(line);
-    if line.is_empty() || line.starts_with('#') {
+    // `comments_on == false` = 本行位于 `# no comment` 之后，`#` 此时是**数据**而非注释。
+    if line.is_empty() || (comments_on && line.starts_with('#')) {
         return None;
     }
     let parts: Vec<&str> = line.split('\t').collect();
@@ -792,19 +856,23 @@ pub fn parse_rime_entries_parallel(
         return Ok((Vec::new(), Vec::new()));
     };
     let body = &content[off..];
+    // `# no comment` 指令位置。**必须在切块前于全局求出**：该指令跨行有状态，
+    // 各块无从知道自己之前有没有出现过它；求出偏移后各块即可独立判定。
+    let cutoff = find_no_comment_directive(body);
     // 列规格判定一次、全文固定，随后传给每个并行块——保证跨块一致（逐行猜时同文件可能分裂）。
     // None = 声明残缺，整库跳过（已在 resolve_columns 内 error! 说明原因）。
-    let Some(spec) = resolve_columns(&content, body, path) else {
+    let Some(spec) = resolve_columns(&content, body, path, cutoff) else {
         return Ok((Vec::new(), Vec::new()));
     };
 
-    // 解析一块 → (全拼, 简拼, 统计)。统计每块独立累加，最后合并——不引入跨线程共享。
-    let parse_chunk = |chunk: &str| -> (RimeEntries, ParseStats) {
+    // 解析一块 → (全拼, 简拼, 统计)。`base` 是本块在正文中的起始偏移，供注释开关定位。
+    // 统计每块独立累加，最后合并——不引入跨线程共享。
+    let parse_chunk = |chunk: &str, base: usize| -> (RimeEntries, ParseStats) {
         let mut fulls = Vec::new();
         let mut abbrevs = Vec::new();
         let mut stats = ParseStats::default();
-        for line in chunk.lines() {
-            if let Some(r) = parse_rime_line(line, lowercase_code, spec, &mut stats) {
+        for (line, comments_on) in body_lines(chunk, base, cutoff) {
+            if let Some(r) = parse_rime_line(line, comments_on, lowercase_code, spec, &mut stats) {
                 if let Some(ab) = r.abbrev {
                     abbrevs.push((ab, r.text.clone(), r.weight));
                 }
@@ -819,7 +887,7 @@ pub fn parse_rime_entries_parallel(
         .unwrap_or(1);
     // 小文件 / 单核：串行，省去切块与起线程开销。
     if threads <= 1 || body.len() < (1 << 20) {
-        let (entries, stats) = parse_chunk(body);
+        let (entries, stats) = parse_chunk(body, 0);
         stats.log_if_dirty(path);
         return Ok(entries);
     }
@@ -842,7 +910,11 @@ pub fn parse_rime_entries_parallel(
     bounds.push(body.len());
     bounds.dedup();
 
-    let chunks: Vec<&str> = bounds.windows(2).map(|w| &body[w[0]..w[1]]).collect();
+    // 连同各块起始偏移一起带上——注释开关要靠它定位本行在整篇正文中的位置。
+    let chunks: Vec<(&str, usize)> = bounds
+        .windows(2)
+        .map(|w| (&body[w[0]..w[1]], w[0]))
+        .collect();
 
     // 复用同一个 parse_chunk——此前这里另抄了一份循环体，而「同一段解析逻辑存在两份拷贝」
     // 正是本模块列序 bug 的成因（两份各自演化，修了一份另一份照旧）。
@@ -850,7 +922,7 @@ pub fn parse_rime_entries_parallel(
     let parts: Vec<(RimeEntries, ParseStats)> = std::thread::scope(|s| {
         let handles: Vec<_> = chunks
             .iter()
-            .map(|chunk| s.spawn(move || parse_chunk(chunk)))
+            .map(|&(chunk, base)| s.spawn(move || parse_chunk(chunk, base)))
             .collect();
         handles.into_iter().map(|h| h.join().unwrap()).collect()
     });
@@ -1260,6 +1332,117 @@ mod tests {
         );
     }
 
+    /// `# no comment` 是**整行精确匹配**：行中间出现、或带后缀的同名子串都不算。
+    #[test]
+    fn no_comment_directive_requires_exact_line() {
+        assert_eq!(find_no_comment_directive("a\n# no comment\nb\n"), Some(2));
+        assert_eq!(find_no_comment_directive("# no comment"), Some(0)); // 无行尾换行
+        assert_eq!(find_no_comment_directive("x\n# no comment\r\ny"), Some(2)); // CRLF
+        assert_eq!(
+            find_no_comment_directive("# no commentX\n"),
+            None,
+            "带后缀不算"
+        );
+        // librime 先 trim_right 整行再比较，故尾随空白仍算指令（与数据行同一套行尾规则）
+        assert_eq!(
+            find_no_comment_directive("# no comment  \n"),
+            Some(0),
+            "尾随空格应算"
+        );
+        assert_eq!(
+            find_no_comment_directive("a\n# no comment\t\r\nb"),
+            Some(2),
+            "尾随制表符应算"
+        );
+        assert_eq!(
+            find_no_comment_directive("a\t# no comment\n"),
+            None,
+            "行中间不算"
+        );
+        assert_eq!(
+            find_no_comment_directive("## no comment\n"),
+            None,
+            "前缀多一个#不算"
+        );
+        assert_eq!(find_no_comment_directive("abc\ndef\n"), None);
+        // 首个合法出现处生效（前面有个不合法的干扰项）
+        assert_eq!(
+            find_no_comment_directive("# no commentX\n# no comment\n"),
+            Some(14)
+        );
+    }
+
+    /// `# no comment` 之后 `#` 是**数据**：这是 Rime 让 `#` 本身能当词条/编码的唯一途径。
+    /// 与用户报的 `@` 打不出来是同一类缺口——只是触发条件不同。
+    #[test]
+    fn hash_becomes_data_after_no_comment_directive() {
+        let path = std::env::temp_dir().join("wind_no_comment.dict.yaml");
+        {
+            let mut f = std::fs::File::create(&path).unwrap();
+            writeln!(f, "---\nname: kf\n...").unwrap();
+            writeln!(f, "# 这行在指令之前，仍是注释").unwrap();
+            writeln!(f, "＃\th").unwrap(); // 全角井号，正常词条
+            writeln!(f, "# no comment").unwrap();
+            writeln!(f, "#\tj").unwrap(); // 指令之后：半角 # 是词条
+            writeln!(f, "##\tk").unwrap(); // 连 ## 也是数据了
+        }
+        let (e, _) = parse_rime_entries_parallel(&path, false).unwrap();
+        let _ = std::fs::remove_file(&path);
+
+        assert_eq!(collect(&e, "＃"), vec![("h".to_string(), 0)]);
+        assert_eq!(
+            collect(&e, "#"),
+            vec![("j".to_string(), 0)],
+            "指令之后半角 # 应作为词条被收下：{e:?}"
+        );
+        assert_eq!(collect(&e, "##"), vec![("k".to_string(), 0)]);
+        // 指令之前的注释行与指令行自身都不该变成条目
+        assert_eq!(e.len(), 3, "只应有 3 条：{e:?}");
+    }
+
+    /// 无指令时，`#` 一律仍是注释（保持既有行为，别把普通词库搞坏）。
+    #[test]
+    fn hash_stays_comment_without_directive() {
+        let path = std::env::temp_dir().join("wind_no_directive.dict.yaml");
+        {
+            let mut f = std::fs::File::create(&path).unwrap();
+            writeln!(f, "---\nname: x\n...").unwrap();
+            writeln!(f, "## 次选").unwrap(); // 第三方编辑器的分组名，仍按注释丢弃
+            writeln!(f, "# 普通注释").unwrap();
+            writeln!(f, "字\tabc\t5").unwrap();
+        }
+        let (e, _) = parse_rime_entries_parallel(&path, false).unwrap();
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(e.len(), 1, "两行注释都应被丢弃：{e:?}");
+        assert_eq!(collect(&e, "字"), vec![("abc".to_string(), 5)]);
+    }
+
+    /// **并行分块边界**：指令在正文靠前，而后续 `#` 词条散落在各块。
+    /// 注释开关是跨行有状态的，若不预先求出全局偏移，后面的块会误判为「注释仍生效」。
+    #[test]
+    fn no_comment_directive_survives_parallel_chunking() {
+        let path = std::env::temp_dir().join("wind_no_comment_parallel.dict.yaml");
+        let n = 60_000; // 正文 > 1MB，触发并行分块
+        {
+            let mut f = std::io::BufWriter::new(std::fs::File::create(&path).unwrap());
+            writeln!(
+                f,
+                "---\nname: big\ncolumns:\n  - text\n  - code\n  - weight\n..."
+            )
+            .unwrap();
+            writeln!(f, "# no comment").unwrap();
+            for i in 0..n {
+                // 每条 text 都以 # 开头：若某块误判注释仍生效，该块条目会整批消失
+                writeln!(f, "#{i}\tc{i}\t{i}").unwrap();
+            }
+        }
+        let (e, _) = parse_rime_entries_parallel(&path, false).unwrap();
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(e.len(), n, "分块后 # 词条不得丢失");
+        assert_eq!(collect(&e, "#0"), vec![("c0".to_string(), 0)]);
+        assert_eq!(collect(&e, "#59999"), vec![("c59999".to_string(), 59999)]);
+    }
+
     /// 缺 `...` 分隔行 → 零条目（此前是全链路最沉默的一处，现已有 warn）。
     #[test]
     fn missing_body_separator_yields_zero_entries() {
@@ -1394,7 +1577,7 @@ mod tests {
     #[test]
     fn detects_code_first_without_declaration() {
         let body = "a\t工\t9999\nggg\t三\t100\ncode1\t文\t5\n";
-        let (layout, tf, cf) = detect_layout(body);
+        let (layout, tf, cf) = detect_layout(body, None);
         assert_eq!(layout, ColumnLayout::CodeFirst, "票数 text={tf} code={cf}");
         assert_eq!((tf, cf), (0, 3));
     }
@@ -1404,7 +1587,7 @@ mod tests {
     #[test]
     fn detects_text_first_without_declaration() {
         let body = "你好\tni hao\t1200\n@\tt\n、\ty\n";
-        let (layout, tf, cf) = detect_layout(body);
+        let (layout, tf, cf) = detect_layout(body, None);
         assert_eq!(layout, ColumnLayout::TextFirst, "票数 text={tf} code={cf}");
         assert_eq!((tf, cf), (3, 0), "`@\\tt` 也应投 TextFirst（@ 不是码形态）");
     }
@@ -1412,11 +1595,15 @@ mod tests {
     /// 两列都像码 / 都不像码 → 弃权，不瞎猜；零票时落到默认 TextFirst。
     #[test]
     fn ambiguous_lines_abstain_and_default_to_text_first() {
-        assert_eq!(vote_layout("abandon\tabandon"), None, "两列都像码 → 弃权");
-        assert_eq!(vote_layout("你好\t、"), None, "两列都不像码 → 弃权");
-        assert_eq!(vote_layout("# 注释\tx"), None);
-        assert_eq!(vote_layout("单列无tab"), None);
-        let (layout, tf, cf) = detect_layout("abandon\tabandon\nABC\tABC\n");
+        assert_eq!(
+            vote_layout("abandon\tabandon", true),
+            None,
+            "两列都像码 → 弃权"
+        );
+        assert_eq!(vote_layout("你好\t、", true), None, "两列都不像码 → 弃权");
+        assert_eq!(vote_layout("# 注释\tx", true), None);
+        assert_eq!(vote_layout("单列无tab", true), None);
+        let (layout, tf, cf) = detect_layout("abandon\tabandon\nABC\tABC\n", None);
         assert_eq!(layout, ColumnLayout::TextFirst, "零票应落默认");
         assert_eq!((tf, cf), (0, 0));
     }

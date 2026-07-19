@@ -73,7 +73,7 @@
 | `stem` 列 | 用于造词/词素反查 | 占位顺延下标，不取用 | 无对应特性，无后果 |
 | weight `%` 后缀 | 按预设词库缩放 | 解析失败 → 0，并计入 `ParseStats.bad_weight` 汇总告警 | 见 §6 R5 |
 | `use_preset_vocabulary` | essay 预设词库 | 未实现 | `%` 无基准可缩放 |
-| `# no comment` | 关闭注释处理 | **未实现**（50 个真实词库零命中） | 见 §6 m1 |
+| `# no comment` | 关闭注释处理 | **已实现**（见 §3.5） | 对齐 |
 | `name`/`version` 校验 | 要求非空 | 不校验 | 我们更宽松，方向无害 |
 | `sort:` 字段 | — | **未消费**（恒 weight↓ + order↑） | 声明 `sort: original` 无效 |
 | `encoder.rules` 自动编码 | 支持 | 未实现 | 见 §6 R1 |
@@ -105,12 +105,12 @@
 列序是文件属性，逐行决策本身就是错的。
 
 ```
-resolve_columns(content, body, path) -> Option<ColumnSpec>
+resolve_columns(content, body, path, cutoff) -> Option<ColumnSpec>
   └─ parse_columns_header(header) -> ColumnsDecl
        ├─ Usable(spec)   声明完整 → 采样正文填 has_syllables
        ├─ MissingCode    声明了但无 code → ERROR + 整库跳过（不降级探测！）
        ├─ MissingText    声明了但无 text → ERROR + 整库跳过（librime 亦丢弃）
-       └─ Absent         无声明 → detect_layout(body) 投票
+       └─ Absent         无声明 → detect_layout(body, cutoff) 投票
             扫正文前 200 行 / 攒够 32 票
             is_code_shape = 小写字母 | 数字 | 空格 | ' | ; | / | -
             两列恰有一列像码 → 投该方向；都像/都不像 → 弃权
@@ -141,9 +141,10 @@ text 可以是任何东西（汉字、`@`、`$CC("[End]", key.seq("End"))`、英
 ### 3.4 行解析要点
 
 ```rust
-parse_rime_line(line, lowercase_code, spec, &mut stats)
+parse_rime_line(line, comments_on, lowercase_code, spec, &mut stats)
   trim_line_end(line)         只剥行尾，前导保留（词条本身可能是 U+3000）
-  空行 / '#' 开头             → 跳过
+  空行                        → 跳过
+  '#' 开头且 comments_on      → 跳过（comments_on=false 时 # 是数据，见 §3.5）
   parts.len() < required_cols → 跳过 + stats.short
       required_cols = max(text_col, code_col) + 1
       ⚠️ 权重不计入——否则两列词库（如 12_kf 全 26 行皆两列）会被整体丢弃
@@ -156,6 +157,22 @@ parse_rime_line(line, lowercase_code, spec, &mut stats)
 
 `ParseStats` 在收尾时**仅在非零时**输出一条汇总 WARN（干净词库不刷屏）；
 并行路径各块独立累加后合并，不引入跨线程共享。
+
+### 3.5 `# no comment` 指令
+
+整行**恰好**等于 `# no comment` 时，其后所有 `#` 开头的行按**数据**解析。
+这是 Rime 让 `#` 本身能当编码或词条用的唯一途径——没有它，一条 `#<TAB>j` 的快符
+会被静默当注释丢掉，与本文档开头那个 `@` 打不出来是同一类缺口。
+
+实现要点：该指令**跨行有状态**，与正文按字节切块并行天然冲突（每块无从知道自己之前
+有没有出现过它）。故先用 `find_no_comment_directive` 在全局求出该行的**起始字节偏移**
+（子串搜索快速定位 + 独占一行校验），再由 `body_lines(slice, base, cutoff)` 逐行产出
+`(行内容, 本行的 # 是否仍作注释)`——各块只需知道自己的 `base`，即可独立判定，
+不引入任何跨线程状态。列序探测、音节采样、正式解析三处共用同一个 cutoff。
+
+> **与 `##` 分组互斥**：启用该指令后，第三方编辑器约定的 `##` 分组名（§1.4）也会变成
+> 数据行；而 `## 次选` 没有 Tab，会落进「列数不足」计数、被 ParseStats 汇总告警报出来。
+> 同一个文件里两者只能二选一。
 
 **音节边界的真值来源是源数据里的空格**（`ni hao`）——词库作者写下的、无需推断的事实。
 丢掉它就只能靠 DAG 反猜切分，而 DAG 只按覆盖字符数最大化，`xian` 是 `xi'an` 还是 `xian`
@@ -336,6 +353,15 @@ librime 完全允许 `columns: [code, text, weight]` 的**拼音**词库，旧�
 ② `cache_fp` 的读写增加 `tag` 参数——`dict_tag(lowercase_code)` 区分英文库的大小写化，
 `COMBINED_CACHE_TAG` / `MERGED_CACHE_TAG` / `UNIGRAM_TAG` 区分缓存种类，
 各自演进互不牵连。
+
+### R8 `##` 分组名仍按注释丢弃（有意为之）
+用户词库里实际有 11 行 `##` 分组名（`## 次选` / `## 符号组` / `## 生僻字` 等，
+分布在 8 个文件），正文里**真正的注释一行都没有**。
+
+但 `##` **不是 Rime 语义**（§1.4），是第三方编辑器 wubi-dict-editor 的约定，
+librime 一视同仁当注释丢弃。要保留它等于**新增我方语义**：把分组名与条目区间解析出来
+供词库管理界面用。它完全不影响候选输出，且界面在独立仓 wind-setting，需两仓协同。
+当前**保持与 librime 一致的丢弃行为**，待真正需要该编辑器功能时再做。
 
 ### R7 其他
 - ~~**`CodetableDict::merge` 零调用点**~~ —— **已删除**。其 `order` 重算用的是每个 code
