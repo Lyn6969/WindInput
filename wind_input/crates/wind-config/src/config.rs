@@ -334,27 +334,44 @@ pub struct PinyinFrequency {
 }
 
 /// 码表自动造词（[schema.codetable.auto_phrase]）。
+///
+/// 语义：连续单字上屏累积成序列，遇终止符（标点/回车/空格/焦点切换/光标移动/多字词上屏）
+/// 或超过 `idle_timeout_ms` 未继续时，按方案 `[[encoder.rules]]` 为整个序列算词组编码并
+/// 写入**临时词库**（立即可作为候选）；累计使用达 `promote_count` 次才晋升进用户词库。
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct AutoPhraseConfig {
     #[serde(default)]
     pub enabled: bool,
-    /// 造词最小字数（默认 2；设置页隐藏）。
+    /// 造词最小字数（默认 2；内部字段，设置页不开放）。
     #[serde(default = "default_phrase_min_len")]
     pub min_phrase_len: usize,
-    /// 造词最大字数（默认 10；设置页隐藏）。
+    /// 造词最大字数（默认 5；内部字段，设置页不开放）。**超长序列整体放弃**，不截取末尾
+    /// N 字——在连续多字中间切一刀，切出来的多半不是词，是杂词的主要来源。
     #[serde(default = "default_phrase_max_len")]
     pub max_phrase_len: usize,
-    /// 临时词晋升所需使用次数（原 learning.temp_promote_count）。
+    /// 临时词晋升进用户词库所需使用次数。**0 = 不晋升**，一直留在临时词库（默认）。
     #[serde(default)]
     pub promote_count: usize,
+    /// 连续单字之间的最大间隔（毫秒，0=默认 5000）。超过则把已累积序列视作终止。
+    /// 兜底用：终止信号全漏时防止跨句拼出「加好加好」这类杂词。内部字段，设置页不开放。
+    #[serde(default)]
+    pub idle_timeout_ms: u32,
+    /// 临时词库条目上限（0=不限）。超出后淘汰权重最低者。内部字段，设置页不开放。
+    #[serde(default = "default_temp_max_entries")]
+    pub temp_max_entries: usize,
 }
 
 fn default_phrase_min_len() -> usize {
     2
 }
 
+/// 默认 5（原为 10）。五笔场景下 10 字连续序列几乎必是跨句杂词；Go 版默认亦为 5。
 fn default_phrase_max_len() -> usize {
-    10
+    5
+}
+
+fn default_temp_max_entries() -> usize {
+    5000
 }
 
 impl Default for AutoPhraseConfig {
@@ -364,6 +381,8 @@ impl Default for AutoPhraseConfig {
             min_phrase_len: default_phrase_min_len(),
             max_phrase_len: default_phrase_max_len(),
             promote_count: 0,
+            idle_timeout_ms: 0,
+            temp_max_entries: default_temp_max_entries(),
         }
     }
 }

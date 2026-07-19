@@ -299,6 +299,15 @@ pub(crate) const ENGINE_MAX_CANDIDATES: usize = 50;
 /// 晋升入用户词库时统一取 `wind_store::temp_words::PROMOTED_WEIGHT`。
 pub(crate) const LEARN_ADD_WEIGHT: i32 = 800;
 
+/// 自提交宽限期：本输入法吐字后这段时间内收到的 `SelectionChanged` 视为宿主回声，
+/// 不当作用户移动光标（见 `handle_selection_changed`）。
+///
+/// **待实测校准**：Go 版实测宿主回声 <50ms 并取 200ms 留余量，但那是另一套进程/宿主组合下
+/// 的观测值。本值先沿用 200ms，真机跑一遍 `selection_changed: since_self_commit=...`
+/// 日志看实际分布后再定。取值过小 → 回声被误判为用户操作，序列被切碎、造词失效；
+/// 取值过大 → 用户上屏后短时间内的真实光标移动漏掉一次终止（由 idle 超时兜底）。
+pub(crate) const SELF_COMMIT_GRACE: std::time::Duration = std::time::Duration::from_millis(200);
+
 /// 当前 unix 秒（拼音衰减分以此对 last_used 计龄；与 store record_freq 同口径）。
 pub(crate) fn now_unix_secs() -> i64 {
     std::time::SystemTime::now()
@@ -563,6 +572,20 @@ pub struct Coordinator {
     pub(crate) punct: Mutex<PunctuationConverter>,
     /// 智能符号模式待命态（同键连按删中文标点改英文）
     pub(crate) smart_symbol: Mutex<SmartSymbolArm>,
+    /// 码表自动造词的连续单字缓冲。**独立于 `State`**：终止信号多来自 IPC 回调
+    /// （焦点丢失 / IME 停用 / 光标移动），那些路径不持 `state` 锁，塞进 `State` 会
+    /// 逼出跨锁调用。见 `auto_phrase` 模块头注释。
+    pub(crate) auto_phrase: Mutex<crate::auto_phrase::AutoPhraseBuf>,
+    /// 最近一次**本输入法自己**向宿主吐字的时刻（由 `commit_action` 统一打点）。
+    ///
+    /// 用途只有一个：宿主插入我们提交的文字后会回送 `SelectionChanged`，它和「用户真的
+    /// 移动了光标」在协议层**长得一模一样**，只能靠时间区分。若不区分，每上屏一个字就会
+    /// 被自己的回声判成「用户移动光标」→ flush → 缓冲永远只有 1 个字 → 造词恒不触发。
+    ///
+    /// **打点必须收口在 `commit_action` 一处**：漏掉任一吐字路径，该路径的回声就会切碎序列。
+    pub(crate) last_self_commit: Mutex<Option<std::time::Instant>>,
+    /// 自动造词写入计数，供临时词库淘汰按次节流（见 `maybe_evict_temp`）。
+    pub(crate) auto_phrase_writes: std::sync::atomic::AtomicUsize,
     /// 短语层（系统+用户，来自 store，仅 enabled）。变更后可 rebuild_phrases 重建。
     pub(crate) phrases: std::sync::RwLock<wind_phrase::PhraseLayer>,
     /// 最近一次解析的系统短语条目（启动时填充；"恢复默认"重读文件成功后刷新）。
@@ -1151,6 +1174,9 @@ impl Coordinator {
             store,
             punct: Mutex::new(punct_conv),
             smart_symbol: Mutex::new(SmartSymbolArm::default()),
+            auto_phrase: Mutex::new(crate::auto_phrase::AutoPhraseBuf::new()),
+            last_self_commit: Mutex::new(None),
+            auto_phrase_writes: std::sync::atomic::AtomicUsize::new(0),
             phrases,
             system_phrase_entries: std::sync::RwLock::new(system_phrase_entries),
             system_phrase_path,
@@ -3500,6 +3526,9 @@ impl MessageHandler for Coordinator {
     fn handle_key_event_policed(&self, data: &KeyEventData) -> KeyAction {
         let action = self.handle_key_event(data);
         self.record_input_stats(&action);
+        // 自提交打点 + 码表自动造词投喂。与 record_input_stats 同一收口理由：上屏路径有
+        // 40+ 个返回点，且约 10 处绕过 commit_action 直接构造 InsertText，散点接线必漏。
+        self.note_commit_action(&action);
         // PassThrough / UpdateComposition 时 C++ 侧会调 FlushHoldCompositionIfActive 提交旧符号；
         // coordinator 需同步清除 held_text，防止后续标点的 pre_held_text 捡到已提交的旧值
         // 而造成二次提交（"。。="）。仅在 held_text 非空时操作，避免干扰无 Hold 状态的武装态。
@@ -4618,6 +4647,7 @@ impl MessageHandler for Coordinator {
         self.notify_toolbar_async(); // 隐藏工具栏（防抖，异步避免阻塞 bridge 线程）
         self.notify_ui_hide(); // 隐藏候选窗 + 弹出菜单（HideCandidates 连带关菜单）
         self.hide_tip(); // 失焦隐藏状态提示（常驻模式尤需）
+        self.terminate_auto_phrase("focus_lost"); // 换窗口 = 一段输入结束
     }
 
     fn get_current_mode(&self, client_token: u64) -> (bool, bool) {
@@ -4687,6 +4717,7 @@ impl MessageHandler for Coordinator {
         self.notify_toolbar_async(); // 非激活态 → notify_toolbar 内部下发 HideToolbar（异步）
         self.notify_ui_hide(); // 隐藏候选窗 + 弹出菜单
         self.hide_tip(); // 切走本输入法隐藏状态提示
+        self.terminate_auto_phrase("ime_deactivated"); // 切走输入法 = 一段输入结束
     }
 
     fn handle_mode_notify(&self, flags: u32) {
@@ -4710,6 +4741,9 @@ impl MessageHandler for Coordinator {
         // 的状态"（对齐搜狗）——取消锁定并归位中文，而非翻转 chinese_mode；否则
         // chinese_mode 原本为 true（被 CapsLock 压制）时翻转反而落到英文，切换仍然无效。
         let caps_cancelled = self.cancel_caps_on_switch();
+        // 中英切换 = 一段输入结束。须在取 state 锁之前调用：terminate_auto_phrase 内部
+        // 走词库 IO，不可在持 state 锁时进行。
+        self.terminate_auto_phrase("toggle_mode");
         let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
         state.chinese_mode = if caps_cancelled {
             true
@@ -4902,7 +4936,40 @@ impl MessageHandler for Coordinator {
         self.arm_pending_first_show_with_timeout(600);
     }
 
-    fn handle_selection_changed(&self, _prev_char: u16) {}
+    /// 宿主报告「光标移动且当前无 composition」（C++ `TextService::OnEndEdit`，守卫
+    /// `selChanged && _pComposition == nullptr`）。
+    ///
+    /// 这是码表自动造词**唯一能感知到「用户敲了空格/回车结束一句」的途径**：码表每选一字
+    /// 就上屏并关闭 composition，此后 Space/Enter 被 TSF 直接透传给宿主，协调器根本收不到
+    /// 按键（`KeyEventSink.cpp:398/966/1024` —— Backspace/Enter/Escape 仅在有 composition
+    /// 或 input session 时才拦截）。
+    ///
+    /// # 自提交宽限期
+    ///
+    /// 本输入法自己提交文字后，宿主插入文本同样导致光标移动 → 同样回送本事件，且在协议层
+    /// **与用户真实光标移动完全无法区分**，只能靠时间判别。若不区分，每上屏一个字就被自己
+    /// 的回声判成「用户移动光标」→ flush → 缓冲永远只有 1 个字 → 造词恒不触发。
+    ///
+    /// 宽限值目前取 [`SELF_COMMIT_GRACE`]，但**这是待实测校准的初值**：宿主回声延迟因宿主
+    /// 而异，代码阅读只能证明「守卫会放行」，无法证明实际延迟分布。下方 DEBUG 日志记录每次
+    /// 事件距上次自提交的毫秒数，真机跑一遍即可据实调整。
+    fn handle_selection_changed(&self, _prev_char: u16) {
+        let since = self
+            .last_self_commit
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .map(|t| t.elapsed());
+        let is_echo = since.is_some_and(|d| d < SELF_COMMIT_GRACE);
+        // 实测校准用：真机跑一遍看这条日志的分布，再定 SELF_COMMIT_GRACE。
+        debug!(
+            "selection_changed: since_self_commit={:?} → {}",
+            since,
+            if is_echo { "自提交回声，忽略" } else { "用户移动光标" }
+        );
+        if !is_echo {
+            self.terminate_auto_phrase("selection_changed");
+        }
+    }
 
     fn handle_commit_request(&self, data: &CommitRequestData) -> Option<CommitResultData> {
         let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());

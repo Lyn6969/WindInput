@@ -252,6 +252,56 @@ impl CachedDict {
         idx
     }
 
+    /// 构建**单字全码表**：汉字 → 该字在本词库中的全码。供码表造词按 `[[encoder.rules]]`
+    /// 公式组装词组编码（`wind_engine::encoder`）。
+    ///
+    /// # 全码判据（按序）
+    ///
+    /// 1. **上限闸**：滤掉码长 > `max_code_length` 的编码（`0` = 不设闸）。扩展词库塞进来的
+    ///    5/6 码怪码在此被排除——否则它就是「最长码」，后续判据根本没机会参与。
+    /// 2. **最长码长**：简码（如「工」=`a`）位数不够公式取第 2 码，必须取全码。
+    /// 3. **权重降序**：同码长多码时取权重高者。
+    /// 4. **码字典序升序**：最终确定性兜底。
+    ///
+    /// # 为什么第 4 条不是「首次出现」
+    ///
+    /// `CodetableDict::for_each_entry` 遍历的是 `HashMap`，**顺序不确定**；mmap 路径则为码
+    /// 字典序。取「首次出现」会让同权同长的字在两条路径下、甚至两次构建间得到不同的码。
+    /// 字典序是确定性代偿，且与 mmap 路径的天然顺序一致。
+    pub fn build_single_char_full_codes(
+        &self,
+        max_code_length: usize,
+    ) -> std::collections::HashMap<char, String> {
+        use std::collections::HashMap;
+        // 值存 (code, weight)；weight 仅用于比较，不外传。
+        let mut best: HashMap<char, (String, i32)> = HashMap::new();
+        self.for_each_entry(&mut |code, text, weight| {
+            let mut it = text.chars();
+            let (Some(ch), None) = (it.next(), it.next()) else {
+                return; // 只收单字条目
+            };
+            let len = code.chars().count();
+            if len == 0 || (max_code_length > 0 && len > max_code_length) {
+                return;
+            }
+            match best.get(&ch) {
+                Some((cur, cur_w)) => {
+                    let cur_len = cur.chars().count();
+                    let better = len > cur_len
+                        || (len == cur_len
+                            && (weight > *cur_w || (weight == *cur_w && code < cur.as_str())));
+                    if better {
+                        best.insert(ch, (code.to_string(), weight));
+                    }
+                }
+                None => {
+                    best.insert(ch, (code.to_string(), weight));
+                }
+            }
+        });
+        best.into_iter().map(|(k, (code, _))| (k, code)).collect()
+    }
+
     /// 总条目数
     pub fn len(&self) -> usize {
         match self {
@@ -269,6 +319,73 @@ impl CachedDict {
 mod tests {
     use super::*;
     use crate::codetable::CodetableDict;
+
+    /// 全码判据①②：简码不能胜出（否则公式取第 2 码越界），且超过 max_code_length 的
+    /// 怪码被上限闸排除——这两条各自都足以让造词静默失效。
+    #[test]
+    fn single_char_full_code_prefers_longest_within_cap() {
+        let mut d = CodetableDict::empty();
+        // 「工」：一级简码 a + 全码 aaaa → 应取 aaaa（简码只有 1 位，取不到第 2 码）。
+        d.merge_single("a".into(), "工".into(), 9999, 0);
+        d.merge_single("aaaa".into(), "工".into(), 100, 1);
+        // 「中」：全码 khk + 扩展库塞进来的 6 码怪码 → 上限闸(4) 排除怪码，取 khk。
+        d.merge_single("khk".into(), "中".into(), 500, 2);
+        d.merge_single("khkkhk".into(), "中".into(), 9999, 3);
+        let cd = CachedDict::Memory(d);
+        let idx = cd.build_single_char_full_codes(4);
+        assert_eq!(
+            idx.get(&'工').map(String::as_str),
+            Some("aaaa"),
+            "简码权重再高也不能当全码"
+        );
+        assert_eq!(
+            idx.get(&'中').map(String::as_str),
+            Some("khk"),
+            "超 max_code_length 的怪码应被上限闸排除，即使它更长、权重更高"
+        );
+    }
+
+    /// 上限闸关闭（0）时退化为纯「最长优先」——非定长码方案不应被误滤。
+    #[test]
+    fn single_char_full_code_cap_zero_disables_gate() {
+        let mut d = CodetableDict::empty();
+        d.merge_single("khk".into(), "中".into(), 500, 0);
+        d.merge_single("khkkhk".into(), "中".into(), 100, 1);
+        let cd = CachedDict::Memory(d);
+        assert_eq!(
+            cd.build_single_char_full_codes(0).get(&'中').map(String::as_str),
+            Some("khkkhk"),
+            "cap=0 应不设闸，取最长"
+        );
+    }
+
+    /// 全码判据③④：同码长先比权重，权重相同再比码字典序（确定性兜底）。
+    #[test]
+    fn single_char_full_code_breaks_ties_by_weight_then_code() {
+        let mut d = CodetableDict::empty();
+        // 同为 2 码：权重高的 de 胜出。
+        d.merge_single("dd".into(), "大".into(), 10, 0);
+        d.merge_single("de".into(), "大".into(), 99, 1);
+        // 同为 2 码且同权重：字典序小的 aa 胜出。
+        d.merge_single("ab".into(), "式".into(), 50, 2);
+        d.merge_single("aa".into(), "式".into(), 50, 3);
+        let cd = CachedDict::Memory(d);
+        let idx = cd.build_single_char_full_codes(4);
+        assert_eq!(idx.get(&'大').map(String::as_str), Some("de"));
+        assert_eq!(idx.get(&'式').map(String::as_str), Some("aa"));
+    }
+
+    /// 只收单字：多字词条不得进入全码表（否则「你好」会被当成一个"字"）。
+    #[test]
+    fn single_char_full_code_skips_multi_char_entries() {
+        let mut d = CodetableDict::empty();
+        d.merge_single("wqvb".into(), "你好".into(), 100, 0);
+        d.merge_single("wqiy".into(), "你".into(), 100, 1);
+        let cd = CachedDict::Memory(d);
+        let idx = cd.build_single_char_full_codes(4);
+        assert_eq!(idx.len(), 1, "多字词条应被跳过");
+        assert!(idx.contains_key(&'你'));
+    }
 
     /// 反查索引:同词收集全部码,码长升序 → 字典序升序,去重。
     #[test]

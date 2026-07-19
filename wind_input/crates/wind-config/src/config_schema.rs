@@ -79,6 +79,8 @@ static REGISTRY: &[ConfigField] = &[
     f("schema.codetable.auto_phrase.min_phrase_len", Int),
     f("schema.codetable.auto_phrase.max_phrase_len", Int),
     f("schema.codetable.auto_phrase.promote_count", Int),
+    f("schema.codetable.auto_phrase.idle_timeout_ms", Int),
+    f("schema.codetable.auto_phrase.temp_max_entries", Int),
     // 全局拼音
     f("schema.pinyin.show_code_hint", Bool),
     f("schema.pinyin.use_smart_compose", Bool),

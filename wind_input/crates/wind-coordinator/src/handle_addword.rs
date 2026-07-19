@@ -19,6 +19,9 @@ const ADD_WORD_DEFAULT_LEN: usize = 2;
 const ADD_WORD_MAX_LEN: usize = 20;
 /// 手动加词默认权重（略高于系统词库归一化中位 1000，对齐 Go addWordMaxWeight）
 const ADD_WORD_WEIGHT: i32 = 1200;
+/// 临时词库淘汰的检查间隔（每 N 次造词写入检查一次）。全表扫描代价高，而上限是软约束，
+/// 略微超出无害，故不必每次都查。
+const EVICT_CHECK_INTERVAL: usize = 64;
 
 /// 自动造词超长裁剪：从尾部保留整段（最近输入优先）使合并字数 ≤ max_chars。
 /// 返回保留区间的起始段索引；max_chars=0 不限（返回 0）。
@@ -60,7 +63,193 @@ fn build_add_word_page(word: &str, code: &str, schema: &str) -> String {
     page
 }
 
+/// 汉字判定：只认表意文字区。**刻意排除全角标点（U+FF00–FFEF）与中文标点（U+3000–303F）**
+/// ——那些是造词的**终止符**而非素材。若用 `c >= 0x3400` 这种粗判据，全角逗号 U+FF0C 会被
+/// 当成汉字混进词里。
+fn is_han(c: char) -> bool {
+    matches!(c as u32,
+        0x4E00..=0x9FFF      // 基本区
+        | 0x3400..=0x4DBF    // 扩展 A
+        | 0xF900..=0xFAFF    // 兼容表意文字
+        | 0x20000..=0x2A6DF  // 扩展 B
+        | 0x2A700..=0x2EBEF  // 扩展 C–F
+        | 0x30000..=0x323AF) // 扩展 G–H
+}
+
 impl Coordinator {
+    // ──────────────────────────────────────────────────────────────────────
+    // 码表自动造词：连续单字 + 终止信号 = 自动组词
+    // 状态机在 `crate::auto_phrase`（纯逻辑）；此处只做接线与 IO。
+    // ──────────────────────────────────────────────────────────────────────
+
+    /// 上屏后处理：**自提交打点** + 喂码表造词缓冲。
+    ///
+    /// 收口在 `handle_key_event_policed`（而非 `commit_action`）——后者不是唯一出口，
+    /// 另有约 10 处直接构造 `InsertText` 的路径（顶码/智能符号/临拼等），散点打点必漏。
+    /// 与 `record_input_stats` 同一收口思路。
+    pub(crate) fn note_commit_action(&self, action: &KeyAction) {
+        let text = match action {
+            KeyAction::InsertText { text, .. } | KeyAction::InsertTextWithCursor { text, .. } => {
+                text.as_str()
+            }
+            _ => return,
+        };
+        if text.is_empty() {
+            return;
+        }
+        // 打点无条件进行：它服务的是 SelectionChanged 的回声判别，与造词是否开启无关。
+        *self
+            .last_self_commit
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = Some(std::time::Instant::now());
+        self.feed_auto_phrase(text);
+    }
+
+    /// 造词是否启用（码表/混输方案 + 开关开启）。拼音方案走 `[pinyin.auto_learn]` 的
+    /// 选词即学路线，不进本缓冲。
+    fn auto_phrase_enabled(&self) -> bool {
+        !self.engine_mgr.is_pinyin() && self.engine_mgr.codetable_settings().auto_phrase.enabled
+    }
+
+    /// 把上屏文本喂给造词缓冲。
+    ///
+    /// - 全汉字单字 → 追加（混输下拼音打出的单字**同样计入**：编码在 flush 时由
+    ///   `[[encoder.rules]]` 从字重算，段自身带什么码不影响结果，故来源无意义）
+    /// - 全汉字多字词 → 终止（选了词组说明这不是散字序列）
+    /// - 含非汉字（标点/英文/数字/空格）→ 终止
+    fn feed_auto_phrase(&self, text: &str) {
+        if !self.auto_phrase_enabled() {
+            return;
+        }
+        let all_han = text.chars().all(is_han);
+        let now = std::time::Instant::now();
+        let idle = self.auto_phrase_idle_timeout();
+        let flushed = {
+            let mut buf = self.auto_phrase.lock().unwrap_or_else(|e| e.into_inner());
+            if all_han {
+                buf.on_commit(text, now, idle)
+            } else {
+                // 非汉字上屏 = 终止符，且该文本自身不入缓冲。
+                buf.terminate()
+            }
+        }; // 锁在此释放：flush 要做词库 IO，不可持缓冲锁。
+        if let Some(seq) = flushed {
+            self.flush_auto_phrase(&seq);
+        }
+    }
+
+    /// 终止信号统一入口（标点/回车/空格/焦点丢失/IME 停用/模式切换/光标移动）。
+    /// `reason` 只进 DEBUG 日志，便于排查「词为什么没造出来 / 为什么被切断」。
+    pub(crate) fn terminate_auto_phrase(&self, reason: &str) {
+        if !self.auto_phrase_enabled() {
+            return;
+        }
+        let flushed = {
+            let mut buf = self.auto_phrase.lock().unwrap_or_else(|e| e.into_inner());
+            buf.terminate()
+        };
+        if let Some(seq) = flushed {
+            debug!("auto-phrase: 终止信号 {} → flush {} 字", reason, seq.len());
+            self.flush_auto_phrase(&seq);
+        }
+    }
+
+    /// idle 超时（连续单字最大间隔）。0 = 用默认 5s。
+    fn auto_phrase_idle_timeout(&self) -> std::time::Duration {
+        let ms = self.rt().config.schema.codetable.auto_phrase.idle_timeout_ms;
+        if ms == 0 {
+            crate::auto_phrase::DEFAULT_IDLE_TIMEOUT
+        } else {
+            std::time::Duration::from_millis(ms as u64)
+        }
+    }
+
+    /// 对吐出的字序列造词：长度策略 → 取码 → 查重 → 写临时层 → 晋升判定 → 淘汰。
+    fn flush_auto_phrase(&self, seq: &[char]) {
+        let ap = self.engine_mgr.codetable_settings().auto_phrase;
+        let Some(word) =
+            crate::auto_phrase::word_from_seq(seq, ap.min_phrase_len, ap.max_phrase_len)
+        else {
+            return; // 太短或超长（超长整体放弃，不切末尾 N 字——中间切一刀多半是杂词）
+        };
+        let active = self.engine_mgr.active_schema_id();
+        // 出码方案与入库方案是**两个不同的 id**（对齐 `add_word_target_schema` 的既有区分）：
+        // 出码要真实方案（读它的 [[encoder.rules]] 与码表词库），入库要数据方案（混输折叠到主码表）。
+        let encode_schema = if self.engine_mgr.schema_engine_type(&active).as_deref() == Some("mixed")
+        {
+            match self.engine_mgr.mixed_primary_schema(&active) {
+                Some(s) => s,
+                None => {
+                    debug!("auto-phrase: 混输方案主码表缺失，跳过造词");
+                    return;
+                }
+            }
+        } else {
+            active.clone()
+        };
+        let code = match self.engine_mgr.encode_word(&encode_schema, &word) {
+            Ok(c) => c,
+            Err(e) => {
+                // DEBUG 级可带具体字符（CLAUDE.md 隐私规则：INFO 及以下不得带）。
+                // 这条是排查「自动造词不生效」最关键的线索——通常是某个字在码表里没有全码。
+                debug!("auto-phrase: 取码失败，整词作废（{}）: {}", word, e);
+                return;
+            }
+        };
+        // 查重①系统词库：反查索引给的是该词在词库里的**实际**编码列表（`a/ab/abc`），
+        // 命中同码即说明系统库已收录这个「码+词」，不必再造。
+        let existing = self.engine_mgr.word_codes_in(&encode_schema, &word);
+        if existing.split('/').any(|c| c == code) {
+            debug!("auto-phrase: 系统词库已有 {} -> {}，跳过", code, word);
+            return;
+        }
+        let Some(store) = &self.store else { return };
+        let Some(schema) = self
+            .engine_mgr
+            .write_data_schema_id(&active, CandidateSource::CodeTable)
+        else {
+            debug!("auto-phrase: 无法归属入库方案，跳过造词");
+            return;
+        };
+        // 查重②用户词库：同「码+词」已存在则不再写临时层（否则候选会出现重复项）。
+        if let Ok(recs) = store.get_user_words(&schema, &code)
+            && recs.iter().any(|r| r.text == word)
+        {
+            debug!("auto-phrase: 用户词库已有 {} -> {}，跳过", code, word);
+            return;
+        }
+        // 码表词组码无音节边界语义 → boundary=0（消费方降级回 DAG）。
+        match store.learn_temp_word(&schema, &code, &word, LEARN_ADD_WEIGHT, 0) {
+            Ok(count) => {
+                debug!("auto-phrase: 已造词 {} -> {} (count={})", code, word, count);
+                self.maybe_promote_temp(store, &schema, &code, &word, count, ap.promote_count);
+                self.maybe_evict_temp(store, &schema);
+            }
+            Err(e) => warn!("auto-phrase: 写临时词库失败: {}", e),
+        }
+    }
+
+    /// 临时词库上限淘汰。按写入次数节流——每次造词都全表扫描代价过高，而上限本身
+    /// 是软约束（略微超出无害）。`max_entries = 0` 视为不限。
+    fn maybe_evict_temp(&self, store: &wind_store::Store, schema: &str) {
+        let max = self.rt().config.schema.codetable.auto_phrase.temp_max_entries;
+        if max == 0 {
+            return;
+        }
+        let n = self
+            .auto_phrase_writes
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            + 1;
+        if !n.is_multiple_of(EVICT_CHECK_INTERVAL) {
+            return;
+        }
+        match store.evict_temp_words(schema, max) {
+            Ok(k) if k > 0 => debug!("auto-phrase: 临时词库淘汰 {} 条（上限 {}）", k, max),
+            Ok(_) => {}
+            Err(e) => warn!("auto-phrase: 临时词库淘汰失败: {}", e),
+        }
+    }
+
     /// 加词到用户层（code 为空时暂不支持自动推导编码）。
     pub(crate) fn cmd_dict_add(&self, text: &str, code: &str) -> anyhow::Result<()> {
         let Some(store) = &self.store else {
@@ -82,26 +271,37 @@ impl Coordinator {
         Ok(())
     }
 
-    /// 自动造词（L）：仅当用户**分步**组成（committed_segs ≥2 段、合并 ≥2 字）才学。
-    /// 完整拼音码 = 各段码拼接；词 = 各段汉字拼接。写入临时层（需临时层，达阈值由 store 晋升路线处理）。
+    /// 拼音自动造词（L）：仅当用户**分步**组成（committed_segs ≥2 段、合并 ≥2 字）才学。
+    /// 完整拼音码 = 各段码拼接；词 = 各段汉字拼接。写入临时层（达阈值由 store 晋升路线处理）。
+    ///
+    /// # 为什么这里只剩拼音
+    ///
+    /// `committed_segs` 是拼音专属的「组合区逐步转换」态，**码表永不进入**（见
+    /// `crate::auto_phrase` 模块头）。原实现在此兼管码表，但守卫 `committed_segs.len() < 2`
+    /// 对码表恒真 → 一行都执行不到，是码表自动造词「完全不工作」的根因之一。码表已迁至
+    /// 独立的连续单字缓冲（`feed_auto_phrase` / `flush_auto_phrase`），此处不再兼管，
+    /// 否则两套路径会对同一次输入重复造词。
     pub(crate) fn learn_phrase_on_commit(&self, state: &State) {
         if state.committed_segs.len() < 2 {
             return;
         }
-        // 自动造词闸门：拼音方案读 [pinyin.auto_learn]，码表/混输读有效 [codetable.auto_phrase]
-        // （混输继承主码表行为）。开关关闭直接跳过；min_len 为造词最小字数（0 回退 2）。
-        // max_len：拼音路径不限（0）；码表路径取 max_phrase_len，0 回退 10。
+        // **纯码表**方案不经此路：该态是拼音专属（码表选词消费整串），对码表恒为死代码；
+        // 且码表已迁至 auto_phrase 连续单字缓冲，留在这里会对同一次输入重复造词。
+        //
+        // 混输**不**在此排除：其拼音子引擎的分步转换会正常产生 committed_segs，那是合法的
+        // 拼音造词路径（学成拼音码的词）。混输的**单字序列**另由 auto_phrase 缓冲学成码表词，
+        // 两者是不同维度、可并存。
+        if self.engine_mgr.is_codetable() {
+            return;
+        }
+        // 闸门：拼音方案读 [pinyin.auto_learn]；混输读有效 [codetable.auto_phrase]（继承主码表）。
+        // min_len 为造词最小字数（0 回退 2）；max_len 拼音路径不限（0）。
         let (enabled, min_len, max_len, promote_count) = if self.engine_mgr.is_pinyin() {
             let al = self.engine_mgr.auto_learn_settings();
             (al.enabled, al.min_word_length, 0, al.promote_count)
         } else {
             let ap = self.engine_mgr.codetable_settings().auto_phrase;
-            let max = if ap.max_phrase_len == 0 {
-                10
-            } else {
-                ap.max_phrase_len
-            };
-            (ap.enabled, ap.min_phrase_len, max, ap.promote_count)
+            (ap.enabled, ap.min_phrase_len, 0, ap.promote_count)
         };
         if !enabled {
             return;
@@ -397,11 +597,19 @@ impl Coordinator {
     }
 
     /// 为词计算编码（对齐设置端 `dict.encode` / web_dict_encode）：
-    /// 拼音方案走引擎词级消歧，无果回退逐字反查表；码表方案走五笔词组取码（逐字反查组合，
-    /// 支持词库中尚不存在的新词）。
+    /// 拼音方案走引擎词级消歧，无果回退逐字反查表；码表方案走 [`EngineManager::encode_word`]
+    /// （按方案 `[[encoder.rules]]` 从码表词库的单字全码组装，支持词库中尚不存在的新词）。
     /// 返回 `(code, boundary)`：boundary 见 `wind_dict::binformat::DictEntry::boundary`。
-    /// 只有引擎词级消歧这条路能给出边界（造词本就逐音节拼接）；逐字反查表回退与五笔取码
+    /// 只有引擎词级消歧这条路能给出边界（造词本就逐音节拼接）；逐字反查表回退与码表取码
     /// 无音节语义，为 0（消费方降级回 DAG）。
+    ///
+    /// # 码源变更（与自动造词统一）
+    ///
+    /// 原实现走 `wind_reverse::wubi_word_code`：码源是**拆字表**、规则是**硬编码的五笔 86
+    /// 三分支**。两个问题——① 拆字表是可选资源（全仓 5 个方案只有 wubi86 配了），未配拆字的
+    /// 第三方码表方案取码恒空、手动加词直接失败；② 硬编码规则对非五笔码表方案静默出错。
+    /// 且拆字表与词库解耦，用户换词库/加扩展库后可能造出**打不出来**的码。
+    /// 现统一走码表词库自身的单字全码 + 方案声明的公式，与「造出的词必须能打出来」对齐。
     fn calc_add_word_code(&self, word: &str) -> (String, u64) {
         let schema = self.add_word_target_schema();
         let is_pinyin = self
@@ -409,13 +617,20 @@ impl Coordinator {
             .schema_engine_type(&schema)
             .map(|t| t == "pinyin")
             .unwrap_or(false);
-        let reverse = self.reverse.read().unwrap_or_else(|e| e.into_inner());
         if is_pinyin {
+            let reverse = self.reverse.read().unwrap_or_else(|e| e.into_inner());
             self.engine_mgr
                 .generate_word_pinyin(&schema, word)
                 .unwrap_or_else(|| (reverse.gen_pinyin(word), 0))
         } else {
-            (reverse.wubi_word_code(word), 0)
+            match self.engine_mgr.encode_word(&schema, word) {
+                Ok(code) => (code, 0),
+                Err(e) => {
+                    // 空码由调用方处理（加词界面中止并提示）。带原因便于排查是哪个字没码。
+                    debug!("addword: 取码失败（{}）: {}", word, e);
+                    (String::new(), 0)
+                }
+            }
         }
     }
 

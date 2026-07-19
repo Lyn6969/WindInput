@@ -10,6 +10,7 @@
 //! 词典加载逻辑从原 `wind_service::bridge_impl` 下沉至此，使引擎层自洽。
 
 use crate::codetable::CodeTableEngine;
+use crate::encoder;
 use crate::engine::{ConvertResult, Engine, EngineType};
 use crate::pinyin::{Config as PinyinConfig, PinyinEngine};
 use std::collections::HashMap;
@@ -97,6 +98,11 @@ pub struct EngineManager {
     /// [编码] 段按词查实际码。懒建(首次需要时按方案词库全量构建),invalidate/reload 时清空。
     /// 内存护栏:每份索引可达数万词条,最多缓存两份(见 `reverse_index_for`)。
     reverse_index: Mutex<HashMap<String, Arc<HashMap<String, Vec<String>>>>>,
+    /// 码表**单字全码**表缓存:方案 id → (汉字 → 全码)。供造词按 `[[encoder.rules]]` 组装
+    /// 词组编码(见 `encode_word`)。与 `reverse_index` 分开是刻意的——那份按「码长升序」排,
+    /// 服务悬停 `[编码]` 的打法列表展示;这份要的是「按权重挑全码」,两种排序需求互斥。
+    /// **只缓存一份**:造词恒对活跃方案(混输则其主码表)进行,切方案即弃,无需两份护栏。
+    single_char_codes: Mutex<Option<SingleCharCodeCache>>,
     /// 全局拼音配置（fuzzy/show_code_hint/...）。Mutex 以支持热重载。
     pinyin: Mutex<wind_config::config::PinyinGlobalConfig>,
     /// 双拼韵母键集缓存：(已缓存的活跃方案 id, Option<HashSet<u8>>)。
@@ -115,6 +121,9 @@ static CACHE_DIR: std::sync::OnceLock<Option<std::path::PathBuf>> = std::sync::O
 const COMBINED_CACHE_TAG: &str = "combined/v1";
 /// rime_pinyin 主表+import_tables 合并缓存（`merged.wdat`）的指纹 tag。
 const MERGED_CACHE_TAG: &str = "merged/v1";
+
+/// 单字全码表缓存项：`(方案 id, 汉字 → 全码)`。见 `EngineManager::single_char_codes`。
+type SingleCharCodeCache = (String, Arc<HashMap<char, String>>);
 
 /// 深合并 TOML：`over` 覆盖到 `base` 之上。两侧皆为 table 时逐键递归；否则 over 整体替换。
 /// 数组按整体替换（如 encoder.rules 覆盖即替换全表）。
@@ -266,6 +275,7 @@ impl EngineManager {
             primary_codetable: Mutex::new(primary_codetable),
             primary_pinyin: Mutex::new(config.schema.primary_pinyin.clone()),
             reverse_index: Mutex::new(HashMap::new()),
+            single_char_codes: Mutex::new(None),
             pinyin: Mutex::new(config.schema.pinyin.clone()),
             shuangpin_finals_cache: Mutex::new((String::new(), None)),
             build_locks: Mutex::new(HashMap::new()),
@@ -465,6 +475,69 @@ impl EngineManager {
             }
             None => HashMap::new(),
         }
+    }
+
+    /// 取 `schema_id` 的单字全码表，缺则构建并缓存（只留一份，见字段注释）。
+    fn single_char_full_codes(&self, schema_id: &str) -> Arc<HashMap<char, String>> {
+        {
+            let guard = self
+                .single_char_codes
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            if let Some((id, m)) = guard.as_ref()
+                && id == schema_id
+            {
+                return m.clone();
+            }
+        }
+        let m = Arc::new(self.build_single_char_codes_for(schema_id));
+        *self
+            .single_char_codes
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = Some((schema_id.to_string(), m.clone()));
+        m
+    }
+
+    /// 按方案构建单字全码表。上限闸取该方案的 `engine.codetable.max_code_length`
+    /// （0 = 不设闸，非定长码方案退化为纯「最长优先」）。读不到方案/词库时返回空表。
+    fn build_single_char_codes_for(&self, schema_id: &str) -> HashMap<char, String> {
+        let Some(data_dir) = self.data_dir.as_deref() else {
+            return HashMap::new();
+        };
+        let Some(schema) =
+            Self::read_schema(schema_id, Some(data_dir), self.override_dir.as_deref())
+        else {
+            return HashMap::new();
+        };
+        let cap = schema.engine.codetable.max_code_length;
+        match Self::load_dictionary(&schema, &data_dir.join("schemas")) {
+            Some(dict) => {
+                let idx = dict.build_single_char_full_codes(cap);
+                info!(
+                    "Built single-char full-code table: {} ({} chars, cap={})",
+                    schema_id,
+                    idx.len(),
+                    cap
+                );
+                idx
+            }
+            None => HashMap::new(),
+        }
+    }
+
+    /// 按方案的 `[[encoder.rules]]` 为词计算码表词组编码（造词/加词统一入口）。
+    ///
+    /// 单字全码取自**该方案的码表词库**——码源与词库同源是刚性要求：造词的唯一目的是
+    /// 「造出来的词以后能打出来」，用与词库解耦的静态资源（如拆字表）出码，用户换了词库
+    /// 或加了扩展库就可能造出打不出的码。
+    ///
+    /// 任一字取不到码即整词失败，错误里带上是哪个字（见 [`encoder::EncodeError`]）。
+    pub fn encode_word(&self, schema_id: &str, word: &str) -> Result<String, encoder::EncodeError> {
+        let spec = Self::read_schema(schema_id, self.data_dir.as_deref(), self.override_dir.as_deref())
+            .and_then(|s| s.encoder)
+            .unwrap_or_default();
+        let codes = self.single_char_full_codes(schema_id);
+        encoder::calc_word_code(word, &spec, |c| codes.get(&c).cloned())
     }
 
     /// 解析主码表方案 id:config 显式指定优先;否则取 available 中首个 codetable 类型方案;都无返回空。
@@ -952,6 +1025,11 @@ impl EngineManager {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .clear();
+        // 单字全码表同源于「启用词库合并」，与反查索引同生命周期，一并失效。
+        *self
+            .single_char_codes
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = None;
         hit
     }
 
@@ -1030,6 +1108,11 @@ impl EngineManager {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .clear();
+        // 单字全码表同源于「启用词库合并」，与反查索引同生命周期，一并失效。
+        *self
+            .single_char_codes
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = None;
         // 双拼布局可能变更：失效韵母键缓存，下次按新布局重建。
         *self
             .shuangpin_finals_cache
@@ -1087,6 +1170,11 @@ impl EngineManager {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .clear();
+        // 单字全码表同源于「启用词库合并」，与反查索引同生命周期，一并失效。
+        *self
+            .single_char_codes
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = None;
         *self.available.lock().unwrap_or_else(|e| e.into_inner()) = available;
         *self.codetable.lock().unwrap_or_else(|e| e.into_inner()) = config.schema.codetable.clone();
         *self.mix.lock().unwrap_or_else(|e| e.into_inner()) = config.schema.mix.clone();

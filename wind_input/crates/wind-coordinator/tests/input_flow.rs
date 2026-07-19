@@ -4003,3 +4003,135 @@ fn test_chinese_fullwidth_numpad_direct_no_caps() {
         }
     }
 }
+
+// ──────────────────────────────────────────────────────────────────────────
+// 码表自动造词端到端
+//
+// ⚠ 必须走 `handle_key_event_policed`（bridge 真入口，server.rs:440 调的就是它）。
+// 本文件其余测试调的是裸 `handle_key_event`，那条路**不经过**自提交打点与造词投喂，
+// 用它写造词测试会得到「永远不造词」的假象。
+// ──────────────────────────────────────────────────────────────────────────
+
+use std::sync::Arc;
+use wind_store::Store;
+
+/// 建一个开/关自动造词的 wubi86 无头协调器 + 独立 store。
+fn auto_phrase_coord(tag: &str, enabled: bool) -> (Arc<Coordinator>, Arc<Store>, PathBuf) {
+    let mut cfg = config_with("wubi86");
+    cfg.schema.codetable.auto_phrase.enabled = enabled;
+    let db = std::env::temp_dir().join(format!("wind_auto_phrase_{tag}.redb"));
+    let _ = std::fs::remove_file(&db);
+    let store = Arc::new(Store::open(&db).unwrap());
+    let coord = Coordinator::new_headless_with_store(cfg, Some(&data_dir()), Arc::clone(&store));
+    (coord, store, db)
+}
+
+/// 枚举某方案下全部临时词（空前缀即扫该方案全部键）。
+fn temp_words(store: &Store, schema: &str) -> Vec<(String, String)> {
+    store
+        .search_temp_words_prefix(schema, "", 200)
+        .unwrap_or_default()
+        .into_iter()
+        .map(|r| (r.code, r.text))
+        .collect()
+}
+
+/// 敲「字母 + 空格」上屏一个字，返回上屏文本。
+fn commit_one_char(coord: &Coordinator, letter: u8) -> String {
+    coord.handle_key_event_policed(&key_event(letter as u32, EVENT_KEY_DOWN));
+    match coord.handle_key_event_policed(&key_event(0x20, EVENT_KEY_DOWN)) {
+        KeyAction::InsertText { text, .. } => text,
+        other => panic!("空格应上屏 InsertText，实际: {:?}", other),
+    }
+}
+
+/// 连续单字上屏 → 终止信号 → 造出词组并写入临时词库。
+///
+/// 覆盖历史上「完全不工作」的两个断裂：触发源（旧实现挂在拼音专属的 `committed_segs` 上，
+/// 码表恒不满足）与编码算法（旧实现拼接各段全码，造出的码查不出来）。
+#[test]
+fn test_codetable_auto_phrase_learns_from_single_chars() {
+    if !has_schemas() {
+        eprintln!("跳过：缺少 schema");
+        return;
+    }
+    let (coord, store, db) = auto_phrase_coord("learn", true);
+
+    let a = commit_one_char(&coord, b'A');
+    let b = commit_one_char(&coord, b'A');
+    let word = format!("{a}{b}");
+    assert_eq!(word.chars().count(), 2, "应上屏两个单字，实际: {:?}", word);
+
+    // 造词发生在终止信号（此处用失焦，等价于打完一句切窗口）。
+    coord.handle_focus_lost();
+
+    let words = temp_words(&store, "wubi86");
+    let hit = words
+        .iter()
+        .find(|(_, t)| *t == word)
+        .unwrap_or_else(|| panic!("终止信号后应造出「{word}」，临时层实际: {words:?}"));
+    // 五笔二字词规则 AaAbBaBb = 各字全码前两位 → 码长恒为 4。
+    // 这条同时否掉了「拼接各字全码」的旧做法（那会得到 7~8 位）。
+    assert_eq!(
+        hit.0.chars().count(),
+        4,
+        "二字词组码应为 4 位（各字全码前两位），实际: {}",
+        hit.0
+    );
+    let _ = std::fs::remove_file(&db);
+}
+
+/// 造词只在终止信号发生：上屏过程中不得写库，否则每打一个字就造一次半截词。
+#[test]
+fn test_codetable_auto_phrase_does_not_learn_before_terminator() {
+    if !has_schemas() {
+        eprintln!("跳过：缺少 schema");
+        return;
+    }
+    let (coord, store, db) = auto_phrase_coord("before_term", true);
+    commit_one_char(&coord, b'A');
+    commit_one_char(&coord, b'A');
+    assert!(
+        temp_words(&store, "wubi86").is_empty(),
+        "终止信号之前不应写入任何临时词，实际: {:?}",
+        temp_words(&store, "wubi86")
+    );
+    let _ = std::fs::remove_file(&db);
+}
+
+/// 开关关闭时闸门有效，一个词都不造。
+#[test]
+fn test_codetable_auto_phrase_disabled_learns_nothing() {
+    if !has_schemas() {
+        eprintln!("跳过：缺少 schema");
+        return;
+    }
+    let (coord, store, db) = auto_phrase_coord("disabled", false);
+    commit_one_char(&coord, b'A');
+    commit_one_char(&coord, b'A');
+    coord.handle_focus_lost();
+    assert!(
+        temp_words(&store, "wubi86").is_empty(),
+        "开关关闭时不应造词，实际: {:?}",
+        temp_words(&store, "wubi86")
+    );
+    let _ = std::fs::remove_file(&db);
+}
+
+/// 单字不成词：只上屏一个字就终止，不应写库（min_phrase_len=2）。
+#[test]
+fn test_codetable_auto_phrase_single_char_is_not_a_word() {
+    if !has_schemas() {
+        eprintln!("跳过：缺少 schema");
+        return;
+    }
+    let (coord, store, db) = auto_phrase_coord("single", true);
+    commit_one_char(&coord, b'A');
+    coord.handle_focus_lost();
+    assert!(
+        temp_words(&store, "wubi86").is_empty(),
+        "单字不应成词，实际: {:?}",
+        temp_words(&store, "wubi86")
+    );
+    let _ = std::fs::remove_file(&db);
+}

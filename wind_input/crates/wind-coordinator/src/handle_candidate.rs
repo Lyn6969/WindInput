@@ -1938,6 +1938,10 @@ impl Coordinator {
         }
     }
 
+    /// 上屏动作的常用构造。**注意它不是唯一出口**——另有约 10 处直接构造 `InsertText`
+    /// 的路径（顶码/智能符号/临拼等），故自提交打点与自动造词投喂**不在这里**做，
+    /// 而是统一在 `handle_key_event_policed` 按最终返回的 action 处理
+    /// （与 `record_input_stats` 同一收口思路）。
     pub(crate) fn commit_action(text: String, chinese_mode: bool) -> KeyAction {
         KeyAction::InsertText {
             text,

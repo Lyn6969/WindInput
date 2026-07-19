@@ -2,6 +2,7 @@
 //!
 //! 与 Go 版本 `wind_input/internal/coordinator/` 对齐。
 
+pub mod auto_phrase;
 pub mod coordinator;
 #[cfg(windows)]
 pub mod direct_switch;

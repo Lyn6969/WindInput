@@ -1023,23 +1023,31 @@ impl Coordinator {
     fn web_dict_encode(&self, params: &Value) -> anyhow::Result<Value> {
         let schema = str_param(params, "schemaId")?;
         let text = str_param(params, "text")?;
-        // 拼音类方案出拼音码；其余（码表/五笔）出五笔词组码。
+        // 拼音类方案出拼音码；其余（码表）按方案 [[encoder.rules]] 出词组码。
         let is_pinyin = self
             .engine_mgr
             .schema_engine_type(schema)
             .map(|t| t == "pinyin")
             .unwrap_or(false);
-        let reverse = self.reverse.read().unwrap_or_else(|e| e.into_inner());
         let code = if is_pinyin {
             // 优先词级消歧（多音字按词典权重），引擎无果时回退逐字反查表。
             // 本 RPC 只回 code 给 UI（契约为裸字符串），边界丢弃——入库时由 web_dict_add
             // 的 infer_boundary_for 按「手输码 == 推导码」重新取回。
+            let reverse = self.reverse.read().unwrap_or_else(|e| e.into_inner());
             self.engine_mgr
                 .generate_word_pinyin(schema, text)
                 .map(|(c, _)| c)
                 .unwrap_or_else(|| reverse.gen_pinyin(text))
         } else {
-            reverse.wubi_word_code(text)
+            // 与自动造词/快捷加词同一取码入口（码源=码表词库自身，规则=方案声明的公式）。
+            // 原走 wubi_word_code：拆字表码源 + 硬编码五笔 86 规则，未配拆字的方案恒空、
+            // 非五笔方案静默出错。见 docs/design/codetable-auto-phrase.md §2「码源统一」。
+            self.engine_mgr
+                .encode_word(schema, text)
+                .unwrap_or_else(|e| {
+                    tracing::debug!("dict.encode: 取码失败（{}）: {}", text, e);
+                    String::new()
+                })
         };
         Ok(json!(code))
     }
@@ -3022,54 +3030,18 @@ mod tests {
         );
     }
 
-    /// P2d Task 4 回归：非混输（码表方案）自动造词维持现行为，不看段来源，落自身 id。
-    /// （用码表而非拼音方案：无头最小 schema 无引擎数据，is_pinyin() 依赖已加载引擎会退化，
-    /// 码表分支只读配置不依赖引擎，可稳定验证"非混输不看段来源"。）
-    #[test]
-    fn codetable_learn_phrase_ignores_source() {
-        use std::io::Write;
-        use wind_candidate::CandidateSource;
-        let base_dir = std::env::temp_dir().join("wind_coord_p2d_ct_learn");
-        let schemas = base_dir.join("schemas");
-        let _ = std::fs::remove_dir_all(&base_dir);
-        std::fs::create_dir_all(&schemas).unwrap();
-        {
-            let mut f = std::fs::File::create(schemas.join("ct_test.schema.toml")).unwrap();
-            write!(
-                f,
-                "[schema]\nid = \"ct_test\"\n[engine]\ntype = \"codetable\"\n"
-            )
-            .unwrap();
-        }
-        let mut cfg = Config::default();
-        cfg.schema.active = "ct_test".into();
-        cfg.schema.available = vec!["ct_test".into()];
-        cfg.schema.codetable.auto_phrase.enabled = true;
-        let db_path = std::env::temp_dir().join("wind_coord_p2d_ct_learn.redb");
-        let _ = std::fs::remove_file(&db_path);
-        let store = Arc::new(Store::open(&db_path).unwrap());
-        let c =
-            Coordinator::new_headless_with_store(cfg, Some(base_dir.as_path()), Arc::clone(&store));
-
-        // 非混输：即使段标注混源（None/Pinyin），也不影响归属，仍落自身 id "ct_test"。
-        {
-            let mut st = c.state.lock().unwrap();
-            st.committed_segs.clear();
-            st.committed_segs
-                .push(("aa".into(), "工".into(), CandidateSource::None, 0));
-            st.committed_segs
-                .push(("bb".into(), "人".into(), CandidateSource::Pinyin, 0));
-            c.learn_phrase_on_commit(&st);
-        }
-        assert!(
-            store
-                .get_temp_words("ct_test", "aabb")
-                .unwrap()
-                .iter()
-                .any(|w| w.text == "工人"),
-            "码表方案忽略段来源，落自身 id"
-        );
-    }
+    // 【已移除】`codetable_learn_phrase_ignores_source`（P2d Task 4 回归）
+    //
+    // 该测试断言纯码表方案经 `committed_segs` 造词、编码为各段码**拼接**（aa + bb = "aabb"）。
+    // 两点使其不再成立：
+    //   ① 语义已判定为错。码表词组编码须按方案 `[[encoder.rules]]` 的公式从各字**全码**取位
+    //      （五笔「你好」= wqvb），拼接各段码得到的串在词库里查不到 —— 这正是自动造词
+    //      历史上「完全不工作」的根因之一。码表已迁至 `crate::auto_phrase` 连续单字缓冲。
+    //   ② 它本就只在**引擎加载失败**时才通过。测试方案 `ct_test` 无 `dictionaries`，引擎加载不出，
+    //      `is_codetable()` 退化为 false，才落进非码表分支。真实码表方案不会走到这里。
+    //
+    // 替代覆盖：`tests/input_flow.rs` 的 `test_codetable_auto_phrase_*` 四条，用**真实 wubi86
+    // 方案与词库**端到端验证取码、终止信号时机与开关闸门。
 
     /// P2d Task 5：混输 active 下手动加词（RPC dict.add）落主码表方案；primary 缺失则报错不 panic。
     #[test]
