@@ -633,17 +633,17 @@ function Stop-ProcessForFile ([string]$fileName) {
 
 # 复制单个文件, 处理被占用的 DLL/EXE。
 # 顺序: ① 先杀占用该 exe 的进程 (如独立开着的设置程序) 并等待让出文件锁
-#       ② 尝试覆盖 (= 删旧写新) ③ 仍被锁 (如已加载的 TSF DLL) 则改名到固定 .old 槽让路再写。
+#       ② 尝试覆盖 (= 删旧写新) ③ 仍被锁 (如已加载的 TSF DLL) 则改名让路再写。
 function Copy-Replace ([string]$targetDir, [string]$fileName, [string]$srcPath) {
     $dst = Join-Path $targetDir $fileName
     if (-not (Test-Path $dst)) { Copy-Item $srcPath $dst -Force; Gray "  - $fileName"; return }
     Stop-ProcessForFile $fileName   # 先判断并杀进程等待, 再尝试覆盖; 覆盖失败才改名让路
     try { Copy-Item $srcPath $dst -Force -ErrorAction Stop; Gray "  - $fileName"; return } catch { }
-    # 用固定 .old 后缀 (不带时间戳) 复用同一让路槽, 避免每次部署堆叠 .old_<随机> 垃圾:
-    # 锁定的 DLL 改名后仍无法删除, 若每次生成新后缀会无限累积。已是 .old 则不再追加后缀。
-    # Move-Item -Force 覆盖上次遗留且已释放的 .old (Rename-Item 不能覆盖已存在目标, 故用 Move);
-    # 若上次 .old 仍被锁 (罕见双代同锁) 覆盖失败, 明确提示重启后重试。
-    $old = "$dst.old"
+    # 让路后缀必须每次唯一: NTFS 允许改名在用文件, 但不允许改名去【覆盖】一个在用文件。
+    # 曾用固定 .old 槽复用, 结果上轮 .old 仍被宿主进程 map 着时 Move -Force 直接失败, 部署中断
+    # (TSF DLL in-proc 常驻, 宿主不重启就一直锁旧代, 双代同锁是常态)。唯一后缀则目标必不存在,
+    # 改名恒成功。垃圾累积由 Remove-OrRename 侧「不重复改名已让路文件」+ 各处 *.old* 清理消化。
+    $old = "$dst.old_$(Get-Random -Maximum 99999999)"
     try {
         Move-Item $dst $old -Force -ErrorAction Stop
         Copy-Item $srcPath $dst -Force
@@ -763,16 +763,21 @@ function Remove-AutoStart ([string]$suffix) {
     Gray "  - 已移除开机自启 ($name)"
 }
 
-# 删除单个文件; 被占用(已加载的 DLL)时改名到固定 .old 槽让路 — NTFS 允许改名在用文件, 仅不可删。
-# 返回 $true=已真正删除; $false=删不掉(已改名让路或失败)。与 Copy-Replace 同一固定 .old 让路策略。
+# 删除单个文件; 被占用(已加载的 DLL)时改名让路 — NTFS 允许改名在用文件, 仅不可删。
+# 返回 $true=已真正删除; $false=删不掉(已改名让路或失败)。与 Copy-Replace 同一唯一后缀让路策略。
 function Remove-OrRename ([string]$path) {
     if (-not (Test-Path $path)) { return $true }
     $leaf = Split-Path $path -Leaf
     try { Remove-Item $path -Force -ErrorAction Stop; Gray "  - 删除 $leaf"; return $true }
     catch {
-        # 固定 .old 让路槽 (不带时间戳): 锁定文件改名后仍删不掉, 复用同名避免堆叠垃圾;
-        # Move-Item -Force 覆盖上次已释放的 .old, 已是 .old 则不再追加后缀。
-        $old = "$path.old"
+        # 已带让路标记的文件不再重复改名: 它已经让过路了, 改成 .old_a.old_b 既无意义,
+        # 又是垃圾累积的真正来源 (卸载遍历目录下所有文件, 每轮把删不掉的存量整体翻新一遍)。
+        # 只标记未让路的原文件, 则每个原文件至多留一个残留, 待宿主释放后被 *.old* 清理带走。
+        if ($leaf -match '\.old(_\d+)?$') {
+            Warn "  - $leaf 仍被占用 (历史让路文件, 不再改名); 重启后可清除"
+            return $false
+        }
+        $old = "$path.old_$(Get-Random -Maximum 99999999)"
         try {
             Move-Item $path $old -Force -ErrorAction Stop
             Warn "  - $leaf 被占用, 已改名让路 ($(Split-Path $old -Leaf)); 重启后可清除"
