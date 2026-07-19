@@ -54,7 +54,7 @@ impl CachedDict {
         lowercase_code: bool,
     ) -> anyhow::Result<Self> {
         // 检查缓存是否有效
-        if Self::cache_is_valid(yaml_path, wdb_path) {
+        if Self::cache_is_valid(yaml_path, wdb_path, lowercase_code) {
             match WdatReader::open(wdb_path) {
                 Ok(reader) => {
                     info!(
@@ -90,8 +90,14 @@ impl CachedDict {
             warn!("Failed to write .wdb cache: {}", e);
             return Ok(Self::Memory(dict));
         }
-        // 写内容指纹 sidecar，供下次按内容(而非 mtime)校验复用
-        crate::cache_fp::write_cache_fp(wdb_path, &[yaml_path]);
+        // 写内容指纹 sidecar，供下次按内容(而非 mtime)校验复用。
+        // tag 带上 lowercase_code：同一份 yaml 在 english / 非 english 两种 dict_type 下
+        // 解析结果不同，不区分就会在切换后复用大小写错误的缓存。
+        crate::cache_fp::write_cache_fp(
+            wdb_path,
+            &[yaml_path],
+            crate::cache_fp::dict_tag(lowercase_code),
+        );
 
         // 用 mmap 重新打开缓存
         match WdatReader::open(wdb_path) {
@@ -110,9 +116,13 @@ impl CachedDict {
         }
     }
 
-    /// 检查缓存是否有效（按源文件**内容指纹**，不受 scp/部署刷新 mtime 影响）。
-    fn cache_is_valid(yaml_path: &Path, wdb_path: &Path) -> bool {
-        crate::cache_fp::cache_is_fresh(wdb_path, &[yaml_path])
+    /// 检查缓存是否有效（按源文件**内容指纹** + 解析方式 tag，不受 scp/部署刷新 mtime 影响）。
+    fn cache_is_valid(yaml_path: &Path, wdb_path: &Path, lowercase_code: bool) -> bool {
+        crate::cache_fp::cache_is_fresh(
+            wdb_path,
+            &[yaml_path],
+            crate::cache_fp::dict_tag(lowercase_code),
+        )
     }
 
     /// 将内存词典写入 .wdb 缓存

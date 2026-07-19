@@ -6,7 +6,7 @@
 use std::collections::BTreeMap;
 use std::fs;
 use std::path::Path;
-use tracing::{info, warn};
+use tracing::{error, info, warn};
 
 /// 词典条目
 #[derive(Debug, Clone)]
@@ -65,21 +65,41 @@ impl ColumnLayout {
     }
 }
 
-/// 某列是否呈「编码」形态：小写字母 / 数字 / 音节分隔空格 / 隔音符。
+/// 某列是否呈「编码」形态：小写字母 / 数字 / 音节分隔空格 / 隔音符 / 双拼与仓颉常用的 `;/-`。
 ///
 /// **判据必须建在 code 列而非 text 列**——这是本模块此前出错的根源。code 的形态约束是强的
 /// （码只能长成码的样子）；text 列可以是任何东西：汉字、`@`、`$CC("[End]", key.seq("End"))`、
 /// 英文单词。对无约束的一侧做形态测试等于赌，对强约束的一侧做才成立。
+///
+/// 刻意**不含** `.` 与 `,`：符号类词库的词条本身常常就是这两个字符（快符 `。`/`，` 的半角形态），
+/// 收进来会让 text 列也呈码形态。多收一个字符换来的是误判风险，不划算。
 fn is_code_shape(s: &str) -> bool {
     !s.is_empty()
-        && s.chars()
-            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == ' ' || c == '\'')
+        && s.chars().all(|c| {
+            c.is_ascii_lowercase()
+                || c.is_ascii_digit()
+                || c == ' '
+                || c == '\''
+                || c == ';'
+                || c == '/'
+                || c == '-'
+        })
+}
+
+/// 剥行尾空白，**保留前导**。对齐 librime 的 `boost::algorithm::trim_right`。
+///
+/// 曾经这里是 `trim()`：Rust 的 `str::trim` 按 Unicode White_Space 判定，而 **U+3000 全角空格
+/// 属于该集合**，于是「全角空格」这个词条本身会被当成缩进削掉，整行字段左移一格
+/// （`　\tcokg\t\t全角空格` → `cokg\t\t全角空格`，text 变成编码、code 变成空串），
+/// 两字段的行则直接掉到列数门槛之下被丢弃。**词条内容不该被当成排版空白。**
+fn trim_line_end(line: &str) -> &str {
+    line.trim_end()
 }
 
 /// 单行投票。仅当两列中**恰有一列**像码时才给结论；两列都像（英文词库 `abandon\tabandon`）
 /// 或都不像时弃权——弃权比瞎猜安全，多数票和默认值会兜住。
 fn vote_layout(line: &str) -> Option<ColumnLayout> {
-    let line = line.trim();
+    let line = trim_line_end(line);
     if line.is_empty() || line.starts_with('#') {
         return None;
     }
@@ -134,29 +154,41 @@ pub(crate) struct ColumnSpec {
     /// `wubi86_jidian_extra_district.dict.yaml` 是 `text\tcode\t\t区号` 四列，
     /// 第 4 列是行政区划编号；它的第 3 列为空，故按 Rime 语义同样得权重 0。
     weight_col: Option<usize>,
+    /// 本词库的 code 列是否承载**音节**语义（→ 算 boundary、出简拼、去空格拼平）。
+    ///
+    /// 判据 = `code 列采样到空格` **或** `text 列在 code 列之前`。
+    ///
+    /// 两个条件各自补一个洞：
+    /// - **空格**是音节边界的正面证据，与列顺序无关。加上它，`columns: [code, text, weight]`
+    ///   这类**编码在前的拼音库**不再被当成形码——那才是真正严重的方向：
+    ///   整张简拼表丢失、音节边界全归零，双拼与整句逻辑集体降级回 DAG 猜切分。
+    /// - **列顺序**保留下来是因为「无空格」推不出「无音节」：`好\thao` 这样的单音节拼音
+    ///   词条同样没有空格，而它的 `0b1`（整串是一个音节）是**真信息**，双拼真值校验要用。
+    ///   无空格时既可能是单音节拼音、也可能是形码，**数据本身无法区分**——五笔类惯例把
+    ///   编码写在前面，故沿用列顺序作这一情形的兜底。
+    ///
+    /// 残留缺口：声明成 `[text, weight, code, stem]` 的**形码**库（真实样本
+    /// `tigercode/tigress.dict.yaml`）仍会被判为有音节，每条拿到 `boundary=0b1`。
+    /// 这与本判据引入前的行为一致（无回归），且码表引擎不消费 boundary，故当前无损害。
+    /// 要根治须把词库类型（schema 的 `dict_type`）传进解析层——**那才是权威判据**，
+    /// 本字段的两条都只是数据侧的近似。
+    has_syllables: bool,
 }
 
 impl ColumnSpec {
     /// 由探测/默认列序构造。权重仍取第 3 列，与 librime 无声明时的默认一致；
     /// 探测只负责 text/code 谁先谁后（librime 不做探测，恒 text 在前）。
-    fn from_layout(layout: ColumnLayout) -> Self {
-        match layout {
-            ColumnLayout::TextFirst => Self {
-                text_col: 0,
-                code_col: 1,
-                weight_col: Some(2),
-            },
-            ColumnLayout::CodeFirst => Self {
-                text_col: 1,
-                code_col: 0,
-                weight_col: Some(2),
-            },
+    fn from_layout(layout: ColumnLayout, has_syllables: bool) -> Self {
+        let (text_col, code_col) = match layout {
+            ColumnLayout::TextFirst => (0, 1),
+            ColumnLayout::CodeFirst => (1, 0),
+        };
+        Self {
+            text_col,
+            code_col,
+            weight_col: Some(2),
+            has_syllables,
         }
-    }
-
-    /// code 列在 text 列之前 → 五笔式码表，无音节语义（不算 boundary、不出简拼）。
-    fn is_code_first(&self) -> bool {
-        self.code_col < self.text_col
     }
 
     /// 本行至少要有这么多列才能取齐**必需**字段（text/code）。
@@ -169,9 +201,31 @@ impl ColumnSpec {
     }
 }
 
+/// 头部 `columns:` 声明的解析结果。区分三态是为了给出**准确**的诊断——
+/// 把「声明不完整」误报成「未声明」，会让照日志排查的人去看头部、发现声明确实存在，
+/// 从而排除掉正确的线索。
+#[derive(Debug, PartialEq, Eq)]
+enum ColumnsDecl {
+    /// 声明完整可用。
+    Usable(ColumnSpec),
+    /// 声明了 `columns:` 但没有 `code` 列。
+    ///
+    /// 这在 librime 里是**合法的自动编码词库**——交给 encoder 按方案字表 +
+    /// `encoder.rules` 从构成字反推编码。本项目未实现该特性，故整库跳过而非降级探测：
+    /// 降级探测会把权重列当成编码（`is_code_shape("100")` 为真），静默灌进一整库垃圾编码。
+    MissingCode,
+    /// 声明了 `columns:` 但没有 `text` 列。librime 对此直接丢弃整个文件。
+    MissingText,
+    /// 没有 `columns:` 声明。
+    Absent,
+}
+
 /// 从 YAML 头部解析 `columns:` 声明，按声明顺序定位 text/code/weight 各列。
-/// 无声明、或声明里缺 text/code（残缺声明不可用）→ None，由调用方降级到探测。
-fn parse_columns_header(header: &str) -> Option<ColumnSpec> {
+///
+/// 两种 YAML 写法都认：块序列（`columns:` 换行后 `  - text`）与流式序列
+/// （`columns: [text, code, weight]`）。**流式必须支持**——它是合法 YAML，而我们的
+/// 警告文案就建议用户这么写；只认块序列会让照建议改完的用户看到「改了没用」。
+fn parse_columns_header(header: &str) -> ColumnsDecl {
     let mut in_columns = false;
     let mut names: Vec<String> = Vec::new();
     for raw in header.lines() {
@@ -180,8 +234,23 @@ fn parse_columns_header(header: &str) -> Option<ColumnSpec> {
         let trimmed = line.trim();
         if !in_columns {
             // 顶格的 `columns:` 才是块起点（缩进的同名键属于别的映射）
-            if trimmed == "columns:" && !line.starts_with([' ', '\t']) {
-                in_columns = true;
+            let Some(rest) = trimmed.strip_prefix("columns:") else {
+                continue;
+            };
+            if line.starts_with([' ', '\t']) {
+                continue;
+            }
+            in_columns = true;
+            // 流式：`columns: [text, code, weight]` —— 同一行取完即收工
+            let rest = rest.trim();
+            if let Some(inner) = rest.strip_prefix('[').and_then(|s| s.strip_suffix(']')) {
+                names.extend(
+                    inner
+                        .split(',')
+                        .map(|s| s.trim().to_string())
+                        .filter(|s| !s.is_empty()),
+                );
+                break;
             }
             continue;
         }
@@ -194,39 +263,149 @@ fn parse_columns_header(header: &str) -> Option<ColumnSpec> {
         names.push(item.trim().to_string());
     }
     if !in_columns {
-        return None;
+        return ColumnsDecl::Absent;
     }
     let find = |k: &str| names.iter().position(|n| n == k);
-    // text/code 缺一不可；stem 等未支持的列名占位但不取用。
-    Some(ColumnSpec {
-        text_col: find("text")?,
-        code_col: find("code")?,
+    // stem 等未支持的列名占位但不取用——占位会顺延其后各列的下标，必须计入。
+    let Some(text_col) = find("text") else {
+        return ColumnsDecl::MissingText;
+    };
+    let Some(code_col) = find("code") else {
+        return ColumnsDecl::MissingCode;
+    };
+    ColumnsDecl::Usable(ColumnSpec {
+        text_col,
+        code_col,
         weight_col: find("weight"),
+        has_syllables: false, // 由 resolve_columns 采样正文后填入
     })
 }
 
-/// 文件级列规格判定：头部 `columns:` 声明优先；缺声明则探测正文列序并 WARN 建议补声明。
-fn resolve_columns(content: &str, body: &str, path: &Path) -> ColumnSpec {
-    let header = &content[..content.len() - body.len()];
-    if let Some(declared) = parse_columns_header(header) {
-        return declared;
+/// 判定 code 列是否承载音节语义。见 [`ColumnSpec::has_syllables`] 对两条判据的说明。
+fn detect_syllables(body: &str, text_col: usize, code_col: usize) -> bool {
+    // text 在 code 之前 → 拼音惯例（五笔类惯例是编码在前）。无空格时靠它兜底。
+    if text_col < code_col {
+        return true;
     }
-    let (layout, text_first, code_first) = detect_layout(body);
-    let (c1, c2) = layout.column_names();
-    warn!(
-        "词库 {} 未声明 columns:，按正文前 {} 行探测判定列序为 {}\\t{}\\tweight（{}票 text 优先 / {}票 code 优先）。\
-         探测是启发式的，纯 ASCII 词条（如 @、$CC(...)）可能判错；\
-         建议在 YAML 头部显式声明，例如 columns: [{}, {}, weight]",
-        path.display(),
-        LAYOUT_SAMPLE_LINES,
-        c1,
-        c2,
-        text_first,
-        code_first,
-        c1,
-        c2,
-    );
-    ColumnSpec::from_layout(layout)
+    // 编码在前，但采样到空格 → 仍是拼音（音节分隔的正面证据胜过列顺序惯例）。
+    let need = text_col.max(code_col) + 1;
+    for line in body.lines().take(LAYOUT_SAMPLE_LINES) {
+        let line = trim_line_end(line);
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let parts: Vec<&str> = line.split('\t').collect();
+        if parts.len() < need {
+            continue;
+        }
+        if parts[code_col].contains(' ') {
+            return true;
+        }
+    }
+    false
+}
+
+/// 文件级列规格判定。返回 `None` = **整库跳过**（声明残缺，宁可显式少一个库，
+/// 也不静默灌进错位数据）。
+///
+/// 优先级：头部 `columns:` 声明 → 无声明则探测正文列序并 WARN 建议补声明。
+fn resolve_columns(content: &str, body: &str, path: &Path) -> Option<ColumnSpec> {
+    let header = &content[..content.len() - body.len()];
+    match parse_columns_header(header) {
+        ColumnsDecl::Usable(mut spec) => {
+            spec.has_syllables = detect_syllables(body, spec.text_col, spec.code_col);
+            Some(spec)
+        }
+        ColumnsDecl::MissingCode => {
+            error!(
+                "词库 {} 的 columns: 声明中没有 code 列，整库跳过。\
+                 这在 Rime 里是「自动编码」词库（由 encoder.rules 从构成字反推编码），\
+                 本输入法尚未支持；若该库本就有编码列，请把它加进 columns: 声明。",
+                path.display()
+            );
+            None
+        }
+        ColumnsDecl::MissingText => {
+            error!(
+                "词库 {} 的 columns: 声明中没有 text 列，整库跳过（Rime 同样丢弃此类文件）。",
+                path.display()
+            );
+            None
+        }
+        ColumnsDecl::Absent => {
+            let (layout, text_first, code_first) = detect_layout(body);
+            let (c1, c2) = layout.column_names();
+            let basis = if text_first + code_first == 0 {
+                "无一行给出有效判据，直接采用默认列序"
+            } else {
+                "依据正文投票"
+            };
+            warn!(
+                "词库 {} 未声明 columns:，{}判定列序为 {}\\t{}\\tweight\
+                 （取样前 {} 行：{} 票 text 优先 / {} 票 code 优先）。\
+                 探测是启发式的，纯 ASCII 词条（如 @、$CC(...)）可能判错；\
+                 建议在 YAML 头部显式声明，两种写法均可：\
+                 单行 `columns: [{}, {}, weight]`，或换行后逐项 `  - {}` / `  - {}` / `  - weight`。",
+                path.display(),
+                basis,
+                c1,
+                c2,
+                LAYOUT_SAMPLE_LINES,
+                text_first,
+                code_first,
+                c1,
+                c2,
+                c1,
+                c2,
+            );
+            let (text_col, code_col) = match layout {
+                ColumnLayout::TextFirst => (0, 1),
+                ColumnLayout::CodeFirst => (1, 0),
+            };
+            let has_syllables = detect_syllables(body, text_col, code_col);
+            Some(ColumnSpec::from_layout(layout, has_syllables))
+        }
+    }
+}
+
+/// 解析过程中被跳过/降级的行的计数，收尾时汇总输出。
+///
+/// 这不修任何 bug，但把整类**静默失败**变成可见：以前一行因空字段被丢、
+/// 一个权重因格式不认识变成 0，都是无声无息的，用户只看到「某些词打不出来」。
+#[derive(Debug, Default, Clone, Copy)]
+pub(crate) struct ParseStats {
+    /// 列数不足，取不齐 text/code。
+    pub short: usize,
+    /// text 或 code 为空串。
+    pub empty_field: usize,
+    /// 权重列存在但解析失败（如 Rime 的 `50%` 相对权重，本项目未实现预设词库故无基准）。
+    pub bad_weight: usize,
+}
+
+impl ParseStats {
+    fn merge(&mut self, o: &ParseStats) {
+        self.short += o.short;
+        self.empty_field += o.empty_field;
+        self.bad_weight += o.bad_weight;
+    }
+
+    fn is_clean(&self) -> bool {
+        self.short == 0 && self.empty_field == 0 && self.bad_weight == 0
+    }
+
+    /// 有异常才出日志——干净的词库不该刷屏。
+    fn log_if_dirty(&self, path: &Path) {
+        if self.is_clean() {
+            return;
+        }
+        warn!(
+            "词库 {} 解析期跳过/降级统计：列数不足 {} 行、text或code为空 {} 行、权重无法解析 {} 处（按 0 计）。",
+            path.display(),
+            self.short,
+            self.empty_field,
+            self.bad_weight
+        );
+    }
 }
 
 /// Rime Codetable 词典（内存模式，按 code 分组的 BTreeMap）
@@ -256,12 +435,28 @@ impl CodetableDict {
         let mut order: i32 = 0;
 
         // 无 `...` 分隔行 → 无正文 → 零条目（与并行解析路径一致）。
-        let body = rime_body_offset(&content).map_or("", |off| &content[off..]);
+        let body = match rime_body_offset(&content) {
+            Some(off) => &content[off..],
+            None => {
+                warn!(
+                    "词库 {} 缺少 YAML 正文分隔行 `...`，按零条目处理（文件可能被截断或损坏）。",
+                    path.display()
+                );
+                ""
+            }
+        };
         // 列规格判定一次、全文固定——不再逐行猜（见 [`ColumnLayout`]）。
-        let spec = resolve_columns(&content, body, path);
+        // None = 声明残缺，整库跳过（已在 resolve_columns 内 error! 说明原因）。
+        let Some(spec) = resolve_columns(&content, body, path) else {
+            return Ok(Self {
+                entries: BTreeMap::new(),
+                total_entries: 0,
+            });
+        };
+        let mut stats = ParseStats::default();
 
         for line in body.lines() {
-            let Some(parsed) = parse_rime_line(line, lowercase_code, spec) else {
+            let Some(parsed) = parse_rime_line(line, lowercase_code, spec, &mut stats) else {
                 continue;
             };
 
@@ -288,6 +483,7 @@ impl CodetableDict {
             entries.len(),
             total
         );
+        stats.log_if_dirty(path);
 
         Ok(Self {
             entries,
@@ -409,19 +605,6 @@ impl CodetableDict {
         }
     }
 
-    /// 合并另一个词典（用于 rime_pinyin 的 import_tables）
-    pub fn merge(&mut self, other: CodetableDict) {
-        for (code, entries) in other.entries {
-            let existing = self.entries.entry(code).or_default();
-            let base_order = existing.len() as i32;
-            for mut entry in entries {
-                entry.order += base_order;
-                existing.push(entry);
-            }
-        }
-        self.total_entries = self.entries.values().map(|v| v.len()).sum();
-    }
-
     /// 导出到 DictWriter（用于写入 .wdb 缓存）
     pub fn export_to_writer(&self, writer: &mut crate::binformat::DictWriter) {
         for (code, entries) in &self.entries {
@@ -479,28 +662,35 @@ pub(crate) struct RimeLine {
     pub boundary: u64,
 }
 
-fn parse_rime_line(line: &str, lowercase_code: bool, spec: ColumnSpec) -> Option<RimeLine> {
-    let line = line.trim();
+fn parse_rime_line(
+    line: &str,
+    lowercase_code: bool,
+    spec: ColumnSpec,
+    stats: &mut ParseStats,
+) -> Option<RimeLine> {
+    // 只剥行尾：词条内容可能以空白开头（「全角空格」这个词条本身就是 U+3000），
+    // 前导 trim 会把它当缩进削掉、导致整行字段左移。见 [`trim_line_end`]。
+    let line = trim_line_end(line);
     if line.is_empty() || line.starts_with('#') {
         return None;
     }
     let parts: Vec<&str> = line.split('\t').collect();
     if parts.len() < spec.required_cols() {
+        stats.short += 1;
         return None;
     }
     // 列位置由文件级判定给定（头部 `columns:` 声明，或整文件探测），不再逐行猜。
-    let (mut code, mut abbrev, text, boundary) = if spec.is_code_first() {
-        // code\ttext —— 五笔类无音节概念，boundary=0、无简拼。
-        (
-            parts[spec.code_col].to_string(),
-            None,
-            parts[spec.text_col].to_string(),
-            0u64,
-        )
-    } else {
+    let raw_code = parts[spec.code_col];
+    let text = parts[spec.text_col];
+    if text.is_empty() || raw_code.is_empty() {
+        // 空 code 会让整批条目挤进 entries[""]；空 text 是无意义候选。librime 亦跳过。
+        stats.empty_field += 1;
+        return None;
+    }
+    // 是否有音节语义由**文件级采样 code 列是否含空格**决定，与列顺序无关（见 ColumnSpec）。
+    let (mut code, mut abbrev, boundary) = if spec.has_syllables {
         // 简拼：2+ 音节时取每个空格分隔音节的首字母（对齐 Go loadRimeFile）。
-        let spaced = parts[spec.code_col];
-        let syllables: Vec<&str> = spaced.split(' ').filter(|s| !s.is_empty()).collect();
+        let syllables: Vec<&str> = raw_code.split(' ').filter(|s| !s.is_empty()).collect();
         let abbrev = if syllables.len() >= 2 {
             Some(
                 syllables
@@ -514,26 +704,37 @@ fn parse_rime_line(line: &str, lowercase_code: bool, spec: ColumnSpec) -> Option
         // 同一批空格既供简拼取首字母，也供 boundary 记边界——此前只用了前者，
         // 转手就 replace(' ',"") 把边界扔了，逼得查询侧用 DAG 猜、造词侧暴力反推。
         (
-            spaced.replace(' ', ""),
+            raw_code.replace(' ', ""),
             abbrev,
-            parts[spec.text_col].to_string(),
-            syllable_boundary_mask(spaced),
+            syllable_boundary_mask(raw_code),
         )
+    } else {
+        // 形码/五笔类：无音节概念，boundary=0（= 无边界信息，消费方降级回 DAG）、无简拼。
+        (raw_code.to_string(), None, 0u64)
     };
     if lowercase_code {
         code = code.to_lowercase();
         abbrev = abbrev.map(|a| a.to_lowercase());
     }
-    // 未声明 columns: 时 weight_col 为 None → 权重恒 0，不按位置猜第三列（可能是区号等）。
-    let weight: i32 = spec
-        .weight_col
-        .and_then(|i| parts.get(i))
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(0);
+    // weight_col 为 None = 该词库声明了 columns: 但其中不含 weight（对齐 librime：声明后
+    // 未列出的字段不读）。未声明 columns: 的词库走 librime 默认，weight_col = Some(2)。
+    let weight: i32 = match spec.weight_col.and_then(|i| parts.get(i)) {
+        // 空权重列是常态（Rime 语义：留给预设词库补），不计入异常统计。
+        None | Some(&"") => 0,
+        Some(s) => match s.parse() {
+            Ok(w) => w,
+            Err(_) => {
+                // Rime 的 `50%` 相对权重会落这里：本项目未实现 use_preset_vocabulary，
+                // 无基准可缩放，故与 librime 一样降级为 0，但记一笔让用户可见。
+                stats.bad_weight += 1;
+                0
+            }
+        },
+    };
     Some(RimeLine {
         code,
         abbrev,
-        text,
+        text: text.to_string(),
         weight,
         boundary,
     })
@@ -583,25 +784,34 @@ pub fn parse_rime_entries_parallel(
     let path = path.as_ref();
     let content = fs::read_to_string(path)?;
     let Some(off) = rime_body_offset(&content) else {
+        // 此前这里静默返回零条目——连 resolve_columns 的日志都走不到，是全链路最沉默的一处。
+        warn!(
+            "词库 {} 缺少 YAML 正文分隔行 `...`，按零条目处理（文件可能被截断或损坏）。",
+            path.display()
+        );
         return Ok((Vec::new(), Vec::new()));
     };
     let body = &content[off..];
     // 列规格判定一次、全文固定，随后传给每个并行块——保证跨块一致（逐行猜时同文件可能分裂）。
-    let spec = resolve_columns(&content, body, path);
+    // None = 声明残缺，整库跳过（已在 resolve_columns 内 error! 说明原因）。
+    let Some(spec) = resolve_columns(&content, body, path) else {
+        return Ok((Vec::new(), Vec::new()));
+    };
 
-    // 解析一块 → (全拼, 简拼)。
-    let parse_chunk = |chunk: &str| -> RimeEntries {
+    // 解析一块 → (全拼, 简拼, 统计)。统计每块独立累加，最后合并——不引入跨线程共享。
+    let parse_chunk = |chunk: &str| -> (RimeEntries, ParseStats) {
         let mut fulls = Vec::new();
         let mut abbrevs = Vec::new();
+        let mut stats = ParseStats::default();
         for line in chunk.lines() {
-            if let Some(r) = parse_rime_line(line, lowercase_code, spec) {
+            if let Some(r) = parse_rime_line(line, lowercase_code, spec, &mut stats) {
                 if let Some(ab) = r.abbrev {
                     abbrevs.push((ab, r.text.clone(), r.weight));
                 }
                 fulls.push((r.code, r.text, r.weight, r.boundary));
             }
         }
-        (fulls, abbrevs)
+        ((fulls, abbrevs), stats)
     };
 
     let threads = std::thread::available_parallelism()
@@ -609,7 +819,9 @@ pub fn parse_rime_entries_parallel(
         .unwrap_or(1);
     // 小文件 / 单核：串行，省去切块与起线程开销。
     if threads <= 1 || body.len() < (1 << 20) {
-        return Ok(parse_chunk(body));
+        let (entries, stats) = parse_chunk(body);
+        stats.log_if_dirty(path);
+        return Ok(entries);
     }
 
     // 按字节均分，再各自前推到下一个换行后，得到不跨行的块边界。
@@ -632,34 +844,26 @@ pub fn parse_rime_entries_parallel(
 
     let chunks: Vec<&str> = bounds.windows(2).map(|w| &body[w[0]..w[1]]).collect();
 
-    let parts: Vec<RimeEntries> = std::thread::scope(|s| {
+    // 复用同一个 parse_chunk——此前这里另抄了一份循环体，而「同一段解析逻辑存在两份拷贝」
+    // 正是本模块列序 bug 的成因（两份各自演化，修了一份另一份照旧）。
+    let parse_chunk = &parse_chunk;
+    let parts: Vec<(RimeEntries, ParseStats)> = std::thread::scope(|s| {
         let handles: Vec<_> = chunks
             .iter()
-            .map(|chunk| {
-                s.spawn(move || -> RimeEntries {
-                    let mut fulls = Vec::new();
-                    let mut abbrevs = Vec::new();
-                    for line in chunk.lines() {
-                        if let Some(r) = parse_rime_line(line, lowercase_code, spec) {
-                            if let Some(ab) = r.abbrev {
-                                abbrevs.push((ab, r.text.clone(), r.weight));
-                            }
-                            fulls.push((r.code, r.text, r.weight, r.boundary));
-                        }
-                    }
-                    (fulls, abbrevs)
-                })
-            })
+            .map(|chunk| s.spawn(move || parse_chunk(chunk)))
             .collect();
         handles.into_iter().map(|h| h.join().unwrap()).collect()
     });
 
     let mut fulls = Vec::new();
     let mut abbrevs = Vec::new();
-    for (f, a) in parts {
+    let mut stats = ParseStats::default();
+    for ((f, a), st) in parts {
         fulls.extend(f);
         abbrevs.extend(a);
+        stats.merge(&st);
     }
+    stats.log_if_dirty(path);
     Ok((fulls, abbrevs))
 }
 
@@ -786,7 +990,11 @@ mod tests {
         {
             let mut f = std::fs::File::create(&path).unwrap();
             // 声明 columns 才会取权重列（未声明时保守只认 text/code）
-            writeln!(f, "---\nname: py\ncolumns:\n  - text\n  - code\n  - weight\n...").unwrap();
+            writeln!(
+                f,
+                "---\nname: py\ncolumns:\n  - text\n  - code\n  - weight\n..."
+            )
+            .unwrap();
             writeln!(f, "# 注释跳过").unwrap();
             writeln!(f).unwrap(); // 空行跳过
             writeln!(f, "你好\tni hao\t1200").unwrap(); // code 去空格 -> nihao
@@ -818,7 +1026,11 @@ mod tests {
         let n = 60_000; // 每行约 20+ 字节 → 正文 > 1MB，触发并行分支
         {
             let mut f = std::io::BufWriter::new(std::fs::File::create(&path).unwrap());
-            writeln!(f, "---\nname: big\ncolumns:\n  - code\n  - text\n  - weight\n...").unwrap();
+            writeln!(
+                f,
+                "---\nname: big\ncolumns:\n  - code\n  - text\n  - weight\n..."
+            )
+            .unwrap();
             for i in 0..n {
                 // 五笔格式 code\ttext\tweight，code 全 ASCII
                 writeln!(f, "code{i}\t文{i}\t{i}").unwrap();
@@ -842,72 +1054,230 @@ mod tests {
         assert_eq!(codes.len(), n, "所有 code 应唯一");
     }
 
+    /// 构造期望的 `Usable`（`has_syllables` 由 resolve_columns 采样填入，此处恒 false）。
+    fn usable(text_col: usize, code_col: usize, weight_col: Option<usize>) -> ColumnsDecl {
+        ColumnsDecl::Usable(ColumnSpec {
+            text_col,
+            code_col,
+            weight_col,
+            has_syllables: false,
+        })
+    }
+
     /// 头部 `columns:` 声明是权威列规格，两种顺序都要认，且能穿过行内注释。
     #[test]
     fn columns_header_is_authoritative() {
         // flypy 风格：带行内注释
         let flypy = "---\nname: x\ncolumns:    # 码表格式\n  - text    # 文字\n  - code    # 输入码\n  - weight  # 权重\n...\n";
-        assert_eq!(
-            parse_columns_header(flypy),
-            Some(ColumnSpec {
-                text_col: 0,
-                code_col: 1,
-                weight_col: Some(2)
-            })
-        );
+        assert_eq!(parse_columns_header(flypy), usable(0, 1, Some(2)));
         // wubi 风格：code 在前
         let wubi = "---\nname: y\nsort: by_weight\ncolumns:\n  - code\n  - text\n  - weight\n...\n";
-        assert_eq!(
-            parse_columns_header(wubi),
-            Some(ColumnSpec {
-                text_col: 1,
-                code_col: 0,
-                weight_col: Some(2)
-            })
-        );
+        assert_eq!(parse_columns_header(wubi), usable(1, 0, Some(2)));
         // 只声明两列（用户为 12_kf 补的正是这种）→ 无权重列
         let two = "---\nname: kf\ncolumns:\n  - text\n  - code\n...\n";
+        assert_eq!(parse_columns_header(two), usable(0, 1, None));
+        // 无声明
         assert_eq!(
-            parse_columns_header(two),
-            Some(ColumnSpec {
-                text_col: 0,
-                code_col: 1,
-                weight_col: None
-            })
+            parse_columns_header("---\nname: z\n...\n"),
+            ColumnsDecl::Absent
         );
-        // 无声明 → None（交给探测）
-        assert_eq!(parse_columns_header("---\nname: z\n...\n"), None);
         // 声明里出现未支持的列名：占位并顺延后续列下标，不得错位
         let stem = "---\ncolumns:\n  - text\n  - code\n  - stem\n  - weight\n...\n";
         assert_eq!(
             parse_columns_header(stem),
-            Some(ColumnSpec {
-                text_col: 0,
-                code_col: 1,
-                weight_col: Some(3)
-            }),
+            usable(0, 1, Some(3)),
             "stem 占一列，weight 应顺延到下标 3"
         );
-        // 残缺声明（缺 code）不可用 → None，降级探测
-        let broken = "---\ncolumns:\n  - text\n  - weight\n...\n";
-        assert_eq!(parse_columns_header(broken), None, "缺 code 的声明不可用");
         // columns 块后回到别的键，不应越界把后续键读成列名
         let trailing = "---\ncolumns:\n  - code\n  - text\nsort: by_weight\n...\n";
+        assert_eq!(parse_columns_header(trailing), usable(1, 0, None));
+    }
+
+    /// **流式序列必须支持**：它是合法 YAML，且我们的警告文案就建议用户这么写。
+    /// 只认块序列会让照建议改完的用户看到「改了没用」——本项目在这条路上吃过亏。
+    #[test]
+    fn columns_header_accepts_flow_sequence() {
         assert_eq!(
-            parse_columns_header(trailing),
-            Some(ColumnSpec {
-                text_col: 1,
-                code_col: 0,
-                weight_col: None
-            })
+            parse_columns_header("---\nname: x\ncolumns: [text, code, weight]\n...\n"),
+            usable(0, 1, Some(2))
+        );
+        // 紧凑写法 + 行内注释 + code 在前
+        assert_eq!(
+            parse_columns_header("---\ncolumns: [code,text,weight]  # 五笔\n...\n"),
+            usable(1, 0, Some(2))
+        );
+        // 两列流式
+        assert_eq!(
+            parse_columns_header("---\ncolumns: [text, code]\n...\n"),
+            usable(0, 1, None)
         );
     }
 
-    /// **未声明 `columns:` 时只保守取 text/code 两列**，多余列一律忽略——不按位置猜权重。
-    /// 真实反例：`wubi86_jidian_extra_district.dict.yaml` 是 `text\tcode\t\t区号` 四列，
-    /// 第 4 列是行政区划编号；按位置猜会把区号读成词频。
+    /// 残缺声明要能被**区分地**诊断：把「声明不完整」误报成「未声明」，
+    /// 会让照日志排查的人去看头部、发现声明确实存在，从而排除掉正确的线索。
     #[test]
-    fn undeclared_columns_ignore_everything_past_code() {
+    fn incomplete_columns_declaration_is_distinguished() {
+        // 缺 code：librime 的自动编码词库形态（如 `columns: [text, weight]`）
+        assert_eq!(
+            parse_columns_header("---\ncolumns:\n  - text\n  - weight\n...\n"),
+            ColumnsDecl::MissingCode
+        );
+        // 缺 text：librime 直接丢弃整个文件
+        assert_eq!(
+            parse_columns_header("---\ncolumns:\n  - code\n  - weight\n...\n"),
+            ColumnsDecl::MissingText
+        );
+    }
+
+    /// 声明缺 code 的词库**整库跳过**，而不是降级探测。
+    /// 降级探测会把权重列当成编码（`is_code_shape("100")` 为真），静默灌进一整库垃圾编码。
+    #[test]
+    fn missing_code_column_skips_whole_dict() {
+        let path = std::env::temp_dir().join("wind_cols_no_code.dict.yaml");
+        {
+            let mut f = std::fs::File::create(&path).unwrap();
+            writeln!(f, "---\nname: auto\ncolumns:\n  - text\n  - weight\n...").unwrap();
+            writeln!(f, "〇〇八\t100").unwrap();
+            writeln!(f, "〇一二\t100").unwrap();
+        }
+        let (e, ab) = parse_rime_entries_parallel(&path, false).unwrap();
+        let _ = std::fs::remove_file(&path);
+        assert!(
+            e.is_empty() && ab.is_empty(),
+            "无 code 列的词库应整库跳过，不得把权重当编码：{e:?}"
+        );
+    }
+
+    /// **词条内容不该被当成排版空白**：以 U+3000 全角空格为词条的行，此前会被
+    /// `str::trim()` 当缩进削掉（U+3000 属 Unicode White_Space），整行字段左移一格。
+    #[test]
+    fn leading_fullwidth_space_text_is_preserved() {
+        let path = std::env::temp_dir().join("wind_leading_ws.dict.yaml");
+        {
+            let mut f = std::fs::File::create(&path).unwrap();
+            writeln!(f, "---\nname: ws\n...").unwrap();
+            writeln!(f, "\u{3000}\tcokg\t\t全角空格").unwrap(); // 四列，第 3 列空
+            writeln!(f, "\u{3000}\tpwst").unwrap(); // 两列
+            writeln!(f, "字\tabc\t5").unwrap();
+        }
+        let (e, _) = parse_rime_entries_parallel(&path, false).unwrap();
+        let _ = std::fs::remove_file(&path);
+
+        assert_eq!(
+            collect(&e, "\u{3000}"),
+            vec![("cokg".to_string(), 0), ("pwst".to_string(), 0)],
+            "全角空格词条应完整保留，两条都在：{e:?}"
+        );
+        // 不得产出 code 为空串的垃圾条目（字段左移的副产物）
+        assert!(
+            !e.iter().any(|(c, _, _, _)| c.is_empty()),
+            "不应出现空编码条目：{e:?}"
+        );
+        assert_eq!(collect(&e, "字"), vec![("abc".to_string(), 5)]);
+    }
+
+    /// text 或 code 为空的行必须跳过：空 code 会让条目全挤进 `entries[""]`。
+    #[test]
+    fn empty_text_or_code_rows_are_skipped() {
+        let path = std::env::temp_dir().join("wind_empty_fields.dict.yaml");
+        {
+            let mut f = std::fs::File::create(&path).unwrap();
+            writeln!(f, "---\nname: e\n...").unwrap();
+            writeln!(f, "我\t").unwrap(); // code 空（行尾 trim 后仅一列，落列数门槛）
+            writeln!(f, "\tabc").unwrap(); // text 空
+            writeln!(f, "好\thao\t9").unwrap();
+        }
+        let (e, _) = parse_rime_entries_parallel(&path, false).unwrap();
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(e.len(), 1, "只应留下完整的那一条：{e:?}");
+        assert_eq!(collect(&e, "好"), vec![("hao".to_string(), 9)]);
+    }
+
+    /// **编码在前的拼音库不得被当成形码**：librime 完全允许 `columns: [code, text, weight]`，
+    /// 而旧判据只看列顺序，会把它整库当五笔处理——**丢掉整张简拼表、音节边界全归零**，
+    /// 双拼与整句逻辑集体降级回 DAG 猜切分。空格是音节的正面证据，应胜过列顺序惯例。
+    #[test]
+    fn code_first_pinyin_dict_keeps_syllables() {
+        let py = std::env::temp_dir().join("wind_syl_codefirst.dict.yaml");
+        {
+            let mut f = std::fs::File::create(&py).unwrap();
+            writeln!(
+                f,
+                "---\nname: p\ncolumns:\n  - code\n  - text\n  - weight\n..."
+            )
+            .unwrap();
+            writeln!(f, "ni hao\t你好\t1200").unwrap();
+            writeln!(f, "ni\t你\t800").unwrap();
+        }
+        let (e, ab) = parse_rime_entries_parallel(&py, false).unwrap();
+        let _ = std::fs::remove_file(&py);
+        assert_eq!(collect(&e, "你好"), vec![("nihao".to_string(), 1200)]);
+        assert_eq!(
+            boundary_of(&e, "你好"),
+            Some(0b101),
+            "code 在前的拼音库同样应保留音节边界"
+        );
+        assert_eq!(
+            collect_ab(&ab, "你好"),
+            vec![("nh".to_string(), 1200)],
+            "code 在前的拼音库不应丢简拼表"
+        );
+    }
+
+    /// 编码在前 + 无空格 → 五笔类形码，boundary 恒 0（= 无边界信息，消费方降级 DAG）。
+    /// 与之对照，**text 在前且无空格**的单音节拼音词条（`好\thao`）必须保留 `0b1`——
+    /// 「整串是一个音节」是真信息，双拼真值校验要用它。无空格时数据本身区分不了这两者，
+    /// 故沿用列顺序惯例兜底。
+    #[test]
+    fn spaceless_code_first_is_form_code_but_text_first_keeps_single_syllable() {
+        let wubi = std::env::temp_dir().join("wind_syl_wubi.dict.yaml");
+        {
+            let mut f = std::fs::File::create(&wubi).unwrap();
+            writeln!(
+                f,
+                "---\nname: w\ncolumns:\n  - code\n  - text\n  - weight\n..."
+            )
+            .unwrap();
+            writeln!(f, "aaaa\t工\t99").unwrap();
+        }
+        let (e, ab) = parse_rime_entries_parallel(&wubi, false).unwrap();
+        let _ = std::fs::remove_file(&wubi);
+        assert_eq!(boundary_of(&e, "工"), Some(0), "形码不应有音节边界");
+        assert!(ab.is_empty(), "形码不应产出简拼");
+
+        let py = std::env::temp_dir().join("wind_syl_single.dict.yaml");
+        {
+            let mut f = std::fs::File::create(&py).unwrap();
+            writeln!(f, "---\nname: s\n...").unwrap(); // 无声明 → 探测得 text 在前
+            writeln!(f, "好\thao\t2000").unwrap();
+        }
+        let (e2, _) = parse_rime_entries_parallel(&py, false).unwrap();
+        let _ = std::fs::remove_file(&py);
+        assert_eq!(
+            boundary_of(&e2, "好"),
+            Some(0b1),
+            "单音节拼音词条的「整串一个音节」是真信息，不得归零"
+        );
+    }
+
+    /// 缺 `...` 分隔行 → 零条目（此前是全链路最沉默的一处，现已有 warn）。
+    #[test]
+    fn missing_body_separator_yields_zero_entries() {
+        let path = std::env::temp_dir().join("wind_no_sep.dict.yaml");
+        {
+            let mut f = std::fs::File::create(&path).unwrap();
+            writeln!(f, "---\nname: broken\n你好\tni hao\t1").unwrap(); // 没有 `...`
+        }
+        let (e, _) = parse_rime_entries_parallel(&path, false).unwrap();
+        let _ = std::fs::remove_file(&path);
+        assert!(e.is_empty());
+    }
+
+    /// 未声明 `columns:` 时按 librime 默认取第 3 列作权重，**第 4 列及以后一律不读**。
+    /// 真实样本：`wubi86_jidian_extra_district.dict.yaml` 是 `text\tcode\t\t区号` 四列，
+    /// 第 3 列为空（→ 权重 0）、第 4 列是行政区划编号——它不得被当成权重。
+    #[test]
+    fn undeclared_columns_ignore_everything_past_weight() {
         let path = std::env::temp_dir().join("wind_cols_undeclared_extra.dict.yaml");
         {
             let mut f = std::fs::File::create(&path).unwrap();
@@ -967,7 +1337,11 @@ mod tests {
         let path = std::env::temp_dir().join("wind_cols_declared.dict.yaml");
         {
             let mut f = std::fs::File::create(&path).unwrap();
-            writeln!(f, "---\nname: en\ncolumns:\n  - code\n  - text\n  - weight\n...").unwrap();
+            writeln!(
+                f,
+                "---\nname: en\ncolumns:\n  - code\n  - text\n  - weight\n..."
+            )
+            .unwrap();
             writeln!(f, "abs\tABS\t100").unwrap();
             writeln!(f, "adob\tAdobe\t20").unwrap();
         }

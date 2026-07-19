@@ -111,6 +111,11 @@ pub struct EngineManager {
 /// 进程级缓存根目录（%LOCALAPPDATA%\WindInput\cache），EngineManager::new 设置一次。
 static CACHE_DIR: std::sync::OnceLock<Option<std::path::PathBuf>> = std::sync::OnceLock::new();
 
+/// 多库合并缓存（`combined.wdat`）的指纹 tag。
+const COMBINED_CACHE_TAG: &str = "combined/v1";
+/// rime_pinyin 主表+import_tables 合并缓存（`merged.wdat`）的指纹 tag。
+const MERGED_CACHE_TAG: &str = "merged/v1";
+
 /// 深合并 TOML：`over` 覆盖到 `base` 之上。两侧皆为 table 时逐键递归；否则 over 整体替换。
 /// 数组按整体替换（如 encoder.rules 覆盖即替换全表）。
 ///
@@ -1749,11 +1754,16 @@ impl EngineManager {
 
         let ug_wdb = cache_path(ug_txt, "wdb");
         // wdb 比 txt 新则直接用；否则从 txt 重建
-        let fresh = Self::combined_cache_fresh(&[ug_txt], &ug_wdb);
+        let fresh =
+            Self::combined_cache_fresh(&[ug_txt], &ug_wdb, wind_dict::cache_fp::UNIGRAM_TAG);
         if !(ug_wdb.exists() && fresh) {
             match parse_unigram_freqs(ug_txt) {
                 Ok(freqs) => match write_unigram_wdb(&ug_wdb, &freqs) {
-                    Ok(()) => wind_dict::cache_fp::write_cache_fp(&ug_wdb, &[ug_txt]),
+                    Ok(()) => wind_dict::cache_fp::write_cache_fp(
+                        &ug_wdb,
+                        &[ug_txt],
+                        wind_dict::cache_fp::UNIGRAM_TAG,
+                    ),
                     Err(e) => warn!("Failed to write unigram.wdb {}: {}", ug_wdb.display(), e),
                 },
                 Err(e) => {
@@ -1949,8 +1959,14 @@ impl EngineManager {
         sources: &[(std::path::PathBuf, String)],
         combined: &Path,
     ) -> Option<CachedDict> {
-        let paths: Vec<&Path> = sources.iter().map(|(p, _)| p.as_path()).collect();
-        if Self::combined_cache_fresh(&paths, combined) {
+        // 指纹须覆盖全部真实输入：rime_pinyin 源在构建时会展开 import_tables，
+        // 只喂主表会让「改子表」无法使缓存失效。
+        let expanded: Vec<std::path::PathBuf> = sources
+            .iter()
+            .flat_map(|(p, t)| Self::rime_source_paths(p, t))
+            .collect();
+        let paths: Vec<&Path> = expanded.iter().map(|p| p.as_path()).collect();
+        if Self::combined_cache_fresh(&paths, combined, COMBINED_CACHE_TAG) {
             if let Ok(reader) = wind_dict::datformat::WdatReader::open(combined) {
                 info!(
                     "Using combined cache: {} ({} keys)",
@@ -2002,7 +2018,7 @@ impl EngineManager {
         match writer.write(combined) {
             Ok(_) => {
                 // 写内容指纹(覆盖全部源，与上面 fresh 校验的 paths 一致)
-                wind_dict::cache_fp::write_cache_fp(combined, &paths);
+                wind_dict::cache_fp::write_cache_fp(combined, &paths, COMBINED_CACHE_TAG);
                 match wind_dict::datformat::WdatReader::open(combined) {
                     Ok(reader) => {
                         info!(
@@ -2026,12 +2042,84 @@ impl EngineManager {
         }
     }
 
-    /// combined.wdb 是否比所有源文件新（源文件缺失/不可访问视为缓存失效）
     /// 缓存是否可复用：按源文件**内容指纹**判定（非 mtime）。
     /// scp/部署/版本控制会刷新源 mtime，旧的 mtime 校验会因此恒失效 → 每次重建(300MB)；
     /// 改为内容指纹后，源内容未变即复用，构建后由 write_cache_fp 写指纹 sidecar。
-    fn combined_cache_fresh(paths: &[&Path], combined: &Path) -> bool {
-        wind_dict::cache_fp::cache_is_fresh(combined, paths)
+    ///
+    /// `paths` 必须覆盖**全部**参与构建的源文件——含 rime_pinyin 的 import_tables 子表，
+    /// 否则改子表不会让缓存失效（静默复用陈旧件）。见 [`Self::rime_source_paths`]。
+    fn combined_cache_fresh(paths: &[&Path], combined: &Path, tag: &str) -> bool {
+        wind_dict::cache_fp::cache_is_fresh(combined, paths, tag)
+    }
+
+    /// 某个词库源实际参与构建的**全部**文件：主表本身，外加 `rime_pinyin` 的
+    /// `import_tables` 子表（子表不存在则跳过）。非 rime_pinyin 只有主表。
+    ///
+    /// 抽出来是因为它有两个消费方（merged 与 combined 两层缓存），而此前只有前者展开了
+    /// 子表 —— 于是改子表时内层 merged 正确重建、外层 combined 指纹却纹丝不动，
+    /// 继续喂陈旧数据给反查索引。**指纹漏掉任一真实输入，就是一条静默陈旧路径。**
+    fn rime_source_paths(dict_path: &Path, dict_type: &str) -> Vec<std::path::PathBuf> {
+        let mut out = vec![dict_path.to_path_buf()];
+        if dict_type != "rime_pinyin" {
+            return out;
+        }
+        // 以下三条降级都会让 import_tables 整批读不到，只剩主表（rime 主表往往只有头部
+        // 元数据、正文寥寥）→ 拼音几乎无候选。必须留下痕迹，否则症状是「拼音突然打不出字」
+        // 而日志一片干净。
+        let content = match std::fs::read_to_string(dict_path) {
+            Ok(c) => c,
+            Err(e) => {
+                warn!(
+                    "词库 {} 读取失败（{e}），无法展开 import_tables，仅按主表处理。",
+                    dict_path.display()
+                );
+                return out;
+            }
+        };
+        // 已知局限（沿用自改动前）：这里是**朴素子串**搜索，而非 codetable.rs 的
+        // `rime_body_offset` 那种行精确匹配。若头部某个值里含字面量 `...`，会被提前截断。
+        // 现存词库无一命中；要收紧须把行精确的分隔行定位提升为 wind-dict 的公开 API。
+        let yaml_section = if let Some(start) = content.find("---") {
+            let after = &content[start + 3..];
+            after.find("...").map(|end| &after[..end]).unwrap_or(after)
+        } else {
+            &content
+        };
+        let yaml = match serde_yaml::from_str::<serde_yaml::Value>(yaml_section) {
+            Ok(y) => y,
+            Err(e) => {
+                warn!(
+                    "词库 {} 的 YAML 头部解析失败（{e}），无法展开 import_tables，仅按主表处理。",
+                    dict_path.display()
+                );
+                return out;
+            }
+        };
+        let Some(dir) = dict_path.parent() else {
+            warn!(
+                "词库路径 {} 没有父目录，无法定位 import_tables 子表。",
+                dict_path.display()
+            );
+            return out;
+        };
+        if let Some(tables) = yaml.get("import_tables").and_then(|v| v.as_sequence()) {
+            for t in tables {
+                if let Some(name) = t.as_str() {
+                    let sub = dir.join(format!("{}.dict.yaml", name));
+                    if sub.exists() {
+                        out.push(sub);
+                    } else {
+                        warn!(
+                            "词库 {} 的 import_tables 声明了 {}，但 {} 不存在，已跳过。",
+                            dict_path.display(),
+                            name,
+                            sub.display()
+                        );
+                    }
+                }
+            }
+        }
+        out
     }
 
     /// 加载 rime_pinyin 词典（合并 import_tables 子词典到 .merged.wdb）
@@ -2039,34 +2127,17 @@ impl EngineManager {
         // merged.wdb 写到可写缓存目录（与 unigram 一致）。安装目录（如 Program Files）
         // 通常只读，若写在源旁会失败 → 回退仅主词典(rime header 数十条) → 拼音无候选。
         let merged_wdb = cache_path(dict_path, "merged.wdat");
-        // 先解析主表头部，收集全部源（主表 + import_tables 子表）。指纹/缓存校验需覆盖
-        // 全部源，故须先于 fresh 判定算出 sub_paths（仅解析头部 yaml，开销极低）。
-        let content = std::fs::read_to_string(dict_path).ok()?;
-        let yaml_section = if let Some(start) = content.find("---") {
-            let after = &content[start + 3..];
-            after.find("...").map(|end| &after[..end]).unwrap_or(after)
-        } else {
-            &content
-        };
-        let yaml: serde_yaml::Value = serde_yaml::from_str(yaml_section).ok()?;
-        let dict_dir = dict_path.parent()?;
-
-        let mut sub_paths = vec![dict_path.to_path_buf()];
-        if let Some(import_tables) = yaml.get("import_tables").and_then(|v| v.as_sequence()) {
-            for table_ref in import_tables {
-                if let Some(name) = table_ref.as_str() {
-                    let sub = dict_dir.join(format!("{}.dict.yaml", name));
-                    if sub.exists() {
-                        sub_paths.push(sub);
-                    }
-                }
-            }
-        }
+        // 收集全部源（主表 + import_tables 子表）。指纹/缓存校验需覆盖全部源，
+        // 故须先于 fresh 判定算出（仅解析头部 yaml，开销极低）。
+        // 与 combined 层共用 rime_source_paths——两处各写一份正是 R6 那条陈旧路径的成因。
+        let sub_paths = Self::rime_source_paths(dict_path, "rime_pinyin");
         let src_refs: Vec<&Path> = sub_paths.iter().map(|p| p.as_path()).collect();
 
         // merged 缓存对**全部源**做内容指纹校验：主表或任一子表内容变化、或源清单增删都
         // 判定失效并重建（避免「子表改了却仍用旧 merged」的静默陈旧）。
-        if merged_wdb.exists() && Self::combined_cache_fresh(&src_refs, &merged_wdb) {
+        if merged_wdb.exists()
+            && Self::combined_cache_fresh(&src_refs, &merged_wdb, MERGED_CACHE_TAG)
+        {
             match wind_dict::datformat::WdatReader::open(&merged_wdb) {
                 Ok(reader) => {
                     info!(
@@ -2169,7 +2240,7 @@ impl EngineManager {
             }
             // 写内容指纹(覆盖全部源；仅对正式缓存路径，fresh 校验也只看 merged_wdb)
             if target.as_path() == merged_wdb.as_path() {
-                wind_dict::cache_fp::write_cache_fp(&merged_wdb, &src_refs);
+                wind_dict::cache_fp::write_cache_fp(&merged_wdb, &src_refs, MERGED_CACHE_TAG);
             }
             match wind_dict::datformat::WdatReader::open(target) {
                 Ok(reader) => {
@@ -2369,7 +2440,11 @@ mod tests {
         );
 
         let ext1 = &arr[1];
-        assert_eq!(ext1.get("enabled").unwrap().as_bool(), Some(false), "enabled 被覆盖");
+        assert_eq!(
+            ext1.get("enabled").unwrap().as_bool(),
+            Some(false),
+            "enabled 被覆盖"
+        );
         assert_eq!(
             ext1.get("path").unwrap().as_str(),
             Some("new/b.yaml"),
@@ -2379,7 +2454,8 @@ mod tests {
         assert_eq!(ext1.get("base_order").unwrap().as_integer(), Some(1));
 
         assert!(
-            !arr.iter().any(|d| d.get("id").and_then(|v| v.as_str()) == Some("gone")),
+            !arr.iter()
+                .any(|d| d.get("id").and_then(|v| v.as_str()) == Some("gone")),
             "方案已删除的库不因 override 复活"
         );
     }

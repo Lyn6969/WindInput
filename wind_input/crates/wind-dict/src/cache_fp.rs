@@ -3,9 +3,9 @@
 //! 痛点：词库源 mtime 会被 scp/部署/版本控制刷新，导致 mtime 校验恒失效 → 每次重建
 //! (300MB、耗时)。改用内容指纹后，只要源**内容**未变即复用缓存。
 //!
-//! 用法：
-//!   - 加载前：`cache_is_fresh(cache, sources)` 为 true 则直接用缓存；
-//!   - 构建后：`write_cache_fp(cache, sources)` 写指纹 sidecar 供下次校验。
+//! 用法（`tag` 标明「这份缓存是按什么方式解析出来的」，读写必须一致）：
+//!   - 加载前：`cache_is_fresh(cache, sources, tag)` 为 true 则直接用缓存；
+//!   - 构建后：`write_cache_fp(cache, sources, tag)` 写指纹 sidecar 供下次校验。
 //!
 //! 指纹用 std SipHash（DefaultHasher）：仅做变更检测，非加密用途，足够且无额外依赖。
 
@@ -29,14 +29,26 @@ fn fp_sidecar(cache: &Path) -> PathBuf {
 /// 历史：
 /// - 1 = 初始（列序逐行按 ASCII 猜）
 /// - 2 = 列序改为文件级判定：读头部 `columns:` 声明，无声明则整文件投票探测列序、
-///       权重仍按 librime 默认取第 3 列（纯 ASCII 词条如 `@`、`$CC(...)` 不再被误判成编码列）
-const PARSE_SEMANTICS_VERSION: u32 = 2;
+///   权重仍按 librime 默认取第 3 列（纯 ASCII 词条如 `@`、`$CC(...)` 不再被误判成编码列）
+/// - 3 = 只剥行尾空白（前导 U+3000 等不再被当缩进削掉）、空 text/code 跳过、
+///   音节语义补上「code 列含空格」这条正面证据（编码在前的拼音库不再丢简拼与边界）、
+///   `columns:` 支持流式写法且残缺声明改为整库跳过
+const PARSE_SEMANTICS_VERSION: u32 = 3;
 
-/// 计算源文件集合的内容指纹：混入解析语义版本 + 对每个源的 文件名 + 长度 + 全部内容。
+/// 计算源文件集合的内容指纹：混入解析语义版本 + 调用方 tag + 每个源的 文件名/长度/内容。
+///
+/// `tag` 用于区分「同一份源文件、但解析方式不同」的缓存。**没有它就会出现这种静默错误**：
+/// 把某词库的 `dict_type` 在 english ↔ 非 english 之间切换，只改变 `lowercase_code`
+/// 而 `.yaml` 字节不变 → 指纹命中 → 永久复用大小写错误的缓存。
+/// 同理，不同种类的缓存（词库 / unigram）也应各自持 tag，免得共用一个语义版本号
+/// 却各改各的、谁也没动机去 +1。
+///
 /// 任一源不可读 → None（视为需重建）。
-fn fingerprint(sources: &[&Path]) -> Option<String> {
+fn fingerprint(sources: &[&Path], tag: &str) -> Option<String> {
     let mut h = std::collections::hash_map::DefaultHasher::new();
     h.write_u32(PARSE_SEMANTICS_VERSION);
+    h.write(tag.as_bytes());
+    h.write_u8(0xfe); // tag 与源内容之间的分隔
     for p in sources {
         let data = std::fs::read(p).ok()?;
         if let Some(name) = p.file_name() {
@@ -49,23 +61,37 @@ fn fingerprint(sources: &[&Path]) -> Option<String> {
     Some(format!("{:016x}", h.finish()))
 }
 
-/// 缓存是否可复用：缓存文件存在 且 指纹 sidecar 与当前源内容一致。
-pub fn cache_is_fresh(cache: &Path, sources: &[&Path]) -> bool {
+/// 缓存是否可复用：缓存文件存在 且 指纹 sidecar 与当前源内容+tag 一致。
+/// `tag` 见 [`fingerprint`]，必须与写入时一致。
+pub fn cache_is_fresh(cache: &Path, sources: &[&Path], tag: &str) -> bool {
     if !cache.exists() {
         return false;
     }
-    let Some(fp) = fingerprint(sources) else {
+    let Some(fp) = fingerprint(sources, tag) else {
         return false;
     };
     matches!(std::fs::read_to_string(fp_sidecar(cache)), Ok(s) if s.trim() == fp)
 }
 
 /// 缓存构建成功后调用：写入指纹 sidecar（best-effort，失败仅影响下次会多重建一次）。
-pub fn write_cache_fp(cache: &Path, sources: &[&Path]) {
-    if let Some(fp) = fingerprint(sources) {
+pub fn write_cache_fp(cache: &Path, sources: &[&Path], tag: &str) {
+    if let Some(fp) = fingerprint(sources, tag) {
         let _ = std::fs::write(fp_sidecar(cache), fp);
     }
 }
+
+/// 词库缓存的 tag：区分 code 列是否被小写化（`dict_type = english` 走小写）。
+pub fn dict_tag(lowercase_code: bool) -> &'static str {
+    if lowercase_code {
+        "dict/lowercase"
+    } else {
+        "dict/raw"
+    }
+}
+
+/// unigram 词频缓存的 tag。它与词库解析无关，单独持 tag 后，
+/// 改 unigram 解析只需改这里的版本后缀，不必去动全局的 [`PARSE_SEMANTICS_VERSION`]。
+pub const UNIGRAM_TAG: &str = "unigram/v1";
 
 #[cfg(test)]
 mod tests {
@@ -89,10 +115,13 @@ mod tests {
     #[test]
     fn parse_semantics_version_participates_in_fingerprint() {
         let src = tmp("semver_src.txt", b"same content");
-        let fp_now = fingerprint(&[&src]).unwrap();
-        // 复算一份「版本不同」的指纹：与 fingerprint() 同构，仅版本号 +1
+        let fp_now = fingerprint(&[&src], "t").unwrap();
+        // 复算一份「仅版本号不同」的指纹：与 fingerprint() 严格同构（含 tag 部分），
+        // 只把版本 +1——否则差异可能来自别处，测试就名不副实了。
         let mut h = std::collections::hash_map::DefaultHasher::new();
         h.write_u32(PARSE_SEMANTICS_VERSION + 1);
+        h.write(b"t");
+        h.write_u8(0xfe);
         let data = std::fs::read(&src).unwrap();
         h.write(src.file_name().unwrap().to_string_lossy().as_bytes());
         h.write_u64(data.len() as u64);
@@ -105,28 +134,52 @@ mod tests {
         );
     }
 
+    /// tag 参与指纹：同一份源、不同解析方式（如 english 词库的 code 小写化）
+    /// 必须落到不同指纹，否则切换 dict_type 会永久复用大小写错误的缓存。
+    #[test]
+    fn tag_participates_in_fingerprint() {
+        let src = tmp("tag_src.txt", b"same content");
+        let raw = fingerprint(&[&src], dict_tag(false)).unwrap();
+        let lower = fingerprint(&[&src], dict_tag(true)).unwrap();
+        assert_ne!(raw, lower, "lowercase 与否必须得到不同指纹");
+        assert_ne!(
+            raw,
+            fingerprint(&[&src], UNIGRAM_TAG).unwrap(),
+            "不同种类缓存必须得到不同指纹"
+        );
+
+        // 端到端：用 raw tag 写的指纹，不该被 lowercase tag 判为新鲜
+        let cache = tmp("tag_src.cache", b"<built>");
+        write_cache_fp(&cache, &[&src], dict_tag(false));
+        assert!(cache_is_fresh(&cache, &[&src], dict_tag(false)));
+        assert!(
+            !cache_is_fresh(&cache, &[&src], dict_tag(true)),
+            "tag 不一致时必须判定为不新鲜"
+        );
+    }
+
     #[test]
     fn fresh_only_when_content_matches() {
         let src = tmp("src.txt", b"hello dict");
         let cache = tmp("src.cache", b"<built>");
         // 未写指纹 → 不新鲜
-        assert!(!cache_is_fresh(&cache, &[&src]));
+        assert!(!cache_is_fresh(&cache, &[&src], "t"));
         // 写指纹后 → 新鲜
-        write_cache_fp(&cache, &[&src]);
-        assert!(cache_is_fresh(&cache, &[&src]));
+        write_cache_fp(&cache, &[&src], "t");
+        assert!(cache_is_fresh(&cache, &[&src], "t"));
     }
 
     #[test]
     fn mtime_change_keeps_fresh_content_change_invalidates() {
         let src = tmp("src2.txt", b"content A");
         let cache = tmp("src2.cache", b"<built>");
-        write_cache_fp(&cache, &[&src]);
+        write_cache_fp(&cache, &[&src], "t");
         // 仅改 mtime（重写相同内容）→ 仍新鲜（这正是修复点）
         std::fs::write(&src, b"content A").unwrap();
-        assert!(cache_is_fresh(&cache, &[&src]));
+        assert!(cache_is_fresh(&cache, &[&src], "t"));
         // 改内容 → 失效
         std::fs::write(&src, b"content B").unwrap();
-        assert!(!cache_is_fresh(&cache, &[&src]));
+        assert!(!cache_is_fresh(&cache, &[&src], "t"));
     }
 
     #[test]
@@ -134,6 +187,6 @@ mod tests {
         let src = tmp("src3.txt", b"x");
         let cache = std::env::temp_dir().join("wind_fp_test_nope.cache");
         let _ = std::fs::remove_file(&cache);
-        assert!(!cache_is_fresh(&cache, &[&src]));
+        assert!(!cache_is_fresh(&cache, &[&src], "t"));
     }
 }

@@ -96,7 +96,7 @@ default = true              # 主库标志；非 default 为扩展库
 
 | 格式 | 文件 | 说明 |
 |---|---|---|
-| YAML 源 | `.dict.yaml` | RIME 风格 TSV：五笔 `code\ttext\tweight`，拼音 `text\tcode\tweight`，按首列是否全 ASCII 自动判别（`codetable.rs:load()`） |
+| YAML 源 | `.dict.yaml` | RIME 风格 TSV：五笔 `code\ttext\tweight`，拼音 `text\tcode\tweight`。列序按**文件级**判定——头部 `columns:` 声明优先，无声明则整文件投票探测、默认 `text` 在前（`codetable.rs:resolve_columns`）。详见 [rime-dict-loading.md](./rime-dict-loading.md) |
 | 二进制 | `.wdb` | Header + KeyIndex + DataSection + StringPool；V3 条目含 order 字段（`binformat.rs`） |
 | 双数组 Trie | `.wdat` | Header + Base/Check 数组 + LeafTable + EntryRecords + StringPool + 可选简拼段（AbbrevSection）+ CharMap（`datformat.rs`） |
 
