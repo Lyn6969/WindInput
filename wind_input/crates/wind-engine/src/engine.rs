@@ -39,6 +39,14 @@ pub struct ConvertResult {
     pub is_empty: bool,
     /// 满码空码时是否应清空缓冲（码表 clear_on_empty_max）
     pub should_clear: bool,
+    /// 精确匹配空码补全的**备选**（码表 `single_code_input` + `single_code_complete`）：
+    /// 从更长编码取的首选，**尚未**计入 `candidates`。
+    ///
+    /// 补全的语义是「一条候选都没有时的兜底」，而这个「没有」必须按**最终显示列表**判定。
+    /// 引擎只看得见自己这一层，看不见协调器随后叠加的短语，就地判空会在「短语已有候选」时
+    /// 多冒一条无关的后续编码；反过来，引擎抢先填非空又会把协调器的短语前缀补全误压制。
+    /// 故引擎只备货，采纳与否由掌握最终列表的协调器统一收口（见 `build_candidates`）。
+    pub completion_hint: Option<Candidate>,
 }
 
 /// 基础引擎接口

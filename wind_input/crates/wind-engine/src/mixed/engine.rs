@@ -407,6 +407,10 @@ impl Engine for MixedEngine {
         let ct_should_commit = ct.should_commit;
         let ct_commit_text = ct.commit_text.clone();
         let ct_should_clear = ct.should_clear;
+        // 主码表的精确空码补全备选原样上浮：混输合并后仍可能一条候选都没有（拼音也未命中），
+        // 那时才由协调器采纳。此处若就地并入 `codetable` 会重蹈引擎自行判空的覆辙——拼音候选
+        // 尚未合入，这一层的「空」同样不是最终的空。见 `ConvertResult::completion_hint`。
+        let ct_completion_hint = ct.completion_hint;
         let mut codetable: Vec<Candidate> = ct.candidates;
         for c in &mut codetable {
             if c.is_phrase {
@@ -497,6 +501,7 @@ impl Engine for MixedEngine {
             should_commit,
             commit_text,
             should_clear,
+            completion_hint: ct_completion_hint,
             ..Default::default()
         })
     }

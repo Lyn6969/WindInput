@@ -356,6 +356,11 @@ impl Coordinator {
 
         // 词库候选 value 内嵌特殊语法统一展开（汇聚点：所有路径共用，见
         // finalize_candidates / docs/redesign/unified-candidate-value-expansion.md）。
+        // 精确匹配空码补全的两个候选源，在下方「补全收口」处统一判空后择一采纳：
+        // - `engine_completion`：码表引擎备下的更长编码首选（`ConvertResult::completion_hint`）；
+        // - `completion_pool`：短语侧前缀命中（仅精确模式抑制了枚举时才装填）。
+        let engine_completion = result.completion_hint;
+        let mut completion_pool: Vec<Candidate> = Vec::new();
         let mut candidates = self.finalize_candidates(result.candidates, &state.input_buffer);
         let phrases = self.phrases.read().unwrap_or_else(|e| e.into_inner());
         if !phrases.is_empty() {
@@ -402,31 +407,25 @@ impl Coordinator {
             // 精确码短语（`lookup`）——与码表引擎跳过 `search_prefix` 的行为对齐。混输不适用：其拼音半边
             // 恒前缀匹配，切精确会与拼音割裂（见 `EngineManager::is_codetable`）。
             // 例外——镜像码表引擎 `single_code_complete`：当前无任何候选（码表 + 精确短语均空）且未满码时，
-            // 放行一次前缀枚举作补全，避免精确模式下彻底无候选（对齐引擎"精确空码取更长首选"语义）。
+            // 放行一次前缀枚举作**补全候选源**，避免精确模式下彻底无候选。
             let ct = self.engine_mgr.codetable_settings();
             let exact_only = self.engine_mgr.is_codetable() && ct.single_code_input;
-            // 空码补全兜底：仅在精确模式抑制了前缀枚举时才可能触发。
+            // 空码补全的短语侧取数闸门：仅在精确模式抑制了前缀枚举时才可能触发。此处的
+            // `candidates.is_empty()` 已是「码表候选 + 精确短语」之和——码表引擎不再抢先把
+            // 补全候选塞进来（见 `ConvertResult::completion_hint`），故这个「空」判得准。
             let complete_fallback = exact_only
                 && ct.single_code_complete
                 && candidates.is_empty()
                 && state.input_buffer.chars().count() < self.engine_mgr.active_max_code_length();
-            let mut prefix_hits = if !exact_only || complete_fallback {
+            let prefix_hits = if !exact_only || complete_fallback {
                 phrases.lookup_prefix(&state.input_buffer, &recent, min_prefix)
             } else {
                 Vec::new()
             };
-            if complete_fallback {
-                // 补全**仅取首选一条**：引擎侧同分支只 push 一条（search_prefix().find()，
-                // 见 codetable/engine.rs "空码补全：从更长编码取首个候选作提示"）。短语侧原样
-                // 放行整串前缀命中，致精确模式下空码补全冒出多条「后续」，与码表规格分叉。
-                //
-                // 须先定序再取：lookup_prefix 由 HashMap 遍历产出、顺序不定（见 wind-phrase
-                // lookup_prefix_at），直接 take(1) 取到的是随机一条而非首选。权重降序 + 文本
-                // 兜底保证稳定；协调器后续的整体排序不改变「只有一条」这个事实。
-                prefix_hits
-                    .sort_by(|a, b| b.weight.cmp(&a.weight).then_with(|| a.text.cmp(&b.text)));
-                prefix_hits.truncate(1);
-            }
+            // 前缀命中 → 候选的构造，正常枚举与补全池两条去向共用：补全要取的是「若开启前缀
+            // 匹配，本会显示在最前的那一条」，故它必须与正常枚举**构造得一模一样**，才能用同一个
+            // 显示排序器（`candidate_display_order`）比出真正的首条。
+            let mut built: Vec<Candidate> = Vec::new();
             for hit in prefix_hits {
                 // 完整原文（仅一行化，不截断）：上屏用原始文本，截断加省略号由 UI 下发层负责。
                 let text = Self::clamp_candidate_display(&hit.text, 0);
@@ -438,7 +437,7 @@ impl Coordinator {
                 if let Some(src) = hit.command_src {
                     // $CC 命令短语：选中直接执行，不二级展开。
                     let code = hit.nav_code.unwrap_or_default();
-                    candidates.push(Candidate {
+                    built.push(Candidate {
                         text,
                         weight: PHRASE_WEIGHT_BASE + hit.weight,
                         is_phrase: true,
@@ -452,7 +451,7 @@ impl Coordinator {
                 } else if let Some(code) = hit.nav_code {
                     // $SS/$AA 组短语：选中补全到完整码再二级展开。
                     // phrase_template 存原始记录文本：右键「禁用短语」按 (group_code, 原文) 定位。
-                    candidates.push(Candidate {
+                    built.push(Candidate {
                         text: text.clone(),
                         weight: PHRASE_WEIGHT_BASE + hit.weight,
                         is_phrase: true,
@@ -466,7 +465,7 @@ impl Coordinator {
                     });
                 } else {
                     // 静态短语前缀命中（Literal/Template，command_src=None, nav_code=None）。
-                    candidates.push(Candidate {
+                    built.push(Candidate {
                         text,
                         weight: PHRASE_WEIGHT_BASE + hit.weight,
                         is_phrase: true,
@@ -478,8 +477,32 @@ impl Coordinator {
                     });
                 }
             }
+            if complete_fallback {
+                completion_pool.extend(built);
+            } else {
+                candidates.extend(built);
+            }
         }
         drop(phrases);
+        // ── 空码补全收口 ──────────────────────────────────────────────────────
+        // 精确匹配模式下「一条候选都没有」时补一条兜底。判据必须落在**最终列表**上：码表引擎
+        // 与短语层各自只看得见自己那一半，谁先跑谁就会拿子集的空当成全局的空——引擎抢先补一条，
+        // 屏幕上短语旁边就多出无关的后续编码；反过来引擎补的那条又会让短语侧误判「已有候选」
+        // 而放弃补全。故两边都只交候选源（`completion_hint` / `completion_pool`），在此统一判空、
+        // 统一取一条。
+        //
+        // 取哪一条：**若开启前缀匹配，本会显示在最前的那一条**——用与最终列表同一个
+        // `candidate_display_order` 排序，不另立跨来源的优先级规则，将来前缀模式排序改了这里自动跟随。
+        // 末级补 text 兜底：`lookup_prefix` 由 HashMap 遍历产出、顺序不定（见 wind-phrase
+        // lookup_prefix_at），而 `candidate_display_order` 无文本末级，同分时取到的会是随机一条。
+        if candidates.is_empty() {
+            completion_pool.extend(engine_completion);
+            let ignore_weight = self.engine_mgr.active_base_sort_ignores_weight();
+            completion_pool.sort_by(|a, b| {
+                candidate_display_order(a, b, ignore_weight).then_with(|| a.text.cmp(&b.text))
+            });
+            candidates.extend(completion_pool.into_iter().next());
+        }
         // 候选层级排序：合并引擎候选 + 短语后按统一层级重排（见 `candidate_display_order`）。
         // base_sort=natural 时忽略权重，对齐引擎 by_natural（否则合并短语后重排会与引擎发散）。
         let ignore_weight = self.engine_mgr.active_base_sort_ignores_weight();

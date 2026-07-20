@@ -3068,6 +3068,68 @@ fn exact_mode_without_complete_suppresses_phrase_prefix() {
     );
 }
 
+/// 精确匹配空码补全的判据须落在**最终显示列表**上，而非某一层的局部视野。
+///
+/// 回归：码表引擎在协调器注入短语**之前**按自己那半边判空，于是 `aab`（五笔全库无精确字、
+/// 主库有 aabx 后继）无条件被补上一条更长编码候选；随后精确码短语 aab 再进来 → 屏幕上短语
+/// 旁边多出一条与输入无关的「后续」。反向同源：引擎抢先把列表填非空，又会让短语侧的补全
+/// 枚举误判「已有候选」而放弃，该补的短语反倒不补。
+///
+/// `aab` 的选取依据：六个 wubi86 词库均无 code=="aab" 的精确项，主库有 4 条 aab? 后继——
+/// 即「码表侧必然想补、且补得出来」，是这个 bug 的最小复现条件。
+fn coord_exact_completion(with_phrase: bool) -> std::sync::Arc<Coordinator> {
+    let store_path =
+        std::env::temp_dir().join(format!("wind_exact_completion_{}.redb", with_phrase as u8));
+    let _ = std::fs::remove_file(&store_path);
+    let store = std::sync::Arc::new(wind_store::Store::open(&store_path).unwrap());
+    if with_phrase {
+        store.add_phrase("aab", "短语占位", 0, 10).unwrap();
+    }
+    let mut cfg = config_with("wubi86");
+    cfg.schema.codetable.single_code_input = true;
+    cfg.schema.codetable.single_code_complete = true;
+    cfg.input.phrase.min_prefix = 2;
+    Coordinator::new_headless_with_store(cfg, Some(&data_dir()), store)
+}
+
+#[test]
+fn exact_mode_completion_yields_to_phrase() {
+    if !has_schemas() {
+        return;
+    }
+    let coord = coord_exact_completion(true);
+    for ch in ['a', 'a', 'b'] {
+        press_letter(&coord, ch);
+    }
+    let texts = coord.debug_all_candidate_texts();
+    assert_eq!(
+        texts,
+        vec!["短语占位".to_string()],
+        "短语已占位时不应再补码表后续——补全以最终屏幕候选数为准，实际: {:?}",
+        texts
+    );
+}
+
+#[test]
+fn exact_mode_completion_fires_without_phrase() {
+    if !has_schemas() {
+        return;
+    }
+    // 对照组：同一编码在无短语时仍应补上一条码表后续。证明上一个测试里「没有多余候选」
+    // 来自补全**让位**，而不是补全整体被改坏了。
+    let coord = coord_exact_completion(false);
+    for ch in ['a', 'a', 'b'] {
+        press_letter(&coord, ch);
+    }
+    let texts = coord.debug_all_candidate_texts();
+    assert_eq!(
+        texts.len(),
+        1,
+        "无短语时精确模式空码应补且仅补一条码表后续，实际: {:?}",
+        texts
+    );
+}
+
 /// 短语自动上屏须过 `auto_commit_min_len` 闸（与码表「满码唯一自动上屏」同规格）。
 ///
 /// 回归：`phrase_auto_commit` 原只判「唯一 + 无更长后继」、不设最短码长，致短码短语

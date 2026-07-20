@@ -145,6 +145,7 @@ impl Engine for CodeTableEngine {
         }
 
         // 前缀匹配补充（精确匹配模式下跳过）
+        let mut completion_hint: Option<Candidate> = None;
         if !self.opts.single_code_input {
             for mut c in self.dm.search_prefix(input, limit) {
                 if seen.insert(c.text.clone()) {
@@ -159,15 +160,19 @@ impl Engine for CodeTableEngine {
             // 空码补全：从更长编码取首个候选作提示（对齐 Go 仅取 1 个）。
             // limit=8：仅需第一个 code != input 者，取 8 条留少量余量以跳过与输入同码项，
             // 避免全量前缀扫描开销。
-            if let Some(mut c) = self
+            //
+            // 只备货、不入列：`candidates.is_empty()` 在这一层只代表「码表没货」，而补全该不该
+            // 出的判据是「最终屏幕上一条都没有」——协调器随后还要叠短语。就地 push 会在短语
+            // 已命中时多冒一条后续编码。交由协调器按最终列表定夺，见 `ConvertResult::completion_hint`。
+            completion_hint = self
                 .dm
                 .search_prefix(input, 8)
                 .into_iter()
                 .find(|c| c.code != input)
-            {
-                c.source = CandidateSource::CodeTable;
-                candidates.push(c);
-            }
+                .map(|mut c| {
+                    c.source = CandidateSource::CodeTable;
+                    c
+                });
         }
 
         // 基础排序维度：weight（默认，better）或 natural（by_natural，纯出现序、忽略权重）。
@@ -192,7 +197,9 @@ impl Engine for CodeTableEngine {
         // 精确候选(code==input)剩余为空 → 不标注。已有 comment 的候选不覆盖。
         if self.opts.show_code_hint {
             let input_len = input.chars().count();
-            for c in candidates.iter_mut() {
+            // 补全备选一并标注：它已移出 `candidates`（见上方 completion_hint），若不接进本循环，
+            // 协调器采纳后会缺「剩余编码」注释——而它恰恰是全场最需要该提示的候选（码更长）。
+            for c in candidates.iter_mut().chain(completion_hint.iter_mut()) {
                 if c.comment.is_empty() && c.code.chars().count() > input_len {
                     c.comment = c.code.chars().skip(input_len).collect();
                 }
@@ -225,6 +232,7 @@ impl Engine for CodeTableEngine {
             should_commit,
             commit_text,
             should_clear,
+            completion_hint,
             ..Default::default()
         })
     }
@@ -506,10 +514,45 @@ mod tests {
             },
         );
         let r = e.convert("ab", 50).unwrap();
-        assert_eq!(r.candidates.len(), 1, "空码补全仅取首选");
-        assert_eq!(r.candidates[0].text, "你");
-        assert_eq!(r.candidates[0].comment, "c", "补全候选应标注剩余编码");
+        // 补全候选走 `completion_hint` 旁路而**不入** `candidates`：该不该补取决于最终屏幕上
+        // 有没有候选，而引擎看不见协调器随后叠加的短语，无权就地拍板（见 ConvertResult 文档）。
+        assert!(r.candidates.is_empty(), "补全候选不应入引擎候选列表");
+        let hint = r.completion_hint.expect("应备好空码补全候选");
+        assert_eq!(hint.text, "你", "空码补全取更长编码首选");
+        assert_eq!(hint.comment, "c", "补全候选应标注剩余编码");
         assert!(!r.should_commit, "补全候选不应触发自动上屏");
+    }
+
+    #[test]
+    fn single_code_complete_hint_absent_without_longer_code() {
+        // 无 "ab" 精确项、也无更长后继 → 无货可备。
+        let e = engine_opts(
+            &[("xy", "甲", 100)],
+            CommitOptions {
+                single_code_input: true,
+                single_code_complete: true,
+                ..Default::default()
+            },
+        );
+        let r = e.convert("ab", 50).unwrap();
+        assert!(r.candidates.is_empty());
+        assert!(r.completion_hint.is_none(), "无更长编码时不应备补全候选");
+    }
+
+    #[test]
+    fn exact_match_suppresses_completion_hint() {
+        // 有 "ab" 精确项 → 不是空码，不该备补全（否则协调器侧判空虽拦得住，但白查一次前缀）。
+        let e = engine_opts(
+            &[("ab", "甲", 100), ("abc", "你", 90)],
+            CommitOptions {
+                single_code_input: true,
+                single_code_complete: true,
+                ..Default::default()
+            },
+        );
+        let r = e.convert("ab", 50).unwrap();
+        assert_eq!(r.candidates.len(), 1);
+        assert!(r.completion_hint.is_none(), "有精确候选时不备补全");
     }
 
     #[test]
