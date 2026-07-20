@@ -854,6 +854,8 @@ CTextService::CTextService()
     , _focusSessionId(0)
     , _hasFocus(FALSE)
     , _hasTextInputContext(FALSE)
+    , _pLastActiveDocMgr(nullptr)
+    , _focusLostSent(FALSE)
     , _pComposition(nullptr)
     , _hasCachedCaretPos(FALSE)
     , _hasCachedCompStartPos(FALSE)
@@ -886,6 +888,11 @@ CTextService::CTextService()
 
 CTextService::~CTextService()
 {
+    if (_pLastActiveDocMgr != nullptr)
+    {
+        _pLastActiveDocMgr->Release();
+        _pLastActiveDocMgr = nullptr;
+    }
     DllRelease();
 }
 
@@ -1309,9 +1316,14 @@ static UINT GetRetryHotkeyMessageId()
     return s_msg;
 }
 
-// Foreground self-check timer：兜底 OnKillThreadFocus 在 Chromium / Wails 类
-// 宿主里可能不触发的问题。只要本进程持有任何热键就需要定期校验，500ms 间隔
-// 既能尽快让出（用户切走半秒内），开销又可忽略。
+// Foreground self-check timer：兜底**热键泄漏**（不是兜底焦点信号缺失）。
+// ⚠ 此处旧注释称 OnKillThreadFocus 在 Chromium / Wails 类宿主「可能不触发」——
+// 2026-07-20 实测证伪：Chrome 5/5、VSCode 5/5、Edge 11/11 次触发，零漏，与实际
+// 切换严格一一对应；只是比 DocMgr 级失焦晚约 100ms。定时器偶尔抢先执行释放，
+// 是在与这个迟到 100ms 的信号赛跑，不是在替补失踪的信号。
+// 保留本定时器的真正理由：热键注册状态可能因 WM_HOTKEY 竞态等原因与焦点不同步，
+// 且 RegisterHotKey 冲突（1409）的后果是前台应用彻底拿不到热键，值得一道独立防线。
+// 只要本进程持有任何热键就需要定期校验，500ms 间隔既能尽快让出，开销又可忽略。
 static constexpr UINT_PTR kFocusCheckTimerId = 0x57494E44; // 'WIND'
 static constexpr UINT     kFocusCheckIntervalMs = 500;
 
@@ -1373,6 +1385,15 @@ STDAPI CTextService::OnKillThreadFocus()
     {
         _UnregisterAddWordHotkeys();
     }
+
+    // 整个应用失去前台 = 真正离开了当前文档，在此收口输入态。
+    // DocMgr 级失焦不再承担这件事（见 OnSetFocus 失焦分支注释），故必须由这里兜住，
+    // 否则切走再切回同一文档时会残留上次没打完的 composition。
+    // 传缓存的 DocMgr 作 hint：composition 建在它上面，而此刻 GetFocus() 未必还可用；
+    // 不传则可能落到 forced cleanup，把残留文本提交进文档（Excel/WPS 表格的 'd' 漏字）。
+    // 实测本回调在 Chrome/VSCode/Edge 各 5/5、5/5、11/11 次触发零漏，仅比 DocMgr
+    // 级失焦晚约 100ms —— 该延迟用户不可感知，且远优于 500ms 自检定时器兜底。
+    CleanupInputStateForDocChange(_pLastActiveDocMgr, L"thread_focus_lost");
     // 注意：失焦时**不**销毁 HostWindow。SearchHost/任务管理器等用 XamlIsland
     // locked/transient DocMgr，OnSetFocus 对其跳过 focus_gained（防 composition
     // replay），而 HostWindow 重建依赖 focus_gained → 一旦销毁就再也不会重建，
@@ -1436,7 +1457,7 @@ BOOL CTextService::_InitHotkeyWindow()
         WIND_LOG_DEBUG_FMT(L"_InitHotkeyWindow: initial thread focus seed=%d (fgPid=%u ownPid=%u)\n",
                            (int)_hasThreadFocus, fgPid, GetCurrentProcessId());
     }
-    // 启动前台自检 timer：兜底 OnKillThreadFocus 不可靠的宿主（Wails/Chromium 等）
+    // 启动前台自检 timer：兜底热键泄漏（非焦点信号缺失，实测数据见 kFocusCheckTimerId 注释）
     SetTimer(_hHotkeyWnd, kFocusCheckTimerId, kFocusCheckIntervalMs, nullptr);
     return TRUE;
 }
@@ -1627,8 +1648,9 @@ LRESULT CALLBACK CTextService::_HotkeyWndProc(HWND hWnd, UINT msg, WPARAM wParam
         }
         return 0;
     }
-    // 定时自检：兜底 OnKillThreadFocus 不可靠的宿主。每 500ms 跑一次，
-    // 如果发现本进程不再前台但仍持有热键，主动释放并通知前台进程重试。
+    // 定时自检：兜底热键泄漏。每 500ms 跑一次，如果发现本进程不再前台但仍持有热键，
+    // 主动释放并通知前台进程重试。注意本分支被 holdsAnyHotkey 门控，因此它纠正的是
+    // 「热键状态」而非「_hasThreadFocus 的正确性」——不要把它当作焦点信号的兜底。
     if (msg == WM_TIMER && wParam == kFocusCheckTimerId)
     {
         CTextService* self = reinterpret_cast<CTextService*>(GetWindowLongPtrW(hWnd, GWLP_USERDATA));
@@ -1989,7 +2011,25 @@ STDAPI CTextService::OnSetFocus(ITfDocumentMgr* pDocMgrFocus, ITfDocumentMgr* pD
     if (pDocMgrFocus != nullptr)
     {
         _focusSessionId++;
-        WIND_LOG_DEBUG_FMT(L"Focus gained focusSession=%llu", _focusSessionId);
+
+        // ── 焦点抖动免疫：判据取「文档变没变」而非「失过焦没有」 ──
+        // Excel 在 cell-select → cell-edit 时把**同一个** DocMgr 置空再设回（实测指针
+        // 不变、间隔 6ms）；VSCode 一次应用切换伴随 5 次 DocMgr 焦点事件。DocMgr 级
+        // 是噪声层，在失焦那一刻无从区分「抖动」与「真的换了文档」，因此不能在那里
+        // 销毁输入态——那正是「Excel 首字符不进编码、直接上屏」的根因。
+        // 把清理推迟到「另一个文档拿到焦点」时执行，抖动便自然被判为同一文档而跳过。
+        // 同源做法见 Weasel（ThreadMgrEventSink.cpp）：DocMgr 级失焦完全不碰 composition。
+        const BOOL isSameDocMgr = (_pLastActiveDocMgr != nullptr && pDocMgrFocus == _pLastActiveDocMgr);
+        WIND_LOG_DEBUG_FMT(L"Focus gained focusSession=%llu sameDoc=%d doc=0x%p",
+                           _focusSessionId, isSameDocMgr ? 1 : 0, pDocMgrFocus);
+
+        if (!isSameDocMgr && _pLastActiveDocMgr != nullptr)
+        {
+            // 真的换了文档：在**旧** doc 上收口。传 hint 是必须的——此刻 GetFocus() 已指向
+            // 新 doc，不传的话 EndComposition 会拿新 context 的 cookie 去清旧 context 的
+            // range，轻则失败，重则动到新文档的内容。
+            CleanupInputStateForDocChange(_pLastActiveDocMgr, L"doc_changed");
+        }
 
         // Register ITfTextLayoutSink on the new context to receive
         // layout change notifications (for accurate candidate window positioning)
@@ -2014,7 +2054,10 @@ STDAPI CTextService::OnSetFocus(ITfDocumentMgr* pDocMgrFocus, ITfDocumentMgr* pD
 
         // Reset composing state on focus gained to ensure clean state
         // This prevents stale composition state from affecting new input
-        if (_pKeyEventSink != nullptr)
+        // 同一文档抖回来时**不**复位：_isComposing/_hasCandidates 一旦清零，
+        // hasInputSession 即为假，紧接着的 Backspace / 空格 / 数字选字会被判为
+        // 「无输入会话」而透传给宿主。上面 doc_changed 分支已负责真正换文档的复位。
+        if (!isSameDocMgr && _pKeyEventSink != nullptr)
         {
             _pKeyEventSink->ResetComposingState();
         }
@@ -2093,6 +2136,7 @@ STDAPI CTextService::OnSetFocus(ITfDocumentMgr* pDocMgrFocus, ITfDocumentMgr* pD
                 // SendFocusLost 是 async 写（无响应等待），但写超时仍有 300ms。
                 const LONGLONG lostT0 = WindLog::PerfNow();
                 _pIPCClient->SendFocusLost();
+                _focusLostSent = TRUE;
                 focusIpcMs += WindLog::PerfMsSince(lostT0);
             }
             _needsFocusRecovery = FALSE;
@@ -2119,6 +2163,7 @@ STDAPI CTextService::OnSetFocus(ITfDocumentMgr* pDocMgrFocus, ITfDocumentMgr* pD
                 WIND_LOG_DEBUG_FMT(L"FocusGained sent (sync) focusSession=%llu ipc=%.1fms",
                                    _focusSessionId, focusIpcMs);
                 _needsFocusRecovery = FALSE;
+                _focusLostSent = FALSE; // 新会话开始，下次离开文档时须再发一次 focus_lost
                 _pIPCClient->ClearNeedsSyncFlag();
             }
             else
@@ -2126,6 +2171,18 @@ STDAPI CTextService::OnSetFocus(ITfDocumentMgr* pDocMgrFocus, ITfDocumentMgr* pD
                 WIND_LOG_WARN_FMT(L"FocusGained IPC send failed focusSession=%llu", _focusSessionId);
                 _needsFocusRecovery = TRUE;
             }
+        }
+
+        // 记住本次活跃文档，供下次 OnSetFocus 比对。**必须 AddRef 保活**：仅存裸指针的话，
+        // 旧 DocMgr 释放后新对象可能落在同一地址，"换了文档"会被误判成抖动而漏清理。
+        // locked/transient（XamlIsland）不入缓存——上面已对其跳过 focus_gained 视作非事件，
+        // 若缓存它，紧随其后的真实文档就会被判成"换了文档"，反而清掉刚输入的内容。
+        if (!(docMgrDynFlags & kXamlIslandLockedFlag) && _pLastActiveDocMgr != pDocMgrFocus)
+        {
+            if (_pLastActiveDocMgr != nullptr)
+                _pLastActiveDocMgr->Release();
+            _pLastActiveDocMgr = pDocMgrFocus;
+            _pLastActiveDocMgr->AddRef();
         }
     }
 
@@ -2139,24 +2196,18 @@ STDAPI CTextService::OnSetFocus(ITfDocumentMgr* pDocMgrFocus, ITfDocumentMgr* pD
             _pKeyEventSink->FlushEnglishStats();
         }
 
-        // End any active composition before sending focus_lost.
-        // 传入 pDocMgrPrevFocus：此刻 GetFocus()=null，必须靠它兜底跑 EditSession，
-        // 否则 forced cleanup 会让 composition 残留文本被提交（Excel/WPS 表格的 'd' 漏字）。
-        EndComposition(pDocMgrPrevFocus);
-
-        // Send focus_lost to service (async, no response expected)
-        if (_pIPCClient != nullptr && _pIPCClient->IsConnected())
-        {
-            const LONGLONG lostT0 = WindLog::PerfNow();
-            _pIPCClient->SendFocusLost();
-            focusIpcMs += WindLog::PerfMsSince(lostT0);
-        }
-
-        // Reset composing state
-        if (_pKeyEventSink != nullptr)
-        {
-            _pKeyEventSink->ResetComposingState();
-        }
+        // ⚠ 这里**刻意不做**结束 composition / 发 focus_lost / 复位会话态这三件事。
+        // 曾经做过，那正是「Excel 首字符不进编码、直接上屏」的根因：Excel 在
+        // cell-select → cell-edit 时把同一个 DocMgr 置空再设回（实测指针不变、间隔 6ms），
+        // 在此销毁输入态就把用户刚敲的首字符连同 composition 一起清掉了。
+        // DocMgr 级失焦是噪声信号（VSCode 实测一次应用切换伴随 5 次 DocMgr 焦点事件），
+        // 且在这一刻无从区分「抖动」与「真的换了文档」。
+        //
+        // 清理改由两条能分辨真伪的路径承担：
+        //   1. 另一个文档拿到焦点   → OnSetFocus 的 doc_changed 分支（本函数上半部分）
+        //   2. 整个应用失去前台     → OnKillThreadFocus（实测 Chrome/VSCode/Edge 各
+        //      5/5、5/5、11/11 次触发，零漏；仅比本回调晚约 100ms）
+        // 同源做法见 Weasel ThreadMgrEventSink.cpp（其 issue #185 就是同一个 Excel bug）。
 
         // Unregister layout sink when losing focus
         _UnadviseTextLayoutSink();
@@ -5063,6 +5114,30 @@ fallback:
     return TRUE;
 }
 
+// 输入态整体清理。**只应由「离开了原来那个文档」的三条路径调用**，不要挂回失焦回调：
+// DocMgr 级失焦是噪声信号（VSCode 实测一次应用切换伴随 5 次 DocMgr 焦点事件，Excel 更
+// 是同一指针 6ms 内掉了又回），在那里销毁用户输入正是「首字符直接上屏」的根因。
+void CTextService::CleanupInputStateForDocChange(ITfDocumentMgr* pDocMgrHint, const wchar_t* reason)
+{
+    WIND_LOG_DEBUG_FMT(L"CleanupInputStateForDocChange reason=%ls hint=0x%p focusLostSent=%d",
+                       reason ? reason : L"-", pDocMgrHint, _focusLostSent ? 1 : 0);
+
+    // 先结束 composition 再发 focus_lost：EndComposition 会清空 composition 范围的文本，
+    // 顺序反了则服务端已清 buffer 而宿主里仍留着未清的 composition 文本。
+    EndComposition(pDocMgrHint);
+
+    if (!_focusLostSent && _pIPCClient != nullptr && _pIPCClient->IsConnected())
+    {
+        _pIPCClient->SendFocusLost();
+        _focusLostSent = TRUE;
+    }
+
+    if (_pKeyEventSink != nullptr)
+    {
+        _pKeyEventSink->ResetComposingState();
+    }
+}
+
 // End composition
 // NOTE: This method is now ASYNC - it returns immediately without waiting for
 // the composition to actually end. The _pComposition pointer is cleared immediately
@@ -5121,24 +5196,25 @@ void CTextService::EndComposition(ITfDocumentMgr* pDocMgrHint)
     _compositionJustStarted = FALSE;
 
     // Need a document manager to request edit session.
-    // 优先使用 GetFocus 拿当前焦点 doc；失败时退回 pDocMgrHint（来自 OnSetFocus 的
-    // pDocMgrPrevFocus），保证失焦时仍能在旧 doc 上跑 EditSession 清空 composition。
+    // pDocMgrHint 一旦给出即**具有权威性**，不再只是 GetFocus 失败时的兜底：
+    // composition 属于创建它的那个 context，调用方（CleanupInputStateForDocChange）
+    // 明确知道是哪一个。而此刻 GetFocus() 可能已经指向**新**文档（doc_changed 路径就是
+    // 在新文档拿到焦点后才收口的），照它去跑 EditSession 会拿着新 context 的 cookie 去
+    // 清旧 context 的 range —— 轻则失败，重则动到新文档的内容。
+    // 无 hint 时（其余调用点均在焦点未变时触发）仍回落 GetFocus。
     ITfDocumentMgr* pDocMgr = nullptr;
-    if (_pThreadMgr == nullptr || FAILED(_pThreadMgr->GetFocus(&pDocMgr)) || pDocMgr == nullptr)
+    if (pDocMgrHint != nullptr)
     {
-        if (pDocMgrHint != nullptr)
-        {
-            WIND_LOG_DEBUG(L"EndComposition: GetFocus null, using pDocMgrHint\n");
-            pDocMgr = pDocMgrHint;
-            pDocMgr->AddRef();
-        }
-        else
-        {
-            // Can't get document manager, force cleanup
-            WIND_LOG_DEBUG(L"EndComposition: Can't get DocMgr, forcing cleanup\n");
-            pCompToEnd->Release();
-            return;
-        }
+        WIND_LOG_DEBUG(L"EndComposition: using pDocMgrHint (authoritative)\n");
+        pDocMgr = pDocMgrHint;
+        pDocMgr->AddRef();
+    }
+    else if (_pThreadMgr == nullptr || FAILED(_pThreadMgr->GetFocus(&pDocMgr)) || pDocMgr == nullptr)
+    {
+        // Can't get document manager, force cleanup
+        WIND_LOG_DEBUG(L"EndComposition: Can't get DocMgr, forcing cleanup\n");
+        pCompToEnd->Release();
+        return;
     }
 
     ITfContext* pContext = nullptr;

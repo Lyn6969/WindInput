@@ -150,13 +150,23 @@ public:
     BOOL ReplacePrecedingChars(int count, const std::wstring& text);
 
     // End current composition.
-    // pDocMgrHint: 失焦场景下 GetFocus() 已为 nullptr，调用方可传入 pDocMgrPrevFocus
-    // 兜底，确保 composition 范围被清空后再 EndComposition；否则 Excel/WPS 等
-    // 表格类宿主会把残留 composition 文本提交到目标 doc。
+    // pDocMgrHint: composition 所属的 DocMgr。**给出即权威**——实现不会再去问 GetFocus()，
+    // 因为收口时机可能晚于焦点转移（doc_changed 路径），那时 GetFocus() 指向的是新文档，
+    // 拿它跑 EditSession 会用新 context 的 cookie 去清旧 context 的 range。
+    // 不给则回落 GetFocus()（其余调用点都在焦点未变时触发）。
+    // 清空 composition 范围后再 EndComposition，否则 Excel/WPS 等表格类宿主会把残留
+    // composition 文本提交到目标 doc。
     void EndComposition(ITfDocumentMgr* pDocMgrHint = nullptr);
 
     // Reset KeyEventSink composing state (called after push pipe commit/clear)
     void ResetComposingState();
+
+    // 输入态整体清理：结束 composition + 通知服务端清 buffer + 复位 KeyEventSink 会话态。
+    // 触发时机**不是**「失去焦点」而是「离开了原来那个文档」——失焦那一刻无从区分抖动
+    // 与真正的切换（见 OnSetFocus 判据注释）。三条进入路径共用本函数，靠 _focusLostSent
+    // 去重。pDocMgrHint 传**离开的那个 doc**（composition 就建在它上面），EndComposition
+    // 会直接采信它而不再问 GetFocus()——此刻焦点可能已经在新文档上了。
+    void CleanupInputStateForDocChange(ITfDocumentMgr* pDocMgrHint, const wchar_t* reason);
 
     // Top-code commit: accumulate the committed text into the pending prefix and
     // keep it INSIDE the composition (Microsoft IME behavior — the real document
@@ -340,6 +350,15 @@ private:
     ULONGLONG _focusSessionId;
     BOOL _hasFocus;             // 当前实例持有 TSF 输入焦点时为 TRUE（OnSetFocus 最后收到非 null pDocMgrFocus）
     BOOL _hasTextInputContext;  // TRUE when focused doc mgr has a real text-editing context (GetTextExt succeeds)
+
+    // 焦点抖动免疫（见 TextService.cpp OnSetFocus 的判据注释）：缓存上一个真正活跃的
+    // DocMgr，用于区分「同一文档抖回来」与「换了文档」。持 AddRef 保活是必须的——
+    // 裸指针在旧对象释放后可能被新对象复用同一地址，导致「换了文档」被误判成抖动。
+    ITfDocumentMgr* _pLastActiveDocMgr;
+    // focus_lost 已发出且尚未被 focus_gained 复位。SendFocusLost 不幂等（服务端据此推进
+    // 状态机），而清理可能从三条路径进入（换文档 / OnKillThreadFocus / 无可编辑上下文），
+    // 故需去重。
+    BOOL _focusLostSent;
 
     // Composition
     ITfComposition* _pComposition;
