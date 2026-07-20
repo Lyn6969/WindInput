@@ -850,6 +850,7 @@ CTextService::CTextService()
     , _bChineseMode(TRUE)
     , _bFullWidth(FALSE)
     , _lastCapsKeyTick(0)
+    , _lastActivateTick(0)
     , _focusSessionId(0)
     , _hasFocus(FALSE)
     , _hasTextInputContext(FALSE)
@@ -982,6 +983,10 @@ STDAPI CTextService::Activate(ITfThreadMgr* pThreadMgr, TfClientId tfClientId)
 STDAPI CTextService::ActivateEx(ITfThreadMgr* pThreadMgr, TfClientId tfClientId, DWORD dwFlags)
 {
     WIND_LOG_INFO_FMT(L"TextService::ActivateEx called tfClientId=0x%08X dwFlags=0x%08X", tfClientId, dwFlags);
+
+    // 起表：激活后的 compartment 变化是系统初始化同步，不是用户操作。
+    // 见 _lastActivateTick 注释与下方两处 OnChange 守卫。
+    _lastActivateTick = GetTickCount64();
 
     _activateFlags = dwFlags;
 
@@ -1314,6 +1319,15 @@ static constexpr UINT     kFocusCheckIntervalMs = 500;
 // 焦点切换（开 DEBUG 日志、含两次进程信息采集）约 5~13ms，关日志后更低；20ms 既
 // 不会被常规切换触发，又能抓住宿主 churn 焦点导致的堆积。
 static constexpr double kSlowFocusWarnMs = 20.0;
+
+// 激活静默期：ActivateEx 之后这段时间内的 compartment 变化视为系统初始化同步而非用户
+// 操作。实测激活后 ~96ms 出现一次 CONVERSION 变化，取 250ms 留 2.6 倍余量。
+//
+// 不取更大值是因为它会和 _hasThreadFocus 的滞后叠加：后者由 500ms 自检定时器兜底
+// （OnSetThreadFocus 可能漏，见 _MsgWndProc 里的反向纠正），两者相加就是切换应用后
+// 「外部改模式的通道被忽略」的最长窗口。Ctrl+Space 不受影响——它在 OnTestKeyDown
+// 就被拦截、由 OnKeyDown 自行处理，根本不走 compartment OnChange。
+static constexpr ULONGLONG kActivateSettleMs = 250;
 
 // Win32 RegisterHotKey 热键 ID（前置声明给 OnKillThreadFocus 使用）
 // 窗口类名按 Debug / Release 区分（class name 是 per-process 不会跨进程冲突，但
@@ -2605,9 +2619,29 @@ STDAPI CTextService::OnChange(REFGUID rguid)
         // 无焦点时的 compartment 变化只能是系统切换输入法等噪声（用户 Ctrl+Space 必有
         // 前台焦点；KBLSwitch 也按前台应用写入）——忽略，防止污染服务端权威模式。
         // 下次聚焦/激活会从服务同步权威值。
-        if (!_hasFocus)
+        // 判据必须是 _hasThreadFocus（ITfThreadFocusSink，「本应用在前台」），
+        // 不是 _hasFocus（DocMgr 级焦点，OnSetFocus 收到非 null 即置位）。
+        // 上面那段注释的意图本来就是前台——「用户 Ctrl+Space 必有前台焦点；KBLSwitch
+        // 也按前台应用写入」——只是取错了变量。实测两个方向都会出错：
+        //   hasFocus=1 hasThreadFocus=0（最小化的记事本仍残留 DocMgr 焦点）
+        //     → 把用户操作**别的输入法**（微软五笔）引起的线程级 compartment 变化
+        //       误当成用户操作上报 → handle_system_mode_switch 覆盖全局 chinese_mode
+        //       → 广播给所有 client → 切回来的应用被带成英文。
+        //   hasFocus=0 hasThreadFocus=1（本应用在前台但 DocMgr 焦点尚未建立）
+        //     → 把用户的真实切换当噪声丢弃。
+        WIND_LOG_INFO_FMT(L"compat.conversion.onchange hasFocus=%d hasThreadFocus=%d curMode=%d\n",
+                          _hasFocus ? 1 : 0, _hasThreadFocus ? 1 : 0, _bChineseMode ? 1 : 0);
+        if (!_hasThreadFocus)
         {
-            WIND_LOG_INFO(L"Compartment CONVERSION changed without focus, ignored\n");
+            WIND_LOG_INFO(L"Compartment CONVERSION changed while not foreground, ignored\n");
+            return S_OK;
+        }
+        // 激活静默期：刚 ActivateEx 完时系统会写 compartment 做初始化同步（实测 ~96ms），
+        // 那不是用户操作。此前这类噪声靠 _hasFocus 尚未置位被顺带挡住，改用
+        // _hasThreadFocus 后不再被挡（激活时本应用正是前台），故显式加窗口。
+        if (GetTickCount64() - _lastActivateTick < kActivateSettleMs)
+        {
+            WIND_LOG_INFO(L"Compartment CONVERSION changed within activate settle window, ignored\n");
             return S_OK;
         }
 
@@ -2683,9 +2717,19 @@ STDAPI CTextService::OnChange(REFGUID rguid)
 
     // 无焦点时的 OPENCLOSE 变化是系统切换输入法等噪声（本路径任何变化都被视为 toggle，
     // 误报会直接翻转服务端权威模式）——忽略，下次聚焦/激活从服务同步权威值。
-    if (!_hasFocus)
+    // 同 CONVERSION 路径：判据须为 _hasThreadFocus（前台），而非 _hasFocus（DocMgr 级）。
+    // 本路径的误报后果更重——「任何变化都被视为 toggle」，直接翻转服务端权威模式。
+    WIND_LOG_INFO_FMT(L"compat.openclose.onchange hasFocus=%d hasThreadFocus=%d curMode=%d\n",
+                      _hasFocus ? 1 : 0, _hasThreadFocus ? 1 : 0, _bChineseMode ? 1 : 0);
+    if (!_hasThreadFocus)
     {
-        WIND_LOG_INFO(L"Compartment OPENCLOSE changed without focus, ignored\n");
+        WIND_LOG_INFO(L"Compartment OPENCLOSE changed while not foreground, ignored\n");
+        return S_OK;
+    }
+    // 激活静默期，理由同 CONVERSION 路径。本路径误报后果更重：任何变化都被当作 toggle。
+    if (GetTickCount64() - _lastActivateTick < kActivateSettleMs)
+    {
+        WIND_LOG_INFO(L"Compartment OPENCLOSE changed within activate settle window, ignored\n");
         return S_OK;
     }
 

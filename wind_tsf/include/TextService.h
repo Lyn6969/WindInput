@@ -406,6 +406,12 @@ private:
     BOOL _bInCompartmentChange;  // Guard against re-entrant OnChange
     ULONGLONG _lastCapsKeyTick;  // 最近一次 CapsLock 按键活动（GetTickCount64），见 NoteCapsLockKeyActivity
 
+    // 最近一次 ActivateEx 的时刻。激活后系统会写 compartment 做初始化同步，那不是用户
+    // 操作——实测 ActivateEx 后 ~96ms 就有一次 CONVERSION 变化。焦点守卫改用
+    // _hasThreadFocus 之后这类噪声不再被顺带挡住（激活时本应用正是前台），故需本时间戳。
+    // 手法同 295350e 用 _lastCapsKeyTick 抑制 CapsLock 联动噪声。
+    ULONGLONG _lastActivateTick;
+
     BOOL _InitOpenCloseCompartment();
     void _UninitOpenCloseCompartment();
     BOOL _SetOpenCloseCompartment(BOOL bOpen);
