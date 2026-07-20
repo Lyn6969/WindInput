@@ -173,6 +173,24 @@ impl MixedEngine {
         (self.auto_commit_block_on_pinyin && has_pinyin) || self.is_ambiguous_pinyin_word(input)
     }
 
+    /// 拼音后续可能性（满码空码清空守护专用）：整串是否**可能**通过继续输入产生拼音候选
+    /// （含残缺尾音节，如 zhon→zhong）。这是码表侧 `has_longer_code` 的拼音对偶——码表问
+    /// 「有无更长后继码」，拼音问「是不是合法音节前缀」，两者共同构成「这串码还有后续」。
+    ///
+    /// 与上屏否决 `is_ambiguous_pinyin_word` 的分工：那个判「拼音**已经**成词」（看词典权重），
+    /// 这个判「拼音**还没打完**」（只查标准音节表，不查词典）。清空发生在无候选时，正需要后者。
+    /// `secondary` 为 None（纯码表混输）时恒 false。
+    ///
+    /// **前提：混输不接双拼**（码长太接近，产品上不支持）。`is_possible_pinyin_sequence` 与另三个
+    /// 音节判据一样，把入参当全拼直喂音节表、不走 `ShuangpinConverter`（不同于 `convert()`）。
+    /// 若将来给混输接入双拼，此处会**静默**误判：如小鹤 `nihc`(=ni+hao) 判为「无后续」→ 清空吞掉
+    /// 用户正在输入的串。届时须先给这四个判据加统一的双拼前置转换，勿只改本函数。
+    fn pinyin_may_continue(&self, input: &str) -> bool {
+        self.secondary
+            .as_ref()
+            .is_some_and(|sec| sec.is_possible_pinyin_sequence(input))
+    }
+
     /// 码表候选按混输策略提权（短语独立档 +1M / 精确 +boost / 前缀补全 +500K）。
     /// `exact_input` 为「视作精确全码」的判据串（正常路径=input，overflow 混合路径=前 N 码前缀）。
     fn boost_codetable(&self, candidates: &mut [Candidate], exact_input: &str) {
@@ -370,6 +388,10 @@ impl Engine for MixedEngine {
 
         // 超长分支（对齐 Go ConvertEx）：输入超过码表最大码长时，按 pinyin_only_overflow 分流，
         // 不再走下方「码表+拼音等长合并」路径。
+        //
+        // 注：此分支**有意不产生 `should_clear`**（`convert_overflow` 恒返回 false）。超长即已切入
+        // 纯拼音语境，「码表满码却无候选」这个前提不再成立，此时清空会打断正常的长拼音输入。
+        // 故满码空码清空仅在 `input_len == max_code_len` 生效，勿按「缺口」补齐。
         if self.max_code_len > 0 && input_len > self.max_code_len {
             return Ok(self.convert_overflow(input, max_candidates));
         }
@@ -451,8 +473,13 @@ impl Engine for MixedEngine {
             (false, String::new())
         };
 
-        // 空码清空：仅当主码表请求清空且无拼音候选（合法拼音序列留给拼音，不清空）。
-        let should_clear = ct_should_clear && !has_pinyin;
+        // 满码空码清空：主码表请求清空 + 拼音侧既无候选、也无后续可能。
+        // - `!has_pinyin`：拼音此刻已出候选 → 留给拼音（粗粒度，且合并后非空，协调器亦会复核）；
+        // - `!pinyin_may_continue`：拼音**还没打完** → 保护中途态。这一项才是无候选时的关键守护：
+        //   如 zhon（码表满码无候选无后继、拼音此刻也无候选）合并结果为空，协调器的
+        //   `state.candidates.is_empty()` 复核挡不住，若不看后续可能性就会把用户正在输入的
+        //   zhong 吞掉。经 `&&` 短路，仅在码表确有清空意向时才查音节表。
+        let should_clear = ct_should_clear && !has_pinyin && !self.pinyin_may_continue(input);
 
         let is_empty = merged.is_empty();
         Ok(ConvertResult {
@@ -656,6 +683,74 @@ mod tests {
         fn completed_syllable_count(&self, _prefix: &str) -> usize {
             self.syllables
         }
+    }
+
+    // ── 满码空码清空：拼音「后续可能性」守护 ──
+
+    /// 构建开启「满码空码清空」的码表引擎（max_code_len=4）。
+    fn ct_engine_clear(entries: &[(&str, &str, i32)]) -> Box<dyn Engine> {
+        let mut d = CodetableDict::empty();
+        for (i, (code, text, w)) in entries.iter().enumerate() {
+            d.merge_single(code.to_string(), text.to_string(), *w, i as i32);
+        }
+        let dm = DictManager::new();
+        dm.register_layer(Box::new(SystemDictLayer::new(CachedDict::Memory(d), "sys")));
+        let opts = CommitOptions {
+            clear_on_empty_max: true,
+            ..Default::default()
+        };
+        Box::new(CodeTableEngine::new(4, opts, Arc::new(dm)))
+    }
+
+    /// 清空守护专用假拼音：**恒无候选**（has_pinyin=false，把协调器的候选非空复核排除在外），
+    /// 仅可配「整串是否为合法拼音前缀」——正是本守护要验的那一位。
+    struct FakePinyinPrefix {
+        may_continue: bool,
+    }
+    impl Engine for FakePinyinPrefix {
+        fn convert(&self, _input: &str, _max: usize) -> anyhow::Result<ConvertResult> {
+            Ok(ConvertResult::default())
+        }
+        fn reset(&self) {}
+        fn engine_type(&self) -> EngineType {
+            EngineType::Pinyin
+        }
+        fn is_possible_pinyin_sequence(&self, _prefix: &str) -> bool {
+            self.may_continue
+        }
+    }
+
+    fn mixed_with_prefix_pinyin(may_continue: bool) -> MixedEngine {
+        MixedEngine::new(
+            ct_engine_clear(&[("aaaa", "工", 100)]),
+            Some(Box::new(FakePinyinPrefix { may_continue })),
+            None,
+            MixConfig::default(),
+        )
+    }
+
+    #[test]
+    fn clear_fires_when_pinyin_cannot_continue() {
+        // 满码(4) 码表无候选无后继 + 拼音无候选且非合法前缀 → 清空。
+        let r = mixed_with_prefix_pinyin(false).convert("qqqq", 50).unwrap();
+        assert!(r.candidates.is_empty(), "前置：此输入确无候选");
+        assert!(r.should_clear, "拼音无后续可能时应清空");
+    }
+
+    #[test]
+    fn clear_vetoed_when_pinyin_may_continue() {
+        // 同上，但拼音判「还没打完」（zhon→zhong 中途态）→ 守护住，不得清空。
+        // 合并候选为空，协调器的 `state.candidates.is_empty()` 复核挡不住——只能靠这一位。
+        let r = mixed_with_prefix_pinyin(true).convert("zhon", 50).unwrap();
+        assert!(r.candidates.is_empty(), "前置：此刻确无候选");
+        assert!(!r.should_clear, "拼音仍可能有后续时不得清空，否则吞掉中途输入");
+    }
+
+    #[test]
+    fn overflow_never_clears() {
+        // 超长（>max_code_len）**有意**不清空：已切入纯拼音语境，「码表满码无候选」前提不成立。
+        let r = mixed_with_prefix_pinyin(false).convert("qqqqq", 50).unwrap();
+        assert!(!r.should_clear, "overflow 分支不得产生清空");
     }
 
     // ── 顶码上屏：与满码全码自动上屏**共用同一套**拼音①②否决 ──
