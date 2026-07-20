@@ -1598,7 +1598,9 @@ pub struct DebugConfig {
     /// 单个日志文件的大小上限（MB），超出后滚动。默认 10。
     #[serde(default = "default_log_max_size_mb")]
     pub log_max_size_mb: u64,
-    /// 保留的旧日志文件数量上限。默认 5。
+    /// 保留的旧日志文件数量上限（不含主文件）。默认 10。
+    ///
+    /// 服务每次启动都会滚动一次，故该值约等于「能回溯最近几次运行」。
     #[serde(default = "default_log_max_files")]
     pub log_max_files: usize,
 }
@@ -1618,7 +1620,7 @@ fn default_log_max_size_mb() -> u64 {
 }
 
 fn default_log_max_files() -> usize {
-    5
+    10
 }
 
 // ───────────────────────── 共享 default 助手 ─────────────────────────

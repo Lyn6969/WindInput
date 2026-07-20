@@ -6,7 +6,6 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 use file_rotate::compression::Compression;
-use file_rotate::suffix::AppendCount;
 use file_rotate::{ContentLimit, FileRotate};
 use std::sync::Arc;
 use tracing::{error, info};
@@ -21,6 +20,7 @@ use wind_bridge::push::{PushConfig, PushServer};
 use wind_bridge::server::{BridgeConfig, BridgeServer};
 
 mod config_cli;
+mod log_rotate;
 
 /// GUI 子系统（release profile，`windows_subsystem="windows"`）下进程不附着控制台，
 /// 故 CLI 子命令的 `println!` 无处可写。此函数把进程附着到**父控制台**（调用它的 cmd/PowerShell），
@@ -324,14 +324,24 @@ fn init_logger() {
         .unwrap_or_else(|| std::path::PathBuf::from("logs"));
     let _ = std::fs::create_dir_all(&log_dir);
 
-    // 按大小滚动：wind_input.log → wind_input.log.1 → … → wind_input.log.N
-    let rotate = FileRotate::new(
-        log_dir.join("wind_input.log"),
-        AppendCount::new(cfg_debug.log_max_files),
+    // 滚动命名：wind_input.log → wind_input.1.log → … → wind_input.N.log
+    // （序号在扩展名之前，滚动后仍是 .log，编辑器认得、按 *.log 也搜得到）
+    let log_path = log_dir.join("wind_input.log");
+
+    // 升级路径：把老方案写下的 wind_input.log.N 迁成新命名，否则新的扫描认不出它们，
+    // 会永久滞留在目录里。须在 FileRotate::new 之前——构造时就会扫描既存序号。
+    log_rotate::migrate_legacy_suffix(&log_path);
+
+    let mut rotate = FileRotate::new(
+        &log_path,
+        log_rotate::AppendCountBeforeExt::new(cfg_debug.log_max_files),
         ContentLimit::Bytes((cfg_debug.log_max_size_mb * 1024 * 1024) as usize),
         Compression::None,
         None,
     );
+
+    log_rotate::rotate_on_startup(&mut rotate, &log_path);
+
     let (writer, _guard) = tracing_appender::non_blocking(rotate);
 
     // 时间戳用本地时区，且格式与 wind_tsf 的 FileLogger 完全一致

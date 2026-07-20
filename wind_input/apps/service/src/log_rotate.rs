@@ -1,0 +1,405 @@
+//! 日志滚动命名方案：序号插在扩展名**之前**。
+//!
+//! `file-rotate` 自带的 [`AppendCount`](file_rotate::suffix::AppendCount) 产出
+//! `wind_input.log.1`，扩展名变成了 `.1`，编辑器/文件管理器不再认它是文本文件，
+//! 双击打不开、按 `*.log` 搜也搜不到。本模块换成 `wind_input.1.log`：
+//!
+//! ```text
+//! wind_input.log     ← 当前这次运行
+//! wind_input.1.log   ← 上一次运行
+//! wind_input.2.log   ← 再上一次
+//! ```
+//!
+//! 实现方式是自定义 [`Representation`] 与 [`SuffixScheme`]。除命名外，滚动与淘汰
+//! 语义与 `AppendCount` 完全一致（序号越大越旧，超出 `max_files` 的删除）。
+//!
+//! 注意 trait 的两个默认方法**必须成对覆盖**：[`Representation::to_path`] 决定写出去
+//! 的文件名，[`SuffixScheme::scan_suffixes`] 决定启动时能认回哪些既存文件。只改前者
+//! 会让扫描认不出自己上次写的文件，旧日志既不参与序号推进也永不被淘汰，最终堆满目录。
+
+use file_rotate::suffix::{Representation, SuffixScheme};
+use file_rotate::{FileRotate, SuffixInfo};
+use std::collections::BTreeSet;
+use std::fmt;
+use std::io;
+use std::path::{Path, PathBuf};
+
+/// 滚动序号。`1` 最新、数字越大越旧。
+///
+/// [`Representation`] 要求 `Ord` 按「新→旧」排序（最新的最小），`usize` 的自然序
+/// 恰好满足，故直接 derive。
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub struct LogIndex(usize);
+
+impl fmt::Display for LogIndex {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
+/// 把 `/dir/wind_input.log` 拆成 `("wind_input", Some("log"))`。
+fn split_stem_ext(basepath: &Path) -> (String, Option<String>) {
+    let stem = basepath
+        .file_stem()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let ext = basepath
+        .extension()
+        .map(|s| s.to_string_lossy().into_owned());
+    (stem, ext)
+}
+
+impl Representation for LogIndex {
+    /// `/dir/wind_input.log` + `1` → `/dir/wind_input.1.log`
+    ///
+    /// 覆盖默认实现（默认是无脑追加 `.{suffix}`，即 `wind_input.log.1`）。
+    fn to_path(&self, basepath: &Path) -> PathBuf {
+        let (stem, ext) = split_stem_ext(basepath);
+        let name = match ext {
+            Some(ext) => format!("{stem}.{}.{ext}", self.0),
+            // 无扩展名时退化成追加序号，与默认实现同形
+            None => format!("{stem}.{}", self.0),
+        };
+        basepath.with_file_name(name)
+    }
+}
+
+/// 与 `AppendCount` 等价的滚动方案，但序号落在扩展名之前。
+///
+/// `max_files` 是**不含主文件**的旧文件数上限：`new(10)` 允许
+/// `wind_input.log` 与 `wind_input.1.log` … `wind_input.10.log` 共存，不会有 `.11`。
+pub struct AppendCountBeforeExt {
+    max_files: usize,
+}
+
+impl AppendCountBeforeExt {
+    pub fn new(max_files: usize) -> Self {
+        Self { max_files }
+    }
+}
+
+impl SuffixScheme for AppendCountBeforeExt {
+    type Repr = LogIndex;
+
+    /// 滚动时序号 +1；主文件（`suffix == None`）滚成 `.1`。
+    ///
+    /// 目标已存在时 `file-rotate` 会拿目标后缀再调一次本函数，从而级联把
+    /// `.1→.2`、`.2→.3` 依次推开——这正是「+1」能自然成立的原因。
+    fn rotate_file(
+        &mut self,
+        _basepath: &Path,
+        _newest_suffix: Option<&LogIndex>,
+        suffix: &Option<LogIndex>,
+    ) -> io::Result<LogIndex> {
+        Ok(match suffix {
+            Some(s) => LogIndex(s.0 + 1),
+            None => LogIndex(1),
+        })
+    }
+
+    fn parse(&self, suffix: &str) -> Option<LogIndex> {
+        suffix.parse::<usize>().ok().map(LogIndex)
+    }
+
+    /// `file_number` 从 0 开始（0 = 最新的那个旧文件）。
+    fn too_old(&self, _suffix: &LogIndex, file_number: usize) -> bool {
+        file_number >= self.max_files
+    }
+
+    /// 扫描既存的 `{stem}.{N}.{ext}`。
+    ///
+    /// 必须覆盖：默认实现只认 `{文件名}.{后缀}`（即 `wind_input.log.N`），
+    /// 对我们写出的 `wind_input.N.log` 一个都认不出来。
+    fn scan_suffixes(&self, basepath: &Path) -> BTreeSet<SuffixInfo<LogIndex>> {
+        let mut found = BTreeSet::new();
+        let (stem, ext) = split_stem_ext(basepath);
+
+        // 相对路径时补上 cwd，与默认实现的行为保持一致
+        let abs;
+        let basepath = if basepath.is_relative() {
+            let Ok(cwd) = std::env::current_dir() else {
+                return found;
+            };
+            abs = cwd.join(basepath);
+            &abs
+        } else {
+            basepath
+        };
+        let Some(parent) = basepath.parent() else {
+            return found;
+        };
+        let Ok(entries) = std::fs::read_dir(parent) else {
+            return found;
+        };
+
+        let prefix = format!("{stem}.");
+        let suffix_ext = ext.map(|e| format!(".{e}"));
+
+        for entry in entries.filter_map(Result::ok) {
+            if !entry.path().is_file() {
+                continue;
+            }
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+
+            // 剥掉 `{stem}.` 前缀
+            let Some(rest) = name.strip_prefix(&prefix) else {
+                continue;
+            };
+            // 再剥掉 `.{ext}` 后缀，中间剩下的必须是纯数字
+            let num = match &suffix_ext {
+                Some(se) => match rest.strip_suffix(se.as_str()) {
+                    Some(n) => n,
+                    None => continue,
+                },
+                None => rest,
+            };
+            if let Some(idx) = self.parse(num) {
+                found.insert(SuffixInfo {
+                    suffix: idx,
+                    compressed: false,
+                });
+            }
+        }
+        found
+    }
+}
+
+/// 服务启动时强制滚动一次日志：上一次运行的内容整体推到 `.1`，本次从空文件写起。
+///
+/// 这样 `wind_input.log` 恒等于「当前这次运行」，排查时不必在混着多次重启的大文件里
+/// 翻找分界点，也不需要另做「清空日志」的入口——`FileRotate` 常驻持有该文件句柄，
+/// 从外部删除只会留下一个已摘名的幽灵 inode，后续日志全写进去且看不见。
+///
+/// 仅在旧文件非空时滚动：首次启动没有 `wind_input.log`，而 `rotate()` 内部是
+/// `fs::rename(old, new)?`，对不存在的文件会直接报错；空文件滚动也只是白占一个序号，
+/// 把真正有用的历史更快挤出保留窗口。
+///
+/// 注意：序号并非「一个序号 = 一次启动」——本次运行写满 `log_max_size_mb` 同样会滚动，
+/// 此时 `.1` 是本次运行的前半段而非上一次运行。
+pub fn rotate_on_startup(rotate: &mut FileRotate<AppendCountBeforeExt>, log_path: &Path) {
+    if std::fs::metadata(log_path)
+        .map(|m| m.len() > 0)
+        .unwrap_or(false)
+        && let Err(e) = rotate.rotate()
+    {
+        // 滚动失败不阻断启动：继续往原文件追加，日志内容仍完整，只是没分段。
+        // 此处 subscriber 尚未 init，只能走 stderr。
+        eprintln!("[WindInput] startup log rotate failed: {e}");
+    }
+}
+
+/// 一次性迁移旧命名：`wind_input.log.N` → `wind_input.N.log`。
+///
+/// 存量用户升级后目录里会留着老方案写下的文件，新的 `scan_suffixes` 认不出它们，
+/// 于是既不参与序号推进也永不被淘汰——不迁移就会永久滞留。
+///
+/// 目标已存在时跳过（不覆盖新方案的文件）。整个过程 best-effort，失败只影响历史日志。
+///
+/// 可在若干版本后删除（存量目录都迁移完之后）。
+pub fn migrate_legacy_suffix(log_path: &Path) {
+    let (stem, ext) = split_stem_ext(log_path);
+    let Some(ext) = ext else { return };
+    let Some(parent) = log_path.parent() else {
+        return;
+    };
+    let Ok(entries) = std::fs::read_dir(parent) else {
+        return;
+    };
+
+    // 老命名形如 `wind_input.log.3`
+    let legacy_prefix = format!("{stem}.{ext}.");
+
+    for entry in entries.filter_map(Result::ok) {
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        let Some(num) = name.strip_prefix(&legacy_prefix) else {
+            continue;
+        };
+        let Ok(n) = num.parse::<usize>() else {
+            continue; // 只认纯数字，别误伤 .log.bak 之类
+        };
+        let target = LogIndex(n).to_path(log_path);
+        if target.exists() {
+            continue;
+        }
+        let _ = std::fs::rename(entry.path(), target);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use file_rotate::ContentLimit;
+    use file_rotate::compression::Compression;
+    use std::io::Write;
+
+    /// 造一个已含内容的日志文件，模拟「上一次运行留下的日志」。
+    fn seed(path: &Path, content: &str) {
+        let mut f = std::fs::File::create(path).unwrap();
+        f.write_all(content.as_bytes()).unwrap();
+    }
+
+    fn make_rotate(path: &Path, max_files: usize) -> FileRotate<AppendCountBeforeExt> {
+        FileRotate::new(
+            path,
+            AppendCountBeforeExt::new(max_files),
+            ContentLimit::Bytes(10 * 1024 * 1024),
+            Compression::None,
+            None,
+        )
+    }
+
+    #[test]
+    fn to_path_puts_index_before_extension() {
+        let base = Path::new("/logs/wind_input.log");
+        assert_eq!(
+            LogIndex(3).to_path(base),
+            PathBuf::from("/logs/wind_input.3.log")
+        );
+    }
+
+    /// 首次启动：没有旧日志，不应报错也不应凭空造出 `.1.log`。
+    /// （`rotate()` 内部是 `fs::rename`，对不存在的文件会 Err，故必须跳过。）
+    #[test]
+    fn first_start_does_not_rotate() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("wind_input.log");
+
+        let mut r = make_rotate(&path, 10);
+        rotate_on_startup(&mut r, &path);
+
+        assert!(!dir.path().join("wind_input.1.log").exists());
+    }
+
+    /// 空日志文件不该白占一个序号，否则会把有用的历史更快挤出保留窗口。
+    #[test]
+    fn empty_log_does_not_rotate() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("wind_input.log");
+        seed(&path, "");
+
+        let mut r = make_rotate(&path, 10);
+        rotate_on_startup(&mut r, &path);
+
+        assert!(!dir.path().join("wind_input.1.log").exists());
+    }
+
+    /// 二次启动：上一次运行的内容整体搬到 `.1.log`，主文件让给本次运行。
+    #[test]
+    fn second_start_moves_previous_run_to_index_1() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("wind_input.log");
+        seed(&path, "run-1\n");
+
+        let mut r = make_rotate(&path, 10);
+        rotate_on_startup(&mut r, &path);
+
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("wind_input.1.log")).unwrap(),
+            "run-1\n"
+        );
+        // 主文件已重开且为空，本次运行从零写起
+        assert_eq!(std::fs::metadata(&path).unwrap().len(), 0);
+        // 绝不能再出现老命名
+        assert!(!dir.path().join("wind_input.log.1").exists());
+    }
+
+    /// 连续多次启动：序号依次后移，最老的一次被淘汰。
+    ///
+    /// 这里同时钉住两件事：级联重命名认得回自己上次写的文件（`scan_suffixes` 正确），
+    /// 以及 `max_files` 是**不含主文件**的旧文件数。
+    #[test]
+    fn old_runs_are_evicted_beyond_max_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("wind_input.log");
+
+        for i in 1..=4 {
+            seed(&path, &format!("run-{i}\n"));
+            let mut r = make_rotate(&path, 2);
+            rotate_on_startup(&mut r, &path);
+        }
+
+        // 最近两次运行（run-3 / run-4）保留，更早的被删
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("wind_input.1.log")).unwrap(),
+            "run-4\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("wind_input.2.log")).unwrap(),
+            "run-3\n"
+        );
+        assert!(!dir.path().join("wind_input.3.log").exists());
+    }
+
+    /// 老命名的存量文件应被迁移成新命名，且序号保持不变。
+    #[test]
+    fn legacy_files_are_migrated() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("wind_input.log");
+        seed(&path, "current\n");
+        seed(&dir.path().join("wind_input.log.1"), "old-1\n");
+        seed(&dir.path().join("wind_input.log.2"), "old-2\n");
+
+        migrate_legacy_suffix(&path);
+
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("wind_input.1.log")).unwrap(),
+            "old-1\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("wind_input.2.log")).unwrap(),
+            "old-2\n"
+        );
+        assert!(!dir.path().join("wind_input.log.1").exists());
+    }
+
+    /// 迁移不得误伤非序号后缀（`.log.bak` 之类），也不得覆盖已存在的新命名文件。
+    #[test]
+    fn migration_skips_non_numeric_and_existing_targets() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("wind_input.log");
+        seed(&dir.path().join("wind_input.log.bak"), "backup\n");
+        seed(&dir.path().join("wind_input.log.1"), "legacy\n");
+        seed(&dir.path().join("wind_input.1.log"), "already-new\n");
+
+        migrate_legacy_suffix(&path);
+
+        // 非数字后缀原样保留
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("wind_input.log.bak")).unwrap(),
+            "backup\n"
+        );
+        // 目标已存在 → 不覆盖，老文件留在原地
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("wind_input.1.log")).unwrap(),
+            "already-new\n"
+        );
+        assert!(dir.path().join("wind_input.log.1").exists());
+    }
+
+    /// 迁移后的文件必须能被 `scan_suffixes` 认回，否则会永不淘汰地堆积。
+    /// 这是「只改 to_path 不改 scan_suffixes」那个坑的回归测试。
+    #[test]
+    fn migrated_files_participate_in_rotation() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("wind_input.log");
+        seed(&path, "current\n");
+        seed(&dir.path().join("wind_input.log.1"), "old-1\n");
+
+        migrate_legacy_suffix(&path);
+
+        let mut r = make_rotate(&path, 10);
+        rotate_on_startup(&mut r, &path);
+
+        // current 进 .1，被迁移来的 old-1 让位到 .2
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("wind_input.1.log")).unwrap(),
+            "current\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("wind_input.2.log")).unwrap(),
+            "old-1\n"
+        );
+    }
+}
