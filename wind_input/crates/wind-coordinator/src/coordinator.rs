@@ -15,7 +15,7 @@ use crate::preedit_cursor;
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
-use tracing::{debug, info, warn};
+use tracing::{debug, info, trace, warn};
 use wind_keys::keymap;
 
 use wind_bridge::handler::*;
@@ -302,10 +302,14 @@ pub(crate) const LEARN_ADD_WEIGHT: i32 = 800;
 /// 自提交宽限期：本输入法吐字后这段时间内收到的 `SelectionChanged` 视为宿主回声，
 /// 不当作用户移动光标（见 `handle_selection_changed`）。
 ///
-/// **待实测校准**：Go 版实测宿主回声 <50ms 并取 200ms 留余量，但那是另一套进程/宿主组合下
-/// 的观测值。本值先沿用 200ms，真机跑一遍 `selection_changed: since_self_commit=...`
-/// 日志看实际分布后再定。取值过小 → 回声被误判为用户操作，序列被切碎、造词失效；
-/// 取值过大 → 用户上屏后短时间内的真实光标移动漏掉一次终止（由 idle 超时兜底）。
+/// **已由真机日志校准**（2026-07-20，记事本/Chrome/EverEdit 混合样本 n≈280）：
+/// - 自提交回声：3.6 ~ 10.7ms，离群值 62.9ms / 78.9ms
+/// - 用户真实光标移动：最小 322.8ms，其余 453ms / 828ms / 1.4s / 70s
+///
+/// 两类之间 79ms→323ms 是一段空白，200ms 落在正中，上下均有 2.5 倍以上余量。
+/// 取值过小 → 回声被误判为用户操作，序列被切碎、造词失效；取值过大 → 用户上屏后
+/// 短时间内的真实光标移动漏掉一次终止（由 idle 超时兜底）。
+/// 重新校准方法：把 `handle_selection_changed` 的 TRACE 打开，重跑分布。
 pub(crate) const SELF_COMMIT_GRACE: std::time::Duration = std::time::Duration::from_millis(200);
 
 /// 当前 unix 秒（拼音衰减分以此对 last_used 计龄；与 store record_freq 同口径）。
@@ -4950,9 +4954,11 @@ impl MessageHandler for Coordinator {
     /// **与用户真实光标移动完全无法区分**，只能靠时间判别。若不区分，每上屏一个字就被自己
     /// 的回声判成「用户移动光标」→ flush → 缓冲永远只有 1 个字 → 造词恒不触发。
     ///
-    /// 宽限值目前取 [`SELF_COMMIT_GRACE`]，但**这是待实测校准的初值**：宿主回声延迟因宿主
-    /// 而异，代码阅读只能证明「守卫会放行」，无法证明实际延迟分布。下方 DEBUG 日志记录每次
-    /// 事件距上次自提交的毫秒数，真机跑一遍即可据实调整。
+    /// 宽限值取 [`SELF_COMMIT_GRACE`]，已由真机日志校准（见该常量注释的实测分布）。
+    ///
+    /// 回声分支**不做任何动作**，故只记 TRACE：它的频率恒等于上屏频率（每上屏一个字必有
+    /// 一条），放在 DEBUG 会把真正有信息量的「用户移动光标 → 终止序列」淹掉。需要重新
+    /// 校准 `SELF_COMMIT_GRACE` 时开 TRACE 即可拿回完整分布。
     fn handle_selection_changed(&self, _prev_char: u16) {
         let since = self
             .last_self_commit
@@ -4960,15 +4966,12 @@ impl MessageHandler for Coordinator {
             .unwrap_or_else(|e| e.into_inner())
             .map(|t| t.elapsed());
         let is_echo = since.is_some_and(|d| d < SELF_COMMIT_GRACE);
-        // 实测校准用：真机跑一遍看这条日志的分布，再定 SELF_COMMIT_GRACE。
-        debug!(
-            "selection_changed: since_self_commit={:?} → {}",
-            since,
-            if is_echo { "自提交回声，忽略" } else { "用户移动光标" }
-        );
-        if !is_echo {
-            self.terminate_auto_phrase("selection_changed");
+        if is_echo {
+            trace!("selection_changed: since_self_commit={since:?} → 自提交回声，忽略");
+            return;
         }
+        debug!("selection_changed: since_self_commit={since:?} → 用户移动光标");
+        self.terminate_auto_phrase("selection_changed");
     }
 
     fn handle_commit_request(&self, data: &CommitRequestData) -> Option<CommitResultData> {

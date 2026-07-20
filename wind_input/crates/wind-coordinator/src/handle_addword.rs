@@ -134,6 +134,13 @@ impl Coordinator {
             }
         }; // 锁在此释放：flush 要做词库 IO，不可持缓冲锁。
         if let Some(seq) = flushed {
+            // 与 `terminate_auto_phrase` 的「终止信号」日志对齐：本路径同样会造词，
+            // 缺了它排查时会看到「凭空出现的已造词」，误以为触发源丢了。
+            debug!(
+                "auto-phrase: 终止信号 {} → flush {} 字",
+                if all_han { "多字词上屏" } else { "非汉字上屏" },
+                seq.len()
+            );
             self.flush_auto_phrase(&seq);
         }
     }
