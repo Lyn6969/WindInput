@@ -2487,12 +2487,33 @@ BOOL CTextService::_SetOpenCloseCompartment(BOOL bOpen)
     if (FAILED(hr) || pCompartment == nullptr)
         return FALSE;
 
+    // 值没变就别写。ITfCompartment::SetValue **不做值比较**——写入相同的值同样会向
+    // 宿主和所有已 advise 的 sink 广播 OnChange，而 OPENCLOSE 是线程级全局 compartment，
+    // 语义是「输入法开/关状态变了」，宿主据此重建输入状态是合理反应。
+    //
+    // 为什么要紧：_SyncStateFromResponse 每收到一次服务端状态推送就调用本函数一次，
+    // 而推送是广播给所有已加载本 DLL 的进程的（实测同一份日志里有 17 个 PID）。
+    // 于是任何一个应用里的状态变化，都会让每一个宿主收到一次「IME 开关变了」的通知。
+    // 参见 295350e「抑制 CapsLock 联动触发的 OPENCLOSE 变化，防模式振荡」——
+    // 同一类问题此前已出现过一次。
+    //
+    // 姊妹函数 _SetConversionMode 早有同样的守卫（注释写着「避免触发多余 OnChange」），
+    // 本函数漏了——两个 compartment 一个防了一个没防。
+    const LONG desired = bOpen ? TRUE : FALSE;
+    VARIANT cur;
+    VariantInit(&cur);
+    if (SUCCEEDED(pCompartment->GetValue(&cur)) && cur.vt == VT_I4 && cur.lVal == desired)
+    {
+        pCompartment->Release();
+        return TRUE;
+    }
+
     // Set guard to prevent re-entrant OnChange
     _bInCompartmentChange = TRUE;
 
     VARIANT var;
     var.vt = VT_I4;
-    var.lVal = bOpen ? TRUE : FALSE;
+    var.lVal = desired;
     hr = pCompartment->SetValue(_tfClientId, &var);
     pCompartment->Release();
 
