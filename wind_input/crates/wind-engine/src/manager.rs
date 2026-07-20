@@ -647,6 +647,8 @@ impl EngineManager {
             &mix_cfg,
             self.override_dir.as_deref(),
             &pinyin_cfg,
+            // 顶层入口：方案自身是拼音时不加约束（简拼开）。混输在其内部为 secondary 注入。
+            None,
         ) {
             Some(engine) => {
                 info!(
@@ -1565,6 +1567,11 @@ impl EngineManager {
     }
 
     /// 为指定 schema 构建引擎
+    ///
+    /// `pinyin_abbrev`：拼音简拼开关的**上下文覆盖**。`None` = 用引擎默认（开，历史行为）；
+    /// 仅混输构建 secondary 时传 `Some(schema.mix.enable_pinyin_abbrev)`——简拼是「混输时」
+    /// 的选项，纯拼音方案不受影响，故不能只看全局配置、须由调用方按语境注入。
+    #[allow(clippy::too_many_arguments)]
     fn build_engine(
         schema_id: &str,
         data_dir: Option<&Path>,
@@ -1573,6 +1580,7 @@ impl EngineManager {
         mix_cfg: &wind_config::MixGlobal,
         override_dir: Option<&Path>,
         pinyin_cfg: &wind_config::config::PinyinGlobalConfig,
+        pinyin_abbrev: Option<bool>,
     ) -> Option<Box<dyn Engine>> {
         let data_dir = data_dir?;
         let schemas = data_dir.join("schemas");
@@ -1593,7 +1601,10 @@ impl EngineManager {
                 mix_cfg,
                 override_dir,
                 pinyin_cfg,
+                None,
             )?;
+            // secondary（拼音）是**唯一**注入简拼开关的地方：`schema.mix.enable_pinyin_abbrev`
+            // 只约束「作为混输辅助的拼音」，纯拼音方案走 build_engine 时仍传 None（简拼照常开）。
             let secondary = if m.secondary_schema.is_empty() {
                 None
             } else {
@@ -1605,6 +1616,7 @@ impl EngineManager {
                     mix_cfg,
                     override_dir,
                     pinyin_cfg,
+                    Some(mix_cfg.enable_pinyin_abbrev),
                 )
             };
             let boost = if m.codetable_weight_boost > 0 {
@@ -1631,6 +1643,7 @@ impl EngineManager {
                     mix_cfg,
                     override_dir,
                     pinyin_cfg,
+                    None,
                 )
             } else {
                 None
@@ -1732,6 +1745,8 @@ impl EngineManager {
             let pcfg = PinyinConfig {
                 show_code_hint: pg.show_code_hint,
                 use_smart_compose: pg.use_smart_compose,
+                // 无覆盖（纯拼音方案）时保持历史行为：简拼开。
+                enable_abbrev: pinyin_abbrev.unwrap_or(true),
             };
             let mut engine =
                 PinyinEngine::with_unigram(pcfg, dict, unigram).with_fuzzy(fuzzy.clone());

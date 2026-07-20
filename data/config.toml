@@ -72,6 +72,10 @@ min_english_length = 3
 block_commit_on_pinyin_word = true
 # 词强度权重阈值（0=仅结构判据：拼音首选须≥2汉字且消费整串；预留真机调）。
 pinyin_word_min_weight = 0
+# 混输时拼音是否产出简拼候选（声母缩写，nh→你好）。关闭后混输的拼音只认全拼，
+# 适合「只把拼音当临时输入补位」的用户——简拼会让几乎任何字母串都可能是拼音。
+# 仅影响混输的拼音子引擎，纯拼音方案不受影响。
+enable_pinyin_abbrev = true
 
 [schema.quick_input]
 # 注：; 由内置 mix「快捷」融合接管（quick_input 作为其成员，同时支持日期/计算/拼音/英文）。

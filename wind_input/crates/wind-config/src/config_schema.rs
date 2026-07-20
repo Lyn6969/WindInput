@@ -115,6 +115,7 @@ static REGISTRY: &[ConfigField] = &[
     f("schema.mix.min_english_length", Int),
     f("schema.mix.block_commit_on_pinyin_word", Bool),
     f("schema.mix.pinyin_word_min_weight", Int),
+    f("schema.mix.enable_pinyin_abbrev", Bool),
     f("schema.quick_input.enabled", Bool),
     f("schema.quick_input.decimal_places", Int),
     f("schema.quick_input.force_vertical", Bool),

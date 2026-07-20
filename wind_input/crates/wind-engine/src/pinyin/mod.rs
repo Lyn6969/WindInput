@@ -71,6 +71,12 @@ const COMPLETION_FAR_WEIGHT_FLOOR: i32 = 100;
 pub struct Config {
     pub show_code_hint: bool,
     pub use_smart_compose: bool,
+    /// 是否产出简拼候选（声母缩写，nh→你好）。默认 true = 历史行为（简拼此前恒开、无开关）。
+    ///
+    /// 混输经 `schema.mix.enable_pinyin_abbrev` 关闭它：简拼让「几乎任何字母串都可能是拼音」
+    /// （`is_abbreviation` 只要求每字母是某音节首字母），而混输里有人只拿拼音做临时输入补位。
+    /// 关闭还顺带省掉用户词层的全量扫描（见 convert step6：`search_prefix("", 0)` 枚举全部用户词）。
+    pub enable_abbrev: bool,
 }
 
 impl Default for Config {
@@ -78,6 +84,7 @@ impl Default for Config {
         Self {
             show_code_hint: false,
             use_smart_compose: true,
+            enable_abbrev: true,
         }
     }
 }
@@ -871,7 +878,8 @@ impl Engine for PinyinEngine {
         // 5. 简拼匹配（声母缩写，如 nh→你好）：查 wdat 预存的独立 AbbrevSection。
         //    仅当输入像简拼时才查（is_abbreviation：每字母均为某音节首字母、且非完整音节序列），
         //    避免对全拼输入做无谓查找。natural_order=999999 让简拼候选默认排在全拼之后。
-        if AbbrevMatcher::is_abbreviation(query, trie) {
+        //    `enable_abbrev` 置于短路前：关闭时连 is_abbreviation 的 Dag 构建都省掉。
+        if self.config.enable_abbrev && AbbrevMatcher::is_abbreviation(query, trie) {
             for (text, weight, _order) in dict.search_abbrev(query, 10) {
                 push_unique(
                     &mut candidates,
@@ -919,7 +927,7 @@ impl Engine for PinyinEngine {
             // 预建 AbbrevSection——规模小，现算即可（枚举该 schema 下全部用户/临时词，
             // 现场切分各词全拼码取声母比对，见 abbrev_of_code）。natural_order 对齐
             // step5 系统简拼候选，同样排在全拼之后。
-            if AbbrevMatcher::is_abbreviation(query, trie) {
+            if self.config.enable_abbrev && AbbrevMatcher::is_abbreviation(query, trie) {
                 for mut c in store_dm.search_prefix("", 0) {
                     if c.text.is_empty() || candidates.iter().any(|x| x.text == c.text) {
                         continue;
@@ -1323,6 +1331,42 @@ mod tests {
         // 全拼整串输入仍应正常命中（无回归）
         let r3 = engine.convert("cainiaoyizhan", 20).unwrap();
         assert!(r3.candidates.iter().any(|c| c.text == "菜鸟驿站"));
+    }
+
+    /// `enable_abbrev=false`（混输经 schema.mix.enable_pinyin_abbrev 注入）时不产简拼候选，
+    /// 但全拼一切照旧。与上一个用例同构，只翻转开关——用于锁住「关掉的是简拼、不是拼音」。
+    #[test]
+    fn abbrev_disabled_suppresses_abbrev_candidates_only() {
+        let store = tmp_store("layer_abbrev_off");
+        store
+            .add_user_word("pinyin", "cainiaoyizhan", "菜鸟驿站", 500, 0)
+            .unwrap();
+        let dm = DictManager::new();
+        dm.register_layer(Box::new(wind_dict::StoreUserLayer::new(
+            store.clone(),
+            "pinyin",
+        )));
+        let engine = PinyinEngine::new(
+            Config {
+                enable_abbrev: false,
+                ..Default::default()
+            },
+            CachedDict::Memory(CodetableDict::empty()),
+        )
+        .with_store_layers(Arc::new(dm));
+
+        let r = engine.convert("cnyz", 20).unwrap();
+        assert!(
+            !r.candidates.iter().any(|c| c.text == "菜鸟驿站"),
+            "关闭简拼后 cnyz 不应命中「菜鸟驿站」"
+        );
+
+        // 全拼不受影响——这一条是关键：开关关的是简拼，不是拼音本身。
+        let r2 = engine.convert("cainiaoyizhan", 20).unwrap();
+        assert!(
+            r2.candidates.iter().any(|c| c.text == "菜鸟驿站"),
+            "关闭简拼不得影响全拼命中"
+        );
     }
 
     /// C1：query→原始输入空间的 consumed 回映射。无 `'` 恒等；边界紧跟 `'` 归入已消费侧；
