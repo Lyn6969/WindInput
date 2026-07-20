@@ -11,7 +11,7 @@ use anyhow::Context;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use tracing::info;
+use tracing::{debug, info, warn};
 
 /// 深合并两个 TOML 值：表递归合并（overlay 的键覆盖/新增），标量与数组由 overlay 整体覆盖。
 /// 用于配置三层合并——overlay 中未出现的键保留 base 的值。
@@ -1691,6 +1691,35 @@ impl Default for Config {
     }
 }
 
+/// 用户配置目录的就绪探测结果。
+///
+/// 存在的意义是把「系统尚未就绪」与「用户确实没有配置」分开——两者此前都表现为
+/// [`Config::load`] 静默跳过用户层，然后 [`Config::active_schema`] 回退到系统预置方案，
+/// 用户看到的就是「设置好的方案重启后变回出厂方案」。
+#[derive(Debug)]
+pub enum UserConfigProbe {
+    /// 便携模式：路径来自 exe 同目录，不依赖 known folder，恒就绪。
+    Portable(PathBuf),
+    /// `dirs::config_dir()` 解析失败——漫游 known folder 尚不可用。
+    RoamingUnavailable,
+    /// 漫游根解析出来了但尚不存在（用户配置文件未挂载完成）。
+    RoamingMissing(PathBuf),
+    /// 漫游根已就绪。此时 `dir_exists`/`file_exists` 是**确定性事实**，
+    /// 再等下去也不会变，故不属于需要重试的状态。
+    Ready {
+        dir: PathBuf,
+        dir_exists: bool,
+        file_exists: bool,
+    },
+}
+
+impl UserConfigProbe {
+    /// 是否已到达「再等也不会变」的状态。
+    pub fn is_settled(&self) -> bool {
+        matches!(self, Self::Portable(_) | Self::Ready { .. })
+    }
+}
+
 impl Config {
     /// 三层合并加载：默认值 → data_dir/config.toml → 用户配置。
     ///
@@ -1710,12 +1739,17 @@ impl Config {
         }
 
         // Layer 3: 用户配置 (%APPDATA%/WindInput/config.toml)
-        if let Some(user_dir) = Self::user_config_dir() {
-            let user_config = user_dir.join("config.toml");
-            if let Some(v) = Self::read_toml_value(&user_config) {
-                merge_value(&mut merged, v);
-                info!("Loaded user config: {}", user_config.display());
+        match Self::user_config_dir() {
+            Some(user_dir) => {
+                let user_config = user_dir.join("config.toml");
+                if let Some(v) = Self::read_toml_value(&user_config) {
+                    merge_value(&mut merged, v);
+                    info!("Loaded user config: {}", user_config.display());
+                }
             }
+            // 漫游 known folder 解析失败。此前这里静默跳过整个用户层，配置退化为
+            // 「默认 ⊕ 系统层」，用户的 schema.active 等设置全部失效且无任何痕迹。
+            None => warn!("User config dir unavailable, user layer skipped"),
         }
 
         let mut config: Config = merged.try_into()?;
@@ -1741,6 +1775,10 @@ impl Config {
     /// 读取 TOML 文件为 Value（不存在/解析失败返回 None 并告警，不中断加载）
     fn read_toml_value(path: &Path) -> Option<toml::Value> {
         if !path.exists() {
+            // 「文件不存在」曾是唯一无日志的失败路径：它让「用户没有配置」与
+            // 「开机早期读不到配置」在日志上完全同形，只能靠有无 `Loaded user config`
+            // 反推。DEBUG 级——`load()` 在热重载/RPC 上高频调用，不能进 INFO 刷屏。
+            debug!("Config file absent: {}", path.display());
             return None;
         }
         match std::fs::read_to_string(path) {
@@ -1801,6 +1839,96 @@ impl Config {
             crate::variant::portable_userdata_dir()
         } else {
             dirs::config_dir().map(|d| d.join(Self::app_dir_name()))
+        }
+    }
+
+    /// 探测用户配置目录当前是否可用。纯查询，无副作用、不重试。
+    ///
+    /// 判据刻意建在**漫游根目录**而非 `config.toml` 上：漫游根一旦可用，
+    /// 「我们的目录/文件在不在」就是确定性事实（全新安装本就没有 config.toml，
+    /// 它只在用户首次改设置时由 `set_user_value` 创建）。把判据建在文件上会让
+    /// 每个全新用户白等一个完整超时。
+    pub fn probe_user_config() -> UserConfigProbe {
+        if crate::variant::is_portable() {
+            return match crate::variant::portable_userdata_dir() {
+                Some(d) => UserConfigProbe::Portable(d),
+                None => UserConfigProbe::RoamingUnavailable,
+            };
+        }
+        let Some(root) = dirs::config_dir() else {
+            return UserConfigProbe::RoamingUnavailable;
+        };
+        if !root.is_dir() {
+            return UserConfigProbe::RoamingMissing(root);
+        }
+        let dir = root.join(Self::app_dir_name());
+        UserConfigProbe::Ready {
+            dir_exists: dir.is_dir(),
+            file_exists: dir.join("config.toml").is_file(),
+            dir,
+        }
+    }
+
+    /// 阻塞等待用户配置目录就绪，最多 `timeout`。返回是否就绪。
+    ///
+    /// 只应在服务启动早期调用一次，且必须在 logger 初始化之后——否则探测日志全部丢失。
+    /// **不要**放进 `load()`：热重载与 RPC 也走 `load()`，在那些线程上阻塞会卡住输入。
+    ///
+    /// 超时后仍继续启动（降级为系统预置配置），不死等：输入法晚几秒可用尚可接受，
+    /// 完全起不来不可接受。
+    pub fn wait_user_config_ready(timeout: std::time::Duration) -> bool {
+        Self::wait_until_settled(
+            Self::probe_user_config,
+            timeout,
+            std::time::Duration::from_millis(250),
+        )
+    }
+
+    /// [`Self::wait_user_config_ready`] 的可注入内核：探测源与轮询间隔都是参数。
+    ///
+    /// 抽出来是为了能测重试路径——真机上漫游根几乎总是就绪，重试分支在开发机
+    /// 永远走不到，而它恰恰是这个修复的目的所在，不能靠「上真机重启一次」来验证。
+    fn wait_until_settled(
+        mut probe_fn: impl FnMut() -> UserConfigProbe,
+        timeout: std::time::Duration,
+        interval: std::time::Duration,
+    ) -> bool {
+        let start = std::time::Instant::now();
+        let mut attempts = 0u32;
+
+        loop {
+            let probe = probe_fn();
+            if probe.is_settled() {
+                // 就绪状态也记录：dir_exists/file_exists 能直接回答
+                // 「是路径没解析出来，还是配置真的不在」，无需再猜。
+                info!(
+                    "User config ready after {} attempt(s), {}ms: {:?}",
+                    attempts,
+                    start.elapsed().as_millis(),
+                    probe
+                );
+                return true;
+            }
+            if start.elapsed() >= timeout {
+                warn!(
+                    "User config NOT ready after {}ms ({} attempts), last={:?}; \
+                         falling back to system preset — user settings will be ignored",
+                    start.elapsed().as_millis(),
+                    attempts,
+                    probe
+                );
+                return false;
+            }
+            if attempts == 0 {
+                warn!("User config dir not ready, waiting: {:?}", probe);
+            } else {
+                debug!(
+                    "User config dir still not ready (attempt {}): {:?}",
+                    attempts, probe
+                );
+            }
+            attempts += 1;
+            std::thread::sleep(interval);
         }
     }
 
@@ -1994,6 +2122,106 @@ mod tests {
         // scope 解析大小写不敏感。
         let parsed: InputDefaultConfig = toml::from_str("state_scope = \"App\"").unwrap();
         assert!(parsed.per_app_scope());
+    }
+
+    /// `is_settled` 的语义边界：只有「再等也不会变」的两态算就绪。
+    /// 尤其 `Ready { file_exists: false }` **必须**算就绪——全新安装本就没有
+    /// config.toml（只在用户首次改设置时创建），把它当未就绪会让每个新用户白等整个超时。
+    #[test]
+    fn probe_settled_semantics() {
+        let dir = PathBuf::from("x");
+        assert!(UserConfigProbe::Portable(dir.clone()).is_settled());
+        assert!(
+            UserConfigProbe::Ready {
+                dir: dir.clone(),
+                dir_exists: true,
+                file_exists: true,
+            }
+            .is_settled()
+        );
+        assert!(
+            UserConfigProbe::Ready {
+                dir: dir.clone(),
+                dir_exists: false,
+                file_exists: false,
+            }
+            .is_settled(),
+            "漫游根就绪后，配置在不在是确定性事实，不该继续等待"
+        );
+        // 这两态才是「系统尚未就绪」，等待有意义。
+        assert!(!UserConfigProbe::RoamingUnavailable.is_settled());
+        assert!(!UserConfigProbe::RoamingMissing(dir).is_settled());
+    }
+
+    /// 等待的返回值必须与探测结论一致，且未就绪时不得超出 timeout 太多
+    /// （防止把服务启动无限期卡住——超时后要降级继续启动，不是死等）。
+    #[test]
+    fn wait_respects_probe_and_timeout() {
+        let settled = Config::probe_user_config().is_settled();
+        let start = std::time::Instant::now();
+        let ready = Config::wait_user_config_ready(std::time::Duration::from_millis(50));
+        let elapsed = start.elapsed();
+
+        assert_eq!(ready, settled, "返回值应与探测结论一致");
+        if settled {
+            // 开发机/CI 上漫游根通常存在：必须立即返回，一次 sleep 都不能有。
+            assert!(
+                elapsed < std::time::Duration::from_millis(250),
+                "已就绪却等待了 {elapsed:?}"
+            );
+        } else {
+            assert!(
+                elapsed < std::time::Duration::from_secs(2),
+                "超时后应降级返回而非死等，实际 {elapsed:?}"
+            );
+        }
+    }
+
+    /// 重试路径：前几次未就绪，之后转就绪 → 必须等到就绪再返回 true。
+    /// 这是本修复的核心分支，开发机上探测恒就绪走不到，只能靠注入。
+    #[test]
+    fn wait_retries_until_ready() {
+        let mut calls = 0u32;
+        let ready = Config::wait_until_settled(
+            || {
+                calls += 1;
+                if calls < 3 {
+                    UserConfigProbe::RoamingUnavailable
+                } else {
+                    UserConfigProbe::Ready {
+                        dir: PathBuf::from("x"),
+                        dir_exists: true,
+                        file_exists: true,
+                    }
+                }
+            },
+            std::time::Duration::from_secs(5),
+            std::time::Duration::from_millis(1),
+        );
+        assert!(ready, "转为就绪后应返回 true");
+        assert_eq!(calls, 3, "应恰好重试到就绪那次为止");
+    }
+
+    /// 始终未就绪 → 必须在 timeout 后降级返回 false，而不是死等把服务卡住。
+    #[test]
+    fn wait_gives_up_after_timeout() {
+        let mut calls = 0u32;
+        let start = std::time::Instant::now();
+        let ready = Config::wait_until_settled(
+            || {
+                calls += 1;
+                UserConfigProbe::RoamingMissing(PathBuf::from("x"))
+            },
+            std::time::Duration::from_millis(60),
+            std::time::Duration::from_millis(10),
+        );
+        assert!(!ready, "始终未就绪应返回 false");
+        assert!(calls > 1, "应至少重试过，实际 {calls} 次");
+        assert!(
+            start.elapsed() < std::time::Duration::from_secs(2),
+            "应及时放弃，实际 {:?}",
+            start.elapsed()
+        );
     }
 
     #[test]

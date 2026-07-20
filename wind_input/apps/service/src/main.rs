@@ -121,6 +121,17 @@ fn main() {
     };
     info!("Singleton check passed");
 
+    // 2.5 等待用户配置目录就绪。
+    //
+    // 开机自启时服务可能跑在登录会话很早的阶段，此时漫游 known folder（%APPDATA%）
+    // 未必已解析/挂载完成，而日志目录走的是另一个 known folder（%LOCALAPPDATA%，
+    // 见 Config::log_dir vs user_config_dir）——两者独立解析，于是会出现
+    // 「日志正常写出、用户配置却像不存在一样」，配置静默退化为系统预置，
+    // 用户表现为「设置成全拼，重启后工具栏又变回五笔」。
+    //
+    // 必须在 init_logger() 之后：探测过程本身要留下日志。
+    wind_config::Config::wait_user_config_ready(std::time::Duration::from_secs(10));
+
     // 3. 创建 DeferredHandler（启动时返回安全默认值）
     let deferred = DeferredHandler::new();
 
