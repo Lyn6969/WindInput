@@ -134,6 +134,15 @@ impl MessageHandler for DeferredHandler {
         self.with_handler((), |h| h.handle_caret_update(data))
     }
 
+    // ⚠ 必须显式转发，不能吃 trait 默认实现：默认实现调的是 `self.handle_caret_update`，
+    // 而这里的 `self` 是本包装器 → 又转发到内层的 handle_caret_update，内层的
+    // handle_focus_gained_caret 永远不会被调用，副作用（消费首显等待→立即显示候选）
+    // 原封不动地回来。整条链每一步都合法，编译器不会报错，只能靠真机日志发现。
+    // 本 trait 今后新增带默认实现的方法时，这里都要跟着补一条转发。
+    fn handle_focus_gained_caret(&self, data: &CaretData) {
+        self.with_handler((), |h| h.handle_focus_gained_caret(data))
+    }
+
     fn handle_caret_pending(&self) {
         self.with_handler((), |h| h.handle_caret_pending())
     }

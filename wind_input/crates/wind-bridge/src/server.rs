@@ -484,8 +484,11 @@ pub(crate) fn dispatch_command(
                 mgr.note_focus(ctx.conn_id, ctx.pid);
             }
             if let Ok(fg) = decode_focus_gained(payload) {
-                // 同步 caret（首键前必须就绪，纯字段写入，对齐 Go applyFocusGainedCaret）
-                handler.handle_caret_update(&CaretData {
+                // 同步 caret（首键前必须就绪，纯字段写入，对齐 Go applyFocusGainedCaret）。
+                // ⚠ 必须走 handle_focus_gained_caret 而**不是** handle_caret_update：
+                // 后者带副作用（消费首显等待 → 立即显示候选），会让焦点事件那一刻的
+                // 非权威坐标抢在 reflow 之前把候选窗显示出来，造成"先在旧位置再跳走"。
+                handler.handle_focus_gained_caret(&CaretData {
                     x: fg.caret.x,
                     y: fg.caret.y,
                     height: fg.caret.height,
@@ -1050,6 +1053,7 @@ mod tests {
         }
         fn handle_composition_terminated(&self) {}
         fn handle_caret_update(&self, _data: &CaretData) {}
+        fn handle_focus_gained_caret(&self, _data: &CaretData) {}
         fn handle_caret_pending(&self) {}
         fn handle_selection_changed(&self, _prev_char: u16) {}
         fn handle_commit_request(&self, _data: &CommitRequestData) -> Option<CommitResultData> {

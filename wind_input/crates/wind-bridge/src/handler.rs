@@ -219,6 +219,20 @@ pub trait MessageHandler: Send + Sync {
     /// 处理光标位置更新
     fn handle_caret_update(&self, data: &CaretData);
 
+    /// focus_gained 随包携带的 caret：**只更新坐标缓存，不得触发任何显示决策**。
+    ///
+    /// 与 [`Self::handle_caret_update`] 的区别是本方法没有副作用——不消费首显等待、
+    /// 不锚定组合起点、不 reshow。焦点事件带来的坐标是「当前这一刻」的，未必是宿主
+    /// reflow 之后的权威值；拿它去满足首显闸门会让候选窗先在中间位置闪一下再跳走
+    /// （Excel 单元格激活实测：1025,687 → **1369,1036** → 1590,1092，中间那个就是
+    /// 焦点事件带来的）。真正的权威坐标由 OnLayoutChange 之后的 caret_update 送达。
+    ///
+    /// **刻意不给默认实现**。曾经给过（委托 `handle_caret_update`），结果 `DeferredHandler`
+    /// 这类装饰器没重写它 → 吃默认实现 → 默认实现调装饰器自己的 `handle_caret_update`
+    /// → 转发回内层旧路径，真正的实现从未被调用。每一步都合法，编译器全程沉默，
+    /// 最后靠真机日志才发现。设为必需方法，让编译器逼每个实现者显式表态。
+    fn handle_focus_gained_caret(&self, data: &CaretData);
+
     /// 处理光标待定（composition 刚启动，真正 caret 在 reflow 后到达）
     fn handle_caret_pending(&self);
 

@@ -140,6 +140,7 @@ mod tests {
         }
         fn handle_composition_terminated(&self) {}
         fn handle_caret_update(&self, _data: &CaretData) {}
+        fn handle_focus_gained_caret(&self, _data: &CaretData) {}
         fn handle_caret_pending(&self) {}
         fn handle_selection_changed(&self, _prev_char: u16) {}
         fn handle_commit_request(&self, _data: &CommitRequestData) -> Option<CommitResultData> {

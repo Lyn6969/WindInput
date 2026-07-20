@@ -4926,6 +4926,44 @@ impl MessageHandler for Coordinator {
         }
     }
 
+    /// focus_gained 随包携带的 caret：只更新坐标缓存，**不做任何显示决策**。
+    ///
+    /// 焦点事件带来的坐标是「切换发生的那一刻」的值，宿主可能还没 reflow。若把它交给
+    /// [`Self::handle_caret_update`]，会被当成 reflow 后的权威坐标消费掉首显等待，候选窗
+    /// 就在中间位置先显示一次再跳到最终位置。Excel 单元格激活实测三段坐标：
+    /// 1025,687（选中态）→ **1369,1036（焦点事件，非权威）** → 1590,1092（reflow 后）。
+    ///
+    /// caret_use_top 变换要照做——坐标缓存本身必须与 handle_caret_update 写入的口径一致，
+    /// 否则首键前的兜底坐标会和后续更新差一个行高。
+    fn handle_focus_gained_caret(&self, data: &CaretData) {
+        // 独立日志行：与 handle_caret_update 区分开，否则无法从日志判断焦点坐标走的是
+        // 哪条路（本次修复第一版就因为看不出这点，白跑了一轮真机验证）。
+        tracing::debug!(
+            "handle_focus_gained_caret (no-show): x={} y={} h={}",
+            data.x,
+            data.y,
+            data.height
+        );
+        if data.height == 0 {
+            return;
+        }
+        let mut data = *data;
+        if self
+            .active_compat
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .1
+        {
+            let raw_h = data.height;
+            data.y -= raw_h;
+            data.height = raw_h.max(CARET_USE_TOP_MIN_LINE_H);
+        }
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        state.caret_x = data.x;
+        state.caret_y = data.y;
+        state.caret_height = data.height;
+    }
+
     fn handle_caret_pending(&self) {
         // DLL 新组合在 reflow 完成前发来的"坐标待定"握手（_compositionJustStarted）：
         // 仅当正等待首显时，延长兜底超时到 600ms，避免 OnLayoutChange burst 慢的应用（如 EverEdit）
