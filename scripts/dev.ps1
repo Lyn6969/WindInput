@@ -69,6 +69,8 @@ $DeployDirRelease = "C:\Program Files\WindInput"
 $DeployDirDev   = "C:\Program Files\WindInputDev"
 # wind-installer: 通用安装器生成器 (兄弟项目, app.toml 驱动); 8/d8 打包命令调用其 pack.ps1。
 $InstallerDir  = "$ProductRoot\..\wind-installer"
+# 在线升级元数据里的下载地址前缀 (不含结尾斜杠); 打包后生成的 latest*.json 据此拼 exeUrl。
+$CdnBase       = "https://dl.windinput.com"
 # 可在 scripts\deploy.local.ps1 覆盖上述变量 (PowerShell 赋值语法; 该文件 gitignore)。
 $deployCfg = "$ScriptDir\deploy.local.ps1"
 if (Test-Path $deployCfg) { . $deployCfg }
@@ -926,6 +928,50 @@ icon        = "$iconFwd"
     [System.IO.File]::WriteAllText($cfgPath, $toml, (New-Object System.Text.UTF8Encoding($false)))
 }
 
+# ---------- 在线升级元数据 (latest.json / latest-dev.json) ----------
+# 供 wind-setting 的在线升级检查读取, 与安装包一并上传 CDN。
+# 字段契约见 wind-setting\docs\online-update-plan.md §3.2。要点:
+#   · sha256/size 为必填 —— 客户端在缺失或不匹配时拒绝升级, 不退化为"不校验就装"
+#     (旧 Go 版官网渠道 size 恒为 0, 导致 %TEMP% 里一个被截断的同名文件会被当成完整包安装)。
+#   · channel 与客户端自身变体交叉校验, 防 CDN 缓存串档把 dev 包发给正式版用户。
+# 两个变体各写各的文件, 互不干扰; 上传时务必**先传 exe 再传 json** —— json 是开关,
+# 反过来会让客户端看到新版本却下载到 404。
+function New-UpdateManifest ([string]$profile, [string]$setupPath) {
+    $isDev    = ($profile -eq "dev")
+    $channel  = if ($isDev) { "dev" } else { "stable" }
+    $base     = if ($isDev) { "WindInputDev" } else { "WindInput" }
+    $jsonName = if ($isDev) { "latest-dev.json" } else { "latest.json" }
+
+    $item = Get-Item $setupPath
+    $sha  = (Get-FileHash -Path $setupPath -Algorithm SHA256).Hash.ToLower()
+
+    # sha256 sidecar (标准 sha256sum 格式), 便于手工核对与 CDN 侧校验
+    $shaFile = "$setupPath.sha256"
+    [System.IO.File]::WriteAllText($shaFile, "$sha  $($item.Name)`n",
+        (New-Object System.Text.UTF8Encoding($false)))
+
+    $manifest = [ordered]@{
+        version         = $Version
+        tag             = "v$Version"
+        channel         = $channel
+        exeUrl          = "$CdnBase/$($item.Name)"
+        sha256          = $sha
+        size            = $item.Length
+        releaseNotesUrl = "$CdnBase/$base-$Version-Release.md"
+        publishedAt     = (Get-Date).ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ssZ")
+    }
+
+    $out = Join-Path $DistDir $jsonName
+    # 无 BOM UTF-8: 客户端按 UTF-8 文本解析, 前置 BOM 会让 serde_json 报错。
+    [System.IO.File]::WriteAllText($out, ($manifest | ConvertTo-Json -Depth 3),
+        (New-Object System.Text.UTF8Encoding($false)))
+
+    Say "升级元数据: $out"
+    Gray "  channel=$channel  version=$Version  size=$($item.Length)"
+    Gray "  sha256=$sha"
+    Gray "  上传顺序: 先 $($item.Name), 确认可访问后再 $jsonName"
+}
+
 # 生成安装包: (除非 skip) 全构建当前变体 → 生成 app.toml → 调 wind-installer\scripts\pack.ps1。
 #   pack.ps1 负责: 原生编译 stub/uninstaller/packer → 注入 uninstall.exe 到 source → wind-packer build。
 # 打包是纯文件 IO + cargo 构建, 不需管理员 (故未纳入 UAC 提权命令)。
@@ -979,8 +1025,8 @@ function Do-Installer ([string]$profile = "release", [bool]$skipBuild = $false) 
     if (Test-Path $setup) {
         $sz = [math]::Round((Get-Item $setup).Length / 1MB, 1)
         Say "`n安装包已生成: $setup (${sz}MB)"
-        $sha = "$setup.sha256"
-        if (Test-Path $sha) { Gray "校验和: $sha" }
+        # 5. 生成在线升级元数据 + sha256 sidecar (供 wind-setting 检查更新)
+        New-UpdateManifest $profile $setup
     } else {
         Warn "打包脚本已结束, 但未找到预期输出: $setup"
         Warn "请检查上方 wind-packer 实际输出名 (dist\ 下)。"
