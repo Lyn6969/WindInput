@@ -209,6 +209,10 @@ private:
     // Called from both OnTestKeyUp and OnKeyUp; clearing in the first caller makes the second a no-op.
     // Returns TRUE if a toggle was matched (caller should set pfEaten=TRUE).
     BOOL _DispatchPendingToggleKeyUp(WPARAM wParam);
+
+    // 记录「该切换键正等 keyup 触发切换」。OnTestKeyDown 与 OnKeyDown 都会调用：
+    // 纯修饰键放行后 TSF 未必再调 OnKeyDown，只在后者记录会让切换失灵。幂等。
+    void _MarkPendingToggleKey(WPARAM wParam, uint32_t modifiers);
     BOOL _SendKeyToService(uint32_t keyCode, uint32_t modifiers, uint8_t eventType);
     BOOL _HandleServiceResponse(); // Returns TRUE if key was handled, FALSE to pass through
 

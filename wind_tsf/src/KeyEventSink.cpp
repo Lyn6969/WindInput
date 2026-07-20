@@ -8,6 +8,29 @@
 
 namespace
 {
+    // 纯修饰键：唯一职责就是修饰别的按键，自身按下/抬起对宿主没有独立语义。
+    //
+    // 这类键**绝不能吃**，哪怕它被配成了中英文切换键。切换判定挂在 keyup 上
+    // （见 IsKeyUpHotkey），吃掉 keydown 换不来任何东西，却会让宿主完全看不到修饰键：
+    //   · AutoCAD 按住 Shift 是正交模式覆盖，需要在光标移动全程持有 keydown。
+    //     吃掉之后 CAD 反复重建输入上下文——实测每次按键放大成约 10 次焦点重建、
+    //     每秒近百次，主线程被自己的重建工作压满，表现为「按住 Shift 移光标非常卡」。
+    //     实测对照：把切换键从 Shift 换成 Ctrl，Shift 和 Ctrl 都不卡且切换正常；
+    //     换回 Shift 立刻复发。Ctrl 不犯病只是因为 CAD 不用它做鼠标移动修饰。
+    //   · 同类问题此前已在 Fusion 360 上出现过（见下方 isToggleModeKey 分支的注释），
+    //     当时只给「未配置为切换键」的情况加了守卫，配置了的仍然照吃。
+    //
+    // CapsLock **不**属于此列：它有真实的大写状态副作用，必须吃掉才能压制。
+    //
+    // ⚠ down 和 up 必须一致放行：只放行一边会让宿主看到「按下但从未松开」的
+    // 卡死修饰键，那比吃掉更糟。
+    BOOL _IsPureModifierKey(WPARAM vk)
+    {
+        return vk == VK_SHIFT   || vk == VK_LSHIFT   || vk == VK_RSHIFT
+            || vk == VK_CONTROL || vk == VK_LCONTROL || vk == VK_RCONTROL
+            || vk == VK_MENU    || vk == VK_LMENU    || vk == VK_RMENU;
+    }
+
     const wchar_t* _HotkeyTypeName(HotkeyType type)
     {
         switch (type)
@@ -154,9 +177,64 @@ STDAPI_(ULONG) CKeyEventSink::Release()
     return cr;
 }
 
+// 记录「这个切换键正等着 keyup 触发切换」。
+// 由 OnTestKeyDown（放行纯修饰键时）与 OnKeyDown 共同调用；对同一个键重复调用不会
+// 重新计时（见函数内说明），因此两处都调、宿主重复发 keydown，都不会影响长按判定。
+void CKeyEventSink::_MarkPendingToggleKey(WPARAM wParam, uint32_t modifiers)
+{
+    // 必须解析出具体的左右键：wParam 可能是笼统的 VK_SHIFT，而热键白名单登记的是
+    // VK_LSHIFT / VK_RSHIFT，不解析就匹配不上配置。
+    // 优先用 modifiers（双源），降级 GetAsyncKeyState——修复 WebView2 / Wails 等
+    // Chromium 宿主下 GetAsyncKeyState 拿不到具体 L/R Shift 的兼容问题。
+    uint32_t specificKey = (uint32_t)wParam;
+    if (wParam == VK_SHIFT)
+    {
+        if (modifiers & KEYMOD_LSHIFT)
+            specificKey = VK_LSHIFT;
+        else if (modifiers & KEYMOD_RSHIFT)
+            specificKey = VK_RSHIFT;
+        else if (GetAsyncKeyState(VK_LSHIFT) & 0x8000)
+            specificKey = VK_LSHIFT;
+        else if (GetAsyncKeyState(VK_RSHIFT) & 0x8000)
+            specificKey = VK_RSHIFT;
+    }
+    else if (wParam == VK_CONTROL)
+    {
+        if (modifiers & KEYMOD_LCTRL)
+            specificKey = VK_LCONTROL;
+        else if (modifiers & KEYMOD_RCTRL)
+            specificKey = VK_RCONTROL;
+        else if (GetAsyncKeyState(VK_LCONTROL) & 0x8000)
+            specificKey = VK_LCONTROL;
+        else if (GetAsyncKeyState(VK_RCONTROL) & 0x8000)
+            specificKey = VK_RCONTROL;
+    }
+    // 同一个键已在 pending 中就**不重新计时**。
+    // 宿主会为一次按住的键重复发 keydown：AutoCAD 实测 28 秒内 145 次 test_down，
+    // MS Word 2010 也会对单次按键发多次 OnTestKeyDown（Weasel 源码注明）。
+    // 每次都重置 _pendingKeyDownTime 的话，_DispatchPendingToggleKeyUp 里的
+    // TOGGLE_TAP_THRESHOLD_MS 判定永远只看到「刚按下」，长按 Shift 会被误判成
+    // 轻敲而切换中英文——这正是放行 keydown 后在 CAD 暴露出来的回归。
+    // 首次按下才起表；重复事件只刷新修饰键位（左右手可能中途变化）。
+    if (_pendingKeyUpKey == specificKey)
+    {
+        _pendingKeyUpModifiers = modifiers;
+        return;
+    }
+
+    _pendingKeyUpKey = specificKey;
+    _pendingKeyUpModifiers = modifiers;
+    _pendingKeyDownTime = GetTickCount();
+}
+
+// ITfKeyEventSink::OnSetFocus —— 名字像是焦点主回调，实际**很不可靠**，不要往这里挂
+// 任何独占职责：AutoCAD 实测整场只触发 2 次，且全是 fForeground=1，从来没有过 0。
+// （曾把 focus_lost 挂在它的 else 分支上，结果 focus_lost 完全断供。）
+// 应用切入/切出的权威信号是 ITfThreadFocusSink::OnSet/KillThreadFocus——同一份日志里
+// 2 / 1 次，与实际切换一一对应。
 STDAPI CKeyEventSink::OnSetFocus(BOOL fForeground)
 {
-    WIND_LOG_INFO(L"KeyEventSink::OnSetFocus\n");
+    WIND_LOG_INFO_FMT(L"KeyEventSink::OnSetFocus fForeground=%d\n", fForeground ? 1 : 0);
     return S_OK;
 }
 
@@ -360,10 +438,22 @@ STDAPI CKeyEventSink::OnTestKeyDown(ITfContext* pContext, WPARAM wParam, LPARAM 
             WindLogForegroundProcessInfo(4, L"compat.toggle_no_textctx.host");
             return S_OK;
         }
-        *pfEaten = TRUE;
+        // 纯修饰键放行给宿主：切换判定在 keyup，吃掉 keydown 毫无收益却会破坏
+        // 宿主的修饰键功能（AutoCAD 正交覆盖卡顿的根因）。详见 _IsPureModifierKey。
+        const BOOL eatToggleDown = !_IsPureModifierKey(wParam);
+
+        // ⚠ 放行时必须在这里就记下待切换状态。TSF 在 OnTestKeyDown 返回 pfEaten=FALSE
+        // 后通常**不再调用 OnKeyDown**（下方那处 Chrome 的注释正说明它是例外），
+        // 而 _pendingKeyUpKey 原本只在 OnKeyDown 里设置——不补这一手，放行 keydown
+        // 就等于把中英文切换整个弄没了。
+        // OnKeyDown 若仍被调用会再记一次，_MarkPendingToggleKey 对同一个键不会重新计时。
+        if (!eatToggleDown)
+            _MarkPendingToggleKey(wParam, modifiers);
+
+        *pfEaten = eatToggleDown;
         _LogKeyDecision(L"test_down", _pTextService->GetFocusSessionId(), wParam, modifiers, HotkeyType::ToggleMode,
                         _pTextService->IsChineseMode(), _pTextService->HasActiveComposition(), _hasCandidates,
-                        hasSession || hasTextCtx, TRUE, L"toggle_mode_key");
+                        hasSession || hasTextCtx, eatToggleDown, L"toggle_mode_key");
         return S_OK;
     }
 
@@ -862,40 +952,13 @@ STDAPI CKeyEventSink::OnKeyDown(ITfContext* pContext, WPARAM wParam, LPARAM lPar
         }
 
         // Mark key as pending for KeyUp toggle (Shift/Ctrl only, not CapsLock)
-        // IMPORTANT: Determine the specific left/right key for proper config matching
-        // wParam might be generic VK_SHIFT, but we need to know if it's LShift or RShift
-        uint32_t specificKey = (uint32_t)wParam;
-        // 同 keyUpHash 解析：优先用 modifiers（双源），降级 GetAsyncKeyState。
-        // 修复 WebView2 / Wails 等 Chromium 宿主下 GetAsyncKeyState 拿不到具体 L/R Shift 的兼容问题。
-        if (wParam == VK_SHIFT)
-        {
-            if (modifiers & KEYMOD_LSHIFT)
-                specificKey = VK_LSHIFT;
-            else if (modifiers & KEYMOD_RSHIFT)
-                specificKey = VK_RSHIFT;
-            else if (GetAsyncKeyState(VK_LSHIFT) & 0x8000)
-                specificKey = VK_LSHIFT;
-            else if (GetAsyncKeyState(VK_RSHIFT) & 0x8000)
-                specificKey = VK_RSHIFT;
-        }
-        else if (wParam == VK_CONTROL)
-        {
-            if (modifiers & KEYMOD_LCTRL)
-                specificKey = VK_LCONTROL;
-            else if (modifiers & KEYMOD_RCTRL)
-                specificKey = VK_RCONTROL;
-            else if (GetAsyncKeyState(VK_LCONTROL) & 0x8000)
-                specificKey = VK_LCONTROL;
-            else if (GetAsyncKeyState(VK_RCONTROL) & 0x8000)
-                specificKey = VK_RCONTROL;
-        }
-        _pendingKeyUpKey = specificKey;
-        _pendingKeyUpModifiers = modifiers;
-        _pendingKeyDownTime = GetTickCount();
+        _MarkPendingToggleKey(wParam, modifiers);
 
         WIND_LOG_DEBUG(L"OnKeyDown: Toggle mode key pending for KeyUp\n");
 
-        *pfEaten = TRUE;
+        // 同 OnTestKeyDown：纯修饰键放行。待切换状态已记在 _pendingKeyUpKey 上，
+        // 放行不影响 keyup 时的切换判定。
+        *pfEaten = !_IsPureModifierKey(wParam);
         return S_OK;
     }
 
@@ -1204,7 +1267,9 @@ STDAPI CKeyEventSink::OnTestKeyUp(ITfContext* pContext, WPARAM wParam, LPARAM lP
     // _DispatchPendingToggleKeyUp clears _pendingKeyUpKey, making the OnKeyUp call a no-op.
     if (_DispatchPendingToggleKeyUp(wParam))
     {
-        *pfEaten = TRUE;
+        // 纯修饰键必须与 keydown 一致放行：只放行 down 而吃掉 up，宿主就会停在
+        // 「Shift 按下且从未松开」的状态，比两边都吃更糟。
+        *pfEaten = !_IsPureModifierKey(wParam);
         return S_OK;
     }
 
@@ -1265,7 +1330,8 @@ STDAPI CKeyEventSink::OnKeyUp(ITfContext* pContext, WPARAM wParam, LPARAM lParam
     // (apps like mintty call OnTestKeyUp but skip OnKeyUp — dispatch happens there).
     if (_DispatchPendingToggleKeyUp(wParam))
     {
-        *pfEaten = TRUE;
+        // 与 keydown 一致放行纯修饰键，理由同 OnTestKeyUp。
+        *pfEaten = !_IsPureModifierKey(wParam);
         return S_OK;
     }
 
