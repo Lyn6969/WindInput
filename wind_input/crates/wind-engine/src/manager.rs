@@ -2134,7 +2134,13 @@ impl EngineManager {
             let loaded = if dict_type == "rime_pinyin" {
                 Self::load_rime_pinyin_dict(p)
             } else {
-                CachedDict::load(p).ok()
+                // 必须用与 load_codetable_layers 相同的缓存路径。此前这里是
+                // `CachedDict::load(p)`，它把缓存落在**源文件旁**（yaml.with_extension），
+                // 而源在只读的安装目录：写入必然拒绝访问 → 退化成内存模式 → 每次都要重解析
+                // 整份 yaml。实测按键触发反查索引时同步卡 452ms（88526 条重新解析），
+                // 且这三个库的 wdat 早已在 reader 池里。改用 cache_path 后指纹命中即复用
+                // 池中 mmap，零解析。
+                CachedDict::load_at(p, &cache_path(p, "wdat")).ok()
             };
             match loaded {
                 Some(d) => {
