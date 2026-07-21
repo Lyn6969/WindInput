@@ -3013,6 +3013,9 @@ impl Coordinator {
                     s.s2t_enabled = !s.s2t_enabled;
                 }
                 self.show_status();
+                // 工具栏「繁」格随切即刷（对齐 toggle_full_width 与菜单路径）。缺这步时
+                // 只有一闪而过的状态气泡，工具栏状态滞后到下次刷新事件，被误感知为“切换卡”。
+                self.notify_toolbar();
                 true
             }
             "toggle_toolbar" => {
