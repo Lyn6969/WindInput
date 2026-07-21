@@ -46,7 +46,7 @@ pub struct ReverseLookup {
     /// 拆字表（字 → 字根/编码），可随主码表方案热重载（`reload_chaizi`）
     chaizi: ChaiziTable,
     /// 字 → 拼音读音（多音字按常用频率排序，最常用在前）
-    pinyin: HashMap<char, Vec<String>>,
+    pinyin: PinyinTable,
 }
 
 /// 拆字表：字 → (字根, 编码)。紧凑存储——按字升序的定长条目数组 + 共享文本 arena，
@@ -123,6 +123,116 @@ impl ChaiziTable {
 
     fn len(&self) -> usize {
         self.entries.len()
+    }
+}
+
+/// 拼音表：字 → 读音列表（多音字按常用频率排序，最常用在前）。与 `ChaiziTable` 同构的紧凑
+/// 存储——按字升序的定长条目数组 + 共享文本 arena，相比 `HashMap<char, Vec<String>>`
+/// （桶空位 + 每字一个 Vec + 每读音一次堆分配）省数倍内存。读音是变长列表，故比拆字表多一级
+/// `reading_ends` 下标。查询走二分：拼音仅用于悬停提示与加词出码，均为低频路径，无需 O(1)。
+#[derive(Default)]
+struct PinyinTable {
+    /// 按 `ch` 升序。本条读音在 `reading_ends` 中的下标区间
+    /// = [前一条目的 `reading_end`, 本条 `reading_end`)，首条起点为 0。
+    entries: Vec<PinyinEntry>,
+    /// 每个读音在 `arena` 中的结束偏移，按条目序连续。
+    /// 单条读音的文本区间 = [前一项, 本项)，首项起点为 0。
+    reading_ends: Vec<u32>,
+    /// 所有读音文本按序连续拼接。
+    arena: String,
+}
+
+struct PinyinEntry {
+    ch: char,
+    reading_end: u32,
+}
+
+/// 某字的读音列表视图：按需从 `arena` 切片，取用不分配。
+#[derive(Clone, Copy)]
+struct PinyinReadings<'a> {
+    table: &'a PinyinTable,
+    /// `reading_ends` 下标区间 [start, end)
+    start: usize,
+    end: usize,
+}
+
+impl<'a> PinyinReadings<'a> {
+    fn len(&self) -> usize {
+        self.end - self.start
+    }
+
+    /// 最常用读音（首项）。
+    fn first(&self) -> Option<&'a str> {
+        (self.start < self.end).then(|| self.table.reading_at(self.start))
+    }
+
+    /// 按序遍历读音（最常用在前）。
+    fn iter(self) -> impl Iterator<Item = &'a str> {
+        (self.start..self.end).map(move |i| self.table.reading_at(i))
+    }
+}
+
+impl PinyinTable {
+    /// 从 (字, 读音列表) 行构建；同字多行取靠后者（与旧 HashMap 覆盖语义一致）。
+    fn build(mut rows: Vec<(char, Vec<&str>)>) -> Self {
+        rows.sort_by_key(|r| r.0); // 稳定排序保文件序，取每组末条即"后行覆盖"
+        let mut entries = Vec::with_capacity(rows.len());
+        let mut reading_ends = Vec::with_capacity(rows.iter().map(|r| r.1.len()).sum());
+        let mut arena =
+            String::with_capacity(rows.iter().flat_map(|r| &r.1).map(|s| s.len()).sum());
+        let mut i = 0;
+        while i < rows.len() {
+            let mut j = i;
+            while j + 1 < rows.len() && rows[j + 1].0 == rows[i].0 {
+                j += 1;
+            }
+            for r in &rows[j].1 {
+                arena.push_str(r);
+                reading_ends.push(arena.len() as u32);
+            }
+            entries.push(PinyinEntry {
+                ch: rows[j].0,
+                reading_end: reading_ends.len() as u32,
+            });
+            i = j + 1;
+        }
+        entries.shrink_to_fit();
+        reading_ends.shrink_to_fit();
+        arena.shrink_to_fit();
+        Self {
+            entries,
+            reading_ends,
+            arena,
+        }
+    }
+
+    /// 二分查字，返回读音列表视图。
+    fn readings(&self, c: char) -> Option<PinyinReadings<'_>> {
+        let i = self.entries.binary_search_by_key(&c, |e| e.ch).ok()?;
+        let start = if i == 0 {
+            0
+        } else {
+            self.entries[i - 1].reading_end as usize
+        };
+        Some(PinyinReadings {
+            table: self,
+            start,
+            end: self.entries[i].reading_end as usize,
+        })
+    }
+
+    /// 按 `reading_ends` 全局下标取单条读音文本。
+    fn reading_at(&self, i: usize) -> &str {
+        let start = if i == 0 {
+            0
+        } else {
+            self.reading_ends[i - 1] as usize
+        };
+        &self.arena[start..self.reading_ends[i] as usize]
+    }
+
+    fn is_empty(&self) -> bool {
+        self.entries.is_empty()
     }
 }
 
@@ -296,6 +406,7 @@ impl ReverseLookup {
         let Ok(content) = std::fs::read_to_string(path) else {
             return;
         };
+        let mut rows: Vec<(char, Vec<&str>)> = Vec::new();
         for line in content.lines() {
             let mut line = line.trim();
             if !line.starts_with("U+") {
@@ -316,25 +427,25 @@ impl ReverseLookup {
                 continue;
             };
             // 逗号分隔多音字读音，首项为最常用读音
-            let readings: Vec<String> = rest
+            let readings: Vec<&str> = rest
                 .trim()
                 .split(',')
                 .map(|s| s.trim())
                 .filter(|s| !s.is_empty())
-                .map(|s| s.to_string())
                 .collect();
             if !readings.is_empty() {
-                self.pinyin.insert(c, readings);
+                rows.push((c, readings));
             }
         }
+        self.pinyin = PinyinTable::build(rows);
     }
 
     /// 生成词的拼音编码（空格分隔、去声调小写；ü→v）。无读音的字跳过。
     /// 用于设置页 dict.genPinyin / 拼音方案加词自动出码。
     pub fn gen_pinyin(&self, text: &str) -> String {
         text.chars()
-            .filter_map(|c| self.pinyin.get(&c).and_then(|r| r.first()))
-            .map(|py| strip_tone(py))
+            .filter_map(|c| self.pinyin.readings(c).and_then(|r| r.first()))
+            .map(strip_tone)
             .filter(|s| !s.is_empty())
             .collect::<Vec<_>>()
             .join(" ")
@@ -440,7 +551,7 @@ impl ReverseLookup {
         if opts.pinyin {
             let mut lines = Vec::new();
             for &c in &chars {
-                if let Some(readings) = self.pinyin.get(&c) {
+                if let Some(readings) = self.pinyin.readings(c) {
                     let n = if !opts.heteronyms {
                         1
                     } else if opts.max_readings > 0 {
@@ -448,7 +559,7 @@ impl ReverseLookup {
                     } else {
                         readings.len()
                     };
-                    let shown = readings[..n.min(readings.len())].join("/");
+                    let shown = readings.iter().take(n).collect::<Vec<_>>().join("/");
                     if !shown.is_empty() {
                         lines.push(format!("{c}：{shown}"));
                     }
@@ -513,6 +624,11 @@ impl ReverseLookup {
     fn set_chaizi(&mut self, rows: Vec<(char, &str, &str)>) {
         self.chaizi = ChaiziTable::build(rows);
     }
+
+    /// 测试助手：直接构建拼音表（字, 读音列表）。
+    fn set_pinyin(&mut self, rows: Vec<(char, Vec<&str>)>) {
+        self.pinyin = PinyinTable::build(rows);
+    }
 }
 
 #[cfg(test)]
@@ -548,9 +664,7 @@ mod tests {
     fn sample_rl() -> ReverseLookup {
         let mut rl = ReverseLookup::default();
         rl.set_chaizi(vec![('好', "女子", "vbg"), ('人', "人", "w")]);
-        rl.pinyin
-            .insert('好', vec!["hǎo".to_string(), "hào".to_string()]);
-        rl.pinyin.insert('人', vec!["rén".to_string()]);
+        rl.set_pinyin(vec![('好', vec!["hǎo", "hào"]), ('人', vec!["rén"])]);
         rl
     }
 
@@ -736,17 +850,14 @@ mod tests {
     fn test_gen_pinyin_uses_first_reading() {
         let mut rl = ReverseLookup::default();
         // 多音字"重"：首音 zhòng（最常用），次音 chóng
-        rl.pinyin
-            .insert('重', vec!["zhòng".to_string(), "chóng".to_string()]);
-        rl.pinyin.insert('要', vec!["yào".to_string()]);
+        rl.set_pinyin(vec![('重', vec!["zhòng", "chóng"]), ('要', vec!["yào"])]);
         assert_eq!(rl.gen_pinyin("重要"), "zhong yao");
     }
 
     #[test]
     fn test_tooltip_multi_reading_joined() {
         let mut rl = ReverseLookup::default();
-        rl.pinyin
-            .insert('重', vec!["zhòng".to_string(), "chóng".to_string()]);
+        rl.set_pinyin(vec![('重', vec!["zhòng", "chóng"])]);
         let t = rl.tooltip_for("重", &TooltipOptions::default(), None, None);
         assert!(t.contains("zhòng/chóng"), "多音字读音应以 / 连接: {t}");
     }
@@ -765,11 +876,36 @@ mod tests {
 
         let mut rl = ReverseLookup::default();
         rl.load_pinyin(&path);
-        assert_eq!(rl.pinyin.get(&'一').unwrap(), &vec!["yī".to_string()]);
         assert_eq!(
-            rl.pinyin.get(&'重').unwrap(),
-            &vec!["zhòng".to_string(), "chóng".to_string()]
+            rl.pinyin.readings('一').unwrap().iter().collect::<Vec<_>>(),
+            vec!["yī"]
+        );
+        assert_eq!(
+            rl.pinyin.readings('重').unwrap().iter().collect::<Vec<_>>(),
+            vec!["zhòng", "chóng"]
         );
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn test_pinyin_table_lookup_and_dup_last_wins() {
+        // 与拆字表对称：乱序输入 + 同字重复，查询按二分命中，重复取靠后者。
+        let t = PinyinTable::build(vec![
+            ('乙', vec!["yǐ"]),
+            ('甲', vec!["jiǎ"]),
+            ('甲', vec!["jiá", "jiǎ"]),
+            ('丙', vec!["bǐng"]),
+        ]);
+        assert_eq!(t.entries.len(), 3, "重复字应合并");
+        assert_eq!(
+            t.readings('甲').unwrap().iter().collect::<Vec<_>>(),
+            vec!["jiá", "jiǎ"],
+            "同字取靠后行"
+        );
+        // 相邻条目的读音区间不串味（甲有 2 个读音，其后的乙仍应只取自己那条）
+        assert_eq!(t.readings('乙').unwrap().first(), Some("yǐ"));
+        assert_eq!(t.readings('乙').unwrap().len(), 1);
+        assert_eq!(t.readings('丙').unwrap().first(), Some("bǐng"));
+        assert!(t.readings('丁').is_none());
     }
 }
