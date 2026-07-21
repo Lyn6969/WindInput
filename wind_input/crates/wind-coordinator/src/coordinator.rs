@@ -677,6 +677,9 @@ pub struct Coordinator {
     /// 全屏状态缓存：由 notify_toolbar_async 在后台线程异步刷新，notify_toolbar 直接读取，
     /// 消除 bridge handler 线程上的 SHQueryUserNotificationState 阻塞。
     pub(crate) fullscreen_cached: std::sync::atomic::AtomicBool,
+    /// 全屏探测的单飞闸：已有探测在途时跳过新的。焦点变化是成串来的，而探的是同一个
+    /// 全局前台状态，此前每次都 spawn 一个线程。见 `notify_toolbar_async`。
+    pub(crate) fullscreen_probing: std::sync::atomic::AtomicBool,
     /// host-render 管理器（Windows）：与 `BridgeServer` 共享同一 `Arc` 实例。
     /// 服务入口经 `set_host_render` 注入一次；Task 6/7 据此写候选/工具提示/状态帧并隐藏。
     /// 采用 `OnceLock`（与 `self_weak`/`cmdbar_services` 同一构造后注入惯例），
@@ -1219,6 +1222,7 @@ impl Coordinator {
             stat_collector,
             stat_recorded: std::sync::atomic::AtomicBool::new(false),
             fullscreen_cached: std::sync::atomic::AtomicBool::new(false),
+            fullscreen_probing: std::sync::atomic::AtomicBool::new(false),
             #[cfg(windows)]
             host_render: std::sync::OnceLock::new(),
             last_input_diag: Mutex::new(Default::default()),
@@ -2460,41 +2464,44 @@ impl Coordinator {
         let Some(weak) = self.self_weak.get().cloned() else {
             return;
         };
-        std::thread::spawn(move || {
-            std::thread::sleep(std::time::Duration::from_millis(ms));
-            let Some(this) = weak.upgrade() else {
-                return;
-            };
-            // token/pending 校验：被新按键的 arm 取代、或已被首显/隐藏消费 → 放弃本次兜底。
-            {
-                let pending = *this
-                    .pending_first_show
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner());
-                let tok = *this
-                    .pending_first_show_token
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner());
-                if !pending || tok != token {
-                    return;
-                }
-            }
-            *this
+        first_show_timer().arm(
+            std::time::Instant::now() + std::time::Duration::from_millis(ms),
+            token,
+            weak,
+        );
+    }
+
+    /// 兜底 timer 到期回调。由共享定时器线程调用。
+    fn fire_pending_first_show(&self, token: u64) {
+        // token/pending 校验：被新按键的 arm 取代、或已被首显/隐藏消费 → 放弃本次兜底。
+        {
+            let pending = *self
                 .pending_first_show
                 .lock()
-                .unwrap_or_else(|e| e.into_inner()) = false;
-            // 兜底超时：reflow 坐标迟迟未到，用当前 state 强制首显（坐标可能为按键前旧值，
-            // 属慢应用降级，仍优于候选窗一直不显示）。
-            let state = this.state.lock().unwrap_or_else(|e| e.into_inner());
-            let has_content = !state.candidates.is_empty()
-                || !state.input_buffer.is_empty()
-                || this.mode_indicator_text(&state).is_some();
-            if has_content {
-                this.show_authorized
-                    .store(true, std::sync::atomic::Ordering::Relaxed);
-                this.notify_ui_update(&state);
+                .unwrap_or_else(|e| e.into_inner());
+            let tok = *self
+                .pending_first_show_token
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            if !pending || tok != token {
+                return;
             }
-        });
+        }
+        *self
+            .pending_first_show
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = false;
+        // 兜底超时：reflow 坐标迟迟未到，用当前 state 强制首显（坐标可能为按键前旧值，
+        // 属慢应用降级，仍优于候选窗一直不显示）。
+        let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        let has_content = !state.candidates.is_empty()
+            || !state.input_buffer.is_empty()
+            || self.mode_indicator_text(&state).is_some();
+        if has_content {
+            self.show_authorized
+                .store(true, std::sync::atomic::Ordering::Relaxed);
+            self.notify_ui_update(&state);
+        }
     }
 
     // ———————————————— 鼠标交互（来自 UI 线程的反向事件）————————————————
@@ -5212,6 +5219,141 @@ impl Coordinator {
             parts.push("✎已调整".to_string());
         }
         format!("[调试]\n来源: {source}\n{}", parts.join(" · "))
+    }
+}
+
+// ———————————————— 首显兜底 timer（进程内共享单线程）————————————————
+
+/// 首显兜底的共享定时器：只保留**最近一次** arm 的待触发任务。
+///
+/// 此前每次 arm 都 `thread::spawn` 一个线程去 `sleep`，靠 token 让被取代的那些醒来后自行
+/// 放弃——日志实测一小时创建两千余个线程。既然 token 已经保证「只有最新一次有效」，被作废
+/// 的任务就没有理由继续占着线程；改成覆盖式待办后语义反而更直白：待办本身只有一个。
+///
+/// 本线程只做「等到点 + 回调」，**绝不在此执行可能阻塞的调用**（如前台窗口探测）——
+/// 一次慢调用就会拖垮兜底的 150ms 时限。需要后台跑阻塞探测的场景另行处理。
+struct FirstShowTimer {
+    /// `(到期时刻, token, 协调器弱引用)`；`None` = 空闲。
+    pending: Mutex<Option<(std::time::Instant, u64, std::sync::Weak<Coordinator>)>>,
+    cv: std::sync::Condvar,
+}
+
+static FIRST_SHOW_TIMER: std::sync::OnceLock<Arc<FirstShowTimer>> = std::sync::OnceLock::new();
+
+/// 取共享定时器，首次调用时懒启动其线程。
+fn first_show_timer() -> &'static Arc<FirstShowTimer> {
+    FIRST_SHOW_TIMER.get_or_init(|| {
+        let timer = Arc::new(FirstShowTimer {
+            pending: Mutex::new(None),
+            cv: std::sync::Condvar::new(),
+        });
+        let worker = timer.clone();
+        let _ = std::thread::Builder::new()
+            .name("first-show-timer".into())
+            .spawn(move || worker.run());
+        timer
+    })
+}
+
+impl FirstShowTimer {
+    /// 覆盖式登记：新的 arm 直接顶掉旧的（与原先"旧线程靠 token 自行作废"等价）。
+    fn arm(
+        &self,
+        deadline: std::time::Instant,
+        token: u64,
+        coord: std::sync::Weak<Coordinator>,
+    ) {
+        *self.pending.lock().unwrap_or_else(|e| e.into_inner()) = Some((deadline, token, coord));
+        self.cv.notify_one();
+    }
+
+    fn run(&self) {
+        let mut guard = self.pending.lock().unwrap_or_else(|e| e.into_inner());
+        loop {
+            let deadline = match guard.as_ref() {
+                Some((d, _, _)) => *d,
+                None => {
+                    // 空闲：睡到下一次 arm
+                    guard = self.cv.wait(guard).unwrap_or_else(|e| e.into_inner());
+                    continue;
+                }
+            };
+            let now = std::time::Instant::now();
+            if now < deadline {
+                // 等待期间可能被新的 arm 顶掉，醒来后重新取 deadline 判断
+                let (g, _) = self
+                    .cv
+                    .wait_timeout(guard, deadline - now)
+                    .unwrap_or_else(|e| e.into_inner());
+                guard = g;
+                continue;
+            }
+            let Some((_, token, coord)) = guard.take() else {
+                continue;
+            };
+            // 回调期间释放锁，否则回调里若触发新的 arm 会自锁
+            drop(guard);
+            if let Some(c) = coord.upgrade() {
+                c.fire_pending_first_show(token);
+            }
+            guard = self.pending.lock().unwrap_or_else(|e| e.into_inner());
+        }
+    }
+}
+
+#[cfg(test)]
+mod first_show_timer_tests {
+    use super::*;
+    use std::time::{Duration, Instant};
+
+    fn idle_timer() -> FirstShowTimer {
+        FirstShowTimer {
+            pending: Mutex::new(None),
+            cv: std::sync::Condvar::new(),
+        }
+    }
+
+    /// 覆盖式登记：这是取代「spawn 多个线程靠 token 自行作废」的等价语义——
+    /// 待办任何时刻只有一个，且必须是最近一次 arm 的那个。
+    #[test]
+    fn arm_replaces_previous_pending() {
+        let t = idle_timer();
+        let dead = std::sync::Weak::<Coordinator>::new();
+        let base = Instant::now();
+
+        t.arm(base + Duration::from_secs(10), 1, dead.clone());
+        t.arm(base + Duration::from_secs(20), 2, dead.clone());
+        t.arm(base + Duration::from_secs(30), 3, dead);
+
+        let g = t.pending.lock().unwrap();
+        let (deadline, token, _) = g.as_ref().expect("应有待办");
+        assert_eq!(*token, 3, "只应保留最近一次 arm 的 token");
+        assert_eq!(
+            *deadline,
+            base + Duration::from_secs(30),
+            "到期时刻也应随最近一次 arm 更新"
+        );
+    }
+
+    /// 线程真的会在到期后回调；且协调器已释放时安全跳过（不 panic）。
+    #[test]
+    fn fires_after_deadline_and_tolerates_dead_coordinator() {
+        let t = Arc::new(idle_timer());
+        let worker = t.clone();
+        std::thread::spawn(move || worker.run());
+
+        t.arm(
+            Instant::now() + Duration::from_millis(30),
+            7,
+            std::sync::Weak::<Coordinator>::new(), // upgrade 必失败，走"协调器已没了"分支
+        );
+
+        // 到期后待办应被取走（说明线程确实醒来处理了），且不 panic
+        std::thread::sleep(Duration::from_millis(200));
+        assert!(
+            t.pending.lock().unwrap().is_none(),
+            "到期后待办应已被消费"
+        );
     }
 }
 

@@ -595,18 +595,38 @@ impl Coordinator {
         let Some(weak) = self.self_weak.get().cloned() else {
             return;
         };
-        std::thread::spawn(move || {
-            let is_fs = crate::is_foreground_fullscreen();
-            if let Some(c) = weak.upgrade() {
-                let prev = c
-                    .fullscreen_cached
-                    .swap(is_fs, std::sync::atomic::Ordering::Relaxed);
-                if prev != is_fs {
-                    // 全屏态发生变化，用新值重新通知
-                    c.notify_toolbar();
+        // 单飞：已有探测在途就跳过。探的是**同一个**全局前台状态，重复查没有意义，
+        // 而焦点变化是成串来的（一次应用切换会连着触发多次），此前每次都 spawn 一个线程。
+        //
+        // 这里不并入 first-show 那个共享定时器：is_foreground_fullscreen 会阻塞
+        // （异步化它正是 1abab9f 的目的），塞进定时器线程会拖垮兜底时限。
+        if self
+            .fullscreen_probing
+            .swap(true, std::sync::atomic::Ordering::AcqRel)
+        {
+            return;
+        }
+        let spawned = std::thread::Builder::new()
+            .name("fullscreen-probe".into())
+            .spawn(move || {
+                let is_fs = crate::is_foreground_fullscreen();
+                if let Some(c) = weak.upgrade() {
+                    let prev = c
+                        .fullscreen_cached
+                        .swap(is_fs, std::sync::atomic::Ordering::Relaxed);
+                    c.fullscreen_probing
+                        .store(false, std::sync::atomic::Ordering::Release);
+                    if prev != is_fs {
+                        // 全屏态发生变化，用新值重新通知
+                        c.notify_toolbar();
+                    }
                 }
-            }
-        });
+            });
+        if spawned.is_err() {
+            // 线程没起来就得把闸放回去，否则此后永远不再探测
+            self.fullscreen_probing
+                .store(false, std::sync::atomic::Ordering::Release);
+        }
     }
 
     /// 推送当前状态到常驻工具栏（中英/方案/标点/全半角）
