@@ -772,6 +772,11 @@ impl Engine for PinyinEngine {
         }
 
 
+        // Viterbi **新合成**的整句文本（词典里没有这个词，只能由多个节点拼出来）。
+        // 与词典整词同文而被合并的那一支不记入——它本身就是精确整词，不存在「让位」问题。
+        // 供 step 6.5 的降级判定使用（须等 step 6 并入用户/临时层后才能定夺）。
+        let mut synthesized_sentence: Option<String> = None;
+
         // 2. Viterbi 长句解码（>=2 音节，仅在完成音节前缀上跑；use_smart_compose=false 时跳过）
         if self.config.use_smart_compose && syllables.len() >= 2 {
             // 切分图：全拼取 DAG 的全部路径；双拼/手动分隔符取真值链（行为与改造前一致）。
@@ -826,6 +831,7 @@ impl Engine for PinyinEngine {
                         // 否则 freq_rerank 会把它当普通候选而让别的整句锚定到它之上。
                         existing.is_sentence = true;
                     } else {
+                        synthesized_sentence = Some(sentence.clone());
                         candidates.insert(
                             0,
                             Candidate {
@@ -1036,6 +1042,75 @@ impl Engine for PinyinEngine {
                 if c.text.chars().count() == 1 {
                     c.weight = c.weight.saturating_add(BARE_INITIAL_SINGLE_CHAR_BOOST);
                 }
+            }
+        }
+
+        // 6.5 整句让位于精确整词：**降级，不销毁**
+        //
+        // 输入 `lianzhengtixing` 时用户词「廉政提醒」严格覆盖整串，而 Viterbi 拼出的
+        // 「连整体性」靠 SENTENCE_WEIGHT_BASE(30M) 的量纲优势恒占首位——30M 碾压一切词频，
+        // 用户把词加进词库、配再高的权重也换不回首选。
+        //
+        // 早先试过的「有精确整词就不构造整句」是**销毁**：整句连候选都不在，用户想选也
+        // 选不到，代价不可挽回。这里改为降级——整句仍在候选里，只是排到精确整词之后，
+        // 代价是「多按一次」。
+        //
+        // 位置必须在 step 6 之后：用户/临时层的词到 step 6 才并进 `candidates`，
+        // 而「用户加词」正是本功能要服务的场景，放在 step 2 旁边会看不见用户词。
+        //
+        // 只降 **Viterbi 新合成** 的整句（`synthesized_sentence`）。与词典整词同文而合并的
+        // 那一支（nihao→你好、gonghe→共和）本身就是精确整词，无处可让。
+        //
+        // ## 为什么用「相对权重」而不是固定的降级基数
+        //
+        // 精确整词的权重是原始词频，量纲跨度极大（系统词条 1~2e6，用户词可配到 2e9）。
+        // 任何固定常数都会在某一侧翻车：偏高则用户词压不住整句（原问题复发），偏低则整句
+        // 沉到普通候选里。取相对值使结果与词频数值无关。
+        //
+        // ## 为什么是 `max - 1` 而不是 `min - 1`
+        //
+        // 取 `max`：整句只让位给**最强的那个**精确整词，恒定停在它之后。这给用户一个
+        // 可预测的位置（「整句就在第二条」），而 `min - 1` 会让 w=8 的冷僻同码词也压过
+        // 引擎对整串输入的最优解读——说不通，且名次随该输入下同码词条数浮动、无从预期。
+        //
+        // **多个精确整词并列于 max 时，整句排在它们全部之后**：并列者权重皆为 `max`，
+        // 严格大于 `max - 1`，由算式保证，无需额外判据（见
+        // `demoted_sentence_falls_below_all_max_weight_exact_words`）。
+        //
+        // ## `max - 1` 与其它候选在 weight 上并列时
+        //
+        // 同层内**只有**精确整词与整句本身：子短语（`is_partial`）、前缀补全（`is_prefix`）、
+        // 模糊命中（`is_fuzzy`）由 `cmp_match_layers` 整体压在下一层，与权重无关；协调器侧
+        // 的短语（`is_prefix=true`）同理，引导键导航候选与码表精确候选则由
+        // `cmp_exact_first` 挡在上一层——两者都在 `candidate_display_order` 中先于权重比较。
+        // 故权重并列只可能发生在整句与**另一个精确整词**之间，此时落到 base_order /
+        // natural_order 决定谁先，无论结果如何都不破坏「整句在普通候选之前」这条不变量。
+        //
+        // 三个排序器（本函数、协调器 `candidate_display_order`、`freq_rerank`）都以
+        // `cmp_match_layers` 为首要键，故这个位置在整条链路上一致。
+        //
+        // `is_sentence` 不清：它表达「引擎对整串输入的最优解读」这个**来源**语义，
+        // 降级是**排序**决策，另立 `is_sentence_demoted` 表达（`freq_rerank` 的顶部锚定
+        // 据此豁免，否则那里不看 weight，本处降权会被整个顶回去）。
+        if let Some(sent) = &synthesized_sentence {
+            // 「精确整词」判据：码恰好等于已消费输入 `completed`，且非模糊命中、
+            // 不在前缀补全/子短语层。含系统词库与 step 6 并入的用户/临时层。
+            let exact_max = candidates
+                .iter()
+                .filter(|c| {
+                    &c.text != sent
+                        && !c.is_fuzzy
+                        && !c.is_prefix
+                        && !c.is_partial
+                        && c.code == completed
+                })
+                .map(|c| c.weight)
+                .max();
+            if let Some(max_w) = exact_max
+                && let Some(c) = candidates.iter_mut().find(|c| &c.text == sent)
+            {
+                c.weight = max_w.saturating_sub(1);
+                c.is_sentence_demoted = true;
             }
         }
 
@@ -2149,6 +2224,88 @@ mod tests {
     /// 判断候选是否为 Viterbi 合成整句（按来源标记，不看权重数值）。
     fn is_viterbi_sentence(c: &Candidate) -> bool {
         c.is_sentence
+    }
+
+    // ── 整句让位于精确整词（step 6.5 降级）─────────────────────────────────────
+
+    /// 用户要求的那条保证：**多个精确整词并列于最大权重时，整句排在它们全部之后**。
+    ///
+    /// `max - 1` 在算术上蕴含它（并列者皆为 `max`），但这是要靠实测确认的那一类断言，
+    /// 不是靠推理就算数的 —— 并列走的是 `better`/`candidate_display_order` 的后续键
+    /// （base_order / natural_order），只有真跑一遍才知道整句没混进并列组里。
+    #[test]
+    fn demoted_sentence_falls_below_all_max_weight_exact_words() {
+        let mut raw = CodetableDict::empty();
+        // 单字给高权重，确保 Viterbi 选「你+好」而非把某个 nihao 词条当单节点整句
+        // （那样会走同文合并分支，压根不触发降级，测试就测空了）。
+        raw.merge_single("ni".to_string(), "你".to_string(), 100_000, 0);
+        raw.merge_single("hao".to_string(), "好".to_string(), 100_000, 1);
+        // 三个精确整词，权重并列且同为最大
+        raw.merge_single("nihao".to_string(), "拟好".to_string(), 5000, 2);
+        raw.merge_single("nihao".to_string(), "泥好".to_string(), 5000, 3);
+        raw.merge_single("nihao".to_string(), "尼好".to_string(), 5000, 4);
+        let e = PinyinEngine::new(Config::default(), CachedDict::Memory(raw));
+        let r = e.convert("nihao", 50).unwrap();
+
+        let pos = |t: &str| {
+            r.candidates
+                .iter()
+                .position(|c| c.text == t)
+                .unwrap_or_else(|| {
+                    panic!(
+                        "候选中找不到 {t}，实际: {:?}",
+                        r.candidates
+                            .iter()
+                            .map(|c| (&c.text, c.weight))
+                            .collect::<Vec<_>>()
+                    )
+                })
+        };
+        let sent = pos("你好");
+        let sc = &r.candidates[sent];
+        assert!(sc.is_sentence, "「你好」应是合成整句");
+        assert!(sc.is_sentence_demoted, "存在精确整词时整句须降级");
+        assert_eq!(sc.weight, 4999, "权重须为 max(5000) - 1");
+        for w in ["拟好", "泥好", "尼好"] {
+            assert!(
+                pos(w) < sent,
+                "并列于 max 的精确整词「{w}」(rank {}) 须排在整句(rank {sent})之前，实际: {:?}",
+                pos(w),
+                r.candidates
+                    .iter()
+                    .map(|c| (&c.text, c.weight))
+                    .collect::<Vec<_>>()
+            );
+        }
+    }
+
+    /// 不变量：降级整句仍须在**普通候选**之前，无论后者权重多高。
+    ///
+    /// 守的是 `max - 1` 的权重并列风险 —— 位置靠 `cmp_match_layers` 的层级键保证，
+    /// 而非靠权重数值，故权重再离谱也不该翻转。
+    #[test]
+    fn demoted_sentence_still_precedes_ordinary_candidates() {
+        let mut raw = CodetableDict::empty();
+        raw.merge_single("ni".to_string(), "你".to_string(), 100_000, 0);
+        raw.merge_single("hao".to_string(), "好".to_string(), 100_000, 1);
+        raw.merge_single("nihao".to_string(), "拟好".to_string(), 5000, 2);
+        // 前缀补全（码比输入长）：权重顶到 2e9，仍应留在整句之后
+        raw.merge_single("nihaoma".to_string(), "你好吗".to_string(), 2_000_000_000, 3);
+        let e = PinyinEngine::new(Config::default(), CachedDict::Memory(raw));
+        let r = e.convert("nihao", 50).unwrap();
+
+        let sent = r.candidates.iter().position(|c| c.text == "你好").unwrap();
+        assert!(r.candidates[sent].is_sentence_demoted, "整句须已降级");
+        // 整句之前只允许出现精确整词（码 == 输入且不在下层）
+        for (i, c) in r.candidates.iter().enumerate().take(sent) {
+            assert!(
+                c.code == "nihao" && !c.is_fuzzy && !c.is_prefix && !c.is_partial,
+                "整句(rank {sent})之前只应有精确整词，却出现 {}(rank {i}, w={}, code={})",
+                c.text,
+                c.weight,
+                c.code
+            );
+        }
     }
 
     /// TDD：use_smart_compose=false 时多音节输入不产生 Viterbi 合成整句候选。

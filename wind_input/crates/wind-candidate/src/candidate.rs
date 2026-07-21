@@ -117,6 +117,24 @@ pub struct Candidate {
     /// 这条阈值线。改用显式标记后，权重只表达"多重要"，来源语义由本字段表达。
     #[serde(default)]
     pub is_sentence: bool,
+    /// 整句解**已让位于精确整词**（降级，非销毁）。
+    ///
+    /// 触发条件：Viterbi 合成出的整句**不是**词典词条，而候选中存在覆盖同一段输入的
+    /// 严格精确整词（系统词库或用户/临时层，非模糊命中）。此时整句仍是一条可选候选，
+    /// 只是不再霸占首位 —— 代价从「选不到」降为「多按一次」。
+    ///
+    /// **为什么不直接清 `is_sentence`**：该标记的语义是「引擎对整串输入的最优解读」，
+    /// 是**来源**属性；降级是**排序**决策。两者混在一个布尔里，日后任何新增的
+    /// `is_sentence` 消费方都会连带继承排序语义。目前 `is_sentence` 的唯一生产消费点是
+    /// `freq_rerank` 的顶部锚定，正是本字段要豁免的那一条。
+    ///
+    /// **为什么不复用 `is_exact_code`**：拼音引擎按约定全体不置位该字段
+    /// （见其文档「拼音引擎不置位」一条），混输下码表精确档恒先于拼音依赖这个约定；
+    /// 在拼音侧置位会让拼音候选整体越过码表候选，伤及共用比较器的另外两个引擎。
+    ///
+    /// 引擎内部用，不推送 UI。
+    #[serde(skip)]
+    pub is_sentence_demoted: bool,
     pub consumed_length: usize,
     /// 该候选 `code` 的**音节边界**（各音节起始字节位 bitmask），见
     /// `wind_dict::binformat::DictEntry::boundary`。`0` = 无边界信息 → 消费方降级回 DAG 猜切分。
@@ -164,6 +182,7 @@ impl Default for Candidate {
             is_partial: false,
             is_exact_code: false,
             is_sentence: false,
+            is_sentence_demoted: false,
             consumed_length: 0,
             boundary: 0,
             source: CandidateSource::None,

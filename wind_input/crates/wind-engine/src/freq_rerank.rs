@@ -105,6 +105,20 @@ pub fn rerank_codetable_usedfirst(
 ///    的候选恒锚定顶部，互相维持引擎权重序（稳定排序）。② 非整句：衰减分 ≥ ε 的"近用"候选软置前于其余，按分降序。
 /// ③ 阈值褪色：衰减分 < ε → 失去 used-first 资格，落回引擎权重序。
 /// `now` 为当前 unix 秒（由调用方注入，便于测试与确定性）。
+///
+/// # ⚠️ 隐式契约：本函数**从不比较 weight**
+///
+/// 所有「维持引擎权重序」的分支返回的都是 `Ordering::Equal`，靠 `sort_by` 的**稳定性**
+/// 保住入参既有顺序 —— 权重序不是本函数算出来的，是**调用方喂进来的**。
+///
+/// 调用点 `handle_candidate.rs:528` 先用 `candidate_display_order`（含权重）排好，`:530`
+/// 才调本函数。两行的先后是本函数正确性的前提，不是巧合。
+///
+/// 由此推出两条，改排序时极易踩：
+/// - **调换这两步、或在其间插入任何重排，本函数的输出即失去权重语义**，且不会报错，
+///   只会让候选顺序静默发散。
+/// - **单测必须按 `candidate_display_order` 的输出顺序喂入**，否则测的是一个生产中
+///   不存在的状态（本文件已有一版这样的错误用例，现已订正）。
 pub fn rerank_pinyin_decay(
     candidates: &mut [Candidate],
     recs: &HashMap<String, FreqRecord>,
@@ -119,8 +133,12 @@ pub fn rerank_pinyin_decay(
     };
     candidates.sort_by(|a, b| {
         // ① 整句/短语锚定顶部（按来源语义判定，不看权重数值——见 Candidate::is_sentence）
-        let sa = a.is_sentence || a.is_phrase;
-        let sb = b.is_sentence || b.is_phrase;
+        //
+        // `is_sentence_demoted` 的整句**不参与**锚定：它已让位于精确整词，若仍锚定，
+        // 引擎侧的降权会被本步整个顶回去（本比较器不看 weight，只看标志）。落选锚定后
+        // 它走下面的层级+衰减+权重序，恰好停在精确整词之后、普通候选之前。
+        let sa = (a.is_sentence && !a.is_sentence_demoted) || a.is_phrase;
+        let sb = (b.is_sentence && !b.is_sentence_demoted) || b.is_phrase;
         if sa != sb {
             return if sa {
                 Ordering::Less
@@ -219,6 +237,72 @@ mod tests {
         assert_eq!(cands[0].text, "你好世界", "整句必须锚定首位");
         assert_eq!(cands[1].text, "你好", "近用词软置前于未用词");
         assert_eq!(cands[2].text, "拟");
+    }
+
+    /// 降级整句**不参与**锚定：让位于精确整词后，须停在精确整词之后、普通候选之前。
+    ///
+    /// 这一条是整个降级方案的另一半。引擎侧只改了 weight，而本比较器**不看 weight**——
+    /// 只要标志为真就置顶。若此处不豁免，引擎那半边等于白改：实测过权重顶到 2e9
+    /// 都赢不过这里的锚定。
+    ///
+    /// **入参顺序即协调器 `candidate_display_order` 的输出**（`handle_candidate.rs:528`
+    /// 先按权重层级排好，`:530` 才调本函数）。本函数在同层同衰减分时返回
+    /// `Ordering::Equal`，靠稳定排序保住入参序 —— 它**从不自己比权重**，故测试必须
+    /// 按显示序喂入，否则测的是一个生产中不存在的状态。
+    #[test]
+    fn pinyin_demoted_sentence_yields_to_exact_word() {
+        let mut cands = vec![
+            pin("廉政提醒", 100_000),
+            {
+                // 引擎侧已把权重降到「最低的精确整词 - 1」
+                let mut c = pin_sentence("连整体性", 99_999);
+                c.is_sentence_demoted = true;
+                c
+            },
+            {
+                // 子短语层：无论权重多高都该留在整句之后（由 cmp_match_layers 保证）
+                let mut c = pin("连", 500_000);
+                c.is_partial = true;
+                c
+            },
+        ];
+        let r = recs(&[]);
+        rerank_pinyin_decay(&mut cands, &r, NOW, FreqProfile::default());
+        assert_eq!(cands[0].text, "廉政提醒", "精确整词须在降级整句之前");
+        assert_eq!(cands[1].text, "连整体性", "降级整句仍须在普通候选之前");
+        assert_eq!(cands[2].text, "连");
+    }
+
+    /// 对照组：**未**降级的整句即使排在后面也会被锚定拉回首位。与上一条合看，
+    /// 才证明 `is_sentence_demoted` 确实是起作用的那个开关，而非「本函数恰好没动它」。
+    #[test]
+    fn pinyin_undemoted_sentence_still_anchors_from_below() {
+        let mut cands = vec![pin("廉政提醒", 100_000), pin_sentence("连整体性", 99_999)];
+        let r = recs(&[]);
+        rerank_pinyin_decay(&mut cands, &r, NOW, FreqProfile::default());
+        assert_eq!(
+            cands[0].text, "连整体性",
+            "未降级的整句仍恒锚定首位（本函数不看 weight）"
+        );
+    }
+
+    /// 降级整句失去锚定后，词频学习对它生效（未降级的整句则恒锚定，见上一条）。
+    #[test]
+    fn pinyin_demoted_sentence_participates_in_freq() {
+        let mut cands = vec![
+            pin("精确整词", 100_000),
+            {
+                let mut c = pin_sentence("降级整句", 99_999);
+                c.is_sentence_demoted = true;
+                c
+            },
+        ];
+        let r = recs(&[("降级整句", 20, NOW)]);
+        rerank_pinyin_decay(&mut cands, &r, NOW, FreqProfile::default());
+        assert_eq!(
+            cands[0].text, "降级整句",
+            "降级整句不再锚定，故可凭词频重新浮上来"
+        );
     }
 
     /// 锚定按来源语义而非权重数值：高权重但非整句的候选（如别的功能提权到 30M 的词）

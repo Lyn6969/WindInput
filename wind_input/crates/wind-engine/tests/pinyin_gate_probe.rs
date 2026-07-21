@@ -98,7 +98,16 @@ fn gate_fixed_point_probe() {
                 .take(3)
                 .map(|c| format!("{}(w={},句={})", c.text, c.weight, c.is_sentence as u8))
                 .collect();
-            println!("  {:<26} {}", input, top.join("  "));
+            // 整句所在名次：整句降级后不再恒为 0，须显式定位（`is_sentence` 标记不随降级清除）。
+            let sent = cands.iter().position(|c| c.is_sentence);
+            let sent_desc = match sent {
+                Some(r) => format!(
+                    "整句={} rank={} 句={} 降级={}",
+                    cands[r].text, r, cands[r].is_sentence as u8, cands[r].is_sentence_demoted as u8
+                ),
+                None => "整句=无".to_string(),
+            };
+            println!("  {:<26} {:<58} | {}", input, top.join("  "), sent_desc);
         }
     }
     println!();
