@@ -16,7 +16,7 @@ use crate::pinyin::{Config as PinyinConfig, PinyinEngine};
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
-use tracing::{info, warn};
+use tracing::{error, info, warn};
 use wind_candidate::CandidateSource;
 use wind_config::Config;
 use wind_config::schema::{DictSpec, Schema};
@@ -1896,19 +1896,64 @@ impl EngineManager {
     /// `codetable-extra-<id>`(enabled=is_enabled())。**不再合并 combined.wdb**——查询期由
     /// CompositeDict 合并去重，开关扩展只需翻该层 enabled 标志，无需重熔大词库（对齐 Go 的
     /// 每库独立缓存 + 查询期合并）。主库优先返回（层序最靠前 → 等权重时排前）。
+    /// 词库文件路径解析：用户配置/schemas 优先，回退 schemas_dir（与 read_schema 同语义）。
+    ///
+    /// 同时支持 **wdat-only 词库**——用户可只投放编译好的 `xxx.wdat` 而不带
+    /// `xxx.dict.yaml`（对齐 Go 的 wdb-only 分发）。yaml 在两个目录都不存在时，改按同名
+    /// wdat 再探一轮**相同顺序**，命中则返回该目录下的 yaml 路径：文件本身不存在，但
+    /// `CachedDict::load_at_with` 会据此推导同目录的 wdat 并直接 mmap。
+    ///
+    /// 为什么必须按 wdat 再探而不能只靠兜底：兜底恒指向安装目录（通常是只读的
+    /// Program Files），而用户投放的 wdat 一般在用户目录，只探 yaml 会把路径定位到错误
+    /// 的目录上。Go 版为此专门引入了 `wdbOnlyHint` 参数，这里靠单点解析一并解决。
+    ///
+    /// 本函数取代了此前 `load_codetable_layers` 与 `load_dictionary` 里两份逐字相同的
+    /// 闭包——「两处各写一份」正是 R6 那条陈旧路径的成因。
+    fn resolve_dict_file(rel: &str, schemas_dir: &Path) -> std::path::PathBuf {
+        Self::resolve_dict_file_in(
+            rel,
+            Config::user_config_dir().map(|u| u.join("schemas")).as_deref(),
+            schemas_dir,
+        )
+    }
+
+    /// [`Self::resolve_dict_file`] 的纯函数内核：用户 schemas 目录显式传入，便于测试
+    /// 四级优先级（user yaml → sys yaml → user wdat → sys wdat → 兜底 sys）。
+    fn resolve_dict_file_in(
+        rel: &str,
+        user_schemas: Option<&Path>,
+        schemas_dir: &Path,
+    ) -> std::path::PathBuf {
+        // 1) yaml 按原优先级
+        if let Some(u) = user_schemas {
+            let p = u.join(rel);
+            if p.is_file() {
+                return p;
+            }
+        }
+        let sys = schemas_dir.join(rel);
+        if sys.is_file() {
+            return sys;
+        }
+        // 2) 两处都无 yaml → 按 wdat-only 同序再探
+        if let Some(u) = user_schemas {
+            let p = u.join(rel);
+            if wind_dict::cached::wdat_sibling(&p).is_some_and(|w| w.is_file()) {
+                return p;
+            }
+        }
+        if wind_dict::cached::wdat_sibling(&sys).is_some_and(|w| w.is_file()) {
+            return sys;
+        }
+        // 3) 兜底同原行为：返回安装目录路径，由调用方报加载失败
+        sys
+    }
+
     fn load_codetable_layers(
         schema: &Schema,
         schemas_dir: &Path,
     ) -> Vec<(String, CachedDict, bool, i32, Option<i32>)> {
-        let resolve = |rel: &str| -> std::path::PathBuf {
-            if let Some(u) = Config::user_config_dir() {
-                let p = u.join("schemas").join(rel);
-                if p.is_file() {
-                    return p;
-                }
-            }
-            schemas_dir.join(rel)
-        };
+        let resolve = |rel: &str| -> std::path::PathBuf { Self::resolve_dict_file(rel, schemas_dir) };
         let is_english =
             |e: &DictSpec| -> bool { !e.dict_type.is_empty() && e.dict_type == "english" };
 
@@ -2004,16 +2049,8 @@ impl EngineManager {
             return None;
         }
 
-        // 词典文件路径解析：用户配置/schemas 优先，回退 schemas_dir（与 read_schema 同语义）。
-        let resolve = |rel: &str| -> std::path::PathBuf {
-            if let Some(u) = Config::user_config_dir() {
-                let p = u.join("schemas").join(rel);
-                if p.is_file() {
-                    return p;
-                }
-            }
-            schemas_dir.join(rel)
-        };
+        // 词典文件路径解析（含 wdat-only 探测）见 resolve_dict_file。
+        let resolve = |rel: &str| -> std::path::PathBuf { Self::resolve_dict_file(rel, schemas_dir) };
 
         let dtype = |e: &DictSpec| {
             if e.dict_type.is_empty() {
@@ -2227,6 +2264,32 @@ impl EngineManager {
 
     /// 加载 rime_pinyin 词典（合并 import_tables 子词典到 .merged.wdb）
     fn load_rime_pinyin_dict(dict_path: &Path) -> Option<CachedDict> {
+        // wdat-only：拼音是独立于 CachedDict::load_at_with 的第二条链路（要读 yaml 头展开
+        // import_tables 再并行解析正文），源缺失时那两步全废，故须在此单独拦截。
+        if !dict_path.is_file()
+            && let Some(sidecar) = wind_dict::cached::wdat_sibling(dict_path)
+            && sidecar.is_file()
+        {
+            return match wind_dict::reader_pool::open_wdat(&sidecar) {
+                Ok(reader) => {
+                    info!(
+                        "以 wdat-only 模式加载拼音词库: {} ({} keys)",
+                        sidecar.display(),
+                        reader.key_count()
+                    );
+                    Some(CachedDict::Mmap(reader))
+                }
+                Err(e) => {
+                    // 无源可重建，明确报错而非静默返回 None——后者会让整个拼音方案无引擎。
+                    error!(
+                        "wdat-only 拼音词库 {} 加载失败: {}。该词库无 yaml 源，无法重建，请更新词库文件。",
+                        sidecar.display(),
+                        e
+                    );
+                    None
+                }
+            };
+        }
         // merged.wdb 写到可写缓存目录（与 unigram 一致）。安装目录（如 Program Files）
         // 通常只读，若写在源旁会失败 → 回退仅主词典(rime header 数十条) → 拼音无候选。
         let merged_wdb = cache_path(dict_path, "merged.wdat");
@@ -2365,6 +2428,66 @@ impl EngineManager {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 词库路径解析的四级优先级。第三级（用户目录的 wdat 优先于安装目录）是关键：
+    /// 用户投放的 wdat-only 词库通常在用户目录，而兜底恒指向安装目录——Go 版正是为此
+    /// 才需要额外的 wdbOnlyHint 参数。
+    #[test]
+    fn resolve_dict_file_priority_order() {
+        let base =
+            std::env::temp_dir().join(format!("wind-resolve-{}", std::process::id()));
+        let user = base.join("user/schemas");
+        let sys = base.join("sys/schemas");
+        std::fs::create_dir_all(user.join("s")).unwrap();
+        std::fs::create_dir_all(sys.join("s")).unwrap();
+        let rel = "s/d.dict.yaml";
+        let touch = |p: &std::path::Path| std::fs::write(p, b"x").unwrap();
+
+        // 全空 → 兜底安装目录
+        assert_eq!(
+            EngineManager::resolve_dict_file_in(rel, Some(&user), &sys),
+            sys.join(rel),
+            "全都没有时应兜底到安装目录（与改造前行为一致）"
+        );
+
+        // 只有安装目录的 wdat → 命中它
+        touch(&sys.join("s/d.wdat"));
+        assert_eq!(
+            EngineManager::resolve_dict_file_in(rel, Some(&user), &sys),
+            sys.join(rel)
+        );
+
+        // 用户目录也有 wdat → 用户目录优先
+        touch(&user.join("s/d.wdat"));
+        assert_eq!(
+            EngineManager::resolve_dict_file_in(rel, Some(&user), &sys),
+            user.join(rel),
+            "用户目录的 wdat 必须优先于安装目录"
+        );
+
+        // 出现安装目录的 yaml → yaml 整体优先于 wdat
+        touch(&sys.join(rel));
+        assert_eq!(
+            EngineManager::resolve_dict_file_in(rel, Some(&user), &sys),
+            sys.join(rel),
+            "yaml 在场时不得被任何 wdat 抢走"
+        );
+
+        // 用户目录的 yaml → 最高优先级
+        touch(&user.join(rel));
+        assert_eq!(
+            EngineManager::resolve_dict_file_in(rel, Some(&user), &sys),
+            user.join(rel)
+        );
+
+        // 无用户目录时不应 panic
+        assert_eq!(
+            EngineManager::resolve_dict_file_in(rel, None, &sys),
+            sys.join(rel)
+        );
+
+        std::fs::remove_dir_all(&base).ok();
+    }
 
     #[test]
     fn freq_strategy_top_parsed() {

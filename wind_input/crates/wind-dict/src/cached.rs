@@ -21,6 +21,24 @@ pub struct DictHit {
     pub boundary: u64,
 }
 
+/// `foo/bar.dict.yaml` → `foo/bar.wdat`（剥掉整个 `.dict.yaml` 后缀）。
+///
+/// **不能用 `Path::with_extension("wdat")`** —— 那只替换最后一级扩展名，会得到
+/// `bar.dict.wdat`。本约定与 Go 版 `wdbOnlyInDir` 一致，从 Go 版迁移过来的词库文件名
+/// 可直接使用。
+///
+/// 供 wdat-only 分发模式定位**用户投放**的二进制词库，与缓存路径无关——后者由
+/// `EngineManager::cache_path` 生成并落在独立的 cache 目录。
+///
+/// 非 `.dict.yaml` / `.yaml` 结尾返回 `None`。
+pub fn wdat_sibling(yaml_path: &Path) -> Option<std::path::PathBuf> {
+    let name = yaml_path.file_name()?.to_str()?;
+    let stem = name
+        .strip_suffix(".dict.yaml")
+        .or_else(|| name.strip_suffix(".yaml"))?;
+    Some(yaml_path.with_file_name(format!("{stem}.wdat")))
+}
+
 /// 缓存词典：优先使用 mmap，回退到内存模式
 pub enum CachedDict {
     /// mmap 零拷贝模式（低内存，wdat DAT 格式）。
@@ -59,6 +77,35 @@ impl CachedDict {
         wdb_path: &Path,
         lowercase_code: bool,
     ) -> anyhow::Result<Self> {
+        // wdat-only：用户只投放编译好的二进制词库、不带 yaml 源（对齐 Go 的 wdb-only 分发）。
+        //
+        // 必须抢在 cache_is_valid 之前——指纹机制以「源不可读 = 需重建」为语义
+        // （`cache_fp::fingerprint` 读不到源即返回 None），而这里恰恰无源可重建，
+        // 走进去必然判定失效；也必须抢在下面 `CodetableDict::load(yaml_path)?` 之前，
+        // 那是硬失败点（文件不存在直接 Err，后续写缓存/mmap 都不会执行）。
+        if !yaml_path.is_file()
+            && let Some(sidecar) = wdat_sibling(yaml_path)
+            && sidecar.is_file()
+        {
+            return match crate::reader_pool::open_wdat(&sidecar) {
+                Ok(reader) => {
+                    info!(
+                        "以 wdat-only 模式加载词库: {} ({} keys)",
+                        sidecar.display(),
+                        reader.key_count()
+                    );
+                    Ok(Self::Mmap(reader))
+                }
+                // 无 yaml 源可重建，只能明确失败：静默降级会让整个方案无引擎，
+                // 而用户完全无从判断是文件版本不对还是路径没放对。
+                Err(e) => Err(anyhow::anyhow!(
+                    "wdat-only 词库 {} 加载失败: {}。该词库无 yaml 源，无法重建，请更新词库文件。",
+                    sidecar.display(),
+                    e
+                )),
+            };
+        }
+
         // 检查缓存是否有效
         if Self::cache_is_valid(yaml_path, wdb_path, lowercase_code) {
             match crate::reader_pool::open_wdat(wdb_path) {
@@ -465,6 +512,102 @@ impl<'a> CodeList<'a> {
 mod tests {
     use super::*;
     use crate::codetable::CodetableDict;
+
+    #[test]
+    fn wdat_sibling_strips_the_whole_dict_yaml_suffix() {
+        let p = Path::new("schemas/wubi86/wubi86_jidian.dict.yaml");
+        assert_eq!(
+            wdat_sibling(p).unwrap(),
+            Path::new("schemas/wubi86/wubi86_jidian.wdat"),
+            "须剥掉整个 .dict.yaml（与 Go 版 wdbOnlyInDir 一致）"
+        );
+        // 对照：with_extension 只换最后一级，会得到错误的名字——这正是不能用它的原因
+        assert_eq!(
+            p.with_extension("wdat"),
+            Path::new("schemas/wubi86/wubi86_jidian.dict.wdat")
+        );
+        // 裸 .yaml 也支持
+        assert_eq!(
+            wdat_sibling(Path::new("a/b.yaml")).unwrap(),
+            Path::new("a/b.wdat")
+        );
+        // 非 yaml 不推导
+        assert!(wdat_sibling(Path::new("a/b.txt")).is_none());
+        assert!(wdat_sibling(Path::new("a/b.wdat")).is_none());
+    }
+
+    fn wdat_only_dir(tag: &str) -> std::path::PathBuf {
+        let d = std::env::temp_dir().join(format!("wind-wdat-only-{}-{}", std::process::id(), tag));
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    /// wdat-only 分发：方案目录里只有编译好的 .wdat，没有 .dict.yaml 源。
+    #[test]
+    fn loads_wdat_only_when_yaml_is_absent() {
+        let dir = wdat_only_dir("load");
+        let yaml = dir.join("x.dict.yaml"); // 故意不创建
+        let wdat = dir.join("x.wdat");
+        let mut d = CodetableDict::empty();
+        d.merge_single("a".into(), "啊".into(), 1, 0);
+        let mut w = WdatWriter::new();
+        d.export_to_wdat(&mut w);
+        w.write(&wdat).unwrap();
+
+        // 缓存路径同样不存在——wdat-only 必须绕过整个指纹/缓存流程
+        let cache = dir.join("cache").join("x.wdat");
+        let loaded = CachedDict::load_at_with(&yaml, &cache, false)
+            .expect("yaml 缺失但同名 wdat 在场时应走 wdat-only");
+        assert_eq!(loaded.search("a").len(), 1);
+        assert!(
+            !cache.exists(),
+            "wdat-only 不应生成缓存副本，应原位直接 mmap"
+        );
+
+        drop(loaded);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// 无源可重建时必须明确报错，而不是静默降级成「整方案无引擎」。
+    #[test]
+    fn wdat_only_unreadable_file_errors_with_actionable_message() {
+        let dir = wdat_only_dir("corrupt");
+        let yaml = dir.join("y.dict.yaml"); // 不存在
+        let wdat = dir.join("y.wdat");
+        std::fs::write(&wdat, b"this is not a valid wdat").unwrap();
+
+        let Err(err) = CachedDict::load_at_with(&yaml, &dir.join("cache/y.wdat"), false) else {
+            panic!("损坏的 wdat-only 词库必须报错，不能静默降级");
+        };
+        let msg = err.to_string();
+        assert!(msg.contains("wdat-only"), "须指明是 wdat-only 模式: {msg}");
+        assert!(msg.contains("无法重建"), "须告知无源可重建: {msg}");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// yaml 在场时不得被 wdat 抢走——正常方案的行为一步都不能变。
+    #[test]
+    fn yaml_present_still_takes_the_normal_path() {
+        let dir = wdat_only_dir("yaml-wins");
+        let yaml = dir.join("z.dict.yaml");
+        std::fs::write(&yaml, "# comment\nzz\t再\t1\n").unwrap();
+        // 同时放一个内容不同的 wdat，若被误用则查得到 "抢"
+        let mut d = CodetableDict::empty();
+        d.merge_single("qq".into(), "抢".into(), 1, 0);
+        let mut w = WdatWriter::new();
+        d.export_to_wdat(&mut w);
+        w.write(&dir.join("z.wdat")).unwrap();
+
+        let loaded = CachedDict::load_at_with(&yaml, &dir.join("cache/z.wdat"), false).unwrap();
+        assert!(
+            loaded.search("qq").is_empty(),
+            "yaml 存在时绝不能走 wdat-only 分支"
+        );
+
+        drop(loaded);
+        std::fs::remove_dir_all(&dir).ok();
+    }
 
     /// 全码判据①②：简码不能胜出（否则公式取第 2 码越界），且超过 max_code_length 的
     /// 怪码被上限闸排除——这两条各自都足以让造词静默失效。
