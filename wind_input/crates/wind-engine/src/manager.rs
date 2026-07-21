@@ -1856,7 +1856,11 @@ impl EngineManager {
         use wind_dict::unigram::write_unigram_wdb;
 
         let ug_wdb = cache_path(ug_txt, "wdb");
-        // wdb 比 txt 新则直接用；否则从 txt 重建
+        // 按缓存文件 single-flight：三个拼音系方案的 unigram_path 都是 pinyin/unigram.txt，
+        // 冷启动时会同时解析 8MB 文本并 rename 同一个 wdb。
+        let build_lock = wind_dict::reader_pool::file_lock(&ug_wdb);
+        let _build_guard = build_lock.lock().unwrap_or_else(|e| e.into_inner());
+        // wdb 比 txt 新则直接用；否则从 txt 重建（拿锁后复查）
         let fresh =
             Self::combined_cache_fresh(&[ug_txt], &ug_wdb, wind_dict::cache_fp::UNIGRAM_TAG);
         if !(ug_wdb.exists() && fresh) {
@@ -2106,6 +2110,11 @@ impl EngineManager {
             .flat_map(|(p, t)| Self::rime_source_paths(p, t))
             .collect();
         let paths: Vec<&Path> = expanded.iter().map(|p| p.as_path()).collect();
+        // 按缓存文件 single-flight，理由见 reader_pool::file_lock（build_locks 的 key 是
+        // schema_id，挡不住"两个方案指向同一个 combined.wdat"）。
+        let build_lock = wind_dict::reader_pool::file_lock(combined);
+        let _build_guard = build_lock.lock().unwrap_or_else(|e| e.into_inner());
+        // 拿锁后复查
         if Self::combined_cache_fresh(&paths, combined, COMBINED_CACHE_TAG) {
             if let Ok(reader) = wind_dict::reader_pool::open_wdat(combined) {
                 info!(
@@ -2296,6 +2305,12 @@ impl EngineManager {
         // 收集全部源（主表 + import_tables 子表）。指纹/缓存校验需覆盖全部源，
         // 故须先于 fresh 判定算出（仅解析头部 yaml，开销极低）。
         // 与 combined 层共用 rime_source_paths——两处各写一份正是 R6 那条陈旧路径的成因。
+        // 按缓存文件 single-flight。这里是该缺陷最典型的现场：pinyin / shuangpin /
+        // 混输的 secondary 子引擎三者的 schema 都指向 pinyin/rime_frost.dict.yaml，
+        // cache_path 又按源文件父目录名做命名空间，最终是同一个 merged.wdat。
+        let build_lock = wind_dict::reader_pool::file_lock(&merged_wdb);
+        let _build_guard = build_lock.lock().unwrap_or_else(|e| e.into_inner());
+
         let sub_paths = Self::rime_source_paths(dict_path, "rime_pinyin");
         let src_refs: Vec<&Path> = sub_paths.iter().map(|p| p.as_path()).collect();
 

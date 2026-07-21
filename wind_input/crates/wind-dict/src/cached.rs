@@ -106,7 +106,13 @@ impl CachedDict {
             };
         }
 
-        // 检查缓存是否有效
+        // 按缓存文件 single-flight：同一个 wdat 常被多个方案引用（如 wubi86 独立引擎与
+        // 混输的 primary 子引擎），缓存失效时会同时走到下面的 write_cache → rename。
+        // 混输子引擎的构建不经 ensure_loaded，也就不受 build_locks 保护，故须在此自锁。
+        let build_lock = crate::reader_pool::file_lock(wdb_path);
+        let _build_guard = build_lock.lock().unwrap_or_else(|e| e.into_inner());
+
+        // 检查缓存是否有效（同时充当拿锁后的复查：等待期间别的线程可能已重建完成）
         if Self::cache_is_valid(yaml_path, wdb_path, lowercase_code) {
             match crate::reader_pool::open_wdat(wdb_path) {
                 Ok(reader) => {
