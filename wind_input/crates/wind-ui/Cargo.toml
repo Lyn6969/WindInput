@@ -7,6 +7,8 @@ edition.workspace = true
 wind-theme = { path = "../wind-theme" }
 wind-candidate = { path = "../wind-candidate" }
 wind-bridge = { path = "../wind-bridge" }
+# 仅用于 startup_trace：UI 线程若在窗口创建阶段退出，主线程与主日志都可能毫无察觉
+wind-config = { path = "../wind-config" }
 tiny-skia = { workspace = true }
 tracing = { workspace = true }
 anyhow = { workspace = true }

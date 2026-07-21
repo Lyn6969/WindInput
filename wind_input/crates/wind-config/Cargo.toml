@@ -12,3 +12,5 @@ tracing = { workspace = true }
 anyhow = { workspace = true }
 thiserror = { workspace = true }
 dirs = { workspace = true }
+# startup_trace 的时间戳需与主日志/TSF 日志格式一致，故与 service 同用 chrono
+chrono = "0.4"

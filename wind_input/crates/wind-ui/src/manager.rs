@@ -455,16 +455,27 @@ impl UiManager {
     }
 
     /// UI 线程主循环
+    ///
+    /// 注意 [`UiManager::new`] 只负责 spawn 本线程即返回 `Ok`——窗口创建成功与否**不影响**
+    /// 它的返回值。因此本函数一旦提前 `return`，主线程毫不知情：服务照常启动、输入照常工作，
+    /// 而候选窗/工具栏/托盘/状态气泡**全部消失**。开机早期窗口站尚未就绪时
+    /// `CreateWindowExW` 失败正是这种场景，且唯一痕迹是下面那条 `error!`——
+    /// 偏偏主日志的 non_blocking worker 也可能已经死了。故这些分支同时写启动轨迹。
     fn ui_thread(rx: mpsc::Receiver<UiCommand>, event_tx: mpsc::Sender<UiEvent>) {
+        wind_config::startup_trace::stage("ui-thread-begin");
+
         // 创建候选窗口
         let config = CandidateWindowConfig::default();
         let mut candidate_window = match CandidateWindow::new(config, event_tx.clone()) {
             Ok(w) => {
                 info!("Candidate window created");
+                wind_config::startup_trace::stage("ui-candidate-window-ok");
                 w
             }
             Err(e) => {
                 error!("Failed to create candidate window: {}", e);
+                // UI 线程就此退出 = 全部 GUI 消失，这是最需要留痕的一步。
+                wind_config::startup_trace::stage(&format!("ui-candidate-window-FAILED: {e}"));
                 return;
             }
         };
@@ -539,6 +550,10 @@ impl UiManager {
         let mut host_render: Option<
             std::sync::Arc<wind_bridge::host_render_windows::HostRenderManager>,
         > = None;
+
+        // 所有窗口构造完毕、即将进入消息泵。走到这里说明 GUI 该有的都建起来了；
+        // 若客户仍报「无 GUI」，问题就在消息泵或显示逻辑，而非创建失败。
+        wind_config::startup_trace::stage("ui-thread-loop");
 
         // Win32 消息循环 + 通道接收
         // 待处理命令队列：每轮排空通道并合并连续候选更新（只渲染最新一帧），
@@ -1133,6 +1148,9 @@ impl UiManager {
                 std::thread::sleep(std::time::Duration::from_millis(8));
             }
         }
+
+        // 消息泵退出 = GUI 全部失效，而主线程同样不会察觉（见函数文档）。
+        wind_config::startup_trace::stage("ui-thread-EXIT");
     }
 }
 

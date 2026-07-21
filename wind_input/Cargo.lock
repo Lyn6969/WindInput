@@ -2495,6 +2495,7 @@ name = "wind-config"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "chrono",
  "dirs",
  "serde",
  "thiserror",
@@ -2720,6 +2721,7 @@ dependencies = [
  "tracing",
  "wind-bridge",
  "wind-candidate",
+ "wind-config",
  "wind-ipc",
  "wind-theme",
  "windows",

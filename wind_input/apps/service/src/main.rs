@@ -12,12 +12,14 @@ use tracing::{error, info};
 use tracing_subscriber::EnvFilter;
 use tracing_subscriber::fmt::time::ChronoLocal;
 
-/// 日志时间戳格式，与 wind_tsf `CFileLogger::_FormatTimestamp` 保持一致。
-const LOG_TIME_FORMAT: &str = "%Y-%m-%d %H:%M:%S%.3f";
-
 use wind_bridge::deferred::DeferredHandler;
 use wind_bridge::push::{PushConfig, PushServer};
 use wind_bridge::server::{BridgeConfig, BridgeServer};
+
+// 启动轨迹下沉在 wind-config，好让 UI 线程等下层也能打点（见该模块文档）。
+// 时间戳格式一并取自那里：与主日志、wind_tsf 的 `CFileLogger::_FormatTimestamp`
+// 共用一处定义，三份日志才能归并排序，也避免两边各写一份而漂移。
+use wind_config::startup_trace::{self, LOG_TIME_FORMAT};
 
 mod config_cli;
 mod log_rotate;
@@ -93,8 +95,13 @@ fn main() {
     // 必须在任何窗口创建之前调用，否则坐标会被 Windows DPI 虚拟化
     set_dpi_awareness();
 
+    // 启动轨迹的第一个探针必须早于 init_logger：主日志失效时，
+    // 「究竟有没有走到日志初始化」本身就是要回答的问题。
+    startup_trace::stage("begin");
+
     // 1. 初始化日志
     init_logger();
+    startup_trace::stage("logger-ready");
 
     let pipe_suffix = wind_config::variant::pipe_suffix();
     let variant = if wind_config::variant::is_dev() {
@@ -120,6 +127,7 @@ fn main() {
         }
     };
     info!("Singleton check passed");
+    startup_trace::stage("singleton-ok");
 
     // 2.5 等待用户配置目录就绪。
     //
@@ -131,6 +139,7 @@ fn main() {
     //
     // 必须在 init_logger() 之后：探测过程本身要留下日志。
     wind_config::Config::wait_user_config_ready(std::time::Duration::from_secs(10));
+    startup_trace::stage("config-ready");
 
     // 3. 创建 DeferredHandler（启动时返回安全默认值）
     let deferred = DeferredHandler::new();
@@ -181,11 +190,16 @@ fn main() {
         }
     });
 
+    startup_trace::stage("bridge-ready");
+
     // 8. 创建重启信号通道（须在协调器创建前，使 request_restart 的发送端就绪）
     let restart_rx = wind_coordinator::restart_signal();
 
     // 9. 创建中央协调器（传入 PushServer 用于激活状态推送）
+    // 前后各打一次：候选窗/工具栏的窗口线程在此创建，是「有服务无 GUI」的头号嫌疑段。
+    startup_trace::stage("coordinator-begin");
     let coordinator = wind_coordinator::Coordinator::new(push_server.clone());
+    startup_trace::stage("coordinator-done");
     // 注入 host-render 管理器（与 BridgeServer 共享同一实例），供后续写帧/隐藏使用。
     #[cfg(windows)]
     coordinator.set_host_render(host_render.clone());
@@ -220,6 +234,7 @@ fn main() {
         "WindInput service ready (pipes: wind_input{}, wind_input_push{}, wind_input_ctrl{})",
         pipe_suffix, pipe_suffix, pipe_suffix
     );
+    startup_trace::stage("service-ready");
 
     // 10. 阻塞主线程，直到菜单触发"重启服务"
     match restart_rx.recv() {
@@ -354,6 +369,9 @@ fn init_logger() {
     log_rotate::rotate_on_startup(&mut rotate, &log_path);
 
     let (writer, _guard) = tracing_appender::non_blocking(rotate);
+    // 丢弃计数器：worker 线程一旦出事，channel 断开后 lossy 模式会静默丢掉此后每一条
+    // 日志，`wind_input.log` 就永久停在某一行而进程照常运行。守护线程据此留痕。
+    let dropped = writer.error_counter();
 
     // 时间戳用本地时区，且格式与 wind_tsf 的 FileLogger 完全一致
     // （`GetLocalTime` → `%04d-%02d-%02d %02d:%02d:%02d.%03d`），
@@ -373,6 +391,8 @@ fn init_logger() {
     // Box::leak 保持 guard 存活至进程退出，确保缓冲日志全部落盘。
     Box::leak(Box::new(_guard));
 
+    spawn_log_health_watch(dropped);
+
     info!(
         log_dir = %log_dir.display(),
         level = %level,
@@ -383,6 +403,33 @@ fn init_logger() {
         tz_offset = %chrono::Local::now().format("%:z"),
         "logger initialized"
     );
+}
+
+/// 守护主日志的健康：丢弃计数一旦增长就写进启动轨迹。
+///
+/// 解决的是「观测工具自己成了故障的一部分」——`tracing_appender::non_blocking` 的
+/// worker 线程出事后，`NonBlocking` 在 lossy 模式下会**静默丢弃**其后每一条日志。
+/// 主日志因此停在某一行，而进程仍在正常跑，极易被误读成「进程卡在那一行」。
+/// 轨迹文件不经 tracing，故此时仍写得出去。
+///
+/// 30 秒一次、且只在计数**变化**时落笔：正常运行零写入，不会撑大轨迹文件。
+fn spawn_log_health_watch(dropped: tracing_appender::non_blocking::ErrorCounter) {
+    std::thread::Builder::new()
+        .name("log-health".into())
+        .spawn(move || {
+            let mut last = 0usize;
+            loop {
+                std::thread::sleep(std::time::Duration::from_secs(30));
+                let n = dropped.dropped_lines();
+                if n != last {
+                    startup_trace::stage(&format!(
+                        "LOG-DROPPED lines={n} (主日志已丢日志，其后内容不可信)"
+                    ));
+                    last = n;
+                }
+            }
+        })
+        .ok();
 }
 
 /// 单例检查：通过 Windows Named Mutex 确保只有一个实例运行
