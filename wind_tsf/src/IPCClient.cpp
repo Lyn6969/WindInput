@@ -2016,10 +2016,24 @@ BOOL CIPCClient::StartAsyncReader()
         }
     }
 
+    // 首连失败**绝不能在此 return**：重连逻辑活在下面这个 async reader 线程内部
+    // （_AsyncReaderLoop 每轮开头见 _hReadPipe == INVALID_HANDLE_VALUE 即重试，
+    // 失败则 continue 无限重试）。旧代码在这里 return FALSE，线程压根不创建，
+    // 于是「一次失手 = 终身失联」——连服务重启都感知不到，push 通道永久缺失。
+    // 对 host-render 白名单宿主（SearchHost）的后果是 HostRender 再不激活，
+    // 开始菜单候选窗永久压在菜单后方（2026-07-21 实测定位：SearchHost 自
+    // 某次首连失败起，跨三次服务重启 0/3 重连，而同期 23 个宿主每次都正常）。
+    //
+    // 首连之所以易失手：服务端 accept 循环原先把握手（写 SERVICE_READY + 读 token，
+    // 均为无超时阻塞）做在循环体内，握手期间管道名下零监听实例，开机/服务重启时
+    // 20+ 宿主 DLL 在数十毫秒内齐冲，必有输家。服务侧已并行修复（握手移出 accept
+    // 循环，见 wind-bridge/src/push.rs `serve_push_client`）。
+    // 两侧都修：服务端降低失手概率，DLL 侧保证失手可恢复——后者才是根治，
+    // 因为服务端再怎么改也无法保证客户端永不失手。
     if (_hReadPipe == INVALID_HANDLE_VALUE)
     {
-        _LogError(L"Failed to connect to push pipe");
-        return FALSE;
+        _LogError(L"Failed to connect to push pipe on first attempt; "
+                  L"starting async reader anyway, it will keep retrying");
     }
 
     // Create async reader thread
@@ -2034,8 +2048,12 @@ BOOL CIPCClient::StartAsyncReader()
     if (_hAsyncThread == NULL)
     {
         _LogError(L"Failed to create async reader thread: %d", GetLastError());
-        CloseHandle(_hReadPipe);
-        _hReadPipe = INVALID_HANDLE_VALUE;
+        // 首连允许失败后（见上），此处句柄可能本就无效——不可无条件 CloseHandle
+        if (_hReadPipe != INVALID_HANDLE_VALUE)
+        {
+            CloseHandle(_hReadPipe);
+            _hReadPipe = INVALID_HANDLE_VALUE;
+        }
         return FALSE;
     }
 
