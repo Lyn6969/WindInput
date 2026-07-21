@@ -20,7 +20,7 @@ use tracing::{info, warn};
 use wind_candidate::CandidateSource;
 use wind_config::Config;
 use wind_config::schema::{DictSpec, Schema};
-use wind_dict::cached::CachedDict;
+use wind_dict::cached::{CachedDict, ReverseIndex};
 
 // 方案定义已统一到 wind_config::schema::Schema（取代此前的私有 SchemaFile）。
 // 引擎只消费该共享类型；构建逻辑（build_engine）保持不变。
@@ -97,7 +97,7 @@ pub struct EngineManager {
     /// 码表反查索引缓存:方案 id → (汉字/词 → 全部编码,码长升序)。供拼音编码提示与悬停
     /// [编码] 段按词查实际码。懒建(首次需要时按方案词库全量构建),invalidate/reload 时清空。
     /// 内存护栏:每份索引可达数万词条,最多缓存两份(见 `reverse_index_for`)。
-    reverse_index: Mutex<HashMap<String, Arc<HashMap<String, Vec<String>>>>>,
+    reverse_index: Mutex<HashMap<String, Arc<ReverseIndex>>>,
     /// 码表**单字全码**表缓存:方案 id → (汉字 → 全码)。供造词按 `[[encoder.rules]]` 组装
     /// 词组编码(见 `encode_word`)。与 `reverse_index` 分开是刻意的——那份按「码长升序」排,
     /// 服务悬停 `[编码]` 的打法列表展示;这份要的是「按权重挑全码」,两种排序需求互斥。
@@ -398,8 +398,8 @@ impl EngineManager {
             return String::new();
         }
         self.reverse_index_for(&primary)
-            .get(text)
-            .and_then(|codes| codes.last().cloned())
+            .codes_of(text)
+            .and_then(|codes| codes.last().map(str::to_string))
             .unwrap_or_default()
     }
 
@@ -427,7 +427,7 @@ impl EngineManager {
             return String::new();
         }
         self.reverse_index_for(schema_id)
-            .get(text)
+            .codes_of(text)
             .map(|codes| codes.join("/"))
             .unwrap_or_default()
     }
@@ -435,7 +435,7 @@ impl EngineManager {
     /// 取 `schema_id` 的反查索引,缺则全量构建并缓存。
     /// 内存护栏:最多保留两份——本次请求方 + 全局主码表(悬停查活跃码表、拼音提示查主码表,
     /// 两者常为同一方案;方案切换的残留索引随下次构建清退)。
-    fn reverse_index_for(&self, schema_id: &str) -> Arc<HashMap<String, Vec<String>>> {
+    fn reverse_index_for(&self, schema_id: &str) -> Arc<ReverseIndex> {
         // primary 在 reverse_index 锁外取,避免嵌套锁。
         let primary = self
             .primary_codetable
@@ -453,15 +453,15 @@ impl EngineManager {
     }
 
     /// 按方案全量构建反查索引(汉字/词 → 全部编码,码长升序)。失败返回空表。
-    fn build_reverse_index_for(&self, schema_id: &str) -> HashMap<String, Vec<String>> {
+    fn build_reverse_index_for(&self, schema_id: &str) -> ReverseIndex {
         let Some(data_dir) = self.data_dir.as_deref() else {
-            return HashMap::new();
+            return ReverseIndex::default();
         };
         let schemas = data_dir.join("schemas");
         let Some(schema) =
             Self::read_schema(schema_id, Some(data_dir), self.override_dir.as_deref())
         else {
-            return HashMap::new();
+            return ReverseIndex::default();
         };
         match Self::load_dictionary(&schema, &schemas) {
             Some(dict) => {
@@ -473,7 +473,7 @@ impl EngineManager {
                 );
                 idx
             }
-            None => HashMap::new(),
+            None => ReverseIndex::default(),
         }
     }
 
