@@ -66,6 +66,7 @@ const COMPLETION_NEAR_SYLLABLES: u32 = 2;
 /// 一半的词低于它，会误沉大量高频使用但低词频的日常词。
 const COMPLETION_FAR_WEIGHT_FLOOR: i32 = 100;
 
+
 /// 拼音引擎配置
 #[derive(Debug, Clone)]
 pub struct Config {
@@ -770,6 +771,7 @@ impl Engine for PinyinEngine {
             }
         }
 
+
         // 2. Viterbi 长句解码（>=2 音节，仅在完成音节前缀上跑；use_smart_compose=false 时跳过）
         if self.config.use_smart_compose && syllables.len() >= 2 {
             // 切分图：全拼取 DAG 的全部路径；双拼/手动分隔符取真值链（行为与改造前一致）。
@@ -957,7 +959,30 @@ impl Engine for PinyinEngine {
             }
             store_cands.extend(store_dm.search_prefix(query, limit));
             for mut c in store_cands {
-                if c.text.is_empty() || candidates.iter().any(|x| x.text == c.text) {
+                if c.text.is_empty() {
+                    continue;
+                }
+                // 同文时**合并**而非整条丢弃。
+                //
+                // 旧行为（`any(|x| x.text == c.text) → continue`）让用户词在系统词典已有同文时
+                // 完全失声：用户把「自激」配到 w=2_000_000_000 也纹丝不动，最终 weight 仍是系统的
+                // 18 —— 用户词的 weight **从不参与比较**，「提权」这个动作在词已存在时无效。
+                //
+                // 合并规则：
+                // - `weight` 取 **max**：用户配高权重即生效；用户权重更低时保留系统值，
+                //   因为用户加词的意图是「提权」而非「降权」（降权应由词频/屏蔽机制表达）。
+                // - `code` / `boundary` **保留已有候选的**，不换成用户词的。二者必须同进同出
+                //   （`d4084b8` 已踩过此坑：composite 去重换 code 时 boundary 未跟随，配出
+                //   「A 层的 code + B 层的 boundary」）。用户手输码常无边界信息（boundary=0），
+                //   换过去等于把系统词典的真值边界抹成未知。
+                // - 置 `meta.is_user_dict = true` 使来源可追溯（该字段目前无比较器读取，
+                //   仅供诊断/UI）。
+                // - 其余层级标志（is_fuzzy/is_prefix/is_partial/is_exact_code）**一律不动**：
+                //   它们描述的是「这条候选相对本次输入处在哪一层」，由已有候选的来源路径决定，
+                //   与用户是否也收录了同一个词无关。
+                if let Some(existing) = candidates.iter_mut().find(|x| x.text == c.text) {
+                    existing.weight = existing.weight.max(c.weight);
+                    existing.meta.is_user_dict = true;
                     continue;
                 }
                 c.source = CandidateSource::Pinyin;
