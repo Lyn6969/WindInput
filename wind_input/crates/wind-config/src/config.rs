@@ -2009,7 +2009,7 @@ impl Config {
         }
     }
 
-    /// 缓存目录（%LOCALAPPDATA%\WindInput\cache）：词库 .wdb 等可重建产物。
+    /// 缓存目录（%LOCALAPPDATA%\WindInput\cache）：词库 .wdat 等可重建产物。
     pub fn cache_dir() -> Option<PathBuf> {
         Self::local_dir().map(|d| d.join("cache"))
     }

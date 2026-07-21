@@ -1897,7 +1897,7 @@ impl EngineManager {
 
     /// 码表方案：把主词库 + 每个扩展词库（含**当前禁用**的）各自加载为独立 system 层。
     /// 返回 `(层名, CachedDict, 初始enabled)`：主库 → `codetable-system`(恒启用)；扩展 →
-    /// `codetable-extra-<id>`(enabled=is_enabled())。**不再合并 combined.wdb**——查询期由
+    /// `codetable-extra-<id>`(enabled=is_enabled())。**不再合并 combined.wdat**——查询期由
     /// CompositeDict 合并去重，开关扩展只需翻该层 enabled 标志，无需重熔大词库（对齐 Go 的
     /// 每库独立缓存 + 查询期合并）。主库优先返回（层序最靠前 → 等权重时排前）。
     /// 词库文件路径解析：用户配置/schemas 优先，回退 schemas_dir（与 read_schema 同语义）。
@@ -2031,7 +2031,7 @@ impl EngineManager {
     /// 加载 schema 的词典：合并所有 enabled 词库（主词库 + default_enabled 附加库）。
     ///
     /// - 拼音（rime_pinyin）：单库经 import_tables 合并（load_rime_pinyin_dict）。
-    /// - 码表反查索引用（build_primary_reverse_index）：主库 + 扩展库合并到 .combined.wdb。
+    /// - 码表反查索引用（build_primary_reverse_index）：主库 + 扩展库合并到 .combined.wdat。
     ///   注意 live 查询层已改为 load_codetable_layers 的每库独立层，此处仅供反查索引复用。
     fn load_dictionary(schema: &Schema, schemas_dir: &Path) -> Option<CachedDict> {
         // 收集 enabled 词库（保持 schema 顺序：主库在前，扩展库在后）
@@ -2087,7 +2087,7 @@ impl EngineManager {
             };
         }
 
-        // 多库：合并到 combined.wdb（缓存键 = 主词库路径 + .combined.wdb）
+        // 多库：合并到 combined.wdat（缓存键 = 主词库路径 + .combined.wdat）
         let sources: Vec<(std::path::PathBuf, String)> = enabled
             .iter()
             .map(|e| (resolve(&e.path), dtype(e)))
@@ -2096,7 +2096,7 @@ impl EngineManager {
         Self::load_merged_dicts(&sources, &combined)
     }
 
-    /// 把多个词库合并到一个 combined.wdb（按 code 聚合），并 mmap 打开。
+    /// 把多个词库合并到一个 combined.wdat（按 code 聚合），并 mmap 打开。
     /// 每个源按其 dict_type 加载：rime_pinyin 先经 import_tables 展开。
     /// 缓存有效性：combined 比所有源都新则直接复用。
     fn load_merged_dicts(
@@ -2277,7 +2277,7 @@ impl EngineManager {
         out
     }
 
-    /// 加载 rime_pinyin 词典（合并 import_tables 子词典到 .merged.wdb）
+    /// 加载 rime_pinyin 词典（合并 import_tables 子词典到 .merged.wdat）
     fn load_rime_pinyin_dict(dict_path: &Path) -> Option<CachedDict> {
         // wdat-only：拼音是独立于 CachedDict::load_at_with 的第二条链路（要读 yaml 头展开
         // import_tables 再并行解析正文），源缺失时那两步全废，故须在此单独拦截。
@@ -2305,16 +2305,16 @@ impl EngineManager {
                 }
             };
         }
-        // merged.wdb 写到可写缓存目录（与 unigram 一致）。安装目录（如 Program Files）
+        // merged.wdat 写到可写缓存目录（与 unigram 一致）。安装目录（如 Program Files）
         // 通常只读，若写在源旁会失败 → 回退仅主词典(rime header 数十条) → 拼音无候选。
-        let merged_wdb = cache_path(dict_path, "merged.wdat");
+        let merged_wdat = cache_path(dict_path, "merged.wdat");
         // 收集全部源（主表 + import_tables 子表）。指纹/缓存校验需覆盖全部源，
         // 故须先于 fresh 判定算出（仅解析头部 yaml，开销极低）。
         // 与 combined 层共用 rime_source_paths——两处各写一份正是 R6 那条陈旧路径的成因。
         // 按缓存文件 single-flight。这里是该缺陷最典型的现场：pinyin / shuangpin /
         // 混输的 secondary 子引擎三者的 schema 都指向 pinyin/rime_frost.dict.yaml，
         // cache_path 又按源文件父目录名做命名空间，最终是同一个 merged.wdat。
-        let build_lock = wind_dict::reader_pool::file_lock(&merged_wdb);
+        let build_lock = wind_dict::reader_pool::file_lock(&merged_wdat);
         let _build_guard = build_lock.lock().unwrap_or_else(|e| e.into_inner());
 
         let sub_paths = Self::rime_source_paths(dict_path, "rime_pinyin");
@@ -2322,35 +2322,36 @@ impl EngineManager {
 
         // merged 缓存对**全部源**做内容指纹校验：主表或任一子表内容变化、或源清单增删都
         // 判定失效并重建（避免「子表改了却仍用旧 merged」的静默陈旧）。
-        if merged_wdb.exists()
-            && Self::combined_cache_fresh(&src_refs, &merged_wdb, MERGED_CACHE_TAG)
+        if merged_wdat.exists()
+            && Self::combined_cache_fresh(&src_refs, &merged_wdat, MERGED_CACHE_TAG)
         {
-            match wind_dict::reader_pool::open_wdat(&merged_wdb) {
+            match wind_dict::reader_pool::open_wdat(&merged_wdat) {
                 Ok(reader) => {
                     info!(
                         "Using merged mmap cache: {} ({} keys)",
-                        merged_wdb.display(),
+                        merged_wdat.display(),
                         reader.key_count()
                     );
                     return Some(CachedDict::Mmap(reader));
                 }
                 Err(e) => {
                     warn!("Stale merged cache ({}), regenerating", e);
-                    Self::remove_stale_cache(&merged_wdb);
+                    Self::remove_stale_cache(&merged_wdat);
                 }
             }
-        } else if merged_wdb.exists() {
+        } else if merged_wdat.exists() {
             info!(
                 "merged cache stale (sources changed), regenerating: {}",
-                merged_wdb.display()
+                merged_wdat.display()
             );
-            Self::remove_stale_cache(&merged_wdb);
+            Self::remove_stale_cache(&merged_wdat);
         }
 
         // 并行解析每个源正文（纯 CPU 多线程），直接产出 (code,text,weight)：不再为每个子表
-        // 生成中间 .wdb，也绕过 CodetableDict 的 BTreeMap 构建与逐 code 排序（merged 稍后会
-        // 统一按权重重排）。DictWriter::add 不合并同 code 多次调用，故先用 HashMap 聚合，否则
-        // wdb 出现重复 KeyIndex，DictReader 二分只命中其一 → 同 code 候选系统性丢失。
+        // 生成中间 .wdat，也绕过 CodetableDict 的 BTreeMap 构建与逐 code 排序（merged 稍后会
+        // 统一按权重重排）。WdatWriter 的 add 系列不合并同 code 的多次调用（内部直接 push），
+        // 故先用 HashMap 聚合，否则同一 code 会落成多条记录、读取端只命中其一 → 同 code
+        // 候选系统性丢失。
         // 全拼按 code 聚合；简拼（声母缩写，如 nh→你好）按简拼码聚合，存进 wdat 独立 AbbrevSection。
         // 全拼条目携带 boundary（wdat v4 音节边界，取自 rime 源数据 `ni hao` 的空格）；
         // 简拼码是各音节首字母的拼接、本身不构成音节序列，无边界语义，故 agg_ab 不带。
@@ -2412,15 +2413,15 @@ impl EngineManager {
             abbrev_count
         );
 
-        info!("Writing merged .wdb cache ({} entries)...", total_entries);
+        info!("Writing merged .wdat cache ({} entries)...", total_entries);
         // 写缓存目录；若仍失败（缓存目录不可写等）退到系统临时目录。绝不退化成仅主词典
         // （rime header 仅数十条），那会让拼音/混输/临时拼音全部无候选。
         let temp_fallback = std::env::temp_dir().join(
-            merged_wdb
+            merged_wdat
                 .file_name()
-                .unwrap_or_else(|| std::ffi::OsStr::new("rime.merged.wdb")),
+                .unwrap_or_else(|| std::ffi::OsStr::new("rime.merged.wdat")),
         );
-        for target in [&merged_wdb, &temp_fallback] {
+        for target in [&merged_wdat, &temp_fallback] {
             let is_fallback = target.as_path() == temp_fallback.as_path();
             if let Err(e) = writer.write(target) {
                 if is_fallback {
@@ -2439,9 +2440,9 @@ impl EngineManager {
                 }
                 continue;
             }
-            // 写内容指纹(覆盖全部源；仅对正式缓存路径，fresh 校验也只看 merged_wdb)
-            if target.as_path() == merged_wdb.as_path() {
-                wind_dict::cache_fp::write_cache_fp(&merged_wdb, &src_refs, MERGED_CACHE_TAG);
+            // 写内容指纹(覆盖全部源；仅对正式缓存路径，fresh 校验也只看 merged_wdat)
+            if target.as_path() == merged_wdat.as_path() {
+                wind_dict::cache_fp::write_cache_fp(&merged_wdat, &src_refs, MERGED_CACHE_TAG);
             }
             match wind_dict::reader_pool::open_wdat(target) {
                 Ok(reader) => {

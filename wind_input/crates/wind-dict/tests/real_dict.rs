@@ -21,8 +21,8 @@ fn test_real_wubi_candidates() {
         return;
     }
 
-    // 清理可能存在的旧缓存，强制走 yaml→wdb→mmap 全路径
-    let _ = std::fs::remove_file(path.with_extension("wdb"));
+    // 清理可能存在的旧缓存，强制走 yaml→wdat→mmap 全路径
+    let _ = std::fs::remove_file(path.with_extension("wdat"));
 
     let dict = CachedDict::load(&path).expect("加载五笔词典");
     assert!(dict.len() > 0, "五笔词典应非空");
@@ -53,7 +53,7 @@ fn test_real_pinyin_candidates() {
         return;
     }
 
-    let _ = std::fs::remove_file(path.with_extension("wdb"));
+    let _ = std::fs::remove_file(path.with_extension("wdat"));
 
     let dict = CachedDict::load(&path).expect("加载拼音词典");
     assert!(dict.len() > 0, "拼音词典应非空");

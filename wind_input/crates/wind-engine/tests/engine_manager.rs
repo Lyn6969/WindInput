@@ -104,8 +104,14 @@ fn test_wubi_extra_dict_loaded() {
         eprintln!("跳过：wubi86 schema 不存在");
         return;
     }
-    // 删除旧 combined 缓存，强制重新合并多库
-    let _ = std::fs::remove_file(dir.join("schemas/wubi86/wubi86_jidian.dict.combined.wdb"));
+    // 尝试删除**源旁**的旧 combined 缓存（扩展名此前还写着 .wdb，格式迁移后已是 .wdat）。
+    //
+    // 注意这行够不到真正的缓存：EngineManager::new 会把 CACHE_DIR 初始化成
+    // %LOCALAPPDATA%\...\cache，cache_path 届时返回 <cache>/wubi86/wubi86_jidian.combined.wdat
+    // （还会剥掉 .dict 中缀），本测试因此实际可能走缓存命中而非重新合并。
+    // 核心断言（扩展库独有的词能查到）不依赖是否重合并，故不阻塞；要真正覆盖合并路径，
+    // 需让 CACHE_DIR 可注入——它现在是进程级 OnceLock，测试无法重设。
+    let _ = std::fs::remove_file(dir.join("schemas/wubi86/wubi86_jidian.dict.combined.wdat"));
     let cfg = make_config(&["wubi86"]);
     let mgr = EngineManager::new(&cfg, Some(&dir));
 

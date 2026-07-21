@@ -1,4 +1,4 @@
-//! 词典缓存层：yaml 首次加载后写入 .wdb 缓存，后续直接 mmap 读取
+//! 词典缓存层：yaml 首次加载后写入 .wdat 缓存，后续直接 mmap 读取
 //!
 //! 与 Go 版 mmap 共享池对齐，显著降低内存占用。
 
@@ -53,28 +53,28 @@ pub enum CachedDict {
 }
 
 impl CachedDict {
-    /// 加载词典，自动使用 .wdb 缓存
+    /// 加载词典，自动使用 .wdat 缓存
     ///
     /// 流程：
-    /// 1. 检查 .wdb 缓存是否存在且比 .yaml 新
+    /// 1. 检查 .wdat 缓存是否存在且比 .yaml 新
     /// 2. 如果是，直接 mmap 打开
-    /// 3. 如果否，加载 .yaml，写入 .wdb 缓存，然后 mmap 打开
+    /// 3. 如果否，加载 .yaml，写入 .wdat 缓存，然后 mmap 打开
     pub fn load(yaml_path: &Path) -> anyhow::Result<Self> {
-        let wdb_path = yaml_path.with_extension("wdat");
-        Self::load_at(yaml_path, &wdb_path)
+        let wdat_path = yaml_path.with_extension("wdat");
+        Self::load_at(yaml_path, &wdat_path)
     }
 
-    /// 加载词典，使用指定的 .wdb 缓存路径（缓存可与源分离，如放
+    /// 加载词典，使用指定的 .wdat 缓存路径（缓存可与源分离，如放
     /// `%LOCALAPPDATA%\WindInput\cache`，避免写入只读的安装目录）。
-    pub fn load_at(yaml_path: &Path, wdb_path: &Path) -> anyhow::Result<Self> {
-        Self::load_at_with(yaml_path, wdb_path, false)
+    pub fn load_at(yaml_path: &Path, wdat_path: &Path) -> anyhow::Result<Self> {
+        Self::load_at_with(yaml_path, wdat_path, false)
     }
 
     /// 同 [`load_at`]，`lowercase_code=true` 时把 code 列小写化（英文词库）。
     /// 缓存命中时直接 mmap（缓存内已是小写码）；缓存重建时用 `load_lowercased`。
     pub fn load_at_with(
         yaml_path: &Path,
-        wdb_path: &Path,
+        wdat_path: &Path,
         lowercase_code: bool,
     ) -> anyhow::Result<Self> {
         // wdat-only：用户只投放编译好的二进制词库、不带 yaml 源（对齐 Go 的 wdb-only 分发）。
@@ -109,16 +109,16 @@ impl CachedDict {
         // 按缓存文件 single-flight：同一个 wdat 常被多个方案引用（如 wubi86 独立引擎与
         // 混输的 primary 子引擎），缓存失效时会同时走到下面的 write_cache → rename。
         // 混输子引擎的构建不经 ensure_loaded，也就不受 build_locks 保护，故须在此自锁。
-        let build_lock = crate::reader_pool::file_lock(wdb_path);
+        let build_lock = crate::reader_pool::file_lock(wdat_path);
         let _build_guard = build_lock.lock().unwrap_or_else(|e| e.into_inner());
 
         // 检查缓存是否有效（同时充当拿锁后的复查：等待期间别的线程可能已重建完成）
-        if Self::cache_is_valid(yaml_path, wdb_path, lowercase_code) {
-            match crate::reader_pool::open_wdat(wdb_path) {
+        if Self::cache_is_valid(yaml_path, wdat_path, lowercase_code) {
+            match crate::reader_pool::open_wdat(wdat_path) {
                 Ok(reader) => {
                     info!(
                         "Using mmap cache: {} ({} keys)",
-                        wdb_path.display(),
+                        wdat_path.display(),
                         reader.key_count()
                     );
                     return Ok(Self::Mmap(reader));
@@ -141,17 +141,17 @@ impl CachedDict {
             dict.len()
         );
 
-        // 确保缓存目录存在后写入 .wdb 缓存
-        if let Some(parent) = wdb_path.parent() {
+        // 确保缓存目录存在后写入 .wdat 缓存
+        if let Some(parent) = wdat_path.parent() {
             let _ = std::fs::create_dir_all(parent);
         }
-        if let Err(e) = Self::write_cache(&dict, wdb_path) {
+        if let Err(e) = Self::write_cache(&dict, wdat_path) {
             // 退化成内存模式：词库整份常驻堆而非 mmap，大词库代价可观。此前只记一行
             // 「Failed to write」，看不出后果，用户也就无从解释内存为何偏高。
             warn!(
-                "写入 wdb 缓存失败 {}: {}。本次退化为内存模式——词库常驻堆而非 mmap，\
+                "写入 wdat 缓存失败 {}: {}。本次退化为内存模式——词库常驻堆而非 mmap，\
                  内存占用显著高于正常路径。常见原因是缓存目录不可写或磁盘空间不足。",
-                wdb_path.display(),
+                wdat_path.display(),
                 e
             );
             return Ok(Self::Memory(dict));
@@ -160,17 +160,17 @@ impl CachedDict {
         // tag 带上 lowercase_code：同一份 yaml 在 english / 非 english 两种 dict_type 下
         // 解析结果不同，不区分就会在切换后复用大小写错误的缓存。
         crate::cache_fp::write_cache_fp(
-            wdb_path,
+            wdat_path,
             &[yaml_path],
             crate::cache_fp::dict_tag(lowercase_code),
         );
 
         // 用 mmap 重新打开缓存
-        match crate::reader_pool::open_wdat(wdb_path) {
+        match crate::reader_pool::open_wdat(wdat_path) {
             Ok(reader) => {
                 info!(
                     "Using mmap cache: {} ({} keys)",
-                    wdb_path.display(),
+                    wdat_path.display(),
                     reader.key_count()
                 );
                 Ok(Self::Mmap(reader))
@@ -183,16 +183,16 @@ impl CachedDict {
     }
 
     /// 检查缓存是否有效（按源文件**内容指纹** + 解析方式 tag，不受 scp/部署刷新 mtime 影响）。
-    fn cache_is_valid(yaml_path: &Path, wdb_path: &Path, lowercase_code: bool) -> bool {
+    fn cache_is_valid(yaml_path: &Path, wdat_path: &Path, lowercase_code: bool) -> bool {
         crate::cache_fp::cache_is_fresh(
-            wdb_path,
+            wdat_path,
             &[yaml_path],
             crate::cache_fp::dict_tag(lowercase_code),
         )
     }
 
-    /// 将内存词典写入 .wdb 缓存
-    fn write_cache(dict: &CodetableDict, wdb_path: &Path) -> anyhow::Result<()> {
+    /// 将内存词典写入 .wdat 缓存
+    fn write_cache(dict: &CodetableDict, wdat_path: &Path) -> anyhow::Result<()> {
         let mut writer = WdatWriter::new();
 
         // 遍历所有键，导出到 writer
@@ -202,10 +202,10 @@ impl CachedDict {
             anyhow::bail!("No entries to write");
         }
 
-        writer.write(wdb_path)?;
+        writer.write(wdat_path)?;
         info!(
-            "Wrote .wdb cache: {} ({} keys)",
-            wdb_path.display(),
+            "Wrote .wdat cache: {} ({} keys)",
+            wdat_path.display(),
             writer.key_count()
         );
         Ok(())
