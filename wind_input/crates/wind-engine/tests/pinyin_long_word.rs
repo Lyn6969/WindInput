@@ -98,15 +98,27 @@ fn test_over_limit_long_word_falls_back_to_dict_exact() {
 
     for (input, expect) in [
         // 罐装动脉…
-        ("guanzhuangdongmaizhouyangyinghuaxingxinzangbing", "冠状动脉粥样硬化性心脏病"),
+        (
+            "guanzhuangdongmaizhouyangyinghuaxingxinzangbing",
+            "冠状动脉粥样硬化性心脏病",
+        ),
         // 大不列颠几倍爱尔兰…
-        ("dabuliedianjibeiaierlanlianhewangguo", "大不列颠及北爱尔兰联合王国"),
+        (
+            "dabuliedianjibeiaierlanlianhewangguo",
+            "大不列颠及北爱尔兰联合王国",
+        ),
         // 里昂好的开端…
-        ("lianghaodekaiduanshichenggongdeyiban", "良好的开端是成功的一半"),
+        (
+            "lianghaodekaiduanshichenggongdeyiban",
+            "良好的开端是成功的一半",
+        ),
         // 塔什库尔干他即可自治县
         ("tashikuergantajikezizhixian", "塔什库尔干塔吉克自治县"),
         // …责任强制保险调理
-        ("jidongchejiaotongshiguzerenqiangzhibaoxiantiaoli", "机动车交通事故责任强制保险条例"),
+        (
+            "jidongchejiaotongshiguzerenqiangzhibaoxiantiaoli",
+            "机动车交通事故责任强制保险条例",
+        ),
     ] {
         assert_eq!(first(&mgr, input), expect, "超长词兜底失效: {}", input);
     }

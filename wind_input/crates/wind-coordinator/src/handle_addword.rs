@@ -138,7 +138,11 @@ impl Coordinator {
             // 缺了它排查时会看到「凭空出现的已造词」，误以为触发源丢了。
             debug!(
                 "auto-phrase: 终止信号 {} → flush {} 字",
-                if all_han { "多字词上屏" } else { "非汉字上屏" },
+                if all_han {
+                    "多字词上屏"
+                } else {
+                    "非汉字上屏"
+                },
                 seq.len()
             );
             self.flush_auto_phrase(&seq);
@@ -163,7 +167,13 @@ impl Coordinator {
 
     /// idle 超时（连续单字最大间隔）。0 = 用默认 5s。
     fn auto_phrase_idle_timeout(&self) -> std::time::Duration {
-        let ms = self.rt().config.schema.codetable.auto_phrase.idle_timeout_ms;
+        let ms = self
+            .rt()
+            .config
+            .schema
+            .codetable
+            .auto_phrase
+            .idle_timeout_ms;
         if ms == 0 {
             crate::auto_phrase::DEFAULT_IDLE_TIMEOUT
         } else {
@@ -182,18 +192,18 @@ impl Coordinator {
         let active = self.engine_mgr.active_schema_id();
         // 出码方案与入库方案是**两个不同的 id**（对齐 `add_word_target_schema` 的既有区分）：
         // 出码要真实方案（读它的 [[encoder.rules]] 与码表词库），入库要数据方案（混输折叠到主码表）。
-        let encode_schema = if self.engine_mgr.schema_engine_type(&active).as_deref() == Some("mixed")
-        {
-            match self.engine_mgr.mixed_primary_schema(&active) {
-                Some(s) => s,
-                None => {
-                    debug!("auto-phrase: 混输方案主码表缺失，跳过造词");
-                    return;
+        let encode_schema =
+            if self.engine_mgr.schema_engine_type(&active).as_deref() == Some("mixed") {
+                match self.engine_mgr.mixed_primary_schema(&active) {
+                    Some(s) => s,
+                    None => {
+                        debug!("auto-phrase: 混输方案主码表缺失，跳过造词");
+                        return;
+                    }
                 }
-            }
-        } else {
-            active.clone()
-        };
+            } else {
+                active.clone()
+            };
         let code = match self.engine_mgr.encode_word(&encode_schema, &word) {
             Ok(c) => c,
             Err(e) => {
@@ -239,7 +249,13 @@ impl Coordinator {
     /// 临时词库上限淘汰。按写入次数节流——每次造词都全表扫描代价过高，而上限本身
     /// 是软约束（略微超出无害）。`max_entries = 0` 视为不限。
     fn maybe_evict_temp(&self, store: &wind_store::Store, schema: &str) {
-        let max = self.rt().config.schema.codetable.auto_phrase.temp_max_entries;
+        let max = self
+            .rt()
+            .config
+            .schema
+            .codetable
+            .auto_phrase
+            .temp_max_entries;
         if max == 0 {
             return;
         }

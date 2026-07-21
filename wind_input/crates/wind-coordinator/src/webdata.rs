@@ -2479,10 +2479,7 @@ mod tests {
     /// phrase.resetSystem 应重读 TOML：手工编辑后无需重启服务即可生效。
     #[test]
     fn phrase_reset_system_rereads_toml() {
-        let (c, dir) = coord_with_phrase_toml(
-            "ok",
-            "[[phrases]]\ncode = 'rq'\ntext = '$date'\n",
-        );
+        let (c, dir) = coord_with_phrase_toml("ok", "[[phrases]]\ncode = 'rq'\ntext = '$date'\n");
 
         assert_eq!(system_codes(&c), vec![("rq".into(), "$date".into())]);
 
@@ -2510,10 +2507,8 @@ mod tests {
     /// TOML 语法错误时必须回退到启动缓存，绝不能把库里系统短语清空。
     #[test]
     fn phrase_reset_system_falls_back_on_broken_toml() {
-        let (c, dir) = coord_with_phrase_toml(
-            "broken",
-            "[[phrases]]\ncode = 'rq'\ntext = '$date'\n",
-        );
+        let (c, dir) =
+            coord_with_phrase_toml("broken", "[[phrases]]\ncode = 'rq'\ntext = '$date'\n");
 
         // 写坏 TOML（未闭合引号）
         std::fs::write(

@@ -655,7 +655,9 @@ mod tests {
         d.merge_single("khkkhk".into(), "中".into(), 100, 1);
         let cd = CachedDict::Memory(d);
         assert_eq!(
-            cd.build_single_char_full_codes(0).get(&'中').map(String::as_str),
+            cd.build_single_char_full_codes(0)
+                .get(&'中')
+                .map(String::as_str),
             Some("khkkhk"),
             "cap=0 应不设闸，取最长"
         );
@@ -721,7 +723,11 @@ mod tests {
         );
         assert!(idx.codes_of("无").is_none());
         // 消费侧的两种取法
-        assert_eq!(idx.codes_of("工").unwrap().last(), Some("aaaa"), "末位=全码");
+        assert_eq!(
+            idx.codes_of("工").unwrap().last(),
+            Some("aaaa"),
+            "末位=全码"
+        );
         assert_eq!(idx.codes_of("工").unwrap().join("/"), "a/aaaa");
     }
 

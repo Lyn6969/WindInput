@@ -762,13 +762,18 @@ mod tests {
         // 合并候选为空，协调器的 `state.candidates.is_empty()` 复核挡不住——只能靠这一位。
         let r = mixed_with_prefix_pinyin(true).convert("zhon", 50).unwrap();
         assert!(r.candidates.is_empty(), "前置：此刻确无候选");
-        assert!(!r.should_clear, "拼音仍可能有后续时不得清空，否则吞掉中途输入");
+        assert!(
+            !r.should_clear,
+            "拼音仍可能有后续时不得清空，否则吞掉中途输入"
+        );
     }
 
     #[test]
     fn overflow_never_clears() {
         // 超长（>max_code_len）**有意**不清空：已切入纯拼音语境，「码表满码无候选」前提不成立。
-        let r = mixed_with_prefix_pinyin(false).convert("qqqqq", 50).unwrap();
+        let r = mixed_with_prefix_pinyin(false)
+            .convert("qqqqq", 50)
+            .unwrap();
         assert!(!r.should_clear, "overflow 分支不得产生清空");
     }
 

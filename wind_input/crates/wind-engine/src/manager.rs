@@ -533,9 +533,13 @@ impl EngineManager {
     ///
     /// 任一字取不到码即整词失败，错误里带上是哪个字（见 [`encoder::EncodeError`]）。
     pub fn encode_word(&self, schema_id: &str, word: &str) -> Result<String, encoder::EncodeError> {
-        let spec = Self::read_schema(schema_id, self.data_dir.as_deref(), self.override_dir.as_deref())
-            .and_then(|s| s.encoder)
-            .unwrap_or_default();
+        let spec = Self::read_schema(
+            schema_id,
+            self.data_dir.as_deref(),
+            self.override_dir.as_deref(),
+        )
+        .and_then(|s| s.encoder)
+        .unwrap_or_default();
         let codes = self.single_char_full_codes(schema_id);
         encoder::calc_word_code(word, &spec, |c| codes.get(&c).cloned())
     }
@@ -1916,7 +1920,9 @@ impl EngineManager {
     fn resolve_dict_file(rel: &str, schemas_dir: &Path) -> std::path::PathBuf {
         Self::resolve_dict_file_in(
             rel,
-            Config::user_config_dir().map(|u| u.join("schemas")).as_deref(),
+            Config::user_config_dir()
+                .map(|u| u.join("schemas"))
+                .as_deref(),
             schemas_dir,
         )
     }
@@ -1957,7 +1963,8 @@ impl EngineManager {
         schema: &Schema,
         schemas_dir: &Path,
     ) -> Vec<(String, CachedDict, bool, i32, Option<i32>)> {
-        let resolve = |rel: &str| -> std::path::PathBuf { Self::resolve_dict_file(rel, schemas_dir) };
+        let resolve =
+            |rel: &str| -> std::path::PathBuf { Self::resolve_dict_file(rel, schemas_dir) };
         let is_english =
             |e: &DictSpec| -> bool { !e.dict_type.is_empty() && e.dict_type == "english" };
 
@@ -2054,7 +2061,8 @@ impl EngineManager {
         }
 
         // 词典文件路径解析（含 wdat-only 探测）见 resolve_dict_file。
-        let resolve = |rel: &str| -> std::path::PathBuf { Self::resolve_dict_file(rel, schemas_dir) };
+        let resolve =
+            |rel: &str| -> std::path::PathBuf { Self::resolve_dict_file(rel, schemas_dir) };
 
         let dtype = |e: &DictSpec| {
             if e.dict_type.is_empty() {
@@ -2469,9 +2477,7 @@ impl EngineManager {
                 Err(e) => warn!("Failed to open merged cache {}: {}", target.display(), e),
             }
         }
-        error!(
-            "merged 缓存的正式路径与临时回退路径均写入失败，拼音词库不可用（该方案将无候选）"
-        );
+        error!("merged 缓存的正式路径与临时回退路径均写入失败，拼音词库不可用（该方案将无候选）");
         None
     }
 
@@ -2505,8 +2511,7 @@ mod tests {
     /// 才需要额外的 wdbOnlyHint 参数。
     #[test]
     fn resolve_dict_file_priority_order() {
-        let base =
-            std::env::temp_dir().join(format!("wind-resolve-{}", std::process::id()));
+        let base = std::env::temp_dir().join(format!("wind-resolve-{}", std::process::id()));
         let user = base.join("user/schemas");
         let sys = base.join("sys/schemas");
         std::fs::create_dir_all(user.join("s")).unwrap();

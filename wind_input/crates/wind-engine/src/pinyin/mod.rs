@@ -760,7 +760,9 @@ impl Engine for PinyinEngine {
                 let log_prob = lattice::score_node(&c.text, c.weight, self.unigram.as_deref());
                 let log_offset =
                     (log_prob * 1000.0).clamp(-(SENTENCE_WEIGHT_BASE as f64), 0.0) as i32;
-                c.weight = c.weight.max(SENTENCE_WEIGHT_BASE.saturating_add(log_offset));
+                c.weight = c
+                    .weight
+                    .max(SENTENCE_WEIGHT_BASE.saturating_add(log_offset));
                 // 与整句同量纲即同身份：它是引擎对整串输入的最优解读，只是恰好由一个词典
                 // 整词构成。不标的话 freq_rerank 会把 is_sentence 的拼接整句锚定到它之上，
                 // 「冠状动脉粥样硬化性心脏病」又会被「罐装动脉…」压回去。

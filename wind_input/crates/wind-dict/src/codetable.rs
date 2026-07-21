@@ -1215,9 +1215,15 @@ mod tests {
             Some("original")
         );
         // 无声明 → 不告警
-        assert_eq!(parse_sort_header("---\nname: x\ncolumns: [text, code]\n...\n"), None);
+        assert_eq!(
+            parse_sort_header("---\nname: x\ncolumns: [text, code]\n...\n"),
+            None
+        );
         // 缩进的同名键属于别的映射，不算（与 columns: 同规则）
-        assert_eq!(parse_sort_header("---\nfoo:\n  sort: by_weight\n...\n"), None);
+        assert_eq!(
+            parse_sort_header("---\nfoo:\n  sort: by_weight\n...\n"),
+            None
+        );
         // 空值不触发
         assert_eq!(parse_sort_header("---\nsort:\n...\n"), None);
     }

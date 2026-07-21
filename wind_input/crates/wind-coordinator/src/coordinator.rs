@@ -2794,8 +2794,7 @@ impl Coordinator {
         // HashSet 迭代序不稳定，排序保证推送字节可复现。
         let mut vks: Vec<u32> = rt.jump_out_keys.iter().copied().collect();
         vks.sort_unstable();
-        let value =
-            wind_ipc::codec::encode_jump_out_keys_value(rt.jump_out_on_right_symbol, &vks);
+        let value = wind_ipc::codec::encode_jump_out_keys_value(rt.jump_out_on_right_symbol, &vks);
         let msg = wind_ipc::codec::encode_sync_config(
             wind_ipc::protocol::CONFIG_KEY_JUMP_OUT_KEYS,
             &value,
@@ -3284,7 +3283,9 @@ impl Coordinator {
 
         let entries = if reread.is_empty() {
             if self.system_phrase_path.is_some() {
-                warn!("恢复默认：重读 system.phrases.toml 为空（文件缺失或语法错误），沿用启动缓存");
+                warn!(
+                    "恢复默认：重读 system.phrases.toml 为空（文件缺失或语法错误），沿用启动缓存"
+                );
             }
             self.system_phrase_entries
                 .read()
@@ -5257,12 +5258,7 @@ fn first_show_timer() -> &'static Arc<FirstShowTimer> {
 
 impl FirstShowTimer {
     /// 覆盖式登记：新的 arm 直接顶掉旧的（与原先"旧线程靠 token 自行作废"等价）。
-    fn arm(
-        &self,
-        deadline: std::time::Instant,
-        token: u64,
-        coord: std::sync::Weak<Coordinator>,
-    ) {
+    fn arm(&self, deadline: std::time::Instant, token: u64, coord: std::sync::Weak<Coordinator>) {
         *self.pending.lock().unwrap_or_else(|e| e.into_inner()) = Some((deadline, token, coord));
         self.cv.notify_one();
     }
@@ -5350,10 +5346,7 @@ mod first_show_timer_tests {
 
         // 到期后待办应被取走（说明线程确实醒来处理了），且不 panic
         std::thread::sleep(Duration::from_millis(200));
-        assert!(
-            t.pending.lock().unwrap().is_none(),
-            "到期后待办应已被消费"
-        );
+        assert!(t.pending.lock().unwrap().is_none(), "到期后待办应已被消费");
     }
 }
 

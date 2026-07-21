@@ -44,11 +44,7 @@ pub enum EncodeError {
     /// 该字在码表词库中查不到任何码。**整词作废**，不做「跳过该字」的降级。
     MissingCode { ch: char },
     /// 该字的全码位数不够公式要求（如公式要第 2 码但该字只有 1 位码）。
-    CodeTooShort {
-        ch: char,
-        code: String,
-        need: usize,
-    },
+    CodeTooShort { ch: char, code: String, need: usize },
 }
 
 impl std::fmt::Display for EncodeError {
@@ -121,11 +117,7 @@ fn match_rule(rules: &[EncoderRule], word_len: usize) -> Option<&EncoderRule> {
 /// `code_of` 提供单字**全码**（见 `EngineManager::single_char_full_codes` 的全码判据：
 /// 码长上限闸 → 最长码长 → 权重降序 → 首次出现）。任一字取不到码即**整词作废**，
 /// 不做「跳过该字」的降级——那会把「你X好」算成「你好」的码，静默产出错词。
-pub fn calc_word_code<F>(
-    word: &str,
-    spec: &EncoderSpec,
-    code_of: F,
-) -> Result<String, EncodeError>
+pub fn calc_word_code<F>(word: &str, spec: &EncoderSpec, code_of: F) -> Result<String, EncodeError>
 where
     F: Fn(char) -> Option<String>,
 {
@@ -168,13 +160,14 @@ where
             }
         };
         // 码是 ASCII 键位串，但仍按 char 取以防方案用了非 ASCII 码位。
-        let piece = code.chars().nth(step.code_index).ok_or_else(|| {
-            EncodeError::CodeTooShort {
+        let piece = code
+            .chars()
+            .nth(step.code_index)
+            .ok_or_else(|| EncodeError::CodeTooShort {
                 ch,
                 code: code.clone(),
                 need: step.code_index,
-            }
-        })?;
+            })?;
         out.push(piece);
     }
     Ok(out)
@@ -238,10 +231,22 @@ mod tests {
         assert_eq!(
             steps,
             vec![
-                FormulaStep { char_index: 0, code_index: 0 },
-                FormulaStep { char_index: 0, code_index: 1 },
-                FormulaStep { char_index: 1, code_index: 0 },
-                FormulaStep { char_index: 1, code_index: 1 },
+                FormulaStep {
+                    char_index: 0,
+                    code_index: 0
+                },
+                FormulaStep {
+                    char_index: 0,
+                    code_index: 1
+                },
+                FormulaStep {
+                    char_index: 1,
+                    code_index: 0
+                },
+                FormulaStep {
+                    char_index: 1,
+                    code_index: 1
+                },
             ]
         );
     }
@@ -259,7 +264,10 @@ mod tests {
         assert!(parse_formula("AaB").is_none(), "奇数长度应判非法");
         assert!(parse_formula("aA").is_none(), "大小写颠倒应判非法");
         assert!(parse_formula("").is_none(), "空公式应判非法");
-        assert!(parse_formula("A字").is_none(), "非 ASCII 应判非法且不 panic");
+        assert!(
+            parse_formula("A字").is_none(),
+            "非 ASCII 应判非法且不 panic"
+        );
     }
 
     /// 二字词：各取前两码。你(wqiy)+好(vbg) → wq+vb = wqvb。

@@ -297,7 +297,10 @@ mod tests {
         let via_parse = Dict::parse(&std::fs::read(&p).unwrap()).expect("parse 应成功");
 
         assert_eq!(via_load.max_key_len, via_parse.max_key_len);
-        assert_eq!(via_load.strings, via_parse.strings, "字符串池必须逐字节一致");
+        assert_eq!(
+            via_load.strings, via_parse.strings,
+            "字符串池必须逐字节一致"
+        );
         assert_eq!(via_load.entries.len(), via_parse.entries.len());
         for (i, (a, b)) in via_load
             .entries

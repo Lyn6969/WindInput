@@ -590,10 +590,7 @@ path = "wb/main.dict.yaml"
         let plan = collect_package_files("wb", &user, Some(&system)).unwrap();
         let names: Vec<&str> = plan.pack.iter().map(|(n, _)| n.as_str()).collect();
         assert!(names.contains(&"wb/main.dict.yaml"));
-        assert!(
-            !names.contains(&"wb/main.wdat"),
-            "yaml 在场时不应改打 wdat"
-        );
+        assert!(!names.contains(&"wb/main.wdat"), "yaml 在场时不应改打 wdat");
     }
 
     /// 非词库资源不受 wdat 探测影响：缺失仍按原相对路径上报。

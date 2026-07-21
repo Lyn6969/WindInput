@@ -47,7 +47,7 @@ fn test_contracted_syllable_words_win_top1() {
     for (input, expect) in [
         ("xianjiaotongdaxue", "西安交通大学"), // xi|an|jiao|tong|da|xue (mm 给 xian|…)
         ("qietubiao", "企鹅图表"),             // qi|e|tu|biao       (mm 给 qie|…)
-        ("xinanchu", "心安处"),               // xin|an|chu         (mm 给 xi|nan|chu)
+        ("xinanchu", "心安处"),                // xin|an|chu         (mm 给 xi|nan|chu)
         ("woqinaide", "我亲爱的"),             // wo|qin|ai|de       (mm 给 wo|qi|nai|de)
     ] {
         let got = mgr
@@ -110,7 +110,11 @@ fn test_consumed_length_is_path_independent() {
         return;
     };
     let mgr = manager(&dir);
-    for (input, expect) in [("xianjiaotongdaxue", 17usize), ("qietubiao", 9), ("nihao", 5)] {
+    for (input, expect) in [
+        ("xianjiaotongdaxue", 17usize),
+        ("qietubiao", 9),
+        ("nihao", 5),
+    ] {
         let r = mgr.convert_with("pinyin", input, 10);
         let c = r.candidates.first().expect("应有候选");
         assert_eq!(c.consumed_length, expect, "{input} 的整句应消费全部输入");

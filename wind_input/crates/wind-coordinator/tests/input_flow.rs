@@ -3510,7 +3510,9 @@ fn auto_pair_quote_always_opens_new_pair() {
                 assert_eq!(text, "“”", "第 {round} 次按引号应插入完整一对");
                 assert_eq!(cursor_offset, 1, "第 {round} 次光标应落在配对中间");
             }
-            other => panic!("第 {round} 次按引号应插入配对（不得跳出/裸出单引号），实际: {other:?}"),
+            other => {
+                panic!("第 {round} 次按引号应插入配对（不得跳出/裸出单引号），实际: {other:?}")
+            }
         }
     }
 }
@@ -4059,7 +4061,11 @@ fn test_chinese_fullwidth_numpad_direct_no_caps() {
     for (vk, want) in [(0x60_u32, "０"), (0x65, "５"), (0x69, "９")] {
         match coord.handle_key_event(&key_event(vk, EVENT_KEY_DOWN)) {
             KeyAction::InsertText { text, .. } => {
-                assert_eq!(text, want, "中文全角小键盘(direct) vk=0x{:02X} 应出全角", vk)
+                assert_eq!(
+                    text, want,
+                    "中文全角小键盘(direct) vk=0x{:02X} 应出全角",
+                    vk
+                )
             }
             other => panic!("中文全角小键盘 vk=0x{:02X} 应出字，实际: {:?}", vk, other),
         }

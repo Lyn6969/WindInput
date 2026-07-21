@@ -59,8 +59,16 @@ fn test_useful_completions_still_float() {
         ("zhongguor", "中国人", "距离+1 w=21385"),
         ("beijingd", "北京大学", "距离+2 w=2010，阈值取1会被误杀"),
         ("jisuanjik", "计算机科学", "距离+2 w=1609，阈值取1会被误杀"),
-        ("zhonghuar", "中华人民共和国", "距离+5 w=3113，纯距离方案会被误杀"),
-        ("zhongguorenm", "中国人民解放军", "距离+4 w=252，与同距离的噪音仅靠weight区分"),
+        (
+            "zhonghuar",
+            "中华人民共和国",
+            "距离+5 w=3113，纯距离方案会被误杀",
+        ),
+        (
+            "zhongguorenm",
+            "中国人民解放军",
+            "距离+4 w=252，与同距离的噪音仅靠weight区分",
+        ),
         ("zhonghuarenmingongheg", "中华人民共和国", "距离+1 w=3113"),
     ] {
         let rank = rank_of(&mgr, "pinyin", input, want);

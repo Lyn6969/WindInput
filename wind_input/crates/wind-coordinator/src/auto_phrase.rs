@@ -109,8 +109,16 @@ impl AutoPhraseBuf {
 /// - 长于 `max` → **不造**。刻意不学 Go 的「取末尾 max 个字」——在连续 8 个字中间切一刀，
 ///   切出来的多半不是词，属于杂词的主要来源之一。宁可放过，不可错造。
 pub fn word_from_seq(seq: &[char], min: usize, max: usize) -> Option<String> {
-    let min = if min == 0 { DEFAULT_MIN_PHRASE_LEN } else { min };
-    let max = if max == 0 { DEFAULT_MAX_PHRASE_LEN } else { max };
+    let min = if min == 0 {
+        DEFAULT_MIN_PHRASE_LEN
+    } else {
+        min
+    };
+    let max = if max == 0 {
+        DEFAULT_MAX_PHRASE_LEN
+    } else {
+        max
+    };
     if seq.len() < min || seq.len() > max {
         return None;
     }
@@ -154,7 +162,10 @@ mod tests {
         let t = t0();
         b.on_commit("中", t, DEFAULT_IDLE_TIMEOUT);
         b.on_commit("国", t, DEFAULT_IDLE_TIMEOUT);
-        assert_eq!(b.on_commit("人民", t, DEFAULT_IDLE_TIMEOUT).unwrap(), vec!['中', '国']);
+        assert_eq!(
+            b.on_commit("人民", t, DEFAULT_IDLE_TIMEOUT).unwrap(),
+            vec!['中', '国']
+        );
         assert!(b.is_empty(), "多字词自身不得进入缓冲");
     }
 

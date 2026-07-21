@@ -75,8 +75,8 @@ fn test_zero_initial_split_suppressed() {
     };
     let mgr = manager(&dir);
     for (input, expect) in [
-        ("guotian", "过天"),   // 曾被切成 guo|ti|an → 过提案
-        ("hualong", "化龙"),   // 曾被切成 hu|a|long  → 和阿龙
+        ("guotian", "过天"),     // 曾被切成 guo|ti|an → 过提案
+        ("hualong", "化龙"),     // 曾被切成 hu|a|long  → 和阿龙
         ("lianfenxi", "链分析"), // 曾被切成 li|an|…   → 李安分析
     ] {
         assert_eq!(top1(&mgr, input), expect, "{input} 首选应为 {expect}");

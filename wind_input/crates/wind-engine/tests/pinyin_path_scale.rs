@@ -173,7 +173,12 @@ fn pinyin_path_scale_census() {
     ] {
         let c = hist.get(b).copied().unwrap_or(0);
         if c > 0 {
-            println!("  {:>8} 条路径: {:>7} 个输入 ({:.2}%)", b, c, c as f64 / n as f64 * 100.0);
+            println!(
+                "  {:>8} 条路径: {:>7} 个输入 ({:.2}%)",
+                b,
+                c,
+                c as f64 / n as f64 * 100.0
+            );
         }
     }
 
@@ -188,11 +193,16 @@ fn pinyin_path_scale_census() {
 
     println!("\n=== 平均查询次数（词典 search 调用/次转换）===");
     println!("  现状（单路径）: {:.2}", sum_mm as f64 / n as f64);
-    println!("  本实现（跨度枚举）: {:.2}  （放大 {:.2}x）",
+    println!(
+        "  本实现（跨度枚举）: {:.2}  （放大 {:.2}x）",
         sum_spans as f64 / n as f64,
         sum_spans as f64 / sum_mm.max(1) as f64
     );
-    println!("  朴素枚举路径总数: {} （平均 {:.1}/输入）", sum_paths, sum_paths as f64 / n as f64);
+    println!(
+        "  朴素枚举路径总数: {} （平均 {:.1}/输入）",
+        sum_paths,
+        sum_paths as f64 / n as f64
+    );
 
     // 最坏情况：人造长串。全由 1 字母音节 a/e/o 与其组合构成，歧义最密。
     println!("\n=== 最坏情况（人造）===");

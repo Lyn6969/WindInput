@@ -50,9 +50,9 @@ use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 use wind_config::Config;
+use wind_engine::EngineManager;
 use wind_engine::pinyin::dag::Dag;
 use wind_engine::pinyin::syllable::SyllableTrie;
-use wind_engine::EngineManager;
 
 // ---------------------------------------------------------------- 基础设施
 
@@ -164,7 +164,10 @@ fn read_dict(path: &Path, out: &mut Vec<(String, String, u64)>) {
         let (Some(text), Some(code)) = (it.next(), it.next()) else {
             continue;
         };
-        let weight = it.next().and_then(|w| w.trim().parse::<u64>().ok()).unwrap_or(0);
+        let weight = it
+            .next()
+            .and_then(|w| w.trim().parse::<u64>().ok())
+            .unwrap_or(0);
         out.push((text.to_string(), code.to_string(), weight));
     }
 }
@@ -213,7 +216,9 @@ fn read_unigram(path: &Path) -> HashMap<String, u64> {
         let mut it = line.split('\t');
         if let (Some(w), Some(f)) = (it.next(), it.next()) {
             if let Ok(f) = f.trim().parse::<u64>() {
-                m.entry(w.to_string()).and_modify(|v| *v = (*v).max(f)).or_insert(f);
+                m.entry(w.to_string())
+                    .and_modify(|v| *v = (*v).max(f))
+                    .or_insert(f);
             }
         }
     }
@@ -239,7 +244,11 @@ fn classify(
     }
 
     let true_syls: Vec<String> = code.split_whitespace().map(|s| s.to_string()).collect();
-    if true_syls.is_empty() || !true_syls.iter().all(|s| s.bytes().all(|b| b.is_ascii_lowercase())) {
+    if true_syls.is_empty()
+        || !true_syls
+            .iter()
+            .all(|s| s.bytes().all(|b| b.is_ascii_lowercase()))
+    {
         *reject.entry("non_plain_code").or_default() += 1;
         return None;
     }
@@ -396,7 +405,9 @@ fn decode_mask(code: &str, mask: u64) -> String {
     if mask == 0 {
         return "-".to_string();
     }
-    let mut starts: Vec<usize> = (0..code.len().min(64)).filter(|i| (mask >> i) & 1 == 1).collect();
+    let mut starts: Vec<usize> = (0..code.len().min(64))
+        .filter(|i| (mask >> i) & 1 == 1)
+        .collect();
     if starts.first() != Some(&0) {
         starts.insert(0, 0);
     }
@@ -520,7 +531,12 @@ fn pinyin_eval_report() {
                 }
                 top => {
                     let (top_text, top_code, top_syls, reason) = match top {
-                        None => (String::new(), String::new(), "-".to_string(), "no_candidate"),
+                        None => (
+                            String::new(),
+                            String::new(),
+                            "-".to_string(),
+                            "no_candidate",
+                        ),
                         Some(t) if t.code != s.input => (
                             t.text.clone(),
                             t.code.clone(),
@@ -594,7 +610,11 @@ fn pinyin_eval_report() {
             sc.total,
             Score::rate(sc.top1, sc.total) * 100.0,
             Score::rate(sc.top5, sc.total) * 100.0,
-            if sc.total == 0 { 0.0 } else { sc.mrr_sum / sc.total as f64 },
+            if sc.total == 0 {
+                0.0
+            } else {
+                sc.mrr_sum / sc.total as f64
+            },
             Score::rate(sc.seg_ok, sc.total) * 100.0,
             ms
         );
@@ -616,13 +636,23 @@ fn pinyin_eval_report() {
             sc.seg_misses.len(),
             v
         );
-        for m in sc.seg_misses.iter().filter(|m| m.reason == "wrong_split").take(dump) {
+        for m in sc
+            .seg_misses
+            .iter()
+            .filter(|m| m.reason == "wrong_split")
+            .take(dump)
+        {
             println!(
                 "  [切错] {:<24} 期望 {:<10} 真值 {:<28} 实选 {:<10} 切分 {:<28} mm {}",
                 m.input, m.expect, m.true_syls, m.top_text, m.top_syls, m.mm
             );
         }
-        for m in sc.seg_misses.iter().filter(|m| m.reason != "wrong_split").take(dump.min(15)) {
+        for m in sc
+            .seg_misses
+            .iter()
+            .filter(|m| m.reason != "wrong_split")
+            .take(dump.min(15))
+        {
             println!(
                 "  [{}] {:<22} 期望 {:<10} 真值 {:<28} 实选 {:<10} code {}",
                 m.reason, m.input, m.expect, m.true_syls, m.top_text, m.top_code
@@ -653,12 +683,19 @@ fn pinyin_eval_report() {
             diff_seg
         );
         println!("--- 其中「切分正确、仅选错同音词」的样本（前 {}）---", dump);
-        for m in sc.misses.iter().filter(|m| !seg_bad.contains(m.input.as_str())).take(dump) {
+        for m in sc
+            .misses
+            .iter()
+            .filter(|m| !seg_bad.contains(m.input.as_str()))
+            .take(dump)
+        {
             println!(
                 "  {:<24} 期望 {:<10} rank={:<5} 首选 {:<10} 真值 {}",
                 m.input,
                 m.expect,
-                m.rank.map(|r| r.to_string()).unwrap_or_else(|| "miss".into()),
+                m.rank
+                    .map(|r| r.to_string())
+                    .unwrap_or_else(|| "miss".into()),
                 m.got_top1,
                 m.true_syls
             );
@@ -672,7 +709,9 @@ fn pinyin_eval_report() {
                 "  {:<24} 期望 {:<10} rank={:<5} 首选 {:<10} uni={:<8} 真值 {} / mm {}",
                 m.input,
                 m.expect,
-                m.rank.map(|r| r.to_string()).unwrap_or_else(|| "miss".into()),
+                m.rank
+                    .map(|r| r.to_string())
+                    .unwrap_or_else(|| "miss".into()),
                 m.got_top1,
                 m.unigram,
                 m.true_syls,
@@ -704,7 +743,11 @@ fn pinyin_eval_report() {
             sc.total,
             Score::rate(sc.top1, sc.total),
             Score::rate(sc.top5, sc.total),
-            if sc.total == 0 { 0.0 } else { sc.mrr_sum / sc.total as f64 },
+            if sc.total == 0 {
+                0.0
+            } else {
+                sc.mrr_sum / sc.total as f64
+            },
             Score::rate(sc.seg_ok, sc.total),
             sc.top1,
             sc.top5,
@@ -717,12 +760,18 @@ fn pinyin_eval_report() {
                 "        {{ \"input\": \"{}\", \"expect\": \"{}\", \"rank\": {}, \"top1\": \"{}\", \"unigram\": {}, \"true_syls\": \"{}\", \"mm\": \"{}\" }}{}\n",
                 json_escape(&m.input),
                 json_escape(&m.expect),
-                m.rank.map(|r| r.to_string()).unwrap_or_else(|| "null".into()),
+                m.rank
+                    .map(|r| r.to_string())
+                    .unwrap_or_else(|| "null".into()),
                 json_escape(&m.got_top1),
                 m.unigram,
                 json_escape(&m.true_syls),
                 json_escape(&m.mm),
-                if k + 1 == sc.misses.len().min(dump) { "" } else { "," }
+                if k + 1 == sc.misses.len().min(dump) {
+                    ""
+                } else {
+                    ","
+                }
             );
         }
         j.push_str("      ]\n    }");
@@ -780,7 +829,12 @@ fn pinyin_eval_class_census() {
             }
             let e = examples.entry(s.class.key()).or_default();
             if e.len() < 20 {
-                e.push(format!("{}({} → {})", s.text, s.true_syls.join("|"), s.mm.join("|")));
+                e.push(format!(
+                    "{}({} → {})",
+                    s.text,
+                    s.true_syls.join("|"),
+                    s.mm.join("|")
+                ));
             }
         }
     }
@@ -801,13 +855,18 @@ fn pinyin_eval_class_census() {
     println!("\n=== 与设计文档「1110 条」对账 ===");
     println!(
         "「汉字数 > mm 音节数」共 {} 条（其中 unigram 收录 {}），按本 harness 判据分布: {:?}",
-        fewer_total, fewer_in_unigram, {
+        fewer_total,
+        fewer_in_unigram,
+        {
             let mut v: Vec<_> = fewer_by_class.iter().collect();
             v.sort();
             v
         }
     );
-    println!("「音节数相同但切法不同」共 {} 条（全部落在 C）", same_len_diff_split);
+    println!(
+        "「音节数相同但切法不同」共 {} 条（全部落在 C）",
+        same_len_diff_split
+    );
 
     let mut rj: Vec<_> = reject.iter().collect();
     rj.sort();
