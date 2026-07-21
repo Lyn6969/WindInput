@@ -58,6 +58,7 @@ impl Forwarder {
         match cmd {
             UiCommand::UpdateCandidates {
                 preedit,
+                preedit_caret,
                 mode_label,
                 candidates,
                 selected,
@@ -89,6 +90,7 @@ impl Forwarder {
                 };
                 self.win.update(
                     &preedit,
+                    preedit_caret,
                     &mode_label,
                     candidates,
                     selected,
@@ -329,6 +331,7 @@ mod tests {
         let mut f = mk(cap.clone(), "_t1");
         f.handle(UiCommand::UpdateCandidates {
             preedit: "a".into(),
+            preedit_caret: 1,
             mode_label: "".into(),
             candidates: vec![item("中"), item("国")],
             selected: 0,
@@ -358,6 +361,7 @@ mod tests {
         // 先显示一帧建 shm。
         f.handle(UiCommand::UpdateCandidates {
             preedit: "a".into(),
+            preedit_caret: 1,
             mode_label: "".into(),
             candidates: vec![item("中")],
             selected: 0,
