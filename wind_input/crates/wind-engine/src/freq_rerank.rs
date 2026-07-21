@@ -26,6 +26,12 @@ const PINYIN_FREQ_EPSILON: f64 = 10.0;
 
 /// 候选来源档位（数字越小越靠前）。五笔优先的硬约束：码表精确全码恒在拼音之上，
 /// 词频重排只在同档内调整。纯拼音/纯码表模式下同源候选档位相同，退化为按词频排序。
+///
+/// ⚠ 下面的 `c.code == input` 与 `Candidate::is_exact_code`（见 `wind_candidate::cmp_exact_first`）
+/// 是同一概念的两份判据，纯码表路径结论一致。未合并是因为本档位还承载词频语义（`is_phrase`
+/// 独占档 1、按来源分 Pinyin/English 档）。**改动任一处须同步核对另一处**——本函数的档位是
+/// `rerank_codetable_usedfirst` 的首要键，开启自动调频时会整体压过协调器的显示序，
+/// 也因此会掩盖 `is_exact_code` 的效果（验证精确匹配优先时须关闭自动调频）。
 fn freq_tier(c: &Candidate, input: &str) -> u8 {
     use wind_candidate::CandidateSource::*;
     if c.is_phrase {

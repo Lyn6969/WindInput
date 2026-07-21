@@ -8,7 +8,7 @@
 use crate::engine::{ConvertResult, Engine, EngineType, ExtendedEngine};
 use std::collections::HashSet;
 use std::sync::Arc;
-use wind_candidate::{Candidate, CandidateSource, better, by_natural};
+use wind_candidate::{Candidate, CandidateSource, better, by_natural, cmp_exact_first};
 use wind_dict::DictManager;
 
 /// 基础排序（`[engine.codetable].base_sort`）：候选**主排序维度**。
@@ -140,6 +140,8 @@ impl Engine for CodeTableEngine {
         for mut c in self.dm.search(input, limit) {
             if seen.insert(c.text.clone()) {
                 c.source = CandidateSource::CodeTable;
+                // 精确层级随候选流动，供协调器重排时沿用（见 `cmp_exact_first`）。
+                c.is_exact_code = c.code == input;
                 candidates.push(c);
             }
         }
@@ -150,6 +152,9 @@ impl Engine for CodeTableEngine {
             for mut c in self.dm.search_prefix(input, limit) {
                 if seen.insert(c.text.clone()) {
                     c.source = CandidateSource::CodeTable;
+                    // 前缀扫描也会命中输入自身（"usr".starts_with("usr")）。正常情况该条已被
+                    // 上面的精确循环占位去重，此处按 code 判定只为不依赖循环先后顺序。
+                    c.is_exact_code = c.code == input;
                     candidates.push(c);
                 }
             }
@@ -175,23 +180,21 @@ impl Engine for CodeTableEngine {
                 });
         }
 
-        // 基础排序维度：weight（默认，better）或 natural（by_natural，纯出现序、忽略权重）。
+        // 排序：精确匹配（code==input）优先，其内按基础维度 weight（默认，better）或
+        // natural（by_natural，纯出现序、忽略权重）。
+        //
+        // 精确优先必须是**常驻主键**而非仅截断时的临时分区：词组权重取自词频、单字权重取自
+        // 字频，两套量纲不可比，纯按权重排会让简码字沉底——如「新的」(usrq, 47487) 与
+        // 「新手」(usrt, 22229) 双双压过简码「新」(usr, 11777)，把它挤到第三位。
+        //
+        // 该层级同时落在 `Candidate::is_exact_code` 上随候选流动：协调器合并短语后会用
+        // `candidate_display_order` 无条件重排全部候选，只在此处排好而不落字段，下游重排即
+        // 按纯权重推翻本层结果（此前的实际行为）。两处共用 `cmp_exact_first` 这一个键。
         let base_cmp = self.opts.base_sort.cmp();
-        candidates.sort_by(base_cmp);
-        // 截断保护精确匹配：单字母等短输入下前缀候选可达数百，若纯按基础序截断，靠后的精确
-        // 全码（code==input，如五笔一/二级简码）会被前缀词组挤出配额而丢失（此后协调器
-        // 再排也找不回）。仅在超额时做一次「精确优先」稳定分区截断——精确候选必留、其余按
-        // base_cmp 序填满剩余配额——再恢复 base_cmp 显示序。不持久化 is_prefix：跨来源权重档位
-        // （混输码表 ÷100 拼音等）不受影响，纯码表显示序也维持基础排序主导。
-        if candidates.len() > max_candidates {
-            candidates.sort_by(|a, b| {
-                (a.code != input)
-                    .cmp(&(b.code != input))
-                    .then_with(|| base_cmp(a, b))
-            });
-            candidates.truncate(max_candidates);
-            candidates.sort_by(base_cmp);
-        }
+        candidates.sort_by(|a, b| cmp_exact_first(a, b).then_with(|| base_cmp(a, b)));
+        // 精确匹配已居首，截断不会再把它挤出配额（此前需一次临时分区保护：单字母等短输入下
+        // 前缀候选可达数百，纯按基础序截断会让低权重简码字丢失，此后协调器再排也找不回）。
+        candidates.truncate(max_candidates);
 
         // 编码提示(码表自身):前缀候选标注「剩余编码」=候选全码去掉已输入前缀(对齐 Go codetable.go)。
         // 精确候选(code==input)剩余为空 → 不标注。已有 comment 的候选不覆盖。
@@ -553,6 +556,39 @@ mod tests {
         let r = e.convert("ab", 50).unwrap();
         assert_eq!(r.candidates.len(), 1);
         assert!(r.completion_hint.is_none(), "有精确候选时不备补全");
+    }
+
+    #[test]
+    fn exact_match_outranks_higher_weight_prefix_words() {
+        // 真实现场（古精86五笔-深海词库）：简码 usr→「新」(11777)，前缀词组 usrq→「新的」(47487)、
+        // usrt→「新手」(22229)。词组权重取自词频、单字取自字频，两套量纲不可比——纯按权重排会把
+        // 简码「新」挤到第三位。精确匹配须恒居首，其后的前缀候选内部仍按权重降序。
+        let e = engine_opts(
+            &[
+                ("usr", "新", 11777),
+                ("usrq", "新的", 47487),
+                ("usrt", "新手", 22229),
+                ("usrp", "亲近", 1861),
+            ],
+            CommitOptions::default(),
+        );
+        let r = e.convert("usr", 50).unwrap();
+        let order: Vec<&str> = r.candidates.iter().map(|c| c.text.as_str()).collect();
+        assert_eq!(
+            order,
+            vec!["新", "新的", "新手", "亲近"],
+            "精确匹配应居首、其余按权重降序"
+        );
+        // 该层级必须落到字段上随候选流动：协调器合并短语后会无条件重排，只在引擎内排好而
+        // 不标记，下游会按纯权重把结果推翻（本 bug 的原始成因）。
+        assert!(
+            r.candidates[0].is_exact_code,
+            "精确候选须标记 is_exact_code 供协调器重排沿用"
+        );
+        assert!(
+            r.candidates[1..].iter().all(|c| !c.is_exact_code),
+            "前缀补全候选不应被标记为精确匹配"
+        );
     }
 
     #[test]

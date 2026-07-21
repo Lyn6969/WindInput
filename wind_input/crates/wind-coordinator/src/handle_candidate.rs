@@ -18,7 +18,13 @@ use wind_ui::manager::CandidateOp;
 
 /// 候选统一层级排序（合并引擎候选 + 短语后的呈现序，与所选 `base_sort` 模式**同维度**）：
 /// ① 非模糊优先于模糊；② 精确优先于前缀补全（`is_prefix`）；③ 完整匹配优先于子短语（`is_partial`）；
-/// ④ 同层内按权重降序（`ignore_weight` 时跳过）；⑤ 词库基序（`base_order`）升序；⑥ 自然序升序。
+/// ④ 同层内编码精确匹配优先（`is_exact_code`）；⑤ 按权重降序（`ignore_weight` 时跳过）；
+/// ⑥ 词库基序（`base_order`）升序；⑦ 自然序升序。
+///
+/// - `is_exact_code` 不可少：码表引擎已把「精确匹配优先」排好，但本函数会**无条件重排全部候选**，
+///   若不复刻该键，引擎结果会在这里被按纯权重推翻——码表词组权重取自词频、单字取自字频，量纲
+///   不可比，「新的」(usrq, 47487) 会压过简码「新」(usr, 11777)。须置于 `cmp_match_layers` 之后：
+///   精确优先只在同匹配层内生效，短语（`is_prefix=true` + 40M 权重）仍留在其下层不受提拔。
 ///
 /// - `is_partial` 不可少：混输 ÷100 压缩权重后，高权重子串单字（平 w=58 is_partial=true）会靠
 ///   weight 反超低权重精确词组（平摊 w=4 is_partial=false）；且须在 `is_prefix` 之后（对齐 PinyinEngine）。
@@ -48,6 +54,7 @@ fn candidate_display_order(
         b.weight.cmp(&a.weight)
     };
     wind_candidate::cmp_match_layers(a, b)
+        .then_with(|| wind_candidate::cmp_exact_first(a, b))
         .then(by_weight)
         .then(a.base_order.cmp(&b.base_order))
         .then(a.natural_order.cmp(&b.natural_order))
@@ -391,6 +398,11 @@ impl Coordinator {
                     // 非命令短语 phrase_template 存原始记录文本（source_text，模板未展开），
                     // 供右键「禁用短语」按 (code, 原文) 定位 store 记录（对齐 Go PhraseTemplate）。
                     is_command,
+                    // `lookup` 查的是**精确码短语**（短语编码与输入完全相等），按定义即精确匹配，
+                    // 须与码表精确候选同层竞争（其内靠 PHRASE_WEIGHT_BASE 居前）。漏标会被
+                    // `cmp_exact_first` 压到码表精确候选之下——如短语 skce 会输给五笔「可能」(skce)。
+                    // 下面 `lookup_prefix` 的前缀枚举则不标，留在精确层之下。
+                    is_exact_code: true,
                     phrase_template: hit.command_src.unwrap_or(hit.source_text),
                     meta: CandidateMeta {
                         is_system_phrase: is_system,
@@ -442,6 +454,11 @@ impl Coordinator {
                         weight: PHRASE_WEIGHT_BASE + hit.weight,
                         is_phrase: true,
                         is_command: true,
+                        // 引导键导航候选恒属精确档：用户正是按引导键**为了**看到它们，不该被
+                        // 码表单字preempt。此前靠「不设任何层级标志」隐式待在精确层（与下面的
+                        // 静态短语分支显式设 is_prefix 形成对照），`cmp_exact_first` 引入后该隐式
+                        // 安排失效，须显式标出。$SS/$AA 组分支同理。
+                        is_exact_code: true,
                         phrase_template: src,
                         group_code: code,
                         comment: hit.comment,
@@ -456,6 +473,8 @@ impl Coordinator {
                         weight: PHRASE_WEIGHT_BASE + hit.weight,
                         is_phrase: true,
                         is_group: true,
+                        // 引导键导航候选恒属精确档，理由同上面的 $CC 分支。
+                        is_exact_code: true,
                         group_code: code,
                         group_name: text,
                         comment: hit.comment,
@@ -2140,5 +2159,67 @@ mod finalize_candidates_tests {
             n[0].text, "主低",
             "natural 模式忽略权重、按 base_order 升序，主库应靠前"
         );
+    }
+
+    /// 回归：码表精确匹配须先于高权重前缀词组，且该优先级**不得跨匹配层提拔**。
+    ///
+    /// 复刻 usr 现场（古精86五笔）：简码「新」(usr, 11777) vs 前缀词组「新的」(usrq, 47487)。
+    /// 引擎已排好序，但本函数会无条件重排全部候选——若不复刻 `is_exact_code` 键，引擎结果
+    /// 会在这里被按纯权重推翻（原始 bug）。同时验证短语（`is_prefix=true` + 40M 权重）仍留在
+    /// 精确层之下，不因本键而上浮。
+    #[test]
+    fn exact_code_outranks_prefix_but_stays_within_match_layer() {
+        let exact = Candidate {
+            text: "新".into(),
+            code: "usr".into(),
+            weight: 11777,
+            // natural_order 拉开档次，使 ignore_weight（natural 模式）下精确档内也有确定序，
+            // 否则平局落到稳定排序取输入序，断言会随入表顺序漂移。
+            natural_order: 10,
+            is_exact_code: true,
+            ..Default::default()
+        };
+        let prefix_word = Candidate {
+            text: "新的".into(),
+            code: "usrq".into(),
+            weight: 47487,
+            natural_order: 20,
+            ..Default::default()
+        };
+        // 前缀枚举短语：is_prefix=true 使其落在更低匹配层，40M 权重也不应把它拉到精确候选之上。
+        let prefix_phrase = Candidate {
+            text: "短语".into(),
+            weight: PHRASE_WEIGHT_BASE,
+            is_phrase: true,
+            is_prefix: true,
+            ..Default::default()
+        };
+        // 引导键导航候选（$SS/$AA 组）：三个匹配层标志均为 false，改动前靠 40M 权重隐式居首。
+        // 须显式属精确档，否则会被每一条码表精确候选压下去——用户按引导键时首选会变成五笔单字。
+        let guide_group = Candidate {
+            text: "组名".into(),
+            weight: PHRASE_WEIGHT_BASE,
+            is_phrase: true,
+            is_group: true,
+            is_exact_code: true,
+            ..Default::default()
+        };
+        for ignore_weight in [false, true] {
+            // 故意以「最不利」的顺序放入，确保结果由排序而非原序决定。
+            let mut cands = vec![
+                prefix_phrase.clone(),
+                prefix_word.clone(),
+                exact.clone(),
+                guide_group.clone(),
+            ];
+            cands.sort_by(|a, b| candidate_display_order(a, b, ignore_weight));
+            let order: Vec<&str> = cands.iter().map(|c| c.text.as_str()).collect();
+            assert_eq!(
+                order,
+                vec!["组名", "新", "新的", "短语"],
+                "引导键候选与精确匹配同档(其内 40M 权重居前)、前缀词组次之、\
+                 低匹配层短语垫底（ignore_weight={ignore_weight}）"
+            );
+        }
     }
 }

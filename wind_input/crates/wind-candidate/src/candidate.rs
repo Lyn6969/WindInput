@@ -82,6 +82,30 @@ pub struct Candidate {
     /// 完整词之间（如 baoan 时「报/宝」塞在「保安」「报案」之间）。对齐 Go 的 coverage
     /// 分层：完整覆盖输入的词恒先于只覆盖部分输入的子短语单字。
     pub is_partial: bool,
+    /// 是否属于**精确匹配档**：候选 `code` 与本次输入完全相等（如五笔简码 `usr`→「新」），
+    /// 区别于编码更长的前缀补全（`usrq`→「新的」）。排序时精确档整体先于前缀补全。
+    ///
+    /// **谁置位**（新增候选来源时须对照，漏标 = 被压到精确候选之下，且编译器抓不到）：
+    /// - 码表引擎 `CodeTableEngine::convert`：按 `code == input` 置位，覆盖文件词库/用户词/临时词
+    ///   （它们都经 `dm.search`/`dm.search_prefix` 返回）及薄封装的英文引擎；
+    /// - 混输 overflow 分支：以**完整输入**重新归一（其码表半边是按前 N 码查的）；
+    /// - 协调器精确码短语（`phrases.lookup`）：按定义即精确匹配；
+    /// - 协调器引导键导航候选（`$CC`/`$SS`/`$AA` 前缀命中）：**按既有设计恒置顶**而非因编码相等，
+    ///   用户正是按引导键为了看到它们。这是本字段唯一的「非 code==input」成员，故字段语义取
+    ///   「精确**档**」而非字面的「编码相等」。
+    /// - 拼音引擎不置位：混输下码表精确恒先于拼音（与 `freq_rerank::freq_tier` 的档位设计一致）；
+    ///   纯拼音模式全体为 `false`，本键退化为无操作。
+    ///
+    /// **为何不复用 `is_prefix`**：该字段已被自定义短语借作「非精确层」标记（协调器
+    /// `build_candidates` 中短语恒 `is_prefix=true` 且带 `PHRASE_WEIGHT_BASE`=40M）。若给码表
+    /// 前缀候选也标 `is_prefix`，短语会与码表词组落进同层，靠 40M 权重整体浮到词组之上——
+    /// 一个字段承担两种含义，复用即耦合两件无关的事。
+    ///
+    /// **为何需要独立层级而非靠权重**：词组权重来自词频、单字权重来自字频，两套量纲不可比。
+    /// 「新的」(usrq, 47487) 纯按权重会压过简码「新」(usr, 11777)，把简码字挤到第三位——
+    /// 跨类别比 weight，比的其实是类别。
+    #[serde(default)]
+    pub is_exact_code: bool,
     /// 是否为**引擎合成的整句解**（Viterbi 多词拼接，或超长词典整词的等价整句分）。
     ///
     /// 语义 = "这是引擎对整串输入的最优解读"，词频重排（`freq_rerank`）据此把它连同
@@ -138,6 +162,7 @@ impl Default for Candidate {
             is_fuzzy: false,
             is_prefix: false,
             is_partial: false,
+            is_exact_code: false,
             is_sentence: false,
             consumed_length: 0,
             boundary: 0,
@@ -174,6 +199,29 @@ pub fn cmp_match_layers(a: &Candidate, b: &Candidate) -> std::cmp::Ordering {
         .cmp(&b.is_fuzzy)
         .then(a.is_prefix.cmp(&b.is_prefix))
         .then(a.is_partial.cmp(&b.is_partial))
+}
+
+/// 候选「精确匹配档优先」比较（`is_exact_code` 降序）。
+///
+/// 与 `cmp_match_layers` 分设：后者表达「匹配质量层级」（模糊/前缀/子短语），本函数表达
+/// 「是否属于精确档」，两者正交。
+///
+/// **必须两处共用**：码表引擎排完序后，协调器合并短语时还会用 `candidate_display_order`
+/// 无条件重排全部候选。若只在引擎内排好而不落到 `Candidate::is_exact_code` 字段上，下游重排
+/// 无从得知谁是精确匹配，只能按纯权重重来，引擎的结果被静默推翻——本函数即为修此断层而抽出。
+///
+/// **两处调用位置不同，是有意为之**：
+/// - 协调器 `candidate_display_order`：置于 `cmp_match_layers` **之后**、权重之前——精确优先
+///   只在同一匹配层内生效，不跨层提拔（`is_prefix=true` 的静态短语前缀枚举仍留在下层）。
+/// - 码表引擎 `CodeTableEngine::convert`：作**顶层首要键**，不叠 `cmp_match_layers`。因其基础
+///   排序器 `better`/`by_natural` 本就不含匹配层级，贸然引入会改变用户词（`store_layer` 会设
+///   `is_prefix`）与文件词库候选的既有相对序，超出本键的职责范围。
+///
+/// **另有一份同概念判据**：`wind_engine::freq_rerank::freq_tier` 的 `code == input`（码表档位）。
+/// 二者在纯码表路径结论一致；未合并是因为 `freq_tier` 只在开启自动调频时参与，且其档位划分
+/// 还承载词频语义。改动任一处时须同步核对另一处。
+pub fn cmp_exact_first(a: &Candidate, b: &Candidate) -> std::cmp::Ordering {
+    b.is_exact_code.cmp(&a.is_exact_code)
 }
 
 /// 比较两个候选词的排序优先级（权重降序）

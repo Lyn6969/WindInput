@@ -351,6 +351,15 @@ impl MixedEngine {
                     .unwrap_or_default();
                 codetable.extend(full.candidates);
             }
+            // `is_exact_code` 归一到**完整输入**：上面两次 convert 分别以 prefix 和 input 为输入，
+            // 码表引擎按各自的输入串置位，于是同一个 Vec 里混着两种「精确」定义。而下游一律以
+            // 完整输入为准（协调器 `candidate_display_order`、`freq_rerank::freq_tier` 的
+            // `code == input`），不归一会让只匹配前缀的候选被提拔进精确档。
+            // 注意与紧随其后的 `boost_codetable(.., &prefix)` 判据不同：那是混输自身的权重档策略
+            // （前 N 码视作全码加权），与「候选编码是否等于本次输入」是两回事，不可合并。
+            for c in &mut codetable {
+                c.is_exact_code = c.code == input;
+            }
             self.boost_codetable(&mut codetable, &prefix);
             // 英文候选（enable_english 开时）：独立加权档并入码表位，与拼音一同竞争。
             codetable.extend(self.english_candidates(input, max_candidates));
