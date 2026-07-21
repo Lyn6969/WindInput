@@ -174,6 +174,16 @@ pub struct SegGraph {
     edges: Vec<Vec<usize>>,
     /// 从 0 可达的位置
     reachable: Vec<bool>,
+    /// ambiguous[j] = 从 j 出发、且**处在歧义接缝上**的音节终点（升序）。
+    ///
+    /// 判据（照搬 librime `Syllabifier::CheckOverlappedSpellings`，
+    /// `ref/weasel/librime/src/rime/algo/syllabifier.cc:243-276`）：
+    /// 若存在 p 使得 `p→j`、`j→q`、`p→q` 三条边同时成立（即整段 `Z` 又能拆成 `Y+X`），
+    /// 则 j 是歧义接缝，**后半段** `j→q` 被标记。
+    ///
+    /// 例：`lian` = `li`+`an` → 边 `an`(2→4) 歧义；`hua` = `hu`+`a` → 边 `a` 歧义。
+    /// 这正是 A 类 13 条回归的全部形态（`ye|xi|an`、`guo|ti|an`、`hu|a|long`）。
+    ambiguous: Vec<Vec<usize>>,
     len: usize,
 }
 
@@ -201,9 +211,28 @@ impl SegGraph {
                 }
             }
         }
+        // 歧义接缝普查：三重循环但每层度数极小（一个位置至多几条音节边），
+        // 实测规模远小于词典查询开销。
+        let mut ambiguous: Vec<Vec<usize>> = vec![Vec::new(); len + 1];
+        for p in 0..=len {
+            let Some(from_p) = edges.get(p) else { continue };
+            for &j in from_p {
+                let Some(from_j) = edges.get(j) else { continue };
+                for &q in from_j {
+                    // p→q 也是一条边 ⇒ 整段 `Z` 又能拆成 `Y+X` ⇒ j 是歧义接缝
+                    if from_p.binary_search(&q).is_ok() && !ambiguous[j].contains(&q) {
+                        ambiguous[j].push(q);
+                    }
+                }
+            }
+        }
+        for v in ambiguous.iter_mut() {
+            v.sort_unstable();
+        }
         Self {
             edges,
             reachable,
+            ambiguous,
             len,
         }
     }
@@ -255,6 +284,27 @@ impl SegGraph {
 
     fn has_edge(&self, p: usize, q: usize) -> bool {
         self.edges_from(p).binary_search(&q).is_ok()
+    }
+
+    /// 音节边 `p→q` 是否处在歧义接缝上（见 `ambiguous` 字段）。
+    pub fn is_ambiguous_edge(&self, p: usize, q: usize) -> bool {
+        self.ambiguous
+            .get(p)
+            .map(|v| v.binary_search(&q).is_ok())
+            .unwrap_or(false)
+    }
+
+    /// 一条切分（各音节起点相对 `p` 的偏移，跨度 `p..q`）中处在歧义接缝上的音节数。
+    pub fn ambiguous_count(&self, p: usize, q: usize, offsets: &[usize]) -> usize {
+        let mut n = 0;
+        for (i, &o) in offsets.iter().enumerate() {
+            let s = p + o;
+            let e = offsets.get(i + 1).map(|&x| p + x).unwrap_or(q);
+            if self.is_ambiguous_edge(s, e) {
+                n += 1;
+            }
+        }
+        n
     }
 
     /// 从 p 出发、经 1..=`max_edges` 条边可达的全部终点（升序去重）。

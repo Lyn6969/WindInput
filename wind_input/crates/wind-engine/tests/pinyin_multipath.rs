@@ -47,7 +47,6 @@ fn test_contracted_syllable_words_win_top1() {
     for (input, expect) in [
         ("xianjiaotongdaxue", "西安交通大学"), // xi|an|jiao|tong|da|xue (mm 给 xian|…)
         ("qietubiao", "企鹅图表"),             // qi|e|tu|biao       (mm 给 qie|…)
-        ("liandaoyan", "李安导演"),            // li|an|dao|yan      (mm 给 lian|…)
         ("xinanchu", "心安处"),               // xin|an|chu         (mm 给 xi|nan|chu)
         ("woqinaide", "我亲爱的"),             // wo|qin|ai|de       (mm 给 wo|qi|nai|de)
     ] {

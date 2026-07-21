@@ -68,6 +68,30 @@ fn is_particle_suffix(c: char) -> bool {
     matches!(c, '了' | '的' | '着' | '过' | '得' | '地')
 }
 
+/// 每个词的固定惩罚，对应 librime `Grammar::Evaluate` 的 `kPenalty`
+/// （`ref/weasel/librime/src/rime/gear/grammar.h:18-26`）。
+///
+/// 取值远小于 librime 的 18.42：两边**同为自然对数概率、量纲一致**（已核对），
+/// 差异来自机制而非单位——librime 的 `kPenalty` 是**无语言模型时的兜底值**，有
+/// grammar 时整个被替换掉；我们始终有 unigram，且 `score_node` 另有单字罚 −3.0、
+/// 实词加成等项同时作用，等效的「多一个词」代价不止这一处。
+pub(crate) const WORD_PENALTY: f64 = 3.0;
+
+/// 歧义接缝上每个音节的惩罚，对应 librime `kPenaltyForAmbiguousSyllable`
+/// （`ref/weasel/librime/src/rime/algo/syllabifier.cc:243-245`）。
+///
+/// librime 用 −23.03（1e-10）近乎硬禁，因其以隔音符号为消歧出口；我们不引入那套
+/// 产品语义（§4.1 实测：Rime 中缩合音词在候选层仍是第 4/5 位），故取「恰好压过
+/// 歧义拆分的收益」的量级即可。
+///
+/// **0.35 是一个刀刃值，改动前务必重跑 `pinyin_eval` 的定点**：≤0.30 时
+/// `lianzhengtixing` 退回「李安整体性」（本次改造的原始缺陷）；≥0.5 时
+/// `liandaoyan` 劣化为「连导演」。**聚合指标在 0.30~0.35 之间完全不变**，
+/// 这两个定点是仅有的差异——因为它们是同一个词、同一个 `li|an` 拆分、同一个
+/// 歧义接缝，切分层没有可区分二者的信息。真正的区分需要 bigram 上下文
+/// （`lm.rs:327-337` 已实现插值，缺磁盘语料）。
+pub(crate) const AMBIGUOUS_PENALTY: f64 = 0.35;
+
 /// 节点对数概率打分（对齐 Go lattice calcLogProb + 惩罚/加成）。
 /// 无 unigram 时回退到归一化词典权重。
 ///
@@ -123,6 +147,10 @@ pub(crate) fn score_node(word: &str, weight: i32, unigram: Option<&dyn UnigramLo
     if weight <= 0 {
         log_prob -= 10.0;
     }
+    // Phase 4：每词固定罚。Viterbi 的路径分是各节点 log_prob 之和，故「每节点减 W」
+    // 等价于「按路径词数罚 k·W」——把低频词打碎成两个高频片段不再免费。
+    // 也施加于 mod.rs step 1.5 的「单节点等价整句分」（那是一句一词，罚一次，量纲一致）。
+    log_prob -= WORD_PENALTY;
     log_prob
 }
 
@@ -219,7 +247,8 @@ impl LatticeBuilder {
                         },
                         MaskCheck::Reject => continue,
                     };
-                    let log_prob = score_node(&hit.text, hit.weight, unigram);
+                    let log_prob = score_node(&hit.text, hit.weight, unigram)
+                        - AMBIGUOUS_PENALTY * graph.ambiguous_count(p, q, &offsets) as f64;
                     nodes[q].push(LatticeNode {
                         start: p,
                         end: q,
@@ -253,7 +282,11 @@ impl LatticeBuilder {
                             if nodes[q].iter().any(|n| n.word == *text && n.start == p) {
                                 continue;
                             }
-                            let log_prob = score_node(text, *weight, unigram) - 0.5; // 模糊匹配轻微惩罚
+                            // 模糊命中同样按图上那条标注路径计歧义罚：惩罚是**切分**的
+                            // 属性（该路径是否踩在歧义接缝上），与词条来源无关。
+                            let log_prob = score_node(text, *weight, unigram)
+                                - 0.5 // 模糊匹配轻微惩罚
+                                - AMBIGUOUS_PENALTY * graph.ambiguous_count(p, q, &offsets) as f64;
                             nodes[q].push(LatticeNode {
                                 start: p,
                                 end: q,
