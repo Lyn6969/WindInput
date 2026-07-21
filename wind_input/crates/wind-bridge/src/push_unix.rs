@@ -62,7 +62,13 @@ fn handle_push_conn(mut stream: UnixStream, clients: Arc<Mutex<Vec<PushClient>>>
     let (tx, rx) = mpsc::channel::<Vec<u8>>();
     {
         let mut c = clients.lock().unwrap();
-        c.push(PushClient { token, tx });
+        // hooked: unix 侧不注册 connected_hook（host-render 是 Windows 专属），
+        // 置 false 与 Windows 语义一致——若将来接入 hook，补跑逻辑自动覆盖。
+        c.push(PushClient {
+            token,
+            tx,
+            hooked: false,
+        });
     }
     // 4. writer loop
     let mut writer = stream;

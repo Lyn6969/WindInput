@@ -32,6 +32,44 @@ pub(crate) struct PushClient {
     pub(crate) token: u64,
     /// 发送通道（writer 线程独占管道句柄）
     pub(crate) tx: std::sync::mpsc::Sender<Vec<u8>>,
+    /// 是否已触发过 connected_hook。
+    ///
+    /// 存在的意义是**跨越 hook 注册时刻**：`start()` 在 main.rs 早期就开始 accept，而
+    /// `set_client_connected_hook` 要等 Coordinator 构造完才注册（实测窗口约 230ms）。
+    /// 窗口内完成握手的客户端曾被静默跳过——对 SearchHost 这类 locked/transient DocMgr
+    /// 宿主是致命的：它既不发 FOCUS_GAINED 也不重发 IME_ACTIVATED，hook 是它拿到
+    /// activation push 的**唯一**通路，丢一次即永久停留本地渲染（开始菜单候选窗被压在后面）。
+    /// 该标志让 hook 注册时能精确补跑这批客户端，且与连接线程的自发触发互斥去重。
+    pub(crate) hooked: bool,
+}
+
+/// 认领指定 token 的 hook 触发权：返回 `true` 表示本次调用赢得认领、应触发回调。
+///
+/// 连接线程与 `set_client_connected_hook` 的补跑可能同时盯上同一个客户端
+/// （客户端已注册进表、但尚未走到自己的 hook 调用点），认领保证恰好触发一次。
+/// 客户端若已断开出表则返回 `false`——不给死连接推帧。
+fn claim_connected_hook(clients: &Mutex<Vec<PushClient>>, token: u64) -> bool {
+    let mut guard = clients.lock().unwrap();
+    match guard.iter_mut().find(|c| c.token == token) {
+        Some(c) if !c.hooked => {
+            c.hooked = true;
+            true
+        }
+        _ => false,
+    }
+}
+
+/// 认领全部未触发过 hook 的客户端，返回其 token 列表。
+fn claim_all_unhooked(clients: &Mutex<Vec<PushClient>>) -> Vec<u64> {
+    let mut guard = clients.lock().unwrap();
+    guard
+        .iter_mut()
+        .filter(|c| !c.hooked)
+        .map(|c| {
+            c.hooked = true;
+            c.token
+        })
+        .collect()
 }
 
 /// push 客户端完成 token 握手注册后的回调（参数 = 客户端 token，高 32 位为 PID）。
@@ -59,8 +97,29 @@ impl PushServer {
     }
 
     /// 注入客户端注册回调（幂等覆盖）。回调在 push accept 线程执行，须自身线程安全且轻量。
+    ///
+    /// **注册时会对已连接但未触发过回调的客户端补跑一次**：`start()` 早于本方法数百毫秒
+    /// 开始 accept，这期间完成握手的客户端此前被静默丢弃（见 `PushClient::hooked`）。
+    ///
+    /// 锁序固定为 `connected_hook` → `clients`，与连接线程的触发路径一致，不会反转。
+    /// 回调在持 `connected_hook` 锁期间执行（与连接线程同构）——回调内只准取 `clients` 锁，
+    /// 不得回调本方法。
     pub fn set_client_connected_hook(&self, hook: ClientConnectedHook) {
-        *self.connected_hook.lock().unwrap() = Some(hook);
+        let mut guard = self.connected_hook.lock().unwrap();
+        *guard = Some(hook);
+
+        let pending = claim_all_unhooked(&self.clients);
+        if !pending.is_empty() {
+            info!(
+                "connected_hook 注册：补跑 {} 个早于注册完成握手的 push 客户端",
+                pending.len()
+            );
+            if let Some(hook) = guard.as_ref() {
+                for token in pending {
+                    hook(token);
+                }
+            }
+        }
     }
 
     /// 定向投递给指定 token 的客户端（精确匹配，无兜底无广播）。返回是否命中。
@@ -277,86 +336,128 @@ fn run_push_pipe_server(
 
         debug!("Push client connected to push pipe");
 
-        // 与 Go 版对齐：先发送 CMD_SERVICE_READY，再读取 token。
-        // Go 的 push pipe 在 ConnectNamedPipe 后立即写 SERVICE_READY，
-        // C++ 端 AsyncReader 收到后触发 _DoFullStateSync(WM_SERVICE_READY)。
-        let ready_msg = IpcHeader::new(CMD_SERVICE_READY, 0).to_bytes().to_vec();
+        // 握手（写 SERVICE_READY + 读 8 字节 token）**必须离开 accept 循环**。
+        //
+        // 二者都是无超时阻塞调用，而它们执行期间管道名下**没有任何监听实例**——
+        // 此刻敲门的客户端拿到的是 ERROR_FILE_NOT_FOUND，白扣一次重试机会。
+        // DLL 侧 `_StartAsyncReader` 只试 3 次就 `return FALSE` 永久放弃，且
+        // **重连逻辑活在它没能创建的 async reader 线程里**，于是一次失手 = 终身失联，
+        // 之后服务重启多少次它都感知不到（IPCClient.cpp:1940-2021）。
+        // 开机/服务重启时 20+ 个宿主 DLL 在数十毫秒内齐冲这条管道，输掉的那个
+        // 就此停在无 push 状态——实测 SearchHost 中招后 HostRender 再不激活，
+        // 开始菜单候选窗永久压在菜单后方（2026-07-21 定位）。
+        //
+        // 交给独立线程后：accept 循环立刻回到 CreateNamedPipe，监听实例常驻；
+        // 慢客户端最多拖住自己那一个线程，拖不住别人的接纳。
+        let clients_c = clients.clone();
+        let hook_c = connected_hook.clone();
+        let pipe = PipeHandle(pipe_handle);
+        if let Err(e) = std::thread::Builder::new()
+            .name("push-handshake".into())
+            .spawn(move || serve_push_client(pipe, clients_c, hook_c))
         {
-            let mut bytes_written: u32 = 0;
-            let write_ok = unsafe {
-                WriteFile(
-                    pipe_handle,
-                    Some(&ready_msg),
-                    Some(&mut bytes_written),
-                    None,
-                )
-            };
-            if write_ok.is_err() {
-                warn!("Failed to send SERVICE_READY to push client");
-                unsafe {
-                    let _ = DisconnectNamedPipe(pipe_handle);
-                    let _ = CloseHandle(pipe_handle);
-                }
-                continue;
-            }
-        }
-        debug!("Sent SERVICE_READY to push client");
-
-        // 读取客户端 token（8 字节）
-        let mut token_buf = [0u8; 8];
-        let mut bytes_read: u32 = 0;
-        let read_ok = unsafe {
-            ReadFile(
-                pipe_handle,
-                Some(&mut token_buf),
-                Some(&mut bytes_read),
-                None,
-            )
-        };
-
-        if read_ok.is_err() || bytes_read != 8 {
-            warn!("Failed to read push client token");
+            error!("spawn push-handshake 线程失败: {e}；关闭该连接");
             unsafe {
                 let _ = DisconnectNamedPipe(pipe_handle);
                 let _ = CloseHandle(pipe_handle);
             }
-            continue;
-        }
-
-        let token = u64::from_le_bytes(token_buf);
-        debug!("Push client token: 0x{:016X}", token);
-
-        // 创建发送通道
-        let (tx, rx) = std::sync::mpsc::channel::<Vec<u8>>();
-
-        // 注册客户端（不持有 pipe handle，writer 线程独占）
-        let client = PushClient { token, tx };
-
-        {
-            let mut clients = clients.lock().unwrap();
-            // 清理同 token 的旧连接
-            clients.retain(|c| c.token != token);
-            clients.push(client);
-        }
-
-        // 将 pipe handle 移交给 writer 线程（包装为 PipeHandle 以满足 Send）
-        let clients_clone = clients.clone();
-        let pipe = PipeHandle(pipe_handle);
-        std::thread::Builder::new()
-            .name("push-writer".into())
-            .spawn(move || {
-                push_writer_loop(pipe, rx, token, clients_clone);
-            })
-            .ok();
-
-        // 注册完成后回调（发送经 tx 入队，writer 线程稍后写出，顺序安全）。
-        // 用途：host-render 白名单宿主（transient DocMgr，如 SearchHost）服务重启重连时
-        // 既不发 focus_gained 也不重发 IME_ACTIVATED，无任何 activation push 会到达 →
-        // DLL 永不重新 setup。由 coordinator 在此回调中定向补推握手帧。
-        if let Some(hook) = connected_hook.lock().unwrap().as_ref() {
-            hook(token);
         }
     }
+}
+
+/// 单个 push 客户端的完整生命周期：握手 → 注册 → 触发 connected_hook → writer loop。
+///
+/// 全程跑在自己的线程上——accept 循环把连接交出来后立刻回去建下一个监听实例，
+/// 故本函数里的阻塞调用不会拖住任何其他客户端的接纳（见调用点长注释）。
+#[cfg(windows)]
+fn serve_push_client(
+    pipe: PipeHandle,
+    clients: Arc<Mutex<Vec<PushClient>>>,
+    connected_hook: Arc<Mutex<Option<ClientConnectedHook>>>,
+) {
+    use windows::Win32::Foundation::*;
+    use windows::Win32::Storage::FileSystem::*;
+    use windows::Win32::System::Pipes::*;
+
+    let pipe_handle = pipe.0;
+
+    // 与 Go 版对齐：先发送 CMD_SERVICE_READY，再读取 token。
+    // Go 的 push pipe 在 ConnectNamedPipe 后立即写 SERVICE_READY，
+    // C++ 端 AsyncReader 收到后触发 _DoFullStateSync(WM_SERVICE_READY)。
+    let ready_msg = IpcHeader::new(CMD_SERVICE_READY, 0).to_bytes().to_vec();
+    {
+        let mut bytes_written: u32 = 0;
+        let write_ok =
+            unsafe { WriteFile(pipe_handle, Some(&ready_msg), Some(&mut bytes_written), None) };
+        if write_ok.is_err() {
+            warn!("Failed to send SERVICE_READY to push client");
+            unsafe {
+                let _ = DisconnectNamedPipe(pipe_handle);
+                let _ = CloseHandle(pipe_handle);
+            }
+            return;
+        }
+    }
+    debug!("Sent SERVICE_READY to push client");
+
+    // 读取客户端 token（8 字节）
+    let mut token_buf = [0u8; 8];
+    let mut bytes_read: u32 = 0;
+    let read_ok =
+        unsafe { ReadFile(pipe_handle, Some(&mut token_buf), Some(&mut bytes_read), None) };
+
+    if read_ok.is_err() || bytes_read != 8 {
+        warn!("Failed to read push client token");
+        unsafe {
+            let _ = DisconnectNamedPipe(pipe_handle);
+            let _ = CloseHandle(pipe_handle);
+        }
+        return;
+    }
+
+    let token = u64::from_le_bytes(token_buf);
+    debug!("Push client token: 0x{:016X}", token);
+
+    // 创建发送通道
+    let (tx, rx) = std::sync::mpsc::channel::<Vec<u8>>();
+
+    // 注册客户端（不持有 pipe handle，本线程稍后独占）
+    let client = PushClient {
+        token,
+        tx,
+        hooked: false,
+    };
+
+    {
+        let mut c = clients.lock().unwrap();
+        // 清理同 token 的旧连接
+        c.retain(|c| c.token != token);
+        c.push(client);
+    }
+
+    // 注册完成后回调（发送经 tx 入队，下面的 writer loop 写出，顺序安全）。
+    // 用途：host-render 白名单宿主（transient DocMgr，如 SearchHost）服务重启重连时
+    // 既不发 focus_gained 也不重发 IME_ACTIVATED，无任何 activation push 会到达 →
+    // DLL 永不重新 setup。由 coordinator 在此回调中定向补推握手帧。
+    //
+    // hook 尚未注册时**不能静默跳过**：客户端已带 hooked=false 在表中，
+    // set_client_connected_hook 会补跑（见该方法与 PushClient::hooked）。
+    {
+        let guard = connected_hook.lock().unwrap();
+        match guard.as_ref() {
+            // 认领失败 = 补跑路径已抢先触发，跳过以免重复推送
+            Some(hook) if claim_connected_hook(&clients, token) => hook(token),
+            Some(_) => {}
+            None => warn!(
+                "Push client 0x{:016X} 握手完成时 connected_hook 尚未注册，\
+                 待 hook 注册时补跑（服务启动期竞态；曾致 SearchHost 永久停留本地渲染）",
+                token
+            ),
+        }
+    }
+
+    // 本线程转为该客户端的 writer loop（无需再 spawn：accept 循环早已脱身）
+    push_writer_loop(pipe, rx, token, clients);
 }
 
 /// 推送写入循环
@@ -428,6 +529,7 @@ mod tests {
         srv.clients_for_test().lock().unwrap().push(PushClient {
             token: 0xAA_0000_0001,
             tx,
+            hooked: false,
         });
 
         // 命中：精确 token 投递
@@ -437,5 +539,84 @@ mod tests {
         // 未命中：即使只有一个客户端也不得兜底投递
         assert!(!srv.push_to_token(0xBB_0000_0002, &[9]));
         assert!(rx.try_recv().is_err(), "不匹配的 token 不得收到任何帧");
+    }
+
+    fn add_test_client(srv: &PushServer, token: u64) {
+        let (tx, _rx) = std::sync::mpsc::channel::<Vec<u8>>();
+        srv.clients_for_test().lock().unwrap().push(PushClient {
+            token,
+            tx,
+            hooked: false,
+        });
+    }
+
+    /// hook 注册前已完成握手的客户端必须被补跑。
+    ///
+    /// 真机根因（2026-07-21 复现）：`push_server.start()` 早于
+    /// `set_client_connected_hook` 约 230ms（中间隔着 `Coordinator::new()`），
+    /// SearchHost 的 DLL 在该窗口内重连成功，回调被静默丢弃 → 它是白名单宿主拿到
+    /// activation push 的唯一通路 → HostRender 永不激活，开始菜单候选窗被压在后面。
+    #[test]
+    fn hook_registration_replays_clients_connected_before_it() {
+        let srv = PushServer::new(PushConfig::default());
+        add_test_client(&srv, 0xAA_0000_0001);
+        add_test_client(&srv, 0xBB_0000_0001);
+
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let seen_c = seen.clone();
+        srv.set_client_connected_hook(Box::new(move |t| seen_c.lock().unwrap().push(t)));
+
+        let mut got = seen.lock().unwrap().clone();
+        got.sort_unstable();
+        assert_eq!(
+            got,
+            vec![0xAA_0000_0001, 0xBB_0000_0001],
+            "注册前连接的客户端必须全部补跑，否则 SearchHost 永久停留本地渲染"
+        );
+    }
+
+    /// 补跑与连接线程的自发触发必须互斥去重（同一客户端恰好触发一次）。
+    #[test]
+    fn connected_hook_fires_exactly_once_per_client() {
+        let srv = PushServer::new(PushConfig::default());
+        add_test_client(&srv, 0xAA_0000_0001);
+
+        let count = Arc::new(AtomicU64::new(0));
+        let count_c = count.clone();
+        srv.set_client_connected_hook(Box::new(move |_| {
+            count_c.fetch_add(1, Ordering::Relaxed);
+        }));
+        assert_eq!(count.load(Ordering::Relaxed), 1, "补跑应触发一次");
+
+        // 模拟连接线程随后走到自己的触发点：认领已被补跑拿走，不得重复触发
+        assert!(
+            !claim_connected_hook(&srv.clients_for_test(), 0xAA_0000_0001),
+            "已补跑的客户端不得被连接线程再次认领"
+        );
+
+        // 断开的客户端不得被认领（不给死连接推帧）
+        assert!(!claim_connected_hook(&srv.clients_for_test(), 0xDEAD_0000));
+    }
+
+    /// 重连（同 token 重新入表）必须能再次触发 hook——DLL 重连后需要重新 setup。
+    #[test]
+    fn reconnected_client_can_be_claimed_again() {
+        let srv = PushServer::new(PushConfig::default());
+        add_test_client(&srv, 0xAA_0000_0001);
+        assert!(claim_connected_hook(
+            &srv.clients_for_test(),
+            0xAA_0000_0001
+        ));
+
+        // 重连：连接路径 retain 掉旧条目后压入新条目（hooked 复位）
+        srv.clients_for_test()
+            .lock()
+            .unwrap()
+            .retain(|c| c.token != 0xAA_0000_0001);
+        add_test_client(&srv, 0xAA_0000_0001);
+        assert!(
+            claim_connected_hook(&srv.clients_for_test(), 0xAA_0000_0001),
+            "重连后必须可再次认领，否则 DLL 重连不会重新 setup"
+        );
     }
 }
