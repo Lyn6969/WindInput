@@ -254,7 +254,8 @@ function Download-Dicts {
     $rimeFrostEn = "$rimeFrost\en_dicts"
     $opencc      = "$CacheDir\opencc\dictionaries"
     $pinyinData  = "$CacheDir\pinyin-data"
-    foreach ($d in @($rimeFrostCn, $rimeFrostEn, $opencc, $pinyinData)) { New-Item -ItemType Directory -Path $d -Force | Out-Null }
+    $rimeWubi    = "$CacheDir\rime-wubi"
+    foreach ($d in @($rimeFrostCn, $rimeFrostEn, $opencc, $pinyinData, $rimeWubi)) { New-Item -ItemType Directory -Path $d -Force | Out-Null }
 
     $frostBase = "https://raw.githubusercontent.com/gaboolic/rime-frost/master"
     Gray "rime-frost (拼音):"
@@ -278,6 +279,14 @@ function Download-Dicts {
     Get-Dict "$pinyinBase/kTGHZ2013.txt"      "$pinyinData\kTGHZ2013.txt"      "通用规范汉字"   | Out-Null
     Get-Dict "$pinyinBase/kMandarin_8105.txt" "$pinyinData\kMandarin_8105.txt" "8105 标准首音"  | Out-Null
     Get-Dict "$pinyinBase/overwrite.txt"      "$pinyinData\overwrite.txt"      "手工纠正"       | Out-Null
+
+    # 五笔词库: 下载上游原始档, 主库与 extra 由 gen_dict 重排/拆分后写入 build 目录;
+    # district 不经 gen_dict, 原样复制 (见 Assemble-Data)
+    $wubiBase = "https://raw.githubusercontent.com/KyleBing/rime-wubi86-jidian/master"
+    Gray "rime-wubi86-jidian (五笔):"
+    Get-Dict "$wubiBase/wubi86_jidian.dict.yaml"                "$rimeWubi\wubi86_jidian.dict.yaml"                "主词库"     | Out-Null
+    Get-Dict "$wubiBase/wubi86_jidian_extra.dict.yaml"          "$rimeWubi\wubi86_jidian_extra.dict.yaml"          "扩展词库"   | Out-Null
+    Get-Dict "$wubiBase/wubi86_jidian_extra_district.dict.yaml" "$rimeWubi\wubi86_jidian_extra_district.dict.yaml" "行政区域"   | Out-Null
 
     $openccBase = "https://raw.githubusercontent.com/BYVoid/OpenCC/master/data/dictionary"
     Gray "OpenCC 简繁词典:"
@@ -347,6 +356,22 @@ function Assemble-Data ([string]$outdir = $BuildDevDir) {
         } finally { Pop-Location }
     } else { Warn "缺 .cache\opencc\, OpenCC 不可用 (运行 gen-data 下载)" }
 
+    # 6. 五笔词库 (Rust 工具 gen_dict): 主库按词频重排 + extra 拆成 4 库
+    #    产物直接写进 build 目录, 不入版本库 —— 源码树 data\schemas\wubi86\ 只保留
+    #    wubi86.schema.toml 与字体等真正的源文件, 避免再把生成物误当源文件手工编辑
+    $wubiOut  = "$schemas\wubi86"
+    $rimeWubi = "$CacheDir\rime-wubi"
+    if (Test-Path "$rimeWubi\wubi86_jidian.dict.yaml") {
+        Gray "生成五笔词库 (gen_dict) ..."
+        New-Item -ItemType Directory -Path $wubiOut -Force | Out-Null
+        Push-Location $ProjectRoot
+        try {
+            # district 由 gen_dict 的 passthrough 一并处理 (原样透传 + 清洗头部)
+            cargo run -q -p wind-tools --bin gen_dict -- --cache $CacheDir --out $wubiOut --report $rimeWubi
+            if ($LASTEXITCODE -ne 0) { Warn "五笔词库生成失败 (五笔方案不可用)" }
+        } finally { Pop-Location }
+    } else { Warn "缺 .cache\rime-wubi\, 五笔词库不可用 (运行 gen-data 下载)" }
+
     $cnt = (Get-ChildItem $data -Recurse -File).Count
     Gray "data/ 组装完成 ($cnt 文件)"
     return $true
@@ -393,7 +418,13 @@ function Verify-DistData ([string]$outdir = $BuildDir) {
         @{ Path = "schemas\pinyin\cn_dicts\base.dict.yaml"; Min = 1000000 },
         @{ Path = "schemas\pinyin\cn_dicts\8105.dict.yaml"; Min = 10000 },
         @{ Path = "schemas\english\en.dict.yaml";           Min = 1000 },
-        @{ Path = "pinyin_map.txt";                         Min = 10000 }
+        @{ Path = "pinyin_map.txt";                         Min = 10000 },
+        # 五笔词库为 gen_dict 生成物, 不入版本库 —— 忘跑 gen-data 时必须在此拦下,
+        # 否则打出来的包五笔方案整个不可用
+        @{ Path = "schemas\wubi86\wubi86_jidian.dict.yaml";       Min = 1000000 },
+        @{ Path = "schemas\wubi86\wubi86_jidian_extra.dict.yaml"; Min = 10000 },
+        @{ Path = "schemas\wubi86\wubi86_jidian_emoji.dict.yaml"; Min = 1000 },
+        @{ Path = "schemas\wubi86\wubi86_jidian_extra_district.dict.yaml"; Min = 10000 }
     )
     Say "`n校验发布数据完整性 → $data"
     foreach ($c in $checks) {
@@ -409,7 +440,7 @@ function Verify-DistData ([string]$outdir = $BuildDir) {
 
     if (-not $ok) {
         ErrMsg "`n发布数据校验失败! 上述文件缺失或异常会导致功能残缺。"
-        ErrMsg "请排查 gen-data 的下载/生成 (词库源、网络、gen_unigram/gen_opencc)。"
+        ErrMsg "请排查 gen-data 的下载/生成 (词库源、网络、gen_unigram/gen_opencc/gen_dict)。"
         return $false
     }
     Say "发布数据校验通过 ✓"; return $true

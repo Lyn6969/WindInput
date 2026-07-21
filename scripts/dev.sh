@@ -335,6 +335,16 @@ download_dicts() {
     download_file "$OPENCC_BASE/TWVariants.txt"   "$opencc/TWVariants.txt"   "台湾字形"
     download_file "$OPENCC_BASE/TWPhrases.txt"    "$opencc/TWPhrases.txt"    "台湾词汇"
     download_file "$OPENCC_BASE/HKVariants.txt"   "$opencc/HKVariants.txt"   "香港字形"
+
+    # 五笔词库：下载上游原始档，主库与 extra 由 gen_dict 重排/拆分后写入 build 目录；
+    # district 不经 gen_dict，原样复制（见 assemble_data）
+    local rime_wubi="$CACHE_DIR/rime-wubi"
+    mkdir -p "$rime_wubi"
+    local WUBI_BASE="https://raw.githubusercontent.com/KyleBing/rime-wubi86-jidian/master"
+    gray "rime-wubi86-jidian (五笔):"
+    download_file "$WUBI_BASE/wubi86_jidian.dict.yaml"                "$rime_wubi/wubi86_jidian.dict.yaml"                "主词库"
+    download_file "$WUBI_BASE/wubi86_jidian_extra.dict.yaml"          "$rime_wubi/wubi86_jidian_extra.dict.yaml"          "扩展词库"
+    download_file "$WUBI_BASE/wubi86_jidian_extra_district.dict.yaml" "$rime_wubi/wubi86_jidian_extra_district.dict.yaml" "行政区域"
 }
 
 # 从 data/（源）+ .cache/（下载/生成）组装完整运行时数据到 $outdir/data/
@@ -405,6 +415,22 @@ assemble_data() {
             || warn "OpenCC 编译失败（简繁转换不可用）"
     else
         warn "缺 .cache/opencc/，OpenCC 不可用（运行 gen-data 下载）"
+    fi
+
+    # 6. 五笔词库（Rust 工具 gen_dict）：主库按词频重排 + extra 拆成 4 库。
+    # 产物直接写进 build 目录、不入版本库 —— 源码树 data/schemas/wubi86/ 只保留
+    # wubi86.schema.toml 与字体等真正的源文件，避免把生成物误当源文件手工编辑。
+    local rime_wubi="$CACHE_DIR/rime-wubi"
+    local wubi_out="$data/schemas/wubi86"
+    if [ -f "$rime_wubi/wubi86_jidian.dict.yaml" ]; then
+        gray "生成五笔词库 (gen_dict) ..."
+        mkdir -p "$wubi_out"
+        # district 由 gen_dict 的 passthrough 一并处理（原样透传 + 清洗头部）
+        ( cd "$RUST_WORKSPACE" && cargo run -q -p wind-tools --bin gen_dict -- \
+            --cache "$CACHE_DIR" --out "$wubi_out" --report "$rime_wubi" ) \
+            || warn "五笔词库生成失败（五笔方案不可用）"
+    else
+        warn "缺 .cache/rime-wubi/，五笔词库不可用（运行 gen-data 下载）"
     fi
 
     gray "data/ 组装完成 ($(find "$data" -type f | wc -l) 文件)"
@@ -698,6 +724,11 @@ verify_dist_data() {
         "schemas/pinyin/cn_dicts/8105.dict.yaml|10000"
         "schemas/english/en.dict.yaml|1000"
         "pinyin_map.txt|10000"
+        # 五笔词库为 gen_dict 生成物、不入版本库 —— 忘跑 gen-data 时必须在此拦下
+        "schemas/wubi86/wubi86_jidian.dict.yaml|1000000"
+        "schemas/wubi86/wubi86_jidian_extra.dict.yaml|10000"
+        "schemas/wubi86/wubi86_jidian_emoji.dict.yaml|1000"
+        "schemas/wubi86/wubi86_jidian_extra_district.dict.yaml|10000"
     )
     say "\n校验发布数据完整性 → $data"
     local entry path min sz

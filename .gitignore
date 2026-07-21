@@ -17,3 +17,7 @@ docs/superpowers/
 wind_macos/.build/
 .swiftpm/
 build_debug/
+
+# 五笔词库为 gen_dict 生成物, 只存在于 build 输出, 不入库
+# (源在 .cache/rime-wubi/, 由 scripts/dev.* 的 gen-data 下载并生成)
+data/schemas/wubi86/*.dict.yaml

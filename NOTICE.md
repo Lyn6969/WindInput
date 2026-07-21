@@ -6,18 +6,6 @@
 
 ### 已包含在本仓库中的资源
 
-#### 极点五笔 for Rime (rime-wubi86-jidian)
-
-- **用途**: 五笔 86 版码表数据源
-- **仓库**: https://github.com/KyleBing/rime-wubi86-jidian
-- **许可证**: Apache-2.0
-- **文件**（位于 `data/schemas/wubi86/`）:
-  - `wubi86_jidian.dict.yaml` — 主码表
-  - `wubi86_jidian_extra.dict.yaml` — 扩展词库
-  - `wubi86_jidian_extra_district.dict.yaml` — 行政区域词库
-  - `wubi86_jidian_emoji.dict.yaml` / `wubi86_jidian_english.dict.yaml` /
-    `wubi86_jidian_symbols.dict.yaml` — emoji / 英文 / 符号扩展
-
 #### 五笔86拆字数据库 (wubi86_chaizi.txt)
 
 - **用途**: 五笔字根拆字数据，用于悬停提示中显示候选字的拆字信息
@@ -37,6 +25,19 @@
 
 以下资源在构建过程中由构建脚本从原始仓库下载（缓存于 `.cache/`，已被
 gitignore），用于生成词库数据文件，其各自适用原项目的许可证条款。
+
+#### 极点五笔 for Rime (rime-wubi86-jidian)
+
+- **用途**: 五笔 86 版码表数据源
+- **仓库**: https://github.com/KyleBing/rime-wubi86-jidian
+- **许可证**: Apache-2.0
+- **使用的文件**: `wubi86_jidian.dict.yaml`（主码表）、
+  `wubi86_jidian_extra.dict.yaml`（扩展词库）、
+  `wubi86_jidian_extra_district.dict.yaml`（行政区域词库）
+- **加工方式**: 由 `wind-tools/gen_dict` 处理后写入构建产物 `data/schemas/wubi86/`：
+  主码表按 unigram 词频重新赋权排序、单字提权，并按简码级别分层；扩展词库按字符
+  类型拆分为 extra / emoji / english / symbols 四个文件；行政区域词库原样透传
+  （仅清理头部的 librime `sort:` 键）。条目文本本身未作增删改
 
 #### 白霜拼音 (rime-frost)
 

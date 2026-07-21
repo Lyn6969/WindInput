@@ -601,6 +601,14 @@ download_dicts() {
     local ocbase="https://raw.githubusercontent.com/BYVoid/OpenCC/master/data/dictionary"
     info "OpenCC 简繁词典:"
     for f in STCharacters STPhrases TWVariants TWPhrases HKVariants; do get_dict "$ocbase/$f.txt" "$oc/$f.txt"; done
+
+    # 五笔词库: 主库与 extra 由 gen_dict 重排/拆分, district 原样复制 (见 assemble_data)。
+    local wubi="$CACHE_DIR/rime-wubi"
+    local wubibase="https://raw.githubusercontent.com/KyleBing/rime-wubi86-jidian/master"
+    info "rime-wubi86-jidian (五笔):"
+    for f in wubi86_jidian wubi86_jidian_extra wubi86_jidian_extra_district; do
+        get_dict "$wubibase/$f.dict.yaml" "$wubi/$f.dict.yaml"
+    done
     return 0
 }
 
@@ -663,6 +671,22 @@ assemble_data() {
         warn "缺 .cache/opencc/, OpenCC 不可用 (先跑 gd 下载)"
     fi
 
+    # 6. 五笔词库 (Rust 工具 gen_dict): 主库按词频重排 + extra 拆成 4 库。
+    # 产物直接写进 build 目录、不入版本库 —— 源码树 data/schemas/wubi86/ 只保留
+    # wubi86.schema.toml 与字体等真正的源文件。
+    local wubi="$CACHE_DIR/rime-wubi"
+    local wubi_out="$data/schemas/wubi86"
+    if [[ -f "$wubi/wubi86_jidian.dict.yaml" ]]; then
+        info "生成五笔词库 (gen_dict) ..."
+        mkdir -p "$wubi_out"
+        # district 由 gen_dict 的 passthrough 一并处理 (原样透传 + 清洗头部)
+        ( cd "$RUST_DIR" && cargo run -q -p wind-tools --bin gen_dict -- \
+            --cache "$CACHE_DIR" --out "$wubi_out" --report "$wubi" ) \
+            || warn "五笔词库生成失败 (五笔方案不可用)"
+    else
+        warn "缺 .cache/rime-wubi/, 五笔词库不可用 (先跑 gd 下载)"
+    fi
+
     info "data/ 组装完成 ($(find "$data" -type f | wc -l | tr -d ' ') 文件)"
     return 0
 }
@@ -714,6 +738,11 @@ verify_dist_data() {
     _check_min "schemas/pinyin/cn_dicts/8105.dict.yaml" 10000
     _check_min "schemas/english/en.dict.yaml"           1000
     _check_min "pinyin_map.txt"                         10000
+    # 五笔词库为 gen_dict 生成物、不入版本库 —— 忘跑 gd 时必须在此拦下
+    _check_min "schemas/wubi86/wubi86_jidian.dict.yaml"                1000000
+    _check_min "schemas/wubi86/wubi86_jidian_extra.dict.yaml"          10000
+    _check_min "schemas/wubi86/wubi86_jidian_emoji.dict.yaml"          1000
+    _check_min "schemas/wubi86/wubi86_jidian_extra_district.dict.yaml" 10000
     local oc; oc=$(ls "$data/opencc"/*.octrie 2>/dev/null | wc -l | tr -d ' ')
     if (( oc < 1 )); then err "  ✗ 缺失: opencc/*.octrie (简繁转换编译失败)"; ok=0
     else info "  ✓ opencc/*.octrie ($oc 个)"; fi
