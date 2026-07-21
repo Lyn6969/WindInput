@@ -54,7 +54,7 @@
 - `wind-ipc`（协议常量/键 hash）、`wind-bridge`（MessageHandler/KeyEventData/Push）、`wind-config`、`wind-store`（redb 持久化）、`wind-dict`、`wind-engine`、`wind-candidate`、`wind-transform`、`wind-theme`、`wind-ui`、`wind-cmdbar`、`wind-phrase`、`wind-keys`（keymap/VK/NavKeys）、`wind-quick-input`、`wind-reverse`、`wind-punct`
 
 ### External
-- `tokio`、`tracing`、`anyhow`、`serde`/`serde_json`、`toml`、`chrono`、`fontdb`；`windows`（仅 `cfg(windows)`）
+- `tracing`、`anyhow`、`serde`/`serde_json`、`toml`、`chrono`、`fontdb`；`windows`（仅 `cfg(windows)`）。无 tokio（2026-07 移除，全 workspace 同步线程模型）
 
 ## 全局约束
 按需引用根 `AGENTS.md`：VK 用 `keymap::VK_*`（来自 wind-keys，禁裸十六进制）；候选导航键走统一入口（`apply_nav_key`/`NavKeys`）；提交只用显式路径（禁 `git add -A`）；改完在 `wind_input/` 跑 `cargo fmt` 并与逻辑改动分开提交；日志 INFO 级不得含用户输入/候选/词库内容。

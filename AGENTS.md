@@ -2,9 +2,22 @@
 
 > 给在本仓工作的 AI/人类协作者。Rust 核心在 `wind_input/`（cargo workspace）。
 
+## 仓库地图
+
+本仓含三大组件，另有若干独立仓库与本仓协同（相对路径以本仓根为基准）：
+
+| 位置 | 内容 | 文档 |
+|---|---|---|
+| `wind_input/` | Rust 核心服务（cargo workspace：19 个 crate + `apps/service`） | 本文档 + crate 级 AGENTS.md |
+| `wind_tsf/` | C++17 TSF DLL：Windows 输入法接口层，经 Named Pipe 与 Rust 服务通信 | [AGENTS.md](wind_tsf/AGENTS.md) |
+| `wind_macos/` | macOS IMKit `.app`（与 `wind_tsf/` 对位，开发中） | [AGENTS.md](wind_macos/AGENTS.md) |
+| `../wind-setting` | 设置 UI（**独立仓库**，经 JSON-RPC 与核心通信）；改设置界面去那边 | — |
+| `../wind-portable` | 绿色版启动器（独立仓库，不存在时构建脚本自动跳过） | — |
+| `../WindInput-Go` | Go 旧版源码（只读参考；docs 旧文档里的 `../WindInput` 指的是它） | — |
+
 ## Crate 索引
 
-> workspace 共 18 个 crate（均在 `wind_input/crates/`）。复杂 crate 已配 crate 级 `AGENTS.md`，改动前先读对应文档；新增/重构 crate 时参照同结构补文档。
+> workspace 共 19 个 crate（均在 `wind_input/crates/`）。复杂 crate 已配 crate 级 `AGENTS.md`，改动前先读对应文档；新增/重构 crate 时参照同结构补文档。
 
 | Crate | 职责 | crate 文档 |
 |---|---|---|
@@ -22,6 +35,7 @@
 | `wind-keys` | 键名/VK 映射、导航键分类（纯逻辑）+ 按键注入（平台层）；**VK 常量 SSOT** | — |
 | `wind-candidate` | 候选词数据类型、排序与过滤 | — |
 | `wind-phrase` | 短语系统：静态/动态模板展开 + cmdbar 双路径 | — |
+| `wind-transfer` | 导入导出/备份还原底座：Bundle（manifest + zip）聚合打包与 Merge 合并策略（编解码在 wind-store） | — |
 | `wind-quick-input` | 快捷输入提供器：日期 / 计算器（纯逻辑） | — |
 | `wind-reverse` | 候选反查：五笔编码/拆字/拼音读音（悬停 tooltip） | — |
 | `wind-punct` | 标点转换纯逻辑（中英标点/全半角/数字后智能） | — |
@@ -50,19 +64,36 @@
 
 这些键**都可配置**，且必须走**统一**入口，禁止各 handler 各写一套硬编码判断：
 
-- 翻页 / 高亮：`keymap::NavKeys`（从 `input.page_keys` / `input.highlight_keys` 组名编译）+
+- 翻页 / 高亮：`keymap::NavKeys`（从 `keys.page_keys` / `keys.highlight_keys` 组名编译）+
   `Coordinator::apply_nav_key(state, data, include_printable)`。普通模式与所有候选模式共用。
   - `include_printable=true`（码表型：普通/特殊/mix/临拼）：`-`/`=`/`[`/`]` 可作翻页；
   - `include_printable=false`（文本/表达式型：临英/快捷输入）：上述键作输入，不当导航。
   - overlay handler 用 `handle_candidate_nav`（按 `state.active` 自判 `include_printable`）。
-- 二三候选键：`select_key_offset`（读 `input.select_key_groups`，经 `hotkey::select_key_vks`）。
+- 二三候选键：`select_key_offset`（读 `keys.select_key_groups`，经 `hotkey::select_key_vks`）。
 - 新增模式/按键时**复用**以上，不要再写 `0x21|0x22 =>` 之类分支。
+
+## 跨组件硬约定（违反即复现历史 bug）
+
+跨 crate / 跨语言边界的立约级不变量集中在此；crate 内部细节归 crate 级 `AGENTS.md`。
+
+- **C++ 吃键集必须 ⊆ Rust 出字集**：`wind_tsf` 在 `OnTestKeyDown` 就决定是否吃键，早于 IPC
+  往返；Rust 侧事后回 PassThrough 已来不及。凡 C++ 吃掉而 Rust 最终不出字的键，在严格 TSF
+  宿主上直接丢失（历史案例：全角模式丢键、密码框丢键；指纹＝「有些应用打不出、有些出半角」）。
+  给 C++ 侧新增吃键条件前，先确认 Rust 侧在同条件下必定产出。
+- **候选排序必须落到 weight**：协调器会按 weight 统一重排候选；引擎内部只调顺序、不改
+  weight 的排序会被重排冲掉。顶码上屏取首选与候选窗展示必须共用同一排序函数。
+- **用户短语数据只存 `user_data.db`**（wind-store，全局不分方案）：yaml 短语文件是系统种子，
+  **不是**用户覆盖入口——旧设计文档里「yaml 用户目录覆盖」的说法已过时，勿据此实现。
 
 ## 提交纪律（多会话共仓）
 
 可能有多个 AI 会话同时在本仓工作。**提交只用显式路径**（`git add <具体文件>`），
 **禁止 `git add -A` / `git add .`**——会把其它会话未提交的文件一起卷入提交。
 提交前 `git status` 确认暂存区只含自己改的文件。
+
+提交信息保持常规工程风格（`type(scope): 摘要`，中文正文）：**不要**添加
+`Co-Authored-By`、`Generated with` 以及 `Constraint:` / `Confidence:` / `Tested:` 等
+AI 附加 trailer。
 
 ## 格式化（强制）
 
@@ -105,8 +136,12 @@ log_level = "debug"   # 或 "trace"
 
 ### 日志文件
 
-- 滚动策略：按大小（默认 10 MB/文件），保留最近 N 个文件（默认 5 个）
-- 文件命名：`wind_input.log`（当前）、`wind_input.log.1`（上一个）…
+- 滚动策略：**每次服务启动滚动一次**（`log_rotate::rotate_on_startup`，上次运行整体搬入
+  历史文件），另按大小兜底（默认 10 MB/文件）；历史文件默认保留 10 个（`debug.log_max_files`）
+- 文件命名：`wind_input.log`（本次运行）、`wind_input.1.log`（上次）… `wind_input.10.log`。
+  **序号在扩展名之前**，滚动后仍是 `.log`（编辑器可双击、按 `*.log` 可搜）；勿改回 `.log.N` 旧式
+- 时间戳为**本地时区**，格式与 `wind_tsf` 的 FileLogger 完全一致，两份日志按时间直接对齐排查；
+  勿退回 tracing 默认的 UTC SystemTime timer
 - 路径（变体感知）：
   - 正常安装 release：`%LOCALAPPDATA%\WindInput\logs\`
   - 正常安装 dev：`%LOCALAPPDATA%\WindInputDev\logs\`
@@ -120,12 +155,37 @@ log_level = "debug"   # 或 "trace"
 
 ## 构建 / 测试
 
-- 交叉编译检查（Windows 目标，纯 Rust 无 C 依赖）：
-  `cargo check --target x86_64-pc-windows-gnu -p <crate>`（`wind_input/` 下，或经 `scripts/dev.sh`）。
-- host 单测：仅 `wind-engine` / `wind-dict` / `wind-config` / `wind-transform` 等无 Windows 依赖的 crate 可在本机
-  `cargo test -p <crate>` 运行；**`wind-coordinator` 传递依赖 `windows` crate，不能在 host 跑测试**
-  （其纯逻辑单测如 `keymap` 仅交叉编译期编译，靠设备/CI 验证）。
+两套开发脚本命令菜单对齐，按主机选择：
+
+### Windows 本机（MSVC，`scripts\dev.ps1` / `dev.bat`）
+
+- host 即 Windows 目标，无交叉编译限制：`cargo check` / `cargo test` 可直接跑全 workspace
+  （含 `wind-coordinator`）。脚本快捷键：`k`=check、`l`=clippy、`t`=test、`f`=fmt、
+  `ci`=fmt+clippy+test。
+- 全构建：`1`（release → `build/`）/ `d1`（dev → `build_dev/`）；单模块 `m1..m4`（tsf/核心/
+  setting/portable，前缀 `d` 为 dev）。系统安装：`p1`/`pd1`；安装包：`8`/`d8` → `dist\*-Setup.exe`。
+- 部署目标默认 `C:\Program Files\WindInput[Dev]`，可在 `scripts\deploy.local.ps1` 覆盖。
+
+### Linux 交叉（MinGW，`scripts/dev.sh`）
+
+- 编译检查：`cargo check --target x86_64-pc-windows-gnu -p <crate>`（`wind_input/` 下）。
+- host 单测仅限 `wind-engine` / `wind-dict` / `wind-config` / `wind-transform` 等无 Windows
+  依赖的 crate；**`wind-coordinator` 传递依赖 `windows` crate，不能在 Linux host 跑测试**。
 - 部署调试版到 Windows：`scripts/dev.sh push debug`（配置见 `scripts/deploy.local`）。
+
+### 注意
+
+- 部分集成测试依赖 `build_dev/` 下的数据（junction/词库）；**数据缺失时测试族静默跳过，
+  0.0x 秒全绿＝假绿**，在 worktree 里跑测试尤其要核对耗时是否合理。
+
+## 版本 / 发布
+
+- 产品版本**唯一真源 = `docs/VERSION`**。构建脚本读取后分发到 5 类产物
+  （`wind_input.exe` / `wind_tsf.dll` / `wind_setting.exe` / `wind_portable.exe` / 安装包），
+  跨仓经环境变量 `WIND_APP_VERSION` 注入（不经脚本独立构建时各仓自行回退）。
+  发版只改 `docs/VERSION` 一处，**不要**手改各仓 `Cargo.toml` 的 `version`。
+- CI（release.yml）为 tag-first：以 tag 覆盖 `docs/VERSION` 再构建；仓库里的 `docs/VERSION`
+  是开发占位。**切勿添加 `tag == docs/VERSION` 一致性校验**——会破坏手动触发的 `-dev` 占位流程。
 
 ## Agent skills
 

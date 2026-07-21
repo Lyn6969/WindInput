@@ -62,7 +62,7 @@ struct NavBind {
     printable: bool,
 }
 
-/// 配置驱动的候选导航键分类器。从 `input.page_keys` / `input.highlight_keys` 组名编译一次，
+/// 配置驱动的候选导航键分类器。从 `keys.page_keys` / `keys.highlight_keys` 组名编译一次，
 /// 普通模式与所有 overlay 模式共用 [`classify`](NavKeys::classify)，消除各处硬编码翻页/高亮判断。
 #[derive(Clone, Default)]
 pub struct NavKeys {

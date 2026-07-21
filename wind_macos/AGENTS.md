@@ -1,6 +1,6 @@
 # wind_macos
 
-macOS IMKit `.app` 工程 (PR-A). 与 Win 端 `wind_tsf/` DLL 对位, 与跨平台 Go 服务 (`wind_input/`) 通过 Unix Domain Socket 通信.
+macOS IMKit `.app` 工程 (PR-A). 与 Win 端 `wind_tsf/` DLL 对位, 与跨平台 Rust 服务 (`wind_input/`) 通过 Unix Domain Socket 通信.
 
 ## 当前阶段
 

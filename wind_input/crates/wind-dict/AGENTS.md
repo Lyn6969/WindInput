@@ -18,7 +18,8 @@
 | `src/store_layer.rs` | `StoreUserLayer` / `StoreTempLayer` 把 `wind-store` 查询包装为 `DictLayer`（User/Temp 层） |
 | `src/binformat.rs` | wdb 格式 `DictReader`（mmap 二分查询，V2/V3）/ `DictWriter`（原子 .tmp→rename 写入）；`for_each_entry` 供反查索引构建 |
 | `src/datformat.rs` | wdat（DAT）格式，含独立 `AbbrevSection`（简拼区）；`CachedDict::Mmap` 实际使用的格式 |
-| `src/cached.rs` | `CachedDict`（Mmap/Memory 两种模式）；yaml→wdat 缓存流程；`build_reverse_index` 构建汉字→编码反查表 |
+| `src/cached.rs` | `CachedDict`（Mmap/Memory 两种模式）；yaml→wdat 缓存流程 + **wdat-only 模式**（用户只投放二进制词库、无 yaml 源时原位直接加载，加载失败不可重建）；`build_reverse_index` 构建汉字→编码反查表 |
+| `src/reader_pool.rs` | wdat/unigram mmap reader 进程级共享池（按缓存文件路径复用，存 `Weak` 不持强引用——mmap 期间 rename 会 Access Denied，池持强引用会让词库重建永久失败；新鲜度归 `cache_fp`，本池只管「同一路径只 mmap 一份」） |
 | `src/cache_fp.rs` | 基于源文件内容指纹（SipHash sidecar `.fp`）的缓存有效性校验，解决部署刷新 mtime 导致恒重建的问题 |
 | `src/codetable.rs` | `CodetableDict` 内存 BTreeMap；自动检测五笔/拼音 Rime 格式；`parse_rime_entries_parallel` 多线程解析（>1MB 走 `thread::scope`），输出全拼+简拼两组 |
 | `src/trie.rs` | 前缀 Trie，供英文词库回退路径等组件使用 |

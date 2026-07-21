@@ -54,8 +54,8 @@ Named Pipe 服务器 + Push 管道，实现 Rust 服务进程与 C++ wind_tsf TS
 - `wind-ipc`（IPC 协议编解码：`IpcHeader`/`codec::*`/`protocol::*`/`SharedRenderHeader` 等）
 
 ### External
-- `tokio`（async runtime，`BridgeServer::start`/`PushServer::start` 为 async fn 入口）
 - `bytes`、`tracing`、`anyhow`/`thiserror`
+- **无 async runtime**：IPC 为同步线程模型（每连接独立线程），`BridgeServer::start`/`PushServer::start` 均为同步 fn（tokio 已于 2026-07 移除，勿再引入）
 - `windows`（`cfg(windows)` gate：Named Pipe API、`ConvertStringSecurityDescriptorToSecurityDescriptorA`）
 
 ## 全局约束
