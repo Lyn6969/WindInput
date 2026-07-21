@@ -87,6 +87,43 @@ fn locate(rel: &str, user_dir: &Path, system_dir: Option<&Path>) -> Located {
     Located::Missing
 }
 
+/// `wubi86/x.dict.yaml` → `wubi86/x.wdat`（包内相对路径版）。
+///
+/// 与 `wind_dict::cached::wdat_sibling` 是同一套命名约定（剥掉整个 `.dict.yaml`），但
+/// **刻意不复用它**：那个函数走 `Path`，Windows 上会把分隔符规范化成 `\`；而包内相对
+/// 路径必须保持 `/`——zip 规范如此，跨平台导入也依赖它。故这里做纯字符串处理，原样
+/// 保留分隔符。两处若要改约定需同步。
+fn wdat_rel(rel: &str) -> Option<String> {
+    let stem = rel
+        .strip_suffix(".dict.yaml")
+        .or_else(|| rel.strip_suffix(".yaml"))?;
+    Some(format!("{stem}.wdat"))
+}
+
+/// 资源定位：先按 `rel` 本身找，未命中再按 wdat-only 约定找同名 `.wdat`。
+///
+/// 返回**实际命中的相对路径**——wdat-only 时它被改写成 `.wdat`。这一步不能省：包内按
+/// 相对路径直存，若仍记 `.dict.yaml`，导入端就会还原出一个名为 yaml、内容却是二进制的
+/// 文件，两头都读不了。
+///
+/// 非词库资源（字根字体、shuangpin toml 等）不受影响——`wdat_sibling` 对非 yaml 后缀
+/// 返回 `None`，直接落回原结果。
+fn locate_resource(rel: &str, user_dir: &Path, system_dir: Option<&Path>) -> (String, Located) {
+    match locate(rel, user_dir, system_dir) {
+        Located::Missing => {
+            if let Some(w) = wdat_rel(rel) {
+                match locate(&w, user_dir, system_dir) {
+                    Located::Missing => {}
+                    hit => return (w, hit),
+                }
+            }
+            // 仍未命中：用原始 rel 上报，缺失提示才对得上用户配置里写的路径
+            (rel.to_string(), Located::Missing)
+        }
+        hit => (rel.to_string(), hit),
+    }
+}
+
 /// 从一个已解析 Schema 提取其资源相对路径(不含方案文件本身、不含引用方案)。
 fn resource_rels(schema: &wind_config::schema::Schema) -> Vec<String> {
     let mut rels = Vec::new();
@@ -172,7 +209,10 @@ fn collect_into(
     }
 
     for rel in resource_rels(&schema) {
-        match locate(&rel, user_dir, system_dir) {
+        // 词库可能是 wdat-only（只有编译好的 .wdat、无 .dict.yaml 源），实际打包的相对
+        // 路径要以命中者为准，见 locate_resource。
+        let (rel, located) = locate_resource(&rel, user_dir, system_dir);
+        match located {
             Located::User(p) => plan.pack.push((rel, p)),
             Located::System => plan.system_refs.push(rel),
             Located::Missing => plan.missing.push(rel),
@@ -481,6 +521,93 @@ path = "my/ghost.dict.yaml"
             w.write_all(data).unwrap();
         }
         w.finish().unwrap();
+    }
+
+    /// wdat-only 词库：方案目录里只有编译好的 .wdat、没有 .dict.yaml 源。
+    /// 打包必须以 .wdat 命中并按 .wdat 的相对路径入包，否则导入端会还原出一个名为 yaml、
+    /// 内容却是二进制的文件。
+    #[test]
+    fn collect_packs_wdat_only_dict() {
+        let t = tempfile::tempdir().unwrap();
+        let (user, system) = (t.path().join("u"), t.path().join("s"));
+        fs::create_dir_all(user.join("wb")).unwrap();
+        fs::create_dir_all(&system).unwrap();
+        fs::write(
+            user.join("wb.schema.toml"),
+            r#"
+[schema]
+id = "wb"
+[engine]
+type = "codetable"
+[[dictionaries]]
+path = "wb/main.dict.yaml"
+"#,
+        )
+        .unwrap();
+        // 只投放 wdat，不放 yaml
+        fs::write(user.join("wb/main.wdat"), b"binary").unwrap();
+
+        let plan = collect_package_files("wb", &user, Some(&system)).unwrap();
+        let names: Vec<&str> = plan.pack.iter().map(|(n, _)| n.as_str()).collect();
+        assert!(
+            names.contains(&"wb/main.wdat"),
+            "wdat-only 词库须以 .wdat 路径入包，实际: {names:?}"
+        );
+        assert!(
+            !names.contains(&"wb/main.dict.yaml"),
+            "不存在的 yaml 不应入包"
+        );
+        assert!(
+            plan.missing.is_empty(),
+            "wdat 在场就不算缺失，实际: {:?}",
+            plan.missing
+        );
+        // 入包的源路径必须指向真实文件
+        let src = plan
+            .pack
+            .iter()
+            .find(|(n, _)| n == "wb/main.wdat")
+            .map(|(_, p)| p.clone())
+            .unwrap();
+        assert!(src.is_file());
+    }
+
+    /// yaml 与 wdat 并存时走原路径，wdat 不得抢占（正常方案行为一步不变）。
+    #[test]
+    fn yaml_wins_over_sibling_wdat_when_packing() {
+        let t = tempfile::tempdir().unwrap();
+        let (user, system) = (t.path().join("u"), t.path().join("s"));
+        fs::create_dir_all(user.join("wb")).unwrap();
+        fs::create_dir_all(&system).unwrap();
+        fs::write(
+            user.join("wb.schema.toml"),
+            "[schema]\nid = \"wb\"\n[engine]\ntype = \"codetable\"\n[[dictionaries]]\npath = \"wb/main.dict.yaml\"\n",
+        )
+        .unwrap();
+        fs::write(user.join("wb/main.dict.yaml"), "src").unwrap();
+        fs::write(user.join("wb/main.wdat"), b"binary").unwrap();
+
+        let plan = collect_package_files("wb", &user, Some(&system)).unwrap();
+        let names: Vec<&str> = plan.pack.iter().map(|(n, _)| n.as_str()).collect();
+        assert!(names.contains(&"wb/main.dict.yaml"));
+        assert!(
+            !names.contains(&"wb/main.wdat"),
+            "yaml 在场时不应改打 wdat"
+        );
+    }
+
+    /// 非词库资源不受 wdat 探测影响：缺失仍按原相对路径上报。
+    #[test]
+    fn non_dict_resources_keep_original_missing_path() {
+        let t = tempfile::tempdir().unwrap();
+        let (user, system) = (t.path().join("u"), t.path().join("s"));
+        fixture(&user, &system);
+        let plan = collect_package_files("my", &user, Some(&system)).unwrap();
+        assert_eq!(
+            plan.missing,
+            vec!["my/ghost.dict.yaml"],
+            "缺失路径须保持用户配置里写的原样"
+        );
     }
 
     #[test]
