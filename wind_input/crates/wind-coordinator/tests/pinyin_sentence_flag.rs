@@ -15,7 +15,10 @@ use wind_coordinator::Coordinator;
 use wind_ipc::protocol::EVENT_KEY_DOWN;
 
 fn data_dir() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../build_dev/data")
+    // 三级：crates/wind-coordinator → crates → wind_input → 仓库根（build_dev 在仓库根）。
+    // 曾误写成两级，解析到 wind_input/build_dev/data —— 该目录不存在，于是下面的
+    // exists() 判假、整个测试族静默走「跳过」分支通过。**判据是耗时 0.00s**。
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../../build_dev/data")
 }
 
 fn key_event(key_code: u32, event_type: u8) -> KeyEventData {
