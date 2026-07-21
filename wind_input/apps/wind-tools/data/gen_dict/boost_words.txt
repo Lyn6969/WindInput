@@ -1,4 +1,4 @@
-# 自定义词序提升表（dictgen 在权重计算 + 简码降权后应用）
+# 自定义词序提升表（gen_dict 在权重计算 + 简码降权后应用）
 #
 # 格式（TAB 分隔）：code  text  [adjust]
 #   adjust 留空      → 顶置（设为该 code 当前最高权重 +1）
