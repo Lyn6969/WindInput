@@ -1324,15 +1324,27 @@ impl CandidateWindow {
                 .gap(box_gap)
                 .cross(Align::Center)
         };
+        // 内联编码的"沉底"（swap_preedit_when_above 在首单元内联下的落点）：
+        // 内联模式没有独立编码栏可参与末尾那段 band/list 交换装配，编码是 list 的首个子节点。
+        // 横排下首单元 = 行首（最左），与上下无关，开关本就无意义 → 不参与；
+        // 竖排下首单元 = 列首（最上），语义上等同于"编码栏在上"，此时开关必须生效 →
+        // 把内联编码（及紧随其后的模式标记，二者共同构成独立栏模式下的"编码栏"内容）
+        // 延迟到候选项之后再挂，得到与独立栏模式一致的"编码沉底贴光标"表现。
+        let inline_preedit_bottom =
+            swap_bands && list_vertical && self.preedit_embedded && !self.preedit.is_empty();
+        // 沉底时延迟装配的内联节点，按原相对顺序在候选项之后追加。
+        let mut inline_tail: Vec<View> = Vec::new();
         // 嵌入模式：编码作为候选行首单元内联（无独立背景，与候选间留白分隔），对齐 Go buildEmbeddedPreedit。
-        // 横排右留白、竖排下留白。
+        // 横排右留白、竖排下留白（沉底时翻到上留白，否则会紧贴末个候选）。
         if self.preedit_embedded && !self.preedit.is_empty() {
             // 左缩进与独立条模式一致：取 preedit_bar.padding.left，避免编码贴窗口左缘。
             let pe_left = edges_or(&v.preedit_bar.padding, [3.0, 8.0, 3.0, 8.0]).l;
             let sep = if list_vertical {
+                let gap = 6.0 * s;
                 Edges {
                     l: pe_left,
-                    b: 6.0 * s,
+                    t: if inline_preedit_bottom { gap } else { 0.0 },
+                    b: if inline_preedit_bottom { 0.0 } else { gap },
                     ..Edges::default()
                 }
             } else {
@@ -1342,7 +1354,12 @@ impl CandidateWindow {
                     ..Edges::default()
                 }
             };
-            list = list.child(self.preedit_view(preedit_fs).margin(sep));
+            let node = self.preedit_view(preedit_fs).margin(sep);
+            if inline_preedit_bottom {
+                inline_tail.push(node);
+            } else {
+                list = list.child(node);
+            }
         }
         // 模式标记（拼/双/快/英/符 或全称）：紧随输入缓冲之后、候选之前内联显示。
         // 仅"无独立 preedit 栏"时在此（内联编码 candidate_inline / 内嵌应用 app_inline /
@@ -1352,8 +1369,10 @@ impl CandidateWindow {
         if !self.mode_label.is_empty() && !preedit_bar_shown {
             let ml_fs = node_fs(&v.mode_label);
             let sep = if list_vertical {
+                let gap = 6.0 * s;
                 Edges {
-                    b: 6.0 * s,
+                    t: if inline_preedit_bottom { gap } else { 0.0 },
+                    b: if inline_preedit_bottom { 0.0 } else { gap },
                     ..Edges::default()
                 }
             } else {
@@ -1377,7 +1396,11 @@ impl CandidateWindow {
                     .radius(dim(v.item.border_radius, 4.0))
                     .pad(edges_or(&v.mode_label.padding, [1.0, 6.0, 1.0, 6.0]));
             }
-            list = list.child(chip);
+            if inline_preedit_bottom {
+                inline_tail.push(chip);
+            } else {
+                list = list.child(chip);
+            }
         }
         // 无候选但有提示（模式徽标 / preedit）时：补一个与正常候选行等高的透明占位行，
         // 使提示窗口（如网址模式、临拼/临英刚进入）高度与有候选时及普通候选窗一致，
@@ -1509,6 +1532,11 @@ impl CandidateWindow {
                 item = item.bg_gradient(g);
             }
             list = list.child(item);
+        }
+        // 内联编码沉底（见 inline_preedit_bottom）：候选项装配完毕后按原顺序追加编码与模式标记。
+        // 竖排未并入的翻页栏另在末尾装配段随 swap 翻到顶部，故此处追加即为窗口最底部。
+        for node in inline_tail {
+            list = list.child(node);
         }
 
         // 翻页器（多页时）：‹ p/t › —— 箭头可点击翻页，带悬停高亮 + 禁用态
