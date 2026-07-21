@@ -45,12 +45,14 @@ pub fn parse_unigram_freqs(path: &Path) -> anyhow::Result<Vec<(String, f64)>> {
 /// mmap 版 Unigram 模型：词频数据走 mmap（几乎不占常驻内存），
 /// 仅 user_freq（用户选词加成）在内存。优先选用此实现。
 pub struct MmapUnigram {
-    reader: UnigramReader,
+    /// 经 [`wind_dict::reader_pool`] 按路径共享：pinyin / shuangpin / 混输子引擎都指向
+    /// 同一个 `<cache>/pinyin/unigram.wdb`，此前各映射一份。
+    reader: std::sync::Arc<UnigramReader>,
     user_freq: RwLock<HashMap<String, i32>>,
 }
 
 impl MmapUnigram {
-    pub fn new(reader: UnigramReader) -> Self {
+    pub fn new(reader: std::sync::Arc<UnigramReader>) -> Self {
         Self {
             reader,
             user_freq: RwLock::new(HashMap::new()),

@@ -11,6 +11,7 @@ pub mod datformat;
 pub mod hotcache;
 pub mod layer;
 pub mod manager;
+pub mod reader_pool;
 pub mod store_layer;
 pub mod trie;
 pub mod unigram;

@@ -5,6 +5,7 @@
 use crate::codetable::CodetableDict;
 use crate::datformat::{WdatReader, WdatWriter};
 use std::path::Path;
+use std::sync::Arc;
 use tracing::{info, warn};
 
 /// 一条查询命中，含音节边界。由 [`CachedDict::search_with_boundary`] /
@@ -22,8 +23,13 @@ pub struct DictHit {
 
 /// 缓存词典：优先使用 mmap，回退到内存模式
 pub enum CachedDict {
-    /// mmap 零拷贝模式（低内存，wdat DAT 格式）
-    Mmap(WdatReader),
+    /// mmap 零拷贝模式（低内存，wdat DAT 格式）。
+    ///
+    /// reader 经 [`crate::reader_pool`] 按文件路径共享：同一个 wdat 被多个方案引用时
+    /// （如 pinyin / shuangpin / 混输子引擎同指 rime_frost）只映射一份。用 `Arc` 而非
+    /// 独占持有，是为了让最后一个持有者释放时 mmap 随之解除——词库重建要 rename 覆盖，
+    /// Windows 上映射未解除会 Access Denied。
+    Mmap(Arc<WdatReader>),
     /// 内存模式（首次加载或缓存写入失败）
     Memory(CodetableDict),
 }
@@ -55,7 +61,7 @@ impl CachedDict {
     ) -> anyhow::Result<Self> {
         // 检查缓存是否有效
         if Self::cache_is_valid(yaml_path, wdb_path, lowercase_code) {
-            match WdatReader::open(wdb_path) {
+            match crate::reader_pool::open_wdat(wdb_path) {
                 Ok(reader) => {
                     info!(
                         "Using mmap cache: {} ({} keys)",
@@ -100,7 +106,7 @@ impl CachedDict {
         );
 
         // 用 mmap 重新打开缓存
-        match WdatReader::open(wdb_path) {
+        match crate::reader_pool::open_wdat(wdb_path) {
             Ok(reader) => {
                 info!(
                     "Using mmap cache: {} ({} keys)",

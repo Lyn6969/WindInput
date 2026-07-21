@@ -1853,7 +1853,7 @@ impl EngineManager {
     /// 几乎不占常驻内存（页按需载入），替代旧的全量 HashMap 方案。
     fn load_unigram_mmap(ug_txt: &Path) -> Option<Arc<dyn crate::pinyin::lm::UnigramLookup>> {
         use crate::pinyin::lm::{MmapUnigram, parse_unigram_freqs};
-        use wind_dict::unigram::{UnigramReader, write_unigram_wdb};
+        use wind_dict::unigram::write_unigram_wdb;
 
         let ug_wdb = cache_path(ug_txt, "wdb");
         // wdb 比 txt 新则直接用；否则从 txt 重建
@@ -1875,7 +1875,7 @@ impl EngineManager {
                 }
             }
         }
-        match UnigramReader::open(&ug_wdb) {
+        match wind_dict::reader_pool::open_unigram(&ug_wdb) {
             Ok(reader) => {
                 info!(
                     "Unigram mmap: {} ({} keys)",
@@ -2070,7 +2070,7 @@ impl EngineManager {
             .collect();
         let paths: Vec<&Path> = expanded.iter().map(|p| p.as_path()).collect();
         if Self::combined_cache_fresh(&paths, combined, COMBINED_CACHE_TAG) {
-            if let Ok(reader) = wind_dict::datformat::WdatReader::open(combined) {
+            if let Ok(reader) = wind_dict::reader_pool::open_wdat(combined) {
                 info!(
                     "Using combined cache: {} ({} keys)",
                     combined.display(),
@@ -2122,7 +2122,7 @@ impl EngineManager {
             Ok(_) => {
                 // 写内容指纹(覆盖全部源，与上面 fresh 校验的 paths 一致)
                 wind_dict::cache_fp::write_cache_fp(combined, &paths, COMBINED_CACHE_TAG);
-                match wind_dict::datformat::WdatReader::open(combined) {
+                match wind_dict::reader_pool::open_wdat(combined) {
                     Ok(reader) => {
                         info!(
                             "Wrote combined cache: {} ({} keys from {} dicts)",
@@ -2241,7 +2241,7 @@ impl EngineManager {
         if merged_wdb.exists()
             && Self::combined_cache_fresh(&src_refs, &merged_wdb, MERGED_CACHE_TAG)
         {
-            match wind_dict::datformat::WdatReader::open(&merged_wdb) {
+            match wind_dict::reader_pool::open_wdat(&merged_wdb) {
                 Ok(reader) => {
                     info!(
                         "Using merged mmap cache: {} ({} keys)",
@@ -2345,7 +2345,7 @@ impl EngineManager {
             if target.as_path() == merged_wdb.as_path() {
                 wind_dict::cache_fp::write_cache_fp(&merged_wdb, &src_refs, MERGED_CACHE_TAG);
             }
-            match wind_dict::datformat::WdatReader::open(target) {
+            match wind_dict::reader_pool::open_wdat(target) {
                 Ok(reader) => {
                     info!(
                         "Using merged mmap cache: {} ({} keys)",
