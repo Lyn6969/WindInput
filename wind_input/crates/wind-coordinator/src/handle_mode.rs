@@ -204,15 +204,15 @@ impl Coordinator {
         state: &mut State,
         refresh: &dyn Fn(&Self, &mut State) -> KeyAction,
     ) -> KeyAction {
-        let Some((code, _, _, _)) = state.committed_segs.pop() else {
+        let Some((raw_code, _, _, _, _)) = state.committed_segs.pop() else {
             return KeyAction::Consumed;
         };
         state.committed_text = state
             .committed_segs
             .iter()
-            .map(|(_, t, _, _)| t.as_str())
+            .map(|(_, _, t, _, _)| t.as_str())
             .collect();
-        state.mix_buffer = format!("{}{}", code, state.mix_buffer);
+        state.mix_buffer = format!("{}{}", raw_code, state.mix_buffer);
         state.mix_cursor = state.mix_buffer.len();
         refresh(self, state)
     }
@@ -676,9 +676,13 @@ impl Coordinator {
                 page_offset as i32,
                 wind_store::stats::CommitSource::Mix,
             );
-            state
-                .committed_segs
-                .push((code, cand.text.clone(), cand.source, cand.boundary));
+            state.committed_segs.push((
+                Self::raw_consumed_code(&state.mix_buffer, consumed, true),
+                code,
+                cand.text.clone(),
+                cand.source,
+                cand.boundary,
+            ));
             state.committed_text.push_str(&cand.text);
             state.mix_buffer = state.mix_buffer[consumed..].to_string();
             // 分步确认消费掉前缀码：光标落剩余码末尾
@@ -700,9 +704,13 @@ impl Coordinator {
             if !numeric {
                 let code = Self::cand_code(&state.mix_buffer, &cand);
                 self.record_selection(&code, &cand.text, cand.source);
-                state
-                    .committed_segs
-                    .push((code, cand.text.clone(), cand.source, cand.boundary));
+                state.committed_segs.push((
+                    state.mix_buffer.clone(), // 消费整串：回退码即整个缓冲
+                    code,
+                    cand.text.clone(),
+                    cand.source,
+                    cand.boundary,
+                ));
                 self.learn_phrase_on_commit(state);
             }
             // 输入统计：混合模式上屏（计算结果 code_len=0；选词用候选码长）。

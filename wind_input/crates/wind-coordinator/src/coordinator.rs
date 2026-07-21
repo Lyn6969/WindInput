@@ -425,13 +425,27 @@ pub(crate) struct State {
     /// 全部转换完才整体上屏）。内部存简体原文，输出时再 s2t。仅拼音/临拼/混输文本透镜使用，
     /// 码表（五笔）选词消费整串、绝不进入此态。见 docs/redesign/pinyin-composition-enhance.md。
     pub(crate) committed_text: String,
-    /// 已转换前缀的分段记录 (消费码, 汉字, 候选来源)：供退格逐段回退与完整上屏时自动造词。
-    /// 来源用于混输自动造词的"全段同源"归属路由（P2d）。
-    /// 已分步上屏的段：`(code, text, source, boundary)`。
+    /// 已分步上屏的段：`(raw_code, code, text, source, boundary)`。
+    /// 供退格逐段回退与完整上屏时自动造词；来源用于混输自动造词的"全段同源"归属路由（P2d）。
+    ///
+    /// # 为什么记两份码
+    ///
+    /// 两个消费者要的量纲天生不同，**不可合并**：
+    /// - `raw_code` = **原始输入空间**的消费码（双拼下是击键 `hc`）。退格回退（`pop_*_seg`）
+    ///   把它并回输入缓冲，故必须与缓冲同域。
+    /// - `code` = **全拼语义**码（`hao`）。词频记账与自动造词（`learn_phrase_on_commit`）
+    ///   用它，且 `boundary` 的位移量按 `code.len()` 算——换成双拼击键会写坏用户词库
+    ///   并让音节边界位全错。
+    ///
+    /// 引擎侧只把 `consumed_length` 回映射到原始输入空间，`code` 刻意保持全拼语义
+    /// （见 `wind_engine::pinyin` 中 `map_consumed_length` 与 Fix A 的注释）。曾因这里
+    /// 只记全拼码，双拼下退格把 `hao` 并回击键缓冲 `ma` → 重解析成 `ha|o|ma` 而错乱。
+    /// 非双拼场景两者恒相等。
+    ///
     /// boundary = 该段 code 的音节边界（见 `wind_dict::binformat::DictEntry::boundary`）；
     /// 段自身可能是多音节整词（选「你好」→ 段码 nihao、段内边界 ni|hao），故自动造词拼接
     /// 各段时须把段内边界平移到全局位置，不能只按「一段一音节」记。
-    pub(crate) committed_segs: Vec<(String, String, CandidateSource, u64)>,
+    pub(crate) committed_segs: Vec<(String, String, String, CandidateSource, u64)>,
     /// 当前激活的独占输入模式（临时拼音/快捷输入/临时英文）。`None` = 普通输入。
     /// 单点决策的唯一真相源：结构上保证同一时刻至多一个独占模式（见 `pipeline.rs`）。
     pub(crate) active: Option<ModeKind>,

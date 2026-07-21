@@ -1021,15 +1021,17 @@ impl Coordinator {
     /// 光标一律拉到剩余编码末尾：回退的码插在缓冲前部，光标留在原处会落进这段码中间，
     /// 语义不清。无段可退时（理论边界）吃掉按键，不透传。
     pub(crate) fn pop_committed_seg(&self, state: &mut State) -> KeyAction {
-        let Some((code, _, _, _)) = state.committed_segs.pop() else {
+        // 并回缓冲的必须是 raw_code（原始输入空间），不是全拼 code：双拼下后者会把
+        // `hao` 塞进击键缓冲，被重解析成 `ha|o` 而整串错乱。
+        let Some((raw_code, _, _, _, _)) = state.committed_segs.pop() else {
             return KeyAction::Consumed;
         };
         state.committed_text = state
             .committed_segs
             .iter()
-            .map(|(_, t, _, _)| t.as_str())
+            .map(|(_, _, t, _, _)| t.as_str())
             .collect();
-        state.input_buffer = format!("{}{}", code, state.input_buffer);
+        state.input_buffer = format!("{}{}", raw_code, state.input_buffer);
         state.input_cursor_pos = state.input_buffer.len();
         self.update_candidates(state);
         let display = state.preedit.clone();
@@ -1098,11 +1100,25 @@ impl Coordinator {
     }
 
     /// 拼音类「消费码」：候选自带 code（拼音段）则用之，否则退回整个输入缓冲。
+    /// **全拼语义**（双拼下为 `hao` 而非击键 `hc`），供词频记账与自动造词。
+    /// 退格回退需要的是同域于缓冲的码，见 `raw_consumed_code`。
     pub(crate) fn cand_code(buf: &str, cand: &Candidate) -> String {
         if cand.code.is_empty() {
             buf.to_string()
         } else {
             cand.code.clone()
+        }
+    }
+
+    /// 分步上屏的「回退码」：本次从缓冲**实际切走**的那一段原始输入。
+    /// 双拼下即击键（`hc`），与 `cand_code` 的全拼码（`hao`）不同域——`consumed_length`
+    /// 已由引擎回映射到原始输入空间，故直接按它切缓冲即得。`partial=false`（消费整串）
+    /// 时整个缓冲都被消费。调用方须已确认 `consumed` 落在字符边界上。
+    pub(crate) fn raw_consumed_code(buf: &str, consumed: usize, partial: bool) -> String {
+        if partial {
+            buf[..consumed].to_string()
+        } else {
+            buf.to_string()
         }
     }
 
@@ -1176,10 +1192,15 @@ impl Coordinator {
             candidate_pos,
             wind_store::stats::CommitSource::Candidate,
         );
+        let raw_code = Self::raw_consumed_code(&state.input_buffer, consumed, partial);
         if partial {
-            state
-                .committed_segs
-                .push((code, cand.text.clone(), cand.source, cand.boundary));
+            state.committed_segs.push((
+                raw_code,
+                code,
+                cand.text.clone(),
+                cand.source,
+                cand.boundary,
+            ));
             state.committed_text.push_str(&cand.text);
             state.input_buffer = state.input_buffer[consumed..].to_string();
             // 分步确认消费掉前缀码：剩余编码整体左移，光标落到剩余码末尾（对齐 Go）。
@@ -1194,6 +1215,7 @@ impl Coordinator {
             }
         } else {
             state.committed_segs.push((
+                raw_code,
                 code.clone(),
                 cand.text.clone(),
                 cand.source,

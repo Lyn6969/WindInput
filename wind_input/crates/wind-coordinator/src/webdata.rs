@@ -2967,10 +2967,20 @@ mod tests {
             let mut st = c.state.lock().unwrap();
             st.committed_segs.clear();
             // 段各为单音节（段内边界 0b1）→ 自动造词拼出 nihao 时全局边界应为 ni|hao = 0b101。
-            st.committed_segs
-                .push(("ni".into(), "你".into(), CandidateSource::Pinyin, 0b1));
-            st.committed_segs
-                .push(("hao".into(), "好".into(), CandidateSource::Pinyin, 0b1));
+            st.committed_segs.push((
+                "ni".into(),
+                "ni".into(),
+                "你".into(),
+                CandidateSource::Pinyin,
+                0b1,
+            ));
+            st.committed_segs.push((
+                "hao".into(),
+                "hao".into(),
+                "好".into(),
+                CandidateSource::Pinyin,
+                0b1,
+            ));
             c.learn_phrase_on_commit(&st);
         }
         let py_words = store.get_temp_words("pinyin", "nihao").unwrap();
@@ -2991,10 +3001,20 @@ mod tests {
             let mut st = c.state.lock().unwrap();
             st.committed_segs.clear();
             // 码表段无音节概念（boundary=0）→ 整词边界作废（半截边界比没有更糟）。
-            st.committed_segs
-                .push(("aaaa".into(), "工".into(), CandidateSource::CodeTable, 0));
-            st.committed_segs
-                .push(("hao".into(), "好".into(), CandidateSource::Pinyin, 0b1));
+            st.committed_segs.push((
+                "aaaa".into(),
+                "aaaa".into(),
+                "工".into(),
+                CandidateSource::CodeTable,
+                0,
+            ));
+            st.committed_segs.push((
+                "hao".into(),
+                "hao".into(),
+                "好".into(),
+                CandidateSource::Pinyin,
+                0b1,
+            ));
             c.learn_phrase_on_commit(&st);
         }
         for schema in ["ct_test", "pinyin", "mx_test"] {
@@ -3008,10 +3028,20 @@ mod tests {
         {
             let mut st = c.state.lock().unwrap();
             st.committed_segs.clear();
-            st.committed_segs
-                .push(("aa".into(), "工".into(), CandidateSource::CodeTable, 0));
-            st.committed_segs
-                .push(("bb".into(), "人".into(), CandidateSource::CodeTable, 0));
+            st.committed_segs.push((
+                "aa".into(),
+                "aa".into(),
+                "工".into(),
+                CandidateSource::CodeTable,
+                0,
+            ));
+            st.committed_segs.push((
+                "bb".into(),
+                "bb".into(),
+                "人".into(),
+                CandidateSource::CodeTable,
+                0,
+            ));
             c.learn_phrase_on_commit(&st);
         }
         let ct_words = store.get_temp_words("ct_test", "aabb").unwrap();

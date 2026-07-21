@@ -3736,6 +3736,63 @@ fn test_backspace_pops_segment_regardless_of_cursor() {
     assert_eq!(action_caret(&act), Some(6), "回退后光标拉到缓冲末尾");
 }
 
+/// 回归：**双拼**分步上屏后退格，回退的必须是原始击键码而非全拼码。
+///
+/// 引擎只把 `consumed_length` 回映射到双拼击键空间，候选的 `code` 刻意保持全拼语义。
+/// 曾因 `committed_segs` 只记全拼码，退格把 `hao` 并回击键缓冲 `ma` → `haoma` 被当双拼
+/// 重解析成 `ha|o|ma`，preedit 变 `ha'oma`，此后整串错乱。
+///
+/// 用 `hcma`（小鹤：hao=hc、ma=ma）而非 `nihc`：**必须选一个双拼码 ≠ 全拼码的首音节**，
+/// 否则 bug 隐身——`ni` 两种码恰好相同，正是它让这个缺陷表现为「有时正常」。
+/// 末尾的 `nihc` 是对照组，锁住等长场景不被改动波及。
+#[test]
+fn test_shuangpin_backspace_restores_raw_keys() {
+    let d = data_dir();
+    if !d.join("schemas/shuangpin.schema.toml").exists() {
+        return;
+    }
+    let sp_cfg = || {
+        let mut cfg = Config::default();
+        cfg.schema.available = vec!["shuangpin".into()];
+        cfg.schema.active = "shuangpin".into();
+        cfg.input.default.chinese_mode = true;
+        cfg
+    };
+
+    // hcma → 「好吗」。选第 6 候选「好」（分步上屏，消费 hc 两键），再退格。
+    let coord = Coordinator::new_headless(sp_cfg(), Some(&d));
+    type_str(&coord, "hcma");
+    let page = coord.debug_page_texts();
+    let i = page
+        .iter()
+        .position(|t| t == "好")
+        .expect("首页应有单字候选「好」");
+    let act = tap(&coord, 0x31 + i as u32);
+    assert_eq!(
+        action_text(&act).as_deref(),
+        Some("好ma"),
+        "分步上屏：「好」入前缀，剩余击键 ma"
+    );
+    let act = tap(&coord, VK_BACK);
+    assert_eq!(
+        action_text(&act).as_deref(),
+        Some("hc'ma"),
+        "退格须还原**击键** hc（全拼 hao 会被重解析成 ha|o → \"ha'oma\"）"
+    );
+
+    // 对照：ni 的双拼码与全拼码相同，行为不得改变。
+    let coord = Coordinator::new_headless(sp_cfg(), Some(&d));
+    type_str(&coord, "nihc");
+    let page = coord.debug_page_texts();
+    let i = page.iter().position(|t| t == "你").expect("首页应有「你」");
+    tap(&coord, 0x31 + i as u32);
+    assert_eq!(
+        action_text(&tap(&coord, VK_BACK)).as_deref(),
+        Some("ni'hc"),
+        "等长场景行为不变"
+    );
+}
+
 // ---- overlay 模式的编码区光标 ----
 
 /// 临时英文：Shift+字母进入时缓冲已含首字母，光标须落其后（回归：曾因光标停在 0 而把

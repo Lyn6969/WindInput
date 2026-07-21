@@ -26,7 +26,7 @@ const EVICT_CHECK_INTERVAL: usize = 64;
 /// 自动造词超长裁剪：从尾部保留整段（最近输入优先）使合并字数 ≤ max_chars。
 /// 返回保留区间的起始段索引；max_chars=0 不限（返回 0）。
 fn trim_segs_start(
-    segs: &[(String, String, wind_candidate::CandidateSource, u64)],
+    segs: &[(String, String, String, wind_candidate::CandidateSource, u64)],
     max_chars: usize,
 ) -> usize {
     if max_chars == 0 {
@@ -34,7 +34,7 @@ fn trim_segs_start(
     }
     let mut total = 0;
     let mut start = segs.len();
-    for (i, (_, t, _, _)) in segs.iter().enumerate().rev() {
+    for (i, (_, _, t, _, _)) in segs.iter().enumerate().rev() {
         let n = t.chars().count();
         if total + n > max_chars {
             break;
@@ -341,7 +341,8 @@ impl Coordinator {
         let mut code = String::new();
         let mut boundary = 0u64;
         let mut boundary_ok = true;
-        for (c, _, _, b) in segs {
+        // 取**全拼** code（第 2 元）而非 raw_code：写入词库的编码与 boundary 位移都须全拼语义。
+        for (_, c, _, _, b) in segs {
             if *b == 0 || code.len() + c.len() > 64 {
                 boundary_ok = false;
             } else {
@@ -350,7 +351,7 @@ impl Coordinator {
             code.push_str(c);
         }
         let boundary = if boundary_ok { boundary } else { 0 };
-        let text: String = segs.iter().map(|(_, t, _, _)| t.as_str()).collect();
+        let text: String = segs.iter().map(|(_, _, t, _, _)| t.as_str()).collect();
         let min_len = if min_len == 0 { 2 } else { min_len };
         if text.chars().count() < min_len || code.is_empty() {
             return;
@@ -361,8 +362,8 @@ impl Coordinator {
         // 混输仅当全段同源时用该源归属 id（混源/无法归因跳过，混合码写给谁都无意义）。
         // 注：混源判定使用截后 segs，截掉的段不参与归属判断。
         let schema = if self.engine_mgr.schema_engine_type(&active).as_deref() == Some("mixed") {
-            let first = segs[0].2; // segs.len()>=2 已保证非空
-            if segs.iter().any(|(_, _, s, _)| *s != first) {
+            let first = segs[0].3; // segs.len()>=2 已保证非空
+            if segs.iter().any(|(_, _, _, s, _)| *s != first) {
                 return; // 混源：跳过自动造词
             }
             match self.engine_mgr.write_data_schema_id(&active, first) {
@@ -769,9 +770,22 @@ mod tests {
         // 辅助：构造含 2 段的 State 并调用 learn_phrase_on_commit
         let make_state_with_segs = || {
             let mut st = c.state.lock().unwrap();
+            // 码表段：raw_code 与 code 同为击键码（无双拼转换）。
             st.committed_segs = vec![
-                ("aa".to_string(), "工".to_string(), CS::CodeTable, 0),
-                ("bb".to_string(), "人".to_string(), CS::CodeTable, 0),
+                (
+                    "aa".to_string(),
+                    "aa".to_string(),
+                    "工".to_string(),
+                    CS::CodeTable,
+                    0,
+                ),
+                (
+                    "bb".to_string(),
+                    "bb".to_string(),
+                    "人".to_string(),
+                    CS::CodeTable,
+                    0,
+                ),
             ];
             drop(st);
         };
@@ -922,7 +936,15 @@ mod tests {
     #[test]
     fn trim_segs_keeps_tail_within_max() {
         use wind_candidate::CandidateSource as S;
-        let seg = |c: &str, t: &str| (c.to_string(), t.to_string(), S::CodeTable, 0u64);
+        let seg = |c: &str, t: &str| {
+            (
+                c.to_string(),
+                c.to_string(),
+                t.to_string(),
+                S::CodeTable,
+                0u64,
+            )
+        };
         let segs = vec![seg("aa", "工人"), seg("bb", "们"), seg("cc", "好的")];
         // 总 5 字，max=3 → 从尾部保留 "们"(1)+"好的"(2)=3 字，起始索引 1
         assert_eq!(trim_segs_start(&segs, 3), 1);
