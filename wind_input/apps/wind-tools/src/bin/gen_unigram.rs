@@ -10,7 +10,13 @@ use std::collections::HashMap;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
-// 按顺序合并；tencent 词库量大但质量参差，放最后（被更高质量词库的频次覆盖累加）
+// 同一词条出现在多个词库时**取最高频次**，不是累加。
+//
+// 这几个词库互相重叠（base/ext/tencent 都收常用词），各自的 weight 是独立标定的词频，
+// 累加等于重复计数——一个词恰好被 N 个库收录就被放大 N 倍，而被多库收录的恰恰是常用词，
+// 结果是系统性抬高常用词权重。取 max 相当于选最可信的那次标定。
+//
+// 取 max 使合并结果与文件顺序无关，故此表的次序仅影响日志可读性。
 const DICT_FILES: &[&str] = &[
     "base.dict.yaml",
     "ext.dict.yaml",
@@ -35,7 +41,14 @@ fn main() -> anyhow::Result<()> {
         let loaded = load_dict_freqs(&path)?;
         eprintln!("  {} → {} 条", fname, loaded.len());
         for (text, freq) in loaded {
-            *freqs.entry(text).or_default() += freq;
+            freqs
+                .entry(text)
+                .and_modify(|cur| {
+                    if freq > *cur {
+                        *cur = freq;
+                    }
+                })
+                .or_insert(freq);
         }
     }
 
@@ -90,7 +103,7 @@ fn load_dict_freqs(path: &Path) -> anyhow::Result<Vec<(String, f64)>> {
         // rime-frost 拼音格式：text\tpinyin[\tweight]
         // text 第一列为中文（非纯 ASCII）
         let text = parts[0];
-        if text.chars().all(|c| c.is_ascii()) {
+        if text.is_ascii() {
             continue;
         }
         let freq: f64 = parts.get(2).and_then(|s| s.parse().ok()).unwrap_or(1.0);
