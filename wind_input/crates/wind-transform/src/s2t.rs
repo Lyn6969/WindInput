@@ -64,9 +64,61 @@ impl Dict {
     }
 
     /// 从文件加载。
+    ///
+    /// 分三段读，而不是「整文件 `fs::read` 进内存再 `parse`」——后者会让整份文件与从中
+    /// 切出来的字符串池（`parse` 里那次 `to_vec`）同时存活，峰值达常驻的两倍：
+    /// STPhrases 实测常驻 1.42 MB（entries 0.56 + strings 0.86），而整文件另有 1.43 MB，
+    /// 峰值 2.85 MB。
+    ///
+    /// 这里 entries 区读进临时缓冲、解析完即释放，字符串区直接读进最终的 `Vec`，
+    /// 全程没有任何一份数据被同时持有两次，**峰值等于常驻**。
     pub fn load(path: &Path) -> Option<Dict> {
-        let data = std::fs::read(path).ok()?;
-        Self::parse(&data)
+        use std::io::Read;
+
+        let mut f = std::fs::File::open(path).ok()?;
+        let total = f.metadata().ok()?.len() as usize;
+
+        let mut header = [0u8; HEADER_SIZE];
+        f.read_exact(&mut header).ok()?;
+        if &header[0..4] != MAGIC {
+            return None;
+        }
+        if u32::from_le_bytes(header[4..8].try_into().ok()?) != 1 {
+            return None;
+        }
+        let count = u32::from_le_bytes(header[8..12].try_into().ok()?) as usize;
+        let max_key = u16::from_le_bytes(header[12..14].try_into().ok()?) as usize;
+
+        // count 来自文件，可能损坏：先防乘法溢出，再校验不越界，避免据此分配巨量缓冲。
+        let entries_len = count.checked_mul(ENTRY_SIZE)?;
+        let entries_end = HEADER_SIZE.checked_add(entries_len)?;
+        if entries_end > total {
+            return None;
+        }
+
+        // 条目区：临时缓冲解析完立刻释放，不与字符串池并存。
+        let mut buf = vec![0u8; entries_len];
+        f.read_exact(&mut buf).ok()?;
+        let mut entries = Vec::with_capacity(count);
+        for chunk in buf.chunks_exact(ENTRY_SIZE) {
+            entries.push(Entry {
+                key_off: u32::from_le_bytes(chunk[0..4].try_into().ok()?),
+                key_len: u16::from_le_bytes(chunk[4..6].try_into().ok()?),
+                val_off: u32::from_le_bytes(chunk[6..10].try_into().ok()?),
+                val_len: u16::from_le_bytes(chunk[10..12].try_into().ok()?),
+            });
+        }
+        drop(buf);
+
+        // 余下全是字符串池，直接读进最终 Vec（预分配，省掉 read_to_end 的逐次扩容）。
+        let mut strings = Vec::with_capacity(total - entries_end);
+        f.read_to_end(&mut strings).ok()?;
+
+        Some(Dict {
+            entries,
+            strings,
+            max_key_len: max_key,
+        })
     }
 
     fn val_of(&self, i: usize) -> &[u8] {
@@ -230,6 +282,60 @@ mod tests {
         // 词级最长匹配（软件 → 軟件，标准 s2t 不转台湾习惯词）
         let r = conv.convert("计算机");
         assert!(r.chars().count() == 3, "长度应保持，实际: {}", r);
+    }
+
+    /// `load` 改成分段读之后，必须与「整文件读入再 parse」逐字段等价。
+    /// 这是本次改动唯一可能出错的地方：偏移算错会让整张表静默错位。
+    #[test]
+    fn load_is_equivalent_to_read_then_parse() {
+        let p = opencc_dir().join("STPhrases.octrie");
+        if !p.exists() {
+            eprintln!("跳过：缺少 opencc 数据");
+            return;
+        }
+        let via_load = Dict::load(&p).expect("load 应成功");
+        let via_parse = Dict::parse(&std::fs::read(&p).unwrap()).expect("parse 应成功");
+
+        assert_eq!(via_load.max_key_len, via_parse.max_key_len);
+        assert_eq!(via_load.strings, via_parse.strings, "字符串池必须逐字节一致");
+        assert_eq!(via_load.entries.len(), via_parse.entries.len());
+        for (i, (a, b)) in via_load
+            .entries
+            .iter()
+            .zip(via_parse.entries.iter())
+            .enumerate()
+        {
+            assert_eq!(
+                (a.key_off, a.key_len, a.val_off, a.val_len),
+                (b.key_off, b.key_len, b.val_off, b.val_len),
+                "第 {i} 条 entry 不一致"
+            );
+        }
+    }
+
+    /// 损坏的 count 不得据此分配巨量缓冲（分段读要先自己校验，不再有 parse 的
+    /// `entries_end > data.len()` 兜底）。
+    #[test]
+    fn load_rejects_corrupt_count() {
+        let dir = std::env::temp_dir().join(format!("wind-s2t-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = dir.join("bad.octrie");
+
+        let mut d = Vec::new();
+        d.extend_from_slice(MAGIC);
+        d.extend_from_slice(&1u32.to_le_bytes()); // version
+        d.extend_from_slice(&u32::MAX.to_le_bytes()); // count：远超文件实际长度
+        d.extend_from_slice(&4u16.to_le_bytes()); // max_key
+        d.extend_from_slice(&[0u8; 2]); // 补齐 HEADER_SIZE
+        assert_eq!(d.len(), HEADER_SIZE);
+        std::fs::write(&p, &d).unwrap();
+
+        assert!(
+            Dict::load(&p).is_none(),
+            "count 越界时应直接拒绝，而不是尝试分配 48GB"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
