@@ -186,10 +186,22 @@ impl LatticeBuilder {
                     continue;
                 }
 
-                // 查找词典
-                let results = dict.search(&code);
-                for (text, weight, _order) in &results {
-                    let log_prob = score_node(text, *weight, unigram);
+                // 本跨度的期望边界 mask：节点的"切分"就是 syllables[start..end] 本身，
+                // 与词典真值边界同域（都是 code 内各音节的起始字节位），可直接比对。
+                let expect_mask = super::syllables_boundary_mask(&syllables[start..end], code.len());
+
+                // 查找词典（带边界）。校验词条真值边界与本跨度一致，否则该词根本不是
+                // 用户按这个切分敲出来的：「李安」真值 li|an 不该从单音节边 lian 进词图。
+                // boundary == 0（五笔码 / code 超 64 字节 / 旧格式）由 boundary_compatible
+                // 内部降级放行——不设防好过误杀。
+                let results = dict.search_with_boundary(&code);
+                for hit in &results {
+                    if !super::boundary_compatible(hit.boundary, expect_mask, code.len(), code.len())
+                    {
+                        continue;
+                    }
+                    let (text, weight) = (&hit.text, hit.weight);
+                    let log_prob = score_node(text, weight, unigram);
                     nodes[char_end].push(LatticeNode {
                         start: char_start,
                         end: char_end,
@@ -200,6 +212,12 @@ impl LatticeBuilder {
                 }
 
                 // 模糊拼音变体
+                //
+                // **刻意不做边界校验**：词典返回的 boundary 是**变体码**空间的偏移
+                // （zhongguo 的 {0,5}），而 expect_mask 在用户**原码**空间（zong|guo 的
+                // {0,4}）。z→zh 这类变体改变码长，两者位偏移不同域，直接比对会把正确的
+                // 模糊命中整片误杀。这与 mod.rs:304/322 对模糊变体一律置 boundary=0
+                // 的既有决策一致，是已记录的永久缺口（待跨域偏移映射），本阶段不碰。
                 if let Some(fuzzy) = fuzzy_config {
                     let variants = FuzzyMatcher::fuzzy_variants(&code, fuzzy);
                     for variant in variants {
