@@ -17,8 +17,8 @@ use crate::sys::{
 };
 use crate::text::dwrite::TextRenderer;
 use crate::view::{Align, Edges, Layout, Rect, View};
-use wind_theme::schema::Dim;
 use crate::window::{LayeredWindow, WindowMouse};
+use wind_theme::schema::Dim;
 #[cfg(windows)]
 use windows::Win32::Foundation::{GlobalFree, HANDLE, HGLOBAL};
 #[cfg(windows)]
@@ -623,7 +623,8 @@ impl PopupMenu {
         let views = self.theme.as_ref().map(|t| &t.views);
         let mi = views.and_then(|v| v.menu_item.as_ref());
         let mroot = views.and_then(|v| v.menu_root.as_ref());
-        let resolve_dim = |o: Option<Dim>, def: f32| o.map(|x| x.resolve(s, 0.0)).unwrap_or(def * s);
+        let resolve_dim =
+            |o: Option<Dim>, def: f32| o.map(|x| x.resolve(s, 0.0)).unwrap_or(def * s);
         let item_h = (FONT_PX * 1.9 * s).ceil();
         // item 内边距：menu.item.padding（左→x、上→y）优先，默认 xy(12,4)。
         let pad = Edges::xy(
