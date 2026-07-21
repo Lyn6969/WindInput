@@ -1,0 +1,99 @@
+# gen_dict 配置：五笔主词库生成与扩展词库拆分
+#
+# 只放算法参数与输入/输出文件名；目录由命令行给出：
+#   --cache <dir>   源数据目录（对应 .cache/）
+#   --out   <dir>   词库输出目录（对应 data/schemas/wubi86/）
+#   --report <dir>  分析报告输出目录，省略则不写报告
+#
+# 本文件由 WindInput-Go 的 tools/dictgen/dictgen.yaml 移植而来，
+# 所有数值参数与原版保持一致——改动会直接改变发行词库的候选顺序。
+
+# ── 输入（相对 --cache）─────────────────────────────────
+jidian_path = "rime-wubi/wubi86_jidian.dict.yaml"
+unigram_path = "pinyin-frost/unigram.txt"
+
+# ── 输出（相对 --out）───────────────────────────────────
+# 扩展库文件名由 output_name 派生：wubi86_jidian_{extra,emoji,english,symbols}.dict.yaml
+output_path = "wubi86_jidian.dict.yaml"
+output_name = "wubi86_jidian"
+
+# ── 原样透传（相对 --cache，输出同名到 --out）───────────
+# 这类词库的条目顺序本身就是数据（district 按行政区划层级排列），按词频重排会毁掉它。
+# 故只复制 + 清洗头部的 sort: 键，内容一字不改。
+passthrough = ["rime-wubi/wubi86_jidian_extra_district.dict.yaml"]
+
+# ── 人工维护的补充数据（相对本配置文件）─────────────────
+custom_words_path = "custom_words.txt"
+custom_emoji_path = "custom_emoji.txt"
+boosts_path = "boost_words.txt"
+
+# ── 分析报告（相对 --report，未传 --report 则不写）───────
+dropped_path = "wubi86_jidian.dict.filtered.tsv"
+conflict_report_path = "wubi86_jidian.shortcode_conflicts.tsv"
+demotion_report_path = "wubi86_jidian.demotion_candidates.tsv"
+
+# ── 权重归一化 ─────────────────────────────────────────
+target_median = 1000    # unigram 中位词频映射到此权重
+weight_max = 9999
+weight_min = 1
+char_boost_factor = 1.3 # 单字权重倍增，让高频单字优先于低频词组
+
+# 普通词条权重上限，须低于 [shortcodes].level3_base_weight
+# （顶层键必须写在所有 [段] 之前，否则会被当成前一个段的字段）
+regular_weight_max = 8999
+
+# 生僻字保底权重（无 unigram 命中时按 jidian 原始优先级给底线）
+[fallback]
+priority_30 = 180
+priority_20 = 150
+priority_10 = 120
+
+# ── 简码优先级分层 ─────────────────────────────────────
+# 识别规则：单字 + 码长 ≤ 3，级别 = 码长；简码表直接从 jidian 原词库提取。
+# 权重区间参考极爽词库比例（一简≈99.7% 最大值）：简码占权重顶部，普通词条严格在下方。
+[shortcodes]
+enabled = true
+level1_weight = 9999      # 一级简码（25 个，每码唯一）
+level2_base_weight = 9950 # 二级简码基础权重，组内按 jidian 顺序递减
+level3_base_weight = 9000 # 三级简码基础权重，组内按 jidian 顺序递减（900 个槽）
+
+# ── 简码降权策略 ───────────────────────────────────────
+# 当一个字同时占据简码和 4 码全码首选时，按第二候选的权重决定是否给简码字降权。
+[demotion]
+enabled = true
+filter_threshold = 200        # 第二候选权重低于此值直接忽略（极低频词/生僻字）
+single_char_promote_wt = 1000 # 单字第二候选权重 ≥ 此值时触发降权
+word_promote_wt = 800         # 词组第二候选权重 ≥ 此值时触发降权
+max_gap_ratio_single = 0.60   # 单字：gap/首字权重 > 此比例则保留（首字优势太大）
+max_gap_ratio_word = 0.65     # 词组：gap/首字权重 > 此比例则保留
+
+# ── 扩展词库拆分 ───────────────────────────────────────
+# 把 jidian_extra.dict.yaml 按字符类型拆成 4 个独立文件。
+# 中文条目（CJK 桶）按 unigram 加权；emoji/english/symbols 桶保留原权重。
+[extra]
+enabled = true
+input_path = "rime-wubi/wubi86_jidian_extra.dict.yaml" # 相对 --cache
+default_weight = 100 # emoji/english/symbols 桶里无原始权重时的兜底值
+
+# ── 内置过滤 ───────────────────────────────────────────
+[filter]
+drop_z_code = true     # 过滤 z 开头的编码（反查占位码）
+drop_dollar = true     # 过滤 $ 开头的词条
+drop_emoji = true      # 过滤含 emoji 的词条
+drop_pure_latin = true # 过滤纯 ASCII 词条
+drop_pua = false       # 不过滤 PUA 字符（五笔字根字，属合法生僻字）
+require_cjk = false    # 不强制要求含 CJK（允许标点等）
+max_code_len = 4       # 最大编码长度
+max_text_len = 16      # 最大词条长度（Unicode 字符数）
+
+# ── 手动过滤规则 ───────────────────────────────────────
+# code_prefix 优先于 code；except_codes 是前缀范围内保留的例外；
+# reason 会出现在 .filtered.tsv 里。
+[[drop_rules]]
+code_prefix = "co"
+reason = "co_shortcut"
+except_codes = [
+    "cogw", # 驜
+    "coqh", # 驎
+    "coaw", # 鸡米花
+]

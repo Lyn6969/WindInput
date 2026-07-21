@@ -2572,6 +2572,8 @@ name = "wind-tools"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "serde",
+ "toml 0.8.23",
 ]
 
 [[package]]

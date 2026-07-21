@@ -18,5 +18,11 @@ path = "src/bin/gen_unigram.rs"
 name = "gen_pinyin"
 path = "src/bin/gen_pinyin.rs"
 
+[[bin]]
+name = "gen_dict"
+path = "src/bin/gen_dict/main.rs"
+
 [dependencies]
 anyhow = { workspace = true }
+serde = { workspace = true }
+toml = { workspace = true }
