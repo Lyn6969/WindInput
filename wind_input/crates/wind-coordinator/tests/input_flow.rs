@@ -1632,6 +1632,61 @@ fn test_s2t_converts_candidate_display() {
 }
 
 #[test]
+fn test_s2t_one_to_many_variant_expansion() {
+    if !has_schemas() {
+        return;
+    }
+    let coord = Coordinator::new_headless(config_with("pinyin"), Some(&data_dir()));
+    if !coord.debug_set_s2t(true) {
+        eprintln!("跳过：缺少 opencc 数据");
+        return;
+    }
+    // 拼音输入 chu → 单字候选「出」（STCharacters 多值行 出→出 齣）应紧跟变体「齣」。
+    for c in "chu".chars() {
+        press_letter(&coord, c);
+    }
+    let internal = coord.debug_page_texts();
+    let display = coord.debug_page_display_texts();
+    let Some(p) = display.iter().position(|t| t == "出") else {
+        panic!("输入 chu 候选应含「出」，实际: {:?}", display);
+    };
+    assert!(
+        p + 1 < display.len() && display[p + 1] == "齣",
+        "「出」之后应紧跟 1对多变体「齣」，实际: {:?}",
+        display
+    );
+    // 变体候选**内部 text 保持简体**（词频/匹配域不被繁体污染）。
+    assert_eq!(internal[p], "出");
+    assert_eq!(internal[p + 1], "出", "变体候选内部 text 应仍是简体「出」");
+    // 选中变体（页内第 p+2 项，数字键 1-based）→ 上屏「齣」而非默认转换的「出」。
+    match coord.handle_key_event(&key_event(0x31 + (p + 1) as u32, EVENT_KEY_DOWN)) {
+        KeyAction::InsertText { text, .. } => {
+            assert_eq!(text, "齣", "选中变体候选应上屏「齣」");
+        }
+        other => panic!("应上屏 InsertText，实际: {:?}", other),
+    }
+}
+
+#[test]
+fn test_s2t_variant_absent_when_disabled() {
+    if !has_schemas() {
+        return;
+    }
+    let coord = Coordinator::new_headless(config_with("pinyin"), Some(&data_dir()));
+    // 简繁关闭：不展开变体，「出」之后不应出现内部 text 重复的变体候选。
+    for c in "chu".chars() {
+        press_letter(&coord, c);
+    }
+    let texts = coord.debug_page_texts();
+    let dup_adjacent = texts.windows(2).any(|w| w[0] == "出" && w[1] == "出");
+    assert!(
+        !dup_adjacent,
+        "简繁关闭时不应出现展开产生的相邻重复候选: {:?}",
+        texts
+    );
+}
+
+#[test]
 fn test_s2t_disabled_keeps_simplified() {
     if !has_schemas() {
         return;

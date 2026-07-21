@@ -34,6 +34,15 @@ fn main() -> anyhow::Result<()> {
         let n = compile_octrie(&path, &dst)?;
         eprintln!("  {} ({} 条) → {}", stem, n, dst.display());
         total += 1;
+        // STCharacters 的多值行（1对多变体，如「出→出 齣」）另编一张变体表：
+        // key→完整多值串（保留定义序，首个=默认转换结果）。主表仍取首值（OpenCC 转换
+        // 语义），变体表仅供候选层 1对多展开查询（wind-transform s2t::Converter::variants_of）。
+        if stem == "STCharacters" {
+            let vdst = out.join("STVariants.octrie");
+            let vn = compile_variants_octrie(&path, &vdst)?;
+            eprintln!("  STVariants ({} 条) → {}", vn, vdst.display());
+            total += 1;
+        }
     }
     eprintln!("gen_opencc: 编译 {} 个词典完成", total);
     Ok(())
@@ -44,20 +53,50 @@ fn compile_octrie(src: &Path, dst: &Path) -> anyhow::Result<usize> {
     let mut pairs: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
 
     for line in content.lines() {
-        let line = line.trim();
-        if line.is_empty() || line.starts_with('#') {
+        let Some((key, rest)) = parse_line(line) else {
             continue;
-        }
-        let Some(tab) = line.find('\t') else { continue };
-        let key = &line[..tab];
-        let rest = &line[tab + 1..];
+        };
         // 多值空格分隔，取第一个
         let val = rest.split(' ').next().unwrap_or(rest);
-        if !key.is_empty() && !val.is_empty() {
+        if !val.is_empty() {
             pairs.push((key.as_bytes().to_vec(), val.as_bytes().to_vec()));
         }
     }
+    write_octrie(pairs, dst)
+}
 
+/// 仅收集**多值行**（值含空格分隔的多个变体），val 保留完整多值串。
+fn compile_variants_octrie(src: &Path, dst: &Path) -> anyhow::Result<usize> {
+    let content = std::fs::read_to_string(src)?;
+    let mut pairs: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
+
+    for line in content.lines() {
+        let Some((key, rest)) = parse_line(line) else {
+            continue;
+        };
+        let vals: Vec<&str> = rest.split(' ').filter(|v| !v.is_empty()).collect();
+        if vals.len() > 1 {
+            pairs.push((key.as_bytes().to_vec(), vals.join(" ").into_bytes()));
+        }
+    }
+    write_octrie(pairs, dst)
+}
+
+/// 解析一行 TSV：跳过空行/注释/无 tab 行，返回 (key, 值区原串)。
+fn parse_line(line: &str) -> Option<(&str, &str)> {
+    let line = line.trim();
+    if line.is_empty() || line.starts_with('#') {
+        return None;
+    }
+    let tab = line.find('\t')?;
+    let key = &line[..tab];
+    if key.is_empty() {
+        return None;
+    }
+    Some((key, &line[tab + 1..]))
+}
+
+fn write_octrie(mut pairs: Vec<(Vec<u8>, Vec<u8>)>, dst: &Path) -> anyhow::Result<usize> {
     // 按 key 字节序排序，去重（保留首次出现）
     pairs.sort_by(|a, b| a.0.cmp(&b.0));
     pairs.dedup_by(|a, b| a.0 == b.0);

@@ -232,6 +232,16 @@ impl Coordinator {
         }
     }
 
+    /// 候选的**出口文本**（显示与上屏同源）：1对多变体候选（`s2t_override`）直接用覆盖
+    /// 文本，其余按需简繁转换。凡「拿某条候选去显示/上屏」一律走本函数，勿直接
+    /// `maybe_s2t(&c.text)`——否则变体候选会退化回默认转换结果（选「齣」出的却是「出」）。
+    pub(crate) fn cand_s2t_text(&self, state: &State, c: &Candidate) -> String {
+        match &c.s2t_override {
+            Some(t) => t.clone(),
+            None => self.maybe_s2t(state, &c.text),
+        }
+    }
+
     /// 若开启简繁转换，把简体文本转为繁体（数据缺失则原样返回）。
     pub(crate) fn maybe_s2t(&self, state: &State, text: &str) -> String {
         if state.s2t_enabled
@@ -720,7 +730,11 @@ impl Coordinator {
                 page_offset as i32,
                 wind_store::stats::CommitSource::Mix,
             );
-            let out = self.maybe_s2t(state, &out);
+            // 变体候选末段用覆盖文本；普通候选整体转换（保留 STPhrases 跨段词级消歧）。
+            let out = match &cand.s2t_override {
+                Some(t) => format!("{}{}", self.maybe_s2t(state, &state.committed_text), t),
+                None => self.maybe_s2t(state, &out),
+            };
             self.exit_mix_mode(state);
             self.notify_ui_hide();
             Self::commit_action(out, true)
@@ -796,6 +810,8 @@ impl Coordinator {
         }
         // 统一展开汇聚点：混输成员词库候选内 `$` 特殊语法在此展开（见 finalize_candidates）。
         state.candidates = self.finalize_candidates(cands, &state.mix_buffer);
+        // 简繁 1对多变体展开（约束见 expand_s2t_variants 文档）。
+        self.expand_s2t_variants(state);
     }
 
     /// 数字 lens（计算/表达式）：数字与符号（含 `=`）作输入，字母作选词。
@@ -1021,15 +1037,23 @@ impl Coordinator {
                             return self.mix_select(state, idx - start);
                         }
                     }
+                    // 高亮是变体候选时末段用覆盖文本；否则整体转换（保留跨段词级消歧）。
                     let head = if !state.candidates.is_empty() {
                         let idx = self
                             .highlighted_global_index(state)
                             .min(state.candidates.len() - 1);
-                        format!("{}{}", state.committed_text, state.candidates[idx].text)
+                        match &state.candidates[idx].s2t_override {
+                            Some(t) => {
+                                format!("{}{}", self.maybe_s2t(state, &state.committed_text), t)
+                            }
+                            None => self.maybe_s2t(
+                                state,
+                                &format!("{}{}", state.committed_text, state.candidates[idx].text),
+                            ),
+                        }
                     } else {
-                        state.committed_text.clone()
+                        self.maybe_s2t(state, &state.committed_text.clone())
                     };
-                    let head = self.maybe_s2t(state, &head);
                     let punct = self.convert_punct_char(state, ch);
                     self.exit_mix_mode(state);
                     self.notify_ui_hide();

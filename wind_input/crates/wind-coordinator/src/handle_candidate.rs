@@ -708,6 +708,58 @@ impl Coordinator {
         wind_candidate::apply_shadow(candidates, &rec.deleted, &pinned);
     }
 
+    /// 简繁 1对多变体展开：s2t 开启时，对最终候选列表中的**单字**候选，紧跟其后插入
+    /// 变体候选（如「出」→ 追加「齣」，STCharacters 多值行，全表 276 字）。变体候选
+    /// text 保持简体原字、输出走 `s2t_override`（见 `cand_s2t_text`）。
+    ///
+    /// 调用时机有两条硬约束：
+    /// - 必须在候选装配**全部完成后**（排序/去重/词频重排/shadow 之后）：去重按 text
+    ///   会把 text 相同的变体误删；重排会把变体与原字拆散。
+    /// - 必须在自动上屏判定**之后**：满码「唯一候选」判定若看到变体会误判不唯一，
+    ///   顶码/满码自动上屏被静默否决。
+    ///
+    /// 词级候选不展开：多字词的 1对多由 STPhrases 词级最长匹配消歧（一出戏→一齣戲）。
+    pub(crate) fn expand_s2t_variants(&self, state: &mut State) {
+        if !state.s2t_enabled {
+            return;
+        }
+        let guard = self.s2t.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(conv) = guard.as_ref() else {
+            return;
+        };
+        let mut i = 0;
+        while i < state.candidates.len() {
+            let c = &state.candidates[i];
+            let single = !c.is_command
+                && !c.is_group
+                && c.s2t_override.is_none()
+                && c.text.chars().count() == 1;
+            if !single {
+                i += 1;
+                continue;
+            }
+            let variants = conv.variants_of(&c.text);
+            if variants.is_empty() {
+                i += 1;
+                continue;
+            }
+            // 默认转换结果已由原字候选呈现（显示层 maybe_s2t），变体里滤掉它防止重复。
+            let default_out = conv.convert(&c.text);
+            let base = state.candidates[i].clone();
+            let mut at = i + 1;
+            for v in variants {
+                if v == default_out {
+                    continue;
+                }
+                let mut nc = base.clone();
+                nc.s2t_override = Some(v);
+                state.candidates.insert(at, nc);
+                at += 1;
+            }
+            i = at;
+        }
+    }
+
     /// 根据输入缓冲更新候选（动态分级加载：首次小批量，翻页到边界再扩展）。
     /// 返回输入结局（全码自动上屏 / 满码空码清空）；多数调用方忽略，仅正向输入字母时消费。
     pub(crate) fn update_candidates(&self, state: &mut State) -> InputOutcome {
@@ -745,6 +797,8 @@ impl Coordinator {
         state.current_page = 0;
         state.selected_index = 0;
         state.hover_index = -1;
+        // 简繁 1对多变体展开（须在自动上屏判定之后——outcome 已定型，见函数文档）。
+        self.expand_s2t_variants(state);
         // 组合区按高亮候选类型重算（混输高亮跟随；含已转换前缀拼接）。
         self.sync_preedit_to_highlight(state);
         outcome
@@ -777,6 +831,9 @@ impl Coordinator {
         let prev_len = state.candidates.len();
         // 翻页扩展不消费全码自动上屏（仅正向输入字母时才上屏）。
         let (engine_count, _) = self.build_candidates(state, new_limit);
+        // 重建后立刻重新展开变体：prev_len 取自展开后的旧列表，两边须同口径比较，
+        // 否则 s2t 开启时新增量会被变体数抵消、误判「已到底」。
+        self.expand_s2t_variants(state);
         if state.candidates.len() <= prev_len {
             // 没有新增 → 已到底
             state.has_more = false;
@@ -1083,14 +1140,20 @@ impl Coordinator {
     }
 
     /// 提交某个候选（记录原始简体词频后清空状态），返回上屏文本（按需简繁转换）。
+    /// `s2t_override`：1对多变体候选的输出覆盖（`Candidate::s2t_override`）；来源无候选
+    /// 实体（如自动上屏取首选文本）时传 None。
     pub(crate) fn commit_candidate(
         &self,
         state: &mut State,
         text: &str,
+        s2t_override: Option<&str>,
         source: CandidateSource,
     ) -> String {
         self.record_selection(&state.input_buffer, text, source);
-        let out = self.maybe_s2t(state, text);
+        let out = match s2t_override {
+            Some(t) => t.to_string(),
+            None => self.maybe_s2t(state, text),
+        };
         state.input_buffer.clear();
         state.preedit.clear();
         state.candidates.clear();
@@ -1262,7 +1325,13 @@ impl Coordinator {
                     }
                 }
             }
-            let out = self.maybe_s2t(state, &final_simplified);
+            // 变体候选（用户明选「齣」类 1对多变体）：末段用覆盖文本、前缀单独转换。
+            // 普通候选保持**整体**转换——STPhrases 词级最长匹配可跨 committed/候选边界
+            // 消歧（「一」+「出」→「一齣」），拆开会丢掉跨段词级命中。
+            let out = match &cand.s2t_override {
+                Some(t) => format!("{}{}", self.maybe_s2t(state, &state.committed_text), t),
+                None => self.maybe_s2t(state, &final_simplified),
+            };
             self.reset_pinyin_composition(state);
             self.notify_ui_hide();
             Self::commit_action(out, true)
@@ -1946,9 +2015,10 @@ impl Coordinator {
             return None;
         }
         let text = state.candidates[idx].text.clone();
+        let s2t_override = state.candidates[idx].s2t_override.clone();
         let source = state.candidates[idx].source;
         let chinese_mode = state.chinese_mode;
-        let out = self.commit_candidate(&mut state, &text, source);
+        let out = self.commit_candidate(&mut state, &text, s2t_override.as_deref(), source);
         // 鼠标提交后彻底复位各输入模式，避免遗留状态
         state.active = None;
         state.temp_pinyin_buffer.clear();

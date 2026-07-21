@@ -222,6 +222,8 @@ impl Coordinator {
         candidates.truncate(ENGINE_MAX_CANDIDATES);
         // 统一展开汇聚点：临时拼音词库候选内 `$` 特殊语法在此展开（见 finalize_candidates）。
         state.candidates = self.finalize_candidates(candidates, &state.temp_pinyin_buffer);
+        // 简繁 1对多变体展开（约束见 expand_s2t_variants 文档）。
+        self.expand_s2t_variants(state);
     }
 
     /// 临时拼音选词 —— 组合区逐步转换（C）。部分匹配并入 committed 前缀留模式内（不上屏）；
@@ -295,7 +297,11 @@ impl Coordinator {
             ));
             let final_simplified = format!("{}{}", state.committed_text, cand.text);
             self.learn_phrase_on_commit(state);
-            let out = self.maybe_s2t(state, &final_simplified);
+            // 变体候选末段用覆盖文本；普通候选整体转换（保留 STPhrases 跨段词级消歧）。
+            let out = match &cand.s2t_override {
+                Some(t) => format!("{}{}", self.maybe_s2t(state, &state.committed_text), t),
+                None => self.maybe_s2t(state, &final_simplified),
+            };
             self.exit_temp_pinyin(state);
             self.notify_ui_hide();
             Self::commit_action(out, true)

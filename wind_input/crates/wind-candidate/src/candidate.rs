@@ -148,6 +148,15 @@ pub struct Candidate {
     /// 引擎内部用，不推送 UI（`serde(skip)`，省 IPC 带宽）。
     #[serde(skip)]
     pub boundary: u64,
+    /// 简繁 1对多**变体候选**的输出覆盖（如「出」的变体「齣」）。
+    ///
+    /// `Some(t)` = 本候选是协调器在简繁开启时展开出的变体：显示与上屏**直接用 `t`**，
+    /// 绕过出口处的 `maybe_s2t`；`text` 仍保持简体原字——词频学习、词库反查、shadow/
+    /// 词频重排的按 text 匹配全部落在简体域，维持「内部状态一律简体」的不变量。
+    ///
+    /// 协调器展开/消费，不推送 UI（UI 收到的 CandidateItem.text 已是覆盖后的显示文本）。
+    #[serde(skip)]
+    pub s2t_override: Option<String>,
     pub source: CandidateSource,
     pub phrase_template: String,
     pub is_group: bool,
@@ -185,6 +194,7 @@ impl Default for Candidate {
             is_sentence_demoted: false,
             consumed_length: 0,
             boundary: 0,
+            s2t_override: None,
             source: CandidateSource::None,
             phrase_template: String::new(),
             is_group: false,

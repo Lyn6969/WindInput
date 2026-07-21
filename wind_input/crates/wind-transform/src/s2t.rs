@@ -153,6 +153,12 @@ impl Dict {
 /// 转换器：串行多步，每步一组词典（OpenCC group 语义：组内取最长匹配）。
 pub struct Converter {
     steps: Vec<Vec<Dict>>,
+    /// ST 基础组（链中第一组）之后的步骤在 `steps` 中的起始索引。变体展开出的字
+    /// 已处于 ST 组的输出域，只需再过后续地区变体步（TWVariants/HKVariants）。
+    post_st_start: usize,
+    /// 1对多变体表（STVariants.octrie：简体字 → 空格分隔的全部繁体变体）。
+    /// 缺失时 `variants_of` 恒返回空——展开能力静默降级，不影响转换。
+    variants: Option<Dict>,
 }
 
 impl Converter {
@@ -160,7 +166,8 @@ impl Converter {
     pub fn load_variant(opencc_dir: &Path, variant: &str) -> Option<Converter> {
         let chain = chain_for(variant);
         let mut steps = Vec::new();
-        for group_names in chain {
+        let mut post_st_start = 0;
+        for (gi, group_names) in chain.into_iter().enumerate() {
             let mut group = Vec::new();
             for name in group_names {
                 let path = opencc_dir.join(format!("{}.octrie", name));
@@ -171,11 +178,20 @@ impl Converter {
             if !group.is_empty() {
                 steps.push(group);
             }
+            // 链首组（ST 基础组）处理完后，无论其是否成功加载，后续组都从当前长度起。
+            if gi == 0 {
+                post_st_start = steps.len();
+            }
         }
         if steps.is_empty() {
             None
         } else {
-            Some(Converter { steps })
+            let variants = Dict::load(&opencc_dir.join("STVariants.octrie"));
+            Some(Converter {
+                steps,
+                post_st_start,
+                variants,
+            })
         }
     }
 
@@ -189,6 +205,34 @@ impl Converter {
             cur = apply_step(group, &cur);
         }
         String::from_utf8(cur).unwrap_or_else(|_| s.to_string())
+    }
+
+    /// 查询简体 `key` 的**全部**繁体变体（1对多，如「出」→ `["出", "齣"]`）。
+    ///
+    /// 返回值已过完链中 ST 组之后的地区变体步（s2tw/s2hk 下变体字继续按台/港习惯归一），
+    /// 顺序保持源词典定义序（首个即 OpenCC 默认转换结果）。表缺失或未命中返回空。
+    /// 调用方自行过滤与默认转换结果重复的项。
+    pub fn variants_of(&self, key: &str) -> Vec<String> {
+        let Some(dict) = &self.variants else {
+            return Vec::new();
+        };
+        let Some(val) = dict.lookup(key.as_bytes()) else {
+            return Vec::new();
+        };
+        let Ok(joined) = std::str::from_utf8(val) else {
+            return Vec::new();
+        };
+        joined
+            .split(' ')
+            .filter(|v| !v.is_empty())
+            .map(|v| {
+                let mut cur = v.as_bytes().to_vec();
+                for group in &self.steps[self.post_st_start..] {
+                    cur = apply_step(group, &cur);
+                }
+                String::from_utf8(cur).unwrap_or_else(|_| v.to_string())
+            })
+            .collect()
     }
 }
 
@@ -339,6 +383,27 @@ mod tests {
         );
 
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// 1对多变体表：多值字返回全部变体（定义序，首个=默认转换结果），单值字返回空。
+    #[test]
+    fn variants_of_returns_all_traditional_forms() {
+        let dir = opencc_dir();
+        if !dir.join("STVariants.octrie").exists() {
+            eprintln!("跳过：缺少 STVariants 数据");
+            return;
+        }
+        let conv = Converter::load_variant(&dir, "s2t").expect("应加载 s2t 链");
+        // 「出」：默认不转（首值=自身），变体含「齣」。
+        let v = conv.variants_of("出");
+        assert_eq!(v, vec!["出", "齣"], "出 的变体应为 [出, 齣]");
+        // 「发」：默认转「發」，变体另含「髮」。
+        let v = conv.variants_of("发");
+        assert!(v.contains(&"發".to_string()) && v.contains(&"髮".to_string()));
+        assert_eq!(v[0], conv.convert("发"), "首个变体应与默认转换一致");
+        // 单值字不在变体表：返回空（展开层据此跳过）。
+        assert!(conv.variants_of("汉").is_empty());
+        assert!(conv.variants_of("x").is_empty());
     }
 
     #[test]

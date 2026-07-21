@@ -1798,7 +1798,7 @@ impl Coordinator {
         let (start, end) = self.page_range(&s);
         s.candidates[start..end]
             .iter()
-            .map(|c| self.maybe_s2t(&s, &c.text))
+            .map(|c| self.cand_s2t_text(&s, c))
             .collect()
     }
 
@@ -1960,9 +1960,9 @@ impl Coordinator {
             let idx = self
                 .highlighted_global_index(state)
                 .min(state.candidates.len() - 1);
-            let t = state.candidates[idx].text.clone();
-            self.record_selection(&state.input_buffer, &t, state.candidates[idx].source);
-            out.push_str(&self.maybe_s2t(state, &t));
+            let cand = state.candidates[idx].clone();
+            self.record_selection(&state.input_buffer, &cand.text, cand.source);
+            out.push_str(&self.cand_s2t_text(state, &cand));
         }
         state.input_buffer.clear();
         state.candidates.clear();
@@ -2238,7 +2238,7 @@ impl Coordinator {
             .iter()
             .enumerate()
             .map(|(i, c)| {
-                let full = self.maybe_s2t(state, &c.text);
+                let full = self.cand_s2t_text(state, c);
                 // 显示截断（超长加 …）：短语与普通候选统一按用户可配的 ui.candidate.max_chars。
                 // 短语 text 在生成层已存完整原文（仅一行化），此处仅裁显示——上屏仍用完整原文。
                 let disp = cand_cfg.truncate_display(&full);
@@ -4190,7 +4190,7 @@ impl MessageHandler for Coordinator {
                             .first()
                             .map(|c| c.source)
                             .unwrap_or_default();
-                        let out = self.commit_candidate(&mut state, &text, source);
+                        let out = self.commit_candidate(&mut state, &text, None, source);
                         self.notify_ui_hide();
                         return Self::commit_action(out, true);
                     }
@@ -4323,7 +4323,7 @@ impl MessageHandler for Coordinator {
                             .first()
                             .map(|c| c.source)
                             .unwrap_or_default();
-                        let out = self.commit_candidate(&mut state, &text, source);
+                        let out = self.commit_candidate(&mut state, &text, None, source);
                         self.notify_ui_hide();
                         return Self::commit_action(out, true);
                     }
@@ -4470,19 +4470,15 @@ impl MessageHandler for Coordinator {
                                 let (start, _) = self.page_range(&state);
                                 let idx =
                                     (start + state.selected_index).min(state.candidates.len() - 1);
-                                let t = state.candidates[idx].text.clone();
-                                self.record_selection(
-                                    &state.input_buffer,
-                                    &t,
-                                    state.candidates[idx].source,
-                                );
+                                let cand = state.candidates[idx].clone();
+                                self.record_selection(&state.input_buffer, &cand.text, cand.source);
                                 self.record_commit(
-                                    &t,
+                                    &cand.text,
                                     state.input_buffer.len() as u32,
                                     (idx - start) as i32,
                                     CommitSource::Candidate,
                                 );
-                                commit_text.push_str(&self.maybe_s2t(&state, &t));
+                                commit_text.push_str(&self.cand_s2t_text(&state, &cand));
                             } else if !state.input_buffer.is_empty() {
                                 commit_text.push_str(&state.input_buffer);
                             }
@@ -4519,20 +4515,16 @@ impl MessageHandler for Coordinator {
                     if !state.candidates.is_empty() {
                         let (start, _) = self.page_range(&state);
                         let idx = (start + state.selected_index).min(state.candidates.len() - 1);
-                        let t = state.candidates[idx].text.clone();
-                        self.record_selection(
-                            &state.input_buffer,
-                            &t,
-                            state.candidates[idx].source,
-                        );
+                        let cand = state.candidates[idx].clone();
+                        self.record_selection(&state.input_buffer, &cand.text, cand.source);
                         // 标点上屏前先记被顶出的高亮候选（来源候选）。
                         self.record_commit(
-                            &t,
+                            &cand.text,
                             state.input_buffer.len() as u32,
                             (idx - start) as i32,
                             CommitSource::Candidate,
                         );
-                        out.push_str(&self.maybe_s2t(&state, &t));
+                        out.push_str(&self.cand_s2t_text(&state, &cand));
                     } else if !state.input_buffer.is_empty() {
                         out.push_str(&state.input_buffer);
                     }
