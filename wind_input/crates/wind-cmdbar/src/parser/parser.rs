@@ -85,6 +85,13 @@ fn find_top_level_marker(src: &str) -> Option<(&'static str, usize, usize)> {
 }
 
 /// 源是否含不在字符串内的未转义 `{`。
+///
+/// **`${` 不算**：那是旧式简单模板的变量语法（`${YC}`，见 `wind_phrase::expand_template`），
+/// 与命令栏的 `{expr}` 插值同形但语义无关。二者若不区分，`${YC}年${MC}月${DC}日` 会被判成
+/// 命令栏语法 → `evaluate` 把 `{YC}` 当插值求值 → `YC` 不在函数注册表 → `UnknownFunc`
+/// → 该候选被静默丢弃（症状：系统短语 `date`/`datm`/`zzrq` 的中文数字日期那条不再显示）。
+///
+/// `$$` 是模板里 `$` 的转义，其后的 `{` 仍是真插值，故先吃掉 `$$` 再判。
 fn has_top_level_brace(src: &str) -> bool {
     let b = src.as_bytes();
     let mut i = 0;
@@ -93,6 +100,21 @@ fn has_top_level_brace(src: &str) -> bool {
         if c == b'\\' && i + 1 < b.len() {
             i = skip_escaped(b, i);
             continue;
+        }
+        if c == b'$' && i + 1 < b.len() {
+            match b[i + 1] {
+                // `$$` → 转义的字面 `$`，整体吃掉，后续 `{` 正常参与判定。
+                b'$' => {
+                    i += 2;
+                    continue;
+                }
+                // `${` → 旧式模板变量，连同 `{` 一起跳过，不视为插值。
+                b'{' => {
+                    i += 2;
+                    continue;
+                }
+                _ => {}
+            }
         }
         if c == b'{' {
             return true;
@@ -843,6 +865,36 @@ mod tests {
             }
             _ => panic!("expected template, got {p:?}"),
         }
+    }
+
+    /// `${VAR}` 是旧式简单模板语法，不属于命令栏语法——宿主据 `is_cmdbar_grammar` 分流，
+    /// 误判会让 `${YC}年${MC}月${DC}日` 走 evaluate、因 `YC` 非注册函数而被整条丢弃。
+    #[test]
+    fn dollar_brace_is_not_cmdbar_grammar() {
+        for src in [
+            "${YC}年${MC}月${DC}日",
+            "${YC}年${MC}月${DC}日 $HH:$mm:$ss",
+            "${Y}-${MM}-${DD}",
+        ] {
+            assert!(!is_cmdbar_grammar(src), "{src} 不应判为命令栏语法");
+            assert!(
+                matches!(parse(src), Ok(Phrase::Literal(t)) if t == src),
+                "{src} 应解析为 Literal 原文"
+            );
+        }
+    }
+
+    /// 豁免只针对 `${`，真正的 `{expr}` 插值与 marker 一律照旧。
+    #[test]
+    fn brace_interpolation_still_detected() {
+        for src in [
+            "年份{date(\"YYYY\")}",
+            "${YC}年，剪贴板：{clip()}", // 混合：`${}` 被跳过，裸 `{` 仍命中
+            "$$-{code()}",               // `$$` 是转义的字面 $，其后的 `{` 是真插值
+        ] {
+            assert!(is_cmdbar_grammar(src), "{src} 应判为命令栏语法");
+        }
+        assert!(is_cmdbar_grammar(r#"$CC("x", type("x"))"#));
     }
 
     #[test]

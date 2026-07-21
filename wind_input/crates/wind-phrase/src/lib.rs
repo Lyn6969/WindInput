@@ -1136,6 +1136,58 @@ mod tests {
         assert_eq!(small_int_chinese(31), "三十一");
     }
 
+    /// 回归：`${VAR}` 旧式模板变量不得被 cmdbar 语法探测劫走。
+    ///
+    /// `has_top_level_brace` 曾只看 `{`、不看它前面的 `$`，于是 `${YC}年${MC}月${DC}日`
+    /// 被判成命令栏语法 → 走 `evaluate` 求值 `YC` → 不在函数注册表 → `UnknownFunc`
+    /// → 候选被静默丢弃（症状：`date`/`datm`/`zzrq` 的中文数字日期那条不再显示）。
+    ///
+    /// **必须从 `lookup_at` 进**：它才覆盖 `is_cmdbar_grammar` 分发。只测 `expand_template`
+    /// 纯函数的用例（如 `test_expand_template`）绕过分发，当年正是它让这个缺陷假绿通过 CI。
+    #[test]
+    fn lookup_expands_brace_template_vars() {
+        let mut map: HashMap<String, Vec<PhraseEntry>> = HashMap::new();
+        map.insert(
+            "date".into(),
+            vec![PhraseEntry {
+                text: "${YC}年${MC}月${DC}日".into(),
+                weight: 100,
+                position: 0,
+                is_system: true,
+            }],
+        );
+        let layer = PhraseLayer { map };
+
+        // 精确匹配路径
+        let got = layer.lookup_at("date", fixed(), &[], &no_clip());
+        assert_eq!(got.len(), 1, "${{YC}} 模板短语不应被丢弃");
+        assert_eq!(got[0].text, "二〇二六年六月十四日");
+
+        // 前缀枚举路径（lookup_prefix 的 Literal 分支同样要展开）
+        let got = layer.lookup_prefix_at("dat", fixed(), &[], 2);
+        assert_eq!(got.len(), 1, "前缀枚举也不应丢弃 ${{YC}} 模板短语");
+        assert_eq!(got[0].text, "二〇二六年六月十四日");
+    }
+
+    /// 真正的 cmdbar 插值 `{expr}` 不受上面的 `${` 豁免影响。
+    #[test]
+    fn lookup_still_evaluates_cmdbar_interpolation() {
+        let mut map: HashMap<String, Vec<PhraseEntry>> = HashMap::new();
+        map.insert(
+            "yy".into(),
+            vec![PhraseEntry {
+                text: r#"年份{date("YYYY")}"#.into(),
+                weight: 1,
+                position: 0,
+                is_system: true,
+            }],
+        );
+        let layer = PhraseLayer { map };
+        let got = layer.lookup_at("yy", fixed(), &[], &no_clip());
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].text, "年份2026");
+    }
+
     #[test]
     fn lookup_prefix_lists_static_phrases() {
         // 静态字面短语（Literal）应出现在前缀结果中，command_src=None，nav_code=None。
