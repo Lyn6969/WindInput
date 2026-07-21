@@ -3328,6 +3328,15 @@ impl Coordinator {
                 position: e.position,
             })
             .collect();
+        // 先认领：历史上 `add_phrase`/wdict 导入撞键时会把系统行降级成用户行，此后
+        // `sync_system_phrases` 的 `!cur.is_system → continue` 分支永远跳过它，该条目
+        // 从「系统短语」列表里再也回不来。「恢复默认」是显式动作，在此把归属改回去。
+        // 必须排在 sync 之前，认领后的行才能被 sync 刷新 weight/position。
+        match store.reclaim_system_phrases(&sys) {
+            Ok(n) if n > 0 => info!("恢复默认：认领回 {n} 条被降级的系统短语"),
+            Err(e) => warn!("恢复默认：系统短语认领失败: {e}"),
+            _ => {}
+        }
         if let Err(e) = store.sync_system_phrases(&sys) {
             warn!("恢复默认：系统短语同步失败: {e}");
             return 0;

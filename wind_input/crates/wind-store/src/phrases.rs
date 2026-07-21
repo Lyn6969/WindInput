@@ -95,6 +95,15 @@ impl Store {
     }
 
     /// 新增/覆盖一条用户短语。
+    ///
+    /// **同键行若已是系统短语，保留其 `is_system=true`**。主键只有 `(code, text)` 一把，
+    /// 若在此无条件写 `is_system: false`，用户新增一条与系统短语完全同款的短语时，会把那行
+    /// **原地降级**成用户行 —— 它随即从设置页「系统短语」列表消失（`list_system_phrases` 按
+    /// `is_system` 过滤），且不可自愈：`sync_system_phrases` 的 `!cur.is_system → continue`
+    /// 分支会永远跳过它，连「恢复默认」也救不回来。
+    ///
+    /// 归属规则是**先到先得**：系统行在先→保持系统（本函数），用户行在先→保持用户
+    /// （`sync_system_phrases` 的跳过分支，见 `sync_does_not_overwrite_user_row`）。
     pub fn add_phrase(
         &self,
         code: &str,
@@ -102,6 +111,7 @@ impl Store {
         position: i32,
         weight: i32,
     ) -> anyhow::Result<()> {
+        let is_system = self.get_phrase(code, text)?.is_some_and(|c| c.is_system);
         self.put_phrase(
             code,
             text,
@@ -109,7 +119,7 @@ impl Store {
                 weight,
                 position,
                 enabled: true,
-                is_system: false,
+                is_system,
             },
         )
     }
@@ -346,12 +356,18 @@ impl Store {
         Ok(crate::wdict::export_phrases_wdict(&rows, exported_at))
     }
 
-    /// 导入用户短语（合并 upsert，is_system=false）。返回 (导入条数, 跳过条数)。
+    /// 导入用户短语（合并 upsert）。返回 (导入条数, 跳过条数)。
+    ///
+    /// 与 [`Self::add_phrase`] 同样保留同键系统行的 `is_system`——导入是撞键的高发路径
+    /// （用户常在导出文件里手工增删行），一次导入即可把整批系统短语静默降级。
     pub fn import_user_phrases_wdict(&self, text: &str) -> anyhow::Result<(usize, usize)> {
         let (rows, skipped) =
             crate::wdict::parse_phrases_wdict(text).map_err(|e| anyhow::anyhow!(e))?;
         let imported = rows.len();
         for r in rows {
+            let is_system = self
+                .get_phrase(&r.code, &r.text)?
+                .is_some_and(|c| c.is_system);
             self.put_phrase(
                 &r.code,
                 &r.text,
@@ -359,11 +375,38 @@ impl Store {
                     weight: r.weight,
                     position: r.position,
                     enabled: r.enabled,
-                    is_system: false,
+                    is_system,
                 },
             )?;
         }
         Ok((imported, skipped))
+    }
+
+    /// 把「(code,text) 命中系统短语表、但库里被记成用户行」的记录**认领回系统行**，
+    /// 返回认领条数。供「恢复默认」显式调用——修复历史上被 `add_phrase`/导入降级的存量数据。
+    ///
+    /// 不放进 [`Self::sync_system_phrases`]：那条路径每次启动都跑，无法区分「被降级的系统行」
+    /// 与「用户自建的同款短语」，静默认领会让后者在该条目从 TOML 移除时被连带删除。
+    /// 「恢复默认」是显式用户动作，认领语义与其名称相符，且只改归属、不删文本。
+    pub fn reclaim_system_phrases(&self, entries: &[SystemPhrase]) -> anyhow::Result<usize> {
+        let mut n = 0;
+        for e in entries {
+            match self.get_phrase(&e.code, &e.text)? {
+                Some(cur) if !cur.is_system => {
+                    self.put_phrase(
+                        &e.code,
+                        &e.text,
+                        PhraseValue {
+                            is_system: true,
+                            ..cur
+                        },
+                    )?;
+                    n += 1;
+                }
+                _ => {}
+            }
+        }
+        Ok(n)
     }
 
     /// 重置为默认：清空全部用户短语，返回删除条数。
@@ -597,6 +640,79 @@ mod tests {
         // 重置清空
         assert_eq!(s.reset_phrases().unwrap(), 1);
         assert_eq!(s.list_phrases().unwrap().len(), 0);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// 用户新增/导入一条与系统短语完全同款的记录，不得把系统行降级成用户行——
+    /// 降级后它会从「系统短语」列表永久消失（sync 的 `!cur.is_system → continue` 跳过它）。
+    #[test]
+    fn user_write_keeps_system_ownership() {
+        let path = tmp("wind_phrases_keep_sys.redb");
+        let s = Store::open(&path).unwrap();
+        // 系统行在先
+        s.sync_system_phrases(&[SystemPhrase {
+            code: "date".into(),
+            text: "二〇二六年".into(),
+            weight: 9,
+            position: 5,
+        }])
+        .unwrap();
+
+        // 用户添加同款 → 仍应留在系统短语列表
+        s.add_phrase("date", "二〇二六年", 1, 100).unwrap();
+        assert_eq!(
+            s.list_system_phrases().unwrap().len(),
+            1,
+            "add_phrase 撞键不应把系统行降级"
+        );
+        // 用户改的 weight/position 生效
+        let row = s.list_system_phrases().unwrap().pop().unwrap();
+        assert_eq!((row.weight, row.position), (100, 1));
+
+        // 导入同款 → 同样不降级
+        let wd = crate::wdict::export_phrases_wdict(
+            &[crate::wdict::PhraseIo {
+                code: "date".into(),
+                text: "二〇二六年".into(),
+                weight: 7,
+                position: 3,
+                enabled: true,
+            }],
+            "2026-07-21T00:00:00+08:00",
+        );
+        s.import_user_phrases_wdict(&wd).unwrap();
+        assert_eq!(
+            s.list_system_phrases().unwrap().len(),
+            1,
+            "导入撞键不应把系统行降级"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// 存量修复：已被降级的行，「恢复默认」应认领回系统归属。
+    #[test]
+    fn reclaim_restores_downgraded_system_rows() {
+        let path = tmp("wind_phrases_reclaim.redb");
+        let s = Store::open(&path).unwrap();
+        let sys = [SystemPhrase {
+            code: "date".into(),
+            text: "二〇二六年".into(),
+            weight: 9,
+            position: 5,
+        }];
+        // 手工制造受损现场：用户行在先，且与系统条目同键
+        s.add_phrase("date", "二〇二六年", 0, 1).unwrap();
+        s.sync_system_phrases(&sys).unwrap();
+        assert!(
+            s.list_system_phrases().unwrap().is_empty(),
+            "受损现场：系统列表应为空"
+        );
+
+        assert_eq!(s.reclaim_system_phrases(&sys).unwrap(), 1);
+        assert_eq!(s.list_system_phrases().unwrap().len(), 1);
+        assert!(s.list_user_phrases_paged(None, 0, 99).unwrap().0.is_empty());
+        // 幂等：再认领一次不重复计数
+        assert_eq!(s.reclaim_system_phrases(&sys).unwrap(), 0);
         let _ = std::fs::remove_file(&path);
     }
 
