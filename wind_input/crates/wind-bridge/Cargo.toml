@@ -5,7 +5,6 @@ edition.workspace = true
 
 [dependencies]
 wind-ipc = { path = "../wind-ipc" }
-tokio = { workspace = true }
 tracing = { workspace = true }
 anyhow = { workspace = true }
 thiserror = { workspace = true }
@@ -15,5 +14,4 @@ bytes = "1"
 windows = { workspace = true }
 
 [target.'cfg(unix)'.dependencies]
-tokio = { version = "1", features = ["net", "sync"] }
 libc = "0.2"

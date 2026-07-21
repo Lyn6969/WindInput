@@ -105,7 +105,7 @@ impl PushServer {
 
     /// 启动推送管道服务器
     #[cfg(windows)]
-    pub async fn start(&self) -> anyhow::Result<()> {
+    pub fn start(&self) -> anyhow::Result<()> {
         let pipe_name = self.pipe_name();
         info!("Push server starting on {:?}", pipe_name);
 
@@ -123,7 +123,7 @@ impl PushServer {
 
     /// 启动 UDS 推送服务器（macOS / Linux）
     #[cfg(unix)]
-    pub async fn start(&self) -> anyhow::Result<()> {
+    pub fn start(&self) -> anyhow::Result<()> {
         let path = crate::endpoint::push_socket_path(&self.config.suffix);
         info!("Push UDS server starting on {:?}", path);
         let clients = self.clients.clone();
@@ -134,7 +134,7 @@ impl PushServer {
     }
 
     #[cfg(not(any(windows, unix)))]
-    pub async fn start(&self) -> anyhow::Result<()> {
+    pub fn start(&self) -> anyhow::Result<()> {
         warn!("Push server not supported on this platform");
         Ok(())
     }

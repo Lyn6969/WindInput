@@ -144,27 +144,19 @@ fn main() {
     // 3. 创建 DeferredHandler（启动时返回安全默认值）
     let deferred = DeferredHandler::new();
 
-    // 4. 创建 tokio runtime
-    let runtime = tokio::runtime::Builder::new_multi_thread()
-        .enable_all()
-        .build()
-        .expect("failed to create tokio runtime");
-
-    // 5. 启动 Push 管道服务器
+    // 4. 启动 Push 管道服务器
     let push_config = PushConfig {
         suffix: pipe_suffix.to_string(),
         write_timeout_ms: 30_000,
     };
     let push_server = Arc::new(PushServer::new(push_config));
 
-    runtime.block_on(async {
-        if let Err(e) = push_server.start().await {
-            error!("Push server failed to start: {}", e);
-            std::process::exit(1);
-        }
-    });
+    if let Err(e) = push_server.start() {
+        error!("Push server failed to start: {}", e);
+        std::process::exit(1);
+    }
 
-    // 6. 创建 Bridge 服务器
+    // 5. 创建 Bridge 服务器
     let bridge_config = BridgeConfig {
         suffix: pipe_suffix.to_string(),
         request_timeout_ms: 1000,
@@ -182,13 +174,11 @@ fn main() {
     #[cfg(windows)]
     let bridge = bridge.with_host_render(host_render.clone());
 
-    // 7. 启动 Bridge 服务器
-    runtime.block_on(async {
-        if let Err(e) = bridge.start().await {
-            error!("Bridge server failed to start: {}", e);
-            std::process::exit(1);
-        }
-    });
+    // 6. 启动 Bridge 服务器
+    if let Err(e) = bridge.start() {
+        error!("Bridge server failed to start: {}", e);
+        std::process::exit(1);
+    }
 
     startup_trace::stage("bridge-ready");
 

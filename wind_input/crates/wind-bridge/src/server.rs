@@ -72,7 +72,7 @@ impl BridgeServer {
 
     /// 启动 Named Pipe 服务器（Windows）
     #[cfg(windows)]
-    pub async fn start(&self) -> anyhow::Result<()> {
+    pub fn start(&self) -> anyhow::Result<()> {
         let pipe_name = self.pipe_name();
         info!("Bridge server starting on {:?}", pipe_name);
 
@@ -92,7 +92,7 @@ impl BridgeServer {
 
     /// 启动 UDS 请求服务器（macOS / Linux）
     #[cfg(unix)]
-    pub async fn start(&self) -> anyhow::Result<()> {
+    pub fn start(&self) -> anyhow::Result<()> {
         let path = crate::endpoint::request_socket_path(&self.config.suffix);
         info!("Bridge UDS server starting on {:?}", path);
         let handler = self.handler.clone();
@@ -104,7 +104,7 @@ impl BridgeServer {
 
     /// 其余平台占位实现
     #[cfg(not(any(windows, unix)))]
-    pub async fn start(&self) -> anyhow::Result<()> {
+    pub fn start(&self) -> anyhow::Result<()> {
         warn!("Bridge server not supported on this platform");
         Ok(())
     }

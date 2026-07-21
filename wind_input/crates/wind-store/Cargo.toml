@@ -11,5 +11,4 @@ tracing = { workspace = true }
 anyhow = { workspace = true }
 thiserror = { workspace = true }
 uuid = { workspace = true }
-tokio = { workspace = true }
 chrono = "0.4"

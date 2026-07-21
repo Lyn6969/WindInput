@@ -31,8 +31,7 @@ fn key_event_roundtrip_through_coordinator() {
     );
 
     // 在后台线程启动 UDS 服务器（start() 内部 spawn 线程后立即返回）
-    let rt2 = tokio::runtime::Runtime::new().unwrap();
-    rt2.block_on(async { bridge.start().await.unwrap() });
+    bridge.start().unwrap();
 
     // 等待 socket 文件出现（最多 2 秒）
     let path = endpoint::request_socket_path("");
