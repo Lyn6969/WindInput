@@ -33,7 +33,33 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock, Weak};
 
-type Pool<T> = OnceLock<Mutex<HashMap<PathBuf, Weak<T>>>>;
+/// 池中一条记录：弱引用 + 打开时的文件标识。
+struct Entry<T> {
+    weak: Weak<T>,
+    /// `(大小, 修改时间)`。复用前必须比对——**仅凭路径复用会交出陈旧数据**。
+    ///
+    /// 实测（见 `rebuilt_file_is_not_served_from_stale_entry`）：词库重建走 tmp + rename，
+    /// 在 Windows 上即便目标正被 mmap 也会**成功**（Rust 的 `File::open` 带
+    /// `FILE_SHARE_DELETE`，旧文件转为 pending-delete，目录项已指向新文件），而既有的
+    /// mmap view 继续指向替换前的数据。若只按路径命中，重建之后新建的引擎会复用到那个
+    /// 仍指向旧数据的 reader——表现为「改了词库不生效，重启才行」。
+    ///
+    /// 这与 `cache_fp` 坚持内容指纹而非 mtime 并不矛盾：那里要判定的是「缓存是否需要
+    /// 重建」，须避免部署刷新 mtime 导致误重建；这里要判定的是「手里的 reader 是否还
+    /// 对应磁盘上的当前文件」，恰恰需要能察觉文件被替换。目的不同，判据也就不同。
+    stamp: FileStamp,
+}
+
+type FileStamp = (u64, Option<std::time::SystemTime>);
+
+fn file_stamp(path: &Path) -> FileStamp {
+    match std::fs::metadata(path) {
+        Ok(m) => (m.len(), m.modified().ok()),
+        Err(_) => (0, None),
+    }
+}
+
+type Pool<T> = OnceLock<Mutex<HashMap<PathBuf, Entry<T>>>>;
 
 static WDAT_POOL: Pool<WdatReader> = OnceLock::new();
 static UNIGRAM_POOL: Pool<UnigramReader> = OnceLock::new();
@@ -87,22 +113,34 @@ pub fn open_unigram(path: &Path) -> anyhow::Result<Arc<UnigramReader>> {
 }
 
 fn get_or_open<T>(
-    pool: &Mutex<HashMap<PathBuf, Weak<T>>>,
+    pool: &Mutex<HashMap<PathBuf, Entry<T>>>,
     path: &Path,
     open: impl FnOnce(&Path) -> anyhow::Result<T>,
 ) -> anyhow::Result<Arc<T>> {
+    // 先取 stamp 再 open：万一两者之间文件恰被替换，失败方向是「下次多开一份」（安全），
+    // 反过来则会把 reader 标记成对应新文件而实际指向旧数据（不安全）。
+    let stamp = file_stamp(path);
     let mut guard = pool.lock().unwrap_or_else(|e| e.into_inner());
-    if let Some(alive) = guard.get(path).and_then(Weak::upgrade) {
+    if let Some(e) = guard.get(path)
+        && e.stamp == stamp
+        && let Some(alive) = e.weak.upgrade()
+    {
         return Ok(alive);
     }
-    // 未命中，或条目已失效（上一批持有者已释放，文件可能已被重建过）：重新打开。
+    // 未命中 / 条目失效 / **文件已被替换**：重新打开。
     //
     // open 放在锁内：mmap 只是建立映射不读盘（按需分页），耗时以微秒计；且引擎构建本就
     // 被 `EngineManager::build_locks` 串行化过，不值得为此引入「锁外构建 + 双检」的两段式。
     let reader = Arc::new(open(path)?);
-    guard.insert(path.to_path_buf(), Arc::downgrade(&reader));
+    guard.insert(
+        path.to_path_buf(),
+        Entry {
+            weak: Arc::downgrade(&reader),
+            stamp,
+        },
+    );
     // 顺带清掉失效条目，避免 map 随方案增删单调增长。
-    guard.retain(|_, w| w.strong_count() > 0);
+    guard.retain(|_, e| e.weak.strong_count() > 0);
     Ok(reader)
 }
 
@@ -231,6 +269,54 @@ mod tests {
 
         drop(readers);
         drop(first);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// 与 `dropping_all_holders_releases_the_mapping` 互为反面：**持有期间**文件不可替换。
+    ///
+    /// 这条 OS 行为是两件事的共同依据：池存 `Weak` 而非 `Arc`（否则 reader 永久驻留，
+    /// 重建永久失败），以及 `EngineManager` 里那两条「可能正被其他方案 mmap 持有」的告警
+    /// ——invalidate 单个方案时，共享同一份词库的其他引擎仍持有映射，重建因此失败并降级
+    /// 到临时副本。有了这个测试，那条因果链就不再是推测。
+    /// 词库在**仍被持有**时被重建，随后的取用必须拿到新内容，不得复用陈旧 reader。
+    ///
+    /// 这是本模块最容易出错的一点，也是引入池之后唯一可能造成**功能性**回归的地方：
+    /// 池之前每个引擎各自 `open`，天然读到当前文件；池化后若只按路径命中，就会把仍指向
+    /// 替换前数据的 reader 交出去，表现为「改了词库不生效，重启才行」。
+    ///
+    /// 前提事实（本测试同时锁定）：Windows 上 rename 覆盖一个正被 mmap 的文件是**会成功**
+    /// 的，旧 view 继续看到旧数据——所以不能指望"重建失败"来兜底。
+    #[test]
+    fn rebuilt_file_is_not_served_from_stale_entry() {
+        let dir = temp_dir("rebuild");
+        let p = make_wdat(&dir, "r.wdat", "aa", "旧");
+
+        let held = open_wdat(&p).unwrap(); // 模拟另一个方案的引擎仍持有
+        assert_eq!(held.search("aa").len(), 1);
+
+        // 持有期间重建该词库（WdatWriter 内部走 tmp + rename）
+        let mut d = CodetableDict::empty();
+        d.merge_single("bb".into(), "新".into(), 1, 0);
+        let mut w = WdatWriter::new();
+        d.export_to_wdat(&mut w);
+        w.write(&p)
+            .expect("被 mmap 持有不影响 rename 覆盖（Windows 亦然）");
+
+        // 旧持有者继续看旧数据——这是 OS 语义，不是缺陷
+        assert_eq!(held.search("aa").len(), 1, "旧 view 应继续指向替换前的数据");
+        assert!(held.search("bb").is_empty());
+
+        // 关键：新的取用必须反映重建后的内容
+        let fresh = open_wdat(&p).unwrap();
+        assert!(
+            !Arc::ptr_eq(&held, &fresh),
+            "文件已被替换，绝不能复用旧 reader"
+        );
+        assert_eq!(fresh.search("bb").len(), 1, "新取用须读到重建后的内容");
+        assert!(fresh.search("aa").is_empty());
+
+        drop(held);
+        drop(fresh);
         std::fs::remove_dir_all(&dir).ok();
     }
 

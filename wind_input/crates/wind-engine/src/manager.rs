@@ -2330,7 +2330,7 @@ impl EngineManager {
                 }
                 Err(e) => {
                     warn!("Stale merged cache ({}), regenerating", e);
-                    let _ = std::fs::remove_file(&merged_wdb);
+                    Self::remove_stale_cache(&merged_wdb);
                 }
             }
         } else if merged_wdb.exists() {
@@ -2338,7 +2338,7 @@ impl EngineManager {
                 "merged cache stale (sources changed), regenerating: {}",
                 merged_wdb.display()
             );
-            let _ = std::fs::remove_file(&merged_wdb);
+            Self::remove_stale_cache(&merged_wdb);
         }
 
         // 并行解析每个源正文（纯 CPU 多线程），直接产出 (code,text,weight)：不再为每个子表
@@ -2415,8 +2415,22 @@ impl EngineManager {
                 .unwrap_or_else(|| std::ffi::OsStr::new("rime.merged.wdb")),
         );
         for target in [&merged_wdb, &temp_fallback] {
+            let is_fallback = target.as_path() == temp_fallback.as_path();
             if let Err(e) = writer.write(target) {
-                warn!("Failed to write merged cache {}: {}", target.display(), e);
+                if is_fallback {
+                    warn!("Failed to write merged cache {}: {}", target.display(), e);
+                } else {
+                    // 正式缓存写不进去是**降级的起点**，不能只记 warn 就滑过去。
+                    // 注意不要归因于「文件被 mmap 占用」——实测 Windows 上 rename 覆盖正被
+                    // 映射的文件是会成功的（见 reader_pool 的回归测试）。真实原因通常是缓存
+                    // 目录不可写、磁盘空间不足或路径权限。
+                    error!(
+                        "写入 merged 缓存失败 {}: {}。常见原因是缓存目录不可写、磁盘空间不足\
+                         或权限受限。接下来会退到临时目录副本。",
+                        target.display(),
+                        e
+                    );
+                }
                 continue;
             }
             // 写内容指纹(覆盖全部源；仅对正式缓存路径，fresh 校验也只看 merged_wdb)
@@ -2425,18 +2439,53 @@ impl EngineManager {
             }
             match wind_dict::reader_pool::open_wdat(target) {
                 Ok(reader) => {
-                    info!(
-                        "Using merged mmap cache: {} ({} keys)",
-                        target.display(),
-                        reader.key_count()
-                    );
+                    if is_fallback {
+                        // 功能可用，所以此前只是 info/warn——但这是一次静默降级，代价实在：
+                        // 副本路径与正式缓存不同，reader 池无从合并（同一份词库映射两次），
+                        // 且指纹只写正式路径，下次启动会原样再走一遍。
+                        error!(
+                            "拼音词库已降级为临时目录副本: {} ({} keys)。功能可用，但该副本\
+                             无法与正式缓存共享映射（同一份词库被映射两次），且指纹只写正式\
+                             路径——下次启动会原样再走一遍。请检查缓存目录是否可写。",
+                            target.display(),
+                            reader.key_count()
+                        );
+                    } else {
+                        info!(
+                            "Using merged mmap cache: {} ({} keys)",
+                            target.display(),
+                            reader.key_count()
+                        );
+                    }
                     return Some(CachedDict::Mmap(reader));
                 }
                 Err(e) => warn!("Failed to open merged cache {}: {}", target.display(), e),
             }
         }
-        warn!("All merged cache writes failed; pinyin dictionary unavailable");
+        error!(
+            "merged 缓存的正式路径与临时回退路径均写入失败，拼音词库不可用（该方案将无候选）"
+        );
         None
+    }
+
+    /// 删除待重建的陈旧缓存。失败不阻断重建流程（后续 write 走 tmp + rename，本就能覆盖），
+    /// 但**必须留痕**：此前这里是 `let _ =`，删不掉时日志上完全没有痕迹，而它往往是缓存
+    /// 目录权限/占用问题的第一个征兆。
+    ///
+    /// 注意：文件正被 mmap 持有**不会**让删除以外的重建步骤失败——rename 覆盖照样成功
+    /// （见 `reader_pool` 的回归测试），陈旧数据由 reader 池的 stamp 校验负责挡住。
+    fn remove_stale_cache(path: &Path) {
+        if let Err(e) = std::fs::remove_file(path) {
+            if e.kind() == std::io::ErrorKind::NotFound {
+                return; // 本就不存在，不是问题
+            }
+            warn!(
+                "无法删除待重建的缓存 {}: {}。重建仍会继续（rename 可覆盖），\
+                 但若反复出现，请检查该目录的权限。",
+                path.display(),
+                e
+            );
+        }
     }
 }
 

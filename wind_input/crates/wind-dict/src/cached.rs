@@ -146,7 +146,14 @@ impl CachedDict {
             let _ = std::fs::create_dir_all(parent);
         }
         if let Err(e) = Self::write_cache(&dict, wdb_path) {
-            warn!("Failed to write .wdb cache: {}", e);
+            // 退化成内存模式：词库整份常驻堆而非 mmap，大词库代价可观。此前只记一行
+            // 「Failed to write」，看不出后果，用户也就无从解释内存为何偏高。
+            warn!(
+                "写入 wdb 缓存失败 {}: {}。本次退化为内存模式——词库常驻堆而非 mmap，\
+                 内存占用显著高于正常路径。常见原因是缓存目录不可写或磁盘空间不足。",
+                wdb_path.display(),
+                e
+            );
             return Ok(Self::Memory(dict));
         }
         // 写内容指纹 sidecar，供下次按内容(而非 mtime)校验复用。
