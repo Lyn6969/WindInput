@@ -153,3 +153,215 @@ impl Dag {
         pos < self.nodes.len() && !self.nodes[pos].is_empty()
     }
 }
+
+/// 切分图：把「从字节位置 p 出发有哪些音节」这一事实单独抽出来。
+///
+/// 存在的理由：词图构建有两种切分来源，此前它们被写死成两套逻辑。
+///
+/// - **全拼**：`Dag` 里本就保留了全部路径（`nodes[i]` = 从 i 出发的所有边），
+///   但 `LatticeBuilder` 此前只消费 `maximum_match` 塌缩后的那一条，
+///   于是「西安交通大学」真值 `xi|an|jiao|tong|da|xue` 这条路径根本不存在，
+///   边界校验一开就把词整片逐出词图（Phase 1 实测 C 类 top-1 掉到 0.00%）。
+/// - **双拼 / 手动分隔符 `'`**：切分是**真值**、只有一条，绝不可让 DAG 重猜
+///   （`nihao` 5 键双拼解释为 `ni|ha|o`，重猜成 `ni|hao` 会让 5 键也能出「你好」）。
+///
+/// 两者的差别只是「图的形状」——多路径图 vs 线性链。抽出本类型后词图构建对二者
+/// 一视同仁，双拼路径的语义天然保持不变（链上只有一条路径，等价于原行为）。
+///
+/// 边只存终点位置：音节本身恒为 `input[p..q]`，无须重复存储。
+pub struct SegGraph {
+    /// edges[p] = 从字节位置 p 出发的音节终点（升序）
+    edges: Vec<Vec<usize>>,
+    /// 从 0 可达的位置
+    reachable: Vec<bool>,
+    len: usize,
+}
+
+/// `mask_path` 的三态结果。
+pub enum MaskCheck {
+    /// mask 是 p→q 的一条合法路径，携带其音节数
+    Path(usize),
+    /// 无边界信息（mask==0：五笔码 / code 超 64 字节 / 旧格式）→ 降级放行
+    NoInfo,
+    /// mask 与本跨度的任何合法切分都不符 → 该词不是用户按这个切分敲出来的
+    Reject,
+}
+
+impl SegGraph {
+    fn finish(edges: Vec<Vec<usize>>, len: usize) -> Self {
+        let mut reachable = vec![false; len + 1];
+        reachable[0] = true;
+        for p in 0..=len {
+            if !reachable[p] {
+                continue;
+            }
+            if let Some(es) = edges.get(p) {
+                for &q in es {
+                    reachable[q] = true;
+                }
+            }
+        }
+        Self {
+            edges,
+            reachable,
+            len,
+        }
+    }
+
+    /// 全拼：消费 DAG 的**全部**切分路径。
+    pub fn from_dag(dag: &Dag) -> Self {
+        let len = dag.input_len();
+        let mut edges = vec![Vec::new(); len + 1];
+        for p in 0..len {
+            let mut ends: Vec<usize> = dag.edges_from(p).iter().map(|n| n.end).collect();
+            ends.sort_unstable();
+            ends.dedup();
+            edges[p] = ends;
+        }
+        Self::finish(edges, len)
+    }
+
+    /// 双拼 / 手动分隔符：切分是真值，图退化为一条线性链。
+    pub fn from_syllables(syllables: &[String]) -> Self {
+        let len: usize = syllables.iter().map(|s| s.len()).sum();
+        let mut edges = vec![Vec::new(); len + 1];
+        let mut pos = 0usize;
+        for s in syllables {
+            if s.is_empty() {
+                continue;
+            }
+            edges[pos].push(pos + s.len());
+            pos += s.len();
+        }
+        Self::finish(edges, len)
+    }
+
+    pub fn len(&self) -> usize {
+        self.len
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    pub fn edges_from(&self, pos: usize) -> &[usize] {
+        self.edges.get(pos).map(|v| v.as_slice()).unwrap_or(&[])
+    }
+
+    /// 位置 p 是否从 0 可达。不可达的位置上建节点纯属浪费——Viterbi 永远到不了那里。
+    pub fn is_reachable(&self, pos: usize) -> bool {
+        self.reachable.get(pos).copied().unwrap_or(false)
+    }
+
+    fn has_edge(&self, p: usize, q: usize) -> bool {
+        self.edges_from(p).binary_search(&q).is_ok()
+    }
+
+    /// 从 p 出发、经 1..=`max_edges` 条边可达的全部终点（升序去重）。
+    ///
+    /// 这是词图查询的**枚举面**：`(p, q)` 对唯一决定查询码 `input[p..q]`
+    /// （音节恒为输入的连续子串，故 `syllables[start..end].join("")` 恒等于 `input[p..q]`）。
+    /// **不枚举路径**——路径条数可指数增长，而跨度对至多 O(n²)。
+    pub fn ends_within(&self, p: usize, max_edges: usize) -> Vec<usize> {
+        let mut seen = vec![false; self.len + 1];
+        let mut out: Vec<usize> = Vec::new();
+        let mut frontier: Vec<usize> = vec![p];
+        for _ in 0..max_edges {
+            let mut next: Vec<usize> = Vec::new();
+            for &cur in &frontier {
+                for &q in self.edges_from(cur) {
+                    if !seen[q] {
+                        seen[q] = true;
+                        out.push(q);
+                        next.push(q);
+                    }
+                }
+            }
+            if next.is_empty() {
+                break;
+            }
+            frontier = next;
+        }
+        out.sort_unstable();
+        out
+    }
+
+    /// 词典给的边界 `mask`（code 内各音节起始字节位）是否恰是 p→q 的一条合法路径。
+    ///
+    /// **这是本次改造的关键手法**：不去枚举路径再比对，而是把词条自带的边界**当作一条
+    /// 待验证的路径**逐段查图。代价 O(音节数)，与图中路径总数无关——路径爆炸因此
+    /// 在结构上不可能发生。
+    ///
+    /// 判据同时兼作 max_word_len 闸门：返回的音节数由调用方比对上限。
+    pub fn mask_path(&self, p: usize, q: usize, mask: u64) -> MaskCheck {
+        if mask == 0 {
+            return MaskCheck::NoInfo; // 无信息 → 不设防（与全仓「boundary==0 降级放行」一致）
+        }
+        let l = q.saturating_sub(p);
+        if l == 0 || l > 64 {
+            return MaskCheck::Reject;
+        }
+        if mask & 1 == 0 {
+            return MaskCheck::Reject; // 首音节必起于 code 起点
+        }
+        // 越出 code 范围的位 → 这份 mask 描述的不是本跨度
+        if l < 64 && (mask >> l) != 0 {
+            return MaskCheck::Reject;
+        }
+        let mut cur = 0usize;
+        let mut count = 0usize;
+        while cur < l {
+            let mut nxt = cur + 1;
+            while nxt < l && (mask >> nxt) & 1 == 0 {
+                nxt += 1;
+            }
+            if !self.has_edge(p + cur, p + nxt) {
+                return MaskCheck::Reject; // 该段不是合法音节 → 用户敲不出这个切分
+            }
+            cur = nxt;
+            count += 1;
+        }
+        MaskCheck::Path(count)
+    }
+
+    /// 任取一条 p→q 的路径（边数 ≤ `max_edges`），返回各音节的**起点偏移**（相对 p）。
+    /// 供无边界信息（降级放行）与模糊变体命中使用——它们没有可信的真值切分，
+    /// 但节点仍需一个自洽的音节标注。取「边数最少」的那条，与 `maximum_match` 的偏好同向。
+    pub fn any_path(&self, p: usize, q: usize, max_edges: usize) -> Option<Vec<usize>> {
+        if p == q {
+            return Some(Vec::new());
+        }
+        // 反向 BFS：dist[x] = 从 x 到 q 的最少边数
+        let mut dist = vec![usize::MAX; self.len + 1];
+        dist[q] = 0;
+        for _ in 0..max_edges {
+            let mut changed = false;
+            for x in (p..q).rev() {
+                for &y in self.edges_from(x) {
+                    if y <= q && dist[y] != usize::MAX && dist[y] + 1 < dist[x] {
+                        dist[x] = dist[y] + 1;
+                        changed = true;
+                    }
+                }
+            }
+            if !changed {
+                break;
+            }
+        }
+        if dist[p] == usize::MAX || dist[p] > max_edges {
+            return None;
+        }
+        let mut out = Vec::with_capacity(dist[p]);
+        let mut cur = p;
+        while cur != q {
+            out.push(cur - p);
+            let nxt = self
+                .edges_from(cur)
+                .iter()
+                .copied()
+                .find(|&y| y <= q && dist[y] != usize::MAX && dist[y] + 1 == dist[cur])?;
+            cur = nxt;
+        }
+        Some(out)
+    }
+}

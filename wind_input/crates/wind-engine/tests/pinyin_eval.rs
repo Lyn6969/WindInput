@@ -336,7 +336,35 @@ struct Score {
     top1: usize,
     top5: usize,
     mrr_sum: f64,
+    /// 首选候选的**音节切分**是否等于真值（不看词对不对，只看切分对不对）。
+    ///
+    /// 为什么需要它：top-1 命中率被同音词噪声主导，而同音词之争（关隘/关爱、珍爱/真爱）
+    /// 与切分能力无关——`guanai` 出「关爱」是切对了 `guan|ai` 只是选错同音词，
+    /// 出「挂乃」才是切分失败。边界感知词图的职责恰恰只是后者，用 top-1 度量它会被
+    /// 前者淹没。本指标把两者分开。
+    ///
+    /// 判据：首选候选覆盖整串输入（`code == input`）且其 `boundary` == 真值 mask。
+    /// 候选无边界信息（boundary==0，如单字）时不算切分正确。
+    seg_ok: usize,
     misses: Vec<Miss>,
+    /// 切分不正确的样本明细（含失败**原因分类**，见 `SegMiss::reason`）
+    seg_misses: Vec<SegMiss>,
+}
+
+struct SegMiss {
+    input: String,
+    expect: String,
+    true_syls: String,
+    mm: String,
+    top_text: String,
+    top_code: String,
+    /// 首选候选 boundary 还原出的切分（`-` = 无边界信息）
+    top_syls: String,
+    /// 失败原因：
+    /// - `not_full_span` 首选候选没覆盖整串输入（是子串/单字，不是"切错"）
+    /// - `no_boundary`   首选覆盖整串但无边界信息（boundary==0）
+    /// - `wrong_split`   首选覆盖整串且有边界，但切分与真值不符 ← **真正的切错**
+    reason: &'static str,
 }
 
 impl Score {
@@ -347,6 +375,39 @@ impl Score {
             hit as f64 / total as f64
         }
     }
+}
+
+/// 真值切分的 bitmask（各音节起始字节位），与 `Candidate::boundary` 同域。
+fn true_mask(true_syls: &[String]) -> u64 {
+    let mut m = 0u64;
+    let mut pos = 0usize;
+    for s in true_syls {
+        if pos >= 64 {
+            return 0;
+        }
+        m |= 1u64 << pos;
+        pos += s.len();
+    }
+    m
+}
+
+/// 把 bitmask 还原成 `a|b|c` 形式的切分串。
+fn decode_mask(code: &str, mask: u64) -> String {
+    if mask == 0 {
+        return "-".to_string();
+    }
+    let mut starts: Vec<usize> = (0..code.len().min(64)).filter(|i| (mask >> i) & 1 == 1).collect();
+    if starts.first() != Some(&0) {
+        starts.insert(0, 0);
+    }
+    let mut out: Vec<&str> = Vec::new();
+    for (i, &s) in starts.iter().enumerate() {
+        let e = starts.get(i + 1).copied().unwrap_or(code.len());
+        if s <= e && e <= code.len() {
+            out.push(&code[s..e]);
+        }
+    }
+    out.join("|")
 }
 
 fn json_escape(s: &str) -> String {
@@ -452,6 +513,45 @@ fn pinyin_eval_report() {
             sc.total += 1;
             let cands = mgr.convert_with("pinyin", &s.input, TOP_N).candidates;
             let rank = cands.iter().position(|c| c.text == s.text);
+            let tm = true_mask(&s.true_syls);
+            match cands.first() {
+                Some(top) if top.code == s.input && top.boundary != 0 && top.boundary == tm => {
+                    sc.seg_ok += 1;
+                }
+                top => {
+                    let (top_text, top_code, top_syls, reason) = match top {
+                        None => (String::new(), String::new(), "-".to_string(), "no_candidate"),
+                        Some(t) if t.code != s.input => (
+                            t.text.clone(),
+                            t.code.clone(),
+                            decode_mask(&t.code, t.boundary),
+                            "not_full_span",
+                        ),
+                        Some(t) if t.boundary == 0 => (
+                            t.text.clone(),
+                            t.code.clone(),
+                            "-".to_string(),
+                            "no_boundary",
+                        ),
+                        Some(t) => (
+                            t.text.clone(),
+                            t.code.clone(),
+                            decode_mask(&t.code, t.boundary),
+                            "wrong_split",
+                        ),
+                    };
+                    sc.seg_misses.push(SegMiss {
+                        input: s.input.clone(),
+                        expect: s.text.clone(),
+                        true_syls: s.true_syls.join("|"),
+                        mm: s.mm.join("|"),
+                        top_text,
+                        top_code,
+                        top_syls,
+                        reason,
+                    });
+                }
+            }
             match rank {
                 Some(r) => {
                     if r == 0 {
@@ -484,21 +584,86 @@ fn pinyin_eval_report() {
     // ---- 4. 报告
     println!("\n=== 基线报告 (seed={}, top_n={}) ===", seed, TOP_N);
     println!(
-        "{:<46} {:>6} {:>9} {:>9} {:>9} {:>8}",
-        "类别", "样本", "top-1", "top-5", "MRR", "耗时ms"
+        "{:<46} {:>6} {:>9} {:>9} {:>9} {:>9} {:>8}",
+        "类别", "样本", "top-1", "top-5", "MRR", "切分正确", "耗时ms"
     );
     for (c, sc, ms) in &scores {
         println!(
-            "{:<46} {:>6} {:>8.2}% {:>8.2}% {:>9.4} {:>8}",
+            "{:<46} {:>6} {:>8.2}% {:>8.2}% {:>9.4} {:>8.2}% {:>8}",
             c.label(),
             sc.total,
             Score::rate(sc.top1, sc.total) * 100.0,
             Score::rate(sc.top5, sc.total) * 100.0,
             if sc.total == 0 { 0.0 } else { sc.mrr_sum / sc.total as f64 },
+            Score::rate(sc.seg_ok, sc.total) * 100.0,
             ms
         );
     }
     println!("\n评测总耗时: {} ms（含引擎初始化 {} ms）", run_ms, load_ms);
+
+    // 切分不正确的明细：按原因分桶。`wrong_split` 才是「多路径选错了切分」，
+    // 其余两类（首选是子串 / 首选无边界信息）不构成切分错误，只是指标判据的副产物。
+    for (c, sc, _) in &scores {
+        let mut by_reason: HashMap<&'static str, usize> = HashMap::new();
+        for m in &sc.seg_misses {
+            *by_reason.entry(m.reason).or_default() += 1;
+        }
+        let mut v: Vec<_> = by_reason.iter().collect();
+        v.sort();
+        println!(
+            "\n--- {} 切分不正确 {} 条，按原因: {:?} ---",
+            c.label(),
+            sc.seg_misses.len(),
+            v
+        );
+        for m in sc.seg_misses.iter().filter(|m| m.reason == "wrong_split").take(dump) {
+            println!(
+                "  [切错] {:<24} 期望 {:<10} 真值 {:<28} 实选 {:<10} 切分 {:<28} mm {}",
+                m.input, m.expect, m.true_syls, m.top_text, m.top_syls, m.mm
+            );
+        }
+        for m in sc.seg_misses.iter().filter(|m| m.reason != "wrong_split").take(dump.min(15)) {
+            println!(
+                "  [{}] {:<22} 期望 {:<10} 真值 {:<28} 实选 {:<10} code {}",
+                m.reason, m.input, m.expect, m.true_syls, m.top_text, m.top_code
+            );
+        }
+    }
+
+    // C 类 top-1 未命中的样本：核对「首选是否切分正确」——这是
+    // 「剩余失败已转为同音词竞争」这一论断的可验证依据。
+    for (c, sc, _) in &scores {
+        if *c != Class::C {
+            continue;
+        }
+        let seg_bad: std::collections::HashSet<&str> =
+            sc.seg_misses.iter().map(|m| m.input.as_str()).collect();
+        let (mut same_seg, mut diff_seg) = (0usize, 0usize);
+        for m in &sc.misses {
+            if seg_bad.contains(m.input.as_str()) {
+                diff_seg += 1;
+            } else {
+                same_seg += 1;
+            }
+        }
+        println!(
+            "\n=== C 类 top-1 未命中 {} 条：首选切分正确 {} 条（同音词竞争）/ 切分不正确 {} 条 ===",
+            sc.misses.len(),
+            same_seg,
+            diff_seg
+        );
+        println!("--- 其中「切分正确、仅选错同音词」的样本（前 {}）---", dump);
+        for m in sc.misses.iter().filter(|m| !seg_bad.contains(m.input.as_str())).take(dump) {
+            println!(
+                "  {:<24} 期望 {:<10} rank={:<5} 首选 {:<10} 真值 {}",
+                m.input,
+                m.expect,
+                m.rank.map(|r| r.to_string()).unwrap_or_else(|| "miss".into()),
+                m.got_top1,
+                m.true_syls
+            );
+        }
+    }
 
     for (c, sc, _) in &scores {
         println!("\n--- {} 非首选明细（前 {}）---", c.label(), dump);
@@ -533,13 +698,14 @@ fn pinyin_eval_report() {
     for (i, (c, sc, ms)) in scores.iter().enumerate() {
         let _ = write!(
             j,
-            "    \"{}\": {{ \"population\": {}, \"sampled\": {}, \"top1\": {:.6}, \"top5\": {:.6}, \"mrr\": {:.6}, \"top1_hits\": {}, \"top5_hits\": {}, \"score_ms\": {},\n",
+            "    \"{}\": {{ \"population\": {}, \"sampled\": {}, \"top1\": {:.6}, \"top5\": {:.6}, \"mrr\": {:.6}, \"seg_ok\": {:.6}, \"top1_hits\": {}, \"top5_hits\": {}, \"score_ms\": {},\n",
             c.key(),
             class_totals.get(c.key()).copied().unwrap_or(0),
             sc.total,
             Score::rate(sc.top1, sc.total),
             Score::rate(sc.top5, sc.total),
             if sc.total == 0 { 0.0 } else { sc.mrr_sum / sc.total as f64 },
+            Score::rate(sc.seg_ok, sc.total),
             sc.top1,
             sc.top5,
             ms

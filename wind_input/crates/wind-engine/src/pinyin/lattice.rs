@@ -3,10 +3,9 @@
 //! 与 Go 版本 `wind_input/internal/engine/pinyin/lattice.go` 对齐。
 //! 构建词图并支持多路径评分，用于 Viterbi 解码。
 
-use crate::pinyin::dag::Dag;
+use crate::pinyin::dag::{MaskCheck, SegGraph};
 use crate::pinyin::fuzzy::{FuzzyConfig, FuzzyMatcher};
 use crate::pinyin::lm::UnigramLookup;
-use crate::pinyin::syllable::SyllableTrie;
 use wind_dict::cached::CachedDict;
 
 /// 虚词集合（单字时轻微惩罚，对齐 Go functionWords）
@@ -134,6 +133,10 @@ pub struct LatticeNode {
     pub end: usize,
     pub word: String,
     pub syllables: Vec<String>,
+    /// 本节点所采用切分的音节起始位 bitmask，**相对节点自身的 code 起点**
+    /// （与词典 `DictEntry::boundary` 同域）。多路径下同一跨度可有多种切法，
+    /// 故必须逐节点记录：Viterbi 选中哪条节点，整句的真实边界就是哪条。
+    pub syl_mask: u64,
     pub log_prob: f64,
 }
 
@@ -157,56 +160,72 @@ impl LatticeBuilder {
         self.max_word_len
     }
 
-    /// 构建格子
+    /// 构建格子（**多路径切分**）
     ///
-    /// 对每个起始位置，尝试 1~max_word_len 个连续音节组合，
-    /// 在词典中查找匹配的词，构建 LatticeNode。
+    /// 枚举的是**字节跨度** `(p, q)` 而非音节路径。这是本次改造的核心决策：
+    ///
+    /// 1. 音节恒为输入的连续子串，故查询码只由跨度决定 —— `input[p..q]`。
+    ///    跨度对至多 O(n²)，而完整切分路径条数可指数增长（实测见
+    ///    `tests/pinyin_path_scale.rs`）。
+    /// 2. 「这个词是不是按某条合法路径敲出来的」不靠枚举路径回答，而是把词条自带的
+    ///    `boundary` **当作一条待验证的路径**逐段查图（`SegGraph::mask_path`），
+    ///    代价 O(音节数)。**路径爆炸因此在结构上不可能发生，无需剪枝。**
+    ///
+    /// 于是「西安交通大学」以真值 `xi|an|jiao|tong|da|xue` 合法入图，
+    /// 而「李安」（真值 `li|an`）仍进不了单音节边 `lian` —— 前者是 Phase 1 里
+    /// 被边界校验误杀的 4362 个词，后者是原始缺陷。两者第一次可以同时成立。
+    ///
+    /// `graph` 的形状决定切分来源：全拼用 `SegGraph::from_dag`（多路径），
+    /// 双拼/手动分隔符用 `SegGraph::from_syllables`（真值链，行为与改造前完全一致）。
     pub fn build(
         &self,
         input: &str,
-        trie: &SyllableTrie,
+        graph: &SegGraph,
         dict: &CachedDict,
         fuzzy_config: Option<&FuzzyConfig>,
         unigram: Option<&dyn UnigramLookup>,
     ) -> Vec<Vec<LatticeNode>> {
-        let dag = Dag::build(input, trie);
-        let syllables = dag.maximum_match();
         let input_len = input.len();
 
         // nodes[end_pos] = 所有在 end_pos 结束的节点
         let mut nodes: Vec<Vec<LatticeNode>> = vec![Vec::new(); input_len + 1];
 
-        for start in 0..syllables.len() {
-            for end in (start + 1)..=syllables.len().min(start + self.max_word_len) {
-                let code: String = syllables[start..end].join("");
-                let char_start: usize = syllables[..start].iter().map(|s| s.len()).sum();
-                let char_end: usize = syllables[..end].iter().map(|s| s.len()).sum();
-
-                if char_end > input_len {
+        for p in 0..input_len.min(graph.len()) {
+            // 从 0 不可达的位置上建节点纯属浪费：Viterbi 的 dp 永远到不了那里。
+            if !graph.is_reachable(p) {
+                continue;
+            }
+            for q in graph.ends_within(p, self.max_word_len) {
+                if q > input_len {
                     continue;
                 }
+                let code = &input[p..q];
 
-                // 本跨度的期望边界 mask：节点的"切分"就是 syllables[start..end] 本身，
-                // 与词典真值边界同域（都是 code 内各音节的起始字节位），可直接比对。
-                let expect_mask = super::syllables_boundary_mask(&syllables[start..end], code.len());
-
-                // 查找词典（带边界）。校验词条真值边界与本跨度一致，否则该词根本不是
-                // 用户按这个切分敲出来的：「李安」真值 li|an 不该从单音节边 lian 进词图。
-                // boundary == 0（五笔码 / code 超 64 字节 / 旧格式）由 boundary_compatible
-                // 内部降级放行——不设防好过误杀。
-                let results = dict.search_with_boundary(&code);
-                for hit in &results {
-                    if !super::boundary_compatible(hit.boundary, expect_mask, code.len(), code.len())
-                    {
-                        continue;
-                    }
-                    let (text, weight) = (&hit.text, hit.weight);
-                    let log_prob = score_node(text, weight, unigram);
-                    nodes[char_end].push(LatticeNode {
-                        start: char_start,
-                        end: char_end,
-                        word: text.clone(),
-                        syllables: syllables[start..end].to_vec(),
+                for hit in dict.search_with_boundary(code) {
+                    // 词条真值边界必须是本跨度上的一条合法切分路径，否则该词根本不是
+                    // 用户按这串键敲出来的：「李安」真值 li|an 与单音节边 lian 不符。
+                    // boundary == 0（五笔码 / code 超 64 字节 / 旧格式）降级放行 ——
+                    // 不设防好过误杀（与全仓其余边界判据一致）。
+                    let offsets = match graph.mask_path(p, q, hit.boundary) {
+                        MaskCheck::Path(syl_count) => {
+                            if syl_count > self.max_word_len {
+                                continue;
+                            }
+                            mask_offsets(hit.boundary, q - p)
+                        }
+                        MaskCheck::NoInfo => match graph.any_path(p, q, self.max_word_len) {
+                            Some(o) => o,
+                            None => continue,
+                        },
+                        MaskCheck::Reject => continue,
+                    };
+                    let log_prob = score_node(&hit.text, hit.weight, unigram);
+                    nodes[q].push(LatticeNode {
+                        start: p,
+                        end: q,
+                        word: hit.text,
+                        syllables: slice_syllables(code, &offsets),
+                        syl_mask: offsets_mask(&offsets),
                         log_prob,
                     });
                 }
@@ -214,29 +233,35 @@ impl LatticeBuilder {
                 // 模糊拼音变体
                 //
                 // **刻意不做边界校验**：词典返回的 boundary 是**变体码**空间的偏移
-                // （zhongguo 的 {0,5}），而 expect_mask 在用户**原码**空间（zong|guo 的
+                // （zhongguo 的 {0,5}），而本跨度在用户**原码**空间（zong|guo 的
                 // {0,4}）。z→zh 这类变体改变码长，两者位偏移不同域，直接比对会把正确的
-                // 模糊命中整片误杀。这与 mod.rs:304/322 对模糊变体一律置 boundary=0
+                // 模糊命中整片误杀。这与 mod.rs 对模糊变体一律置 boundary=0
                 // 的既有决策一致，是已记录的永久缺口（待跨域偏移映射），本阶段不碰。
+                // 音节标注取图上任意一条最短路径——模糊命中没有可信真值切分，
+                // 但节点仍需一个自洽的标注供整句边界回填。
                 if let Some(fuzzy) = fuzzy_config {
-                    let variants = FuzzyMatcher::fuzzy_variants(&code, fuzzy);
+                    let variants = FuzzyMatcher::fuzzy_variants(code, fuzzy);
+                    if variants.is_empty() {
+                        continue;
+                    }
+                    let Some(offsets) = graph.any_path(p, q, self.max_word_len) else {
+                        continue;
+                    };
                     for variant in variants {
-                        let variant_results = dict.search(&variant);
-                        for (text, weight, _order) in &variant_results {
+                        for (text, weight, _order) in &dict.search(&variant) {
                             // 去重
-                            if !nodes[char_end]
-                                .iter()
-                                .any(|n| n.word == *text && n.start == char_start)
-                            {
-                                let log_prob = score_node(text, *weight, unigram) - 0.5; // 模糊匹配轻微惩罚
-                                nodes[char_end].push(LatticeNode {
-                                    start: char_start,
-                                    end: char_end,
-                                    word: text.clone(),
-                                    syllables: syllables[start..end].to_vec(),
-                                    log_prob,
-                                });
+                            if nodes[q].iter().any(|n| n.word == *text && n.start == p) {
+                                continue;
                             }
+                            let log_prob = score_node(text, *weight, unigram) - 0.5; // 模糊匹配轻微惩罚
+                            nodes[q].push(LatticeNode {
+                                start: p,
+                                end: q,
+                                word: text.clone(),
+                                syllables: slice_syllables(code, &offsets),
+                                syl_mask: offsets_mask(&offsets),
+                                log_prob,
+                            });
                         }
                     }
                 }
@@ -245,4 +270,37 @@ impl LatticeBuilder {
 
         nodes
     }
+}
+
+/// 由 bitmask 还原音节起始偏移列表（升序，恒以 0 开头）。
+fn mask_offsets(mask: u64, len: usize) -> Vec<usize> {
+    let mut out = Vec::new();
+    for i in 0..len.min(64) {
+        if (mask >> i) & 1 == 1 {
+            out.push(i);
+        }
+    }
+    out
+}
+
+fn offsets_mask(offsets: &[usize]) -> u64 {
+    let mut m = 0u64;
+    for &o in offsets {
+        if o < 64 {
+            m |= 1u64 << o;
+        }
+    }
+    m
+}
+
+/// 按起始偏移把 code 切成音节串。
+fn slice_syllables(code: &str, offsets: &[usize]) -> Vec<String> {
+    let mut out = Vec::with_capacity(offsets.len());
+    for (i, &o) in offsets.iter().enumerate() {
+        let end = offsets.get(i + 1).copied().unwrap_or(code.len());
+        if o <= end && end <= code.len() {
+            out.push(code[o..end].to_string());
+        }
+    }
+    out
 }

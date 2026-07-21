@@ -23,7 +23,7 @@ pub mod syllable;
 pub mod viterbi;
 
 use crate::engine::{ConvertResult, Engine, EngineType};
-use dag::Dag;
+use dag::{Dag, SegGraph};
 use fuzzy::FuzzyConfig;
 use generate::CharPinyinIndex;
 use lattice::LatticeBuilder;
@@ -422,6 +422,25 @@ struct LookupHit {
     boundary: u64,
 }
 
+/// 按边界 bitmask 渲染 preedit：`code` 以 `'` 在各音节起点断开，尾部残码另起一段。
+/// 供「预编辑区跟随首选候选」使用（见 `convert`）。
+fn render_preedit(code: &str, boundary: u64, partial: &str) -> String {
+    let mut out = String::with_capacity(code.len() + 8);
+    for (i, ch) in code.char_indices() {
+        if i > 0 && i < 64 && (boundary >> i) & 1 == 1 {
+            out.push('\'');
+        }
+        out.push(ch);
+    }
+    if !partial.is_empty() {
+        if !out.is_empty() {
+            out.push('\'');
+        }
+        out.push_str(partial);
+    }
+    out
+}
+
 /// 由音节列表算边界 bitmask（全拼空间），只取覆盖前 `limit_len` 字节的部分。
 ///
 /// 用于 **DAG 切分出来的**候选（Viterbi 整句、前缀子短语）——它们的 code 是把
@@ -662,6 +681,10 @@ impl Engine for PinyinEngine {
             }
             v
         });
+        // `fixed_segmentation` = 切分是**真值**、只有一条（双拼每 2 键 1 音节；`'` 是硬边界），
+        // 词图必须照单全收，绝不可让 DAG 重猜。全拼则相反：切分是猜的，词图应看到**全部**
+        // 候选切法（见 lattice::LatticeBuilder::build）。
+        let fixed_segmentation = sp_syllables.is_some() || has_sep;
         let syllables = if let Some(v) = sp_syllables {
             v
         } else if has_sep {
@@ -670,7 +693,15 @@ impl Engine for PinyinEngine {
             Dag::build(input, trie).maximum_match()
         };
 
-        // 完成音节覆盖的连续前缀（从起点算）。尾部不成音节的残码（如「nihaom」的「m」）
+        // 完成音节覆盖的连续前缀（从起点算）。
+        //
+        // **多路径切分下这个值依然唯一确定**，无须在多条路径间做选择：所有切分路径都从 0
+        // 连续覆盖，故「覆盖长度」恒等于「路径终点」，而 `maximum_match` 取的正是**最远
+        // 可达位置**——该位置是图的性质，与走哪条路径无关。于是 `completed_len` /
+        // `consumed_length`（分段上屏字节数）保持单一确定值，多路径只影响词图**内部**
+        // 查哪些跨度，不影响引擎对外承诺消费多少输入。
+        //
+        // 尾部不成音节的残码（如「nihaom」的「m」）
         // 不参与精确匹配/整句解码——否则 lattice 到不了残码末端、Viterbi 失败、整句退化成单字，
         // 且精确层会把「nihao」当模糊变体误标 is_fuzzy 沉底被截断（bug①）。
         let completed_len: usize = syllables.iter().map(|s| s.len()).sum();
@@ -739,9 +770,15 @@ impl Engine for PinyinEngine {
 
         // 2. Viterbi 长句解码（>=2 音节，仅在完成音节前缀上跑；use_smart_compose=false 时跳过）
         if self.config.use_smart_compose && syllables.len() >= 2 {
+            // 切分图：全拼取 DAG 的全部路径；双拼/手动分隔符取真值链（行为与改造前一致）。
+            let seg_graph = if fixed_segmentation {
+                SegGraph::from_syllables(&syllables)
+            } else {
+                SegGraph::from_dag(&Dag::build(completed, trie))
+            };
             let lattice_nodes = self.lattice_builder.build(
                 completed,
-                trie,
+                &seg_graph,
                 dict,
                 Some(&self.fuzzy_config),
                 self.unigram.as_deref(),
@@ -757,6 +794,7 @@ impl Engine for PinyinEngine {
                         start: node.start,
                         end: node.end,
                         word: node.word.clone(),
+                        syl_mask: node.syl_mask,
                         log_prob: node.log_prob,
                     });
                 }
@@ -795,10 +833,14 @@ impl Engine for PinyinEngine {
                                 natural_order: 0,
                                 source: CandidateSource::Pinyin,
                                 is_sentence: true,
-                                // 整句是按 DAG 这份切分拼出来的，其边界即该切分本身。
-                                // 双拼下 DAG 会把 nihao 重切成 ni|hao 拼出「你好」——标上它，
-                                // 才能被双拼真值 ni|ha|o 拒掉（否则 boundary=0 直接放行）。
-                                boundary: syllables_boundary_mask(&syllables, completed.len()),
+                                // 整句的边界 = 解码器**实际选中**的那条路径（多路径下同一串
+                                // 输入可有多种切法，只有解码器知道走的是哪条）。回退到
+                                // maximum_match 仅用于解码器给不出边界的极端情形（超 64 字节）。
+                                boundary: if result.boundary != 0 {
+                                    result.boundary
+                                } else {
+                                    syllables_boundary_mask(&syllables, completed.len())
+                                },
                                 ..Default::default()
                             },
                         );
@@ -1019,6 +1061,24 @@ impl Engine for PinyinEngine {
 
         let (mut preedit_display, completed_syllables, partial_syllable) =
             self.compute_composition(input);
+
+        // 预编辑区**跟随首选候选**（用户拍板的策略）。
+        //
+        // 多路径切分后，`maximum_match` 那条不再必然是首选候选走的那条：`xianjiaotongdaxue`
+        // 首选「西安交通大学」实走 `xi|an|jiao|tong|da|xue`，而 mm 给的是 `xian|jiao|…`。
+        // 显示 mm 就与用户看到的候选自相矛盾。候选自带 `boundary`（整句由解码器回填真实
+        // 路径，词典命中则是词库真值），据此还原其切分即可，无须另建通道。
+        //
+        // 只在「无双拼、无手动分隔符、首选覆盖已完成音节前缀且带边界信息」时接管——
+        // 双拼的 preedit 另有 build_raw_preedit 负责（下方覆盖），分隔符段的 `'` 是用户
+        // 亲手打的硬边界不容改写，无边界信息则无从跟随。其余情形保持 mm 显示不变。
+        if sp_result.is_none() && !has_sep {
+            if let Some(top) = candidates.first() {
+                if top.boundary != 0 && top.code == completed && !completed.is_empty() {
+                    preedit_display = render_preedit(completed, top.boundary, &partial_syllable);
+                }
+            }
+        }
 
         // Fix A：双拼激活时，preedit 改为显示用户实际输入的原始按键（按双拼音节边界以 `'` 分隔），
         // 而非转换后的全拼。仅覆盖 preedit_display；候选/completed_syllables/partial_syllable/

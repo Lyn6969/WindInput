@@ -8,6 +8,15 @@
 pub struct ViterbiResult {
     pub words: Vec<String>,
     pub log_prob: f64,
+    /// 最优路径**实际采用**的音节边界（全输入空间的起始位 bitmask）。
+    ///
+    /// 多路径切分下同一串输入可有多种切法，整句是按其中哪一条拼出来的，只有解码器
+    /// 知道。此前整句候选一律标 `maximum_match` 的切分——单路径时那恰好就是真相，
+    /// 多路径时便成了谎报（`xianjiaotongdaxue` 实走 `xi|an|…` 却标成 `xian|…`）。
+    /// 该字段供整句候选回填 `Candidate::boundary`，双拼校验与用户造词都依赖它。
+    ///
+    /// 0 = 无可用信息（解码失败 / 输入超 64 字节，超出 bitmask 表达范围）。
+    pub boundary: u64,
 }
 
 /// 词节点（用于构建 lattice）
@@ -16,6 +25,8 @@ pub struct WordNode {
     pub start: usize,
     pub end: usize,
     pub word: String,
+    /// 本节点所采用切分的音节起始位 bitmask，相对 `start`（见 `LatticeNode::syl_mask`）
+    pub syl_mask: u64,
     pub log_prob: f64,
 }
 
@@ -25,6 +36,7 @@ struct DpEntry {
     log_prob: f64,
     prev_pos: usize,
     word: String,
+    syl_mask: u64,
 }
 
 /// Viterbi 解码器
@@ -50,6 +62,7 @@ impl ViterbiDecoder {
             return ViterbiResult {
                 words: Vec::new(),
                 log_prob: 0.0,
+                boundary: 0,
             };
         }
 
@@ -59,6 +72,7 @@ impl ViterbiDecoder {
                 log_prob: f64::NEG_INFINITY,
                 prev_pos: 0,
                 word: String::new(),
+                syl_mask: 0,
             })
             .collect();
         dp[0].log_prob = 0.0;
@@ -83,6 +97,7 @@ impl ViterbiDecoder {
                         log_prob: total_prob,
                         prev_pos: start_pos,
                         word: node.word.clone(),
+                        syl_mask: node.syl_mask,
                     };
                 }
             }
@@ -97,12 +112,19 @@ impl ViterbiDecoder {
             pos -= 1;
         }
 
+        // 回溯的同时把各节点的音节 mask 平移到全输入空间累加，得到整句的真实边界。
+        // 输入超 64 字节时 bitmask 表达不下，一律给 0（= 无信息，下游降级放行）。
+        let mut boundary = 0u64;
+        let expressible = input_len <= 64;
         while pos > 0 {
             let entry = &dp[pos];
             if entry.word.is_empty() {
                 break;
             }
             words.push(entry.word.clone());
+            if expressible {
+                boundary |= entry.syl_mask << entry.prev_pos;
+            }
             pos = entry.prev_pos;
         }
 
@@ -111,6 +133,7 @@ impl ViterbiDecoder {
         ViterbiResult {
             words,
             log_prob: dp[input_len].log_prob,
+            boundary: if expressible { boundary } else { 0 },
         }
     }
 }
@@ -131,12 +154,14 @@ mod tests {
             start: 0,
             end: 5,
             word: "你好".to_string(),
+            syl_mask: 0b101, // ni|hao
             log_prob: 10.0,
         });
         let decoder = ViterbiDecoder::new();
         let result = decoder.decode(&nodes, input_len);
         assert_eq!(result.words, vec!["你好".to_string()], "应解码出 你好");
         assert!(result.log_prob.is_finite());
+        assert_eq!(result.boundary, 0b101, "整句边界应回填节点自身的切分");
     }
 
     /// 两段路径：ni(0..2) + hao(2..5)，验证多节点拼接。
@@ -148,16 +173,20 @@ mod tests {
             start: 0,
             end: 2,
             word: "你".to_string(),
+            syl_mask: 0b1,
             log_prob: 3.0,
         });
         nodes[5].push(WordNode {
             start: 2,
             end: 5,
             word: "好".to_string(),
+            syl_mask: 0b1,
             log_prob: 3.0,
         });
         let decoder = ViterbiDecoder::new();
         let result = decoder.decode(&nodes, input_len);
         assert_eq!(result.words, vec!["你".to_string(), "好".to_string()]);
+        // 两个单音节节点分别起于 0 与 2 → {0,2}
+        assert_eq!(result.boundary, 0b101);
     }
 }
