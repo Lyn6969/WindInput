@@ -193,10 +193,11 @@ pub struct DictSpec {
     /// 用户覆盖启用（tri-state，nil=继承 default_enabled）
     #[serde(default)]
     pub enabled: Option<bool>,
-    /// 权重仅表示同码内排序序号
-    #[serde(default)]
-    pub weight_as_order: bool,
-    /// 权重归一化参数（[dictionaries.weight_spec]）
+    /// 权重归一化参数（[dictionaries.weight_spec]）。
+    ///
+    /// **当前未接线**：仅作为词库权重分布的事实记录供设计者查阅（如 pinyin 方案记 median=200，
+    /// 是 `pinyin/mod.rs` COMPLETION_FAR_WEIGHT_FLOOR 取值的依据）。跨库权重归一化尚未实现——
+    /// 现阶段用 `default_weight`（整库定档）+ `base_order`（硬分档）手工校准。
     #[serde(default)]
     pub weight_spec: Option<WeightSpec>,
     /// 该词库的**层级基序档位**（小整数）：排序时作为独立层级（weight 之后、natural_order 之前）。

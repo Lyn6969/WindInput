@@ -36,7 +36,8 @@ description = "新词、网络用语、生僻词等非常用词条"
 path = "wubi86/wubi86_jidian_extra.dict.yaml"
 type = "rime_codetable"
 default_enabled = true
-weight_as_order = true
+# 本库有真实词频权重（1843 条 / 643 个不同值，中位 950、max 2125，与主库同量纲），
+# 故不设 default_weight——抹平会丢失词频信息。base_order=1 保证等权时排在主库之后。
 base_order = 1
 
 [[dictionaries]]
@@ -46,7 +47,9 @@ description = "按五笔编码检索 emoji；输入 emoj 可查看常用表情"
 path = "wubi86/wubi86_jidian_emoji.dict.yaml"
 type = "rime_codetable"
 default_enabled = true
-weight_as_order = true
+# 切勿设 default_weight：本库 71 条常用表情共用编码 `emoj`，靠 200/199/198… 递减权重表达
+# 展示顺序（😂>🤣>😊…），抹平权重会把这套顺序毁成文件序。其余 251 条恒 100，天然等权。
+# base_sort=weight 下同码内按权重降序，该顺序已自动生效，无需额外配置。
 base_order = 2
 
 [[dictionaries]]
@@ -57,8 +60,11 @@ path = "wubi86/wubi86_jidian_extra_district.dict.yaml"
 type = "rime_codetable"
 default_enabled = false
 base_order = 3
-# 注：该库经解析权重为 0（无权重）。启用后如需让地名落在特定权重档而非沉底，配 default_weight。
-weight_as_order = true
+# 本库无 weight 列（列为 text/code/空/行政区划码），解析后权重恒 0。不配 default_weight 时
+# 会因 weight=0 在权重模式下整体沉底——此前"看起来正常"只是全库同为 0 而退化成文件序的巧合。
+# 显式定档 500：低于主库中位 941（地名不压常用字），远高于 0（启用后可见而非沉底）。
+# 整库同权 ⟹ 库内自动按 natural_order（文件顺序）排列，即该库 yaml 里 `sort: original` 的本意。
+default_weight = 500
 
 [encoder]
 max_word_length = 10

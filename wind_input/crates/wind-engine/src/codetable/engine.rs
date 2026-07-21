@@ -23,11 +23,22 @@ pub enum BaseSort {
 }
 
 impl BaseSort {
-    /// 解析配置字符串：`"natural"` → Natural，其余（含空/`"weight"`）→ Weight。
+    /// 解析配置字符串：`"natural"` → Natural，`""`/`"weight"` → Weight。
+    ///
+    /// 其余取值同样回退 Weight，但**会告警**：此前静默吞掉拼写错误，配置者只会观察到
+    /// 「改了没生效」而拿不到任何线索。注意本项**不接受 librime 的 `by_weight`/`original`
+    /// 拼法**——那是 `.dict.yaml` 里 rime 的库内同码排序键，与本项（方案级全局排序维度）
+    /// 语义不同，故列为非法值而非别名，避免两套词汇被误当等价。
     pub fn parse(s: &str) -> Self {
         if s.eq_ignore_ascii_case("natural") {
             Self::Natural
         } else {
+            if !s.is_empty() && !s.eq_ignore_ascii_case("weight") {
+                tracing::warn!(
+                    value = %s,
+                    "[engine.codetable].base_sort 取值无法识别，已回退 \"weight\"；合法值仅 \"weight\" / \"natural\""
+                );
+            }
             Self::Weight
         }
     }

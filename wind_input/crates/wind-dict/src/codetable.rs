@@ -335,6 +335,28 @@ fn parse_columns_header(header: &str) -> ColumnsDecl {
     })
 }
 
+/// 从 YAML 头部取出 librime 的 `sort:` 声明值（无声明返回 `None`）。
+///
+/// 该键**不被本输入法消费**，取出仅为告警——此前它被静默跳过，配置者把 `by_weight` 改成
+/// `original` 会观察到毫无变化且拿不到任何诊断。排序语义见 `resolve_columns` 中的告警文案。
+///
+/// 与 `columns:` 同规则：只认顶格键（缩进的同名键属于别的映射），并剥除行内注释。
+fn parse_sort_header(header: &str) -> Option<String> {
+    for raw in header.lines() {
+        let line = raw.split('#').next().unwrap_or("");
+        if line.starts_with([' ', '\t']) {
+            continue;
+        }
+        if let Some(rest) = line.trim().strip_prefix("sort:") {
+            let v = rest.trim();
+            if !v.is_empty() {
+                return Some(v.to_string());
+            }
+        }
+    }
+    None
+}
+
 /// 判定 code 列是否承载音节语义。见 [`ColumnSpec::has_syllables`] 对两条判据的说明。
 fn detect_syllables(body: &str, text_col: usize, code_col: usize, cutoff: Option<usize>) -> bool {
     // text 在 code 之前 → 拼音惯例（五笔类惯例是编码在前）。无空格时靠它兜底。
@@ -370,6 +392,16 @@ fn resolve_columns(
     cutoff: Option<usize>,
 ) -> Option<ColumnSpec> {
     let header = &content[..content.len() - body.len()];
+    if let Some(sort) = parse_sort_header(header) {
+        warn!(
+            "词库 {} 声明了 `sort: {}`，本输入法**不解析此键**（librime 用它决定库内同码条目的排列，\
+             我们没有对应实现）。词库顺序请改用方案 .schema.toml 的 `[[dictionaries]]` 配置：\
+             `base_order` 定库间硬分档，`default_weight` 抹平整库权重使其退化为文件顺序\
+             （等价于 rime 的 `sort: original`），`[engine.codetable].base_sort` 定全局排序维度。",
+            path.display(),
+            sort
+        );
+    }
     match parse_columns_header(header) {
         ColumnsDecl::Usable(mut spec) => {
             spec.has_syllables = detect_syllables(body, spec.text_col, spec.code_col, cutoff);
@@ -1163,6 +1195,31 @@ mod tests {
         // columns 块后回到别的键，不应越界把后续键读成列名
         let trailing = "---\ncolumns:\n  - code\n  - text\nsort: by_weight\n...\n";
         assert_eq!(parse_columns_header(trailing), usable(1, 0, None));
+    }
+
+    /// `sort:` 是 librime 的库内同码排序键，本输入法不消费，取出仅为告警。
+    /// 此前它被静默跳过：配置者把 `by_weight` 改成 `original` 观察不到任何变化也拿不到诊断。
+    #[test]
+    fn sort_header_is_detected_for_warning() {
+        assert_eq!(
+            parse_sort_header("---\nname: x\nsort: by_weight\n...\n").as_deref(),
+            Some("by_weight")
+        );
+        assert_eq!(
+            parse_sort_header("---\nsort: original\n...\n").as_deref(),
+            Some("original")
+        );
+        // 行内注释剥离（district 库就带注释）
+        assert_eq!(
+            parse_sort_header("---\nsort: original  # 原始顺序\n...\n").as_deref(),
+            Some("original")
+        );
+        // 无声明 → 不告警
+        assert_eq!(parse_sort_header("---\nname: x\ncolumns: [text, code]\n...\n"), None);
+        // 缩进的同名键属于别的映射，不算（与 columns: 同规则）
+        assert_eq!(parse_sort_header("---\nfoo:\n  sort: by_weight\n...\n"), None);
+        // 空值不触发
+        assert_eq!(parse_sort_header("---\nsort:\n...\n"), None);
     }
 
     /// **流式序列必须支持**：它是合法 YAML，且我们的警告文案就建议用户这么写。

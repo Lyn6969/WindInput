@@ -85,10 +85,20 @@ pub struct DictSpec {               // [[dictionaries]]
     pub default: bool,              // 主词库
     pub default_enabled: Option<bool>,  // 扩展库默认启用（tri-state）
     pub enabled: Option<bool>,
-    pub weight_as_order: bool,      // ★ 权重仅表示同码内排序序号（已有，但未接线到全局序）
-    pub weight_spec: Option<WeightSpec>,  // 跨库权重归一化
+    pub weight_spec: Option<WeightSpec>,  // 跨库权重归一化（未接线，仅作权重分布的事实记录）
+    pub base_order: i32,            // 库间硬分档（weight 之后、natural_order 之前的独立层级）
+    pub default_weight: Option<i32>,  // 整库权重定档；设值后库内自动退化为 natural_order
 }
 ```
+
+> **2026-07-21 更新**：`weight_as_order: bool` 字段**已删除**（下文 D5 及阶段一步骤 3 中对它的实施计划一并作废）。
+> 它自定义起从未接线，而三处实际配置经核对全部无效或误配：`wubi86_extra` 有 643 个不同值的真实词频
+> （中位 950，与主库同量纲）属误配；`wubi86_emoji` 的 71 条 `emoj` 编码用 200/199/198… 递减权重表达
+> 展示顺序，而 `base_sort=weight` 下同码内本就按权重降序，**设计目标已自动达成**，接线亦是空转；
+> `wubi86_xzqy` 无 weight 列，改配 `default_weight` 表达。
+>
+> 「库内按文件顺序」这一诉求的现行表达是 **`default_weight`（整库同权 ⟹ 比较器退化到 `natural_order`）**，
+> 见 `wind-dict/src/manager.rs:144` 的覆盖语义与 `manager.rs:238` 的验证测试。
 
 ## 3. 根因
 
@@ -185,7 +195,7 @@ default = true              # group_rank=0
 [[dictionaries]]
 id = "ext_names"
 default_enabled = true      # group_rank=1（扩展库，dict_base_order 生效时排基础库后）
-weight_as_order = true      # 该库无真实权重，weight 列即同码内序号
+default_weight = 500        # 该库无真实权重：整库定档 500，库内自动按文件顺序（natural_order）
 ```
 
 - `sort_grouping="none"` + `dict_base_order="none"` → `category_rank`/`group_rank` 恒 0 → 完全等价现状。
