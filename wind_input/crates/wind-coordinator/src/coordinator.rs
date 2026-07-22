@@ -1591,6 +1591,12 @@ impl Coordinator {
         mutate(&mut cfg);
         let bundle = std::sync::Arc::new(ConfigBundle::build(cfg));
         *self.rt.write().unwrap_or_else(|e| e.into_inner()) = bundle;
+        // 状态气泡去重缓存只在"内容配置不变"的前提下有效：改了 ui.status.items 之类后，
+        // 同一状态该合成出不同文本，留着旧缓存会把改动后的第一次显示误判成"内容没变"而吞掉。
+        self.last_status_text
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear();
     }
 
     pub fn reload_user_config(&self) -> bool {
@@ -1609,6 +1615,12 @@ impl Coordinator {
                 let new_cfg = bundle.config.clone();
                 *self.rt.write().unwrap_or_else(|e| e.into_inner()) = bundle;
                 info!("User config hot-reloaded (schema_dirty={})", schema_dirty);
+                // 同 refresh_config_in_memory：设置页改了 ui.status.items 后，旧的去重缓存
+                // 会把改动后的第一次状态显示误判成"内容没变"而吞掉。
+                self.last_status_text
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .clear();
 
                 if schema_dirty {
                     // 热重建方案集：清输入缓冲、刷新工具栏/状态，免重启切换方案。
@@ -2883,6 +2895,12 @@ impl Coordinator {
         let si = &bundle.config.ui.status;
         // 禁用则完全不显示状态提示气泡。
         if !si.enabled {
+            return;
+        }
+        // 空文本不弹窗：ui.status.items 全部取消勾选时合成文本为空，此前会渲染出一个
+        // 什么都没有的小气泡（本地窗口路径无空文本判断，只有 host-render 的 render_frame 有）。
+        // 与设置页「全部取消则不显示气泡」的说明保持一致。
+        if text.trim().is_empty() {
             return;
         }
         let (x, y, caret_height) = {
