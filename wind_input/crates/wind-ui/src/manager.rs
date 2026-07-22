@@ -139,6 +139,11 @@ pub enum UiCommand {
     ScreenshotTooltip { dir: std::path::PathBuf },
     /// 设置悬停提示右键菜单打开状态（开启时抑制其 WM_MOUSELEAVE 自动隐藏）。
     SetTooltipMenuOpen(bool),
+    /// 标记状态气泡的右键菜单开/关（打开期间抑制自动隐藏）。
+    SetStatusMenuOpen(bool),
+    /// 请求上报状态气泡当前位置：UI 侧回 `UiEvent::StatusTipMoved`。
+    /// 供「固定位置」开关把当前实际位置落盘，而不是跳到陈旧的 custom_x/custom_y。
+    ReportStatusTipPos,
     /// 注册全局热键（Win32 RegisterHotKey，线程级）。覆盖式：先反注册旧列表再注册新列表，
     /// 空列表 = 仅清除已注册项。来自 keys.global_hotkeys（协调器构建，启动/配置重载时下发）。
     RegisterGlobalHotkeys(Vec<GlobalHotkeyEntry>),
@@ -267,6 +272,8 @@ pub enum MenuCmd {
     TooltipCopy,
     /// 悬停提示（编码反查气泡）：截图此窗口
     TooltipScreenshot,
+    /// 状态提示气泡：切换固定位置（position_mode fixed/follow_caret）
+    StatusTogglePinned,
 }
 
 /// 菜单项的动作类型（右键候选菜单 + 功能主菜单共用）
@@ -321,6 +328,7 @@ impl MenuKind {
                 MenuCmd::StatusScreenshot => 117,
                 MenuCmd::TooltipCopy => 118,
                 MenuCmd::TooltipScreenshot => 119,
+                MenuCmd::StatusTogglePinned => 122,
                 MenuCmd::ToggleInputDiagnostics => 120,
                 MenuCmd::TogglePasswordSuppress => 121,
                 MenuCmd::SchemaSelect(i) => 1000 + i as i32,
@@ -360,6 +368,7 @@ impl MenuKind {
             117 => MenuCmd::StatusScreenshot,
             118 => MenuCmd::TooltipCopy,
             119 => MenuCmd::TooltipScreenshot,
+            122 => MenuCmd::StatusTogglePinned,
             120 => MenuCmd::ToggleInputDiagnostics,
             121 => MenuCmd::TogglePasswordSuppress,
             1000..=1999 => MenuCmd::SchemaSelect((id - 1000) as usize),
@@ -523,6 +532,8 @@ impl UiManager {
             }
         };
         let mut tip_hide_at: Option<std::time::Instant> = None;
+        // 最近一次显示所用的自动隐藏时长（毫秒），交互结束后据此重新计时。
+        let mut tip_duration_ms: u64 = 0;
 
         // 输入诊断 HUD（惰性创建：首次 ShowInputDiag 时构造，best-effort）
         let mut input_diag_hud: Option<crate::input_diag_hud::InputDiagHud> = None;
@@ -594,9 +605,17 @@ impl UiManager {
         // 避免长按翻页/连按方向键时 UpdateCandidates 堆积、松键后仍继续刷新。
         let mut pending: std::collections::VecDeque<UiCommand> = std::collections::VecDeque::new();
         'main: loop {
-            // 状态提示气泡到期自动隐藏
+            // 状态提示气泡到期自动隐藏。
+            // 用户正在与气泡交互（拖动 / 悬停其上 / 右键菜单打开）时**顺延**而非隐藏：
+            // 否则气泡会在被操作的过程中凭空消失。交互结束后重新获得完整一份时长。
             if let Some(deadline) = tip_hide_at {
-                if std::time::Instant::now() >= deadline {
+                let interacting = status_tip.as_ref().is_some_and(|t| t.interacting());
+                if interacting {
+                    tip_hide_at = Some(
+                        std::time::Instant::now()
+                            + std::time::Duration::from_millis(tip_duration_ms.max(1)),
+                    );
+                } else if std::time::Instant::now() >= deadline {
                     if let Some(t) = &status_tip {
                         t.hide();
                     }
@@ -705,6 +724,7 @@ impl UiManager {
                     }
                 }
                 // dur==0 → 常驻(always):不设隐藏时刻;否则按配置时长自动隐藏。
+                tip_duration_ms = dur;
                 tip_hide_at = if dur == 0 {
                     None
                 } else {
@@ -967,8 +987,25 @@ impl UiManager {
                                 match st.capture_to_file(&path) {
                                     Ok(_) => {
                                         info!("Screenshot saved: {:?}", path);
+                                        // 存盘的同时进剪贴板：截完就能直接粘贴，省去翻目录。
+                                        let clip = st.capture_to_clipboard();
+                                        if let Err(e) = &clip {
+                                            tracing::warn!(
+                                                "Screenshot status_tip clipboard: {}",
+                                                e
+                                            );
+                                        }
+                                        let suffix = if clip.is_ok() {
+                                            "（已复制到剪贴板）"
+                                        } else {
+                                            ""
+                                        };
                                         (
-                                            format!("状态提示气泡已截图\n{}", path.display()),
+                                            format!(
+                                                "状态提示气泡已截图{}\n{}",
+                                                suffix,
+                                                path.display()
+                                            ),
                                             ToastKind::Success,
                                         )
                                     }
@@ -1009,8 +1046,18 @@ impl UiManager {
                             match candidate_window.tooltip_capture_to_file(&path) {
                                 Ok(_) => {
                                     info!("Screenshot saved: {:?}", path);
+                                    // 存盘的同时进剪贴板：截完就能直接粘贴，省去翻目录。
+                                    let clip = candidate_window.tooltip_capture_to_clipboard();
+                                    if let Err(e) = &clip {
+                                        tracing::warn!("Screenshot tooltip clipboard: {}", e);
+                                    }
+                                    let suffix = if clip.is_ok() {
+                                        "（已复制到剪贴板）"
+                                    } else {
+                                        ""
+                                    };
                                     (
-                                        format!("提示气泡已截图\n{}", path.display()),
+                                        format!("提示气泡已截图{}\n{}", suffix, path.display()),
                                         ToastKind::Success,
                                     )
                                 }
@@ -1027,6 +1074,19 @@ impl UiManager {
                             toast_hide_at = Some(
                                 std::time::Instant::now() + std::time::Duration::from_millis(3000),
                             );
+                        }
+                    }
+                    UiCommand::SetStatusMenuOpen(open) => {
+                        if let Some(st) = &status_tip {
+                            st.set_menu_open(open);
+                        }
+                    }
+                    UiCommand::ReportStatusTipPos => {
+                        if let Some(st) = &status_tip
+                            && st.is_visible()
+                        {
+                            let (x, y) = st.content_origin();
+                            let _ = event_tx.send(UiEvent::StatusTipMoved { x, y });
                         }
                     }
                     UiCommand::SetTooltipMenuOpen(open) => {

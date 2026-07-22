@@ -363,6 +363,14 @@ impl CandidateWindow {
         }
     }
 
+    /// 将悬停 tooltip 当前渲染帧复制到剪贴板。
+    pub fn tooltip_capture_to_clipboard(&self) -> Result<(), String> {
+        match self.tooltip.as_ref() {
+            Some(t) => t.capture_to_clipboard(),
+            None => Err("tooltip 未初始化".to_string()),
+        }
+    }
+
     /// 悬停提示窗口当前是否可见。
     pub fn tooltip_is_visible(&self) -> bool {
         self.tooltip

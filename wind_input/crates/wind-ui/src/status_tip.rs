@@ -26,6 +26,41 @@ struct StatusTipMouse {
     margin: (i32, i32),
     /// 拖动中最近一次落定的窗口左上坐标（`WM_MOUSEMOVE` 写入）。
     drag_pin: Option<(i32, i32)>,
+    /// 光标是否在气泡窗口内（`WM_MOUSEMOVE` 置 true / `WM_MOUSELEAVE` 置 false）。
+    mouse_over: bool,
+    /// 是否已注册过 `WM_MOUSELEAVE` 追踪（一次性，收到 LEAVE 后需重新注册）。
+    leave_armed: bool,
+    /// 本气泡的右键菜单是否打开中。
+    menu_open: bool,
+}
+
+impl StatusTipMouse {
+    /// 交互进行中：拖动 / 光标悬停其上 / 右键菜单打开。
+    /// 临时模式的自动隐藏在此期间必须顺延，否则气泡会在用户正操作它时凭空消失。
+    fn interacting(&self) -> bool {
+        self.dragging || self.mouse_over || self.menu_open
+    }
+
+    /// 注册一次性 `WM_MOUSELEAVE` 通知（光标移出窗口时收到）。
+    fn arm_leave(&mut self) {
+        if self.leave_armed {
+            return;
+        }
+        self.leave_armed = true;
+        #[cfg(windows)]
+        unsafe {
+            use windows::Win32::UI::Input::KeyboardAndMouse::{
+                TME_LEAVE, TRACKMOUSEEVENT, TrackMouseEvent,
+            };
+            let mut t = TRACKMOUSEEVENT {
+                cbSize: std::mem::size_of::<TRACKMOUSEEVENT>() as u32,
+                dwFlags: TME_LEAVE,
+                hwndTrack: self.hwnd,
+                dwHoverTime: 0,
+            };
+            let _ = TrackMouseEvent(&mut t);
+        }
+    }
 }
 
 impl crate::window::WindowMouse for StatusTipMouse {
@@ -39,10 +74,16 @@ impl crate::window::WindowMouse for StatusTipMouse {
         use crate::sys::{
             GetWindowRect, HWND_TOPMOST, IDC_ARROW, IDC_SIZEALL, LRESULT, LoadCursorW, RECT,
             ReleaseCapture, SWP_NOACTIVATE, SWP_NOSIZE, SWP_NOZORDER, SetCapture, SetCursor,
-            SetWindowPos, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_RBUTTONDOWN, WM_SETCURSOR,
-            clamp_to_work_area,
+            SetWindowPos, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSELEAVE, WM_MOUSEMOVE,
+            WM_RBUTTONDOWN, WM_SETCURSOR, clamp_to_work_area,
         };
         match msg {
+            WM_MOUSELEAVE => {
+                // 光标移出气泡：解除"交互中"，临时模式的自动隐藏随后重新计时。
+                self.mouse_over = false;
+                self.leave_armed = false;
+                Some(LRESULT(0))
+            }
             WM_LBUTTONDOWN => {
                 let (mx, my) = cursor_screen();
                 let (wx, wy) = window_origin(self.hwnd);
@@ -55,6 +96,9 @@ impl crate::window::WindowMouse for StatusTipMouse {
                 Some(LRESULT(0))
             }
             WM_MOUSEMOVE => {
+                // 悬停即视为交互中：光标停在气泡上时不该被自动隐藏抽走。
+                self.mouse_over = true;
+                self.arm_leave();
                 if self.dragging {
                     let (mx, my) = cursor_screen();
                     let nx = mx - self.grab_dx;
@@ -180,6 +224,9 @@ impl StatusTip {
             grab_dy: 0,
             margin: (0, 0),
             drag_pin: None,
+            mouse_over: false,
+            leave_armed: false,
+            menu_open: false,
         }));
         window.register_mouse(mouse.clone());
         let renderer = TextRenderer::new("Microsoft YaHei UI", Self::DEFAULT_FONT_PX * scale)?;
@@ -365,6 +412,30 @@ impl StatusTip {
     /// 将当前渲染帧保存为 PNG 文件（截图用）。
     pub fn capture_to_file(&self, path: &std::path::Path) -> Result<(), String> {
         self.window.capture_to_file(path)
+    }
+
+    /// 将当前渲染帧复制到剪贴板（截图用）。
+    pub fn capture_to_clipboard(&self) -> Result<(), String> {
+        self.window.capture_to_clipboard()
+    }
+
+    /// 用户是否正在与气泡交互（拖动 / 悬停 / 右键菜单打开）。
+    /// 临时模式的自动隐藏须在此期间顺延——否则用户正拖着它、或菜单还开着，气泡就消失了。
+    pub fn interacting(&self) -> bool {
+        self.mouse.borrow().interacting()
+    }
+
+    /// 标记本气泡的右键菜单开/关（打开期间抑制自动隐藏）。
+    pub fn set_menu_open(&self, open: bool) {
+        self.mouse.borrow_mut().menu_open = open;
+    }
+
+    /// 当前气泡**内容左上**屏幕坐标（窗口左上 + 阴影扩边）。
+    /// 供「固定位置」开关把当前实际位置落盘成 custom_x/custom_y。
+    pub fn content_origin(&self) -> (i32, i32) {
+        let m = self.mouse.borrow();
+        let (wx, wy) = window_origin(m.hwnd);
+        (wx + m.margin.0, wy + m.margin.1)
     }
 
     /// 窗口当前是否可见（查询 Win32 IsWindowVisible）。

@@ -81,6 +81,7 @@ impl Coordinator {
             MenuCmd::ToggleInputDiagnostics => self.toggle_input_diag_hud(),
             MenuCmd::TogglePasswordSuppress => self.toggle_password_suppress(),
             MenuCmd::StatusToggleAlways => self.status_toggle_always(),
+            MenuCmd::StatusTogglePinned => self.status_toggle_pinned(),
             MenuCmd::StatusResetPosition => self.status_reset_position(),
             MenuCmd::StatusScreenshot => {
                 if let Some(dir) = screenshots_dir() {
@@ -167,19 +168,49 @@ impl Coordinator {
         });
     }
 
-    /// 右键状态提示气泡请求的功能菜单：常驻显示（勾选态）/ 恢复默认位置 / 截图此窗口。
-    pub(crate) fn show_status_menu(&self, x: i32, y: i32) {
-        use wind_ui::manager::MenuItemSpec as M;
-        let always = self
+    /// 状态提示气泡右键菜单「固定位置」：在 fixed / follow_caret 间翻转。
+    ///
+    /// 打开时**以气泡当前实际位置**落盘，而不是直接切到陈旧的 custom_x/custom_y——
+    /// 否则用户拖到某处后点「固定位置」，气泡会跳到上次保存的（往往是 0,0）坐标。
+    /// 做法：先把模式改成 fixed，再请 UI 上报当前位置，回来的 `StatusTipMoved`
+    /// 经 `save_status_tip_pos` 落盘（该函数只在 fixed 模式下持久化，此时条件已满足）。
+    pub(crate) fn status_toggle_pinned(&self) {
+        let now_fixed = !self
             .rt()
             .config
             .ui
             .status
-            .display_mode
-            .eq_ignore_ascii_case("always");
+            .position_mode
+            .eq_ignore_ascii_case("fixed");
+        let mode = if now_fixed { "fixed" } else { "follow_caret" };
+        let _ = Config::set_user_string(&["ui", "status", "position_mode"], mode);
+        self.refresh_config_in_memory(|c| c.ui.status.position_mode = mode.to_string());
+        if now_fixed {
+            let _ = self.ui_tx.send(UiCommand::ReportStatusTipPos);
+        }
+    }
+
+    /// 右键状态提示气泡请求的功能菜单：常驻显示 / 固定位置（均带勾选）/ 恢复默认位置 / 截图。
+    pub(crate) fn show_status_menu(&self, x: i32, y: i32) {
+        use wind_ui::manager::MenuItemSpec as M;
+        let si_always;
+        let si_fixed;
+        {
+            let si = &self.rt().config.ui.status;
+            si_always = si.display_mode.eq_ignore_ascii_case("always");
+            si_fixed = si.position_mode.eq_ignore_ascii_case("fixed");
+        }
+        // 菜单打开期间抑制气泡自动隐藏，否则临时模式下菜单还开着气泡就没了。
+        let _ = self.ui_tx.send(UiCommand::SetStatusMenuOpen(true));
         let cmd = |c: MenuCmd| MenuKind::Command(c);
         let items = vec![
-            M::leaf("常驻显示", cmd(MenuCmd::StatusToggleAlways), true, always),
+            M::leaf(
+                "常驻显示",
+                cmd(MenuCmd::StatusToggleAlways),
+                true,
+                si_always,
+            ),
+            M::leaf("固定位置", cmd(MenuCmd::StatusTogglePinned), true, si_fixed),
             M::leaf(
                 "恢复默认位置",
                 cmd(MenuCmd::StatusResetPosition),
@@ -590,6 +621,9 @@ impl Coordinator {
     /// 表现为「复制能用、截图不能用」。
     pub(crate) fn clear_tooltip_menu_flag(&self) {
         let _ = self.ui_tx.send(UiCommand::SetTooltipMenuOpen(false));
+        // 状态气泡同理：菜单关掉后恢复自动隐藏计时。这里解除是安全的——它只影响
+        // 隐藏抑制，不像 tooltip 那样会立即隐藏窗口，故不受"截图命令尚未处理"的时序制约。
+        let _ = self.ui_tx.send(UiCommand::SetStatusMenuOpen(false));
     }
 
     /// 菜单打开时转发导航键给菜单窗口；返回 true 表示已消费。

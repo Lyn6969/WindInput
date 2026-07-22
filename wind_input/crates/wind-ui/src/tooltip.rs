@@ -341,6 +341,11 @@ impl Tooltip {
         self.window.capture_to_file(path)
     }
 
+    /// 将当前渲染帧复制到剪贴板（截图用）。
+    pub fn capture_to_clipboard(&self) -> Result<(), String> {
+        self.window.capture_to_clipboard()
+    }
+
     /// 窗口当前是否可见（查询 Win32 IsWindowVisible）。
     pub fn is_visible(&self) -> bool {
         #[cfg(windows)]
