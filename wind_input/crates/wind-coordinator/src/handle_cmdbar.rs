@@ -241,6 +241,12 @@ impl ImeController for CoordIme {
             None => Ok(String::new()),
         }
     }
+    fn undo_commit(&self) -> anyhow::Result<()> {
+        if let Some(c) = self.0.upgrade() {
+            c.cmd_undo_commit();
+        }
+        Ok(())
+    }
 }
 
 /// 词库控制器：dict.add 接通用户词层。

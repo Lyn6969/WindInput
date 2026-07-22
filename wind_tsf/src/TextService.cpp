@@ -3297,6 +3297,21 @@ BOOL CTextService::_InitIPCClient()
         }
     });
 
+    // Set up replace-backward callback for undo commit push from service
+    _pIPCClient->SetReplaceBackwardCallback([pThis](int count, const std::wstring& text) {
+        // This callback is called from the async reader thread; hop to the TSF
+        // thread via the message window (ReplacePrecedingChars needs it).
+        WIND_LOG_DEBUG_FMT(L"Replace backward received from service, count=%d\n", count);
+        if (pThis->_pLangBarItemButton != nullptr)
+        {
+            pThis->_pLangBarItemButton->PostReplaceBackward(count, text);
+        }
+        else
+        {
+            WIND_LOG_WARN(L"Replace backward push dropped: no LangBarItemButton\n");
+        }
+    });
+
     // Set up clear composition callback for mode toggle via menu
     _pIPCClient->SetClearCompositionCallback([pThis]() {
         // This callback is called from the async reader thread

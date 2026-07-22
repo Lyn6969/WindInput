@@ -57,6 +57,11 @@ pub trait ImeController: Send + Sync {
     fn set_schema(&self, id: &str) -> anyhow::Result<()>;
     /// 循环切换主题；dir="next"/"" 向后，"prev" 向前，返回新主题 ID。
     fn theme_cycle(&self, dir: &str) -> anyhow::Result<String>;
+    /// 撤销最近一次上屏（`ime.undo_commit`）：按上屏历史删除对应字符数，
+    /// 无历史时删 1 个。默认未支持（测试/精简宿主）。
+    fn undo_commit(&self) -> anyhow::Result<()> {
+        anyhow::bail!("undo_commit: 宿主未支持")
+    }
 }
 
 /// 配置读写：`config.get` / `config.set` / `config.toggle`，key 为 YAML 路径。

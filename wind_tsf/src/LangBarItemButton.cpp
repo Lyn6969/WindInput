@@ -122,6 +122,7 @@ const UINT CLangBarItemButton::WM_CLEAR_COMPOSITION = WM_USER + 102;
 const UINT CLangBarItemButton::WM_UPDATE_COMPOSITION = WM_USER + 103;
 const UINT CLangBarItemButton::WM_SERVICE_READY = WM_USER + 104;
 const UINT CLangBarItemButton::WM_ACTIVATION_STATUS = WM_USER + 105;
+const UINT CLangBarItemButton::WM_REPLACE_BACKWARD = WM_USER + 106;
 
 static const UINT_PTR TIMER_ID_CARET_RETRY    = 0xC401;
 static const UINT_PTR TIMER_ID_SERVICE_READY  = 0xC402;
@@ -744,6 +745,25 @@ LRESULT CALLBACK CLangBarItemButton::_MsgWndProc(HWND hwnd, UINT msg, WPARAM wPa
         delete pData;
         return 0;
     }
+    else if (msg == WM_REPLACE_BACKWARD)
+    {
+        // lParam contains pointer to ReplaceBackwardData (allocated by sender)
+        ReplaceBackwardData* pData = reinterpret_cast<ReplaceBackwardData*>(lParam);
+        CLangBarItemButton* pThis = reinterpret_cast<CLangBarItemButton*>(GetWindowLongPtrW(hwnd, GWLP_USERDATA));
+
+        if (pThis != nullptr && pData != nullptr && pThis->_pTextService != nullptr)
+        {
+            WIND_LOG_DEBUG_FMT(L"MsgWndProc: Processing WM_REPLACE_BACKWARD, count=%d, textLen=%zu\n",
+                               pData->count, pData->text.length());
+            // Same primitive as smart-symbol correction: atomic TSF range replace
+            // first, synthetic-key fallback inside (undo commit push path).
+            pThis->_pTextService->ReplacePrecedingChars(pData->count, pData->text);
+        }
+
+        // Free the data allocated by sender
+        delete pData;
+        return 0;
+    }
     else if (msg == WM_CLEAR_COMPOSITION)
     {
         CLangBarItemButton* pThis = reinterpret_cast<CLangBarItemButton*>(GetWindowLongPtrW(hwnd, GWLP_USERDATA));
@@ -1129,6 +1149,34 @@ void CLangBarItemButton::PostCommitText(const std::wstring& text)
     else
     {
         WIND_LOG_DEBUG_FMT(L"PostCommitText: Message posted to UI thread, textLen=%zu\n", text.length());
+    }
+}
+
+void CLangBarItemButton::PostReplaceBackward(int count, const std::wstring& text)
+{
+    // Thread-safe: post to the message window so ReplacePrecedingChars runs on
+    // the UI (TSF) thread. Unlike PostCommitText there is no meaningful direct
+    // fallback — ReplacePrecedingChars needs the TSF thread — so without a
+    // message window the push is dropped (logged).
+    if (_hMsgWnd == NULL)
+    {
+        WIND_LOG_WARN(L"PostReplaceBackward: No message window, dropping undo push\n");
+        return;
+    }
+
+    // Allocate data on heap (will be freed by message handler)
+    ReplaceBackwardData* pData = new ReplaceBackwardData();
+    pData->count = count;
+    pData->text = text;
+
+    if (!PostMessageW(_hMsgWnd, WM_REPLACE_BACKWARD, 0, reinterpret_cast<LPARAM>(pData)))
+    {
+        delete pData;
+        WIND_LOG_WARN(L"PostReplaceBackward: PostMessage failed, dropping undo push\n");
+    }
+    else
+    {
+        WIND_LOG_DEBUG_FMT(L"PostReplaceBackward: Message posted to UI thread, count=%d\n", count);
     }
 }
 

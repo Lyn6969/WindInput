@@ -214,26 +214,29 @@ impl PushServer {
 
     /// 仅向活动客户端投递（用于 commit 等带副作用的消息，避免广播导致多次上屏）。
     /// 优先按活动 token 匹配；无匹配且仅一个客户端时兜底发它；否则跳过。
-    pub fn push_commit_to_active(&self, data: &[u8]) {
+    /// 返回是否已投入某客户端的发送队列（false = 无客户端/无匹配/通道已断，
+    /// 肯定没投出去）。true 仅表示入队成功，不保证对端最终收到；需要区分
+    /// 「肯定失败」的调用方（如撤销上屏回滚历史）用返回值，其余调用点可忽略。
+    pub fn push_commit_to_active(&self, data: &[u8]) -> bool {
         let active = self.active_token.load(Ordering::Relaxed);
         let clients = self.clients.lock().unwrap();
         if clients.is_empty() {
-            return;
+            return false;
         }
         if active != 0 {
             if let Some(c) = clients.iter().find(|c| c.token == active) {
-                let _ = c.tx.send(data.to_vec());
-                return;
+                return c.tx.send(data.to_vec()).is_ok();
             }
         }
         if clients.len() == 1 {
-            let _ = clients[0].tx.send(data.to_vec());
+            clients[0].tx.send(data.to_vec()).is_ok()
         } else {
             warn!(
                 "push_commit: 无匹配活动客户端 (active=0x{:016X}, clients={})，跳过以防多发",
                 active,
                 clients.len()
             );
+            false
         }
     }
 
@@ -387,8 +390,14 @@ fn serve_push_client(
     let ready_msg = IpcHeader::new(CMD_SERVICE_READY, 0).to_bytes().to_vec();
     {
         let mut bytes_written: u32 = 0;
-        let write_ok =
-            unsafe { WriteFile(pipe_handle, Some(&ready_msg), Some(&mut bytes_written), None) };
+        let write_ok = unsafe {
+            WriteFile(
+                pipe_handle,
+                Some(&ready_msg),
+                Some(&mut bytes_written),
+                None,
+            )
+        };
         if write_ok.is_err() {
             warn!("Failed to send SERVICE_READY to push client");
             unsafe {
@@ -403,8 +412,14 @@ fn serve_push_client(
     // 读取客户端 token（8 字节）
     let mut token_buf = [0u8; 8];
     let mut bytes_read: u32 = 0;
-    let read_ok =
-        unsafe { ReadFile(pipe_handle, Some(&mut token_buf), Some(&mut bytes_read), None) };
+    let read_ok = unsafe {
+        ReadFile(
+            pipe_handle,
+            Some(&mut token_buf),
+            Some(&mut bytes_read),
+            None,
+        )
+    };
 
     if read_ok.is_err() || bytes_read != 8 {
         warn!("Failed to read push client token");
