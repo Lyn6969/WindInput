@@ -77,7 +77,117 @@ impl Coordinator {
             MenuCmd::OpenLogDir => self.open_dir(Config::log_dir()),
             MenuCmd::ToggleInputDiagnostics => self.toggle_input_diag_hud(),
             MenuCmd::TogglePasswordSuppress => self.toggle_password_suppress(),
+            MenuCmd::StatusToggleAlways => self.status_toggle_always(),
+            MenuCmd::StatusResetPosition => self.status_reset_position(),
+            MenuCmd::StatusScreenshot => {
+                if let Some(dir) = screenshots_dir() {
+                    let _ = self.ui_tx.send(UiCommand::ScreenshotStatusTip {
+                        dir: std::path::PathBuf::from(dir),
+                    });
+                }
+            }
         }
+    }
+
+    /// 状态提示气泡右键菜单「常驻显示」：在 always/temp 间翻转 display_mode 并立即生效。
+    /// 变为 always 时立即以常驻方式显示一次当前状态；变为 temp 时立即隐藏。
+    pub(crate) fn status_toggle_always(&self) {
+        let now_always = !self
+            .rt()
+            .config
+            .ui
+            .status
+            .display_mode
+            .eq_ignore_ascii_case("always");
+        let mode = if now_always { "always" } else { "temp" };
+        let _ = Config::set_user_string(&["ui", "status", "display_mode"], mode);
+        self.refresh_config_in_memory(|c| c.ui.status.display_mode = mode.to_string());
+        if now_always {
+            self.show_persistent_status_if_always();
+        } else {
+            self.hide_tip();
+        }
+    }
+
+    /// 状态提示气泡右键菜单「恢复默认位置」：改回跟随光标，custom_x/y 归零。
+    pub(crate) fn status_reset_position(&self) {
+        let _ = Config::set_user_string(&["ui", "status", "position_mode"], "follow_caret");
+        let _ = Config::set_user_value(&["ui", "status", "custom_x"], toml::Value::Integer(0));
+        let _ = Config::set_user_value(&["ui", "status", "custom_y"], toml::Value::Integer(0));
+        self.refresh_config_in_memory(|c| {
+            c.ui.status.position_mode = "follow_caret".to_string();
+            c.ui.status.custom_x = 0;
+            c.ui.status.custom_y = 0;
+        });
+    }
+
+    /// 拖动状态提示气泡释放后的落位处理——**是否持久化取决于当前模式**：
+    ///
+    /// - `fixed`（固定坐标）：写回 `custom_x/custom_y`，永久生效。
+    /// - `follow_caret`（跟随光标）：**不落盘**。拖动只是把气泡临时挪开，
+    ///   下次状态变化重新显示时自然回到光标旁——UI 侧仅在拖动进行中锁定位置，
+    ///   松手后的 `show()` 会照常按光标重新定位，无需在此做任何清理。
+    ///
+    /// 这样两种模式各自语义自洽：跟随模式拖动是临时的，固定模式拖动才是"重新摆放"。
+    pub(crate) fn save_status_tip_pos(&self, x: i32, y: i32) {
+        if !self
+            .rt()
+            .config
+            .ui
+            .status
+            .position_mode
+            .eq_ignore_ascii_case("fixed")
+        {
+            return;
+        }
+        let _ = Config::set_user_value(
+            &["ui", "status", "custom_x"],
+            toml::Value::Integer(x as i64),
+        );
+        let _ = Config::set_user_value(
+            &["ui", "status", "custom_y"],
+            toml::Value::Integer(y as i64),
+        );
+        self.refresh_config_in_memory(|c| {
+            c.ui.status.custom_x = x;
+            c.ui.status.custom_y = y;
+        });
+    }
+
+    /// 右键状态提示气泡请求的功能菜单：常驻显示（勾选态）/ 恢复默认位置 / 截图此窗口。
+    pub(crate) fn show_status_menu(&self, x: i32, y: i32) {
+        use wind_ui::manager::MenuItemSpec as M;
+        let always = self
+            .rt()
+            .config
+            .ui
+            .status
+            .display_mode
+            .eq_ignore_ascii_case("always");
+        let cmd = |c: MenuCmd| MenuKind::Command(c);
+        let items = vec![
+            M::leaf("常驻显示", cmd(MenuCmd::StatusToggleAlways), true, always),
+            M::leaf(
+                "恢复默认位置",
+                cmd(MenuCmd::StatusResetPosition),
+                true,
+                false,
+            ),
+            M::leaf("截图此窗口", cmd(MenuCmd::StatusScreenshot), true, false),
+        ];
+        {
+            let mut s = self.state.lock().unwrap_or_else(|e| e.into_inner());
+            s.menu_open = true;
+            s.menu_target_page_local = 0;
+            s.menu_target_text = String::new();
+        }
+        let _ = self.ui_tx.send(UiCommand::ShowCandidateMenu {
+            items,
+            x,
+            y,
+            y_bottom: y,
+            above: false,
+        });
     }
 
     /// 切换输入诊断 HUD 显隐（高级菜单）：开启时立即推送当前快照，关闭时下发隐藏。

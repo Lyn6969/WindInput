@@ -1574,6 +1574,19 @@ impl Coordinator {
         }
     }
 
+    /// 就地改写内存配置并重建 ConfigBundle，**不触发** reload_user_config 的那一整套副作用
+    /// （toast、引擎热重建、热键重注册、主题下发、向 TSF 推 IPC 配置）。
+    ///
+    /// 用于「改动只影响少数几个 UI 字段、且发生频率高」的场景——典型是拖动窗口后落盘位置：
+    /// 走 reload_user_config 会每拖一次弹一个「设置已更新」toast，明显不合适。
+    /// 调用方仍需自行用 `Config::set_user_*` 把值写盘，本函数只负责让内存态立刻跟上。
+    pub(crate) fn refresh_config_in_memory(&self, mutate: impl FnOnce(&mut Config)) {
+        let mut cfg = self.rt().config.clone();
+        mutate(&mut cfg);
+        let bundle = std::sync::Arc::new(ConfigBundle::build(cfg));
+        *self.rt.write().unwrap_or_else(|e| e.into_inner()) = bundle;
+    }
+
     pub fn reload_user_config(&self) -> bool {
         match Config::load(Config::data_dir().as_deref()) {
             Ok(cfg) => {
@@ -2541,6 +2554,8 @@ impl Coordinator {
             UiEvent::MenuAction(kind) => self.menu_action(kind),
             UiEvent::MenuClose => self.menu_close(),
             UiEvent::GlobalHotkey(action) => self.handle_global_hotkey(&action),
+            UiEvent::StatusTipMoved { x, y } => self.save_status_tip_pos(x, y),
+            UiEvent::RequestStatusMenu { x, y } => self.show_status_menu(x, y),
         }
     }
 

@@ -3,9 +3,145 @@
 //! 与 Go 版本的 showModeIndicator / CmdStatusShow 对齐（简化版）。
 //! 统一到 View 盒模型 + DirectWrite：深色半透明圆角底 + 居中白字，约 1 秒后自动隐藏。
 
+use crate::manager::UiEvent;
 use crate::text::dwrite::TextRenderer;
 use crate::view::{Align, Edges, View, ViewImage, ViewLayer};
 use crate::window::LayeredWindow;
+use std::cell::RefCell;
+use std::rc::Rc;
+use std::sync::mpsc::Sender;
+
+/// 状态提示气泡的鼠标处理器：左键拖动移动位置，右键请求功能菜单。
+/// 抓取偏移模型（同 `input_diag_hud::DragState`）：按下时记录光标−窗口左上偏移，
+/// 拖动时用该偏移换算新窗口左上，钳制到工作区后 `SetWindowPos`。
+struct StatusTipMouse {
+    hwnd: crate::sys::HWND,
+    events: Sender<UiEvent>,
+    /// 是否正在拖动（`WM_LBUTTONDOWN` → true，`WM_LBUTTONUP` → false）。
+    dragging: bool,
+    /// 按下时光标屏幕坐标与窗口左上角的偏移，拖动时保持该偏移。
+    grab_dx: i32,
+    grab_dy: i32,
+    /// 阴影左/上扩边（由 `show`/`show_fixed` 每次渲染后同步），供换算内容左上坐标。
+    margin: (i32, i32),
+    /// 拖动中最近一次落定的窗口左上坐标（`WM_MOUSEMOVE` 写入）。
+    drag_pin: Option<(i32, i32)>,
+}
+
+impl crate::window::WindowMouse for StatusTipMouse {
+    fn on_message(
+        &mut self,
+        _hwnd: crate::sys::HWND,
+        msg: u32,
+        _wparam: crate::sys::WPARAM,
+        _lparam: crate::sys::LPARAM,
+    ) -> Option<crate::sys::LRESULT> {
+        use crate::sys::{
+            GetWindowRect, HWND_TOPMOST, IDC_ARROW, IDC_SIZEALL, LRESULT, LoadCursorW, RECT,
+            ReleaseCapture, SWP_NOACTIVATE, SWP_NOSIZE, SWP_NOZORDER, SetCapture, SetCursor,
+            SetWindowPos, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_RBUTTONDOWN, WM_SETCURSOR,
+            clamp_to_work_area,
+        };
+        match msg {
+            WM_LBUTTONDOWN => {
+                let (mx, my) = cursor_screen();
+                let (wx, wy) = window_origin(self.hwnd);
+                self.grab_dx = mx - wx;
+                self.grab_dy = my - wy;
+                self.dragging = true;
+                unsafe {
+                    SetCapture(self.hwnd);
+                }
+                Some(LRESULT(0))
+            }
+            WM_MOUSEMOVE => {
+                if self.dragging {
+                    let (mx, my) = cursor_screen();
+                    let nx = mx - self.grab_dx;
+                    let ny = my - self.grab_dy;
+                    let (w, h) = {
+                        let mut r = RECT::default();
+                        unsafe {
+                            if GetWindowRect(self.hwnd, &mut r).is_ok() {
+                                ((r.right - r.left) as u32, (r.bottom - r.top) as u32)
+                            } else {
+                                (0, 0)
+                            }
+                        }
+                    };
+                    let (cx, cy) = clamp_to_work_area(nx, ny, w, h);
+                    unsafe {
+                        let _ = SetWindowPos(
+                            self.hwnd,
+                            HWND_TOPMOST,
+                            cx,
+                            cy,
+                            0,
+                            0,
+                            SWP_NOSIZE | SWP_NOACTIVATE | SWP_NOZORDER,
+                        );
+                    }
+                    self.drag_pin = Some((cx, cy));
+                    return Some(LRESULT(0));
+                }
+                None
+            }
+            WM_LBUTTONUP => {
+                if self.dragging {
+                    self.dragging = false;
+                    unsafe {
+                        let _ = ReleaseCapture();
+                    }
+                    let (wx, wy) = window_origin(self.hwnd);
+                    let x = wx + self.margin.0;
+                    let y = wy + self.margin.1;
+                    let _ = self.events.send(UiEvent::StatusTipMoved { x, y });
+                    return Some(LRESULT(0));
+                }
+                None
+            }
+            WM_RBUTTONDOWN => {
+                let (mx, my) = cursor_screen();
+                let _ = self
+                    .events
+                    .send(UiEvent::RequestStatusMenu { x: mx, y: my });
+                Some(LRESULT(0))
+            }
+            WM_SETCURSOR => {
+                unsafe {
+                    let cur = if self.dragging {
+                        IDC_SIZEALL
+                    } else {
+                        IDC_ARROW
+                    };
+                    if let Ok(c) = LoadCursorW(None, cur) {
+                        SetCursor(c);
+                    }
+                }
+                Some(LRESULT(1))
+            }
+            _ => None,
+        }
+    }
+}
+
+/// 取鼠标屏幕坐标（失败回退 (0,0)）。
+fn cursor_screen() -> (i32, i32) {
+    let mut pt = crate::sys::POINT::default();
+    unsafe {
+        let _ = crate::sys::GetCursorPos(&mut pt);
+    }
+    (pt.x, pt.y)
+}
+
+/// 取窗口左上角屏幕坐标（失败回退 (0,0)）。
+fn window_origin(hwnd: crate::sys::HWND) -> (i32, i32) {
+    let mut r = crate::sys::RECT::default();
+    unsafe {
+        let _ = crate::sys::GetWindowRect(hwnd, &mut r);
+    }
+    (r.left, r.top)
+}
 
 /// 状态提示气泡窗口
 pub struct StatusTip {
@@ -25,15 +161,27 @@ pub struct StatusTip {
     theme: Option<wind_theme::Resolved>,
     /// 基准字号（逻辑像素）：跟随主题 behavior.font_size（+ status 节点偏移）。
     base_logical: f32,
+    /// 拖动 + 右键菜单处理器（`show`/`show_fixed` 每次渲染后同步其 margin）。
+    mouse: Rc<RefCell<StatusTipMouse>>,
 }
 
 impl StatusTip {
     /// 无主题时的兜底字号（逻辑像素），与候选窗主题默认一致。
     const DEFAULT_FONT_PX: f32 = 18.0;
 
-    pub fn new() -> Result<Self, String> {
+    pub fn new(events: Sender<UiEvent>) -> Result<Self, String> {
         let scale = Self::dpi_scale();
         let window = LayeredWindow::create(None, 200, 80, "WindInputStatusTip")?;
+        let mouse = Rc::new(RefCell::new(StatusTipMouse {
+            hwnd: window.hwnd(),
+            events,
+            dragging: false,
+            grab_dx: 0,
+            grab_dy: 0,
+            margin: (0, 0),
+            drag_pin: None,
+        }));
+        window.register_mouse(mouse.clone());
         let renderer = TextRenderer::new("Microsoft YaHei UI", Self::DEFAULT_FONT_PX * scale)?;
         Ok(Self {
             window,
@@ -48,6 +196,7 @@ impl StatusTip {
             radius: None,
             theme: None,
             base_logical: Self::DEFAULT_FONT_PX,
+            mouse,
         })
     }
 
@@ -182,6 +331,13 @@ impl StatusTip {
         self.ensure_scale(cx, cy);
         let s = self.scale;
         let (cw, ch, ml, mt) = self.render_bubble(text);
+        self.mouse.borrow_mut().margin = (ml as i32, mt as i32);
+        // 拖动中：跳过重新定位，避免状态刷新把窗口拽回去（拖动本身已用 SetWindowPos 定位）。
+        let m = self.mouse.borrow();
+        if m.dragging && m.drag_pin.is_some() {
+            return;
+        }
+        drop(m);
         // 水平居中于光标、默认光标下方（下方不足上翻），叠加用户偏移；按工作区钳位。
         let gap = (4.0 * s).round() as i32;
         let x = cx - (cw as i32) / 2 + off_x;
@@ -195,6 +351,13 @@ impl StatusTip {
     pub fn show_fixed(&mut self, text: &str, fx: i32, fy: i32) {
         self.ensure_scale(fx, fy);
         let (_cw, _ch, ml, mt) = self.render_bubble(text);
+        self.mouse.borrow_mut().margin = (ml as i32, mt as i32);
+        // 拖动中：跳过重新定位，避免状态刷新把窗口拽回去（拖动本身已用 SetWindowPos 定位）。
+        let m = self.mouse.borrow();
+        if m.dragging && m.drag_pin.is_some() {
+            return;
+        }
+        drop(m);
         // 内容锚点 (fx,fy) − 左/上 margin，阴影向四周溢出。
         self.window.show(fx - ml as i32, fy - mt as i32);
     }

@@ -131,6 +131,8 @@ pub enum UiCommand {
     TakeScreenshot { dir: String },
     /// 将候选窗口截图复制到剪贴板（候选不可见则提示）。
     ScreenshotCandidateToClipboard,
+    /// 截图状态提示气泡到文件（状态提示右键菜单「截图此窗口」）。
+    ScreenshotStatusTip { dir: std::path::PathBuf },
     /// 注册全局热键（Win32 RegisterHotKey，线程级）。覆盖式：先反注册旧列表再注册新列表，
     /// 空列表 = 仅清除已注册项。来自 keys.global_hotkeys（协调器构建，启动/配置重载时下发）。
     RegisterGlobalHotkeys(Vec<GlobalHotkeyEntry>),
@@ -249,6 +251,12 @@ pub enum MenuCmd {
     ToggleInputDiagnostics,
     /// 切换密码框强制英文（高级菜单，临时测试入口）
     TogglePasswordSuppress,
+    /// 状态提示气泡：切换常驻显示（display_mode always/temp）
+    StatusToggleAlways,
+    /// 状态提示气泡：恢复默认位置（position_mode=follow_caret）
+    StatusResetPosition,
+    /// 状态提示气泡：截图此窗口
+    StatusScreenshot,
 }
 
 /// 菜单项的动作类型（右键候选菜单 + 功能主菜单共用）
@@ -298,6 +306,9 @@ impl MenuKind {
                 MenuCmd::ScreenshotCandidateToClipboard => 112,
                 MenuCmd::OpenAppDir => 113,
                 MenuCmd::OpenLogDir => 114,
+                MenuCmd::StatusToggleAlways => 115,
+                MenuCmd::StatusResetPosition => 116,
+                MenuCmd::StatusScreenshot => 117,
                 MenuCmd::ToggleInputDiagnostics => 120,
                 MenuCmd::TogglePasswordSuppress => 121,
                 MenuCmd::SchemaSelect(i) => 1000 + i as i32,
@@ -332,6 +343,9 @@ impl MenuKind {
             112 => MenuCmd::ScreenshotCandidateToClipboard,
             113 => MenuCmd::OpenAppDir,
             114 => MenuCmd::OpenLogDir,
+            115 => MenuCmd::StatusToggleAlways,
+            116 => MenuCmd::StatusResetPosition,
+            117 => MenuCmd::StatusScreenshot,
             120 => MenuCmd::ToggleInputDiagnostics,
             121 => MenuCmd::TogglePasswordSuppress,
             1000..=1999 => MenuCmd::SchemaSelect((id - 1000) as usize),
@@ -418,6 +432,10 @@ pub enum UiEvent {
     MenuClose,
     /// 全局热键触发（线程级 RegisterHotKey 的 WM_HOTKEY），携带热键动作名
     GlobalHotkey(String),
+    /// 状态提示气泡被拖动到新位置（内容左上屏幕坐标），供协调器持久化
+    StatusTipMoved { x: i32, y: i32 },
+    /// 右键状态提示气泡请求弹出菜单（屏幕坐标）
+    RequestStatusMenu { x: i32, y: i32 },
 }
 
 /// UI 管理器（在独立线程中运行）
@@ -481,7 +499,7 @@ impl UiManager {
         };
 
         // 状态提示气泡（best-effort，失败不影响候选窗口）
-        let mut status_tip = match crate::status_tip::StatusTip::new() {
+        let mut status_tip = match crate::status_tip::StatusTip::new(event_tx.clone()) {
             Ok(t) => Some(t),
             Err(e) => {
                 error!("Failed to create status tip: {}", e);
@@ -906,6 +924,34 @@ impl UiManager {
                             }
                         } else {
                             ("候选窗口未显示，无法截图".to_string(), ToastKind::Info)
+                        };
+                        if let Some(t) = &mut toast {
+                            t.show(&msg, ToastPosition::BottomRight, kind);
+                            toast_hide_at = Some(
+                                std::time::Instant::now() + std::time::Duration::from_millis(3000),
+                            );
+                        }
+                    }
+                    UiCommand::ScreenshotStatusTip { dir } => {
+                        let ts = crate::screenshot::timestamp();
+                        let (msg, kind) = match &status_tip {
+                            Some(st) if st.is_visible() => {
+                                let path = dir.join(format!("status_tip_{ts}.png"));
+                                match st.capture_to_file(&path) {
+                                    Ok(_) => {
+                                        info!("Screenshot saved: {:?}", path);
+                                        (
+                                            format!("状态提示气泡已截图\n{}", path.display()),
+                                            ToastKind::Success,
+                                        )
+                                    }
+                                    Err(e) => {
+                                        tracing::warn!("Screenshot status_tip: {}", e);
+                                        (format!("截图失败：{}", e), ToastKind::Error)
+                                    }
+                                }
+                            }
+                            _ => ("状态提示气泡未显示，无法截图".to_string(), ToastKind::Info),
                         };
                         if let Some(t) = &mut toast {
                             t.show(&msg, ToastPosition::BottomRight, kind);
