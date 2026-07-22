@@ -31,6 +31,14 @@ pub fn run(args: &[String]) -> i32 {
             }
             None => return usage_err("reset <方案id>"),
         },
+        Some("rebuild") => match args.get(1) {
+            None => cmd_rebuild(),
+            Some(_) => {
+                eprintln!("rebuild 为全量重建（不支持指定方案）：缓存指纹会在源变化时自动重建，");
+                eprintln!("需要手动重建的场景（如升级后强制刷新）都应全量执行");
+                return 2;
+            }
+        },
         Some("dict") => match args.get(1).map(String::as_str) {
             Some("list") => match args.get(2) {
                 Some(id) => cmd_dict_list(id),
@@ -70,6 +78,7 @@ fn print_usage() {
          get <方案id> [键]                 查看方案配置（含定制合并；键为点路径如 engine.codetable.min_len）\n  \
          set <方案id> <键> <值>            修改方案配置（写入定制层，方案文件不动）\n  \
          reset <方案id>                    清除该方案的全部定制，恢复方案文件默认\n  \
+         rebuild                           强制重建全部词库缓存（下次使用各方案时按源重新生成）\n  \
          dict list <方案id>                列出方案的词库及启用状态\n  \
          dict enable <方案id> <词库id>     启用分类/扩展词库（即时生效）\n  \
          dict disable <方案id> <词库id>    停用分类/扩展词库（即时生效）"
@@ -161,6 +170,21 @@ fn cmd_reset(id: &str) -> anyhow::Result<i32> {
     rpc_online("schema.resetConfig", json!({ "id": id }))?;
     rpc_online("schema.invalidate", json!({ "id": id }))?;
     println!("✓ {id}: 已清除全部定制，恢复方案文件默认");
+    Ok(0)
+}
+
+fn cmd_rebuild() -> anyhow::Result<i32> {
+    let v = rpc_online("schema.rebuildCache", json!({}))?;
+    let removed = v.get("removed").and_then(Value::as_u64).unwrap_or(0);
+    let failed = v.get("failed").and_then(Value::as_u64).unwrap_or(0);
+    if failed > 0 {
+        println!(
+            "✓ 已清除 {removed} 个缓存文件（{failed} 个仍被占用，可稍后再次执行 rebuild 清理）"
+        );
+    } else {
+        println!("✓ 已清除 {removed} 个缓存文件");
+    }
+    println!("各方案将在下次使用时按源重新生成（首次可能稍慢）");
     Ok(0)
 }
 

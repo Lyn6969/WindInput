@@ -175,6 +175,12 @@ impl Coordinator {
                 self.engine_mgr.invalidate_schema(id);
                 Ok(json!({ "ok": true }))
             }
+            // 全量强制重建词库缓存（CLI `schema rebuild`）：失效全部引擎后删缓存产物。
+            // 面向「指纹判新鲜但内容需重建」的场景（如解析器修复后存量缓存静默过期）。
+            "schema.rebuildCache" => {
+                let (removed, failed) = self.engine_mgr.rebuild_all_caches();
+                Ok(json!({ "removed": removed, "failed": failed }))
+            }
             "schema.delete" => self.web_schema_delete(params),
             "schema.references" => Ok(json!({})), // 引用关系（删除安全检查）：暂返空，前端宽松消费
             "scheme.exportPackage" => self.web_scheme_export_package(params),

@@ -211,6 +211,42 @@ fn cache_path(source: &Path, ext: &str) -> std::path::PathBuf {
     source.with_extension(ext)
 }
 
+/// 递归删除目录下的缓存产物（wdat 词库 / fp 指纹 / wdb unigram），best-effort：
+/// 单个文件删除失败（如仍被 mmap 占用）计入 failed 继续。只认扩展名白名单，
+/// 不触碰目录本身与其它文件（缓存根与用户数据同在 %LOCALAPPDATA% 命名空间下）。
+fn purge_cache_files(dir: &Path, removed: &mut usize, failed: &mut usize) {
+    let Ok(rd) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in rd.flatten() {
+        let p = entry.path();
+        // DirEntry::file_type 不跟随符号链接：防缓存根下被植入指向别处的
+        // junction/symlink 后递归删到外部目录。
+        let ft = entry.file_type();
+        if ft.as_ref().is_ok_and(|t| t.is_dir()) {
+            purge_cache_files(&p, removed, failed);
+            continue;
+        }
+        if !ft.is_ok_and(|t| t.is_file()) {
+            continue;
+        }
+        let is_cache = p
+            .extension()
+            .and_then(|s| s.to_str())
+            .is_some_and(|s| matches!(s, "wdat" | "fp" | "wdb"));
+        if !is_cache {
+            continue;
+        }
+        match std::fs::remove_file(&p) {
+            Ok(()) => *removed += 1,
+            Err(e) => {
+                warn!("删除缓存 {} 失败: {}", p.display(), e);
+                *failed += 1;
+            }
+        }
+    }
+}
+
 impl EngineManager {
     /// 从配置创建；仅构建活跃方案引擎，其余按需懒加载。
     pub fn new(config: &Config, data_dir: Option<&Path>) -> Self {
@@ -1124,6 +1160,26 @@ impl EngineManager {
             .shuangpin_finals_cache
             .lock()
             .unwrap_or_else(|e| e.into_inner()) = (String::new(), None);
+    }
+
+    /// 强制重建全部词库缓存：失效所有已装方案的引擎与解析缓存（释放 mmap
+    /// reader 的强引用），再 best-effort 删除缓存根下的全部缓存产物。
+    ///
+    /// 指纹（`cache_fp`，已含 PARSE_SEMANTICS_VERSION）覆盖不到的场景用它兜底：
+    /// 缓存文件损坏、解析语义修复未 bump 版本号、或需要立即生效不等下次校验。
+    /// 返回 `(removed, failed)`；failed 通常是仍被短暂持有的 mmap（引擎 Arc 尚在
+    /// 某次按键处理中），再次执行 rebuild 可清，不影响正确性。
+    pub fn rebuild_all_caches(&self) -> (usize, usize) {
+        for id in self.installed_schemas() {
+            self.invalidate_schema(&id);
+        }
+        let Some(Some(dir)) = CACHE_DIR.get() else {
+            return (0, 0);
+        };
+        let mut removed = 0;
+        let mut failed = 0;
+        purge_cache_files(dir, &mut removed, &mut failed);
+        (removed, failed)
     }
 
     /// 切换到指定方案；成功返回 true（必要时懒加载）
@@ -3324,5 +3380,30 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(&base_dir);
         let _ = std::fs::remove_dir_all(&ov_dir);
+    }
+
+    #[test]
+    fn purge_cache_files_only_removes_cache_extensions() {
+        let dir = std::env::temp_dir().join(format!("wind_eng_purge-{}", std::process::id()));
+        let sub = dir.join("wubi86");
+        std::fs::create_dir_all(&sub).unwrap();
+        // 缓存产物（应删）：wdat / 多点 combined.wdat / fp 指纹 / wdb
+        std::fs::write(sub.join("main.wdat"), b"x").unwrap();
+        std::fs::write(sub.join("main.combined.wdat"), b"x").unwrap();
+        std::fs::write(sub.join("main.wdat.fp"), b"x").unwrap();
+        std::fs::write(dir.join("unigram.wdb"), b"x").unwrap();
+        // 非缓存文件（应留）
+        std::fs::write(dir.join("note.txt"), b"x").unwrap();
+        std::fs::write(sub.join("raw.dict.yaml"), b"x").unwrap();
+
+        let (mut removed, mut failed) = (0usize, 0usize);
+        purge_cache_files(&dir, &mut removed, &mut failed);
+        assert_eq!((removed, failed), (4, 0));
+        assert!(dir.join("note.txt").exists());
+        assert!(sub.join("raw.dict.yaml").exists());
+        assert!(!sub.join("main.wdat").exists());
+        assert!(!dir.join("unigram.wdb").exists());
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
