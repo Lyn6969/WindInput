@@ -168,6 +168,13 @@ impl Coordinator {
             "schema.saveConfig" => self.web_schema_save_config(params),
             "schema.resetConfig" => self.web_schema_reset_config(params),
             "schema.setDictEnabled" => self.web_schema_set_dict_enabled(params),
+            // 失效方案的引擎缓存（未加载时安全 no-op）：CLI `schema set/reset` 后
+            // 调用，让 override 改动在下次使用该方案时按新配置重建生效。
+            "schema.invalidate" => {
+                let id = str_param(params, "id")?;
+                self.engine_mgr.invalidate_schema(id);
+                Ok(json!({ "ok": true }))
+            }
             "schema.delete" => self.web_schema_delete(params),
             "schema.references" => Ok(json!({})), // 引用关系（删除安全检查）：暂返空，前端宽松消费
             "scheme.exportPackage" => self.web_scheme_export_package(params),

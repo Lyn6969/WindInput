@@ -21,8 +21,10 @@ use wind_bridge::server::{BridgeConfig, BridgeServer};
 // 共用一处定义，三份日志才能归并排序，也避免两边各写一份而漂移。
 use wind_config::startup_trace::{self, LOG_TIME_FORMAT};
 
+mod cli_util;
 mod config_cli;
 mod log_rotate;
+mod schema_cli;
 
 /// GUI 子系统（release profile，`windows_subsystem="windows"`）下进程不附着控制台，
 /// 故 CLI 子命令的 `println!` 无处可写。此函数把进程附着到**父控制台**（调用它的 cmd/PowerShell），
@@ -77,13 +79,19 @@ fn attach_parent_console() {
 }
 
 fn main() {
-    // CLI 子命令：`wind_input config ...`（查看/读写配置）。在服务启动前拦截，处理完即退出。
+    // CLI 子命令（config/schema/...）：在服务启动前拦截，处理完即退出。
+    // 注意保持在单例检查之前——CLI 进程不该被「另一实例已运行」挡掉。
     let cli_args: Vec<String> = std::env::args().collect();
-    if cli_args.get(1).map(String::as_str) == Some("config") {
+    let sub = cli_args.get(1).map(String::as_str);
+    if matches!(sub, Some("config" | "schema")) {
         // GUI 子系统下附着父控制台，让输出回到调用的终端（详见 attach_parent_console）。
         #[cfg(windows)]
         attach_parent_console();
-        let code = config_cli::run(&cli_args[2..]);
+        let code = match sub {
+            Some("config") => config_cli::run(&cli_args[2..]),
+            Some("schema") => schema_cli::run(&cli_args[2..]),
+            _ => unreachable!(),
+        };
         // process::exit 不会刷新缓冲，重定向/管道时可能丢尾部输出——显式 flush。
         use std::io::Write;
         let _ = std::io::stdout().flush();
