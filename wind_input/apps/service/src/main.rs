@@ -99,7 +99,26 @@ fn main() {
     // 「究竟有没有走到日志初始化」本身就是要回答的问题。
     startup_trace::stage("begin");
 
-    // 1. 初始化日志
+    // 1. 单例检查（与 Go 版 checkSingleton 对齐）
+    //
+    // **必须早于 init_logger**：后者会滚动日志（rotate_on_startup），而一个注定要退出的
+    // 重复实例不该有权改动正在运行实例的日志。此前顺序相反，于是形成了恶性反馈——
+    // 用户遇到故障 → 尝试重启输入法 → 新实例先把故障现场的日志顶到 .1.log、再写下一个
+    // 两行空壳、然后被单例挡掉退出。越排查，现场越少。
+    //
+    // 代价是此处无法用 tracing（subscriber 尚未装），改用启动轨迹 + stderr：
+    // 反正 `exit(1)` 也刷不出 tracing 的 non_blocking 缓冲，同步落盘的轨迹反而更可靠。
+    let _singleton_guard = match check_singleton() {
+        Some(guard) => guard,
+        None => {
+            startup_trace::stage("singleton-BLOCKED 另一实例已在运行，本实例退出");
+            eprintln!("WindInput: 另一个实例已在运行中");
+            std::process::exit(1);
+        }
+    };
+    startup_trace::stage("singleton-ok");
+
+    // 2. 初始化日志（含启动滚动：至此才确定本实例会真正运行）
     init_logger();
     startup_trace::stage("logger-ready");
 
@@ -116,18 +135,7 @@ fn main() {
         env!("WIND_BUILD_TIME"),
         env!("WIND_GIT_HASH"),
     );
-
-    // 2. 单例检查（与 Go 版 checkSingleton 对齐）
-    let _singleton_guard = match check_singleton() {
-        Some(guard) => guard,
-        None => {
-            error!("Another instance is already running, exiting");
-            eprintln!("WindInput: 另一个实例已在运行中");
-            std::process::exit(1);
-        }
-    };
     info!("Singleton check passed");
-    startup_trace::stage("singleton-ok");
 
     // 2.5 等待用户配置目录就绪。
     //
@@ -152,8 +160,10 @@ fn main() {
     let push_server = Arc::new(PushServer::new(push_config));
 
     if let Err(e) = push_server.start() {
-        error!("Push server failed to start: {}", e);
-        std::process::exit(1);
+        fatal_exit(
+            "push-server-FAILED",
+            &format!("Push server failed to start: {e}"),
+        );
     }
 
     // 5. 创建 Bridge 服务器
@@ -176,8 +186,10 @@ fn main() {
 
     // 6. 启动 Bridge 服务器
     if let Err(e) = bridge.start() {
-        error!("Bridge server failed to start: {}", e);
-        std::process::exit(1);
+        fatal_exit(
+            "bridge-server-FAILED",
+            &format!("Bridge server failed to start: {e}"),
+        );
     }
 
     startup_trace::stage("bridge-ready");
@@ -395,6 +407,22 @@ fn init_logger() {
     );
 }
 
+/// 带必达落盘的致命退出。
+///
+/// `std::process::exit` 不运行析构，也不刷 `tracing_appender` 的 non_blocking 缓冲——
+/// 退出原因能否落进主日志纯看 worker 线程有没有抢在进程消失前刷一次盘。这曾直接误导过
+/// 排查：同一条退出路径，有的日志里三条俱全，有的只剩一行，让人误以为是两种不同的故障。
+///
+/// 故退出原因先同步写进启动轨迹（必达），再给 worker 一点时间尽力刷出主日志。
+fn fatal_exit(stage: &str, msg: &str) -> ! {
+    error!("{}", msg);
+    startup_trace::stage(&format!("{stage}: {msg}"));
+    eprintln!("WindInput: {msg}");
+    // best-effort：让 non_blocking worker 有机会把上面那条 error! 写出去。
+    std::thread::sleep(std::time::Duration::from_millis(100));
+    std::process::exit(1);
+}
+
 /// 守护主日志的健康：丢弃计数一旦增长就写进启动轨迹。
 ///
 /// 解决的是「观测工具自己成了故障的一部分」——`tracing_appender::non_blocking` 的
@@ -454,7 +482,8 @@ fn check_singleton() -> Option<SingletonGuard> {
     let handle = unsafe { CreateMutexW(std::ptr::null(), 0, wide_name.as_ptr()) };
 
     if handle.is_invalid() {
-        error!("CreateMutexW failed");
+        // 本函数现在早于 init_logger 运行，tracing 尚无 subscriber，只能走启动轨迹。
+        startup_trace::stage("singleton-CreateMutexW-FAILED");
         return None;
     }
 

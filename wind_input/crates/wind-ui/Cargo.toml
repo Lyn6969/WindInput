@@ -17,7 +17,9 @@ image = { workspace = true }
 resvg = "0.44"
 
 [target.'cfg(windows)'.dependencies]
-windows = { workspace = true }
+# 局部追加 StationsAndDesktops：诊断浮层归属的桌面/窗口站（见 window.rs 的
+# current_desktop_name）。在此声明而非改 workspace 定义，避免影响其它 crate 的配置。
+windows = { workspace = true, features = ["Win32_System_StationsAndDesktops"] }
 # `#[implement]` 宏展开引用 `::windows_core`，需作为直接依赖（版本随 windows 0.58）。
 windows-core = "0.58"
 # host-render 协议常量（HOST_WINDOW_CANDIDATE）与 HostRenderHitRect。

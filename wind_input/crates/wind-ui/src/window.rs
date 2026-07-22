@@ -45,6 +45,61 @@ mod platform {
         height: u32,
         /// BGRA 像素缓冲区
         buffer: Vec<u8>,
+        /// 窗口类名，仅用于诊断日志区分是哪一个浮层。
+        class_name: String,
+        /// 首次成功 show 后是否已记录实测几何。
+        ///
+        /// 「代码走到了 show()」与「像素出现在屏幕上」之间隔着好几层，而此前一层都没测量：
+        /// `SetWindowPos` 的结果被丢弃、最终落点无日志、窗口归属哪个桌面也无从得知。
+        /// 只记第一次——`show()` 在候选刷新时每帧调用，不能进热路径。
+        geometry_logged: std::cell::Cell<bool>,
+    }
+
+    /// 当前线程所属桌面名（如 `Default`、`Winlogon`）。取不到返回 `?`。
+    ///
+    /// 浮层归属哪个桌面在窗口创建时就定死了，事后无法从窗口自身看出来，
+    /// 故须在创建时记下——它是「服务一切正常却全屏无 GUI」的候选成因之一。
+    fn current_desktop_name() -> String {
+        use windows::Win32::System::StationsAndDesktops::GetThreadDesktop;
+        unsafe {
+            match GetThreadDesktop(windows::Win32::System::Threading::GetCurrentThreadId()) {
+                Ok(h) => user_object_name(h.0),
+                Err(_) => "?".to_string(),
+            }
+        }
+    }
+
+    /// 当前进程所属窗口站名（交互式会话通常为 `WinSta0`）。取不到返回 `?`。
+    fn current_window_station_name() -> String {
+        use windows::Win32::System::StationsAndDesktops::GetProcessWindowStation;
+        unsafe {
+            match GetProcessWindowStation() {
+                Ok(h) => user_object_name(h.0),
+                Err(_) => "?".to_string(),
+            }
+        }
+    }
+
+    /// 读取 USER 对象（桌面/窗口站）名称。
+    fn user_object_name(handle: *mut std::ffi::c_void) -> String {
+        use windows::Win32::System::StationsAndDesktops::{GetUserObjectInformationW, UOI_NAME};
+        unsafe {
+            let mut buf = [0u16; 128];
+            let mut needed = 0u32;
+            let ok = GetUserObjectInformationW(
+                windows::Win32::Foundation::HANDLE(handle),
+                UOI_NAME,
+                Some(buf.as_mut_ptr() as *mut std::ffi::c_void),
+                std::mem::size_of_val(&buf) as u32,
+                Some(&mut needed),
+            )
+            .is_ok();
+            if !ok {
+                return "?".to_string();
+            }
+            let len = buf.iter().position(|&c| c == 0).unwrap_or(buf.len());
+            String::from_utf16_lossy(&buf[..len])
+        }
     }
 
     impl LayeredWindow {
@@ -104,11 +159,25 @@ mod platform {
 
                 let buffer = vec![0u8; (width * height * 4) as usize];
 
+                // 记录窗口所属的桌面 / 窗口站。开机自启时服务可能跑在用户交互桌面就绪之前，
+                // 此时建出的窗口不属于用户当前桌面：服务逻辑全对、管道照常通信、TSF 是 in-proc
+                // 所以打字正常，而所有浮层在用户眼里都不存在——且 kill 重启即恢复。
+                // 这是「所有 GUI 元素同时不可见」少数能一次性解释的成因，故在创建时就留证。
+                wind_config::startup_trace::stage(&format!(
+                    "win-create {} hwnd={:?} desktop={} winsta={}",
+                    class_name,
+                    hwnd.0,
+                    current_desktop_name(),
+                    current_window_station_name(),
+                ));
+
                 Ok(Self {
                     hwnd,
                     width,
                     height,
                     buffer,
+                    class_name: class_name.to_string(),
+                    geometry_logged: std::cell::Cell::new(false),
                 })
             }
         }
@@ -149,7 +218,16 @@ mod platform {
         pub fn update_with_alpha(&self, alpha: u8) -> Result<(), String> {
             unsafe {
                 let hdc_screen = GetDC(HWND::default());
+                // 两者此前都未做空值检查就往下用。开机早期或 GDI 句柄耗尽时它们会返回空，
+                // 后续调用便在空 DC 上静默失败，最终表现为「一切成功但什么都没画出来」。
+                if hdc_screen.is_invalid() {
+                    return Err("GetDC(screen) returned null".to_string());
+                }
                 let hdc_mem = CreateCompatibleDC(hdc_screen);
+                if hdc_mem.is_invalid() {
+                    ReleaseDC(HWND::default(), hdc_screen);
+                    return Err("CreateCompatibleDC returned null".to_string());
+                }
 
                 let bmi = BITMAPINFO {
                     bmiHeader: BITMAPINFOHEADER {
@@ -221,7 +299,7 @@ mod platform {
 
         pub fn show(&self, x: i32, y: i32) {
             unsafe {
-                let _ = SetWindowPos(
+                let r = SetWindowPos(
                     self.hwnd,
                     HWND_TOPMOST,
                     x,
@@ -230,6 +308,35 @@ mod platform {
                     self.height as i32,
                     SWP_NOACTIVATE | SWP_SHOWWINDOW,
                 );
+                // 这是唯一让窗口现身的调用，其结果此前被整个丢弃。
+                if let Err(e) = r {
+                    tracing::warn!("{}: SetWindowPos failed: {}", self.class_name, e);
+                }
+
+                // 首次显示后回读系统的真实认知：请求坐标未必等于落点，
+                // 而 layered 窗口即便 UpdateLayeredWindow 成功、IsWindowVisible 为真，
+                // 也可能因落在所有显示器之外或不属于当前桌面而看不见。
+                // 只记一次，避免进候选刷新的热路径。
+                if !self.geometry_logged.get() {
+                    self.geometry_logged.set(true);
+                    let mut rect = RECT::default();
+                    let got = GetWindowRect(self.hwnd, &mut rect).is_ok();
+                    wind_config::startup_trace::stage(&format!(
+                        "win-show {} req=({x},{y}) {}x{} rect={} visible={}",
+                        self.class_name,
+                        self.width,
+                        self.height,
+                        if got {
+                            format!(
+                                "({},{})-({},{})",
+                                rect.left, rect.top, rect.right, rect.bottom
+                            )
+                        } else {
+                            "GetWindowRect-FAILED".to_string()
+                        },
+                        IsWindowVisible(self.hwnd).as_bool(),
+                    ));
+                }
             }
         }
 
