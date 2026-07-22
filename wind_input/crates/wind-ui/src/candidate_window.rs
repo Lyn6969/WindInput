@@ -10,8 +10,10 @@ use std::sync::mpsc::Sender;
 
 use crate::manager::{HOVER_PAGE_NEXT as TAG_PAGE_NEXT, HOVER_PAGE_PREV as TAG_PAGE_PREV, UiEvent};
 use crate::sys::{
-    GetCursorPos, HWND, IDC_ARROW, LPARAM, LRESULT, LoadCursorW, POINT, SetCursor, WM_LBUTTONDOWN,
-    WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_RBUTTONDOWN, WM_SETCURSOR, WPARAM,
+    GetCursorPos, GetWindowRect, HWND, HWND_TOPMOST, IDC_ARROW, IDC_SIZEALL, LPARAM, LRESULT,
+    LoadCursorW, POINT, RECT, ReleaseCapture, SWP_NOACTIVATE, SWP_NOSIZE, SWP_NOZORDER, SetCapture,
+    SetCursor, SetWindowPos, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_MOUSEWHEEL,
+    WM_RBUTTONDOWN, WM_SETCURSOR, WPARAM, clamp_to_work_area,
 };
 use crate::text::dwrite::TextRenderer;
 use crate::view::{Align, Edges, Layout, Rect, View, ViewImage, ViewLayer};
@@ -213,6 +215,11 @@ impl CandidateWindow {
             engage_at: None,
             pending_raw: -1,
             engage_delay_ms: 60,
+            hwnd: window.hwnd(),
+            dragging: false,
+            drag_anchor: (0, 0),
+            drag_origin: (0, 0),
+            drag_pin: None,
         }));
         window.register_mouse(mouse.clone());
         Ok(Self {
@@ -730,6 +737,10 @@ impl CandidateWindow {
         let width = content_w + ml + mr;
         let height = content_h + mt + mb;
 
+        // 用户已手动拖动过本次组合的候选窗 → 冻结落位：位置固定、上/下方排列也不再翻转，
+        // 否则窗口停在原处但内容突然倒序，视觉上会"自己变了个样"。
+        let drag_pin = self.mouse.borrow().drag_pin;
+
         // Windows 的 self.y 已是光标底端（与 show() 语义一致），直接传入。
         let (px0, py0, above) = Self::place_window(
             self.x,
@@ -739,7 +750,9 @@ impl CandidateWindow {
             content_h,
             self.placed_above,
         );
-        self.placed_above = above;
+        if drag_pin.is_none() {
+            self.placed_above = above;
+        }
         let (px, py) = match self.last_content_pos {
             Some((lx, ly)) if self.visible => {
                 let thr = (4.0 * self.scale).round().max(1.0) as i32;
@@ -788,9 +801,14 @@ impl CandidateWindow {
         root.paint(&mut buf, width, height, &self.text_renderer);
 
         self.visible = true;
+        // drag_pin 记的是窗口左上（含阴影扩边），与 screen_x/y 同一坐标系，直接顶替。
+        let (screen_x, screen_y) = match drag_pin {
+            Some((wx, wy)) => (wx, wy),
+            None => (px - ml as i32, py - mt as i32),
+        };
         Some(RenderedFrame {
-            screen_x: px - ml as i32,
-            screen_y: py - mt as i32,
+            screen_x,
+            screen_y,
             width,
             height,
             scale: self.scale,
@@ -1702,7 +1720,13 @@ impl CandidateWindow {
         self.visible = false;
         self.last_content_pos = None; // 组合结束，下次显示重新落位
         self.placed_above = false; // 清除上方粘滞，下次组合按下方默认重新判定
-        self.mouse.borrow_mut().reset_hover();
+        {
+            let mut m = self.mouse.borrow_mut();
+            m.reset_hover();
+            // 拖动位置只在"本次组合"内有效：组合结束即失效，下次输入恢复跟随光标。
+            // 注意 hide_local_window_only()（host-render 分流）刻意不走这里，落位状态须保留。
+            m.reset_drag();
+        }
         if let Some(t) = self.tooltip.as_mut() {
             t.hide();
         }
@@ -1771,6 +1795,17 @@ pub struct CandidateMouse {
     pending_raw: i32,
     /// 悬停激活延迟（毫秒）。来自 ui.tooltip.delay；默认 60。
     engage_delay_ms: u64,
+    /// 本窗口句柄（拖动时 SetCapture / SetWindowPos 用）
+    hwnd: HWND,
+    /// 是否正在拖动（左键按在空白区并保持）
+    dragging: bool,
+    /// 拖动起点：光标屏幕坐标
+    drag_anchor: (i32, i32),
+    /// 拖动起点：窗口左上屏幕坐标
+    drag_origin: (i32, i32),
+    /// 拖动落定位置（窗口左上屏幕坐标）。`Some` 即"本次组合已被用户手动摆放"，
+    /// 此后该组合内的每帧渲染都固定用它，不再跟随光标；`hide()`（组合结束）清空。
+    drag_pin: Option<(i32, i32)>,
 }
 
 impl CandidateMouse {
@@ -1808,6 +1843,34 @@ impl CandidateMouse {
 }
 
 impl CandidateMouse {
+    /// 当前窗口左上屏幕坐标；取不到时 None（非 Windows mock 恒 None 语义下的兜底由调用点给）。
+    fn window_origin(&self) -> Option<(i32, i32)> {
+        let mut r = RECT::default();
+        unsafe {
+            if GetWindowRect(self.hwnd, &mut r).is_ok() {
+                return Some((r.left, r.top));
+            }
+        }
+        None
+    }
+
+    /// 当前窗口尺寸（含阴影扩边）；用于拖动时的工作区钳制。
+    fn window_size(&self) -> (u32, u32) {
+        let mut r = RECT::default();
+        unsafe {
+            if GetWindowRect(self.hwnd, &mut r).is_ok() {
+                return ((r.right - r.left) as u32, (r.bottom - r.top) as u32);
+            }
+        }
+        (0, 0)
+    }
+
+    /// 清除拖动落定位置：下次显示恢复跟随光标自动定位。
+    fn reset_drag(&mut self) {
+        self.dragging = false;
+        self.drag_pin = None;
+    }
+
     fn hit(&self, x: f32, y: f32) -> i32 {
         for (tag, r) in &self.hit_rects {
             if r.contains(x, y) {
@@ -1848,7 +1911,57 @@ impl WindowMouse for CandidateMouse {
                     i if i >= 0 => {
                         let _ = self.events.send(UiEvent::CandidateSelect(i as usize));
                     }
-                    _ => {}
+                    _ => {
+                        // 空白区（编码栏/内边距，非候选非翻页键）→ 起拖，整窗跟随光标。
+                        // 与工具栏同构：记录光标与窗口起点，SetCapture 保证移出窗口后仍收到消息。
+                        let mut p = POINT::default();
+                        unsafe {
+                            let _ = GetCursorPos(&mut p);
+                        }
+                        self.drag_anchor = (p.x, p.y);
+                        self.drag_origin = self.window_origin().unwrap_or((p.x, p.y));
+                        self.dragging = true;
+                        unsafe {
+                            SetCapture(self.hwnd);
+                        }
+                    }
+                }
+                Some(LRESULT(0))
+            }
+            WM_LBUTTONUP => {
+                if self.dragging {
+                    self.dragging = false;
+                    unsafe {
+                        let _ = ReleaseCapture();
+                    }
+                    // 以真实窗口位置落定，避免累积误差
+                    if let Some(pos) = self.window_origin() {
+                        self.drag_pin = Some(pos);
+                    }
+                }
+                Some(LRESULT(0))
+            }
+            WM_MOUSEMOVE if self.dragging => {
+                let mut p = POINT::default();
+                unsafe {
+                    let _ = GetCursorPos(&mut p);
+                }
+                let nx = self.drag_origin.0 + (p.x - self.drag_anchor.0);
+                let ny = self.drag_origin.1 + (p.y - self.drag_anchor.1);
+                let (w, h) = self.window_size();
+                let (cx, cy) = clamp_to_work_area(nx, ny, w, h);
+                // 拖动中即写 drag_pin：候选内容若在拖动期间刷新，渲染路径才不会把窗口拽回光标处。
+                self.drag_pin = Some((cx, cy));
+                unsafe {
+                    let _ = SetWindowPos(
+                        self.hwnd,
+                        HWND_TOPMOST,
+                        cx,
+                        cy,
+                        0,
+                        0,
+                        SWP_NOSIZE | SWP_NOACTIVATE | SWP_NOZORDER,
+                    );
                 }
                 Some(LRESULT(0))
             }
@@ -1916,7 +2029,12 @@ impl WindowMouse for CandidateMouse {
             }
             WM_SETCURSOR => {
                 unsafe {
-                    if let Ok(c) = LoadCursorW(None, IDC_ARROW) {
+                    let cur = if self.dragging {
+                        IDC_SIZEALL
+                    } else {
+                        IDC_ARROW
+                    };
+                    if let Ok(c) = LoadCursorW(None, cur) {
                         SetCursor(c);
                     }
                 }

@@ -112,3 +112,45 @@ mod imp {
 }
 
 pub use imp::*;
+
+/// 将 (x,y,w,h) 钳制到所在（或最近）显示器工作区内，保证窗口完整可见。
+/// 用于拖动窗口时防止拖出桌面/拖入任务栏，以及切换显示器 / 远程连接后旧坐标落到屏外时拉回。
+/// 多显示器下 `MonitorFromPoint(NEAREST)` 会随光标过界切到目标显示器。
+// 非 Windows 下无显示器工作区查询，w/h 仅 Windows 分支使用。
+#[cfg_attr(not(windows), allow(unused_variables))]
+pub fn clamp_to_work_area(x: i32, y: i32, w: u32, h: u32) -> (i32, i32) {
+    #[cfg(windows)]
+    {
+        use windows::Win32::Graphics::Gdi::{
+            GetMonitorInfoW, MONITOR_DEFAULTTONEAREST, MONITORINFO, MonitorFromPoint,
+        };
+        unsafe {
+            let pt = POINT { x, y };
+            let mon = MonitorFromPoint(pt, MONITOR_DEFAULTTONEAREST);
+            let mut mi = MONITORINFO {
+                cbSize: std::mem::size_of::<MONITORINFO>() as u32,
+                ..Default::default()
+            };
+            if GetMonitorInfoW(mon, &mut mi).as_bool() {
+                let wa = mi.rcWork;
+                let (wi, hi) = (w as i32, h as i32);
+                let mut nx = x;
+                let mut ny = y;
+                if nx + wi > wa.right {
+                    nx = wa.right - wi;
+                }
+                if ny + hi > wa.bottom {
+                    ny = wa.bottom - hi;
+                }
+                if nx < wa.left {
+                    nx = wa.left;
+                }
+                if ny < wa.top {
+                    ny = wa.top;
+                }
+                return (nx, ny);
+            }
+        }
+    }
+    (x, y)
+}

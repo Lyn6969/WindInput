@@ -14,7 +14,7 @@ use crate::sys::{
     GetCursorPos, GetWindowRect, HWND, HWND_TOPMOST, IDC_ARROW, IDC_SIZEALL, LPARAM, LRESULT,
     LoadCursorW, POINT, RECT, ReleaseCapture, SWP_NOACTIVATE, SWP_NOSIZE, SWP_NOZORDER, SetCapture,
     SetCursor, SetWindowPos, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSELEAVE, WM_MOUSEMOVE,
-    WM_RBUTTONDOWN, WM_SETCURSOR, WPARAM,
+    WM_RBUTTONDOWN, WM_SETCURSOR, WPARAM, clamp_to_work_area,
 };
 use crate::text::dwrite::TextRenderer;
 use crate::view::Rect;
@@ -806,48 +806,6 @@ impl WindowMouse for ToolbarMouse {
             _ => None,
         }
     }
-}
-
-/// 在缓冲区子区域 (x,y,w,h) 内填充圆角矩形
-/// 将 (x,y,w,h) 钳制到所在（或最近）显示器工作区内，保证完整可见。
-/// 用于切换显示器 / 远程连接后旧坐标落到屏外时拉回。
-// 非 Windows 下无显示器工作区查询，w/h 仅 Windows 分支使用。
-#[cfg_attr(not(windows), allow(unused_variables))]
-fn clamp_to_work_area(x: i32, y: i32, w: u32, h: u32) -> (i32, i32) {
-    #[cfg(windows)]
-    {
-        use windows::Win32::Graphics::Gdi::{
-            GetMonitorInfoW, MONITOR_DEFAULTTONEAREST, MONITORINFO, MonitorFromPoint,
-        };
-        unsafe {
-            let pt = POINT { x, y };
-            let mon = MonitorFromPoint(pt, MONITOR_DEFAULTTONEAREST);
-            let mut mi = MONITORINFO {
-                cbSize: std::mem::size_of::<MONITORINFO>() as u32,
-                ..Default::default()
-            };
-            if GetMonitorInfoW(mon, &mut mi).as_bool() {
-                let wa = mi.rcWork;
-                let (wi, hi) = (w as i32, h as i32);
-                let mut nx = x;
-                let mut ny = y;
-                if nx + wi > wa.right {
-                    nx = wa.right - wi;
-                }
-                if ny + hi > wa.bottom {
-                    ny = wa.bottom - hi;
-                }
-                if nx < wa.left {
-                    nx = wa.left;
-                }
-                if ny < wa.top {
-                    ny = wa.top;
-                }
-                return (nx, ny);
-            }
-        }
-    }
-    (x, y)
 }
 
 /// 圆角填充：复用 view 的抗锯齿 + 预乘混合实现，保持各窗口圆角一致。
