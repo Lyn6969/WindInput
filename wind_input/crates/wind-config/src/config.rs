@@ -1203,6 +1203,21 @@ pub struct StatusIndicatorConfig {
     /// fixed 模式的固定屏幕 Y（像素）。
     #[serde(default)]
     pub custom_y: i32,
+    /// 气泡显示哪些内容段（按此处顺序无关，渲染顺序固定）。合法项：
+    /// `schema`（输入方案 / 中英）、`punct`（标点状态）、`full_width`（全半角）、
+    /// `s2t`（简繁）、`caps`（大写锁定）。
+    ///
+    /// **留空 = 全部显示**：既是"未配置"的合理默认，也让旧配置文件（无此键）行为不变。
+    /// 用列表而非逐项 bool，是为了后续增加状态项时不必再动配置结构。
+    #[serde(default = "default_status_items")]
+    pub items: Vec<String>,
+}
+
+/// 状态气泡内容段的全集，同时也是默认值（全部显示）。
+pub const STATUS_ITEM_KEYS: [&str; 5] = ["schema", "punct", "full_width", "s2t", "caps"];
+
+fn default_status_items() -> Vec<String> {
+    STATUS_ITEM_KEYS.iter().map(|s| s.to_string()).collect()
 }
 
 fn default_schema_name_style() -> String {
@@ -1230,6 +1245,7 @@ impl Default for StatusIndicatorConfig {
             offset_y: 0,
             custom_x: 0,
             custom_y: 0,
+            items: default_status_items(),
         }
     }
 }

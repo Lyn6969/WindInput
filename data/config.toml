@@ -229,6 +229,8 @@ offset_x = 0
 offset_y = 0
 custom_x = 0
 custom_y = 0
+# 气泡显示哪些内容段；留空 = 全部显示。可选：schema/punct/full_width/s2t/caps
+items = ["schema", "punct", "full_width", "s2t", "caps"]
 
 # 悬停提示：原 ui.tooltip.{code,pinyin,chaizi,debug}.* 子表已拍平为平铺字段
 [ui.tooltip]

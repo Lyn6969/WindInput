@@ -668,6 +668,11 @@ pub struct Coordinator {
     pub(crate) theme_name: Mutex<String>,
     /// 主题颜色风格：0=跟随系统 1=亮色 2=暗色
     pub(crate) theme_style: Mutex<u8>,
+    /// 状态气泡上一次显示的文本，用于抑制"内容没变却重复弹窗"。
+    /// 关掉某个内容段后（如全半角），切换该状态不再改变气泡文本，此时应当整个不弹窗。
+    /// 在 `show_status` 做文本比对而非判断"这次变的是哪个字段"，是因为后者要给全部
+    /// 十余个调用点传参，而文本比对一处生效、且将来新增状态项零成本。
+    pub(crate) last_status_text: Mutex<String>,
     /// 当前主题定义的序号槽位字符（views.index.labels）；push_theme 载入时刷新。
     /// 序号优先级：用户配置 index_labels > 本字段 > 默认数字。
     pub(crate) theme_index_labels: Mutex<Vec<String>>,
@@ -1225,6 +1230,7 @@ impl Coordinator {
             front_ctx: Mutex::new((String::new(), String::new(), String::new())),
             themes_dir,
             theme_name: Mutex::new(initial_theme),
+            last_status_text: Mutex::new(String::new()),
             theme_style: Mutex::new(theme_style_init),
             theme_index_labels: Mutex::new(Vec::new()),
             cmdbar_services: std::sync::OnceLock::new(),
@@ -2903,11 +2909,23 @@ impl Coordinator {
             fixed_x: si.custom_x,
             fixed_y: si.custom_y,
         });
+        // 记录实际显示出去的文本，供 show_status 去重。临时提示（模式标记/主题名等）
+        // 也记在这里：它们会覆盖掉旧的状态文本，从而使随后的同名状态气泡照常显示，
+        // 不会被误判成"内容没变"。
+        *self
+            .last_status_text
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = text.to_string();
     }
 
     /// 隐藏状态提示气泡（常驻模式失焦时调用）。
     pub(crate) fn hide_tip(&self) {
         let _ = self.ui_tx.send(UiCommand::HideStatusTip);
+        // 清空去重缓存：否则重新获焦时"常驻显示"会因文本与隐藏前相同而不弹。
+        self.last_status_text
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear();
     }
 
     /// 常驻(always)模式且启用时,显示当前合成状态(激活/获焦时调用)。temp 模式不在此显示。
@@ -2931,10 +2949,18 @@ impl Coordinator {
                 s.caps_lock,
             )
         };
+        // 内容段过滤：ui.status.items 未列出的段不参与拼接。空列表 = 全部显示
+        // （既是未配置时的合理默认，也让无此键的旧配置行为不变）。
+        let items = self.rt().config.ui.status.items.clone();
+        let show = |k: &str| items.is_empty() || items.iter().any(|i| i == k);
+
         let mut parts: Vec<String> = Vec::new();
-        // 方案 / 中英 / 大写锁定
-        if caps {
+        // 方案 / 中英 / 大写锁定。三者共用首个槽位：关掉 caps 段时大写锁定不再顶替，
+        // 落回正常的中英/方案显示。
+        if caps && show("caps") {
             parts.push("A".into());
+        } else if !show("schema") {
+            // 方案段关闭：首槽整体略过（含英文态标记）
         } else if !chinese {
             parts.push("英".into());
         } else {
@@ -2957,27 +2983,43 @@ impl Coordinator {
                 label
             });
         }
-        // 标点（总显示）：英文模式（含大写锁定）下固定显示半角，不看内部 punct_cn 状态。
-        let effective_chinese = chinese && !caps;
-        parts.push(if effective_chinese && punct_cn {
-            "。".into()
-        } else {
-            ".".into()
-        });
+        // 标点（本段启用时总显示）：英文模式（含大写锁定）下固定显示半角，
+        // 不看内部 punct_cn 状态。
+        if show("punct") {
+            let effective_chinese = chinese && !caps;
+            parts.push(if effective_chinese && punct_cn {
+                "。".into()
+            } else {
+                ".".into()
+            });
+        }
         // 全角（仅全角时）
-        if full {
+        if full && show("full_width") {
             parts.push("全".into());
         }
         // 繁（仅繁体时）
-        if s2t {
+        if s2t && show("s2t") {
             parts.push("繁".into());
         }
         parts.join(" ")
     }
 
     /// 显示合成的核心状态气泡（中英/标点/全半角/简繁/方案切换共用）。
+    ///
+    /// 文本与上次显示的完全相同时**整个跳过**，不弹窗——用户通过 `ui.status.items`
+    /// 关掉某段后，切换该状态不再改变气泡文本，弹一个和上次一模一样的气泡纯属噪声。
     pub(crate) fn show_status(&self) {
-        self.show_tip(&self.status_indicator_text());
+        let text = self.status_indicator_text();
+        {
+            let last = self
+                .last_status_text
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            if *last == text {
+                return;
+            }
+        }
+        self.show_tip(&text);
     }
 
     /// 分发热键动作；返回是否已处理
