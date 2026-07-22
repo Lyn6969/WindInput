@@ -223,6 +223,12 @@ static REGISTRY: &[ConfigField] = &[
     f("ui.candidate.flip_when_above", Bool),
     f("ui.candidate.swap_preedit_when_above", Bool),
     f("ui.candidate.pager_in_preedit", Bool),
+    f(
+        "ui.candidate.position_mode",
+        Enum(&["follow_caret", "fixed"]),
+    ),
+    f("ui.candidate.custom_x", Int),
+    f("ui.candidate.custom_y", Int),
     f("ui.font.family", Str),
     f("ui.font.path", Str),
     f("ui.font.render_mode", Enum(&["directwrite", "gdi"])),

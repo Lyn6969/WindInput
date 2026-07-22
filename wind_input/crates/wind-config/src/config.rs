@@ -1343,10 +1343,25 @@ pub struct UiCandidateConfig {
     /// 翻页栏并入编码栏行、右对齐显示（竖排省一行）。仅"非嵌入编码"（有独立编码栏）时生效。
     #[serde(default)]
     pub pager_in_preedit: bool,
+    /// 候选窗定位方式："follow_caret"（默认，跟随光标）/ "fixed"（固定屏幕坐标）。
+    /// fixed 下窗口不再随光标移动，也不再上翻（flip/swap_when_above 随之失去意义）。
+    #[serde(default = "default_candidate_position_mode")]
+    pub position_mode: String,
+    /// 固定模式下的**内容左上**屏幕坐标（不含阴影扩边），仅 position_mode="fixed" 生效。
+    /// 由用户拖动候选窗落盘，设置页刻意不暴露：手填绝对坐标既不直观又会与拖动互相覆盖
+    /// （与 ui.status.custom_x/y 同一决策）。(0,0) 视作"尚未设定"，首次显示落到屏幕默认锚点。
+    #[serde(default)]
+    pub custom_x: i32,
+    #[serde(default)]
+    pub custom_y: i32,
 }
 
 fn default_preedit_display() -> String {
     "app_inline".to_string()
+}
+
+fn default_candidate_position_mode() -> String {
+    "follow_caret".to_string()
 }
 
 /// 编码显示方式（解析自 ui.candidate.preedit_display）。
@@ -1425,11 +1440,19 @@ impl Default for UiCandidateConfig {
             flip_when_above: false,
             swap_preedit_when_above: false,
             pager_in_preedit: false,
+            position_mode: default_candidate_position_mode(),
+            custom_x: 0,
+            custom_y: 0,
         }
     }
 }
 
 impl UiCandidateConfig {
+    /// 是否为固定位置模式（position_mode="fixed"）。
+    pub fn is_fixed_position(&self) -> bool {
+        self.position_mode.eq_ignore_ascii_case("fixed")
+    }
+
     /// 解析后的编码显示方式。
     pub fn preedit(&self) -> PreeditDisplay {
         PreeditDisplay::from_config(&self.preedit_display)

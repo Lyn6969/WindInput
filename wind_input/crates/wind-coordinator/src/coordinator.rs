@@ -1586,6 +1586,17 @@ impl Coordinator {
     /// 用于「改动只影响少数几个 UI 字段、且发生频率高」的场景——典型是拖动窗口后落盘位置：
     /// 走 reload_user_config 会每拖一次弹一个「设置已更新」toast，明显不合适。
     /// 调用方仍需自行用 `Config::set_user_*` 把值写盘，本函数只负责让内存态立刻跟上。
+    /// 候选窗定位参数 `(fixed, fixed_x, fixed_y)`，随每次 `UpdateCandidates` 下发。
+    ///
+    /// fixed 时 UI 侧忽略光标坐标，改用 `custom_x/custom_y`；`(0,0)` 表示"已开启固定
+    /// 但用户还没拖过"，由 UI 落到屏幕默认锚点。快捷加词面板复用同一个候选窗实例，
+    /// 因此也走这里——否则同一个窗口会在"加词时跟随、打字时固定"之间来回跳。
+    pub(crate) fn candidate_fixed_pos(&self) -> (bool, i32, i32) {
+        let rt = self.rt();
+        let c = &rt.config.ui.candidate;
+        (c.is_fixed_position(), c.custom_x, c.custom_y)
+    }
+
     pub(crate) fn refresh_config_in_memory(&self, mutate: impl FnOnce(&mut Config)) {
         let mut cfg = self.rt().config.clone();
         mutate(&mut cfg);
@@ -1609,6 +1620,8 @@ impl Coordinator {
                 // 引擎按需缓存，故一并纳入脏判定。
                 let schema_dirty = old.config.schema != cfg.schema
                     || old.config.input.temp_pinyin != cfg.input.temp_pinyin;
+                // 候选窗定位方式切换的边沿检测（见下方 ReportCandidatePos）。
+                let cand_was_fixed = old.config.ui.candidate.is_fixed_position();
                 drop(old);
 
                 let bundle = std::sync::Arc::new(ConfigBundle::build(cfg));
@@ -1658,6 +1671,12 @@ impl Coordinator {
                     s.toolbar_visible = new_cfg.ui.toolbar.visible;
                 }
                 self.apply_ui_config(); // 外观项（候选排列/编码显示/候选窗显隐）即时生效
+                // 「定位方式」刚从跟随切到固定：若候选窗此刻正显示着，就地固定在它当前的位置，
+                // 而不是跳到陈旧的 custom_x/custom_y（用户从没拖过时是 0,0，会窜到屏幕左上角）。
+                // 窗口没显示则不上报，首显时由 UI 侧落到屏幕默认锚点。与 status_toggle_pinned 同构。
+                if !cand_was_fixed && new_cfg.ui.candidate.is_fixed_position() {
+                    let _ = self.ui_tx.send(UiCommand::ReportCandidatePos);
+                }
                 self.reload_config(); // 刷新主题/工具栏（候选窗下次输入按新配置）
                 self.notify_toolbar(); // 工具栏显隐(visible/全屏)按新配置即时刷新
                 self.sync_global_hotkeys(); // keys.global_hotkeys 增删/改键即时生效
@@ -2383,6 +2402,7 @@ impl Coordinator {
         } else {
             self.ui_caret_bytes(state).min(preedit.len())
         };
+        let (cand_fixed, cand_fixed_x, cand_fixed_y) = self.candidate_fixed_pos();
         // mode_label 已在顶部计算（纳入空则隐藏守卫）：作为候选窗内联标记随候选窗一并显示。
         let _ = self.ui_tx.send(UiCommand::UpdateCandidates {
             preedit,
@@ -2397,6 +2417,9 @@ impl Coordinator {
             caret_y,
             caret_height,
             caret_valid,
+            fixed: cand_fixed,
+            fixed_x: cand_fixed_x,
+            fixed_y: cand_fixed_y,
         });
         // 候选窗已下发显示：标记本组合已首显，后续刷新（翻页/选字/打字）即可立即下发不再延迟。
         *self
@@ -2577,6 +2600,7 @@ impl Coordinator {
             }
             UiEvent::GlobalHotkey(action) => self.handle_global_hotkey(&action),
             UiEvent::StatusTipMoved { x, y } => self.save_status_tip_pos(x, y),
+            UiEvent::CandidateWindowMoved { x, y } => self.save_candidate_pos(x, y),
             UiEvent::RequestStatusMenu { x, y } => self.show_status_menu(x, y),
             UiEvent::RequestTooltipMenu { x, y } => self.show_tooltip_menu(x, y),
         }

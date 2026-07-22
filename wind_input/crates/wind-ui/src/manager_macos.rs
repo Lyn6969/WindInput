@@ -69,6 +69,11 @@ impl Forwarder {
                 caret_y,
                 caret_height,
                 caret_valid,
+                // 固定位置模式只对本地自绘窗口（Windows）有意义：macOS 走 IMKit 转发，
+                // 候选窗由系统按光标定位，Rust 侧无从干预，故此处显式丢弃。
+                fixed: _,
+                fixed_x: _,
+                fixed_y: _,
             } => {
                 tracing::debug!(
                     "forwarder UpdateCandidates: n={} preedit={:?} caret=({},{},{}) valid={}",
@@ -342,6 +347,9 @@ mod tests {
             caret_y: 200,
             caret_height: 20,
             caret_valid: true,
+            fixed: false,
+            fixed_x: 0,
+            fixed_y: 0,
         });
         let v = cap.lock().unwrap();
         assert!(
@@ -372,6 +380,9 @@ mod tests {
             caret_y: 20,
             caret_height: 20,
             caret_valid: true,
+            fixed: false,
+            fixed_x: 0,
+            fixed_y: 0,
         });
         cap.lock().unwrap().clear();
         f.handle(UiCommand::HideCandidates);

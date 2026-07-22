@@ -701,6 +701,8 @@ impl Coordinator {
                 row(word, code_comment),
             ]
         };
+        // 加词面板复用候选窗实例，定位方式须与候选窗一致（见 candidate_fixed_pos）。
+        let (fixed, fixed_x, fixed_y) = self.candidate_fixed_pos();
         let _ = self.ui_tx.send(UiCommand::UpdateCandidates {
             preedit: String::new(),
             preedit_caret: 0, // 加词面板无编码区
@@ -714,6 +716,9 @@ impl Coordinator {
             caret_y: state.caret_y,
             caret_height: state.caret_height,
             caret_valid: true,
+            fixed,
+            fixed_x,
+            fixed_y,
         });
     }
 

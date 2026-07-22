@@ -168,6 +168,33 @@ impl Coordinator {
         });
     }
 
+    /// 拖动候选窗释放后的落位处理——**是否持久化取决于当前定位方式**：
+    ///
+    /// - `fixed`（固定位置）：写回 `ui.candidate.custom_x/custom_y`，永久生效。
+    /// - `follow_caret`（跟随光标）：**不落盘**。拖动只是把候选窗临时挪开，
+    ///   本次组合内保持不动，组合结束（`hide()` → `reset_drag()`）即恢复跟随光标。
+    ///
+    /// 与 `save_status_tip_pos` 同构：两种模式各自语义自洽，跟随模式的拖动是临时的，
+    /// 固定模式的拖动才是"重新摆放"。
+    pub(crate) fn save_candidate_pos(&self, x: i32, y: i32) {
+        if !self.rt().config.ui.candidate.is_fixed_position() {
+            return;
+        }
+        let (x, y) = avoid_unset_sentinel(x, y);
+        let _ = Config::set_user_value(
+            &["ui", "candidate", "custom_x"],
+            toml::Value::Integer(x as i64),
+        );
+        let _ = Config::set_user_value(
+            &["ui", "candidate", "custom_y"],
+            toml::Value::Integer(y as i64),
+        );
+        self.refresh_config_in_memory(|c| {
+            c.ui.candidate.custom_x = x;
+            c.ui.candidate.custom_y = y;
+        });
+    }
+
     /// 状态提示气泡右键菜单「固定位置」：在 fixed / follow_caret 间翻转。
     ///
     /// 打开时**以气泡当前实际位置**落盘，而不是直接切到陈旧的 custom_x/custom_y——
@@ -956,4 +983,38 @@ fn monitor_key_from_point(x: i32, y: i32) -> String {
 /// 返回 None 表示无法确定用户目录（portable 模式但找不到 exe 路径等极罕见情况）。
 fn screenshots_dir() -> Option<String> {
     Config::user_config_dir().map(|d| d.join("screenshots").display().to_string())
+}
+
+/// 候选窗固定位置落盘前的哨兵规避。
+///
+/// UI 侧用 `(0, 0)` 表示"已开启固定但尚未设定位置"（落到屏幕默认锚点），可主屏工作区
+/// 的左上角**往往正是** `(0, 0)`（任务栏在底部时）——用户真把候选窗拖到屏幕最左上角，
+/// 落盘值就撞上哨兵，下次显示被判为"没设过"而跳回默认锚点，表现为"位置没被记住"。
+///
+/// 哨兵值与合法值域重叠是根因；这里在落盘侧下移 1px 避开：视觉不可察觉，语义无歧义。
+fn avoid_unset_sentinel(x: i32, y: i32) -> (i32, i32) {
+    if (x, y) == (0, 0) { (0, 1) } else { (x, y) }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::avoid_unset_sentinel;
+
+    /// 只有恰好 (0,0) 被规避，其余坐标（含含 0 分量与负坐标）必须原样落盘。
+    #[test]
+    fn only_the_exact_sentinel_is_nudged() {
+        assert_eq!(avoid_unset_sentinel(0, 0), (0, 1), "撞哨兵 → 下移 1px");
+        // 含 0 分量但非哨兵：不能动，否则用户贴左边/贴顶边的位置会被悄悄改掉
+        assert_eq!(avoid_unset_sentinel(0, 5), (0, 5));
+        assert_eq!(avoid_unset_sentinel(5, 0), (5, 0));
+        // 负坐标：副屏位于主屏左侧/上方时屏幕坐标为负，属合法值
+        assert_eq!(avoid_unset_sentinel(-1920, -100), (-1920, -100));
+        assert_eq!(avoid_unset_sentinel(100, 200), (100, 200));
+    }
+
+    /// 规避结果自身绝不能再是哨兵，否则等于没修。
+    #[test]
+    fn nudged_result_is_never_the_sentinel() {
+        assert_ne!(avoid_unset_sentinel(0, 0), (0, 0));
+    }
 }

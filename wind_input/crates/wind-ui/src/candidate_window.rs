@@ -13,7 +13,7 @@ use crate::sys::{
     GetCursorPos, GetWindowRect, HWND, HWND_TOPMOST, IDC_ARROW, IDC_SIZEALL, LPARAM, LRESULT,
     LoadCursorW, POINT, RECT, ReleaseCapture, SWP_NOACTIVATE, SWP_NOSIZE, SWP_NOZORDER, SetCapture,
     SetCursor, SetWindowPos, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_MOUSEWHEEL,
-    WM_RBUTTONDOWN, WM_SETCURSOR, WPARAM, clamp_to_work_area,
+    WM_RBUTTONDOWN, WM_SETCURSOR, WPARAM, clamp_content_to_monitor,
 };
 use crate::text::dwrite::TextRenderer;
 use crate::view::{Align, Edges, Layout, Rect, View, ViewImage, ViewLayer};
@@ -200,6 +200,10 @@ pub struct CandidateWindow {
     /// 翻页栏并入编码栏行、右对齐显示（竖排省一行）。仅"非嵌入编码"（有独立编码栏）时生效。
     /// 来自 ui.candidate.pager_in_preedit。
     pager_in_preedit: bool,
+    /// 固定位置模式的**内容左上**屏幕坐标；`None`=跟随光标（默认）。
+    /// 来自 ui.candidate.position_mode + custom_x/custom_y，每次 UpdateCandidates 同步。
+    /// `Some((0, 0))` 是"已开启固定但尚未设定位置"，定位时落到屏幕默认锚点。
+    fixed_pos: Option<(i32, i32)>,
 }
 
 impl CandidateWindow {
@@ -221,6 +225,7 @@ impl CandidateWindow {
             drag_anchor: (0, 0),
             drag_origin: (0, 0),
             drag_pin: None,
+            margin: (0, 0, 0, 0),
         }));
         window.register_mouse(mouse.clone());
         Ok(Self {
@@ -255,6 +260,7 @@ impl CandidateWindow {
             page_number_display: String::new(),
             swap_preedit_when_above: false,
             pager_in_preedit: false,
+            fixed_pos: None,
         })
     }
 
@@ -419,6 +425,19 @@ impl CandidateWindow {
         self.y = y;
         self.caret_height = caret_height;
         self.caret_valid = caret_valid;
+    }
+
+    /// 设置固定位置模式：`Some((x, y))`=固定在该内容左上屏幕坐标，`None`=跟随光标。
+    pub fn set_fixed_position(&mut self, pos: Option<(i32, i32)>) {
+        self.fixed_pos = pos;
+    }
+
+    /// 当前候选窗**内容左上**屏幕坐标（窗口左上 + 阴影扩边）。
+    /// 供「定位方式」切到 fixed 时把当前实际位置落盘成 custom_x/custom_y。
+    pub fn content_origin(&self) -> (i32, i32) {
+        let m = self.mouse.borrow();
+        let w = m.window_origin().unwrap_or((0, 0));
+        Self::window_to_content(w, m.margin.0, m.margin.1)
     }
 
     /// 候选页内命中矩形（绝对坐标，相对窗口左上角）
@@ -747,7 +766,13 @@ impl CandidateWindow {
             return None;
         }
 
-        let new_scale = crate::dpi::scale_for_point(self.x, self.y);
+        // DPI 探测点：固定位置模式按**固定点**取缩放，而不是光标点——固定位置可能落在
+        // 与光标不同缩放的另一块屏上，按光标算会让窗口用错误的 DPI 渲染（字号忽大忽小）。
+        let (dpi_x, dpi_y) = match self.fixed_pos {
+            Some(f) if f != (0, 0) => f,
+            _ => (self.x, self.y),
+        };
+        let new_scale = crate::dpi::scale_for_point(dpi_x, dpi_y);
         if (new_scale - self.scale).abs() > 0.01 {
             self.scale = new_scale;
             self.text_renderer
@@ -774,34 +799,55 @@ impl CandidateWindow {
         let width = content_w + ml + mr;
         let height = content_h + mt + mb;
 
+        // ── 定位：三级优先级 drag_pin > fixed_pos > place_window(跟随光标) ──
         // 用户已手动拖动过本次组合的候选窗 → 冻结落位：位置固定、上/下方排列也不再翻转，
         // 否则窗口停在原处但内容突然倒序，视觉上会"自己变了个样"。
         let drag_pin = self.mouse.borrow().drag_pin;
-
-        // Windows 的 self.y 已是光标底端（与 show() 语义一致），直接传入。
-        let (px0, py0, above) = Self::place_window(
-            self.x,
-            self.y,
-            self.caret_height,
-            content_w,
-            content_h,
-            self.placed_above,
-        );
-        if drag_pin.is_none() {
-            self.placed_above = above;
-        }
-        let (px, py) = match self.last_content_pos {
-            Some((lx, ly)) if self.visible => {
-                let thr = (4.0 * self.scale).round().max(1.0) as i32;
-                if (px0 - lx).abs() < thr && (py0 - ly).abs() < thr {
-                    (lx, ly)
-                } else {
-                    (px0, py0)
-                }
+        let mut screen_xy: Option<(i32, i32)> = match (drag_pin, self.fixed_pos) {
+            // 拖动落定：placed_above 保持不变（同上，避免窗口不动而内容倒序）。
+            (Some(p), _) => Some(p),
+            // 固定位置模式：窗口不再随光标上下移动，"上翻"随之失去意义 —— placed_above
+            // 必须归 false，否则 flip_when_above / swap_preedit_when_above 会让内容
+            // 在一个位置固定的窗口里莫名倒序。
+            (None, Some(f)) => {
+                self.placed_above = false;
+                self.last_content_pos = None;
+                Some(Self::place_fixed(
+                    f,
+                    self.x,
+                    self.y,
+                    width,
+                    height,
+                    (ml as i32, mt as i32, mr as i32, mb as i32),
+                ))
             }
-            _ => (px0, py0),
+            (None, None) => None,
         };
-        self.last_content_pos = Some((px, py));
+        if screen_xy.is_none() {
+            // Windows 的 self.y 已是光标底端（与 show() 语义一致），直接传入。
+            let (px0, py0, above) = Self::place_window(
+                self.x,
+                self.y,
+                self.caret_height,
+                content_w,
+                content_h,
+                self.placed_above,
+            );
+            self.placed_above = above;
+            let (px, py) = match self.last_content_pos {
+                Some((lx, ly)) if self.visible => {
+                    let thr = (4.0 * self.scale).round().max(1.0) as i32;
+                    if (px0 - lx).abs() < thr && (py0 - ly).abs() < thr {
+                        (lx, ly)
+                    } else {
+                        (px0, py0)
+                    }
+                }
+                _ => (px0, py0),
+            };
+            self.last_content_pos = Some((px, py));
+            screen_xy = Some((px - ml as i32, py - mt as i32));
+        }
         if self.placed_above && (self.flip_when_above || self.swap_preedit_when_above) {
             root = self.build_tree(true);
             root.layout(ml as f32, mt as f32, &self.text_renderer);
@@ -838,11 +884,15 @@ impl CandidateWindow {
         root.paint(&mut buf, width, height, &self.text_renderer);
 
         self.visible = true;
-        // drag_pin 记的是窗口左上（含阴影扩边），与 screen_x/y 同一坐标系，直接顶替。
-        let (screen_x, screen_y) = match drag_pin {
-            Some((wx, wy)) => (wx, wy),
-            None => (px - ml as i32, py - mt as i32),
-        };
+        // 上方三级定位分支穷尽，此处必为 Some；debug 下断言，release 兜底到光标处而非
+        // (0,0)——真出现逻辑漏洞时窗口至少还在光标附近，不会莫名飞到屏幕左上角。
+        debug_assert!(screen_xy.is_some(), "定位三分支必有其一赋值 screen_xy");
+        let (screen_x, screen_y) = screen_xy.unwrap_or((self.x, self.y));
+        // 鼠标层记录阴影扩边，两处要用：
+        // 1. 拖动落定时把窗口左上换算回**内容左上**再上报落盘，否则每次「拖动→保存→
+        //    重显」都会多减一次阴影，窗口逐次漂移；
+        // 2. 拖动中按内容矩形钳制，让可见内容能真正贴到屏幕边缘（含任务栏）。
+        self.mouse.borrow_mut().margin = (ml as i32, mt as i32, mr as i32, mb as i32);
         Some(RenderedFrame {
             screen_x,
             screen_y,
@@ -954,6 +1004,84 @@ impl CandidateWindow {
         }
     }
 
+    /// **内容**左上 → **窗口**左上（减去软阴影扩边）。
+    ///
+    /// 落盘的 custom_x/y 记的是内容左上（用户视觉上看到的窗口边缘），而 Win32 定位用的是
+    /// 窗口左上。本函数与 `window_to_content` 必须严格互逆，否则每轮
+    /// 「拖动 → 落盘 → 重新显示」都会多减一次阴影，候选窗逐次向左上漂移。
+    #[cfg(windows)]
+    fn content_to_window(content: (i32, i32), ml: u32, mt: u32) -> (i32, i32) {
+        (content.0 - ml as i32, content.1 - mt as i32)
+    }
+
+    /// **窗口**左上 → **内容**左上（加回软阴影扩边）。`content_to_window` 的逆。
+    #[cfg(windows)]
+    fn window_to_content(window: (i32, i32), ml: i32, mt: i32) -> (i32, i32) {
+        (window.0 + ml, window.1 + mt)
+    }
+
+    /// 固定位置模式的窗口落点（返回窗口左上屏幕坐标，含阴影扩边）。
+    ///
+    /// - `fixed` 是**内容**左上坐标，减去阴影扩边 `(ml, mt)` 才是窗口左上。
+    /// - `(0, 0)` 视作"已开启固定但尚未设定位置"（用户还没拖过），落到默认锚点。
+    /// - 钳制按**内容**矩形、且钳到整块屏幕（含任务栏）：`custom_x/y` 是绝对屏幕坐标，
+    ///   用户换分辨率或拔掉副屏后会指向不可见区域，候选窗就此"消失"且无法用鼠标拖回来；
+    ///   但按含阴影的窗口矩形去钳会让内容离屏幕边还有一整个阴影宽就被拦下，见
+    ///   [`clamp_content_to_monitor`]。
+    #[cfg(windows)]
+    fn place_fixed(
+        fixed: (i32, i32),
+        caret_x: i32,
+        caret_y: i32,
+        width: u32,
+        height: u32,
+        margin: (i32, i32, i32, i32),
+    ) -> (i32, i32) {
+        let (ml, mt, _, _) = margin;
+        let (wx, wy) = if fixed == (0, 0) {
+            let content_w = (width as i32 - ml - margin.2).max(1) as u32;
+            let (cx, cy) = Self::default_fixed_anchor(caret_x, caret_y, content_w);
+            (cx - ml, cy - mt)
+        } else {
+            Self::content_to_window(fixed, ml as u32, mt as u32)
+        };
+        clamp_content_to_monitor(wx, wy, width, height, margin)
+    }
+
+    /// 固定模式尚未设定位置时的默认锚点（**内容**左上屏幕坐标）。
+    ///
+    /// 取**光标所在**显示器的工作区（用户在哪块屏打字就在哪块屏出现），水平居中、
+    /// 垂直落在约 3/4 高度处：贴底会和任务栏/其他浮动 UI 挤在一起，居中则挡住正文。
+    /// 内容高度不参与——顶端定在 3/4 处即可，超出底部由调用方的钳制拉回。
+    ///
+    /// 这里用 `rcWork` 而非 `rcMonitor`：自动落位应避开任务栏，只有用户**手动拖动**
+    /// 才允许压到任务栏上。
+    #[cfg(windows)]
+    fn default_fixed_anchor(caret_x: i32, caret_y: i32, width: u32) -> (i32, i32) {
+        use windows::Win32::Foundation::POINT;
+        use windows::Win32::Graphics::Gdi::{
+            GetMonitorInfoW, MONITOR_DEFAULTTONEAREST, MONITORINFO, MonitorFromPoint,
+        };
+        unsafe {
+            let pt = POINT {
+                x: caret_x,
+                y: caret_y,
+            };
+            let mon = MonitorFromPoint(pt, MONITOR_DEFAULTTONEAREST);
+            let mut mi = MONITORINFO {
+                cbSize: std::mem::size_of::<MONITORINFO>() as u32,
+                ..Default::default()
+            };
+            if GetMonitorInfoW(mon, &mut mi).as_bool() {
+                let wa = mi.rcWork;
+                let x = wa.left + ((wa.right - wa.left) - width as i32) / 2;
+                let y = wa.top + ((wa.bottom - wa.top) * 3) / 4;
+                return (x, y);
+            }
+        }
+        (caret_x, caret_y)
+    }
+
     /// 据冻结光标锚点与当前内容尺寸计算候选窗位置，钳制在光标所在显示器工作区内。
     /// 规则：
     /// - 默认显示在光标下方（+gap）；下方空间不足则上翻到光标上方。
@@ -962,8 +1090,11 @@ impl CandidateWindow {
     /// - `sticky_above`=true（当前已在上方）时优先保持上方，仅当上方也放不下才回落下方，
     ///   避免候选数量变化时上下抖动（需求 4）。
     /// - 左右溢出则贴边（横向右方空间不足时允许左移，属位置保护的例外）。
-    // 非 Windows 下窗口钳制为空实现，caret_h/w/h 及 x/y 的可变性仅 Windows 分支需要。
+    ///
     /// 返回 (x, y, above)：above=true 表示窗口被上翻到光标上方（供 flip_when_above 判定）。
+    ///
+    /// 仅「跟随光标」定位方式走这里；固定位置见 [`Self::place_fixed`]。
+    // 非 Windows 下窗口钳制为空实现，caret_h/w/h 及 x/y 的可变性仅 Windows 分支需要。
     #[cfg_attr(not(windows), allow(unused_variables, unused_mut))]
     fn place_window(
         caret_x: i32,
@@ -1843,6 +1974,10 @@ pub struct CandidateMouse {
     /// 拖动落定位置（窗口左上屏幕坐标）。`Some` 即"本次组合已被用户手动摆放"，
     /// 此后该组合内的每帧渲染都固定用它，不再跟随光标；`hide()`（组合结束）清空。
     drag_pin: Option<(i32, i32)>,
+    /// 当前阴影扩边 (left, top, right, bottom)，每帧渲染后由 `render_frame` 同步。
+    /// 窗口左上 + (left, top) = **内容**左上，即落盘用的坐标系；四个分量一起用于
+    /// 按内容矩形做拖动钳制。
+    margin: (i32, i32, i32, i32),
 }
 
 impl CandidateMouse {
@@ -1974,6 +2109,14 @@ impl WindowMouse for CandidateMouse {
                     // 以真实窗口位置落定，避免累积误差
                     if let Some(pos) = self.window_origin() {
                         self.drag_pin = Some(pos);
+                        // 上报**内容左上**（窗口左上 + 阴影扩边）：固定位置模式下协调器把它
+                        // 落盘成 custom_x/custom_y；跟随模式下协调器直接忽略——那里的拖动
+                        // 只是"临时挪开"，下次组合仍回到光标旁。
+                        let (cx, cy) =
+                            CandidateWindow::window_to_content(pos, self.margin.0, self.margin.1);
+                        let _ = self
+                            .events
+                            .send(UiEvent::CandidateWindowMoved { x: cx, y: cy });
                     }
                 }
                 Some(LRESULT(0))
@@ -1986,7 +2129,10 @@ impl WindowMouse for CandidateMouse {
                 let nx = self.drag_origin.0 + (p.x - self.drag_anchor.0);
                 let ny = self.drag_origin.1 + (p.y - self.drag_anchor.1);
                 let (w, h) = self.window_size();
-                let (cx, cy) = clamp_to_work_area(nx, ny, w, h);
+                // 按**内容**矩形钳制、且钳到整块屏幕：软阴影可溢出屏幕，候选窗也允许
+                // 摆到任务栏上方。用 clamp_to_work_area 会让内容离屏幕边还差一个阴影
+                // 宽（blur=8 的主题约 29px）就拖不动了。
+                let (cx, cy) = clamp_content_to_monitor(nx, ny, w, h, self.margin);
                 // 拖动中即写 drag_pin：候选内容若在拖动期间刷新，渲染路径才不会把窗口拽回光标处。
                 self.drag_pin = Some((cx, cy));
                 unsafe {
@@ -2110,5 +2256,38 @@ mod tests {
                 assert_eq!(format!("{head}{tail}"), text);
             }
         }
+    }
+
+    /// 固定位置的两个坐标系必须严格互逆。
+    ///
+    /// 落盘的 custom_x/y 是**内容**左上，Win32 定位用的是**窗口**左上（含软阴影扩边）：
+    /// 固定定位走 content→window，拖动落定上报走 window→content。若两者不互逆，
+    /// 每轮「拖动 → 落盘 → 重新显示」都会多减一次阴影，候选窗每次重显都往左上爬一点——
+    /// 这种漂移从现象极难反推，故在此直接锁死。
+    #[cfg(windows)]
+    #[test]
+    fn content_window_coord_roundtrip_is_lossless() {
+        // 覆盖有/无阴影、负坐标（副屏在主屏左侧时屏幕坐标为负）
+        for (content, ml, mt) in [
+            ((100, 200), 12u32, 10u32),
+            ((0, 0), 0, 0),
+            ((-1920, 40), 8, 8),
+            ((3, 7), 1, 0),
+        ] {
+            let w = CandidateWindow::content_to_window(content, ml, mt);
+            let back = CandidateWindow::window_to_content(w, ml as i32, mt as i32);
+            assert_eq!(back, content, "content={content:?} margin=({ml},{mt})");
+        }
+    }
+
+    /// 阴影扩边确实被减掉了——若 content_to_window 退化成恒等函数，
+    /// 上面的 round-trip 仍会通过，但固定位置会整体偏移一个阴影的量。
+    #[cfg(windows)]
+    #[test]
+    fn content_to_window_subtracts_the_shadow_margin() {
+        assert_eq!(
+            CandidateWindow::content_to_window((100, 200), 12, 10),
+            (88, 190)
+        );
     }
 }

@@ -41,6 +41,11 @@ pub enum UiCommand {
         caret_height: i32,
         /// 光标坐标是否有效（无效时窗口仅临时显示、不锁定锚点）
         caret_valid: bool,
+        /// 固定位置模式（ui.candidate.position_mode=fixed）：忽略光标，用 fixed_x/fixed_y 定位。
+        fixed: bool,
+        /// 固定位置的**内容左上**屏幕坐标；(0,0) 表示尚未设定，由 UI 侧落到屏幕默认锚点。
+        fixed_x: i32,
+        fixed_y: i32,
     },
     /// 隐藏候选窗口
     HideCandidates,
@@ -144,6 +149,10 @@ pub enum UiCommand {
     /// 请求上报状态气泡当前位置：UI 侧回 `UiEvent::StatusTipMoved`。
     /// 供「固定位置」开关把当前实际位置落盘，而不是跳到陈旧的 custom_x/custom_y。
     ReportStatusTipPos,
+    /// 请求上报候选窗当前位置：UI 侧回 `UiEvent::CandidateWindowMoved`。
+    /// 供「定位方式」切到 fixed 时就地固定——窗口正显示着就用它当前的位置，
+    /// 不显示则不上报（协调器留空，首显时由 UI 落到屏幕默认锚点）。
+    ReportCandidatePos,
     /// 注册全局热键（Win32 RegisterHotKey，线程级）。覆盖式：先反注册旧列表再注册新列表，
     /// 空列表 = 仅清除已注册项。来自 keys.global_hotkeys（协调器构建，启动/配置重载时下发）。
     RegisterGlobalHotkeys(Vec<GlobalHotkeyEntry>),
@@ -457,6 +466,9 @@ pub enum UiEvent {
     GlobalHotkey(String),
     /// 状态提示气泡被拖动到新位置（内容左上屏幕坐标），供协调器持久化
     StatusTipMoved { x: i32, y: i32 },
+    /// 候选窗被拖动到新位置（内容左上屏幕坐标）。协调器仅在 fixed 模式下持久化；
+    /// follow_caret 模式的拖动是"本次组合内临时挪开"，不落盘。
+    CandidateWindowMoved { x: i32, y: i32 },
     /// 右键状态提示气泡请求弹出菜单（屏幕坐标）
     RequestStatusMenu { x: i32, y: i32 },
     /// 右键悬停提示（编码反查气泡）请求弹出菜单（屏幕坐标）
@@ -769,6 +781,9 @@ impl UiManager {
                         caret_y,
                         caret_height,
                         caret_valid,
+                        fixed,
+                        fixed_x,
+                        fixed_y,
                     } => {
                         debug!(
                             "UI: UpdateCandidates ({} items, selected={}, hover={}, page={}/{}, pos={},{})",
@@ -791,6 +806,7 @@ impl UiManager {
                             total_pages,
                         );
                         candidate_window.set_position(caret_x, caret_y, caret_height, caret_valid);
+                        candidate_window.set_fixed_position(fixed.then_some((fixed_x, fixed_y)));
                         // host-render 分流：有活跃目标时渲染到 SHM，本地窗口互斥隐藏。
                         // 无目标或 host-render 未注入时落本地 LayeredWindow 路径（零改动）。
                         #[cfg(windows)]
@@ -1087,6 +1103,12 @@ impl UiManager {
                         {
                             let (x, y) = st.content_origin();
                             let _ = event_tx.send(UiEvent::StatusTipMoved { x, y });
+                        }
+                    }
+                    UiCommand::ReportCandidatePos => {
+                        if candidate_window.is_visible() {
+                            let (x, y) = candidate_window.content_origin();
+                            let _ = event_tx.send(UiEvent::CandidateWindowMoved { x, y });
                         }
                     }
                     UiCommand::SetTooltipMenuOpen(open) => {
