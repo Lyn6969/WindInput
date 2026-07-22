@@ -21,9 +21,12 @@ use wind_bridge::server::{BridgeConfig, BridgeServer};
 // 共用一处定义，三份日志才能归并排序，也避免两边各写一份而漂移。
 use wind_config::startup_trace::{self, LOG_TIME_FORMAT};
 
+mod backup_cli;
 mod cli_util;
 mod config_cli;
+mod dict_cli;
 mod log_rotate;
+mod phrase_cli;
 mod schema_cli;
 
 /// GUI 子系统（release profile，`windows_subsystem="windows"`）下进程不附着控制台，
@@ -83,13 +86,19 @@ fn main() {
     // 注意保持在单例检查之前——CLI 进程不该被「另一实例已运行」挡掉。
     let cli_args: Vec<String> = std::env::args().collect();
     let sub = cli_args.get(1).map(String::as_str);
-    if matches!(sub, Some("config" | "schema")) {
+    if matches!(
+        sub,
+        Some("config" | "schema" | "dict" | "phrase" | "backup")
+    ) {
         // GUI 子系统下附着父控制台，让输出回到调用的终端（详见 attach_parent_console）。
         #[cfg(windows)]
         attach_parent_console();
         let code = match sub {
             Some("config") => config_cli::run(&cli_args[2..]),
             Some("schema") => schema_cli::run(&cli_args[2..]),
+            Some("dict") => dict_cli::run(&cli_args[2..]),
+            Some("phrase") => phrase_cli::run(&cli_args[2..]),
+            Some("backup") => backup_cli::run(&cli_args[2..]),
             _ => unreachable!(),
         };
         // process::exit 不会刷新缓冲，重定向/管道时可能丢尾部输出——显式 flush。
