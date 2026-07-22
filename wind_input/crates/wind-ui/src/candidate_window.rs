@@ -206,6 +206,7 @@ impl CandidateWindow {
     pub fn new(config: CandidateWindowConfig, events: Sender<UiEvent>) -> Result<Self, String> {
         let window = LayeredWindow::create(None, 400, 200, "WindInputCandidate")?;
         let text_renderer = TextRenderer::new("Microsoft YaHei UI", config.font_size)?;
+        let tooltip_events = events.clone();
         let mouse = Rc::new(RefCell::new(CandidateMouse {
             hit_rects: Vec::new(),
             events,
@@ -242,7 +243,7 @@ impl CandidateWindow {
             text_renderer,
             hit_rects: Vec::new(),
             mouse,
-            tooltip: crate::tooltip::Tooltip::new().ok(),
+            tooltip: crate::tooltip::Tooltip::new(tooltip_events).ok(),
             theme: wind_theme::Resolved::default(),
             scale: CandidateWindowConfig::get_dpi_scale(),
             vertical: false,
@@ -346,6 +347,34 @@ impl CandidateWindow {
     pub fn set_tooltip_chaizi_font(&mut self, path: &str, family: &str) {
         if let Some(t) = self.tooltip.as_mut() {
             t.set_chaizi_font(path, family);
+        }
+    }
+
+    /// 悬停提示当前（或最近一次）显示的文本内容（右键菜单「复制内容」用）；无实例返回空串。
+    pub fn tooltip_text(&self) -> &str {
+        self.tooltip.as_ref().map(|t| t.text()).unwrap_or("")
+    }
+
+    /// 将悬停提示窗口当前渲染帧保存为 PNG 文件（截图用）。
+    pub fn tooltip_capture_to_file(&self, path: &std::path::Path) -> Result<(), String> {
+        match self.tooltip.as_ref() {
+            Some(t) => t.capture_to_file(path),
+            None => Err("tooltip 未初始化".to_string()),
+        }
+    }
+
+    /// 悬停提示窗口当前是否可见。
+    pub fn tooltip_is_visible(&self) -> bool {
+        self.tooltip
+            .as_ref()
+            .map(|t| t.is_visible())
+            .unwrap_or(false)
+    }
+
+    /// 设置悬停提示右键菜单打开状态（转发给 Tooltip，见其 set_menu_open 说明）。
+    pub fn tooltip_set_menu_open(&mut self, open: bool) {
+        if let Some(t) = self.tooltip.as_mut() {
+            t.set_menu_open(open);
         }
     }
 

@@ -26,6 +26,9 @@ impl Coordinator {
             MenuKind::Command(cmd) => self.run_menu_cmd(cmd),
             MenuKind::Submenu | MenuKind::Separator => {}
         }
+        // 派发完再解除 tooltip 抑制：Tooltip 截图命令必须先于本次解除被处理，
+        // 否则 tooltip 会在截图前被隐藏。详见 clear_tooltip_menu_flag 的说明。
+        self.clear_tooltip_menu_flag();
     }
 
     /// 执行功能主菜单命令
@@ -82,6 +85,16 @@ impl Coordinator {
             MenuCmd::StatusScreenshot => {
                 if let Some(dir) = screenshots_dir() {
                     let _ = self.ui_tx.send(UiCommand::ScreenshotStatusTip {
+                        dir: std::path::PathBuf::from(dir),
+                    });
+                }
+            }
+            MenuCmd::TooltipCopy => {
+                let _ = self.ui_tx.send(UiCommand::CopyTooltipText);
+            }
+            MenuCmd::TooltipScreenshot => {
+                if let Some(dir) = screenshots_dir() {
+                    let _ = self.ui_tx.send(UiCommand::ScreenshotTooltip {
                         dir: std::path::PathBuf::from(dir),
                     });
                 }
@@ -174,6 +187,33 @@ impl Coordinator {
                 false,
             ),
             M::leaf("截图此窗口", cmd(MenuCmd::StatusScreenshot), true, false),
+        ];
+        {
+            let mut s = self.state.lock().unwrap_or_else(|e| e.into_inner());
+            s.menu_open = true;
+            s.menu_target_page_local = 0;
+            s.menu_target_text = String::new();
+        }
+        let _ = self.ui_tx.send(UiCommand::ShowCandidateMenu {
+            items,
+            x,
+            y,
+            y_bottom: y,
+            above: false,
+        });
+    }
+
+    /// 右键悬停提示（编码反查气泡）请求的功能菜单：复制内容 / 截图此窗口。
+    /// **先**发 SetTooltipMenuOpen(true) 抑制 tooltip 的 WM_MOUSELEAVE 自动隐藏——
+    /// 右键弹出菜单后鼠标会移到菜单窗口上，若不抑制 tooltip 会当场消失，菜单就指向一个
+    /// 已不存在的窗口，「截图此窗口」会截空。抑制标志在菜单关闭时由 menu_close 统一清除。
+    pub(crate) fn show_tooltip_menu(&self, x: i32, y: i32) {
+        use wind_ui::manager::MenuItemSpec as M;
+        let _ = self.ui_tx.send(UiCommand::SetTooltipMenuOpen(true));
+        let cmd = |c: MenuCmd| MenuKind::Command(c);
+        let items = vec![
+            M::leaf("复制内容", cmd(MenuCmd::TooltipCopy), true, false),
+            M::leaf("截图此窗口", cmd(MenuCmd::TooltipScreenshot), true, false),
         ];
         {
             let mut s = self.state.lock().unwrap_or_else(|e| e.into_inner());
@@ -529,7 +569,9 @@ impl Coordinator {
             .menu_open
     }
 
-    /// 关闭菜单
+    /// 关闭菜单。单点收口：所有菜单关闭路径（ESC/点击外部/动作执行完毕）都经此函数，
+    /// 顺带清除 tooltip 右键菜单的 suppress_hide 抑制标志——不区分是否为 tooltip 菜单，
+    /// 非 tooltip 菜单关闭时清除是无操作（tooltip 菜单未打开则标志本就是 false）。
     pub(crate) fn menu_close(&self) {
         let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
         if state.menu_open {
@@ -537,6 +579,17 @@ impl Coordinator {
             drop(state);
             let _ = self.ui_tx.send(UiCommand::HideMenu);
         }
+    }
+
+    /// 解除 Tooltip 的「菜单打开中」隐藏抑制。
+    ///
+    /// **必须在菜单动作派发之后调用，不能并进 `menu_close()`**：`menu_action()` 是先
+    /// `menu_close()` 再 `run_menu_cmd()`，若在前者里解除，UI 线程会按序先处理解除
+    /// （此时光标在菜单窗口上、不在 tooltip 上 → 立即隐藏 tooltip），再处理
+    /// `ScreenshotTooltip`，于是截图恒定失败在「未显示」上。复制不受影响（文本已留存），
+    /// 表现为「复制能用、截图不能用」。
+    pub(crate) fn clear_tooltip_menu_flag(&self) {
+        let _ = self.ui_tx.send(UiCommand::SetTooltipMenuOpen(false));
     }
 
     /// 菜单打开时转发导航键给菜单窗口；返回 true 表示已消费。

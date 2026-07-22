@@ -2552,10 +2552,15 @@ impl Coordinator {
                 above,
             } => self.show_main_menu(x, y, y_bottom, above),
             UiEvent::MenuAction(kind) => self.menu_action(kind),
-            UiEvent::MenuClose => self.menu_close(),
+            UiEvent::MenuClose => {
+                // ESC / 点击别处关闭：无动作派发，可直接解除 tooltip 隐藏抑制。
+                self.menu_close();
+                self.clear_tooltip_menu_flag();
+            }
             UiEvent::GlobalHotkey(action) => self.handle_global_hotkey(&action),
             UiEvent::StatusTipMoved { x, y } => self.save_status_tip_pos(x, y),
             UiEvent::RequestStatusMenu { x, y } => self.show_status_menu(x, y),
+            UiEvent::RequestTooltipMenu { x, y } => self.show_tooltip_menu(x, y),
         }
     }
 

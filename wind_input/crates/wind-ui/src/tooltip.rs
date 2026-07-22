@@ -5,17 +5,27 @@
 
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
+use std::sync::mpsc::Sender;
 
-use crate::sys::{HWND, LPARAM, LRESULT, WM_MOUSELEAVE, WM_MOUSEMOVE, WPARAM};
+use crate::manager::UiEvent;
+use crate::sys::{
+    GetCursorPos, HWND, LPARAM, LRESULT, POINT, WM_MOUSELEAVE, WM_MOUSEMOVE, WM_RBUTTONDOWN, WPARAM,
+};
 use crate::text::dwrite::TextRenderer;
 use crate::view::{Align, Edges, View, ViewImage, ViewLayer};
 use crate::window::{LayeredWindow, WindowMouse};
 
-/// 鼠标跟踪器：检测鼠标是否悬停在 tooltip 上（WM_MOUSELEAVE 触发时直接隐藏窗口）。
+/// 鼠标跟踪器：检测鼠标是否悬停在 tooltip 上（WM_MOUSELEAVE 触发时直接隐藏窗口）；
+/// 右键弹出反查菜单（复制内容/截图此窗口）。
 struct TooltipMouse {
     hwnd: HWND,
     mouse_over: Rc<Cell<bool>>,
     tracking: bool,
+    /// 回送协调器的鼠标事件通道（右键请求菜单）。
+    events: Sender<UiEvent>,
+    /// 菜单打开期间抑制 WM_MOUSELEAVE 自动隐藏：右键弹出菜单后鼠标会移到菜单窗口上，
+    /// 触发 WM_MOUSELEAVE，若不抑制 tooltip 会当场消失，菜单就指向一个已不存在的窗口。
+    suppress_hide: Rc<Cell<bool>>,
 }
 
 impl TooltipMouse {
@@ -58,12 +68,27 @@ impl WindowMouse for TooltipMouse {
             WM_MOUSELEAVE => {
                 self.mouse_over.set(false);
                 self.tracking = false;
-                // 鼠标离开时直接隐藏（对齐 Go TooltipWindow WM_MOUSELEAVE 行为）
-                #[cfg(windows)]
-                unsafe {
-                    use windows::Win32::UI::WindowsAndMessaging::{SW_HIDE, ShowWindow};
-                    let _ = ShowWindow(self.hwnd, SW_HIDE);
+                // 鼠标离开时直接隐藏（对齐 Go TooltipWindow WM_MOUSELEAVE 行为）；
+                // 菜单打开期间抑制——鼠标离开是移向菜单窗口，不是真正离开。
+                if !self.suppress_hide.get() {
+                    #[cfg(windows)]
+                    unsafe {
+                        use windows::Win32::UI::WindowsAndMessaging::{SW_HIDE, ShowWindow};
+                        let _ = ShowWindow(self.hwnd, SW_HIDE);
+                    }
                 }
+                None
+            }
+            WM_RBUTTONDOWN => {
+                self.suppress_hide.set(true);
+                let (sx, sy) = unsafe {
+                    let mut p = POINT::default();
+                    let _ = GetCursorPos(&mut p);
+                    (p.x, p.y)
+                };
+                let _ = self
+                    .events
+                    .send(UiEvent::RequestTooltipMenu { x: sx, y: sy });
                 None
             }
             _ => None,
@@ -95,19 +120,26 @@ pub struct Tooltip {
     /// 鼠标是否正悬停在 tooltip 上（由 TooltipMouse 更新）。
     /// hide() 遇到此标志时推迟隐藏，待 WM_MOUSELEAVE 自动触发后真正隐藏。
     mouse_over: Rc<Cell<bool>>,
+    /// 右键菜单是否打开中（与 TooltipMouse 共享，供 set_menu_open 写入）。
+    suppress_hide: Rc<Cell<bool>>,
+    /// 当前显示的文本内容（供右键菜单「复制内容」使用）。
+    text: String,
 }
 
 impl Tooltip {
-    pub fn new() -> Result<Self, String> {
+    pub fn new(events: Sender<UiEvent>) -> Result<Self, String> {
         let scale = dpi_scale();
         let window = LayeredWindow::create(None, 120, 40, "WindInputTooltip")?;
         let renderer = TextRenderer::new("Microsoft YaHei UI", FONT_PX * scale)?;
         let mouse_over = Rc::new(Cell::new(false));
-        // 注册鼠标跟踪：鼠标进入 tooltip 时保持可见；WM_MOUSELEAVE 触发时自动隐藏。
+        let suppress_hide = Rc::new(Cell::new(false));
+        // 注册鼠标跟踪：鼠标进入 tooltip 时保持可见；WM_MOUSELEAVE 触发时自动隐藏；右键弹出菜单。
         window.register_mouse(Rc::new(RefCell::new(TooltipMouse {
             hwnd: window.hwnd(),
             mouse_over: mouse_over.clone(),
             tracking: false,
+            events,
+            suppress_hide: suppress_hide.clone(),
         })));
         Ok(Self {
             window,
@@ -123,6 +155,8 @@ impl Tooltip {
             radius: None,
             theme: None,
             mouse_over,
+            suppress_hide,
+            text: String::new(),
         })
     }
 
@@ -250,6 +284,7 @@ impl Tooltip {
     /// 横排模式：在候选行下方显示提示，下方不足时上翻到候选行上方。
     /// `anchor_top`/`anchor_bottom` 为候选行的屏幕上/下边界。
     pub fn show(&mut self, text: &str, x: i32, anchor_top: i32, anchor_bottom: i32) {
+        self.text = text.to_string();
         if text.is_empty() {
             self.hide();
             return;
@@ -273,6 +308,7 @@ impl Tooltip {
         row_top: i32,
         row_bottom: i32,
     ) {
+        self.text = text.to_string();
         if text.is_empty() {
             self.hide();
             return;
@@ -292,6 +328,37 @@ impl Tooltip {
         if self.visible {
             self.window.hide();
             self.visible = false;
+        }
+    }
+
+    /// 当前显示（或最近一次显示）的文本内容（右键菜单「复制内容」用）。
+    pub fn text(&self) -> &str {
+        &self.text
+    }
+
+    /// 将当前渲染帧保存为 PNG 文件（截图用）。
+    pub fn capture_to_file(&self, path: &std::path::Path) -> Result<(), String> {
+        self.window.capture_to_file(path)
+    }
+
+    /// 窗口当前是否可见（查询 Win32 IsWindowVisible）。
+    pub fn is_visible(&self) -> bool {
+        #[cfg(windows)]
+        unsafe {
+            windows::Win32::UI::WindowsAndMessaging::IsWindowVisible(self.window.hwnd()).as_bool()
+        }
+        #[cfg(not(windows))]
+        {
+            false
+        }
+    }
+
+    /// 设置右键菜单打开状态：开启时抑制 WM_MOUSELEAVE 自动隐藏；关闭时若鼠标已不在
+    /// tooltip 上则立即隐藏（避免菜单关掉后 tooltip 永久赖着不走）。
+    pub fn set_menu_open(&mut self, open: bool) {
+        self.suppress_hide.set(open);
+        if !open && !self.mouse_over.get() {
+            self.hide();
         }
     }
 

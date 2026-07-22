@@ -133,6 +133,12 @@ pub enum UiCommand {
     ScreenshotCandidateToClipboard,
     /// 截图状态提示气泡到文件（状态提示右键菜单「截图此窗口」）。
     ScreenshotStatusTip { dir: std::path::PathBuf },
+    /// 复制悬停提示（编码反查气泡）文本到剪贴板（其右键菜单「复制内容」）。
+    CopyTooltipText,
+    /// 截图悬停提示到文件（其右键菜单「截图此窗口」）。
+    ScreenshotTooltip { dir: std::path::PathBuf },
+    /// 设置悬停提示右键菜单打开状态（开启时抑制其 WM_MOUSELEAVE 自动隐藏）。
+    SetTooltipMenuOpen(bool),
     /// 注册全局热键（Win32 RegisterHotKey，线程级）。覆盖式：先反注册旧列表再注册新列表，
     /// 空列表 = 仅清除已注册项。来自 keys.global_hotkeys（协调器构建，启动/配置重载时下发）。
     RegisterGlobalHotkeys(Vec<GlobalHotkeyEntry>),
@@ -257,6 +263,10 @@ pub enum MenuCmd {
     StatusResetPosition,
     /// 状态提示气泡：截图此窗口
     StatusScreenshot,
+    /// 悬停提示（编码反查气泡）：复制内容
+    TooltipCopy,
+    /// 悬停提示（编码反查气泡）：截图此窗口
+    TooltipScreenshot,
 }
 
 /// 菜单项的动作类型（右键候选菜单 + 功能主菜单共用）
@@ -309,6 +319,8 @@ impl MenuKind {
                 MenuCmd::StatusToggleAlways => 115,
                 MenuCmd::StatusResetPosition => 116,
                 MenuCmd::StatusScreenshot => 117,
+                MenuCmd::TooltipCopy => 118,
+                MenuCmd::TooltipScreenshot => 119,
                 MenuCmd::ToggleInputDiagnostics => 120,
                 MenuCmd::TogglePasswordSuppress => 121,
                 MenuCmd::SchemaSelect(i) => 1000 + i as i32,
@@ -346,6 +358,8 @@ impl MenuKind {
             115 => MenuCmd::StatusToggleAlways,
             116 => MenuCmd::StatusResetPosition,
             117 => MenuCmd::StatusScreenshot,
+            118 => MenuCmd::TooltipCopy,
+            119 => MenuCmd::TooltipScreenshot,
             120 => MenuCmd::ToggleInputDiagnostics,
             121 => MenuCmd::TogglePasswordSuppress,
             1000..=1999 => MenuCmd::SchemaSelect((id - 1000) as usize),
@@ -436,6 +450,8 @@ pub enum UiEvent {
     StatusTipMoved { x: i32, y: i32 },
     /// 右键状态提示气泡请求弹出菜单（屏幕坐标）
     RequestStatusMenu { x: i32, y: i32 },
+    /// 右键悬停提示（编码反查气泡）请求弹出菜单（屏幕坐标）
+    RequestTooltipMenu { x: i32, y: i32 },
 }
 
 /// UI 管理器（在独立线程中运行）
@@ -857,6 +873,17 @@ impl UiManager {
                                 }
                             }
                         }
+                        // 悬停提示（编码反查气泡）
+                        if candidate_window.tooltip_is_visible() {
+                            let path = dir.join(format!("tooltip_{ts}.png"));
+                            match candidate_window.tooltip_capture_to_file(&path) {
+                                Ok(_) => {
+                                    saved += 1;
+                                    info!("Screenshot saved: {:?}", path);
+                                }
+                                Err(e) => tracing::warn!("Screenshot tooltip: {}", e),
+                            }
+                        }
                         // 右键菜单
                         if let Some(pm) = &popup_menu {
                             if pm.is_visible() {
@@ -959,6 +986,51 @@ impl UiManager {
                                 std::time::Instant::now() + std::time::Duration::from_millis(3000),
                             );
                         }
+                    }
+                    UiCommand::CopyTooltipText => {
+                        let text = candidate_window.tooltip_text().to_string();
+                        let (msg, kind) = if !text.is_empty() {
+                            crate::popup_menu::set_clipboard_text(&text);
+                            ("提示内容已复制".to_string(), ToastKind::Success)
+                        } else {
+                            ("提示内容为空，无法复制".to_string(), ToastKind::Info)
+                        };
+                        if let Some(t) = &mut toast {
+                            t.show(&msg, ToastPosition::BottomRight, kind);
+                            toast_hide_at = Some(
+                                std::time::Instant::now() + std::time::Duration::from_millis(3000),
+                            );
+                        }
+                    }
+                    UiCommand::ScreenshotTooltip { dir } => {
+                        let ts = crate::screenshot::timestamp();
+                        let (msg, kind) = if candidate_window.tooltip_is_visible() {
+                            let path = dir.join(format!("tooltip_{ts}.png"));
+                            match candidate_window.tooltip_capture_to_file(&path) {
+                                Ok(_) => {
+                                    info!("Screenshot saved: {:?}", path);
+                                    (
+                                        format!("提示气泡已截图\n{}", path.display()),
+                                        ToastKind::Success,
+                                    )
+                                }
+                                Err(e) => {
+                                    tracing::warn!("Screenshot tooltip: {}", e);
+                                    (format!("截图失败：{}", e), ToastKind::Error)
+                                }
+                            }
+                        } else {
+                            ("提示气泡未显示，无法截图".to_string(), ToastKind::Info)
+                        };
+                        if let Some(t) = &mut toast {
+                            t.show(&msg, ToastPosition::BottomRight, kind);
+                            toast_hide_at = Some(
+                                std::time::Instant::now() + std::time::Duration::from_millis(3000),
+                            );
+                        }
+                    }
+                    UiCommand::SetTooltipMenuOpen(open) => {
+                        candidate_window.tooltip_set_menu_open(open);
                     }
                     UiCommand::ShowStatusTip {
                         text,
