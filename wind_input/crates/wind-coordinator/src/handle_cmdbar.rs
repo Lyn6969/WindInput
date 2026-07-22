@@ -6,9 +6,10 @@
 //! 2. [`CmdbarCtx`]：把 coordinator 运行时状态适配为 [`EvalContext`]；
 //! 3. 控制器（[`CoordIme`] / [`CoordDict`]）：把 cmdbar 动作映射到 coordinator 能力。
 //!
-//! **平台缺口**：key/clip/proc/url/search/config/setting 等服务在 Rust 平台层尚缺，
-//! 对应字段留 `None`，相关动作调用返回 ServiceUnavailable（宿主侧记 WARN 降级）；
-//! 现已接通 ime.toggle(cn-en/fullshape/s2t)、ime.schema、dict.add。
+//! **平台缺口**：search 留 `None`（经 open 默认可用），相关动作缺失时返回
+//! ServiceUnavailable（宿主侧记 WARN 降级）；已接通 ime.toggle/ime.schema/
+//! dict.add/proc/open/clip/keys/config（get/set/toggle 注册表校验 + 热重载）/
+//! wind.cli（自身 exe 跑 CLI 子命令）。
 //!
 //! **线程/锁**：动作经独立线程执行（见 `Coordinator::spawn_command`），故控制器回调
 //! 自锁的 coordinator 方法是安全的（此刻按键处理已释放 state 锁）。
@@ -19,7 +20,8 @@ use std::process::Command;
 use std::sync::{Arc, Weak};
 use tracing::warn;
 use wind_cmdbar::{
-    ClipboardService, DictService, EvalContext, ImeController, ProcessRunner, Services, UrlOpener,
+    ClipboardService, ConfigService, DictService, EvalContext, ImeController, ProcessRunner,
+    Services, UrlOpener,
 };
 
 impl Coordinator {
@@ -44,7 +46,9 @@ impl Coordinator {
         {
             svc.keys = Some(Arc::new(wind_keys::key_inject::SysKeys));
         }
-        // search/config/setting：经 open 默认可用 / 配置能力待补，留 None。
+        // 配置读写：config.get/set/toggle 接通用户配置（注册表校验 + 热重载）。
+        svc.config = Some(Arc::new(CoordConfig(weak.clone())));
+        // search：经 open 默认可用，留 None。
         let _ = self.cmdbar_services.set(svc);
     }
 
@@ -277,6 +281,75 @@ impl ProcessRunner for CoordProc {
     fn shell_ex(&self, cmdline: &str, _flags: &[String]) -> anyhow::Result<()> {
         // flags(term/pwsh)暂未区分，统一走默认 shell（待平台 shell 选择补齐）。
         shell_spawn(cmdline)
+    }
+    fn run_self(&self, args: &[String]) -> anyhow::Result<()> {
+        // wind.cli：以服务自身 exe 跑 CLI 子命令。CLI 进程经控制管道回连本服务
+        // 执行（热重载/重建等），fire-and-forget；GUI 子系统下 spawn 无控制台闪窗。
+        let exe = std::env::current_exe()?;
+        std::process::Command::new(exe).args(args).spawn()?;
+        Ok(())
+    }
+}
+
+/// 配置服务：cmdbar `config.get` / `config.set` / `config.toggle`。
+/// 写路径与 CLI `config set` 同构：注册表解析校验 → 写用户配置文件 → 热重载。
+struct CoordConfig(Weak<Coordinator>);
+
+impl CoordConfig {
+    /// 读某键当前值（三层合并后），字符串裸值、其余紧凑 JSON。
+    fn load_value(key: &str) -> anyhow::Result<String> {
+        use wind_config::config_schema::is_known_key;
+        if !is_known_key(key) {
+            anyhow::bail!("未登记的配置键: {key}");
+        }
+        let cfg = wind_config::Config::load(wind_config::Config::data_dir().as_deref())?;
+        let full = serde_json::to_value(cfg)?;
+        let mut cur = &full;
+        for part in key.split('.') {
+            cur = cur
+                .get(part)
+                .ok_or_else(|| anyhow::anyhow!("配置缺少键 {key}"))?;
+        }
+        Ok(match cur {
+            serde_json::Value::String(s) => s.clone(),
+            other => other.to_string(),
+        })
+    }
+}
+
+impl ConfigService for CoordConfig {
+    fn get(&self, key: &str) -> anyhow::Result<String> {
+        Self::load_value(key)
+    }
+
+    fn set(&self, key: &str, value: &str) -> anyhow::Result<()> {
+        use wind_config::config_schema::{parse_str_value, validate};
+        let v = parse_str_value(key, value).map_err(|e| anyhow::anyhow!("{e}"))?;
+        validate(key, &v).map_err(|e| anyhow::anyhow!("{e}"))?;
+        let parts: Vec<&str> = key.split('.').collect();
+        wind_config::Config::set_user_value(&parts, v)?;
+        if let Some(c) = self.0.upgrade() {
+            c.reload_user_config();
+        }
+        Ok(())
+    }
+
+    fn toggle(&self, key: &str) -> anyhow::Result<String> {
+        use wind_config::config_schema::{FieldType, field};
+        let fld = field(key).ok_or_else(|| anyhow::anyhow!("未登记的配置键: {key}"))?;
+        let cur = Self::load_value(key)?;
+        let next: String = match fld.ty {
+            FieldType::Bool => (cur != "true").to_string(),
+            FieldType::Enum(vals) => {
+                let pos = vals.iter().position(|v| *v == cur);
+                // 当前值不在枚举内（异常状态）时回落第一项。
+                let next_pos = pos.map(|p| (p + 1) % vals.len()).unwrap_or(0);
+                vals[next_pos].to_string()
+            }
+            _ => anyhow::bail!("config.toggle 仅支持 bool / 枚举键: {key}"),
+        };
+        self.set(key, &next)?;
+        Ok(next)
     }
 }
 

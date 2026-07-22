@@ -28,12 +28,17 @@ pub trait UrlOpener: Send + Sync {
     fn open(&self, target: &str) -> anyhow::Result<()>;
 }
 
-/// 进程启动 / shell 执行：`proc.run` / `proc.shell`。
+/// 进程启动 / shell 执行：`proc.run` / `proc.shell` / `wind.cli`。
 pub trait ProcessRunner: Send + Sync {
     fn run(&self, cmd: &str, args: &[String]) -> anyhow::Result<()>;
     fn shell(&self, cmdline: &str) -> anyhow::Result<()>;
     /// `proc.shell(cmd, "flagA,flagB")` 的扩展形式；不支持时可退化为 [`Self::shell`]。
     fn shell_ex(&self, cmdline: &str, flags: &[String]) -> anyhow::Result<()>;
+    /// 以主程序自身 exe 执行 CLI 子命令（`wind.cli`）：宿主自取 exe 路径，
+    /// 词条无需硬编码安装位置。默认未支持（测试/精简宿主）。
+    fn run_self(&self, _args: &[String]) -> anyhow::Result<()> {
+        anyhow::bail!("run_self: 宿主未支持")
+    }
 }
 
 /// 词库：`dict.add`。`code` 为空时由实现按当前方案规则推导。

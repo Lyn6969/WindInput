@@ -10,6 +10,7 @@ serde = { workspace = true }
 toml = { workspace = true }
 tracing = { workspace = true }
 anyhow = { workspace = true }
+serde_json = { workspace = true }
 thiserror = { workspace = true }
 dirs = { workspace = true }
 # startup_trace 的时间戳需与主日志/TSF 日志格式一致，故与 service 同用 chrono

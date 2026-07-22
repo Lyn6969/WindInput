@@ -8,7 +8,7 @@
 use serde_json::{Value, json};
 use wind_config::Config;
 use wind_config::config_schema::{
-    FieldType, ValidateError, field, is_known_key, leaf_entries, registry, validate,
+    FieldType, field, is_known_key, leaf_entries, parse_str_value, registry, validate,
 };
 
 // 变体后缀经 wind_config::variant::pipe_suffix() 运行时取得：CLI 与 core 同一 exe，自辨一致。
@@ -261,40 +261,9 @@ fn load_value(key: &str) -> anyhow::Result<Value> {
     Ok(cur.clone())
 }
 
-/// 按注册表类型把命令行原始字符串解析为 TOML 值。
+/// 按注册表类型把命令行原始字符串解析为 TOML 值（下沉共享实现，cmdbar 同用）。
 fn parse_value(key: &str, raw: &str) -> Result<toml::Value, String> {
-    let fld = field(key).ok_or(ValidateError::UnknownKey.to_string())?;
-    let v = match fld.ty {
-        FieldType::Bool => match raw.trim().to_ascii_lowercase().as_str() {
-            "true" | "1" | "yes" | "on" => toml::Value::Boolean(true),
-            "false" | "0" | "no" | "off" => toml::Value::Boolean(false),
-            _ => return Err(format!("'{raw}' 不是布尔值（true/false）")),
-        },
-        FieldType::Int => raw
-            .trim()
-            .parse::<i64>()
-            .map(toml::Value::Integer)
-            .map_err(|_| format!("'{raw}' 不是整数"))?,
-        FieldType::Float => raw
-            .trim()
-            .parse::<f64>()
-            .map(toml::Value::Float)
-            .map_err(|_| format!("'{raw}' 不是数字"))?,
-        FieldType::Str | FieldType::Enum(_) => toml::Value::String(raw.to_string()),
-        FieldType::StrList => toml::Value::Array(
-            raw.split(',')
-                .map(str::trim)
-                .filter(|s| !s.is_empty())
-                .map(|s| toml::Value::String(s.to_string()))
-                .collect(),
-        ),
-        FieldType::Map | FieldType::StructList => {
-            let jv: Value =
-                serde_json::from_str(raw).map_err(|e| format!("复杂值需为 JSON: {e}"))?;
-            toml::Value::try_from(jv).map_err(|e| format!("无法转为配置值: {e}"))?
-        }
-    };
-    Ok(v)
+    parse_str_value(key, raw)
 }
 
 /// 类型的可读标签。

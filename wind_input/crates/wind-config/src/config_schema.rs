@@ -285,6 +285,46 @@ pub fn is_known_key(key: &str) -> bool {
     field(key).is_some()
 }
 
+/// 把命令行/词条来源的原始字符串按注册表类型解析为 TOML 值（CLI `config set` 与
+/// cmdbar `config.set` 共用；解析不校验枚举成员与范围，交给 [`validate`]）。
+///
+/// - Bool 认 true/1/yes/on 与 false/0/no/off（大小写不敏感）
+/// - Float 拒绝 nan/inf/溢出（`Value::from(非有限 f64)` 下游会静默变 null）
+/// - StrList 按逗号拆分；Map/StructList 需 JSON 文本
+pub fn parse_str_value(key: &str, raw: &str) -> Result<toml::Value, String> {
+    let fld = field(key).ok_or(ValidateError::UnknownKey.to_string())?;
+    let v = match fld.ty {
+        FieldType::Bool => match raw.trim().to_ascii_lowercase().as_str() {
+            "true" | "1" | "yes" | "on" => toml::Value::Boolean(true),
+            "false" | "0" | "no" | "off" => toml::Value::Boolean(false),
+            _ => return Err(format!("'{raw}' 不是布尔值（true/false）")),
+        },
+        FieldType::Int => raw
+            .trim()
+            .parse::<i64>()
+            .map(toml::Value::Integer)
+            .map_err(|_| format!("'{raw}' 不是整数"))?,
+        FieldType::Float => match raw.trim().parse::<f64>() {
+            Ok(f) if f.is_finite() => toml::Value::Float(f),
+            _ => return Err(format!("'{raw}' 不是有限数字")),
+        },
+        FieldType::Str | FieldType::Enum(_) => toml::Value::String(raw.to_string()),
+        FieldType::StrList => toml::Value::Array(
+            raw.split(',')
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(|s| toml::Value::String(s.to_string()))
+                .collect(),
+        ),
+        FieldType::Map | FieldType::StructList => {
+            let jv: serde_json::Value =
+                serde_json::from_str(raw).map_err(|e| format!("复杂值需为 JSON: {e}"))?;
+            toml::Value::try_from(jv).map_err(|e| format!("无法转为配置值: {e}"))?
+        }
+    };
+    Ok(v)
+}
+
 /// 配置值校验错误（按 registry 校验 setItems / CLI 写入时用）。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ValidateError {
