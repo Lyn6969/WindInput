@@ -27,7 +27,30 @@ mod config_cli;
 mod dict_cli;
 mod log_rotate;
 mod phrase_cli;
+mod restart_cli;
 mod schema_cli;
+
+/// 顶层 CLI 总览（`wind_input help`）。主动请求的帮助走 stdout（可管道/重定向），
+/// 与 `--version` 一致；各子命令的详细用法见 `wind_input <子命令> help`。
+fn print_root_usage() {
+    println!(
+        "WindInput 输入法服务 v{}\n\
+         \n\
+         用法: wind_input [子命令]   （不带子命令 = 启动输入法服务）\n\
+         \n\
+         子命令:\n  \
+         config    配置查看/读写/导入导出（离线可用，core 在线时热重载）\n  \
+         schema    方案配置 / 分类词库开关 / 词库缓存重建（需 core 在线）\n  \
+         dict      用户词库按方案导入导出（需 core 在线）\n  \
+         phrase    用户短语导入导出 / 系统短语恢复（需 core 在线）\n  \
+         backup    整机备份创建/查看/还原（需 core 在线）\n  \
+         restart   重启输入法服务（未运行则直接启动）\n  \
+         help      显示本帮助；--version 显示版本\n\
+         \n\
+         各子命令详细用法: wind_input <子命令> help",
+        env!("WIND_APP_VERSION")
+    );
+}
 
 /// GUI 子系统（release profile，`windows_subsystem="windows"`）下进程不附着控制台，
 /// 故 CLI 子命令的 `println!` 无处可写。此函数把进程附着到**父控制台**（调用它的 cmd/PowerShell），
@@ -88,7 +111,19 @@ fn main() {
     let sub = cli_args.get(1).map(String::as_str);
     if matches!(
         sub,
-        Some("config" | "schema" | "dict" | "phrase" | "backup")
+        Some(
+            "config"
+                | "schema"
+                | "dict"
+                | "phrase"
+                | "backup"
+                | "restart"
+                | "help"
+                | "--help"
+                | "-h"
+                | "--version"
+                | "-V"
+        )
     ) {
         // GUI 子系统下附着父控制台，让输出回到调用的终端（详见 attach_parent_console）。
         #[cfg(windows)]
@@ -99,6 +134,20 @@ fn main() {
             Some("dict") => dict_cli::run(&cli_args[2..]),
             Some("phrase") => phrase_cli::run(&cli_args[2..]),
             Some("backup") => backup_cli::run(&cli_args[2..]),
+            Some("restart") => restart_cli::run(&cli_args[2..]),
+            Some("help" | "--help" | "-h") => {
+                print_root_usage();
+                0
+            }
+            Some("--version" | "-V") => {
+                println!(
+                    "wind_input {} (build {} git:{})",
+                    env!("WIND_APP_VERSION"),
+                    env!("WIND_BUILD_TIME"),
+                    env!("WIND_GIT_HASH"),
+                );
+                0
+            }
             _ => unreachable!(),
         };
         // process::exit 不会刷新缓冲，重定向/管道时可能丢尾部输出——显式 flush。
@@ -299,47 +348,57 @@ impl wind_rpc::CoreRpc for RpcCore {
 /// 以分离子进程重新启动自身（用于"重启服务"）。
 #[cfg(windows)]
 fn relaunch_self() {
-    use std::os::windows::process::CommandExt;
-    const DETACHED_PROCESS: u32 = 0x0000_0008;
-    const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
-    // 脱离父进程的 Job Object：IME/TSF 宿主进程常处于 kill-on-job-close 作业对象中，
-    // 不加此标志时父进程一退出会连带杀掉刚拉起的子进程（症状：重启只退出、新进程不存活）。
-    const CREATE_BREAKAWAY_FROM_JOB: u32 = 0x0100_0000;
-
-    let exe = match std::env::current_exe() {
-        Ok(e) => e,
-        Err(e) => {
-            error!("Failed to resolve current exe for relaunch: {}", e);
-            return;
-        }
-    };
-    let base = DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP;
-
-    // 优先带 breakaway；若作业对象不允许 breakaway（spawn 报错）则回退到不带该标志再试。
-    match std::process::Command::new(&exe)
-        .creation_flags(base | CREATE_BREAKAWAY_FROM_JOB)
-        .spawn()
-    {
-        Ok(_) => {
-            info!("Relaunched (breakaway): {}", exe.display());
-            return;
-        }
-        Err(e) => error!("Relaunch with breakaway failed ({e}); retrying without breakaway"),
-    }
-    match std::process::Command::new(&exe)
-        .creation_flags(base)
-        .spawn()
-    {
-        Ok(_) => info!("Relaunched: {}", exe.display()),
+    match spawn_detached_self() {
+        Ok(()) => info!("Relaunched service"),
         Err(e) => error!("Failed to relaunch: {}", e),
     }
 }
 
 #[cfg(not(windows))]
 fn relaunch_self() {
-    if let Ok(exe) = std::env::current_exe() {
-        let _ = std::process::Command::new(exe).spawn();
+    if let Err(e) = spawn_detached_self() {
+        error!("Failed to relaunch: {}", e);
     }
+}
+
+/// 以脱离父进程的方式拉起自身（服务启动形态）。服务重启（[`relaunch_self`]）与
+/// CLI `restart` 的离线启动共用：不脱离时子进程会继承父控制台（用户关终端窗口
+/// 广播 CTRL_CLOSE_EVENT 连带杀掉刚起的服务）与 kill-on-job-close 作业对象
+/// （IME/TSF 宿主进程常见，父进程退出即连带杀子进程——症状：重启只退出、新进程
+/// 不存活）。stdio 一律接 null：服务日志走文件，不该喷进调用方终端。
+#[cfg(windows)]
+fn spawn_detached_self() -> std::io::Result<()> {
+    use std::os::windows::process::CommandExt;
+    use std::process::Stdio;
+    const DETACHED_PROCESS: u32 = 0x0000_0008;
+    const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
+    const CREATE_BREAKAWAY_FROM_JOB: u32 = 0x0100_0000;
+
+    let exe = std::env::current_exe()?;
+    let base = DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP;
+    let try_spawn = |flags: u32| {
+        std::process::Command::new(&exe)
+            .creation_flags(flags)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .map(|_| ())
+    };
+    // 优先带 breakaway；作业对象不允许 breakaway（spawn 报错）时回退不带该标志再试。
+    try_spawn(base | CREATE_BREAKAWAY_FROM_JOB).or_else(|_| try_spawn(base))
+}
+
+#[cfg(not(windows))]
+fn spawn_detached_self() -> std::io::Result<()> {
+    use std::process::Stdio;
+    let exe = std::env::current_exe()?;
+    std::process::Command::new(exe)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .map(|_| ())
 }
 
 fn init_logger() {

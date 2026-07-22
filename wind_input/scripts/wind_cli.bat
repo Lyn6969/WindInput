@@ -12,10 +12,21 @@ if not exist "%TARGET%" (
     exit /b 127
 )
 
-if "%~1"=="config" (
-    "%TARGET%" %*
-) else (
-    "%TARGET%" config %*
+rem 无参数：显示顶层帮助（列出全部子命令）
+if "%~1"=="" (
+    "%TARGET%" help
+    exit /b %errorlevel%
 )
 
+rem 已知子命令与帮助/版本旗标：原样透传
+for %%s in (config schema dict phrase backup restart help --help -h --version -V) do (
+    if "%~1"=="%%s" goto passthrough
+)
+
+rem 其余参数：向后兼容旧用法，自动补 config 前缀（如 `wind_cli get ui.theme.name`）
+"%TARGET%" config %*
+exit /b %errorlevel%
+
+:passthrough
+"%TARGET%" %*
 exit /b %errorlevel%

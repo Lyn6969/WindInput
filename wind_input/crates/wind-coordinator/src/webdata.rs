@@ -181,6 +181,16 @@ impl Coordinator {
                 let (removed, failed) = self.engine_mgr.rebuild_all_caches();
                 Ok(json!({ "removed": removed, "failed": failed }))
             }
+            // 重启服务（CLI `wind_input restart`）：与托盘菜单同一条 request_restart
+            // 流程。延迟发信号——main 收到即释放单例并 exit，先让本条 RPC 响应写回
+            // 客户端，避免 CLI 读响应与进程退出竞争。
+            "system.restart" => {
+                std::thread::spawn(|| {
+                    std::thread::sleep(std::time::Duration::from_millis(200));
+                    crate::request_restart();
+                });
+                Ok(json!({ "ok": true }))
+            }
             "schema.delete" => self.web_schema_delete(params),
             "schema.references" => Ok(json!({})), // 引用关系（删除安全检查）：暂返空，前端宽松消费
             "scheme.exportPackage" => self.web_scheme_export_package(params),
