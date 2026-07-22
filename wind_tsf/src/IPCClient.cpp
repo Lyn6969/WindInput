@@ -1874,6 +1874,13 @@ void CIPCClient::SetActivationPushCallback(ActivationPushCallback callback)
     LeaveCriticalSection(&_asyncLock);
 }
 
+void CIPCClient::SetReplaceBackwardCallback(ReplaceBackwardCallback callback)
+{
+    EnterCriticalSection(&_asyncLock);
+    _replaceBackwardCallback = callback;
+    LeaveCriticalSection(&_asyncLock);
+}
+
 void CIPCClient::SetCommitTextCallback(CommitTextCallback callback)
 {
     EnterCriticalSection(&_asyncLock);
@@ -2427,6 +2434,34 @@ void CIPCClient::_AsyncReaderLoop()
                     if (callback && !response.text.empty())
                     {
                         callback(response.text);
+                    }
+                }
+            }
+            else if (header.command == CMD_REPLACE_BACKWARD)
+            {
+                // Replace-backward push (undo commit): delete N chars before caret
+                // then insert text. Payload layout identical to the key-response
+                // form, so _ParseResponse fills replaceCount/text for us.
+                std::vector<uint8_t> payload;
+                if (header.length > 0 && bytesRead >= sizeof(IpcHeader) + header.length)
+                {
+                    payload.assign(buffer.begin() + sizeof(IpcHeader),
+                                   buffer.begin() + sizeof(IpcHeader) + header.length);
+                }
+
+                ServiceResponse response;
+                if (_ParseResponse(header, payload, response))
+                {
+                    _LogInfo(L"Async reader: replace backward received, count=%d, textLen=%zu",
+                             response.replaceCount, response.text.length());
+
+                    EnterCriticalSection(&_asyncLock);
+                    ReplaceBackwardCallback callback = _replaceBackwardCallback;
+                    LeaveCriticalSection(&_asyncLock);
+
+                    if (callback && response.replaceCount > 0)
+                    {
+                        callback(response.replaceCount, response.text);
                     }
                 }
             }

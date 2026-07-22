@@ -28,12 +28,17 @@ pub trait UrlOpener: Send + Sync {
     fn open(&self, target: &str) -> anyhow::Result<()>;
 }
 
-/// 进程启动 / shell 执行：`proc.run` / `proc.shell`。
+/// 进程启动 / shell 执行：`proc.run` / `proc.shell` / `wind.cli`。
 pub trait ProcessRunner: Send + Sync {
     fn run(&self, cmd: &str, args: &[String]) -> anyhow::Result<()>;
     fn shell(&self, cmdline: &str) -> anyhow::Result<()>;
     /// `proc.shell(cmd, "flagA,flagB")` 的扩展形式；不支持时可退化为 [`Self::shell`]。
     fn shell_ex(&self, cmdline: &str, flags: &[String]) -> anyhow::Result<()>;
+    /// 以主程序自身 exe 执行 CLI 子命令（`wind.cli`）：宿主自取 exe 路径，
+    /// 词条无需硬编码安装位置。默认未支持（测试/精简宿主）。
+    fn run_self(&self, _args: &[String]) -> anyhow::Result<()> {
+        anyhow::bail!("run_self: 宿主未支持")
+    }
 }
 
 /// 词库：`dict.add`。`code` 为空时由实现按当前方案规则推导。
@@ -52,6 +57,11 @@ pub trait ImeController: Send + Sync {
     fn set_schema(&self, id: &str) -> anyhow::Result<()>;
     /// 循环切换主题；dir="next"/"" 向后，"prev" 向前，返回新主题 ID。
     fn theme_cycle(&self, dir: &str) -> anyhow::Result<String>;
+    /// 撤销最近一次上屏（`ime.undo_commit`）：按上屏历史删除对应字符数，
+    /// 无历史时删 1 个。默认未支持（测试/精简宿主）。
+    fn undo_commit(&self) -> anyhow::Result<()> {
+        anyhow::bail!("undo_commit: 宿主未支持")
+    }
 }
 
 /// 配置读写：`config.get` / `config.set` / `config.toggle`，key 为 YAML 路径。

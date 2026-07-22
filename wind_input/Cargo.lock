@@ -2391,6 +2391,7 @@ dependencies = [
  "chrono",
  "dirs",
  "serde",
+ "serde_json",
  "thiserror",
  "toml 0.8.23",
  "tracing",

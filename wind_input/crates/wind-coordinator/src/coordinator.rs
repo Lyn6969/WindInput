@@ -2059,6 +2059,58 @@ impl Coordinator {
 
     /// cmdbar 能力 wrapper（被 handle_cmdbar 控制器经 Weak 回调）。各方法自锁，**禁止**在持
     /// state 锁时调用（spawn_command 已确保在独立线程、未持锁时执行）。
+    /// 撤销最近一次上屏（cmdbar `ime.undo_commit`）：取上屏历史队首的字符数 N，
+    /// 推 ReplaceBackward(N, "") 给活跃客户端（复用智能标点删除替换通道及其全部
+    /// 宿主兼容修复），并把该条弹出历史——连续触发即逐条回退。无历史时删 1 个。
+    ///
+    /// 队首同时供 cmdbar `last()` 与加词还原池消费：弹出即三处语义一致
+    /// （这个词已不在屏幕上）。v1 不校验光标前内容（上屏后用户在输入法之外
+    /// 移过光标/改过文本时会误删，责任在主动触发方）；v2 预留 prevChar 比对。
+    pub(crate) fn cmd_undo_commit(&self) {
+        // 正在打字（缓冲非空）时不动作：ReplaceBackward 作用于已上屏文本，
+        // 与组合态并存会把删除落进组合窗前的位置，语义混乱。
+        {
+            let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+            if !state.input_buffer.is_empty() {
+                debug!("undo_commit: 输入缓冲非空，忽略");
+                return;
+            }
+        }
+        // 弹出队首求字符数；推送「肯定失败」（无客户端/通道断）时回滚，避免
+        // 一次 no-op 污染 last()/加词还原池的历史。不持锁跨管道 IO（防按键线程
+        // 读 last() 被阻塞），故失败回滚存在与新上屏交错的理论窗口——推送失败
+        // 本身已是边缘态，接受。
+        let popped = {
+            let mut h = self
+                .recent_commits
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            h.pop_front()
+        };
+        // 计数量纲取 UTF-16 code unit：TSF ShiftStart 与 macOS NSRange 都按它计，
+        // 主路径（TSF 原子范围替换）两端皆准，含 emoji 词条不再少删。已知限制：
+        // SendInput 退格兜底宿主按「一次退格删一整字」处理时，emoji 会多删——
+        // 兜底宿主 × emoji 双重边缘，留待后续按宿主特判。
+        let count = popped
+            .as_ref()
+            .map(|t| t.encode_utf16().count() as u32)
+            .unwrap_or(1);
+        if count == 0 {
+            return;
+        }
+        debug!("undo_commit: 删除 {} 个 UTF-16 单元", count);
+        let encoded = wind_ipc::codec::encode_replace_backward(count, "");
+        if !self.push_server.push_commit_to_active(&encoded)
+            && let Some(t) = popped
+        {
+            let mut h = self
+                .recent_commits
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            h.push_front(t);
+        }
+    }
+
     pub(crate) fn cmd_ime_toggle(&self, target: &str) {
         match target {
             "cn-en" => {

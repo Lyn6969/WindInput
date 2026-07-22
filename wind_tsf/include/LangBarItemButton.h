@@ -74,6 +74,10 @@ public:
     // This ensures EndComposition is called before InsertText on the correct thread
     void PostCommitText(const std::wstring& text);
 
+    // Thread-safe replace-backward from async thread (undo commit push):
+    // delete `count` chars before caret then insert text on the UI thread
+    void PostReplaceBackward(int count, const std::wstring& text);
+
     // Thread-safe clear composition from async thread (posts message to UI thread)
     // Used when mode is toggled via menu while there's an active composition
     void PostClearComposition();
@@ -118,6 +122,7 @@ private:
     static const UINT WM_UPDATE_COMPOSITION;
     static const UINT WM_SERVICE_READY;
     static const UINT WM_ACTIVATION_STATUS;
+    static const UINT WM_REPLACE_BACKWARD;
 
     // Packed status for message passing
     struct StatusUpdateData {
@@ -131,6 +136,12 @@ private:
 
     // Data for commit text message
     struct CommitTextData {
+        std::wstring text;
+    };
+
+    // Data for replace-backward message (undo commit)
+    struct ReplaceBackwardData {
+        int count;
         std::wstring text;
     };
 

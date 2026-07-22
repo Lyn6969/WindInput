@@ -23,6 +23,7 @@ pub fn specs() -> Vec<FuncSpec> {
         "clip.copy"  : Clip   (1, 1)  effect => fn_clip_copy,   "把文本写入系统剪贴板", "clip.copy(last())";
         "clip.paste" : Clip   (0, 0)  effect => fn_clip_paste,  "模拟 Ctrl+V 粘贴剪贴板内容", "clip.paste()";
         "web.search" : Web    (2, 2)  effect => fn_search,      "用搜索引擎搜索 (engine ∈ baidu/bing/google/zdic)", "web.search(\"baidu\", last())";
+        "wind.cli"   : Proc   (1, -1) effect => fn_wind_cli,    "以主程序 CLI 执行子命令 (单参按空白拆分; 多参逐个原样传递)", "wind.cli(\"schema dict disable wubi86 fl\")";
         "ask"        : Action (1, 1)  effect => fn_unimpl,      "弹小输入框, 阻塞返回用户输入 (未实现)", "ask(\"提示\")";
         "pick"       : Action (1, -1) effect => fn_unimpl,      "弹下拉列表选择 (未实现)", "pick(\"a\", \"b\")";
     }
@@ -46,6 +47,28 @@ fn fn_run(ctx: &dyn EvalContext, args: &[String]) -> Result<String> {
         .ok_or_else(|| CmdbarError::service("proc.run"))?;
     proc.run(&args[0], &args[1..])
         .map_err(|e| runtime_err("proc.run", e))?;
+    Ok(String::new())
+}
+
+/// `wind.cli`：以主程序自身 exe 跑 CLI 子命令。单参形式按空白拆分
+/// （`wind.cli("config set ui.theme.name dark")`）；多参形式逐个原样传递，
+/// 供含空格的参数（如文件路径）精确传参（`wind.cli("backup", "create", path)`）。
+fn fn_wind_cli(ctx: &dyn EvalContext, args: &[String]) -> Result<String> {
+    let s = services("wind.cli", ctx)?;
+    let proc = s
+        .proc
+        .as_ref()
+        .ok_or_else(|| CmdbarError::service("wind.cli"))?;
+    let argv: Vec<String> = if args.len() == 1 {
+        args[0].split_whitespace().map(String::from).collect()
+    } else {
+        args.to_vec()
+    };
+    if argv.is_empty() {
+        return Err(runtime_err("wind.cli", anyhow::anyhow!("子命令为空")));
+    }
+    proc.run_self(&argv)
+        .map_err(|e| runtime_err("wind.cli", e))?;
     Ok(String::new())
 }
 
@@ -250,6 +273,51 @@ mod tests {
         assert_eq!(log[0], "run:notepad.exe:a.txt");
         assert_eq!(log[1], "shell:echo hi");
         assert_eq!(log[2], "shellex:echo hi:term|pwsh");
+    }
+
+    #[test]
+    fn wind_cli_splits_single_arg_and_passes_multi_verbatim() {
+        use crate::services::ProcessRunner;
+
+        #[derive(Default)]
+        struct RecSelf(Mutex<Vec<Vec<String>>>);
+        impl ProcessRunner for RecSelf {
+            fn run(&self, _cmd: &str, _args: &[String]) -> anyhow::Result<()> {
+                unreachable!()
+            }
+            fn shell(&self, _cmdline: &str) -> anyhow::Result<()> {
+                unreachable!()
+            }
+            fn shell_ex(&self, _cmdline: &str, _flags: &[String]) -> anyhow::Result<()> {
+                unreachable!()
+            }
+            fn run_self(&self, args: &[String]) -> anyhow::Result<()> {
+                self.0.lock().unwrap().push(args.to_vec());
+                Ok(())
+            }
+        }
+
+        let rec = Arc::new(RecSelf::default());
+        let mut svc = Services::new();
+        svc.proc = Some(rec.clone());
+        let ctx = MemoryContext::new().with_services(svc);
+        // 单参：按空白拆分
+        fn_wind_cli(&ctx, &["schema dict disable wubi86 fl".into()]).unwrap();
+        // 多参：原样传递（路径含空格不被拆散）
+        fn_wind_cli(
+            &ctx,
+            &[
+                "backup".into(),
+                "create".into(),
+                "D:/我的 备份/a.zip".into(),
+            ],
+        )
+        .unwrap();
+        // 空白单参：报错
+        assert!(fn_wind_cli(&ctx, &["   ".into()]).is_err());
+        let log = rec.0.lock().unwrap();
+        assert_eq!(log[0], vec!["schema", "dict", "disable", "wubi86", "fl"]);
+        assert_eq!(log[1], vec!["backup", "create", "D:/我的 备份/a.zip"]);
     }
 
     #[test]

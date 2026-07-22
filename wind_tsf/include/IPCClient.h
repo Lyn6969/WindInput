@@ -235,6 +235,10 @@ public:
     // Callback type for clear composition from Go (mode toggle via menu)
     using ClearCompositionCallback = std::function<void()>;
 
+    // Callback type for replace-backward push from service (undo commit):
+    // delete `count` chars before caret, then insert text (may be empty).
+    using ReplaceBackwardCallback = std::function<void(int, const std::wstring&)>;
+
     // Callback type for update composition from Go (mouse click partial confirm)
     using UpdateCompositionCallback = std::function<void(const std::wstring& text, int caretPos)>;
 
@@ -266,6 +270,9 @@ public:
 
     // Set callback for receiving clear composition from Go (mode toggle via menu)
     void SetClearCompositionCallback(ClearCompositionCallback callback);
+
+    // Set callback for receiving replace-backward push from service (undo commit)
+    void SetReplaceBackwardCallback(ReplaceBackwardCallback callback);
 
     // Set callback for receiving update composition from Go (mouse click partial confirm)
     void SetUpdateCompositionCallback(UpdateCompositionCallback callback);
@@ -382,6 +389,7 @@ private:
     ActivationPushCallback _activationPushCallback;
     CommitTextCallback _commitTextCallback;
     ClearCompositionCallback _clearCompositionCallback;
+    ReplaceBackwardCallback _replaceBackwardCallback;
     UpdateCompositionCallback _updateCompositionCallback;
     SyncConfigCallback _syncConfigCallback;
     ServiceReadyCallback _serviceReadyCallback;
