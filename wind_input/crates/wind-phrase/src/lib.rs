@@ -14,7 +14,7 @@
 use chrono::{DateTime, Datelike, Local, Timelike};
 use std::collections::HashMap;
 use std::path::Path;
-use tracing::warn;
+use tracing::{debug, warn};
 use wind_cmdbar::{
     Phrase, PhraseEval, Services, default_registry, evaluate, evaluate_phrase, is_cmdbar_grammar,
     parse,
@@ -284,7 +284,15 @@ impl PhraseLayer {
                             }
                         }
                     }
-                    Err(err) => warn!("cmdbar phrase eval failed ({:?}): {}", e.text, err),
+                    // 隐私红线（docs/logging-convention.md）：warn 不得含词条明文，源文降到 debug。
+                    Err(err) => {
+                        warn!(
+                            "cmdbar phrase eval failed (chars={}): {}",
+                            e.text.chars().count(),
+                            err
+                        );
+                        debug!("cmdbar phrase eval failed text={:?}", e.text);
+                    }
                 }
             } else if let Some(text) = expand_template(&e.text, &now) {
                 out.push(PhraseHit::plain(text, e.weight).with_source(&e.text));
@@ -504,7 +512,13 @@ pub fn expand_dict_value(
                 }
             }
             Err(err) => {
-                warn!("cmdbar 词库候选求值失败 ({:?}): {}", text, err);
+                // 隐私红线（docs/logging-convention.md）：warn 不得含词条明文，源文降到 debug。
+                warn!(
+                    "cmdbar 词库候选求值失败 (chars={}): {}",
+                    text.chars().count(),
+                    err
+                );
+                debug!("cmdbar 词库候选求值失败 text={:?}", text);
                 DictExpansion::None
             }
         }

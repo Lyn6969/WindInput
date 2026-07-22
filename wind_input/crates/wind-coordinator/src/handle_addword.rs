@@ -513,7 +513,12 @@ impl Coordinator {
         let code = state.add_word_code.clone();
         let boundary = state.add_word_boundary;
         if code.is_empty() {
-            warn!("addword: 无法计算编码，放弃加词 word={}", word);
+            // 隐私红线（docs/logging-convention.md）：warn 不得含用户输入明文，词本身降到 debug。
+            warn!(
+                "addword: 无法计算编码，放弃加词 chars={}",
+                word.chars().count()
+            );
+            debug!("addword: 无法计算编码，放弃加词 word={}", word);
             self.exit_add_word_mode(state);
             return KeyAction::ClearComposition;
         }
@@ -524,7 +529,12 @@ impl Coordinator {
                 .engine_mgr
                 .write_data_schema_id(&active, CandidateSource::CodeTable)
             else {
-                warn!("addword: 混输方案主码表缺失，跳过加词 word={}", word);
+                warn!(
+                    "addword: 混输方案主码表缺失，跳过加词 schema={} chars={}",
+                    active,
+                    word.chars().count()
+                );
+                debug!("addword: 混输方案主码表缺失，跳过加词 word={}", word);
                 self.exit_add_word_mode(state);
                 return KeyAction::ClearComposition;
             };
