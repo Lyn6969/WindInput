@@ -22,6 +22,9 @@
 #   m4 / dm4     仅 wind_portable (../wind-portable)            release / dev (不存在则跳过)
 #   8            生成安装包 (= 1 + 打包 → Setup.exe + sha256)
 #   8s           跳过编译，直接打包现有 build/
+#   9            生成便携包 (= 1 + 打 zip → dist/WindInput-Portable-<版本>.zip + sha256)
+#                (免安装；不依赖 wind-installer；内含便携标记，不含 userdata/)
+#   9s           跳过编译，直接打包现有 build/
 #   p1 / pd1     push 全部 build[_dev]/ → Windows 安装目录 (release / dev)
 #   pm1/pm2      push 单模块 (tsf/核心, release)
 #   pdm1/pdm2    push 单模块 (dev)

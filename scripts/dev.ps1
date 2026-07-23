@@ -29,6 +29,9 @@
 #   ub1/ub / ubd1/ubd  便携卸载 (release / dev): 停进程 + 删程序文件 (userdata\ 保留)
 #   8  / d8      生成安装包 (release / dev): 全构建 + wind-installer 打包 → dist\*-Setup.exe
 #   8s / d8s     生成安装包 (跳过重建, 直接打包现有 build[_dev]/)
+#   9  / d9      生成便携包 (release / dev): 全构建 + 打 zip → dist\*-Portable-<版本>.zip
+#                (免安装; 不依赖 wind-installer; 内含便携标记, 不含 userdata\)
+#   9s / d9s     生成便携包 (跳过重建, 直接打包现有 build[_dev]/)
 #   k=check  l=clippy  t=test  f=fmt  fmt-check  ci(=fmt+clippy+test)  clean
 #   gd=gen-data  r=repl
 #
@@ -1219,6 +1222,60 @@ function New-UpdateManifest ([string]$profile, [string]$setupPath) {
 # 生成安装包: (除非 skip) 全构建当前变体 → 生成 app.toml → 调 wind-installer\scripts\pack.ps1。
 #   pack.ps1 负责: 原生编译 stub/uninstaller/packer → 注入 uninstall.exe 到 source → wind-packer build。
 # 打包是纯文件 IO + cargo 构建, 不需管理员 (故未纳入 UAC 提权命令)。
+# 便携版压缩包: build[_dev]\ → dist\WindInput[Dev]-Portable-<版本>.zip (+ .sha256)
+# 与 dev.sh 的 9/portable-zip 同口径 (同名、同结构), 两边产物可互换。
+# 内容依据 Deploy-Portable (便携部署的权威定义): 程序文件 + data\ + 便携标记。
+# 【不含 userdata\】—— 那是便携版的用户数据目录 (配置/词频/用户词库), 打进包等于把
+# 打包机的个人数据分发给所有人; 同时排除部署残留的 *.old*。
+function Do-PortableZip ([string]$profile = "release", [bool]$skipBuild = $false) {
+    $outdir = Out-For $profile
+    $suffix = if ($profile -eq "dev") { "_dev" } else { "" }
+    if (-not $skipBuild) {
+        if (-not (Do-Full $profile)) { return $false }
+    } elseif (-not (Test-Path "$outdir\wind_input$suffix.exe")) {
+        ErrMsg "无 $outdir 产物; 去掉 skip 先全构建, 或运行 '$(if($profile -eq 'dev'){'d1'}else{'1'})'。"
+        return $false
+    }
+
+    $base  = if ($profile -eq "dev") { "WindInputDev" } else { "WindInput" }
+    $name  = "$base-$Version"                       # zip 内顶层目录, 避免解压散落
+    $zip   = Join-Path $DistDir "$base-Portable-$Version.zip"
+    $stage = Join-Path $DistDir ".portable-stage"
+
+    Say "`n========== 打包便携版 ($profile) → $zip =========="
+    if (Test-Path $stage) { Remove-Item $stage -Recurse -Force }
+    New-Item -ItemType Directory -Path "$stage\$name" -Force | Out-Null
+    Copy-Item "$outdir\*" -Destination "$stage\$name" -Recurse -Force
+
+    $ud = Join-Path "$stage\$name" $PortableDataDir
+    if (Test-Path $ud) { Remove-Item $ud -Recurse -Force }   # 用户数据, 绝不入包
+    Get-ChildItem "$stage\$name\*.old*" -ErrorAction SilentlyContinue | Remove-Item -Force
+
+    # 便携标记: 复用 Write-PortableMarker, 与 wind-portable 的 ensure_portable_layout 同内容。
+    # 缺了它 wind_input.exe 会退化成安装版行为把用户数据写进 %APPDATA%。
+    Write-PortableMarker "$stage\$name"
+
+    $hasLauncher = Test-Path "$stage\$name\wind_portable.exe"
+    if (Test-Path $zip) { Remove-Item $zip -Force }
+    Compress-Archive -Path "$stage\$name" -DestinationPath $zip -CompressionLevel Optimal
+
+    # sha256 sidecar (标准 sha256sum 格式, 与安装包 sidecar 一致)
+    $sha = (Get-FileHash -Path $zip -Algorithm SHA256).Hash.ToLower()
+    [System.IO.File]::WriteAllText("$zip.sha256", "$sha  $(Split-Path $zip -Leaf)`n",
+        (New-Object System.Text.UTF8Encoding($false)))
+
+    Remove-Item $stage -Recurse -Force
+    $sz = [math]::Round((Get-Item $zip).Length / 1MB, 1)
+    Say "`n便携版打包完成: $zip (${sz}MB)"
+    if ($hasLauncher) {
+        Gray "使用: 解压后运行 wind_portable.exe (注册组件并拉起服务)"
+    } else {
+        Gray "使用: 包内无便携启动器 —— 需管理员 regsvr32 注册 wind_tsf.dll"
+        Gray "      (x86 版用 %SystemRoot%\SysWOW64\regsvr32.exe), 再手动运行 wind_input.exe"
+    }
+    return $true
+}
+
 function Do-Installer ([string]$profile = "release", [bool]$skipBuild = $false) {
     # 1. 定位 wind-installer 兄弟项目
     $instDir = $InstallerDir
@@ -1320,6 +1377,10 @@ function Show-Menu {
     Write-Host "    8    生成安装包 (release)       d8    生成安装包 (dev)"
     Write-Host "    8s   跳过重建直接打包 (release)  d8s   跳过重建直接打包 (dev)"
     Write-Host "      输出 → $DistDir" -ForegroundColor DarkGray
+    Write-Host "`n  便携包 (免安装 zip, 不依赖 wind-installer):" -ForegroundColor Yellow
+    Write-Host "    9    生成便携包 (release)       d9    生成便携包 (dev)"
+    Write-Host "    9s   跳过重建直接打包 (release)  d9s   跳过重建直接打包 (dev)"
+    Write-Host "      输出 → $DistDir\WindInput[Dev]-Portable-$Version.zip" -ForegroundColor DarkGray
     Write-Host "`n  代码质量:" -ForegroundColor Yellow
     Write-Host "    k=check  l=clippy  t=test  f=fmt  ci=fmt+clippy+test"
     Write-Host "`n  数据 / 实测:" -ForegroundColor Yellow
@@ -1376,6 +1437,10 @@ function Dispatch ([string]$cmd, [string]$arg) {
         "8s"                                 { if (Do-Installer release $true)  { 0 } else { 1 }; break }
         { $_ -in @("d8", "installer-dev") }  { if (Do-Installer dev $false)   { 0 } else { 1 }; break }
         "d8s"                                { if (Do-Installer dev $true)     { 0 } else { 1 }; break }
+        { $_ -in @("9", "portable-zip") }    { if (Do-PortableZip release $false) { 0 } else { 1 }; break }
+        "9s"                                 { if (Do-PortableZip release $true)  { 0 } else { 1 }; break }
+        { $_ -in @("d9", "portable-zip-dev") } { if (Do-PortableZip dev $false) { 0 } else { 1 }; break }
+        "d9s"                                { if (Do-PortableZip dev $true)   { 0 } else { 1 }; break }
         { $_ -in @("k", "check") }   { Do-Check;  $LASTEXITCODE; break }
         { $_ -in @("l", "clippy") }  { Do-Clippy; $LASTEXITCODE; break }
         { $_ -in @("t", "test") }    { Do-Test;   $LASTEXITCODE; break }
