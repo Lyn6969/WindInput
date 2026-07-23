@@ -1009,13 +1009,18 @@ impl CandidateWindow {
     /// 落盘的 custom_x/y 记的是内容左上（用户视觉上看到的窗口边缘），而 Win32 定位用的是
     /// 窗口左上。本函数与 `window_to_content` 必须严格互逆，否则每轮
     /// 「拖动 → 落盘 → 重新显示」都会多减一次阴影，候选窗逐次向左上漂移。
-    #[cfg(windows)]
+    ///
+    /// 纯算术、无平台依赖，故【不加 cfg 门控】：调用方 `content_origin` 是未门控的 pub fn，
+    /// 若把本对函数限定为 windows-only，非 Windows 目标就会 E0599 找不到函数——这类不对称
+    /// 在 Windows 本地开发时永远显现不出来，只有 CI 的 macOS 目标才炸。
+    /// 非 Windows 下 `place_fixed`（windows-only）不参与编译，本函数暂无调用者，故显式
+    /// allow(dead_code)：它与 `window_to_content` 共用互逆契约和 round-trip 测试，必须成对存在。
+    #[cfg_attr(not(windows), allow(dead_code))]
     fn content_to_window(content: (i32, i32), ml: u32, mt: u32) -> (i32, i32) {
         (content.0 - ml as i32, content.1 - mt as i32)
     }
 
     /// **窗口**左上 → **内容**左上（加回软阴影扩边）。`content_to_window` 的逆。
-    #[cfg(windows)]
     fn window_to_content(window: (i32, i32), ml: i32, mt: i32) -> (i32, i32) {
         (window.0 + ml, window.1 + mt)
     }
