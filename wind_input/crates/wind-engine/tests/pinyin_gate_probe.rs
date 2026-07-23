@@ -63,30 +63,33 @@ fn gate_fixed_point_probe() {
     );
 
     let groups: [(&str, &[&str]); 3] = [
-        ("原始诉求 + 常规整句", &[
-            "lianzhengtixing",
-            "nihao",
-            "woshizhongguoren",
-            "jintiantianqizhenhao",
-            "zhonghuarenmingongheguo",
-        ]),
-        ("Phase 3/4 已守卫的定点", &[
-            "xianjiaotongdaxue",
-            "qietubiao",
-            "guotian",
-            "hualong",
-            "lianfenxi",
-        ]),
+        (
+            "原始诉求 + 常规整句",
+            &[
+                "lianzhengtixing",
+                "nihao",
+                "woshizhongguoren",
+                "jintiantianqizhenhao",
+                "zhonghuarenmingongheguo",
+            ],
+        ),
+        (
+            "Phase 3/4 已守卫的定点",
+            &[
+                "xianjiaotongdaxue",
+                "qietubiao",
+                "guotian",
+                "hualong",
+                "lianfenxi",
+            ],
+        ),
         // 自选：整串输入**本身即词典整词**，但整句合成未必更差 —— 闸门在这些输入上
         // 会直接掐掉整句，是探测负面影响的靶子。
         // gonghe 取自 `mod.rs` step 1.5 注释里点名的例子（恭贺/共贺）。
-        ("自选：精确整词 vs 整句", &[
-            "gonghe",
-            "yijian",
-            "qishi",
-            "yigeren",
-            "sanbaiwushi",
-        ]),
+        (
+            "自选：精确整词 vs 整句",
+            &["gonghe", "yijian", "qishi", "yigeren", "sanbaiwushi"],
+        ),
     ];
 
     for (label, inputs) in groups {
@@ -103,7 +106,10 @@ fn gate_fixed_point_probe() {
             let sent_desc = match sent {
                 Some(r) => format!(
                     "整句={} rank={} 句={} 降级={}",
-                    cands[r].text, r, cands[r].is_sentence as u8, cands[r].is_sentence_demoted as u8
+                    cands[r].text,
+                    r,
+                    cands[r].is_sentence as u8,
+                    cands[r].is_sentence_demoted as u8
                 ),
                 None => "整句=无".to_string(),
             };
@@ -164,15 +170,22 @@ fn gate_sentence_composition_probe() {
         let (Some(text), Some(code)) = (it.next(), it.next()) else {
             continue;
         };
-        let w = it.next().and_then(|w| w.trim().parse::<u64>().ok()).unwrap_or(0);
+        let w = it
+            .next()
+            .and_then(|w| w.trim().parse::<u64>().ok())
+            .unwrap_or(0);
         let chars: Vec<char> = text.chars().collect();
         let syls: Vec<&str> = code.split_whitespace().collect();
         // 只取 2 字 2 音节的常用词做拼接素材：形态统一，且拼接结果稳定为 4 字 4 音节。
         if chars.len() == 2
             && syls.len() == 2
             && w >= 500
-            && chars.iter().all(|&c| ('\u{4E00}'..='\u{9FFF}').contains(&c))
-            && syls.iter().all(|s| s.bytes().all(|b| b.is_ascii_lowercase()))
+            && chars
+                .iter()
+                .all(|&c| ('\u{4E00}'..='\u{9FFF}').contains(&c))
+            && syls
+                .iter()
+                .all(|s| s.bytes().all(|b| b.is_ascii_lowercase()))
         {
             words.push((text.to_string(), syls.concat(), w));
         }
@@ -250,7 +263,13 @@ fn gate_sentence_composition_probe() {
             ));
         }
     }
-    let pct = |h: usize| if total == 0 { 0.0 } else { h as f64 / total as f64 * 100.0 };
+    let pct = |h: usize| {
+        if total == 0 {
+            0.0
+        } else {
+            h as f64 / total as f64 * 100.0
+        }
+    };
     println!(
         "样本 {}   top-1 {:.2}%   top-5 {:.2}%   MRR {:.4}",
         total,

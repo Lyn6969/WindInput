@@ -289,14 +289,11 @@ mod tests {
     /// 降级整句失去锚定后，词频学习对它生效（未降级的整句则恒锚定，见上一条）。
     #[test]
     fn pinyin_demoted_sentence_participates_in_freq() {
-        let mut cands = vec![
-            pin("精确整词", 100_000),
-            {
-                let mut c = pin_sentence("降级整句", 99_999);
-                c.is_sentence_demoted = true;
-                c
-            },
-        ];
+        let mut cands = vec![pin("精确整词", 100_000), {
+            let mut c = pin_sentence("降级整句", 99_999);
+            c.is_sentence_demoted = true;
+            c
+        }];
         let r = recs(&[("降级整句", 20, NOW)]);
         rerank_pinyin_decay(&mut cands, &r, NOW, FreqProfile::default());
         assert_eq!(

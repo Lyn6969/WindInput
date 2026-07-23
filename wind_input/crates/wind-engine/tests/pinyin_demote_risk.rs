@@ -105,7 +105,8 @@ fn demote_risk_zone_probe() {
         "ext.dict.yaml",
         "others.dict.yaml",
     ] {
-        let Ok(raw) = std::fs::read_to_string(dir.join("schemas/pinyin/cn_dicts").join(file)) else {
+        let Ok(raw) = std::fs::read_to_string(dir.join("schemas/pinyin/cn_dicts").join(file))
+        else {
             continue;
         };
         let mut in_data = false;
@@ -135,7 +136,10 @@ fn demote_risk_zone_probe() {
             if !chars.iter().copied().all(is_cjk) {
                 continue;
             }
-            if !syls.iter().all(|s| s.bytes().all(|b| b.is_ascii_lowercase())) {
+            if !syls
+                .iter()
+                .all(|s| s.bytes().all(|b| b.is_ascii_lowercase()))
+            {
                 continue;
             }
             all.push(Entry {
@@ -194,7 +198,9 @@ fn demote_risk_zone_probe() {
     let mgr = EngineManager::new(&cfg, Some(&dir));
 
     println!("=== 风险区探针 (seed={seed}, N={n}) ===");
-    println!("样本判据：input = u.code ++ v.code（2~3 音节），且 input 本身也是某词条 X 的完整编码，X.text != u.text ++ v.text");
+    println!(
+        "样本判据：input = u.code ++ v.code（2~3 音节），且 input 本身也是某词条 X 的完整编码，X.text != u.text ++ v.text"
+    );
 
     let (mut total, mut tries) = (0usize, 0usize);
     // 拼接整句 u+v 一侧
@@ -259,9 +265,10 @@ fn demote_risk_zone_probe() {
                     sent_is_composition += 1;
                 }
                 // 整句之前只允许是精确整词（码 == 输入且不在下层）
-                if let Some(bad) = cands[..r].iter().find(|c| {
-                    !(c.code == input && !c.is_fuzzy && !c.is_prefix && !c.is_partial)
-                }) {
+                if let Some(bad) = cands[..r]
+                    .iter()
+                    .find(|c| !(c.code == input && !c.is_fuzzy && !c.is_prefix && !c.is_partial))
+                {
                     invariant_violations += 1;
                     if violation_samples.len() < 10 {
                         violation_samples.push(format!(
@@ -316,7 +323,15 @@ fn demote_risk_zone_probe() {
         x_mrr / total as f64
     );
     println!("\n整句候选（is_sentence）名次分布：");
-    let labels = ["rank 0", "rank 1", "rank 2", "rank 3", "rank 4", "rank>=5", "无整句"];
+    let labels = [
+        "rank 0",
+        "rank 1",
+        "rank 2",
+        "rank 3",
+        "rank 4",
+        "rank>=5",
+        "无整句",
+    ];
     for (i, l) in labels.iter().enumerate() {
         println!(
             "  {:<8} {:>6} 条  ({:.2}%)",

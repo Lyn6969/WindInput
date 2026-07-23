@@ -91,9 +91,7 @@ fn user_high_weight_merges_into_existing_system_word() {
     let with_user = manager(&dir, "high_user", &[(INPUT, WORD, USER_W)]);
     let (rank_after, w_after) = find(&with_user, INPUT, WORD).expect("合并后仍应在候选中");
 
-    println!(
-        "[高权重] 「{WORD}」 rank {rank_before}→{rank_after}  weight {w_before}→{w_after}"
-    );
+    println!("[高权重] 「{WORD}」 rank {rank_before}→{rank_after}  weight {w_before}→{w_after}");
     assert_eq!(w_after, USER_W, "同文合并应取 max(系统, 用户) = 用户值");
     assert!(
         rank_after < rank_before,
@@ -117,9 +115,7 @@ fn user_low_weight_does_not_demote_system_word() {
     let with_user = manager(&dir, "low_user", &[(INPUT, WORD, 1)]);
     let (rank_after, w_after) = find(&with_user, INPUT, WORD).expect("合并后仍应在候选中");
 
-    println!(
-        "[低权重] 「{WORD}」 rank {rank_before}→{rank_after}  weight {w_before}→{w_after}"
-    );
+    println!("[低权重] 「{WORD}」 rank {rank_before}→{rank_after}  weight {w_before}→{w_after}");
     assert_eq!(w_after, w_before, "用户权重更低时应保留系统值");
     assert_eq!(rank_after, rank_before, "名次不应变化");
 }

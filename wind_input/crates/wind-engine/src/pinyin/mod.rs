@@ -66,7 +66,6 @@ const COMPLETION_NEAR_SYLLABLES: u32 = 2;
 /// 一半的词低于它，会误沉大量高频使用但低词频的日常词。
 const COMPLETION_FAR_WEIGHT_FLOOR: i32 = 100;
 
-
 /// 拼音引擎配置
 #[derive(Debug, Clone)]
 pub struct Config {
@@ -770,7 +769,6 @@ impl Engine for PinyinEngine {
                 c.is_sentence = true;
             }
         }
-
 
         // Viterbi **新合成**的整句文本（词典里没有这个词，只能由多个节点拼出来）。
         // 与词典整词同文而被合并的那一支不记入——它本身就是精确整词，不存在「让位」问题。
@@ -2290,7 +2288,12 @@ mod tests {
         raw.merge_single("hao".to_string(), "好".to_string(), 100_000, 1);
         raw.merge_single("nihao".to_string(), "拟好".to_string(), 5000, 2);
         // 前缀补全（码比输入长）：权重顶到 2e9，仍应留在整句之后
-        raw.merge_single("nihaoma".to_string(), "你好吗".to_string(), 2_000_000_000, 3);
+        raw.merge_single(
+            "nihaoma".to_string(),
+            "你好吗".to_string(),
+            2_000_000_000,
+            3,
+        );
         let e = PinyinEngine::new(Config::default(), CachedDict::Memory(raw));
         let r = e.convert("nihao", 50).unwrap();
 
