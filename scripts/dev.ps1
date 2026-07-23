@@ -22,17 +22,26 @@
 #   m4 / dm4     仅 wind_portable (绿色版, ../wind-portable)   release / dev (不存在则跳过)
 #   p1 / pd1     系统安装全部 (release / dev): 复制 + 注册 TSF + 开机自启 + 启动服务
 #   u1/u / ud1/ud  系统卸载全部 (release / dev): 反注册 + 移出输入法列表 + 移除自启 + 删目录
-#   pm1 / pm2    系统安装单模块 (tsf / 核心, release)
-#   pdm1 / pdm2  系统安装单模块 (dev)
+#   pm1..pm4     系统安装单模块 (tsf / 核心 / setting / portable, release)
+#   pdm1..pdm4   系统安装单模块 (dev)
+#   pb1 / pbd1   便携部署全部 (release / dev): 纯复制 + 写便携标记 + 启动 wind_portable
+#   pbm1..pbm4   便携部署单模块 (release)      pbdm1..pbdm4  便携部署单模块 (dev)
+#   ub1/ub / ubd1/ubd  便携卸载 (release / dev): 停进程 + 删程序文件 (userdata\ 保留)
 #   8  / d8      生成安装包 (release / dev): 全构建 + wind-installer 打包 → dist\*-Setup.exe
 #   8s / d8s     生成安装包 (跳过重建, 直接打包现有 build[_dev]/)
 #   k=check  l=clippy  t=test  f=fmt  fmt-check  ci(=fmt+clippy+test)  clean
 #   gd=gen-data  r=repl
 #
-# 部署目标 (Go 非便携式系统安装; 默认在 Program Files 下, 部署自动 UAC 提权;
-# 在 scripts\deploy.local.ps1 覆盖, PowerShell 赋值格式):
-#   DeployDirRelease = C:\Program Files\WindInput      # p1 / pm* 目标
-#   DeployDirDev   = C:\Program Files\WindInputDev   # pd1 / pdm* 目标
+# 部署目标 (在 scripts\deploy.local.ps1 覆盖, PowerShell 赋值格式):
+#   ── 系统安装 (注册 COM/写自启; 默认在 Program Files 下, 部署自动 UAC 提权)
+#   WIND_DIR_RELEASE          = C:\Program Files\WindInput      # p1 / pm* 目标
+#   WIND_DIR_DEV              = C:\Program Files\WindInputDev   # pd1 / pdm* 目标
+#   ── 便携部署 (纯复制, 免注册免自启; 无需管理员)
+#   WIND_DIR_PORTABLE_RELEASE = D:\WindInputPortable            # pb1 / pbm* 目标
+#   WIND_DIR_PORTABLE_DEV     = D:\WindInputPortableDev         # pbd1 / pbdm* 目标
+#   注: 便携目录【不可】落在 Program Files\ 或 Windows\ 下 —— wind_portable 的
+#       is_protected_dir (layout.rs) 会拒绝在系统保护目录启动便携模式。
+#   注: 便携用户数据在 <便携目录>\userdata\, 重新部署与卸载均保留该目录。
 #
 # 数据目录说明:
 #   data/                源文件(入库): 配置、五笔词库、主题等手工维护文件
@@ -65,8 +74,18 @@ $CacheDir      = "$ProductRoot\.cache"        # 外部下载/生成 (不入库)
 $DistDir       = "$ProductRoot\dist"          # 安装包输出目录 (gitignore)
 
 # ---------- 部署目标 (Go 便携式: 复制到指定本地目录) ----------
-$DeployDirRelease = "C:\Program Files\WindInput"
-$DeployDirDev   = "C:\Program Files\WindInputDev"
+$WIND_DIR_RELEASE = "C:\Program Files\WindInput"
+$WIND_DIR_DEV     = "C:\Program Files\WindInputDev"
+# 便携部署目标 (绿色版: 纯复制 + 便携标记, 不注册 COM/不写自启, 无需管理员)。
+# 默认放 D:\ 而非 Program Files —— wind_portable 探测到自身位于系统保护目录会直接拒绝
+# 启动便携模式 (wind-portable\src\layout.rs is_protected_dir), 故此处不能沿用安装目录。
+$WIND_DIR_PORTABLE_RELEASE = "D:\WindInputPortable"
+$WIND_DIR_PORTABLE_DEV     = "D:\WindInputPortableDev"
+# 便携标记文件名与用户数据目录名: 真源是 wind-config\src\variant.rs 的 PORTABLE_MARKER_NAME
+# / PORTABLE_DATA_DIR 常量 (注意不是 config\app.toml 里那个 portable_marker = "portable_mode",
+# 那是安装器侧的字段, 与 launcher 认的名字不同)。改这两个常量时须同步此处。
+$PortableMarkerName = "wind_portable_mode"
+$PortableDataDir    = "userdata"
 # wind-installer: 通用安装器生成器 (兄弟项目, app.toml 驱动); 8/d8 打包命令调用其 pack.ps1。
 $InstallerDir  = "$ProductRoot\..\wind-installer"
 # 在线升级元数据里的下载地址前缀 (不含结尾斜杠); 打包后生成的 latest*.json 据此拼 exeUrl。
@@ -510,9 +529,11 @@ function Test-Admin {
 }
 
 # 部署命令 → 目标安装目录; 非部署命令返回 $null (兼作"是否部署命令"判断)。
+# 注: 便携命令 (pb*/ub*) 刻意【不】列入 —— 便携部署是纯文件复制, 目标在普通目录,
+# 不注册 COM 也不装字体, 无需管理员; 列进来只会让每次部署白弹一次 UAC。
 function Deploy-TargetForCmd ([string]$cmd) {
-    if (@("p1","pm1","pm2","u1","u") -contains $cmd)           { return $DeployDirRelease }
-    if (@("pd1","pdm1","pdm2","ud1","ud") -contains $cmd)      { return $DeployDirDev }
+    if (@("p1","pm1","pm2","pm3","pm4","u1","u") -contains $cmd)            { return $WIND_DIR_RELEASE }
+    if (@("pd1","pdm1","pdm2","pdm3","pdm4","ud1","ud") -contains $cmd)     { return $WIND_DIR_DEV }
     return $null
 }
 
@@ -697,7 +718,7 @@ function Stop-WindService ([string]$suffix) {
 # 系统安装: 全部 build[_dev]/ → 安装目录, 注册 TSF + 开机自启 + 启动服务 (p1 / pd1)。
 function Deploy-Full ([string]$profile = "release") {
     $outdir = Out-For $profile
-    $targetDir = if ($profile -eq "dev") { $DeployDirDev } else { $DeployDirRelease }
+    $targetDir = if ($profile -eq "dev") { $WIND_DIR_DEV } else { $WIND_DIR_RELEASE }
     $suffix = if ($profile -eq "dev") { "_dev" } else { "" }
     if (-not (Require-Admin)) { return $false }
     if (-not (Test-Path "$outdir\wind_input$suffix.exe")) {
@@ -737,41 +758,233 @@ function Deploy-Full ([string]$profile = "release") {
     return $true
 }
 
-# 系统安装单模块 (不重编, 用现有产物): pm1=tsf pm2=core (pd 前缀=dev)。
+# 模块名 → 该模块的产物文件。Required 缺失即判失败 (防"部署成功但什么都没换"),
+# Optional 有则一并带上。系统安装与便携部署共用同一份映射, 免得两处各写一遍而漂移。
+function Get-ModuleFiles ([string]$mod, [string]$suffix) {
+    switch ($mod) {
+        "tsf"     { @{ Required = @("wind_tsf$suffix.dll", "wind_tsf_x86${suffix}.dll"); Optional = @() } }
+        # wind_cli.bat 两变体共用一份、且 Build-Core 里是"存在才复制", 故列为可选
+        "core"    { @{ Required = @("wind_input$suffix.exe"); Optional = @("wind_cli.bat") } }
+        "setting" { @{ Required = @("wind_setting$suffix.exe"); Optional = @() } }
+        # 便携启动器是单一二进制, 不带变体后缀 (运行时按同级有无 _dev exe 自辨变体)
+        "portable" { @{ Required = @("wind_portable.exe"); Optional = @() } }
+        default   { $null }
+    }
+}
+
+# 系统安装单模块 (不重编, 用现有产物): pm1=tsf pm2=core pm3=setting pm4=portable (pd 前缀=dev)。
 #   tsf : 停服务 → 反注册旧 COM → 复制 → icacls → 重注册 → 重启服务
 #   core: 停服务 → 复制 (含 wind_cli.bat) → 重启服务
+#   setting/portable: 仅复制 —— 它们是独立进程, 不参与输入法运行时。停/重启核心服务会
+#   平白打断正在使用的输入法, 故这两个模块不碰服务 (Copy-Replace 内部按镜像名杀各自进程)。
 function Deploy-Module ([string]$profile, [string]$mod) {
     $outdir = Out-For $profile
-    $targetDir = if ($profile -eq "dev") { $DeployDirDev } else { $DeployDirRelease }
+    $targetDir = if ($profile -eq "dev") { $WIND_DIR_DEV } else { $WIND_DIR_RELEASE }
     $suffix = if ($profile -eq "dev") { "_dev" } else { "" }
-    $files = @()
-    switch ($mod) {
-        "tsf"  { $files = @("wind_tsf$suffix.dll", "wind_tsf_x86${suffix}.dll") }
-        "core" { $files = @("wind_input$suffix.exe") }
-        default { ErrMsg "未知模块: $mod (tsf|core)"; return $false }
-    }
+    $spec = Get-ModuleFiles $mod $suffix
+    if (-not $spec) { ErrMsg "未知模块: $mod (tsf|core|setting|portable)"; return $false }
+    $touchesService = @("tsf", "core") -contains $mod
     if (-not (Require-Admin)) { return $false }
     if (-not (Test-Path $targetDir)) {
         ErrMsg "安装目录不存在: $targetDir; 请先 '$(if($profile -eq 'dev'){'pd1'}else{'p1'})' 完整安装。"; return $false
     }
-    foreach ($f in $files) { if (-not (Test-Path "$outdir\$f")) { ErrMsg "本地无 $outdir\$f (先构建对应模块)"; return $false } }
+    foreach ($f in $spec.Required) {
+        if (-not (Test-Path "$outdir\$f")) { ErrMsg "本地无 $outdir\$f (先构建对应模块)"; return $false }
+    }
     Say "`n========== 系统安装模块 ($profile/$mod) → $targetDir =========="
-    Say "[1/4] 停止旧进程..."; Stop-WindService $suffix
+    if ($touchesService) { Say "[1/4] 停止旧进程..."; Stop-WindService $suffix }
+    else                 { Say "[1/4] (跳过停服务: $mod 不参与输入法运行时)" }
     if ($mod -eq "tsf") { Say "[2/4] 反注册旧 TSF COM..."; Unregister-Tsf $targetDir $suffix }
-    else                { Say "[2/4] (core 无需反注册 COM)" }
+    else                { Say "[2/4] ($mod 无需反注册 COM)" }
     Say "[3/4] 复制模块文件..."
-    foreach ($f in $files) { Copy-Replace $targetDir $f "$outdir\$f" }
-    if ($mod -eq "core" -and (Test-Path "$outdir\wind_cli.bat")) { Copy-Replace $targetDir "wind_cli.bat" "$outdir\wind_cli.bat" }
+    foreach ($f in $spec.Required) { Copy-Replace $targetDir $f "$outdir\$f" }
+    foreach ($f in $spec.Optional) { if (Test-Path "$outdir\$f") { Copy-Replace $targetDir $f "$outdir\$f" } }
     if ($mod -eq "tsf") {
         Grant-TsfAcl $targetDir $suffix
         if (-not (Register-Tsf $targetDir $suffix)) { return $false }
         Enable-TsfForUser $profile
     }
     Get-ChildItem "$targetDir\*.old*" -ErrorAction SilentlyContinue | Remove-Item -Force -ErrorAction SilentlyContinue
-    Say "[4/4] 启动输入法服务..."
-    $exe = Join-Path $targetDir "wind_input$suffix.exe"
-    if (Test-Path $exe) { Start-Process -FilePath $exe; Gray "  - 已启动 wind_input$suffix.exe" }
+    if ($touchesService) {
+        Say "[4/4] 启动输入法服务..."
+        $exe = Join-Path $targetDir "wind_input$suffix.exe"
+        if (Test-Path $exe) { Start-Process -FilePath $exe; Gray "  - 已启动 wind_input$suffix.exe" }
+    } else {
+        Say "[4/4] (跳过重启服务: $mod 不参与输入法运行时)"
+    }
     Say "`n模块部署完成 ($profile/$mod)"
+    return $true
+}
+
+# ---------- 便携部署 (绿色版: 纯复制到本地目录, 免注册免污染) ----------
+# 与系统安装的区别: 不 regsvr32、不写 HKCU Run、不装字体、不改用户输入法列表 —— 这些全部
+# 由 wind_portable.exe 运行期自行完成 (registration.rs 见到便携标记才走便携注册路径), 退出时
+# 再自行撤销。故便携部署 = 复制文件 + 写标记 + 拉起 launcher, 全程无需管理员。
+function Portable-TargetFor ([string]$profile) {
+    if ($profile -eq "dev") { return $WIND_DIR_PORTABLE_DEV }
+    return $WIND_DIR_PORTABLE_RELEASE
+}
+
+# 便携根目录合法性校验 —— 对齐 wind-portable\src\layout.rs 的 is_protected_dir。
+# 提前拦下, 否则文件都复制完了才在启动 launcher 时收到"不支持便携模式"而白忙一场。
+# 注: $profile 显式传参 —— 不可省。PowerShell 的 $profile 就是自动变量 $PROFILE (用户配置
+# 文件路径, 变量名不区分大小写); 函数内不声明就会靠动态作用域偷读调用方的同名参数, 调用链
+# 一变即静默读到那个路径串。
+function Test-PortableRoot ([string]$root, [string]$profile = "release") {
+    $prefixes = @($env:ProgramFiles, ${env:ProgramFiles(x86)}, $env:ProgramW6432, $env:SystemRoot) |
+        Where-Object { $_ }
+    $lower = $root.ToLower().TrimEnd('\')
+    foreach ($p in $prefixes) {
+        $pl = $p.ToLower().TrimEnd('\')
+        if ($lower -eq $pl -or $lower.StartsWith("$pl\")) {
+            ErrMsg "便携目录不能位于系统保护目录下: $root"
+            ErrMsg "  (命中前缀: $p) —— wind_portable 会拒绝在此启动便携模式。"
+            $varName = if ($profile -eq 'dev') { 'WIND_DIR_PORTABLE_DEV' } else { 'WIND_DIR_PORTABLE_RELEASE' }
+            ErrMsg "请在 scripts\deploy.local.ps1 中把 `$$varName 改到普通目录, 如 D:\WindInputPortable。"
+            return $false
+        }
+    }
+    return $true
+}
+
+# 只停【本便携目录下】的进程。便携版与系统安装版镜像名完全相同 (都是 wind_input.exe),
+# 按名杀会连正在使用的系统安装版一起干掉, 故必须按 Path 前缀过滤。
+function Stop-PortableProcesses ([string]$root, [string]$suffix) {
+    $names = @("wind_portable", "wind_input$suffix", "wind_setting$suffix")
+    $rootPrefix = $root.TrimEnd('\') + "\"
+    $killed = 0
+    foreach ($n in $names) {
+        $procs = @(Get-Process -Name $n -ErrorAction SilentlyContinue | Where-Object {
+            $_.Path -and $_.Path.StartsWith($rootPrefix, [System.StringComparison]::OrdinalIgnoreCase)
+        })
+        foreach ($p in $procs) { $p | Stop-Process -Force -ErrorAction SilentlyContinue; $killed++ }
+    }
+    if ($killed -gt 0) { Gray "  - 已停止 $killed 个便携进程"; Start-Sleep -Milliseconds 600 }
+    else { Gray "  - 无运行中的便携进程" }
+}
+
+# 写便携标记文件 (root\wind_portable_mode)。launcher 启动时也会自建, 此处先写是为了让
+# "复制完还没跑过 launcher"的目录就已经是合法便携包 (直接双击 wind_input.exe 也走便携路径)。
+# 内容与 wind-portable\src\service.rs ensure_portable_layout 一致; 已存在则不覆盖 ——
+# 运行期可能写入 stopped=1 等守卫位, 覆盖会抹掉状态。
+function Write-PortableMarker ([string]$root) {
+    $marker = Join-Path $root $PortableMarkerName
+    if (Test-Path $marker) { Gray "  - 便携标记已存在, 保留 ($PortableMarkerName)"; return }
+    [System.IO.File]::WriteAllText($marker, "wind_portable=1`n", (New-Object System.Text.UTF8Encoding($false)))
+    Gray "  - 已写便携标记 ($PortableMarkerName)"
+}
+
+# 启动便携 launcher。WorkingDirectory 必须设为便携根 —— layout.rs 的候选根探测会用到
+# current_dir, 从别处拉起可能探到错误的根。
+function Start-Portable ([string]$root) {
+    $exe = Join-Path $root "wind_portable.exe"
+    if (-not (Test-Path $exe)) {
+        Warn "  - 无 wind_portable.exe, 跳过启动 (可手动运行目录下的 wind_input*.exe)"
+        return
+    }
+    Start-Process -FilePath $exe -WorkingDirectory $root
+    Gray "  - 已启动 wind_portable.exe"
+}
+
+# 便携部署全部 (pb1 / pbd1): build[_dev]\ 全量 → 便携目录。
+# userdata\ 是便携版的用户数据 (词库/配置/统计), 就在便携根目录内部 —— 全量部署只替换
+# 程序文件与 data\, 绝不碰 userdata\, 否则一次重新部署就抹掉用户全部个人数据。
+function Deploy-Portable ([string]$profile = "release") {
+    $outdir = Out-For $profile
+    $root = Portable-TargetFor $profile
+    $suffix = if ($profile -eq "dev") { "_dev" } else { "" }
+    if (-not (Test-Path "$outdir\wind_input$suffix.exe")) {
+        ErrMsg "无 $outdir 产物; 请先 '$(if($profile -eq 'dev'){'d1'}else{'1'})' 全构建。"; return $false
+    }
+    if (-not (Test-PortableRoot $root $profile)) { return $false }
+    Say "`n========== 便携部署 ($profile) → $root =========="
+    Say "[1/5] 停止便携进程..."; Stop-PortableProcesses $root $suffix
+    Say "[2/5] 准备目录..."; New-Item -ItemType Directory -Path $root -Force | Out-Null
+    Say "[3/5] 复制程序文件..."
+    Copy-Replace $root "wind_input$suffix.exe" "$outdir\wind_input$suffix.exe"
+    if (Test-Path "$outdir\wind_cli.bat") { Copy-Replace $root "wind_cli.bat" "$outdir\wind_cli.bat" }
+    foreach ($dll in (Get-ChildItem "$outdir\wind_tsf*.dll" -ErrorAction SilentlyContinue)) {
+        Copy-Replace $root $dll.Name $dll.FullName
+    }
+    if (Test-Path "$outdir\wind_setting$suffix.exe") { Copy-Replace $root "wind_setting$suffix.exe" "$outdir\wind_setting$suffix.exe" }
+    if (Test-Path "$outdir\wind_portable.exe")       { Copy-Replace $root "wind_portable.exe"       "$outdir\wind_portable.exe" }
+    if (Test-Path "$outdir\data") {
+        $td = Join-Path $root "data"
+        if (Test-Path $td) { Remove-Item $td -Recurse -Force -ErrorAction SilentlyContinue }
+        Copy-Item "$outdir\data" -Destination $root -Recurse -Force
+        Gray "  - data\ (词库、方案、主题)"
+    }
+    Get-ChildItem "$root\*.old*" -ErrorAction SilentlyContinue | Remove-Item -Force -ErrorAction SilentlyContinue
+    Say "[4/5] 写便携标记..."; Write-PortableMarker $root
+    Say "[5/5] 启动便携版..."; Start-Portable $root
+    Say "`n便携部署完成 ($profile) → $root"
+    Gray "用户数据目录: $root\$PortableDataDir (部署不会覆盖)"
+    return $true
+}
+
+# 便携部署单模块 (pbm1..pbm4 / pbdm1..pbdm4): 只换指定模块文件, 不重编不动 data\。
+# 停的是整个便携实例 —— 便携版由 launcher 统一托管 (TSF DLL 由它注册、服务由它拉起),
+# 换任何一个模块都得让它整体重启才能生效, 单独换文件而不重启等于没换。
+function Deploy-PortableModule ([string]$profile, [string]$mod) {
+    $outdir = Out-For $profile
+    $root = Portable-TargetFor $profile
+    $suffix = if ($profile -eq "dev") { "_dev" } else { "" }
+    $spec = Get-ModuleFiles $mod $suffix
+    if (-not $spec) { ErrMsg "未知模块: $mod (tsf|core|setting|portable)"; return $false }
+    if (-not (Test-PortableRoot $root $profile)) { return $false }
+    if (-not (Test-Path $root)) {
+        ErrMsg "便携目录不存在: $root; 请先 '$(if($profile -eq 'dev'){'pbd1'}else{'pb1'})' 完整部署。"; return $false
+    }
+    foreach ($f in $spec.Required) {
+        if (-not (Test-Path "$outdir\$f")) { ErrMsg "本地无 $outdir\$f (先构建对应模块)"; return $false }
+    }
+    Say "`n========== 便携部署模块 ($profile/$mod) → $root =========="
+    Say "[1/3] 停止便携进程..."; Stop-PortableProcesses $root $suffix
+    Say "[2/3] 复制模块文件..."
+    foreach ($f in $spec.Required) { Copy-Replace $root $f "$outdir\$f" }
+    foreach ($f in $spec.Optional) { if (Test-Path "$outdir\$f") { Copy-Replace $root $f "$outdir\$f" } }
+    Get-ChildItem "$root\*.old*" -ErrorAction SilentlyContinue | Remove-Item -Force -ErrorAction SilentlyContinue
+    Say "[3/3] 重启便携版..."; Write-PortableMarker $root; Start-Portable $root
+    Say "`n便携模块部署完成 ($profile/$mod)"
+    return $true
+}
+
+# 便携卸载 (ub1/ub / ubd1/ubd): 停进程 + 删程序文件; userdata\ 保留。
+# 【不】动 HKCU Run 与 TSF COM 注册 —— 便携版用的是与系统安装版【完全相同】的自启值名
+# (WindInput) 和 CLSID, 脚本在此清理会连同已装的系统版一起废掉。这些注册项由便携版自己
+# 在退出时撤销, 故正确姿势是先在便携版托盘里退出, 再跑本命令。
+function Uninstall-Portable ([string]$profile = "release") {
+    $root = Portable-TargetFor $profile
+    $suffix = if ($profile -eq "dev") { "_dev" } else { "" }
+    if (-not (Test-Path $root)) { Warn "便携目录不存在, 无需卸载: $root"; return $true }
+    Say "`n========== 便携卸载 ($profile) → $root =========="
+    Say "[1/2] 停止便携进程..."; Stop-PortableProcesses $root $suffix
+    Say "[2/2] 删除程序文件 (保留 $PortableDataDir\)..."
+    $dataRoot = (Join-Path $root $PortableDataDir).TrimEnd('\') + "\"
+    Get-ChildItem "$root\*.old*" -Recurse -File -ErrorAction SilentlyContinue | Remove-Item -Force -ErrorAction SilentlyContinue
+    $allGone = $true
+    Get-ChildItem $root -Recurse -File -ErrorAction SilentlyContinue | ForEach-Object {
+        if ($_.FullName.StartsWith($dataRoot, [System.StringComparison]::OrdinalIgnoreCase)) { return }
+        if (-not (Remove-OrRename $_.FullName)) { $allGone = $false }
+    }
+    # 清空的子目录一并删掉 (userdata\ 除外); 目录本身留待最后判断
+    Get-ChildItem $root -Directory -ErrorAction SilentlyContinue | ForEach-Object {
+        if ($_.Name -ieq $PortableDataDir) { return }
+        if (-not (Get-ChildItem $_.FullName -Recurse -File -ErrorAction SilentlyContinue)) {
+            Remove-Item $_.FullName -Recurse -Force -ErrorAction SilentlyContinue
+        }
+    }
+    if (Test-Path (Join-Path $root $PortableDataDir)) {
+        Say "`n便携卸载完成 ($profile); 用户数据已保留:"
+        Warn "  $root\$PortableDataDir  (如需彻底清除请手动删除整个 $root)"
+    } elseif ($allGone) {
+        try { Remove-Item $root -Recurse -Force -ErrorAction Stop; Gray "  - 已删除便携目录 $root" }
+        catch { Warn "  - 文件已清空, 但目录未能删除 (重启后可删): $root" }
+        Say "`n便携卸载完成 ($profile)。"
+    } else {
+        Warn "  - 部分文件被占用已改名让路; 重启后重跑本命令或手动删除: $root"
+    }
+    Gray "注: 便携版的开机自启与 TSF 注册由其自身托管, 本命令未改动 (与系统安装版共用同一注册项)。"
     return $true
 }
 
@@ -832,7 +1045,7 @@ function Remove-OrRename ([string]$path) {
 # 字体(黑体字根)为两变体共享, 故【不】卸载, 以免影响仍在用的另一变体。
 # 个人数据(词库/配置/统计)默认保留; 仅打印路径供手动清除。
 function Uninstall-Full ([string]$profile = "release") {
-    $targetDir = if ($profile -eq "dev") { $DeployDirDev } else { $DeployDirRelease }
+    $targetDir = if ($profile -eq "dev") { $WIND_DIR_DEV } else { $WIND_DIR_RELEASE }
     $suffix = if ($profile -eq "dev") { "_dev" } else { "" }
     if (-not (Require-Admin)) { return $false }
     Say "`n========== 系统卸载 ($profile) → $targetDir =========="
@@ -1092,10 +1305,17 @@ function Show-Menu {
     Write-Host "    m4   仅 wind_portable (../wind-portable) dm4"
     Write-Host "`n  系统安装 / 卸载 (注册 TSF + 开机自启 + 默认启用, 自动提权):" -ForegroundColor Yellow
     Write-Host "    p1   安装全部 (release)        pd1   安装全部 (dev)"
-    Write-Host "    pm1/pm2  安装模块(tsf/核心)    pdm1/pdm2 (dev)"
+    Write-Host "    pm1..pm4  安装模块(tsf/核心/setting/portable)   pdm1..pdm4 (dev)"
     Write-Host "    u1/u  卸载全部 (release)        ud1/ud  卸载全部 (dev)"
-    Write-Host "      release → $DeployDirRelease" -ForegroundColor DarkGray
-    Write-Host "      dev     → $DeployDirDev" -ForegroundColor DarkGray
+    Write-Host "      release → $WIND_DIR_RELEASE" -ForegroundColor DarkGray
+    Write-Host "      dev     → $WIND_DIR_DEV" -ForegroundColor DarkGray
+    Write-Host "`n  便携部署 / 卸载 (纯复制 + 便携标记, 免注册免提权):" -ForegroundColor Yellow
+    Write-Host "    pb1  部署全部 (release)        pbd1  部署全部 (dev)"
+    Write-Host "    pbm1..pbm4  部署模块(tsf/核心/setting/portable)  pbdm1..pbdm4 (dev)"
+    Write-Host "    ub1/ub  卸载 (release)          ubd1/ubd  卸载 (dev)"
+    Write-Host "      release → $WIND_DIR_PORTABLE_RELEASE" -ForegroundColor DarkGray
+    Write-Host "      dev     → $WIND_DIR_PORTABLE_DEV" -ForegroundColor DarkGray
+    Write-Host "      用户数据 <目录>\$PortableDataDir 部署/卸载均保留" -ForegroundColor DarkGray
     Write-Host "`n  安装包 (调用兄弟项目 wind-installer 打包):" -ForegroundColor Yellow
     Write-Host "    8    生成安装包 (release)       d8    生成安装包 (dev)"
     Write-Host "    8s   跳过重建直接打包 (release)  d8s   跳过重建直接打包 (dev)"
@@ -1125,14 +1345,33 @@ function Dispatch ([string]$cmd, [string]$arg) {
         "dm4"  { if (Build-Portable dev)   { 0 } else { 1 }; break }
         "p1"   { if (Deploy-Full release) { 0 } else { 1 }; break }
         "pd1"  { if (Deploy-Full dev)   { 0 } else { 1 }; break }
-        "pm1"  { if (Deploy-Module release tsf)  { 0 } else { 1 }; break }
-        "pm2"  { if (Deploy-Module release core) { 0 } else { 1 }; break }
-        "pdm1" { if (Deploy-Module dev tsf)    { 0 } else { 1 }; break }
-        "pdm2" { if (Deploy-Module dev core)   { 0 } else { 1 }; break }
+        "pm1"  { if (Deploy-Module release tsf)      { 0 } else { 1 }; break }
+        "pm2"  { if (Deploy-Module release core)     { 0 } else { 1 }; break }
+        "pm3"  { if (Deploy-Module release setting)  { 0 } else { 1 }; break }
+        "pm4"  { if (Deploy-Module release portable) { 0 } else { 1 }; break }
+        "pdm1" { if (Deploy-Module dev tsf)      { 0 } else { 1 }; break }
+        "pdm2" { if (Deploy-Module dev core)     { 0 } else { 1 }; break }
+        "pdm3" { if (Deploy-Module dev setting)  { 0 } else { 1 }; break }
+        "pdm4" { if (Deploy-Module dev portable) { 0 } else { 1 }; break }
         "u"    { if (Uninstall-Full release) { 0 } else { 1 }; break }
         "u1"   { if (Uninstall-Full release) { 0 } else { 1 }; break }
         "ud"   { if (Uninstall-Full dev)   { 0 } else { 1 }; break }
         "ud1"  { if (Uninstall-Full dev)   { 0 } else { 1 }; break }
+        # 便携部署 (纯复制, 不提权)
+        "pb1"   { if (Deploy-Portable release) { 0 } else { 1 }; break }
+        "pbd1"  { if (Deploy-Portable dev)     { 0 } else { 1 }; break }
+        "pbm1"  { if (Deploy-PortableModule release tsf)      { 0 } else { 1 }; break }
+        "pbm2"  { if (Deploy-PortableModule release core)     { 0 } else { 1 }; break }
+        "pbm3"  { if (Deploy-PortableModule release setting)  { 0 } else { 1 }; break }
+        "pbm4"  { if (Deploy-PortableModule release portable) { 0 } else { 1 }; break }
+        "pbdm1" { if (Deploy-PortableModule dev tsf)      { 0 } else { 1 }; break }
+        "pbdm2" { if (Deploy-PortableModule dev core)     { 0 } else { 1 }; break }
+        "pbdm3" { if (Deploy-PortableModule dev setting)  { 0 } else { 1 }; break }
+        "pbdm4" { if (Deploy-PortableModule dev portable) { 0 } else { 1 }; break }
+        "ub"    { if (Uninstall-Portable release) { 0 } else { 1 }; break }
+        "ub1"   { if (Uninstall-Portable release) { 0 } else { 1 }; break }
+        "ubd"   { if (Uninstall-Portable dev)     { 0 } else { 1 }; break }
+        "ubd1"  { if (Uninstall-Portable dev)     { 0 } else { 1 }; break }
         { $_ -in @("8", "installer") }       { if (Do-Installer release $false) { 0 } else { 1 }; break }
         "8s"                                 { if (Do-Installer release $true)  { 0 } else { 1 }; break }
         { $_ -in @("d8", "installer-dev") }  { if (Do-Installer dev $false)   { 0 } else { 1 }; break }
