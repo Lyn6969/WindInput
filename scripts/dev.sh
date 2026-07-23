@@ -108,31 +108,9 @@ gray() { printf '%b%b%b\n' "$C_GRAY" "$1" "$C_RESET"; }
 # 共用 cargo-xwin 下载的 MSVC CRT/Windows SDK(缓存于 ~/.cache/cargo-xwin)。
 # 统一用带版本号的 clang(MSVC STL 要求 clang≥19);可用 WIND_LLVM_VER 切到 20。
 # 依赖:cargo-xwin、clang-<ver>、lld-<ver>、llvm-<ver>(含 llvm-rc/llvm-lib)。
-XWIN_BIN="$HOME/.local/xwin-bin"
-WIND_LLVM_VER="${WIND_LLVM_VER:-19}"
-setup_xwin_env() {
-    local v="$WIND_LLVM_VER"
-    if ! command -v "clang-$v" >/dev/null 2>&1; then
-        err "未找到 clang-$v;请安装 clang-$v lld-$v llvm-$v(MSVC STL 要求 clang≥19)。"
-        return 1
-    fi
-    if ! command -v cargo-xwin >/dev/null 2>&1; then
-        err "未找到 cargo-xwin;请运行 'cargo install cargo-xwin'。"; return 1
-    fi
-    # 软链桥:cargo-xwin 按无版本名搜索 clang-cl/lld-link/llvm-rc/llvm-lib/llvm-dlltool,
-    # 全部指向 -<v>,使整条链(Rust/Tauri + C 依赖 + 链接)统一走 clang-<v>。幂等。
-    mkdir -p "$XWIN_BIN"
-    ln -sf "$(command -v clang-$v)"          "$XWIN_BIN/clang-cl"
-    ln -sf "$(command -v clang-$v)"          "$XWIN_BIN/clang"
-    ln -sf "$(command -v clang++-$v)"        "$XWIN_BIN/clang++"
-    ln -sf "$(command -v lld-link-$v)"       "$XWIN_BIN/lld-link"     2>/dev/null || true
-    ln -sf "$(command -v llvm-rc-$v)"        "$XWIN_BIN/llvm-rc"      2>/dev/null || true
-    ln -sf "$(command -v llvm-lib-$v)"       "$XWIN_BIN/llvm-lib"     2>/dev/null || true
-    ln -sf "$(command -v llvm-dlltool-$v)"   "$XWIN_BIN/llvm-dlltool" 2>/dev/null || true
-    case ":$PATH:" in *":$XWIN_BIN:"*) ;; *) export PATH="$XWIN_BIN:$PATH";; esac
-    export XWIN_ACCEPT_LICENSE="${XWIN_ACCEPT_LICENSE:-1}"  # 接受微软 SDK/CRT 许可
-    export XWIN_ARCH="${XWIN_ARCH:-x86,x86_64}"             # 同时 splat 32/64 位(x86 TSF 需要)
-}
+# XWIN_BIN / WIND_LLVM_VER / setup_xwin_env 定义在共享环境桥里 —— pack-installer.sh
+# 写同一个 $XWIN_BIN 目录，两处各存一份实现会互相覆盖（原委见 lib/xwin-env.sh 头部）。
+. "$SCRIPT_DIR/lib/xwin-env.sh"
 
 # 统一 MSVC 构建入口:确保工具链就绪,并注入 +crt-static(静态链 MSVC 运行时,
 # 产物自包含,无需目标机装 VC++ 运行库)。RUSTFLAGS 仅作用于此次 cargo-xwin 调用,

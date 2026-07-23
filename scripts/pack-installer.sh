@@ -87,17 +87,11 @@ fi
 
 # ---- 编译安装器 stub(cargo-xwin/MSVC 交叉)+ packer(原生)----
 echo ">>> 交叉编译 wind-installer stub (cargo-xwin/MSVC) + 原生 wind-packer ..."
-# 对齐 dev.sh setup_xwin_env:clang→clang-cl/lld-link/llvm-rc/llvm-lib/llvm-dlltool 全套软链
-XWIN_BIN="$HOME/.local/xwin-bin"
-if command -v clang >/dev/null 2>&1; then
-  mkdir -p "$XWIN_BIN"
-  CLANG="$(command -v clang)"
-  for name in clang-cl lld-link llvm-rc llvm-lib llvm-dlltool; do
-    command -v "$name" >/dev/null 2>&1 || ln -sf "$CLANG" "$XWIN_BIN/$name"
-  done
-  export PATH="$XWIN_BIN:$PATH"
-fi
-export XWIN_ACCEPT_LICENSE="${XWIN_ACCEPT_LICENSE:-1}"
+# 工具链软链桥与 dev.sh 共用同一份实现 —— 两者写同一个 $XWIN_BIN 目录，各自维护一份
+# 必然互相覆盖。此处曾把 llvm-lib 等一律软链到 clang，覆盖掉 dev.sh 建立的正确映射，
+# 导致 zstd-sys 拿 clang 当归档器而长期发版失败（原委见 lib/xwin-env.sh 头部）。
+. "$SCRIPT_DIR/lib/xwin-env.sh"
+setup_xwin_env || exit 1
 (
   cd "$INSTALLER_DIR"
   # stub/uninstaller 交叉编 MSVC(+crt-static 自包含);packer 原生编(纯 IO,跑在主机)
