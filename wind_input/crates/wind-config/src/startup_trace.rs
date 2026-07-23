@@ -53,12 +53,17 @@ pub fn stage(name: &str) {
         return;
     };
 
-    let _ = writeln!(
-        f,
-        "{} pid={} {}",
+    // 必须先拼成整行再一次 write_all：`writeln!` 走 `Write::write_fmt`，会按格式片段
+    // 逐段调 write（时间戳一次、" pid=" 一次、pid 一次……）。append 模式下单次 write 是
+    // 原子的，但**片段之间**会被其它进程插入，行就被撕成乱码。而多进程齐发（开机、升级后
+    // 十余个宿主同时抢着拉服务）恰恰是本文件唯一的证据来源——2026-07-23 客户升级日志里
+    // 就有整片撕裂行无法判读。
+    let line = format!(
+        "{} pid={} {}\n",
         chrono::Local::now().format(LOG_TIME_FORMAT),
         std::process::id(),
         name
     );
+    let _ = f.write_all(line.as_bytes());
     let _ = f.flush();
 }
