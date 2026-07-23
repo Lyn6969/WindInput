@@ -824,6 +824,55 @@ do_installer() {
     "$SCRIPT_DIR/pack-installer.sh" --version "$VERSION" || return 1
 }
 
+# 便携版压缩包: build/ → dist/WindInput-Portable-<版本>.zip
+# 内容依据 dev.ps1 的 Deploy-Portable(便携部署的权威定义): 程序文件 + data/ + 便携标记。
+# 【不含 userdata/】—— 那是便携版的用户数据目录(配置/词频/用户词库), 打进包等于把打包机
+# 的个人数据分发给所有人。
+# 缺 wind_setting.exe / wind_portable.exe 时照常出包: build_setting/build_portable 在伴生仓
+# 缺失时自行跳过(见其函数首行), 此处不二次判定 —— 这也让没有私有伴生仓的环境能出便携包。
+do_portable_zip() {
+    local skip="${1:-}"
+    if [ "$skip" = "skip" ]; then
+        say "\n跳过构建，直接打包现有 $BUILD_DIR/"
+        [ -f "$BUILD_DIR/wind_input.exe" ] || {
+            err "build/ 无产物；请先运行 'dev.sh portable-zip'（不带 skip）或 'dev.sh 1'。"; return 1; }
+    else
+        do_full release || return 1
+    fi
+    command -v zip >/dev/null 2>&1 || { err "需要 zip 命令（Debian/Ubuntu: apt install zip）"; return 1; }
+
+    local dist="$PRODUCT_ROOT/dist"
+    local name="WindInput-$VERSION"                       # zip 内顶层目录, 避免解压散落
+    local zipfile="$dist/WindInput-Portable-$VERSION.zip"
+    local stage="$dist/.portable-stage"
+
+    say "\n=== 打包便携版 → $zipfile ==="
+    rm -rf "$stage"; mkdir -p "$stage/$name" "$dist"
+    cp -a "$BUILD_DIR/." "$stage/$name/" || { err "复制 build/ 失败"; return 1; }
+    rm -rf "$stage/$name/userdata"        # 用户数据目录, 绝不入包
+    rm -f  "$stage/$name"/*.old*          # 部署残留
+
+    # 便携标记: 内容与 wind-portable 的 ensure_portable_layout 一致(同 dev.ps1 Write-PortableMarker)。
+    # 有它 wind_input.exe 才把 userdata 落在自身目录; 缺了会退化成安装版行为写 %APPDATA%,
+    # 那样"便携"就名不副实了。
+    printf 'wind_portable=1\n' > "$stage/$name/wind_portable_mode"
+
+    rm -f "$zipfile" "$zipfile.sha256"
+    ( cd "$stage" && zip -qr "$zipfile" "$name" ) || { err "zip 打包失败"; return 1; }
+    ( cd "$dist" && sha256sum "$(basename "$zipfile")" > "$(basename "$zipfile").sha256" )
+
+    local has_launcher=0
+    [ -f "$stage/$name/wind_portable.exe" ] && has_launcher=1
+    rm -rf "$stage"
+    say "便携版打包完成: $zipfile ($(du -h "$zipfile" | cut -f1))"
+    if [ "$has_launcher" = 1 ]; then
+        gray "使用: 解压后运行 wind_portable.exe（注册组件并拉起服务）"
+    else
+        gray "使用: 包内无便携启动器 —— 需管理员 regsvr32 注册 wind_tsf.dll"
+        gray "      (x86 版用 %SystemRoot%\\SysWOW64\\regsvr32.exe)，再手动运行 wind_input.exe"
+    fi
+}
+
 show_menu() {
     clear 2>/dev/null || true
     printf '%b============================================%b\n' "$C_CYAN" "$C_RESET"
@@ -840,6 +889,8 @@ show_menu() {
     printf '\n%b  安装包:%b\n' "$C_YELLOW" "$C_RESET"
     echo  "    8    生成安装包 (= 1 + 打包 → Setup.exe + sha256)"
     echo  "    8s   跳过编译, 直接打包现有 build/"
+    echo  "    9    生成便携包 (= 1 + 打包 → dist/WindInput-Portable-<版本>.zip + sha256)"
+    echo  "    9s   跳过编译, 直接打包现有 build/"
     printf '\n%b  部署 → Windows (deploy.local 配 RELEASE/DEV 路径; SSH → %s):%b\n' "$C_YELLOW" "${WIND_REMOTE:-未配置}" "$C_RESET"
     echo  "    p1   push 全部 (release)        pd1   push 全部 (dev)"
     echo  "    pm1/pm2  push 模块(tsf/核心)    pdm1/pdm2 (dev)"
@@ -869,6 +920,8 @@ dispatch() {
         dm4)              build_portable dev ;;
         8|installer|pack) do_installer ;;
         8s|installer-skip) do_installer skip ;;
+        9|portable-zip)   do_portable_zip ;;
+        9s|portable-zip-skip) do_portable_zip skip ;;
         p1)               do_push_full release ;;
         pd1)              do_push_full dev ;;
         pm1)              do_push_module release tsf ;;

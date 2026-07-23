@@ -104,6 +104,13 @@ jobs:
         working-directory: WindInput
         run: ./scripts/dev.sh release
 
+      # 排在安装器之前：便携包只依赖上一步的 build/，不碰任何私有伴生仓，
+      # 先出它可以在安装器打包出问题时仍拿到一份可用产物。
+      # skip 复用已构建的 build/，不重复全构建。
+      - name: 打包便携版压缩包
+        working-directory: WindInput
+        run: ./scripts/dev.sh portable-zip skip
+
       - name: 打包安装程序 (cross stub + native packer，免 wine)
         working-directory: WindInput
         env:
@@ -126,6 +133,8 @@ jobs:
           files: |
             wind-installer/dist/WindInput-Setup-*.exe
             wind-installer/dist/WindInput-Setup-*.exe.sha256
+            WindInput/dist/WindInput-Portable-*.zip
+            WindInput/dist/WindInput-Portable-*.zip.sha256
 
       - name: 上传安装器 artifact (手动触发,供 Windows 实测)
         if: github.ref_type != 'tag'
@@ -135,4 +144,6 @@ jobs:
           path: |
             wind-installer/dist/WindInput-Setup-*.exe
             wind-installer/dist/WindInput-Setup-*.exe.sha256
+            WindInput/dist/WindInput-Portable-*.zip
+            WindInput/dist/WindInput-Portable-*.zip.sha256
           retention-days: 14
