@@ -20,7 +20,7 @@ pub(crate) const SDDL: &str = "D:P(A;;GA;;;WD)(A;;GA;;;SY)(A;;GA;;;BA)(A;;GA;;;A
 const SDDL_REVISION_1: u32 = 1;
 
 /// 解析后的安全描述符（RAII 封装，析构时释放 LocalAlloc 内存）
-pub(crate) struct SecurityDescriptor {
+pub struct SecurityDescriptor {
     bytes: Vec<u8>,
 }
 
@@ -70,9 +70,22 @@ impl SecurityDescriptor {
     }
 
     /// 获取安全描述符指针（用于 SECURITY_ATTRIBUTES）
-    pub(crate) fn as_ptr(&self) -> *const std::ffi::c_void {
+    pub fn as_ptr(&self) -> *const std::ffi::c_void {
         self.bytes.as_ptr() as *const std::ffi::c_void
     }
+}
+
+/// 与命名管道同款的安全描述符，供本 crate 之外的命名内核对象复用
+/// （目前：服务的全局单例互斥体 `Global\WindInputIMEService*`）。
+///
+/// 单例互斥体此前不带安全描述符，拿的是令牌默认 DACL——实测形如
+/// `O:BA D:(A;;0x1f0001;;;SY)(A;;0x1f0001;;;BA)(A;;0x120001;;;<登录会话SID>)`，
+/// 既无 `AC` 也无完整性标签。于是 AppContainer / 低完整性 / 异账户的宿主进程
+/// 调 `CreateMutexW`（隐含请求 `MUTEX_ALL_ACCESS`）会被拒，服务的单例判断随之失真。
+/// 四个 IPC 对象（两条管道 + 命名事件 + 共享内存）早就统一用这份描述符了，
+/// 互斥体当年不在那批对象里才被漏掉，此处补齐。
+pub fn shared_object_security_descriptor() -> Option<SecurityDescriptor> {
+    SecurityDescriptor::from_sddl(SDDL)
 }
 
 /// 创建管道安全属性，包含 SDDL 安全描述符

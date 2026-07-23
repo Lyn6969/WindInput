@@ -175,10 +175,23 @@ fn main() {
     // 代价是此处无法用 tracing（subscriber 尚未装），改用启动轨迹 + stderr：
     // 反正 `exit(1)` 也刷不出 tracing 的 non_blocking 缓冲，同步落盘的轨迹反而更可靠。
     let _singleton_guard = match check_singleton() {
-        Some(guard) => guard,
-        None => {
+        SingletonCheck::Acquired(guard) => guard,
+        SingletonCheck::AlreadyRunning => {
             startup_trace::stage("singleton-BLOCKED 另一实例已在运行，本实例退出");
             eprintln!("WindInput: 另一个实例已在运行中");
+            std::process::exit(1);
+        }
+        // 够不着全局互斥体：本进程多半继承了受限的宿主上下文（TSF DLL 用
+        // `CreateProcessW` 拉起服务时不换令牌，宿主是 AppContainer/低完整性，
+        // 子进程就跟着受限）。这种进程也建不了全局命名管道、写不了日志目录，
+        // 撑不起服务，退出是对的——但绝不能声称「另一实例已在运行」，
+        // 那会把「服务根本没起来」伪装成「服务已经在跑」。
+        SingletonCheck::Inaccessible(err) => {
+            startup_trace::stage(&format!(
+                "singleton-INACCESSIBLE err={err} 打不开全局单例对象（本进程上下文受限），\
+                 无从判断另一实例是否存在，本实例退出"
+            ));
+            eprintln!("WindInput: 无法访问全局单例对象 (err={err})，本进程上下文受限");
             std::process::exit(1);
         }
     };
@@ -526,15 +539,31 @@ fn spawn_log_health_watch(dropped: tracing_appender::non_blocking::ErrorCounter)
         .ok();
 }
 
+/// 单例检查的三种结局。
+///
+/// **必须分开。** 此前 `CreateMutexW` 返回空句柄与「名字已存在」共用一个出口，
+/// 都被翻译成「另一实例已在运行」——可空句柄的含义是*拿不到那个对象*，
+/// 与*另一实例存在*根本是两回事。2026-07-23 客户日志里 10 个被挡实例有 8 个
+/// 走的是空句柄分支，日志却异口同声说「另一实例已在运行」，
+/// 于是"服务到底起没起来"这个最基本的问题反而查不出来。
+enum SingletonCheck {
+    /// 拿到所有权，本实例可以继续启动。
+    Acquired(SingletonGuard),
+    /// 确认另一实例持有互斥体。
+    AlreadyRunning,
+    /// 连最小权限的 `OpenMutexW(SYNCHRONIZE)` 都打不开：本进程够不着这个全局对象
+    /// （AppContainer / 低完整性 / 异账户上下文），**无从判断**另一实例是否存在。
+    /// 携带 `CreateMutexW` 的 `GetLastError()`（5 = ERROR_ACCESS_DENIED）。
+    Inaccessible(u32),
+}
+
 /// 单例检查：通过 Windows Named Mutex 确保只有一个实例运行
 ///
 /// 与 Go 版 `checkSingleton()` 对齐：
 /// - Mutex 名称：`Global\WindInput{Suffix}IMEService`
 /// - Global namespace 让所有桌面共享同一实例
-/// - 返回 Some(guard) 表示成功获取锁，guard 析构时释放
-/// - 返回 None 表示已有另一实例在运行
 #[cfg(windows)]
-fn check_singleton() -> Option<SingletonGuard> {
+fn check_singleton() -> SingletonCheck {
     // 直接调用 kernel32 的 CreateMutexW，绕过 windows crate 的 Result 包装。
     // Go 版 CreateMutex 在 ERROR_ALREADY_EXISTS 时仍返回有效 handle，
     // 但 windows crate 的 .ok() 会把它转为 Err 丢弃 handle。
@@ -555,12 +584,44 @@ fn check_singleton() -> Option<SingletonGuard> {
         .chain(std::iter::once(0))
         .collect();
 
-    let handle = unsafe { CreateMutexW(std::ptr::null(), 0, wide_name.as_ptr()) };
+    // 与两条命名管道、命名事件、共享内存同款的安全描述符（Everyone + AppContainer
+    // + 低完整性标签）。不带它时用的是令牌默认 DACL，普通宿主进程请求
+    // `MUTEX_ALL_ACCESS` 会被拒——理由见 `wind_bridge::security` 里的说明。
+    //
+    // 只对**本次新建**的互斥体生效：既存实例保留创建时的 ACL，得等它退出后
+    // 才换上新描述符。所以升级后第一次仍可能沿用旧行为，属预期。
+    let sd = wind_bridge::security::shared_object_security_descriptor();
+    let mut sa = sd.as_ref().map(|s| {
+        use windows::Win32::Security::SECURITY_ATTRIBUTES;
+        SECURITY_ATTRIBUTES {
+            nLength: std::mem::size_of::<SECURITY_ATTRIBUTES>() as u32,
+            lpSecurityDescriptor: s.as_ptr() as *mut _,
+            bInheritHandle: false.into(),
+        }
+    });
+    let sa_ptr = sa
+        .as_mut()
+        .map(|p| p as *mut _ as *const std::ffi::c_void)
+        .unwrap_or(std::ptr::null());
+
+    let handle = unsafe { CreateMutexW(sa_ptr, 0, wide_name.as_ptr()) };
 
     if handle.is_invalid() {
-        // 本函数现在早于 init_logger 运行，tracing 尚无 subscriber，只能走启动轨迹。
-        startup_trace::stage("singleton-CreateMutexW-FAILED");
-        return None;
+        // GetLastError 必须紧贴失败的调用读，中间不能夹任何 Win32 调用。
+        let create_err = unsafe { windows::Win32::Foundation::GetLastError() }.0;
+        // 空句柄本身不区分「另一实例存在但本进程够不着」和「全局命名空间不可达」。
+        // 退到最小权限 SYNCHRONIZE 再探一次：能打开就说明那个互斥体确实存在。
+        // 同会话的普通进程即便被默认 DACL 拒了 MUTEX_ALL_ACCESS，登录会话那条 ACE
+        // 通常仍给 SYNCHRONIZE，所以这一步真能把两种情况分开。
+        //
+        // 本函数早于 init_logger 运行，tracing 尚无 subscriber，只能走启动轨迹。
+        if open_existing_mutex(&wide_name) {
+            startup_trace::stage(&format!(
+                "singleton-CreateMutexW-DENIED err={create_err}（互斥体确实存在，本进程权限不足以参与竞争）"
+            ));
+            return SingletonCheck::AlreadyRunning;
+        }
+        return SingletonCheck::Inaccessible(create_err);
     }
 
     // 检查 ERROR_ALREADY_EXISTS（GetLastError = 183）
@@ -571,7 +632,7 @@ fn check_singleton() -> Option<SingletonGuard> {
         unsafe {
             let _ = windows::Win32::Foundation::CloseHandle(handle);
         }
-        return None;
+        return SingletonCheck::AlreadyRunning;
     }
 
     // 等待获取 mutex 所有权（立即返回）
@@ -580,19 +641,44 @@ fn check_singleton() -> Option<SingletonGuard> {
     if wait_result == windows::Win32::Foundation::WAIT_OBJECT_0
         || wait_result == windows::Win32::Foundation::WAIT_ABANDONED
     {
-        Some(SingletonGuard { _handle: handle })
+        SingletonCheck::Acquired(SingletonGuard { _handle: handle })
     } else {
         unsafe {
             let _ = windows::Win32::Foundation::CloseHandle(handle);
         }
-        None
+        SingletonCheck::AlreadyRunning
     }
 }
 
+/// 以最小权限 `SYNCHRONIZE` 探测同名互斥体是否存在。仅用于把 `CreateMutexW`
+/// 的空句柄拆成「存在但够不着」与「够不着全局命名空间」两种结局，不持有句柄。
+#[cfg(windows)]
+fn open_existing_mutex(wide_name: &[u16]) -> bool {
+    // 与上面的 CreateMutexW 同理直接声明：避开 windows crate 的 Result 包装，
+    // 也避开为一个探测函数额外开 feature。
+    unsafe extern "system" {
+        fn OpenMutexW(
+            dwDesiredAccess: u32,
+            bInheritHandle: i32,
+            lpName: *const u16,
+        ) -> windows::Win32::Foundation::HANDLE;
+    }
+    const SYNCHRONIZE: u32 = 0x0010_0000;
+
+    let handle = unsafe { OpenMutexW(SYNCHRONIZE, 0, wide_name.as_ptr()) };
+    if handle.is_invalid() {
+        return false;
+    }
+    unsafe {
+        let _ = windows::Win32::Foundation::CloseHandle(handle);
+    }
+    true
+}
+
 #[cfg(not(windows))]
-fn check_singleton() -> Option<SingletonGuard> {
+fn check_singleton() -> SingletonCheck {
     // 非 Windows 平台：暂不实现单例检查
-    Some(SingletonGuard {})
+    SingletonCheck::Acquired(SingletonGuard {})
 }
 
 /// 单例守卫：析构时释放 Mutex
