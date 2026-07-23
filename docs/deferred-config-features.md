@@ -6,12 +6,13 @@ Stage 1（config_schema 注册表）从 `data/config.toml` 删除了 33 个**孤
 
 > 注：纯样式类（"跟随主题"）与主题层重复的键，不应简单恢复到 config，详见各项备注。
 
-## 1. 热键（hotkeys）
-| 键 | 含义 | 备注 |
+## 1. 热键（hotkeys）——**本节三项均已实现，保留作变更记录**
+
+| 键 | 含义 | 现状 |
 |---|---|---|
-| `hotkeys.take_screenshot` | 截图（OCR/取词）热键 | Go 有截图功能；Rust「无界面截图」在计划中延后 |
-| `hotkeys.open_add_word_dialog` | 独立打开加词对话框热键 | Go 默认 none；当前 Ctrl+Enter 在加词模式内转设置端，未做独立热键 |
-| `hotkeys.enter_temp_pinyin` | 进入临时拼音的全局热键 | 临拼当前靠触发键进入，无独立热键 |
+| `hotkeys.take_screenshot` | 截图（OCR/取词）热键 | **已实现** → `keys.take_screenshot`，默认 `ctrl+shift+f11`；`coordinator.rs` 的 `trigger_screenshot`，且在 `global_hotkeys` 支持集内 |
+| `hotkeys.open_add_word_dialog` | 独立打开加词对话框热键 | **已实现** → `keys.open_add_word_dialog`，默认 `ctrl+shift+equal` |
+| `hotkeys.enter_temp_pinyin` | 进入临时拼音的全局热键 | **已实现** → `input.temp_pinyin.hotkey`（默认空串 = 不注册），与引导键 `trigger_keys` 共存 |
 
 ## 2. 输入（input）
 | 键 | 含义 | 备注 |
@@ -52,3 +53,23 @@ Stage 1（config_schema 注册表）从 `data/config.toml` 删除了 33 个**孤
 | `features.quick_input.accent_color` | 快捷输入模式强调色 | UI 增强 |
 
 > 注：快捷输入已重构为 `features.mix_modes` 融合的成员。恢复这些 provider 开关时，应考虑是否并入 mix_mode 的成员配置体系（见 SETTINGS_REVAMP_PLAN.md 的「实例集合 schema」一节），而非恢复独立 `alpha_providers` 表。
+
+---
+
+# 附：预置层（L2）与代码默认值（L1）不一致的数组键
+
+`data/config.toml` 的数组是**整体覆盖**而非合并，故以下三处的代码默认值在成品里完全不生效——
+成品行为一律以 L2 为准。三者都不是有意识的取舍，而是两侧各自演进、从未对账留下的漂移，
+**待产品决策**后择一收敛（改 L1 使其与 L2 一致，或改 L2 采纳 L1 的元素）。
+
+| 键 | L1（`config.rs` 默认） | L2（`data/config.toml`，即成品行为） | 差异 |
+|---|---|---|---|
+| `input.auto_pair.chinese_pairs` | `（） 【】 ｛｝ 《》 〈〉 「」 『』` | `（） 【】 ｛｝ 《》 〈〉` | 成品**没有** `「」` `『』` 配对 |
+| `input.auto_pair.english_pairs` | `() [] {}` | `() [] {} <>` | 成品**多出** `<>` 配对（`<` 常作小于号，是否该配对存疑） |
+| `input.url.prefixes` | `www. http https ftp. bbs.` | `www. http https ftp.` | 成品**不认** `bbs.` 前缀 |
+
+> 另有两个枚举键的 L1 默认值**不在注册表允许集合内**：`debug.log_level`（L1 = `""`，允许集
+> `trace/debug/info/warn/error`）与 `ui.font.render_mode`（L1 = `""`，允许集 `directwrite/gdi`）。
+> 二者靠 L2 分别填 `info` / `directwrite` 兜住，故加载路径无恙；但对单独的 `Config::default()`
+> 调 `validate()` 会判非法。要么给这两个 enum 的允许集补上 `""`（如 `pager_bar_display` 那样），
+> 要么把 L1 默认值改成合法成员。

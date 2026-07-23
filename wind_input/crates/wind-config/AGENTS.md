@@ -24,7 +24,9 @@
 
 ### Working In This Directory
 
-- **新增配置字段**：在 `config.rs` 对应子结构体添加字段（值类型，带 `#[serde(default)]`）→ 在 `Default::default()` 或 `default_*()` 函数给出合理初值 → 在 `config_schema.rs` 的 `REGISTRY` 中以点分路径追加一条 `f(...)` 声明 → 在 `data/config.toml` 中显式列出。四处必须同步，缺一则 `registry_covers_every_config_key` 测试失败。
+- **新增配置字段**：在 `config.rs` 对应子结构体添加字段（值类型，带 `#[serde(default)]`）→ 在 `Default::default()` 或 `default_*()` 函数给出合理初值 → 在 `config_schema.rs` 的 `REGISTRY` 中以点分路径追加一条 `f(...)` 声明 → 在 `data/config.toml` 中显式列出并写一句说明。四处必须同步：漏注册表由 `registry_covers_every_config_key` 拦，漏预置文件由 `data_config_toml_covers_registry` 拦。
+- **`data/config.toml` 必须列全**：它同时是「出厂默认值」与「全部可配置项的说明书」，注册表里每个键都要在其中显式出现。唯二豁免是 `schema.special_modes` / `schema.mix_modes`——结构体数组写进预置文件会把定义**冻结成快照**（数组是整体覆盖不是合并），日后改代码侧默认值会被静默遮蔽；豁免名单在 `config_schema.rs` 的 `ABSENT_FROM_DATA_CONFIG`，加条目须有「写进去会造成实际危害」这一级的理由。
+- **预置文件的数组会整体替换代码默认值**：`data/config.toml` 里少写一个元素 = 成品里没有该元素。改 `chinese_pairs` / `english_pairs` / `url.prefixes` 这类键前，先与 `config.rs` 的 `default_*()` 比对（三者目前均与代码默认值不一致，见 `docs/deferred-config-features.md`）。
 - **`KeysConfig` 必须手写 `Default`，禁止 derive**：字段的 `#[serde(default)]` 在整表缺失时不触发，全靠 `Default::default()` 给出有效热键默认值；若改为 derive，设置页"恢复默认"后热键清空。
 - **REGISTRY 是全局真相源**：wind-rpc 的 `config.setItems` 用它校验写入，`system.capabilities` 由它派生，`config.getItem` 用它检查键合法性。**改键路径（罕见）须同步**：`REGISTRY` + `Config` struct 字段名（serde rename）+ `data/config.toml` + 所有调用 `Config::set_user_*` 的硬编码路径（`internal_setter_paths_are_registered` 测试守护）。
 - **`set_user_value` 是部分合并写**：只改指定路径，保留用户文件其他已有项，用户层维持最小 diff；异步持久化需先 clone Config 再写，避免并发修改（见根 `AGENTS.md`）。
@@ -35,7 +37,7 @@
 ### Testing Requirements
 
 - wind-config 无 Windows 平台依赖，可在任意主机运行 `cargo test -p wind-config`。
-- `config_schema.rs` 的测试会读取仓库 `data/config.toml`（via `CARGO_MANIFEST_DIR/../../../data`），需仓库 data 目录存在。核心守护：`registry_covers_every_config_key`（struct ↔ registry 零漂移）、`data_config_toml_has_no_orphan_keys`（预置文件无孤立键）、`data_config_toml_values_pass_validation`（类型/enum 合法）。
+- `config_schema.rs` 的测试会读取仓库 `data/config.toml`（via `CARGO_MANIFEST_DIR/../../../data`），需仓库 data 目录存在。核心守护：`registry_covers_every_config_key`（struct ↔ registry 零漂移）、`data_config_toml_covers_registry`（预置文件**不许少**键）、`data_config_toml_has_no_orphan_keys`（预置文件**不许多**键）、`absent_allowlist_stays_accurate`（豁免名单不腐烂）、`data_config_toml_values_pass_validation`（类型/enum 合法）。
 - `hotkey.rs` 的单测覆盖 toggle 模式键 hash（含具体修饰位回归）、数字模板展开、Compiler 端到端编译。
 
 ## Dependencies

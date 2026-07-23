@@ -4,6 +4,18 @@
 # （%APPDATA%\WindInput\config.toml，Layer 3）。
 # 修改此文件可调整新安装或新版本升级后的默认行为，无需重新编译。
 #
+# ── 本文件的契约 ────────────────────────────────────────────────────────────
+# 1. **完整**：`config_schema.rs` 的 REGISTRY 里每一个键都必须在此显式列出，
+#    使本文件同时是「出厂默认值」与「全部可配置项的说明书」。
+#    仅两个实例集合键刻意不写（见下方 [schema] 段说明），已在测试中登记豁免。
+#    守护测试：`data_config_toml_covers_registry`（缺键即失败）、
+#    `data_config_toml_has_no_orphan_keys`（多键即失败）。
+# 2. **新增配置项需四处同步**：`config.rs` 结构体字段 + `Default` 初值 →
+#    `config_schema.rs` 的 REGISTRY → 本文件。漏掉本文件时上面第一个测试会失败。
+# 3. **数组是整体覆盖，不是合并**：本文件写出的数组会**整体替换**代码默认值，
+#    而非并集。故此处漏写一个元素 = 该元素在成品里不存在。改数组类键前请先比对
+#    `config.rs` 的 `default_*()` 函数。
+#
 # 注意：本文件不写 version 键——version 是用户文件的迁移状态锚点。
 
 [schema]
@@ -14,6 +26,17 @@ primary_codetable = ""
 # 主拼音方案 ID（临时拼音的目标方案，如双拼方案 id），留空 = 全拼 "pinyin"
 primary_pinyin = ""
 
+# ── 刻意不在本文件出现的两个键（实例集合，注册表类型 StructList）────────────
+# schema.special_modes  特殊模式列表（引导键 + 引用方案 id；代码默认 = 空数组）
+# schema.mix_modes      临时融合模式列表（代码默认 = 内置「快捷」quick_mix，
+#                       `;` 触发，成员 quick_input / $primary_pinyin / english）
+#
+# 二者是**结构体数组**，本文件一旦写出就会整体替换代码默认值，把当时的定义**冻结**
+# 成快照——日后在 `default_mix_modes()` 里给内置「快捷」加成员或改触发键，全部会被
+# 这份陈旧快照静默遮蔽（用户配置层已因设置页整表写回踩过同一个坑，见
+# `Config::migrate_quick_mix_pinyin_member`）。故真相源留在代码侧，本文件不写。
+# 二者已在 `data_config_toml_covers_registry` 的豁免名单中登记。
+
 # 全局码表配置：所有码表方案公共基线（出厂取主力码表 wubi86 偏好）。
 # 方案个性覆盖：在方案 .schema.toml 的 [engine.codetable] 内联行为字段（作者基线），或
 # %APPDATA%/WindInput/schema_overrides/{id}.toml 同名的 [engine.codetable] 段（设置页写入，深合并覆盖）；
@@ -22,6 +45,8 @@ primary_pinyin = ""
 top_code_commit = true
 clear_on_empty_max = false
 auto_commit_at_full = false
+# 自动上屏的最短码长（0 = 等于该方案全码长）。隐藏参数，设置页不暴露。
+auto_commit_min_len = 0
 punct_commit = true
 show_code_hint = true
 single_code_input = false
@@ -34,9 +59,23 @@ enabled = false
 protect_top_n = 1
 strategy = "top"
 
-# 码表自动造词（连续单字）。
+# 码表自动造词（连续单字）：连续单字上屏累积成序列，遇终止符（标点/回车/空格/焦点切换/
+# 光标移动/多字词上屏）或空闲超时后，按方案 [[encoder.rules]] 为整串算词组编码写入**临时
+# 词库**（立即可选），累计用满 promote_count 次才晋升进用户词库。
 [schema.codetable.auto_phrase]
 enabled = false
+# 造词最小字数。内部字段，设置页不暴露。
+min_phrase_len = 2
+# 造词最大字数。**超长序列整体放弃**，不截末尾 N 字——在连续多字中间切一刀，切出来的
+# 多半不是词，是杂词的主要来源。内部字段，设置页不暴露。
+max_phrase_len = 5
+# 临时词晋升进用户词库所需的使用次数。0 = 不晋升，一直留在临时词库。
+promote_count = 0
+# 连续单字之间的最大间隔（毫秒，0 = 用内置 5000）。超时则视作序列终止。
+# 兜底用：终止信号全漏时防止跨句拼出「加好加好」这类杂词。内部字段，设置页不暴露。
+idle_timeout_ms = 0
+# 临时词库条目上限（0 = 不限）。超出后淘汰权重最低者。内部字段，设置页不暴露。
+temp_max_entries = 5000
 
 # 全局拼音配置：所有拼音类方案（全拼/双拼/混输拼音子方案/临时拼音反查）共用一份。
 [schema.pinyin]
@@ -44,16 +83,40 @@ show_code_hint = true
 use_smart_compose = true
 separator = "auto"
 
+# 模糊音：enabled 是总开关，下面每项各自控制一组等价音（默认全关，逐项按需开启）。
 [schema.pinyin.fuzzy]
 enabled = false
+# 声母组
+zh_z = false
+ch_c = false
+sh_s = false
+n_l = false
+f_h = false
+r_l = false
+# 韵母组（前后鼻音）
+an_ang = false
+en_eng = false
+in_ing = false
+ian_iang = false
+uan_uang = false
 
-# 拼音调频（衰减参数；0=用 store 默认）。
+# 拼音调频（衰减参数；三个数值 0 = 用词频 store 的内置默认）。
 [schema.pinyin.frequency]
 enabled = true
+# 半衰期（小时）：词频热度衰减到一半所需时间。
+half_life = 0.0
+# base 系数：静态基础词频在总分中的权重。
+base_scale = 0.0
+# 最近使用峰值：一次刚使用过的词能获得的最高加成。
+recency_peak = 0.0
 
 # 拼音自动造词。
 [schema.pinyin.auto_learn]
 enabled = true
+# 造词最小字数（0 = 用内置 2）。
+min_word_length = 0
+# 临时词晋升进用户词库所需的使用次数（0 = 用内置默认）。
+promote_count = 0
 
 # 全局混输配置（融合策略；全局唯一，无方案级 override）。
 [schema.mix]
@@ -90,6 +153,12 @@ filter_mode = "smart"
 enter_behavior = "commit"
 space_on_empty_behavior = "commit"
 numpad_behavior = "direct"
+# 顶码上屏时「已确认文字」如何落到宿主（内部/实验项，设置页不暴露）：
+#   direct_commit（默认）= 顶码时真提交，余码的新组合延到触发键 keyup 才开，靠隔一拍
+#                          消息泵躲开 diff 合并；无下划线歧义、WPS 智能标点顶屏不清空。
+#   pre_confirm         = 留在 TSF 组合态聚合，延到最终 CommitText 才真提交；diff 式宿主
+#                          （终端 / Chromium）不双写，但部分宿主会给整段画下划线。
+top_commit_mode = "direct_commit"
 
 # 启动默认状态（原 [general] 域）
 [input.default]
@@ -107,12 +176,22 @@ smart_after_digit = true
 smart_list = ".,:"
 # custom_enabled 为自定义标点映射总开关；custom_mappings 留空时全部走内置默认转换
 custom_enabled = false
+# 自定义标点映射表：key = 源字符（引号用 "1/"2/'1/'2 区分左右），
+# value = [中文半角, 英文全角, 中文全角, 英文半角]（空串或缺列 = 该状态回退默认转换）。
+# 例：custom_mappings = { "." = ["。", "．", "。", "."] }
+custom_mappings = {}
 
 # 智能符号：同一中文标点在时限内连按两次，删前一字符替换为英文
 [input.symbol]
 smart_mode = false
 smart_timeout_ms = 500
 smart_chars = "。，？！：；、～￥·……——"
+# 替换方案：
+#   hold_composition（默认）= 首次按键开 TSF 组合态展示中文符号，再按一次替换组合提交
+#                             英文；超时后自动提交中文，全程无删改操作。
+#   delete_replace          = 首次按键直接提交中文符号，再按一次删掉重打；部分 Chromium
+#                             应用会出现光标偏移。
+smart_method = "hold_composition"
 
 [input.temp_english]
 enabled = true
@@ -128,6 +207,9 @@ cancel_on_mode_switch = false
 [input.temp_pinyin]
 enabled = true
 trigger_keys = ["backtick"]
+# 直达热键（如 "ctrl+shift+p"；空串 = 不注册）。与 trigger_keys 引导键共存，
+# 用热键进入时组合区不写引导符。
+hotkey = ""
 
 [input.auto_pair]
 chinese = false
@@ -171,6 +253,13 @@ add_word = "ctrl+equal"
 open_add_word_dialog = "ctrl+shift+equal"
 toggle_s2t = "ctrl+shift+j"
 activate_ime = "ctrl+shift+["
+take_screenshot = "ctrl+shift+f11"
+# 改用系统级 RegisterHotKey 抢占的**动作名**列表（不是键串）：列进来的动作会绕开宿主
+# 自身的同名快捷键。仅支持无需按键上下文的 7 个动作：
+#   switch_engine / toggle_full_width / toggle_punct / toggle_toolbar /
+#   open_settings / take_screenshot / toggle_s2t
+# 写入其它名字只会进 warn 日志并被忽略。activate_ime 不在此列（走系统
+# DirectSwitchHotkeys 注册表，不经 RegisterHotKey）。空 = 全部走普通键盘钩子。
 global_hotkeys = []
 select_key_groups = ["semicolon_quote"]
 page_keys = ["pageupdown", "minus_equal"]
@@ -197,9 +286,10 @@ max_chars = 16
 layout = "horizontal"
 # 编码显示方式：app_inline=内嵌应用光标处(候选窗不显 preedit) | candidate_top=候选窗顶部独立栏 | candidate_inline=编码内联候选首单元
 preedit_display = "app_inline"
-# 候选窗上翻到光标上方时的三个正交行为开关（可单独或叠加）：
+# 候选窗上翻到光标上方时的两个正交行为开关（可单独或叠加）：
 flip_when_above = false          # 反转候选项排列顺序
 swap_preedit_when_above = false  # 交换编码栏与候选栏位置（编码沉底贴光标）
+# 完全不显示候选窗（与上翻无关的独立开关；盲打用）。
 hide_window = false
 index_labels = ""
 pager_bar_display = ""
@@ -262,4 +352,10 @@ track_english = true
 host_render_processes = ["SearchHost.exe"]
 
 [debug]
+# trace / debug / info / warn / error。注意 info 及以下级别不得含用户输入内容与候选词。
 log_level = "info"
+# 单个日志文件大小上限（MB），超出即滚动。
+log_max_size_mb = 10
+# 保留的旧日志文件数上限（不含主文件）。服务每次启动都会滚动一次，
+# 故该值约等于「能回溯最近几次运行」。
+log_max_files = 10

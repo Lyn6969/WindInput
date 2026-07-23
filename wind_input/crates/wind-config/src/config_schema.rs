@@ -569,6 +569,53 @@ mod tests {
         );
     }
 
+    /// 刻意不写进 `data/config.toml` 的键（配套 [`data_config_toml_covers_registry`]）。
+    ///
+    /// 二者均为**结构体数组**（`StructList`）。本文件写出的数组是整体覆盖而非合并，
+    /// 一旦列进预置文件就会把当时的定义冻结成快照，日后改代码侧默认值全被静默遮蔽。
+    /// 故其真相源留在 `config.rs` 的 `Default`，预置文件只在注释里说明。
+    ///
+    /// **加条目前请三思**：豁免一个键 = 它的默认值从此不在说明书里，
+    /// 只有「写进去会造成实际危害」才够格，「懒得写」不够格。
+    const ABSENT_FROM_DATA_CONFIG: &[&str] = &["schema.special_modes", "schema.mix_modes"];
+
+    /// `data/config.toml` 必须显式列出注册表里的每一个键（豁免名单除外）。
+    ///
+    /// 与 [`data_config_toml_has_no_orphan_keys`] 互为反向：那个测试管「不许多」，
+    /// 这个管「不许少」。缺了这一侧，新增配置项时漏写预置文件不会被任何测试发现——
+    /// 本测试补上前，预置文件已积压 31 个缺键（模糊音 10 项、自动造词 5 项、
+    /// 拼音调频衰减 3 项、截图热键、日志滚动 2 项等）。
+    #[test]
+    fn data_config_toml_covers_registry() {
+        let toml_keys: BTreeSet<String> = leaf_keys_of(&data_config_toml()).into_iter().collect();
+        let missing: Vec<&str> = registry()
+            .iter()
+            .map(|f| f.key)
+            .filter(|k| !toml_keys.contains(*k) && !ABSENT_FROM_DATA_CONFIG.contains(k))
+            .collect();
+        assert!(
+            missing.is_empty(),
+            "data/config.toml 缺少 {} 个已登记键（预置文件应完整列出全部可配置项，\
+             既是出厂默认值也是说明书）: {:?}",
+            missing.len(),
+            missing
+        );
+    }
+
+    /// 豁免名单自身不能腐烂：里面的键必须仍在注册表中，且确实没写进预置文件。
+    /// 否则删掉某个字段后，名单会留下一条永远为真的死条目。
+    #[test]
+    fn absent_allowlist_stays_accurate() {
+        let toml_keys: BTreeSet<String> = leaf_keys_of(&data_config_toml()).into_iter().collect();
+        for key in ABSENT_FROM_DATA_CONFIG {
+            assert!(is_known_key(key), "豁免名单含未登记键（已删字段？）: {key}");
+            assert!(
+                !toml_keys.contains(*key),
+                "{key} 已写进 data/config.toml，应从豁免名单移除"
+            );
+        }
+    }
+
     #[test]
     fn data_config_toml_has_no_orphan_keys() {
         let struct_keys: BTreeSet<String> = config_leaf_keys().into_iter().collect();
