@@ -26,6 +26,7 @@ pub mod input_diag;
 pub mod pipeline;
 pub(crate) mod preedit_cursor;
 pub mod stats;
+pub mod theme_style;
 pub mod watchdog;
 pub mod webdata;
 

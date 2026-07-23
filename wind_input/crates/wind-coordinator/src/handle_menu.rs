@@ -4,6 +4,7 @@
 //! 从 coordinator.rs 拆出（同 crate 内 `impl Coordinator` 块，组织性重构，无逻辑变更）。
 
 use crate::coordinator::{Coordinator, FILTER_MODES};
+use crate::theme_style::ThemeStyle;
 use wind_bridge::handler::MessageHandler;
 use wind_config::Config;
 use wind_keys::keymap;
@@ -500,24 +501,14 @@ impl Coordinator {
         if !theme_children.is_empty() {
             theme_children.push(M::separator());
         }
-        theme_children.push(M::leaf(
-            "跟随系统",
-            cmd(MenuCmd::ThemeStyle(0)),
-            true,
-            style == 0,
-        ));
-        theme_children.push(M::leaf(
-            "亮色",
-            cmd(MenuCmd::ThemeStyle(1)),
-            true,
-            style == 1,
-        ));
-        theme_children.push(M::leaf(
-            "暗色",
-            cmd(MenuCmd::ThemeStyle(2)),
-            true,
-            style == 2,
-        ));
+        for s in [ThemeStyle::System, ThemeStyle::Light, ThemeStyle::Dark] {
+            theme_children.push(M::leaf(
+                s.label(),
+                cmd(MenuCmd::ThemeStyle(s.as_menu_id())),
+                true,
+                style == s,
+            ));
+        }
 
         // 检索范围子菜单：过滤模式单选
         let filter_children: Vec<_> = FILTER_MODES

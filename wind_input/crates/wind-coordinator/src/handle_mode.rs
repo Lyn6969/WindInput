@@ -6,6 +6,7 @@
 use crate::coordinator::{Coordinator, State};
 use crate::pipeline::ModeKind;
 use crate::preedit_cursor;
+use crate::theme_style::ThemeStyle;
 use tracing::{debug, info, warn};
 use wind_bridge::handler::KeyAction;
 use wind_config::Config;
@@ -314,34 +315,51 @@ impl Coordinator {
         }
         let (id, name) = list[index].clone();
         *self.theme_name.lock().unwrap_or_else(|e| e.into_inner()) = id.clone();
-        let dark = *self.theme_style.lock().unwrap_or_else(|e| e.into_inner()) == 2;
+        let dark = self.resolve_theme_dark();
         self.push_theme(&id, dark);
         self.persist_theme(&id);
         self.show_tip(&format!("主题: {}", name));
     }
 
-    /// 设置主题明暗（0 跟随/1 亮/2 暗），用当前主题重解析,并持久化到 config.ui.theme.style。
+    /// 当前该用暗色吗：读运行时明暗设置，`system` 交由实时探测系统明暗。
+    pub(crate) fn resolve_theme_dark(&self) -> bool {
+        self.theme_style
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .resolve_dark()
+    }
+
+    /// 设置主题明暗（菜单协议编码：0 跟随/1 亮/2 暗），用当前主题重解析并持久化到
+    /// config.ui.theme.style。
     pub(crate) fn set_theme_style(&self, style: u8) {
-        let dark = style == 2;
+        let style = ThemeStyle::from_menu_id(style);
         *self.theme_style.lock().unwrap_or_else(|e| e.into_inner()) = style;
-        let style_str = match style {
-            1 => "light",
-            2 => "dark",
-            _ => "system",
-        };
-        let _ = Config::set_user_string(&["ui", "theme", "style"], style_str);
+        let _ = Config::set_user_string(&["ui", "theme", "style"], style.as_config());
         let name = self
             .theme_name
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .clone();
+        self.push_theme(&name, style.resolve_dark());
+        self.show_tip(style.label());
+    }
+
+    /// 系统「浅色/深色模式」切换的响应（UI 线程截获 WM_SETTINGCHANGE 后回送）。
+    ///
+    /// 仅 `system` 需要动作——显式选了亮/暗的用户不该被系统设置改写。
+    pub(crate) fn on_system_theme_changed(&self) {
+        let style = *self.theme_style.lock().unwrap_or_else(|e| e.into_inner());
+        if style != ThemeStyle::System {
+            return;
+        }
+        let name = self
+            .theme_name
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        let dark = style.resolve_dark();
+        tracing::info!("系统明暗切换 → 重解析主题 {} (dark={})", name, dark);
         self.push_theme(&name, dark);
-        let tip = match style {
-            1 => "亮色",
-            2 => "暗色",
-            _ => "跟随系统",
-        };
-        self.show_tip(tip);
     }
 
     /// 持久化主题选择。config.ui.theme.name 为单一源（设置页/右键统一，reload 据此应用）。

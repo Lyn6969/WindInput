@@ -6,8 +6,26 @@
 
 use std::cell::RefCell;
 use std::rc::Rc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::sys::{HWND, LPARAM, LRESULT, WPARAM};
+
+/// 系统「浅色/深色模式」已变更的置位标记。
+///
+/// 系统用 `SendMessageTimeout(HWND_BROADCAST, WM_SETTINGCHANGE, 0, "ImmersiveColorSet")`
+/// 广播这一变更。**发送**的消息不入线程消息队列——它由系统在本线程调用 `PeekMessage`
+/// 期间直接回调 `wnd_proc`，因此 UI 主循环的消息泵里根本看不到它，只能在 `wnd_proc`
+/// 截获。而截获点身处对方 `SendMessage` 的同步等待中，不宜就地重解析主题（会阻塞广播方，
+/// 且 wnd_proc 拿不到协调器），故仅置标记，由 UI 主循环取走后回送协调器。
+static SYSTEM_COLOR_CHANGED: AtomicBool = AtomicBool::new(false);
+
+/// 取走「系统明暗已变更」标记（读取即清零）。UI 主循环每轮调用一次。
+///
+/// 一次系统切换会广播给本进程的每个顶层窗口（候选窗/工具栏/气泡…），标记因而被重复置位；
+/// swap 语义把这一串重复塌缩成一次事件，避免同一次切换触发多轮主题重解析。
+pub fn take_system_color_changed() -> bool {
+    SYSTEM_COLOR_CHANGED.swap(false, Ordering::Relaxed)
+}
 
 /// 浮层窗口鼠标消息处理器（由具体窗口实现，如候选窗）。
 /// 返回 `Some(lresult)` 表示已处理；`None` 交回默认处理。
@@ -36,6 +54,22 @@ mod platform {
         /// hwnd → 鼠标处理器（仅 UI 线程访问，wnd_proc 与窗口同线程）
         static MOUSE_HANDLERS: RefCell<HashMap<isize, Rc<RefCell<dyn WindowMouse>>>> =
             RefCell::new(HashMap::new());
+    }
+
+    /// `WM_SETTINGCHANGE` 的 lParam 是否为 `"ImmersiveColorSet"`（即系统明暗/强调色变更）。
+    ///
+    /// 该消息被系统复用于几十种设置变更（区域、字体、电源…），lParam 是唯一的区分依据；
+    /// 它可能为 NULL（部分变更不带名字），也并非总以我方期望的长度收尾，故显式设上限扫描，
+    /// 不用 `PCWSTR::to_string()`——后者在非法指针上会走到未定义行为。
+    fn is_immersive_color_set(lparam: LPARAM) -> bool {
+        if lparam.0 == 0 {
+            return false;
+        }
+        // 逐字比对（含结尾 NUL——否则 "ImmersiveColorSetX" 之类会被前缀误判）。
+        // `all` 短路：首个不符即停，不会沿非预期字符串一路读下去。
+        let p = lparam.0 as *const u16;
+        let expect = "ImmersiveColorSet".encode_utf16().chain(std::iter::once(0));
+        unsafe { expect.enumerate().all(|(i, c)| *p.add(i) == c) }
     }
 
     /// Layered Window 封装
@@ -370,6 +404,10 @@ mod platform {
             wparam: WPARAM,
             lparam: LPARAM,
         ) -> LRESULT {
+            // 系统浅色/深色模式切换：置标记后仍需交回默认处理（本消息不属于我们，别吞）。
+            if msg == WM_SETTINGCHANGE && is_immersive_color_set(lparam) {
+                super::SYSTEM_COLOR_CHANGED.store(true, super::Ordering::Relaxed);
+            }
             // 不抢焦点：点击浮层不激活窗口，目标应用保持前台
             if msg == WM_MOUSEACTIVATE {
                 return LRESULT(MA_NOACTIVATE as isize);

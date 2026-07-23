@@ -12,6 +12,7 @@
 
 use crate::pipeline::{ModeKind, Rewind};
 use crate::preedit_cursor;
+use crate::theme_style::ThemeStyle;
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
@@ -667,7 +668,7 @@ pub struct Coordinator {
     /// 当前主题名
     pub(crate) theme_name: Mutex<String>,
     /// 主题颜色风格：0=跟随系统 1=亮色 2=暗色
-    pub(crate) theme_style: Mutex<u8>,
+    pub(crate) theme_style: Mutex<ThemeStyle>,
     /// 状态气泡上一次显示的文本，用于抑制"内容没变却重复弹窗"。
     /// 关掉某个内容段后（如全半角），切换该状态不再改变气泡文本，此时应当整个不弹窗。
     /// 在 `show_status` 做文本比对而非判断"这次变的是哪个字段"，是因为后者要给全部
@@ -1106,12 +1107,8 @@ impl Coordinator {
         } else {
             "default".to_string()
         };
-        // 初始明暗：config.ui.theme.style == "dark"(否则亮/跟随系统按亮处理)。修启动不应用风格。
-        let theme_style_init: u8 = match config.ui.theme.style.to_lowercase().as_str() {
-            "light" => 1,
-            "dark" => 2,
-            _ => 0,
-        };
+        // 初始明暗：config.ui.theme.style（system 跟随系统实时探测，见 ThemeStyle::resolve_dark）。
+        let theme_style_init = ThemeStyle::from_config(&config.ui.theme.style);
 
         // 标点转换器：注入自定义映射（四状态）。
         let mut punct_conv = PunctuationConverter::new();
@@ -1667,11 +1664,7 @@ impl Coordinator {
                             name.to_string();
                     }
                     *self.theme_style.lock().unwrap_or_else(|e| e.into_inner()) =
-                        match new_cfg.ui.theme.style.to_lowercase().as_str() {
-                            "light" => 1,
-                            "dark" => 2,
-                            _ => 0,
-                        };
+                        ThemeStyle::from_config(&new_cfg.ui.theme.style);
                 }
                 // 同步工具栏显隐:设置页改 ui.toolbar.visible 后运行时态跟随,再刷新工具栏。
                 {
@@ -2642,6 +2635,7 @@ impl Coordinator {
             UiEvent::CandidateWindowMoved { x, y } => self.save_candidate_pos(x, y),
             UiEvent::RequestStatusMenu { x, y } => self.show_status_menu(x, y),
             UiEvent::RequestTooltipMenu { x, y } => self.show_tooltip_menu(x, y),
+            UiEvent::SystemThemeChanged => self.on_system_theme_changed(),
         }
     }
 

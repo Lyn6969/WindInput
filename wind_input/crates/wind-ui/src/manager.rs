@@ -473,6 +473,9 @@ pub enum UiEvent {
     RequestStatusMenu { x: i32, y: i32 },
     /// 右键悬停提示（编码反查气泡）请求弹出菜单（屏幕坐标）
     RequestTooltipMenu { x: i32, y: i32 },
+    /// 系统「浅色/深色模式」已切换（Win32 `WM_SETTINGCHANGE`/`ImmersiveColorSet`）。
+    /// 协调器仅在 `ui.theme.style = "system"` 时据此重解析主题，其余明暗为用户显式指定。
+    SystemThemeChanged,
 }
 
 /// UI 管理器（在独立线程中运行）
@@ -673,6 +676,12 @@ impl UiManager {
                     }
                     let _ = TranslateMessage(&msg);
                     DispatchMessageW(&msg);
+                }
+                // 系统明暗切换：wnd_proc 在上面 PeekMessage 期间被系统回调置标记（该消息是
+                // SendMessage 广播，不入队列，泵里截不到），故在泵之后取走并回送协调器。
+                if crate::window::take_system_color_changed() {
+                    debug!("UI: 系统明暗设置变更 → 通知协调器");
+                    let _ = event_tx.send(UiEvent::SystemThemeChanged);
                 }
             }
 
