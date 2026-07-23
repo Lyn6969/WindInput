@@ -9,7 +9,10 @@
 //!
 //! 复用 wind-ipc 的 JSON-RPC 协议（Request/Response/EventMessage + 4 字节大端长度前缀帧）。
 
-mod capabilities;
+/// capability descriptor 生成。**公开**是为了让消费方（wind-setting 检入的
+/// `capabilities.snapshot.json`）能在测试里直接对照生成结果，而不是靠人工同步一份副本
+/// ——手抄的镜像必然漂移，此前该快照已积累 4 处默认值偏离、缺 2 键、多 1 键。
+pub mod capabilities;
 pub mod client;
 mod dispatch;
 mod events;
