@@ -124,7 +124,11 @@ show_source_hint = false
 enable_english = false
 pinyin_only_overflow = true
 top_code_override_pinyin = false
-auto_commit_block_on_pinyin = false
+# 满码自动上屏**与顶码上屏**遇拼音候选则否决（粗粒度：整串只要查得出拼音候选就让路拼音，
+# 不看拼音成不成词）。与下方细粒度的 block_commit_on_pinyin_word 叠加，任一命中即否决。
+# 注意它同时管顶码上屏，而 schema.codetable.top_code_commit 出厂即开；
+# top_code_override_pinyin 可无视本否决强制倒向码表。
+auto_commit_block_on_pinyin = true
 # 满码上屏遇英文候选则否决（保护正在输入英文词的用户；仅 enable_english 开时有意义）。
 auto_commit_block_on_english = false
 min_pinyin_length = 2

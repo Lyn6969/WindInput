@@ -415,9 +415,14 @@ pub struct MixGlobal {
     /// 顶码偏好（顶码覆盖拼音）。
     #[serde(default)]
     pub top_code_override_pinyin: bool,
-    /// 满码上屏遇拼音候选则否决（保护拼音用户）。默认关：粗粒度一票否决太激进，
-    /// 细粒度拦截由 `block_commit_on_pinyin_word`（默认开）承担。
-    #[serde(default)]
+    /// 满码自动上屏 **与顶码上屏**遇拼音候选则否决（保护拼音用户）。默认开。
+    ///
+    /// 这是**粗粒度**一票否决：整串只要能查出任何拼音候选就让路拼音，不看拼音成不成词。
+    /// 与细粒度的 `block_commit_on_pinyin_word`（按词强度判，默认开）叠加生效，
+    /// 二者任一命中即否决（见 `pinyin_vetoes_commit`）。
+    /// 注意作用面覆盖顶码上屏，而 `schema.codetable.top_code_commit` 出厂即开——
+    /// 混输方案下改动本项会直接改变顶码行为；`top_code_override_pinyin` 可无视本否决。
+    #[serde(default = "default_true")]
     pub auto_commit_block_on_pinyin: bool,
     /// 满码上屏遇英文候选则否决（保护正在输入英文词的用户；仅 enable_english 开时有意义）。
     #[serde(default)]
@@ -450,7 +455,7 @@ impl Default for MixGlobal {
             enable_english: false,
             pinyin_only_overflow: false,
             top_code_override_pinyin: false,
-            auto_commit_block_on_pinyin: false,
+            auto_commit_block_on_pinyin: true,
             auto_commit_block_on_english: false,
             min_pinyin_length: 0,
             min_english_length: 0,
