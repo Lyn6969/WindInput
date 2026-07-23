@@ -186,12 +186,13 @@ custom_mappings = {}
 smart_mode = false
 smart_timeout_ms = 500
 smart_chars = "。，？！：；、～￥·……——"
-# 替换方案：
-#   hold_composition（默认）= 首次按键开 TSF 组合态展示中文符号，再按一次替换组合提交
-#                             英文；超时后自动提交中文，全程无删改操作。
-#   delete_replace          = 首次按键直接提交中文符号，再按一次删掉重打；部分 Chromium
-#                             应用会出现光标偏移。
-smart_method = "hold_composition"
+# 替换方案（「体感」与「兼容性」的取舍，故两者都保留）：
+#   delete_replace（默认）= 首次按键直接上屏中文符号，再按一次删掉重打成英文。所见即所得、
+#                           无预览态中间状态，实际体感更好；代价是依赖对宿主做删改。
+#   hold_composition      = 首次按键开 TSF 组合态预览中文符号，再按一次替换组合提交英文；
+#                           超时后自动提交中文。全程不做删改，**兼容性更好**，适合在
+#                           delete_replace 下表现异常的宿主。
+smart_method = "delete_replace"
 
 [input.temp_english]
 enabled = true

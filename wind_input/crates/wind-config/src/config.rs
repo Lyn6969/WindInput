@@ -712,15 +712,19 @@ impl Default for PunctConfig {
     }
 }
 
-/// 智能符号替换方案。
-/// - `DeleteReplace`：press1 直接提交中文符号，press2 删改（当前方案，部分 Chromium 应用光标偏移）。
+/// 智能符号替换方案。两者是「体感」与「兼容性」的取舍，故都保留：
+/// - `DeleteReplace`（**默认**）：press1 直接提交中文符号，press2 删掉重打成英文。
+///   所见即所得、无预览态中间状态，实际体感更好；代价是依赖对宿主做删改
+///   （早期的 Office 500ms 重复、SendInput 自重入、prevChar 读不到致完全不触发
+///   三处已修）。
 /// - `HoldComposition`：press1 开启 TSF 组合态展示中文符号，press2 替换组合提交英文；
-///   超时（smart_timeout_ms）后自动提交中文，无删改操作（推荐）。
+///   超时（smart_timeout_ms）后自动提交中文。全程不做删改，**兼容性更好**，
+///   适合对删改敏感、DeleteReplace 下表现异常的宿主。
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
 #[serde(rename_all = "snake_case")]
 pub enum SmartMethod {
-    DeleteReplace,
     #[default]
+    DeleteReplace,
     HoldComposition,
 }
 
@@ -750,7 +754,7 @@ pub struct SymbolConfig {
     /// 参与智能符号转换的中文标点集合（子串包含匹配，含成对/多字符标点）。
     #[serde(default = "default_smart_symbol_chars")]
     pub smart_chars: String,
-    /// 替换方案：`delete_replace`（删改）或 `hold_composition`（保持组合态，默认）。
+    /// 替换方案：`delete_replace`（删改，默认）或 `hold_composition`（保持组合态，兼容性更好）。
     #[serde(default)]
     pub smart_method: SmartMethod,
 }
@@ -2550,7 +2554,7 @@ mod tests {
     #[test]
     fn test_smart_method_default() {
         let cfg = SymbolConfig::default();
-        assert_eq!(cfg.smart_method, SmartMethod::HoldComposition);
+        assert_eq!(cfg.smart_method, SmartMethod::DeleteReplace);
     }
 
     #[test]
@@ -2568,7 +2572,7 @@ smart_method = "delete_replace"
     fn test_smart_method_default_when_absent() {
         let toml = r#"smart_mode = true"#;
         let cfg: SymbolConfig = toml::from_str(toml).unwrap();
-        assert_eq!(cfg.smart_method, SmartMethod::HoldComposition);
+        assert_eq!(cfg.smart_method, SmartMethod::DeleteReplace);
     }
 
     #[test]
