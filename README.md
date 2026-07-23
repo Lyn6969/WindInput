@@ -10,34 +10,35 @@
 
 <p align="center">
   <img src="https://img.shields.io/badge/platform-Windows%2010%2F11-brightgreen" alt="Platform">
-  <img src="https://img.shields.io/badge/macOS-12%2B%20alpha-orange" alt="macOS alpha">
+  <img src="https://img.shields.io/badge/macOS-12%2B-blue" alt="macOS">
   <img src="https://img.shields.io/badge/license-MIT-green" alt="License">
 </p>
 
-> **⚠️ 早期开发阶段**
->
-> 本项目处于 alpha 阶段，功能和配置格式可能随版本更新发生变化。
+<p align="center">
+  <a href="https://windinput.com"><b>官网</b></a> ·
+  <a href="https://windinput.com/download"><b>下载</b></a> ·
+  <a href="https://windinput.com/docs"><b>使用文档</b></a> ·
+  <a href="https://windinput.com/changelog"><b>更新日志</b></a>
+</p>
 
 ## 特性
 
-- **专为五笔设计** — 支持五笔 86、五笔拼音混输，同时提供全拼和双拼输入
+- **专为五笔和码表输入方案设计** — 五笔 86、五笔拼音混输，同时提供全拼和双拼
 - **方案驱动** — 通过方案文件灵活定义输入行为
 - **图形设置** — 配套设置工具，配置可视化调整，修改即时生效
 - **亮暗主题** — 支持亮色和暗色主题，可随系统自动切换
-- **高 DPI 适配** — 支持高分辨率和多显示器环境
 - **轻量运行** — Rust 实现，资源占用低，启动迅速
 
 ## 安装
 
-从 [Releases](../../releases) 页面下载：
+前往 [windinput.com/download](https://windinput.com/download) 下载 Windows 安装包，
+双击安装后按 `Win + Space` 切换到清风输入法。
 
-- **Windows 安装包**：`WindInput-Setup-x.x.x.exe`，双击安装
+macOS 目前仅支持从源码构建，暂未提供安装包。
 
-安装完成后，按 `Win + Space` 切换到清风输入法。
+## 文档
 
-> 当前版本未做数字签名，安装时可能需要在系统安全设置中手动放行。
-
-macOS 目前仅支持[从源码构建](#从源码构建)，暂未提供安装包。
+完整的使用说明、配置参考和常见问题都在文档站：**[windinput.com/docs](https://windinput.com/docs)**
 
 ## 仓库范围
 
@@ -50,7 +51,7 @@ macOS 目前仅支持[从源码构建](#从源码构建)，暂未提供安装包
 | `wind_macos` | Swift | macOS IMKit 输入法客户端 |
 
 配套的设置程序、便携启动器与安装器目前未开源，完整成品请从
-[Releases](../../releases) 下载。核心部分可独立构建和运行。
+[下载页](https://windinput.com/download)获取。核心部分可独立构建和运行。
 
 ## 从源码构建
 
@@ -67,21 +68,12 @@ macOS 目前仅支持[从源码构建](#从源码构建)，暂未提供安装包
 
 > 首次提交 PR 需要签署 [贡献者许可协议 (CLA)](CLA.md)。
 
-## 第三方资源
-
-| 资源 | 用途 | 许可证 |
-|------|------|--------|
-| [白霜拼音 (rime-frost)](https://github.com/gaboolic/rime-frost) | 拼音词库数据源 | GPL-3.0 |
-| [极点五笔 for Rime](https://github.com/KyleBing/rime-wubi86-jidian) | 五笔 86 码表数据源 | Apache-2.0 |
-| [pinyin-data](https://github.com/mozillazg/pinyin-data) | 汉字拼音注音数据 | MIT |
-| [OpenCC](https://github.com/BYVoid/OpenCC) | 简繁转换数据 | Apache-2.0 |
-
-完整声明（含来源不详资源的说明）请参阅 [NOTICE.md](NOTICE.md)。
-
 ## 许可证
 
-本项目源代码采用 [MIT 许可证](LICENSE)。词库数据来源于第三方项目，
-适用各自的许可证条款，详见 [NOTICE.md](NOTICE.md)。
+本项目源代码采用 [MIT 许可证](LICENSE)。词库数据来源于
+[白霜拼音](https://github.com/gaboolic/rime-frost)、[极点五笔](https://github.com/KyleBing/rime-wubi86-jidian)、
+[pinyin-data](https://github.com/mozillazg/pinyin-data)、[OpenCC](https://github.com/BYVoid/OpenCC)
+等第三方项目，适用各自的许可证条款，完整声明详见 [NOTICE.md](NOTICE.md)。
 
 ## 交流与反馈
 
