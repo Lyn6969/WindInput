@@ -1,0 +1,228 @@
+name: Release Published
+
+# Release 正式发布(release.yml 产出草稿 → 人工审核 Release Notes → 点 Publish)的下游动作:
+#   1. notify-docs  通知文档仓同步更新记录 → data/releases.json → 驱动 /changelog 与 /download
+#   2. sync-to-r2   把安装包与在线升级元数据推到 Cloudflare R2(dl.windinput.com)
+#
+# 配置项(Settings → Secrets and variables → Actions)。缺任一项时对应 job 跳过而非失败:
+#   Variables:
+#     DOCS_REPO    文档仓 owner/name,如 huanfeng/WindInputDocs
+#     R2_BUCKET    Cloudflare R2 bucket 名
+#     R2_BASE_URL  R2 自定义域名,如 https://dl.windinput.com(不含结尾斜杠)
+#   Secrets:
+#     DOCS_REPO_PAT          对文档仓有 contents:write 的 PAT(GITHUB_TOKEN 跨仓无效)
+#     CLOUDFLARE_API_TOKEN   具备 R2 Edit 权限的 Token
+#     CLOUDFLARE_ACCOUNT_ID  Cloudflare 账户 ID
+#
+# ⚠️ 依赖 release.yml 的 draft: true。GitHub 不会为 GITHUB_TOKEN 发起的动作触发新 workflow
+# (防递归),若把 release.yml 改成直接发布正式版,release:published 事件不会产生,本工作流
+# 将静默失效 —— 届时需改由 release.yml 内联这两段逻辑。
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "要补同步的 Release tag(如 v0.109.0)"
+        required: true
+        type: string
+
+permissions:
+  contents: read          # gh release download / view
+
+jobs:
+  notify-docs:
+    name: 通知文档仓同步更新记录
+    runs-on: ubuntu-latest
+    env:
+      DOCS_REPO: ${{ vars.DOCS_REPO }}
+      PAT: ${{ secrets.DOCS_REPO_PAT }}
+      TAG: ${{ github.event.release.tag_name || inputs.tag }}
+    steps:
+      # 文档仓侧由 .github/workflows/sync-changelog.yml 接收 changelog-updated,
+      # 取 Release body 的 user-facing 标记块写入 data/releases.json 并开 PR 自动合并。
+      # 该仓另有每天 04:00 CST 的 schedule 兜底,故此处失败只会退化为最长约一天的延迟。
+      - name: 发送 repository_dispatch
+        run: |
+          if [ -z "$DOCS_REPO" ] || [ -z "$PAT" ]; then
+            echo "::warning::未配置 vars.DOCS_REPO 或 secrets.DOCS_REPO_PAT,跳过通知;文档仓的每日 schedule 会兜底同步。"
+            exit 0
+          fi
+          jq -n --arg tag "$TAG" \
+            '{event_type: "changelog-updated", client_payload: {tag: $tag}}' \
+            | curl -fsS -X POST \
+                -H "Accept: application/vnd.github+json" \
+                -H "Authorization: Bearer $PAT" \
+                "https://api.github.com/repos/${DOCS_REPO}/dispatches" \
+                --data-binary @-
+          echo "已通知 ${DOCS_REPO} 同步 $TAG"
+
+  sync-to-r2:
+    name: 同步安装包与升级元数据到 R2
+    runs-on: ubuntu-latest
+    env:
+      R2_BUCKET: ${{ vars.R2_BUCKET }}
+      R2_BASE_URL: ${{ vars.R2_BASE_URL }}
+      TAG: ${{ github.event.release.tag_name || inputs.tag }}
+      CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+      CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+    steps:
+      - name: 检查 R2 配置是否完整
+        id: gate
+        run: |
+          if [ -z "$R2_BUCKET" ] || [ -z "$R2_BASE_URL" ] \
+             || [ -z "$CLOUDFLARE_API_TOKEN" ] || [ -z "$CLOUDFLARE_ACCOUNT_ID" ]; then
+            echo "::warning::R2 配置不完整(vars.R2_BUCKET / vars.R2_BASE_URL / secrets.CLOUDFLARE_API_TOKEN / secrets.CLOUDFLARE_ACCOUNT_ID),跳过 R2 同步。"
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Setup Node
+        if: steps.gate.outputs.skip != 'true'
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: 安装 wrangler
+        if: steps.gate.outputs.skip != 'true'
+        run: npm install -g wrangler@4
+
+      # 产物名以打包脚本为唯一口径:pack-installer.sh 与 dev.ps1 均产出
+      # WindInput-Setup-<版本>.exe。dev.ps1 的 exeUrl 直接用产物名拼 CDN 地址,
+      # 故 R2 上的对象名必须与之逐字一致,否则在线升级会下到 404。
+      - name: 从 Release 下载安装包与发布说明
+        if: steps.gate.outputs.skip != 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          VERSION="${TAG#v}"
+          echo "VERSION=$VERSION" >> "$GITHUB_ENV"
+          mkdir -p dl
+          gh release download "$TAG" --repo "${{ github.repository }}" \
+            --pattern "WindInput-Setup-${VERSION}.exe" --dir ./dl
+          gh release download "$TAG" --repo "${{ github.repository }}" \
+            --pattern "WindInput-Setup-${VERSION}.exe.sha256" --dir ./dl
+          # 升级元数据里的 releaseNotesUrl 指向它(命名口径见 dev.ps1 New-UpdateManifest)
+          gh release view "$TAG" --repo "${{ github.repository }}" --json body -q .body \
+            > "./dl/WindInput-${VERSION}-Release.md"
+          # 统一从 Release 取发布时间:手动 workflow_dispatch 补触发时
+          # github.event.release.* 全为空,直接引用会写出 publishedAt 为空串的元数据。
+          PUBLISHED_AT=$(gh release view "$TAG" --repo "${{ github.repository }}" \
+            --json publishedAt -q .publishedAt)
+          echo "PUBLISHED_AT=$PUBLISHED_AT" >> "$GITHUB_ENV"
+          ls -lh ./dl
+
+      # 记下 R2 上当前指向的版本,留到最后再删 —— 先删后传会留出一个
+      # 「latest.json 指向的对象已不存在」的窗口。
+      - name: 记录 R2 上的前一版本
+        if: steps.gate.outputs.skip != 'true'
+        id: prev
+        run: |
+          PREV_JSON=$(curl -fsSL "${R2_BASE_URL}/latest.json" || echo "")
+          PREV=$(printf '%s' "$PREV_JSON" | jq -r '.version // empty' 2>/dev/null || echo "")
+          echo "previous version on R2: ${PREV:-<none>}"
+          echo "version=$PREV" >> "$GITHUB_OUTPUT"
+
+      # 上传顺序是契约:先 exe 后 latest.json。json 是开关,反过来会让客户端
+      # 看到新版本却下载到 404(dev.ps1:1181 同款约定)。
+      - name: 上传安装包到 R2
+        if: steps.gate.outputs.skip != 'true'
+        run: |
+          wrangler r2 object put --remote "$R2_BUCKET/WindInput-Setup-${VERSION}.exe" \
+            --file "./dl/WindInput-Setup-${VERSION}.exe" \
+            --content-type "application/octet-stream"
+          wrangler r2 object put --remote "$R2_BUCKET/WindInput-Setup-${VERSION}.exe.sha256" \
+            --file "./dl/WindInput-Setup-${VERSION}.exe.sha256" \
+            --content-type "text/plain; charset=utf-8"
+
+      - name: 上传发布说明到 R2
+        if: steps.gate.outputs.skip != 'true'
+        run: |
+          wrangler r2 object put --remote "$R2_BUCKET/WindInput-${VERSION}-Release.md" \
+            --file "./dl/WindInput-${VERSION}-Release.md" \
+            --content-type "text/markdown; charset=utf-8"
+
+      # 字段契约见 wind-setting/docs/online-update-plan.md §3.2,与 dev.ps1 的
+      # New-UpdateManifest 保持一致。sha256/size 为必填且必须真实 —— 客户端在缺失或
+      # 不匹配时拒绝升级,不退化为「不校验就装」(旧 Go 版 size 恒为 0,导致 %TEMP% 里
+      # 一个被截断的同名文件会被当成完整包安装)。size 必须是 JSON 数字而非字符串,
+      # 故用 jq --argjson 构造。
+      - name: 生成并上传 latest.json
+        if: steps.gate.outputs.skip != 'true'
+        run: |
+          EXE="./dl/WindInput-Setup-${VERSION}.exe"
+          SHA=$(awk '{print $1}' "./dl/WindInput-Setup-${VERSION}.exe.sha256")
+          SIZE=$(stat -c %s "$EXE")
+          # sidecar 与实际产物不符说明 Release 资产被动过,宁可发布失败也不能发出错误校验值
+          ACTUAL=$(sha256sum "$EXE" | awk '{print $1}')
+          if [ "$SHA" != "$ACTUAL" ]; then
+            echo "ERROR: sha256 sidecar($SHA) 与安装包实际值($ACTUAL) 不符" >&2
+            exit 1
+          fi
+          jq -n \
+            --arg version "$VERSION" \
+            --arg tag "$TAG" \
+            --arg exeUrl "${R2_BASE_URL}/WindInput-Setup-${VERSION}.exe" \
+            --arg sha256 "$SHA" \
+            --argjson size "$SIZE" \
+            --arg releaseNotesUrl "${R2_BASE_URL}/WindInput-${VERSION}-Release.md" \
+            --arg publishedAt "$PUBLISHED_AT" \
+            '{version: $version, tag: $tag, channel: "stable", exeUrl: $exeUrl,
+              sha256: $sha256, size: $size, releaseNotesUrl: $releaseNotesUrl,
+              publishedAt: $publishedAt}' > latest.json
+          cat latest.json
+          wrangler r2 object put --remote "$R2_BUCKET/latest.json" \
+            --file latest.json \
+            --content-type "application/json; charset=utf-8"
+
+      - name: 校验 R2 公开地址可达
+        if: steps.gate.outputs.skip != 'true'
+        run: |
+          set -e
+          EXPECTED_EXE_SIZE=$(stat -c %s "./dl/WindInput-Setup-${VERSION}.exe")
+          check() {
+            local url="$1" expected_size="$2" attempt=0 headers actual
+            echo "Verifying: $url"
+            while [ $attempt -lt 6 ]; do
+              attempt=$((attempt + 1))
+              if headers=$(curl -fsSL -I "$url" 2>&1); then
+                if [ -z "$expected_size" ]; then
+                  echo "OK: reachable"; return 0
+                fi
+                actual=$(printf '%s\n' "$headers" \
+                  | awk 'BEGIN{IGNORECASE=1} /^content-length:/ {gsub(/\r/,""); print $2}' | tail -n1)
+                if [ "$actual" = "$expected_size" ]; then
+                  echo "OK: size matches ($actual bytes)"; return 0
+                fi
+                echo "Size mismatch: expected=$expected_size actual=$actual, retrying..."
+              else
+                echo "HEAD failed (attempt $attempt/6), retrying in 5s..."
+              fi
+              sleep 5
+            done
+            echo "ERROR: $url 六次尝试后仍不可达或大小不符" >&2
+            return 1
+          }
+          check "${R2_BASE_URL}/WindInput-Setup-${VERSION}.exe" "$EXPECTED_EXE_SIZE"
+          check "${R2_BASE_URL}/WindInput-Setup-${VERSION}.exe.sha256" ""
+          check "${R2_BASE_URL}/WindInput-${VERSION}-Release.md" ""
+          check "${R2_BASE_URL}/latest.json" ""
+          echo "R2 对象全部校验通过。"
+
+      # 校验通过后才清理旧版本,失败时旧版本原样留着仍可下载。
+      # 只删按当前命名口径拼出的对象;更早的 Go 版遗留对象(WindInput-<版本>-Setup.exe)
+      # 命名不同,不会被误删,需要时手工清理。
+      - name: 清理 R2 上的旧版本对象
+        if: steps.gate.outputs.skip != 'true' && steps.prev.outputs.version != ''
+        env:
+          PREV_VERSION: ${{ steps.prev.outputs.version }}
+        run: |
+          if [ "$PREV_VERSION" = "$VERSION" ]; then
+            echo "前一版本与本次相同($VERSION),无需清理"
+            exit 0
+          fi
+          echo "清理旧版本: $PREV_VERSION"
+          wrangler r2 object delete --remote "$R2_BUCKET/WindInput-Setup-${PREV_VERSION}.exe" || true
+          wrangler r2 object delete --remote "$R2_BUCKET/WindInput-Setup-${PREV_VERSION}.exe.sha256" || true
+          wrangler r2 object delete --remote "$R2_BUCKET/WindInput-${PREV_VERSION}-Release.md" || true
