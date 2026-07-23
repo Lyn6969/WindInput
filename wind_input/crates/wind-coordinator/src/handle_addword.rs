@@ -88,6 +88,25 @@ impl Coordinator {
     /// 另有约 10 处直接构造 `InsertText` 的路径（顶码/智能符号/临拼等），散点打点必漏。
     /// 与 `record_input_stats` 同一收口思路。
     pub(crate) fn note_commit_action(&self, action: &KeyAction) {
+        // 撤销上屏窗口（`ime.undo_commit`）：记录本次按键「同步落到光标前」的字符数（UTF-16
+        // 单元，对齐 ReplaceBackward 删除量纲）。覆盖一切确定落屏的返回变体——每次上屏都顶掉
+        // 上一次计数，故 undo 只精准删「刚输入完那次」；英文/标点逐键上屏自然把计数刷回 1，
+        // 不会残留更早的中文整词计数致误删。组合态（PassThrough/UpdateComposition/
+        // HoldComposition）尚未落屏，不动计数。本收口点覆盖 40+ 返回点，避免散点接线漏更新。
+        let committed = match action {
+            KeyAction::InsertText { text, .. }
+            | KeyAction::InsertTextWithCursor { text, .. }
+            | KeyAction::ReplaceBackward { text, .. } => text.as_str(),
+            KeyAction::CommitAndHoldComposition { commit_text, .. }
+            | KeyAction::CommitThenDeferComposition { commit_text, .. } => commit_text.as_str(),
+            _ => "",
+        };
+        let n = committed.encode_utf16().count();
+        if n > 0 {
+            self.last_commit_len
+                .store(n, std::sync::atomic::Ordering::Relaxed);
+        }
+
         let text = match action {
             KeyAction::InsertText { text, .. } | KeyAction::InsertTextWithCursor { text, .. } => {
                 text.as_str()
@@ -764,6 +783,63 @@ mod tests {
         for it in items {
             h.push_front(it.to_string());
         }
+    }
+
+    use std::sync::atomic::Ordering;
+    use wind_bridge::handler::{KeyAction, MessageHandler};
+
+    /// 撤销上屏计数（`last_commit_len`）随「同步落屏」按键更新：中文整词记字符数、
+    /// 英文/标点逐键覆盖回 1（防残留旧中文计数误删）、emoji 按 UTF-16 单元、组合态不动。
+    #[test]
+    fn undo_commit_len_tracks_last_commit() {
+        let c = coord("undo_len");
+        assert_eq!(c.last_commit_len.load(Ordering::Relaxed), 1, "默认删 1");
+
+        c.note_commit_action(&Coordinator::commit_action("你好".into(), true));
+        assert_eq!(c.last_commit_len.load(Ordering::Relaxed), 2, "中文整词记 2");
+
+        // 英文逐键上屏刷回 1：这一步顶掉上面的中文计数，正是「敲 abc 后 undo 不误删你好」的关键。
+        c.note_commit_action(&Coordinator::commit_action("a".into(), false));
+        assert_eq!(c.last_commit_len.load(Ordering::Relaxed), 1, "英文覆盖为 1");
+
+        // emoji：UTF-16 surrogate pair 计 2 单元，与 TSF/macOS 删除量纲一致。
+        c.note_commit_action(&Coordinator::commit_action("😀".into(), true));
+        assert_eq!(c.last_commit_len.load(Ordering::Relaxed), 2, "emoji 记 2 单元");
+
+        // 组合态（尚未落屏）不动计数。
+        c.note_commit_action(&KeyAction::PassThrough);
+        assert_eq!(c.last_commit_len.load(Ordering::Relaxed), 2, "组合态不覆盖");
+
+        // 智能标点替换：按替换后光标前文本长度计。
+        c.note_commit_action(&KeyAction::ReplaceBackward {
+            count: 2,
+            text: "—".into(),
+        });
+        assert_eq!(c.last_commit_len.load(Ordering::Relaxed), 1, "替换后记新符号长");
+    }
+
+    /// 焦点变化复位撤销计数：换窗/换文本框后光标前已非「刚上屏那段」，退化删 1。
+    #[test]
+    fn focus_lost_resets_undo_commit_len() {
+        let c = coord("undo_focus");
+        c.note_commit_action(&Coordinator::commit_action("世界".into(), true));
+        assert_eq!(c.last_commit_len.load(Ordering::Relaxed), 2);
+        c.handle_focus_lost();
+        assert_eq!(c.last_commit_len.load(Ordering::Relaxed), 1, "失焦后退化删 1");
+    }
+
+    /// 打字中（输入缓冲非空）触发 undo 应提前返回、不消耗计数（不 swap）。
+    #[test]
+    fn undo_commit_ignored_while_composing() {
+        let c = coord("undo_composing");
+        c.last_commit_len.store(5, Ordering::Relaxed);
+        c.state.lock().unwrap().input_buffer = "abc".to_string();
+        c.cmd_undo_commit();
+        assert_eq!(
+            c.last_commit_len.load(Ordering::Relaxed),
+            5,
+            "缓冲非空应忽略，计数不变"
+        );
     }
 
     /// learn_phrase_on_commit 6a 晋升路径：promote_count=2，造词两次达阈值 → 自动晋升。

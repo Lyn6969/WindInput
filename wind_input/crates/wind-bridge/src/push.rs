@@ -215,8 +215,9 @@ impl PushServer {
     /// 仅向活动客户端投递（用于 commit 等带副作用的消息，避免广播导致多次上屏）。
     /// 优先按活动 token 匹配；无匹配且仅一个客户端时兜底发它；否则跳过。
     /// 返回是否已投入某客户端的发送队列（false = 无客户端/无匹配/通道已断，
-    /// 肯定没投出去）。true 仅表示入队成功，不保证对端最终收到；需要区分
-    /// 「肯定失败」的调用方（如撤销上屏回滚历史）用返回值，其余调用点可忽略。
+    /// 肯定没投出去）。true 仅表示入队成功，不保证对端最终收到。当前调用点均忽略
+    /// 该返回；保留以备需要区分「肯定失败」的场景（撤销上屏曾据此回滚历史，现改为
+    /// 读取即复位计数、不再依赖投递结果）。
     pub fn push_commit_to_active(&self, data: &[u8]) -> bool {
         let active = self.active_token.load(Ordering::Relaxed);
         let clients = self.clients.lock().unwrap();

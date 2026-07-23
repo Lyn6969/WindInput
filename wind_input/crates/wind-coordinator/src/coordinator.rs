@@ -682,6 +682,13 @@ pub struct Coordinator {
     pub(crate) self_weak: std::sync::OnceLock<std::sync::Weak<Coordinator>>,
     /// 上屏历史环形缓冲（index 0 = 最近）：供命令栏 `last(n)` 取最近上屏文本。
     pub(crate) recent_commits: Mutex<std::collections::VecDeque<String>>,
+    /// 撤销上屏（`ime.undo_commit`）删除量：最近一次「同步落到光标前」的字符数（UTF-16 单元，
+    /// 与 TSF ShiftStart / macOS NSRange 同量纲）。**刻意与 `recent_commits` 分离**——历史队列
+    /// 记「上过什么」（供 last/加词，深度 16），本值记「光标前紧邻的还是不是它、有几个字」这一
+    /// 时效态。默认 1 → undo 永远有动作；每次上屏经 `note_commit_action` 覆盖 → 只有「刚输入完
+    /// 那次」精准删多个；撤销一次即复位 1、焦点变化亦复位 → 之后回落删 1（宁可少删多按几次，
+    /// 也不按陈旧计数误删多个）。
+    pub(crate) last_commit_len: std::sync::atomic::AtomicUsize,
     /// 编码显示方式运行时态（命令栏 ime.toggle("preedit") 循环切换；初值随配置）。
     /// 统一权威：决定候选窗是否显示 preedit（in_app→不显示）及是否内联首单元（embedded）。
     pub(crate) preedit_display: Mutex<PreeditDisplay>,
@@ -1236,6 +1243,7 @@ impl Coordinator {
             cmdbar_services: std::sync::OnceLock::new(),
             self_weak: std::sync::OnceLock::new(),
             recent_commits: Mutex::new(std::collections::VecDeque::new()),
+            last_commit_len: std::sync::atomic::AtomicUsize::new(1),
             preedit_display: Mutex::new(preedit_display_init),
             hide_candidate_window: Mutex::new(hide_candidate_window_init),
             candidate_vertical: Mutex::new(candidate_vertical_init),
@@ -2059,13 +2067,15 @@ impl Coordinator {
 
     /// cmdbar 能力 wrapper（被 handle_cmdbar 控制器经 Weak 回调）。各方法自锁，**禁止**在持
     /// state 锁时调用（spawn_command 已确保在独立线程、未持锁时执行）。
-    /// 撤销最近一次上屏（cmdbar `ime.undo_commit`）：取上屏历史队首的字符数 N，
-    /// 推 ReplaceBackward(N, "") 给活跃客户端（复用智能标点删除替换通道及其全部
-    /// 宿主兼容修复），并把该条弹出历史——连续触发即逐条回退。无历史时删 1 个。
+    /// 撤销最近一次上屏（cmdbar `ime.undo_commit`）：删除光标前 `last_commit_len` 个字符
+    /// （UTF-16 单元），推 ReplaceBackward(N, "") 给活跃客户端（复用智能标点删除替换通道及其
+    /// 全部宿主兼容修复）。计数语义见 [`Self::last_commit_len`]：默认 1 → 永远有动作；被最近
+    /// 一次上屏覆盖 → 只精准删「刚输入完那次」；`swap(1)` 读取即复位 → 连续触发第二次起逐字删
+    /// （数量不再可信，宁可少删多按几次，也不按陈旧计数误删多个）。
     ///
-    /// 队首同时供 cmdbar `last()` 与加词还原池消费：弹出即三处语义一致
-    /// （这个词已不在屏幕上）。v1 不校验光标前内容（上屏后用户在输入法之外
-    /// 移过光标/改过文本时会误删，责任在主动触发方）；v2 预留 prevChar 比对。
+    /// v1 不校验光标前内容（用户主动触发；焦点变化/其它输入均已把计数刷回 1，故误删至多 1 个）；
+    /// v2 预留 prevChar 比对。已知限制：SendInput 退格兜底宿主按「一次退格删一整字」处理时，
+    /// emoji 会多删（兜底宿主 × emoji 双重边缘），留待后续按宿主特判。
     pub(crate) fn cmd_undo_commit(&self) {
         // 正在打字（缓冲非空）时不动作：ReplaceBackward 作用于已上屏文本，
         // 与组合态并存会把删除落进组合窗前的位置，语义混乱。
@@ -2076,39 +2086,16 @@ impl Coordinator {
                 return;
             }
         }
-        // 弹出队首求字符数；推送「肯定失败」（无客户端/通道断）时回滚，避免
-        // 一次 no-op 污染 last()/加词还原池的历史。不持锁跨管道 IO（防按键线程
-        // 读 last() 被阻塞），故失败回滚存在与新上屏交错的理论窗口——推送失败
-        // 本身已是边缘态，接受。
-        let popped = {
-            let mut h = self
-                .recent_commits
-                .lock()
-                .unwrap_or_else(|e| e.into_inner());
-            h.pop_front()
-        };
-        // 计数量纲取 UTF-16 code unit：TSF ShiftStart 与 macOS NSRange 都按它计，
-        // 主路径（TSF 原子范围替换）两端皆准，含 emoji 词条不再少删。已知限制：
-        // SendInput 退格兜底宿主按「一次退格删一整字」处理时，emoji 会多删——
-        // 兜底宿主 × emoji 双重边缘，留待后续按宿主特判。
-        let count = popped
-            .as_ref()
-            .map(|t| t.encode_utf16().count() as u32)
-            .unwrap_or(1);
+        // 读取并复位为 1：撤销一次后计数即失效，下次 undo 退化删 1（除非其间又有新上屏刷新）。
+        let count = self
+            .last_commit_len
+            .swap(1, std::sync::atomic::Ordering::Relaxed) as u32;
         if count == 0 {
             return;
         }
         debug!("undo_commit: 删除 {} 个 UTF-16 单元", count);
         let encoded = wind_ipc::codec::encode_replace_backward(count, "");
-        if !self.push_server.push_commit_to_active(&encoded)
-            && let Some(t) = popped
-        {
-            let mut h = self
-                .recent_commits
-                .lock()
-                .unwrap_or_else(|e| e.into_inner());
-            h.push_front(t);
-        }
+        let _ = self.push_server.push_commit_to_active(&encoded);
     }
 
     pub(crate) fn cmd_ime_toggle(&self, target: &str) {
@@ -4788,6 +4775,10 @@ impl MessageHandler for Coordinator {
             // 不依赖 IME_ACTIVATED 的到达时机，确保工具栏在焦点到达时即可显示。
             state.ime_active = true;
         }
+        // 撤销上屏计数复位：进入新文本框，光标前是新上下文，下次 undo 退化删 1
+        // （首次聚焦无配对 focus_lost 时，本处兜底）。
+        self.last_commit_len
+            .store(1, std::sync::atomic::Ordering::Relaxed);
         // 记录活动客户端：鼠标点击的 commit 只推给它，避免广播多发
         if data.client_token != 0 {
             self.push_server.set_active_token(data.client_token);
@@ -4826,6 +4817,9 @@ impl MessageHandler for Coordinator {
             self.reset_exclusive_modes(&mut s); // 失焦丢弃临时英文/拼音/快捷输入残留
         }
         self.clear_pair_tracker(); // 失焦：配对上下文失效，清栈防下次聚焦后跳出键误判
+        // 撤销上屏计数复位：换窗/换文本框后光标前已非「刚上屏那段」，下次 undo 退化删 1。
+        self.last_commit_len
+            .store(1, std::sync::atomic::Ordering::Relaxed);
         // 失焦即清抑制态：密码框失焦到下次 focus_gained 之间无控件收键，suppress 残留虽不可利用，
         // 但属状态卫生隐患——独立 atomic，无锁依赖，不与上面的 state 锁冲突。
         self.password_suppress
