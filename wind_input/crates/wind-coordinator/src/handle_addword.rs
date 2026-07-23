@@ -10,6 +10,7 @@ use wind_ipc::protocol::MOD_CTRL;
 use wind_keys::keymap;
 use wind_ui::candidate_window::CandidateItem;
 use wind_ui::manager::UiCommand;
+use wind_ui::toast::{ToastKind, ToastPosition};
 
 /// 最小加词长度
 const ADD_WORD_MIN_LEN: usize = 1;
@@ -74,6 +75,48 @@ fn is_han(c: char) -> bool {
         | 0x20000..=0x2A6DF  // 扩展 B
         | 0x2A700..=0x2EBEF  // 扩展 C–F
         | 0x30000..=0x323AF) // 扩展 G–H
+}
+
+/// `dict.add` 入库文本规整：只去首尾空白，**不做一行化 / 截断**。
+///
+/// 来源可能是剪贴板整段文本（`coad`）。把一大段悄悄截成前 N 字入库，比直接拒绝更糟——
+/// 用户不知道自己加了什么，词库还多一条打不出来的垃圾。故规整只做无损清理，剩下的
+/// 不合格情形一律拒绝并提示（见 `check_derivable_word`）。
+fn sanitize_dict_add_text(raw: &str) -> anyhow::Result<&str> {
+    let s = raw.trim();
+    if s.is_empty() {
+        anyhow::bail!("内容为空");
+    }
+    if s.contains(['\r', '\n']) {
+        anyhow::bail!("内容含换行，请只复制一个词");
+    }
+    Ok(s)
+}
+
+/// 推导编码路径**专属**的额外校验。
+///
+/// 编码由方案规则从单字全码组装（见 `calc_add_word_code`），只有汉字词推得出来；长度上限
+/// 对齐加词界面的 [`ADD_WORD_MAX_LEN`]。**显式给了 code 的调用方不走这里**——那是用户
+/// 明确意图（可能加颜文字、外文等无法自动取码的词条），套上这些守卫是回归。
+fn check_derivable_word(word: &str) -> anyhow::Result<()> {
+    let n = word.chars().count();
+    if n > ADD_WORD_MAX_LEN {
+        anyhow::bail!("内容过长（{} 字，上限 {}）", n, ADD_WORD_MAX_LEN);
+    }
+    if !word.chars().all(is_han) {
+        anyhow::bail!("含非汉字，无法自动取码");
+    }
+    Ok(())
+}
+
+/// toast 回显用的词截断（按字符，超出加省略号）。词本身最长受 [`ADD_WORD_MAX_LEN`] 约束，
+/// 但显式 code 路径不限长，故回显仍需兜底，避免 toast 被撑爆。
+fn toast_clamp(word: &str) -> String {
+    const MAX: usize = 16;
+    if word.chars().count() <= MAX {
+        return word.to_string();
+    }
+    word.chars().take(MAX).collect::<String>() + "…"
 }
 
 impl Coordinator {
@@ -292,25 +335,76 @@ impl Coordinator {
         }
     }
 
-    /// 加词到用户层（code 为空时暂不支持自动推导编码）。
+    /// 加词到用户层。`code` 为空时**按当前方案规则推导**——兑现 `dict.add` 注册签名里
+    /// 「code 可选, 不传时按当前方案规则推导」的承诺（见 `wind-cmdbar` funcs/dict_ime.rs）。
+    /// 系统短语 `coad`（`$CC("剪贴板加词:{clip()}", dict.add(clip()))`）正是照该契约写的，
+    /// 而推导那一半此前从未实现，于是 `coad` 恒在下面第一道守卫处失败、且只有一句 warn
+    /// 日志、用户侧完全无感——「选了没反应」即由此而来。
+    ///
+    /// 成功/失败都弹一次 toast：命令动作链的错误在 `run_command_candidate` 仅 `warn!`，
+    /// 不给可见反馈的话同类欠账还会继续潜伏。
     pub(crate) fn cmd_dict_add(&self, text: &str, code: &str) -> anyhow::Result<()> {
-        let Some(store) = &self.store else {
-            anyhow::bail!("dict.add: 无 store");
-        };
-        if code.is_empty() {
-            anyhow::bail!("dict.add: code 为空（Rust 端暂未支持自动推导编码）");
+        match self.try_dict_add(text, code) {
+            Ok(word) => {
+                self.show_toast(
+                    &format!("已加词：{}", toast_clamp(&word)),
+                    ToastPosition::BottomCenter,
+                    ToastKind::Success,
+                );
+                Ok(())
+            }
+            Err(e) => {
+                self.show_toast(
+                    &format!("加词失败：{}", e),
+                    ToastPosition::BottomCenter,
+                    ToastKind::Error,
+                );
+                Err(e)
+            }
         }
+    }
+
+    /// `cmd_dict_add` 的实际逻辑，成功返回入库的词（供 toast 回显）。
+    ///
+    /// 隐私红线（docs/logging-convention.md）：返回的错误会被 cmdbar 侧包成 `dict.add: …`
+    /// 打进 **warn** 日志，故消息内**不得含词本身或剪贴板内容**；词只出现在 toast（UI）
+    /// 与 debug 日志里。消息也不再自带 `dict.add:` 前缀——`runtime_err` 已负责加，
+    /// 重复会得到 `dict.add: dict.add: …`。
+    fn try_dict_add(&self, text: &str, code: &str) -> anyhow::Result<String> {
+        let Some(store) = &self.store else {
+            anyhow::bail!("无词库存储");
+        };
+        let word = sanitize_dict_add_text(text)?;
+        let (code, boundary) = if code.is_empty() {
+            check_derivable_word(word)?;
+            // 与快捷加词（Ctrl+=）同一套推导：拼音方案走引擎词级消歧、无果回退逐字反查；
+            // 码表方案按方案 `[[encoder.rules]]` 从单字全码组装。boundary 一并取回——
+            // 只有拼音那条路给得出音节边界，透传后消费方才不必降级回 DAG。
+            let (c, b) = self.calc_add_word_code(word);
+            if c.is_empty() {
+                // 具体是哪个字没码由 calc_add_word_code 内部 debug 日志给出。
+                anyhow::bail!("当前方案取不出编码");
+            }
+            (c, b)
+        } else {
+            // 调用方显式给码：扁平串，无音节边界表达 → boundary=0，消费方降级回 DAG。
+            (code.to_string(), 0)
+        };
         let active = self.engine_mgr.active_schema_id();
-        // 手动加词是码表语义（显式 code）；混输落主码表方案，primary 缺失则报错不静默写孤儿。
+        // 加词按码表语义归属：混输落主码表方案，primary 缺失则报错不静默写孤儿。
+        // **这与推导侧必须同步**——`calc_add_word_code` 经 `add_word_target_schema()` 对混输
+        // 同样解析到 primary 码表方案，故推导出的恒是码表码，与此处 `CodeTable` 一致；
+        // 非混输方案 `write_data_schema_id` 直接返回 data id、忽略 source，拼音方案照样正确。
+        // 改动任一侧的方案解析都要回头核对另一侧，否则会把拼音码写进码表词库。
         let Some(schema) = self
             .engine_mgr
             .write_data_schema_id(&active, CandidateSource::CodeTable)
         else {
-            anyhow::bail!("dict.add: 混输方案主码表缺失，无法归属加词");
+            anyhow::bail!("混输方案主码表缺失，无法归属加词");
         };
-        // code 由调用方显式给出（扁平串，无音节边界表达）→ boundary=0，消费方降级回 DAG。
-        store.add_user_word(&schema, code, text, ADD_WORD_WEIGHT, 0)?;
-        Ok(())
+        store.add_user_word(&schema, &code, word, ADD_WORD_WEIGHT, boundary)?;
+        debug!("dict.add: 已加词 {} -> {}", code, word);
+        Ok(word.to_string())
     }
 
     /// 拼音自动造词（L）：仅当用户**分步**组成（committed_segs ≥2 段、合并 ≥2 字）才学。
@@ -804,7 +898,11 @@ mod tests {
 
         // emoji：UTF-16 surrogate pair 计 2 单元，与 TSF/macOS 删除量纲一致。
         c.note_commit_action(&Coordinator::commit_action("😀".into(), true));
-        assert_eq!(c.last_commit_len.load(Ordering::Relaxed), 2, "emoji 记 2 单元");
+        assert_eq!(
+            c.last_commit_len.load(Ordering::Relaxed),
+            2,
+            "emoji 记 2 单元"
+        );
 
         // 组合态（尚未落屏）不动计数。
         c.note_commit_action(&KeyAction::PassThrough);
@@ -815,7 +913,11 @@ mod tests {
             count: 2,
             text: "—".into(),
         });
-        assert_eq!(c.last_commit_len.load(Ordering::Relaxed), 1, "替换后记新符号长");
+        assert_eq!(
+            c.last_commit_len.load(Ordering::Relaxed),
+            1,
+            "替换后记新符号长"
+        );
     }
 
     /// 焦点变化复位撤销计数：换窗/换文本框后光标前已非「刚上屏那段」，退化删 1。
@@ -825,7 +927,11 @@ mod tests {
         c.note_commit_action(&Coordinator::commit_action("世界".into(), true));
         assert_eq!(c.last_commit_len.load(Ordering::Relaxed), 2);
         c.handle_focus_lost();
-        assert_eq!(c.last_commit_len.load(Ordering::Relaxed), 1, "失焦后退化删 1");
+        assert_eq!(
+            c.last_commit_len.load(Ordering::Relaxed),
+            1,
+            "失焦后退化删 1"
+        );
     }
 
     /// 打字中（输入缓冲非空）触发 undo 应提前返回、不消耗计数（不 swap）。
@@ -1068,5 +1174,91 @@ mod tests {
         // 直开路径不得进入加词模式、不得改候选窗布局占位
         assert!(!st.add_word_active, "直开加词界面不应进入加词模式");
         assert!(st.add_word_chars.is_empty(), "不应填充加词字符池");
+    }
+
+    // ──────────────────────────────────────────────────────────────────────
+    // dict.add（`coad` 剪贴板加词的落点）
+    // ──────────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn sanitize_trims_but_never_truncates() {
+        use super::sanitize_dict_add_text;
+        assert_eq!(sanitize_dict_add_text("  你好 \r\n").unwrap(), "你好");
+        // 首尾换行属无损清理；**内部**换行则拒绝，不做一行化（宁可不加也不加错）。
+        assert!(
+            sanitize_dict_add_text("你好\n世界").is_err(),
+            "内含换行应拒绝"
+        );
+        assert!(sanitize_dict_add_text("   \t \n ").is_err(), "空白串应拒绝");
+        assert!(sanitize_dict_add_text("").is_err());
+    }
+
+    #[test]
+    fn derivable_word_rejects_non_han_and_overlong() {
+        use super::{ADD_WORD_MAX_LEN, check_derivable_word};
+        assert!(check_derivable_word("你好").is_ok());
+        assert!(check_derivable_word("hello").is_err(), "纯英文取不出码");
+        assert!(check_derivable_word("你好abc").is_err(), "混入非汉字应拒绝");
+        // 全角/中文标点是造词终止符、不是素材（见 is_han 的刻意排除）。
+        assert!(check_derivable_word("你好，").is_err(), "中文标点应拒绝");
+        let long: String = std::iter::repeat_n('好', ADD_WORD_MAX_LEN + 1).collect();
+        assert!(check_derivable_word(&long).is_err(), "超上限应拒绝");
+        let ok: String = std::iter::repeat_n('好', ADD_WORD_MAX_LEN).collect();
+        assert!(check_derivable_word(&ok).is_ok(), "恰好等于上限应放行");
+    }
+
+    #[test]
+    fn toast_clamp_limits_length() {
+        use super::toast_clamp;
+        assert_eq!(toast_clamp("你好"), "你好");
+        let long: String = std::iter::repeat_n('好', 40).collect();
+        let out = toast_clamp(&long);
+        assert_eq!(out.chars().count(), 17, "16 字 + 省略号");
+        assert!(out.ends_with('…'));
+    }
+
+    /// 显式 code 路径：保持原行为（不受新增的汉字/长度守卫影响），照常写库。
+    #[test]
+    fn dict_add_with_explicit_code_writes_user_word() {
+        let c = coord("dictadd_code");
+        // 颜文字等无法自动取码的词条，显式给码时必须仍能加——新守卫只作用于推导路径。
+        c.cmd_dict_add("(╯°□°)╯", "kaomoji").unwrap();
+        let schema = c.engine_mgr.active_schema_id();
+        let schema = c.engine_mgr.data_schema_id(&schema); // 与写入路径一致
+        let store = c.store.as_ref().unwrap();
+        let recs = store.get_user_words(&schema, "kaomoji").unwrap();
+        assert_eq!(recs.len(), 1);
+        assert_eq!(recs[0].text, "(╯°□°)╯");
+    }
+
+    /// 推导路径：headless 无引擎 → 取码为空 → 报错且**不写库**（不留空码孤儿记录）。
+    /// 这是 `coad` 的实际形态（`dict.add(clip())`，只有一个参数）。
+    #[test]
+    fn dict_add_without_code_takes_derive_path_and_reports() {
+        let c = coord("dictadd_derive");
+        let err = c.cmd_dict_add("你好", "").unwrap_err().to_string();
+        // 关键：不再是「暂未支持自动推导编码」——已进入推导，只是 headless 取不出码。
+        assert!(err.contains("取不出编码"), "应走推导路径并如实报因: {err}");
+        // 隐私红线：错误消息会进 warn 日志，不得回显用户输入。
+        assert!(!err.contains("你好"), "错误消息不得含词本身: {err}");
+        let schema = c.engine_mgr.active_schema_id();
+        let schema = c.engine_mgr.data_schema_id(&schema);
+        let store = c.store.as_ref().unwrap();
+        assert!(
+            store.get_user_words(&schema, "").unwrap().is_empty(),
+            "取码失败不得写入空码记录"
+        );
+    }
+
+    /// 剪贴板整段文本（多行）走推导路径：拒绝并提示，不截断、不入库。
+    #[test]
+    fn dict_add_rejects_multiline_clipboard() {
+        let c = coord("dictadd_multiline");
+        let err = c
+            .cmd_dict_add("第一行\n第二行", "")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("换行"), "应因换行被拒: {err}");
+        assert!(!err.contains("第一行"), "错误消息不得含剪贴板内容: {err}");
     }
 }
