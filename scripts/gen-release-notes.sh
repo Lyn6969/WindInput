@@ -3,11 +3,15 @@
 #
 #   scripts/gen-release-notes.sh [--tag v0.111.0] [--prev v0.110.0] [-o release_notes.md]
 #
-# 结构(与下游消费者的约定见下):
-#   1. docs/release-notes/header.md   基础信息:下载表 + 指向官网文档的链接
-#   2. ## 更新说明                     人工填写区,被 <!-- user-facing --> 标记包裹
-#   3. <details> 变更记录              按 conventional commits 分类的提交列表(默认折叠)
-#   4. docs/release-notes/footer.md   官网/文档/反馈入口
+# 结构(自上而下,面向用户的内容置顶,可追溯的明细置底):
+#   1. ## 更新说明                     人工填写区,被 <!-- user-facing --> 标记包裹;
+#                                      上方留 4 类标签的 HTML 注释脚手架供编辑者取用
+#   2. docs/release-notes/header.md   下载:只说格式(安装版/便携版),不列具体文件名
+#   3. docs/release-notes/footer.md   引导入口:官网文档 / 上手 / 反馈(醒目)
+#   4. <details> 变更记录              按 conventional commits 分类的提交列表(折叠,置底)
+#
+# ⚠️ 4 类标签只能作为【标记块外的 HTML 注释】存在,绝不能当可见文本塞进标记块:
+#   notes.rs 用 body == "暂未填写" 全等判断是否已填,块内多一个字都会被当正文推给用户。
 #
 # ⚠️ user-facing 标记块有两个下游消费者,改动其格式前先看它们:
 #   - 文档仓 scripts/sync_release_notes.py → data/releases.json → 官网 /changelog
@@ -114,27 +118,41 @@ render() {   # 输出模板文件,替换 {{VERSION}} / {{TAG}}
 }
 
 emit() {
-  render docs/release-notes/header.md
+  # 1) 面向用户的更新说明(置顶,最重要)。标记块内容供下游同步 —— 保持纯占位文本
+  #    「暂未填写」;4 类标签写成标记块【外】的 HTML 注释脚手架,GitHub 发布后自动隐藏、
+  #    编辑草稿时可见,既不破坏 notes.rs 的全等占位判断,又能指引编辑者分类填写。
+  cat <<'USERFACING'
+## 更新说明
 
-  # 版本专属说明(可选):docs/release-notes/<tag>.md 或 <版本>.md
+<!--
+## ✨ 新功能
+## ⚡ 优化改进
+## 🐛 问题修复
+## 📌 其他说明
+-->
+<!-- user-facing:start -->
+暂未填写
+<!-- user-facing:end -->
+
+USERFACING
+
+  # 版本专属补充说明(可选):docs/release-notes/<tag>.md 或 <版本>.md
   local note="docs/release-notes/${TAG}.md"
   [ -f "$note" ] || note="docs/release-notes/${VERSION}.md"
   render "$note"
 
-  printf '## 更新说明\n\n'
-  printf '<!-- user-facing:start -->\n'
-  printf '暂未填写\n'
-  printf '<!-- user-facing:end -->\n\n'
+  # 2) 下载(只说格式,不列文件名)
+  render docs/release-notes/header.md
 
+  # 3) 引导官网说明(醒目)。render 对缺失文件安全返回,无需 -f 守卫
+  render docs/release-notes/footer.md
+
+  # 4) 详细变更记录(折叠,置底)
+  printf -- '---\n\n'
   printf '<details>\n<summary>%s</summary>\n\n' "$summary"
   printf '%s' "$changelog"
   if [ -n "$compare" ]; then printf '%s\n' "$compare"; fi
-  printf '\n</details>\n\n'
-
-  if [ -f docs/release-notes/footer.md ]; then
-    printf -- '---\n\n'
-    render docs/release-notes/footer.md
-  fi
+  printf '\n</details>\n'
 }
 
 if [ -n "$OUT" ]; then

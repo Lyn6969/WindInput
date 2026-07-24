@@ -1,12 +1,12 @@
 ## 下载
 
-| 文件 | 说明 |
+| 版本 | 适用场景 |
 | --- | --- |
-| `WindInput-Setup-{{VERSION}}.exe` | Windows 安装版（推荐） |
-| `WindInput-Portable-{{VERSION}}.zip` | Windows 便携版，解压即用 |
+| 安装版 `.exe` | **推荐**。Windows 安装程序，向导式安装、自动配置输入法 |
+| 便携版 `.zip` | 免安装，解压即用，适合放 U 盘或绿色使用 |
 
-同名 `.sha256` 为对应的校验文件。国内网络可从 [官网下载页](https://windinput.com/download) 走 CDN 获取同一份安装包。
+每个安装包都附带同名 `.sha256` 校验文件，可用于核对下载完整性。
 
-系统要求、安装步骤与常见问题见 **[安装指南](https://windinput.com/docs/start/installation)**，上手教程见 **[开始输入](https://windinput.com/docs/start/first-input)**。
-
-> 本版本未做数字签名，安装时 Windows 安全中心（SmartScreen）可能弹出拦截：点「更多信息」→「仍要运行」即可继续。
+> 🌏 **国内网络**建议从 **[官网下载页](https://windinput.com/download)** 经 CDN 获取同一版本，速度更稳。
+>
+> ⚠️ 本版本未做数字签名，安装时若 Windows 安全中心（SmartScreen）拦截，点「更多信息」→「仍要运行」即可继续。
