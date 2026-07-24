@@ -108,6 +108,9 @@ fn main() {
     // CLI 子命令（config/schema/...）：在服务启动前拦截，处理完即退出。
     // 注意保持在单例检查之前——CLI 进程不该被「另一实例已运行」挡掉。
     let cli_args: Vec<String> = std::env::args().collect();
+    // 由 relaunch_self 在重启路径下附加，标记「此次启动是手动重启后的新进程」而非
+    // 开机首启/CLI 离线启动——service-ready 后据此决定是否弹「服务已重启」提示。
+    let restarted = cli_args.iter().any(|a| a == "--restarted");
     let sub = cli_args.get(1).map(String::as_str);
     if matches!(
         sub,
@@ -307,6 +310,7 @@ fn main() {
         }));
     }
     let coord_for_web = coordinator.clone();
+    let coord_for_restart_toast = coordinator.clone();
     deferred.set_ready(coordinator);
 
     // 9.5 启动本地控制 / 配置 JSON-RPC 服务（命名管道：..._ctrl + ..._events）。
@@ -329,6 +333,12 @@ fn main() {
         pipe_suffix, pipe_suffix, pipe_suffix
     );
     startup_trace::stage("service-ready");
+
+    // 手动重启（区别于开机首启/CLI 离线启动）：新进程就绪后补一次用户可见反馈，
+    // 因为旧进程连同其 UI 窗口线程已在重启前被销毁，反馈只能由新进程接力弹出。
+    if restarted {
+        coord_for_restart_toast.show_restart_toast();
+    }
 
     // 10. 阻塞主线程，直到菜单触发"重启服务"
     match restart_rx.recv() {
@@ -374,7 +384,7 @@ impl wind_rpc::CoreRpc for RpcCore {
 /// 以分离子进程重新启动自身（用于"重启服务"）。
 #[cfg(windows)]
 fn relaunch_self() {
-    match spawn_detached_self() {
+    match spawn_detached_self(true) {
         Ok(()) => info!("Relaunched service"),
         Err(e) => error!("Failed to relaunch: {}", e),
     }
@@ -382,7 +392,7 @@ fn relaunch_self() {
 
 #[cfg(not(windows))]
 fn relaunch_self() {
-    if let Err(e) = spawn_detached_self() {
+    if let Err(e) = spawn_detached_self(true) {
         error!("Failed to relaunch: {}", e);
     }
 }
@@ -393,7 +403,7 @@ fn relaunch_self() {
 /// （IME/TSF 宿主进程常见，父进程退出即连带杀子进程——症状：重启只退出、新进程
 /// 不存活）。stdio 一律接 null：服务日志走文件，不该喷进调用方终端。
 #[cfg(windows)]
-fn spawn_detached_self() -> std::io::Result<()> {
+fn spawn_detached_self(restarted: bool) -> std::io::Result<()> {
     use std::os::windows::process::CommandExt;
     use std::process::Stdio;
     const DETACHED_PROCESS: u32 = 0x0000_0008;
@@ -403,28 +413,32 @@ fn spawn_detached_self() -> std::io::Result<()> {
     let exe = std::env::current_exe()?;
     let base = DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP;
     let try_spawn = |flags: u32| {
-        std::process::Command::new(&exe)
-            .creation_flags(flags)
+        let mut cmd = std::process::Command::new(&exe);
+        cmd.creation_flags(flags)
             .stdin(Stdio::null())
             .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .map(|_| ())
+            .stderr(Stdio::null());
+        if restarted {
+            cmd.arg("--restarted");
+        }
+        cmd.spawn().map(|_| ())
     };
     // 优先带 breakaway；作业对象不允许 breakaway（spawn 报错）时回退不带该标志再试。
     try_spawn(base | CREATE_BREAKAWAY_FROM_JOB).or_else(|_| try_spawn(base))
 }
 
 #[cfg(not(windows))]
-fn spawn_detached_self() -> std::io::Result<()> {
+fn spawn_detached_self(restarted: bool) -> std::io::Result<()> {
     use std::process::Stdio;
     let exe = std::env::current_exe()?;
-    std::process::Command::new(exe)
-        .stdin(Stdio::null())
+    let mut cmd = std::process::Command::new(exe);
+    cmd.stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .map(|_| ())
+        .stderr(Stdio::null());
+    if restarted {
+        cmd.arg("--restarted");
+    }
+    cmd.spawn().map(|_| ())
 }
 
 fn init_logger() {

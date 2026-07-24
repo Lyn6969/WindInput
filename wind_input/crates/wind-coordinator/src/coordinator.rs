@@ -1721,6 +1721,15 @@ impl Coordinator {
         });
     }
 
+    /// 服务重启后由新进程在就绪时弹一次「服务已重启」提示。
+    ///
+    /// 「重启服务」把旧进程连同其 UI 窗口线程一起销毁，退出前发 toast 用户看不到，
+    /// 故反馈须由重启拉起的新进程接力（main 解析 `--restarted` 标志，service-ready 后调本方法）。
+    /// Toast 由本进程 wind-ui 窗口渲染，不经 push 下发、不依赖 TSF 客户端重连，故就绪即可见。
+    pub fn show_restart_toast(&self) {
+        self.show_toast("服务已重启", ToastPosition::BottomCenter, ToastKind::Success);
+    }
+
     /// 触发截图所有可见 UI 窗口，保存到用户配置目录下的 screenshots/ 子目录。
     pub(crate) fn trigger_screenshot(&self) {
         if let Some(dir) = wind_config::Config::user_config_dir() {

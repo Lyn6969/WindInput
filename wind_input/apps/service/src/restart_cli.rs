@@ -27,7 +27,7 @@ pub fn run(args: &[String]) -> i32 {
         Err(RpcFailure::Offline) => {
             // 服务未运行：以脱离形态拉起（CLI 此刻附着用户终端，裸 spawn 会让
             // 服务继承控制台与作业对象——关终端连带杀服务，见 spawn_detached_self）。
-            match crate::spawn_detached_self() {
+            match crate::spawn_detached_self(false) {
                 Ok(()) => {
                     println!("服务未运行，已直接启动");
                     0
