@@ -214,13 +214,16 @@
 
 ### 7.4 纯拼音：`rerank_pinyin_decay`
 
-- **锚定**：`(is_sentence && !is_sentence_demoted) || is_phrase` 的候选恒锚定顶部（互相维持引擎权重序）。
+- **锚定**：`(is_sentence && !is_sentence_demoted) || (is_phrase && is_exact_code)` 的候选恒锚定顶部
+  （互相维持引擎权重序）。**只锚定精确码短语**——前缀短语（`is_phrase && !is_exact_code`）不锚定，
+  落到下面 `cmp_match_layers` 靠 `is_prefix` 降到精确候选之下（与 §7.3 `freq_tier` tier1/tier2、
+  §6 `candidate_display_order` **同口径**：完全匹配才提前、前缀避让）。
 - 其余：先 `cmp_match_layers`（不跨层提拔），再按衰减分（半衰期）软置前，褪色（< ε）落回权重序。
 
-> ⚠️ **已知平行漂移（待办）**：`rerank_pinyin_decay` 的锚定用的是 `|| is_phrase` **一刀切**，
-> 尚**未**像 `freq_tier` 那样按 `is_exact_code` 区分精确/前缀短语。故**纯拼音下前缀短语仍会被锚定到顶部**。
-> 与 §7.3 的对齐口径不一致，是个已知漂移点。对齐方案：改为 `|| (is_phrase && is_exact_code)`，
-> 并把 `pinyin_phrase_is_anchored_like_sentence` 测试改用精确码短语。
+> ✅ **已对齐**：此前 `|| is_phrase` 一刀切锚定所有短语，导致纯拼音下 `date` 前缀短语在「自动调频开
+> 且有词频记录」时被顶到首位（潜伏 bug，实测复现）。已改为 `|| (is_phrase && is_exact_code)`，与
+> `freq_tier` 口径一致。回归测试 `pinyin_exact_phrase_is_anchored_like_sentence`（精确码短语仍锚定）
+> + `pinyin_prefix_phrase_not_anchored`（前缀短语不锚定）。
 
 ---
 
@@ -276,8 +279,7 @@
 
 ## 12. 已知待办 / 存疑
 
-- **拼音锚定平行漂移**（§7.4）：`rerank_pinyin_decay` 仍 `|| is_phrase` 一刀切锚定，未按 `is_exact_code`
-  区分。纯拼音下前缀短语仍被顶到首位，待对齐。
+- ~~拼音锚定平行漂移~~ **已修**（§7.4）：`rerank_pinyin_decay` 改为只锚定精确码短语，与 `freq_tier` 对齐。
 - **混输加成系统 vs 匹配层**：混输引擎的 500K/1M 加成是「类别编码进权重」的老范式，与
   `candidate_display_order` 的匹配层是两套语言。长期可考虑统一到「匹配层 + 真实权重」，属较大重构。
 - **`base_sort=natural` 与短语**：natural 模式忽略权重，短语靠 `base_order`/`natural_order` 默认 0 浮顶，

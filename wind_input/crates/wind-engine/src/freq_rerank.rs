@@ -107,8 +107,11 @@ pub fn rerank_codetable_usedfirst(
 
 /// 拼音词频重排（§4）：衰减软置前 + 整句豁免 + 阈值褪色。
 /// 与码表的"永久 used-first"不同——拼音"用过"随半衰期褪色（久未用 → 落回权重序）。
-/// ① 整句/短语豁免：`is_sentence`（Viterbi 整句/超长词典整词）或 `is_phrase`（自定义短语）
-///    的候选恒锚定顶部，互相维持引擎权重序（稳定排序）。② 非整句：衰减分 ≥ ε 的"近用"候选软置前于其余，按分降序。
+/// ① 整句/短语豁免：`is_sentence`（Viterbi 整句/超长词典整词）或**精确码短语**
+///    （`is_phrase && is_exact_code`，即 `lookup` 完全匹配）的候选恒锚定顶部，互相维持引擎权重序
+///    （稳定排序）。**前缀短语（`is_phrase && !is_exact_code`）不锚定**——落到下面的匹配层，靠
+///    `is_prefix` 降到精确候选之下（与 `freq_tier` 的 tier1/tier2 分档、协调器 `candidate_display_order`
+///    同口径：完全匹配才提前、前缀避让）。② 非整句：衰减分 ≥ ε 的"近用"候选软置前于其余，按分降序。
 /// ③ 阈值褪色：衰减分 < ε → 失去 used-first 资格，落回引擎权重序。
 /// `now` 为当前 unix 秒（由调用方注入，便于测试与确定性）。
 ///
@@ -138,13 +141,18 @@ pub fn rerank_pinyin_decay(
             .unwrap_or(0.0)
     };
     candidates.sort_by(|a, b| {
-        // ① 整句/短语锚定顶部（按来源语义判定，不看权重数值——见 Candidate::is_sentence）
+        // ① 整句/精确码短语锚定顶部（按来源语义判定，不看权重数值——见 Candidate::is_sentence）
         //
         // `is_sentence_demoted` 的整句**不参与**锚定：它已让位于精确整词，若仍锚定，
         // 引擎侧的降权会被本步整个顶回去（本比较器不看 weight，只看标志）。落选锚定后
         // 它走下面的层级+衰减+权重序，恰好停在精确整词之后、普通候选之前。
-        let sa = (a.is_sentence && !a.is_sentence_demoted) || a.is_phrase;
-        let sb = (b.is_sentence && !b.is_sentence_demoted) || b.is_phrase;
+        //
+        // 短语只锚定**精确码短语**（`is_phrase && is_exact_code`）：前缀短语（`lookup_prefix`，
+        // `!is_exact_code`）不锚定，落到下面 `cmp_match_layers` 靠 is_prefix 降到精确候选之下。
+        // 否则打 `da` 时 `date` 前缀短语只因 is_phrase 就被顶到首位（与 freq_tier tier1/tier2、
+        // 协调器 candidate_display_order 对齐：完全匹配才提前、前缀避让）。
+        let sa = (a.is_sentence && !a.is_sentence_demoted) || (a.is_phrase && a.is_exact_code);
+        let sb = (b.is_sentence && !b.is_sentence_demoted) || (b.is_phrase && b.is_exact_code);
         if sa != sb {
             return if sa {
                 Ordering::Less
@@ -322,17 +330,46 @@ mod tests {
         );
     }
 
-    /// 短语（is_phrase）与整句同享锚定豁免。
+    /// 精确码短语（`is_phrase && is_exact_code`，lookup 完全匹配）与整句同享锚定豁免。
+    /// 前缀短语不锚定，见 `pinyin_prefix_phrase_not_anchored`。
     #[test]
-    fn pinyin_phrase_is_anchored_like_sentence() {
+    fn pinyin_exact_phrase_is_anchored_like_sentence() {
         let mut cands = vec![pin("普通词", 5000), {
             let mut c = pin("我的邮箱", 40_000_000);
             c.is_phrase = true;
+            c.is_exact_code = true; // 精确码短语才锚定
             c
         }];
         let r = recs(&[("普通词", 30, NOW)]);
         rerank_pinyin_decay(&mut cands, &r, NOW, FreqProfile::default());
-        assert_eq!(cands[0].text, "我的邮箱", "短语须与整句同享锚定");
+        assert_eq!(cands[0].text, "我的邮箱", "精确码短语须与整句同享锚定");
+    }
+
+    /// 前缀短语**不锚定**：`is_phrase && !is_exact_code`（`lookup_prefix` 命中）落到匹配层，
+    /// 靠 is_prefix 降到精确候选之下，不因 is_phrase 被顶到首位。
+    ///
+    /// 回归拼音潜伏现场：打 `da` 时 `date` 前缀短语曾被 `|| is_phrase` 一刀切锚定到首位（开
+    /// 自动调频且有词频记录时触发）。入参按 candidate_display_order 输出序（精确拼音字在前、
+    /// 前缀短语在后）。旧码（`|| is_phrase`）下前缀短语会锚到首位 → 本用例会红。
+    #[test]
+    fn pinyin_prefix_phrase_not_anchored() {
+        let exact_word = pin("大", 5000); // 精确拼音字：is_prefix=false, is_exact_code=false
+        let prefix_phrase = {
+            let mut c = pin("date短语", 40_000_000); // 高权重也不该把它顶起
+            c.is_phrase = true;
+            c.is_prefix = true; // is_exact_code 默认 false
+            c
+        };
+        let mut cands = vec![exact_word, prefix_phrase];
+        let r = recs(&[("大", 3, NOW)]); // 有词频记录 → 重排确实生效
+        rerank_pinyin_decay(&mut cands, &r, NOW, FreqProfile::default());
+        assert_eq!(
+            cands[0].text,
+            "大",
+            "前缀短语(is_phrase && !is_exact_code)不锚定，须留在精确拼音候选之下，实际: {:?}",
+            cands.iter().map(|c| &c.text).collect::<Vec<_>>()
+        );
+        assert_eq!(cands[1].text, "date短语");
     }
 
     /// 衰减软置前：近用词（衰减分 ≥ ε）浮到未用词之上，即使权重更低。
