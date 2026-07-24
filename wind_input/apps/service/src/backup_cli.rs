@@ -3,10 +3,12 @@
 //! 经 RPC 打给运行中的 core（仅在线）。**文件读写在 core 进程内完成**
 //! （`backup.create`/`backup.restore` 的 RPC 收路径参数），故 CLI 侧必须先把
 //! 相对路径转为绝对路径——否则会按 core 进程的工作目录解析而非当前终端。
+//! 路径经 [`resolve_path`] 解析，支持 `${APP_DIR}` / `${USER_DATA}` /
+//! `${LOCAL_DATA}` 内部目录变量。
 
 use serde_json::{Value, json};
 
-use crate::cli_util::rpc_online;
+use crate::cli_util::{resolve_path, rpc_online};
 
 /// 还原可选的域名。backup.rs 的 `section_of` 只重映射 schema_file/theme_file/
 /// stats_meta 三类，其余条目 type（config/state/dict/temp/freq/shadow/phrase/stats）
@@ -69,12 +71,6 @@ fn usage_err(form: &str) -> i32 {
     2
 }
 
-/// 转绝对路径（见模块文档：路径在 core 进程内解析）。
-fn absolutize(file: &str) -> anyhow::Result<String> {
-    let p = std::path::absolute(file).map_err(|e| anyhow::anyhow!("路径 {file} 无效: {e}"))?;
-    Ok(p.to_string_lossy().into_owned())
-}
-
 fn cmd_create(file: &str, rest: &[String]) -> anyhow::Result<i32> {
     let mut include_stats = false;
     let mut include_state = false;
@@ -85,7 +81,7 @@ fn cmd_create(file: &str, rest: &[String]) -> anyhow::Result<i32> {
             other => anyhow::bail!("未知参数: {other}"),
         }
     }
-    let path = absolutize(file)?;
+    let path = resolve_path(file)?;
     let v = rpc_online(
         "backup.create",
         json!({ "path": path, "includeStats": include_stats, "includeState": include_state }),
@@ -100,7 +96,7 @@ fn cmd_create(file: &str, rest: &[String]) -> anyhow::Result<i32> {
 }
 
 fn cmd_inspect(file: &str) -> anyhow::Result<i32> {
-    let path = absolutize(file)?;
+    let path = resolve_path(file)?;
     let v = rpc_online("backup.inspect", json!({ "path": path }))?;
     let Some(m) = v.get("manifest") else {
         anyhow::bail!("backup.inspect 返回了意外形状");
@@ -158,7 +154,7 @@ fn cmd_restore(file: &str, rest: &[String]) -> anyhow::Result<i32> {
             other => anyhow::bail!("未知参数: {other}"),
         }
     }
-    let path = absolutize(file)?;
+    let path = resolve_path(file)?;
     let mut params = json!({ "path": path });
     if replace {
         params["strategy"] = json!("replace");

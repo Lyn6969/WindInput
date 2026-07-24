@@ -5,7 +5,70 @@
 //! 它们操作 redb 单写者库或 coordinator 内的 override 合并逻辑，离线直写
 //! 会与运行中实例冲突，故连不上 core 一律报错退出（区别于 config 的离线降级）。
 
+use std::path::{Path, PathBuf};
+
 use serde_json::Value;
+
+/// 把内部目录变量名解析为绝对目录。返回 None = 该变量不支持或目录无法定位。
+///
+/// 三个内部目录（都可能含用户名或安装位置，硬编码进脚本不可移植）：
+/// - `APP_DIR`   程序安装目录（wind_input.exe 所在目录）
+/// - `USER_DATA` 漫游用户数据目录（`%APPDATA%\WindInput[Dev]`）
+/// - `LOCAL_DATA` 本机用户数据目录（`%LOCALAPPDATA%\WindInput[Dev]`）
+fn resolve_path_var(name: &str) -> Option<PathBuf> {
+    match name {
+        "APP_DIR" => std::env::current_exe()
+            .ok()
+            .and_then(|p| p.parent().map(Path::to_path_buf)),
+        "USER_DATA" => wind_config::Config::user_config_dir(),
+        "LOCAL_DATA" => wind_config::Config::local_dir(),
+        _ => None,
+    }
+}
+
+/// 支持的内部目录变量名（用于错误提示与文档同步）。
+const PATH_VARS: &[&str] = &["APP_DIR", "USER_DATA", "LOCAL_DATA"];
+
+/// 展开路径里的 `${VAR}` 内部目录变量（见 [`resolve_path_var`]）。`resolve`
+/// 注入变量→目录字符串的映射，便于测试；未知变量或未闭合 `${` 一律报错，
+/// 不静默留字面量——否则脚本会把文件写到诸如 `${USER_DATA}\x` 这种字面目录。
+fn expand_with(input: &str, resolve: impl Fn(&str) -> Option<String>) -> anyhow::Result<String> {
+    let mut out = String::with_capacity(input.len());
+    let mut rest = input;
+    while let Some(start) = rest.find("${") {
+        out.push_str(&rest[..start]);
+        let after = &rest[start + 2..];
+        let Some(end) = after.find('}') else {
+            anyhow::bail!("路径变量未闭合（缺 `}}`）: {input}");
+        };
+        let name = &after[..end];
+        let dir = resolve(name).ok_or_else(|| {
+            anyhow::anyhow!(
+                "未知路径变量 ${{{name}}}（支持: {}）",
+                PATH_VARS.join(" / ")
+            )
+        })?;
+        out.push_str(&dir);
+        rest = &after[end + 1..];
+    }
+    out.push_str(rest);
+    Ok(out)
+}
+
+/// 展开内部目录变量并转为绝对路径。
+///
+/// 备份/词库/短语等命令的文件参数统一经此解析：支持 `${APP_DIR}` /
+/// `${USER_DATA}` / `${LOCAL_DATA}` 三个内部目录变量后再按当前终端工作目录
+/// 绝对化。backup 的文件读写在 core 进程内完成，必须传绝对路径（否则按 core
+/// 的工作目录解析）；dict/phrase 在 CLI 侧读写，绝对化亦无害且保持一致。
+pub fn resolve_path(input: &str) -> anyhow::Result<String> {
+    let expanded = expand_with(input, |name| {
+        resolve_path_var(name).map(|p| p.to_string_lossy().into_owned())
+    })?;
+    let abs =
+        std::path::absolute(&expanded).map_err(|e| anyhow::anyhow!("路径 {expanded} 无效: {e}"))?;
+    Ok(abs.to_string_lossy().into_owned())
+}
 
 /// RPC 调用失败的分类：连接失败（core 未运行）与远端错误须给用户不同提示。
 pub enum RpcFailure {
@@ -162,6 +225,39 @@ mod tests {
         assert!(coerce_like(&json!(1.5), "1e400").is_err());
         assert!(coerce_like(&json!(["x"]), "{}").is_err());
         assert!(coerce_like(&Value::Null, "1").is_err());
+    }
+
+    fn fake_resolve(name: &str) -> Option<String> {
+        match name {
+            "USER_DATA" => Some(r"C:\Users\me\AppData\Roaming\WindInput".to_string()),
+            "APP_DIR" => Some(r"C:\Program Files\WindInput".to_string()),
+            _ => None,
+        }
+    }
+
+    #[test]
+    fn expand_path_vars_replaces_known_and_preserves_literals() {
+        assert_eq!(
+            expand_with("no/vars/here.zip", fake_resolve).unwrap(),
+            "no/vars/here.zip"
+        );
+        assert_eq!(
+            expand_with(r"${USER_DATA}\bak\wind.zip", fake_resolve).unwrap(),
+            r"C:\Users\me\AppData\Roaming\WindInput\bak\wind.zip"
+        );
+        // 多个变量与中间字面量都保留
+        assert_eq!(
+            expand_with("${APP_DIR}/x/${USER_DATA}/y", fake_resolve).unwrap(),
+            r"C:\Program Files\WindInput/x/C:\Users\me\AppData\Roaming\WindInput/y"
+        );
+    }
+
+    #[test]
+    fn expand_path_vars_rejects_unknown_and_unclosed() {
+        // 未知变量报错，不静默留字面量（否则写到字面目录）
+        assert!(expand_with("${NOPE}/x", fake_resolve).is_err());
+        // 未闭合 ${ 报错
+        assert!(expand_with("${USER_DATA/x", fake_resolve).is_err());
     }
 
     #[test]

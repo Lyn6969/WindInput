@@ -2,11 +2,12 @@
 //!
 //! 经 RPC 打给运行中的 core（仅在线）。文件读写在 CLI 侧完成，RPC 只传内容
 //! 字符串——与设置页共用 `dict.export` / `dict.import` 同一契约（多段 wdict、
-//! 引擎类型校验、Rime/TSV 自动识别）。
+//! 引擎类型校验、Rime/TSV 自动识别）。文件路径经 `resolve_path` 解析，支持
+//! `${APP_DIR}` / `${USER_DATA}` / `${LOCAL_DATA}` 内部目录变量。
 
 use serde_json::{Value, json};
 
-use crate::cli_util::rpc_online;
+use crate::cli_util::{resolve_path, rpc_online};
 
 /// 合法的段类型 key（与 wind-store `DictSection::key()` 驼峰一致）。
 const SECTION_KEYS: &[&str] = &["userWords", "tempWords", "freq", "shadow"];
@@ -107,15 +108,17 @@ fn cmd_export(id: &str, file: &str, rest: &[String]) -> anyhow::Result<i32> {
         .get("content")
         .and_then(Value::as_str)
         .ok_or_else(|| anyhow::anyhow!("dict.export 返回了意外形状"))?;
-    std::fs::write(file, content).map_err(|e| anyhow::anyhow!("写入 {file} 失败: {e}"))?;
-    println!("✓ 已导出 {id} 词库数据到 {file}（{} 字节）", content.len());
+    let path = resolve_path(file)?;
+    std::fs::write(&path, content).map_err(|e| anyhow::anyhow!("写入 {path} 失败: {e}"))?;
+    println!("✓ 已导出 {id} 词库数据到 {path}（{} 字节）", content.len());
     Ok(0)
 }
 
 fn cmd_import(id: &str, file: &str, rest: &[String]) -> anyhow::Result<i32> {
     let (sections, replace) = parse_flags(rest)?;
+    let path = resolve_path(file)?;
     let content =
-        std::fs::read_to_string(file).map_err(|e| anyhow::anyhow!("读取 {file} 失败: {e}"))?;
+        std::fs::read_to_string(&path).map_err(|e| anyhow::anyhow!("读取 {path} 失败: {e}"))?;
     let mut params = json!({ "schemaId": id, "content": content });
     if replace {
         params["strategy"] = json!("replace");

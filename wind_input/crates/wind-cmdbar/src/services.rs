@@ -50,6 +50,8 @@ pub trait DictService: Send + Sync {
 pub trait ImeController: Send + Sync {
     /// 切换 IME 状态（cn-en / fullshape / layout / candwin / s2t / preedit / toolbar）。
     fn toggle(&self, target: &str) -> anyhow::Result<()>;
+    /// 打开设置窗口的指定页面。`page` 为规范页 id（schema/input/keys/ui/dict/
+    /// advanced/about），空串打开默认页。未知 id 由设置端忽略并落到默认页。
     fn open_setting(&self, page: &str) -> anyhow::Result<()>;
     /// 以 --web 参数启动设置 Web 版。
     fn open_setting_web(&self, page: &str) -> anyhow::Result<()>;

@@ -44,9 +44,9 @@ pub fn run(args: &[String]) -> i32 {
                 Some(id) => cmd_dict_list(id),
                 None => return usage_err("dict list <方案id>"),
             },
-            Some(op @ ("enable" | "disable")) => match (args.get(2), args.get(3)) {
-                (Some(id), Some(dict_id)) => cmd_dict_toggle(id, dict_id, op == "enable"),
-                _ => return usage_err("dict enable|disable <方案id> <词库id>"),
+            Some(op @ ("enable" | "disable")) => match args.get(2) {
+                Some(id) if args.len() > 3 => cmd_dict_toggle(id, &args[3..], op == "enable"),
+                _ => return usage_err("dict enable|disable <方案id> <词库id> [<词库id>...]"),
             },
             _ => return usage_err("dict list|enable|disable ..."),
         },
@@ -80,8 +80,8 @@ fn print_usage() {
          reset <方案id>                    清除该方案的全部定制，恢复方案文件默认\n  \
          rebuild                           强制重建全部词库缓存（下次使用各方案时按源重新生成）\n  \
          dict list <方案id>                列出方案的词库及启用状态\n  \
-         dict enable <方案id> <词库id>     启用分类/扩展词库（即时生效）\n  \
-         dict disable <方案id> <词库id>    停用分类/扩展词库（即时生效）"
+         dict enable <方案id> <词库id>...  启用分类/扩展词库（可多个，即时生效）\n  \
+         dict disable <方案id> <词库id>... 停用分类/扩展词库（可多个，即时生效）"
     );
 }
 
@@ -216,34 +216,47 @@ fn cmd_dict_list(id: &str) -> anyhow::Result<i32> {
     Ok(0)
 }
 
-fn cmd_dict_toggle(id: &str, dict_id: &str, enable: bool) -> anyhow::Result<i32> {
-    // 主库不可停用：结构上它是方案的编码来源，关掉等于废掉方案。
-    if !enable {
-        let cfg = fetch_config(id)?;
-        let is_default = cfg
-            .get("dictionaries")
-            .and_then(Value::as_array)
-            .into_iter()
-            .flatten()
-            .any(|d| {
-                d.get("id").and_then(Value::as_str) == Some(dict_id)
-                    && d.get("default").and_then(Value::as_bool).unwrap_or(false)
-            });
-        if is_default {
-            anyhow::bail!("{dict_id} 是方案 {id} 的主库，不可停用");
+/// 批量启用/停用一个方案的多个词库。取一次配置整体校验（词库须存在、主库
+/// 不可停用），任一非法即中止不做部分应用，再逐个走 `schema.setDictEnabled`。
+fn cmd_dict_toggle(id: &str, dict_ids: &[String], enable: bool) -> anyhow::Result<i32> {
+    let cfg = fetch_config(id)?;
+    let dicts: Vec<&Value> = cfg
+        .get("dictionaries")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .collect();
+    let find = |did: &str| {
+        dicts
+            .iter()
+            .find(|d| d.get("id").and_then(Value::as_str) == Some(did))
+            .copied()
+    };
+    // 先整体校验：拼错的词库 id 会静默写进 override，故须逐个确认存在；
+    // 主库结构上是方案的编码来源，停用等于废掉方案，一律拒绝。
+    for did in dict_ids {
+        let Some(d) = find(did) else {
+            anyhow::bail!(
+                "方案 {id} 无此词库: {did}（用 `wind_input schema dict list {id}` 查看）"
+            );
+        };
+        if !enable && d.get("default").and_then(Value::as_bool).unwrap_or(false) {
+            anyhow::bail!("{did} 是方案 {id} 的主库，不可停用");
         }
     }
-    let r = rpc_online(
-        "schema.setDictEnabled",
-        json!({ "id": id, "dictId": dict_id, "enabled": enable }),
-    )?;
-    let live = r.get("live").and_then(Value::as_bool).unwrap_or(false);
     let verb = if enable { "启用" } else { "停用" };
-    let note = if live {
-        "（已即时生效）"
-    } else {
-        "（方案未加载，下次使用时生效）"
-    };
-    println!("✓ {id}: 词库 {dict_id} 已{verb}{note}");
+    for did in dict_ids {
+        let r = rpc_online(
+            "schema.setDictEnabled",
+            json!({ "id": id, "dictId": did, "enabled": enable }),
+        )?;
+        let live = r.get("live").and_then(Value::as_bool).unwrap_or(false);
+        let note = if live {
+            "（已即时生效）"
+        } else {
+            "（方案未加载，下次使用时生效）"
+        };
+        println!("✓ {id}: 词库 {did} 已{verb}{note}");
+    }
     Ok(0)
 }

@@ -16,8 +16,8 @@ pub fn specs() -> Vec<FuncSpec> {
         "ime.theme"       : Ime     (1, 1) effect => fn_ime_theme,   "切换主题并持久化 (= config.set ui.theme.name)", "ime.theme(\"msime\")";
         "ime.theme_cycle" : Ime     (0, 1) effect => fn_theme_cycle, "循环切换主题并持久化; dir 可选 next(默认)/prev", "ime.theme_cycle()";
         "ime.undo_commit" : Ime     (0, 0) effect => fn_undo_commit,"撤销最近一次上屏 (删刚上屏的字符数; 焦点变化或又输入其它内容后退化删 1 个)", "ime.undo_commit()";
-        "setting.open"    : Setting (1, 1) effect => fn_setting_open,"打开 wind_setting 设置窗口的指定页面", "setting.open(\"dict\")";
-        "setting.web"     : Setting (1, 1) effect => fn_setting_web, "以 --web 启动 wind_setting 打开 Web 版设置", "setting.web(\"\")";
+        "setting.open"    : Setting (1, 1) effect => fn_setting_open,"打开设置窗口的指定页面 (schema/input/keys/ui/dict/advanced/about; 空串=默认页)", "setting.open(\"dict\")";
+        "setting.web"     : Setting (1, 1) effect => fn_setting_web, "打开设置页 (page 同 setting.open; --web 已废弃, 降级为原生设置页)", "setting.web(\"\")";
     }
 }
 
