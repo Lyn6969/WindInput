@@ -97,6 +97,16 @@ $CdnBase       = "https://dl.windinput.com"
 $deployCfg = "$ScriptDir\deploy.local.ps1"
 if (Test-Path $deployCfg) { . $deployCfg }
 
+# ---------- 静态链接 MSVC CRT(+crt-static) ----------
+# 所有 Rust 产物(wind_input / wind_setting / wind_portable, 及子进程 pack.ps1 的
+# installer stub)自包含, 目标机无需装 VC++ 运行库 —— VCRUNTIME140.dll 非系统内置,
+# 缺它则原生 cargo build 默认动态 CRT, 干净机器上 exe 报「找不到 VCRUNTIME140.dll」
+# / 0xc000007b 而无法启动。与 dev.sh 的 RUSTFLAGS 注入(+crt-static)对齐。
+# 追加而非覆盖以保留调用方既有 RUSTFLAGS; 已含则跳过, 幂等避免重复追加。
+if ($env:RUSTFLAGS -notmatch 'crt-static') {
+    $env:RUSTFLAGS = (@($env:RUSTFLAGS, '-C target-feature=+crt-static') -join ' ').Trim()
+}
+
 # ---------- 输出辅助 ----------
 function Say  ([string]$m) { Write-Host $m -ForegroundColor Green }
 function Warn ([string]$m) { Write-Host $m -ForegroundColor Yellow }
