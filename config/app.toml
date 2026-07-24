@@ -39,6 +39,11 @@ profile_guid = "{99C2EE31-5C57-45A2-9C63-FB54B34FD90A}"
 lang_id      = "0804"
 dll_x64      = "wind_tsf.dll"
 dll_x86      = "wind_tsf_x86.dll"
+# 安装前清扫「指向已消失 DLL 的悬空注册」：旧版（含同 CLSID 的 Go 版）卸载不净时，
+# HKCR\CLSID、CTF\TIP、旧 NSIS 的 RunOnce 会残留并指向已删 DLL，导致部分应用无法开启输入法。
+# 缺省 false（通用安装器不擅自改注册表）；只删悬空项，按本段 clsid/profile 变体隔离，
+# 故 dev（DEB 系列）与 release（EE 系列）各自只清自己那套键、互不影响。
+sweep_residue = true
 
 [[font]]
 file         = "HeiTiZiGen.ttf"
