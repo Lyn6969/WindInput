@@ -1,5 +1,7 @@
 #include "Globals.h"
 #include <appmodel.h>
+#include <sddl.h>  // ConvertSidToStringSidW（per-user 管道名）
+#include <string>
 #include <vector>
 
 // 链接必要的库
@@ -9,6 +11,7 @@
 #pragma comment(lib, "uuid.lib")
 #pragma comment(lib, "user32.lib")
 #pragma comment(lib, "gdi32.lib")
+#pragma comment(lib, "advapi32.lib")  // OpenProcessToken / GetTokenInformation / ConvertSidToStringSidW
 
 // 全局变量定义
 HINSTANCE g_hInstance = nullptr;
@@ -166,6 +169,74 @@ namespace
         _QueryTokenMetadata(hProcess, *info);
         return info->queryError == ERROR_SUCCESS || !info->processPath.empty();
     }
+}
+
+namespace {
+    // 当前进程令牌的用户 SID 字符串（`S-1-5-...`）；失败返回空串。
+    // 与 Rust wind-bridge::pipe_scope::current_user_sid 用同一 OS API，产出同一字符串。
+    std::wstring _CurrentUserSidString()
+    {
+        HANDLE hToken = nullptr;
+        if (!OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &hToken))
+            return L"";
+
+        std::wstring sid;
+        DWORD len = 0;
+        GetTokenInformation(hToken, TokenUser, nullptr, 0, &len);  // 先探长度
+        if (len > 0)
+        {
+            std::vector<BYTE> buf(len);
+            if (GetTokenInformation(hToken, TokenUser, buf.data(), len, &len))
+            {
+                auto* tu = reinterpret_cast<TOKEN_USER*>(buf.data());
+                LPWSTR s = nullptr;
+                if (ConvertSidToStringSidW(tu->User.Sid, &s))
+                {
+                    sid.assign(s);
+                    LocalFree(s);
+                }
+            }
+        }
+        CloseHandle(hToken);
+        return sid;
+    }
+
+    // `\\.\pipe\{base}` 再按需追加 `_{SID}`（扁平后缀，不加路径段）。
+    std::wstring _BuildPipeName(const wchar_t* base)
+    {
+        std::wstring name = L"\\\\.\\pipe\\";
+        name += base;
+        std::wstring sid = _CurrentUserSidString();
+        if (!sid.empty())
+        {
+            name += L"_";
+            name += sid;
+        }
+        return name;
+    }
+}
+
+// 主/推送管道名：进程内惰性求值一次（含 SID），静态局部存活至进程退出，
+// 故返回的 c_str() 全程有效。变体后缀由 WIND_DEV_VARIANT 决定，须与 Rust
+// 端的 wind_input{_dev} / wind_input_push{_dev} 完全一致。
+const wchar_t* WindPipeName()
+{
+#ifdef WIND_DEV_VARIANT
+    static const std::wstring name = _BuildPipeName(L"wind_input_dev");
+#else
+    static const std::wstring name = _BuildPipeName(L"wind_input");
+#endif
+    return name.c_str();
+}
+
+const wchar_t* WindPushPipeName()
+{
+#ifdef WIND_DEV_VARIANT
+    static const std::wstring name = _BuildPipeName(L"wind_input_push_dev");
+#else
+    static const std::wstring name = _BuildPipeName(L"wind_input_push");
+#endif
+    return name.c_str();
 }
 
 BOOL WindQueryCurrentProcessInfo(WindHostProcessInfo* info)

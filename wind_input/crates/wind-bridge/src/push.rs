@@ -158,8 +158,15 @@ impl PushServer {
     /// TSF `Globals.h` dev 变体: `\\.\pipe\wind_input_push_dev`。
     /// 此前误写成 `wind_input_push{suffix}` (= wind_input_push_dev)，
     /// 导致 TSF 永远连不上 push 管道、收不到热键白名单 → Shift/Ctrl+Shift+E 不被转发。
+    /// 尾部再追加 per-user SID 后缀（`_S-1-...`）：管道名字空间是机器级的，靠它按
+    /// 用户隔离（详见 [`crate::pipe_scope`]）。C++ TSF 端算同一名字，顺序须一致：
+    /// `wind_input_push{变体后缀}{SID 后缀}`。
     pub fn pipe_name(&self) -> String {
-        format!(r"\\.\pipe\wind_input_push{}", self.config.suffix)
+        format!(
+            r"\\.\pipe\wind_input_push{}{}",
+            self.config.suffix,
+            crate::pipe_scope::user_scope_suffix()
+        )
     }
 
     /// 启动推送管道服务器
@@ -519,21 +526,43 @@ fn push_writer_loop(
 mod tests {
     use super::*;
 
-    /// 锁定 push 管道名格式：后缀必须插在 `wind_input` 与 `_push` 之间，
-    /// 与 Go endpoint_windows.go / TSF Globals.h 一致，否则 TSF 连不上 push 管道。
+    /// 锁定 push 管道名格式：变体后缀紧跟 `wind_input_push`，per-user SID 后缀再在其后，
+    /// 与 TSF Globals.cpp 一致，否则 TSF 连不上 push 管道。SID 段随机器/用户变化，
+    /// 故只断言前缀不变量；Windows 上另断言确有 `_S-` 后缀。
     #[test]
     fn test_push_pipe_name_suffix_position() {
         let dev = PushServer::new(PushConfig {
             suffix: "_dev".into(),
             write_timeout_ms: 30_000,
         });
-        assert_eq!(dev.pipe_name(), r"\\.\pipe\wind_input_push_dev");
+        let dev_name = dev.pipe_name();
+        assert!(
+            dev_name.starts_with(r"\\.\pipe\wind_input_push_dev"),
+            "变体后缀须紧跟 wind_input_push，实得 {dev_name}"
+        );
 
         let release = PushServer::new(PushConfig {
             suffix: String::new(),
             write_timeout_ms: 30_000,
         });
-        assert_eq!(release.pipe_name(), r"\\.\pipe\wind_input_push");
+        let rel_name = release.pipe_name();
+        assert!(
+            rel_name.starts_with(r"\\.\pipe\wind_input_push"),
+            "实得 {rel_name}"
+        );
+
+        // Windows：SID 后缀必在变体后缀之后（`..._push_dev_S-...`）。
+        #[cfg(windows)]
+        {
+            assert!(
+                dev_name.contains(r"\wind_input_push_dev_S-"),
+                "缺 per-user SID 后缀，实得 {dev_name}"
+            );
+            assert!(
+                rel_name.contains(r"\wind_input_push_S-"),
+                "缺 per-user SID 后缀，实得 {rel_name}"
+            );
+        }
     }
 
     /// push_to_token 必须精确匹配、无兜底：activation push 的 hostRenderAvail 位按事件源

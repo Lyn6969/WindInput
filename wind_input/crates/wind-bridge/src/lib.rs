@@ -6,6 +6,7 @@ pub mod deferred;
 pub mod endpoint;
 pub mod handler;
 pub mod host_render_sink;
+pub mod pipe_scope;
 pub mod push;
 pub mod security;
 pub mod server;

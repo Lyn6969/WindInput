@@ -65,9 +65,14 @@ impl BridgeServer {
         self
     }
 
-    /// 获取管道名称
+    /// 获取管道名称。`{变体后缀}{per-user SID 后缀}`——管道名字空间是机器级的，
+    /// 靠 SID 后缀按用户隔离（详见 [`crate::pipe_scope`]）。C++ TSF 端算同一名字。
     pub fn pipe_name(&self) -> String {
-        format!(r"\\.\pipe\wind_input{}", self.config.suffix)
+        format!(
+            r"\\.\pipe\wind_input{}{}",
+            self.config.suffix,
+            crate::pipe_scope::user_scope_suffix()
+        )
     }
 
     /// 启动 Named Pipe 服务器（Windows）

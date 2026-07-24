@@ -174,15 +174,18 @@ extern const GUID c_guidDisplayAttributeConverted;
 // 语言 ID (简体中文)
 #define TEXTSERVICE_LANGID      0x0804
 
-// 命名管道名称 (与 Go Service 通信)
-// 注意：不使用 LOCAL\ 前缀，AppContainer 进程可能无法访问带目录前缀的管道
-#ifdef WIND_DEV_VARIANT
-#define PIPE_NAME               L"\\\\.\\pipe\\wind_input_dev"
-#define PUSH_PIPE_NAME          L"\\\\.\\pipe\\wind_input_push_dev"
-#else
-#define PIPE_NAME               L"\\\\.\\pipe\\wind_input"
-#define PUSH_PIPE_NAME          L"\\\\.\\pipe\\wind_input_push"
-#endif
+// 命名管道名称 (与 Rust core 通信)
+// 注意：不使用 LOCAL\ 前缀，AppContainer 进程可能无法访问带目录前缀的管道。
+//
+// per-user 隔离：命名管道名字空间是**机器级**的，故在**扁平后缀**位置追加当前
+// 用户 SID（`..._S-1-5-...`，不引入 `\` 路径段以免 AppContainer 打不开），
+// 与 Rust wind-bridge::pipe_scope 用同一 OS API（ConvertSidToStringSidW）算出同名，
+// 两端才在同名管道上会合。含 SID 故须运行时求值：由函数返回（进程内惰性缓存一次），
+// 宏转发以保持所有调用点不变。
+const wchar_t* WindPipeName();
+const wchar_t* WindPushPipeName();
+#define PIPE_NAME               WindPipeName()
+#define PUSH_PIPE_NAME          WindPushPipeName()
 
 // Modifier key flags (using KEY_ prefix to avoid Windows macro conflicts)
 constexpr int KEY_MOD_SHIFT = 0x01;
