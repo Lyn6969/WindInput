@@ -862,13 +862,15 @@ impl Coordinator {
             let _ = coordinator.ui_tx.send(UiCommand::SetToolbarPos { x, y });
         }
 
-        // 加载并下发初始主题
+        // 加载并下发初始主题。明暗必须走 resolve_theme_dark（system 实时探测系统明暗），
+        // 不能硬编码 false——否则跟随系统在**冷启动**这一刻永远回落亮色（实时跟随另有 WM_SETTINGCHANGE
+        // 路径，故只在启动瞬间错、切一次系统主题就"自愈"，与 theme_style 的其余消费点保持同一出口）。
         let name = coordinator
             .theme_name
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .clone();
-        coordinator.push_theme(&name, false);
+        coordinator.push_theme(&name, coordinator.resolve_theme_dark());
         // 下发候选布局方向（ui.candidate.layout == "vertical"）。
         let vertical = coordinator
             .rt()
