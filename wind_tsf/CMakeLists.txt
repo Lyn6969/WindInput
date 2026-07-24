@@ -4,6 +4,12 @@ project(WindTsf)
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
+# 静态链接 MSVC CRT(/MT):DLL 自包含,目标机无需安装 VC++ 运行库。
+# TSF DLL 会被注入任意第三方宿主进程,动态 CRT(/MD)会新增 VCRUNTIME140/MSVCP140
+# 依赖 —— 在未装运行库的宿主里等同"加载失败"。发布产物必须保持零外部运行库依赖
+# (与旧交叉编译产物一致)。需 CMake ≥3.15 的 CMP0091(本文件 minimum 3.15 → 默认 NEW)。
+set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
+
 # Debug variant option: builds with separate CLSID/pipe names for coexistence
 option(WIND_DEV_VARIANT "Build debug variant with separate CLSID/pipe names" OFF)
 

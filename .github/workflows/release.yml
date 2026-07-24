@@ -1,11 +1,20 @@
 name: Release
 
-# 全 Linux 交叉编译 + 打包。两种触发:
-#   - push tag v*    → 产出草稿 Release(附 Setup.exe + .sha256)
+# Windows 原生 MSVC 构建 + 打包。两种触发:
+#   - push tag v*    → 产出草稿 Release(附 Setup.exe + Portable.zip + .sha256)
 #   - workflow_dispatch → 产出可测 artifact(不发 Release),供合并前 Windows 实测
-# 产物:WindInput-Setup-<版本>.exe(自解压安装程序,含 x64/x86 TSF + 设置程序 + 便携启动器 + 词库)。
-# 依赖私有仓(wind-installer/wind-setting)经 secrets.WIND_REPOS_TOKEN 检出,故本 workflow
-# 只能在本仓库运行;fork 无 token 发版会失败,但 ci.yml 不碰私有仓,fork 的 CI 正常。
+# 产物:WindInput-Setup-<版本>.exe(含 x64/x86 TSF + 设置程序 + 便携启动器 + 词库)
+#      与 WindInput-Portable-<版本>.zip,均落在 WindInput\dist\。
+#
+# 为何用 windows-latest 原生 MSVC,而非过去的 ubuntu 交叉编译(clang + lld-link + xwin):
+#   交叉编产出的 wind_tsf.dll 虽 PE 安全元数据(DllCharacteristics/SafeSEH)与原生 MSVC
+#   逐位一致、也能独立 LoadLibrary,却在部分启用进程级缓解策略的宿主中 COM 激活失败 ——
+#   差异落在工具链代码生成层(clang vs cl.exe),静态审计无法穷尽。TSF DLL 会被注入任意
+#   第三方宿主进程,故【发布产物】必须由与生态一致的原生 MSVC 构建。CI 门禁(ci.yml)仍用
+#   ubuntu + xwin 交叉编译做快速校验(只验能否编过),不受影响。
+#
+# 依赖私有仓(wind-installer/wind-setting/wind-portable)经 secrets.WIND_REPOS_TOKEN 检出,
+# 故本 workflow 只能在本仓库运行;fork 无 token 发版会失败,但 ci.yml 不碰私有仓,fork 的 CI 正常。
 on:
   push:
     tags: ['v*']
@@ -16,11 +25,11 @@ permissions:
 
 jobs:
   release:
-    runs-on: ubuntu-latest
+    runs-on: windows-latest
     steps:
       # 多仓库需为同级目录:wind-setting 依赖 ../wind-ui-rust 和 ../WindInput;
-      # pack-installer.sh 用 ../wind-installer。均 checkout 到 $GITHUB_WORKSPACE 下。
-      # 其中 wind-installer / wind-setting 为私有仓,必须经 WIND_REPOS_TOKEN 检出。
+      # dev.ps1 用 ../wind-installer / ../wind-portable。均 checkout 到 $GITHUB_WORKSPACE 下平级。
+      # 其中 wind-installer / wind-setting / wind-portable 为私有仓,必须经 WIND_REPOS_TOKEN 检出。
       - name: 检出 WindInput
         uses: actions/checkout@v4
         with:
@@ -31,9 +40,8 @@ jobs:
         with:
           repository: huanfeng/wind-installer
           path: wind-installer
-          # 私有仓库需在仓库 Secrets 配置 PAT(repo 读权限);公开仓库可删此行。
           token: ${{ secrets.WIND_REPOS_TOKEN }}
-      - name: 检出 wind-ui-rust (installer GUI 依赖)
+      - name: 检出 wind-ui-rust (installer/setting GUI 依赖)
         uses: actions/checkout@v4
         with:
           repository: huanfeng/wind-ui-rust
@@ -45,37 +53,17 @@ jobs:
         with:
           repository: huanfeng/wind-setting
           path: wind-setting
-          # 私有仓库无权限时必须失败，避免发布包缺少设置程序。
           token: ${{ secrets.WIND_REPOS_TOKEN }}
       - name: 检出 wind-portable
         uses: actions/checkout@v4
         with:
           repository: huanfeng/wind-portable
           path: wind-portable
-          # 私有仓库无权限时必须失败，避免发布包缺少便携启动器。
           token: ${{ secrets.WIND_REPOS_TOKEN }}
 
-      # 统一 MSVC 工具链:clang-19(C++ TSF 需 clang≥19)+ lld-19 + llvm-19;
-      # Rust 经 cargo-xwin、C++ TSF 经 clang,均走 MSVC SDK(无需 mingw)。
-      - name: 安装 clang-19/lld-19/llvm-19
-        run: sudo apt-get update && sudo apt-get install -y clang-19 lld-19 llvm-19
-
+      # windows-latest 镜像自带 VS2022(含 C++ 工具链)+ CMake + Rust(stable-msvc),
+      # 故不再需要 clang/lld/xwin。仍显式钉 Rust stable 以稳定缓存键与工具链版本。
       - uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: x86_64-pc-windows-msvc
-
-      - name: 安装 cargo-xwin
-        uses: taiki-e/install-action@v2
-        with:
-          tool: cargo-xwin
-
-      - name: 缓存 xwin SDK
-        uses: actions/cache@v4
-        with:
-          path: ~/.cache/cargo-xwin
-          key: xwin-${{ runner.os }}-v1
-          restore-keys: |
-            xwin-${{ runner.os }}-
 
       - uses: Swatinem/rust-cache@v2
         with:
@@ -86,42 +74,42 @@ jobs:
             wind-setting
             wind-portable
 
-      # tag 为发布版本的唯一真值源；docs/VERSION 仅为开发占位。把 tag 版本写入
-      # docs/VERSION，让下游(build.rs 资源版本 / dev.sh release / pack-installer)统一取到。
+      # tag 为发布版本的唯一真值源;把 tag 版本写入 docs/VERSION,让下游
+      # (build.rs 资源版本 / dev.ps1 / CMake -DAPP_VERSION_STR)统一取到。
       - name: 确定版本并写入 docs/VERSION
+        shell: pwsh
         working-directory: WindInput
         run: |
-          if [ "$GITHUB_REF_TYPE" = "tag" ]; then
-            V="${GITHUB_REF_NAME#v}"                                     # tag 为发布版本唯一真值源
-          else
-            V="$(tr -d '[:space:]' < docs/VERSION)-dev.${GITHUB_SHA::8}"  # 手动触发:开发占位版本
-          fi
-          echo "$V" > docs/VERSION
-          echo "build version = $V"
-          echo "BUILD_VERSION=$V" >> "$GITHUB_ENV"
+          if ($env:GITHUB_REF_TYPE -eq 'tag') {
+            $V = $env:GITHUB_REF_NAME -replace '^v',''                       # tag 为发布版本唯一真值源
+          } else {
+            $base = (Get-Content docs/VERSION -Raw).Trim()
+            $V = "$base-dev.$($env:GITHUB_SHA.Substring(0,8))"               # 手动触发:开发占位版本
+          }
+          Set-Content -Path docs/VERSION -Value $V -NoNewline
+          "BUILD_VERSION=$V" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          Write-Host "build version = $V"
 
-      - name: 构建发布产物
+      # dev.ps1 8  = 全构建(wind_input + tsf x64/x86 + setting + portable + 词库数据)
+      #              + 调 wind-installer\scripts\pack.ps1 打包 → WindInput\dist\WindInput-Setup-<版本>.exe
+      #              (+ .sha256 sidecar + 在线升级 manifest,由 New-UpdateManifest 生成)
+      - name: 构建并打包安装程序(原生 MSVC)
+        shell: pwsh
         working-directory: WindInput
-        run: ./scripts/dev.sh release
+        run: .\scripts\dev.ps1 8
 
-      # 排在安装器之前：便携包只依赖上一步的 build/，不碰任何私有伴生仓，
-      # 先出它可以在安装器打包出问题时仍拿到一份可用产物。
-      # skip 复用已构建的 build/，不重复全构建。
+      # dev.ps1 9s = 复用上一步的 build/ 产出便携 zip(skip 全构建)→ WindInput\dist\WindInput-Portable-<版本>.zip(+ .sha256)
       - name: 打包便携版压缩包
+        shell: pwsh
         working-directory: WindInput
-        run: ./scripts/dev.sh portable-zip skip
+        run: .\scripts\dev.ps1 9s
 
-      - name: 打包安装程序 (cross stub + native packer，免 wine)
-        working-directory: WindInput
-        env:
-          WIND_REQUIRE_COMPANIONS: "1"
-        run: ./scripts/pack-installer.sh --version "$BUILD_VERSION" --compression lzma
-
-      # 本仓绝大多数改动直接提交、不走 PR，GitHub 的 generate_release_notes 只会
-      # 产出一个空的 "What's Changed"，故改为自行按 conventional commits 汇总。
-      # 模板与分类规则见 scripts/gen-release-notes.sh 与 docs/release-notes/。
+      # 本仓绝大多数改动直接提交、不走 PR,GitHub 的 generate_release_notes 只会产出空的
+      # "What's Changed",故改为自行按 conventional commits 汇总。gen-release-notes.sh 为 bash,
+      # windows-latest 自带 Git Bash,用 shell: bash 运行。
       - name: 生成 Release Notes (仅 tag 触发)
         if: github.ref_type == 'tag'
+        shell: bash
         working-directory: WindInput
         run: ./scripts/gen-release-notes.sh --tag "$GITHUB_REF_NAME" -o release_notes.md
 
@@ -131,14 +119,13 @@ jobs:
         with:
           draft: true                          # 人工审核 Release Notes 后再发布
           name: 清风输入法 v${{ env.BUILD_VERSION }}
-          # 正文里的 user-facing 标记块是给人填的：发布前把面向用户的更新说明写进
-          # 标记内。两个下游按此标记取内容 —— 文档仓 scripts/sync_release_notes.py
-          # (→ 官网更新记录) 与 wind-setting src/update/notes.rs (→ 应用内升级提示)，
-          # 保持"暂未填写"占位则两边都跳过。
+          # 正文里的 user-facing 标记块是给人填的:发布前把面向用户的更新说明写进标记内。
+          # 两个下游按此标记取内容 —— 文档仓 scripts/sync_release_notes.py(→ 官网更新记录)
+          # 与 wind-setting src/update/notes.rs(→ 应用内升级提示),保持"暂未填写"占位则两边都跳过。
           body_path: WindInput/release_notes.md
           files: |
-            wind-installer/dist/WindInput-Setup-*.exe
-            wind-installer/dist/WindInput-Setup-*.exe.sha256
+            WindInput/dist/WindInput-Setup-*.exe
+            WindInput/dist/WindInput-Setup-*.exe.sha256
             WindInput/dist/WindInput-Portable-*.zip
             WindInput/dist/WindInput-Portable-*.zip.sha256
 
@@ -148,8 +135,8 @@ jobs:
         with:
           name: WindInput-Setup-${{ github.sha }}
           path: |
-            wind-installer/dist/WindInput-Setup-*.exe
-            wind-installer/dist/WindInput-Setup-*.exe.sha256
+            WindInput/dist/WindInput-Setup-*.exe
+            WindInput/dist/WindInput-Setup-*.exe.sha256
             WindInput/dist/WindInput-Portable-*.zip
             WindInput/dist/WindInput-Portable-*.zip.sha256
           retention-days: 14
