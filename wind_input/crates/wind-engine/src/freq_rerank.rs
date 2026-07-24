@@ -35,7 +35,12 @@ const PINYIN_FREQ_EPSILON: f64 = 10.0;
 fn freq_tier(c: &Candidate, input: &str) -> u8 {
     use wind_candidate::CandidateSource::*;
     if c.is_phrase {
-        return 1;
+        // 短语按「完全匹配 vs 前缀匹配」再分档，勿因 is_phrase 一刀切抬到码表前缀补全之上：
+        // - 精确码短语（`lookup`，码==输入的完全匹配 → `is_exact_code=true`）留 tier 1、紧随码表精确；
+        // - 前缀短语（`lookup_prefix` 命中 → `is_exact_code=false`）降到 tier 2，与码表前缀补全同档。
+        //   否则混输/拼音下打 `da` 会让 `date` 短语只因 is_phrase 就压过码表前缀补全（如 矼）。
+        //   与协调器 `candidate_display_order`（is_exact_code/is_prefix）、混输侧口径对齐。
+        return if c.is_exact_code { 1 } else { 2 };
     }
     match c.source {
         CodeTable if c.code == input => 0, // 码表精确全码（如五笔 cang→駏）
@@ -47,7 +52,8 @@ fn freq_tier(c: &Candidate, input: &str) -> u8 {
 }
 
 /// 码表/混输词频重排（§3）：档位感知的**永久** used-first（五笔优先）。
-/// 先按来源档位（码表精确 < 词/短语 < 码表前缀 < 拼音），档内再 used-first + 策略排序。
+/// 先按来源档位（码表精确 < 精确码短语 < {码表前缀补全, 前缀短语} < 拼音），档内再
+/// used-first + 策略排序。前缀短语与码表前缀补全同档＝短语不因 is_phrase 抬到补全之上。
 /// 稳定排序保证同档无记录者维持引擎权重序，绝不把拼音浮到五笔精确全码之上。
 ///
 /// 策略：`Step`（默认/逐次提升）count 降序、last_used 降序 tiebreak（抗误选）；
@@ -429,5 +435,39 @@ mod tests {
         rerank_codetable_usedfirst(&mut cands, &recs_map, "abcd", FreqStrategy::Step, 1);
         assert_eq!(cands[0].text, "甲", "protect_top_n=1 应锁定原首位");
         assert_eq!(cands[1].text, "丙", "词频候选在保护位之后正常上浮");
+    }
+
+    /// freq_tier 短语再分档：精确码短语（is_exact_code）tier 1 紧随码表精确；前缀短语
+    /// （!is_exact_code）tier 2 与码表前缀补全同档，**不因 is_phrase 抬到补全之上**。
+    ///
+    /// 回归 `da`→`date` 现场：混输下 `date` 前缀短语曾只因 is_phrase 拿 tier 1、压过码表
+    /// 前缀补全（如 矼/509000）。入参按 `candidate_display_order` 的输出序喂入（精确码 →
+    /// 精确码短语 → 码表前缀补全 → 前缀短语），验证 rerank 维持该档位结构而非把短语顶起。
+    /// 旧码（`is_phrase => 1`）下前缀短语会跳到 tier 1、排到 矼 之前 → 本用例会红。
+    #[test]
+    fn codetable_tier_prefix_phrase_stays_with_completion() {
+        let exact_code = ct("da", "左", 3000); // 码表精确全码 tier 0
+        let exact_phrase = {
+            let mut c = ct("", "精确短语", 10); // lookup 精确码短语 tier 1
+            c.is_phrase = true;
+            c.is_exact_code = true;
+            c
+        };
+        let completion = ct("dax", "矼", 509_000); // 码表前缀补全 tier 2
+        let prefix_phrase = {
+            let mut c = ct("", "date短语", 10); // lookup_prefix 前缀短语 tier 2
+            c.is_phrase = true;
+            c.is_prefix = true; // is_exact_code 默认 false
+            c
+        };
+        let mut cands = vec![exact_code, exact_phrase, completion, prefix_phrase];
+        let r = recs(&[]); // 无词频记录 → 纯按档位 + 稳定序（维持入参显示序）
+        rerank_codetable_usedfirst(&mut cands, &r, "da", FreqStrategy::Step, 0);
+        let order: Vec<&str> = cands.iter().map(|c| c.text.as_str()).collect();
+        assert_eq!(
+            order,
+            vec!["左", "精确短语", "矼", "date短语"],
+            "精确码短语 tier1 紧随码表精确；前缀短语 tier2 与码表前缀补全同档、不抬到补全之上"
+        );
     }
 }
