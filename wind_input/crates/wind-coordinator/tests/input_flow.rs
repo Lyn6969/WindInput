@@ -4318,3 +4318,66 @@ fn test_codetable_auto_phrase_single_char_is_not_a_word() {
     );
     let _ = std::fs::remove_file(&db);
 }
+
+/// 前缀匹配的 marker 短语（`$AA` 组）须按引擎模式定层：拼音/混输下避让、落到拼音精确候选
+/// 之下；码表（引导键场景）下保留精确档置顶。
+///
+/// 回归：marker 短语来自 `lookup_prefix`（前缀枚举、码严格更长＝非完全匹配），却被无条件标
+/// `is_exact_code=true` 抬进精确档，在拼音模式下越过全部拼音候选（用户报「系统/用户短语前缀
+/// 匹配时优先级偏高、压普通候选」）。短语设计上尽量不与编码冲突，前缀匹配应避让、只在完全
+/// 匹配（`lookup` 精确码）时提前。构造组短语码 `nia`（严格长于输入 `ni` → 前缀枚举命中）。
+fn coord_with_group_phrase(schema: &str, tag: &str) -> std::sync::Arc<Coordinator> {
+    let store_path = std::env::temp_dir().join(format!("wind_group_marker_{tag}.redb"));
+    let _ = std::fs::remove_file(&store_path);
+    let store = std::sync::Arc::new(wind_store::Store::open(&store_path).unwrap());
+    store
+        .add_phrase("nia", r#"$AA("测试组", "①②③")"#, 0, 100)
+        .unwrap();
+    let mut cfg = config_with(schema);
+    cfg.input.phrase.min_prefix = 2;
+    Coordinator::new_headless_with_store(cfg, Some(&data_dir()), store)
+}
+
+#[test]
+fn prefix_group_marker_defers_below_pinyin_candidates() {
+    if !has_schemas() {
+        return;
+    }
+    let coord = coord_with_group_phrase("pinyin", "pinyin");
+    for ch in ['n', 'i'] {
+        press_letter(&coord, ch);
+    }
+    let texts = coord.debug_all_candidate_texts();
+    let group_pos = texts.iter().position(|t| t == "测试组");
+    assert!(
+        group_pos.is_some(),
+        "前缀枚举应仍列出组 marker，实际: {:?}",
+        texts
+    );
+    assert_ne!(
+        group_pos,
+        Some(0),
+        "拼音模式下前缀匹配的组 marker 不应占首位（须避让拼音精确候选），实际: {:?}",
+        texts
+    );
+}
+
+#[test]
+fn prefix_group_marker_stays_top_in_codetable() {
+    if !has_schemas() {
+        return;
+    }
+    // 对照组：码表（引导键场景）下前缀 marker 保留精确档置顶，证明拼音的避让来自模式分档
+    // 而非 marker 被整体改坏。
+    let coord = coord_with_group_phrase("wubi86", "wubi");
+    for ch in ['n', 'i'] {
+        press_letter(&coord, ch);
+    }
+    let texts = coord.debug_all_candidate_texts();
+    assert_eq!(
+        texts.first().map(|s| s.as_str()),
+        Some("测试组"),
+        "码表模式下前缀 marker 应保持置顶（引导键行为不回归），实际: {:?}",
+        texts
+    );
+}

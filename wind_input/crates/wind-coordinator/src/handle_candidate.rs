@@ -421,7 +421,12 @@ impl Coordinator {
             // 例外——镜像码表引擎 `single_code_complete`：当前无任何候选（码表 + 精确短语均空）且未满码时，
             // 放行一次前缀枚举作**补全候选源**，避免精确模式下彻底无候选。
             let ct = self.engine_mgr.codetable_settings();
-            let exact_only = self.engine_mgr.is_codetable() && ct.single_code_input;
+            // 引擎模式：纯码表 vs 拼音/混输。决定**前缀匹配**的 marker 短语落哪个匹配层——
+            // 短语在设计上尽量不与编码冲突，故前缀匹配应避让、只在完全匹配时提前：
+            // - 码表（引导键场景）：沿用精确档置顶（用户按引导键正是为看到它们）；
+            // - 拼音/混输：降进前缀层，落到拼音精确候选之下（见下方两个 marker 分支）。
+            let codetable_mode = self.engine_mgr.is_codetable();
+            let exact_only = codetable_mode && ct.single_code_input;
             // 空码补全的短语侧取数闸门：仅在精确模式抑制了前缀枚举时才可能触发。此处的
             // `candidates.is_empty()` 已是「码表候选 + 精确短语」之和——码表引擎不再抢先把
             // 补全候选塞进来（见 `ConvertResult::completion_hint`），故这个「空」判得准。
@@ -454,11 +459,15 @@ impl Coordinator {
                         weight: PHRASE_WEIGHT_BASE + hit.weight,
                         is_phrase: true,
                         is_command: true,
-                        // 引导键导航候选恒属精确档：用户正是按引导键**为了**看到它们，不该被
-                        // 码表单字preempt。此前靠「不设任何层级标志」隐式待在精确层（与下面的
-                        // 静态短语分支显式设 is_prefix 形成对照），`cmp_exact_first` 引入后该隐式
-                        // 安排失效，须显式标出。$SS/$AA 组分支同理。
-                        is_exact_code: true,
+                        // 本条来自 `lookup_prefix`（前缀枚举、码严格更长），是**前缀匹配**而非完全匹配：
+                        // - 码表（引导键场景）：属精确档置顶——用户正是按引导键**为了**看到它们，不被
+                        //   码表单字 preempt（`cmp_exact_first`）。此前靠「不设任何层级标志」隐式待在精确
+                        //   层，`cmp_exact_first` 引入后须显式标出。
+                        // - 拼音/混输：短语应避让编码，降进前缀层（`cmp_match_layers` 的 is_prefix），
+                        //   与静态前缀短语同层、落在拼音精确候选（is_prefix=false）之下。
+                        // 两标志互斥（同一条不会既精确又前缀）。$SS/$AA 组分支同理。
+                        is_exact_code: codetable_mode,
+                        is_prefix: !codetable_mode,
                         phrase_template: src,
                         group_code: code,
                         comment: hit.comment,
@@ -473,8 +482,9 @@ impl Coordinator {
                         weight: PHRASE_WEIGHT_BASE + hit.weight,
                         is_phrase: true,
                         is_group: true,
-                        // 引导键导航候选恒属精确档，理由同上面的 $CC 分支。
-                        is_exact_code: true,
+                        // 前缀匹配的组 marker 分模式定层，理由同上面的 $CC 分支。
+                        is_exact_code: codetable_mode,
+                        is_prefix: !codetable_mode,
                         group_code: code,
                         group_name: text,
                         comment: hit.comment,
