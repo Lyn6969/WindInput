@@ -117,19 +117,25 @@ jobs:
           WIND_REQUIRE_COMPANIONS: "1"
         run: ./scripts/pack-installer.sh --version "$BUILD_VERSION" --compression lzma
 
+      # 本仓绝大多数改动直接提交、不走 PR，GitHub 的 generate_release_notes 只会
+      # 产出一个空的 "What's Changed"，故改为自行按 conventional commits 汇总。
+      # 模板与分类规则见 scripts/gen-release-notes.sh 与 docs/release-notes/。
+      - name: 生成 Release Notes (仅 tag 触发)
+        if: github.ref_type == 'tag'
+        working-directory: WindInput
+        run: ./scripts/gen-release-notes.sh --tag "$GITHUB_REF_NAME" -o release_notes.md
+
       - name: 创建草稿 Release (仅 tag 触发)
         if: github.ref_type == 'tag'
         uses: softprops/action-gh-release@v2
         with:
           draft: true                          # 人工审核 Release Notes 后再发布
-          generate_release_notes: true
-          # user-facing 标记块：发布前把面向用户的更新说明填进标记内，
-          # 文档仓 scripts/sync_release_notes.py 按此标记同步到官网更新记录；
-          # 保持"暂未填写"占位则跳过同步。自动生成的 PR 列表会附在本模板之后。
-          body: |
-            <!-- user-facing:start -->
-            > 暂未填写
-            <!-- user-facing:end -->
+          name: 清风输入法 v${{ env.BUILD_VERSION }}
+          # 正文里的 user-facing 标记块是给人填的：发布前把面向用户的更新说明写进
+          # 标记内。两个下游按此标记取内容 —— 文档仓 scripts/sync_release_notes.py
+          # (→ 官网更新记录) 与 wind-setting src/update/notes.rs (→ 应用内升级提示)，
+          # 保持"暂未填写"占位则两边都跳过。
+          body_path: WindInput/release_notes.md
           files: |
             wind-installer/dist/WindInput-Setup-*.exe
             wind-installer/dist/WindInput-Setup-*.exe.sha256

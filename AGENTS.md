@@ -186,6 +186,11 @@ log_level = "debug"   # 或 "trace"
   发版只改 `docs/VERSION` 一处，**不要**手改各仓 `Cargo.toml` 的 `version`。
 - CI（release.yml）为 tag-first：以 tag 覆盖 `docs/VERSION` 再构建；仓库里的 `docs/VERSION`
   是开发占位。**切勿添加 `tag == docs/VERSION` 一致性校验**——会破坏手动触发的 `-dev` 占位流程。
+- 草稿 Release 的正文由 `scripts/gen-release-notes.sh` 生成（模板在 `docs/release-notes/`）：
+  基础信息 + 人工填写区 + 折叠的提交记录。人工填写区由 `<!-- user-facing:start/end -->`
+  圈定，**两个下游按此标记取内容**——文档仓 `scripts/sync_release_notes.py`（官网更新记录）
+  与 wind-setting `src/update/notes.rs`（应用内升级提示）。占位文本必须恰好是 `暂未填写`
+  （Rust 侧按全等判定），前面加 `>` 之类修饰会让占位符被当成正文弹给用户。
 
 ## Agent skills
 
