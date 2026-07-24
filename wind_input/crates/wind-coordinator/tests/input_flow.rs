@@ -4319,23 +4319,42 @@ fn test_codetable_auto_phrase_single_char_is_not_a_word() {
     let _ = std::fs::remove_file(&db);
 }
 
-/// 前缀匹配的 marker 短语（`$AA` 组）须按引擎模式定层：拼音/混输下避让、落到拼音精确候选
-/// 之下；码表（引导键场景）下保留精确档置顶。
+/// 前缀匹配的全局短语（此处以 `$AA` 组 marker 为例）按**来源**统一处理：来源=短语库、全局、
+/// 不与方案挂钩，故前缀命中一律避让、不占首位——码表下与更长编码补全按权重同档、拼音/混输下
+/// 降到拼音精确候选之下。**不按语法类型区分**（`$CC`/`$SS`/静态同规则），也不再靠 40M 类别硬顶。
 ///
-/// 回归：marker 短语来自 `lookup_prefix`（前缀枚举、码严格更长＝非完全匹配），却被无条件标
-/// `is_exact_code=true` 抬进精确档，在拼音模式下越过全部拼音候选（用户报「系统/用户短语前缀
-/// 匹配时优先级偏高、压普通候选」）。短语设计上尽量不与编码冲突，前缀匹配应避让、只在完全
-/// 匹配（`lookup` 精确码）时提前。构造组短语码 `nia`（严格长于输入 `ni` → 前缀枚举命中）。
+/// 回归：marker 来自 `lookup_prefix`（前缀枚举、码严格更长＝非完全匹配），曾被标 `is_exact_code=true`
+/// + `PHRASE_WEIGHT_BASE`(40M) 抬进精确档并整体上浮，压过普通候选（用户报「系统/用户短语前缀
+/// 匹配时优先级偏高、压普通编码/候选」）。现改为 `is_exact_code=false` + `is_prefix=!codetable` +
+/// `weight=hit.weight`。低权重（1）确保 marker 可靠沉到码表候选之下，隔离出「避让」这一单一断言。
+/// 构造组短语码 `nia`（严格长于输入 `ni` → 前缀枚举命中）。
 fn coord_with_group_phrase(schema: &str, tag: &str) -> std::sync::Arc<Coordinator> {
     let store_path = std::env::temp_dir().join(format!("wind_group_marker_{tag}.redb"));
     let _ = std::fs::remove_file(&store_path);
     let store = std::sync::Arc::new(wind_store::Store::open(&store_path).unwrap());
     store
-        .add_phrase("nia", r#"$AA("测试组", "①②③")"#, 0, 100)
+        .add_phrase("nia", r#"$AA("测试组", "①②③")"#, 0, 1)
         .unwrap();
     let mut cfg = config_with(schema);
     cfg.input.phrase.min_prefix = 2;
     Coordinator::new_headless_with_store(cfg, Some(&data_dir()), store)
+}
+
+/// 断言：前缀 marker 仍在候选列表里，但**不占首位**（避让首选普通候选）。
+fn assert_group_marker_defers(coord: &Coordinator, mode: &str) {
+    let texts = coord.debug_all_candidate_texts();
+    let group_pos = texts.iter().position(|t| t == "测试组");
+    assert!(
+        group_pos.is_some(),
+        "[{mode}] 前缀枚举应仍列出组 marker，实际: {:?}",
+        texts
+    );
+    assert_ne!(
+        group_pos,
+        Some(0),
+        "[{mode}] 前缀匹配的组 marker 不应占首位（须避让普通候选），实际: {:?}",
+        texts
+    );
 }
 
 #[test]
@@ -4347,37 +4366,20 @@ fn prefix_group_marker_defers_below_pinyin_candidates() {
     for ch in ['n', 'i'] {
         press_letter(&coord, ch);
     }
-    let texts = coord.debug_all_candidate_texts();
-    let group_pos = texts.iter().position(|t| t == "测试组");
-    assert!(
-        group_pos.is_some(),
-        "前缀枚举应仍列出组 marker，实际: {:?}",
-        texts
-    );
-    assert_ne!(
-        group_pos,
-        Some(0),
-        "拼音模式下前缀匹配的组 marker 不应占首位（须避让拼音精确候选），实际: {:?}",
-        texts
-    );
+    // 拼音：is_prefix 使 marker 落到拼音精确候选（is_prefix=false）之下。
+    assert_group_marker_defers(&coord, "pinyin");
 }
 
 #[test]
-fn prefix_group_marker_stays_top_in_codetable() {
+fn prefix_group_marker_defers_in_codetable_too() {
     if !has_schemas() {
         return;
     }
-    // 对照组：码表（引导键场景）下前缀 marker 保留精确档置顶，证明拼音的避让来自模式分档
-    // 而非 marker 被整体改坏。
+    // 码表：marker 不再靠 is_exact_code+40M 置顶（旧行为），改按权重——低权重沉到码表候选之下。
+    // 与拼音测试同断言，印证「按来源统一避让」而非按引擎模式分档。
     let coord = coord_with_group_phrase("wubi86", "wubi");
     for ch in ['n', 'i'] {
         press_letter(&coord, ch);
     }
-    let texts = coord.debug_all_candidate_texts();
-    assert_eq!(
-        texts.first().map(|s| s.as_str()),
-        Some("测试组"),
-        "码表模式下前缀 marker 应保持置顶（引导键行为不回归），实际: {:?}",
-        texts
-    );
+    assert_group_marker_defers(&coord, "wubi86");
 }

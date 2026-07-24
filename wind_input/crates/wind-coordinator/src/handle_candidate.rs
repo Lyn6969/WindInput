@@ -421,10 +421,11 @@ impl Coordinator {
             // 例外——镜像码表引擎 `single_code_complete`：当前无任何候选（码表 + 精确短语均空）且未满码时，
             // 放行一次前缀枚举作**补全候选源**，避免精确模式下彻底无候选。
             let ct = self.engine_mgr.codetable_settings();
-            // 引擎模式：纯码表 vs 拼音/混输。决定**前缀匹配**的 marker 短语落哪个匹配层——
-            // 短语在设计上尽量不与编码冲突，故前缀匹配应避让、只在完全匹配时提前：
-            // - 码表（引导键场景）：沿用精确档置顶（用户按引导键正是为看到它们）；
-            // - 拼音/混输：降进前缀层，落到拼音精确候选之下（见下方两个 marker 分支）。
+            // 引擎模式：纯码表 vs 拼音/混输。全局短语的前缀命中按**来源**（来源=短语库、全局、
+            // 不与方案挂钩）统一处理，不按语法类型（`$CC`/`$SS`/静态）区分——见下方三个前缀分支
+            // 共用的 `phrase_prefix_is_prefix`。此处只承载「码表用 is_exact_code 分档、拼音用
+            // is_prefix 分层」这一引擎差异：两种引擎表达「短语该降到方案精确候选之下」的标志不同。
+            // （方案内词库词条走引擎/`finalize_candidates`，按方案权重排，不经这里，故第①类天然正确。）
             let codetable_mode = self.engine_mgr.is_codetable();
             let exact_only = codetable_mode && ct.single_code_input;
             // 空码补全的短语侧取数闸门：仅在精确模式抑制了前缀枚举时才可能触发。此处的
@@ -442,6 +443,14 @@ impl Coordinator {
             // 前缀命中 → 候选的构造，正常枚举与补全池两条去向共用：补全要取的是「若开启前缀
             // 匹配，本会显示在最前的那一条」，故它必须与正常枚举**构造得一模一样**，才能用同一个
             // 显示排序器（`candidate_display_order`）比出真正的首条。
+            //
+            // 三个前缀分支（`$CC`/`$SS`·`$AA`/静态）的**排序标志一律相同**——只按「来源=全局短语 +
+            // 前缀匹配」处理，不按语法类型区分（语法只决定 is_command/is_group 的**选中行为**）：
+            // - `is_exact_code=false`：前缀非完全匹配，不进精确档（完全匹配走上面的 `lookup`，仍抬升）；
+            // - `is_prefix=!codetable_mode`：码表下与更长编码补全同档、按权重竞争；拼音/混输下降到
+            //   拼音精确候选（is_prefix=false）之下；
+            // - `weight=hit.weight`：**不加** `PHRASE_WEIGHT_BASE`——按短语自身权重排，不靠 40M 类别硬顶。
+            let phrase_prefix_is_prefix = !codetable_mode;
             let mut built: Vec<Candidate> = Vec::new();
             for hit in prefix_hits {
                 // 完整原文（仅一行化，不截断）：上屏用原始文本，截断加省略号由 UI 下发层负责。
@@ -456,18 +465,11 @@ impl Coordinator {
                     let code = hit.nav_code.unwrap_or_default();
                     built.push(Candidate {
                         text,
-                        weight: PHRASE_WEIGHT_BASE + hit.weight,
+                        // 排序标志三分支统一，见上方 `phrase_prefix_is_prefix` 处说明。
+                        weight: hit.weight,
                         is_phrase: true,
                         is_command: true,
-                        // 本条来自 `lookup_prefix`（前缀枚举、码严格更长），是**前缀匹配**而非完全匹配：
-                        // - 码表（引导键场景）：属精确档置顶——用户正是按引导键**为了**看到它们，不被
-                        //   码表单字 preempt（`cmp_exact_first`）。此前靠「不设任何层级标志」隐式待在精确
-                        //   层，`cmp_exact_first` 引入后须显式标出。
-                        // - 拼音/混输：短语应避让编码，降进前缀层（`cmp_match_layers` 的 is_prefix），
-                        //   与静态前缀短语同层、落在拼音精确候选（is_prefix=false）之下。
-                        // 两标志互斥（同一条不会既精确又前缀）。$SS/$AA 组分支同理。
-                        is_exact_code: codetable_mode,
-                        is_prefix: !codetable_mode,
+                        is_prefix: phrase_prefix_is_prefix,
                         phrase_template: src,
                         group_code: code,
                         comment: hit.comment,
@@ -479,12 +481,11 @@ impl Coordinator {
                     // phrase_template 存原始记录文本：右键「禁用短语」按 (group_code, 原文) 定位。
                     built.push(Candidate {
                         text: text.clone(),
-                        weight: PHRASE_WEIGHT_BASE + hit.weight,
+                        // 排序标志三分支统一，见上方 `phrase_prefix_is_prefix` 处说明。
+                        weight: hit.weight,
                         is_phrase: true,
                         is_group: true,
-                        // 前缀匹配的组 marker 分模式定层，理由同上面的 $CC 分支。
-                        is_exact_code: codetable_mode,
-                        is_prefix: !codetable_mode,
+                        is_prefix: phrase_prefix_is_prefix,
                         group_code: code,
                         group_name: text,
                         comment: hit.comment,
@@ -494,11 +495,12 @@ impl Coordinator {
                     });
                 } else {
                     // 静态短语前缀命中（Literal/Template，command_src=None, nav_code=None）。
+                    // 排序标志三分支统一，见上方 `phrase_prefix_is_prefix` 处说明。
                     built.push(Candidate {
                         text,
-                        weight: PHRASE_WEIGHT_BASE + hit.weight,
+                        weight: hit.weight,
                         is_phrase: true,
-                        is_prefix: true,
+                        is_prefix: phrase_prefix_is_prefix,
                         comment: hit.comment,
                         phrase_template: hit.source_text,
                         meta: phrase_meta(),
