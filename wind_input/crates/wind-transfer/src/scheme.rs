@@ -67,10 +67,10 @@ pub struct CollectPlan {
     pub root_version: String,
 }
 
-/// 单个相对路径的三分类结果。
+/// 单个相对路径的三分类结果。System 携带源绝对路径,自包含导出需据此读取打包。
 enum Located {
     User(PathBuf),
-    System,
+    System(PathBuf),
     Missing,
 }
 
@@ -80,8 +80,9 @@ fn locate(rel: &str, user_dir: &Path, system_dir: Option<&Path>) -> Located {
         return Located::User(u);
     }
     if let Some(s) = system_dir {
-        if s.join(rel).is_file() {
-            return Located::System;
+        let sp = s.join(rel);
+        if sp.is_file() {
+            return Located::System(sp);
         }
     }
     Located::Missing
@@ -150,11 +151,16 @@ fn resource_rels(schema: &wind_config::schema::Schema) -> Vec<String> {
 }
 
 /// 收集方案 `id` 的打包计划。根方案文件必打包(用户目录优先解析,系统命中也打包——
-/// 包必须自含方案文件);资源与 mixed 引用方案按三分类;引用的用户方案递归(visited 防环)。
+/// 包必须自含方案文件);引用的用户方案递归(visited 防环)。
+///
+/// `include_system` 控制系统目录命中的资源/子方案如何处理:
+/// - `true`(自包含导出):一并读源打包 → 产出的包在任何机器上都完整可用,不依赖目标机内置文件。
+/// - `false`(删除路径复用):系统命中只记 `system_refs` 且子方案不递归,维持"系统文件永不触碰"的语义。
 pub fn collect_package_files(
     id: &str,
     user_dir: &Path,
     system_dir: Option<&Path>,
+    include_system: bool,
 ) -> anyhow::Result<CollectPlan> {
     let mut plan = CollectPlan {
         pack: Vec::new(),
@@ -164,13 +170,22 @@ pub fn collect_package_files(
         root_version: String::new(),
     };
     let mut visited: HashSet<String> = HashSet::new();
-    collect_into(id, true, user_dir, system_dir, &mut plan, &mut visited)?;
+    collect_into(
+        id,
+        true,
+        include_system,
+        user_dir,
+        system_dir,
+        &mut plan,
+        &mut visited,
+    )?;
     Ok(plan)
 }
 
 fn collect_into(
     id: &str,
     is_root: bool,
+    include_system: bool,
     user_dir: &Path,
     system_dir: Option<&Path>,
     plan: &mut CollectPlan,
@@ -180,12 +195,13 @@ fn collect_into(
         return Ok(()); // 防环
     }
     let schema_rel = format!("{id}.schema.toml");
-    // 方案文件解析:用户优先;根方案系统命中也打包(包自含);非根系统命中→只记引用。
+    // 方案文件解析:用户优先;根方案系统命中必打包(包自含);非根系统命中在自包含模式下也
+    // 打包并继续递归其资源,否则只记引用不递归(删除路径:系统文件永不触碰)。
     let schema_abs = match locate(&schema_rel, user_dir, system_dir) {
         Located::User(p) => p,
-        Located::System => {
-            if is_root {
-                system_dir.unwrap().join(&schema_rel)
+        Located::System(p) => {
+            if is_root || include_system {
+                p
             } else {
                 plan.system_refs.push(schema_rel);
                 return Ok(());
@@ -214,15 +230,30 @@ fn collect_into(
         let (rel, located) = locate_resource(&rel, user_dir, system_dir);
         match located {
             Located::User(p) => plan.pack.push((rel, p)),
-            Located::System => plan.system_refs.push(rel),
+            // 自包含导出:系统词库/拆字库/字体也读源打包;删除路径:只记引用不打包。
+            Located::System(p) => {
+                if include_system {
+                    plan.pack.push((rel, p));
+                } else {
+                    plan.system_refs.push(rel);
+                }
+            }
             Located::Missing => plan.missing.push(rel),
         }
     }
-    // mixed 引用方案:用户命中→递归;系统命中→记引用;缺失→记缺失(在递归调用内处理)。
+    // mixed 引用方案:用户命中→递归;系统命中→自包含模式递归打包,否则记引用;缺失→记缺失。
     let mixed = &schema.engine.mixed;
     for sub in [&mixed.primary_schema, &mixed.secondary_schema] {
         if !sub.is_empty() {
-            collect_into(sub, false, user_dir, system_dir, plan, visited)?;
+            collect_into(
+                sub,
+                false,
+                include_system,
+                user_dir,
+                system_dir,
+                plan,
+                visited,
+            )?;
         }
     }
     Ok(())
@@ -246,7 +277,8 @@ pub fn export_package(
     platform: &str,
     created_at: &str,
 ) -> anyhow::Result<SchemeExportResult> {
-    let plan = collect_package_files(id, user_dir, system_dir)?;
+    // 自包含导出:内置(系统目录)词库/拆字/字体一并打包,产出的包脱离目标机内置文件也完整可用。
+    let plan = collect_package_files(id, user_dir, system_dir, true)?;
     let meta = PackageMeta {
         package: PackageInfo {
             app_version: app_version.to_string(),
@@ -431,14 +463,15 @@ pub fn delete_package(
     system_dir: Option<&Path>,
     keep_ids: &[String],
 ) -> anyhow::Result<SchemeDeleteResult> {
-    let plan = collect_package_files(id, user_dir, system_dir)?;
+    // 删除只关心用户目录文件,系统命中记引用即可(include_system=false),避免解析系统子方案。
+    let plan = collect_package_files(id, user_dir, system_dir, false)?;
     // 其余现存方案引用的文件集合(单个方案收集失败不阻断删除,跳过即可)。
     let mut kept: HashSet<String> = HashSet::new();
     for kid in keep_ids {
         if kid == id {
             continue;
         }
-        if let Ok(p) = collect_package_files(kid, user_dir, system_dir) {
+        if let Ok(p) = collect_package_files(kid, user_dir, system_dir, false) {
             kept.extend(p.pack.into_iter().map(|(rel, _)| rel));
         }
     }
@@ -547,7 +580,7 @@ path = "wb/main.dict.yaml"
         // 只投放 wdat，不放 yaml
         fs::write(user.join("wb/main.wdat"), b"binary").unwrap();
 
-        let plan = collect_package_files("wb", &user, Some(&system)).unwrap();
+        let plan = collect_package_files("wb", &user, Some(&system), false).unwrap();
         let names: Vec<&str> = plan.pack.iter().map(|(n, _)| n.as_str()).collect();
         assert!(
             names.contains(&"wb/main.wdat"),
@@ -587,7 +620,7 @@ path = "wb/main.dict.yaml"
         fs::write(user.join("wb/main.dict.yaml"), "src").unwrap();
         fs::write(user.join("wb/main.wdat"), b"binary").unwrap();
 
-        let plan = collect_package_files("wb", &user, Some(&system)).unwrap();
+        let plan = collect_package_files("wb", &user, Some(&system), false).unwrap();
         let names: Vec<&str> = plan.pack.iter().map(|(n, _)| n.as_str()).collect();
         assert!(names.contains(&"wb/main.dict.yaml"));
         assert!(!names.contains(&"wb/main.wdat"), "yaml 在场时不应改打 wdat");
@@ -599,7 +632,7 @@ path = "wb/main.dict.yaml"
         let t = tempfile::tempdir().unwrap();
         let (user, system) = (t.path().join("u"), t.path().join("s"));
         fixture(&user, &system);
-        let plan = collect_package_files("my", &user, Some(&system)).unwrap();
+        let plan = collect_package_files("my", &user, Some(&system), false).unwrap();
         assert_eq!(
             plan.missing,
             vec!["my/ghost.dict.yaml"],
@@ -612,7 +645,7 @@ path = "wb/main.dict.yaml"
         let t = tempfile::tempdir().unwrap();
         let (user, system) = (t.path().join("u"), t.path().join("s"));
         fixture(&user, &system);
-        let plan = collect_package_files("my", &user, Some(&system)).unwrap();
+        let plan = collect_package_files("my", &user, Some(&system), false).unwrap();
         let names: Vec<&str> = plan.pack.iter().map(|(n, _)| n.as_str()).collect();
         assert!(names.contains(&"my.schema.toml"), "根方案文件必打包");
         assert!(names.contains(&"my/main.dict.yaml"));
@@ -648,7 +681,7 @@ secondary_schema = "pinyin"
             "[schema]\nid=\"pinyin\"\n",
         )
         .unwrap();
-        let plan = collect_package_files("mix", &user, Some(&system)).unwrap();
+        let plan = collect_package_files("mix", &user, Some(&system), false).unwrap();
         let names: Vec<&str> = plan.pack.iter().map(|(n, _)| n.as_str()).collect();
         assert!(names.contains(&"mix.schema.toml"));
         assert!(names.contains(&"my.schema.toml"), "用户引用方案递归打包");
@@ -660,6 +693,65 @@ secondary_schema = "pinyin"
         assert_eq!(plan.schema_ids, vec!["mix", "my"]);
     }
 
+    /// 自包含模式(include_system=true):系统目录命中的资源改为读源打包,system_refs 清空。
+    /// 这正是内置方案(如 wubi86)导出时词库能进包的关键。
+    #[test]
+    fn collect_self_contained_packs_system_resources() {
+        let t = tempfile::tempdir().unwrap();
+        let (user, system) = (t.path().join("u"), t.path().join("s"));
+        fixture(&user, &system);
+        let plan = collect_package_files("my", &user, Some(&system), true).unwrap();
+        let names: Vec<&str> = plan.pack.iter().map(|(n, _)| n.as_str()).collect();
+        assert!(
+            names.contains(&"sys/shared.dict.yaml"),
+            "系统词库自包含时须入包,实际: {names:?}"
+        );
+        assert!(
+            plan.system_refs.is_empty(),
+            "自包含时无系统引用,实际: {:?}",
+            plan.system_refs
+        );
+        assert_eq!(plan.missing, vec!["my/ghost.dict.yaml"], "真缺失仍上报");
+        // 入包的系统源路径必须指向真实文件
+        let src = plan
+            .pack
+            .iter()
+            .find(|(n, _)| n == "sys/shared.dict.yaml")
+            .map(|(_, p)| p.clone())
+            .unwrap();
+        assert!(src.starts_with(&system) && src.is_file());
+    }
+
+    /// 自包含模式下,混输引用的系统子方案(及其资源)一并递归打包,而非只记引用。
+    #[test]
+    fn collect_self_contained_recurses_system_subschema() {
+        let t = tempfile::tempdir().unwrap();
+        let (user, system) = (t.path().join("u"), t.path().join("s"));
+        fixture(&user, &system);
+        fs::create_dir_all(system.join("pinyin")).unwrap();
+        fs::write(
+            user.join("mix.schema.toml"),
+            "[schema]\nid=\"mix\"\n[engine]\ntype=\"mixed\"\n[engine.mixed]\nprimary_schema=\"my\"\nsecondary_schema=\"pinyin\"\n",
+        )
+        .unwrap();
+        fs::write(
+            system.join("pinyin.schema.toml"),
+            "[schema]\nid=\"pinyin\"\n[engine]\ntype=\"pinyin\"\n[[dictionaries]]\npath=\"pinyin/main.dict.yaml\"\n",
+        )
+        .unwrap();
+        fs::write(system.join("pinyin/main.dict.yaml"), "py").unwrap();
+
+        let plan = collect_package_files("mix", &user, Some(&system), true).unwrap();
+        let names: Vec<&str> = plan.pack.iter().map(|(n, _)| n.as_str()).collect();
+        assert!(names.contains(&"pinyin.schema.toml"), "系统子方案文件入包");
+        assert!(
+            names.contains(&"pinyin/main.dict.yaml"),
+            "系统子方案的词库也入包,实际: {names:?}"
+        );
+        assert!(plan.system_refs.is_empty(), "自包含无系统引用");
+        assert_eq!(plan.schema_ids, vec!["mix", "my", "pinyin"]);
+    }
+
     #[test]
     fn export_package_writes_flat_layout_and_meta() {
         let t = tempfile::tempdir().unwrap();
@@ -668,19 +760,25 @@ secondary_schema = "pinyin"
         let out = t.path().join("my.zip");
         let r = export_package("my", &user, Some(&system), &out, "1.0.0", "windows", "t").unwrap();
         assert_eq!(r.path, out);
-        assert_eq!(r.packed.len(), 3);
-        assert_eq!(r.system_refs.len(), 1);
+        // 自包含导出:用户资源 3 个 + 系统 sys/shared.dict.yaml 一并打包 = 4;系统引用清空。
+        assert_eq!(r.packed.len(), 4);
+        assert!(r.system_refs.is_empty(), "自包含导出无系统引用");
         assert_eq!(r.missing.len(), 1);
         // 零层级布局:条目名即 schemas 相对路径
         let bytes = crate::bundle::extract_entry(&out, "my/main.dict.yaml").unwrap();
         assert_eq!(bytes, b"d");
         assert!(crate::bundle::extract_entry(&out, "my.schema.toml").is_ok());
+        // 系统词库内容确实进了包
+        assert_eq!(
+            crate::bundle::extract_entry(&out, "sys/shared.dict.yaml").unwrap(),
+            b"s"
+        );
         // package.toml 元信息完备
         let meta = read_package_meta(&out);
         assert_eq!(meta.package.app_version, "1.0.0");
         assert_eq!(meta.schema.id, "my");
         assert_eq!(meta.schema.version, "1.2");
-        assert_eq!(meta.refs.system, vec!["sys/shared.dict.yaml"]);
+        assert!(meta.refs.system.is_empty(), "自包含导出无系统引用");
         assert_eq!(meta.refs.missing, vec!["my/ghost.dict.yaml"]);
     }
 
@@ -695,16 +793,19 @@ secondary_schema = "pinyin"
         let dest = t.path().join("dest");
         std::fs::create_dir_all(&dest).unwrap();
         let prev = preview_import(&out, &dest).unwrap();
-        assert_eq!(prev.will_add.len(), 3);
+        // 自包含包含系统词库 → 4 个条目全部待新增,无系统引用。
+        assert_eq!(prev.will_add.len(), 4);
         assert!(prev.conflicts.is_empty());
-        assert_eq!(prev.system_refs.len(), 1);
+        assert!(prev.system_refs.is_empty());
         assert_eq!(prev.meta.schema.id, "my");
 
         let r = import_package(&out, &dest, crate::merge::Strategy::Merge).unwrap();
-        assert_eq!(r.imported.len(), 3);
+        assert_eq!(r.imported.len(), 4);
         assert!(r.conflicts.is_empty());
         assert_eq!(r.schema_ids, vec!["my"]);
         assert!(dest.join("my.schema.toml").is_file());
+        // 系统词库随包落进目标用户目录
+        assert!(dest.join("sys/shared.dict.yaml").is_file());
         assert!(
             !dest.join(PACKAGE_META_NAME).exists(),
             "package.toml 是元信息,不落盘"
@@ -728,18 +829,18 @@ secondary_schema = "pinyin"
         let prev = preview_import(&out, &dest).unwrap();
         assert_eq!(prev.conflicts, vec!["my/main.dict.yaml"]);
 
-        // Merge:跳过已存在,内容保持 OLD
+        // Merge:跳过已存在,内容保持 OLD(自包含包 4 条,冲突 1 条 → 导入 3 条)
         let r = import_package(&out, &dest, crate::merge::Strategy::Merge).unwrap();
         assert_eq!(r.conflicts, vec!["my/main.dict.yaml"]);
-        assert_eq!(r.imported.len(), 2);
+        assert_eq!(r.imported.len(), 3);
         assert_eq!(
             std::fs::read(dest.join("my/main.dict.yaml")).unwrap(),
             b"OLD"
         );
 
-        // Replace:覆盖为包内内容
+        // Replace:覆盖为包内内容(4 条全写)
         let r2 = import_package(&out, &dest, crate::merge::Strategy::Replace).unwrap();
-        assert_eq!(r2.imported.len(), 3);
+        assert_eq!(r2.imported.len(), 4);
         assert!(r2.conflicts.is_empty());
         assert_eq!(std::fs::read(dest.join("my/main.dict.yaml")).unwrap(), b"d");
     }
