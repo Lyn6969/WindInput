@@ -56,6 +56,14 @@
 - **禁止**在 `match data.key_code` / 比较中写裸 `0x1B`、`0x21` 之类字面量；用 `keymap::VK_*`。
 - 触发键名（配置里的 `"backslash"`/`"semicolon"`）→ VK：`keymap::key_name_to_vk(_with_letters)`，
   单一真相源 `KEY_TABLE`，新增键只改一处。
+- **⚠️ 触发键名跨仓一致性**：设置界面（独立仓库 `../wind-setting`，见上方仓库列表）的
+  `src/assets/settings_manifest.toml` 里各触发键选项的 `value` 必须与本表 `KEY_TABLE.names`
+  字符串**逐字相同**——两仓无编译期/运行期校验，写错会静默失效（UI 显示"已选中"、保存不报错，
+  内核 `key_name_to_vk` 返回 `None` 后被 `filter_map` 悄悄丢弃）。曾因 `wind-setting` 把方括号
+  选项写成 `open_bracket`/`close_bracket`（本表实际是 `lbracket`/`rbracket`）导致临时英文/临时
+  拼音/快捷输入的方括号触发键全部失效。改本表新增键或改名时，**必须同步 grep 检查
+  `wind-setting/src/assets/settings_manifest.toml` 与 `wind-setting/src/key_conflict.rs` 的
+  `key_symbol()`** 有没有过时或不一致的字符串。
 - **注意类型**：`KeyEventData.prev_char`、`CommitRequestData.trigger_key` 是 **u16**
   （UTF-16 码元 / 协议字段），与 VK(`u32`) 比较前需 `as u32` 转换；prev_char 是字符码点不是 VK，
   别套 VK 常量（用数值区间，如 `(0x30..=0x39).contains(&prev_char)` 判数字字符）。
