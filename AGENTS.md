@@ -105,6 +105,10 @@ AI 附加 trailer。
 
 ## 格式化（强制）
 
+仓库自带 `.githooks/pre-commit`（提交前自动跑 `cargo fmt --check`），默认未激活，
+一次性执行 `./scripts/dev.sh hooks`（或 `.\scripts\dev.ps1 hooks`）激活；
+纯本地 git config，不随仓库自动传播，每个 worktree/clone 都需单独激活一次。
+
 **每次修改 Rust 文件后，验证通过前必须运行 `cargo fmt`**（在 `wind_input/` 目录下），
 再把格式化结果作为独立提交：
 

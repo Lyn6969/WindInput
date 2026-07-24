@@ -32,7 +32,7 @@
 #   9  / d9      生成便携包 (release / dev): 全构建 + 打 zip → dist\*-Portable-<版本>.zip
 #                (免安装; 不依赖 wind-installer; 内含便携标记, 不含 userdata\)
 #   9s / d9s     生成便携包 (跳过重建, 直接打包现有 build[_dev]/)
-#   k=check  l=clippy  t=test  f=fmt  fmt-check  ci(=fmt+clippy+test)  clean
+#   k=check  l=clippy  t=test  f=fmt  fmt-check  ci(=fmt+clippy+test)  hooks(=激活pre-commit)  clean
 #   gd=gen-data  r=repl
 #
 # 部署目标 (在 scripts\deploy.local.ps1 覆盖, PowerShell 赋值格式):
@@ -236,6 +236,11 @@ function Do-Test   { Say "`n正在运行 cargo test (全工作区)...";   Push-L
 function Do-Fmt    { Say "`n正在运行 cargo fmt...";                Push-Location $ProjectRoot; try { cargo fmt }                finally { Pop-Location } }
 function Do-FmtCheck { Say "`n正在运行 cargo fmt --check...";      Push-Location $ProjectRoot; try { cargo fmt --all -- --check } finally { Pop-Location } }
 function Do-Clean  { Say "`n正在运行 cargo clean...";              Push-Location $ProjectRoot; try { cargo clean }              finally { Pop-Location } }
+function Do-HooksInstall {
+    Say "`n激活 .githooks/pre-commit (git config core.hooksPath .githooks)..."
+    Push-Location $ProductRoot; try { git config core.hooksPath .githooks } finally { Pop-Location }
+    Say "已激活：提交前将自动跑 cargo fmt --check"
+}
 
 function Do-Ci {
     Push-Location $ProjectRoot
@@ -1447,6 +1452,7 @@ function Dispatch ([string]$cmd, [string]$arg) {
         { $_ -in @("f", "fmt") }     { Do-Fmt;    $LASTEXITCODE; break }
         "fmt-check"                  { Do-FmtCheck; $LASTEXITCODE; break }
         "ci"                         { if (Do-Ci) { 0 } else { 1 }; break }
+        "hooks"                      { Do-HooksInstall; 0; break }
         "clean"                      { Do-Clean;  $LASTEXITCODE; break }
         { $_ -in @("gd", "gen-data") }  { if (Do-GenData) { 0 } else { 1 }; break }
         { $_ -in @("r", "repl") }       { Do-Repl $arg; 0; break }

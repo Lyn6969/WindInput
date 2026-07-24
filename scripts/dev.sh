@@ -28,7 +28,7 @@
 #   p1 / pd1     push 全部 build[_dev]/ → Windows 安装目录 (release / dev)
 #   pm1/pm2      push 单模块 (tsf/核心, release)
 #   pdm1/pdm2    push 单模块 (dev)
-#   k=check  l=clippy  t=test  f=fmt  fmt-check  ci(=fmt+clippy+test)  clean
+#   k=check  l=clippy  t=test  f=fmt  fmt-check  ci(=fmt+clippy+test)  hooks(=激活pre-commit)  clean
 #   gd=gen-data  r=repl  dl=pull-data  pc=pull-config  pl=pull-log(pla=全部)
 #
 # 部署配置 scripts/deploy.local（SSH 推送到 Windows 实测机）:
@@ -217,6 +217,12 @@ do_fmt() {
 do_fmt_check() {
     say "\n正在运行 cargo fmt --check..."
     cd "$PROJECT_ROOT" && cargo fmt --all -- --check
+}
+
+do_hooks_install() {
+    say "\n激活 .githooks/pre-commit (git config core.hooksPath .githooks)..."
+    cd "$PRODUCT_ROOT" && git config core.hooksPath .githooks
+    say "已激活：提交前将自动跑 cargo fmt --check"
 }
 
 do_clean() {
@@ -915,6 +921,7 @@ dispatch() {
         f|fmt)            do_fmt ;;
         fmt-check)        do_fmt_check ;;
         ci)               do_ci ;;
+        hooks)            do_hooks_install ;;
         clean)            do_clean ;;
         gd|gen-data)      do_gen_data ;;
         r|repl)           do_repl "${2:-}" ;;

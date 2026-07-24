@@ -72,6 +72,18 @@ macOS 额外需要：
 > （wind-installer）为独立的未开源仓库，构建脚本在其不存在时会自动跳过，
 > 不影响核心部分的构建。
 
+### Git Hooks（首次克隆后建议激活）
+
+仓库自带 `.githooks/pre-commit`（提交前自动跑 `cargo fmt --check`，避免
+未格式化代码被提交后才在 CI 里暴露），默认不生效，需一次性激活：
+
+```
+.\scripts\dev.ps1 hooks    # Windows
+scripts/dev.sh hooks       # Linux/macOS
+```
+
+（等价于 `git config core.hooksPath .githooks`，仅影响本地 clone，不会随仓库自动传播。）
+
 ### 提交规范
 
 本项目使用 [Conventional Commits](https://www.conventionalcommits.org/zh-hans/) 规范：
