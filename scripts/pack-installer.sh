@@ -119,6 +119,9 @@ cp -f  "$BUILD_DIR/wind_input.exe"   "$STAGE/"
 cp -f  "$BUILD_DIR/wind_tsf.dll"     "$STAGE/"
 cp -f  "$BUILD_DIR/wind_tsf_x86.dll" "$STAGE/"
 cp -rf "$BUILD_DIR/data"             "$STAGE/"
+# CLI 包装器随核心分发(与 dev.sh Build-Core / dev.ps1 整目录打包口径一致)。
+# Build-Core 里是"存在才复制", 故此处也守卫存在性。
+[[ -f "$BUILD_DIR/wind_cli.bat" ]] && cp -f "$BUILD_DIR/wind_cli.bat" "$STAGE/"
 for f in "${companions[@]}"; do
   [[ -f "$BUILD_DIR/$f" ]] && cp -f "$BUILD_DIR/$f" "$STAGE/"
 done
