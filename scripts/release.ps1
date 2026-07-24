@@ -256,8 +256,15 @@ function Get-RepoState ([pscustomobject]$repo, [string]$branch, [string]$tag, [b
     }
 
     # -------- 工作区 --------
+    # WindInput 的 docs/VERSION 是本地版本占位文件(release 末尾会自动写它、常态不提交),
+    # 不计入脏工作区确认, 避免每次发布都为它多按一次 y。porcelain 格式为 "XY path",
+    # 路径从第 4 个字符起(Substring(3))。
     $porcelain = Get-GitValue $path @("status", "--porcelain")
-    if ($porcelain) { $st.Dirty = @($porcelain -split "`n" | Where-Object { $_.Trim() }) }
+    if ($porcelain) {
+        $st.Dirty = @($porcelain -split "`n" | Where-Object { $_.Trim() } | Where-Object {
+            -not ($name -eq $MainRepo -and $_.Length -ge 3 -and $_.Substring(3).Trim() -eq "docs/VERSION")
+        })
+    }
 
     # -------- tag 冲突 (仅对需要打 tag 的仓库) --------
     if ($needTag -and $st.Tag) {
@@ -378,7 +385,7 @@ function Invoke-Release {
     Write-Host ("  " + ("-" * 78)) -ForegroundColor DarkGray
     foreach ($st in $states) {
         $ops = @()
-        if ($st.Ahead -gt 0) { $ops += "push $branch ($($st.Ahead) 提交)" } else { $ops += "push(无新提交)" }
+        if ($st.Ahead -gt 0) { $ops += "push $branch ($($st.Ahead) 提交)" } else { $ops += "跳过 push(无新提交)" }
         if ($needTag -and $st.Tag) { $ops += $(if ($st.RemoteHasTag) { "覆盖 $tag" } else { "打 $tag" }) }
         Write-Host ("  {0,-16} {1,-10} {2,-6} {3,-6} {4}" -f `
             $st.Name, $st.HeadShort, $st.Ahead, $st.Dirty.Count, ($ops -join " + "))
@@ -413,17 +420,23 @@ function Invoke-Release {
         Write-Host ""
         Write-Host "── $($st.Name)" -ForegroundColor White
         try {
-            # 预检已确保处于目标分支, 故直接推分支名。
-            # 不加 --force: 非快进会被远端拒绝, 这正是我们要的保护。
-            $pushArgs = @("push", "origin", $branch)
-            if ($dryRun) { $pushArgs += "--dry-run" }
-            Gray "  git push origin $branch$(if ($dryRun) { ' --dry-run' })"
-            $out = Invoke-GitOrDie $st.Path $pushArgs "推送分支"
-            # 仓库可能装有 pre-push hook (如 wind-ui-rust 会跑 clippy + 全量测试),
-            # 成功时其输出对发布无价值, 只保留末尾的 git 推送结果行。
-            # 失败路径不走这里 —— Invoke-GitOrDie 抛出的异常带完整输出。
-            if ($out) { Show-PushOutput $out }
-            if ($dryRun) { Say "  [OK] 分支推送校验通过" } else { Say "  [OK] 分支已推送" }
+            # 预检已确保处于目标分支。无新提交(Ahead=0)时跳过 push ——
+            # 远端已含 HEAD(Behind 已在预检拦截), 再 push 只是空操作, 却会触发 pre-push
+            # hook(如 wind-ui-rust 跑 clippy + 全量测试)白白变慢; 预检已 fetch 过, 无意义。
+            if ($st.Ahead -eq 0) {
+                Gray "  无新提交, 跳过 push (远端已是最新)"
+            } else {
+                # 不加 --force: 非快进会被远端拒绝, 这正是我们要的保护。
+                $pushArgs = @("push", "origin", $branch)
+                if ($dryRun) { $pushArgs += "--dry-run" }
+                Gray "  git push origin $branch$(if ($dryRun) { ' --dry-run' })"
+                $out = Invoke-GitOrDie $st.Path $pushArgs "推送分支"
+                # 仓库可能装有 pre-push hook (如 wind-ui-rust 会跑 clippy + 全量测试),
+                # 成功时其输出对发布无价值, 只保留末尾的 git 推送结果行。
+                # 失败路径不走这里 —— Invoke-GitOrDie 抛出的异常带完整输出。
+                if ($out) { Show-PushOutput $out }
+                if ($dryRun) { Say "  [OK] 分支推送校验通过" } else { Say "  [OK] 分支已推送" }
+            }
 
             if ($needTag -and $st.Tag -and -not $dryRun) {
                 if ($st.LocalTagOnHead -and -not $Force) {
