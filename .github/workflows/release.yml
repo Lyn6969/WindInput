@@ -25,7 +25,11 @@ permissions:
 
 jobs:
   release:
-    runs-on: windows-latest
+    # 钉死 windows-2022(自带 VS2022 Enterprise + C++)。不用 windows-latest ——
+    # 它是滚动标签,现已指向 windows-2025-vs2026(装 VS2026),而 dev.ps1 的 CMake
+    # 生成器硬编码 "Visual Studio 17 2022",在无 VS2022 的机器上会「找不到任何 VS 实例」。
+    # 且本次原生化的目的正是与生态一致的 VS2022(用户机普遍 VS2022,VS2026 过新)。
+    runs-on: windows-2022
     steps:
       # 多仓库需为同级目录:wind-setting 依赖 ../wind-ui-rust 和 ../WindInput;
       # dev.ps1 用 ../wind-installer / ../wind-portable。均 checkout 到 $GITHUB_WORKSPACE 下平级。
