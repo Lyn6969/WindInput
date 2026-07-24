@@ -165,6 +165,12 @@ fn main() {
     // 「究竟有没有走到日志初始化」本身就是要回答的问题。
     startup_trace::stage("begin");
 
+    // 0.5 启动上下文自检（B）：核心必须跑在交互用户上下文。若被错误地拉起在
+    // SYSTEM/服务账户或 AppContainer 里（TSF DLL 从早期系统/UWP 宿主 CreateProcessW
+    // 拉核心时不换令牌），当场退出——绝不带着系统预置（五笔）去占坑、供错配置。
+    // 早于单例与日志：错上下文的进程连日志目录都未必写得了。
+    guard_process_context();
+
     // 1. 单例检查（与 Go 版 checkSingleton 对齐）
     //
     // **必须早于 init_logger**：后者会滚动日志（rotate_on_startup），而一个注定要退出的
@@ -181,17 +187,19 @@ fn main() {
             eprintln!("WindInput: 另一个实例已在运行中");
             std::process::exit(1);
         }
-        // 够不着全局互斥体：本进程多半继承了受限的宿主上下文（TSF DLL 用
+        // 够不着单例对象：本进程多半继承了受限的宿主上下文（TSF DLL 用
         // `CreateProcessW` 拉起服务时不换令牌，宿主是 AppContainer/低完整性，
-        // 子进程就跟着受限）。这种进程也建不了全局命名管道、写不了日志目录，
+        // 子进程就跟着受限）。这种进程也建不了命名管道、写不了日志目录，
         // 撑不起服务，退出是对的——但绝不能声称「另一实例已在运行」，
         // 那会把「服务根本没起来」伪装成「服务已经在跑」。
+        // 注：改 `Local\` + 默认 DACL 后，同会话进程通常都够得着自己会话的对象，
+        // 加上前置的 guard_process_context 已拦掉多数错上下文，此分支已近乎兜底。
         SingletonCheck::Inaccessible(err) => {
             startup_trace::stage(&format!(
-                "singleton-INACCESSIBLE err={err} 打不开全局单例对象（本进程上下文受限），\
+                "singleton-INACCESSIBLE err={err} 打不开单例对象（本进程上下文受限），\
                  无从判断另一实例是否存在，本实例退出"
             ));
-            eprintln!("WindInput: 无法访问全局单例对象 (err={err})，本进程上下文受限");
+            eprintln!("WindInput: 无法访问单例对象 (err={err})，本进程上下文受限");
             std::process::exit(1);
         }
     };
@@ -227,6 +235,11 @@ fn main() {
     // 必须在 init_logger() 之后：探测过程本身要留下日志。
     wind_config::Config::wait_user_config_ready(std::time::Duration::from_secs(10));
     startup_trace::stage("config-ready");
+
+    // D：若本用户此刻确有 config.toml（定制过设置），落一个本地标记（幂等）。
+    // 下次开机 `probe_user_config` 用它区分「默认用户（永不等）」与「定制用户但漫游
+    // 未挂载（要等，别退回系统五笔）」。只在服务启动路径写，不进 load()（见其文档）。
+    wind_config::Config::mark_user_config_seen_if_present();
 
     // 3. 创建 DeferredHandler（启动时返回安全默认值）
     let deferred = DeferredHandler::new();
@@ -557,11 +570,128 @@ enum SingletonCheck {
     Inaccessible(u32),
 }
 
-/// 单例检查：通过 Windows Named Mutex 确保只有一个实例运行
+/// 启动上下文自检：核心服务被拉起在错误上下文时立即退出。
 ///
-/// 与 Go 版 `checkSingleton()` 对齐：
-/// - Mutex 名称：`Global\WindInput{Suffix}IMEService`
-/// - Global namespace 让所有桌面共享同一实例
+/// 对齐 Weasel `WeaselServer.cpp` 的 `GetUserName()=="SYSTEM"` 守卫，并扩到 AppContainer。
+/// 与「单例改 `Local\` 命名空间」互补：命名空间隔离让错上下文实例挡不住正确实例，
+/// 本自检再让它**当场自杀**而非常驻占着管道/供错配置。
+///
+/// 前提假设：核心永远应以交互用户身份运行（每用户登录自启 / 正常宿主拉起）。
+/// 目前没有「以 SYSTEM 服务身份运行核心」的部署；若将来引入，需在此放行。
+#[cfg(windows)]
+fn guard_process_context() {
+    if let Some(reason) = wrong_process_context() {
+        startup_trace::stage(&format!(
+            "context-WRONG {reason} 核心被拉起在非交互用户上下文，退出（避免用系统预置五笔占坑）"
+        ));
+        eprintln!("WindInput: 进程上下文异常（{reason}），本实例退出");
+        std::process::exit(1);
+    }
+}
+
+#[cfg(not(windows))]
+fn guard_process_context() {}
+
+/// 判定当前进程是否处于错误上下文；正常（交互用户）返回 `None`，否则返回原因串。
+///
+/// 判两类：① AppContainer 令牌（UWP 宿主里被拉起的子进程）；
+/// ② TokenUser SID 属于 SYSTEM 家族（LocalSystem/LocalService/NetworkService）。
+/// 任一命中即错上下文。任何令牌 API 失败也保守判为错上下文——连自己的令牌都读不了，
+/// 说明上下文已异常到无从判断，宁可退出让正确实例接管。
+#[cfg(windows)]
+fn wrong_process_context() -> Option<&'static str> {
+    use windows::Win32::Foundation::{CloseHandle, HANDLE};
+    use windows::Win32::Security::{
+        CreateWellKnownSid, EqualSid, GetTokenInformation, PSID, TOKEN_QUERY, TOKEN_USER,
+        TokenIsAppContainer, TokenUser, WinLocalServiceSid, WinLocalSystemSid,
+        WinNetworkServiceSid,
+    };
+    use windows::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
+
+    unsafe {
+        let mut token = HANDLE::default();
+        if OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token).is_err() {
+            return Some("open-token-failed");
+        }
+        struct Guard(HANDLE);
+        impl Drop for Guard {
+            fn drop(&mut self) {
+                unsafe {
+                    let _ = CloseHandle(self.0);
+                }
+            }
+        }
+        let _guard = Guard(token);
+
+        // ① AppContainer 令牌？
+        let mut is_ac: u32 = 0;
+        let mut ret: u32 = 0;
+        if GetTokenInformation(
+            token,
+            TokenIsAppContainer,
+            Some(&mut is_ac as *mut u32 as *mut _),
+            std::mem::size_of::<u32>() as u32,
+            &mut ret,
+        )
+        .is_ok()
+            && is_ac != 0
+        {
+            return Some("appcontainer");
+        }
+
+        // ② TokenUser SID ∈ SYSTEM 家族？先探长度再取。
+        let mut len: u32 = 0;
+        let _ = GetTokenInformation(token, TokenUser, None, 0, &mut len);
+        if len == 0 {
+            return Some("token-user-len-0");
+        }
+        let mut buf = vec![0u8; len as usize];
+        if GetTokenInformation(
+            token,
+            TokenUser,
+            Some(buf.as_mut_ptr() as *mut _),
+            len,
+            &mut len,
+        )
+        .is_err()
+        {
+            return Some("token-user-failed");
+        }
+        let tu = &*(buf.as_ptr() as *const TOKEN_USER);
+        let sid = tu.User.Sid;
+
+        for kind in [WinLocalSystemSid, WinLocalServiceSid, WinNetworkServiceSid] {
+            let mut wk = vec![0u8; 68]; // SECURITY_MAX_SID_SIZE
+            let mut wk_len = wk.len() as u32;
+            if CreateWellKnownSid(
+                kind,
+                PSID::default(),
+                PSID(wk.as_mut_ptr() as *mut _),
+                &mut wk_len,
+            )
+            .is_ok()
+                && EqualSid(sid, PSID(wk.as_ptr() as *mut _)).is_ok()
+            {
+                return Some("system-account");
+            }
+        }
+    }
+    None
+}
+
+/// 单例检查：通过 Windows Named Mutex 确保**每个登录会话**只有一个实例运行
+///
+/// 命名空间从 `Global\` 改为 **`Local\`**（每会话隔离），这是多用户/开机竞态的要害：
+/// - `Local\` 由 Windows 按登录会话分隔，错会话（如 SYSTEM 的 session 0）里抢先建的
+///   单例落在别的命名空间，**挡不住**用户会话里的正确实例——旧 `Global\` 会被它长期占位。
+/// - `Global\` 命名空间的创建需要 `SeCreateGlobalPrivilege`，**普通用户没有**；
+///   `Local\` 谁都能建，多用户设备上才不会因权限而失败。
+/// - 隔离靠**命名空间**而非放宽 ACL：因此这里回到令牌默认 DACL（不再挂共享安全描述符），
+///   与 Weasel 的 `CreateMutex(NULL, FALSE, <per-session name>)` 同构。跨上下文冒占问题
+///   由「命名空间隔离 + 启动上下文自检（guard_process_context）」两道解决，不靠宽 ACL。
+///
+/// 注：管道名仍是机器级、暂未 per-user（见 guard_process_context 附近说明），
+/// 那属于另一条针对「多会话跨用户串扰」的后续，需真机 AppContainer 回归。
 #[cfg(windows)]
 fn check_singleton() -> SingletonCheck {
     // 直接调用 kernel32 的 CreateMutexW，绕过 windows crate 的 Result 包装。
@@ -576,7 +706,7 @@ fn check_singleton() -> SingletonCheck {
     }
 
     let mutex_name = format!(
-        "Global\\WindInputIMEService{}",
+        "Local\\WindInputIMEService{}",
         wind_config::variant::pipe_suffix()
     );
     let wide_name: Vec<u16> = mutex_name
@@ -584,27 +714,11 @@ fn check_singleton() -> SingletonCheck {
         .chain(std::iter::once(0))
         .collect();
 
-    // 与两条命名管道、命名事件、共享内存同款的安全描述符（Everyone + AppContainer
-    // + 低完整性标签）。不带它时用的是令牌默认 DACL，普通宿主进程请求
-    // `MUTEX_ALL_ACCESS` 会被拒——理由见 `wind_bridge::security` 里的说明。
-    //
-    // 只对**本次新建**的互斥体生效：既存实例保留创建时的 ACL，得等它退出后
-    // 才换上新描述符。所以升级后第一次仍可能沿用旧行为，属预期。
-    let sd = wind_bridge::security::shared_object_security_descriptor();
-    let mut sa = sd.as_ref().map(|s| {
-        use windows::Win32::Security::SECURITY_ATTRIBUTES;
-        SECURITY_ATTRIBUTES {
-            nLength: std::mem::size_of::<SECURITY_ATTRIBUTES>() as u32,
-            lpSecurityDescriptor: s.as_ptr() as *mut _,
-            bInheritHandle: false.into(),
-        }
-    });
-    let sa_ptr = sa
-        .as_mut()
-        .map(|p| p as *mut _ as *const std::ffi::c_void)
-        .unwrap_or(std::ptr::null());
-
-    let handle = unsafe { CreateMutexW(sa_ptr, 0, wide_name.as_ptr()) };
+    // 令牌默认 DACL（不挂共享安全描述符）：单例互斥体只由核心进程触碰，
+    // 无需对 AppContainer/异账户开放，隔离已由 `Local\` 命名空间承担。
+    // 曾经为了让全局对象跨上下文可达而放宽 ACL，恰恰是「错上下文也能占坑」的成因，
+    // 改 per-session 命名后不再需要，故回到 NULL 安全属性。
+    let handle = unsafe { CreateMutexW(std::ptr::null(), 0, wide_name.as_ptr()) };
 
     if handle.is_invalid() {
         // GetLastError 必须紧贴失败的调用读，中间不能夹任何 Win32 调用。

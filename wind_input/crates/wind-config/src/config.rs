@@ -1752,6 +1752,10 @@ pub enum UserConfigProbe {
     RoamingUnavailable,
     /// 漫游根解析出来了但尚不存在（用户配置文件未挂载完成）。
     RoamingMissing(PathBuf),
+    /// 漫游根已就绪、但本用户的 `config.toml` 此刻还看不到，**而本地标记表明它本该存在**
+    /// （该用户此前确有用户配置）。这是开机早期漫游 profile 尚未挂载完的竞态，不是
+    /// 「用户没配置」——**必须继续等**，别把「没看到」当成「没有」而退回系统五笔。
+    ConfigPending { dir: PathBuf },
     /// 漫游根已就绪。此时 `dir_exists`/`file_exists` 是**确定性事实**，
     /// 再等下去也不会变，故不属于需要重试的状态。
     Ready {
@@ -1762,7 +1766,8 @@ pub enum UserConfigProbe {
 }
 
 impl UserConfigProbe {
-    /// 是否已到达「再等也不会变」的状态。
+    /// 是否已到达「再等也不会变」的状态。`ConfigPending` **刻意排除**：它正是
+    /// 「本该有、暂时没看到」的可变态，要继续轮询等漫游挂载。
     pub fn is_settled(&self) -> bool {
         matches!(self, Self::Portable(_) | Self::Ready { .. })
     }
@@ -1910,10 +1915,63 @@ impl Config {
             return UserConfigProbe::RoamingMissing(root);
         }
         let dir = root.join(Self::app_dir_name());
+        let file_exists = dir.join("config.toml").is_file();
+        if !file_exists && Self::user_config_seen() {
+            // 看不到 config.toml，但本地标记说这用户此前确有配置：开机早期漫游
+            // profile 还没挂载完的竞态。继续等，别退回系统预置。
+            return UserConfigProbe::ConfigPending { dir };
+        }
         UserConfigProbe::Ready {
             dir_exists: dir.is_dir(),
-            file_exists: dir.join("config.toml").is_file(),
+            file_exists,
             dir,
+        }
+    }
+
+    /// 本地「用户配置曾存在」标记文件路径
+    /// （`%LOCALAPPDATA%\WindInput[Dev]\user_config.seen`）。
+    ///
+    /// 放 `%LOCALAPPDATA%`（非漫游）是关键：它登录即挂载、不受漫游延迟影响
+    /// （日志能写出就是证据），故能可靠仲裁那个「可能迟到」的漫游 `config.toml`。
+    fn user_config_marker_path() -> Option<PathBuf> {
+        Self::local_dir().map(|d| d.join("user_config.seen"))
+    }
+
+    /// 查询本地「用户配置曾存在」标记。纯查询、无副作用、不重试——供 [`probe_user_config`]
+    /// 区分「默认用户（永不等）」与「定制用户但漫游未挂载（要等）」。
+    pub fn user_config_seen() -> bool {
+        Self::user_config_marker_path()
+            .map(|p| p.exists())
+            .unwrap_or(false)
+    }
+
+    /// 若本用户当前确有 `config.toml`（即定制过设置），落下本地标记（幂等）。
+    ///
+    /// **只应由服务启动路径调用一次**，绝不放进 [`load`](Self::load)：`load()` 在
+    /// 热重载/RPC 上高频调用、且被单元测试直接执行，从中写盘会污染真实
+    /// `%LOCALAPPDATA%`。写标记是「观察到真实用户配置」后的一次性副作用，
+    /// 收敛在服务二进制里。
+    pub fn mark_user_config_seen_if_present() {
+        // 只有确实看得到用户 config.toml 时才记；看不到就不记，避免把
+        // 「漫游没挂载」误记成「用户有配置」而污染下次判断。
+        let Some(user_dir) = Self::user_config_dir() else {
+            return;
+        };
+        if !user_dir.join("config.toml").is_file() {
+            return;
+        }
+        let Some(marker) = Self::user_config_marker_path() else {
+            return;
+        };
+        if marker.exists() {
+            return;
+        }
+        if let Some(parent) = marker.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        match std::fs::write(&marker, b"1") {
+            Ok(()) => info!("Marked user-config-seen: {}", marker.display()),
+            Err(e) => warn!("Failed to write user-config-seen marker: {e}"),
         }
     }
 
@@ -2195,6 +2253,10 @@ mod tests {
             }
             .is_settled(),
             "漫游根就绪后，配置在不在是确定性事实，不该继续等待"
+        );
+        assert!(
+            !UserConfigProbe::ConfigPending { dir: dir.clone() }.is_settled(),
+            "本地标记说该用户本有 config.toml，但此刻看不到 → 竞态，须继续等而非就绪"
         );
         // 这两态才是「系统尚未就绪」，等待有意义。
         assert!(!UserConfigProbe::RoamingUnavailable.is_settled());
