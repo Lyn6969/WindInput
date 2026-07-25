@@ -469,6 +469,82 @@ fn test_pinyin_trailing_partial_prefix_floats_above_exact() {
     }
 }
 
+/// 长用户词上浮的端到端回归（真实拼音词库 + store 学习词）：
+/// ① 全拼精确命中恒居首，且**不被错误整句挤下**（step6.5 降级配合）；
+/// ② 打到第 3 个音节（含「整音节 + 残码」如 qingfengs）用户长词应上浮显现；
+/// ③ 只打 2 音节（qingfeng，无残码）不上浮，精确整句仍居首。
+/// weight=0 模拟「学习词」（词频另在协调器算），是最易触发上浮边界的场景。
+#[test]
+fn user_long_word_promotion_end_to_end() {
+    let dir = data_dir();
+    if !schema_exists(&dir, "pinyin") {
+        eprintln!("跳过：pinyin schema 不存在");
+        return;
+    }
+    let cfg = make_config(&["pinyin"]);
+    let sp = std::env::temp_dir().join("wind_e2e_longword.redb");
+    let _ = std::fs::remove_file(&sp);
+    let store = std::sync::Arc::new(wind_store::Store::open(&sp).unwrap());
+    store
+        .add_user_word(
+            "pinyin",
+            "cangmangdetianyashiwodeai",
+            "苍茫的天涯是我的爱",
+            0,
+            0,
+        )
+        .unwrap();
+    store
+        .add_user_word("pinyin", "qingfengshurufa", "清风输入法", 0, 0)
+        .unwrap();
+    let mgr = EngineManager::with_store(&cfg, Some(&dir), Some(store));
+
+    // ① 全拼：学习词精确命中居首，不被合成整句挤下。
+    let r = mgr.convert("cangmangdetianyashiwodeai", 400);
+    assert_eq!(
+        r.candidates.first().map(|c| c.text.as_str()),
+        Some("苍茫的天涯是我的爱"),
+        "全拼精确的学习词应居首，实际前3: {:?}",
+        r.candidates
+            .iter()
+            .take(3)
+            .map(|c| &c.text)
+            .collect::<Vec<_>>()
+    );
+
+    // ② 整音节 + 残码（qingfengs）：用户长词应上浮（is_promoted_completion）。
+    let r = mgr.convert("qingfengs", 400);
+    let w = r
+        .candidates
+        .iter()
+        .find(|c| c.text == "清风输入法")
+        .expect("qingfengs 应出现清风输入法");
+    assert!(w.is_promoted_completion, "qingfengs 下清风输入法应上浮");
+
+    // 整 3 音节（qingfengshu）：同样上浮。
+    let r = mgr.convert("qingfengshu", 400);
+    assert!(
+        r.candidates
+            .iter()
+            .any(|c| c.text == "清风输入法" && c.is_promoted_completion),
+        "qingfengshu 下清风输入法应上浮"
+    );
+
+    // ③ 仅 2 音节无残码（qingfeng）：不上浮；精确整句「清风」居首。
+    let r = mgr.convert("qingfeng", 400);
+    assert_eq!(
+        r.candidates.first().map(|c| c.text.as_str()),
+        Some("清风"),
+        "qingfeng 首选应是精确整句「清风」"
+    );
+    if let Some(w) = r.candidates.iter().find(|c| c.text == "清风输入法") {
+        assert!(
+            !w.is_promoted_completion,
+            "qingfeng(2 音节无残码)不应上浮清风输入法"
+        );
+    }
+}
+
 #[test]
 fn test_schema_cycle() {
     let dir = data_dir();

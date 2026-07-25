@@ -135,6 +135,21 @@ pub struct Candidate {
     /// 引擎内部用，不推送 UI。
     #[serde(skip)]
     pub is_sentence_demoted: bool,
+    /// 前缀补全**已被提升进完整匹配层**（排序决策，与 `is_prefix` 表达的「码更长」结构事实正交）。
+    ///
+    /// `is_prefix=true` 表达的是结构事实——候选码严格长于输入（补全词）；而「该不该沉到
+    /// 非精确层」是**排序决策**。二者曾被塞进 `is_prefix` 一个布尔里：拼音残码上浮
+    /// （`meiy→没有`）与用户长词上浮都靠**给真·补全词硬标 `is_prefix=false`** 实现，使
+    /// 该字段名不符实（一条「码更长」的候选却 `is_prefix=false`）。
+    ///
+    /// 现按 [[is_sentence]] / `is_sentence_demoted` 的先例拆分：`is_prefix` 恒表结构事实，
+    /// 本字段承接排序提升。`cmp_match_layers` 计算「有效前缀层」= `is_prefix && !本字段`，
+    /// 提升后的补全在层级比较中等价于非补全（落进 Exact/子短语层，再按权重排）。
+    ///
+    /// 生产方：拼音引擎 step4（系统词残码上浮）/ step6（用户·临时词长词上浮）。
+    /// 引擎内部用，不推送 UI。
+    #[serde(skip)]
+    pub is_promoted_completion: bool,
     pub consumed_length: usize,
     /// 该候选 `code` 的**音节边界**（各音节起始字节位 bitmask），见
     /// `wind_dict::binformat::DictEntry::boundary`。`0` = 无边界信息 → 消费方降级回 DAG 猜切分。
@@ -192,6 +207,7 @@ impl Default for Candidate {
             is_exact_code: false,
             is_sentence: false,
             is_sentence_demoted: false,
+            is_promoted_completion: false,
             consumed_length: 0,
             boundary: 0,
             s2t_override: None,
@@ -216,17 +232,23 @@ impl Default for Candidate {
 /// 候选「匹配层级」比较——`Exact >> 子短语 >> 前缀补全 >> 模糊` 的**唯一真相**。
 ///
 /// ① 非模糊优先于模糊（输入 si 时精确「四」先于模糊命中「是」）；
-/// ② 精确/子短语（`is_prefix=false`）优先于前缀补全（输入 si 时「四」先于补全「思考」）；
+/// ② 精确/子短语（**有效前缀层**为 false）优先于前缀补全（输入 si 时「四」先于补全「思考」）；
 /// ③ 完整匹配优先于子短语（输入 baoan 时「保安」「报案」先于单字「报」「宝」）。
+///
+/// **有效前缀层** = `is_prefix && !is_promoted_completion`：`is_prefix` 表结构事实（码更长），
+/// `is_promoted_completion` 表「已被提升进完整匹配层」的排序决策（拼音残码上浮 / 用户长词
+/// 上浮）。二者正交，见 [[is_promoted_completion]] 字段文档。提升后的补全在此等价于非补全。
 ///
 /// 该层级此前在三处各写了一遍——引擎内部排序、协调器 `candidate_display_order`、
 /// 词频重排 `rerank_pinyin_decay`——三份必须手工保持同步，漏改任何一处都不会编译报错，
 /// 只会让候选顺序在某条路径上静默发散。三处现统一调用本函数，各自的额外维度
 /// （权重/`base_order`/衰减分/整句锚定）在其前后自行追加。
 pub fn cmp_match_layers(a: &Candidate, b: &Candidate) -> std::cmp::Ordering {
+    // 有效前缀层：结构补全被提升后等价于非补全（落进精确/子短语层）。
+    let eff_prefix = |c: &Candidate| c.is_prefix && !c.is_promoted_completion;
     a.is_fuzzy
         .cmp(&b.is_fuzzy)
-        .then(a.is_prefix.cmp(&b.is_prefix))
+        .then(eff_prefix(a).cmp(&eff_prefix(b)))
         .then(a.is_partial.cmp(&b.is_partial))
 }
 
@@ -308,4 +330,42 @@ pub fn sort_candidates(candidates: &mut [Candidate]) {
 /// 排序候选词列表（自然顺序，精确匹配优先）
 pub fn sort_candidates_natural(candidates: &mut [Candidate]) {
     candidates.sort_by(better_natural);
+}
+
+#[cfg(test)]
+mod match_layer_tests {
+    use super::*;
+    use std::cmp::Ordering;
+
+    fn cand(is_prefix: bool, is_partial: bool, is_promoted: bool) -> Candidate {
+        Candidate {
+            is_prefix,
+            is_partial,
+            is_promoted_completion: is_promoted,
+            ..Default::default()
+        }
+    }
+
+    /// `is_promoted_completion` 让「码更长的补全」在层级比较中等价于非补全（有效前缀层为 false）。
+    #[test]
+    fn promoted_completion_ranks_in_exact_layer() {
+        let exact = cand(false, false, false); // 精确
+        let plain_prefix = cand(true, false, false); // 普通前缀补全（沉底层）
+        let promoted = cand(true, false, true); // 提升后的前缀补全
+
+        // 普通补全排在精确之后。
+        assert_eq!(cmp_match_layers(&exact, &plain_prefix), Ordering::Less);
+        // 提升后的补全与精确同层（层级比较相等，交由后续权重决出）。
+        assert_eq!(cmp_match_layers(&exact, &promoted), Ordering::Equal);
+        // 提升后的补全排在普通补全之前。
+        assert_eq!(cmp_match_layers(&promoted, &plain_prefix), Ordering::Less);
+    }
+
+    /// 提升只影响前缀层，不越过子短语维度：提升补全(is_partial=false)仍优先于子短语(is_partial=true)。
+    #[test]
+    fn promoted_completion_still_above_subphrase() {
+        let promoted = cand(true, false, true);
+        let subphrase = cand(false, true, false);
+        assert_eq!(cmp_match_layers(&promoted, &subphrase), Ordering::Less);
+    }
 }

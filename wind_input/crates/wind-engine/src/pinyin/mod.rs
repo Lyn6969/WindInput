@@ -66,6 +66,34 @@ const COMPLETION_NEAR_SYLLABLES: u32 = 2;
 /// 一半的词低于它，会误沉大量高频使用但低词频的日常词。
 const COMPLETION_FAR_WEIGHT_FLOOR: i32 = 100;
 
+/// 用户/临时词的**前缀补全**是否上浮进完整匹配层（贴合「长词打到第 3-4 个音节就给出」）。
+///
+/// 用户长词（如「清风输入法」qingfengshurufa，5 音节）在部分拼音下由 store 层前缀命中，
+/// 但恒带 `is_prefix=true`，会被首音节一大批同音子短语（清/青/情…，`is_prefix=false`）整层
+/// 压到候选最底、翻页翻不到。此判据决定何时把它提升到完整匹配层（`is_promoted_completion`）：
+///
+/// **尾部残码**（未成音节的声母，如 `qingfengs` 的 `s`）算作「已起头的一个音节」——用户已
+/// 明确要接着打这个音节，意图强于停在整音节边界（`qingfeng`）。`started` = 完整音节数 +
+/// (有残码 ? 1 : 0)：
+/// - **有边界**（GUI 加词/学习词带音节真值）：`started ≥ 2` 且**距词尾 ≤ `COMPLETION_NEAR_SYLLABLES`**
+///   才上浮——`qingfengshu`(started 3, 剩 2) 给、`qingfengs`(started 3, 剩 2) 给、`qingfeng`(started 2, 剩 3) 不给、`qing`(1) 不给。
+/// - **无边界**（手输码用户词 `boundary=0`，算不出剩余）：退化为「`started ≥ 3`」门槛，
+///   同样对齐「打到第 3 个音节才给」，避免 1-2 音节时被一堆冷僻长词占满前排。
+fn should_promote_user_completion(
+    completed_syls: usize,
+    trailing_partial: bool,
+    boundary: u64,
+) -> bool {
+    let started = completed_syls + usize::from(trailing_partial);
+    if boundary != 0 {
+        let word_syls = boundary.count_ones() as usize;
+        let remaining = word_syls.saturating_sub(started);
+        started >= 2 && remaining <= COMPLETION_NEAR_SYLLABLES as usize
+    } else {
+        started >= 3
+    }
+}
+
 /// 拼音引擎配置
 #[derive(Debug, Clone)]
 pub struct Config {
@@ -629,7 +657,8 @@ impl Engine for PinyinEngine {
                            order: i32,
                            is_fuzzy: bool,
                            is_prefix: bool,
-                           boundary: u64| {
+                           boundary: u64,
+                           is_promoted: bool| {
             if text.is_empty() || cands.iter().any(|c| c.text == text) {
                 return;
             }
@@ -647,6 +676,7 @@ impl Engine for PinyinEngine {
                 is_prefix,
                 is_partial,
                 boundary,
+                is_promoted_completion: is_promoted,
                 ..Default::default()
             });
         };
@@ -731,6 +761,7 @@ impl Engine for PinyinEngine {
                 h.is_fuzzy,
                 false,
                 h.boundary,
+                false,
             );
         }
 
@@ -879,6 +910,7 @@ impl Engine for PinyinEngine {
                         h.is_fuzzy,
                         false,
                         h.boundary,
+                        false,
                     );
                 }
             }
@@ -886,13 +918,15 @@ impl Engine for PinyinEngine {
 
         // 4. 前缀查找（补全词，code 比输入长，如 si→思考）→ 前缀层级，降到精确之后。
         //
-        // 尾部残码存在时（如 meiy 的 "y" 未成音节，completed="mei" ⊂ query="meiy"）：**不标
-        // is_prefix**。若标 is_prefix=true，协调器 build_candidates 重排 is_prefix asc 会把
-        // 前缀补全候选压到全部精确匹配（is_prefix=false）之后，数百条单字「没/每/美/…」
-        // 会淹掉「没有」（用户翻 15+ 页才见，与 "不处理" 无异）。不标后 is_prefix=false，
-        // 同时 code("meiyou") 长于 query("meiy") → is_partial=false（由 push_unique 自动计算），
-        // is_partial asc 让他们浮到 is_partial=true 的精确子串（没/每）之前。
-        // 无残码时（meiyou）保持 is_prefix=true，前缀补全沉在精确匹配之后（正常行为）。
+        // 尾部残码存在时（如 meiy 的 "y" 未成音节，completed="mei" ⊂ query="meiy"）：**提升进
+        // 完整匹配层**（`is_promoted_completion=true`）。否则 is_prefix=true 会被协调器
+        // build_candidates 的有效前缀层比较压到全部精确匹配之后，数百条单字「没/每/美/…」
+        // 会淹掉「没有」（用户翻 15+ 页才见，与 "不处理" 无异）。提升后有效前缀层为 false，
+        // 且 code("meiyou") 长于 query("meiy") → is_partial=false（由 push_unique 自动计算），
+        // 落进精确/子短语层、浮到 is_partial=true 的精确子串（没/每）之前。
+        // is_prefix 本身恒表结构真值（码更长），排序提升与结构事实拆开，见
+        // `wind_candidate::Candidate::is_promoted_completion`。
+        // 无残码时（meiyou）不提升，前缀补全沉在精确匹配之后（正常行为）。
         // 残码时的上浮特权不是无条件的：双拼每 2 键 1 音节，奇数键必然有残码，
         // 若 30 条补全全部上浮，长输入下候选 2~5 位会被该前缀下的冷僻长词占满
         // （`zhonghuarenmingongheg` → 一串「中华人民共和国XXX法」w≤60），且随每次
@@ -913,6 +947,8 @@ impl Engine for PinyinEngine {
             } else {
                 true // 无残码：正常前缀补全，沉在精确匹配之后
             };
+            // is_prefix 恒表结构事实（search_prefix_with_boundary 返回的都是码更长的补全）；
+            // 「是否沉到非精确层」的排序决策由 is_promoted_completion 承接（残码上浮即提升）。
             push_unique(
                 &mut candidates,
                 h.text,
@@ -920,8 +956,9 @@ impl Engine for PinyinEngine {
                 h.weight,
                 h.order,
                 false,
-                demote_to_prefix_layer,
+                true,
                 h.boundary,
+                !demote_to_prefix_layer,
             );
         }
 
@@ -941,6 +978,7 @@ impl Engine for PinyinEngine {
                     true,
                     // 简拼码（nh）是各音节首字母的拼接，本身不构成音节序列 → 无边界语义。
                     0,
+                    false,
                 );
             }
         }
@@ -962,6 +1000,24 @@ impl Engine for PinyinEngine {
                 }
             }
             store_cands.extend(store_dm.search_prefix(query, limit));
+
+            // 用户长词上浮的**封顶基准**：提升后的补全不得越过「本次输入的最佳完整解」——
+            // 码 == completed 的顶层候选（精确整词 / Viterbi 整句，均在此前步骤产出）。取其最大
+            // 权重 - 1，与 step 6.5 整句降级同款手法，给出可预期的「就在最佳解之后」位置。
+            // 无此类候选（如 qingfengshu 无精确词/整句）→ None → 不封顶，用户词落顶层按自身权重排。
+            let completed_syls = syllables.len();
+            let promotion_cap = candidates
+                .iter()
+                .filter(|c| {
+                    !c.is_fuzzy
+                        && !(c.is_prefix && !c.is_promoted_completion)
+                        && !c.is_partial
+                        && c.code == completed
+                })
+                .map(|c| c.weight)
+                .max()
+                .map(|w| w.saturating_sub(1));
+
             for mut c in store_cands {
                 if c.text.is_empty() {
                     continue;
@@ -993,6 +1049,17 @@ impl Engine for PinyinEngine {
                 // 与 push_unique 一致：store 层的前缀子码命中也是子短语，降到完整匹配之后。
                 c.is_partial =
                     !c.is_prefix && c.code.len() < query.len() && query.starts_with(&c.code);
+                // 用户/临时词的前缀补全（is_prefix=true，码更长）：打到词尾附近就提升进完整
+                // 匹配层，否则被首音节同音子短语整层淹没（长词打到第 3-4 音节才给的根因）。
+                // is_prefix 保持结构真值不动，排序提升由 is_promoted_completion 承接。
+                if c.is_prefix
+                    && should_promote_user_completion(completed_syls, trailing_partial, c.boundary)
+                {
+                    c.is_promoted_completion = true;
+                    if let Some(cap) = promotion_cap {
+                        c.weight = c.weight.min(cap);
+                    }
+                }
                 candidates.push(c);
             }
 
@@ -1453,6 +1520,165 @@ mod tests {
             c.unwrap().consumed_length,
             "nihao".len(),
             "应只消费前缀 nihao"
+        );
+    }
+
+    /// 构造「带 qing 同音字洪泛的系统词典 + 用户长词」的引擎（复用于长词上浮系列测试）。
+    fn engine_with_qing_flood_and_user_word(store_name: &str) -> PinyinEngine {
+        let mut raw = CodetableDict::empty();
+        for (i, ch) in ["清", "青", "情", "请", "轻", "晴", "倾", "氢", "卿", "顷"]
+            .iter()
+            .enumerate()
+        {
+            raw.merge_single(
+                "qing".to_string(),
+                ch.to_string(),
+                1000 - i as i32,
+                i as i32,
+            );
+        }
+        raw.merge_single("feng".to_string(), "风".to_string(), 900, 0);
+        raw.merge_single("qingfeng".to_string(), "清风".to_string(), 800, 0);
+
+        let store = tmp_store(store_name);
+        // boundary=0：模拟手输码用户词（无音节真值）→ 走 completed_syls>=3 兜底门槛。
+        store
+            .add_user_word("pinyin", "qingfengshurufa", "清风输入法", 5000, 0)
+            .unwrap();
+        let dm = DictManager::new();
+        dm.register_layer(Box::new(wind_dict::StoreUserLayer::new(store, "pinyin")));
+        PinyinEngine::new(Config::default(), CachedDict::Memory(raw))
+            .with_store_layers(Arc::new(dm))
+    }
+
+    /// 【核心回归】用户长词「清风输入法」在打到第 3-4 音节时应上浮到同音子短语之上，
+    /// 而非被压到候选最底（本次修复的用户反馈现场：打到完整全拼才出现）。
+    #[test]
+    fn user_long_word_surfaces_at_partial_pinyin() {
+        let engine = engine_with_qing_flood_and_user_word("long_word_surface");
+
+        for input in ["qingfengshu", "qingfengshuruf"] {
+            let r = engine.convert(input, 300).unwrap();
+            let pos_word = r
+                .candidates
+                .iter()
+                .position(|c| c.text == "清风输入法")
+                .unwrap_or_else(|| panic!("{input}: 清风输入法 应在候选中"));
+            let pos_qing = r
+                .candidates
+                .iter()
+                .position(|c| c.text == "清")
+                .expect("清 子短语应存在");
+            assert!(
+                pos_word < pos_qing,
+                "{input}: 用户长词应上浮到同音子短语「清」之上，实际 word@{pos_word} qing@{pos_qing}: {:?}",
+                r.candidates
+                    .iter()
+                    .take(5)
+                    .map(|c| &c.text)
+                    .collect::<Vec<_>>()
+            );
+            assert!(
+                r.candidates[pos_word].is_promoted_completion,
+                "{input}: 上浮的用户长词应标 is_promoted_completion"
+            );
+            // is_prefix 结构真值保持不变（码确实更长）。
+            assert!(
+                r.candidates[pos_word].is_prefix,
+                "{input}: is_prefix 结构事实（码更长）不应被抹掉"
+            );
+        }
+
+        // 完整全拼：精确命中，本就在首位（is_prefix=false，非提升）。
+        let r_full = engine.convert("qingfengshurufa", 300).unwrap();
+        assert_eq!(
+            r_full.candidates[0].text, "清风输入法",
+            "完整全拼应精确命中首位"
+        );
+        assert!(
+            !r_full.candidates[0].is_prefix,
+            "完整全拼是精确匹配，非补全"
+        );
+        assert!(
+            !r_full.candidates[0].is_promoted_completion,
+            "精确命中不经上浮通道"
+        );
+    }
+
+    /// 【边界守卫】音节太少时不上浮：`qing`(1 音节) / `qingfeng`(2 音节) 下用户长词
+    /// 仍沉在补全层，且精确词「清风」在 qingfeng 下仍居首——不被用户长词越过。
+    #[test]
+    fn user_long_word_not_promoted_when_too_few_syllables() {
+        let engine = engine_with_qing_flood_and_user_word("long_word_guard");
+
+        // qing：1 音节，boundary=0 兜底门槛 completed_syls>=3 未达 → 不上浮。
+        let r1 = engine.convert("qing", 300).unwrap();
+        if let Some(p) = r1.candidates.iter().position(|c| c.text == "清风输入法") {
+            assert!(
+                !r1.candidates[p].is_promoted_completion,
+                "qing(1 音节)不应上浮用户长词"
+            );
+        }
+
+        // qingfeng：2 音节，未达门槛 → 不上浮；精确「清风」应排在用户长词之前。
+        let r2 = engine.convert("qingfeng", 300).unwrap();
+        let pos_qf = r2.candidates.iter().position(|c| c.text == "清风");
+        let pos_word = r2.candidates.iter().position(|c| c.text == "清风输入法");
+        if let Some(pw) = pos_word {
+            assert!(
+                !r2.candidates[pw].is_promoted_completion,
+                "qingfeng(2 音节)不应上浮用户长词"
+            );
+            if let Some(pqf) = pos_qf {
+                assert!(pqf < pw, "qingfeng 下精确「清风」应排在用户长词之前");
+            }
+        }
+    }
+
+    /// 上浮判据单测：距词尾 ≤2（有边界）/ 已打 ≥3 音节（无边界）才上浮。
+    #[test]
+    fn promote_user_completion_thresholds() {
+        // 5 音节词（boundary 五个音节起始位；此处只关心 count_ones()=5）。
+        let b5: u64 = 0b11111; // 5 个置位（count_ones=5，模拟 5 音节词）
+        assert_eq!(b5.count_ones(), 5);
+        // 无残码：completed_syls 即 started。
+        assert!(
+            !should_promote_user_completion(2, false, b5),
+            "5 音节词打 2 音节剩 3 > 2，不上浮"
+        );
+        assert!(
+            should_promote_user_completion(3, false, b5),
+            "5 音节词打 3 音节剩 2 = 2，上浮"
+        );
+        assert!(
+            should_promote_user_completion(4, false, b5),
+            "5 音节词打 4 音节剩 1，上浮"
+        );
+        assert!(
+            !should_promote_user_completion(1, false, b5),
+            "1 音节 < 2，无条件不上浮"
+        );
+        // 尾部残码算作已起头的一个音节：qingfengs = 2 完整音节 + 残码 → started 3 → 上浮。
+        assert!(
+            should_promote_user_completion(2, true, b5),
+            "2 完整音节 + 残码（started 3, 剩 2）应上浮"
+        );
+        assert!(
+            !should_promote_user_completion(1, true, b5),
+            "1 完整音节 + 残码（started 2, 剩 3 > 2）不上浮"
+        );
+        // 无边界兜底：started>=3。
+        assert!(
+            !should_promote_user_completion(2, false, 0),
+            "无边界 2 音节不上浮"
+        );
+        assert!(
+            should_promote_user_completion(3, false, 0),
+            "无边界 3 音节上浮"
+        );
+        assert!(
+            should_promote_user_completion(2, true, 0),
+            "无边界 2 音节 + 残码（started 3）上浮"
         );
     }
 
