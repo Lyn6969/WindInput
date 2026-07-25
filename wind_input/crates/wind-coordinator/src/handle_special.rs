@@ -155,6 +155,15 @@ impl Coordinator {
             .convert_with(&schema, &state.special_buffer, 100);
         // 统一展开汇聚点：快符表内 `$AA/$SS/$CC` 等特殊语法在此炸开/标命令（见 finalize_candidates）。
         state.candidates = self.finalize_candidates(result.candidates, &state.special_buffer);
+        // 空码补全对齐主码表方案（`single_code_input` + `single_code_complete`）：精确匹配模式下
+        // 当前编码无精确候选、但更长前缀有候选时，引擎「备货不 push」把首个更长编码候选放进
+        // `completion_hint`（见 codetable/engine.rs），交由掌握最终列表的调用方判空后取一条。
+        // 特殊模式此前只消费 `result.candidates`、丢弃了这条旁路 → 屏幕全空；此处补上收口，
+        // 与主路径 `update_candidates` 一致（见 handle_candidate.rs 的补全收口）。引擎已在
+        // `show_code_hint` 循环里给它标好「剩余编码」注释，直接采纳即可。
+        if state.candidates.is_empty() {
+            state.candidates.extend(result.completion_hint);
+        }
         // 自动上屏由方案码表引擎的 should_auto_commit 决定（prefix_free≈全码唯一、fixed_length 等
         // 映射到该方案的 [engine.codetable] 配置）；复核上屏目标仍在候选中。`$CC` 命令词条经
         // finalize_candidates 展开后 text 已改写为 display 标签，而引擎意向 commit_text 是原始

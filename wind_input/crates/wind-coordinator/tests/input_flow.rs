@@ -3351,6 +3351,49 @@ fn special_mode_effect_command_auto_commit_executes() {
 }
 
 #[test]
+fn special_mode_exact_completion_shows_longer_code() {
+    if !has_schemas() {
+        return;
+    }
+    // 需求回归：特殊模式（引用 wubi86）在精确匹配模式 + 空码补全下，输入 `aab` 无精确候选，
+    // 但主库有 `aab?` 更长后继 → 引擎备下 completion_hint（备货不 push）。此前特殊模式只消费
+    // result.candidates、丢弃 completion_hint → 屏幕全空；修复后应采纳这条更长编码首选，与主码表
+    // 方案一致。single_code_input/single_code_complete 配在全局 schema.codetable、方案未覆盖 →
+    // tri-state 回落全局（manager.rs resolved），故特殊模式独立引擎也拿到这两个开关。
+    // `aab` 复用 project_phrase_candidate_commit §三 的回归码（六库均无精确 aab、主库有 4 条 aab? 后继）。
+    let store_path = std::env::temp_dir().join("wind_special_exact_completion.redb");
+    let _ = std::fs::remove_file(&store_path);
+    let store = std::sync::Arc::new(wind_store::Store::open(&store_path).unwrap());
+    let mut cfg = config_with("wubi86");
+    cfg.schema.codetable.single_code_input = true;
+    cfg.schema.codetable.single_code_complete = true;
+    cfg.schema.special_modes = vec![wind_config::config::SpecialModeConfig {
+        id: "sym".into(),
+        trigger_keys: vec!["backslash".into()],
+        schema: "wubi86".into(),
+        ..Default::default()
+    }];
+    let coord = Coordinator::new_headless_with_store(cfg, Some(&data_dir()), store);
+    // 空缓冲按 \ 进入特殊模式
+    let act = coord.handle_key_event(&key_event(0xDC, EVENT_KEY_DOWN));
+    assert!(
+        matches!(act, KeyAction::UpdateComposition { .. }),
+        "\\ 应进入特殊模式，实际: {:?}",
+        act
+    );
+    for ch in ['a', 'a', 'b'] {
+        press_letter(&coord, ch);
+    }
+    let texts = coord.debug_all_candidate_texts();
+    assert!(
+        !texts.is_empty(),
+        "精确匹配+空码补全下，特殊模式 aab 无精确候选时应补一条更长编码候选（completion_hint），实际候选: {:?}",
+        texts
+    );
+    let _ = std::fs::remove_file(&store_path);
+}
+
+#[test]
 fn clear_on_empty_max_keeps_phrase_candidate() {
     if !has_schemas() {
         return;
