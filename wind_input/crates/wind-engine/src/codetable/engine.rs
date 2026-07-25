@@ -139,11 +139,19 @@ impl Engine for CodeTableEngine {
     }
 
     /// 空码枚举：空前缀查询从根遍历整表（datformat::search_prefix），已按 weight 降序 +
-    /// order 升序排好并截断到 `limit`。标 CodeTable 来源供协调器统一处理。
+    /// order 升序排好并截断。标 CodeTable 来源供协调器统一处理。
     /// 注：大表会在字典层 materialize 全部条目再截断，仅宜用于小符号表的「进入即浏览」。
+    ///
+    /// 遵循精确匹配模式：`single_code_input`（关前缀枚举）时最多补 **1 条**——与空码补全
+    /// `single_code_complete`「取首位后续码」同语义；非精确模式才枚举首页（`limit` 条）。
     fn enumerate(&self, limit: usize) -> Vec<Candidate> {
+        let n = if self.opts.single_code_input {
+            1
+        } else {
+            limit
+        };
         self.dm
-            .search_prefix("", limit)
+            .search_prefix("", n)
             .into_iter()
             .map(|mut c| {
                 c.source = CandidateSource::CodeTable;

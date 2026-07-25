@@ -3436,6 +3436,45 @@ fn special_mode_show_all_on_enter_lists_candidates() {
 }
 
 #[test]
+fn special_mode_show_all_respects_single_code_input() {
+    if !has_schemas() {
+        return;
+    }
+    // show_all_on_enter 遵循方案 single_code_input：精确匹配模式下进入即展示最多补 1 条
+    // （与空码补全「取首位后续码」同语义）；非精确模式枚举整页（多条）。
+    let make = |single_code: bool| {
+        let store_path =
+            std::env::temp_dir().join(format!("wind_special_showall_single_{}.redb", single_code));
+        let _ = std::fs::remove_file(&store_path);
+        let store = std::sync::Arc::new(wind_store::Store::open(&store_path).unwrap());
+        let mut cfg = config_with("wubi86");
+        // 全局基线设 single_code_input；wubi86 方案未覆盖 → tri-state 回落此值。
+        cfg.schema.codetable.single_code_input = single_code;
+        cfg.schema.special_modes = vec![wind_config::config::SpecialModeConfig {
+            id: "sym".into(),
+            trigger_keys: vec!["backslash".into()],
+            schema: "wubi86".into(),
+            show_all_on_enter: true,
+            ..Default::default()
+        }];
+        let coord = Coordinator::new_headless_with_store(cfg, Some(&data_dir()), store);
+        coord.handle_key_event(&key_event(0xDC, EVENT_KEY_DOWN));
+        let texts = coord.debug_all_candidate_texts();
+        let _ = std::fs::remove_file(&store_path);
+        texts
+    };
+    assert_eq!(
+        make(true).len(),
+        1,
+        "精确匹配模式下 show_all_on_enter 应最多补 1 条"
+    );
+    assert!(
+        make(false).len() > 1,
+        "非精确模式下 show_all_on_enter 应枚举整页（多条）"
+    );
+}
+
+#[test]
 fn clear_on_empty_max_keeps_phrase_candidate() {
     if !has_schemas() {
         return;
