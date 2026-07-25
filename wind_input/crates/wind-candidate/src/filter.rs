@@ -23,6 +23,16 @@ impl FilterMode {
             "smart" | _ => Self::Smart,
         }
     }
+
+    /// 配置值（`input.filter_mode`）。与 [`from_str`](Self::from_str) 成对：菜单切换要把
+    /// 新模式写回配置（config 为单一源，见 `set_filter_mode`），故必须能反向取到配置字符串。
+    pub fn as_config(&self) -> &'static str {
+        match self {
+            Self::Gb18030 => "gb18030",
+            Self::General => "general",
+            Self::Smart => "smart",
+        }
+    }
 }
 
 /// 按模式过滤候选词
@@ -121,6 +131,19 @@ mod tests {
             !out.iter().any(|c| c.text == "尪"),
             "同来源同码有常用则滤非常用"
         );
+    }
+
+    #[test]
+    fn filter_mode_config_round_trip() {
+        // 菜单切换靠 as_config 写回配置、启动/热重载靠 from_str 读回；两者必须互逆，
+        // 否则会出现「菜单选了全部字符、重启回到智能」这类静默回退。
+        for m in [FilterMode::Smart, FilterMode::General, FilterMode::Gb18030] {
+            assert_eq!(FilterMode::from_str(m.as_config()), m);
+        }
+        // 配置值集须与 wind-setting 的 select options 一致（smart/general/gb18030）。
+        assert_eq!(FilterMode::Smart.as_config(), "smart");
+        assert_eq!(FilterMode::General.as_config(), "general");
+        assert_eq!(FilterMode::Gb18030.as_config(), "gb18030");
     }
 
     #[test]

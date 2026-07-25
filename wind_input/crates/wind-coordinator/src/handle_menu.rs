@@ -379,6 +379,9 @@ impl Coordinator {
         };
         // 持久化到 config.ui.toolbar.visible(单一源:与设置页统一,reload 不会覆盖菜单选择)。
         let _ = Config::set_user_bool(&["ui", "toolbar", "visible"], vis);
+        // 内存 config 同步跟上（同 status_toggle_always）：落盘与内存不同步时，下一次
+        // 未经重载的读取会拿到陈旧值。
+        self.refresh_config_in_memory(|c| c.ui.toolbar.visible = vis);
         self.notify_toolbar();
     }
 

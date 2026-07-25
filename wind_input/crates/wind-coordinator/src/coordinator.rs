@@ -1669,9 +1669,26 @@ impl Coordinator {
                         ThemeStyle::from_config(&new_cfg.ui.theme.style);
                 }
                 // 同步工具栏显隐:设置页改 ui.toolbar.visible 后运行时态跟随,再刷新工具栏。
-                {
+                // 运行时镜像态回灌：这些开关运行时读 state（菜单/热键直改），config 是持久化
+                // 真相源，两者只在启动时拷贝一次是不够的——设置页改了必须在此跟随，否则要重启
+                // 服务才生效（症状：设置页改「检索范围」无效、而右键菜单正常）。
+                let filter_changed = {
                     let mut s = self.state.lock().unwrap_or_else(|e| e.into_inner());
                     s.toolbar_visible = new_cfg.ui.toolbar.visible;
+                    s.s2t_enabled = new_cfg.input.s2t.enabled;
+                    let new_mode = wind_candidate::FilterMode::from_str(&new_cfg.input.filter_mode);
+                    let changed = s.filter_mode != new_mode;
+                    s.filter_mode = new_mode;
+                    changed
+                };
+                // 检索范围变了且正在组合：以新范围重过滤刷新（与 set_filter_mode 一致，
+                // 否则当前这屏候选要等下一次按键才更新）。
+                if filter_changed {
+                    let mut s = self.state.lock().unwrap_or_else(|e| e.into_inner());
+                    if !s.input_buffer.is_empty() {
+                        self.update_candidates(&mut s);
+                        self.notify_ui_update(&s);
+                    }
                 }
                 self.apply_ui_config(); // 外观项（候选排列/编码显示/候选窗显隐）即时生效
                 // 「定位方式」刚从跟随切到固定：若候选窗此刻正显示着，就地固定在它当前的位置，
@@ -2655,6 +2672,7 @@ impl Coordinator {
     }
 
     /// 切换检索范围（0 智能/1 常用字/2 全部字符），以新范围重过滤并刷新候选。
+    /// 持久化到 `config.input.filter_mode`（单一源：与设置页统一，reload 不会覆盖菜单选择）。
     pub(crate) fn set_filter_mode(&self, index: usize) {
         let (mode, label) = match FILTER_MODES.get(index) {
             Some(&(m, l)) => (m, l),
@@ -2667,6 +2685,10 @@ impl Coordinator {
             }
             s.filter_mode = mode;
         }
+        if let Err(e) = Config::set_user_string(&["input", "filter_mode"], mode.as_config()) {
+            warn!("set_filter_mode: 持久化 input.filter_mode 失败: {}", e);
+        }
+        self.refresh_config_in_memory(|c| c.input.filter_mode = mode.as_config().to_string());
         // 组合中：以新范围重建候选并刷新
         let mut s = self.state.lock().unwrap_or_else(|e| e.into_inner());
         if !s.input_buffer.is_empty() {
@@ -2675,6 +2697,15 @@ impl Coordinator {
         }
         drop(s);
         self.show_tip(label);
+    }
+
+    /// 持久化简繁开关到 `config.input.s2t.enabled`（单一源：与设置页统一，reload 不会覆盖
+    /// 菜单/热键选择）。菜单与热键两条切换路径共用，避免只改一处留下不对称。
+    pub(crate) fn persist_s2t_enabled(&self, on: bool) {
+        if let Err(e) = Config::set_user_bool(&["input", "s2t", "enabled"], on) {
+            warn!("toggle_s2t: 持久化 input.s2t.enabled 失败: {}", e);
+        }
+        self.refresh_config_in_memory(|c| c.input.s2t.enabled = on);
     }
 
     /// 影子规则：当前 code 是否对 word 有规则（置顶/删除），决定菜单"恢复默认"可用性。
@@ -3160,10 +3191,12 @@ impl Coordinator {
                     );
                     return true;
                 }
-                {
+                let on = {
                     let mut s = self.state.lock().unwrap_or_else(|e| e.into_inner());
                     s.s2t_enabled = !s.s2t_enabled;
-                }
+                    s.s2t_enabled
+                };
+                self.persist_s2t_enabled(on);
                 self.show_status();
                 // 工具栏「繁」格随切即刷（对齐 toggle_full_width 与菜单路径）。缺这步时
                 // 只有一闪而过的状态气泡，工具栏状态滞后到下次刷新事件，被误感知为“切换卡”。
@@ -3541,10 +3574,12 @@ impl MessageHandler for Coordinator {
                 Some(self.build_status())
             }
             "toggle_s2t" => {
-                {
+                let on = {
                     let mut s = self.state.lock().unwrap_or_else(|e| e.into_inner());
                     s.s2t_enabled = !s.s2t_enabled;
-                }
+                    s.s2t_enabled
+                };
+                self.persist_s2t_enabled(on);
                 self.show_status();
                 Some(self.build_status())
             }
