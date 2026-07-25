@@ -656,3 +656,30 @@ fn test_pinyin_abbrev() {
     // 全拼仍正常（简拼区段不影响全拼查询）。
     assert!(has("nihao", "你好"), "全拼 nihao 应含 你好");
 }
+
+/// 回归：整句「苍茫的天涯是我的爱」不被低频 3 字词「填鸭式」挤掉首选。
+///
+/// 根因＝unigram 独立性假设让 `P(天涯)·P(是)` 双重扣 `ln(total)`，加上每词罚 WORD_PENALTY，
+/// 一个低频整词（填鸭式 w=152）便压过 2 词正解。修法＝虚词（是/的/了…）豁免每词罚
+/// （见 `lattice::score_node`）。真正的解是 bigram，此为近似补偿。
+#[test]
+fn sentence_function_word_not_penalized_as_fragment() {
+    let dir = data_dir();
+    if !schema_exists(&dir, "pinyin") {
+        eprintln!("跳过：pinyin schema 不存在");
+        return;
+    }
+    let cfg = make_config(&["pinyin"]);
+    let mgr = EngineManager::new(&cfg, Some(&dir));
+    let r = mgr.convert("cangmangdetianyashiwodeai", 10);
+    assert_eq!(
+        r.candidates.first().map(|c| c.text.as_str()),
+        Some("苍茫的天涯是我的爱"),
+        "整句应以「天涯是」切分居首，不被「填鸭式」挤掉，实际前3: {:?}",
+        r.candidates
+            .iter()
+            .take(3)
+            .map(|c| &c.text)
+            .collect::<Vec<_>>()
+    );
+}

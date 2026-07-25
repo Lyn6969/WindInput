@@ -150,7 +150,16 @@ pub(crate) fn score_node(word: &str, weight: i32, unigram: Option<&dyn UnigramLo
     // Phase 4：每词固定罚。Viterbi 的路径分是各节点 log_prob 之和，故「每节点减 W」
     // 等价于「按路径词数罚 k·W」——把低频词打碎成两个高频片段不再免费。
     // 也施加于 mod.rs step 1.5 的「单节点等价整句分」（那是一句一词，罚一次，量纲一致）。
-    log_prob -= WORD_PENALTY;
+    //
+    // **虚词（是/的/了…）豁免每词罚**：WORD_PENALTY 意在阻止「把低频词打碎成高频
+    // 片段」的投机拆分，而单字虚词随内容词出现是语法黏着、不是碎片。unigram 的独立性
+    // 假设对 P(内容词)·P(虚词) 双重扣了 ln(total)（每词一份），一个低频 3 字整词
+    // （填鸭式 w=152）便能压过「天涯+是」这种 2 词正解——这正是 bigram P(是|天涯)
+    // 该解决而 unigram 解决不了的（lm.rs SimpleBigramModel 已备、缺磁盘语料）。豁免虚词
+    // 的每词罚是对该缺陷的近似补偿：不让「虚词自成一词」这件语法必然的事付投机拆分的代价。
+    if !(char_count == 1 && is_function_word(word)) {
+        log_prob -= WORD_PENALTY;
+    }
     log_prob
 }
 
