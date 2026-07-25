@@ -597,6 +597,11 @@ pub struct SpecialModeConfig {
     /// 热键进入时组合区不写引导符（见 docs/design/special-mode-entry-hotkey.md）。
     #[serde(default)]
     pub hotkey: String,
+    /// 进入模式即展示候选：空编码（刚进入、尚未敲码）时枚举该方案码表首页候选（按 weight 降序），
+    /// UI 按 per_page 分页浏览。默认 false（进入空白，敲码才出候选）。
+    /// 面向快符/生僻字等**小符号表**的「进入即浏览」；大表会遍历全表取首 N 条、有开销，慎用。
+    #[serde(default)]
+    pub show_all_on_enter: bool,
 }
 
 impl SpecialModeConfig {

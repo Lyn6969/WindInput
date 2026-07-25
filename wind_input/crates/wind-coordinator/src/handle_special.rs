@@ -89,6 +89,17 @@ impl Coordinator {
         }
     }
 
+    /// 当前特殊模式是否开启「进入即展示候选」（`show_all_on_enter`；按 special_id 定位配置）。
+    fn special_mode_show_all(&self, state: &State) -> bool {
+        self.rt()
+            .config
+            .schema
+            .special_modes
+            .get(state.special_id as usize)
+            .map(|m| m.show_all_on_enter)
+            .unwrap_or(false)
+    }
+
     /// 特殊模式引用的方案 id（features.special_modes[idx].schema）。
     pub(crate) fn special_schema(&self, idx: u8) -> Option<String> {
         self.rt()
@@ -147,6 +158,15 @@ impl Coordinator {
         // 组合区 = 显示态前缀 + 编码缓冲（前缀只显示不参与查询）。
         state.preedit = format!("{}{}", state.special_prefix, state.special_buffer);
         if state.special_buffer.is_empty() {
+            // 进入即展示：该模式开启 show_all_on_enter 时，空码枚举方案码表首页候选（按 weight
+            // 降序）供浏览，UI 按 per_page 分页；经 finalize 展开词条内特殊语法（浏览态无输入
+            // 上下文，input 传空）。未开则维持空白（原行为，敲码才出候选）。
+            if self.special_mode_show_all(state)
+                && let Some(schema) = self.overlay_engine_schema(state)
+            {
+                let raw = self.engine_mgr.enumerate_with(&schema, 100);
+                state.candidates = self.finalize_candidates(raw, "");
+            }
             return None;
         }
         let schema = self.overlay_engine_schema(state)?;

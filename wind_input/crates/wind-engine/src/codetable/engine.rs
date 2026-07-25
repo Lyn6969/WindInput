@@ -138,6 +138,20 @@ impl Engine for CodeTableEngine {
             .set_layer_enabled(&format!("codetable-extra-{dict_id}"), enabled)
     }
 
+    /// 空码枚举：空前缀查询从根遍历整表（datformat::search_prefix），已按 weight 降序 +
+    /// order 升序排好并截断到 `limit`。标 CodeTable 来源供协调器统一处理。
+    /// 注：大表会在字典层 materialize 全部条目再截断，仅宜用于小符号表的「进入即浏览」。
+    fn enumerate(&self, limit: usize) -> Vec<Candidate> {
+        self.dm
+            .search_prefix("", limit)
+            .into_iter()
+            .map(|mut c| {
+                c.source = CandidateSource::CodeTable;
+                c
+            })
+            .collect()
+    }
+
     fn convert(&self, input: &str, max_candidates: usize) -> anyhow::Result<ConvertResult> {
         if input.is_empty() {
             return Ok(ConvertResult::default());

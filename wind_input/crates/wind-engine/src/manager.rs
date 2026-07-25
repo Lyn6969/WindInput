@@ -1556,6 +1556,21 @@ impl EngineManager {
         }
     }
 
+    /// 用指定方案的引擎枚举码表首 `limit` 条候选（特殊模式「进入即展示」浏览）。
+    /// 方案未加载或引擎无浏览语义（如拼音）时返回空。
+    pub fn enumerate_with(&self, schema_id: &str, limit: usize) -> Vec<wind_candidate::Candidate> {
+        if !self.ensure_loaded(schema_id) {
+            return Vec::new();
+        }
+        let engine = self
+            .engines
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(schema_id)
+            .cloned();
+        engine.map(|e| e.enumerate(limit)).unwrap_or_default()
+    }
+
     /// 用指定方案的引擎为词语生成全拼编码**与音节边界**（造词反推、多音字消歧）。
     /// 方案非拼音类、未能加载或无法生成时返回 None（调用方可回退逐字反查表，该回退无边界）。
     pub fn generate_word_pinyin(&self, schema_id: &str, text: &str) -> Option<(String, u64)> {

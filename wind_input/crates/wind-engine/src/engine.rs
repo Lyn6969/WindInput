@@ -108,6 +108,12 @@ pub trait Engine: Send + Sync {
         false
     }
 
+    /// 空码枚举：列出词典首 `limit` 条候选（按引擎内部序），供特殊模式「进入即展示」浏览。
+    /// 码表引擎返回其码表首页（按 weight 降序）；拼音等无浏览语义的引擎返回空。
+    fn enumerate(&self, _limit: usize) -> Vec<Candidate> {
+        Vec::new()
+    }
+
     /// 前缀是否构成「合法拼音序列」（含残缺尾音节前缀，用于保护正在输入的拼音）。
     /// 拼音引擎实现（对齐 Go isPossiblePinyinSequence）；其余默认 false。
     fn is_possible_pinyin_sequence(&self, _prefix: &str) -> bool {

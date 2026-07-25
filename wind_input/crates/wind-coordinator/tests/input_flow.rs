@@ -3394,6 +3394,48 @@ fn special_mode_exact_completion_shows_longer_code() {
 }
 
 #[test]
+fn special_mode_show_all_on_enter_lists_candidates() {
+    if !has_schemas() {
+        return;
+    }
+    // 需求：show_all_on_enter 开启时，进入模式（空编码、尚未敲码）即枚举方案码表首页候选；
+    // 关闭时（默认）进入模式候选为空、敲码才出。用同一份配置的开/关两态对照。
+    let make = |show_all: bool| {
+        let store_path =
+            std::env::temp_dir().join(format!("wind_special_showall_{}.redb", show_all));
+        let _ = std::fs::remove_file(&store_path);
+        let store = std::sync::Arc::new(wind_store::Store::open(&store_path).unwrap());
+        let mut cfg = config_with("wubi86");
+        cfg.schema.special_modes = vec![wind_config::config::SpecialModeConfig {
+            id: "sym".into(),
+            trigger_keys: vec!["backslash".into()],
+            schema: "wubi86".into(),
+            show_all_on_enter: show_all,
+            ..Default::default()
+        }];
+        let coord = Coordinator::new_headless_with_store(cfg, Some(&data_dir()), store);
+        // 空缓冲按 \ 进入特殊模式（尚未敲任何编码）
+        let act = coord.handle_key_event(&key_event(0xDC, EVENT_KEY_DOWN));
+        assert!(
+            matches!(act, KeyAction::UpdateComposition { .. }),
+            "\\ 应进入特殊模式，实际: {:?}",
+            act
+        );
+        let texts = coord.debug_all_candidate_texts();
+        let _ = std::fs::remove_file(&store_path);
+        texts
+    };
+    assert!(
+        !make(true).is_empty(),
+        "show_all_on_enter 开启时，进入模式（空编码）应立即枚举出码表候选"
+    );
+    assert!(
+        make(false).is_empty(),
+        "show_all_on_enter 关闭（默认）时，进入模式（空编码）候选应为空"
+    );
+}
+
+#[test]
 fn clear_on_empty_max_keeps_phrase_candidate() {
     if !has_schemas() {
         return;
