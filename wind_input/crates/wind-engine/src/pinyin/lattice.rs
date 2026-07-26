@@ -277,15 +277,22 @@ impl LatticeBuilder {
                 // 的既有决策一致，是已记录的永久缺口（待跨域偏移映射），本阶段不碰。
                 // 音节标注取图上任意一条最短路径——模糊命中没有可信真值切分，
                 // 但节点仍需一个自洽的标注供整句边界回填。
-                if let Some(fuzzy) = fuzzy_config {
-                    let variants = FuzzyMatcher::fuzzy_variants(code, fuzzy);
-                    if variants.is_empty() {
-                        continue;
-                    }
+                if let Some(fuzzy) = fuzzy_config.filter(|f| f.any_enabled()) {
+                    // **先取切分，再逐音节展开变体**。此前这里对整串 `code` 调
+                    // `fuzzy_variants`，而其声母规则是 `starts_with`、韵母规则是 `find`，
+                    // 对多音节串只能改到首音节声母与第一处韵母——`zhongzou`→`zhongzhou`
+                    // （中州）这类非首音节模糊整片丢失。切分本就在下面 `slice_syllables`
+                    // 里用着，只是没回头喂给变体生成（同 P1 记的「信息拿在手上，用完即弃」）。
                     let Some(offsets) = graph.any_path(p, q, self.max_word_len) else {
                         continue;
                     };
-                    for variant in variants {
+                    let syls = slice_syllables(code, &offsets);
+                    for variant in FuzzyMatcher::expand_syllables(&syls, fuzzy) {
+                        // 全原音节组合 == 原码，属精确命中，已由上面的 search_with_boundary
+                        // 循环加入（且带真值边界校验），不可在此重复添加为模糊节点。
+                        if variant == code {
+                            continue;
+                        }
                         for (text, weight, _order) in &dict.search(&variant) {
                             // 去重
                             if nodes[q].iter().any(|n| n.word == *text && n.start == p) {

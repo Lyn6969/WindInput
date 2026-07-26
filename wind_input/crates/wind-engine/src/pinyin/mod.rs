@@ -40,6 +40,41 @@ use wind_dict::cached::CachedDict;
 /// 整句候选权重基准（高于拼音词频上限 ~19260817，确保整句置顶且不被截断）
 const SENTENCE_WEIGHT_BASE: i32 = 30_000_000;
 
+/// 模糊音命中的权重折扣（对齐 Go `ranker.go` 的 `IsFuzzy → score -= 100`）。
+///
+/// **为何是惩罚而非层级**：模糊命中是「召回来源」，不是「匹配质量」——`si` 经 s↔sh 命中的
+/// 「是」在音节结构上与精确命中的「四」完全对齐，两者本就该同层按权重竞争。此前 `is_fuzzy`
+/// 是 `cmp_match_layers` 的首要键（等价于惩罚 ∞），真实词典下打 `si` 时「是」落在第 231 位、
+/// 打 `zong` 时「中」落在第 158 位，而生产候选上限仅 50（临拼/混输）~300（拼音方案），
+/// 模糊音在全部三条路径上等价于未实现。
+///
+/// **为何用乘性而非 Go 的加性常数**：Go 的分数是归一化后的加权和（音节对齐 +500、用户词 +300、
+/// 词频仅 ×0.00001），而本侧 weight 直接就是词频量纲且跨来源差异极大（词典词 ~1e2、
+/// 前缀补全可达 2e9、整句 3e7）。固定减法在不同量纲上效果天差地别，乘性折扣则量纲无关。
+///
+/// **取值依据（build_dev 真实词库实测，非估算）**：汉语单字词频跨数量级，同音字之间常差
+/// 1~2 个量级——「是」=1799848 vs「四」=22625（80 倍），「中」=497871 vs「总」=20874（24 倍）。
+/// 要让精确命中守住首选位，折扣必须小于二者之比，即 `si` 需 <0.013、`zong` 需 <0.042。
+/// 取 **0.01** 同时满足两者并留余量；实测下 `si`→「四 死 是\* 斯」、`zong`→「总 中\* 纵」，
+/// 精确守首位而模糊命中仍稳定落在首屏可见区（第 2~3 位），这正是模糊音要的效果。
+///
+/// 更大的值（如 0.5）会让模糊高频字直接夺走首选位（`si`→「是\* 时\* 四」），等于把
+/// 「我分不清 s/sh」曲解成「我要的就是 sh」。
+///
+/// **本常数不作用于整句路径**：Viterbi 整句拿 [`SENTENCE_WEIGHT_BASE`] (3e7) 基准分，
+/// 与词频量纲差几个数量级，任何比例折扣都压不下来。模糊整句改走 step 6.5 的
+/// `is_sentence_demoted` 降级（降到精确整词之下），见该处注释。
+const FUZZY_WEIGHT_SCALE: f64 = 0.01;
+
+/// 对模糊命中施加权重折扣，见 [`FUZZY_WEIGHT_SCALE`]。
+/// 饱和到 `>= 1`：折扣不该把候选压成 0/负权重而改变它与「无权重」候选的关系。
+fn fuzzy_penalized(weight: i32) -> i32 {
+    if weight <= 1 {
+        return weight;
+    }
+    ((weight as f64) * FUZZY_WEIGHT_SCALE).round().max(1.0) as i32
+}
+
 /// 裸声母（无完整音节，如 "m"）单字提权：使单字候选（吗/么）排在多字前缀补全词
 /// （没有/目前）之前——对齐主流输入法「首字优先」。取 1e7：高于常规词频（单字基础权重上限
 /// ~2e6），稳压多字词。（历史注记：此值原本还须刻意低于 freq_rerank 的 2e7 阈值以免被误当
@@ -326,7 +361,7 @@ impl PinyinEngine {
                     if seen.insert(text.clone()) {
                         results.push(LookupHit {
                             text,
-                            weight,
+                            weight: fuzzy_penalized(weight),
                             order,
                             is_fuzzy: true,
                             boundary: 0,
@@ -344,7 +379,7 @@ impl PinyinEngine {
                     if seen.insert(text.clone()) {
                         results.push(LookupHit {
                             text,
-                            weight,
+                            weight: fuzzy_penalized(weight),
                             order,
                             is_fuzzy: true,
                             boundary: 0,
@@ -357,39 +392,13 @@ impl PinyinEngine {
         results
     }
 
-    /// 对多音节做模糊变体笛卡尔积展开（对齐 Go FuzzyConfig.ExpandCode）。
-    /// 每个音节取 `[原音节] + fuzzy_variants(音节)`，做笛卡尔积拼接成完整 code。
-    /// 组合数超过上限（64）时跳过扩展返回空，避免组合爆炸。
+    /// 对多音节做模糊变体笛卡尔积展开（对齐 Go `FuzzyConfig.ExpandCode`）。
+    ///
+    /// 实现收口在 [`fuzzy::FuzzyMatcher::expand_syllables`]，与 `lattice.rs` 的整句路径共用
+    /// **同一份**逐音节展开逻辑——两处曾各写一套，且 lattice 那套对整串求变体，非首音节的
+    /// 模糊永远命中不了（见该函数文档）。
     fn expand_code(&self, syllables: &[String]) -> Vec<String> {
-        let per_syllable: Vec<Vec<String>> = syllables
-            .iter()
-            .map(|s| {
-                let mut opts = vec![s.clone()];
-                opts.extend(fuzzy::FuzzyMatcher::fuzzy_variants(s, &self.fuzzy_config));
-                opts
-            })
-            .collect();
-
-        // 预估组合数，超限直接放弃扩展，避免组合爆炸。
-        let mut combo_count: usize = 1;
-        for opts in &per_syllable {
-            combo_count = combo_count.saturating_mul(opts.len());
-            if combo_count > 64 {
-                return Vec::new();
-            }
-        }
-
-        let mut codes: Vec<String> = vec![String::new()];
-        for opts in &per_syllable {
-            let mut next: Vec<String> = Vec::with_capacity(codes.len() * opts.len());
-            for prefix in &codes {
-                for opt in opts {
-                    next.push(format!("{prefix}{opt}"));
-                }
-            }
-            codes = next;
-        }
-        codes
+        fuzzy::FuzzyMatcher::expand_syllables(syllables, &self.fuzzy_config)
     }
 }
 
@@ -1079,7 +1088,9 @@ impl Engine for PinyinEngine {
                     c.code = query.to_string();
                     c.is_prefix = false;
                     c.is_partial = false;
-                    c.is_fuzzy = true;
+                    // 简拼层标记。此前借 `is_fuzzy` 沉底——那是模糊音的「召回来源」标记，
+                    // 与简拼无关；`is_fuzzy` 退出 `cmp_match_layers` 后借用会把简拼一起放上来。
+                    c.is_abbrev = true;
                     c.natural_order = 999999;
                     candidates.push(c);
                 }
@@ -1157,13 +1168,32 @@ impl Engine for PinyinEngine {
         // `is_sentence` 不清：它表达「引擎对整串输入的最优解读」这个**来源**语义，
         // 降级是**排序**决策，另立 `is_sentence_demoted` 表达（`freq_rerank` 的顶部锚定
         // 据此豁免，否则那里不看 weight，本处降权会被整个顶回去）。
-        if let Some(sent) = &synthesized_sentence {
+        // 两类整句需要让位于精确整词：
+        // ① Viterbi **新合成**的整句（词典无此词，由多节点拼出）；
+        // ② **模糊命中**的整句（词典有此词，但经模糊变体召回——如 `sixiang` 经 s↔sh 命中
+        //    词条「是想」，在词图里成为覆盖全串的单节点被 Viterbi 选中）。
+        //
+        // ② 必须走这条路而非 `fuzzy_penalized` 的比例折扣：整句拿的是 `SENTENCE_WEIGHT_BASE`
+        // (3e7) 基准分，与词典词的词频量纲（1e2~1e6）差几个数量级，任何比例折扣都压不下来
+        // （0.01 折扣后仍有 3e5，照样碾过「思想」的 26133）。而「降到精确整词之下」在语义上
+        // 恰好对：模糊解读让位于精确解读。
+        //
+        // 该判据还天然区分了两种场景，无需额外条件：`sixiang` 存在精确整词「思想」故
+        // 「是想」让位；`zongguo` 下没有以 zongguo 为码的精确整词（exact_max=None），
+        // 「中国」照常居首——这正是模糊音想要的效果。
+        let mut demote_targets: Vec<String> = synthesized_sentence.iter().cloned().collect();
+        for c in candidates.iter() {
+            if c.is_sentence && c.is_fuzzy && !demote_targets.contains(&c.text) {
+                demote_targets.push(c.text.clone());
+            }
+        }
+        for sent in demote_targets {
             // 「精确整词」判据：码恰好等于已消费输入 `completed`，且非模糊命中、
             // 不在前缀补全/子短语层。含系统词库与 step 6 并入的用户/临时层。
             let exact_max = candidates
                 .iter()
                 .filter(|c| {
-                    &c.text != sent
+                    c.text != sent
                         && !c.is_fuzzy
                         && !c.is_prefix
                         && !c.is_partial
@@ -1172,7 +1202,7 @@ impl Engine for PinyinEngine {
                 .map(|c| c.weight)
                 .max();
             if let Some(max_w) = exact_max
-                && let Some(c) = candidates.iter_mut().find(|c| &c.text == sent)
+                && let Some(c) = candidates.iter_mut().find(|c| c.text == sent)
             {
                 c.weight = max_w.saturating_sub(1);
                 c.is_sentence_demoted = true;
@@ -2389,6 +2419,164 @@ mod tests {
             !r.candidates.iter().any(|c| c.text == "是"),
             "fuzzy 关闭时 \"si\" 不应命中「是」，实际: {:?}",
             r.candidates.iter().map(|c| &c.text).collect::<Vec<_>>()
+        );
+    }
+
+    /// 模糊命中的权重折扣：同一输入下，精确命中恒优先于**同词频**的模糊命中。
+    #[test]
+    fn fuzzy_penalty_keeps_exact_ahead_at_equal_weight() {
+        let mut raw = CodetableDict::empty();
+        raw.merge_single("si".to_string(), "四".to_string(), 1000, 0);
+        raw.merge_single("shi".to_string(), "是".to_string(), 1000, 1);
+        let mut fz = FuzzyConfig::default();
+        fz.sh_s = true;
+        let eng = PinyinEngine::new(Config::default(), CachedDict::Memory(raw)).with_fuzzy(fz);
+
+        let r = eng.convert("si", 10).unwrap();
+        let texts: Vec<&String> = r.candidates.iter().map(|c| &c.text).collect();
+        let pos_exact = texts.iter().position(|t| *t == "四").expect("「四」应存在");
+        let pos_fuzzy = texts.iter().position(|t| *t == "是").expect("「是」应存在");
+        assert!(
+            pos_exact < pos_fuzzy,
+            "同词频时精确命中须在模糊命中之前（折扣生效），实际: {texts:?}"
+        );
+    }
+
+    /// **本次修复的回归守卫（原 bug 的直接复现）**：模糊命中不得被大量**前缀补全**挤出候选。
+    ///
+    /// 原实现把 `is_fuzzy` 当 `cmp_match_layers` 的首要键，所有非模糊候选（含码更长的前缀
+    /// 补全）无条件排在模糊命中之前。真实词库下 `si` 的前缀补全有 230 条，把「是」顶到第
+    /// 231 位，而生产候选上限仅 50~300 —— 模糊音整体失效。
+    ///
+    /// 此处用 40 条 `si*` 前缀补全模拟那堵墙：**上限取 20**（小于补全总数），若模糊命中仍
+    /// 被整层压在补全之后，它必然落在截断线外。这正是「迷你词典单测全绿、真机全废」的
+    /// 那道缺口——测试数据的**规模**本身就是被测条件的一部分。
+    #[test]
+    fn fuzzy_hit_survives_a_wall_of_prefix_completions() {
+        let mut raw = CodetableDict::empty();
+        // 一堵前缀补全的墙：码比输入长（is_prefix=true），非模糊，权重普通。
+        for i in 0..40 {
+            raw.merge_single(format!("si{i:02}"), format!("思{i:02}"), 500, i);
+        }
+        // 模糊命中：码 shi，经 s↔sh 由输入 si 召回；词频显著高于补全（真实词库中
+        // 「是」正是高频字），折扣后仍应有竞争力。
+        raw.merge_single("shi".to_string(), "是".to_string(), 900_000, 99);
+        let mut fz = FuzzyConfig::default();
+        fz.sh_s = true;
+        let eng = PinyinEngine::new(Config::default(), CachedDict::Memory(raw)).with_fuzzy(fz);
+
+        const LIMIT: usize = 20;
+        let r = eng.convert("si", LIMIT).unwrap();
+        let texts: Vec<&String> = r.candidates.iter().map(|c| &c.text).collect();
+        assert!(
+            texts.iter().any(|t| *t == "是"),
+            "模糊命中须能挤进前 {LIMIT} 条，不得被 40 条前缀补全整层压到截断线外，实际: {texts:?}"
+        );
+    }
+
+    /// 多音节整词的模糊命中（**step1 `lookup_with_fuzzy` 路径**，一直走逐音节 `expand_code`）：
+    /// `beijinsi` → 「北京市」(beijingshi) 需要第 2 音节 in→ing **且** 第 3 音节 s→sh。
+    ///
+    /// 注意本例**测不到 lattice 路径**：词典存有覆盖整串的词条，step1 直接命中。
+    /// lattice 的逐音节展开由 `fuzzy_non_initial_initial_via_lattice_sentence` 覆盖。
+    #[test]
+    fn fuzzy_hits_non_initial_syllables_via_lookup() {
+        let mut raw = CodetableDict::empty();
+        raw.merge_single("beijingshi".to_string(), "北京市".to_string(), 5000, 0);
+        let mut fz = FuzzyConfig::default();
+        fz.in_ing = true;
+        fz.sh_s = true;
+        let eng = PinyinEngine::new(Config::default(), CachedDict::Memory(raw)).with_fuzzy(fz);
+
+        let r = eng.convert("beijinsi", 20).unwrap();
+        assert!(
+            r.candidates.iter().any(|c| c.text == "北京市"),
+            "第 2、3 音节同时模糊时应命中「北京市」，实际: {:?}",
+            r.candidates.iter().map(|c| &c.text).collect::<Vec<_>>()
+        );
+    }
+
+    /// **lattice 逐音节展开的专项回归守卫**（本次修复的核心路径）。
+    ///
+    /// 设计要点，缺一条就测不到真东西：
+    /// - 用**非首音节的声母**变体（`zou`→`zhou`，第 2 音节）。声母规则是 `starts_with`，
+    ///   整串调用只能改首音节；而韵母规则是 `find`，第一处匹配常恰好落在非首音节上，
+    ///   用韵母做判据会让整串调用也「碰巧」通过（`beijin`→`beijing` 正是如此）。
+    /// - 词典**不含**覆盖整串的词条，迫使候选只能由 Viterbi 多节点拼接产生，
+    ///   从而必经 lattice；否则 step1 的 `lookup_with_fuzzy` 会先命中，测不到 lattice。
+    ///
+    /// 把 lattice 改回对整串 `code` 求变体，本测试即挂。
+    #[test]
+    fn fuzzy_non_initial_initial_via_lattice_sentence() {
+        let mut raw = CodetableDict::empty();
+        // 覆盖前两音节的词（其码 zhongzhou 需由 zhong|zou 经第 2 音节 z→zh 得到）
+        raw.merge_single("zhongzhou".to_string(), "中州".to_string(), 5000, 0);
+        // 覆盖末音节的字，供 Viterbi 拼出整句
+        raw.merge_single("ming".to_string(), "明".to_string(), 5000, 1);
+        let mut fz = FuzzyConfig::default();
+        fz.zh_z = true;
+        let eng = PinyinEngine::new(Config::default(), CachedDict::Memory(raw)).with_fuzzy(fz);
+
+        // zhong|zou|ming：词典无覆盖整串的词条 → 只能靠词图拼接
+        let r = eng.convert("zhongzouming", 20).unwrap();
+        // **必须断言整句**（`is_sentence`），不能只断言「中州」出现：后者由 step3 的子短语
+        // 查询命中（`partial=true, code=zhongzou`，同样走逐音节 `lookup_with_fuzzy`），
+        // 在旧实现下**照样存在**——拿它做判据测不到 lattice，是一条会永远通过的假测试。
+        // 只有整句「中州明」需要「中州」先作为**词图节点**存在，才必经 lattice 的模糊展开。
+        let dump: Vec<String> = r
+            .candidates
+            .iter()
+            .map(|c| format!("{}(sent={})", c.text, c.is_sentence))
+            .collect();
+        assert!(
+            r.candidates
+                .iter()
+                .any(|c| c.is_sentence && c.text.contains("中州")),
+            "第 2 音节 zou→zhou 须能进入词图，使 Viterbi 拼出整句「中州明」，实际: {dump:?}"
+        );
+    }
+
+    /// 模糊命中的**整句**让位于精确整词：整句带 3e7 基准分，比例折扣压不下来，
+    /// 故走 `is_sentence_demoted` 降级。
+    #[test]
+    fn fuzzy_sentence_yields_to_exact_word() {
+        let mut raw = CodetableDict::empty();
+        // 精确整词（码 == 输入）
+        raw.merge_single("sixiang".to_string(), "思想".to_string(), 26_000, 0);
+        // 模糊命中的整词（码 shixiang，经 s↔sh 由 sixiang 召回）
+        raw.merge_single("shixiang".to_string(), "是想".to_string(), 30_000, 1);
+        let mut fz = FuzzyConfig::default();
+        fz.sh_s = true;
+        let eng = PinyinEngine::new(Config::default(), CachedDict::Memory(raw)).with_fuzzy(fz);
+
+        let r = eng.convert("sixiang", 10).unwrap();
+        let texts: Vec<&String> = r.candidates.iter().map(|c| &c.text).collect();
+        let pos_exact = texts.iter().position(|t| *t == "思想");
+        assert_eq!(
+            pos_exact,
+            Some(0),
+            "存在精确整词时它必须居首，模糊整句让位，实际: {texts:?}"
+        );
+    }
+
+    /// 反面：**没有**精确整词竞争时，模糊命中的整句照常居首——这正是模糊音要的效果
+    /// （`zongguo` → 「中国」）。与上一条共用同一判据，二者必须同时成立。
+    #[test]
+    fn fuzzy_sentence_leads_when_no_exact_word() {
+        let mut raw = CodetableDict::empty();
+        raw.merge_single("zhongguo".to_string(), "中国".to_string(), 30_000, 0);
+        // zongguo 下只有子短语单字，没有码 == zongguo 的精确整词
+        raw.merge_single("zong".to_string(), "总".to_string(), 20_000, 1);
+        let mut fz = FuzzyConfig::default();
+        fz.zh_z = true;
+        let eng = PinyinEngine::new(Config::default(), CachedDict::Memory(raw)).with_fuzzy(fz);
+
+        let r = eng.convert("zongguo", 10).unwrap();
+        let texts: Vec<&String> = r.candidates.iter().map(|c| &c.text).collect();
+        assert_eq!(
+            texts.first().map(|s| s.as_str()),
+            Some("中国"),
+            "无精确整词竞争时模糊整句应居首，实际: {texts:?}"
         );
     }
 

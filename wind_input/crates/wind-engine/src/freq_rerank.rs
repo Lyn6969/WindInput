@@ -387,24 +387,31 @@ mod tests {
         c
     }
 
-    /// 模糊层级优先于词频（完全模拟线上 si→是 词频污染场景）：
-    /// 用户曾在 "si" 下选过模糊命中「是」(有使用记录、权重更高)，但精确命中「四」(非模糊、
-    /// 未使用、权重更低) 仍须排在「是」之前——词频 used-first 不得把模糊提到精确之上。
+    /// 词频 used-first **不因「模糊来源」而豁免**：用户在 "si" 下反复选过模糊命中「是」，
+    /// 词频重排应照常把它软置前——`is_fuzzy` 只是「召回来源」标记，不构成学习壁垒。
+    ///
+    /// **本测试断言的是与从前相反的行为**（原名 `pinyin_exact_ranks_above_used_fuzzy`，
+    /// 断言「精确恒优先于被使用过的模糊命中」）。那套语义依赖 `cmp_match_layers` 把
+    /// `is_fuzzy` 当首要层级键，而该分层在真实词库下把模糊候选整体压到 200 名开外
+    /// （`si` 下「是」第 231 位），远超 50~300 的生产候选上限，使模糊音在拼音 / 混输 /
+    /// 临拼三条路径上全部等价于未实现。层级键已废除，模糊惩罚改由引擎在 weight 上施加
+    /// （见 `pinyin::FUZZY_WEIGHT_SCALE`）——真实链路进入本函数时「是」的权重已被折过，
+    /// 词频再据用户实际选择调整是合理的：用户反复选它，说明他要的就是它。
     #[test]
-    fn pinyin_exact_ranks_above_used_fuzzy() {
+    fn pinyin_used_fuzzy_can_rank_above_exact() {
         let mut cands = vec![
-            pin_fuzzy("是", 9000), // 模糊命中，高权重，且被频繁使用过
-            pin("四", 100),        // 精确命中，低权重，未使用
+            pin_fuzzy("是", 9000), // 模糊命中，且被频繁使用过
+            pin("四", 100),        // 精确命中，未使用
         ];
         let r = recs(&[("是", 4, NOW)]); // 「是」有使用记录（模拟 si→是 count=4）
         rerank_pinyin_decay(&mut cands, &r, NOW, FreqProfile::default());
         assert_eq!(
             cands[0].text,
-            "四",
-            "精确命中「四」须优先于被使用过的模糊命中「是」，实际: {:?}",
+            "是",
+            "用户反复选过的模糊命中应被词频软置前，实际: {:?}",
             cands.iter().map(|c| &c.text).collect::<Vec<_>>()
         );
-        assert_eq!(cands[1].text, "是");
+        assert_eq!(cands[1].text, "四");
     }
 
     /// 阈值褪色：久未用（衰减分 < ε）失去 used-first 资格，落回引擎权重序。
