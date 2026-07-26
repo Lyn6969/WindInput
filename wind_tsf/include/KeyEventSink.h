@@ -155,6 +155,12 @@ private:
     static constexpr int   RESYNC_MAX_RETRIES = 3;
     BOOL _IsResyncActive();       // 读旗+过期检查；过期会自动清旗
 
+    // 「当前是否有活跃输入会话」的**唯一判据**——决定各类键归本输入法还是透传宿主。
+    // 曾以三份等价表达式散落在 OnTestKeyDown / OnKeyDown / session 热键三处，direct_commit
+    // 顶码新增 defer 真空期时只有部分被更新，导致该窗口内空格/退格直落宿主（见
+    // project_top_commit_mode）。任何新的「算不算有会话」的状态，只加到这里。
+    BOOL _HasInputSession();
+
     WCHAR _lastPassthroughDigit; // Last digit key that passed through (for smart punct fallback in apps where TSF can't read text)
     uint32_t _pendingKeyUpKey;   // Key code of pending KeyUp toggle key
     uint32_t _pendingKeyUpModifiers; // Modifiers when KeyDown was pressed

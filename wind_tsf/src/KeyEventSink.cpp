@@ -357,7 +357,7 @@ STDAPI CKeyEventSink::OnTestKeyDown(ITfContext* pContext, WPARAM wParam, LPARAM 
         BOOL chineseMode = _pTextService->IsChineseMode();
         // resync 期 (上次 IPC 失败后) 视作有会话, 让 ENTER/ESC/Backspace 等 session 热键
         // 也走 Go 重握手, 由 Go 权威响应清旗 + 重建状态。
-        BOOL hasSession  = _pTextService->HasActiveComposition() || _hasCandidates || _IsResyncActive();
+        BOOL hasSession  = _HasInputSession();
         if (chineseMode && hasSession)
         {
             WIND_LOG_DEBUG_FMT(L"KeyDown session hotkey matched: vk=0x%02X, hash=0x%08X\n",
@@ -489,10 +489,9 @@ STDAPI CKeyEventSink::OnTestKeyDown(ITfContext* pContext, WPARAM wParam, LPARAM 
     BOOL isChineseMode = _pTextService->IsChineseMode();
     // Use TextService's composition state - this is the source of truth in async architecture
     BOOL hasComposition = _pTextService->HasActiveComposition();
-    // Also check _hasCandidates for cases where InlinePreedit is disabled
-    // (Go sends UpdateComposition with empty text, _hasCandidates is TRUE but HasActiveComposition is FALSE)
-    // _needsCompositionResync: 上次 IPC 失败后强行视作有会话, 让 ENTER/ESC 也能发给 Go 重握手。
-    BOOL hasInputSession = hasComposition || _hasCandidates || _IsResyncActive();
+    // 判据收口在 _HasInputSession()（含 defer 真空期，见其定义）。此处不得就地展开：
+    // OnTestKeyDown 放行的键根本不会调到 OnKeyDown，两边不一致即「吃了再吐」或直接丢键。
+    BOOL hasInputSession = _HasInputSession();
 
     // English auto-pair: intercept bracket keys in English mode.
     // Ctrl/Alt 组合留给热键/宿主（如 Ctrl+Shift+] open_settings），不做配对。
@@ -1032,9 +1031,10 @@ STDAPI CKeyEventSink::OnKeyDown(ITfContext* pContext, WPARAM wParam, LPARAM lPar
     BOOL isChineseMode = _pTextService->IsChineseMode();
     // Use TextService's composition state - this is the source of truth in async architecture
     BOOL hasComposition = _pTextService->HasActiveComposition();
-    // Also check _hasCandidates for cases where InlinePreedit is disabled.
-    // _needsCompositionResync: 上次 IPC 失败后强行视作有会话, 让 ENTER/ESC 也能发给 Go 重握手。
-    BOOL hasInputSession = hasComposition || _hasCandidates || _IsResyncActive();
+    // 与 OnTestKeyDown 同一判据（见 _HasInputSession 定义）：那边吃了键才会调到本函数，
+    // 这边若判「无会话」，Backspace/Enter/Escape/CursorKey 会落成 isInputKey=FALSE，
+    // 形成「吃了再吐」——严格 TSF 宿主会直接丢键（见 project_fullwidth_eat_flip 的教训）。
+    BOOL hasInputSession = _HasInputSession();
 
     // 与 OnTestKeyDown 对称：中文 + CapsLock ON + 非全角 + 无 session 的字母同步透传
     // （不吃、不发 Go），由系统按 CapsLock 产生大写字母 + 保留 WM_KEYDOWN 供 CAD 快捷键
@@ -2374,6 +2374,21 @@ BOOL CKeyEventSink::_IsResyncActive()
         return FALSE;
     }
     return TRUE;
+}
+
+// 「有活跃输入会话」的唯一判据（声明处有为何收口的来龙去脉）。四个分量：
+//   HasActiveComposition : TSF 组合活跃 —— 常规主判据。
+//   _hasCandidates       : 候选窗有内容而组合为空（非 app_inline 时 core 发空组合串）。
+//   _IsResyncActive      : 上次 IPC 失败后的自愈窗口，强行视作有会话以便重握手。
+//   HasDeferredComposition: CommitThenDefer（direct_commit 顶码）已 commit、余码组合尚未
+//     重开的真空期。coordinator 缓冲里确有余码，该段内的键理应归本输入法；漏掉会让空格
+//     插入字面空格、退格删掉刚上屏的字（真机复现：skce 顶码后快打 h + 空格）。
+BOOL CKeyEventSink::_HasInputSession()
+{
+    return _pTextService->HasActiveComposition()
+        || _hasCandidates
+        || _IsResyncActive()
+        || _pTextService->HasDeferredComposition();
 }
 
 void CKeyEventSink::_CheckBarrierTimeout()
