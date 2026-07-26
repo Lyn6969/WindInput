@@ -4853,6 +4853,13 @@ impl MessageHandler for Coordinator {
     }
 
     fn handle_focus_gained(&self, data: &FocusData) -> Option<StatusUpdateData> {
+        // 与 handle_focus_lost 的 token 日志配对：只有两边都记 token，才能从日志算出
+        // 「同一实例 gained 后多久自己 lost」——区分 DocMgr 抖动与真实离开就靠这个间隔。
+        tracing::debug!(
+            "handle_focus_gained: token={:#x} scope={:#x}",
+            data.client_token,
+            data.input_scope_mask
+        );
         {
             let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
             state.caret_x = data.x;
