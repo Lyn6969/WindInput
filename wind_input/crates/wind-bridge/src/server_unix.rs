@@ -120,7 +120,7 @@ mod tests {
         fn handle_focus_gained(&self, _data: &FocusData) -> Option<StatusUpdateData> {
             None
         }
-        fn handle_focus_lost(&self, _client_token: u64) {}
+        fn handle_focus_lost(&self, _client_token: u64, _reason: FocusLostReason) {}
         fn handle_ime_activated(&self, _client_token: u64) -> Option<StatusUpdateData> {
             None
         }

@@ -62,8 +62,8 @@ impl MessageHandler for DeferredHandler {
         self.with_handler(None, |h| h.handle_focus_gained(data))
     }
 
-    fn handle_focus_lost(&self, client_token: u64) {
-        self.with_handler((), |h| h.handle_focus_lost(client_token))
+    fn handle_focus_lost(&self, client_token: u64, reason: wind_ipc::protocol::FocusLostReason) {
+        self.with_handler((), |h| h.handle_focus_lost(client_token, reason))
     }
 
     fn handle_show_context_menu(&self, x: i32, y: i32) {

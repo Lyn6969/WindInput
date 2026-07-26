@@ -4,6 +4,10 @@
 
 use wind_ipc::protocol::KeyPayload;
 
+// re-export：FocusLostReason 是 MessageHandler 签名的一部分，实现方（含各处测试桩）
+// 都经 `use crate::handler::*` 引入，不 re-export 会让它们各自去写 wind_ipc 路径。
+pub use wind_ipc::protocol::FocusLostReason;
+
 /// 按键事件数据
 #[derive(Debug, Clone)]
 pub struct KeyEventData {
@@ -212,7 +216,11 @@ pub trait MessageHandler: Send + Sync {
     /// `client_token` 为发出该失焦的 TSF 实例（0 = 旧 DLL 未携带，实现方应保守放行）。
     /// 实现方**必须**据此做归属校验：DLL 的 `OnKillThreadFocus` 比 DocMgr 级失焦晚约
     /// 100ms 才发本命令，跨宿主切换时它必然晚于新宿主的 focus_gained 到达。
-    fn handle_focus_lost(&self, client_token: u64);
+    ///
+    /// `reason` 区分四种语义完全不同的「失焦」，实现方**不可一刀切**地全部按「离开输入法」
+    /// 处理——尤其 [`FocusLostReason::CtxLost`] 来自 DocMgr 噪声层，清输入态会复发
+    /// 「首字符直接上屏」。各 reason 的后果矩阵见 [`FocusLostReason`]。
+    fn handle_focus_lost(&self, client_token: u64, reason: FocusLostReason);
 
     /// 处理 IME 激活（返回状态用于 ActivationStatusPush）
     fn handle_ime_activated(&self, client_token: u64) -> Option<StatusUpdateData>;

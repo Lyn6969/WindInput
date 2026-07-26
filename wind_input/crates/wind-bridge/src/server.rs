@@ -520,10 +520,13 @@ pub(crate) fn dispatch_command(
         // readFrame 永久阻塞 → 切换/失焦卡死。Windows TSF fire-and-forget（is_async）不读，
         // 回了反而污染管道 → 仅 !is_async 回 ack（对齐 feat / 历史 fix 803f7fa）。
         CMD_FOCUS_LOST => {
-            // 载荷自 v0.111.4 起携带 8 字节 clientToken（旧 DLL 发 0 字节 → token=0，
-            // handler 保守放行以保持旧行为）。handler 据此丢弃陈旧失焦，详见
-            // MessageHandler::handle_focus_lost 的归属校验说明。
-            handler.handle_focus_lost(decode_client_token(payload));
+            // 载荷自 v0.111.4 起携带 8 字节 clientToken，v0.111.5 起追加 1 字节 reason。
+            // 旧 DLL 发 0 字节 → token=0（handler 保守放行）+ reason=Thread（旧语义），
+            // 故新旧两侧可任意组合。归属校验见 MessageHandler::handle_focus_lost。
+            handler.handle_focus_lost(
+                decode_client_token(payload),
+                decode_focus_lost_reason(payload),
+            );
             if is_async { None } else { Some(encode_ack()) }
         }
 
@@ -959,6 +962,14 @@ fn decode_client_token(payload: &[u8]) -> u64 {
     }
 }
 
+/// 从 CMD_FOCUS_LOST 载荷解出 reason（第 9 字节）。
+///
+/// 载荷不足 9 字节（旧 DLL 只发 token 甚至空载荷）时返回 `Thread`——那是旧行为的隐含
+/// 语义，也是后果最完整的一种，误判方向安全。
+fn decode_focus_lost_reason(payload: &[u8]) -> wind_ipc::protocol::FocusLostReason {
+    wind_ipc::protocol::FocusLostReason::from_u8(payload.get(8).copied().unwrap_or(0))
+}
+
 /// 将 KeyAction 编码为响应字节
 ///
 /// 与 Go 版 handleKeyEvent 的 switch 分支对齐
@@ -1050,7 +1061,7 @@ mod tests {
         fn handle_focus_gained(&self, _data: &FocusData) -> Option<StatusUpdateData> {
             None
         }
-        fn handle_focus_lost(&self, _client_token: u64) {}
+        fn handle_focus_lost(&self, _client_token: u64, _reason: FocusLostReason) {}
         fn handle_ime_activated(&self, _client_token: u64) -> Option<StatusUpdateData> {
             None
         }

@@ -16,20 +16,33 @@ pub struct InputDiagView {
     pub disabled: bool,
     pub reason_text: String,
     pub mask: u64,
+    /// 本输入法是否在为某宿主服务（协调器 `State::ime_active`）。
+    pub ime_active: bool,
+    /// 焦点是否落在可编辑控件里（协调器 `State::has_edit_context`）。
+    ///
+    /// 与 `ime_active` 正交，两者都为真工具栏才显示。把它们摆进 HUD 是因为
+    /// 「工具栏该显示却没显示 / 该隐藏却不隐藏」只能靠这两位区分，此前只能翻服务端日志。
+    pub has_edit_context: bool,
 }
 
-/// 纯格式化：4 行诊断文本（可单测）。
+/// 纯格式化：5 行诊断文本（可单测）。
 pub fn format_diag_lines(v: &InputDiagView) -> Vec<String> {
     let name = if v.process_name.is_empty() {
         "(未知)"
     } else {
         &v.process_name
     };
+    let yn = |b: bool| if b { "是" } else { "否" };
     vec![
         format!("{} ({})", name, v.pid),
-        format!("禁用态: {}", if v.disabled { "是" } else { "否" }),
+        format!("禁用态: {}", yn(v.disabled)),
         format!("原因: {}", v.reason_text),
         format!("InputScope: 0x{:X}", v.mask),
+        format!(
+            "激活: {} 可编辑上下文: {}",
+            yn(v.ime_active),
+            yn(v.has_edit_context)
+        ),
     ]
 }
 
@@ -383,13 +396,18 @@ mod tests {
             disabled: true,
             reason_text: "compartment".into(),
             mask: 1 << 31,
+            ime_active: true,
+            has_edit_context: false,
         };
         let lines = format_diag_lines(&v);
-        assert_eq!(lines.len(), 4);
+        assert_eq!(lines.len(), 5);
         assert!(lines[0].contains("chrome.exe"));
         assert!(lines[0].contains("4242"));
         assert!(lines[1].contains("是")); // 禁用态: 是
         assert!(lines[2].contains("compartment"));
         assert!(lines[3].contains("0x")); // mask 十六进制
+        // 两个状态位取值不同，确保没有把同一个变量渲染两遍
+        assert!(lines[4].contains("激活: 是"));
+        assert!(lines[4].contains("可编辑上下文: 否"));
     }
 }

@@ -856,6 +856,7 @@ CTextService::CTextService()
     , _hasTextInputContext(FALSE)
     , _pLastActiveDocMgr(nullptr)
     , _focusLostSent(FALSE)
+    , _editCtxReported(FALSE)
     , _pComposition(nullptr)
     , _hasCachedCaretPos(FALSE)
     , _hasCachedCompStartPos(FALSE)
@@ -1373,7 +1374,6 @@ STDAPI CTextService::OnSetThreadFocus()
     WIND_LOG_DEBUG(L"OnSetThreadFocus called\n");
     _hasThreadFocus = TRUE;
     // 拿回 thread focus：候选可见性热键由 NotifyCandidatesVisibilityChanged 驱动，
-
     // 这里不主动补——切焦点时候选窗通常已经消失。
     // 加词热键不依赖候选，重新评估（若当前中文+文本框则重新注册）。
     _ReevaluateAddWordHotkey();
@@ -1402,7 +1402,7 @@ STDAPI CTextService::OnKillThreadFocus()
     // 不传则可能落到 forced cleanup，把残留文本提交进文档（Excel/WPS 表格的 'd' 漏字）。
     // 实测本回调在 Chrome/VSCode/Edge 各 5/5、5/5、11/11 次触发零漏，仅比 DocMgr
     // 级失焦晚约 100ms —— 该延迟用户不可感知，且远优于 500ms 自检定时器兜底。
-    CleanupInputStateForDocChange(_pLastActiveDocMgr, L"thread_focus_lost");
+    CleanupInputStateForDocChange(_pLastActiveDocMgr, FOCUS_LOST_REASON_THREAD);
     // 注意：失焦时**不**销毁 HostWindow。SearchHost/任务管理器等用 XamlIsland
     // locked/transient DocMgr，OnSetFocus 对其跳过 focus_gained（防 composition
     // replay），而 HostWindow 重建依赖 focus_gained → 一旦销毁就再也不会重建，
@@ -2052,7 +2052,8 @@ STDAPI CTextService::OnSetFocus(ITfDocumentMgr* pDocMgrFocus, ITfDocumentMgr* pD
             DWORD incomingDynFlags = 0;
             _DocMgrHasEditableContext(pDocMgrFocus, &incomingDynFlags);
             const BOOL willSkipFocusGained = (incomingDynFlags & kXamlIslandLockedFlag) != 0;
-            CleanupInputStateForDocChange(_pLastActiveDocMgr, L"doc_changed", !willSkipFocusGained);
+            CleanupInputStateForDocChange(_pLastActiveDocMgr, FOCUS_LOST_REASON_DOC_CHANGED,
+                                          !willSkipFocusGained);
         }
 
         // Register ITfTextLayoutSink on the new context to receive
@@ -2163,8 +2164,11 @@ STDAPI CTextService::OnSetFocus(ITfDocumentMgr* pDocMgrFocus, ITfDocumentMgr* pD
                 // 走的是本分支而非 focus_gained，不计就会在最该测的场景里恒报 0。
                 // SendFocusLost 是 async 写（无响应等待），但写超时仍有 300ms。
                 const LONGLONG lostT0 = WindLog::PerfNow();
-                _pIPCClient->SendFocusLost();
+                // NO_EDIT_CTX：新文档确实没有可输入的地方，残留 buffer 无处可去必须清，
+                // 工具栏也该隐藏；但宿主还在前台、输入法仍激活，故不动 ime_active。
+                _pIPCClient->SendFocusLost(FOCUS_LOST_REASON_NO_EDIT_CTX);
                 _focusLostSent = TRUE;
+                _editCtxReported = FALSE; // 已告知服务端"没有可编辑上下文"，勿再补 CTX_LOST
                 focusIpcMs += WindLog::PerfMsSince(lostT0);
             }
             _needsFocusRecovery = FALSE;
@@ -2192,6 +2196,9 @@ STDAPI CTextService::OnSetFocus(ITfDocumentMgr* pDocMgrFocus, ITfDocumentMgr* pD
                                    _focusSessionId, focusIpcMs);
                 _needsFocusRecovery = FALSE;
                 _focusLostSent = FALSE; // 新会话开始，下次离开文档时须再发一次 focus_lost
+                // 服务端此刻已知「焦点在可编辑控件里」。置位后，焦点离开时
+                // _ReportEditContextLost 才会在翻转沿补一条 CTX_LOST。
+                _editCtxReported = TRUE;
                 _pIPCClient->ClearNeedsSyncFlag();
             }
             else
@@ -2217,9 +2224,7 @@ STDAPI CTextService::OnSetFocus(ITfDocumentMgr* pDocMgrFocus, ITfDocumentMgr* pD
     // If losing focus (pDocMgrFocus is null)
     if (pDocMgrFocus == nullptr)
     {
-        // ⚠ 文案必须如实说明「不发 IPC」：旧文案是 "notifying service"，与下方刻意不通知
-        // 服务端的行为正好相反，2026-07-26 排查工具栏闪隐时据此误判过一轮失焦来源。
-        WIND_LOG_DEBUG_FMT(L"DocMgr focus lost focusSession=%llu (no IPC; focus_lost deferred to OnKillThreadFocus)",
+        WIND_LOG_DEBUG_FMT(L"DocMgr focus lost focusSession=%llu (ctx_lost only; 输入态清理仍延后到 OnKillThreadFocus)",
                            _focusSessionId);
 
         if (_pKeyEventSink != nullptr)
@@ -2227,18 +2232,24 @@ STDAPI CTextService::OnSetFocus(ITfDocumentMgr* pDocMgrFocus, ITfDocumentMgr* pD
             _pKeyEventSink->FlushEnglishStats();
         }
 
-        // ⚠ 这里**刻意不做**结束 composition / 发 focus_lost / 复位会话态这三件事。
+        // ⚠ 这里**刻意不做**结束 composition / 清输入态 / 复位会话态这三件事。
         // 曾经做过，那正是「Excel 首字符不进编码、直接上屏」的根因：Excel 在
         // cell-select → cell-edit 时把同一个 DocMgr 置空再设回（实测指针不变、间隔 6ms），
         // 在此销毁输入态就把用户刚敲的首字符连同 composition 一起清掉了。
         // DocMgr 级失焦是噪声信号（VSCode 实测一次应用切换伴随 5 次 DocMgr 焦点事件），
         // 且在这一刻无从区分「抖动」与「真的换了文档」。
         //
-        // 清理改由两条能分辨真伪的路径承担：
+        // 输入态清理仍由两条能分辨真伪的路径承担：
         //   1. 另一个文档拿到焦点   → OnSetFocus 的 doc_changed 分支（本函数上半部分）
         //   2. 整个应用失去前台     → OnKillThreadFocus（实测 Chrome/VSCode/Edge 各
         //      5/5、5/5、11/11 次触发，零漏；仅比本回调晚约 100ms）
         // 同源做法见 Weasel ThreadMgrEventSink.cpp（其 issue #185 就是同一个 Excel bug）。
+        //
+        // **但工具栏可见性不同**：它不需要"分辨真伪"，因为翻错了也只是闪一下，UI 层
+        // 50ms 隐藏防抖会吸收，而漏报的代价是应用内点到非文本框后工具栏永不隐藏（实测
+        // LogExpert / 文件管理器，2026-07-26）。故这里补一条 CTX_LOST——它只翻可见性
+        // 标志、不碰输入态，是唯一能安全放在噪声层的通知。
+        _ReportEditContextLost();
 
         // Unregister layout sink when losing focus
         _UnadviseTextLayoutSink();
@@ -5160,14 +5171,30 @@ fallback:
     return TRUE;
 }
 
-// 输入态整体清理。**只应由「离开了原来那个文档」的三条路径调用**，不要挂回失焦回调：
-// DocMgr 级失焦是噪声信号（VSCode 实测一次应用切换伴随 5 次 DocMgr 焦点事件，Excel 更
-// 是同一指针 6ms 内掉了又回），在那里销毁用户输入正是「首字符直接上屏」的根因。
-void CTextService::CleanupInputStateForDocChange(ITfDocumentMgr* pDocMgrHint, const wchar_t* reason,
+// FOCUS_LOST_REASON_* 的日志名。日志文案与协议值共用一处，避免两边各写一份而说反
+// （TextService.cpp 的 "notifying service" 就是这么错了一年）。
+static const wchar_t* FocusLostReasonName(uint8_t reason)
+{
+    switch (reason)
+    {
+    case FOCUS_LOST_REASON_THREAD:      return L"thread_focus_lost";
+    case FOCUS_LOST_REASON_DOC_CHANGED: return L"doc_changed";
+    case FOCUS_LOST_REASON_CTX_LOST:    return L"ctx_lost";
+    default:                            return L"?";
+    }
+}
+
+// 输入态整体清理。**只应由「离开了原来那个文档」的两条路径调用**（OnKillThreadFocus /
+// doc_changed），不要挂回失焦回调：DocMgr 级失焦是噪声信号（VSCode 实测一次应用切换伴随
+// 5 次 DocMgr 焦点事件，Excel 更是同一指针 6ms 内掉了又回），在那里销毁用户输入正是
+// 「首字符直接上屏」的根因。
+// DocMgr 级失焦要通知服务端隐藏工具栏时，走 _ReportEditContextLost() 而**不是**本函数——
+// 那条路径只翻可见性标志、不碰输入态。
+void CTextService::CleanupInputStateForDocChange(ITfDocumentMgr* pDocMgrHint, uint8_t reason,
                                                  BOOL sendFocusLost)
 {
     WIND_LOG_DEBUG_FMT(L"CleanupInputStateForDocChange reason=%ls hint=0x%p focusLostSent=%d sendLost=%d",
-                       reason ? reason : L"-", pDocMgrHint, _focusLostSent ? 1 : 0, sendFocusLost ? 1 : 0);
+                       FocusLostReasonName(reason), pDocMgrHint, _focusLostSent ? 1 : 0, sendFocusLost ? 1 : 0);
 
     // 先结束 composition 再发 focus_lost：EndComposition 会清空 composition 范围的文本，
     // 顺序反了则服务端已清 buffer 而宿主里仍留着未清的 composition 文本。
@@ -5178,13 +5205,44 @@ void CTextService::CleanupInputStateForDocChange(ITfDocumentMgr* pDocMgrHint, co
     // ime_active 会被永久清掉（见 OnSetFocus doc_changed 分支注释）。
     if (sendFocusLost && !_focusLostSent && _pIPCClient != nullptr && _pIPCClient->IsConnected())
     {
-        _pIPCClient->SendFocusLost();
+        _pIPCClient->SendFocusLost(reason);
         _focusLostSent = TRUE;
+        // 本函数发出的两种 reason（THREAD / DOC_CHANGED）都意味着「已经不在原来那个可编辑
+        // 上下文里了」，故一并复位上报态：否则紧接着的 DocMgr 失焦会再补一条 CTX_LOST。
+        _editCtxReported = FALSE;
     }
 
     if (_pKeyEventSink != nullptr)
     {
         _pKeyEventSink->ResetComposingState();
+    }
+}
+
+// 焦点离开可编辑控件（DocMgr 级失焦）时通知服务端隐藏工具栏。
+//
+// 与 CleanupInputStateForDocChange 的分工是本次设计的要点：本函数**只翻可见性标志，
+// 绝不碰输入态**。这正是它能在 DocMgr 噪声层安全调用的原因——Excel 那种「同一 DocMgr
+// 6ms 内掉了又回」的抖动，最多让工具栏闪一下（UI 层 50ms 隐藏防抖会吸收），而输入缓冲
+// 毫发无损。反过来，若在这里调 CleanupInputStateForDocChange，就是把「首字符不进编码、
+// 直接上屏」原样请回来。
+//
+// **不设 _focusLostSent**：那个标志表示「真失焦已上报」，供 OnKillThreadFocus 去重。
+// CTX_LOST 不是真失焦（应用还在前台、输入法仍激活），置位会让随后真正的
+// thread_focus_lost 被吞掉，ime_active 就永远清不掉了。
+//
+// 靠 _editCtxReported 去重：DocMgr 级失焦实测可达 60~98 次/秒，每次都发会造成 IPC 洪泛。
+// 只在「上报过有可编辑上下文 → 现在没有了」这个翻转沿发一次。
+void CTextService::_ReportEditContextLost()
+{
+    if (!_editCtxReported)
+    {
+        return; // 本来就没上报过有上下文，无需再说一遍
+    }
+    _editCtxReported = FALSE;
+
+    if (_pIPCClient != nullptr && _pIPCClient->IsConnected())
+    {
+        _pIPCClient->SendFocusLost(FOCUS_LOST_REASON_CTX_LOST);
     }
 }
 

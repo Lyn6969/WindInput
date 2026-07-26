@@ -859,17 +859,23 @@ impl Coordinator {
                 .fullscreen_cached
                 .load(std::sync::atomic::Ordering::Relaxed);
         let s = self.state.lock().unwrap_or_else(|e| e.into_inner());
-        if !(s.ime_active && s.toolbar_visible) || hide_fullscreen {
-            // 记录是三项中的哪一项否决了显示：UI 层日志只看得到「HideToolbar」，判不出成因，
-            // 而三条路径的排查方向完全不同（激活态乱序 / 用户关了开关 / 全屏探测）。
+        // 四项合取：本输入法在服务某宿主（ime_active）、焦点在可编辑控件里
+        // （has_edit_context）、用户开着工具栏（toolbar_visible）、且未处于全屏。
+        // 前两项正交且缺一不可——只看 ime_active 会让应用内点到非文本框时工具栏不隐藏。
+        if !(s.ime_active && s.has_edit_context && s.toolbar_visible) || hide_fullscreen {
+            // 记录是哪一项否决了显示：UI 层日志只看得到「HideToolbar」，判不出成因，
+            // 而四条路径的排查方向完全不同（激活态乱序 / 焦点离开输入框 / 用户关了开关 /
+            // 全屏探测）。
             tracing::debug!(
-                "notify_toolbar: 隐藏 ime_active={} toolbar_visible={} fullscreen={}",
+                "notify_toolbar: 隐藏 ime_active={} has_edit_ctx={} toolbar_visible={} fullscreen={}",
                 s.ime_active,
+                s.has_edit_context,
                 s.toolbar_visible,
                 hide_fullscreen
             );
             drop(s);
             let _ = self.ui_tx.send(UiCommand::HideToolbar);
+            self.push_input_diag_hud_if_visible(); // 见函数末尾同一行的说明
             return;
         }
         let (chinese_mode, caps_lock) = (s.chinese_mode, s.caps_lock);
@@ -902,6 +908,13 @@ impl Coordinator {
         };
         drop(s);
         let _ = self.ui_tx.send(UiCommand::UpdateToolbar(tb));
+        // HUD 刷新收口于此（两个出口各一次）。诊断 HUD 展示的 ime_active /
+        // has_edit_context 正是上面那道合取的输入，而**凡是改动它们的路径都必须调
+        // notify_toolbar 才能生效**，所以这里是唯一不会漏的落点。
+        // 反例（2026-07-26 实测）：起初只在 apply_input_diag 里推，于是 focus_gained
+        // 之外的路径（CtxLost 等）改了状态却不刷新，HUD 一直显示上一次的快照。
+        // 在此调用是安全的：state 锁已 drop，且 HUD 关闭时该函数首行即返回，零开销。
+        self.push_input_diag_hud_if_visible();
     }
 }
 

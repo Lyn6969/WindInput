@@ -37,6 +37,62 @@ pub const CMD_SHOW_CONTEXT_MENU: u16 = 0x020A;
 pub const CMD_SYSTEM_MODE_SWITCH: u16 = 0x020B;
 pub const CMD_INPUT_STATE_REPORT: u16 = 0x0213;
 
+/// `CMD_FOCUS_LOST` 载荷的 reason 字段（第 9 字节）。与 C++ `BinaryProtocol.h` 的
+/// `FOCUS_LOST_REASON_*` 一一对应，改动须两边同步。
+///
+/// 「失焦」在 TSF 里是四件语义不同的事，过去挤在一个命令里，服务端只能一刀切地
+/// 「清激活态 + 清输入态」：于是同宿主换文档也会关掉工具栏，而 DocMgr 级失焦因为不敢
+/// 清输入态干脆什么都不发、工具栏永不隐藏。拆开后三项后果各自独立：
+///
+/// | reason        | ime_active | has_edit_context | 输入态 |
+/// |---------------|------------|------------------|--------|
+/// | `Thread`      | false      | false            | 清     |
+/// | `DocChanged`  | 不动       | 不动             | 清     |
+/// | `CtxLost`     | 不动       | false            | **不清** |
+/// | `NoEditCtx`   | 不动       | false            | 清     |
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FocusLostReason {
+    /// 整个应用失去前台（DLL 的 `OnKillThreadFocus`）。真正意义上离开本输入法。
+    Thread,
+    /// 同一宿主内换了文档。宿主没变、输入法仍在服务它，故不动激活态。
+    DocChanged,
+    /// 焦点离开可编辑控件（DLL 的 DocMgr 级失焦）。
+    ///
+    /// **绝不可用它清输入态**：该事件来自噪声层（Excel 实测同一 DocMgr 6ms 内掉了又回），
+    /// 在那里销毁输入态正是「首字符不进编码、直接上屏」的根因。只翻可见性标志才安全。
+    CtxLost,
+    /// 换到了没有可编辑控件的文档（QQ Ctrl+1 切会话）。残留 buffer 无处可去，须清。
+    NoEditCtx,
+}
+
+impl FocusLostReason {
+    /// 从协议字节解码。未知值与缺省一律按 [`Self::Thread`] 处理——那是旧 DLL 不带
+    /// reason 时的隐含语义，也是后果最完整的一种，误判方向安全。
+    pub fn from_u8(v: u8) -> Self {
+        match v {
+            1 => Self::DocChanged,
+            2 => Self::CtxLost,
+            3 => Self::NoEditCtx,
+            _ => Self::Thread,
+        }
+    }
+
+    /// 是否应清空输入态（buffer / preedit / 候选）。
+    pub fn clears_input(self) -> bool {
+        !matches!(self, Self::CtxLost)
+    }
+
+    /// 是否应清 `ime_active`（本输入法整体不再服务任何宿主）。
+    pub fn clears_ime_active(self) -> bool {
+        matches!(self, Self::Thread)
+    }
+
+    /// 是否应清 `has_edit_context`（焦点不在可编辑控件里了）。
+    pub fn clears_edit_context(self) -> bool {
+        !matches!(self, Self::DocChanged)
+    }
+}
+
 // 上行（darwin .app / Windows host-render DLL）：鼠标候选交互。方向与下行 0x020D/0x020E 由 dispatch 上下文区分。
 pub const CMD_CANDIDATE_SELECT: u16 = 0x020D; // payload: pageLocalIndex i32 LE；<0 为翻页按钮（-1 上页 / -2 下页，与 SHM 命中矩形约定一致）
 pub const CMD_CANDIDATE_HOVER: u16 = 0x020E; // payload: pageLocalIndex i32 LE (-1=无；Windows 另带 anchorX/belowY/aboveY 三个 i32，当前仅取 index)

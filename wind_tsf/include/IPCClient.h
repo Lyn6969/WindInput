@@ -154,8 +154,10 @@ public:
     // Send focus lost notification.
     // Carries this instance's clientToken so the service can discard a *stale* focus_lost —
     // OnKillThreadFocus emits it ~100ms after the DocMgr-level focus loss, i.e. after the next
-    // host's focus_gained has already arrived. See ClientTokenPayload in BinaryProtocol.h.
-    BOOL SendFocusLost();
+    // host's focus_gained has already arrived.
+    // reason 取 FOCUS_LOST_REASON_*，决定服务端清哪些状态；三种语义的区别见
+    // BinaryProtocol.h。默认 THREAD＝最保守的「整个应用离开了」。
+    BOOL SendFocusLost(uint8_t reason = FOCUS_LOST_REASON_THREAD);
 
     // Send focus gained notification (with optional caret position and InputScope bitmask).
     // disabled/reason: input diagnostics HUD state for the newly focused control (Task 7).

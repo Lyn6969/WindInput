@@ -390,10 +390,21 @@ pub(crate) struct State {
     /// 用户是否开启常驻工具栏（菜单开关；与“当前是否激活”正交）。
     pub(crate) toolbar_visible: bool,
     /// 本输入法当前是否处于激活态：IME_ACTIVATED/FocusGained 置真；
-    /// IME_DEACTIVATED（切换输入法）与 FocusLost（失焦，含“每应用独立输入法”下切到
-    /// 别的输入法的应用）置假。工具栏仅在激活态显示，对齐 Go toolbar_reducer 的
-    /// `imeActivated && userWantsVisible` 公式；隐藏经 UI 层 50ms 防抖消除切换闪烁。
+    /// IME_DEACTIVATED（切换输入法）与 FocusLost 的 `Thread` reason（整个应用失去前台，
+    /// 含“每应用独立输入法”下切到别的输入法的应用）置假。
+    ///
+    /// ⚠ 本字段只表达「本输入法是否在为某个宿主服务」，**不表达「焦点在不在可编辑控件
+    /// 里」**——后者是 [`Self::has_edit_context`]。两者变化时机不同（前者随应用切换，
+    /// 后者随控件切换），曾经挤在这一个布尔量里，导致应用内点到非文本框时无法表达，
+    /// 工具栏永不隐藏（实测 LogExpert / 文件管理器，2026-07-26）。
     pub(crate) ime_active: bool,
+    /// 焦点当前是否落在可编辑控件里。focus_gained 置真；FocusLost 的 `CtxLost` /
+    /// `NoEditCtx` / `Thread` reason 置假（`DocChanged` 不动——换文档后由随后的
+    /// focus_gained 或 no-edit-ctx 分支重新定夺）。
+    ///
+    /// 与 [`Self::ime_active`] 正交：应用还在前台、输入法仍激活，但焦点可能落在
+    /// 不可输入的地方（文件列表、日志面板），此时工具栏应当隐藏。
+    pub(crate) has_edit_context: bool,
     pub(crate) caps_lock: bool,
     pub(crate) input_buffer: String,
     /// 编码区光标：`input_buffer` 内的字节偏移，定义域 `[0, input_buffer.len()]`。
@@ -1150,6 +1161,7 @@ impl Coordinator {
                 filter_mode: wind_candidate::FilterMode::from_str(&config.input.filter_mode),
                 toolbar_visible: config.ui.toolbar.visible, // 启动初值来自配置(运行时可菜单切换)
                 ime_active: false, // 启动未激活：工具栏待 IME_ACTIVATED/FocusGained 才显示
+                has_edit_context: false, // 同上：焦点尚未落到任何可编辑控件
                 caps_lock: false,
                 input_buffer: String::new(),
                 input_cursor_pos: 0,
@@ -1390,12 +1402,23 @@ impl Coordinator {
             .last_input_diag
             .lock()
             .unwrap_or_else(|e| e.into_inner());
+        // 取 state 快照：HUD 要显示决定工具栏可见性的两个正交状态位。
+        // 先 drop 掉 last_input_diag 的锁再取 state 锁，避免与其它路径形成反序嵌套。
+        let (process_name, pid, disabled, reason, mask) =
+            (d.process_name.clone(), d.pid, d.disabled, d.reason, d.mask);
+        drop(d);
+        let (ime_active, has_edit_context) = {
+            let s = self.state.lock().unwrap_or_else(|e| e.into_inner());
+            (s.ime_active, s.has_edit_context)
+        };
         let view = wind_ui::manager::InputDiagView {
-            process_name: d.process_name.clone(),
-            pid: d.pid,
-            disabled: d.disabled,
-            reason_text: crate::input_diag::reason_label(d.reason).to_string(),
-            mask: d.mask,
+            process_name,
+            pid,
+            disabled,
+            reason_text: crate::input_diag::reason_label(reason).to_string(),
+            mask,
+            ime_active,
+            has_edit_context,
         };
         let _ = self
             .ui_tx
@@ -4868,6 +4891,10 @@ impl MessageHandler for Coordinator {
             // 焦点进入文本框 = 本输入法激活（对齐 Go HandleFocusGained → SetIMEActivated(true)）。
             // 不依赖 IME_ACTIVATED 的到达时机，确保工具栏在焦点到达时即可显示。
             state.ime_active = true;
+            // DLL 只对「有可编辑上下文」的 DocMgr 发 focus_gained（无上下文走 NoEditCtx
+            // 分支），故收到本命令即等价于"焦点在可编辑控件里"。这是 has_edit_context
+            // 唯一的置真路径之一，另一处是 handle_ime_activated 的兜底。
+            state.has_edit_context = true;
         }
         // 撤销上屏计数复位：进入新文本框，光标前是新上下文，下次 undo 退化删 1
         // （首次聚焦无配对 focus_lost 时，本处兜底）。
@@ -4895,40 +4922,64 @@ impl MessageHandler for Coordinator {
         Some(status)
     }
 
-    fn handle_focus_lost(&self, client_token: u64) {
+    fn handle_focus_lost(&self, client_token: u64, reason: FocusLostReason) {
         // 独立日志行：失焦此前在服务端日志里完全不可见，只能靠 TSF 日志反推 HideToolbar
         // 的来源（2026-07-26 工具栏闪隐排查即因此多绕一圈）。token 便于与 DLL 日志的
         // `Sending focus_lost token=…` 对齐到具体宿主实例。
-        tracing::debug!("handle_focus_lost: token={:#x}", client_token);
+        tracing::debug!(
+            "handle_focus_lost: token={:#x} reason={:?}",
+            client_token,
+            reason
+        );
         if self.is_stale_focus_event(client_token, "handle_focus_lost") {
             return;
         }
+        // 三项后果彼此独立，由 reason 决定各自是否发生（矩阵见 FocusLostReason）。
+        // 一刀切地全做，就是 CtxLost 清输入态复发「首字符直接上屏」的由来；
+        // 一刀切地全不做，就是应用内点到非文本框工具栏永不隐藏的由来。
+        let clears_input = reason.clears_input();
         // 词频已即时写入 redb（事务持久），失焦无需再落盘。
         {
             let mut s = self.state.lock().unwrap_or_else(|e| e.into_inner());
-            // 失焦即视为非激活并隐藏工具栏：用户开启系统“为每个应用窗口使用不同输入法”时，
-            // 切到使用别的输入法的应用不会触发 IME_DEACTIVATED，只有 FocusLost。工具栏隐藏经
-            // UI 层 50ms 防抖——若紧接着 FocusGained（同输入法切窗/切文本框）会取消隐藏，无闪烁。
-            s.ime_active = false;
-            // 焦点切换后旧 composition 上下文已失效，清理输入态，避免候选残留到新焦点。
-            s.input_buffer.clear();
-            s.preedit.clear();
-            s.candidates.clear();
-            s.menu_open = false; // 复位菜单态，否则下一个键被 forward_menu_key 吞掉
-            self.reset_exclusive_modes(&mut s); // 失焦丢弃临时英文/拼音/快捷输入残留
+            if reason.clears_ime_active() {
+                // 整个应用失去前台。用户开启系统“为每个应用窗口使用不同输入法”时，切到用
+                // 别的输入法的应用不会触发 IME_DEACTIVATED，只有 FocusLost。工具栏隐藏经
+                // UI 层 50ms 防抖——紧接着若有 FocusGained 会取消隐藏，无闪烁。
+                s.ime_active = false;
+            }
+            if reason.clears_edit_context() {
+                // 焦点不在可编辑控件里了 → 工具栏隐藏。DocChanged 不走这里：换文档后
+                // 由随后的 focus_gained（可编辑）或 NoEditCtx（不可编辑）重新定夺。
+                s.has_edit_context = false;
+            }
+            if clears_input {
+                // 焦点切换后旧 composition 上下文已失效，清理输入态，避免候选残留到新焦点。
+                s.input_buffer.clear();
+                s.preedit.clear();
+                s.candidates.clear();
+                s.menu_open = false; // 复位菜单态，否则下一个键被 forward_menu_key 吞掉
+                self.reset_exclusive_modes(&mut s); // 失焦丢弃临时英文/拼音/快捷输入残留
+            }
         }
-        self.clear_pair_tracker(); // 失焦：配对上下文失效，清栈防下次聚焦后跳出键误判
-        // 撤销上屏计数复位：换窗/换文本框后光标前已非「刚上屏那段」，下次 undo 退化删 1。
-        self.last_commit_len
-            .store(1, std::sync::atomic::Ordering::Relaxed);
-        // 失焦即清抑制态：密码框失焦到下次 focus_gained 之间无控件收键，suppress 残留虽不可利用，
-        // 但属状态卫生隐患——独立 atomic，无锁依赖，不与上面的 state 锁冲突。
-        self.password_suppress
-            .store(false, std::sync::atomic::Ordering::Relaxed);
-        self.notify_toolbar_async(); // 隐藏工具栏（防抖，异步避免阻塞 bridge 线程）
-        self.notify_ui_hide(); // 隐藏候选窗 + 弹出菜单（HideCandidates 连带关菜单）
-        self.hide_tip(); // 失焦隐藏状态提示（常驻模式尤需）
-        self.terminate_auto_phrase("focus_lost"); // 换窗口 = 一段输入结束
+        if clears_input {
+            self.clear_pair_tracker(); // 失焦：配对上下文失效，清栈防下次聚焦后跳出键误判
+            // 撤销上屏计数复位：换窗/换文本框后光标前已非「刚上屏那段」，下次 undo 退化删 1。
+            self.last_commit_len
+                .store(1, std::sync::atomic::Ordering::Relaxed);
+            // 失焦即清抑制态：密码框失焦到下次 focus_gained 之间无控件收键，suppress 残留虽不
+            // 可利用，但属状态卫生隐患——独立 atomic，无锁依赖，不与上面的 state 锁冲突。
+            self.password_suppress
+                .store(false, std::sync::atomic::Ordering::Relaxed);
+        }
+        // 工具栏可见性无论哪种 reason 都要重算：ime_active 与 has_edit_context 任一变化都影响它。
+        self.notify_toolbar_async(); // 防抖，异步避免阻塞 bridge 线程
+        if clears_input {
+            self.notify_ui_hide(); // 隐藏候选窗 + 弹出菜单（HideCandidates 连带关菜单）
+            self.hide_tip(); // 失焦隐藏状态提示（常驻模式尤需）
+            self.terminate_auto_phrase("focus_lost"); // 换窗口 = 一段输入结束
+        }
+        // CtxLost 刻意不碰候选窗：输入态还在（Excel 抖动保护），候选窗应跟随输入态而非
+        // 焦点。真正离开时随后的 DocChanged / Thread 会收口。
     }
 
     fn get_current_mode(&self, client_token: u64) -> (bool, bool) {
@@ -4972,10 +5023,15 @@ impl MessageHandler for Coordinator {
         // remember=true 保持全局记忆；state_scope="app" 恢复该应用的会话记忆。
         // 同时构成对 compartment 脏事件污染的自愈兜底（详见 TextService.cpp 门卫修复）。
         self.apply_initial_mode(client_token, true);
-        self.state
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .ime_active = true;
+        {
+            let mut s = self.state.lock().unwrap_or_else(|e| e.into_inner());
+            s.ime_active = true;
+            // 兜底置真：宿主主动激活本输入法，通常意味着焦点已进入输入框。
+            // 若某些宿主 IME_ACTIVATED 之后不补发 focus_gained，而这里不置位，
+            // has_edit_context 将永远停在 false —— 工具栏再也不显示。
+            // 该字段的失效方向不对称：多显示只是碍眼，永不显示是功能失效，故取宽松侧。
+            s.has_edit_context = true;
+        }
         let status = self.build_status();
         self.push_activation_status(client_token);
         self.notify_toolbar_async(); // 激活态 → 工具栏显示（异步，避免 is_foreground_fullscreen 阻塞 bridge 线程）
@@ -4995,6 +5051,7 @@ impl MessageHandler for Coordinator {
         {
             let mut s = self.state.lock().unwrap_or_else(|e| e.into_inner());
             s.ime_active = false;
+            s.has_edit_context = false; // 切走本输入法：谈不上焦点在不在可编辑控件里
             s.input_buffer.clear();
             s.preedit.clear();
             s.candidates.clear();
@@ -6113,12 +6170,87 @@ mod focus_ownership_tests {
     //! 把 `ime_active` 清成 false，工具栏闪一下即隐藏。
     use super::*;
 
-    /// 已有宿主 `token` 处于激活态的协调器。
+    /// 已有宿主 `token` 处于激活态、且焦点在可编辑控件里的协调器。
     fn activated(token: u64) -> Arc<Coordinator> {
         let c = Coordinator::new_headless(Config::default(), None);
         c.push_server.set_active_token(token);
-        c.state.lock().unwrap().ime_active = true;
+        let mut s = c.state.lock().unwrap();
+        s.ime_active = true;
+        s.has_edit_context = true;
+        drop(s);
         c
+    }
+
+    /// 四种 reason 的后果矩阵——本设计的核心契约。
+    ///
+    /// 三项后果彼此独立，任何一格改错都会复活一个已修的缺陷：
+    /// - `CtxLost` 那行的「输入态不清」＝ Excel「首字符不进编码、直接上屏」的防线；
+    /// - `DocChanged` 那行的「ime_active 不动」＝ 同宿主换文档不再误关工具栏；
+    /// - 各行的 `has_edit_context`＝ 应用内点到非文本框时工具栏能否隐藏。
+    #[test]
+    fn focus_lost_reason_consequence_matrix() {
+        // (reason, ime_active 保留?, has_edit_context 保留?, 输入态保留?)
+        let cases = [
+            (FocusLostReason::Thread, false, false, false),
+            (FocusLostReason::DocChanged, true, true, false),
+            (FocusLostReason::CtxLost, true, false, true),
+            (FocusLostReason::NoEditCtx, true, false, false),
+        ];
+        for (reason, keep_ime, keep_edit, keep_input) in cases {
+            let c = activated(NOTEPAD);
+            c.state.lock().unwrap().input_buffer.push_str("abc");
+
+            c.handle_focus_lost(NOTEPAD, reason);
+
+            let s = c.state.lock().unwrap();
+            assert_eq!(
+                s.ime_active, keep_ime,
+                "{reason:?}: ime_active 应为 {keep_ime}"
+            );
+            assert_eq!(
+                s.has_edit_context, keep_edit,
+                "{reason:?}: has_edit_context 应为 {keep_edit}"
+            );
+            assert_eq!(
+                !s.input_buffer.is_empty(),
+                keep_input,
+                "{reason:?}: 输入态保留应为 {keep_input}"
+            );
+        }
+    }
+
+    /// CtxLost 来自 DocMgr 噪声层（Excel 同一 DocMgr 6ms 内掉了又回），在那里清输入态
+    /// 就是「首字符直接上屏」的根因。单独立一条守住这个不变量。
+    #[test]
+    fn ctx_lost_never_touches_input_buffer() {
+        let c = activated(NOTEPAD);
+        c.state.lock().unwrap().input_buffer.push_str("nihao");
+        c.handle_focus_lost(NOTEPAD, FocusLostReason::CtxLost);
+        assert_eq!(
+            c.state.lock().unwrap().input_buffer,
+            "nihao",
+            "CtxLost 绝不可清输入态，否则复发 Excel 首字符丢失"
+        );
+    }
+
+    /// 陈旧失焦被丢弃时，四种 reason 都不得改动任何状态。
+    #[test]
+    fn stale_focus_lost_is_inert_for_all_reasons() {
+        for reason in [
+            FocusLostReason::Thread,
+            FocusLostReason::DocChanged,
+            FocusLostReason::CtxLost,
+            FocusLostReason::NoEditCtx,
+        ] {
+            let c = activated(NOTEPAD);
+            c.handle_focus_lost(TERMINAL, reason);
+            let s = c.state.lock().unwrap();
+            assert!(s.ime_active, "{reason:?}: 陈旧失焦不得清 ime_active");
+            assert!(
+                s.has_edit_context,
+                "{reason:?}: 陈旧失焦不得清 has_edit_context"
+            );
+        }
     }
 
     const NOTEPAD: u64 = 0x0000_3644_0000_0001;
@@ -6127,7 +6259,7 @@ mod focus_ownership_tests {
     #[test]
     fn stale_focus_lost_keeps_activation() {
         let c = activated(NOTEPAD);
-        c.handle_focus_lost(TERMINAL);
+        c.handle_focus_lost(TERMINAL, FocusLostReason::Thread);
         assert!(
             c.state.lock().unwrap().ime_active,
             "旧宿主迟到的失焦不得清激活态，否则工具栏闪一下即隐藏"
@@ -6137,7 +6269,7 @@ mod focus_ownership_tests {
     #[test]
     fn own_focus_lost_clears_activation() {
         let c = activated(NOTEPAD);
-        c.handle_focus_lost(NOTEPAD);
+        c.handle_focus_lost(NOTEPAD, FocusLostReason::Thread);
         assert!(
             !c.state.lock().unwrap().ime_active,
             "当前活动客户端自己失焦仍须正常清激活态"
@@ -6147,7 +6279,7 @@ mod focus_ownership_tests {
     #[test]
     fn legacy_zero_token_still_clears() {
         let c = activated(NOTEPAD);
-        c.handle_focus_lost(0);
+        c.handle_focus_lost(0, FocusLostReason::Thread);
         assert!(
             !c.state.lock().unwrap().ime_active,
             "旧 DLL 不带 token，保守放行以保持既有行为"
@@ -6319,7 +6451,7 @@ mod input_diag_tests {
             c.password_suppress.load(Relaxed),
             "前置条件：密码框抑制应已置位"
         );
-        c.handle_focus_lost(0);
+        c.handle_focus_lost(0, FocusLostReason::Thread);
         assert!(
             !c.password_suppress.load(Relaxed),
             "失焦后应清除密码框抑制态，避免残留到下次 focus_gained 之前"

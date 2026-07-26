@@ -163,14 +163,21 @@ public:
 
     // 输入态整体清理：结束 composition + 通知服务端清 buffer + 复位 KeyEventSink 会话态。
     // 触发时机**不是**「失去焦点」而是「离开了原来那个文档」——失焦那一刻无从区分抖动
-    // 与真正的切换（见 OnSetFocus 判据注释）。三条进入路径共用本函数，靠 _focusLostSent
-    // 去重。pDocMgrHint 传**离开的那个 doc**（composition 就建在它上面），EndComposition
-    // 会直接采信它而不再问 GetFocus()——此刻焦点可能已经在新文档上了。
+    // 与真正的切换（见 OnSetFocus 判据注释）。两条进入路径共用本函数（OnKillThreadFocus /
+    // doc_changed），靠 _focusLostSent 去重。pDocMgrHint 传**离开的那个 doc**（composition
+    // 就建在它上面），EndComposition 会直接采信它而不再问 GetFocus()——此刻焦点可能已经
+    // 在新文档上了。
+    // reason 取 FOCUS_LOST_REASON_*（THREAD / DOC_CHANGED），决定服务端清哪些状态。
     // sendFocusLost=FALSE 时只做本地清理、不通知服务端失焦：新 DocMgr 若会被
     // XamlIsland locked 守卫跳过 focus_gained，发出去的 focus_lost 就没有配对者，
     // 服务端 ime_active 会被永久清掉（实测 explorer 地址栏工具栏消失）。
-    void CleanupInputStateForDocChange(ITfDocumentMgr* pDocMgrHint, const wchar_t* reason,
+    void CleanupInputStateForDocChange(ITfDocumentMgr* pDocMgrHint, uint8_t reason,
                                        BOOL sendFocusLost = TRUE);
+
+    // 焦点离开可编辑控件时通知服务端隐藏工具栏（发 FOCUS_LOST_REASON_CTX_LOST）。
+    // **只翻可见性标志，不碰输入态**——这是它能在 DocMgr 噪声层安全调用的前提，
+    // 实现处有完整说明。靠 _editCtxReported 去重。
+    void _ReportEditContextLost();
 
     // Top-code commit: accumulate the committed text into the pending prefix and
     // keep it INSIDE the composition (Microsoft IME behavior — the real document
@@ -367,8 +374,14 @@ private:
     ITfDocumentMgr* _pLastActiveDocMgr;
     // focus_lost 已发出且尚未被 focus_gained 复位。SendFocusLost 不幂等（服务端据此推进
     // 状态机），而清理可能从三条路径进入（换文档 / OnKillThreadFocus / 无可编辑上下文），
-    // 故需去重。
+    // 故需去重。⚠ CTX_LOST **不**置本标志：它不是真失焦，置了会让随后真正的
+    // thread_focus_lost 被吞掉，服务端的 ime_active 就永远清不掉（见 _ReportEditContextLost）。
     BOOL _focusLostSent;
+
+    // 已向服务端上报「当前焦点在可编辑控件里」（focus_gained 送达时置位）。
+    // 供 _ReportEditContextLost 在翻转沿去重——DocMgr 级失焦实测可达 60~98 次/秒，
+    // 不去重会造成 IPC 洪泛。
+    BOOL _editCtxReported;
 
     // Composition
     ITfComposition* _pComposition;

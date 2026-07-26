@@ -727,7 +727,7 @@ BOOL CIPCClient::SendSelectionChanged(uint16_t prevChar)
     return _SendBinaryMessage(CMD_SELECTION_CHANGED, &payload, sizeof(payload), true /* async */);
 }
 
-BOOL CIPCClient::SendFocusLost()
+BOOL CIPCClient::SendFocusLost(uint8_t reason)
 {
     if (!IsConnected())
     {
@@ -738,10 +738,15 @@ BOOL CIPCClient::SendFocusLost()
     // active one. Without it, this message — which OnKillThreadFocus emits ~100ms after the
     // DocMgr-level focus loss — lands after the *next* host's focus_gained and clears the
     // activation that host just established (toolbar flashes on, then hides).
-    ClientTokenPayload payload;
+    //
+    // reason 决定服务端清哪些状态：THREAD 清激活态、DOC_CHANGED 只清输入态、
+    // CTX_LOST 只隐工具栏（详见 BinaryProtocol.h 的 FOCUS_LOST_REASON_* 注释）。
+    FocusLostPayload payload;
     payload.clientToken = _clientToken;
+    payload.reason = reason;
 
-    _LogDebug(L"Sending focus_lost (async): token=0x%016llX", (unsigned long long)_clientToken);
+    _LogDebug(L"Sending focus_lost (async): token=0x%016llX reason=%u",
+              (unsigned long long)_clientToken, (unsigned)reason);
     // Send async - no response needed for focus lost
     return _SendBinaryMessage(CMD_FOCUS_LOST, &payload, sizeof(payload), true /* async */);
 }

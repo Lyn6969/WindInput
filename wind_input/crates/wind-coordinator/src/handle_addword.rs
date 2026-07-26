@@ -926,7 +926,7 @@ mod tests {
         let c = coord("undo_focus");
         c.note_commit_action(&Coordinator::commit_action("世界".into(), true));
         assert_eq!(c.last_commit_len.load(Ordering::Relaxed), 2);
-        c.handle_focus_lost(0);
+        c.handle_focus_lost(0, wind_bridge::handler::FocusLostReason::Thread);
         assert_eq!(
             c.last_commit_len.load(Ordering::Relaxed),
             1,

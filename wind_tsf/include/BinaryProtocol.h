@@ -414,9 +414,9 @@ struct IMEActivatedPayload
 };
 static_assert(sizeof(IMEActivatedPayload) == 8, "IMEActivatedPayload must be 8 bytes");
 
-// CMD_FOCUS_LOST / CMD_IME_DEACTIVATED payload (8 bytes, same shape as IMEActivatedPayload).
+// CMD_IME_DEACTIVATED payload (8 bytes, same shape as IMEActivatedPayload).
 //
-// Added in v0.111.4. These two used to carry an empty payload; the service then had no way to
+// Added in v0.111.4. This used to carry an empty payload; the service then had no way to
 // tell *which* instance lost focus and unconditionally cleared its single global ime_active.
 // That breaks on every cross-host switch: OnKillThreadFocus fires ~100ms after DocMgr-level
 // focus loss (deliberate, see TextService.cpp), so the old host's focus_lost always lands
@@ -429,6 +429,39 @@ struct ClientTokenPayload
     uint64_t clientToken;
 };
 static_assert(sizeof(ClientTokenPayload) == 8, "ClientTokenPayload must be 8 bytes");
+
+// ── CMD_FOCUS_LOST reason（v0.111.5 起）─────────────────────────────────────────
+// "失焦"在 TSF 里是四件语义不同的事，挤在一个命令里会逼服务端做错误的一刀切：过去
+// 一律「清激活态 + 清输入态」，于是同宿主换文档也会把工具栏关掉，而 DocMgr 级失焦则
+// 因为不敢清输入态干脆什么都不发、工具栏永不隐藏。
+//
+// 服务端按 reason 分派三项独立后果（见 Rust FocusLostReason）：
+//
+//   reason            ime_active   has_edit_context   输入态
+//   THREAD      (0)     false          false           清     整个应用失去前台
+//   DOC_CHANGED (1)     不动           不动            清     同宿主内换文档
+//   CTX_LOST    (2)     不动           false          **不清** 焦点离开可编辑控件
+//   NO_EDIT_CTX (3)     不动           false           清     换到无可编辑控件的文档
+//
+// CTX_LOST 之所以必须「不清输入态」：它来自 DocMgr 级失焦，那是噪声层（Excel 实测同一
+// DocMgr 6ms 内掉了又回），在那里销毁输入态正是「首字符不进编码、直接上屏」的根因。
+// 它只翻可见性标志，所以能安全地在噪声层调用。
+// NO_EDIT_CTX 与之相反：新文档确实没有可输入的地方（QQ Ctrl+1 切会话），残留 buffer
+// 无处可去，必须清。
+//
+// 兼容：载荷 < 9 字节时服务端取 reason=THREAD，即旧 DLL 的隐含语义，行为不变。
+constexpr uint8_t FOCUS_LOST_REASON_THREAD      = 0;
+constexpr uint8_t FOCUS_LOST_REASON_DOC_CHANGED = 1;
+constexpr uint8_t FOCUS_LOST_REASON_CTX_LOST    = 2;
+constexpr uint8_t FOCUS_LOST_REASON_NO_EDIT_CTX = 3;
+
+// CMD_FOCUS_LOST payload (9 bytes)。在 #pragma pack(push,1) 区内，故 uint8 紧跟 uint64。
+struct FocusLostPayload
+{
+    uint64_t clientToken;
+    uint8_t  reason;
+};
+static_assert(sizeof(FocusLostPayload) == 9, "FocusLostPayload must be 9 bytes");
 
 // CMD_FOCUS_GAINED extended payload (38 bytes = CaretPayload + clientToken + inputScopeMask
 // + disabled + reason)
