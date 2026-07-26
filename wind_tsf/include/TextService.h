@@ -166,7 +166,11 @@ public:
     // 与真正的切换（见 OnSetFocus 判据注释）。三条进入路径共用本函数，靠 _focusLostSent
     // 去重。pDocMgrHint 传**离开的那个 doc**（composition 就建在它上面），EndComposition
     // 会直接采信它而不再问 GetFocus()——此刻焦点可能已经在新文档上了。
-    void CleanupInputStateForDocChange(ITfDocumentMgr* pDocMgrHint, const wchar_t* reason);
+    // sendFocusLost=FALSE 时只做本地清理、不通知服务端失焦：新 DocMgr 若会被
+    // XamlIsland locked 守卫跳过 focus_gained，发出去的 focus_lost 就没有配对者，
+    // 服务端 ime_active 会被永久清掉（实测 explorer 地址栏工具栏消失）。
+    void CleanupInputStateForDocChange(ITfDocumentMgr* pDocMgrHint, const wchar_t* reason,
+                                       BOOL sendFocusLost = TRUE);
 
     // Top-code commit: accumulate the committed text into the pending prefix and
     // keep it INSIDE the composition (Microsoft IME behavior — the real document

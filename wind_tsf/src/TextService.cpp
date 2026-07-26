@@ -1332,6 +1332,14 @@ static constexpr UINT     kFocusCheckIntervalMs = 500;
 // 不会被常规切换触发，又能抓住宿主 churn 焦点导致的堆积。
 static constexpr double kSlowFocusWarnMs = 20.0;
 
+// XamlIsland / transient locked DocMgr 标志：dynFlags 的 0x20 位稳定标记 Explorer 的
+// XamlIsland 容器 DocMgr（RequestEditSession 对它返回 TF_E_NOLOCK）。OnSetFocus 对这类
+// DocMgr 跳过 focus_gained（防 composition replay 到不稳定文档）。
+// 提为文件级常量是因为 OnSetFocus 里有**两处**要判它：跳过 focus_gained 的守卫本身，
+// 以及 doc_changed 收口——后者必须预判前者会不会命中，否则会发出一个没有配对
+// focus_gained 的 focus_lost（详见两处注释）。
+static constexpr DWORD kXamlIslandLockedFlag = 0x20;
+
 // 激活静默期：ActivateEx 之后这段时间内的 compartment 变化视为系统初始化同步而非用户
 // 操作。实测激活后 ~96ms 出现一次 CONVERSION 变化，取 250ms 留 2.6 倍余量。
 //
@@ -1365,6 +1373,7 @@ STDAPI CTextService::OnSetThreadFocus()
     WIND_LOG_DEBUG(L"OnSetThreadFocus called\n");
     _hasThreadFocus = TRUE;
     // 拿回 thread focus：候选可见性热键由 NotifyCandidatesVisibilityChanged 驱动，
+
     // 这里不主动补——切焦点时候选窗通常已经消失。
     // 加词热键不依赖候选，重新评估（若当前中文+文本框则重新注册）。
     _ReevaluateAddWordHotkey();
@@ -2028,7 +2037,22 @@ STDAPI CTextService::OnSetFocus(ITfDocumentMgr* pDocMgrFocus, ITfDocumentMgr* pD
             // 真的换了文档：在**旧** doc 上收口。传 hint 是必须的——此刻 GetFocus() 已指向
             // 新 doc，不传的话 EndComposition 会拿新 context 的 cookie 去清旧 context 的
             // range，轻则失败，重则动到新文档的内容。
-            CleanupInputStateForDocChange(_pLastActiveDocMgr, L"doc_changed");
+            //
+            // ⚠ 收口会发 focus_lost，而它**必须与随后的 focus_gained 配对**。下面的
+            // XamlIsland locked 守卫会对 dynFlags&0x20 的新 DocMgr 跳过 focus_gained——
+            // 两个决策各自都对，组合起来却让服务端只收到半边失焦：ime_active 被清掉后
+            // 再没有东西恢复它，工具栏就此消失。实测 explorer 地址栏（2026-07-26）：点
+            // 地址栏 → 换到 transient DocMgr → 发 lost、跳过 gained，用户停在该 DocMgr
+            // 上正常打字，4 秒内再无任何 focus_gained（守卫旧注释断言的「后续稳定 DocMgr
+            // 会补一个 gained」不成立）。
+            // 故此处预判守卫是否将命中：会命中就不发这个 lost（焦点其实没离开本宿主的可
+            // 输入上下文，只是换了个 transient 容器）。EndComposition 等本地清理照常做。
+            // _DocMgrHasEditableContext 是纯查询（GetTop + GetStatus），提前问一次无副作用；
+            // 只在真正换文档时多查一次，不在焦点热路径上。
+            DWORD incomingDynFlags = 0;
+            _DocMgrHasEditableContext(pDocMgrFocus, &incomingDynFlags);
+            const BOOL willSkipFocusGained = (incomingDynFlags & kXamlIslandLockedFlag) != 0;
+            CleanupInputStateForDocChange(_pLastActiveDocMgr, L"doc_changed", !willSkipFocusGained);
         }
 
         // Register ITfTextLayoutSink on the new context to receive
@@ -2105,12 +2129,16 @@ STDAPI CTextService::OnSetFocus(ITfDocumentMgr* pDocMgrFocus, ITfDocumentMgr* pD
 
         // XamlIsland/transient locked DocMgr guard: dynFlags=0x20 consistently
         // marks Explorer's XamlIsland container DocMgrs where RequestEditSession
-        // returns TF_E_NOLOCK. Sending focus_gained would cause Go to replay
+        // returns TF_E_NOLOCK. Sending focus_gained would cause the service to replay
         // composition into this unstable DocMgr; when the user then clicks away
         // the composition text is committed at screen position (0,0).
-        // Skip focus_gained for these DocMgrs — the subsequent stable DocMgr
-        // focus_gained will arrive and handle composition replay correctly.
-        const DWORD kXamlIslandLockedFlag = 0x20;
+        // Skip focus_gained for these DocMgrs.
+        //
+        // ⚠ 旧注释断言「the subsequent stable DocMgr focus_gained will arrive」——**实测
+        // 不成立**：explorer 地址栏点击后用户就停在这个 transient DocMgr 上正常打字，
+        // 4 秒内再无第二个 focus_gained（2026-07-26 实测）。依赖它补配对是错的，因此
+        // 上面的 doc_changed 收口会预判本守卫是否命中、命中则不发 focus_lost。
+        // **改动本守卫的命中条件时，必须同步那一处的预判。**
         if (docMgrDynFlags & kXamlIslandLockedFlag)
         {
             WIND_LOG_INFO_FMT(
@@ -5135,16 +5163,20 @@ fallback:
 // 输入态整体清理。**只应由「离开了原来那个文档」的三条路径调用**，不要挂回失焦回调：
 // DocMgr 级失焦是噪声信号（VSCode 实测一次应用切换伴随 5 次 DocMgr 焦点事件，Excel 更
 // 是同一指针 6ms 内掉了又回），在那里销毁用户输入正是「首字符直接上屏」的根因。
-void CTextService::CleanupInputStateForDocChange(ITfDocumentMgr* pDocMgrHint, const wchar_t* reason)
+void CTextService::CleanupInputStateForDocChange(ITfDocumentMgr* pDocMgrHint, const wchar_t* reason,
+                                                 BOOL sendFocusLost)
 {
-    WIND_LOG_DEBUG_FMT(L"CleanupInputStateForDocChange reason=%ls hint=0x%p focusLostSent=%d",
-                       reason ? reason : L"-", pDocMgrHint, _focusLostSent ? 1 : 0);
+    WIND_LOG_DEBUG_FMT(L"CleanupInputStateForDocChange reason=%ls hint=0x%p focusLostSent=%d sendLost=%d",
+                       reason ? reason : L"-", pDocMgrHint, _focusLostSent ? 1 : 0, sendFocusLost ? 1 : 0);
 
     // 先结束 composition 再发 focus_lost：EndComposition 会清空 composition 范围的文本，
     // 顺序反了则服务端已清 buffer 而宿主里仍留着未清的 composition 文本。
     EndComposition(pDocMgrHint);
 
-    if (!_focusLostSent && _pIPCClient != nullptr && _pIPCClient->IsConnected())
+    // sendFocusLost=FALSE：本地清理照做，但**不通知服务端失焦**。用于「新 DocMgr 会被
+    // XamlIsland locked 守卫跳过 focus_gained」的情形——发了就没人配对，服务端的
+    // ime_active 会被永久清掉（见 OnSetFocus doc_changed 分支注释）。
+    if (sendFocusLost && !_focusLostSent && _pIPCClient != nullptr && _pIPCClient->IsConnected())
     {
         _pIPCClient->SendFocusLost();
         _focusLostSent = TRUE;
