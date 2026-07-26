@@ -161,6 +161,35 @@ private:
     // project_top_commit_mode）。任何新的「算不算有会话」的状态，只加到这里。
     BOOL _HasInputSession();
 
+    // 智能符号 hold 预览态下「我们无法代劳、必须交给宿主」的键：走「吃键 → 收口 → 重放」，
+    // 见 OnKeyDown 里的调用点注释。回车已真机验证，其余同族键机制相同。
+    //
+    // 判据是「会被吃键门控捕获、且服务端在空缓冲下回 PassThrough」的键，**不是**按键语义。
+    // 全角态下空格/数字改走 CommitText（字符由我们输出），那时 pfEaten 为真，重放分支的
+    // `!pfEaten` 守卫直接挡住——故此处无须、也不该按全半角区分，列全即可。
+    // 数字键必须在列：hold 期间无候选，它被 session_select_or_page 吃掉后服务端回
+    // PassThrough，漏列就退回「吃了再吐」，EverEdit 这类宿主下数字会丢。
+    //
+    // 仍未覆盖 Ctrl/Alt 组合：它们走 isCtrlAltCleanup，响应多为 Ack（pfEaten 仍为真），
+    // 进不到重放分支——hold 期间按 Ctrl+S 仍会被吃掉，需另行处理。
+    BOOL _IsHoldReplayKey(WPARAM wParam) const
+    {
+        if (wParam >= '0' && wParam <= '9')                 return TRUE; // 主键盘数字
+        if (wParam >= VK_NUMPAD0 && wParam <= VK_NUMPAD9)   return TRUE; // 小键盘数字
+        switch (wParam)
+        {
+        case VK_RETURN: case VK_SPACE:  case VK_BACK: case VK_DELETE:
+        case VK_ESCAPE: case VK_TAB:
+        case VK_LEFT:   case VK_RIGHT:  case VK_UP:   case VK_DOWN:
+        case VK_HOME:   case VK_END:    case VK_PRIOR: case VK_NEXT:
+            return TRUE;
+        default:
+            return FALSE;
+        }
+    }
+    // 把一个已被我们吃掉的键原样重放给宿主（skip 表标记，避免自己的钩子二次处理）。
+    void _ReplayKeyToHost(WORD vk);
+
     WCHAR _lastPassthroughDigit; // Last digit key that passed through (for smart punct fallback in apps where TSF can't read text)
     uint32_t _pendingKeyUpKey;   // Key code of pending KeyUp toggle key
     uint32_t _pendingKeyUpModifiers; // Modifiers when KeyDown was pressed

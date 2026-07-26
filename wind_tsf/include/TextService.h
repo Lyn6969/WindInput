@@ -272,6 +272,12 @@ public:
     // 若 HoldComposition 计时器活跃，立即提交中文符号（宿主中断组合时调用，如 PassThrough 键）。
     void FlushHoldCompositionIfActive();
 
+    // HoldComposition 计时器是否活跃 ⇔ 组合内只有待定的中文符号（外加已承诺提交的 prefix），
+    // 不含任何编码——「智能符号预览态」的精确判据。
+    // ⚠️ 判据只能是计时器：`_pendingCommitPrefix` 非空在顶码 pre_confirm 聚合时同样成立，
+    // 那是真输入会话，拿它当判据会把顶码路径一并误判掉。
+    BOOL IsHoldCompositionActive() const { return _hHoldTimer != 0; }
+
     // 若 HoldComposition 计时器活跃，把 held 符号定格并入 _pendingCommitPrefix（不 commit、
     // 不动文档），供"定格旧符号 + 立即更新/开启组合"场景（连续智能符号、符号后快速输入）
     // 在单一 EditSession 内完成显示更新——规避「commit+立即重启组合」在 Chromium/WPS

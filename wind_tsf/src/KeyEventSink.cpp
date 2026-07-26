@@ -1184,9 +1184,42 @@ STDAPI CKeyEventSink::OnKeyDown(ITfContext* pContext, WPARAM wParam, LPARAM lPar
         return S_OK;
     }
 
+    // 智能符号 hold 预览态须**在**响应处理前采样：PassThrough 分支会把组合收口掉，
+    // 之后 IsHoldCompositionActive() 就查不到了。
+    BOOL holdActiveBeforeResponse = _pTextService->IsHoldCompositionActive();
+
     // SYNC: Wait for response and handle it directly
     // This is simpler and matches Weasel's architecture
     *pfEaten = _HandleServiceResponse();
+
+    // ── hold 预览态 + 无法代劳的键：吃键 → 收口 → 重放 ─────────────────────────
+    // 走到这里意味着服务端回了 PassThrough（缓冲为空），且 _HandleServiceResponse 已在
+    // OnKeyDown 这个**合法的文档修改上下文**里把符号同步收口（实测日志
+    // `CommitText: TSF atomic commit succeeded`）。
+    //
+    // 为什么不能直接 return FALSE 让键透传（那是本改动前的行为）：
+    //   1. OnTestKeyDown 此前已按「有会话」吃了这个键，这里再吐成 FALSE 就是「吃了再吐」
+    //      翻转——记事本/Chromium 会补发，EverEdit 这类不补发的宿主直接丢键（实测
+    //      vk=0x0D：test_down eaten=1 → down eaten=0，符号上屏而回车消失）。
+    //   2. 就算宿主补发，**组合态活着时回车是宿主的通用语义「确认输入」而非换行**——
+    //      任何 IME 都一样。我们的 hold 是预览态，用户并不认为自己在输入中，于是回车
+    //      被静默吞掉（实测：只提交符号、不换行）。
+    //   3. 也不能靠更早收口来规避：曾在 OnTestKeyDown 里 Flush，写入同样成功、选区也
+    //      Collapse 到末尾了，真机却打出 `\n。`——宿主处理「TSF 文档变更」与「WM_KEYDOWN」
+    //      是两条独立路径，不保证前者先落地。我们没有任何 TSF 手段能强制它先消化写入。
+    //
+    // 故把两个动作都收进我们控制的顺序：吃掉原键（与 OnTestKeyDown 的决定一致，无翻转），
+    // 再用 SendInput 重放。宿主先看到收口后的文档，再看到一个与组合无关的普通按键。
+    if (holdActiveBeforeResponse && !(*pfEaten) && _IsHoldReplayKey(wParam))
+    {
+        _ReplayKeyToHost((WORD)wParam);
+        *pfEaten = TRUE;
+        _LogKeyDecision(L"down", _pTextService->GetFocusSessionId(), wParam, modifiers,
+                        CHotkeyManager::ClassifyInputKey(wParam, modifiers),
+                        isChineseMode, hasComposition, _hasCandidates, hasInputSession,
+                        TRUE, L"hold_commit_then_replay");
+        return S_OK;
+    }
 
     // 数字键"吃了又吐"缺口修复：有候选时数字键被 TSF eat（pfEaten=TRUE）发给 coordinator，
     // coordinator 返回 PassThrough → OnKeyDown 返 FALSE。此时 OnTestKeyDown 里
@@ -2459,6 +2492,36 @@ void CKeyEventSink::_SimulatePairKey(WORD vk)
     inputs[1].ki.wVk = vk;
     inputs[1].ki.dwFlags = KEYEVENTF_KEYUP;
     SendInput(2, inputs, sizeof(INPUT));
+}
+
+// 把一个已被我们吃掉的键原样重放给宿主。
+// 与 _SimulatePairKey 的区别：**不做修饰键 defer**。那边注入的是 VK_RIGHT（我们自己
+// 造的光标移动），物理按住的 Shift 叠上去会变成「Shift+→ 选中」，语义被污染；这里重放的
+// 是用户真按下的那个键，Shift/Ctrl 叠加恰恰还原用户本意（Shift+Enter 就该是 Shift+Enter）。
+void CKeyEventSink::_ReplayKeyToHost(WORD vk)
+{
+    // skip 条目**只压一个**（与 _SimulatePairKey 一致）：down 消费掉它，注入的 keyup 走
+    // 正常路径。看似该压两个（down/up 都是合成的），但那样更危险——若宿主不调
+    // OnTestKeyUp（本仓已知 mintty 类宿主有此怪癖），多出的条目会残留，把用户**下一次
+    // 真实按下的同一个键**静默吃掉。重放的都不是 toggle 键，keyup 走正常路径无副作用。
+    _PushSkipKey(vk);
+
+    INPUT inputs[2] = {};
+    inputs[0].type = INPUT_KEYBOARD;
+    inputs[0].ki.wVk = vk;
+    inputs[1].type = INPUT_KEYBOARD;
+    inputs[1].ki.wVk = vk;
+    inputs[1].ki.dwFlags = KEYEVENTF_KEYUP;
+    UINT sent = SendInput(2, inputs, sizeof(INPUT));
+    if (sent != 2)
+    {
+        // 注入失败＝这个键彻底消失（原键已被我们吃掉），且用户毫无感知。
+        // 必须留痕：否则现象是「hold 后按某键偶尔没反应」，无从诊断。
+        WIND_LOG_WARN_FMT(L"HoldReplay: SendInput sent %u of 2 for vk=0x%02X, key lost\n",
+                          sent, (uint32_t)vk);
+        return;
+    }
+    WIND_LOG_DEBUG_FMT(L"HoldReplay: replayed vk=0x%02X to host after commit\n", (uint32_t)vk);
 }
 
 bool CKeyEventSink::_AreModifiersHeld()
