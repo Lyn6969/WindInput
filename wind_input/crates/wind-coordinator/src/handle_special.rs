@@ -308,12 +308,18 @@ impl Coordinator {
                 }
             }
             keymap::VK_RETURN => {
-                // 空缓冲（只按了模式键、还没敲编码）：新增分支——commit 模式上屏模式键符号本身
-                // （原样不转换，补输被占用的符号，如 \）；clear 模式放弃退出（同原空缓冲行为）。
+                // clear 模式：整段放弃，不上屏任何内容。须先于下方各分支——此前该判断只写在
+                // 「空缓冲」分支内，导致「打了码再回车」仍走非空缓冲路径无条件上屏编码原文，
+                // 配置形同虚设（与主输入路径行为不一致）。
+                if self.enter_clears_composition() {
+                    self.exit_special_mode(state);
+                    self.notify_ui_hide();
+                    return KeyAction::ClearComposition;
+                }
+                // 空缓冲（只按了模式键、还没敲编码）：commit 模式上屏模式键符号本身
+                // （原样不转换，补输被占用的符号，如 \）。
                 if state.special_buffer.is_empty() {
-                    if self.rt().config.input.enter_behavior != "clear"
-                        && !state.special_prefix.is_empty()
-                    {
+                    if !state.special_prefix.is_empty() {
                         let sym = state.special_prefix.clone();
                         self.record_commit(
                             &sym,

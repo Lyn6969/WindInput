@@ -1287,6 +1287,16 @@ impl Coordinator {
         self.rt.read().unwrap_or_else(|e| e.into_inner()).clone()
     }
 
+    /// 回车键是否配置为「清空编码」（`input.enter_behavior = "clear"`）。
+    ///
+    /// 回车有五条彼此独立的处理路径（主输入 / 临时拼音 / 临时英文 / 混合输入 / 特殊模式），
+    /// 此判据由它们共用。此前各路径内联比较字符串，且**只判在「空缓冲」分支上**，
+    /// 于是「打了码再按回车」时配置静默失效、照旧上屏原码；收口成单一具名判据，
+    /// 使「某条路径没接」退化为「没有调用点」这种更容易发现的缺失。
+    pub(crate) fn enter_clears_composition(&self) -> bool {
+        self.rt().config.input.enter_behavior == "clear"
+    }
+
     /// 焦点/IME 激活时按 client_token 高 32 位的 PID 解析焦点进程名，缓存其 caret 兼容态
     /// （对齐 Go `HandleFocusGained` 设置 activeCompatRule）。按 pid 缓存：同进程命中直接返回，
     /// 避免每次焦点事件重复 OpenProcess。仅在重型/异步段调用，不在 DLL 同步阻塞路径上。
@@ -3338,8 +3348,7 @@ impl Coordinator {
                         self.record_commit(&buf, buf.len() as u32, -1, CommitSource::ModeSwitch);
                         let raw = format!("{}{}", state.committed_text, buf);
                         self.maybe_s2t(state, &raw)
-                    } else if !prefix.is_empty() && self.rt().config.input.enter_behavior != "clear"
-                    {
+                    } else if !prefix.is_empty() && !self.enter_clears_composition() {
                         // 只按了模式进入符（缓冲空）：原样上屏该前缀符号本身，与回车空缓冲上屏一致
                         // （enter_behavior=clear 时回车也不上屏，故一并放弃）。
                         self.record_commit(&prefix, 0, -1, CommitSource::Punctuation);
@@ -4272,7 +4281,7 @@ impl MessageHandler for Coordinator {
                 // Enter：按 enter_behavior 配置（对齐 Go handleEnter）——"clear" 清空编码
                 // (不上屏)；否则(commit)上屏「已转换前缀 + 剩余原码」。
                 if !state.input_buffer.is_empty() || !state.committed_text.is_empty() {
-                    if self.rt().config.input.enter_behavior == "clear" {
+                    if self.enter_clears_composition() {
                         state.committed_text.clear();
                         state.committed_segs.clear();
                         state.input_buffer.clear();

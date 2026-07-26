@@ -1,0 +1,67 @@
+# 回车键行为（`input.enter_behavior`）语义与实现收口
+
+## 配置
+
+| 值 | 语义 |
+|---|---|
+| `commit`（默认） | 回车上屏「已转换前缀 + 剩余原码」，然后退出组合 |
+| `clear` | 回车放弃整段组合，**不上屏任何内容**，退出组合 |
+
+## 回车有五条彼此独立的处理路径
+
+回车不是在一个地方处理的。各输入模式在分发阶段就被劫走，各自有一份 `VK_RETURN` 实现：
+
+| 路径 | 文件 | 劫持点 |
+|---|---|---|
+| 主输入 | `coordinator.rs` `VK_RETURN` 分支 | 默认路径 |
+| 临时拼音 | `handle_temp.rs::handle_temp_pinyin_key` | `coordinator.rs` `ModeKind::TempPinyin => return …` |
+| 临时英文 | `handle_temp.rs::handle_temp_english_key` | 同上，`ModeKind::TempEnglish` |
+| 混合 / 快捷输入 | `handle_mode.rs` | `ModeKind::Mix` |
+| 特殊模式（快符 / 生僻字） | `handle_special.rs` | `ModeKind::Special` |
+
+分发是 `return`，不是 fallthrough —— **主输入路径里的任何回车逻辑都不会惠及其余四条**。
+
+## 曾经的缺陷（已修）
+
+四个模式 handler 都把 `enter_behavior` 判断写在了 `if buffer.is_empty()` 的**内部**：
+
+```rust
+if state.xxx_buffer.is_empty() && state.committed_text.is_empty() {
+    if self.rt().config.input.enter_behavior != "clear" && !prefix.is_empty() { … }
+    return KeyAction::ClearComposition;
+}
+// 非空缓冲：上屏「已转换前缀 + 缓冲原文」（原行为不变）  ← 完全不看配置
+```
+
+成因：这段配置判断是为**另一个需求**（「空缓冲回车上屏被模式键占用的符号本身」）才引入的，只加在新增的空缓冲分支上，注释里明写「非空缓冲……原行为不变」。配置判断是**顺带**进来的，从未覆盖它本该覆盖的主路径。
+
+**用户可见指纹**：设了「清空编码」后，什么都不打直接回车是生效的；**打了码再回车就失效**，照旧上屏原码。「时灵时不灵」正是判断位置错了一层的表现。
+
+修复：判据收口为 `Coordinator::enter_clears_composition()`，五条路径共用，且在各 `VK_RETURN` 分支的**最外层**前置判断。收口的价值在于——漏接会从「调用了但判在错误分支」（grep 搜得到字符串、看不出位置错）退化为「没有调用点」（容易发现）。
+
+## 已定决策
+
+**`clear` 一并丢弃 `committed_text`**（即临拼/混合模式下已通过选词逐步上屏的那部分转换结果），与主输入路径 `coordinator.rs` 的既有行为一致。四条路径的退出都走各自的 `exit_*` 函数，它们本就会清 `committed_text` / `committed_segs`。
+
+理由：保持五条路径行为统一，用户心智负担最小 —— 「清空编码」就是清空全部，不需要记忆「哪部分会保留」。
+
+## 待办（未实施）
+
+用户明确表示**不排除后续需要「上屏已转换部分、只丢弃剩余原码」的需求** —— 即回车时把已选好的汉字上屏，只放弃还没转换的编码。
+
+若要实现，注意：
+
+- 这是**第三种模式**，不应改变现有 `clear` 的语义（会破坏已建立的用户预期）。建议取值扩展为 `commit` / `clear` / `commit_converted` 之类，而非在 `clear` 内部加分支。
+- 五条路径都要接，且**必须为每条路径写「非空缓冲」的回归测试** —— 本次缺陷正是「只覆盖了空缓冲」造成的。
+- 临时英文没有 `committed_text` 概念（无逐步转换），该模式下新值应退化为等同 `clear`。
+
+## 测试
+
+`crates/wind-coordinator/tests/input_flow.rs`，四条路径各一个 `*_nonempty_enter_clear_discards`，外加两个 `*_nonempty_enter_commit_still_outputs_code` 对照组。
+
+两个约束，改动本节测试时务必保留：
+
+1. **必须先断言「确实进入了该模式」**。触发键若未生效，按键会落到主输入路径，而主输入路径的 `clear` 同样返回 `ClearComposition` —— 不验证进入就是假绿。
+2. **对照组不可删**。没有 `commit` 模式的对照，无法区分「配置生效」与「该模式回车本来就不上屏」。
+
+> 注：该测试族依赖仓库根 `build_dev/data`（`has_schemas()` 为假时全部静默 `return`，测试显示 ok）。全量 `cargo test -p wind-coordinator` 真跑约 1.6s，**0.0x s 即假绿**。另该测试族会真写 `%APPDATA%\WindInput\config.toml` 的 `schema.active`，跑完须核对。

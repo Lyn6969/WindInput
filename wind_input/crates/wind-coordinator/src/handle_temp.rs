@@ -409,12 +409,18 @@ impl Coordinator {
                 }
             }
             keymap::VK_RETURN => {
-                // 空缓冲（只按了模式键、无已转换前缀）：新增分支——commit 模式上屏模式键符号本身
-                // （原样不转换，如 `）；clear 模式放弃退出（同原空缓冲行为）。
+                // clear 模式：整段放弃，不上屏任何内容（含已选词的 committed_text）。
+                // 须先于下方各分支——此前该判断只写在「空缓冲」分支内，导致「打了码再回车」
+                // 仍走非空缓冲路径无条件上屏原码，配置形同虚设（与主输入路径行为不一致）。
+                if self.enter_clears_composition() {
+                    self.exit_temp_pinyin(state);
+                    self.notify_ui_hide();
+                    return KeyAction::ClearComposition;
+                }
+                // 空缓冲（只按了模式键、无已转换前缀）：commit 模式上屏模式键符号本身
+                // （原样不转换，如 `）。
                 if state.temp_pinyin_buffer.is_empty() && state.committed_text.is_empty() {
-                    if self.rt().config.input.enter_behavior != "clear"
-                        && !state.temp_pinyin_prefix.is_empty()
-                    {
+                    if !state.temp_pinyin_prefix.is_empty() {
                         let sym = state.temp_pinyin_prefix.clone();
                         self.record_commit(
                             &sym,
@@ -703,6 +709,14 @@ impl Coordinator {
                 }
             }
             keymap::VK_RETURN => {
+                // clear 模式：放弃缓冲，不上屏任何内容（含空缓冲时的触发键回显）。
+                // 注：临英回车上屏的是英文原文而非「编码」，纳入 enter_behavior 管辖属用户明确
+                // 决策——四种模式的回车语义统一，优先于「编码」一词的字面含义。
+                if self.enter_clears_composition() {
+                    self.exit_temp_english(state);
+                    self.notify_ui_hide();
+                    return KeyAction::ClearComposition;
+                }
                 // 回车：上屏原始输入文本（不取候选）；缓冲空时上屏触发键字符（触发键透传）
                 let text = if state.temp_english_buffer.is_empty() {
                     state.temp_english_prefix.clone()

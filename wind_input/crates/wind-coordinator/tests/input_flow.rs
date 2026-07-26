@@ -1487,6 +1487,177 @@ fn test_quick_input_empty_enter_clear_behavior_discards() {
     }
 }
 
+// ───── enter_behavior=clear 在各模式的「非空缓冲」路径同样生效 ─────
+//
+// 回归保护：此前四个模式 handler 的回车分支都把 enter_behavior 判断写在
+// `if buffer.is_empty()` **内部**，于是「打了码再按回车」走非空缓冲路径无条件上屏原码，
+// 配置只对「什么都没打就回车」生效。指纹＝空缓冲时配置生效、打了码就失效。
+//
+// 每个测试都必须先断言「确实进了模式」：触发键若没生效，按键会落到主输入路径，
+// 而主输入路径的 clear 同样返回 ClearComposition —— 不验进入就是假绿。
+
+/// 临时拼音打了码再回车：clear 应整段放弃，不上屏拼音原码。
+#[test]
+fn test_temp_pinyin_nonempty_enter_clear_discards() {
+    if !has_schemas() {
+        return;
+    }
+    let mut cfg = config_with("wubi86");
+    cfg.input.enter_behavior = "clear".into();
+    let coord = Coordinator::new_headless(cfg, Some(&data_dir()));
+    let act = coord.handle_key_event(&key_event(0xC0, EVENT_KEY_DOWN)); // ` 进入临拼
+    assert_eq!(action_text(&act).unwrap(), "`", "反引号应进入临时拼音");
+    for c in "nihao".chars() {
+        press_letter(&coord, c);
+    }
+    let disp = action_text(&press_letter(&coord, 'o')).unwrap_or_default();
+    assert!(
+        disp.starts_with('`'),
+        "字母应进临拼缓冲（组合区以 ` 开头），实际: {:?}",
+        disp
+    );
+    match coord.handle_key_event(&key_event(0x0D, EVENT_KEY_DOWN)) {
+        KeyAction::ClearComposition => {}
+        other => panic!("clear 模式临拼非空缓冲回车应清空不上屏，实际: {:?}", other),
+    }
+    let act = press_letter(&coord, 'a');
+    assert_eq!(action_text(&act).unwrap(), "a", "回车清空后应已退出临拼");
+}
+
+/// 对照组：commit 模式（默认）下同样操作仍应上屏原码。
+/// 没有它，上面的测试无法区分「配置生效」与「临拼回车本来就不上屏」。
+#[test]
+fn test_temp_pinyin_nonempty_enter_commit_still_outputs_code() {
+    if !has_schemas() {
+        return;
+    }
+    let coord = Coordinator::new_headless(config_with("wubi86"), Some(&data_dir()));
+    coord.handle_key_event(&key_event(0xC0, EVENT_KEY_DOWN)); // `
+    for c in "nihao".chars() {
+        press_letter(&coord, c);
+    }
+    match coord.handle_key_event(&key_event(0x0D, EVENT_KEY_DOWN)) {
+        KeyAction::InsertText { text, .. } => {
+            assert_eq!(text, "nihao", "commit 模式临拼回车应上屏拼音原码");
+        }
+        other => panic!("commit 模式临拼回车应上屏原码，实际: {:?}", other),
+    }
+}
+
+/// 快捷输入（混合模式）打了码再回车：clear 应整段放弃。
+#[test]
+fn test_quick_input_nonempty_enter_clear_discards() {
+    if !has_schemas() {
+        return;
+    }
+    let mut cfg = config_with("wubi86");
+    cfg.input.enter_behavior = "clear".into();
+    let coord = Coordinator::new_headless(cfg, Some(&data_dir()));
+    let act = coord.handle_key_event(&key_event(0xBA, EVENT_KEY_DOWN)); // ;
+    assert_eq!(action_text(&act).unwrap(), ";", "分号应进入快捷输入");
+    let mut disp = String::new();
+    for c in "abc".chars() {
+        disp = action_text(&press_letter(&coord, c)).unwrap_or_default();
+    }
+    assert!(
+        disp.starts_with(';'),
+        "字母应进快捷输入缓冲，实际组合区: {:?}",
+        disp
+    );
+    match coord.handle_key_event(&key_event(0x0D, EVENT_KEY_DOWN)) {
+        KeyAction::ClearComposition => {}
+        other => panic!(
+            "clear 模式快捷输入非空缓冲回车应清空不上屏，实际: {:?}",
+            other
+        ),
+    }
+}
+
+/// 对照组：commit 模式下快捷输入回车仍上屏缓冲原文。
+#[test]
+fn test_quick_input_nonempty_enter_commit_still_outputs_code() {
+    if !has_schemas() {
+        return;
+    }
+    let coord = Coordinator::new_headless(config_with("wubi86"), Some(&data_dir()));
+    coord.handle_key_event(&key_event(0xBA, EVENT_KEY_DOWN)); // ;
+    for c in "abc".chars() {
+        press_letter(&coord, c);
+    }
+    match coord.handle_key_event(&key_event(0x0D, EVENT_KEY_DOWN)) {
+        KeyAction::InsertText { text, .. } => {
+            assert_eq!(text, "abc", "commit 模式快捷输入回车应上屏缓冲原文");
+        }
+        other => panic!("commit 模式快捷输入回车应上屏原文，实际: {:?}", other),
+    }
+}
+
+/// 特殊模式打了码再回车：clear 应整段放弃，不上屏编码原文。
+#[test]
+fn test_special_mode_nonempty_enter_clear_discards() {
+    if !has_schemas() {
+        return;
+    }
+    let mut cfg = config_with("wubi86");
+    cfg.input.enter_behavior = "clear".into();
+    cfg.schema.special_modes = vec![wind_config::config::SpecialModeConfig {
+        id: "sym".into(),
+        trigger_keys: vec!["backslash".into()],
+        schema: "pinyin".into(),
+        ..Default::default()
+    }];
+    let coord = Coordinator::new_headless(cfg, Some(&data_dir()));
+    let act = coord.handle_key_event(&key_event(0xDC, EVENT_KEY_DOWN)); // \
+    assert!(
+        matches!(act, KeyAction::UpdateComposition { .. }),
+        "反斜杠应进入特殊模式，实际: {:?}",
+        act
+    );
+    let mut disp = String::new();
+    for c in "ni".chars() {
+        disp = action_text(&press_letter(&coord, c)).unwrap_or_default();
+    }
+    assert!(
+        disp.contains("ni"),
+        "字母应进特殊模式编码缓冲，实际组合区: {:?}",
+        disp
+    );
+    match coord.handle_key_event(&key_event(0x0D, EVENT_KEY_DOWN)) {
+        KeyAction::ClearComposition => {}
+        other => panic!(
+            "clear 模式特殊模式非空缓冲回车应清空不上屏，实际: {:?}",
+            other
+        ),
+    }
+}
+
+/// 临时英文打了内容再回车：clear 应整段放弃。
+/// 注：临英回车上屏的是英文原文而非「编码」，纳入本配置管辖属用户明确决策。
+#[test]
+fn test_temp_english_nonempty_enter_clear_discards() {
+    if !has_schemas() {
+        return;
+    }
+    let mut cfg = config_with_english_trigger("wubi86", "slash");
+    cfg.input.enter_behavior = "clear".into();
+    let coord = Coordinator::new_headless(cfg, Some(&data_dir()));
+    let act = coord.handle_key_event(&key_event(0xBF, EVENT_KEY_DOWN)); // /
+    assert_eq!(action_text(&act).unwrap(), "/", "斜杠应进入临时英文");
+    let mut disp = String::new();
+    for c in "abc".chars() {
+        disp = action_text(&press_letter(&coord, c)).unwrap_or_default();
+    }
+    assert!(
+        disp.starts_with('/'),
+        "字母应进临英缓冲，实际组合区: {:?}",
+        disp
+    );
+    match coord.handle_key_event(&key_event(0x0D, EVENT_KEY_DOWN)) {
+        KeyAction::ClearComposition => {}
+        other => panic!("clear 模式临英非空缓冲回车应清空不上屏，实际: {:?}", other),
+    }
+}
+
 #[test]
 fn test_mix_letter_trigger_empty_enter_no_symbol() {
     if !has_schemas() {
