@@ -388,7 +388,7 @@ convert(input):
      压缩权重后，高权重子串单字会靠 weight 反超低权重精确词组——如 `pingtan` 在混输下
      平(w=58 part=true)＞平摊(w=4 part=false)，前者插到词组前）
 ④ 按 text 去重（HashSet 保留首个）
-⑤ apply_filter：填充 is_common（常用字表；短语豁免）→ wind_candidate::filter_candidates
+⑤ apply_filter：填充 is_common（常用字表；短语豁免，判定作用域见 §8.1.1）→ wind_candidate::filter_candidates
 ⑥ apply_freq_rerank：用户词频重排（独立维度，绝不改 weight）
 ⑦ apply_shadow：shadow 规则删除过滤 + 置顶/移动重排（优先级最高，排序后应用）
 ⑧ 自动上屏复评与守护：
@@ -404,6 +404,33 @@ convert(input):
 （is_common/is_phrase/is_command/is_group）则滤掉非常用，无常用则整组保留。
 按来源分组是提交 19d580f 的修复：混输下码表与拼音候选常共用同一 code 串（如 wang），
 原先只按 code 分组会让拼音常用字误杀同码的码表生僻字（佢），导致混输码表表现与纯五笔不一致。
+
+#### 8.1.1 常用性判定的作用域（`wind-candidate/src/common.rs`）
+
+`is_string_common` 逐字判定：**属「汉字」的字符必须在通用规范汉字表（8105 字）内，其余辅助
+字符忽略**。所谓「汉字」= `is_han` ∪ `is_pua`，两侧各挡一类误判：
+
+- **纳入 PUA**（158a383）：码表把私用区码位当汉字使用（`dwi` 下 U+E831 冒充生僻字、占着
+  汉字编码排在「仄」旁边），不查表就会让无字形的豆腐候选混进「常用字/智能」档。
+- **`is_han` 排除 CJK 标点与符号**：`、。《》〈〉「」〇`（U+3000–U+303F）、假名、注音、
+  谚文、带圈与兼容符号（`① ㈱ ℃ ㎡`，U+3200–U+33FF）虽紧邻汉字块，却与 `，`(U+FF0C)、
+  emoji 同属辅助符号，规范汉字表对其无从判断。旧实现按整段 `0x2E80..=0x33FF` 圈定判定域
+  （沿用 Go `isCJKChar` 的名字与范围），把它们当成必须查表的汉字 → 用户词库里含中文顿号的
+  词条在「常用字/智能」档被静默滤掉。**该缺陷的指纹是判定不自洽**：同为中文标点，`、` 判
+  非常用而 `，` 判常用，差别只在落没落进那段区间。
+
+判据是语义而非 Unicode 块邻接：**「码表拿它当汉字用」才查表，「它只是符号」就忽略**。
+部首（U+2E80–U+2FDF）与笔画（U+31C0–U+31EF）保留在判定域内，理由同 PUA——它们无独立输入
+语义，却会占着汉字编码出现在候选里。
+
+> **待办（未实施，用户已确认方向）**：给「用户词库词条不受检索范围过滤」加一个开关。
+> 现状是用户显式加进词库的生僻字（`囍 靐 嘅 冇` 等均不在规范字表）在「常用字」档仍被滤掉，
+> 只能整体切到 `gb18030` 档才打得出，与「我自己加的词就该打得出」的直觉相悖。
+> 落点：`handle_candidate.rs` `apply_filter` 处 `c.meta.is_user_dict` 已由 dict 层
+> （`wind-dict/src/store_layer.rs:22-26`）置位，可直接读，形如
+> `c.is_common = c.meta.is_user_dict || self.common_chars.is_string_common(&c.text)`。
+> **豁免范围须止于 `is_user_dict`**：`is_temp_dict` 是码表自动造词的产物（连续单字+终止符
+> 自动成词，杂词率高），一并豁免等于让自动造出的杂词绕过这层过滤，而那正是它该管的。
 
 ### 8.2 词频重排（freq_rerank.rs，两策略）
 
