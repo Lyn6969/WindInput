@@ -327,7 +327,7 @@ BOOL CIPCClient::_ReadWithTimeout(void* buffer, DWORD size, DWORD* bytesRead, DW
 
 BOOL CIPCClient::_StartService()
 {
-    _LogInfo(L"Attempting to start Go service...");
+    _LogInfo(L"Attempting to start service...");
 
     // Guard: installer running flag — set by NSIS before killing processes,
     // cleared after installation completes. Prevents respawn during install/uninstall.
@@ -453,7 +453,7 @@ BOOL CIPCClient::Connect()
         return FALSE;
     }
 
-    _LogDebug(L"Connecting to Go Service (binary protocol)...");
+    _LogDebug(L"Connecting to Service (binary protocol)...");
 
     for (int attempt = 0; attempt < 3; attempt++)
     {
@@ -496,7 +496,7 @@ BOOL CIPCClient::Connect()
             DWORD mode = PIPE_READMODE_MESSAGE;
             SetNamedPipeHandleState(_hPipe, &mode, nullptr, nullptr);
 
-            _LogInfo(L"Connected to Go Service (binary protocol v%d.%d)",
+            _LogInfo(L"Connected to Service (binary protocol v%d.%d)",
                      PROTOCOL_VERSION >> 12, PROTOCOL_VERSION & 0xFFF);
             _RecordSuccess();
             _needsStateSync = TRUE;
@@ -523,7 +523,7 @@ BOOL CIPCClient::Connect()
         break;
     }
 
-    _LogError(L"Failed to connect to Go Service (pipe=%s, lastErr=%d)", PIPE_NAME, GetLastError());
+    _LogError(L"Failed to connect to Service (pipe=%s, lastErr=%d)", PIPE_NAME, GetLastError());
     {
         WindHostProcessInfo currentHost;
         if (WindQueryCurrentProcessInfo(&currentHost))
@@ -541,7 +541,7 @@ void CIPCClient::Disconnect()
         CancelIo(_hPipe);
         CloseHandle(_hPipe);
         _hPipe = INVALID_HANDLE_VALUE;
-        _LogDebug(L"Disconnected from Go Service");
+        _LogDebug(L"Disconnected from Service");
     }
 }
 
@@ -734,9 +734,16 @@ BOOL CIPCClient::SendFocusLost()
         return FALSE;
     }
 
-    _LogDebug(L"Sending focus_lost (async)");
+    // Carry the client token: the service discards a focus_lost whose token is no longer the
+    // active one. Without it, this message — which OnKillThreadFocus emits ~100ms after the
+    // DocMgr-level focus loss — lands after the *next* host's focus_gained and clears the
+    // activation that host just established (toolbar flashes on, then hides).
+    ClientTokenPayload payload;
+    payload.clientToken = _clientToken;
+
+    _LogDebug(L"Sending focus_lost (async): token=0x%016llX", (unsigned long long)_clientToken);
     // Send async - no response needed for focus lost
-    return _SendBinaryMessage(CMD_FOCUS_LOST, nullptr, 0, true /* async */);
+    return _SendBinaryMessage(CMD_FOCUS_LOST, &payload, sizeof(payload), true /* async */);
 }
 
 BOOL CIPCClient::SendCaretPending()
@@ -847,9 +854,13 @@ BOOL CIPCClient::SendIMEDeactivated()
         return FALSE;
     }
 
-    _LogInfo(L"Sending ime_deactivated (async)");
+    // Token carried for the same ordering reason as SendFocusLost (both are fire-and-forget).
+    ClientTokenPayload payload;
+    payload.clientToken = _clientToken;
+
+    _LogInfo(L"Sending ime_deactivated (async): token=0x%016llX", (unsigned long long)_clientToken);
     // Send async - no response needed for IME deactivated
-    return _SendBinaryMessage(CMD_IME_DEACTIVATED, nullptr, 0, true /* async */);
+    return _SendBinaryMessage(CMD_IME_DEACTIVATED, &payload, sizeof(payload), true /* async */);
 }
 
 BOOL CIPCClient::SendIMEActivated()
@@ -2467,7 +2478,7 @@ void CIPCClient::_AsyncReaderLoop()
             }
             else if (header.command == CMD_CLEAR_COMPOSITION)
             {
-                _LogInfo(L"Async reader: clear composition received from Go service");
+                _LogInfo(L"Async reader: clear composition received from service");
 
                 // Call callback
                 EnterCriticalSection(&_asyncLock);

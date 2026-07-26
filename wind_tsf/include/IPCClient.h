@@ -151,7 +151,10 @@ public:
     // Async: notifies Go that the caret moved outside of composition (e.g., mouse click)
     BOOL SendSelectionChanged(uint16_t prevChar = 0);
 
-    // Send focus lost notification
+    // Send focus lost notification.
+    // Carries this instance's clientToken so the service can discard a *stale* focus_lost —
+    // OnKillThreadFocus emits it ~100ms after the DocMgr-level focus loss, i.e. after the next
+    // host's focus_gained has already arrived. See ClientTokenPayload in BinaryProtocol.h.
     BOOL SendFocusLost();
 
     // Send focus gained notification (with optional caret position and InputScope bitmask).

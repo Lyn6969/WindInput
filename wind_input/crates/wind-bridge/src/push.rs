@@ -141,6 +141,14 @@ impl PushServer {
         self.active_token.store(token, Ordering::Relaxed);
     }
 
+    /// 当前活动客户端 token（0 = 尚未有任何客户端获焦）。
+    /// 失焦类命令据此做归属校验：TSF 的 `OnKillThreadFocus` 比 DocMgr 级失焦晚约 100ms
+    /// 发出 focus_lost，跨宿主切换时必然晚于新宿主的 focus_gained，无校验会清掉新宿主
+    /// 刚建立的激活态（工具栏闪一下即消失）。
+    pub fn active_token(&self) -> u64 {
+        self.active_token.load(Ordering::Relaxed)
+    }
+
     /// 是否有已连接的 TSF 客户端（用于决定是否经 IPC 让宿主执行前台操作）
     pub fn has_clients(&self) -> bool {
         !self.clients.lock().unwrap().is_empty()

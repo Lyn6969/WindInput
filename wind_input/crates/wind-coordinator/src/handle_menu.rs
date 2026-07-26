@@ -860,6 +860,14 @@ impl Coordinator {
                 .load(std::sync::atomic::Ordering::Relaxed);
         let s = self.state.lock().unwrap_or_else(|e| e.into_inner());
         if !(s.ime_active && s.toolbar_visible) || hide_fullscreen {
+            // 记录是三项中的哪一项否决了显示：UI 层日志只看得到「HideToolbar」，判不出成因，
+            // 而三条路径的排查方向完全不同（激活态乱序 / 用户关了开关 / 全屏探测）。
+            tracing::debug!(
+                "notify_toolbar: 隐藏 ime_active={} toolbar_visible={} fullscreen={}",
+                s.ime_active,
+                s.toolbar_visible,
+                hide_fullscreen
+            );
             drop(s);
             let _ = self.ui_tx.send(UiCommand::HideToolbar);
             return;

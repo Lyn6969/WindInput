@@ -414,6 +414,22 @@ struct IMEActivatedPayload
 };
 static_assert(sizeof(IMEActivatedPayload) == 8, "IMEActivatedPayload must be 8 bytes");
 
+// CMD_FOCUS_LOST / CMD_IME_DEACTIVATED payload (8 bytes, same shape as IMEActivatedPayload).
+//
+// Added in v0.111.4. These two used to carry an empty payload; the service then had no way to
+// tell *which* instance lost focus and unconditionally cleared its single global ime_active.
+// That breaks on every cross-host switch: OnKillThreadFocus fires ~100ms after DocMgr-level
+// focus loss (deliberate, see TextService.cpp), so the old host's focus_lost always lands
+// *after* the new host's focus_gained and wipes the activation that was just established.
+//
+// The service treats a 0-byte payload as token 0 and keeps the legacy behaviour, so an older
+// DLL still works against a newer service.
+struct ClientTokenPayload
+{
+    uint64_t clientToken;
+};
+static_assert(sizeof(ClientTokenPayload) == 8, "ClientTokenPayload must be 8 bytes");
+
 // CMD_FOCUS_GAINED extended payload (38 bytes = CaretPayload + clientToken + inputScopeMask
 // + disabled + reason)
 struct FocusGainedPayload

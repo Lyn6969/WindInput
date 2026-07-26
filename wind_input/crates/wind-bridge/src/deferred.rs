@@ -62,8 +62,8 @@ impl MessageHandler for DeferredHandler {
         self.with_handler(None, |h| h.handle_focus_gained(data))
     }
 
-    fn handle_focus_lost(&self) {
-        self.with_handler((), |h| h.handle_focus_lost())
+    fn handle_focus_lost(&self, client_token: u64) {
+        self.with_handler((), |h| h.handle_focus_lost(client_token))
     }
 
     fn handle_show_context_menu(&self, x: i32, y: i32) {
@@ -104,8 +104,8 @@ impl MessageHandler for DeferredHandler {
         self.with_handler(None, |h| h.handle_ime_activated(client_token))
     }
 
-    fn handle_ime_deactivated(&self) {
-        self.with_handler((), |h| h.handle_ime_deactivated())
+    fn handle_ime_deactivated(&self, client_token: u64) {
+        self.with_handler((), |h| h.handle_ime_deactivated(client_token))
     }
 
     fn handle_mode_notify(&self, flags: u32) {

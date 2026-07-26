@@ -4370,7 +4370,7 @@ fn test_codetable_auto_phrase_learns_from_single_chars() {
     assert_eq!(word.chars().count(), 2, "应上屏两个单字，实际: {:?}", word);
 
     // 造词发生在终止信号（此处用失焦，等价于打完一句切窗口）。
-    coord.handle_focus_lost();
+    coord.handle_focus_lost(0);
 
     let words = temp_words(&store, "wubi86");
     let hit = words
@@ -4416,7 +4416,7 @@ fn test_codetable_auto_phrase_disabled_learns_nothing() {
     let (coord, store, db) = auto_phrase_coord("disabled", false);
     commit_one_char(&coord, b'A');
     commit_one_char(&coord, b'A');
-    coord.handle_focus_lost();
+    coord.handle_focus_lost(0);
     assert!(
         temp_words(&store, "wubi86").is_empty(),
         "开关关闭时不应造词，实际: {:?}",
@@ -4434,7 +4434,7 @@ fn test_codetable_auto_phrase_single_char_is_not_a_word() {
     }
     let (coord, store, db) = auto_phrase_coord("single", true);
     commit_one_char(&coord, b'A');
-    coord.handle_focus_lost();
+    coord.handle_focus_lost(0);
     assert!(
         temp_words(&store, "wubi86").is_empty(),
         "单字不应成词，实际: {:?}",

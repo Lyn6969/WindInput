@@ -120,11 +120,11 @@ mod tests {
         fn handle_focus_gained(&self, _data: &FocusData) -> Option<StatusUpdateData> {
             None
         }
-        fn handle_focus_lost(&self) {}
+        fn handle_focus_lost(&self, _client_token: u64) {}
         fn handle_ime_activated(&self, _client_token: u64) -> Option<StatusUpdateData> {
             None
         }
-        fn handle_ime_deactivated(&self) {}
+        fn handle_ime_deactivated(&self, _client_token: u64) {}
         fn handle_mode_notify(&self, _flags: u32) {}
         fn handle_toggle_mode(&self) -> (Option<StatusUpdateData>, String) {
             (None, String::new())

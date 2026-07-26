@@ -520,7 +520,10 @@ pub(crate) fn dispatch_command(
         // readFrame 永久阻塞 → 切换/失焦卡死。Windows TSF fire-and-forget（is_async）不读，
         // 回了反而污染管道 → 仅 !is_async 回 ack（对齐 feat / 历史 fix 803f7fa）。
         CMD_FOCUS_LOST => {
-            handler.handle_focus_lost();
+            // 载荷自 v0.111.4 起携带 8 字节 clientToken（旧 DLL 发 0 字节 → token=0，
+            // handler 保守放行以保持旧行为）。handler 据此丢弃陈旧失焦，详见
+            // MessageHandler::handle_focus_lost 的归属校验说明。
+            handler.handle_focus_lost(decode_client_token(payload));
             if is_async { None } else { Some(encode_ack()) }
         }
 
@@ -528,11 +531,7 @@ pub(crate) fn dispatch_command(
         // Go 的两阶段模式：Phase1 更新 activeProcessID/activeToken + 回 Ack，
         // Phase2 调用 HandleIMEActivated 并推送 ActivationStatusPush。
         CMD_IME_ACTIVATED => {
-            let token = if payload.len() >= 8 {
-                u64::from_le_bytes(payload[..8].try_into().unwrap())
-            } else {
-                0
-            };
+            let token = decode_client_token(payload);
             // 记录最近焦点实例（host-render 写帧目标）。已 setup 才在 active_target 生效。
             #[cfg(windows)]
             if let Some(mgr) = host_render {
@@ -545,7 +544,7 @@ pub(crate) fn dispatch_command(
 
         // ── IME 停用（异步） ──
         CMD_IME_DEACTIVATED => {
-            handler.handle_ime_deactivated();
+            handler.handle_ime_deactivated(decode_client_token(payload));
             None
         }
 
@@ -947,6 +946,19 @@ fn handle_batch_events(
     Some(encode_batch_response(&responses))
 }
 
+/// 从裸 8 字节载荷解出 clientToken；载荷不足 8 字节返回 0。
+///
+/// 用于 CMD_IME_ACTIVATED / CMD_FOCUS_LOST / CMD_IME_DEACTIVATED 这类「整个载荷就是一个
+/// token」的命令。返回 0 有两种成因，调用方一律按「未知客户端」保守处理：旧 DLL 不带
+/// token，或载荷被截断。
+fn decode_client_token(payload: &[u8]) -> u64 {
+    if payload.len() >= 8 {
+        u64::from_le_bytes(payload[..8].try_into().unwrap())
+    } else {
+        0
+    }
+}
+
 /// 将 KeyAction 编码为响应字节
 ///
 /// 与 Go 版 handleKeyEvent 的 switch 分支对齐
@@ -1038,11 +1050,11 @@ mod tests {
         fn handle_focus_gained(&self, _data: &FocusData) -> Option<StatusUpdateData> {
             None
         }
-        fn handle_focus_lost(&self) {}
+        fn handle_focus_lost(&self, _client_token: u64) {}
         fn handle_ime_activated(&self, _client_token: u64) -> Option<StatusUpdateData> {
             None
         }
-        fn handle_ime_deactivated(&self) {}
+        fn handle_ime_deactivated(&self, _client_token: u64) {}
         fn handle_mode_notify(&self, _flags: u32) {}
         fn handle_toggle_mode(&self) -> (Option<StatusUpdateData>, String) {
             (None, String::new())

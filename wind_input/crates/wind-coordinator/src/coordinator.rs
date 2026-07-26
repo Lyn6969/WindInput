@@ -3538,6 +3538,40 @@ impl Coordinator {
     }
 }
 
+impl Coordinator {
+    /// 失焦类事件的归属校验：`client_token` 不是当前活动客户端时判为**陈旧事件**并丢弃。
+    ///
+    /// 必要性来自 DLL 侧刻意安排的时序：DocMgr 级失焦是噪声信号（VSCode 实测一次应用切换
+    /// 伴随 5 次），故 focus_lost 不在那里发，改由 `OnKillThreadFocus` 发出——实测**比
+    /// DocMgr 级失焦晚约 100ms**（见 TextService.cpp 失焦分支注释）。而新宿主的
+    /// focus_gained 在十几毫秒内就送达，于是跨宿主切换时到达顺序恒为
+    /// 「新宿主 focus_gained → 旧宿主 focus_lost」。
+    ///
+    /// `ime_active` 是全局单例（不区分客户端），无校验时后者会把前者刚建立的激活态清掉：
+    /// 工具栏闪一下即隐藏。服务端日志指纹＝`UpdateToolbar` 后约 90ms 紧跟一条 `HideToolbar`，
+    /// 且此后长时间没有新的 `UpdateToolbar`。
+    ///
+    /// 两种放行情形：`client_token == 0`（旧 DLL 不带 token，保持既有行为）、
+    /// `active == 0`（尚无任何客户端获焦，无从判定归属）。
+    ///
+    /// 注意本校验**只挡跨宿主**：同一进程内多个 DocMgr 共用一个 token，宿主自身在两个
+    /// DocMgr 间抖动时 token 相同、一律放行——那条路径是 doc_changed 先发 focus_lost 紧接
+    /// focus_gained，间隔 <10ms，由 UI 层 50ms 隐藏防抖吸收。
+    pub(crate) fn is_stale_focus_event(&self, client_token: u64, what: &str) -> bool {
+        let active = self.push_server.active_token();
+        if client_token == 0 || active == 0 || client_token == active {
+            return false;
+        }
+        tracing::debug!(
+            "{}: 丢弃陈旧失焦 token={:#x} active={:#x}（旧宿主迟到的失焦，不动激活态与 UI）",
+            what,
+            client_token,
+            active
+        );
+        true
+    }
+}
+
 impl MessageHandler for Coordinator {
     fn handle_menu_command(&self, command: &str) -> Option<StatusUpdateData> {
         info!("Menu command: {}", command);
@@ -4845,7 +4879,14 @@ impl MessageHandler for Coordinator {
         Some(status)
     }
 
-    fn handle_focus_lost(&self) {
+    fn handle_focus_lost(&self, client_token: u64) {
+        // 独立日志行：失焦此前在服务端日志里完全不可见，只能靠 TSF 日志反推 HideToolbar
+        // 的来源（2026-07-26 工具栏闪隐排查即因此多绕一圈）。token 便于与 DLL 日志的
+        // `Sending focus_lost token=…` 对齐到具体宿主实例。
+        tracing::debug!("handle_focus_lost: token={:#x}", client_token);
+        if self.is_stale_focus_event(client_token, "handle_focus_lost") {
+            return;
+        }
         // 词频已即时写入 redb（事务持久），失焦无需再落盘。
         {
             let mut s = self.state.lock().unwrap_or_else(|e| e.into_inner());
@@ -4926,7 +4967,13 @@ impl MessageHandler for Coordinator {
         Some(status)
     }
 
-    fn handle_ime_deactivated(&self) {
+    fn handle_ime_deactivated(&self, client_token: u64) {
+        tracing::debug!("handle_ime_deactivated: token={:#x}", client_token);
+        // 与 focus_lost 同源的乱序风险：切走本输入法时旧宿主的 IME_DEACTIVATED 同样可能
+        // 晚于新宿主的 focus_gained 到达（两者都是 fire-and-forget 异步写）。
+        if self.is_stale_focus_event(client_token, "handle_ime_deactivated") {
+            return;
+        }
         // 切走本输入法（换到别的 IME / 非输入法应用）：清激活态、清输入、隐藏全部 UI。
         // 对齐 Go SetIMEActivated(false)（隐藏工具栏 + hideUI），根治“切走仍残留显示”。
         {
@@ -6042,6 +6089,89 @@ mod capslock_tests {
 }
 
 #[cfg(test)]
+mod focus_ownership_tests {
+    //! 失焦事件的客户端归属校验：旧宿主迟到的 focus_lost 不得清掉新宿主刚建立的激活态。
+    //!
+    //! 复现自 2026-07-26 的工具栏缺陷——从 Windows Terminal 切到记事本，记事本
+    //! focus_gained 让工具栏显示，86ms 后 Terminal 的 OnKillThreadFocus 才发出 focus_lost，
+    //! 把 `ime_active` 清成 false，工具栏闪一下即隐藏。
+    use super::*;
+
+    /// 已有宿主 `token` 处于激活态的协调器。
+    fn activated(token: u64) -> Arc<Coordinator> {
+        let c = Coordinator::new_headless(Config::default(), None);
+        c.push_server.set_active_token(token);
+        c.state.lock().unwrap().ime_active = true;
+        c
+    }
+
+    const NOTEPAD: u64 = 0x0000_3644_0000_0001;
+    const TERMINAL: u64 = 0x0000_3ECC_0000_0001;
+
+    #[test]
+    fn stale_focus_lost_keeps_activation() {
+        let c = activated(NOTEPAD);
+        c.handle_focus_lost(TERMINAL);
+        assert!(
+            c.state.lock().unwrap().ime_active,
+            "旧宿主迟到的失焦不得清激活态，否则工具栏闪一下即隐藏"
+        );
+    }
+
+    #[test]
+    fn own_focus_lost_clears_activation() {
+        let c = activated(NOTEPAD);
+        c.handle_focus_lost(NOTEPAD);
+        assert!(
+            !c.state.lock().unwrap().ime_active,
+            "当前活动客户端自己失焦仍须正常清激活态"
+        );
+    }
+
+    #[test]
+    fn legacy_zero_token_still_clears() {
+        let c = activated(NOTEPAD);
+        c.handle_focus_lost(0);
+        assert!(
+            !c.state.lock().unwrap().ime_active,
+            "旧 DLL 不带 token，保守放行以保持既有行为"
+        );
+    }
+
+    #[test]
+    fn stale_ime_deactivated_keeps_activation() {
+        let c = activated(NOTEPAD);
+        c.handle_ime_deactivated(TERMINAL);
+        assert!(
+            c.state.lock().unwrap().ime_active,
+            "IME_DEACTIVATED 与 focus_lost 同为异步写，乱序风险相同"
+        );
+    }
+
+    #[test]
+    fn own_ime_deactivated_clears_activation() {
+        let c = activated(NOTEPAD);
+        c.handle_ime_deactivated(NOTEPAD);
+        assert!(!c.state.lock().unwrap().ime_active);
+    }
+
+    /// 同一宿主内多个 DocMgr 共用一个 token，一律放行——那层抖动（doc_changed 先发
+    /// focus_lost 紧接 focus_gained，间隔 <10ms）由 UI 层 50ms 隐藏防抖吸收，不归本校验管。
+    #[test]
+    fn same_host_doc_churn_is_not_stale() {
+        let c = activated(NOTEPAD);
+        assert!(!c.is_stale_focus_event(NOTEPAD, "test"));
+    }
+
+    /// 服务端刚启动、尚无任何客户端获焦：无从判定归属，放行。
+    #[test]
+    fn no_active_client_is_not_stale() {
+        let c = Coordinator::new_headless(Config::default(), None);
+        assert!(!c.is_stale_focus_event(TERMINAL, "test"));
+    }
+}
+
+#[cfg(test)]
 mod input_diag_tests {
     //! last_input_diag 存储 + 密码框强制英文抑制。
     use super::*;
@@ -6173,7 +6303,7 @@ mod input_diag_tests {
             c.password_suppress.load(Relaxed),
             "前置条件：密码框抑制应已置位"
         );
-        c.handle_focus_lost();
+        c.handle_focus_lost(0);
         assert!(
             !c.password_suppress.load(Relaxed),
             "失焦后应清除密码框抑制态，避免残留到下次 focus_gained 之前"

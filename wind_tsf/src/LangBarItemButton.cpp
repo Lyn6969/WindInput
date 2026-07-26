@@ -328,7 +328,7 @@ STDAPI CLangBarItemButton::OnClick(TfLBIClick click, POINT pt, const RECT* prcAr
 
 STDAPI CLangBarItemButton::InitMenu(ITfMenu* pMenu)
 {
-    WIND_LOG_INFO(L"InitMenu called by TSF - returning empty menu (unified menu handled by Go service)\n");
+    WIND_LOG_INFO(L"InitMenu called by TSF - returning empty menu (unified menu handled by service)\n");
 
     if (pMenu == nullptr)
     {
@@ -1333,7 +1333,7 @@ void CLangBarItemButton::SetInputTypeLabel(const wchar_t* label)
 // Go service renders the unified menu with consistent styling
 void CLangBarItemButton::_ShowPopupMenu(POINT pt)
 {
-    WIND_LOG_INFO_FMT(L"_ShowPopupMenu: Sending context menu request to Go service at (%ld, %ld)\n", pt.x, pt.y);
+    WIND_LOG_INFO_FMT(L"_ShowPopupMenu: Sending context menu request to service at (%ld, %ld)\n", pt.x, pt.y);
 
     if (_pTextService != nullptr)
     {

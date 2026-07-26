@@ -192,14 +192,18 @@ pub trait MessageHandler: Send + Sync {
     /// 处理焦点获取（返回状态用于 ActivationStatusPush）
     fn handle_focus_gained(&self, data: &FocusData) -> Option<StatusUpdateData>;
 
-    /// 处理焦点丢失
-    fn handle_focus_lost(&self);
+    /// 处理焦点丢失。
+    ///
+    /// `client_token` 为发出该失焦的 TSF 实例（0 = 旧 DLL 未携带，实现方应保守放行）。
+    /// 实现方**必须**据此做归属校验：DLL 的 `OnKillThreadFocus` 比 DocMgr 级失焦晚约
+    /// 100ms 才发本命令，跨宿主切换时它必然晚于新宿主的 focus_gained 到达。
+    fn handle_focus_lost(&self, client_token: u64);
 
     /// 处理 IME 激活（返回状态用于 ActivationStatusPush）
     fn handle_ime_activated(&self, client_token: u64) -> Option<StatusUpdateData>;
 
-    /// 处理 IME 停用
-    fn handle_ime_deactivated(&self);
+    /// 处理 IME 停用。`client_token` 语义同 [`Self::handle_focus_lost`]。
+    fn handle_ime_deactivated(&self, client_token: u64);
 
     /// 处理模式通知
     fn handle_mode_notify(&self, flags: u32);

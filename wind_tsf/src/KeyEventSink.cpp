@@ -2093,7 +2093,7 @@ BOOL CKeyEventSink::_IsContextReadOnly(ITfContext* pContext)
 // 3. Application forcefully terminates composition
 void CKeyEventSink::OnCompositionUnexpectedlyTerminated()
 {
-    WIND_LOG_INFO(L"OnCompositionUnexpectedlyTerminated: Resetting state and notifying Go service\n");
+    WIND_LOG_INFO(L"OnCompositionUnexpectedlyTerminated: Resetting state and notifying service\n");
 
     // Reset local state
     _isComposing = FALSE;
@@ -2106,7 +2106,7 @@ void CKeyEventSink::OnCompositionUnexpectedlyTerminated()
     if (pIPCClient != nullptr && pIPCClient->IsConnected())
     {
         pIPCClient->SendCompositionTerminated();
-        WIND_LOG_DEBUG(L"OnCompositionUnexpectedlyTerminated: Sent CompositionTerminated to Go service\n");
+        WIND_LOG_DEBUG(L"OnCompositionUnexpectedlyTerminated: Sent CompositionTerminated to service\n");
     }
 }
 

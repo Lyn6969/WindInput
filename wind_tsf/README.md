@@ -253,17 +253,23 @@ struct IpcHeader {
 };
 ```
 
-### 上行命令 (C++ → Go)
+### 上行命令 (C++ → Service)
 
 | 命令 | 代码 | 说明 |
 |------|------|------|
 | CMD_KEY_EVENT | 0x0101 | 按键事件 |
 | CMD_FOCUS_GAINED | 0x0201 | 获得焦点 |
-| CMD_FOCUS_LOST | 0x0202 | 焦点丢失 |
+| CMD_FOCUS_LOST | 0x0202 | 焦点丢失（载荷 8 字节 clientToken，见下） |
 | CMD_IME_ACTIVATED | 0x0203 | 输入法激活 |
+| CMD_IME_DEACTIVATED | 0x0204 | 输入法停用（载荷 8 字节 clientToken，见下） |
 | CMD_CARET_UPDATE | 0x0301 | 光标更新 |
 
-### 下行命令 (Go → C++)
+失焦类命令（0x0202 / 0x0204）自 v0.111.4 起携带发送方的 clientToken。服务端据此丢弃
+**陈旧失焦**：`OnKillThreadFocus` 比 DocMgr 级失焦晚约 100ms 才发出，跨宿主切换时它必然
+晚于新宿主的 focus_gained 到达，无校验会清掉新宿主刚建立的激活态（工具栏闪一下即隐藏）。
+载荷为 0 字节时服务端按 token=0 处理并保持旧行为，故新旧两侧可任意组合。
+
+### 下行命令 (Service → C++)
 
 | 命令 | 代码 | 说明 |
 |------|------|------|

@@ -2189,7 +2189,10 @@ STDAPI CTextService::OnSetFocus(ITfDocumentMgr* pDocMgrFocus, ITfDocumentMgr* pD
     // If losing focus (pDocMgrFocus is null)
     if (pDocMgrFocus == nullptr)
     {
-        WIND_LOG_DEBUG_FMT(L"Focus lost focusSession=%llu, notifying service", _focusSessionId);
+        // ⚠ 文案必须如实说明「不发 IPC」：旧文案是 "notifying service"，与下方刻意不通知
+        // 服务端的行为正好相反，2026-07-26 排查工具栏闪隐时据此误判过一轮失焦来源。
+        WIND_LOG_DEBUG_FMT(L"DocMgr focus lost focusSession=%llu (no IPC; focus_lost deferred to OnKillThreadFocus)",
+                           _focusSessionId);
 
         if (_pKeyEventSink != nullptr)
         {
@@ -3215,7 +3218,7 @@ BOOL CTextService::_InitIPCClient()
     // Try to connect to Go Service (failure is OK, will retry later)
     if (!_pIPCClient->Connect())
     {
-        WIND_LOG_WARN(L"Failed to connect to Go Service, will retry later\n");
+        WIND_LOG_WARN(L"Failed to connect to Service, will retry later\n");
     }
 
     // Set up activation status push callback (CMD_ACTIVATION_STATUS_PUSH)
@@ -3315,7 +3318,7 @@ BOOL CTextService::_InitIPCClient()
     // Set up clear composition callback for mode toggle via menu
     _pIPCClient->SetClearCompositionCallback([pThis]() {
         // This callback is called from the async reader thread
-        WIND_LOG_DEBUG(L"Clear composition received from Go service\n");
+        WIND_LOG_DEBUG(L"Clear composition received from service\n");
 
         if (pThis->_pLangBarItemButton != nullptr)
         {
@@ -3331,7 +3334,7 @@ BOOL CTextService::_InitIPCClient()
     // Set up update composition callback for mouse click partial confirm
     _pIPCClient->SetUpdateCompositionCallback([pThis](const std::wstring& text, int caretPos) {
         // This callback is called from the async reader thread
-        WIND_LOG_DEBUG_FMT(L"Update composition received from Go service, textLen=%zu, caret=%d\n",
+        WIND_LOG_DEBUG_FMT(L"Update composition received from service, textLen=%zu, caret=%d\n",
                            text.length(), caretPos);
 
         if (pThis->_pLangBarItemButton != nullptr)
