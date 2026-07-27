@@ -698,6 +698,7 @@ impl Coordinator {
             }
             keymap::VK_SPACE => {
                 // space_as_input：空格作为输入字符入缓冲，仅回车上屏（对齐 Go）。
+                // 上屏职责随之转给回车，且回车此时取**高亮候选**而非原文（见下方 VK_RETURN）。
                 if self.rt().config.input.temp_english.space_as_input {
                     Self::temp_english_insert(state, ' ');
                     refresh(self, state)
@@ -725,6 +726,22 @@ impl Coordinator {
                     self.exit_temp_english(state);
                     self.notify_ui_hide();
                     return KeyAction::ClearComposition;
+                }
+                // space_as_input：空格已被占作输入字符，回车接过「上屏高亮候选」的职责——
+                // 否则该配置下一个选词键都不剩（allow_symbols 再开，数字键也让位于输入），
+                // 候选窗形同虚设。未导航时高亮就在首候选（=用户原文），故对「回车上屏原文」
+                // 的既有直觉向下兼容：只有主动导航过才会上屏别的候选。
+                if self.rt().config.input.temp_english.space_as_input
+                    && !state.candidates.is_empty()
+                {
+                    let idx = self
+                        .highlighted_global_index(state)
+                        .min(state.candidates.len() - 1);
+                    if let Some(act) = self.temp_english_try_command(state, idx) {
+                        return act;
+                    }
+                    let text = state.candidates[idx].text.clone();
+                    return commit_text(self, state, text);
                 }
                 // 回车：上屏原始输入文本（不取候选）；缓冲空时上屏触发键字符（触发键透传）
                 let text = if state.temp_english_buffer.is_empty() {

@@ -2238,6 +2238,102 @@ fn test_temp_english_digits_still_select_when_symbols_disallowed() {
     }
 }
 
+/// space_as_input 开：空格被占作输入字符，回车接过「上屏高亮候选」的职责。
+/// 回归点：该配置下空格不再选词，`allow_symbols` 再开则数字键也让位，若回车仍固定上屏原文，
+/// 就一个选词键都不剩、候选窗形同虚设。
+#[test]
+fn test_temp_english_space_as_input_enter_commits_highlighted() {
+    if !has_schemas() {
+        return;
+    }
+    let mut cfg = config_with("wubi86");
+    cfg.input.temp_english.space_as_input = true;
+    let coord = Coordinator::new_headless(cfg, Some(&data_dir()));
+    press_shift_letter(&coord, 'h');
+    press_letter(&coord, 'e');
+    press_letter(&coord, 'l'); // 候选 [Hel, hel, HEL, hell, ...]
+    coord.handle_key_event(&key_event(0x28, EVENT_KEY_DOWN)); // ↓ 高亮第 1 项
+    let (_, sel, _) = coord.debug_page_info();
+    assert_eq!(sel, 1, "前置条件：下方向键应把高亮移到第 1 项");
+    match coord.handle_key_event(&key_event(0x0D, EVENT_KEY_DOWN)) {
+        KeyAction::InsertText { text, .. } => {
+            assert_eq!(text, "hel", "space_as_input 下回车应上屏高亮候选")
+        }
+        other => panic!("回车应上屏高亮候选，实际: {:?}", other),
+    }
+}
+
+/// 同上配置但**未导航**：高亮停在首候选（=用户原文），故回车仍上屏原文——
+/// 对「回车上屏原文」的既有直觉向下兼容，只有主动导航过才会上屏别的候选。
+#[test]
+fn test_temp_english_space_as_input_enter_without_nav_commits_original() {
+    if !has_schemas() {
+        return;
+    }
+    let mut cfg = config_with("wubi86");
+    cfg.input.temp_english.space_as_input = true;
+    let coord = Coordinator::new_headless(cfg, Some(&data_dir()));
+    press_shift_letter(&coord, 'h');
+    press_letter(&coord, 'e');
+    press_letter(&coord, 'l');
+    match coord.handle_key_event(&key_event(0x0D, EVENT_KEY_DOWN)) {
+        KeyAction::InsertText { text, .. } => assert_eq!(text, "Hel", "未导航时回车应上屏原文"),
+        other => panic!("回车应上屏原文，实际: {:?}", other),
+    }
+}
+
+/// space_as_input 开的端到端：空格入缓冲打出带空格的短句，回车上屏整句。
+#[test]
+fn test_temp_english_space_as_input_multiword_enter() {
+    if !has_schemas() {
+        return;
+    }
+    let mut cfg = config_with("wubi86");
+    cfg.input.temp_english.space_as_input = true;
+    cfg.input.temp_english.trigger_keys = vec!["/".to_string()];
+    let coord = Coordinator::new_headless(cfg, Some(&data_dir()));
+    press_vk(&coord, 0xBF, false); // "/" 进入（首字母不受 Shift 影响）
+    for c in "hi".chars() {
+        press_letter(&coord, c);
+    }
+    coord.handle_key_event(&key_event(0x20, EVENT_KEY_DOWN)); // 空格入缓冲
+    let mut last = KeyAction::Consumed;
+    for c in "there".chars() {
+        last = press_letter(&coord, c);
+    }
+    assert_eq!(
+        action_text(&last).unwrap(),
+        "/hi there",
+        "空格应入缓冲（组合区含触发键前缀）"
+    );
+    match coord.handle_key_event(&key_event(0x0D, EVENT_KEY_DOWN)) {
+        KeyAction::InsertText { text, .. } => {
+            assert_eq!(text, "hi there", "回车应上屏整句（高亮在首候选=原文）")
+        }
+        other => panic!("回车应上屏整句，实际: {:?}", other),
+    }
+}
+
+/// 对照组：space_as_input 关（默认）时回车仍固定上屏原文，**即使已导航到别的候选**——
+/// 此时空格才是选词键，回车的「放弃候选、要我打的原文」语义必须保住。
+#[test]
+fn test_temp_english_enter_commits_original_when_space_selects() {
+    if !has_schemas() {
+        return;
+    }
+    let coord = Coordinator::new_headless(config_with("wubi86"), Some(&data_dir()));
+    press_shift_letter(&coord, 'h');
+    press_letter(&coord, 'e');
+    press_letter(&coord, 'l');
+    coord.handle_key_event(&key_event(0x28, EVENT_KEY_DOWN)); // ↓ 高亮第 1 项 (hel)
+    match coord.handle_key_event(&key_event(0x0D, EVENT_KEY_DOWN)) {
+        KeyAction::InsertText { text, .. } => {
+            assert_eq!(text, "Hel", "默认配置下回车应上屏原文而非高亮候选")
+        }
+        other => panic!("回车应上屏原文，实际: {:?}", other),
+    }
+}
+
 /// direct（默认）：临英缓冲是文本，小键盘数字/符号直接入缓冲 →「英文数字连输」可用。
 #[test]
 fn test_temp_english_numpad_direct_inputs() {

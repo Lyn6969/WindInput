@@ -870,6 +870,8 @@ pub struct TempEnglishConfig {
     /// 方向/翻页键导航 + 空格上屏。
     #[serde(default)]
     pub allow_symbols: bool,
+    /// 空格作为输入字符入缓冲（可打出带空格的英文短句）。上屏职责随之转给回车，
+    /// 且回车此时上屏**高亮候选**而非原文——否则该配置下没有任何选词键可用。
     #[serde(default)]
     pub space_as_input: bool,
 }

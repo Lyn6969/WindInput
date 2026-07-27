@@ -208,6 +208,8 @@ trigger_keys = []
 # allow_symbols：符号与数字直接入缓冲（C++ / hello2 / x64）而非上屏退出或选词。
 #                开启后数字键 1-9 不再当选词键，选词改走「方向/翻页键导航 + 空格上屏」。
 allow_symbols = false
+# space_as_input：空格作为输入字符入缓冲（可打出带空格的英文短句）。上屏职责转给回车，
+#                 且回车此时上屏「高亮候选」而非原文——否则该配置下没有任何选词键可用。
 space_as_input = false
 
 [input.capslock]
