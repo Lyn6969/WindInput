@@ -319,6 +319,16 @@ fn main() {
     let core_rpc: Arc<dyn wind_rpc::CoreRpc> = Arc::new(RpcCore(coord_for_web));
     match wind_rpc::RpcServer::new(core_rpc, variant, pipe_suffix) {
         Ok(rpc_server) => {
+            // 活跃方案变更 → RPC 事件广播。EngineManager 位于 wind-rpc 之下，无法直接
+            // 持有 EventSink，故在此接线——这里是唯一同时看得见两者的地方。接上后，
+            // 快捷键/托盘/RPC 任一路径切方案，设置界面都能收到通知（此前只有候选窗的
+            // push 通道收得到，而那条载荷里没有方案 id）。
+            let sink = rpc_server.event_sink();
+            wind_engine::active_hook::set_active_schema_hook(std::sync::Arc::new(
+                move |id: &str| {
+                    sink.broadcast("schema.activeChanged", serde_json::json!({ "id": id }));
+                },
+            ));
             if let Err(e) = rpc_server.start() {
                 error!("RPC server failed to start: {}", e);
             }

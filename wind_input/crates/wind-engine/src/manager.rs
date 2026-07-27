@@ -1187,12 +1187,16 @@ impl EngineManager {
         if !self.ensure_loaded(schema_id) {
             return false;
         }
-        let mut active = self.active.lock().unwrap_or_else(|e| e.into_inner());
-        if *active == schema_id {
-            return false;
+        {
+            let mut active = self.active.lock().unwrap_or_else(|e| e.into_inner());
+            if *active == schema_id {
+                return false;
+            }
+            info!("Switching schema: {} -> {}", *active, schema_id);
+            *active = schema_id.to_string();
         }
-        info!("Switching schema: {} -> {}", *active, schema_id);
-        *active = schema_id.to_string();
+        // 出锁后再通知：回调是上层代码（RPC 广播），不在持锁期间执行。
+        crate::active_hook::notify_active_changed(schema_id);
         true
     }
 
@@ -1279,6 +1283,9 @@ impl EngineManager {
             "EngineManager reloaded from config (active={}, changed={})",
             new_active, changed
         );
+        if changed {
+            crate::active_hook::notify_active_changed(&new_active);
+        }
         changed
     }
 
@@ -1298,9 +1305,12 @@ impl EngineManager {
                 continue;
             }
             if self.ensure_loaded(&cand) {
-                let mut active = self.active.lock().unwrap_or_else(|e| e.into_inner());
-                info!("Cycling schema: {} -> {}", *active, cand);
-                *active = cand.clone();
+                {
+                    let mut active = self.active.lock().unwrap_or_else(|e| e.into_inner());
+                    info!("Cycling schema: {} -> {}", *active, cand);
+                    *active = cand.clone();
+                }
+                crate::active_hook::notify_active_changed(&cand);
                 return Some(cand);
             }
         }
