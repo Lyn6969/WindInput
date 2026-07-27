@@ -7,8 +7,23 @@
 #   comment:              说明（仅文档用途）
 #   caret_use_top:        使用 caret rect 的 top 而非 bottom 定位候选框
 #                         适用于 GetTextExt 返回的 height 不稳定的 WebView 应用
+#   skip_caret_pending:   新组合首帧跳过「等宿主 reflow 后的权威坐标」，立即显示候选框
+#                         默认关。多数宿主在上屏后光标会漂移，若立即用按键前的旧坐标显示，
+#                         候选框会先错位出现再跳（这正是首帧等待要防的）。
+#                         但等待有代价：实测按键→候选框恒定 85~95ms（大头是 C++ 侧
+#                         OnLayoutChange 的 50ms debounce），快速连打时候选框只来得及
+#                         显示几毫秒，表现为「迟钝」。
+#                         若某宿主光标稳定（上屏后坐标立刻正确），可为它开启本项消除该延迟。
+#                         判断办法：开 debug 日志连打几次，若 caret_update 的 compStart
+#                         与按键前的 caret 坐标一致，即说明该宿主光标稳定。
 
 [[apps]]
 process = "Weixin.exe"
 comment = "微信 - Qt WebView 输入框 caret height 不稳定（h=1 或 h=20），使用 rect.top 定位"
 caret_use_top = true
+
+# 示例：为光标稳定的宿主消除候选框首显延迟（默认不启用，按需去掉注释并按实测调整）
+# [[apps]]
+# process = "EverEdit.exe"
+# comment = "光标稳定，无需等 reflow 权威坐标"
+# skip_caret_pending = true

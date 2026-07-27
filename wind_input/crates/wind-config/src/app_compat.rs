@@ -26,10 +26,16 @@ pub struct AppCompatRule {
     /// height 在 1↔20px 间跳变 → bottom 漂移 ~20px，但 top 始终稳定）。
     #[serde(default)]
     pub caret_use_top: bool,
-    /// 跳过首次 composition 的 CARET_PENDING 等待（光标稳定的应用）。
+    /// 跳过首次 composition 的 CARET_PENDING 等待（光标稳定的应用）：新组合首帧不等宿主
+    /// reflow 后的权威坐标，立即显示候选窗。消费点 `Coordinator::notify_ui_update` 的首显闸门。
     #[serde(default)]
     pub skip_caret_pending: bool,
     /// 固定候选窗位置：拖动后位置持久化记忆，跨会话恢复。
+    ///
+    /// ⚠ **当前是死字段，无任何消费点**：该能力后来由 `ui.candidate.position_mode = "fixed"`
+    /// 那一套（drag_pin > fixed > 跟随光标 三级优先级）实现，与本 per-app 开关无关。
+    /// 保留字段只为兼容既有 compat.toml 不报错；要么接线，要么随下次 compat 格式调整删除。
+    /// 故意不写进 `data/compat.toml` 的字段文档，避免承诺不存在的功能。
     #[serde(default)]
     pub pin_candidate_position: bool,
 }

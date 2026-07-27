@@ -130,8 +130,19 @@ STDAPI CCaretEditSession::DoEditSession(TfEditCookie ec)
                     if (SUCCEEDED(hr))
                     {
                         _hasCompositionStart = TRUE;
-                        WIND_LOG_DEBUG_FMT(L"CaretEditSession: Composition start (%ld, %ld)\n",
-                                  _compositionStartRect.left, _compositionStartRect.bottom);
+                        // 打全 4 值 + clipped：与上面 caret rect 同口径，便于直接比对两者差值
+                        // （caret 落在组合内容之后、compStart 锚在组合头部，两者之差 = 已插入的
+                        // 组合宽度）。只打 left/bottom 时看不出该 rect 是否退化（top==bottom），
+                        // 而退化正是宿主尚未 reflow 的信号。
+                        WIND_LOG_DEBUG_FMT(L"CaretEditSession: Composition start rect (%ld, %ld, %ld, %ld) clipped=%d\n",
+                                  _compositionStartRect.left, _compositionStartRect.top,
+                                  _compositionStartRect.right, _compositionStartRect.bottom, clippedComp);
+                    }
+                    else
+                    {
+                        // 失败即 compStart=(0,0) 上报，Rust 侧据此判定「本轮 reflow 坐标未到」而继续
+                        // 等待。此前无日志，表现为「组合起点一直锁不上」却查不到原因。
+                        WIND_LOG_DEBUG_FMT(L"CaretEditSession: Composition start GetTextExt failed hr=0x%08X\n", hr);
                     }
                     pStartRange->Release();
                 }

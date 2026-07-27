@@ -587,6 +587,25 @@ impl ConfigBundle {
     }
 }
 
+/// 当前焦点进程派生的 caret 兼容态，字段取自 `compat.toml` 的 `[[apps]]` 规则。
+///
+/// focus_gained / ime_activated 时按 `client_token` 高 32 位的 PID 解析进程名并缓存
+/// （见 `update_active_compat`），避免每次 caret 更新重复 OpenProcess。
+///
+/// 用命名结构体而非元组：两个 bool 语义完全不同，`(u32, bool, bool)` 的 `.1`/`.2`
+/// 在调用点无从分辨——本仓已有多次「下标/名字与实际语义脱节」的返工。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct ActiveCompat {
+    /// 已解析的焦点进程 PID（0 = 尚未解析，此时其余字段无意义）。
+    pub(crate) pid: u32,
+    /// 用 caret rect 的 top 而非 bottom 定位候选窗。微信等 WebView 宿主的 GetTextExt
+    /// height 在 1↔20px 间跳变致 bottom 漂移，top 稳定。
+    pub(crate) caret_use_top: bool,
+    /// 「光标稳定」的宿主：新组合首帧跳过等 reflow 权威坐标，立即显示候选窗。
+    /// 对齐 Go `AppCompatRule.SkipCaretPending`（其消费点 handle_key_action.go:207）。
+    pub(crate) skip_caret_pending: bool,
+}
+
 /// 中央协调器
 pub struct Coordinator {
     pub(crate) state: Mutex<State>,
@@ -656,10 +675,8 @@ pub struct Coordinator {
     composition_start: Mutex<(i32, i32, bool)>,
     /// 应用兼容规则表（compat.toml，系统层 + 用户层覆盖）。按焦点进程名查规则。
     app_compat: wind_config::app_compat::AppCompat,
-    /// 当前焦点进程派生的 caret 兼容态 `(pid, caret_use_top)`：focus_gained / ime_activated
-    /// 时按 client_token 高 32 位的 PID 解析进程名并缓存，避免每次 caret 更新重复 OpenProcess。
-    /// 微信等 WebView 应用置 caret_use_top=true，handle_caret_update 据此把候选窗从 bottom 改锚 top。
-    active_compat: Mutex<(u32, bool)>,
+    /// 当前焦点进程派生的 caret 兼容态，见 [`ActiveCompat`]。
+    active_compat: Mutex<ActiveCompat>,
     /// pid → 进程名（小写）缓存，`update_active_compat` 填充，会话级只增不清。
     /// 供 FOCUS_GAINED 同步路径（`get_current_mode`）免 OpenProcess 查询进程名。
     pid_names: Mutex<HashMap<u32, String>>,
@@ -1240,7 +1257,7 @@ impl Coordinator {
             show_authorized: std::sync::atomic::AtomicBool::new(false),
             composition_start: Mutex::new((0, 0, false)),
             app_compat,
-            active_compat: Mutex::new((0, false)),
+            active_compat: Mutex::new(ActiveCompat::default()),
             pid_names: Mutex::new(HashMap::new()),
             mode_states: Mutex::new(HashMap::new()),
             runtime_last: Mutex::new((init_chinese, init_full, init_punct)),
@@ -1318,19 +1335,26 @@ impl Coordinator {
             return;
         }
         let mut ac = self.active_compat.lock().unwrap_or_else(|e| e.into_inner());
-        if ac.0 == pid {
+        if ac.pid == pid {
             return; // 同进程，规则已缓存
         }
         let name = process_name(pid);
-        let use_top = self
-            .app_compat
-            .get_rule(&name)
-            .map(|r| r.caret_use_top)
-            .unwrap_or(false);
-        if use_top {
-            debug!("Compat rule matched: process={name} caret_use_top=true");
-        }
-        *ac = (pid, use_top);
+        let rule = self.app_compat.get_rule(&name);
+        let next = ActiveCompat {
+            pid,
+            caret_use_top: rule.map(|r| r.caret_use_top).unwrap_or(false),
+            skip_caret_pending: rule.map(|r| r.skip_caret_pending).unwrap_or(false),
+        };
+        // 无条件记录（对齐 Go handle_lifecycle.go:698）。原实现仅在 caret_use_top=true 时打，
+        // 规则未命中与「命中但全 false」在日志里无从区分，查「某应用兼容项没生效」时看不到
+        // 究竟是没匹配上进程名还是字段没读到。
+        debug!(
+            "Compat rule for process={name}: matched={} caret_use_top={} skip_caret_pending={}",
+            rule.is_some(),
+            next.caret_use_top,
+            next.skip_caret_pending
+        );
+        *ac = next;
         drop(ac);
         // 顺带填 pid→进程名缓存，供 FOCUS_GAINED 同步路径免 OpenProcess 查询（per-app 状态）。
         if !name.is_empty() {
@@ -1481,7 +1505,7 @@ impl Coordinator {
             .active_compat
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .0;
+            .pid;
         let name = self
             .pid_names
             .lock()
@@ -2315,15 +2339,51 @@ impl Coordinator {
         let authorized = self
             .show_authorized
             .swap(false, std::sync::atomic::Ordering::Relaxed);
-        if !authorized
-            && !*self
-                .candidate_shown
+        // 例外②③：两个「不必等」的逃生口。对齐 Go handle_key_action.go:207-209——本仓移植时
+        // 只搬了「等」的一侧，漏了 Go 用来跳过等待的这两项，故此前比 Go 原版更保守：无论坐标
+        // 是否已就绪、宿主是否光标稳定，新组合首帧一律压到 reflow 权威坐标才显示。实测代价是
+        // 按键→候选窗恒定 85~95ms（其中 C++ OnLayoutChange 的 50ms debounce 占大头），连打时
+        // 候选窗只来得及显示 2~29ms，表现为「迟钝」。
+        //   ② skip_caret_pending：compat.toml 把该宿主标记为「光标稳定、无 reflow 漂移」，
+        //      直接首显。连打场景**只有这一项能生效**——③ 依赖的组合起点会被
+        //      reset_first_show() 在每次上屏时复位（Go 的 clearState 同样如此）。
+        //   ③ 坐标已就绪：已有过有效 caret 且本轮组合起点已锁定 ⇒ 没有漂移可等。
+        //      对应 Go 的 `!caretValid || !compositionStartValid` 取反。
+        let skip_caret_pending = self
+            .active_compat
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .skip_caret_pending;
+        let coords_ready = self
+            .last_valid_caret
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .2
+            > 0
+            && self
+                .composition_start
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
-            && !only_mode_label
-        {
+                .2;
+        let shown = *self
+            .candidate_shown
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let is_first_frame = !authorized && !shown && !only_mode_label;
+        if is_first_frame && !skip_caret_pending && !coords_ready {
+            // 唯一的「等」出口。与下面的放行日志成对，两条合起来即可从服务端日志判定
+            // 每一帧走了哪条路、以及是哪个逃生口生效——不必再对着 TSF 日志比时间戳。
+            debug!(
+                "first_show 闸门 → 等待权威坐标（arm 150ms 兜底）: skip_caret_pending=0 coords_ready=0"
+            );
             self.arm_pending_first_show();
             return;
+        }
+        if is_first_frame {
+            debug!(
+                "first_show 闸门 → 立即显示（逃生口）: skip_caret_pending={} coords_ready={}",
+                skip_caret_pending as u8, coords_ready as u8
+            );
         }
         let t_nu = std::time::Instant::now();
         // 仅推送当前页候选（窗口按 1..N 编号，翻页后重新编号）
@@ -5167,11 +5227,17 @@ impl MessageHandler for Coordinator {
     }
 
     fn handle_caret_update(&self, data: &CaretData) {
+        // compStart 必须打：它是「本轮 composition 的 reflow 坐标是否已到」的唯一判据
+        // （compStart=(0,0) ⇒ 该帧来自 idle 更新，组合还没建立/还没 reflow），也是
+        // coords_ready 逃生口与嵌入模式定位锚点的来源。此前只打 x/y/h，查候选窗定位问题时
+        // 必须去翻 TSF 日志对时间戳才能补上这一维。
         tracing::debug!(
-            "handle_caret_update: x={} y={} h={}",
+            "handle_caret_update: x={} y={} h={} compStart=({},{})",
             data.x,
             data.y,
-            data.height
+            data.height,
+            data.composition_start_x,
+            data.composition_start_y
         );
         // height==0：宿主尚未 reflow，GetTextExt 返回退化矩形，坐标不可靠 → 跳过（不更新缓存、
         // 不触发显示），等 OnLayoutChange 后的有效坐标（对齐 Go HandleCaretUpdate）。
@@ -5194,7 +5260,7 @@ impl MessageHandler for Coordinator {
                 .active_compat
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
-                .1
+                .caret_use_top
         {
             let raw_h = data.height;
             data.y -= raw_h;
@@ -5212,10 +5278,15 @@ impl MessageHandler for Coordinator {
         let now_valid =
             !(data.x == 0 && data.y == 0) && data.x.abs() < 32000 && data.y.abs() < 32000;
         if !now_valid {
+            debug!("caret_update → 丢弃: 坐标无效（(0,0) 哨兵或越界）");
             return;
         }
         let composing = !state.candidates.is_empty() || !state.input_buffer.is_empty();
         if !composing {
+            // 常态、非异常：上屏后到下一键之间宿主仍会上报 caret。注意坐标**已在上面写入
+            // state.caret_x/y**，只是不做显示决策——这一条解释了「按键前明明收到过正确坐标，
+            // 候选窗却还在等 reflow」，是排查首显延迟时最容易看漏的一环。
+            debug!("caret_update → 仅更新缓存: 无组合（无候选且缓冲空），不做显示决策");
             return;
         }
         // 组合起点锚定：同一组合只接受首个有效 compStart，后续即便携带新值也不覆盖（防部分控件
@@ -5230,6 +5301,15 @@ impl MessageHandler for Coordinator {
                 let dy = (data.composition_start_y - data.y).abs();
                 if dx < 500 && dy < 500 {
                     *cs = (data.composition_start_x, data.composition_start_y, true);
+                    debug!(
+                        "组合起点锁定: ({},{})（本组合内不再更新；coords_ready 逃生口据此成立）",
+                        data.composition_start_x, data.composition_start_y
+                    );
+                } else {
+                    debug!(
+                        "组合起点丢弃: ({},{}) 距 caret dx={dx} dy={dy} ≥500px（疑 logical/physical 坐标系不一致）",
+                        data.composition_start_x, data.composition_start_y
+                    );
                 }
             }
         }
@@ -5245,6 +5325,7 @@ impl MessageHandler for Coordinator {
         };
         if was_pending {
             // 延迟的首次显示：用本权威坐标无条件首显（不过滤）。
+            debug!("caret_update → 首显: 消费 pending_first_show，本帧作权威坐标");
             self.show_authorized
                 .store(true, std::sync::atomic::Ordering::Relaxed);
             self.notify_ui_update(&state);
@@ -5258,11 +5339,18 @@ impl MessageHandler for Coordinator {
             let dx = (data.x - prev_x).abs();
             let dy = (data.y - prev_y).abs();
             if dx <= 3 && dy <= 3 {
+                debug!("caret_update → 忽略: 微移 dx={dx} dy={dy}（≤3px，不 reshow）");
                 return;
             }
+            debug!("caret_update → reshow: dx={dx} dy={dy}");
             self.show_authorized
                 .store(true, std::sync::atomic::Ordering::Relaxed);
             self.notify_ui_update(&state);
+        } else {
+            // 隐式出口：既没在等首显、候选窗也没显示着。此前这里静默结束，日志上与
+            // 「首显」「reshow」无从区分——查「候选窗为什么没出现」时这一条最要紧，
+            // 因为它说明本帧坐标到了但没有任何一方消费它。
+            debug!("caret_update → 无动作: 未等待首显且候选窗未显示，本帧仅落缓存");
         }
     }
 
@@ -5292,7 +5380,7 @@ impl MessageHandler for Coordinator {
             .active_compat
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .1
+            .caret_use_top
         {
             let raw_h = data.height;
             data.y -= raw_h;
@@ -5764,7 +5852,11 @@ mod caret_compat_tests {
     fn caret_use_top_shifts_y_to_top_and_keeps_real_line_height() {
         let c = coord();
         // 模拟焦点进程命中 caret_use_top 规则。
-        *c.active_compat.lock().unwrap() = (1234, true);
+        *c.active_compat.lock().unwrap() = ActiveCompat {
+            pid: 1234,
+            caret_use_top: true,
+            ..Default::default()
+        };
         c.handle_caret_update(&caret(200, 20));
         let s = c.state.lock().unwrap();
         // bottom(200) → top：200 - 20 = 180（下方显示锚此稳定值）。
@@ -5776,12 +5868,78 @@ mod caret_compat_tests {
     #[test]
     fn caret_use_top_degenerate_height_floored_to_min() {
         let c = coord();
-        *c.active_compat.lock().unwrap() = (1234, true);
+        *c.active_compat.lock().unwrap() = ActiveCompat {
+            pid: 1234,
+            caret_use_top: true,
+            ..Default::default()
+        };
         // 退化帧 height=1：top 仍稳定（bottom-1），但行高落到下限避免上方遮挡。
         c.handle_caret_update(&caret(200, 1));
         let s = c.state.lock().unwrap();
         assert_eq!(s.caret_y, 199);
         assert_eq!(s.caret_height, CARET_USE_TOP_MIN_LINE_H);
+    }
+
+    /// 走一次 notify_ui_update 的首显闸门，返回「是否 arm 了等待」。
+    /// 缓冲非空是必要前提，否则会先命中「空则隐藏」守卫、根本到不了闸门。
+    fn armed_after_first_frame(c: &Arc<Coordinator>) -> bool {
+        {
+            let mut s = c.state.lock().unwrap();
+            s.input_buffer = "a".to_string();
+        }
+        let s = c.state.lock().unwrap();
+        c.notify_ui_update(&s);
+        drop(s);
+        *c.pending_first_show.lock().unwrap()
+    }
+
+    #[test]
+    fn default_host_waits_for_authoritative_caret() {
+        // 对照组：无 compat 规则、坐标未就绪 → 保持原行为，等 reflow 权威坐标。
+        // 这条也是另外两个测试的有效性保证：若闸门被改成恒放行，此测试会挂。
+        let c = coord();
+        assert!(
+            armed_after_first_frame(&c),
+            "默认宿主首帧应 arm 等待权威坐标"
+        );
+    }
+
+    #[test]
+    fn skip_caret_pending_bypasses_first_show_wait() {
+        // 逃生口②：compat.toml 标记「光标稳定」的宿主直接首显。连打场景只有这一项能生效。
+        let c = coord();
+        *c.active_compat.lock().unwrap() = ActiveCompat {
+            pid: 1234,
+            skip_caret_pending: true,
+            ..Default::default()
+        };
+        assert!(
+            !armed_after_first_frame(&c),
+            "skip_caret_pending=true 应立即首显，不得 arm 等待"
+        );
+    }
+
+    #[test]
+    fn ready_coords_bypass_first_show_wait() {
+        // 逃生口③：已有过有效 caret 且本轮组合起点已锁定 ⇒ 没有漂移可等。
+        // 对应 Go 的 `!caretValid || !compositionStartValid` 取反。
+        let c = coord();
+        *c.last_valid_caret.lock().unwrap() = (100, 200, 20);
+        *c.composition_start.lock().unwrap() = (100, 200, true);
+        assert!(!armed_after_first_frame(&c), "坐标已就绪时不应再等 reflow");
+    }
+
+    #[test]
+    fn ready_coords_requires_both_caret_and_composition_start() {
+        // 逃生口③的两个分量必须同时成立：只有 caret 有效、组合起点未锁定时仍须等待
+        // ——组合起点未锁定正说明本轮 composition 的 reflow 坐标还没到。
+        let c = coord();
+        *c.last_valid_caret.lock().unwrap() = (100, 200, 20);
+        // composition_start 保持 (0,0,false)
+        assert!(
+            armed_after_first_frame(&c),
+            "仅 caret 有效、组合起点未锁定时应继续等待"
+        );
     }
 
     #[test]
@@ -5799,12 +5957,12 @@ mod caret_compat_tests {
         let c = coord();
         // client_token = PID<<32 | instance。PID=0（无效）不更新缓存。
         c.update_active_compat(0);
-        assert_eq!(*c.active_compat.lock().unwrap(), (0, false));
+        assert_eq!(*c.active_compat.lock().unwrap(), ActiveCompat::default());
         // 合法 PID：headless（非真实进程）下 process_name 取不到名字 → caret_use_top=false，
         // 但 pid 应被缓存（避免重复 OpenProcess）。
         let token = (4321u64 << 32) | 7;
         c.update_active_compat(token);
-        assert_eq!(c.active_compat.lock().unwrap().0, 4321);
+        assert_eq!(c.active_compat.lock().unwrap().pid, 4321);
     }
 }
 
@@ -5821,7 +5979,7 @@ mod initial_mode_tests {
 
     /// 注入焦点进程（headless 下 OpenProcess 取不到真实进程名，手动填缓存）。
     fn set_focus_proc(c: &Arc<Coordinator>, pid: u32, name: &str) {
-        c.active_compat.lock().unwrap().0 = pid;
+        c.active_compat.lock().unwrap().pid = pid;
         c.pid_names.lock().unwrap().insert(pid, name.to_string());
     }
 
