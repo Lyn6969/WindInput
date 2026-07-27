@@ -170,8 +170,14 @@ private:
     // 数字键必须在列：hold 期间无候选，它被 session_select_or_page 吃掉后服务端回
     // PassThrough，漏列就退回「吃了再吐」，EverEdit 这类宿主下数字会丢。
     //
-    // 仍未覆盖 Ctrl/Alt 组合：它们走 isCtrlAltCleanup，响应多为 Ack（pfEaten 仍为真），
-    // 进不到重放分支——hold 期间按 Ctrl+S 仍会被吃掉，需另行处理。
+    // 仍未覆盖 Ctrl/Alt 组合（Ctrl+S 等宿主快捷键）。此处曾断言它们「走 isCtrlAltCleanup、
+    // 响应为 Ack、会被吃掉」——**实测证伪**：hold 期间缓冲为空，服务端对 Ctrl+S / Ctrl+C
+    // 一律回 PassThrough，故 pfEaten 为假、`isCtrlAltCleanup && *pfEaten` 那段压根不执行，
+    // 符号也已在 PassThrough 分支的 FlushHoldCompositionIfActive 里收口。
+    // 真实症状与本函数治的是同一个：OnTestKeyDown 吃了、OnKeyDown 吐成 FALSE 的「吃了再吐」
+    // ——记事本/Chromium 补发所以正常，EverEdit 这类严格宿主丢键。
+    // 修法也同构：把重放条件放宽为 `_IsHoldReplayKey(vk) || (modifiers & (KEYMOD_CTRL|KEYMOD_ALT))`
+    // 即可（重放时物理修饰键仍按着，宿主 GetKeyState 能还原 Ctrl+S 语义）。暂未实施。
     BOOL _IsHoldReplayKey(WPARAM wParam) const
     {
         if (wParam >= '0' && wParam <= '9')                 return TRUE; // 主键盘数字
