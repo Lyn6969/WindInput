@@ -283,6 +283,9 @@ pub enum MenuCmd {
     TooltipScreenshot,
     /// 状态提示气泡：切换固定位置（position_mode fixed/follow_caret）
     StatusTogglePinned,
+    /// 为当前焦点应用切换「立即显示候选窗」（compat.toml 的 skip_caret_pending）：
+    /// 新组合首帧不等宿主 reflow 后的权威坐标，直接显示候选窗。写入用户层 compat.toml。
+    ToggleSkipCaretPending,
 }
 
 /// 菜单项的动作类型（右键候选菜单 + 功能主菜单共用）
@@ -340,6 +343,7 @@ impl MenuKind {
                 MenuCmd::StatusTogglePinned => 122,
                 MenuCmd::ToggleInputDiagnostics => 120,
                 MenuCmd::TogglePasswordSuppress => 121,
+                MenuCmd::ToggleSkipCaretPending => 123,
                 MenuCmd::SchemaSelect(i) => 1000 + i as i32,
                 MenuCmd::ThemeSelect(i) => 2000 + i as i32,
                 MenuCmd::FilterMode(i) => 3000 + i as i32,
@@ -378,6 +382,7 @@ impl MenuKind {
             118 => MenuCmd::TooltipCopy,
             119 => MenuCmd::TooltipScreenshot,
             122 => MenuCmd::StatusTogglePinned,
+            123 => MenuCmd::ToggleSkipCaretPending,
             120 => MenuCmd::ToggleInputDiagnostics,
             121 => MenuCmd::TogglePasswordSuppress,
             1000..=1999 => MenuCmd::SchemaSelect((id - 1000) as usize),
@@ -1520,3 +1525,68 @@ fn open_app(path: &str, args: &str) {
 
 #[cfg(not(windows))]
 fn open_app(_path: &str, _args: &str) {}
+
+#[cfg(test)]
+mod menu_id_tests {
+    use super::*;
+
+    /// `to_menu_id` 与 `from_menu_id` 是**两份手写的 match**，新增 MenuCmd 变体必须同时改两处。
+    /// 漏掉 `from_menu_id` 那侧的表现是「点了菜单毫无反应」且不留任何日志——极难联想到 id 映射。
+    /// 本测试锁住双向一致性，顺带也能抓出两个变体撞同一 id 的情况（撞号时 round-trip 必然不等）。
+    ///
+    /// ⚠ 编译器抓不到下面这张列表的遗漏：新增 MenuCmd 变体时请手动补一行。
+    #[test]
+    fn menu_cmd_id_roundtrip() {
+        let all = [
+            MenuCmd::SchemaEnglish,
+            MenuCmd::TogglePunct,
+            MenuCmd::ToggleWidth,
+            MenuCmd::ToggleS2t,
+            MenuCmd::ToggleToolbar,
+            MenuCmd::ReloadConfig,
+            MenuCmd::RestartService,
+            MenuCmd::OpenConfigDir,
+            MenuCmd::OpenAppDir,
+            MenuCmd::OpenLogDir,
+            MenuCmd::OpenDictionary,
+            MenuCmd::OpenSettings,
+            MenuCmd::OpenAbout,
+            MenuCmd::TakeScreenshot,
+            MenuCmd::ScreenshotCandidateToClipboard,
+            MenuCmd::ToggleInputDiagnostics,
+            MenuCmd::TogglePasswordSuppress,
+            MenuCmd::ToggleSkipCaretPending,
+            MenuCmd::StatusToggleAlways,
+            MenuCmd::StatusResetPosition,
+            MenuCmd::StatusScreenshot,
+            MenuCmd::StatusTogglePinned,
+            MenuCmd::TooltipCopy,
+            MenuCmd::TooltipScreenshot,
+            MenuCmd::SchemaSelect(0),
+            MenuCmd::SchemaSelect(7),
+            MenuCmd::ThemeSelect(3),
+            MenuCmd::FilterMode(2),
+            MenuCmd::ThemeStyle(1),
+        ];
+        for cmd in all {
+            let id = MenuKind::Command(cmd).to_menu_id();
+            let back = MenuKind::from_menu_id(id).unwrap_or_else(|| {
+                panic!("{cmd:?} → id={id} 无法反解析（from_menu_id 漏了该 id）")
+            });
+            assert_eq!(
+                back,
+                MenuKind::Command(cmd),
+                "{cmd:?} → id={id} → {back:?}：双向映射不一致（多为 id 撞号）"
+            );
+        }
+    }
+
+    /// 不可点击项（分隔符 / 子菜单）恒为 0，且 0 不得反解析成任何动作——
+    /// 否则点到分隔符会误触发某个命令。
+    #[test]
+    fn non_clickable_ids_are_inert() {
+        assert_eq!(MenuKind::Separator.to_menu_id(), 0);
+        assert_eq!(MenuKind::Submenu.to_menu_id(), 0);
+        assert!(MenuKind::from_menu_id(0).is_none());
+    }
+}

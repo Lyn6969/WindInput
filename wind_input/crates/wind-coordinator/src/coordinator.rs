@@ -674,12 +674,20 @@ pub struct Coordinator {
     /// （缓冲头部），不随输入移动。同一组合只锁定首个有效值（handle_caret_update），组合结束复位。
     composition_start: Mutex<(i32, i32, bool)>,
     /// 应用兼容规则表（compat.toml，系统层 + 用户层覆盖）。按焦点进程名查规则。
-    app_compat: wind_config::app_compat::AppCompat,
+    ///
+    /// 用 Mutex 而非不可变字段：右键菜单切换 per-app 开关后要写用户层并**立即重载**。
+    /// 只更新 `active_compat` 缓存是不够的——切到别的应用再切回来时 pid 变化两次，
+    /// `update_active_compat` 会拿这张表重新解析，用旧表就会把刚才的切换悄悄回滚。
+    pub(crate) app_compat: Mutex<wind_config::app_compat::AppCompat>,
+    /// 启动时的 (系统数据目录, 用户配置目录)，供 compat.toml 热重载复用同一口径。
+    /// 不用 `Config::data_dir()` 等静态函数：便携版/测试会传入自定义路径，静态函数
+    /// 拿到的是默认安装位置，重载后规则会与初次加载不一致。
+    pub(crate) compat_dirs: (Option<std::path::PathBuf>, Option<std::path::PathBuf>),
     /// 当前焦点进程派生的 caret 兼容态，见 [`ActiveCompat`]。
-    active_compat: Mutex<ActiveCompat>,
+    pub(crate) active_compat: Mutex<ActiveCompat>,
     /// pid → 进程名（小写）缓存，`update_active_compat` 填充，会话级只增不清。
     /// 供 FOCUS_GAINED 同步路径（`get_current_mode`）免 OpenProcess 查询进程名。
-    pid_names: Mutex<HashMap<u32, String>>,
+    pub(crate) pid_names: Mutex<HashMap<u32, String>>,
     /// 按应用独立中英状态表（`input.default.state_scope = "app"` 时启用）：
     /// 进程名（小写）→ chinese_mode，会话级记忆（服务重启即清，见计划决策）。
     mode_states: Mutex<HashMap<String, bool>>,
@@ -1256,7 +1264,11 @@ impl Coordinator {
             candidate_shown: Mutex::new(false),
             show_authorized: std::sync::atomic::AtomicBool::new(false),
             composition_start: Mutex::new((0, 0, false)),
-            app_compat,
+            app_compat: Mutex::new(app_compat),
+            compat_dirs: (
+                data_dir.map(|d| d.to_path_buf()),
+                user_dir.as_ref().map(|d| d.to_path_buf()),
+            ),
             active_compat: Mutex::new(ActiveCompat::default()),
             pid_names: Mutex::new(HashMap::new()),
             mode_states: Mutex::new(HashMap::new()),
@@ -1339,20 +1351,24 @@ impl Coordinator {
             return; // 同进程，规则已缓存
         }
         let name = process_name(pid);
-        let rule = self.app_compat.get_rule(&name);
-        let next = ActiveCompat {
-            pid,
-            caret_use_top: rule.map(|r| r.caret_use_top).unwrap_or(false),
-            skip_caret_pending: rule.map(|r| r.skip_caret_pending).unwrap_or(false),
+        let (next, rule_matched) = {
+            let table = self.app_compat.lock().unwrap_or_else(|e| e.into_inner());
+            let rule = table.get_rule(&name);
+            (
+                ActiveCompat {
+                    pid,
+                    caret_use_top: rule.map(|r| r.caret_use_top).unwrap_or(false),
+                    skip_caret_pending: rule.map(|r| r.skip_caret_pending).unwrap_or(false),
+                },
+                rule.is_some(),
+            )
         };
         // 无条件记录（对齐 Go handle_lifecycle.go:698）。原实现仅在 caret_use_top=true 时打，
         // 规则未命中与「命中但全 false」在日志里无从区分，查「某应用兼容项没生效」时看不到
         // 究竟是没匹配上进程名还是字段没读到。
         debug!(
             "Compat rule for process={name}: matched={} caret_use_top={} skip_caret_pending={}",
-            rule.is_some(),
-            next.caret_use_top,
-            next.skip_caret_pending
+            rule_matched, next.caret_use_top, next.skip_caret_pending
         );
         *ac = next;
         drop(ac);

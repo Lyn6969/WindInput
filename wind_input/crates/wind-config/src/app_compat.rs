@@ -5,30 +5,51 @@
 //! 系统预置（`{data_dir}/compat.toml`）→ 用户覆盖（`{user_config_dir}/compat.toml`），
 //! 用户层同进程名规则覆盖系统层。
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::Path;
 
 /// 默认兼容规则文件名。
 pub const COMPAT_FILE_NAME: &str = "compat.toml";
 
+/// 写回用户层 compat.toml 时的固定文件头。
+///
+/// 用户层由右键菜单自动管理，每次切换都会**整份重写**（TOML 序列化不保留注释），
+/// 故必须在文件里就把这件事讲明白，否则用户手写的说明被吞掉时无从得知原因。
+/// 完整的字段文档留在系统层 `data/compat.toml`——那份不会被程序改写。
+const USER_COMPAT_HEADER: &str = "\
+# 用户层应用兼容规则（覆盖 / 追加系统层 data/compat.toml）
+#
+# ⚠ 本文件由输入法右键菜单自动管理，每次通过菜单切换开关都会整份重写，
+#   手写的注释与排版不会保留。需要长期留存的说明请写在系统层 compat.toml。
+#
+# 合并语义：同名进程（不区分大小写）整条覆盖系统层，系统层其余规则保留。
+# 字段说明见系统层 data/compat.toml 顶部注释。
+
+";
+
+/// `skip_serializing_if` 用：省略默认为 false 的开关，避免写回时铺满一堆 `= false`。
+fn is_false(b: &bool) -> bool {
+    !*b
+}
+
 /// 单个应用的兼容性规则。
-#[derive(Debug, Clone, Deserialize, Default)]
+#[derive(Debug, Clone, Deserialize, Serialize, Default)]
 pub struct AppCompatRule {
     /// 进程名（不区分大小写），如 "Weixin.exe"。
     #[serde(default)]
     pub process: String,
     /// 说明（仅文档用途）。
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     pub comment: String,
     /// 使用 caret rect 的 top 而非 bottom 定位候选窗。
     /// 适用于 GetTextExt 返回的 height 不稳定的 WebView 应用（如微信 Qt 输入框，
     /// height 在 1↔20px 间跳变 → bottom 漂移 ~20px，但 top 始终稳定）。
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "is_false")]
     pub caret_use_top: bool,
     /// 跳过首次 composition 的 CARET_PENDING 等待（光标稳定的应用）：新组合首帧不等宿主
     /// reflow 后的权威坐标，立即显示候选窗。消费点 `Coordinator::notify_ui_update` 的首显闸门。
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "is_false")]
     pub skip_caret_pending: bool,
     /// 固定候选窗位置：拖动后位置持久化记忆，跨会话恢复。
     ///
@@ -36,8 +57,59 @@ pub struct AppCompatRule {
     /// 那一套（drag_pin > fixed > 跟随光标 三级优先级）实现，与本 per-app 开关无关。
     /// 保留字段只为兼容既有 compat.toml 不报错；要么接线，要么随下次 compat 格式调整删除。
     /// 故意不写进 `data/compat.toml` 的字段文档，避免承诺不存在的功能。
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "is_false")]
     pub pin_candidate_position: bool,
+}
+
+/// 在一组规则上切换指定进程的 `skip_caret_pending`，返回切换后的新值。
+///
+/// 纯函数（不碰文件系统），故可直接单测——本仓凡涉 `%APPDATA%` 落盘的逻辑都要这样
+/// 抽出来，否则端到端测试会真写用户配置目录（见 project_dict_override_sparse_merge 的教训）。
+///
+/// 语义对齐 Go `toggleUserCompatFlag`：进程名不区分大小写匹配；命中则翻转该字段、
+/// 其余字段保持不动；未命中则**追加**一条只带该开关的新规则（不是整表快照，
+/// 避免把系统层的其它字段冻结进用户层）。
+pub fn toggle_skip_caret_pending(rules: &mut Vec<AppCompatRule>, process: &str) -> bool {
+    let key = process.to_ascii_lowercase();
+    for r in rules.iter_mut() {
+        if r.process.to_ascii_lowercase() == key {
+            r.skip_caret_pending = !r.skip_caret_pending;
+            return r.skip_caret_pending;
+        }
+    }
+    rules.push(AppCompatRule {
+        process: process.to_string(),
+        skip_caret_pending: true,
+        ..Default::default()
+    });
+    true
+}
+
+/// 把规则集渲染成用户层 compat.toml 全文（含固定文件头）。纯函数，便于单测断言产物。
+pub fn render_user_compat(rules: &[AppCompatRule]) -> Result<String, toml::ser::Error> {
+    let file = AppCompatFile {
+        apps: rules.to_vec(),
+    };
+    Ok(format!("{USER_COMPAT_HEADER}{}", toml::to_string(&file)?))
+}
+
+/// 切换用户层 compat.toml 中指定进程的 `skip_caret_pending`，返回新值。
+///
+/// 只读写**用户层**：系统层 `data/compat.toml` 不受影响（合并时用户层同名进程整条覆盖它）。
+/// 文件或目录不存在时自动创建；解析失败按空规则集处理（宁可重建也不要把菜单卡死，
+/// 用户手改坏了 TOML 时仍能通过菜单恢复到可用状态）。
+pub fn toggle_user_skip_caret_pending(
+    user_dir: &Path,
+    process: &str,
+) -> Result<bool, std::io::Error> {
+    let path = user_dir.join(COMPAT_FILE_NAME);
+    let mut rules = load_file(&path).unwrap_or_default();
+    let new_value = toggle_skip_caret_pending(&mut rules, process);
+    let text = render_user_compat(&rules)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+    std::fs::create_dir_all(user_dir)?;
+    std::fs::write(&path, text)?;
+    Ok(new_value)
 }
 
 /// 所有应用兼容性规则 + 运行时查找表。
@@ -48,8 +120,8 @@ pub struct AppCompat {
     lookup: HashMap<String, usize>,
 }
 
-/// 反序列化中间体：仅承载 `[[apps]]` 数组，避免把 `lookup` 暴露给 TOML。
-#[derive(Debug, Deserialize, Default)]
+/// 序列化中间体：仅承载 `[[apps]]` 数组，避免把 `lookup` 暴露给 TOML。
+#[derive(Debug, Deserialize, Serialize, Default)]
 struct AppCompatFile {
     #[serde(default)]
     apps: Vec<AppCompatRule>,
@@ -193,5 +265,60 @@ mod tests {
         let merged = merge_rules(base, vec![]);
         assert_eq!(merged.len(), 1);
         assert!(merged[0].caret_use_top);
+    }
+
+    #[test]
+    fn toggle_flips_existing_rule_and_keeps_other_fields() {
+        // 命中已有规则：只翻 skip_caret_pending，caret_use_top / comment 不得被动。
+        let mut rules = vec![AppCompatRule {
+            process: "Weixin.exe".into(),
+            comment: "微信".into(),
+            caret_use_top: true,
+            ..Default::default()
+        }];
+        assert!(toggle_skip_caret_pending(&mut rules, "weixin.exe")); // 大小写无关
+        assert_eq!(rules.len(), 1, "命中时不得追加新规则");
+        assert!(rules[0].skip_caret_pending);
+        assert!(rules[0].caret_use_top, "其它开关不得被连带修改");
+        assert_eq!(rules[0].comment, "微信");
+        // 再切一次回到 false。
+        assert!(!toggle_skip_caret_pending(&mut rules, "Weixin.EXE"));
+        assert!(!rules[0].skip_caret_pending);
+    }
+
+    #[test]
+    fn toggle_appends_minimal_rule_when_absent() {
+        // 未命中：追加**只带该开关**的最小规则，不做整表快照（否则会把系统层其它字段
+        // 冻结进用户层，正是 project_dict_override_sparse_merge 记录过的坑）。
+        let mut rules: Vec<AppCompatRule> = Vec::new();
+        assert!(toggle_skip_caret_pending(&mut rules, "EverEdit.exe"));
+        assert_eq!(rules.len(), 1);
+        assert_eq!(rules[0].process, "EverEdit.exe", "应保留原始大小写");
+        assert!(rules[0].skip_caret_pending);
+        assert!(!rules[0].caret_use_top);
+        assert!(!rules[0].pin_candidate_position);
+    }
+
+    #[test]
+    fn render_omits_false_flags_and_roundtrips() {
+        // 渲染产物：false 开关与空 comment 全部省略（不铺 `= false`），且能被自己解析回来。
+        let rules = vec![AppCompatRule {
+            process: "EverEdit.exe".into(),
+            skip_caret_pending: true,
+            ..Default::default()
+        }];
+        let text = render_user_compat(&rules).expect("渲染失败");
+        assert!(text.contains("skip_caret_pending = true"));
+        assert!(
+            !text.contains("caret_use_top"),
+            "false 开关不应写出: {text}"
+        );
+        assert!(!text.contains("comment"), "空 comment 不应写出: {text}");
+        assert!(text.starts_with("# 用户层应用兼容规则"), "缺少文件头警示");
+
+        let parsed: AppCompatFile = toml::from_str(&text).expect("产物应可解析");
+        assert_eq!(parsed.apps.len(), 1);
+        assert!(parsed.apps[0].skip_caret_pending);
+        assert_eq!(parsed.apps[0].process, "EverEdit.exe");
     }
 }

@@ -81,6 +81,7 @@ impl Coordinator {
             MenuCmd::OpenLogDir => self.open_dir(Config::log_dir()),
             MenuCmd::ToggleInputDiagnostics => self.toggle_input_diag_hud(),
             MenuCmd::TogglePasswordSuppress => self.toggle_password_suppress(),
+            MenuCmd::ToggleSkipCaretPending => self.toggle_skip_caret_pending(),
             MenuCmd::StatusToggleAlways => self.status_toggle_always(),
             MenuCmd::StatusTogglePinned => self.status_toggle_pinned(),
             MenuCmd::StatusResetPosition => self.status_reset_position(),
@@ -312,6 +313,67 @@ impl Coordinator {
         // 同步给 DLL：吃键门控在 TSF 侧本地判定（早于 IPC），不推则开关对 DLL 无效——
         // 关掉抑制后 DLL 仍会放行所有键，这个「误置位时用来救场」的逃生阀就成了摆设。
         self.push_password_suppress_config(0);
+    }
+
+    /// 当前焦点进程名（小写，取自 `pid_names` 缓存）。未解析出进程时返回空串。
+    pub(crate) fn active_process_name(&self) -> String {
+        let pid = self
+            .active_compat
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .pid;
+        if pid == 0 {
+            return String::new();
+        }
+        self.pid_names
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&pid)
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    /// 为当前焦点应用切换「立即显示候选窗」（compat.toml 的 `skip_caret_pending`）。
+    ///
+    /// 三步收口，缺一不可：
+    ///   1. 写用户层 compat.toml（持久化，跨重启保留）；
+    ///   2. **重载规则表**——只改运行时缓存不够，切到别的应用再切回来时
+    ///      `update_active_compat` 会拿这张表重新解析，旧表会把本次切换悄悄回滚；
+    ///   3. 刷新当前 `active_compat` 缓存，使本次切换对当前应用立即生效
+    ///      （同 pid 时 `update_active_compat` 提前 return，不会自己刷）。
+    pub(crate) fn toggle_skip_caret_pending(&self) {
+        let name = self.active_process_name();
+        if name.is_empty() {
+            // 焦点进程未解析（尚无焦点 / OpenProcess 失败）。菜单项此时应是禁用态，
+            // 走到这里说明有别的路径调用，记一条便于排查——静默返回会让用户以为点了没反应。
+            tracing::warn!("toggle_skip_caret_pending: 当前焦点进程未知，忽略本次切换");
+            return;
+        }
+        let Some(user_dir) = self.compat_dirs.1.clone() else {
+            tracing::warn!("toggle_skip_caret_pending: 无用户配置目录，无法持久化");
+            return;
+        };
+        let new_value =
+            match wind_config::app_compat::toggle_user_skip_caret_pending(&user_dir, &name) {
+                Ok(v) => v,
+                Err(e) => {
+                    tracing::error!("toggle_skip_caret_pending: 写用户 compat.toml 失败: {e}");
+                    return;
+                }
+            };
+        // 2）重载整表（系统层 + 用户层），与启动时同一口径。
+        let reloaded = wind_config::app_compat::AppCompat::load(
+            self.compat_dirs.0.as_deref(),
+            Some(user_dir.as_path()),
+        );
+        *self.app_compat.lock().unwrap_or_else(|e| e.into_inner()) = reloaded;
+        // 3）当前应用立即生效。
+        self.active_compat
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .skip_caret_pending = new_value;
+        tracing::info!("立即显示候选窗 for process={name}: {new_value}");
+        self.show_status();
     }
 
     /// 在文件管理器中打开目录（高级菜单「打开…目录」共用）。
@@ -555,6 +617,32 @@ impl Coordinator {
                 self.password_suppress_enabled
                     .load(std::sync::atomic::Ordering::Relaxed),
             ),
+            // 「立即显示候选窗」per-app 开关（对齐 Go UnifiedMenuSkipCaretPending）：标签带进程名，
+            // 让用户清楚这是只对当前应用生效、且会写进用户 compat.toml 的设置。
+            // 进程名未解析时禁用而非隐藏——菜单项位置稳定，用户不会以为功能消失了。
+            {
+                let proc = self.active_process_name();
+                let checked = self
+                    .active_compat
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .skip_caret_pending;
+                if proc.is_empty() {
+                    M::leaf(
+                        "立即显示候选窗（当前应用未知）",
+                        cmd(MenuCmd::ToggleSkipCaretPending),
+                        false,
+                        false,
+                    )
+                } else {
+                    M::leaf(
+                        format!("为 {proc} 立即显示候选窗"),
+                        cmd(MenuCmd::ToggleSkipCaretPending),
+                        true,
+                        checked,
+                    )
+                }
+            },
         ];
 
         let items = vec![
