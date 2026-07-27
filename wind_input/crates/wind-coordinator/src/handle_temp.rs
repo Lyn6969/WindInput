@@ -4,8 +4,7 @@
 //! 触发键判定、进入/退出、候选刷新、按键处理、选词上屏。
 
 use crate::coordinator::{
-    Coordinator, ENGINE_MAX_CANDIDATES, EnCase, State, adapt_en_case, detect_en_case, numpad_char,
-    punct_char,
+    Coordinator, ENGINE_MAX_CANDIDATES, State, en_case_variants, numpad_char, punct_char,
 };
 use crate::pipeline::{ModeKind, Rewind};
 use crate::preedit_cursor;
@@ -566,8 +565,17 @@ impl Coordinator {
         state.candidates.clear();
     }
 
-    /// 刷新临时英文候选：首候选=用户原始输入，其后为英文词库前缀匹配（大小写适配）。
-    /// 需 `shift_temp_english.show_candidates` 开启才查词库；词库为固定 id "english" 方案。
+    /// 刷新临时英文候选：`原文 → 大小写变形 → 英文词库前缀匹配（保持词库原文）`。
+    /// 需 `temp_english.show_candidates` 开启才产出变形与词库候选；词库为固定 id "english" 方案。
+    ///
+    /// 词库候选**不再按输入形态适配大小写**（旧 `adapt_en_case` 已删）——临英由 Shift+字母进入，
+    /// 缓冲首字母恒大写，旧适配便把整列候选强制套成 `Hello`/`Help`，而词库 86% 的词本是小写。
+    /// 大小写改由 [`en_case_variants`] 产出的显式变形候选承载，位置紧随原文（1-3 号键即可取到
+    /// 三种形态），词库候选顺延其后。
+    ///
+    /// 去重按**精确文本**（旧实现按小写去重）：变形候选之间恰是同一小写形态的不同大小写，
+    /// 小写去重会把它们全部抹掉。精确去重同时仍能挡住与原文/变形重复的词库项
+    /// （如缓冲 `Hello` 时词库的 `hello` 被变形候选先占位挡下）。
     pub(crate) fn update_temp_english_candidates(&self, state: &mut State) {
         state.candidates.clear();
         state.current_page = 0;
@@ -583,28 +591,29 @@ impl Coordinator {
             natural_order: 0,
             ..Default::default()
         }];
+        let mut seen = std::collections::HashSet::new();
+        seen.insert(buf.clone());
+        let mut push = |text: String, cands: &mut Vec<Candidate>| {
+            if !seen.insert(text.clone()) {
+                return;
+            }
+            let order = cands.len() as i32;
+            cands.push(Candidate {
+                text,
+                natural_order: order,
+                ..Default::default()
+            });
+        };
         if let Some(schema) = self.overlay_engine_schema(state) {
-            let lower = buf.to_lowercase();
-            let case = detect_en_case(&buf);
-            let result = self.engine_mgr.convert_with(&schema, &lower, 60);
-            let mut seen = std::collections::HashSet::new();
-            seen.insert(lower);
-            for (i, c) in result.candidates.into_iter().enumerate() {
-                let cl = c.text.to_lowercase();
-                if !seen.insert(cl.clone()) {
-                    continue;
-                }
-                // 词库全小写词按输入大小写适配；专有词（iPhone/Aaron）保持原样。
-                let display = if case != EnCase::Lower && c.text == cl {
-                    adapt_en_case(&c.text, case)
-                } else {
-                    c.text
-                };
-                cands.push(Candidate {
-                    text: display,
-                    natural_order: (i + 1) as i32,
-                    ..Default::default()
-                });
+            // 大小写变形（全小写 / 首字母大写 / 全大写，去掉与原文相同者）。
+            for v in en_case_variants(&buf) {
+                push(v, &mut cands);
+            }
+            let result = self
+                .engine_mgr
+                .convert_with(&schema, &buf.to_lowercase(), 60);
+            for c in result.candidates {
+                push(c.text, &mut cands);
             }
         }
         // 统一展开汇聚点：临时英文词库候选内 `$` 特殊语法在此展开（见 finalize_candidates）。
@@ -737,10 +746,15 @@ impl Coordinator {
                 refresh(self, state)
             }
             keymap::VK_1..=keymap::VK_9 if data.modifiers & MOD_SHIFT == 0 => {
+                // allow_symbols 开：数字是合法英文内容（hello2 / mp3 / x64），一律入缓冲——
+                // 该开关的语义是「英文原文优先于选词」，此前它只接到下方标点臂，数字臂完全没读它，
+                // 于是开了开关也仍被候选抢走；连带 `0` 走独立臂无条件入缓冲，成了「0 能打、1-9 不能」
+                // 的不一致。此时选词改走：方向/翻页键导航高亮 + 空格上屏（回车仍上屏原文）。
+                let digits_as_input = self.rt().config.input.temp_english.allow_symbols;
                 // 数字：有词库候选（>1，即除原文外还有匹配）时按页选词；否则作输入（英文含数字 v2）
                 let (start, end) = self.page_range(state);
                 let gi = start + (data.key_code - 0x31) as usize;
-                if state.candidates.len() > 1 && gi < end {
+                if !digits_as_input && state.candidates.len() > 1 && gi < end {
                     if let Some(act) = self.temp_english_try_command(state, gi) {
                         return act;
                     }

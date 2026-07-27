@@ -852,6 +852,9 @@ pub struct TempEnglishConfig {
     /// 触发键（符号键进入临时英文模式，类似临时拼音触发键）。默认空（仅 Shift+字母触发）。
     #[serde(default)]
     pub trigger_keys: Vec<String>,
+    /// 允许符号与数字直接入缓冲（`C++` / `hello2` / `x64`）而非触发上屏或选词。
+    /// 开启后数字键 1-9 也不再当选词键——语义是「英文原文优先于选词」，选词改走
+    /// 方向/翻页键导航 + 空格上屏。
     #[serde(default)]
     pub allow_symbols: bool,
     #[serde(default)]

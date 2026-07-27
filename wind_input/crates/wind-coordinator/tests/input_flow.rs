@@ -2000,6 +2000,110 @@ fn test_temp_english_digits_and_punct() {
     }
 }
 
+/// 临英候选排布：`原文 → 大小写变形 → 词库原文`，且词库候选**不再被套上输入的大小写形态**。
+/// 回归点：临英由 Shift+字母进入，缓冲首字母恒大写，旧实现据此把整列词库候选适配成
+/// `Help`/`Held`/`Hell`，于是「候选全是大写首字母」。
+#[test]
+fn test_temp_english_case_variants_and_dict_keeps_original_case() {
+    if !has_schemas() {
+        return;
+    }
+    let coord = Coordinator::new_headless(config_with("wubi86"), Some(&data_dir()));
+    press_shift_letter(&coord, 'h'); // H
+    press_letter(&coord, 'e');
+    press_letter(&coord, 'l'); // 缓冲 "Hel"
+
+    let texts = coord.debug_all_candidate_texts();
+    assert_eq!(
+        texts.iter().take(3).collect::<Vec<_>>(),
+        vec!["Hel", "hel", "HEL"],
+        "前三候选应为 原文 → 全小写 → 全大写（原文已是首字母大写，Title 变形被去重），实际: {:?}",
+        texts
+    );
+    assert!(
+        texts.iter().any(|t| t == "help"),
+        "词库候选应保持原文小写，实际: {:?}",
+        texts
+    );
+    assert!(
+        !texts.iter().any(|t| t == "Help"),
+        "词库候选不应被适配成输入的首字母大写形态，实际: {:?}",
+        texts
+    );
+    assert!(
+        texts.iter().any(|t| t == "Helen"),
+        "词库中本就大写的专有名词应原样保留，实际: {:?}",
+        texts
+    );
+}
+
+/// 变形候选对全小写 / 全大写输入同样自洽：缺哪种形态就补哪种，原文永远排首位。
+#[test]
+fn test_temp_english_case_variants_from_lowercase_entry() {
+    if !has_schemas() {
+        return;
+    }
+    // 触发键进入 → 缓冲首字母不受 Shift 影响，可打出全小写原文。
+    let mut cfg = config_with("wubi86");
+    cfg.input.temp_english.trigger_keys = vec!["/".to_string()];
+    let coord = Coordinator::new_headless(cfg, Some(&data_dir()));
+    press_vk(&coord, 0xBF, false); // "/" 进入临英
+    for c in "hel".chars() {
+        press_letter(&coord, c);
+    }
+    let texts = coord.debug_all_candidate_texts();
+    assert_eq!(
+        texts.iter().take(3).collect::<Vec<_>>(),
+        vec!["hel", "Hel", "HEL"],
+        "全小写输入应补出首字母大写与全大写两个变形，实际: {:?}",
+        texts
+    );
+}
+
+/// allow_symbols 开：数字键 1-9 一律入缓冲（英文原文优先于选词），即使此刻有词库候选。
+#[test]
+fn test_temp_english_allow_symbols_digits_go_to_buffer() {
+    if !has_schemas() {
+        return;
+    }
+    let mut cfg = config_with("wubi86");
+    cfg.input.temp_english.allow_symbols = true;
+    let coord = Coordinator::new_headless(cfg, Some(&data_dir()));
+    press_shift_letter(&coord, 'h');
+    press_letter(&coord, 'e');
+    press_letter(&coord, 'l'); // "Hel" —— 此刻词库候选非空
+    assert!(
+        coord.debug_all_candidate_texts().len() > 1,
+        "前置条件：此刻应有候选，否则测不出「有候选时数字仍入缓冲」"
+    );
+    let act = press_vk(&coord, 0x32, false); // 2
+    assert_eq!(
+        action_text(&act).unwrap(),
+        "Hel2",
+        "allow_symbols 开启时数字应入缓冲而非选第 2 个候选"
+    );
+    // 符号同样入缓冲（既有行为），并可继续与数字混排。
+    let act = press_vk(&coord, 0xBD, false); // "-"
+    assert_eq!(action_text(&act).unwrap(), "Hel2-", "符号应入缓冲");
+}
+
+/// 对照组：allow_symbols 关（默认）时数字键仍是选词键——守住既有行为不被上面的改动误伤。
+#[test]
+fn test_temp_english_digits_still_select_when_symbols_disallowed() {
+    if !has_schemas() {
+        return;
+    }
+    let coord = Coordinator::new_headless(config_with("wubi86"), Some(&data_dir()));
+    press_shift_letter(&coord, 'h');
+    press_letter(&coord, 'e');
+    press_letter(&coord, 'l'); // 候选 [Hel, hel, HEL, held, ...]
+    match coord.handle_key_event(&key_event(0x32, EVENT_KEY_DOWN)) {
+        // 2 → 第 2 个候选 = 全小写变形
+        KeyAction::InsertText { text, .. } => assert_eq!(text, "hel"),
+        other => panic!("数字键应选第 2 个候选并上屏，实际: {:?}", other),
+    }
+}
+
 /// direct（默认）：临英缓冲是文本，小键盘数字/符号直接入缓冲 →「英文数字连输」可用。
 #[test]
 fn test_temp_english_numpad_direct_inputs() {

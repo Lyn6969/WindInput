@@ -200,9 +200,13 @@ smart_method = "delete_replace"
 
 [input.temp_english]
 enabled = true
+# show_candidates：候选列表 = 原文 → 大小写变形（全小写/首字母大写/全大写，去掉与原文重复者）
+#                  → 英文词库前缀匹配（保持词库原文大小写）。关闭则只留原文一条。
 show_candidates = true
 shift_behavior = "temp_english"
 trigger_keys = []
+# allow_symbols：符号与数字直接入缓冲（C++ / hello2 / x64）而非上屏退出或选词。
+#                开启后数字键 1-9 不再当选词键，选词改走「方向/翻页键导航 + 空格上屏」。
 allow_symbols = false
 space_as_input = false
 

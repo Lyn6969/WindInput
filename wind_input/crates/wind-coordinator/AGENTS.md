@@ -46,7 +46,7 @@
 
 ### Testing Requirements
 - 本 crate **传递依赖 `windows` crate**（自身 `cfg(windows)` + 经 wind-bridge/wind-ui/wind-ipc 等），**不能在 host 跑 `cargo test -p wind-coordinator`**；需 Windows 目标交叉编译 / 设备验证。
-- 纯逻辑函数（`detect_en_case`/`adapt_en_case`/`parse_pairs`/`punct_char` 等）逻辑独立，可借设备/CI 上的集成测试或无头构造器（`new_headless`）覆盖。
+- 纯逻辑函数（`en_case_variants`/`parse_pairs`/`punct_char` 等）逻辑独立，可借设备/CI 上的集成测试或无头构造器（`new_headless`）覆盖。
 
 ## Dependencies
 

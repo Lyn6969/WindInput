@@ -231,48 +231,33 @@ pub(crate) fn numpad_char(key_code: u32) -> Option<char> {
     }
 }
 
-/// 英文输入大小写模式（临时英文候选适配用，对齐 Go detectCasePattern）。
-#[derive(Clone, Copy, PartialEq, Eq)]
-pub(crate) enum EnCase {
-    Lower,
-    Upper,
-    Title,
-    Mixed,
-}
-
-/// 检测缓冲的大小写模式（仅看字母）。
-pub(crate) fn detect_en_case(s: &str) -> EnCase {
-    let letters: Vec<char> = s.chars().filter(|c| c.is_ascii_alphabetic()).collect();
-    if letters.is_empty() {
-        return EnCase::Lower;
-    }
-    if letters.iter().all(|c| c.is_ascii_lowercase()) {
-        return EnCase::Lower;
-    }
-    if letters.len() > 1 && letters.iter().all(|c| c.is_ascii_uppercase()) {
-        return EnCase::Upper;
-    }
-    // 首字母大写、其余小写（含单个大写字母如 "A"）→ Title
-    if letters[0].is_ascii_uppercase() && letters[1..].iter().all(|c| c.is_ascii_lowercase()) {
-        return EnCase::Title;
-    }
-    EnCase::Mixed
-}
-
-/// 把词库单词适配为输入的大小写模式（对齐 Go adaptCase）。
-pub(crate) fn adapt_en_case(word: &str, case: EnCase) -> String {
-    match case {
-        EnCase::Lower => word.to_lowercase(),
-        EnCase::Upper => word.to_uppercase(),
-        EnCase::Title => {
-            let mut chars = word.chars();
-            match chars.next() {
-                Some(f) => f.to_uppercase().collect::<String>() + &chars.as_str().to_lowercase(),
-                None => String::new(),
-            }
+/// 用户输入的大小写**变形候选**：按 全小写 → 首字母大写 → 全大写 的固定次序产出，
+/// 并剔除与原文相同的那一项（原文自身是首候选，无需重复）。纯 ASCII 语义即够用——
+/// 临英缓冲只可能由 VK 字母 / 数字 / ASCII 标点组成。
+///
+/// 之所以是「枚举三形态」而非旧的「检测输入形态 → 适配词库候选」（`detect_en_case` /
+/// `adapt_en_case`，已删）：Shift+字母是临英的进入方式，缓冲首字母**恒为大写**，
+/// 于是旧检测恒返回 Title，把整列词库候选强制套成 `Hello`/`Help`/`Held`，
+/// 而词库里 86% 的词本是小写。触发方式的副作用被当成了用户的大小写意图。
+/// 现在词库候选一律保持原文，大小写改由用户在这几个变形候选里显式选。
+///
+/// 副产物：对全大写、混合大小写输入也自洽——原文是哪种形态，缺的另两种就自动补齐。
+/// 无字母的缓冲（如 `123`）三形态皆等于原文，返回空表。
+pub(crate) fn en_case_variants(s: &str) -> Vec<String> {
+    let lower = s.to_lowercase();
+    let mut chars = lower.chars();
+    let title = match chars.next() {
+        Some(f) => f.to_uppercase().collect::<String>() + chars.as_str(),
+        None => String::new(),
+    };
+    // 三形态间也可能互等（单个小写字母 "a" → title/upper 同为 "A"），故一并有序去重。
+    let mut out: Vec<String> = Vec::with_capacity(3);
+    for v in [lower, title, s.to_uppercase()] {
+        if v != s && !out.contains(&v) {
+            out.push(v);
         }
-        EnCase::Mixed => word.to_string(),
     }
+    out
 }
 
 /// VK + shift → 可打印 ASCII 字符（字母按 shift 决定大小写、数字/符号复用 punct_char）。
