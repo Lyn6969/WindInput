@@ -185,7 +185,10 @@ private:
     // 真实症状与本函数治的是同一个：OnTestKeyDown 吃了、OnKeyDown 吐成 FALSE 的「吃了再吐」
     // ——记事本/Chromium 补发所以正常，EverEdit 这类严格宿主丢键。
     // 修法也同构：把重放条件放宽为 `_IsHoldReplayKey(vk) || (modifiers & (KEYMOD_CTRL|KEYMOD_ALT))`
-    // 即可（重放时物理修饰键仍按着，宿主 GetKeyState 能还原 Ctrl+S 语义）。暂未实施。
+    // 即可（重放时物理修饰键仍按着，宿主 GetKeyState 能还原 Ctrl+S 语义）。暂未实施——触及面
+    // 小：只在「hold 的 500ms 窗口内」+「严格 TSF 宿主」同时成立时才丢那一次快捷键，符号本身
+    // 不丢。完整背景、实测探测方法与「普通输入会话下同类翻转尚未验证」的提醒见
+    // docs/architecture/smart-symbol-compat-notes.md 的「HoldComposition 方案」一节。
     BOOL _IsHoldReplayKey(WPARAM wParam) const
     {
         if (wParam >= '0' && wParam <= '9')                 return TRUE; // 主键盘数字
