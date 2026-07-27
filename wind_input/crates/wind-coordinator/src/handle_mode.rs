@@ -93,30 +93,54 @@ impl Coordinator {
             .unwrap_or_default()
     }
 
-    /// mix 模式可加载的成员方案列表（过滤空/不可加载）。
-    /// mix 可用的真实方案成员（过滤空 / 不可加载 / 内置 quick_input）。
+    /// mix 可用的**真实方案**成员（过滤空 / 不可加载 / 快捷输入内置来源）。
+    ///
+    /// 快捷来源（`quick_input.*`）没有 `.schema.toml`，由协调器直接产候选，故排除在外。
+    /// 英文候选的开关**只看 members 有无**——旧的 `quick_input.enable_english` 旁路已废弃
+    /// （它与 members 构成双真相源，且这里与 `update_mix_candidates` 各过滤一遍）。
     pub(crate) fn mix_members(&self, idx: u8) -> Vec<String> {
-        // 快捷英文候选关时，english 成员不计入（与 update_mix_candidates 一致，读快捷开关）。
-        let enable_english = self.rt().config.schema.quick_input.enable_english;
         self.mix_members_resolved(idx)
             .into_iter()
             .filter(|s| {
                 !s.is_empty()
-                    && s != "quick_input"
-                    && (s != "english" || enable_english)
+                    && !wind_quick_input::is_quick_member(s)
                     && self.engine_mgr.ensure_schema(s)
             })
             .collect()
     }
 
-    /// mix 是否含内置类方案 quick_input（日期/计算）成员——启用「首字符数字/字母决定选词逻辑」。
+    /// mix 是否含**任一**快捷输入内置来源（计算/日期/数字/重复）。
+    /// 用于「进入条件」与「强制竖排」——只配了重复上屏的 mix 也算快捷输入。
     pub(crate) fn mix_has_quick_input(&self, idx: u8) -> bool {
         self.rt()
             .config
             .schema
             .mix_modes
             .get(idx as usize)
-            .map(|m| m.members.iter().any(|s| s == "quick_input"))
+            .map(|m| {
+                m.members
+                    .iter()
+                    .any(|s| wind_quick_input::is_quick_member(s))
+            })
+            .unwrap_or(false)
+    }
+
+    /// mix 是否含**表达式类**来源（计算/日期/数字）——启用数字透镜：
+    /// 首字符数字/符号进表达式录入、字母作选词、`-`/`=` 是运算符而非翻页键。
+    ///
+    /// 刻意与 [`Self::mix_has_quick_input`] 分开：`quick_input.repeat` 不录入表达式，
+    /// 只配了它的 mix 若开数字透镜，数字键会变成录不进任何候选的死输入。
+    pub(crate) fn mix_has_quick_numeric(&self, idx: u8) -> bool {
+        self.rt()
+            .config
+            .schema
+            .mix_modes
+            .get(idx as usize)
+            .map(|m| {
+                m.members
+                    .iter()
+                    .any(|s| wind_quick_input::QuickSource::from_member(s).is_some())
+            })
             .unwrap_or(false)
     }
 
@@ -222,6 +246,7 @@ impl Coordinator {
         state.active = None;
         state.mix_buffer.clear();
         state.mix_cursor = 0;
+        state.mix_repeat = false;
         state.mix_prefix.clear();
         state.committed_text.clear();
         state.committed_segs.clear();
@@ -688,7 +713,7 @@ impl Coordinator {
         {
             return act;
         }
-        let numeric = self.mix_has_quick_input(state.mix_id) && state.mix_numeric;
+        let numeric = self.mix_has_quick_numeric(state.mix_id) && state.mix_numeric;
         let total = state.mix_buffer.len();
         let consumed = cand.consumed_length;
         let partial = !numeric
@@ -740,6 +765,10 @@ impl Coordinator {
                     cand.boundary,
                 ));
                 self.learn_phrase_on_commit(state);
+            } else {
+                // 数字透镜（计算/日期/金额）无编码可记词频，但同样是一次上屏：
+                // 单独记历史，使「算完再按 ; 空格」能重复刚上屏的结果。
+                self.push_commit_history(&cand.text);
             }
             // 输入统计：混合模式上屏（计算结果 code_len=0；选词用候选码长）。
             self.record_commit(
@@ -760,13 +789,18 @@ impl Coordinator {
     }
 
     /// 刷新 mix 候选：按配置成员序逐个查询、合并、按文本去重。
-    /// "quick_input" 是内置类方案（日期/计算），用 generate_quick_input_candidates 计算；
-    /// 其余为真实方案经 convert_with。数字模式只取 quick_input（表达式），文本模式只取真实方案
-    /// （拼音/英文），避免互相污染候选。
+    ///
+    /// 成员分三类：快捷输入内置来源（`quick_input.calc/.date/.number`，由
+    /// `wind_quick_input` 直接算）、重复上屏（`quick_input.repeat`，取上屏历史，**仅空缓冲时**）、
+    /// 真实方案（拼音/英文等，经 `convert_with`）。
+    ///
+    /// 数字透镜只取内置来源（表达式无拼音/英文意义），文本透镜只取真实方案，避免互相污染。
+    /// **成员顺序即候选优先级**——把 `quick_input.calc` 排在最前即得「计算结果作首选」。
     pub(crate) fn update_mix_candidates(&self, state: &mut State) {
         state.candidates.clear();
         state.current_page = 0;
         state.selected_index = 0;
+        state.mix_repeat = false;
         // 组合区 = 显示态前缀 + 已转换前缀（文本透镜逐步转换累积）+ 剩余缓冲。
         state.preedit = format!(
             "{}{}{}",
@@ -775,37 +809,36 @@ impl Coordinator {
         // 默认主体 = 原始缓冲；文本透镜若给出音节分隔显示，下方会覆盖为该显示串。
         state.overlay_body = state.mix_buffer.clone();
         if state.mix_buffer.is_empty() {
+            self.inject_mix_repeat_candidate(state);
             return;
         }
-        let numeric = self.mix_has_quick_input(state.mix_id) && state.mix_numeric;
+        let numeric = self.mix_has_quick_numeric(state.mix_id) && state.mix_numeric;
         let members = self.mix_members_resolved(state.mix_id);
-        // 快捷英文候选开关（schema.quick_input.enable_english）：关时快捷/融合不纳入 english 成员。
-        // 独立于混输的 schema.mix.enable_english（那个控制 MixedEngine 码表+拼音混输）。
-        let enable_english = self.rt().config.schema.quick_input.enable_english;
         let mut cands: Vec<Candidate> = Vec::new();
         let mut seen = std::collections::HashSet::new();
         // 文本透镜：取首个真实方案的 preedit_display（拼音含音节分隔 "ni hao"）作组合区显示。
         let mut text_display: Option<String> = None;
         for member in &members {
-            if member == "quick_input" {
+            if let Some(src) = wind_quick_input::QuickSource::from_member(member) {
                 if !numeric {
-                    continue; // 文本模式跳过计算
+                    continue; // 文本模式跳过表达式类来源
                 }
                 let dp = self.rt().config.schema.quick_input.decimal_places;
-                for t in wind_quick_input::generate_quick_input_candidates(&state.mix_buffer, dp) {
-                    if seen.insert(t.clone()) {
+                for t in wind_quick_input::generate(src, &state.mix_buffer, dp) {
+                    if !t.is_empty() && seen.insert(t.clone()) {
                         cands.push(Candidate {
                             text: t,
                             ..Default::default()
                         });
                     }
                 }
+            } else if wind_quick_input::is_quick_member(member) {
+                // quick_input.repeat：仅空缓冲时有候选（上面已 return），此处无动作。
+                // 旧值 quick_input 若漏迁移也落这里——不产候选，胜过按未知方案去加载。
+                continue;
             } else {
                 if numeric {
                     continue; // 数字模式跳过真实方案（表达式无拼音/英文意义）
-                }
-                if member == "english" && !enable_english {
-                    continue; // 英文候选总开关关：跳过 english 成员
                 }
                 if !self.engine_mgr.ensure_schema(member) {
                     continue;
@@ -830,6 +863,48 @@ impl Coordinator {
         state.candidates = self.finalize_candidates(cands, &state.mix_buffer);
         // 简繁 1对多变体展开（约束见 expand_s2t_variants 文档）。
         self.expand_s2t_variants(state);
+    }
+
+    /// 空缓冲时注入「重复上屏」候选（成员 `quick_input.repeat`）：把上次上屏的内容
+    /// 摆成唯一候选，按空格即再上屏一次。
+    ///
+    /// 这是快捷输入的固有能力（Go 版 `handleQuickInputRepeat`），Rust 重写为 mix 成员时丢失。
+    /// 复用 `recent_commits` 上屏历史，与 z 键重复上屏、加词推荐同一事实源。
+    ///
+    /// 置 `state.mix_repeat` 标记而非在候选上加字段：这条候选与输入缓冲无对应关系
+    /// （码为空），选词记录、造词、标点顶屏三条路径都必须绕开它，用一个状态位表达
+    /// 「当前候选区是重复候选」比让每条路径各自去嗅探候选特征更难写错。
+    fn inject_mix_repeat_candidate(&self, state: &mut State) {
+        if !state.committed_text.is_empty() {
+            return; // 模式内已逐步上屏过内容：此时的空缓冲不是「刚进来」，不插重复
+        }
+        let has_repeat = self
+            .rt()
+            .config
+            .schema
+            .mix_modes
+            .get(state.mix_id as usize)
+            .map(|m| {
+                m.members
+                    .iter()
+                    .any(|s| s == wind_quick_input::MEMBER_REPEAT)
+            })
+            .unwrap_or(false);
+        if !has_repeat {
+            return;
+        }
+        let Some(text) = self
+            .recent_commits_snapshot()
+            .into_iter()
+            .find(|t| !t.is_empty())
+        else {
+            return;
+        };
+        state.candidates = vec![Candidate {
+            text,
+            ..Default::default()
+        }];
+        state.mix_repeat = true;
     }
 
     /// 数字 lens（计算/表达式）：数字与符号（含 `=`）作输入，字母作选词。
@@ -932,6 +1007,15 @@ impl Coordinator {
                 }
             }
             keymap::VK_SPACE => {
+                // 重复上屏：整体上屏上次内容，不记选词/不造词（该候选无对应编码）。
+                if state.mix_repeat && !state.candidates.is_empty() {
+                    let text = state.candidates[0].text.clone();
+                    self.record_commit(&text, 0, 0, wind_store::stats::CommitSource::Mix);
+                    // 重复上屏本身也入历史：连按两次仍重复同一内容（而非取到更早的一条）。
+                    self.push_commit_history(&text);
+                    let out = self.maybe_s2t(state, &text);
+                    return commit_text(self, state, out);
+                }
                 // 空格：选当前高亮候选（文本透镜逐步转换）
                 if state.candidates.is_empty() {
                     // 上屏剩余原码：committed 段已在各次选词记过，此处只记 mix_buffer 避免重复。
@@ -991,7 +1075,7 @@ impl Coordinator {
             }
             _ => {
                 let shift = data.modifiers & MOD_SHIFT != 0;
-                let calc = self.mix_has_quick_input(state.mix_id);
+                let calc = self.mix_has_quick_numeric(state.mix_id);
                 // 首字符确定 lens：非字母可打印字符（数字/符号）→ 数字 lens。
                 if state.mix_buffer.is_empty() {
                     let is_letter = (keymap::VK_A..=keymap::VK_Z).contains(&data.key_code);
@@ -1049,8 +1133,11 @@ impl Coordinator {
                 if let Some(ch) =
                     punct_char(data.key_code, shift).or_else(|| numpad_char(data.key_code))
                 {
+                    // 重复上屏候选不参与顶屏：它是「空缓冲时的备选动作」而非本次输入的转换结果，
+                    // 顶屏它等于用户没打字却被塞进上次的内容。此时按标点 = 空缓冲按标点。
+                    let has_head = !state.mix_repeat && !state.candidates.is_empty();
                     // 高亮候选为组/命令：走统一选中（组→展开重查，命令→执行动作），标点不单独上屏。
-                    if !state.candidates.is_empty() {
+                    if has_head {
                         let (start, _) = self.page_range(state);
                         let idx = self
                             .highlighted_global_index(state)
@@ -1060,7 +1147,7 @@ impl Coordinator {
                         }
                     }
                     // 高亮是变体候选时末段用覆盖文本；否则整体转换（保留跨段词级消歧）。
-                    let head = if !state.candidates.is_empty() {
+                    let head = if has_head {
                         let idx = self
                             .highlighted_global_index(state)
                             .min(state.candidates.len() - 1);

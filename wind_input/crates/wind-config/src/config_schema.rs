@@ -116,10 +116,10 @@ static REGISTRY: &[ConfigField] = &[
     f("schema.mix.block_commit_on_pinyin_word", Bool),
     f("schema.mix.pinyin_word_min_weight", Int),
     f("schema.mix.enable_pinyin_abbrev", Bool),
-    f("schema.quick_input.enabled", Bool),
+    // 快捷输入：各候选来源的开关与优先级在 schema.mix_modes 的 members 里（有无=开关，
+    // 顺序=优先级）；总开关＝把 quick_mix 的 trigger_keys 清空。此处只有全局行为项。
     f("schema.quick_input.decimal_places", Int),
     f("schema.quick_input.force_vertical", Bool),
-    f("schema.quick_input.enable_english", Bool),
     f("schema.special_modes", StructList),
     f("schema.mix_modes", StructList),
     // -- input（输入行为）--

@@ -369,7 +369,15 @@ convert(input):
   （那是临时拼音↔临时双拼切换用的）。
 - **临时拼音**：`[input.temp_pinyin]`（总开关 + 引导键，默认反引号）由协调器 pipeline 层分发，临时切到
   目标拼音方案，不在 MixedEngine 内。目标方案取全局 `schema.primary_pinyin`（空=全拼 `"pinyin"`），
-  见 `temp_pinyin_target`。快捷输入 `;` 由内置 mix「快捷」融合方案接管（quick_input 作为成员）。
+  见 `temp_pinyin_target`。
+- **快捷输入**：`;` 由内置 mix「快捷」（`quick_mix`）融合接管，各候选来源即其 `members` 成员——
+  `quick_input.calc`（算式）/ `.date`（日期年月）/ `.number`（数字金额）/ `.repeat`（重复上屏）
+  与 `$primary_pinyin` / `english`。**有无即开关、顺序即优先级**，无旁路 bool 开关
+  （旧的 `schema.quick_input.enable_english` 已废弃并在加载期迁移为成员删除）。
+  也没有总开关——禁用即把 `trigger_keys` 清空（曾有 `quick_input.enabled`，但它从未被任何
+  逻辑读取，关掉不产生任何效果，已删）。
+  前三者由 `wind-quick-input` 纯函数产出，`.repeat` 取 `recent_commits` 上屏历史（仅空缓冲时）。
+  透镜分派见 `mix_has_quick_numeric`：含表达式类来源才开数字透镜（`-`/`=` 作运算符而非翻页）。
 - **词库热插拔**：`set_dict_enabled` 转发主/次子引擎（扩展码表层在码表子引擎）。
 
 ---

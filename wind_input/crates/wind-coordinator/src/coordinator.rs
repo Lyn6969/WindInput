@@ -490,9 +490,14 @@ pub(crate) struct State {
     pub(crate) mix_prefix: String,
     /// 当前 mix 模式下标（= features.mix_modes 索引；仅 active==Mix 时有效）
     pub(crate) mix_id: u8,
-    /// mix 数字模式（仅含 quick_input 成员时有效）：首字符数字/符号 → true（表达式：数字/符号
+    /// mix 数字模式（仅含表达式类快捷来源时有效）：首字符数字/符号 → true（表达式：数字/符号
     /// 输入、字母选词）；首字符字母 → false（拼音/英文：字母输入、数字选词）。
     pub(crate) mix_numeric: bool,
+    /// 当前候选区是「重复上屏」候选（成员 `quick_input.repeat`，空缓冲时注入上次上屏内容）。
+    ///
+    /// 该候选没有对应编码，只能整体上屏：选词记录、造词、标点顶屏三条路径据此绕开它。
+    /// 由 `update_mix_candidates` 每次装配时重置，故任何一次输入都会自动清掉。
+    pub(crate) mix_repeat: bool,
     pub(crate) caret_x: i32,
     pub(crate) caret_y: i32,
     pub(crate) caret_height: i32,
@@ -1208,6 +1213,7 @@ impl Coordinator {
                 mix_id: 0,
                 mix_prefix: String::new(),
                 mix_numeric: false,
+                mix_repeat: false,
                 caret_x: 0,
                 caret_y: 0,
                 caret_height: 0,

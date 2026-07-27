@@ -28,8 +28,8 @@ primary_pinyin = ""
 
 # ── 刻意不在本文件出现的两个键（实例集合，注册表类型 StructList）────────────
 # schema.special_modes  特殊模式列表（引导键 + 引用方案 id；代码默认 = 空数组）
-# schema.mix_modes      临时融合模式列表（代码默认 = 内置「快捷」quick_mix，
-#                       `;` 触发，成员 quick_input / $primary_pinyin / english）
+# schema.mix_modes      临时融合模式列表（代码默认 = 内置「快捷」quick_mix，`;` 触发，
+#                       成员 quick_input.calc/.date/.number/.repeat + $primary_pinyin + english）
 #
 # 二者是**结构体数组**，本文件一旦写出就会整体替换代码默认值，把当时的定义**冻结**
 # 成快照——日后在 `default_mix_modes()` 里给内置「快捷」加成员或改触发键，全部会被
@@ -145,12 +145,12 @@ pinyin_word_min_weight = 0
 enable_pinyin_abbrev = true
 
 [schema.quick_input]
-# 注：; 由内置 mix「快捷」融合接管（quick_input 作为其成员，同时支持日期/计算/拼音/英文）。
-enabled = true
+# 注：; 由内置 mix「快捷」融合接管。各候选来源（计算 / 日期 / 数字金额 / 重复上屏 /
+# 拼音 / 英文）是该 mix 的 members 成员——开关即增删、优先级即顺序，真相源在代码侧的
+# default_mix_modes()，本文件不写 mix_modes（写了会把定义冻结成快照，见文件头说明）。
+# 本段只留与来源无关的全局项——没有总开关，禁用＝把 quick_mix 的 trigger_keys 清空。
 force_vertical = true
 decimal_places = 6
-# 快捷（融合）模式混入英文候选（低优先级排在拼音后）；独立于 schema.mix.enable_english。
-enable_english = true
 
 [input]
 filter_mode = "smart"

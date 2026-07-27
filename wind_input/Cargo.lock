@@ -2395,6 +2395,7 @@ dependencies = [
  "thiserror",
  "toml 0.8.23",
  "tracing",
+ "wind-quick-input",
 ]
 
 [[package]]

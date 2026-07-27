@@ -80,21 +80,31 @@ impl Coordinator {
     /// 记录一次选词到 redb FREQ（词频维度：count+1、last_used=now，按 schema+code+text）。
     /// 词频是与权重解耦的独立维度（frequency.md），仅记真实使用数据；redb 事务即时持久。
     /// 未开启「自动调频」（`schema.codetable/pinyin.frequency.enabled`）时不记录，避免关闭功能后仍写库。
+    /// 记一条上屏历史（最近置前，限 16 条）。供命令栏 `last(n)`、加词推荐、
+    /// z 键重复上屏与快捷输入的 `quick_input.repeat` 共用同一事实源。
+    ///
+    /// **与 [`Self::record_selection`] 分开**：那里记的是「用编码选中了某候选」（还要写词频），
+    /// 而快捷输入数字透镜的上屏（计算结果、日期、金额）没有编码、恒不记词频，却同样是
+    /// 一次上屏。历史点若只挂在选词上，「算完再按 ; 空格重复一次」永远取不到刚算的结果。
+    pub(crate) fn push_commit_history(&self, text: &str) {
+        if text.is_empty() {
+            return;
+        }
+        let mut h = self
+            .recent_commits
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        h.push_front(text.to_string());
+        if h.len() > 16 {
+            h.truncate(16);
+        }
+    }
+
     pub(crate) fn record_selection(&self, code: &str, text: &str, source: CandidateSource) {
         if text.is_empty() {
             return;
         }
-        // 上屏历史（命令栏 last(n) 用）：最近置前，限 16 条。
-        {
-            let mut h = self
-                .recent_commits
-                .lock()
-                .unwrap_or_else(|e| e.into_inner());
-            h.push_front(text.to_string());
-            if h.len() > 16 {
-                h.truncate(16);
-            }
-        }
+        self.push_commit_history(text);
         if let Some(store) = &self.store {
             // 未开启「自动调频」则不记录（配置说关、代码却记的潜在 bug，对齐 apply_freq_rerank 的开关检查）。
             if !self.engine_mgr.freq_settings().enabled {
@@ -1135,9 +1145,12 @@ impl Coordinator {
         };
     }
 
-    /// overlay 候选模式的导航分派：码表型（特殊/临拼，及不含 quick_input 的 mix）`-`/`=` 作翻页；
-    /// 文本型（临英）、表达式型（快捷输入）、含 quick_input 的 mix（`-`/`=` 是运算符输入）不把
-    /// `-`/`=` 当导航。由 active 自判。
+    /// overlay 候选模式的导航分派：码表型（特殊/临拼，及无表达式来源的 mix）`-`/`=` 作翻页；
+    /// 文本型（临英）与含表达式来源（`quick_input.calc/.date/.number`）的 mix 不把 `-`/`=`
+    /// 当导航——那里它们是运算符输入。由 active 自判。
+    ///
+    /// 判据是 `mix_has_quick_numeric` 而非 `mix_has_quick_input`：只配了 `quick_input.repeat`
+    /// 的 mix 没有表达式录入，`-`/`=` 仍应是翻页键。
     pub(crate) fn handle_candidate_nav(
         &self,
         state: &mut State,
@@ -1145,7 +1158,7 @@ impl Coordinator {
     ) -> Option<KeyAction> {
         let include_printable = match state.active {
             Some(ModeKind::Special(_)) | Some(ModeKind::TempPinyin) => true,
-            Some(ModeKind::Mix(idx)) => !self.mix_has_quick_input(idx),
+            Some(ModeKind::Mix(idx)) => !self.mix_has_quick_numeric(idx),
             _ => false,
         };
         self.apply_nav_key(state, data, include_printable)

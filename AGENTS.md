@@ -36,7 +36,7 @@
 | `wind-candidate` | 候选词数据类型、排序与过滤 | — |
 | `wind-phrase` | 短语系统：静态/动态模板展开 + cmdbar 双路径 | — |
 | `wind-transfer` | 导入导出/备份还原底座：Bundle（manifest + zip）聚合打包与 Merge 合并策略（编解码在 wind-store） | — |
-| `wind-quick-input` | 快捷输入提供器：日期 / 计算器（纯逻辑） | — |
+| `wind-quick-input` | 快捷输入的内置候选来源（纯逻辑）：`quick_input.calc` 算式（含幂 `^`）/ `.date` 日期年月 / `.number` 数字金额；另定义 `.repeat`（重复上屏，由协调器实现）的成员 id。开关与优先级 = `mix_modes.members` 的有无与顺序 | — |
 | `wind-reverse` | 候选反查：五笔编码/拆字/拼音读音（悬停 tooltip） | — |
 | `wind-punct` | 标点转换纯逻辑（中英标点/全半角/数字后智能） | — |
 | `wind-transform` | 文本变换：标点、全角、自动配对、简繁 | — |

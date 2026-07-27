@@ -1,43 +1,104 @@
-//! 快捷输入：纯逻辑提供器（日期 / 计算器）。
+//! 快捷输入：内置候选来源（日期 / 计算 / 数字金额）的纯逻辑提供器。
 //!
-//! 与 Go 版本 `wind_input/internal/coordinator/quick_input_{date,calc}.go` 对齐。
 //! 本模块只负责把输入缓冲（如 "12.25" / "1+2*3"）转换为候选文本列表，
 //! 不涉及按键流程与 UI（由协调器状态机驱动）。
 //!
-//! 首版覆盖：日期格式化 + 计算器（表达式=结果 / 结果）。
-//! 后置：中文数字/金额读法、年月、快捷输入内拼音。
+//! ## 来源与开关
+//!
+//! 三个来源各自是一个 **mix 成员 id**（`quick_input.date` / `.calc` / `.number`），
+//! 连同协调器实现的 `quick_input.repeat`（重复上屏）一起，由 `mix_modes.members`
+//! 列表决定**有无与顺序**——开关即增删，优先级即排序，不再另设 bool 旁路开关
+//! （旧的 `schema.quick_input.enable_english` 曾与 `members` 构成双真相源）。
+//!
+//! ## 格式取舍
+//!
+//! 候选格式按国标精简，冗余与不规范写法不再产出（见各来源函数文档）：
+//! - 日期：GB/T 7408（≡ISO 8601）+ GB/T 15835（中文数字用法，月日**不补前导零**）
+//! - 金额：《会计基础工作规范》第五十二条（大写金额与「整」的写法）
 
 use chrono::Datelike;
 
-/// 合并各提供器候选并去重（保留首现顺序：日期 → 年月 → 计算器 → 数字/金额）。
-pub fn generate_quick_input_candidates(buffer: &str, decimal_places: i32) -> Vec<String> {
-    // 表达式以运算符结尾（输入未完成，如 "123+"）：候选维持为去掉尾部运算符后的样子，
-    // 不中断。"123+" → 与 "123" 一致；"1+2*" → 与 "1+2" 一致。
-    let trimmed = buffer.trim_end_matches(['+', '-', '*', '/']);
-    let buffer = if trimmed.len() != buffer.len() && !trimmed.is_empty() {
-        trimmed
-    } else {
-        buffer
-    };
-    let mut out: Vec<String> = Vec::new();
-    let push_unique = |s: String, out: &mut Vec<String>| {
-        if !s.is_empty() && !out.contains(&s) {
-            out.push(s);
+// ───────────────────────── 成员 id ─────────────────────────
+
+/// 旧的合并成员 id。存量配置里出现时展开为 [`LEGACY_EXPANSION`]。
+pub const MEMBER_LEGACY: &str = "quick_input";
+/// 日期 / 年月来源。
+pub const MEMBER_DATE: &str = "quick_input.date";
+/// 计算来源。
+pub const MEMBER_CALC: &str = "quick_input.calc";
+/// 数字 / 金额来源。
+pub const MEMBER_NUMBER: &str = "quick_input.number";
+/// 重复上屏来源（**由协调器实现**：候选取自上屏历史，本 crate 不产出）。
+pub const MEMBER_REPEAT: &str = "quick_input.repeat";
+
+/// 旧值 `quick_input` 的展开序，同时是内置「快捷」融合的默认来源序。
+///
+/// calc 在 date 之前：二者的输入形态互斥（表达式必含二元运算符，日期只有数字与点），
+/// 谁在前都不会互相遮蔽，但计算结果作首选是明确诉求，故把 calc 排在最前。
+pub const LEGACY_EXPANSION: &[&str] = &[MEMBER_CALC, MEMBER_DATE, MEMBER_NUMBER, MEMBER_REPEAT];
+
+/// 是否为快捷输入家族的内置成员 id（含 `quick_input.repeat` 与旧值 `quick_input`）。
+/// 用于把它们从「真实方案成员」中排除——它们没有对应的 `.schema.toml`。
+pub fn is_quick_member(member: &str) -> bool {
+    member == MEMBER_LEGACY || member.starts_with("quick_input.")
+}
+
+/// 本 crate 实现的候选来源。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum QuickSource {
+    /// 日期与年月。
+    Date,
+    /// 算式求值。
+    Calc,
+    /// 数字、中文数字与金额。
+    Number,
+}
+
+impl QuickSource {
+    /// 成员 id → 来源。`quick_input.repeat` 与旧值 `quick_input` 返回 `None`
+    /// （前者由协调器实现，后者应先经 [`LEGACY_EXPANSION`] 展开）。
+    pub fn from_member(member: &str) -> Option<Self> {
+        match member {
+            MEMBER_DATE => Some(Self::Date),
+            MEMBER_CALC => Some(Self::Calc),
+            MEMBER_NUMBER => Some(Self::Number),
+            _ => None,
         }
-    };
-    for c in generate_date_candidates(buffer) {
-        push_unique(c, &mut out);
     }
-    for c in generate_year_month_candidates(buffer) {
-        push_unique(c, &mut out);
+}
+
+/// 按来源生成候选。
+pub fn generate(src: QuickSource, buffer: &str, decimal_places: i32) -> Vec<String> {
+    match src {
+        QuickSource::Date => generate_date_candidates(buffer),
+        QuickSource::Calc => generate_calc_candidates(buffer, decimal_places),
+        QuickSource::Number => generate_number_candidates(buffer, decimal_places),
     }
-    for c in generate_calc_candidates(buffer, decimal_places) {
-        push_unique(c, &mut out);
-    }
-    for c in generate_number_candidates(buffer) {
-        push_unique(c, &mut out);
+}
+
+/// 三个来源全开时的合并候选（按 [`LEGACY_EXPANSION`] 序去重）。
+/// 便捷入口，主要供测试与不读配置的调用方使用；协调器按 `members` 逐个调 [`generate`]。
+pub fn generate_quick_input_candidates(buffer: &str, decimal_places: i32) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for src in [QuickSource::Calc, QuickSource::Date, QuickSource::Number] {
+        for c in generate(src, buffer, decimal_places) {
+            if !c.is_empty() && !out.contains(&c) {
+                out.push(c);
+            }
+        }
     }
     out
+}
+
+// ───────────────────────── 输入归一 ─────────────────────────
+
+/// 裁掉尾部「未写完」的运算符与点号，使输入过程中候选不中断：
+/// `"123+"` 等同 `"123"`、`"1+2*"` 等同 `"1+2"`、`"2026.3."` 等同 `"2026.3"`。
+///
+/// 全部裁完则返回原串（`"+++"` 不该被当成空输入）。
+fn trim_pending_tail(s: &str) -> &str {
+    let t = s.trim_end_matches(['+', '-', '*', '/', '^', '.']);
+    if t.is_empty() { s } else { t }
 }
 
 // ───────────────────────── 日期 ─────────────────────────
@@ -69,8 +130,23 @@ fn parse_date_parts(s: &str) -> Option<(i32, u32, u32)> {
     }
 }
 
-/// 由日期串生成多种格式候选。
+/// 日期来源：完整日期优先，否则试年月。输入尾部的点号被容忍
+/// （`"2026.3."` 仍出「2026年3月」，此前会因第三段为空而候选全空）。
+///
+/// 格式集（按序）：中文 → ISO 扩展 → ISO 基本 → 斜杠。
+/// **不产出**中文补零写法（`2025年03月05日`）——GB/T 15835 的中文日期不加前导零，
+/// 它与不补零的那条只在月/日 <10 时不同，属纯冗余。
 pub fn generate_date_candidates(input: &str) -> Vec<String> {
+    let input = trim_pending_tail(input);
+    let ymd = generate_full_date_candidates(input);
+    if !ymd.is_empty() {
+        return ymd;
+    }
+    generate_year_month_candidates(input)
+}
+
+/// 完整日期（y.m.d 或 m.d，后者补当前年）。
+fn generate_full_date_candidates(input: &str) -> Vec<String> {
     let (mut year, month, day) = match parse_date_parts(input) {
         Some(v) => v,
         None => return Vec::new(),
@@ -79,16 +155,19 @@ pub fn generate_date_candidates(input: &str) -> Vec<String> {
         year = chrono::Local::now().year();
     }
     vec![
-        format!("{:04}{:02}{:02}", year, month, day),
         format!("{}年{}月{}日", year, month, day),
-        format!("{}年{:02}月{:02}日", year, month, day),
         format!("{:04}-{:02}-{:02}", year, month, day),
+        format!("{:04}{:02}{:02}", year, month, day),
         format!("{:04}/{:02}/{:02}", year, month, day),
     ]
 }
 
-/// 年月表达式（首段>31，第二段 1-12）生成 "y年m月" 等。
+/// 年月表达式（首段>31，第二段 1-12）。
+///
+/// 首段 >31 是与「月.日」的分界：`12.25` 只可能是 12 月 25 日，`2025.12` 只可能是年月。
+/// 同样不产出中文补零写法（`2025年06月`）。
 pub fn generate_year_month_candidates(input: &str) -> Vec<String> {
+    let input = trim_pending_tail(input);
     let parts: Vec<&str> = input.split('.').collect();
     if parts.len() != 2 {
         return Vec::new();
@@ -106,7 +185,6 @@ pub fn generate_year_month_candidates(input: &str) -> Vec<String> {
     }
     vec![
         format!("{}年{}月", y, m),
-        format!("{}年{:02}月", y, m),
         format!("{:04}-{:02}", y, m),
         format!("{:04}/{:02}", y, m),
     ]
@@ -114,29 +192,47 @@ pub fn generate_year_month_candidates(input: &str) -> Vec<String> {
 
 // ───────────────────────── 计算器 ─────────────────────────
 
-/// 是否包含运算符。
-fn has_operator(s: &str) -> bool {
-    s.chars().any(|c| matches!(c, '+' | '-' | '*' | '/'))
+/// 是否含**二元**运算符：开头的、以及紧跟另一运算符或左括号的 `+`/`-` 是一元号，不算。
+///
+/// 这道区分让 `"-5"` 不被当成算式（它只是个负数，交给数字来源），而 `"-5+3"` 是。
+fn has_binary_operator(s: &str) -> bool {
+    let b = s.as_bytes();
+    for (i, &c) in b.iter().enumerate() {
+        if !matches!(c, b'+' | b'-' | b'*' | b'/' | b'^') {
+            continue;
+        }
+        if matches!(c, b'*' | b'/' | b'^') {
+            return true;
+        }
+        // `+`/`-`：前一个非空字符是数字或右括号才是二元运算
+        match b[..i].iter().rev().find(|&&p| p != b' ') {
+            Some(&p) if p.is_ascii_digit() || p == b')' => return true,
+            _ => {}
+        }
+    }
+    false
 }
 
-/// 由计算表达式生成候选（首版：表达式=结果 / 结果）。
+/// 表达式字符集：数字、四则、幂、括号、点。
+fn is_expr_charset(s: &str) -> bool {
+    s.chars()
+        .all(|c| c.is_ascii_digit() || matches!(c, '+' | '-' | '*' | '/' | '^' | '.' | '(' | ')'))
+}
+
+/// 计算来源：**结果作首候选**，完整等式次之。
+///
+/// 用户打算式多半是为了拿结果，等式形态（`1+2*3=7`）留作次选，供需要留痕的场景。
+/// 用户手打的 `=` 及其右侧被忽略（取首个 `=` 前求值），使「再按 =」乃至续打答案时
+/// 候选不清空。
 pub fn generate_calc_candidates(expr: &str, decimal_places: i32) -> Vec<String> {
-    // 用户可手打完整等式（如 "100+200=300"）：取首个 '=' 前的表达式部分求值，
-    // 使「再按 =」乃至续打答案时首候选维持为 "100+200=300"，不清空。
     let lhs = expr.split('=').next().unwrap_or(expr);
-    let clean: &str = lhs.trim_end_matches(['+', '-', '*', '/']);
-    if clean.is_empty() || !has_operator(clean) {
+    let clean: &str = trim_pending_tail(lhs);
+    if clean.is_empty() || !has_binary_operator(clean) || !is_expr_charset(clean) {
         return Vec::new();
     }
-    // 仅允许数字/运算符/括号/点，且以数字或左括号开头
+    // 以数字、左括号或一元号开头
     let first = clean.as_bytes()[0];
-    if first != b'(' && !first.is_ascii_digit() {
-        return Vec::new();
-    }
-    if !clean
-        .chars()
-        .all(|c| c.is_ascii_digit() || matches!(c, '+' | '-' | '*' | '/' | '.' | '(' | ')'))
-    {
+    if first != b'(' && first != b'-' && first != b'+' && !first.is_ascii_digit() {
         return Vec::new();
     }
     let val = match evaluate_expression(clean) {
@@ -144,10 +240,13 @@ pub fn generate_calc_candidates(expr: &str, decimal_places: i32) -> Vec<String> 
         _ => return Vec::new(),
     };
     let result = format_calc_result_prec(val, decimal_places);
-    vec![format!("{}={}", clean, result), result]
+    vec![result.clone(), format!("{}={}", clean, result)]
 }
 
-/// 递归下降求值（支持 + - * / 与括号、优先级）。返回 None 表示解析失败。
+/// 递归下降求值。支持 `+ - * /`、幂 `^`、一元正负号与括号。返回 None 表示解析失败。
+///
+/// 优先级（低→高）：`+ -` < `* /` < 一元 `+ -` < `^`（右结合）。
+/// 一元号低于 `^` 是数学惯例：`-2^2 = -(2^2) = -4`；指数侧仍接受一元号，故 `2^-1 = 0.5`。
 pub fn evaluate_expression(expr: &str) -> Option<f64> {
     let bytes: Vec<u8> = expr.bytes().collect();
     let mut p = ExprParser {
@@ -187,14 +286,14 @@ impl ExprParser<'_> {
     }
 
     fn parse_term(&mut self) -> Option<f64> {
-        let mut left = self.parse_primary()?;
+        let mut left = self.parse_unary()?;
         while self.pos < self.input.len() {
             let op = self.input[self.pos];
             if op != b'*' && op != b'/' {
                 break;
             }
             self.pos += 1;
-            let right = self.parse_primary()?;
+            let right = self.parse_unary()?;
             if op == b'*' {
                 left *= right;
             } else {
@@ -205,6 +304,32 @@ impl ExprParser<'_> {
             }
         }
         Some(left)
+    }
+
+    /// 一元正负号（可叠加，如 `--3`）。作用于整个幂，故 `-2^2 = -4`。
+    fn parse_unary(&mut self) -> Option<f64> {
+        if self.pos < self.input.len() {
+            let c = self.input[self.pos];
+            if c == b'-' || c == b'+' {
+                self.pos += 1;
+                let v = self.parse_unary()?;
+                return Some(if c == b'-' { -v } else { v });
+            }
+        }
+        self.parse_power()
+    }
+
+    /// 幂运算，右结合：`2^3^2 = 2^(3^2) = 512`。
+    /// 指数侧递归到 `parse_unary` 而非 `parse_power`，使 `2^-1` 合法。
+    fn parse_power(&mut self) -> Option<f64> {
+        let base = self.parse_primary()?;
+        if self.pos < self.input.len() && self.input[self.pos] == b'^' {
+            self.pos += 1;
+            let exp = self.parse_unary()?;
+            let v = base.powf(exp);
+            return Some(v);
+        }
+        Some(base)
     }
 
     fn parse_primary(&mut self) -> Option<f64> {
@@ -241,17 +366,27 @@ impl ExprParser<'_> {
 }
 
 /// 结果格式化：decimal_places<=0 四舍五入为整数，否则最多保留位数并去尾零。
+/// 超出 i64 量程的值走定点浮点格式，避免 `as i64` 饱和成 9223372036854775807。
 pub fn format_calc_result_prec(val: f64, decimal_places: i32) -> String {
     if val.is_nan() || val.is_infinite() {
         return val.to_string();
     }
+    let fits_i64 = val.abs() < i64::MAX as f64;
     if decimal_places <= 0 {
         let rounded = val.round();
-        return format!("{}", rounded as i64);
+        return if fits_i64 {
+            format!("{}", rounded as i64)
+        } else {
+            format!("{:.0}", rounded)
+        };
     }
     // 整数结果直接输出
-    if val == val.trunc() && val.abs() < i64::MAX as f64 {
-        return format!("{}", val as i64);
+    if val == val.trunc() {
+        return if fits_i64 {
+            format!("{}", val as i64)
+        } else {
+            format!("{:.0}", val)
+        };
     }
     let mut s = format!("{:.*}", decimal_places as usize, val);
     if s.contains('.') {
@@ -360,23 +495,19 @@ fn number_to_chinese(num: &str, digits: &[&str; 10], units: &[&str; 4]) -> Strin
     }
 }
 
-fn number_to_amount(num: &str, upper: bool) -> String {
-    let text = if upper {
+/// 大写金额（《会计基础工作规范》第五十二条）：整数到「元」写「整」。
+fn number_to_amount(num: &str) -> String {
+    format!(
+        "{}元整",
         number_to_chinese(num, &UPPER_DIGITS, &UPPER_UNITS)
-    } else {
-        number_to_chinese(num, &LOWER_DIGITS, &LOWER_UNITS)
-    };
-    format!("{}元整", text)
+    )
 }
 
-/// 带角分金额转换（≤2 位小数）；超 2 位返回空串。
-fn decimal_to_amount(int_part: &str, dec_part: &str, upper: bool) -> String {
-    let int_text = if upper {
-        number_to_chinese(int_part, &UPPER_DIGITS, &UPPER_UNITS)
-    } else {
-        number_to_chinese(int_part, &LOWER_DIGITS, &LOWER_UNITS)
-    };
-    let digits = if upper { &UPPER_DIGITS } else { &LOWER_DIGITS };
+/// 带角分的大写金额（≤2 位小数）；超 2 位返回空串。
+///
+/// 「整」的写法遵规范：到元、到角写「整」，到分不写。
+fn decimal_to_amount(int_part: &str, dec_part: &str) -> String {
+    let int_text = number_to_chinese(int_part, &UPPER_DIGITS, &UPPER_UNITS);
     if dec_part.is_empty() {
         return format!("{}元整", int_text);
     }
@@ -395,15 +526,15 @@ fn decimal_to_amount(int_part: &str, dec_part: &str, upper: bool) -> String {
     let mut b = format!("{}元", int_text);
     if jiao == 0 {
         b.push('零');
-        b.push_str(digits[fen]);
+        b.push_str(UPPER_DIGITS[fen]);
         b.push('分');
     } else if fen == 0 {
-        b.push_str(digits[jiao]);
+        b.push_str(UPPER_DIGITS[jiao]);
         b.push_str("角整");
     } else {
-        b.push_str(digits[jiao]);
+        b.push_str(UPPER_DIGITS[jiao]);
         b.push('角');
-        b.push_str(digits[fen]);
+        b.push_str(UPPER_DIGITS[fen]);
         b.push('分');
     }
     b
@@ -431,83 +562,98 @@ fn decimal_to_chinese_text(int_part: &str, dec_part: &str, upper: bool) -> Strin
 }
 
 /// 逐位中文（含小数点）："123" → "一二三"
-fn digits_to_chinese_chars(num: &str, upper: bool) -> String {
-    let digits = if upper { &UPPER_DIGITS } else { &LOWER_DIGITS };
+fn digits_to_chinese_chars(num: &str) -> String {
     let mut b = String::new();
     for ch in num.chars() {
         if ch.is_ascii_digit() {
-            b.push_str(digits[(ch as u8 - b'0') as usize]);
+            b.push_str(LOWER_DIGITS[(ch as u8 - b'0') as usize]);
         } else if ch == '.' {
             b.push('点');
         }
     }
     if b.is_empty() {
-        digits[0].to_string()
+        LOWER_DIGITS[0].to_string()
     } else {
         b
     }
 }
 
-/// 千分位分组："1234567" → "1,234,567"
-fn format_thousands(num: &str) -> String {
-    if num.len() <= 3 {
-        return num.to_string();
-    }
-    let mut b = String::new();
-    let remainder = num.len() % 3;
-    if remainder > 0 {
-        b.push_str(&num[..remainder]);
-    }
-    let mut i = remainder;
-    while i < num.len() {
-        if !b.is_empty() {
-            b.push(',');
+/// 千分位分组："1234567" → "1,234,567"；小数部分不分组（GB/T 15835）。
+fn format_thousands(int_part: &str, dec_part: &str) -> String {
+    let grouped = if int_part.len() <= 3 {
+        int_part.to_string()
+    } else {
+        let mut b = String::new();
+        let remainder = int_part.len() % 3;
+        if remainder > 0 {
+            b.push_str(&int_part[..remainder]);
         }
-        b.push_str(&num[i..i + 3]);
-        i += 3;
+        let mut i = remainder;
+        while i < int_part.len() {
+            if !b.is_empty() {
+                b.push(',');
+            }
+            b.push_str(&int_part[i..i + 3]);
+            i += 3;
+        }
+        b
+    };
+    if dec_part.is_empty() {
+        grouped
+    } else {
+        format!("{}.{}", grouped, dec_part)
     }
-    b
 }
 
-/// 由纯数字串生成候选（金额/中文数字/千分位）。非数字串返回空。
-pub fn generate_number_candidates(s: &str) -> Vec<String> {
-    if !is_decimal_number(s) {
-        return Vec::new();
+/// 数字来源的取值：纯数字直接用；**算式先求值再转**，使「算完顺手要金额」一步到位
+/// （`123*4` 也能出「肆佰玖拾贰元整」）。负数结果无金额读法，返回 None。
+fn number_subject(buffer: &str, decimal_places: i32) -> Option<String> {
+    let s = trim_pending_tail(buffer);
+    if is_decimal_number(s) {
+        return Some(s.to_string());
     }
-    let (int_part_raw, dec_part) = split_decimal(s);
+    if !has_binary_operator(s) || !is_expr_charset(s) {
+        return None;
+    }
+    let val = evaluate_expression(s).filter(|v| v.is_finite())?;
+    if val < 0.0 {
+        return None;
+    }
+    let text = format_calc_result_prec(val, decimal_places);
+    is_decimal_number(&text).then_some(text)
+}
+
+/// 数字来源：金额、中文数字、千分位。
+///
+/// 格式集按规范精简，**不产出**：
+/// - 「一百二十三元整」——财务金额只有「大写壹佰贰拾叁元整」与「小写 ¥123.00」两种合法写法，
+///   中文小写加「元整」不属任何规范；
+/// - 逐位大写「壹贰叁」——逐位读法用于念号码，与财务大写无关，无使用场景。
+pub fn generate_number_candidates(s: &str, decimal_places: i32) -> Vec<String> {
+    let Some(subject) = number_subject(s, decimal_places) else {
+        return Vec::new();
+    };
+    let (int_part_raw, dec_part) = split_decimal(&subject);
     let int_part = if int_part_raw.is_empty() {
         "0"
     } else {
         int_part_raw
     };
 
-    if dec_part.is_empty() {
-        // 整数（含 "123." 情况）
-        return vec![
-            number_to_amount(int_part, true),
-            number_to_amount(int_part, false),
-            number_to_chinese(int_part, &LOWER_DIGITS, &LOWER_UNITS),
-            number_to_chinese(int_part, &UPPER_DIGITS, &UPPER_UNITS),
-            digits_to_chinese_chars(int_part, false),
-            digits_to_chinese_chars(int_part, true),
-            format_thousands(int_part),
-        ];
-    }
-
-    // 小数
     let mut out = Vec::new();
-    let amt_u = decimal_to_amount(int_part, dec_part, true);
-    if !amt_u.is_empty() {
-        out.push(amt_u);
-    }
-    let amt_l = decimal_to_amount(int_part, dec_part, false);
-    if !amt_l.is_empty() {
-        out.push(amt_l);
+    if dec_part.is_empty() {
+        out.push(number_to_amount(int_part));
+    } else {
+        // >2 位小数无角分写法，此条为空则跳过
+        let amt = decimal_to_amount(int_part, dec_part);
+        if !amt.is_empty() {
+            out.push(amt);
+        }
     }
     out.push(decimal_to_chinese_text(int_part, dec_part, false));
     out.push(decimal_to_chinese_text(int_part, dec_part, true));
-    out.push(digits_to_chinese_chars(s, false));
-    out.push(digits_to_chinese_chars(s, true));
+    out.push(digits_to_chinese_chars(&subject));
+    out.push(format_thousands(int_part, dec_part));
     out
 }
 
@@ -515,11 +661,42 @@ pub fn generate_number_candidates(s: &str) -> Vec<String> {
 mod tests {
     use super::*;
 
+    // ── 成员 id ──
+
     #[test]
-    fn test_calc_basic_precedence() {
+    fn test_member_ids() {
+        assert_eq!(
+            QuickSource::from_member(MEMBER_DATE),
+            Some(QuickSource::Date)
+        );
+        assert_eq!(
+            QuickSource::from_member(MEMBER_CALC),
+            Some(QuickSource::Calc)
+        );
+        assert_eq!(
+            QuickSource::from_member(MEMBER_NUMBER),
+            Some(QuickSource::Number)
+        );
+        // repeat 由协调器实现，旧值应先展开
+        assert_eq!(QuickSource::from_member(MEMBER_REPEAT), None);
+        assert_eq!(QuickSource::from_member(MEMBER_LEGACY), None);
+        assert_eq!(QuickSource::from_member("pinyin"), None);
+        // 家族判定覆盖 repeat 与旧值，不误伤真实方案
+        assert!(is_quick_member(MEMBER_LEGACY));
+        assert!(is_quick_member(MEMBER_REPEAT));
+        assert!(is_quick_member(MEMBER_DATE));
+        assert!(!is_quick_member("pinyin"));
+        assert!(!is_quick_member("english"));
+    }
+
+    // ── 计算 ──
+
+    #[test]
+    fn test_calc_result_is_first_candidate() {
+        // 结果首候选，等式次之（使用算式形态的是少数）
         let c = generate_calc_candidates("1+2*3", 6);
-        assert_eq!(c[0], "1+2*3=7");
-        assert_eq!(c[1], "7");
+        assert_eq!(c[0], "7");
+        assert_eq!(c[1], "1+2*3=7");
     }
 
     #[test]
@@ -529,33 +706,62 @@ mod tests {
     }
 
     #[test]
+    fn test_calc_power_precedence_and_associativity() {
+        // 幂高于乘除
+        assert_eq!(evaluate_expression("2*3^2"), Some(18.0));
+        assert_eq!(evaluate_expression("3^2+1"), Some(10.0));
+        // 右结合：2^(3^2) = 512，而非 (2^3)^2 = 64
+        assert_eq!(evaluate_expression("2^3^2"), Some(512.0));
+        // 括号仍可改写结合
+        assert_eq!(evaluate_expression("(2^3)^2"), Some(64.0));
+        let c = generate_calc_candidates("5^2", 6);
+        assert_eq!(c[0], "25");
+        assert_eq!(c[1], "5^2=25");
+    }
+
+    #[test]
+    fn test_calc_unary_sign() {
+        // 一元号低于幂：-2^2 = -(2^2)
+        assert_eq!(evaluate_expression("-2^2"), Some(-4.0));
+        // 指数侧接受一元号
+        assert_eq!(evaluate_expression("2^-1"), Some(0.5));
+        assert_eq!(evaluate_expression("-5+3"), Some(-2.0));
+        // 首负号的算式产出候选
+        let c = generate_calc_candidates("-5+3", 6);
+        assert_eq!(c[0], "-2");
+        // 纯负数不是算式（无二元运算符），交给数字来源
+        assert!(generate_calc_candidates("-5", 6).is_empty());
+    }
+
+    #[test]
     fn test_calc_division_and_trailing_op() {
         // 尾部运算符应被裁剪
         let c = generate_calc_candidates("10/4+", 6);
-        assert_eq!(c[0], "10/4=2.5");
+        assert_eq!(c[0], "2.5");
+        assert_eq!(c[1], "10/4=2.5");
     }
 
     #[test]
     fn test_calc_division_by_zero_no_candidates() {
         assert!(generate_calc_candidates("1/0", 6).is_empty());
+        // 0 的负幂 = inf，同样无候选
+        assert!(generate_calc_candidates("0^-1", 6).is_empty());
     }
 
     #[test]
     fn test_calc_rejects_non_expression() {
         assert!(generate_calc_candidates("123", 6).is_empty()); // 无运算符
         assert!(generate_calc_candidates("abc", 6).is_empty());
+        assert!(generate_calc_candidates("2025.12.25", 6).is_empty()); // 日期不是算式
     }
 
     #[test]
     fn test_calc_keeps_result_through_equals() {
-        // 用户按 = 写出完整等式：首候选维持为 123+100=223，不清空。
-        let c0 = generate_calc_candidates("123+100", 6);
-        assert_eq!(c0[0], "123+100=223");
-        let c1 = generate_calc_candidates("123+100=", 6);
-        assert_eq!(c1[0], "123+100=223");
+        // 用户按 = 写出完整等式：候选维持不清空。
+        assert_eq!(generate_calc_candidates("123+100", 6)[1], "123+100=223");
+        assert_eq!(generate_calc_candidates("123+100=", 6)[1], "123+100=223");
         // 续打答案也维持（取 = 前的表达式求值）。
-        let c2 = generate_calc_candidates("123+100=223", 6);
-        assert_eq!(c2[0], "123+100=223");
+        assert_eq!(generate_calc_candidates("123+100=223", 6)[1], "123+100=223");
     }
 
     #[test]
@@ -572,13 +778,26 @@ mod tests {
         );
     }
 
+    // ── 日期 ──
+
     #[test]
     fn test_date_full_formats() {
         let c = generate_date_candidates("2025.12.25");
-        assert!(c.contains(&"20251225".to_string()));
-        assert!(c.contains(&"2025年12月25日".to_string()));
-        assert!(c.contains(&"2025-12-25".to_string()));
-        assert!(c.contains(&"2025/12/25".to_string()));
+        assert_eq!(
+            c,
+            vec!["2025年12月25日", "2025-12-25", "20251225", "2025/12/25"],
+            "中文优先，且不含补零的中文写法"
+        );
+    }
+
+    #[test]
+    fn test_date_no_padded_chinese_form() {
+        // 中文日期不加前导零（GB/T 15835），补零写法不再产出
+        let c = generate_date_candidates("2025.3.5");
+        assert!(c.contains(&"2025年3月5日".to_string()));
+        assert!(!c.contains(&"2025年03月05日".to_string()));
+        // 数字格式仍补零（ISO 8601）
+        assert!(c.contains(&"2025-03-05".to_string()));
     }
 
     #[test]
@@ -597,38 +816,45 @@ mod tests {
     #[test]
     fn test_year_month() {
         let c = generate_year_month_candidates("2025.6");
-        assert!(c.contains(&"2025年6月".to_string()));
-        assert!(c.contains(&"2025-06".to_string()));
+        assert_eq!(c, vec!["2025年6月", "2025-06", "2025/06"]);
     }
 
     #[test]
-    fn test_merge_dedup() {
-        // 计算器表达式
-        let c = generate_quick_input_candidates("3*3", 6);
-        assert_eq!(c[0], "3*3=9");
-        assert!(c.contains(&"9".to_string()));
+    fn test_year_month_survives_trailing_dot() {
+        // 「2026.3.」输入到一半：此前第三段为空导致候选全空，现应维持年月候选
+        let c = generate_date_candidates("2026.3.");
+        assert_eq!(c, vec!["2026年3月", "2026-03", "2026/03"]);
+        assert_eq!(c, generate_date_candidates("2026.3"), "尾点不改变候选");
+        // 完整日期同理
+        assert_eq!(
+            generate_date_candidates("2025.12.25."),
+            generate_date_candidates("2025.12.25")
+        );
     }
+
+    // ── 数字 / 金额 ──
 
     #[test]
     fn test_number_integer_candidates() {
-        let c = generate_number_candidates("123");
-        assert!(
-            c.contains(&"壹佰贰拾叁元整".to_string()),
-            "大写金额，实际: {:?}",
-            c
+        let c = generate_number_candidates("123", 6);
+        assert_eq!(
+            c,
+            vec![
+                "壹佰贰拾叁元整",
+                "一百二十三",
+                "壹佰贰拾叁",
+                "一二三",
+                "123"
+            ]
         );
-        assert!(
-            c.contains(&"一百二十三".to_string()),
-            "中文小写，实际: {:?}",
-            c
-        );
-        assert!(c.contains(&"壹佰贰拾叁".to_string()), "中文大写");
-        assert!(c.contains(&"一二三".to_string()), "逐位");
+        // 不规范/无场景的两条已移除
+        assert!(!c.contains(&"一百二十三元整".to_string()));
+        assert!(!c.contains(&"壹贰叁".to_string()));
     }
 
     #[test]
     fn test_number_thousands() {
-        let c = generate_number_candidates("1234567");
+        let c = generate_number_candidates("1234567", 6);
         assert!(
             c.contains(&"1,234,567".to_string()),
             "千分位，实际: {:?}",
@@ -643,25 +869,47 @@ mod tests {
 
     #[test]
     fn test_number_decimal_amount() {
-        let c = generate_number_candidates("123.45");
-        assert!(
-            c.contains(&"壹佰贰拾叁元肆角伍分".to_string()),
-            "大写角分金额，实际: {:?}",
-            c
+        let c = generate_number_candidates("123.45", 6);
+        assert_eq!(
+            c,
+            vec![
+                "壹佰贰拾叁元肆角伍分",
+                "一百二十三点四五",
+                "壹佰贰拾叁点肆伍",
+                "一二三点四五",
+                "123.45"
+            ]
         );
+    }
+
+    #[test]
+    fn test_number_decimal_thousands() {
+        // 小数也给千分位（整数部分分组，小数部分不分组）
+        let c = generate_number_candidates("1234567.89", 6);
         assert!(
-            c.contains(&"一百二十三点四五".to_string()),
-            "中文小数读法，实际: {:?}",
+            c.contains(&"1,234,567.89".to_string()),
+            "小数千分位，实际: {:?}",
             c
         );
     }
 
     #[test]
-    fn test_pure_number_via_merge() {
-        // 纯整数经合并入口也应产出金额候选（修复"123 无候选"）
-        let c = generate_quick_input_candidates("123", 6);
-        assert!(!c.is_empty(), "纯数字应有候选");
-        assert!(c.contains(&"一百二十三".to_string()));
+    fn test_number_amount_zheng_rules() {
+        // 到元写整、到角写整、到分不写整（《会计基础工作规范》第五十二条）
+        assert_eq!(generate_number_candidates("100", 6)[0], "壹佰元整");
+        assert_eq!(generate_number_candidates("100.5", 6)[0], "壹佰元伍角整");
+        assert_eq!(generate_number_candidates("100.56", 6)[0], "壹佰元伍角陆分");
+        assert_eq!(generate_number_candidates("100.06", 6)[0], "壹佰元零陆分");
+    }
+
+    #[test]
+    fn test_number_from_calc_result() {
+        // 算完顺手要金额：表达式先求值再转
+        let c = generate_number_candidates("123*4", 6);
+        assert_eq!(c[0], "肆佰玖拾贰元整", "实际: {:?}", c);
+        assert!(c.contains(&"四百九十二".to_string()));
+        // 负结果无金额读法
+        assert!(generate_number_candidates("1-5", 6).is_empty());
     }
 
     #[test]
@@ -675,5 +923,33 @@ mod tests {
             number_to_chinese("100", &LOWER_DIGITS, &LOWER_UNITS),
             "一百"
         );
+    }
+
+    // ── 合并入口 ──
+
+    #[test]
+    fn test_merge_calc_first_then_number() {
+        // 3*3：计算结果 9 首选，等式次之，随后是结果的金额读法
+        let c = generate_quick_input_candidates("3*3", 6);
+        assert_eq!(c[0], "9");
+        assert_eq!(c[1], "3*3=9");
+        assert!(c.contains(&"玖元整".to_string()), "实际: {:?}", c);
+    }
+
+    #[test]
+    fn test_pure_number_via_merge() {
+        // 纯整数经合并入口产出金额候选
+        let c = generate_quick_input_candidates("123", 6);
+        assert_eq!(c[0], "壹佰贰拾叁元整");
+        assert!(c.contains(&"一百二十三".to_string()));
+    }
+
+    #[test]
+    fn test_date_and_number_coexist() {
+        // "12.25" 既是日期也是数字：日期在前（number 排在 LEGACY_EXPANSION 之后）
+        let c = generate_quick_input_candidates("12.25", 6);
+        let year = chrono::Local::now().year();
+        assert_eq!(c[0], format!("{}年12月25日", year));
+        assert!(c.contains(&"壹拾贰元贰角伍分".to_string()), "实际: {:?}", c);
     }
 }

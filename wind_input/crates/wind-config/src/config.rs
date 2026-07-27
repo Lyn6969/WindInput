@@ -495,20 +495,26 @@ pub struct PinyinFuzzy {
     pub uan_uang: bool,
 }
 
+/// 快捷输入的**全局**行为配置。
+///
+/// 各候选来源的开关与优先级**不在这里**——它们是 `mix_modes.members` 的成员
+/// （`quick_input.calc` / `.date` / `.number` / `.repeat` 与 `$primary_pinyin` / `english`），
+/// 开关即增删、优先级即排序。本结构只留与来源无关的全局项。
+///
+/// 曾有 `enable_english` 与 `members` 并存，构成双真相源（协调器两处各过滤一遍
+/// english 成员）。已废弃并在加载期迁移：旧值 false → 从 quick_mix 的 members 移除 english。
+/// 快捷输入的**全局**行为配置。
+///
+/// 没有总开关：想禁用就把 `quick_mix` 的 `trigger_keys` 清空——没有触发键自然进不去，
+/// 一件事只有一种表达。（曾有 `enabled` 字段，但它从未被任何逻辑读取，关掉不产生任何效果。）
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct QuickInputConfig {
-    #[serde(default = "default_true")]
-    pub enabled: bool,
     /// 计算器结果小数位数，默认 6
     #[serde(default = "default_decimal_places")]
     pub decimal_places: i32,
     /// 强制竖排显示：进入快捷输入时切竖排候选，退出恢复原布局。
     #[serde(default)]
     pub force_vertical: bool,
-    /// 快捷（融合）模式是否混入英文候选（english 成员）。默认开启（低优先级排在拼音后）。
-    /// 独立于混输的 schema.mix.enable_english。
-    #[serde(default = "default_true")]
-    pub enable_english: bool,
 }
 
 fn default_decimal_places() -> i32 {
@@ -518,10 +524,8 @@ fn default_decimal_places() -> i32 {
 impl Default for QuickInputConfig {
     fn default() -> Self {
         Self {
-            enabled: true,
             decimal_places: default_decimal_places(),
             force_vertical: false,
-            enable_english: true,
         }
     }
 }
@@ -541,8 +545,15 @@ pub struct MixModeConfig {
     /// 引导键列表
     #[serde(default)]
     pub trigger_keys: Vec<String>,
-    /// 成员方案 id 列表（按序合并候选；如 ["pinyin", "quick_symbols"]）。
-    /// 支持占位符 [`MIX_MEMBER_PRIMARY_PINYIN`]；字面 id 一律精确解释（"pinyin" 恒为全拼）。
+    /// 成员列表：**候选来源的单一真相源**——有无即开关，顺序即优先级。
+    ///
+    /// 三类取值：
+    /// - 真实方案 id（`"pinyin"` / `"english"` / 码表方案…），经其 `.schema.toml` 加载；
+    /// - 占位符 [`MIX_MEMBER_PRIMARY_PINYIN`]（解析为 `schema.primary_pinyin`）；
+    ///   字面 id 一律精确解释（`"pinyin"` 恒为全拼，永不被替换）；
+    /// - 快捷输入内置来源（`wind_quick_input::MEMBER_*`：`quick_input.calc` / `.date` /
+    ///   `.number` / `.repeat`），无对应方案文件，由协调器直接产出候选。
+    ///   旧的合并值 `"quick_input"` 在加载期展开为这四项。
     #[serde(default)]
     pub members: Vec<String>,
 }
@@ -561,16 +572,18 @@ pub const MIX_MEMBER_PRIMARY_PINYIN: &str = "$primary_pinyin";
 pub const DEFAULT_PINYIN_SCHEMA: &str = "pinyin";
 
 fn default_mix_modes() -> Vec<MixModeConfig> {
+    let mut members: Vec<String> = wind_quick_input::LEGACY_EXPANSION
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+    members.push(MIX_MEMBER_PRIMARY_PINYIN.to_string());
+    members.push("english".to_string());
     vec![MixModeConfig {
         id: QUICK_MIX_ID.to_string(),
         name: "快捷".to_string(),
         short_name: "快".to_string(),
         trigger_keys: vec!["semicolon".to_string()],
-        members: vec![
-            "quick_input".to_string(),
-            MIX_MEMBER_PRIMARY_PINYIN.to_string(),
-            "english".to_string(),
-        ],
+        members,
     }]
 }
 
@@ -1813,9 +1826,45 @@ impl Config {
             None => warn!("User config dir unavailable, user layer skipped"),
         }
 
+        Self::migrate_enable_english_value(&mut merged);
         let mut config: Config = merged.try_into()?;
         config.normalize();
         Ok(config)
+    }
+
+    /// 存量迁移（**须在反序列化前**跑，字段已从 [`QuickInputConfig`] 移除、结构体上读不到）：
+    /// 废弃键 `schema.quick_input.enable_english = false` → 从内置 quick_mix 的 members 移除
+    /// `english`。
+    ///
+    /// 该键与 members 曾是双真相源；语义合并到 members 后，关掉过英文候选的存量用户
+    /// 必须在这里落成成员删除，否则升级后英文候选会自己冒回来。只认 false——true 是默认值，
+    /// 无需动作。
+    fn migrate_enable_english_value(merged: &mut toml::Value) {
+        let disabled = merged
+            .get("schema")
+            .and_then(|s| s.get("quick_input"))
+            .and_then(|q| q.get("enable_english"))
+            .and_then(|v| v.as_bool())
+            .is_some_and(|v| !v);
+        if !disabled {
+            return;
+        }
+        let Some(modes) = merged
+            .get_mut("schema")
+            .and_then(|s| s.get_mut("mix_modes"))
+            .and_then(|m| m.as_array_mut())
+        else {
+            return;
+        };
+        for mode in modes.iter_mut() {
+            if mode.get("id").and_then(|v| v.as_str()) != Some(QUICK_MIX_ID) {
+                continue;
+            }
+            if let Some(members) = mode.get_mut("members").and_then(|m| m.as_array_mut()) {
+                members.retain(|v| v.as_str() != Some("english"));
+            }
+        }
+        info!("Migrated quick_input.enable_english=false into quick_mix members");
     }
 
     /// 系统预置配置的 TOML 值：代码默认(L1) ⊕ `data/config.toml`(L2)，**不含用户层(L3)**。
@@ -1863,6 +1912,32 @@ impl Config {
             self.ui.candidate.per_page = default_per_page();
         }
         self.migrate_quick_mix_pinyin_member();
+        self.migrate_quick_input_legacy_member();
+    }
+
+    /// 存量迁移：合并成员 `"quick_input"` → 细分来源 [`wind_quick_input::LEGACY_EXPANSION`]。
+    ///
+    /// 快捷输入的四个来源（计算/日期/数字/重复）曾是一个不可分的成员，无法单独开关。
+    /// 拆分后旧值在原位展开，顺序与展开序一致——存量用户的候选序不变，只是从此可增删。
+    /// 对**所有** mix 生效（不限内置 quick_mix）：`"quick_input"` 是保留 id，任何 mix 里
+    /// 出现都只可能是这个含义。
+    fn migrate_quick_input_legacy_member(&mut self) {
+        for m in self.schema.mix_modes.iter_mut() {
+            let Some(at) = m
+                .members
+                .iter()
+                .position(|s| s == wind_quick_input::MEMBER_LEGACY)
+            else {
+                continue;
+            };
+            // 展开时跳过已单独写在别处的细分来源，避免重复成员。
+            let expansion: Vec<String> = wind_quick_input::LEGACY_EXPANSION
+                .iter()
+                .filter(|e| !m.members.iter().any(|s| s == *e))
+                .map(|e| e.to_string())
+                .collect();
+            m.members.splice(at..=at, expansion);
+        }
     }
 
     /// 存量迁移：内置 `quick_mix` 的字面 `"pinyin"` 成员 → [`MIX_MEMBER_PRIMARY_PINYIN`] 占位符。
@@ -2209,15 +2284,125 @@ mod tests {
             },
         ];
         cfg.normalize();
-        assert_eq!(
-            cfg.schema.mix_modes[0].members,
-            vec!["quick_input", MIX_MEMBER_PRIMARY_PINYIN, "english"],
-            "内置 quick_mix 的字面 pinyin 应迁为占位符"
+        assert!(
+            cfg.schema.mix_modes[0]
+                .members
+                .contains(&MIX_MEMBER_PRIMARY_PINYIN.to_string()),
+            "内置 quick_mix 的字面 pinyin 应迁为占位符，实际 {:?}",
+            cfg.schema.mix_modes[0].members
         );
         assert_eq!(
             cfg.schema.mix_modes[1].members,
             vec!["pinyin"],
             "自定义 mix 的字面 pinyin 应原样保留"
+        );
+    }
+
+    /// 存量迁移：合并成员 `quick_input` 就地展开为四个细分来源，其余成员的相对序不变。
+    #[test]
+    fn normalize_expands_legacy_quick_input_member() {
+        let mut cfg = Config::default();
+        cfg.schema.mix_modes = vec![MixModeConfig {
+            id: QUICK_MIX_ID.to_string(),
+            members: vec![
+                "quick_input".to_string(),
+                MIX_MEMBER_PRIMARY_PINYIN.to_string(),
+                "english".to_string(),
+            ],
+            ..Default::default()
+        }];
+        cfg.normalize();
+        let mut expected: Vec<String> = wind_quick_input::LEGACY_EXPANSION
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        expected.push(MIX_MEMBER_PRIMARY_PINYIN.to_string());
+        expected.push("english".to_string());
+        assert_eq!(
+            cfg.schema.mix_modes[0].members, expected,
+            "旧值应在原位展开，展开序 = 默认成员序"
+        );
+        // 幂等：再跑一次不重复展开
+        let once = cfg.schema.mix_modes[0].members.clone();
+        cfg.normalize();
+        assert_eq!(cfg.schema.mix_modes[0].members, once, "迁移应幂等");
+    }
+
+    /// 展开时跳过用户已单独写出的细分来源，不产生重复成员。
+    #[test]
+    fn legacy_expansion_skips_already_present_sources() {
+        let mut cfg = Config::default();
+        cfg.schema.mix_modes = vec![MixModeConfig {
+            id: QUICK_MIX_ID.to_string(),
+            members: vec![
+                wind_quick_input::MEMBER_NUMBER.to_string(),
+                "quick_input".to_string(),
+            ],
+            ..Default::default()
+        }];
+        cfg.normalize();
+        let m = &cfg.schema.mix_modes[0].members;
+        assert_eq!(
+            m.iter()
+                .filter(|s| *s == wind_quick_input::MEMBER_NUMBER)
+                .count(),
+            1,
+            "细分来源不应重复，实际 {:?}",
+            m
+        );
+        assert_eq!(
+            m,
+            &vec![
+                wind_quick_input::MEMBER_NUMBER.to_string(),
+                wind_quick_input::MEMBER_CALC.to_string(),
+                wind_quick_input::MEMBER_DATE.to_string(),
+                wind_quick_input::MEMBER_REPEAT.to_string(),
+            ],
+            "用户显式写出的来源保持其位置"
+        );
+    }
+
+    /// 存量迁移：废弃键 `enable_english = false` 落成 members 里的 english 删除。
+    /// 该迁移在反序列化前作用于 TOML 值，故直接验证 `migrate_enable_english_value`。
+    #[test]
+    fn migrates_disabled_enable_english_into_members() {
+        let mut v = toml::Value::try_from(Config::default()).unwrap();
+        // 模拟存量用户配置：关掉了英文候选
+        v.get_mut("schema")
+            .unwrap()
+            .get_mut("quick_input")
+            .unwrap()
+            .as_table_mut()
+            .unwrap()
+            .insert("enable_english".to_string(), toml::Value::Boolean(false));
+        Config::migrate_enable_english_value(&mut v);
+        let cfg: Config = v.try_into().unwrap();
+        assert!(
+            !cfg.schema.mix_modes[0]
+                .members
+                .contains(&"english".to_string()),
+            "关过英文候选的存量用户，升级后英文不应冒回来：{:?}",
+            cfg.schema.mix_modes[0].members
+        );
+        assert!(
+            cfg.schema.mix_modes[0]
+                .members
+                .contains(&MIX_MEMBER_PRIMARY_PINYIN.to_string()),
+            "只应移除 english，其余成员不动"
+        );
+    }
+
+    /// 默认值（enable_english 缺省或为 true）不触发迁移。
+    #[test]
+    fn default_keeps_english_member() {
+        let mut v = toml::Value::try_from(Config::default()).unwrap();
+        Config::migrate_enable_english_value(&mut v);
+        let cfg: Config = v.try_into().unwrap();
+        assert!(
+            cfg.schema.mix_modes[0]
+                .members
+                .contains(&"english".to_string()),
+            "无废弃键时 english 成员应保留"
         );
     }
 
@@ -2587,7 +2772,6 @@ mod tests {
         // 模式三件套归 schema
         assert_eq!(c.schema.mix_modes.len(), 1, "默认一个快捷 mix");
         assert_eq!(c.schema.mix_modes[0].trigger_keys, vec!["semicolon"]);
-        assert!(c.schema.quick_input.enabled);
         assert_eq!(c.schema.quick_input.decimal_places, 6);
         // input 子组
         assert!(

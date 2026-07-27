@@ -1305,19 +1305,145 @@ fn test_quick_input_calc() {
     let last = press_vk(&coord, 0x33, false);
     assert_eq!(action_text(&last).unwrap(), ";1+2*3", "组合区应为 ;1+2*3");
 
-    // 首选候选应为 "1+2*3=7"
+    // 首选是**结果**（用算式形态的是少数），等式次之，随后是结果的金额读法
     let texts = coord.debug_page_texts();
-    assert_eq!(
-        texts[0], "1+2*3=7",
-        "计算器首选应为表达式=结果，实际: {:?}",
+    assert_eq!(texts[0], "7", "计算首选应为结果，实际: {:?}", texts);
+    assert_eq!(texts[1], "1+2*3=7", "等式形态应为次选，实际: {:?}", texts);
+    assert!(
+        texts.contains(&"柒元整".to_string()),
+        "计算结果应同时给出金额读法，实际: {:?}",
         texts
     );
 
     // 字母 a 选第 1 个候选上屏
     match press_vk(&coord, 0x41, false) {
-        KeyAction::InsertText { text, .. } => assert_eq!(text, "1+2*3=7"),
+        KeyAction::InsertText { text, .. } => assert_eq!(text, "7"),
         other => panic!("字母 a 应上屏首选，实际: {:?}", other),
     }
+}
+
+/// 幂运算 `^`（Shift+6）：优先级高于乘除，结果作首选。
+#[test]
+fn test_quick_input_power_operator() {
+    if !has_schemas() {
+        return;
+    }
+    let coord = Coordinator::new_headless(config_with("wubi86"), Some(&data_dir()));
+    coord.handle_key_event(&key_event(0xBA, EVENT_KEY_DOWN)); // ;
+    press_vk(&coord, 0x32, false); // 2
+    press_vk(&coord, 0xBB, true); // +
+    press_vk(&coord, 0x33, false); // 3
+    press_vk(&coord, 0x36, true); // ^ (Shift+6)
+    press_vk(&coord, 0x32, false); // 2
+    let texts = coord.debug_page_texts();
+    assert_eq!(texts[0], "11", "2+3^2 应先算幂（=2+9），实际: {:?}", texts);
+    assert_eq!(texts[1], "2+3^2=11", "实际: {:?}", texts);
+}
+
+/// 日期打到一半的尾点（`2026.3.`）不应清空候选——年月候选须维持。
+#[test]
+fn test_quick_input_date_trailing_dot_keeps_year_month() {
+    if !has_schemas() {
+        return;
+    }
+    let coord = Coordinator::new_headless(config_with("wubi86"), Some(&data_dir()));
+    coord.handle_key_event(&key_event(0xBA, EVENT_KEY_DOWN)); // ;
+    for vk in [0x32, 0x30, 0x32, 0x36] {
+        press_vk(&coord, vk, false); // 2026
+    }
+    press_vk(&coord, 0xBE, false); // .
+    press_vk(&coord, 0x33, false); // 3
+    let before = coord.debug_page_texts();
+    assert!(
+        before.contains(&"2026年3月".to_string()),
+        "2026.3 应有年月候选，实际: {:?}",
+        before
+    );
+    press_vk(&coord, 0xBE, false); // 第二个 . —— 此前候选在此清空
+    let after = coord.debug_page_texts();
+    assert!(
+        after.contains(&"2026年3月".to_string()),
+        "2026.3. 应维持年月候选，实际: {:?}",
+        after
+    );
+}
+
+/// 重复上屏（成员 `quick_input.repeat`）：空缓冲时把上次上屏内容作唯一候选，空格再上屏一次。
+#[test]
+fn test_quick_input_repeat_last_commit() {
+    if !has_schemas() {
+        return;
+    }
+    let coord = Coordinator::new_headless(config_with("wubi86"), Some(&data_dir()));
+    // 先用快捷输入上屏一次计算结果
+    coord.handle_key_event(&key_event(0xBA, EVENT_KEY_DOWN)); // ;
+    press_vk(&coord, 0x31, false); // 1
+    press_vk(&coord, 0xBB, true); // +
+    press_vk(&coord, 0x32, false); // 2
+    match coord.handle_key_event(&key_event(0x20, EVENT_KEY_DOWN)) {
+        KeyAction::InsertText { text, .. } => assert_eq!(text, "3", "空格应上屏计算结果"),
+        other => panic!("空格应上屏首选，实际: {:?}", other),
+    }
+    // 再进快捷输入：空缓冲应出重复候选
+    coord.handle_key_event(&key_event(0xBA, EVENT_KEY_DOWN)); // ;
+    let texts = coord.debug_page_texts();
+    assert_eq!(
+        texts,
+        vec!["3"],
+        "空缓冲应显示上次上屏内容，实际: {:?}",
+        texts
+    );
+    // 空格重复上屏
+    match coord.handle_key_event(&key_event(0x20, EVENT_KEY_DOWN)) {
+        KeyAction::InsertText { text, .. } => assert_eq!(text, "3", "空格应重复上屏"),
+        other => panic!("空格应重复上屏，实际: {:?}", other),
+    }
+}
+
+/// 移除成员即关闭该来源：members 去掉 `quick_input.calc` 后，算式不再产出计算候选
+/// （金额来源仍会对结果求值，故这里连 number 一起移除，验证「开关=增删」）。
+#[test]
+fn test_quick_input_member_removal_disables_source() {
+    if !has_schemas() {
+        return;
+    }
+    let mut cfg = config_with("wubi86");
+    cfg.schema.mix_modes[0]
+        .members
+        .retain(|m| m != wind_quick_input::MEMBER_CALC && m != wind_quick_input::MEMBER_NUMBER);
+    let coord = Coordinator::new_headless(cfg, Some(&data_dir()));
+    coord.handle_key_event(&key_event(0xBA, EVENT_KEY_DOWN)); // ;
+    press_vk(&coord, 0x31, false); // 1
+    press_vk(&coord, 0xBB, true); // +
+    press_vk(&coord, 0x32, false); // 2
+    let texts = coord.debug_page_texts();
+    assert!(
+        texts.is_empty(),
+        "移除 calc/number 成员后算式不应有候选，实际: {:?}",
+        texts
+    );
+    // 日期成员仍在：日期照常出候选（证明关的是单个来源而非整个快捷输入）
+    let coord2 = {
+        let mut c = config_with("wubi86");
+        c.schema.mix_modes[0]
+            .members
+            .retain(|m| m != wind_quick_input::MEMBER_CALC);
+        Coordinator::new_headless(c, Some(&data_dir()))
+    };
+    coord2.handle_key_event(&key_event(0xBA, EVENT_KEY_DOWN));
+    for vk in [0x31, 0x32] {
+        press_vk(&coord2, vk, false); // 12
+    }
+    press_vk(&coord2, 0xBE, false); // .
+    for vk in [0x32, 0x35] {
+        press_vk(&coord2, vk, false); // 25
+    }
+    let texts2 = coord2.debug_page_texts();
+    assert!(
+        texts2.iter().any(|t| t.ends_with("月25日")),
+        "date 成员仍在，日期候选应照常产出，实际: {:?}",
+        texts2
+    );
 }
 
 #[test]
@@ -1345,9 +1471,17 @@ fn test_quick_input_date_space_commits() {
         "日期候选应含 2025年12月25日，实际: {:?}",
         texts
     );
-    // 空格上屏高亮（首选 20251225）
+    // 中文日期是首选（中文输入法场景下最常用），且不产出补零的中文写法
+    assert_eq!(texts[0], "2025年12月25日", "实际: {:?}", texts);
+    assert_eq!(
+        texts.iter().filter(|t| t.contains('年')).count(),
+        1,
+        "中文日期只应有不补零的一条（补零写法不合 GB/T 15835），实际: {:?}",
+        texts
+    );
+    // 空格上屏高亮（首选）
     match coord.handle_key_event(&key_event(0x20, EVENT_KEY_DOWN)) {
-        KeyAction::InsertText { text, .. } => assert_eq!(text, "20251225"),
+        KeyAction::InsertText { text, .. } => assert_eq!(text, "2025年12月25日"),
         other => panic!("空格应上屏日期首选，实际: {:?}", other),
     }
 }
