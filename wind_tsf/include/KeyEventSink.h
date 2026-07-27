@@ -143,6 +143,14 @@ private:
     // 输入右符号本身是否跳出（配置 jump_out_keys 里的 `right_symbol` 特殊值）。右符号不是
     // 固定按键（取决于配对表），故与 _jumpOutKeys 分开存。对称配对（引号）不受此项影响。
     bool _jumpOutOnRightSymbol = false;
+    // 「英半列有自定义标点映射」的源字符集合（core 经 CONFIG_KEY_CUSTOM_EN_PUNCT 推送）。
+    // 英文模式（非全角）本 DLL 默认透传标点键 → core 收不到 → 英半列打不到；据此**精确**吃下
+    // 集合内的键转发。空集合（默认）= 与历史行为完全一致，不配的键一律不受影响。
+    std::set<wchar_t> _customEnPunctChars;
+    // 该键是否属于「英半自定义标点」：英文模式吃键判据，同时也是英文本地配对的让位判据
+    // （吃下的键要交给 core 出字，本地配对若抢先 CommitText 就把转发吞了）。
+    // 判据必须与 core 的 `wind_punct::custom_english_punct_chars` 同源，漂移即「吃了再吐」丢键。
+    BOOL _IsCustomEnglishPunctKey(WPARAM vk, uint32_t modifiers) const;
     // IPC 失败后置位：本地 composition 已强制复位，但 Go 侧可能仍持有活跃会话状态。
     // 下一次按键前提下视作"有会话"，让 ENTER/ESC 也能发给 Go 走重握手；
     // 任何一次成功 ReceiveResponse 之后清旗，状态由响应处理路径自然重建。

@@ -529,6 +529,10 @@ constexpr const char* CONFIG_KEY_STATS = "stats";
 // OnTestKeyDown 本地判定是否放行——吃键决策发生在 IPC 之前，仅靠 core 回 PassThrough
 // 已经太晚（会形成「吃了再吐」丢键）。
 constexpr const char* CONFIG_KEY_PASSWORD_SUPPRESS = "password_suppress";
+// 「英文半角列有自定义标点映射」的源字符集合。英文模式（非全角）下本 DLL 默认直接透传标点键、
+// core 收不到，用户配的「英半」列因此永远不生效；据此集合精确吃下这些键转发给 core。
+// 集合为空（默认）= 行为与历史完全一致。格式：count(u8) + [ch:u16(LE)]...
+constexpr const char* CONFIG_KEY_CUSTOM_EN_PUNCT = "custom_en_punct";
 
 // Calculate key hash for hotkey matching
 // Format: (modifiers << 16) | keyCode

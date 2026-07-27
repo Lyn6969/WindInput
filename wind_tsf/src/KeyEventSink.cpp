@@ -681,6 +681,19 @@ STDAPI CKeyEventSink::OnTestKeyDown(ITfContext* pContext, WPARAM wParam, LPARAM 
             return S_OK;
         }
     }
+    // 英文模式 + 半角：只吃「英半列有自定义标点映射」的标点键（core 经
+    // CONFIG_KEY_CUSTOM_EN_PUNCT 推送字符集合），交给 core 按英半列出字。
+    // 不吃的话该键直接透传、core 永远收不到，用户配的英半列就是个打不到的死格。
+    // 集合为空（未启用自定义映射）→ 判据立即返回 FALSE，行为与历史完全一致。
+    else if (!isChineseMode && _IsCustomEnglishPunctKey(wParam, modifiers))
+    {
+        *pfEaten = TRUE;
+        _LogKeyDecision(L"test_down", _pTextService->GetFocusSessionId(), wParam, modifiers,
+                        CHotkeyManager::ClassifyInputKey(wParam, modifiers),
+                        isChineseMode, hasComposition, _hasCandidates, hasInputSession, TRUE,
+                        L"english_custom_punct");
+        return S_OK;
+    }
     // else: not in Chinese mode and no input session — pass through
 
     // Track digit pass-through for smart punctuation fallback.
@@ -752,8 +765,11 @@ STDAPI CKeyEventSink::OnKeyDown(ITfContext* pContext, WPARAM wParam, LPARAM lPar
     // （表现为英文模式上屏 }，中文正常；Ctrl+Shift+E / \ 不受影响因非配对字符）。
     // 全角时本地配对让位给 core（与 OnTestKeyDown 的同款守卫必须成对，否则该处不吃、
     // 此处却仍本地插入半角配对，全角配对永远不生效）。
+    // 「英半自定义标点」的键同样让位给 core（与上面全角让位同源）：OnTestKeyDown 已吃下它
+    // 等 core 出字，若此处本地配对抢先 CommitText 并 return，转发就被吞掉、自定义永不生效。
     if (!_pTextService->IsChineseMode() && _englishPairEngine.IsEnabled()
-        && !_pTextService->IsFullWidth())
+        && !_pTextService->IsFullWidth()
+        && !_IsCustomEnglishPunctKey(wParam, CHotkeyManager::GetCurrentModifiers()))
     {
         uint32_t mods = CHotkeyManager::GetCurrentModifiers();
         if (!(mods & (KEYMOD_CTRL | KEYMOD_ALT)))
@@ -1107,6 +1123,12 @@ STDAPI CKeyEventSink::OnKeyDown(ITfContext* pContext, WPARAM wParam, LPARAM lPar
         {
             isInputKey = TRUE;
         }
+    }
+    // 英文模式 + 半角 + 该键配了英半列：与 OnTestKeyDown 的 english_custom_punct 分支成对，
+    // 必须同条件放行转发，否则那边吃了、这边不发 → 键彻底丢失。
+    else if (!isChineseMode && _IsCustomEnglishPunctKey(wParam, modifiers))
+    {
+        isInputKey = TRUE;
     }
 
     if (!isKeyDownHotkey && !isInputKey)
@@ -2258,6 +2280,21 @@ void CKeyEventSink::_SyncStateFromResponse(uint32_t statusFlags)
 // Config sync handler
 // ============================================================================
 
+// 该键是否配了「英文半角」列的自定义标点映射（core 推送的字符集合）。
+// 空集合时零开销返回 FALSE —— 未启用自定义映射的用户完全不受本机制影响。
+BOOL CKeyEventSink::_IsCustomEnglishPunctKey(WPARAM vk, uint32_t modifiers) const
+{
+    if (_customEnPunctChars.empty())
+        return FALSE;
+    // Ctrl/Alt 组合是功能热键，不参与出字（与 ClassifyInputKey 对其返回 None 保持一致）。
+    if (modifiers & (KEYMOD_CTRL | KEYMOD_ALT))
+        return FALSE;
+    if (!CHotkeyManager::IsPunctuationKey(vk))
+        return FALSE;
+    wchar_t ch = CHotkeyManager::VirtualKeyToPunctuation(vk, (modifiers & KEYMOD_SHIFT) != 0);
+    return ch != 0 && _customEnPunctChars.count(ch) > 0;
+}
+
 void CKeyEventSink::OnSyncConfig(const std::string& key, const std::vector<uint8_t>& value)
 {
     if (key == CONFIG_KEY_ENGLISH_PAIRS)
@@ -2294,6 +2331,19 @@ void CKeyEventSink::OnSyncConfig(const std::string& key, const std::vector<uint8
         }
         WIND_LOG_INFO_FMT(L"Jump-out keys config updated: count=%d, right_symbol=%d\n",
                           (int)_jumpOutKeys.size(), (int)_jumpOutOnRightSymbol);
+    }
+    else if (key == CONFIG_KEY_CUSTOM_EN_PUNCT)
+    {
+        // 格式：count(u8) + [ch:u16(LE)]...（对齐 Rust encode_custom_en_punct_value）
+        _customEnPunctChars.clear();
+        if (value.empty()) return;
+        uint8_t count = value[0];
+        for (size_t i = 0; i < count && (1 + i * 2 + 2) <= value.size(); i++)
+        {
+            uint16_t ch = *reinterpret_cast<const uint16_t*>(value.data() + 1 + i * 2);
+            _customEnPunctChars.insert((wchar_t)ch);
+        }
+        WIND_LOG_INFO_FMT(L"Custom english punct chars updated: count=%d\n", (int)_customEnPunctChars.size());
     }
     else if (key == CONFIG_KEY_PASSWORD_SUPPRESS)
     {
