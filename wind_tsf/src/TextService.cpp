@@ -2100,10 +2100,14 @@ STDAPI CTextService::OnSetFocus(ITfDocumentMgr* pDocMgrFocus, ITfDocumentMgr* pD
         // 仅对真正有可编辑上下文的文档查询，避免对无文本控件的 DocMgr 多跑一次同步读锁。
         UINT64 inputScopeMask = _hasTextInputContext ? _QueryInputScopeMask(pDocMgrFocus) : 0;
 
-        // 密码框信号（Weasel/小狼毫做法）：宿主在 context 上置 GUID_COMPARTMENT_KEYBOARD_DISABLED
+        // 密码框信号（Weasel/小狼毫做法）：宿主在 **context** 上置 GUID_COMPARTMENT_KEYBOARD_DISABLED
         // 表示"此控件禁用输入法"。Chromium 系浏览器密码框会置位，而无痕模式普通可编辑框不会，
-        // 因此能精确区分密码框与隐私字段。置位则补 IS_PASSWORD 位让 Go 抑制中文。
-        // InputScope 原始位（IS_PRIVATE/IS_SEARCH 等）仍随 mask 上报，留作 Go 端将来扩展判断。
+        // 因此能精确区分密码框与隐私字段。
+        // ⚠ 这是 context 级，与线程级的 `_bKeyboardDisabled` 是**两回事**：后者才是 OnTestKeyDown
+        // 开头全放行的依据，网页密码框并不会置它。因此 context 级命中时键仍会被 DLL 吃下，
+        // 必须靠补 IS_PASSWORD 位驱动抑制门控（IsPasswordSuppressActive / core apply_input_diag）
+        // 来强制英文——mask 是这条信号唯一的出口，勿删。
+        // InputScope 原始位（IS_PRIVATE/IS_SEARCH 等）仍随 mask 上报，留作将来扩展判断。
         // 密码框判据复用到加词热键门卫：密码框（中文已被抑制）不注册加词热键，缩小抢占面。
         _focusIsPassword = (_hasTextInputContext && _IsFocusKeyboardDisabled(pDocMgrFocus)) != FALSE;
         if (_focusIsPassword)
@@ -2183,12 +2187,16 @@ STDAPI CTextService::OnSetFocus(ITfDocumentMgr* pDocMgrFocus, ITfDocumentMgr* pD
         // Lazy connect: 服务在 TSF 加载之后才启动也能覆盖（SendFocusGained 内部已处理）。
         else if (_pIPCClient != nullptr)
         {
-            uint8_t inputReason = ComputeInputReason(_focusIsPassword, inputScopeMask);
+            // 上报的 disabled 字段统一为**线程级** KEYBOARD_DISABLED（与 OnChange 里的
+            // SendInputStateReport 同源），语义＝「系统禁用了输入法，DLL 已全放行」。
+            // 密码框（context 级）不走这个字段，它已折进 mask 的 IS_PASSWORD 位——此前这里
+            // 传 _focusIsPassword，让 core 把「密码框」误读成「键已放行」，抑制被自我否决。
+            uint8_t inputReason = ComputeInputReason(_bKeyboardDisabled != FALSE, inputScopeMask);
             // 单独计时这一段：它是本函数里唯一会阻塞在别的进程上的调用，
             // 需要能和 COM/日志开销分开归因。
             const LONGLONG focusIpcT0 = WindLog::PerfNow();
             const BOOL focusSent = _pIPCClient->SendFocusGained(
-                caretX, caretY, caretHeight, inputScopeMask, _focusIsPassword, inputReason);
+                caretX, caretY, caretHeight, inputScopeMask, _bKeyboardDisabled != FALSE, inputReason);
             focusIpcMs += WindLog::PerfMsSince(focusIpcT0);
             if (focusSent)
             {
@@ -3225,7 +3233,7 @@ void CTextService::TryRecoverFocusState()
     // 输入诊断 HUD（Task 7）：与 OnSetFocus / compartment OnChange 一致，重新查询当前
     // 焦点 DocMgr 的 InputScope mask，避免恢复路径硬编码 mask=0 让 HUD 误显示
     // "原因: 无"。若此刻拿不到焦点 DocMgr（理论上不应发生，仅作防御），mask 退化为 0，
-    // reason 仍据 _focusIsPassword 计算，与旧行为一致。
+    // reason 仍据线程级 _bKeyboardDisabled + mask 计算，与另两条上报路径同语义。
     UINT64 recoveryMask = 0;
     ITfDocumentMgr* pDocMgrRecover = nullptr;
     if (_pThreadMgr != nullptr && SUCCEEDED(_pThreadMgr->GetFocus(&pDocMgrRecover)) && pDocMgrRecover != nullptr)
@@ -3233,8 +3241,8 @@ void CTextService::TryRecoverFocusState()
         recoveryMask = _QueryInputScopeMask(pDocMgrRecover);
         pDocMgrRecover->Release();
     }
-    uint8_t recoveryReason = ComputeInputReason(_focusIsPassword, recoveryMask);
-    if (_pIPCClient->SendFocusGained((int)caretX, (int)caretY, (int)caretHeight, recoveryMask, _focusIsPassword, recoveryReason))
+    uint8_t recoveryReason = ComputeInputReason(_bKeyboardDisabled != FALSE, recoveryMask);
+    if (_pIPCClient->SendFocusGained((int)caretX, (int)caretY, (int)caretHeight, recoveryMask, _bKeyboardDisabled != FALSE, recoveryReason))
     {
         _needsFocusRecovery = FALSE;
         _pIPCClient->ClearNeedsSyncFlag();
@@ -3793,19 +3801,28 @@ bool CTextService::_IsFocusKeyboardDisabled(ITfDocumentMgr* pDocMgr)
 }
 
 // 密码框强制英文抑制当前是否生效。**必须镜像** core `apply_input_diag` 的判据：
-//   suppress = is_password_scope(mask) && !disabled && password_suppress_enabled
+//   suppress = is_password_scope(mask) && password_suppress_enabled
 // 两侧判据一旦漂移就会重现「吃了再吐」——DLL 吃了键、core 却回 PassThrough → 严格 TSF
 // 宿主（Chrome/Electron）不回退合成 WM_CHAR，键直接丢失（密码框里表现为完全打不出字）。
 //
-// `!disabled`（compartment 未禁用）这条不可省：compartment 置位时 DLL 早在
-// OnTestKeyDown 开头就全放行了，引擎收不到键，抑制无从谈起（core 注释所谓 moot）。
-// Chromium 系密码框走的正是 compartment 那条路；本判据只覆盖「宿主标了 IS_PASSWORD
-// InputScope 但没禁用键盘」的那类宿主——恰恰是此前会丢键的场景。
+// ⚠ KEYBOARD_DISABLED 有**两个层级**，混为一谈正是本函数此前失效的原因（2026-07-27 修）：
+//   · 线程级 `_bKeyboardDisabled`（advise 在 _pThreadMgr 的 compartment 上）——
+//     OnTestKeyDown 开头 `IsKeyboardDisabled()` 全放行看的就是它。此时引擎压根收不到键，
+//     抑制无从谈起，故在此早退。
+//   · context 级 `_focusIsPassword`（读焦点 context 的 compartment，见 _IsFocusKeyboardDisabled）
+//     —— **Chromium 系网页密码框置的是这一层**，线程级纹丝不动，DLL 照常吃键。
+//
+// 旧判据把 `_focusIsPassword` 也列为早退条件，理由是「compartment 置位时键已被放行」，
+// 但那句话只对线程级成立。于是网页密码框同时逃过了「放行」与「抑制」两道闸，中文照打，
+// 而高级菜单里的开关怎么切都没反应（它只能改 _passwordSuppressEnabled，改不动早退）。
+//
+// context 级的密码信号已在 OnSetFocus 折进 mask 的 IS_PASSWORD 位（见 _focusIsPassword
+// 赋值处），因此这里只判 mask 就已覆盖两种来源，无需再单独看 _focusIsPassword。
 BOOL CTextService::IsPasswordSuppressActive() const
 {
     if (!_passwordSuppressEnabled)
         return FALSE;
-    if (_focusIsPassword || _bKeyboardDisabled)
+    if (_bKeyboardDisabled)
         return FALSE;
     // IS_PASSWORD=31 / IS_NUMERIC_PASSWORD=63（对齐 core is_password_scope 的两位）
     const UINT64 kPasswordScopeBits = (1ULL << 31) | (1ULL << 63);

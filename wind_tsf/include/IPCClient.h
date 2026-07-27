@@ -162,6 +162,12 @@ public:
     // Send focus gained notification (with optional caret position and InputScope bitmask).
     // disabled/reason: input diagnostics HUD state for the newly focused control (Task 7).
     // reason: 0 None / 1 CompartmentDisabled / 2 InputScopePassword / 3 NumericPassword.
+    //
+    // ⚠ `disabled` 恒为**线程级** GUID_COMPARTMENT_KEYBOARD_DISABLED（_pThreadMgr 上那个），
+    // 语义＝「系统禁用输入法，DLL 已在 OnTestKeyDown 全放行」。**不要**往这里传 context 级的
+    // 密码框判定（_focusIsPassword）：core 会据此认定「键已放行、抑制 moot」而跳过强制英文，
+    // 而网页密码框恰恰只置 context 级、键并没被放行 → 密码框里照打中文（2026-07-27 修）。
+    // 密码框信号一律走 inputScopeMask 的 IS_PASSWORD 位。
     BOOL SendFocusGained(int caretX = 0, int caretY = 0, int caretHeight = 0, UINT64 inputScopeMask = 0,
                          bool disabled = false, uint8_t reason = 0);
 

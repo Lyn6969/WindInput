@@ -1409,10 +1409,21 @@ impl Coordinator {
         } else {
             String::new()
         };
-        // 抑制：命中密码 InputScope 位 且 compartment 未禁用（禁用态 DLL 已放行所有键，引擎收不到键，
-        // 抑制是 moot 的——见设计 D 节）且 策略开关开 → 强制英文。
+        // 抑制：命中密码 InputScope 位 且 策略开关开 → 强制英文。
+        //
+        // ⚠ 曾经这里还有一条 `&& !disabled`，理由是「disabled 时 DLL 已放行所有键、引擎收不到
+        // 键，抑制 moot」。那条推理错在 `disabled` 的层级：DLL 放行看的是**线程级**
+        // KEYBOARD_DISABLED，而 Windows 侧当时往这个字段传的是**context 级**的密码框判定。
+        // 于是 Chromium 网页密码框（只置 context 级）被这条判据整个否掉——键没被放行、抑制也
+        // 不生效，密码框里照打中文，高级菜单的开关看着像坏了。2026-07-27 两侧一并修正：
+        // `disabled` 统一为线程级语义，密码信号只走 mask。
+        //
+        // 现在 disabled 只参与 `reason_from` 的展示推导，不再进决策——单一来源，避免再次歧义。
+        // 线程级 disabled 为真时本判据仍可能算出 suppress=true，这是**安全的**：那时 DLL 在
+        // OnTestKeyDown 开头就全放行了，一个键都不会送到引擎，suppress 取值无从被观测。
+        // 危险的只有反方向（core 抑制而 DLL 吃键 → 「吃了再吐」丢键），故不变量是
+        // **core.suppress ⊆ C++.suppress**，见 C++ `IsPasswordSuppressActive`。
         let suppress = crate::input_diag::is_password_scope(mask)
-            && !disabled
             && self.password_suppress_enabled.load(Relaxed);
         self.password_suppress.store(suppress, Relaxed);
         {
@@ -6632,21 +6643,94 @@ mod input_diag_tests {
         );
     }
 
+    /// 回归（2026-07-27）：Chromium 网页密码框必须强制英文，**即便上报的 disabled=true**。
+    ///
+    /// 此前判据里有一条 `&& !disabled`，本意是「compartment 禁用时 DLL 已全放行、抑制 moot」。
+    /// 但 DLL 放行看的是**线程级** KEYBOARD_DISABLED，而 Windows 侧当时往 `disabled` 字段传的
+    /// 是 **context 级**的 `_focusIsPassword` —— 网页密码框恒为 true，于是抑制被自我否决：
+    /// 键没被放行、中文照打，高级菜单的开关看着像坏了。
+    ///
+    /// ⚠ 本用例的要害是 `disabled=true`。改动前所有密码框用例都传 false（macOS 只发 mask、
+    /// 不发 disabled，走的正是那条路），恰好绕开失效分支，所以旧代码测试全绿。
+    /// **动这条判据时必须保住这个取值**，否则回归保护形同虚设。
     #[test]
-    fn compartment_disabled_does_not_set_suppress() {
+    fn password_scope_suppresses_even_when_disabled_flag_set() {
+        let mut cfg = Config::default();
+        cfg.input.default.chinese_mode = true;
+        let c = Coordinator::new_headless(cfg, None);
+
+        // disabled=true + 密码位：正是 Chromium 网页密码框改动前的上报组合。
+        c.apply_input_diag(4321, true, 1, 1 << 31);
+        assert!(
+            c.password_suppress
+                .load(std::sync::atomic::Ordering::Relaxed),
+            "context 级密码框（disabled=true）必须触发强制英文抑制"
+        );
+
+        let action = c.handle_key_event(&kev(0x41 /* VK_A */, EVENT_KEY_DOWN));
+        assert!(
+            matches!(action, KeyAction::PassThrough),
+            "密码框里字母键应强制透传为英文，实际: {:?}",
+            action
+        );
+        assert!(
+            c.state.lock().unwrap().chinese_mode,
+            "抑制不应改动 chinese_mode 持久值（图标保持不变）"
+        );
+    }
+
+    /// disabled 只参与 `reason_from` 的展示推导，**不参与** suppress 决策——单一来源。
+    ///
+    /// 本用例取代旧的 `compartment_disabled_does_not_set_suppress`：那条断言同样的输入
+    /// （disabled=true + 密码位）**不该**置 suppress，把「compartment 禁用 ⇒ DLL 已放行所有键」
+    /// 这条前提固化成了契约。前提只对**线程级** KEYBOARD_DISABLED 成立，而当时 Windows 侧
+    /// 往该字段传的是 context 级的密码框判定 —— 契约锁住的恰是 bug 本身。reason 断言保留。
+    #[test]
+    fn disabled_flag_drives_reason_display_not_suppression() {
         use std::sync::atomic::Ordering::Relaxed;
         let c = test_coordinator();
-        // disabled=true 且 mask 含密码位：compartment 已禁用，DLL 放行所有键，suppress 应为 moot。
+
+        // 线程级禁用 + 密码位：reason 展示为 compartment（优先级最高），suppress 仍置位。
+        // suppress=true 在此场景无害：DLL 已全放行，引擎收不到键，取值无从被观测。
+        c.apply_input_diag(1, true, 1, 1 << 31);
+        assert_eq!(
+            c.last_input_diag.lock().unwrap().reason,
+            crate::input_diag::InputDiagReason::CompartmentDisabled,
+            "disabled=true 时 reason 展示应为 compartment"
+        );
+        assert!(
+            c.password_suppress.load(Relaxed),
+            "reason 的展示优先级不应反过来否决抑制决策"
+        );
+
+        // 无密码位：无论 disabled 与否都不抑制。
+        c.apply_input_diag(1, true, 1, 0);
+        assert!(
+            !c.password_suppress.load(Relaxed),
+            "mask 无密码位时不应抑制"
+        );
+    }
+
+    /// 策略开关关闭后，即便命中密码位也不抑制（高级菜单的逃生阀必须真的管用）。
+    #[test]
+    fn disabled_switch_defeats_password_scope() {
+        use std::sync::atomic::Ordering::Relaxed;
+        let c = test_coordinator();
+        c.toggle_password_suppress();
+        assert!(
+            !c.password_suppress_enabled.load(Relaxed),
+            "前置条件：开关已关"
+        );
+
         c.apply_input_diag(1, true, 1, 1 << 31);
         assert!(
             !c.password_suppress.load(Relaxed),
-            "compartment 禁用态不应冗余置位 suppress"
+            "开关关闭时密码框不应强制英文"
         );
-        let d = c.last_input_diag.lock().unwrap();
-        assert_eq!(
-            d.reason,
-            InputDiagReason::CompartmentDisabled,
-            "reason 不受 suppress 判据变化影响"
+        c.apply_input_diag(1, false, 2, 1 << 63);
+        assert!(
+            !c.password_suppress.load(Relaxed),
+            "数字密码位同样受开关约束"
         );
     }
 }
