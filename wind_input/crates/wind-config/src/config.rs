@@ -2369,6 +2369,8 @@ impl Config {
         if !root.is_table() {
             root = toml::Value::Table(Default::default());
         }
+        // 供落盘后通知钩子用：下方 set_nested 会 move 掉 value。
+        let value_for_hook = value.clone();
         // 出厂默认取不到时 `is_default` 恒 false → 退化为「照常写入」的旧行为（安全降级）。
         // `is_known_key` 与 `prune_redundant` 同一道保险：未登记键（废弃键 / Map 子路径）不收口。
         let is_default = crate::config_schema::is_known_key(&path.join("."))
@@ -2388,6 +2390,10 @@ impl Config {
         let tmp = file.with_extension("toml.tmp");
         std::fs::write(&tmp, out)?;
         std::fs::rename(&tmp, &file)?;
+        // 落盘成功后通知订阅方（设置界面等）。放在 rename 之后：失败路径提前 `?`
+        // 返回，不会误报。传出的是入参值——键被剪枝删除时用户层虽无此键，生效值
+        // 仍是它（见上方剪枝说明），对订阅方语义一致。
+        crate::change_hook::notify_changed(path, &value_for_hook);
         Ok(())
     }
 

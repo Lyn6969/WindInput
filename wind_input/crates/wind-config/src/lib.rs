@@ -3,6 +3,7 @@
 //! 与 Go 版本 `wind_input/pkg/config/` 和 `wind_input/internal/schema/` 对齐。
 
 pub mod app_compat;
+pub mod change_hook;
 pub mod config;
 pub mod config_schema;
 pub mod hotkey;

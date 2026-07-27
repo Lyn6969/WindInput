@@ -334,9 +334,25 @@ fn main() {
             // 快捷键/托盘/RPC 任一路径切方案，设置界面都能收到通知（此前只有候选窗的
             // push 通道收得到，而那条载荷里没有方案 id）。
             let sink = rpc_server.event_sink();
-            wind_engine::active_hook::set_active_schema_hook(std::sync::Arc::new(
+            wind_engine::active_hook::set_active_schema_hook(std::sync::Arc::new({
+                let sink = sink.clone();
                 move |id: &str| {
                     sink.broadcast("schema.activeChanged", serde_json::json!({ "id": id }));
+                }
+            }));
+            // 配置落盘 → 广播。托盘/右键菜单、快捷键、命令栏改配置都不经 RPC，
+            // 设置界面此前无从得知（「显示工具栏」「简入繁出」「主题」「常驻显示」等
+            // 都会显示陈旧值）。带上 key 与新值，订阅方可直接更新对应字段，无需回查。
+            // 经 RPC setItems 的写入同样会走到这里，属预期内的自我回声：设置端此时
+            // 值已相同，更新是幂等的。
+            wind_config::change_hook::set_config_change_hook(std::sync::Arc::new(
+                move |path: &[&str], value: &toml::Value| {
+                    let key = path.join(".");
+                    let value = serde_json::to_value(value).unwrap_or(serde_json::Value::Null);
+                    sink.broadcast(
+                        "config.changed",
+                        serde_json::json!({ "reason": "write", "key": key, "value": value }),
+                    );
                 },
             ));
             if let Err(e) = rpc_server.start() {
