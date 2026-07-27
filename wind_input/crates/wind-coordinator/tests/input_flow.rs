@@ -4226,6 +4226,150 @@ fn quote_alternates_when_not_in_pair_table() {
     );
 }
 
+/// 英文模式（半角）下「英文半角」列生效：DLL 按 core 推送的字符集合吃下这些标点键转发，
+/// 此处必须出字。
+///
+/// 历史：英文非全角时 DLL 直接透传标点键（真机日志 `decision=passthrough_not_handled`），
+/// 引擎收不到 → 四列里的「英半」是打不到的死格（英全列有 `english_fullwidth` 分支才生效）。
+#[test]
+fn english_mode_uses_english_half_width_column() {
+    if !has_schemas() {
+        return;
+    }
+    let mut cfg = config_with("wubi86");
+    cfg.input.default.chinese_mode = false; // 英文输入模式
+    cfg.input.punct.custom_enabled = true;
+    cfg.input.punct.custom_mappings.insert(
+        "\"1".into(),
+        vec!["E".into(), "＂".into(), "R".into(), "#".into()],
+    );
+    cfg.input.punct.custom_mappings.insert(
+        "\"2".into(),
+        vec!["￥".into(), "＂".into(), "%".into(), "$".into()],
+    );
+    let coord = Coordinator::new_headless(cfg, Some(&data_dir()));
+    assert!(!coord.is_chinese_mode(), "前置：应处于英文模式");
+
+    // Shift+VK_OEM_7 两次 → 英半列的左形 / 右形（`#` → `$`）
+    let first = coord.handle_key_event(&key_event_mods(0xDE, EVENT_KEY_DOWN, 0x0001));
+    let second = coord.handle_key_event(&key_event_mods(0xDE, EVENT_KEY_DOWN, 0x0001));
+    assert_eq!(
+        action_text(&first).as_deref(),
+        Some("#"),
+        "英文模式首次应出英半列的左形，实际: {first:?}"
+    );
+    assert_eq!(
+        action_text(&second).as_deref(),
+        Some("$"),
+        "英文模式第二次应出英半列的右形，实际: {second:?}"
+    );
+}
+
+/// 吃键集 ⊆ 出字集的**反向**保证：没配英半列的标点键在英文模式下仍须透传。
+///
+/// DLL 只吃 core 推送的字符集合内的键，core 也只接手同一集合——两侧同源。若此处误接手
+/// （返回 Consumed 之类）就会吞掉 DLL 根本没吃的键；反之若 DLL 吃了而这里不出字，
+/// 就是「吃了再吐」，Chrome/Electron 不回退合成 WM_CHAR，键直接丢失。
+#[test]
+fn english_mode_uncovered_punct_still_passes_through() {
+    if !has_schemas() {
+        return;
+    }
+    let mut cfg = config_with("wubi86");
+    cfg.input.default.chinese_mode = false;
+    cfg.input.punct.custom_enabled = true;
+    // 只给双引号配英半列，逗号不配
+    cfg.input.punct.custom_mappings.insert(
+        "\"1".into(),
+        vec!["".into(), "".into(), "".into(), "#".into()],
+    );
+    let coord = Coordinator::new_headless(cfg, Some(&data_dir()));
+
+    let comma = coord.handle_key_event(&key_event(0xBC, EVENT_KEY_DOWN)); // VK_OEM_COMMA
+    assert!(
+        matches!(comma, KeyAction::PassThrough),
+        "未配英半列的标点键在英文模式下必须透传（DLL 也没吃它），实际: {comma:?}"
+    );
+    // 单引号（同一物理键、无 Shift）也没配 → 同样透传
+    let quote = coord.handle_key_event(&key_event(0xDE, EVENT_KEY_DOWN));
+    assert!(
+        matches!(quote, KeyAction::PassThrough),
+        "同键无 Shift 的 `'` 未配英半列，应透传，实际: {quote:?}"
+    );
+}
+
+/// 自定义映射 × 引号配对：`"1`/`"2` 两行 = **左形/右形**，配对时一次按键两行都用上。
+///
+/// 语义定名（用户拍板）：界面上的「第一次 / 第二次」实质是左形 / 右形，「第几次」只是没有
+/// 自动配对时按次序推导角色的说法。此前配对判定用硬编码的内置 `“”`，而上屏走自定义映射：
+/// 把引号自定义成 `「」` 后判定不命中 → 不钉左 → 交替态照旧前进 → 第 2 次按键出 `」`（右符号）
+/// → 「出对 / 出单」交替循环复发；反过来若判定命中却钉左，`"2` 那行就永远取不到。
+#[test]
+fn custom_quote_mapping_pairs_by_left_right_rows() {
+    if !has_schemas() {
+        return;
+    }
+    let mut cfg = config_with("wubi86");
+    cfg.input.auto_pair.chinese = true; // 默认中文配对表已含「」
+    cfg.input.punct.custom_enabled = true;
+    cfg.input
+        .punct
+        .custom_mappings
+        .insert("\"1".into(), vec!["「".into()]);
+    cfg.input
+        .punct
+        .custom_mappings
+        .insert("\"2".into(), vec!["」".into()]);
+    let coord = Coordinator::new_headless(cfg, Some(&data_dir()));
+
+    // 连按两次：每次都插入由「左形 + 右形」组成的完整一对，第二次不退化成裸右符号。
+    for round in 1..=2 {
+        let act = coord.handle_key_event(&key_event_mods(0xDE, EVENT_KEY_DOWN, 0x0001));
+        match act {
+            KeyAction::InsertTextWithCursor {
+                text,
+                cursor_offset,
+            } => {
+                assert_eq!(
+                    text, "「」",
+                    "第 {round} 次按引号应插入自定义左右形组成的一对"
+                );
+                assert_eq!(cursor_offset, 1, "第 {round} 次光标应落在配对中间");
+            }
+            other => panic!("第 {round} 次按引号应插入自定义配对，实际: {other:?}"),
+        }
+    }
+}
+
+/// 自定义映射 + 引号**不**参与配对时，两行仍按「第一次左 / 第二次右」交替取用。
+#[test]
+fn custom_quote_mapping_alternates_without_pairing() {
+    if !has_schemas() {
+        return;
+    }
+    let mut cfg = config_with("wubi86");
+    cfg.input.auto_pair.chinese = false; // 配对关 → 回到按次序取行
+    cfg.input.punct.custom_enabled = true;
+    cfg.input
+        .punct
+        .custom_mappings
+        .insert("\"1".into(), vec!["@".into()]);
+    cfg.input
+        .punct
+        .custom_mappings
+        .insert("\"2".into(), vec!["￥".into()]);
+    let coord = Coordinator::new_headless(cfg, Some(&data_dir()));
+
+    let first = coord.handle_key_event(&key_event_mods(0xDE, EVENT_KEY_DOWN, 0x0001));
+    let second = coord.handle_key_event(&key_event_mods(0xDE, EVENT_KEY_DOWN, 0x0001));
+    assert_eq!(action_text(&first).as_deref(), Some("@"), "首次应取 \"1 行");
+    assert_eq!(
+        action_text(&second).as_deref(),
+        Some("￥"),
+        "第二次应取 \"2 行"
+    );
+}
+
 fn action_caret(action: &KeyAction) -> Option<u32> {
     match action {
         KeyAction::UpdateComposition { caret_pos, .. } => Some(*caret_pos),

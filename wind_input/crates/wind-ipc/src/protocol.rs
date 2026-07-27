@@ -205,6 +205,11 @@ pub const CONFIG_KEY_JUMP_OUT_KEYS: &str = "jump_out_keys";
 /// TSF 端据此 + 自身持有的 InputScope 掩码在 `OnTestKeyDown` 本地判定是否放行：
 /// 吃键决策发生在 IPC 之前，协调器回 PassThrough 已太晚（形成「吃了再吐」丢键）。
 pub const CONFIG_KEY_PASSWORD_SUPPRESS: &str = "password_suppress";
+/// 「英文半角列有自定义标点映射」的源字符集合同步键名。英文模式（非全角）下 TSF 默认直接
+/// 透传标点键、引擎收不到，英半列因此永远不生效；TSF 据此集合**精确**吃下这些键转发引擎
+/// （集合为空 = 行为与历史完全一致）。判据须与 `wind_punct::custom_english_punct_chars`
+/// 同源，漂移即「吃了再吐」丢键。
+pub const CONFIG_KEY_CUSTOM_EN_PUNCT: &str = "custom_en_punct";
 
 // 消费确认
 pub const CMD_CONSUMED: u16 = 0x0401;

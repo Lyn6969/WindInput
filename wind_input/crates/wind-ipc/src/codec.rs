@@ -1046,6 +1046,35 @@ pub fn encode_jump_out_keys_value(right_symbol: bool, vks: &[u32]) -> Vec<u8> {
     value
 }
 
+/// 编码「英半列有自定义映射的源字符集合」（对齐 TSF `OnSyncConfig` CONFIG_KEY_CUSTOM_EN_PUNCT）。
+///
+/// 格式：count(u8) + [ch:u16(LE)]...  源字符均为 ASCII 标点，一个 UTF-16 单元足够。
+/// `chars` 应已去重排序（见 `wind_punct::custom_english_punct_chars`）以稳定输出。
+pub fn encode_custom_en_punct_value(chars: &[char]) -> Vec<u8> {
+    let n = chars.len().min(u8::MAX as usize);
+    let mut value = Vec::with_capacity(1 + n * 2);
+    value.push(n as u8);
+    for c in chars.iter().take(n) {
+        value.extend_from_slice(&(*c as u16).to_le_bytes());
+    }
+    value
+}
+
+#[cfg(test)]
+mod custom_en_punct_tests {
+    use super::*;
+
+    #[test]
+    fn layout_is_count_then_utf16_le() {
+        assert_eq!(encode_custom_en_punct_value(&[]), vec![0]);
+        // '"' = 0x22, '\'' = 0x27
+        assert_eq!(
+            encode_custom_en_punct_value(&['"', '\'']),
+            vec![2, 0x22, 0x00, 0x27, 0x00]
+        );
+    }
+}
+
 #[cfg(test)]
 mod darwin_push_tests {
     use super::*;

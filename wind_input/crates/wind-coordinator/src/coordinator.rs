@@ -553,6 +553,10 @@ pub(crate) struct ConfigBundle {
     pub(crate) jump_out_keys: std::collections::HashSet<u32>,
     /// 输入右符号本身是否跳出（`jump_out_keys` 含 `right_symbol`）。对称配对不受此项影响。
     pub(crate) jump_out_on_right_symbol: bool,
+    /// 「英半列有自定义标点映射」的源字符集合（预解析自 `punct.custom_mappings`，空=英文模式
+    /// 行为与历史一致）。这是 DLL 吃键与本侧出字的**同源判据**，且在英文标点键的热路径上每键
+    /// 都要查——故预计算，别在按键时重新遍历 `custom_mappings`。有序集合使推送字节可复现。
+    pub(crate) custom_en_punct_chars: std::collections::BTreeSet<char>,
 }
 
 impl ConfigBundle {
@@ -565,6 +569,9 @@ impl ConfigBundle {
         let jump_out_keys = parse_jump_out_keys(&config.input.auto_pair.jump_out_keys);
         let jump_out_on_right_symbol =
             parse_jump_out_on_right_symbol(&config.input.auto_pair.jump_out_keys);
+        let custom_en_punct_chars = wind_punct::custom_english_punct_chars(&config.input)
+            .into_iter()
+            .collect();
         Self {
             config,
             compiled_hotkeys,
@@ -573,6 +580,7 @@ impl ConfigBundle {
             en_pairs,
             jump_out_keys,
             jump_out_on_right_symbol,
+            custom_en_punct_chars,
         }
     }
 }
@@ -1156,12 +1164,9 @@ impl Coordinator {
         // 初始明暗：config.ui.theme.style（system 跟随系统实时探测，见 ThemeStyle::resolve_dark）。
         let theme_style_init = ThemeStyle::from_config(&config.ui.theme.style);
 
-        // 标点转换器：注入自定义映射（四状态）。
-        let mut punct_conv = PunctuationConverter::new();
-        punct_conv.set_custom_mappings(
-            config.input.punct.custom_enabled,
-            config.input.punct.custom_mappings.clone(),
-        );
+        // 标点转换器：只持引号交替态，自定义映射每次从实时配置读（故此处无需注入——
+        // 曾在此注入一份副本且仅此一次，设置页改自定义标点必须重启服务才生效）。
+        let punct_conv = PunctuationConverter::new();
 
         // 编码显示方式运行时初值（config 移入结构体前先算）。
         let preedit_display_init = config.ui.candidate.preedit();
@@ -1804,6 +1809,7 @@ impl Coordinator {
                 self.push_english_pair_config(0);
                 self.push_jump_out_keys_config(0); // 配对跳出键同步（英文模式跳出 + 中文转发放行）
                 self.push_password_suppress_config(0); // 密码框抑制策略（DLL 本地吃键门控）
+                self.push_custom_en_punct_config(0); // 英半列自定义标点：DLL 据此吃键转发
                 #[cfg(windows)]
                 if let Some(mgr) = self.host_render() {
                     mgr.set_whitelist(new_cfg.compat.host_render_processes.clone());
@@ -3062,6 +3068,7 @@ impl Coordinator {
         self.push_english_pair_config(client_token);
         self.push_jump_out_keys_config(client_token); // 配对跳出键（英文模式跳出 + 中文转发放行）
         self.push_password_suppress_config(client_token); // 密码框抑制策略（DLL 本地吃键门控）
+        self.push_custom_en_punct_config(client_token); // 英半列自定义标点：DLL 据此吃键转发
 
         let Some(mgr) = self.host_render() else {
             return;
@@ -3100,6 +3107,27 @@ impl Coordinator {
         let value = wind_ipc::codec::encode_password_suppress_value(enabled);
         let msg = wind_ipc::codec::encode_sync_config(
             wind_ipc::protocol::CONFIG_KEY_PASSWORD_SUPPRESS,
+            &value,
+        );
+        if client_token != 0 {
+            self.push_server.push_to_token(client_token, &msg);
+        } else {
+            self.push_server.push_to_active(&msg);
+        }
+    }
+
+    /// 下发「英半列有自定义标点映射」的源字符集合给 DLL。
+    ///
+    /// 英文模式（非全角）下 DLL 默认直接透传标点键、引擎收不到，英半列因此打不到；DLL 据此
+    /// 集合精确吃下这些键并转发（集合为空 = 完全保持历史行为）。**吃键集必须 ⊆ 出字集**：
+    /// 出字方 `handle_english_custom_punct` 与本推送共用 `custom_english_punct_chars` 作判据，
+    /// 同源即不会漂移；两侧一旦不一致就是「吃了再吐」丢键（Chrome/Electron 不回退合成 WM_CHAR）。
+    pub fn push_custom_en_punct_config(&self, client_token: u64) {
+        // BTreeSet 迭代天然有序 → 推送字节可复现（与 jump_out_keys 排序同理）。
+        let chars: Vec<char> = self.rt().custom_en_punct_chars.iter().copied().collect();
+        let value = wind_ipc::codec::encode_custom_en_punct_value(&chars);
+        let msg = wind_ipc::codec::encode_sync_config(
+            wind_ipc::protocol::CONFIG_KEY_CUSTOM_EN_PUNCT,
             &value,
         );
         if client_token != 0 {
@@ -4221,6 +4249,14 @@ impl MessageHandler for Coordinator {
             if state.full_width
                 && data.modifiers & (MOD_CTRL | MOD_ALT) == 0
                 && let Some(act) = self.handle_english_full_width(&mut state, data)
+            {
+                return act;
+            }
+            // 半角英文 + 该标点键配了「英半」列：DLL 已按 core 推送的字符集合吃下此键
+            // （`english_custom_punct` 分支），此处必须出字，否则同样「吃了再吐」丢键。
+            // 未配的键 handle 返回 None → 落到下方透传，行为与历史完全一致。
+            if data.modifiers & (MOD_CTRL | MOD_ALT) == 0
+                && let Some(act) = self.handle_english_custom_punct(&mut state, data)
             {
                 return act;
             }

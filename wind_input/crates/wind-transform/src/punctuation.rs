@@ -3,15 +3,16 @@
 //! 与 Go 版本 `wind_input/internal/transform/punctuation.go` 对齐。
 //! 英文标点 → 中文标点；引号根据左右状态切换。
 
-use std::collections::HashMap;
+use wind_config::config::PunctConfig;
 
-/// 标点转换器（持有引号左右状态 + 自定义映射表）
+/// 标点转换器（**只**持有引号左右交替状态）。
+///
+/// 自定义映射表刻意**不**存在这里：它是配置，须每次从实时 `PunctConfig` 读。曾经存过一份
+/// 副本，只在 `Coordinator::new` 注入一次 → 设置页保存后不重启服务永不生效（且外层开关读
+/// 实时配置、内层数据读旧副本，症状是「开关明明开着却完全无反应」）。转换器只留运行时状态。
 pub struct PunctuationConverter {
     single_quote_left: bool,
     double_quote_left: bool,
-    custom_enabled: bool,
-    /// key=源字符（引号用 `"1`/`"2`/`'1`/`'2`），value=[中半,英全,中全,英半]
-    custom_mappings: HashMap<String, Vec<String>>,
 }
 
 impl Default for PunctuationConverter {
@@ -25,54 +26,57 @@ impl PunctuationConverter {
         Self {
             single_quote_left: true,
             double_quote_left: true,
-            custom_enabled: false,
-            custom_mappings: HashMap::new(),
         }
     }
 
-    /// 设置自定义标点映射（配置加载/热更时调用）。
-    pub fn set_custom_mappings(&mut self, enabled: bool, mappings: HashMap<String, Vec<String>>) {
-        self.custom_enabled = enabled;
-        self.custom_mappings = mappings;
-    }
-
-    /// 重置引号状态（模式切换/清空时调用）。不清自定义映射（配置态）。
+    /// 重置引号状态（模式切换/清空时调用）。
     pub fn reset(&mut self) {
         self.single_quote_left = true;
         self.double_quote_left = true;
     }
 
-    /// 查找自定义映射。`col_idx`: 0=中文半角 1=英文全角 2=中文全角 3=英文半角。
-    /// 引号按当前左右态选 `"1`/`"2`/`'1`/`'2` 作为 key；命中（非空）时切换引号态并返回。
-    /// 未命中不切换状态。对齐 Go `PunctuationConverter.LookupCustom`。
-    pub fn lookup_custom(&mut self, c: char, col_idx: usize) -> Option<String> {
-        if !self.custom_enabled || self.custom_mappings.is_empty() {
-            return None;
-        }
-        let (key, is_quote) = match c {
-            '"' => (
-                if self.double_quote_left { "\"1" } else { "\"2" }.to_string(),
-                true,
-            ),
-            '\'' => (
-                if self.single_quote_left { "'1" } else { "'2" }.to_string(),
-                true,
-            ),
-            _ => (c.to_string(), false),
-        };
-        let vals = self.custom_mappings.get(&key)?;
-        let v = vals.get(col_idx)?;
-        if v.is_empty() {
-            return None;
-        }
-        if is_quote {
-            match c {
-                '"' => self.double_quote_left = !self.double_quote_left,
-                '\'' => self.single_quote_left = !self.single_quote_left,
-                _ => {}
+    /// 自定义映射的查表键：引号按当前左右态取左形行/右形行，其余键取字符本身。
+    pub fn custom_key(&self, c: char) -> String {
+        match quote_custom_keys(c) {
+            Some((left_key, right_key)) => {
+                let is_left = match c {
+                    '"' => self.double_quote_left,
+                    _ => self.single_quote_left,
+                };
+                if is_left { left_key } else { right_key }.to_string()
             }
+            None => c.to_string(),
         }
-        Some(v.clone())
+    }
+
+    /// 查自定义映射但**不**推进引号态。`col_idx`: 0=中半 1=英全 2=中全 3=英半。
+    /// 开关与映射表同取自实时 `PunctConfig`——不得再在别处存副本（见结构体文档）。
+    pub fn peek_custom(&self, punct: &PunctConfig, c: char, col_idx: usize) -> Option<String> {
+        if !punct.custom_enabled {
+            return None;
+        }
+        let v = punct
+            .custom_mappings
+            .get(&self.custom_key(c))?
+            .get(col_idx)?;
+        (!v.is_empty()).then(|| v.clone())
+    }
+
+    /// 查自定义映射；命中（非空）时推进引号交替态并返回，未命中不动状态。
+    /// 对齐 Go `PunctuationConverter.LookupCustom`。
+    pub fn lookup_custom(
+        &mut self,
+        punct: &PunctConfig,
+        c: char,
+        col_idx: usize,
+    ) -> Option<String> {
+        let v = self.peek_custom(punct, c, col_idx)?;
+        match c {
+            '"' => self.double_quote_left = !self.double_quote_left,
+            '\'' => self.single_quote_left = !self.single_quote_left,
+            _ => {}
+        }
+        Some(v)
     }
 
     /// 预测 `c` 的中文标点产物但**不**改引号状态（智能符号武装/匹配用）。
@@ -180,7 +184,43 @@ impl PunctuationConverter {
     }
 }
 
-/// 引号键的「左形 / 右形」中文产物，**与当前交替状态无关**；非引号键返回 None。
+/// 引号键在自定义映射里的两行键名 **(左形行, 右形行)**；非引号键返回 None。
+///
+/// **存储键格式的唯一定义处**（跨仓的第二个知情者是设置端 `PUNCT_DEFAULTS` 的 token 列）。
+///
+/// 语义要点：这两行界面上叫「第一次 / 第二次」，实质是**左形 / 右形**——「第几次」只是没有
+/// 自动配对时按次序推导左右角色的说法。配对生效后一次按键同时产出左右两个符号，就得同时取用
+/// 这两行（见 `wind_punct::quote_forms`），否则交替态被钉左、「第二次」那行永远取不到。
+pub fn quote_custom_keys(c: char) -> Option<(&'static str, &'static str)> {
+    match c {
+        '"' => Some(("\"1", "\"2")),
+        '\'' => Some(("'1", "'2")),
+        _ => None,
+    }
+}
+
+/// 自定义映射行键 → 源字符（[`quote_custom_keys`] 的反函数）：`"1`/`"2`→`"`、`'1`/`'2`→`'`、
+/// 单字符键即其本身；多字符或未知格式返回 None。
+///
+/// 用途：从 `custom_mappings` 反推「哪些按键被用户覆盖过」（如告知 TSF 英文模式下该吃哪些
+/// 标点键）。与 `quote_custom_keys` 成对维护——键格式一旦变化，两侧必须同时改。
+pub fn custom_key_source_char(key: &str) -> Option<char> {
+    for c in ['"', '\''] {
+        if let Some((left_key, right_key)) = quote_custom_keys(c)
+            && (key == left_key || key == right_key)
+        {
+            return Some(c);
+        }
+    }
+    let mut it = key.chars();
+    match (it.next(), it.next()) {
+        (Some(c), None) => Some(c),
+        _ => None,
+    }
+}
+
+/// 引号键的「左形 / 右形」**内置**中文产物，与交替状态和自定义映射均无关；非引号键返回 None。
+/// 含自定义映射的版本见 `wind_punct::quote_forms`。
 ///
 /// 引号是唯一的**对称配对键**：同一个物理键既可能产出左引号也可能产出右引号，按键本身
 /// 不携带「这是开还是闭」这一位信息。其它配对符（`（` 与 `）`）是两个不同的键，天然携带。
@@ -207,35 +247,63 @@ mod tests {
         assert_eq!(p.to_chinese('a'), None);
     }
 
-    #[test]
-    fn test_custom_mapping() {
-        let mut p = PunctuationConverter::new();
-        let mut m = HashMap::new();
+    /// 测试用自定义映射配置：'/' 四列全配 + 双引号左右分键（仅中文半角列）。
+    fn custom_cfg(enabled: bool) -> PunctConfig {
+        let mut c = PunctConfig {
+            custom_enabled: enabled,
+            ..PunctConfig::default()
+        };
         // '/' 自定义：中半=、 英全=／ 中全=、 英半=/
-        m.insert(
+        c.custom_mappings.insert(
             "/".to_string(),
             vec!["、".into(), "／".into(), "、".into(), "/".into()],
         );
-        // 引号：左右分键，仅配中文半角列（col 0）
-        m.insert("\"1".to_string(), vec!["「".into()]);
-        m.insert("\"2".to_string(), vec!["」".into()]);
-        p.set_custom_mappings(true, m);
-        assert_eq!(p.lookup_custom('/', 0).as_deref(), Some("、")); // 中文半角
-        assert_eq!(p.lookup_custom('/', 1).as_deref(), Some("／")); // 英文全角
-        assert_eq!(p.lookup_custom('/', 3).as_deref(), Some("/")); // 英文半角
-        assert_eq!(p.lookup_custom('a', 0), None); // 无映射
+        c.custom_mappings
+            .insert("\"1".to_string(), vec!["「".into()]);
+        c.custom_mappings
+            .insert("\"2".to_string(), vec!["」".into()]);
+        c
+    }
+
+    #[test]
+    fn test_custom_mapping() {
+        let mut p = PunctuationConverter::new();
+        let cfg = custom_cfg(true);
+        assert_eq!(p.lookup_custom(&cfg, '/', 0).as_deref(), Some("、")); // 中文半角
+        assert_eq!(p.lookup_custom(&cfg, '/', 1).as_deref(), Some("／")); // 英文全角
+        assert_eq!(p.lookup_custom(&cfg, '/', 3).as_deref(), Some("/")); // 英文半角
+        assert_eq!(p.lookup_custom(&cfg, 'a', 0), None); // 无映射
         // 引号按左右交替选 key 并切换状态
-        assert_eq!(p.lookup_custom('"', 0).as_deref(), Some("「")); // 左
-        assert_eq!(p.lookup_custom('"', 0).as_deref(), Some("」")); // 右
+        assert_eq!(p.lookup_custom(&cfg, '"', 0).as_deref(), Some("「")); // 左
+        assert_eq!(p.lookup_custom(&cfg, '"', 0).as_deref(), Some("」")); // 右
     }
 
     #[test]
     fn test_custom_disabled() {
         let mut p = PunctuationConverter::new();
-        let mut m = HashMap::new();
-        m.insert("/".to_string(), vec!["、".into()]);
-        p.set_custom_mappings(false, m);
-        assert_eq!(p.lookup_custom('/', 0), None); // 未启用
+        assert_eq!(p.lookup_custom(&custom_cfg(false), '/', 0), None); // 未启用
+    }
+
+    /// 配置是**参数**而非转换器内的副本：同一实例，配置换了下一次查表即跟随
+    /// （回归锁：曾把映射表存进转换器且只在启动时注入一次，热重载后仍用旧表）。
+    #[test]
+    fn custom_mapping_follows_live_config() {
+        let mut p = PunctuationConverter::new();
+        assert_eq!(p.lookup_custom(&PunctConfig::default(), '/', 0), None); // 出厂无映射
+        assert_eq!(
+            p.lookup_custom(&custom_cfg(true), '/', 0).as_deref(),
+            Some("、")
+        );
+    }
+
+    /// peek 不推进引号态，且引号也走 `"1`/`"2` 键（曾按 `"` 拼键 → 引号永远查不到自定义）。
+    #[test]
+    fn peek_custom_quote_key_without_advancing() {
+        let p = PunctuationConverter::new();
+        let cfg = custom_cfg(true);
+        assert_eq!(p.custom_key('"'), "\"1");
+        assert_eq!(p.peek_custom(&cfg, '"', 0).as_deref(), Some("「"));
+        assert_eq!(p.peek_custom(&cfg, '"', 0).as_deref(), Some("「")); // 未推进
     }
 
     #[test]
