@@ -32,7 +32,8 @@
 - **`convert` 永不 panic**：引擎错误降级为 `ConvertResult::default()`（空候选），勿在热路径用会 panic 的 `unwrap`。锁中毒统一 `unwrap_or_else(|e| e.into_inner())`。
 - **扩展词库热插拔**：`set_dict_enabled` 直接翻 `codetable-extra-<id>` 系统层的 enabled 标志，无需重建引擎；启用集变化会失效反查索引（编码提示依赖启用词库合并）。
 - **混输拼音否决默认值三处同源**：`auto_commit_block_on_pinyin` / `block_commit_on_pinyin_word` / `pinyin_only_overflow` **均默认开**——`MixConfig::default()`（mixed/engine.rs）、`MixGlobal::default()` + serde default（wind-config/config.rs）、`data/config.toml [schema.mix]` 三处必须一致，改默认须同步全部三处。**出厂默认以 L1⊕L2 为准**（L2 覆盖 L1，即 data/config.toml 的值）。前两者曾漂移过（`MixConfig` false vs 另两处 true / `pinyin_only_overflow` L1 false vs L2 true），后果分两层：引擎单测跑在现实中不存在的配置下；且 `Config::preset_for_pruning` 拿 L1⊕L2 判「用户值是否等于默认」，L1/L2 不一致时该判据会开始吃用户配置。
-- **超码长归拼音管，顶码不得抢**：`pinyin_only_overflow` 同时约束 `convert`（走 `convert_overflow`）与 `handle_top_code`（否决⓪）。协调器让顶码**先于**候选刷新执行，故顶码若不读这个键，overflow 的纯拼音分支就永远够不着（youyoud→「变凉」即此漏）。⓪ 必须叠 `has_pinyin`：无拼音候选的纯五笔溢出串若也禁顶码，overflow 侧同样交不出候选，用户会卡在无出口的长串上。
+- **★ 混输上屏有三条通路，任何否决开关必须三处都接**：① `convert` 的满码上屏（`should_commit`）、② `recheck_auto_commit` 的显示态复评、③ `handle_top_code` 的顶码。**协调器让顶码先于候选刷新执行**（`coordinator.rs` 字母键臂），所以第三条漏读一个开关，该开关对超码长输入就等于完全失效——而它在满码路径上工作正常，日志与设置页均无痕迹。已因此栽过两次：`pinyin_only_overflow` 只被 `convert` 读（youyoud→顶出「变凉」，补否决⓪）、`auto_commit_block_on_english` 只有前两个使用点（github 打到第 5 键顶出「不算」，补否决③）。`coordinator.rs` 那道「显示首选是拼音/英文就放弃顶码」的保护指望不上：码表精确 +1e7 vs 英文精确 +500K，非码表候选永远排不到第一。
+- **顶码否决必须叠「对方确有候选」**：⓪ 叠 `has_pinyin`、③ 叠 `!english_candidates(input,1).is_empty()`。只看开关就禁顶码会把「顶码抢了别人的活」修成「谁的活都没人干」——纯五笔溢出串（`aaaab`）在 `pinyin_only_overflow=true` 下 overflow 侧只查拼音、同样交不出候选，用户卡在既不上屏又无候选的长串上。③ 天然满足（判据与 `convert_overflow` 调同一个 `english_candidates`、同一个 input）。③ 还须放在 `if let Some(sec)` 块**外**：英文守护与拼音子引擎无关，纯码表+英文混输也要生效。
 
 ### Testing Requirements
 - 纯逻辑，host 可跑：`cargo test -p wind-engine`（单元测试 + `tests/engine_manager.rs` 集成测试；部分用例读 `data/schemas/` 真实数据文件）。

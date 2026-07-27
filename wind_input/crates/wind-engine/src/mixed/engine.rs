@@ -562,7 +562,9 @@ impl Engine for MixedEngine {
     /// - ① `auto_commit_block_on_pinyin` 且整串有拼音候选 → 抑制顶码（打开时 wangba/aipu 等含拼音
     ///   读法的串都让路拼音）；
     /// - ② `block_commit_on_pinyin_word` 且整串是强拼音词（wangba→网吧）→ 抑制顶码；
+    /// - ③ `auto_commit_block_on_english` 且整串有英文候选 → 抑制顶码（github→GitHub，见下）；
     /// - `top_code_override_pinyin` 开启 = 顶码优先，**无视**上述全部否决强制倒向五笔。
+    ///   （该名字只提 pinyin 属历史局限，它实际是顶码总开关，⓪①②③ 一律受其压制。）
     ///
     /// ⓪ 与 [`Self::convert`] 的超长分流**共用同一个判据**（`input_len > max_code_len` +
     /// `pinyin_only_overflow`）。此前本函数完全不读 `pinyin_only_overflow`，于是同一次按键里
@@ -579,8 +581,22 @@ impl Engine for MixedEngine {
         if self.max_code_len == 0 || input_len <= self.max_code_len {
             return self.primary.handle_top_code(input);
         }
-        // 顶码优先开关关闭时，应用 ⓪ 与满码同一套拼音①②否决。
+        // 顶码优先开关关闭时，应用 ⓪③ 与满码同一套拼音①②否决。
         if !self.top_code_override_pinyin {
+            // ③ 英文守护：与满码上屏（`convert`）/ 显示态复评（`recheck_auto_commit`）**同一个
+            // 开关**，补齐第三条上屏通路。此前 `auto_commit_block_on_english` 全仓只有那两个
+            // 使用点，顶码一个都没有 —— 用户开了「有英文候选时否决上屏」，打 github 到第 5 键
+            // 仍被顶出五笔词「不算」（`gith` 在主码表有词），与 ⓪ 同构的漏。
+            //
+            // 自带防卡死，无需 ⓪ 那样的额外条件：判据要求「英文确有候选」，而它与
+            // `convert_overflow` 调的是同一个 `english_candidates`、同一个 `input` ——
+            // 拦下顶码后 overflow 必然交得出那批候选。
+            //
+            // ⚠️ 刻意放在下方 `Some(sec)` 块**之外**：英文守护与拼音子引擎无关，
+            // 纯码表 + 英文的混输（secondary=None）同样该生效。
+            if self.auto_commit_block_on_english && !self.english_candidates(input, 1).is_empty() {
+                return None;
+            }
             if let Some(sec) = &self.secondary {
                 // ①的 has_pinyin：整串是否有拼音候选（与满码"合并前拼音候选非空"同义）。
                 let has_pinyin = sec
@@ -1076,6 +1092,96 @@ mod tests {
             e.handle_top_code("wangba"),
             Some(("王".to_string(), "ba".to_string())),
             "顶码优先应无视 ⓪"
+        );
+    }
+
+    // ── ③ auto_commit_block_on_english：有英文候选时顶码不得抢 ──
+
+    /// 真机场景：`gith` 在五笔主码表是「不算」，英文词库有 GitHub。打 github 到第 5 键 `u`
+    /// 时缓冲 `githu` 超 4 码，旧实现顶出「不算」+ 余码 `u`。
+    /// **secondary=None 是刻意的**：一并锁住「③ 必须在 `Some(sec)` 块之外」——英文守护与
+    /// 拼音子引擎无关，纯码表 + 英文的混输同样该生效。
+    #[test]
+    fn topcode_vetoed_by_english_candidate() {
+        let primary = ct_engine_topcode(&[("gith", "不算", 1822)]);
+        let english = english_engine(&[("github", "GitHub", 100)]);
+        let e = MixedEngine::new(
+            primary,
+            None,
+            Some(english),
+            MixConfig {
+                auto_commit_block_on_english: true,
+                ..Default::default()
+            },
+        );
+        assert_eq!(
+            e.handle_top_code("githu"),
+            None,
+            "③ 开 + 有英文候选：顶码不得抢（且无拼音子引擎时也须生效）"
+        );
+    }
+
+    #[test]
+    fn topcode_allowed_when_no_english_candidate() {
+        // ③ 开但整串无英文候选 → 顶码正常（判据要求英文确有候选，不是开关一开就禁）。
+        let primary = ct_engine_topcode(&[("gith", "不算", 1822)]);
+        let english = english_engine(&[("hello", "hello", 50)]);
+        let e = MixedEngine::new(
+            primary,
+            None,
+            Some(english),
+            MixConfig {
+                auto_commit_block_on_english: true,
+                ..Default::default()
+            },
+        );
+        assert_eq!(
+            e.handle_top_code("githu"),
+            Some(("不算".to_string(), "u".to_string())),
+            "③ 开但无英文候选：顶码应正常"
+        );
+    }
+
+    #[test]
+    fn topcode_english_guard_off_allows_topcode() {
+        // ③ 关（出厂默认）→ 即便有英文候选也顶码，保持零回归。
+        let primary = ct_engine_topcode(&[("gith", "不算", 1822)]);
+        let english = english_engine(&[("github", "GitHub", 100)]);
+        let e = MixedEngine::new(
+            primary,
+            None,
+            Some(english),
+            MixConfig {
+                auto_commit_block_on_english: false,
+                ..Default::default()
+            },
+        );
+        assert_eq!(
+            e.handle_top_code("githu"),
+            Some(("不算".to_string(), "u".to_string())),
+            "③ 关时应保持旧行为"
+        );
+    }
+
+    #[test]
+    fn topcode_override_beats_english_guard() {
+        // top_code_override_pinyin 是顶码总开关，压过 ③（名字只提 pinyin 属历史局限）。
+        let primary = ct_engine_topcode(&[("gith", "不算", 1822)]);
+        let english = english_engine(&[("github", "GitHub", 100)]);
+        let e = MixedEngine::new(
+            primary,
+            None,
+            Some(english),
+            MixConfig {
+                auto_commit_block_on_english: true,
+                top_code_override_pinyin: true,
+                ..Default::default()
+            },
+        );
+        assert_eq!(
+            e.handle_top_code("githu"),
+            Some(("不算".to_string(), "u".to_string())),
+            "顶码优先应无视 ③"
         );
     }
 
