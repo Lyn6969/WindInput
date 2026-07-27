@@ -1889,7 +1889,9 @@ BOOL CKeyEventSink::_HandleServiceResponse()
             else
             {
                 // No new composition, commit text atomically (end composition + insert in one EditSession)
-                _pTextService->CommitText(response.text);
+                // replacingHeld：智能符号 press2 要覆盖 hold 预览态里的中文符号；其余提交
+                // 路径为 FALSE，held 符号并入前缀一起上屏（见 CTextService::CommitText）。
+                _pTextService->CommitText(response.text, FALSE, response.replacingHeld ? TRUE : FALSE);
                 QueryPerformanceCounter(&ctMid1);
 
                 _isComposing = FALSE;

@@ -647,6 +647,9 @@ pub const STATUS_HOST_RENDER_AVAIL: u32 = 0x0040;
 pub const COMMIT_FLAG_MODE_CHANGED: u16 = 0x0001;
 pub const COMMIT_FLAG_HAS_NEW_COMPOSITION: u16 = 0x0002;
 pub const COMMIT_FLAG_CHINESE_MODE: u16 = 0x0004;
+// bit3 已被 CommitText 的 replacingHeld 占用（见 encode_commit_text_replacing_held），
+// barrier 的 CommitResult 路径不用它——此处登记以免同一位被挪作他用。
+pub const COMMIT_FLAG_REPLACING_HELD: u16 = 0x0008;
 
 // ──────────────────────────────────────────────
 // Event type

@@ -142,7 +142,13 @@ public:
     // fromHoldTimer=TRUE：来自智能符号 HoldComposition 超时收口（裸 WM_TIMER 回调）——
     // 改用异步编辑会话（TF_ES_ASYNCDONTCARE）且不走 SendInput 兜底，规避 Word 在
     // 计时器上下文拒发同步会话（TS_E_SYNCHRONOUS）导致的重复上屏。见 .cpp 注释。
-    BOOL CommitText(const std::wstring& text, BOOL fromHoldTimer = FALSE);
+    //
+    // replacingHeld=TRUE：本次提交要**替换**掉 hold 预览态里那个待定的中文符号
+    // （智能符号 press2：「。」→「.」）。默认 FALSE = 追加语义，held 符号并入 prefix
+    // 与本次文本一起上屏——因为提交用的是组合 range 的 SetText，不并入就会被覆盖掉。
+    // 由服务端在 CommitText 响应的 flags bit3 显式声明，见 COMMIT_FLAG_REPLACING_HELD。
+    BOOL CommitText(const std::wstring& text, BOOL fromHoldTimer = FALSE,
+                    BOOL replacingHeld = FALSE);
 
     // 把光标前 count 个已上屏字符替换为 text（智能符号纠错替换）。
     // 优先走 TSF 同步 EditSession（原子、不受输入队列时序/修饰键影响）；

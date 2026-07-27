@@ -6723,6 +6723,44 @@ mod capslock_tests {
         assert_eq!(text, "，", "实际文本: {:?}", text);
     }
 
+    // ── 智能符号 HoldComposition：press2 的替换语义 ──────────────────────────
+
+    /// press1 把中文符号放进 TSF 组合（hold 预览态），press2 必须返回
+    /// `CommitReplacingHeld` 而非普通 `InsertText`。
+    ///
+    /// 两者在 IPC 载荷上完全同构，C++ 端只能靠这个 action 带的 flags 位判断该
+    /// **覆盖**还是**追加** held 符号。退回 InsertText 的后果是 press2 打出「，,」
+    /// ——中文符号被并入前缀跟着一起上屏了。
+    #[test]
+    fn smart_symbol_hold_press2_replaces_held_symbol() {
+        let mut cfg = Config::default();
+        cfg.input.default.chinese_mode = true;
+        cfg.input.symbol.smart_mode = true;
+        cfg.input.symbol.smart_method = wind_config::config::SmartMethod::HoldComposition;
+        let c = Coordinator::new_headless(cfg, None);
+
+        // press1：空缓冲 + 中文标点 → 中文符号进组合态，等 press2
+        let a1 = c.handle_key_event(&kev(0xBC, EVENT_KEY_DOWN));
+        match &a1 {
+            KeyAction::HoldComposition { text, .. } => {
+                assert_eq!(text, "，", "press1 应把中文逗号放进组合")
+            }
+            other => panic!("press1 应开 hold 组合，实际: {:?}", other),
+        }
+
+        // press2：超时窗口内重按同键 → 英文符号 + 替换语义
+        let a2 = c.handle_key_event(&kev(0xBC, EVENT_KEY_DOWN));
+        match &a2 {
+            KeyAction::CommitReplacingHeld { text, .. } => {
+                assert_eq!(text, ",", "press2 应换成英文逗号")
+            }
+            other => panic!(
+                "press2 必须返回 CommitReplacingHeld（替换语义），实际: {:?}",
+                other
+            ),
+        }
+    }
+
     // ── 全角模式：提交全角字符 ───────────────────────────────────────────────
 
     #[test]

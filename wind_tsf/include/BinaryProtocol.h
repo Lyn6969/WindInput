@@ -276,6 +276,9 @@ static_assert(sizeof(CommitThenDeferPayload) == 12, "CommitThenDeferPayload must
 constexpr uint32_t COMMIT_FLAG_MODE_CHANGED       = 0x0001;
 constexpr uint32_t COMMIT_FLAG_HAS_NEW_COMPOSITION = 0x0002;
 constexpr uint32_t COMMIT_FLAG_CHINESE_MODE       = 0x0004;
+// 本次提交要**替换**掉 HoldComposition 里待定的中文符号（智能符号 press2：「。」→「.」），
+// 而非追加在它后面。只有 press2 会置位；其余提交路径一律追加（见 CTextService::CommitText）。
+constexpr uint32_t COMMIT_FLAG_REPLACING_HELD     = 0x0008;
 
 // Commit request payload (for barrier mechanism)
 // Sent from C++ to Go when Space/Enter/number key is pressed during composition
@@ -305,6 +308,7 @@ static_assert(sizeof(CommitResultPayload) == 12, "CommitResultPayload must be 12
 // COMMIT_FLAG_MODE_CHANGED       = 0x0001
 // COMMIT_FLAG_HAS_NEW_COMPOSITION = 0x0002
 // COMMIT_FLAG_CHINESE_MODE       = 0x0004
+// 不含 COMMIT_FLAG_REPLACING_HELD：barrier 路径是顶码提交，与智能符号 hold 预览态无交集。
 
 // ============================================================================
 // Host render shared memory structures

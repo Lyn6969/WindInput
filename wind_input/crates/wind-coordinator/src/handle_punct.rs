@@ -181,12 +181,12 @@ impl Coordinator {
                                 "SmartSymbol(HoldComposition): press2, commit english: {}",
                                 rep
                             );
-                            return Some(KeyAction::InsertText {
+                            // 必须是 CommitReplacingHeld 而非 InsertText：held 的中文符号此刻
+                            // 正显示在 C++ 的组合态里，press2 要**覆盖**它。普通 InsertText 在
+                            // hold 活跃时是追加语义（held 并入前缀一起上屏），会打出「。.」。
+                            return Some(KeyAction::CommitReplacingHeld {
                                 text: rep,
-                                new_composition: None,
-                                mode_changed: false,
                                 chinese_mode: state.chinese_mode,
-                                has_new_composition: false,
                             });
                         }
                     } else {

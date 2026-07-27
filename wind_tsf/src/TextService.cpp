@@ -5072,12 +5072,25 @@ BOOL CTextService::ReplacePrecedingChars(int count, const std::wstring& text)
 // Commit text atomically: end composition + insert text in a single EditSession.
 // This avoids race conditions in browsers where async EndComposition could clear
 // text that was inserted by a subsequent synchronous InsertText.
-BOOL CTextService::CommitText(const std::wstring& text, BOOL fromHoldTimer)
+BOOL CTextService::CommitText(const std::wstring& text, BOOL fromHoldTimer, BOOL replacingHeld)
 {
-    // 如果 HoldComposition 计时器活跃（智能符号等待 press2），先取消，
-    // 防止 timeout 与此次 commit 竞争。fromHoldTimer 时计时器已在 OnHoldTimerExpired
-    // 里清零，这里是无副作用的 no-op。
-    CancelHoldTimer();
+    // hold 预览态活跃时（智能符号已把中文符号放进组合、等 press2），本次提交必须交代
+    // 那个符号的去向——下面提交走的是**组合 range 的 SetText**，range 里此刻显示的正是
+    // 它，不主动处置就会被静默覆盖掉。
+    //
+    //   replacingHeld=TRUE （press2）：本就是要拿英文符号换掉它 → 丢弃，让 SetText 覆盖。
+    //   replacingHeld=FALSE（其余一切）：并入 prefix，与本次文本一起上屏（追加语义）。
+    //
+    // 默认取追加：hold 期间可能触发提交的路径远不止一处（全角空格/数字、临时英文、各
+    // 独占模式出字……），把安全的一侧设为默认，新增路径自动正确。曾经默认丢弃，表现为
+    // 全角下「。」+空格 → 符号消失、只剩全角空格。
+    //
+    // fromHoldTimer 时计时器已在 OnHoldTimerExpired 里清零、文本也已 move 进 text 参数，
+    // 两个分支在那条路上都是无副作用的 no-op。
+    if (replacingHeld)
+        CancelHoldTimer();
+    else
+        AbsorbHeldIntoPrefix();
 
     // 顶码聚合：真正提交 = 待提交前缀 + 本次文本（微软 IME 的延迟提交在此收口）。
     std::wstring full = _pendingCommitPrefix + text;

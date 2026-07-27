@@ -1031,6 +1031,9 @@ fn encode_key_action(action: &KeyAction) -> Vec<u8> {
         KeyAction::HoldComposition { text, timeout_ms } => {
             encode_hold_composition(*timeout_ms, text)
         }
+        KeyAction::CommitReplacingHeld { text, chinese_mode } => {
+            encode_commit_text_replacing_held(text, *chinese_mode)
+        }
         KeyAction::CommitAndHoldComposition {
             commit_text,
             hold_text,

@@ -83,13 +83,45 @@ pub fn decode_input_state_report(payload: &[u8]) -> Result<InputStateReportPaylo
 ///
 /// 格式: CommitTextHeader(12) + UTF-8 text + optional newComposition
 ///
-/// flags: bit0=modeChanged(0x01), bit1=hasNewComposition(0x02), bit2=chineseMode(0x04)
+/// flags: bit0=modeChanged(0x01), bit1=hasNewComposition(0x02), bit2=chineseMode(0x04),
+///        bit3=replacingHeld(0x08)
 pub fn encode_commit_text(
     text: &str,
     new_composition: Option<&str>,
     mode_changed: bool,
     chinese_mode: bool,
     has_new_composition: bool,
+) -> Vec<u8> {
+    encode_commit_text_inner(
+        text,
+        new_composition,
+        mode_changed,
+        chinese_mode,
+        has_new_composition,
+        false,
+    )
+}
+
+/// 编码带 replacingHeld 标志的 CommitText 响应 (CMD_COMMIT_TEXT 0x0101, flags bit3)。
+///
+/// 语义：本次提交要**替换**掉 C++ 端 HoldComposition 里那个待定的中文符号，而不是追加在
+/// 它后面。只有智能符号 press2（超时窗口内重按同一符号，中文→英文）需要它。
+///
+/// 其余一切上屏路径都是追加语义——C++ 端 `CommitText` 默认走 `AbsorbHeldIntoPrefix`，把
+/// held 符号并进 prefix 一起提交。这个默认值是刻意选的：hold 期间可能触发提交的路径远不止
+/// 一处（全角空格/数字、临时英文、各独占模式出字……），把安全的那一侧设为默认，新增路径
+/// 自动正确；只有这一个真正要覆盖的点显式声明。
+pub fn encode_commit_text_replacing_held(text: &str, chinese_mode: bool) -> Vec<u8> {
+    encode_commit_text_inner(text, None, false, chinese_mode, false, true)
+}
+
+fn encode_commit_text_inner(
+    text: &str,
+    new_composition: Option<&str>,
+    mode_changed: bool,
+    chinese_mode: bool,
+    has_new_composition: bool,
+    replacing_held: bool,
 ) -> Vec<u8> {
     let text_bytes = text.as_bytes();
     let comp_bytes = new_composition.map(|s| s.as_bytes());
@@ -104,6 +136,9 @@ pub fn encode_commit_text(
     }
     if chinese_mode {
         flags |= 0x04;
+    }
+    if replacing_held {
+        flags |= 0x08;
     }
 
     let total = 12 + text_bytes.len() + comp_len;
@@ -684,6 +719,34 @@ mod tests {
         assert_eq!(u32::from_le_bytes([buf[12], buf[13], buf[14], buf[15]]), 3);
         // UTF-8 bytes of "，" = [0xEF, 0xBC, 0x8C] (at offset 16+)
         assert_eq!(&buf[16..], "，".as_bytes());
+    }
+
+    /// 智能符号 press2 的提交必须带 flags bit3，C++ 端据此改走「覆盖 held 符号」而非
+    /// 「并入前缀一起上屏」。漏置位的后果是 press2 打出「。.」而不是「.」。
+    #[test]
+    fn test_encode_commit_text_replacing_held_sets_flag_bit3() {
+        let buf = encode_commit_text_replacing_held(".", true);
+        let p = IpcHeader::SIZE;
+        let flags = u32::from_le_bytes([buf[p], buf[p + 1], buf[p + 2], buf[p + 3]]);
+        assert_eq!(flags & 0x08, 0x08, "replacingHeld 位必须置位");
+        assert_eq!(flags & 0x04, 0x04, "chineseMode 位应透传");
+        assert_eq!(flags & 0x03, 0, "不得误置 modeChanged / hasNewComposition");
+        // 命令码仍是 CMD_COMMIT_TEXT——复用同一响应类型，只靠 flags 区分语义
+        assert_eq!(u16::from_le_bytes([buf[2], buf[3]]), CMD_COMMIT_TEXT);
+        assert_eq!(&buf[p + 12..], b".");
+    }
+
+    /// 反向守卫：普通提交路径绝不能带上 bit3，否则 hold 期间任何上屏都会吞掉待定符号。
+    #[test]
+    fn test_encode_commit_text_never_sets_replacing_held() {
+        for (comp, mode_changed, cn, has_comp) in
+            [(None, false, false, false), (Some("ni"), true, true, true)]
+        {
+            let buf = encode_commit_text("　", comp, mode_changed, cn, has_comp);
+            let p = IpcHeader::SIZE;
+            let flags = u32::from_le_bytes([buf[p], buf[p + 1], buf[p + 2], buf[p + 3]]);
+            assert_eq!(flags & 0x08, 0, "普通 CommitText 不得置 replacingHeld");
+        }
     }
 
     #[test]

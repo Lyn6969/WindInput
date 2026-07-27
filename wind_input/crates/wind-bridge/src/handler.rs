@@ -99,8 +99,14 @@ pub enum KeyAction {
     ReplaceBackward { count: u32, text: String },
     /// 持有组合态（智能符号 HoldComposition 方案）：
     /// C++ 端开启组合显示 text，在 timeout_ms 毫秒后自动提交中文；
-    /// press2 到来时直接用英文文本替换组合（通过普通 InsertText / CommitText 提交）。
+    /// press2 到来时用 `CommitReplacingHeld` 覆盖组合。
     HoldComposition { text: String, timeout_ms: u32 },
+    /// 提交并**替换**掉 C++ 端 HoldComposition 里待定的中文符号（智能符号 press2 专用）。
+    ///
+    /// 与 `InsertText` 的唯一区别就是这个替换语义：`InsertText` 在 hold 活跃时会把 held
+    /// 符号并入前缀一起提交（追加），press2 要的却是把「。」换成「.」。两者在 IPC 载荷上
+    /// 本来完全同构，C++ 端无从分辨，故用独立 action + flags 位显式声明。
+    CommitReplacingHeld { text: String, chinese_mode: bool },
     /// 顶屏后开 HoldComposition（has_input + 智能符号 HoldComposition 组合路径）：
     /// 先提交 commit_text（候选/前缀），再将 hold_text（中文标点）放入 TSF 组合态，
     /// timeout_ms 后自动提交中文；press2 与普通 HoldComposition press2 路径一致。
