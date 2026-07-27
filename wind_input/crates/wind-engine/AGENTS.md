@@ -31,7 +31,8 @@
 - **懒加载 + single-flight 构建锁**：`ensure_loaded` 抢方案专属 build_lock 后复查，避免后台预热与首次切换重复熔大词库；不同方案可并行构建。引擎缓存仅在 `invalidate_schema`/`reload_from_config` 清除（无 LRU 驱逐，与 Go 版不同）。
 - **`convert` 永不 panic**：引擎错误降级为 `ConvertResult::default()`（空候选），勿在热路径用会 panic 的 `unwrap`。锁中毒统一 `unwrap_or_else(|e| e.into_inner())`。
 - **扩展词库热插拔**：`set_dict_enabled` 直接翻 `codetable-extra-<id>` 系统层的 enabled 标志，无需重建引擎；启用集变化会失效反查索引（编码提示依赖启用词库合并）。
-- **混输拼音否决默认值三处同源**：`auto_commit_block_on_pinyin` 默认关、`block_commit_on_pinyin_word` 默认开——`MixConfig::default()`（mixed/engine.rs）、`MixGlobal::default()` + serde default（wind-config/config.rs）、`data/config.toml [schema.mix]` 三处必须一致，改默认须同步全部三处。
+- **混输拼音否决默认值三处同源**：`auto_commit_block_on_pinyin` / `block_commit_on_pinyin_word` / `pinyin_only_overflow` **均默认开**——`MixConfig::default()`（mixed/engine.rs）、`MixGlobal::default()` + serde default（wind-config/config.rs）、`data/config.toml [schema.mix]` 三处必须一致，改默认须同步全部三处。**出厂默认以 L1⊕L2 为准**（L2 覆盖 L1，即 data/config.toml 的值）。前两者曾漂移过（`MixConfig` false vs 另两处 true / `pinyin_only_overflow` L1 false vs L2 true），后果分两层：引擎单测跑在现实中不存在的配置下；且 `Config::preset_for_pruning` 拿 L1⊕L2 判「用户值是否等于默认」，L1/L2 不一致时该判据会开始吃用户配置。
+- **超码长归拼音管，顶码不得抢**：`pinyin_only_overflow` 同时约束 `convert`（走 `convert_overflow`）与 `handle_top_code`（否决⓪）。协调器让顶码**先于**候选刷新执行，故顶码若不读这个键，overflow 的纯拼音分支就永远够不着（youyoud→「变凉」即此漏）。⓪ 必须叠 `has_pinyin`：无拼音候选的纯五笔溢出串若也禁顶码，overflow 侧同样交不出候选，用户会卡在无出口的长串上。
 
 ### Testing Requirements
 - 纯逻辑，host 可跑：`cargo test -p wind-engine`（单元测试 + `tests/engine_manager.rs` 集成测试；部分用例读 `data/schemas/` 真实数据文件）。

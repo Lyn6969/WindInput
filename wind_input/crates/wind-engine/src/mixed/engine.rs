@@ -45,7 +45,11 @@ impl Default for MixConfig {
         Self {
             min_pinyin_length: 2,
             codetable_weight_boost: 10_000_000,
-            auto_commit_block_on_pinyin: false,
+            // ⚠️ 三处同源：本处 / `MixGlobal::default()`（wind-config）/ `data/config.toml
+            // [schema.mix]` 必须一致，改默认须同步全部三处。出厂默认以 L1⊕L2 为准（L2 覆盖 L1），
+            // 即 data/config.toml 里的值。本处曾长期为 false 而另两处为 true，导致引擎单测跑在一个
+            // 现实中不存在的配置下（测试全绿但保护实际是开着的）。
+            auto_commit_block_on_pinyin: true,
             pinyin_only_overflow: true,
             top_code_override_pinyin: false,
             show_source_hint: false,
@@ -67,9 +71,10 @@ pub struct MixedEngine {
     min_pinyin_length: usize,
     /// 码表精确匹配提权
     codetable_weight_boost: i32,
-    /// 全码自动上屏时，若存在拼音候选则否决（保护拼音用户，对齐 Go AutoCommitBlockOnPinyin）。
-    /// 默认关（与 data/config.toml 一致）：粗粒度一票否决太激进，细粒度拦截由
-    /// `block_commit_on_pinyin_word`（默认开）承担。
+    /// 全码自动上屏**与顶码上屏**时，若存在拼音候选则否决（保护拼音用户，对齐 Go
+    /// AutoCommitBlockOnPinyin）。**默认开**（三处同源：`MixConfig::default()` /
+    /// `MixGlobal::default()` / `data/config.toml`）。粗粒度：整串只要查得出拼音候选就让路，
+    /// 不看拼音成不成词；细粒度拦截另由 `block_commit_on_pinyin_word`（亦默认开）承担，两者叠加。
     auto_commit_block_on_pinyin: bool,
     /// 输入超过码表最大码长时仅查拼音（主流混输行为，对齐 Go PinyinOnlyOverflow）。
     /// false 时走「码表前 N 码 + 拼音完整输入」混合 overflow。
@@ -553,16 +558,28 @@ impl Engine for MixedEngine {
     /// （`pinyin_vetoes_commit`），未被否决才委托主码表顶码。两条上屏通路同一套判据，杜绝
     /// "满码不否决、顶码却否决"的不一致。
     ///
+    /// - ⓪ `pinyin_only_overflow` 且整串有拼音候选 → 超码长即纯拼音语境，抑制顶码（见下）；
     /// - ① `auto_commit_block_on_pinyin` 且整串有拼音候选 → 抑制顶码（打开时 wangba/aipu 等含拼音
     ///   读法的串都让路拼音）；
     /// - ② `block_commit_on_pinyin_word` 且整串是强拼音词（wangba→网吧）→ 抑制顶码；
-    /// - `top_code_override_pinyin` 开启 = 顶码优先，**无视**拼音否决强制倒向五笔。
+    /// - `top_code_override_pinyin` 开启 = 顶码优先，**无视**上述全部否决强制倒向五笔。
+    ///
+    /// ⓪ 与 [`Self::convert`] 的超长分流**共用同一个判据**（`input_len > max_code_len` +
+    /// `pinyin_only_overflow`）。此前本函数完全不读 `pinyin_only_overflow`，于是同一次按键里
+    /// `convert` 判「切入纯拼音语境」、`handle_top_code` 却委托纯码表顶掉前 N 码；而协调器
+    /// （`coordinator.rs` 字母键臂）让顶码**先于**候选刷新执行 → 顶码恒赢，`convert_overflow`
+    /// 的纯拼音分支只在拼音否决①②恰好命中时才够得着。混输下打 `youyoud`（悠悠的）在第 5 键
+    /// 被顶出「变凉」+ 余码 `oud` 即此漏的实例。
+    ///
+    /// 与码表侧判据天然互补，不重复拦截：`CodeTableEngine::handle_top_code` 仅在整串**既无精确
+    /// 匹配也无更长后继**时才返回 Some，而 `convert_overflow` 的「长码特例」（`has_full_or_longer`）
+    /// 恰是它的补集 —— 顶码想触发的那些串，在 overflow 侧走的正是纯拼音分支。
     fn handle_top_code(&self, input: &str) -> Option<(String, String)> {
         let input_len = input.chars().count();
         if self.max_code_len == 0 || input_len <= self.max_code_len {
             return self.primary.handle_top_code(input);
         }
-        // 顶码优先开关关闭时，应用与满码同一套拼音①②否决。
+        // 顶码优先开关关闭时，应用 ⓪ 与满码同一套拼音①②否决。
         if !self.top_code_override_pinyin {
             if let Some(sec) = &self.secondary {
                 // ①的 has_pinyin：整串是否有拼音候选（与满码"合并前拼音候选非空"同义）。
@@ -570,6 +587,18 @@ impl Engine for MixedEngine {
                     .convert(input, 1)
                     .map(|r| !r.candidates.is_empty())
                     .unwrap_or(false);
+                // ⓪ 超码长仅查拼音：本串已归拼音管，只要拼音真给得出候选，顶码就不该抢。
+                //
+                // **必须叠 `has_pinyin`，不可只看开关**：纯五笔溢出串（aaaab 之类，拼音一条
+                // 候选都没有）若也禁顶码，`convert_overflow` 的纯拼音分支同样交不出候选——
+                // 用户会卡在一个既不上屏、又没候选的长串上，没有出口。
+                //
+                // 与 ① 的分工：① 不限超码长（满码时同样生效）、由 `auto_commit_block_on_pinyin`
+                // 驱动；⓪ 只在本函数成立（此处已确认 `input_len > max_code_len`）、由
+                // `pinyin_only_overflow` 驱动。两者独立配置，任一命中即否决。
+                if self.pinyin_only_overflow && has_pinyin {
+                    return None;
+                }
                 if self.pinyin_vetoes_commit(input, has_pinyin) {
                     return None;
                 }
@@ -805,6 +834,8 @@ mod tests {
     #[test]
     fn topcode_allowed_when_no_pinyin_candidate() {
         // 纯五笔溢出（整串无拼音候选）→ 顶码正常上屏（② 默认开也不拦）。
+        // 默认下 ⓪ 亦为开，此例同时守着它的 `has_pinyin` 前提（详见
+        // `topcode_allowed_when_overflow_has_no_pinyin`）。
         let primary = ct_engine_topcode(&[("aaaa", "工", 100)]);
         let e = MixedEngine::new(
             primary,
@@ -844,6 +875,8 @@ mod tests {
     #[test]
     fn topcode_allowed_when_both_guards_off() {
         // ①② 都关：即便整串像拼音也顶码倒向五笔（王 + 余码 ba）。
+        // ⓪ 须显式关以隔离变量——`MixConfig::default()` 的 pinyin_only_overflow 为 true，
+        // 而本串有拼音候选，不关掉的话拦截来自 ⓪ 而非被测的 ①②。
         let primary = ct_engine_topcode(&[("wang", "王", 100)]);
         let e = MixedEngine::new(
             primary,
@@ -855,6 +888,7 @@ mod tests {
             MixConfig {
                 auto_commit_block_on_pinyin: false,
                 block_commit_on_pinyin_word: false,
+                pinyin_only_overflow: false,
                 ..Default::default()
             },
         );
@@ -915,6 +949,7 @@ mod tests {
     #[test]
     fn topcode_allowed_for_multi_syllable_prefix_when_block_on_pinyin_off() {
         // ① 关、② 开：前缀 "aipu"=ai+pu 是完整多音节单元、无强词 → 放行顶码倒向五笔（落实）。
+        // ⓪ 须显式关以隔离变量（理由同 `topcode_allowed_when_both_guards_off`）。
         let primary = ct_engine_topcode(&[("aipu", "落实", 100)]);
         let e = MixedEngine::new(
             primary,
@@ -925,6 +960,7 @@ mod tests {
             None,
             MixConfig {
                 auto_commit_block_on_pinyin: false,
+                pinyin_only_overflow: false,
                 ..Default::default()
             },
         );
@@ -932,6 +968,114 @@ mod tests {
             e.handle_top_code("aipux"),
             Some(("落实".to_string(), "x".to_string())),
             "① 关 + ② 开：多音节前缀无强词应放行顶码"
+        );
+    }
+
+    // ── ⓪ pinyin_only_overflow：超码长归拼音管，顶码不得抢 ──
+
+    #[test]
+    fn topcode_vetoed_by_pinyin_only_overflow() {
+        // 与 `topcode_allowed_when_both_guards_off` 构成**单一变量对照**：同样的码表/假拼音/
+        // 输入串、同样 ①② 都关，唯一差别是 ⓪ 开 → 拦截只可能来自 ⓪。
+        let primary = ct_engine_topcode(&[("wang", "王", 100)]);
+        let e = MixedEngine::new(
+            primary,
+            Some(Box::new(FakePinyin {
+                word: "网吧",
+                syllables: 2,
+            })),
+            None,
+            MixConfig {
+                auto_commit_block_on_pinyin: false,
+                block_commit_on_pinyin_word: false,
+                pinyin_only_overflow: true,
+                ..Default::default()
+            },
+        );
+        assert_eq!(
+            e.handle_top_code("wangba"),
+            None,
+            "⓪ 开 + 有拼音候选：超码长归拼音管，顶码不得抢"
+        );
+    }
+
+    #[test]
+    fn topcode_pinyin_only_overflow_protects_youyoud() {
+        // 真机回归（用户实测）：混输下打 `youyoud`（悠悠的），第 5 键 `o` 使缓冲 "youyo" 超 4 码
+        // → 旧实现顶出 `youy` 的首选「变凉」+ 余码 `oud`。
+        //
+        // 本例精确复刻当时 ①② 双双落空的判据状态，故只有 ⓪ 能救：
+        // - ① 关（用户层 auto_commit_block_on_pinyin=false 覆盖了系统层的 true）；
+        // - ②(b) 落空：前 4 码 "youy" = you + 残尾 y，不是完整音节（syllables=2 使
+        //   completed_syllable_count != 1）；
+        // - ②(a) 落空：整串 "youyo" 拼不出「≥2 汉字」的强词（word 只 1 字）。
+        let primary = ct_engine_topcode(&[("youy", "变凉", 864)]);
+        let e = MixedEngine::new(
+            primary,
+            Some(Box::new(FakePinyin {
+                word: "悠",
+                syllables: 2,
+            })),
+            None,
+            MixConfig {
+                auto_commit_block_on_pinyin: false,
+                pinyin_only_overflow: true,
+                ..Default::default()
+            },
+        );
+        assert_eq!(
+            e.handle_top_code("youyo"),
+            None,
+            "①② 落空时 ⓪ 应兜住：超码长的拼音串不得被五笔顶码截胡"
+        );
+    }
+
+    #[test]
+    fn topcode_allowed_when_overflow_has_no_pinyin() {
+        // ⓪ 开但整串**无**拼音候选（纯五笔溢出）→ 必须放行顶码。
+        // 一刀切禁顶会让用户卡死：convert_overflow 此时只查拼音，同样交不出候选，
+        // 那串既不上屏也没候选，没有出口。
+        let primary = ct_engine_topcode(&[("aaaa", "工", 100)]);
+        let e = MixedEngine::new(
+            primary,
+            Some(Box::new(FakePinyin {
+                word: "",
+                syllables: 0,
+            })),
+            None,
+            MixConfig {
+                pinyin_only_overflow: true,
+                ..Default::default()
+            },
+        );
+        assert_eq!(
+            e.handle_top_code("aaaab"),
+            Some(("工".to_string(), "b".to_string())),
+            "⓪ 开但无拼音候选：纯五笔溢出应正常顶码"
+        );
+    }
+
+    #[test]
+    fn topcode_override_beats_pinyin_only_overflow() {
+        // top_code_override_pinyin 是总开关，压过 ⓪ 与 ①②。
+        let primary = ct_engine_topcode(&[("wang", "王", 100)]);
+        let e = MixedEngine::new(
+            primary,
+            Some(Box::new(FakePinyin {
+                word: "网吧",
+                syllables: 2,
+            })),
+            None,
+            MixConfig {
+                pinyin_only_overflow: true,
+                top_code_override_pinyin: true,
+                ..Default::default()
+            },
+        );
+        assert_eq!(
+            e.handle_top_code("wangba"),
+            Some(("王".to_string(), "ba".to_string())),
+            "顶码优先应无视 ⓪"
         );
     }
 
