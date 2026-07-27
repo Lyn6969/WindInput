@@ -842,7 +842,9 @@ do_portable_zip() {
     # 便携标记: 内容与 wind-portable 的 ensure_portable_layout 一致(同 dev.ps1 Write-PortableMarker)。
     # 有它 wind_input.exe 才把 userdata 落在自身目录; 缺了会退化成安装版行为写 %APPDATA%,
     # 那样"便携"就名不副实了。
-    printf 'wind_portable=1\n' > "$stage/$name/wind_portable_mode"
+    # 文件名与安装器清单 [app] portable_marker 及 wind-config PORTABLE_MARKER_NAME 统一为
+    # portable_mode (旧名 wind_portable_mode 仅保留读取兼容, 新包不再写)。
+    printf 'wind_portable=1\n' > "$stage/$name/portable_mode"
 
     rm -f "$zipfile" "$zipfile.sha256"
     ( cd "$stage" && zip -qr "$zipfile" "$name" ) || { err "zip 打包失败"; return 1; }

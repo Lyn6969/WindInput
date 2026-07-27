@@ -46,7 +46,21 @@ pub fn app_dir_name() -> &'static str {
 }
 
 /// 便携模式标记文件名。
-pub const PORTABLE_MARKER_NAME: &str = "wind_portable_mode";
+///
+/// 与安装器清单 `config/app.toml` 的 `[app] portable_marker` **同名**——两侧曾各叫各的
+/// （安装器 `portable_mode` / 本侧 `wind_portable_mode`），导致安装包便携模式装出来的目录
+/// 主程序不认、数据落回 `%APPDATA%`。现已统一，改名须同步两仓。
+pub const PORTABLE_MARKER_NAME: &str = "portable_mode";
+
+/// 旧标记文件名，**仅用于读取兼容**：存量便携部署（已发布的便携包、用户现有目录）
+/// 里是这个名字，不认它会让这些用户的词库与配置一夜之间"消失"（实为落回 `%APPDATA%`）。
+/// 新写入一律用 [`PORTABLE_MARKER_NAME`]；待存量足够老后可删。
+pub const LEGACY_PORTABLE_MARKER_NAME: &str = "wind_portable_mode";
+
+/// 目录内是否存在便携标记（新名优先，旧名兼容）。抽出以便单测。
+fn has_portable_marker_in(dir: &std::path::Path) -> bool {
+    dir.join(PORTABLE_MARKER_NAME).is_file() || dir.join(LEGACY_PORTABLE_MARKER_NAME).is_file()
+}
 
 /// 用 OnceLock 缓存，进程内只检测一次。
 pub fn is_portable() -> bool {
@@ -54,7 +68,7 @@ pub fn is_portable() -> bool {
     *IS_PORTABLE.get_or_init(|| {
         std::env::current_exe()
             .ok()
-            .and_then(|p| p.parent().map(|d| d.join(PORTABLE_MARKER_NAME).is_file()))
+            .and_then(|p| p.parent().map(has_portable_marker_in))
             .unwrap_or(false)
     })
 }
@@ -248,5 +262,38 @@ mod tests {
     #[test]
     fn absent_conf_falls_back_to_default() {
         assert_eq!(decide_custom_dir(false, None), None);
+    }
+
+    /// 便携标记新旧两名都必须认出。
+    ///
+    /// 旧名兼容不是洁癖：存量便携包里全是 `wind_portable_mode`，只认新名会让这些
+    /// 用户的词库配置落回 `%APPDATA%`——现象是「升级后我的词库全没了」。
+    #[test]
+    fn portable_marker_accepts_new_and_legacy_names() {
+        let base = std::env::temp_dir().join(format!("wind_marker_{}", std::process::id()));
+
+        for (i, name) in [PORTABLE_MARKER_NAME, LEGACY_PORTABLE_MARKER_NAME]
+            .iter()
+            .enumerate()
+        {
+            let dir = base.join(format!("case{i}"));
+            std::fs::create_dir_all(&dir).unwrap();
+            assert!(!has_portable_marker_in(&dir), "无标记时不该判为便携");
+            std::fs::write(dir.join(name), "portable=1\n").unwrap();
+            assert!(has_portable_marker_in(&dir), "{name} 应被认出");
+        }
+
+        // 目录存在但两个名字都没有 → 非便携（安装版的常态）。
+        let plain = base.join("plain");
+        std::fs::create_dir_all(&plain).unwrap();
+        assert!(!has_portable_marker_in(&plain));
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// 新名必须与安装器清单 `[app] portable_marker` 一致——两侧不同正是原 bug。
+    #[test]
+    fn portable_marker_name_matches_installer_manifest() {
+        assert_eq!(PORTABLE_MARKER_NAME, "portable_mode");
     }
 }

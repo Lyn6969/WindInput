@@ -359,25 +359,35 @@ BOOL CIPCClient::_StartService()
 
     WCHAR* lastSlash = wcsrchr(dllPath, L'\\');
 
-    // Guard: check portable mode marker file for stopped flag
+    // Guard: check portable mode marker file for stopped flag.
+    // 标记名以 portable_mode 为准（与安装器清单 config/app.toml 的 [app] portable_marker
+    // 及 wind-config variant.rs 的 PORTABLE_MARKER_NAME 一致）；wind_portable_mode 是旧名，
+    // 仅为存量便携包保留读取兼容，新写入不再使用。三处必须同步。
     {
         if (lastSlash)
         {
-            WCHAR markerPath[MAX_PATH];
-            wcsncpy_s(markerPath, dllPath, (lastSlash - dllPath + 1));
-            wcscat_s(markerPath, MAX_PATH, L"wind_portable_mode");
+            static const WCHAR* const kMarkerNames[] = { L"portable_mode", L"wind_portable_mode" };
 
-            HANDLE hFile = CreateFileW(
-                markerPath,
-                GENERIC_READ,
-                FILE_SHARE_READ | FILE_SHARE_WRITE,
-                nullptr,
-                OPEN_EXISTING,
-                FILE_ATTRIBUTE_NORMAL,
-                nullptr);
-
-            if (hFile != INVALID_HANDLE_VALUE)
+            for (size_t i = 0; i < ARRAYSIZE(kMarkerNames); ++i)
             {
+                WCHAR markerPath[MAX_PATH];
+                wcsncpy_s(markerPath, dllPath, (lastSlash - dllPath + 1));
+                wcscat_s(markerPath, MAX_PATH, kMarkerNames[i]);
+
+                HANDLE hFile = CreateFileW(
+                    markerPath,
+                    GENERIC_READ,
+                    FILE_SHARE_READ | FILE_SHARE_WRITE,
+                    nullptr,
+                    OPEN_EXISTING,
+                    FILE_ATTRIBUTE_NORMAL,
+                    nullptr);
+
+                if (hFile == INVALID_HANDLE_VALUE)
+                {
+                    continue;
+                }
+
                 char buf[256] = {};
                 DWORD bytesRead = 0;
                 ReadFile(hFile, buf, sizeof(buf) - 1, &bytesRead, nullptr);
@@ -389,6 +399,9 @@ BOOL CIPCClient::_StartService()
                     _LogInfo(L"Portable mode stopped flag detected, not starting service");
                     return FALSE;
                 }
+                // 标记文件已找到并读完：新名存在时不再回看旧名，否则一个陈旧的
+                // wind_portable_mode 会盖过新名里刚被清掉的 stopped 标志。
+                break;
             }
         }
     }

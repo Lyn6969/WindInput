@@ -85,9 +85,12 @@ $WIND_DIR_DEV     = "C:\Program Files\WindInputDev"
 $WIND_DIR_PORTABLE_RELEASE = "D:\WindInputPortable"
 $WIND_DIR_PORTABLE_DEV     = "D:\WindInputPortableDev"
 # 便携标记文件名与用户数据目录名: 真源是 wind-config\src\variant.rs 的 PORTABLE_MARKER_NAME
-# / PORTABLE_DATA_DIR 常量 (注意不是 config\app.toml 里那个 portable_marker = "portable_mode",
-# 那是安装器侧的字段, 与 launcher 认的名字不同)。改这两个常量时须同步此处。
-$PortableMarkerName = "wind_portable_mode"
+# / PORTABLE_DATA_DIR 常量。标记名已与 config\app.toml 的 portable_marker (安装器侧字段)
+# 统一 —— 此前两侧各叫各的, 安装包便携模式装出的目录主程序不认, 数据落回 %APPDATA%。
+# 改这两个常量时须同步此处、app.toml、wind-portable 与 IPCClient.cpp。
+$PortableMarkerName = "portable_mode"
+# 旧标记名: 仅用于部署时识别存量便携目录 (读取兼容), 不再写入。
+$PortableMarkerLegacy = "wind_portable_mode"
 $PortableDataDir    = "userdata"
 # wind-installer: 通用安装器生成器 (兄弟项目, app.toml 驱动); 8/d8 打包命令调用其 pack.ps1。
 $InstallerDir  = "$ProductRoot\..\wind-installer"
@@ -881,15 +884,20 @@ function Stop-PortableProcesses ([string]$root, [string]$suffix) {
     else { Gray "  - 无运行中的便携进程" }
 }
 
-# 写便携标记文件 (root\wind_portable_mode)。launcher 启动时也会自建, 此处先写是为了让
+# 写便携标记文件 (root\portable_mode)。launcher 启动时也会自建, 此处先写是为了让
 # "复制完还没跑过 launcher"的目录就已经是合法便携包 (直接双击 wind_input.exe 也走便携路径)。
 # 内容与 wind-portable\src\service.rs ensure_portable_layout 一致; 已存在则不覆盖 ——
 # 运行期可能写入 stopped=1 等守卫位, 覆盖会抹掉状态。
+# 存量目录里可能只有旧名: 补写新名完成迁移, 旧名保留 (回退到旧版程序时它仍是唯一被认的标记)。
 function Write-PortableMarker ([string]$root) {
     $marker = Join-Path $root $PortableMarkerName
     if (Test-Path $marker) { Gray "  - 便携标记已存在, 保留 ($PortableMarkerName)"; return }
     [System.IO.File]::WriteAllText($marker, "wind_portable=1`n", (New-Object System.Text.UTF8Encoding($false)))
-    Gray "  - 已写便携标记 ($PortableMarkerName)"
+    if (Test-Path (Join-Path $root $PortableMarkerLegacy)) {
+        Gray "  - 已补写新便携标记 ($PortableMarkerName); 旧名 $PortableMarkerLegacy 保留"
+    } else {
+        Gray "  - 已写便携标记 ($PortableMarkerName)"
+    }
 }
 
 # 启动便携 launcher。WorkingDirectory 必须设为便携根 —— layout.rs 的候选根探测会用到
