@@ -732,6 +732,30 @@ pub(crate) fn dispatch_command(
             None
         }
 
+        // ── 首显试探采样（异步）──
+        // 载荷同 CaretPayload；长度不足直接丢弃：半截坐标定位候选窗比不定位更糟。
+        CMD_CARET_PROBE => {
+            // 入口无条件记一条：本分支此前对「解码失败」是静默丢弃的，真机排查时
+            // 「一条日志都没有」既可能是没收到、也可能是收到但解码失败，无从区分。
+            debug!("CMD_CARET_PROBE 到达: payload={} 字节", payload.len());
+            if let Some(p) = wind_ipc::protocol::CaretPayload::from_bytes(payload) {
+                handler.handle_caret_probe(&CaretData {
+                    x: p.x,
+                    y: p.y,
+                    height: p.height,
+                    composition_start_x: p.composition_start_x,
+                    composition_start_y: p.composition_start_y,
+                });
+            } else {
+                warn!(
+                    "CMD_CARET_PROBE 载荷不足 {} 字节（收到 {}），丢弃",
+                    wind_ipc::protocol::CaretPayload::SIZE,
+                    payload.len()
+                );
+            }
+            None
+        }
+
         // ── 显示功能主菜单（任务栏输入法指示右键，同步）──
         CMD_SHOW_CONTEXT_MENU => {
             // 载荷若含 8 字节则为屏幕坐标 (i32 x, i32 y)，否则用哨兵让 UI 取光标位
@@ -1082,6 +1106,7 @@ mod tests {
         fn handle_composition_terminated(&self) {}
         fn handle_caret_update(&self, _data: &CaretData) {}
         fn handle_focus_gained_caret(&self, _data: &CaretData) {}
+        fn handle_caret_probe(&self, _data: &CaretData) {}
         fn handle_caret_pending(&self) {}
         fn handle_selection_changed(&self, _prev_char: u16) {}
         fn handle_commit_request(&self, _data: &CommitRequestData) -> Option<CommitResultData> {

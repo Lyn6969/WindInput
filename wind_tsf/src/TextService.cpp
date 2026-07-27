@@ -588,6 +588,7 @@ public:
             // 不会立即发 IPC，而是等 OnLayoutChange 提供 reflow 后的权威坐标，
             // 50ms timer 兜底（应对不发 OnLayoutChange 的应用，如某些 CUAS 路径）。
             _pTextService->_compositionJustStarted = TRUE;
+            _pTextService->_firstShowProbeSeq = 0; // 新组合开始：试探采样计数归零
         }
 
         // 2. Get range from composition
@@ -4707,12 +4708,45 @@ STDAPI CTextService::OnLayoutChange(ITfContext* pContext, TfLayoutCode lCode, IT
             {
                 _pLangBarItemButton->PostDelayedCaretPositionUpdate();
             }
+            // 首帧 reflow 期间的**试探采样**：每次 layout change 取一次坐标发给服务端。
+            // DLL 一侧不做任何判断——哪一帧可信取决于 per-app 策略，而策略要读 compat.toml，
+            // 那是服务端的事。实测两类宿主表现相反：EverEdit 第 1 次采样就已是 reflow 后的
+            // 正确值；WPS 前两次仍是上一轮的旧坐标、第 3 次才更新。服务端据此判定。
+            //
+            // ⚠ 本采样的前提是宿主**会**发 OnLayoutChange，而这远非普遍：实测 Word 在 50 轮
+            // 连打中一次都没发过（记事本仅首轮 1 次），它俩的组合坐标只能靠下面的 50ms timer
+            // 兜底 + 异步 GetTextExt 拿到，实测要 60~190ms（Word 的 edit session 排队）。
+            // 所以服务端的 fast 档必须自带短兜底（ui.candidate.fast_first_show_fallback_ms），
+            // 否则在这类宿主上它会退化成 wait 档、候选窗几乎不出现。
+            //
+            // 仍然保留下面的 debounce + 50ms timer 兜底：本采样只是让**已启用快速首显的**宿主
+            // 能提前放行，不改变默认行为（服务端默认忽略 probe），也不改变本地 composition 状态。
+            // 限前 5 次：burst 长的宿主会刷 IPC，且嵌套 EditSession 有触发额外 layout change 的
+            // 风险，限次数同时兜住这两点。
+            if (++_firstShowProbeSeq <= 5 && _pIPCClient != nullptr && _pIPCClient->IsConnected())
+            {
+                RECT probeCaret = {};
+                RECT probeCs = {};
+                BOOL probeHasCs = FALSE;
+                if (CCaretEditSession::GetCaretAndCompositionStartRect(
+                        pContext, _tfClientId, _pComposition,
+                        &probeCaret, &probeCs, &probeHasCs, 0))
+                {
+                    // 与 SendCaretPositionUpdate 同口径：y 取 bottom、height 由 rect 高度算。
+                    LONG ph = probeCaret.bottom - probeCaret.top;
+                    LONG csx = probeHasCs ? probeCs.left : 0;
+                    LONG csy = probeHasCs ? probeCs.bottom : 0;
+                    _pIPCClient->SendCaretProbe(probeCaret.left, probeCaret.bottom, ph, csx, csy);
+                }
+            }
             WIND_LOG_DEBUG(L"OnLayoutChange (first show): debouncing caret flush\n");
             return S_OK;
         }
         WIND_LOG_DEBUG(L"OnLayoutChange: TF_LC_CHANGE with active composition, updating caret position\n");
         SendCaretPositionUpdate();
+        return S_OK;
     }
+    // 无活跃组合期的 layout change 无需处理（无组合＝无候选窗要跟）。
     return S_OK;
 }
 

@@ -591,9 +591,8 @@ pub(crate) struct ActiveCompat {
     /// 用 caret rect 的 top 而非 bottom 定位候选窗。微信等 WebView 宿主的 GetTextExt
     /// height 在 1↔20px 间跳变致 bottom 漂移，top 稳定。
     pub(crate) caret_use_top: bool,
-    /// 「光标稳定」的宿主：新组合首帧跳过等 reflow 权威坐标，立即显示候选窗。
-    /// 对齐 Go `AppCompatRule.SkipCaretPending`（其消费点 handle_key_action.go:207）。
-    pub(crate) skip_caret_pending: bool,
+    /// 候选窗首显策略（见 `AppCompatRule::first_show_mode`）。三档互斥。
+    pub(crate) first_show_mode: wind_config::app_compat::FirstShowMode,
 }
 
 /// 中央协调器
@@ -660,6 +659,25 @@ pub struct Coordinator {
     /// 显示授权：handle_caret_update / 兜底 timer 在调 notify_ui_update 前置位以放行首帧显示；
     /// 按键路径不置位，首帧改为 arm 延迟。notify_ui_update 内 swap 消费。
     show_authorized: std::sync::atomic::AtomicBool,
+    /// 本轮组合的首显是否用了**非权威**坐标（fast 的试探采样 / instant 沿用的旧坐标）。
+    /// 置位后，该轮第一次权威坐标到达时改用放宽的容差判断要不要校正——校正动作本身
+    /// 才是抖动的观感来源，小偏差不动比「跳一下修正」更稳。组合结束时复位。
+    pub(crate) first_show_was_provisional: std::sync::atomic::AtomicBool,
+    /// 上一次按键时刻，仅用于算出下面那个「相邻按键间隔」。
+    pub(crate) last_key_at: Mutex<Option<std::time::Instant>>,
+    /// **相邻两次按键**的间隔（毫秒），fast 档据此判断是否处于连续快速输入。
+    ///
+    /// ⚠ 必须是「按键与按键之间」，不能用 `last_key_at.elapsed()`——后者是「距上次按键多久」，
+    /// 而试探坐标恒在按键后 10ms 内到达，那个条件永远成立、判据会被完全绕过。本功能就这么
+    /// 空跑过一轮：日志里 163 次全报「连续输入 7~13ms」，而实际脚本节奏是 60ms。
+    pub(crate) last_key_interval_ms: Mutex<Option<u64>>,
+    /// 上一轮组合最终采纳的**权威** caret 坐标 (x, y, valid)，供首显试探采样做判据。
+    ///
+    /// 为什么这个能当判据：首帧 reflow 未完成时，宿主的 GetTextExt 返回的正是上一轮那个
+    /// 位置（实测 WPS 连续两次返回上一轮终值，第三次才更新）；而真正 reflow 之后，光标
+    /// 必然因新插入的组合内容而移动。所以「与上一轮权威坐标不同」≈「宿主已经 reflow」。
+    /// 误判方向是安全的：判成「未 reflow」只是退回等 debounce（慢而不错）。
+    pub(crate) last_authoritative_caret: Mutex<(i32, i32, bool)>,
     /// 组合起点屏幕坐标 (x, y, valid)：嵌入预编辑模式（编码插入宿主、光标随输入右移）下候选窗锚此处
     /// （缓冲头部），不随输入移动。同一组合只锁定首个有效值（handle_caret_update），组合结束复位。
     composition_start: Mutex<(i32, i32, bool)>,
@@ -1255,6 +1273,10 @@ impl Coordinator {
             candidate_shown: Mutex::new(false),
             show_authorized: std::sync::atomic::AtomicBool::new(false),
             composition_start: Mutex::new((0, 0, false)),
+            last_authoritative_caret: Mutex::new((0, 0, false)),
+            last_key_at: Mutex::new(None),
+            last_key_interval_ms: Mutex::new(None),
+            first_show_was_provisional: std::sync::atomic::AtomicBool::new(false),
             app_compat: Mutex::new(app_compat),
             compat_dirs: (
                 data_dir.map(|d| d.to_path_buf()),
@@ -1349,7 +1371,7 @@ impl Coordinator {
                 ActiveCompat {
                     pid,
                     caret_use_top: rule.map(|r| r.caret_use_top).unwrap_or(false),
-                    skip_caret_pending: rule.map(|r| r.skip_caret_pending).unwrap_or(false),
+                    first_show_mode: rule.map(|r| r.first_show_mode).unwrap_or_default(),
                 },
                 rule.is_some(),
             )
@@ -1358,8 +1380,10 @@ impl Coordinator {
         // 规则未命中与「命中但全 false」在日志里无从区分，查「某应用兼容项没生效」时看不到
         // 究竟是没匹配上进程名还是字段没读到。
         debug!(
-            "Compat rule for process={name}: matched={} caret_use_top={} skip_caret_pending={}",
-            rule_matched, next.caret_use_top, next.skip_caret_pending
+            "Compat rule for process={name}: matched={} caret_use_top={} first_show_mode={}",
+            rule_matched,
+            next.caret_use_top,
+            next.first_show_mode.as_config()
         );
         *ac = next;
         drop(ac);
@@ -2371,7 +2395,8 @@ impl Coordinator {
             .active_compat
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .skip_caret_pending;
+            .first_show_mode
+            == wind_config::app_compat::FirstShowMode::Instant;
         let coords_ready = self
             .last_valid_caret
             .lock()
@@ -2392,14 +2417,21 @@ impl Coordinator {
             // 唯一的「等」出口。与下面的放行日志成对，两条合起来即可从服务端日志判定
             // 每一帧走了哪条路、以及是哪个逃生口生效——不必再对着 TSF 日志比时间戳。
             debug!(
-                "first_show 闸门 → 等待权威坐标（arm 150ms 兜底）: skip_caret_pending=0 coords_ready=0"
+                "first_show 闸门 → 等待权威坐标（arm {}ms 兜底）: skip_caret_pending=0 coords_ready=0",
+                self.first_show_fallback_ms()
             );
             self.arm_pending_first_show();
             return;
         }
         if is_first_frame {
+            // instant 档用的是上一轮遗留的坐标，必然是「非权威」；coords_ready 那条是已锁定
+            // 的本轮组合起点，属权威，不置位。
+            if skip_caret_pending {
+                self.first_show_was_provisional
+                    .store(true, std::sync::atomic::Ordering::Relaxed);
+            }
             debug!(
-                "first_show 闸门 → 立即显示（逃生口）: skip_caret_pending={} coords_ready={}",
+                "first_show 闸门 → 立即显示（逃生口）: instant={} coords_ready={}",
                 skip_caret_pending as u8, coords_ready as u8
             );
         }
@@ -2664,6 +2696,8 @@ impl Coordinator {
 
     /// 复位首显延迟状态（候选窗隐藏 / 组合结束）：下次新组合重新延迟首显，并作废未触发的兜底 timer。
     pub(crate) fn reset_first_show(&self) {
+        self.first_show_was_provisional
+            .store(false, std::sync::atomic::Ordering::Relaxed);
         *self
             .candidate_shown
             .lock()
@@ -2685,10 +2719,26 @@ impl Coordinator {
             .unwrap_or_else(|e| e.into_inner()) = (0, 0, false);
     }
 
-    /// 推迟首次显示候选窗：标记 pending 并启动兜底 timer（默认 150ms）。token 比对使后续按键的
-    /// arm 自动作废旧 timer。handle_caret_pending 握手会改用 600ms（应对 OnLayoutChange burst 慢的应用）。
+    /// 推迟首次显示候选窗：标记 pending 并启动兜底 timer。token 比对使后续按键的 arm 自动作废
+    /// 旧 timer。handle_caret_pending 握手会把 wait 档延到 600ms（应对 OnLayoutChange burst 慢的应用）。
     fn arm_pending_first_show(&self) {
-        self.arm_pending_first_show_with_timeout(150);
+        self.arm_pending_first_show_with_timeout(self.first_show_fallback_ms());
+    }
+
+    /// 本档位等不到坐标时的兜底超时。fast 档取远小于 wait 的值，理由见
+    /// `fast_first_show_fallback_ms` 的字段注释（150ms 会让 fast 在 Word/记事本上退化成 wait）。
+    fn first_show_fallback_ms(&self) -> u64 {
+        if self
+            .active_compat
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .first_show_mode
+            == wind_config::app_compat::FirstShowMode::Fast
+        {
+            self.rt().config.ui.candidate.fast_first_show_fallback_ms
+        } else {
+            150
+        }
     }
 
     fn arm_pending_first_show_with_timeout(&self, ms: u64) {
@@ -2741,8 +2791,14 @@ impl Coordinator {
             || !state.input_buffer.is_empty()
             || self.mode_indicator_text(&state).is_some();
         if has_content {
+            // 用的既然是旧坐标，就必须按「非权威」记账，否则随后到达的权威坐标会被 3px 常规容差
+            // 判成需要校正而跳一下——兜底路径本来就是抖动最容易被看见的地方。
+            // 置位在 has_content 内：没真显示就不该留下"用过非权威坐标"的账。
+            self.first_show_was_provisional
+                .store(true, std::sync::atomic::Ordering::Relaxed);
             self.show_authorized
                 .store(true, std::sync::atomic::Ordering::Relaxed);
+            debug!("first_show 兜底 timer 到期 → 用现有坐标首显（非权威，享放宽容差）");
             self.notify_ui_update(&state);
         }
     }
@@ -3951,6 +4007,23 @@ impl MessageHandler for Coordinator {
             "handle_key_event: type={} code=0x{:02X} mods=0x{:04X}",
             data.event_type, data.key_code, data.modifiers
         );
+        // 记录按键时刻：fast 档据此判断「连续快速输入」（见 handle_caret_probe）。
+        // 记录打字节奏：算出**相邻两次按键**的间隔，供 fast 档判断连续输入（见 handle_caret_probe）。
+        {
+            let now = std::time::Instant::now();
+            let prev = self
+                .last_key_at
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .replace(now);
+            if let Some(p) = prev {
+                *self
+                    .last_key_interval_ms
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner()) =
+                    Some(now.duration_since(p).as_millis() as u64);
+            }
+        }
 
         // 用每键携带的 toggles 快照（C++ 前台线程 GetKeyState 实时采集）校准 CapsLock 镜像。
         // 专门的 VK_CAPITAL key_up 状态通知在英文模式（TSF 不吃该键）或用户于其它应用/
@@ -5331,6 +5404,13 @@ impl MessageHandler for Coordinator {
                 }
             }
         }
+        // 记录本帧为「上一轮权威坐标」，供下一轮组合的试探采样做判据。
+        // 放在这里（已过有效性与 composing 守卫）而非函数入口：只有真正被采纳为定位依据的
+        // 坐标才有资格当基准，否则会把 idle 帧、退化帧混进来，判据立刻失真。
+        *self
+            .last_authoritative_caret
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = (data.x, data.y, true);
         // 消费首显等待：本次为 reflow 后权威坐标。
         let was_pending = {
             let mut pfs = self
@@ -5356,8 +5436,23 @@ impl MessageHandler for Coordinator {
             // 显著变化（换行 / reflow 修正）才 reshow，由 UI 层 4px 位置阈值再次过滤微移。
             let dx = (data.x - prev_x).abs();
             let dy = (data.y - prev_y).abs();
-            if dx <= 3 && dy <= 3 {
-                debug!("caret_update → 忽略: 微移 dx={dx} dy={dy}（≤3px，不 reshow）");
+            // 首显用过非权威坐标时，本轮**第一次**权威坐标改用放宽的容差：偏差在
+            // 「行高 × settle_ratio」以内就不校正。抖动的观感来自校正动作本身而非坐标偏差
+            // ——十几像素的偏移用户根本不会注意，跳一下却很显眼（多数输入法也这么处理）。
+            // 换行/重排的偏差通常 ≥2 个行高，远超此阈值，仍会正常校正。
+            let settle = if self
+                .first_show_was_provisional
+                .swap(false, std::sync::atomic::Ordering::Relaxed)
+            {
+                let ratio = self.rt().config.ui.candidate.first_show_settle_ratio;
+                let h = data.height.max(state.caret_height).max(1) as f32;
+                (h * ratio.max(0.0)) as i32
+            } else {
+                0
+            };
+            let tol = settle.max(3); // 常规微移过滤下限保持 3px 不变
+            if dx <= tol && dy <= tol {
+                debug!("caret_update → 忽略: 微移 dx={dx} dy={dy}（≤{tol}px，不 reshow）");
                 return;
             }
             debug!("caret_update → reshow: dx={dx} dy={dy}");
@@ -5410,6 +5505,76 @@ impl MessageHandler for Coordinator {
         state.caret_height = data.height;
     }
 
+    fn handle_caret_probe(&self, data: &CaretData) {
+        // 首帧 reflow 期间 DLL 逐次采样上报（CMD_CARET_PROBE）。默认**完全忽略**——
+        // 不开 fast_first_show 的宿主必须保持「等 reflow 权威坐标」的原行为，一字不差。
+        let compat = *self.active_compat.lock().unwrap_or_else(|e| e.into_inner());
+        if compat.first_show_mode != wind_config::app_compat::FirstShowMode::Fast {
+            debug!(
+                "caret_probe → 忽略: 当前档位={} 非 fast",
+                compat.first_show_mode.as_config()
+            );
+            return;
+        }
+        // 只在正等首显时有意义：已显示 / 未 arm 的帧交给常规 caret_update 路径。
+        if !*self
+            .pending_first_show
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+        {
+            debug!("caret_probe → 忽略: 未在等待首显（已首显过 / 未 arm）");
+            return;
+        }
+        // 退化 rect（无高度）一律不采信：实测 WPS 首帧曾采到 top==bottom 的样本，
+        // 其 x 与真实位置差 1687px，采信即大幅错位。
+        if data.height <= 0 {
+            debug!("caret_probe → 丢弃: 退化 rect（h<=0）");
+            return;
+        }
+        // 快路径：连续快速输入时直接采信首条采样，不再比对上一轮权威坐标。
+        // 依据是连打时光标沿同一行顺序前移、不发生重排，坐标本来就八九不离十；而这种节奏下
+        // 用户对「跟手」的敏感度远高于十几像素的偏差。窗口可经
+        // ui.candidate.fast_typing_window_ms 调整，0 = 关闭本快路径。
+        let fast_window = self.rt().config.ui.candidate.fast_typing_window_ms;
+        if fast_window > 0 {
+            let interval = *self
+                .last_key_interval_ms
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            if let Some(ms) = interval
+                && ms <= fast_window
+            {
+                debug!(
+                    "caret_probe → 提前首显(按键间隔 {ms}ms≤{fast_window}ms): x={} y={}",
+                    data.x, data.y
+                );
+                self.first_show_was_provisional
+                    .store(true, std::sync::atomic::Ordering::Relaxed);
+                self.handle_caret_update(data);
+                return;
+            }
+        }
+        // 判据：与上一轮权威坐标不同 ⇒ 宿主已 reflow ⇒ 本帧可信。
+        // 尚无上一轮基准时（焦点刚到达的首次输入）直接采信：此时没有「旧值」可疑。
+        let (lx, ly, has_base) = *self
+            .last_authoritative_caret
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if has_base && data.x == lx && data.y == ly {
+            debug!("caret_probe → 继续等待: 坐标仍等于上一轮权威 ({lx},{ly})，宿主尚未 reflow");
+            return;
+        }
+        debug!(
+            "caret_probe → 提前首显: x={} y={} h={}（基准 ({lx},{ly}) has_base={has_base}）",
+            data.x, data.y, data.height
+        );
+        // 复用权威路径：更新坐标缓存 + 消费等待 + 首显。若判错，随后到达的真权威坐标
+        // 会经 handle_caret_update 按放宽后的容差决定是否校正。
+        self.first_show_was_provisional
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        self.handle_caret_update(data);
+    }
+
     fn handle_caret_pending(&self) {
         // DLL 新组合在 reflow 完成前发来的"坐标待定"握手（_compositionJustStarted）：
         // 仅当正等待首显时，延长兜底超时到 600ms，避免 OnLayoutChange burst 慢的应用（如 EverEdit）
@@ -5419,6 +5584,18 @@ impl MessageHandler for Coordinator {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
         {
+            return;
+        }
+        // fast 档刻意不接受这次延长：它的短兜底就是为「坐标要 60~190ms 才到」的宿主设计的，
+        // 延到 600ms 等于把 fast 重新变回 wait（而组合往往活不到 100ms，兜底根本不会到期）。
+        if self
+            .active_compat
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .first_show_mode
+            == wind_config::app_compat::FirstShowMode::Fast
+        {
+            debug!("caret_pending → 忽略延长: fast 档保持短兜底");
             return;
         }
         self.arm_pending_first_show_with_timeout(600);
@@ -5911,6 +6088,293 @@ mod caret_compat_tests {
         *c.pending_first_show.lock().unwrap()
     }
 
+    /// 造一个「正等首显、且已有上一轮权威坐标」的局面，返回喂入 probe 后是否仍在等待。
+    fn still_waiting_after_probe(c: &Arc<Coordinator>, probe: CaretData) -> bool {
+        {
+            let mut st = c.state.lock().unwrap();
+            st.input_buffer = "a".to_string();
+        }
+        *c.last_authoritative_caret.lock().unwrap() = (500, 300, true);
+        *c.pending_first_show.lock().unwrap() = true;
+        c.handle_caret_probe(&probe);
+        *c.pending_first_show.lock().unwrap()
+    }
+
+    fn probe_at(x: i32, y: i32, height: i32) -> CaretData {
+        CaretData {
+            x,
+            y,
+            height,
+            composition_start_x: x,
+            composition_start_y: y,
+        }
+    }
+
+    fn set_mode(c: &Arc<Coordinator>, mode: wind_config::app_compat::FirstShowMode) {
+        *c.active_compat.lock().unwrap() = ActiveCompat {
+            pid: 1234,
+            first_show_mode: mode,
+            ..Default::default()
+        };
+    }
+
+    /// fast 档的兜底必须远短于 wait 档：Word 这类宿主不发 OnLayoutChange、组合坐标 60~190ms
+    /// 才到，而连打时组合只活 27~57ms，150ms 兜底永远等不到到期 ⇒ fast 退化成 wait、候选窗不显示。
+    #[test]
+    fn fast_mode_uses_short_first_show_fallback() {
+        use wind_config::app_compat::FirstShowMode;
+        let c = coord();
+        set_mode(&c, FirstShowMode::Wait);
+        assert_eq!(c.first_show_fallback_ms(), 150, "wait 档保持既有 150ms");
+        set_mode(&c, FirstShowMode::Instant);
+        assert_eq!(
+            c.first_show_fallback_ms(),
+            150,
+            "instant 档走逃生口不 arm，取值无所谓但不应被 fast 的短值污染"
+        );
+        set_mode(&c, FirstShowMode::Fast);
+        let cfg = c.rt().config.ui.candidate.fast_first_show_fallback_ms;
+        assert_eq!(c.first_show_fallback_ms(), cfg);
+        assert!(cfg < 150, "fast 档兜底必须短于 wait 档，否则本修复失效");
+    }
+
+    /// DLL 的「坐标待定」握手会把 wait 档延长到 600ms。fast 档必须拒绝这次延长，
+    /// 否则短兜底当场作废、又变回干等。观察点取 token：arm 会 bump 它，early return 不会。
+    #[test]
+    fn caret_pending_does_not_extend_fast_mode_timeout() {
+        use wind_config::app_compat::FirstShowMode;
+        let c = coord();
+        set_mode(&c, FirstShowMode::Fast);
+        *c.pending_first_show.lock().unwrap() = true;
+        let before = *c.pending_first_show_token.lock().unwrap();
+        c.handle_caret_pending();
+        assert_eq!(
+            *c.pending_first_show_token.lock().unwrap(),
+            before,
+            "fast 档不得重 arm（token 未变即未重 arm）"
+        );
+    }
+
+    /// 上一条的对照：wait 档必须照旧延长，证明那条不是被别的守卫挡住的。
+    #[test]
+    fn caret_pending_still_extends_wait_mode_timeout() {
+        use wind_config::app_compat::FirstShowMode;
+        let c = coord();
+        set_mode(&c, FirstShowMode::Wait);
+        *c.pending_first_show.lock().unwrap() = true;
+        let before = *c.pending_first_show_token.lock().unwrap();
+        c.handle_caret_pending();
+        assert_ne!(
+            *c.pending_first_show_token.lock().unwrap(),
+            before,
+            "wait 档应重 arm 到 600ms"
+        );
+    }
+
+    /// 兜底首显用的是按键前的旧坐标，必须记为「非权威」，否则随后到达的权威坐标会被 3px
+    /// 常规容差判成要校正而跳一下——兜底路径正是抖动最容易被看见的地方。
+    #[test]
+    fn fallback_first_show_marks_provisional() {
+        let c = coord();
+        {
+            let mut st = c.state.lock().unwrap();
+            st.input_buffer = "a".to_string();
+            st.caret_x = 100;
+            st.caret_y = 200;
+            st.caret_height = 25;
+        }
+        *c.pending_first_show.lock().unwrap() = true;
+        let token = *c.pending_first_show_token.lock().unwrap();
+        c.fire_pending_first_show(token);
+        assert!(
+            c.first_show_was_provisional
+                .load(std::sync::atomic::Ordering::Relaxed),
+            "兜底显示后应置位 provisional 以享放宽容差"
+        );
+    }
+
+    /// 首显用过非权威坐标后，随后到达的权威坐标若只差不到 80% 行高，不得 reshow。
+    /// 抖动的观感来自校正动作本身——这条钉住「小偏差不动」的行为。
+    #[test]
+    fn provisional_first_show_tolerates_small_correction() {
+        let c = coord();
+        {
+            let mut st = c.state.lock().unwrap();
+            st.input_buffer = "a".to_string();
+            st.caret_x = 100;
+            st.caret_y = 200;
+            st.caret_height = 25;
+        }
+        *c.candidate_shown.lock().unwrap() = true;
+        c.first_show_was_provisional
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        // 偏差 15px < 25 × 0.8 = 20px ⇒ 应被吞掉
+        c.handle_caret_update(&CaretData {
+            x: 115,
+            y: 200,
+            height: 25,
+            composition_start_x: 115,
+            composition_start_y: 200,
+        });
+        assert_eq!(
+            c.last_valid_caret.lock().unwrap().0,
+            0,
+            "小于 80% 行高的偏差不应触发 reshow（未走到 notify_ui_update）"
+        );
+    }
+
+    /// 换行那种大偏差必须照常校正——容差放宽不能把真正的错位也一起吞掉。
+    #[test]
+    fn provisional_first_show_still_corrects_large_jump() {
+        let c = coord();
+        {
+            let mut st = c.state.lock().unwrap();
+            st.input_buffer = "a".to_string();
+            st.caret_x = 900;
+            st.caret_y = 200;
+            st.caret_height = 25;
+        }
+        *c.candidate_shown.lock().unwrap() = true;
+        c.first_show_was_provisional
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        // 换行：x 回行首、y 下移两行（实测 EverEdit 曾出现 dx=156 dy=194）
+        c.handle_caret_update(&CaretData {
+            x: 726,
+            y: 250,
+            height: 25,
+            composition_start_x: 726,
+            composition_start_y: 250,
+        });
+        assert_eq!(
+            c.last_valid_caret.lock().unwrap().0,
+            726,
+            "换行级偏差必须校正"
+        );
+    }
+
+    /// 容差只作用于「首显用过非权威坐标」的那一次：常规光标更新仍按 3px 走，
+    /// 否则正常输入时的小幅移动会被误吞、候选窗跟不上光标。
+    #[test]
+    fn settle_tolerance_applies_only_after_provisional_first_show() {
+        let c = coord();
+        {
+            let mut st = c.state.lock().unwrap();
+            st.input_buffer = "a".to_string();
+            st.caret_x = 100;
+            st.caret_y = 200;
+            st.caret_height = 25;
+        }
+        *c.candidate_shown.lock().unwrap() = true;
+        // 未置位 first_show_was_provisional
+        c.handle_caret_update(&CaretData {
+            x: 115,
+            y: 200,
+            height: 25,
+            composition_start_x: 115,
+            composition_start_y: 200,
+        });
+        assert_eq!(
+            c.last_valid_caret.lock().unwrap().0,
+            115,
+            "常规路径下 15px 偏移仍应 reshow"
+        );
+    }
+
+    #[test]
+    fn probe_ignored_unless_fast_mode() {
+        // 默认档的底线：不开开关的宿主必须保持「等 reflow 权威坐标」的原行为。
+        // 这条挂了说明默认行为被改动了——那是本功能最不能碰的东西。
+        let c = coord();
+        assert!(
+            still_waiting_after_probe(&c, probe_at(800, 600, 24)),
+            "非 fast 档时 probe 必须被完全忽略"
+        );
+    }
+
+    #[test]
+    fn probe_releases_first_show_when_caret_moved() {
+        // 坐标已不同于上一轮权威 ⇒ 宿主已 reflow ⇒ 采信并提前首显。
+        let c = coord();
+        *c.active_compat.lock().unwrap() = ActiveCompat {
+            pid: 1,
+            first_show_mode: wind_config::app_compat::FirstShowMode::Fast,
+            ..Default::default()
+        };
+        assert!(
+            !still_waiting_after_probe(&c, probe_at(800, 600, 24)),
+            "坐标已变应提前首显"
+        );
+    }
+
+    /// 连打快路径必须由**相邻按键间隔**驱动，不能由「距上次按键多久」驱动。
+    ///
+    /// 后者恒成立（试探坐标总在按键后 10ms 内到达），会让判据被完全绕过——本功能就这么
+    /// 空跑过一轮。这条测试构造「间隔很大（慢速手打）」的局面：此时即使坐标等于上一轮权威
+    /// （即宿主尚未 reflow），也必须继续等待，绝不能被快路径放行。
+    #[test]
+    fn slow_typing_does_not_take_fast_path() {
+        let c = coord();
+        *c.active_compat.lock().unwrap() = ActiveCompat {
+            pid: 1,
+            first_show_mode: wind_config::app_compat::FirstShowMode::Fast,
+            ..Default::default()
+        };
+        // 慢速手打：相邻按键间隔 800ms，远超默认 100ms 窗口
+        *c.last_key_interval_ms.lock().unwrap() = Some(800);
+        assert!(
+            still_waiting_after_probe(&c, probe_at(500, 300, 24)),
+            "慢速输入下不得走连打快路径，须回落到「≠上一轮权威」判据"
+        );
+    }
+
+    /// 连打（间隔在窗口内）时直接采信首条试探坐标——即使它等于上一轮权威坐标。
+    /// 依据：连打时光标沿同一行顺序前移、不重排，跟手比精确更重要。
+    #[test]
+    fn fast_typing_takes_fast_path_even_when_caret_unchanged() {
+        let c = coord();
+        *c.active_compat.lock().unwrap() = ActiveCompat {
+            pid: 1,
+            first_show_mode: wind_config::app_compat::FirstShowMode::Fast,
+            ..Default::default()
+        };
+        *c.last_key_interval_ms.lock().unwrap() = Some(60); // 与真机脚本同节奏
+        assert!(
+            !still_waiting_after_probe(&c, probe_at(500, 300, 24)),
+            "连打间隔内应走快路径立即首显"
+        );
+    }
+
+    #[test]
+    fn probe_keeps_waiting_when_caret_equals_previous() {
+        // 与上一轮权威坐标相同 ⇒ 宿主尚未 reflow（实测 WPS 前两次采样即如此）⇒ 继续等。
+        // 采信它就会把候选窗定在上一轮的位置，正是要避免的抖动。
+        let c = coord();
+        *c.active_compat.lock().unwrap() = ActiveCompat {
+            pid: 1,
+            first_show_mode: wind_config::app_compat::FirstShowMode::Fast,
+            ..Default::default()
+        };
+        assert!(
+            still_waiting_after_probe(&c, probe_at(500, 300, 24)),
+            "坐标等于上一轮权威时必须继续等待"
+        );
+    }
+
+    #[test]
+    fn probe_rejects_degenerate_rect() {
+        // 退化 rect（h<=0）：实测 WPS 采到过 top==bottom 的样本，其 x 与真实位置差 1687px。
+        let c = coord();
+        *c.active_compat.lock().unwrap() = ActiveCompat {
+            pid: 1,
+            first_show_mode: wind_config::app_compat::FirstShowMode::Fast,
+            ..Default::default()
+        };
+        assert!(
+            still_waiting_after_probe(&c, probe_at(9999, 8888, 0)),
+            "退化 rect 不得采信"
+        );
+    }
+
     #[test]
     fn default_host_waits_for_authoritative_caret() {
         // 对照组：无 compat 规则、坐标未就绪 → 保持原行为，等 reflow 权威坐标。
@@ -5923,17 +6387,17 @@ mod caret_compat_tests {
     }
 
     #[test]
-    fn skip_caret_pending_bypasses_first_show_wait() {
+    fn instant_mode_bypasses_first_show_wait() {
         // 逃生口②：compat.toml 标记「光标稳定」的宿主直接首显。连打场景只有这一项能生效。
         let c = coord();
         *c.active_compat.lock().unwrap() = ActiveCompat {
             pid: 1234,
-            skip_caret_pending: true,
+            first_show_mode: wind_config::app_compat::FirstShowMode::Instant,
             ..Default::default()
         };
         assert!(
             !armed_after_first_frame(&c),
-            "skip_caret_pending=true 应立即首显，不得 arm 等待"
+            "instant 档应立即首显，不得 arm 等待"
         );
     }
 

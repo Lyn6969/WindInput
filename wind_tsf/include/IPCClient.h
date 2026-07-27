@@ -147,6 +147,11 @@ public:
     // Tells Go to extend its first-show fallback timeout so it doesn't fall back to pre-key cursor.
     BOOL SendCaretPending();
 
+    // Send a first-show caret probe: one pre-reflow sample taken inside an OnLayoutChange
+    // burst iteration. Fire-and-forget; the service decides whether the sample is trustworthy
+    // (see CMD_CARET_PROBE in BinaryProtocol.h). Never affects local composition state.
+    BOOL SendCaretProbe(int x, int y, int height, int compositionStartX, int compositionStartY);
+
     // Send selection changed notification (from ITfTextEditSink::OnEndEdit)
     // Async: notifies Go that the caret moved outside of composition (e.g., mouse click)
     BOOL SendSelectionChanged(uint16_t prevChar = 0);

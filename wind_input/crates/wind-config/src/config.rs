@@ -1150,6 +1150,17 @@ impl Default for OverflowConfig {
 fn default_per_page() -> usize {
     7
 }
+fn default_first_show_settle_ratio() -> f32 {
+    0.8
+}
+
+fn default_fast_typing_window_ms() -> u64 {
+    100
+}
+
+fn default_fast_first_show_fallback_ms() -> u64 {
+    25
+}
 
 /// UI 配置（子表结构，对齐真实 config.toml：[ui.candidate] / [ui.font] / [ui.theme]）
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -1358,6 +1369,29 @@ pub struct UiCandidateConfig {
     /// 页码文字显示覆盖："" 跟随主题 / "show" / "hide"。
     #[serde(default)]
     pub page_number_display: String,
+    /// 首显容差系数（**内部选项**，不进设置页）：首帧用了非权威坐标时，随后到达的权威
+    /// 坐标与它相差在 `行高 × 本系数` 以内就**不再校正**——校正本身才是抖动的观感来源，
+    /// 十几像素的偏差不动比"跳一下修正"更稳（多数输入法也是这么做的）。
+    /// 换行/重排的偏差通常 ≥2 个行高，远超此阈值，仍会正常校正。
+    /// 0 表示禁用该容差（任何偏差都校正，即旧行为）。默认 0.8。
+    #[serde(default = "default_first_show_settle_ratio")]
+    pub first_show_settle_ratio: f32,
+    /// 连续输入判定窗口（**内部选项**，毫秒）：两次按键间隔小于此值即视为"连续快速输入"，
+    /// 此时 fast 档直接采信首条试探坐标、不再比对上一轮权威坐标。
+    /// 依据是连打时光标顺序前移、不发生重排，且用户对"跟手"的敏感度远高于十几像素的偏差。
+    /// 0 表示禁用该快路径。默认 100。
+    #[serde(default = "default_fast_typing_window_ms")]
+    pub fast_typing_window_ms: u64,
+    /// fast 档的首显兜底超时（**内部选项**，毫秒）：等不到试探/权威坐标就用现有坐标先显示。
+    ///
+    /// 为什么必须远小于 wait 档的 150ms：实测 Word 从不发 `OnLayoutChange`（试探坐标无从产生），
+    /// 其组合坐标要 60~190ms 才到，而连打时组合只活 27~57ms——上屏即 `reset_first_show()` 作废
+    /// timer，150ms 兜底**永远等不到自己到期**，fast 档就此退化成 wait 档，候选窗 57/70 轮不显示。
+    /// 取小值让 fast 在这类宿主上退化成 instant（用旧坐标 + 放宽容差）而非干等。
+    /// 发 `OnLayoutChange` 的宿主（EverEdit/WPS）试探坐标 3~10ms 就到，不受本值影响。
+    /// 默认 25。
+    #[serde(default = "default_fast_first_show_fallback_ms")]
+    pub fast_first_show_fallback_ms: u64,
     /// 候选文本最大显示字数，超出截断（0=不限）。
     #[serde(default)]
     pub max_chars: usize,
@@ -1457,6 +1491,9 @@ impl Default for UiCandidateConfig {
     fn default() -> Self {
         Self {
             per_page: default_per_page(),
+            first_show_settle_ratio: default_first_show_settle_ratio(),
+            fast_typing_window_ms: default_fast_typing_window_ms(),
+            fast_first_show_fallback_ms: default_fast_first_show_fallback_ms(),
             per_page_extended: 0,
             layout: "horizontal".to_string(),
             preedit_display: default_preedit_display(),

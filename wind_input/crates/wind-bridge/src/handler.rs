@@ -263,6 +263,19 @@ pub trait MessageHandler: Send + Sync {
     /// 处理光标待定（composition 刚启动，真正 caret 在 reflow 后到达）
     fn handle_caret_pending(&self);
 
+    /// 处理首显试探采样（`CMD_CARET_PROBE`）。
+    ///
+    /// 首帧 reflow 期间 DLL 每次 layout change 采一次坐标发来，**这些采样未必可信**：
+    /// 实测 WPS 前两条仍是上一轮的旧坐标，EverEdit 第一条就已正确。实现方要自行判定哪条
+    /// 可采纳（例如「与上一轮权威坐标不同即视为已 reflow」），并且**默认应当忽略**——
+    /// 不启用快速首显的宿主必须保持原有「等 reflow 权威坐标」的行为，一字不差。
+    ///
+    /// ⚠ **必需方法，不给默认实现**——理由同 [`Self::handle_focus_gained_caret`]：本 trait 有
+    /// `DeferredHandler` 这类装饰器，它们逐个方法转发；一旦提供默认空实现，装饰器不重写也能
+    /// 编译通过，于是真正的实现永远收不到消息。本方法就这么栽过一次：IPC 到达 150 次、解码
+    /// 全部成功，coordinator 里却一条日志都没有，查了好几轮才定位到是装饰器吃了默认实现。
+    fn handle_caret_probe(&self, data: &CaretData);
+
     /// 处理选区变化
     fn handle_selection_changed(&self, prev_char: u16);
 

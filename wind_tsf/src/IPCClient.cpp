@@ -767,6 +767,30 @@ BOOL CIPCClient::SendCaretPending()
     return _SendBinaryMessage(CMD_CARET_PENDING, nullptr, 0, true /* async */);
 }
 
+BOOL CIPCClient::SendCaretProbe(int x, int y, int height, int compositionStartX, int compositionStartY)
+{
+    if (!_ShouldAttemptOperation())
+    {
+        return FALSE;
+    }
+
+    if (!IsConnected() && !Connect())
+    {
+        return FALSE;
+    }
+
+    CaretPayload payload;
+    payload.x = x;
+    payload.y = y;
+    payload.height = height;
+    payload.compositionStartX = compositionStartX;
+    payload.compositionStartY = compositionStartY;
+
+    _LogDebug(L"Sending caret probe (async): x=%d, y=%d, h=%d, compStart=(%d,%d)",
+              x, y, height, compositionStartX, compositionStartY);
+    return _SendBinaryMessage(CMD_CARET_PROBE, &payload, sizeof(payload), true /* async */);
+}
+
 BOOL CIPCClient::SendCompositionTerminated()
 {
     if (!IsConnected())

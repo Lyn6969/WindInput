@@ -33,6 +33,46 @@ fn is_false(b: &bool) -> bool {
     !*b
 }
 
+/// 候选窗首显策略：新组合的候选窗**何时**显示。
+///
+/// 背景：宿主插入组合内容后要 reflow 才能给出正确的光标坐标，而 reflow 需要时间
+/// （实测首帧 GetTextExt 到稳定值要 85~95ms）。这三档是「快」与「准」之间的取舍。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FirstShowMode {
+    /// 等宿主 reflow 后的权威坐标才显示。最准，代价是 85~95ms 首显延迟，
+    /// 快速连打时候选窗只来得及显示几毫秒，观感「迟钝」。
+    #[default]
+    Wait,
+    /// 仍等坐标，但等到「可信」即放行：DLL 在首帧 reflow 期间连发几条试探坐标，
+    /// 取第一条「与上一轮权威坐标不同」的采用（宿主未 reflow 时返回的正是上一轮那个
+    /// 位置，一旦变化即说明新位置已就绪）。连续快速输入时更进一步——直接采信首条。
+    /// 实测 EverEdit ~3ms、WPS ~11ms 出候选窗。
+    Fast,
+    /// 完全不等，首帧直接沿用上一次的坐标。最快，但只要光标位置变动过
+    /// （手动移动、换行、文本重排）那个位置就是错的，会先错位显示再跳回。
+    Instant,
+}
+
+impl FirstShowMode {
+    /// 配置串 → 枚举。无法识别时回落 `Wait`（最保守的一档）。
+    pub fn from_config(s: &str) -> Self {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "fast" => Self::Fast,
+            "instant" => Self::Instant,
+            _ => Self::Wait,
+        }
+    }
+    /// 枚举 → 配置串（写回 compat.toml 用）。
+    pub fn as_config(self) -> &'static str {
+        match self {
+            Self::Wait => "wait",
+            Self::Fast => "fast",
+            Self::Instant => "instant",
+        }
+    }
+}
+
 /// 单个应用的兼容性规则。
 #[derive(Debug, Clone, Deserialize, Serialize, Default)]
 pub struct AppCompatRule {
@@ -47,10 +87,11 @@ pub struct AppCompatRule {
     /// height 在 1↔20px 间跳变 → bottom 漂移 ~20px，但 top 始终稳定）。
     #[serde(default, skip_serializing_if = "is_false")]
     pub caret_use_top: bool,
-    /// 跳过首次 composition 的 CARET_PENDING 等待（光标稳定的应用）：新组合首帧不等宿主
-    /// reflow 后的权威坐标，立即显示候选窗。消费点 `Coordinator::notify_ui_update` 的首显闸门。
-    #[serde(default, skip_serializing_if = "is_false")]
-    pub skip_caret_pending: bool,
+    /// 候选窗首显策略。三档互斥——做成枚举而不是几个 bool：布尔开关可以同时打开，
+    /// 实测就因此出过一次「fast 配了却从未生效」（instant 优先、抢先放行，fast 的判据
+    /// 根本没机会跑），日志里 630 条试探坐标一条没被消费。互斥语义要由类型保证。
+    #[serde(default)]
+    pub first_show_mode: FirstShowMode,
     /// 固定候选窗位置：拖动后位置持久化记忆，跨会话恢复。
     ///
     /// ⚠ **当前是死字段，无任何消费点**：该能力后来由 `ui.candidate.position_mode = "fixed"`
@@ -61,28 +102,26 @@ pub struct AppCompatRule {
     pub pin_candidate_position: bool,
 }
 
-/// 在一组规则上切换指定进程的 `skip_caret_pending`，返回切换后的新值。
+/// 在一组规则上设置指定进程的首显策略。
 ///
 /// 纯函数（不碰文件系统），故可直接单测——本仓凡涉 `%APPDATA%` 落盘的逻辑都要这样
 /// 抽出来，否则端到端测试会真写用户配置目录（见 project_dict_override_sparse_merge 的教训）。
 ///
-/// 语义对齐 Go `toggleUserCompatFlag`：进程名不区分大小写匹配；命中则翻转该字段、
-/// 其余字段保持不动；未命中则**追加**一条只带该开关的新规则（不是整表快照，
-/// 避免把系统层的其它字段冻结进用户层）。
-pub fn toggle_skip_caret_pending(rules: &mut Vec<AppCompatRule>, process: &str) -> bool {
+/// 进程名不区分大小写匹配；命中则只改这一个字段、其余字段保持不动；未命中则**追加**
+/// 一条只带该字段的新规则（不是整表快照，避免把系统层的其它字段冻结进用户层）。
+pub fn set_first_show_mode(rules: &mut Vec<AppCompatRule>, process: &str, mode: FirstShowMode) {
     let key = process.to_ascii_lowercase();
     for r in rules.iter_mut() {
         if r.process.to_ascii_lowercase() == key {
-            r.skip_caret_pending = !r.skip_caret_pending;
-            return r.skip_caret_pending;
+            r.first_show_mode = mode;
+            return;
         }
     }
     rules.push(AppCompatRule {
         process: process.to_string(),
-        skip_caret_pending: true,
+        first_show_mode: mode,
         ..Default::default()
     });
-    true
 }
 
 /// 把规则集渲染成用户层 compat.toml 全文（含固定文件头）。纯函数，便于单测断言产物。
@@ -93,23 +132,24 @@ pub fn render_user_compat(rules: &[AppCompatRule]) -> Result<String, toml::ser::
     Ok(format!("{USER_COMPAT_HEADER}{}", toml::to_string(&file)?))
 }
 
-/// 切换用户层 compat.toml 中指定进程的 `skip_caret_pending`，返回新值。
+/// 设置用户层 compat.toml 中指定进程的首显策略。
 ///
 /// 只读写**用户层**：系统层 `data/compat.toml` 不受影响（合并时用户层同名进程整条覆盖它）。
 /// 文件或目录不存在时自动创建；解析失败按空规则集处理（宁可重建也不要把菜单卡死，
 /// 用户手改坏了 TOML 时仍能通过菜单恢复到可用状态）。
-pub fn toggle_user_skip_caret_pending(
+pub fn set_user_first_show_mode(
     user_dir: &Path,
     process: &str,
-) -> Result<bool, std::io::Error> {
+    mode: FirstShowMode,
+) -> Result<(), std::io::Error> {
     let path = user_dir.join(COMPAT_FILE_NAME);
     let mut rules = load_file(&path).unwrap_or_default();
-    let new_value = toggle_skip_caret_pending(&mut rules, process);
+    set_first_show_mode(&mut rules, process, mode);
     let text = render_user_compat(&rules)
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
     std::fs::create_dir_all(user_dir)?;
     std::fs::write(&path, text)?;
-    Ok(new_value)
+    Ok(())
 }
 
 /// 所有应用兼容性规则 + 运行时查找表。
@@ -232,7 +272,7 @@ mod tests {
         let compat = AppCompat::from_rules(file.apps);
         let rule = compat.get_rule("foo.exe").unwrap();
         assert!(!rule.caret_use_top);
-        assert!(!rule.skip_caret_pending);
+        assert_eq!(rule.first_show_mode, FirstShowMode::Wait);
         assert!(!rule.pin_candidate_position);
     }
 
@@ -268,35 +308,49 @@ mod tests {
     }
 
     #[test]
-    fn toggle_flips_existing_rule_and_keeps_other_fields() {
-        // 命中已有规则：只翻 skip_caret_pending，caret_use_top / comment 不得被动。
+    fn set_mode_on_existing_rule_keeps_other_fields() {
+        // 命中已有规则：只改 first_show_mode，caret_use_top / comment 不得被动。
         let mut rules = vec![AppCompatRule {
             process: "Weixin.exe".into(),
             comment: "微信".into(),
             caret_use_top: true,
             ..Default::default()
         }];
-        assert!(toggle_skip_caret_pending(&mut rules, "weixin.exe")); // 大小写无关
+        set_first_show_mode(&mut rules, "weixin.exe", FirstShowMode::Fast); // 大小写无关
         assert_eq!(rules.len(), 1, "命中时不得追加新规则");
-        assert!(rules[0].skip_caret_pending);
-        assert!(rules[0].caret_use_top, "其它开关不得被连带修改");
+        assert_eq!(rules[0].first_show_mode, FirstShowMode::Fast);
+        assert!(rules[0].caret_use_top, "其它字段不得被连带修改");
         assert_eq!(rules[0].comment, "微信");
-        // 再切一次回到 false。
-        assert!(!toggle_skip_caret_pending(&mut rules, "Weixin.EXE"));
-        assert!(!rules[0].skip_caret_pending);
+        // 三档互斥：再设一次直接覆盖，不存在「两档同时生效」的中间态
+        // ——正是布尔开关时代那个「fast 配了却从未生效」的成因。
+        set_first_show_mode(&mut rules, "Weixin.EXE", FirstShowMode::Instant);
+        assert_eq!(rules[0].first_show_mode, FirstShowMode::Instant);
     }
 
     #[test]
-    fn toggle_appends_minimal_rule_when_absent() {
-        // 未命中：追加**只带该开关**的最小规则，不做整表快照（否则会把系统层其它字段
+    fn set_mode_appends_minimal_rule_when_absent() {
+        // 未命中：追加**只带该字段**的最小规则，不做整表快照（否则会把系统层其它字段
         // 冻结进用户层，正是 project_dict_override_sparse_merge 记录过的坑）。
         let mut rules: Vec<AppCompatRule> = Vec::new();
-        assert!(toggle_skip_caret_pending(&mut rules, "EverEdit.exe"));
+        set_first_show_mode(&mut rules, "EverEdit.exe", FirstShowMode::Fast);
         assert_eq!(rules.len(), 1);
         assert_eq!(rules[0].process, "EverEdit.exe", "应保留原始大小写");
-        assert!(rules[0].skip_caret_pending);
+        assert_eq!(rules[0].first_show_mode, FirstShowMode::Fast);
         assert!(!rules[0].caret_use_top);
-        assert!(!rules[0].pin_candidate_position);
+    }
+
+    #[test]
+    fn mode_parses_from_config_and_falls_back_to_wait() {
+        assert_eq!(FirstShowMode::from_config("fast"), FirstShowMode::Fast);
+        assert_eq!(
+            FirstShowMode::from_config(" INSTANT "),
+            FirstShowMode::Instant
+        );
+        assert_eq!(FirstShowMode::from_config("wait"), FirstShowMode::Wait);
+        // 未知值回落最保守的一档，而不是 panic 或取激进档——用户手改错了不该变成抖动。
+        assert_eq!(FirstShowMode::from_config("turbo"), FirstShowMode::Wait);
+        assert_eq!(FirstShowMode::default(), FirstShowMode::Wait);
+        assert_eq!(FirstShowMode::Fast.as_config(), "fast");
     }
 
     #[test]
@@ -304,11 +358,11 @@ mod tests {
         // 渲染产物：false 开关与空 comment 全部省略（不铺 `= false`），且能被自己解析回来。
         let rules = vec![AppCompatRule {
             process: "EverEdit.exe".into(),
-            skip_caret_pending: true,
+            first_show_mode: FirstShowMode::Fast,
             ..Default::default()
         }];
         let text = render_user_compat(&rules).expect("渲染失败");
-        assert!(text.contains("skip_caret_pending = true"));
+        assert!(text.contains(r#"first_show_mode = "fast""#), "产物: {text}");
         assert!(
             !text.contains("caret_use_top"),
             "false 开关不应写出: {text}"
@@ -318,7 +372,7 @@ mod tests {
 
         let parsed: AppCompatFile = toml::from_str(&text).expect("产物应可解析");
         assert_eq!(parsed.apps.len(), 1);
-        assert!(parsed.apps[0].skip_caret_pending);
+        assert_eq!(parsed.apps[0].first_show_mode, FirstShowMode::Fast);
         assert_eq!(parsed.apps[0].process, "EverEdit.exe");
     }
 }

@@ -208,6 +208,12 @@ static REGISTRY: &[ConfigField] = &[
         Enum(&["app_inline", "candidate_top", "candidate_inline"]),
     ),
     f("ui.candidate.hide_window", Bool),
+    // 首显策略的三个内部选项（不进设置页，仅 config.toml / CLI 可调）。
+    // 注册到此表是必须的：registry_covers_every_config_key 强制全键覆盖，
+    // 漏注册的键会静默无法经 CLI/RPC 读写。
+    f("ui.candidate.first_show_settle_ratio", Float),
+    f("ui.candidate.fast_typing_window_ms", Int),
+    f("ui.candidate.fast_first_show_fallback_ms", Int),
     f("ui.candidate.font_size", Float),
     f("ui.candidate.font_size_follow_theme", Bool),
     f(

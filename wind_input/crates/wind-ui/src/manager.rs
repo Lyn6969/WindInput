@@ -283,9 +283,9 @@ pub enum MenuCmd {
     TooltipScreenshot,
     /// 状态提示气泡：切换固定位置（position_mode fixed/follow_caret）
     StatusTogglePinned,
-    /// 为当前焦点应用切换「立即显示候选窗」（compat.toml 的 skip_caret_pending）：
-    /// 新组合首帧不等宿主 reflow 后的权威坐标，直接显示候选窗。写入用户层 compat.toml。
-    ToggleSkipCaretPending,
+    /// 为当前焦点应用设置候选窗首显策略（compat.toml 的 first_show_mode）。
+    /// 参数：0=wait 1=fast 2=instant。三档互斥，UI 上呈现为子菜单单选。
+    FirstShowMode(u8),
 }
 
 /// 菜单项的动作类型（右键候选菜单 + 功能主菜单共用）
@@ -343,7 +343,7 @@ impl MenuKind {
                 MenuCmd::StatusTogglePinned => 122,
                 MenuCmd::ToggleInputDiagnostics => 120,
                 MenuCmd::TogglePasswordSuppress => 121,
-                MenuCmd::ToggleSkipCaretPending => 123,
+                MenuCmd::FirstShowMode(m) => 5000 + m as i32,
                 MenuCmd::SchemaSelect(i) => 1000 + i as i32,
                 MenuCmd::ThemeSelect(i) => 2000 + i as i32,
                 MenuCmd::FilterMode(i) => 3000 + i as i32,
@@ -382,13 +382,14 @@ impl MenuKind {
             118 => MenuCmd::TooltipCopy,
             119 => MenuCmd::TooltipScreenshot,
             122 => MenuCmd::StatusTogglePinned,
-            123 => MenuCmd::ToggleSkipCaretPending,
+
             120 => MenuCmd::ToggleInputDiagnostics,
             121 => MenuCmd::TogglePasswordSuppress,
             1000..=1999 => MenuCmd::SchemaSelect((id - 1000) as usize),
             2000..=2999 => MenuCmd::ThemeSelect((id - 2000) as usize),
             3000..=3999 => MenuCmd::FilterMode((id - 3000) as usize),
             4000..=4999 => MenuCmd::ThemeStyle((id - 4000) as u8),
+            5000..=5999 => MenuCmd::FirstShowMode((id - 5000) as u8),
             _ => return None,
         };
         Some(MenuKind::Command(cmd))
@@ -1555,7 +1556,9 @@ mod menu_id_tests {
             MenuCmd::ScreenshotCandidateToClipboard,
             MenuCmd::ToggleInputDiagnostics,
             MenuCmd::TogglePasswordSuppress,
-            MenuCmd::ToggleSkipCaretPending,
+            MenuCmd::FirstShowMode(0),
+            MenuCmd::FirstShowMode(1),
+            MenuCmd::FirstShowMode(2),
             MenuCmd::StatusToggleAlways,
             MenuCmd::StatusResetPosition,
             MenuCmd::StatusScreenshot,

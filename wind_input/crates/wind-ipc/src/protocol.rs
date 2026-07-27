@@ -114,6 +114,10 @@ pub const CMD_HOST_RENDER_FAILED: u16 = 0x0212;
 pub const CMD_CARET_UPDATE: u16 = 0x0301;
 pub const CMD_SELECTION_CHANGED: u16 = 0x0302;
 pub const CMD_CARET_PENDING: u16 = 0x0303;
+/// 首显试探采样：DLL 在首帧 reflow 的每次 layout change 各发一条（限 5 条），payload 同
+/// `CaretPayload`。**采样不等于可信**——首帧期间宿主可能仍返回旧坐标（实测 WPS 前两条是上
+/// 一轮的值、EverEdit 第一条就已正确），是否采纳由服务端按 per-app 策略判定。
+pub const CMD_CARET_PROBE: u16 = 0x0304;
 
 // Host Render
 pub const CMD_HOST_RENDER_REQUEST: u16 = 0x0501;

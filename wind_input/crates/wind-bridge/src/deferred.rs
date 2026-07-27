@@ -143,6 +143,10 @@ impl MessageHandler for DeferredHandler {
         self.with_handler((), |h| h.handle_focus_gained_caret(data))
     }
 
+    fn handle_caret_probe(&self, data: &CaretData) {
+        self.with_handler((), |h| h.handle_caret_probe(data))
+    }
+
     fn handle_caret_pending(&self) {
         self.with_handler((), |h| h.handle_caret_pending())
     }

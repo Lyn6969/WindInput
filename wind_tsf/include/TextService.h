@@ -403,6 +403,9 @@ private:
     // Weasel 模式：StartComposition 后第一次 SendCaretPositionUpdate 不立即发 IPC，
     // 改为等 OnLayoutChange（reflow 完成的权威信号）或 50ms timer 兜底。
     BOOL _compositionJustStarted;
+    // 首帧 reflow 期间已发出的试探采样次数（见 OnLayoutChange 与 CMD_CARET_PROBE）。
+    // 每次 StartComposition 归零；限次上报，防 burst 长的宿主刷 IPC。
+    int  _firstShowProbeSeq = 0;
     BOOL _needsFocusRecovery;
     LONG _lastFocusCaretX;
     LONG _lastFocusCaretY;

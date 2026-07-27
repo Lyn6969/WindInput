@@ -44,6 +44,10 @@ constexpr uint16_t CMD_COMPOSITION_TERMINATED = 0x0209; // Composition unexpecte
 constexpr uint16_t CMD_CARET_UPDATE     = 0x0301; // Caret position update
 constexpr uint16_t CMD_SELECTION_CHANGED = 0x0302; // Selection/caret changed without composition (from ITfTextEditSink)
 constexpr uint16_t CMD_CARET_PENDING    = 0x0303; // First-show handshake: composition just started, real caret coming after reflow
+constexpr uint16_t CMD_CARET_PROBE      = 0x0304; // First-show probe: one pre-reflow caret sample per OnLayoutChange burst iteration.
+// DLL 只上报、不做判断：首帧 reflow 期间宿主可能连续多次 layout change，前几次 GetTextExt
+// 仍返回旧坐标（实测 WPS 前两次是上一轮的值，EverEdit 第一次就已正确）。哪一帧可信由服务端
+// 按策略判定，故这里不筛不等，纯采样上报——策略留在能读 compat.toml 的那一侧。
 constexpr uint16_t CMD_BATCH_EVENTS     = 0x0F01; // Batch events container
 constexpr uint16_t CMD_INPUT_STATS      = 0x0F03; // Input stats report (async, from English mode)
 

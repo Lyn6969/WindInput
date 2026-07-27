@@ -287,6 +287,16 @@ select_key = "ignore"
 select_char_key = "ignore"
 
 [ui.candidate]
+# 首显用过非权威坐标时，权威坐标与它相差在「行高 × 本值」以内就不再校正。
+# 校正动作本身才是抖动的观感来源；换行/重排的偏差远超此阈值，仍会正常校正。0 = 关闭容差。
+first_show_settle_ratio = 0.8
+# 两次按键间隔小于此毫秒数即视为连续输入，first_show_mode="fast" 时直接采信首条试探坐标
+# （连打不重排，跟手比精确更重要）。0 = 关闭该快路径。
+fast_typing_window_ms = 100
+# first_show_mode="fast" 的兜底超时（毫秒）：等不到试探/权威坐标就用现有坐标先显示。
+# 必须远小于 wait 档的 150ms——Word 这类宿主不发 OnLayoutChange 且组合坐标要 60~190ms 才到，
+# 连打时组合只活 27~57ms，上屏即作废 timer，150ms 兜底永远不会到期（fast 就退化成 wait）。
+fast_first_show_fallback_ms = 25
 font_size = 18
 font_size_follow_theme = true
 per_page = 7
