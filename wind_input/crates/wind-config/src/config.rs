@@ -51,6 +51,89 @@ fn set_nested(table: &mut toml::Table, path: &[&str], value: toml::Value) {
     }
 }
 
+/// 在 TOML 值里按 `path` 逐级取值（任一级缺失或非表则 `None`）。
+/// 供 [`Config::set_user_value`] 与出厂默认（L1⊕L2）比对用。
+fn get_nested<'a>(root: &'a toml::Value, path: &[&str]) -> Option<&'a toml::Value> {
+    let mut cur = root;
+    for k in path {
+        cur = cur.as_table()?.get(*k)?;
+    }
+    Some(cur)
+}
+
+/// 在 TOML 表里按 `path` 删除叶子，并回收因此变空的中间表（避免留下 `[schema.mix]` 这类空段）。
+/// 返回是否真的删掉了东西。供用户层「与默认相同即不落盘」的收口用。
+fn remove_nested(table: &mut toml::Table, path: &[&str]) -> bool {
+    if path.is_empty() {
+        return false;
+    }
+    if path.len() == 1 {
+        return table.remove(path[0]).is_some();
+    }
+    let Some(toml::Value::Table(t)) = table.get_mut(path[0]) else {
+        return false;
+    };
+    let removed = remove_nested(t, &path[1..]);
+    if removed && t.is_empty() {
+        table.remove(path[0]);
+    }
+    removed
+}
+
+/// 从 `root`（用户层）删除所有与 `preset`（出厂默认 L1⊕L2）取值相同的叶子键，返回删除数。
+///
+/// 纯函数、不碰文件系统：[`Config::prune_user_config`] 负责 IO，本函数负责判定，
+/// 单测得以在不触碰真实 `%APPDATA%` 的前提下验证「清理前后三层合并结果不变」这条不变量。
+///
+/// **两道保险，缺一不可**：
+/// 1. `is_known_key` —— 只碰注册表登记过的键。这排除掉两类绝不能删的东西：**废弃键**（清理它们
+///    是另一件事，必须走显式名单，绝不能靠「preset 里没有」来推断）、以及 `Map`/`StructList`
+///    类型键的**下钻子路径**（`input.punct.custom_mappings` 整体才是一个配置项，
+///    `collect_leaf_paths` 却会切出 `...custom_mappings."'1"` 这种伪键——删单条是错的语义）。
+/// 2. 值必须与 preset 逐一相等（`get_nested` 两侧都取到才比）。
+fn prune_redundant(root: &mut toml::Value, preset: &toml::Value) -> usize {
+    let mut leaves = Vec::new();
+    collect_leaf_paths(root, &mut Vec::new(), &mut leaves);
+    let redundant: Vec<Vec<String>> = leaves
+        .into_iter()
+        .filter(|p| crate::config_schema::is_known_key(&p.join(".")))
+        .filter(|p| {
+            let refs: Vec<&str> = p.iter().map(|s| s.as_str()).collect();
+            get_nested(root, &refs)
+                .zip(get_nested(preset, &refs))
+                .is_some_and(|(user, default)| user == default)
+        })
+        .collect();
+    let toml::Value::Table(t) = root else {
+        return 0;
+    };
+    let mut removed = 0usize;
+    for p in &redundant {
+        let refs: Vec<&str> = p.iter().map(|s| s.as_str()).collect();
+        if remove_nested(t, &refs) {
+            removed += 1;
+        }
+    }
+    removed
+}
+
+/// 收集 TOML 值里所有叶子路径（表递归；数组/标量视为叶子，不下钻）。
+///
+/// 数组**必须**当叶子：`schema.mix_modes` / `keys.page_keys` 这类整体就是一个配置项，
+/// 下钻进数组元素会切出无法用 `path` 表达、也无法与出厂默认逐项比对的伪键。
+fn collect_leaf_paths(v: &toml::Value, prefix: &mut Vec<String>, out: &mut Vec<Vec<String>>) {
+    match v {
+        toml::Value::Table(t) if !t.is_empty() => {
+            for (k, sub) in t {
+                prefix.push(k.clone());
+                collect_leaf_paths(sub, prefix, out);
+                prefix.pop();
+            }
+        }
+        _ => out.push(prefix.clone()),
+    }
+}
+
 /// 完整配置
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
@@ -453,7 +536,9 @@ impl Default for MixGlobal {
         Self {
             show_source_hint: false,
             enable_english: false,
-            pinyin_only_overflow: false,
+            // ⚠️ 三处同源：本处 / `MixConfig::default()`（wind-engine mixed/engine.rs）/
+            // `data/config.toml [schema.mix]` 必须一致，改默认须同步全部三处。
+            pinyin_only_overflow: true,
             top_code_override_pinyin: false,
             auto_commit_block_on_pinyin: true,
             auto_commit_block_on_english: false,
@@ -1927,6 +2012,63 @@ impl Config {
         Ok(merged)
     }
 
+    /// 「与默认相同即不落盘」判定所用的出厂默认（L1⊕L2）。取不到则 `None`。
+    ///
+    /// ⚠️ **必须确认 `data/config.toml` 在场才返回 `Some`**：[`system_preset_value`] 传 `None`
+    /// 会退回纯 L1，而 L2 本就允许合法覆盖 L1（`schema.active`、`compat.host_render_processes`
+    /// 等出厂值只写在 L2）。拿纯 L1 当"默认"去比对，会把用户显式设的值误判成默认而删掉，
+    /// `load()` 时再从 L2 回落成**另一个**值 —— 用户的设置被静默改写，比不清理坏得多。
+    ///
+    /// 这不是假想：`schema.mix.pinyin_only_overflow` 与 `auto_commit_block_on_pinyin` 就曾长期
+    /// L1/L2 不一致（已随本次修复对齐），此类漂移只要发生一次，纯 L1 比对就会开始吃用户配置。
+    ///
+    /// 返回 `None` 时调用方一律退化为「照常写入 / 不清理」，即旧行为。
+    ///
+    /// [`system_preset_value`]: Self::system_preset_value
+    fn preset_for_pruning() -> Option<toml::Value> {
+        let dir = Self::data_dir()?;
+        if !dir.join("config.toml").is_file() {
+            return None;
+        }
+        Self::system_preset_value(Some(&dir)).ok()
+    }
+
+    /// 清理用户层里与出厂默认（L1⊕L2）相同的冗余键，返回删除的键数。
+    ///
+    /// **不变量：清理前后 `load()` 的结果逐键完全相同** —— 删掉的每个键，三层合并时都会从
+    /// L1⊕L2 回落到同一个值。故本操作对当前行为零影响，只影响**将来**默认值变更能否到达该用户。
+    /// `set_user_value` 的同款收口负责不再产生新的冗余键，本函数负责清掉存量（该收口上线前
+    /// 积累的量很可观：真机一份配置 105 键中 62 键冗余）。
+    ///
+    /// 幂等——跑第二次删 0 个。`data/config.toml` 或用户层缺失时直接返回 0。
+    pub fn prune_user_config() -> anyhow::Result<usize> {
+        let Some(preset) = Self::preset_for_pruning() else {
+            return Ok(0);
+        };
+        let Some(dir) = Self::user_config_dir() else {
+            return Ok(0);
+        };
+        let file = dir.join("config.toml");
+        let Some(mut root) = std::fs::read_to_string(&file)
+            .ok()
+            .and_then(|s| toml::from_str::<toml::Value>(&s).ok())
+        else {
+            return Ok(0);
+        };
+
+        let removed = prune_redundant(&mut root, &preset);
+        if removed == 0 {
+            return Ok(0);
+        }
+
+        let out = toml::to_string_pretty(&root)?;
+        let tmp = file.with_extension("toml.tmp");
+        std::fs::write(&tmp, out)?;
+        std::fs::rename(&tmp, &file)?;
+        info!("Pruned {} redundant key(s) from user config", removed);
+        Ok(removed)
+    }
+
     /// 读取 TOML 文件为 Value（不存在/解析失败返回 None 并告警，不中断加载）
     fn read_toml_value(path: &Path) -> Option<toml::Value> {
         if !path.exists() {
@@ -2200,6 +2342,17 @@ impl Config {
     /// 只改 `path` 指定的项、保留用户文件里其它已有项，**不写入未改动的默认/系统段**——
     /// 用户层维持最小 diff，避免覆盖系统层/默认层的后续更新。
     /// 原子写（tmp + rename）。`path` 如 `["ui","candidate","preedit_display"]`。
+    ///
+    /// ★ **值等于出厂默认（L1⊕L2）时删除该键，而不是写入**（见
+    /// [`preset_for_pruning`](Self::preset_for_pruning)）。这条收口是上面那句「避免覆盖后续更新」
+    /// 唯一的兑现方式：此前无论值是什么都照写，用户把开关点回默认位就在用户层留下一个显式值，
+    /// 从此**永久钉死、不再跟随 L1/L2 的后续变更**。真机实测一份用户配置 105 个键里 62 个是这种
+    /// 冗余键，其中 `schema.mix.auto_commit_block_on_pinyin` 已经引爆：它在默认值还是 `false` 的
+    /// 版本被写入，之后默认改回 `true`，该用户却一直停在 `false`，顶码的拼音保护被静默卸掉。
+    ///
+    /// 语义取舍：加了这条之后，「用户显式选了与默认相同的值」无法与「跟随默认」区分。对配置系统
+    /// 而言后者才是正确语义；若将来要支持「锁定某值不随升级变化」（pin），需要另设表达方式，
+    /// **不要**靠退回「照原样写入」来实现——那等于把这 62 颗雷再埋回去。
     pub fn set_user_value(path: &[&str], value: toml::Value) -> anyhow::Result<()> {
         if path.is_empty() {
             anyhow::bail!("set_user_value: empty path");
@@ -2216,8 +2369,19 @@ impl Config {
         if !root.is_table() {
             root = toml::Value::Table(Default::default());
         }
+        // 出厂默认取不到时 `is_default` 恒 false → 退化为「照常写入」的旧行为（安全降级）。
+        // `is_known_key` 与 `prune_redundant` 同一道保险：未登记键（废弃键 / Map 子路径）不收口。
+        let is_default = crate::config_schema::is_known_key(&path.join("."))
+            && Self::preset_for_pruning()
+                .as_ref()
+                .and_then(|p| get_nested(p, path))
+                .is_some_and(|d| *d == value);
         if let toml::Value::Table(t) = &mut root {
-            set_nested(t, path, value);
+            if is_default {
+                remove_nested(t, path);
+            } else {
+                set_nested(t, path, value);
+            }
         }
 
         let out = toml::to_string_pretty(&root)?;
@@ -2583,6 +2747,217 @@ mod tests {
             start.elapsed() < std::time::Duration::from_secs(2),
             "应及时放弃，实际 {:?}",
             start.elapsed()
+        );
+    }
+
+    fn tv(s: &str) -> toml::Value {
+        toml::from_str::<toml::Value>(s).expect("测试 TOML 应可解析")
+    }
+
+    /// 出厂默认（L1⊕L2）样本：覆盖标量 / 数组 / 多级嵌套。
+    fn preset_sample() -> toml::Value {
+        tv(r#"
+[schema]
+active = "wubi86"
+
+[schema.mix]
+auto_commit_block_on_pinyin = true
+pinyin_only_overflow = true
+show_source_hint = false
+
+[schema.codetable]
+top_code_commit = true
+
+[keys]
+page_keys = ["pageupdown", "minus_equal"]
+"#)
+    }
+
+    #[test]
+    fn prune_removes_redundant_keeps_overrides() {
+        let preset = preset_sample();
+        let mut user = tv(r#"
+[schema]
+active = "wubi86_pinyin"
+
+[schema.mix]
+auto_commit_block_on_pinyin = false
+pinyin_only_overflow = true
+show_source_hint = false
+
+[keys]
+page_keys = ["pageupdown", "minus_equal"]
+"#);
+        let removed = prune_redundant(&mut user, &preset);
+        assert_eq!(
+            removed, 3,
+            "pinyin_only_overflow / show_source_hint / page_keys 三个与默认相同"
+        );
+        assert_eq!(
+            get_nested(&user, &["schema", "mix", "auto_commit_block_on_pinyin"]),
+            Some(&toml::Value::Boolean(false)),
+            "真实覆盖（与默认相反）必须保留"
+        );
+        assert_eq!(
+            get_nested(&user, &["schema", "active"]).and_then(|v| v.as_str()),
+            Some("wubi86_pinyin"),
+            "真实覆盖必须保留"
+        );
+        assert!(
+            get_nested(&user, &["keys"]).is_none(),
+            "唯一子键被删后，空的 [keys] 段应一并回收"
+        );
+    }
+
+    #[test]
+    fn prune_preserves_merged_result() {
+        // ★ 本轮修复的核心保证：被删的键都会从 L1⊕L2 回落到同一个值，故清理对**当前**行为
+        // 零影响，只影响将来默认值变更能否到达该用户。这条不变量成立，清理才是安全的。
+        let preset = preset_sample();
+        let user = tv(r#"
+[schema]
+active = "wubi86_pinyin"
+
+[schema.mix]
+auto_commit_block_on_pinyin = false
+pinyin_only_overflow = true
+show_source_hint = false
+
+[schema.codetable]
+top_code_commit = true
+
+[keys]
+page_keys = ["pageupdown", "minus_equal"]
+
+[input.punct.custom_mappings]
+"'1" = ["1", "＇"]
+"#);
+        let mut before = preset.clone();
+        merge_value(&mut before, user.clone());
+
+        let mut pruned = user.clone();
+        let removed = prune_redundant(&mut pruned, &preset);
+        assert!(removed > 0, "样本应含冗余键，否则本测试证明不了任何事");
+        let mut after = preset.clone();
+        merge_value(&mut after, pruned);
+
+        assert_eq!(before, after, "清理前后三层合并结果必须逐键相同");
+    }
+
+    #[test]
+    fn prune_is_idempotent() {
+        let preset = preset_sample();
+        let mut user = tv(r#"
+[schema.mix]
+pinyin_only_overflow = true
+show_source_hint = false
+"#);
+        assert_eq!(prune_redundant(&mut user, &preset), 2);
+        assert_eq!(prune_redundant(&mut user, &preset), 0, "二次清理应无事可做");
+    }
+
+    #[test]
+    fn prune_keeps_keys_absent_from_preset() {
+        // 出厂默认里没有的键一律保留：用户自定义标点映射这类**动态键**（键名由用户输入决定，
+        // 不可能出现在 preset 里）若被当成冗余删掉就是丢用户数据。废弃键的清理是另一件事，
+        // 必须走显式名单，绝不能靠「preset 里没有」来推断。
+        let preset = preset_sample();
+        let mut user = tv(r#"
+[input.punct.custom_mappings]
+"'1" = ["1", "＇"]
+"#);
+        assert_eq!(prune_redundant(&mut user, &preset), 0);
+        assert!(get_nested(&user, &["input", "punct", "custom_mappings", "'1"]).is_some());
+    }
+
+    #[test]
+    fn prune_keeps_unregistered_keys_even_when_matching_preset() {
+        // 注册表未登记的键即使与 preset 完全相同也不得删——此处用真实存在过的废弃键
+        // `input.code_commit.*`（已迁到 schema.codetable.*，注册表里查不到）。
+        // 废弃键清理是另一件事，必须走显式名单：靠「等于 preset」去推断会把语义搞反。
+        assert!(
+            !crate::config_schema::is_known_key("input.code_commit.auto_commit_at_full"),
+            "前提：该键确未登记，否则本测试证明不了 registry 这道保险"
+        );
+        let preset = tv(r#"
+[input.code_commit]
+auto_commit_at_full = false
+"#);
+        let mut user = preset.clone();
+        assert_eq!(prune_redundant(&mut user, &preset), 0);
+        assert!(
+            get_nested(&user, &["input", "code_commit", "auto_commit_at_full"]).is_some(),
+            "未登记键必须原样保留"
+        );
+    }
+
+    #[test]
+    fn prune_keeps_map_subpaths() {
+        // `input.punct.custom_mappings` 在注册表里是 Map 类型——**整体**才是一个配置项。
+        // collect_leaf_paths 会把它下钻成 `...custom_mappings."'1"` 这种伪键，删单条是错的语义
+        // （等于悄悄改写用户的标点映射表）。registry 保险必须拦住。
+        assert!(
+            crate::config_schema::is_known_key("input.punct.custom_mappings"),
+            "前提：Map 整体是登记键"
+        );
+        assert!(
+            !crate::config_schema::is_known_key("input.punct.custom_mappings.'1"),
+            "前提：其子路径不是登记键"
+        );
+        let preset = tv(r#"
+[input.punct.custom_mappings]
+"'1" = ["1", "＇"]
+"#);
+        let mut user = preset.clone();
+        assert_eq!(
+            prune_redundant(&mut user, &preset),
+            0,
+            "Map 子路径不得被当叶子删除"
+        );
+        assert!(get_nested(&user, &["input", "punct", "custom_mappings", "'1"]).is_some());
+    }
+
+    #[test]
+    fn remove_nested_reclaims_empty_parents_only() {
+        let mut root = tv(r#"
+[a.b]
+x = 1
+y = 2
+"#);
+        let toml::Value::Table(t) = &mut root else {
+            unreachable!()
+        };
+        assert!(remove_nested(t, &["a", "b", "x"]));
+        assert!(
+            get_nested(&root, &["a", "b", "y"]).is_some(),
+            "兄弟键还在时不得回收父表"
+        );
+        let toml::Value::Table(t) = &mut root else {
+            unreachable!()
+        };
+        assert!(remove_nested(t, &["a", "b", "y"]));
+        assert!(get_nested(&root, &["a"]).is_none(), "父表变空应逐级回收");
+    }
+
+    #[test]
+    fn collect_leaf_paths_treats_arrays_as_leaves() {
+        // 数组整体是一个配置项：下钻进元素会切出无法用 path 表达、也无法与 preset 比对的伪键。
+        let v = tv(r#"
+[keys]
+page_keys = ["a", "b"]
+
+[schema]
+active = "x"
+"#);
+        let mut out = Vec::new();
+        collect_leaf_paths(&v, &mut Vec::new(), &mut out);
+        out.sort();
+        assert_eq!(
+            out,
+            vec![
+                vec!["keys".to_string(), "page_keys".to_string()],
+                vec!["schema".to_string(), "active".to_string()],
+            ]
         );
     }
 

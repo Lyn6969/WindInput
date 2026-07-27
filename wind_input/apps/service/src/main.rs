@@ -8,7 +8,7 @@
 use file_rotate::compression::Compression;
 use file_rotate::{ContentLimit, FileRotate};
 use std::sync::Arc;
-use tracing::{error, info};
+use tracing::{error, info, warn};
 use tracing_subscriber::EnvFilter;
 use tracing_subscriber::fmt::time::ChronoLocal;
 
@@ -243,6 +243,16 @@ fn main() {
     // 下次开机 `probe_user_config` 用它区分「默认用户（永不等）」与「定制用户但漫游
     // 未挂载（要等，别退回系统五笔）」。只在服务启动路径写，不进 load()（见其文档）。
     wind_config::Config::mark_user_config_seen_if_present();
+
+    // D2：清理用户层里与出厂默认（L1⊕L2）取值相同的冗余键（幂等，`Config::prune_user_config`
+    // 自带日志）。这类键是「默认值升级的死区」——写入时与默认一致、看似无害，日后默认改了
+    // 用户却一直停在旧值。set_user_value 已收口不再产生新的，此处清掉存量。
+    //
+    // 必须在 wait_user_config_ready 之后：漫游未挂载时用户层「看起来是空的」，那时清理
+    // 无事可做（返回 0），但也绝不会误删。
+    if let Err(e) = wind_config::Config::prune_user_config() {
+        warn!("Prune user config failed: {e}");
+    }
 
     // 3. 创建 DeferredHandler（启动时返回安全默认值）
     let deferred = DeferredHandler::new();
