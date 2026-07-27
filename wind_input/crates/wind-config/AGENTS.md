@@ -15,7 +15,7 @@
 | `src/config.rs` | `Config` 结构体（七域：schema/input/keys/ui/stats/compat/debug）+ 三层合并加载（`Config::load`）+ 部分合并写入（`Config::set_user_value`，原子写）+ 路径辅助（`user_config_dir`/`local_dir`/`cache_dir`/`data_dir`） |
 | `src/config_schema.rs` | **配置字段注册表 SSOT**：`REGISTRY` 静态数组声明所有叶子键的点分路径与类型（`FieldType`）；`validate` 校验键+值；`leaf_entries` 拍平 TOML 值；测试反向对照守护 struct ↔ registry ↔ data/config.toml 三不漂移 |
 | `src/hotkey.rs` | `Compiler`：从 `Config` 编译 `CompiledHotkeys`（key_down/key_up 热键表，含 tsf_hash/match_hash/action）；VK 常量（`VK_LSHIFT` 等）与修饰位（`MOD_*`）模块内定义；`parse_hotkey` / `select_key_vks` / `select_char_vks` 供上游调用 |
-| `src/variant.rs` | 运行时 dev/release/portable 判断：从 exe 文件名尾缀 `_dev` 判定（不依赖编译 profile）；`pipe_suffix` / `app_dir_name` / `is_portable` 供全仓使用；`WIND_VARIANT` 环境变量仅供开发覆盖 |
+| `src/variant.rs` | 运行时 dev/release/portable 判断：从 exe 文件名尾缀 `_dev` 判定（不依赖编译 profile）；`pipe_suffix` / `app_dir_name` / `is_portable` 供全仓使用；`WIND_VARIANT` 环境变量仅供开发覆盖。另含 `custom_userdata_dir`：读安装器写的 `datadir.conf` |
 | `src/runtime_state.rs` | `RuntimeState`（state.toml）：上次中英模式、工具栏位置（按显示器 key）、候选框 pin 位置；原子写（tmp+rename） |
 | `src/schema.rs` | `Schema` 方案定义（对应 `data/schemas/*.schema.toml`）：`SchemaInfo`/`EngineSpec`/`DictSpec` 等；与 config.toml 无关 |
 | `src/app_compat.rs` | `AppCompat`：按进程名（不区分大小写）匹配兼容规则（compat.toml，系统层+用户层合并），`get_rule` 返回 `Option<&AppCompatRule>` |
@@ -32,6 +32,8 @@
 - **`set_user_value` 是部分合并写**：只改指定路径，保留用户文件其他已有项，用户层维持最小 diff；异步持久化需先 clone Config 再写，避免并发修改（见根 `AGENTS.md`）。
 - **variant.rs 的 dev 判定与编译 profile 解耦**：产物一律叫 `wind_input.exe`；复制改名为 `wind_input_dev.exe` 即成 dev 变体。`is_dev()` 用 `OnceLock` 缓存，进程内不变，禁止在生产环境设 `WIND_VARIANT`。
 - **`RuntimeState` 与 `Config` 分开存储**（state.toml vs config.toml）：用户手动编辑 config.toml 不会覆盖工具栏位置等本机状态；`Config::state_dir()` 与 `local_dir()` 返回同一路径（语义区分）。
+- **`datadir.conf` 只重定向 `user_config_dir()`，`local_dir()` 系不跟随**：安装向导选定的自定义数据目录由安装器写入 `%LOCALAPPDATA%\WindInput[Dev]\datadir.conf`（跨仓约定，写端在 `wind-installer`）。优先级 **便携 > datadir.conf > 默认漫游**。cache/logs/state.toml 刻意留在 `%LOCALAPPDATA%`——与卸载器语义对齐（`cleanup.rs` 的 `user_data_dir()` 读该文件、`local_cache_dir()` 恒定不读），且让 C++ `FileLogger` 的硬编码日志路径无需改动、两份日志仍能按时间对齐。**新增读该配置的路径函数前先确认属于哪一侧**，两侧口径不一致会让卸载删错目录。
+- **改 `user_config_dir()` 的分支必须同步 `probe_user_config()`**：后者是启动期「等漫游挂载」的探测，若只改前者，就会出现「配置已指向自定义目录、探测却仍盯着漫游根」的错配——白等一个完整超时后退回系统预置方案。`tests/datadir_conf.rs` 守护这条接线（该测试必须真调公开 API，纯解析单测证明不了接线）。
 - **`schema.rs` ≠ 配置**：`Schema` 是方案 `.schema.toml` 的定义，由引擎直接加载，不经三层合并，不在 `REGISTRY` 中。
 
 ### Testing Requirements

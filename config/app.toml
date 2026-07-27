@@ -75,9 +75,13 @@ prestart = true
 
 # ── 用户数据目录配置：整段缺省即不写 ─────────────────────────────────────────
 #    首次安装时把向导中选定的数据目录写入 %LOCALAPPDATA%\WindInput\datadir.conf，
-#    供主程序启动时读取；升级时跳过以保留用户既有配置。
+#    供主程序启动时读取（读端在 wind-config/src/variant.rs 的 custom_userdata_dir）。
+#    升级时跳过以保留用户既有配置。
 [datadir]
 conf_file = "datadir.conf"
+# 卸载删除用户数据前的安全判据：datadir.conf 是用户可编辑的明文路径，而下游动作是
+# remove_dir_all + 拷到桌面。目录非空时必须命中其一，否则跳过删除（空目录一律放行）。
+markers = ["config.toml", "compat.toml", "userdata.redb", "wind_setting.toml", "schemas", "themes"]
 
 # ── 界面文案：留空即用中性默认（不含「输入法」「词库」字样）──────────────────
 #    安装器内置默认是领域中性的，输入法专用措辞需在此显式声明

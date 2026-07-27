@@ -1808,6 +1808,9 @@ impl Default for Config {
 pub enum UserConfigProbe {
     /// 便携模式：路径来自 exe 同目录，不依赖 known folder，恒就绪。
     Portable(PathBuf),
+    /// 用户自定义数据目录（安装向导选定，见 `variant::custom_userdata_dir`）：
+    /// 是本机固定盘上的普通目录，不经漫游 known folder，故与便携同属恒就绪一类。
+    CustomDir(PathBuf),
     /// `dirs::config_dir()` 解析失败——漫游 known folder 尚不可用。
     RoamingUnavailable,
     /// 漫游根解析出来了但尚不存在（用户配置文件未挂载完成）。
@@ -1829,7 +1832,10 @@ impl UserConfigProbe {
     /// 是否已到达「再等也不会变」的状态。`ConfigPending` **刻意排除**：它正是
     /// 「本该有、暂时没看到」的可变态，要继续轮询等漫游挂载。
     pub fn is_settled(&self) -> bool {
-        matches!(self, Self::Portable(_) | Self::Ready { .. })
+        matches!(
+            self,
+            Self::Portable(_) | Self::CustomDir(_) | Self::Ready { .. }
+        )
     }
 }
 
@@ -2008,13 +2014,19 @@ impl Config {
 
     /// 用户配置目录（config.toml / userdata.redb / 词频 / shadow 置顶删词 / 用户词库）。
     /// - 便携模式：`<exe目录>/userdata/`
+    /// - 自定义数据目录（安装向导选定，落 `datadir.conf`）：该目录本身
     /// - 正常模式：漫游 `%APPDATA%\WindInput[Dev]`（随用户在多设备间同步）
+    ///
+    /// 三者优先级即上述顺序。注意自定义目录**只影响本函数**——`local_dir()` 系
+    /// （cache / logs / state.toml）不跟随，详见 `variant::custom_userdata_dir`。
     pub fn user_config_dir() -> Option<PathBuf> {
         if crate::variant::is_portable() {
-            crate::variant::portable_userdata_dir()
-        } else {
-            dirs::config_dir().map(|d| d.join(Self::app_dir_name()))
+            return crate::variant::portable_userdata_dir();
         }
+        if let Some(d) = crate::variant::custom_userdata_dir() {
+            return Some(d);
+        }
+        dirs::config_dir().map(|d| d.join(Self::app_dir_name()))
     }
 
     /// 探测用户配置目录当前是否可用。纯查询，无副作用、不重试。
@@ -2029,6 +2041,11 @@ impl Config {
                 Some(d) => UserConfigProbe::Portable(d),
                 None => UserConfigProbe::RoamingUnavailable,
             };
+        }
+        // 自定义目录同样绕开漫游 known folder，恒就绪——若漏了这一支，配置已指向
+        // 自定义目录、探测却仍盯着漫游根，就会出现「等一个根本不用的目录」的错配。
+        if let Some(d) = crate::variant::custom_userdata_dir() {
+            return UserConfigProbe::CustomDir(d);
         }
         let Some(root) = dirs::config_dir() else {
             return UserConfigProbe::RoamingUnavailable;
@@ -2469,6 +2486,9 @@ mod tests {
     fn probe_settled_semantics() {
         let dir = PathBuf::from("x");
         assert!(UserConfigProbe::Portable(dir.clone()).is_settled());
+        // 自定义数据目录是本机固定盘上的普通目录，不存在「等漫游挂载」一说；
+        // 漏判会让每次启动都白等一个完整超时，然后退回系统预置方案。
+        assert!(UserConfigProbe::CustomDir(dir.clone()).is_settled());
         assert!(
             UserConfigProbe::Ready {
                 dir: dir.clone(),
