@@ -19,6 +19,63 @@ pub struct TextMetrics {
     pub height: f32,
 }
 
+/// 扫描 UTF-16 序列，返回私用区（PUA）字符的连续段 `[(起始下标, 码元长度)]`，
+/// 下标/长度均以 **UTF-16 码元** 计，可直接用作 `DWRITE_TEXT_RANGE`。
+///
+/// 三段私用区缺一不可——不同拆字库用的区不同：内置 wubi86 字根在 BMP 私用区
+/// （U+E0E1 等），而 986 等第三方码表的字根在补充私用区 A（U+F00FD 等）。
+/// 早期只判 BMP 一段，导致后者从不切字体、渲染成方框。
+///
+/// - BMP 私用区 `U+E000..=U+F8FF`：单码元，`u16` 值即码位。
+/// - 补充私用区 A/B `U+F0000..=U+10FFFD`：UTF-16 下是代理对。高位代理恰好占满
+///   `0xDB80..=0xDBFF`（`0xDB80..=0xDBBF` → 第 15 平面，`0xDBC0..=0xDBFF` → 第 16
+///   平面），不多不少，故判「高位代理落在该段 + 后随合法低位代理」即可，无需还原码位。
+///
+/// 相邻的 BMP 与补充私用区字符合并进同一段——它们目标字体族相同，合并只减少
+/// `SetFontFamilyName` 调用次数，不改变渲染结果。
+#[cfg_attr(not(windows), allow(dead_code))]
+fn pua_runs(wide: &[u16]) -> Vec<(usize, usize)> {
+    /// 单码元即为私用区码位（BMP PUA）。
+    fn is_bmp_pua(u: u16) -> bool {
+        (0xE000..=0xF8FF).contains(&u)
+    }
+    /// 补充私用区 A/B 的高位代理段。
+    fn is_spua_lead(u: u16) -> bool {
+        (0xDB80..=0xDBFF).contains(&u)
+    }
+    /// 任意低位代理（配对合法性；具体码位无需还原）。
+    fn is_trail(u: u16) -> bool {
+        (0xDC00..=0xDFFF).contains(&u)
+    }
+
+    let mut runs: Vec<(usize, usize)> = Vec::new();
+    let mut start: Option<usize> = None;
+    let mut i = 0usize;
+    while i < wide.len() {
+        // 命中长度：1=BMP 私用区，2=补充私用区代理对，0=非私用区。
+        let step = if is_bmp_pua(wide[i]) {
+            1
+        } else if is_spua_lead(wide[i]) && wide.get(i + 1).is_some_and(|&t| is_trail(t)) {
+            2
+        } else {
+            0
+        };
+        if step == 0 {
+            if let Some(s) = start.take() {
+                runs.push((s, i - s));
+            }
+            i += 1;
+        } else {
+            start.get_or_insert(i);
+            i += step;
+        }
+    }
+    if let Some(s) = start {
+        runs.push((s, wide.len() - s));
+    }
+    runs
+}
+
 #[cfg(windows)]
 pub use imp::TextRenderer;
 
@@ -225,25 +282,17 @@ mod imp {
                     let famw: Vec<u16> = fam.encode_utf16().chain(std::iter::once(0)).collect();
                     let _ = layout.SetFontFamilyName(PCWSTR(famw.as_ptr()), full);
                 }
-                // 拆字字根：对 PUA 码位（U+E000..=U+F8FF，皆 BMP 单码元）的连续段
-                // 切到黑体字根字体集，级联回退渲染字根字符。
+                // 拆字字根：把私用区（BMP PUA + 补充私用区 A/B）的连续段切到字根字体集，
+                // 级联回退渲染字根字符。段划分见 `super::pua_runs`——测量与绘制共用本函数，
+                // 故字根段的字体在两条路径上必然一致（否则宽度按主字体缺字宽算，布局出错）。
                 if let Some(cf) = &self.chaizi {
-                    let mut i = 0usize;
-                    while i < wide.len() {
-                        if (0xE000..=0xF8FF).contains(&wide[i]) {
-                            let start = i;
-                            while i < wide.len() && (0xE000..=0xF8FF).contains(&wide[i]) {
-                                i += 1;
-                            }
-                            let range = DWRITE_TEXT_RANGE {
-                                startPosition: start as u32,
-                                length: (i - start) as u32,
-                            };
-                            let _ = layout.SetFontCollection(&cf.collection, range);
-                            let _ = layout.SetFontFamilyName(PCWSTR(cf.family.as_ptr()), range);
-                        } else {
-                            i += 1;
-                        }
+                    for (start, len) in super::pua_runs(&wide) {
+                        let range = DWRITE_TEXT_RANGE {
+                            startPosition: start as u32,
+                            length: len as u32,
+                        };
+                        let _ = layout.SetFontCollection(&cf.collection, range);
+                        let _ = layout.SetFontFamilyName(PCWSTR(cf.family.as_ptr()), range);
                     }
                 }
                 Ok(layout)
@@ -797,6 +846,75 @@ mod imp {
         ) -> Result<(), String> {
             Ok(())
         }
+    }
+}
+
+// 私用区分段的跨平台测试（`pua_runs` 不依赖 DirectWrite，故不限平台，Windows 本机
+// `cargo test` 也覆盖）。真实数据取自两份拆字库的首行，避免自造码位掩盖区间边界错误。
+#[cfg(test)]
+mod pua_runs_tests {
+    use super::pua_runs;
+
+    fn runs(s: &str) -> Vec<(usize, usize)> {
+        pua_runs(&s.encode_utf16().collect::<Vec<u16>>())
+    }
+
+    /// 内置 wubi86 拆字库："的" → U+E0E1 U+E124 U+E147 U+E13D（BMP 私用区，单码元）。
+    #[test]
+    fn bmp_pua_run_is_detected() {
+        assert_eq!(runs("\u{E0E1}\u{E124}\u{E147}\u{E13D}"), vec![(0, 4)]);
+    }
+
+    /// 986 拆字库："的" → U+F00FD U+F00F7 U+F013C（补充私用区 A，各占 2 码元）。
+    /// 修复前这一段完全不命中，字根落回主字体渲染成方框。
+    #[test]
+    fn spua_a_run_is_detected() {
+        assert_eq!(runs("\u{F00FD}\u{F00F7}\u{F013C}"), vec![(0, 6)]);
+    }
+
+    /// 补充私用区 B（第 16 平面）同样纳入。
+    #[test]
+    fn spua_b_run_is_detected() {
+        assert_eq!(runs("\u{100000}\u{10FFFD}"), vec![(0, 4)]);
+    }
+
+    /// 非私用区的**代理对不得命中**——CJK 扩展 B（U+20000）等生僻字若被误切到字根
+    /// 字体集，反而会变成方框。这是判据不能只看"是不是代理对"的原因。
+    #[test]
+    fn non_pua_supplementary_chars_are_excluded() {
+        assert!(runs("\u{20000}\u{2A6DF}\u{1F600}").is_empty());
+    }
+
+    /// 混排：汉字 + 字根 + 编码，段起止按 UTF-16 码元定位（非字符数）。
+    /// "的" 1 码元 + "：" 1 码元 → 字根段从下标 2 起、占 6 码元。
+    #[test]
+    fn mixed_text_run_offsets_are_utf16_units() {
+        assert_eq!(runs("的：\u{F00FD}\u{F00F7}\u{F013C} rqy"), vec![(2, 6)]);
+    }
+
+    /// 多段：被普通字符隔开的字根分别成段。
+    #[test]
+    fn separate_runs_are_not_merged_across_plain_text() {
+        assert_eq!(runs("\u{E0E1}中\u{F00FD}"), vec![(0, 1), (2, 2)]);
+    }
+
+    /// BMP 与补充私用区相邻时合并为一段（目标字体族相同，合并不改变渲染）。
+    #[test]
+    fn adjacent_bmp_and_supplementary_pua_merge() {
+        assert_eq!(runs("\u{E0E1}\u{F00FD}"), vec![(0, 3)]);
+    }
+
+    /// 孤立高位代理（非法 UTF-16，可能来自截断的外部数据）不得命中、不得越界 panic。
+    #[test]
+    fn lone_lead_surrogate_is_ignored() {
+        assert!(pua_runs(&[0xDB80]).is_empty());
+        assert!(pua_runs(&[0xDB80, 0x4E2D]).is_empty());
+    }
+
+    #[test]
+    fn empty_and_plain_text_yield_no_runs() {
+        assert!(runs("").is_empty());
+        assert!(runs("中文 abc 123").is_empty());
     }
 }
 
