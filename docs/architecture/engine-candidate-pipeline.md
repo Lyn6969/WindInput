@@ -313,7 +313,8 @@ convert(input):
 ```
 
 **① 粗粒度守护 `auto_commit_block_on_pinyin`**：只要整串存在拼音候选就否决码表上屏。
-**默认关**（代码默认与 `data/config.toml` 一致均为 false）——粗粒度一票否决太激进，实际生效的主力是②。
+**默认开**（三处同源：`MixConfig::default()` / `MixGlobal::default()` / `data/config.toml`）。
+它同时是**满码空码清空**的总闸（见下方「空码清空」），关闭 = 拼音一律不干预码表处置。
 
 **② 拼音词拦截 `is_ambiguous_pinyin_word()`**（engine.rs:134-163，`block_commit_on_pinyin_word`
 控制，默认**开**），命中任一即判「用户意图是拼音」：
@@ -336,7 +337,29 @@ convert(input):
 
 配套：**英文守护** `auto_commit_block_on_english`（默认关）——满码上屏时合并结果存在英文候选则否决
 （保护正在输入更长英文词的用户）。
-**空码清空**：仅当主码表请求清空**且无拼音候选**（合法拼音序列留给拼音，不清空，engine.rs:453）。
+**空码清空**（第四条「拼音让路」通路）：主码表请求清空后，再过两道拼音守护——
+`has_pinyin`（此刻已出拼音候选）与 `pinyin_may_continue`（`is_possible_pinyin_sequence`：
+整串是合法音节前缀，或完整音节 + 合法尾部前缀，如 zhon→zhong 的中途态）。
+
+两道**同受 `auto_commit_block_on_pinyin` 支配**，与上三条通路同一个开关：
+
+```rust
+should_clear = ct_should_clear && !(auto_commit_block_on_pinyin && (has_pinyin || pinyin_may_continue))
+```
+
+⚠️ 两道必须一起受控，只放开 `has_pinyin` 等于没放开：`nunl` 这类「完整音节 + 单个声母字母」
+即便词库无候选，`pinyin_may_continue` 仍判「还没打完」（单字母恒是某音节前缀）而独立拦住清空。
+
+**清空还要过第三道门**（协调器 `clear_blocked_by_candidates`，见 §8）——引擎在追加短语之前
+就算好了 `should_clear`，且它只按音节表推测「还有没有后续」，而协调器看得到候选的实际形态：
+
+| 输入 | 拼音候选 | code | consumed | 判定 |
+|---|---|---|---|---|
+| `nunl` | 嫩 | `nun`（比输入**短**） | 3 < 4 | 部分匹配 → 放行清空 |
+| `wanl` | 完了/晚了 | `wanle`（比输入**长**） | 4 = 4 | 前缀补全 → 拦住清空 |
+
+故关闭开关**不牺牲**「还没打完」的中途态：`wanl`/`zhon` 由前缀补全候选兜住，真正被清空的
+只有「候选全是部分匹配」的串。
 
 ### 7.4 超长分支（`convert_overflow()`，engine.rs:265-349）
 
@@ -472,9 +495,9 @@ convert(input):
 | 自动上屏 | 满码唯一精确且无更长后继 | 无 | 无 | 码表意向 + **拼音否决①② + 英文守护 + 存活复核 + 显示首选须码表** | 无 |
 | 顶码 | 超满码顶前 N 码首选，余码续打 | 无 | 无 | 同否决①②后委托码表；`top_code_override_pinyin` 可强制 | 无 |
 | 分段上屏 | 无（consumed_length=0） | consumed_length 前缀消费，余码续转 | 同全拼（映射回双拼键数） | 拼音候选支持；接力强制走 secondary_schema | 无 |
-| 空码行为 | 满码空码清空（可配） | 不清空 | 不清空 | 码表请求清空且**无拼音候选**才清 | — |
+| 空码行为 | 满码空码清空（可配） | 不清空 | 不清空 | 三道门：码表请求清空 → 两道拼音守护（受 `auto_commit_block_on_pinyin` 支配）→ 协调器候选复核（拼音部分匹配不算有效候选） | — |
 | 词频重排 | used-first 永久档位 | 衰减软置前 | 衰减软置前 | 按候选 source 分流两策略 | 归入档位 3 |
-| preedit | 原始码 | 音节 `'` 分隔 | 原始按键按音节分隔 | ≥2 音节用拼音拆分串，否则原始码；高亮跟随可切换 | 原始输入 |
+| preedit | 原始码 | 音节 `'` 分隔 | 原始按键按音节分隔 | `preedit_display`：≥2 音节用拼音拆分串，否则原始码。`preedit_pinyin`（高亮跟随用）判据更宽：**拆分串 ≠ 原串**即给出，覆盖单音节 + 残码（`nun'l`） | 原始输入 |
 
 后处理管线（短语/过滤/词频/shadow/复评，§8）对所有模式统一，由协调器执行。
 
@@ -487,7 +510,7 @@ convert(input):
 
 | 键 | 默认 | 说明 |
 |---|---|---|
-| `schema.mix.auto_commit_block_on_pinyin` | false（代码默认与 config.toml 一致） | 否决① 粗粒度：有拼音候选即否决 |
+| `schema.mix.auto_commit_block_on_pinyin` | true（三处同源） | 否决① 粗粒度：有拼音候选即否决上屏；**兼管满码空码清空的两道守护** |
 | `schema.mix.block_commit_on_pinyin_word` | true | 否决② 拼音词拦截（实际主力） |
 | `schema.mix.pinyin_word_min_weight` | 0 | 0=仅结构判据（≥2 汉字消费整串） |
 | `schema.mix.top_code_override_pinyin` | false | 顶码优先，无视拼音否决 |

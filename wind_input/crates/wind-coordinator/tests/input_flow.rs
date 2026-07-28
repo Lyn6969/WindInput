@@ -5216,3 +5216,84 @@ fn prefix_group_marker_defers_in_codetable_too() {
     }
     assert_group_marker_defers(&coord, "wubi86");
 }
+
+/// 真机回归（`nunl`）：混输下满 4 码，五笔无候选，拼音只有**部分匹配**「嫩」——
+/// `nun` 是标准音节表中的稀有音节（为双拼转换真值补入），故 `nunl` 被切成
+/// 「完成音节 nun + 残码 l」，候选只消费 3 码。用户诉求：这不算匹配，满码应清空。
+///
+/// **这是三道门串联的唯一端到端验证**，缺任何一道都不会清空：
+/// ① 码表 `clear_on_empty_max`（满码 + 无候选 + 无更长后继）
+/// ② 混输 `should_clear`（两道拼音守护，受 `auto_commit_block_on_pinyin` 支配）
+/// ③ 协调器 `clear_blocked_by_candidates`（拼音部分匹配不算有效候选）
+#[test]
+fn test_mixed_full_code_clears_when_only_partial_pinyin() {
+    if !has_schemas() {
+        return;
+    }
+    let mut cfg = config_mixed();
+    cfg.schema.codetable.clear_on_empty_max = true;
+    cfg.schema.mix.auto_commit_block_on_pinyin = false;
+    let coord = Coordinator::new_headless(cfg, Some(&data_dir()));
+
+    // 前置：打到 nun（3 键）时拼音候选「嫩」确实存在——否则后面测的根本不是本场景
+    // （多道闸门串联时，「无候选」会让测试静默退化成从不执行被测分支的假绿）。
+    // 必须查**全部**候选而非当前页：nun 的首页被五笔前缀词（习惯/憧憬…）占满，
+    // 「嫩」排在第 8 位、落到第二页去了。
+    for c in "nun".chars() {
+        press_letter(&coord, c);
+    }
+    let all = coord.debug_all_candidate_texts();
+    assert!(
+        all.iter().any(|t| t == "嫩"),
+        "前置：nun 应出拼音候选「嫩」（41448 大字表的异读注音），实际: {:?}",
+        &all[..all.len().min(10)]
+    );
+
+    // 第 4 键 l：满码，五笔无候选，拼音只剩部分匹配（嫩/嫰/黁，code 均为 nun、消费 3 码）→ 清空。
+    // 注意此刻候选列表**非空**（3 条），旧判据 `state.candidates.is_empty()` 正是在这里拦下清空的。
+    match press_letter(&coord, 'l') {
+        KeyAction::ClearComposition => {}
+        other => panic!(
+            "满 4 码仅剩拼音部分匹配时应清空缓冲，实际: {:?}，候选: {:?}",
+            other,
+            coord.debug_all_candidate_texts()
+        ),
+    }
+}
+
+/// 反向锁，与上一个测试构成**单一变量对照**：同样满 4 码、同样关掉守护开关、同样是
+/// 「完整音节 + 单个声母字母」的结构（`wanl` vs `nunl`），唯一差别是拼音候选的类型——
+///
+/// | 输入 | 候选 | code | consumed | 判定 |
+/// |---|---|---|---|---|
+/// | `nunl` | 嫩 | `nun`（比输入**短**） | 3 < 4 | 部分匹配 → 清空 |
+/// | `wanl` | 完了/晚了 | `wanle`（比输入**长**） | 4 = 4 | 前缀补全 → 拦住 |
+///
+/// 这一条锁住的正是「拼音还没打完」的中途态保护：前缀补全候选消费整串，天然拦下清空，
+/// 用户接着打 `wanle` 不会被吞。**关掉守护开关并不会牺牲这类中途态**——真正被清空的只有
+/// 「候选全是部分匹配」的串，也就是确实打岔了的那些。
+#[test]
+fn test_mixed_full_code_keeps_prefix_completion_candidates() {
+    if !has_schemas() {
+        return;
+    }
+    let mut cfg = config_mixed();
+    cfg.schema.codetable.clear_on_empty_max = true;
+    cfg.schema.mix.auto_commit_block_on_pinyin = false;
+    let coord = Coordinator::new_headless(cfg, Some(&data_dir()));
+
+    let mut last = None;
+    for c in "wanl".chars() {
+        last = Some(press_letter(&coord, c));
+    }
+    assert!(
+        !matches!(last, Some(KeyAction::ClearComposition)),
+        "wanl 有前缀补全候选（wanle→完了），不得清空"
+    );
+    let all = coord.debug_all_candidate_texts();
+    assert!(
+        all.iter().any(|t| t == "完了" || t == "晚了"),
+        "应保留消费整串的前缀补全候选，实际: {:?}",
+        &all[..all.len().min(10)]
+    );
+}

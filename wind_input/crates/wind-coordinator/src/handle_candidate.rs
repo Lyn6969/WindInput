@@ -61,6 +61,34 @@ fn candidate_display_order(
         .then(a.consumed_length.cmp(&b.consumed_length).reverse())
 }
 
+/// 满码空码清空的**最终复核**：候选列表里是否存在「拦得住清空」的候选。
+///
+/// 清空要穿过三道门，缺一不可：
+/// 1. 码表 `clear_on_empty_max`（`CodeTableEngine`：满码 + 无候选 + 无更长后继）；
+/// 2. 混输 `should_clear`（`MixedEngine`：两道拼音守护，受 `auto_commit_block_on_pinyin` 支配）；
+/// 3. **本复核** —— 引擎在追加短语**之前**就算好了 `should_clear`，看不见协调器随后并入的短语
+///    候选（`zzbd` 这类码表无字但短语命中），故须以最终列表复查。
+///
+/// 判据**不是**「列表非空」：**拼音的部分匹配不算匹配**。`nunl` 的「嫩」只解释了前 3 码 `nun`
+/// （`consumed_length=3 < 4`），拿它当「有候选」等于让一个没解释完输入的候选替整串挡下清空，
+/// 而用户看到的正是「满 4 码没打出东西、缓冲还赖着」。消费整串的拼音候选（`nuan`→「暖」，
+/// `consumed_length=4`）是货真价实的匹配，照常拦住清空——否则关掉守护开关的用户就再也打不出
+/// 那些码表无字、只有拼音出得来的字。
+///
+/// 曾经写作 `state.candidates.is_empty()`：那让第 2 道门的裁决被本道原样覆盖——引擎那句
+/// 「开关关了就别管拼音」白说，因为拼音候选照样留在列表里把清空挡下（真机 `nunl` 不清空的
+/// 直接原因）。同一语义分散在三处且无编译期强制同步，改任一道都要回头核另外两道。
+///
+/// `consumed_length == 0` = 引擎未标注（码表候选恒为 0）→ 视为整串匹配，与
+/// `apply_freq_rerank` 的 `consumes_all` 同一约定。
+fn clear_blocked_by_candidates(candidates: &[Candidate], input_len: usize) -> bool {
+    candidates.iter().any(|c| {
+        c.source != CandidateSource::Pinyin
+            || c.consumed_length == 0
+            || c.consumed_length >= input_len
+    })
+}
+
 /// 自动上屏最短码长的归一（纯函数）：配置 0 = 跟随全码长。
 ///
 /// 复刻引擎侧 `CodeTableEngine::new` 的同名归一——那份藏在引擎构造函数里、只作用于其私有
@@ -590,10 +618,16 @@ impl Coordinator {
                     _ => InputOutcome::Normal,
                 }
             }
-            // 满码空码清空：`should_clear` 由码表引擎在追加短语**之前**计算（仅看码表候选）。
-            // 协调器随后可能追加短语候选（zzbd 等短语专属码：码表无字但短语命中），故此处须以
-            // 叠加短语后的最终候选复查——`state.candidates` 非空即不清，避免误清短语列表。
-            None if should_clear && state.candidates.is_empty() => InputOutcome::Clear,
+            // 满码空码清空：`should_clear` 由引擎在追加短语**之前**计算，故此处须以叠加短语后的
+            // 最终候选复查（判据见 `clear_blocked_by_candidates`——不是简单的「列表非空」）。
+            None if should_clear
+                && !clear_blocked_by_candidates(
+                    &state.candidates,
+                    state.input_buffer.chars().count(),
+                ) =>
+            {
+                InputOutcome::Clear
+            }
             None => InputOutcome::Normal,
         };
         // 短语自动上屏：码表未给出上屏意向（Normal）时，补齐短语侧——引擎判据看不到短语，
@@ -2338,5 +2372,95 @@ mod finalize_candidates_tests {
                  低匹配层短语垫底（ignore_weight={ignore_weight}）"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod clear_recheck_tests {
+    //! 满码空码清空的**第三道门**（`clear_blocked_by_candidates`）。
+    //!
+    //! 前两道在引擎内（码表 `clear_on_empty_max` → 混输 `should_clear` 的拼音守护），
+    //! 见 `wind-engine` 的 `mixed_trailing_partial_pinyin` 与 `mixed::engine::tests`。
+    //! 本模块只锁这一道：哪些候选**拦得住**清空。
+    use super::*;
+
+    fn pinyin(text: &str, consumed: usize) -> Candidate {
+        Candidate {
+            text: text.into(),
+            source: CandidateSource::Pinyin,
+            consumed_length: consumed,
+            ..Default::default()
+        }
+    }
+
+    fn codetable(text: &str) -> Candidate {
+        Candidate {
+            text: text.into(),
+            source: CandidateSource::CodeTable,
+            // 码表候选恒不标注消费长度（选词即消费整串）。
+            consumed_length: 0,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn empty_list_never_blocks() {
+        assert!(!clear_blocked_by_candidates(&[], 4), "空列表不得拦清空");
+    }
+
+    /// 真机现象 `nunl`：拼音候选「嫩」只解释了前 3 码 `nun`，没解释完整串 → 不算匹配。
+    /// 这是修复前 `state.candidates.is_empty()` 那版的直接失效点。
+    #[test]
+    fn partial_pinyin_candidate_does_not_block() {
+        let cands = vec![pinyin("嫩", 3)];
+        assert!(
+            !clear_blocked_by_candidates(&cands, 4),
+            "拼音部分匹配（consumed 3 < 4）不得替整串挡下清空"
+        );
+    }
+
+    /// 反向锁：消费整串的拼音候选（`nuan`→「暖」，码表无字）是货真价实的匹配，必须拦住——
+    /// 否则关掉守护开关的用户再也打不出那些只有拼音出得来的字。
+    #[test]
+    fn full_pinyin_candidate_blocks() {
+        let cands = vec![pinyin("暖", 4)];
+        assert!(
+            clear_blocked_by_candidates(&cands, 4),
+            "拼音消费整串 → 有效匹配，必须拦住清空"
+        );
+    }
+
+    /// 非拼音来源（短语 / 码表 / 英文）一律拦住：引擎算 `should_clear` 时看不见协调器
+    /// 随后追加的短语，本道门存在的原始理由就是它。
+    #[test]
+    fn non_pinyin_candidate_always_blocks() {
+        assert!(
+            clear_blocked_by_candidates(&[codetable("工")], 4),
+            "码表候选（consumed_length=0 未标注）须视为整串匹配并拦住清空"
+        );
+        let phrase = Candidate {
+            text: "地址".into(),
+            is_phrase: true,
+            ..Default::default()
+        };
+        assert!(
+            clear_blocked_by_candidates(&[phrase], 4),
+            "短语候选必须拦住清空（zzbd 等码表无字但短语命中）"
+        );
+    }
+
+    /// 混合列表：只要有**一条**有效候选就拦住，部分匹配的拼音不参与计数。
+    #[test]
+    fn mixed_list_blocks_only_on_effective_candidate() {
+        let only_partial = vec![pinyin("嫩", 3), pinyin("女", 2)];
+        assert!(
+            !clear_blocked_by_candidates(&only_partial, 4),
+            "全是拼音部分匹配 → 不拦"
+        );
+        let with_full = vec![pinyin("嫩", 3), pinyin("暖", 4)];
+        assert!(
+            clear_blocked_by_candidates(&with_full, 4),
+            "混有一条消费整串的拼音候选 → 拦住"
+        );
     }
 }

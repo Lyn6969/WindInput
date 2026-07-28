@@ -128,6 +128,10 @@ top_code_override_pinyin = false
 # 不看拼音成不成词）。与下方细粒度的 block_commit_on_pinyin_word 叠加，任一命中即否决。
 # 注意它同时管顶码上屏，而 schema.codetable.top_code_commit 出厂即开；
 # top_code_override_pinyin 可无视本否决强制倒向码表。
+# 它还是**满码空码清空**（schema.codetable.clear_on_empty_max）的总闸：开着时「已有拼音候选」
+# 或「拼音还没打完」都会拦下清空；关掉则拼音不再干预，满码只剩「部分匹配」的拼音候选时即清空
+# （如 nunl：候选「嫩」只解释了前 3 码 nun）。仍在打的词不受影响——wanl 有前缀补全候选
+# （wanle→完了，消费整串）照常拦住清空。
 auto_commit_block_on_pinyin = true
 # 满码上屏遇英文候选则否决（保护正在输入英文词的用户；仅 enable_english 开时有意义）。
 auto_commit_block_on_english = false

@@ -71,10 +71,13 @@ pub struct MixedEngine {
     min_pinyin_length: usize,
     /// 码表精确匹配提权
     codetable_weight_boost: i32,
-    /// 全码自动上屏**与顶码上屏**时，若存在拼音候选则否决（保护拼音用户，对齐 Go
-    /// AutoCommitBlockOnPinyin）。**默认开**（三处同源：`MixConfig::default()` /
+    /// 全码自动上屏 / 顶码上屏 / **满码空码清空**时，若存在拼音候选则否决（保护拼音用户，
+    /// 对齐 Go AutoCommitBlockOnPinyin）。**默认开**（三处同源：`MixConfig::default()` /
     /// `MixGlobal::default()` / `data/config.toml`）。粗粒度：整串只要查得出拼音候选就让路，
     /// 不看拼音成不成词；细粒度拦截另由 `block_commit_on_pinyin_word`（亦默认开）承担，两者叠加。
+    ///
+    /// 清空那条通路（`convert` 的 `should_clear`）除「有拼音候选」外还受 `pinyin_may_continue`
+    /// （拼音还没打完）支配，二者同归本开关——关闭即「拼音一律不干预码表处置」。
     auto_commit_block_on_pinyin: bool,
     /// 输入超过码表最大码长时仅查拼音（主流混输行为，对齐 Go PinyinOnlyOverflow）。
     /// false 时走「码表前 N 码 + 拼音完整输入」混合 overflow。
@@ -243,13 +246,33 @@ impl MixedEngine {
         codetable
     }
 
-    /// 拼音音节拆分显示（≥2 完成音节且有 preedit 时采用，供组合区分隔显示）。
+    /// 组合区**默认**形态（`preedit_display`）：≥2 完成音节且有 preedit 时才用拼音拆分串。
+    /// 单音节不拆——纯五笔码更不该被拆（cang 显示 cang，不是 cang）。
     fn pinyin_preedit_of(py: &ConvertResult) -> Option<String> {
         if py.completed_syllables.len() >= 2 && !py.preedit_display.is_empty() {
             Some(py.preedit_display.clone())
         } else {
             None
         }
+    }
+
+    /// 拼音拆分形态（`preedit_pinyin` → 协调器 `preedit_split_body`），供**高亮跟随**取用：
+    /// 高亮拼音候选时显示它，高亮码表候选时显示原始码（`effective_preedit_body`）。
+    ///
+    /// 判据是「**拆分串与原始输入不同**」，而非 `pinyin_preedit_of` 的「≥2 完成音节」。
+    /// 后者是「默认显示什么」的保守取舍，套到本字段上会漏掉**单音节 + 尾部残码**：
+    /// `nunl` = 完成音节 `nun`（稀有音节，见 `syllable.rs` 末尾）+ 残码 `l`，拼音候选「嫩」
+    /// 只消费 3 个字符，而编码栏却显示整串 `nunl` —— 候选按 `nun|l` 算、显示按整串算，
+    /// 用户看不出引擎已把 `l` 划到音节外，空格上屏残留一个 `l` 便显得无由来。
+    ///
+    /// 拆分串 == 原始输入时返回 None（`nun`、纯五笔码 `aaaa` 的 `a'a'a'a` 除外——那确实不同，
+    /// 但它只在高亮到拼音候选时才显示，那时拆分正是该候选的真实解读）。空串同样返回 None：
+    /// 空 = 「无拆分形态」，协调器据此恒用原始码。
+    fn pinyin_split_of(py: &ConvertResult, input: &str) -> Option<String> {
+        if py.preedit_display.is_empty() || py.preedit_display == input {
+            return None;
+        }
+        Some(py.preedit_display.clone())
     }
 
     /// 来源标记（对齐 Go addSourceHints）：给拼音候选 comment 加「拼」前缀，助用户区分混输来源。
@@ -309,6 +332,7 @@ impl MixedEngine {
         if self.pinyin_only_overflow {
             let py = sec.convert(input, max_candidates).unwrap_or_default();
             let pinyin_preedit = Self::pinyin_preedit_of(&py);
+            let pinyin_split = Self::pinyin_split_of(&py, input);
             let mut pinyin = py.candidates;
             // 英文候选（enable_english 开时）：独立加权档，与拼音/码表统一混入（对齐 Go 各路径处理英文）。
             let english = self.english_candidates(input, max_candidates);
@@ -336,7 +360,7 @@ impl MixedEngine {
             let is_empty = merged.is_empty();
             ConvertResult {
                 candidates: merged,
-                preedit_pinyin: pinyin_preedit.clone().unwrap_or_default(),
+                preedit_pinyin: pinyin_split.unwrap_or_default(),
                 preedit_display: pinyin_preedit.unwrap_or_else(|| input.to_string()),
                 is_empty,
                 ..Default::default()
@@ -370,6 +394,7 @@ impl MixedEngine {
             codetable.extend(self.english_candidates(input, max_candidates));
             let py = sec.convert(input, max_candidates).unwrap_or_default();
             let pinyin_preedit = Self::pinyin_preedit_of(&py);
+            let pinyin_split = Self::pinyin_split_of(&py, input);
             let mut pinyin = py.candidates;
             Self::normalize_pinyin(&mut pinyin);
             let mut merged = Self::merge_sort_dedup(codetable, pinyin, max_candidates);
@@ -379,7 +404,7 @@ impl MixedEngine {
             let is_empty = merged.is_empty();
             ConvertResult {
                 candidates: merged,
-                preedit_pinyin: pinyin_preedit.clone().unwrap_or_default(),
+                preedit_pinyin: pinyin_split.unwrap_or_default(),
                 preedit_display: pinyin_preedit.unwrap_or_else(|| input.to_string()),
                 is_empty,
                 ..Default::default()
@@ -441,12 +466,13 @@ impl Engine for MixedEngine {
         // 多音节拼音的组合区分隔显示（如 "ni hao"）：仅当拼音解析出 ≥2 完成音节时采用，
         // 否则保持原始码（单音节如 "cang" 无需分隔，纯五笔码更不应被拆）。
         let mut pinyin_preedit: Option<String> = None;
+        // 高亮跟随用的拆分形态：判据比上面宽（见 `pinyin_split_of`），单音节 + 残码也提供。
+        let mut pinyin_split: Option<String> = None;
         if input_len >= self.min_pinyin_length {
             if let Some(sec) = &self.secondary {
                 if let Ok(py) = sec.convert(input, max_candidates) {
-                    if py.completed_syllables.len() >= 2 && !py.preedit_display.is_empty() {
-                        pinyin_preedit = Some(py.preedit_display.clone());
-                    }
+                    pinyin_preedit = Self::pinyin_preedit_of(&py);
+                    pinyin_split = Self::pinyin_split_of(&py, input);
                     pinyin = py.candidates;
                     for c in &mut pinyin {
                         c.weight /= PINYIN_TIER_SCALE;
@@ -496,20 +522,39 @@ impl Engine for MixedEngine {
             (false, String::new())
         };
 
-        // 满码空码清空：主码表请求清空 + 拼音侧既无候选、也无后续可能。
-        // - `!has_pinyin`：拼音此刻已出候选 → 留给拼音（粗粒度，且合并后非空，协调器亦会复核）；
-        // - `!pinyin_may_continue`：拼音**还没打完** → 保护中途态。这一项才是无候选时的关键守护：
+        // 满码空码清空：主码表请求清空 + 拼音守护未拦截。
+        //
+        // 两道守护，**同受 `auto_commit_block_on_pinyin` 支配**（这是第四条「拼音让路」通路，
+        // 与 `convert` 满码上屏 / `recheck_auto_commit` 显示态复评 / `handle_top_code` 顶码同源）：
+        // - `has_pinyin`：拼音此刻已出候选 → 留给拼音（粗粒度，且合并后非空，协调器亦会复核）；
+        // - `pinyin_may_continue`：拼音**还没打完** → 保护中途态。这一项才是无候选时的关键守护：
         //   如 zhon（码表满码无候选无后继、拼音此刻也无候选）合并结果为空，协调器的
         //   `state.candidates.is_empty()` 复核挡不住，若不看后续可能性就会把用户正在输入的
-        //   zhong 吞掉。经 `&&` 短路，仅在码表确有清空意向时才查音节表。
-        let should_clear = ct_should_clear && !has_pinyin && !self.pinyin_may_continue(input);
+        //   zhong 吞掉。经 `&&` 短路，仅在码表确有清空意向且守护开时才查音节表。
+        //
+        // ⚠️ 两道**必须一起**受开关支配，只放开 `has_pinyin` 等于没放开：`nunl` 这类
+        // 「完整音节 + 单个声母字母」串即便词库里一条候选都没有，`pinyin_may_continue` 仍判
+        // 「还没打完」（单字母恒是某音节前缀）而独立拦住清空。见
+        // `clear_still_vetoed_even_without_the_nun_entry`。
+        //
+        // 关闭该开关**不会**牺牲「拼音还没打完」的中途态——那由协调器的第三道门
+        // （`clear_blocked_by_candidates`）按候选实际形态兜住，比本处的音节表推测精确得多：
+        // 真实词库下 `wanl` 出的是前缀补全候选（code=`wanle`，消费整串）→ 拦住清空，
+        // 用户接着打 `wanle` 不会被吞；`zhon`(→zhong 系列) 同理。真正会被清空的只有
+        // 「候选全是部分匹配」的串（`nunl` 的「嫩」只解释了 `nun`），即确实打岔了的那些。
+        // 实测见 `input_flow.rs` 的 `..._clears_when_only_partial_pinyin` /
+        // `..._keeps_prefix_completion_candidates` 单一变量对照。
+        let pinyin_guards_clear =
+            self.auto_commit_block_on_pinyin && (has_pinyin || self.pinyin_may_continue(input));
+        let should_clear = ct_should_clear && !pinyin_guards_clear;
 
         let is_empty = merged.is_empty();
         Ok(ConvertResult {
             candidates: merged,
             // 组合区：多音节拼音用音节分隔（ni'hao），否则原始码（五笔为主，简明）。
-            // 拼音拆分形态单独留存，供协调器「按高亮候选类型」选择显示原始码 / 拆分串。
-            preedit_pinyin: pinyin_preedit.clone().unwrap_or_default(),
+            // 拼音拆分形态单独留存，供协调器「按高亮候选类型」选择显示原始码 / 拆分串——
+            // 它的判据比 preedit_display 宽（单音节 + 残码也给），见 `pinyin_split_of`。
+            preedit_pinyin: pinyin_split.unwrap_or_default(),
             preedit_display: pinyin_preedit.unwrap_or_else(|| input.to_string()),
             is_empty,
             should_commit,
@@ -810,6 +855,68 @@ mod tests {
         assert!(
             !r.should_clear,
             "拼音仍可能有后续时不得清空，否则吞掉中途输入"
+        );
+    }
+
+    /// 开关关 → 拼音「还没打完」不再拦清空。用户明确关掉「有拼音候选时否决上屏」即表态
+    /// 不要拼音干预，此时满码无候选就该清空（真机诉求：nunl 打满 4 码不清空）。
+    #[test]
+    fn clear_fires_when_pinyin_guard_disabled() {
+        let e = MixedEngine::new(
+            ct_engine_clear(&[("aaaa", "工", 100)]),
+            Some(Box::new(FakePinyinPrefix { may_continue: true })),
+            None,
+            MixConfig {
+                auto_commit_block_on_pinyin: false,
+                ..Default::default()
+            },
+        );
+        let r = e.convert("zhon", 50).unwrap();
+        assert!(
+            r.should_clear,
+            "① 关时拼音后续可能性不得再拦清空（用户已表态不要拼音干预）"
+        );
+    }
+
+    /// 开关关 + 拼音**确有候选** → 同样清空。锁住「两道守护一起受开关支配」，
+    /// 只放开其中一道等于没放开（nunl 即便无候选也会被 may_continue 拦住）。
+    #[test]
+    fn clear_fires_when_guard_disabled_even_with_pinyin_candidates() {
+        let e = MixedEngine::new(
+            ct_engine_clear(&[("aaaa", "工", 100)]),
+            Some(Box::new(FakePinyin {
+                word: "嫩",
+                syllables: 1,
+            })),
+            None,
+            MixConfig {
+                auto_commit_block_on_pinyin: false,
+                ..Default::default()
+            },
+        );
+        let r = e.convert("nunl", 50).unwrap();
+        assert!(
+            r.candidates.iter().any(|c| c.text == "嫩"),
+            "前置：拼音此刻确有候选"
+        );
+        assert!(r.should_clear, "① 关时有拼音候选也不得拦清空");
+    }
+
+    /// 反向锁：开关**开**（出厂默认）时两道守护照常拦住，勿把上面两例误改成无条件清空。
+    #[test]
+    fn clear_still_vetoed_when_guard_enabled() {
+        let e = MixedEngine::new(
+            ct_engine_clear(&[("aaaa", "工", 100)]),
+            Some(Box::new(FakePinyinPrefix { may_continue: true })),
+            None,
+            MixConfig {
+                auto_commit_block_on_pinyin: true,
+                ..Default::default()
+            },
+        );
+        assert!(
+            !e.convert("zhon", 50).unwrap().should_clear,
+            "① 开时中途态必须守住（zhon→zhong 不得被吞）"
         );
     }
 

@@ -23,7 +23,9 @@ pub struct ConvertResult {
     pub preedit_display: String,
     /// 拼音音节拆分形态（供「混输高亮跟随」：高亮拼音候选时显示此拆分串，高亮码表/五笔
     /// 候选时显示原始码）。拼音引擎 = preedit_display；混输引擎 = 拼音子引擎的音节拆分
-    /// （≥2 音节时，否则空）；码表/无拼音引擎 = 空串（恒原始码）。
+    /// （**拆分串与原始输入不同时**给出，含单音节 + 尾部残码如 `nun'l`）；码表/无拼音引擎 =
+    /// 空串（恒原始码）。判据与 `preedit_display` 的「≥2 完成音节」刻意不同，见
+    /// `MixedEngine::pinyin_split_of`。
     pub preedit_pinyin: String,
     /// 已完成音节（拼音 UI 高亮用）
     pub completed_syllables: Vec<String>,

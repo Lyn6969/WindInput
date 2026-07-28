@@ -505,6 +505,10 @@ pub struct MixGlobal {
     /// 二者任一命中即否决（见 `pinyin_vetoes_commit`）。
     /// 注意作用面覆盖顶码上屏，而 `schema.codetable.top_code_commit` 出厂即开——
     /// 混输方案下改动本项会直接改变顶码行为；`top_code_override_pinyin` 可无视本否决。
+    ///
+    /// 它还兼管**满码空码清空**（`schema.codetable.clear_on_empty_max`）的两道拼音守护：
+    /// 「已有拼音候选」与「拼音还没打完」（`is_possible_pinyin_sequence`，如 zhon→zhong）。
+    /// 关闭本项 = 拼音一律不干预码表处置，满码无匹配即清空/上屏。
     #[serde(default = "default_true")]
     pub auto_commit_block_on_pinyin: bool,
     /// 满码上屏遇英文候选则否决（保护正在输入英文词的用户；仅 enable_english 开时有意义）。

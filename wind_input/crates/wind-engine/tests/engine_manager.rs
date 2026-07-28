@@ -8,7 +8,11 @@ use wind_config::Config;
 use wind_engine::EngineManager;
 
 fn data_dir() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../build_dev/data")
+    // 三级：crates/wind-engine → crates → wind_input → 仓库根（build_dev 在仓库根）。
+    // 曾误写成两级，解析到 wind_input/build_dev/data —— 该目录不存在，于是 schema_exists()
+    // 判假、**本文件所有依赖真实词库的测试静默走「跳过」分支通过**。判据是耗时 0.00s。
+    // 同款坑见 wind-coordinator/tests/input_flow.rs 的同名函数（那边早已修正）。
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../../build_dev/data")
 }
 
 fn make_config(schemas: &[&str]) -> Config {
