@@ -125,12 +125,20 @@ impl Coordinator {
         wind_punct::participates(&self.rt().config.input, cn)
     }
 
-    /// 计算 `ch` 当前会产生的「参与集合内的中文标点串」用于武装；不参与返回 None。
-    /// 对齐 Go `smartSymbolArmStr`：仅中文标点模式 + 非数字后智能 + 在参与集合内。
+    /// 计算 `ch` 本次按下会进入的武装态：`Some((press1 实际上屏串, reverse))`；不参与返回 None。
+    /// 对齐 Go `smartSymbolArmStr`（Go 版只有正向）：仅中文标点模式 + 在参与集合内。
     ///
     /// **判据是「实际会上屏的产物」，含自定义映射的产物**（用户拍板，不给自定义键开后门）：
     /// 把 `"2` 配成 `￥` 而 `￥` 在 `symbol.smart_chars` 里 → 按第二次引号照常进入 `￥` 预览态、
     /// 再按一次换英文。不想要就把该符号从 `smart_chars` 移除，纯配置解决。
+    ///
+    /// **数字后智能标点走反向**（`reverse=true`）：`3.` 这类场景 press1 照旧出英文 `.`（数字后
+    /// 语义不变），但**不再是终点**——时限内再按一次换回中文 `。`。此前这里直接 `return None`
+    /// 拒绝武装，于是数字后想打中文标点只能去关掉「数字后智能」总开关，粒度粗到没法用。
+    ///
+    /// **参与集合恒按中文产物判定**：`symbol.smart_chars` 存的是中文标点（`。，？！…`），反向时
+    /// 上屏的虽是英文形，参与与否仍问它的中文形——否则用户得再维护一份英文列表，且同一个键在
+    /// 两个方向上会给出不一致的答案。
     ///
     /// 另注意三者的优先级：**智能符号（短路） > 自定义映射（定产物） > 自动配对（按产物补右符）**。
     /// 武装并 `HoldComposition` 会直接 return，配对逻辑当次完全不执行——排查「配对忽然不生效」
@@ -140,26 +148,32 @@ impl Coordinator {
         state: &State,
         ch: char,
         prev_char: u16,
-    ) -> Option<String> {
+    ) -> Option<(String, bool)> {
         if !state.chinese_punct {
             return None;
         }
-        if self.is_smart_punct_after_digit(ch, prev_char) {
-            return None;
-        }
+        let reverse = self.is_smart_punct_after_digit(ch, prev_char);
         let cn = self.compute_punct_str_pure(state, ch, true)?;
         if !self.smart_symbol_participates(&cn) {
             return None;
         }
+        // press1 实际上屏串：反向取英文产物——与普通标点流程一致（`convert_punct` 对数字后智能
+        // 同样落英文列），两条路必须产出同一个串，否则 press2 的删除数就对不上光标前的内容。
+        let out = if reverse {
+            self.compute_punct_str_pure(state, ch, false)?
+        } else {
+            cn
+        };
         // 与自动配对互斥：被配对的符号（单字符且在配对表）不武装智能符号。否则 press1 插入配对
         // 并回退光标至中间，press2 时 prevChar 恰为配对左符号 → 误删左符号改英文、留下中文右符号。
-        if cn.chars().count() == 1 {
-            let c0 = cn.chars().next().unwrap();
+        // 判据用**实际上屏串**而非中文串：反向时插进文档的是英文形，配对与否得问它。
+        if out.chars().count() == 1 {
+            let c0 = out.chars().next().unwrap();
             if self.is_auto_pair_char(state, c0) {
                 return None;
             }
         }
-        Some(cn)
+        Some((out, reverse))
     }
 
     /// 智能符号替换判定（在标点分支入口调用）。对齐 Go `trySmartSymbolReplace`：
@@ -178,105 +192,17 @@ impl Coordinator {
         let timeout_ms = self.smart_symbol_timeout().as_millis() as u32;
         let mut arm = self.smart_symbol.lock().unwrap_or_else(|e| e.into_inner());
 
-        // ── press2 判定 ──────────────────────────────────────────────────────────
-        if arm.armed
-            && ch == arm.key
-            && state.chinese_punct
-            && arm
-                .at
-                .map(|t| t.elapsed() < self.smart_symbol_timeout())
-                .unwrap_or(false)
-        {
-            match method {
-                SmartMethod::HoldComposition => {
-                    if arm.held_text.is_some() {
-                        // 正常 hold 路径：press1 时无活跃编码，组合态内无需 prev_char 验证，直接提交英文。
-                        if let Some(rep) = self.compute_punct_str_pure(state, ch, false) {
-                            arm.armed = false;
-                            arm.held_text = None;
-                            if ch == '\'' || ch == '"' {
-                                self.punct
-                                    .lock()
-                                    .unwrap_or_else(|e| e.into_inner())
-                                    .revert_last_quote(ch);
-                            }
-                            debug!(
-                                "SmartSymbol(HoldComposition): press2, commit english: {}",
-                                rep
-                            );
-                            // 必须是 CommitReplacingHeld 而非 InsertText：held 的中文符号此刻
-                            // 正显示在 C++ 的组合态里，press2 要**覆盖**它。普通 InsertText 在
-                            // hold 活跃时是追加语义（held 并入前缀一起上屏），会打出「。.」。
-                            return Some(KeyAction::CommitReplacingHeld {
-                                text: rep,
-                                chinese_mode: state.chinese_mode,
-                            });
-                        }
-                    } else {
-                        // press1 时有活跃编码，中文标点已作文本顶屏提交，非组合态 → 降级走
-                        // DeleteReplace 路径：检查 prev_char 再 ReplaceBackward。
-                        // prev_char==0 视为"宿主读不回文档"（微信/Windows Terminal 等 Qt/
-                        // ConPTY 宿主的 TSF OnEndEdit 里 GetSelection/GetText 经常拿不到内容），
-                        // 而不是"确定不匹配"——press2 时光标前必然至少有 press1 刚提交的符号，
-                        // 真读到 0 只可能是读失败。此时退回只信服务端自己的武装态
-                        // （armed+key+timeout，与文档内容无关），否则永远判定不是 press2。
-                        let armed_runes: Vec<char> = arm.str.chars().collect();
-                        if let Some(&last) = armed_runes.last()
-                            && (prev_char == 0 || last as u32 == prev_char as u32)
-                            && let Some(rep) = self.compute_punct_str_pure(state, ch, false)
-                        {
-                            arm.armed = false;
-                            if ch == '\'' || ch == '"' {
-                                self.punct
-                                    .lock()
-                                    .unwrap_or_else(|e| e.into_inner())
-                                    .revert_last_quote(ch);
-                            }
-                            debug!(
-                                "SmartSymbol(HoldComposition->fallback): press2, replace chinese punct with english, count={}",
-                                armed_runes.len()
-                            );
-                            return Some(KeyAction::ReplaceBackward {
-                                count: armed_runes.len() as u32,
-                                text: rep,
-                            });
-                        }
-                    }
-                }
-                SmartMethod::DeleteReplace => {
-                    // 光标前字符须与武装串末位匹配；prev_char==0 视为宿主读不回文档
-                    // （见上面 HoldComposition->fallback 分支的同类注释），退回只信武装态。
-                    let armed_runes: Vec<char> = arm.str.chars().collect();
-                    if let Some(&last) = armed_runes.last()
-                        && (prev_char == 0 || last as u32 == prev_char as u32)
-                        && let Some(rep) = self.compute_punct_str_pure(state, ch, false)
-                    {
-                        arm.armed = false;
-                        if ch == '\'' || ch == '"' {
-                            self.punct
-                                .lock()
-                                .unwrap_or_else(|e| e.into_inner())
-                                .revert_last_quote(ch);
-                        }
-                        debug!(
-                            "SmartSymbol(DeleteReplace): replace prev chinese punct with english, count={}",
-                            armed_runes.len()
-                        );
-                        return Some(KeyAction::ReplaceBackward {
-                            count: armed_runes.len() as u32,
-                            text: rep,
-                        });
-                    }
-                }
-            }
+        if let Some(act) = self.smart_symbol_press2(state, ch, prev_char, &method, &mut arm) {
+            return Some(act);
         }
 
         // ── press1：尝试武装 ─────────────────────────────────────────────────────
         match self.smart_symbol_arm_str(state, ch, prev_char) {
-            Some(cn) => {
+            Some((out, reverse)) => {
                 arm.key = ch;
-                arm.str = cn.clone();
+                arm.str = out.clone();
                 arm.at = Some(std::time::Instant::now());
+                arm.reverse = reverse;
 
                 match method {
                     SmartMethod::HoldComposition => {
@@ -286,18 +212,18 @@ impl Coordinator {
                         if has_input {
                             // 有活跃编码时，不短路进入 hold composition——让调用方的标点分支
                             // 检测 hold_pending_commit 并生成 CommitAndHoldComposition：先顶屏
-                            // 上屏候选，再开 HoldComposition 放入中文标点。
+                            // 上屏候选，再开 HoldComposition 放入标点。
                             arm.held_text = None;
                             arm.hold_pending_commit = true;
                         } else {
-                            arm.held_text = Some(cn.clone());
+                            arm.held_text = Some(out.clone());
                             debug!(
-                                "SmartSymbol(HoldComposition): press1, hold composition: {}, timeout={}ms",
-                                cn, timeout_ms
+                                "SmartSymbol(HoldComposition): press1, hold composition: {}, reverse={}, timeout={}ms",
+                                out, reverse, timeout_ms
                             );
                             // 短路返回：由 C++ 端负责开启组合态和计时，不走普通标点流程
                             return Some(KeyAction::HoldComposition {
-                                text: cn,
+                                text: out,
                                 timeout_ms,
                             });
                         }
@@ -317,10 +243,149 @@ impl Coordinator {
         None
     }
 
+    /// press2 判定（同键、时限内）：命中则解除武装并返回替换响应，未命中返回 None 不动武装态。
+    ///
+    /// 替换目标由 `arm.reverse` 定：正向换英文产物、反向换中文产物。两个方向共用同一套删改/组合
+    /// 覆盖机制——差别只在「取哪一列产物」，故此处只有 `!arm.reverse` 这一个分歧点。
+    fn smart_symbol_press2(
+        &self,
+        state: &State,
+        ch: char,
+        prev_char: u16,
+        method: &SmartMethod,
+        arm: &mut crate::coordinator::SmartSymbolArm,
+    ) -> Option<KeyAction> {
+        if !arm.armed
+            || ch != arm.key
+            || !state.chinese_punct
+            || !arm
+                .at
+                .map(|t| t.elapsed() < self.smart_symbol_timeout())
+                .unwrap_or(false)
+        {
+            return None;
+        }
+        // 替换产物取**武装方向的另一侧**：正向 press1 出中文 → press2 出英文；反向反之。
+        let target_chinese = arm.reverse;
+        // 引号交替态修正：正向时 press1 已由 `convert_punct` 推进过一格，换英文后须退回；
+        // 反向时 press1 出的是英文（未推进），而 press2 真吐了一个中文引号，须补进一格。
+        // 引号只有左/右两态，「退回」与「补进」都是同一个翻转，故两个方向共用 revert_last_quote。
+        let fix_quote = |this: &Self| {
+            if ch == '\'' || ch == '"' {
+                this.punct
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .revert_last_quote(ch);
+            }
+        };
+        let dir = if target_chinese { "en->cn" } else { "cn->en" };
+
+        match method {
+            SmartMethod::HoldComposition if arm.held_text.is_some() => {
+                // 正常 hold 路径：press1 时无活跃编码，组合态内无需 prev_char 验证，直接提交。
+                let rep = self.compute_punct_str_pure(state, ch, target_chinese)?;
+                arm.armed = false;
+                arm.held_text = None;
+                fix_quote(self);
+                debug!(
+                    "SmartSymbol(HoldComposition): press2 {}, commit: {}",
+                    dir, rep
+                );
+                // 必须是 CommitReplacingHeld 而非 InsertText：held 的符号此刻正显示在 C++ 的
+                // 组合态里，press2 要**覆盖**它。普通 InsertText 在 hold 活跃时是追加语义
+                // （held 并入前缀一起上屏），会打出「。.」。
+                Some(KeyAction::CommitReplacingHeld {
+                    text: rep,
+                    chinese_mode: state.chinese_mode,
+                })
+            }
+            // 两条走删改的路：DeleteReplace 方案，以及 HoldComposition 方案下 press1 时有活跃编码
+            // （标点已作文本顶屏提交、非组合态）或符号由模式进入键直接上屏（见
+            // `arm_smart_symbol_after_commit`）——`held_text.is_none()` 即这两种降级情形。
+            //
+            // 光标前字符须与武装串末位匹配；prev_char==0 视为"宿主读不回文档"（微信/Windows
+            // Terminal 等 Qt/ConPTY 宿主的 TSF OnEndEdit 里 GetSelection/GetText 经常拿不到内容），
+            // 而不是"确定不匹配"——press2 时光标前必然至少有 press1 刚提交的符号，真读到 0 只可能
+            // 是读失败。此时退回只信服务端自己的武装态（armed+key+timeout，与文档内容无关），
+            // 否则永远判定不是 press2。
+            _ => {
+                let armed_runes: Vec<char> = arm.str.chars().collect();
+                let &last = armed_runes.last()?;
+                if prev_char != 0 && last as u32 != prev_char as u32 {
+                    return None;
+                }
+                let rep = self.compute_punct_str_pure(state, ch, target_chinese)?;
+                arm.armed = false;
+                fix_quote(self);
+                debug!(
+                    "SmartSymbol(replace): press2 {}, count={}, text={}",
+                    dir,
+                    armed_runes.len(),
+                    rep
+                );
+                Some(KeyAction::ReplaceBackward {
+                    count: armed_runes.len() as u32,
+                    text: rep,
+                })
+            }
+        }
+    }
+
+    /// 「符号已实打实上屏」后的智能符号武装 —— 模式进入键二次按下专用。
+    ///
+    /// 场景：`;`（快捷输入）/ `` ` ``（临时拼音）/ `\`（特殊模式）这类**被模式占用的符号键**，
+    /// 在模式内空缓冲时再按一次会上屏它的中文标点并退出模式（三处调用：`handle_mode.rs` /
+    /// `handle_temp.rs` / `handle_special.rs`）。此前那就是终点——想要英文形没有任何便捷通路，
+    /// 因为该键在空闲态一按就又进模式了。现在这一步顺手武装智能符号：时限内再按同键即换英文。
+    ///
+    /// **恒按删改语义武装**（`held_text=None`）：符号是经 `CommitText` 真上屏的，不存在组合态可
+    /// 覆盖，故 press2 必须走 `ReplaceBackward`。用户选 `HoldComposition` 方案时亦然——
+    /// `smart_symbol_press2` 的 `held_text.is_none()` 分支就是这条降级路径。
+    ///
+    /// **press2 的拦截点在 `try_activate_mode` 开头**（`handle_lifecycle.rs`），必须早于模式激活
+    /// 链：空闲态按 `;` 会被模式进入抢走，永远走不到标点分支的智能符号判定，武装也就白武装。
+    pub(crate) fn arm_smart_symbol_after_commit(&self, state: &State, ch: char, out: &str) {
+        if !self.rt().config.input.symbol.smart_mode || !state.chinese_punct {
+            return;
+        }
+        // 参与集合按实际上屏串判定（与 `smart_symbol_arm_str` 同一判据）：符号不在
+        // `symbol.smart_chars` 里就不武装，行为与改造前完全一致。
+        if !self.smart_symbol_participates(out) {
+            return;
+        }
+        let mut arm = self.smart_symbol.lock().unwrap_or_else(|e| e.into_inner());
+        arm.armed = true;
+        arm.reverse = false;
+        arm.key = ch;
+        arm.str = out.to_string();
+        arm.at = Some(std::time::Instant::now());
+        arm.held_text = None;
+        arm.hold_pending_commit = false;
+        debug!("SmartSymbol(mode trigger): armed after commit: {}", out);
+    }
+
+    /// 只做 press2 判定、不做 press1 武装 —— 供 `try_activate_mode` 抢在模式激活链之前调用。
+    /// 武装职责仍单一收口在 `try_smart_symbol_replace`（标点分支）与
+    /// `arm_smart_symbol_after_commit`（模式进入键），此处只负责「别让模式进入吃掉 press2」。
+    pub(crate) fn try_smart_symbol_press2_only(
+        &self,
+        state: &State,
+        ch: char,
+        prev_char: u16,
+    ) -> Option<KeyAction> {
+        if !self.rt().config.input.symbol.smart_mode {
+            return None;
+        }
+        let method = self.rt().config.input.symbol.smart_method.clone();
+        let mut arm = self.smart_symbol.lock().unwrap_or_else(|e| e.into_inner());
+        self.smart_symbol_press2(state, ch, prev_char, &method, &mut arm)
+    }
+
     /// 解除智能符号待命态（焦点变化/模式切换等的防御性复位）。
     pub(crate) fn disarm_smart_symbol(&self) {
         let mut arm = self.smart_symbol.lock().unwrap_or_else(|e| e.into_inner());
         arm.armed = false;
+        arm.reverse = false;
         arm.held_text = None;
         arm.hold_pending_commit = false;
         // 注：HoldComposition 模式下若组合尚未提交，C++ 端的 SetTimer 计时器会在 timeout

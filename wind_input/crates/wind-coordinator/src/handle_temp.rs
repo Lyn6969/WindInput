@@ -321,6 +321,8 @@ impl Coordinator {
             return act;
         }
         // 进入键二次按下（缓冲空 + 无已转换前缀）：按中英标点配置上屏该符号并退出。
+        // 顺带武装智能符号：时限内再按同键即换英文形——否则这个键被模式占着，英文形没有通路
+        // （空闲态一按就又进模式）。press2 的拦截在 try_activate_mode 开头，早于模式激活链。
         if state.temp_pinyin_buffer.is_empty()
             && state.committed_text.is_empty()
             && self.is_temp_pinyin_trigger(data.key_code)
@@ -332,6 +334,7 @@ impl Coordinator {
                 .or_else(|| punct_char(data.key_code, data.modifiers & MOD_SHIFT != 0));
             if let Some(ch) = ch {
                 let out = self.convert_punct_char(state, ch);
+                self.arm_smart_symbol_after_commit(state, ch, &out);
                 self.record_commit(&out, 0, -1, wind_store::stats::CommitSource::Punctuation);
                 self.exit_temp_pinyin(state);
                 self.notify_ui_hide();

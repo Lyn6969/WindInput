@@ -522,15 +522,19 @@ pub(crate) struct State {
     pub(crate) add_word_saved_vertical: Option<bool>,
 }
 
-/// 智能符号模式待命态：press1 提交一个参与集合内的中文标点后武装，等待时限内同键 press2
+/// 智能符号模式待命态：press1 提交一个参与集合内的标点后武装，等待时限内同键 press2
 /// 触发替换。对齐 Go `smartSymbol*` 字段。
 #[derive(Default)]
 pub(crate) struct SmartSymbolArm {
     pub(crate) armed: bool,
     /// 武装的触发键（原始英文标点字符）
     pub(crate) key: char,
-    /// press1 产出的中文标点串（…… 为多 rune），删除数 = 其 rune 数
+    /// press1 产出的标点串（…… 为多 rune），删除数 = 其 rune 数。
+    /// 正向存中文串、反向存英文串——恒等于**实际上屏的那个串**，press2 的删除数按它算。
     pub(crate) str: String,
+    /// 替换方向：false=正向（press1 中文 → press2 英文，原有语义）；
+    /// true=反向（press1 英文 → press2 中文）。反向目前唯一来源是数字后智能标点。
+    pub(crate) reverse: bool,
     /// 武装时刻（None=未武装）；用于时限判定
     pub(crate) at: Option<std::time::Instant>,
     /// HoldComposition 模式下 press1 进入组合态的中文文本（用于 disarm 时清理）。

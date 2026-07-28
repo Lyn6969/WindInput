@@ -4,7 +4,7 @@
 //! 注：IME 激活/失活、焦点变更、composition 终止是 MessageHandler trait 方法，留在
 //! coordinator.rs 的 `impl MessageHandler` 块。
 
-use crate::coordinator::{Coordinator, State};
+use crate::coordinator::{Coordinator, State, punct_char};
 use crate::pipeline::ModeKind;
 use tracing::{debug, info};
 use wind_bridge::handler::{KeyAction, KeyEventData};
@@ -48,6 +48,19 @@ impl Coordinator {
         // 不再弹「已重载」气泡：热重载统一由 reload_user_config 的 toast 通知，避免重复。
     }
 
+    /// 该键是否被**任一模式**配作进入键（临拼/临英的符号触发键、特殊模式引导键、mix 触发键）。
+    /// 仅用于「智能符号 press2 要不要抢在模式激活之前」的门控：只有被模式占用的符号键存在
+    /// 这个冲突，其余标点照常在标点分支判 press2。
+    ///
+    /// 临拼的**字母**触发键（z）刻意不算：它要过三重身份裁决，且字母键根本不产出标点，
+    /// `punct_char` 那一关就已经把它挡在门外。
+    fn is_any_mode_trigger(&self, key_code: u32) -> bool {
+        self.is_temp_pinyin_trigger(key_code)
+            || self.is_temp_english_trigger(key_code)
+            || self.match_special_trigger(key_code).is_some()
+            || self.match_mix_trigger(key_code).is_some()
+    }
+
     /// 空缓冲模式激活的单一入口（对齐 key-pipeline.md §2.1 优先级链）。
     /// 优先级：临时英文(Shift+字母) > 快捷输入 > 临时拼音 > 特殊模式。命中返回激活 KeyAction，
     /// 都不命中返回 None（落普通输入）。URL 前缀夺取是「缓冲扩展夺取」语义，不在此链，单独处理。
@@ -56,6 +69,24 @@ impl Coordinator {
         state: &mut State,
         data: &KeyEventData,
     ) -> Option<KeyAction> {
+        // 智能符号 press2 **优先于模式激活**：模式内二次按进入键时已上屏中文标点并武装
+        // （见 `arm_smart_symbol_after_commit`），时限内再按同键必须替换成英文形，而不是又进
+        // 一次模式——否则被模式占用的符号键（`;` / `` ` `` / `\`）永远打不出英文形，武装白武装。
+        //
+        // 三重收窄，确保不惊扰既有路径：① 仅空闲态（无缓冲/无已转换前缀/无候选，缓冲非空时的
+        // 模式触发另有 `decideBufferedTrigger` 那条链，不归此处管）；② 仅被某模式占用的键
+        // （普通标点仍按原路径在标点分支判 press2，路径与风险都不扩散）；③ 仅判 press2，不武装。
+        if state.input_buffer.is_empty()
+            && state.committed_text.is_empty()
+            && state.candidates.is_empty()
+            && data.modifiers & (MOD_CTRL | MOD_ALT) == 0
+            && self.is_any_mode_trigger(data.key_code)
+            && let Some(ch) = punct_char(data.key_code, data.modifiers & MOD_SHIFT != 0)
+            && let Some(act) = self.try_smart_symbol_press2_only(state, ch, data.prev_char)
+        {
+            return Some(act);
+        }
+
         // 临时英文：Shift+字母（空缓冲 + 无候选 + 已启用）
         if state.input_buffer.is_empty()
             && state.candidates.is_empty()

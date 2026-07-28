@@ -244,11 +244,14 @@ impl Coordinator {
             return act;
         }
         // 进入键二次按下（缓冲空）：按中英标点配置上屏该符号并退出。
+        // 顺带武装智能符号：时限内再按同键即换英文形，否则这个键被模式占着、英文形没有通路。
+        // press2 的拦截在 try_activate_mode 开头，早于模式激活链。
         if state.special_buffer.is_empty()
             && self.match_special_trigger(data.key_code) == Some(state.special_id)
             && let Some(ch) = punct_char(data.key_code, data.modifiers & MOD_SHIFT != 0)
         {
             let out = self.convert_punct_char(state, ch);
+            self.arm_smart_symbol_after_commit(state, ch, &out);
             self.record_commit(&out, 0, -1, wind_store::stats::CommitSource::Punctuation);
             self.exit_special_mode(state);
             self.notify_ui_hide();

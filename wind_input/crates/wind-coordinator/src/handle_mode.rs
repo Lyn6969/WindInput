@@ -948,6 +948,8 @@ impl Coordinator {
         };
         // 进入键二次按下（缓冲空 + 无已转换前缀）：按中英标点配置上屏该符号并退出。
         // 必须前置于下方数字透镜——否则 ; 等会被 printable_char 当表达式字符吞进缓冲。
+        // 顺带武装智能符号：时限内再按同键即换英文形（`;` → `；` → `;`），否则这个键被模式
+        // 占着、英文形没有通路。press2 的拦截在 try_activate_mode 开头，早于模式激活链。
         if state.mix_buffer.is_empty()
             && state.committed_text.is_empty()
             && data.modifiers & MOD_SHIFT == 0
@@ -955,6 +957,7 @@ impl Coordinator {
             && let Some(ch) = punct_char(data.key_code, false)
         {
             let out = self.convert_punct_char(state, ch);
+            self.arm_smart_symbol_after_commit(state, ch, &out);
             self.record_commit(&out, 0, -1, wind_store::stats::CommitSource::Punctuation);
             self.exit_mix_mode(state);
             self.notify_ui_hide();

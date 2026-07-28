@@ -135,9 +135,30 @@ if (holdActiveBeforeResponse && !(*pfEaten)
 
 **一并留个提醒**：普通输入会话（有候选）下的 Ctrl 组合走的是另一条路——服务端返回非 `PassThrough` 时会进 `isCtrlAltCleanup` 那段，末尾同样有一句 `*pfEaten = FALSE`，理论上是**同一个翻转**。那条路覆盖 Ctrl+C/V/Z/S 全部高频快捷键，改动面比 hold 大得多。**该路径的服务端响应尚未实测**，要动之前必须先用同样的探测方法确认，不要沿用本节结论。
 
+## 后续扩展：两条新增触发通路（2026-07-28）
+
+原本只有一条通路：中文标点模式下 press1 出中文 → press2 换英文。现在多了两条。它们**复用同一套 press2 执行机制**（同样的 `ReplaceBackward` / `CommitReplacingHeld`，同样的 `prev_char==0` 容错），故本文上面所有宿主兼容性结论对它们一并适用。
+
+### 1. 反向：数字后智能标点
+
+`3.` 这类场景 press1 照旧出英文 `.`（数字后语义不变），但不再是终点——时限内再按一次换回中文 `。`。方向记在 `SmartSymbolArm::reverse`，press2 只是把「取哪一列产物」翻过来，删改机制一字未动。
+
+此前 `smart_symbol_arm_str` 遇数字后智能直接 `return None` 拒绝武装，于是数字后想打中文标点只能去关掉「数字后智能」总开关，粒度粗到没法用。
+
+### 2. 模式进入键的二次按下
+
+`;`（快捷输入）/ `` ` ``（临时拼音）/ `\`（特殊模式）这类被模式占用的符号键，在模式内空缓冲时二次按下会上屏中文标点并退出模式（`handle_mode.rs` / `handle_temp.rs` / `handle_special.rs` 三处），此刻顺带武装（`arm_smart_symbol_after_commit`），第三次按下即换英文形。仍受 `symbol.smart_chars` 参与集合门控。
+
+两处必须知道的约束：
+
+- **这条通路恒走删改路径**。符号是经 `CommitText` 真上屏的，没有组合态可以覆盖，因此**即使用户选了 `HoldComposition` 方案，press2 也只能是 `ReplaceBackward`**（走 `smart_symbol_press2` 里 `held_text.is_none()` 那条降级分支）。也就是说上文 EverEdit / Tabby / 微信那一系列删改问题对它同样成立——而选 `HoldComposition` 的用户本来正是为了绕开删改。默认的三个进入键都不是 Shift 组合键，故 EverEdit 那条「Shift 叠加致 `VK_BACK` 变 Shift+Backspace」的坑不触发；用户把引导键配成 Shift 组合符号（如 `~`）时才会撞上。
+- **press2 的拦截点在 `handle_lifecycle.rs::try_activate_mode` 开头，必须早于模式激活链**。空闲态按下这些键会被模式进入抢走，走不到标点分支的智能符号判定——武装了也白武装。该拦截三重收窄（仅空闲态、仅被模式占用的键、仅判 press2 不武装），普通标点的路径完全不变。
+
 ## 相关代码位置
 
-- `wind_input/crates/wind-coordinator/src/handle_punct.rs`：`try_smart_symbol_replace`（press1/press2 状态机、`prev_char` 判定）
+- `wind_input/crates/wind-coordinator/src/handle_punct.rs`：`try_smart_symbol_replace`（press1 武装 + press2 分发）、`smart_symbol_press2`（press2 状态机、`prev_char` 判定、方向分歧点）、`smart_symbol_arm_str`（武装判据 + 方向判定）、`arm_smart_symbol_after_commit`（模式进入键武装）
+- `wind_input/crates/wind-coordinator/src/handle_lifecycle.rs`：`try_activate_mode` 开头的 press2 拦截、`is_any_mode_trigger`
+- `wind_input/crates/wind-coordinator/tests/smart_symbol.rs`：两条新通路的端到端锁
 - `wind_tsf/src/TextService.cpp`：`CommitText`、`ReplacePrecedingChars`（含 `kTryTsfRangeReplace` 开关）、`CReplaceBackwardEditSession`（含诊断用 readback 日志）
 - `wind_tsf/src/KeyEventSink.cpp` / `include/KeyEventSink.h`：`MarkSyntheticKey`、`_PushSkipKey`/`_TryConsumeSkipKey`、`_SimulatePairKey`（Shift 合成按键相关历史教训）
 
