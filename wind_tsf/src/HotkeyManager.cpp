@@ -18,6 +18,7 @@ void CHotkeyManager::UpdateHotkeys(const std::vector<uint32_t>& keyDownHotkeys,
     _keyDownChineseOnly.clear();
     _keyDownSession.clear();
     _globalHotkeys.clear();
+    _keyDownForwardOnly.clear();
     _keyUpHotkeys.clear();
 
     // Add KeyDown hotkeys — 按 policy 位分流到三个 set
@@ -40,6 +41,11 @@ void CHotkeyManager::UpdateHotkeys(const std::vector<uint32_t>& keyDownHotkeys,
         if (hash & HOTKEY_POLICY_GLOBAL)
         {
             _globalHotkeys.insert(rawHash);
+        }
+        // FORWARD_ONLY 同为正交标记：标记「这不是动作热键，只是让 TSF 认得的转发登记」。
+        if (hash & HOTKEY_POLICY_FORWARD_ONLY)
+        {
+            _keyDownForwardOnly.insert(rawHash);
         }
     }
 
@@ -65,6 +71,11 @@ BOOL CHotkeyManager::IsKeyDownChineseOnlyHotkey(uint32_t keyHash) const
 BOOL CHotkeyManager::IsKeyDownSessionHotkey(uint32_t keyHash) const
 {
     return _keyDownSession.find(keyHash) != _keyDownSession.end();
+}
+
+BOOL CHotkeyManager::IsKeyDownForwardOnlyHotkey(uint32_t keyHash) const
+{
+    return _keyDownForwardOnly.find(keyHash) != _keyDownForwardOnly.end();
 }
 
 BOOL CHotkeyManager::IsKeyUpHotkey(uint32_t keyHash) const
@@ -264,9 +275,9 @@ uint32_t CHotkeyManager::NormalizeModifiers(uint32_t modifiers)
 
 void CHotkeyManager::LogConfig() const
 {
-    WIND_LOG_DEBUG_FMT(L"HotkeyManager: keyDownHotkeys=%d, chineseOnly=%d, session=%d, keyUpHotkeys=%d\n",
+    WIND_LOG_DEBUG_FMT(L"HotkeyManager: keyDownHotkeys=%d, chineseOnly=%d, session=%d, forwardOnly=%d, keyUpHotkeys=%d\n",
               (int)_keyDownHotkeys.size(), (int)_keyDownChineseOnly.size(),
-              (int)_keyDownSession.size(), (int)_keyUpHotkeys.size());
+              (int)_keyDownSession.size(), (int)_keyDownForwardOnly.size(), (int)_keyUpHotkeys.size());
 
     // Log some hotkey hashes for debugging
     if (!_keyDownHotkeys.empty())

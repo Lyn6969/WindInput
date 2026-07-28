@@ -227,6 +227,31 @@ void CKeyEventSink::_MarkPendingToggleKey(WPARAM wParam, uint32_t modifiers)
     _pendingKeyDownTime = GetTickCount();
 }
 
+// 取消待切换。热键分支（keydown 白名单 / chinese-only / session / Ctrl+Space）都是
+// 就地 return，够不着 OnTestKeyDown 下方那段「非 toggle 键取消 pending」的统一处理。
+//
+// 不在这些分支显式取消的后果：Shift 被配成切换键时（默认 lshift/rshift），Shift 自身的
+// keydown 已把 _pendingKeyUpKey 记成待切换；随后的 Shift+Space 若在热键分支被吃掉并
+// return，松开 Shift 时 _DispatchPendingToggleKeyUp 仍会命中 —— 一次 Shift+Space 既切了
+// 全半角又切了中英文。Ctrl 被配成切换键时的 Ctrl+= / Ctrl+Space 同理。
+//
+// 命中热键白名单本身就说明这次按键是组合键而非切换键轻敲，故无条件取消。
+void CKeyEventSink::_CancelPendingToggle(WPARAM wParam, const wchar_t* reason)
+{
+    if (_pendingKeyUpKey == 0)
+        return;
+    // 纯修饰键自身永不在此取消：宿主对按住的键会重复发 keydown（CAD 实测 28 秒 145 次），
+    // 若它某天也命中了 keydown 白名单（select_key_groups 支持 lrshift/lrctrl），
+    // 「取消→重记」会不断重置 _pendingKeyDownTime，长按被误判成轻敲而误切中英文。
+    if (_IsPureModifierKey(wParam))
+        return;
+
+    WIND_LOG_DEBUG_FMT(L"Cancel pending toggle (%ls): vk=0x%02X pending=0x%02X\n",
+        reason ? reason : L"-", (uint32_t)wParam, _pendingKeyUpKey);
+    _pendingKeyUpKey = 0;
+    _pendingKeyUpModifiers = 0;
+}
+
 // ITfKeyEventSink::OnSetFocus —— 名字像是焦点主回调，实际**很不可靠**，不要往这里挂
 // 任何独占职责：AutoCAD 实测整场只触发 2 次，且全是 fForeground=1，从来没有过 0。
 // （曾把 focus_lost 挂在它的 else 分支上，结果 focus_lost 完全断供。）
@@ -295,25 +320,29 @@ STDAPI CKeyEventSink::OnTestKeyDown(ITfContext* pContext, WPARAM wParam, LPARAM 
     // Use normalized hash for function hotkeys (Ctrl+`, Shift+Space, etc.)
     if (pHotkeyMgr != nullptr && pHotkeyMgr->IsKeyDownHotkey(normalizedKeyHash))
     {
-        // For keys without Ctrl/Alt modifiers (page keys like -=, select keys like ;'),
-        // only intercept in Chinese mode or when there's an active input session.
-        // Otherwise these keys get swallowed in English mode on some applications (e.g., WindTerm)
-        // where OnTestKeyDown(pfEaten=TRUE) + OnKeyDown(pfEaten=FALSE) doesn't properly pass through.
+        _CancelPendingToggle(wParam, L"keydown_hotkey");
+
+        // 「仅注册转发」的键（翻页键组 -=、选词键组 ;'）无会话时放行，并**继续往下走**
+        // （不是 return）：引擎对它们只会回 PassThrough，而 WindTerm 等宿主处理不好
+        // OnTestKeyDown(TRUE)+OnKeyDown(FALSE) 的翻转会直接吞键；放行后下方
+        // ClassifyInputKey 会在中文模式把它们当标点正确处理。
+        //
+        // ⚠ 闸门只对 FORWARD_ONLY 生效，绝不能按「无 Ctrl/Alt」一刀切扩到真动作热键上。
+        // 曾经就是一刀切，于是 shift+space（toggle_full_width）也被放行——而 Space 在下方
+        // 只有「有会话」和「已是全角」两条出路，半角 + 空缓冲时无人接手，键直接透传：
+        // 严格 TSF 宿主（EverEdit）在 pfEaten=FALSE 后不再回调 OnKeyDown，热键永远送不到
+        // 引擎，全半角切换彻底失效；宽松宿主（记事本 / Chromium）照调 OnKeyDown，由那边的
+        // 白名单分发兜住才碰巧能用——这正是「记事本行、EverEdit 不行」的由来。
+        // 判据须与服务端保持单一真相源：action 为空的登记项才带 FORWARD_ONLY（见 hotkey.rs）。
         BOOL shouldEatHotkey = TRUE;
-        if (!(modifiers & (KEYMOD_CTRL | KEYMOD_ALT)))
+        if (!(modifiers & (KEYMOD_CTRL | KEYMOD_ALT))
+            && pHotkeyMgr->IsKeyDownForwardOnlyHotkey(normalizedKeyHash))
         {
-            // Page keys (-=) and select keys (;') without modifiers should only be
-            // intercepted when there's an active input session (candidates showing).
-            // Without input session, Go would return PassThrough for page keys,
-            // and some apps (e.g., WindTerm) don't handle OnTestKeyDown(TRUE) +
-            // OnKeyDown(FALSE) correctly, causing the key to be swallowed.
-            // The key will still be caught by ClassifyInputKey below as Punctuation
-            // in Chinese mode, which correctly handles it.
             BOOL hasComp = _pTextService->HasActiveComposition();
             BOOL hasSession = hasComp || _hasCandidates;
             if (!hasSession)
             {
-                WIND_LOG_DEBUG_FMT(L"OnTestKeyDown hotkey skipped (no input session): vk=0x%02X, hash=0x%08X\n",
+                WIND_LOG_DEBUG_FMT(L"OnTestKeyDown hotkey skipped (forward-only, no input session): vk=0x%02X, hash=0x%08X\n",
                     (uint32_t)wParam, normalizedKeyHash);
                 shouldEatHotkey = FALSE;
             }
@@ -334,6 +363,7 @@ STDAPI CKeyEventSink::OnTestKeyDown(ITfContext* pContext, WPARAM wParam, LPARAM 
     // Policy: 仅中文模式吃（AddWord / TogglePunct / ToggleS2T）
     if (pHotkeyMgr != nullptr && pHotkeyMgr->IsKeyDownChineseOnlyHotkey(normalizedKeyHash))
     {
+        _CancelPendingToggle(wParam, L"chineseonly_hotkey");
         if (_pTextService->IsChineseMode())
         {
             WIND_LOG_DEBUG_FMT(L"KeyDown chinese-only hotkey matched: vk=0x%02X, hash=0x%08X\n",
@@ -354,6 +384,7 @@ STDAPI CKeyEventSink::OnTestKeyDown(ITfContext* pContext, WPARAM wParam, LPARAM 
     // Policy: 仅中文模式 + session 时吃（PinCandidate / DeleteCandidate Ctrl+0..9）
     if (pHotkeyMgr != nullptr && pHotkeyMgr->IsKeyDownSessionHotkey(normalizedKeyHash))
     {
+        _CancelPendingToggle(wParam, L"session_hotkey");
         BOOL chineseMode = _pTextService->IsChineseMode();
         // resync 期 (上次 IPC 失败后) 视作有会话, 让 ENTER/ESC/Backspace 等 session 热键
         // 也走 Go 重握手, 由 Go 权威响应清旗 + 重建状态。
@@ -464,6 +495,7 @@ STDAPI CKeyEventSink::OnTestKeyDown(ITfContext* pContext, WPARAM wParam, LPARAM 
     // at 1 permanently and we handle the toggle ourselves in OnKeyDown.
     if (wParam == VK_SPACE && (modifiers & KEYMOD_CTRL) && !(modifiers & (KEYMOD_ALT | KEYMOD_SHIFT)))
     {
+        _CancelPendingToggle(wParam, L"ctrl_space_intercept");
         *pfEaten = TRUE;
         _LogKeyDecision(L"test_down", _pTextService->GetFocusSessionId(), wParam, modifiers, HotkeyType::None,
                         _pTextService->IsChineseMode(), _pTextService->HasActiveComposition(), _hasCandidates,

@@ -44,6 +44,11 @@ public:
     // 仅中文模式 + 有 composition / 候选时吃。其它情形透传。
     BOOL IsKeyDownSessionHotkey(uint32_t keyHash) const;
 
+    // 「仅注册转发」的键（翻页键组 / 选词键组）。与 _keyDownHotkeys 叠加的正交标记：
+    // 命中它的键在无会话时必须**放行并继续往下走**（不是 return），交给 ClassifyInputKey
+    // 按普通标点处理。真动作热键不带此标记，任何时候都吃。
+    BOOL IsKeyDownForwardOnlyHotkey(uint32_t keyHash) const;
+
     // Check if a KeyUp should be intercepted (O(1) lookup)
     // Returns true if the key matches a KeyUp hotkey in the whitelist
     BOOL IsKeyUpHotkey(uint32_t keyHash) const;
@@ -87,7 +92,10 @@ public:
     // 全局拦截位（正交，与 CHINESE_ONLY 叠加）：TSF 在中文+文本框时用 RegisterHotKey
     // 把这些键注册为系统级热键，规避 Chromium 类宿主的加速键双处理。
     static constexpr uint32_t HOTKEY_POLICY_GLOBAL       = 0x20000000;
-    static constexpr uint32_t HOTKEY_POLICY_MASK         = HOTKEY_POLICY_CHINESE_ONLY | HOTKEY_POLICY_SESSION | HOTKEY_POLICY_GLOBAL;
+    // 仅注册转发位（正交，与上面三选一叠加）：翻页/选词键组这类无动作的登记项。
+    static constexpr uint32_t HOTKEY_POLICY_FORWARD_ONLY = 0x10000000;
+    static constexpr uint32_t HOTKEY_POLICY_MASK         = HOTKEY_POLICY_CHINESE_ONLY | HOTKEY_POLICY_SESSION
+                                                         | HOTKEY_POLICY_GLOBAL | HOTKEY_POLICY_FORWARD_ONLY;
 
     // 需全局拦截的热键 raw hash（GLOBAL 位命中，已剥 policy）。供 RegisterHotKey 反解 (mods,vk)。
     const std::unordered_set<uint32_t>& GlobalHotkeys() const { return _globalHotkeys; }
@@ -104,6 +112,9 @@ private:
 
     // 需全局拦截（RegisterHotKey）的热键 raw hash，与 _keyDownChineseOnly 叠加（正交标记）
     std::unordered_set<uint32_t> _globalHotkeys;
+
+    // 仅注册转发的键 raw hash（翻页/选词键组），与 _keyDownHotkeys 叠加（正交标记）
+    std::unordered_set<uint32_t> _keyDownForwardOnly;
 
     // Hotkey whitelist (KeyUp triggered - for toggle mode keys)
     std::unordered_set<uint32_t> _keyUpHotkeys;

@@ -28,6 +28,16 @@ const HOTKEY_POLICY_SESSION: u32 = 0x80000000;
 /// 时用 Win32 RegisterHotKey 把这些键注册为系统级热键，让 OS 在 WM_KEYDOWN 派发前
 /// 直接消费，规避 QQNT / Tabby 等 Chromium 类宿主无视 TSF pfEaten 契约的加速键双处理。
 const HOTKEY_POLICY_GLOBAL: u32 = 0x20000000;
+/// 「仅注册转发」标记：翻页键组 / 选词键组这类 action 为空的登记项——它们不是动作热键，
+/// 只是让 TSF 认得这些键、在有会话时转发给引擎；无会话时必须放行，由 TSF 下游的
+/// ClassifyInputKey 按普通标点处理（中文模式下要出中文标点）。
+///
+/// ⚠ 真动作热键**绝不能**带此位。TSF 侧的「无 Ctrl/Alt 且无会话就不吃」闸门只认这个标记；
+/// 早先该闸门无差别地套在所有无 Ctrl/Alt 的 keydown 热键上，把 `shift+space`
+/// （toggle_full_width）一并放行了，而 Space 在下游只有「有会话」和「已是全角」两条
+/// 出路，半角空缓冲时无人接手 —— 严格 TSF 宿主（EverEdit）不再回调 OnKeyDown，
+/// 全半角切换彻底失效；宽松宿主（记事本/Chromium）照调 OnKeyDown 才碰巧还能用。
+const HOTKEY_POLICY_FORWARD_ONLY: u32 = 0x10000000;
 
 /// Windows 虚拟键码（toggle / select / page 用）
 const VK_LSHIFT: u32 = 0xA0;
@@ -180,7 +190,7 @@ impl Compiler {
         for group in &self.config.keys.select_key_groups {
             for raw in compile_select_key_group(group) {
                 result.key_down.push(HotkeyEntry {
-                    tsf_hash: raw,
+                    tsf_hash: raw | HOTKEY_POLICY_FORWARD_ONLY,
                     match_hash: raw,
                     action: String::new(),
                 });
@@ -191,7 +201,7 @@ impl Compiler {
         for group in &self.config.keys.page_keys {
             for raw in compile_page_key_group(group) {
                 result.key_down.push(HotkeyEntry {
-                    tsf_hash: raw,
+                    tsf_hash: raw | HOTKEY_POLICY_FORWARD_ONLY,
                     match_hash: raw,
                     action: String::new(),
                 });
@@ -559,6 +569,48 @@ mod tests {
                 .any(|e| e.action == "open_add_word_dialog"),
             "open_add_word_dialog 应注册进 key_down"
         );
+    }
+
+    #[test]
+    fn forward_only_bit_marks_page_and_select_keys_only() {
+        let mut cfg = Config::default();
+        cfg.keys.toggle_full_width = "shift+space".to_string();
+        cfg.keys.select_key_groups = vec!["semicolon_quote".into()];
+        cfg.keys.page_keys = vec!["minus_equal".into(), "shift_tab".into()];
+        let compiled = Compiler::new(cfg).compile();
+
+        // ⚠ 判据不能用「action 为空」：pin/delete 候选的数字热键 action 同样是空串
+        //（动作由服务端按 hash 自认），它们是 session 热键、不该带 FORWARD_ONLY。
+        // 只有翻页键组 / 选词键组才是仅注册转发，故按 raw hash 精确点名。
+        let forward_only_raw: Vec<u32> = [
+            compile_select_key_group("semicolon_quote"),
+            compile_page_key_group("minus_equal"),
+            compile_page_key_group("shift_tab"),
+        ]
+        .concat();
+        assert_eq!(forward_only_raw.len(), 6, "样例键组应展开出 6 个键");
+
+        for e in &compiled.key_down {
+            let expected = forward_only_raw.contains(&e.match_hash);
+            assert_eq!(
+                e.tsf_hash & HOTKEY_POLICY_FORWARD_ONLY != 0,
+                expected,
+                "hash=0x{:08X} action={:?} 的 FORWARD_ONLY 位不符预期",
+                e.tsf_hash,
+                e.action
+            );
+            // match_hash 是服务端匹配用的裸 hash，任何 policy 位都不该混进去
+            assert_eq!(e.match_hash & HOTKEY_POLICY_FORWARD_ONLY, 0);
+        }
+
+        // 定桩：shift+space 无任何 policy 位，TSF 侧必须无条件吃。
+        let fw = compiled
+            .key_down
+            .iter()
+            .find(|e| e.action == "toggle_full_width")
+            .expect("toggle_full_width 应在 key_down 组");
+        assert_eq!(fw.tsf_hash, fw.match_hash);
+        assert_eq!(fw.tsf_hash, key_hash(MOD_SHIFT, 0x20));
     }
 
     #[test]
