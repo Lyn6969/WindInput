@@ -5,6 +5,8 @@ edition.workspace = true
 
 [dependencies]
 wind-cmdbar = { path = "../wind-cmdbar" }
+# `${APP_DIR}` 等内部目录变量：与命令栏字符串同源，见 wind_config::dir_var
+wind-config = { path = "../wind-config" }
 tracing = { workspace = true }
 chrono = "0.4"
 serde = { workspace = true }

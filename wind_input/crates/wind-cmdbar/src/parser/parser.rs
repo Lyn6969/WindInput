@@ -9,7 +9,9 @@
 //! 新增 `$` 短语类型的扩展点：在 [`MARKER_TABLE`] 注册 marker，并在 [`parse`] 分派到
 //! 对应解析函数（可复用 [`parse_array_phrase`] 并按 marker 分策略，如 `$AA` 的 rune 炸开）。
 
-use super::lexer::{Lexer, RawStringPart, Token, TokenKind, decode_escape, skip_escaped};
+use super::lexer::{
+    Lexer, RawStringPart, Token, TokenKind, decode_escape, scan_dir_var, skip_escaped,
+};
 use crate::ast::{ArrayPhrase, CommandPhrase, Expr, ModValue, Modifiers, Phrase, StringPart};
 use crate::error::{CmdbarError, Result};
 
@@ -517,6 +519,15 @@ fn scan_template_parts(src: &str) -> Result<Vec<RawStringPart>> {
             let esc = src[i + 1..].chars().next().unwrap();
             decode_escape(esc, &mut lit);
             i += 1 + esc.len_utf8();
+            continue;
+        }
+        // `${NAME}` 内部目录变量：与 lexer::scan_string 同一份实现，两条扫描路径
+        // 对 `${` 的处置必须一致（不一致正是本功能最初失效的成因）。
+        if c == b'$'
+            && let Some((text, next)) = scan_dir_var(src, i)?
+        {
+            lit.push_str(&text);
+            i = next;
             continue;
         }
         if c == b'{' {
@@ -1062,6 +1073,137 @@ mod tests {
             Phrase::Array(a) => assert_eq!(a.elements.len(), 1),
             _ => panic!("expected array"),
         }
+    }
+
+    /// 期望的 APP_DIR 展开值，独立于被测代码另算一遍（不拿 `wind_config::dir_var_str`
+    /// 的返回值当期望值，否则只是自证「函数等于它自己」）。
+    fn want_app_dir() -> String {
+        let d = std::env::current_exe()
+            .unwrap()
+            .parent()
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        // 空串会让下面基于 `contains` 的断言恒真（假绿）。
+        assert!(!d.is_empty(), "APP_DIR 期望值不该为空");
+        d
+    }
+
+    /// 取 `$CC` 第一个动作调用的首个实参。
+    fn first_action_arg(p: &Phrase) -> &Expr {
+        match p {
+            Phrase::Command(c) => match &c.actions[0] {
+                Expr::Call { args, .. } => &args[0],
+                other => panic!("expected call, got {other:?}"),
+            },
+            other => panic!("expected command, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn dir_var_expands_in_action_string_arg() {
+        // 回归：`open("${APP_DIR}")` 曾把 `{APP_DIR}` 当 `{expr}` 插值 → 求值时
+        // `UnknownFunc` → 动作静默失败（候选出得来、选中没反应）。现应在词法期
+        // 展开成绝对目录字面量，AST 里不得留下任何 Interp。
+        let p = pp(r#"$CC("[打开安装目录]", open("${APP_DIR}"))"#);
+        assert_eq!(
+            *first_action_arg(&p),
+            Expr::StringLit(vec![StringPart::Text(want_app_dir())])
+        );
+    }
+
+    #[test]
+    fn dir_var_expands_in_type_action() {
+        // `type` 由 eval 特例拦截为文本上屏，参数同样是字符串字面量，走同一条词法路径。
+        let p = pp(r#"$CC("[输出安装目录]", type("${APP_DIR}"))"#);
+        assert_eq!(
+            *first_action_arg(&p),
+            Expr::StringLit(vec![StringPart::Text(want_app_dir())])
+        );
+    }
+
+    #[test]
+    fn dir_var_concatenates_with_surrounding_literals() {
+        // 变量与前后字面量拼成**一个** Text 片段（不被切碎成多段）。
+        let p = pp(r#"$CC("[日志]", open("前${APP_DIR}\\logs"))"#);
+        assert_eq!(
+            *first_action_arg(&p),
+            Expr::StringLit(vec![StringPart::Text(format!(
+                r"前{}\logs",
+                want_app_dir()
+            ))])
+        );
+    }
+
+    #[test]
+    fn unknown_dollar_brace_stays_literal_and_does_not_drop_phrase() {
+        // `${YC}` 是旧式模板变量（归 wind_phrase::expand_template 管），命令栏不认识它。
+        // 关键是**不能**把 `{YC}` 当插值 —— 那会 UnknownFunc 让整条候选被静默丢弃。
+        // 未知变量原样留字面，解析必须成功。
+        let p = pp(r#"$CC("[日期]", type("${YC}年"))"#);
+        assert_eq!(
+            *first_action_arg(&p),
+            Expr::StringLit(vec![StringPart::Text("${YC}年".into())])
+        );
+    }
+
+    #[test]
+    fn real_interpolation_still_works_without_dollar() {
+        // 不带 `$` 的 `{expr}` 语义不变，仍是插值（本次改动不得波及正常插值）。
+        let p = pp(r#"$CC("[粘贴]", type("{last()}"))"#);
+        match first_action_arg(&p) {
+            Expr::StringLit(parts) => assert!(
+                matches!(parts.as_slice(), [StringPart::Interp(_)]),
+                "应为插值，实际 {parts:?}"
+            ),
+            other => panic!("expected string lit, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn escaped_dollar_restores_interpolation_after_it() {
+        // `${` 现在是变量语法，想写「字面 $ 紧跟一个真插值」就得转义：`\${expr}`。
+        // 这是 `\$` 进转义白名单的唯一理由，丢了它这种写法就没有出路。
+        let p = pp(r#"$CC("[价格]", type("\${last()}"))"#);
+        match first_action_arg(&p) {
+            Expr::StringLit(parts) => assert!(
+                matches!(
+                    parts.as_slice(),
+                    [StringPart::Text(t), StringPart::Interp(_)] if t == "$"
+                ),
+                "应为字面 $ + 插值，实际 {parts:?}"
+            ),
+            other => panic!("expected string lit, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn dir_var_expands_in_template_phrase_path() {
+        // 模板短语（无 marker、含真插值）走 scan_template_parts 那条**独立**扫描路径。
+        // 两条路径对 `${` 的处置必须一致 —— 只改一条正是本功能最初失效的成因。
+        let p = pp(r#"{last()} ${APP_DIR}"#);
+        match p {
+            Phrase::Template(Expr::StringLit(parts)) => {
+                let tail = parts
+                    .iter()
+                    .filter_map(|p| match p {
+                        StringPart::Text(t) => Some(t.clone()),
+                        _ => None,
+                    })
+                    .collect::<String>();
+                assert!(
+                    tail.contains(&want_app_dir()),
+                    "模板路径未展开 ${{APP_DIR}}，实际片段: {parts:?}"
+                );
+            }
+            other => panic!("expected template, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn unclosed_dollar_brace_falls_back_to_interpolation_error() {
+        // `${` 未闭合：不当变量处理，退回原有插值路径并报未闭合错（而非静默吞掉）。
+        assert!(parse(r#"$CC("x", type("${APP_DIR"))"#).is_err());
     }
 
     #[test]

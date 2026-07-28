@@ -10,3 +10,5 @@ thiserror = { workspace = true }
 chrono = "0.4"
 regex = "1"
 base64 = "0.22"
+# `${APP_DIR}` 等内部目录变量的单一真相源（词法层展开时查表；见 wind_config::dir_var）
+wind-config = { path = "../wind-config" }

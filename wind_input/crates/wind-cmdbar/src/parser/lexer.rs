@@ -228,6 +228,14 @@ impl<'a> Lexer<'a> {
                 self.pos += 1 + esc.len_utf8();
                 continue;
             }
+            // `${NAME}` 内部目录变量：先于插值判定，展开/保留都并入字面缓冲。
+            if c == b'$'
+                && let Some((text, next)) = scan_dir_var(self.src, self.pos)?
+            {
+                lit.push_str(&text);
+                self.pos = next;
+                continue;
+            }
             if c == b'{' {
                 flush_lit(&mut parts, &mut lit, lit_off);
                 let brace_off = self.pos;
@@ -307,9 +315,11 @@ fn flush_lit(parts: &mut Vec<RawStringPart>, lit: &mut String, offset: usize) {
 ///
 /// 取**完整字符**（而非单字节）：中文等多字节字符被转义时（如 `\文`）仍能正确保留，
 /// 不再把多字节 lead 字节当 Latin-1 单字节处理产生乱码 / 后续切片 panic。
+/// `\$` 在白名单内：`${NAME}` 现在是内部目录变量语法（见 [`scan_dir_var`]），
+/// 想让 `$` 后面紧跟一个真插值就得写 `"\${last()}"`，否则整段会被当变量处理。
 pub fn decode_escape(next: char, out: &mut String) {
     match next {
-        '\\' | '"' | '\'' | '{' | '}' | '(' | ')' => out.push(next),
+        '\\' | '"' | '\'' | '{' | '}' | '(' | ')' | '$' => out.push(next),
         'n' => out.push('\n'),
         't' => out.push('\t'),
         'r' => out.push('\r'),
@@ -318,6 +328,45 @@ pub fn decode_escape(next: char, out: &mut String) {
             out.push(next);
         }
     }
+}
+
+/// 在 `pos`（须指向 `$`）处尝试识别 `${NAME}` 内部目录变量，返回
+/// `Some((应写入字面缓冲的文本, `}` 之后的位置))`；`$` 后不是 `{…}` 形式则 `None`
+/// （调用方按普通字面 `$` 处理）。
+///
+/// 两类结果都写字面、都不产生插值：
+/// - `NAME` 是内部目录变量（[`wind_config::is_dir_var`]）→ 展开为绝对目录；
+/// - 否则 → **原样保留 `${NAME}`**。
+///
+/// 「未知就留字面」是刻意的：短语文本里 `${YC}` 这类旧模板变量合法存在
+/// （由 `wind_phrase::expand_template` 负责，不归命令栏管）。若把 `{NAME}` 当插值，
+/// `NAME` 查不到函数 → `UnknownFunc` → **整条候选被静默丢弃**，这正是
+/// `parser::has_top_level_brace` 已在顶层分流处修过一次的回归；那次只修了「要不要走
+/// 命令栏」的门口判定，字符串内部仍按插值处理，于是 `open("${APP_DIR}")` 依旧哑失败。
+/// 此处补齐同一豁免，两处语义至此对齐。
+///
+/// 变量名里出现 `}` 不可能（变量名集是固定白名单），故用字节 `find` 定位闭合括号；
+/// `$`/`{`/`}` 均为 ASCII，切出的 `name` 边界天然落在 UTF-8 字符边界上。
+pub(crate) fn scan_dir_var(src: &str, pos: usize) -> Result<Option<(String, usize)>> {
+    let b = src.as_bytes();
+    if b.get(pos) != Some(&b'$') || b.get(pos + 1) != Some(&b'{') {
+        return Ok(None);
+    }
+    let name_start = pos + 2;
+    let Some(rel) = src[name_start..].find('}') else {
+        // 未闭合：交回调用方按字面 `$` + 后续 `{` 走原有插值路径（含其未闭合报错）。
+        return Ok(None);
+    };
+    let name = &src[name_start..name_start + rel];
+    let after = name_start + rel + 1;
+    if !wind_config::is_dir_var(name) {
+        return Ok(Some((format!("${{{name}}}"), after)));
+    }
+    // 是内部目录变量却定位不到目录：展开成空串会静默拼出错误路径（如把文件落到
+    // 盘根），故硬失败。能走到这里说明用户目录探测已经坏了，属真异常而非用法问题。
+    let dir = wind_config::dir_var_str(name)
+        .ok_or_else(|| CmdbarError::parse(pos, format!("无法定位目录变量 ${{{name}}}")))?;
+    Ok(Some((dir, after)))
 }
 
 /// UTF-8 lead 字节 → 该字符的字节数（1~4）。

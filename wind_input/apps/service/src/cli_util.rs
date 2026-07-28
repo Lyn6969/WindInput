@@ -5,33 +5,15 @@
 //! 它们操作 redb 单写者库或 coordinator 内的 override 合并逻辑，离线直写
 //! 会与运行中实例冲突，故连不上 core 一律报错退出（区别于 config 的离线降级）。
 
-use std::path::{Path, PathBuf};
-
 use serde_json::Value;
 
-/// 把内部目录变量名解析为绝对目录。返回 None = 该变量不支持或目录无法定位。
-///
-/// 三个内部目录（都可能含用户名或安装位置，硬编码进脚本不可移植）：
-/// - `APP_DIR`   程序安装目录（wind_input.exe 所在目录）
-/// - `USER_DATA` 漫游用户数据目录（`%APPDATA%\WindInput[Dev]`）
-/// - `LOCAL_DATA` 本机用户数据目录（`%LOCALAPPDATA%\WindInput[Dev]`）
-fn resolve_path_var(name: &str) -> Option<PathBuf> {
-    match name {
-        "APP_DIR" => std::env::current_exe()
-            .ok()
-            .and_then(|p| p.parent().map(Path::to_path_buf)),
-        "USER_DATA" => wind_config::Config::user_config_dir(),
-        "LOCAL_DATA" => wind_config::Config::local_dir(),
-        _ => None,
-    }
-}
-
-/// 支持的内部目录变量名（用于错误提示与文档同步）。
-const PATH_VARS: &[&str] = &["APP_DIR", "USER_DATA", "LOCAL_DATA"];
-
-/// 展开路径里的 `${VAR}` 内部目录变量（见 [`resolve_path_var`]）。`resolve`
+/// 展开路径里的 `${VAR}` 内部目录变量（变量集见 [`wind_config::dir_var`]）。`resolve`
 /// 注入变量→目录字符串的映射，便于测试；未知变量或未闭合 `${` 一律报错，
 /// 不静默留字面量——否则脚本会把文件写到诸如 `${USER_DATA}\x` 这种字面目录。
+///
+/// **与命令栏词法层的处置刻意不同**：那边未知 `${NAME}` 原样保留字面（短语文本里
+/// `${YC}` 等旧模板变量合法存在，报错会整条丢候选）；这边是文件路径参数，留字面
+/// 就是静默写坏位置，必须硬失败。两处策略勿"统一"。
 fn expand_with(input: &str, resolve: impl Fn(&str) -> Option<String>) -> anyhow::Result<String> {
     let mut out = String::with_capacity(input.len());
     let mut rest = input;
@@ -45,7 +27,7 @@ fn expand_with(input: &str, resolve: impl Fn(&str) -> Option<String>) -> anyhow:
         let dir = resolve(name).ok_or_else(|| {
             anyhow::anyhow!(
                 "未知路径变量 ${{{name}}}（支持: {}）",
-                PATH_VARS.join(" / ")
+                wind_config::dir_var_help()
             )
         })?;
         out.push_str(&dir);
@@ -62,9 +44,7 @@ fn expand_with(input: &str, resolve: impl Fn(&str) -> Option<String>) -> anyhow:
 /// 绝对化。backup 的文件读写在 core 进程内完成，必须传绝对路径（否则按 core
 /// 的工作目录解析）；dict/phrase 在 CLI 侧读写，绝对化亦无害且保持一致。
 pub fn resolve_path(input: &str) -> anyhow::Result<String> {
-    let expanded = expand_with(input, |name| {
-        resolve_path_var(name).map(|p| p.to_string_lossy().into_owned())
-    })?;
+    let expanded = expand_with(input, wind_config::dir_var_str)?;
     let abs =
         std::path::absolute(&expanded).map_err(|e| anyhow::anyhow!("路径 {expanded} 无效: {e}"))?;
     Ok(abs.to_string_lossy().into_owned())

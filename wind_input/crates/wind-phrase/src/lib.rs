@@ -699,7 +699,9 @@ fn expand_var(name: &str, now: &DateTime<Local>) -> Option<String> {
         "DC" => small_int_chinese(now.day()),
         "ts" => now.timestamp().to_string(),
         "tsms" => now.timestamp_millis().to_string(),
-        _ => return None,
+        // 内部目录变量（${APP_DIR} 等）与命令栏字符串走同一份真相源：同样的写法
+        // 若只在 $CC 里生效、直接写就不生效，用户无从分辨是语法错还是没支持。
+        _ => return wind_config::dir_var_str(name),
     })
 }
 
@@ -792,6 +794,28 @@ mod tests {
             expand_template("${YC}年${MC}月${DC}日", &now).unwrap(),
             "二〇二六年六月十四日"
         );
+    }
+
+    #[test]
+    fn test_expand_dir_var() {
+        // 内部目录变量在普通短语文本里也展开：同样的 `${APP_DIR}` 若只在 $CC 里生效、
+        // 直接写就不生效，用户无从分辨是写错了还是没支持。
+        let now = fixed();
+        let want = std::env::current_exe()
+            .unwrap()
+            .parent()
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        assert!(!want.is_empty(), "APP_DIR 期望值不该为空");
+        assert_eq!(expand_template("${APP_DIR}", &now).unwrap(), want);
+        assert_eq!(
+            expand_template(r"${APP_DIR}\data", &now).unwrap(),
+            format!(r"{want}\data")
+        );
+        // 无花括号的 `$APP_DIR` 只吃到 `$APP`（变量名扫描遇下划线即止）→ 未知 → None。
+        // 目录变量一律要求花括号形式，与 CLI 侧写法一致。
+        assert!(expand_template("$APP_DIR", &now).is_none());
     }
 
     #[test]

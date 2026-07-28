@@ -2381,6 +2381,7 @@ dependencies = [
  "regex",
  "thiserror",
  "tracing",
+ "wind-config",
 ]
 
 [[package]]
@@ -2493,6 +2494,7 @@ dependencies = [
  "toml 0.8.23",
  "tracing",
  "wind-cmdbar",
+ "wind-config",
 ]
 
 [[package]]

@@ -30,6 +30,7 @@
 - **`type(arg)` 是 eval 拦截的特例**，不经 registry 查找，直接产出 `ActionKind::Text`；其余动作函数产出 `ActionKind::Effect`。`run_actions` 先执行所有 Effect（副作用先于上屏），再拼接 Text，这个顺序不能颠倒。
 - **新增内置函数**必须在 `funcs/` 下的对应文件里用 `func_specs!` 宏声明，并在 `registry.rs` 的 `with_builtins()` 或 `full()` 中注册。`pure` 字段关系到 `assert_pure_display`——副作用函数写错 `pure=true` 会让它出现在 display 表达式里，产生候选渲染阶段的副作用。
 - **`$AA` marker** 是 Rust 版新增（Go 版无）：把一个字符串按 Unicode codepoint 拆分为逐字符候选，parser 展开为 `ArrayPhrase`，`expand_array` 处理。不要混淆 `$SS`（显式列举元素）与 `$AA`（自动按字符拆分）。
+- **`${NAME}` 是内部目录变量，不是插值**：字符串里的 `${APP_DIR}` / `${USER_DATA}` / `${LOCAL_DATA}` 在**词法期**展开为绝对目录（`lexer::scan_dir_var` → `wind_config::dir_var`），未知的 `${X}` 原样保留字面。这条豁免必须在**两条**扫描路径上同时生效——`lexer::scan_string`（带引号字符串）与 `parser::scan_template_parts`（无引号模板体）；只改一条，另一条就会把 `{NAME}` 当 `{expr}` 插值 → `UnknownFunc` → 动作静默失败或整条候选被丢弃。想在 `$` 后面紧跟真插值须写 `\${expr}`（`\$` 因此进了转义白名单）。
 - **`Services` 字段均可 `None`**；动作函数缺失服务时返回 `CmdbarError::ServiceUnavailable`，`run_actions` 收集首个错误但不中断后续动作——宿主不需要填满所有字段，但要处理返回的 `Option<CmdbarError>`。
 - **`Modifiers` 语义是 last-write-wins**（`Modifiers::get` 反向查找）；`Modifiers::merge(defaults, explicit)` 把 explicit 追加在后，自然实现 parser 的 sugar defaults 被显式声明覆盖。修改 modifier 处理逻辑时不要改成 HashMap——有序保留是有意的设计。
 - **`ResolvedAction` 不持有求值结果，只持有 `Expr`**，在 `run()` 时按当前 ctx 重新求值（对齐 Go 的闭包延迟语义）。这使 `type(last())` 每次执行都拿到最新 history，宿主在 commit 后调用 `History::push()` 即可。

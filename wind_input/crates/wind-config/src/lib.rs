@@ -6,6 +6,7 @@ pub mod app_compat;
 pub mod change_hook;
 pub mod config;
 pub mod config_schema;
+pub mod dir_var;
 pub mod hotkey;
 pub mod runtime_state;
 pub mod schema;
@@ -16,5 +17,6 @@ pub use config::{
     CodetableGlobal, Config, MixGlobal, ModeIndicatorStyle, PinyinFuzzy, PinyinGlobalConfig,
     PreeditDisplay, TopCommitMode,
 };
+pub use dir_var::{dir_var, dir_var_help, dir_var_names, dir_var_str, is_dir_var};
 pub use runtime_state::RuntimeState;
 pub use schema::Schema;
