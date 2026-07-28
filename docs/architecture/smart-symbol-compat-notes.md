@@ -154,11 +154,31 @@ if (holdActiveBeforeResponse && !(*pfEaten)
 - **这条通路恒走删改路径**。符号是经 `CommitText` 真上屏的，没有组合态可以覆盖，因此**即使用户选了 `HoldComposition` 方案，press2 也只能是 `ReplaceBackward`**（走 `smart_symbol_press2` 里 `held_text.is_none()` 那条降级分支）。也就是说上文 EverEdit / Tabby / 微信那一系列删改问题对它同样成立——而选 `HoldComposition` 的用户本来正是为了绕开删改。默认的三个进入键都不是 Shift 组合键，故 EverEdit 那条「Shift 叠加致 `VK_BACK` 变 Shift+Backspace」的坑不触发；用户把引导键配成 Shift 组合符号（如 `~`）时才会撞上。
 - **press2 的拦截点在 `handle_lifecycle.rs::try_activate_mode` 开头，必须早于模式激活链**。空闲态按下这些键会被模式进入抢走，走不到标点分支的智能符号判定——武装了也白武装。该拦截三重收窄（仅空闲态、仅被模式占用的键、仅判 press2 不武装），普通标点的路径完全不变。
 
+### 3. 英文标点状态（`symbol.english_punct_mode`）
+
+中文输入模式 + 工具栏把标点切成英文（`chinese_punct=false`）时，连按同键把英文标点换成中文。标点键在这条路上本来就进引擎（主标点分支），故是纯 Rust 改动，无宿主风险。
+
+### 4. 英文输入模式（`symbol.english_mode`）
+
+整个输入法切英文（`chinese_mode=false`）时同样可用。**这条通路要先把键从 DLL 手里要回来**：英文半角下 DLL 默认透传标点键，引擎收不到。做法是把 `symbol.english_chars` 并入 `CONFIG_KEY_CUSTOM_EN_PUNCT` 推送（`ConfigBundle::build` 合并两个来源），DLL 侧判据 `_IsCustomEnglishPunctKey` 是数据驱动的字符集查表，**C++ 一行没改**。
+
+- **铁律仍是「C++ 吃键集 ⊆ Rust 出字集」**。合并后集合同时是推送内容与 `handle_english_custom_punct` 的接手判据（都读 `rt().custom_en_punct_chars`），同源即不漂移；集合内没配英半自定义的键会出原样 ASCII，与透传等价，故并入安全。改动其中一侧时必须同时改另一侧。
+- **副作用：英文本地配对对这些键让位给 core**（`KeyEventSink.cpp` 的 `_IsCustomEnglishPunctKey` 同时是配对让位判据）。core 侧有自己的配对处理，但 DLL 的跳出栈是空的 → 若用户把配对符放进 `english_chars`，那对括号的 Tab 跳出会失效（既有已知限制的扩大面）。默认集合 `.,?!:;` 不含配对符。
+- 两个开关独立于中文侧、也彼此独立，且全部默认关——英文态默认保持纯净。
+
+### 三种上下文的共同约束
+
+`SmartSymbolArm::mode_snapshot` 记下 press1 当时的 `(chinese_mode, chinese_punct)`，press2 要求两者都没变。三种上下文各有独立开关与独立产物列，press1 后用户切了模式再按同键，必须当成全新 press1——否则会在新上下文里按旧方向删掉文档里的字。这条守卫替换了原先写死的 `state.chinese_punct` 判定。
+
+另有一个易错点：press1 的武装串必须用 `press1_committed_str` 而非 `compute_punct_str_pure`。后者的英文半角列**刻意不查自定义**（它的语义是「press2 的替换目标，须保持原样英文」），而武装串要等于真正插进文档的东西——用户把 `;` 的英半列配成 `#` 时，press1 上屏 `#` 而武装串若还是 `;`，press2 的 `prev_char` 比对永远失配、功能静默失效。三条反向通路的 press1 都落在英文列，都必须走前者。
+
 ## 相关代码位置
 
-- `wind_input/crates/wind-coordinator/src/handle_punct.rs`：`try_smart_symbol_replace`（press1 武装 + press2 分发）、`smart_symbol_press2`（press2 状态机、`prev_char` 判定、方向分歧点）、`smart_symbol_arm_str`（武装判据 + 方向判定）、`arm_smart_symbol_after_commit`（模式进入键武装）
+- `wind_input/crates/wind-coordinator/src/handle_punct.rs`：`try_smart_symbol_replace`（press1 武装 + press2 分发）、`smart_symbol_press2`（press2 状态机、`prev_char` 判定、方向分歧点）、`smart_symbol_arm_str`（中文输入模式的两种上下文 + 方向判定）、`english_mode_smart_symbol`（英文输入模式通路）、`arm_smart_symbol_after_commit`（模式进入键武装）、`press1_committed_str`（武装串的唯一真相源）
 - `wind_input/crates/wind-coordinator/src/handle_lifecycle.rs`：`try_activate_mode` 开头的 press2 拦截、`is_any_mode_trigger`
-- `wind_input/crates/wind-coordinator/tests/smart_symbol.rs`：两条新通路的端到端锁
+- `wind_input/crates/wind-coordinator/src/coordinator.rs`：`ConfigBundle::build`（吃键集合并）、`push_custom_en_punct_config`（推送时机：配置热重载广播 + 新客户端连接）
+- `wind_input/crates/wind-punct/src/lib.rs`：`english_participates`（按源字符判定的理由）、`english_smart_source_chars`
+- `wind_input/crates/wind-coordinator/tests/smart_symbol.rs`：四条通路的端到端锁
 - `wind_tsf/src/TextService.cpp`：`CommitText`、`ReplacePrecedingChars`（含 `kTryTsfRangeReplace` 开关）、`CReplaceBackwardEditSession`（含诊断用 readback 日志）
 - `wind_tsf/src/KeyEventSink.cpp` / `include/KeyEventSink.h`：`MarkSyntheticKey`、`_PushSkipKey`/`_TryConsumeSkipKey`、`_SimulatePairKey`（Shift 合成按键相关历史教训）
 

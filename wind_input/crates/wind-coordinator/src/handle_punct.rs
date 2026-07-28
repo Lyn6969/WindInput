@@ -125,6 +125,34 @@ impl Coordinator {
         wind_punct::participates(&self.rt().config.input, cn)
     }
 
+    /// press1 **实际会上屏**的串（无副作用镜像 `convert_punct`）。
+    ///
+    /// 与 [`Self::compute_punct_str_pure`] 的差别**只在英文半角这一格**：pure 那条路刻意不查
+    /// 自定义（它的语义是「press2 的替换目标，须保持原样英文」），而武装串必须等于真正插进
+    /// 文档的东西——用户把 `;` 的英半列配成 `#` 时，press1 上屏 `#` 而武装串若还是 `;`，
+    /// press2 的 `prev_char` 比对就永远失配，功能静默失效。
+    ///
+    /// 三条反向通路（数字后智能 / 英文标点状态 / 英文输入模式）的 press1 都落在英文列，
+    /// 故都必须走这里而不是 pure。
+    fn press1_committed_str(&self, state: &State, ch: char, chinese: bool) -> Option<String> {
+        if !chinese && !state.full_width {
+            let bundle = self.rt();
+            let conv = self.punct.lock().unwrap_or_else(|e| e.into_inner());
+            // 英半列（col 3）：先查自定义，无值回落原样 ASCII——与 `convert_punct` 同一条路。
+            if let Some(v) = wind_punct::custom_lookup(&conv, &bundle.config.input, ch, 3) {
+                return Some(v);
+            }
+            return Some(ch.to_string());
+        }
+        self.compute_punct_str_pure(state, ch, chinese)
+    }
+
+    /// 智能符号三个总开关是否有任一开启（入口短路用；具体该走哪个由上下文判定各自再查）。
+    fn any_smart_symbol_enabled(&self) -> bool {
+        let s = &self.rt().config.input.symbol;
+        s.smart_mode || s.english_punct_mode || s.english_mode
+    }
+
     /// 计算 `ch` 本次按下会进入的武装态：`Some((press1 实际上屏串, reverse))`；不参与返回 None。
     /// 对齐 Go `smartSymbolArmStr`（Go 版只有正向）：仅中文标点模式 + 在参与集合内。
     ///
@@ -138,18 +166,35 @@ impl Coordinator {
     ///
     /// **参与集合恒按中文产物判定**：`symbol.smart_chars` 存的是中文标点（`。，？！…`），反向时
     /// 上屏的虽是英文形，参与与否仍问它的中文形——否则用户得再维护一份英文列表，且同一个键在
-    /// 两个方向上会给出不一致的答案。
+    /// 两个方向上会给出不一致的答案。**英文标点状态则相反**，按源字符查 `symbol.english_chars`
+    /// （理由见 [`wind_punct::english_participates`]）。
     ///
     /// 另注意三者的优先级：**智能符号（短路） > 自定义映射（定产物） > 自动配对（按产物补右符）**。
     /// 武装并 `HoldComposition` 会直接 return，配对逻辑当次完全不执行——排查「配对忽然不生效」
     /// 时先看这里有没有把键截走（真机指纹：日志出现 `SmartSymbol(HoldComposition): press1`）。
+    ///
+    /// 只管中文输入模式下的两种上下文；英文输入模式走 [`Self::english_mode_smart_symbol`]
+    /// （那条路的标点键要先从 DLL 手里要回来，state 上的 `chinese_punct` 也不代表实际产物列）。
     pub(crate) fn smart_symbol_arm_str(
         &self,
         state: &State,
         ch: char,
         prev_char: u16,
     ) -> Option<(String, bool)> {
+        let bundle = self.rt();
+        let sym = &bundle.config.input.symbol;
+        // 上下文一：英文标点状态（中文输入 + 工具栏标点切英文）。恒反向，独立开关、独立集合。
         if !state.chinese_punct {
+            if !sym.english_punct_mode
+                || !wind_punct::english_participates(&bundle.config.input, ch)
+            {
+                return None;
+            }
+            let out = self.press1_committed_str(state, ch, false)?;
+            return self.reject_if_auto_paired(state, out).map(|o| (o, true));
+        }
+        // 上下文二：中文标点状态。正向；其中数字后智能标点反向（press1 仍出英文）。
+        if !sym.smart_mode {
             return None;
         }
         let reverse = self.is_smart_punct_after_digit(ch, prev_char);
@@ -160,20 +205,26 @@ impl Coordinator {
         // press1 实际上屏串：反向取英文产物——与普通标点流程一致（`convert_punct` 对数字后智能
         // 同样落英文列），两条路必须产出同一个串，否则 press2 的删除数就对不上光标前的内容。
         let out = if reverse {
-            self.compute_punct_str_pure(state, ch, false)?
+            self.press1_committed_str(state, ch, false)?
         } else {
             cn
         };
-        // 与自动配对互斥：被配对的符号（单字符且在配对表）不武装智能符号。否则 press1 插入配对
-        // 并回退光标至中间，press2 时 prevChar 恰为配对左符号 → 误删左符号改英文、留下中文右符号。
-        // 判据用**实际上屏串**而非中文串：反向时插进文档的是英文形，配对与否得问它。
+        self.reject_if_auto_paired(state, out).map(|o| (o, reverse))
+    }
+
+    /// 与自动配对互斥：被配对的符号（单字符且在生效配对表）不武装智能符号，返回 None。
+    ///
+    /// 否则 press1 插入配对并回退光标至中间，press2 时 `prev_char` 恰为配对左符号 → 误删左符号
+    /// 改成另一形态、留下孤零零的右符号。判据用**实际上屏串**：反向时插进文档的是英文形，
+    /// 配对与否得问它。
+    fn reject_if_auto_paired(&self, state: &State, out: String) -> Option<String> {
         if out.chars().count() == 1 {
             let c0 = out.chars().next().unwrap();
             if self.is_auto_pair_char(state, c0) {
                 return None;
             }
         }
-        Some((out, reverse))
+        Some(out)
     }
 
     /// 智能符号替换判定（在标点分支入口调用）。对齐 Go `trySmartSymbolReplace`：
@@ -185,7 +236,7 @@ impl Coordinator {
         ch: char,
         prev_char: u16,
     ) -> Option<KeyAction> {
-        if !self.rt().config.input.symbol.smart_mode {
+        if !self.any_smart_symbol_enabled() {
             return None;
         }
         let method = self.rt().config.input.symbol.smart_method.clone();
@@ -203,6 +254,7 @@ impl Coordinator {
                 arm.str = out.clone();
                 arm.at = Some(std::time::Instant::now());
                 arm.reverse = reverse;
+                arm.mode_snapshot = (state.chinese_mode, state.chinese_punct);
 
                 match method {
                     SmartMethod::HoldComposition => {
@@ -257,7 +309,9 @@ impl Coordinator {
     ) -> Option<KeyAction> {
         if !arm.armed
             || ch != arm.key
-            || !state.chinese_punct
+            // 上下文必须与 press1 时一致：三种上下文各有独立开关与独立产物列，press1 后用户
+            // 切了中英模式或标点模式，这一按就该当全新 press1，而不是按旧方向删掉文档里的字。
+            || arm.mode_snapshot != (state.chinese_mode, state.chinese_punct)
             || !arm
                 .at
                 .map(|t| t.elapsed() < self.smart_symbol_timeout())
@@ -359,9 +413,63 @@ impl Coordinator {
         arm.key = ch;
         arm.str = out.to_string();
         arm.at = Some(std::time::Instant::now());
+        arm.mode_snapshot = (state.chinese_mode, state.chinese_punct);
         arm.held_text = None;
         arm.hold_pending_commit = false;
         debug!("SmartSymbol(mode trigger): armed after commit: {}", out);
+    }
+
+    /// 英文输入模式（`chinese_mode=false`）的智能符号：press2 判定 + press1 武装，一次收口。
+    ///
+    /// 与中文输入模式那条路分开的三个理由：
+    ///   1. **键得先要回来**。英文半角下 DLL 默认透传标点键，引擎收不到；开了 `english_mode`
+    ///      后 core 把 `english_chars` 并入 `CONFIG_KEY_CUSTOM_EN_PUNCT` 推送，DLL 才吃下转发。
+    ///      因此本函数的调用点必须在 [`Self::handle_english_custom_punct`] /
+    ///      [`Self::handle_english_full_width`] 里——那是英文模式下标点键唯一的落点。
+    ///   2. **`state.chinese_punct` 在这条路上不代表产物列**。英文模式恒按英文列出字，与工具栏
+    ///      的中/英标点开关无关（`handle_english_custom_punct` 里临时置 false 就是这个意思），
+    ///      故上下文判定只能看 `chinese_mode`。
+    ///   3. 开关独立（`english_mode` vs `english_punct_mode`）——用户可以只要其中一个。
+    ///
+    /// `committed` 是本次 press1 会上屏的串（调用方已算好，含配对/全角处理前的标点本体）。
+    /// 返回 `Some` 表示这次是 press2，调用方应短路返回该替换响应。
+    pub(crate) fn english_mode_smart_symbol(
+        &self,
+        state: &State,
+        ch: char,
+        prev_char: u16,
+        committed: &str,
+    ) -> Option<KeyAction> {
+        let bundle = self.rt();
+        if !bundle.config.input.symbol.english_mode {
+            return None;
+        }
+        let method = bundle.config.input.symbol.smart_method.clone();
+        let mut arm = self.smart_symbol.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(act) = self.smart_symbol_press2(state, ch, prev_char, &method, &mut arm) {
+            return Some(act);
+        }
+        // press1：仅参与集合内的键武装。配对符天然被排除——调用点在配对分支**之后**，插对/跳出
+        // 的键根本走不到这里（理由同 `reject_if_auto_paired`：press1 插了一对后 `prev_char`
+        // 会是配对左符号，press2 会误删它）。
+        if !wind_punct::english_participates(&bundle.config.input, ch) {
+            arm.armed = false;
+            arm.held_text = None;
+            return None;
+        }
+        arm.armed = true;
+        // 恒反向：英文模式 press1 出英文形，press2 换中文形。
+        arm.reverse = true;
+        arm.key = ch;
+        arm.str = committed.to_string();
+        arm.at = Some(std::time::Instant::now());
+        arm.mode_snapshot = (state.chinese_mode, state.chinese_punct);
+        // 恒按删改语义武装：英文模式下 press1 是经 `CommitText` 真上屏的（无组合态可覆盖），
+        // 与模式进入键那条通路同理，press2 走 `ReplaceBackward` 降级分支。
+        arm.held_text = None;
+        arm.hold_pending_commit = false;
+        debug!("SmartSymbol(english mode): press1 armed: {}", committed);
+        None
     }
 
     /// 只做 press2 判定、不做 press1 武装 —— 供 `try_activate_mode` 抢在模式激活链之前调用。
@@ -373,7 +481,7 @@ impl Coordinator {
         ch: char,
         prev_char: u16,
     ) -> Option<KeyAction> {
-        if !self.rt().config.input.symbol.smart_mode {
+        if !self.any_smart_symbol_enabled() {
             return None;
         }
         let method = self.rt().config.input.symbol.smart_method.clone();
@@ -458,6 +566,11 @@ impl Coordinator {
                     cursor_offset,
                 });
             }
+        }
+        // 英文智能符号（`symbol.english_mode`）：同键连按把英文标点换成中文形。置于配对分支
+        // **之后**——插对/跳出的键不参与武装，否则 press2 会误删配对左符号。
+        if let Some(act) = self.english_mode_smart_symbol(state, ch, data.prev_char, &piece) {
+            return Some(act);
         }
         Some(Self::commit_action(piece, false))
     }
@@ -569,6 +682,15 @@ impl Coordinator {
                     cursor_offset,
                 });
             }
+        }
+        // 英文智能符号（`symbol.english_mode`）：同键连按把英文标点换成中文形。置于配对分支
+        // **之后**——插对/跳出的键不参与武装，否则 press2 会误删配对左符号。
+        //
+        // 注意本函数的接手判据 `custom_en_punct_chars` 已在 `ConfigBundle::build` 里并入了
+        // `english_chars`，所以开了 `english_mode` 的键即使没配英半自定义也会走到这里
+        // （出原样 ASCII，与透传等价），press1 才有落点。
+        if let Some(act) = self.english_mode_smart_symbol(state, ch, data.prev_char, &piece) {
+            return Some(act);
         }
         Some(Self::commit_action(piece, false))
     }

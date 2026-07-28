@@ -189,7 +189,13 @@ custom_enabled = false
 # 例：custom_mappings = { "." = ["。", "．", "。", "."] }
 custom_mappings = {}
 
-# 智能符号：同一中文标点在时限内连按两次，删前一字符替换为英文
+# 智能符号：同一标点在时限内连按两次，删前一字符替换为另一形态。
+# 三个总开关互相独立，各管一种上下文，都默认关：
+#   smart_mode         = 中文标点状态：连按 → 换英文（数字后智能标点方向相反，见下）
+#   english_punct_mode = 中文输入 + 标点切英文：连按 → 换中文
+#   english_mode       = 英文输入模式：连按 → 换中文
+# 后两者拆成两个开关而非一个，是因为场景不同：前者是「用英文标点写中文、偶尔要个中文句号」，
+# 后者是「正在打英文」。多数人只想要前者，英文态保持纯净。
 [input.symbol]
 smart_mode = false
 smart_timeout_ms = 500
@@ -201,6 +207,17 @@ smart_chars = "。，？！：；、～￥·……——"
 #                           超时后自动提交中文。全程不做删改，**兼容性更好**，适合在
 #                           delete_replace 下表现异常的宿主。
 smart_method = "delete_replace"
+# 英文标点状态（中文输入模式 + 工具栏标点切英文）下的智能符号
+english_punct_mode = false
+# 英文输入模式（整个输入法切英文）下的智能符号。开启会让 core 把下面 english_chars 里的键
+# 推给输入法 DLL 吃下转发——英文半角下这些键本来直接透传给宿主，不吃就到不了引擎。
+# 故此开关影响面比上一个大，默认关。
+english_mode = false
+# 参与英文智能符号的**源字符**集合（上面两个开关共用）。与 smart_chars 存中文产物不同，
+# 这里存键本身的 ASCII 标点（`.` 而非 `。`）。
+# 不建议放配对符（([{"' 等）：英文模式下这些键被吃走后配对改由引擎处理，而 DLL 的跳出栈是
+# 空的，Tab 跳出会失效。
+english_chars = ".,?!:;"
 
 [input.temp_english]
 enabled = true

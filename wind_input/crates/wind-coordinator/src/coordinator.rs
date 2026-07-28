@@ -533,8 +533,13 @@ pub(crate) struct SmartSymbolArm {
     /// 正向存中文串、反向存英文串——恒等于**实际上屏的那个串**，press2 的删除数按它算。
     pub(crate) str: String,
     /// 替换方向：false=正向（press1 中文 → press2 英文，原有语义）；
-    /// true=反向（press1 英文 → press2 中文）。反向目前唯一来源是数字后智能标点。
+    /// true=反向（press1 英文 → press2 中文）。反向来源：数字后智能标点、英文标点状态、
+    /// 英文输入模式。
     pub(crate) reverse: bool,
+    /// press1 当时的 `(chinese_mode, chinese_punct)` 快照。press2 要求两者都没变——三种上下文
+    /// （中文标点 / 英文标点 / 英文输入模式）各有独立开关与独立产物，press1 后用户切了模式，
+    /// 再按同键就该当成全新 press1，而不是在新上下文里按旧方向删字。
+    pub(crate) mode_snapshot: (bool, bool),
     /// 武装时刻（None=未武装）；用于时限判定
     pub(crate) at: Option<std::time::Instant>,
     /// HoldComposition 模式下 press1 进入组合态的中文文本（用于 disarm 时清理）。
@@ -573,9 +578,14 @@ impl ConfigBundle {
         let jump_out_keys = parse_jump_out_keys(&config.input.auto_pair.jump_out_keys);
         let jump_out_on_right_symbol =
             parse_jump_out_on_right_symbol(&config.input.auto_pair.jump_out_keys);
-        let custom_en_punct_chars = wind_punct::custom_english_punct_chars(&config.input)
-            .into_iter()
-            .collect();
+        // 英文模式下需要 DLL 吃下转发的标点键 = 「配了英半列自定义」∪「英文智能符号参与集」。
+        // 两个来源都是「英文半角下 DLL 默认透传、core 却需要收到」的键，合并成一份推送即可
+        // （DLL 侧判据是数据驱动的字符集查表，集合变大自动多吃，无需改 C++）。
+        let custom_en_punct_chars: std::collections::BTreeSet<char> =
+            wind_punct::custom_english_punct_chars(&config.input)
+                .into_iter()
+                .chain(wind_punct::english_smart_source_chars(&config.input))
+                .collect();
         Self {
             config,
             compiled_hotkeys,
@@ -3120,12 +3130,15 @@ impl Coordinator {
         }
     }
 
-    /// 下发「英半列有自定义标点映射」的源字符集合给 DLL。
+    /// 下发「英文模式下 DLL 需吃键转发」的源字符集合给 DLL。两个来源合成一份推送：
+    ///   - 配了**英半列自定义**的键（`wind_punct::custom_english_punct_chars`）；
+    ///   - 开了 `symbol.english_mode` 时的**英文智能符号参与集**（`english_smart_source_chars`）。
     ///
-    /// 英文模式（非全角）下 DLL 默认直接透传标点键、引擎收不到，英半列因此打不到；DLL 据此
-    /// 集合精确吃下这些键并转发（集合为空 = 完全保持历史行为）。**吃键集必须 ⊆ 出字集**：
-    /// 出字方 `handle_english_custom_punct` 与本推送共用 `custom_english_punct_chars` 作判据，
+    /// 英文模式（非全角）下 DLL 默认直接透传标点键、引擎收不到，上面两件事因此都无从发生；
+    /// DLL 据此集合精确吃下这些键并转发（集合为空 = 完全保持历史行为）。**吃键集必须 ⊆ 出字集**：
+    /// 出字方 `handle_english_custom_punct` 与本推送共用 `rt().custom_en_punct_chars` 作判据，
     /// 同源即不会漂移；两侧一旦不一致就是「吃了再吐」丢键（Chrome/Electron 不回退合成 WM_CHAR）。
+    /// 集合内没配英半自定义的键会出原样 ASCII（与透传等价），故并入是安全的。
     pub fn push_custom_en_punct_config(&self, client_token: u64) {
         // BTreeSet 迭代天然有序 → 推送字节可复现（与 jump_out_keys 排序同理）。
         let chars: Vec<char> = self.rt().custom_en_punct_chars.iter().copied().collect();

@@ -183,6 +183,116 @@ fn mode_trigger_not_in_smart_chars_keeps_old_behavior() {
     );
 }
 
+// ── 英文标点状态（中文输入 + 工具栏标点切英文，`english_punct_mode`）────────────────
+
+fn cfg_en_punct() -> Config {
+    let mut cfg = Config::default();
+    cfg.input.default.chinese_mode = true;
+    cfg.input.default.chinese_punct = false; // 标点切英文
+    cfg.input.symbol.english_punct_mode = true;
+    cfg
+}
+
+/// 英文标点状态：press1 出英文 `.`，时限内再按换成中文 `。`。
+#[test]
+fn english_punct_press1_english_then_press2_chinese() {
+    let coord = Coordinator::new_headless(cfg_en_punct(), Some(&data_dir()));
+    let a1 = press(&coord, VK_OEM_PERIOD, 0);
+    assert_eq!(
+        inserted(&a1),
+        Some("."),
+        "英文标点状态 press1 应出英文句点，实际: {:?}",
+        a1
+    );
+    let a2 = press(&coord, VK_OEM_PERIOD, '.' as u16);
+    assert_eq!(
+        replaced(&a2),
+        Some((1, "。")),
+        "时限内 press2 应换成中文句号，实际: {:?}",
+        a2
+    );
+}
+
+/// 中文侧总开关与英文侧**互不影响**：只开 `smart_mode`（中文侧）时英文标点状态不该有替换。
+#[test]
+fn english_punct_requires_its_own_switch() {
+    let mut cfg = cfg_en_punct();
+    cfg.input.symbol.english_punct_mode = false;
+    cfg.input.symbol.smart_mode = true; // 中文侧开着也不该外溢到英文标点状态
+    let coord = Coordinator::new_headless(cfg, Some(&data_dir()));
+    let a1 = press(&coord, VK_OEM_PERIOD, 0);
+    assert_eq!(inserted(&a1), Some("."), "实际: {:?}", a1);
+    let a2 = press(&coord, VK_OEM_PERIOD, '.' as u16);
+    assert_eq!(
+        replaced(&a2),
+        None,
+        "英文侧开关关闭时不得有任何替换，实际: {:?}",
+        a2
+    );
+}
+
+/// 参与集合按**源字符**判定：把 `english_chars` 收窄成 ","，`.` 就不再参与。
+#[test]
+fn english_punct_outside_english_chars_not_armed() {
+    let mut cfg = cfg_en_punct();
+    cfg.input.symbol.english_chars = ",".to_string();
+    let coord = Coordinator::new_headless(cfg, Some(&data_dir()));
+    press(&coord, VK_OEM_PERIOD, 0);
+    let a2 = press(&coord, VK_OEM_PERIOD, '.' as u16);
+    assert_eq!(replaced(&a2), None, "实际: {:?}", a2);
+    // 同一份配置下逗号仍参与——证明上面的 None 是集合判定所致，而非整个开关没生效。
+    press(&coord, VK_OEM_COMMA, 0);
+    let b2 = press(&coord, VK_OEM_COMMA, ',' as u16);
+    assert_eq!(replaced(&b2), Some((1, "，")), "实际: {:?}", b2);
+}
+
+// ── 英文输入模式（整个输入法切英文，`english_mode`）──────────────────────────────────
+
+fn cfg_en_mode() -> Config {
+    let mut cfg = Config::default();
+    cfg.input.default.chinese_mode = false; // 英文输入模式
+    cfg.input.symbol.english_mode = true;
+    cfg
+}
+
+/// 英文输入模式：press1 出英文 `.`（此前这个键是直接透传给宿主的），press2 换中文 `。`。
+/// 前置条件是 core 把 `english_chars` 并入了推给 DLL 的吃键集，否则引擎根本收不到这个键。
+#[test]
+fn english_mode_press1_english_then_press2_chinese() {
+    let coord = Coordinator::new_headless(cfg_en_mode(), Some(&data_dir()));
+    let a1 = press(&coord, VK_OEM_PERIOD, 0);
+    assert_eq!(
+        inserted(&a1),
+        Some("."),
+        "英文模式 press1 应由 core 出英文句点（而非 PassThrough），实际: {:?}",
+        a1
+    );
+    let a2 = press(&coord, VK_OEM_PERIOD, '.' as u16);
+    assert_eq!(
+        replaced(&a2),
+        Some((1, "。")),
+        "时限内 press2 应换成中文句号，实际: {:?}",
+        a2
+    );
+}
+
+/// 关掉 `english_mode`：标点键回到**透传**（吃键集为空，DLL 压根不吃、core 也不接手）。
+/// 这条同时锁住「开关关闭 = 与历史行为完全一致」，是本功能不惊扰纯英文用户的底线。
+#[test]
+fn english_mode_off_passes_through() {
+    let mut cfg = cfg_en_mode();
+    cfg.input.symbol.english_mode = false;
+    cfg.input.symbol.smart_mode = true; // 中文侧开着也不该外溢
+    cfg.input.symbol.english_punct_mode = true; // 英文标点状态开着同样不该外溢到英文模式
+    let coord = Coordinator::new_headless(cfg, Some(&data_dir()));
+    let a1 = press(&coord, VK_OEM_PERIOD, 0);
+    assert!(
+        matches!(a1, KeyAction::PassThrough),
+        "关掉 english_mode 后标点键应透传，实际: {:?}",
+        a1
+    );
+}
+
 /// 超时后模式进入键必须**交还**给模式激活链：武装是有时限的劫持，不是永久接管。
 #[test]
 fn mode_trigger_after_timeout_enters_mode_again() {

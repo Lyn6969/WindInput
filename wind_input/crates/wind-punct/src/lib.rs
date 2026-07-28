@@ -195,6 +195,41 @@ pub fn participates(cfg: &InputConfig, cn: &str) -> bool {
     !cn.is_empty() && cfg.symbol.smart_chars.contains(cn)
 }
 
+/// 英文智能符号：**源字符** `ch`（键本身的 ASCII 标点）是否在 `symbol.english_chars` 里。
+///
+/// 与中文侧 [`participates`] 按「实际产物」判定刻意不同——英文侧的产物通常就等于源字符，
+/// 而推给 DLL 的吃键集必须是源字符（见 [`english_smart_source_chars`]）。按源字符判定，
+/// 「参与判据」与「吃键判据」天然同源，不必从自定义英半列的产物反推回按键。
+pub fn english_participates(cfg: &InputConfig, ch: char) -> bool {
+    cfg.symbol.english_chars.contains(ch)
+}
+
+/// 英文输入模式的智能符号需要 DLL 吃下并转发的源字符集合（去重、升序）。
+///
+/// 英文半角下 DLL 默认**直接透传**标点键，引擎收不到 → 智能符号无从触发。core 把这个集合
+/// 并入 `CONFIG_KEY_CUSTOM_EN_PUNCT` 推送（与 [`custom_english_punct_chars`] 合并），DLL 据此
+/// 精确吃键。开关关闭时返回空集，英文模式行为与历史完全一致。
+///
+/// 与之配对的铁律同 [`custom_english_punct_chars`]：**C++ 吃键集必须 ⊆ Rust 出字集**。合并后的
+/// 集合同时是 DLL 吃键判据和 `Coordinator::handle_english_custom_punct` 的接手判据，同源即不漂移
+/// ——后者对没有英半自定义的键会原样出 ASCII，与透传等价，故并入是安全的。
+pub fn english_smart_source_chars(cfg: &InputConfig) -> Vec<char> {
+    if !cfg.symbol.english_mode {
+        return Vec::new();
+    }
+    let mut out: Vec<char> = Vec::new();
+    for c in cfg.symbol.english_chars.chars() {
+        // 空白不是按键产物，混进集合会让 DLL 吃下空格键（`IsPunctuationKey` 挡得住，但判据
+        // 应当自己干净）。
+        if c.is_whitespace() || out.contains(&c) {
+            continue;
+        }
+        out.push(c);
+    }
+    out.sort_unstable();
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -251,6 +286,34 @@ mod tests {
         assert!(participates(&c, "。"));
         assert!(!participates(&c, "！"));
         assert!(!participates(&c, ""));
+    }
+
+    /// 英文侧参与判定按**源字符**（键本身的 ASCII），与中文侧按产物刻意不同。
+    #[test]
+    fn english_participates_by_source_char() {
+        let mut c = cfg();
+        c.symbol.english_chars = ".,".to_string();
+        assert!(english_participates(&c, '.'));
+        assert!(english_participates(&c, ','));
+        assert!(!english_participates(&c, '?'));
+    }
+
+    /// 推给 DLL 的吃键集受 `english_mode` 门控：关闭时必须是空集——英文模式的标点键就该
+    /// 保持透传，多吃一个键就是一次潜在丢键（吃了再吐，严格 TSF 宿主不回退合成 WM_CHAR）。
+    #[test]
+    fn english_smart_source_chars_gated_by_switch() {
+        let mut c = cfg();
+        c.symbol.english_chars = ".,;".to_string();
+        assert!(
+            english_smart_source_chars(&c).is_empty(),
+            "开关关闭时不得吃任何键"
+        );
+        c.symbol.english_mode = true;
+        // 升序去重（推送字节须可复现）。
+        assert_eq!(english_smart_source_chars(&c), vec![',', '.', ';']);
+        // 空白不是按键产物，不进吃键集。
+        c.symbol.english_chars = ". ,".to_string();
+        assert_eq!(english_smart_source_chars(&c), vec![',', '.']);
     }
 
     #[test]

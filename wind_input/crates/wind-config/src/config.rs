@@ -854,21 +854,49 @@ pub enum TopCommitMode {
     DirectCommit,
 }
 
-/// 智能符号配置（[input.symbol]）：同一中文标点在时限内连按两次，删前一字符替换为英文。
+/// 智能符号配置（[input.symbol]）：同一标点在时限内连按两次，删前一字符替换为另一形态。
+///
+/// 三个总开关**互相独立**，各管一种上下文，都默认关：
+///   - `smart_mode`：中文标点状态 —— press1 中文 → press2 英文（数字后智能标点方向相反）。
+///   - `english_punct_mode`：中文输入 + 英文标点状态 —— press1 英文 → press2 中文。
+///   - `english_mode`：英文输入模式 —— 同上，但发生在整个输入法切英文时。
+///
+/// 后两者拆成两个开关而非一个，是因为它们是**不同场景**：前者是「用英文标点写中文、偶尔要个
+/// 中文句号」，后者是「正在打英文」。很多人只想要前者，英文态保持纯净。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SymbolConfig {
     /// 智能符号模式总开关（默认 false）。
     #[serde(default)]
     pub smart_mode: bool,
-    /// 判定时限（毫秒，默认 500）。
+    /// 判定时限（毫秒，默认 500）。三种上下文共用。
     #[serde(default = "default_smart_symbol_timeout_ms")]
     pub smart_timeout_ms: i32,
     /// 参与智能符号转换的中文标点集合（子串包含匹配，含成对/多字符标点）。
     #[serde(default = "default_smart_symbol_chars")]
     pub smart_chars: String,
     /// 替换方案：`delete_replace`（删改，默认）或 `hold_composition`（保持组合态，兼容性更好）。
+    /// 三种上下文共用。
     #[serde(default)]
     pub smart_method: SmartMethod,
+    /// 英文标点状态（中文输入模式 + 工具栏标点切英文）下的智能符号（默认 false）。
+    #[serde(default)]
+    pub english_punct_mode: bool,
+    /// 英文输入模式（整个输入法切英文）下的智能符号（默认 false）。
+    ///
+    /// 开启会让 core 把 `english_chars` 里的键推给 DLL 吃下转发——英文半角下这些键本来是直接
+    /// 透传给宿主的，不吃就永远到不了引擎。故此开关的影响面比另外两个大，默认关。
+    #[serde(default)]
+    pub english_mode: bool,
+    /// 参与英文智能符号的**源字符**集合（`english_punct_mode` 与 `english_mode` 共用）。
+    ///
+    /// 与 `smart_chars` 存中文产物不同，这里存的是**键本身的 ASCII 标点**（`.` 而非 `。`）：
+    /// 英文侧的产物通常就等于源字符，而推给 DLL 的吃键集必须是源字符——按源字符判定，
+    /// 两边同源、无需从产物反推。
+    ///
+    /// **不建议放配对符**（`([{"'` 等）：英文模式下这些键被吃走后，配对改由 core 处理，而
+    /// DLL 的跳出栈是空的，Tab 跳出会失效（见 `handle_english_custom_punct` 的已知限制）。
+    #[serde(default = "default_english_smart_chars")]
+    pub english_chars: String,
 }
 
 impl Default for SymbolConfig {
@@ -878,6 +906,9 @@ impl Default for SymbolConfig {
             smart_timeout_ms: default_smart_symbol_timeout_ms(),
             smart_chars: default_smart_symbol_chars(),
             smart_method: SmartMethod::default(),
+            english_punct_mode: false,
+            english_mode: false,
+            english_chars: default_english_smart_chars(),
         }
     }
 }
@@ -1848,6 +1879,12 @@ fn default_smart_symbol_timeout_ms() -> i32 {
 
 fn default_smart_symbol_chars() -> String {
     "。，？！：；、～￥·……——".to_string()
+}
+
+/// 参与英文智能符号的源字符默认集：`smart_chars` 那批中文标点对应的 ASCII 键，去掉配对符
+/// （配对符在英文模式下被吃走会让 DLL 的 Tab 跳出失效，见 `SymbolConfig::english_chars`）。
+fn default_english_smart_chars() -> String {
+    ".,?!:;".to_string()
 }
 
 fn default_filter_mode() -> String {
