@@ -51,6 +51,10 @@ const OVERFLOW_VALUES: &[&str] = &["ignore", "commit", "commit_and_input"];
 /// 码表词频应用策略。
 const FREQ_STRATEGY_VALUES: &[&str] = &["top", "step"];
 
+/// 模式级候选布局意图（`LayoutIntent` 的 serde 形态）。临拼/临英/网址/加词共用；
+/// mix / special 的同名字段是 StructList 条目内的属性，不在本注册表单独登记。
+const LAYOUT_INTENT_VALUES: &[&str] = &["follow", "vertical", "horizontal"];
+
 /// 全部配置字段声明（单一真相源）。与 [`Config`] 经测试反向对照，保证零漂移。
 /// 域划分见 `docs/config-key-migration.md`（不做向后兼容，旧键已弃）。
 static REGISTRY: &[ConfigField] = &[
@@ -119,7 +123,9 @@ static REGISTRY: &[ConfigField] = &[
     // 快捷输入：各候选来源的开关与优先级在 schema.mix_modes 的 members 里（有无=开关，
     // 顺序=优先级）；总开关＝把 quick_mix 的 trigger_keys 清空。此处只有全局行为项。
     f("schema.quick_input.decimal_places", Int),
-    f("schema.quick_input.force_vertical", Bool),
+    // 强制竖排原在此（force_vertical）。它其实是 quick_mix **实例**的显示属性，已迁往
+    // mix_modes[].candidate_layout；per-instance 字段由 StructList 条目承载，不另立项
+    // （一个配置键只能有一个 manifest 项）。
     f("schema.special_modes", StructList),
     f("schema.mix_modes", StructList),
     // -- input（输入行为）--
@@ -162,12 +168,25 @@ static REGISTRY: &[ConfigField] = &[
     f("input.temp_english.trigger_keys", StrList),
     f("input.temp_english.allow_symbols", Bool),
     f("input.temp_english.space_as_input", Bool),
+    f(
+        "input.temp_english.candidate_layout",
+        Enum(LAYOUT_INTENT_VALUES),
+    ),
     f("input.capslock.cancel_on_mode_switch", Bool),
     f("input.temp_pinyin.enabled", Bool),
     f("input.temp_pinyin.trigger_keys", StrList),
     f("input.temp_pinyin.hotkey", Str),
+    f(
+        "input.temp_pinyin.candidate_layout",
+        Enum(LAYOUT_INTENT_VALUES),
+    ),
     f("input.url.enabled", Bool),
     f("input.url.prefixes", StrList),
+    f("input.url.candidate_layout", Enum(LAYOUT_INTENT_VALUES)),
+    f(
+        "input.add_word.candidate_layout",
+        Enum(LAYOUT_INTENT_VALUES),
+    ),
     f("input.s2t.enabled", Bool),
     f("input.s2t.variant", Str),
     f("input.cmdbar.enabled", Bool),

@@ -459,8 +459,6 @@ pub(crate) struct State {
     pub(crate) temp_pinyin_schema: String,
     /// 临时拼音组合区前缀字符（触发键，如 "`"）
     pub(crate) temp_pinyin_prefix: String,
-    /// 融合「快捷」含 quick_input 成员时「强制竖排」记住进入前的布局（Some(原 vertical) = 已强制，退出恢复）。
-    pub(crate) quick_saved_vertical: Option<bool>,
     /// 临时英文输入缓冲
     pub(crate) temp_english_buffer: String,
     /// 临时英文编码区光标（`temp_english_buffer` 内字节偏移）
@@ -518,8 +516,6 @@ pub(crate) struct State {
     /// `add_word_code` 的音节边界（见 `wind_dict::binformat::DictEntry::boundary`）；
     /// 0 = 无信息（码表反查/逐字兜底）。与 code 同生同灭，入库时一并写入用户词。
     pub(crate) add_word_boundary: u64,
-    /// 加词模式「强制竖排」时记住进入前的布局（Some(原 vertical) = 已强制，退出恢复）。
-    pub(crate) add_word_saved_vertical: Option<bool>,
 }
 
 /// 智能符号模式待命态：press1 提交一个参与集合内的标点后武装，等待时限内同键 press2
@@ -762,7 +758,12 @@ pub struct Coordinator {
     /// 候选窗隐藏开关（命令栏 ime.toggle("candwin") 切换；隐藏时 notify_ui_update 不显示候选）。
     hide_candidate_window: Mutex<bool>,
     /// 候选布局方向运行时态（命令栏 ime.toggle("layout") 切换；true=竖排，初值随配置，持久化）。
-    candidate_vertical: Mutex<bool>,
+    ///
+    /// 这是布局方向的**基线真相源**——模式级覆盖（`layout.rs`）在它之上叠加，不改写它。
+    pub(crate) candidate_vertical: Mutex<bool>,
+    /// 上次真正下发给 UI 的候选方向（`layout.rs` 的去重缓存，避免每次按键重发致重排抖动）。
+    /// 与 `candidate_vertical` 的区别：后者是基线，本字段是**叠加模式意图后实际生效**的值。
+    pub(crate) candidate_layout_sent: Mutex<bool>,
     /// 输入统计采集器（内存聚合 + 后台 flush，与 store 共享 Arc）；None=无持久化/headless。
     pub(crate) stat_collector: Option<StatCollector>,
     /// 本次按键是否已被具体上屏路径记录统计（AtomicBool，避免与 state 锁冲突致死锁）。
@@ -1234,7 +1235,6 @@ impl Coordinator {
                 temp_pinyin_cursor: 0,
                 temp_pinyin_schema: String::new(),
                 temp_pinyin_prefix: String::new(),
-                quick_saved_vertical: None,
                 temp_english_buffer: String::new(),
                 temp_english_cursor: 0,
                 temp_english_prefix: String::new(),
@@ -1262,7 +1262,6 @@ impl Coordinator {
                 add_word_len: 0,
                 add_word_code: String::new(),
                 add_word_boundary: 0,
-                add_word_saved_vertical: None,
             }),
             push_server,
             rt: std::sync::RwLock::new(std::sync::Arc::new(bundle)),
@@ -1319,6 +1318,7 @@ impl Coordinator {
             preedit_display: Mutex::new(preedit_display_init),
             hide_candidate_window: Mutex::new(hide_candidate_window_init),
             candidate_vertical: Mutex::new(candidate_vertical_init),
+            candidate_layout_sent: Mutex::new(candidate_vertical_init),
             stat_collector,
             stat_recorded: std::sync::atomic::AtomicBool::new(false),
             fullscreen_cached: std::sync::atomic::AtomicBool::new(false),
@@ -1884,13 +1884,21 @@ impl Coordinator {
     pub(crate) fn apply_ui_config(&self) {
         let bundle = self.rt();
         let cand = &bundle.config.ui.candidate;
-        // 候选排列方向（ui.candidate.layout == "vertical"）
+        // 候选排列方向（ui.candidate.layout == "vertical"）：config 是**基线**的持久化真相源，
+        // 但实际下发要叠加当前模式的布局意图（见 layout.rs）——热重载不能把模式级覆盖清掉。
+        // 此前这里无条件下发 config 值：模式进行中改任意一项设置都会静默取消强制竖排，
+        // 且因为不留痕迹而极难复现。
         let vertical = cand.layout.eq_ignore_ascii_case("vertical");
         *self
             .candidate_vertical
             .lock()
             .unwrap_or_else(|e| e.into_inner()) = vertical;
-        let _ = self.ui_tx.send(UiCommand::SetCandidateLayout(vertical));
+        {
+            // 调用点（启动 / 配置重载）均不持 state 锁；加锁顺序 state → candidate_layout_sent
+            // 与 notify_ui_update 一致，不构成环。
+            let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+            self.sync_candidate_layout(&state);
+        }
         // 编码显示方式（ui.candidate.preedit_display）
         let mode = cand.preedit();
         *self
@@ -2324,7 +2332,12 @@ impl Coordinator {
             *v = !*v;
             *v
         };
-        let _ = self.ui_tx.send(UiCommand::SetCandidateLayout(vertical));
+        // 翻转的是**基线**；实际下发仍要叠加当前模式意图（见 layout.rs），否则在强制竖排的
+        // 模式里切换会绕过覆盖直接改方向，且去重缓存与真实下发值脱节。
+        {
+            let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+            self.sync_candidate_layout(&state);
+        }
         // 持久化 ui.candidate.layout（重启后保留）。
         if let Err(e) = Config::set_user_string(
             &["ui", "candidate", "layout"],
@@ -2387,6 +2400,10 @@ impl Coordinator {
             self.reset_first_show();
             return;
         }
+        // 模式级候选布局：按当前模式意图叠加全局基线重算方向，与上次下发不同才下发。
+        // 必须在下方 UpdateCandidates **之前**——同 channel 按序处理，UI 先改方向再填候选。
+        // 这是「强制竖排/横排」的唯一执行点，模式进入/退出各处都不再自己动布局（见 layout.rs）。
+        self.sync_candidate_layout(state);
         // 延迟首次显示：新组合首帧若非经授权（reflow 后权威坐标 / 兜底 timer）则不立即显示，
         // 改 arm 兜底 timer，待 handle_caret_update 的权威坐标或超时再首显。避免在 reflow 前的
         // 陈旧坐标处先显示、reflow 后再跳（根治"上屏后立即输入候选窗错位约一个上屏宽度"）。

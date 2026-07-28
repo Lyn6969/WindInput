@@ -23,6 +23,7 @@ pub mod handle_tooltip;
 pub mod handle_url;
 pub mod hotkey_match;
 pub mod input_diag;
+pub mod layout;
 pub mod pipeline;
 pub(crate) mod preedit_cursor;
 pub mod stats;

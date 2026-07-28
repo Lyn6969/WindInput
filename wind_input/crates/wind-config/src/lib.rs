@@ -14,8 +14,8 @@ pub mod startup_trace;
 pub mod variant;
 
 pub use config::{
-    CodetableGlobal, Config, MixGlobal, ModeIndicatorStyle, PinyinFuzzy, PinyinGlobalConfig,
-    PreeditDisplay, TopCommitMode,
+    CodetableGlobal, Config, LayoutIntent, MixGlobal, ModeIndicatorStyle, PinyinFuzzy,
+    PinyinGlobalConfig, PreeditDisplay, TopCommitMode,
 };
 pub use dir_var::{dir_var, dir_var_help, dir_var_names, dir_var_str, is_dir_var};
 pub use runtime_state::RuntimeState;
