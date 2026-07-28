@@ -5,15 +5,19 @@
 #include <string>
 
 // Log path macros for debug variant coexistence
+//
+// 变体隔离**只做在目录一层**：dev 与正式版的数据目录本就分开
+// （`WindInputDev` / `WindInput`），目录内的文件名再带 `_dev` 是重复隔离，
+// 只会让两版本的排查步骤（找哪个文件、写哪个配置）无谓地不一致。
+// 故文件名与配置名两版本一律同名，切换变体时排查命令原样可用。
 #ifdef WIND_DEV_VARIANT
 #define WIND_LOG_DIR_NAME       L"WindInputDev"
-#define WIND_LOG_FILE_NAME      L"wind_tsf_dev.log"
-#define WIND_LOG_CONFIG_NAME    L"tsf_dev_log_config"
 #else
 #define WIND_LOG_DIR_NAME       L"WindInput"
-#define WIND_LOG_FILE_NAME      L"wind_tsf.log"
-#define WIND_LOG_CONFIG_NAME    L"tsf_log_config"
 #endif
+#define WIND_LOG_FILE_NAME      L"wind_tsf.log"
+#define WIND_LOG_OLD_FILE_NAME  L"wind_tsf.old.log"
+#define WIND_LOG_CONFIG_NAME    L"tsf_log_config"
 
 // ============================================================================
 // FileLogger - Multi-process safe logging for TSF DLL

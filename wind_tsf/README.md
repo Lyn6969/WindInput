@@ -54,7 +54,7 @@ wind_tsf/
 
 ```bash
 make                       # → build/wind_tsf.dll
-make DEV_VARIANT=1       # → build_dev/wind_tsf_dev.dll（独立 CLSID/管道/日志）
+make DEV_VARIANT=1       # → build_dev/wind_tsf_dev.dll（独立 CLSID/管道/日志目录）
 # 或经 dev.sh：
 ../scripts/dev.sh tsf            # release
 ../scripts/dev.sh tsf debug      # dev 变体

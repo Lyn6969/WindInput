@@ -139,6 +139,8 @@ cmake --build . --config Release      # → build/Release/wind_tsf.dll
 - 四种输出模式：`none`（默认，零开销）/ `file` / `debugstring` / `all`
 - 日志文件：`%LOCALAPPDATA%\WindInput\logs\wind_tsf.log`
 - 配置文件：`%LOCALAPPDATA%\WindInput\logs\tsf_log_config`（mode/level 两个键）
+- dev 变体只换目录（`WindInputDev\logs\`），**文件名与配置名同正式版**——目录已隔离，
+  文件名不再重复带 `_dev`；互斥体名仍按变体区分（机器级命名空间，见 `FileLogger.cpp` 注释）
 - 多进程安全：Named Mutex + append 模式文件 I/O
 - 自动轮转：超过 5MB 时重命名为 `wind_tsf.old.log`
 - 在 `dllmain.cpp` 的 DLL_PROCESS_ATTACH / DLL_PROCESS_DETACH 中 Init/Shutdown

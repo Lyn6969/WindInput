@@ -59,6 +59,10 @@ void CFileLogger::Init()
         return;
 
     // Create named mutex for file write synchronization (only needed for file mode)
+    //
+    // 互斥体名仍按变体区分——这里和日志**文件名**是两码事：文件名靠父目录隔离即可，
+    // 而互斥体名活在**机器级**内核对象命名空间里，两版本共用一个名字就会为写各自
+    // 不同的文件而互相阻塞。别因为文件名统一了就顺手把这里也合并。
     if (_mode == LogMode::File || _mode == LogMode::All)
     {
 #ifdef WIND_DEV_VARIANT
@@ -296,11 +300,7 @@ void CFileLogger::_RotateIfNeeded()
 
     wchar_t oldPath[MAX_PATH];
     _snwprintf_s(oldPath, _countof(oldPath), _TRUNCATE,
-#ifdef WIND_DEV_VARIANT
-        L"%ls\\wind_tsf_dev.old.log", _logDir);
-#else
-        L"%ls\\wind_tsf.old.log", _logDir);
-#endif
+        L"%ls\\" WIND_LOG_OLD_FILE_NAME, _logDir);
 
     DeleteFileW(oldPath);
     MoveFileW(_logPath, oldPath);
