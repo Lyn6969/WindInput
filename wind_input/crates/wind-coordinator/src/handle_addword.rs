@@ -341,27 +341,20 @@ impl Coordinator {
     /// 而推导那一半此前从未实现，于是 `coad` 恒在下面第一道守卫处失败、且只有一句 warn
     /// 日志、用户侧完全无感——「选了没反应」即由此而来。
     ///
-    /// 成功/失败都弹一次 toast：命令动作链的错误在 `run_command_candidate` 仅 `warn!`，
-    /// 不给可见反馈的话同类欠账还会继续潜伏。
+    /// 成功弹一次 toast 回显入库的词——这条具体反馈只有本函数给得出（通用失败路径
+    /// 拿不到词本身）。
+    ///
+    /// **失败不在此弹**：动作链的失败反馈统一由 [`Coordinator::run_command_candidate`]
+    /// 收口，本函数只把错误原样上抛。职责这样切分是为了不重复弹窗——本函数唯一的
+    /// 非测试调用点就是 cmdbar 的 `DictService::add`，两处都弹会得到两个 toast。
     pub(crate) fn cmd_dict_add(&self, text: &str, code: &str) -> anyhow::Result<()> {
-        match self.try_dict_add(text, code) {
-            Ok(word) => {
-                self.show_toast(
-                    &format!("已加词：{}", toast_clamp(&word)),
-                    ToastPosition::BottomCenter,
-                    ToastKind::Success,
-                );
-                Ok(())
-            }
-            Err(e) => {
-                self.show_toast(
-                    &format!("加词失败：{}", e),
-                    ToastPosition::BottomCenter,
-                    ToastKind::Error,
-                );
-                Err(e)
-            }
-        }
+        let word = self.try_dict_add(text, code)?;
+        self.show_toast(
+            &format!("已加词：{}", toast_clamp(&word)),
+            ToastPosition::BottomCenter,
+            ToastKind::Success,
+        );
+        Ok(())
     }
 
     /// `cmd_dict_add` 的实际逻辑，成功返回入库的词（供 toast 回显）。

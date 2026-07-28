@@ -23,6 +23,7 @@ use wind_cmdbar::{
     ClipboardService, ConfigService, DictService, EvalContext, ImeController, ProcessRunner,
     Services, UrlOpener,
 };
+use wind_ui::toast::{ToastKind, ToastPosition};
 
 impl Coordinator {
     /// 构造后装配 cmdbar：自身 Weak 引用 + Services。一次性，幂等。
@@ -56,6 +57,11 @@ impl Coordinator {
     /// type() 文本经 push 管道上屏；其余为副作用。文本上屏后稍候再跑后续副作用，
     /// 让落字先于后续按键（如 `type("「」")` 后 `key.tap("Left")` 才能把光标落到括号中间）。
     /// **必须在独立线程、未持 state 锁时调用**（控制器会回调自锁的 coordinator 方法）。
+    ///
+    /// 失败一律弹 toast：此前求值/动作错误只进 `warn!` 日志，用户侧是「选了没反应」的
+    /// 哑失败——短语写错一个函数名或变量名，除了翻日志没有任何线索。这里是动作链的
+    /// 唯一失败出口，各动作自身不再重复弹（成功回显仍归各动作，见 `cmd_dict_add`）。
+    /// 整条链只弹**第一个**错误：链上后续动作往往因同一根因连环失败，逐个弹会刷屏。
     pub(crate) fn run_command_candidate(&self, src: &str, input: &str) {
         let Some(services) = self.cmdbar_services.get() else {
             return;
@@ -77,11 +83,14 @@ impl Coordinator {
             Ok(wind_cmdbar::PhraseEval::Array(_)) => return,
             Err(e) => {
                 warn!("cmdbar 命令求值失败 ({:?}): {}", src, e);
+                self.show_command_error(&e.to_string());
                 return;
             }
         };
         let mut text_pending = false;
         let mut first_text = true;
+        // 只留第一个错误：链上后续动作常因同一根因连环失败，逐个弹 toast 会刷屏。
+        let mut first_err: Option<String> = None;
         for a in &actions {
             match a.kind {
                 wind_cmdbar::ActionKind::Text => match a.run(&ctx, reg) {
@@ -96,7 +105,10 @@ impl Coordinator {
                         text_pending = true;
                     }
                     Ok(_) => {}
-                    Err(e) => warn!("cmdbar type 动作失败: {}", e),
+                    Err(e) => {
+                        warn!("cmdbar type 动作失败: {}", e);
+                        first_err.get_or_insert_with(|| e.to_string());
+                    }
                 },
                 wind_cmdbar::ActionKind::Effect => {
                     if text_pending {
@@ -105,10 +117,27 @@ impl Coordinator {
                     }
                     if let Err(e) = a.run(&ctx, reg) {
                         warn!("cmdbar 动作失败: {}", e);
+                        first_err.get_or_insert_with(|| e.to_string());
                     }
                 }
             }
         }
+        if let Some(msg) = first_err {
+            self.show_command_error(&msg);
+        }
+    }
+
+    /// 命令动作失败的用户可见反馈。消息取 `CmdbarError` 的 Display（形如
+    /// `open: …` / `unknown function: …`），足以指认是哪个函数、什么问题。
+    ///
+    /// toast 是 UI 通道不落盘，不受日志隐私红线约束；但错误消息本身仍会进 `warn!`
+    /// 日志，故各动作的错误文案不得携带用户输入内容（见 `handle_addword` 的说明）。
+    fn show_command_error(&self, msg: &str) {
+        self.show_toast(
+            &format!("命令执行失败：{msg}"),
+            ToastPosition::BottomCenter,
+            ToastKind::Error,
+        );
     }
 
     /// 顶码等同步场景：求值命令源，动作链**全为 Text**（无副作用）时返回拼接文本 `Some(text)`；
