@@ -1765,10 +1765,13 @@ fn test_special_mode_nonempty_enter_clear_discards() {
     }
 }
 
-/// 临时英文打了内容再回车：clear 应整段放弃。
-/// 注：临英回车上屏的是英文原文而非「编码」，纳入本配置管辖属用户明确决策。
+/// 临时英文**豁免** clear：打了内容再回车仍须上屏。
+///
+/// 临英缓冲装的是英文原文而非「编码」，且 `space_as_input` 开启后空格被占作输入字符、
+/// 上屏职责整个压在回车上 —— clear 若管辖非空缓冲，本模式一个上屏通路都不剩。
+/// 故临英的 clear 只管空缓冲（见下一个测试），非空缓冲无条件上屏。
 #[test]
-fn test_temp_english_nonempty_enter_clear_discards() {
+fn test_temp_english_nonempty_enter_clear_still_commits() {
     if !has_schemas() {
         return;
     }
@@ -1787,8 +1790,65 @@ fn test_temp_english_nonempty_enter_clear_discards() {
         disp
     );
     match coord.handle_key_event(&key_event(0x0D, EVENT_KEY_DOWN)) {
+        KeyAction::InsertText { text, .. } => {
+            assert_eq!(text, "abc", "临英非空缓冲回车应豁免 clear、照常上屏原文");
+        }
+        other => panic!("临英非空缓冲回车应上屏原文，实际: {:?}", other),
+    }
+}
+
+/// 临英 clear 的**保留边界**：空缓冲（只按了触发键）回车仍按 clear 放弃，不回显触发键字符。
+/// 没有它，「豁免」会被误实现成「临英完全不读 enter_behavior」而无人察觉。
+#[test]
+fn test_temp_english_empty_enter_clear_discards_prefix() {
+    if !has_schemas() {
+        return;
+    }
+    let mut cfg = config_with_english_trigger("wubi86", "slash");
+    cfg.input.enter_behavior = "clear".into();
+    let coord = Coordinator::new_headless(cfg, Some(&data_dir()));
+    let act = coord.handle_key_event(&key_event(0xBF, EVENT_KEY_DOWN)); // /
+    assert_eq!(action_text(&act).unwrap(), "/", "斜杠应进入临时英文");
+    match coord.handle_key_event(&key_event(0x0D, EVENT_KEY_DOWN)) {
         KeyAction::ClearComposition => {}
-        other => panic!("clear 模式临英非空缓冲回车应清空不上屏，实际: {:?}", other),
+        other => panic!("clear 模式临英空缓冲回车应清空不上屏，实际: {:?}", other),
+    }
+}
+
+/// 用户实报场景：`space_as_input` + `enter_behavior=clear` 叠加曾使临英**没有任何上屏通路**
+/// —— 空格让位给输入字符，回车又被 clear 拿走，打进去的英文只能靠 Esc 丢弃。
+#[test]
+fn test_temp_english_space_as_input_enter_clear_still_commits() {
+    if !has_schemas() {
+        return;
+    }
+    let mut cfg = config_with_english_trigger("wubi86", "slash");
+    cfg.input.enter_behavior = "clear".into();
+    cfg.input.temp_english.space_as_input = true;
+    let coord = Coordinator::new_headless(cfg, Some(&data_dir()));
+    let act = coord.handle_key_event(&key_event(0xBF, EVENT_KEY_DOWN)); // /
+    assert_eq!(action_text(&act).unwrap(), "/", "斜杠应进入临时英文");
+    for c in "hi".chars() {
+        press_letter(&coord, c);
+    }
+    coord.handle_key_event(&key_event(0x20, EVENT_KEY_DOWN)); // 空格入缓冲
+    let mut last = KeyAction::Consumed;
+    for c in "there".chars() {
+        last = press_letter(&coord, c);
+    }
+    assert_eq!(
+        action_text(&last).unwrap(),
+        "/hi there",
+        "前置条件：空格应入缓冲而非上屏"
+    );
+    match coord.handle_key_event(&key_event(0x0D, EVENT_KEY_DOWN)) {
+        KeyAction::InsertText { text, .. } => {
+            assert_eq!(
+                text, "hi there",
+                "space_as_input + clear 下回车仍须上屏整句"
+            );
+        }
+        other => panic!("回车应上屏整句，实际: {:?}", other),
     }
 }
 

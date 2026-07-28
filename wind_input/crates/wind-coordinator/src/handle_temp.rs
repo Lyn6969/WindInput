@@ -719,10 +719,12 @@ impl Coordinator {
                 }
             }
             keymap::VK_RETURN => {
-                // clear 模式：放弃缓冲，不上屏任何内容（含空缓冲时的触发键回显）。
-                // 注：临英回车上屏的是英文原文而非「编码」，纳入 enter_behavior 管辖属用户明确
-                // 决策——四种模式的回车语义统一，优先于「编码」一词的字面含义。
-                if self.enter_clears_composition() {
+                // clear 模式在临英**只管空缓冲**：临英缓冲装的是英文原文而非「编码」，
+                // 且 `space_as_input` 开启后空格被占作输入字符、上屏职责整个压在回车上——
+                // 若 clear 一并管辖非空缓冲，本模式将一个上屏通路都不剩（只余 Esc 放弃整段），
+                // 打进去的内容永远出不来。故非空缓冲无条件走下方上屏路径，不读该配置。
+                // 空缓冲本就没有内容可上屏，clear 语义照旧：不回显触发键字符。
+                if self.enter_clears_composition() && state.temp_english_buffer.is_empty() {
                     self.exit_temp_english(state);
                     self.notify_ui_hide();
                     return KeyAction::ClearComposition;
