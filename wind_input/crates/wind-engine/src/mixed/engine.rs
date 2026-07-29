@@ -81,6 +81,10 @@ pub struct MixedEngine {
     auto_commit_block_on_pinyin: bool,
     /// 输入超过码表最大码长时仅查拼音（主流混输行为，对齐 Go PinyinOnlyOverflow）。
     /// false 时走「码表前 N 码 + 拼音完整输入」混合 overflow。
+    ///
+    /// 「仅查拼音」有一个例外口 [`Self::codetable_owns_overflow`]：前 N 码是码表精确全码而拼音
+    /// 主张不了整串时，码表候选照样回捞、顶码照样放行。它同时管着本项在 `convert_overflow` 与
+    /// `handle_top_code` 两处的表现，改判据须两处一起验。
     pinyin_only_overflow: bool,
     /// 顶码歧义裁决（对齐 Go TopCodeOverridePinyin）：前缀既是完整拼音又是唯一五笔全码时，
     /// true 放行顶码倒向五笔，false（默认）维持拼音保护。
@@ -202,6 +206,53 @@ impl MixedEngine {
         self.secondary
             .as_ref()
             .is_some_and(|sec| sec.is_possible_pinyin_sequence(input))
+    }
+
+    /// 拼音是否**主张**这个超码长串（「这串确实归拼音管」）。两条任一成立即主张：
+    /// - `pinyin_may_continue`：还没打完（`youyo` = you + `yo`，`yo` 是合法音节前缀）；
+    /// - 拼音首选**解释了整串**（`consumed_length` 覆盖全长；0 = 引擎未标注，按整串算，与
+    ///   `is_ambiguous_pinyin_word` 同口径）。简拼串走的正是这一支——`pinyin_may_continue`
+    ///   只认全拼音节前缀，对简拼恒 false（见其文档）。
+    ///
+    /// 反面即「拼音打岔了」：`yijga`（五笔全码 `yijg`=就是 再多打一个字母）拼音只切得出 `yi`、
+    /// 余下 `jga` 连音节前缀都不是，首选「以」只消费 2/5 —— 这种串不该由拼音独占。
+    ///
+    /// 与 `is_ambiguous_pinyin_word` 的分工：那个判「拼音**已经**成词」（看词典权重，用于否决
+    /// 上屏），本函数判「拼音**够不够格接管整串**」（看覆盖度，用于超码长归属）。
+    fn pinyin_claims_overflow(&self, input: &str) -> bool {
+        if self.pinyin_may_continue(input) {
+            return true;
+        }
+        let Some(sec) = &self.secondary else {
+            return false;
+        };
+        let Ok(r) = sec.convert(input, 1) else {
+            return false;
+        };
+        let input_len = input.chars().count();
+        r.candidates
+            .first()
+            .is_some_and(|c| c.consumed_length == 0 || c.consumed_length >= input_len)
+    }
+
+    /// 超码长时**码表前 N 码是否比拼音更有话说**：⓪ `pinyin_only_overflow` 的例外口，
+    /// 顶码（`handle_top_code`）与候选装配（`convert_overflow`）共用同一判据。两条缺一不可：
+    /// - 前 N 码前缀恰是码表**精确全码**（`yijg` = 唯一编码「就是」）——只有前缀确实成码才值得
+    ///   让码表回来；否则捞回的全是前缀补全候选，纯属刷屏。拼音打错一个字母（`nihxo`）也靠这条
+    ///   兜住：`nihx` 在五笔没有精确全码 → 仍归拼音，不会被五笔顶码截胡；
+    /// - 拼音并不主张这一串（见 [`Self::pinyin_claims_overflow`]）。
+    ///
+    /// ⚠️ 判据落在**前 N 码前缀**而非整串，这是本函数存在的全部理由：`convert_overflow` 原有的
+    /// 逃生口 `has_full_input_match(input) || has_longer_code(input)` 问的是**整串**，而定长码表
+    /// （五笔 4 码封顶）里根本不存在 5 码词条 —— 那个条件对五笔恒假，等于没有逃生口，于是
+    /// `yijg` + **任意**字母都被拼音「以」整串接管，且关掉全部上屏否决开关也无济于事
+    /// （①②③ 与 ⓪ 是独立通路）。真机实测即由此而来。
+    fn codetable_owns_overflow(&self, input: &str) -> bool {
+        if self.max_code_len == 0 {
+            return false;
+        }
+        let prefix: String = input.chars().take(self.max_code_len).collect();
+        self.primary.has_full_input_match(&prefix) && !self.pinyin_claims_overflow(input)
     }
 
     /// 码表候选按混输策略提权（短语独立档 +1M / 精确 +boost / 前缀补全 +500K）。
@@ -336,15 +387,40 @@ impl MixedEngine {
             let mut pinyin = py.candidates;
             // 英文候选（enable_english 开时）：独立加权档，与拼音/码表统一混入（对齐 Go 各路径处理英文）。
             let english = self.english_candidates(input, max_candidates);
-            // 长码特例：完整 input 在码表有精确/更长后继 → 追加码表候选，拼音归一化降档避免档位重叠。
-            let mut merged = if has_full_or_longer {
+            // 码表回捞（两条互补的口子，任一成立即把码表候选并回来，拼音同时归一化降档避免
+            // 档位重叠）：
+            // - 长码特例 `has_full_or_longer`：**整串**在码表有精确匹配/更长后继。只有码长可变
+            //   的码表够得着——五笔这类定长码表恒假（4 码封顶，不存在 5 码词条）。
+            // - `codetable_owns_overflow`：**前 N 码**是精确全码而拼音并不主张这一串
+            //   （`yijg`+任意字母）。这条才是定长码表的逃生口，与顶码 ⓪ 共用判据。
+            let ct_owns = self.codetable_owns_overflow(input);
+            let mut merged = if has_full_or_longer || ct_owns {
                 Self::normalize_pinyin(&mut pinyin);
-                let mut ct = self
-                    .primary
-                    .convert(input, max_candidates)
-                    .unwrap_or_default()
-                    .candidates;
-                self.boost_codetable(&mut ct, input);
+                let mut ct = if has_full_or_longer {
+                    let mut full = self
+                        .primary
+                        .convert(input, max_candidates)
+                        .unwrap_or_default()
+                        .candidates;
+                    self.boost_codetable(&mut full, input);
+                    full
+                } else {
+                    // 前 N 码前缀候选：前缀视作精确全码加权（同混合 overflow 分支的口径），
+                    // 但 `is_exact_code` 归一到**完整输入** —— 前缀恒短于 input，故一律 false，
+                    // 免得下游（协调器 `candidate_display_order` / `freq_rerank`）把只匹配
+                    // 前缀的候选当成本次输入的精确匹配提拔进精确档。
+                    let prefix: String = input.chars().take(self.max_code_len).collect();
+                    let mut pre = self
+                        .primary
+                        .convert(&prefix, max_candidates)
+                        .unwrap_or_default()
+                        .candidates;
+                    for c in &mut pre {
+                        c.is_exact_code = false;
+                    }
+                    self.boost_codetable(&mut pre, &prefix);
+                    pre
+                };
                 ct.extend(english);
                 Self::merge_sort_dedup(ct, pinyin, max_candidates)
             } else if !english.is_empty() {
@@ -603,7 +679,8 @@ impl Engine for MixedEngine {
     /// （`pinyin_vetoes_commit`），未被否决才委托主码表顶码。两条上屏通路同一套判据，杜绝
     /// "满码不否决、顶码却否决"的不一致。
     ///
-    /// - ⓪ `pinyin_only_overflow` 且整串有拼音候选 → 超码长即纯拼音语境，抑制顶码（见下）；
+    /// - ⓪ `pinyin_only_overflow` 且整串有拼音候选 → 超码长即纯拼音语境，抑制顶码（见下）。
+    ///   例外：`codetable_owns_overflow`（前 N 码是精确全码 + 拼音主张不了整串）时放行；
     /// - ① `auto_commit_block_on_pinyin` 且整串有拼音候选 → 抑制顶码（打开时 wangba/aipu 等含拼音
     ///   读法的串都让路拼音）；
     /// - ② `block_commit_on_pinyin_word` 且整串是强拼音词（wangba→网吧）→ 抑制顶码；
@@ -654,10 +731,17 @@ impl Engine for MixedEngine {
                 // 候选都没有）若也禁顶码，`convert_overflow` 的纯拼音分支同样交不出候选——
                 // 用户会卡在一个既不上屏、又没候选的长串上，没有出口。
                 //
+                // **例外口 `codetable_owns_overflow`**：前 N 码是精确全码而拼音只解释得了开头
+                // 一小截（`yijg`=就是，再打任意字母 → 拼音只切出 `yi`，余下连音节前缀都不是）。
+                // 这种串归码表，放行顶码。没有这个例外时 ⓪ 是一票独占：用户把 ①②③ 全关也
+                // 改变不了结果——它们是彼此独立的通路，⓪ 只受 `top_code_override_pinyin` 压制。
+                // 不必担心卡死：例外成立⇒前缀确有精确全码，码表侧顶码必给得出结果；即便码表侧
+                // 因整串有更长后继而返回 None，`convert_overflow` 的长码特例也照样交得出候选。
+                //
                 // 与 ① 的分工：① 不限超码长（满码时同样生效）、由 `auto_commit_block_on_pinyin`
                 // 驱动；⓪ 只在本函数成立（此处已确认 `input_len > max_code_len`）、由
                 // `pinyin_only_overflow` 驱动。两者独立配置，任一命中即否决。
-                if self.pinyin_only_overflow && has_pinyin {
+                if self.pinyin_only_overflow && has_pinyin && !self.codetable_owns_overflow(input) {
                     return None;
                 }
                 if self.pinyin_vetoes_commit(input, has_pinyin) {
