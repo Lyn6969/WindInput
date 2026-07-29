@@ -165,7 +165,8 @@ public:
     void EndComposition(ITfDocumentMgr* pDocMgrHint = nullptr);
 
     // Reset KeyEventSink composing state (called after push pipe commit/clear)
-    void ResetComposingState();
+    // keepPairState=TRUE 时保留自动配对状态，语义见 CKeyEventSink::ResetComposingState。
+    void ResetComposingState(BOOL keepPairState = FALSE);
 
     // 输入态整体清理：结束 composition + 通知服务端清 buffer + 复位 KeyEventSink 会话态。
     // 触发时机**不是**「失去焦点」而是「离开了原来那个文档」——失焦那一刻无从区分抖动

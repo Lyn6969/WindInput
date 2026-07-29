@@ -2083,6 +2083,9 @@ STDAPI CTextService::OnSetFocus(ITfDocumentMgr* pDocMgrFocus, ITfDocumentMgr* pD
         // 同一文档抖回来时**不**复位：_isComposing/_hasCandidates 一旦清零，
         // hasInputSession 即为假，紧接着的 Backspace / 空格 / 数字选字会被判为
         // 「无输入会话」而透传给宿主。上面 doc_changed 分支已负责真正换文档的复位。
+        //
+        // 配对状态同样在此复位（跨焦点保留已于 2026-07-29 放弃，理由见
+        // CleanupInputStateForDocChange）。
         if (!isSameDocMgr && _pKeyEventSink != nullptr)
         {
             _pKeyEventSink->ResetComposingState();
@@ -2780,7 +2783,7 @@ STDAPI CTextService::OnChange(REFGUID rguid)
             _pKeyEventSink->FlushEnglishStats();
 
         EndComposition();
-        ResetComposingState();
+        ResetComposingState(TRUE);  // 中英切换保留配对状态：光标与已插入的右符号都没变
 
         BOOL newChineseMode = bWantChinese;
         if (_pIPCClient != nullptr && _pIPCClient->IsConnected())
@@ -2906,7 +2909,7 @@ STDAPI CTextService::OnChange(REFGUID rguid)
 
     // End any active composition since we're switching modes
     EndComposition();
-    ResetComposingState();
+    ResetComposingState(TRUE);  // 中英切换保留配对状态：光标与已插入的右符号都没变
 
     // Notify Go service of the mode switch (sync: may return CommitText for pending input)
     if (_pIPCClient != nullptr && _pIPCClient->IsConnected())
@@ -4369,7 +4372,7 @@ void CTextService::HandleCtrlSpaceToggle()
 
     // End any active composition
     EndComposition();
-    ResetComposingState();
+    ResetComposingState(TRUE);  // 中英切换保留配对状态：光标与已插入的右符号都没变
 
     // Notify Go service of the mode switch
     if (_pIPCClient != nullptr && _pIPCClient->IsConnected())
@@ -5278,6 +5281,11 @@ void CTextService::CleanupInputStateForDocChange(ITfDocumentMgr* pDocMgrHint, ui
 
     if (_pKeyEventSink != nullptr)
     {
+        // 失焦一律复位，**配对状态也不例外**（keepPair 取默认 FALSE）。
+        // 曾按 reason 细分保留过（THREAD 时光标其实还在括号中间），2026-07-29 真机后放弃：
+        // 本 DLL 的 _pairPendingDepth 是**每个宿主进程各自一份**的，而 core 侧是全局单栈，
+        // 两种作用域模型对不齐；开启「为每个应用配置不同输入法」后切换应用还会重建整个
+        // IME 上下文。实测「大部分情况不行」——功能时灵时不灵比没有更糟，故收敛为确定行为。
         _pKeyEventSink->ResetComposingState();
     }
 }
@@ -5425,11 +5433,11 @@ void CTextService::EndComposition(ITfDocumentMgr* pDocMgrHint)
     pContext->Release();
 }
 
-void CTextService::ResetComposingState()
+void CTextService::ResetComposingState(BOOL keepPairState)
 {
     if (_pKeyEventSink != nullptr)
     {
-        _pKeyEventSink->ResetComposingState();
+        _pKeyEventSink->ResetComposingState(keepPairState);
     }
 }
 

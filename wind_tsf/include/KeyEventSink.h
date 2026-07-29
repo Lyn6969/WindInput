@@ -11,11 +11,16 @@
 
 class CTextService;
 
-// Lightweight pair engine for English auto-pair (C++ side, for English mode)
+// 英文自动配对的**查表**（不再持有栈）。
+//
+// 配对状态的唯一真相源是协调器的 `pair_tracker`，四条建立路径（中文标点 / 英文全角 /
+// 英半自定义 / 英半普通）全部入那一个栈；DLL 这边只回答「这个键该不该吃下转发」，
+// 并用 `_pairPendingDepth` 作吃键闸门。
+//
+// 此前这里另有一个栈，与协调器的栈互相看不见，于是「中文里打的配对切到英文跳不出、
+// 反之亦然」——那是三处记账、三个互不相认的判定入口造成的，删栈即消除该类根因。
 class PairEngine {
 public:
-    struct Entry { wchar_t left; wchar_t right; };
-
     void SetEnabled(bool enabled) { _enabled = enabled; }
     bool IsEnabled() const { return _enabled; }
 
@@ -26,7 +31,6 @@ public:
             _pairMap[p.first] = p.second;
             _rightSet.insert(p.second);
         }
-        _stack.clear();
     }
 
     bool IsLeft(wchar_t ch) const { return _pairMap.count(ch) > 0; }
@@ -36,25 +40,13 @@ public:
         return it != _pairMap.end() ? it->second : 0;
     }
 
-    void Push(wchar_t left, wchar_t right) { _stack.push_back({left, right}); }
-    bool Peek(Entry& entry) const {
-        if (_stack.empty()) return false;
-        entry = _stack.back();
-        return true;
-    }
-    bool Pop(Entry& entry) {
-        if (_stack.empty()) return false;
-        entry = _stack.back();
-        _stack.pop_back();
-        return true;
-    }
-    void Clear() { _stack.clear(); }
-    bool IsEmpty() const { return _stack.empty(); }
+    // 吃键判据：开关已开 且 该字符在生效配对表内。**吃键面不得超出此判据**——
+    // 协调器侧 `handle_english_custom_punct` 用同源判据出字，漂移即「吃了再吐」丢键。
+    bool ShouldEat(wchar_t ch) const { return _enabled && (IsLeft(ch) || IsRight(ch)); }
 
 private:
     std::map<wchar_t, wchar_t> _pairMap;
     std::set<wchar_t> _rightSet;
-    std::vector<Entry> _stack;
     bool _enabled = false;
 };
 
@@ -91,7 +83,29 @@ public:
     // 用于 Excel/WPS cell-select(按数字直通) → cell-edit(按标点) 这种焦点切换
     // 场景的数字后智能标点判断。残留由按键事件路径（_SendKeyToService 非智能
     // 标点目标键清零）和光标 Y 跨行检测兜底，不应在 IME 会话状态重置时一起清。
-    void ResetComposingState() { _isComposing = FALSE; _hasCandidates = FALSE; _needsCompositionResync = FALSE; _resyncDeadline = 0; _resyncFailStreak = 0; _skipKeyCount = 0; _pendingPairAction = {}; _englishPairEngine.Clear(); _pairPendingDepth = 0; }
+    // keepPairState=TRUE：保留自动配对状态（`_englishPairEngine` 与 `_pairPendingDepth`）。
+    // 配对状态的前提是「光标紧贴一个已插入的右符号」。中英模式切换与上屏都不移动光标、
+    // 也不消除那个右符号，前提仍成立，清掉只会让 Tab/Enter 跳不出去（切走再切回、或
+    // 配对里打完字再跳出）。真正让前提失效的是焦点/文档切换与组合被清，那些路径按默认值全清。
+    void ResetComposingState(BOOL keepPairState = FALSE) {
+        _isComposing = FALSE; _hasCandidates = FALSE; _needsCompositionResync = FALSE; _resyncDeadline = 0; _resyncFailStreak = 0; _skipKeyCount = 0; _pendingPairAction = {};
+        if (!keepPairState) { _pairPendingDepth = 0; _pairLastActivityTick = 0; }
+    }
+
+    // 配对状态保活：所有按键都应调用（含英文模式的普通字母——协调器在英文模式下收不到
+    // 它们，只有这里能看全）。栈空（depth==0）时不记，避免空状态攒出活动时间。
+    void TouchPairState() { if (_pairPendingDepth > 0) _pairLastActivityTick = GetTickCount64(); }
+
+    // 配对状态是否已陈旧。TTL=0 表示不过期。
+    //
+    // **判据必须留在 DLL 侧**：吃键闸门在这里，若只有协调器过期而这边照吃跳出键，
+    // 协调器回 PassThrough 已太晚——OnTestKeyDown 已经吃了，再吐成 FALSE 就是「吃了再吐」，
+    // 不补发 WM_KEYDOWN 的宿主（EverEdit 等）直接丢键。
+    BOOL IsPairStateStale() const {
+        if (_pairStateTtlMs == 0 || _pairPendingDepth <= 0 || _pairLastActivityTick == 0)
+            return FALSE;
+        return (GetTickCount64() - _pairLastActivityTick) >= _pairStateTtlMs;
+    }
 
     // Flush pending English pass-through stats before focus/mode teardown.
     void FlushEnglishStats();
@@ -139,9 +153,14 @@ private:
     // 待跳出配对深度：收到 InsertTextWithCursor(配对插入)时 +1，MoveCursorRight(跳出)时 -1，
     // 会话/焦点复位归零（见 ResetComposingState）。中文模式据此判断 Enter 等键是否该转发。
     int _pairPendingDepth = 0;
+    // 配对状态最后一次活动时刻（GetTickCount64，0=无）与时效阈值（毫秒，0=不过期）。
+    // 阈值由协调器经 CONFIG_KEY_PAIR_STATE_TTL 推送，见 IsPairStateStale。
+    ULONGLONG _pairLastActivityTick = 0;
+    ULONGLONG _pairStateTtlMs = 0;
     bool _IsJumpOutKey(UINT vk) const { return _jumpOutKeys.count(vk) > 0; }
-    // 输入右符号本身是否跳出（配置 jump_out_keys 里的 `right_symbol` 特殊值）。右符号不是
-    // 固定按键（取决于配对表），故与 _jumpOutKeys 分开存。对称配对（引号）不受此项影响。
+    // 输入右符号本身是否跳出（配置 jump_out_keys 里的 `right_symbol` 特殊值）。
+    // **本 DLL 已不再消费它**——右符号跳出统一由协调器裁决（配对栈在那边，需要比对具体是
+    // 哪一对）。但仍须解析：它占 payload 首字节，不读就会算错后面 VK 列表的偏移。
     bool _jumpOutOnRightSymbol = false;
     // 「英半列有自定义标点映射」的源字符集合（core 经 CONFIG_KEY_CUSTOM_EN_PUNCT 推送）。
     // 英文模式（非全角）本 DLL 默认透传标点键 → core 收不到 → 英半列打不到；据此**精确**吃下

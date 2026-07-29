@@ -530,23 +530,18 @@ STDAPI CKeyEventSink::OnTestKeyDown(ITfContext* pContext, WPARAM wParam, LPARAM 
     // 全角时本地配对让位给 core：全角下 `(` 要出 `（` 并配 `）`，而本引擎只认半角配对表；
     // 若在此吃键本地插入，会出半角配对且与 core 的 pair_tracker 双重处理。全角态统一由
     // core 的 handle_english_full_width 出字+配对（配对表由 english_pairs 过同一条流水线派生）。
-    if (!isChineseMode && _englishPairEngine.IsEnabled()
+    // 全角时本地不判：全角配对由 core 经 english_fullwidth 分支出字（配对表由 english_pairs
+    // 过同一条流水线派生），此处只需不重复吃键。
+    if (!isChineseMode
         && !_pTextService->IsFullWidth()
         && !(modifiers & (KEYMOD_CTRL | KEYMOD_ALT)))
     {
-        // 配对跳出键：栈非空时吃键，让 OnKeyDown 稳定被调用执行跳出（严格 TSF 宿主
-        // 只有 OnTestKeyDown 吃键才会回调 OnKeyDown）。排除 Shift 组合。
-        if (!_englishPairEngine.IsEmpty() && _IsJumpOutKey((UINT)wParam) && !(modifiers & KEYMOD_SHIFT))
-        {
-            *pfEaten = TRUE;
-            _LogKeyDecision(L"test_down", _pTextService->GetFocusSessionId(), wParam, modifiers, HotkeyType::None,
-                            isChineseMode, hasComposition, _hasCandidates, hasInputSession, TRUE, L"english_pair_jumpout");
-            return S_OK;
-        }
         bool hasShift = (modifiers & KEYMOD_SHIFT) != 0;
         wchar_t pairChar = _MapVkToEnglishPairChar(wParam, hasShift);
-        if (pairChar != 0 && (_englishPairEngine.IsLeft(pairChar) || _englishPairEngine.IsRight(pairChar)))
+        if (pairChar != 0 && _englishPairEngine.ShouldEat(pairChar))
         {
+            // 吃下转发给 core 出字 + 记栈（不再本地插入）。判据与 core 的
+            // handle_english_custom_punct 同源，漂移即「吃了再吐」丢键。
             *pfEaten = TRUE;
             _LogKeyDecision(L"test_down", _pTextService->GetFocusSessionId(), wParam, modifiers, HotkeyType::None,
                             isChineseMode, hasComposition, _hasCandidates, hasInputSession, TRUE, L"english_autopair");
@@ -554,28 +549,37 @@ STDAPI CKeyEventSink::OnTestKeyDown(ITfContext* pContext, WPARAM wParam, LPARAM 
         }
     }
 
-    // Clear English pair stack when non-pair key is pressed in English mode
-    if (!isChineseMode && !_englishPairEngine.IsEmpty())
+    // 配对跳出键：**全模式统一闸门**，不再按中英/全半角分岔。
+    //
+    // `_pairPendingDepth > 0` 本身就蕴含「开了配对、确实插入过、尚未跳出」，故没配对时
+    // 一个 Tab/Enter 都不会被吃。陈旧状态由 TTL 挡掉——用户中途用鼠标点走、删掉括号这类
+    // 操作输入法感知不到，没有时效的话状态会一直存活到吃掉用户的 Tab。
+    //
+    // 吃键后一律转发协调器裁决（真相源在那边）。此前英文分支自己持栈本地跳出、中文分支
+    // 转发，两套判据互不相认，正是跨模式跳不出的根因。
+    if (_pairPendingDepth > 0 && !IsPairStateStale()
+        && _IsJumpOutKey((UINT)wParam)
+        && !(modifiers & (KEYMOD_CTRL | KEYMOD_ALT | KEYMOD_SHIFT)))
     {
-        // If we reach here, the key was NOT a pair key (would have returned above)
-        _englishPairEngine.Clear();
+        *pfEaten = TRUE;
+        // 部署指纹（勿删）：grep 构建产物 = 编进去了、grep 部署目录 = 换上了、
+        // 真机日志出现本行 = 运行时确实加载了新 DLL。C++ 侧「看起来成功但没换二进制」
+        // 已让本仓空转过好几轮真机验证。
+        WIND_LOG_DEBUG_FMT(L"cross-mode jumpout: vk=0x%02X depth=%d chinese=%d\n",
+                           (uint32_t)wParam, _pairPendingDepth, isChineseMode ? 1 : 0);
+        _LogKeyDecision(L"test_down", _pTextService->GetFocusSessionId(), wParam, modifiers,
+                        CHotkeyManager::ClassifyInputKey(wParam, modifiers),
+                        isChineseMode, hasComposition, _hasCandidates, hasInputSession, TRUE, L"pair_jumpout_forward");
+        return S_OK;
     }
+
+    // 配对状态保活。**必须在上面的陈旧判定之后**，否则每次按键都先把自己刷新掉，TTL 永不触发。
+    // 放在这里能覆盖英文模式的普通字母——协调器在英文模式下收不到它们，只有 DLL 看得全，
+    // 这也是 TTL 判据必须以 DLL 侧为准的原因之一。
+    TouchPairState();
 
     if (hasInputSession || isChineseMode)
     {
-        // 配对跳出键（中文模式）：有待跳出配对时即使无输入会话也吃键，让 OnKeyDown 转发
-        // 给协调器执行跳出。Tab 走下方 session_select_or_page 分支在中文模式本就转发，
-        // 此处专补 Enter 等被 session 门控的键。排除 Ctrl/Alt/Shift 组合。
-        if (_pairPendingDepth > 0 && _IsJumpOutKey((UINT)wParam)
-            && !(modifiers & (KEYMOD_CTRL | KEYMOD_ALT | KEYMOD_SHIFT)))
-        {
-            *pfEaten = TRUE;
-            _LogKeyDecision(L"test_down", _pTextService->GetFocusSessionId(), wParam, modifiers,
-                            CHotkeyManager::ClassifyInputKey(wParam, modifiers),
-                            isChineseMode, hasComposition, _hasCandidates, hasInputSession, TRUE, L"pair_jumpout_forward");
-            return S_OK;
-        }
-
         // Ctrl/Alt combos during active input session: intercept so OnKeyDown can
         // send to Go for state cleanup, then pass through to the host application.
         // This prevents dangling composition state when user presses Ctrl+S, Ctrl+C, etc.
@@ -791,95 +795,15 @@ STDAPI CKeyEventSink::OnKeyDown(ITfContext* pContext, WPARAM wParam, LPARAM lPar
     if (_pTextService->IsPasswordSuppressActive())
         return S_OK;
 
-    // English auto-pair handling (before toggle key detection and Go IPC).
-    // 必须跳过 Ctrl/Alt 组合：否则 Ctrl+Shift+] 等功能热键在 OnTestKeyDown 已按
-    // 白名单吃键后，OnKeyDown 会被 auto-pair 当成 '}' 直接 InsertText，永远发不到 core
-    // （表现为英文模式上屏 }，中文正常；Ctrl+Shift+E / \ 不受影响因非配对字符）。
-    // 全角时本地配对让位给 core（与 OnTestKeyDown 的同款守卫必须成对，否则该处不吃、
-    // 此处却仍本地插入半角配对，全角配对永远不生效）。
-    // 「英半自定义标点」的键同样让位给 core（与上面全角让位同源）：OnTestKeyDown 已吃下它
-    // 等 core 出字，若此处本地配对抢先 CommitText 并 return，转发就被吞掉、自定义永不生效。
-    if (!_pTextService->IsChineseMode() && _englishPairEngine.IsEnabled()
-        && !_pTextService->IsFullWidth()
-        && !_IsCustomEnglishPunctKey(wParam, CHotkeyManager::GetCurrentModifiers()))
-    {
-        uint32_t mods = CHotkeyManager::GetCurrentModifiers();
-        if (!(mods & (KEYMOD_CTRL | KEYMOD_ALT)))
-        {
-            // 配对跳出键（Tab/Enter 等）：英文配对栈非空时按此键 = 越过右符号跳出，
-            // 等效输入右符号。置于 pairChar 映射之前——跳出键本身不是配对字符。
-            // 排除 Shift 组合（Shift+Tab 回退制表 / Shift+Enter 软换行不应被劫持）。
-            if (!_englishPairEngine.IsEmpty() && _IsJumpOutKey((UINT)wParam) && !(mods & KEYMOD_SHIFT))
-            {
-                PairEngine::Entry entry;
-                _englishPairEngine.Pop(entry);
-                WIND_LOG_DEBUG_FMT(L"English auto-pair: jump-out key vk=0x%02X -> VK_RIGHT\n", (uint32_t)wParam);
-                _SimulatePairKey(VK_RIGHT);
-                *pfEaten = TRUE;
-                return S_OK;
-            }
-            bool hasShift = (mods & KEYMOD_SHIFT) != 0;
-            wchar_t pairChar = _MapVkToEnglishPairChar(wParam, hasShift);
-
-            if (pairChar != 0)
-            {
-                // Smart skip: right bracket matches stack top.
-                // 对称配对（引号 `"` `'`：左右同形，IsLeft/IsRight 同时为真）不走此路——
-                // 按键不携带「开/闭」这一位，无从判断用户想跳出还是想嵌套新的一对，故一律
-                // 按「开新的一对」处理（落到下面的 IsLeft 分支），跳出交给配对跳出键。
-                // 不排除的话会与 core 侧同源的「一次出对、一次出单」交替循环一致地复发。
-                if (_englishPairEngine.IsRight(pairChar) && _englishPairEngine.IsLeft(pairChar))
-                {
-                    // 对称配对键落此分支：不做任何右符号判定，直接交给下面的 IsLeft 开新的一对。
-                    WIND_LOG_DEBUG_FMT(L"English auto-pair: symmetric pair '%c', always open new pair\n", pairChar);
-                }
-                else if (_englishPairEngine.IsRight(pairChar) && _jumpOutOnRightSymbol)
-                {
-                    PairEngine::Entry entry;
-                    if (_englishPairEngine.Peek(entry) && entry.right == pairChar)
-                    {
-                        _englishPairEngine.Pop(entry);
-                        WIND_LOG_DEBUG_FMT(L"English auto-pair: smart skip '%c'\n", pairChar);
-                        _SimulatePairKey(VK_RIGHT);
-                        *pfEaten = TRUE;
-                        return S_OK;
-                    }
-                    // Stack doesn't match — clear and let the char through
-                    _englishPairEngine.Clear();
-                    // Fall through to insert the right bracket normally
-                }
-
-                // Auto-pair: left bracket
-                if (_englishPairEngine.IsLeft(pairChar))
-                {
-                    wchar_t rightChar = _englishPairEngine.GetRight(pairChar);
-                    if (rightChar != 0)
-                    {
-                        std::wstring pairText;
-                        pairText += pairChar;
-                        pairText += rightChar;
-
-                        WIND_LOG_DEBUG_FMT(L"English auto-pair: insert pair '%c%c'\n", pairChar, rightChar);
-                        _pTextService->CommitText(pairText);
-                        _SimulatePairKey(VK_LEFT);
-                        _englishPairEngine.Push(pairChar, rightChar);
-
-                        *pfEaten = TRUE;
-                        return S_OK;
-                    }
-                }
-
-                // Right bracket with no stack match: insert the character normally
-                if (_englishPairEngine.IsRight(pairChar))
-                {
-                    std::wstring ch(1, pairChar);
-                    _pTextService->InsertText(ch);
-                    *pfEaten = TRUE;
-                    return S_OK;
-                }
-            }
-        }
-    }
+    // 英文自动配对**不再在此本地处理**：OnTestKeyDown 已按 `PairEngine::ShouldEat` 吃下配对键，
+    // 这里直接落到下方的 `_SendKeyToService`，由 core 出字 + 记栈（与「英半自定义标点」同一条路）。
+    //
+    // 之所以搬走：配对状态原先分散在 core 的 pair_tracker 与这里的英文栈两处，谁也看不见谁，
+    // 于是中文里打的配对切到英文跳不出、反之亦然。现在四条建立路径全部入 core 的那一个栈，
+    // 本文件只留吃键判据与 `_pairPendingDepth` 闸门。
+    //
+    // IPC 断连时的兜底见下方 `ipc_failed_*` 分支：那时不能吐成 pfEaten=FALSE（已经吃了），
+    // 否则不补发 WM_KEYDOWN 的宿主直接丢字符。
 
     uint32_t modifiers = CHotkeyManager::GetCurrentModifiers();
     uint32_t keyHash = CHotkeyManager::CalcKeyHash(modifiers, (uint32_t)wParam);
@@ -1104,6 +1028,18 @@ STDAPI CKeyEventSink::OnKeyDown(ITfContext* pContext, WPARAM wParam, LPARAM lPar
     // Track whether this is a Ctrl/Alt combo that needs cleanup-then-passthrough
     BOOL isCtrlAltCleanup = FALSE;
 
+    // 配对跳出键的统一判据，**必须与 OnTestKeyDown 的 pair_jumpout_forward 逐条一致**。
+    //
+    // ⚠️ 必须在 `hasInputSession || isChineseMode` 这个门**之外**放行：英文模式没有输入会话，
+    // 判据写在门里面就永远进不去 —— 那边吃了、这边不发，键凭空消失。真机实测正是如此：
+    // 日志里 `cross-mode jumpout ... depth=1 chinese=0` 连打 45 次（每次都吃），而同一时段
+    // core 侧一条日志都没有（根本没收到），用户看到的现象就是「英文下 Tab/Enter 全无反应」。
+    BOOL isPairJumpOut = (_pairPendingDepth > 0 && !IsPairStateStale()
+                          && _IsJumpOutKey((UINT)wParam)
+                          && !(modifiers & (KEYMOD_CTRL | KEYMOD_ALT | KEYMOD_SHIFT)));
+    if (isPairJumpOut)
+        isInputKey = TRUE;
+
     if (hasInputSession || isChineseMode)
     {
         // Ctrl/Alt combos during active input session: mark as input key so we can
@@ -1125,10 +1061,9 @@ STDAPI CKeyEventSink::OnKeyDown(ITfContext* pContext, WPARAM wParam, LPARAM lPar
         {
             HotkeyType keyType = CHotkeyManager::ClassifyInputKey(wParam, modifiers);
 
-            // 配对跳出键（中文模式）：有待跳出配对时转发给协调器执行跳出，即使无会话
-            // （与 OnTestKeyDown 的 pair_jumpout_forward 对称）。排除 Ctrl/Alt/Shift 组合。
-            if (_pairPendingDepth > 0 && _IsJumpOutKey((UINT)wParam)
-                && !(modifiers & (KEYMOD_CTRL | KEYMOD_ALT | KEYMOD_SHIFT)))
+            // 配对跳出键复用门外算好的判据。**必须留在本链首位**：否则中文模式无会话时
+            // 会被下面那条 `isInputKey = hasInputSession` 覆盖回 FALSE，又变成吃了不发。
+            if (isPairJumpOut)
             {
                 isInputKey = TRUE;
             }
@@ -1159,6 +1094,16 @@ STDAPI CKeyEventSink::OnKeyDown(ITfContext* pContext, WPARAM wParam, LPARAM lPar
     // 英文模式 + 半角 + 该键配了英半列：与 OnTestKeyDown 的 english_custom_punct 分支成对，
     // 必须同条件放行转发，否则那边吃了、这边不发 → 键彻底丢失。
     else if (!isChineseMode && _IsCustomEnglishPunctKey(wParam, modifiers))
+    {
+        isInputKey = TRUE;
+    }
+    // 英文模式 + 半角 + 该键是配对字符：与 OnTestKeyDown 的 english_autopair 分支成对，
+    // 同理必须同条件放行。英文配对改由 core 出字 + 记栈后，这条放行就是它唯一的转发出口——
+    // 少了它就是「OnTestKeyDown 吃下、OnKeyDown 不发」，键彻底消失。
+    else if (!isChineseMode && !_pTextService->IsFullWidth()
+             && !(modifiers & (KEYMOD_CTRL | KEYMOD_ALT))
+             && _englishPairEngine.ShouldEat(
+                    _MapVkToEnglishPairChar(wParam, (modifiers & KEYMOD_SHIFT) != 0)))
     {
         isInputKey = TRUE;
     }
@@ -1230,10 +1175,29 @@ STDAPI CKeyEventSink::OnKeyDown(ITfContext* pContext, WPARAM wParam, LPARAM lPar
         }
         else
         {
-            // 非字母按键（符号、标点等）：放行给应用程序处理
-            *pfEaten = FALSE;
-            _LogKeyDecision(L"down", _pTextService->GetFocusSessionId(), wParam, modifiers, HotkeyType::None,
-                            isChineseMode, hasComposition, _hasCandidates, hasInputSession, FALSE, L"ipc_failed_passthrough");
+            // 英文配对键的断连兜底：OnTestKeyDown 已按 ShouldEat 吃下它等 core 出字，此处
+            // 若吐成 pfEaten=FALSE 就是「吃了再吐」——记事本/Chromium 会补发 WM_KEYDOWN，
+            // EverEdit 这类不补发的宿主直接丢字符。故降级为本地插入**单个字符**：
+            // 不配对、不记栈（也就不会留下需要清理的状态），断连期间「无配对但不丢字」。
+            bool hasShift = (modifiers & KEYMOD_SHIFT) != 0;
+            wchar_t pairChar = _MapVkToEnglishPairChar(wParam, hasShift);
+            if (!isChineseMode && !_pTextService->IsFullWidth()
+                && !(modifiers & (KEYMOD_CTRL | KEYMOD_ALT))
+                && pairChar != 0 && _englishPairEngine.ShouldEat(pairChar))
+            {
+                std::wstring ch(1, pairChar);
+                _pTextService->InsertText(ch);
+                *pfEaten = TRUE;
+                _LogKeyDecision(L"down", _pTextService->GetFocusSessionId(), wParam, modifiers, HotkeyType::None,
+                                isChineseMode, hasComposition, _hasCandidates, hasInputSession, TRUE, L"ipc_failed_pair_insert");
+            }
+            else
+            {
+                // 其余非字母按键（符号、标点等）：放行给应用程序处理
+                *pfEaten = FALSE;
+                _LogKeyDecision(L"down", _pTextService->GetFocusSessionId(), wParam, modifiers, HotkeyType::None,
+                                isChineseMode, hasComposition, _hasCandidates, hasInputSession, FALSE, L"ipc_failed_passthrough");
+            }
         }
         return S_OK;
     }
@@ -1272,6 +1236,29 @@ STDAPI CKeyEventSink::OnKeyDown(ITfContext* pContext, WPARAM wParam, LPARAM lPar
                         CHotkeyManager::ClassifyInputKey(wParam, modifiers),
                         isChineseMode, hasComposition, _hasCandidates, hasInputSession,
                         TRUE, L"hold_commit_then_replay");
+        return S_OK;
+    }
+
+    // ── 配对跳出转发的 desync 兜底 ──────────────────────────────────────────────
+    // 本次按 isPairJumpOut 把键吃了，core 却回 PassThrough：说明它那边的配对栈已经空了
+    // （失焦清栈 / 归属校验清栈 / 右符号不匹配清栈等），而本地 depth 还挂着 —— 两侧对
+    // 「还有没有待跳出的配对」给出了相反答案。
+    //
+    // 此时直接吐成 FALSE 就是「吃了再吐」，不补发 WM_KEYDOWN 的宿主会丢掉这个 Tab/Enter。
+    // 处理：**以 core 为准**把本地 depth 归零（下次不再吃，desync 自愈），并把键原样重放
+    // 给宿主，让用户拿到正常的缩进/换行。
+    if (isPairJumpOut && !(*pfEaten))
+    {
+        WIND_LOG_DEBUG_FMT(L"pair jumpout desync: core 未跳出，depth %d -> 0，重放 vk=0x%02X\n",
+                           _pairPendingDepth, (uint32_t)wParam);
+        _pairPendingDepth = 0;
+        _pairLastActivityTick = 0;
+        _ReplayKeyToHost((WORD)wParam);
+        *pfEaten = TRUE;
+        _LogKeyDecision(L"down", _pTextService->GetFocusSessionId(), wParam, modifiers,
+                        CHotkeyManager::ClassifyInputKey(wParam, modifiers),
+                        isChineseMode, hasComposition, _hasCandidates, hasInputSession,
+                        TRUE, L"pair_jumpout_desync_replay");
         return S_OK;
     }
 
@@ -2030,10 +2017,14 @@ BOOL CKeyEventSink::_HandleServiceResponse()
             _hasCandidates = FALSE;
             for (int i = 0; i < response.cursorOffset; i++)
                 _SimulatePairKey(VK_LEFT);
-            // 中文模式配对插入：记一层待跳出深度，使后续 Enter 等被会话门控的跳出键
-            // 在无会话时也转发给协调器执行跳出（Tab 本就无条件转发，不依赖此计数）。
+            // 配对插入：记一层待跳出深度。它是 core 侧 pair_tracker 的镜像计数，也是本文件
+            // 唯一的吃键闸门——Enter 等被会话门控的键靠它放行转发（Tab 本就无条件转发）。
+            // 四条配对建立路径（中文标点 / 英文全角 / 英半自定义 / 英半普通）都经此响应。
             if (response.cursorOffset > 0)
+            {
                 _pairPendingDepth++;
+                TouchPairState(); // 起算时效
+            }
         }
         return TRUE;
 
@@ -2376,6 +2367,14 @@ void CKeyEventSink::OnSyncConfig(const std::string& key, const std::vector<uint8
             _customEnPunctChars.insert((wchar_t)ch);
         }
         WIND_LOG_INFO_FMT(L"Custom english punct chars updated: count=%d\n", (int)_customEnPunctChars.size());
+    }
+    else if (key == CONFIG_KEY_PAIR_STATE_TTL)
+    {
+        // 格式：secs(u16 LE)（对齐 Rust encode_pair_state_ttl_value）
+        if (value.size() < 2) return;
+        uint16_t secs = *reinterpret_cast<const uint16_t*>(value.data());
+        _pairStateTtlMs = (ULONGLONG)secs * 1000ULL;
+        WIND_LOG_INFO_FMT(L"Pair state TTL updated: %d s\n", (int)secs);
     }
     else if (key == CONFIG_KEY_PASSWORD_SUPPRESS)
     {

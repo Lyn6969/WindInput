@@ -533,6 +533,10 @@ constexpr const char* CONFIG_KEY_PASSWORD_SUPPRESS = "password_suppress";
 // core 收不到，用户配的「英半」列因此永远不生效；据此集合精确吃下这些键转发给 core。
 // 集合为空（默认）= 行为与历史完全一致。格式：count(u8) + [ch:u16(LE)]...
 constexpr const char* CONFIG_KEY_CUSTOM_EN_PUNCT = "custom_en_punct";
+// 配对状态时效（秒，0=不过期）。格式：secs(u16 LE)。
+// 吃键闸门（_pairPendingDepth）在本 DLL，故陈旧判据也必须在本地：若只有 core 过期而这边
+// 照吃跳出键，core 回 PassThrough 已太晚（「吃了再吐」，不补发 WM_KEYDOWN 的宿主会丢键）。
+constexpr const char* CONFIG_KEY_PAIR_STATE_TTL = "pair_state_ttl";
 
 // Calculate key hash for hotkey matching
 // Format: (modifiers << 16) | keyCode

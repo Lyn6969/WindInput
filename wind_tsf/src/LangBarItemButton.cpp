@@ -737,8 +737,12 @@ LRESULT CALLBACK CLangBarItemButton::_MsgWndProc(HWND hwnd, UINT msg, WPARAM wPa
             // EndComposition could clear the just-inserted text, especially in apps
             // like VSCode and browsers when InlinePreedit is disabled.
             pThis->_pTextService->CommitText(pData->text);
-            // Reset KeyEventSink state so shortcut keys work again
-            pThis->_pTextService->ResetComposingState();
+            // Reset KeyEventSink state so shortcut keys work again.
+            // 保留配对状态：上屏只是在光标处插入文本，已配对的右符号仍在光标右侧
+            // （`（你好|）`）。此前一并清零 _pairPendingDepth，导致中文模式下
+            // 「输左符号 → 打字上屏 → 按 Enter」跳不出去（Enter 被会话门控挡下不转发；
+            // Tab 因中文模式无条件转发才幸免）。
+            pThis->_pTextService->ResetComposingState(TRUE);
         }
 
         // Free the data allocated by sender
