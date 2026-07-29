@@ -1865,6 +1865,7 @@ fn test_mix_letter_trigger_empty_enter_no_symbol() {
         short_name: "测".into(),
         trigger_keys: vec!["z".into()],
         members: vec!["quick_input".into()],
+        ..Default::default()
     }];
     let coord = Coordinator::new_headless(cfg, Some(&data_dir()));
     // 按 z(0x5A) 进入 mix（字母触发键，mix_prefix 为空）

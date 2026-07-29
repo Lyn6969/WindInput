@@ -596,14 +596,15 @@ pub struct PinyinFuzzy {
 ///
 /// 没有总开关：想禁用就把 `quick_mix` 的 `trigger_keys` 清空——没有触发键自然进不去，
 /// 一件事只有一种表达。（曾有 `enabled` 字段，但它从未被任何逻辑读取，关掉不产生任何效果。）
+///
+/// 曾有 `force_vertical`（强制竖排），但它的判定条件是「**这个 mix 实例**含 quick 成员」，
+/// 属于实例的显示属性却被存在与实例无关的全局段里。已迁移到
+/// [`MixModeConfig::candidate_layout`]（见 docs/design/mode-candidate-layout.md）。
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct QuickInputConfig {
     /// 计算器结果小数位数，默认 6
     #[serde(default = "default_decimal_places")]
     pub decimal_places: i32,
-    /// 强制竖排显示：进入快捷输入时切竖排候选，退出恢复原布局。
-    #[serde(default)]
-    pub force_vertical: bool,
 }
 
 fn default_decimal_places() -> i32 {
@@ -614,9 +615,30 @@ impl Default for QuickInputConfig {
     fn default() -> Self {
         Self {
             decimal_places: default_decimal_places(),
-            force_vertical: false,
         }
     }
+}
+
+// ───────────────────────── 模式级显示属性（多模式共用）─────────────────────────
+
+/// 模式级候选布局意图（设计见 docs/design/mode-candidate-layout.md）。
+///
+/// - `Follow`：跟随全局 `ui.candidate.layout`——用户改全局，本模式跟着改。
+/// - `Vertical` / `Horizontal`：进入该模式期间覆盖全局方向，退出自动回到全局。
+///
+/// 刻意与 `ui.candidate.layout` 共用取值词汇（"vertical"/"horizontal"），让「模式级设置」
+/// 与「全局设置」在用户眼里是同一件事的两个层级，而不是两套发明出来的开关名。
+///
+/// **为什么不是布尔**：`Follow` 与 `Vertical` 只在全局本身是竖排时才有区别——前者跟着
+/// 全局变、后者恒定竖排。布尔（旧 `quick_input.force_vertical`）把这两种意图压成同一个
+/// `true`，且表达不了「全局竖排但本模式横排」（临英候选一行放得下，竖排反而占屏）。
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, Default, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum LayoutIntent {
+    #[default]
+    Follow,
+    Vertical,
+    Horizontal,
 }
 
 /// 临时 mix 模式配置（overlay 激活面）。触发后对每个成员方案查询并按成员序合并候选。
@@ -645,6 +667,11 @@ pub struct MixModeConfig {
     ///   旧的合并值 `"quick_input"` 在加载期展开为这四项。
     #[serde(default)]
     pub members: Vec<String>,
+    /// 进入本 mix 期间的候选布局（默认跟随全局）。每实例独立——两个融合模式可以
+    /// 一个竖排一个横排。旧的 `schema.quick_input.force_vertical` 已迁移到这里
+    /// （它本就是 quick_mix 这个实例的属性，却被存在了与实例无关的全局段里）。
+    #[serde(default)]
+    pub candidate_layout: LayoutIntent,
 }
 
 /// 内置「快捷」融合 mix 的实例 id（`;` 触发，成员含日期/计算/拼音/英文）。
@@ -673,6 +700,10 @@ fn default_mix_modes() -> Vec<MixModeConfig> {
         short_name: "快".to_string(),
         trigger_keys: vec!["semicolon".to_string()],
         members,
+        // 出厂强制竖排：快捷输入的候选是日期/算式结果等长文本，横排放不下。
+        // 与旧 data/config.toml 的 `quick_input.force_vertical = true` 行为一致
+        // （mix_modes 不能写进预置文件，故默认值只能落在这里，见 §迁移）。
+        candidate_layout: LayoutIntent::Vertical,
     }]
 }
 
@@ -704,6 +735,10 @@ pub struct SpecialModeConfig {
     /// 面向快符/生僻字等**小符号表**的「进入即浏览」；大表会遍历全表取首 N 条、有开销，慎用。
     #[serde(default)]
     pub show_all_on_enter: bool,
+    /// 进入本特殊模式期间的候选布局（默认跟随全局）。每实例独立——快符表可竖排、
+    /// 生僻字表可横排，互不影响。
+    #[serde(default)]
+    pub candidate_layout: LayoutIntent,
 }
 
 impl SpecialModeConfig {
@@ -753,6 +788,9 @@ pub struct InputConfig {
     /// 网址输入模式。
     #[serde(default)]
     pub url: UrlConfig,
+    /// 快捷加词面板（目前只有候选布局一项；进入方式是 keys.add_word 热键）。
+    #[serde(default)]
+    pub add_word: AddWordConfig,
     /// 简繁转换（上屏文字变换）。原 features.s2t。
     #[serde(default)]
     pub s2t: S2TConfig,
@@ -782,6 +820,7 @@ impl Default for InputConfig {
             capslock: CapslockConfig::default(),
             temp_pinyin: TempPinyinConfig::default(),
             url: UrlConfig::default(),
+            add_word: AddWordConfig::default(),
             s2t: S2TConfig::default(),
             cmdbar: CmdbarConfig::default(),
             phrase: PhraseConfig::default(),
@@ -1011,6 +1050,10 @@ pub struct TempEnglishConfig {
     /// 且回车此时上屏**高亮候选**而非原文——否则该配置下没有任何选词键可用。
     #[serde(default)]
     pub space_as_input: bool,
+    /// 进入临时英文期间的候选布局（默认跟随全局）。
+    /// 典型用法是设 `horizontal`——英文候选一行放得下，全局竖排时反而占屏。
+    #[serde(default)]
+    pub candidate_layout: LayoutIntent,
 }
 
 impl Default for TempEnglishConfig {
@@ -1022,6 +1065,7 @@ impl Default for TempEnglishConfig {
             trigger_keys: Vec::new(),
             allow_symbols: false,
             space_as_input: false,
+            candidate_layout: LayoutIntent::default(),
         }
     }
 }
@@ -1045,6 +1089,9 @@ pub struct TempPinyinConfig {
     /// 热键进入时组合区不写引导符（见 docs/design/special-mode-entry-hotkey.md）。
     #[serde(default)]
     pub hotkey: String,
+    /// 进入临时拼音期间的候选布局（默认跟随全局）。
+    #[serde(default)]
+    pub candidate_layout: LayoutIntent,
 }
 
 fn default_temp_pinyin_triggers() -> Vec<String> {
@@ -1057,6 +1104,7 @@ impl Default for TempPinyinConfig {
             enabled: true,
             trigger_keys: default_temp_pinyin_triggers(),
             hotkey: String::new(),
+            candidate_layout: LayoutIntent::default(),
         }
     }
 }
@@ -1070,6 +1118,9 @@ pub struct UrlConfig {
     /// 触发前缀（恰好匹配；如 "www." / "http" / "https" / "ftp."）
     #[serde(default = "default_url_prefixes")]
     pub prefixes: Vec<String>,
+    /// 进入网址模式期间的候选布局（默认跟随全局）。
+    #[serde(default)]
+    pub candidate_layout: LayoutIntent,
 }
 
 fn default_url_prefixes() -> Vec<String> {
@@ -1087,6 +1138,30 @@ impl Default for UrlConfig {
         Self {
             enabled: false,
             prefixes: default_url_prefixes(),
+            candidate_layout: LayoutIntent::default(),
+        }
+    }
+}
+
+/// 快捷加词配置（[input.add_word]）。加词面板是覆盖在任意输入态之上的临时面板，
+/// 故其布局意图优先于底层模式（见 `Coordinator::layout_intent`）。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AddWordConfig {
+    /// 加词面板期间的候选布局。默认竖排——逐字确认的面板竖排更易读。
+    /// 此前是**无条件硬编码**强制竖排、连开关都没有；本项只是给它一个出口，
+    /// 默认值保持原行为不变。
+    #[serde(default = "default_add_word_layout")]
+    pub candidate_layout: LayoutIntent,
+}
+
+fn default_add_word_layout() -> LayoutIntent {
+    LayoutIntent::Vertical
+}
+
+impl Default for AddWordConfig {
+    fn default() -> Self {
+        Self {
+            candidate_layout: default_add_word_layout(),
         }
     }
 }
@@ -2015,6 +2090,7 @@ impl Config {
         }
 
         Self::migrate_enable_english_value(&mut merged);
+        Self::migrate_force_vertical_value(&mut merged);
         let mut config: Config = merged.try_into()?;
         config.normalize();
         Ok(config)
@@ -2053,6 +2129,50 @@ impl Config {
             }
         }
         info!("Migrated quick_input.enable_english=false into quick_mix members");
+    }
+
+    /// 存量迁移（**须在反序列化前**跑，字段已从 [`QuickInputConfig`] 移除）：
+    /// 废弃键 `schema.quick_input.force_vertical` → 内置 quick_mix 的
+    /// [`MixModeConfig::candidate_layout`]。
+    ///
+    /// 映射刻意**不对称**：
+    /// - `true`  → `"vertical"`（强制竖排）
+    /// - `false` → `"follow"`（**不是** `"horizontal"`）——旧布尔的 false 语义是「不强制」，
+    ///   即跟随全局；写成 horizontal 会把「没开过这个开关」的用户强行钉在横排上。
+    ///
+    /// 键不存在则不动，让 [`default_mix_modes`] 的出厂值（Vertical）生效。老版预置文件
+    /// 写的是 `force_vertical = true`，与出厂值同义，故未改过配置的用户升级后行为不变。
+    fn migrate_force_vertical_value(merged: &mut toml::Value) {
+        let Some(forced) = merged
+            .get("schema")
+            .and_then(|s| s.get("quick_input"))
+            .and_then(|q| q.get("force_vertical"))
+            .and_then(|v| v.as_bool())
+        else {
+            return;
+        };
+        let layout = if forced { "vertical" } else { "follow" };
+        let Some(modes) = merged
+            .get_mut("schema")
+            .and_then(|s| s.get_mut("mix_modes"))
+            .and_then(|m| m.as_array_mut())
+        else {
+            return;
+        };
+        for mode in modes.iter_mut() {
+            if mode.get("id").and_then(|v| v.as_str()) != Some(QUICK_MIX_ID) {
+                continue;
+            }
+            if let Some(t) = mode.as_table_mut() {
+                t.insert(
+                    "candidate_layout".to_string(),
+                    toml::Value::String(layout.to_string()),
+                );
+            }
+        }
+        info!(
+            "Migrated quick_input.force_vertical={forced} into quick_mix candidate_layout={layout}"
+        );
     }
 
     /// 系统预置配置的 TOML 值：代码默认(L1) ⊕ `data/config.toml`(L2)，**不含用户层(L3)**。
@@ -2579,6 +2699,64 @@ mod tests {
             cfg.schema.mix_modes[1].members,
             vec!["pinyin"],
             "自定义 mix 的字面 pinyin 应原样保留"
+        );
+    }
+
+    /// 在合并值里塞一个存量用户配置残留的 `schema.quick_input.force_vertical`。
+    fn merged_with_force_vertical(v: Option<bool>) -> toml::Value {
+        let mut merged = toml::Value::try_from(Config::default()).expect("默认配置应可序列化");
+        if let Some(v) = v {
+            merged
+                .get_mut("schema")
+                .and_then(|s| s.get_mut("quick_input"))
+                .and_then(|q| q.as_table_mut())
+                .expect("schema.quick_input 应存在")
+                .insert("force_vertical".to_string(), toml::Value::Boolean(v));
+        }
+        merged
+    }
+
+    fn quick_mix_layout(merged: toml::Value) -> LayoutIntent {
+        let cfg: Config = merged.try_into().expect("迁移后应可反序列化");
+        cfg.schema
+            .mix_modes
+            .iter()
+            .find(|m| m.id == QUICK_MIX_ID)
+            .expect("内置 quick_mix 应存在")
+            .candidate_layout
+    }
+
+    /// 废弃键 `force_vertical` → `mix_modes[quick_mix].candidate_layout`。
+    ///
+    /// ★ 映射刻意不对称：`false` 迁成 **Follow 而非 Horizontal**。旧布尔的 false 语义是
+    /// 「不强制」（跟随全局），迁成 Horizontal 会把从没开过这个开关、又把全局设成竖排的
+    /// 用户强行钉在横排上。
+    #[test]
+    fn force_vertical_migrates_into_quick_mix_candidate_layout() {
+        for (old, want) in [
+            (true, LayoutIntent::Vertical),
+            (false, LayoutIntent::Follow),
+        ] {
+            let mut merged = merged_with_force_vertical(Some(old));
+            Config::migrate_force_vertical_value(&mut merged);
+            assert_eq!(
+                quick_mix_layout(merged),
+                want,
+                "force_vertical={old} 应迁为 {want:?}"
+            );
+        }
+    }
+
+    /// 旧键缺席（全新安装 / 新版预置文件已删该行）时不动，保留出厂竖排。
+    /// 守的是「未改过配置的用户升级后行为不变」。
+    #[test]
+    fn absent_force_vertical_keeps_factory_vertical() {
+        let mut merged = merged_with_force_vertical(None);
+        Config::migrate_force_vertical_value(&mut merged);
+        assert_eq!(
+            quick_mix_layout(merged),
+            LayoutIntent::Vertical,
+            "无旧键时应保留 default_mix_modes() 的出厂竖排"
         );
     }
 

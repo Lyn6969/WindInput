@@ -153,7 +153,12 @@ enable_pinyin_abbrev = true
 # 拼音 / 英文）是该 mix 的 members 成员——开关即增删、优先级即顺序，真相源在代码侧的
 # default_mix_modes()，本文件不写 mix_modes（写了会把定义冻结成快照，见文件头说明）。
 # 本段只留与来源无关的全局项——没有总开关，禁用＝把 quick_mix 的 trigger_keys 清空。
-force_vertical = true
+#
+# 「强制竖排」原是本段的 force_vertical，现已迁往 mix_modes[].candidate_layout ——
+# 它的判定条件本就是「**这个 mix 实例**含 quick 成员」，属于实例的显示属性。
+# 内置 quick_mix 出厂即 "vertical"，默认值在代码侧 default_mix_modes()（本文件不写
+# mix_modes，写了会把整份定义冻结成快照，见文件头说明）。存量 force_vertical 在加载期
+# 自动迁移：true → "vertical"，false → "follow"（不是 horizontal——false 的语义是「不强制」）。
 decimal_places = 6
 
 [input]
@@ -232,6 +237,12 @@ allow_symbols = false
 # space_as_input：空格作为输入字符入缓冲（可打出带空格的英文短句）。上屏职责转给回车，
 #                 且回车此时上屏「高亮候选」而非原文——否则该配置下没有任何选词键可用。
 space_as_input = false
+# candidate_layout：进入本模式期间的候选排列方向，各模式都有同名项。
+#   follow（默认）= 跟随全局 ui.candidate.layout，用户改全局本模式跟着改
+#   vertical / horizontal = 本模式期间覆盖全局方向，退出自动恢复
+# 不是布尔：follow 与 vertical 只在全局本身竖排时才有区别（前者跟着变、后者恒定）。
+# 临英常设 horizontal——英文候选一行放得下，全局竖排时反而占屏。
+candidate_layout = "follow"
 
 [input.capslock]
 cancel_on_mode_switch = false
@@ -242,6 +253,7 @@ trigger_keys = ["backtick"]
 # 直达热键（如 "ctrl+shift+p"；空串 = 不注册）。与 trigger_keys 引导键共存，
 # 用热键进入时组合区不写引导符。
 hotkey = ""
+candidate_layout = "follow"
 
 [input.auto_pair]
 chinese = false
@@ -263,6 +275,12 @@ state_ttl_secs = 120
 [input.url]
 enabled = false
 prefixes = ["www.", "http", "https", "ftp."]
+candidate_layout = "follow"
+
+# 快捷加词面板（Ctrl+= 进入，见 [keys] add_word）。
+# 默认竖排：逐字确认的面板竖排更易读。此前是硬编码强制竖排、没有开关。
+[input.add_word]
+candidate_layout = "vertical"
 
 [input.s2t]
 enabled = false

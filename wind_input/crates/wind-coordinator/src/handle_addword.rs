@@ -532,16 +532,8 @@ impl Coordinator {
         state.add_word_chars = self.add_word_recent_chars(ADD_WORD_MAX_LEN);
         state.add_word_active = true;
 
-        // 强制竖排（对齐 Go），退出时恢复进入前布局。
-        let cur = self
-            .rt()
-            .config
-            .ui
-            .candidate
-            .layout
-            .eq_ignore_ascii_case("vertical");
-        state.add_word_saved_vertical = Some(cur);
-        let _ = self.ui_tx.send(UiCommand::SetCandidateLayout(true));
+        // 候选布局（input.add_word.candidate_layout，出厂竖排）由 show_add_word_preview
+        // 末尾的 notify_ui_update 统一重算，这里不再自己切布局（见 layout.rs）。
 
         if state.add_word_chars.len() < ADD_WORD_MIN_LEN {
             state.add_word_len = 0;
@@ -561,16 +553,14 @@ impl Coordinator {
         }
     }
 
-    /// 退出加词模式：清状态、恢复布局、隐藏候选窗。
+    /// 退出加词模式：清状态、隐藏候选窗。
+    /// 布局无需在此恢复：`add_word_active` 已清，下一次 notify_ui_update 自动算回基线。
     pub(crate) fn exit_add_word_mode(&self, state: &mut State) {
         state.add_word_active = false;
         state.add_word_chars.clear();
         state.add_word_len = 0;
         state.add_word_code.clear();
         state.add_word_boundary = 0;
-        if let Some(prev) = state.add_word_saved_vertical.take() {
-            let _ = self.ui_tx.send(UiCommand::SetCandidateLayout(prev));
-        }
         self.notify_ui_hide();
     }
 
@@ -763,6 +753,10 @@ impl Coordinator {
 
     /// 显示加词预览候选窗（两行：标题行提示 + 词行编码；均为提示行，no_index 不渲染序号）。
     fn show_add_word_preview(&self, state: &State) {
+        // 加词面板**不走** notify_ui_update（下方直接发 UpdateCandidates），所以布局重算要在
+        // 这里单独接一次——`UpdateCandidates` 的发送点共两处，两处都得接，否则加词的
+        // candidate_layout 完全失效（见 layout.rs / docs/design/mode-candidate-layout.md）。
+        self.sync_candidate_layout(state);
         // 提示行构造：no_index=true 完全不显示序号（避免默认主题空圆圈）。
         let row = |text: String, comment: String| CandidateItem {
             text,

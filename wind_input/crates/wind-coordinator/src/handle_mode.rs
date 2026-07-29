@@ -158,19 +158,8 @@ impl Coordinator {
             .map(|c| c.to_string())
             .unwrap_or_default();
         self.update_mix_candidates(state);
-        // 快捷输入「强制竖排」：含 quick_input 成员的 mix（如默认「快捷」融合，; 触发），
-        // 进入时切竖排候选并记住原布局，退出恢复（与独立快捷输入模式一致）。
-        if self.mix_has_quick_input(idx) && self.rt().config.schema.quick_input.force_vertical {
-            let cur = self
-                .rt()
-                .config
-                .ui
-                .candidate
-                .layout
-                .eq_ignore_ascii_case("vertical");
-            state.quick_saved_vertical = Some(cur);
-            let _ = self.ui_tx.send(UiCommand::SetCandidateLayout(true));
-        }
+        // 候选布局（本 mix 的 candidate_layout）由 notify_ui_update → sync_candidate_layout
+        // 统一重算，这里不再自己保存/切换布局（见 layout.rs）。
         self.notify_ui_update(state);
         let display = state.preedit.clone();
         debug!("Entered mix mode idx={}", idx);
@@ -252,10 +241,7 @@ impl Coordinator {
         state.committed_segs.clear();
         state.candidates.clear();
         state.preedit.clear();
-        // 强制竖排退出：恢复进入前布局。
-        if let Some(prev) = state.quick_saved_vertical.take() {
-            let _ = self.ui_tx.send(UiCommand::SetCandidateLayout(prev));
-        }
+        // 布局无需在此恢复：active 已清空，下一次 notify_ui_update 会自动算回全局基线。
     }
 
     /// 候选的**出口文本**（显示与上屏同源）：1对多变体候选（`s2t_override`）直接用覆盖

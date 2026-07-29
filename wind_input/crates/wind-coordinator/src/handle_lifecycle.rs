@@ -263,19 +263,15 @@ impl Coordinator {
         state.committed_segs.clear();
         // 焦点/模式切换：解除智能符号待命，避免跨上下文误触发替换。
         self.disarm_smart_symbol();
-        // 快捷输入「强制竖排」遗留：离开模式时恢复进入前布局。
-        if let Some(prev) = state.quick_saved_vertical.take() {
-            let _ = self.ui_tx.send(UiCommand::SetCandidateLayout(prev));
-        }
-        // 快捷加词模式遗留：焦点/模式切换时退出并恢复布局。
+        // 快捷加词模式遗留：焦点/模式切换时退出。
+        // 布局无需在此恢复——模式标志已清，下一次候选显示会自动算回全局基线（见 layout.rs）。
+        // 这正是声明式重算相对「保存/恢复」的价值：这条路径当年就是补丁式加上的第 3、第 4 个
+        // 恢复出口，再加四个模式就会有十几处，漏一处即候选窗卡在竖排且无日志。
         if state.add_word_active {
             state.add_word_active = false;
             state.add_word_chars.clear();
             state.add_word_len = 0;
             state.add_word_code.clear();
-            if let Some(prev) = state.add_word_saved_vertical.take() {
-                let _ = self.ui_tx.send(UiCommand::SetCandidateLayout(prev));
-            }
         }
         if dirty {
             debug!("reset_exclusive_modes: cleared residual exclusive input mode state");
