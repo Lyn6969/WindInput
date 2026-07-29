@@ -210,6 +210,13 @@ pub const CONFIG_KEY_PASSWORD_SUPPRESS: &str = "password_suppress";
 /// （集合为空 = 行为与历史完全一致）。判据须与 `wind_punct::custom_english_punct_chars`
 /// 同源，漂移即「吃了再吐」丢键。
 pub const CONFIG_KEY_CUSTOM_EN_PUNCT: &str = "custom_en_punct";
+/// 配对状态时效（秒，0=不过期）同步键名。TSF 端持有吃键闸门（`_pairPendingDepth`），
+/// 必须能本地判定状态是否陈旧：若只有协调器过期而 DLL 仍吃跳出键，协调器回 PassThrough
+/// 已太晚（形成「吃了再吐」丢键）。故 TTL 判据以 DLL 侧为准，此键把阈值推给它。
+///
+/// **刻意不并入 `CONFIG_KEY_JUMP_OUT_KEYS` 的 payload**：那个格式已经改过一次
+/// （前置 `right_symbol` u8，两侧解析偏移 1→2），再叠字段容易出现偏移不同步。
+pub const CONFIG_KEY_PAIR_STATE_TTL: &str = "pair_state_ttl";
 
 // 消费确认
 pub const CMD_CONSUMED: u16 = 0x0401;

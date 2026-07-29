@@ -4142,6 +4142,177 @@ fn auto_pair_jump_out_key_moves_cursor_right() {
     );
 }
 
+/// 中英文切换**不清**配对栈：切走再切回后 Tab 仍能跳出。
+/// 切模式既不移动光标也不消除已插入的右符号，「光标紧贴右符号」的前提仍成立。
+/// （对照组见 `auto_pair_focus_lost_clears_stack`：失焦才该清。）
+#[test]
+fn auto_pair_stack_survives_mode_switch() {
+    if !has_schemas() {
+        return;
+    }
+    let mut cfg = config_with("wubi86");
+    cfg.input.auto_pair.chinese = true;
+    cfg.input.auto_pair.jump_out_keys = vec!["tab".into()];
+    let coord = Coordinator::new_headless(cfg, Some(&data_dir()));
+
+    // 前置：左括号插入配对，栈里确有一层（不断言就无从区分「保住了」与「压根没进栈」）。
+    let ins = coord.handle_key_event(&key_event_mods(0x39, EVENT_KEY_DOWN, 0x0001));
+    assert!(
+        matches!(ins, KeyAction::InsertTextWithCursor { .. }),
+        "前置：左括号应插入配对，实际: {ins:?}"
+    );
+
+    // 左 Shift 释放切英文 → 再切回中文。两次都断言模式确实翻转，否则本测试会退化成
+    // 「压根没切过模式」的假绿。
+    coord.handle_key_event(&key_event(0xA0, EVENT_KEY_UP));
+    assert!(!coord.is_chinese_mode(), "前置：应已切到英文");
+    coord.handle_key_event(&key_event(0xA0, EVENT_KEY_UP));
+    assert!(coord.is_chinese_mode(), "前置：应已切回中文");
+
+    // 核心断言：配对栈跨模式切换存活 → Tab 仍跳出。
+    let jump = coord.handle_key_event(&key_event(0x09, EVENT_KEY_DOWN));
+    assert!(
+        matches!(jump, KeyAction::MoveCursorRight),
+        "中英切换不应清配对栈，切回后 Tab 应仍能跳出，实际: {jump:?}"
+    );
+}
+
+/// 跨模式跳出（本次改造的核心目标）：中文里打的配对，切到英文后 Tab 应能跳出。
+///
+/// 旧实现下这条必失败——协调器的跳出判定写在中文 composition 路径里，而英文模式在更早处
+/// 就 `PassThrough` 了，那段判定是死代码。
+#[test]
+fn auto_pair_jump_out_works_in_english_mode() {
+    if !has_schemas() {
+        return;
+    }
+    let mut cfg = config_with("wubi86");
+    cfg.input.auto_pair.chinese = true;
+    cfg.input.auto_pair.jump_out_keys = vec!["tab".into()];
+    let coord = Coordinator::new_headless(cfg, Some(&data_dir()));
+
+    let ins = coord.handle_key_event(&key_event_mods(0x39, EVENT_KEY_DOWN, 0x0001));
+    assert!(
+        matches!(ins, KeyAction::InsertTextWithCursor { .. }),
+        "前置：中文模式下左括号应插入配对，实际: {ins:?}"
+    );
+    coord.handle_key_event(&key_event(0xA0, EVENT_KEY_UP));
+    assert!(!coord.is_chinese_mode(), "前置：应已切到英文");
+
+    let jump = coord.handle_key_event(&key_event(0x09, EVENT_KEY_DOWN));
+    assert!(
+        matches!(jump, KeyAction::MoveCursorRight),
+        "英文模式应能跳出中文模式建立的配对，实际: {jump:?}"
+    );
+}
+
+/// 英文半角普通配对键由协调器接手（此前由 DLL 的 `_englishPairEngine` 本地插入）。
+/// 这是「四条建立路径全部入同一个栈」的关键一步。
+#[test]
+fn english_halfwidth_pair_handled_by_coordinator() {
+    if !has_schemas() {
+        return;
+    }
+    let mut cfg = config_with("wubi86");
+    cfg.input.default.chinese_mode = false; // 英文模式
+    cfg.input.auto_pair.english = true;
+    cfg.input.auto_pair.jump_out_keys = vec!["tab".into()];
+    let coord = Coordinator::new_headless(cfg, Some(&data_dir()));
+    assert!(!coord.is_chinese_mode(), "前置：应处于英文模式");
+
+    // Shift+9 → `(`：协调器出字并补右括号
+    let ins = coord.handle_key_event(&key_event_mods(0x39, EVENT_KEY_DOWN, 0x0001));
+    match ins {
+        KeyAction::InsertTextWithCursor {
+            ref text,
+            cursor_offset,
+        } => {
+            assert_eq!(text, "()", "英文半角应插入 ASCII 配对");
+            assert_eq!(cursor_offset, 1, "光标应落在配对中间");
+        }
+        other => panic!("英文半角左括号应由协调器插入配对，实际: {other:?}"),
+    }
+
+    let jump = coord.handle_key_event(&key_event(0x09, EVENT_KEY_DOWN));
+    assert!(
+        matches!(jump, KeyAction::MoveCursorRight),
+        "英文模式应能跳出自己建立的配对，实际: {jump:?}"
+    );
+}
+
+/// 吃键面未扩大（硬性约束的回归保护）：配对开关关闭时，协调器不得接手配对键。
+/// 接手即意味着 DLL 也吃了它，而 DLL 的判据是 `IsEnabled() && 在配对表内`——
+/// 两侧一旦不同源就是「吃了再吐」丢键。
+#[test]
+fn english_pair_not_handled_when_disabled() {
+    if !has_schemas() {
+        return;
+    }
+    let mut cfg = config_with("wubi86");
+    cfg.input.default.chinese_mode = false;
+    cfg.input.auto_pair.english = false; // 配对关
+    let coord = Coordinator::new_headless(cfg, Some(&data_dir()));
+
+    let act = coord.handle_key_event(&key_event_mods(0x39, EVENT_KEY_DOWN, 0x0001));
+    assert!(
+        matches!(act, KeyAction::PassThrough),
+        "配对关闭时英文括号必须透传（吃键面不得扩大），实际: {act:?}"
+    );
+}
+
+/// 失焦后配对状态的存废。**跨焦点保留已放弃**（2026-07-29 真机后决定）：
+/// 配对状态在 core 全局单栈与每个宿主进程各自一份的 DLL 计数两处，作用域模型对不齐，
+/// 加上焦点离开期间用户做了什么输入法无法感知，保留本质上是猜测——实测大部分情况失效。
+/// 故凡是会清输入缓冲的 reason，一律连配对状态一起清；`CtxLost` 是 DocMgr 噪声层，
+/// 它本来就不清任何输入态，配对状态也跟着不清。
+fn pair_state_after_focus_lost(reason: wind_bridge::handler::FocusLostReason) -> KeyAction {
+    let mut cfg = config_with("wubi86");
+    cfg.input.auto_pair.chinese = true;
+    cfg.input.auto_pair.jump_out_keys = vec!["tab".into()];
+    let coord = Coordinator::new_headless(cfg, Some(&data_dir()));
+
+    let ins = coord.handle_key_event(&key_event_mods(0x39, EVENT_KEY_DOWN, 0x0001));
+    assert!(
+        matches!(ins, KeyAction::InsertTextWithCursor { .. }),
+        "前置：左括号应插入配对，实际: {ins:?}"
+    );
+    coord.handle_focus_lost(0, reason);
+    coord.handle_key_event(&key_event(0x09, EVENT_KEY_DOWN))
+}
+
+#[test]
+fn auto_pair_cleared_on_real_focus_loss() {
+    if !has_schemas() {
+        return;
+    }
+    use wind_bridge::handler::FocusLostReason;
+    for reason in [
+        FocusLostReason::Thread,
+        FocusLostReason::DocChanged,
+        FocusLostReason::NoEditCtx,
+    ] {
+        let act = pair_state_after_focus_lost(reason);
+        assert!(
+            matches!(act, KeyAction::PassThrough),
+            "{reason:?} 属真实失焦，配对状态须清空、Tab 应透传，实际: {act:?}"
+        );
+    }
+}
+
+/// `CtxLost` 是 DocMgr 噪声层（Excel 实测同一 DocMgr 6ms 内掉了又回），它**不清任何输入态**，
+/// 配对状态也跟着不清——在这里清就是把 Excel 那类抖动变成「配对忽然跳不出去」。
+#[test]
+fn auto_pair_survives_ctx_lost_noise() {
+    if !has_schemas() {
+        return;
+    }
+    let act = pair_state_after_focus_lost(wind_bridge::handler::FocusLostReason::CtxLost);
+    assert!(
+        matches!(act, KeyAction::MoveCursorRight),
+        "CtxLost 是噪声层，不该清配对状态，实际: {act:?}"
+    );
+}
+
 /// 配对跳出键未配置时：Tab 不被吞（回归保护——默认空集不启用）。
 #[test]
 fn auto_pair_no_jump_out_key_passes_tab_through() {

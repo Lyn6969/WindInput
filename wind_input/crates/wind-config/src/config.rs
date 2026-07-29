@@ -939,6 +939,16 @@ pub struct AutoPairConfig {
     /// 无从判断跳出还是嵌套，故一律开新的一对（见 `pin_quote_left_if_paired`）。
     #[serde(default = "default_jump_out_keys")]
     pub jump_out_keys: Vec<String>,
+    /// 配对状态时效，单位秒（内部项，设置界面不暴露）。`0` = 不过期。
+    ///
+    /// 管的是**同一个输入框内**的状态陈旧：用户中途用鼠标点过别处、滚过页、把括号退格删掉
+    /// ——这些输入法都感知不到，没有时效的话陈旧状态会一直存活到吃掉用户的 Tab。
+    /// 距**最后一次按键**超过本值即视为陈旧，跳出键不再生效；从最后一次按键算起而非从插入
+    /// 配对算起，因此持续输入会不断刷新，在括号里打多久都不会误过期。
+    ///
+    /// 跨焦点的陈旧不归它管——失焦一律清空配对状态（见 `handle_focus_lost`）。
+    #[serde(default = "default_pair_state_ttl_secs")]
+    pub state_ttl_secs: u32,
 }
 
 impl Default for AutoPairConfig {
@@ -949,8 +959,15 @@ impl Default for AutoPairConfig {
             chinese_pairs: default_chinese_pairs(),
             english_pairs: default_english_pairs(),
             jump_out_keys: default_jump_out_keys(),
+            state_ttl_secs: default_pair_state_ttl_secs(),
         }
     }
+}
+
+/// 默认 120 秒。够覆盖「在括号里停下来想一会儿」，又不会让状态在用户去干别的事之后
+/// 仍然存活到吃掉 Tab。
+fn default_pair_state_ttl_secs() -> u32 {
+    120
 }
 
 /// 默认只启用右符号跳出（保持「打 `）` 跳出」这一长期行为），Tab/Enter 需用户显式勾选。

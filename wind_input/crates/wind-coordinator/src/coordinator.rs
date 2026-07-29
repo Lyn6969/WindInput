@@ -1824,6 +1824,7 @@ impl Coordinator {
                 self.push_jump_out_keys_config(0); // 配对跳出键同步（英文模式跳出 + 中文转发放行）
                 self.push_password_suppress_config(0); // 密码框抑制策略（DLL 本地吃键门控）
                 self.push_custom_en_punct_config(0); // 英半列自定义标点：DLL 据此吃键转发
+                self.push_pair_state_ttl_config(0); // 配对状态时效（DLL 侧闸门据此判陈旧）
                 #[cfg(windows)]
                 if let Some(mgr) = self.host_render() {
                     mgr.set_whitelist(new_cfg.compat.host_render_processes.clone());
@@ -3083,6 +3084,7 @@ impl Coordinator {
         self.push_jump_out_keys_config(client_token); // 配对跳出键（英文模式跳出 + 中文转发放行）
         self.push_password_suppress_config(client_token); // 密码框抑制策略（DLL 本地吃键门控）
         self.push_custom_en_punct_config(client_token); // 英半列自定义标点：DLL 据此吃键转发
+        self.push_pair_state_ttl_config(client_token); // 配对状态时效（DLL 侧闸门据此判陈旧）
 
         let Some(mgr) = self.host_render() else {
             return;
@@ -3101,6 +3103,23 @@ impl Coordinator {
         let value = wind_ipc::codec::encode_english_pairs_value(enabled, &rt.en_pairs);
         let msg = wind_ipc::codec::encode_sync_config(
             wind_ipc::protocol::CONFIG_KEY_ENGLISH_PAIRS,
+            &value,
+        );
+        if client_token != 0 {
+            self.push_server.push_to_token(client_token, &msg);
+        } else {
+            self.push_server.push_to_active(&msg);
+        }
+    }
+
+    /// 下发配对状态时效给 DLL。吃键闸门（`_pairPendingDepth`）在 DLL 侧，它必须能本地判定
+    /// 状态是否陈旧——只有协调器过期而 DLL 照吃跳出键的话，协调器回 PassThrough 已太晚
+    /// （「吃了再吐」丢键）。故 TTL 以 DLL 侧判据为准，此处只推阈值。
+    pub fn push_pair_state_ttl_config(&self, client_token: u64) {
+        let secs = self.rt().config.input.auto_pair.state_ttl_secs;
+        let value = wind_ipc::codec::encode_pair_state_ttl_value(secs);
+        let msg = wind_ipc::codec::encode_sync_config(
+            wind_ipc::protocol::CONFIG_KEY_PAIR_STATE_TTL,
             &value,
         );
         if client_token != 0 {
@@ -4015,6 +4034,9 @@ impl MessageHandler for Coordinator {
             }
             _ => {}
         }
+        // 配对状态保活：须在 handle_key_event **之后**刷新，否则本次按键的陈旧判定
+        // 会先被自己刷新掉，TTL 永不触发。栈空时是空操作。
+        self.touch_pair_state();
         if self.preedit_uses_placeholder() {
             action.with_composition_placeholder()
         } else {
@@ -4258,6 +4280,13 @@ impl MessageHandler for Coordinator {
             return KeyAction::PassThrough;
         }
 
+        // 配对跳出键：**全模式统一前置判定**，必须早于下面的英文模式分支——英文模式对普通键
+        // 直接 PassThrough，判定放在中文路径里就永远跑不到（旧实现即如此，是「英文模式跳不出
+        // 中文里打的配对」的根因之一）。守卫与失效方向见 try_jump_out。
+        if let Some(act) = self.try_jump_out(&state, data) {
+            return act;
+        }
+
         // 英文模式
         if !state.chinese_mode {
             // 全角：键已被 TSF 的 `english_fullwidth` 分支吃下等 Rust 出字，此处必须转换，
@@ -4400,22 +4429,6 @@ impl MessageHandler for Coordinator {
                 || !state.committed_text.is_empty()
                 || !state.candidates.is_empty();
             return self.commit_highlight_then_char(&mut state, npc, has_comp);
-        }
-
-        // 配对跳出键：无活跃编码时，命中配置的跳出键（Tab/Enter 等）且配对栈非空，
-        // 等效输入右符号跳出——光标越过右符号、弹栈。栈空则不拦截，让该键落入下方 match
-        // 的空缓冲透传臂正常透传给宿主（Tab 缩进 / Enter 换行）。须置于 match 之前抢先判定，
-        // 仅无编码+无候选时生效，避免吞掉正常编辑/选词按键。
-        if state.input_buffer.is_empty()
-            && state.candidates.is_empty()
-            && data.modifiers & (MOD_CTRL | MOD_ALT | MOD_SHIFT) == 0
-            && self.rt().jump_out_keys.contains(&data.key_code)
-        {
-            let mut tr = self.pair_tracker.lock().unwrap_or_else(|e| e.into_inner());
-            if tr.peek().is_some() {
-                tr.pop();
-                return KeyAction::MoveCursorRight;
-            }
         }
 
         match data.key_code {
@@ -5049,10 +5062,7 @@ impl MessageHandler for Coordinator {
                         }
                         // 插入配对：左括号 → 补右括号，光标置于其间
                         if let Some((_, right)) = pairs.iter().find(|(l, _)| *l == pch).copied() {
-                            self.pair_tracker
-                                .lock()
-                                .unwrap_or_else(|e| e.into_inner())
-                                .push(pch, right);
+                            self.push_pair(pch, right);
                             // 右引号已由本次配对补出，交替开关不该停在「右」——否则一旦中途
                             // 关掉配对，遗留的右态会让下一个引号直接出闭引号。
                             if quote_paired {
@@ -5104,6 +5114,10 @@ impl MessageHandler for Coordinator {
         // （首次聚焦无配对 focus_lost 时，本处兜底）。
         self.last_commit_len
             .store(1, std::sync::atomic::Ordering::Relaxed);
+        // 配对状态归属校验（防御性）：配对栈是全局单栈、不分宿主，栈顶有可能是别的宿主压的。
+        // 真实失焦已在 handle_focus_lost 清过栈，能活到这里的只有 CtxLost 噪声，故本校验
+        // 正常不触发；留着是因为成本为零，且「全局单栈」这个事实没变。
+        self.clear_pair_tracker_if_foreign(data.client_token);
         // 记录活动客户端：鼠标点击的 commit 只推给它，避免广播多发
         if data.client_token != 0 {
             self.push_server.set_active_token(data.client_token);
@@ -5166,7 +5180,15 @@ impl MessageHandler for Coordinator {
             }
         }
         if clears_input {
-            self.clear_pair_tracker(); // 失焦：配对上下文失效，清栈防下次聚焦后跳出键误判
+            // 失焦即清配对状态。**曾尝试按 reason 细分保留**（弹框夺走前台时光标其实还在
+            // 括号中间），2026-07-29 真机后放弃：配对状态存在 core 全局单栈与**每个宿主进程
+            // 各自一份**的 DLL 计数两处，而开启「为每个应用配置不同输入法」后切换应用会让
+            // 整个 IME 上下文重建；更根本的是焦点离开期间用户做了什么（点走光标、删掉括号）
+            // 输入法完全无法感知，保留状态本质上是猜测。实测「大部分情况不行」——
+            // 一个大部分情况下失效的功能比没有更糟，用户拍板放弃。
+            //
+            // 注意「同一焦点内」的陈旧风险与本项无关，仍由 state_ttl_secs 兜底。
+            self.clear_pair_tracker();
             // 撤销上屏计数复位：换窗/换文本框后光标前已非「刚上屏那段」，下次 undo 退化删 1。
             self.last_commit_len
                 .store(1, std::sync::atomic::Ordering::Relaxed);
@@ -5309,7 +5331,11 @@ impl MessageHandler for Coordinator {
         self.record_last_state();
         self.punct.lock().unwrap_or_else(|e| e.into_inner()).reset();
         self.disarm_smart_symbol();
-        self.clear_pair_tracker();
+        // 配对栈**刻意不清**：中英切换既不移动光标也不消除已插入的右符号，「光标紧贴右符号」
+        // 这个前提仍然成立，清掉只会让用户切走再切回后 Tab/Enter 跳不出去。真正让前提失效的
+        // 是失焦与组合被终止，那两处仍清（见 clear_pair_tracker 的其余调用点）。
+        // C++ 侧同源：模式切换路径调 ResetComposingState(TRUE) 保留 _pairPendingDepth，
+        // 否则中文模式下 Enter 会被会话门控挡在 DLL 里，根本到不了这里。
         self.push_state_update();
         self.show_status();
         self.notify_toolbar();
@@ -5333,7 +5359,7 @@ impl MessageHandler for Coordinator {
         self.record_last_state();
         self.punct.lock().unwrap_or_else(|e| e.into_inner()).reset();
         self.disarm_smart_symbol();
-        self.clear_pair_tracker();
+        // 配对栈刻意不清，理由同 handle_toggle_mode。
         self.push_state_update();
         self.show_status(); // 与 Shift 切换（handle_toggle_mode）统一：Ctrl+Space/外部切换也显示中/英提示
         self.notify_toolbar();

@@ -1046,6 +1046,14 @@ pub fn encode_jump_out_keys_value(right_symbol: bool, vks: &[u32]) -> Vec<u8> {
     value
 }
 
+/// 编码配对状态时效（对齐 TSF `OnSyncConfig` CONFIG_KEY_PAIR_STATE_TTL）。
+///
+/// 格式：secs(u16 LE)。`0` = 不过期。上限取 u16（约 18 小时），超出即饱和——
+/// 再长的时效与「不过期」在实际使用上没有区别。
+pub fn encode_pair_state_ttl_value(secs: u32) -> Vec<u8> {
+    (secs.min(u16::MAX as u32) as u16).to_le_bytes().to_vec()
+}
+
 /// 编码「英半列有自定义映射的源字符集合」（对齐 TSF `OnSyncConfig` CONFIG_KEY_CUSTOM_EN_PUNCT）。
 ///
 /// 格式：count(u8) + [ch:u16(LE)]...  源字符均为 ASCII 标点，一个 UTF-16 单元足够。

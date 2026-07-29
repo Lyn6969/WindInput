@@ -153,6 +153,7 @@ static REGISTRY: &[ConfigField] = &[
     f("input.auto_pair.chinese_pairs", StrList),
     f("input.auto_pair.english_pairs", StrList),
     f("input.auto_pair.jump_out_keys", StrList),
+    f("input.auto_pair.state_ttl_secs", Int),
     f("input.temp_english.enabled", Bool),
     f("input.temp_english.show_candidates", Bool),
     f(

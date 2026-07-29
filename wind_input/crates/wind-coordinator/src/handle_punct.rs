@@ -8,7 +8,7 @@ use crate::coordinator::{Coordinator, State, full_width_source_char, numpad_char
 use tracing::debug;
 use wind_bridge::handler::{KeyAction, KeyEventData, MessageHandler};
 use wind_config::config::SmartMethod;
-use wind_ipc::protocol::MOD_SHIFT;
+use wind_ipc::protocol::{MOD_ALT, MOD_CTRL, MOD_SHIFT};
 use wind_keys::keymap;
 
 /// 恰好单字符则返回之，否则 None（自定义映射可为多字符串，不能充当配对符）。
@@ -556,10 +556,7 @@ impl Coordinator {
             }
             // 插入配对：左符号 → 补右符号，光标置于其间。
             if let Some((_, right)) = pairs.iter().find(|(l, _)| *l == pch).copied() {
-                self.pair_tracker
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .push(pch, right);
+                self.push_pair(pch, right);
                 let cursor_offset = piece.encode_utf16().count() as u32;
                 return Some(KeyAction::InsertTextWithCursor {
                     text: format!("{}{}", piece, right),
@@ -629,11 +626,10 @@ impl Coordinator {
     /// 引号在此照常按左右形交替（`"1` → `"2` → `"1`…），交替态与中文侧共用同一个转换器，
     /// 中英模式切换时由 `punct.reset()` 归零（`coordinator.rs` 的两处 mode_switch）。
     ///
-    /// **已知限制**（窄边缘，未修）：英文模式下配对栈此时分成两半——本路径接手的键入
-    /// 协调器的 `pair_tracker`，其余英文标点仍入 DLL 的 `_englishPairEngine`。故若用户把某键的
-    /// 英半列自定义成一个配对左符号，它插入的那对无法用 Tab 跳出（DLL 的跳出判据看的是自己那个
-    /// 空栈）。要修需让 DLL 的跳出判定也认协调器侧的待跳出深度（中文侧 `_pairPendingDepth` 已有
-    /// 同类机制可循）。触发条件是「自定义产物恰为配对符 + 英文模式 + 用跳出键」，故暂记不修。
+    /// **本路径同时接手英文半角的普通配对键**（此前由 DLL 的 `_englishPairEngine` 本地插入）。
+    /// 合并的理由是消除记账处：配对状态原先分散在协调器的 `pair_tracker` 与 DLL 的英文栈两处，
+    /// 谁也看不见谁，于是「中文里打的配对切到英文跳不出、反之亦然」。现在四条配对建立路径
+    /// （中文标点 / 英文全角 / 英半自定义 / 英半普通）全部入 `pair_tracker`，DLL 只留吃键判据。
     pub(crate) fn handle_english_custom_punct(
         &self,
         state: &mut State,
@@ -641,8 +637,18 @@ impl Coordinator {
     ) -> Option<KeyAction> {
         let shift = data.modifiers & MOD_SHIFT != 0;
         let ch = punct_char(data.key_code, shift)?;
-        if !self.rt().custom_en_punct_chars.contains(&ch) {
-            return None; // DLL 未吃此键（判据同源），透传给宿主
+        // 判据必须与 DLL 的吃键判据**逐条同源**，漂移即「吃了再吐」丢键。DLL 吃两类键：
+        //   ① 英半列配了自定义映射的源字符（`push_custom_en_punct_config` 推送的集合）
+        //   ② 英文配对表内的字符（`push_english_pair_config` 推送 `en_pairs` + `enabled`；
+        //      DLL 侧判据是 `IsEnabled() && (IsLeft(c) || IsRight(c))`）
+        // 两类都必须出字：①必有英半列值，②无自定义时 `convert_punct_char` 回落原样 ASCII，
+        // 与透传等价，故并入安全。
+        let rt = self.rt();
+        let eaten_as_custom = rt.custom_en_punct_chars.contains(&ch);
+        let eaten_as_pair = rt.config.input.auto_pair.english
+            && rt.en_pairs.iter().any(|(l, r)| *l == ch || *r == ch);
+        if !eaten_as_custom && !eaten_as_pair {
+            return None; // DLL 未吃此键，透传给宿主
         }
 
         // 「英半」= 英文标点 + 半角（列 3）。英文模式恒按英文标点列输出，与工具栏的
@@ -672,10 +678,7 @@ impl Coordinator {
                 tr.clear();
             }
             if let Some((_, right)) = pairs.iter().find(|(l, _)| *l == pch).copied() {
-                self.pair_tracker
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .push(pch, right);
+                self.push_pair(pch, right);
                 let cursor_offset = piece.encode_utf16().count() as u32;
                 return Some(KeyAction::InsertTextWithCursor {
                     text: format!("{}{}", piece, right),
@@ -712,13 +715,100 @@ impl Coordinator {
         self.handle_english_stats(chars, digits, puncts, spaces);
     }
 
-    /// 清空配对跟踪栈（焦点/模式切换等的防御性复位，与 `disarm_smart_symbol` 并列调用）。
-    /// 焦点/模式一旦切换，旧的「光标紧贴右符号」假设即失效，残留栈会让跳出键/右符号跳出误判，
-    /// 故必须清空。
+    /// 清空配对跟踪栈（失焦 / 组合被意外终止时的防御性复位）。
+    /// 这两种场景下光标已离开原位置，旧的「光标紧贴右符号」假设失效，残留栈会让跳出键/
+    /// 右符号跳出误判，故必须清空。
+    ///
+    /// **中英模式切换不在此列**（曾经在，已移除）：切模式既不移动光标也不消除已插入的
+    /// 右符号，前提仍成立；清掉只会让用户切走再切回后跳不出去。C++ 侧的 `_pairPendingDepth`
+    /// 同步保留（`ResetComposingState(TRUE)`）。
     pub(crate) fn clear_pair_tracker(&self) {
         self.pair_tracker
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .clear();
+    }
+
+    /// 聚焦到与配对状态归属不同的客户端时清栈。配对栈是全局单栈、不分宿主，
+    /// 换了宿主之后栈顶可能是别人压的那层。`token == 0`（未归属/未知）不做判断。
+    ///
+    /// **跨焦点保留放弃后，本校验退化为防御性保险**：真实失焦（Thread / DocChanged /
+    /// NoEditCtx）已在 `handle_focus_lost` 里清过栈，能活到这里的只有 `CtxLost` 噪声，
+    /// 而那是同一应用内的 DocMgr 抖动，不会换宿主。保留它是因为成本为零（一次整数比较），
+    /// 且「全局单栈」这个事实没变——判据一旦再放宽，它就是最后一道防串台的闸。
+    pub(crate) fn clear_pair_tracker_if_foreign(&self, client_token: u64) {
+        if client_token == 0 {
+            return;
+        }
+        let mut tr = self.pair_tracker.lock().unwrap_or_else(|e| e.into_inner());
+        let owner = tr.owner_token();
+        if owner != 0 && owner != client_token {
+            debug!("配对状态归属不符（owner={owner:#x} → {client_token:#x}），清栈");
+            tr.clear();
+        }
+    }
+
+    /// 压入一层配对，并认领归属（首层才有意义，非首层 set 同一 token 无副作用）。
+    pub(crate) fn push_pair(&self, left: char, right: char) {
+        let token = self.push_server.active_token();
+        let mut tr = self.pair_tracker.lock().unwrap_or_else(|e| e.into_inner());
+        if tr.is_empty() {
+            tr.set_owner_token(token);
+        }
+        tr.push(left, right);
+    }
+
+    /// 配对状态是否已陈旧（距最后一次按键超过 `state_ttl_secs`）。
+    ///
+    /// 判定点在协调器，但**吃键闸门在 DLL**：DLL 用同一个阈值本地判 `_pairPendingDepth`
+    /// 是否还作数。两侧刷新时机天然不对称——英文模式下协调器收不到普通字母键，这边的
+    /// 时间戳会偏旧。该不对称的失效方向是安全的：协调器偏保守地认为已陈旧，结果是打右
+    /// 符号时正常插入而不是误跳出。**宁可不跳出，不要误跳出。**
+    pub(crate) fn pair_state_stale(&self) -> bool {
+        let ttl = self.rt().config.input.auto_pair.state_ttl_secs;
+        self.pair_tracker
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .is_stale(ttl)
+    }
+
+    /// 配对跳出键的统一前置判定（全模式生效）。命中则光标越过右符号并弹栈。
+    ///
+    /// **必须置于英文模式分支之前**：英文模式下协调器对普通键直接 `PassThrough`，判定若留在
+    /// 中文 composition 分派路径里就是死代码——这正是「英文模式跳不出中文配对」的根因之一。
+    ///
+    /// 守卫（任一不满足即不拦截，让键落回原有路径，绝不吞键）：
+    /// - 不在独占模式（`state.active`）：网址/临拼/快捷输入/特殊模式里的 Tab/Enter 是它们自己的
+    ///   语义，前置之后本判定会跑在那些分支之前，不挡就会被抢走
+    /// - 无编码、无候选：避免吞掉正常的选词/编辑按键
+    /// - 无 Ctrl/Alt/Shift：Shift+Tab 是反向切焦点，不能当跳出
+    /// - 命中 `jump_out_keys` 且配对栈非空、未陈旧
+    pub(crate) fn try_jump_out(&self, state: &State, data: &KeyEventData) -> Option<KeyAction> {
+        if state.active.is_some()
+            || !state.input_buffer.is_empty()
+            || !state.candidates.is_empty()
+            || data.modifiers & (MOD_CTRL | MOD_ALT | MOD_SHIFT) != 0
+            || !self.rt().jump_out_keys.contains(&data.key_code)
+        {
+            return None;
+        }
+        if self.pair_state_stale() {
+            // 陈旧即就地清掉：否则每次按跳出键都要重算一遍，且状态会一直挂到下次失焦。
+            debug!("配对状态已陈旧（超过 state_ttl_secs），清栈并放行跳出键");
+            self.clear_pair_tracker();
+            return None;
+        }
+        let mut tr = self.pair_tracker.lock().unwrap_or_else(|e| e.into_inner());
+        tr.peek()?;
+        tr.pop();
+        Some(KeyAction::MoveCursorRight)
+    }
+
+    /// 刷新配对状态活动时间（每次按键调用；栈空时是空操作）。
+    pub(crate) fn touch_pair_state(&self) {
+        self.pair_tracker
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .touch();
     }
 }
