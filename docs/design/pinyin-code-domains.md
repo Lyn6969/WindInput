@@ -1,8 +1,11 @@
 # 拼音编码域：raw / flat / syl 的统一表示
 
-> 状态：**规划中，尚未动生产代码**。
+> 状态：**§3 的三层断链 L1/L2/L3 已全部接通**（`19e7e96` / `4e8395e` / `b6655b3`），
+> 未真机验证。§6 的 Phase 4–6 仍待做。
 > 本文是 `pinyin-boundary-aware-lattice.md` §11「Interpretation/SylSpan 抽象」条目的展开。
 > 那里记录了该抽象缺位已三次致 bug；本文补上第四次现场（简拼），并据此重定了目标形状。
+>
+> §3 各节保留**修复前**的实测数据与代码片段作为病历，不是当前状态；每节标题已标注修复提交。
 
 ## 1. 为什么现在写
 
@@ -67,7 +70,7 @@ flat 作为 `(schema, code, text)` 的 code **不变**。前缀查询是逐键�
 
 用户词库则在三层上依次断开。
 
-### L1 — 持久化格式无边界：备份还原清零（**已修**，见 §6 Phase 1）
+### L1 — 持久化格式无边界：备份还原清零（**已修** `19e7e96`，见 §6 Phase 1）
 
 wdict 是四列 TSV，`WordIo { code, text, weight, count }`，没有边界。
 `backup.rs:286-288` 的还原路径是 `clear_user_words` + `import`，清空后全是新键，
@@ -87,7 +90,7 @@ wdict 是四列 TSV，`WordIo { code, text, weight, count }`，没有边界。
 `[4]` 说明 `import_user_words:327` 的「boundary 沿用旧值」确实生效，但它只能保护
 **已存在的键**，救不了还原场景，也救不了从别处导入的新词。
 
-### L2 — 传递链断裂：候选恒 0
+### L2 — 传递链断裂：候选恒 0（**已修** `4e8395e`）
 
 `store_layer.rs:13`：
 
@@ -124,7 +127,7 @@ fn record_to_candidate(r: UserWordRecord, is_temp: bool, is_prefix: bool) -> Can
 同一模式已复发两次，说明「贯通某字段」的难点不是改哪几行，而是**枚举全部构造
 `Candidate` 的地方**——`..Default::default()` 让漏掉的字段静默取 0，编译器不提醒。
 
-### L3 — 消费端重猜
+### L3 — 消费端重猜（**已修** `b6655b3`）
 
 `mod.rs:314`：
 
@@ -152,14 +155,18 @@ fn abbrev_of_code(&self, code: &str) -> Option<String> {
 
 ### 3.1 受害范围：不止简拼
 
-`boundary=0` 对**所有**消费者生效：
+`boundary=0` 曾对**所有**消费者生效。L2 接通后四项一并恢复：
 
-| 消费点 | 用户词候选的实际行为 |
-|---|---|
-| `abbrev_of_code` 简拼投影 | 回退 DAG 猜 → 歧义码上出错 |
-| `boundary_compatible` 双拼校验 | 任一侧 0 即放行 → **一律不校验** |
-| `should_promote_user_completion` 长词上浮（`mod.rs:1065`） | 恒走「无边界」分支 |
-| `handle_candidate.rs:1388` 自动造词沿用边界 | 选中用户词候选时传 0 |
+| 消费点 | 断链期的行为 | 接通后 |
+|---|---|---|
+| `abbrev_of_code` 简拼投影 | 回退 DAG 猜 → 歧义码上出错 | 采信真值（L3 一并修） |
+| `boundary_compatible` 双拼校验 | 任一侧 0 即放行 → **一律不校验** | 真正校验，实测无误杀 |
+| `should_promote_user_completion` 长词上浮（`mod.rs:1065`） | 恒走「无边界」分支 | 2 音节即可上浮 |
+| `handle_candidate.rs:1388` 自动造词沿用边界 | 选中用户词候选时传 0 | 传真值 |
+
+**双拼误杀风险已实测排除**：用户词的 boundary 要么是真值（造词/导入），要么是 0
+（手输码在 `infer_boundary_for` 里码不一致时给 0），不会产生错值，故校验不会拒掉
+本该出现的词。`dabologe` / `dabo` / `dabolo` 三种击键下用户词位次均相同或更前。
 
 ### 3.2 其余缺口
 
@@ -297,25 +304,44 @@ rime 源 `你好\tni hao\t100` 的空格本就是作者标注的音节真值，�
 **仍未接通**：L2（`record_to_candidate`）没改，所以边界目前只到 redb，尚未到候选。
 用户词的简拼 / 双拼校验 / 长词上浮**仍是旧行为**，须等 Phase 2。
 
-### Phase 2 — L2：接上 `record_to_candidate`
+### Phase 2 — L2：接上 `record_to_candidate` ✅ **已完成**（`4e8395e`）
 
-一行的事，但**收益远超一行**：§3.1 表里四项会同时活过来。
+一行的事，收益是 §3.1 表里四项同时活过来。
 
-⚠️ 其中双拼边界校验与长词上浮属于**行为变更而非纯修复**——它们此前一直走
-「无边界」分支，接上后开始真正校验。需要 `pinyin_eval.rs` 那套评测基础设施兜底，
-不能只跑单元测试。建议本阶段单独成一次提交，便于回滚定位。
+**行为变更实测**（真实词库，用户词「大菠萝哥」`da|bo|luo|ge`）：
 
-同时排查其余 `Candidate { .. ..Default::default() }` 构造点，确认没有第四处遗漏。
+| 输入 | 有边界 | boundary=0（旧行为） |
+|---|---|---|
+| `daboluoge` | 位次 0 | 位次 0 |
+| `dabo` | 位次 1，上浮 | **未命中——30 个候选里没有** |
+| `daboluo` | 位次 1，上浮 | 位次 1，上浮 |
 
-### Phase 3 — L3：简拼采信真值边界
+差异只在 2 音节这一档，不是整体翻转。`e10933f`「用户长词打部分拼音即上浮」
+对用户词此前从未真正生效。
 
-`abbrev_of_code` 改为优先用候选自带的 boundary 投影声母，`boundary=0` 才回退 DAG。
+> 原计划用 `pinyin_eval.rs` 兜底，**实际不适用**：该评测跑系统词库转换准确率，
+> 走 `CachedDict` 不经 `record_to_candidate`，覆盖不到本改动。改以上述对照实验
+> 加双拼误杀专项验证替代（见 §3.1 末）。这类「评测覆盖不到的改动」应当明说，
+> 而不是跑一遍绿的评测充当证据。
 
-⚠️ **回归测试必须用歧义切分码。** 现有两个简拼测试
-（`store_layer_words_match_abbreviation`）用的是 `cainiaoyizhan`、`lanshoubing`——
-`maximum_match` 恰好猜对，**测不出这个 bug**。这是「测试样本避开失效分支」的又一例，
-与密码框分区那案同型。建议样本：`xi|an|ning`、`fan|gan`（vs `fang|an`）、
-`ping|an`（vs `pin|gan`）。反向验证：改回重猜版本，新测试必须变红。
+### Phase 3 — L3：简拼采信真值边界 ✅ **已完成**（`b6655b3`）
+
+`abbrev_of_code` 优先用候选自带的 boundary 投影声母，`boundary=0` 才回退 DAG。
+
+实测（用户词「西安宁」，真值 `xi|an|ning`）：
+
+| 查询 | 修复前 | 修复后 |
+|---|---|---|
+| `xan` | 未命中（漏） | 命中 |
+| `xn` | 命中（错） | 不命中 |
+
+回归用的正是歧义切分码。仓库原有两个简拼测试
+（`store_layer_words_match_abbreviation`）用 `cainiaoyizhan` / `lanshoubing`——
+`maximum_match` 恰好猜对，**测不出这个 bug**，是「测试样本避开失效分支」的典型，
+与密码框分区那案同型。备用样本：`fan|gan`（vs `fang|an`）、`ping|an`（vs `pin|gan`）。
+
+**遗留**：`Candidate { .. ..Default::default() }` 的其余构造点尚未逐一排查，
+不能排除第四处同型遗漏。
 
 ### Phase 4 — 简拼词频归并（§5.2）
 
