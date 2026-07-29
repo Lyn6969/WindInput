@@ -147,12 +147,21 @@ pub fn rerank_pinyin_decay(
         // 引擎侧的降权会被本步整个顶回去（本比较器不看 weight，只看标志）。落选锚定后
         // 它走下面的层级+衰减+权重序，恰好停在精确整词之后、普通候选之前。
         //
+        // `is_sentence_contested` 的整句同样**不参与**锚定：它自己就是一个词典精确整词，
+        // 而同码还有别的精确整词（`siyuan` 寺院/思源、`gonghe` 共和/恭贺）。锚定是硬闸门
+        // ——衰减分连算都不算——会让同码竞争者无论被选中多少次都翻不过它，词频维度对该
+        // 编码整体失效。摘掉锚定后它落到下面按衰减分与竞争者公平比较；**无词频记录时
+        // 仍靠引擎喂进来的权重序（SENTENCE_WEIGHT_BASE 量纲）居首**，不会平白掉位。
+        //
         // 短语只锚定**精确码短语**（`is_phrase && is_exact_code`）：前缀短语（`lookup_prefix`，
         // `!is_exact_code`）不锚定，落到下面 `cmp_match_layers` 靠 is_prefix 降到精确候选之下。
         // 否则打 `da` 时 `date` 前缀短语只因 is_phrase 就被顶到首位（与 freq_tier tier1/tier2、
         // 协调器 candidate_display_order 对齐：完全匹配才提前、前缀避让）。
-        let sa = (a.is_sentence && !a.is_sentence_demoted) || (a.is_phrase && a.is_exact_code);
-        let sb = (b.is_sentence && !b.is_sentence_demoted) || (b.is_phrase && b.is_exact_code);
+        let anchored = |c: &Candidate| {
+            (c.is_sentence && !c.is_sentence_demoted && !c.is_sentence_contested)
+                || (c.is_phrase && c.is_exact_code)
+        };
+        let (sa, sb) = (anchored(a), anchored(b));
         if sa != sb {
             return if sa {
                 Ordering::Less
@@ -313,6 +322,55 @@ mod tests {
         assert_eq!(
             cands[0].text, "降级整句",
             "降级整句不再锚定，故可凭词频重新浮上来"
+        );
+    }
+
+    /// 有同码竞争者的整句（`is_sentence_contested`）**不再锚定**：同码精确整词可凭词频反超。
+    ///
+    /// 现场 `siyuan`：「寺院」既是词典精确整词、又被 Viterbi 选为最优解（step 2 同文合并
+    /// 继承整句身份，weight 被抬到 SENTENCE_WEIGHT_BASE 量纲），而「思源」同码。锚定是
+    /// 硬闸门，实测灌到 count=5000 都翻不动 —— 词频对该编码整体失效。
+    #[test]
+    fn pinyin_contested_sentence_yields_to_used_peer() {
+        let mut cands = vec![
+            {
+                let mut c = pin_sentence("寺院", 29_984_561);
+                c.is_sentence_contested = true;
+                c
+            },
+            pin("思源", 245),
+        ];
+        // 只用一次：衰减分 100·log2(2) = 100 ≫ ε，足以软置前。
+        let r = recs(&[("思源", 1, NOW)]);
+        rerank_pinyin_decay(&mut cands, &r, NOW, FreqProfile::default());
+        assert_eq!(
+            cands[0].text,
+            "思源",
+            "有同码竞争者的整句须接受词频挑战，实际: {:?}",
+            cands.iter().map(|c| &c.text).collect::<Vec<_>>()
+        );
+        assert_eq!(cands[1].text, "寺院", "整句退居第二，不是被赶出列表");
+    }
+
+    /// 与上一条配对：**无词频记录时 contested 整句仍居首**。
+    ///
+    /// 本字段只摘锚定、不动 weight —— 引擎那边「寺院」拿的仍是 3e7 量纲，靠调用方喂进来的
+    /// 权重序 + 稳定排序保住首位。若哪天误把本字段做成降权，这条会挂。
+    #[test]
+    fn pinyin_contested_sentence_still_leads_without_freq() {
+        let mut cands = vec![
+            {
+                let mut c = pin_sentence("寺院", 29_984_561);
+                c.is_sentence_contested = true;
+                c
+            },
+            pin("思源", 245),
+        ];
+        let r = recs(&[]);
+        rerank_pinyin_decay(&mut cands, &r, NOW, FreqProfile::default());
+        assert_eq!(
+            cands[0].text, "寺院",
+            "无使用记录时整句仍是最优解读，须维持首位"
         );
     }
 

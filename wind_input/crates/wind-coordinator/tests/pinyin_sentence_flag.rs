@@ -1,10 +1,25 @@
-//! 整句锚定标记的跨层贯通测试
+//! 整句排序标记的跨层贯通测试
 //!
 //! `freq_rerank` 的整句豁免此前靠 `weight >= 20_000_000` 判定，现改为按
-//! `Candidate::is_sentence` 语义标记。标记在引擎产出后要穿过
+//! `Candidate::is_sentence` 族语义标记。标记在引擎产出后要穿过
 //! `finalize_candidates` → `build_candidates` → `apply_freq_rerank` 整条链路，
-//! 任何一处重建 Candidate 都会把它丢掉——丢了不会编译报错，只会让整句在有词频
-//! 记录时被静默挤下首位。本测试锁住这条链路。
+//! 任何一处重建 Candidate 都会把它丢掉——丢了不会编译报错，只会让整句排序
+//! 静默走样。本测试锁住这条链路。
+//!
+//! ## ⚠️ 断言方向已随语义反转（原为「整句恒锚定首位」）
+//!
+//! 原测试断言 `gonghe` 的首选恒为整句「共和」，即便同码的「恭贺」有高词频。该语义
+//! 已被推翻：「共和」自己就是一个词典精确整词，只是恰好被 Viterbi 选为最优解而继承
+//! 了整句身份；锚定是**硬闸门**（`freq_rerank` 的 ① 步直接 return，衰减分连算都不算），
+//! 于是同码的「恭贺」无论被选中多少次都翻不过它 —— 词频维度对整个 `gonghe` 编码失效。
+//! `siyuan` 的「寺院」压住「思源」是同一现场（实测灌到 count=5000 仍纹丝不动）。
+//!
+//! 现由 `Candidate::is_sentence_contested` 标记这类「有同码竞争者」的整句并摘掉其锚定。
+//!
+//! **本测试保护的目标没有变**：`is_sentence` 与 `is_sentence_contested` 同为 Candidate 上
+//! 相邻的 `serde(skip)` 字段，「跨层重建把标记丢掉」这一失效模式会同时丢掉两者 ——
+//! 丢掉 contested 则锚定恢复、「共和」重回首位，本断言即会失败。判据方向反了，守的
+//! 是同一条链路。
 //!
 //! 词典缺失时自动跳过。
 
@@ -38,12 +53,12 @@ fn press_letter(coord: &Coordinator, c: char) {
     coord.handle_key_event(&key_event(vk, EVENT_KEY_DOWN));
 }
 
-/// 「恭贺」被反复使用出高词频，但 gonghe 的首选必须仍是 Viterbi 整句「共和」。
+/// 「恭贺」被反复使用出高词频后，gonghe 的首选须让给它；整句「共和」退居第二而非消失。
 ///
-/// 若 `is_sentence` 在跨层传递中丢失，「共和」会退化成普通候选参与词频重排，
-/// 被有使用记录的「恭贺」挤到第二——本断言即会失败。
+/// 若 `is_sentence_contested` 在跨层传递中丢失，「共和」会恢复顶部锚定、把「恭贺」
+/// 永久压在下面——本断言即会失败（这正是修复前的行为）。
 #[test]
-fn test_sentence_flag_survives_to_freq_rerank() {
+fn test_sentence_flags_survive_to_freq_rerank() {
     let d = data_dir();
     if !d.join("schemas/pinyin/cn_dicts/base.dict.yaml").exists() {
         eprintln!("跳过：拼音词库不存在");
@@ -72,11 +87,16 @@ fn test_sentence_flag_survives_to_freq_rerank() {
     }
 
     let all = coord.debug_all_candidate_texts();
+    let head: Vec<&str> = all.iter().take(5).map(|s| s.as_str()).collect();
     assert_eq!(
         all.first().map(|s| s.as_str()),
+        Some("恭贺"),
+        "反复使用过的同码词须能反超整句（is_sentence_contested 应贯通到 freq_rerank），实际候选: {head:?}"
+    );
+    assert_eq!(
+        all.get(1).map(|s| s.as_str()),
         Some("共和"),
-        "整句「共和」须锚定首位（is_sentence 标记应贯通到 freq_rerank），实际候选: {:?}",
-        &all[..all.len().min(5)]
+        "整句只是退居第二、不得被赶出列表（本标记只摘锚定、不动 weight），实际候选: {head:?}"
     );
 
     let _ = std::fs::remove_file(&store_path);

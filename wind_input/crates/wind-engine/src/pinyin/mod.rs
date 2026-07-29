@@ -1209,6 +1209,44 @@ impl Engine for PinyinEngine {
             }
         }
 
+        // 6.6 整句解「有同码竞争者」标记：**只摘词频锚定，不动 weight**
+        //
+        // 上面的 6.5 处理的是「整句该不该让位」（合成解/模糊解 vs 精确整词），本节处理的是
+        // 另一件事：整句解**自己就是**一个词典精确整词，而同码还有别的精确整词。
+        // `siyuan` 的「寺院」即如此——它经 step 2 的同文合并分支继承了整句身份，而
+        // `freq_rerank` 的顶部锚定是硬闸门（衰减分连算都不算），于是同码的「思源」
+        // 无论选中多少次都翻不过它。`gonghe` 共和/恭贺、`nihao` 你好/拟好同构。
+        //
+        // **判据与 6.5 的 `exact_max` 过滤器逐条一致**（同码、非模糊、不在补全/子短语层），
+        // 差别只在这里要的是「存在性」而非「最大权重」。两处若不一致，会出现「6.5 认为有
+        // 竞争者而降级、6.6 认为没有而仍锚定」这类自相矛盾的状态。
+        //
+        // 不动 weight 是有意的：无词频记录时整句仍须凭 `SENTENCE_WEIGHT_BASE` 量纲居首
+        // （它确实是引擎对整串的最优解读），本标记只让它在**有用户实际选择数据时**接受
+        // 挑战。已降级的整句跳过——它已经让过位了，weight 也已被压低。
+        //
+        // 无竞争者的整句（`woshizhongguoren` 这类纯合成解、step 1.5 的超长词典整词）
+        // 不置位、维持锚定：那里没有「用户明确选过另一个同码词」这个事实可依据。
+        let contested: Vec<String> = candidates
+            .iter()
+            .filter(|c| c.is_sentence && !c.is_sentence_demoted)
+            .filter(|s| {
+                candidates.iter().any(|o| {
+                    o.text != s.text
+                        && !o.is_fuzzy
+                        && !o.is_prefix
+                        && !o.is_partial
+                        && o.code == completed
+                })
+            })
+            .map(|c| c.text.clone())
+            .collect();
+        for text in contested {
+            if let Some(c) = candidates.iter_mut().find(|c| c.text == text) {
+                c.is_sentence_contested = true;
+            }
+        }
+
         // 引擎内部排序（层级对齐 Go：完整匹配 >> 子短语 >> 前缀补全 >> 模糊）：
         // ① 非模糊优先于模糊（is_fuzzy=false 在前）；② 完整匹配/子短语(is_prefix=false)优先于
         // 前缀补全(is_prefix=true)；③ 完整匹配(is_partial=false)优先于子短语(is_partial=true)
@@ -2636,6 +2674,76 @@ mod tests {
     /// 判断候选是否为 Viterbi 合成整句（按来源标记，不看权重数值）。
     fn is_viterbi_sentence(c: &Candidate) -> bool {
         c.is_sentence
+    }
+
+    // ── 整句有同码竞争者（step 6.6 摘词频锚定）──────────────────────────────────
+
+    /// 整句解**自己就是**词典精确整词、且同码还有别的精确整词时，须标 `is_sentence_contested`。
+    ///
+    /// 现场 `siyuan`：「寺院」经 step 2 同文合并继承整句身份 → `freq_rerank` 顶部锚定
+    /// （硬闸门）→ 同码「思源」灌到 count=5000 都翻不动。此处用 `nihao` 你好/拟好复现
+    /// 同一结构：**给整词高权重、单字低权重**，迫使 Viterbi 选「你好」这个单节点，
+    /// 从而走同文合并分支（与 `demoted_sentence_falls_below_all_max_weight_exact_words`
+    /// 的构造正好相反 —— 那里要的是合成整句）。
+    #[test]
+    fn dict_word_sentence_with_same_code_peer_is_contested() {
+        let mut raw = CodetableDict::empty();
+        raw.merge_single("ni".to_string(), "你".to_string(), 100, 0);
+        raw.merge_single("hao".to_string(), "好".to_string(), 100, 1);
+        raw.merge_single("nihao".to_string(), "你好".to_string(), 50_000, 2);
+        raw.merge_single("nihao".to_string(), "拟好".to_string(), 200, 3);
+        let e = PinyinEngine::new(Config::default(), CachedDict::Memory(raw));
+        let r = e.convert("nihao", 50).unwrap();
+
+        let c = r
+            .candidates
+            .iter()
+            .find(|c| c.text == "你好")
+            .expect("候选中应有「你好」");
+        assert!(c.is_sentence, "词典整词被 Viterbi 选中 → 继承整句身份");
+        assert!(
+            !c.is_sentence_demoted,
+            "它本身即精确整词，无处可让，不该走 6.5 降级"
+        );
+        assert!(
+            c.is_sentence_contested,
+            "同码存在「拟好」→ 须标 contested（否则词频对 nihao 整体失效）"
+        );
+        assert!(
+            c.weight >= SENTENCE_WEIGHT_BASE - 1_000_000,
+            "本标记只摘锚定、**不动 weight**，整句仍须保有 SENTENCE_WEIGHT_BASE 量纲，实际 {}",
+            c.weight
+        );
+        assert_eq!(
+            r.candidates[0].text, "你好",
+            "无词频记录时整句仍居首（引擎侧顺序不因本标记改变）"
+        );
+    }
+
+    /// 对照组：同码**没有**别的精确整词 → 不标 contested，锚定保留。
+    ///
+    /// 与上一条合看才证明判据真在看「有无竞争者」，而非恒置位。少了这条，把 6.6 写成
+    /// 无条件置位也能让上一条通过 —— 那会连 `woshizhongguoren` 这类无竞争者的整句
+    /// 一起摘掉锚定。
+    #[test]
+    fn dict_word_sentence_without_peer_is_not_contested() {
+        let mut raw = CodetableDict::empty();
+        raw.merge_single("ni".to_string(), "你".to_string(), 100, 0);
+        raw.merge_single("hao".to_string(), "好".to_string(), 100, 1);
+        raw.merge_single("nihao".to_string(), "你好".to_string(), 50_000, 2);
+        let e = PinyinEngine::new(Config::default(), CachedDict::Memory(raw));
+        let r = e.convert("nihao", 50).unwrap();
+
+        let c = r
+            .candidates
+            .iter()
+            .find(|c| c.text == "你好")
+            .expect("候选中应有「你好」");
+        assert!(c.is_sentence, "仍是整句");
+        assert!(
+            !c.is_sentence_contested,
+            "同码无竞争者 → 不得标 contested，锚定须保留"
+        );
     }
 
     // ── 整句让位于精确整词（step 6.5 降级）─────────────────────────────────────
