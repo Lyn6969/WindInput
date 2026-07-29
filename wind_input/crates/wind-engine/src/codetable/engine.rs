@@ -94,12 +94,13 @@ impl CodeTableEngine {
     }
 
     /// 是否存在比 `input` 更长的后继编码（避免把长码精确匹配的前缀误当全码上屏）。
+    ///
+    /// 走 `DictManager::has_longer_code` 直接问各层有序索引，而非「`search_prefix(input, 64)`
+    /// 再 `.any(code 更长)`」——后者为一个 bool 遍历整棵前缀子树（`ok` 拼字这类单前缀
+    /// 8.8 万条的词库上单次 20ms 级），且其判据经权重截断与跨层「同 text 取最短码」两道
+    /// 变形，长码候选权重偏低时会漏判成 false，反而让不该自动上屏的情形上了屏。
     fn has_longer_code(&self, input: &str) -> bool {
-        let n = input.chars().count();
-        self.dm
-            .search_prefix(input, 64)
-            .iter()
-            .any(|c| c.code.chars().count() > n)
+        self.dm.has_longer_code(input)
     }
 
     /// `input` 是否存在精确（code==input）匹配。

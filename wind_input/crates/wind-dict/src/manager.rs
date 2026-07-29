@@ -47,6 +47,11 @@ impl DictManager {
         self.composite.search_prefix(prefix, limit)
     }
 
+    /// 是否存在**严格长于** `prefix` 的编码（跨层，见 `DictLayer::has_longer_code`）。
+    pub fn has_longer_code(&self, prefix: &str) -> bool {
+        self.composite.has_longer_code(prefix)
+    }
+
     pub fn composite(&self) -> &CompositeDict {
         &self.composite
     }
@@ -176,6 +181,12 @@ impl DictLayer for SystemDictLayer {
             v.truncate(limit);
         }
         v
+    }
+
+    /// 直接问底层有序索引（DAT 转移表 / BTreeMap），不物化任何候选。
+    /// 覆盖 trait 默认实现，规避其 limit 截断导致的漏判。
+    fn has_longer_code(&self, prefix: &str) -> bool {
+        self.dict.has_longer_code(prefix)
     }
 }
 

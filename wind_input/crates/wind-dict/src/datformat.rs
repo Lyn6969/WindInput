@@ -766,6 +766,33 @@ impl WdatReader {
         self.abbrev.is_some()
     }
 
+    /// 是否存在**严格长于** `prefix` 的编码（trie 上即：prefix 状态还有非终止后继）。
+    ///
+    /// 成本 O(max_code)（≤ 出现过的字节种数，码表约 26）次数组读，**不触碰 LeafTable /
+    /// StringPool**。这是给「更长后继」这类**存在性**判据用的——此前调用方一律走
+    /// `search_prefix(input, 64)` 再 `.any(code 更长)`，等于为一个 bool 遍历整棵子树，
+    /// 在 `ok` 拼字这类单前缀 8.8 万条的词库上单次即 20ms 级。
+    ///
+    /// 注意语义比「search_prefix 后 any」**更严格也更正确**：后者的结果先经权重排序截断
+    /// （长码候选权重低时会被挤出而漏判），跨层合并时还会因「同 text 取最短码」抹掉长码；
+    /// 本函数直接问 trie，不受二者影响。
+    pub fn has_longer_code(&self, prefix: &str) -> bool {
+        let v = &self.main;
+        if v.dat_size == 0 {
+            return false;
+        }
+        let Some(s) = self.walk(v, prefix) else {
+            return false;
+        };
+        // c=0 是终止符（prefix 自身成词），不算「更长」；c>=1 的任一有效转移都意味着
+        // 该子树下必有更长编码（trie 每条路径终归通向叶）。
+        let b = self.base(v, s);
+        (1..=v.max_code).any(|c| {
+            let t = b + c;
+            Self::in_range(v, t) && self.check(v, t) == s
+        })
+    }
+
     /// 前缀查找：走到前缀状态，DFS 子树遍历叶（重建每个候选的完整 code），
     /// 按权重降序、order 升序取前 `limit` 条（与 binformat::DictReader 对齐）。
     ///
@@ -1065,6 +1092,81 @@ mod tests {
             "字典序最末的高权重词被漏掉 ⇒ DFS 提前中止了"
         );
         assert_eq!(out[0].code, "okzz");
+        let _ = std::fs::remove_file(&p);
+    }
+
+    /// `has_longer_code` 的基本语义：只认**严格更长**的后继，前缀自身成词不算。
+    #[test]
+    fn has_longer_code_semantics() {
+        let p = build(
+            "wdat_has_longer.wdat",
+            &[
+                ("ok", &[("好", 10)]),     // 自身成词，且下面还有更长的
+                ("okz", &[("仄", 10)]),    // 中间节点，自身也成词
+                ("okzz", &[("最长", 10)]), // 该支最长
+                ("om", &[("某", 10)]),     // 自身成词，无更长后继
+            ],
+        );
+        let r = WdatReader::open(&p).unwrap();
+
+        assert!(r.has_longer_code(""), "空前缀：词库非空即有更长码");
+        assert!(r.has_longer_code("o"), "o 下有 ok/om");
+        assert!(r.has_longer_code("ok"), "ok 自身成词，但下面还有 okz/okzz");
+        assert!(r.has_longer_code("okz"), "okz 自身成词，但下面还有 okzz");
+        assert!(!r.has_longer_code("okzz"), "okzz 是该支最长，无更长后继");
+        assert!(!r.has_longer_code("om"), "om 自身成词且无后继");
+        assert!(!r.has_longer_code("xyz"), "前缀不存在");
+        assert!(!r.has_longer_code("okzzz"), "越过最长码");
+        let _ = std::fs::remove_file(&p);
+    }
+
+    /// `has_longer_code` 与旧判据（`search_prefix(_, 64)` 再 `any(code 更长)`）在
+    /// **未触发截断**时逐一致——覆盖「前缀自身成词 / 中间节点 / 叶子 / 不存在」四类位置。
+    ///
+    /// 二者并非全等：旧判据经权重排序截断，长码候选权重偏低被挤出前 64 名时会漏判成
+    /// false。新实现直接问 trie，故 **新 ⊇ 旧**（只会更保守，不会更激进）——这正是
+    /// 「更长后继」作为上屏安全阀所需的方向。本测试锁住未截断场景下二者不得分歧。
+    #[test]
+    fn has_longer_code_agrees_with_legacy_predicate_when_untruncated() {
+        let data: Vec<(String, Vec<(String, i32)>)> = (0..300u32)
+            .map(|i| {
+                let c1 = (b'a' + (i / 26) as u8) as char;
+                let c2 = (b'a' + (i % 26) as u8) as char;
+                // 一半是 3 码（叶），一半再挂 4 码后继 → 覆盖有/无更长后继两类。
+                if i % 2 == 0 {
+                    (format!("z{c1}{c2}"), vec![(format!("甲{i}"), 10)])
+                } else {
+                    (format!("z{c1}{c2}q"), vec![(format!("乙{i}"), 10)])
+                }
+            })
+            .collect();
+        let p = build_owned("wdat_has_longer_agree.wdat", &data);
+        let r = WdatReader::open(&p).unwrap();
+
+        let legacy = |prefix: &str| -> bool {
+            let n = prefix.chars().count();
+            r.search_prefix(prefix, 64)
+                .iter()
+                .any(|e| e.code.chars().count() > n)
+        };
+        // 枚举全部编码的全部前缀 + 空串 + 若干不存在的码。
+        let mut prefixes: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+        prefixes.insert(String::new());
+        for extra in ["zzzz", "q", "z"] {
+            prefixes.insert(extra.to_string());
+        }
+        r.for_each_entry(&mut |code, _t, _w| {
+            for i in 1..=code.len() {
+                prefixes.insert(code[..i].to_string());
+            }
+        });
+        for pre in &prefixes {
+            assert_eq!(
+                r.has_longer_code(pre),
+                legacy(pre),
+                "前缀 {pre:?} 上新旧判据分歧"
+            );
+        }
         let _ = std::fs::remove_file(&p);
     }
 

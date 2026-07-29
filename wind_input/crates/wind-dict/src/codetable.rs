@@ -648,6 +648,24 @@ impl CodetableDict {
         results
     }
 
+    /// 是否存在**严格长于** `prefix` 的编码。内存路径对应
+    /// [`crate::datformat::WdatReader::has_longer_code`]，语义与之一致。
+    ///
+    /// BTreeMap 有序：从 `prefix` 起扫，遇到第一个不以 `prefix` 开头的 key 即止——
+    /// 实际只看常数条（`prefix` 自身 + 至多一个后继）。
+    pub fn has_longer_code(&self, prefix: &str) -> bool {
+        for code in self.entries.range(prefix.to_string()..).map(|(c, _)| c) {
+            if !code.starts_with(prefix) {
+                return false;
+            }
+            // 已知 code 以 prefix 开头 → 字节更长 ⟺ 字符更多（UTF-8 同前缀）。
+            if code.len() > prefix.len() {
+                return true;
+            }
+        }
+        false
+    }
+
     /// 前缀查找
     pub fn search_prefix(&self, prefix: &str, limit: usize) -> Vec<(String, String, i32, i32)> {
         let mut results = Vec::new();

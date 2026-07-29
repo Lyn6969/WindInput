@@ -266,6 +266,15 @@ impl CachedDict {
         }
     }
 
+    /// 是否存在**严格长于** `prefix` 的编码（存在性判据，不物化候选）。
+    /// 两个后端语义一致：mmap 走 DAT 转移表 O(字节种数)，内存走 BTreeMap 有序扫常数条。
+    pub fn has_longer_code(&self, prefix: &str) -> bool {
+        match self {
+            Self::Mmap(reader) => reader.has_longer_code(prefix),
+            Self::Memory(dict) => dict.has_longer_code(prefix),
+        }
+    }
+
     /// 前缀查找
     pub fn search_prefix(&self, prefix: &str, limit: usize) -> Vec<(String, String, i32, i32)> {
         match self {

@@ -31,6 +31,20 @@ pub trait DictLayer: Send + Sync {
     /// 前缀查找
     fn search_prefix(&self, prefix: &str, limit: usize) -> Vec<Candidate>;
 
+    /// 该层是否存在**严格长于** `prefix` 的编码——「更长后继」存在性判据，供上屏安全阀
+    /// （自动上屏 / 满码清空 / 顶码）使用：还能接着打就别急着替用户上屏。
+    ///
+    /// 默认实现沿用「取一批前缀候选再看有没有更长 code」的老办法，仅为无法廉价判断的层
+    /// （redb / 内存 trie）兜底。它**受 limit 截断影响**：更长编码的候选权重偏低被挤出
+    /// 前 64 名时会漏判成 false。由有序结构支撑的层应覆盖本方法直接问索引，
+    /// 见 `SystemDictLayer`。
+    fn has_longer_code(&self, prefix: &str) -> bool {
+        let n = prefix.chars().count();
+        self.search_prefix(prefix, 64)
+            .iter()
+            .any(|c| c.code.chars().count() > n)
+    }
+
     /// 该层当前是否启用：禁用层在 composite 查询时被跳过（不出候选）。默认始终启用。
     /// 用于码表扩展词库的运行时热插拔——禁用的扩展层仍常驻（已 mmap），仅不参与查询。
     fn enabled(&self) -> bool {

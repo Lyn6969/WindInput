@@ -58,6 +58,19 @@ impl CompositeDict {
         self.merge_search(prefix, limit, true)
     }
 
+    /// 是否存在**严格长于** `prefix` 的编码：任一**启用**层命中即 true，命中即短路。
+    ///
+    /// 刻意不经 `merge_search`——那条路会按 text 去重并「同 text 取最短码」
+    /// （见 `merge_search` 注释），把一个字的长码换成它在别层的短码，正好抹掉本判据
+    /// 要找的信息。存在性判断必须逐层原样问。
+    pub fn has_longer_code(&self, prefix: &str) -> bool {
+        let layers = self.layers.read().unwrap();
+        layers
+            .iter()
+            .filter(|l| l.enabled())
+            .any(|l| l.has_longer_code(prefix))
+    }
+
     /// 跨层合并：遍历各层收集候选，按 text 去重——
     ///   - 保留**高优先级层**(先出现)的词条信息(code/natural_order)；
     ///   - 但**继承后续层中同 text 的更高权重**(用户词不因低权重丢失码表词的自然排序位)；
@@ -170,6 +183,91 @@ mod tests {
             boundary,
             ..cand(text, code, weight, no)
         }
+    }
+
+    /// 跨层「更长后继」判据**必须逐层原样问**，不能走 `merge_search`。
+    ///
+    /// 合并期会按 text 去重并「同 text 取最短码」：同一个词在高优先层有短码、在系统层有
+    /// 长码时，合并结果只剩短码——正好把本判据要找的信息抹掉。这曾是旧实现
+    /// （`search_prefix(input, 64)` 再 `.any(code 更长)`）的漏判来源，会让「用户还能接着
+    /// 打」的情形被误判成「已到底」，进而触发不该发生的自动上屏 / 顶码。
+    #[test]
+    fn has_longer_code_bypasses_dedup_shortest_code() {
+        let c = CompositeDict::new();
+        c.register_layer(Box::new(MockLayer {
+            name: "user".into(),
+            ltype: LayerType::User, // 高优先层：短码，长度 == 待查前缀
+            items: vec![cand("好", "ok", 100, 0)],
+        }));
+        c.register_layer(Box::new(MockLayer {
+            name: "system".into(),
+            ltype: LayerType::System, // 同 text，但码更长
+            items: vec![cand("好", "okzz", 500, 0)],
+        }));
+
+        // 旧路径：合并去重后同 text 取最短码 "ok"，长度不大于输入 → 漏判为 false。
+        let merged_says = {
+            let n = "ok".chars().count();
+            c.search_prefix("ok", 64)
+                .iter()
+                .any(|x| x.code.chars().count() > n)
+        };
+        assert!(
+            !merged_says,
+            "前提校验：合并路径确实因取最短码而看不到 okzz"
+        );
+
+        // 新路径：逐层问，system 层的 okzz 如实命中。
+        assert!(
+            c.has_longer_code("ok"),
+            "系统层存在更长码 okzz，跨层判据不得因去重而漏掉"
+        );
+
+        // 无更长后继时不得误报。
+        assert!(!c.has_longer_code("okzz"), "okzz 已最长");
+        assert!(!c.has_longer_code("zzz"), "无此前缀");
+    }
+
+    /// 禁用层不参与「更长后继」判据——与 `merge_search` 跳过禁用层的行为一致，
+    /// 否则关掉的扩展词库仍会压住自动上屏。
+    #[test]
+    fn has_longer_code_skips_disabled_layers() {
+        struct Toggle {
+            name: String,
+            on: std::sync::atomic::AtomicBool,
+        }
+        impl DictLayer for Toggle {
+            fn name(&self) -> &str {
+                &self.name
+            }
+            fn layer_type(&self) -> LayerType {
+                LayerType::System
+            }
+            fn search(&self, _c: &str, _l: usize) -> Vec<Candidate> {
+                Vec::new()
+            }
+            fn search_prefix(&self, prefix: &str, _l: usize) -> Vec<Candidate> {
+                if "okzz".starts_with(prefix) {
+                    vec![cand("好", "okzz", 10, 0)]
+                } else {
+                    Vec::new()
+                }
+            }
+            fn enabled(&self) -> bool {
+                self.on.load(std::sync::atomic::Ordering::Relaxed)
+            }
+            fn set_enabled(&self, e: bool) {
+                self.on.store(e, std::sync::atomic::Ordering::Relaxed);
+            }
+        }
+        let c = CompositeDict::new();
+        c.register_layer(Box::new(Toggle {
+            name: "extra".into(),
+            on: std::sync::atomic::AtomicBool::new(true),
+        }));
+        assert!(c.has_longer_code("ok"), "启用时应看到 okzz");
+        c.set_layer_enabled("extra", false);
+        assert!(!c.has_longer_code("ok"), "禁用后该层不得参与判据");
     }
 
     /// **boundary 必须与 code 同进同出**（合并期的错位陷阱）。
