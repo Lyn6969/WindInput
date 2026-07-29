@@ -1,6 +1,6 @@
 # 模式级候选布局（强制竖排 / 横排）统一设计
 
-状态：✅ core 已实施（分支 `feat/mode-candidate-layout`，工作区 1300+ 测试全绿），待真机手测；设置页 UI 待做
+状态：✅ 已并入 main（core + 设置页 UI 均完成，两仓测试全绿），**待真机手测**
 起因：快捷输入已有「强制竖排」，用户要求临时拼音 / 临时英文 / 特殊模式（快符、生僻字）等同样支持。
 
 > 实施中对设计做了三处修正，已就地更新到下文并标注：**不引入 `serde(flatten)`**（§4.2）、
@@ -326,30 +326,49 @@ add_word_active  >  state.active 对应模式  >  Follow（回落全局基线）
 
 ### wind-setting（独立仓 `D:\Develop\workspace\windinput\wind-setting`）
 
-**加配置项有四道守门测试依次拦，各自自带 regenerate 命令**：
+状态：✅ 已完成（设置仓 `d49dd29`，321 项测试全绿）。
 
-1. 本仓 `config_schema::tests::registry_covers_every_config_key` ✅ 已过
-2. 本仓 `data_config_toml_covers_registry` ✅ 已过
+**五道守门测试全部通过**：
+
+1. 本仓 `config_schema::tests::registry_covers_every_config_key`
+2. 本仓 `data_config_toml_covers_registry`
 3. 设置仓 `snapshot_matches_core_generated_capabilities` → `cargo test regenerate_capabilities_snapshot -- --ignored`
 4. 设置仓 `rpc::tests::mock_config_matches_core_system_preset` → `cargo test regenerate_mock_config -- --ignored`
-5. 设置仓 `uncovered_capability_keys_match_allowlist` → 不进 GUI 的键须具名登记进 `UNCOVERED_BY_DESIGN`
+5. 设置仓 `uncovered_capability_keys_match_allowlist` → 不进 GUI 的键须具名登记 `UNCOVERED_BY_DESIGN`
 
-**⚠️ 合并后必做（本 worktree 里做不了）**：设置仓通过 `path = "../WindInput/..."` 依赖
-**主工作区**的 `wind-config` + `data`，不是本 worktree。所以它现在是绿的，**合并进 main 后
-第 3/4/5 道闸门才会红**。合并后立即做：
+⚠️ 3/4 两条的快照与 mockdata 从主仓 `wind-config` + `data` **现算**，不要手改。
+⚠️ 设置仓靠 `path = "../WindInput/..."` 依赖**主工作区**，所以在 feature worktree 里
+它是绿的——**合并进 main 后才会红**。同类改动要把设置仓的收尾算进「合并后」而非「分支内」。
 
-1. 把 4 个新键（`input.temp_pinyin` / `temp_english` / `url` / `add_word` 的 `.candidate_layout`）
-   接进设置清单，**或**具名登记进 `UNCOVERED_BY_DESIGN`——「暂不做 UI」不等于「设置仓不用改」，
-   不暴露也要显式登记，那是它的正规落点。
-2. 跑两条 regenerate 命令刷新快照与 mockdata（**不要手改**这两个文件，它们从主仓现算）。
+### 实际落点
 
-**⚠️ 交付边界（否则会以为「做完了但设置页没有」）**：
+| 模式 | 清单项 | 控件 |
+|---|---|---|
+| 快捷输入 | `schema.mix_modes#candidate_layout`（视图 key） | `select_mix_layout`（新增类型） |
+| 临时拼音 | `input.temp_pinyin.candidate_layout` | `select` |
+| 临时英文 | `input.temp_english.candidate_layout` | `select` |
+| 网址输入 | `input.url.candidate_layout` | `select` + `enabled_when = "input.url.enabled == true"` |
+| 快捷加词 | —— | 不暴露，登记 `UNCOVERED_BY_DESIGN` |
 
-- `schema.special_modes` 当前**整个不在设置页**，被显式登记在 `capabilities.rs:230` 的 `UNCOVERED_BY_DESIGN` 名单里。所以特殊模式的 `candidate_layout` 短期内**只能改配置文件**。要暴露它需要先做特殊模式列表的条目编辑器，那是独立一块工作。
-- `schema.mix_modes` 在设置页是**整体读写的 StructList**，现有两个清单项（触发键、候选来源）都是用「视图 key + 按硬编码 `quick_mix` id 打补丁」的方式实现的（`manifest.rs:1778-1880`、`mix_trigger.rs`、`mix_members.rs`）。若要暴露 `quick_mix` 的布局下拉，照这个既有模式再加一个视图 key 即可；若要支持任意 mix 实例，同样需要真正的列表条目编辑器。
-- 单例键（`input.temp_pinyin` / `temp_english` / `url` / `add_word`）是普通 `Enum` 项，正常走清单即可。注意 `input.temp_pinyin.enabled` / `.hotkey` 也在 `UNCOVERED_BY_DESIGN` 里，说明临拼这一组当前在设置页的暴露程度有限，加 `candidate_layout` 时要决定是一并补上这个分组还是同样先不暴露。
+快捷输入那项**不能复用通用 `build_select`**：后者直接 `cfg.get_str(key)` / `set_path(key, String)`，
+用在 structlist 上会把整个 `mix_modes` 数组换成一个字符串。故新增 `mix_layout.rs`
+（纯读写逻辑，照 `mix_trigger.rs` / `mix_members.rs` 的形态）+ `select_mix_layout` 控件类型，
+`control_type_compatible` 里按 `structlist` 而非 `enum` 校验。
 
-**结论**：core 侧可以一次做完并让配置文件全部生效；设置页 UI 是可以分期的第二阶段，不阻塞功能落地。
+加词不暴露的理由：没有独立设置分区，且逐字确认的两行提示本就该竖排，出厂 `vertical`
+即最优解，横排没有使用场景。
+
+### 仍存在的交付边界
+
+- **`schema.special_modes` 整个不在设置页**（登记在 `UNCOVERED_BY_DESIGN`）。所以快符 /
+  生僻字等特殊模式的 `candidate_layout` **只能改配置文件**。要暴露它得先做特殊模式列表的
+  条目编辑器，那是独立一块工作。
+- **只有内置 `quick_mix` 一个 mix 实例能在 GUI 里改布局**。`schema.mix_modes` 在设置页是
+  整体读写的 structlist，三个清单项（触发键、候选来源、布局）都靠硬编码 `quick_mix` id
+  打补丁。用户自建的 mix 实例同样只能改配置文件。
+- **`quick_mix` 的默认值进不了 `data/config.toml`**。预置文件写 `mix_modes` 会把整份定义
+  冻结成快照（见该文件头部说明），所以出厂 `vertical` 只能落在代码侧 `default_mix_modes()`，
+  config.toml 里只留注释指路。其余四个单例键的默认值都已写进 config.toml。
 
 ---
 
@@ -406,6 +425,7 @@ add_word_active  >  state.active 对应模式  >  Follow（回落全局基线）
 
 | 项 | 说明 |
 |---|---|
-| 特殊模式设置页缺口 | 见 §8，功能可用但只能改文件；是否本轮补条目编辑器需另行决定 |
+| **真机手测未做** | 候选窗方向切换的视觉表现、有无闪烁，需在真实宿主里确认（构建走 `scripts/dev.ps1` 的 `dm1`/`dm2` 再 `pdm1`/`pdm2`） |
+| 特殊模式 / 自建 mix 的设置页缺口 | 见 §8，功能可用但只能改配置文件；补条目编辑器是独立一块工作 |
 | `Follow` 的语义边界 | 若将来出现「模式 A 覆盖 → 模式 A 中进入模式 B」的嵌套，当前优先级链是「取最内层」，不做栈式嵌套。目前没有这种嵌套场景，如果出现需重新审视 |
 | 加词默认值 | 定为 `vertical` 是为了保持现状；若认为它本就该跟随全局，改默认值即可，但属于行为变更需单独说明 |
