@@ -3725,27 +3725,25 @@ impl Coordinator {
         *g = wind_phrase::PhraseLayer::from_records(recs);
     }
 
-    /// 恢复默认系统短语：重读 system.phrases.toml → 强制同步入库 + 全部启用 + 重建输入层。
+    /// 当前有效的系统短语条目：重读 system.phrases.toml，为空则回退启动缓存。
     ///
     /// 重读使手工编辑 TOML 后无需重启服务。`parse_system_entries` 对"文件缺失"与
     /// "TOML 语法错误"同样返回空，二者不可区分，故重读为空时回退到启动缓存——
-    /// 否则一个语法错误就会让下面的 sync 把库里系统短语全部删除。
-    pub(crate) fn restore_system_phrases(&self) -> usize {
-        let Some(store) = self.store.as_ref() else {
-            return 0;
-        };
-
-        // 重读文件；为空（缺失/语法错误）则沿用启动缓存。
+    /// 否则一个语法错误就会让调用方的 sync 把库里系统短语全部删除。
+    pub(crate) fn current_system_phrase_entries(
+        &self,
+        reason: &str,
+    ) -> Vec<wind_phrase::SystemPhraseEntry> {
         let reread = self
             .system_phrase_path
             .as_ref()
             .map(|p| wind_phrase::PhraseLayer::parse_system_entries(p))
             .unwrap_or_default();
 
-        let entries = if reread.is_empty() {
+        if reread.is_empty() {
             if self.system_phrase_path.is_some() {
                 warn!(
-                    "恢复默认：重读 system.phrases.toml 为空（文件缺失或语法错误），沿用启动缓存"
+                    "{reason}：重读 system.phrases.toml 为空（文件缺失或语法错误），沿用启动缓存"
                 );
             }
             self.system_phrase_entries
@@ -3760,8 +3758,44 @@ impl Coordinator {
                 .unwrap_or_else(|e| e.into_inner());
             *g = reread.clone();
             reread
+        }
+    }
+
+    /// 清空用户短语后把被遮蔽的系统条目补回来。
+    ///
+    /// 用户短语遮蔽同键系统条目时该行**归属用户**（`is_system=false`，见
+    /// `Store::add_phrase`），于是「清空用户短语」会把它连同遮蔽关系一起删掉——
+    /// 库里该 `(code,text)` 彻底消失，系统条目也随之不见。sync 只在 TOML 哈希变化或
+    /// 「系统恢复默认」时才跑，不补这一次，被遮蔽过的系统短语要等到下次哈希变动才回来。
+    pub(crate) fn resync_system_phrases_after_user_reset(&self) {
+        let Some(store) = self.store.as_ref() else {
+            return;
+        };
+        let entries = self.current_system_phrase_entries("清空用户短语");
+        if entries.is_empty() {
+            return;
+        }
+        let sys: Vec<wind_store::phrases::SystemPhrase> = entries
+            .iter()
+            .map(|e| wind_store::phrases::SystemPhrase {
+                code: e.code.clone(),
+                text: e.text.clone(),
+                weight: e.weight,
+                position: e.position,
+            })
+            .collect();
+        if let Err(e) = store.sync_system_phrases(&sys) {
+            warn!("清空用户短语：系统短语补齐失败: {e}");
+        }
+    }
+
+    /// 恢复默认系统短语：重读 system.phrases.toml → 强制同步入库 + 全部启用 + 重建输入层。
+    pub(crate) fn restore_system_phrases(&self) -> usize {
+        let Some(store) = self.store.as_ref() else {
+            return 0;
         };
 
+        let entries = self.current_system_phrase_entries("恢复默认");
         if entries.is_empty() {
             return 0;
         }
