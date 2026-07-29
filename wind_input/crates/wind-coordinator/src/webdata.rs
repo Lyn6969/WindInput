@@ -1257,12 +1257,15 @@ impl Coordinator {
             str_param(params, "code")?,
             str_param(params, "word")?,
         );
+        // 设置页删规则时回传 `shadow.list` 给出的 candId：动态短语规则的 word 是写入当天的
+        // 求值文本，只按 word 定位会删不掉（列表里看得见、点删除无效）。
+        let cand_id = params.get("candId").and_then(|v| v.as_str());
         let schema = self.engine_mgr.data_schema_id(schema); // 拼音族折叠到 "pinyin"
         let store = self
             .store
             .as_ref()
             .ok_or_else(|| anyhow::anyhow!("无持久化存储"))?;
-        store.remove_shadow_rule(&schema, code, word)?;
+        store.remove_shadow_rule(&schema, code, word, cand_id)?;
         Ok(json!({ "ok": true }))
     }
 

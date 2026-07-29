@@ -36,14 +36,29 @@ impl ShadowRecord {
         self.pinned.is_empty() && self.deleted.is_empty()
     }
 
+    /// 一条规则是否指向同一个候选：`cand_id` 双方非空 → 按 id；否则按 word。
+    ///
+    /// ⚠ 动态短语（`date` 等）的 `word` 是**写入当天**的求值文本，逐日不同。凡「按用户当下
+    /// 指定的候选去定位一条既有规则」的操作（去重、恢复默认、菜单灰显）都必须走本判据，
+    /// 只比 word 会在次日失配——表现为规则删不掉、「恢复默认」菜单项恒灰。
+    pub fn same_target(
+        p_word: &str,
+        p_id: &Option<String>,
+        word: &str,
+        cand_id: Option<&str>,
+    ) -> bool {
+        match (cand_id, p_id.as_deref()) {
+            (Some(a), Some(b)) if !a.is_empty() && !b.is_empty() => a == b,
+            _ => p_word == word,
+        }
+    }
+
     /// 置顶/移动：把 (word, cand_id) 固定到 position。LIFO（新规则插队首）；置顶优先于删除。
-    /// 去重键：cand_id 双方非空时按 cand_id，否则按 word。
+    /// 去重键见 [`Self::same_target`]。
     pub fn apply_pin(&mut self, word: &str, cand_id: Option<String>, position: usize) {
-        let same = |w: &str, id: &Option<String>| match (&cand_id, id) {
-            (Some(a), Some(b)) => a == b,
-            _ => w == word,
-        };
-        self.pinned.retain(|p| !same(&p.word, &p.cand_id));
+        let id_ref = cand_id.as_deref();
+        self.pinned
+            .retain(|p| !Self::same_target(&p.word, &p.cand_id, word, id_ref));
         self.deleted.retain(|d| d != word);
         self.pinned.insert(
             0,
@@ -63,10 +78,21 @@ impl ShadowRecord {
         }
     }
 
-    /// 恢复默认：清除该 word 的置顶与删除规则。
-    pub fn apply_remove(&mut self, word: &str) {
-        self.pinned.retain(|p| p.word != word);
+    /// 恢复默认：清除该候选的置顶与删除规则。定位判据见 [`Self::same_target`]——
+    /// 动态短语必须按 `cand_id` 找，按 word 找会在次日删不掉自己写下的规则。
+    pub fn apply_remove(&mut self, word: &str, cand_id: Option<&str>) {
+        self.pinned
+            .retain(|p| !Self::same_target(&p.word, &p.cand_id, word, cand_id));
+        // deleted 无 id 维度（走 shadow 删除的只有静态候选，见 wind_candidate::apply_shadow）。
         self.deleted.retain(|d| d != word);
+    }
+
+    /// 是否存在指向该候选的规则（置顶或删除）——菜单「恢复默认」的可用性判据。
+    pub fn has_target(&self, word: &str, cand_id: Option<&str>) -> bool {
+        self.pinned
+            .iter()
+            .any(|p| Self::same_target(&p.word, &p.cand_id, word, cand_id))
+            || self.deleted.iter().any(|d| d == word)
     }
 }
 
@@ -113,7 +139,7 @@ impl ShadowStore {
         let mut map = self.map.write().unwrap_or_else(|e| e.into_inner());
         let key = Self::key(schema, code);
         if let Some(rec) = map.get_mut(&key) {
-            rec.apply_remove(word);
+            rec.apply_remove(word, None);
             if rec.is_empty() {
                 map.remove(&key);
             }
@@ -124,9 +150,7 @@ impl ShadowStore {
     pub fn has_rule(&self, schema: &str, code: &str, word: &str) -> bool {
         let map = self.map.read().unwrap_or_else(|e| e.into_inner());
         match map.get(&Self::key(schema, code)) {
-            Some(rec) => {
-                rec.pinned.iter().any(|p| p.word == word) || rec.deleted.iter().any(|d| d == word)
-            }
+            Some(rec) => rec.has_target(word, None),
             None => false,
         }
     }
@@ -231,9 +255,16 @@ impl Store {
         self.modify_shadow(schema, code, |rec| rec.apply_delete(word))
     }
 
-    /// 移除某候选的 Shadow 规则（恢复默认）。
-    pub fn remove_shadow_rule(&self, schema: &str, code: &str, word: &str) -> anyhow::Result<()> {
-        self.modify_shadow(schema, code, |rec| rec.apply_remove(word))
+    /// 移除某候选的 Shadow 规则（恢复默认）。`cand_id` 非空时按 id 定位——动态短语的 word
+    /// 逐日变化，只按 word 会删不掉自己昨天写下的规则（见 `ShadowRecord::same_target`）。
+    pub fn remove_shadow_rule(
+        &self,
+        schema: &str,
+        code: &str,
+        word: &str,
+        cand_id: Option<&str>,
+    ) -> anyhow::Result<()> {
+        self.modify_shadow(schema, code, |rec| rec.apply_remove(word, cand_id))
     }
 
     /// 取某 code 的 Shadow 规则（无则 None）。
@@ -511,7 +542,8 @@ mod tests {
         assert_eq!(r.deleted, vec!["恭恭敬敬".to_string()]);
 
         // remove → 规则清空后该键删除
-        s.remove_shadow_rule("wb", "aaaa", "恭恭敬敬").unwrap();
+        s.remove_shadow_rule("wb", "aaaa", "恭恭敬敬", None)
+            .unwrap();
         assert!(s.get_shadow_rules("wb", "aaaa").unwrap().is_none());
 
         // cand_id 动态短语：按 id 去重
@@ -523,6 +555,65 @@ mod tests {
         assert_eq!(r.pinned.len(), 1, "同 cand_id 应去重为 1 条");
         assert_eq!(r.pinned[0].word, "日期改");
 
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// 动态短语（`date`）的完整生命周期：**规则里的 word 是写入当天的求值文本**，
+    /// 次日用户看到的候选文本已全变。去重 / 恢复默认 / 菜单灰显三处都必须按 cand_id 定位，
+    /// 否则表现为「昨天调好今天被还原，且既清不掉也改不动」。
+    ///
+    /// ⚠ 这个测试必须用**两个不同的 word**（昨天/今天）才有判别力——若前后都传同一个 word，
+    /// 按 word 匹配的旧实现也会全绿。
+    #[test]
+    fn dynamic_phrase_rule_located_by_cand_id_across_days() {
+        let path = tmp("wind_shadow_dyn_phrase.redb");
+        let s = Store::open(&path).unwrap();
+        let id = "phrase:date:$Y-$MM-$DD";
+
+        // 昨天：把 date 的 `$Y-$MM-$DD` 那条置顶，word 记的是昨天的求值结果。
+        s.pin_shadow("wb", "date", "2026-07-28", Some(id), 0)
+            .unwrap();
+
+        // 今天：候选文本已变成 2026-07-29，而规则里存的仍是昨天的 2026-07-28。
+        // 判别力全在这两行——按 id 查得到，只按今天的文本查不到（旧实现的失效点）。
+        let rec = s.get_shadow_rules("wb", "date").unwrap().unwrap();
+        assert!(rec.has_target("2026-07-29", Some(id)), "按 id 应跨日命中");
+        assert!(
+            !rec.has_target("2026-07-29", None),
+            "只按当日文本必失配——这正是「昨天调好今天被还原」的成因"
+        );
+
+        // 今天：同一条短语再次置顶到别的位置 → 应**更新**原规则而非新增一条。
+        s.pin_shadow("wb", "date", "2026-07-29", Some(id), 2)
+            .unwrap();
+        let rec = s.get_shadow_rules("wb", "date").unwrap().unwrap();
+        assert_eq!(rec.pinned.len(), 1, "同 id 跨日应去重，而不是逐日堆积");
+        assert_eq!(rec.pinned[0].position, 2);
+        assert_eq!(rec.pinned[0].word, "2026-07-29", "word 刷新为当次文本");
+
+        // 明天：文本又变了，按 id 仍能删掉。
+        s.remove_shadow_rule("wb", "date", "2026-07-30", Some(id))
+            .unwrap();
+        assert!(
+            s.get_shadow_rules("wb", "date").unwrap().is_none(),
+            "按 cand_id 恢复默认应删得掉跨日规则"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// 反向闸门：静态候选（无 id）的规则仍按 word 定位，不受上面的改动影响。
+    #[test]
+    fn static_candidate_rule_still_located_by_word() {
+        let path = tmp("wind_shadow_static_word.redb");
+        let s = Store::open(&path).unwrap();
+        s.pin_shadow("wb", "aaaa", "工", None, 0).unwrap();
+        let rec = s.get_shadow_rules("wb", "aaaa").unwrap().unwrap();
+        assert!(rec.has_target("工", None));
+        assert!(!rec.has_target("恭", None));
+        // 传了 id 但规则侧无 id → 落回 word 比较，仍命中。
+        assert!(rec.has_target("工", Some("phrase:x:y")));
+        s.remove_shadow_rule("wb", "aaaa", "工", None).unwrap();
+        assert!(s.get_shadow_rules("wb", "aaaa").unwrap().is_none());
         let _ = std::fs::remove_file(&path);
     }
 

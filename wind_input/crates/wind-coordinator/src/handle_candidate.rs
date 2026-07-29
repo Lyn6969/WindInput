@@ -128,11 +128,21 @@ impl Coordinator {
         }
     }
 
+    /// 记一次选词：上屏历史恒记，词频**按来源分流**。
+    ///
+    /// **短语（`CandidateSource::Phrase`）恒不记词频**：短语的候选集与其内部次序完全由短语
+    /// 定义决定（`PhraseEntry` 的 weight/position），词频在这里没有排序职责；而它的上屏文本
+    /// 可能是模板求值结果（`date` → `2026-07-29`、`time`、`clip()`），**每次上屏都是一个新
+    /// 键**——记进 FREQ 表既永远不会被命中（次日查的是新文本），又逐日累积垃圾行。
+    /// 读取端 `apply_freq_rerank` 对应地跳过短语候选，两端必须同时成立。
     pub(crate) fn record_selection(&self, code: &str, text: &str, source: CandidateSource) {
         if text.is_empty() {
             return;
         }
         self.push_commit_history(text);
+        if source == CandidateSource::Phrase {
+            return;
+        }
         if let Some(store) = &self.store {
             // 未开启「自动调频」则不记录（配置说关、代码却记的潜在 bug，对齐 apply_freq_rerank 的开关检查）。
             if !self.engine_mgr.freq_settings().enabled {
@@ -200,6 +210,12 @@ impl Coordinator {
         let recs: std::collections::HashMap<String, FreqRecord> = candidates
             .iter()
             .filter_map(|c| {
+                // 短语不参与词频维度（写入端 `record_selection` 对称跳过）：其次序由短语定义的
+                // weight/position 决定，且求值型短语的文本逐日变化，点查恒 miss——白花一次
+                // redb 查询，还会让人误以为词频在这里生效。
+                if c.is_phrase {
+                    return None;
+                }
                 let consumes_all = c.consumed_length == 0 || c.consumed_length >= input_len;
                 if !consumes_all {
                     return None;
@@ -242,6 +258,21 @@ impl Coordinator {
                 settings.protect_top_n,
             );
         }
+    }
+
+    /// 短语候选的**稳定 id**（`Candidate::id`）：`phrase:{code}:{原始记录文本}`，对齐 Go
+    /// `dict.phraseCandID`。供 shadow 规则跨日精准匹配——短语的显示文本可能是模板求值结果
+    /// （`date` 的 `$Y-$MM-$DD` → `2026-07-29`），以文本为键的规则次日必失配。
+    ///
+    /// `code` 用**短语自身的完整码**（前缀导航候选取 `nav_code`，精确命中取输入缓冲），与
+    /// shadow 规则的存储键 code 同源；`raw` 为 store 里的 `PhraseEntry.text`（模板未展开）。
+    /// `raw` 为空（测试直构的 `PhraseHit::plain` / `$AA` 字面元素）→ 返回空 id，表示该候选
+    /// 无稳定身份，shadow 落回文本匹配。
+    pub(crate) fn phrase_cand_id(code: &str, raw: &str) -> String {
+        if raw.is_empty() {
+            return String::new();
+        }
+        format!("phrase:{code}:{raw}")
     }
 
     /// 候选总数（测试/诊断用）
@@ -438,6 +469,8 @@ impl Coordinator {
             for hit in phrases.lookup(&state.input_buffer, &recent, &clip) {
                 let is_command = hit.command_src.is_some();
                 let is_system = hit.is_system;
+                // 稳定 id 取**模板原文**：text 可能是求值结果（date/time/clip），逐日变化。
+                let cand_id = Self::phrase_cand_id(&state.input_buffer, &hit.source_text);
                 candidates.push(Candidate {
                     // text 存完整原文（仅一行化，不截断）——上屏须用原始文本，超长省略号截断
                     // 移到 UI 下发层（见 coordinator 候选映射）。传 0 表示不限长度。
@@ -455,6 +488,11 @@ impl Coordinator {
                     // 下面 `lookup_prefix` 的前缀枚举则不标，留在精确层之下。
                     is_exact_code: true,
                     phrase_template: hit.command_src.unwrap_or(hit.source_text),
+                    id: cand_id,
+                    // 来源如实标注为短语：`record_selection` 据此跳过词频记账（短语的上屏文本
+                    // 可能逐次不同，记了永不命中、只污染 FREQ 表），排序层不受影响——层级键
+                    // 走的是 `is_phrase`（见 `freq_tier` / `cmp_match_layers`）。
+                    source: CandidateSource::Phrase,
                     meta: CandidateMeta {
                         is_system_phrase: is_system,
                         ..Default::default()
@@ -514,6 +552,9 @@ impl Coordinator {
                 if let Some(src) = hit.command_src {
                     // $CC 命令短语：选中直接执行，不二级展开。
                     let code = hit.nav_code.unwrap_or_default();
+                    // 稳定 id 的 code 取**短语自身完整码**（nav_code）而非当前输入前缀：
+                    // 同一条短语在敲 `co` 与敲 `coad` 时都应是同一个身份。
+                    let cand_id = Self::phrase_cand_id(&code, &src);
                     built.push(Candidate {
                         text,
                         // 排序标志三分支统一，见上方 `phrase_prefix_is_prefix` 处说明。
@@ -524,12 +565,15 @@ impl Coordinator {
                         phrase_template: src,
                         group_code: code,
                         comment: hit.comment,
+                        id: cand_id,
+                        source: CandidateSource::Phrase,
                         meta: phrase_meta(),
                         ..Default::default()
                     });
                 } else if let Some(code) = hit.nav_code {
                     // $SS/$AA 组短语：选中补全到完整码再二级展开。
                     // phrase_template 存原始记录文本：右键「禁用短语」按 (group_code, 原文) 定位。
+                    let cand_id = Self::phrase_cand_id(&code, &hit.source_text);
                     built.push(Candidate {
                         text: text.clone(),
                         // 排序标志三分支统一，见上方 `phrase_prefix_is_prefix` 处说明。
@@ -541,12 +585,16 @@ impl Coordinator {
                         group_name: text,
                         comment: hit.comment,
                         phrase_template: hit.source_text,
+                        id: cand_id,
+                        source: CandidateSource::Phrase,
                         meta: phrase_meta(),
                         ..Default::default()
                     });
                 } else {
                     // 静态短语前缀命中（Literal/Template，command_src=None, nav_code=None）。
                     // 排序标志三分支统一，见上方 `phrase_prefix_is_prefix` 处说明。
+                    // 无 nav_code → id 的 code 位退回当前输入缓冲（该分支的短语码即输入前缀）。
+                    let cand_id = Self::phrase_cand_id(&state.input_buffer, &hit.source_text);
                     built.push(Candidate {
                         text,
                         weight: hit.weight,
@@ -554,6 +602,8 @@ impl Coordinator {
                         is_prefix: phrase_prefix_is_prefix,
                         comment: hit.comment,
                         phrase_template: hit.source_text,
+                        id: cand_id,
+                        source: CandidateSource::Phrase,
                         meta: phrase_meta(),
                         ..Default::default()
                     });
@@ -768,11 +818,17 @@ impl Coordinator {
             Ok(Some(r)) => r,
             _ => return,
         };
-        // 纯重排逻辑下沉 wind_candidate（用元组解耦，避免该 crate 依赖 wind-store）。
-        let pinned: Vec<(String, usize)> = rec
+        // 纯重排逻辑下沉 wind_candidate（镜像结构解耦，避免该 crate 依赖 wind-store）。
+        // `cand_id` 必须一并传下去：短语候选的 word 记的是写入当天的求值文本，只有 id
+        // 跨日稳定（匹配契约见 `ShadowPinRule`）。
+        let pinned: Vec<wind_candidate::ShadowPinRule> = rec
             .pinned
             .iter()
-            .map(|p| (p.word.clone(), p.position))
+            .map(|p| wind_candidate::ShadowPinRule {
+                word: p.word.clone(),
+                cand_id: p.cand_id.clone(),
+                position: p.position,
+            })
             .collect();
         wind_candidate::apply_shadow(candidates, &rec.deleted, &pinned);
     }
@@ -1710,19 +1766,23 @@ impl Coordinator {
     }
 
     /// 顶码「文本上屏 + 余码续打」收尾（码表候选 / 普通短语 / 纯文本命令 / 引擎回退文本共用）。
-    /// 记账（顶码归属码表来源）→ 设余码为缓冲 → 刷新候选 → 复位首显延迟 → 按 `top_commit_mode`
+    /// 记账 → 设余码为缓冲 → 刷新候选 → 复位首显延迟 → 按 `top_commit_mode`
     /// 返回 `InsertText`（pre_confirm）或 `CommitThenDeferComposition`（direct_commit，余码
     /// keyup 延迟重开）。`top_text` 空（理论边界）时跳过记账、仅刷新余码组合。
+    ///
+    /// `source` 由调用方按被顶出的候选如实传入，**不能一律当码表**：本函数的三条来路里有两条
+    /// 是短语（普通短语顶码、`$CC` 纯文本命令顶码），谎报成码表会让短语的求值文本被写进 FREQ
+    /// 表——那正是 `record_selection` 要拦掉的逐日新键。顶码机制本身归属码表不改变候选的来源。
     pub(crate) fn commit_top_text(
         &self,
         state: &mut State,
         prefix: &str,
         top_text: String,
         remainder: &str,
+        source: CandidateSource,
     ) -> KeyAction {
         if !top_text.is_empty() {
-            // 顶码上屏是码表机制，归属码表来源。
-            self.record_selection(prefix, &top_text, CandidateSource::CodeTable);
+            self.record_selection(prefix, &top_text, source);
             // 顶码即上屏首选（pos=0），code_len=被顶出的前缀码长。
             self.record_commit(
                 &top_text,
@@ -1897,17 +1957,21 @@ impl Coordinator {
             // 候选调整按 data_schema_id 归属（拼音族折叠）；Delete 分支仍传原始 schema，
             // 供 delete_candidate_by_source 对用户词/临时词按来源分流（混输）。
             let sh_schema = self.engine_mgr.data_schema_id(&schema);
-            // None cand_id：码表静态词无动态短语 id。redb 事务持久，无需显式落盘。
+            // 稳定 id：短语候选有（`phrase:{code}:{模板原文}`），码表/拼音静态候选无（空串 →
+            // None → 落回 word 匹配）。**必须在此传下去**——`word` 记的是当次求值结果，
+            // `date`/`time` 类短语次日即失配，规则表现为「昨天调好、今天被还原」。
+            // redb 事务持久，无需显式落盘。
+            let cand_id = (!cand.id.is_empty()).then(|| cand.id.as_str());
             let r = match op {
-                CandidateOp::MoveTop => store.pin_shadow(&sh_schema, &code, &word, None, 0),
+                CandidateOp::MoveTop => store.pin_shadow(&sh_schema, &code, &word, cand_id, 0),
                 CandidateOp::MoveUp => {
-                    store.pin_shadow(&sh_schema, &code, &word, None, idx.saturating_sub(1))
+                    store.pin_shadow(&sh_schema, &code, &word, cand_id, idx.saturating_sub(1))
                 }
                 CandidateOp::MoveDown => {
-                    store.pin_shadow(&sh_schema, &code, &word, None, (idx + 1).min(last))
+                    store.pin_shadow(&sh_schema, &code, &word, cand_id, (idx + 1).min(last))
                 }
                 CandidateOp::Delete => self.delete_candidate_by_source(&schema, &code, &cand),
-                CandidateOp::Reset => store.remove_shadow_rule(&sh_schema, &code, &word),
+                CandidateOp::Reset => store.remove_shadow_rule(&sh_schema, &code, &word, cand_id),
             };
             if let Err(e) = r {
                 warn!("candidate op failed: {}", e);
@@ -2481,6 +2545,142 @@ mod clear_recheck_tests {
         assert!(
             clear_blocked_by_candidates(&with_full, 4),
             "混有一条消费整串的拼音候选 → 拦住"
+        );
+    }
+}
+
+#[cfg(test)]
+mod dynamic_candidate_shadow_tests {
+    //! 求值型候选（`date`/`time` 等短语）的 shadow 接线：规则须按**稳定 id** 落键与匹配，
+    //! 否则次日文本一变即失配——用户侧表现为「候选调整昨天设了、今天被还原」。
+    use super::*;
+    use std::sync::Arc;
+    use wind_config::config::Config;
+    use wind_store::store::Store;
+
+    fn store_at(name: &str) -> Arc<Store> {
+        let p = std::env::temp_dir().join(name);
+        let _ = std::fs::remove_file(&p);
+        Arc::new(Store::open(&p).unwrap())
+    }
+
+    fn coord_with(store: Arc<Store>) -> Arc<Coordinator> {
+        Coordinator::new_headless_with_store(Config::default(), None, store)
+    }
+
+    /// 一条 `date` 短语候选：`text` 是当日求值结果，`id` 是模板身份。
+    fn date_cand(text: &str, template: &str) -> Candidate {
+        Candidate {
+            text: text.to_string(),
+            is_phrase: true,
+            is_exact_code: true,
+            phrase_template: template.to_string(),
+            id: Coordinator::phrase_cand_id("date", template),
+            source: CandidateSource::Phrase,
+            ..Default::default()
+        }
+    }
+
+    /// id 构造：模板原文入 id，空模板 → 空 id（无稳定身份，落回文本匹配）。
+    #[test]
+    fn phrase_cand_id_shape() {
+        assert_eq!(
+            Coordinator::phrase_cand_id("date", "$Y-$MM-$DD"),
+            "phrase:date:$Y-$MM-$DD"
+        );
+        assert_eq!(Coordinator::phrase_cand_id("date", ""), "");
+    }
+
+    /// 核心回归：昨天置顶的 `date` 格式，今天（文本已全变）依然置顶。
+    ///
+    /// ⚠ 判别力全在「写规则用的文本」与「今天候选的文本」**不相同**——若两者相同，
+    /// 按 text 匹配的旧实现也会全绿，这个测试就成了假测试。
+    #[test]
+    fn pinned_date_format_survives_next_day() {
+        let store = store_at("wind_coord_shadow_date.redb");
+        let c = coord_with(store.clone());
+        let schema = c
+            .engine_mgr
+            .data_schema_id(&c.engine_mgr.active_schema_id());
+        let tpl = "$Y-$MM-$DD";
+
+        // 昨天：用户把 `$Y-$MM-$DD` 那条置顶，规则 word = 昨天的求值文本。
+        store
+            .pin_shadow(
+                &schema,
+                "date",
+                "2026-07-28",
+                Some(&Coordinator::phrase_cand_id("date", tpl)),
+                0,
+            )
+            .unwrap();
+
+        // 今天：候选文本全变，且被置顶的那条排在第二位。
+        let mut cands = vec![
+            date_cand("2026年7月29日", "$Y年$M月$D日"),
+            date_cand("2026-07-29", tpl),
+            date_cand("2026.07.29", "$Y.$MM.$DD"),
+        ];
+        c.apply_shadow(&mut cands, "date");
+
+        assert_eq!(
+            cands.iter().map(|c| c.text.as_str()).collect::<Vec<_>>(),
+            ["2026-07-29", "2026年7月29日", "2026.07.29"],
+            "按 cand_id 匹配，昨天的置顶今天仍生效"
+        );
+    }
+
+    /// 反向：规则不带 id（存量规则 / 手工添加）时仍按文本匹配，老行为不回归。
+    #[test]
+    fn legacy_rule_without_id_still_matches_by_text() {
+        let store = store_at("wind_coord_shadow_legacy.redb");
+        let c = coord_with(store.clone());
+        let schema = c
+            .engine_mgr
+            .data_schema_id(&c.engine_mgr.active_schema_id());
+        store.pin_shadow(&schema, "aaaa", "敬", None, 0).unwrap();
+
+        let mut cands = vec![
+            Candidate {
+                text: "工".into(),
+                ..Default::default()
+            },
+            Candidate {
+                text: "敬".into(),
+                ..Default::default()
+            },
+        ];
+        c.apply_shadow(&mut cands, "aaaa");
+        assert_eq!(
+            cands.iter().map(|c| c.text.as_str()).collect::<Vec<_>>(),
+            ["敬", "工"]
+        );
+    }
+
+    /// 短语上屏不写 FREQ：求值型文本每次都是新键，记了永不命中、只堆垃圾。
+    /// 同一条 code 下的码表候选照常记账，证明拦的是来源而非整条路径。
+    #[test]
+    fn phrase_commit_does_not_record_freq() {
+        let store = store_at("wind_coord_phrase_freq.redb");
+        let c = coord_with(store.clone());
+        let schema = c
+            .engine_mgr
+            .data_schema_id(&c.engine_mgr.active_schema_id());
+
+        c.record_selection("date", "2026-07-29", CandidateSource::Phrase);
+        assert!(
+            store
+                .get_freq(&schema, "date", "2026-07-29")
+                .unwrap()
+                .is_none(),
+            "短语候选不得写入词频"
+        );
+
+        // 上屏历史仍应记（`z` 键重复上屏 / cmdbar last() 依赖它）。
+        assert_eq!(
+            c.recent_commits_snapshot().first().map(|s| s.as_str()),
+            Some("2026-07-29"),
+            "不记词频不等于不记上屏历史"
         );
     }
 }

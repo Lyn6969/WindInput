@@ -231,6 +231,16 @@ pub struct Candidate {
     pub has_shadow: bool,
     pub index_label: String,
     pub meta: CandidateMeta,
+    /// 候选**稳定 id**：跨会话、跨日期不变的身份标识，供 shadow 规则（置顶/移动）精准匹配。
+    ///
+    /// 格式 `phrase:{code}:{原始记录文本}`（对齐 Go `dict.phraseCandID`）。生产方是协调器的
+    /// 短语装配（`build_candidates`）——`text` 是模板求值结果、逐日变化，`phrase_template`
+    /// 才是 store 里的原始记录。空串 = 该候选无稳定身份（码表/拼音等静态候选，其 `text`
+    /// 本身就稳定，shadow 按文本匹配即可）。
+    ///
+    /// **为什么必须存在**：`date`/`time` 这类求值型短语的显示文本每天/每秒都变，shadow 规则
+    /// 若以文本为键，写入次日即失配——用户看到的是「候选调整昨天设了，今天被还原」，
+    /// 且失效的旧规则会逐日在 redb 里堆积。匹配契约见 [[ShadowPinRule]]。
     pub id: String,
     pub display_text: String,
     pub actions: Vec<Action>,

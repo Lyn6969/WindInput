@@ -881,7 +881,8 @@ impl Coordinator {
             vec![M::leaf("复制", MenuKind::Copy, true, false)]
         } else {
             let schema = self.engine_mgr.active_schema_id();
-            let has_rule = self.shadow_has_rule(&schema, &code, &word);
+            let cand_id = (!cand.id.is_empty()).then(|| cand.id.as_str());
+            let has_rule = self.shadow_has_rule(&schema, &code, &word, cand_id);
             // 拼音普通候选禁调位：动态权重 + 衰减软置前与 pin 位置语义冲突；命令候选仍可调。
             let is_pinyin = matches!(
                 self.engine_mgr.current_engine_type(),

@@ -2720,7 +2720,8 @@ impl Coordinator {
             if !deletable {
                 f |= 0x08;
             }
-            if code.is_empty() || !self.shadow_has_rule(&schema, code, word) {
+            let cand_id = (!cand.id.is_empty()).then(|| cand.id.as_str());
+            if code.is_empty() || !self.shadow_has_rule(&schema, code, word, cand_id) {
                 f |= 0x10; // 无 shadow 规则：禁恢复默认
             }
             flags.push(f);
@@ -2915,8 +2916,18 @@ impl Coordinator {
         self.refresh_config_in_memory(|c| c.input.s2t.enabled = on);
     }
 
-    /// 影子规则：当前 code 是否对 word 有规则（置顶/删除），决定菜单"恢复默认"可用性。
-    pub(crate) fn shadow_has_rule(&self, schema: &str, code: &str, word: &str) -> bool {
+    /// 影子规则：当前 code 是否对该候选有规则（置顶/删除），决定菜单"恢复默认"可用性。
+    ///
+    /// `cand_id` 取候选的稳定 id（短语候选非空）：动态短语的规则 `word` 记的是写入当天的
+    /// 求值文本，只按 word 查会在次日恒判「无规则」——菜单「恢复默认」永久灰显，用户既改
+    /// 不动也清不掉。判据与 `apply_shadow` / `candidate_op` 的写入端保持同一把键。
+    pub(crate) fn shadow_has_rule(
+        &self,
+        schema: &str,
+        code: &str,
+        word: &str,
+        cand_id: Option<&str>,
+    ) -> bool {
         let Some(store) = &self.store else {
             return false;
         };
@@ -2924,8 +2935,7 @@ impl Coordinator {
         let schema = self.engine_mgr.data_schema_id(schema);
         matches!(
             store.get_shadow_rules(&schema, code),
-            Ok(Some(rec))
-                if rec.pinned.iter().any(|p| p.word == word) || rec.deleted.iter().any(|d| d == word)
+            Ok(Some(rec)) if rec.has_target(word, cand_id)
         )
     }
 
@@ -4619,10 +4629,11 @@ impl MessageHandler for Coordinator {
                 // 顶码上屏候选 = 用户实际所见的**显示首选**：取顶码前缓冲（即将成为前缀）的显示
                 // 首候选——它已过智能过滤 / 词频重排 / shadow，正是用户所见。保留整条候选（含
                 // is_command / phrase_template / group_code），供顶码分流：码表候选 & 普通短语 →
-                // 文本顶上屏；$CC 命令短语 → 求值执行。短语 source 恒为 None，须靠 is_phrase /
-                // is_command 显式放行；source==None 的拼音/英文（拼音本就排首，或智能过滤掉生僻
-                // 码表字后仅剩拼音，如「wang」只有生僻字「佢」被过滤、显示全是拼音）仍被排除 →
-                // 下方放弃顶码继续组合（对齐「上屏须与显示一致 + 非码表/短语类不上屏」）。
+                // 文本顶上屏；$CC 命令短语 → 求值执行。短语 source 为 `Phrase`（**不参与**本
+                // filter，放行靠 is_phrase / is_command 显式判定，与 source 取值无关）；拼音/英文
+                // 候选（拼音本就排首，或智能过滤掉生僻码表字后仅剩拼音，如「wang」只有生僻字
+                // 「佢」被过滤、显示全是拼音）仍被排除 → 下方放弃顶码继续组合
+                // （对齐「上屏须与显示一致 + 非码表/短语类不上屏」）。
                 let pre_display_first = state.candidates.first().cloned().filter(|c| {
                     c.source == CandidateSource::CodeTable || c.is_phrase || c.is_command
                 });
@@ -4659,9 +4670,13 @@ impl MessageHandler for Coordinator {
                                 return match self
                                     .eval_command_text_only(&cand.phrase_template, &input)
                                 {
-                                    Some(text) => {
-                                        self.commit_top_text(&mut state, &prefix, text, &remainder)
-                                    }
+                                    Some(text) => self.commit_top_text(
+                                        &mut state,
+                                        &prefix,
+                                        text,
+                                        &remainder,
+                                        cand.source,
+                                    ),
                                     None => self.top_commit_command_with_remainder(
                                         &mut state, &cand, &prefix, &remainder,
                                     ),
@@ -4669,16 +4684,24 @@ impl MessageHandler for Coordinator {
                             }
                             // 码表候选 / 普通短语：文本顶上屏 + 余码续打。
                             Some(cand) => {
-                                return self
-                                    .commit_top_text(&mut state, &prefix, cand.text, &remainder);
+                                let source = cand.source;
+                                return self.commit_top_text(
+                                    &mut state, &prefix, cand.text, &remainder, source,
+                                );
                             }
                             // 显示首选是拼音/英文 → 放弃顶码，落到下方正常候选刷新继续组合。
                             None => {}
                         }
                     } else if !engine_top.is_empty() {
                         // 多级溢出：引擎码表纯文本顶码（码表无字则 engine_top 空 → 放弃顶码，
-                        // 落到下方正常候选刷新继续组合）。
-                        return self.commit_top_text(&mut state, &prefix, engine_top, &remainder);
+                        // 落到下方正常候选刷新继续组合）。此路来自引擎码表查询，确为码表来源。
+                        return self.commit_top_text(
+                            &mut state,
+                            &prefix,
+                            engine_top,
+                            &remainder,
+                            CandidateSource::CodeTable,
+                        );
                     }
                 }
 
