@@ -1468,6 +1468,8 @@ impl Coordinator {
                 json!({
                     "code": p.code, "text": p.text, "weight": p.weight,
                     "position": p.position, "enabled": p.enabled, "isSystem": true,
+                    // 该系统行被用户重新添加过（同时出现在用户短语列表），供 UI 标注区分。
+                    "userModified": p.user_modified,
                 })
             })
             .collect();
@@ -1507,7 +1509,12 @@ impl Coordinator {
             .map(|p| {
                 json!({
                     "code": p.code, "text": p.text, "weight": p.weight,
-                    "position": p.position, "enabled": p.enabled, "isSystem": false,
+                    "position": p.position, "enabled": p.enabled,
+                    // **不能再硬编码 false**：本列表现在也含「被用户重新添加过的系统行」
+                    // （`user_modified`），它们的归属仍是系统——删除/恢复语义与纯用户行不同，
+                    // UI 需按此标注，谎报会让用户以为能像自建短语一样删掉它。
+                    "isSystem": p.is_system,
+                    "userModified": p.user_modified,
                 })
             })
             .collect();

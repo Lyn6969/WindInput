@@ -37,6 +37,14 @@ pub struct PhraseRecord {
     pub position: i32,
     pub enabled: bool,
     pub is_system: bool,
+    /// 该系统行**被用户重新添加过**（`add_phrase` / wdict 导入撞上同 `(code,text)` 的系统行）。
+    ///
+    /// 主键只有 `(code, text)` 一把，系统的与用户的「同款」短语在库里无法并存两行，归属规则
+    /// 是先到先得。此位的作用是让「归属仍是系统」与「用户确实建过它」两件事**同时可表达**：
+    /// 该行留在系统短语列表（`sync` / 恢复默认照常工作），同时也出现在用户短语列表里，
+    /// 不再出现「新建了一条，两个列表都找不到」。见 [`Store::add_phrase`]。
+    #[serde(default)]
+    pub user_modified: bool,
 }
 
 /// value 部分（text/code 存于 key）。
@@ -50,6 +58,8 @@ struct PhraseValue {
     enabled: bool,
     #[serde(default)]
     is_system: bool,
+    #[serde(default)]
+    user_modified: bool,
 }
 
 fn default_true() -> bool {
@@ -87,6 +97,7 @@ impl Store {
                         position: val.position,
                         enabled: val.enabled,
                         is_system: val.is_system,
+                        user_modified: val.user_modified,
                     });
                 }
             }
@@ -104,6 +115,14 @@ impl Store {
     ///
     /// 归属规则是**先到先得**：系统行在先→保持系统（本函数），用户行在先→保持用户
     /// （`sync_system_phrases` 的跳过分支，见 `sync_does_not_overwrite_user_row`）。
+    ///
+    /// 撞上系统行时置 [`PhraseRecord::user_modified`]，使该行同时出现在**用户短语列表**里。
+    /// 否则用户新建一条与系统短语同款的短语后，它既不在用户列表（`is_system=true` 被滤掉）、
+    /// 在系统列表里又与原条目毫无区别——用户看到的就是「我建的东西不见了」。
+    ///
+    /// 保留归属而非降级，是因为降级不可自愈：`sync_system_phrases` 的 `!cur.is_system →
+    /// continue` 会永远跳过降级行，连「恢复默认」也救不回来（那正是本函数上一版的行为，
+    /// 表现为反方向的「系统短语自动隐藏」）。
     pub fn add_phrase(
         &self,
         code: &str,
@@ -120,6 +139,8 @@ impl Store {
                 position,
                 enabled: true,
                 is_system,
+                // 归属仍是系统，但这条是用户主动建的 → 让它在用户列表里也可见。
+                user_modified: is_system,
             },
         )
     }
@@ -178,6 +199,7 @@ impl Store {
             position: 0,
             enabled: true,
             is_system: false,
+            user_modified: false,
         });
         let nc = new_code.unwrap_or(code);
         let nt = new_text.unwrap_or(text);
@@ -186,6 +208,9 @@ impl Store {
             position: position.unwrap_or(cur.position),
             enabled: cur.enabled,
             is_system: cur.is_system,
+            // 编辑既有条目**不**置位：那是在系统短语列表里正常调整，不该因此把该行搬进
+            // 用户列表。本位只表达「用户新建/导入过同款」（见 `add_phrase`）。
+            user_modified: cur.user_modified,
         };
         // 键改变 → 先删旧键
         if nc != code || nt != text {
@@ -201,6 +226,7 @@ impl Store {
             position: 0,
             enabled: true,
             is_system: false,
+            user_modified: false,
         });
         cur.enabled = enabled;
         self.put_phrase(code, text, cur)
@@ -249,6 +275,9 @@ impl Store {
                         position: e.position,
                         enabled: cur.enabled, // 保留开关
                         is_system: true,
+                        // weight/position 已被刷回 TOML 定义 → 用户的那次「新建同款」已被覆盖，
+                        // 标志随之清零。「恢复默认」经此路径，因而天然把这类行还原成纯系统行。
+                        user_modified: false,
                     };
                     self.put_phrase(&e.code, &e.text, val)?;
                     stats.updated += 1;
@@ -262,6 +291,7 @@ impl Store {
                             position: e.position,
                             enabled: true,
                             is_system: true,
+                            user_modified: false,
                         },
                     )?;
                     stats.added += 1;
@@ -280,8 +310,12 @@ impl Store {
             .collect())
     }
 
-    /// 用户短语分页（is_system=false）。prefix 非空时按 code/text 包含过滤后再分页。
+    /// 用户短语分页：纯用户行（`is_system=false`）**加上**被用户重新添加过的系统行
+    /// （`user_modified`，见 [`Self::add_phrase`]）。prefix 非空时按 code/text 包含过滤后再分页。
     /// 返回 (页内行, 过滤后总数)。
+    ///
+    /// 后一类行同时出现在系统短语列表里——这是有意的：主键只有一把，同款短语只有一行，
+    /// 它既是系统条目也确实是用户建的。调用方按 `is_system` / `user_modified` 区分标注。
     pub fn list_user_phrases_paged(
         &self,
         prefix: Option<&str>,
@@ -291,7 +325,7 @@ impl Store {
         let mut all: Vec<PhraseRecord> = self
             .list_phrases()?
             .into_iter()
-            .filter(|p| !p.is_system)
+            .filter(|p| !p.is_system || p.user_modified)
             .collect();
         if let Some(q) = prefix {
             let q = q.trim();
@@ -326,6 +360,10 @@ impl Store {
     }
 
     /// 用户"清空"：删 is_system=false 行。返回删除条数。
+    ///
+    /// **不含 `user_modified` 的系统行**——它们的归属是系统，删掉就等于把系统短语删了
+    /// （且 `sync` 的删除分支会认为它是过时系统项）。要还原那些行请走系统侧「恢复默认」，
+    /// `sync_system_phrases` 会把 weight/position 刷回 TOML 定义并清掉标志。
     pub fn reset_user_phrases(&self) -> anyhow::Result<usize> {
         let users: Vec<PhraseRecord> = self
             .list_phrases()?
@@ -339,12 +377,13 @@ impl Store {
         Ok(n)
     }
 
-    /// 导出全部用户短语为 wdict 文本。
+    /// 导出全部用户短语为 wdict 文本。与用户短语列表同口径（含 `user_modified` 的系统行）——
+    /// 那些行承载了用户实际写下的 weight/position，漏导等于备份丢数据。
     pub fn export_user_phrases_wdict(&self, exported_at: &str) -> anyhow::Result<String> {
         let rows: Vec<crate::wdict::PhraseIo> = self
             .list_phrases()?
             .into_iter()
-            .filter(|p| !p.is_system)
+            .filter(|p| !p.is_system || p.user_modified)
             .map(|p| crate::wdict::PhraseIo {
                 code: p.code,
                 text: p.text,
@@ -376,6 +415,8 @@ impl Store {
                     position: r.position,
                     enabled: r.enabled,
                     is_system,
+                    // 与 add_phrase 同口径：撞系统行 → 该行在用户列表里也可见。
+                    user_modified: is_system,
                 },
             )?;
         }
@@ -686,6 +727,87 @@ mod tests {
             1,
             "导入撞键不应把系统行降级"
         );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// 撞键可见性：用户新建一条与系统短语完全同款的短语后，**两个列表都要能看到它**。
+    ///
+    /// 历史上这里反复翻车过两次，方向相反：早期 `add_phrase` 无条件写 `is_system=false`，
+    /// 把系统行降级 → 现象是「系统短语自动隐藏」；修掉降级后又变成「用户短语看不到」。
+    /// 根因是主键只有 `(code,text)` 一把、`is_system` 是行属性，两种归属无法并存——
+    /// `user_modified` 就是用来同时表达这两件事的。
+    #[test]
+    fn user_added_duplicate_visible_in_both_lists() {
+        let path = tmp("wind_phrases_dup_visible.redb");
+        let s = Store::open(&path).unwrap();
+        let sys = [SystemPhrase {
+            code: "date".into(),
+            text: "$Y年$M月$D日".into(),
+            weight: 1000,
+            position: 1,
+        }];
+        s.sync_system_phrases(&sys).unwrap();
+
+        // 用户建了一条一模一样的（同 code 同 text），并给了自己的权重/位置。
+        s.add_phrase("date", "$Y年$M月$D日", 9, 5000).unwrap();
+
+        // ① 仍在系统短语列表（sync / 恢复默认照常认得它），并标出被改过。
+        let sys_list = s.list_system_phrases().unwrap();
+        assert_eq!(sys_list.len(), 1, "不得降级出系统列表");
+        assert!(sys_list[0].user_modified, "应标记为被用户重新添加过");
+
+        // ② 同时出现在用户短语列表——这正是此前「看不到」的那一条。
+        let (user_rows, total) = s.list_user_phrases_paged(None, 0, 99).unwrap();
+        assert_eq!(total, 1, "用户新建的同款短语必须在用户列表可见");
+        assert_eq!((user_rows[0].weight, user_rows[0].position), (5000, 9));
+        assert!(user_rows[0].is_system, "归属仍是系统，UI 据此区分删除语义");
+
+        // ③ 导出（备份）不能漏掉它，否则用户写的权重/位置备份即丢。
+        let wd = s.export_user_phrases_wdict("t").unwrap();
+        assert!(
+            wd.contains("$Y年$M月$D日"),
+            "用户改过的系统行须随用户短语导出"
+        );
+
+        // ④ 「用户清空」不碰它（归属是系统，删掉等于删系统短语）。
+        assert_eq!(s.reset_user_phrases().unwrap(), 0);
+        assert_eq!(s.list_system_phrases().unwrap().len(), 1);
+
+        // ⑤ 系统「恢复默认」把 weight/position 刷回 TOML 定义并清掉标志。
+        s.sync_system_phrases(&sys).unwrap();
+        let after = s.list_system_phrases().unwrap();
+        assert_eq!(
+            (after[0].weight, after[0].position),
+            (1000, 1),
+            "还原成定义值"
+        );
+        assert!(!after[0].user_modified, "还原后不再算用户改过");
+        assert_eq!(
+            s.list_user_phrases_paged(None, 0, 99).unwrap().1,
+            0,
+            "还原后退出用户列表"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// 编辑既有系统短语（改权重）**不**把它搬进用户列表——本位只表达「用户新建过同款」。
+    #[test]
+    fn editing_system_phrase_does_not_mark_user_modified() {
+        let path = tmp("wind_phrases_edit_no_mark.redb");
+        let s = Store::open(&path).unwrap();
+        s.sync_system_phrases(&[SystemPhrase {
+            code: "em".into(),
+            text: "（＾＿＾）".into(),
+            weight: 1000,
+            position: 0,
+        }])
+        .unwrap();
+        s.update_phrase("em", "（＾＿＾）", None, None, None, Some(42))
+            .unwrap();
+        let row = s.list_system_phrases().unwrap().pop().unwrap();
+        assert_eq!(row.weight, 42, "编辑生效");
+        assert!(!row.user_modified, "编辑不置位");
+        assert_eq!(s.list_user_phrases_paged(None, 0, 99).unwrap().1, 0);
         let _ = std::fs::remove_file(&path);
     }
 
