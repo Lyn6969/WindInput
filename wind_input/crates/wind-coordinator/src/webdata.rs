@@ -1142,15 +1142,24 @@ impl Coordinator {
         let (page, total) = if prefix.is_empty() && sort.is_none() {
             store.list_freq_paged(&schema, "", offset, limit)?
         } else {
-            let (mut all, _) = store.list_freq_paged(&schema, prefix, 0, 0)?;
-            // 词条内容搜索：并入 text 包含搜索词的词条（去重）。
+            // 词频表的 key 是扁平码；用户可能从用户词库列表复制带空格的串来搜，先拆
+            //（对无空格串恒等，故无副作用）。
+            let (code_prefix, _) = wind_store::wdict::split_spaced_code(prefix);
+            let (mut all, _) = store.list_freq_paged(&schema, &code_prefix, 0, 0)?;
+            // 并入两类补充命中（与上面的编码前缀取并集，去重）：
+            //   ① 词条内容包含搜索词（拿汉字匹配 text，用原串）
+            //   ② **编码中段包含**搜索词 —— 与 web_dict_list_paged 同款，前缀扫描只能
+            //      命中开头，`haoya` 搜 `ya` 一条也出不来。两者共用这一次全量扫描。
             if !prefix.is_empty() {
                 let q = prefix.to_lowercase();
+                let code_q = code_prefix.to_lowercase();
                 let seen: std::collections::HashSet<(String, String)> =
                     all.iter().map(|(c, t, _)| (c.clone(), t.clone())).collect();
                 let (rest, _) = store.list_freq_paged(&schema, "", 0, 0)?;
                 for (c, t, rec) in rest {
-                    if t.to_lowercase().contains(&q) && !seen.contains(&(c.clone(), t.clone())) {
+                    let hit = t.to_lowercase().contains(&q)
+                        || (!code_q.is_empty() && c.to_lowercase().contains(&code_q));
+                    if hit && !seen.contains(&(c.clone(), t.clone())) {
                         all.push((c, t, rec));
                     }
                 }
@@ -1472,6 +1481,9 @@ impl Coordinator {
     fn web_phrase_reset(&self) -> anyhow::Result<Value> {
         if let Some(store) = self.store.as_ref() {
             store.reset_user_phrases()?;
+            // 用户行里可能有遮蔽了系统条目的（`overrides_system`），删掉后那些系统短语
+            // 也一并没了 → 补一次同步插回来，否则要等到 TOML 哈希变动才恢复。
+            self.resync_system_phrases_after_user_reset();
         }
         self.rebuild_phrases();
         Ok(json!({ "ok": true }))
@@ -1489,8 +1501,6 @@ impl Coordinator {
                 json!({
                     "code": p.code, "text": p.text, "weight": p.weight,
                     "position": p.position, "enabled": p.enabled, "isSystem": true,
-                    // 该系统行被用户重新添加过（同时出现在用户短语列表），供 UI 标注区分。
-                    "userModified": p.user_modified,
                 })
             })
             .collect();
@@ -1530,12 +1540,10 @@ impl Coordinator {
             .map(|p| {
                 json!({
                     "code": p.code, "text": p.text, "weight": p.weight,
-                    "position": p.position, "enabled": p.enabled,
-                    // **不能再硬编码 false**：本列表现在也含「被用户重新添加过的系统行」
-                    // （`user_modified`），它们的归属仍是系统——删除/恢复语义与纯用户行不同，
-                    // UI 需按此标注，谎报会让用户以为能像自建短语一样删掉它。
-                    "isSystem": p.is_system,
-                    "userModified": p.user_modified,
+                    "position": p.position, "enabled": p.enabled, "isSystem": false,
+                    // 这条用户短语遮蔽了同码同内容的系统条目（该系统条目已从系统列表隐去，
+                    // 输入期生效的是这条）。供 UI 标注来源，并提示「删除本条即恢复系统默认」。
+                    "overridesSystem": p.overrides_system,
                 })
             })
             .collect();
@@ -2165,6 +2173,51 @@ mod tests {
                 .unwrap_or_default()
                 .is_empty(),
             "remove 收到带空格的码须先拆再删"
+        );
+    }
+
+    /// 词频列表的编码搜索同样要能命中中段（与用户词库同款，两处是各自独立的实现）。
+    #[test]
+    fn freq_search_matches_code_middle_segment() {
+        let c = coord("freq_search_middle");
+        let store = c.store.as_ref().expect("有 store");
+        store.record_freq("pinyin", "haoya", "好呀").unwrap();
+        store.record_freq("pinyin", "nihao", "你好").unwrap();
+
+        let hits = |q: &str| -> Vec<String> {
+            let r = c
+                .web_data_rpc(
+                    "freq.listPaged",
+                    &serde_json::json!({ "schemaId": "pinyin", "prefix": q }),
+                )
+                .unwrap();
+            r.get("items")
+                .and_then(|v| v.as_array())
+                .map(|a| {
+                    a.iter()
+                        .filter_map(|x| x.get("text").and_then(|t| t.as_str()))
+                        .map(String::from)
+                        .collect()
+                })
+                .unwrap_or_default()
+        };
+
+        assert!(
+            hits("hao").contains(&"好呀".to_string()),
+            "前缀命中（原有行为）"
+        );
+        assert!(
+            hits("ya").contains(&"好呀".to_string()),
+            "中段命中：haoya 搜 ya 须能找到"
+        );
+        assert!(
+            hits("hao").contains(&"你好".to_string()),
+            "nihao 的中段 hao 同样要命中"
+        );
+        // 词频 key 是扁平码，但用户可能从用户词库列表复制带空格的串来搜
+        assert!(
+            hits("ni hao").contains(&"你好".to_string()),
+            "带空格的搜索词须先拆再匹配"
         );
     }
 
