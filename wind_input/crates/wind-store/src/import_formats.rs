@@ -190,9 +190,16 @@ pub fn parse_words_tsv(text: &str) -> Result<(Vec<WordIo>, usize), String> {
     Ok((rows, skipped))
 }
 
-/// 编码归一化：去内部空白（拼音音节合并；码表码无空格时幂等）。
+/// 编码归一化：空白折叠为**单个空格**，前后剥净。
+///
+/// 此前是 `split_whitespace().collect()`（直接删空格，注释写作「拼音音节合并」）——
+/// 而 rime 词库的 `你好\tni hao\t1200` 里，那些空格正是词库作者标注的**音节真值**，
+/// 删掉即永久丢失，落库只能 boundary=0。现改为保留，由
+/// [`crate::wdict::split_spaced_code`] 在落库时拆成 flat key + 边界。
+///
+/// 对码表码（五笔等，本就无空格）幂等，行为与改动前一致。
 fn normalize_code(code: &str) -> String {
-    code.split_whitespace().collect()
+    code.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
 /// 编码合法性：可打印 ASCII（0x20-0x7E）。拦乱码与"词在前码在后"的列序颠倒文件。
@@ -241,15 +248,35 @@ mod tests {
         );
     }
 
+    /// ⚠️ **断言方向已反转**（原为「拼音码去空格连写」，测试名亦为 `..._space_join`）。
+    ///
+    /// rime 源里 `你好\tni hao\t100` 的空格是词库作者标注的**音节真值**。旧的
+    /// `normalize_code` 直接把它删掉，导入的词一律 boundary=0 —— 信息拿在手上、用完即弃。
+    /// 现保留为单空格，落库时由 `wdict::split_spaced_code` 拆成 flat key + 边界
+    /// （key 仍是扁平的 `nihao`，见 docs/design/pinyin-code-domains.md §2.2）。
     #[test]
-    fn rime_default_columns_and_space_join() {
+    fn rime_default_columns_keeps_syllable_spaces() {
         let (rows, skipped) = parse_words_rime(RIME_SAMPLE).unwrap();
         assert_eq!(skipped, 0);
         assert_eq!(rows.len(), 2);
-        // 默认列序 text 在前;拼音码去空格连写
+        // 默认列序 text 在前；音节空格保留，供落库端拆出边界
         assert_eq!(rows[0].text, "你好");
-        assert_eq!(rows[0].code, "nihao");
+        assert_eq!(rows[0].code, "ni hao");
         assert_eq!(rows[0].weight, 100);
+        assert_eq!(rows[1].code, "shi jie");
+        // 落库端拆分后 key 仍是扁平码，边界随之得到
+        assert_eq!(
+            crate::wdict::split_spaced_code(&rows[0].code),
+            ("nihao".to_string(), 0b101)
+        );
+    }
+
+    /// 空白折叠：多空格/制表列内空白归一为单个空格；码表码（无空格）幂等。
+    #[test]
+    fn normalize_code_folds_whitespace_and_is_idempotent_for_flat() {
+        assert_eq!(normalize_code("ni  hao"), "ni hao");
+        assert_eq!(normalize_code("  ni hao  "), "ni hao");
+        assert_eq!(normalize_code("abcd"), "abcd");
     }
 
     #[test]

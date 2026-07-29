@@ -1348,9 +1348,9 @@ impl Engine for PinyinEngine {
         EngineType::Pinyin
     }
 
-    /// 为词语生成全拼编码与音节边界（多音字按词典权重消歧）。
+    /// 为词语生成带空格的全拼音节码（多音字按词典权重消歧）。
     /// 单字读音索引按词典懒构建并缓存。含无读音字符时返回 `None`。
-    fn generate_word_pinyin(&self, word: &str) -> Option<(String, u64)> {
+    fn generate_word_pinyin(&self, word: &str) -> Option<String> {
         let idx = self
             .char_pinyin_idx
             .get_or_init(|| CharPinyinIndex::build(&self.dict));

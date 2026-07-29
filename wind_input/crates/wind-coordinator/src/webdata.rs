@@ -440,21 +440,39 @@ impl Coordinator {
             .store
             .as_ref()
             .ok_or_else(|| anyhow::anyhow!("无持久化存储"))?;
-        let boundary = self.infer_boundary_for(&schema, code, text);
-        store.add_user_word(&schema, code, text, weight, boundary)?;
+        let (code, boundary) = self.normalize_add_code(&schema, code, text);
+        store.add_user_word(&schema, &code, text, weight, boundary)?;
         Ok(json!({ "ok": true }))
+    }
+
+    /// 规范化设置端提交的编码，返回 `(扁平 code, boundary)`。
+    ///
+    /// 两条边界来源，按可信度取：
+    /// 1. **用户在码里打了空格**（`ni hao`）—— 显式声明的切分，直接采信。同时必须拆成扁平
+    ///    码：带空格的串若原样落库，key 就成了 `ni hao`，前缀查询再也匹配不到它。
+    /// 2. 无空格 → 退回 [`Self::infer_boundary_for`] 的「手输码 == 推导码则借用」兜底。
+    fn normalize_add_code(&self, schema: &str, code: &str, text: &str) -> (String, u64) {
+        let (flat, explicit) = wind_store::wdict::split_spaced_code(code);
+        if explicit != 0 {
+            return (flat, explicit);
+        }
+        let b = self.infer_boundary_for(schema, &flat, text);
+        (flat, b)
     }
 
     /// 为设置端手输的 (code, text) 推断音节边界。
     ///
-    /// 参数串/RPC/UI 全链路都是扁平 ASCII 码，**用户无从表达音节边界**。但若手输码恰与引擎
-    /// 推导的码逐字相同，其切分就是确定的，可直接借用推导出的边界——多数手动加词用的正是
-    /// 系统给出的码（`dict.encode`），故这条兜底能覆盖大半。
+    /// 手输码通常是扁平 ASCII，**用户多数时候无从表达音节边界**（能表达时走
+    /// [`Self::normalize_add_code`] 的空格分支）。但若手输码恰与引擎推导的码逐字相同，
+    /// 其切分就是确定的，可直接借用推导出的边界——多数手动加词用的正是系统给出的码
+    /// （`dict.encode`），故这条兜底能覆盖大半。
     ///
     /// 不一致（用户自定义切分/生僻音）或非拼音方案 → 0，消费方降级回 DAG。
     fn infer_boundary_for(&self, schema: &str, code: &str, text: &str) -> u64 {
         self.engine_mgr
             .generate_word_pinyin(schema, text)
+            // 引擎给的是带空格的音节码，须拆成扁平码再与手输码比对（手输码恒无空格）。
+            .map(|spaced| wind_store::wdict::split_spaced_code(&spaced))
             .filter(|(derived, _)| derived == code)
             .map(|(_, b)| b)
             .unwrap_or(0)
@@ -470,9 +488,10 @@ impl Coordinator {
             .as_ref()
             .ok_or_else(|| anyhow::anyhow!("无持久化存储"))?;
         // 存在则改权重（boundary 沿用）；不存在则新增（upsert 语义）。
-        if !store.update_user_word_weight(&schema, code, text, weight)? {
-            let boundary = self.infer_boundary_for(&schema, code, text);
-            store.add_user_word(&schema, code, text, weight, boundary)?;
+        // code 同样先规范化，否则带空格的码既查不到既有记录、又会新增出带空格的 key。
+        let (code, boundary) = self.normalize_add_code(&schema, code, text);
+        if !store.update_user_word_weight(&schema, &code, text, weight)? {
+            store.add_user_word(&schema, &code, text, weight, boundary)?;
         }
         Ok(json!({ "ok": true }))
     }
@@ -1059,7 +1078,9 @@ impl Coordinator {
             let reverse = self.reverse.read().unwrap_or_else(|e| e.into_inner());
             self.engine_mgr
                 .generate_word_pinyin(schema, text)
-                .map(|(c, _)| c)
+                // 引擎给带空格的音节码；**本 RPC 契约是扁平码**，须去空格再回给 UI——
+                // UI 会把它回填到编码框、原样提交给 dict.add，带空格就会存成带空格的 key。
+                .map(|spaced| spaced.replace(' ', ""))
                 .unwrap_or_else(|| reverse.gen_pinyin(text))
         } else {
             // 与自动造词/快捷加词同一取码入口（码源=码表词库自身，规则=方案声明的公式）。
@@ -1083,7 +1104,8 @@ impl Coordinator {
         self.engine_mgr
             .generate_word_pinyin(&active, text)
             .or_else(|| self.engine_mgr.generate_word_pinyin("pinyin", text))
-            .map(|(c, _)| c)
+            // 同 dict.encode：契约为扁平码，去掉音节空格再回给调用方。
+            .map(|spaced| spaced.replace(' ', ""))
             .unwrap_or_else(|| {
                 self.reverse
                     .read()

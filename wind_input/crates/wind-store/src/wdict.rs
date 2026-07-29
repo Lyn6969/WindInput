@@ -150,6 +150,69 @@ pub struct WordIo {
 
 const WORD_COLUMNS: &[&str] = &["code", "text", "weight", "count"];
 
+// ─────────────────── 音节码：空格表示 ↔ 存储表示（flat + boundary）───────────────────
+//
+// wdict 文本里拼音方案的 code 列写成**带空格的音节码**（`ni hao`），与 rime 源词库同形；
+// 落库时拆成 `flat + mask`。**列结构不变**（仍是 code/text/weight/count），只是 code 列
+// 的内容多了空格，故老文件天然兼容。
+//
+// key 必须保持扁平：`ni hao` 作存储键会让 `niha` 无法前缀匹配，而前缀查询是逐键出候选
+// 的命脉（见 docs/design/pinyin-code-domains.md §2.2）。
+//
+// **判据是「有没有空格」，不看方案类型** —— wind-store 拿不到 engine_mgr，无从判断引擎
+// 类型。这条规则对三种输入同时正确：拼音多音节词导出带空格 → 拆出边界；五笔码无空格
+// → 0；旧版无空格文件 → 0（与改动前等价）。
+//
+// ⚠️ 故意**不复用** `wind_dict::codetable::syllable_boundary_mask`：那个函数对无空格串
+// 返回 `0b1`（「整串一个音节」，因为它的输入保证是已知有音节语义的拼音码），而这里无空格
+// 必须解释为「未知」。语义不同，各自实现才是对的。依赖方向上也不可能复用——
+// wind-dict 依赖 wind-store，反向依赖会成环。
+
+/// 存储表示 → 空格表示（导出用）。
+///
+/// `boundary` 语义同 `wind_dict::binformat::DictEntry::boundary`：各音节起始字节位 bitmask。
+///
+/// ⚠️ **单音节不可逆**：`boundary=0b1`（「整串一个音节」）join 后无空格，
+/// [`split_spaced_code`] 读回来是 0。单音节无切分歧义，该信息价值极低；且 0 在消费端
+/// 一律是「放行」而非「拒绝」（`boundary_compatible` 任一侧为 0 即放行），不会误杀。
+pub fn join_code_by_boundary(flat: &str, boundary: u64) -> String {
+    // 0 = 无边界信息；0b1 = 整串一个音节。两者都没有可插入的内部边界。
+    if boundary == 0 || boundary == 1 {
+        return flat.to_string();
+    }
+    let mut out = String::with_capacity(flat.len() + 8);
+    for (i, ch) in flat.char_indices() {
+        // bit 位是**字节**偏移；拼音码为 ASCII，char_indices 的下标即字节位。
+        if i > 0 && i < 64 && (boundary >> i) & 1 == 1 {
+            out.push(' ');
+        }
+        out.push(ch);
+    }
+    out
+}
+
+/// 空格表示 → 存储表示（导入用）。返回 `(flat_code, boundary)`。
+///
+/// 无空格 → `(原串, 0)`：可能是五笔码、单音节词，或旧版导出的扁平拼音码，一律按
+/// 「无边界信息」处理，消费方降级回 DAG。
+pub fn split_spaced_code(spaced: &str) -> (String, u64) {
+    if !spaced.contains(' ') {
+        return (spaced.to_string(), 0);
+    }
+    let mut mask = 0u64;
+    let mut pos = 0usize;
+    for syl in spaced.split(' ').filter(|s| !s.is_empty()) {
+        if pos >= 64 {
+            // 超出 bitmask 表达范围 → 整体降级，不给半截错误边界（对齐
+            // wind_dict::syllable_boundary_mask 的同款契约）。
+            return (spaced.replace(' ', ""), 0);
+        }
+        mask |= 1u64 << pos;
+        pos += syl.len();
+    }
+    (spaced.replace(' ', ""), mask)
+}
+
 /// 导出 words 为 wdict 文本（YAML 头 + `--- !words` TSV 段）。
 pub fn export_words_wdict(rows: &[WordIo], exported_at: &str) -> String {
     let mut s = String::new();
@@ -603,6 +666,56 @@ pub fn sections_present(text: &str) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 空格表示 ↔ 存储表示的往返。多音节必须无损，否则备份还原仍会丢边界。
+    #[test]
+    fn spaced_code_roundtrip() {
+        // ni|hao → 起始字节位 {0,2}
+        assert_eq!(join_code_by_boundary("nihao", 0b101), "ni hao");
+        assert_eq!(split_spaced_code("ni hao"), ("nihao".into(), 0b101));
+        // xi|an|ning → {0,2,4}
+        assert_eq!(join_code_by_boundary("xianning", 0b10101), "xi an ning");
+        assert_eq!(
+            split_spaced_code("xi an ning"),
+            ("xianning".into(), 0b10101)
+        );
+        // 变长音节 zhuang|ni → {0,6}
+        assert_eq!(join_code_by_boundary("zhuangni", 0b1000001), "zhuang ni");
+        assert_eq!(
+            split_spaced_code("zhuang ni"),
+            ("zhuangni".into(), 0b1000001)
+        );
+    }
+
+    /// 无空格一律解释为「无边界信息」——五笔码、旧版导出的扁平拼音码走的都是这条路，
+    /// 结果与本次改动前完全等价（boundary=0 → 消费方降级回 DAG）。
+    #[test]
+    fn flat_code_means_unknown_boundary() {
+        assert_eq!(split_spaced_code("abcd"), ("abcd".into(), 0)); // 五笔
+        assert_eq!(split_spaced_code("nihao"), ("nihao".into(), 0)); // 旧版导出
+        assert_eq!(split_spaced_code(""), ("".into(), 0));
+        // 反向：无边界 / 单音节都不加空格（没有可插入的内部边界）
+        assert_eq!(join_code_by_boundary("nihao", 0), "nihao");
+        assert_eq!(join_code_by_boundary("ni", 0b1), "ni");
+    }
+
+    /// ⚠️ 单音节 `0b1` 不可逆（文档已声明）：join 后无空格，split 回来是 0。
+    /// 锁住这个**已知且可接受**的损失，避免日后被当成 bug 顺手「修」成 0b1 ——
+    /// 那会让五笔码也被判成单音节，语义反而错了。
+    #[test]
+    fn single_syllable_boundary_is_lossy_by_design() {
+        let joined = join_code_by_boundary("ni", 0b1);
+        assert_eq!(split_spaced_code(&joined).1, 0, "单音节边界不经文本往返");
+    }
+
+    /// 超过 64 字节的拼接：bitmask 装不下 → 整体降级为 0，不给半截错误边界。
+    #[test]
+    fn overlong_code_degrades_to_zero() {
+        let spaced = vec!["zhuang"; 12].join(" "); // 12*6=72B
+        let (flat, mask) = split_spaced_code(&spaced);
+        assert_eq!(flat.len(), 72);
+        assert_eq!(mask, 0, "超长码整体降级");
+    }
 
     #[test]
     fn phrases_wdict_roundtrip() {

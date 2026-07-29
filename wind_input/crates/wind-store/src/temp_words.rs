@@ -215,10 +215,11 @@ impl Store {
         exported_at: &str,
     ) -> anyhow::Result<String> {
         let recs = self.search_temp_words_prefix(schema, "", 0)?;
+        // code 列输出带空格的音节码，边界随之流出（同 collect_user_word_rows）。
         let rows: Vec<wdict::WordIo> = recs
             .into_iter()
             .map(|r| wdict::WordIo {
-                code: r.code,
+                code: wdict::join_code_by_boundary(&r.code, r.boundary),
                 text: r.text,
                 weight: r.weight,
                 count: 0,
@@ -235,8 +236,9 @@ impl Store {
     ) -> anyhow::Result<(usize, usize)> {
         let (rows, skipped) = wdict::parse_words_wdict(text).map_err(|e| anyhow::anyhow!(e))?;
         for r in &rows {
-            // wdict 是扁平文本（code\ttext\tweight），无音节边界可言 → 0（消费方降级回 DAG）。
-            self.learn_temp_word(schema, &r.code, &r.text, r.weight, 0)?;
+            // code 列可能是带空格的音节码 → 拆成扁平码 + 边界；无空格则 boundary=0。
+            let (code, b) = wdict::split_spaced_code(&r.code);
+            self.learn_temp_word(schema, &code, &r.text, r.weight, b)?;
         }
         Ok((rows.len(), skipped))
     }
@@ -254,13 +256,20 @@ impl Store {
             {
                 let mut t = txn.open_table(TEMP_WORDS)?;
                 for r in rows {
-                    let key = enc_key(schema, &r.code, &r.text);
+                    // code 列可能是带空格的音节码 → 拆成扁平 key + 边界。
+                    let (code, in_b) = wdict::split_spaced_code(&r.code);
+                    let key = enc_key(schema, &code, &r.text);
                     let cap = r.weight.min(TEMP_WORD_MAX_WEIGHT);
-                    // wdict 行无边界；已存在则沿用旧 boundary（切分不因导入而变）。
+                    // 已存在且旧 boundary 非 0 则沿用（切分不因导入而变），为 0 时用导入行补齐。
                     let (w, c, ca, b) = match t.get(key.as_str())?.and_then(|g| dec_val(g.value()))
                     {
-                        Some((ow, oc, oca, ob)) => (ow.max(cap), oc.max(r.count), oca, ob),
-                        None => (cap, r.count, now_secs(), 0),
+                        Some((ow, oc, oca, ob)) => (
+                            ow.max(cap),
+                            oc.max(r.count),
+                            oca,
+                            if ob != 0 { ob } else { in_b },
+                        ),
+                        None => (cap, r.count, now_secs(), in_b),
                     };
                     t.insert(key.as_str(), enc_val(w, c, ca, b).as_slice())?;
                 }

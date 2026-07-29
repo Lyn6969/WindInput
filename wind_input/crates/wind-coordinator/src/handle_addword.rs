@@ -736,8 +736,11 @@ impl Coordinator {
             .unwrap_or(false);
         if is_pinyin {
             let reverse = self.reverse.read().unwrap_or_else(|e| e.into_inner());
+            // 引擎给出带空格的音节码（`ni hao`）→ 拆成扁平 code + 边界。
+            // 逐字反查表回退无音节语义，其结果不含空格 ⇒ split 后 boundary=0。
             self.engine_mgr
                 .generate_word_pinyin(&schema, word)
+                .map(|spaced| wind_store::wdict::split_spaced_code(&spaced))
                 .unwrap_or_else(|| (reverse.gen_pinyin(word), 0))
         } else {
             match self.engine_mgr.encode_word(&schema, word) {

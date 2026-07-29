@@ -89,8 +89,10 @@ impl Store {
                     let recs = self.search_temp_words_prefix(schema, "", 0)?;
                     d.temp_words = Some(
                         recs.into_iter()
+                            // 带空格的音节码，与 collect_user_word_rows 同款（导入端
+                            // import_temp_word_rows 会拆回 flat + 边界）。
                             .map(|r| WordIo {
-                                code: r.code,
+                                code: wdict::join_code_by_boundary(&r.code, r.boundary),
                                 text: r.text,
                                 weight: r.weight,
                                 count: r.count,

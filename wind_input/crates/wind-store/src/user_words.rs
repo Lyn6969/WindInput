@@ -311,24 +311,29 @@ impl Store {
             {
                 let mut t = txn.open_table(USER_WORDS)?;
                 for r in rows {
-                    let key = enc_key(schema, &r.code, &r.text);
+                    // code 列可能是带空格的音节码（`ni hao`）→ 拆成扁平 key + 边界。
+                    // 无空格（五笔码/旧版导出）→ boundary=0，与改动前等价。
+                    let (code, in_b) = wdict::split_spaced_code(&r.code);
+                    let key = enc_key(schema, &code, &r.text);
                     let existing = t.get(key.as_str())?.and_then(|g| dec_val(g.value()));
                     match existing {
                         None => {
-                            // wdict 是扁平文本，无音节边界 → 0（消费方降级回 DAG）。
                             t.insert(
                                 key.as_str(),
-                                enc_val(r.weight, r.count, now_secs(), 0).as_slice(),
+                                enc_val(r.weight, r.count, now_secs(), in_b).as_slice(),
                             )?;
                             c.added += 1;
                         }
                         Some((w, cnt, ca, b)) => {
-                            // weight/count 各取 max；任一变大即写盘为 updated，否则 unchanged。
-                            // boundary 沿用旧值：导入行本就无边界，不该把已有的抹掉。
+                            // weight/count 各取 max；boundary 旧值非 0 则沿用（同
+                            // `add_user_word`：同 (schema,code,text) 的切分是确定的，
+                            // 不因再次导入而变），旧值为 0 时用导入行补齐。
+                            // 三者任一变化即写盘为 updated，否则 unchanged。
                             let nw = w.max(r.weight);
                             let nc = cnt.max(r.count);
-                            if nw != w || nc != cnt {
-                                t.insert(key.as_str(), enc_val(nw, nc, ca, b).as_slice())?;
+                            let nb = if b != 0 { b } else { in_b };
+                            if nw != w || nc != cnt || nb != b {
+                                t.insert(key.as_str(), enc_val(nw, nc, ca, nb).as_slice())?;
                                 c.updated += 1;
                             } else {
                                 c.unchanged += 1;
@@ -355,14 +360,21 @@ impl Store {
             let mut c = WordsImportCounts::default();
             let mut samples = Vec::new();
             for r in rows {
-                let key = enc_key(schema, &r.code, &r.text);
+                // 与 import_user_words 同款拆分：key 必须用扁平码，否则带空格的行
+                // 一律查不到既有记录、全部误报为 added。
+                let (code, in_b) = wdict::split_spaced_code(&r.code);
+                let key = enc_key(schema, &code, &r.text);
                 let existing = t.get(key.as_str())?.and_then(|g| dec_val(g.value()));
                 let will_write = match existing {
                     None => {
                         c.added += 1;
                         true
                     }
-                    Some((w, cnt, _, _)) if r.weight > w || r.count > cnt => {
+                    // 判据须与 import_user_words 逐项对齐，含 boundary 补齐那一项
+                    // （旧值为 0 且导入行给得出边界 → 会落盘 → 算 updated）。
+                    Some((w, cnt, _, b))
+                        if r.weight > w || r.count > cnt || (b == 0 && in_b != 0) =>
+                    {
                         c.updated += 1;
                         true
                     }
@@ -390,6 +402,10 @@ impl Store {
     }
 
     /// 收集某方案全部用户词为 wdict WordIo 行(code/text/weight/count)。
+    ///
+    /// code 列输出**带空格的音节码**（`ni hao`），边界随之流出——此前导出的是扁平码，
+    /// 边界在文本里无处安放，于是「导出→清空→导入」一轮就把 boundary 全清零
+    /// （备份还原正是这条路径）。见 [`wdict::join_code_by_boundary`]。
     pub(crate) fn collect_user_word_rows(
         &self,
         schema: &str,
@@ -398,7 +414,7 @@ impl Store {
         Ok(recs
             .into_iter()
             .map(|r| wdict::WordIo {
-                code: r.code,
+                code: wdict::join_code_by_boundary(&r.code, r.boundary),
                 text: r.text,
                 weight: r.weight,
                 count: r.count,
@@ -434,6 +450,99 @@ mod tests {
         let p = std::env::temp_dir().join(name);
         let _ = std::fs::remove_file(&p);
         p
+    }
+
+    /// **备份还原不得丢音节边界**（本次改动的验收标准）。
+    ///
+    /// `backup.rs` 的还原路径是 `clear_user_words` + `import_user_words_wdict`。清空后
+    /// 全是新键，而 wdict 此前是扁平四列文本、边界无处安放 ⇒ **一轮备份还原把 boundary
+    /// 全部清零**（实测：写入 `[5,21]` → 还原后 `[0,0]`）。现 code 列改写带空格的音节码。
+    ///
+    /// 反向验证：把 `collect_user_word_rows` 的 `join_code_by_boundary` 换回 `r.code`，
+    /// 本测试即变红。
+    #[test]
+    fn boundary_survives_export_clear_import() {
+        let p = tmp("wind_uw_boundary_backup.redb");
+        let s = Store::open(&p).unwrap();
+        s.add_user_word("pinyin", "nihao", "你好", 500, 0b101)
+            .unwrap();
+        s.add_user_word("pinyin", "xianning", "西安宁", 800, 0b10101)
+            .unwrap();
+
+        let text = s.export_user_words_wdict("pinyin", "2026-07-29").unwrap();
+        assert!(
+            text.contains("ni hao") && text.contains("xi an ning"),
+            "导出文本的 code 列须为带空格的音节码，实际:\n{text}"
+        );
+
+        // ── 模拟备份还原 ──
+        s.clear_user_words("pinyin").unwrap();
+        s.import_user_words_wdict("pinyin", &text).unwrap();
+
+        let recs = s.search_user_words_prefix("pinyin", "", 0).unwrap();
+        let mut got: Vec<(String, u64)> =
+            recs.iter().map(|r| (r.code.clone(), r.boundary)).collect();
+        got.sort();
+        assert_eq!(
+            got,
+            vec![
+                ("nihao".to_string(), 0b101),
+                ("xianning".to_string(), 0b10101)
+            ],
+            "还原后 key 须仍是扁平码、且边界原样存活"
+        );
+        let _ = std::fs::remove_file(&p);
+    }
+
+    /// 旧版 wdict（code 列为扁平码，无空格）导入后 boundary=0，不报错、不误判为单音节。
+    /// 用户手上已有的备份文件都是这个形态，必须平滑降级。
+    #[test]
+    fn legacy_flat_wdict_imports_as_unknown_boundary() {
+        let p = tmp("wind_uw_legacy_wdict.redb");
+        let s = Store::open(&p).unwrap();
+        let legacy = "# WindInput 用户数据文件\nwind_dict:\n  version: 1\n  sections:\n    words:\n      columns: [code, text, weight, count]\n\n--- !words\nnihao\t你好\t500\t0\nabcd\t工作\t100\t0\n";
+        let (imported, skipped) = s.import_user_words_wdict("pinyin", legacy).unwrap();
+        assert_eq!((imported, skipped), (2, 0));
+        let recs = s.search_user_words_prefix("pinyin", "", 0).unwrap();
+        assert!(
+            recs.iter().all(|r| r.boundary == 0),
+            "无空格的码一律按「无边界信息」处理"
+        );
+        assert!(recs.iter().any(|r| r.code == "nihao"));
+        let _ = std::fs::remove_file(&p);
+    }
+
+    /// 导入行带边界、库中旧记录 boundary=0（v1 遗留或历史扁平导入）→ 补齐而非忽略，
+    /// 且该行计入 updated；`preview_import_user_words` 的分类必须给出同样答案。
+    #[test]
+    fn import_fills_missing_boundary_and_preview_agrees() {
+        let p = tmp("wind_uw_fill_boundary.redb");
+        let s = Store::open(&p).unwrap();
+        s.add_user_word("pinyin", "nihao", "你好", 500, 0).unwrap(); // 旧记录无边界
+
+        let rows = vec![wdict::WordIo {
+            code: "ni hao".into(),
+            text: "你好".into(),
+            weight: 500, // weight/count 均不变，只有 boundary 可补
+            count: 0,
+        }];
+        let (pc, _) = s.preview_import_user_words("pinyin", &rows).unwrap();
+        let ic = s.import_user_words("pinyin", &rows).unwrap();
+        assert_eq!(
+            (pc.added, pc.updated, pc.unchanged),
+            (0, 1, 0),
+            "dry-run 须把「仅补边界」也算作会落盘的 updated"
+        );
+        assert_eq!(
+            (ic.added, ic.updated, ic.unchanged),
+            (0, 1, 0),
+            "实际导入的分类须与 dry-run 完全一致"
+        );
+        assert_eq!(
+            s.get_user_words("pinyin", "nihao").unwrap()[0].boundary,
+            0b101
+        );
+        let _ = std::fs::remove_file(&p);
     }
 
     /// **向后兼容契约**（数据安全）：value 从 v1 的 16B 扩到 24B（追加 boundary u64）。

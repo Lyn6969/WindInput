@@ -75,62 +75,65 @@ impl CharPinyinIndex {
     }
 }
 
-/// 按音节/词段拼接 code，**顺带累积音节边界**。
+/// 按音节/词段拼接**带空格的音节码**（`ni hao`）。
 ///
-/// 造词本就是「逐音节拼起来」，每次拼接前的 `code.len()` 就是该音节的起始字节位——边界是
-/// 白送的，此前只是被 `String::push_str` 丢掉，逼得下游用 DAG 反猜（甚至靠 410 音节暴力反查）。
+/// 造词本就是「逐音节拼起来」，边界是白送的——此前被 `String::push_str` 丢掉，逼得下游用
+/// DAG 反猜（甚至靠 410 音节暴力反查）。
 ///
-/// 溢出（拼接后 >64 字节，bitmask 装不下）时整体作废为 0 = 无边界信息，与
-/// `wind_dict` 侧 `syllable_boundary_mask` 的降级契约一致：宁可不给，不给半截错的。
-struct CodeBuilder {
-    code: String,
-    mask: u64,
-    overflow: bool,
+/// 此前的形态是「扁平 code + 手工累积的 bitmask」两个独立值，有两个固有毛病，空格表示
+/// 一并消除：
+/// - **二者可以不一致**：`d4084b8` 已踩过「A 层的 code + B 层的 boundary」。空格串里
+///   码与边界物理上不可分离，错配连写都写不出来。
+/// - **64 字节天花板**：bitmask 装不下更长的拼接，只能整体降级为「无边界」，长词因此
+///   一律拿不到边界。字符串没有这个限制。
+///
+/// 落库时由 [`wind_store::wdict::split_spaced_code`] 拆回 `flat + mask`——key 必须保持
+/// 扁平，见 `docs/design/pinyin-code-domains.md` §2.2。
+struct SpacedCode {
+    syls: Vec<String>,
 }
 
-impl CodeBuilder {
+impl SpacedCode {
     fn new(cap: usize) -> Self {
         Self {
-            code: String::with_capacity(cap),
-            mask: 0,
-            overflow: false,
+            syls: Vec::with_capacity(cap),
         }
     }
 
-    /// 追加一个**已知内部边界**的词段（如整词 "nihao" + 段内 mask ni|hao）。
-    /// 段内 mask 的 bit 是段内偏移，须平移 `base` 到全局位置。
-    fn push_segment(&mut self, s: &str, seg_mask: u64) {
-        let base = self.code.len();
-        // 段内 mask 的置位不会超出 s.len()，故 base+s.len()<=64 即可安全左移。
-        if base + s.len() > 64 {
-            self.overflow = true;
-        } else {
-            self.mask |= seg_mask << base;
-        }
-        self.code.push_str(s);
+    /// 追加一个**已带空格的多音节词段**（如整词 `ni hao`）。段内边界随空格原样并入，
+    /// 无需平移——这正是空格表示取代 bitmask 左移的地方。
+    fn push_segment(&mut self, spaced: &str) {
+        self.syls.extend(
+            spaced
+                .split(' ')
+                .filter(|s| !s.is_empty())
+                .map(String::from),
+        );
     }
 
-    /// 追加一个音节（段内 mask 恒为 `0b1`：段首即音节首）。
+    /// 追加单个音节。
     fn push_syllable(&mut self, s: &str) {
-        self.push_segment(s, 0b1);
+        self.syls.push(s.to_string());
     }
 
-    fn finish(self) -> (String, u64) {
-        (self.code, if self.overflow { 0 } else { self.mask })
+    fn finish(self) -> String {
+        self.syls.join(" ")
     }
 }
 
-/// 为词语生成全拼编码**与音节边界**。含无读音字符时返回 `None`。
+/// 为词语生成**带空格的全拼音节码**（`你好` → `ni hao`）。含无读音字符时返回 `None`。
 ///
-/// 返回的 boundary 语义同 `wind_dict::binformat::DictEntry::boundary`，供用户自造词从
-/// 诞生起就带上边界（否则用户词是块「边界空洞」，双拼校验只能对其降级）。
+/// 空格即音节边界，与 rime 源词库同形。落库时由
+/// [`wind_store::wdict::split_spaced_code`] 拆成扁平 code + boundary
+/// （语义同 `wind_dict::binformat::DictEntry::boundary`），供用户自造词从诞生起就带上
+/// 边界——否则用户词是块「边界空洞」，双拼校验只能对其降级。
 ///
 /// `dict` 为拼音系统词典（提供整词验证的真值表），`index` 为单字读音索引。
 pub fn generate_word_pinyin(
     dict: &CachedDict,
     index: &CharPinyinIndex,
     word: &str,
-) -> Option<(String, u64)> {
+) -> Option<String> {
     let runes: Vec<char> = word.chars().collect();
     if runes.is_empty() {
         return None;
@@ -143,8 +146,8 @@ pub fn generate_word_pinyin(
     if let Some(r) = infer_by_subword_segmentation(dict, index, &runes) {
         return Some(r);
     }
-    // 3) 兜底：逐字代表读音（每字一音节，边界即逐字累积）
-    let mut b = CodeBuilder::new(runes.len() * 4);
+    // 3) 兜底：逐字代表读音（每字一音节）
+    let mut b = SpacedCode::new(runes.len());
     for &r in &runes {
         b.push_syllable(index.representative(r)?);
     }
@@ -159,7 +162,7 @@ fn infer_whole_word_code(
     index: &CharPinyinIndex,
     runes: &[char],
     word: &str,
-) -> Option<(String, u64)> {
+) -> Option<String> {
     if runes.len() < 2 {
         return None;
     }
@@ -180,14 +183,16 @@ fn infer_whole_word_code(
     // 笛卡尔积枚举（按字典序，等价于按权重组合的优先级）
     let mut idxs = vec![0usize; runes.len()];
     loop {
-        // 每字一音节 → 边界随拼接累积（readings[i][pos] 即第 i 字选中的读音）。
-        let mut b = CodeBuilder::new(runes.len() * 4);
+        // 每字一音节（readings[i][pos] 即第 i 字选中的读音）。
+        let mut b = SpacedCode::new(runes.len());
         for (i, &pos) in idxs.iter().enumerate() {
             b.push_syllable(&readings[i][pos]);
         }
-        let (code, mask) = b.finish();
-        if dict.search(&code).iter().any(|(text, _, _)| text == word) {
-            return Some((code, mask));
+        let spaced = b.finish();
+        // 查词典须用**扁平**码：词典 key 是扁平的（见 §2.2）。
+        let flat = spaced.replace(' ', "");
+        if dict.search(&flat).iter().any(|(text, _, _)| text == word) {
+            return Some(spaced);
         }
         // 递增到下一个组合（低位满则进位）
         let mut k = runes.len();
@@ -209,11 +214,10 @@ fn infer_whole_word_code(
 #[derive(Clone)]
 struct DpState {
     prev: usize,
-    /// 该段为多字子词时的整体读音 code；单字过渡为空。
+    /// 该段为多字子词时的整体读音码，**带空格**（如「你好」→ `ni hao`）；单字过渡为空。
+    /// 段内边界就在空格里，回溯拼接时直接并入即可——此前需额外存一个 `seg_mask`
+    /// 并在拼接时左移到全局位置，漏平移就会丢掉长词的段内边界。
     seg: String,
-    /// `seg` 的**段内**音节边界（多字子词自身可含多音节，如「你好」→ ni|hao）。
-    /// 回溯拼接时须平移到全局位置，否则长词的段内边界会丢。
-    seg_mask: u64,
     /// 已用多字子词段数（越少越优，同总字数下）。
     multi_segs: usize,
     /// 已用多字子词的总字数（越大越优）。
@@ -235,7 +239,7 @@ fn infer_by_subword_segmentation(
     dict: &CachedDict,
     index: &CharPinyinIndex,
     runes: &[char],
-) -> Option<(String, u64)> {
+) -> Option<String> {
     let n = runes.len();
     if n < 2 {
         return None;
@@ -245,7 +249,6 @@ fn infer_by_subword_segmentation(
     dp[0] = Some(DpState {
         prev: 0,
         seg: String::new(),
-        seg_mask: 0,
         multi_segs: 0,
         total_mul: 0,
     });
@@ -258,11 +261,10 @@ fn infer_by_subword_segmentation(
         let mut l = 2;
         while i + l <= n {
             let sub: String = runes[i..i + l].iter().collect();
-            if let Some((code, mask)) = infer_whole_word_code(dict, index, &runes[i..i + l], &sub) {
+            if let Some(code) = infer_whole_word_code(dict, index, &runes[i..i + l], &sub) {
                 let next = DpState {
                     prev: i,
                     seg: code,
-                    seg_mask: mask,
                     multi_segs: cur.multi_segs + 1,
                     total_mul: cur.total_mul + l,
                 };
@@ -276,7 +278,6 @@ fn infer_by_subword_segmentation(
         let next = DpState {
             prev: i,
             seg: String::new(),
-            seg_mask: 0,
             multi_segs: cur.multi_segs,
             total_mul: cur.total_mul,
         };
@@ -294,7 +295,6 @@ fn infer_by_subword_segmentation(
     struct Span {
         from: usize,
         code: String,
-        mask: u64,
     }
     let mut spans: Vec<Span> = Vec::new();
     let mut cur = n;
@@ -303,17 +303,16 @@ fn infer_by_subword_segmentation(
         spans.push(Span {
             from: s.prev,
             code: s.seg.clone(),
-            mask: s.seg_mask,
         });
         cur = s.prev;
     }
     spans.reverse();
 
-    let mut b = CodeBuilder::new(n * 4);
+    let mut b = SpacedCode::new(n);
     for sp in &spans {
         if !sp.code.is_empty() {
-            // 多字子词段：段内自带音节边界（如「你好」→ ni|hao），平移到全局位置。
-            b.push_segment(&sp.code, sp.mask);
+            // 多字子词段：段内音节边界就在空格里，直接并入（无需平移）。
+            b.push_segment(&sp.code);
         } else {
             // 单字段：用代表读音（本身即一个音节）
             b.push_syllable(index.representative(runes[sp.from])?);
@@ -336,19 +335,29 @@ mod tests {
         CachedDict::Memory(d)
     }
 
+    /// 扁平码（不关心边界的断言用）。
     fn gen_py(entries: &[(&str, &str, i32)], word: &str) -> Option<String> {
-        gen_py_full(entries, word).map(|(c, _)| c)
+        gen_py_spaced(entries, word).map(|s| s.replace(' ', ""))
     }
 
-    /// 同 `gen_py`，但保留音节边界，供边界相关断言。
-    fn gen_py_full(entries: &[(&str, &str, i32)], word: &str) -> Option<(String, u64)> {
+    /// 引擎的原始产出：**带空格的音节码**。空格即边界，是本模块的真相源。
+    fn gen_py_spaced(entries: &[(&str, &str, i32)], word: &str) -> Option<String> {
         let dict = dict_from(entries);
         let idx = CharPinyinIndex::build(&dict);
         generate_word_pinyin(&dict, &idx, word)
     }
 
+    /// 落库口径：按 `wind_store::wdict::split_spaced_code` 拆成 `(flat, boundary)`，
+    /// 即用户词表里最终存下的形态。
+    fn gen_py_stored(entries: &[(&str, &str, i32)], word: &str) -> Option<(String, u64)> {
+        gen_py_spaced(entries, word).map(|s| wind_store::wdict::split_spaced_code(&s))
+    }
+
     /// 造词须同时产出音节边界——用户自造词的边界从此有来源，不再是「空洞」。
     /// 三条产码路径（整词消歧 / 子词切分 / 逐字兜底）都要带边界。
+    ///
+    /// 断言直接落在**带空格的产出**上：空格表示让切分肉眼可读，也免去了「bitmask 与 code
+    /// 各存一份、可以不一致」的老毛病（`d4084b8` 踩过）。
     #[test]
     fn generate_word_pinyin_carries_boundary() {
         let entries = &[
@@ -360,23 +369,40 @@ mod tests {
             ("qing", "庆", 100),
             ("chongqing", "重庆", 800),
         ];
-        // 整词命中：ni|hao → 起始 {0,2}
-        assert_eq!(gen_py_full(entries, "你好"), Some(("nihao".into(), 0b101)));
-        // 整词消歧（重庆读 chongqing 而非 zhongqing）：chong|qing → 起始 {0,5}
+        // 整词命中
+        assert_eq!(gen_py_spaced(entries, "你好").as_deref(), Some("ni hao"));
+        // 整词消歧（重庆读 chongqing 而非 zhongqing）
         assert_eq!(
-            gen_py_full(entries, "重庆"),
+            gen_py_spaced(entries, "重庆").as_deref(),
+            Some("chong qing")
+        );
+        // 单字：整串一个音节，无内部边界可标
+        assert_eq!(gen_py_spaced(entries, "你").as_deref(), Some("ni"));
+        // 逐字兜底（整词不在词典）
+        assert_eq!(gen_py_spaced(entries, "你重").as_deref(), Some("ni zhong"));
+
+        // 落库形态：key 扁平、边界随 value 存下
+        assert_eq!(
+            gen_py_stored(entries, "你好"),
+            Some(("nihao".into(), 0b101))
+        );
+        assert_eq!(
+            gen_py_stored(entries, "重庆"),
             Some(("chongqing".into(), 0b100001))
         );
-        // 单字：整串一个音节 → {0}
-        assert_eq!(gen_py_full(entries, "你"), Some(("ni".into(), 0b1)));
-        // 逐字兜底（整词不在词典）：ni|zhong → 起始 {0,2}
         assert_eq!(
-            gen_py_full(entries, "你重"),
+            gen_py_stored(entries, "你重"),
             Some(("nizhong".into(), 0b101))
         );
+        // ⚠️ 单音节的 `0b1` 不经文本往返（见 wdict::single_syllable_boundary_is_lossy_by_design）。
+        // 单音节无切分歧义，且 0 在消费端一律是「放行」，不会误杀。
+        assert_eq!(gen_py_stored(entries, "你"), Some(("ni".into(), 0)));
     }
 
-    /// 子词切分路径：段自身是多音节整词时，**段内边界须平移到全局**，不能按「一段一音节」记。
+    /// 子词切分路径：段自身是多音节整词时，段内边界须并入全局，不能把整段当一个音节。
+    ///
+    /// 空格表示下这是纯拼接（`push_segment` 按空格展开）；此前是 bitmask 左移 `base`，
+    /// 漏平移就会把长词的段内边界丢掉。
     #[test]
     fn subword_segmentation_preserves_inner_boundary() {
         let entries = &[
@@ -385,11 +411,29 @@ mod tests {
             ("nihao", "你好", 500),
             ("a", "啊", 100),
         ];
-        // 「你好啊」整词不在词典 → 子词切分：段「你好」(nihao, 段内 ni|hao) + 单字「啊」(a)。
-        // 全局边界须为 ni|hao|a = 起始 {0,2,5}，而非把 nihao 当单个音节记成 {0,5}。
+        // 「你好啊」整词不在词典 → 子词切分：段「你好」(ni hao) + 单字「啊」(a)。
         assert_eq!(
-            gen_py_full(entries, "你好啊"),
+            gen_py_spaced(entries, "你好啊").as_deref(),
+            Some("ni hao a")
+        );
+        assert_eq!(
+            gen_py_stored(entries, "你好啊"),
             Some(("nihaoa".into(), 0b100101))
+        );
+    }
+
+    /// 超长词（拼接 >64 字节）：bitmask 装不下，落库时整体降级为 0；但**带空格的产出
+    /// 本身不受限**——这正是空格表示相对 bitmask 的增量，边界在传输/导出层面得以保全。
+    #[test]
+    fn overlong_word_keeps_spaces_though_mask_degrades() {
+        let entries = &[("zhuang", "装", 100)];
+        let word: String = std::iter::repeat_n('装', 12).collect(); // 12*6=72B
+        let spaced = gen_py_spaced(entries, &word).expect("应能逐字兜底产码");
+        assert_eq!(spaced.split(' ').count(), 12, "12 个音节全部保留");
+        assert_eq!(
+            gen_py_stored(entries, &word).unwrap().1,
+            0,
+            "落库时超 64B 整体降级为无边界（bitmask 的固有上限）"
         );
     }
 

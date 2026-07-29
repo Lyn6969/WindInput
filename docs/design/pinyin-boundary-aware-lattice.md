@@ -454,6 +454,16 @@ Phase 3 初次报告曾称残余 C 类漏网「绝大多数是切分正确的同
 提交信息中记录的未完成工作（仓库里**没有**叫「P3/P4」的东西）：
 
 - Interpretation/SylSpan 抽象；模糊音按真边界逐音节展开；`generate.rs` 的暴力反推可整体删除
+  - **→ 已展开为独立文档 `pinyin-code-domains.md`**，含第四次现场（简拼）、三域模型与分阶段
+    计划。三条要点在此提前标注：① 该抽象**已经存在**于 `shuangpin.rs` 的 `ConvertedSyllable`
+    （字段与设想的 `SylSpan` 一一对应），只服务双拼一家，故是「推广」而非「新造」；
+    ② 简拼证明枢纽选错了——`raw(简拼) → flat` 这个映射**不存在**（`xan` 不对应唯一全拼码），
+    凡需 raw↔flat 往返处正确解法都是绕道音节序列域；
+    ③ **追查简拼时发现用户词库的边界维度整个是死的**——三层断链（wdict 无边界列⇒备份还原
+    清零／`record_to_candidate` 用 `..Default::default()` 丢弃⇒候选恒 0／`abbrev_of_code`
+    重猜），已实测确认，**均未修**。其中 `record_to_candidate` 是本文 §5.1「已知漏洞模式
+    的复发」的**第三次**：P2a 修了 `SystemDictLayer`，`PinyinEngine → CachedDict` 由 P2b
+    补上，而 `StoreUserLayer`/`StoreTempLayer` 这条旁路至今没补
   - **该抽象缺位已第三次致 bug**。前两处是提交信息里点名的 `map_consumed_length`（双拼域）
     与 `map_consumed_over_separators`（全拼 `'` 域）—— 本质都是 flat→raw 映射。第三处是
     **词频记账码**：写入端用 `cand_code`（全拼扁平域 `siyuan`）、读取端用 `state.input_buffer`
