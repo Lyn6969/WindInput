@@ -2709,13 +2709,24 @@ fn test_web_schema_get_config_and_encode_real() {
     assert!(cfg.get("schema").is_some(), "应含 schema 段");
     assert!(cfg.get("engine").is_some(), "应含 engine 段");
     // dict.encode：拼音方案出拼音码；dict.genPinyin 同源。
+    //
+    // 契约是**带空格的音节码**（`ni hao`），让设置页用户看清拼音词库的音节格式。
+    // 原断言只有 `is_string()`，契约从扁平码改成空格码时它照样绿——弱断言等于没有断言。
     let code = coord
         .web_data_rpc(
             "dict.encode",
             &serde_json::json!({ "schemaId": "pinyin", "text": "你好" }),
         )
         .unwrap();
-    assert!(code.is_string(), "encode 应返回字符串");
+    assert_eq!(
+        code.as_str(),
+        Some("ni hao"),
+        "dict.encode 应回带空格的音节码"
+    );
+    let gen_code = coord
+        .web_data_rpc("dict.genPinyin", &serde_json::json!({ "text": "你好" }))
+        .unwrap();
+    assert_eq!(gen_code.as_str(), Some("ni hao"), "dict.genPinyin 同源同形");
 }
 
 #[test]

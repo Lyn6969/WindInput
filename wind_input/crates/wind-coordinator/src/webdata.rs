@@ -376,7 +376,10 @@ impl Coordinator {
             .store
             .as_ref()
             .ok_or_else(|| anyhow::anyhow!("无持久化存储"))?;
-        let mut all = store.search_user_words_prefix(&schema, prefix, 0)?;
+        // 编码前缀须用扁平码（key 是扁平的），用户可能照着列表显示的 `ni hao` 来搜。
+        // 下面的**词条内容**搜索仍用原串——那是拿汉字去匹配 text，与音节空格无关。
+        let (code_prefix, _) = wind_store::wdict::split_spaced_code(prefix);
+        let mut all = store.search_user_words_prefix(&schema, &code_prefix, 0)?;
         // 词条内容搜索：并入 text 包含搜索词的词条（编码前缀 ∪ 词条内容包含，去重）。
         // 前缀项走 redb 有序前缀扫描；内容项需全量扫描，仅在有搜索词时才付出该代价。
         if !prefix.is_empty() {
@@ -423,8 +426,11 @@ impl Coordinator {
             .store
             .as_ref()
             .ok_or_else(|| anyhow::anyhow!("无持久化存储"))?;
+        // 列表显示的是带空格的音节码（见 word_item），用户很可能照着搜。key 是扁平的，
+        // 不拆则 `ni ha` 一条也匹配不到。拆完仍是前缀语义（`ni ha` → `niha`）。
+        let (query, _) = wind_store::wdict::split_spaced_code(query);
         let items: Vec<Value> = store
-            .search_user_words_prefix(&schema, query, limit)?
+            .search_user_words_prefix(&schema, &query, limit)?
             .into_iter()
             .map(word_item)
             .collect();
@@ -504,7 +510,9 @@ impl Coordinator {
             .store
             .as_ref()
             .ok_or_else(|| anyhow::anyhow!("无持久化存储"))?;
-        store.remove_user_word(&schema, code, text)?;
+        // 列表项的 code 带音节空格（见 word_item），而 key 是扁平的——不拆就删不掉。
+        let (code, _) = wind_store::wdict::split_spaced_code(code);
+        store.remove_user_word(&schema, &code, text)?;
         Ok(json!({ "ok": true }))
     }
 
@@ -1076,11 +1084,12 @@ impl Coordinator {
             // 本 RPC 只回 code 给 UI（契约为裸字符串），边界丢弃——入库时由 web_dict_add
             // 的 infer_boundary_for 按「手输码 == 推导码」重新取回。
             let reverse = self.reverse.read().unwrap_or_else(|e| e.into_inner());
+            // 直接回**带空格的音节码**，让用户看清拼音词库的音节格式（与 word_item 同形）。
+            // 安全前提：UI 会把它回填进编码框再提交，而写入侧 normalize_add_code 会拆回
+            // 扁平 key，并把用户打的空格当作**显式声明的切分**采信（优先于推断兜底）。
+            // 逐字反查表回退无音节语义，其结果本就不含空格。
             self.engine_mgr
                 .generate_word_pinyin(schema, text)
-                // 引擎给带空格的音节码；**本 RPC 契约是扁平码**，须去空格再回给 UI——
-                // UI 会把它回填到编码框、原样提交给 dict.add，带空格就会存成带空格的 key。
-                .map(|spaced| spaced.replace(' ', ""))
                 .unwrap_or_else(|| reverse.gen_pinyin(text))
         } else {
             // 与自动造词/快捷加词同一取码入口（码源=码表词库自身，规则=方案声明的公式）。
@@ -1098,14 +1107,13 @@ impl Coordinator {
 
     /// 为词语生成拼音码：优先用拼音引擎词级消歧（活跃方案→"pinyin"方案），
     /// 都无果时回退逐字反查表（pinyin_map.txt）。用于 dict.genPinyin（无方案上下文）。
+    ///
+    /// 同 `dict.encode`：回带空格的音节码，写入侧负责拆回扁平 key。
     fn gen_pinyin_word(&self, text: &str) -> String {
         let active = self.engine_mgr.active_schema_id();
-        // 本入口只需 code（dict.genPinyin 契约为裸字符串），边界丢弃。
         self.engine_mgr
             .generate_word_pinyin(&active, text)
             .or_else(|| self.engine_mgr.generate_word_pinyin("pinyin", text))
-            // 同 dict.encode：契约为扁平码，去掉音节空格再回给调用方。
-            .map(|spaced| spaced.replace(' ', ""))
             .unwrap_or_else(|| {
                 self.reverse
                     .read()
@@ -1939,8 +1947,15 @@ impl Coordinator {
 }
 
 /// UserWordRecord → 前端 UserWordItem。
+/// 用户词 → 设置页列表项。
+///
+/// `code` 输出**带空格的音节码**（`ni hao`），与 `dict.encode` 的出码结果同形，
+/// 让用户直观看到拼音词库的音节格式。存储侧 key 仍是扁平的——设置页把这个串原样回传
+/// 给 add/update/remove 时，由 `normalize_add_code` / `web_dict_remove` 拆回扁平码。
+/// 无边界（旧数据/手输码/五笔码）则不含空格，与改动前一致。
 fn word_item(r: wind_store::user_words::UserWordRecord) -> Value {
-    json!({ "code": r.code, "text": r.text, "weight": r.weight, "enabled": true })
+    let code = wind_store::wdict::join_code_by_boundary(&r.code, r.boundary);
+    json!({ "code": code, "text": r.text, "weight": r.weight, "enabled": true })
 }
 
 /// 稀疏 diff：返回 `cfg` 相对 `base` 的变化项（仅含改动的叶子/键）；无变化返回 None。
@@ -2037,6 +2052,53 @@ mod tests {
                     .cloned()
             })
             .unwrap_or(Value::Null)
+    }
+
+    /// **设置页显示带空格的音节码，存储 key 保持扁平**——两个域在 RPC 边界上的往返契约。
+    ///
+    /// 用户在设置页看到 `ni hao`（`dict.encode` / 列表回显同形），把它原样提交回来时，
+    /// 写入侧必须拆成扁平 key，否则 `niha` 前缀匹配不到这条记录、逐键出候选就废了。
+    /// 反过来 remove/search 收到带空格的串也必须拆，不然删不掉、搜不着。
+    ///
+    /// 顺带确认一条增益：用户打的空格被当作**显式声明的切分**采信，比
+    /// `infer_boundary_for` 的「手输码 == 推导码才借用」兜底更强。
+    #[test]
+    fn dict_spaced_code_display_flat_storage_roundtrip() {
+        let c = coord("spaced_roundtrip");
+        let p = |code: &str| {
+            serde_json::json!({
+                "schemaId": "pinyin", "code": code, "text": "你好", "weight": 500
+            })
+        };
+
+        // 提交带空格的码（模拟用户从「出码」按钮拿到后直接保存）
+        c.web_data_rpc("dict.add", &p("ni hao")).unwrap();
+
+        // 存储侧：key 扁平、边界由空格得来（ni|hao → {0,2}）
+        let store = c.store.as_ref().expect("有 store");
+        let recs = store.get_user_words("pinyin", "nihao").unwrap();
+        assert_eq!(recs.len(), 1, "key 必须是扁平的 nihao，不能带空格");
+        assert_eq!(recs[0].boundary, 0b101, "用户打的空格即显式切分，须被采信");
+
+        // 显示侧：列表与搜索都回带空格的码
+        let items = c
+            .web_data_rpc(
+                "dict.search",
+                &serde_json::json!({ "schemaId": "pinyin", "query": "ni hao" }),
+            )
+            .unwrap();
+        assert_eq!(
+            items[0].get("code").and_then(|v| v.as_str()),
+            Some("ni hao"),
+            "列表回显须与出码同形；搜索词带空格也要能命中（查询侧同样拆）"
+        );
+
+        // 删除：带空格的码同样要能删掉
+        c.web_data_rpc("dict.remove", &p("ni hao")).unwrap();
+        assert!(
+            store.get_user_words("pinyin", "nihao").unwrap().is_empty(),
+            "remove 收到带空格的码须先拆再删"
+        );
     }
 
     #[test]
