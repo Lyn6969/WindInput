@@ -80,6 +80,17 @@ pub trait Engine: Send + Sync {
         None
     }
 
+    /// 反查某条已知 `(code, text)` 在词典里记录的音节边界；查不到或非拼音方案返回 0
+    /// （= 无边界信息，消费方降级）。
+    ///
+    /// 与 [`Self::generate_word_pinyin`] 的区别是**不做推断**：那个从词反推读音、多音字
+    /// 靠权重消歧，可能给出与目标条目不同的码；这里是拿现成的码去词典点查、取真值边界。
+    /// 词频列表要显示音节格式，用的正是这条——词频记录只有 `(code, text)`，没有边界
+    /// （词频表是唯一不带 boundary 的持久层）。
+    fn syllable_boundary_of(&self, _code: &str, _text: &str) -> u64 {
+        0
+    }
+
     /// 运行时启停某扩展词库（按 dict id），**无需重建引擎**：直接翻 composite 中对应
     /// 系统层的 enabled 标志。返回是否命中该层。默认不支持（拼音等返回 false）；
     /// 码表/混输按 `codetable-extra-<id>` 层翻标志。用于扩展词库热插拔。

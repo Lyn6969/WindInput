@@ -1182,10 +1182,43 @@ impl Coordinator {
         let items: Vec<Value> = page
             .into_iter()
             .map(|(code, text, rec)| {
+                let code = self.freq_display_code(&schema, &code, &text);
                 json!({ "code": code, "text": text, "count": rec.count, "lastUsed": rec.last_used })
             })
             .collect();
         Ok(json!({ "items": items, "total": total }))
+    }
+
+    /// 词频列表的编码显示：反查音节边界后渲染成带空格的音节码，与用户词库/临时词库列表同形。
+    ///
+    /// **词频表是唯一不带 boundary 的持久层**（value 仅 `count + last_used`），边界只能反查。
+    /// 三处依次问：系统词典（mmap 点查，最快也最可能命中）→ 用户词表 → 临时词表。
+    /// 都查不到即原样返回扁平码——存量的简拼码记录、码表方案、以及词条已被删除的
+    /// 遗留记录都会落到这里，属正常降级。
+    ///
+    /// 只对**当前页**（≤ limit 条）反查，开销与词频表总规模无关。
+    ///
+    /// 之所以选反查而非给词频表扩容加 boundary 字段：词频是长期积累的数据，扩容只能让
+    /// 此后新写入的记录带边界，用户会看到「新词有空格、老词没有」的混杂列表。
+    fn freq_display_code(&self, schema: &str, code: &str, text: &str) -> String {
+        let mut b = self.engine_mgr.syllable_boundary_of(schema, code, text);
+        if b == 0
+            && let Some(store) = &self.store
+        {
+            let from = |recs: Vec<wind_store::user_words::UserWordRecord>| {
+                recs.into_iter()
+                    .find(|w| w.text == text)
+                    .map(|w| w.boundary)
+                    .filter(|x| *x != 0)
+            };
+            b = store
+                .get_user_words(schema, code)
+                .ok()
+                .and_then(&from)
+                .or_else(|| store.get_temp_words(schema, code).ok().and_then(&from))
+                .unwrap_or(0);
+        }
+        wind_store::wdict::join_code_by_boundary(code, b)
     }
 
     fn web_freq_delete(&self, params: &Value) -> anyhow::Result<Value> {
@@ -1196,7 +1229,9 @@ impl Coordinator {
             .store
             .as_ref()
             .ok_or_else(|| anyhow::anyhow!("无持久化存储"))?;
-        store.delete_freq(&schema, code, text)?;
+        // 列表项的 code 带音节空格（见 freq_display_code），而词频表 key 是扁平的。
+        let (code, _) = wind_store::wdict::split_spaced_code(code);
+        store.delete_freq(&schema, &code, text)?;
         Ok(json!({ "ok": true }))
     }
 
@@ -2174,6 +2209,69 @@ mod tests {
                 .is_empty(),
             "remove 收到带空格的码须先拆再删"
         );
+    }
+
+    /// 词频列表的编码显示带音节空格 —— 边界靠**反查**，因为词频表自己不存 boundary。
+    ///
+    /// 三处来源依次问：系统词典 → 用户词表 → 临时词表。这里用后两者（无真实词库时
+    /// 系统词典为空，正好把反查降级链走一遍）。查不到的记录原样保持扁平，不得报错。
+    ///
+    /// 同时锁住 freq.delete：列表给的是带空格的 code，不拆就删不掉。
+    #[test]
+    fn freq_list_shows_spaced_code_via_boundary_lookup() {
+        let c = coord("freq_spaced");
+        let store = c.store.as_ref().expect("有 store");
+        // 用户词提供边界：ni|hao
+        store
+            .add_user_word("pinyin", "nihao", "你好", 500, 0b101)
+            .unwrap();
+        // 临时词提供边界：hao|ya
+        store
+            .learn_temp_word("pinyin", "haoya", "好呀", 500, 0b1001)
+            .unwrap();
+        // 无处可查 → 保持扁平（存量简拼记录/已删词条的遗留记录都是这种）
+        store.record_freq("pinyin", "nihao", "你好").unwrap();
+        store.record_freq("pinyin", "haoya", "好呀").unwrap();
+        store.record_freq("pinyin", "wubian", "无边").unwrap();
+
+        let r = c
+            .web_data_rpc(
+                "freq.listPaged",
+                &serde_json::json!({ "schemaId": "pinyin" }),
+            )
+            .unwrap();
+        let items = r.get("items").and_then(|v| v.as_array()).unwrap().clone();
+        let code_of = |text: &str| -> String {
+            items
+                .iter()
+                .find(|x| x.get("text").and_then(|t| t.as_str()) == Some(text))
+                .and_then(|x| x.get("code").and_then(|c| c.as_str()))
+                .unwrap_or_default()
+                .to_string()
+        };
+
+        assert_eq!(code_of("你好"), "ni hao", "边界应从用户词表反查到");
+        assert_eq!(code_of("好呀"), "hao ya", "边界应从临时词表反查到");
+        assert_eq!(
+            code_of("无边"),
+            "wubian",
+            "三处都查不到 → 保持扁平码，不得报错"
+        );
+
+        // 删除：列表给的是带空格的 code
+        c.web_data_rpc(
+            "freq.delete",
+            &serde_json::json!({ "schemaId": "pinyin", "code": "ni hao", "text": "你好" }),
+        )
+        .unwrap();
+        let r2 = c
+            .web_data_rpc(
+                "freq.listPaged",
+                &serde_json::json!({ "schemaId": "pinyin" }),
+            )
+            .unwrap();
+        let left = r2.get("total").and_then(|v| v.as_u64()).unwrap();
+        assert_eq!(left, 2, "带空格的 code 须先拆再删，否则删不掉");
     }
 
     /// 词频列表的编码搜索同样要能命中中段（与用户词库同款，两处是各自独立的实现）。

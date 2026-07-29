@@ -1392,6 +1392,16 @@ impl Engine for PinyinEngine {
         EngineType::Pinyin
     }
 
+    /// 反查 `(code, text)` 在词典里的音节边界（点查，不做推断）。查不到返回 0。
+    fn syllable_boundary_of(&self, code: &str, text: &str) -> u64 {
+        self.dict
+            .search_with_boundary(code)
+            .into_iter()
+            .find(|h| h.text == text)
+            .map(|h| h.boundary)
+            .unwrap_or(0)
+    }
+
     /// 为词语生成带空格的全拼音节码（多音字按词典权重消歧）。
     /// 单字读音索引按词典懒构建并缓存。含无读音字符时返回 `None`。
     fn generate_word_pinyin(&self, word: &str) -> Option<String> {

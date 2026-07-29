@@ -108,6 +108,28 @@ fn full_pinyin_still_returns_same_code_single_syllable_word() {
     assert!(t.contains(&"西安".to_string()), "也应出「西安」: {t:?}");
 }
 
+/// `syllable_boundary_of` 是**点查取真值，不做推断** —— 这是它与
+/// `generate_word_pinyin` 的分水岭。
+///
+/// 夹具里 `xian` 一个码下挂着两个切分不同的词（西安 xi|an、先 xian），只有按
+/// `(code, text)` 精确定位才能给对答案；从词反推读音的那条路做不到这件事。
+/// 词频列表靠它显示音节格式——词频表只有 `(code, text)`，自己不存 boundary。
+#[test]
+fn boundary_lookup_is_exact_not_inferred() {
+    let e = engine(fixture("blookup"));
+
+    assert_eq!(e.syllable_boundary_of("xian", "西安"), 0b101, "xi|an");
+    assert_eq!(
+        e.syllable_boundary_of("xian", "先"),
+        0b1,
+        "同一个码下的另一个词，切分不同，必须按 text 区分"
+    );
+    assert_eq!(e.syllable_boundary_of("xiai", "喜爱"), 0b101);
+    // 查不到一律 0（= 无边界信息，消费方降级为扁平显示），不得瞎猜
+    assert_eq!(e.syllable_boundary_of("xian", "不存在的词"), 0);
+    assert_eq!(e.syllable_boundary_of("meiyouzhege", "西安"), 0);
+}
+
 /// 夹具自检：确认走的是 mmap 路径（简拼表只有 mmap 词典才有）。
 /// 若哪天 wdat-only 模式变了、夹具退化成内存词典，简拼恒空、上面几个断言会变得没有意义。
 #[test]
