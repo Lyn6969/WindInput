@@ -74,6 +74,50 @@ fn user_word_boundary_reaches_candidate() {
     );
 }
 
+/// **简拼须按真值边界投影声母，不得用 `maximum_match` 现猜**。
+///
+/// 「西安宁」真值切分 `xi|an|ning` ⇒ 简拼 `xan`。而 `maximum_match` 会把
+/// `xianning` 切成 `xian|ning` ⇒ 猜出 `xn`。重猜的后果是**既漏又错**：
+/// 真简拼 `xan` 打不出来，假简拼 `xn` 反而命中。
+///
+/// ⚠️ **本用例必须用歧义切分码**。仓库原有的两个简拼测试用
+/// `cainiaoyizhan` / `lanshoubing`——`maximum_match` 恰好猜对，测不出这个缺陷，
+/// 是「测试样本集体避开失效分支」的典型。
+#[test]
+fn user_word_abbrev_uses_true_boundary_not_maximum_match() {
+    let Some(dir) = data_dir() else {
+        eprintln!("跳过：拼音词库不存在");
+        return;
+    };
+    const B: u64 = 0b10101; // xi|an|ning
+    let with = manager(&dir, "abbr_on", &[("xianning", "西安宁", 5000, B)]);
+    let without = manager(&dir, "abbr_off", &[("xianning", "西安宁", 5000, 0)]);
+
+    let hit = |m: &EngineManager, q: &str| {
+        m.convert(q, 30)
+            .candidates
+            .iter()
+            .any(|c| c.text == "西安宁")
+    };
+
+    assert!(hit(&with, "xan"), "真值边界下 xi|an|ning 的简拼应为 xan");
+    assert!(
+        !hit(&with, "xn"),
+        "xn 是 maximum_match 猜的 xian|ning 的投影，不该再命中"
+    );
+
+    // 对照组 = 修复前的行为，方向恰好相反
+    assert!(
+        !hit(&without, "xan"),
+        "无边界只能退回 DAG 猜，真简拼打不出（这正是修复前的现场）"
+    );
+    assert!(hit(&without, "xn"), "无边界时反而是假简拼命中");
+
+    // 全拼整串不受影响
+    assert!(hit(&with, "xianning"));
+    assert!(hit(&without, "xianning"));
+}
+
 /// **用户长词打 2 个音节即可上浮**——这正是边界接通后才拿得到的行为。
 ///
 /// 「大菠萝哥」4 音节，输入 `dabo`（2 音节）：

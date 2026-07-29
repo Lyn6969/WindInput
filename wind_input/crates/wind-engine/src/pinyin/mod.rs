@@ -307,11 +307,30 @@ impl PinyinEngine {
         syllables
     }
 
-    /// 由全拼码现算简拼（各音节声母拼接），供用户/临时造词层动态简拼匹配。
+    /// 由全拼码取简拼（各音节声母拼接），供用户/临时造词层动态简拼匹配。
     /// 系统词库规模大，离线预建 AbbrevSection 索引（性能考量）；用户词库规模小，
-    /// 现场切分+取声母足够快，无需为其单独建索引/维护写入时的双写一致性。
+    /// 现场取声母足够快，无需为其单独建索引/维护写入时的双写一致性。
+    ///
+    /// **优先采信候选自带的 `boundary`（音节起始字节位 bitmask）**——那是造词/词库解析
+    /// 期留下的真值，直接取这些位置的字符即得声母。仅当 `boundary == 0`（旧数据、
+    /// 手输码、五笔码）才退回 DAG 切分去猜。
+    ///
+    /// ⚠️ 重猜在**歧义切分码**上必错，且既漏又错。用户词「西安宁」真值 `xi|an|ning`
+    /// 应给 `xan`，而 `maximum_match` 切成 `xian|ning` 给出 `xn` —— 真简拼打不出、
+    /// 假简拼反而命中。这是「`maximum_match` 不是真相」的第二次现场（第一次是整句
+    /// boundary，见 `pinyin_multipath.rs`：必须用解码器实际走的那条路径）。
+    ///
     /// 切分未完全覆盖 code（残码/非法拼音）时返回 None，不参与简拼匹配。
-    fn abbrev_of_code(&self, code: &str) -> Option<String> {
+    fn abbrev_of_code(&self, code: &str, boundary: u64) -> Option<String> {
+        if boundary != 0 {
+            // bit 位是**字节**偏移；拼音码为 ASCII，char_indices 的下标即字节位。
+            return Some(
+                code.char_indices()
+                    .filter(|(i, _)| *i < 64 && (boundary >> i) & 1 == 1)
+                    .map(|(_, ch)| ch)
+                    .collect(),
+            );
+        }
         let syllables = self.segment_with_separators(code);
         let consumed: usize = syllables.iter().map(|s| s.len()).sum();
         if syllables.is_empty() || consumed != code.len() {
@@ -1074,14 +1093,14 @@ impl Engine for PinyinEngine {
 
             // 简拼匹配（用户/临时造词层）：用户词写入时只存全拼码，不像系统词库那样离线
             // 预建 AbbrevSection——规模小，现算即可（枚举该 schema 下全部用户/临时词，
-            // 现场切分各词全拼码取声母比对，见 abbrev_of_code）。natural_order 对齐
+            // 按各词自带的音节边界取声母比对，见 abbrev_of_code）。natural_order 对齐
             // step5 系统简拼候选，同样排在全拼之后。
             if self.config.enable_abbrev && AbbrevMatcher::is_abbreviation(query, trie) {
                 for mut c in store_dm.search_prefix("", 0) {
                     if c.text.is_empty() || candidates.iter().any(|x| x.text == c.text) {
                         continue;
                     }
-                    if self.abbrev_of_code(&c.code).as_deref() != Some(query) {
+                    if self.abbrev_of_code(&c.code, c.boundary).as_deref() != Some(query) {
                         continue;
                     }
                     c.source = CandidateSource::Pinyin;
