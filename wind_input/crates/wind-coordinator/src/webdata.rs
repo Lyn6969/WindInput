@@ -3323,7 +3323,8 @@ mod tests {
         assert_eq!(py_cands[0].text, "好", "拼音候选应按 pinyin 词频提权");
     }
 
-    /// P2d Task 4：混输自动造词按"全段同源"路由——全段同源落该源归属，混源跳过。
+    /// P2d Task 4：混输自动造词按"全段同源"路由——全段拼音落 pinyin 归属，混源跳过，
+    /// 全段码表同样跳过（拼接码无意义 + 与 auto_phrase 重复，见下方该段注释）。
     #[test]
     fn mixed_learn_phrase_same_source_only() {
         use wind_candidate::CandidateSource;
@@ -3391,7 +3392,17 @@ mod tests {
             );
         }
 
-        // 全段码表 → 临时词落 primary "ct_test"。
+        // 全段码表 → **不造词**（本断言已反转，理由见下）。
+        //
+        // ① 语义与本文件下方已移除的 `codetable_learn_phrase_ignores_source` 完全同源：码表词组
+        //    编码须按方案 `[[encoder.rules]]` 从各字**全码**取位（五笔「你好」= wqvb），各段码
+        //    拼接（aa + bb = "aabb"）得到的串在词库里查不到 —— 正是自动造词历史上「完全不工作」
+        //    的根因之一。码表侧造词已迁至 `crate::auto_phrase` 连续单字缓冲。
+        // ② 它当时测的是**现实中不可达**的分支：码表候选 `consumed_length` 恒 0 ⇒ 永不 partial
+        //    ⇒ 单段即被 `reset_pinyin_composition` 清掉，混输下永远凑不满 2 段全码表。直到混输
+        //    超码长回捞的前缀候选开始如实标注 `consumed_length`（见 `mixed/engine.rs` 的
+        //    `convert_overflow`）这条路才第一次可达 —— 而可达之后产出的正是 ① 里那种错码，
+        //    还会与 auto_phrase 对同一次输入重复造词。故 `learn_phrase_on_commit` 显式跳过。
         {
             let mut st = c.state.lock().unwrap();
             st.committed_segs.clear();
@@ -3411,15 +3422,13 @@ mod tests {
             ));
             c.learn_phrase_on_commit(&st);
         }
-        let ct_words = store.get_temp_words("ct_test", "aabb").unwrap();
-        let gongren = ct_words
-            .iter()
-            .find(|w| w.text == "工人")
-            .expect("全段码表应落 primary ct_test 临时词");
-        assert_eq!(
-            gongren.boundary, 0,
-            "码表段无音节概念 → 整词 boundary 应为 0（消费方据此降级回 DAG）"
-        );
+        for schema in ["ct_test", "pinyin", "mx_test"] {
+            assert!(
+                store.get_temp_words(schema, "aabb").unwrap().is_empty(),
+                "全段码表不应落任何临时词（{schema}）——拼接码 aabb 在码表里查不到，\
+                 且码表侧造词归 auto_phrase 连续单字缓冲管"
+            );
+        }
     }
 
     // 【已移除】`codetable_learn_phrase_ignores_source`（P2d Task 4 回归）

@@ -235,12 +235,46 @@ impl MixedEngine {
             .is_some_and(|c| c.consumed_length == 0 || c.consumed_length >= input_len)
     }
 
-    /// 超码长时**码表前 N 码是否比拼音更有话说**：⓪ `pinyin_only_overflow` 的例外口，
-    /// 顶码（`handle_top_code`）与候选装配（`convert_overflow`）共用同一判据。两条缺一不可：
+    /// 英文是否**主张**这个超码长串：英文词库里有**精确整串**词条（`github` 是完整英文词）。
+    ///
+    /// 与 [`Self::pinyin_claims_overflow`] 对称 —— 超码长归属问的是「谁解释得了整串」。码表只
+    /// 解释得了前 N 码（`gith`=不算），英文却吃得下整个 `github`，归属就不该判给码表。
+    ///
+    /// ⚠️ 判据刻意用**精确整串**而非 `english_candidates` 的「有候选（含前缀）」：英文库 21918 条，
+    /// 前缀面极大，按前缀判会让一堆恰好撞上某英文词开头的五笔全码平白丢掉归属。也不走
+    /// `english_candidates` 取候选再比对 —— 那会被 `max_candidates` 截断，精确词未必在前几条。
+    ///
+    /// ⚠️ **不读 `auto_commit_block_on_english`**：那是**上屏否决**开关（出厂 `false`），本判据决定的
+    /// 是**候选归属/排序**，两者正交。若受其支配，默认配置的用户照样会看到 `github` 首选是「不算」。
+    fn english_claims_overflow(&self, input: &str) -> bool {
+        let Some(eng) = &self.english else {
+            return false;
+        };
+        // 英文词库 code 列已小写化（`type = "english"`），查询侧同口径小写。
+        eng.has_full_input_match(&input.to_lowercase())
+    }
+
+    /// 超码长时**码表前 N 码是否比拼音/英文更有话说**：⓪ `pinyin_only_overflow` 的例外口，
+    /// 顶码（`handle_top_code`）与候选装配（`convert_overflow`）共用同一判据。四条缺一不可：
     /// - 前 N 码前缀恰是码表**精确全码**（`yijg` = 唯一编码「就是」）——只有前缀确实成码才值得
     ///   让码表回来；否则捞回的全是前缀补全候选，纯属刷屏。拼音打错一个字母（`nihxo`）也靠这条
     ///   兜住：`nihx` 在五笔没有精确全码 → 仍归拼音，不会被五笔顶码截胡；
-    /// - 拼音并不主张这一串（见 [`Self::pinyin_claims_overflow`]）。
+    /// - 拼音并不**主张**这一串（见 [`Self::pinyin_claims_overflow`]）；
+    /// - 英文并不**主张**这一串（见 [`Self::english_claims_overflow`]）——开着英文词库时 `words`
+    ///   的前 4 码 `word` 若在码表成词，码表精确 `+1e7` 会把英文精确档 `+500K` 整层压掉；
+    /// - 拼音至少**交得出候选**（见 [`Self::pinyin_has_any`]）——这条与上面第二条方向相反，
+    ///   两头夹出「还在中文语境里、但拼音接管不了整串」这个窄带。
+    ///
+    /// ⚠️ **前三条的判据是「谁解释得了整串」，第四条问的却是「这串还算不算中文」**，别把它们当成
+    /// 一类。真机回归 `github`（英文词库关着）四条里前三条全放行：`gith` 在五笔主库确是精确全码
+    /// 「不算」（1822）、`gi` 不成音节所以拼音主张不了、英文引擎压根不在场 —— 于是归属判给码表，
+    /// 首选变成「不算」，空格上屏还把整个缓冲吃掉。可这串连开头都解释不出一个字，判给码表毫无
+    /// 依据（对比 `yijga` 至少出得来「以」）。第四条即为此而设，落回 249f486 之前的行为：候选
+    /// 保持为空，用户空格/回车直接上屏原码。
+    ///
+    /// ⚠️ 第四条对**顶码通路无影响**：⓪ 的判据是 `pinyin_only_overflow && has_pinyin && !ct_owns`，
+    /// `has_pinyin=false` 时整条本就不成立。顶码侧的英文场景另由 ③ `auto_commit_block_on_english`
+    /// 负责（出厂 `false`），两者是不同维度，勿混。
     ///
     /// ⚠️ 判据落在**前 N 码前缀**而非整串，这是本函数存在的全部理由：`convert_overflow` 原有的
     /// 逃生口 `has_full_input_match(input) || has_longer_code(input)` 问的是**整串**，而定长码表
@@ -251,8 +285,28 @@ impl MixedEngine {
         if self.max_code_len == 0 {
             return false;
         }
+        if self.english_claims_overflow(input) {
+            return false;
+        }
+        if !self.pinyin_has_any(input) {
+            return false;
+        }
         let prefix: String = input.chars().take(self.max_code_len).collect();
         self.primary.has_full_input_match(&prefix) && !self.pinyin_claims_overflow(input)
+    }
+
+    /// 拼音对这串**交得出候选**（哪怕只解释开头一小截）——「这串还在中文语境里」的最低证据。
+    ///
+    /// 与 [`Self::pinyin_claims_overflow`] 是**方向相反**的一对：那个问「拼音够不够格接管整串」
+    /// （够格就别让码表插手），这个问「拼音是不是连一个字都读不出来」（读不出来说明这串根本不是
+    /// 中文码，码表也别硬解释）。`yijga` 出得来「以」→ 归码表；`github` 什么都出不来 → 谁都不接，
+    /// 候选留空让用户上屏原码。
+    fn pinyin_has_any(&self, input: &str) -> bool {
+        self.secondary.as_ref().is_some_and(|sec| {
+            sec.convert(input, 1)
+                .map(|r| !r.candidates.is_empty())
+                .unwrap_or(false)
+        })
     }
 
     /// 码表候选按混输策略提权（短语独立档 +1M / 精确 +boost / 前缀补全 +500K）。
@@ -417,6 +471,20 @@ impl MixedEngine {
                         .candidates;
                     for c in &mut pre {
                         c.is_exact_code = false;
+                        // ★ 这条候选只解释得了**前 N 码**，必须如实标注消费长度。不标（码表候选
+                        // 恒 0）的话协调器 `commit_selected` 的
+                        // `partial = consumed > 0 && consumed < total` 恒为 false ⇒ 按「消费整串」
+                        // 处理，选中即把没解释的尾码一并吃掉（`yijga` 选「就是」→ 尾巴上的 `a`
+                        // 凭空消失；`github` 选「不算」→ `ub` 消失）。
+                        //
+                        // ⚠️ 这是**码表候选带 `consumed_length` 的唯一出口**。协调器侧有两处判据
+                        // 原本依赖「码表恒 0 ⇒ 永不部分匹配」这个不变量，已随本改动一并对齐：
+                        // `build_candidates` 的分段续转（改看最后一段来源）与
+                        // `learn_phrase_on_commit`（混输下跳过码表段）。
+                        //
+                        // 字节长度：协调器按字节切缓冲（`input_buffer[consumed..]` +
+                        // `is_char_boundary`），而输入缓冲在此恒为 ASCII 码字符，与字符数相等。
+                        c.consumed_length = prefix.len();
                     }
                     self.boost_codetable(&mut pre, &prefix);
                     pre

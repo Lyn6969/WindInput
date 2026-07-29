@@ -454,6 +454,13 @@ impl Coordinator {
             if segs.iter().any(|(_, _, _, s, _)| *s != first) {
                 return; // 混源：跳过自动造词
             }
+            // 全段码表：混输超码长回捞的前缀候选现在带 `consumed_length`（见 `mixed/engine.rs`
+            // 的 `convert_overflow`），码表首次进得了分段态——但本路径是**拼音专属**的，码表侧
+            // 造词由 `auto_phrase` 连续单字缓冲负责，在此放行会对同一次输入重复造词。何况这里
+            // 拼出来的码是「前 N 码 + 尾码」的机械拼接（`yijg` + `a`），本就不是一个有意义的词条。
+            if first == CandidateSource::CodeTable {
+                return;
+            }
             match self.engine_mgr.write_data_schema_id(&active, first) {
                 Some(sid) => sid,
                 None => return, // 无法归因来源

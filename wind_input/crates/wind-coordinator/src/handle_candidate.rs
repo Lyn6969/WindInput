@@ -198,7 +198,11 @@ impl Coordinator {
         let input_len = code.len();
         // 取每个"消费整串"候选的词频记录。分段子候选（consumed_length < 整串，如「nihao」里的「你」
         // 只消费「ni」）的词频归属其自身前缀码，不能被整串码的历史计数上浮——否则单字会浮到整句
-        // 「你好」之上。consumed_length==0 表示引擎未标注（码表型），视为整串匹配。
+        // 「你好」之上。consumed_length==0 表示引擎未标注，视为整串匹配。
+        //
+        // 注：码表候选**大多**为 0，但已非全部——混输超码长回捞的前缀候选如实标注（见
+        // `mixed/engine.rs` 的 `convert_overflow`），故它与拼音分段子候选同样不参与本次重排。
+        // 这是有意的：它只解释得了前 N 码，让它靠历史计数浮到消费整串的候选之上并不正确。
         //
         // ⚠️ 查询码必须用 `cand_code`（候选存储码 = **全拼扁平域**），不能用 `code`（输入缓冲
         // = **击键域**）。二者在下列输入下不相等，用错即恒 miss、词频功能整体失效：
@@ -407,12 +411,22 @@ impl Coordinator {
         state: &mut State,
         limit: usize,
     ) -> (usize, InputOutcome) {
-        // 分段上屏进行中（committed 前缀非空 ⟺ 来自拼音选词——五笔候选 consumed_length=0
-        // 永不部分匹配）：剩余编码强制按混输方案的拼音子方案转换，避免混输让五笔抢首选
-        // （你↑选后 hao→虚）。拼音方案 id 取当前混输方案的 [engine.mixed].secondary_schema
-        // （如 wubi86_pinyin → "pinyin"）。注意不用全局 primary_pinyin——那是给「临时拼音↔
-        // 临时双拼」切换用的，对混输不适用。
-        let pinyin_schema = if !state.committed_text.is_empty() {
+        // 分段上屏进行中**且最后一段来自拼音选词**：剩余编码强制按混输方案的拼音子方案转换，
+        // 避免混输让五笔抢首选（你↑选后 hao→虚）。拼音方案 id 取当前混输方案的
+        // [engine.mixed].secondary_schema（如 wubi86_pinyin → "pinyin"）。注意不用全局
+        // primary_pinyin——那是给「临时拼音↔临时双拼」切换用的，对混输不适用。
+        //
+        // ⚠️ 判据曾写作 `!state.committed_text.is_empty()`，理由是「committed 前缀非空 ⟺ 来自
+        // 拼音选词——五笔候选 consumed_length=0 永不部分匹配」。**该等价关系已不成立**：混输
+        // 超码长回捞的码表前缀候选现在如实带 `consumed_length`（见 `mixed/engine.rs` 的
+        // `convert_overflow`），码表也会进入分段态。沿用旧判据的话，`yijga` 选「就是」后剩下的
+        // `a` 会被强制按拼音解释，用户看到五笔码出拼音候选。改看**最后一段的来源**：谁刚被选走，
+        // 剩余编码就大概率还是谁的。
+        let last_seg_is_pinyin = state
+            .committed_segs
+            .last()
+            .is_some_and(|(_, _, _, src, _)| *src == CandidateSource::Pinyin);
+        let pinyin_schema = if last_seg_is_pinyin {
             let active = self.engine_mgr.active_schema_id();
             self.engine_mgr
                 .schema_merged(&active)

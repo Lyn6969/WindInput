@@ -2604,6 +2604,113 @@ fn test_mixed_pinyin_supplement() {
     );
 }
 
+/// ★ 混输**超码长**回捞的码表前缀候选只解释得了前 N 码，选中时必须只消费那 N 码。
+///
+/// `yijg` 是五笔全码「就是」，再打一个 `a` 即超码长（五笔 4 码封顶）。引擎的
+/// `codetable_owns_overflow` 把「就是」回捞到首位（拼音的 `jg` 不成音节，主张不了这串），
+/// 此时它的 `code` 只覆盖 `yijg` —— 选中后 `a` 必须留在缓冲里继续参与输入。
+///
+/// 修复前码表候选 `consumed_length` 恒 0 ⇒ 协调器 `commit_selected` 的
+/// `partial = consumed > 0 && consumed < total` 恒为 false ⇒ 走「消费整串」分支整体上屏，
+/// 尾码 `a` 凭空消失。同一条链路上 `github` 打出的是更刺眼的版本（首选「不算」+ 吃掉 `ub`）。
+#[test]
+fn test_mixed_overflow_prefix_candidate_consumes_only_prefix() {
+    if !has_schemas() {
+        return;
+    }
+    let coord = Coordinator::new_headless(config_mixed(), Some(&data_dir()));
+    for c in "yijga".chars() {
+        press_letter(&coord, c);
+    }
+    let texts = coord.debug_page_texts();
+    assert_eq!(
+        texts.first().map(String::as_str),
+        Some("就是"),
+        "前置：回捞的码表候选应在首位，否则下面选中的不是被测候选。实际: {:?}",
+        &texts[..texts.len().min(5)]
+    );
+
+    // 空格选首选：应留在组合区（分段），而非整体上屏。
+    let act = coord.handle_key_event(&key_event(0x20, EVENT_KEY_DOWN));
+    match &act {
+        KeyAction::UpdateComposition { text, .. } => assert_eq!(
+            text, "就是a",
+            "「就是」应进组合区前缀、尾码 a 留在缓冲继续输入"
+        ),
+        other => panic!("不应整串上屏（那会吃掉尾码 a），实际: {other:?}"),
+    }
+}
+
+/// ★ 真机回归（用户报告）：混输 + 英文词库下打 `github`，首候选变成五笔词「不算」，
+/// 空格上屏还把尾码 `ub` 一并吃掉。
+///
+/// 成因是超码长归属判据只问了「拼音主张不主张」：`github` 前 4 码 `gith` 在五笔主库确是精确
+/// 全码「不算」，而 `gi` 不成音节 ⇒ 拼音交不出候选，于是归属判给码表，码表精确 `+1e7` 把英文
+/// 精确档 `+500K` 整层压掉。判据补上「英文主张不主张」后归属回到英文。
+///
+/// 配置取用户的真实场景：`enable_english` + `auto_commit_block_on_english` 都开（后者不开的话
+/// 第 5 键 `githu` 就被顶码顶走了，那是另一条通路，见 `mixed_overflow_codetable_claim.rs` 的
+/// `topcode_on_english_word_is_still_governed_by_the_english_guard`）。
+#[test]
+fn test_mixed_english_word_keeps_overflow_ownership() {
+    if !has_schemas() {
+        return;
+    }
+    let mut cfg = config_mixed();
+    cfg.schema.mix.enable_english = true;
+    cfg.schema.mix.auto_commit_block_on_english = true;
+    let coord = Coordinator::new_headless(cfg, Some(&data_dir()));
+    for c in "github".chars() {
+        press_letter(&coord, c);
+    }
+    let texts = coord.debug_page_texts();
+    assert!(
+        !texts.iter().any(|t| t == "不算"),
+        "码表前缀候选（只解释得了 gith）不得夺走 github 的归属，实际: {:?}",
+        &texts[..texts.len().min(6)]
+    );
+    assert!(
+        texts.iter().any(|t| t.eq_ignore_ascii_case("github")),
+        "英文候选 GitHub 应在列，实际: {:?}",
+        &texts[..texts.len().min(6)]
+    );
+}
+
+/// ★ 真机回归（用户报告的原始配置：**英文词库关着**，即出厂默认）：打 `github` 首候选是五笔词
+/// 「不算」，空格上屏还把整个缓冲吃掉。
+///
+/// 此时英文引擎不在场，前三条归属判据全部放行（`gith` 是精确全码、`gi` 不成音节 ⇒ 拼音主张
+/// 不了、英文缺席），全靠第四条「拼音须交得出候选」兜住：`github` 拼音一条候选都出不来，
+/// 说明它连开头都不在中文语境里，码表没有依据主张它。候选保持为空，空格直接上屏原码。
+///
+/// 对照 `test_mixed_overflow_prefix_candidate_consumes_only_prefix`：`yijga` 的拼音出得来「以」，
+/// 码表照常主张 —— 两条用例只差「拼音交不交得出候选」这一个变量。
+#[test]
+fn test_mixed_non_chinese_overflow_falls_back_to_raw_code() {
+    if !has_schemas() {
+        return;
+    }
+    // 出厂默认即 enable_english=false，此处不额外开启，就是用户的配置。
+    let coord = Coordinator::new_headless(config_mixed(), Some(&data_dir()));
+    for c in "github".chars() {
+        press_letter(&coord, c);
+    }
+    let texts = coord.debug_page_texts();
+    assert!(
+        texts.is_empty(),
+        "github 不该被五笔前 4 码强行解释，候选应为空，实际: {:?}",
+        &texts[..texts.len().min(6)]
+    );
+
+    let act = coord.handle_key_event(&key_event(0x20, EVENT_KEY_DOWN));
+    match &act {
+        KeyAction::InsertText { text, .. } => {
+            assert_eq!(text, "github", "空码空格应上屏原码全串")
+        }
+        other => panic!("应上屏原码 github，实际: {other:?}"),
+    }
+}
+
 #[test]
 fn test_mode_toggle_via_shift() {
     if !has_schemas() {

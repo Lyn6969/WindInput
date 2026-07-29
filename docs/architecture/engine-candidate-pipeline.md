@@ -365,9 +365,36 @@ should_clear = ct_should_clear && !(auto_commit_block_on_pinyin && (has_pinyin |
 
 `input_len > max_code_len` 时按 `pinyin_only_overflow` 分流（config.toml 默认 true）：
 
-- **true（默认）**：仅查拼音 + 英文。长码特例：整串在码表有精确匹配或更长后继
-  （`has_full_input_match || has_longer_code`）→ 追加码表候选并把拼音归一化降档。
+- **true（默认）**：仅查拼音 + 英文。两个互补的码表回捞口，任一成立即把码表候选并回来
+  （拼音同时归一化降档）：
+  - 长码特例 `has_full_input_match(input) || has_longer_code(input)`：问的是**整串**，只有码长
+    可变的码表够得着 —— 五笔这类定长码表恒假（4 码封顶，不存在 5 码词条）。
+  - `codetable_owns_overflow(input)`：问的是**前 N 码**，这才是定长码表的逃生口，与顶码 ⓪ 共用。
 - **false**：码表取前 N 码（+ 长码特例的整串候选）+ 拼音整串，统一加权混合竞争。
+
+#### `codetable_owns_overflow` 的四条判据（缺一不可）
+
+| # | 判据 | 拦住的场景 |
+|---|---|---|
+| 1 | 前 N 码前缀是码表**精确全码** | 拼音打错一个字母（`nihxo`：`nihx` 无全码）不被五笔顶码截胡 |
+| 2 | 拼音**主张不了**整串（`pinyin_claims_overflow`） | `youyo` = you + `yo` 还没打完 ⇒ 归拼音（`youyoud`→「变凉」回归） |
+| 3 | 英文**主张不了**整串（`english_claims_overflow`：有精确整串词条） | 开着英文词库时 `words` 首选被码表 `+1e7` 压掉英文 `+500K` |
+| 4 | 拼音至少**交得出候选**（`pinyin_has_any`） | `github`：连开头都读不出一个字，判给码表毫无依据 |
+
+前三条问的都是「谁解释得了整串」，第 4 条问的是「这串还算不算中文」，别混为一类。第 2 与第 4 条
+方向相反，两头夹出「还在中文语境里、但拼音接管不了整串」这个窄带 —— `yijga` 出得来「以」却只
+解释 2/5，正落在带内。
+
+判据 3、4 命中时候选保持为空（无英文库的情况下），用户空格/回车直接上屏原码，这是 249f486
+之前的行为。判据 4 对**顶码通路无影响**：⓪ 是 `pinyin_only_overflow && has_pinyin && !ct_owns`，
+`has_pinyin=false` 时整条本就不成立；顶码侧的英文场景另由 ③ `auto_commit_block_on_english` 管。
+
+回捞的前缀候选有两处归一化，都因为它**只解释得了前 N 码**：
+- `is_exact_code = false`（下游一律以完整输入为准，见 §7.5 / `freq_tier`）；
+- `consumed_length = 前 N 码长度` —— **码表候选带 consumed_length 的唯一出口**。不标的话协调器
+  `commit_selected` 的 `partial = consumed > 0 && consumed < total` 恒为 false ⇒ 按「消费整串」
+  上屏，选中即把尾码吃掉（`yijga` 选「就是」→ `a` 消失）。协调器侧两处依赖「码表恒 0」的判据
+  已随之对齐，见 §7.6 分段上屏接力与 `learn_phrase_on_commit`。
 
 ### 7.5 顶码/满码上屏与显示一致（协调器侧配合）
 
@@ -386,10 +413,14 @@ should_clear = ct_should_clear && !(auto_commit_block_on_pinyin && (has_pinyin |
 
 - **来源提示**：`show_source_hint`（默认关）给拼音候选 comment 加「拼」前缀（`add_source_hints()`）。
 - **preedit**：拼音解析出 ≥2 完成音节时组合区用音节分隔串（ni'hao），否则原始码（单音节/纯五笔码不拆）。
-- **分段上屏接力**（handle_candidate.rs:182-202）：`committed_text` 非空（必来自拼音选词——码表候选
-  consumed_length=0 永不部分匹配）时，剩余编码**强制**按混输方案的 `[engine.mixed].secondary_schema`
-  转换（`convert_with`），避免混输让码表抢首选（选「你」后 hao→虚）。注意不用全局 primary_pinyin
-  （那是临时拼音↔临时双拼切换用的）。
+- **分段上屏接力**（`build_candidates`）：**最后一段来自拼音选词**时，剩余编码**强制**按混输方案的
+  `[engine.mixed].secondary_schema` 转换（`convert_with`），避免混输让码表抢首选（选「你」后 hao→虚）。
+  注意不用全局 primary_pinyin（那是临时拼音↔临时双拼切换用的）。
+  ⚠️ 判据曾是「`committed_text` 非空」，理由是「必来自拼音选词——码表候选 consumed_length=0 永不
+  部分匹配」。**该等价关系已不成立**：§7.4 的超码长回捞候选如实标注 consumed_length，码表也会进入
+  分段态；沿用旧判据会让 `yijga` 选「就是」后剩下的 `a` 被强制按拼音解释。同源的
+  `learn_phrase_on_commit`（拼音专属造词）也据此对全段码表显式跳过 —— 码表侧造词归 `auto_phrase`
+  连续单字缓冲管，且各段码机械拼接（`yijg`+`a`）本就不是有意义的词条。
 - **临时拼音**：`[input.temp_pinyin]`（总开关 + 引导键，默认反引号）由协调器 pipeline 层分发，临时切到
   目标拼音方案，不在 MixedEngine 内。目标方案取全局 `schema.primary_pinyin`（空=全拼 `"pinyin"`），
   见 `temp_pinyin_target`。
