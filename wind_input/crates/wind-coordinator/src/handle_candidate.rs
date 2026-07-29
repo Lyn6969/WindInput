@@ -310,10 +310,13 @@ impl Coordinator {
         }
         let now = chrono::Local::now();
         let recent = self.recent_commits_snapshot();
+        // 走 **_cached**：本闭包在每次按键的候选构建期求值，只用于拼显示标签，绝不能
+        // 卡按键线程（`get_clipboard_text` 打不开时会 sleep 重试至 40ms）。真正执行动作
+        // 时另有 CmdbarCtx 用非缓存版取值。
         let clip = |_n: i64| -> String {
             #[cfg(windows)]
             {
-                wind_ui::popup_menu::get_clipboard_text()
+                wind_ui::popup_menu::get_clipboard_text_cached()
             }
             #[cfg(not(windows))]
             {
@@ -420,10 +423,12 @@ impl Coordinator {
             let recent = self.recent_commits_snapshot();
             // 剪贴板读取回调注入 wind-phrase（其不依赖平台 UI 层）：精确码命令 display
             // 含 {clip()}（如 coad）时按需读取；非 windows 返回空。
+            // 走 **_cached**：这里是每次按键都会经过的候选构建期，只为拼 display 标签——
+            // 用会 sleep 重试的 `get_clipboard_text` 等于把最坏 40ms 摊到按键线程上。
             let clip = |_n: i64| -> String {
                 #[cfg(windows)]
                 {
-                    wind_ui::popup_menu::get_clipboard_text()
+                    wind_ui::popup_menu::get_clipboard_text_cached()
                 }
                 #[cfg(not(windows))]
                 {

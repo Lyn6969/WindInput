@@ -23,7 +23,8 @@ use wind_theme::schema::Dim;
 use windows::Win32::Foundation::{GlobalFree, HANDLE, HGLOBAL};
 #[cfg(windows)]
 use windows::Win32::System::DataExchange::{
-    CloseClipboard, EmptyClipboard, GetClipboardData, OpenClipboard, SetClipboardData,
+    CloseClipboard, EmptyClipboard, GetClipboardData, GetClipboardSequenceNumber, OpenClipboard,
+    SetClipboardData,
 };
 #[cfg(windows)]
 use windows::Win32::System::Memory::{
@@ -932,13 +933,97 @@ pub fn try_set_clipboard_text(_text: &str) -> anyhow::Result<()> {
     anyhow::bail!("写剪贴板：当前平台暂未支持")
 }
 
-/// 读剪贴板文本（CF_UNICODETEXT）。失败/无文本返回空串。
+/// 剪贴板文本缓存 `(序列号, 文本)`，失效判据见 [`get_clipboard_text`]。
+///
+/// 内存权衡：缓存会持有剪贴板全文副本，直到剪贴板下次变化。刻意**不设大小上限**——
+/// 超限就不缓存的话，超大剪贴板下每次按键都要重跑一遍整段 UTF-16→UTF-8 转换，那比
+/// 多占一份内存糟得多；而不加上限的最坏内存占用等于剪贴板本身，且任何情况下都不比
+/// 改造前（每次真读、读完即弃）更慢。若日后内存成为问题，正确的做法是给显示路径缓存
+/// 截断版、执行路径仍真读，而不是简单地超限不缓存。
+#[cfg(windows)]
+static CLIP_CACHE: std::sync::Mutex<Option<(u32, String)>> = std::sync::Mutex::new(None);
+
+/// 取缓存。`seq == 0` 表示序列号不可用（调用方无窗口站剪贴板访问权限，罕见）——
+/// 此时判据失效，一律未命中，绝不能拿旧值冒充当前内容。
+#[cfg(windows)]
+fn clip_cache_get(seq: u32) -> Option<String> {
+    if seq == 0 {
+        return None;
+    }
+    let g = CLIP_CACHE.lock().ok()?;
+    let (s, t) = g.as_ref()?;
+    (*s == seq).then(|| t.clone())
+}
+
+/// 写缓存。`seq == 0` 时不写——没有有效判据的缓存日后无法判断是否过期。
+#[cfg(windows)]
+fn clip_cache_put(seq: u32, text: &str) {
+    if seq == 0 {
+        return;
+    }
+    if let Ok(mut g) = CLIP_CACHE.lock() {
+        *g = Some((seq, text.to_string()));
+    }
+}
+
+#[cfg(windows)]
+fn clip_cache_stale() -> String {
+    CLIP_CACHE
+        .lock()
+        .ok()
+        .and_then(|g| g.as_ref().map(|(_, t)| t.clone()))
+        .unwrap_or_default()
+}
+
+/// 读剪贴板文本（CF_UNICODETEXT），**带序列号缓存**。失败/无文本返回空串。
+///
+/// `GetClipboardSequenceNumber` 只读窗口站上的一个计数器：不需要 `OpenClipboard`、
+/// 不参与剪贴板全局锁竞争、不会被别的进程挡住。内容没变时据此直接复用上次结果，
+/// 把「开剪贴板 + 整段 UTF-16→UTF-8 转换」整个省掉。
+///
+/// 这对**候选构建期**尤其要紧：含 `{clip()}` 的短语（如 `coad`、`ojs`）每次按键都要
+/// 求值 display 标签，若每次都真开剪贴板，`open_clipboard_retry` 最坏 5×10ms 的 sleep
+/// 就直接摊在按键线程上。但该场景应改用 [`get_clipboard_text_cached`]——本函数在缓存
+/// 未命中时仍会重试等待。
 #[cfg(windows)]
 pub fn get_clipboard_text() -> String {
-    if open_clipboard_retry().is_err() {
-        return String::new();
+    read_clipboard(true)
+}
+
+/// 同 [`get_clipboard_text`]，但**绝不阻塞调用线程**：缓存未命中且剪贴板正被其它进程
+/// 占用时，直接返回上次缓存的文本（从未读到过则空串），不做 sleep 重试。
+///
+/// 专供**只用于显示**的场景（候选标签）：标签短暂陈旧一拍无害，按键线程卡 40ms 则
+/// 用户直接可感。**执行动作的路径不可用本函数**——那里拿到陈旧内容会粘错东西，必须用
+/// [`get_clipboard_text`]，它在打不开时返回空串而非旧值。
+#[cfg(windows)]
+pub fn get_clipboard_text_cached() -> String {
+    read_clipboard(false)
+}
+
+/// 剪贴板读取实现。`allow_retry` 区分两种失败语义，见两个公开包装的文档。
+#[cfg(windows)]
+fn read_clipboard(allow_retry: bool) -> String {
+    let seq = unsafe { GetClipboardSequenceNumber() };
+    if let Some(hit) = clip_cache_get(seq) {
+        return hit;
     }
-    unsafe {
+
+    let opened = if allow_retry {
+        open_clipboard_retry().is_ok()
+    } else {
+        unsafe { OpenClipboard(HWND::default()) }.is_ok()
+    };
+    if !opened {
+        // 执行路径宁可给空串也不能给陈旧内容（会粘错）；显示路径退回旧标签即可。
+        return if allow_retry {
+            String::new()
+        } else {
+            clip_cache_stale()
+        };
+    }
+
+    let out = unsafe {
         let mut out = String::new();
         if let Ok(h) = GetClipboardData(CF_UNICODETEXT.0 as u32) {
             let hglobal = HGLOBAL(h.0);
@@ -958,7 +1043,12 @@ pub fn get_clipboard_text() -> String {
         }
         let _ = CloseClipboard();
         out
-    }
+    };
+
+    // 以**读之前**的 seq 作键：若期间剪贴板恰好变了，这份缓存下次会因 seq 不等而被弃用，
+    // 顶多多读一次；反过来用读之后的 seq 则可能把旧内容盖上新序号，那才是错的方向。
+    clip_cache_put(seq, &out);
+    out
 }
 
 /// 读剪贴板文本（macOS：经 `pbpaste` 子进程）。失败/无文本返回空串。
@@ -1075,4 +1165,52 @@ fn place_child(
         }
     }
     (x, y)
+}
+
+#[cfg(all(test, windows))]
+mod clipboard_tests {
+    use super::*;
+
+    /// 缓存必须随剪贴板内容变更而失效——**这是本缓存唯一会伤到用户的失败模式**：
+    /// 若序列号判据失灵，`clip()` 会一直吐上一次的剪贴板内容，短语 `ojs`/`coad` 就会
+    /// 粘错东西。
+    ///
+    /// 标 `#[ignore]` 的理由（两条，缺一都不该 ignore）：
+    /// 1. 它**真写系统剪贴板**，会覆盖跑测试者当下的剪贴板内容（末尾尽力恢复，但进程
+    ///    被中断就恢复不了）——不该混进 `cargo test` 的日常批次；
+    /// 2. CI 是 Linux 宿主，`#[cfg(windows)]` 下本测试根本不参与编译，进日常批次也只是
+    ///    个不会执行的摆设。
+    ///
+    /// 改动 `read_clipboard` / 缓存判据后，请在 Windows 本机手动跑一次：
+    /// `cargo test -p wind-ui --lib clipboard_cache -- --ignored --nocapture`
+    #[test]
+    #[ignore = "真写系统剪贴板，会覆盖使用者当前内容；须在 Windows 本机手动跑"]
+    fn clipboard_cache_invalidates_on_change() {
+        const A: &str = "WindInput-clip-cache-A";
+        const B: &str = "WindInput-clip-cache-B";
+        let original = get_clipboard_text();
+
+        set_clipboard_text(A);
+        assert_eq!(get_clipboard_text(), A, "写入后首读");
+        assert_eq!(get_clipboard_text(), A, "二读（应命中缓存）");
+        assert_eq!(
+            get_clipboard_text_cached(),
+            A,
+            "非阻塞版与阻塞版共用同一缓存"
+        );
+
+        // 内容变更 → GetClipboardSequenceNumber 递增 → 缓存必须失效。
+        set_clipboard_text(B);
+        assert_eq!(
+            get_clipboard_text(),
+            B,
+            "缓存未随剪贴板变更失效（会粘错内容）"
+        );
+        assert_eq!(get_clipboard_text_cached(), B, "非阻塞版同样须失效");
+
+        // 尽力恢复（set_clipboard_text 对空串是 no-op，故原本为空时无法还原）。
+        if !original.is_empty() {
+            set_clipboard_text(&original);
+        }
+    }
 }
