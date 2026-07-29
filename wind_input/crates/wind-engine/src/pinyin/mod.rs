@@ -1104,7 +1104,14 @@ impl Engine for PinyinEngine {
                         continue;
                     }
                     c.source = CandidateSource::Pinyin;
-                    c.code = query.to_string();
+                    // **保留全拼码**（连同同域的 boundary），不覆盖成简拼串。
+                    //
+                    // 词频记账走 `cand_code`（取候选的 code），覆盖成 `xan` 会让同一个词在
+                    // 简拼与全拼下走两个互不相认的计数——用简拼练熟的词切回全拼一点不认。
+                    //
+                    // `consumed_length` 不受影响：它的判据是 `query.starts_with(&c.code)`，
+                    // 简拼下 `xan` 不以 `xianning` 开头 ⇒ 落 else 分支取 `query.len()`，
+                    // 仍是「消费整串」，与覆盖时同值。
                     c.is_prefix = false;
                     c.is_partial = false;
                     // 简拼层标记。此前借 `is_fuzzy` 沉底——那是模糊音的「召回来源」标记，

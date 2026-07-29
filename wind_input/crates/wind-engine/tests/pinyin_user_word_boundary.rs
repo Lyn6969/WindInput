@@ -118,6 +118,52 @@ fn user_word_abbrev_uses_true_boundary_not_maximum_match() {
     assert!(hit(&without, "xianning"));
 }
 
+/// **简拼候选保留全拼码**，好让词频与全拼输入共用同一个计数。
+///
+/// 词频记账走 `cand_code`（取候选的 `code`）。此前简拼分支把 code 覆盖成简拼串本身，
+/// 于是同一个词在简拼 `xan` 与全拼 `xianning` 下走两个互不相认的计数——用简拼练熟的
+/// 词切回全拼一点不认，反之亦然。
+///
+/// 同时锁住 `consumed_length`：它的判据是 `query.starts_with(&c.code)`，简拼下
+/// `xan` 不以 `xianning` 开头 ⇒ 落 else 分支取 `query.len()`，仍是「消费整串」。
+/// 这一条容易想当然地认为「code 变长了消费也会变长」，故显式断言。
+#[test]
+fn user_word_abbrev_keeps_full_pinyin_code() {
+    let Some(dir) = data_dir() else {
+        eprintln!("跳过：拼音词库不存在");
+        return;
+    };
+    const B: u64 = 0b10101; // xi|an|ning
+    let mgr = manager(&dir, "abbr_code", &[("xianning", "西安宁", 5000, B)]);
+
+    let r = mgr.convert("xan", 30);
+    let c = r
+        .candidates
+        .iter()
+        .find(|c| c.text == "西安宁")
+        .expect("简拼 xan 应命中「西安宁」");
+
+    assert_eq!(
+        c.code, "xianning",
+        "简拼候选须保留全拼码，词频才能与全拼输入共用计数"
+    );
+    assert_eq!(c.boundary, B, "边界与全拼码同域，一并保留");
+    assert!(c.is_abbrev, "仍标记为简拼层（排序沉底靠它）");
+    assert_eq!(
+        c.consumed_length, 3,
+        "简拼消费整串（xan 共 3 字节），不因 code 变长而变"
+    );
+
+    // 全拼输入时同一个词的 code 相同 —— 这正是两者共用词频键的前提
+    let r2 = mgr.convert("xianning", 30);
+    let c2 = r2
+        .candidates
+        .iter()
+        .find(|c| c.text == "西安宁")
+        .expect("全拼应命中");
+    assert_eq!(c2.code, c.code, "简拼与全拼下的 code 必须一致");
+}
+
 /// **用户长词打 2 个音节即可上浮**——这正是边界接通后才拿得到的行为。
 ///
 /// 「大菠萝哥」4 音节，输入 `dabo`（2 音节）：
