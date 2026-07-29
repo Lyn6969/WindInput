@@ -19,6 +19,8 @@
 
 use crate::binformat::DictEntry;
 use memmap2::Mmap;
+use std::cmp::Ordering;
+use std::collections::BinaryHeap;
 use std::path::Path;
 use tracing::info;
 
@@ -764,32 +766,104 @@ impl WdatReader {
         self.abbrev.is_some()
     }
 
-    /// 前缀查找：走到前缀状态，DFS 子树收集叶（重建每个候选的完整 code），
-    /// 再按权重降序、order 升序排序并截断（与 binformat::DictReader 对齐）。
+    /// 前缀查找：走到前缀状态，DFS 子树遍历叶（重建每个候选的完整 code），
+    /// 按权重降序、order 升序取前 `limit` 条（与 binformat::DictReader 对齐）。
+    ///
+    /// **实现为 top-N 堆而非「全收集 + 全排序 + 截断」**：DFS 仍遍历整棵子树（不早停，
+    /// 故结果不漏高权重项），但只保留最优的 `limit` 条，且**够不上当前第 N 名的条目
+    /// 不做任何 String 分配**。对 `ok` 拼字这类「单前缀下 8.8 万条」的词库，旧写法要
+    /// 物化 8.8 万个 `DictEntry`（17.6 万次堆分配）再全排序，最后扔掉 99.9%——单次
+    /// 前缀查询 80ms 级。
+    ///
+    /// 排序键含 `seq`（DFS 遍历序）作第三级 tie-break，以复现 `sort_by` 的**稳定排序**
+    /// 语义：`(weight, order)` 打平时保持 DFS 顺序。这不是可选项——`with_local_order`
+    /// 写入的词库（`export_to_writer` / combined 合并路径）order 是「code 内序号 0,1,2」，
+    /// 等权时会大量打平，缺了 seq 堆将任意取舍，候选列表随之抖动。
     pub fn search_prefix(&self, prefix: &str, limit: usize) -> Vec<DictEntry> {
-        if self.main.dat_size == 0 {
+        if self.main.dat_size == 0 || limit == 0 {
             return Vec::new();
         }
         let Some(start) = self.walk(&self.main, prefix) else {
             return Vec::new();
         };
+
+        /// 排序键。`Ord` 定义为「**越差越大**」，故堆顶恒为当前最差的入选者，
+        /// 且 `into_sorted_vec()`（升序）直接给出最优→最差的最终顺序。
+        #[derive(PartialEq, Eq)]
+        struct RankKey {
+            weight: i32,
+            order: i32,
+            seq: u64,
+        }
+        impl Ord for RankKey {
+            fn cmp(&self, other: &Self) -> Ordering {
+                // weight 小 → 差；order 大 → 差；seq 大 → 差。
+                other
+                    .weight
+                    .cmp(&self.weight)
+                    .then(self.order.cmp(&other.order))
+                    .then(self.seq.cmp(&other.seq))
+            }
+        }
+        impl PartialOrd for RankKey {
+            fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+                Some(self.cmp(other))
+            }
+        }
+        struct Ranked {
+            key: RankKey,
+            entry: DictEntry,
+        }
+        impl PartialEq for Ranked {
+            fn eq(&self, other: &Self) -> bool {
+                self.key == other.key
+            }
+        }
+        impl Eq for Ranked {}
+        impl Ord for Ranked {
+            fn cmp(&self, other: &Self) -> Ordering {
+                self.key.cmp(&other.key)
+            }
+        }
+        impl PartialOrd for Ranked {
+            fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+                Some(self.cmp(other))
+            }
+        }
+
         let v = &self.main;
-        let mut out = Vec::new();
+        let mut heap: BinaryHeap<Ranked> = BinaryHeap::with_capacity(limit + 1);
+        let mut seq: u64 = 0;
         let mut path: Vec<u8> = prefix.as_bytes().to_vec();
         self.for_each_leaf(v, start, &mut path, &mut |code, leaf| {
             self.read_leaf_entries(v, leaf, &mut |text, weight, order, boundary| {
-                out.push(DictEntry {
-                    code: code.to_string(),
-                    text: text.to_string(),
-                    weight,
-                    order,
-                    boundary,
+                let key = RankKey { weight, order, seq };
+                seq += 1;
+                if heap.len() >= limit {
+                    // 堆顶是最差的入选者：不严格优于它就丢弃——注意此处**先比较后分配**，
+                    // 绝大多数条目走到这里即返回，不触碰 code/text 的 to_string()。
+                    match heap.peek() {
+                        Some(worst) if key >= worst.key => return,
+                        _ => {}
+                    }
+                    heap.pop();
+                }
+                heap.push(Ranked {
+                    key,
+                    entry: DictEntry {
+                        code: code.to_string(),
+                        text: text.to_string(),
+                        weight,
+                        order,
+                        boundary,
+                    },
                 });
             });
         });
-        out.sort_by(|a, b| b.weight.cmp(&a.weight).then(a.order.cmp(&b.order)));
-        out.truncate(limit);
-        out
+        heap.into_sorted_vec()
+            .into_iter()
+            .map(|r| r.entry)
+            .collect()
     }
 
     /// 遍历全部条目（供反查索引构建）：DFS 全树**流式**回调 (code,text,weight)，
@@ -858,6 +932,151 @@ mod tests {
         }
         w.write(&p).expect("write wdat");
         p
+    }
+
+    /// 按 (code, entries) 构建 wdat（owned 版，供批量生成用例）。走 `WdatWriter::add`
+    /// → `with_local_order`，即 order = code 内序号——与 `export_to_writer` / combined
+    /// 合并路径同语义，单条 code 时 order 恒 0（等权即全打平，最坏 tie-break 场景）。
+    fn build_owned(tmp_name: &str, data: &[(String, Vec<(String, i32)>)]) -> std::path::PathBuf {
+        let p = std::env::temp_dir().join(tmp_name);
+        let mut w = WdatWriter::new();
+        for (code, ents) in data {
+            w.add(code.clone(), ents.clone());
+        }
+        w.write(&p).expect("write wdat");
+        p
+    }
+
+    /// 参考实现 = 改造前的「DFS 全量收集 → 稳定排序 → 截断」。作为差分对比的黄金标准：
+    /// top-N 堆的输出必须与它**逐条相同**（含顺序），否则即为正确性回归。
+    fn reference_prefix(r: &WdatReader, prefix: &str, limit: usize) -> Vec<DictEntry> {
+        let v = &r.main;
+        let Some(start) = r.walk(v, prefix) else {
+            return Vec::new();
+        };
+        let mut out = Vec::new();
+        let mut path: Vec<u8> = prefix.as_bytes().to_vec();
+        r.for_each_leaf(v, start, &mut path, &mut |code, leaf| {
+            r.read_leaf_entries(v, leaf, &mut |text, weight, order, boundary| {
+                out.push(DictEntry {
+                    code: code.to_string(),
+                    text: text.to_string(),
+                    weight,
+                    order,
+                    boundary,
+                });
+            });
+        });
+        out.sort_by(|a, b| b.weight.cmp(&a.weight).then(a.order.cmp(&b.order)));
+        out.truncate(limit);
+        out
+    }
+
+    fn assert_same(actual: &[DictEntry], expect: &[DictEntry], ctx: &str) {
+        let a: Vec<_> = actual
+            .iter()
+            .map(|e| (&e.code, &e.text, e.weight))
+            .collect();
+        let b: Vec<_> = expect
+            .iter()
+            .map(|e| (&e.code, &e.text, e.weight))
+            .collect();
+        assert_eq!(a, b, "{ctx}");
+    }
+
+    /// top-N 堆 == 全量排序取前 N，在**权重与 order 全部打平**时也成立。
+    ///
+    /// 这是 `ok` 拼字词库的真实形状：88020 条无 weight 列（全取 default_weight），
+    /// 每 code 单条（order 恒 0）。此时两级排序键完全失效，顺序只由稳定排序的
+    /// 「保持 DFS 序」兜底——正是 top-N 堆最容易与全排序分歧之处（堆本身不稳定，
+    /// 靠 `RankKey::seq` 复现）。
+    #[test]
+    fn topn_prefix_matches_full_sort_when_all_keys_tie() {
+        let data: Vec<(String, Vec<(String, i32)>)> = (0..500u32)
+            .map(|i| {
+                let c1 = (b'a' + (i / 26) as u8) as char;
+                let c2 = (b'a' + (i % 26) as u8) as char;
+                (format!("ok{c1}{c2}"), vec![(format!("字{i}"), 0)])
+            })
+            .collect();
+        let p = build_owned("wdat_topn_all_tie.wdat", &data);
+        let r = WdatReader::open(&p).unwrap();
+
+        for limit in [1usize, 5, 90, 499, 500, 501, 1000] {
+            assert_same(
+                &r.search_prefix("ok", limit),
+                &reference_prefix(&r, "ok", limit),
+                &format!("全打平 limit={limit}"),
+            );
+        }
+        let _ = std::fs::remove_file(&p);
+    }
+
+    /// top-N 堆 == 全量排序取前 N，混合权重 + 同 code 多条（order 0,1,2）时也成立。
+    #[test]
+    fn topn_prefix_matches_full_sort_mixed_weights() {
+        let data: Vec<(String, Vec<(String, i32)>)> = (0..200u32)
+            .map(|i| {
+                let c1 = (b'a' + (i / 26) as u8) as char;
+                let c2 = (b'a' + (i % 26) as u8) as char;
+                // 权重故意大量重复（i % 7），并让部分 code 带 2 条（order 0/1）。
+                let mut ents = vec![(format!("甲{i}"), (i % 7) as i32 * 100)];
+                if i % 3 == 0 {
+                    ents.push((format!("乙{i}"), (i % 7) as i32 * 100));
+                }
+                (format!("ok{c1}{c2}"), ents)
+            })
+            .collect();
+        let p = build_owned("wdat_topn_mixed.wdat", &data);
+        let r = WdatReader::open(&p).unwrap();
+
+        for limit in [1usize, 3, 50, 200, 999] {
+            assert_same(
+                &r.search_prefix("ok", limit),
+                &reference_prefix(&r, "ok", limit),
+                &format!("混合权重 limit={limit}"),
+            );
+        }
+        let _ = std::fs::remove_file(&p);
+    }
+
+    /// **护栏**：DFS 必须遍历完整棵子树，不得早停。
+    ///
+    /// 最高权重的词放在字典序最末。若把本函数「优化」成 `codetable.rs` / `binformat.rs`
+    /// 那种「攒够 limit(*2) 就 break」，DFS 按字典序推进，这条永远进不了结果集——
+    /// 那正是本次修复**刻意没有采用**早停方案的原因（8.8 万条的库上偏差极显著）。
+    #[test]
+    fn topn_prefix_keeps_high_weight_entry_at_lexical_tail() {
+        let mut data: Vec<(String, Vec<(String, i32)>)> = (0..400u32)
+            .map(|i| {
+                let c1 = (b'a' + (i / 26) as u8) as char;
+                let c2 = (b'a' + (i % 26) as u8) as char;
+                (format!("ok{c1}{c2}"), vec![(format!("庸{i}"), 10)])
+            })
+            .collect();
+        data.push(("okzz".to_string(), vec![("压轴".to_string(), 9999)]));
+        let p = build_owned("wdat_topn_tail.wdat", &data);
+        let r = WdatReader::open(&p).unwrap();
+
+        let out = r.search_prefix("ok", 5);
+        assert_eq!(out.len(), 5);
+        assert_eq!(
+            out[0].text, "压轴",
+            "字典序最末的高权重词被漏掉 ⇒ DFS 提前中止了"
+        );
+        assert_eq!(out[0].code, "okzz");
+        let _ = std::fs::remove_file(&p);
+    }
+
+    /// limit=0 → 空（与改造前 `truncate(0)` 语义一致，且不做无谓的 DFS）。
+    #[test]
+    fn topn_prefix_limit_zero_is_empty() {
+        let data = vec![("oka".to_string(), vec![("甲".to_string(), 10)])];
+        let p = build_owned("wdat_topn_zero.wdat", &data);
+        let r = WdatReader::open(&p).unwrap();
+        assert!(r.search_prefix("ok", 0).is_empty());
+        assert_eq!(r.search_prefix("ok", 1).len(), 1);
+        let _ = std::fs::remove_file(&p);
     }
 
     #[test]
