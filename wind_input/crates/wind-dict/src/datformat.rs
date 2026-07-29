@@ -31,7 +31,12 @@ const MAGIC: [u8; 4] = [b'W', b'D', b'A', b'T'];
 // 空格本就是音节真值边界，此前在解析期被 replace(' ',"") 丢弃，迫使查询侧用 DAG 重新猜切分
 // （xi'an vs xian 无从分辨）、造词侧靠 410 音节暴力反推。key 仍为扁平串，故 DAT/前缀查询
 // 语义完全不变——边界只作为 entry 侧元数据随查询结果返回。旧缓存同样靠指纹不匹配自动重建。
-const VERSION: u32 = 4;
+// v5：AbbrevSection 的条目文本从「词」改为「全拼码」——二级索引指向主键而非复制数据。
+// 简拼查询因此变成「查索引拿码 → 走主表装配候选」，候选得到真实的 code 与 boundary，
+// 词频不再因简拼/全拼分裂成两份计数。**二进制结构完全未变**，变的是那个字符串字段的
+// 语义，故必须 bump：旧 v4 缓存若按新逻辑读，会把词当成码拿去查主表、简拼全数落空。
+// 旧缓存靠内容指纹不匹配自动重建，无迁移代码。
+const VERSION: u32 = 5;
 const HEADER_SIZE: usize = 48;
 const LEAF_SIZE: usize = 8;
 const ENTRY_SIZE: usize = 22;
@@ -304,7 +309,10 @@ impl WdatWriter {
         }
     }
 
-    /// 追加简拼条目（abbrev=声母序列，如 "nh"→你好）。空条目忽略。order 按 code 内序号补全。
+    /// 追加简拼条目：`abbrev`=声母序列（`nh`），`entries` 每条 `(全拼码, weight)`
+    /// —— **存的是码不是词**（v5，见文件头版本说明）。空条目忽略；order 按叶内序号补全。
+    ///
+    /// `weight` 只决定该简拼下截断时保留哪些码，候选自身的权重来自主表。
     pub fn add_abbrev(&mut self, abbrev: String, entries: Vec<(String, i32)>) {
         if !entries.is_empty() {
             self.abbrevs.push((abbrev, with_local_order(entries)));
@@ -1400,26 +1408,33 @@ mod tests {
     }
 
     /// 简拼 AbbrevSection 往返：简拼查得到、按权重排序，且**不污染全拼**精确/前缀查询。
+    ///
+    /// ⚠️ **条目内容已随 v5 从「词」改为「全拼码」**（二级索引指向主键）。取出的
+    /// `DictEntry::text` 现在装的是码，调用方拿它去主表装配候选。
     #[test]
     fn abbrev_section_roundtrip() {
         let p = std::env::temp_dir().join("wdat_abbrev_test.wdat");
         let mut w = WdatWriter::new();
         w.add("nihao".into(), vec![("你好".into(), 1200)]);
         w.add("beijing".into(), vec![("北京".into(), 2000)]);
-        w.add_abbrev("nh".into(), vec![("你好".into(), 1200), ("妮豪".into(), 5)]);
-        w.add_abbrev("bj".into(), vec![("北京".into(), 2000)]);
-        w.add_abbrev("nhm".into(), vec![("你好吗".into(), 300)]);
+        // 存码不存词；同一简拼下多个码按权重降序（权重只用于截断时取舍）。
+        w.add_abbrev(
+            "nh".into(),
+            vec![("nihao".into(), 1200), ("nihuo".into(), 5)],
+        );
+        w.add_abbrev("bj".into(), vec![("beijing".into(), 2000)]);
+        w.add_abbrev("nhm".into(), vec![("nihaoma".into(), 300)]);
         w.write(&p).unwrap();
 
         let r = WdatReader::open(&p).unwrap();
         assert!(r.has_abbrev());
-        // 简拼命中 + 权重降序。
+        // 简拼命中 + 权重降序；取出的是**全拼码**。
         let nh = r.search_abbrev("nh", 10);
         assert_eq!(nh.len(), 2);
-        assert_eq!(nh[0].text, "你好", "按权重降序: {nh:?}");
+        assert_eq!(nh[0].text, "nihao", "按权重降序，且存的是码: {nh:?}");
         assert_eq!(nh[0].code, "nh");
-        assert_eq!(r.search_abbrev("bj", 10)[0].text, "北京");
-        assert_eq!(r.search_abbrev("nhm", 10)[0].text, "你好吗");
+        assert_eq!(r.search_abbrev("bj", 10)[0].text, "beijing");
+        assert_eq!(r.search_abbrev("nhm", 10)[0].text, "nihaoma");
         assert!(r.search_abbrev("zzz", 10).is_empty());
         // **不污染全拼**：全拼 search/search_prefix 不应命中简拼码。
         assert!(r.search("nh").is_empty(), "全拼精确不应命中简拼码 nh");

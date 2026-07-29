@@ -2445,7 +2445,10 @@ impl EngineManager {
         // 全拼条目携带 boundary（wdat v4 音节边界，取自 rime 源数据 `ni hao` 的空格）；
         // 简拼码是各音节首字母的拼接、本身不构成音节序列，无边界语义，故 agg_ab 不带。
         let mut agg: HashMap<String, Vec<(String, i32, u64)>> = HashMap::new();
-        let mut agg_ab: HashMap<String, Vec<(String, i32)>> = HashMap::new();
+        // 简拼 → (全拼码 → 该码下的最高权重)。**内层用 map 去重**：同一简拼下多个词
+        // 常共用一个全拼码（`nh` 的「你好」「拟好」同为 `nihao`），存词时它们是不同条目，
+        // 改存码后就成了重复项，不去重会把 AbbrevSection 撑大且截断时挤掉别的码。
+        let mut agg_ab: HashMap<String, HashMap<String, i32>> = HashMap::new();
         let mut total_entries = 0usize;
         for sub_path in &sub_paths {
             // lowercase_code=false：import_tables 子表均为拼音表(非 english)，与改前
@@ -2462,8 +2465,13 @@ impl EngineManager {
                     for (code, text, weight, boundary) in fulls {
                         agg.entry(code).or_default().push((text, weight, boundary));
                     }
-                    for (ab, text, weight) in abbrevs {
-                        agg_ab.entry(ab).or_default().push((text, weight));
+                    for (ab, code, weight) in abbrevs {
+                        let slot = agg_ab
+                            .entry(ab)
+                            .or_default()
+                            .entry(code)
+                            .or_insert(i32::MIN);
+                        *slot = (*slot).max(weight);
                     }
                     total_entries += count;
                 }
@@ -2490,10 +2498,13 @@ impl EngineManager {
                 .collect();
             writer.add_with_boundary(code, with_order);
         }
-        // 简拼表 → 独立 AbbrevSection（与全拼查询互不污染）；同简拼下按权重降序。
+        // 简拼表 → 独立 AbbrevSection（与全拼查询互不污染）。存的是**全拼码**，
+        // 查询时据此走主表装配候选（wdat v5，见 codetable::RimeEntries）。
+        // 同简拼下按权重降序——该权重只决定截断时保留哪些码。
         let abbrev_count = agg_ab.len();
-        for (ab, mut entries) in agg_ab {
-            entries.sort_by(|a, b| b.1.cmp(&a.1));
+        for (ab, codes) in agg_ab {
+            let mut entries: Vec<(String, i32)> = codes.into_iter().collect();
+            entries.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
             writer.add_abbrev(ab, entries);
         }
         info!(

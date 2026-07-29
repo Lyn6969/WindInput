@@ -887,8 +887,21 @@ fn rime_body_offset(content: &str) -> Option<usize> {
 /// 多线程解析（行解析是纯 CPU、可完美并行——拼音大词库的主要耗时）。块边界对齐 `\n`
 /// （该字节不会落在 UTF-8 多字节序列内部），故切片始终在合法 char 边界。
 /// 顺序不保证与文件一致：merged 路径会按权重重排，无需稳定顺序。
-/// `(fulls, abbrevs)`；fulls 每条 `(code, text, weight, boundary)`，abbrevs 每条 `(abbrev, text, weight)`。
-/// 简拼码（`nh`）不带 boundary——它是各音节首字母的拼接，本身不构成音节序列，无边界语义。
+/// `(fulls, abbrevs)`；fulls 每条 `(code, text, weight, boundary)`，
+/// abbrevs 每条 **`(abbrev, 全拼码, weight)`**。
+///
+/// # 简拼存的是全拼码，不是词（wdat v5）
+///
+/// AbbrevSection 是**二级索引**，指向主键（全拼码）而非复制数据。此前存的是词本身
+/// （`nh` → 「你好」），带来三个连带问题：简拼候选不知道自己的全拼码，只能把 code 设成
+/// 简拼串 ⇒ 同一个词在简拼与全拼下走两个互不相认的词频计数；候选拿不到 boundary
+/// （硬编码 0）；词频表因此混着全拼码与简拼码两种键。
+///
+/// 改存全拼码后，简拼查询变成「查索引拿码 → 走主表装配候选」，上述三项一并解决。
+/// 这里的 `weight` 只用于**挑选该简拼下取哪些码**（截断前排序），候选自身的权重来自主表。
+///
+/// 简拼码（`nh`）本身不带 boundary——它是各音节首字母的拼接，不构成音节序列；
+/// 边界随主表条目一起拿到。
 type RimeEntries = (Vec<(String, String, i32, u64)>, Vec<(String, String, i32)>);
 
 pub fn parse_rime_entries_parallel(
@@ -924,7 +937,9 @@ pub fn parse_rime_entries_parallel(
         for (line, comments_on) in body_lines(chunk, base, cutoff) {
             if let Some(r) = parse_rime_line(line, comments_on, lowercase_code, spec, &mut stats) {
                 if let Some(ab) = r.abbrev {
-                    abbrevs.push((ab, r.text.clone(), r.weight));
+                    // 存**全拼码**而非词：AbbrevSection 是二级索引，应指向主键。
+                    // 详见 RimeEntries 的类型注释。
+                    abbrevs.push((ab, r.code.clone(), r.weight));
                 }
                 fulls.push((r.code, r.text, r.weight, r.boundary));
             }
@@ -1090,11 +1105,15 @@ mod tests {
     }
 
     /// 取 abbrevs（(abbrev, text, weight)，无 boundary）中某 text 的 (abbrev, weight)。
-    fn collect_ab(entries: &[(String, String, i32)], text: &str) -> Vec<(String, i32)> {
+    /// 取 abbrevs 中某**全拼码**对应的 `(简拼, weight)`。
+    ///
+    /// ⚠️ 查询键已随 v5 从「词」改为「全拼码」——abbrevs 的第二个字段现在存的是码
+    /// （AbbrevSection 是指向主键的二级索引，不再复制词本身）。
+    fn collect_ab(entries: &[(String, String, i32)], full_code: &str) -> Vec<(String, i32)> {
         entries
             .iter()
-            .filter(|(_, t, _)| t == text)
-            .map(|(c, _, w)| (c.clone(), *w))
+            .filter(|(_, c, _)| c == full_code)
+            .map(|(ab, _, w)| (ab.clone(), *w))
             .collect()
     }
 
@@ -1128,8 +1147,9 @@ mod tests {
         assert_eq!(collect(&e, "你好"), vec![("nihao".to_string(), 1200)]);
         assert_eq!(collect(&e, "你"), vec![("ni".to_string(), 800)]);
         // 简拼：多音节 "ni hao"→"nh"；单音节 "ni" 无简拼。
-        assert_eq!(collect_ab(&ab, "你好"), vec![("nh".to_string(), 1200)]);
-        assert!(collect_ab(&ab, "你").is_empty(), "单音节不产简拼");
+        // 查询键是**全拼码**（v5：AbbrevSection 存码不存词）。
+        assert_eq!(collect_ab(&ab, "nihao"), vec![("nh".to_string(), 1200)]);
+        assert!(collect_ab(&ab, "ni").is_empty(), "单音节不产简拼");
         // 音节边界（v4）：源数据 "ni hao" 的空格是真值边界，不得随 code 拼平而丢弃。
         // "nihao" 音节 ni|hao → 起始字节 {0,2} → 0b101。
         assert_eq!(
@@ -1371,9 +1391,9 @@ mod tests {
             "code 在前的拼音库同样应保留音节边界"
         );
         assert_eq!(
-            collect_ab(&ab, "你好"),
+            collect_ab(&ab, "nihao"),
             vec![("nh".to_string(), 1200)],
-            "code 在前的拼音库不应丢简拼表"
+            "code 在前的拼音库不应丢简拼表（键为全拼码，v5）"
         );
     }
 

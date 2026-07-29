@@ -287,14 +287,18 @@ impl CachedDict {
         }
     }
 
-    /// 简拼查找（声母缩写，如 nh→你好）：仅 wdat(Mmap) 的独立 AbbrevSection 支持；
-    /// 内存回退(yaml 未建简拼) 返回空。结果 (text, weight, order)，已按权重降序、截断。
-    pub fn search_abbrev(&self, code: &str, limit: usize) -> Vec<(String, i32, i32)> {
+    /// 简拼查找（声母缩写，如 `nh`）：返回该简拼对应的**全拼码**列表，已按权重降序、截断。
+    /// 仅 wdat(Mmap) 的独立 AbbrevSection 支持；内存回退（yaml 未建简拼）返回空。
+    ///
+    /// **返回的是码不是词**（v5）——AbbrevSection 是二级索引，指向主键。调用方拿码去
+    /// 主表装配候选，从而得到真实的 code 与 boundary；此前直接返回词，简拼候选只能把
+    /// code 设成简拼串，词频遂与全拼输入分裂成两份计数。
+    pub fn search_abbrev(&self, abbrev: &str, limit: usize) -> Vec<String> {
         match self {
             Self::Mmap(reader) => reader
-                .search_abbrev(code, limit)
+                .search_abbrev(abbrev, limit)
                 .into_iter()
-                .map(|e| (e.text, e.weight, e.order))
+                .map(|e| e.text)
                 .collect(),
             Self::Memory(_) => Vec::new(),
         }

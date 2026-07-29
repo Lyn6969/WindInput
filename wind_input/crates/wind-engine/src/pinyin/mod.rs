@@ -994,20 +994,38 @@ impl Engine for PinyinEngine {
         //    仅当输入像简拼时才查（is_abbreviation：每字母均为某音节首字母、且非完整音节序列），
         //    避免对全拼输入做无谓查找。natural_order=999999 让简拼候选默认排在全拼之后。
         //    `enable_abbrev` 置于短路前：关闭时连 is_abbreviation 的 Dag 构建都省掉。
+        //
+        //    AbbrevSection 存的是**全拼码**（v5），故这里是「查索引拿码 → 走主表装配」两步。
+        //    候选因此带上真实的 code 与 boundary：词频记账走 `cand_code` 取候选的 code，
+        //    此前设成简拼串 `nh`，同一个词在简拼与全拼下遂走两个互不相认的计数。
         if self.config.enable_abbrev && AbbrevMatcher::is_abbreviation(query, trie) {
-            for (text, weight, _order) in dict.search_abbrev(query, 10) {
-                push_unique(
-                    &mut candidates,
-                    text,
-                    query.to_string(),
-                    weight,
-                    999999,
-                    false,
-                    true,
-                    // 简拼码（nh）是各音节首字母的拼接，本身不构成音节序列 → 无边界语义。
-                    0,
-                    false,
-                );
+            for abbr_code in dict.search_abbrev(query, 10) {
+                // 用 search_with_boundary 而非 search：拼音引擎直接持有 CachedDict、
+                // 不经 SystemDictLayer，用 search() 会把边界丢在这里（P2b 踩过同款）。
+                for h in dict.search_with_boundary(&abbr_code) {
+                    // **音节数必须等于简拼字母数**。扁平码有损：`xian` 既是「西安」的
+                    // xi|an（2 音节），也是「先」的 xian（1 音节）。索引里 `xa` 指向的是
+                    // 前者的码，回查主表却会把后者一并捞出来 —— 实测 `xa` 出「先/线/弦/
+                    // 现/县」一串单字。这是「存词」改「存码」引入的，存词时不会发生。
+                    //
+                    // boundary=0（无边界信息）放行，与全仓「任一侧为 0 即降级」的约定一致。
+                    if h.boundary != 0 && h.boundary.count_ones() as usize != query.len() {
+                        continue;
+                    }
+                    push_unique(
+                        &mut candidates,
+                        h.text,
+                        abbr_code.clone(),
+                        h.weight,
+                        999999,
+                        false,
+                        // is_prefix=true：码（nihao）比输入（nh）长，结构上属前缀补全，
+                        // 与改前同值——本次只换数据来源，不动排序层级。
+                        true,
+                        h.boundary,
+                        false,
+                    );
+                }
             }
         }
 
