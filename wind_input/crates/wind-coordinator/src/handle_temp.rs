@@ -855,7 +855,9 @@ impl Coordinator {
             let (start, _) = self.page_range(state);
             let idx = (start + state.selected_index).min(state.candidates.len() - 1);
             let t = state.candidates[idx].text.clone();
-            self.record_selection(&state.input_buffer, &t, state.candidates[idx].source);
+            // 记账码取候选存储码（全拼扁平域），与主选词路径同口径。
+            let code = Self::cand_code(&state.input_buffer, &state.candidates[idx]);
+            self.record_selection(&code, &t, state.candidates[idx].source);
             // 进入临时拼音前顶屏高亮候选（来源候选；prefix 段已在选词时记过）。
             self.record_commit(
                 &t,

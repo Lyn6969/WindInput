@@ -2941,6 +2941,80 @@ mod tests {
         );
     }
 
+    /// 回归：词频读写两端的 code 统一为**候选存储码**（全拼扁平域），而非输入缓冲（击键域）。
+    ///
+    /// 现场：双拼下缓冲是击键 `siyr`、候选码是全拼 `siyuan`（实测 `convert("siyr")` 出的
+    /// 候选 code 恒为 `siyuan`）。写入端 `commit_selected` 用 `cand_code` → 键 `siyuan`；
+    /// 读取端曾用输入缓冲 → 键 `siyr`。二者永不相等，**双拼下词频重排整体失效、tooltip
+    /// 使用次数恒 0**。全拼带分隔符（`xi'an` → 码 `xian`）与前缀补全（`si` → 码 `sikao`）
+    /// 同形态。
+    ///
+    /// 判据刻意让「码 ≠ 缓冲」：读侧若退回用缓冲查，`recs` 为空、`apply_freq_rerank` 提前
+    /// 返回，顺序不变 → 本用例挂。全仓 code 域标准（用户词库 key、造词码、加词码）皆为
+    /// 全拼扁平码，本测试同时锁住词频与它们对齐。
+    #[test]
+    fn freq_lookup_uses_candidate_code_not_input_buffer() {
+        use std::io::Write;
+        use wind_candidate::{Candidate, CandidateSource};
+        let base_dir = std::env::temp_dir().join("wind_coord_freq_code_domain");
+        let schemas = base_dir.join("schemas");
+        let _ = std::fs::remove_dir_all(&base_dir);
+        std::fs::create_dir_all(&schemas).unwrap();
+        {
+            let mut f = std::fs::File::create(schemas.join("py_test.schema.toml")).unwrap();
+            write!(
+                f,
+                "[schema]\nid = \"py_test\"\n[engine]\ntype = \"pinyin\"\n"
+            )
+            .unwrap();
+        }
+        let mut cfg = Config::default();
+        cfg.schema.active = "py_test".into();
+        cfg.schema.available = vec!["py_test".into()];
+        cfg.schema.pinyin.frequency.enabled = true;
+        let db_path = std::env::temp_dir().join("wind_coord_freq_code_domain.redb");
+        let _ = std::fs::remove_file(&db_path);
+        let store = Arc::new(Store::open(&db_path).unwrap());
+        let c =
+            Coordinator::new_headless_with_store(cfg, Some(base_dir.as_path()), Arc::clone(&store));
+
+        // 双拼形态的候选：击键缓冲 4 字节 `siyr`，存储码 6 字节 `siyuan`。
+        let mk = |t: &str| Candidate {
+            text: t.to_string(),
+            code: "siyuan".to_string(),
+            source: CandidateSource::Pinyin,
+            consumed_length: 4, // 消费整串击键（consumed_length 已回映射到原始输入空间）
+            ..Default::default()
+        };
+
+        // ① 记账码来自 cand_code，不是缓冲。
+        let picked = mk("思源");
+        let code = Coordinator::cand_code("siyr", &picked);
+        assert_eq!(code, "siyuan", "记账码须取候选存储码（全拼），不是击键缓冲");
+        c.record_selection(&code, "思源", CandidateSource::Pinyin);
+        assert!(
+            store
+                .get_freq("pinyin", "siyuan", "思源")
+                .unwrap()
+                .is_some(),
+            "写入落在全拼码键空间"
+        );
+        assert!(
+            store.get_freq("pinyin", "siyr", "思源").unwrap().is_none(),
+            "击键码键空间不应有记录（若有，说明写入端也串了域）"
+        );
+
+        // ② 再次按击键缓冲取候选时，词频须读得到 → 「思源」软置前。
+        let mut cands = vec![mk("寺院"), mk("思源")];
+        c.apply_freq_rerank(&mut cands, "siyr");
+        assert_eq!(
+            cands[0].text,
+            "思源",
+            "读侧须按候选存储码查词频；实际: {:?}",
+            cands.iter().map(|x| &x.text).collect::<Vec<_>>()
+        );
+    }
+
     /// P2d Task 3：混输 active 下 apply_freq_rerank 按候选来源读子方案词频。
     /// 码表候选读 primary(ct_test)、拼音候选读 "pinyin"；命中记录者档内提权。
     /// （若读侧仍走 mx_test 单一归属，则两处预置的记录都读不到，无提权 → 测试失败。）

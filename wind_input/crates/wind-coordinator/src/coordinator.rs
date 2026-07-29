@@ -2172,7 +2172,9 @@ impl Coordinator {
                 .highlighted_global_index(state)
                 .min(state.candidates.len() - 1);
             let cand = state.candidates[idx].clone();
-            self.record_selection(&state.input_buffer, &cand.text, cand.source);
+            // 记账码取候选存储码（全拼扁平域），与主选词路径 `commit_selected` 同口径。
+            let code = Self::cand_code(&state.input_buffer, &cand);
+            self.record_selection(&code, &cand.text, cand.source);
             out.push_str(&self.cand_s2t_text(state, &cand));
         }
         state.input_buffer.clear();
@@ -4684,12 +4686,15 @@ impl MessageHandler for Coordinator {
                 match self.update_candidates(&mut state) {
                     InputOutcome::AutoCommit(text) => {
                         // 自动上屏文本取自首候选（handle_candidate.rs 构造 AutoCommit 时同源）。
-                        let source = state
+                        // 记账码同取首候选的存储码（全拼扁平域），无候选时退回输入缓冲。
+                        let (source, code) = state
                             .candidates
                             .first()
-                            .map(|c| c.source)
-                            .unwrap_or_default();
-                        let out = self.commit_candidate(&mut state, &text, None, source);
+                            .map(|c| (c.source, Self::cand_code(&state.input_buffer, c)))
+                            .unwrap_or_else(|| {
+                                (CandidateSource::default(), state.input_buffer.clone())
+                            });
+                        let out = self.commit_candidate(&mut state, &text, None, source, &code);
                         self.notify_ui_hide();
                         return Self::commit_action(out, true);
                     }
@@ -4817,12 +4822,15 @@ impl MessageHandler for Coordinator {
                 }
                 match self.update_candidates(&mut state) {
                     InputOutcome::AutoCommit(text) => {
-                        let source = state
+                        // 记账码取首候选存储码（全拼扁平域），与上一处 AutoCommit 同口径。
+                        let (source, code) = state
                             .candidates
                             .first()
-                            .map(|c| c.source)
-                            .unwrap_or_default();
-                        let out = self.commit_candidate(&mut state, &text, None, source);
+                            .map(|c| (c.source, Self::cand_code(&state.input_buffer, c)))
+                            .unwrap_or_else(|| {
+                                (CandidateSource::default(), state.input_buffer.clone())
+                            });
+                        let out = self.commit_candidate(&mut state, &text, None, source, &code);
                         self.notify_ui_hide();
                         return Self::commit_action(out, true);
                     }
@@ -5894,16 +5902,21 @@ impl Coordinator {
     }
 
     /// 候选词频使用次数（按候选归属方案点查 redb FREQ；无 store/无记录 → 0）。
+    ///
+    /// 查询码走 `cand_code`（全拼扁平域）而非 `input_code`（击键缓冲）——双拼 `siyr`/全拼
+    /// 分隔符 `xi'an`/前缀补全下二者不同域，用后者查恒 miss，显示恒 0。与
+    /// `apply_freq_rerank` 及写入端 `record_selection` 同口径，三处必须一致。
     fn debug_freq_count(&self, c: &Candidate, input_code: &str, ctx: &DebugSchemaCtx) -> u32 {
         let Some(store) = &self.store else {
             return 0;
         };
         let sid = self.debug_schema_id_for(c, ctx);
-        if sid.is_empty() || input_code.is_empty() {
+        let code = Self::cand_code(input_code, c);
+        if sid.is_empty() || code.is_empty() {
             return 0;
         }
         store
-            .get_freq(&sid, input_code, &c.text)
+            .get_freq(&sid, &code, &c.text)
             .ok()
             .flatten()
             .map(|r| r.count)

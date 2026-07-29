@@ -189,6 +189,14 @@ impl Coordinator {
         // 取每个"消费整串"候选的词频记录。分段子候选（consumed_length < 整串，如「nihao」里的「你」
         // 只消费「ni」）的词频归属其自身前缀码，不能被整串码的历史计数上浮——否则单字会浮到整句
         // 「你好」之上。consumed_length==0 表示引擎未标注（码表型），视为整串匹配。
+        //
+        // ⚠️ 查询码必须用 `cand_code`（候选存储码 = **全拼扁平域**），不能用 `code`（输入缓冲
+        // = **击键域**）。二者在下列输入下不相等，用错即恒 miss、词频功能整体失效：
+        // - 双拼：缓冲 `siyr`，候选码 `siyuan`；
+        // - 全拼带分隔符：缓冲 `xi'an`，候选码 `xian`；
+        // - 前缀补全：缓冲 `si`，候选码 `sikao`。
+        // 写入端 `record_selection` 用的就是 `cand_code`（见其调用点），全仓 code 域标准
+        // （用户词库 key、`generate_word_pinyin` 造词码、加词 `calc_add_word_code`）同为全拼扁平码。
         let recs: std::collections::HashMap<String, FreqRecord> = candidates
             .iter()
             .filter_map(|c| {
@@ -206,7 +214,7 @@ impl Coordinator {
                 } else {
                     &schema
                 };
-                match store.get_freq(sid, code, &c.text) {
+                match store.get_freq(sid, &Self::cand_code(code, c), &c.text) {
                     Ok(Some(r)) if r.count > 0 => Some((c.text.clone(), r)),
                     _ => None,
                 }
@@ -1201,14 +1209,20 @@ impl Coordinator {
     /// 提交某个候选（记录原始简体词频后清空状态），返回上屏文本（按需简繁转换）。
     /// `s2t_override`：1对多变体候选的输出覆盖（`Candidate::s2t_override`）；来源无候选
     /// 实体（如自动上屏取首选文本）时传 None。
+    ///
+    /// `code`：词频记账码，须为**候选存储码**（`Self::cand_code` 的结果，全拼扁平域），
+    /// 不是输入缓冲——双拼/分隔符/前缀补全下二者不同域。**刻意做成显式入参而非在此取
+    /// `state.input_buffer`**：本函数只拿得到 `text`，同文多候选无从反查，交由每个调用点
+    /// 交代码来源（同 `add_user_word` 的 `boundary` 入参先例）。
     pub(crate) fn commit_candidate(
         &self,
         state: &mut State,
         text: &str,
         s2t_override: Option<&str>,
         source: CandidateSource,
+        code: &str,
     ) -> String {
-        self.record_selection(&state.input_buffer, text, source);
+        self.record_selection(code, text, source);
         let out = match s2t_override {
             Some(t) => t.to_string(),
             None => self.maybe_s2t(state, text),
@@ -2076,8 +2090,9 @@ impl Coordinator {
         let text = state.candidates[idx].text.clone();
         let s2t_override = state.candidates[idx].s2t_override.clone();
         let source = state.candidates[idx].source;
+        let code = Self::cand_code(&state.input_buffer, &state.candidates[idx]);
         let chinese_mode = state.chinese_mode;
-        let out = self.commit_candidate(&mut state, &text, s2t_override.as_deref(), source);
+        let out = self.commit_candidate(&mut state, &text, s2t_override.as_deref(), source, &code);
         // 鼠标提交后彻底复位各输入模式，避免遗留状态
         state.active = None;
         state.temp_pinyin_buffer.clear();

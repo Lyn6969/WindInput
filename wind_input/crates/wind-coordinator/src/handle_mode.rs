@@ -189,7 +189,9 @@ impl Coordinator {
                 .highlighted_global_index(state)
                 .min(state.candidates.len() - 1);
             let t = state.candidates[i].text.clone();
-            self.record_selection(&state.input_buffer, &t, state.candidates[i].source);
+            // 记账码取候选存储码（全拼扁平域），与主选词路径同口径。
+            let code = Self::cand_code(&state.input_buffer, &state.candidates[i]);
+            self.record_selection(&code, &t, state.candidates[i].source);
             Some(format!("{prefix}{t}"))
         } else if !prefix.is_empty() {
             Some(prefix)
