@@ -245,16 +245,16 @@ impl ImeController for CoordIme {
         }
         Ok(())
     }
-    fn open_setting(&self, page: &str) -> anyhow::Result<()> {
+    fn open_setting(&self, page: &str, args: &str) -> anyhow::Result<()> {
         if let Some(c) = self.0.upgrade() {
-            c.open_settings(if page.is_empty() { None } else { Some(page) });
+            c.open_settings_with(if page.is_empty() { None } else { Some(page) }, args);
         }
         Ok(())
     }
-    fn open_setting_web(&self, page: &str) -> anyhow::Result<()> {
+    fn open_setting_web(&self, page: &str, args: &str) -> anyhow::Result<()> {
         // web 配置已废弃，降级到 native 设置
         if let Some(c) = self.0.upgrade() {
-            c.open_settings(if page.is_empty() { None } else { Some(page) });
+            c.open_settings_with(if page.is_empty() { None } else { Some(page) }, args);
         }
         Ok(())
     }

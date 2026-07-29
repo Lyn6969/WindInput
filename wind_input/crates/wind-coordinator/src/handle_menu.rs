@@ -11,6 +11,51 @@ use wind_keys::keymap;
 use wind_ui::manager::{CandidateOp, MenuCmd, MenuKind, ToolbarAction, UiCommand};
 use wind_ui::toolbar::ToolbarState;
 
+/// 把 (键, 值) 列表拼成设置程序的附加参数串（`--k=v`，空格分隔）。值为空的项跳过
+/// ——设置端把"传了空串"和"没传"当同一回事，少一个参数更省事。
+///
+/// 值含空白时加双引号：参数串最终经 `ShellExecuteW` 的 params 交给目标进程，由
+/// `CommandLineToArgvW` 重新切分，不加引号的 `--text=你 好` 会被拆成两个 argv，
+/// 设置端只收得到 `--text=你`。引号在切分时会被剥掉，故设置端拿到的仍是裸值。
+pub(crate) fn build_settings_args(pairs: &[(&str, &str)]) -> String {
+    let mut out = String::new();
+    for (k, v) in pairs {
+        if v.is_empty() {
+            continue;
+        }
+        if !out.is_empty() {
+            out.push(' ');
+        }
+        if v.contains(char::is_whitespace) {
+            out.push_str(&format!("--{k}=\"{v}\""));
+        } else {
+            out.push_str(&format!("--{k}={v}"));
+        }
+    }
+    out
+}
+
+/// 组装设置程序的完整命令行参数串。
+///
+/// `--page <p>` 与附加参数各自独立成段：附加参数**不依附于页**（`--dark` / `--soft`
+/// 这类没有页也有意义），故 `page=None` 时仍原样带上，不能因为没页就丢掉。
+/// macOS 走 IPC 裸串、无命令行概念，故仅非 macOS 使用。
+#[cfg(not(target_os = "macos"))]
+pub(crate) fn settings_cmdline(page: Option<&str>, extra: &str) -> String {
+    let mut out = String::new();
+    if let Some(p) = page {
+        out.push_str("--page ");
+        out.push_str(p);
+    }
+    if !extra.is_empty() {
+        if !out.is_empty() {
+            out.push(' ');
+        }
+        out.push_str(extra);
+    }
+    out
+}
+
 impl Coordinator {
     /// 菜单项激活：UI 已自管导航/子菜单，这里仅按动作派发。
     pub(crate) fn menu_action(&self, kind: MenuKind) {
@@ -62,7 +107,7 @@ impl Coordinator {
             }
             MenuCmd::RestartService => self.restart_service(),
             MenuCmd::OpenSettings => self.open_settings(None),
-            MenuCmd::OpenDictionary => self.open_settings(Some("dict")),
+            MenuCmd::OpenDictionary => self.open_dictionary(),
             MenuCmd::OpenAbout => self.open_settings(Some("about")),
             MenuCmd::TakeScreenshot => {
                 if let Some(dir) = screenshots_dir() {
@@ -401,24 +446,45 @@ impl Coordinator {
     /// 执行路径：有 TSF 连接时经 IPC 让宿主进程执行 ShellExecuteW（有前台权限，能拉窗口到前面）；
     /// 无 TSF 连接时回退到服务进程侧直接启动。
     pub(crate) fn open_settings(&self, page: Option<&str>) {
+        self.open_settings_with(page, "");
+    }
+
+    /// 带附加参数的「打开设置」。`extra` 是**原样直通**给设置程序的命令行参数串
+    /// （如 `--schema=wubi86 --type=shadow`），空串=无附加参数。
+    ///
+    /// 刻意不解析 `extra`：设置端每加一个参数就要同步改一遍宿主，才是真正难维护的。
+    /// 宿主只负责拼接与投递，取值合法性由设置端自己判断（它会降级并提示，不会崩）。
+    /// 内部调用方请用 [`build_settings_args`] 构造，含空白的值会被正确加引号。
+    pub(crate) fn open_settings_with(&self, page: Option<&str>, extra: &str) {
+        #[cfg(not(target_os = "macos"))]
+        let args = settings_cmdline(page, extra);
+
         // macOS：经 CmdOpenSettings(0x0507) 让 .app 用 LaunchServices 按 bundleID 启动/激活
         // 设置应用（app 侧 ModeStatusController.openSettings 已实现）。settings_app_path 拼 .exe，
         // macOS 恒为 None，旧路径会误落到已废弃的 web 分支并 WARN 失败，故此处直接短路。
+        // payload 沿用「页名后接参数」的裸串形态（既有 add-word 路径就是这样传的），
+        // Swift 侧解析方式不变。
         #[cfg(target_os = "macos")]
         {
-            let encoded = wind_ipc::codec::encode_open_settings(page.unwrap_or(""));
+            let target = match (page, extra.is_empty()) {
+                (Some(p), false) => format!("{p} {extra}"),
+                (Some(p), true) => p.to_string(),
+                (None, false) => extra.to_string(),
+                (None, true) => String::new(),
+            };
+            let encoded = wind_ipc::codec::encode_open_settings(&target);
             self.push_server.push_to_active(&encoded);
             return;
         }
         #[cfg(not(target_os = "macos"))]
         if let Some(app) = crate::coordinator::settings_app_path() {
-            let args = page.map(|p| format!("--page {p}")).unwrap_or_default();
             if self.push_server.has_clients() {
                 self.push_shell_exec(&app, &args);
             } else {
                 let _ = self.ui_tx.send(UiCommand::OpenApp { path: app, args });
             }
         } else if let Some(url) = crate::coordinator::settings_url() {
+            // web 回退没有命令行概念：只带页锚点，附加参数丢弃（页仍能到位）。
             let url = match page {
                 Some(p) => format!("{url}#{p}"),
                 None => url,
@@ -431,6 +497,14 @@ impl Coordinator {
         } else {
             tracing::warn!("打开设置失败：未找到 wind_setting 程序，web 服务也未就绪");
         }
+    }
+
+    /// 菜单「词库管理」：直接落到当前正在用的方案域，而不是默认的快捷短语域。
+    /// 用户从输入法菜单进词库，十有八九是要管当前这套方案的词。
+    /// 方案 id 取不到时退化为不带参数，行为与从前一致。
+    pub(crate) fn open_dictionary(&self) {
+        let schema = self.engine_mgr.active_schema_id();
+        self.open_settings_with(Some("dict"), &build_settings_args(&[("schema", &schema)]));
     }
 
     /// 用户开关常驻工具栏（菜单）。仅翻转 toolbar_visible，显隐交 notify_toolbar
@@ -1138,5 +1212,39 @@ mod tests {
     #[test]
     fn nudged_result_is_never_the_sentinel() {
         assert_ne!(avoid_unset_sentinel(0, 0), (0, 0));
+    }
+
+    #[test]
+    fn settings_args_skip_empty_and_quote_whitespace() {
+        use super::build_settings_args;
+        assert_eq!(build_settings_args(&[]), "");
+        assert_eq!(build_settings_args(&[("schema", "")]), "", "空值整项跳过");
+        assert_eq!(
+            build_settings_args(&[("schema", "wubi86"), ("type", "shadow")]),
+            "--schema=wubi86 --type=shadow"
+        );
+        assert_eq!(
+            build_settings_args(&[("text", "a b")]),
+            "--text=\"a b\"",
+            "含空白必须加引号，否则会被 CommandLineToArgvW 拆成两个 argv"
+        );
+    }
+
+    /// 附加参数不依附于页：没给页也要原样带上（`--dark`/`--soft` 无页也有意义）。
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn settings_cmdline_keeps_extra_without_page() {
+        use super::settings_cmdline;
+        assert_eq!(settings_cmdline(None, ""), "");
+        assert_eq!(settings_cmdline(Some("dict"), ""), "--page dict");
+        assert_eq!(
+            settings_cmdline(Some("dict"), "--schema=wubi86 --type=shadow"),
+            "--page dict --schema=wubi86 --type=shadow"
+        );
+        assert_eq!(
+            settings_cmdline(None, "--dark"),
+            "--dark",
+            "无页时附加参数不得被丢弃"
+        );
     }
 }

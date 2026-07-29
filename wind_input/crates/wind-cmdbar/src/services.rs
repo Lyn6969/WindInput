@@ -52,9 +52,14 @@ pub trait ImeController: Send + Sync {
     fn toggle(&self, target: &str) -> anyhow::Result<()>;
     /// 打开设置窗口的指定页面。`page` 为规范页 id（schema/input/keys/ui/dict/
     /// advanced/about），空串打开默认页。未知 id 由设置端忽略并落到默认页。
-    fn open_setting(&self, page: &str) -> anyhow::Result<()>;
-    /// 以 --web 参数启动设置 Web 版。
-    fn open_setting_web(&self, page: &str) -> anyhow::Result<()>;
+    ///
+    /// `args` 是**原样直通**给设置程序的附加命令行参数（如
+    /// `--schema=wubi86 --type=shadow` 定位到五笔的候选调整），空串=无附加参数。
+    /// 宿主刻意不解析、不校验其内容：设置端每加一个新参数都要改一遍这里，
+    /// 才是真正难维护的地方。含空白的值请自行用引号包裹。
+    fn open_setting(&self, page: &str, args: &str) -> anyhow::Result<()>;
+    /// 以 --web 参数启动设置 Web 版。`args` 语义同 [`Self::open_setting`]。
+    fn open_setting_web(&self, page: &str, args: &str) -> anyhow::Result<()>;
     /// 切换输入方案（持久化）。
     fn set_schema(&self, id: &str) -> anyhow::Result<()>;
     /// 循环切换主题；dir="next"/"" 向后，"prev" 向前，返回新主题 ID。

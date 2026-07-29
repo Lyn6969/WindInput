@@ -46,24 +46,6 @@ fn trim_segs_start(
     start
 }
 
-/// 构造设置端加词界面参数串（对齐 Go openAddWordDialogWith）：非空字段才附带。
-fn build_add_word_page(word: &str, code: &str, schema: &str) -> String {
-    let mut page = String::from("add-word");
-    if !word.is_empty() {
-        page.push_str(" --text=");
-        page.push_str(word);
-    }
-    if !code.is_empty() {
-        page.push_str(" --code=");
-        page.push_str(code);
-    }
-    if !schema.is_empty() {
-        page.push_str(" --schema=");
-        page.push_str(schema);
-    }
-    page
-}
-
 /// 汉字判定：只认表意文字区。**刻意排除全角标点（U+FF00–FFEF）与中文标点（U+3000–303F）**
 /// ——那些是造词的**终止符**而非素材。若用 `c >= 0x3400` 这种粗判据，全角逗号 U+FF0C 会被
 /// 当成汉字混进词里。
@@ -679,7 +661,12 @@ impl Coordinator {
         code: &str,
         schema: &str,
     ) -> KeyAction {
-        self.open_settings(Some(&build_add_word_page(word, code, schema)));
+        let args = crate::handle_menu::build_settings_args(&[
+            ("text", word),
+            ("code", code),
+            ("schema", schema),
+        ]);
+        self.open_settings_with(Some("add-word"), &args);
         KeyAction::ClearComposition
     }
 
@@ -1144,17 +1131,29 @@ mod tests {
         assert_eq!(trim_segs_start(&segs, 1), 3);
     }
 
+    /// 加词参数串：空字段跳过（设置端把"空串"与"没传"当同一回事）。
+    /// 页名由 `open_settings_with` 单独带，故这里只断言参数部分。
     #[test]
     fn build_page_omits_empty_fields() {
-        use super::build_add_word_page;
+        use crate::handle_menu::build_settings_args;
+        let args = |w, c, s| build_settings_args(&[("text", w), ("code", c), ("schema", s)]);
         assert_eq!(
-            build_add_word_page("你好", "nihao", "pinyin"),
-            "add-word --text=你好 --code=nihao --schema=pinyin"
+            args("你好", "nihao", "pinyin"),
+            "--text=你好 --code=nihao --schema=pinyin"
         );
-        assert_eq!(build_add_word_page("", "", ""), "add-word");
+        assert_eq!(args("", "", ""), "");
+        assert_eq!(args("你好", "", "wubi"), "--text=你好 --schema=wubi");
+    }
+
+    /// 含空白的值必须加引号：参数串经 ShellExecuteW 交给设置端后由
+    /// CommandLineToArgvW 重新切分，不加引号会把 `--text=你 好` 拆成两个 argv，
+    /// 设置端只收得到 `--text=你`（剪贴板加词的整段文本正是这种值）。
+    #[test]
+    fn build_args_quotes_values_with_whitespace() {
+        use crate::handle_menu::build_settings_args;
         assert_eq!(
-            build_add_word_page("你好", "", "wubi"),
-            "add-word --text=你好 --schema=wubi"
+            build_settings_args(&[("text", "hello world"), ("schema", "wubi86")]),
+            "--text=\"hello world\" --schema=wubi86"
         );
     }
 

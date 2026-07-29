@@ -185,10 +185,10 @@ mod tests {
                 self.0.lock().unwrap().push(target.into());
                 Ok(())
             }
-            fn open_setting(&self, _: &str) -> anyhow::Result<()> {
+            fn open_setting(&self, _: &str, _: &str) -> anyhow::Result<()> {
                 Ok(())
             }
-            fn open_setting_web(&self, _: &str) -> anyhow::Result<()> {
+            fn open_setting_web(&self, _: &str, _: &str) -> anyhow::Result<()> {
                 Ok(())
             }
             fn set_schema(&self, _: &str) -> anyhow::Result<()> {
