@@ -10,11 +10,19 @@ use wind_store::Store;
 use wind_store::user_words::UserWordRecord;
 
 /// 把用户/临时词记录映射为候选；`is_temp` 决定 meta 标记，`is_prefix` 标记前缀补全。
+///
+/// ⚠️ **`boundary` 必须显式带上**。P2a 贯通边界时改的是 `SystemDictLayer`，但有两条旁路
+/// 绕开它：`PinyinEngine` 直接持有 `CachedDict`（P2b 已补），以及本层——记录里
+/// （`user_words.rs` 的 24B value）明明存着边界、`search_user_words_prefix` 也读了出来，
+/// 到这里被 `..Default::default()` 吃掉，于是**用户词候选的 boundary 恒为 0**，
+/// 双拼边界校验、长词上浮判据、自动造词沿用边界四处一并失效。
+/// 见 docs/design/pinyin-code-domains.md §3 L2。
 fn record_to_candidate(r: UserWordRecord, is_temp: bool, is_prefix: bool) -> Candidate {
     let mut c = Candidate {
         text: r.text,
         code: r.code,
         weight: r.weight,
+        boundary: r.boundary,
         is_prefix,
         ..Default::default()
     };
@@ -150,6 +158,38 @@ mod tests {
         let p = std::env::temp_dir().join(format!("wind_storelayer_{name}.redb"));
         let _ = std::fs::remove_file(&p);
         Arc::new(Store::open(&p).unwrap())
+    }
+
+    /// **边界必须穿过「记录 → 候选」这一层**（P2a 漏掉的第二条旁路，见 record_to_candidate 注释）。
+    ///
+    /// 存储层一直存着边界（24B value），`search_user_words_prefix` 也一直读得出来，
+    /// 但转候选时被 `..Default::default()` 吃掉 ⇒ 用户词候选 boundary 恒 0，
+    /// 双拼校验 / 长词上浮 / 自动造词沿用边界一并静默失效。
+    ///
+    /// 三条取候选的路径都要守（精确、前缀、临时层），漏一条就等于没修。
+    #[test]
+    fn boundary_reaches_candidate_from_store() {
+        let s = store("boundary_passthrough");
+        // ni|hao → 起始 {0,2}；xi|an|ning → {0,2,4}
+        s.add_user_word("pinyin", "nihao", "你好", 500, 0b101)
+            .unwrap();
+        s.learn_temp_word("pinyin", "xianning", "西安宁", 800, 0b10101)
+            .unwrap();
+
+        let ul = StoreUserLayer::new(s.clone(), "pinyin");
+        assert_eq!(ul.search("nihao", 10)[0].boundary, 0b101, "精确查询");
+        assert_eq!(
+            ul.search_prefix("ni", 10)[0].boundary,
+            0b101,
+            "前缀补全（用户长词上浮判据吃这个值）"
+        );
+
+        let tl = StoreTempLayer::new(s.clone(), "pinyin");
+        assert_eq!(tl.search("xianning", 10)[0].boundary, 0b10101, "临时层");
+
+        // 无边界记录仍是 0（旧数据 / 手输码 → 消费方降级回 DAG），不得凭空造出边界
+        s.add_user_word("pinyin", "abcd", "工作", 100, 0).unwrap();
+        assert_eq!(ul.search("abcd", 10)[0].boundary, 0);
     }
 
     #[test]
