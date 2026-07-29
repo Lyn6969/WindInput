@@ -347,16 +347,25 @@ add_word_active  >  state.active 对应模式  >  Follow（回落全局基线）
 | 快捷输入 | `schema.mix_modes#candidate_layout`（视图 key） | `select_mix_layout`（新增类型） |
 | 临时拼音 | `input.temp_pinyin.candidate_layout` | `select` |
 | 临时英文 | `input.temp_english.candidate_layout` | `select` |
-| 网址输入 | `input.url.candidate_layout` | `select` + `enabled_when = "input.url.enabled == true"` |
+| 网址输入 | `input.url.candidate_layout` | `select`，但 **`hidden = true` 暂时隐藏** |
 | 快捷加词 | —— | 不暴露，登记 `UNCOVERED_BY_DESIGN` |
+
+两处不进 GUI，用的机制不同，别混：
+
+- **网址** —— 该模式目前**不产出任何候选**，候选窗根本不出现，这一项没有可观察的效果。
+  用 `hidden = true` 而非删清单项：key 仍在清单里，capability 覆盖照旧满足（**不需要**
+  登记 `UNCOVERED_BY_DESIGN`），将来网址若开始出候选，删掉 `hidden` 一行即可恢复。
+- **加词** —— 没有独立设置分区，且逐字确认的两行提示本就该竖排，出厂 `vertical` 即最优解，
+  横排没有使用场景。属于「设计上就不打算暴露」，故走 `UNCOVERED_BY_DESIGN`。
+
+判据：**「暂时没意义」用 `hidden`，「设计上不暴露」用 `UNCOVERED_BY_DESIGN`**。前者预期会
+恢复、留着清单项省事；后者是长期决策、名单里那句理由就是它存在的凭据。
 
 快捷输入那项**不能复用通用 `build_select`**：后者直接 `cfg.get_str(key)` / `set_path(key, String)`，
 用在 structlist 上会把整个 `mix_modes` 数组换成一个字符串。故新增 `mix_layout.rs`
 （纯读写逻辑，照 `mix_trigger.rs` / `mix_members.rs` 的形态）+ `select_mix_layout` 控件类型，
 `control_type_compatible` 里按 `structlist` 而非 `enum` 校验。
 
-加词不暴露的理由：没有独立设置分区，且逐字确认的两行提示本就该竖排，出厂 `vertical`
-即最优解，横排没有使用场景。
 
 ### 仍存在的交付边界
 
