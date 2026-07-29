@@ -380,18 +380,22 @@ impl Coordinator {
         // 下面的**词条内容**搜索仍用原串——那是拿汉字去匹配 text，与音节空格无关。
         let (code_prefix, _) = wind_store::wdict::split_spaced_code(prefix);
         let mut all = store.search_user_words_prefix(&schema, &code_prefix, 0)?;
-        // 词条内容搜索：并入 text 包含搜索词的词条（编码前缀 ∪ 词条内容包含，去重）。
-        // 前缀项走 redb 有序前缀扫描；内容项需全量扫描，仅在有搜索词时才付出该代价。
+        // 并入两类补充命中（与上面的编码前缀取并集，去重）：
+        //   ① 词条内容包含搜索词（拿汉字匹配 text，用原串）
+        //   ② **编码中段包含**搜索词（用拆过的扁平码）—— 前缀扫描只能命中开头，
+        //      `haoya` 搜 `ya` 一条也出不来，而用户并不知道搜索框只认前缀。
+        // 两者共用这一次全量扫描，仅在有搜索词时才付出该代价。
         if !prefix.is_empty() {
             let q = prefix.to_lowercase();
+            let code_q = code_prefix.to_lowercase();
             let seen: std::collections::HashSet<(String, String)> = all
                 .iter()
                 .map(|w| (w.code.clone(), w.text.clone()))
                 .collect();
             for w in store.search_user_words_prefix(&schema, "", 0)? {
-                if w.text.to_lowercase().contains(&q)
-                    && !seen.contains(&(w.code.clone(), w.text.clone()))
-                {
+                let hit = w.text.to_lowercase().contains(&q)
+                    || (!code_q.is_empty() && w.code.to_lowercase().contains(&code_q));
+                if hit && !seen.contains(&(w.code.clone(), w.text.clone())) {
                     all.push(w);
                 }
             }
@@ -1307,10 +1311,15 @@ impl Coordinator {
             .store
             .as_ref()
             .ok_or_else(|| anyhow::anyhow!("无持久化存储"))?;
+        // code 带音节空格，与用户词库列表（word_item）同形。remove/promote 两个入口
+        // 会收到这个串，各自拆回扁平码——三处必须同改，否则「显示得了、删不掉」。
         let items: Vec<Value> = store
             .search_temp_words_prefix(&schema, "", 0)?
             .into_iter()
-            .map(|r| json!({ "code": r.code, "text": r.text, "count": r.count }))
+            .map(|r| {
+                let code = wind_store::wdict::join_code_by_boundary(&r.code, r.boundary);
+                json!({ "code": code, "text": r.text, "count": r.count })
+            })
             .collect();
         Ok(json!(items))
     }
@@ -1323,7 +1332,9 @@ impl Coordinator {
             .store
             .as_ref()
             .ok_or_else(|| anyhow::anyhow!("无持久化存储"))?;
-        store.promote_temp_word(&schema, code, text)?;
+        // 列表项的 code 带音节空格（见 web_temp_list），key 是扁平的。
+        let (code, _) = wind_store::wdict::split_spaced_code(code);
+        store.promote_temp_word(&schema, &code, text)?;
         Ok(json!({ "ok": true }))
     }
 
@@ -1335,7 +1346,9 @@ impl Coordinator {
             .store
             .as_ref()
             .ok_or_else(|| anyhow::anyhow!("无持久化存储"))?;
-        store.remove_temp_word(&schema, code, text)?;
+        // 同 promote：列表项的 code 带音节空格，不拆则删不掉。
+        let (code, _) = wind_store::wdict::split_spaced_code(code);
+        store.remove_temp_word(&schema, &code, text)?;
         Ok(json!({ "ok": true }))
     }
 
@@ -2098,6 +2111,116 @@ mod tests {
         assert!(
             store.get_user_words("pinyin", "nihao").unwrap().is_empty(),
             "remove 收到带空格的码须先拆再删"
+        );
+    }
+
+    /// 临时词库与用户词库同款：列表显示带空格，remove / promote 收到后各自拆回扁平码。
+    /// **三处必须同改**——只改列表就成了「显示得了、删不掉、也晋升不了」。
+    #[test]
+    fn temp_word_spaced_code_roundtrip() {
+        let c = coord("temp_spaced");
+        let store = c.store.as_ref().expect("有 store");
+        // hao|ya → 起始字节位 {0,3}
+        store
+            .learn_temp_word("pinyin", "haoya", "好呀", 500, 0b1001)
+            .unwrap();
+        store
+            .learn_temp_word("pinyin", "nihao", "你好", 500, 0b101)
+            .unwrap();
+
+        let items = c
+            .web_data_rpc("temp.list", &serde_json::json!({ "schemaId": "pinyin" }))
+            .unwrap();
+        let codes: Vec<&str> = items
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|v| v.get("code").and_then(|c| c.as_str()))
+            .collect();
+        assert!(
+            codes.contains(&"hao ya") && codes.contains(&"ni hao"),
+            "临时词库列表须显示带空格的音节码，实际 {codes:?}"
+        );
+
+        // 晋升：带空格的 code 要能查到 temp 记录并写进用户词库
+        c.web_data_rpc(
+            "temp.promote",
+            &serde_json::json!({ "schemaId": "pinyin", "code": "ni hao", "text": "你好" }),
+        )
+        .unwrap();
+        assert!(
+            !store.get_user_words("pinyin", "nihao").unwrap().is_empty(),
+            "promote 收到带空格的码须先拆再晋升"
+        );
+
+        // 删除：同理
+        c.web_data_rpc(
+            "temp.remove",
+            &serde_json::json!({ "schemaId": "pinyin", "code": "hao ya", "text": "好呀" }),
+        )
+        .unwrap();
+        assert!(
+            store
+                .get_temp_words("pinyin", "haoya")
+                .unwrap_or_default()
+                .is_empty(),
+            "remove 收到带空格的码须先拆再删"
+        );
+    }
+
+    /// 编码搜索须能命中**中段**，不能只认前缀。
+    ///
+    /// redb 前缀扫描只覆盖开头，`haoya` 搜 `ya` 一条也出不来——而搜索框并没有告诉用户
+    /// 它只认前缀。词条内容搜索本就在做全量扫描，编码子串搭同一趟车，不增加扫描次数。
+    #[test]
+    fn dict_search_matches_code_middle_segment() {
+        let c = coord("search_middle");
+        let add = |code: &str, text: &str| {
+            c.web_data_rpc(
+                "dict.add",
+                &serde_json::json!({
+                    "schemaId": "pinyin", "code": code, "text": text, "weight": 500
+                }),
+            )
+            .unwrap();
+        };
+        add("hao ya", "好呀");
+        add("ni hao", "你好");
+
+        let hits = |q: &str| -> Vec<String> {
+            let r = c
+                .web_data_rpc(
+                    "dict.listPaged",
+                    &serde_json::json!({ "schemaId": "pinyin", "prefix": q }),
+                )
+                .unwrap();
+            r.get("items")
+                .and_then(|v| v.as_array())
+                .map(|a| {
+                    a.iter()
+                        .filter_map(|x| x.get("text").and_then(|t| t.as_str()))
+                        .map(String::from)
+                        .collect()
+                })
+                .unwrap_or_default()
+        };
+
+        assert!(
+            hits("hao").contains(&"好呀".to_string()),
+            "前缀命中（原有行为）"
+        );
+        assert!(
+            hits("ya").contains(&"好呀".to_string()),
+            "中段命中：haoya 搜 ya 须能找到"
+        );
+        assert!(
+            hits("hao").contains(&"你好".to_string()),
+            "nihao 的中段 hao 同样要命中"
+        );
+        // 带空格的搜索词照样走中段匹配（先拆再比）
+        assert!(
+            hits("hao ya").contains(&"好呀".to_string()),
+            "带空格的搜索词须先拆再匹配"
         );
     }
 
