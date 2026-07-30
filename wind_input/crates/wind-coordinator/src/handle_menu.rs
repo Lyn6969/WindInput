@@ -70,7 +70,7 @@ impl Coordinator {
                 let _ = self.ui_tx.send(UiCommand::CopyToClipboard(text));
             }
             MenuKind::Command(cmd) => self.run_menu_cmd(cmd),
-            MenuKind::Submenu | MenuKind::Separator => {}
+            MenuKind::Submenu | MenuKind::Separator | MenuKind::Label => {}
         }
         // 派发完再解除 tooltip 抑制：Tooltip 截图命令必须先于本次解除被处理，
         // 否则 tooltip 会在截图前被隐藏。详见 clear_tooltip_menu_flag 的说明。
@@ -785,9 +785,15 @@ impl Coordinator {
         // 输入模式 ▸ 三选一」是四层，而此前的「高级 ▸ 候选窗首显 ▸ 三选一」是三层；提到顶层
         // 后维持三层不变。这些项也比截图/打开目录更常用。
         //
-        // 进程名只在父项显示一次，子项不再各自重复；进程未解析时**子项禁用而非隐藏**
-        // （父项 enabled 恒 true，见 `MenuItemSpec::submenu`），菜单项位置保持稳定。
-        let (per_app_label, per_app_children) = {
+        // 顶层标签固定为「应用独立配置」，**不嵌入进程名**：进程名长度不一（如
+        // "Everything.exe" vs "chrome.exe"）曾导致主菜单整体宽度随焦点应用忽宽忽窄，
+        // 观感很差——主菜单的宽度由其中最宽的一项撑开，顶层项不该背这个不确定性。
+        // 进程名改放进子菜单的第一行（禁用的展示行，见 `MenuItemSpec::label`），宽度
+        // 波动被限制在这个子菜单自己弹出的窗口里，不影响主菜单。
+        //
+        // 进程未解析时**子项禁用而非隐藏**（父项 enabled 恒 true，见
+        // `MenuItemSpec::submenu`），菜单项位置保持稳定。
+        let per_app_children = {
             use wind_config::app_compat::{FirstShowMode as F, InitialMode as IM};
             let proc = self.active_process_name();
             let enabled = !proc.is_empty();
@@ -798,10 +804,10 @@ impl Coordinator {
                 .first_show_mode;
             let cur_mode = self.rule_initial_mode(&proc);
             let cur_punct = self.rule_initial_punct(&proc);
-            let label = if enabled {
-                format!("应用独立配置（{proc}）")
+            let header = if enabled {
+                proc.clone()
             } else {
-                "应用独立配置（当前应用未知）".to_string()
+                "当前应用未知".to_string()
             };
             // 三档单选。「跟随全局」必须是独立一档，不能靠"取消勾选"表达——否则用户设了
             // 规则之后无从撤销。它对应写盘时的 None，即从 compat.toml 里清掉该字段。
@@ -812,7 +818,9 @@ impl Coordinator {
                     M::leaf("中文", cmd(mk(2)), enabled, cur == Some(IM::Chinese)),
                 ]
             };
-            let children = vec![
+            vec![
+                M::label(header),
+                M::separator(),
                 M::submenu("初始输入模式", tri(cur_mode, MenuCmd::InitialMode)),
                 M::submenu("初始中文标点", tri(cur_punct, MenuCmd::InitialPunct)),
                 M::separator(),
@@ -841,8 +849,7 @@ impl Coordinator {
                         ),
                     ],
                 ),
-            ];
-            (label, children)
+            ]
         };
 
         let items = vec![
@@ -858,7 +865,7 @@ impl Coordinator {
             M::leaf("重载配置", cmd(MenuCmd::ReloadConfig), true, false),
             M::leaf("重启服务", cmd(MenuCmd::RestartService), true, false),
             M::separator(),
-            M::submenu(per_app_label, per_app_children),
+            M::submenu("应用独立配置", per_app_children),
             M::submenu("高级", advanced_children),
             M::separator(),
             M::leaf("词库管理...", cmd(MenuCmd::OpenDictionary), true, false),

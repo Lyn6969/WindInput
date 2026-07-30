@@ -307,17 +307,23 @@ pub enum MenuKind {
     Submenu,
     /// 分隔线（不可点击）
     Separator,
+    /// 纯展示的文本行（不可点击，不画分隔线）。用于在子菜单顶部显示上下文信息
+    /// （如当前焦点进程名），型别本身保证它永远不会触发任何动作——`enabled` 恒
+    /// 由构造函数按 false 写死已经能挡住 `selectable()` 那道闸门，这里在
+    /// `to_menu_id`/`menu_action` 两处再补一道静态保证，双保险防的是「万一以后
+    /// 有人手滑把 enabled 传成 true」。
+    Label,
 }
 
 impl MenuKind {
     /// 稳定菜单 id：macOS `.app` 把它写进 `NSMenuItem.tag`，选中后经 `CmdMenuAction`
     /// 原样回传，Rust 据此还原动作。构建菜单树（下发）与处理回传（还原）共用此映射，
-    /// 二者必须一致。`Submenu`/`Separator` 不回传，恒为 0。
+    /// 二者必须一致。`Submenu`/`Separator`/`Label` 不回传，恒为 0。
     /// id 区间：1 复制｜10-19 词条操作｜100-199 固定命令｜1000+ 方案｜2000+ 主题｜3000+ 过滤｜
     /// 4000+ 明暗｜5000+ 候选窗首显｜6000+ 初始中英｜7000+ 初始标点。
     pub fn to_menu_id(self) -> i32 {
         match self {
-            MenuKind::Separator | MenuKind::Submenu => 0,
+            MenuKind::Separator | MenuKind::Submenu | MenuKind::Label => 0,
             MenuKind::Copy => 1,
             MenuKind::Op(op) => match op {
                 CandidateOp::MoveTop => 10,
@@ -433,6 +439,16 @@ impl MenuItemSpec {
         Self {
             label: String::new(),
             kind: MenuKind::Separator,
+            enabled: false,
+            checked: false,
+            children: Vec::new(),
+        }
+    }
+    /// 纯展示的文本行，用作子菜单顶部的上下文标题（如「当前应用：xxx.exe」）。
+    pub fn label(text: impl Into<String>) -> Self {
+        Self {
+            label: text.into(),
+            kind: MenuKind::Label,
             enabled: false,
             checked: false,
             children: Vec::new(),
@@ -1601,12 +1617,13 @@ mod menu_id_tests {
         }
     }
 
-    /// 不可点击项（分隔符 / 子菜单）恒为 0，且 0 不得反解析成任何动作——
-    /// 否则点到分隔符会误触发某个命令。
+    /// 不可点击项（分隔符 / 子菜单 / 展示文本行）恒为 0，且 0 不得反解析成任何
+    /// 动作——否则点到分隔符/标题行会误触发某个命令。
     #[test]
     fn non_clickable_ids_are_inert() {
         assert_eq!(MenuKind::Separator.to_menu_id(), 0);
         assert_eq!(MenuKind::Submenu.to_menu_id(), 0);
+        assert_eq!(MenuKind::Label.to_menu_id(), 0);
         assert!(MenuKind::from_menu_id(0).is_none());
     }
 }
