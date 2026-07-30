@@ -73,6 +73,61 @@ impl FirstShowMode {
     }
 }
 
+/// 应用独立的初始中英状态取值。
+///
+/// 语义是**初始值而非锁定**：进入该应用时套用，用户随后可自由手动切换，
+/// 停留在该应用期间不再被改写（详见 `Coordinator::initial_chinese_mode_for`）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum InitialMode {
+    English,
+    Chinese,
+}
+
+impl InitialMode {
+    /// 配置串 → 枚举。无法识别返回 `None`（＝不干预），不 panic 也不回落到某一档：
+    /// 「用户拼错了」与「用户想要英文」是两回事，后者必须是显式写对才成立。
+    pub fn from_config(s: &str) -> Option<Self> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "english" | "en" => Some(Self::English),
+            "chinese" | "zh" => Some(Self::Chinese),
+            _ => None,
+        }
+    }
+    /// 枚举 → 配置串（写回 compat.toml 用）。
+    pub fn as_config(self) -> &'static str {
+        match self {
+            Self::English => "english",
+            Self::Chinese => "chinese",
+        }
+    }
+    /// 落到 `chinese_mode` / `chinese_punct` 这类布尔状态。
+    pub fn is_chinese(self) -> bool {
+        matches!(self, Self::Chinese)
+    }
+    /// 布尔 → 枚举（菜单写盘时把当前状态反写成规则用）。
+    pub fn from_chinese(chinese: bool) -> Self {
+        if chinese {
+            Self::Chinese
+        } else {
+            Self::English
+        }
+    }
+}
+
+/// 容错反序列化 `Option<InitialMode>`：无法识别的值退化为 `None`（＝不干预）。
+///
+/// ⚠ 不能直接 `#[derive(Deserialize)]` 让 serde 自己认字符串：`load_file` 解析失败时
+/// 返回 `None` 会**整份 compat.toml 静默跳过**，于是一个字段拼错就让该文件里所有应用的
+/// 所有规则一起失效，且日志里毫无痕迹。单字段容错把爆炸半径限制在这一个字段内。
+fn de_initial_mode<'de, D>(d: D) -> Result<Option<InitialMode>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let raw = Option::<String>::deserialize(d)?;
+    Ok(raw.as_deref().and_then(InitialMode::from_config))
+}
+
 /// 单个应用的兼容性规则。
 #[derive(Debug, Clone, Deserialize, Serialize, Default)]
 pub struct AppCompatRule {
@@ -92,36 +147,68 @@ pub struct AppCompatRule {
     /// 根本没机会跑），日志里 630 条试探坐标一条没被消费。互斥语义要由类型保证。
     #[serde(default)]
     pub first_show_mode: FirstShowMode,
-    /// 固定候选窗位置：拖动后位置持久化记忆，跨会话恢复。
+    /// 进入本应用时的初始中英状态；`None` = 不干预，沿用全局逻辑。
     ///
-    /// ⚠ **当前是死字段，无任何消费点**：该能力后来由 `ui.candidate.position_mode = "fixed"`
-    /// 那一套（drag_pin > fixed > 跟随光标 三级优先级）实现，与本 per-app 开关无关。
-    /// 保留字段只为兼容既有 compat.toml 不报错；要么接线，要么随下次 compat 格式调整删除。
-    /// 故意不写进 `data/compat.toml` 的字段文档，避免承诺不存在的功能。
-    #[serde(default, skip_serializing_if = "is_false")]
-    pub pin_candidate_position: bool,
+    /// **必须是 `Option` 不能是 `bool`**：`#[serde(default)]` 下的 bool 会让所有未配置
+    /// 规则的应用都拿到 `false`，等于给全世界配了「初始英文」。
+    #[serde(
+        default,
+        deserialize_with = "de_initial_mode",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub initial_mode: Option<InitialMode>,
+    /// 进入本应用时的初始中英标点；`None` = 不干预。
+    ///
+    /// 显式值**压过** `input.punct.follow_mode` 的推导，否则用户配了它却恰好开着
+    /// follow_mode 时会完全无效且无痕迹。
+    #[serde(
+        default,
+        deserialize_with = "de_initial_mode",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub initial_punct: Option<InitialMode>,
 }
 
-/// 在一组规则上设置指定进程的首显策略。
+/// 在一组规则上就地修改指定进程的**某一个**字段。
 ///
 /// 纯函数（不碰文件系统），故可直接单测——本仓凡涉 `%APPDATA%` 落盘的逻辑都要这样
 /// 抽出来，否则端到端测试会真写用户配置目录（见 project_dict_override_sparse_merge 的教训）。
 ///
-/// 进程名不区分大小写匹配；命中则只改这一个字段、其余字段保持不动；未命中则**追加**
+/// 进程名不区分大小写匹配；命中则只改 `edit` 触碰的字段、其余保持不动；未命中则**追加**
 /// 一条只带该字段的新规则（不是整表快照，避免把系统层的其它字段冻结进用户层）。
-pub fn set_first_show_mode(rules: &mut Vec<AppCompatRule>, process: &str, mode: FirstShowMode) {
+pub fn upsert_rule(
+    rules: &mut Vec<AppCompatRule>,
+    process: &str,
+    edit: impl FnOnce(&mut AppCompatRule),
+) {
     let key = process.to_ascii_lowercase();
     for r in rules.iter_mut() {
         if r.process.to_ascii_lowercase() == key {
-            r.first_show_mode = mode;
+            edit(r);
             return;
         }
     }
-    rules.push(AppCompatRule {
+    let mut fresh = AppCompatRule {
         process: process.to_string(),
-        first_show_mode: mode,
         ..Default::default()
-    });
+    };
+    edit(&mut fresh);
+    rules.push(fresh);
+}
+
+/// 在一组规则上设置指定进程的首显策略。语义见 [`upsert_rule`]。
+pub fn set_first_show_mode(rules: &mut Vec<AppCompatRule>, process: &str, mode: FirstShowMode) {
+    upsert_rule(rules, process, |r| r.first_show_mode = mode);
+}
+
+/// 在一组规则上设置指定进程的初始中英状态（`None` = 清除规则，回到跟随全局）。
+pub fn set_initial_mode(rules: &mut Vec<AppCompatRule>, process: &str, mode: Option<InitialMode>) {
+    upsert_rule(rules, process, |r| r.initial_mode = mode);
+}
+
+/// 在一组规则上设置指定进程的初始中英标点（`None` = 清除规则，回到跟随全局）。
+pub fn set_initial_punct(rules: &mut Vec<AppCompatRule>, process: &str, mode: Option<InitialMode>) {
+    upsert_rule(rules, process, |r| r.initial_punct = mode);
 }
 
 /// 把规则集渲染成用户层 compat.toml 全文（含固定文件头）。纯函数，便于单测断言产物。
@@ -132,24 +219,51 @@ pub fn render_user_compat(rules: &[AppCompatRule]) -> Result<String, toml::ser::
     Ok(format!("{USER_COMPAT_HEADER}{}", toml::to_string(&file)?))
 }
 
-/// 设置用户层 compat.toml 中指定进程的首显策略。
+/// 就地修改用户层 compat.toml 中指定进程的规则（load-modify-save）。
 ///
 /// 只读写**用户层**：系统层 `data/compat.toml` 不受影响（合并时用户层同名进程整条覆盖它）。
 /// 文件或目录不存在时自动创建；解析失败按空规则集处理（宁可重建也不要把菜单卡死，
 /// 用户手改坏了 TOML 时仍能通过菜单恢复到可用状态）。
-pub fn set_user_first_show_mode(
+pub fn update_user_rule(
     user_dir: &Path,
     process: &str,
-    mode: FirstShowMode,
+    edit: impl FnOnce(&mut AppCompatRule),
 ) -> Result<(), std::io::Error> {
     let path = user_dir.join(COMPAT_FILE_NAME);
     let mut rules = load_file(&path).unwrap_or_default();
-    set_first_show_mode(&mut rules, process, mode);
+    upsert_rule(&mut rules, process, edit);
     let text = render_user_compat(&rules)
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
     std::fs::create_dir_all(user_dir)?;
     std::fs::write(&path, text)?;
     Ok(())
+}
+
+/// 设置用户层 compat.toml 中指定进程的首显策略。语义见 [`update_user_rule`]。
+pub fn set_user_first_show_mode(
+    user_dir: &Path,
+    process: &str,
+    mode: FirstShowMode,
+) -> Result<(), std::io::Error> {
+    update_user_rule(user_dir, process, |r| r.first_show_mode = mode)
+}
+
+/// 设置用户层 compat.toml 中指定进程的初始中英状态（`None` = 清除规则）。
+pub fn set_user_initial_mode(
+    user_dir: &Path,
+    process: &str,
+    mode: Option<InitialMode>,
+) -> Result<(), std::io::Error> {
+    update_user_rule(user_dir, process, |r| r.initial_mode = mode)
+}
+
+/// 设置用户层 compat.toml 中指定进程的初始中英标点（`None` = 清除规则）。
+pub fn set_user_initial_punct(
+    user_dir: &Path,
+    process: &str,
+    mode: Option<InitialMode>,
+) -> Result<(), std::io::Error> {
+    update_user_rule(user_dir, process, |r| r.initial_punct = mode)
 }
 
 /// 所有应用兼容性规则 + 运行时查找表。
@@ -273,7 +387,54 @@ mod tests {
         let rule = compat.get_rule("foo.exe").unwrap();
         assert!(!rule.caret_use_top);
         assert_eq!(rule.first_show_mode, FirstShowMode::Wait);
-        assert!(!rule.pin_candidate_position);
+        // 缺字段 = 不干预。若这两个退化成 Some(English)，等于给所有未配置的应用
+        // 都配上了「初始英文」——这正是字段必须用 Option 而非 bool 的原因。
+        assert_eq!(rule.initial_mode, None);
+        assert_eq!(rule.initial_punct, None);
+    }
+
+    #[test]
+    fn initial_mode_parses_both_values() {
+        let toml = r#"
+            [[apps]]
+            process = "Everything.exe"
+            initial_mode = "english"
+            initial_punct = "chinese"
+        "#;
+        let file: AppCompatFile = toml::from_str(toml).unwrap();
+        let compat = AppCompat::from_rules(file.apps);
+        let rule = compat.get_rule("everything.exe").unwrap();
+        assert_eq!(rule.initial_mode, Some(InitialMode::English));
+        assert_eq!(rule.initial_punct, Some(InitialMode::Chinese));
+        assert!(!rule.initial_mode.unwrap().is_chinese());
+        assert!(rule.initial_punct.unwrap().is_chinese());
+    }
+
+    /// 单字段拼错只让**该字段**退化为「不干预」，不得连累同规则的其它字段、
+    /// 也不得让整份 compat.toml 解析失败（`load_file` 失败会静默跳过整个文件，
+    /// 于是一个错别字就让所有应用的所有规则一起失效且毫无痕迹）。
+    #[test]
+    fn unknown_initial_mode_degrades_to_none_without_killing_the_file() {
+        let toml = r#"
+            [[apps]]
+            process = "Everything.exe"
+            initial_mode = "englsh"
+            caret_use_top = true
+
+            [[apps]]
+            process = "Weixin.exe"
+            initial_mode = "chinese"
+        "#;
+        let file: AppCompatFile = toml::from_str(toml).expect("拼错的值不得让整份文件解析失败");
+        let compat = AppCompat::from_rules(file.apps);
+        let bad = compat.get_rule("everything.exe").unwrap();
+        assert_eq!(bad.initial_mode, None, "无法识别 → 不干预");
+        assert!(bad.caret_use_top, "同规则的其它字段不受牵连");
+        // 后续规则完整存活。
+        assert_eq!(
+            compat.get_rule("weixin.exe").unwrap().initial_mode,
+            Some(InitialMode::Chinese)
+        );
     }
 
     #[test]
@@ -374,5 +535,58 @@ mod tests {
         assert_eq!(parsed.apps.len(), 1);
         assert_eq!(parsed.apps[0].first_show_mode, FirstShowMode::Fast);
         assert_eq!(parsed.apps[0].process, "EverEdit.exe");
+    }
+
+    #[test]
+    fn set_initial_mode_upserts_and_clears() {
+        let mut rules = vec![AppCompatRule {
+            process: "Everything.exe".into(),
+            comment: "搜索框默认英文".into(),
+            caret_use_top: true,
+            ..Default::default()
+        }];
+        // 命中：只改 initial_mode，其它字段不得被连带修改。
+        set_initial_mode(&mut rules, "everything.exe", Some(InitialMode::English));
+        assert_eq!(rules.len(), 1, "命中时不得追加新规则");
+        assert_eq!(rules[0].initial_mode, Some(InitialMode::English));
+        assert!(rules[0].caret_use_top, "其它字段不得被连带修改");
+        assert_eq!(rules[0].comment, "搜索框默认英文");
+
+        // 标点是独立维度，设置它不得动中英。
+        set_initial_punct(&mut rules, "Everything.EXE", Some(InitialMode::English));
+        assert_eq!(rules[0].initial_punct, Some(InitialMode::English));
+        assert_eq!(rules[0].initial_mode, Some(InitialMode::English));
+
+        // None = 清除规则，回到跟随全局（菜单的「跟随全局」档走这条）。
+        set_initial_mode(&mut rules, "Everything.exe", None);
+        assert_eq!(rules[0].initial_mode, None);
+        assert_eq!(
+            rules[0].initial_punct,
+            Some(InitialMode::English),
+            "只清中英"
+        );
+
+        // 未命中：追加只带该字段的最小规则。
+        set_initial_mode(&mut rules, "cmd.exe", Some(InitialMode::English));
+        assert_eq!(rules.len(), 2);
+        assert_eq!(rules[1].process, "cmd.exe", "应保留原始大小写");
+        assert_eq!(rules[1].initial_mode, Some(InitialMode::English));
+        assert!(!rules[1].caret_use_top);
+    }
+
+    #[test]
+    fn render_omits_none_initial_mode_and_roundtrips() {
+        let rules = vec![AppCompatRule {
+            process: "Everything.exe".into(),
+            initial_mode: Some(InitialMode::English),
+            ..Default::default()
+        }];
+        let text = render_user_compat(&rules).expect("渲染失败");
+        assert!(text.contains(r#"initial_mode = "english""#), "产物: {text}");
+        assert!(!text.contains("initial_punct"), "None 字段不应写出: {text}");
+
+        let parsed: AppCompatFile = toml::from_str(&text).expect("产物应可解析");
+        assert_eq!(parsed.apps[0].initial_mode, Some(InitialMode::English));
+        assert_eq!(parsed.apps[0].initial_punct, None);
     }
 }

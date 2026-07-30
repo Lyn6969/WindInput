@@ -18,8 +18,23 @@
 #                                   实测 EverEdit ~3ms、WPS ~11ms 出候选框。
 #                         "instant" 完全不等，首帧沿用上一次的坐标。最快，但只要光标位置
 #                                   变动过（手动移动、换行、重排）那个位置就是错的。
-#                         对应右键菜单：高级 → 「候选窗首显（<进程名>）」子菜单单选。
-#                         （菜单切换会写入用户层 compat.toml，不改本文件）
+#   initial_mode:         进入本应用时的初始中英状态："english" | "chinese"｜不写=跟随全局。
+#                         典型用途：搜索框/终端类应用默认英文（如 Everything.exe）。
+#   initial_punct:        进入本应用时的初始中英标点，取值同上；不写=跟随全局。
+#                         显式值优先于 config.toml 的 input.punct.follow_mode 推导。
+#
+# 上述三项对应右键菜单：「应用独立配置（<进程名>）」子菜单，各自单选。
+# （菜单切换会写入用户层 compat.toml，不改本文件）
+#
+# ⚠ initial_mode / initial_punct 的语义是「初始值」而不是「锁定」：
+#   - 每次焦点**从别的应用**切进来时套用一次；停留在本应用期间用户可自由手动切换，
+#     同一应用内换输入框（如搜索框↔结果列表）不会重新套用。
+#   - 焦点**离开**规则应用时，下一个应用会重新按全局规则决定自己的状态。在出厂默认
+#     （input.default.state_scope = "global" 且 remember_last_state = false）下，这意味着
+#     它回到 input.default.chinese_mode 这个配置默认值，而不是它自己上次的状态。
+#     若希望每个应用各自精确记住上次状态，请另行设置 input.default.state_scope = "app"，
+#     两者可叠加（规则决定初始值，记忆负责其余应用）。
+#   - 没有配置任何 initial_* 规则的两个应用之间切换，状态一律不动，不受本功能影响。
 #
 # 与首显相关的三个内部选项在 config.toml 的 [ui.candidate] 下（不进设置页）：
 #   first_show_settle_ratio      首显用过非权威坐标时，权威坐标与它相差在「行高 × 本值」以内
@@ -38,4 +53,12 @@ caret_use_top = true
 # [[apps]]
 # process = "EverEdit.exe"
 # comment = "光标稳定，无需等 reflow 权威坐标"
-# skip_caret_pending = true
+# first_show_mode = "fast"
+
+# 示例：搜索框类应用默认英文，用户仍可随时手动切中文（默认不启用）
+# 也可直接在该应用里右键输入法图标 →「应用独立配置」→「初始输入模式」→「英文」，
+# 菜单会把等效规则写进用户层 compat.toml，无需手工编辑本文件。
+# [[apps]]
+# process = "Everything.exe"
+# comment = "文件搜索框，默认英文"
+# initial_mode = "english"

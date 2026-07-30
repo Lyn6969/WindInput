@@ -611,6 +611,37 @@ pub(crate) struct ActiveCompat {
     pub(crate) caret_use_top: bool,
     /// 候选窗首显策略（见 `AppCompatRule::first_show_mode`）。三档互斥。
     pub(crate) first_show_mode: wind_config::app_compat::FirstShowMode,
+    /// 本进程是否配了初始状态规则（`initial_mode` / `initial_punct` 任一非空）。
+    ///
+    /// 用途是判定「本次焦点切换是否**进出**了规则应用」：规则的副作用必须严格限制在
+    /// 规则应用的进出，不能外溢。若判据退化成「规则表非空」，那么只要用户配过任意
+    /// 一条规则，**任意两个应用之间**的切换都会触发重算——`global + remember=false`
+    /// （出厂默认）下这会把模式重置成配置默认，用户在 Word 手切的英文切到 Chrome
+    /// 就没了，与 Everything 毫无关系。
+    pub(crate) has_initial_rule: bool,
+}
+
+/// 焦点切换时是否需要重算初始状态（即是否调用 `apply_initial_mode`）。
+///
+/// 抽成模块级纯函数是为了能直接单测这个判据本身。内联在 `handle_focus_gained` 里时，
+/// 唯一的覆盖方式是构造完整 `FocusData` 并走那条带 UI/IPC 副作用的路径，于是「门控条件
+/// 写错」这类缺陷极易漏网——本仓已有多次「门控退化后测试仍全绿」的先例。
+///
+/// - `crossed`      焦点是否**跨进程**切入。同应用内的焦点跳转为 false，否则用户手切的
+///                  模式会在换输入框时被拉回初始值（「初始值」与「锁定」的分界线）。
+/// - `per_app`      `state_scope="app"` 的既有按应用记忆语义。
+/// - `old_has_rule` / `new_has_rule`
+///                  切换前后的进程是否配了 compat.toml 初始状态规则。两者**取或**，使规则
+///                  同时覆盖「进入规则应用」和「离开规则应用」两个方向：只看 new 会让从
+///                  Everything 切出去后英文状态残留给下一个应用；而放宽成「规则表非空」
+///                  又会让任意两个无规则应用之间的切换也重算，把用户手切的状态冲掉。
+pub(crate) fn should_reapply_initial(
+    crossed: bool,
+    per_app: bool,
+    old_has_rule: bool,
+    new_has_rule: bool,
+) -> bool {
+    crossed && (per_app || old_has_rule || new_has_rule)
 }
 
 /// 中央协调器
@@ -1383,26 +1414,37 @@ impl Coordinator {
             return; // 同进程，规则已缓存
         }
         let name = process_name(pid);
-        let (next, rule_matched) = {
+        let (next, rule_matched, rule_initial_mode, rule_initial_punct) = {
             let table = self.app_compat.lock().unwrap_or_else(|e| e.into_inner());
             let rule = table.get_rule(&name);
+            let initial_mode = rule.and_then(|r| r.initial_mode);
+            let initial_punct = rule.and_then(|r| r.initial_punct);
             (
                 ActiveCompat {
                     pid,
                     caret_use_top: rule.map(|r| r.caret_use_top).unwrap_or(false),
                     first_show_mode: rule.map(|r| r.first_show_mode).unwrap_or_default(),
+                    has_initial_rule: initial_mode.is_some() || initial_punct.is_some(),
                 },
                 rule.is_some(),
+                initial_mode,
+                initial_punct,
             )
         };
         // 无条件记录（对齐 Go handle_lifecycle.go:698）。原实现仅在 caret_use_top=true 时打，
         // 规则未命中与「命中但全 false」在日志里无从区分，查「某应用兼容项没生效」时看不到
         // 究竟是没匹配上进程名还是字段没读到。
         debug!(
-            "Compat rule for process={name}: matched={} caret_use_top={} first_show_mode={}",
+            "Compat rule for process={name}: matched={} caret_use_top={} first_show_mode={} initial_mode={} initial_punct={}",
             rule_matched,
             next.caret_use_top,
-            next.first_show_mode.as_config()
+            next.first_show_mode.as_config(),
+            rule_initial_mode
+                .map(|m| m.as_config())
+                .unwrap_or("(follow-global)"),
+            rule_initial_punct
+                .map(|m| m.as_config())
+                .unwrap_or("(follow-global)")
         );
         *ac = next;
         drop(ac);
@@ -1510,11 +1552,56 @@ impl Coordinator {
             .send(wind_ui::manager::UiCommand::ShowInputDiag(view));
     }
 
+    /// 查 `compat.toml` 中该进程的初始中英规则；`None` = 未配置（不干预）。
+    ///
+    /// 仅 HashMap 查询，无 OpenProcess，故可用于 DLL 同步阻塞路径（`get_current_mode`）。
+    pub(crate) fn rule_initial_mode(
+        &self,
+        proc_name: &str,
+    ) -> Option<wind_config::app_compat::InitialMode> {
+        if proc_name.is_empty() {
+            return None;
+        }
+        self.app_compat
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get_rule(proc_name)
+            .and_then(|r| r.initial_mode)
+    }
+
+    /// 查 `compat.toml` 中该进程的初始中英标点规则；`None` = 未配置（不干预）。
+    pub(crate) fn rule_initial_punct(
+        &self,
+        proc_name: &str,
+    ) -> Option<wind_config::app_compat::InitialMode> {
+        if proc_name.is_empty() {
+            return None;
+        }
+        self.app_compat
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get_rule(proc_name)
+            .and_then(|r| r.initial_punct)
+    }
+
     /// 决策进程 `proc_name` 的中英初始状态（初始状态语义的单一内聚点）。
-    /// 顺序：per-app 记忆表 →（预留：按应用规则表）→ 全局记忆 / 配置默认。
+    ///
+    /// 顺序：**按应用规则表（compat.toml）** → per-app 记忆表 → 全局记忆 / 配置默认。
+    ///
+    /// ⚠ 规则表排在记忆表**之前**是刻意的，与此处原 `TODO(app_rules)` 注释设想的位置相反。
+    /// 原设想是「首次进入时生效，之后跟随用户手切」，那个语义对 Everything / Listary 这类
+    /// **常驻隐藏式**窗口不成立：进程始终不退出，会话级记忆表里「首次」只有一次，用户从第二次
+    /// 唤出起规则就再也不生效。放到记忆表之前，配合 `apply_initial_mode` 的跨进程守卫，语义
+    /// 才是「每次从别的应用切进来都套用，停留在该应用期间尊重手切」。
+    ///
+    /// 规则是**初始值不是锁定**：它只在焦点跨进程切入的那一刻参与决策，此后用户手切自由，
+    /// 且同应用内的焦点跳转不会重新套用（守卫见 `apply_initial_mode` 调用点）。
     fn initial_chinese_mode_for(&self, proc_name: &str) -> bool {
         let bundle = self.rt();
         let d = &bundle.config.input.default;
+        if let Some(m) = self.rule_initial_mode(proc_name) {
+            return m.is_chinese();
+        }
         if d.per_app_scope()
             && !proc_name.is_empty()
             && let Some(&m) = self
@@ -1525,8 +1612,6 @@ impl Coordinator {
         {
             return m;
         }
-        // TODO(app_rules): 未来在此查按应用规则表（input.default.app_rules：进程名 → 初始中/英，
-        // 优先级高于下方全局记忆/默认；配置形态对齐 input.punct.custom_mappings 的 Map 先例）。
         if d.remember_last_state {
             self.runtime_last
                 .lock()
@@ -1637,6 +1722,7 @@ impl Coordinator {
         let d = &bundle.config.input.default;
         let proc = self.cached_proc_name(client_token);
         let chinese = self.initial_chinese_mode_for(&proc);
+        let rule_punct = self.rule_initial_punct(&proc);
         let follow = bundle.config.input.punct.follow_mode;
         let mut s = self.state.lock().unwrap_or_else(|e| e.into_inner());
         if reset_aux && !d.remember_last_state {
@@ -1649,6 +1735,12 @@ impl Coordinator {
             if follow {
                 s.chinese_punct = chinese;
             }
+        }
+        // per-app 标点规则**最后**落地，压过 follow_mode 的推导与 reset_aux 的重置。
+        // 顺序反了的话，用户配了 initial_punct 却恰好开着 follow_mode 时，规则会被
+        // 上面那行静默覆盖——「配了没反应、日志里也没有痕迹」正是本仓反复出现的形态。
+        if let Some(p) = rule_punct {
+            s.chinese_punct = p.is_chinese();
         }
     }
 
@@ -5215,11 +5307,43 @@ impl MessageHandler for Coordinator {
         }
         // 解析焦点进程的 caret 兼容态（微信 caret_use_top 等）。本段为 FOCUS_GAINED 的重型
         // 后置段（DLL 阻塞响应已写出），同步 OpenProcess 不影响首键延迟。
+        // ⚠ 必须在 update_active_compat **之前**取旧值：该函数会整体覆写 active_compat，
+        // 跑完之后读到的已是新进程的规则，「切换前那个应用有没有初始规则」就永远取不到了。
+        // 漏掉这点不会编译报错、不会 panic，只表现为「从规则应用切出去后模式不恢复」。
+        let new_pid = (data.client_token >> 32) as u32;
+        let (old_pid, old_has_rule) = {
+            let ac = self.active_compat.lock().unwrap_or_else(|e| e.into_inner());
+            (ac.pid, ac.has_initial_rule)
+        };
         self.update_active_compat(data.client_token);
-        // per-app 状态：进程名已入缓存，按记忆表/默认值切换本应用中英状态。若与同步段
+        let new_has_rule = self
+            .active_compat
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .has_initial_rule;
+        // per-app 状态：进程名已入缓存，按规则表/记忆表/默认值切换本应用中英状态。若与同步段
         // get_current_mode 回传值不同（该进程首次聚焦），随后的 push_activation_status 推送修正。
-        // global 作用域下焦点切换不动状态（激活重置只发生在 IME_ACTIVATED）。
-        if self.rt().config.input.default.per_app_scope() {
+        //
+        // 两个条件的分工：
+        //   crossed      焦点**跨进程**切入才重算。同应用内的焦点跳转（Everything 的搜索框
+        //                ↔ 结果列表）不重算，否则用户手切的模式会被反复拉回初始值——这正是
+        //                「初始值」与「锁定」的分界线。
+        //   per_app / has_rule
+        //                per_app_scope 是既有的按应用记忆语义；has_rule 把 compat.toml 规则的
+        //                影响严格限制在**进出规则应用**这一步。判据若退化成「规则表非空」，
+        //                则任意两个应用之间的切换都会重算，global+remember=false（出厂默认）下
+        //                会把用户在 Word 手切的英文在切到 Chrome 时重置掉，与规则应用无关。
+        //
+        // 取舍：per_app_scope 下同进程重复 focus_gained 不再重算（此前每次都算）。记忆表由
+        // record_app_mode 与当前状态保持同步，重算结果恒等于现值，故语义无变化；代价是失去了
+        // 一条隐式的 compartment 脏事件自愈路径，该自愈在 IME_ACTIVATED 路径仍然保留。
+        let crossed = new_pid != 0 && old_pid != new_pid;
+        if should_reapply_initial(
+            crossed,
+            self.rt().config.input.default.per_app_scope(),
+            old_has_rule,
+            new_has_rule,
+        ) {
             self.apply_initial_mode(data.client_token, false);
         }
         let status = self.build_status();
@@ -5302,25 +5426,54 @@ impl MessageHandler for Coordinator {
     fn get_current_mode(&self, client_token: u64) -> (bool, bool) {
         // FocusGained 同步路径回传 ModePush：DLL 正同步阻塞等本值，仅允许锁+HashMap 查询，
         // 严禁 OpenProcess 等跨进程调用。
-        // state_scope="app"：pid 已入缓存且记忆表命中 → 先切到该应用的记忆状态再回传，
-        // 消除首键竞态；未命中（进程首次聚焦）保持现状，由重型段 handle_focus_gained 修正。
-        if self.rt().config.input.default.per_app_scope() {
+        // 命中规则表 / 记忆表 → 先切到目标状态再回传，消除首键竞态；都未命中（进程首次聚焦
+        // 且无规则）保持现状，由重型段 handle_focus_gained 修正。
+        //
+        // 本段早于重型段的 update_active_compat，此刻 active_compat.pid 仍是**上一个**进程，
+        // 正好用来判断本次是否跨进程切入。同应用内跳转不重算，理由同 handle_focus_gained：
+        // 否则用户手切的模式会在换个输入框时被拉回初始值。
+        let new_pid = (client_token >> 32) as u32;
+        let crossed = new_pid != 0
+            && self
+                .active_compat
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .pid
+                != new_pid;
+        if crossed {
             let proc = self.cached_proc_name(client_token);
             if !proc.is_empty() {
-                let remembered = self
-                    .mode_states
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .get(&proc)
-                    .copied();
-                if let Some(chinese) = remembered {
+                // 规则表优先于记忆表，与 `initial_chinese_mode_for` **必须同序**：两处顺序不
+                // 一致会让同步回传值与重型段的落地值不同，表现为首键按 A 上屏、随后被 push 成 B。
+                let target = self
+                    .rule_initial_mode(&proc)
+                    .map(|m| m.is_chinese())
+                    .or_else(|| {
+                        if self.rt().config.input.default.per_app_scope() {
+                            self.mode_states
+                                .lock()
+                                .unwrap_or_else(|e| e.into_inner())
+                                .get(&proc)
+                                .copied()
+                        } else {
+                            None
+                        }
+                    });
+                let rule_punct = self.rule_initial_punct(&proc);
+                if target.is_some() || rule_punct.is_some() {
                     let follow = self.rt().config.input.punct.follow_mode;
                     let mut s = self.state.lock().unwrap_or_else(|e| e.into_inner());
-                    if s.chinese_mode != chinese {
+                    if let Some(chinese) = target
+                        && s.chinese_mode != chinese
+                    {
                         s.chinese_mode = chinese;
                         if follow {
                             s.chinese_punct = chinese;
                         }
+                    }
+                    // 与 apply_initial_mode 同序：显式标点规则最后落地，压过 follow 推导。
+                    if let Some(p) = rule_punct {
+                        s.chinese_punct = p.is_chinese();
                     }
                     return (s.chinese_mode, s.full_width);
                 }
@@ -6720,7 +6873,14 @@ mod initial_mode_tests {
             cfg.input.default.state_scope = "app".into();
             cfg.input.default.chinese_mode = true;
         });
-        set_focus_proc(&c, 100, "game.exe");
+        // 焦点原本在别的进程。同步段先于重型段的 update_active_compat 执行，此刻
+        // active_compat.pid 仍是**上一个**进程——`crossed` 判据正是靠这一点识别「跨进程
+        // 切入」。故夹具必须把旧进程留在 active_compat 里，只把新进程名喂进 pid_names。
+        set_focus_proc(&c, 1, "other.exe");
+        c.pid_names
+            .lock()
+            .unwrap()
+            .insert(100, "game.exe".to_string());
         c.mode_states
             .lock()
             .unwrap()
@@ -6741,6 +6901,114 @@ mod initial_mode_tests {
         c.state.lock().unwrap().chinese_mode = false;
         let (chinese, _) = c.get_current_mode(token(100));
         assert!(!chinese);
+    }
+
+    /// 注入 compat.toml 的应用规则（纯内存，不碰文件系统）。
+    fn set_rule(
+        c: &Arc<Coordinator>,
+        process: &str,
+        mode: Option<wind_config::app_compat::InitialMode>,
+        punct: Option<wind_config::app_compat::InitialMode>,
+    ) {
+        use wind_config::app_compat::{AppCompat, AppCompatRule};
+        *c.app_compat.lock().unwrap() = AppCompat::from_rules(vec![AppCompatRule {
+            process: process.to_string(),
+            initial_mode: mode,
+            initial_punct: punct,
+            ..Default::default()
+        }]);
+    }
+
+    /// 应用规则**压过** per-app 记忆表。
+    ///
+    /// 顺序反了（规则排记忆表之后）对 Everything / Listary 这类**常驻隐藏式**进程等于
+    /// 只在开机后第一次唤出时生效：进程不退出，会话级记忆表里「首次」永远只有一次。
+    #[test]
+    fn app_rule_beats_per_app_memory() {
+        use wind_config::app_compat::InitialMode as IM;
+        let c = coord_with(|cfg| {
+            cfg.input.default.state_scope = "app".into();
+            cfg.input.default.chinese_mode = true;
+        });
+        set_rule(&c, "everything.exe", Some(IM::English), None);
+        c.mode_states
+            .lock()
+            .unwrap()
+            .insert("everything.exe".into(), true); // 记忆表说中文
+        assert!(
+            !c.initial_chinese_mode_for("everything.exe"),
+            "规则必须压过记忆表，否则对常驻进程只生效一次"
+        );
+        // 没有规则的进程仍旧走记忆表，既有语义不变。
+        c.mode_states
+            .lock()
+            .unwrap()
+            .insert("game.exe".into(), true);
+        assert!(c.initial_chinese_mode_for("game.exe"));
+    }
+
+    /// 重算门控的完整矩阵。这是本功能唯一容易写错又最难从现象反推的地方，
+    /// 逐条锁死；每条注释即该组合对应的真实场景。
+    #[test]
+    fn reapply_gate_matrix() {
+        // 同应用内焦点跳转（Everything 搜索框 ↔ 结果列表）：一律不重算，保住用户手切。
+        assert!(!should_reapply_initial(false, true, true, true));
+        // 跨进程、无 per_app、两边都没规则（Word → Chrome）：不动。放宽成「规则表非空」
+        // 就会在这里重算，把用户在 Word 手切的英文冲成配置默认。
+        assert!(!should_reapply_initial(true, false, false, false));
+        // 进入规则应用（Word → Everything）。
+        assert!(should_reapply_initial(true, false, false, true));
+        // **离开**规则应用（Everything → Word）：只看 new_has_rule 会漏掉这条，
+        // 表现为 Everything 的英文残留给之后的每一个应用。
+        assert!(should_reapply_initial(true, false, true, false));
+        // per_app 既有语义不受规则影响。
+        assert!(should_reapply_initial(true, true, false, false));
+    }
+
+    /// 显式 `initial_punct` 压过 `follow_mode` 的推导。
+    /// 顺序反了的话，用户配了标点规则却恰好开着 follow_mode 时它会被静默覆盖。
+    #[test]
+    fn initial_punct_rule_beats_follow_mode() {
+        use wind_config::app_compat::InitialMode as IM;
+        let c = coord_with(|cfg| {
+            cfg.input.punct.follow_mode = true;
+            cfg.input.default.chinese_mode = true;
+        });
+        set_rule(&c, "everything.exe", Some(IM::English), Some(IM::Chinese));
+        set_focus_proc(&c, 100, "everything.exe");
+        c.apply_initial_mode(token(100), false);
+        let s = c.state.lock().unwrap();
+        assert!(!s.chinese_mode, "规则要求初始英文");
+        assert!(
+            s.chinese_punct,
+            "initial_punct=chinese 必须压过 follow_mode 推出的英文标点"
+        );
+    }
+
+    /// 同步路径：跨进程切入规则应用时当场回传英文（消除首键竞态），
+    /// 而同应用内的再次 focus_gained 不得把用户手切的模式拉回规则值。
+    #[test]
+    fn get_current_mode_rule_applies_only_on_cross_process_switch() {
+        use wind_config::app_compat::InitialMode as IM;
+        let c = coord_with(|cfg| cfg.input.default.chinese_mode = true);
+        set_rule(&c, "everything.exe", Some(IM::English), None);
+        // 焦点原本在别的进程（active_compat.pid=1），现在切入 everything.exe。
+        set_focus_proc(&c, 1, "other.exe");
+        c.pid_names
+            .lock()
+            .unwrap()
+            .insert(100, "everything.exe".to_string());
+        let (chinese, _) = c.get_current_mode(token(100));
+        assert!(!chinese, "跨进程切入规则应用 → 同步段即回传英文");
+
+        // 重型段已把 active_compat.pid 更新为 100；用户随后手切回中文。
+        c.active_compat.lock().unwrap().pid = 100;
+        c.state.lock().unwrap().chinese_mode = true;
+        let (chinese, _) = c.get_current_mode(token(100));
+        assert!(
+            chinese,
+            "同应用内跳转不得把手切的中文拉回规则的英文——规则是初始值不是锁定"
+        );
     }
 
     /// cancel_on_mode_switch=false（默认）：CapsLock 开着按切换键，保持翻转语义、不动 CapsLock。

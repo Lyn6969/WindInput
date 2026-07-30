@@ -286,6 +286,12 @@ pub enum MenuCmd {
     /// 为当前焦点应用设置候选窗首显策略（compat.toml 的 first_show_mode）。
     /// 参数：0=wait 1=fast 2=instant。三档互斥，UI 上呈现为子菜单单选。
     FirstShowMode(u8),
+    /// 为当前焦点应用设置初始中英状态（compat.toml 的 initial_mode）。
+    /// 参数：0=跟随全局（清除规则）1=英文 2=中文。
+    InitialMode(u8),
+    /// 为当前焦点应用设置初始中英标点（compat.toml 的 initial_punct）。
+    /// 参数同 [`MenuCmd::InitialMode`]。
+    InitialPunct(u8),
 }
 
 /// 菜单项的动作类型（右键候选菜单 + 功能主菜单共用）
@@ -307,7 +313,8 @@ impl MenuKind {
     /// 稳定菜单 id：macOS `.app` 把它写进 `NSMenuItem.tag`，选中后经 `CmdMenuAction`
     /// 原样回传，Rust 据此还原动作。构建菜单树（下发）与处理回传（还原）共用此映射，
     /// 二者必须一致。`Submenu`/`Separator` 不回传，恒为 0。
-    /// id 区间：1 复制｜10-19 词条操作｜100-199 固定命令｜1000+ 方案｜2000+ 主题｜3000+ 过滤｜4000+ 明暗。
+    /// id 区间：1 复制｜10-19 词条操作｜100-199 固定命令｜1000+ 方案｜2000+ 主题｜3000+ 过滤｜
+    /// 4000+ 明暗｜5000+ 候选窗首显｜6000+ 初始中英｜7000+ 初始标点。
     pub fn to_menu_id(self) -> i32 {
         match self {
             MenuKind::Separator | MenuKind::Submenu => 0,
@@ -344,6 +351,8 @@ impl MenuKind {
                 MenuCmd::ToggleInputDiagnostics => 120,
                 MenuCmd::TogglePasswordSuppress => 121,
                 MenuCmd::FirstShowMode(m) => 5000 + m as i32,
+                MenuCmd::InitialMode(m) => 6000 + m as i32,
+                MenuCmd::InitialPunct(m) => 7000 + m as i32,
                 MenuCmd::SchemaSelect(i) => 1000 + i as i32,
                 MenuCmd::ThemeSelect(i) => 2000 + i as i32,
                 MenuCmd::FilterMode(i) => 3000 + i as i32,
@@ -390,6 +399,8 @@ impl MenuKind {
             3000..=3999 => MenuCmd::FilterMode((id - 3000) as usize),
             4000..=4999 => MenuCmd::ThemeStyle((id - 4000) as u8),
             5000..=5999 => MenuCmd::FirstShowMode((id - 5000) as u8),
+            6000..=6999 => MenuCmd::InitialMode((id - 6000) as u8),
+            7000..=7999 => MenuCmd::InitialPunct((id - 7000) as u8),
             _ => return None,
         };
         Some(MenuKind::Command(cmd))
@@ -1559,6 +1570,12 @@ mod menu_id_tests {
             MenuCmd::FirstShowMode(0),
             MenuCmd::FirstShowMode(1),
             MenuCmd::FirstShowMode(2),
+            MenuCmd::InitialMode(0),
+            MenuCmd::InitialMode(1),
+            MenuCmd::InitialMode(2),
+            MenuCmd::InitialPunct(0),
+            MenuCmd::InitialPunct(1),
+            MenuCmd::InitialPunct(2),
             MenuCmd::StatusToggleAlways,
             MenuCmd::StatusResetPosition,
             MenuCmd::StatusScreenshot,

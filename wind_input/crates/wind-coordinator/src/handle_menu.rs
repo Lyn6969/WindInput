@@ -127,6 +127,8 @@ impl Coordinator {
             MenuCmd::ToggleInputDiagnostics => self.toggle_input_diag_hud(),
             MenuCmd::TogglePasswordSuppress => self.toggle_password_suppress(),
             MenuCmd::FirstShowMode(m) => self.set_first_show_mode(m),
+            MenuCmd::InitialMode(m) => self.set_initial_state_rule(false, m),
+            MenuCmd::InitialPunct(m) => self.set_initial_state_rule(true, m),
             MenuCmd::StatusToggleAlways => self.status_toggle_always(),
             MenuCmd::StatusTogglePinned => self.status_toggle_pinned(),
             MenuCmd::StatusResetPosition => self.status_reset_position(),
@@ -423,6 +425,88 @@ impl Coordinator {
         self.show_status();
     }
 
+    /// 为当前焦点应用设置初始中英状态（`is_punct=false`）或初始标点（`is_punct=true`），
+    /// 并写入用户层 compat.toml。`mode_id`：0=跟随全局（清除规则）1=英文 2=中文。
+    ///
+    /// 前三步与 [`Self::set_first_show_mode`] 完全同构，缺一不可，理由见那里的注释。
+    /// 第四步是本项特有：规则语义是「初始状态」，只在焦点跨进程切入时参与决策，但用户
+    /// 此刻正是在**当前**应用里显式设置它，必须立即生效一次——否则得切走再切回才看得到
+    /// 效果，会被当成"设了没反应"。
+    pub(crate) fn set_initial_state_rule(&self, is_punct: bool, mode_id: u8) {
+        use wind_config::app_compat::InitialMode as IM;
+        let mode = match mode_id {
+            1 => Some(IM::English),
+            2 => Some(IM::Chinese),
+            _ => None, // 0 = 跟随全局：清除该应用在本维度上的规则
+        };
+        let name = self.active_process_name();
+        if name.is_empty() {
+            // 与 set_first_show_mode 一致：菜单项此时应是禁用态，走到这里说明有别的调用
+            // 路径，记一条便于排查——静默返回会让用户以为点了没反应。
+            tracing::warn!("set_initial_state_rule: 当前焦点进程未知，忽略本次设置");
+            return;
+        }
+        let Some(user_dir) = self.compat_dirs.1.clone() else {
+            tracing::warn!("set_initial_state_rule: 无用户配置目录，无法持久化");
+            return;
+        };
+        // 1）写用户层 compat.toml。
+        let written = if is_punct {
+            wind_config::app_compat::set_user_initial_punct(&user_dir, &name, mode)
+        } else {
+            wind_config::app_compat::set_user_initial_mode(&user_dir, &name, mode)
+        };
+        if let Err(e) = written {
+            tracing::error!("set_initial_state_rule: 写用户 compat.toml 失败: {e}");
+            return;
+        }
+        // 2）重载整表（系统层 + 用户层），与启动时同一口径。
+        let reloaded = wind_config::app_compat::AppCompat::load(
+            self.compat_dirs.0.as_deref(),
+            Some(user_dir.as_path()),
+        );
+        *self.app_compat.lock().unwrap_or_else(|e| e.into_inner()) = reloaded;
+        // 3）刷新 active 缓存的判据位：同 pid 时 update_active_compat 提前 return，不会自己刷。
+        //    漏掉这步会让「切出本应用时是否重算」用上过期的判据。
+        //    注意先取值再持 active_compat 锁，避免与 app_compat 锁形成嵌套顺序。
+        let want_mode = self.rule_initial_mode(&name).map(|m| m.is_chinese());
+        let want_punct = self.rule_initial_punct(&name).map(|m| m.is_chinese());
+        self.active_compat
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .has_initial_rule = want_mode.is_some() || want_punct.is_some();
+        // 4）立即生效一次。清除规则（None）时刻意不动当前状态：撤销规则不等于要求立刻
+        //    切换模式，下次从别的应用切进来时自然走回全局逻辑。
+        let follow = self.rt().config.input.punct.follow_mode;
+        {
+            let mut s = self.state.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(c) = want_mode
+                && s.chinese_mode != c
+            {
+                s.chinese_mode = c;
+                if follow {
+                    s.chinese_punct = c;
+                }
+            }
+            // 与 apply_initial_mode 同序：显式标点规则最后落地，压过 follow 推导。
+            if let Some(p) = want_punct {
+                s.chinese_punct = p;
+            }
+        }
+        tracing::info!(
+            "应用独立初始状态 for process={name}: {}={}",
+            if is_punct {
+                "initial_punct"
+            } else {
+                "initial_mode"
+            },
+            mode.map(|m| m.as_config()).unwrap_or("(follow-global)")
+        );
+        self.push_state_update();
+        self.notify_toolbar();
+        self.show_status();
+    }
+
     /// 在文件管理器中打开目录（高级菜单「打开…目录」共用）。
     /// 目录可能尚未创建（如日志目录在首条日志前不存在），先 best-effort 建目录，
     /// 否则资源管理器会弹「找不到路径」。
@@ -679,49 +763,6 @@ impl Coordinator {
             M::leaf("打开用户数据目录", cmd(MenuCmd::OpenConfigDir), true, false),
             M::leaf("打开日志目录", cmd(MenuCmd::OpenLogDir), true, false),
             M::separator(),
-            // 候选窗首显策略（per-app，写用户层 compat.toml）。三档**互斥**，做成子菜单单选：
-            // 布尔开关时代它们能同时打开，实测就因此出过「fast 配了却从未生效」——instant
-            // 抢先放行，fast 的判据根本没机会跑。互斥语义现在由类型与 UI 双重保证。
-            // 进程名未解析时整个子菜单禁用而非隐藏，菜单项位置保持稳定。
-            {
-                let proc = self.active_process_name();
-                let cur = self
-                    .active_compat
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .first_show_mode;
-                use wind_config::app_compat::FirstShowMode as F;
-                let enabled = !proc.is_empty();
-                let label = if enabled {
-                    format!("候选窗首显（{proc}）")
-                } else {
-                    "候选窗首显（当前应用未知）".to_string()
-                };
-                M::submenu(
-                    label,
-                    vec![
-                        M::leaf(
-                            "等待精确坐标（默认）",
-                            cmd(MenuCmd::FirstShowMode(0)),
-                            enabled,
-                            cur == F::Wait,
-                        ),
-                        M::leaf(
-                            "快速显示",
-                            cmd(MenuCmd::FirstShowMode(1)),
-                            enabled,
-                            cur == F::Fast,
-                        ),
-                        M::leaf(
-                            "立即显示（最快，可能抖动）",
-                            cmd(MenuCmd::FirstShowMode(2)),
-                            enabled,
-                            cur == F::Instant,
-                        ),
-                    ],
-                )
-            },
-            M::separator(),
             M::leaf(
                 "输入诊断 HUD",
                 cmd(MenuCmd::ToggleInputDiagnostics),
@@ -738,6 +779,72 @@ impl Coordinator {
             ),
         ];
 
+        // 应用独立配置：所有 per-app 规则（均落在用户层 compat.toml）聚合于此。
+        //
+        // 放**顶层**而不是塞进「高级」是为了不增加层级深度——「高级 ▸ 应用独立配置 ▸ 初始
+        // 输入模式 ▸ 三选一」是四层，而此前的「高级 ▸ 候选窗首显 ▸ 三选一」是三层；提到顶层
+        // 后维持三层不变。这些项也比截图/打开目录更常用。
+        //
+        // 进程名只在父项显示一次，子项不再各自重复；进程未解析时**子项禁用而非隐藏**
+        // （父项 enabled 恒 true，见 `MenuItemSpec::submenu`），菜单项位置保持稳定。
+        let (per_app_label, per_app_children) = {
+            use wind_config::app_compat::{FirstShowMode as F, InitialMode as IM};
+            let proc = self.active_process_name();
+            let enabled = !proc.is_empty();
+            let cur_first_show = self
+                .active_compat
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .first_show_mode;
+            let cur_mode = self.rule_initial_mode(&proc);
+            let cur_punct = self.rule_initial_punct(&proc);
+            let label = if enabled {
+                format!("应用独立配置（{proc}）")
+            } else {
+                "应用独立配置（当前应用未知）".to_string()
+            };
+            // 三档单选。「跟随全局」必须是独立一档，不能靠"取消勾选"表达——否则用户设了
+            // 规则之后无从撤销。它对应写盘时的 None，即从 compat.toml 里清掉该字段。
+            let tri = |cur: Option<IM>, mk: fn(u8) -> MenuCmd| {
+                vec![
+                    M::leaf("跟随全局（默认）", cmd(mk(0)), enabled, cur.is_none()),
+                    M::leaf("英文", cmd(mk(1)), enabled, cur == Some(IM::English)),
+                    M::leaf("中文", cmd(mk(2)), enabled, cur == Some(IM::Chinese)),
+                ]
+            };
+            let children = vec![
+                M::submenu("初始输入模式", tri(cur_mode, MenuCmd::InitialMode)),
+                M::submenu("初始中文标点", tri(cur_punct, MenuCmd::InitialPunct)),
+                M::separator(),
+                // 三档**互斥**，做成子菜单单选：布尔开关时代它们能同时打开，实测就因此出过
+                // 「fast 配了却从未生效」——instant 抢先放行，fast 的判据根本没机会跑。
+                M::submenu(
+                    "候选窗首显",
+                    vec![
+                        M::leaf(
+                            "等待精确坐标（默认）",
+                            cmd(MenuCmd::FirstShowMode(0)),
+                            enabled,
+                            cur_first_show == F::Wait,
+                        ),
+                        M::leaf(
+                            "快速显示",
+                            cmd(MenuCmd::FirstShowMode(1)),
+                            enabled,
+                            cur_first_show == F::Fast,
+                        ),
+                        M::leaf(
+                            "立即显示（最快，可能抖动）",
+                            cmd(MenuCmd::FirstShowMode(2)),
+                            enabled,
+                            cur_first_show == F::Instant,
+                        ),
+                    ],
+                ),
+            ];
+            (label, children)
+        };
+
         let items = vec![
             M::submenu("输入方案", schema_children),
             M::leaf("全角", cmd(MenuCmd::ToggleWidth), true, full),
@@ -751,6 +858,7 @@ impl Coordinator {
             M::leaf("重载配置", cmd(MenuCmd::ReloadConfig), true, false),
             M::leaf("重启服务", cmd(MenuCmd::RestartService), true, false),
             M::separator(),
+            M::submenu(per_app_label, per_app_children),
             M::submenu("高级", advanced_children),
             M::separator(),
             M::leaf("词库管理...", cmd(MenuCmd::OpenDictionary), true, false),
