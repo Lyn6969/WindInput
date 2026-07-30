@@ -35,5 +35,10 @@ x = ["ie"]
 y = ["ing"]
 z = ["iao"]
 
+# 零声母以 `o` 引导，第二键取该音节自身的韵母键：
+#   oa=a  ol=ai  oj=an  oh=ang  ok=ao  oe=e  oq=ei  of=en  og=eng  or=er  oo=o  ob=ou
+# 此处必须列全 12 个 —— 转换时零声母走「引导键的允许列表 ∩ 第二键的韵母表」，
+# 列表里没有的音节即便韵母键对得上也会被拒。原先只列了 o/ou 两个，
+# 于是智能ABC 下「爱/安/恩/儿」这类零声母字一个都打不出来。
 [zero_initials]
-o = ["o", "ou"]
+o = ["a", "ai", "an", "ang", "ao", "e", "ei", "en", "eng", "er", "o", "ou"]
