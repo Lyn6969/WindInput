@@ -176,7 +176,7 @@ When implementing features or fixes in wind_tsf:
 4. **COM reference counting:** Use SafeRelease() template for interface cleanup
 5. **Named pipes:** Connection is lazy (on-demand), with circuit breaker fallback
 6. **Edit sessions:** For TSF API calls (composition, caret position), must be called within RequestEditSession
-7. **HostWindow:** 只在 host_render_processes 配置的进程中激活（由 Go 服务通过 IPC 指令触发 Initialize）
+7. **HostWindow:** 只在 compat.toml 中 `host_render = true` 的进程中激活（由 Rust 服务通过 IPC 指令触发 Initialize）
 
 ### Common Patterns
 

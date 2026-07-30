@@ -126,10 +126,10 @@ mod tests {
                 .unwrap_or_else(|| panic!("缺 key {k}"))
                 .clone()
         };
-        // L2 预置覆盖
+        // L2 预置覆盖（code default 是空串，data/config.toml 覆盖成 wubi86）
         assert_eq!(
-            find("compat.host_render_processes")["default"],
-            serde_json::json!(["SearchHost.exe"])
+            find("schema.active")["default"],
+            serde_json::json!("wubi86")
         );
         // 配对跳出键默认只含右符号：设置界面的默认勾选态直接取自这里，漂了就会与内核不一致。
         assert_eq!(

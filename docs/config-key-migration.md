@@ -7,13 +7,14 @@
 > 注：第二轮微调（`general`→`input.default` 去前缀 · `ui.status_indicator`→`ui.status` ·
 > `dict.phrase`→`input.phrase` · 移除 `debug.perf_sampling`）已合入下表的"现行"列。
 
-## 顶级域（7 个，"正交大类"准则）
+## 顶级域（6 个，"正交大类"准则）
 
 `schema`(方案/拼音/模式) · `input`(输入行为，含 `default` 启动默认 / `phrase` 短语) ·
-`keys`(全部按键) · `ui`(外观) · `stats`(统计) · `compat`(兼容) · `debug`(调试)
+`keys`(全部按键) · `ui`(外观) · `stats`(统计) · `debug`(调试)
 
 移除的旧顶级：`hotkeys`(→keys) · `pinyin`(→schema.pinyin) · `features`(拆解：stats 升顶级 / s2t·cmdbar→input / 模式三件套→schema) ·
-`general`(→input.default) · `dict`(→input.phrase)。
+`general`(→input.default) · `dict`(→input.phrase) · `compat`(唯一字段 `host_render_processes` 已迁入 `compat.toml` 的
+`AppCompatRule::host_render`，与按进程名匹配的其余兼容规则同库，详见 `docs/redesign/host-render-windows-port.md` §11.7)。
 
 ---
 
@@ -119,10 +120,10 @@
 | `features.stats.enabled` | `stats.enabled` |
 | `features.stats.track_english` | `stats.track_english` |
 
-## compat（1，不变） / debug（1）
+## debug（1）
 
 | 旧 | 现行 |
 |---|---|
-| `compat.host_render_processes` | 不变 |
 | `debug.log_level` | 不变 |
 | `debug.perf_sampling` | **已移除**（无业务读取点） |
+| `compat.host_render_processes` | **已移除**（并入 `compat.toml` 的 `AppCompatRule::host_render`） |

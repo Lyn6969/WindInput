@@ -276,13 +276,16 @@ fn main() {
         suffix: pipe_suffix.to_string(),
         request_timeout_ms: 1000,
     };
-    // host-render 管理器（Windows）：白名单取自 compat.host_render_processes。
+    // host-render 管理器（Windows）：白名单取自 compat.toml 里 host_render=true 的规则
+    // （系统层 + 用户层，与 Coordinator 启动时加载 AppCompat 同一口径）。
     // 同一 Arc 实例同时注入 BridgeServer（连接循环 setup/清理）与 Coordinator（写帧/隐藏）。
     #[cfg(windows)]
     let host_render = {
-        let whitelist = wind_config::Config::load(wind_config::Config::data_dir().as_deref())
-            .map(|c| c.compat.host_render_processes)
-            .unwrap_or_default();
+        let data_dir = wind_config::Config::data_dir();
+        let user_dir = wind_config::Config::user_config_dir();
+        let whitelist =
+            wind_config::app_compat::AppCompat::load(data_dir.as_deref(), user_dir.as_deref())
+                .host_render_processes();
         wind_bridge::host_render_windows::HostRenderManager::new(pipe_suffix, whitelist)
     };
     let bridge = BridgeServer::new(bridge_config, deferred.clone());

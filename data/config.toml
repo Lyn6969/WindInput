@@ -413,9 +413,6 @@ auto_hide_delay = 5
 enabled = true
 track_english = true
 
-[compat]
-host_render_processes = ["SearchHost.exe"]
-
 [debug]
 # trace / debug / info / warn / error。注意 info 及以下级别不得含用户输入内容与候选词。
 log_level = "info"

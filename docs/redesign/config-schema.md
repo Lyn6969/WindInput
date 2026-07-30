@@ -92,8 +92,8 @@ Rust 目标：`SchemaManager`（扫描/合并/激活）+ `build_engine` 消费�
 
 ## 6. compat / runtime_state / schema_overrides（阶段 C，配合 coordinator）
 - **AppCompat**：per-process 规则，按进程名匹配——对应 coordinator.md 的敏感字段/光标定位/应用级行为。**字段级合并**（修 Go 整体替换坏设计）。
-  - 已实现：`caret_use_top`、`first_show_mode`、`initial_mode`、`initial_punct`（后两项即「应用独立的初始中英/标点」，语义为初始值而非锁定，字段文档见 `data/compat.toml`）。
-  - 待接线：`skip_caret_pending`、`host_render`（后者当前仍是 `config.toml` 的 `compat.host_render_processes` 进程名列表；归并到本表时**不可**走 `ActiveCompat` 全局焦点槽缓存，须按事件源 PID 直查，理由见 `host-render-windows-port.md` §11.2）。
+  - 已实现：`caret_use_top`、`first_show_mode`、`initial_mode`、`initial_punct`（后两项即「应用独立的初始中英/标点」，语义为初始值而非锁定，字段文档见 `data/compat.toml`）、`host_render`（原 `config.toml` 的 `compat.host_render_processes` 进程名列表已并入本表；白名单现算于 `AppCompat::host_render_processes()`，消费点按事件源 PID 直查 `HostRenderManager::is_process_whitelisted`，**不经** `ActiveCompat` 全局焦点槽缓存，理由见 `host-render-windows-port.md` §11.2/§11.7）。
+  - 待接线：`skip_caret_pending`。
   - 已删除：`pin_candidate_position`（长期无消费点；该能力由 `ui.candidate.position_mode = "fixed"` 一套实现）。
 - **RuntimeState**：last 中英文/全半角/标点、引擎类型、工具栏位置、候选固定位；与 `remember_last_state` 的关系（位置类始终持久化）。
 - **schema_overrides**：每方案覆盖全局配置项——Rust 用**类型化**覆盖（修 Go 的 `map[string]any` 无校验 + 合并散落调用方）。

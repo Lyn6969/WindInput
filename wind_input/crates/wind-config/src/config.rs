@@ -5,7 +5,10 @@
 //!
 //! 顶级域（"正交大类"准则，详见 SETTINGS_REVAMP_PLAN.md / docs/config-key-migration.md）：
 //! schema(方案+pinyin+模式) / input(输入行为，含 default 启动默认 / phrase 短语) /
-//! keys(全部按键) / ui(外观) / stats(统计) / compat / debug。
+//! keys(全部按键) / ui(外观) / stats(统计) / debug。
+//!
+//! 按进程名的兼容性规则（HostRender 白名单、caret 定位等）不在这里，见
+//! `app_compat.rs`（独立的 `compat.toml` 文件，字段级合并，键名不受本文件三层合并约束）。
 
 use anyhow::Context;
 use serde::{Deserialize, Serialize};
@@ -147,8 +150,6 @@ pub struct Config {
     pub ui: UiConfig,
     #[serde(default)]
     pub stats: StatsConfig,
-    #[serde(default)]
-    pub compat: CompatConfig,
     #[serde(default)]
     pub debug: DebugConfig,
 }
@@ -1889,25 +1890,7 @@ impl Default for StatsConfig {
     }
 }
 
-// ───────────────────────── compat / debug ─────────────────────────
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct CompatConfig {
-    #[serde(default = "default_host_render_processes")]
-    pub host_render_processes: Vec<String>,
-}
-
-fn default_host_render_processes() -> Vec<String> {
-    vec!["SearchHost.exe".to_string()]
-}
-
-impl Default for CompatConfig {
-    fn default() -> Self {
-        Self {
-            host_render_processes: default_host_render_processes(),
-        }
-    }
-}
+// ───────────────────────── debug ─────────────────────────
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DebugConfig {
@@ -2011,7 +1994,6 @@ impl Default for Config {
             keys: KeysConfig::default(),
             ui: UiConfig::default(),
             stats: StatsConfig::default(),
-            compat: CompatConfig::default(),
             debug: DebugConfig::default(),
         }
     }
@@ -2178,7 +2160,7 @@ impl Config {
     /// 系统预置配置的 TOML 值：代码默认(L1) ⊕ `data/config.toml`(L2)，**不含用户层(L3)**。
     ///
     /// 供 capability 的 `default` 来源——出厂默认 = L1⊕L2。config.toml 作为系统预置
-    /// 可合法覆盖 L1（如 schema.active、compat.host_render_processes）。
+    /// 可合法覆盖 L1（如 schema.active）。
     pub fn system_preset_value(data_dir: Option<&Path>) -> anyhow::Result<toml::Value> {
         let mut merged = toml::Value::try_from(Self::default())?;
         if let Some(data_dir) = data_dir {
@@ -2193,8 +2175,8 @@ impl Config {
     /// 「与默认相同即不落盘」判定所用的出厂默认（L1⊕L2）。取不到则 `None`。
     ///
     /// ⚠️ **必须确认 `data/config.toml` 在场才返回 `Some`**：[`system_preset_value`] 传 `None`
-    /// 会退回纯 L1，而 L2 本就允许合法覆盖 L1（`schema.active`、`compat.host_render_processes`
-    /// 等出厂值只写在 L2）。拿纯 L1 当"默认"去比对，会把用户显式设的值误判成默认而删掉，
+    /// 会退回纯 L1，而 L2 本就允许合法覆盖 L1（`schema.active` 等出厂值只写在 L2）。
+    /// 拿纯 L1 当"默认"去比对，会把用户显式设的值误判成默认而删掉，
     /// `load()` 时再从 L2 回落成**另一个**值 —— 用户的设置被静默改写，比不清理坏得多。
     ///
     /// 这不是假想：`schema.mix.pinyin_only_overflow` 与 `auto_commit_block_on_pinyin` 就曾长期
@@ -3293,17 +3275,15 @@ active = "x"
     }
 
     #[test]
-    fn test_merge_keeps_input_s2t_compat_debug() {
+    fn test_merge_keeps_input_s2t_debug() {
         // 回归：deep-merge 必须保留各段（features 拆解后 s2t 归 input）
         let cfg = merged_with(
             "[input.s2t]\nenabled = true\nvariant = \"s2tw\"\n\
-             [debug]\nlog_level = \"trace\"\n\
-             [compat]\nhost_render_processes = [\"a.exe\"]\n",
+             [debug]\nlog_level = \"trace\"\n",
         );
         assert!(cfg.input.s2t.enabled, "input.s2t.enabled 应被合并");
         assert_eq!(cfg.input.s2t.variant, "s2tw");
         assert_eq!(cfg.debug.log_level, "trace", "debug 段应被合并");
-        assert_eq!(cfg.compat.host_render_processes, vec!["a.exe".to_string()]);
     }
 
     #[test]
@@ -3474,16 +3454,7 @@ active = "x"
         let preset = Config::system_preset_value(Some(data_dir)).unwrap();
         let cfg: Config = preset.try_into().unwrap();
         // config.toml 作为 L2 预置覆盖了空的 code default
-        assert_eq!(
-            cfg.compat.host_render_processes,
-            vec!["SearchHost.exe".to_string()]
-        );
         assert_eq!(cfg.schema.active, "wubi86");
-        // L1 code default 也含 SearchHost.exe；config.toml 的 L2 与之相同，合并后值不变。
-        assert_eq!(
-            Config::default().compat.host_render_processes,
-            vec!["SearchHost.exe".to_string()]
-        );
     }
 
     #[test]
@@ -3538,38 +3509,5 @@ smart_method = "delete_replace"
         let d = ToolbarConfig::default();
         assert!(!d.auto_hide);
         assert_eq!(d.auto_hide_delay, 5);
-    }
-
-    #[test]
-    fn test_compat_host_render_processes_serde_default() {
-        // 验证反序列化时缺少 host_render_processes 字段时，使用具名默认函数
-        let cfg: CompatConfig = toml::from_str("").unwrap();
-        assert_eq!(
-            cfg.host_render_processes,
-            vec!["SearchHost.exe".to_string()],
-            "缺少 host_render_processes 时应返回默认值 [\"SearchHost.exe\"]"
-        );
-    }
-
-    #[test]
-    fn test_compat_host_render_processes_missing_in_merged_config() {
-        // 验证在三层合并中，缺少 [compat] 段时反序列化得到正确的默认值
-        let cfg = merged_with("");
-        assert_eq!(
-            cfg.compat.host_render_processes,
-            vec!["SearchHost.exe".to_string()],
-            "合并时缺少 [compat] 段时应保留默认值"
-        );
-    }
-
-    #[test]
-    fn test_compat_host_render_processes_explicit_in_merged_config() {
-        // 验证显式指定 host_render_processes 时的覆盖
-        let cfg = merged_with("[compat]\nhost_render_processes = [\"test.exe\"]\n");
-        assert_eq!(
-            cfg.compat.host_render_processes,
-            vec!["test.exe".to_string()],
-            "显式指定时应覆盖默认值"
-        );
     }
 }

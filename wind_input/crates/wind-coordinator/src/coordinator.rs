@@ -1030,6 +1030,24 @@ impl Coordinator {
         self.host_render.get()
     }
 
+    /// 把 `app_compat` 现算的 HostRender 白名单同步给 manager。
+    ///
+    /// 白名单来自 compat.toml 的 `host_render = true` 规则（`AppCompatRule::host_render`），
+    /// 不是 config.toml 字段——调用点是每次 `app_compat` 被重新加载之后（menu 写规则、
+    /// 未来若加设置页开关同理），而非常规配置热重载（compat.toml 与 config.toml 是两个
+    /// 独立文件，后者变了不代表前者变了）。
+    #[cfg(windows)]
+    pub(crate) fn sync_host_render_whitelist(&self) {
+        if let Some(mgr) = self.host_render() {
+            let processes = self
+                .app_compat
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .host_render_processes();
+            mgr.set_whitelist(processes);
+        }
+    }
+
     /// 当前是否处于 host-render 受限宿主模式（SearchHost.exe / 开始菜单搜索框等）。
     /// `active_target()` 每次现查（无缓存），避免跨帧持有失效目标；它仅在 active 连接
     /// **已完成 setup** 时返回 Some，而 setup 会拒绝白名单外进程——故此判定天然经过
@@ -1917,10 +1935,6 @@ impl Coordinator {
                 self.push_password_suppress_config(0); // 密码框抑制策略（DLL 本地吃键门控）
                 self.push_custom_en_punct_config(0); // 英半列自定义标点：DLL 据此吃键转发
                 self.push_pair_state_ttl_config(0); // 配对状态时效（DLL 侧闸门据此判陈旧）
-                #[cfg(windows)]
-                if let Some(mgr) = self.host_render() {
-                    mgr.set_whitelist(new_cfg.compat.host_render_processes.clone());
-                }
                 self.show_toast(
                     "设置已更新",
                     ToastPosition::BottomCenter,

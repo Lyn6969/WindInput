@@ -167,6 +167,17 @@ pub struct AppCompatRule {
         skip_serializing_if = "Option::is_none"
     )]
     pub initial_punct: Option<InitialMode>,
+    /// 该进程加入 HostRender 白名单（受限宿主如 Win11 开始菜单 SearchHost.exe，候选窗由
+    /// 服务进程渲染后经共享内存转交宿主进程内的 DLL 上屏，绕开普通窗口盖不过的 Band 层级）。
+    ///
+    /// 原为独立的 `config.toml` 全局列表 `compat.host_render_processes`，现并入按进程名
+    /// 匹配的兼容规则表——与 `caret_use_top` 等字段同一套查找路径，不再是第二个真相源。
+    /// 消费点须按**事件源 PID 直查** `AppCompat::host_render_processes()` 现算的白名单
+    /// （`HostRenderManager::is_process_whitelisted`），不得经 `ActiveCompat` 全局焦点槽缓存
+    /// ——开始菜单弹出会连带激活兄弟进程，焦点槽会被污染，详见
+    /// `docs/redesign/host-render-windows-port.md` §11.2。
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub host_render: bool,
 }
 
 /// 在一组规则上就地修改指定进程的**某一个**字段。
@@ -209,6 +220,11 @@ pub fn set_initial_mode(rules: &mut Vec<AppCompatRule>, process: &str, mode: Opt
 /// 在一组规则上设置指定进程的初始中英标点（`None` = 清除规则，回到跟随全局）。
 pub fn set_initial_punct(rules: &mut Vec<AppCompatRule>, process: &str, mode: Option<InitialMode>) {
     upsert_rule(rules, process, |r| r.initial_punct = mode);
+}
+
+/// 在一组规则上设置指定进程是否加入 HostRender 白名单。语义见 [`upsert_rule`]。
+pub fn set_host_render(rules: &mut Vec<AppCompatRule>, process: &str, enabled: bool) {
+    upsert_rule(rules, process, |r| r.host_render = enabled);
 }
 
 /// 把规则集渲染成用户层 compat.toml 全文（含固定文件头）。纯函数，便于单测断言产物。
@@ -266,6 +282,15 @@ pub fn set_user_initial_punct(
     update_user_rule(user_dir, process, |r| r.initial_punct = mode)
 }
 
+/// 设置用户层 compat.toml 中指定进程是否加入 HostRender 白名单。
+pub fn set_user_host_render(
+    user_dir: &Path,
+    process: &str,
+    enabled: bool,
+) -> Result<(), std::io::Error> {
+    update_user_rule(user_dir, process, |r| r.host_render = enabled)
+}
+
 /// 所有应用兼容性规则 + 运行时查找表。
 #[derive(Debug, Clone, Default)]
 pub struct AppCompat {
@@ -297,6 +322,18 @@ impl AppCompat {
         self.lookup
             .get(&process_name.to_ascii_lowercase())
             .map(|&i| &self.apps[i])
+    }
+
+    /// 现算 HostRender 白名单：所有 `host_render = true` 的进程名（原始大小写）。
+    ///
+    /// 供 `HostRenderManager::set_whitelist` 消费；调用方须按事件源 PID 直查，
+    /// 不得经 `ActiveCompat` 全局焦点槽缓存，理由见 [`AppCompatRule::host_render`]。
+    pub fn host_render_processes(&self) -> Vec<String> {
+        self.apps
+            .iter()
+            .filter(|r| r.host_render)
+            .map(|r| r.process.clone())
+            .collect()
     }
 
     fn build_lookup(&mut self) {
@@ -588,5 +625,71 @@ mod tests {
         let parsed: AppCompatFile = toml::from_str(&text).expect("产物应可解析");
         assert_eq!(parsed.apps[0].initial_mode, Some(InitialMode::English));
         assert_eq!(parsed.apps[0].initial_punct, None);
+    }
+
+    #[test]
+    fn host_render_defaults_false_and_omitted_from_render() {
+        let toml = r#"
+            [[apps]]
+            process = "Foo.exe"
+        "#;
+        let file: AppCompatFile = toml::from_str(toml).unwrap();
+        let compat = AppCompat::from_rules(file.apps);
+        assert!(!compat.get_rule("foo.exe").unwrap().host_render);
+
+        let rules = vec![AppCompatRule {
+            process: "Foo.exe".into(),
+            ..Default::default()
+        }];
+        let text = render_user_compat(&rules).expect("渲染失败");
+        assert!(!text.contains("host_render"), "false 开关不应写出: {text}");
+    }
+
+    #[test]
+    fn set_host_render_upserts_and_host_render_processes_collects_only_enabled() {
+        let mut rules = vec![
+            AppCompatRule {
+                process: "Weixin.exe".into(),
+                caret_use_top: true,
+                ..Default::default()
+            },
+            AppCompatRule {
+                process: "SearchHost.exe".into(),
+                ..Default::default()
+            },
+        ];
+        set_host_render(&mut rules, "searchhost.exe", true); // 大小写无关命中
+        assert_eq!(rules.len(), 2, "命中时不得追加新规则");
+        assert!(rules[1].host_render);
+        assert!(rules[0].caret_use_top, "其它规则不受牵连");
+
+        let compat = AppCompat::from_rules(rules);
+        assert_eq!(
+            compat.host_render_processes(),
+            vec!["SearchHost.exe".to_string()],
+            "只收集 host_render=true 的进程，且保留原始大小写"
+        );
+    }
+
+    #[test]
+    fn render_omits_false_host_render_but_keeps_true() {
+        let rules = vec![
+            AppCompatRule {
+                process: "A.exe".into(),
+                host_render: true,
+                ..Default::default()
+            },
+            AppCompatRule {
+                process: "B.exe".into(),
+                host_render: false,
+                ..Default::default()
+            },
+        ];
+        let text = render_user_compat(&rules).expect("渲染失败");
+        assert!(text.contains("host_render = true"), "产物: {text}");
+
+        let parsed: AppCompatFile = toml::from_str(&text).expect("产物应可解析");
+        let compat = AppCompat::from_rules(parsed.apps);
+        assert_eq!(compat.host_render_processes(), vec!["A.exe".to_string()]);
     }
 }

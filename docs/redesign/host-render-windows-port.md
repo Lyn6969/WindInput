@@ -268,3 +268,21 @@ Rust 无 Go 的 `last_key_time` 竞态窗口，改为 `host_render_active()` 时
 ### 提交
 - `0d1efb5` 第一轮（翻页 i32 解码 / avail 按事件源 PID / 键事件 note_focus）
 - `dfccc8e` 第二轮（翻页 rect 重映射 / push_to_token 定向投递 / 重连补推 / 首帧不跳过）
+
+### 11.7 白名单迁入 compat.toml（2026-07-30）
+`compat.host_render_processes`（`config.toml` 全局字符串列表，支持 `*`/`?` 通配）已删除，
+改为 `AppCompatRule::host_render: bool`（`wind-config/src/app_compat.rs`），随 `caret_use_top`
+等字段一起走按进程名匹配的 compat.toml（系统层 `data/compat.toml` + 用户层覆盖）。
+
+- 现算白名单：`AppCompat::host_render_processes()`（遍历 `host_render=true` 的规则，取进程名，
+  不支持通配——原字段唯一的实际值就是单个进程名 `SearchHost.exe`，字段级合并模型下没有
+  通配的位置，需要时按精确进程名逐条加规则）。
+- 消费点不变：`HostRenderManager::is_process_whitelisted(pid)` 仍是每次按事件源 PID 现查
+  `query_process_filename` 结果，**不经** `ActiveCompat` 全局焦点槽缓存——白名单来源换了，
+  §11.2 的约束（不能走全局焦点槽）依旧成立，且天然满足（迁移前后这条查询路径本身没变）。
+- 刷新时机：启动时 `main.rs` 用 `AppCompat::load` 现算一次；运行时唯二会重载 `app_compat`
+  的两处（`set_first_show_mode` / `set_initial_state_rule`，均在 `handle_menu.rs`）之后调用
+  新增的 `Coordinator::sync_host_render_whitelist()` 顺带刷新。`host_render` 本身不接右键菜单
+  开关（默认值已够用），因此手改 compat.toml 里的 `host_render` 字段和改 `caret_use_top`
+  一样需要重启生效，不是回归——是与既有字段同一口径。
+- `config.toml` 的 `[compat]` 顶级域随之整体移除（该字段是其唯一内容）。

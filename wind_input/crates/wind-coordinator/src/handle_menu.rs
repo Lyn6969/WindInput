@@ -416,6 +416,8 @@ impl Coordinator {
             Some(user_dir.as_path()),
         );
         *self.app_compat.lock().unwrap_or_else(|e| e.into_inner()) = reloaded;
+        #[cfg(windows)]
+        self.sync_host_render_whitelist();
         // 3）当前应用立即生效。
         self.active_compat
             .lock()
@@ -466,6 +468,8 @@ impl Coordinator {
             Some(user_dir.as_path()),
         );
         *self.app_compat.lock().unwrap_or_else(|e| e.into_inner()) = reloaded;
+        #[cfg(windows)]
+        self.sync_host_render_whitelist();
         // 3）刷新 active 缓存的判据位：同 pid 时 update_active_compat 提前 return，不会自己刷。
         //    漏掉这步会让「切出本应用时是否重算」用上过期的判据。
         //    注意先取值再持 active_compat 锁，避免与 app_compat 锁形成嵌套顺序。

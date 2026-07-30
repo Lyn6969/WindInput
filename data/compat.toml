@@ -22,6 +22,10 @@
 #                         典型用途：搜索框/终端类应用默认英文（如 Everything.exe）。
 #   initial_punct:        进入本应用时的初始中英标点，取值同上；不写=跟随全局。
 #                         显式值优先于 config.toml 的 input.punct.follow_mode 推导。
+#   host_render:          加入 HostRender 白名单（默认 false）。用于候选窗无法盖过宿主
+#                         Band 层级的受限宿主（如 Win11 开始菜单 SearchHost.exe）：候选窗
+#                         改由服务进程渲染后经共享内存转交宿主进程内的 DLL 上屏。
+#                         普通应用不要开启——多一层渲染路径，出问题时本地窗口路径更好排查。
 #
 # 上述三项对应右键菜单：「应用独立配置（<进程名>）」子菜单，各自单选。
 # （菜单切换会写入用户层 compat.toml，不改本文件）
@@ -48,6 +52,11 @@
 process = "Weixin.exe"
 comment = "微信 - Qt WebView 输入框 caret height 不稳定（h=1 或 h=20），使用 rect.top 定位"
 caret_use_top = true
+
+[[apps]]
+process = "SearchHost.exe"
+comment = "Win11 开始菜单 / 任务栏搜索，候选窗无法盖过其 Band 层级，走 HostRender 代理渲染"
+host_render = true
 
 # 示例：为光标稳定的宿主消除候选框首显延迟（默认不启用，按需去掉注释并按实测调整）
 # [[apps]]
