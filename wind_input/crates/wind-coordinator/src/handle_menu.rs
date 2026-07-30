@@ -822,7 +822,7 @@ impl Coordinator {
                 M::label(header),
                 M::separator(),
                 M::submenu("初始输入模式", tri(cur_mode, MenuCmd::InitialMode)),
-                M::submenu("初始中文标点", tri(cur_punct, MenuCmd::InitialPunct)),
+                M::submenu("初始标点模式", tri(cur_punct, MenuCmd::InitialPunct)),
                 M::separator(),
                 // 三档**互斥**，做成子菜单单选：布尔开关时代它们能同时打开，实测就因此出过
                 // 「fast 配了却从未生效」——instant 抢先放行，fast 的判据根本没机会跑。
