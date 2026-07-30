@@ -12,6 +12,7 @@
 use crate::codetable::CodeTableEngine;
 use crate::encoder;
 use crate::engine::{ConvertResult, Engine, EngineType};
+use crate::freq_rerank::ProtectPolicy;
 use crate::pinyin::{Config as PinyinConfig, PinyinEngine};
 use std::collections::HashMap;
 use std::path::Path;
@@ -46,9 +47,10 @@ pub struct FreqSettings {
     pub enabled: bool,
     /// used-first 内的排序策略（全局 schema.codetable.frequency.strategy；仅码表用）。
     pub strategy: FreqStrategy,
-    /// 呈现层前 N 位保护（全局 schema.codetable.frequency.protect_top_n；仅码表用）。
-    /// 重排前记录基础序前 N 个候选，重排后原序回填——优先级高于词频，默认 0 = 空保护集。
-    pub protect_top_n: usize,
+    /// 呈现层前 N 位保护（全局 `schema.codetable.frequency.protect_top_n*`；仅码表/混输用）。
+    /// 重排前记录基础序前 N 个候选，重排后原序回填——优先级高于词频。
+    /// N 按输入码长分级：简码位保住词库钦定首选，全码位放开调频（见 `ProtectPolicy`）。
+    pub protect: ProtectPolicy,
 }
 
 impl Default for FreqSettings {
@@ -56,7 +58,7 @@ impl Default for FreqSettings {
         Self {
             enabled: false,
             strategy: FreqStrategy::Step,
-            protect_top_n: 0,
+            protect: ProtectPolicy::NONE,
         }
     }
 }
@@ -1511,18 +1513,25 @@ impl EngineManager {
         let is_pinyin = matches!(self.schema_engine_type(&id).as_deref(), Some("pinyin"));
         let settings = if is_pinyin {
             let pf = self.pinyin.lock().unwrap_or_else(|e| e.into_inner());
-            // 拼音 strategy/protect_top_n 字段不参与（仅码表 used-first 排序用），取默认。
+            // 拼音 strategy/protect 字段不参与（仅码表 used-first 排序用），取默认。
             FreqSettings {
                 enabled: pf.frequency.enabled,
                 strategy: FreqStrategy::Step,
-                protect_top_n: 0,
+                protect: ProtectPolicy::NONE,
             }
         } else {
             let ct = self.codetable.lock().unwrap_or_else(|e| e.into_inner());
             FreqSettings {
                 enabled: ct.frequency.enabled,
                 strategy: Self::parse_freq_strategy(&ct.frequency.strategy),
-                protect_top_n: ct.frequency.protect_top_n,
+                protect: ProtectPolicy {
+                    by_len: [
+                        ct.frequency.protect_top_n_len1,
+                        ct.frequency.protect_top_n_len2,
+                        ct.frequency.protect_top_n_len3,
+                    ],
+                    fallback: ct.frequency.protect_top_n,
+                },
             }
         };
         self.freq_cache

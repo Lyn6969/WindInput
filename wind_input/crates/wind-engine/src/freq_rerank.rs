@@ -24,6 +24,48 @@ use wind_store::freq::{FreqProfile, FreqRecord};
 /// （拼音"用过"随半衰期褪色，不同于码表的永久 used-first）。
 const PINYIN_FREQ_EPSILON: f64 = 10.0;
 
+/// 按**输入码长**分级的首选保护策略（见 docs/design/codetable-freq-short-code-protection.md）。
+///
+/// 保护的是「用户当前所在这个码位的钦定首选」，故按**输入码长**分级而非候选码长——
+/// 精确档内两者相等，但前缀补全候选的码更长，用候选码长会把分级判据搅乱。
+///
+/// 五笔一简 25 个码**每个都是二选一**（`a` → 工 9999 / 戈 9998），词库靠权重表达的钦定
+/// 地位在本模块完全失效（比较链不含 weight），故简码位默认保护首选 1 位；全码位默认放开，
+/// 那里才是调频该起作用的地方。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ProtectPolicy {
+    /// 索引 0/1/2 = 码长 1/2/3（一简/二简/三简位）。
+    pub by_len: [usize; 3],
+    /// 码长 ≥ 4（未单列的深码位）。
+    pub fallback: usize,
+}
+
+impl Default for ProtectPolicy {
+    fn default() -> Self {
+        Self {
+            by_len: [1, 1, 0],
+            fallback: 0,
+        }
+    }
+}
+
+impl ProtectPolicy {
+    /// 空策略（全不保护）：拼音路径与「关闭保护」用。
+    pub const NONE: Self = Self {
+        by_len: [0; 3],
+        fallback: 0,
+    };
+
+    /// 本次输入码长对应的保护位数。空码不保护；码长 ≥ 4 落兜底档。
+    pub fn resolve(&self, code: &str) -> usize {
+        match code.chars().count() {
+            0 => 0,
+            n if n <= self.by_len.len() => self.by_len[n - 1],
+            _ => self.fallback,
+        }
+    }
+}
+
 /// 候选来源档位（数字越小越靠前）。五笔优先的硬约束：码表精确全码恒在拼音之上，
 /// 词频重排只在同档内调整。纯拼音/纯码表模式下同源候选档位相同，退化为按词频排序。
 ///
@@ -87,12 +129,20 @@ pub fn rerank_codetable_usedfirst(
     recs: &HashMap<String, FreqRecord>,
     code: &str,
     strategy: FreqStrategy,
-    protect_top_n: usize,
+    protect: ProtectPolicy,
 ) {
     // 呈现层保护：记录基础序前 N 位，重排后原序回填（不动 weight，见 frequency.md §8）。
+    // 保护位数按输入码长分级——简码位（一简/二简）的钦定首选不该被一次误选永久改写，
+    // 而全码位正是调频该起作用的地方。
+    //
+    // 名额**只在精确档内取**（`is_exact_code`）：钦定首选一定是精确档，把名额匀给前缀补全
+    // 没有语义依据——那会把一个碰巧排在前面的补全词钉死，还挡住用户真正常用的那条。
+    // 精确候选不足名额数就少保护；该码位没有精确候选（打了词库里没有的码）则不保护。
+    let protect_n = protect.resolve(code);
     let protected: Vec<String> = candidates
         .iter()
-        .take(protect_top_n)
+        .filter(|c| c.is_exact_code)
+        .take(protect_n)
         .map(|c| c.text.clone())
         .collect();
 
@@ -515,7 +565,13 @@ mod tests {
             ct("aaaa", "啊", 80),
         ];
         let r = recs(&[("戈", 5, NOW), ("工", 2, NOW)]);
-        rerank_codetable_usedfirst(&mut cands, &r, "aaaa", FreqStrategy::Step, 0);
+        rerank_codetable_usedfirst(
+            &mut cands,
+            &r,
+            "aaaa",
+            FreqStrategy::Step,
+            ProtectPolicy::NONE,
+        );
         assert_eq!(cands[0].text, "戈", "step：count 高者置前");
         assert_eq!(cands[1].text, "工");
         assert_eq!(cands[2].text, "啊", "未用词维持权重序殿后");
@@ -527,7 +583,13 @@ mod tests {
         let mut cands = vec![ct("aaaa", "工", 100), ct("aaaa", "戈", 90)];
         // 工 用 10 次但很久前；戈 仅 1 次但刚用
         let r = recs(&[("工", 10, NOW - 10_000), ("戈", 1, NOW)]);
-        rerank_codetable_usedfirst(&mut cands, &r, "aaaa", FreqStrategy::Top, 0);
+        rerank_codetable_usedfirst(
+            &mut cands,
+            &r,
+            "aaaa",
+            FreqStrategy::Top,
+            ProtectPolicy::NONE,
+        );
         assert_eq!(cands[0].text, "戈", "top：最近使用者置首");
     }
 
@@ -537,18 +599,27 @@ mod tests {
         let mut cands = vec![ct("aaaa", "工", 100), pin("啊", 5000)];
         // 拼音「啊」高频近用，但档位 3 低于码表精确全码档位 0
         let r = recs(&[("啊", 50, NOW)]);
-        rerank_codetable_usedfirst(&mut cands, &r, "aaaa", FreqStrategy::Step, 0);
+        rerank_codetable_usedfirst(
+            &mut cands,
+            &r,
+            "aaaa",
+            FreqStrategy::Step,
+            ProtectPolicy::NONE,
+        );
         assert_eq!(cands[0].text, "工", "码表精确全码档位最高，拼音不得反超");
     }
 
-    /// protect_top_n=1：重排后基础序首位被回填锁定，高词频候选在保护位之后正常上浮。
+    /// 兜底档 `fallback=1`：重排后基础序首位被回填锁定，高词频候选在保护位之后正常上浮。
+    ///
+    /// 三条候选的 `code` 均等于输入，故都属精确档（保护名额只在该档内取，见
+    /// `protect_slots_taken_from_exact_only`）。
     #[test]
     fn protect_top_n_pins_original_head() {
         // 基础序：甲(高weight) 乙 丙；"丙"有词频记录本应浮首。
         let mut cands = vec![
-            ct("abcd", "甲", 300),
-            ct("abcd", "乙", 200),
-            ct("abcd", "丙", 100),
+            ct_exact("abcd", "甲", 300),
+            ct_exact("abcd", "乙", 200),
+            ct_exact("abcd", "丙", 100),
         ];
         let mut recs_map = HashMap::new();
         recs_map.insert(
@@ -558,9 +629,163 @@ mod tests {
                 last_used: 1000,
             },
         );
-        rerank_codetable_usedfirst(&mut cands, &recs_map, "abcd", FreqStrategy::Step, 1);
+        rerank_codetable_usedfirst(
+            &mut cands,
+            &recs_map,
+            "abcd",
+            FreqStrategy::Step,
+            ProtectPolicy {
+                by_len: [0; 3],
+                fallback: 1,
+            },
+        );
         assert_eq!(cands[0].text, "甲", "protect_top_n=1 应锁定原首位");
         assert_eq!(cands[1].text, "丙", "词频候选在保护位之后正常上浮");
+    }
+
+    /// 精确档候选（`code == input`）。五笔简码字与全码字都属此档，是「词库钦定首选」的载体。
+    fn ct_exact(code: &str, text: &str, weight: i32) -> Candidate {
+        let mut c = ct(code, text, weight);
+        c.is_exact_code = true;
+        c
+    }
+
+    /// 分级表按输入码长取值，码长 ≥ 4 落兜底档。
+    #[test]
+    fn protect_policy_resolve_by_len() {
+        let p = ProtectPolicy {
+            by_len: [3, 2, 1],
+            fallback: 9,
+        };
+        assert_eq!(p.resolve("a"), 3, "一简位");
+        assert_eq!(p.resolve("aa"), 2, "二简位");
+        assert_eq!(p.resolve("aaa"), 1, "三简位");
+        assert_eq!(p.resolve("aaaa"), 9, "全码位落兜底");
+        assert_eq!(p.resolve("aaaaaa"), 9, "超长码同样落兜底");
+        assert_eq!(p.resolve(""), 0, "空码不保护");
+    }
+
+    /// **主用例**：一简位（码长 1）的词库钦定首选不被词频顶掉。
+    ///
+    /// 现场取自发行词库 `wubi86_jidian.dict.yaml`：`a` → 工(9999) / 戈(9998)。一简 25 个码
+    /// **每个都是二选一**，而本模块的比较链不含 weight——词库靠 9999/9998 表达的钦定次序
+    /// 在这里完全失效，「戈」被误选一次即永久翻转（码表侧 used-first 不衰减）。
+    ///
+    /// 必须与 `full_code_still_reranks_freely` 合看：只有这一条时，一个「全局硬保护」的
+    /// 错误实现同样会绿，证明不了分级真的分了。
+    #[test]
+    fn short_code_len1_protects_dict_head() {
+        let mut cands = vec![ct_exact("a", "工", 9999), ct_exact("a", "戈", 9998)];
+        let r = recs(&[("戈", 5, NOW)]); // 用户选过 5 次「戈」
+        rerank_codetable_usedfirst(
+            &mut cands,
+            &r,
+            "a",
+            FreqStrategy::Step,
+            ProtectPolicy::default(),
+        );
+        assert_eq!(
+            cands[0].text,
+            "工",
+            "一简位钦定首选须恒居首，实际: {:?}",
+            cands.iter().map(|c| &c.text).collect::<Vec<_>>()
+        );
+        assert_eq!(cands[1].text, "戈", "被保护的只是位次，戈仍在列表里");
+    }
+
+    /// **对照组**：同一组数据放到全码位（码长 4）→ 词频照常生效。
+    /// 这一条锁住「分级」本身：若把简码保护做成全局硬保护，本用例会红。
+    #[test]
+    fn full_code_still_reranks_freely() {
+        let mut cands = vec![ct_exact("aaaa", "甲", 9999), ct_exact("aaaa", "乙", 9998)];
+        let r = recs(&[("乙", 5, NOW)]);
+        rerank_codetable_usedfirst(
+            &mut cands,
+            &r,
+            "aaaa",
+            FreqStrategy::Step,
+            ProtectPolicy::default(),
+        );
+        assert_eq!(
+            cands[0].text,
+            "乙",
+            "全码位不设保护，用过的候选须正常上浮，实际: {:?}",
+            cands.iter().map(|c| &c.text).collect::<Vec<_>>()
+        );
+    }
+
+    /// 二简位同样受保护，且 `Top`（MRU）策略下结论一致——MRU 在简码位危害最大（选一次到顶）。
+    #[test]
+    fn short_code_len2_protects_under_mru() {
+        let mut cands = vec![ct_exact("aa", "式", 9950), ct_exact("aa", "戒", 9949)];
+        let r = recs(&[("戒", 1, NOW)]); // MRU 下一次即可到顶
+        rerank_codetable_usedfirst(
+            &mut cands,
+            &r,
+            "aa",
+            FreqStrategy::Top,
+            ProtectPolicy::default(),
+        );
+        assert_eq!(cands[0].text, "式", "二简位在 MRU 策略下同样须保住钦定首选");
+    }
+
+    /// 保护名额**只在精确档内取**：名额多于精确候选时，多出来的不落到前缀补全头上。
+    ///
+    /// 现场：打 `a`，精确档只有一简字「工」，其后全是 `a*` 的前缀补全。若名额按位置无差别
+    /// 取（旧实现），第 2 个名额会把补全词「工艺」钉死在第 2 位——它不是任何码位的钦定首选，
+    /// 没有被保护的语义依据，且会挡住用户真正常用的「工区」。
+    #[test]
+    fn protect_slots_taken_from_exact_only() {
+        let mut cands = vec![
+            ct_exact("a", "工", 9999),
+            ct("aaan", "工艺", 1717),
+            ct("aaaq", "工区", 737),
+        ];
+        let r = recs(&[("工区", 5, NOW)]);
+        rerank_codetable_usedfirst(
+            &mut cands,
+            &r,
+            "a",
+            FreqStrategy::Step,
+            ProtectPolicy {
+                by_len: [2, 0, 0], // 名额 2 > 精确候选数 1
+                fallback: 0,
+            },
+        );
+        let order: Vec<&str> = cands.iter().map(|c| c.text.as_str()).collect();
+        assert_eq!(
+            order,
+            vec!["工", "工区", "工艺"],
+            "名额只在精确档内取：工受保护，补全档内部照常按词频重排"
+        );
+    }
+
+    /// 该码位没有精确候选（打了词库里没有的码，候选全是前缀补全）→ 保护集为空。
+    /// 没有钦定首选可言，不该平白钉死一个补全词。
+    #[test]
+    fn no_exact_candidate_means_no_protection() {
+        let mut cands = vec![ct("aaan", "工艺", 1717), ct("aaaq", "工区", 737)];
+        let r = recs(&[("工区", 5, NOW)]);
+        rerank_codetable_usedfirst(
+            &mut cands,
+            &r,
+            "a",
+            FreqStrategy::Step,
+            ProtectPolicy {
+                by_len: [1, 0, 0],
+                fallback: 0,
+            },
+        );
+        assert_eq!(cands[0].text, "工区", "无精确候选时不设保护，词频照常生效");
+    }
+
+    /// 空策略退化为「无保护」，与分级引入前逐字节一致。
+    #[test]
+    fn none_policy_degrades_to_no_protection() {
+        let mut cands = vec![ct_exact("a", "工", 9999), ct_exact("a", "戈", 9998)];
+        let r = recs(&[("戈", 5, NOW)]);
+        rerank_codetable_usedfirst(&mut cands, &r, "a", FreqStrategy::Step, ProtectPolicy::NONE);
+        assert_eq!(cands[0].text, "戈", "NONE 策略下词频照常生效");
     }
 
     /// freq_tier 短语再分档：精确码短语（is_exact_code）tier 1 紧随码表精确；前缀短语
@@ -588,7 +813,13 @@ mod tests {
         };
         let mut cands = vec![exact_code, exact_phrase, completion, prefix_phrase];
         let r = recs(&[]); // 无词频记录 → 纯按档位 + 稳定序（维持入参显示序）
-        rerank_codetable_usedfirst(&mut cands, &r, "da", FreqStrategy::Step, 0);
+        rerank_codetable_usedfirst(
+            &mut cands,
+            &r,
+            "da",
+            FreqStrategy::Step,
+            ProtectPolicy::NONE,
+        );
         let order: Vec<&str> = cands.iter().map(|c| c.text.as_str()).collect();
         assert_eq!(
             order,

@@ -379,12 +379,33 @@ impl CodetableGlobal {
 pub struct CodetableFrequency {
     #[serde(default)]
     pub enabled: bool,
-    /// 锁定码表原始前 N 位（仅纯码表生效）。
+    /// 锁定码表原始前 N 位——**兜底档**：码长 ≥ 4 的深码位。
+    /// 简码位（码长 1/2/3）另有分级值，见下面三个字段。
+    ///
+    /// ⚠️ 作用域是「码表配置组」而非「纯码表方案」：混输走的也是这套值
+    /// （`EngineManager::freq_settings` 按"非拼音即码表"分流）。
     #[serde(default)]
     pub protect_top_n: usize,
+    /// 一简位（码长 1）保护前 N 位。五笔一简 25 个码每个都是二选一，默认保护首选。
+    #[serde(default = "default_protect_len1")]
+    pub protect_top_n_len1: usize,
+    /// 二简位（码长 2）保护前 N 位。
+    #[serde(default = "default_protect_len2")]
+    pub protect_top_n_len2: usize,
+    /// 三简位（码长 3）保护前 N 位。默认不保护——三简的钦定性弱于一二简。
+    #[serde(default)]
+    pub protect_top_n_len3: usize,
     /// 词频应用策略："top"（一次到顶 MRU）/ "step"（逐次提升）。原 freq_strategy 迁入。
     #[serde(default = "default_freq_strategy")]
     pub strategy: String,
+}
+
+fn default_protect_len1() -> usize {
+    1
+}
+
+fn default_protect_len2() -> usize {
+    1
 }
 
 fn default_freq_strategy() -> String {
@@ -396,6 +417,9 @@ impl Default for CodetableFrequency {
         Self {
             enabled: false,
             protect_top_n: 0,
+            protect_top_n_len1: default_protect_len1(),
+            protect_top_n_len2: default_protect_len2(),
+            protect_top_n_len3: 0,
             strategy: default_freq_strategy(),
         }
     }

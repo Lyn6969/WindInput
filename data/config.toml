@@ -54,9 +54,21 @@ single_code_complete = true
 z_key_repeat = true
 
 # 码表调频（全局唯一；strategy: top=一次到顶 MRU / step=逐次提升）。
+#
+# 首选保护按**输入码长分级**（见 docs/design/codetable-freq-short-code-protection.md）：
+# 词库靠权重表达简码的钦定地位（gen_dict 给一简 9999 / 二简 9950 / 三简 9000），但调频重排
+# 的比较链**不含 weight**，只看「有没有被选过」。五笔一简 25 个码每个都是二选一
+# （a → 工 9999 / 戈 9998），次选字被误选一次就永久翻转。故简码位保住首选、全码位放开。
 [schema.codetable.frequency]
 enabled = false
-protect_top_n = 1
+# 兜底档：码长 ≥ 4 的深码位。0 = 不保护——那里正是调频该起作用的地方。
+protect_top_n = 0
+# 一简位（码长 1）：保护词库钦定首选。
+protect_top_n_len1 = 1
+# 二简位（码长 2）。
+protect_top_n_len2 = 1
+# 三简位（码长 3）：默认不保护，其钦定性弱于一二简。
+protect_top_n_len3 = 0
 strategy = "top"
 
 # 码表自动造词（连续单字）：连续单字上屏累积成序列，遇终止符（标点/回车/空格/焦点切换/

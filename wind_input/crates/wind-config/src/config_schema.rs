@@ -75,6 +75,9 @@ static REGISTRY: &[ConfigField] = &[
     f("schema.codetable.z_key_repeat", Bool),
     f("schema.codetable.frequency.enabled", Bool),
     f("schema.codetable.frequency.protect_top_n", Int),
+    f("schema.codetable.frequency.protect_top_n_len1", Int),
+    f("schema.codetable.frequency.protect_top_n_len2", Int),
+    f("schema.codetable.frequency.protect_top_n_len3", Int),
     f(
         "schema.codetable.frequency.strategy",
         Enum(FREQ_STRATEGY_VALUES),
