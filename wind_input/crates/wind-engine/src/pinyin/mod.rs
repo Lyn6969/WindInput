@@ -17,6 +17,7 @@ pub mod generate;
 pub mod interp;
 pub mod lattice;
 pub mod lm;
+pub mod mixed_abbrev;
 pub mod parser;
 pub mod scorer;
 pub mod shuangpin;
@@ -101,6 +102,34 @@ const COMPLETION_NEAR_SYLLABLES: u32 = 2;
 /// 注意不能对近距离补全也套这道门槛：词库 weight_spec 的 median 仅 200，
 /// 一半的词低于它，会误沉大量高频使用但低词频的日常词。
 const COMPLETION_FAR_WEIGHT_FLOOR: i32 = 100;
+
+/// 混合简拼查 `AbbrevSection` 时的取码上限（step 5b）。
+///
+/// 比纯简拼的 10 大一截：纯简拼那边「键即答案」，按权重取前 10 条就是最终候选；混合路径
+/// 拿到的码还要过一道逐段校验（`nh` 下的 `nihao`/`nanhai`/`naihe`… 只有第二段等于 `hao`
+/// 的能活下来），**绝大多数会被滤掉**，取 10 条几乎必然一条不剩。
+/// 索引点查本身是 DAT 前缀走位 + 定长条目读取，放宽到 64 的成本远小于「查了等于没查」。
+const MIXED_ABBREV_INDEX_LIMIT: usize = 64;
+
+/// 简拼族前缀回退（step 6.2）的最短击键段。与 `is_abbreviation` 的下限一致：
+/// 单字母不构成简拼，退到 1 只会拖出一堆高频单字。
+const MIN_ABBREV_STROKE: usize = 2;
+
+/// 前缀回退**单个切点**的产出上限。
+///
+/// 逐切点限流而非只设总额，是为了保证**短切点也挤得进来**：`bzdhaobuhao` 的
+/// `bzdh` 切点若把配额占满，`bzd`（→「不知道」，词频高 672 倍）就一条都进不来。
+const MAX_FALLBACK_PER_CUT: usize = 6;
+
+/// 前缀回退**参与竞争的切点数**（有产出的才计数）。
+///
+/// 取 2 = 「最长 + 次长」。相邻切点的竞争才是真实场景（`bzdhaobuhao` 里 `bzdh`→「表彰大会」
+/// 与 `bzd`→「不知道」），再往下只会引入越来越短、越来越不相关的解释：试到 `bz` 时
+/// 「标准/帮助/保证」会凭着高词频（~5 万）挤进前几位，而它们只解释了 11 键里的 2 键。
+///
+/// 这是**软偏好**的落点——不给短切点打折扣（那要按未解释字母数调一个乘性系数，量纲难定
+/// 且依赖本轮最大消费长度、不稳定），而是限制它们**是否入场**。入场后一律同层按词频竞争。
+const MAX_FALLBACK_CUTS: usize = 2;
 
 /// 用户/临时词的**前缀补全**是否上浮进完整匹配层（贴合「长词打到第 3-4 个音节就给出」）。
 ///
@@ -327,6 +356,10 @@ impl PinyinEngine {
     /// boundary，见 `pinyin_multipath.rs`：必须用解码器实际走的那条路径）。
     ///
     /// 切分未完全覆盖 code（残码/非法拼音）时返回 None，不参与简拼匹配。
+    ///
+    /// ⚠️ 混合简拼另有 [`mixed_abbrev::syllables_from_boundary`]，对同一个 `boundary` 做
+    /// 同一件事的另一半（那边要整段音节，这边只要首字母）。**两者对 boundary 的解释必须
+    /// 一致**，改动其一时同步核对另一处。
     fn abbrev_of_code(&self, code: &str, boundary: u64) -> Option<String> {
         if boundary != 0 {
             // bit 位是**字节**偏移；拼音码为 ASCII，char_indices 的下标即字节位。
@@ -343,6 +376,110 @@ impl PinyinEngine {
             return None;
         }
         Some(syllables.iter().filter_map(|s| s.chars().next()).collect())
+    }
+
+    /// 简拼族召回，但只针对击键串的一个**前缀**（step 6.2 的前缀回退用）。
+    ///
+    /// `stroke` = 击键串的前 `consumed` 个字节；产出的候选只消费这么多击键，余下的字母
+    /// 留给下一次转换（分步上屏）。覆盖四条来源，与整串路径一一对应：
+    /// 纯简拼系统词（step5）、混合简拼系统词（step5b）、以及二者的用户词版本（step6）。
+    ///
+    /// ⚠️ **与那三处是重复实现，改判据时必须同步。** 没有合并是有意的取舍：那三处各自
+    /// 带着大段历史踩坑注释和专门的回归测试（层级一致、音节数过滤、边界豁免…），把它们
+    /// 抽成公共函数的回归风险大于这里重复三十行的维护成本。判据本身很短，且都由
+    /// `mixed_abbrev` 的同一套模式表达。
+    fn recall_abbrev_prefix(&self, stroke: &str, consumed: usize, cands: &mut Vec<Candidate>) {
+        let trie = &self.trie;
+        let dict = &self.dict;
+        // 本切点的产出配额（见 MAX_FALLBACK_PER_CUT：不逐切点限流，长切点会把额度占满，
+        // 词频高得多的短切点一条都进不来）。
+        let start = cands.len();
+
+        // 部分候选统一形态：`is_abbrev` 归入简拼层、`is_partial` 表示只覆盖了输入前缀
+        // （沉在完整匹配之后），`consumed_length` **自带击键域的消费数**——下方那个按
+        // code/query 关系统一计算 consumed 的循环会跳过它们（见其注释）。
+        let push =
+            |cands: &mut Vec<Candidate>, text: String, code: String, w: i32, boundary: u64| {
+                if cands.len() - start >= MAX_FALLBACK_PER_CUT {
+                    return;
+                }
+                if text.is_empty() || cands.iter().any(|c| c.text == text) {
+                    return;
+                }
+                cands.push(Candidate {
+                    text,
+                    code,
+                    weight: w,
+                    natural_order: 999999,
+                    source: CandidateSource::Pinyin,
+                    is_abbrev: true,
+                    is_partial: true,
+                    boundary,
+                    consumed_length: consumed,
+                    ..Default::default()
+                });
+            };
+
+        // ① 纯简拼系统词（同 step5，含「音节数 == 简拼字母数」过滤）
+        if AbbrevMatcher::is_abbreviation(stroke, trie) {
+            for abbr_code in dict.search_abbrev(stroke, 10) {
+                for h in dict.search_with_boundary(&abbr_code) {
+                    if h.boundary != 0 && h.boundary.count_ones() as usize != stroke.len() {
+                        continue;
+                    }
+                    push(cands, h.text, abbr_code.clone(), h.weight, h.boundary);
+                }
+            }
+        }
+
+        // ② 混合简拼系统词（同 step5b）。`stroke` 已是完整音节序列时不做混合解释——
+        //    那属于全拼语义，交给主路径（此处的 stroke 是前缀，主路径按整串查，故这里
+        //    直接跳过即可）。
+        let covered: usize = Dag::build(stroke, trie)
+            .maximum_match()
+            .iter()
+            .map(|s| s.len())
+            .sum();
+        let pats = if covered >= stroke.len() {
+            Vec::new()
+        } else {
+            mixed_abbrev::mixed_patterns(stroke, trie)
+        };
+        if !pats.is_empty() {
+            let mut keys: Vec<&str> = pats.iter().map(|p| p.key()).collect();
+            keys.sort_unstable();
+            keys.dedup();
+            for key in keys {
+                for abbr_code in dict.search_abbrev(key, MIXED_ABBREV_INDEX_LIMIT) {
+                    for h in dict.search_with_boundary(&abbr_code) {
+                        let Some(syls) =
+                            mixed_abbrev::syllables_from_boundary(&abbr_code, h.boundary)
+                        else {
+                            continue;
+                        };
+                        if !pats.iter().any(|p| p.key() == key && p.matches(&syls)) {
+                            continue;
+                        }
+                        push(cands, h.text, abbr_code.clone(), h.weight, h.boundary);
+                    }
+                }
+            }
+        }
+
+        // ③④ 用户/临时造词层的纯简拼与混合简拼（同 step6 末段）
+        if let Some(store_dm) = &self.store_layers {
+            if AbbrevMatcher::is_abbreviation(stroke, trie) || !pats.is_empty() {
+                for c in store_dm.search_prefix("", 0) {
+                    let plain = self.abbrev_of_code(&c.code, c.boundary).as_deref() == Some(stroke);
+                    let mixed = !plain
+                        && mixed_abbrev::syllables_from_boundary(&c.code, c.boundary)
+                            .is_some_and(|syls| pats.iter().any(|p| p.matches(&syls)));
+                    if plain || mixed {
+                        push(cands, c.text, c.code, c.weight, c.boundary);
+                    }
+                }
+            }
+        }
     }
 
     /// 带模糊拼音扩展的词库查找（对齐 Go lookupWithFuzzy）。
@@ -987,6 +1124,16 @@ impl Engine for PinyinEngine {
             );
         }
 
+        // 简拼族（纯简拼 step5 / 混合 step5b / 用户词 step6）是否命中了**整串**击键。
+        // step 6.2 的前缀回退只在这三处全都落空时才启动——整串能打出词就不该降级。
+        let mut abbrev_full_hit = false;
+
+        // 整串是否**纯简拼形态**（每字母均为某音节首字母、且非完整音节序列）。
+        // 提成变量供 step5 / step6 / step6.2 共用，`enable_abbrev` 仍在短路前（关闭时
+        // 连 is_abbreviation 的 Dag 构建都省掉）。
+        let stroke_is_plain_abbrev =
+            self.config.enable_abbrev && AbbrevMatcher::is_abbreviation(abbr_query, trie);
+
         // 5. 简拼匹配（声母缩写，如 nh→你好）：查 wdat 预存的独立 AbbrevSection。
         //    仅当输入像简拼时才查（is_abbreviation：每字母均为某音节首字母、且非完整音节序列），
         //    避免对全拼输入做无谓查找。natural_order=999999 让简拼候选默认排在全拼之后。
@@ -995,7 +1142,7 @@ impl Engine for PinyinEngine {
         //    AbbrevSection 存的是**全拼码**（v5），故这里是「查索引拿码 → 走主表装配」两步。
         //    候选因此带上真实的 code 与 boundary：词频记账走 `cand_code` 取候选的 code，
         //    此前设成简拼串 `nh`，同一个词在简拼与全拼下遂走两个互不相认的计数。
-        if self.config.enable_abbrev && AbbrevMatcher::is_abbreviation(abbr_query, trie) {
+        if stroke_is_plain_abbrev {
             for abbr_code in dict.search_abbrev(abbr_query, 10) {
                 // 用 search_with_boundary 而非 search：拼音引擎直接持有 CachedDict、
                 // 不经 SystemDictLayer，用 search() 会把边界丢在这里（P2b 踩过同款）。
@@ -1031,6 +1178,80 @@ impl Engine for PinyinEngine {
                     // 「夺不了冠」之后。同层之后两者才能按权重/词频正常竞争。
                     if candidates.len() > before {
                         candidates[before].is_abbrev = true;
+                        abbrev_full_hit = true;
+                    }
+                }
+            }
+        }
+
+        // 5b. 混合简拼：同一串里混用声母与完整音节（`nhao` = n + hao、`nih` = ni + h）。
+        //     设计文档 `docs/design/pinyin-mixed-abbrev.md`；模式表示见 `mixed_abbrev`。
+        //
+        //     召回复用 step5 的同一条索引：模式的**声母投影键**退化成纯简拼串（`nhao` → `nh`），
+        //     AbbrevSection 的键正是这个形状，故索引一个字节都不用改。混合信息留在模式里做
+        //     后置校验（按 boundary 把全拼码切回音节序列，逐段比对），因此不会像纯简拼那样
+        //     把 `nh` 下的词一股脑捞出来。
+        //
+        //     **短路：整串已被音节完整覆盖时不进这里。** `nihao`/`xian` 这类正常全拼输入
+        //     因此零开销——而它们正是绝大多数击键。判据用 `completed_len`（step1 之前已算好，
+        //     不额外建 Dag），但只在全拼下可用：双拼的 `completed_len` 说的是转换后的全拼串，
+        //     与 `abbr_query`（原始击键，文档 §5 约束 4）不同域。双拼下改为「转换结果覆盖了
+        //     整串击键」——双拼每 2 键 1 音节，覆盖完整即无残码可作声母段。
+        let mixed_covered = match &sp_result {
+            Some(r) => r
+                .syllables
+                .last()
+                .is_some_and(|s| s.raw_end >= raw_input.len()),
+            None => completed_len >= abbr_query.len(),
+        };
+        let mixed_pats = if self.config.enable_abbrev && !mixed_covered {
+            mixed_abbrev::mixed_patterns(abbr_query, trie)
+        } else {
+            Vec::new()
+        };
+        if !mixed_pats.is_empty() {
+            // 同一串的多条解释常投影到同一个键（`nhao` 的 [n][hao] 与 `nih` 的 [ni][h] 都是
+            // `nh`），按键去重后每个键只点查一次索引。
+            let mut keys: Vec<&str> = mixed_pats.iter().map(|p| p.key()).collect();
+            keys.sort_unstable();
+            keys.dedup();
+            for key in keys {
+                // limit 比 step5 的 10 大一截：那边键即答案、取权重前 10 就够；这里拿到的
+                // 码还要过一道逐段校验，**绝大多数会被滤掉**，取 10 条几乎必然一条不剩。
+                for abbr_code in dict.search_abbrev(key, MIXED_ABBREV_INDEX_LIMIT) {
+                    for h in dict.search_with_boundary(&abbr_code) {
+                        // 无边界信息 → 判据不存在 → 不参与（不是放行，见 syllables_from_boundary）。
+                        let Some(syls) =
+                            mixed_abbrev::syllables_from_boundary(&abbr_code, h.boundary)
+                        else {
+                            continue;
+                        };
+                        if !mixed_pats
+                            .iter()
+                            .any(|p| p.key() == key && p.matches(&syls))
+                        {
+                            continue;
+                        }
+                        let before = candidates.len();
+                        push_unique(
+                            &mut candidates,
+                            h.text,
+                            abbr_code.clone(),
+                            h.weight,
+                            999999,
+                            false,
+                            false,
+                            h.boundary,
+                            false,
+                        );
+                        // **并入 is_abbrev 层，不新造层级、更不借用别的层级键**（文档 §5 约束 2）：
+                        // 混合简拼与纯简拼是同质候选，分属两层就会让其中一侧被硬闸门整层压住、
+                        // 词频永远翻不过来。这个标记同时让候选走在双拼边界校验的豁免侧（约束 1）
+                        // ——它的 code 是词的全拼码，与当次击键根本不同域。
+                        if candidates.len() > before {
+                            candidates[before].is_abbrev = true;
+                            abbrev_full_hit = true;
+                        }
                     }
                 }
             }
@@ -1120,14 +1341,24 @@ impl Engine for PinyinEngine {
             // 预建 AbbrevSection——规模小，现算即可（枚举该 schema 下全部用户/临时词，
             // 按各词自带的音节边界取声母比对，见 abbrev_of_code）。natural_order 对齐
             // step5 系统简拼候选，同样排在全拼之后。
-            if self.config.enable_abbrev && AbbrevMatcher::is_abbreviation(abbr_query, trie) {
+            // 混合简拼（step 5b）在这里共用同一次全表枚举：`nih` 这类形态 `is_abbreviation`
+            // 判假（`i` 不是任何音节首字母）却有合法混合解释，故入口条件是两者取或。
+            if stroke_is_plain_abbrev || !mixed_pats.is_empty() {
                 for mut c in store_dm.search_prefix("", 0) {
                     if c.text.is_empty() || candidates.iter().any(|x| x.text == c.text) {
                         continue;
                     }
                     // 比对基准是原始击键（见 `abbr_query`）：双拼下 query 已是转换结果，
                     // 拿它比对永远匹配不上用户敲的简拼。
-                    if self.abbrev_of_code(&c.code, c.boundary).as_deref() != Some(abbr_query) {
+                    let plain =
+                        self.abbrev_of_code(&c.code, c.boundary).as_deref() == Some(abbr_query);
+                    // 混合简拼：按 boundary 切回音节序列逐段比对（无边界 → 无判据 → 不参与）。
+                    // 与系统词侧走同一批 `mixed_pats`，判据完全一致，只是这边不经索引——
+                    // 用户词规模小，现算即可（与 `abbrev_of_code` 那条注释同理）。
+                    let mixed = !plain
+                        && mixed_abbrev::syllables_from_boundary(&c.code, c.boundary)
+                            .is_some_and(|syls| mixed_pats.iter().any(|p| p.matches(&syls)));
+                    if !plain && !mixed {
                         continue;
                     }
                     c.source = CandidateSource::Pinyin;
@@ -1146,6 +1377,68 @@ impl Engine for PinyinEngine {
                     c.is_abbrev = true;
                     c.natural_order = 999999;
                     candidates.push(c);
+                    abbrev_full_hit = true;
+                }
+            }
+        }
+
+        // 6.2 简拼族**前缀回退**：整串一无所获时，退到最长的能命中的前缀，
+        //     余下字母作残码留给下一次输入（分步上屏）。
+        //
+        //     真机现场（连打 `bzdnihaobuhao`）：输到 `bzdha` **整串空码**。`bzd` 明明能出
+        //     「不知道」，但简拼族的召回一直是「全串或无」——索引按完整简拼串点查、混合
+        //     模式要求覆盖整串，于是简拼一旦长过任何单个词就彻底没有候选。全拼下有 step3
+        //     子短语与 step4 前缀补全兜着（`nihaobu` 照样出「你好」且只消费 5 字节），
+        //     简拼下此前没有任何对应机制。**这不是混合简拼引入的，纯简拼一直如此。**
+        //
+        //     **只在整串一无所获时降级**，故整串能命中的情形与改动前逐字节一致（零回归）。
+        //
+        //     ★★ **不做「最长匹配、一有产出即停」——多个切点的候选共存，同层按词频竞争。**
+        //     首版那样 break 掉更短的切点，等于把「切点长短」做成了**硬闸门（惩罚 ∞）**：
+        //     `bzdhaobuhao` 的 `bzdh` 恰好是「表彰大会」的简拼（w=93），于是它把 `h` 抢走、
+        //     短切点 `bzd`（→「不知道」，**w=62492，高 672 倍**）一条都进不来，剩下的
+        //     `aobuhao` 成了垃圾。一个结构性偏好压过了三个数量级的词频差异。
+        //     切点长短是**来源差异**、不是结构质量差异，只配走 weight，不配做布尔层级键
+        //     （同款教训见模糊拼音 `is_fuzzy` 从层级键改惩罚的那一轮）。
+        //     代价是候选变多，用 `MAX_FALLBACK_PER_CUT` / `MAX_FALLBACK_TOTAL` 两道限流兜住。
+        //
+        //     ⚠️ 这仍是**启发式**，不是智能组句：简拼段不进 lattice/Viterbi，`bzd|haobuhao`
+        //     与 `bzdh|aobuhao` 之间没有语言模型仲裁，只靠词频。真正的解法是把简拼段作为
+        //     词图节点纳入整句解码（见 §4.8 待办）。
+        //
+        //     ⚠️ 门槛问的必须是「这串里**有成不了音节的部分**吗」（`!mixed_covered`），
+        //     而不是「整串本身是不是一条合法的简拼/混合模式」。两处都栽过：
+        //
+        //     - 只看 `!abbrev_full_hit`（简拼族没命中）⇒ **纯全拼也被拖进降级**：`meiyou`
+        //       的 is_abbreviation 因 `i` 判假、整串又被音节完整覆盖使混合模式为空，于是
+        //       「一无所获」成立 ⇒ 退到 `meiy` 后 `[mei][y]` 命中「没有」，凭空多出
+        //       `is_abbrev` 候选、破坏「前缀补全排在精确匹配之后」的层级
+        //       （`test_pinyin_trailing_partial_prefix_floats_above_exact` 当场抓到）。
+        //     - 改用「整串是简拼族形态」又**把长串挡在门外**：`bzdnihaobuh` 最少需要
+        //       `[b][z][d][ni][hao][bu][h]` 七段、超过 `MAX_SEGMENTS`，于是整串模式为空、
+        //       门槛不过 ⇒ 连打到第 11 键**彻底空码**（真机报的正是这个）。
+        //
+        //     `!mixed_covered` 两边都对：`meiyou`/`nihao` 被音节完整覆盖 ⇒ 不降级；
+        //     凡含成不了音节的字母（`bzdha`、`bzdnihaobuh`）⇒ 允许降级，且**逐前缀的严格
+        //     判定在 `recall_abbrev_prefix` 内部**（每个 stroke 各自过 is_abbreviation /
+        //     mixed_patterns），门槛只负责挡掉纯全拼、不负责替前缀把关。
+        if self.config.enable_abbrev
+            && !abbrev_full_hit
+            && !mixed_covered
+            && abbr_query.len() > MIN_ABBREV_STROKE
+        {
+            let mut cuts_with_hits = 0usize;
+            for take in (MIN_ABBREV_STROKE..abbr_query.len()).rev() {
+                if !abbr_query.is_char_boundary(take) {
+                    continue;
+                }
+                let before = candidates.len();
+                self.recall_abbrev_prefix(&abbr_query[..take], take, &mut candidates);
+                if candidates.len() > before {
+                    cuts_with_hits += 1;
+                    if cuts_with_hits >= MAX_FALLBACK_CUTS {
+                        break;
+                    }
                 }
             }
         }
@@ -1338,6 +1631,18 @@ impl Engine for PinyinEngine {
         // 双拼激活时：全拼字节数需通过 map_consumed_length 回算为双拼原始键数，
         // 否则变长音节（2键→3字节，如 zh/ch/sh）会错误消费/越界双拼键缓冲区。
         for c in candidates.iter_mut() {
+            // 简拼族前缀回退（step 6.2）的候选**自带击键域的消费数**，必须跳过这套计算。
+            //
+            // 简拼的 code 是词的全拼码（`buzhidao`），不以 query（`bzdha`）开头 ⇒ 会落到
+            // else 分支取 `query.len()`，即「消费整串」——选中「不知道」后余下的 `ha` 会被
+            // 一起吃掉，分步上屏当场失效。整串简拼候选的 consumed_length 保持 0、照旧走
+            // 这条计算（消费整串正是它要的），故此判据不影响它们。
+            //
+            // 双拼下同样跳过：简拼的判据本就走 raw_input（击键域），consumed_length 的语义
+            // 就是「消费多少击键」，无须再过 map_consumed_length 换算。
+            if c.is_abbrev && c.consumed_length != 0 {
+                continue;
+            }
             // 以剥除分隔符后的 query 为基准计算消费长度（无分隔符时 query==input）。
             let fp_consumed = if !c.code.is_empty() && query.starts_with(&c.code) {
                 c.code.len()
@@ -1367,10 +1672,43 @@ impl Engine for PinyinEngine {
         // 只在「无双拼、无手动分隔符、首选覆盖已完成音节前缀且带边界信息」时接管——
         // 双拼的 preedit 另有 build_raw_preedit 负责（下方覆盖），分隔符段的 `'` 是用户
         // 亲手打的硬边界不容改写，无边界信息则无从跟随。其余情形保持 mm 显示不变。
+        //
+        // 简拼/混合简拼另走一支：它们的 code 与击键**不同域**，故 `top.code == completed`
+        // 恒不成立（`nhao` 一个完整音节都切不出，`completed` 是空串），此前因此完全没有
+        // 分隔显示——`nhao` 原样显示为 `nhao`，`nh` 显示为 `nh`。见下方分支。
         if sp_result.is_none() && !has_sep {
             if let Some(top) = candidates.first() {
                 if top.boundary != 0 && top.code == completed && !completed.is_empty() {
                     preedit_display = render_preedit(completed, top.boundary, &partial_syllable);
+                } else if top.is_abbrev && top.boundary != 0 {
+                    // 简拼（`nh`→`n'h`）与混合简拼（`nhao`→`n'hao`）的分段显示。
+                    //
+                    // **切的是击键串，不是候选的 code。** 直接渲染 code 会显示成 `ni'hao`：
+                    // 用户只敲了 4 键却看到 5 个字母，退格与光标编辑立刻错位。这里用候选
+                    // 自带的真值音节序列去切 `raw_input`，声母段吃 1 字节、音节段吃整段
+                    // （见 `render_keystroke_preedit`）。
+                    //
+                    // 对不上就保持原显示：preedit 是显示层，宁可少一个分隔符，
+                    // 也不能给出与击键长度不符的串。
+                    if let Some((head, used)) =
+                        mixed_abbrev::syllables_from_boundary(&top.code, top.boundary).and_then(
+                            |syls| mixed_abbrev::render_keystroke_preedit(raw_input, &syls),
+                        )
+                    {
+                        if used == raw_input.len() {
+                            preedit_display = head;
+                        } else if top.consumed_length != 0 && used == top.consumed_length {
+                            // 部分匹配（step 6.2 前缀回退）：余下的击键**自己再切一遍**，
+                            // 别整段甩上去。`bzdnihaob` 选中「不知道」(消费 bzd) 后尾巴是
+                            // `nihaob`，含完整音节 `ni`/`hao` + 残码 `b`——整段追加会显示成
+                            // `b'z'd'nihaob`，该切的地方没切。走 compose_segment 得
+                            // `ni'hao'b`，最终 `b'z'd'ni'hao'b`。
+                            let (tail, _, _) = self.compose_segment(&raw_input[used..]);
+                            preedit_display = format!("{head}'{tail}");
+                        }
+                        // 其余情形（走不完且不是部分候选）保持原显示：那说明模式与击键
+                        // 对不上，硬拼只会给出与击键长度不符的串。
+                    }
                 }
             }
         }

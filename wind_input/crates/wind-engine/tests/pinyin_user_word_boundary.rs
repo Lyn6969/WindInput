@@ -218,6 +218,54 @@ fn shuangpin_abbrev_uses_raw_keystrokes() {
     );
 }
 
+/// **双拼下的混合简拼**（`xanning` = x + an + ning → 西安宁）不得被边界校验误杀。
+///
+/// 这是混合简拼最容易翻车的一处（设计文档 `pinyin-mixed-abbrev.md` §5 约束 1）：
+/// 候选的 code 是词的全拼码 `xianning`，而当次击键是 `xanning` —— 两者**根本不同域**，
+/// 双拼真值边界比较必然不符。排序前那道 `boundary_compatible` 过滤靠 `is_abbrev` 豁免
+/// 放行；混合候选一旦漏标这个位，双拼下就会被整批误杀。
+///
+/// 历史同款：wdat v5 给简拼候选填上真实 boundary 后，原本「任一侧为 0 即放行」的隐式
+/// 豁免失效，双拼下简拼整批消失（`ae2df59` 改为显式豁免）。
+///
+/// 用歧义切分码：「西安宁」真值 `xi|an|ning`，而 `maximum_match` 会切成 `xian|ning`。
+#[test]
+fn shuangpin_mixed_abbrev_survives_boundary_check() {
+    let Some(dir) = data_dir() else {
+        eprintln!("跳过：拼音词库不存在");
+        return;
+    };
+    const B: u64 = 0b10101; // xi|an|ning
+
+    // 全拼基线：确认混合式本身成立（否则下面的双拼断言分不清是哪一层坏了）
+    let fp = manager(&dir, "mix_abbr_fp", &[("xianning", "西安宁", 5000, B)]);
+    assert!(
+        fp.convert("xanning", 30)
+            .candidates
+            .iter()
+            .any(|c| c.text == "西安宁"),
+        "全拼下 xanning 应命中（基线）"
+    );
+
+    // 切到双拼：同样 7 键，走双拼转换 + 真值边界校验
+    let sp = manager_shuangpin(&dir, "mix_abbr_sp", &[("xianning", "西安宁", 5000, B)]);
+    let r = sp.convert("xanning", 30);
+    let c = r
+        .candidates
+        .iter()
+        .find(|c| c.text == "西安宁")
+        .unwrap_or_else(|| {
+            panic!(
+                "双拼下 xanning 也应命中——混合简拼候选须走在边界校验的豁免侧: {:?}",
+                r.candidates.iter().map(|c| &c.text).collect::<Vec<_>>()
+            )
+        });
+    assert!(
+        c.is_abbrev,
+        "豁免正是靠这个位；它没立起来就说明候选是从别的路径来的，本测试也就失去意义"
+    );
+}
+
 /// **用户长词打 2 个音节即可上浮**——这正是边界接通后才拿得到的行为。
 ///
 /// 「大菠萝哥」4 音节，输入 `dabo`（2 音节）：
