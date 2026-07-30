@@ -110,6 +110,7 @@ enum Class {
     A,
     B,
     C,
+    D,
 }
 
 impl Class {
@@ -118,6 +119,7 @@ impl Class {
             Class::A => "A_normal",
             Class::B => "B_contracted_short",
             Class::C => "C_multi_syllable_contracted",
+            Class::D => "D_mixed_abbrev_sentence",
         }
     }
 
@@ -126,6 +128,19 @@ impl Class {
             Class::A => "A 普通词 (mm == 真值)",
             Class::B => "B 缩合音短词 (塌缩进单音节边)",
             Class::C => "C 多音节含缩合音 (跨多音节但边界不符)",
+            Class::D => "D 简拼+全拼混合整句 (bzd+haobuhao)",
+        }
+    }
+
+    /// 本类的第四列（表头「切分正确」）实际度量什么。
+    ///
+    /// A/B/C 度量首选候选的**音节切分**是否等于真值；D 类的击键串与真值音节不同域
+    /// （`bzdhaobuhao` 里的 `bzd` 压根不是音节），那个判据无从成立，故改为度量
+    /// **首选是否至少给对了第一个词**（见 `Score::partial_ok`）。
+    fn col4_meaning(self) -> &'static str {
+        match self {
+            Class::D => "首词命中",
+            _ => "切分正确",
         }
     }
 }
@@ -138,6 +153,11 @@ struct Sample {
     weight: u64,
     unigram: u64,
     class: Class,
+    /// D 类的组成词（`[W1, W2]`）。其余类为空。
+    ///
+    /// 用于 `partial_ok`：整句没出来时，至少要能确认「首选给对了 W1」——那是当前
+    /// 分步上屏的行为，改动后不应下降。
+    parts: Vec<String>,
 }
 
 fn is_cjk(c: char) -> bool {
@@ -281,7 +301,97 @@ fn classify(
         weight,
         unigram: 0,
         class,
+        parts: Vec::new(),
     })
+}
+
+/// D 类样本：把 W1 的**简拼**与 W2 的**全拼**拼成一串击键，期望整句 = W1 + W2。
+///
+/// 度量的是「智能组句」——微软拼音打 `bzdhaobuhao` 直接出「不知道好不好」，而本引擎的
+/// 简拼段**不进 lattice/Viterbi**（简拼走独立的 AbbrevSection 点查），切点选择只靠词频
+/// 启发式，故整句 top-1 的基线预期接近 0。**立这条基线正是本类的目的**：
+/// 没有它，把简拼节点接进词图之后无从判断改善了多少、也无从发现 A/C 类被拖累。
+///
+/// 入池条件（不满足即丢弃，逐条都是为了避免假样本）：
+/// - W1 取 2..=4 音节、W2 取 2..=3 音节：控制击键串长度，也保证简拼有意义（单音节词
+///   的「简拼」就是一个字母，那是裸声母场景、另有路径负责）。
+/// - **整串击键不能被完整切成音节序列**。否则它会走纯全拼路径（`mixed_covered` 短路），
+///   测的就不是简拼了——比如 W1=「哦哦」简拼 `oo` 恰好是合法音节序列 `o|o`。
+/// - 击键串 ≤ 16 字节：与 `mixed_abbrev::MAX_INPUT_LEN` 对齐，超出则混合模式压根不枚举，
+///   样本落在能力范围外、只会稀释指标。
+/// - 两词不同且拼接后仍是纯 CJK。
+fn build_mixed_samples(
+    pool: &[Sample],
+    n: usize,
+    seed: u64,
+    trie: &SyllableTrie,
+    reject: &mut HashMap<&'static str, usize>,
+) -> Vec<Sample> {
+    let mut rng = Rng(seed ^ 0xD_1234);
+    // 候选池：按音节数分成「可作 W1」与「可作 W2」两组
+    let w1: Vec<&Sample> = pool
+        .iter()
+        .filter(|s| (2..=4).contains(&s.true_syls.len()))
+        .collect();
+    let w2: Vec<&Sample> = pool
+        .iter()
+        .filter(|s| (2..=3).contains(&s.true_syls.len()))
+        .collect();
+    if w1.is_empty() || w2.is_empty() {
+        return Vec::new();
+    }
+
+    let mut out = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    // 尝试次数给足（多数组合会被入池条件筛掉），但设硬上限避免词库形态异常时空转。
+    let max_attempts = n.saturating_mul(60).max(2000);
+    for _ in 0..max_attempts {
+        if out.len() >= n {
+            break;
+        }
+        let a = w1[(rng.next_u64() % w1.len() as u64) as usize];
+        let b = w2[(rng.next_u64() % w2.len() as u64) as usize];
+        if a.text == b.text {
+            continue;
+        }
+        // W1 → 简拼（各音节首字母）；W2 → 全拼码
+        let abbrev: String = a
+            .true_syls
+            .iter()
+            .filter_map(|s| s.chars().next())
+            .collect();
+        let stroke = format!("{abbrev}{}", b.input);
+        if stroke.len() > 16 {
+            *reject.entry("D_stroke_too_long").or_default() += 1;
+            continue;
+        }
+        // 整串可完整切分 ⇒ 走全拼路径，测不到简拼
+        if Dag::build(&stroke, trie).maximum_match().concat() == stroke {
+            *reject.entry("D_stroke_is_full_pinyin").or_default() += 1;
+            continue;
+        }
+        let text = format!("{}{}", a.text, b.text);
+        if !seen.insert(stroke.clone()) {
+            continue;
+        }
+        out.push(Sample {
+            text,
+            input: stroke,
+            // D 类不度量切分（击键串与真值音节不同域），真值音节仅供明细展示
+            true_syls: a
+                .true_syls
+                .iter()
+                .chain(b.true_syls.iter())
+                .cloned()
+                .collect(),
+            mm: Vec::new(),
+            weight: a.weight.min(b.weight),
+            unigram: a.unigram.min(b.unigram),
+            class: Class::D,
+            parts: vec![a.text.clone(), b.text.clone()],
+        });
+    }
+    out
 }
 
 // ---------------------------------------------------------------- 抽样
@@ -317,6 +427,7 @@ fn stratified_sample(mut pool: Vec<Sample>, n: usize, seed: u64) -> Vec<Sample> 
                 weight: chunk[i].weight,
                 unigram: chunk[i].unigram,
                 class: chunk[i].class,
+                parts: chunk[i].parts.clone(),
             });
         }
     }
@@ -355,6 +466,21 @@ struct Score {
     /// 判据：首选候选覆盖整串输入（`code == input`）且其 `boundary` == 真值 mask。
     /// 候选无边界信息（boundary==0，如单字）时不算切分正确。
     seg_ok: usize,
+    /// **仅 D 类**：整句没出来时，首选是否至少给对了第一个词（W1）。
+    ///
+    /// 它度量的是当前「分步上屏」的行为：`bzdhaobuhao` 出「不知道」（消费 3 键）后由用户
+    /// 再选一次。把简拼接进 lattice 之后 `top1` 应上升，而**这一项不应下降**——否则说明
+    /// 整句路径抢走了首选却没抢对。
+    partial_ok: usize,
+    /// **仅 D 类**：W1 出现在候选列表里（任意位次）。
+    ///
+    /// 与 `partial_ok` 配对使用，用来区分两种完全不同的失败：
+    /// - `partial_recall` 低 ⇒ **召回本身没做到**（前缀回退没退到 W1 那个切点），是缺陷；
+    /// - `partial_recall` 高而 `partial_ok` 低 ⇒ 召回到了但排不到首位，那是简拼固有的
+    ///   同简拼歧义（`bzd` 下 12 个词按词频竞争，采样到的低频 W1 本就不该在首位）。
+    ///
+    /// 缺了这个区分，光看 `partial_ok` 会把后者误读成前者。
+    partial_recall: usize,
     misses: Vec<Miss>,
     /// 切分不正确的样本明细（含失败**原因分类**，见 `SegMiss::reason`）
     seg_misses: Vec<SegMiss>,
@@ -487,11 +613,24 @@ fn pinyin_eval_report() {
             pools.entry(s.class.key()).or_default().push(s);
         }
     }
+    // D 类是**组合样本**（两个词拼出来的），不是从单条词库记录 classify 而来，故在
+    // A/B/C 建池之后单独构造。取材于 A 池：那些词的真值切分与最大匹配一致，简拼投影
+    // 不会引入额外歧义，混合整句的失败因此可归因到「简拼段没进词图」而非切分本身。
+    let d_pool = {
+        let a_pool = pools
+            .get(Class::A.key())
+            .map(|v| v.as_slice())
+            .unwrap_or(&[]);
+        build_mixed_samples(a_pool, n_per_class, seed, &trie, &mut reject)
+    };
+    *class_totals.entry(Class::D.key()).or_default() += d_pool.len();
+    pools.insert(Class::D.key(), d_pool);
+
     let gen_ms = t_gen.elapsed().as_millis();
 
     println!("\n=== 评测集生成 ({} ms) ===", gen_ms);
     println!("词库原始条目: {}", raw.len());
-    for c in [Class::A, Class::B, Class::C] {
+    for c in [Class::A, Class::B, Class::C, Class::D] {
         println!(
             "  {:<44} 总体 {:>7}",
             c.label(),
@@ -504,7 +643,7 @@ fn pinyin_eval_report() {
 
     // ---- 2. 抽样
     let mut samples: Vec<(Class, Vec<Sample>)> = Vec::new();
-    for c in [Class::A, Class::B, Class::C] {
+    for c in [Class::A, Class::B, Class::C, Class::D] {
         let pool = pools.remove(c.key()).unwrap_or_default();
         samples.push((c, stratified_sample(pool, n_per_class, seed)));
     }
@@ -525,6 +664,22 @@ fn pinyin_eval_report() {
             let cands = mgr.convert_with("pinyin", &s.input, TOP_N).candidates;
             let rank = cands.iter().position(|c| c.text == s.text);
             let tm = true_mask(&s.true_syls);
+            // D 类：击键串与真值音节不同域（`bzd` 不是音节），切分判据无从成立。
+            // 第四列改度量「首选至少给对了 W1」——当前分步上屏的实际行为。
+            if s.class == Class::D {
+                if cands
+                    .first()
+                    .is_some_and(|t| Some(&t.text) == s.parts.first())
+                {
+                    sc.partial_ok += 1;
+                }
+                if s.parts
+                    .first()
+                    .is_some_and(|w1| cands.iter().any(|c| &c.text == w1))
+                {
+                    sc.partial_recall += 1;
+                }
+            }
             match cands.first() {
                 Some(top) if top.code == s.input && top.boundary != 0 && top.boundary == tm => {
                     sc.seg_ok += 1;
@@ -601,9 +756,14 @@ fn pinyin_eval_report() {
     println!("\n=== 基线报告 (seed={}, top_n={}) ===", seed, TOP_N);
     println!(
         "{:<46} {:>6} {:>9} {:>9} {:>9} {:>9} {:>8}",
-        "类别", "样本", "top-1", "top-5", "MRR", "切分正确", "耗时ms"
+        "类别", "样本", "top-1", "top-5", "MRR", "切分正确*", "耗时ms"
     );
     for (c, sc, ms) in &scores {
+        // 第四列对 A/B/C 是切分正确率、对 D 是首词命中率（见 Class::col4_meaning）
+        let col4 = match c {
+            Class::D => Score::rate(sc.partial_ok, sc.total),
+            _ => Score::rate(sc.seg_ok, sc.total),
+        };
         println!(
             "{:<46} {:>6} {:>8.2}% {:>8.2}% {:>9.4} {:>8.2}% {:>8}",
             c.label(),
@@ -615,8 +775,22 @@ fn pinyin_eval_report() {
             } else {
                 sc.mrr_sum / sc.total as f64
             },
-            Score::rate(sc.seg_ok, sc.total) * 100.0,
+            col4 * 100.0,
             ms
+        );
+    }
+    println!(
+        "* 第四列：A/B/C = 切分正确；{} = {}（击键串与真值音节不同域，切分判据无从成立）",
+        Class::D.key(),
+        Class::D.col4_meaning()
+    );
+    println!("  D 类 top-1 度量「智能组句」：简拼段目前不进 lattice/Viterbi，基线预期接近 0。");
+    if let Some((_, sc, _)) = scores.iter().find(|(c, _, _)| *c == Class::D) {
+        println!(
+            "  D 类首词：命中(首选) {:.2}% / 召回(任意位次) {:.2}% —— 两者的差是「简拼同音歧义」，\n  \
+             只有召回率低才说明前缀回退本身没做到。",
+            Score::rate(sc.partial_ok, sc.total) * 100.0,
+            Score::rate(sc.partial_recall, sc.total) * 100.0
         );
     }
     println!("\n评测总耗时: {} ms（含引擎初始化 {} ms）", run_ms, load_ms);
@@ -753,6 +927,16 @@ fn pinyin_eval_report() {
             sc.top5,
             ms
         );
+        // D 类专有：首词命中率（seg_ok 对它恒为 0，不可用于对账）
+        if *c == Class::D {
+            let _ = write!(
+                j,
+                "      \"first_word_top1\": {:.6}, \"first_word_hits\": {}, \"first_word_recall\": {:.6},\n",
+                Score::rate(sc.partial_ok, sc.total),
+                sc.partial_ok,
+                Score::rate(sc.partial_recall, sc.total)
+            );
+        }
         j.push_str("      \"misses\": [\n");
         for (k, m) in sc.misses.iter().take(dump).enumerate() {
             let _ = write!(
