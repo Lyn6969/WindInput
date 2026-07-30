@@ -269,8 +269,75 @@ schema/code 域写错、调频开关没开、词频记录没进重排，任一�
 
 待办：
 
-1. **设置页 GUI**（`wind-setting` 仓）：3 个 `number` 行 + 现有 `protect_top_n` 的 label/hint
-   改成「全码位」口径；过五道守门测试。
+1. **设置页 GUI**（`wind-setting` 仓）——⚠️ **必须等本分支合并进主仓 main 之后再做**：
+   设置仓通过 path 依赖直接编译主仓**工作区**的 `wind-config`/`wind-rpc`
+   （`Cargo.toml`），而 capability 快照的 `default` 取自
+   `Config::system_preset_value(data_dir)`，即 **REGISTRY 与 `data/config.toml` 两者**，
+   两处都指向主仓工作区。合并前重生成快照拿不到新键，守门测试必红。
+
+   合并后按序执行：
+
+   ① 在 `src/assets/settings_manifest.toml` 的「词频调整」小节，把现有 `protect_top_n`
+   一项替换为下面四项（顺序即渲染顺序，简码位在前）：
+
+   ```toml
+   [[items]]
+   key = "schema.codetable.frequency.protect_top_n_len1"
+   group = "schema"
+   section = "上屏行为"
+   subsection = "词频调整"
+   type = "number"
+   label = "一简位保护前 N 项"
+   hint = "只输入 1 个编码时（如五笔一简），词典前 N 项不参与调频。一简每个编码通常只有两个字，误选一次就会永久换掉首选，故默认保护"
+   min = 0
+   max = 100
+   enabled_when = "schema.codetable.frequency.enabled == true"
+
+   [[items]]
+   key = "schema.codetable.frequency.protect_top_n_len2"
+   group = "schema"
+   section = "上屏行为"
+   subsection = "词频调整"
+   type = "number"
+   label = "二简位保护前 N 项"
+   hint = "输入 2 个编码时，词典前 N 项不参与调频（0 = 不保护）"
+   min = 0
+   max = 100
+   enabled_when = "schema.codetable.frequency.enabled == true"
+
+   [[items]]
+   key = "schema.codetable.frequency.protect_top_n_len3"
+   group = "schema"
+   section = "上屏行为"
+   subsection = "词频调整"
+   type = "number"
+   label = "三简位保护前 N 项"
+   hint = "输入 3 个编码时，词典前 N 项不参与调频。默认不保护——三简的固定程度弱于一二简"
+   min = 0
+   max = 100
+   enabled_when = "schema.codetable.frequency.enabled == true"
+
+   [[items]]
+   key = "schema.codetable.frequency.protect_top_n"
+   group = "schema"
+   section = "上屏行为"
+   subsection = "词频调整"
+   type = "number"
+   label = "全码位保护前 N 项"
+   hint = "输入 4 个及以上编码时，词典前 N 项不参与调频。默认 0 = 不保护，让调频在全码位正常起作用"
+   min = 0
+   max = 100
+   enabled_when = "schema.codetable.frequency.enabled == true"
+   ```
+
+   ② 重生成两份产物（**勿手改**）：
+
+   ```
+   cargo test regenerate_capabilities_snapshot -- --ignored
+   cargo test regenerate_mock_config -- --ignored
+   ```
+
+   ③ `cargo test` 全绿（`manifest_consistent_with_capabilities` 是把关的那道）。
 2. **真机验证**：打 `a` / `aa` 选次选字若干次后确认首选不变；`aaaa` 位确认调频仍生效。
 3. 文档站 `../WindInputDocs`：config 参考页 + 用法页两处。
 
