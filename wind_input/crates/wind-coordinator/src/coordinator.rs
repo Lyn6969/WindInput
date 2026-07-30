@@ -3761,17 +3761,24 @@ impl Coordinator {
         }
     }
 
-    /// 清空用户短语后把被遮蔽的系统条目补回来。
+    /// 把**缺失**的系统短语条目补回库里（不动任何已存在的行）。
     ///
     /// 用户短语遮蔽同键系统条目时该行**归属用户**（`is_system=false`，见
-    /// `Store::add_phrase`），于是「清空用户短语」会把它连同遮蔽关系一起删掉——
-    /// 库里该 `(code,text)` 彻底消失，系统条目也随之不见。sync 只在 TOML 哈希变化或
+    /// `Store::add_phrase`），于是任何「清空用户短语」的动作都会把它连同遮蔽关系一起删掉——
+    /// 库里该 `(code,text)` 彻底消失，系统条目也随之不见。sync 平时只在 TOML 哈希变化或
     /// 「系统恢复默认」时才跑，不补这一次，被遮蔽过的系统短语要等到下次哈希变动才回来。
-    pub(crate) fn resync_system_phrases_after_user_reset(&self) {
+    ///
+    /// **两个调用点**（漏一个就等于那条路上的系统短语静默丢失）：设置页「清空用户短语」、
+    /// 备份还原的 replace 模式（`restore_backup` 内部会先 `reset_user_phrases`）。
+    ///
+    /// ⚠️ **走 `ensure_system_phrases` 而非 `sync_system_phrases`**：后者会用 TOML 值覆盖已存在
+    /// 系统行的 weight/position，那样一次「清空用户短语」会顺带把用户在系统短语列表里改过的
+    /// 权重重置掉——用户没要求这件事。补齐只应补缺失的。
+    pub(crate) fn restore_missing_system_phrases(&self, reason: &str) {
         let Some(store) = self.store.as_ref() else {
             return;
         };
-        let entries = self.current_system_phrase_entries("清空用户短语");
+        let entries = self.current_system_phrase_entries(reason);
         if entries.is_empty() {
             return;
         }
@@ -3784,8 +3791,10 @@ impl Coordinator {
                 position: e.position,
             })
             .collect();
-        if let Err(e) = store.sync_system_phrases(&sys) {
-            warn!("清空用户短语：系统短语补齐失败: {e}");
+        match store.ensure_system_phrases(&sys) {
+            Ok(n) if n > 0 => info!("{reason}：补回 {n} 条缺失的系统短语"),
+            Err(e) => warn!("{reason}：系统短语补齐失败: {e}"),
+            _ => {}
         }
     }
 

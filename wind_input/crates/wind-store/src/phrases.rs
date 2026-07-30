@@ -425,6 +425,36 @@ impl Store {
         Ok((imported, skipped))
     }
 
+    /// 只把**缺失**的系统条目补回库里，已存在的行一律不动。返回补回条数。
+    ///
+    /// **与 [`Self::sync_system_phrases`] 的区别是要点**：sync 会用 TOML 值覆盖已存在系统行的
+    /// weight/position（「以文件为准」，供「恢复默认」与 TOML 变更时用），本函数一个字节都不改。
+    ///
+    /// 用于「用户短语被清空后，把被遮蔽的系统条目补回来」：遮蔽行归属用户
+    /// （见 [`Self::add_phrase`]），`reset_user_phrases` 会连它一起删掉，该 `(code,text)` 遂
+    /// 彻底消失。这条路**不能用 sync**——用户的动作只是清空用户短语，顺带把他在系统短语
+    /// 列表里改过的权重重置掉是越界的副作用。
+    pub fn ensure_system_phrases(&self, entries: &[SystemPhrase]) -> anyhow::Result<usize> {
+        let mut n = 0;
+        for e in entries {
+            if self.get_phrase(&e.code, &e.text)?.is_none() {
+                self.put_phrase(
+                    &e.code,
+                    &e.text,
+                    PhraseValue {
+                        weight: e.weight,
+                        position: e.position,
+                        enabled: true,
+                        is_system: true,
+                        overrides_system: false,
+                    },
+                )?;
+                n += 1;
+            }
+        }
+        Ok(n)
+    }
+
     /// 把「(code,text) 命中系统短语表、但库里是用户行」的记录**认领回系统行**，
     /// 返回认领条数。供「恢复默认」显式调用。
     ///
@@ -822,6 +852,79 @@ mod tests {
         let after = s.list_system_phrases().unwrap();
         assert_eq!(after.len(), 1, "系统条目应被补回");
         assert_eq!((after[0].weight, after[0].position), (1000, 1));
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// `ensure_system_phrases` 只补缺失、**绝不改动已存在的行**。
+    ///
+    /// 这条性质是它存在的全部理由：用 sync 代替它，一次「清空用户短语」就会把用户在系统
+    /// 短语列表里改过的权重/次序重置回 TOML 默认值——用户没要求这件事。
+    #[test]
+    fn ensure_system_phrases_only_fills_gaps() {
+        let path = tmp("wind_phrases_ensure.redb");
+        let s = Store::open(&path).unwrap();
+        let sys = [
+            SystemPhrase {
+                code: "a".into(),
+                text: "甲".into(),
+                weight: 1000,
+                position: 1,
+            },
+            SystemPhrase {
+                code: "b".into(),
+                text: "乙".into(),
+                weight: 1000,
+                position: 2,
+            },
+        ];
+        s.sync_system_phrases(&sys).unwrap();
+
+        // 用户在系统短语列表里改了「甲」的权重、并把「乙」停用。
+        s.update_phrase("a", "甲", None, None, Some(9), Some(5555))
+            .unwrap();
+        s.set_phrase_enabled("b", "乙", false).unwrap();
+        // 「乙」被删掉（模拟遮蔽行被 reset_user_phrases 连带清掉后的缺口）
+        s.remove_phrase("b", "乙").unwrap();
+
+        assert_eq!(s.ensure_system_phrases(&sys).unwrap(), 1, "只补回缺失的乙");
+
+        let list = s.list_system_phrases().unwrap();
+        let a = list.iter().find(|p| p.code == "a").unwrap();
+        assert_eq!(
+            (a.weight, a.position),
+            (5555, 9),
+            "已存在的行一字不改——这正是不能用 sync 的原因"
+        );
+        assert!(list.iter().any(|p| p.code == "b"), "缺失的补回");
+
+        // 幂等：再补一次不重复插入。
+        assert_eq!(s.ensure_system_phrases(&sys).unwrap(), 0);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// 对照：同样的场景下 `sync_system_phrases` **会**重置用户的编辑。
+    /// 锁住这个差异，避免日后有人「顺手统一成 sync」。
+    #[test]
+    fn sync_overwrites_user_edits_on_system_rows() {
+        let path = tmp("wind_phrases_sync_overwrites.redb");
+        let s = Store::open(&path).unwrap();
+        let sys = [SystemPhrase {
+            code: "a".into(),
+            text: "甲".into(),
+            weight: 1000,
+            position: 1,
+        }];
+        s.sync_system_phrases(&sys).unwrap();
+        s.update_phrase("a", "甲", None, None, Some(9), Some(5555))
+            .unwrap();
+
+        s.sync_system_phrases(&sys).unwrap();
+        let a = s.list_system_phrases().unwrap().pop().unwrap();
+        assert_eq!(
+            (a.weight, a.position),
+            (1000, 1),
+            "sync 以 TOML 为准（供恢复默认/文件变更用），故补齐场景不能用它"
+        );
         let _ = std::fs::remove_file(&path);
     }
 

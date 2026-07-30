@@ -1062,6 +1062,10 @@ impl Coordinator {
             }
         }
         if touched_phrase {
+            // Replace 还原会先 `reset_user_phrases`（见 restore_backup 的 "phrase" 分支），
+            // 遮蔽了系统条目的用户行随之被删、那些系统短语一并消失 → 补回缺失的。
+            // 与设置页「清空用户短语」同一条约束，漏在这里就是备份还原后系统短语静默少几条。
+            self.restore_missing_system_phrases("备份还原");
             self.rebuild_phrases();
         }
         if touched_config {
@@ -1489,6 +1493,9 @@ impl Coordinator {
         if let Some(en) = params.get("enabled").and_then(|v| v.as_bool()) {
             store.set_phrase_enabled(new_code.unwrap_or(code), new_text.unwrap_or(text), en)?;
         }
+        // 改 code/text 时 `update_phrase` 内部会 remove 旧键——若改的是一条遮蔽了系统条目的
+        // 用户短语，旧键一删那条系统短语也没了。与 `web_phrase_remove` 同一条约束。
+        self.restore_missing_system_phrases("编辑短语");
         self.rebuild_phrases();
         Ok(json!({ "ok": true }))
     }
@@ -1500,6 +1507,10 @@ impl Coordinator {
             .as_ref()
             .ok_or_else(|| anyhow::anyhow!("无持久化存储"))?;
         store.remove_phrase(code, text)?;
+        // 删掉的可能是一条**遮蔽了系统条目**的用户短语（`overrides_system`）——主键只有
+        // 一把，删掉它等于把那条系统短语也删了。用户的预期恰恰相反：删掉自己加的那条
+        // 就该露出系统默认那条。故补回缺失的系统条目。
+        self.restore_missing_system_phrases("删除短语");
         self.rebuild_phrases();
         Ok(json!({ "ok": true }))
     }
@@ -1523,8 +1534,8 @@ impl Coordinator {
         if let Some(store) = self.store.as_ref() {
             store.reset_user_phrases()?;
             // 用户行里可能有遮蔽了系统条目的（`overrides_system`），删掉后那些系统短语
-            // 也一并没了 → 补一次同步插回来，否则要等到 TOML 哈希变动才恢复。
-            self.resync_system_phrases_after_user_reset();
+            // 也一并没了 → 补回缺失的，否则要等到 TOML 哈希变动才恢复。
+            self.restore_missing_system_phrases("清空用户短语");
         }
         self.rebuild_phrases();
         Ok(json!({ "ok": true }))
@@ -3930,5 +3941,163 @@ mod tests {
             .unwrap();
         assert_eq!(listed.get("total").and_then(|v| v.as_u64()), Some(1));
         let _ = std::fs::remove_file(&out);
+    }
+}
+
+#[cfg(test)]
+mod phrase_shadowing_tests {
+    //! 「用户短语遮蔽系统条目」的可逆性：主键只有 `(code, text)` 一把，遮蔽行归属用户，
+    //! 于是**任何删掉该行的操作都会连带删掉那条系统短语**。每条这样的路径都必须补回缺失的
+    //! 系统条目，漏一条就是「系统短语莫名少了一条」——正是本特性早期版本的原始 bug。
+    use super::*;
+    use std::sync::Arc;
+    use wind_config::config::Config;
+    use wind_store::Store;
+
+    const SYS_CODE: &str = "date";
+    const SYS_TEXT: &str = "$Y年$M月$D日";
+
+    /// 带真实 `system.phrases.toml` 的无头协调器（`data_dir=None` 时补齐逻辑会整体早退，
+    /// 那样测出来的「通过」是假的——它根本没跑到被测代码）。
+    fn coord_with_sys_phrase(tag: &str) -> (Arc<Coordinator>, std::path::PathBuf) {
+        let base = std::env::temp_dir().join(format!("wind_phrase_shadow_{tag}"));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).unwrap();
+        std::fs::write(
+            base.join("system.phrases.toml"),
+            format!(
+                "[[phrases]]\ncode = '{SYS_CODE}'\ntext = '{SYS_TEXT}'\nweight = 1000\nposition = 1\n"
+            ),
+        )
+        .unwrap();
+        let db = base.join("s.redb");
+        let store = Arc::new(Store::open(&db).unwrap());
+        let c = Coordinator::new_headless_with_store(Config::default(), Some(&base), store);
+        (c, base)
+    }
+
+    fn system_phrase_count(c: &Coordinator) -> usize {
+        c.store
+            .as_ref()
+            .unwrap()
+            .list_system_phrases()
+            .unwrap()
+            .len()
+    }
+
+    fn user_phrase_count(c: &Coordinator) -> usize {
+        c.store
+            .as_ref()
+            .unwrap()
+            .list_user_phrases_paged(None, 0, 99)
+            .unwrap()
+            .1
+    }
+
+    /// 前置校验：启动即完成系统短语入库，否则下面每个用例都在空库上跑、结论无意义。
+    #[test]
+    fn sanity_system_phrase_seeded_on_startup() {
+        let (c, base) = coord_with_sys_phrase("seed");
+        assert_eq!(system_phrase_count(&c), 1, "启动应把 TOML 系统短语同步入库");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// 删除遮蔽行 → 系统条目露出来（用户预期：删掉我加的那条，就该回到系统默认）。
+    #[test]
+    fn removing_shadowing_phrase_restores_system_entry() {
+        let (c, base) = coord_with_sys_phrase("remove");
+        let p = json!({ "code": SYS_CODE, "text": SYS_TEXT, "weight": 5000, "position": 9 });
+        c.web_data_rpc("phrase.add", &p).unwrap();
+        assert_eq!(user_phrase_count(&c), 1, "遮蔽行归用户");
+        assert_eq!(system_phrase_count(&c), 0, "系统条目被遮蔽");
+
+        c.web_data_rpc(
+            "phrase.remove",
+            &json!({ "code": SYS_CODE, "text": SYS_TEXT }),
+        )
+        .unwrap();
+        assert_eq!(user_phrase_count(&c), 0);
+        assert_eq!(
+            system_phrase_count(&c),
+            1,
+            "删掉遮蔽行后系统条目必须回来，而不是两条一起消失"
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// 「清空用户短语」同理，且**不得**顺带重置用户对系统短语的编辑。
+    #[test]
+    fn clearing_user_phrases_restores_system_entry_without_resetting_edits() {
+        let (c, base) = coord_with_sys_phrase("clear");
+        let store = c.store.clone().unwrap();
+        // 另加一条纯系统短语并由用户改过权重（模拟在系统短语列表里调过）
+        store
+            .add_phrase("other", "别的", 0, 1)
+            .and_then(|_| {
+                store.reclaim_system_phrases(&[wind_store::phrases::SystemPhrase {
+                    code: "other".into(),
+                    text: "别的".into(),
+                    weight: 1,
+                    position: 0,
+                }])
+            })
+            .unwrap();
+        store
+            .update_phrase("other", "别的", None, None, Some(7), Some(4321))
+            .unwrap();
+
+        c.web_data_rpc(
+            "phrase.add",
+            &json!({ "code": SYS_CODE, "text": SYS_TEXT, "weight": 5000, "position": 9 }),
+        )
+        .unwrap();
+        c.web_data_rpc("phrase.resetDefault", &json!({})).unwrap();
+
+        assert_eq!(user_phrase_count(&c), 0, "用户短语已清空");
+        assert!(
+            store
+                .list_system_phrases()
+                .unwrap()
+                .iter()
+                .any(|p| p.code == SYS_CODE),
+            "被遮蔽的系统条目须补回"
+        );
+        let other = store
+            .list_system_phrases()
+            .unwrap()
+            .into_iter()
+            .find(|p| p.code == "other")
+            .expect("另一条系统短语仍在");
+        assert_eq!(
+            (other.weight, other.position),
+            (4321, 7),
+            "清空用户短语不得重置用户对系统短语的编辑（补齐必须只补缺失，不能走 sync）"
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// 改遮蔽行的编码 → 旧键被 remove，系统条目同样要补回。
+    #[test]
+    fn rekeying_shadowing_phrase_restores_system_entry() {
+        let (c, base) = coord_with_sys_phrase("rekey");
+        c.web_data_rpc(
+            "phrase.add",
+            &json!({ "code": SYS_CODE, "text": SYS_TEXT, "weight": 5000, "position": 0 }),
+        )
+        .unwrap();
+        assert_eq!(system_phrase_count(&c), 0);
+
+        c.web_data_rpc(
+            "phrase.update",
+            &json!({ "code": SYS_CODE, "text": SYS_TEXT, "newCode": "rq2" }),
+        )
+        .unwrap();
+        assert_eq!(
+            system_phrase_count(&c),
+            1,
+            "改键腾出原 (code,text) 后系统条目须补回"
+        );
+        assert_eq!(user_phrase_count(&c), 1, "改键后的用户短语仍在");
+        let _ = std::fs::remove_dir_all(&base);
     }
 }
