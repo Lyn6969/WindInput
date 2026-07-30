@@ -27,6 +27,20 @@ custom_words_path = "custom_words.txt"
 custom_emoji_path = "custom_emoji.txt"
 boosts_path = "boost_words.txt"
 
+# emoji 中文命名表（CLDR 反查五笔码，「⚽ 足球」→ khgf）。
+#
+# ⚠ 研究中，**暂不启用**：留空即整条通路不生效。
+# 实测生成 8942 条、覆盖 1910 个 emoji，但它们散布在 5356 个编码上，其中大量落在
+# 简码/二简的前缀子树里——五笔按前缀匹配，打 `ew` 会连带命中 `ewgi`/`ewxx`… 全部
+# 后代，日常打字被 emoji 严重污染。要实装必须先解决前缀污染（限制码长、只保留
+# tts、或给 emoji 库单独的前缀策略），不是调 stopwords 能解决的。
+#
+# 研究用法（产物不入库，落在 gitignore 的 .cache/ 下）:
+#   cargo run -p wind-tools --bin gen_emoji_names -- \
+#     --cldr .cache/cldr --out .cache/cldr/custom_emoji_named.txt
+# 然后把下面的路径临时指向该文件即可单独测试。
+custom_emoji_named_path = ""
+
 # ── 分析报告（相对 --report，未传 --report 则不写）───────
 dropped_path = "wubi86_jidian.dict.filtered.tsv"
 conflict_report_path = "wubi86_jidian.shortcode_conflicts.tsv"

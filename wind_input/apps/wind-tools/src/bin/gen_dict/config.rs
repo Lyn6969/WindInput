@@ -20,6 +20,9 @@ pub struct Config {
     // 人工维护数据（相对配置文件所在目录）
     pub custom_words_path: String,
     pub custom_emoji_path: String,
+    /// emoji 中文命名表（由 gen_emoji_names 从 CLDR 生成）：中文名反查五笔码，
+    /// 与 `custom_emoji_path` 的固定 `emoj` 码是两条互不影响的通路。
+    pub custom_emoji_named_path: String,
     pub boosts_path: String,
 
     // 分析报告（相对 --report）
@@ -124,6 +127,7 @@ impl Default for Config {
             output_name: "wubi86_jidian".into(),
             custom_words_path: String::new(),
             custom_emoji_path: String::new(),
+            custom_emoji_named_path: String::new(),
             boosts_path: String::new(),
             dropped_path: String::new(),
             conflict_report_path: String::new(),
@@ -214,6 +218,7 @@ pub struct Paths {
     pub passthrough: Vec<(PathBuf, PathBuf)>,
     pub custom_words: Option<PathBuf>,
     pub custom_emoji: Option<PathBuf>,
+    pub custom_emoji_named: Option<PathBuf>,
     pub boosts: Option<PathBuf>,
     pub dropped: Option<PathBuf>,
     pub conflict_report: Option<PathBuf>,
@@ -304,6 +309,7 @@ impl Config {
                 .collect(),
             custom_words: opt(&self.custom_words_path, config_dir),
             custom_emoji: opt(&self.custom_emoji_path, config_dir),
+            custom_emoji_named: opt(&self.custom_emoji_named_path, config_dir),
             boosts: opt(&self.boosts_path, config_dir),
             dropped: report_dir.and_then(|d| opt(&self.dropped_path, d)),
             conflict_report: report_dir.and_then(|d| opt(&self.conflict_report_path, d)),

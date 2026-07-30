@@ -426,6 +426,36 @@ fn process_extra(
         Err(e) => eprintln!("      [custom_emoji] 加载失败，跳过: {e}"),
     }
 
+    // CLDR 命名表：中文名反查五笔码，与上面的固定 `emoj` 码是两条独立通路。
+    //
+    // 与 custom_emoji 一样**直接注入 emoji 桶、不经 classify**：`has_emoji` 的区间表
+    // 漏判 ⭐(U+2B50)、国旗(U+1F1E6..)、keycap(ASCII+U+20E3) 等 76 个字形，若改成走
+    // classify，这些条目会落进 symbols/english 桶而从 emoji 库里消失。
+    match extra::load_named_emoji(paths.custom_emoji_named.as_deref(), char_codes, &mut log) {
+        Ok(named) if !named.is_empty() => {
+            let n = named.len();
+            let slot = buckets
+                .iter_mut()
+                .find(|(c, _)| *c == extra::Category::Emoji)
+                .expect("emoji 桶必然存在");
+            slot.1.extend(named);
+            eprintln!("      [emoji_named] 注入 {n} 条五笔码 emoji 条目");
+        }
+        Ok(_) => {}
+        Err(e) => eprintln!("      [emoji_named] 加载失败，跳过: {e}"),
+    }
+
+    // 去重放在所有注入之后：既清掉上游自带的重复，也合并 named 与上游的重合项
+    if let Some((_, list)) = buckets
+        .iter_mut()
+        .find(|(c, _)| *c == extra::Category::Emoji)
+    {
+        let removed = extra::dedup_emoji_entries(list);
+        if removed > 0 {
+            eprintln!("      [emoji] 去重移除 {removed} 条（同码同 emoji，保留权重最高者）");
+        }
+    }
+
     for (cat, list) in buckets.iter_mut() {
         let name = format!("{}_{}", cfg.output_name, cat.suffix());
         let path = extra::extra_output_path(&paths.output, &cfg.output_name, cat.suffix());

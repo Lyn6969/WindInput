@@ -332,6 +332,19 @@ download_dicts() {
     download_file "$WUBI_BASE/wubi86_jidian.dict.yaml"                "$rime_wubi/wubi86_jidian.dict.yaml"                "主词库"
     download_file "$WUBI_BASE/wubi86_jidian_extra.dict.yaml"          "$rime_wubi/wubi86_jidian_extra.dict.yaml"          "扩展词库"
     download_file "$WUBI_BASE/wubi86_jidian_extra_district.dict.yaml" "$rime_wubi/wubi86_jidian_extra_district.dict.yaml" "行政区域"
+
+    # Unicode CLDR emoji 中文注解 + emoji 白名单。不参与常规构建——emoji 命名表
+    # (custom_emoji_named.txt) 已入库，这些原始档只在需要重新生成它时用到：
+    #   cargo run -p wind-tools --bin gen_emoji_names -- --cldr .cache/cldr \
+    #     --stopwords <gen_dict数据目录>/emoji_stopwords.txt --out <同目录>/custom_emoji_named.txt
+    # 许可证 Unicode-3.0，见 NOTICE.md
+    local cldr="$CACHE_DIR/cldr"
+    mkdir -p "$cldr"
+    local CLDR_BASE="https://raw.githubusercontent.com/unicode-org/cldr/main/common"
+    gray "Unicode CLDR (emoji 中文名):"
+    download_file "$CLDR_BASE/annotations/zh.xml"        "$cldr/zh.xml"         "emoji 注解"
+    download_file "$CLDR_BASE/annotationsDerived/zh.xml" "$cldr/zh_derived.xml" "派生注解(国旗)"
+    download_file "https://unicode.org/Public/emoji/latest/emoji-test.txt" "$cldr/emoji-test.txt" "emoji 白名单"
 }
 
 # 从 data/（源）+ .cache/（下载/生成）组装完整运行时数据到 $outdir/data/

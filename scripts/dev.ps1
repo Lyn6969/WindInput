@@ -295,7 +295,8 @@ function Download-Dicts {
     $opencc      = "$CacheDir\opencc\dictionaries"
     $pinyinData  = "$CacheDir\pinyin-data"
     $rimeWubi    = "$CacheDir\rime-wubi"
-    foreach ($d in @($rimeFrostCn, $rimeFrostEn, $opencc, $pinyinData, $rimeWubi)) { New-Item -ItemType Directory -Path $d -Force | Out-Null }
+    $cldr        = "$CacheDir\cldr"
+    foreach ($d in @($rimeFrostCn, $rimeFrostEn, $opencc, $pinyinData, $rimeWubi, $cldr)) { New-Item -ItemType Directory -Path $d -Force | Out-Null }
 
     $frostBase = "https://raw.githubusercontent.com/gaboolic/rime-frost/master"
     Gray "rime-frost (拼音):"
@@ -327,6 +328,18 @@ function Download-Dicts {
     Get-Dict "$wubiBase/wubi86_jidian.dict.yaml"                "$rimeWubi\wubi86_jidian.dict.yaml"                "主词库"     | Out-Null
     Get-Dict "$wubiBase/wubi86_jidian_extra.dict.yaml"          "$rimeWubi\wubi86_jidian_extra.dict.yaml"          "扩展词库"   | Out-Null
     Get-Dict "$wubiBase/wubi86_jidian_extra_district.dict.yaml" "$rimeWubi\wubi86_jidian_extra_district.dict.yaml" "行政区域"   | Out-Null
+
+    # Unicode CLDR emoji 中文注解 + emoji 白名单。不参与常规构建 —— emoji 命名表
+    # (custom_emoji_named.txt) 已入库, 这些原始档只在需要重新生成它时用到:
+    #   cargo run -p wind-tools --bin gen_emoji_names -- --cldr .cache\cldr `
+    #     --stopwords <gen_dict数据目录>\emoji_stopwords.txt --out <同目录>\custom_emoji_named.txt
+    # 生成的命名表交给 gen_dict 反查五笔码 (「足球」-> khgf)。
+    # 许可证 Unicode-3.0, 见 NOTICE.md
+    $cldrBase = "https://raw.githubusercontent.com/unicode-org/cldr/main/common"
+    Gray "Unicode CLDR (emoji 中文名):"
+    Get-Dict "$cldrBase/annotations/zh.xml"        "$cldr\zh.xml"         "emoji 注解"     | Out-Null
+    Get-Dict "$cldrBase/annotationsDerived/zh.xml" "$cldr\zh_derived.xml" "派生注解(国旗)" | Out-Null
+    Get-Dict "https://unicode.org/Public/emoji/latest/emoji-test.txt" "$cldr\emoji-test.txt" "emoji 白名单" | Out-Null
 
     $openccBase = "https://raw.githubusercontent.com/BYVoid/OpenCC/master/data/dictionary"
     Gray "OpenCC 简繁词典:"

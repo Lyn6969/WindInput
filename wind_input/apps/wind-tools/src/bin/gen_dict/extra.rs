@@ -5,6 +5,7 @@
 
 use crate::config::Config;
 use crate::entry::{Entry, has_cjk, has_emoji};
+use crate::reverse::{CharCodes, encode_phrase};
 use crate::weight::{Unigram, compute_weight, fallback_weight};
 use std::io::{BufRead, BufReader};
 use std::path::Path;
@@ -147,6 +148,119 @@ pub fn load_custom_emoji(path: Option<&Path>) -> anyhow::Result<Vec<Entry>> {
         .collect())
 }
 
+/// named emoji 的权重档位。
+///
+/// 三档必须严格递减，且都高于 `extra.default_weight`(100)：同码内按权重降序输出，
+/// 所以 CLDR 主名 > CLDR 关键词 > 上游条目。tts 单独抬一档是因为它是每个 emoji
+/// 的唯一确定名称（实测 1584 个主名零共享），理应在同码里排第一。
+const NAMED_TTS_WEIGHT: i64 = 130;
+const NAMED_KEYWORD_WEIGHT: i64 = 110;
+
+/// 加载 emoji 中文命名表，把中文名反查成五笔码。
+///
+/// 输入是 gen_emoji_names 的产物，每行 `emoji<TAB>中文名<TAB>tts|kw`。编码不在表里——
+/// 这里用与自定义词表同一套 [`encode_phrase`] 现场反查，于是「⚽ 足球」得到 `khgf`，
+/// 与上游 rime-wubi 手工编的码天然一致。
+///
+/// 反查失败（中文名含反查表里没有的字）时跳过该行并计数，绝不产出错码。
+pub fn load_named_emoji(
+    path: Option<&Path>,
+    char_codes: &CharCodes,
+    log: &mut dyn FnMut(String),
+) -> anyhow::Result<Vec<Entry>> {
+    let Some(path) = path else {
+        return Ok(Vec::new());
+    };
+    if !path.exists() {
+        log(format!(
+            "      [emoji_named] 命名表不存在，跳过: {}",
+            path.display()
+        ));
+        return Ok(Vec::new());
+    }
+
+    let f = std::fs::File::open(path)?;
+    let mut entries = Vec::new();
+    let (mut skipped, mut malformed) = (0usize, 0usize);
+
+    for line in BufReader::new(f).lines() {
+        let line = line?;
+        let line = line.trim_end();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let mut cols = line.split('\t');
+        let (Some(emoji), Some(name)) = (cols.next(), cols.next()) else {
+            malformed += 1;
+            continue;
+        };
+        let is_tts = cols.next() == Some("tts");
+        let (emoji, name) = (emoji.trim(), name.trim());
+        if emoji.is_empty() || name.is_empty() {
+            malformed += 1;
+            continue;
+        }
+        let Some(code) = encode_phrase(name, char_codes) else {
+            skipped += 1;
+            continue;
+        };
+        let weight = if is_tts {
+            NAMED_TTS_WEIGHT
+        } else {
+            NAMED_KEYWORD_WEIGHT
+        };
+        entries.push(Entry::new(emoji.to_string(), code, weight, 0));
+    }
+
+    if skipped > 0 {
+        log(format!(
+            "      [emoji_named] {skipped} 条无法反查编码，已跳过"
+        ));
+    }
+    if malformed > 0 {
+        log(format!(
+            "      [emoji_named] {malformed} 行格式不符，已跳过"
+        ));
+    }
+    Ok(entries)
+}
+
+/// 按 (编码, emoji) 去重，同键保留权重最高的一条。
+///
+/// 两个来源都需要它：上游 extra 本身就带 53 条完全重复的 emoji 条目（`ddkk 😭` 出现
+/// 两次），而 named 表与上游有 129 条重合。
+///
+/// 去重键剥掉 U+FE0F：`⚽`(U+26BD) 与 `⚽️`(U+26BD FE0F) 渲染完全一样，不归一化就会
+/// 留下两条肉眼无法区分的候选。**保留的条目仍用它自己的原文**，于是权重更高的 named
+/// 条目胜出后，写进词库的是 emoji-test.txt 的规范形态（带 VS16，宿主才渲染彩色字形）。
+pub fn dedup_emoji_entries(list: &mut Vec<Entry>) -> usize {
+    let mut best: std::collections::HashMap<(String, String), usize> = Default::default();
+    let mut drop_flags = vec![false; list.len()];
+
+    for (i, e) in list.iter().enumerate() {
+        let key = (e.code.clone(), e.text.replace('\u{FE0F}', ""));
+        match best.get(&key) {
+            Some(&j) if list[j].weight >= e.weight => drop_flags[i] = true,
+            Some(&j) => {
+                drop_flags[j] = true;
+                best.insert(key, i);
+            }
+            None => {
+                best.insert(key, i);
+            }
+        }
+    }
+
+    let before = list.len();
+    let mut i = 0usize;
+    list.retain(|_| {
+        let keep = !drop_flags[i];
+        i += 1;
+        keep
+    });
+    before - list.len()
+}
+
 /// 把主输出路径里的 output_name 换成 `output_name_<suffix>`，其余部分保留。
 ///
 /// 例：`.../wubi86_jidian.dict.yaml` + `emoji` → `.../wubi86_jidian_emoji.dict.yaml`
@@ -205,6 +319,129 @@ mod tests {
                 .is_empty()
         );
         assert!(load_custom_emoji(None).unwrap().is_empty());
+    }
+
+    fn wubi_codes() -> CharCodes {
+        let mut m = CharCodes::new();
+        for (c, code) in [
+            ('足', "khu"),
+            ('球', "gfi"),
+            ('哭', "kkdu"),
+            ('脸', "ewgi"),
+            ('鑫', "qqqf"), // 反查表里有，但下面的「饕」没有
+        ] {
+            m.insert(c, code.into());
+        }
+        m
+    }
+
+    fn write_tmp(name: &str, content: &str) -> std::path::PathBuf {
+        let p = std::env::temp_dir().join(name);
+        std::fs::write(&p, content).unwrap();
+        p
+    }
+
+    #[test]
+    fn named_emoji_reverses_code_and_ranks_tts_above_keyword() {
+        let p = write_tmp(
+            "gen_dict_named_ok.txt",
+            "# 注释\n⚽\t足球\ttts\n⚽\t球\tkw\n",
+        );
+        let mut log = |_: String| {};
+        let v = load_named_emoji(Some(&p), &wubi_codes(), &mut log).unwrap();
+        assert_eq!(v.len(), 2);
+        assert_eq!((v[0].code.as_str(), v[0].weight), ("khgf", 130), "tts 档");
+        assert_eq!(
+            (v[1].code.as_str(), v[1].weight),
+            ("gfi", 110),
+            "keyword 档"
+        );
+        assert!(
+            v[0].weight > v[1].weight,
+            "同码内 tts 必须排在 keyword 之前"
+        );
+    }
+
+    #[test]
+    fn named_emoji_skips_unreversible_names_without_producing_wrong_code() {
+        // 「饕餮」不在反查表里 → 整条跳过，绝不产出错码
+        let p = write_tmp("gen_dict_named_skip.txt", "🍖\t饕餮\ttts\n⚽\t足球\ttts\n");
+        let mut msgs = Vec::new();
+        let mut log = |s: String| msgs.push(s);
+        let v = load_named_emoji(Some(&p), &wubi_codes(), &mut log).unwrap();
+        assert_eq!(v.len(), 1, "只剩可反查的那条");
+        assert_eq!(v[0].text, "⚽");
+        assert!(
+            msgs.iter().any(|m| m.contains("无法反查编码")),
+            "跳过必须留下日志，否则静默丢词无从察觉"
+        );
+    }
+
+    #[test]
+    fn named_emoji_tolerates_malformed_lines() {
+        let p = write_tmp(
+            "gen_dict_named_bad.txt",
+            "只有一列\n\t足球\ttts\n⚽\t\ttts\n⚽\t足球\ttts\n",
+        );
+        let mut log = |_: String| {};
+        let v = load_named_emoji(Some(&p), &wubi_codes(), &mut log).unwrap();
+        assert_eq!(v.len(), 1, "三种残行都跳过，只留合法行");
+    }
+
+    #[test]
+    fn named_emoji_missing_file_is_not_an_error() {
+        let mut log = |_: String| {};
+        assert!(
+            load_named_emoji(
+                Some(Path::new("/definitely/not/here.txt")),
+                &wubi_codes(),
+                &mut log
+            )
+            .unwrap()
+            .is_empty()
+        );
+        assert!(
+            load_named_emoji(None, &wubi_codes(), &mut log)
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn dedup_keeps_highest_weight_and_normalizes_vs16() {
+        // ⚽(U+26BD) 与 ⚽️(U+26BD FE0F) 渲染完全相同，必须视为同一条
+        let mut list = vec![
+            Entry::new("\u{26BD}\u{FE0F}".into(), "khgf".into(), 100, 0), // 上游
+            Entry::new("\u{26BD}".into(), "khgf".into(), 130, 1),         // named tts
+        ];
+        let removed = dedup_emoji_entries(&mut list);
+        assert_eq!(removed, 1);
+        assert_eq!(list.len(), 1);
+        assert_eq!(list[0].weight, 130, "保留权重高的");
+        assert_eq!(list[0].text, "\u{26BD}", "胜出者保留自己的规范形态");
+    }
+
+    #[test]
+    fn dedup_removes_upstream_self_duplicates() {
+        // 上游 extra 本身带完全重复的行（实测 53 条），同权时只留一条
+        let mut list = vec![
+            Entry::new("😭".into(), "ddkk".into(), 100, 0),
+            Entry::new("😭".into(), "ddkk".into(), 100, 1),
+        ];
+        assert_eq!(dedup_emoji_entries(&mut list), 1);
+        assert_eq!(list.len(), 1);
+    }
+
+    #[test]
+    fn dedup_keeps_distinct_emoji_under_same_code() {
+        // 同码不同 emoji 是正常的多候选，不能被去重误伤
+        let mut list = vec![
+            Entry::new("⚽".into(), "gfi".into(), 110, 0),
+            Entry::new("🏀".into(), "gfi".into(), 110, 1),
+            Entry::new("⚽".into(), "khgf".into(), 130, 2),
+        ];
+        assert_eq!(dedup_emoji_entries(&mut list), 0);
+        assert_eq!(list.len(), 3);
     }
 
     #[test]

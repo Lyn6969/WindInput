@@ -48,7 +48,7 @@ path = "wubi86/wubi86_jidian_emoji.dict.yaml"
 type = "rime_codetable"
 default_enabled = true
 # 切勿设 default_weight：本库 71 条常用表情共用编码 `emoj`，靠 200/199/198… 递减权重表达
-# 展示顺序（😂>🤣>😊…），抹平权重会把这套顺序毁成文件序。其余 251 条恒 100，天然等权。
+# 展示顺序（😂>🤣>😊…），抹平权重会把这套顺序毁成文件序。其余 199 条恒 100，天然等权。
 # base_sort=weight 下同码内按权重降序，该顺序已自动生效，无需额外配置。
 base_order = 2
 

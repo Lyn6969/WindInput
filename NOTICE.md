@@ -21,6 +21,7 @@
 - **来源**: 来自五笔输入法资源网盘，原始来源及作者不详
 - **许可证**: 未附带任何版权声明或许可证信息。处理方式同上
 
+
 ### 构建时下载的资源（不包含在本仓库中）
 
 以下资源在构建过程中由构建脚本从原始仓库下载（缓存于 `.cache/`，已被
@@ -60,6 +61,20 @@ gitignore），用于生成词库数据文件，其各自适用原项目的许�
 - **仓库**: https://github.com/BYVoid/OpenCC
 - **许可证**: Apache-2.0
 
+#### Unicode CLDR / Unicode emoji 数据（研究用，未纳入发行版）
+
+- **用途**: emoji 中文名称，供 `wind-tools/gen_emoji_names` 研究「按语义用五笔
+  编码检索 emoji」（输入 `khgf` 出 ⚽）。**当前功能未启用**，其产物既不入库
+  也不进发行版，仅在本机 `.cache/` 下用于评估
+- **仓库/来源**:
+  - https://github.com/unicode-org/cldr — `common/annotations/zh.xml`、
+    `common/annotationsDerived/zh.xml`
+  - https://unicode.org/Public/emoji/latest/emoji-test.txt
+- **许可证**: **Unicode-3.0**（Unicode License V3）。允许自由使用、修改、再分发
+  与商业使用，仅要求保留版权与许可声明。`Copyright © 1991-2025 Unicode, Inc.`，
+  完整条款见 https://www.unicode.org/license.txt。若将来启用该功能，其产物可
+  直接入库——本许可证无 copyleft 传染性
+
 #### 腾讯词向量
 
 - **用途**: 词频数据参考（经由 rime-frost 的 `tencent.dict.yaml`），
@@ -95,3 +110,7 @@ gitignore），用于生成词库数据文件，其各自适用原项目的许�
 GPL-3.0 许可的词库数据（rime-frost）不包含在本仓库中，而是在构建过程中
 作为外部数据依赖从原始仓库下载；发行版中包含由其生成的词库数据文件，
 该部分数据适用 GPL-3.0 条款。
+
+Apache-2.0（极点五笔码表）与 Unicode-3.0（Unicode CLDR，当前仅研究用）
+均为宽松许可证，允许修改后再分发，其加工产物可直接包含在本仓库中，
+无 copyleft 传染性。

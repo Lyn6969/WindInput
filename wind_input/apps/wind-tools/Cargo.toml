@@ -22,6 +22,10 @@ path = "src/bin/gen_pinyin.rs"
 name = "gen_dict"
 path = "src/bin/gen_dict/main.rs"
 
+[[bin]]
+name = "gen_emoji_names"
+path = "src/bin/gen_emoji_names.rs"
+
 [dependencies]
 anyhow = { workspace = true }
 serde = { workspace = true }
