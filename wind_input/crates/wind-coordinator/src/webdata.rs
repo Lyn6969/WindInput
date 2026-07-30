@@ -1325,8 +1325,13 @@ impl Coordinator {
         Ok(json!({ "ok": true }))
     }
 
-    /// 候选调整手动添加：type="hide" 转屏蔽；否则（pin）按 position 置顶。
+    /// 候选调整手动添加/编辑：type="hide" 转屏蔽；否则（pin）按 position 置顶。
     /// 匹配设置端候选调整对话框契约。
+    ///
+    /// **编辑既有规则时设置端会回传 `candId`，必须透传下去**：短语规则靠稳定 id 跨日命中，
+    /// 而这条路会先按 `same_target` 匹配掉同一条旧规则再插入新规则——不带 id 就等于
+    /// 把原规则的 id 擦掉（退化成按当日文本匹配，次日必失配）。用户侧表现为
+    /// 「在设置页改了一下位置，第二天整条规则就不生效了」。
     fn web_shadow_add_rule(&self, params: &Value) -> anyhow::Result<Value> {
         let (schema, code, word) = (
             str_param(params, "schemaId")?,
@@ -1334,6 +1339,7 @@ impl Coordinator {
             str_param(params, "word")?,
         );
         let kind = params.get("type").and_then(|v| v.as_str()).unwrap_or("pin");
+        let cand_id = params.get("candId").and_then(|v| v.as_str());
         let schema = self.engine_mgr.data_schema_id(schema); // 拼音族折叠到 "pinyin"
         let store = self
             .store
@@ -1343,7 +1349,7 @@ impl Coordinator {
             store.delete_shadow(&schema, code, word)?;
         } else {
             let position = usize_param(params, "position", 0);
-            store.pin_shadow(&schema, code, word, None, position)?;
+            store.pin_shadow(&schema, code, word, cand_id, position)?;
         }
         Ok(json!({ "ok": true }))
     }
