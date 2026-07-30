@@ -137,10 +137,14 @@ pub struct RvViews {
     pub status: Option<RvNode>,
     pub tooltip: Option<RvNode>,
     pub toast: Option<RvNode>,
-    /// 弹出菜单容器（menu.root）：背景图/层 + 容器色。item/separator 颜色仍走 palette。
+    /// 弹出菜单容器（menu.root）：背景色/图/层 + 边框 + shadow。
+    /// 颜色语义与候选窗一致——节点显式值优先，未配回退 palette（menu_bg/menu_border）。
     pub menu_root: Option<RvNode>,
-    /// 弹出菜单项（menu.item）：几何（padding/hover 圆角/字号偏移）来源，去 popup_menu.rs 硬编码。
+    /// 弹出菜单项（menu.item）：几何（padding/hover 圆角/字号偏移）+ 文字色，
+    /// 含 hover/disabled 状态 patch（默认色分别取 menu_hover_bg/menu_hover_text、menu_disabled）。
     pub menu_item: Option<RvNode>,
+    /// 菜单分隔线（menu.separator）：线色取 background.color，未配回退 menu_separator。
+    pub menu_separator: Option<RvNode>,
     /// 菜单最小宽度（None→渲染层兜底 90）。
     pub menu_min_width: Option<Dim>,
 

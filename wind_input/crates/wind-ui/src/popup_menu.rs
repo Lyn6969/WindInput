@@ -295,6 +295,9 @@ pub struct PopupMenu {
     hl_bg: [u8; 4],
     /// 高亮项文字色（menu_hover_text）：选中/悬停项文字与基态不同。
     hl_fg: [u8; 4],
+    /// 生效字号（逻辑 px）= FONT_PX + menu.item.font_size 偏移。
+    /// 存字段而非每次现算：ensure_scale 与 build_view 都要用，且需与 renderer 基准保持一致。
+    font_px: f32,
     /// 菜单容器位图背景 + z 层（jidian menu.root 吃九宫格 panel + 角标水印）。
     bg_image: Option<crate::view::ViewImage>,
     layers: Vec<crate::view::ViewLayer>,
@@ -332,6 +335,7 @@ impl PopupMenu {
             sep: SEP,
             hl_bg: HL_BG,
             hl_fg: HL_FG,
+            font_px: FONT_PX,
             bg_image: None,
             layers: Vec::new(),
             border_w: scale, // 默认 1dp（≈1 设备像素，细边清晰）
@@ -359,7 +363,9 @@ impl PopupMenu {
         let sc = crate::dpi::scale_for_point(x, y);
         if (sc - self.scale).abs() > 0.01 {
             self.scale = sc;
-            self.renderer.set_base_size(FONT_PX * sc);
+            // 用主题生效字号而非常量：主题配了 menu.item.font_size 时，
+            // 跨屏切换不能把字号打回 FONT_PX。set_theme 末尾还会再同步一次。
+            self.renderer.set_base_size(self.font_px * sc);
             if let Some(t) = self.theme.clone() {
                 self.set_theme(&t);
             }
@@ -369,6 +375,10 @@ impl PopupMenu {
     /// 应用主题（菜单各色）。
     pub fn set_theme(&mut self, theme: &wind_theme::Resolved) {
         self.theme = Some(theme.clone());
+        // 先取 palette 兜底，随后被视图节点覆盖。
+        // 节点色在 resolve 阶段已是「主题显式值 ⊕ palette 默认」的合成结果
+        // （resolve.rs build(&m.root, tk("menu_bg"), …)），所以此处只要节点存在就以它为准，
+        // 与候选窗/状态窗保持同一套优先级；节点缺席（主题没写 [menu]）才落回 token。
         self.bg = theme.color("menu_bg", BG);
         self.fg = theme.color("menu_text", FG);
         self.disabled = theme.color("menu_disabled", DISABLED);
@@ -376,12 +386,46 @@ impl PopupMenu {
         self.sep = theme.color("menu_separator", SEP);
         self.hl_bg = theme.color("menu_hover_bg", HL_BG);
         self.hl_fg = theme.color("menu_hover_text", self.fg);
+        // 菜单项：字号偏移 + 文字色 + hover/disabled 状态色。
+        self.font_px = FONT_PX;
+        if let Some(item) = &theme.views.menu_item {
+            // 字号偏移语义与候选窗一致：相对模块基准的有符号增量，钳到 >=6 防止不可读。
+            if item.font_size != 0.0 {
+                self.font_px = (FONT_PX + item.font_size).max(6.0);
+            }
+            if let Some(c) = item.text_color {
+                self.fg = c;
+            }
+            if let Some(h) = &item.hover {
+                if let Some(c) = h.bg_color {
+                    self.hl_bg = c;
+                }
+                // hover 文字未配时沿用正文色（与旧的 color("menu_hover_text", fg) 兜底一致）。
+                self.hl_fg = h.text_color.unwrap_or(self.fg);
+            }
+            if let Some(d) = &item.disabled {
+                if let Some(c) = d.text_color {
+                    self.disabled = c;
+                }
+            }
+        }
+        // 分隔线：线色取 background.color。
+        if let Some(sep) = &theme.views.menu_separator {
+            if let Some(c) = sep.bg_color {
+                self.sep = c;
+            }
+        }
+        // 字号可能被主题改了，同步渲染器基准（否则测量仍按旧字号，宽高算错）。
+        self.renderer.set_base_size(self.font_px * self.scale);
         let s = self.scale;
         if let Some(node) = &theme.views.menu_root {
             self.bg_image = crate::theme_assets::rv_image(theme, node.bg_image.as_ref());
             self.layers = crate::theme_assets::rv_layers(theme, &node.layers, s);
-            // 边框色/宽/圆角从 menu.root 节点读取（权威，px/dp 经 Dim 区分）；
-            // border_color 默认已带 menu_border token 兜底（resolve build 传入）。
+            // 背景色/边框色/宽/圆角从 menu.root 节点读取（权威，px/dp 经 Dim 区分）；
+            // bg_color / border_color 默认已带 menu_bg / menu_border token 兜底（resolve build 传入）。
+            if let Some(c) = node.bg_color {
+                self.bg = c;
+            }
             if let Some(c) = node.border_color {
                 self.border = c;
             }
@@ -626,16 +670,42 @@ impl PopupMenu {
         let mroot = views.and_then(|v| v.menu_root.as_ref());
         let resolve_dim =
             |o: Option<Dim>, def: f32| o.map(|x| x.resolve(s, 0.0)).unwrap_or(def * s);
-        let item_h = (FONT_PX * 1.9 * s).ceil();
-        // item 内边距：menu.item.padding（左→x、上→y）优先，默认 xy(12,4)。
-        let pad = Edges::xy(
-            resolve_dim(mi.and_then(|n| n.padding.left), 12.0),
-            resolve_dim(mi.and_then(|n| n.padding.top), 4.0),
-        );
+        let item_h = (self.font_px * 1.9 * s).ceil();
+        // item 四边内边距独立可配；right/bottom 未写时回退到 left/top（保持既有主题的对称外观）。
+        let pad_l = resolve_dim(mi.and_then(|n| n.padding.left), 12.0);
+        let pad_t = resolve_dim(mi.and_then(|n| n.padding.top), 4.0);
+        let pad = Edges {
+            l: pad_l,
+            t: pad_t,
+            r: mi
+                .and_then(|n| n.padding.right)
+                .map(|x| x.resolve(s, 0.0))
+                .unwrap_or(pad_l),
+            b: mi
+                .and_then(|n| n.padding.bottom)
+                .map(|x| x.resolve(s, 0.0))
+                .unwrap_or(pad_t),
+        };
         // item 高亮圆角：menu.item.border_radius 优先，默认 4。
         let hover_radius = resolve_dim(mi.and_then(|n| n.border_radius), 4.0);
         // root 四边内边距：menu.root.padding（取 left 代表）优先，默认 4。
-        let root_pad = resolve_dim(mroot.and_then(|n| n.padding.left), 4.0);
+        // root 四边内边距独立可配；未写的边回退到 left（保持既有主题的对称外观）。
+        let root_pad_l = resolve_dim(mroot.and_then(|n| n.padding.left), 4.0);
+        let root_pad = Edges {
+            l: root_pad_l,
+            t: mroot
+                .and_then(|n| n.padding.top)
+                .map(|x| x.resolve(s, 0.0))
+                .unwrap_or(root_pad_l),
+            r: mroot
+                .and_then(|n| n.padding.right)
+                .map(|x| x.resolve(s, 0.0))
+                .unwrap_or(root_pad_l),
+            b: mroot
+                .and_then(|n| n.padding.bottom)
+                .map(|x| x.resolve(s, 0.0))
+                .unwrap_or(root_pad_l),
+        };
         // 内容最小宽：menu.min_width 优先，默认 90。
         let min_w = resolve_dim(views.and_then(|v| v.menu_min_width), 90.0);
 
@@ -665,7 +735,7 @@ impl PopupMenu {
             .bg(self.bg)
             .border(self.border, self.border_w)
             .radius(self.radius)
-            .pad(Edges::all(root_pad));
+            .pad(root_pad);
         // 主题位图背景 + 层（jidian menu.root 吃九宫格 panel + 角标水印）。
         if let Some(img) = &self.bg_image {
             root = root.bg_image(img.clone());

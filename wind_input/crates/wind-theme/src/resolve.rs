@@ -438,16 +438,42 @@ fn resolve_views(v: &Views, palette: &HashMap<String, Rgba>, is_dark: bool) -> R
         .toast
         .as_ref()
         .map(|n| build(n, tk("toast_bg"), None, tk("toast_text")));
-    // 菜单容器（menu.root）：背景图/层来源；颜色默认 menu_bg/menu_border/menu_text。
+    // 菜单容器（menu.root）：背景色/图/层来源；颜色默认 menu_bg/menu_border/menu_text。
     rv.menu_root = v
         .menu
         .as_ref()
         .map(|m| build(&m.root, tk("menu_bg"), tk("menu_border"), tk("menu_text")));
-    // 菜单项（menu.item）：几何来源（padding/hover 圆角/字号偏移），供 popup_menu 去硬编码。
+    // 菜单项（menu.item）：几何（padding/hover 圆角/字号偏移）+ 文字色。
     rv.menu_item = v
         .menu
         .as_ref()
         .map(|m| build(&m.item, None, None, tk("menu_text")));
+    // 菜单项状态 patch：与候选窗 item 同构——节点显式值优先，未配落到 palette 默认色。
+    // 之前只建了基态，hover/disabled 全靠 popup_menu.rs 直读 token，导致主题里写的
+    // menu.item.hover / .disabled 不生效。
+    if let Some(m) = v.menu.as_ref() {
+        if let Some(item) = rv.menu_item.as_mut() {
+            item.hover = resolve_state(
+                m.item.hover.as_deref(),
+                palette,
+                is_dark,
+                tk("menu_hover_bg"),
+                tk("menu_hover_text"),
+            );
+            item.disabled = resolve_state(
+                m.item.disabled.as_deref(),
+                palette,
+                is_dark,
+                None,
+                tk("menu_disabled"),
+            );
+        }
+    }
+    // 菜单分隔线（menu.separator）：线色走 background.color，默认 menu_separator。
+    rv.menu_separator = v
+        .menu
+        .as_ref()
+        .map(|m| build(&m.separator, tk("menu_separator"), None, None));
     rv.menu_min_width = v.menu.as_ref().and_then(|m| m.min_width);
 
     // 工具栏几何：从 [toolbar] 直读 Dim（None→toolbar.rs 内置默认），供渲染器去硬编码。
@@ -507,6 +533,103 @@ mod tests {
             r.views.index_labels,
             vec!["①".to_string(), "②".to_string(), "③".to_string()],
         );
+    }
+
+    /// 菜单颜色语义：节点显式值优先，未配回退 palette token（与候选窗一致）。
+    /// 历史上 popup_menu.rs 只读 token、无视 [menu.*] 节点色，主题里写的颜色全不生效。
+    #[test]
+    fn test_menu_node_colors_override_palette() {
+        let text = "\
+[colors]
+menu_bg = \"#111111\"
+menu_text = \"#222222\"
+menu_hover_bg = \"#333333\"
+menu_hover_text = \"#444444\"
+menu_disabled = \"#555555\"
+menu_separator = \"#666666\"
+
+[menu.root]
+background = \"#AA0000\"
+
+[menu.item]
+color = \"#BB0000\"
+font_size = 2
+
+[menu.item.hover]
+background = \"#CC0000\"
+color = \"#DD0000\"
+
+[menu.item.disabled]
+color = \"#EE0000\"
+
+[menu.separator]
+background = \"#FF0000\"
+";
+        let value: toml::Value = toml::from_str(text).unwrap();
+        let normalized = crate::normalize::normalize_theme(value);
+        let theme: Theme = normalized.try_into().unwrap();
+        let r = resolve(&theme, false, &[data_dir()]);
+
+        let root = r.views.menu_root.as_ref().expect("menu_root");
+        assert_eq!(
+            root.bg_color,
+            Some([0xAA, 0, 0, 255]),
+            "容器背景色应取节点值"
+        );
+
+        let item = r.views.menu_item.as_ref().expect("menu_item");
+        assert_eq!(
+            item.text_color,
+            Some([0xBB, 0, 0, 255]),
+            "项文字色应取节点值"
+        );
+        assert_eq!(item.font_size, 2.0, "字号偏移应透传");
+
+        let hover = item.hover.as_ref().expect("menu.item.hover 应被构建");
+        assert_eq!(hover.bg_color, Some([0xCC, 0, 0, 255]));
+        assert_eq!(hover.text_color, Some([0xDD, 0, 0, 255]));
+
+        let disabled = item.disabled.as_ref().expect("menu.item.disabled 应被构建");
+        assert_eq!(disabled.text_color, Some([0xEE, 0, 0, 255]));
+
+        let sep = r.views.menu_separator.as_ref().expect("menu_separator");
+        assert_eq!(sep.bg_color, Some([0xFF, 0, 0, 255]), "分隔线色应取节点值");
+    }
+
+    /// 未写 [menu.*] 节点色时回退 palette token —— 保证既有主题行为不变。
+    #[test]
+    fn test_menu_falls_back_to_palette_tokens() {
+        let text = "\
+[colors]
+menu_bg = \"#111111\"
+menu_text = \"#222222\"
+menu_hover_bg = \"#333333\"
+menu_hover_text = \"#444444\"
+menu_disabled = \"#555555\"
+menu_separator = \"#666666\"
+
+[menu.root]
+radius = 6
+";
+        let value: toml::Value = toml::from_str(text).unwrap();
+        let normalized = crate::normalize::normalize_theme(value);
+        let theme: Theme = normalized.try_into().unwrap();
+        let r = resolve(&theme, false, &[data_dir()]);
+
+        let root = r.views.menu_root.as_ref().expect("menu_root");
+        assert_eq!(root.bg_color, Some([0x11, 0x11, 0x11, 255]));
+        let item = r.views.menu_item.as_ref().expect("menu_item");
+        assert_eq!(item.text_color, Some([0x22, 0x22, 0x22, 255]));
+        let hover = item.hover.as_ref().expect("hover 由 palette 默认色撑起");
+        assert_eq!(hover.bg_color, Some([0x33, 0x33, 0x33, 255]));
+        assert_eq!(hover.text_color, Some([0x44, 0x44, 0x44, 255]));
+        let disabled = item
+            .disabled
+            .as_ref()
+            .expect("disabled 由 palette 默认色撑起");
+        assert_eq!(disabled.text_color, Some([0x55, 0x55, 0x55, 255]));
+        let sep = r.views.menu_separator.as_ref().expect("menu_separator");
+        assert_eq!(sep.bg_color, Some([0x66, 0x66, 0x66, 255]));
     }
 
     #[test]
