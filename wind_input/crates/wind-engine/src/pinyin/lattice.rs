@@ -92,6 +92,25 @@ pub(crate) const WORD_PENALTY: f64 = 3.0;
 /// （`lm.rs:327-337` 已实现插值，缺磁盘语料）。
 pub(crate) const AMBIGUOUS_PENALTY: f64 = 0.35;
 
+/// 简拼节点每个音节的惩罚（混合整句解码用，见 [`LatticeBuilder::add_abbrev_nodes`]）。
+///
+/// **按音节数计而非固定值**：简拼段越长，「每个字母只给了一个声母」积累的不确定性越大
+/// ——`bzd` 要在 12 个同简拼词里选，`bzdh` 的候选面更宽。固定罚会让长简拼段不合理地便宜。
+///
+/// 量纲参照同文件的 `WORD_PENALTY`(3.0) 与模糊命中的 0.5：简拼的不确定性远大于模糊音
+/// （一个声母对应几十个音节 vs z↔zh 两个变体），但又不能大到让混合整句根本出不来。
+/// **本值由 `pinyin_eval` 的 D 类对账定出，改动前必须重跑**（见 `pinyin-mixed-abbrev.md` §4.8）。
+pub(crate) const ABBREV_NODE_PENALTY: f64 = 1.2;
+
+/// 单个简拼跨度最多取几个词进图。
+///
+/// 简拼召回面宽（`bzd` 真实词库下 12 个词），全塞进去会让节点数与 Viterbi 的边数一起膨胀，
+/// 而排在后面的低频词几乎不可能赢下整句路径。按权重取前 N 即可。
+const ABBREV_NODE_LIMIT: usize = 8;
+
+/// 简拼跨度的最大字母数（= 最大音节数）。与 `AbbrevMatcher::find_candidates` 的上限一致。
+const MAX_ABBREV_SPAN: usize = 6;
+
 /// 节点对数概率打分（对齐 Go lattice calcLogProb + 惩罚/加成）。
 /// 无 unigram 时回退到归一化词典权重。
 ///
@@ -214,6 +233,13 @@ impl LatticeBuilder {
     ///
     /// `graph` 的形状决定切分来源：全拼用 `SegGraph::from_dag`（多路径），
     /// 双拼/手动分隔符用 `SegGraph::from_syllables`（真值链，行为与改造前完全一致）。
+    /// `require_reachable`：是否只在「音节图上从 0 可达」的位置建节点。
+    ///
+    /// 常规路径传 `true`——不可达的位置上建节点纯属浪费，Viterbi 的 dp 永远到不了那里。
+    /// **混合整句路径必须传 `false`**：简拼段会打断音节图的可达性（`bzdhaobuhao` 里
+    /// b/z/d 都不成音节，位置 3 从 0 不可达），而 `[3,6) hao`、`[6,8) bu` 这些边其实
+    /// 都在图里、只是被这道守卫挡住了；补上连接的是随后追加的简拼节点
+    /// （见 [`Self::add_abbrev_nodes`]），那是音节图看不见的。
     pub fn build(
         &self,
         input: &str,
@@ -221,6 +247,7 @@ impl LatticeBuilder {
         dict: &CachedDict,
         fuzzy_config: Option<&FuzzyConfig>,
         unigram: Option<&dyn UnigramLookup>,
+        require_reachable: bool,
     ) -> Vec<Vec<LatticeNode>> {
         let input_len = input.len();
 
@@ -228,8 +255,7 @@ impl LatticeBuilder {
         let mut nodes: Vec<Vec<LatticeNode>> = vec![Vec::new(); input_len + 1];
 
         for p in 0..input_len.min(graph.len()) {
-            // 从 0 不可达的位置上建节点纯属浪费：Viterbi 的 dp 永远到不了那里。
-            if !graph.is_reachable(p) {
+            if require_reachable && !graph.is_reachable(p) {
                 continue;
             }
             for q in graph.ends_within(p, self.max_word_len) {
@@ -318,6 +344,80 @@ impl LatticeBuilder {
         }
 
         nodes
+    }
+
+    /// 在已建好的词图上**追加简拼节点**，供混合整句解码（`bzd` + `haobuhao` → 不知道好不好）。
+    ///
+    /// ## 为什么必须独立枚举跨度
+    ///
+    /// [`Self::build`] 的跨度来自 `graph.ends_within(p, ..)` —— 音节图的合法终点，且开头
+    /// 有 `graph.is_reachable(p)` 守卫。简拼段两条都不满足：`bzdhaobuhao` 的 b/z/d 都不成
+    /// 音节，位置 0 在音节图上根本不可达，从它出发也没有任何终点。所以简拼节点走独立枚举：
+    /// 任意 `(p, q)` 且 `q - p ∈ [2, MAX_ABBREV_SPAN]`。
+    ///
+    /// ## 与全拼节点的兼容性
+    ///
+    /// [`LatticeNode`] 的 `start`/`end` 是**字节跨度**、Viterbi 的 dp 也按字节位置推进，
+    /// 故简拼节点与全拼节点在同一张图里天然可串：`[0,3)` 的「不知道」接上 `[3,6)` 的
+    /// 「好」，dp 一路推到串尾。**Viterbi 一行都不用改。**
+    ///
+    /// ## 音节标注
+    ///
+    /// 简拼段里**每个字母就是一个音节的位置**（击键空间），故 `syllables` 逐字母切、
+    /// `syl_mask` 每字母一位。整句 boundary 由此回填出 `b'z'd'hao'bu'hao` 这样的显示，
+    /// 与击键串同域——这正是简拼候选一贯的做法（见 `mixed_abbrev` 模块文档）。
+    ///
+    /// ⚠️ `input` 必须是**原始击键串**。双拼下 `input` 是转换后的全拼、与击键不同域，
+    /// 简拼判据会全部失配（文档 §5 约束 4），故调用方须在双拼下跳过本方法。
+    pub fn add_abbrev_nodes(
+        &self,
+        input: &str,
+        dict: &CachedDict,
+        unigram: Option<&dyn UnigramLookup>,
+        nodes: &mut [Vec<LatticeNode>],
+    ) {
+        let input_len = input.len();
+        let bytes = input.as_bytes();
+        for p in 0..input_len {
+            // 简拼段每个字母都必须是小写 ASCII（声母），一遇到非法字符即可停止从此处出发
+            if !bytes[p].is_ascii_lowercase() {
+                continue;
+            }
+            for span in 2..=MAX_ABBREV_SPAN {
+                let q = p + span;
+                if q > input_len || q >= nodes.len() {
+                    break;
+                }
+                if !bytes[p..q].iter().all(|b| b.is_ascii_lowercase()) {
+                    break;
+                }
+                let stroke = &input[p..q];
+                for abbr_code in dict.search_abbrev(stroke, ABBREV_NODE_LIMIT) {
+                    for hit in dict.search_with_boundary(&abbr_code) {
+                        // **音节数必须等于简拼字母数**（同 mod.rs step5 的过滤）：扁平码有损，
+                        // `xa` 指向的 `xian` 回查主表会把 1 音节的「先」一并捞出来。
+                        // boundary==0 无从校验，直接跳过——混合整句的每个节点都要求真值切分。
+                        if hit.boundary.count_ones() as usize != span {
+                            continue;
+                        }
+                        if nodes[q].iter().any(|n| n.word == hit.text && n.start == p) {
+                            continue;
+                        }
+                        let log_prob = score_node(&hit.text, hit.weight, unigram)
+                            - ABBREV_NODE_PENALTY * span as f64;
+                        nodes[q].push(LatticeNode {
+                            start: p,
+                            end: q,
+                            word: hit.text,
+                            // 击键空间：每个字母一个音节位
+                            syllables: stroke.chars().map(|c| c.to_string()).collect(),
+                            syl_mask: (0..span).fold(0u64, |m, i| m | (1u64 << i)),
+                            log_prob,
+                        });
+                    }
+                }
+            }
+        }
     }
 }
 

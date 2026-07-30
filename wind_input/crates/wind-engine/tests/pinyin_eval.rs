@@ -328,13 +328,26 @@ fn build_mixed_samples(
     reject: &mut HashMap<&'static str, usize>,
 ) -> Vec<Sample> {
     let mut rng = Rng(seed ^ 0xD_1234);
+
+    // **只用常用词配对。** 用户打简拼正是为了少敲**熟词**；全词库随机配对产出的是
+    // 「达拉特旗」+「半道儿」这种没人会打的串，拿它调阈值会把参数调偏——被度量的场景
+    // 与样本分布不匹配时，指标越精确越误导。
+    //
+    // 判据取 unigram 词频前 1/3（须在语言模型里，`unigram > 0`）：整句解码本就靠 unigram
+    // 打分，模型里没有的词无论如何都拼不出整句，留在池里只会把指标压成噪声。
+    let mut common: Vec<&Sample> = pool.iter().filter(|s| s.unigram > 0).collect();
+    common.sort_by(|a, b| b.unigram.cmp(&a.unigram).then_with(|| a.text.cmp(&b.text)));
+    common.truncate((common.len() / 3).max(1));
+
     // 候选池：按音节数分成「可作 W1」与「可作 W2」两组
-    let w1: Vec<&Sample> = pool
+    let w1: Vec<&Sample> = common
         .iter()
+        .copied()
         .filter(|s| (2..=4).contains(&s.true_syls.len()))
         .collect();
-    let w2: Vec<&Sample> = pool
+    let w2: Vec<&Sample> = common
         .iter()
+        .copied()
         .filter(|s| (2..=3).contains(&s.true_syls.len()))
         .collect();
     if w1.is_empty() || w2.is_empty() {

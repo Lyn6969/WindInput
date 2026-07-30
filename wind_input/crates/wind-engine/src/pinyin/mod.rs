@@ -111,6 +111,42 @@ const COMPLETION_FAR_WEIGHT_FLOOR: i32 = 100;
 /// 索引点查本身是 DAT 前缀走位 + 定长条目读取，放宽到 64 的成本远小于「查了等于没查」。
 const MIXED_ABBREV_INDEX_LIMIT: usize = 64;
 
+/// 混合整句的**质量闸门**：路径平均每字 log_prob 低于此值就不插入候选。
+///
+/// 为什么需要它：整句靠 [`SENTENCE_WEIGHT_BASE`] (3e7) 无条件置顶，而混合整句的简拼段
+/// 歧义极大——`bzd` 要在 12 个同简拼词里选，靠 unigram 常常选错。没有闸门时**错误整句
+/// 100% 占据首选**，连原本可用的部分候选（分步上屏的「不知道」）都被顶掉。
+/// 调 `ABBREV_NODE_PENALTY` 治不了这个：`log_offset` 那点差异撼动不了 3e7 的基准
+/// （实测 1.2 / 2.5 / 4.0 三档，D 类指标几乎不动）。
+///
+/// **取值依据：D 类评测的受控对比（常用词口径，n=1000）**，不是估算：
+///
+/// | 阈值 | 整句 top-1 | 首词命中 |
+/// |---|---|---|
+/// | 不设闸门 | 12.10% | 0.00% |
+/// | **-8.0（本值）** | **12.10%** | 0.00% |
+/// | -6.5 | 10.30% | 0.50% |
+/// | -5.0 | 1.10% | 3.30% |
+///
+/// -8.0 是**零代价点**：整句命中与不设闸门完全相同，却挡掉了最离谱的那批——
+/// `nhaoma` 原本出「你会熬吗」（每字 -11.01），闸掉后正确的「你好吗」上位。
+///
+/// ★ 收紧到 -5.0 曾看似合理（用户真会打的组合每字落在 -3.7 ~ -4.8：`bzdhaobuhao`
+/// →不知道好不好 -3.90、`wmyiqizou`→我们一起走 -4.81），但受控对比显示它**砍掉 91%
+/// 的正确整句**，只换来 3.3% 的首词命中——很不划算。且整句占首位时部分候选就在第 2、3 位，
+/// 按一下数字键即可选到，「首词命中 0%」并不等于分步上屏那条路断了。
+///
+/// ⚠️ 正确与错误的分布**在 -5 ~ -6.5 区间大幅重叠**，任何阈值都必然既误伤正解又放行错解；
+/// -8.0 只保证「不误伤」。真正的区分需要上下文概率（`lm.rs` 的 bigram 插值已实现、缺语料）。
+/// 改动本值必须重跑 `pinyin_eval` 的 D 类并做同样的受控对比。
+const MIXED_SENTENCE_MIN_LOGP_PER_CHAR: f64 = -8.0;
+
+/// 混合整句解码（step 2b）的最短击键串。
+///
+/// 至少要容得下「一个简拼段（2 字母）+ 一个全拼音节（2 字母）」，再短就不存在混合形态，
+/// 白建一次词图。
+const MIN_MIXED_SENTENCE_LEN: usize = 4;
+
 /// 简拼族前缀回退（step 6.2）的最短击键段。与 `is_abbreviation` 的下限一致：
 /// 单字母不构成简拼，退到 1 只会拖出一堆高频单字。
 const MIN_ABBREV_STROKE: usize = 2;
@@ -975,6 +1011,19 @@ impl Engine for PinyinEngine {
         // 供 step 6.5 的降级判定使用（须等 step 6 并入用户/临时层后才能定夺）。
         let mut synthesized_sentence: Option<String> = None;
 
+        // 整串是否已被完整音节覆盖。**两条简拼路径共用**：step 2b 的混合整句与 step 5b/6.2
+        // 的混合简拼都只在「输入里有成不了音节的字母」时才该启动，纯全拼一律不碰。
+        //
+        // 全拼下比较 `completed_len` 与击键长度；双拼下 `completed_len` 说的是转换后的全拼域，
+        // 与 `abbr_query`（原始击键）不同域，故改判「转换结果覆盖了整串击键」。
+        let mixed_covered = match &sp_result {
+            Some(r) => r
+                .syllables
+                .last()
+                .is_some_and(|s| s.raw_end >= raw_input.len()),
+            None => completed_len >= abbr_query.len(),
+        };
+
         // 2. Viterbi 长句解码（>=2 音节，仅在完成音节前缀上跑；use_smart_compose=false 时跳过）
         if self.config.use_smart_compose && syllables.len() >= 2 {
             // 切分图：全拼取 DAG 的全部路径；双拼/手动分隔符取真值链（行为与改造前一致）。
@@ -989,6 +1038,7 @@ impl Engine for PinyinEngine {
                 dict,
                 Some(&self.fuzzy_config),
                 self.unigram.as_deref(),
+                true,
             );
             let input_len = completed.len();
             let mut lattice: Vec<Vec<WordNode>> = vec![Vec::new(); input_len + 1];
@@ -1053,6 +1103,111 @@ impl Engine for PinyinEngine {
                             },
                         );
                     }
+                }
+            }
+        }
+
+        // 2b. **混合整句解码**：简拼段与全拼段在同一张词图里由 Viterbi 选路径
+        //     （`bzdhaobuhao` → 「不知道」+「好不好」→ 整句「不知道好不好」）。
+        //
+        //     为什么不能复用 step 2：它的入口是 `syllables.len() >= 2`，而 `syllables` 是
+        //     **从 0 起连续的完整音节覆盖**。`bzdhaobuhao` 的 DAG 从位置 0 就走不通（`b` 不
+        //     成音节）⇒ `syllables` 为空、`completed` 为空串 ⇒ 整句解码压根不启动。step 2
+        //     依赖 `completed` 来处理残码（`nihaom` 只在 `nihao` 上跑整句），不能改成整串，
+        //     故这里另起一条在**整串**上建图的路径。
+        //
+        //     与 step 2 的三处差别：
+        //     ① 在 `abbr_query`（整串击键）而非 `completed` 上建图；
+        //     ② `require_reachable=false` —— 简拼段打断了音节图的可达性，而 `[3,6) hao`
+        //        这些边其实都在图里，补上连接的是随后追加的简拼节点；
+        //     ③ 追加 `add_abbrev_nodes`，跨度独立枚举（音节图给不出简拼段的终点）。
+        //
+        //     门槛：`!mixed_covered`（整串有成不了音节的字母）挡掉纯全拼输入——那种输入
+        //     step 2 已经处理，再跑一遍只会重复建图并引入简拼噪音。双拼跳过：`input` 是
+        //     转换后的全拼、与击键不同域，简拼判据会全部失配（文档 §5 约束 4）。
+        if self.config.use_smart_compose
+            && self.config.enable_abbrev
+            && sp_result.is_none()
+            && !has_sep
+            // **未被音节覆盖的部分要够构成一个简拼段**，比 `!mixed_covered` 更严。
+            // 尾部单字母残码是「还没打完」而不是简拼：`zhongguorenm` 的 `m` 也让
+            // `!mixed_covered` 成立，整句便插到首位、把「中国人民解放军」挤后一格
+            // （`pinyin_completion::test_useful_completions_still_float` 当场抓到）。
+            // 这道闸门只加在 step 2b —— 只有它会抢首选；step 5b 的混合召回不受影响，
+            // `nihaom` → 「你好吗」正该走混合模式。
+            && abbr_query.len().saturating_sub(completed_len) >= MIN_ABBREV_STROKE
+            && abbr_query.len() >= MIN_MIXED_SENTENCE_LEN
+        {
+            let graph = SegGraph::from_dag(&Dag::build(abbr_query, trie));
+            let mut lattice_nodes = self.lattice_builder.build(
+                abbr_query,
+                &graph,
+                dict,
+                Some(&self.fuzzy_config),
+                self.unigram.as_deref(),
+                false,
+            );
+            self.lattice_builder.add_abbrev_nodes(
+                abbr_query,
+                dict,
+                self.unigram.as_deref(),
+                &mut lattice_nodes,
+            );
+
+            let input_len = abbr_query.len();
+            let mut lattice: Vec<Vec<WordNode>> = vec![Vec::new(); input_len + 1];
+            for (end_pos, at_end) in lattice_nodes.iter().enumerate() {
+                if end_pos > input_len {
+                    continue;
+                }
+                for node in at_end {
+                    lattice[end_pos].push(WordNode {
+                        start: node.start,
+                        end: node.end,
+                        word: node.word.clone(),
+                        syl_mask: node.syl_mask,
+                        log_prob: node.log_prob,
+                    });
+                }
+            }
+            let result = self.viterbi.decode(&lattice, input_len);
+            if !result.words.is_empty() && result.log_prob.is_finite() {
+                let sentence: String = result.words.join("");
+                // 质量闸门：低置信整句宁可不出，也不该顶掉可用的部分候选
+                // （见 MIXED_SENTENCE_MIN_LOGP_PER_CHAR 的取值依据）。
+                let logp_per_char = result.log_prob / sentence.chars().count().max(1) as f64;
+                // **至少两个节点才算「组句」。** 单节点路径（`dblg` → 只有「夺不了冠」）
+                // 本质就是一条简拼候选，包装成整句有实际危害：整句的 code 是**击键串**
+                // （`dblg`），而简拼候选的 code 是全拼码（`duobuliaoguan`）——同一个词的
+                // 词频会记到两个互不相认的键上，正是 wdat v5 改「索引存码」时修掉的那个坑。
+                // 交给 step5/6.2 的简拼路径处理即可，那边的 code 是对的。
+                if result.words.len() >= 2
+                    && !sentence.is_empty()
+                    && logp_per_char >= MIXED_SENTENCE_MIN_LOGP_PER_CHAR
+                    && !candidates.iter().any(|c| c.text == sentence)
+                {
+                    let log_offset = (result.log_prob * 1000.0)
+                        .clamp(-(SENTENCE_WEIGHT_BASE as f64), 0.0)
+                        as i32;
+                    candidates.insert(
+                        0,
+                        Candidate {
+                            text: sentence,
+                            // code = 整串**击键**。混合整句本就不是词库主键（它是解读不是词），
+                            // 与 step 2 的整句一样以「本次输入」为码；消费整串由此自然成立。
+                            code: abbr_query.to_string(),
+                            weight: SENTENCE_WEIGHT_BASE.saturating_add(log_offset),
+                            natural_order: 0,
+                            source: CandidateSource::Pinyin,
+                            is_sentence: true,
+                            // 解码器实际走的那条路径。简拼段每字母一位，故回填出的
+                            // preedit 是 `b'z'd'hao'bu'hao` —— 与击键同域，正是要的。
+                            boundary: result.boundary,
+                            // **不标 is_abbrev**：它是整句解读，不是简拼候选。标了会沉进
+                            // 简拼层，被前缀回退的部分候选压在下面。
+                            ..Default::default()
+                        },
+                    );
                 }
             }
         }
@@ -1204,13 +1359,6 @@ impl Engine for PinyinEngine {
         //     不额外建 Dag），但只在全拼下可用：双拼的 `completed_len` 说的是转换后的全拼串，
         //     与 `abbr_query`（原始击键，文档 §5 约束 4）不同域。双拼下改为「转换结果覆盖了
         //     整串击键」——双拼每 2 键 1 音节，覆盖完整即无残码可作声母段。
-        let mixed_covered = match &sp_result {
-            Some(r) => r
-                .syllables
-                .last()
-                .is_some_and(|s| s.raw_end >= raw_input.len()),
-            None => completed_len >= abbr_query.len(),
-        };
         let mixed_pats = if self.config.enable_abbrev && !mixed_covered {
             mixed_abbrev::mixed_patterns(abbr_query, trie)
         } else {
@@ -1687,6 +1835,12 @@ impl Engine for PinyinEngine {
             if let Some(top) = candidates.first() {
                 if top.boundary != 0 && top.code == completed && !completed.is_empty() {
                     preedit_display = render_preedit(completed, top.boundary, &partial_syllable);
+                } else if top.is_sentence && top.boundary != 0 && top.code == raw_input {
+                    // 混合整句（step 2b）：它的 code 是整串**击键**、boundary 也在击键空间
+                    // （简拼段每字母一位），故直接渲染击键串即可，得 `b'z'd'hao'bu'hao`。
+                    // 走不到上一支是因为 `completed` 对这类输入恒为空串——`bzdhaobuhao`
+                    // 从位置 0 就切不出完整音节。
+                    preedit_display = render_preedit(raw_input, top.boundary, "");
                 } else if top.is_abbrev && top.boundary != 0 {
                     // 简拼（`nh`→`n'h`）与混合简拼（`nhao`→`n'hao`）的分段显示。
                     //

@@ -571,13 +571,117 @@ fn full_pinyin_never_enters_prefix_fallback() {
     }
 }
 
-/// 部分匹配时 preedit 把余下击键作残码尾段：`bzdha` → `b'z'd'ha`。
-/// 与全拼残码的显示风格一致（`nihaom` → `ni'hao'm`）。
+/// 部分匹配时 preedit 把余下击键作残码尾段。
+///
+/// 用 `bzdnih`：夹具里 `nih` 那段拼不出任何整句（`ni`+`h` 的 `h` 是残码），故首选仍是
+/// 部分简拼候选「不知道」，走的是 `render_keystroke_preedit` 那一支。
+/// （`bzdha` 已被 step 2b 的混合整句接管，见 `mixed_sentence_*` 用例。）
 #[test]
 fn preedit_shows_trailing_remainder_on_partial_abbrev() {
     let e = engine("preedit_partial");
-    let r = e.convert("bzdha", 30).expect("应有候选");
+    let r = e.convert("bzdnih", 30).expect("应有候选");
     assert_eq!(r.candidates[0].text, "不知道", "前提：首选是部分简拼候选");
+    assert!(r.candidates[0].is_partial, "且是部分匹配");
+    assert_eq!(r.preedit_display, "b'z'd'ni'h");
+    assert_eq!(
+        r.preedit_display.replace('\'', "").len(),
+        "bzdnih".len(),
+        "去掉分隔符仍须还原击键串"
+    );
+}
+
+/// ★★ **混合整句**：`bzdha` = `bzd`(简拼→不知道) + `ha`(全拼→哈) 由 Viterbi 拼成一句。
+///
+/// 这是「智能组句」本身 —— 用户一次上屏即可，无需先选「不知道」再选「哈」。
+/// 简拼节点与全拼节点在同一张词图里竞争（`LatticeNode` 是字节跨度、Viterbi 按字节推进），
+/// 故这条路径不需要改解码器，只需让简拼跨度进得了图。
+#[test]
+fn mixed_sentence_combines_abbrev_and_full_pinyin() {
+    let e = engine("mixed_sentence");
+    let r = e.convert("bzdha", 30).expect("应有候选");
+    let top = &r.candidates[0];
+    assert_eq!(
+        top.text,
+        "不知道哈",
+        "简拼段 + 全拼段应拼成整句: {:?}",
+        r.candidates
+            .iter()
+            .take(4)
+            .map(|c| &c.text)
+            .collect::<Vec<_>>()
+    );
+    assert!(top.is_sentence, "须标整句身份");
+    assert!(!top.is_abbrev, "整句不是简拼候选，标了会沉进简拼层");
+    assert_eq!(top.consumed_length, 5, "整句消费全部击键");
+}
+
+/// 混合整句**不因质量闸门误伤正常解**。
+///
+/// 闸门（`MIXED_SENTENCE_MIN_LOGP_PER_CHAR`）挡的是「路径平均每字 log_prob 过低」的拼凑
+/// 整句。取值定在零代价点：真实词库的受控对比里，它与不设闸门的整句命中率完全相同
+/// （12.10%），只挡掉最离谱的那批。这条断言守住「正常的混合整句照常出」这一侧。
+#[test]
+fn mixed_sentence_survives_quality_gate() {
+    let e = engine("gate");
+    let r = e.convert("bzdha", 30).expect("应有候选");
+    assert!(
+        r.candidates[0].is_sentence,
+        "夹具里 bzd+ha 是合理组合，不该被闸门挡掉: {:?}",
+        r.candidates
+            .iter()
+            .take(3)
+            .map(|c| &c.text)
+            .collect::<Vec<_>>()
+    );
+}
+
+/// **单节点路径不包装成整句**（词频记账的红线）。
+///
+/// `dblg` 只解出「夺不了冠」一个词——那本质就是一条简拼候选。包装成整句会让它的 `code`
+/// 变成击键串 `dblg`，而简拼候选的 `code` 是全拼码 `duobuliaoguan`：同一个词的词频就此
+/// 记到两个互不相认的键上，用简拼练熟的词切回全拼一点不认。这正是 wdat v5 改「索引存码」
+/// 时修掉的坑，不能从整句这条新路径上重新引进来。
+#[test]
+fn single_node_path_is_not_wrapped_as_sentence() {
+    let e = engine("single_node");
+    let r = e.convert("bzd", 30).expect("应有候选");
+    let c = r
+        .candidates
+        .iter()
+        .find(|c| c.text == "不知道")
+        .expect("应命中");
+    assert!(!c.is_sentence, "一个词不算句: {c:?}");
+    assert_eq!(c.code, "buzhidao", "须保留全拼码，词频才记在同一个键上");
+}
+
+/// 关掉简拼总开关时混合整句一并关掉 —— 它整条路径都建立在简拼节点上。
+#[test]
+fn disabling_abbrev_also_disables_mixed_sentence() {
+    let cfg = PyConfig {
+        enable_abbrev: false,
+        ..PyConfig::default()
+    };
+    let e = PinyinEngine::new(cfg, fixture("gate_off"));
+    let r = e.convert("bzdha", 30).expect("应有结果");
+    assert!(
+        !r.candidates.iter().any(|c| c.text == "不知道哈"),
+        "enable_abbrev=false 时不该出混合整句: {:?}",
+        r.candidates
+            .iter()
+            .take(3)
+            .map(|c| &c.text)
+            .collect::<Vec<_>>()
+    );
+}
+
+/// 混合整句的 preedit 同样与击键同域：`bzdha` → `b'z'd'ha`（简拼段每字母一位）。
+///
+/// 走不到常规整句那一支是因为 `completed` 对这类输入恒为空串——`bzdha` 从位置 0 就切不出
+/// 完整音节，而那一支的条件是 `top.code == completed && !completed.is_empty()`。
+#[test]
+fn mixed_sentence_preedit_is_in_keystroke_domain() {
+    let e = engine("mixed_sentence_preedit");
+    let r = e.convert("bzdha", 30).expect("应有候选");
     assert_eq!(r.preedit_display, "b'z'd'ha");
     assert_eq!(
         r.preedit_display.replace('\'', "").len(),
