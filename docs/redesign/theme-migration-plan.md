@@ -109,3 +109,36 @@ T4a 背景图 → T4b layers → T4c SVG 箭头 → 菜单修复 → 死代码�
 
 ### 后置（独立于渲染管线）
 - capability manifest 静态文件（供编辑器/setting 消费）。
+- **`border.style` 虚线/点线描边（`dashed` / `dotted`）** —— 见下节。
+
+## 待办：border.style 边框线型
+
+**现状：两侧都只有数据通路，没有任何渲染实现，也没有编辑入口。**
+
+`solid`（默认）/ `dashed` / `dotted`，作用于所有带边框的节点
+（window、item、text、comment、index、status、tooltip、toast、menu.root、toolbar）。
+
+| 层 | 引擎 | 编辑器 |
+|---|---|---|
+| schema | ✅ `schema.rs` `ViewBorder.style: Option<String>` | ✅ `types.ts` `BorderV3.style` |
+| TOML 往返 | ✅ normalize 透传 | ✅ `toml.ts`，有单测锁 `dashed` 保留 |
+| 解析层 | ✅ 到 `RvNode.border_style` | ❌ **`RVNode` 无 `borderStyle` 字段，信息在此丢失** |
+| 渲染层 | ❌ 零消费（按 solid 画） | ❌ 零消费 |
+| 表单控件 | — | ❌ 无 |
+
+补齐要点：
+1. 引擎 `view.rs` 描边加 dash pattern。底层是 tiny-skia，`Stroke` 自带
+   `dash: Option<StrokeDash>`，只需按 style 构造 `StrokeDash::new(vec![...], 0.0)`；
+   虚线/点线的段长应随 `border_width` 与 DPI scale 缩放，否则高分屏上点线会糊成实线。
+2. 编辑器先给 `RVNode` 补 `borderStyle`（`resolveViews.ts` + `theme3/resolve.ts` 两处），
+   渲染侧 Canvas 2D 用 `ctx.setLineDash()` 即可；注意与「选中节点蓝色虚线高亮框」
+   （`candidateBox.ts` 的 `selectedKey`/`outlineAlpha`，同样用 setLineDash）区分开，
+   两者互不相干，别共用状态。
+3. 表单在「边框」区块加线型下拉，三个枚举值。
+
+优先级：低。当前主题尚未实际使用该字段，且 `solid` 覆盖绝大多数场景；
+但两侧改动都不大、数据通路已铺好一半，可作为主题能力的补齐项择机做。
+
+> 注：`line_spacing` / `col_gap` / `title_gap`（tooltip/toast 多行多列间距）
+> 同样是 wind-ui 零消费，但**不列为待办**——tooltip/toast 的换行由文本内容直接控制
+> （渲染器按文本换行排版），间距参数化没有实际需求。
