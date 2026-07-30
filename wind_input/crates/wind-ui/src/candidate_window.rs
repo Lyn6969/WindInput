@@ -1722,6 +1722,14 @@ impl CandidateWindow {
             if let Some(g) = item_grad {
                 item = item.bg_gradient(g);
             }
+            // 候选项边框（含 selected/hover 换色换宽）。eff_border 此前只用在
+            // index/text/comment 三个叶子上，item 容器自己从没画过边框——
+            // 主题里写的 [item] border / [item.selected] border 一律不生效。
+            // 只取色与宽：圆角沿用上面按 item_radius 设好的值，避免 eff_border 的
+            // 0.0 兜底把未配 border.radius 的候选项圆角抹平。
+            if let Some((bc, bw, _)) = eff_border(&v.item, is_sel, is_hover) {
+                item = item.border(bc, bw);
+            }
             list = list.child(item);
         }
         // 内联编码沉底（见 inline_preedit_bottom）：候选项装配完毕后按原顺序追加编码与模式标记。
