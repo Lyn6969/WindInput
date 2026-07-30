@@ -23,6 +23,9 @@ const ENGLISH_EXACT_BOOST: i32 = 500_000;
 /// 英文前缀补全提权：不额外提权（保留词库原始权重），使前缀英文沉在码表/拼音候选之后，
 /// 避免短前缀（如「d」）刷屏。真机若仍偏高可继续下调。
 const ENGLISH_PREFIX_BOOST: i32 = 0;
+/// 拼音候选的**保底配额分母**：截断时至少给拼音留 `max_candidates / 此值` 席
+/// （生产 `max_candidates=300` ⇒ 60 席）。见 [`MixedEngine::truncate_with_pinyin_quota`]。
+const PINYIN_QUOTA_DIVISOR: usize = 5;
 
 /// 混输引擎的标量配置（融合策略参数）。引擎部件 primary/secondary/english 单独传入 `new`；
 /// 此处仅聚合可配开关/阈值，避免 `new` 参数膨胀。字段语义见 [`MixedEngine`] 同名字段。
@@ -333,22 +336,77 @@ impl MixedEngine {
         }
     }
 
-    /// 合并（码表在前、拼音在后）→ 按权重稳定排序 → 按文本去重 → 截断。
+    /// 合并（码表在前、拼音在后）→ 按权重稳定排序 → 按文本去重 → 带拼音保底配额截断。
     fn merge_sort_dedup(
         mut codetable: Vec<Candidate>,
         pinyin: Vec<Candidate>,
         max_candidates: usize,
     ) -> Vec<Candidate> {
         codetable.extend(pinyin);
-        codetable.sort_by(|a, b| {
+        Self::sort_dedup_truncate(&mut codetable, max_candidates);
+        codetable
+    }
+
+    /// 按权重稳定排序 → 按文本去重 → 带拼音保底配额截断（`convert` 主路径与 overflow 共用）。
+    fn sort_dedup_truncate(cands: &mut Vec<Candidate>, max_candidates: usize) {
+        cands.sort_by(|a, b| {
             b.weight
                 .cmp(&a.weight)
                 .then(a.natural_order.cmp(&b.natural_order))
         });
         let mut seen = std::collections::HashSet::new();
-        codetable.retain(|c| seen.insert(c.text.clone()));
-        codetable.truncate(max_candidates);
-        codetable
+        cands.retain(|c| seen.insert(c.text.clone()));
+        Self::truncate_with_pinyin_quota(cands, max_candidates);
+    }
+
+    /// 截断到 `max_candidates`，但**保证拼音候选至少留 `max/PINYIN_QUOTA_DIVISOR` 席**。
+    ///
+    /// **为什么需要**：码表候选带 `PARTIAL_MATCH_BOOST`(500K)、拼音 `÷100`，于是截断时码表恒
+    /// 排在前。而五笔 2 码前缀的候选量常常超过整个配额——实测 **52 个 2 码前缀条目数 > 300**
+    /// （最多 `kh` 663 条），其中 `pu`（495 条）正是「既是五笔 2 码、又是完整拼音音节」的交集。
+    /// 那种输入下拼音候选**一条都进不了列表**，下游协调器的拼音精确档
+    /// （`cmp_pinyin_exact_first`）就无从下手——提档提不了不在场的候选。
+    ///
+    /// **只补不挤空**：尾部确实没有拼音候选时（纯五笔溢出串、`kh` 这类非音节码）`extra` 为空，
+    /// 一条码表候选都不会被挤掉，行为与改动前完全一致。
+    ///
+    /// ⚠️ 补进来的拼音候选**追加在尾部、不保证有序**——这依赖协调器
+    /// `candidate_display_order` 会**无条件重排全部候选**（见 candidate-sorting-rules.md §6）。
+    /// 本函数的职责只是「让候选进得来」，不是「排好序」。
+    fn truncate_with_pinyin_quota(cands: &mut Vec<Candidate>, max_candidates: usize) {
+        if cands.len() <= max_candidates {
+            return;
+        }
+        let quota = max_candidates / PINYIN_QUOTA_DIVISOR;
+        let is_py = |c: &Candidate| c.source == CandidateSource::Pinyin;
+        if quota == 0 {
+            cands.truncate(max_candidates);
+            return;
+        }
+        let kept = cands[..max_candidates].iter().filter(|c| is_py(c)).count();
+        if kept >= quota {
+            cands.truncate(max_candidates);
+            return;
+        }
+        // 从被截掉的部分按序取拼音补足（拼音引擎已按其排序链排好，前几条即精确候选优先）。
+        let extra: Vec<Candidate> = cands[max_candidates..]
+            .iter()
+            .filter(|c| is_py(c))
+            .take(quota - kept)
+            .cloned()
+            .collect();
+        cands.truncate(max_candidates);
+        // 腾位：从尾部往前挤掉等量的非拼音候选（权重最低的那些）。
+        let mut to_remove = extra.len();
+        let mut i = cands.len();
+        while to_remove > 0 && i > 0 {
+            i -= 1;
+            if !is_py(&cands[i]) {
+                cands.remove(i);
+                to_remove -= 1;
+            }
+        }
+        cands.extend(extra);
     }
 
     /// 组合区**默认**形态（`preedit_display`）：≥2 完成音节且有 preedit 时才用拼音拆分串。
@@ -634,14 +692,8 @@ impl Engine for MixedEngine {
         merged.extend(pinyin);
         // 英文候选（enable_english 开时）：独立加权档混入，与码表/拼音一同竞争排序。
         merged.extend(self.english_candidates(input, max_candidates));
-        merged.sort_by(|a, b| {
-            b.weight
-                .cmp(&a.weight)
-                .then(a.natural_order.cmp(&b.natural_order))
-        });
-        let mut seen = std::collections::HashSet::new();
-        merged.retain(|c| seen.insert(c.text.clone()));
-        merged.truncate(max_candidates);
+        // 排序 → 去重 → 带拼音保底配额截断（与 overflow 路径共用，见 `sort_dedup_truncate`）。
+        Self::sort_dedup_truncate(&mut merged, max_candidates);
         if self.show_source_hint {
             Self::add_source_hints(&mut merged);
         }
@@ -844,6 +896,139 @@ mod tests {
             ..Default::default()
         };
         Box::new(CodeTableEngine::new(4, opts, Arc::new(dm)))
+    }
+
+    // ── 截断的拼音保底配额（`truncate_with_pinyin_quota`）──
+
+    fn ct_cand(text: &str, weight: i32) -> Candidate {
+        Candidate {
+            text: text.into(),
+            weight,
+            source: CandidateSource::CodeTable,
+            ..Default::default()
+        }
+    }
+
+    fn py_cand(text: &str, weight: i32) -> Candidate {
+        Candidate {
+            text: text.into(),
+            weight,
+            source: CandidateSource::Pinyin,
+            ..Default::default()
+        }
+    }
+
+    /// 复刻 `pu`（495 条码表 + 拼音）现场：码表候选多到吃满整个配额，拼音一条都进不来。
+    /// 保底后拼音应拿到 `max/PINYIN_QUOTA_DIVISOR` 席。
+    #[test]
+    fn pinyin_gets_minimum_quota_when_codetable_floods() {
+        let mut cands: Vec<Candidate> = (0..20)
+            .map(|i| ct_cand(&format!("码{i}"), 500_000))
+            .collect();
+        cands.extend((0..5).map(|i| py_cand(&format!("拼{i}"), 100 - i)));
+        MixedEngine::truncate_with_pinyin_quota(&mut cands, 10);
+        assert_eq!(cands.len(), 10, "总数仍受 max_candidates 约束");
+        let py = cands
+            .iter()
+            .filter(|c| c.source == CandidateSource::Pinyin)
+            .count();
+        assert_eq!(py, 2, "10/5=2 席保底（否则协调器的拼音精确档无候选可提）");
+        // 挤掉的是权重最低的码表候选，码表仍占多数。
+        assert_eq!(cands.len() - py, 8);
+    }
+
+    /// ★ 反向锁：尾部**没有**拼音候选时（`kh` 663 条这类非音节码、纯五笔溢出串），
+    /// 一条码表候选都不许被挤掉 —— 行为与改动前完全一致。
+    #[test]
+    fn no_pinyin_means_no_codetable_is_evicted() {
+        let mut cands: Vec<Candidate> = (0..20)
+            .map(|i| ct_cand(&format!("码{i}"), 500_000))
+            .collect();
+        MixedEngine::truncate_with_pinyin_quota(&mut cands, 10);
+        assert_eq!(cands.len(), 10);
+        assert!(
+            cands.iter().all(|c| c.source == CandidateSource::CodeTable),
+            "无拼音可补时不得腾位"
+        );
+        assert_eq!(cands[0].text, "码0", "顺序不应被打乱");
+    }
+
+    /// 未超上限时原样不动（不触发任何腾位逻辑）。
+    #[test]
+    fn under_limit_is_untouched() {
+        let mut cands = vec![ct_cand("码", 500_000), py_cand("拼", 69)];
+        MixedEngine::truncate_with_pinyin_quota(&mut cands, 10);
+        assert_eq!(cands.len(), 2);
+    }
+
+    /// 拼音本就够席位时不额外腾位（避免把配额当成"必须凑满"的硬指标）。
+    #[test]
+    fn existing_pinyin_above_quota_needs_no_eviction() {
+        let mut cands: Vec<Candidate> = (0..5)
+            .map(|i| py_cand(&format!("拼{i}"), 900 - i))
+            .collect();
+        cands.extend((0..20).map(|i| ct_cand(&format!("码{i}"), 100)));
+        MixedEngine::truncate_with_pinyin_quota(&mut cands, 10);
+        let py = cands
+            .iter()
+            .filter(|c| c.source == CandidateSource::Pinyin)
+            .count();
+        assert_eq!(py, 5, "前 10 条里已有 5 条拼音 ≥ 配额 2，不动");
+        assert_eq!(cands.len(), 10);
+    }
+
+    /// 接线验证：配额逻辑必须真的挂在 `convert` 的截断上，不能只是个没人调的函数
+    /// （「函数写对了但生产端不调」是本仓反复出现的欠账形态）。
+    #[test]
+    fn convert_applies_pinyin_quota() {
+        // 码表 20 条同码候选（权重高，会吃满配额）；拼音 5 条。
+        let entries: Vec<(String, String, i32)> = (0..20)
+            .map(|i| ("aa".to_string(), format!("码{i}"), 9000 - i))
+            .collect();
+        let refs: Vec<(&str, &str, i32)> = entries
+            .iter()
+            .map(|(c, t, w)| (c.as_str(), t.as_str(), *w))
+            .collect();
+        let e = MixedEngine::new(
+            ct_engine(&refs, false),
+            Some(Box::new(FakePinyinMulti { n: 5 })),
+            None,
+            MixConfig::default(),
+        );
+        let r = e.convert("aa", 10).unwrap();
+        assert_eq!(r.candidates.len(), 10);
+        let py = r
+            .candidates
+            .iter()
+            .filter(|c| c.source == CandidateSource::Pinyin)
+            .count();
+        assert_eq!(py, 2, "convert 必须走带配额的截断");
+    }
+
+    /// 产出多条 `source=Pinyin` 候选的假拼音引擎（`FakePinyin` 只给一条，测不了配额）。
+    struct FakePinyinMulti {
+        n: usize,
+    }
+    impl Engine for FakePinyinMulti {
+        fn convert(&self, input: &str, _max: usize) -> anyhow::Result<ConvertResult> {
+            let candidates = (0..self.n)
+                .map(|i| Candidate {
+                    text: format!("拼{i}"),
+                    code: input.to_string(),
+                    weight: 100 - i as i32,
+                    source: CandidateSource::Pinyin,
+                    ..Default::default()
+                })
+                .collect();
+            Ok(ConvertResult {
+                candidates,
+                ..Default::default()
+            })
+        }
+        fn reset(&self) {}
+        fn engine_type(&self) -> EngineType {
+            EngineType::Pinyin
+        }
     }
 
     #[test]

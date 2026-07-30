@@ -42,19 +42,36 @@ use wind_ui::manager::CandidateOp;
 ///   缺失，留谁将由一个不含该字段的键随机决定，留下「消费整串」那条会让分段上屏把剩余拼音
 ///   一并吃掉。该级在 `better` 里早已存在，此前漏抄到本函数。
 ///
+/// - `mixed`：当前是混输引擎时，在 `is_exact_code` 之后、权重之前插入**拼音精确档**
+///   （`wind_candidate::cmp_pinyin_exact_first`），使三档顺序为「码表精确 → 拼音精确 → 码表前缀
+///   补全」。解决混输打 `xu` 时拼音「需」被码表 `xu*` 的 124 条前缀补全压到第 125 位。
+///   ⚠️ **必须由调用方按引擎语境传入、不可恒 true**：纯拼音下全体候选同为 `Pinyin` 来源，该键会
+///   退化成「`is_common` 优先」，把含生僻字的多字词硬降到全部常用单字之后。依赖 `mark_common`
+///   已在排序前跑过（`is_common` 是提档准入条件）。
+///
 /// 排序规则：Exact >> Sub-phrase >> Prefix >> Fuzzy。
 fn candidate_display_order(
     a: &Candidate,
     b: &Candidate,
     ignore_weight: bool,
+    mixed: bool,
 ) -> std::cmp::Ordering {
     let by_weight = if ignore_weight {
         std::cmp::Ordering::Equal
     } else {
         b.weight.cmp(&a.weight)
     };
+    // 混输专属层级：拼音精确档先于码表前缀补全（见 `cmp_pinyin_exact_first`）。
+    // 纯拼音/纯码表下必须为空操作——纯拼音时它会退化成「is_common 优先」，把含生僻字的
+    // 多字词硬降到全部常用单字之后。
+    let by_pinyin_exact = if mixed {
+        wind_candidate::cmp_pinyin_exact_first(a, b)
+    } else {
+        std::cmp::Ordering::Equal
+    };
     wind_candidate::cmp_match_layers(a, b)
         .then_with(|| wind_candidate::cmp_exact_first(a, b))
+        .then(by_pinyin_exact)
         .then(by_weight)
         .then(a.base_order.cmp(&b.base_order))
         .then(a.natural_order.cmp(&b.natural_order))
@@ -641,21 +658,30 @@ impl Coordinator {
         // `candidate_display_order` 排序，不另立跨来源的优先级规则，将来前缀模式排序改了这里自动跟随。
         // 末级补 text 兜底：`lookup_prefix` 由 HashMap 遍历产出、顺序不定（见 wind-phrase
         // lookup_prefix_at），而 `candidate_display_order` 无文本末级，同分时取到的会是随机一条。
+        let mixed =
+            self.engine_mgr.current_engine_type() == Some(wind_engine::engine::EngineType::Mixed);
         if candidates.is_empty() {
             completion_pool.extend(engine_completion);
             let ignore_weight = self.engine_mgr.active_base_sort_ignores_weight();
+            // 与最终列表同一套排序 ⇒ 同样先补 is_common（否则混输档位键在此退化为空操作，
+            // 上面「本会显示在最前的那一条」这句承诺就不成立了）。
+            self.mark_common(&mut completion_pool);
             completion_pool.sort_by(|a, b| {
-                candidate_display_order(a, b, ignore_weight).then_with(|| a.text.cmp(&b.text))
+                candidate_display_order(a, b, ignore_weight, mixed)
+                    .then_with(|| a.text.cmp(&b.text))
             });
             candidates.extend(completion_pool.into_iter().next());
         }
         // 候选层级排序：合并引擎候选 + 短语后按统一层级重排（见 `candidate_display_order`）。
         // base_sort=natural 时忽略权重，对齐引擎 by_natural（否则合并短语后重排会与引擎发散）。
         let ignore_weight = self.engine_mgr.active_base_sort_ignores_weight();
-        candidates.sort_by(|a, b| candidate_display_order(a, b, ignore_weight));
+        // ⚠️ 常用字判定必须**先于排序**：混输的拼音精确档拿 `is_common` 作提档准入条件
+        // （见 `mark_common` 与 `wind_candidate::is_pinyin_exact_tier`）。过滤仍在下面按模式进行。
+        self.mark_common(&mut candidates);
+        candidates.sort_by(|a, b| candidate_display_order(a, b, ignore_weight, mixed));
         let mut seen = std::collections::HashSet::new();
         candidates.retain(|c| seen.insert(c.text.clone()));
-        // 检索范围过滤（填充常用标志后按模式过滤；对齐 Go 引擎内过滤）
+        // 检索范围过滤（按模式裁剪；is_common 已由上面的 mark_common 填好）
         self.apply_filter(state, &mut candidates);
         // 用户词频重排（独立维度，used-first，绝不改 weight；frequency.md §3）
         self.apply_freq_rerank(&mut candidates, &state.input_buffer);
@@ -799,11 +825,17 @@ impl Coordinator {
         }
     }
 
-    /// 按当前检索范围过滤候选：先填充 is_common（常用字表），再按模式过滤。
-    /// Gb18030 或数据缺失时不过滤（避免误删）。
-    pub(crate) fn apply_filter(&self, state: &State, candidates: &mut Vec<Candidate>) {
-        let mode = state.filter_mode;
-        if mode == wind_candidate::FilterMode::Gb18030 || self.common_chars.is_empty() {
+    /// 常用字**判定**（只置 `is_common`，无过滤、无删除）。
+    ///
+    /// ⚠️ **必须在排序之前无条件调用**，且刻意**不看 `filter_mode`**：混输的拼音精确档
+    /// （`wind_candidate::is_pinyin_exact_tier`）拿 `is_common` 当提档准入条件，而本判定原先
+    /// 写在 `apply_filter` 内部、`FilterMode::Gb18030` 时随那道 early-return 一起被跳过 ——
+    /// 沿用那个位置会让提档在 Gb18030 下因 `is_common` 恒假而**整体失效且无任何痕迹**。
+    ///
+    /// 判定（纯计算）与过滤（按模式裁剪，见 `apply_filter`）因此拆开：判定无条件跑，
+    /// 过滤仍留在原步骤、语义不变。
+    pub(crate) fn mark_common(&self, candidates: &mut [Candidate]) {
+        if self.common_chars.is_empty() {
             return;
         }
         for c in candidates.iter_mut() {
@@ -811,6 +843,18 @@ impl Coordinator {
             if !c.is_phrase {
                 c.is_common = self.common_chars.is_string_common(&c.text);
             }
+        }
+    }
+
+    /// 按当前检索范围过滤候选（`is_common` 由 `mark_common` 提前填好）。
+    /// Gb18030 或数据缺失时不过滤（避免误删）。
+    ///
+    /// ⚠️ `common_chars.is_empty()` 这道检查**不可省**：常用字表未加载时全体 `is_common=false`，
+    /// `General` 模式会把候选**全部滤光**。
+    pub(crate) fn apply_filter(&self, state: &State, candidates: &mut Vec<Candidate>) {
+        let mode = state.filter_mode;
+        if mode == wind_candidate::FilterMode::Gb18030 || self.common_chars.is_empty() {
+            return;
         }
         let taken = std::mem::take(candidates);
         *candidates = wind_candidate::filter_candidates(taken, mode);
@@ -2371,6 +2415,104 @@ mod finalize_candidates_tests {
         }
     }
 
+    /// 混输打 `xu` 的三档现场（`per_page=7` 时「需」原本在第 125 位 / 第 18~20 页）：
+    /// 码表精确「弱」(`xu`, 二简码) → 拼音精确「需」(`code==xu`, 该音节最高频字) →
+    /// 码表前缀补全「弹幕」(`xuaj`, 要打满 4 码才精确)。
+    ///
+    /// 权重取真实值：码表带 `PARTIAL_MATCH_BOOST`(500K)、拼音已 `÷PINYIN_TIER_SCALE`(100)，
+    /// 所以「需」纯按权重必输（69 vs 501,554）——这一条锁的正是「层级先于权重」。
+    fn xu_scene() -> (Candidate, Candidate, Candidate) {
+        let ct_exact = Candidate {
+            text: "弱".into(),
+            code: "xu".into(),
+            weight: 10_009_950, // 9950 + codetable_weight_boost(1e7)
+            is_common: true,
+            is_exact_code: true,
+            source: CandidateSource::CodeTable,
+            ..Default::default()
+        };
+        let py_exact = Candidate {
+            text: "需".into(),
+            code: "xu".into(),
+            weight: 69, // 6999 / 100
+            is_common: true,
+            source: CandidateSource::Pinyin,
+            ..Default::default()
+        };
+        let ct_prefix = Candidate {
+            text: "弹幕".into(),
+            code: "xuaj".into(),
+            weight: 501_554, // 1554 + PARTIAL_MATCH_BOOST(500K)
+            is_common: true,
+            source: CandidateSource::CodeTable,
+            ..Default::default()
+        };
+        (ct_exact, py_exact, ct_prefix)
+    }
+
+    /// 混输：拼音精确档插在「码表精确」与「码表前缀补全」之间。
+    #[test]
+    fn mixed_pinyin_exact_sits_between_codetable_exact_and_prefix() {
+        let (ct_exact, py_exact, ct_prefix) = xu_scene();
+        // 故意以最不利顺序放入，确保结果由排序而非原序决定。
+        let mut cands = vec![ct_prefix, py_exact, ct_exact];
+        cands.sort_by(|a, b| candidate_display_order(a, b, false, true));
+        let order: Vec<&str> = cands.iter().map(|c| c.text.as_str()).collect();
+        assert_eq!(
+            order,
+            vec!["弱", "需", "弹幕"],
+            "混输应为「码表精确 → 拼音精确 → 码表前缀补全」"
+        );
+    }
+
+    /// ★ 反向锁一：`mixed=false`（纯拼音/纯码表）时本档**不得生效**。
+    /// 纯拼音下全体候选同为 Pinyin 来源，该键会退化成「is_common 优先」，把含生僻字的多字词
+    /// 硬降到全部常用单字之后 —— 那是明显回归。此处以码表权重序验证键未参与。
+    #[test]
+    fn non_mixed_keeps_weight_order_for_pinyin() {
+        let (_, py_exact, ct_prefix) = xu_scene();
+        let mut cands = vec![py_exact, ct_prefix];
+        cands.sort_by(|a, b| candidate_display_order(a, b, false, false));
+        assert_eq!(
+            cands[0].text, "弹幕",
+            "非混输时应回落到纯权重序（501554 > 69），拼音精确档不得生效"
+        );
+    }
+
+    /// ★ 反向锁二：生僻拼音字（`is_common=false`）不提档，仍留在码表前缀补全之后。
+    /// 这一条锁住「不设条数上限、由检索范围把关」的设计——`xu` 有 329 条同音字，
+    /// 若生僻字一并提档会把码表候选整片挤出候选配额。
+    #[test]
+    fn mixed_rare_pinyin_char_stays_below_codetable_prefix() {
+        let (_, py_exact, ct_prefix) = xu_scene();
+        let rare = Candidate {
+            text: "𬣙".into(),
+            weight: 0,
+            is_common: false,
+            ..py_exact
+        };
+        let mut cands = vec![rare, ct_prefix];
+        cands.sort_by(|a, b| candidate_display_order(a, b, false, true));
+        assert_eq!(
+            cands[0].text, "弹幕",
+            "生僻同音字不得越过码表前缀补全（否则 329 条同音字会挤爆配额）"
+        );
+    }
+
+    /// 档内仍按权重竞争：两条都在拼音精确档时，高频字在前（本键在同档不表态）。
+    #[test]
+    fn mixed_within_pinyin_exact_tier_weight_still_decides() {
+        let (_, py_exact, _) = xu_scene();
+        let xu_low = Candidate {
+            text: "序".into(),
+            weight: 13, // 1321 / 100
+            ..py_exact.clone()
+        };
+        let mut cands = vec![xu_low, py_exact];
+        cands.sort_by(|a, b| candidate_display_order(a, b, false, true));
+        assert_eq!(cands[0].text, "需", "同档内仍按权重降序（69 > 13）");
+    }
+
     /// 回归：跨词库排序须以 `base_order` 隔离，`natural_order` 只在同档内当 tiebreaker。
     /// 复刻 flypy「y」现场——主库「一」(base_order=0, natural_order 大) vs 一简次选库「有时」
     /// (base_order=2, natural_order 小)：修复前协调器仅按 natural_order 升序会把「有时」拉到首位，
@@ -2382,7 +2524,7 @@ mod finalize_candidates_tests {
         for ignore_weight in [false, true] {
             // 故意以「有时」在前的顺序放入，确保是排序而非原序决定结果。
             let mut cands = vec![youshi.clone(), yi.clone()];
-            cands.sort_by(|a, b| candidate_display_order(a, b, ignore_weight));
+            cands.sort_by(|a, b| candidate_display_order(a, b, ignore_weight, false));
             assert_eq!(
                 cands[0].text, "一",
                 "base_order=0 主库候选应排在 base_order=2 次选库候选之前（ignore_weight={ignore_weight}）"
@@ -2399,11 +2541,11 @@ mod finalize_candidates_tests {
         let extra_high = cand_ordered("扩高", 1, 5, 999); // 次选库、高权重
         // weight 模式：权重降序主导 → 扩高(999) 在前。
         let mut w = vec![main_low.clone(), extra_high.clone()];
-        w.sort_by(|a, b| candidate_display_order(a, b, false));
+        w.sort_by(|a, b| candidate_display_order(a, b, false, false));
         assert_eq!(w[0].text, "扩高", "weight 模式高权重应靠前");
         // natural 模式：忽略权重 → base_order 升序主导，主库(0) 在前。
         let mut n = vec![main_low, extra_high];
-        n.sort_by(|a, b| candidate_display_order(a, b, true));
+        n.sort_by(|a, b| candidate_display_order(a, b, true, false));
         assert_eq!(
             n[0].text, "主低",
             "natural 模式忽略权重、按 base_order 升序，主库应靠前"
@@ -2461,7 +2603,7 @@ mod finalize_candidates_tests {
                 exact.clone(),
                 guide_group.clone(),
             ];
-            cands.sort_by(|a, b| candidate_display_order(a, b, ignore_weight));
+            cands.sort_by(|a, b| candidate_display_order(a, b, ignore_weight, false));
             let order: Vec<&str> = cands.iter().map(|c| c.text.as_str()).collect();
             assert_eq!(
                 order,

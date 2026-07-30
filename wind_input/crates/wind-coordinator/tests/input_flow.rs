@@ -2565,6 +2565,86 @@ fn config_mixed() -> Config {
     cfg
 }
 
+/// 混输打 `xu`：拼音精确候选「需」必须进首页，不得被码表 `xu*` 的前缀补全整体压后。
+///
+/// **真机现场**（本测试即其回归）：首选是码表精确全码「弱」（`xu` 是二简码，权重 9950+1e7），
+/// 而拼音的「需」（`code==xu` 精确匹配、该音节最高频字 6999）被 `xu*` 的码表前缀补全整体压住。
+/// 短路本改动实测「需」落在**第 98 位**（报告者 `per_page=5` ⇒ 正是其所报的第 20 页）；候选前 12 条
+/// 全是五笔：`["弱","缮","绊","弹","缯","缔","绞","缣","缢","弱点","弹幕","弹性"]`。
+/// 词库侧规模：主库 130 条加 extra 4 条，按 `text` 去重后 124 条 `xu*` 前缀补全。
+/// 根因是混输的档位系统只承认码表那一半「精确 vs 前缀」：码表精确 `+1e7`、码表前缀补全
+/// `+PARTIAL_MATCH_BOOST`(500K)，而拼音**不分精确与补全**统一 `÷PINYIN_TIER_SCALE`(100)。
+///
+/// ⚠️ `new_headless` 的 `store` 为 `None` ⇒ `freq_rerank` 不参与（其触发前提要求有词频记录），
+/// 故本测试测的是纯 `candidate_display_order` 的效果 —— 正是文档「验证匹配层类改动必须关自动
+/// 调频」要求的隔离条件。`freq_tier` 侧的同款档位另由 wind-engine 的单测覆盖。
+#[test]
+fn mixed_xu_pinyin_exact_reaches_first_page() {
+    if !has_schemas() {
+        eprintln!("跳过：缺少 schema");
+        return;
+    }
+    // 贴合真机配置：filter_mode=general（只保留常用字）——提档判据 is_common 与该模式同口径。
+    let mut cfg = config_mixed();
+    cfg.input.filter_mode = "general".into();
+    let coord = Coordinator::new_headless(cfg, Some(&data_dir()));
+    press_letter(&coord, 'x');
+    press_letter(&coord, 'u');
+    let texts = coord.debug_all_candidate_texts();
+
+    // 前置一：码表精确全码仍稳居首位（本改动**不得**动摇「码表精确 > 拼音」这条硬约束）。
+    assert_eq!(
+        texts.first().map(String::as_str),
+        Some("弱"),
+        "码表精确全码「弱」必须仍是首选，实际: {:?}",
+        &texts[..texts.len().min(10)]
+    );
+    // 前置二：确认码表前缀补全候选**确实在场** —— 否则本测试退化成「没有竞争者的假绿」。
+    assert!(
+        texts
+            .iter()
+            .any(|t| t == "弹幕" || t == "弹性" || t == "弱点"),
+        "前置：xu 的码表前缀补全候选应在候选列表内，实际: {:?}",
+        &texts[..texts.len().min(20)]
+    );
+
+    let pos = texts.iter().position(|t| t == "需").unwrap_or_else(|| {
+        panic!(
+            "「需」应在候选中，实际: {:?}",
+            &texts[..texts.len().min(20)]
+        )
+    });
+    assert!(
+        pos < 7,
+        "「需」应进首页（per_page=7），实际第 {} 位；前 12 条: {:?}",
+        pos + 1,
+        &texts[..texts.len().min(12)]
+    );
+}
+
+/// 反向锁：**纯拼音**方案不受本改动影响（拼音精确档只在混输生效）。
+/// 纯拼音下全体候选同为 `Pinyin` 来源，若那个层级键误在此生效，会退化成「is_common 优先」，
+/// 把含生僻字的多字词硬降到全部常用单字之后。此处以「打 `xu` 首选仍是最高频字」把住基线。
+#[test]
+fn pure_pinyin_xu_order_is_unaffected() {
+    if !has_schemas() {
+        eprintln!("跳过：缺少 schema");
+        return;
+    }
+    let mut cfg = config_with("pinyin");
+    cfg.input.filter_mode = "general".into();
+    let coord = Coordinator::new_headless(cfg, Some(&data_dir()));
+    press_letter(&coord, 'x');
+    press_letter(&coord, 'u');
+    let texts = coord.debug_all_candidate_texts();
+    assert_eq!(
+        texts.first().map(String::as_str),
+        Some("需"),
+        "纯拼音下 xu 首选应是最高频字「需」，实际: {:?}",
+        &texts[..texts.len().min(10)]
+    );
+}
+
 #[test]
 fn test_mixed_wubi_exact_priority() {
     if !has_schemas() {

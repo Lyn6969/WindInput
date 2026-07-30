@@ -341,6 +341,58 @@ pub fn cmp_exact_first(a: &Candidate, b: &Candidate) -> std::cmp::Ordering {
     b.is_exact_code.cmp(&a.is_exact_code)
 }
 
+/// 候选是否属于**拼音精确档**：混输下该档整体先于码表前缀补全（见 [`cmp_pinyin_exact_first`]）。
+///
+/// 判据是「这条拼音候选完整、精确地解释了本次输入，且是常用字词」：
+/// - `is_prefix`/`is_partial`/`is_abbrev` 全假 = 既非前缀补全、也非子短语、也非简拼，即音节精确对齐；
+/// - `is_fuzzy` 假 = 非模糊音变体。★ 注意这里**不是**把 `is_fuzzy` 当层级键用（它明确不是层级，
+///   见其字段文档），而是作为**提档准入**条件：模糊命中意味着用户没精确打对，不该越过码表词；
+/// - `is_common` 真 = 落在检索范围（常用字表）内。★ 这一条是本判据的关键：拼音单音节的同音字
+///   动辄上百条（`xu` 有 329 条，含权重 0 的生僻字 𬣙/馘/谞），若不限常用字，整片生僻字都会
+///   越过码表前缀补全，反过来把码表候选挤出候选配额。用 `is_common` 而非固定条数上限，是让
+///   「提多少条」跟着用户的检索范围设置走。
+///
+/// ⚠️ **依赖 `is_common` 已被置位**：协调器 `mark_common` 必须在排序**之前**无条件跑过一遍。
+/// 该置位历史上写在 `apply_filter` 内部，且 `FilterMode::Gb18030` 时提前 return 完全不置位 ——
+/// 若沿用那个位置，本判据在 Gb18030 下会因 `is_common` 恒假而**整体失效且无任何痕迹**。
+/// 判定（无副作用）与过滤（按模式裁剪）因此拆开：判定无条件、过滤仍留在原步骤。
+pub fn is_pinyin_exact_tier(c: &Candidate) -> bool {
+    c.source == CandidateSource::Pinyin
+        && c.is_common
+        && !c.is_prefix
+        && !c.is_partial
+        && !c.is_abbrev
+        && !c.is_fuzzy
+}
+
+/// 「拼音精确档先于码表前缀补全」比较（**仅混输**，见 `candidate_display_order` 的 `mixed` 参数）。
+///
+/// **要解决什么**：混输打 `xu`，首选是码表精确全码「弱」（`xu` 是二简码），但拼音的「需」
+/// （`code==xu` 的精确匹配、该音节最高频字）此前排在**第 98 位**（实测，报告者 `per_page=5`
+/// ⇒ 第 20 页）——被码表 `xu*` 的 124 条前缀补全整体压住。
+/// 根因是「精确 vs 前缀」这个维度混输只承认码表那一半：
+/// 码表精确 +1e7、码表前缀补全 +`PARTIAL_MATCH_BOOST`(500K)，而拼音**不分精确与补全**统一
+/// `÷PINYIN_TIER_SCALE`(100)。拼音侧的 `is_prefix`/`is_partial` 信息一直是齐全的，只是在
+/// `normalize_pinyin` 那一步被抹平了。
+///
+/// **为何是层级键而不是权重加成**：给拼音精确档加一个介于 500K 与 1e7 之间的常量同样能排对，
+/// 但那是「把类别编码进权重」的老范式（红线②）。更要紧的是拼音词库最高权重是「的」
+/// **15,378,475**，任何「不先归一就加 boost」的写法都会让它越过码表精确档 1e7 ——
+/// 打 `de` 首选从五笔字变成「的」。层级键没有这个量纲陷阱。
+///
+/// **位置**：置于 `cmp_exact_first` **之后**、`by_weight` 之前。于是三档顺序为
+/// 「码表精确/精确码短语 → 拼音精确 → 码表前缀补全」，档内仍按权重竞争。
+///
+/// ⚠️ **只在混输生效**：纯拼音下全体候选都是 `Pinyin` 来源，本键会退化成「`is_common` 优先」，
+/// 把含生僻字的多字词（`is_string_common` 要求整串每字都常用）硬降到全部常用单字之后 ——
+/// 那是明显回归。纯码表下没有拼音候选，本键是空操作。
+///
+/// ⚠️ **`freq_rerank::freq_tier` 是同概念的第二份判据**（同一个 `is_pinyin_exact_tier`，档位 2）。
+/// 开自动调频时它是首要键、整体压过本比较链，两处改一处须核对另一处（红线③）。
+pub fn cmp_pinyin_exact_first(a: &Candidate, b: &Candidate) -> std::cmp::Ordering {
+    is_pinyin_exact_tier(b).cmp(&is_pinyin_exact_tier(a))
+}
+
 /// 比较两个候选词的排序优先级（权重降序）
 ///
 /// 与 Go 版本 `candidate.Better` 对齐。
@@ -396,6 +448,128 @@ pub fn sort_candidates(candidates: &mut [Candidate]) {
 /// 排序候选词列表（自然顺序，精确匹配优先）
 pub fn sort_candidates_natural(candidates: &mut [Candidate]) {
     candidates.sort_by(better_natural);
+}
+
+#[cfg(test)]
+mod pinyin_exact_tier_tests {
+    use super::*;
+    use std::cmp::Ordering;
+
+    /// 混输里「拼音精确档」的典型成员：`xu`→「需」（精确音节、常用字）。
+    fn pinyin_exact() -> Candidate {
+        Candidate {
+            text: "需".into(),
+            code: "xu".into(),
+            weight: 6999,
+            is_common: true,
+            source: CandidateSource::Pinyin,
+            ..Default::default()
+        }
+    }
+
+    /// 码表前缀补全：`xu` 输入下的 `xuaj`→「弹幕」（码更长，故非精确）。
+    fn codetable_prefix() -> Candidate {
+        Candidate {
+            text: "弹幕".into(),
+            code: "xuaj".into(),
+            weight: 1554,
+            is_common: true,
+            source: CandidateSource::CodeTable,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn pinyin_exact_common_char_is_in_tier() {
+        assert!(is_pinyin_exact_tier(&pinyin_exact()));
+    }
+
+    /// ★ 生僻字不进档 —— 这是「不设条数上限、改用检索范围把关」的落点。
+    /// `xu` 有 329 条同音字，若生僻字一并提档，整片生僻字都会越过码表前缀补全。
+    #[test]
+    fn rare_char_is_excluded_from_tier() {
+        let rare = Candidate {
+            is_common: false,
+            ..pinyin_exact()
+        };
+        assert!(!is_pinyin_exact_tier(&rare), "非常用字不得进拼音精确档");
+    }
+
+    /// 四类「非精确」召回一律不进档（各自单独翻转，避免一个漏判被别的条件掩盖）。
+    #[test]
+    fn non_exact_recalls_are_excluded_from_tier() {
+        for (label, c) in [
+            (
+                "前缀补全",
+                Candidate {
+                    is_prefix: true,
+                    ..pinyin_exact()
+                },
+            ),
+            (
+                "子短语",
+                Candidate {
+                    is_partial: true,
+                    ..pinyin_exact()
+                },
+            ),
+            (
+                "简拼",
+                Candidate {
+                    is_abbrev: true,
+                    ..pinyin_exact()
+                },
+            ),
+            (
+                "模糊音",
+                Candidate {
+                    is_fuzzy: true,
+                    ..pinyin_exact()
+                },
+            ),
+        ] {
+            assert!(!is_pinyin_exact_tier(&c), "{label}候选不得进拼音精确档");
+        }
+    }
+
+    /// 码表候选永不进本档（本档是拼音专属；码表的分层靠 `is_exact_code`）。
+    #[test]
+    fn codetable_never_enters_pinyin_tier() {
+        assert!(!is_pinyin_exact_tier(&codetable_prefix()));
+        let ct_exact = Candidate {
+            code: "xu".into(),
+            is_exact_code: true,
+            ..codetable_prefix()
+        };
+        assert!(!is_pinyin_exact_tier(&ct_exact));
+    }
+
+    /// 核心断言：拼音精确档先于码表前缀补全，**且与权重高低无关**。
+    /// 现场是混输打 `xu`——码表前缀补全带 `PARTIAL_MATCH_BOOST`(500K) 而拼音 `÷100` 只剩 69，
+    /// 纯按权重永远输；层级键让它翻过来。
+    #[test]
+    fn pinyin_exact_outranks_codetable_prefix_regardless_of_weight() {
+        let py = pinyin_exact(); // 混输里实际权重 6999/100 = 69
+        let ct = Candidate {
+            weight: 509_999, // 码表前缀补全的权重上限（9999 + 500K）
+            ..codetable_prefix()
+        };
+        assert_eq!(cmp_pinyin_exact_first(&py, &ct), Ordering::Less);
+        assert_eq!(cmp_pinyin_exact_first(&ct, &py), Ordering::Greater);
+    }
+
+    /// 反向锁：同档内本键不表态（交给后续权重级决），否则会掩盖档内的词频序。
+    #[test]
+    fn same_tier_is_undecided() {
+        assert_eq!(
+            cmp_pinyin_exact_first(&pinyin_exact(), &pinyin_exact()),
+            Ordering::Equal
+        );
+        assert_eq!(
+            cmp_pinyin_exact_first(&codetable_prefix(), &codetable_prefix()),
+            Ordering::Equal
+        );
+    }
 }
 
 #[cfg(test)]
