@@ -43,6 +43,23 @@ fn manager(dir: &Path, tag: &str, words: &[(&str, &str, i32, u64)]) -> EngineMan
     EngineManager::with_store_override(&cfg, Some(dir), Some(store), Some(root.join("ov")))
 }
 
+/// 同 [`manager`]，但激活**双拼**方案（用户词仍写 `pinyin`——拼音族 data_schema_id 折叠）。
+fn manager_shuangpin(dir: &Path, tag: &str, words: &[(&str, &str, i32, u64)]) -> EngineManager {
+    let root = std::env::temp_dir().join(format!("wind_uw_boundary_{tag}"));
+    let _ = std::fs::remove_dir_all(&root);
+    let _ = std::fs::create_dir_all(&root);
+    let store = Arc::new(Store::open(root.join("user_data.db")).expect("打开 store"));
+    for (code, text, weight, boundary) in words {
+        store
+            .add_user_word("pinyin", code, text, *weight, *boundary)
+            .expect("写入用户词");
+    }
+    let mut cfg = Config::default();
+    cfg.schema.available = vec!["shuangpin".to_string()];
+    cfg.schema.active = "shuangpin".to_string();
+    EngineManager::with_store_override(&cfg, Some(dir), Some(store), Some(root.join("ov")))
+}
+
 /// 返回 (候选位次, boundary, is_promoted_completion)。未命中为 None。
 fn find(mgr: &EngineManager, input: &str, text: &str) -> Option<(usize, u64, bool)> {
     let r = mgr.convert(input, 30);
@@ -162,6 +179,43 @@ fn user_word_abbrev_keeps_full_pinyin_code() {
         .find(|c| c.text == "西安宁")
         .expect("全拼应命中");
     assert_eq!(c2.code, c.code, "简拼与全拼下的 code 必须一致");
+}
+
+/// **双拼下简拼要认原始击键**，不能拿双拼转换后的全拼去判。
+///
+/// 简拼的定义是「每字母取一个音节的声母」，只跟敲下的字母有关、与双拼编码方案无关。
+/// 而 `convert` 里 `input` 会被双拼转换结果覆盖、`query` 由它派生：双拼下打 `xan` 得到的
+/// 是「某音节 + partial 声母」，拿它判简拼永远匹配不到用户实际敲的 `xan`——用户词
+/// 「西安宁」的简拼在双拼下因此完全不可达（真机报的现象）。
+#[test]
+fn shuangpin_abbrev_uses_raw_keystrokes() {
+    let Some(dir) = data_dir() else {
+        eprintln!("跳过：拼音词库不存在");
+        return;
+    };
+    const B: u64 = 0b10101; // xi|an|ning
+    let mgr = manager(&dir, "sp_abbr", &[("xianning", "西安宁", 5000, B)]);
+
+    // 全拼下先确认基线成立
+    assert!(
+        mgr.convert("xan", 30)
+            .candidates
+            .iter()
+            .any(|c| c.text == "西安宁"),
+        "全拼下 xan 应命中（基线）"
+    );
+
+    // 切到双拼：同样敲 xan，走的是双拼转换路径
+    let sp = manager_shuangpin(&dir, "sp_abbr_sp", &[("xianning", "西安宁", 5000, B)]);
+    let hit = sp
+        .convert("xan", 30)
+        .candidates
+        .iter()
+        .any(|c| c.text == "西安宁");
+    assert!(
+        hit,
+        "双拼下 xan 也应命中——简拼判据须用原始击键，不能用双拼转换后的全拼"
+    );
 }
 
 /// **用户长词打 2 个音节即可上浮**——这正是边界接通后才拿得到的行为。

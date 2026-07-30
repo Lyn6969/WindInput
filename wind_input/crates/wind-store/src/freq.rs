@@ -220,7 +220,11 @@ impl Store {
             {
                 let mut t = txn.open_table(FREQ)?;
                 for r in rows {
-                    let key = enc_key(schema, &r.code, &r.text);
+                    // code 列可能带音节空格（导出端与 words/temp_words 同形），而词频表 key
+                    // 是扁平的。**不拆就会写进一条永不匹配任何候选的死键**——查询侧拿的是
+                    // 候选的扁平 code，那条记录再也读不到，用户只会看到「调频不生效」。
+                    let (code, _) = crate::wdict::split_spaced_code(&r.code);
+                    let key = enc_key(schema, &code, &r.text);
                     let merged = match t.get(key.as_str())?.and_then(|g| dec_freq(g.value())) {
                         Some(old) => (old.count.max(r.count), old.last_used.max(r.last_used)),
                         None => (r.count, r.last_used),

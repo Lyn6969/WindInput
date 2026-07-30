@@ -130,6 +130,74 @@ fn boundary_lookup_is_exact_not_inferred() {
     assert_eq!(e.syllable_boundary_of("meiyouzhege", "西安"), 0);
 }
 
+/// **系统词简拼与用户词简拼必须同层**，否则用户词被整层压住、调频也翻不过来。
+///
+/// `cmp_match_layers` 的第一键就是 `is_abbrev`（`false < true`，标记者沉底）。此前
+/// step5 的系统词简拼借 `is_prefix=true` 沉底、step6 的用户词简拼用 `is_abbrev=true`
+/// ——分属两个层级，于是 `dblg` 下用户词「大菠萝哥」永远排在系统词「夺不了冠」之后，
+/// 层级是硬闸门，怎么调频都翻不过来。
+///
+/// 本测试只断言**同层**（都标 `is_abbrev`），不断言谁在前——那由权重与词频决定。
+#[test]
+fn system_and_user_abbrev_share_one_layer() {
+    let dir = std::env::temp_dir().join("wind_abbrev_layer");
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let wdat = dir.join("t.wdat");
+
+    let mut w = WdatWriter::new();
+    // 系统词「夺不了冠」duo|bu|liao|guan → 简拼 dblg
+    w.add_with_boundary(
+        "duobuliaoguan".into(),
+        vec![("夺不了冠".into(), 5000, 0, 0b1000010010001)],
+    );
+    w.add_abbrev("dblg".into(), vec![("duobuliaoguan".into(), 5000)]);
+    w.write(&wdat).unwrap();
+    let dict = CachedDict::load_at(&dir.join("t.dict.yaml"), &wdat).expect("夹具");
+
+    // 用户词「大菠萝哥」da|bo|luo|ge → 简拼同为 dblg
+    let p = std::env::temp_dir().join("wind_abbrev_layer.redb");
+    let _ = std::fs::remove_file(&p);
+    let store = std::sync::Arc::new(wind_store::Store::open(&p).unwrap());
+    store
+        .add_user_word("pinyin", "daboluoge", "大菠萝哥", 500, 0b10010101)
+        .unwrap();
+    let dm = wind_dict::manager::DictManager::new();
+    dm.register_layer(Box::new(wind_dict::StoreUserLayer::new(
+        store.clone(),
+        "pinyin",
+    )));
+
+    let e = PinyinEngine::new(PyConfig::default(), dict).with_store_layers(std::sync::Arc::new(dm));
+    let r = e.convert("dblg", 20).expect("简拼应有结果");
+
+    let sys = r
+        .candidates
+        .iter()
+        .find(|c| c.text == "夺不了冠")
+        .expect("系统词简拼应命中");
+    let usr = r
+        .candidates
+        .iter()
+        .find(|c| c.text == "大菠萝哥")
+        .expect("用户词简拼应命中");
+
+    assert!(
+        sys.is_abbrev,
+        "系统词简拼须标 is_abbrev（此前借的是 is_prefix）"
+    );
+    assert!(usr.is_abbrev, "用户词简拼须标 is_abbrev");
+    assert!(
+        !sys.is_prefix,
+        "简拼不是前缀补全，层级由 is_abbrev 表达，不该再借 is_prefix"
+    );
+    assert_eq!(
+        wind_candidate::cmp_match_layers(sys, usr),
+        std::cmp::Ordering::Equal,
+        "两侧必须同层，否则用户词被整层压住、词频翻不过硬闸门"
+    );
+}
+
 /// 夹具自检：确认走的是 mmap 路径（简拼表只有 mmap 词典才有）。
 /// 若哪天 wdat-only 模式变了、夹具退化成内存词典，简拼恒空、上面几个断言会变得没有意义。
 #[test]

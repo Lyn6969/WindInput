@@ -618,8 +618,19 @@ impl Engine for PinyinEngine {
         };
 
         // Fix A：在任何 shadow 之前保存用户实际输入的原始字符（双拼键序列或全拼）。
-        // 仅用于重建 preedit_display（显示原始按键），不影响候选/消费语义。
+        // 用于重建 preedit_display（显示原始按键），以及简拼判定（见 `abbr_query`）。
         let raw_input = input;
+
+        // 简拼判定与比对的基准串：**原始击键**，不是转换后的全拼。
+        //
+        // 简拼的定义是「每个字母取一个音节的声母」，这件事只跟用户敲下的字母有关，与双拼
+        // 编码方案无关。而下面 `input` 会被双拼转换结果覆盖、`query` 由它派生——双拼下打
+        // `xan` 得到的是「某音节 + partial 声母」，拿它去判简拼永远匹配不到用户实际敲的
+        // `xan`，用户词「西安宁」的简拼在双拼下因此完全不可达。
+        //
+        // 全拼下 `raw_input == query`，故此改动对全拼零影响。简拼串不含 `'`
+        //（`is_abbreviation` 对分隔符判假），故与手动分隔符路径也不冲突。
+        let abbr_query = raw_input;
 
         // 双拼激活时保留 SpConvertResult，以便后续用 map_consumed_length 回算消费键数。
         let sp_result: Option<shuangpin::SpConvertResult> =
@@ -984,8 +995,8 @@ impl Engine for PinyinEngine {
         //    AbbrevSection 存的是**全拼码**（v5），故这里是「查索引拿码 → 走主表装配」两步。
         //    候选因此带上真实的 code 与 boundary：词频记账走 `cand_code` 取候选的 code，
         //    此前设成简拼串 `nh`，同一个词在简拼与全拼下遂走两个互不相认的计数。
-        if self.config.enable_abbrev && AbbrevMatcher::is_abbreviation(query, trie) {
-            for abbr_code in dict.search_abbrev(query, 10) {
+        if self.config.enable_abbrev && AbbrevMatcher::is_abbreviation(abbr_query, trie) {
+            for abbr_code in dict.search_abbrev(abbr_query, 10) {
                 // 用 search_with_boundary 而非 search：拼音引擎直接持有 CachedDict、
                 // 不经 SystemDictLayer，用 search() 会把边界丢在这里（P2b 踩过同款）。
                 for h in dict.search_with_boundary(&abbr_code) {
@@ -995,9 +1006,10 @@ impl Engine for PinyinEngine {
                     // 现/县」一串单字。这是「存词」改「存码」引入的，存词时不会发生。
                     //
                     // boundary=0（无边界信息）放行，与全仓「任一侧为 0 即降级」的约定一致。
-                    if h.boundary != 0 && h.boundary.count_ones() as usize != query.len() {
+                    if h.boundary != 0 && h.boundary.count_ones() as usize != abbr_query.len() {
                         continue;
                     }
+                    let before = candidates.len();
                     push_unique(
                         &mut candidates,
                         h.text,
@@ -1005,12 +1017,21 @@ impl Engine for PinyinEngine {
                         h.weight,
                         999999,
                         false,
-                        // is_prefix=true：码（nihao）比输入（nh）长，结构上属前缀补全，
-                        // 与改前同值——本次只换数据来源，不动排序层级。
-                        true,
+                        // is_prefix=false：简拼不是前缀补全，层级由 is_abbrev 表达（见下）。
+                        false,
                         h.boundary,
                         false,
                     );
+                    // **简拼层标记，必须与 step6 的用户词简拼一致。**
+                    //
+                    // 此前这里借 `is_prefix=true` 沉底，而 step6 用 `is_abbrev=true`——
+                    // 二者在 `cmp_match_layers` 里是**两个不同层级**（`is_abbrev` 是第一键、
+                    // 比前缀层更沉），于是用户词简拼被整层压在系统词简拼之后，怎么调频都
+                    // 翻不过来（层级是硬闸门）：`dblg` 下用户词「大菠萝哥」永远排在系统词
+                    // 「夺不了冠」之后。同层之后两者才能按权重/词频正常竞争。
+                    if candidates.len() > before {
+                        candidates[before].is_abbrev = true;
+                    }
                 }
             }
         }
@@ -1099,12 +1120,14 @@ impl Engine for PinyinEngine {
             // 预建 AbbrevSection——规模小，现算即可（枚举该 schema 下全部用户/临时词，
             // 按各词自带的音节边界取声母比对，见 abbrev_of_code）。natural_order 对齐
             // step5 系统简拼候选，同样排在全拼之后。
-            if self.config.enable_abbrev && AbbrevMatcher::is_abbreviation(query, trie) {
+            if self.config.enable_abbrev && AbbrevMatcher::is_abbreviation(abbr_query, trie) {
                 for mut c in store_dm.search_prefix("", 0) {
                     if c.text.is_empty() || candidates.iter().any(|x| x.text == c.text) {
                         continue;
                     }
-                    if self.abbrev_of_code(&c.code, c.boundary).as_deref() != Some(query) {
+                    // 比对基准是原始击键（见 `abbr_query`）：双拼下 query 已是转换结果，
+                    // 拿它比对永远匹配不上用户敲的简拼。
+                    if self.abbrev_of_code(&c.code, c.boundary).as_deref() != Some(abbr_query) {
                         continue;
                     }
                     c.source = CandidateSource::Pinyin;
@@ -1291,8 +1314,14 @@ impl Engine for PinyinEngine {
             let sp_mask = sp_boundary_mask(r);
             if sp_mask != 0 {
                 let full_len = r.full_pinyin.len();
-                candidates
-                    .retain(|c| boundary_compatible(c.boundary, sp_mask, c.code.len(), full_len));
+                candidates.retain(|c| {
+                    // **简拼候选豁免。** 它的 code 是词的全拼码（`xianning`），与当次击键
+                    // （`xan`）根本不同域，边界比较无意义且必然不符——双拼下打简拼会被整批
+                    // 误杀。原设计里简拼候选 boundary 恒为 0，靠「任一侧为 0 即放行」自然
+                    // 豁免；wdat v5 让简拼改走主表装配、带上了真实边界，那条隐式豁免随之
+                    // 失效，故须显式写出。同理于模糊变体——那边至今仍靠 boundary=0 豁免。
+                    c.is_abbrev || boundary_compatible(c.boundary, sp_mask, c.code.len(), full_len)
+                });
             }
         }
 

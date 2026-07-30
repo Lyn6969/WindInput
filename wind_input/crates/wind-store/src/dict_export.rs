@@ -72,6 +72,29 @@ pub struct DictImportReport {
 }
 
 impl Store {
+    /// 词频记录的导出编码：查用户词 / 临时词表补出音节边界，渲染成带空格的音节码。
+    ///
+    /// 词频表是唯一不带 boundary 的持久层（value 仅 `count + last_used`），边界只能反查。
+    /// **store 层查不到系统词典**（那需要 engine），故系统词的词频记录保持扁平码——
+    /// 设置页列表另有一条经引擎的反查路径（`Coordinator::freq_display_code`）覆盖得更全。
+    ///
+    /// 查不到即原样返回，不猜。
+    fn spaced_freq_code(&self, schema: &str, code: &str, text: &str) -> String {
+        let pick = |recs: Vec<crate::user_words::UserWordRecord>| {
+            recs.into_iter()
+                .find(|w| w.text == text)
+                .map(|w| w.boundary)
+                .filter(|b| *b != 0)
+        };
+        let b = self
+            .get_user_words(schema, code)
+            .ok()
+            .and_then(&pick)
+            .or_else(|| self.get_temp_words(schema, code).ok().and_then(&pick))
+            .unwrap_or(0);
+        crate::wdict::join_code_by_boundary(code, b)
+    }
+
     /// 导出所选数据段为单个多段 wdict 文本。缺数据的段仍会写出（空段），保证文件自描述。
     /// `engine_type` 写入头部供导入时校验（防跨引擎类型误导）；调用方（RPC）解析后传入。
     pub fn export_dict_sections_wdict(
@@ -105,7 +128,12 @@ impl Store {
                     d.freq = Some(
                         rows.into_iter()
                             .map(|(code, text, rec)| FreqIo {
-                                code,
+                                // 与 words / temp_words 两段同形，输出带空格的音节码。
+                                // 词频表自己不存 boundary，只能反查——这里只查得到用户词与
+                                // 临时词（store 层没有系统词典），系统词的记录保持扁平。
+                                // 对功能无影响：导入端会拆回扁平 key，词频表也不存边界；
+                                // 带空格纯为文件可读性与三段格式一致。
+                                code: self.spaced_freq_code(schema, &code, &text),
                                 text,
                                 count: rec.count,
                                 last_used: rec.last_used,
@@ -211,6 +239,54 @@ mod tests {
         let p = std::env::temp_dir().join(name);
         let _ = std::fs::remove_file(&p);
         p
+    }
+
+    /// **freq 段的 code 列也要带音节空格**，与 words / temp_words 两段同形；
+    /// 且导入端必须拆回扁平 key。
+    ///
+    /// 词频表自己不存 boundary，导出时只能反查——store 层查得到用户词与临时词，
+    /// 查不到系统词（那需要 engine），故系统词的词频记录保持扁平，属正常降级。
+    ///
+    /// ⚠️ **导入端拆空格比导出更要紧**：不拆就会写进一条永不匹配任何候选的死键
+    /// （查询侧拿的是候选的扁平 code），用户只会看到「调频不生效」，且毫无痕迹。
+    #[test]
+    fn freq_section_uses_spaced_code_and_imports_flat() {
+        let path = tmp("wind_dict_freq_spaced.redb");
+        let s = Store::open(&path).unwrap();
+        // 用户词提供边界：ni|hao
+        s.add_user_word("pinyin", "nihao", "你好", 500, 0b101)
+            .unwrap();
+        s.record_freq("pinyin", "nihao", "你好").unwrap();
+        // 无处可查边界 → 保持扁平
+        s.record_freq("pinyin", "wubian", "无边").unwrap();
+
+        let text = s
+            .export_dict_sections_wdict("pinyin", &[DictSection::Freq], "t", "pinyin")
+            .unwrap();
+        assert!(
+            text.contains("ni hao\t你好"),
+            "freq 段的 code 应带音节空格，实际:\n{text}"
+        );
+        assert!(
+            text.contains("wubian\t无边"),
+            "查不到边界的记录保持扁平，实际:\n{text}"
+        );
+
+        // 导入到新库：key 必须是扁平的，否则这条记录永远匹配不到候选
+        let p2 = tmp("wind_dict_freq_spaced2.redb");
+        let s2 = Store::open(&p2).unwrap();
+        s2.import_dict_sections_wdict("pinyin", &text, &[DictSection::Freq], false)
+            .unwrap();
+        let (rows, _) = s2.list_freq_paged("pinyin", "", 0, 0).unwrap();
+        let mut codes: Vec<String> = rows.into_iter().map(|(c, _, _)| c).collect();
+        codes.sort();
+        assert_eq!(
+            codes,
+            vec!["nihao".to_string(), "wubian".to_string()],
+            "导入端须把带空格的 code 拆回扁平 key"
+        );
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(&p2);
     }
 
     #[test]
