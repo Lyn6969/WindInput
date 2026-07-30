@@ -5,7 +5,9 @@
 //! - 后台线程每 30s flush 一次；`Drop`（对齐 Go `Close`）停线程并最终 flush；
 //! - 活跃时间：两次上屏间隔 < 15s 视为持续输入，累加秒数（用于速度统计）。
 
-use crate::stats::{CommitSource, DailyStats, StatsMeta, speed_per_minute};
+use crate::stats::{
+    CommitSource, DailyStats, StatsMeta, qualifies_for_max_speed, speed_per_minute,
+};
 use crate::store::Store;
 use chrono::{DateTime, Local, NaiveDate, Timelike};
 use std::sync::{Arc, Condvar, Mutex};
@@ -280,9 +282,14 @@ impl Shared {
             return;
         }
         update_streak(&mut inner.meta, &inner.today_date);
-        let sp = speed_per_minute(inner.today.total(), inner.today.active_seconds);
-        if sp > inner.meta.max_speed {
-            inner.meta.max_speed = sp;
+        // flush 每 30 秒一次，当天开头几次的活跃秒数还是个位数——不设门槛就会把
+        // 外推出来的上千字/分永久写进历史最快（见 qualifies_for_max_speed）。
+        let (total, active) = (inner.today.total(), inner.today.active_seconds);
+        if qualifies_for_max_speed(total, active) {
+            let sp = speed_per_minute(total, active);
+            if sp > inner.meta.max_speed {
+                inner.meta.max_speed = sp;
+            }
         }
         if let Err(e) = self.store.put_stats_meta(&inner.meta) {
             warn!("flush StatsMeta failed: {}", e);

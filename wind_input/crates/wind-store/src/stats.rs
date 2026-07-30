@@ -138,12 +138,31 @@ pub struct StatsSummary {
 }
 
 /// 每分钟字数：活跃时间设 5 秒下限（对齐 Go `SpeedPerMinute`）。
+///
+/// 分母小时结果是**外推值**而非实测速度（`speed_per_minute(252, 6) == 2520`），
+/// 用于展示当日/区间速度尚可（分母通常够大），但绝不可直接拿去刷新历史最快——
+/// 那个是永久记录，见 [`qualifies_for_max_speed`]。
 pub fn speed_per_minute(chars: u32, active_seconds: u32) -> u32 {
     if chars == 0 || active_seconds == 0 {
         return 0;
     }
     let secs = active_seconds.max(5);
     chars.saturating_mul(60) / secs
+}
+
+/// 计入「历史最快」所需的最小活跃时长（秒）。
+const MIN_SPEED_SAMPLE_SECS: u32 = 60;
+/// 计入「历史最快」所需的最小字数。
+const MIN_SPEED_SAMPLE_CHARS: u32 = 100;
+
+/// 该样本是否够格刷新「历史最快」。
+///
+/// 活跃秒数只累加**相邻两次上屏的间隔**，当天第一次上屏不计时（见 `StatCollector::record`），
+/// 于是每天开头必然出现「字数已有几十上百、活跃秒数还是个位数」的窗口；
+/// 此时 `speed_per_minute` 会外推出上千字/分。而 `max_speed` 是永久记录，
+/// 一旦被这种样本污染就再也降不回来（除非重算），故这里要求样本量足够才参与比较。
+pub fn qualifies_for_max_speed(chars: u32, active_seconds: u32) -> bool {
+    active_seconds >= MIN_SPEED_SAMPLE_SECS && chars >= MIN_SPEED_SAMPLE_CHARS
 }
 
 impl Store {
@@ -326,9 +345,13 @@ impl Store {
                 meta.first_day = date.clone();
             }
             meta.total_chars += stat.total() as u64;
-            let sp = speed_per_minute(stat.total(), stat.active_seconds);
-            if sp > meta.max_speed {
-                meta.max_speed = sp;
+            // 样本太小的日子不参与历史最快（见 qualifies_for_max_speed）；
+            // 本函数从零重算，故也是修正历史污染值的入口。
+            if qualifies_for_max_speed(stat.total(), stat.active_seconds) {
+                let sp = speed_per_minute(stat.total(), stat.active_seconds);
+                if sp > meta.max_speed {
+                    meta.max_speed = sp;
+                }
             }
             dates.push(date.clone());
         }
@@ -614,6 +637,28 @@ mod tests {
         assert_eq!(speed_per_minute(100, 0), 0);
     }
 
+    /// 守护：小样本不得刷新「历史最快」。
+    ///
+    /// 上面那几个用例正说明 `speed_per_minute` 在分母小时给的是**外推值**
+    /// （252 字 / 6 秒 → 2520 字每分）。展示当日速度时无妨，写进永久的 max_speed
+    /// 就是污染——现实中表现为「历史最快 1500 字/分」这种不可能的数字。
+    #[test]
+    fn small_samples_never_qualify_for_max_speed() {
+        // 典型污染场景：当天开头，第一次上屏的字不计时间，第二次上屏才攒出几秒。
+        assert!(
+            !qualifies_for_max_speed(125, 5),
+            "125字/5秒 外推 1500，须挡掉"
+        );
+        assert!(!qualifies_for_max_speed(252, 6));
+        // 时长够但字数太少 → 仍不算（几十个字的偶发爆发不代表稳定速度）。
+        assert!(!qualifies_for_max_speed(50, 300));
+        // 字数够但时长太短 → 不算。
+        assert!(!qualifies_for_max_speed(5000, 30));
+        // 两者都够 → 计入。
+        assert!(qualifies_for_max_speed(100, 60));
+        assert!(qualifies_for_max_speed(6000, 600));
+    }
+
     #[test]
     fn test_classify_chars_full() {
         let (zh, en, pu, ot) = classify_chars_full("你好abc，123");
@@ -757,6 +802,39 @@ mod tests {
         assert_eq!(meta.streak_max, 1);
         assert_eq!(meta.streak_last_day, "2026-04-23");
         assert_eq!(meta.max_speed, 300, "300字/60s = 300字/分");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// 重算时同样要挡掉小样本，且它是**修正历史污染值的入口**：
+    /// 之前写进去的虚高 max_speed，重算一次即可回落到真实值。
+    #[test]
+    fn recalculate_ignores_small_samples_for_max_speed() {
+        let path = std::env::temp_dir().join("wind_recalc_speed_test.redb");
+        let _ = std::fs::remove_file(&path);
+        let s = Store::open(&path).unwrap();
+
+        // 一天正常（240字/120秒 = 120字/分），一天是"开头窗口"式的小样本
+        // （125字/5秒，外推 1500 字/分）。
+        for (date, total, active) in [("2026-04-21", 240u32, 120u32), ("2026-04-22", 125, 5)] {
+            let stat = DailyStats {
+                chinese: total,
+                active_seconds: active,
+                ..Default::default()
+            };
+            s.put_daily_stat(date, &stat).unwrap();
+        }
+        // 先人为写入被污染的历史值，模拟旧版本留下的数据。
+        s.put_stats_meta(&StatsMeta {
+            max_speed: 1500,
+            ..Default::default()
+        })
+        .unwrap();
+
+        let meta = s.recalculate_stats_meta().unwrap();
+        assert_eq!(
+            meta.max_speed, 120,
+            "小样本那天应被忽略，且旧的污染值 1500 被重算覆盖"
+        );
         let _ = std::fs::remove_file(&path);
     }
 }

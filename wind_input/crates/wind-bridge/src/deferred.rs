@@ -167,4 +167,108 @@ impl MessageHandler for DeferredHandler {
         // 未就绪时回中文模式（安全默认）；就绪后委派真实处理器读权威模式。
         self.with_handler((true, false), |h| h.get_current_mode(client_token))
     }
+
+    /// TSF 侧英文模式统计上报（CMD_INPUT_STATS）。必须转发——trait 默认实现是空的，
+    /// 不转发则 DLL 明明发了、Coordinator 也实现了，英文统计在生产中仍恒为 0
+    /// （与上方 `handle_key_event_policed` 完全同类的坑）。
+    fn handle_english_stats(&self, chars: u32, digits: u32, puncts: u32, spaces: u32) {
+        self.with_handler((), |h| {
+            h.handle_english_stats(chars, digits, puncts, spaces)
+        })
+    }
+
+    /// compartment 禁用态上报。同上：默认实现为空，不转发则输入诊断永远拿不到数据。
+    fn handle_input_state_report(&self, pid: u32, disabled: bool, reason: u8, mask: u64) {
+        self.with_handler((), |h| {
+            h.handle_input_state_report(pid, disabled, reason, mask)
+        })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Mutex;
+
+    /// 记录被转发到的方法，供转发完整性断言。
+    #[derive(Default)]
+    struct Recorder {
+        calls: Mutex<Vec<&'static str>>,
+    }
+
+    impl Recorder {
+        fn got(&self, name: &'static str) -> bool {
+            self.calls.lock().unwrap().contains(&name)
+        }
+    }
+
+    impl MessageHandler for Recorder {
+        // ── 被测方法：记录是否收到转发 ──
+        fn handle_english_stats(&self, _c: u32, _d: u32, _p: u32, _s: u32) {
+            self.calls.lock().unwrap().push("english_stats");
+        }
+        fn handle_input_state_report(&self, _pid: u32, _dis: bool, _r: u8, _m: u64) {
+            self.calls.lock().unwrap().push("input_state_report");
+        }
+
+        // ── 以下仅为满足 trait 的必需项，本测试不关心 ──
+        fn handle_key_event(&self, _d: &KeyEventData) -> KeyAction {
+            KeyAction::PassThrough
+        }
+        fn handle_focus_gained(&self, _d: &FocusData) -> Option<StatusUpdateData> {
+            None
+        }
+        fn handle_focus_lost(&self, _t: u64, _r: wind_ipc::protocol::FocusLostReason) {}
+        fn handle_ime_activated(&self, _t: u64) -> Option<StatusUpdateData> {
+            None
+        }
+        fn handle_ime_deactivated(&self, _t: u64) {}
+        fn handle_mode_notify(&self, _f: u32) {}
+        fn handle_toggle_mode(&self) -> (Option<StatusUpdateData>, String) {
+            (None, String::new())
+        }
+        fn handle_system_mode_switch(&self, _c: bool) -> (Option<StatusUpdateData>, String) {
+            (None, String::new())
+        }
+        fn handle_menu_command(&self, _c: &str) -> Option<StatusUpdateData> {
+            None
+        }
+        fn handle_composition_terminated(&self) {}
+        fn handle_caret_update(&self, _d: &CaretData) {}
+        fn handle_focus_gained_caret(&self, _d: &CaretData) {}
+        fn handle_caret_pending(&self) {}
+        fn handle_caret_probe(&self, _d: &CaretData) {}
+        fn handle_selection_changed(&self, _p: u16) {}
+        fn handle_commit_request(&self, _d: &CommitRequestData) -> Option<CommitResultData> {
+            None
+        }
+    }
+
+    /// 守护：**纯副作用**方法（返回 `()`、trait 默认实现为空）必须转发到内层处理器。
+    ///
+    /// 这类方法漏转发是**静默**的——不报错、不 panic，只是功能悄悄失效：英文统计恒为 0、
+    /// 输入诊断收不到数据。而单测若直接对 `Coordinator` 调用，会绕过本代理，完全测不出来。
+    /// 历史上 `handle_key_event_policed` 就踩过（上屏统计恒为 0），
+    /// `handle_english_stats` / `handle_input_state_report` 是同一个坑的复发。
+    /// **新增此类方法时请一并在这里登记。**
+    #[test]
+    fn forwards_side_effect_only_methods() {
+        let rec = Arc::new(Recorder::default());
+        let deferred = DeferredHandler::new();
+
+        // 未就绪：静默丢弃、不 panic（启动早期 DLL 可能已在上报）。
+        deferred.handle_english_stats(1, 2, 3, 4);
+        deferred.handle_input_state_report(1, true, 2, 3);
+        assert!(rec.calls.lock().unwrap().is_empty(), "未就绪时不应触达内层");
+
+        deferred.set_ready(rec.clone());
+        deferred.handle_english_stats(5, 0, 0, 0);
+        deferred.handle_input_state_report(42, true, 1, 0xFF);
+
+        assert!(
+            rec.got("english_stats"),
+            "英文统计未转发 → DLL 发了也白发，今日英文恒为 0"
+        );
+        assert!(rec.got("input_state_report"), "输入诊断上报未转发");
+    }
 }
