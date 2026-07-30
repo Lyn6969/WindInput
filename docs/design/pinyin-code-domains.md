@@ -445,4 +445,7 @@ raw 不推进 flat，`xi'anx'hao` 里第三段的位置会整体错位。由此�
 ## 8. 相关文档
 
 - `pinyin-boundary-aware-lattice.md` —— 边界系列主文档，§11 为本文前身
+- `pinyin-mixed-abbrev.md` —— **混合简拼**（`nhao` = `n` 简 + `hao` 全）立项。真机反馈引出的
+  功能缺失：`is_abbreviation` 是全串判据、简拼索引与投影都只认整串，两种混合形态卡在不同
+  环节。含实测判定表、三条方案取舍、以及本文这几轮踩过的五条约束
 - `docs/architecture/engine-candidate-pipeline.md` —— 候选装配全链路
