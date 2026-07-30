@@ -14,6 +14,7 @@
 pub mod dag;
 pub mod fuzzy;
 pub mod generate;
+pub mod interp;
 pub mod lattice;
 pub mod lm;
 pub mod parser;
@@ -297,14 +298,19 @@ impl PinyinEngine {
     /// 拼接为纯音节序列（不含 `'`）。`'` 为硬边界，任何音节不得跨越。
     /// 段内未成音节的残码（partial）不计入（仅用于 completed 音节序列）。
     fn segment_with_separators(&self, input: &str) -> Vec<String> {
-        let mut syllables = Vec::new();
-        for seg in input.split('\'') {
-            if seg.is_empty() {
-                continue;
-            }
-            syllables.extend(Dag::build(seg, &self.trie).maximum_match());
-        }
-        syllables
+        self.spans_with_separators(input)
+            .into_iter()
+            .map(|s| s.pinyin)
+            .collect()
+    }
+
+    /// 同 [`Self::segment_with_separators`]，但保留每个音节在 raw / flat 两域的偏移。
+    ///
+    /// `consumed_length` 要回映射到**含 `'` 的原始输入空间**，需要的正是这些偏移；
+    /// 只拿音节文本的那个版本丢了它们，此前只能靠 `map_consumed_over_separators`
+    /// 逐字节数分隔符补算。两者共用同一次切分，故取 span 版本不多花开销。
+    fn spans_with_separators(&self, input: &str) -> Vec<interp::SylSpan> {
+        interp::spans_for_full_pinyin(input, &self.trie)
     }
 
     /// 由全拼码取简拼（各音节声母拼接），供用户/临时造词层动态简拼匹配。
@@ -441,33 +447,6 @@ fn syllable_span(syllables: &[String], code: &str) -> Option<usize> {
     None
 }
 
-/// 把「剥除分隔符 `'` 后的 query 空间」消费字节数回映射到「含 `'` 的原始输入空间」字节数。
-/// 引擎按剥除 `'` 的 query 计算 consumed_length，而协调器按含 `'` 的原始缓冲切片提交，
-/// 二者失配会致分隔符后残留尾字符（xi'an 选「西安」残 "n"、两步流残 "'an"）。此函数补偿
-/// `'` 偏移，使 consumed_length 语义统一为「原始输入空间」（与双拼 map_consumed_length 同域）。
-///
-/// 规则：消费边界紧跟分隔符时，`'` 归入已消费侧（两步流残留 "an" 而非 "'an"）；连续 `''` 一并
-/// 吸收。无 `'` 输入时恒等（零回归）。`'` 与拼音键均为 ASCII，按字节处理安全。
-fn map_consumed_over_separators(input: &str, fp_consumed: usize) -> usize {
-    if fp_consumed == 0 {
-        return 0;
-    }
-    let bytes = input.as_bytes();
-    let mut non_sep = 0usize; // 已跨过的非分隔符字节数（query 空间计数）
-    let mut i = 0usize;
-    while i < bytes.len() && non_sep < fp_consumed {
-        if bytes[i] != b'\'' {
-            non_sep += 1;
-        }
-        i += 1;
-    }
-    // 消费边界紧跟的分隔符并入已消费侧（连续 `''` 一并吸收），使已消费段带走其后的手动边界。
-    while i < bytes.len() && bytes[i] == b'\'' {
-        i += 1;
-    }
-    i
-}
-
 /// 词典查询命中（含音节边界），供 `lookup_with_fuzzy` 返回。
 struct LookupHit {
     text: String,
@@ -525,7 +504,7 @@ fn syllables_boundary_mask(syllables: &[String], limit_len: usize) -> u64 {
 /// `full_pinyin` 后交给 DAG 重猜。
 ///
 /// **回写段也算一个段起点**。`convert` 拼不出合法音节时会把两个键原样写进 full
-/// （注释所谓「简拼/无效键对」）且不产生 `ConvertedSyllable`——但它照样**占据 full 的一段**、
+/// （注释所谓「简拼/无效键对」）且不产生 `SylSpan`——但它照样**占据 full 的一段**、
 /// 用户也确实是当一个单元敲的，故它的起点同样是真值。曾以为这类段"无从表达"而让整个
 /// mask 作废（返回 0 = 不校验），结果 `nihaoya` 的「你好呀」从 step4 前缀补全漏网：
 /// 校验一关，全拼命中就畅通无阻。给回写段标上起点后，`ni|ha|oy…` = {0,2,4} 与词典的
@@ -592,7 +571,7 @@ fn boundary_compatible(cand_boundary: u64, sp_mask: u64, code_len: usize, full_l
 
 /// Fix A：用双拼原始按键重建 preedit（按音节边界以 `'` 分隔）。
 ///
-/// **必须完整覆盖 `raw_input` 的每个字节**：已完成音节取其 `[sp_start, sp_end)`，音节之间与尾部
+/// **必须完整覆盖 `raw_input` 的每个字节**：已完成音节取其 `[raw_start, raw_end)`，音节之间与尾部
 /// 未被任何音节覆盖的字节原样作独立段。不可只在 `has_partial` 时补尾——无匹配键对（`convert`
 /// 的 else 分支「原样回写」，如首道双拼的 `om`）既不进 `syllables` 也不置 `has_partial`，
 /// 早期实现据此判尾会把它们静默吞掉：`nihaom` → `ni'ha`（om 消失）、再按 `a` 又诡异复现。
@@ -605,11 +584,11 @@ fn build_raw_preedit(raw_input: &str, sp: &shuangpin::SpConvertResult) -> String
     let mut cursor = 0usize;
     for s in &sp.syllables {
         // 音节之前未被覆盖的字节：无匹配键对的原样回写段。
-        if s.sp_start > cursor {
-            segments.push(&raw_input[cursor..s.sp_start]);
+        if s.raw_start > cursor {
+            segments.push(&raw_input[cursor..s.raw_start]);
         }
-        segments.push(&raw_input[s.sp_start..s.sp_end]);
-        cursor = s.sp_end;
+        segments.push(&raw_input[s.raw_start..s.raw_end]);
+        cursor = s.raw_end;
     }
     // 尾部剩余：partial 尾键 或 无匹配回写段。
     if cursor < raw_input.len() {
@@ -719,7 +698,7 @@ impl Engine for PinyinEngine {
         // 双拼激活：取**从 0 起连续覆盖**的音节前缀，遇断裂即止。
         //
         // 断裂 = 「无匹配键对原样回写」段（convert 的 else 分支，如 `oy`——o 非声母、拼不出
-        // 音节）。它没有 ConvertedSyllable，其后音节的 fp 偏移也已被它污染，故断裂处之后
+        // 音节）。它没有 SylSpan，其后音节的 fp 偏移也已被它污染，故断裂处之后
         // **不解释**：那本就是用户打错的键，不该产生候选。
         //
         // 不可整串退回 DAG——那等于「打错一个键对反而解锁全拼」，与 nihao(5键) 不出「你好」
@@ -743,10 +722,17 @@ impl Engine for PinyinEngine {
         // 词图必须照单全收，绝不可让 DAG 重猜。全拼则相反：切分是猜的，词图应看到**全部**
         // 候选切法（见 lattice::LatticeBuilder::build）。
         let fixed_segmentation = sp_syllables.is_some() || has_sep;
+        // 带分隔符时保留 span 序列：下方 consumed_length 要靠它回映射到含 `'` 的原始空间，
+        // 与双拼的 map_consumed_length 共用同一套 SylSpan 表示（见 interp 模块文档）。
+        let sep_spans = if has_sep {
+            self.spans_with_separators(input)
+        } else {
+            Vec::new()
+        };
         let syllables = if let Some(v) = sp_syllables {
             v
         } else if has_sep {
-            self.segment_with_separators(input)
+            sep_spans.iter().map(|s| s.pinyin.clone()).collect()
         } else {
             Dag::build(input, trie).maximum_match()
         };
@@ -1333,7 +1319,8 @@ impl Engine for PinyinEngine {
                 Some(r) => r.map_consumed_length(fp_consumed),
                 // 全拼含手动分隔符：query 是剥除 `'` 的串，需回映射到含 `'` 的原始输入空间，
                 // 否则协调器按含 `'` 缓冲切片时会残留尾字符（xi'an 选「西安」残 "n"）。
-                None if has_sep => map_consumed_over_separators(input, fp_consumed),
+                // 与双拼分支同一套 SylSpan 表示，只是 span 来源不同（切分 vs 双拼转换）。
+                None if has_sep => interp::map_fp_to_raw(&sep_spans, fp_consumed, input),
                 None => fp_consumed,
             };
         }
@@ -1881,27 +1868,6 @@ mod tests {
 
     /// C1：query→原始输入空间的 consumed 回映射。无 `'` 恒等；边界紧跟 `'` 归入已消费侧；
     /// 连续 `''` 一并吸收；越过分隔符时正确计数；nih'ao 段内残码边界不 panic。
-    #[test]
-    fn map_consumed_over_separators_cases() {
-        use super::map_consumed_over_separators as m;
-        // 无分隔符：恒等（零回归红线）
-        assert_eq!(m("nihao", 0), 0);
-        assert_eq!(m("nihao", 2), 2);
-        assert_eq!(m("nihao", 5), 5);
-        // xi'an：西安 code="xian" 消费 query 4 → 含 ' 的原始空间 5（全消费）
-        assert_eq!(m("xi'an", 4), 5);
-        // xi'an：西 code="xi" 消费 query 2 → 边界紧跟 ' 归入已消费侧 → 3（残留 "an" 而非 "'an"）
-        assert_eq!(m("xi'an", 2), 3);
-        // 连续 '' 一并吸收：ni''hao 消费 "ni"(2) → 吃掉两个 ' → 4（残留 "hao"）
-        assert_eq!(m("ni''hao", 2), 4);
-        // 末尾 '：ni' 全消费 query 2 → 吸收尾部 ' → 3
-        assert_eq!(m("ni'", 2), 3);
-        // nih'ao：段内残码 h 不成音节；消费 "ni"(2) 时 h 非分隔符不吸收 → 2，残留 "h'ao"（不 panic）
-        assert_eq!(m("nih'ao", 2), 2);
-        // nih'ao 全 query 消费 5 → 覆盖到末尾 6
-        assert_eq!(m("nih'ao", 5), 6);
-    }
-
     /// Task 1.4 TDD：with_fuzzy builder 注入的配置应被引擎持有（探针验证）。
     #[test]
     fn engine_applies_fuzzy_config() {
@@ -1982,11 +1948,11 @@ mod tests {
     /// 双拼分段边界：音节、尾部 partial、**以及无匹配键对回写段**，各开一个段起点。
     #[test]
     fn sp_boundary_mask_rules() {
-        use crate::pinyin::shuangpin::{ConvertedSyllable, SpConvertResult};
-        let syl = |p: &str, fs, fe| ConvertedSyllable {
+        use crate::pinyin::shuangpin::{SpConvertResult, SylSpan};
+        let syl = |p: &str, fs, fe| SylSpan {
             pinyin: p.to_string(),
-            sp_start: 0,
-            sp_end: 0,
+            raw_start: 0,
+            raw_end: 0,
             fp_start: fs,
             fp_end: fe,
         };
@@ -2054,11 +2020,11 @@ mod tests {
     /// 真机现象（首道双拼）：nihaom → 显示 niha（om 消失），再按 a → ni'ha'oma 又复现。
     #[test]
     fn build_raw_preedit_covers_unmatched_pairs() {
-        use crate::pinyin::shuangpin::{ConvertedSyllable, SpConvertResult};
-        let syl = |sp_start, sp_end| ConvertedSyllable {
+        use crate::pinyin::shuangpin::{SpConvertResult, SylSpan};
+        let syl = |raw_start, raw_end| SylSpan {
             pinyin: String::new(), // build_raw_preedit 只用 sp 区间切原始串，不读 pinyin
-            sp_start,
-            sp_end,
+            raw_start,
+            raw_end,
             fp_start: 0,
             fp_end: 0,
         };
@@ -2259,7 +2225,7 @@ mod tests {
         );
     }
 
-    /// 无匹配键对**原样回写**进 full_pinyin（不产 ConvertedSyllable），输入不被吞——
+    /// 无匹配键对**原样回写**进 full_pinyin（不产 SylSpan），输入不被吞——
     /// 这是简拼兜底的前提：AbbrevMatcher 走 `query`（即 full_pinyin），**不看音节切分**，
     /// 故双拼真值切分不影响它。
     ///
@@ -2276,7 +2242,7 @@ mod tests {
         let sp = conv.convert("oy");
         assert!(
             sp.syllables.is_empty(),
-            "oy 拼不出音节，不该产出 ConvertedSyllable，实际 {:?}",
+            "oy 拼不出音节，不该产出 SylSpan，实际 {:?}",
             sp.syllables.iter().map(|s| &s.pinyin).collect::<Vec<_>>()
         );
         assert_eq!(sp.full_pinyin, "oy", "无匹配键对须原样回写，输入不得被吞");

@@ -136,20 +136,12 @@ impl Layout {
 
 use crate::pinyin::syllable::SyllableTrie;
 
-/// 一个转换后的音节（对齐 Go ConvertedSyllable）。
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ConvertedSyllable {
-    /// 全拼文本（如 "hao"）
-    pub pinyin: String,
-    /// 在双拼原始输入中的起始位置
-    pub sp_start: usize,
-    /// 在双拼原始输入中的结束位置（不包含）
-    pub sp_end: usize,
-    /// 在全拼输出中的起始位置
-    pub fp_start: usize,
-    /// 在全拼输出中的结束位置（不包含）
-    pub fp_end: usize,
-}
+/// 一个转换后的音节。
+///
+/// 原为本模块私有的 `ConvertedSyllable`（字段名 `sp_*` = shuangpin），现已提升为通用的
+/// [`SylSpan`]——raw↔flat 的往返需求遍布全拼、分隔符、简拼各条路径，不是双拼专属。
+/// 见 `super::interp` 的模块文档。
+pub use super::interp::SylSpan;
 
 /// 双拼→全拼转换结果（对齐 Go ConvertResult）。
 #[derive(Debug, Clone, Default)]
@@ -158,7 +150,7 @@ pub struct SpConvertResult {
     /// 与 Go FullPinyin 一致：包含无匹配键对的原样回写，以及尾部 partial 声母前缀。
     pub full_pinyin: String,
     /// 已完成（或原样回写）的音节列表。
-    pub syllables: Vec<ConvertedSyllable>,
+    pub syllables: Vec<SylSpan>,
     /// 未配对的最后一个键解析出的声母（无则 None）。
     pub partial_initial: Option<String>,
     /// 未配对的原始按键（无则 None）。
@@ -188,7 +180,7 @@ impl SpConvertResult {
         for s in &self.syllables {
             fp_end += s.pinyin.len();
             if fp_end >= fp_consumed {
-                return s.sp_end;
+                return s.raw_end;
             }
         }
         // Fallback：使用位置映射表（覆盖 partial、无效键对/简拼等场景）。
@@ -396,10 +388,10 @@ impl ShuangpinConverter {
                 full.push_str(&best);
 
                 let best_len = best.len();
-                result.syllables.push(ConvertedSyllable {
+                result.syllables.push(SylSpan {
                     pinyin: best,
-                    sp_start: i,
-                    sp_end: i + 2,
+                    raw_start: i,
+                    raw_end: i + 2,
                     fp_start: fp_pos,
                     fp_end: fp_pos + best_len,
                 });
@@ -739,8 +731,8 @@ mod converter_tests {
         assert_eq!(r.syllables.len(), 2);
         assert_eq!(r.syllables[0].pinyin, "ni");
         assert_eq!(r.syllables[1].pinyin, "hao");
-        assert_eq!((r.syllables[0].sp_start, r.syllables[0].sp_end), (0, 2));
-        assert_eq!((r.syllables[1].sp_start, r.syllables[1].sp_end), (2, 4));
+        assert_eq!((r.syllables[0].raw_start, r.syllables[0].raw_end), (0, 2));
+        assert_eq!((r.syllables[1].raw_start, r.syllables[1].raw_end), (2, 4));
     }
 
     // --- TestXiaoheZhChSh ---
@@ -980,7 +972,7 @@ mod converter_tests {
         assert_eq!(r.full_pinyin(), "ning", "mspy: n; 应转换为 ning");
         assert_eq!(r.syllables.len(), 1, "应有 1 个音节");
         assert_eq!(r.syllables[0].pinyin, "ning");
-        assert_eq!((r.syllables[0].sp_start, r.syllables[0].sp_end), (0, 2));
+        assert_eq!((r.syllables[0].raw_start, r.syllables[0].raw_end), (0, 2));
 
         // 多音节：n; + ni → ning + ni（第二对是普通双拼）
         let r2 = c.convert("n;ni");
