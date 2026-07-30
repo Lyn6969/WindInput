@@ -175,4 +175,9 @@ pub struct RvViews {
     pub toolbar_button_width: Option<Dim>,
     pub toolbar_button_padding: Option<Dim>,
     pub toolbar_button_radius: Option<Dim>,
+    /// 工具栏整体背景色 / 边框色（[toolbar] background、border.color）。
+    /// ToolbarViews 不是 ViewNode（自带 background/border 字段），故不走 RvNode，
+    /// 这里只提取两个色；背景图/渐变待补。None=未配，渲染层回退 toolbar_* token。
+    pub toolbar_bg_color: Option<Rgba>,
+    pub toolbar_border_color: Option<Rgba>,
 }

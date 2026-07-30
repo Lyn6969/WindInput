@@ -262,8 +262,19 @@ impl StatusTip {
     /// 应用主题（状态气泡底色/文字色 + 位图背景/层）。
     pub fn set_theme(&mut self, theme: &wind_theme::Resolved) {
         self.theme = Some(theme.clone());
+        // 先取 palette 兜底，再让 status 节点覆盖。节点色在 resolve 阶段已是
+        // 「主题显式值 ⊕ palette 默认」的合成结果（build(n, tk("status_bg"), …)），
+        // 与候选窗/菜单保持同一套优先级；节点缺席才落回 token。
         self.bg = theme.color("status_bg", self.bg);
         self.fg = theme.color("status_text", self.fg);
+        if let Some(node) = &theme.views.status {
+            if let Some(c) = node.bg_color {
+                self.bg = c;
+            }
+            if let Some(c) = node.text_color {
+                self.fg = c;
+            }
+        }
         // 尺寸跟随主题：基准 = behavior.font_size（+ status 节点相对偏移），弃用硬编码。
         let node_off = theme
             .views

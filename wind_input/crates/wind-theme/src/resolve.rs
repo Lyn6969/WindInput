@@ -483,6 +483,12 @@ fn resolve_views(v: &Views, palette: &HashMap<String, Rgba>, is_dark: bool) -> R
         rv.toolbar_button_width = tb.button_width;
         rv.toolbar_button_padding = tb.button_padding;
         rv.toolbar_button_radius = tb.button_radius;
+        // 整体背景色/边框色：主题显式值优先，未配落 toolbar_background / toolbar_border token
+        // （与其它窗口同一套「节点 ⊕ palette」语义）。
+        rv.toolbar_bg_color = resolve_color(tb.background.color.as_ref(), palette, is_dark)
+            .or_else(|| tk("toolbar_background"));
+        rv.toolbar_border_color = resolve_color(tb.border.color.as_ref(), palette, is_dark)
+            .or_else(|| tk("toolbar_border"));
     }
 
     rv
@@ -630,6 +636,41 @@ radius = 6
         assert_eq!(disabled.text_color, Some([0x55, 0x55, 0x55, 255]));
         let sep = r.views.menu_separator.as_ref().expect("menu_separator");
         assert_eq!(sep.bg_color, Some([0x66, 0x66, 0x66, 255]));
+    }
+
+    /// 工具栏整体背景色/边框色：节点优先，未配回退 toolbar_* token。
+    #[test]
+    fn test_toolbar_node_colors_override_palette() {
+        let text = "\
+[colors]
+toolbar_background = \"#111111\"
+toolbar_border = \"#222222\"
+
+[toolbar]
+background = \"#AA0000\"
+border = { color = \"#BB0000\" }
+";
+        let value: toml::Value = toml::from_str(text).unwrap();
+        let normalized = crate::normalize::normalize_theme(value);
+        let theme: Theme = normalized.try_into().unwrap();
+        let r = resolve(&theme, false, &[data_dir()]);
+        assert_eq!(r.views.toolbar_bg_color, Some([0xAA, 0, 0, 255]));
+        assert_eq!(r.views.toolbar_border_color, Some([0xBB, 0, 0, 255]));
+
+        // 未配节点色 → 回退 token
+        let text2 = "\
+[colors]
+toolbar_background = \"#111111\"
+toolbar_border = \"#222222\"
+
+[toolbar]
+height = 30
+";
+        let v2: toml::Value = toml::from_str(text2).unwrap();
+        let t2: Theme = crate::normalize::normalize_theme(v2).try_into().unwrap();
+        let r2 = resolve(&t2, false, &[data_dir()]);
+        assert_eq!(r2.views.toolbar_bg_color, Some([0x11, 0x11, 0x11, 255]));
+        assert_eq!(r2.views.toolbar_border_color, Some([0x22, 0x22, 0x22, 255]));
     }
 
     #[test]

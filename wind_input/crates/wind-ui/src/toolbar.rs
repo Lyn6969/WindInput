@@ -168,6 +168,8 @@ impl Toolbar {
 
     /// 应用主题（工具栏各色，跟随语义）。
     pub fn set_theme(&mut self, theme: &wind_theme::Resolved) {
+        // 背景色/边框色：[toolbar] 节点值优先（resolve 已合成 palette 默认），
+        // 未配才落回 token —— 与其它窗口一致。
         self.bg = theme.color("toolbar_background", self.bg);
         self.fg = theme.color("toolbar_full_width_off_text", self.fg);
         self.hl_bg = theme.color("toolbar_mode_chinese_bg", self.hl_bg);
@@ -183,6 +185,13 @@ impl Toolbar {
         self.tb_button_width = v.toolbar_button_width;
         self.tb_button_padding = v.toolbar_button_padding;
         self.tb_button_radius = v.toolbar_button_radius;
+        // [toolbar] 节点色覆盖上面的 token 兜底。
+        if let Some(c) = v.toolbar_bg_color {
+            self.bg = c;
+        }
+        if let Some(c) = v.toolbar_border_color {
+            self.sep = c;
+        }
     }
 
     /// 配置自动隐藏（启动/配置重载时经 SetToolbarAutoHide 下发）。

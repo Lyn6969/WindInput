@@ -73,6 +73,8 @@ pub struct Toast {
     layers: Vec<ViewLayer>,
     shadow: Option<crate::view::SoftShadow>,
     radius: Option<f32>,
+    /// 主题配的边框（色, 宽 dp）。None=未配，回退按提示等级取色的内置默认。
+    border: Option<([u8; 4], Option<f32>)>,
     theme: Option<wind_theme::Resolved>,
     /// 基准字号（逻辑像素）：跟随主题 behavior.font_size（+ toast 节点偏移）。
     base_logical: f32,
@@ -96,6 +98,7 @@ impl Toast {
             layers: Vec::new(),
             shadow: None,
             radius: None,
+            border: None,
             theme: None,
             base_logical: Self::DEFAULT_FONT_PX,
         })
@@ -129,10 +132,23 @@ impl Toast {
                 s,
             );
             self.radius = node.border_radius.map(|d| d.resolve(s, 0.0));
+            // 底色/文字色/边框改由节点覆盖 palette 兜底（节点色已在 resolve 阶段
+            // 合成 toast_bg / toast_text 默认）。边框此前是 accent + 2px 字面量，
+            // 主题写什么都没用，现在未配才回退到那套按等级取色的默认。
+            if let Some(c) = node.bg_color {
+                self.bg = c;
+            }
+            if let Some(c) = node.text_color {
+                self.fg = c;
+            }
+            self.border = node
+                .border_color
+                .map(|c| (c, node.border_width.map(|d| d.resolve(s, 0.0))));
         } else {
             self.bg_image = None;
             self.layers = Vec::new();
             self.shadow = None;
+            self.border = None;
             self.radius = None;
         }
     }
@@ -147,12 +163,17 @@ impl Toast {
         let s = self.scale;
         // 深色圆角底 + 居中文本；类型用边框色区分（稳健、跨主题可见）。
         let label = View::leaf(text, self.fg).text_align(Align::Center);
+        // 边框：主题 toast.border 优先；未配沿用「按提示等级取色 + 2dp」的内置默认。
+        let (border_color, border_width) = match self.border {
+            Some((c, w)) => (c, w.unwrap_or(2.0 * s).max(1.0)),
+            None => (kind.accent(), (2.0 * s).max(1.0)),
+        };
         let mut card = View::container(Layout::Row)
             .cross(Align::Center)
             .bg(self.bg)
             .pad(Edges::xy(14.0 * s, 10.0 * s))
             .child(label)
-            .border(kind.accent(), (2.0 * s).max(1.0));
+            .border(border_color, border_width);
         card.corner_radius = self.radius.unwrap_or(6.0 * s);
         if let Some(img) = &self.bg_image {
             card = card.bg_image(img.clone());

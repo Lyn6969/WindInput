@@ -1371,6 +1371,18 @@ impl CandidateWindow {
                 .unwrap_or(0.0);
             Some((color, width, radius))
         };
+        // 有效背景色：状态 patch ?? 基态。与 eff_border 同构。
+        // 独立于 patch_bg（那个只看状态、且带硬兜底），用于「基态也要能配底色」的节点。
+        let eff_bg = |node: &RvNode, sel: bool, hov: bool| -> Option<[u8; 4]> {
+            let st = if sel {
+                node.selected.as_deref()
+            } else if hov {
+                node.hover.as_deref()
+            } else {
+                None
+            };
+            st.and_then(|n| n.bg_color).or(node.bg_color)
+        };
 
         let mut root = View::container(Layout::Column)
             .bg(col(v.window.bg_color, [255, 255, 255, 255]))
@@ -1670,6 +1682,17 @@ impl CandidateWindow {
                 .font_family(v.text.font_family.clone())
                 .pad(edges_or(&v.text.padding, [0.0; 4]))
                 .margin(text_margin);
+            // 文字叶子的背景（底色/图/渐变）：此前只画边框，配了背景一律不生效，
+            // 「文字药丸」这类样式做不出来。圆角由下面的 eff_border 一并给。
+            if let Some(c) = eff_bg(&v.text, is_sel, is_hover) {
+                tleaf = tleaf.bg(c);
+            }
+            if let Some(vi) = self.rv_image(v.text.bg_image.as_ref()) {
+                tleaf = tleaf.bg_image(vi);
+            }
+            if let Some(g) = self.rv_gradient(v.text.bg_gradient.as_ref()) {
+                tleaf = tleaf.bg_gradient(g);
+            }
             if let Some((bc, bw, br)) = eff_border(&v.text, is_sel, is_hover) {
                 tleaf = tleaf.border(bc, bw).radius(br);
             }
@@ -1683,10 +1706,25 @@ impl CandidateWindow {
                     .font_family(v.comment.font_family.clone())
                     .pad(edges_or(&v.comment.padding, [0.0; 4]))
                     .margin(edges_or(&v.comment.margin, [0.0, 0.0, 0.0, 6.0]));
+                // 注释叶子背景同 text（「注释气泡」样式）。
+                if let Some(c) = eff_bg(&v.comment, is_sel, is_hover) {
+                    cleaf = cleaf.bg(c);
+                }
+                if let Some(vi) = self.rv_image(v.comment.bg_image.as_ref()) {
+                    cleaf = cleaf.bg_image(vi);
+                }
+                if let Some(g) = self.rv_gradient(v.comment.bg_gradient.as_ref()) {
+                    cleaf = cleaf.bg_gradient(g);
+                }
                 if let Some((bc, bw, br)) = eff_border(&v.comment, is_sel, is_hover) {
                     cleaf = cleaf.border(bc, bw).radius(br);
                 }
                 item = item.child(cleaf);
+            }
+            // 候选项基态底色：此前只在选中/悬停时调 .bg()，`[item] background = "…"` 从不生效，
+            // 而同级的背景图/渐变基态是读的（见下），三者本该同级。选中/悬停底色随后覆盖。
+            if let Some(c) = v.item.bg_color {
+                item = item.bg(c);
             }
             // 选中底色优先于悬停底色（两者独立：选中=空格上屏目标，悬停=鼠标提示）
             if is_sel {

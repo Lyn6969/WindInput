@@ -182,9 +182,16 @@ impl Tooltip {
     /// 应用主题（tooltip 底色/文字色 + 位图背景/层）。
     pub fn set_theme(&mut self, theme: &wind_theme::Resolved) {
         self.theme = Some(theme.clone());
+        // palette 兜底 → tooltip 节点覆盖（节点色已在 resolve 阶段合成 palette 默认）。
         self.bg = theme.color("tooltip_bg", BG);
         self.fg = theme.color("tooltip_text", FG);
         if let Some(node) = &theme.views.tooltip {
+            if let Some(c) = node.bg_color {
+                self.bg = c;
+            }
+            if let Some(c) = node.text_color {
+                self.fg = c;
+            }
             let s = self.scale;
             self.bg_image = crate::theme_assets::rv_image(theme, node.bg_image.as_ref());
             self.layers = crate::theme_assets::rv_layers(theme, &node.layers, s);
