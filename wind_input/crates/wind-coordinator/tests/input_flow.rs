@@ -2299,6 +2299,99 @@ fn test_temp_english_digits_still_select_when_symbols_disallowed() {
     }
 }
 
+/// 二三候选键（默认 `;` `'`）在临英下应选中对应候选。
+/// 回归点：临英曾是唯一没接 `select_key_offset` 的模式处理器，`;` 一路落到标点臂被判成
+/// 「上屏高亮候选 + 标点」，用户按次选键实得**首候选被直接上屏**。
+#[test]
+fn test_temp_english_select_keys_pick_candidates() {
+    if !has_schemas() {
+        return;
+    }
+    let mut cfg = config_with("wubi86");
+    // 显式声明键组，使本测试不随默认值漂移（默认亦为 semicolon_quote）。
+    cfg.keys.select_key_groups = vec!["semicolon_quote".into()];
+    let coord = Coordinator::new_headless(cfg, Some(&data_dir()));
+    press_shift_letter(&coord, 'h');
+    press_letter(&coord, 'e');
+    press_letter(&coord, 'l'); // 候选 [Hel, hel, HEL, held, ...]
+    // 前置条件：页内至少 3 项，否则 `gi < end` 不成立，选词分支根本执行不到（假绿）。
+    assert!(
+        coord.debug_all_candidate_texts().len() >= 3,
+        "前置条件：应有 ≥3 个候选，否则测不到二/三选键的选词分支"
+    );
+    match coord.handle_key_event(&key_event(0xBA, EVENT_KEY_DOWN)) {
+        // `;` → 次选 = 第 2 候选（全小写变形）
+        KeyAction::InsertText { text, .. } => assert_eq!(text, "hel"),
+        other => panic!("`;` 应选第 2 候选并上屏，实际: {:?}", other),
+    }
+
+    // 三选键 `'` → 第 3 候选（全大写变形）。复用同一 Coordinator 重新进临英——
+    // 上屏后临英已退出，重打即可。刻意不新建实例：引擎 reader / LRU 跨实例共享且带
+    // 配额语义（见 mmap 共享 reader 的设计），一个测试建多个实例会与并行跑的其他
+    // 测试争用，实测会让无关测试偶发失败。
+    press_shift_letter(&coord, 'h');
+    press_letter(&coord, 'e');
+    press_letter(&coord, 'l');
+    match coord.handle_key_event(&key_event(0xDE, EVENT_KEY_DOWN)) {
+        KeyAction::InsertText { text, .. } => assert_eq!(text, "HEL"),
+        other => panic!("`'` 应选第 3 候选并上屏，实际: {:?}", other),
+    }
+}
+
+/// 对照组一：allow_symbols 开时二三候选键让位于字符输入——该开关的声明语义是
+/// 符号「入缓冲而非上屏退出**或选词**」，与数字臂同构，不能被上面的接线改动破坏。
+#[test]
+fn test_temp_english_select_keys_yield_to_input_when_symbols_allowed() {
+    if !has_schemas() {
+        return;
+    }
+    let mut cfg = config_with("wubi86");
+    cfg.keys.select_key_groups = vec!["semicolon_quote".into()];
+    cfg.input.temp_english.allow_symbols = true;
+    let coord = Coordinator::new_headless(cfg, Some(&data_dir()));
+    press_shift_letter(&coord, 'h');
+    press_letter(&coord, 'e');
+    press_letter(&coord, 'l');
+    assert!(
+        coord.debug_all_candidate_texts().len() >= 3,
+        "前置条件：应有 ≥3 个候选，否则「有候选仍不选词」无从谈起"
+    );
+    let act = press_vk(&coord, 0xBA, false); // `;`
+    assert_eq!(
+        action_text(&act).unwrap(),
+        "Hel;",
+        "allow_symbols 开启时 `;` 应入缓冲而非选第 2 候选"
+    );
+}
+
+/// 对照组二：页内候选不足时 `;` 仍走标点臂（上屏高亮候选 + 标点并退出），
+/// 守住越界语义不被选词接线误伤。`show_candidates` 关 → 候选只剩原文一项。
+#[test]
+fn test_temp_english_select_key_overflow_falls_back_to_punct() {
+    if !has_schemas() {
+        return;
+    }
+    let mut cfg = config_with("wubi86");
+    cfg.keys.select_key_groups = vec!["semicolon_quote".into()];
+    cfg.input.temp_english.show_candidates = false;
+    let coord = Coordinator::new_headless(cfg, Some(&data_dir()));
+    press_shift_letter(&coord, 'h');
+    press_letter(&coord, 'e');
+    press_letter(&coord, 'l');
+    assert_eq!(
+        coord.debug_all_candidate_texts().len(),
+        1,
+        "前置条件：show_candidates 关时应只剩原文候选，次选键才会越界"
+    );
+    let act = press_vk(&coord, 0xBA, false); // `;`
+    let text = action_text(&act).expect("越界时应按标点臂上屏");
+    assert!(
+        text.starts_with("Hel") && text.chars().count() == 4,
+        "越界时应上屏「原文 + 转换后标点」，实际: {:?}",
+        text
+    );
+}
+
 /// space_as_input 开：空格被占作输入字符，回车接过「上屏高亮候选」的职责。
 /// 回归点：该配置下空格不再选词，`allow_symbols` 再开则数字键也让位，若回车仍固定上屏原文，
 /// 就一个选词键都不剩、候选窗形同虚设。

@@ -801,8 +801,29 @@ impl Coordinator {
                 refresh(self, state)
             }
             _ => {
-                // 其它（标点等）：上屏当前高亮候选 + 转换后标点，退出
                 let shift = data.modifiers & MOD_SHIFT != 0;
+                // 二三候选键（默认 `;` `'`）→ 选候选。临英此前是**唯一**没接
+                // `select_key_offset` 的模式处理器（主流程 / 临拼 / 特殊 / mix 都接了），
+                // 于是次选键一路落到下方标点臂，被判成「上屏高亮候选 + 标点」——用户按 `;`
+                // 想选第 2 候选，实得首候选被直接上屏并退出临英。
+                // 与数字臂同构地受 allow_symbols 抑制：该开关的语义是符号/数字「入缓冲，
+                // 而非上屏退出**或选词**」（见 config.toml 该项说明）。
+                // 越界（页内候选不足）不在此处理，落下方标点臂保持既有语义。
+                if !shift
+                    && !self.rt().config.input.temp_english.allow_symbols
+                    && let Some(offset) = self.select_key_offset(data.key_code)
+                {
+                    let (start, end) = self.page_range(state);
+                    let gi = start + offset;
+                    if gi < end {
+                        if let Some(act) = self.temp_english_try_command(state, gi) {
+                            return act;
+                        }
+                        let text = state.candidates[gi].text.clone();
+                        return commit_text(self, state, text);
+                    }
+                }
+                // 其它（标点等）：上屏当前高亮候选 + 转换后标点，退出
                 if let Some(ch) = punct_char(data.key_code, shift) {
                     // allow_symbols：可见符号直接入缓冲累积（如 C++），不上屏退出（对齐 Go）。
                     if self.rt().config.input.temp_english.allow_symbols {
