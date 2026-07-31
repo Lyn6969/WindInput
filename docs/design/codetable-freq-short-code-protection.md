@@ -1,6 +1,6 @@
 # 码表调频：按码长分级的首选保护
 
-> 状态：**主仓已实施**（引擎 + 配置 + 文档 + 测试），设置页 GUI 与真机验证见 §9
+> 状态：**已实施并合并**（主仓引擎/配置/测试 + 设置页 GUI），**真机验证待做**，见 §9
 > 相关：`docs/redesign/frequency.md` §8（`protect_top_n` 原始语义）、
 > `docs/architecture/candidate-sorting-rules.md` §7.3（`rerank_codetable_usedfirst` 在三套排序系统中的位置）
 
@@ -259,87 +259,44 @@ schema/code 域写错、调频开关没开、词频记录没进重排，任一�
 
 ## 9. 实施状态
 
-已完成（主仓，分支 `worktree-codetable-freq-shortcode-protect`）：
+### 已完成
 
-- `ProtectPolicy` + 分级 `resolve` + 精确档过滤（`freq_rerank.rs`）
+**主仓**（`567b2d0` + `148bed0` + `01c20a7`，已合并 main）
+
+- `ProtectPolicy` + 分级 `resolve` + 保护名额只在精确档内取（`freq_rerank.rs`）
 - 配置三处：结构体字段 / 注册表 / `data/config.toml`（`protect_top_n` 出厂 1 → 0）
 - `FreqSettings` 与协调器接线
-- 单测 8 条 + 端到端 3 条；`wind-engine` / `wind-config` / `wind-candidate` / `wind-coordinator`
-  全量绿，clippy 无新增警告
+- 单测 8 条 + 端到端 3 条；`wind-engine` / `wind-config` / `wind-candidate` /
+  `wind-coordinator` 全量绿，clippy 无新增警告，fmt clean
 
-待办：
+**设置页**（`wind-setting` 仓 `4fc1735`）
 
-1. **设置页 GUI**（`wind-setting` 仓）——⚠️ **必须等本分支合并进主仓 main 之后再做**：
-   设置仓通过 path 依赖直接编译主仓**工作区**的 `wind-config`/`wind-rpc`
-   （`Cargo.toml`），而 capability 快照的 `default` 取自
-   `Config::system_preset_value(data_dir)`，即 **REGISTRY 与 `data/config.toml` 两者**，
-   两处都指向主仓工作区。合并前重生成快照拿不到新键，守门测试必红。
+- 原「保护前 N 个词条」一项拆成一简/二简/三简/全码四项，口径写进 hint
+- `capabilities.snapshot.json` 与 `mockdata/config.json` 由 regenerate 命令重生成
+  （**勿手改**），360 测试全绿
 
-   合并后按序执行：
+### 待办
 
-   ① 在 `src/assets/settings_manifest.toml` 的「词频调整」小节，把现有 `protect_top_n`
-   一项替换为下面四项（顺序即渲染顺序，简码位在前）：
+1. **真机验证**：打 `a` / `aa` 反复选次选字后确认首选不变；`aaaa` 位确认调频仍生效。
+   需先 `scripts/dev.ps1` 的 `dm1`/`dm2` 编译 + `pdm1`/`pdm2` 部署（`m1` ≠ `dm1`，
+   产物不同名不同目录）。
+2. 文档站 `../WindInputDocs`：config 参考页 + 用法页两处。
 
-   ```toml
-   [[items]]
-   key = "schema.codetable.frequency.protect_top_n_len1"
-   group = "schema"
-   section = "上屏行为"
-   subsection = "词频调整"
-   type = "number"
-   label = "一简位保护前 N 项"
-   hint = "只输入 1 个编码时（如五笔一简），词典前 N 项不参与调频。一简每个编码通常只有两个字，误选一次就会永久换掉首选，故默认保护"
-   min = 0
-   max = 100
-   enabled_when = "schema.codetable.frequency.enabled == true"
+### ⚠️ 两条对以后同类改动仍成立的约束
 
-   [[items]]
-   key = "schema.codetable.frequency.protect_top_n_len2"
-   group = "schema"
-   section = "上屏行为"
-   subsection = "词频调整"
-   type = "number"
-   label = "二简位保护前 N 项"
-   hint = "输入 2 个编码时，词典前 N 项不参与调频（0 = 不保护）"
-   min = 0
-   max = 100
-   enabled_when = "schema.codetable.frequency.enabled == true"
+**① 设置页只能在主仓改动合并进 main 之后做。** 设置仓通过 path 依赖直接编译主仓**工作区**
+的 `wind-config`/`wind-rpc`，而 capability 快照的 `default` 取自
+`Config::system_preset_value(data_dir)` ＝ **REGISTRY 与 `data/config.toml` 两者**，
+`data_dir` 又硬编码 `../WindInput/data`——**两处都是主仓工作区，不是你的分支**。
+在 worktree 或未合并分支上跑重生成命令，快照里根本不会有新键，而守门测试的报错
+（「清单 key 不在 capability 快照中」）指向 manifest，看不出真因是「core 那边还没这个键」。
 
-   [[items]]
-   key = "schema.codetable.frequency.protect_top_n_len3"
-   group = "schema"
-   section = "上屏行为"
-   subsection = "词频调整"
-   type = "number"
-   label = "三简位保护前 N 项"
-   hint = "输入 3 个编码时，词典前 N 项不参与调频。默认不保护——三简的固定程度弱于一二简"
-   min = 0
-   max = 100
-   enabled_when = "schema.codetable.frequency.enabled == true"
+合并后两条命令即可：
 
-   [[items]]
-   key = "schema.codetable.frequency.protect_top_n"
-   group = "schema"
-   section = "上屏行为"
-   subsection = "词频调整"
-   type = "number"
-   label = "全码位保护前 N 项"
-   hint = "输入 4 个及以上编码时，词典前 N 项不参与调频。默认 0 = 不保护，让调频在全码位正常起作用"
-   min = 0
-   max = 100
-   enabled_when = "schema.codetable.frequency.enabled == true"
-   ```
+```
+cargo test regenerate_capabilities_snapshot -- --ignored
+cargo test regenerate_mock_config -- --ignored
+```
 
-   ② 重生成两份产物（**勿手改**）：
-
-   ```
-   cargo test regenerate_capabilities_snapshot -- --ignored
-   cargo test regenerate_mock_config -- --ignored
-   ```
-
-   ③ `cargo test` 全绿（`manifest_consistent_with_capabilities` 是把关的那道）。
-2. **真机验证**：打 `a` / `aa` 选次选字若干次后确认首选不变；`aaaa` 位确认调频仍生效。
-3. 文档站 `../WindInputDocs`：config 参考页 + 用法页两处。
-
-⚠️ 跑 `cargo test -p wind-coordinator` 会**真写** `%APPDATA%/WindInput/config.toml` 的
-`schema.active`（实测被改成 `pinyin`）。本次已备份/恢复，后续同样要防。
+**② 跑 `cargo test -p wind-coordinator` 会真写 `%APPDATA%/WindInput/config.toml` 的
+`schema.active`**（实测被改成 `pinyin`）。本次两轮测试均先备份后恢复，后续同样要防。
