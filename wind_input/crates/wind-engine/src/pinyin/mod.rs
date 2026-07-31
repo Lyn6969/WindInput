@@ -103,6 +103,13 @@ const COMPLETION_NEAR_SYLLABLES: u32 = 2;
 /// 一半的词低于它，会误沉大量高频使用但低词频的日常词。
 const COMPLETION_FAR_WEIGHT_FLOOR: i32 = 100;
 
+/// 前缀补全的取数上限（见 convert 中 `completion_limit` 处的完整说明）。
+///
+/// 取 1000 是 `push_unique` 的 O(n²) 查重与「单字母可持续翻页」之间的平衡点：
+/// 实测 1000 条约 3.5ms，5000 条则达 54ms。1000 条按每页 9 项可翻 110 页，
+/// 远超实用范围；该上限只约束**补全**，精确匹配候选不受影响。
+const MAX_COMPLETION_CANDIDATES: usize = 1000;
+
 /// 混合简拼查 `AbbrevSection` 时的取码上限（step 5b）。
 ///
 /// 比纯简拼的 10 大一截：纯简拼那边「键即答案」，按权重取前 10 条就是最终候选；混合路径
@@ -1264,7 +1271,21 @@ impl Engine for PinyinEngine {
         // 与本文件其他位置「无边界信息一律降级放行」的处理一致。
         let trailing_partial = completed != query;
         let completed_syls = syllables.len() as u32;
-        for h in dict.search_prefix_with_boundary(query, 30) {
+        // 补全条数**跟随调用方请求量**，并 clamp 到 [30, MAX_COMPLETION_CANDIDATES]。
+        //
+        // 原先写死 30，代价是单字母输入（`b`/`y` 这类不成音节、无精确匹配的码）候选恒为 30 条、
+        // 翻页翻不动。而**那个限制并没有省下成本**：wdat 前缀查询原是「遍历整棵子树 + 堆淘汰」，
+        // 实测 `b` 取 30 条与取 5000 条同为 8~11ms，限制只压低了 String 分配，白白牺牲功能。
+        // wdat v6 改为分支限界后（docs/design/prefix-topk-branch-and-bound.md），取数成本随条数
+        // 而非子树规模增长，放开才真正划算：`b` 现在 300 条只要 0.9ms（改造前 30 条要 8ms）。
+        //
+        // ⚠️ **上限不能去掉**，瓶颈已从词库层转移到本函数的 `push_unique`：它按
+        // `cands.iter().any(|c| c.text == text)` 线性查重，整体是 O(n²)。实测 `b`：
+        // 300 条 0.9ms → 1000 条 3.5ms → 5000 条 **54.5ms**（5 倍数据量、15 倍耗时）。
+        // 治本要把查重换成哈希索引，但 Viterbi 整句走 `insert(0)` 绕过该闭包、后续还有
+        // `retain`，两者都会让哈希集与实际列表失同步，须单独立项处理。
+        let completion_limit = max_candidates.clamp(30, MAX_COMPLETION_CANDIDATES);
+        for h in dict.search_prefix_with_boundary(query, completion_limit) {
             let demote_to_prefix_layer = if trailing_partial {
                 let distance = h.boundary.count_ones().saturating_sub(completed_syls);
                 distance > COMPLETION_NEAR_SYLLABLES && h.weight < COMPLETION_FAR_WEIGHT_FLOOR
@@ -1470,7 +1491,29 @@ impl Engine for PinyinEngine {
                 //   它们描述的是「这条候选相对本次输入处在哪一层」，由已有候选的来源路径决定，
                 //   与用户是否也收录了同一个词无关。
                 if let Some(existing) = candidates.iter_mut().find(|x| x.text == c.text) {
-                    existing.weight = existing.weight.max(c.weight);
+                    // ⚠️ 用户权重的生效条件必须与下面「新增」分支**对称**，否则用户词会借合并
+                    // 路径绕过 `should_promote_user_completion` 与 `promotion_cap`：
+                    //
+                    // 系统前缀补全放开条数后（`completion_limit`），用户词与系统候选同文的概率
+                    // 大增。此处若无条件 `max`，一个**远距离**补全词会被抬到用户权重并留在
+                    // 补全提升层——实测单字母 `s` 配上 w=2e9 的用户词「筛选」，它直接夺走首选，
+                    // 把「是」「上」这些高频单字挤到第 2 位起。补全只取 30 条时该词进不了系统
+                    // 候选、走的是新增分支、被判据正确拦下，于是问题只在放开后显形。
+                    //
+                    // 分层处理，与新增分支一一对应：
+                    // - 精确匹配（`is_prefix=false`）：用户提权全效，这是「加词提权」的本义。
+                    // - 前缀补全：须满足同一个提升判据，且同样受 `promotion_cap` 封顶。
+                    // - 不满足判据的远距离补全：保留系统权重，沉在补全层（不是丢弃）。
+                    if !existing.is_prefix {
+                        existing.weight = existing.weight.max(c.weight);
+                    } else if should_promote_user_completion(
+                        completed_syls,
+                        trailing_partial,
+                        existing.boundary,
+                    ) {
+                        let w = existing.weight.max(c.weight);
+                        existing.weight = promotion_cap.map_or(w, |cap| w.min(cap));
+                    }
                     existing.meta.is_user_dict = true;
                     continue;
                 }
