@@ -91,6 +91,23 @@ fn check_derivable_word(word: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// 加词编码的**展示/交换形态**：扁平 key + boundary → 带音节空格的音节码（`ni hao`）。
+///
+/// 编码有两个域：存储域是「扁平 key + boundary bitmask」（前缀查询的命脉——`nihao` 必须
+/// 被 `niha` 匹配到，带空格的串一旦成了 key 就再也查不出来），展示/交换域是带空格串。
+/// 设置页的词库列表（`webdata::word_item`）与「出码」按钮（`dict.encode`）早已统一到后者，
+/// 唯独加词这三处（候选窗预览 / Ctrl+Enter 转设置页 / Ctrl+Shift+= 直开）此前只传扁平串，
+/// 于是同一个加词窗里预填显示 `nihao`、用户点一下「出码」却变成 `ni hao`，自相矛盾。
+///
+/// 回写方向由设置端 `webdata::normalize_add_code` 兜住：带空格的码提交回来会被拆回扁平
+/// key，且串里的空格**被当作显式声明的切分直接采信**，比「手输码 == 推导码才借用边界」的
+/// 兜底更准。命令行参数侧亦已就绪——`build_settings_args` 对含空白的值加引号。
+///
+/// 码表码 boundary 恒 0 → 原样返回，本函数对非拼音方案是恒等变换。
+fn display_code(code: &str, boundary: u64) -> String {
+    wind_store::wdict::join_code_by_boundary(code, boundary)
+}
+
 /// toast 回显用的词截断（按字符，超出加省略号）。词本身最长受 [`ADD_WORD_MAX_LEN`] 约束，
 /// 但显式 code 路径不限长，故回显仍需兜底，避免 toast 被撑爆。
 fn toast_clamp(word: &str) -> String {
@@ -522,6 +539,15 @@ impl Coordinator {
         }
     }
 
+    /// 当前加词编码的**展示形态**（带音节空格），候选窗预览与设置端预填共用。
+    ///
+    /// `add_word_code` 是扁平 key、`add_word_boundary` 是它的音节切分，二者必须**成对**读出
+    /// 才还原得出 `ni hao`。此前两个调用点都只读了前者，boundary 字段一直在 State 里躺着
+    /// 没人用——收口到这里，避免再出现「只读一半」。见 [`display_code`]。
+    fn add_word_display_code(&self, state: &State) -> String {
+        display_code(&state.add_word_code, state.add_word_boundary)
+    }
+
     /// 取当前选取的词（字符池末尾 `add_word_len` 个字符）。
     fn add_word_current_word(&self, state: &State) -> String {
         let n = state.add_word_chars.len();
@@ -674,7 +700,8 @@ impl Coordinator {
         {
             (
                 self.add_word_current_word(state),
-                state.add_word_code.clone(),
+                // 同 `open_add_word_from_history`：转交设置端用展示形态（带音节空格）。
+                self.add_word_display_code(state),
             )
         } else {
             (String::new(), String::new())
@@ -693,12 +720,13 @@ impl Coordinator {
         self.notify_ui_hide();
 
         let chars = self.add_word_recent_chars(ADD_WORD_MAX_LEN);
-        // 设置端对话框只展示/回填扁平 code（参数串无边界表达），故此处丢弃 boundary。
         let (word, code) = if chars.len() >= ADD_WORD_MIN_LEN {
             let len = ADD_WORD_DEFAULT_LEN.min(chars.len());
             let word: String = chars[chars.len() - len..].iter().collect();
-            let (code, _boundary) = self.calc_add_word_code(&word);
-            (word, code)
+            let (code, boundary) = self.calc_add_word_code(&word);
+            // 预填给设置端的是**展示形态**（带音节空格）：与该窗「出码」按钮及词库列表同形，
+            // 回写时由 normalize_add_code 拆回扁平 key。见 [`display_code`]。
+            (word, display_code(&code, boundary))
         } else {
             (String::new(), String::new())
         };
@@ -742,13 +770,44 @@ impl Coordinator {
             .map(|t| t == "pinyin")
             .unwrap_or(false);
         if is_pinyin {
+            // 含非汉字 → 不取码，让加词中止（界面显示「无法计算编码」）。
+            //
+            // 拼音码来自读音，而非汉字没有读音：`gen_pinyin` 的 `filter_map` 会**静默跳过**
+            // 它们，「你好a」产出 `ni hao`——一个覆盖不全的码，打 `nihao` 出「你好a」。
+            // 悄悄丢字入库比直接拒绝更糟：用户不知道自己加了什么，词库还多一条对不上的记录
+            // （同 `sanitize_dict_add_text` 的取向）。这也补上了一处不一致——纯英文「abc」
+            // 取码本就为空、早已中止，只有**混合**的情况从这里漏了过去。
+            //
+            // 守卫**只作用于拼音**：码表方案的码不来自读音，词库里可能真收录了符号条目
+            // （标点/特殊符号有合法的码），一刀切会把它们的加词能力砍掉。非汉字在码表下
+            // 取不出码时，`encode_word` 自己会失败返回空码，行为不变。
+            if !word.chars().all(is_han) {
+                debug!("addword: 含非汉字，拼音方案不取码（word={}）", word);
+                return (String::new(), 0);
+            }
             let reverse = self.reverse.read().unwrap_or_else(|e| e.into_inner());
-            // 引擎给出带空格的音节码（`ni hao`）→ 拆成扁平 code + 边界。
-            // 逐字反查表回退无音节语义，其结果不含空格 ⇒ split 后 boundary=0。
+            // **两条路产出的都是带空格的音节码**，故统一 split 成扁平 code + 边界。
+            //
+            // 逐字反查表（`gen_pinyin`）同样以 `.join(" ")` 收尾——此前这里把它的结果当扁平码
+            // 直接返回，于是 `add_user_word` 拿带空格的串当 key（`pinyin\0ni hao\0…`），
+            // 前缀查询再也命中不到，**加进去的词一个都打不出来**，且界面毫无异常。
+            // 触发条件不罕见：`generate_word_pinyin` 对含非汉字的词返回 None（快捷加词的
+            // 字符池直接取最近上屏字符，中英混输下「你好a」这种一抓一个准），正好落进回退。
+            //
+            // 顺带把回退路径的 boundary 从恒 0 修成真值：逐字反查每字一音节，切分完全确定，
+            // 与 code 自洽。原先记 0 意味着双拼相容校验一律放行（`boundary_compatible` 任一侧
+            // 为 0 即不设防），填真值后这些词才和词典词受同样的校验。
+            //
+            // ⚠️ 上面的非汉字守卫落地后，这条回退**在实践中已几乎不可达**：含非汉字的词被守卫
+            // 挡在前面，全汉字的词则 `generate_word_pinyin` 几乎总有值（实测拼音词典连 CJK
+            // 扩展 B 区都覆盖）。剩下的可达情形只有引擎加载失败，而那时 reverse 表通常也是空的。
+            // 保留它是为了契约自洽（两条路同形、同样落扁平 key），**不是**在防一个活跃的缺陷；
+            // 故不为它写端到端测试——那种测试只会永远绿着却从不执行被测分支。
             self.engine_mgr
                 .generate_word_pinyin(&schema, word)
+                .or_else(|| Some(reverse.gen_pinyin(word)))
                 .map(|spaced| wind_store::wdict::split_spaced_code(&spaced))
-                .unwrap_or_else(|| (reverse.gen_pinyin(word), 0))
+                .unwrap_or_default()
         } else {
             match self.engine_mgr.encode_word(&schema, word) {
                 Ok(code) => (code, 0),
@@ -788,7 +847,9 @@ impl Coordinator {
             let code_comment = if state.add_word_code.is_empty() {
                 "无法计算编码".to_string()
             } else {
-                state.add_word_code.clone()
+                // 候选窗里也显示音节形态：用户在这里看到的码要与 Ctrl+Enter 转过去的
+                // 设置页、以及词库列表一致，否则同一个码在三个界面有两种样子。
+                self.add_word_display_code(state)
             };
             vec![
                 row(
@@ -1158,6 +1219,139 @@ mod tests {
         assert_eq!(
             build_settings_args(&[("text", "hello world"), ("schema", "wubi86")]),
             "--text=\"hello world\" --schema=wubi86"
+        );
+    }
+
+    /// 拼音方案下含非汉字的词**不取码**，加词中止，不留坏数据。
+    ///
+    /// 病灶：`gen_pinyin` 的 `filter_map` 静默跳过无读音字符，「你好a」产出 `ni hao`——
+    /// 码覆盖不全，且（在 split 修复前）还带着空格落成 key，词彻底打不出来。快捷加词的
+    /// 字符池直接取最近上屏字符，中英混输下「你好a」这种一抓一个准。
+    ///
+    /// 同时补上一处不一致：**纯**英文取码本就为空、早已中止，只有混合的情况漏了过去。
+    ///
+    /// ⚠️ 本测试**必须用真实词库**：headless 无引擎时 `is_pinyin` 判false、reverse 表也空，
+    /// 取码恒为空串 —— 那样「断言空码」会因为完全错误的原因通过，成为典型假绿。故对照组
+    /// （纯汉字词必须取得出码）是这条测试的命脉，不能省。
+    #[test]
+    fn pinyin_rejects_non_han_word_and_adds_han_word() {
+        let data =
+            std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../../build_dev/data");
+        if !data.join("schemas/pinyin.schema.toml").exists() {
+            return;
+        }
+        let mut cfg = Config::default();
+        cfg.schema.available = vec!["pinyin".into()];
+        cfg.schema.active = "pinyin".into();
+        let path = std::env::temp_dir().join("wind_addword_fallback_flat.redb");
+        let _ = std::fs::remove_file(&path);
+        let store = Arc::new(Store::open(&path).unwrap());
+        let c = Coordinator::new_headless_with_store(cfg, Some(&data), store);
+
+        let sid = c.engine_mgr.active_schema_id();
+        let sid = c.engine_mgr.data_schema_id(&sid);
+
+        // ① 含非汉字「你好a」→ 不取码、不写库
+        push_commits(&c, &["你", "好", "a"]);
+        {
+            let mut st = c.state.lock().unwrap();
+            c.enter_add_word_mode(&mut st);
+            c.adjust_add_word_length(&mut st, 1); // 默认 2（"好a"）→ 3（"你好a"）
+            assert_eq!(c.add_word_current_word(&st), "你好a");
+            assert!(
+                st.add_word_code.is_empty(),
+                "含非汉字应取不出码，实际 {:?}",
+                st.add_word_code
+            );
+            c.confirm_add_word(&mut st);
+        }
+        let store = c.store.as_ref().unwrap();
+        assert!(
+            store.get_user_words(&sid, "nihao").unwrap().is_empty(),
+            "不得把丢了字母的「ni hao → 你好a」写进库"
+        );
+        assert!(
+            store.get_user_words(&sid, "ni hao").unwrap().is_empty(),
+            "更不得写出带空格的坏 key"
+        );
+
+        // ② 对照组：纯汉字「你好」照常取码入库。
+        //    没有这一半，上面的「空码」断言在引擎根本没加载时也会通过——那是假绿。
+        push_commits(&c, &["你", "好"]);
+        {
+            let mut st = c.state.lock().unwrap();
+            c.enter_add_word_mode(&mut st);
+            assert_eq!(c.add_word_current_word(&st), "你好");
+            assert_eq!(st.add_word_code, "nihao", "落库 code 必须扁平、无空格");
+            assert_eq!(st.add_word_boundary, 0b101, "音节边界 ni|hao");
+            // 展示形态还原得出空格（与设置页「出码」按钮、词库列表同形）
+            assert_eq!(c.add_word_display_code(&st), "ni hao");
+            c.confirm_add_word(&mut st);
+        }
+        assert_eq!(
+            store.get_user_words(&sid, "nihao").unwrap().len(),
+            1,
+            "扁平 key 必须查得到——这正是候选查询用的形态"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    // ──────────────────────────────────────────────────────────────────────
+    // 编码的展示形态（带音节空格）——三个加词界面的共用口径
+    // ──────────────────────────────────────────────────────────────────────
+
+    /// 存储域（扁平 key + boundary）→ 展示域（带空格音节码）的转换语义。
+    /// 拼音方案下这一步此前完全没做，Ctrl+Shift+= 的对话框才会预填出 `nihao`。
+    #[test]
+    fn display_code_restores_syllable_spaces() {
+        use super::display_code;
+        // 拼音多音节：boundary 的 bit 位是各音节起始**字节**偏移（ni|hao → {0,2}）
+        assert_eq!(display_code("nihao", 0b101), "ni hao");
+        assert_eq!(display_code("chongqing", 0b100001), "chong qing");
+        // 码表码 boundary 恒 0 → 恒等变换，五笔等方案不受影响
+        assert_eq!(display_code("aabb", 0), "aabb");
+        // 单音节（0b1）无内部边界可插，与 0 同样原样返回
+        assert_eq!(display_code("ni", 0b1), "ni");
+        assert_eq!(display_code("", 0), "");
+    }
+
+    /// `add_word_code` 与 `add_word_boundary` 必须**成对**读出。
+    ///
+    /// 本次 bug 的形态正是「字段在 State 里、但消费端只读了一半」——boundary 一直被算出来
+    /// 并存着，三个显示/传参点却都只取扁平 code。这条测试钉的就是这一步不再退化。
+    #[test]
+    fn add_word_display_code_reads_boundary_from_state() {
+        let c = coord("display_code_state");
+        push_commits(&c, &["你", "好"]);
+        let mut st = c.state.lock().unwrap();
+        c.enter_add_word_mode(&mut st);
+        // headless 无引擎，calc_add_word_code 取不出码 → 手动注入引擎会给出的那一对
+        st.add_word_code = "nihao".to_string();
+        st.add_word_boundary = 0b101;
+        assert_eq!(
+            c.add_word_display_code(&st),
+            "ni hao",
+            "展示形态必须带音节空格，与设置页「出码」按钮及词库列表同形"
+        );
+        // 码表方案（boundary=0）不受影响
+        st.add_word_code = "aabb".to_string();
+        st.add_word_boundary = 0;
+        assert_eq!(c.add_word_display_code(&st), "aabb");
+    }
+
+    /// 带空格的码进参数串必须被引号包住。
+    ///
+    /// 这是本次改动**新走通**的组合：在此之前 code 恒无空格，`build_settings_args` 的加引号
+    /// 分支从来只有 `--text`（剪贴板整段）会碰到。不加引号则 CommandLineToArgvW 会把
+    /// `--code=ni hao` 切成两个 argv，设置端只收得到 `--code=ni`——比不带空格更糟。
+    #[test]
+    fn prefill_args_quote_spaced_code() {
+        use super::display_code;
+        use crate::handle_menu::build_settings_args;
+        let code = display_code("nihao", 0b101);
+        assert_eq!(
+            build_settings_args(&[("text", "你好"), ("code", &code), ("schema", "pinyin")]),
+            "--text=你好 --code=\"ni hao\" --schema=pinyin"
         );
     }
 

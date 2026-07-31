@@ -1095,7 +1095,8 @@ impl Coordinator {
             // 直接回**带空格的音节码**，让用户看清拼音词库的音节格式（与 word_item 同形）。
             // 安全前提：UI 会把它回填进编码框再提交，而写入侧 normalize_add_code 会拆回
             // 扁平 key，并把用户打的空格当作**显式声明的切分**采信（优先于推断兜底）。
-            // 逐字反查表回退无音节语义，其结果本就不含空格。
+            // 逐字反查表回退**同样**以空格分隔（每字一音节，`gen_pinyin` 以 `.join(" ")`
+            // 收尾），故两条路出来的都是同形的音节码，本 RPC 无需再做区分。
             self.engine_mgr
                 .generate_word_pinyin(schema, text)
                 .unwrap_or_else(|| reverse.gen_pinyin(text))
