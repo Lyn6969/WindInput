@@ -7,7 +7,7 @@
 //! 文件布局（小端）：
 //! ```text
 //! [Header 48B]
-//! [DAT Base: dat_size*4][DAT Check: dat_size*4]
+//! [DAT Base: dat_size*4][DAT Check: dat_size*4][DAT MaxW: dat_size*4]
 //! [LeafTable: leaf_count*8]   每条 {entry_off u32, entry_len u16, _ u16}
 //! [EntryRecords: entry_count*22]  每条 {text_off u32, text_len u16, weight i32, order u32, boundary u64}
 //! [StringPool]
@@ -16,6 +16,12 @@
 //! ```
 //! DAT 查询：`base[s]+c=t`（状态 s 经紧凑码 c 转移到 t），`check[t]==s` 校验；
 //! `base[t]<0` 表叶节点，`-base[t]-1` 为 LeafTable 索引；`c=0` 为终止符。
+//!
+//! **MaxW 段**（v6）：`maxw[s]` = 以状态 s 为根的子树内所有条目 weight 的最大值，
+//! `NO_MAXW`（= i32::MIN）表示子树无条目。它是前缀 Top-K 查询的**剪枝上界**，
+//! 使查询成本随 K 而非随子树规模 M 增长（见 `search_prefix`）。
+//! 段位置紧跟 Check 之后，无需 Header 新字段——`maxw_off = dat_off + dat_size*4*2` 可直接算出，
+//! 其后各段偏移（leaf/entry/str）本就在 Header 中显式存储。
 
 use crate::binformat::DictEntry;
 use memmap2::Mmap;
@@ -36,11 +42,19 @@ const MAGIC: [u8; 4] = [b'W', b'D', b'A', b'T'];
 // 词频不再因简拼/全拼分裂成两份计数。**二进制结构完全未变**，变的是那个字符串字段的
 // 语义，故必须 bump：旧 v4 缓存若按新逻辑读，会把词当成码拿去查主表、简拼全数落空。
 // 旧缓存靠内容指纹不匹配自动重建，无迁移代码。
-const VERSION: u32 = 5;
+// v6：新增 MaxW 段（每状态 4B，子树最大 weight），前缀 Top-K 查询改为分支限界。
+// 旧 v5 缓存缺该段，且 leaf/entry 偏移整体前移，按新布局读必然错位，故必须 bump。
+// 旧缓存靠版本不匹配自动重建，无迁移代码。
+const VERSION: u32 = 6;
 const HEADER_SIZE: usize = 48;
 const LEAF_SIZE: usize = 8;
 const ENTRY_SIZE: usize = 22;
 const CHARMAP_SIZE: usize = 4 + 256 * 4; // 1028
+
+/// `maxw[s]` 的空子树哨兵。**刻意不复用 `i32::MIN` 之外的值**：weight 为 i32，
+/// 任何真实条目的 weight 都 > i32::MIN，故该哨兵不会与真实值混淆。
+/// （当前词库最小 weight 为 0，但不依赖该事实。）
+const NO_MAXW: i32 = i32::MIN;
 
 /// 原子写临时文件序号（同 binformat，进程内防 tmp 撞名）。
 static ATOMIC_WRITE_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -244,6 +258,93 @@ fn build_section(
     (build_dat_from_sorted(&codes), leaves, entries)
 }
 
+/// 计算 MaxW 段（v6）：`maxw[s]` = 以状态 s 为根的子树中所有条目 weight 的最大值。
+///
+/// 这是前缀 Top-K 查询的剪枝上界，须满足**不变量**：
+/// 对任意状态 s 与任意 `e ∈ subtree(s)`，有 `weight(e) <= maxw[s]`。
+/// 上界只需保守（偏大无害、偏小会漏结果），故任何"取 max"的实现错误方向都是危险的，
+/// 单元测试须逐状态对拍暴力计算的结果。
+///
+/// **实现为两趟而非递归**：DAT 深度等于最长编码长度，用户词库可能出现极长编码，
+/// 递归有栈溢出风险。第一趟前序 DFS 收集访问序（父必先于子出现），第二趟逆序回填
+/// （于是子必先于父被算出），等价于后序遍历且无递归。
+fn compute_maxw(
+    dat: &Dat,
+    leaves: &[(u32, u16)],
+    entries: &[(u32, u16, i32, u32, u64)],
+) -> Vec<i32> {
+    let n = dat.base.len();
+    let mut maxw = vec![NO_MAXW; n];
+    if n == 0 {
+        return maxw;
+    }
+    let in_range = |t: i32| t >= 0 && (t as usize) < n;
+    // 状态 s 经终止符（紧凑码 0）指向的叶节点，返回 (叶状态下标, LeafTable 索引)。
+    let terminal = |s: i32| -> Option<(usize, usize)> {
+        let t = dat.base[s as usize]; // + 0
+        if !in_range(t) || dat.check[t as usize] != s {
+            return None;
+        }
+        let bt = dat.base[t as usize];
+        if bt >= 0 {
+            return None; // 非叶
+        }
+        Some((t as usize, (-bt - 1) as usize))
+    };
+    // 某个叶（一码多词）内的最大 weight。
+    let leaf_max = |leaf_idx: usize| -> i32 {
+        let Some(&(byte_off, len)) = leaves.get(leaf_idx) else {
+            return NO_MAXW;
+        };
+        let start = byte_off as usize / ENTRY_SIZE;
+        entries
+            .iter()
+            .skip(start)
+            .take(len as usize)
+            .map(|e| e.2)
+            .max()
+            .unwrap_or(NO_MAXW)
+    };
+
+    // 第一趟：前序 DFS，收集正常状态（叶状态经 c=0 到达，不入序列、不展开）。
+    let mut order: Vec<i32> = Vec::with_capacity(n);
+    let mut stack: Vec<i32> = vec![0];
+    while let Some(s) = stack.pop() {
+        order.push(s);
+        let bs = dat.base[s as usize];
+        if bs < 0 {
+            continue; // 叶状态无出边（防御，构建侧不应产生）
+        }
+        for c in 1..=dat.max_code {
+            let t = bs + c;
+            if in_range(t) && dat.check[t as usize] == s {
+                stack.push(t);
+            }
+        }
+    }
+
+    // 第二趟：逆序回填。
+    for &s in order.iter().rev() {
+        let mut m = NO_MAXW;
+        if let Some((leaf_state, leaf_idx)) = terminal(s) {
+            let lw = leaf_max(leaf_idx);
+            maxw[leaf_state] = lw; // 叶状态自身也填上，保持段语义自洽（查询不读它）
+            m = m.max(lw);
+        }
+        let bs = dat.base[s as usize];
+        if bs >= 0 {
+            for c in 1..=dat.max_code {
+                let t = bs + c;
+                if in_range(t) && dat.check[t as usize] == s {
+                    m = m.max(maxw[t as usize]);
+                }
+            }
+        }
+        maxw[s as usize] = m;
+    }
+    maxw
+}
+
 /// wdat 写入器：与 binformat::DictWriter 同样接口（add(code, entries)），输出 DAT 格式。
 /// `add_abbrev` 追加简拼（声母缩写）表，写入独立 AbbrevSection（与全拼查询互不污染）。
 /// 写入侧的一条候选：`(text, weight, order, boundary)`。
@@ -349,10 +450,17 @@ impl WdatWriter {
             (None, Vec::new(), Vec::new())
         };
 
-        // 主区段偏移。
+        // MaxW 段（v6 剪枝上界），与各自的 DAT 同长。
+        let maxw = compute_maxw(&dat, &leaves, &entries);
+        let a_maxw = a_dat
+            .as_ref()
+            .map(|ad| compute_maxw(ad, &a_leaves, &a_entries))
+            .unwrap_or_default();
+
+        // 主区段偏移。base/check/maxw 三段等长，故 leaf 段起点为 dat_off + dat_size*4*3。
         let dat_size = dat.base.len() as u32;
         let dat_off = HEADER_SIZE as u32;
-        let leaf_off = dat_off + dat_size * 4 * 2;
+        let leaf_off = dat_off + dat_size * 4 * 3;
         let entry_off = leaf_off + (leaves.len() * LEAF_SIZE) as u32;
         let str_off = entry_off + (entries.len() * ENTRY_SIZE) as u32;
         let after_pool = str_off + pool.buf.len() as u32;
@@ -365,7 +473,7 @@ impl WdatWriter {
                 let abbrev_off = after_pool;
                 let a_dat_off = abbrev_off + ABBREV_HDR;
                 let a_dat_size = ad.base.len() as u32;
-                let a_leaf_off = a_dat_off + a_dat_size * 4 * 2;
+                let a_leaf_off = a_dat_off + a_dat_size * 4 * 3;
                 let a_entry_off = a_leaf_off + (a_leaves.len() * LEAF_SIZE) as u32;
                 let a_charmap_off = a_entry_off + (a_entries.len() * ENTRY_SIZE) as u32;
                 let after = a_charmap_off + CHARMAP_SIZE as u32;
@@ -413,6 +521,7 @@ impl WdatWriter {
 
         let write_dat_section = |f: &mut std::io::BufWriter<std::fs::File>,
                                  dat: &Dat,
+                                 maxw: &[i32],
                                  leaves: &[(u32, u16)],
                                  entries: &[(u32, u16, i32, u32, u64)]|
          -> std::io::Result<()> {
@@ -420,6 +529,11 @@ impl WdatWriter {
                 f.write_all(&v.to_le_bytes())?;
             }
             for v in &dat.check {
+                f.write_all(&v.to_le_bytes())?;
+            }
+            // v6 MaxW：与 base/check 等长，长度不符即为构建 bug（读取侧按 dat_size 定长切片）。
+            debug_assert_eq!(maxw.len(), dat.base.len());
+            for v in maxw {
                 f.write_all(&v.to_le_bytes())?;
             }
             for (eoff, elen) in leaves {
@@ -446,7 +560,7 @@ impl WdatWriter {
             };
 
         // 主区段 + 共享池。
-        write_dat_section(&mut f, &dat, &leaves, &entries)?;
+        write_dat_section(&mut f, &dat, &maxw, &leaves, &entries)?;
         f.write_all(&pool.buf)?;
 
         // 简拼区段：自描述头 + DAT/leaf/entry + 简拼 CharMap。
@@ -457,7 +571,7 @@ impl WdatWriter {
             f.write_all(&a_leaf_off.to_le_bytes())?;
             f.write_all(&a_entry_off.to_le_bytes())?;
             f.write_all(&a_charmap_off.to_le_bytes())?;
-            write_dat_section(&mut f, ad, &a_leaves, &a_entries)?;
+            write_dat_section(&mut f, ad, &a_maxw, &a_leaves, &a_entries)?;
             write_charmap(&mut f, ad)?;
         }
 
@@ -497,10 +611,109 @@ impl Default for WdatWriter {
 
 // ======================= 读取（mmap 零拷贝） =======================
 
+/// 前缀查询的执行统计（诊断与收益验证用；生产路径可忽略）。
+#[derive(Default, Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PrefixSearchStats {
+    /// 实际出队展开的状态数（分支限界记号 V）。与子树总状态数之比即剪枝效果。
+    pub states_visited: usize,
+    /// 实际读取的条目数（分支限界记号 E）。
+    pub entries_read: usize,
+}
+
+/// 前缀查询的排序键。`Ord` 定义为「**越差越大**」，故堆顶恒为当前最差的入选者，
+/// 且 `into_sorted_vec()`（升序）直接给出最优→最差的最终顺序。
+///
+/// 三、四级 tie-break 取 `(leaf, slot)`（LeafTable 索引 + 叶内序号）而**不是遍历序**。
+/// 这一点是必须的：`with_local_order` 写入的词库（`export_to_writer` / combined 合并路径）
+/// order 是「code 内序号 0,1,2」，等权时会大量打平；若拿遍历序做 tie-break，DFS 与分支限界
+/// 两种遍历顺序会给出不同结果——既无法对拍验证，也会让候选顺序随实现改动而抖动。
+/// `leaf` 是构建期按 code 字典序分配的稳定编号，任何遍历顺序下答案唯一。
+#[derive(PartialEq, Eq)]
+struct RankKey {
+    weight: i32,
+    order: i32,
+    leaf: u32,
+    slot: u16,
+}
+impl Ord for RankKey {
+    fn cmp(&self, other: &Self) -> Ordering {
+        // weight 小 → 差；order 大 → 差；leaf/slot 大 → 差。
+        other
+            .weight
+            .cmp(&self.weight)
+            .then(self.order.cmp(&other.order))
+            .then(self.leaf.cmp(&other.leaf))
+            .then(self.slot.cmp(&other.slot))
+    }
+}
+impl PartialOrd for RankKey {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+struct Ranked {
+    key: RankKey,
+    entry: DictEntry,
+}
+impl PartialEq for Ranked {
+    fn eq(&self, other: &Self) -> bool {
+        self.key == other.key
+    }
+}
+impl Eq for Ranked {}
+impl Ord for Ranked {
+    fn cmp(&self, other: &Self) -> Ordering {
+        self.key.cmp(&other.key)
+    }
+}
+impl PartialOrd for Ranked {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+/// 分支限界的待展开项，按子树权重上界 `bound` 降序出队。
+struct Pending {
+    bound: i32,
+    state: i32,
+    /// `PathArena` 索引；`u32::MAX` 表示「路径就是查询前缀本身」。
+    path: u32,
+}
+impl PartialEq for Pending {
+    fn eq(&self, other: &Self) -> bool {
+        self.bound == other.bound && self.state == other.state
+    }
+}
+impl Eq for Pending {}
+impl Ord for Pending {
+    fn cmp(&self, other: &Self) -> Ordering {
+        // BinaryHeap 是最大堆：bound 大者先出队。bound 相等时按 state 升序（任意但确定，
+        // 保证同一词库上的执行完全可复现）。
+        self.bound
+            .cmp(&other.bound)
+            .then(other.state.cmp(&self.state))
+    }
+}
+impl PartialOrd for Pending {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+/// 路径链节点：`(父节点索引, 该步字节)`。
+///
+/// **入队时不拼 String**：入队状态数可能远大于最终产出条目数，且绝大多数入队项会被剪枝
+/// 丢弃，给它们各分配一个 code 字符串是纯浪费。只在真正要产出条目时才回溯拼接。
+struct PathNode {
+    parent: u32,
+    byte: u8,
+}
+
 /// 一段 DAT 的视图（主表 / 简拼表各一份），供查询方法复用同一套 walk/DFS 逻辑。
 struct DatView {
     dat_off: usize,
     check_off: usize,
+    maxw_off: usize, // v6：子树最大 weight（剪枝上界），与 base/check 等长
     dat_size: u32,
     leaf_off: usize,
     entry_off: usize,
@@ -563,9 +776,10 @@ impl WdatReader {
             (cm, rm, max_code)
         };
 
-        // 主区段越界校验。
+        // 主区段越界校验。v6 起 base/check/maxw 三段等长依次排列。
         let check_off = dat_off + dat_size as usize * 4;
-        if check_off + dat_size as usize * 4 > file_len
+        let maxw_off = check_off + dat_size as usize * 4;
+        if maxw_off + dat_size as usize * 4 > file_len
             || char_map_off + CHARMAP_SIZE > file_len
             || leaf_off > file_len
             || str_off > file_len
@@ -576,6 +790,7 @@ impl WdatReader {
         let main = DatView {
             dat_off,
             check_off,
+            maxw_off,
             dat_size,
             leaf_off,
             entry_off,
@@ -592,12 +807,13 @@ impl WdatReader {
             let a_entry_off = rd(abbrev_off + 16) as usize;
             let a_charmap_off = rd(abbrev_off + 20) as usize;
             if a_charmap_off + CHARMAP_SIZE <= file_len
-                && a_dat_off + a_dat_size as usize * 8 <= file_len
+                && a_dat_off + a_dat_size as usize * 12 <= file_len
             {
                 let (cm, rm, mc) = read_charmap(a_charmap_off);
                 Some(DatView {
                     dat_off: a_dat_off,
                     check_off: a_dat_off + a_dat_size as usize * 4,
+                    maxw_off: a_dat_off + a_dat_size as usize * 8,
                     dat_size: a_dat_size,
                     leaf_off: a_leaf_off,
                     entry_off: a_entry_off,
@@ -640,6 +856,12 @@ impl WdatReader {
     #[inline]
     fn check(&self, v: &DatView, i: i32) -> i32 {
         let o = v.check_off + (i as usize) * 4;
+        i32::from_le_bytes(self.mmap[o..o + 4].try_into().unwrap())
+    }
+    /// v6 剪枝上界：以状态 i 为根的子树内最大 weight（`NO_MAXW` = 子树无条目）。
+    #[inline]
+    fn maxw(&self, v: &DatView, i: i32) -> i32 {
+        let o = v.maxw_off + (i as usize) * 4;
         i32::from_le_bytes(self.mmap[o..o + 4].try_into().unwrap())
     }
     #[inline]
@@ -801,82 +1023,180 @@ impl WdatReader {
         })
     }
 
-    /// 前缀查找：走到前缀状态，DFS 子树遍历叶（重建每个候选的完整 code），
-    /// 按权重降序、order 升序取前 `limit` 条（与 binformat::DictReader 对齐）。
+    /// 沿 `PathNode` 链回溯拼出完整 code。只在真正产出条目时调用（见 `PathNode` 说明）。
+    fn build_code(prefix: &str, arena: &[PathNode], mut idx: u32) -> String {
+        if idx == u32::MAX {
+            return prefix.to_string();
+        }
+        let mut suffix: Vec<u8> = Vec::new();
+        while idx != u32::MAX {
+            let n = &arena[idx as usize];
+            suffix.push(n.byte);
+            idx = n.parent;
+        }
+        suffix.reverse();
+        let mut s = String::with_capacity(prefix.len() + suffix.len());
+        s.push_str(prefix);
+        s.push_str(std::str::from_utf8(&suffix).unwrap_or(""));
+        s
+    }
+
+    /// 前缀查找：按权重降序、order 升序取前 `limit` 条（与 binformat::DictReader 对齐）。
     ///
-    /// **实现为 top-N 堆而非「全收集 + 全排序 + 截断」**：DFS 仍遍历整棵子树（不早停，
-    /// 故结果不漏高权重项），但只保留最优的 `limit` 条，且**够不上当前第 N 名的条目
-    /// 不做任何 String 分配**。对 `ok` 拼字这类「单前缀下 8.8 万条」的词库，旧写法要
-    /// 物化 8.8 万个 `DictEntry`（17.6 万次堆分配）再全排序，最后扔掉 99.9%——单次
-    /// 前缀查询 80ms 级。
+    /// **v6 起为分支限界（branch and bound）**，成本随 `limit` 而非随子树规模增长。
+    /// 借助 v6 的 MaxW 段（`maxw[s]` = 子树内最大 weight）按上界降序展开状态，一旦
+    /// 「结果已满 且 当前出队项的上界严格劣于第 `limit` 名」即可终止——此时优先队列中
+    /// 剩余各项的上界都不高于它，其子树内条目全部不可能入选。
     ///
-    /// 排序键含 `seq`（DFS 遍历序）作第三级 tie-break，以复现 `sort_by` 的**稳定排序**
-    /// 语义：`(weight, order)` 打平时保持 DFS 顺序。这不是可选项——`with_local_order`
-    /// 写入的词库（`export_to_writer` / combined 合并路径）order 是「code 内序号 0,1,2」，
-    /// 等权时会大量打平，缺了 seq 堆将任意取舍，候选列表随之抖动。
+    /// 改此实现前请先读 `docs/design/prefix-topk-branch-and-bound.md` 的正确性论证。两处要害：
+    ///
+    /// 1. **剪枝判据必须是严格小于**。上界只覆盖 RankKey 的首要键 weight；`bound == 第 limit 名
+    ///    的 weight` 时，子树内仍可能有同 weight 而 order 更小的条目应当取代它。放宽成 `<=`
+    ///    会静默漏结果——没有崩溃、没有日志，只是候选少了几条。
+    /// 2. **`NO_MAXW` 子树直接跳过**：空子树无条目可贡献，入队只是浪费。
+    ///
+    /// 旧的全遍历实现保留为 [`search_prefix_scan`](Self::search_prefix_scan)，仅供对拍验证。
     pub fn search_prefix(&self, prefix: &str, limit: usize) -> Vec<DictEntry> {
-        if self.main.dat_size == 0 || limit == 0 {
+        self.search_prefix_stats(prefix, limit).0
+    }
+
+    /// 同 [`search_prefix`](Self::search_prefix)，另返回执行统计（剪枝效果验证用）。
+    pub fn search_prefix_stats(
+        &self,
+        prefix: &str,
+        limit: usize,
+    ) -> (Vec<DictEntry>, PrefixSearchStats) {
+        let mut stats = PrefixSearchStats::default();
+        let v = &self.main;
+        if v.dat_size == 0 || limit == 0 {
+            return (Vec::new(), stats);
+        }
+        let Some(start) = self.walk(v, prefix) else {
+            return (Vec::new(), stats);
+        };
+        let root_bound = self.maxw(v, start);
+        if root_bound == NO_MAXW {
+            return (Vec::new(), stats); // 子树无任何条目
+        }
+
+        let mut heap: BinaryHeap<Ranked> = BinaryHeap::with_capacity(limit + 1);
+        let mut pq: BinaryHeap<Pending> = BinaryHeap::new();
+        let mut arena: Vec<PathNode> = Vec::new();
+        pq.push(Pending {
+            bound: root_bound,
+            state: start,
+            path: u32::MAX,
+        });
+
+        while let Some(node) = pq.pop() {
+            // 剪枝（见函数文档要害 1）：严格小于才终止，且是 break 而非 continue——
+            // 出队顺序保证剩余各项上界都 <= 本项。
+            if heap.len() >= limit
+                && let Some(worst) = heap.peek()
+                && node.bound < worst.key.weight
+            {
+                break;
+            }
+            stats.states_visited += 1;
+
+            // 本状态自身若成词，收集其条目（一码多词）。
+            if let Some(leaf) = self.terminal_leaf(v, node.state) {
+                let code = Self::build_code(prefix, &arena, node.path);
+                let mut slot: u16 = 0;
+                let entries_read = &mut stats.entries_read;
+                self.read_leaf_entries(v, leaf, &mut |text, weight, order, boundary| {
+                    let key = RankKey {
+                        weight,
+                        order,
+                        leaf,
+                        slot,
+                    };
+                    slot += 1;
+                    *entries_read += 1;
+                    if heap.len() >= limit {
+                        // 堆顶是最差的入选者：不严格优于它就丢弃——**先比较后分配**，
+                        // 绝大多数条目走到这里即返回，不触碰 code/text 的 to_string()。
+                        match heap.peek() {
+                            Some(worst) if key >= worst.key => return,
+                            _ => {}
+                        }
+                        heap.pop();
+                    }
+                    heap.push(Ranked {
+                        key,
+                        entry: DictEntry {
+                            code: code.clone(),
+                            text: text.to_string(),
+                            weight,
+                            order,
+                            boundary,
+                        },
+                    });
+                });
+            }
+
+            // 展开子状态（紧凑码 0 是终止符，已由上面的 terminal_leaf 处理）。
+            let bs = self.base(v, node.state);
+            if bs < 0 {
+                continue; // 叶状态无出边
+            }
+            for c in 1..=v.max_code {
+                let t = bs + c;
+                if !Self::in_range(v, t) || self.check(v, t) != node.state {
+                    continue;
+                }
+                let bound = self.maxw(v, t);
+                if bound == NO_MAXW {
+                    continue; // 见函数文档要害 2
+                }
+                let path = arena.len() as u32;
+                arena.push(PathNode {
+                    parent: node.path,
+                    byte: v.rev_map[c as usize],
+                });
+                pq.push(Pending {
+                    bound,
+                    state: t,
+                    path,
+                });
+            }
+        }
+        let out = heap
+            .into_sorted_vec()
+            .into_iter()
+            .map(|r| r.entry)
+            .collect();
+        (out, stats)
+    }
+
+    /// 前缀查找的**全遍历参考实现**（v6 之前的行为）：DFS 整棵子树 + top-N 堆。
+    ///
+    /// 保留它只为验证：[`search_prefix`](Self::search_prefix) 的分支限界结果必须与本函数
+    /// **逐条一致**（测试 `bnb_matches_full_scan`）。剪枝一旦写错就是静默漏候选，
+    /// 唯有对拍能可靠地发现。
+    ///
+    /// 生产路径不应调用——它的成本随子树规模而非 `limit` 增长。
+    pub fn search_prefix_scan(&self, prefix: &str, limit: usize) -> Vec<DictEntry> {
+        let v = &self.main;
+        if v.dat_size == 0 || limit == 0 {
             return Vec::new();
         }
-        let Some(start) = self.walk(&self.main, prefix) else {
+        let Some(start) = self.walk(v, prefix) else {
             return Vec::new();
         };
-
-        /// 排序键。`Ord` 定义为「**越差越大**」，故堆顶恒为当前最差的入选者，
-        /// 且 `into_sorted_vec()`（升序）直接给出最优→最差的最终顺序。
-        #[derive(PartialEq, Eq)]
-        struct RankKey {
-            weight: i32,
-            order: i32,
-            seq: u64,
-        }
-        impl Ord for RankKey {
-            fn cmp(&self, other: &Self) -> Ordering {
-                // weight 小 → 差；order 大 → 差；seq 大 → 差。
-                other
-                    .weight
-                    .cmp(&self.weight)
-                    .then(self.order.cmp(&other.order))
-                    .then(self.seq.cmp(&other.seq))
-            }
-        }
-        impl PartialOrd for RankKey {
-            fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
-                Some(self.cmp(other))
-            }
-        }
-        struct Ranked {
-            key: RankKey,
-            entry: DictEntry,
-        }
-        impl PartialEq for Ranked {
-            fn eq(&self, other: &Self) -> bool {
-                self.key == other.key
-            }
-        }
-        impl Eq for Ranked {}
-        impl Ord for Ranked {
-            fn cmp(&self, other: &Self) -> Ordering {
-                self.key.cmp(&other.key)
-            }
-        }
-        impl PartialOrd for Ranked {
-            fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
-                Some(self.cmp(other))
-            }
-        }
-
-        let v = &self.main;
         let mut heap: BinaryHeap<Ranked> = BinaryHeap::with_capacity(limit + 1);
-        let mut seq: u64 = 0;
         let mut path: Vec<u8> = prefix.as_bytes().to_vec();
         self.for_each_leaf(v, start, &mut path, &mut |code, leaf| {
+            let mut slot: u16 = 0;
             self.read_leaf_entries(v, leaf, &mut |text, weight, order, boundary| {
-                let key = RankKey { weight, order, seq };
-                seq += 1;
+                let key = RankKey {
+                    weight,
+                    order,
+                    leaf,
+                    slot,
+                };
+                slot += 1;
                 if heap.len() >= limit {
-                    // 堆顶是最差的入选者：不严格优于它就丢弃——注意此处**先比较后分配**，
-                    // 绝大多数条目走到这里即返回，不触碰 code/text 的 to_string()。
                     match heap.peek() {
                         Some(worst) if key >= worst.key => return,
                         _ => {}
@@ -1070,6 +1390,118 @@ mod tests {
                 &r.search_prefix("ok", limit),
                 &reference_prefix(&r, "ok", limit),
                 &format!("混合权重 limit={limit}"),
+            );
+        }
+        let _ = std::fs::remove_file(&p);
+    }
+
+    /// **剪枝确实发生**：权重有区分度时，小 limit 的访问状态数须远低于全遍历。
+    ///
+    /// ⚠️ 上面两个对拍测试证明不了这件事。`..._all_keys_tie` 里 weight 全为 0，剪枝判据
+    /// `bound < worst.weight` 即 `0 < 0` 恒假，分支限界**退化成全遍历**，结果自然一致——
+    /// 剪枝逻辑若被误删或写成恒不触发，那个测试照样全绿。本测试直接钉 `states_visited`，
+    /// 是「剪枝真的执行了」唯一的证据。
+    #[test]
+    fn bnb_actually_prunes_when_weights_differ() {
+        let data: Vec<(String, Vec<(String, i32)>)> = (0..676u32)
+            .map(|i| {
+                let c1 = (b'a' + (i / 26) as u8) as char;
+                let c2 = (b'a' + (i % 26) as u8) as char;
+                // 伪随机但确定的权重，让高权重分散到不同子树（逼近真实词库形状）。
+                let w = ((i * 7919) % 10000) as i32;
+                (format!("ok{c1}{c2}"), vec![(format!("字{i}"), w)])
+            })
+            .collect();
+        let p = build_owned("wdat_bnb_prune.wdat", &data);
+        let r = WdatReader::open(&p).unwrap();
+
+        let (_, full) = r.search_prefix_stats("ok", 100_000);
+        let (_, few) = r.search_prefix_stats("ok", 5);
+        assert!(
+            few.states_visited * 4 < full.states_visited,
+            "limit=5 应因剪枝远少于全遍历：few={} full={}",
+            few.states_visited,
+            full.states_visited
+        );
+        // 剪枝不得损害正确性。
+        for limit in [1usize, 5, 40, 676, 999] {
+            assert_same(
+                &r.search_prefix("ok", limit),
+                &r.search_prefix_scan("ok", limit),
+                &format!("剪枝对拍 limit={limit}"),
+            );
+        }
+        let _ = std::fs::remove_file(&p);
+    }
+
+    /// **剪枝判据必须是严格小于**，放宽成 `<=` 即静默漏候选。
+    ///
+    /// 上界只覆盖 RankKey 的首要键 weight。`bound == 第 limit 名的 weight` 时，该子树内
+    /// 仍可能有同 weight 但 order/leaf 更小的条目应当取代第 limit 名。
+    ///
+    /// 构造刻意让**出队顺序完全确定**（否则 `<` 与 `<=` 的差异会随 tie 顺序时隐时现，
+    /// 测试变成抛硬币）：`za` 一个叶子内含两条（300/100）**一次性填满 limit=2**，
+    /// 于是 worst 的 weight=100 由它独自决定；此时唯一待展开的 `a` 子树 maxw 恰为 100。
+    /// `甲`(order=0, leaf=0) 优于 `丙`(order=1, leaf=1)，故必须能取代它。
+    #[test]
+    fn pruning_bound_must_be_strictly_less() {
+        let p = build(
+            "wdat_bnb_strict.wdat",
+            &[
+                ("ab", &[("甲", 100)][..]),
+                ("za", &[("乙", 300), ("丙", 100)][..]),
+            ],
+        );
+        let r = WdatReader::open(&p).unwrap();
+        let got: Vec<String> = r
+            .search_prefix("", 2)
+            .iter()
+            .map(|e| e.text.clone())
+            .collect();
+        assert_eq!(
+            got,
+            vec!["乙".to_string(), "甲".to_string()],
+            "同 weight 时 order 更小的「甲」应取代「丙」；若剪枝误用 <=，「甲」所在子树被整棵跳过"
+        );
+        assert_same(
+            &r.search_prefix("", 2),
+            &r.search_prefix_scan("", 2),
+            "严格小于对拍",
+        );
+        let _ = std::fs::remove_file(&p);
+    }
+
+    /// `maxw` 必须是**真实上界**：偏大只是剪枝变弱（结果仍正确），偏小则静默漏候选。
+    /// 逐前缀与暴力遍历子树求得的最大 weight 对拍。
+    #[test]
+    fn maxw_equals_brute_force_subtree_max() {
+        let p = build(
+            "wdat_maxw_bound.wdat",
+            &[
+                ("ab", &[("甲", 100)][..]),
+                ("abc", &[("乙", 700)][..]),
+                ("abd", &[("丙", 300)][..]),
+                ("az", &[("丁", 50)][..]),
+                ("z", &[("戊", 900)][..]),
+            ],
+        );
+        let r = WdatReader::open(&p).unwrap();
+        let v = &r.main;
+        for prefix in ["", "a", "ab", "abc", "abd", "az", "z"] {
+            let Some(s) = r.walk(v, prefix) else {
+                panic!("前缀 {prefix:?} 应可达");
+            };
+            let mut brute = NO_MAXW;
+            let mut path: Vec<u8> = prefix.as_bytes().to_vec();
+            r.for_each_leaf(v, s, &mut path, &mut |_code, leaf| {
+                r.read_leaf_entries(v, leaf, &mut |_t, w, _o, _b| {
+                    brute = brute.max(w);
+                });
+            });
+            assert_eq!(
+                r.maxw(v, s),
+                brute,
+                "前缀 {prefix:?} 的子树权重上界与暴力结果不符"
             );
         }
         let _ = std::fs::remove_file(&p);
