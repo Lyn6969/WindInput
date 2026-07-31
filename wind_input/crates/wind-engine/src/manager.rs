@@ -1347,6 +1347,19 @@ impl EngineManager {
         self.active_engine().map(|e| e.engine_type())
     }
 
+    /// 指定方案**已加载引擎**的类型（内存查，无 IO）。未加载返回 None。
+    ///
+    /// 与 [`schema_engine_type`](Self::schema_engine_type) 的区别是后者每次都
+    /// **读文件 + 解析 TOML**，不可放进逐键路径；本函数只查已加载引擎表。
+    /// 供 overlay 类模式（临拼等）按目标方案类型分流取数策略。
+    pub fn loaded_engine_type(&self, schema_id: &str) -> Option<EngineType> {
+        self.engines
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(schema_id)
+            .map(|e| e.engine_type())
+    }
+
     /// 确保指定方案可加载（懒加载）。用于 overlay 模式（特殊模式等）激活前的可用性校验。
     pub fn ensure_schema(&self, schema_id: &str) -> bool {
         self.ensure_loaded(schema_id)

@@ -4,7 +4,8 @@
 //! 触发键判定、进入/退出、候选刷新、按键处理、选词上屏。
 
 use crate::coordinator::{
-    Coordinator, ENGINE_MAX_CANDIDATES, State, en_case_variants, numpad_char, punct_char,
+    Coordinator, ENGINE_MAX_CANDIDATES, State, TEMP_PINYIN_MAX_CANDIDATES, en_case_variants,
+    numpad_char, punct_char,
 };
 use crate::pipeline::{ModeKind, Rewind};
 use crate::preedit_cursor;
@@ -185,6 +186,21 @@ impl Coordinator {
         state.selected_index = 0;
     }
 
+    /// 临拼向引擎取数的上限：目标方案是拼音类才取全量。
+    ///
+    /// 目标方案来自用户配置 `schema.primary_pinyin`，**该配置没有类型校验**——手改配置文件
+    /// 指向码表方案时，取全量会是 34.9MB 峰值 + 39.6ms 的严重劣化（码表单字母候选达 5472 条）。
+    /// 故按引擎类型分流：非拼音类退回原有小批量。
+    ///
+    /// 用 `loaded_engine_type` 而非 `schema_engine_type`：后者每次都读文件 + 解析 TOML，
+    /// 本函数在逐键路径上。目标方案此时必然已加载（`temp_pinyin_target` 内部调过 `ensure_loaded`）。
+    fn temp_pinyin_limit(&self, schema: &str) -> usize {
+        match self.engine_mgr.loaded_engine_type(schema) {
+            Some(wind_engine::EngineType::Pinyin) => TEMP_PINYIN_MAX_CANDIDATES,
+            _ => ENGINE_MAX_CANDIDATES,
+        }
+    }
+
     /// 用临时拼音目标方案转换缓冲，刷新候选与组合区（前缀 + 已转换汉字 + 剩余拼音）
     pub(crate) fn update_temp_pinyin_candidates(&self, state: &mut State) {
         state.candidates.clear();
@@ -200,9 +216,10 @@ impl Coordinator {
             state.overlay_body = state.temp_pinyin_buffer.clone();
             return;
         };
-        let result =
-            self.engine_mgr
-                .convert_with(&schema, &state.temp_pinyin_buffer, ENGINE_MAX_CANDIDATES);
+        let limit = self.temp_pinyin_limit(&schema);
+        let result = self
+            .engine_mgr
+            .convert_with(&schema, &state.temp_pinyin_buffer, limit);
         let display = if result.preedit_display.is_empty() {
             state.temp_pinyin_buffer.clone()
         } else {
@@ -218,9 +235,20 @@ impl Coordinator {
                 .cmp(&a.weight)
                 .then(a.natural_order.cmp(&b.natural_order))
         });
-        candidates.truncate(ENGINE_MAX_CANDIDATES);
+        // 截断值必须跟取数上限同源：这两处曾同用一个常量兼任「取多少」与「留多少」，
+        // 只改一处会出现「取了 5000 条又砍回 50」。
+        candidates.truncate(limit);
         // 统一展开汇聚点：临时拼音词库候选内 `$` 特殊语法在此展开（见 finalize_candidates）。
-        state.candidates = self.finalize_candidates(candidates, &state.temp_pinyin_buffer);
+        let mut candidates = self.finalize_candidates(candidates, &state.temp_pinyin_buffer);
+        // 检索范围过滤，与主路径同序：mark_common（判定，无条件）→ apply_filter（按模式裁剪）。
+        // **必须在 finalize 之后**：过滤的保留条件含 `is_command` / `is_group`，而这两个标志
+        // 正是 finalize_candidates 展开 `$CC`/`$AA` 时才置位的，提前过滤会把命令/组候选误删。
+        //
+        // 临拼此前完全不接过滤——「检索范围」设置对它从来无效，且默认 smart 下临拼比主路径
+        // 多出数百个生僻字候选（实测 `ying`：临拼 299 条 vs 主路径 76 条）。
+        self.mark_common(&mut candidates);
+        self.apply_filter(state, &mut candidates);
+        state.candidates = candidates;
         // 简繁 1对多变体展开（约束见 expand_s2t_variants 文档）。
         self.expand_s2t_variants(state);
     }

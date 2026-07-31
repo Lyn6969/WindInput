@@ -280,6 +280,22 @@ pub(crate) fn printable_char(key_code: u32, shift: bool) -> Option<char> {
 /// 引擎一次转换请求的候选上限（boost 重排后截断到 9）
 pub(crate) const ENGINE_MAX_CANDIDATES: usize = 50;
 
+/// 临时拼音（overlay 模式）向拼音引擎取数的上限。
+///
+/// **为什么这里可以直接取全量、而主路径要分批**：拼音引擎的 `max_candidates` 只用于最后
+/// 一步 `truncate`，召回/整句/排序全是全量做的（见 `pinyin/mod.rs`）。实测 `yi` 取 50 与取
+/// 5000 的耗时（6.2ms vs 6.4ms）与峰值内存（778KB）**完全相同**——小 limit 省不到任何成本，
+/// 只是把已构造好的候选丢掉。而临拼**没有翻页扩容通路**（`expand_candidates` 的守卫比对的是
+/// `input_buffer`，临拼的码在 `temp_pinyin_buffer` 里），一次取不全就永远取不到：
+/// 这正是「临拼下 `ying` 打不出「瑩」（该字在第 158 位）」的成因。
+///
+/// 取全量后翻页天然可穷尽——翻页只是对 `state.candidates` 切片，无需重新查询。
+/// 实测拼音候选上界为 916（`yi`），5000 留足余量。
+///
+/// ⚠️ **该值只对拼音类引擎安全**。码表单字母候选可达 5472 条（`r`），取全量峰值 34.9MB、
+/// 耗时 39.6ms，绝不可用；故取数前须按目标方案的引擎类型分流（见 `temp_pinyin_limit`）。
+pub(crate) const TEMP_PINYIN_MAX_CANDIDATES: usize = 5000;
+
 /// 自动造词（L）写入临时层的初始权重（保守默认，低于手动加词；后续可接 schema.learning 配置）。
 /// 复选次数只用于晋升判定（见 `Store::learn_temp_word`），不再驱动权重增长——
 /// 晋升入用户词库时统一取 `wind_store::temp_words::PROMOTED_WEIGHT`。
