@@ -279,7 +279,7 @@
   码表精确候选，保护它与"五笔优先"同向）。拼音路径恒为 `ProtectPolicy::NONE`。
 - ⚠️ **`freq_tier` 是首要键，开自动调频时整体压过 `candidate_display_order`**，也因此**掩盖
   `is_exact_code`/`is_prefix` 的效果**——验证 §6 类改动**必须关自动调频**。
-- ⚠️ tier 1 vs tier 2 对短语的区分**依赖 §5 打好的 `is_exact_code`**：精确码短语 tier 1、前缀短语 tier 2
+- ⚠️ tier 1 vs tier 3 对短语的区分**依赖 §5 打好的 `is_exact_code`**：精确码短语 tier 1、前缀短语 tier 3
   与码表补全同档（这是「打 `da` 时 `date` 短语不再压过码表补全」的落点）。
 
 ### 7.4 纯拼音：`rerank_pinyin_decay`
