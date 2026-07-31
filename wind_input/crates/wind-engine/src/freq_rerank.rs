@@ -63,7 +63,7 @@ fn freq_tier(c: &Candidate, input: &str) -> u8 {
     // ⚠️ 这里**不必**像协调器那样区分「是否混输」：本函数只服务
     // `rerank_codetable_usedfirst`（码表 / 混输），纯拼音走 `rerank_pinyin_decay` 不经过此处；
     // 而纯码表下没有 `Pinyin` 来源候选，本档天然是空操作。
-    if wind_candidate::is_pinyin_exact_tier(c) {
+    if wind_candidate::is_pinyin_exact_tier(c, input.len()) {
         return 2;
     }
     match c.source {

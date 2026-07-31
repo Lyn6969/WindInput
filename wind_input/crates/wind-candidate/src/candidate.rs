@@ -344,6 +344,7 @@ pub fn cmp_exact_first(a: &Candidate, b: &Candidate) -> std::cmp::Ordering {
 /// 候选是否属于**拼音精确档**：混输下该档整体先于码表前缀补全（见 [`cmp_pinyin_exact_first`]）。
 ///
 /// 判据是「这条拼音候选完整、精确地解释了本次输入，且是常用字词」：
+/// - **消费整串**（`consumed_length >= input_len`，0 = 引擎未标注，按整串算，与全仓约定一致）；
 /// - `is_prefix`/`is_partial`/`is_abbrev` 全假 = 既非前缀补全、也非子短语、也非简拼，即音节精确对齐；
 /// - `is_fuzzy` 假 = 非模糊音变体。★ 注意这里**不是**把 `is_fuzzy` 当层级键用（它明确不是层级，
 ///   见其字段文档），而是作为**提档准入**条件：模糊命中意味着用户没精确打对，不该越过码表词；
@@ -352,17 +353,29 @@ pub fn cmp_exact_first(a: &Candidate, b: &Candidate) -> std::cmp::Ordering {
 ///   越过码表前缀补全，反过来把码表候选挤出候选配额。用 `is_common` 而非固定条数上限，是让
 ///   「提多少条」跟着用户的检索范围设置走。
 ///
+/// ⚠️⚠️ **「消费整串」必须直接问 `consumed_length`，不能拿 `!is_partial` 代替**（首版即栽于此）：
+/// 真机打 `aaw`（本意 `aawt`→工作）时首选变成拼音「啊啊」。那是 Viterbi 整句（词条 `啊啊 a a`），
+/// `code` 取 `completed`="aa"、`consumed_length=2`，只解释了 3 键中的 2 键（`w` 是残码）——
+/// **可它的 `is_partial` 是 false**：整句走 `insert(0)` 不经 `pinyin/mod.rs` 的 `push_hit` 闭包
+/// （那里才算 `is_partial`），同文合并时还会主动 `existing.is_partial = false`。
+/// ★ `is_partial` 的语义是「这不是子短语」，**不是**「消费了整串」——两者在残码场景下分叉：
+/// 整句「啊啊」既不是子短语、也没消费整串。两个条件都保留（`is_partial=true` 而
+/// `consumed_length` 恰好未标注为 0 时，靠 `!is_partial` 兜住）。
+///
 /// ⚠️ **依赖 `is_common` 已被置位**：协调器 `mark_common` 必须在排序**之前**无条件跑过一遍。
 /// 该置位历史上写在 `apply_filter` 内部，且 `FilterMode::Gb18030` 时提前 return 完全不置位 ——
 /// 若沿用那个位置，本判据在 Gb18030 下会因 `is_common` 恒假而**整体失效且无任何痕迹**。
 /// 判定（无副作用）与过滤（按模式裁剪）因此拆开：判定无条件、过滤仍留在原步骤。
-pub fn is_pinyin_exact_tier(c: &Candidate) -> bool {
+///
+/// `input_len` 取**字节长度**，与 `consumed_length` 同域（输入缓冲恒为 ASCII 码字符）。
+pub fn is_pinyin_exact_tier(c: &Candidate, input_len: usize) -> bool {
     c.source == CandidateSource::Pinyin
         && c.is_common
         && !c.is_prefix
         && !c.is_partial
         && !c.is_abbrev
         && !c.is_fuzzy
+        && (c.consumed_length == 0 || c.consumed_length >= input_len)
 }
 
 /// 「拼音精确档先于码表前缀补全」比较（**仅混输**，见 `candidate_display_order` 的 `mixed` 参数）。
@@ -389,8 +402,12 @@ pub fn is_pinyin_exact_tier(c: &Candidate) -> bool {
 ///
 /// ⚠️ **`freq_rerank::freq_tier` 是同概念的第二份判据**（同一个 `is_pinyin_exact_tier`，档位 2）。
 /// 开自动调频时它是首要键、整体压过本比较链，两处改一处须核对另一处（红线③）。
-pub fn cmp_pinyin_exact_first(a: &Candidate, b: &Candidate) -> std::cmp::Ordering {
-    is_pinyin_exact_tier(b).cmp(&is_pinyin_exact_tier(a))
+pub fn cmp_pinyin_exact_first(
+    a: &Candidate,
+    b: &Candidate,
+    input_len: usize,
+) -> std::cmp::Ordering {
+    is_pinyin_exact_tier(b, input_len).cmp(&is_pinyin_exact_tier(a, input_len))
 }
 
 /// 比较两个候选词的排序优先级（权重降序）
@@ -479,9 +496,46 @@ mod pinyin_exact_tier_tests {
         }
     }
 
+    /// `xu` 的字节长度（本组用例的输入）。
+    const XU_LEN: usize = 2;
+
     #[test]
     fn pinyin_exact_common_char_is_in_tier() {
-        assert!(is_pinyin_exact_tier(&pinyin_exact()));
+        assert!(is_pinyin_exact_tier(&pinyin_exact(), XU_LEN));
+    }
+
+    /// ★★ 真机 `aaw` 现场（本判据首版栽在这里）：Viterbi 整句「啊啊」只消费 2/3 键，
+    /// 但 `is_partial` **是 false**（整句走 `insert(0)` 不经算 `is_partial` 的闭包，同文合并时
+    /// 还会主动置 false）。故「消费整串」必须直接问 `consumed_length`，不能拿 `!is_partial` 代替。
+    #[test]
+    fn partial_sentence_is_excluded_even_though_not_marked_partial() {
+        let aa = Candidate {
+            text: "啊啊".into(),
+            code: "aa".into(),
+            weight: 516,
+            is_common: true,
+            is_partial: false, // ← 整句路径就是这么置的，正是本用例的要害
+            consumed_length: 2,
+            source: CandidateSource::Pinyin,
+            ..Default::default()
+        };
+        assert!(
+            !is_pinyin_exact_tier(&aa, 3),
+            "只消费 2/3 键的整句不得进精确档（`aaw` 时它会抢走首位）"
+        );
+        // 同一条候选，输入恰好是 `aa`（消费整串）时才够格。
+        assert!(is_pinyin_exact_tier(&aa, 2), "消费整串时应进档");
+    }
+
+    /// `consumed_length == 0` = 引擎未标注 ⇒ 按整串算（与全仓约定一致，如 `apply_freq_rerank`
+    /// 的 `consumes_all`、`clear_blocked_by_candidates`）。
+    #[test]
+    fn unmarked_consumption_counts_as_whole_input() {
+        let c = Candidate {
+            consumed_length: 0,
+            ..pinyin_exact()
+        };
+        assert!(is_pinyin_exact_tier(&c, 5));
     }
 
     /// ★ 生僻字不进档 —— 这是「不设条数上限、改用检索范围把关」的落点。
@@ -492,7 +546,10 @@ mod pinyin_exact_tier_tests {
             is_common: false,
             ..pinyin_exact()
         };
-        assert!(!is_pinyin_exact_tier(&rare), "非常用字不得进拼音精确档");
+        assert!(
+            !is_pinyin_exact_tier(&rare, XU_LEN),
+            "非常用字不得进拼音精确档"
+        );
     }
 
     /// 四类「非精确」召回一律不进档（各自单独翻转，避免一个漏判被别的条件掩盖）。
@@ -528,20 +585,23 @@ mod pinyin_exact_tier_tests {
                 },
             ),
         ] {
-            assert!(!is_pinyin_exact_tier(&c), "{label}候选不得进拼音精确档");
+            assert!(
+                !is_pinyin_exact_tier(&c, XU_LEN),
+                "{label}候选不得进拼音精确档"
+            );
         }
     }
 
     /// 码表候选永不进本档（本档是拼音专属；码表的分层靠 `is_exact_code`）。
     #[test]
     fn codetable_never_enters_pinyin_tier() {
-        assert!(!is_pinyin_exact_tier(&codetable_prefix()));
+        assert!(!is_pinyin_exact_tier(&codetable_prefix(), XU_LEN));
         let ct_exact = Candidate {
             code: "xu".into(),
             is_exact_code: true,
             ..codetable_prefix()
         };
-        assert!(!is_pinyin_exact_tier(&ct_exact));
+        assert!(!is_pinyin_exact_tier(&ct_exact, XU_LEN));
     }
 
     /// 核心断言：拼音精确档先于码表前缀补全，**且与权重高低无关**。
@@ -554,19 +614,19 @@ mod pinyin_exact_tier_tests {
             weight: 509_999, // 码表前缀补全的权重上限（9999 + 500K）
             ..codetable_prefix()
         };
-        assert_eq!(cmp_pinyin_exact_first(&py, &ct), Ordering::Less);
-        assert_eq!(cmp_pinyin_exact_first(&ct, &py), Ordering::Greater);
+        assert_eq!(cmp_pinyin_exact_first(&py, &ct, XU_LEN), Ordering::Less);
+        assert_eq!(cmp_pinyin_exact_first(&ct, &py, XU_LEN), Ordering::Greater);
     }
 
     /// 反向锁：同档内本键不表态（交给后续权重级决），否则会掩盖档内的词频序。
     #[test]
     fn same_tier_is_undecided() {
         assert_eq!(
-            cmp_pinyin_exact_first(&pinyin_exact(), &pinyin_exact()),
+            cmp_pinyin_exact_first(&pinyin_exact(), &pinyin_exact(), XU_LEN),
             Ordering::Equal
         );
         assert_eq!(
-            cmp_pinyin_exact_first(&codetable_prefix(), &codetable_prefix()),
+            cmp_pinyin_exact_first(&codetable_prefix(), &codetable_prefix(), XU_LEN),
             Ordering::Equal
         );
     }

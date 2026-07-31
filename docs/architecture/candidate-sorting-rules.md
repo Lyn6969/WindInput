@@ -182,9 +182,20 @@
 ⑦ consumed_length         降              （消费整串者优先，供分段上屏；对齐引擎 better 末级）
 ```
 
-**③ 拼音精确档（混输专属）**：判据 `wind_candidate::is_pinyin_exact_tier` =
-`source==Pinyin && is_common && !is_prefix && !is_partial && !is_abbrev && !is_fuzzy`。
+**③ 拼音精确档（混输专属）**：判据 `wind_candidate::is_pinyin_exact_tier(c, input_len)` =
+`source==Pinyin && is_common && !is_prefix && !is_partial && !is_abbrev && !is_fuzzy`
+**且消费整串**（`consumed_length == 0 || consumed_length >= input_len`，0=未标注按整串算）。
 于是三档顺序为「码表精确/精确码短语 → **拼音精确** → 码表前缀补全」。
+
+- ⚠️⚠️ **「消费整串」必须直接问 `consumed_length`，不能拿 `!is_partial` 代替**（首版即栽于此）：
+  真机打 `aaw`（本意 `aawt`→工作）首选变成拼音「啊啊」。它是 Viterbi 整句（词条 `啊啊 a a`），
+  `code` 取 `completed`="aa"、`consumed_length=2`，只解释了 3 键中的 2 键——**可 `is_partial`
+  是 false**：整句走 `insert(0)` 不经 `pinyin/mod.rs` 里算 `is_partial` 的 `push_hit` 闭包，
+  同文合并时还会主动 `existing.is_partial = false`。
+  ★ `is_partial` 的语义是「这不是子短语」，**不是**「消费了整串」，两者在残码场景下分叉。
+  ★ 该场景比 `xu` 更严苛：五笔 `aaw` **无精确全码**（候选全是前缀补全），没有
+  `is_exact_code=true` 的候选占着首位 ⇒ 拼音一旦被误提档就直接是首选。
+  回归测试 `mixed_aaw_partial_sentence_does_not_preempt_codetable`（断言首选是「工作」）。
 
 - **修的什么**：混输打 `xu`，码表精确「弱」是首选（`xu` 是二简码），但拼音「需」（`code==xu`、
   该音节最高频字 6999）**实测排第 98 位**——被 124 条 `xu*` 码表前缀补全整体压住

@@ -2622,6 +2622,46 @@ fn mixed_xu_pinyin_exact_reaches_first_page() {
     );
 }
 
+/// 混输打 `aaw`（本意是 `aawt`→「工作」）：拼音的**部分匹配整句**不得抢走首位。
+///
+/// 真机现象：`aaw` 时首选变成拼音「啊啊」，把 `a`+`a` 拆成两个音节。
+///
+/// ★ 这是「拼音精确档」判据的边界：五笔 `aaw` **无精确全码**（候选全是 `aawt` 工作 / `aawf`
+/// 工会 一类前缀补全），所以没有 `is_exact_code=true` 的候选占着首位 —— 一旦拼音被误判进精确
+/// 档，它就直接是首选。而「啊啊」正是那个误判：
+/// - 它是 Viterbi 整句（词条 `啊啊 a a`），`code` 取 `completed`="aa"、`consumed_length=2`，
+///   只解释了 3 键中的 2 键，`w` 是残码；
+/// - 但 `is_partial` **是 false** —— 整句走 `insert(0)` 不经 `push_hit` 闭包，且同文合并时
+///   `mod.rs` 还会主动 `existing.is_partial = false`（其语义是「这不是子短语」，不是「消费了整串」）。
+///
+/// 故判据不能拿 `!is_partial` 代替「消费整串」，必须直接问 `consumed_length`。
+#[test]
+fn mixed_aaw_partial_sentence_does_not_preempt_codetable() {
+    if !has_schemas() {
+        eprintln!("跳过：缺少 schema");
+        return;
+    }
+    let mut cfg = config_mixed();
+    cfg.input.filter_mode = "general".into();
+    let coord = Coordinator::new_headless(cfg, Some(&data_dir()));
+    for c in "aaw".chars() {
+        press_letter(&coord, c);
+    }
+    let texts = coord.debug_all_candidate_texts();
+    // 前置：确认码表前缀补全确实在场（否则本用例退化成「没有竞争者」的假绿）。
+    assert!(
+        texts.iter().any(|t| t == "工作"),
+        "前置：aawt→「工作」应在候选内，实际: {:?}",
+        &texts[..texts.len().min(15)]
+    );
+    assert_eq!(
+        texts.first().map(String::as_str),
+        Some("工作"),
+        "首选应是码表前缀补全 aawt→「工作」(w=2268)，而非只消费 2/3 键的拼音整句「啊啊」；         前 10 条: {:?}",
+        &texts[..texts.len().min(10)]
+    );
+}
+
 /// 反向锁：**纯拼音**方案不受本改动影响（拼音精确档只在混输生效）。
 /// 纯拼音下全体候选同为 `Pinyin` 来源，若那个层级键误在此生效，会退化成「is_common 优先」，
 /// 把含生僻字的多字词硬降到全部常用单字之后。此处以「打 `xu` 首选仍是最高频字」把住基线。

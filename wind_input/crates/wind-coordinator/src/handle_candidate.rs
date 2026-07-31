@@ -42,6 +42,9 @@ use wind_ui::manager::CandidateOp;
 ///   缺失，留谁将由一个不含该字段的键随机决定，留下「消费整串」那条会让分段上屏把剩余拼音
 ///   一并吃掉。该级在 `better` 里早已存在，此前漏抄到本函数。
 ///
+/// - `input_len`：本次输入的**字节**长度，供拼音精确档判「消费整串」（与 `consumed_length` 同域，
+///   输入缓冲恒为 ASCII）。⚠️ 不可省成 `!is_partial`：Viterbi 整句只解释部分输入时
+///   `is_partial` 仍是 false（`aaw` → 「啊啊」只消费 2/3 键），会被误提档并抢走首位。
 /// - `mixed`：当前是混输引擎时，在 `is_exact_code` 之后、权重之前插入**拼音精确档**
 ///   （`wind_candidate::cmp_pinyin_exact_first`），使三档顺序为「码表精确 → 拼音精确 → 码表前缀
 ///   补全」。解决混输打 `xu` 时拼音「需」被码表 `xu*` 的 124 条前缀补全压到第 125 位。
@@ -55,6 +58,7 @@ fn candidate_display_order(
     b: &Candidate,
     ignore_weight: bool,
     mixed: bool,
+    input_len: usize,
 ) -> std::cmp::Ordering {
     let by_weight = if ignore_weight {
         std::cmp::Ordering::Equal
@@ -65,7 +69,7 @@ fn candidate_display_order(
     // 纯拼音/纯码表下必须为空操作——纯拼音时它会退化成「is_common 优先」，把含生僻字的
     // 多字词硬降到全部常用单字之后。
     let by_pinyin_exact = if mixed {
-        wind_candidate::cmp_pinyin_exact_first(a, b)
+        wind_candidate::cmp_pinyin_exact_first(a, b, input_len)
     } else {
         std::cmp::Ordering::Equal
     };
@@ -660,6 +664,8 @@ impl Coordinator {
         // lookup_prefix_at），而 `candidate_display_order` 无文本末级，同分时取到的会是随机一条。
         let mixed =
             self.engine_mgr.current_engine_type() == Some(wind_engine::engine::EngineType::Mixed);
+        // 供拼音精确档判「消费整串」。字节长度，与 `consumed_length` 同域（缓冲恒 ASCII）。
+        let input_len = state.input_buffer.len();
         if candidates.is_empty() {
             completion_pool.extend(engine_completion);
             let ignore_weight = self.engine_mgr.active_base_sort_ignores_weight();
@@ -667,7 +673,7 @@ impl Coordinator {
             // 上面「本会显示在最前的那一条」这句承诺就不成立了）。
             self.mark_common(&mut completion_pool);
             completion_pool.sort_by(|a, b| {
-                candidate_display_order(a, b, ignore_weight, mixed)
+                candidate_display_order(a, b, ignore_weight, mixed, input_len)
                     .then_with(|| a.text.cmp(&b.text))
             });
             candidates.extend(completion_pool.into_iter().next());
@@ -678,7 +684,7 @@ impl Coordinator {
         // ⚠️ 常用字判定必须**先于排序**：混输的拼音精确档拿 `is_common` 作提档准入条件
         // （见 `mark_common` 与 `wind_candidate::is_pinyin_exact_tier`）。过滤仍在下面按模式进行。
         self.mark_common(&mut candidates);
-        candidates.sort_by(|a, b| candidate_display_order(a, b, ignore_weight, mixed));
+        candidates.sort_by(|a, b| candidate_display_order(a, b, ignore_weight, mixed, input_len));
         let mut seen = std::collections::HashSet::new();
         candidates.retain(|c| seen.insert(c.text.clone()));
         // 检索范围过滤（按模式裁剪；is_common 已由上面的 mark_common 填好）
@@ -2404,6 +2410,10 @@ mod finalize_candidates_tests {
         assert!(out[0].is_command);
     }
 
+    /// 本组用例的输入长度（`xu` 两字节）。传给 `candidate_display_order` 的拼音精确档，
+    /// 用来判「候选是否消费了整串」；`mixed=false` 的用例里该档不参与，取值无影响。
+    const XU_LEN: usize = 2;
+
     fn cand_ordered(text: &str, base_order: i32, natural_order: i32, weight: i32) -> Candidate {
         Candidate {
             text: text.into(),
@@ -2456,7 +2466,7 @@ mod finalize_candidates_tests {
         let (ct_exact, py_exact, ct_prefix) = xu_scene();
         // 故意以最不利顺序放入，确保结果由排序而非原序决定。
         let mut cands = vec![ct_prefix, py_exact, ct_exact];
-        cands.sort_by(|a, b| candidate_display_order(a, b, false, true));
+        cands.sort_by(|a, b| candidate_display_order(a, b, false, true, XU_LEN));
         let order: Vec<&str> = cands.iter().map(|c| c.text.as_str()).collect();
         assert_eq!(
             order,
@@ -2472,7 +2482,7 @@ mod finalize_candidates_tests {
     fn non_mixed_keeps_weight_order_for_pinyin() {
         let (_, py_exact, ct_prefix) = xu_scene();
         let mut cands = vec![py_exact, ct_prefix];
-        cands.sort_by(|a, b| candidate_display_order(a, b, false, false));
+        cands.sort_by(|a, b| candidate_display_order(a, b, false, false, XU_LEN));
         assert_eq!(
             cands[0].text, "弹幕",
             "非混输时应回落到纯权重序（501554 > 69），拼音精确档不得生效"
@@ -2492,7 +2502,7 @@ mod finalize_candidates_tests {
             ..py_exact
         };
         let mut cands = vec![rare, ct_prefix];
-        cands.sort_by(|a, b| candidate_display_order(a, b, false, true));
+        cands.sort_by(|a, b| candidate_display_order(a, b, false, true, XU_LEN));
         assert_eq!(
             cands[0].text, "弹幕",
             "生僻同音字不得越过码表前缀补全（否则 329 条同音字会挤爆配额）"
@@ -2509,7 +2519,7 @@ mod finalize_candidates_tests {
             ..py_exact.clone()
         };
         let mut cands = vec![xu_low, py_exact];
-        cands.sort_by(|a, b| candidate_display_order(a, b, false, true));
+        cands.sort_by(|a, b| candidate_display_order(a, b, false, true, XU_LEN));
         assert_eq!(cands[0].text, "需", "同档内仍按权重降序（69 > 13）");
     }
 
@@ -2524,7 +2534,7 @@ mod finalize_candidates_tests {
         for ignore_weight in [false, true] {
             // 故意以「有时」在前的顺序放入，确保是排序而非原序决定结果。
             let mut cands = vec![youshi.clone(), yi.clone()];
-            cands.sort_by(|a, b| candidate_display_order(a, b, ignore_weight, false));
+            cands.sort_by(|a, b| candidate_display_order(a, b, ignore_weight, false, XU_LEN));
             assert_eq!(
                 cands[0].text, "一",
                 "base_order=0 主库候选应排在 base_order=2 次选库候选之前（ignore_weight={ignore_weight}）"
@@ -2541,11 +2551,11 @@ mod finalize_candidates_tests {
         let extra_high = cand_ordered("扩高", 1, 5, 999); // 次选库、高权重
         // weight 模式：权重降序主导 → 扩高(999) 在前。
         let mut w = vec![main_low.clone(), extra_high.clone()];
-        w.sort_by(|a, b| candidate_display_order(a, b, false, false));
+        w.sort_by(|a, b| candidate_display_order(a, b, false, false, XU_LEN));
         assert_eq!(w[0].text, "扩高", "weight 模式高权重应靠前");
         // natural 模式：忽略权重 → base_order 升序主导，主库(0) 在前。
         let mut n = vec![main_low, extra_high];
-        n.sort_by(|a, b| candidate_display_order(a, b, true, false));
+        n.sort_by(|a, b| candidate_display_order(a, b, true, false, XU_LEN));
         assert_eq!(
             n[0].text, "主低",
             "natural 模式忽略权重、按 base_order 升序，主库应靠前"
@@ -2603,7 +2613,7 @@ mod finalize_candidates_tests {
                 exact.clone(),
                 guide_group.clone(),
             ];
-            cands.sort_by(|a, b| candidate_display_order(a, b, ignore_weight, false));
+            cands.sort_by(|a, b| candidate_display_order(a, b, ignore_weight, false, XU_LEN));
             let order: Vec<&str> = cands.iter().map(|c| c.text.as_str()).collect();
             assert_eq!(
                 order,
