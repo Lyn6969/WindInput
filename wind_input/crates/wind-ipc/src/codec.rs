@@ -294,20 +294,34 @@ pub fn encode_mode_push(chinese_mode: bool, full_width: bool) -> Vec<u8> {
 
 /// 编码 ShellExec 推送（CMD_SHELL_EXEC 0x020E）：让 TSF DLL 在前台应用进程中执行 ShellExecuteW。
 ///
-/// 格式: target_len(u32 LE) + target(UTF-8) + params_len(u32 LE) + params(UTF-8)
+/// 格式: 依次为 5 个 `len(u32 LE) + bytes(UTF-8)` 段：
+/// target / params / dir / verb / show
+///
 /// - open(url/file): target = url, params = ""
 /// - proc.run(cmd, args): target = cmd, params = args joined with space
-pub fn encode_shell_exec(target: &str, params: &str) -> Vec<u8> {
-    let t = target.as_bytes();
-    let p = params.as_bytes();
-    let payload_len = 4 + t.len() + 4 + p.len();
+/// - dir: 子进程工作目录，空串 = 不指定（TSF 侧即沿用宿主应用当前目录）
+/// - verb: ShellExecute 动词（`open` / `runas` / …），空串 = `open`
+/// - show: 初始窗口状态（`normal` / `min` / `max` / `hidden`），空串 = `normal`
+///
+/// `verb` / `show` 传**语义名而非 SW_ 数值**：协议自描述（日志里 `show=min` 比
+/// `show=2` 好读），且 Windows API 常量留在 C++ 侧，跨平台的本 crate 不碰。
+///
+/// dir/verb/show 都是后加的段，两个方向都容错：旧 DLL 只读它认识的前几段、忽略
+/// 尾部（表现为新选项不生效，不会崩）；新 DLL 每读一段前先查剩余长度，遇旧服务
+/// 按空串处理。⚠️ 因此「装了新服务但宿主进程还挂着旧 DLL」时这些字段静默失效，
+/// 排查时服务端日志是唯一能证明"发过什么"的一侧。
+///
+/// ShellExecuteW 的入参到此已全部覆盖（hwnd 恒 null），这条协议不会再长。
+pub fn encode_shell_exec(target: &str, params: &str, dir: &str, verb: &str, show: &str) -> Vec<u8> {
+    let segs = [target, params, dir, verb, show];
+    let payload_len: usize = segs.iter().map(|s| 4 + s.len()).sum();
     let mut buf = Vec::with_capacity(IpcHeader::SIZE + payload_len);
     let ipc = IpcHeader::new(CMD_SHELL_EXEC, payload_len as u32);
     buf.extend_from_slice(&ipc.to_bytes());
-    buf.extend_from_slice(&(t.len() as u32).to_le_bytes());
-    buf.extend_from_slice(t);
-    buf.extend_from_slice(&(p.len() as u32).to_le_bytes());
-    buf.extend_from_slice(p);
+    for s in segs {
+        buf.extend_from_slice(&(s.len() as u32).to_le_bytes());
+        buf.extend_from_slice(s.as_bytes());
+    }
     buf
 }
 
@@ -647,6 +661,67 @@ pub fn encode_host_render_setup(
     buf.extend_from_slice(&ipc.to_bytes());
     buf.extend_from_slice(&payload);
     buf
+}
+
+#[cfg(test)]
+mod shell_exec_tests {
+    use super::*;
+
+    /// 按「长度前缀 + 内容」逐段解码，最多取 `max_segs` 段。
+    /// `max_segs=2` 即模拟只认 target/params 的**旧版 DLL**。
+    fn decode_segs(buf: &[u8], max_segs: usize) -> Vec<String> {
+        let mut p = &buf[IpcHeader::SIZE..];
+        let mut out = Vec::new();
+        while out.len() < max_segs && p.len() >= 4 {
+            let n = u32::from_le_bytes(p[0..4].try_into().unwrap()) as usize;
+            if p.len() < 4 + n {
+                break;
+            }
+            out.push(String::from_utf8(p[4..4 + n].to_vec()).unwrap());
+            p = &p[4 + n..];
+        }
+        out
+    }
+
+    #[test]
+    fn encodes_five_segments_in_order() {
+        let buf = encode_shell_exec("d.exe", "a b", "D:/W", "runas", "min");
+        assert_eq!(
+            decode_segs(&buf, 5),
+            vec!["d.exe", "a b", "D:/W", "runas", "min"]
+        );
+    }
+
+    /// 未指定的选项走空串段而非省略段——段数恒定，解码方不必猜"少的是哪一个"。
+    #[test]
+    fn omitted_options_are_empty_segments_not_missing_ones() {
+        let buf = encode_shell_exec("d.exe", "", "", "", "");
+        assert_eq!(decode_segs(&buf, 5), vec!["d.exe", "", "", "", ""]);
+    }
+
+    /// **向后兼容**：只认前两段的旧 DLL 读同一份新报文，仍应拿到正确的
+    /// target/params。新段追加在尾部，旧解析器读完就停，不会错位。
+    /// 这是「新服务 + 旧 DLL」组合下 proc.run 不至于整体失效的依据。
+    #[test]
+    fn old_two_segment_reader_still_gets_target_and_params() {
+        let buf = encode_shell_exec("d.exe", "a b", "D:/W", "runas", "min");
+        assert_eq!(decode_segs(&buf, 2), vec!["d.exe", "a b"]);
+    }
+
+    /// 载荷长度必须与声明一致，否则 C++ 侧以 header.length 为边界会截断尾部段。
+    #[test]
+    fn payload_len_in_header_covers_all_segments() {
+        let buf = encode_shell_exec("d.exe", "a b", "D:/W", "runas", "min");
+        let declared = u32::from_le_bytes(buf[4..8].try_into().unwrap()) as usize;
+        assert_eq!(declared, buf.len() - IpcHeader::SIZE);
+    }
+
+    /// 非 ASCII 段按 UTF-8 字节计长（中文路径必经之路）。
+    #[test]
+    fn non_ascii_segments_use_byte_length() {
+        let buf = encode_shell_exec("d.exe", "", "D:/我的 词库", "", "");
+        assert_eq!(decode_segs(&buf, 3)[2], "D:/我的 词库");
+    }
 }
 
 #[cfg(test)]

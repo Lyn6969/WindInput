@@ -15,6 +15,9 @@ use super::lexer::{
 use crate::ast::{ArrayPhrase, CommandPhrase, Expr, ModValue, Modifiers, Phrase, StringPart};
 use crate::error::{CmdbarError, Result};
 
+/// 一次调用的实参：位置参数 + 具名参数（`k=expr`，保留源顺序）。
+type ArgList = (Vec<Expr>, Vec<(String, Expr)>);
+
 /// 解析一条短语源为 [`Phrase`]。
 pub fn parse(src: &str) -> Result<Phrase> {
     if let Some((marker, idx, open_off)) = find_top_level_marker(src) {
@@ -657,14 +660,63 @@ impl Parser {
         CmdbarError::parse(self.base_off + off, msg.into())
     }
 
-    /// 零或多个逗号分隔的表达式。
+    /// 零或多个逗号分隔的表达式（marker 短语的参数位；不接受具名参数）。
     fn parse_expr_list(&mut self) -> Result<Vec<Expr>> {
+        let off = self.peek().offset;
+        let (args, named) = self.parse_arg_list()?;
+        if !named.is_empty() {
+            // marker 短语的「选项」是末参 options bag `{k: v}`，不是 `k=v`。
+            return Err(self.errf(
+                off,
+                "named arguments are only allowed in function calls (use the {k: v} options bag here)",
+            ));
+        }
+        Ok(args)
+    }
+
+    /// 调用实参列表：位置参数在前，具名参数 `k=expr` 在后。
+    ///
+    /// key 不单独向前看，而是先按表达式解析、见到 `=` 再要求它是裸标识符——
+    /// 这样 `"s"=1` / `f(x)=1` 这类写法自然被拒，无需额外判据。
+    fn parse_arg_list(&mut self) -> Result<ArgList> {
         if matches!(self.peek().kind, TokenKind::Eof | TokenKind::RParen) {
-            return Ok(Vec::new());
+            return Ok((Vec::new(), Vec::new()));
         }
         let mut out = Vec::new();
+        let mut named: Vec<(String, Expr)> = Vec::new();
         loop {
-            out.push(self.parse_expr()?);
+            let off = self.peek().offset;
+            let e = self.parse_expr()?;
+            if self.peek().kind == TokenKind::Assign {
+                let Expr::Ident(key) = e else {
+                    return Err(self.errf(off, "named argument key must be a bare identifier"));
+                };
+                self.bump(); // '='
+                if matches!(
+                    self.peek().kind,
+                    TokenKind::Eof | TokenKind::RParen | TokenKind::Comma
+                ) {
+                    return Err(self.errf(
+                        self.peek().offset,
+                        format!("named argument {key:?} has no value"),
+                    ));
+                }
+                // 重复键报错而非 last-write-wins：两次赋值必有一次是笔误，
+                // 静默取后者会让「改了不生效」变成无痕迹的排查题。
+                if named.iter().any(|(k, _)| *k == key) {
+                    return Err(self.errf(off, format!("duplicate named argument {key:?}")));
+                }
+                let val = self.parse_expr()?;
+                named.push((key, val));
+            } else {
+                // 位置参数不得跟在具名参数之后，否则「这是第几个参数」随写法漂移。
+                if !named.is_empty() {
+                    return Err(
+                        self.errf(off, "positional argument must not follow a named argument")
+                    );
+                }
+                out.push(e);
+            }
             if self.peek().kind != TokenKind::Comma {
                 break;
             }
@@ -673,7 +725,7 @@ impl Parser {
                 return Err(self.errf(self.peek().offset, "trailing comma"));
             }
         }
-        Ok(out)
+        Ok((out, named))
     }
 
     fn parse_expr(&mut self) -> Result<Expr> {
@@ -710,10 +762,10 @@ impl Parser {
                 // 调用形式？
                 if self.peek().kind == TokenKind::LParen {
                     self.bump();
-                    let args = if self.peek().kind != TokenKind::RParen {
-                        self.parse_expr_list()?
+                    let (args, named) = if self.peek().kind != TokenKind::RParen {
+                        self.parse_arg_list()?
                     } else {
-                        Vec::new()
+                        (Vec::new(), Vec::new())
                     };
                     if self.peek().kind != TokenKind::RParen {
                         return Err(self.errf(
@@ -722,7 +774,7 @@ impl Parser {
                         ));
                     }
                     self.bump();
-                    return Ok(Expr::Call { name, args });
+                    return Ok(Expr::Call { name, args, named });
                 }
                 // 裸标识符：带 namespace 的必须用 ()。
                 if name.contains('.') {
@@ -920,6 +972,63 @@ mod tests {
         }
     }
 
+    /// 取 `$CC` 第一个动作的调用节点。
+    fn first_call(src: &str) -> (String, Vec<Expr>, Vec<(String, Expr)>) {
+        match pp(src) {
+            Phrase::Command(c) => match c.actions[0].clone() {
+                Expr::Call { name, args, named } => (name, args, named),
+                other => panic!("expected call, got {other:?}"),
+            },
+            _ => panic!("expected command"),
+        }
+    }
+
+    #[test]
+    fn named_args_parse_after_positional() {
+        let (name, args, named) =
+            first_call(r#"$CC("查词", proc.run("D:/Dict/d.exe", "x", cwd="D:/Dict"))"#);
+        assert_eq!(name, "proc.run");
+        assert_eq!(args.len(), 2);
+        assert_eq!(named.len(), 1);
+        assert_eq!(named[0].0, "cwd");
+        assert_eq!(
+            named[0].1,
+            Expr::StringLit(vec![StringPart::Text("D:/Dict".into())])
+        );
+    }
+
+    #[test]
+    fn named_arg_value_may_interpolate() {
+        // 值是完整表达式，插值/嵌套调用都成立（cwd 取自当前输入等场景）。
+        let (_, _, named) = first_call(r#"$CC("x", proc.run("a.exe", cwd="{last(1)}"))"#);
+        assert!(matches!(&named[0].1, Expr::StringLit(parts)
+            if matches!(parts[0], StringPart::Interp(_))));
+    }
+
+    #[test]
+    fn named_args_reject_bad_forms() {
+        // 位置参数不能跟在具名之后
+        assert!(parse(r#"$CC("x", proc.run("a.exe", cwd="d", "p"))"#).is_err());
+        // 重复 key
+        assert!(parse(r#"$CC("x", proc.run("a.exe", cwd="d", cwd="e"))"#).is_err());
+        // 缺值
+        assert!(parse(r#"$CC("x", proc.run("a.exe", cwd=))"#).is_err());
+        // key 必须是裸标识符
+        assert!(parse(r#"$CC("x", proc.run("a.exe", "cwd"="d"))"#).is_err());
+        // marker 层不收具名参数（那里的选项是末参 options bag）
+        assert!(parse(r#"$CC("x", type("y"), prefix=true)"#).is_err());
+    }
+
+    #[test]
+    fn named_args_round_trip_through_display() {
+        // Display 用于调试回显与设置页展示，具名参数必须能原样写回。
+        let src = r#"$CC("x", proc.run("a.exe", "p", cwd="D:/d"))"#;
+        assert_eq!(pp(src).to_string(), src);
+        // 无位置参数时不应留下多余逗号
+        let only_named = r#"$CC("x", proc.run(cwd="D:/d"))"#;
+        assert_eq!(pp(only_named).to_string(), only_named);
+    }
+
     #[test]
     fn cc1_injects_prefix_modifier() {
         let p = pp(r#"$CC1("x", type("x"))"#);
@@ -1034,7 +1143,7 @@ mod tests {
         let p = pp(r#"$CC("打开", open("E:\我的文档\x"))"#);
         match p {
             Phrase::Command(c) => match &c.actions[0] {
-                Expr::Call { name, args } => {
+                Expr::Call { name, args, .. } => {
                     assert_eq!(name, "open");
                     // 未知转义 `\我` / `\x` 原样保留（含反斜杠）。
                     assert_eq!(

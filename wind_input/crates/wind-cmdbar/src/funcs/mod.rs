@@ -20,11 +20,18 @@ pub mod value;
 ///     "len" : Text (1, 1) det => fn_len, "字符数", "len(x)";
 ///     "code": Value (0, 1) pure => fn_code, "输入编码", "code()";
 ///     "open": Action (1, 1) effect => fn_open, "打开", "open(\"u\")";
+///     // 带具名参数：尾部追加 `named(入口, "名" = "说明", ...)`
+///     "proc.run": Proc (1, -1) effect => fn_run, "启动程序", "proc.run(\"x\")"
+///         named(fn_run_named, "cwd" = "工作目录");
 /// }
 /// ```
 /// `det` = 纯且确定；`pure` = 纯但非确定（依赖外部状态）；`effect` = 副作用函数。
+///
+/// 具名参数**声明在这里**而不是在 `specs()` 里事后打补丁：函数的能力应当在它的
+/// 声明处就看得见，否则「这个函数支不支持 cwd」得跨函数翻代码才能回答。
 macro_rules! func_specs {
-    ( $( $name:literal : $cat:ident ( $min:expr, $max:expr ) $kind:ident => $eval:path , $desc:literal , $ex:literal );+ $(;)? ) => {
+    ( $( $name:literal : $cat:ident ( $min:expr, $max:expr ) $kind:ident => $eval:path , $desc:literal , $ex:literal
+         $( named ( $nf:path $(, $np:literal = $nd:literal )+ ) )? );+ $(;)? ) => {
         vec![ $(
             $crate::registry::FuncSpec {
                 name: $name,
@@ -38,6 +45,18 @@ macro_rules! func_specs {
                 description: $desc,
                 example: $ex,
                 eval: $eval,
+                named_params: {
+                    #[allow(unused_mut)]
+                    let mut _v: &'static [(&'static str, &'static str)] = &[];
+                    $( _v = &[ $( ($np, $nd) ),+ ]; )?
+                    _v
+                },
+                eval_named: {
+                    #[allow(unused_mut)]
+                    let mut _f: ::core::option::Option<$crate::registry::EvalFnNamed> = None;
+                    $( _f = Some($nf); )?
+                    _f
+                },
             }
         ),+ ]
     };

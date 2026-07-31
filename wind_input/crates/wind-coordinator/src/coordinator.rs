@@ -3347,9 +3347,19 @@ impl Coordinator {
     }
 
     /// macOS 的 open/proc.run/设置均改为进程内执行或 CmdOpenSettings，不再经此 IPC，故仅非 macOS。
+    ///
+    /// `dir` = 被启动进程的工作目录（空串 = 不指定，由 TSF 侧沿用调用进程当前目录）；
+    /// `verb` / `show` = ShellExecute 的动词与初始窗口状态（空串 = open / normal）。
     #[cfg(not(target_os = "macos"))]
-    pub(crate) fn push_shell_exec(&self, target: &str, params: &str) {
-        let encoded = wind_ipc::codec::encode_shell_exec(target, params);
+    pub(crate) fn push_shell_exec(
+        &self,
+        target: &str,
+        params: &str,
+        dir: &str,
+        verb: &str,
+        show: &str,
+    ) {
+        let encoded = wind_ipc::codec::encode_shell_exec(target, params, dir, verb, show);
         // 带副作用操作（启动/激活外部程序）只投给活跃（前台）客户端，与 push_commit 语义一致。
         // 若广播全部客户端，多个后台 TSF 进程会竞相 ShellExecuteW，非前台进程启动的 wind_setting
         // 第二实例无前台权限，其 SetForegroundWindow 失败，导致窗口有较大概率停在后台。

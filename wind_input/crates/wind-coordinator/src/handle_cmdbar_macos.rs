@@ -23,8 +23,15 @@ pub(crate) fn open_native(target: &str) -> anyhow::Result<()> {
 
 /// 服务进程内启动外部程序（带参数），直接 spawn。若需以 .app 名启动并激活，用户可改用
 /// `open("...")` 或 `proc.shell("open -a ...")`。
-pub(crate) fn run_native(cmd: &str, args: &[String]) -> anyhow::Result<()> {
-    Command::new(cmd).args(args).spawn()?;
+pub(crate) fn run_native(cmd: &str, args: &[String], cwd: &str) -> anyhow::Result<()> {
+    let mut c = Command::new(cmd);
+    c.args(args);
+    // 空串 = 继承服务进程的当前目录。服务由 launchd 拉起时那通常是 `/`，
+    // 同样是不确定的，故调用方应先经 resolve_workdir 定好目录。
+    if !cwd.is_empty() {
+        c.current_dir(cwd);
+    }
+    c.spawn()?;
     Ok(())
 }
 

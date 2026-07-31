@@ -275,7 +275,14 @@ public:
     // Callback type for shell exec push (CMD_SHELL_EXEC).
     // 在 TSF 侧（前台应用进程）调用 ShellExecuteW，解决 Service 进程无前台权限问题。
     // 回调在 AsyncReader 线程上调用，ShellExecuteW 线程安全，可直接调用。
-    using ShellExecCallback = std::function<void(const std::wstring& target, const std::wstring& params)>;
+    //
+    // dir = 子进程的工作目录，空串表示不指定。**空串意味着继承本进程（前台宿主
+    // 应用）的当前目录**，那个值不可控且会被文件对话框改掉，所以服务端总会算好
+    // 一个确定目录发过来；这里为空只出现在对接旧版服务时。
+    // verb = ShellExecute 动词（open/runas/edit/print/explore/properties），空串 = open。
+    // show = 初始窗口状态（normal/min/max/hidden），空串 = normal。
+    // verb/show 的取值已由服务端按白名单校验，收到的一定合法或为空。
+    using ShellExecCallback = std::function<void(const std::wstring& target, const std::wstring& params, const std::wstring& dir, const std::wstring& verb, const std::wstring& show)>;
 
     // Set callback for receiving state push from Go
     void SetStatePushCallback(StatePushCallback callback);

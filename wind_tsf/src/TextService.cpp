@@ -3299,11 +3299,24 @@ BOOL CTextService::_InitIPCClient()
     // Set up shell exec callback (CMD_SHELL_EXEC)
     // 在前台应用进程中调用 ShellExecuteW，拥有前台权限，打开的窗口可正确置顶。
     // 回调在 AsyncReader 线程执行，ShellExecuteW 是线程安全的，无需切换到 TSF 主线程。
-    _pIPCClient->SetShellExecCallback([](const std::wstring& target, const std::wstring& params) {
+    // lpDirectory 传服务端算好的工作目录：传 nullptr 等于沿用**本进程**（即用户正在
+    // 打字的那个宿主应用）的当前目录，那个值不可控——通用文件对话框会改掉它——
+    // 于是靠相对路径找数据文件的程序（词典等）会找不到自己的词库。
+    _pIPCClient->SetShellExecCallback([](const std::wstring& target, const std::wstring& params, const std::wstring& dir, const std::wstring& verb, const std::wstring& show) {
         const wchar_t* pParams = params.empty() ? nullptr : params.c_str();
-        HINSTANCE ret = ::ShellExecuteW(nullptr, L"open", target.c_str(), pParams, nullptr, SW_SHOWNORMAL);
+        const wchar_t* pDir = dir.empty() ? nullptr : dir.c_str();
+        // 空 verb 传 nullptr 而非 L"open"：nullptr 用的是该文件类型的**默认动词**，
+        // 未必是 open（如某些类型默认 play/edit），与不带 verb 的历史行为一致。
+        const wchar_t* pVerb = verb.empty() ? nullptr : verb.c_str();
+        // 语义名 → SW_ 常量。取值已由服务端白名单校验；未知值落 SW_SHOWNORMAL，
+        // 这只会在「新服务加了新取值 + 旧 DLL」的版本错配下出现。
+        int nShow = SW_SHOWNORMAL;
+        if      (show == L"min")    nShow = SW_SHOWMINNOACTIVE;  // 最小化且不抢焦点
+        else if (show == L"max")    nShow = SW_SHOWMAXIMIZED;
+        else if (show == L"hidden") nShow = SW_HIDE;
+        HINSTANCE ret = ::ShellExecuteW(nullptr, pVerb, target.c_str(), pParams, pDir, nShow);
         if (reinterpret_cast<INT_PTR>(ret) <= 32)
-            WIND_LOG_ERROR_FMT(L"ShellExecuteW failed: target=%s code=%d", target.c_str(), static_cast<int>(reinterpret_cast<INT_PTR>(ret)));
+            WIND_LOG_ERROR_FMT(L"ShellExecuteW failed: target=%s dir=%s verb=%s code=%d", target.c_str(), dir.c_str(), verb.c_str(), static_cast<int>(reinterpret_cast<INT_PTR>(ret)));
     });
 
     // Set up state push callback

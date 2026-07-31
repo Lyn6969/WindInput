@@ -107,7 +107,15 @@ pub enum Expr {
     /// 裸标识符（语义等价零参调用）。
     Ident(String),
     /// 函数调用；`name` 可含单个 `.` 作 namespace（如 `clip.copy`）。
-    Call { name: String, args: Vec<Expr> },
+    ///
+    /// `named` 是具名参数（`cwd="D:/d"`），保留源顺序、值为完整表达式（可含插值）。
+    /// 位置参数与具名参数分开存放：位置参数是**变参**（`proc.run` 是 `(1, -1)`），
+    /// 若把具名参数混进 `args`，末位到底是第 N 个参数还是一个选项就永远二义。
+    Call {
+        name: String,
+        args: Vec<Expr>,
+        named: Vec<(String, Expr)>,
+    },
     /// options bag `{k: v, ...}`（仅作为 marker 调用的末参出现）。
     Object(Vec<(String, ModValue)>),
     /// 嵌入的 `$CC(...)`（仅出现在 `$SS` 元素位）。
@@ -193,13 +201,20 @@ impl fmt::Display for Expr {
                 }
             }
             Expr::Ident(name) => write!(f, "{name}"),
-            Expr::Call { name, args } => {
+            Expr::Call { name, args, named } => {
                 write!(f, "{name}(")?;
                 for (i, a) in args.iter().enumerate() {
                     if i > 0 {
                         write!(f, ", ")?;
                     }
                     write!(f, "{a}")?;
+                }
+                // 具名参数恒排在位置参数之后（与解析期规则一致），故可直接续写。
+                for (i, (k, v)) in named.iter().enumerate() {
+                    if i > 0 || !args.is_empty() {
+                        write!(f, ", ")?;
+                    }
+                    write!(f, "{k}={v}")?;
                 }
                 write!(f, ")")
             }

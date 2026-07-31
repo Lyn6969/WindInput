@@ -18,8 +18,8 @@
 | `src/action.rs` | `ActionKind`（Text/Effect）与 `ResolvedAction`；持有 `Expr` 在 `run()` 时延迟求值 |
 | `src/context.rs` | `EvalContext` trait、`History`（固定容量环形缓冲，Mutex 互斥）、`MemoryContext`（测试用内存实现） |
 | `src/services.rs` | 8 个副作用 trait（`ClipboardService` / `KeyInjector` / `UrlOpener` / `ProcessRunner` / `DictService` / `ImeController` / `ConfigService` / `SearchEngine`）及 `Services` 聚合结构 |
-| `src/registry.rs` | `FuncSpec` 元信息、`Registry`（`with_builtins` / `full` / `default_registry`）、`Category` 枚举 |
-| `src/parser/` | 手写词法（`lexer.rs`）+ 语法（`parser.rs`）；`is_cmdbar_grammar` 检测顶层 `{` 或 marker |
+| `src/registry.rs` | `FuncSpec` 元信息、`Registry`（`with_builtins` / `full` / `default_registry`）、`Category` 枚举；`named_params` 白名单 + `eval_named` 入口**必须成对声明**（有自检测试兜底） |
+| `src/parser/` | 手写词法（`lexer.rs`）+ 语法（`parser.rs`）；`is_cmdbar_grammar` 检测顶层 `{` 或 marker；`parse_arg_list` 产出位置参数 + 具名参数（`k=expr`，仅函数调用可用，marker 短语的选项仍是末参 `{k: v}`） |
 | `src/funcs/` | 内置函数：`value`（code/tail/last/clip/sel/app/title/date/time/now/env）、`text`（len/upper/lower/trim/sub/replace/regex/split/concat/reverse/url/html/json/base64/default）、`calc`（calc/num）、`action`（open/proc.run/proc.shell/key.tap/key.seq/clip.copy/clip.paste/web.search/…）、`dict_ime`（dict.add/ime.toggle/ime.schema/ime.theme_cycle/setting.open/setting.web）、`config`（config.get/config.set/config.toggle）、`help` |
 
 ## For AI Agents

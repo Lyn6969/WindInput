@@ -28,12 +28,53 @@ pub trait UrlOpener: Send + Sync {
     fn open(&self, target: &str) -> anyhow::Result<()>;
 }
 
+/// 一次 `proc.run` 启动请求。
+///
+/// **刻意用结构体而不是继续加形参**：这些选项都来自 `proc.run` 的具名参数，会随
+/// 需求增长。加字段时每个实现点都会编译失败、被迫面对新选项；而多加一个形参
+/// 很容易被某个实现原样忽略掉，表现为「参数写了不生效」且毫无痕迹。
+///
+/// 空串一律表示"未指定，用默认"。各字段的取值已在 cmdbar 层校验过白名单，
+/// 宿主收到的一定是合法值（或空串）。
+#[derive(Debug, Clone, Copy)]
+pub struct ProcSpawn<'a> {
+    /// 目标程序 / 文件 / URL。
+    pub cmd: &'a str,
+    /// 命令行参数，引号处理由宿主负责。
+    pub args: &'a [String],
+    /// 工作目录；空串 = 宿主按默认策略决定（**不是**"继承调用方当前目录"）。
+    pub cwd: &'a str,
+    /// ShellExecute 动词：`open`(默认) / `runas` / `edit` / `print` / `explore` / `properties`。
+    /// 仅 Windows 有效，其它平台由宿主记 WARN 并忽略。
+    pub verb: &'a str,
+    /// 初始窗口状态：`normal`(默认) / `min` / `max` / `hidden`。
+    /// 仅 Windows 有效，其它平台由宿主记 WARN 并忽略。
+    pub show: &'a str,
+}
+
+impl<'a> ProcSpawn<'a> {
+    /// 只给目标与参数的最简形式（其余走默认），供测试与内部调用。
+    pub fn new(cmd: &'a str, args: &'a [String]) -> Self {
+        ProcSpawn {
+            cmd,
+            args,
+            cwd: "",
+            verb: "",
+            show: "",
+        }
+    }
+}
+
 /// 进程启动 / shell 执行：`proc.run` / `proc.shell` / `wind.cli`。
+///
+/// `cwd` 不是可选形参：「忘了接工作目录」的宿主会静默把 CWD 继承给子进程
+/// （在 Windows 上就是前台应用的当前目录，且会随文件对话框漂移），没有任何
+/// 报错——这类半接线只能靠签名本身杜绝。
 pub trait ProcessRunner: Send + Sync {
-    fn run(&self, cmd: &str, args: &[String]) -> anyhow::Result<()>;
-    fn shell(&self, cmdline: &str) -> anyhow::Result<()>;
-    /// `proc.shell(cmd, "flagA,flagB")` 的扩展形式；不支持时可退化为 [`Self::shell`]。
-    fn shell_ex(&self, cmdline: &str, flags: &[String]) -> anyhow::Result<()>;
+    fn run(&self, spec: &ProcSpawn<'_>) -> anyhow::Result<()>;
+    /// `flags` 为 `proc.shell(cmd, "flagA,flagB")` 拆出的标志集（可空）。
+    /// 无 verb/show：命令行交给 shell 执行，那两个是 ShellExecute 的概念。
+    fn shell(&self, cmdline: &str, flags: &[String], cwd: &str) -> anyhow::Result<()>;
     /// 以主程序自身 exe 执行 CLI 子命令（`wind.cli`）：宿主自取 exe 路径，
     /// 词条无需硬编码安装位置。默认未支持（测试/精简宿主）。
     fn run_self(&self, _args: &[String]) -> anyhow::Result<()> {

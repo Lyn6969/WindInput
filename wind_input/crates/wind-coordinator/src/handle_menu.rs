@@ -567,7 +567,9 @@ impl Coordinator {
         #[cfg(not(target_os = "macos"))]
         if let Some(app) = crate::coordinator::settings_app_path() {
             if self.push_server.has_clients() {
-                self.push_shell_exec(&app, &args);
+                // 设置程序落到它自己所在目录（app 目录），不继承宿主应用的当前目录。
+                let dir = crate::handle_cmdbar::resolve_workdir("setting.open", &app, "");
+                self.push_shell_exec(&app, &args, &dir, "", "");
             } else {
                 let _ = self.ui_tx.send(UiCommand::OpenApp { path: app, args });
             }
@@ -578,7 +580,8 @@ impl Coordinator {
                 None => url,
             };
             if self.push_server.has_clients() {
-                self.push_shell_exec(&url, "");
+                let dir = crate::handle_cmdbar::resolve_workdir("setting.open", &url, "");
+                self.push_shell_exec(&url, "", &dir, "", "");
             } else {
                 let _ = self.ui_tx.send(UiCommand::OpenPath(url));
             }

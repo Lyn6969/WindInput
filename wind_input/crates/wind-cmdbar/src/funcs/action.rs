@@ -13,8 +13,13 @@ use crate::registry::FuncSpec;
 pub fn specs() -> Vec<FuncSpec> {
     func_specs! {
         "open"       : Action (1, 1)  effect => fn_open,        "打开 URL / 程序 / 文件 (通用 ShellExecute 语义)", "open(\"https://baidu.com\")";
-        "proc.run"   : Proc   (1, -1) effect => fn_run,         "启动外部程序, 可带参数", "proc.run(\"notepad.exe\")";
-        "proc.shell" : Proc   (1, 2)  effect => fn_shell,       "通过 shell 执行命令行; 第二参可选 flag (term/pwsh)", "proc.shell(\"echo hi\")";
+        "proc.run"   : Proc   (1, -1) effect => fn_run,         "启动外部程序, 可带参数", "proc.run(\"notepad.exe\")"
+            named(fn_run_named,
+                  "cwd"  = "工作目录; 省略时取被启动程序所在目录",
+                  "verb" = "动作: open(默认)/runas(管理员)/edit/print/explore/properties; 仅 Windows",
+                  "show" = "初始窗口: normal(默认)/min/max/hidden; 仅 Windows");
+        "proc.shell" : Proc   (1, 2)  effect => fn_shell,       "通过 shell 执行命令行; 第二参可选 flag (term/pwsh)", "proc.shell(\"echo hi\")"
+            named(fn_shell_named, "cwd" = "工作目录; 省略时取用户主目录");
         "key.tap"    : Key    (1, 1)  effect => fn_key_tap,     "模拟单次按键组合, 如 Ctrl+C / Shift+End / Enter", "key.tap(\"Ctrl+C\")";
         "key.seq"    : Key    (1, -1) effect => fn_key_seq,     "顺序模拟多个按键组合", "key.seq(\"Home\", \"Shift+End\", \"Delete\")";
         "key.hold"   : Key    (1, 1)  effect => fn_key_hold,    "按下并保持按键组合 (需与 key.release 成对)", "key.hold(\"Shift\")";
@@ -39,14 +44,71 @@ fn fn_open(ctx: &dyn EvalContext, args: &[String]) -> Result<String> {
     Ok(String::new())
 }
 
+/// 取具名参数值；名字白名单已在 [`crate::eval`] 的 `call_func` 校验过，此处只取。
+fn named_val<'a>(named: &'a [(String, String)], key: &str) -> &'a str {
+    named
+        .iter()
+        .find(|(k, _)| k == key)
+        .map(|(_, v)| v.as_str())
+        .unwrap_or("")
+}
+
+/// `proc.run` 的 `verb` 取值白名单（对应 ShellExecuteW 的 lpOperation）。
+///
+/// 收白名单而不是透传：拼错的动词交给 ShellExecuteW 只会换回一个泛化的
+/// "没有关联程序" 错误码，用户无从知道问题出在动词上。
+const RUN_VERBS: &[&str] = &["open", "runas", "edit", "print", "explore", "properties"];
+
+/// `proc.run` 的 `show` 取值白名单（对应 ShellExecuteW 的 nShowCmd）。
+const RUN_SHOWS: &[&str] = &["normal", "min", "max", "hidden"];
+
+/// 校验枚举型具名参数的**值**。名字的合法性由 registry 白名单在调用前保证，
+/// 这里管的是值。
+///
+/// 刻意**不带 `cfg(windows)`**：verb/show 只在 Windows 生效，但值校验必须跨平台
+/// 一致，否则同一条词条在 macOS 上写错值不报错、拿到 Windows 才失败——短语文件
+/// 是跟着用户跨机器走的，校验口径必须与平台无关。平台差异只体现在执行端
+/// （不支持的平台记 WARN 忽略），不体现在能不能写。
+fn check_enum(func: &str, key: &str, val: &str, allowed: &[&str]) -> Result<()> {
+    if val.is_empty() || allowed.contains(&val) {
+        return Ok(());
+    }
+    Err(runtime_err(
+        func,
+        anyhow::anyhow!("{key} 不支持 {val:?}（支持: {}）", allowed.join(" / ")),
+    ))
+}
+
 fn fn_run(ctx: &dyn EvalContext, args: &[String]) -> Result<String> {
+    fn_run_named(ctx, args, &[])
+}
+
+/// `proc.run(cmd, args..., cwd="…", verb="…", show="…")`。
+///
+/// 所有具名参数空串 = 用默认：`cwd` 交宿主按默认策略决定（**不是**继承调用方当前
+/// 目录），`verb` 为 `open`，`show` 为 `normal`。
+fn fn_run_named(
+    ctx: &dyn EvalContext,
+    args: &[String],
+    named: &[(String, String)],
+) -> Result<String> {
     let s = services("proc.run", ctx)?;
     let proc = s
         .proc
         .as_ref()
         .ok_or_else(|| CmdbarError::service("proc.run"))?;
-    proc.run(&args[0], &args[1..])
-        .map_err(|e| runtime_err("proc.run", e))?;
+    let spec = crate::services::ProcSpawn {
+        cmd: &args[0],
+        args: &args[1..],
+        cwd: named_val(named, "cwd"),
+        verb: named_val(named, "verb"),
+        show: named_val(named, "show"),
+    };
+    // 值校验在服务调用之前：先把能静态判死的写法挡下，避免拿一个非法动词去
+    // 启动进程再从平台错误码倒推。
+    check_enum("proc.run", "verb", spec.verb, RUN_VERBS)?;
+    check_enum("proc.run", "show", spec.show, RUN_SHOWS)?;
+    proc.run(&spec).map_err(|e| runtime_err("proc.run", e))?;
     Ok(String::new())
 }
 
@@ -73,24 +135,35 @@ fn fn_wind_cli(ctx: &dyn EvalContext, args: &[String]) -> Result<String> {
 }
 
 fn fn_shell(ctx: &dyn EvalContext, args: &[String]) -> Result<String> {
+    fn_shell_named(ctx, args, &[])
+}
+
+/// `proc.shell(cmdline, "flagA,flagB", cwd="…")`。
+///
+/// 与 `proc.run` 不同，命令行是整串交给 shell 的，无法从中认出目标程序，
+/// 所以 `cwd` 省略时只能落到中性目录——需要相对路径的场景必须显式写 `cwd`。
+fn fn_shell_named(
+    ctx: &dyn EvalContext,
+    args: &[String],
+    named: &[(String, String)],
+) -> Result<String> {
     let s = services("proc.shell", ctx)?;
     let proc = s
         .proc
         .as_ref()
         .ok_or_else(|| CmdbarError::service("proc.shell"))?;
-    if args.len() == 1 {
-        proc.shell(&args[0])
-            .map_err(|e| runtime_err("proc.shell", e))?;
-    } else {
-        let flags: Vec<String> = args[1]
+    let flags: Vec<String> = if args.len() > 1 {
+        args[1]
             .split(',')
             .map(|p| p.trim())
             .filter(|p| !p.is_empty())
             .map(|p| p.to_string())
-            .collect();
-        proc.shell_ex(&args[0], &flags)
-            .map_err(|e| runtime_err("proc.shell", e))?;
-    }
+            .collect()
+    } else {
+        Vec::new()
+    };
+    proc.shell(&args[0], &flags, named_val(named, "cwd"))
+        .map_err(|e| runtime_err("proc.shell", e))?;
     Ok(String::new())
 }
 
@@ -235,33 +308,34 @@ mod tests {
         assert_eq!(rec.0.lock().unwrap()[0], "https://www.baidu.com/s?wd=a+b");
     }
 
+    /// 记录 `ProcessRunner` 收到的全部字段，供两个测试共用。
+    /// 把每个字段都拼进字符串是刻意的：漏传某个选项会直接体现在断言串上，
+    /// 而只断言关心的那个字段会让"其它选项被悄悄丢掉"逃过检查。
+    #[derive(Default)]
+    struct RecProc(Mutex<Vec<String>>);
+    impl crate::services::ProcessRunner for RecProc {
+        fn run(&self, spec: &crate::services::ProcSpawn<'_>) -> anyhow::Result<()> {
+            self.0.lock().unwrap().push(format!(
+                "run:{}:{}:cwd={}:verb={}:show={}",
+                spec.cmd,
+                spec.args.join(","),
+                spec.cwd,
+                spec.verb,
+                spec.show
+            ));
+            Ok(())
+        }
+        fn shell(&self, cmdline: &str, flags: &[String], cwd: &str) -> anyhow::Result<()> {
+            self.0
+                .lock()
+                .unwrap()
+                .push(format!("shell:{cmdline}:{}:cwd={cwd}", flags.join("|")));
+            Ok(())
+        }
+    }
+
     #[test]
     fn proc_run_dispatches_cmd_and_args() {
-        use crate::services::ProcessRunner;
-
-        #[derive(Default)]
-        struct RecProc(Mutex<Vec<String>>);
-        impl ProcessRunner for RecProc {
-            fn run(&self, cmd: &str, args: &[String]) -> anyhow::Result<()> {
-                self.0
-                    .lock()
-                    .unwrap()
-                    .push(format!("run:{cmd}:{}", args.join(",")));
-                Ok(())
-            }
-            fn shell(&self, cmdline: &str) -> anyhow::Result<()> {
-                self.0.lock().unwrap().push(format!("shell:{cmdline}"));
-                Ok(())
-            }
-            fn shell_ex(&self, cmdline: &str, flags: &[String]) -> anyhow::Result<()> {
-                self.0
-                    .lock()
-                    .unwrap()
-                    .push(format!("shellex:{cmdline}:{}", flags.join("|")));
-                Ok(())
-            }
-        }
-
         let rec = Arc::new(RecProc::default());
         let mut svc = Services::new();
         svc.proc = Some(rec.clone());
@@ -269,10 +343,63 @@ mod tests {
         fn_run(&ctx, &["notepad.exe".into(), "a.txt".into()]).unwrap();
         fn_shell(&ctx, &["echo hi".into()]).unwrap();
         fn_shell(&ctx, &["echo hi".into(), "term,pwsh".into()]).unwrap();
+        // 具名参数直达服务层（不写则为空串 = 交宿主定默认）。
+        fn_run_named(
+            &ctx,
+            &["dict.exe".into()],
+            &[
+                ("cwd".into(), "D:/Dict".into()),
+                ("verb".into(), "runas".into()),
+                ("show".into(), "min".into()),
+            ],
+        )
+        .unwrap();
+        fn_shell_named(
+            &ctx,
+            &["dict -q x".into()],
+            &[("cwd".into(), "D:/Dict".into())],
+        )
+        .unwrap();
         let log = rec.0.lock().unwrap();
-        assert_eq!(log[0], "run:notepad.exe:a.txt");
-        assert_eq!(log[1], "shell:echo hi");
-        assert_eq!(log[2], "shellex:echo hi:term|pwsh");
+        assert_eq!(log[0], "run:notepad.exe:a.txt:cwd=:verb=:show=");
+        assert_eq!(log[1], "shell:echo hi::cwd=");
+        assert_eq!(log[2], "shell:echo hi:term|pwsh:cwd=");
+        assert_eq!(log[3], "run:dict.exe::cwd=D:/Dict:verb=runas:show=min");
+        assert_eq!(log[4], "shell:dict -q x::cwd=D:/Dict");
+    }
+
+    /// 枚举型具名参数的**值**要校验白名单，且报错要列出合法取值。
+    ///
+    /// 这一条**不带 cfg(windows)**：verb/show 只在 Windows 生效，但校验必须跨平台
+    /// 一致——短语文件跟着用户跨机器走，不能在 macOS 上写错了不报、到 Windows 才炸。
+    #[test]
+    fn proc_run_validates_enum_named_values_on_all_platforms() {
+        let rec = Arc::new(RecProc::default());
+        let mut svc = Services::new();
+        svc.proc = Some(rec.clone());
+        let ctx = MemoryContext::new().with_services(svc);
+
+        let err = fn_run_named(&ctx, &["x.exe".into()], &[("verb".into(), "RUNAS".into())])
+            .expect_err("大小写不同的动词不应被接受");
+        assert!(err.to_string().contains("runas"), "{err}");
+        let err = fn_run_named(&ctx, &["x.exe".into()], &[("show".into(), "tiny".into())])
+            .expect_err("未知窗口状态应报错");
+        assert!(err.to_string().contains("normal"), "{err}");
+
+        // 合法值全都放行
+        for v in RUN_VERBS {
+            fn_run_named(&ctx, &["x.exe".into()], &[("verb".into(), (*v).into())]).unwrap();
+        }
+        for s in RUN_SHOWS {
+            fn_run_named(&ctx, &["x.exe".into()], &[("show".into(), (*s).into())]).unwrap();
+        }
+
+        // 非法值必须在调用服务**之前**挡下：上面两次报错不该留下任何启动记录，
+        // 否则就成了"报了错但程序已经用错参数启动了"。
+        assert_eq!(
+            rec.0.lock().unwrap().len(),
+            RUN_VERBS.len() + RUN_SHOWS.len()
+        );
     }
 
     #[test]
@@ -282,13 +409,10 @@ mod tests {
         #[derive(Default)]
         struct RecSelf(Mutex<Vec<Vec<String>>>);
         impl ProcessRunner for RecSelf {
-            fn run(&self, _cmd: &str, _args: &[String]) -> anyhow::Result<()> {
+            fn run(&self, _spec: &crate::services::ProcSpawn<'_>) -> anyhow::Result<()> {
                 unreachable!()
             }
-            fn shell(&self, _cmdline: &str) -> anyhow::Result<()> {
-                unreachable!()
-            }
-            fn shell_ex(&self, _cmdline: &str, _flags: &[String]) -> anyhow::Result<()> {
+            fn shell(&self, _cmdline: &str, _flags: &[String], _cwd: &str) -> anyhow::Result<()> {
                 unreachable!()
             }
             fn run_self(&self, args: &[String]) -> anyhow::Result<()> {

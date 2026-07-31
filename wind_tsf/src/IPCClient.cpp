@@ -2413,40 +2413,50 @@ void CIPCClient::_AsyncReaderLoop()
             else if (header.command == CMD_SHELL_EXEC)
             {
                 // TSF 侧在前台应用进程执行 ShellExecuteW（打开 URL / 启动程序）。
-                // 载荷：target_len(u32 LE) + target(UTF-8) + params_len(u32 LE) + params(UTF-8)
+                // 载荷：5 个 len(u32 LE)+bytes(UTF-8) 段，依次为
+                //     target / params / dir / verb / show
+                // dir 及其后的段都是后加的：**缺失即按空串处理**，不能因为读不到就
+                // 丢掉整条消息，否则新 DLL 配旧服务会让 proc.run / open 全部失效。
                 const uint8_t* p = buffer.data() + sizeof(IpcHeader);
                 // 以 header.length 为权威边界，防止 bytesRead 与声明长度不一致。
                 size_t avail = (header.length <= bytesRead - sizeof(IpcHeader))
                              ? header.length : bytesRead - sizeof(IpcHeader);
-                std::string targetUtf8, paramsUtf8;
-                do {
-                    if (avail < 4) break;
-                    uint32_t tLen = static_cast<uint32_t>(p[0]) | (static_cast<uint32_t>(p[1]) << 8)
-                                  | (static_cast<uint32_t>(p[2]) << 16) | (static_cast<uint32_t>(p[3]) << 24);
+                // 逐段读取；读不到就保持空串并停止（不影响已读到的前几段）。
+                auto readSeg = [&p, &avail](std::string& out) -> bool {
+                    if (avail < 4) return false;
+                    uint32_t n = static_cast<uint32_t>(p[0]) | (static_cast<uint32_t>(p[1]) << 8)
+                               | (static_cast<uint32_t>(p[2]) << 16) | (static_cast<uint32_t>(p[3]) << 24);
                     p += 4; avail -= 4;
-                    if (tLen > avail) break;  // 截断载荷，放弃本消息
-                    targetUtf8.assign(reinterpret_cast<const char*>(p), tLen);
-                    p += tLen; avail -= tLen;
-                    if (avail < 4) break;
-                    uint32_t pLen = static_cast<uint32_t>(p[0]) | (static_cast<uint32_t>(p[1]) << 8)
-                                  | (static_cast<uint32_t>(p[2]) << 16) | (static_cast<uint32_t>(p[3]) << 24);
-                    p += 4; avail -= 4;
-                    if (pLen <= avail) paramsUtf8.assign(reinterpret_cast<const char*>(p), pLen);
-                } while (false);
+                    if (n > avail) return false;  // 截断载荷
+                    out.assign(reinterpret_cast<const char*>(p), n);
+                    p += n; avail -= n;
+                    return true;
+                };
+                std::string targetUtf8, paramsUtf8, dirUtf8, verbUtf8, showUtf8;
+                readSeg(targetUtf8) && readSeg(paramsUtf8) && readSeg(dirUtf8)
+                    && readSeg(verbUtf8) && readSeg(showUtf8);
 
                 if (!targetUtf8.empty())
                 {
-                    int tWLen = MultiByteToWideChar(CP_UTF8, 0, targetUtf8.c_str(), -1, nullptr, 0);
-                    int pWLen = MultiByteToWideChar(CP_UTF8, 0, paramsUtf8.c_str(), -1, nullptr, 0);
-                    std::wstring targetW(tWLen > 0 ? tWLen - 1 : 0, L'\0');
-                    std::wstring paramsW(pWLen > 0 ? pWLen - 1 : 0, L'\0');
-                    if (tWLen > 0) MultiByteToWideChar(CP_UTF8, 0, targetUtf8.c_str(), -1, targetW.data(), tWLen);
-                    if (pWLen > 0) MultiByteToWideChar(CP_UTF8, 0, paramsUtf8.c_str(), -1, paramsW.data(), pWLen);
-                    _LogInfo(L"Async reader: CMD_SHELL_EXEC target=%s params=%s", targetW.c_str(), paramsW.c_str());
+                    auto toW = [](const std::string& s) -> std::wstring {
+                        int n = MultiByteToWideChar(CP_UTF8, 0, s.c_str(), -1, nullptr, 0);
+                        std::wstring w(n > 0 ? n - 1 : 0, L'\0');
+                        if (n > 0) MultiByteToWideChar(CP_UTF8, 0, s.c_str(), -1, w.data(), n);
+                        return w;
+                    };
+                    std::wstring targetW = toW(targetUtf8);
+                    std::wstring paramsW = toW(paramsUtf8);
+                    std::wstring dirW    = toW(dirUtf8);
+                    std::wstring verbW   = toW(verbUtf8);
+                    std::wstring showW   = toW(showUtf8);
+                    // 新增字段一律记日志：新服务 + 旧 DLL 时它们会被静默忽略，
+                    // 「设了不生效」的排查全靠对比两侧日志有没有这些字段。
+                    _LogInfo(L"Async reader: CMD_SHELL_EXEC target=%s params=%s dir=%s verb=%s show=%s",
+                             targetW.c_str(), paramsW.c_str(), dirW.c_str(), verbW.c_str(), showW.c_str());
                     EnterCriticalSection(&_asyncLock);
                     ShellExecCallback seCallback = _shellExecCallback;
                     LeaveCriticalSection(&_asyncLock);
-                    if (seCallback) seCallback(targetW, paramsW);
+                    if (seCallback) seCallback(targetW, paramsW, dirW, verbW, showW);
                 }
                 else
                 {

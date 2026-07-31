@@ -27,6 +27,12 @@ pub enum TokenKind {
     RBrace,
     /// `:` —— ObjectLit 内 key 与 value 的分隔。
     Colon,
+    /// `=` —— 函数调用的具名参数分隔（`proc.run("x.exe", cwd="D:/d")`）。
+    ///
+    /// 刻意不复用 ObjectLit 的 `:`：`{k: v}` 是**短语级**修饰符（`$CC` 的末参，
+    /// 控制候选行为），`k=v` 是**函数级**参数（控制这一次调用）。两者作用域不同，
+    /// 共用一个符号会让写错位置的写法静默生效在另一层。
+    Assign,
 }
 
 /// 字符串字面量的一个原始片段：字面文本或待再解析的插值原文。
@@ -114,6 +120,10 @@ impl<'a> Lexer<'a> {
                 }
                 b':' => {
                     tokens.push(Token::simple(TokenKind::Colon, ":", self.pos));
+                    self.pos += 1;
+                }
+                b'=' => {
+                    tokens.push(Token::simple(TokenKind::Assign, "=", self.pos));
                     self.pos += 1;
                 }
                 b'"' | b'\'' => {
