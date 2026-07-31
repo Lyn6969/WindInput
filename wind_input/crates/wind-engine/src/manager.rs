@@ -846,7 +846,9 @@ impl EngineManager {
     /// 纯扫描逻辑（可测）：按 `dirs` 顺序扫描 `*.toml`，靠前目录优先，
     /// 以文件名 stem 去重；输出按 id 字典序稳定排序。
     fn scan_shuangpin_layouts(dirs: &[std::path::PathBuf]) -> Vec<(String, String)> {
-        let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+        // 值是胜出文件的路径，仅供被遮蔽方打覆盖日志时引用（见下）。
+        let mut seen: std::collections::HashMap<String, std::path::PathBuf> =
+            std::collections::HashMap::new();
         let mut out: Vec<(String, String)> = Vec::new();
         for dir in dirs {
             let Ok(entries) = std::fs::read_dir(dir) else {
@@ -863,9 +865,19 @@ impl EngineManager {
                     continue;
                 };
                 let id = stem.to_string();
-                if !seen.insert(id.clone()) {
-                    continue; // 靠前目录已收录，跳过后续同名
+                if let Some(winner) = seen.get(&id) {
+                    // 靠前目录（用户）已收录：本条是被遮蔽的安装目录同名布局。打点必须放在
+                    // **被遮蔽方**——只有扫到这里才确证「两侧都有同名」，命中那一刻还不知道
+                    // 安装目录有没有；但日志里给的路径要是**胜出**的那份，故记住胜出路径。
+                    Config::log_user_override(
+                        "shuangpin",
+                        &format!("shuangpin/{id}.toml"),
+                        winner,
+                        true,
+                    );
+                    continue;
                 }
+                seen.insert(id.clone(), entry.path());
                 match crate::pinyin::shuangpin::Layout::from_toml(&entry.path()) {
                     Ok(lay) => {
                         // id 以文件名 stem 为准（加载路径 {layout}.toml）；[meta].id 仅作校验。
@@ -1633,6 +1645,12 @@ impl EngineManager {
         if let Some(user) = Config::user_config_dir() {
             let p = user.join("schemas").join(rel);
             if p.is_file() {
+                Config::log_user_override(
+                    "schema",
+                    rel,
+                    &p,
+                    data_dir.join("schemas").join(rel).is_file(),
+                );
                 return p;
             }
         }
@@ -1837,7 +1855,11 @@ impl EngineManager {
                 if schema.engine.pinyin.unigram_path.is_empty() {
                     None
                 } else {
-                    let ug_txt = schemas.join(&schema.engine.pinyin.unigram_path);
+                    // 必须走 resolve_schema_file（用户目录优先）而非直接拼安装目录：
+                    // 第三方拼音方案的 unigram 只存在于用户目录，只拼 data_dir 会永远找不到，
+                    // 且失败路径是静默回退词典权重（长句打分变差、无任何报错）。
+                    let ug_txt =
+                        Self::resolve_schema_file(&schema.engine.pinyin.unigram_path, data_dir);
                     Self::load_unigram_mmap(&ug_txt)
                 };
             // 从全局拼音配置构建引擎配置和模糊音（Task 1.4：修 fuzzy 从未生效 bug）。
@@ -2044,25 +2066,32 @@ impl EngineManager {
         user_schemas: Option<&Path>,
         schemas_dir: &Path,
     ) -> std::path::PathBuf {
+        // fn item 而非闭包：闭包会借住 `sys`，与后面几处 `return sys` 的 move 冲突。
+        fn has_wdat(p: &Path) -> bool {
+            wind_dict::cached::wdat_sibling(p).is_some_and(|w| w.is_file())
+        }
+        let sys = schemas_dir.join(rel);
         // 1) yaml 按原优先级
         if let Some(u) = user_schemas {
             let p = u.join(rel);
             if p.is_file() {
+                // 遮蔽判定含 wdat：安装侧只投放了 wdat（无 yaml）时，用户的 yaml 同样是覆盖。
+                Config::log_user_override("dict", rel, &p, sys.is_file() || has_wdat(&sys));
                 return p;
             }
         }
-        let sys = schemas_dir.join(rel);
         if sys.is_file() {
             return sys;
         }
         // 2) 两处都无 yaml → 按 wdat-only 同序再探
         if let Some(u) = user_schemas {
             let p = u.join(rel);
-            if wind_dict::cached::wdat_sibling(&p).is_some_and(|w| w.is_file()) {
+            if has_wdat(&p) {
+                Config::log_user_override("dict", rel, &p, has_wdat(&sys));
                 return p;
             }
         }
-        if wind_dict::cached::wdat_sibling(&sys).is_some_and(|w| w.is_file()) {
+        if has_wdat(&sys) {
             return sys;
         }
         // 3) 兜底同原行为：返回安装目录路径，由调用方报加载失败

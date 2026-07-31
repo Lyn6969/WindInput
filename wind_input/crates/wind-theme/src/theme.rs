@@ -13,10 +13,27 @@ use toml::Value;
 pub const THEME_FILE: &str = "theme.toml";
 
 /// 在多个主题目录中定位 `<name>` 的主题目录（靠前目录优先；用户目录可覆盖内置）。
+///
+/// 命中后**不立即返回**，而是继续看后面的目录有没有同名——只为确证「这是覆盖而非
+/// 用户独有主题」并打一条日志。主题定位的全部路径（`read_meta` / `load_typed_dirs` /
+/// `theme_chain_dirs`）都经过这里，故打点放此处不会漏。措辞与 `Config::log_user_override`
+/// 一致，便于按 `用户覆盖生效` 一次 grep 出全部生效的覆盖。
 pub fn find_theme_dir(dirs: &[PathBuf], name: &str) -> Option<PathBuf> {
-    dirs.iter()
-        .map(|d| d.join(name))
-        .find(|p| p.join(THEME_FILE).exists())
+    let mut hit: Option<PathBuf> = None;
+    for d in dirs {
+        let p = d.join(name);
+        if !p.join(THEME_FILE).exists() {
+            continue;
+        }
+        match &hit {
+            None => hit = Some(p),
+            Some(w) => {
+                tracing::info!("用户覆盖生效[theme]: {} → {}", name, w.display());
+                break;
+            }
+        }
+    }
+    hit
 }
 
 /// 主题 base 链的目录列表（self 在前，base 在后）。

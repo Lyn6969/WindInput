@@ -340,15 +340,18 @@ fn merge_chaizi_pinyin(sections: Vec<Section>) -> Vec<Section> {
 // ─────────────────────────────────────────────────────────────────────────────
 
 impl ReverseLookup {
-    /// 加载反查表：拆字库路径由调用方从方案 `[engine.chaizi].db_path` 解析后传入（无则跳过）；
-    /// 拼音读音表 `pinyin_map.txt` 是全局资源，仍按 data_dir 定位。
-    pub fn load(data_dir: Option<&Path>, chaizi_path: Option<&Path>) -> Self {
+    /// 加载反查表：两份资源的路径**都**由调用方解析后传入（无则跳过）——拆字库来自方案
+    /// `[engine.chaizi].db_path`，拼音读音表 `pinyin_map.txt` 来自数据根。
+    ///
+    /// 之所以不在这里拼 `data_dir/pinyin_map.txt`：那样就绕过了「用户目录同名文件优先」
+    /// 的解析，用户放的覆盖版永远不生效。本 crate 不依赖 wind-config，解析职责一律上提。
+    pub fn load(pinyin_map: Option<&Path>, chaizi_path: Option<&Path>) -> Self {
         let mut rl = Self::default();
         if let Some(p) = chaizi_path {
             rl.load_chaizi(p);
         }
-        if let Some(dir) = data_dir {
-            rl.load_pinyin(&dir.join("pinyin_map.txt"));
+        if let Some(p) = pinyin_map {
+            rl.load_pinyin(p);
         }
         rl
     }

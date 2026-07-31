@@ -1114,7 +1114,13 @@ impl Coordinator {
         // 短语层（方案 B）：TOML 变更时同步进 store，再从 store（仅 enabled）建层。
         // 启动解析的条目缓存进结构体，作为"恢复默认"重读文件失败时的回退。
         let mut system_phrase_entries: Vec<wind_phrase::SystemPhraseEntry> = Vec::new();
-        let system_phrase_path = data_dir.map(|d| d.join("system.phrases.toml"));
+        // 用户目录同名文件整体替代安装目录那份（覆盖替换，非合并）。
+        // ⚠️ 解析在此**一次定死**：后续 `current_system_phrase_entries` 的重读走同一路径，
+        // 故运行时新放的覆盖文件要下次启动才生效（与全仓其它覆盖点一致，无文件监视）。
+        let system_phrase_path = Config::resolve_data_file(data_dir, "system.phrases.toml");
+        if system_phrase_path.is_none() && data_dir.is_some() {
+            warn!("system.phrases.toml 缺失（用户/安装目录均未找到），系统短语将为空");
+        }
         let phrases = {
             if let Some(store) = store.as_ref() {
                 if let Some(p) = system_phrase_path.as_ref() {
@@ -1179,11 +1185,10 @@ impl Coordinator {
 
         // 标点配对表（中/英）已在 ConfigBundle 内构建。
 
-        // 通用规范汉字表（检索范围"常用字"判定）
+        // 通用规范汉字表（检索范围"常用字"判定）。用户目录同名文件整体替代（见
+        // docs/architecture/user-override.md）——自定义"常用字"范围是这张表的主要用途。
         let common_chars = wind_candidate::CommonChars::load(
-            &data_dir
-                .map(|d| d.join("schemas").join("common_chars.txt"))
-                .unwrap_or_default(),
+            &Config::resolve_schema_resource(data_dir, "common_chars.txt").unwrap_or_default(),
         );
         if common_chars.is_empty() {
             warn!("common_chars.txt 缺失，检索范围过滤将退化为不过滤");
@@ -1206,7 +1211,13 @@ impl Coordinator {
                 }
                 p
             });
-        let reverse = wind_reverse::ReverseLookup::load(data_dir, chaizi_db.as_deref());
+        // 拼音读音表同样支持用户覆盖（整体替代）：改多音字取音、补生僻字读音都靠换这张表。
+        let pinyin_map = Config::resolve_data_file(data_dir, "pinyin_map.txt");
+        if pinyin_map.is_none() && data_dir.is_some() {
+            warn!("pinyin_map.txt 缺失（用户/安装目录均未找到），逐字拼音反查将不可用");
+        }
+        let reverse =
+            wind_reverse::ReverseLookup::load(pinyin_map.as_deref(), chaizi_db.as_deref());
         if !reverse.is_empty() {
             info!("Loaded reverse-lookup (chaizi/pinyin)");
         }

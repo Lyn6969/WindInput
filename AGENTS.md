@@ -92,6 +92,12 @@
   weight 的排序会被重排冲掉。顶码上屏取首选与候选窗展示必须共用同一排序函数。
 - **用户短语数据只存 `user_data.db`**（wind-store，全局不分方案）：yaml 短语文件是系统种子，
   **不是**用户覆盖入口——旧设计文档里「yaml 用户目录覆盖」的说法已过时，勿据此实现。
+- **自带数据文件一律经覆盖解析函数定位，禁止直接 `data_dir.join(...)`**：用户目录同名文件
+  整体替代安装目录那份（`Config::resolve_data_file` / `resolve_schema_resource` /
+  `EngineManager::resolve_schema_file` / `resolve_dict_file`）。绕过解析函数是这套机制历史上
+  **全部**缺陷的唯一形态（`common_chars.txt`、`pinyin_map.txt`、`unigram_path` 均栽于此），
+  且失败静默——找不到就退化，不报错。键级合并只有 `config.toml` 与 `compat.toml` 两处。
+  完整矩阵与新增数据文件的约定见 `docs/architecture/user-override.md`。
 
 ## 提交纪律（多会话共仓）
 

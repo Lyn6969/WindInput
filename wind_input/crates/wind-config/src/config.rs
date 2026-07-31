@@ -2503,22 +2503,75 @@ impl Config {
         }
     }
 
+    /// 用户覆盖命中时的统一日志打点。
+    ///
+    /// 「用户目录同名文件整体替代安装目录自带文件」这条能力散落在多个解析函数里
+    /// （方案文件 / 词库 / 方案附属资源 / 双拼布局 / 主题 / 数据根文件），各函数的回退
+    /// 级数还不一样。排查「同一版程序、这台机器行为和出厂不一致」时，唯一可靠的线索就是
+    /// 「当时到底加载了哪个文件」——故所有解析点一律经此打点、共用同一措辞，便于按
+    /// `用户覆盖生效` 一次 grep 出全部生效的覆盖。
+    ///
+    /// `kind` 是资源类别（`schema` / `dict` / `resource` / `shuangpin` / `theme` / `data`），
+    /// `rel` 是方案/数据根下的相对路径。**只在命中用户层时调用**：未覆盖的默认安装
+    /// 不产生任何日志，故日志里出现即异常排查线索。
+    ///
+    /// `shadowed` 区分命中用户层的两种情形，**不可省**：安装目录也有同名文件时才是真的
+    /// 「覆盖自带数据」（记 info，排查目标）；安装目录没有时只是第三方方案自带资源走用户
+    /// 目录（记 debug）。二者都打 info 的话，一个第三方方案的几十个词库会把真正的覆盖淹掉。
+    pub fn log_user_override(kind: &str, rel: &str, path: &Path, shadowed: bool) {
+        if shadowed {
+            info!("用户覆盖生效[{}]: {} → {}", kind, rel, path.display());
+        } else {
+            debug!("用户目录资源[{}]: {} → {}", kind, rel, path.display());
+        }
+    }
+
+    /// 「用户目录优先、回落安装目录」的解析内核。`sub` 为两侧共同的子目录
+    /// （方案类资源传 `Some("schemas")`，数据根文件传 `None`）。
+    fn resolve_overridable(
+        data_dir: Option<&Path>,
+        sub: Option<&str>,
+        rel: &str,
+        kind: &str,
+    ) -> Option<PathBuf> {
+        if rel.is_empty() {
+            return None;
+        }
+        let under = |base: &Path| -> PathBuf {
+            match sub {
+                Some(s) => base.join(s).join(rel),
+                None => base.join(rel),
+            }
+        };
+        // 借用而非 move：`under` 在下面的用户分支里还要再用一次。
+        let sys = data_dir.map(&under);
+        if let Some(user) = Self::user_config_dir() {
+            let p = under(&user);
+            if p.is_file() {
+                let shadowed = sys.as_ref().is_some_and(|s| s.is_file());
+                Self::log_user_override(kind, rel, &p, shadowed);
+                return Some(p);
+            }
+        }
+        sys.filter(|p| p.is_file())
+    }
+
     /// 解析方案附属资源（拆字库/字根字体等 `[engine.chaizi]` 相对路径）：与方案文件同规则，
     /// 用户方案目录（`user_config_dir()/schemas/`）优先，回落系统数据目录 `data_dir/schemas/`。
     /// 第三方方案装在用户目录，其资源只在用户目录下——只拼 data_dir 会永远找不到。
     /// 两处均不存在返回 None（调用方自行告警）。
     pub fn resolve_schema_resource(data_dir: Option<&Path>, rel: &str) -> Option<PathBuf> {
-        if rel.is_empty() {
-            return None;
-        }
-        if let Some(user) = Self::user_config_dir() {
-            let p = user.join("schemas").join(rel);
-            if p.is_file() {
-                return Some(p);
-            }
-        }
-        let p = data_dir?.join("schemas").join(rel);
-        p.is_file().then_some(p)
+        Self::resolve_overridable(data_dir, Some("schemas"), rel, "resource")
+    }
+
+    /// 解析**数据根**下的程序自带文件（`system.phrases.toml` / `pinyin_map.txt` 等）：
+    /// 用户配置目录同名文件整体替代，回落安装目录 `data_dir/`。两处均无返回 None。
+    ///
+    /// 与 [`Self::resolve_schema_resource`] 的差别只在根少一层 `schemas/`。这类文件是
+    /// **整体替换**语义（不做键级合并）——合并语义只有 `config.toml`（三层）与
+    /// `compat.toml`（字段级）两处，它们各有专用加载器，不走本函数。
+    pub fn resolve_data_file(data_dir: Option<&Path>, rel: &str) -> Option<PathBuf> {
+        Self::resolve_overridable(data_dir, None, rel, "data")
     }
 
     /// 把单个配置项**部分合并**写入用户层 `config.toml`（%APPDATA%/WindInput/config.toml）。
