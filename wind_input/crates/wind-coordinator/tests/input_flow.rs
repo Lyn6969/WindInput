@@ -5800,3 +5800,77 @@ fn test_mixed_full_code_keeps_prefix_completion_candidates() {
         &all[..all.len().min(10)]
     );
 }
+
+/// 翻页键（默认 `-`/`=`）在临英下应翻页。
+/// 回归点：`handle_candidate_nav` 曾按 `ModeKind` 把临英整类排除出可打印导航键
+/// （`include_printable` 恒 false），于是 `=` 落到 `_ =>` 标点臂被判成「上屏高亮候选 +
+/// 标点」——用户按 `=` 想翻页，实得首候选连同 `=` 被直接上屏并退出临英（`Hel=`）。
+/// 与二三候选键 `;`/`'` 是同一条兜底臂的两个出口，但成因不同（那次是漏调选词偏移）。
+#[test]
+fn test_temp_english_page_keys_flip_pages_when_symbols_disallowed() {
+    if !has_schemas() {
+        return;
+    }
+    let mut cfg = config_with("wubi86");
+    // 显式声明键组与页大小，使本测试不随默认值漂移（默认亦含 minus_equal）。
+    cfg.keys.page_keys = vec!["pageupdown".into(), "minus_equal".into()];
+    cfg.ui.candidate.per_page = 3;
+    let coord = Coordinator::new_headless(cfg, Some(&data_dir()));
+    press_shift_letter(&coord, 'h');
+    press_letter(&coord, 'e');
+    press_letter(&coord, 'l');
+    // 前置条件：多于一页，否则 page_next 返回 false，翻页分支测不出差异（假绿）。
+    let (_, _, total_pages) = coord.debug_page_info();
+    assert!(
+        total_pages >= 2,
+        "前置条件：应有 ≥2 页候选，否则测不到翻页，实际 {total_pages} 页"
+    );
+    let page0_first = coord.debug_page_texts()[0].clone();
+
+    let act = press_vk(&coord, 0xBB, false); // `=` 下一页
+    assert!(
+        matches!(act, KeyAction::Consumed),
+        "`=` 应作翻页被消费，而非上屏退出临英，实际: {act:?}"
+    );
+    assert_eq!(coord.debug_page_info().0, 1, "`=` 应翻到第 2 页");
+    assert_ne!(
+        coord.debug_page_texts()[0],
+        page0_first,
+        "第 2 页首候选应与第 1 页不同"
+    );
+
+    let act = press_vk(&coord, 0xBD, false); // `-` 上一页
+    assert!(
+        matches!(act, KeyAction::Consumed),
+        "`-` 应作翻页被消费，实际: {act:?}"
+    );
+    assert_eq!(coord.debug_page_info().0, 0, "`-` 应翻回第 1 页");
+}
+
+/// 对照组：allow_symbols 开时翻页键让位于字符输入——该开关的声明语义是符号「入缓冲，
+/// 而非上屏退出、选词或导航」，与二三候选键 / 数字臂同构，不能被上面的接线改动破坏。
+#[test]
+fn test_temp_english_page_keys_yield_to_input_when_symbols_allowed() {
+    if !has_schemas() {
+        return;
+    }
+    let mut cfg = config_with("wubi86");
+    cfg.keys.page_keys = vec!["pageupdown".into(), "minus_equal".into()];
+    cfg.ui.candidate.per_page = 3;
+    cfg.input.temp_english.allow_symbols = true;
+    let coord = Coordinator::new_headless(cfg, Some(&data_dir()));
+    press_shift_letter(&coord, 'h');
+    press_letter(&coord, 'e');
+    press_letter(&coord, 'l');
+    assert!(
+        coord.debug_page_info().2 >= 2,
+        "前置条件：应有 ≥2 页候选，否则「有得翻却不翻」无从谈起"
+    );
+    let act = press_vk(&coord, 0xBB, false); // `=`
+    assert_eq!(
+        action_text(&act).unwrap(),
+        "Hel=",
+        "allow_symbols 开启时 `=` 应入缓冲而非翻页"
+    );
+    assert_eq!(coord.debug_page_info().0, 0, "让位输入时不应翻页");
+}

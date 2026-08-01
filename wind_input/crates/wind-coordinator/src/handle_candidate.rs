@@ -1320,11 +1320,17 @@ impl Coordinator {
     }
 
     /// overlay 候选模式的导航分派：码表型（特殊/临拼，及无表达式来源的 mix）`-`/`=` 作翻页；
-    /// 文本型（临英）与含表达式来源（`quick_input.calc/.date/.number`）的 mix 不把 `-`/`=`
-    /// 当导航——那里它们是运算符输入。由 active 自判。
+    /// 含表达式来源（`quick_input.calc/.date/.number`）的 mix 不把 `-`/`=` 当导航——那里
+    /// 它们是运算符输入。由 active 自判。
     ///
     /// 判据是 `mix_has_quick_numeric` 而非 `mix_has_quick_input`：只配了 `quick_input.repeat`
     /// 的 mix 没有表达式录入，`-`/`=` 仍应是翻页键。
+    ///
+    /// 临英按 `allow_symbols` 动态判定，不是恒排除：该开关关闭时符号本就进不了缓冲，
+    /// `-`/`=` 不再承担任何输入语义，却因这里恒 `false` 落到 `_ =>` 标点臂，被判成
+    /// 「上屏高亮候选 + 标点 → 退出」——用户按 `=` 想翻页，实得首候选被直接上屏。
+    /// 与二三候选键 `;`/`'` 受 `allow_symbols` 抑制同构：该开关的语义是符号「入缓冲，
+    /// 而非上屏退出、选词**或导航**」，开着时仍让位输入（`e-mail` 这类词打得出）。
     pub(crate) fn handle_candidate_nav(
         &self,
         state: &mut State,
@@ -1333,6 +1339,7 @@ impl Coordinator {
         let include_printable = match state.active {
             Some(ModeKind::Special(_)) | Some(ModeKind::TempPinyin) => true,
             Some(ModeKind::Mix(idx)) => !self.mix_has_quick_numeric(idx),
+            Some(ModeKind::TempEnglish) => !self.rt().config.input.temp_english.allow_symbols,
             _ => false,
         };
         self.apply_nav_key(state, data, include_printable)
