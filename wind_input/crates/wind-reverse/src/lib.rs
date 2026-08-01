@@ -612,22 +612,35 @@ fn case_fallbacks(text: &str) -> Vec<String> {
     out
 }
 
-/// 注释库缓存文件名：`<源文件主名>.<路径哈希>.wcmt`。
+/// 源文件 → 缓存路径：`<cache>/<父目录名>/<文件干>.wcmt`。
 ///
-/// 带路径哈希是因为不同目录下的同名文件是常态（系统 `data/comments/emoji.dict.yaml`
-/// 与用户覆盖版同名）。只用主名会让两者争用同一份缓存，表现为「改了用户版没生效」或
-/// 两者反复互相失效重建。
-fn comment_cache_name(src: &Path) -> String {
-    use std::hash::Hasher;
-    let mut h = std::collections::hash_map::DefaultHasher::new();
-    h.write(src.to_string_lossy().as_bytes());
+/// 与 `wind_engine::manager::cache_path` **同构**：用父目录名做命名空间避免同名冲突，
+/// 文件干剥掉 `.dict.yaml` 的 `.dict` 冗余中缀。挂在 `schemas/comments/` 下的库因此
+/// 落到 `<cache>/comments/`。
+///
+/// # 为什么不用路径哈希
+///
+/// 初版是 `<文件干>.<路径哈希>.wcmt`，为的是让「用户目录版」与「安装目录版」同名文件
+/// 各持一份缓存。但那是自造的第二套命名法，而词库那边早用父目录名解决了同一问题。
+/// 更关键的是，同一时刻 `resolve_data_file` 只会解析出其中**一个**路径，两份缓存里
+/// 必有一份是孤儿——共用一份、靠内容指纹判定重建，反而连孤儿都不会产生。
+fn comment_cache_path(cache_root: &Path, src: &Path) -> std::path::PathBuf {
+    let ns = src
+        .parent()
+        .and_then(|p| p.file_name())
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_default();
     let stem = src
         .file_stem()
-        .map(|s| s.to_string_lossy().to_string())
+        .map(|s| s.to_string_lossy().into_owned())
         .unwrap_or_else(|| "comment".to_string());
-    // `x.dict.yaml` 的 stem 是 `x.dict`，再剥一层让缓存名短一些
     let stem = stem.strip_suffix(".dict").unwrap_or(&stem);
-    format!("{stem}.{:016x}.wcmt", h.finish())
+    let base = if ns.is_empty() {
+        cache_root.to_path_buf()
+    } else {
+        cache_root.join(ns)
+    };
+    base.join(format!("{stem}.wcmt"))
 }
 
 /// 加载一个注释库：优先 mmap `.wcmt` 缓存，缓存不新鲜则重建，重建失败降级内存表。
@@ -647,7 +660,7 @@ fn load_comment_source(src: &Path, cache_dir: Option<&Path>) -> Option<CommentSo
         let rows = parse_or_warn(src)?;
         return wrap(CommentBody::Memory(CommentTable::build(rows)));
     };
-    let cache_file = dir.join(comment_cache_name(src));
+    let cache_file = comment_cache_path(dir, src);
 
     // single-flight：同一缓存文件的构建区间互斥。注释库虽只由协调器串行加载，但同一
     // 文件可能同时被别处（如设置页预览）打开，沿用词库那套锁不额外花什么代价。
@@ -687,24 +700,42 @@ fn parse_or_warn(src: &Path) -> Option<Vec<(String, String, String)>> {
 
 /// 清掉挂载列表里已不存在的库留下的 `.wcmt`（含指纹 sidecar 与残留 tmp）。
 ///
-/// 只在专用缓存目录里、只删这三种后缀 —— 缓存目录理论上归我们管，但「理论上」不足以
-/// 支撑一个递归删除。正被本进程映射的文件删不掉（Windows），失败即跳过，下次再清。
-fn prune_comment_cache(dir: &Path, paths: &[std::path::PathBuf]) {
-    let keep: HashSet<String> = paths.iter().map(|p| comment_cache_name(p)).collect();
-    let Ok(rd) = std::fs::read_dir(dir) else {
-        return;
-    };
-    for entry in rd.flatten() {
-        let name = entry.file_name().to_string_lossy().to_string();
-        let stem = name
-            .strip_suffix(".fp")
-            .or_else(|| name.strip_suffix(".tmp"))
-            .unwrap_or(&name);
-        if !stem.ends_with(".wcmt") || keep.contains(stem) {
+/// 缓存按父目录名分了命名空间（见 [`comment_cache_path`]），故要**逐层下探**——但只认
+/// 这三种后缀，绝不删目录本身：缓存根同时住着词库的 `.wdat`/`.wdb`，扫到它们必须原样放过。
+/// 「只删自己认识的文件」比「这个目录归我管所以可以递归删」安全一个量级。
+///
+/// 正被本进程映射的文件删不掉（Windows），失败即跳过，下次再清。
+fn prune_comment_cache(cache_root: &Path, paths: &[std::path::PathBuf]) {
+    let keep: HashSet<std::path::PathBuf> = paths
+        .iter()
+        .map(|p| comment_cache_path(cache_root, p))
+        .collect();
+    let mut stack = vec![cache_root.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        let Ok(rd) = std::fs::read_dir(&dir) else {
             continue;
-        }
-        if std::fs::remove_file(entry.path()).is_ok() {
-            tracing::info!("清理已移除注释库的缓存：{}", name);
+        };
+        for entry in rd.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                stack.push(path);
+                continue;
+            }
+            let name = entry.file_name().to_string_lossy().to_string();
+            // `x.wcmt` / `x.wcmt.fp` / `x.wcmt.tmp` 都归到主名 `x.wcmt` 上判定
+            let base = name
+                .strip_suffix(".fp")
+                .or_else(|| name.strip_suffix(".tmp"))
+                .unwrap_or(&name);
+            if !base.ends_with(".wcmt") {
+                continue;
+            }
+            if keep.contains(&dir.join(base)) {
+                continue;
+            }
+            if std::fs::remove_file(&path).is_ok() {
+                tracing::info!("清理已移除注释库的缓存：{}", name);
+            }
         }
     }
 }
@@ -1466,11 +1497,9 @@ mod tests {
         let mut rl = ReverseLookup::default();
         rl.reload_comments(&paths, Some(&cache));
         assert_eq!(rl.comment_of("甲", None), "旧释义");
-        let wcmt = std::fs::read_dir(&cache)
-            .unwrap()
-            .flatten()
-            .map(|e| e.path())
-            .find(|p| p.extension().is_some_and(|e| e == "wcmt"))
+        let wcmt = find_wcmt(&cache)
+            .into_iter()
+            .next()
             .expect("应生成 .wcmt 缓存");
         let stamp1 = std::fs::metadata(&wcmt).unwrap().modified().unwrap();
 
@@ -1544,28 +1573,91 @@ mod tests {
     fn removed_library_cache_is_pruned() {
         let (dir, paths) = write_libs("prune", &[&[("甲", "一号库", "")], &[("乙", "二号库", "")]]);
         let cache = dir.join("cache");
-        let count = || {
-            std::fs::read_dir(&cache)
-                .map(|rd| {
-                    rd.flatten()
-                        .filter(|e| e.file_name().to_string_lossy().ends_with(".wcmt"))
-                        .count()
-                })
-                .unwrap_or(0)
-        };
-
         let mut rl = ReverseLookup::default();
         rl.reload_comments(&paths, Some(&cache));
-        assert_eq!(count(), 2);
+        assert_eq!(find_wcmt(&cache).len(), 2);
 
         // 只留第一个库：第二个的缓存应被清理，第一个的保留（不能连坐）
         rl.reload_comments(&paths[..1], Some(&cache));
-        assert_eq!(count(), 1, "已卸载库的缓存应被清掉");
+        assert_eq!(find_wcmt(&cache).len(), 1, "已卸载库的缓存应被清掉");
         assert_eq!(rl.comment_of("甲", None), "一号库", "保留库不受影响");
         assert_eq!(rl.comment_of("乙", None), "");
 
         drop(rl);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// ★ prune 递归下探时**不得碰词库缓存**：缓存根同住着 `.wdat`/`.wdb`。
+    ///
+    /// 「这个目录归我管所以可以递归清理」是这类清理最容易写错的地方——注释库缓存与词库
+    /// 缓存共用一个根（`comment_cache_path` 按父目录名分命名空间），扫到别人的文件必须原样放过。
+    #[test]
+    fn prune_never_touches_other_cache_files() {
+        let (dir, paths) = write_libs("prune-foreign", &[&[("甲", "一号库", "")]]);
+        let cache = dir.join("cache");
+        std::fs::create_dir_all(cache.join("wubi86")).unwrap();
+        let foreign = cache.join("wubi86").join("wubi86.wdat");
+        std::fs::write(&foreign, b"<pretend wdat>").unwrap();
+        let foreign_root = cache.join("unigram.wdb");
+        std::fs::write(&foreign_root, b"<pretend wdb>").unwrap();
+
+        let mut rl = ReverseLookup::default();
+        rl.reload_comments(&paths, Some(&cache));
+        // 再清一次（此时挂载列表为空，最激进的清理条件）
+        rl.reload_comments(&[], Some(&cache));
+
+        assert!(foreign.exists(), "词库缓存不得被注释库的清理波及");
+        assert!(foreign_root.exists(), "缓存根下的其他文件同样不得被删");
+        assert_eq!(find_wcmt(&cache).len(), 0, "自己的缓存该清干净");
+
+        drop(rl);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 递归找出缓存根下所有 `.wcmt`（缓存按父目录名分了命名空间，不再是一层）。
+    fn find_wcmt(root: &Path) -> Vec<PathBuf> {
+        let mut out = Vec::new();
+        let mut stack = vec![root.to_path_buf()];
+        while let Some(d) = stack.pop() {
+            let Ok(rd) = std::fs::read_dir(&d) else {
+                continue;
+            };
+            for e in rd.flatten() {
+                let p = e.path();
+                if p.is_dir() {
+                    stack.push(p);
+                } else if p.extension().is_some_and(|x| x == "wcmt") {
+                    out.push(p);
+                }
+            }
+        }
+        out
+    }
+
+    /// 同名但父目录不同的两个库：缓存靠命名空间隔离，不得互相覆盖。
+    ///
+    /// 这是去掉路径哈希后唯一真正需要命名空间的场景——两份缓存若落到同一路径，
+    /// 每次加载都会因内容指纹不符而互相重建，表现为启动变慢却查不出原因。
+    #[test]
+    fn same_name_different_dirs_get_separate_caches() {
+        let base = std::env::temp_dir().join(format!("wind_cmt_ns_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let (a, b) = (base.join("libA"), base.join("libB"));
+        std::fs::create_dir_all(&a).unwrap();
+        std::fs::create_dir_all(&b).unwrap();
+        let head = "name: t\ncolumns:\n  - text\n  - comment\n...\n";
+        std::fs::write(a.join("x.dict.yaml"), format!("{head}词\tA 库\n")).unwrap();
+        std::fs::write(b.join("x.dict.yaml"), format!("{head}词\tB 库\n")).unwrap();
+        let paths = vec![a.join("x.dict.yaml"), b.join("x.dict.yaml")];
+        let cache = base.join("cache");
+
+        let mut rl = ReverseLookup::default();
+        rl.reload_comments(&paths, Some(&cache));
+        assert_eq!(find_wcmt(&cache).len(), 2, "同名库须各自持有缓存");
+        assert_eq!(rl.comment_of("词", None), "A 库", "靠前的库优先");
+
+        drop(rl);
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     /// ★★ 大小写回退必须**双向**：英文库里既有小写词条也有大写缩写。

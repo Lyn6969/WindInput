@@ -402,11 +402,15 @@ comment_max_chars = 0
 # 需要时在**用户配置**里按下面的形态增补（出厂为空，故此处不预置）：
 #
 #   [[ui.comment_dicts]]
-#   id = "emoji"                       # 稳定标识（日志/设置页定位用）
+#   id = "emoji"                          # 稳定标识（日志/设置页定位用）
 #   label = "Emoji 名称"
-#   path = "comments/emoji.dict.yaml"  # 相对数据目录；用户目录优先，回落安装目录
+#   path = "comments/emoji.dict.yaml"     # 相对 schemas/；用户目录优先，回落安装目录
 #   enabled = true
-#   schemas = []                       # 限定生效方案；留空=全部方案
+#   schemas = []                          # 限定生效方案；留空=全部方案
+#
+# path 以 schemas/ 为基准（同拆字库、字根字体等方案附属资源）。放在那里是有意的：
+# 整机备份打包的是整个 schemas 目录（递归），注释库因此自动随备份走，
+# 不必再单列一处「记得也要备份」的目录。
 #
 # 数组顺序即优先级（同一个词多库都有注释时取靠前的）。schemas 用来避免无谓开销：
 # 一份大英汉词典写 schemas = ["english"] 后，中文方案下根本不加载。

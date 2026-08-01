@@ -1882,8 +1882,10 @@ impl Coordinator {
     /// 每次输入都要多走一次注定查不到的二分。方案专属的库因此只在其方案下加载 ——
     /// 这也是切方案要调本函数的原因。
     ///
-    /// 路径按「用户数据目录优先、回落安装目录」解析，与 `pinyin_map.txt` 同规则 ——
-    /// 用户放在自己目录里的同名文件应当覆盖随附版本。
+    /// 路径**以 `schemas/` 为基准**解析（`resolve_schema_resource`，用户目录优先、回落安装
+    /// 目录），与拆字库、字根字体这些方案附属资源同一规则 —— 注释库本就是同类东西：
+    /// 放在 `schemas/` 下、随整机备份走（`user_schemas_dir` 递归打包）、不参与召回。
+    /// 配置里因此写 `comments/xxx.dict.yaml` 而非 `schemas/comments/xxx.dict.yaml`。
     pub(crate) fn sync_comment_dicts(&self) {
         let data_dir = Config::data_dir();
         let specs = {
@@ -1896,7 +1898,7 @@ impl Coordinator {
             .iter()
             .filter(|s| s.enabled && !s.path.is_empty() && s.applies_to(&active))
         {
-            match Config::resolve_data_file(data_dir.as_deref(), &s.path) {
+            match Config::resolve_schema_resource(data_dir.as_deref(), &s.path) {
                 // 按**解析后路径**去重：两条 spec 写不同的相对路径却指向同一个文件时
                 // （`a.dict.yaml` 与 `./a.dict.yaml`，或用户目录与安装目录同名文件都被
                 // 解析到同一处），只加载一次。重复加载除了浪费解析时间，还会让优先级
@@ -1919,10 +1921,11 @@ impl Coordinator {
         if *cur == paths {
             return;
         }
-        // 注释库缓存与词库 .wdat 同根，但收在 `comments/` 专用子目录：那里会做「清掉已移除
-        // 库的缓存」的扫描，限定在自己的目录里才敢删。无缓存目录（便携/测试）时传 None，
-        // 注释库退化为内存加载，功能不受影响。
-        let cache_dir = Config::cache_dir().map(|d| d.join("comments"));
+        // 注释库缓存与词库 .wdat **同根**：`comment_cache_path` 自己按源文件父目录名分
+        // 命名空间（`schemas/comments/x.dict.yaml` → `<cache>/comments/x.wcmt`），与
+        // `EngineManager::cache_path` 同构，不再另立一层专用目录。
+        // 无缓存目录（便携/测试）时传 None，注释库退化为内存加载，功能不受影响。
+        let cache_dir = Config::cache_dir();
         self.reverse
             .write()
             .unwrap_or_else(|e| e.into_inner())
