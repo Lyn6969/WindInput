@@ -260,6 +260,14 @@ space_as_input = false
 # 不是布尔：follow 与 vertical 只在全局本身竖排时才有区别（前者跟着变、后者恒定）。
 # 临英常设 horizontal——英文候选一行放得下，全局竖排时反而占屏。
 candidate_layout = "follow"
+# 模式级注释模板（高级，无图形界面）：本模式期间覆盖全局 ui.candidate.comment_template_*。
+#   不写这两个键 = 跟随全局；写空串 "" = 本模式不显示注释；写模板 = 本模式改用它。
+#   「不写」与「写空串」是两回事，所以这里刻意不预置——预置任何值都会改掉默认语义。
+#   临英的典型用法（挂了英汉注释库时，只在打英文时显示释义）：
+# comment_template_vertical   = "${dict}"
+# comment_template_horizontal = "${dict}"
+# 同样的两个键在 [input.temp_pinyin]、[input.url]、[[schema.mix_modes]]、
+# [[schema.special_modes]] 下也可用。说明见 https://windinput.com/docs/customize/candidate-comment
 
 [input.capslock]
 cancel_on_mode_switch = false

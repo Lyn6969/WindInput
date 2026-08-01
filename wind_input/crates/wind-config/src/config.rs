@@ -666,6 +666,25 @@ pub enum LayoutIntent {
     Horizontal,
 }
 
+/// 模式级注释模板覆盖（三态）。见 `crate::comment::template_for` 的决策点说明。
+///
+/// - **键缺失**（`None`）= 跟随全局同方向的模板（默认，零回归）
+/// - **非空** = 本模式期间改用该模板
+/// - **空串** = 本模式期间不显示注释
+///
+/// # 为什么是 `Option<String>` 而不是 `String`
+///
+/// 用空串表达「跟随全局」的话，「本模式不要注释」就没法表达了——而这恰恰是本功能最主要的
+/// 用途（反查类模式信息太多、干扰正常输入）。三态里「缺失」与「空」必须是两件事。
+///
+/// # 横竖各一份，与全局同构
+///
+/// 字段名与 `ui.candidate.comment_template_vertical` / `_horizontal` 刻意保持一致，
+/// 且**两个方向各自独立三态**——只覆盖竖排、横排仍跟随全局是合法且常见的配置。
+/// 与 [`LayoutIntent`] 的取值词汇复用同一个理由：让「模式级」与「全局」在用户眼里
+/// 是同一件事的两个层级，而不是两套发明出来的键名。
+pub type CommentTemplateOverride = Option<String>;
+
 /// 临时 mix 模式配置（overlay 激活面）。触发后对每个成员方案查询并按成员序合并候选。
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
 pub struct MixModeConfig {
@@ -697,6 +716,12 @@ pub struct MixModeConfig {
     /// （它本就是 quick_mix 这个实例的属性，却被存在了与实例无关的全局段里）。
     #[serde(default)]
     pub candidate_layout: LayoutIntent,
+    /// 本 mix 期间的注释模板覆盖（竖排），见 [`CommentTemplateOverride`]。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub comment_template_vertical: CommentTemplateOverride,
+    /// 本 mix 期间的注释模板覆盖（横排），见 [`CommentTemplateOverride`]。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub comment_template_horizontal: CommentTemplateOverride,
 }
 
 /// 内置「快捷」融合 mix 的实例 id（`;` 触发，成员含日期/计算/拼音/英文）。
@@ -729,6 +754,9 @@ fn default_mix_modes() -> Vec<MixModeConfig> {
         // 与旧 data/config.toml 的 `quick_input.force_vertical = true` 行为一致
         // （mix_modes 不能写进预置文件，故默认值只能落在这里，见 §迁移）。
         candidate_layout: LayoutIntent::Vertical,
+        // None = 跟随全局注释模板（内置 quick_mix 不预设覆盖）
+        comment_template_vertical: None,
+        comment_template_horizontal: None,
     }]
 }
 
@@ -764,6 +792,12 @@ pub struct SpecialModeConfig {
     /// 生僻字表可横排，互不影响。
     #[serde(default)]
     pub candidate_layout: LayoutIntent,
+    /// 本特殊模式期间的注释模板覆盖（竖排），见 [`CommentTemplateOverride`]。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub comment_template_vertical: CommentTemplateOverride,
+    /// 本特殊模式期间的注释模板覆盖（横排），见 [`CommentTemplateOverride`]。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub comment_template_horizontal: CommentTemplateOverride,
 }
 
 impl SpecialModeConfig {
@@ -1079,6 +1113,14 @@ pub struct TempEnglishConfig {
     /// 典型用法是设 `horizontal`——英文候选一行放得下，全局竖排时反而占屏。
     #[serde(default)]
     pub candidate_layout: LayoutIntent,
+    /// 临英期间的注释模板覆盖（竖排），见 [`CommentTemplateOverride`]。
+    /// 典型用法 `"${dict}"`——只在打英文时显示挂载的英汉释义，中文输入不受影响。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub comment_template_vertical: CommentTemplateOverride,
+    /// 临英期间的注释模板覆盖（横排），见 [`CommentTemplateOverride`]。
+    /// 临英常设 `candidate_layout = "horizontal"`，此时生效的是本项而非竖排那份。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub comment_template_horizontal: CommentTemplateOverride,
     /// 生成大小写变形候选（全小写 / 首字母大写 / 全大写）。
     ///
     /// 关掉后候选只剩输入原文 + 词库匹配。变形候选的代价是**每条都占一个候选位**：
@@ -1100,6 +1142,8 @@ impl Default for TempEnglishConfig {
             space_as_input: false,
             candidate_layout: LayoutIntent::default(),
             case_variants: true,
+            comment_template_vertical: None,
+            comment_template_horizontal: None,
         }
     }
 }
@@ -1126,6 +1170,13 @@ pub struct TempPinyinConfig {
     /// 进入临时拼音期间的候选布局（默认跟随全局）。
     #[serde(default)]
     pub candidate_layout: LayoutIntent,
+    /// 临拼期间的注释模板覆盖（竖排），见 [`CommentTemplateOverride`]。
+    /// 反查场景的典型用法是设 `"${code}"` 只留编码，或设 `""` 什么都不显示。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub comment_template_vertical: CommentTemplateOverride,
+    /// 临拼期间的注释模板覆盖（横排），见 [`CommentTemplateOverride`]。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub comment_template_horizontal: CommentTemplateOverride,
 }
 
 fn default_temp_pinyin_triggers() -> Vec<String> {
@@ -1139,6 +1190,8 @@ impl Default for TempPinyinConfig {
             trigger_keys: default_temp_pinyin_triggers(),
             hotkey: String::new(),
             candidate_layout: LayoutIntent::default(),
+            comment_template_vertical: None,
+            comment_template_horizontal: None,
         }
     }
 }
@@ -1155,6 +1208,12 @@ pub struct UrlConfig {
     /// 进入网址模式期间的候选布局（默认跟随全局）。
     #[serde(default)]
     pub candidate_layout: LayoutIntent,
+    /// 网址模式期间的注释模板覆盖（竖排），见 [`CommentTemplateOverride`]。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub comment_template_vertical: CommentTemplateOverride,
+    /// 网址模式期间的注释模板覆盖（横排），见 [`CommentTemplateOverride`]。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub comment_template_horizontal: CommentTemplateOverride,
 }
 
 fn default_url_prefixes() -> Vec<String> {
@@ -1173,6 +1232,8 @@ impl Default for UrlConfig {
             enabled: false,
             prefixes: default_url_prefixes(),
             candidate_layout: LayoutIntent::default(),
+            comment_template_vertical: None,
+            comment_template_horizontal: None,
         }
     }
 }
@@ -3274,6 +3335,39 @@ show_source_hint = false
 "#);
         assert_eq!(prune_redundant(&mut user, &preset), 2);
         assert_eq!(prune_redundant(&mut user, &preset), 0, "二次清理应无事可做");
+    }
+
+    /// ★ 模式级注释模板（三态 `Option`，**刻意不进注册表**）不得被写回清理掉。
+    ///
+    /// 这类键的出厂值是「键不存在」＝跟随全局，故 preset 里没有它们、注册表也不登记
+    /// （见 `config_schema::REGISTRY` 的说明）。若哪天有人为了「让设置页能看见」把它们
+    /// 补进注册表，`prune_redundant` 的第一道保险就失效——用户手写的模板会在某次保存后
+    /// 被静默删掉，表现为「配了几天突然没了」。本测试是那个改动的拦截点。
+    #[test]
+    fn prune_keeps_mode_comment_templates() {
+        let preset = preset_sample();
+        let mut user = tv(r#"
+[input.temp_english]
+comment_template_vertical = "${dict}"
+comment_template_horizontal = ""
+"#);
+        assert_eq!(prune_redundant(&mut user, &preset), 0, "未登记键一律不碰");
+        assert!(
+            get_nested(
+                &user,
+                &["input", "temp_english", "comment_template_vertical"]
+            )
+            .is_some(),
+            "用户手写的模式级模板必须原样保留"
+        );
+        assert!(
+            get_nested(
+                &user,
+                &["input", "temp_english", "comment_template_horizontal"]
+            )
+            .is_some(),
+            "空串（= 本模式不显示注释）同样是有效配置，不得被当成冗余删除"
+        );
     }
 
     #[test]

@@ -57,6 +57,16 @@ const LAYOUT_INTENT_VALUES: &[&str] = &["follow", "vertical", "horizontal"];
 
 /// 全部配置字段声明（单一真相源）。与 [`Config`] 经测试反向对照，保证零漂移。
 /// 域划分见 `docs/config-key-migration.md`（不做向后兼容，旧键已弃）。
+///
+/// # 三态键（`Option<T>`，默认 `None`）刻意不登记
+///
+/// 模式级注释模板 `input.{temp_english,temp_pinyin,url}.comment_template_{vertical,horizontal}`
+/// 不在本表内，**这不是遗漏**：注册表是与 `Config::default()` 的序列化键集反向对照的，
+/// 而这类键的出厂值恰恰是「键不存在」（= 跟随全局），序列化时压根不出现，登记即被判「多余」。
+///
+/// 不登记同时是**正确**的：`prune_redundant` 只清理「已登记且值等于出厂默认」的键，
+/// 未登记键一律不碰——用户手写的模板因此永远不会被写回逻辑清掉。这与废弃键、
+/// `Map`/`StructList` 下钻子路径归为同一类处置，理由见该函数的「两道保险」。
 static REGISTRY: &[ConfigField] = &[
     // -- schema（方案 + 拼音 + 模式）--
     f("schema.active", Str),

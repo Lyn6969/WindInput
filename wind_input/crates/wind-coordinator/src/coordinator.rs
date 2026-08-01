@@ -1096,6 +1096,27 @@ impl Coordinator {
         Self::build(config, data_dir, push_server, ui_tx, None, None)
     }
 
+    /// 无头 + **保留 UI 通道接收端**（测试用）。
+    ///
+    /// `new_headless` 丢弃 rx，于是一切「发给 UI 的内容」在测试里都不可见——而候选的注释段、
+    /// 悬停提示这些是在**发送路径上**算出来的，不回写 `state.candidates`。要验证它们只有两条路：
+    /// 收这个 rx，或者另写一个「按同样规则再算一遍」的 debug 方法。后者是假测试的经典形态——
+    /// 它证明不了生产路径接对了，决策函数写好但消费端没接的情况照样全绿。
+    pub fn new_headless_with_ui(
+        config: Config,
+        data_dir: Option<&Path>,
+    ) -> (Arc<Self>, std::sync::mpsc::Receiver<UiCommand>) {
+        let (ui_tx, rx) = std::sync::mpsc::channel();
+        let push_server = Arc::new(PushServer::new(PushConfig {
+            suffix: String::new(),
+            write_timeout_ms: 30_000,
+        }));
+        (
+            Self::build(config, data_dir, push_server, ui_tx, None, None),
+            rx,
+        )
+    }
+
     /// 无头 + 注入 redb store（测试用）：用于 web_data_rpc 数据域契约测试。
     pub fn new_headless_with_store(
         config: Config,
@@ -2722,7 +2743,9 @@ impl Coordinator {
         let reverse = self.reverse.read().unwrap_or_else(|e| e.into_inner());
         // 注释段（候选右侧灰字）模板，见 `crate::comment`。横竖各持一份、互不影响：
         // 两种排布的可用横向空间差一个数量级，能放什么本就不是同一个答案。
-        let comment_tpl = cand_cfg.comment_template(self.desired_vertical(state));
+        // 模式级覆盖优先于全局（临英可只显示 ${dict}、临拼可整个关掉），见 `comment::template_for`。
+        let comment_tpl =
+            self.comment_template_for(&rt.config, state, self.desired_vertical(state));
         // [编码] 段来源方案（循环外解析一次）：码表方案=自身全部编码（码长升序 a/ab/abc）、
         // 混输=其主码表成员、拼音=全局主码表。编码按词查方案词库反查索引（word_codes_in），
         // 不按取码规则生成。候选并非用该编码方案直接输入时（来源方案≠活跃方案，或处于
@@ -6476,6 +6499,121 @@ mod reload_tests {
         let b = ConfigBundle::build(cfg);
         assert!(b.config.input.symbol.smart_mode);
         assert_eq!(b.config.ui.candidate.per_page, 9);
+    }
+}
+
+#[cfg(test)]
+mod mode_comment_e2e_tests {
+    //! 模式级注释模板走到**发往 UI 的候选**上——决策函数 `comment::template_for` 的单元测试
+    //! 证明不了消费端接上了它（本仓反复出现的「半接线」欠账）。
+    //!
+    //! 注释段在发送路径上算、不回写 `state.candidates`，故这里收 UI 通道断言。放在 crate 内
+    //! 而非 tests/ 下，是因为要预置 caret 绕过首显闸门——headless 无宿主坐标，首帧会被
+    //! `first_show` 闸门拦下不下发候选（见 `ready_coords_bypass_first_show_wait`）。
+    use super::*;
+
+    /// 造协调器并把坐标预置成「已就绪」，使候选能立即下发。
+    fn coord_with_ui(cfg: Config) -> (Arc<Coordinator>, std::sync::mpsc::Receiver<UiCommand>) {
+        let (c, rx) = Coordinator::new_headless_with_ui(cfg, None);
+        *c.last_valid_caret.lock().unwrap() = (100, 200, 20);
+        *c.composition_start.lock().unwrap() = (100, 200, true);
+        (c, rx)
+    }
+
+    /// 直接驱动候选下发：造一条候选、进指定模式，然后走真实的 `notify_ui_update`。
+    ///
+    /// 候选带 `comment`（`${code_hint}` 的取值源）——模板**必须含至少一个非空变量**，
+    /// 否则「变量全空则整个模板输出空串」的隐式可选段规则会让纯字面量模板恒渲染成空，
+    /// 三个用例会一起拿到 `Some("")`，看起来像「模板没生效」其实是测试自己写错了。
+    fn emit(c: &Arc<Coordinator>, active: Option<ModeKind>) {
+        {
+            let mut st = c.state.lock().unwrap();
+            st.active = active;
+            st.candidates = vec![wind_candidate::Candidate {
+                text: "测".into(),
+                comment: "码".into(),
+                ..Default::default()
+            }];
+            st.input_buffer = "a".into();
+        }
+        let st = c.state.lock().unwrap();
+        c.notify_ui_update(&st);
+    }
+
+    /// 取最近一条 `UpdateCandidates` 里首候选的注释段。
+    fn last_comment(rx: &std::sync::mpsc::Receiver<UiCommand>) -> Option<String> {
+        let mut found = None;
+        // 排空取**最后**一条：一次刷新会发多条 UI 命令，取第一条会拿到上一轮残留。
+        while let Ok(cmd) = rx.try_recv() {
+            if let UiCommand::UpdateCandidates { candidates, .. } = cmd {
+                found = candidates.first().map(|c| c.comment.clone());
+            }
+        }
+        found
+    }
+
+    fn cfg_with_templates() -> Config {
+        let mut c = Config::default();
+        // 用字面量而非变量，断言才不依赖词库内容
+        c.ui.candidate.comment_template_vertical = "全局${code_hint}".into();
+        c.ui.candidate.comment_template_horizontal = "全局${code_hint}".into();
+        c
+    }
+
+    #[test]
+    fn mode_override_reaches_ui() {
+        let mut cfg = cfg_with_templates();
+        cfg.input.temp_english.comment_template_vertical = Some("临英${code_hint}".into());
+        cfg.input.temp_english.comment_template_horizontal = Some("临英${code_hint}".into());
+        let (c, rx) = coord_with_ui(cfg);
+
+        emit(&c, None);
+        assert_eq!(
+            last_comment(&rx),
+            Some("全局码".to_string()),
+            "无模式时取全局模板"
+        );
+
+        emit(&c, Some(ModeKind::TempEnglish));
+        assert_eq!(
+            last_comment(&rx),
+            Some("临英码".to_string()),
+            "临英期间必须改用模式级模板——只测 template_for 抓不到消费端没接线"
+        );
+    }
+
+    /// ★ 空串 = 本模式不显示注释（与「跟随全局」是两回事），且这条语义要一路走到 UI。
+    #[test]
+    fn empty_override_hides_comment_at_ui() {
+        let mut cfg = cfg_with_templates();
+        cfg.input.temp_pinyin.comment_template_vertical = Some(String::new());
+        cfg.input.temp_pinyin.comment_template_horizontal = Some(String::new());
+        let (c, rx) = coord_with_ui(cfg);
+
+        emit(&c, Some(ModeKind::TempPinyin));
+        assert_eq!(
+            last_comment(&rx),
+            Some(String::new()),
+            "空串必须让本模式不显示注释，而不是回落全局"
+        );
+    }
+
+    /// 退出模式后自动回到全局模板——声明式重算的自愈性，无需任何「恢复」动作。
+    #[test]
+    fn leaving_mode_restores_global_template() {
+        let mut cfg = cfg_with_templates();
+        cfg.input.temp_english.comment_template_vertical = Some("临英${code_hint}".into());
+        cfg.input.temp_english.comment_template_horizontal = Some("临英${code_hint}".into());
+        let (c, rx) = coord_with_ui(cfg);
+
+        emit(&c, Some(ModeKind::TempEnglish));
+        assert_eq!(last_comment(&rx), Some("临英码".to_string()));
+        emit(&c, None);
+        assert_eq!(
+            last_comment(&rx),
+            Some("全局码".to_string()),
+            "退出模式后应自动算回全局，不依赖任何显式恢复"
+        );
     }
 }
 
