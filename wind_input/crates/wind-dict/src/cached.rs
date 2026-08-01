@@ -211,6 +211,21 @@ impl CachedDict {
         Ok(())
     }
 
+    /// 全库最大 weight（空库返回 `None`）。
+    ///
+    /// 词频等效权重的量纲基准（`docs/design/freq-weight-model.md` §5.1）：词频分必须相对
+    /// **当前引擎的** weight 量纲标定，混输把拼音候选整体 `/= PINYIN_TIER_SCALE`，同一个词
+    /// 两种模式差 100 倍，任何跨模式硬编码常数都会错。
+    ///
+    /// mmap 模式 O(1)（读 v6 MaxW 段根节点）；内存模式 O(码数)。**调用方应缓存结果**
+    /// ——内存模式是首次加载/缓存写失败的降级路径，不宜每次查询都算。
+    pub fn max_weight(&self) -> Option<i32> {
+        match self {
+            Self::Mmap(reader) => reader.max_weight(),
+            Self::Memory(dict) => dict.max_weight(),
+        }
+    }
+
     /// 精确查找
     pub fn search(&self, code: &str) -> Vec<(String, i32, i32)> {
         match self {

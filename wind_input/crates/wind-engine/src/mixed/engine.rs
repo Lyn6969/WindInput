@@ -616,6 +616,22 @@ impl MixedEngine {
 }
 
 impl Engine for MixedEngine {
+    /// 词频等效权重的量纲基准：取**拼音子引擎**的基准并同步降档。
+    ///
+    /// 混输对拼音候选整体 `/= PINYIN_TIER_SCALE`（[`Self::normalize_pinyin`]），故基准必须
+    /// 跟着除——否则按纯拼音标定的词频分会碾压混输下的全部拼音候选（其 p99 降档后只有 69）。
+    ///
+    /// 取拼音侧而非码表侧，是因为本模型只服务拼音路线（`freq-weight-model.md` §9.3：
+    /// 码表侧维持 used-first + `ProtectPolicy` 不动）。码表候选另有 `PHRASE_WEIGHT_BOOST`
+    /// 等加成、量纲更高，拼音的词频分压不过它们——「五笔优先」的硬约束因此自然保持。
+    fn max_dict_weight(&self) -> Option<i32> {
+        self.secondary
+            .as_ref()?
+            .max_dict_weight()
+            .map(|w| w / PINYIN_TIER_SCALE)
+            .filter(|w| *w > 0)
+    }
+
     /// 热插拔扩展词库：转发到主/次子引擎（码表子引擎承载 codetable-extra 层）。
     fn set_dict_enabled(&self, dict_id: &str, enabled: bool) -> bool {
         let a = self.primary.set_dict_enabled(dict_id, enabled);

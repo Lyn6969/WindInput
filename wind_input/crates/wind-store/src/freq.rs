@@ -45,6 +45,17 @@ impl Default for FreqProfile {
 }
 
 impl FreqProfile {
+    /// 半衰期衰减因子，落在 `(0, 1]`：刚用过 ≈ 1，久未用 → 0。
+    ///
+    /// 从 [`Self::pinyin_score`] 中拆出，供**等效权重模型**单独取用
+    /// （`docs/design/freq-weight-model.md` §5.1）——后者的次数项是**线性**的
+    /// （对齐 fcitx5 的 `pr ∝ uf1`），不能复用 `pinyin_score` 的 `log2` 形状，
+    /// 但衰减这一维两者共用，故抽出以免公式落成两份。
+    pub fn decay_factor(&self, rec: &FreqRecord, now: i64) -> f64 {
+        let age_hours = (now - rec.last_used).max(0) as f64 / 3600.0;
+        (-std::f64::consts::LN_2 * age_hours / self.half_life_hours).exp()
+    }
+
     /// 拼音词频衰减分（frequency.md §4）：
     /// `(base_scale * log2(count+1) + recency_peak) * exp(-ln2*age/half_life)`。
     /// 最近+高频 → 分高；久未用 → 衰减回落。count=0 返回 0。
@@ -52,9 +63,8 @@ impl FreqProfile {
         if rec.count == 0 {
             return 0.0;
         }
-        let age_hours = (now - rec.last_used).max(0) as f64 / 3600.0;
-        let decay = (-std::f64::consts::LN_2 * age_hours / self.half_life_hours).exp();
-        (self.base_scale * ((rec.count + 1) as f64).log2() + self.recency_peak) * decay
+        (self.base_scale * ((rec.count + 1) as f64).log2() + self.recency_peak)
+            * self.decay_factor(rec, now)
     }
 }
 

@@ -179,6 +179,71 @@ pub fn rerank_codetable_usedfirst(
     }
 }
 
+/// 追平 `W_max` 所需的使用次数——等效权重模型的**唯一无量纲旋钮**。
+///
+/// 取值 11765 由 fcitx5 换算而来，不是拍脑袋（`docs/design/freq-weight-model.md` §5.3）：
+/// libime 里一个词用过 1 次得 `pr = 5.4e-6`，而本仓词库最高权重「的」占全库总权重
+/// 6.32%（实测 15,378,475 / 2.4315e8，与中文语料中「的」的真实频率 4~7% 吻合，故该 weight
+/// 可近似当概率用）。两者相除得 `8.5e-5`，其倒数即本常数。
+///
+/// 代入后「用一次」≈ 1307 点权重，与本仓 `ADD_WORD_WEIGHT = 1200`（用户主动加词的默认
+/// 权重）落在同一量级——两个独立来源的交叉印证：「主动加一个词」与「选中一个词一次」
+/// 表达的意图强度本就相当。
+pub const DEFAULT_FREQ_SAT_COUNT: u32 = 11765;
+
+/// 词频的**等效权重** `W_freq`：把「用过几次、多久前用的」折算成与词库 weight 同量纲的值。
+///
+/// ```text
+/// W_freq = (w_max / n_sat) · min(count, n_sat) · decay(age)
+/// ```
+///
+/// **对次数线性**，不是饱和曲线。fcitx5 的 `pr` 正比于词在历史池中的出现次数
+/// （`historybigram.cpp:620`），饱和只来自 pool 容量这个物理上限；早期方案误用
+/// `count/(count+K)` 的饱和形状，`g(1)=0.09` 会让用过一次的词直接跳到最高权重的 9%，
+/// 激进了近三个数量级。
+///
+/// `min(count, n_sat)` 是必需的：本仓 `count` 是 `u32` 单调递增、**没有** fcitx5 那个
+/// pool 容量上限，不封顶则线性增长最终会越过任何权重。
+///
+/// `w_max` 必须来自**当前引擎**（`PinyinEngine::max_dict_weight`）——混输把拼音候选整体
+/// `/= PINYIN_TIER_SCALE`，跨模式的硬编码常数必错。
+///
+/// 返回 0 表示无有效词频（未用过 / 已衰减殆尽 / 基准无效）。
+pub fn freq_weight(
+    rec: &FreqRecord,
+    now: i64,
+    profile: FreqProfile,
+    w_max: i32,
+    n_sat: u32,
+) -> i32 {
+    if rec.count == 0 || w_max <= 0 || n_sat == 0 {
+        return 0;
+    }
+    let unit = w_max as f64 / n_sat as f64;
+    let n = rec.count.min(n_sat) as f64;
+    let w = unit * n * profile.decay_factor(rec, now);
+    // 上界即 w_max（count 已 clamp 到 n_sat、decay ≤ 1），钳一次防浮点误差越界。
+    w.clamp(0.0, w_max as f64) as i32
+}
+
+/// 候选的**等效权重** `W_eff = max(weight, W_freq)`。
+///
+/// `max` 而非加法，对齐 fcitx5 的 `std::max(score, …)`（`userlanguagemodel.cpp:139`）：
+///
+/// - **词频只抬不降**。当前的布尔 used-first 恰恰相反——它既抬高用过的，**也把没用过的
+///   高权重词压下去**，这正是「打一个 `d` 首选变『的样子』」的机制。
+/// - 加法在 Zipf 分布下退化：对 p50 的词（weight=34）任何加数都是碾压，对「的」
+///   （1.5e7）任何加数都是噪声，**没有「意图强度」这个语义**，只是平移。
+/// - `max` 的语义清晰：「这个词对**你**而言至少值 `W_freq`，不管词库怎么说」。词库权重
+///   更高时以词库为准——高频字因此不会被偶发选择挤掉。
+///
+/// 传 `weight` 而非 `&Candidate`：contested 整句要用的是 `dict_weight`（整句加成前的词典
+/// 权重）而非被 3e7 覆盖后的 `weight`，由调用方决定喂哪个。
+#[inline]
+pub fn effective_weight(weight: i32, w_freq: i32) -> i32 {
+    weight.max(w_freq)
+}
+
 /// 词频 used-first 的**准入判据**：候选字数不得超过输入击键数。
 ///
 /// 打一个 `d` 就把用过一次的「的样子」顶成首选，是词频越权最刺眼的形态——用户只给出
@@ -854,6 +919,179 @@ mod tests {
             vec!["左", "精确短语", "矼", "date短语"],
             "精确码短语 tier1 紧随码表精确；前缀短语 tier2 与码表前缀补全同档、不抬到补全之上"
         );
+    }
+
+    // ─────────────── 等效权重（freq-weight-model.md §5）───────────────
+    //
+    // 下列常量全部是 `build_dev/data/schemas/pinyin/cn_dicts/` 的**实测值**，不是构造数字。
+    // 复现方法见该设计文档附录。换词库或改 `import_tables` 后需重新标定，这些用例会先红。
+
+    /// 全库最大 weight：「的」（`8105.dict.yaml`），亦即 `W_max` 基准。
+    const W_MAX: i32 = 15_378_475;
+    /// 「的样子」（`ext.dict.yaml`）≈ base 库的 p99.9——**不是低频词**，
+    /// 它在用户现场夺走首选靠的是布尔闸门让权重完全不参与比较。
+    const W_DEYANGZI: i32 = 23_923;
+    /// `si yuan` 同码：寺院 491 > 思源 245，仅差 2 倍。
+    const W_SIYUAN_TEMPLE: i32 = 491;
+    const W_SIYUAN_PRODUCT: i32 = 245;
+
+    fn rec(count: u32, last_used: i64) -> FreqRecord {
+        FreqRecord { count, last_used }
+    }
+
+    fn fw(count: u32, now_offset_hours: i64) -> i32 {
+        freq_weight(
+            &rec(count, NOW - now_offset_hours * 3600),
+            NOW,
+            FreqProfile::default(),
+            W_MAX,
+            DEFAULT_FREQ_SAT_COUNT,
+        )
+    }
+
+    /// 标定的核心断言：用一次约等于没用——高权重词纹丝不动。
+    ///
+    /// 对齐 fcitx5（`max(-2.5, -2.597) = -2.5`）与 librime（`formula_p` 在 `d/kM≈0.005`
+    /// 处几乎不动）。两个独立实现殊途同归，这是本模型最该守住的性质。
+    #[test]
+    fn freq_weight_one_use_does_not_move_a_high_weight_word() {
+        let w1 = fw(1, 0);
+        assert_eq!(
+            w1, 1307,
+            "用一次 ≈ W_max/N_sat；与 ADD_WORD_WEIGHT(1200) 同量级"
+        );
+        assert_eq!(
+            effective_weight(W_DEYANGZI, w1),
+            W_DEYANGZI,
+            "「的样子」23923 用一次后等效权重不变——这正是用户现场该有的结果"
+        );
+        assert_eq!(effective_weight(W_MAX, w1), W_MAX, "「的」更不可能被撼动");
+    }
+
+    /// **反向对照**：词频不是被废掉了——次数够多就能翻越。
+    ///
+    /// 缺了这条，上面的断言可以靠「让 `freq_weight` 恒返回 0」满足，那是更严重的退化。
+    #[test]
+    fn freq_weight_grows_linearly_and_eventually_overtakes() {
+        assert_eq!(fw(10, 0), 13_071, "十次仍低于「的样子」23923");
+        assert_eq!(effective_weight(W_DEYANGZI, fw(10, 0)), W_DEYANGZI);
+
+        let w20 = fw(20, 0);
+        assert!(w20 > W_DEYANGZI, "二十次开始越过自身权重，got {w20}");
+        assert_eq!(effective_weight(W_DEYANGZI, w20), w20);
+
+        // 线性：翻倍次数 → 翻倍权重（对齐 fcitx5 的 pr ∝ uf1，非饱和曲线）。
+        // 容 1 点误差——`as i32` 向零截断，两次独立截断的结果不必严格等于「先算后翻倍」。
+        assert!(
+            (fw(200, 0) - fw(100, 0) * 2).abs() <= 1,
+            "对次数必须线性，got {} vs {}",
+            fw(200, 0),
+            fw(100, 0) * 2
+        );
+    }
+
+    /// 用户提的场景：寺院（通用语料常用）vs 思源（产品名，该用户日常要打的）。
+    ///
+    /// 两者权重仅差 2 倍，而「用一次」值 1307 远超两者 ⇒ **一次即翻转**，
+    /// 不需要几十次。这正是「压得过低频、压不过高频」在起作用。
+    #[test]
+    fn freq_weight_flips_siyuan_after_single_use() {
+        let once = fw(1, 0);
+        let product = effective_weight(W_SIYUAN_PRODUCT, once);
+        // 寺院此处用 dict_weight（491）参与比较，而非被整句加成覆盖后的 3e7
+        let temple = effective_weight(W_SIYUAN_TEMPLE, 0);
+        assert!(
+            product > temple,
+            "选过一次「思源」后应超过「寺院」，got {product} vs {temple}"
+        );
+    }
+
+    /// 高频字不可被夺走：追平「的」需 11765 次，实际不可达。
+    #[test]
+    fn freq_weight_cannot_overtake_top_frequency_char() {
+        // 先钉住非 0：不然「freq_weight 恒返回 0」也能满足下面「压不过高频字」的全部断言
+        // ——那时通过的原因是词频压根没生效，而非取舍正确。反向验证当场抓到过这一点。
+        assert!(fw(1000, 0) > 0, "一千次必须是真值，否则本用例是空转");
+        assert!(fw(1000, 0) < W_MAX, "一千次仍远不足以追平「的」");
+        assert_eq!(
+            effective_weight(W_MAX, fw(1000, 0)),
+            W_MAX,
+            "高频字必须岿然不动——这是有意的取舍，对齐 librime/fcitx5"
+        );
+    }
+
+    /// `count` 封顶：本仓 `count` 是 u32 单调递增，没有 fcitx5 的 pool 容量上限，
+    /// 不 clamp 则线性增长最终越过任何权重。
+    #[test]
+    fn freq_weight_saturates_at_n_sat() {
+        let at_sat = fw(DEFAULT_FREQ_SAT_COUNT, 0);
+        let way_past = fw(u32::MAX, 0);
+        // 先钉住非 0：否则「freq_weight 恒返回 0」也能让下面两条断言通过（0 == 0、0 <= W_MAX）
+        assert!(at_sat > 0, "封顶值必须是真值而非退化的 0");
+        assert_eq!(at_sat, way_past, "超过 N_sat 后不再增长");
+        assert!(at_sat <= W_MAX, "上界即 W_max，got {at_sat}");
+    }
+
+    /// 衰减：久未用的词自然回落，`max` 随之退回词库权重——不需要额外的阈值褪色判据。
+    #[test]
+    fn freq_weight_decays_and_falls_back_to_dict_weight() {
+        let fresh = fw(20, 0);
+        let one_half_life = fw(20, 72); // FreqProfile::default().half_life_hours = 72
+        let ratio = one_half_life as f64 / fresh as f64;
+        assert!((ratio - 0.5).abs() < 0.02, "一个半衰期应≈半衰，got {ratio}");
+
+        let ancient = fw(20, 365 * 24);
+        assert_eq!(
+            effective_weight(W_DEYANGZI, ancient),
+            W_DEYANGZI,
+            "一年前用过 → 衰减殆尽 → 落回词库权重"
+        );
+    }
+
+    /// 边界：无记录 / 基准无效时必须返回 0，不能让 `max` 拿到垃圾值。
+    #[test]
+    fn freq_weight_guards_invalid_inputs() {
+        let p = FreqProfile::default();
+        let r = rec(5, NOW);
+        assert_eq!(
+            freq_weight(&rec(0, NOW), NOW, p, W_MAX, DEFAULT_FREQ_SAT_COUNT),
+            0,
+            "未用过"
+        );
+        assert_eq!(
+            freq_weight(&r, NOW, p, 0, DEFAULT_FREQ_SAT_COUNT),
+            0,
+            "空库/无基准"
+        );
+        assert_eq!(
+            freq_weight(&r, NOW, p, -1, DEFAULT_FREQ_SAT_COUNT),
+            0,
+            "负基准"
+        );
+        assert_eq!(freq_weight(&r, NOW, p, W_MAX, 0), 0, "n_sat=0 不得除零");
+        // 对照：同样的记录在参数有效时必须非 0，否则上面四条「返回 0」全是空转
+        assert!(
+            freq_weight(&r, NOW, p, W_MAX, DEFAULT_FREQ_SAT_COUNT) > 0,
+            "有效输入必须产出非 0，否则守卫测试是空转"
+        );
+    }
+
+    /// 量纲随引擎走：混输把拼音候选 `/= PINYIN_TIER_SCALE`，基准必须同步缩放，
+    /// 否则按纯拼音标定的词频分会碾压混输下的全部拼音候选（其 p99 只有 69）。
+    #[test]
+    fn freq_weight_scales_with_engine_dimension() {
+        let mixed_max = W_MAX / 100; // 混输量纲
+        let pure = fw(5, 0);
+        let mixed = freq_weight(
+            &rec(5, NOW),
+            NOW,
+            FreqProfile::default(),
+            mixed_max,
+            DEFAULT_FREQ_SAT_COUNT,
+        );
+        assert_eq!(mixed, pure / 100, "基准缩放 100 倍，词频分同步缩放");
+        // 若误用纯拼音基准，混输下 p99(69) 的候选会被一次使用碾压
+        assert!(pure > 69 * 10, "反证：跨模式硬编码常数必然越权");
     }
 
     /// 短输入下，用过一次的长词不得夺走首选（用户实测现场）。

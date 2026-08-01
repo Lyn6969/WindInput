@@ -709,6 +709,20 @@ impl CodetableDict {
         self.total_entries == 0
     }
 
+    /// 全库最大 weight（空库返回 `None`）。
+    ///
+    /// 每组 `Vec<CodetableEntry>` 构建时已按 weight 降序，故只需比较各组首元素，
+    /// 复杂度是 O(码数) 而非 O(条目数)。
+    ///
+    /// 对应 mmap 模式的 [`crate::datformat::WdatReader::max_weight`]（那边读 v6 MaxW 段
+    /// 根节点，O(1)）。用途见 `docs/design/freq-weight-model.md` §5.1。
+    pub fn max_weight(&self) -> Option<i32> {
+        self.entries
+            .values()
+            .filter_map(|v| v.first().map(|e| e.weight))
+            .max()
+    }
+
     /// 创建空词典
     pub fn empty() -> Self {
         Self {
