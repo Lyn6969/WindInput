@@ -13,6 +13,12 @@ enum class CaretProbeKind
 {
     Composition,
     Focus,
+    // 组合刚启动即发起的**试探**：结果不走正式 caret_update，而是发 CMD_CARET_PROBE。
+    // 目的是回答一个至今没有实测数据的问题——异步请求排在宿主当前 edit session 之后执行，
+    // 那么它拿到的究竟是 reflow **前**还是**后**的坐标？
+    // 走 probe 通道意味着 wait 档一律忽略、fast 档才读，因此本探测**不改变任何现有行为**。
+    // 作废判据同 Composition（靠 _pComposition 判活）。
+    FirstShowProbe,
 };
 
 // 异步取坐标的回调结果。

@@ -746,6 +746,14 @@ pub struct Coordinator {
     /// **刻意不配兜底 timer**：超时后能做的只有「拿不可信坐标显示」，正是本机制要挡的事。
     /// 等不到就不显示，失焦/下一次焦点事件清位。
     pending_focus_tip: std::sync::atomic::AtomicBool,
+    /// 上一次弹过焦点气泡的宿主（`client_token`，DLL 实例级 = 每进程一个）。
+    ///
+    /// **气泡的语义是「切到了新的输入宿主」，不是「换了 docMgr」**。一个宿主内部可以有多个
+    /// docMgr 并频繁互切：Excel 在单元格里起输入时切一次、输入完焦点落到公式编辑栏又切一次，
+    /// 若按 docMgr 计就成了「输入一次闪两下」（同一单元格内连续输入反而不闪，因为中途不换
+    /// docMgr）——这个「闪的时机与用户的操作节奏对不上」正是它扰人的原因。
+    /// 故以 token 去重：同 token 只在首次进入时弹，离开该宿主（`FocusLostReason::Thread`）时清零。
+    last_focus_tip_token: Mutex<u64>,
     /// 上一次按键时刻，仅用于算出下面那个「相邻按键间隔」。
     pub(crate) last_key_at: Mutex<Option<std::time::Instant>>,
     /// **相邻两次按键**的间隔（毫秒），fast 档据此判断是否处于连续快速输入。
@@ -1417,6 +1425,7 @@ impl Coordinator {
             last_key_interval_ms: Mutex::new(None),
             first_show_was_provisional: std::sync::atomic::AtomicBool::new(false),
             pending_focus_tip: std::sync::atomic::AtomicBool::new(false),
+            last_focus_tip_token: Mutex::new(0),
             app_compat: Mutex::new(app_compat),
             compat_dirs: (
                 data_dir.map(|d| d.to_path_buf()),
@@ -3642,10 +3651,25 @@ impl Coordinator {
     /// 由 [`Self::handle_caret_update`] 消费本次挂起并补显示，故绝大多数宿主上并不会真的落空。
     ///
     /// `fixed` 模式不读 caret（用 custom_x/custom_y），故不受本闸门约束，一律直接显示。
-    pub(crate) fn show_focus_status_if_enabled(&self) {
+    /// `client_token` 用于按**宿主**去重，见 [`Self::last_focus_tip_token`]：同一宿主内部换
+    /// docMgr（Excel 单元格 ↔ 公式编辑栏）不该重复弹。
+    pub(crate) fn show_focus_status_if_enabled(&self, client_token: u64) {
         let si = &self.rt().config.ui.status;
         if !si.enabled || !si.show_on_focus {
             return;
+        }
+        // 宿主去重。放在最前面：后面几条分支（fixed / TSF 闸门 / 挂起）都属于「这一次该怎么弹」，
+        // 而这里回答的是**该不该弹**，语义在先。token=0 是旧 DLL 未携带的占位，不参与去重。
+        if client_token != 0 {
+            let mut last = self
+                .last_focus_tip_token
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            if *last == client_token {
+                debug!("focus_tip → 跳过: 同一宿主内换 docMgr（token={client_token:#x}）");
+                return;
+            }
+            *last = client_token;
         }
         // always 模式已由 show_persistent_status_if_always 在同一处焦点回调里显示过，
         // 这里再来一次只会重复下发同一帧。
@@ -5561,6 +5585,18 @@ impl MessageHandler for Coordinator {
             },
             "handle_focus_gained",
         );
+        // 组合起点锚定作废：焦点事件意味着**换了 docMgr**。组合本身可能还在（buffer 未清），
+        // 但它的宿主位置可能整体迁移——Excel 输入时会在「单元格」与「公式编辑栏」两个 docMgr
+        // 之间来回切，实测组合从 (593,572) 迁到 (1457,959)。而锚定「同一组合只锁一次、之后
+        // 不再更新」的隐含前提正是**起点不会移动**，这里恰好证伪。
+        //
+        // 不作废的后果是候选窗钉死在旧 docMgr 上：协调器拿 state.caret_* 判出 reshow，下发时
+        // 却用锁死的组合起点，日志上表现为「reshow: dx=1297 说要重定位，UI pos 却纹丝不动」。
+        // 清掉后由下一帧 caret_update 就地重锁，候选窗跟到新位置。
+        *self
+            .composition_start
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = (0, 0, false);
         {
             let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
             // 焦点进入文本框 = 本输入法激活（对齐 Go HandleFocusGained → SetIMEActivated(true)）。
@@ -5628,7 +5664,9 @@ impl MessageHandler for Coordinator {
         self.push_activation_status(data.client_token);
         self.notify_toolbar_async(); // 激活态 → 工具栏显示（异步，避免 is_foreground_fullscreen 阻塞 bridge 线程）
         self.show_persistent_status_if_always(); // 常驻模式:获焦即显示状态
-        self.show_focus_status_if_enabled(); // ui.status.show_on_focus:换输入框也提示一次
+        // ui.status.show_on_focus：切到新宿主时提示一次。按 client_token 去重——同一宿主内换
+        // docMgr（Excel 单元格 ↔ 公式栏）不重复弹，见 last_focus_tip_token。
+        self.show_focus_status_if_enabled(data.client_token);
         let pid = (data.client_token >> 32) as u32;
         self.apply_input_diag(pid, data.disabled, data.reason, data.input_scope_mask);
         Some(status)
@@ -5658,6 +5696,13 @@ impl MessageHandler for Coordinator {
                 // 别的输入法的应用不会触发 IME_DEACTIVATED，只有 FocusLost。工具栏隐藏经
                 // UI 层 50ms 防抖——紧接着若有 FocusGained 会取消隐藏，无闪烁。
                 s.ime_active = false;
+                // 真正离开了这个宿主 ⇒ 焦点气泡的去重记录作废，下次再进来该重新提示一次。
+                // **只在这一档清**：CtxLost/DocChanged 是宿主内部换 docMgr 的噪声，清了就等于
+                // 按 docMgr 计数，Excel 下又会变回「输入一次闪两下」。
+                *self
+                    .last_focus_tip_token
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner()) = 0;
             }
             if reason.clears_edit_context() {
                 // 焦点不在可编辑控件里了 → 工具栏隐藏。DocChanged 不走这里：换文档后
@@ -6990,6 +7035,83 @@ mod caret_compat_tests {
         st.caret_source = source;
     }
 
+    /// 两个不同宿主的 client_token。用具名常量而非字面量，是因为下面「同宿主不重复弹」
+    /// 那组用例的全部含义就在于**这两个值相不相等**，字面量会让它退化成看不出意图的魔数。
+    const TOKEN_A: u64 = 0x1111_0000_0001;
+    const TOKEN_B: u64 = 0x2222_0000_0001;
+
+    /// 同一宿主内换 docMgr（Excel 单元格 ↔ 公式编辑栏）不得重复弹气泡。
+    /// 这是「输入一次闪两下」的直接成因——闪的时机与用户的操作节奏对不上。
+    #[test]
+    fn focus_tip_skips_same_host_docmgr_switch() {
+        let (c, rx) = coord_focus_tip(true, "follow_caret");
+        set_caret(
+            &c,
+            100,
+            200,
+            wind_ipc::protocol::caret_source::TSF_SELECTION,
+        );
+        c.show_focus_status_if_enabled(TOKEN_A);
+        assert!(got_status_tip(&rx), "首次进入该宿主应弹一次");
+
+        c.show_focus_status_if_enabled(TOKEN_A);
+        assert!(
+            !got_status_tip(&rx),
+            "同一 token = 同一宿主内换 docMgr，不得重复弹"
+        );
+    }
+
+    /// 反向对照：换了宿主必须照弹。
+    /// **缺了这条，上一条用「弹过一次就再也不弹」的实现也能通过**——那会让切换应用时
+    /// 气泡彻底消失，比重复弹更糟。
+    #[test]
+    fn focus_tip_shows_again_for_different_host() {
+        let (c, rx) = coord_focus_tip(true, "follow_caret");
+        set_caret(
+            &c,
+            100,
+            200,
+            wind_ipc::protocol::caret_source::TSF_SELECTION,
+        );
+        c.show_focus_status_if_enabled(TOKEN_A);
+        assert!(got_status_tip(&rx));
+
+        c.show_focus_status_if_enabled(TOKEN_B);
+        assert!(got_status_tip(&rx), "换宿主必须重新提示一次");
+    }
+
+    /// 离开宿主（Thread 级失焦）后再回来，应当重新提示。
+    /// ⚠ 只有 Thread 档清去重记录：CtxLost/DocChanged 是宿主内换 docMgr 的噪声，
+    /// 若也清就等于按 docMgr 计数，Excel 下会退回「输入一次闪两下」。
+    #[test]
+    fn focus_tip_resets_after_leaving_host() {
+        let (c, rx) = coord_focus_tip(true, "follow_caret");
+        set_caret(
+            &c,
+            100,
+            200,
+            wind_ipc::protocol::caret_source::TSF_SELECTION,
+        );
+        c.show_focus_status_if_enabled(TOKEN_A);
+        assert!(got_status_tip(&rx));
+
+        // docMgr 级失焦：不清记录，回来仍不弹
+        c.handle_focus_lost(TOKEN_A, wind_bridge::handler::FocusLostReason::CtxLost);
+        c.show_focus_status_if_enabled(TOKEN_A);
+        assert!(!got_status_tip(&rx), "CtxLost 属 docMgr 噪声，不该解除去重");
+
+        // 真正离开宿主：清记录，回来重新弹
+        c.handle_focus_lost(TOKEN_A, wind_bridge::handler::FocusLostReason::Thread);
+        set_caret(
+            &c,
+            100,
+            200,
+            wind_ipc::protocol::caret_source::TSF_SELECTION,
+        );
+        c.show_focus_status_if_enabled(TOKEN_A);
+        assert!(got_status_tip(&rx), "离开宿主后再进入应重新提示");
+    }
+
     /// follow_caret 下，坐标来自 GUI 回退时**不得**直接弹气泡——那正是用户反馈的
     /// 「还没输入时定位非常不准」：`OnSetFocus` 拿不到同步锁，回退链交出的是跨窗口的
     /// Win32 光标（Word 标题行实测偏差 814px）。应转为挂起等权威坐标。
@@ -6997,7 +7119,7 @@ mod caret_compat_tests {
     fn focus_tip_defers_when_caret_source_is_not_tsf() {
         let (c, rx) = coord_focus_tip(true, "follow_caret");
         set_caret(&c, 0, 1388, wind_ipc::protocol::caret_source::GUI_CARET);
-        c.show_focus_status_if_enabled();
+        c.show_focus_status_if_enabled(TOKEN_A);
         assert!(
             !got_status_tip(&rx),
             "GUI 回退坐标不可作气泡锚点，此时不得下发显示"
@@ -7018,7 +7140,7 @@ mod caret_compat_tests {
     fn focus_tip_shows_when_authoritative_caret_arrives() {
         let (c, rx) = coord_focus_tip(true, "follow_caret");
         set_caret(&c, 0, 1388, wind_ipc::protocol::caret_source::GUI_CARET);
-        c.show_focus_status_if_enabled();
+        c.show_focus_status_if_enabled(TOKEN_A);
         assert!(!got_status_tip(&rx));
 
         c.handle_caret_update(&CaretData {
@@ -7043,7 +7165,7 @@ mod caret_compat_tests {
     fn focus_tip_stays_pending_for_non_tsf_caret_update() {
         let (c, rx) = coord_focus_tip(true, "follow_caret");
         set_caret(&c, 0, 1388, wind_ipc::protocol::caret_source::GUI_CARET);
-        c.show_focus_status_if_enabled();
+        c.show_focus_status_if_enabled(TOKEN_A);
         let _ = got_status_tip(&rx); // 排空
 
         c.handle_caret_update(&CaretData {
@@ -7072,7 +7194,7 @@ mod caret_compat_tests {
             217,
             wind_ipc::protocol::caret_source::TSF_SELECTION,
         );
-        c.show_focus_status_if_enabled();
+        c.show_focus_status_if_enabled(TOKEN_A);
         assert!(got_status_tip(&rx), "TSF 域坐标应立即显示");
         assert!(
             !c.pending_focus_tip
@@ -7087,7 +7209,7 @@ mod caret_compat_tests {
     fn focus_tip_ignores_caret_source_in_fixed_mode() {
         let (c, rx) = coord_focus_tip(true, "fixed");
         set_caret(&c, 0, 1388, wind_ipc::protocol::caret_source::GUI_CARET);
-        c.show_focus_status_if_enabled();
+        c.show_focus_status_if_enabled(TOKEN_A);
         assert!(got_status_tip(&rx), "fixed 模式不读 caret，应照常显示");
     }
 
@@ -7102,7 +7224,7 @@ mod caret_compat_tests {
             217,
             wind_ipc::protocol::caret_source::TSF_SELECTION,
         );
-        c.show_focus_status_if_enabled();
+        c.show_focus_status_if_enabled(TOKEN_A);
         assert!(!got_status_tip(&rx), "show_on_focus=false 时不得显示");
         assert!(
             !c.pending_focus_tip
@@ -7111,10 +7233,14 @@ mod caret_compat_tests {
         );
     }
 
-    /// 焦点气泡必须绕过 `show_status` 的文本去重。
+    /// 焦点气泡必须绕过 `show_status` 的**文本**去重。
     ///
-    /// 焦点切换正是「状态文本没变但仍要提示」的场景——走去重路径的话，连着切两个输入框
+    /// 焦点切换正是「状态文本没变但仍要提示」的场景——走文本去重路径的话，连着切两个宿主
     /// 只有第一次会弹，而这恰恰是本功能最主要的使用场景，等于开关基本无效。
+    ///
+    /// ⚠ 与 [`focus_tip_skips_same_host_docmgr_switch`] 的**宿主**去重是两回事，别混：
+    /// 这里换的是宿主（TOKEN_A → TOKEN_B），本就该弹；那里是同一宿主内换 docMgr，不该弹。
+    /// 本用例原先第二次也传同一 token，测到的其实是宿主去重引入前的旧语义。
     #[test]
     fn focus_tip_bypasses_text_dedup() {
         let (c, rx) = coord_focus_tip(true, "follow_caret");
@@ -7124,13 +7250,13 @@ mod caret_compat_tests {
             217,
             wind_ipc::protocol::caret_source::TSF_SELECTION,
         );
-        c.show_focus_status_if_enabled();
+        c.show_focus_status_if_enabled(TOKEN_A);
         assert!(got_status_tip(&rx), "第一次焦点切换应显示");
-        // 状态一字未改，模拟切到另一个输入框
-        c.show_focus_status_if_enabled();
+        // 状态一字未改，模拟切到**另一个宿主**的输入框
+        c.show_focus_status_if_enabled(TOKEN_B);
         assert!(
             got_status_tip(&rx),
-            "文本相同也必须再显示一次——去重会让这个开关形同虚设"
+            "文本相同也必须再显示一次——文本去重会让这个开关形同虚设"
         );
     }
 
@@ -7139,7 +7265,7 @@ mod caret_compat_tests {
     fn hide_tip_cancels_pending_focus_tip() {
         let (c, rx) = coord_focus_tip(true, "follow_caret");
         set_caret(&c, 0, 1388, wind_ipc::protocol::caret_source::GUI_CARET);
-        c.show_focus_status_if_enabled();
+        c.show_focus_status_if_enabled(TOKEN_A);
         assert!(
             c.pending_focus_tip
                 .load(std::sync::atomic::Ordering::Relaxed)
@@ -7234,6 +7360,35 @@ mod caret_compat_tests {
         assert_eq!(
             st.caret_source,
             wind_ipc::protocol::caret_source::TSF_SELECTION
+        );
+    }
+
+    /// 焦点事件必须作废组合起点锚定。
+    ///
+    /// 锚定「同一组合只锁一次、之后不再更新」的前提是**起点不会移动**，而 focus_gained 意味着
+    /// 换了 docMgr——Excel 输入时在「单元格」与「公式编辑栏」之间来回切，组合整体迁移（实测
+    /// 从 (593,572) 到 (1457,959)），锚点若不作废，候选窗就钉死在旧 docMgr 上：协调器拿
+    /// state.caret_* 判出 reshow，下发却用锁死的组合起点，日志表现为「reshow 说要重定位、
+    /// UI 位置纹丝不动」。
+    #[test]
+    fn focus_gained_invalidates_composition_start_anchor() {
+        let c = coord();
+        *c.composition_start.lock().unwrap() = (593, 572, true);
+        c.handle_focus_gained(&FocusData {
+            x: 1457,
+            y: 959,
+            height: 37,
+            composition_start_x: 0,
+            composition_start_y: 0,
+            client_token: TOKEN_A,
+            input_scope_mask: 0,
+            disabled: false,
+            reason: 0,
+            caret_source: wind_ipc::protocol::caret_source::TSF_SELECTION,
+        });
+        assert!(
+            !c.composition_start.lock().unwrap().2,
+            "换 docMgr 后组合起点必须作废，交由下一帧 caret_update 就地重锁"
         );
     }
 

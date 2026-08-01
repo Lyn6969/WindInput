@@ -4327,7 +4327,7 @@ void CTextService::_EmitCaretUpdate(LONG x, LONG y, LONG height, LONG compStartX
 
 // 非按键上下文里发起取坐标：见 CCaretEditSession::RequestCaretRectAsync 的说明。
 // 返回 FALSE 表示请求根本没发出去（无焦点 context 等），调用方需自己兜底。
-BOOL CTextService::RequestCaretPositionUpdateAsync()
+BOOL CTextService::RequestCaretPositionUpdateAsync(CaretProbeKind kind)
 {
     if (_pThreadMgr == nullptr || _pComposition == nullptr)
     {
@@ -4351,7 +4351,7 @@ BOOL CTextService::RequestCaretPositionUpdateAsync()
 
     BOOL requested = CCaretEditSession::RequestCaretRectAsync(
         pContext, _tfClientId, _pComposition, (LONG)GetPendingCommitPrefixLength(), this,
-        CaretProbeKind::Composition, 0);
+        kind, 0);
     pContext->Release();
 
     return requested;
@@ -4454,9 +4454,29 @@ void CTextService::OnAsyncCaretRectReady(const AsyncCaretResult& result)
     }
 
     const int source = result.usedCompStartAsCaret ? CARET_SRC_TSF_COMPOSITION : CARET_SRC_TSF_SELECTION;
+    const wchar_t* kindName = isFocusProbe                                    ? L"focus"
+                              : (result.kind == CaretProbeKind::FirstShowProbe) ? L"first_show_probe"
+                                                                                : L"composition";
     WIND_LOG_DEBUG_FMT(L"OnAsyncCaretRectReady(%s): caret(%ld,%ld h=%ld) compStart=(%ld,%ld) src=%d\n",
-                       isFocusProbe ? L"focus" : L"composition",
+                       kindName,
                        caretRect.left, caretRect.bottom, height, compStartX, compStartY, source);
+
+    // 首显试探：**只记日志，不发任何 IPC**。
+    //
+    // 2026-08-01 实测结论（否定）：组合刚启动就发起的异步请求，绝大多数宿主选择**内联执行**
+    // （accepted 分布 inline 170 : queued 38），那等同于同步取，拿到的就是 reflow **前**的坐标
+    // ——Excel 实测探测值 (542,784) 与随后权威值 (558,786) 差 16px。
+    // 故这条来源**不能**用于「让 fast 档摆脱 25ms 短兜底」。
+    //
+    // ⚠ 曾让它走 probe 通道，以为「wait 档忽略 ⇒ 零风险」，结果 **fast 档会读 probe**：
+    // 本探测比 OnLayoutChange 的采样早约 19ms 到达，抢先被判据 2 采信提前首显，随后真权威
+    // 坐标的 16px 偏差又被 settle 容差吞掉，错位就此固定。Excel 上表现为候选窗持续错位。
+    // **「某档位忽略它」不等于「所有档位都忽略它」**——多消费者通道上的新增生产者必须逐个
+    // 消费者过一遍。
+    if (result.kind == CaretProbeKind::FirstShowProbe)
+    {
+        return;
+    }
 
     if (isFocusProbe)
     {
@@ -4500,6 +4520,12 @@ void CTextService::SendCaretPositionUpdate()
         // 通知 Go 端：composition 刚启动, 真正的 caret 会在 reflow 后到达。
         // Go 端据此延长 pendingFirstShow 超时, 避免回退到按键前的旧坐标。
         // 适用于 OnLayoutChange burst 跨度较长的应用 (如 EverEdit ~200ms 间隔)。
+        // 首显试探（纯观测，走 probe 通道，wait 档忽略）：组合刚启动就发起一次异步 edit
+        // session，用来实测「排在宿主当前 edit session 之后执行时，拿到的是 reflow 前还是
+        // 后的坐标」。这是 fast 档能否摆脱 25ms 短兜底的前提——目前它的判据 1/2 只读
+        // OnLayoutChange 驱动的 probe，而 Word/记事本根本不发该回调。
+        RequestCaretPositionUpdateAsync(CaretProbeKind::FirstShowProbe);
+
         if (_pIPCClient != nullptr && _pIPCClient->IsConnected())
         {
             _pIPCClient->SendCaretPending();

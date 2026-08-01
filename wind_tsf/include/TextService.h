@@ -219,7 +219,9 @@ public:
     // 非按键上下文（WM_TIMER 等）专用：用异步 edit session 取坐标，结果经
     // OnAsyncCaretRectReady 回调发出。同步锁在这些上下文里会被宿主合法拒绝
     // （TS_E_SYNCHRONOUS），详见 CCaretEditSession::RequestCaretRectAsync。
-    BOOL RequestCaretPositionUpdateAsync();
+    // kind 决定回调怎么处理结果：Composition 发正式 caret_update；
+    // FirstShowProbe 只发 CMD_CARET_PROBE（wait 档忽略），用于零风险观测时序。
+    BOOL RequestCaretPositionUpdateAsync(CaretProbeKind kind = CaretProbeKind::Composition);
 
     // OnSetFocus 专用：焦点刚到达、**尚无 composition** 时取一次插入点。
     //
