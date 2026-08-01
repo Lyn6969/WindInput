@@ -305,6 +305,7 @@ impl Coordinator {
         let id = list[index].clone();
         self.engine_mgr.switch_schema(&id);
         self.sync_chaizi_assets(); // 拆字库/字根字体随活跃方案切换（变更检测，未变不动）
+        self.sync_comment_dicts(); // 方案专属注释库（`schemas` 字段）同理
         {
             let mut s = self.state.lock().unwrap_or_else(|e| e.into_inner());
             s.chinese_mode = true;
@@ -599,6 +600,7 @@ impl Coordinator {
         }
         if self.engine_mgr.switch_schema(schema_id) {
             self.sync_chaizi_assets(); // 拆字库/字根字体随活跃方案切换（变更检测，未变不动）
+            self.sync_comment_dicts(); // 方案专属注释库（`schemas` 字段）同理
             let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
             state.input_buffer.clear();
             state.candidates.clear();
@@ -611,6 +613,7 @@ impl Coordinator {
     pub(crate) fn cycle_schema(&self) {
         if let Some(next) = self.engine_mgr.cycle_schema() {
             self.sync_chaizi_assets(); // 拆字库/字根字体随活跃方案切换（变更检测，未变不动）
+            self.sync_comment_dicts(); // 方案专属注释库（`schemas` 字段）同理
             // 「切换模式时取消大小写锁定」延伸：切方案的意图是用新方案输中文，
             // 配置开启时取消 CapsLock，且若当前为英文模式一并归位中文。
             let caps_cancelled = self.cancel_caps_on_switch();

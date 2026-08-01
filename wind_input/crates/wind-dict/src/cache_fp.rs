@@ -93,6 +93,10 @@ pub fn dict_tag(lowercase_code: bool) -> &'static str {
 /// 改 unigram 解析只需改这里的版本后缀，不必去动全局的 [`PARSE_SEMANTICS_VERSION`]。
 pub const UNIGRAM_TAG: &str = "unigram/v1";
 
+/// 注释库缓存的 tag。同理独立于词库解析：注释库用的是 `wind-reverse` 里那份精简解析器
+/// （只取 text/comment/code 三列），与 `codetable` 的 rime 解析各自演进。
+pub const COMMENT_TAG: &str = "comment/v1";
+
 #[cfg(test)]
 mod tests {
     use super::*;

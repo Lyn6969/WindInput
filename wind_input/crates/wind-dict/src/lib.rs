@@ -6,6 +6,7 @@ pub mod binformat;
 pub mod cache_fp;
 pub mod cached;
 pub mod codetable;
+pub mod commentdict;
 pub mod composite;
 pub mod datformat;
 pub mod hotcache;

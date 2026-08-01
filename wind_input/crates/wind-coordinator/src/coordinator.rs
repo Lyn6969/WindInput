@@ -710,6 +710,9 @@ pub struct Coordinator {
     pub(crate) reverse: std::sync::RwLock<wind_reverse::ReverseLookup>,
     /// 拆字资产当前生效状态（库解析路径 / 已下发字根字体），reload 变更检测用。
     pub(crate) chaizi_assets: Mutex<ChaiziAssets>,
+    /// 注释词库当前生效的解析路径列表（顺序即优先级），reload 变更检测用。
+    /// 见 `sync_comment_dicts`。
+    pub(crate) comment_dict_paths: Mutex<Vec<std::path::PathBuf>>,
     /// 标点配对跟踪栈（用于智能跳过）；中/英配对表在 rt bundle 内。
     pub(crate) pair_tracker: Mutex<wind_transform::pair_tracker::PairTracker>,
     /// 最近一次有效光标坐标 (x,y,height)；用于无效坐标时回退，避免候选窗跑到左上角
@@ -1021,6 +1024,8 @@ impl Coordinator {
         // 拆字字根字体（PUA 字根渲染）：路径 + DWrite 家族名取自主码表方案 [engine.chaizi]。
         // 库已在 build 内加载，此处仅补发字体（sync 按变更检测，重复调用幂等）。
         coordinator.sync_chaizi_assets();
+        // 注释词库首次加载（`[[ui.comment_dicts]]`，出厂为空数组=不加载任何库）。
+        coordinator.sync_comment_dicts();
         // 统一应用外观项（幂等）：补齐上面手动块未含的候选字体族 / 翻页栏 / 页码 / 字号跟随主题，
         // 使首次启动即按 config 应用（与 reload_user_config 同一路径）。
         coordinator.apply_ui_config();
@@ -1360,6 +1365,9 @@ impl Coordinator {
                 db: chaizi_db,
                 font: None, // 字体在 new() 经 sync_chaizi_assets 下发（headless 无 UI 不发）
             }),
+            // 空初值 + new() 里的 sync_comment_dicts 首次加载：与拆字字体同一套「声明式变更
+            // 检测」，构造期不做 IO，加载与热重载走同一条路径（不会出现只在启动生效的分叉）。
+            comment_dict_paths: Mutex::new(Vec::new()),
             pair_tracker: Mutex::new(wind_transform::pair_tracker::PairTracker::new()),
             last_valid_caret: Mutex::new((0, 0, 0)),
             pending_first_show: Mutex::new(false),
@@ -1842,6 +1850,65 @@ impl Coordinator {
         }
     }
 
+    /// 同步注释词库（`[[ui.comment_dicts]]`）到反查表：解析路径列表，与上次生效的比对，
+    /// **变了才重载**。调用点=启动、reload_user_config、切方案（switch/cycle）。
+    ///
+    /// 变更检测比的是**解析后的路径序列**（含顺序）而非配置结构：顺序即优先级，调换两个库
+    /// 的位置必须触发重载；而只改 `label` 这类不影响加载的字段则不该重载。有了 `.wcmt`
+    /// 缓存，重载本身只是重开 mmap，但切方案是高频操作，能不动就不动。
+    ///
+    /// **按活跃方案过滤**（`schemas` 字段，留空=全部）：一份大英汉词典挂在五笔方案上，
+    /// 每次输入都要多走一次注定查不到的二分。方案专属的库因此只在其方案下加载 ——
+    /// 这也是切方案要调本函数的原因。
+    ///
+    /// 路径按「用户数据目录优先、回落安装目录」解析，与 `pinyin_map.txt` 同规则 ——
+    /// 用户放在自己目录里的同名文件应当覆盖随附版本。
+    pub(crate) fn sync_comment_dicts(&self) {
+        let data_dir = Config::data_dir();
+        let specs = {
+            let rt = self.rt();
+            rt.config.ui.comment_dicts.clone()
+        };
+        let active = self.engine_mgr.active_schema_id();
+        let mut paths: Vec<std::path::PathBuf> = Vec::new();
+        for s in specs
+            .iter()
+            .filter(|s| s.enabled && !s.path.is_empty() && s.applies_to(&active))
+        {
+            match Config::resolve_data_file(data_dir.as_deref(), &s.path) {
+                // 按**解析后路径**去重：两条 spec 写不同的相对路径却指向同一个文件时
+                // （`a.dict.yaml` 与 `./a.dict.yaml`，或用户目录与安装目录同名文件都被
+                // 解析到同一处），只加载一次。重复加载除了浪费解析时间，还会让优先级
+                // 判定变得依赖「第几次出现」——去重后靠前那条恒胜出。
+                Some(p) if paths.contains(&p) => {
+                    info!("注释词库重复挂载，已跳过: {} (id={})", p.display(), s.id)
+                }
+                Some(p) => paths.push(p),
+                // 只 warn 不中断：一个库路径写错不该让其余库一起不加载。
+                None => warn!(
+                    "注释词库不存在（用户/安装目录均未找到）: {} (id={})",
+                    s.path, s.id
+                ),
+            }
+        }
+        let mut cur = self
+            .comment_dict_paths
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if *cur == paths {
+            return;
+        }
+        // 注释库缓存与词库 .wdat 同根，但收在 `comments/` 专用子目录：那里会做「清掉已移除
+        // 库的缓存」的扫描，限定在自己的目录里才敢删。无缓存目录（便携/测试）时传 None，
+        // 注释库退化为内存加载，功能不受影响。
+        let cache_dir = Config::cache_dir().map(|d| d.join("comments"));
+        self.reverse
+            .write()
+            .unwrap_or_else(|e| e.into_inner())
+            .reload_comments(&paths, cache_dir.as_deref());
+        *cur = paths;
+    }
+
     /// 就地改写内存配置并重建 ConfigBundle，**不触发** reload_user_config 的那一整套副作用
     /// （toast、引擎热重建、热键重注册、主题下发、向 TSF 推 IPC 配置）。
     ///
@@ -1896,12 +1963,20 @@ impl Coordinator {
                     .lock()
                     .unwrap_or_else(|e| e.into_inner())
                     .clear();
+                // 注释词库跟随全局配置，**不在 schema_dirty 分支内**：`[[ui.comment_dicts]]`
+                // 改动本身不会把 schema 标脏，放进那个分支等于「改了挂载列表没反应，
+                // 直到下次切方案才生效」。自身按路径序列做变更检测，未变即空操作。
+                self.sync_comment_dicts();
 
                 if schema_dirty {
                     // 热重建方案集：清输入缓冲、刷新工具栏/状态，免重启切换方案。
                     self.engine_mgr.reload_from_config(&new_cfg);
                     // 主码表可能变更：拆字库/字根字体随之切换（变更检测，未变不动）。
                     self.sync_chaizi_assets();
+                    // 再同步一次注释库：上面那次用的是**重建前**的活跃方案，而重建可能换掉
+                    // 它（方案被删除、默认方案变更）。方案专属库（`schemas`）因此要在这里
+                    // 复核一遍——两次调用都有变更检测，未变的那次是空操作。
+                    self.sync_comment_dicts();
                     {
                         let mut s = self.state.lock().unwrap_or_else(|e| e.into_inner());
                         s.input_buffer.clear();

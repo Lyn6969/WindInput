@@ -370,6 +370,8 @@ impl crate::coordinator::Coordinator {
     ///   拼在一起即悬停提示拆字段的同款信息（`亻尔 [wq]`），但格式由模板决定而非写死。
     /// - `chaizi_all[:分隔符]` —— 不限字数的逐字字根，默认空格连接；带参数可改，
     ///   如 `${chaizi_all:／}` → `亻尔／女子`。长度自负（配 `comment_max_chars` 或只用于竖排）。
+    /// - `dict` —— 用户挂载的注释词库（`[[ui.comment_dicts]]`）里该词的注释。键是**词**，
+    ///   一份「英汉释义」「emoji 名称」可跨全部方案复用；候选 `code` 作可选消歧。
     ///
     /// `arg` = `${name:arg}` 的冒号后部分（未 trim）。只有声明支持参数的变量会读它，
     /// 其余变量收到参数时**静默忽略**而非报未知——参数写错不该让整个变量退化成错误回显。
@@ -402,6 +404,10 @@ impl crate::coordinator::Coordinator {
             "chaizi_code" if single => reverse.chaizi_code_of(&c.text),
             "chaizi_code" => String::new(),
             "chaizi_all" => reverse.radicals_of(&c.text, arg.unwrap_or(" ")),
+            // 用户挂载的注释词库（`[[ui.comment_dicts]]`）。键是**词**，故一份库可跨方案复用；
+            // 候选自身的 `code` 作可选消歧（注释库声明了 code 列时才生效，跨方案对不上则
+            // 回落该词首条，见 `ReverseLookup::comment_of`）。
+            "dict" => reverse.comment_of(&c.text, Some(&c.code)),
             _ => return None,
         })
     }

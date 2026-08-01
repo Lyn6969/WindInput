@@ -1418,6 +1418,54 @@ pub struct UiConfig {
     pub status: StatusIndicatorConfig,
     #[serde(default)]
     pub toolbar: ToolbarConfig,
+    /// 注释词库挂载列表（`[[ui.comment_dicts]]`），供候选注释模板的 `${dict}` 变量查询。
+    ///
+    /// **数组顺序即优先级**：同一个词在多个库里都有注释时，取靠前那个库的。
+    #[serde(default)]
+    pub comment_dicts: Vec<CommentDictSpec>,
+}
+
+/// 一个注释词库（`[[ui.comment_dicts]]`）。
+///
+/// # 为什么是独立配置表，而不是塞进 `[[dictionaries]]`
+///
+/// 🔴 **注释库不参与召回**。若复用词库表加个 `type = "comment"` 区分，那么词库开关、
+/// `base_order`、`composite::merge_search`、造词、加词、词频学习 —— 每一条路径都得**记得**
+/// 跳过它，漏一处的表现是注释库里的词变成候选。独立成表意味着它从来就不在召回的数据结构里，
+/// 不需要任何一处记得跳过。
+///
+/// 这也是本仓反复出现的教训（见候选调整按来源分流、密码框抑制的分层）：**「加个标志位区分」
+/// 要求所有消费点同步，而消费点的数量只增不减。**
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct CommentDictSpec {
+    /// 稳定标识（供设置页与日志定位；不参与查询）。
+    #[serde(default)]
+    pub id: String,
+    /// 显示名。
+    #[serde(default)]
+    pub label: String,
+    /// 词库路径，相对数据目录（用户目录优先，回落安装目录）。
+    #[serde(default)]
+    pub path: String,
+    /// 是否启用。缺省视为启用 —— 用户手写一条却忘了 `enabled = true` 时，
+    /// 「配了没反应」比「多加载一份」难查得多。
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    /// 限定生效的方案 id；**留空 = 全部方案**。
+    ///
+    /// 注释库常常是方案专属的：一份大英汉词典只在英文方案下有意义，挂在五笔方案上
+    /// 每次输入都要多走一次二分且注定查不到。留空之所以是「全部」而非「无」——
+    /// 用户手写一条却没写 `schemas` 时，「到处都显示」比「哪都不显示」好查得多，
+    /// 与 `enabled` 缺省即启用同一取舍。
+    #[serde(default)]
+    pub schemas: Vec<String>,
+}
+
+impl CommentDictSpec {
+    /// 本库是否适用于给定方案。
+    pub fn applies_to(&self, schema_id: &str) -> bool {
+        self.schemas.is_empty() || self.schemas.iter().any(|s| s == schema_id)
+    }
 }
 
 /// 工具栏配置（[ui.toolbar]，对齐 Go）。
@@ -2737,6 +2785,32 @@ impl Config {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 注释库的方案限定：`schemas` 留空适用于全部方案，非空则只在列出的方案下加载。
+    ///
+    /// 「留空=全部」这个方向不能反：反过来的话，用户手写一条却没写 `schemas` 就是
+    /// 「配了完全没反应」，而那是本仓反复出现的最难自查的一类故障。
+    #[test]
+    fn comment_dict_schema_scoping() {
+        let global = CommentDictSpec::default();
+        assert!(global.applies_to("wubi86"), "留空适用于任意方案");
+        assert!(global.applies_to(""), "空方案 id 也算适用");
+
+        let scoped = CommentDictSpec {
+            schemas: vec!["english".into(), "pinyin".into()],
+            ..Default::default()
+        };
+        assert!(scoped.applies_to("english"));
+        assert!(scoped.applies_to("pinyin"));
+        assert!(
+            !scoped.applies_to("wubi86"),
+            "未列出的方案不得加载——挂大英汉词典在五笔下查是纯浪费，这正是本字段的目的"
+        );
+        assert!(
+            !scoped.applies_to("English"),
+            "方案 id 区分大小写，按精确匹配"
+        );
+    }
 
     /// 内置「快捷」默认成员用占位符，使快捷输入的拼音跟随主拼音方案（而非恒为全拼）。
     #[test]

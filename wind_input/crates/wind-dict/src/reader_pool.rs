@@ -27,6 +27,7 @@
 //! 同一文件必然得到同一字符串。万一将来出现不同写法，后果也只是退化成各开一份
 //! （即本池引入前的行为），不会取到错误的 reader。
 
+use crate::commentdict::CommentReader;
 use crate::datformat::WdatReader;
 use crate::unigram::UnigramReader;
 use std::collections::HashMap;
@@ -63,6 +64,7 @@ type Pool<T> = OnceLock<Mutex<HashMap<PathBuf, Entry<T>>>>;
 
 static WDAT_POOL: Pool<WdatReader> = OnceLock::new();
 static UNIGRAM_POOL: Pool<UnigramReader> = OnceLock::new();
+static COMMENT_POOL: Pool<CommentReader> = OnceLock::new();
 
 #[allow(clippy::type_complexity)]
 static BUILD_LOCKS: OnceLock<Mutex<HashMap<PathBuf, Arc<Mutex<()>>>>> = OnceLock::new();
@@ -109,6 +111,16 @@ pub fn open_wdat(path: &Path) -> anyhow::Result<Arc<WdatReader>> {
 pub fn open_unigram(path: &Path) -> anyhow::Result<Arc<UnigramReader>> {
     get_or_open(UNIGRAM_POOL.get_or_init(Default::default), path, |p| {
         UnigramReader::open(p)
+    })
+}
+
+/// 打开注释库 `.wcmt`；同一路径已有存活 reader 时复用，不再新建映射。
+///
+/// 注释库比词库更容易被多处引用：一份「英汉释义」可能同时挂在拼音、五笔、混输方案下，
+/// 用户也可能在挂载列表里写两遍同一个文件。按路径复用后，无论引用几次都只有一份映射。
+pub fn open_comment(path: &Path) -> anyhow::Result<Arc<CommentReader>> {
+    get_or_open(COMMENT_POOL.get_or_init(Default::default), path, |p| {
+        CommentReader::open(p)
     })
 }
 

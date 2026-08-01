@@ -2528,6 +2528,7 @@ name = "wind-reverse"
 version = "0.1.0"
 dependencies = [
  "tracing",
+ "wind-dict",
 ]
 
 [[package]]

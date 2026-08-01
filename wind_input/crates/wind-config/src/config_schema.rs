@@ -254,6 +254,7 @@ static REGISTRY: &[ConfigField] = &[
     f("ui.candidate.comment_template_vertical", Str),
     f("ui.candidate.comment_template_horizontal", Str),
     f("ui.candidate.comment_max_chars", Int),
+    f("ui.comment_dicts", StructList),
     f("ui.candidate.index_labels", Str),
     f("ui.candidate.flip_when_above", Bool),
     f("ui.candidate.swap_preedit_when_above", Bool),
@@ -610,7 +611,15 @@ mod tests {
     ///
     /// **加条目前请三思**：豁免一个键 = 它的默认值从此不在说明书里，
     /// 只有「写进去会造成实际危害」才够格，「懒得写」不够格。
-    const ABSENT_FROM_DATA_CONFIG: &[&str] = &["schema.special_modes", "schema.mix_modes"];
+    const ABSENT_FROM_DATA_CONFIG: &[&str] = &[
+        "schema.special_modes",
+        "schema.mix_modes",
+        // 注释词库挂载列表：**出厂为空数组**（不随附任何注释词库——词典内容多有版权，
+        // 由用户自行放置）。写进预置文件除了一行 `comment_dicts = []` 没有任何信息量，
+        // 而它一旦以数组表形态出现，用户增删条目就会与预置层的整表覆盖语义纠缠。
+        // 格式与示例在文档站 customize/candidate-comment。
+        "ui.comment_dicts",
+    ];
 
     /// `data/config.toml` 必须显式列出注册表里的每一个键（豁免名单除外）。
     ///

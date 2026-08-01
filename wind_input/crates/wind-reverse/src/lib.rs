@@ -47,6 +47,187 @@ pub struct ReverseLookup {
     chaizi: ChaiziTable,
     /// 字 → 拼音读音（多音字按常用频率排序，最常用在前）
     pinyin: PinyinTable,
+    /// 已挂载的注释库，**按优先级升序**（先挂载者优先）。每库一份，不合并 ——
+    /// 见 [`CommentSource`]。可热重载（`reload_comments`）。
+    comments: Vec<CommentSource>,
+}
+
+/// 一个已挂载的注释库。
+///
+/// # 为什么每库独立而不合并成一张表
+///
+/// 合并表的缓存键必然是「这一组文件的组合」：用户加挂一个库就要重建全部，两个方案挂了
+/// 交集不同的库也无法共享。按**文件**缓存后，`.wcmt` 与源文件一一对应，加挂只建新的那份；
+/// 多方案引用同一个库时经 `reader_pool` 复用同一份 mmap，映射不会翻倍。
+///
+/// 代价是查询要遍历 N 个库，但 N 是个位数、每库一次二分，且只在当前页候选上发生。
+struct CommentSource {
+    /// 源文件路径（**不是**缓存路径）：重载时用来认出「这个库我已经开着了」。
+    src: std::path::PathBuf,
+    body: CommentBody,
+}
+
+enum CommentBody {
+    /// 正常路径：mmap `.wcmt` 缓存，常驻内存与库大小基本无关。
+    Mmap(std::sync::Arc<wind_dict::commentdict::CommentReader>),
+    /// 降级路径：缓存目录不可写 / 构建失败时，直接把解析结果留在内存。
+    ///
+    /// 没有它的话，只读安装 + 缓存目录异常会让注释功能**整个消失**，且表现为「配了没反应」
+    /// 这种最难自查的样子。降级只影响内存占用，不影响正确性。
+    Memory(CommentTable),
+}
+
+impl CommentSource {
+    fn lookup_by_code(&self, text: &str, code: &str) -> Option<&str> {
+        match &self.body {
+            CommentBody::Mmap(r) => r.lookup_by_code(text, code),
+            CommentBody::Memory(t) => t.lookup_by_code(text, code),
+        }
+    }
+    fn lookup_first(&self, text: &str) -> Option<&str> {
+        match &self.body {
+            CommentBody::Mmap(r) => r.lookup_first(text),
+            CommentBody::Memory(t) => t.lookup_first(text),
+        }
+    }
+    fn len(&self) -> usize {
+        match &self.body {
+            CommentBody::Mmap(r) => r.entry_count() as usize,
+            CommentBody::Memory(t) => t.len(),
+        }
+    }
+}
+
+/// 注释表的**内存**形态（仅用于 [`CommentSource::Memory`] 降级路径）。
+///
+/// 与 [`ChaiziTable`] 同构的紧凑存储（排序数组 + 共享 arena + 二分），但**键是词而非字**
+/// ——注释要标注的是「这个词是什么」，不是逐字属性。正常路径走 `.wcmt` mmap，见
+/// [`wind_dict::commentdict`]；两者的查找语义必须保持一致，故本表的
+/// `lookup_by_code` / `lookup_first` 与那边同名同义。
+///
+/// # 条目布局
+///
+/// 每条在 arena 里连续存 `text | comment | code` 三段，各自长度记在条目里。
+/// **不沿用 ChaiziTable「start = 前一条的 end」那套**：那要求算 start 时能拿到前一条，
+/// 而 `binary_search_by` 的闭包只给到 `&Entry`，够不着前一条。故改存绝对偏移，
+/// 多 4 字节/条（十万条 ≈ 0.4MB）换取二分可行。
+#[derive(Default)]
+struct CommentTable {
+    /// 按 `text` 升序；同 `text` 的多条相邻（供 code 消歧），组内保持挂载顺序。
+    entries: Vec<CommentEntry>,
+    /// 所有 text/comment/code 文本按条目序连续拼接。
+    arena: String,
+}
+
+struct CommentEntry {
+    /// 本条三段文本在 arena 中的起点。
+    off: u32,
+    text_len: u32,
+    comment_len: u32,
+    /// 该条目所属方案的编码；`0` = 无 code 列（通用条目，任何方案都匹配）。
+    code_len: u32,
+}
+
+impl CommentEntry {
+    fn text_end(&self) -> usize {
+        (self.off + self.text_len) as usize
+    }
+    fn comment_end(&self) -> usize {
+        self.text_end() + self.comment_len as usize
+    }
+    fn code_end(&self) -> usize {
+        self.comment_end() + self.code_len as usize
+    }
+}
+
+impl CommentTable {
+    fn text_of<'a>(&'a self, e: &CommentEntry) -> &'a str {
+        &self.arena[e.off as usize..e.text_end()]
+    }
+    fn comment_of<'a>(&'a self, e: &CommentEntry) -> &'a str {
+        &self.arena[e.text_end()..e.comment_end()]
+    }
+    fn code_of<'a>(&'a self, e: &CommentEntry) -> &'a str {
+        &self.arena[e.comment_end()..e.code_end()]
+    }
+
+    /// 从 `(词, 注释, 编码)` 行构建。**挂载顺序即优先级**：同 (词, 编码) 重复时保留**首次**
+    /// 出现的那条，于是先挂载的库覆盖后挂载的。
+    ///
+    /// 排序用 `sort_by`（稳定），组内因此保持挂载顺序 —— 这正是「先到先得」得以成立的前提，
+    /// 换成 `sort_unstable_by` 同 text 条目的相对顺序就不再有保证，优先级会随输入规模抖动。
+    fn build(mut rows: Vec<(String, String, String)>) -> Self {
+        rows.sort_by(|a, b| a.0.cmp(&b.0));
+        let mut entries = Vec::with_capacity(rows.len());
+        let mut arena =
+            String::with_capacity(rows.iter().map(|r| r.0.len() + r.1.len() + r.2.len()).sum());
+        // 同 (text, code) 去重：只在相邻的同 text 组内比对 code，无需全局 HashSet。
+        let mut i = 0usize;
+        while i < rows.len() {
+            let mut j = i;
+            while j < rows.len() && rows[j].0 == rows[i].0 {
+                // 本组内是否已有同 code 的条目（含都无 code 的情形）。
+                let dup = entries[entries.len() - (j - i)..]
+                    .iter()
+                    .any(|e: &CommentEntry| self_code_eq(&arena, e, &rows[j].2));
+                if !dup {
+                    let off = arena.len() as u32;
+                    arena.push_str(&rows[j].0);
+                    arena.push_str(&rows[j].1);
+                    arena.push_str(&rows[j].2);
+                    entries.push(CommentEntry {
+                        off,
+                        text_len: rows[j].0.len() as u32,
+                        comment_len: rows[j].1.len() as u32,
+                        code_len: rows[j].2.len() as u32,
+                    });
+                }
+                j += 1;
+            }
+            i = j;
+        }
+        Self { entries, arena }
+    }
+
+    /// 该词对应的连续条目组（按挂载顺序）。
+    fn group(&self, text: &str) -> impl Iterator<Item = &CommentEntry> {
+        let lo = self.entries.partition_point(|e| self.text_of(e) < text);
+        self.entries[lo..]
+            .iter()
+            .take_while(move |e| self.text_of(e) == text)
+    }
+
+    /// 该词在本库的首条注释。空注释视为未命中。
+    fn lookup_first(&self, text: &str) -> Option<&str> {
+        self.group(text)
+            .map(|e| self.comment_of(e))
+            .find(|c| !c.is_empty())
+    }
+
+    /// 该词中 `code` **精确匹配**的注释。用于方案内消歧。
+    ///
+    /// 对不上时返回 None 由调用方回落 `lookup_first` —— 注释库里的 `tfhh` 是五笔码，
+    /// 拿拼音候选的 `hang` 去比对必然不匹配，而跨方案挂同一份注释库是常态，
+    /// 那里不该因为对不上 code 就什么都不显示。
+    fn lookup_by_code(&self, text: &str, code: &str) -> Option<&str> {
+        if code.is_empty() {
+            return None;
+        }
+        self.group(text)
+            .find(|e| self.code_of(e) == code)
+            .map(|e| self.comment_of(e))
+            .filter(|c| !c.is_empty())
+    }
+
+    fn len(&self) -> usize {
+        self.entries.len()
+    }
+}
+
+/// `build` 内部去重用：比对已入 arena 的条目 code 与待入行的 code。
+/// 独立成函数是因为 `build` 里 `arena` 已被可变借用，走不了 `&self` 方法。
+fn self_code_eq(arena: &str, e: &CommentEntry, code: &str) -> bool {
+    &arena[e.comment_end()..e.code_end()] == code
 }
 
 /// 拆字表：字 → (字根, 编码)。紧凑存储——按字升序的定长条目数组 + 共享文本 arena，
@@ -339,6 +520,211 @@ fn merge_chaizi_pinyin(sections: Vec<Section>) -> Vec<Section> {
 
 // ─────────────────────────────────────────────────────────────────────────────
 
+/// 解析注释词库（rime `.dict.yaml` 形态：YAML 头 + `...` + TSV 正文）→ `(词, 注释, 编码)`。
+///
+/// 列序由头部 `columns:` 声明，**未声明时默认 `[text, comment]`**。合法列名 `text` /
+/// `comment` / `code`；其余列名占位但不读（与 librime 对未知列的处理一致）。缺 `text` 或
+/// 缺 `comment` 的声明整库跳过 —— 没有注释的注释库是配置错误，静默当空会让人以为是路径问题。
+///
+/// # 为什么不复用 `wind_dict::codetable` 的 rime 解析
+///
+/// 那个解析器背着 `PARSE_SEMANTICS_VERSION`：它一动，**全部主词库的 wdat 缓存失效并重建**
+/// （300MB 级）。给它加一个只有注释库用得上的 `comment` 列，等于让每个用户为一个他可能
+/// 没启用的功能付一次全量重建。而注释库要的只是这套格式的一个子集 —— 不需要 weight、
+/// boundary、简拼、`# no comment` 指令、并行分块，那些正是那个文件复杂度的来源。
+///
+/// 保持格式**兼容**（用户能拿 rime 形态的文件直接用）与共用**实现**是两件事，这里只要前者。
+fn parse_comment_dict(path: &std::path::Path) -> std::io::Result<Vec<(String, String, String)>> {
+    let content = std::fs::read_to_string(path)?;
+    // 正文起点：首个独占一行的 `...` 之后。无该行 → 整个文件都是正文（容许无 YAML 头的裸表）。
+    let (header, body) = match content.find("\n...") {
+        Some(i) if content[i + 1..].starts_with("...") => {
+            let rest = &content[i + 4..];
+            let body = rest.strip_prefix("\r").unwrap_or(rest);
+            (&content[..i], body.strip_prefix('\n').unwrap_or(body))
+        }
+        _ if content.starts_with("...") => (&content[..0], &content[3..]),
+        _ => (&content[..0], content.as_str()),
+    };
+    let Some((text_col, comment_col, code_col)) = comment_columns(header) else {
+        tracing::warn!(
+            "注释库 {} 的 columns 声明缺 text 或 comment，整库跳过",
+            path.display()
+        );
+        return Ok(Vec::new());
+    };
+    // 只要求 text/comment 两列到位，**不把 code 列算进来**：声明了 code 列的库里，没有
+    // 编码的行通常直接写成两列（或写成 `text\tcomment\t`，行尾 tab 又会被 trim_end 剥掉）。
+    // 把 code 计入 need 会让这些行整行消失，表现为「库里明明有这个词却没注释」。
+    let need = text_col.max(comment_col) + 1;
+    let mut out = Vec::new();
+    for line in body.lines() {
+        // 只剥行尾：词条本身可能以 U+3000 之类开头（同 codetable 的 trim_line_end 决定）。
+        let line = line.trim_end();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let parts: Vec<&str> = line.split('\t').collect();
+        if parts.len() < need {
+            continue;
+        }
+        let text = parts[text_col];
+        let comment = parts[comment_col];
+        if text.is_empty() || comment.is_empty() {
+            continue;
+        }
+        let code = code_col.and_then(|i| parts.get(i)).copied().unwrap_or("");
+        out.push((text.to_string(), comment.to_string(), code.to_string()));
+    }
+    Ok(out)
+}
+
+/// 注释库缓存文件名：`<源文件主名>.<路径哈希>.wcmt`。
+///
+/// 带路径哈希是因为不同目录下的同名文件是常态（系统 `data/comments/emoji.dict.yaml`
+/// 与用户覆盖版同名）。只用主名会让两者争用同一份缓存，表现为「改了用户版没生效」或
+/// 两者反复互相失效重建。
+fn comment_cache_name(src: &Path) -> String {
+    use std::hash::Hasher;
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    h.write(src.to_string_lossy().as_bytes());
+    let stem = src
+        .file_stem()
+        .map(|s| s.to_string_lossy().to_string())
+        .unwrap_or_else(|| "comment".to_string());
+    // `x.dict.yaml` 的 stem 是 `x.dict`，再剥一层让缓存名短一些
+    let stem = stem.strip_suffix(".dict").unwrap_or(&stem);
+    format!("{stem}.{:016x}.wcmt", h.finish())
+}
+
+/// 加载一个注释库：优先 mmap `.wcmt` 缓存，缓存不新鲜则重建，重建失败降级内存表。
+///
+/// 源文件读不出来（路径错、无权限）返回 `None` —— 那是配置问题，应当跳过并告警，
+/// 而不是降级成一个空表让人以为「库里没这个词」。
+fn load_comment_source(src: &Path, cache_dir: Option<&Path>) -> Option<CommentSource> {
+    use wind_dict::{cache_fp, commentdict, reader_pool};
+
+    let wrap = |body| {
+        Some(CommentSource {
+            src: src.to_path_buf(),
+            body,
+        })
+    };
+    let Some(dir) = cache_dir else {
+        let rows = parse_or_warn(src)?;
+        return wrap(CommentBody::Memory(CommentTable::build(rows)));
+    };
+    let cache_file = dir.join(comment_cache_name(src));
+
+    // single-flight：同一缓存文件的构建区间互斥。注释库虽只由协调器串行加载，但同一
+    // 文件可能同时被别处（如设置页预览）打开，沿用词库那套锁不额外花什么代价。
+    let lock = reader_pool::file_lock(&cache_file);
+    let _guard = lock.lock().unwrap_or_else(|e| e.into_inner());
+
+    if cache_fp::cache_is_fresh(&cache_file, &[src], cache_fp::COMMENT_TAG)
+        && let Ok(r) = reader_pool::open_comment(&cache_file)
+    {
+        return wrap(CommentBody::Mmap(r));
+    }
+
+    let rows = parse_or_warn(src)?;
+    match commentdict::write_comment_wcmt(&cache_file, &rows) {
+        Ok(()) => {
+            cache_fp::write_cache_fp(&cache_file, &[src], cache_fp::COMMENT_TAG);
+            match reader_pool::open_comment(&cache_file) {
+                Ok(r) => return wrap(CommentBody::Mmap(r)),
+                Err(e) => tracing::warn!("注释库缓存写成但打不开 {}: {}", cache_file.display(), e),
+            }
+        }
+        Err(e) => tracing::warn!("注释库缓存构建失败 {}: {}", cache_file.display(), e),
+    }
+    // 缓存这条路走不通（目录只读、磁盘满、文件被占）——功能继续，只是这一库常驻内存。
+    wrap(CommentBody::Memory(CommentTable::build(rows)))
+}
+
+fn parse_or_warn(src: &Path) -> Option<Vec<(String, String, String)>> {
+    match parse_comment_dict(src) {
+        Ok(rows) => Some(rows),
+        Err(e) => {
+            tracing::warn!("读取注释库失败 {}: {}", src.display(), e);
+            None
+        }
+    }
+}
+
+/// 清掉挂载列表里已不存在的库留下的 `.wcmt`（含指纹 sidecar 与残留 tmp）。
+///
+/// 只在专用缓存目录里、只删这三种后缀 —— 缓存目录理论上归我们管，但「理论上」不足以
+/// 支撑一个递归删除。正被本进程映射的文件删不掉（Windows），失败即跳过，下次再清。
+fn prune_comment_cache(dir: &Path, paths: &[std::path::PathBuf]) {
+    let keep: HashSet<String> = paths.iter().map(|p| comment_cache_name(p)).collect();
+    let Ok(rd) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in rd.flatten() {
+        let name = entry.file_name().to_string_lossy().to_string();
+        let stem = name
+            .strip_suffix(".fp")
+            .or_else(|| name.strip_suffix(".tmp"))
+            .unwrap_or(&name);
+        if !stem.ends_with(".wcmt") || keep.contains(stem) {
+            continue;
+        }
+        if std::fs::remove_file(entry.path()).is_ok() {
+            tracing::info!("清理已移除注释库的缓存：{}", name);
+        }
+    }
+}
+
+/// 从 YAML 头解析注释库的列位置 → `(text, comment, code)`。
+/// 无 `columns:` 声明时取默认 `[text, comment]`；声明里缺 text 或 comment 返回 `None`。
+fn comment_columns(header: &str) -> Option<(usize, usize, Option<usize>)> {
+    let mut in_columns = false;
+    let mut names: Vec<String> = Vec::new();
+    for raw in header.lines() {
+        // 剥行内注释（`columns: [text, comment]  # 说明`）。
+        let line = raw.split('#').next().unwrap_or("");
+        let trimmed = line.trim();
+        if !in_columns {
+            let Some(rest) = trimmed.strip_prefix("columns:") else {
+                continue;
+            };
+            // 顶格的 columns: 才是块起点（缩进的同名键属于别的映射）。
+            if line.starts_with([' ', '\t']) {
+                continue;
+            }
+            in_columns = true;
+            // 流式：`columns: [text, comment]`
+            if let Some(inner) = rest
+                .trim()
+                .strip_prefix('[')
+                .and_then(|s| s.strip_suffix(']'))
+            {
+                names.extend(
+                    inner
+                        .split(',')
+                        .map(|s| s.trim().to_string())
+                        .filter(|s| !s.is_empty()),
+                );
+                break;
+            }
+            continue;
+        }
+        let Some(item) = trimmed.strip_prefix('-') else {
+            if trimmed.is_empty() {
+                continue;
+            }
+            break; // 回到非缩进键 → columns 块结束
+        };
+        names.push(item.trim().to_string());
+    }
+    if !in_columns {
+        return Some((0, 1, None)); // 默认列序
+    }
+    let find = |k: &str| names.iter().position(|n| n == k);
+    Some((find("text")?, find("comment")?, find("code")))
+}
+
 impl ReverseLookup {
     /// 加载反查表：两份资源的路径**都**由调用方解析后传入（无则跳过）——拆字库来自方案
     /// `[engine.chaizi].db_path`，拼音读音表 `pinyin_map.txt` 来自数据根。
@@ -357,7 +743,75 @@ impl ReverseLookup {
     }
 
     pub fn is_empty(&self) -> bool {
-        self.chaizi.is_empty() && self.pinyin.is_empty()
+        self.chaizi.is_empty() && self.pinyin.is_empty() && self.comments.is_empty()
+    }
+
+    /// 重载注释库（挂载列表变更 / 开关切换时热切换）；空列表清空并释放映射。
+    ///
+    /// `paths` **按优先级升序**（先到先得）：同一个词在多个库里都有注释时，取靠前那个库的。
+    /// 路径由调用方解析（用户目录优先），与拆字/拼音表同一约定 —— 本 crate 不依赖
+    /// wind-config，解析职责一律上提。
+    ///
+    /// `cache_dir` 是 `.wcmt` 缓存的存放目录（通常是 `<cache>/comments`）。传 `None`
+    /// 则全部走内存（测试与无缓存环境）。每个源文件各自缓存、各自校验新鲜度，
+    /// 增删一个库不牵动其他库。
+    pub fn reload_comments(&mut self, paths: &[std::path::PathBuf], cache_dir: Option<&Path>) {
+        // 先接管旧列表、构建完新的再让它析构：仍在新列表里的库直接原样搬过去，既省掉
+        // 一次「读整份源文件算内容指纹」，也让映射不必解除重建。
+        //
+        // 这条路径是切方案（`schemas` 字段）走的，属于高频交互：若每次都重新校验，挂了
+        // 一份十万条词典的用户每切一次方案就要多读几 MB —— 而那份库通常压根没变。
+        let mut old = std::mem::take(&mut self.comments);
+        for p in paths {
+            if let Some(i) = old.iter().position(|s| s.src == *p) {
+                // 顺序无所谓：`old` 之后只用于按路径查找
+                self.comments.push(old.swap_remove(i));
+                continue;
+            }
+            match load_comment_source(p, cache_dir) {
+                Some(src) => {
+                    tracing::info!(
+                        "已加载注释库 {}：{} 条{}",
+                        p.display(),
+                        src.len(),
+                        if matches!(src.body, CommentBody::Memory(_)) {
+                            "（内存降级）"
+                        } else {
+                            ""
+                        }
+                    );
+                    self.comments.push(src);
+                }
+                None => tracing::warn!("注释库加载失败，已跳过：{}", p.display()),
+            }
+        }
+        // 已卸载的库在此释放映射，随后 prune 才删得掉它们的缓存文件（Windows 上被映射
+        // 的文件删不掉）。
+        drop(old);
+        if let Some(dir) = cache_dir {
+            prune_comment_cache(dir, paths);
+        }
+    }
+
+    /// 查词的注释；`code` 非空时同码条目优先，无同码回落该词首条。查不到返回空串。
+    ///
+    /// 键是**词**而非字：一份「英汉释义」「emoji 名称」可跨五笔/拼音/双拼全部方案复用。
+    /// `code` 是可选的方案内消歧（注释库写了 `columns: [text, code, comment]` 时才有）。
+    ///
+    /// **两遍扫描**：先跨全部库找 code 精确命中，都没有再按挂载顺序取首条。这与合并单表
+    /// 时代的语义一致（组内 code 优先于挂载顺序）—— 若改成「逐库各自先 code 后首条」，
+    /// 第一个库有该词但 code 对不上时就会截胡，后面库里精确匹配的那条永远轮不到。
+    pub fn comment_of(&self, text: &str, code: Option<&str>) -> String {
+        if let Some(c) = code.filter(|c| !c.is_empty())
+            && let Some(hit) = self.comments.iter().find_map(|s| s.lookup_by_code(text, c))
+        {
+            return hit.to_string();
+        }
+        self.comments
+            .iter()
+            .find_map(|s| s.lookup_first(text))
+            .unwrap_or("")
+            .to_string()
     }
 
     /// 重载拆字表（主码表方案变更时热切换）；`path=None` 清空并释放内存。
@@ -707,6 +1161,7 @@ impl ReverseLookup {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::PathBuf;
 
     #[test]
     fn test_strip_tone() {
@@ -815,6 +1270,432 @@ mod tests {
         let rl = heteronym_rl();
         assert_eq!(rl.toned_pinyin_of("行X", None, " "), "xíng");
         assert_eq!(rl.toned_pinyin_of("XY", None, " "), "");
+    }
+
+    // ---------------- 注释表 ----------------
+
+    fn ct(rows: &[(&str, &str, &str)]) -> CommentTable {
+        CommentTable::build(
+            rows.iter()
+                .map(|(t, c, k)| (t.to_string(), c.to_string(), k.to_string()))
+                .collect(),
+        )
+    }
+
+    /// 把若干「库」各写成一个 `.dict.yaml`，返回路径列表（顺序即优先级）。
+    fn write_libs(tag: &str, libs: &[&[(&str, &str, &str)]]) -> (PathBuf, Vec<PathBuf>) {
+        let dir = std::env::temp_dir().join(format!("wind_cmt_{}_{}", std::process::id(), tag));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let paths = libs
+            .iter()
+            .enumerate()
+            .map(|(i, rows)| {
+                let mut s =
+                    String::from("name: t\ncolumns:\n  - text\n  - comment\n  - code\n...\n");
+                for (t, c, k) in rows.iter() {
+                    s.push_str(&format!("{t}\t{c}\t{k}\n"));
+                }
+                let p = dir.join(format!("lib{i}.dict.yaml"));
+                std::fs::write(&p, s).unwrap();
+                p
+            })
+            .collect();
+        (dir, paths)
+    }
+
+    /// 用给定的若干库建反查表，**两种后端各建一份**：内存降级（`cache_dir=None`）与
+    /// mmap `.wcmt`。同一组断言跑两遍，两条路径的查找语义必须完全一致。
+    ///
+    /// 断言了 mmap 那份确实走到 `CommentSource::Mmap` —— 少了这一句，缓存目录一旦不可写
+    /// 就会静默降级成两份内存表，parity 测试照样全绿却什么都没验证到。
+    fn rl_both(
+        tag: &str,
+        libs: &[&[(&str, &str, &str)]],
+    ) -> (PathBuf, Vec<(&'static str, ReverseLookup)>) {
+        let (dir, paths) = write_libs(tag, libs);
+        let mut mem = ReverseLookup::default();
+        mem.reload_comments(&paths, None);
+        let mut mm = ReverseLookup::default();
+        mm.reload_comments(&paths, Some(&dir.join("cache")));
+
+        assert_eq!(mem.comments.len(), libs.len(), "每个库各一个 source");
+        assert!(
+            mm.comments
+                .iter()
+                .all(|s| matches!(s.body, CommentBody::Mmap(_))),
+            "mmap 后端必须真的走 mmap，否则本测试退化成两份内存表的自比"
+        );
+        assert!(
+            mem.comments
+                .iter()
+                .all(|s| matches!(s.body, CommentBody::Memory(_)))
+        );
+        (dir, vec![("内存", mem), ("mmap", mm)])
+    }
+
+    /// 基本点查：命中返回注释，未命中返回 None。
+    #[test]
+    fn comment_lookup_basic() {
+        let t = ct(&[("苹果", "apple", ""), ("香蕉", "banana", "")]);
+        assert_eq!(t.lookup_first("苹果"), Some("apple"));
+        assert_eq!(t.lookup_first("香蕉"), Some("banana"));
+        assert_eq!(t.lookup_first("梨"), None);
+        assert_eq!(t.lookup_first(""), None);
+    }
+
+    /// ★★ 两种后端（内存降级 / mmap `.wcmt`）的查找语义必须逐条一致。
+    ///
+    /// mmap 是常态路径、内存是降级路径，二者分叉的话，用户只在缓存目录出问题时才会撞见
+    /// 差异——那是最难复现也最难归因的一类故障。
+    #[test]
+    fn memory_and_mmap_backends_agree() {
+        let (dir, both) = rl_both(
+            "parity",
+            &[&[
+                ("行", "háng 行列", "tfhh"),
+                ("行", "xíng 走路", "tfhx"),
+                ("好", "hǎo 美好", ""),
+                ("你好", "hello", ""),
+                ("𠮷", "扩展区汉字", ""),
+            ]],
+        );
+        for (name, rl) in &both {
+            assert_eq!(rl.comment_of("行", Some("tfhh")), "háng 行列", "{name}");
+            assert_eq!(rl.comment_of("行", Some("tfhx")), "xíng 走路", "{name}");
+            assert_eq!(
+                rl.comment_of("行", Some("hang")),
+                "háng 行列",
+                "{name} 码不匹配回落首条"
+            );
+            assert_eq!(rl.comment_of("行", None), "háng 行列", "{name}");
+            assert_eq!(rl.comment_of("好", Some("vb")), "hǎo 美好", "{name}");
+            assert_eq!(rl.comment_of("你好", None), "hello", "{name}");
+            assert_eq!(rl.comment_of("𠮷", None), "扩展区汉字", "{name}");
+            assert_eq!(rl.comment_of("没有的词", None), "", "{name}");
+            assert_eq!(rl.comment_of("", None), "", "{name}");
+        }
+        drop(both);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// ★★ 跨库仲裁：**code 精确匹配优先于库顺序**。
+    ///
+    /// 靠前的库有这个词但 code 对不上时，不得就地回落——后面库里精确匹配的那条应当胜出。
+    /// 合并单表时代这条由「组内先扫 code 再取首条」保证；改成每库独立后，若写成「逐库各自
+    /// 先 code 后首条」，第一个库会截胡，这条语义就悄悄丢了。
+    #[test]
+    fn exact_code_wins_across_libraries() {
+        let (dir, both) = rl_both(
+            "cross",
+            &[
+                &[("行", "通用释义", "")],     // 靠前：无 code
+                &[("行", "五笔专用", "tfhh")], // 靠后：精确 code
+            ],
+        );
+        for (name, rl) in &both {
+            assert_eq!(
+                rl.comment_of("行", Some("tfhh")),
+                "五笔专用",
+                "{name}：精确 code 必须越过靠前库的通用条目"
+            );
+            assert_eq!(
+                rl.comment_of("行", None),
+                "通用释义",
+                "{name}：无 code 时靠前库优先"
+            );
+            assert_eq!(
+                rl.comment_of("行", Some("hang")),
+                "通用释义",
+                "{name}：都对不上 code 时回落靠前库首条"
+            );
+        }
+        drop(both);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// ★ 源文件改动后必须读到新内容；未改动则复用缓存不重建。
+    ///
+    /// 这是二进制缓存最容易出错的地方，而错法很隐蔽：缓存恒新鲜 → 「改了词库不生效，
+    /// 重启也没用」。用 `.wcmt` 的 mtime 判断是否重建过 —— 直接断言查询结果不足以区分
+    /// 「重建了」与「压根没缓存」。
+    #[test]
+    fn cache_reused_until_source_changes() {
+        let (dir, paths) = write_libs("fresh", &[&[("甲", "旧释义", "")]]);
+        let cache = dir.join("cache");
+
+        let mut rl = ReverseLookup::default();
+        rl.reload_comments(&paths, Some(&cache));
+        assert_eq!(rl.comment_of("甲", None), "旧释义");
+        let wcmt = std::fs::read_dir(&cache)
+            .unwrap()
+            .flatten()
+            .map(|e| e.path())
+            .find(|p| p.extension().is_some_and(|e| e == "wcmt"))
+            .expect("应生成 .wcmt 缓存");
+        let stamp1 = std::fs::metadata(&wcmt).unwrap().modified().unwrap();
+
+        // 源未变 → 复用缓存（不重写文件）
+        drop(rl);
+        let mut rl = ReverseLookup::default();
+        rl.reload_comments(&paths, Some(&cache));
+        assert_eq!(rl.comment_of("甲", None), "旧释义");
+        assert_eq!(
+            std::fs::metadata(&wcmt).unwrap().modified().unwrap(),
+            stamp1,
+            "源未变时不该重建缓存"
+        );
+
+        // 源变更 → 必须重建并读到新内容。先释放映射：Windows 上被 mmap 的文件虽能被
+        // rename 覆盖，但旧 view 会继续指向替换前的数据（见 reader_pool 的同名测试）。
+        drop(rl);
+        std::fs::write(
+            &paths[0],
+            "name: t\ncolumns:\n  - text\n  - comment\n  - code\n...\n甲\t新释义\t\n",
+        )
+        .unwrap();
+        let mut rl = ReverseLookup::default();
+        rl.reload_comments(&paths, Some(&cache));
+        assert_eq!(
+            rl.comment_of("甲", None),
+            "新释义",
+            "源文件改了必须读到新内容——恒新鲜的缓存表现为「改了不生效，重启也没用」"
+        );
+
+        drop(rl);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// ★ 重载时仍在列表里的库**原样复用**：不重新校验指纹，也就不再读源文件。
+    ///
+    /// 这是切方案（`schemas` 字段）的高频路径——方案专属库开关的同时，全局库通常一字未改，
+    /// 而校验指纹要读完整份源文件（十万条约 3.6MB）。
+    ///
+    /// 判据是「把源文件删掉后仍能查」：复用路径压根不碰源文件，重新加载则会在
+    /// `cache_is_fresh` 读源失败 → 重新解析 → 整库消失。
+    ///
+    /// **`Arc::ptr_eq` 在这里是无效判据**（试过）：即使不复用，`reader_pool` 也会因为旧
+    /// Arc 仍存活而交出同一个指针，测试照样全绿——那测的是 reader_pool，不是本函数。
+    #[test]
+    fn unchanged_libraries_are_reused_without_rereading_source() {
+        let (dir, paths) = write_libs("reuse", &[&[("甲", "全局库", "")], &[("乙", "专属库", "")]]);
+        let cache = dir.join("cache");
+        let mut rl = ReverseLookup::default();
+        rl.reload_comments(&paths, Some(&cache));
+        assert_eq!(rl.comment_of("甲", None), "全局库");
+
+        // 源文件消失（等价于「这次重载没有去读它」的可观测代理）
+        std::fs::remove_file(&paths[0]).unwrap();
+
+        // 去掉第二个库，模拟切到不挂它的方案
+        rl.reload_comments(&paths[..1], Some(&cache));
+        assert_eq!(
+            rl.comment_of("甲", None),
+            "全局库",
+            "未变动的库必须原样复用——一旦重新校验指纹，每次切方案都要重读整份源文件"
+        );
+        assert_eq!(rl.comment_of("乙", None), "", "已卸载的库不再参与查询");
+
+        drop(rl);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 卸载一个库后，它的 `.wcmt` 与指纹 sidecar 应被清掉，不在缓存目录里越积越多。
+    #[test]
+    fn removed_library_cache_is_pruned() {
+        let (dir, paths) = write_libs("prune", &[&[("甲", "一号库", "")], &[("乙", "二号库", "")]]);
+        let cache = dir.join("cache");
+        let count = || {
+            std::fs::read_dir(&cache)
+                .map(|rd| {
+                    rd.flatten()
+                        .filter(|e| e.file_name().to_string_lossy().ends_with(".wcmt"))
+                        .count()
+                })
+                .unwrap_or(0)
+        };
+
+        let mut rl = ReverseLookup::default();
+        rl.reload_comments(&paths, Some(&cache));
+        assert_eq!(count(), 2);
+
+        // 只留第一个库：第二个的缓存应被清理，第一个的保留（不能连坐）
+        rl.reload_comments(&paths[..1], Some(&cache));
+        assert_eq!(count(), 1, "已卸载库的缓存应被清掉");
+        assert_eq!(rl.comment_of("甲", None), "一号库", "保留库不受影响");
+        assert_eq!(rl.comment_of("乙", None), "");
+
+        drop(rl);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 挂载顺序即优先级（跨库）：同一个词在两个库里都有时取靠前那个。
+    #[test]
+    fn earlier_library_wins() {
+        let (dir, both) = rl_both(
+            "order",
+            &[&[("苹果", "先挂载", "")], &[("苹果", "后挂载", "")]],
+        );
+        for (name, rl) in &both {
+            assert_eq!(rl.comment_of("苹果", None), "先挂载", "{name}");
+        }
+        drop(both);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 声明了 `code` 列、但某些行只写两列：这些行必须照常入表。
+    ///
+    /// 曾把 code 列计入「最少列数」，于是这类行整行被丢弃 —— 表现为「库里明明有这个词
+    /// 却没注释」，而库本身看起来完全正常。
+    #[test]
+    fn rows_without_code_survive_when_code_column_declared() {
+        let rows =
+            parse_str("columns:\n  - text\n  - comment\n  - code\n...\n甲\t有码\tlhnh\n乙\t无码\n");
+        assert_eq!(
+            rows,
+            vec![
+                ("甲".to_string(), "有码".to_string(), "lhnh".to_string()),
+                ("乙".to_string(), "无码".to_string(), String::new()),
+            ]
+        );
+    }
+
+    /// ★ 挂载顺序即优先级：同词同码时**保留首次出现**的那条（先挂载的库覆盖后挂载的）。
+    ///
+    /// 依赖 `build` 用稳定排序 —— 换成 `sort_unstable_by`，同 text 条目的相对顺序不再有
+    /// 保证，优先级会随输入规模抖动（小输入下可能碰巧对，大输入下随机翻转）。
+    #[test]
+    fn earlier_source_wins_on_duplicate() {
+        let t = ct(&[("行", "第一份", ""), ("行", "第二份", "")]);
+        assert_eq!(t.lookup_first("行"), Some("第一份"));
+        assert_eq!(t.len(), 1, "同词同码只保留一条");
+    }
+
+    /// ★ code 消歧：同词不同码各存一条，按 code 精确匹配。
+    #[test]
+    fn code_disambiguates_same_text() {
+        let t = ct(&[("行", "háng 行列", "tfhh"), ("行", "xíng 走路", "tfhx")]);
+        assert_eq!(t.len(), 2, "同词不同码应各存一条");
+        assert_eq!(t.lookup_by_code("行", "tfhh"), Some("háng 行列"));
+        assert_eq!(t.lookup_by_code("行", "tfhx"), Some("xíng 走路"));
+    }
+
+    /// ★★ code 对不上时**回落该词首条**，而不是返回空。
+    ///
+    /// 注释库里的 `tfhh` 是五笔码；拿拼音候选的 `hang` 去比对必然不匹配。跨方案挂同一份
+    /// 注释库是常态，那里不该因为对不上 code 就什么都不显示。
+    #[test]
+    fn unmatched_code_falls_back_to_first_entry() {
+        let t = ct(&[("行", "háng 行列", "tfhh"), ("行", "xíng 走路", "tfhx")]);
+        assert_eq!(t.lookup_by_code("行", "hang"), None, "对不上即未命中");
+        assert_eq!(t.lookup_first("行"), Some("háng 行列"), "由调用方回落首条");
+        assert_eq!(t.lookup_by_code("行", ""), None, "空 code 不参与消歧");
+    }
+
+    /// 无 code 的通用条目与带 code 的条目并存：带 code 者按码命中，其余回落首条。
+    #[test]
+    fn generic_and_coded_entries_coexist() {
+        let t = ct(&[("行", "通用", ""), ("行", "五笔专用", "tfhh")]);
+        assert_eq!(t.len(), 2);
+        assert_eq!(t.lookup_by_code("行", "tfhh"), Some("五笔专用"));
+        assert_eq!(
+            t.lookup_first("行"),
+            Some("通用"),
+            "首条是无 code 的通用条目"
+        );
+    }
+
+    /// 二分边界：首条 / 末条 / 排序键相邻的词都要能查到。
+    #[test]
+    fn comment_lookup_covers_binary_search_edges() {
+        let t = ct(&[
+            ("a", "A", ""),
+            ("ab", "AB", ""),
+            ("b", "B", ""),
+            ("z", "Z", ""),
+        ]);
+        for (k, v) in [("a", "A"), ("ab", "AB"), ("b", "B"), ("z", "Z")] {
+            assert_eq!(t.lookup_first(k), Some(v), "查 {k}");
+        }
+        assert_eq!(
+            t.lookup_first("aa"),
+            None,
+            "落在 a 与 ab 之间的词不得误命中"
+        );
+        assert_eq!(t.lookup_first("zz"), None, "越过末条不得越界");
+    }
+
+    /// 多字节键（中文）在 arena 里按字节切分，不得切在 UTF-8 中间。
+    #[test]
+    fn multibyte_keys_are_sliced_safely() {
+        let t = ct(&[("你好", "hello", "wqvb"), ("世界", "world", "")]);
+        assert_eq!(t.lookup_first("你好"), Some("hello"));
+        assert_eq!(t.lookup_first("世界"), Some("world"));
+    }
+
+    // ---------------- 注释库解析 ----------------
+
+    fn parse_str(content: &str) -> Vec<(String, String, String)> {
+        let p = std::env::temp_dir().join(format!(
+            "wind_comment_test_{}.dict.yaml",
+            content.len() as u64 * 31 + content.as_bytes().first().copied().unwrap_or(0) as u64
+        ));
+        std::fs::write(&p, content).unwrap();
+        let r = parse_comment_dict(&p).unwrap();
+        let _ = std::fs::remove_file(&p);
+        r
+    }
+
+    /// 默认列序 `[text, comment]`（无 columns 声明）。
+    #[test]
+    fn parse_defaults_to_text_comment() {
+        let rows = parse_str("name: x\n...\n苹果\tapple\n香蕉\tbanana\n");
+        assert_eq!(
+            rows,
+            vec![
+                ("苹果".into(), "apple".into(), String::new()),
+                ("香蕉".into(), "banana".into(), String::new()),
+            ]
+        );
+    }
+
+    /// 显式 columns 声明（流式与块式两种写法都要认）+ code 列。
+    #[test]
+    fn parse_honors_columns_declaration() {
+        let flow = parse_str("columns: [text, code, comment]\n...\n行\ttfhh\thang\n");
+        assert_eq!(flow, vec![("行".into(), "hang".into(), "tfhh".into())]);
+
+        let block = parse_str("columns:\n  - text\n  - code\n  - comment\n...\n行\ttfhh\thang\n");
+        assert_eq!(block, flow, "块式与流式声明结果须一致");
+    }
+
+    /// 声明里缺 comment（或缺 text）→ 整库跳过。没有注释的注释库是配置错误，
+    /// 静默当空会让人以为是路径问题。
+    #[test]
+    fn parse_skips_library_without_comment_column() {
+        assert!(parse_str("columns: [text, code]\n...\n行\ttfhh\n").is_empty());
+        assert!(parse_str("columns: [comment]\n...\nx\n").is_empty());
+    }
+
+    /// `#` 注释行、空行、列数不足的行一律跳过；空 text / 空 comment 同样跳过。
+    #[test]
+    fn parse_skips_comments_and_incomplete_rows() {
+        let rows = parse_str("...\n# 这是注释\n\n只有一列\n苹果\tapple\n\tempty_text\n梨\t\n");
+        assert_eq!(rows, vec![("苹果".into(), "apple".into(), String::new())]);
+    }
+
+    /// 无 YAML 头的裸 TSV 也能读（容许用户直接丢一张两列表）。
+    #[test]
+    fn parse_accepts_headerless_tsv() {
+        let rows = parse_str("苹果\tapple\n");
+        assert_eq!(rows, vec![("苹果".into(), "apple".into(), String::new())]);
+    }
+
+    /// 注释内容含空格/标点原样保留（只按 `\t` 切列，不 trim 内容）。
+    #[test]
+    fn parse_preserves_comment_content() {
+        let rows = parse_str("...\n行\txíng; 走路 / háng; 行列\n");
+        assert_eq!(rows[0].1, "xíng; 走路 / háng; 行列");
     }
 
     /// 整词字根串：逐字拼接，无拆字数据的字跳过。
