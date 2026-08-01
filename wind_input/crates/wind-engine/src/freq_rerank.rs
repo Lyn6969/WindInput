@@ -3,22 +3,21 @@
 //! **绝不改 weight**：词频只按 redb 记录 `{count, last_used}` 参与排序，不回写
 //! `Candidate::weight`，词库数据不被污染。
 //!
-//! ⚠ 但「不改 weight」**不等于「不比较 weight」**。拼音侧已改为等效权重模型
-//! （`docs/design/freq-weight-model.md`）：把词频折算成与词库同量纲的派生值，取
-//! `max(weight, W_freq)` 参与比较。`frequency.md` §2 那条原则反对的是 Go 的
-//! 「有界 boost 加到大 weight 上」，不是反对同量纲比较——恰恰相反，布尔闸门跨越权重轴
-//! 才是「打一个 `d` 首选变『的样子』」的根因。
+//! 拼音侧走**位置提升**模型（`docs/design/freq-rerank-model.md`）：候选按**位次**前移
+//! （`base_pos / 2^count`），完全不看权重数值。此前三版都试图在权重轴上解决问题，
+//! 全部失败于同一点——体感由词库的权重分布决定，而那个分布不可控（`de` 下「的」是第二名
+//! 的 486 倍，`siyuan` 下「寺院」只是「思源」的 2 倍）。
 //!
 //! ⚠ 「不改 weight」≠「不改顺序」。`rerank_codetable_usedfirst` 的**首要键是 `freq_tier`**，
 //! 与协调器 `candidate_display_order` 的匹配层级是两个正交维度——只要存在词频记录，档位序
-//! 就整体压过前一步的排序结果（稳定排序只保住档内相对序）。`rerank_pinyin_decay` 则显式
+//! 就整体压过前一步的排序结果（稳定排序只保住档内相对序）。`rerank_pinyin_positional` 则显式
 //! 复刻了层级（调用 `cmp_match_layers`）故不会跨层提拔。改本模块前先想清楚要改的是哪一种。
 //!
 //! 两种语义按引擎类型分流，**它们的模型已经不同**：
 //! - 码表/混输（§3）：**永久布尔 used-first**——用过的（count>0）档内上浮，不衰减。
 //!   码表调频默认关闭且有 `ProtectPolicy` 按码长保护首选，实测无越权问题，故维持原样。
-//! - 纯拼音：**等效权重**——`max(weight, W_freq)`，词频与权重同量纲竞争，`W_freq` 随次数
-//!   线性增长并封顶、随半衰期衰减。取代了原先的「布尔 used-first + 衰减分 + 阈值褪色」。
+//! - 纯拼音：**位置提升**——`target_pos = base_pos / 2^count`，衰减乘在次数上。取代了原先
+//!   的「布尔 used-first + 衰减分 + 阈值褪色」，也取代了中途试过的等效权重方案。
 //!
 //! 设计归属：frequency.md §5/§7 明确把词频重排放在 engine 排序层（持 store freq 只读访问），
 //! 而非 dict 查询层或 coordinator。本模块即该排序层的纯函数实现，由 coordinator 在排序后调用。
@@ -107,7 +106,7 @@ fn freq_tier(c: &Candidate, input: &str) -> u8 {
     // 只改协调器一侧等于没改。
     //
     // ⚠️ 这里**不必**像协调器那样区分「是否混输」：本函数只服务
-    // `rerank_codetable_usedfirst`（码表 / 混输），纯拼音走 `rerank_pinyin_decay` 不经过此处；
+    // `rerank_codetable_usedfirst`（码表 / 混输），纯拼音走 `rerank_pinyin_positional` 不经过此处；
     // 而纯码表下没有 `Pinyin` 来源候选，本档天然是空操作。
     if wind_candidate::is_pinyin_exact_tier(c, input.len()) {
         return 2;
@@ -183,192 +182,114 @@ pub fn rerank_codetable_usedfirst(
     }
 }
 
-/// 追平 `W_max` 所需的使用次数——等效权重模型的**唯一无量纲旋钮**。
+/// 位置提升的**步长底数**：每积累一次有效使用，候选的目标位次除以它。
 ///
-/// 取值 11765 由 fcitx5 换算而来，不是拍脑袋（`docs/design/freq-weight-model.md` §5.3）：
-/// libime 里一个词用过 1 次得 `pr = 5.4e-6`，而本仓词库最高权重「的」占全库总权重
-/// 6.32%（实测 15,378,475 / 2.4315e8，与中文语料中「的」的真实频率 4~7% 吻合，故该 weight
-/// 可近似当概率用）。两者相除得 `8.5e-5`，其倒数即本常数。
+/// 取 2（每次减半）是拿实测的微软拼音行为标定的——用户观察「中间档的字 1 次提前一半、
+/// 2 次进第 2 位、再 1 次到首位」，位次 10→5→2→1 与减半逐条吻合。
 ///
-/// 代入后「用一次」≈ 1307 点权重，与本仓 `ADD_WORD_WEIGHT = 1200`（用户主动加词的默认
-/// 权重）落在同一量级——两个独立来源的交叉印证：「主动加一个词」与「选中一个词一次」
-/// 表达的意图强度本就相当。
-pub const DEFAULT_FREQ_SAT_COUNT: u32 = 11765;
+/// **这是位次的除数，不是权重的步长**，两者性质完全不同：权重步长的体感取决于词库的
+/// 权重分布（`de` 下「的」是第二名的 486 倍、`siyuan` 下「寺院」只是「思源」的 2 倍，
+/// 同一个步长在两处天差地别），位次除数则与分布无关——第 2 位就是第 2 位。
+pub const POSITION_HALVING_BASE: u32 = 2;
 
-/// 词频的**等效权重** `W_freq`：把「用过几次、多久前用的」折算成与词库 weight 同量纲的值。
+/// 一个候选的有效提升次数：`count` 经半衰期衰减后取整。
 ///
-/// ```text
-/// W_freq = (w_max / n_sat) · min(count, n_sat) · decay(age)
-/// ```
-///
-/// **对次数线性**，不是饱和曲线。fcitx5 的 `pr` 正比于词在历史池中的出现次数
-/// （`historybigram.cpp:620`），饱和只来自 pool 容量这个物理上限；早期方案误用
-/// `count/(count+K)` 的饱和形状，`g(1)=0.09` 会让用过一次的词直接跳到最高权重的 9%，
-/// 激进了近三个数量级。
-///
-/// `min(count, n_sat)` 是必需的：本仓 `count` 是 `u32` 单调递增、**没有** fcitx5 那个
-/// pool 容量上限，不封顶则线性增长最终会越过任何权重。
-///
-/// `w_max` 必须来自**当前引擎**（`PinyinEngine::max_dict_weight`）——混输把拼音候选整体
-/// `/= PINYIN_TIER_SCALE`，跨模式的硬编码常数必错。
-///
-/// 返回 0 表示无有效词频（未用过 / 已衰减殆尽 / 基准无效）。
-pub fn freq_weight(
-    rec: &FreqRecord,
+/// 衰减乘在次数上而非结果上，语义是「久未用 ⇒ 当初那些使用逐渐不算数」，位次随之回落，
+/// 不需要额外的阈值褪色判据。取整后为 0 即完全不提升。
+fn promotion_steps(
+    c: &Candidate,
+    recs: &HashMap<String, FreqRecord>,
     now: i64,
     profile: FreqProfile,
-    w_max: i32,
-    n_sat: u32,
-) -> i32 {
-    if rec.count == 0 || w_max <= 0 || n_sat == 0 {
-        return 0;
-    }
-    let unit = w_max as f64 / n_sat as f64;
-    let n = rec.count.min(n_sat) as f64;
-    let w = unit * n * profile.decay_factor(rec, now);
-    // 上界即 w_max（count 已 clamp 到 n_sat、decay ≤ 1），钳一次防浮点误差越界。
-    w.clamp(0.0, w_max as f64) as i32
+) -> u32 {
+    recs.get(&c.text).map_or(0, |r| {
+        let eff = r.count as f64 * profile.decay_factor(r, now);
+        // 上限 31：saturating_pow 防溢出，且 2^31 已远超任何候选列表长度
+        (eff as u32).min(31)
+    })
 }
 
-/// 候选的**等效权重** `W_eff = max(weight, W_freq)`。
+/// 拼音词频重排：**位置提升**模型（`docs/design/freq-rerank-model.md`）。
 ///
-/// `max` 而非加法，对齐 fcitx5 的 `std::max(score, …)`（`userlanguagemodel.cpp:139`）：
+/// ```text
+/// target_pos = base_pos / (HALVING_BASE ^ effective_count)
+/// ```
 ///
-/// - **词频只抬不降**。当前的布尔 used-first 恰恰相反——它既抬高用过的，**也把没用过的
-///   高权重词压下去**，这正是「打一个 `d` 首选变『的样子』」的机制。
-/// - 加法在 Zipf 分布下退化：对 p50 的词（weight=34）任何加数都是碾压，对「的」
-///   （1.5e7）任何加数都是噪声，**没有「意图强度」这个语义**，只是平移。
-/// - `max` 的语义清晰：「这个词对**你**而言至少值 `W_freq`，不管词库怎么说」。词库权重
-///   更高时以词库为准——高频字因此不会被偶发选择挤掉。
+/// 排序键：`(锚定, 匹配层级, target_pos, 是否被提升, base_pos)`。
 ///
-/// 传 `weight` 而非 `&Candidate`：contested 整句要用的是 `dict_weight`（整句加成前的词典
-/// 权重）而非被 3e7 覆盖后的 `weight`，由调用方决定喂哪个。
-#[inline]
-pub fn effective_weight(weight: i32, w_freq: i32) -> i32 {
-    weight.max(w_freq)
-}
-
-/// 拼音词频重排：**等效权重**模型（`docs/design/freq-weight-model.md`）。
+/// # 为什么是位次而不是权重
 ///
-/// 比较链三层：
-/// ① **锚定**：`is_sentence`（Viterbi 整句/超长词典整词）或**精确码短语**
-///    （`is_phrase && is_exact_code`）恒占顶部，互相维持引擎权重序。
-///    **前缀短语不锚定**（落到 ② 靠 `is_prefix` 降到精确候选之下，与 `freq_tier` 的
-///    tier1/tier2、协调器 `candidate_display_order` 同口径）。
-///    `is_sentence_demoted` / `is_sentence_contested` 的整句**不参与**锚定。
-/// ② **匹配层级** `cmp_match_layers`（简拼/前缀补全/子短语）：词频不得跨层提拔。
-/// ③ **等效权重降序** `max(可比权重, 词频折算权重)`，并列时整句优先。
+/// 前三版都试图在**权重轴**上解决问题（布尔闸门 → 等效权重 → 局部插值），全部失败于同一点：
+/// **体感由词库的权重分布决定，而那个分布不可控**。`de` 下 rime-ice 把「的」抬到第二名的
+/// 486 倍，`siyuan` 下「寺院」只是「思源」的 2 倍——同一套参数在前者慢得离谱、在后者快得
+/// 离谱，调参只是在两个坏结果之间挪，换本词库还要重调。
 ///
-/// `now` 为当前 unix 秒（调用方注入，便于测试与确定性）；`w_max` 是**当前引擎**的量纲
-/// 基准（[`crate::Engine::max_dict_weight`]，混输已降档），`n_sat` 见
-/// [`DEFAULT_FREQ_SAT_COUNT`]。
+/// 位次把体感与分布**彻底解耦**：第 2 位用一次就能到首位，第 40 位要六次，与它们的绝对
+/// 权重无关。这也是实测的微软拼音行为，且与搜狗/fcitx5 的框架自洽——它们都是「加权混合」，
+/// 而混合的前提是**先归一化**；用位次归一化，加权混合即退化为本模型。
 ///
-/// # ⚠️ 契约变更：本函数现在**显式比较 weight**
+/// # 契约：入参必须已按显示序排好
 ///
-/// **此前的契约是「从不比较 weight」**——所有「维持引擎权重序」的分支返回 `Ordering::Equal`，
-/// 靠 `sort_by` 的稳定性保住调用方喂进来的顺序。那是布尔 used-first 时代的产物：词频只做
-/// 「用过的整体上浮」，权重序全靠上游。
+/// `base_pos` 取的就是入参下标，所以调用方必须先跑 `candidate_display_order`。协调器
+/// `handle_candidate.rs` 的顺序（display_order → filter → **本函数** → shadow）满足这一点，
+/// 且本函数是最后一道整体排序，其结果不会被后续按权重重排推翻。
 ///
-/// 等效权重模型下 ③ 直接比较 `W_eff`，于是：
-/// - **不再依赖调用方先按权重排好**。此前 `candidate_display_order` 与本函数的先后是正确性
-///   前提，现在只影响并列时的相对次序。
-/// - **单测不必再按 `candidate_display_order` 的输出顺序喂入**（仍建议如此，以贴近生产）。
-/// - 但 ① 的锚定分支仍返回 `Equal` 靠稳定性维持整句间的引擎序，那部分契约未变。
+/// # 三层的分工
 ///
-/// 三层里**只有 ③ 看数值**：① 按来源语义、② 按结构层级，都不看 weight。给候选加「排第一」
-/// 语义时应走 ①/②，**不要再往 weight 里塞魔数**——`SENTENCE_WEIGHT_BASE` 就是那样进来的，
-/// 它让整句权重与词库权重不可比，contested 因此必须靠 `dict_weight` 换算回来。
-pub fn rerank_pinyin_decay(
+/// ① **锚定**（`is_sentence` 或精确码短语）恒占顶部、互相维持原序，**不参与位置提升**。
+///    `is_sentence_demoted` / `is_sentence_contested` 的整句不在此列——后者正是为了让同码
+///    竞争者能靠位置提升反超它（`siyuan` 寺院/思源）。
+/// ② **匹配层级** `cmp_match_layers`：词频不得跨层提拔（模糊「是」不能压过精确「四」）。
+/// ③ **目标位次**升序；同位次时**被提升者在前**——否则提升到 0 的候选会与原本就在 0 位的
+///    并列，再按 `base_pos` 排又回到原位，提升等于没做。
+pub fn rerank_pinyin_positional(
     candidates: &mut [Candidate],
     recs: &HashMap<String, FreqRecord>,
     now: i64,
     profile: FreqProfile,
-    w_max: i32,
-    n_sat: u32,
 ) {
-    use std::cmp::Ordering;
-    // 候选参与比较的**可比权重**：contested 整句要换回词典原值。
-    //
-    // `SENTENCE_WEIGHT_BASE`(3e7) 不是权重，是「我要排第一」的编码——真机 `siyuan` 下
-    // 「寺院」显示 `权 29984561`，而它在词库里只有 491。contested 已摘掉锚定、下场与同码
-    // 竞争者比量级，若仍拿 3e7 参与比较，「思源」无论被选中多少次都翻不过，词频维度对该
-    // 编码整体失效。
-    //
-    // 只对 contested 这么做：`is_sentence_demoted` 的整句其 weight 已被引擎降到
-    // `peer_max - 1`（本就可比），锚定中的整句根本走不到这里。
-    let cmp_weight = |c: &Candidate| -> i32 {
-        if c.is_sentence_contested {
-            c.dict_weight.unwrap_or(c.weight)
-        } else {
-            c.weight
-        }
+    let n = candidates.len();
+    if n < 2 {
+        return;
+    }
+    let anchored = |c: &Candidate| {
+        (c.is_sentence && !c.is_sentence_demoted && !c.is_sentence_contested)
+            || (c.is_phrase && c.is_exact_code)
     };
-    let w_eff = |c: &Candidate| -> i32 {
-        let wf = recs
-            .get(&c.text)
-            .map(|r| freq_weight(r, now, profile, w_max, n_sat))
-            .unwrap_or(0);
-        effective_weight(cmp_weight(c), wf)
-    };
-    candidates.sort_by(|a, b| {
-        // ① 整句/精确码短语锚定顶部（按来源语义判定，不看权重数值——见 Candidate::is_sentence）
-        //
-        // `is_sentence_demoted` 的整句**不参与**锚定：它已让位于精确整词，若仍锚定，
-        // 引擎侧的降权会被本步整个顶回去（本比较器不看 weight，只看标志）。落选锚定后
-        // 它走下面的层级+衰减+权重序，恰好停在精确整词之后、普通候选之前。
-        //
-        // `is_sentence_contested` 的整句同样**不参与**锚定：它自己就是一个词典精确整词，
-        // 而同码还有别的精确整词（`siyuan` 寺院/思源、`gonghe` 共和/恭贺）。锚定是硬闸门
-        // ——衰减分连算都不算——会让同码竞争者无论被选中多少次都翻不过它，词频维度对该
-        // 编码整体失效。摘掉锚定后它落到下面按衰减分与竞争者公平比较；**无词频记录时
-        // 仍靠引擎喂进来的权重序（SENTENCE_WEIGHT_BASE 量纲）居首**，不会平白掉位。
-        //
-        // 短语只锚定**精确码短语**（`is_phrase && is_exact_code`）：前缀短语（`lookup_prefix`，
-        // `!is_exact_code`）不锚定，落到下面 `cmp_match_layers` 靠 is_prefix 降到精确候选之下。
-        // 否则打 `da` 时 `date` 前缀短语只因 is_phrase 就被顶到首位（与 freq_tier tier1/tier2、
-        // 协调器 candidate_display_order 对齐：完全匹配才提前、前缀避让）。
-        let anchored = |c: &Candidate| {
-            (c.is_sentence && !c.is_sentence_demoted && !c.is_sentence_contested)
-                || (c.is_phrase && c.is_exact_code)
-        };
-        let (sa, sb) = (anchored(a), anchored(b));
-        if sa != sb {
-            return if sa {
-                Ordering::Less
-            } else {
-                Ordering::Greater
-            };
+    // 预计算 (锚定, 目标位次, 是否真的前移)。base_pos 即入参下标，见上文契约。
+    let meta: Vec<(bool, usize, bool)> = candidates
+        .iter()
+        .enumerate()
+        .map(|(pos, c)| {
+            let s = promotion_steps(c, recs, now, profile);
+            let target = pos / (POSITION_HALVING_BASE as usize).saturating_pow(s);
+            (anchored(c), target, target < pos)
+        })
+        .collect();
+
+    let mut idx: Vec<usize> = (0..n).collect();
+    idx.sort_by(|&a, &b| {
+        let (aa, ab) = (meta[a].0, meta[b].0);
+        if aa != ab {
+            return ab.cmp(&aa); // 锚定者在前
         }
-        if sa {
-            return Ordering::Equal; // 均为整句/短语 → 维持引擎权重序
+        if aa {
+            return a.cmp(&b); // 均锚定 → 维持原序，不参与提升
         }
-        // ①.5 匹配层级（模糊/前缀补全/子短语）：与引擎、协调器共用同一比较函数。
-        //     词频 used-first 不得跨层级提拔——用户曾在 si 下误选模糊「是」，不能让它
-        //     永久压过精确「四」；频繁使用的补全「思考」也不能压过精确「四」；baoan 下
-        //     常用单字「报」不能压过完整词「报案」。对齐 Go 的 Exact/coverage 硬分层。
-        let layers = wind_candidate::cmp_match_layers(a, b);
-        if layers != Ordering::Equal {
-            return layers;
-        }
-        // ② 非整句、同层级：**等效权重**降序 `max(可比权重, 词频折算权重)`。
-        //
-        // 取代了此前的「布尔 used-first + 衰减分 + 阈值褪色」三层。那三层的问题是 ③ 在 ⑤
-        // 之前且是布尔的——「用过」这一事实跨越权重轴，无论两者权重差多少个数量级。
-        // 现在词频与权重同量纲比较，且 `max` 保证词频**只抬不降**（旧闸门还会把没用过的
-        // 高权重词压下去，那正是「打一个 `d` 首选变『的样子』」的机制）。
-        //
-        // 阈值褪色不再需要：`decay → 0` 时 `W_freq → 0`，`max` 自然退回词库权重。
-        let (wa, wb) = (w_eff(a), w_eff(b));
-        if wa != wb {
-            return wb.cmp(&wa);
-        }
-        // ③ 等效权重并列 → 整句优先。
-        //
-        // 此前「无词频时 contested 整句仍居首」依赖稳定排序 + 引擎喂进来的 3e7 权重序，
-        // 是隐式的；改用 `dict_weight` 比较后那个隐式保证消失（寺院 491 与思源 245 已是
-        // 同量级，可能并列），故显式写出。
-        b.is_sentence.cmp(&a.is_sentence)
+        wind_candidate::cmp_match_layers(&candidates[a], &candidates[b])
+            .then_with(|| meta[a].1.cmp(&meta[b].1)) // 目标位次升序
+            .then_with(|| meta[b].2.cmp(&meta[a].2)) // 同位次：被提升者在前
+            .then(a.cmp(&b)) // 其余维持原序（稳定）
     });
+
+    // 应用置换：move 而非 clone（候选含 String，上千条时 clone 不可忽略）
+    let mut reordered: Vec<Candidate> = Vec::with_capacity(n);
+    for &i in &idx {
+        reordered.push(std::mem::take(&mut candidates[i]));
+    }
+    for (slot, c) in candidates.iter_mut().zip(reordered) {
+        *slot = c;
+    }
 }
 
 #[cfg(test)]
@@ -429,14 +350,7 @@ mod tests {
             pin("拟", 1000),
         ];
         let r = recs(&[("你好", 20, NOW)]);
-        rerank_pinyin_decay(
-            &mut cands,
-            &r,
-            NOW,
-            FreqProfile::default(),
-            W_MAX,
-            DEFAULT_FREQ_SAT_COUNT,
-        );
+        rerank_pinyin_positional(&mut cands, &r, NOW, FreqProfile::default());
         assert_eq!(cands[0].text, "你好世界", "整句必须锚定首位");
         assert_eq!(cands[1].text, "你好", "近用词软置前于未用词");
         assert_eq!(cands[2].text, "拟");
@@ -470,14 +384,7 @@ mod tests {
             },
         ];
         let r = recs(&[]);
-        rerank_pinyin_decay(
-            &mut cands,
-            &r,
-            NOW,
-            FreqProfile::default(),
-            W_MAX,
-            DEFAULT_FREQ_SAT_COUNT,
-        );
+        rerank_pinyin_positional(&mut cands, &r, NOW, FreqProfile::default());
         assert_eq!(cands[0].text, "廉政提醒", "精确整词须在降级整句之前");
         assert_eq!(cands[1].text, "连整体性", "降级整句仍须在普通候选之前");
         assert_eq!(cands[2].text, "连");
@@ -489,14 +396,7 @@ mod tests {
     fn pinyin_undemoted_sentence_still_anchors_from_below() {
         let mut cands = vec![pin("廉政提醒", 100_000), pin_sentence("连整体性", 99_999)];
         let r = recs(&[]);
-        rerank_pinyin_decay(
-            &mut cands,
-            &r,
-            NOW,
-            FreqProfile::default(),
-            W_MAX,
-            DEFAULT_FREQ_SAT_COUNT,
-        );
+        rerank_pinyin_positional(&mut cands, &r, NOW, FreqProfile::default());
         assert_eq!(
             cands[0].text, "连整体性",
             "未降级的整句仍恒锚定首位（本函数不看 weight）"
@@ -514,14 +414,7 @@ mod tests {
         // 需 W_freq > 100_000 才能翻过「精确整词」⇒ count > 100000/1307 ≈ 76.5。
         // 旧值 20 是布尔闸门时代的遗留——那时 count 只用来过 ε 阈值，多少都一样。
         let r = recs(&[("降级整句", 100, NOW)]);
-        rerank_pinyin_decay(
-            &mut cands,
-            &r,
-            NOW,
-            FreqProfile::default(),
-            W_MAX,
-            DEFAULT_FREQ_SAT_COUNT,
-        );
+        rerank_pinyin_positional(&mut cands, &r, NOW, FreqProfile::default());
         assert_eq!(
             cands[0].text, "降级整句",
             "降级整句不再锚定，故可凭词频重新浮上来"
@@ -535,19 +428,10 @@ mod tests {
     /// 硬闸门，实测灌到 count=5000 都翻不动 —— 词频对该编码整体失效。
     #[test]
     fn pinyin_contested_sentence_yields_to_used_peer() {
-        // 必须带 dict_weight——生产中由 step 6.6 保证（词典词取词库原值，合成整句取同码
-        // 最强竞争者）。漏掉它，比较器会退回 3e7、竞争者永远翻不过，本用例即测空。
-        let mut cands = vec![pin_contested("寺院", W_SIYUAN_TEMPLE), pin("思源", 245)];
-        // 用一次值 1307，已越过「寺院」的词库权重 491。
+        let mut cands = vec![pin_contested("寺院"), pin("思源", 245)];
+        // 第 2 位用一次即可提升到第 0 位。
         let r = recs(&[("思源", 1, NOW)]);
-        rerank_pinyin_decay(
-            &mut cands,
-            &r,
-            NOW,
-            FreqProfile::default(),
-            W_MAX,
-            DEFAULT_FREQ_SAT_COUNT,
-        );
+        rerank_pinyin_positional(&mut cands, &r, NOW, FreqProfile::default());
         assert_eq!(
             cands[0].text,
             "思源",
@@ -572,14 +456,7 @@ mod tests {
             pin("思源", 245),
         ];
         let r = recs(&[]);
-        rerank_pinyin_decay(
-            &mut cands,
-            &r,
-            NOW,
-            FreqProfile::default(),
-            W_MAX,
-            DEFAULT_FREQ_SAT_COUNT,
-        );
+        rerank_pinyin_positional(&mut cands, &r, NOW, FreqProfile::default());
         assert_eq!(
             cands[0].text, "寺院",
             "无使用记录时整句仍是最优解读，须维持首位"
@@ -591,39 +468,21 @@ mod tests {
     /// 这正是把 `weight >= 20M` 阈值换成 `is_sentence` 标记要解决的问题。
     #[test]
     fn pinyin_high_weight_non_sentence_still_learns() {
-        // 92,194 = 8105 常用字表的 p99，是非整句候选够得到的真实量级。
-        // 旧用例用 30,000,000——那是 SENTENCE_WEIGHT_BASE 量级，非整句候选根本到不了。
+        // 92,194 = 8105 常用字表的 p99，是非整句候选够得到的真实量级
+        // （早先用例写 30,000,000，那是 SENTENCE_WEIGHT_BASE 量级，非整句候选到不了）。
         let mut cands = vec![pin("高权非整句", 92_194), pin("近用低权", 100)];
-        // 92194/1307 ≈ 70.5 ⇒ 71 次足以翻越
-        let r = recs(&[("近用低权", 71, NOW)]);
-        rerank_pinyin_decay(
-            &mut cands,
-            &r,
-            NOW,
-            FreqProfile::default(),
-            W_MAX,
-            DEFAULT_FREQ_SAT_COUNT,
-        );
+        let r = recs(&[("近用低权", 1, NOW)]);
+        rerank_pinyin_positional(&mut cands, &r, NOW, FreqProfile::default());
         assert_eq!(
             cands[0].text, "近用低权",
-            "非整句候选不享锚定豁免，词频量级足够时应可下沉它"
+            "非整句候选不享锚定豁免，第 2 位用一次即可超过它"
         );
 
-        // **对照**：次数不足时压不动。证明上面的翻越来自词频量级，而非「非整句一律可被下沉」。
-        let mut few = vec![pin("高权非整句", 92_194), pin("近用低权", 100)];
-        let r_few = recs(&[("近用低权", 10, NOW)]);
-        rerank_pinyin_decay(
-            &mut few,
-            &r_few,
-            NOW,
-            FreqProfile::default(),
-            W_MAX,
-            DEFAULT_FREQ_SAT_COUNT,
-        );
-        assert_eq!(
-            few[0].text, "高权非整句",
-            "10 次(W_eff=13071)不足以翻越 92194——压不过高频是有意的取舍"
-        );
+        // 配对用例（分别在别处）：`anchored_sentence_is_immune_to_promotion` 验证锚定者
+        // 用 50 次也纹丝不动，`no_record_means_no_movement` 验证无记录时一步不挪。
+        //
+        // 此处不再写「次数不足时压不动」的对照——位置模型下只有两个候选，第 2 位用一次
+        // 就到顶，不存在「次数不足」这个状态。那是等效权重模型的遗留断言。
     }
 
     /// 精确码短语（`is_phrase && is_exact_code`，lookup 完全匹配）与整句同享锚定豁免。
@@ -637,14 +496,7 @@ mod tests {
             c
         }];
         let r = recs(&[("普通词", 30, NOW)]);
-        rerank_pinyin_decay(
-            &mut cands,
-            &r,
-            NOW,
-            FreqProfile::default(),
-            W_MAX,
-            DEFAULT_FREQ_SAT_COUNT,
-        );
+        rerank_pinyin_positional(&mut cands, &r, NOW, FreqProfile::default());
         assert_eq!(cands[0].text, "我的邮箱", "精确码短语须与整句同享锚定");
     }
 
@@ -665,14 +517,7 @@ mod tests {
         };
         let mut cands = vec![exact_word, prefix_phrase];
         let r = recs(&[("大", 3, NOW)]); // 有词频记录 → 重排确实生效
-        rerank_pinyin_decay(
-            &mut cands,
-            &r,
-            NOW,
-            FreqProfile::default(),
-            W_MAX,
-            DEFAULT_FREQ_SAT_COUNT,
-        );
+        rerank_pinyin_positional(&mut cands, &r, NOW, FreqProfile::default());
         assert_eq!(
             cands[0].text,
             "大",
@@ -687,14 +532,7 @@ mod tests {
     fn pinyin_recent_use_floats_above_higher_weight() {
         let mut cands = vec![pin("低频高权", 5000), pin("近用低权", 100)];
         let r = recs(&[("近用低权", 8, NOW)]);
-        rerank_pinyin_decay(
-            &mut cands,
-            &r,
-            NOW,
-            FreqProfile::default(),
-            W_MAX,
-            DEFAULT_FREQ_SAT_COUNT,
-        );
+        rerank_pinyin_positional(&mut cands, &r, NOW, FreqProfile::default());
         assert_eq!(cands[0].text, "近用低权", "近期使用应软置前");
     }
 
@@ -721,14 +559,7 @@ mod tests {
             pin("四", 100),        // 精确命中，未使用
         ];
         let r = recs(&[("是", 4, NOW)]); // 「是」有使用记录（模拟 si→是 count=4）
-        rerank_pinyin_decay(
-            &mut cands,
-            &r,
-            NOW,
-            FreqProfile::default(),
-            W_MAX,
-            DEFAULT_FREQ_SAT_COUNT,
-        );
+        rerank_pinyin_positional(&mut cands, &r, NOW, FreqProfile::default());
         assert_eq!(
             cands[0].text,
             "是",
@@ -744,14 +575,7 @@ mod tests {
         let long_ago = NOW - 365 * 24 * 3600; // 一年前用过一次 → 衰减远小于 ε
         let mut cands = vec![pin("高权未用", 5000), pin("陈旧低权", 100)];
         let r = recs(&[("陈旧低权", 1, long_ago)]);
-        rerank_pinyin_decay(
-            &mut cands,
-            &r,
-            NOW,
-            FreqProfile::default(),
-            W_MAX,
-            DEFAULT_FREQ_SAT_COUNT,
-        );
+        rerank_pinyin_positional(&mut cands, &r, NOW, FreqProfile::default());
         assert_eq!(cands[0].text, "高权未用", "褪色词应落回权重序，高权在前");
     }
 
@@ -1027,314 +851,156 @@ mod tests {
         );
     }
 
-    // ─────────────── 等效权重（freq-weight-model.md §5）───────────────
+    // ─────────────── 位置提升（docs/design/freq-rerank-model.md）───────────────
     //
-    // 下列常量全部是 `build_dev/data/schemas/pinyin/cn_dicts/` 的**实测值**，不是构造数字。
-    // 复现方法见该设计文档附录。换词库或改 `import_tables` 后需重新标定，这些用例会先红。
+    // 下列常量是 `build_dev/data/schemas/pinyin/cn_dicts/` 的实测权重，用来构造**真实的
+    // 位次关系**——位置模型本身不看权重，但入参顺序必须与生产一致（按显示序排好）。
 
-    /// 全库最大 weight：「的」（`8105.dict.yaml`），亦即 `W_max` 基准。
-    const W_MAX: i32 = 15_378_475;
-    /// 「的样子」（`ext.dict.yaml`）≈ base 库的 p99.9——**不是低频词**，
-    /// 它在用户现场夺走首选靠的是布尔闸门让权重完全不参与比较。
-    const W_DEYANGZI: i32 = 23_923;
-    /// `si yuan` 同码：寺院 491 > 思源 245，仅差 2 倍。
+    /// `de` 音单字实测：的 > 得 > 地 > 德，「的」是第二名的 486 倍。
+    /// 位置模型下这个悬殊比例**不影响**提升速度，这正是它取代权重模型的理由。
+    const W_DE: i32 = 15_378_475;
+    const W_DEI: i32 = 31_646;
+    const W_DI: i32 = 13_039;
+    /// `si yuan` 实测：寺院 491 > 思源 245，仅 2 倍。
     const W_SIYUAN_TEMPLE: i32 = 491;
     const W_SIYUAN_PRODUCT: i32 = 245;
 
-    /// contested 整句：weight 是真机实测的整句量级（3e7 + log_offset），
-    /// `dict_weight` 是它在词库里的原值。
-    fn pin_contested(text: &str, dict_w: i32) -> Candidate {
+    /// contested 整句：weight 是真机实测的整句量级（3e7 + log_offset）。
+    /// 位置模型不看这个数值，它只决定 base_pos——整句因 3e7 天然占据第 0 位。
+    fn pin_contested(text: &str) -> Candidate {
         let mut c = pin(text, 29_984_561);
         c.is_sentence = true;
         c.is_sentence_contested = true;
-        c.dict_weight = Some(dict_w);
         c
     }
 
-    fn rec(count: u32, last_used: i64) -> FreqRecord {
-        FreqRecord { count, last_used }
-    }
-
-    fn fw(count: u32, now_offset_hours: i64) -> i32 {
-        freq_weight(
-            &rec(count, NOW - now_offset_hours * 3600),
-            NOW,
-            FreqProfile::default(),
-            W_MAX,
-            DEFAULT_FREQ_SAT_COUNT,
-        )
-    }
-
-    /// 标定的核心断言：用一次约等于没用——高权重词纹丝不动。
+    /// **模型的核心断言**：提升速度与权重差距无关。
     ///
-    /// 对齐 fcitx5（`max(-2.5, -2.597) = -2.5`）与 librime（`formula_p` 在 `d/kM≈0.005`
-    /// 处几乎不动）。两个独立实现殊途同归，这是本模型最该守住的性质。
+    /// `de` 下「的」是第二名的 486 倍，`siyuan` 下「寺院」只是「思源」的 2 倍——两处的
+    /// 第 2 位候选都应**用一次到首位**。前三版权重模型正是死在这里：同一套参数在 486 倍
+    /// 的落差下慢得离谱、在 2 倍的落差下快得离谱。
     #[test]
-    fn freq_weight_one_use_does_not_move_a_high_weight_word() {
-        let w1 = fw(1, 0);
-        assert_eq!(
-            w1, 1307,
-            "用一次 ≈ W_max/N_sat；与 ADD_WORD_WEIGHT(1200) 同量级"
-        );
-        assert_eq!(
-            effective_weight(W_DEYANGZI, w1),
-            W_DEYANGZI,
-            "「的样子」23923 用一次后等效权重不变——这正是用户现场该有的结果"
-        );
-        assert_eq!(effective_weight(W_MAX, w1), W_MAX, "「的」更不可能被撼动");
+    fn promotion_speed_is_independent_of_weight_gap() {
+        // ① 486 倍落差
+        let mut de = vec![pin("的", W_DE), pin("得", W_DEI), pin("地", W_DI)];
+        let r = recs(&[("得", 1, NOW)]);
+        rerank_pinyin_positional(&mut de, &r, NOW, FreqProfile::default());
+        assert_eq!(de[0].text, "得", "第 2 位用一次即到首位（486 倍落差）");
+
+        // ② 2 倍落差——同样一次
+        let mut sy = vec![pin("寺院", W_SIYUAN_TEMPLE), pin("思源", W_SIYUAN_PRODUCT)];
+        let r2 = recs(&[("思源", 1, NOW)]);
+        rerank_pinyin_positional(&mut sy, &r2, NOW, FreqProfile::default());
+        assert_eq!(sy[0].text, "思源", "第 2 位用一次即到首位（2 倍落差）");
     }
 
-    /// **反向对照**：词频不是被废掉了——次数够多就能翻越。
+    /// 位次逐次减半：第 8 位 → 4 → 2 → 1 → 0。
     ///
-    /// 缺了这条，上面的断言可以靠「让 `freq_weight` 恒返回 0」满足，那是更严重的退化。
+    /// 对应实测的微软行为「1 次提前一半、2 次进第 2 位、再 1 次到首位」。
     #[test]
-    fn freq_weight_grows_linearly_and_eventually_overtakes() {
-        assert_eq!(fw(10, 0), 13_071, "十次仍低于「的样子」23923");
-        assert_eq!(effective_weight(W_DEYANGZI, fw(10, 0)), W_DEYANGZI);
-
-        let w20 = fw(20, 0);
-        assert!(w20 > W_DEYANGZI, "二十次开始越过自身权重，got {w20}");
-        assert_eq!(effective_weight(W_DEYANGZI, w20), w20);
-
-        // 线性：翻倍次数 → 翻倍权重（对齐 fcitx5 的 pr ∝ uf1，非饱和曲线）。
-        // 容 1 点误差——`as i32` 向零截断，两次独立截断的结果不必严格等于「先算后翻倍」。
-        assert!(
-            (fw(200, 0) - fw(100, 0) * 2).abs() <= 1,
-            "对次数必须线性，got {} vs {}",
-            fw(200, 0),
-            fw(100, 0) * 2
-        );
+    fn position_halves_on_each_use() {
+        let names = ["a", "b", "c", "d", "e", "f", "g", "h", "i"];
+        // 权重递减，保证入参即显示序；目标候选 "i" 在第 8 位（idx 8）
+        let build = || -> Vec<Candidate> {
+            names
+                .iter()
+                .enumerate()
+                .map(|(i, t)| pin(t, 1000 - i as i32))
+                .collect()
+        };
+        for (count, want) in [(1u32, 4usize), (2, 2), (3, 1), (4, 0)] {
+            let mut c = build();
+            let r = recs(&[("i", count, NOW)]);
+            rerank_pinyin_positional(&mut c, &r, NOW, FreqProfile::default());
+            let got = c.iter().position(|x| x.text == "i").unwrap();
+            assert_eq!(got, want, "用 {count} 次后应在第 {want} 位，实际 {got}");
+        }
     }
 
-    /// 用户提的场景：寺院（通用语料常用）vs 思源（产品名，该用户日常要打的）。
+    /// **反向对照**：没有词频记录就一步都不动。
     ///
-    /// 两者权重仅差 2 倍，而「用一次」值 1307 远超两者 ⇒ **一次即翻转**，
-    /// 不需要几十次。这正是「压得过低频、压不过高频」在起作用。
+    /// 缺了它，「无条件把某些候选前移」也能让上面两条通过。
     #[test]
-    fn freq_weight_flips_siyuan_after_single_use() {
-        let once = fw(1, 0);
-        let product = effective_weight(W_SIYUAN_PRODUCT, once);
-        // 寺院此处用 dict_weight（491）参与比较，而非被整句加成覆盖后的 3e7
-        let temple = effective_weight(W_SIYUAN_TEMPLE, 0);
-        assert!(
-            product > temple,
-            "选过一次「思源」后应超过「寺院」，got {product} vs {temple}"
-        );
+    fn no_record_means_no_movement() {
+        let mut c = vec![pin("的", W_DE), pin("得", W_DEI), pin("地", W_DI)];
+        let before: Vec<String> = c.iter().map(|x| x.text.clone()).collect();
+        rerank_pinyin_positional(&mut c, &recs(&[]), NOW, FreqProfile::default());
+        let after: Vec<String> = c.iter().map(|x| x.text.clone()).collect();
+        assert_eq!(before, after, "无词频记录时顺序必须原样保持");
     }
 
-    /// 高频字不可被夺走：追平「的」需 11765 次，实际不可达。
-    #[test]
-    fn freq_weight_cannot_overtake_top_frequency_char() {
-        // 先钉住非 0：不然「freq_weight 恒返回 0」也能满足下面「压不过高频字」的全部断言
-        // ——那时通过的原因是词频压根没生效，而非取舍正确。反向验证当场抓到过这一点。
-        assert!(fw(1000, 0) > 0, "一千次必须是真值，否则本用例是空转");
-        assert!(fw(1000, 0) < W_MAX, "一千次仍远不足以追平「的」");
-        assert_eq!(
-            effective_weight(W_MAX, fw(1000, 0)),
-            W_MAX,
-            "高频字必须岿然不动——这是有意的取舍，对齐 librime/fcitx5"
-        );
-    }
-
-    /// `count` 封顶：本仓 `count` 是 u32 单调递增，没有 fcitx5 的 pool 容量上限，
-    /// 不 clamp 则线性增长最终越过任何权重。
-    #[test]
-    fn freq_weight_saturates_at_n_sat() {
-        let at_sat = fw(DEFAULT_FREQ_SAT_COUNT, 0);
-        let way_past = fw(u32::MAX, 0);
-        // 先钉住非 0：否则「freq_weight 恒返回 0」也能让下面两条断言通过（0 == 0、0 <= W_MAX）
-        assert!(at_sat > 0, "封顶值必须是真值而非退化的 0");
-        assert_eq!(at_sat, way_past, "超过 N_sat 后不再增长");
-        assert!(at_sat <= W_MAX, "上界即 W_max，got {at_sat}");
-    }
-
-    /// 衰减：久未用的词自然回落，`max` 随之退回词库权重——不需要额外的阈值褪色判据。
-    #[test]
-    fn freq_weight_decays_and_falls_back_to_dict_weight() {
-        let fresh = fw(20, 0);
-        let one_half_life = fw(20, 72); // FreqProfile::default().half_life_hours = 72
-        let ratio = one_half_life as f64 / fresh as f64;
-        assert!((ratio - 0.5).abs() < 0.02, "一个半衰期应≈半衰，got {ratio}");
-
-        let ancient = fw(20, 365 * 24);
-        assert_eq!(
-            effective_weight(W_DEYANGZI, ancient),
-            W_DEYANGZI,
-            "一年前用过 → 衰减殆尽 → 落回词库权重"
-        );
-    }
-
-    /// 边界：无记录 / 基准无效时必须返回 0，不能让 `max` 拿到垃圾值。
-    #[test]
-    fn freq_weight_guards_invalid_inputs() {
-        let p = FreqProfile::default();
-        let r = rec(5, NOW);
-        assert_eq!(
-            freq_weight(&rec(0, NOW), NOW, p, W_MAX, DEFAULT_FREQ_SAT_COUNT),
-            0,
-            "未用过"
-        );
-        assert_eq!(
-            freq_weight(&r, NOW, p, 0, DEFAULT_FREQ_SAT_COUNT),
-            0,
-            "空库/无基准"
-        );
-        assert_eq!(
-            freq_weight(&r, NOW, p, -1, DEFAULT_FREQ_SAT_COUNT),
-            0,
-            "负基准"
-        );
-        assert_eq!(freq_weight(&r, NOW, p, W_MAX, 0), 0, "n_sat=0 不得除零");
-        // 对照：同样的记录在参数有效时必须非 0，否则上面四条「返回 0」全是空转
-        assert!(
-            freq_weight(&r, NOW, p, W_MAX, DEFAULT_FREQ_SAT_COUNT) > 0,
-            "有效输入必须产出非 0，否则守卫测试是空转"
-        );
-    }
-
-    /// 量纲随引擎走：混输把拼音候选 `/= PINYIN_TIER_SCALE`，基准必须同步缩放，
-    /// 否则按纯拼音标定的词频分会碾压混输下的全部拼音候选（其 p99 只有 69）。
-    #[test]
-    fn freq_weight_scales_with_engine_dimension() {
-        let mixed_max = W_MAX / 100; // 混输量纲
-        let pure = fw(5, 0);
-        let mixed = freq_weight(
-            &rec(5, NOW),
-            NOW,
-            FreqProfile::default(),
-            mixed_max,
-            DEFAULT_FREQ_SAT_COUNT,
-        );
-        assert_eq!(mixed, pure / 100, "基准缩放 100 倍，词频分同步缩放");
-        // 若误用纯拼音基准，混输下 p99(69) 的候选会被一次使用碾压
-        assert!(pure > 69 * 10, "反证：跨模式硬编码常数必然越权");
-    }
-
-    /// 用户实测现场：打一个 `d`，用过一次的「的样子」不得夺走首选。
+    /// contested 整句可被同码竞争者靠位置提升反超（`siyuan` 寺院/思源）。
     ///
-    /// **必须设 `is_promoted_completion`**，否则测的是一个不存在的状态：「的样子」在 `d` 下
-    /// 是前缀补全，`cmp_match_layers` 本就会把它降到「的」之下，现场压根不会发生。它能与
-    /// 单字同层竞争，正是因为拼音残码上浮把它提进了完整匹配层。
-    ///
-    /// 旧实现靠布尔 used-first——「用过」跨越权重轴，与权重差多少无关。现在靠量级：
-    /// 用一次值 1307，而「的」是 15,378,475。
+    /// 位置模型下**不需要 `dict_weight`**：整句的 3e7 只决定它的 `base_pos=0`，
+    /// 竞争者提升到同一目标位次后靠「被提升者在前」胜出。
     #[test]
-    fn pinyin_freq_does_not_promote_long_word_on_short_input() {
-        let mut long = pin("的样子", W_DEYANGZI);
-        long.is_prefix = true;
-        long.is_promoted_completion = true;
-        let mut cands = vec![pin("的", W_MAX), pin("得", 31_646), long];
-        let r = recs(&[("的样子", 1, NOW)]);
-        rerank_pinyin_decay(
-            &mut cands,
-            &r,
-            NOW,
-            FreqProfile::default(),
-            W_MAX,
-            DEFAULT_FREQ_SAT_COUNT,
-        );
-        assert_eq!(
-            cands.iter().map(|c| c.text.as_str()).collect::<Vec<_>>(),
-            vec!["的", "得", "的样子"],
-            "用一次的 3 字词(W_eff=23923) 应仍在「得」(31646) 之后、「的」之下"
-        );
-    }
-
-    /// **反向对照**：次数足够时确实能翻越——否则上面的断言可以靠「词频完全失效」满足。
-    ///
-    /// 翻过「得」(31,646) 需 `count > 31646/1307 ≈ 24.2`，故取 25 次。
-    /// 但「的」(15,378,475) 仍不可撼动，这是模型有意的取舍。
-    #[test]
-    fn pinyin_freq_promotes_after_enough_uses() {
-        let mut long = pin("的样子", W_DEYANGZI);
-        long.is_prefix = true;
-        long.is_promoted_completion = true;
-        let mut cands = vec![pin("的", W_MAX), pin("得", 31_646), long];
-        let r = recs(&[("的样子", 25, NOW)]);
-        rerank_pinyin_decay(
-            &mut cands,
-            &r,
-            NOW,
-            FreqProfile::default(),
-            W_MAX,
-            DEFAULT_FREQ_SAT_COUNT,
-        );
-        assert_eq!(
-            cands.iter().map(|c| c.text.as_str()).collect::<Vec<_>>(),
-            vec!["的", "的样子", "得"],
-            "25 次后 W_eff=32675 应越过「得」，但仍压不过「的」"
-        );
-    }
-
-    /// contested 整句必须用 `dict_weight` 下场竞争（步骤 2 的核心）。
-    ///
-    /// 真机 `siyuan`：「寺院」显示 `权 29984561`（= 3e7 + log_offset），词库里只有 491。
-    /// 若拿 3e7 参与比较，「思源」无论选中多少次都翻不过——词频维度对该编码整体失效。
-    #[test]
-    fn contested_sentence_uses_dict_weight_so_peer_can_win() {
+    fn contested_sentence_can_be_overtaken_by_promoted_peer() {
+        let mut c = vec![pin_contested("寺院"), pin("思源", W_SIYUAN_PRODUCT)];
         let r = recs(&[("思源", 1, NOW)]);
-        let mut cands = vec![
-            pin_contested("寺院", W_SIYUAN_TEMPLE),
-            pin("思源", W_SIYUAN_PRODUCT),
-        ];
-        rerank_pinyin_decay(
-            &mut cands,
-            &r,
-            NOW,
-            FreqProfile::default(),
-            W_MAX,
-            DEFAULT_FREQ_SAT_COUNT,
-        );
-        assert_eq!(
-            cands[0].text, "思源",
-            "选过一次的「思源」(W_eff=1307) 应越过「寺院」(dict_weight=491)"
-        );
+        rerank_pinyin_positional(&mut c, &r, NOW, FreqProfile::default());
+        assert_eq!(c[0].text, "思源", "选过一次的同码词应反超 contested 整句");
+        assert_eq!(c[1].text, "寺院", "整句退居第二，不是被赶出列表");
     }
 
     /// **反向对照**：无词频记录时 contested 整句仍居首，不得平白掉位。
-    ///
-    /// 这是现有不变量。此前它靠「引擎喂进来的 3e7 权重序 + 稳定排序」隐式保证；
-    /// 改用 `dict_weight` 后两者已是同量级（491 vs 245），故须由显式的整句 tie-break 兜住。
     #[test]
-    fn contested_sentence_still_leads_without_freq_record() {
-        let r = recs(&[]);
-        let mut cands = vec![
-            pin_contested("寺院", W_SIYUAN_TEMPLE),
-            pin("思源", W_SIYUAN_PRODUCT),
-        ];
-        rerank_pinyin_decay(
-            &mut cands,
-            &r,
-            NOW,
-            FreqProfile::default(),
-            W_MAX,
-            DEFAULT_FREQ_SAT_COUNT,
-        );
-        assert_eq!(cands[0].text, "寺院", "无词频记录时整句解仍是最优解读");
+    fn contested_sentence_still_leads_without_record() {
+        let mut c = vec![pin_contested("寺院"), pin("思源", W_SIYUAN_PRODUCT)];
+        rerank_pinyin_positional(&mut c, &recs(&[]), NOW, FreqProfile::default());
+        assert_eq!(c[0].text, "寺院", "无词频记录时整句解仍是最优解读");
     }
 
-    /// 整句 tie-break 必须在**等效权重并列**时才生效，不能变成新的硬闸门。
+    /// 锚定候选**不参与位置提升**：用再多次也不会把整句挤下去。
     ///
-    /// 构造成竞争者权重更高：若 tie-break 被误写在权重之前，整句会无条件居首，
-    /// 那等于把刚拆掉的锚定硬闸门又装了回去。
+    /// 与 contested 的区别正在于此——后者被摘掉锚定才下场竞争。
     #[test]
-    fn sentence_tiebreak_does_not_override_weight() {
-        let r = recs(&[]);
-        let mut cands = vec![
-            pin_contested("寺院", W_SIYUAN_TEMPLE),
-            pin("思源", W_SIYUAN_TEMPLE * 2),
+    fn anchored_sentence_is_immune_to_promotion() {
+        let mut c = vec![pin_sentence("整句解", 30_000_000), pin("普通词", 5000)];
+        let r = recs(&[("普通词", 50, NOW)]);
+        rerank_pinyin_positional(&mut c, &r, NOW, FreqProfile::default());
+        assert_eq!(c[0].text, "整句解", "锚定整句不受位置提升影响");
+    }
+
+    /// 衰减：久未用则有效次数归零，位次回落原处。
+    #[test]
+    fn promotion_decays_with_time() {
+        let long_ago = NOW - 365 * 24 * 3600;
+        let mut c = vec![pin("的", W_DE), pin("得", W_DEI), pin("地", W_DI)];
+        let r = recs(&[("得", 1, long_ago)]);
+        rerank_pinyin_positional(&mut c, &r, NOW, FreqProfile::default());
+        assert_eq!(c[0].text, "的", "一年前用过一次 → 衰减殆尽 → 不再提升");
+
+        // 对照：同样的记录、刚用过则生效——否则上面可能只是「提升从未工作」
+        let mut fresh = vec![pin("的", W_DE), pin("得", W_DEI), pin("地", W_DI)];
+        let r2 = recs(&[("得", 1, NOW)]);
+        rerank_pinyin_positional(&mut fresh, &r2, NOW, FreqProfile::default());
+        assert_eq!(fresh[0].text, "得", "刚用过必须生效");
+    }
+
+    /// 位置提升**不得跨匹配层级**：前缀补全再常用也压不过精确候选。
+    ///
+    /// ⚠️ 必须同时钉住「层内提升确实生效」——只断言「补全没上来」的话，
+    /// 「提升机制整个失效」也能让它通过。反向验证（令 `promotion_steps` 恒 0）
+    /// 当场抓到过这一点：其余 8 条全红，唯独本条还绿着。
+    #[test]
+    fn promotion_does_not_cross_match_layers() {
+        let completion = |t: &str, w: i32| {
+            let mut c = pin(t, w);
+            c.is_prefix = true;
+            c
+        };
+        // 入参顺序即显示序：精确「四」在前，两条补全按权重降序
+        let mut c = vec![
+            pin("四", 100),
+            completion("思考", 900_000),
+            completion("思路", 800_000),
         ];
-        rerank_pinyin_decay(
-            &mut cands,
-            &r,
-            NOW,
-            FreqProfile::default(),
-            W_MAX,
-            DEFAULT_FREQ_SAT_COUNT,
-        );
+        let r = recs(&[("思路", 50, NOW)]);
+        rerank_pinyin_positional(&mut c, &r, NOW, FreqProfile::default());
+        assert_eq!(c[0].text, "四", "补全用 50 次也不得跨层压过精确候选");
         assert_eq!(
-            cands[0].text, "思源",
-            "权重更高的竞争者应居首——整句身份只在并列时才作 tie-break"
+            c[1].text, "思路",
+            "但层内提升必须生效——否则本用例测的是「提升从未工作」"
         );
     }
 }

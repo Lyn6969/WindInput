@@ -183,31 +183,6 @@ pub struct Candidate {
     /// 引擎内部用，不推送 UI。
     #[serde(skip)]
     pub is_sentence_contested: bool,
-    /// 整句身份加成**之前**的词典权重。`None` = 本候选的 `weight` 未被整句加成覆盖过。
-    ///
-    /// 拼音 step2 的同文合并（`pinyin/mod.rs`）会把词典词的权重抬成整句量级：
-    /// `existing.weight = existing.weight.max(SENTENCE_WEIGHT_BASE + log_offset)`。
-    /// 现场实测 `siyuan` 的「寺院」——词库里 491，候选里显示 `权 29984561`，原值**无从取回**。
-    ///
-    /// 而 `SENTENCE_WEIGHT_BASE`(3e7) **不是权重，是「我要排第一」的编码**，与词库权重不可比。
-    /// 一旦 `is_sentence_contested` 摘掉锚定、让整句下场与同码词按量级竞争（寺院 vs 思源），
-    /// 就必须有一个**可比的**权重顶上，否则 3e7 会碾压一切、词频维度对该编码整体失效。
-    /// 本字段即为此留存。
-    ///
-    /// **不能改成「同文合并时不抬 weight、只设 `is_sentence`」**：整句的高 weight 还承担
-    /// 引擎内截断前的排序——留在 491 会让整句在 `max_candidates` 截断时被直接丢弃，
-    /// 锚定层根本轮不到。
-    ///
-    /// **合成整句也会被置 contested**——该判据只要求「是整句且有同码竞争者」，不要求它自己
-    /// 是词典词。故拼音 step 6.6 在置位时会给尚无此值的候选填**同码最强竞争者的权重**，
-    /// 保证任何 contested 候选都有可比量级可用。
-    ///
-    /// 消费方仍写 `unwrap_or(weight)` 作防御，但那条路径一旦被走到就意味着漏填：
-    /// 拿到的是 3e7，竞争者永远翻不过，且**没有任何报错**。
-    ///
-    /// 引擎内部用，不推送 UI。
-    #[serde(skip)]
-    pub dict_weight: Option<i32>,
     /// 前缀补全**已被提升进完整匹配层**（排序决策，与 `is_prefix` 表达的「码更长」结构事实正交）。
     ///
     /// `is_prefix=true` 表达的是结构事实——候选码严格长于输入（补全词）；而「该不该沉到
@@ -292,7 +267,6 @@ impl Default for Candidate {
             is_sentence: false,
             is_sentence_demoted: false,
             is_sentence_contested: false,
-            dict_weight: None,
             is_promoted_completion: false,
             consumed_length: 0,
             boundary: 0,

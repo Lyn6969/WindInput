@@ -47,9 +47,9 @@ impl Default for FreqProfile {
 impl FreqProfile {
     /// 半衰期衰减因子，落在 `(0, 1]`：刚用过 ≈ 1，久未用 → 0。
     ///
-    /// 从 [`Self::pinyin_score`] 中拆出，供**等效权重模型**单独取用
-    /// （`docs/design/freq-weight-model.md` §5.1）——后者的次数项是**线性**的
-    /// （对齐 fcitx5 的 `pr ∝ uf1`），不能复用 `pinyin_score` 的 `log2` 形状，
+    /// 从 [`Self::pinyin_score`] 中拆出，供拼音的**位置提升**模型单独取用
+    /// （`docs/design/freq-rerank-model.md`）——那边把衰减乘在**使用次数**上
+    /// （「久未用 ⇒ 当初那些使用逐渐不算数」），与 `pinyin_score` 的 `log2` 打分形状无关，
     /// 但衰减这一维两者共用，故抽出以免公式落成两份。
     pub fn decay_factor(&self, rec: &FreqRecord, now: i64) -> f64 {
         let age_hours = (now - rec.last_used).max(0) as f64 / 3600.0;

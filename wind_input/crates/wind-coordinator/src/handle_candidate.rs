@@ -266,20 +266,19 @@ impl Coordinator {
         }
         // 词频重排归属 engine 排序层（frequency.md §5/§7）：本协调器只负责取词频记录、按引擎
         // 类型分流到纯函数。码表/混输永久 used-first（§3），纯拼音走等效权重
-        // （docs/design/freq-weight-model.md）。
+        // （docs/design/freq-rerank-model.md）。
         if self.engine_mgr.is_pinyin() {
             let profile = self.engine_mgr.pinyin_freq_profile();
-            // 量纲基准取自**当前引擎**：混输已按 PINYIN_TIER_SCALE 降档，跨模式的硬编码
-            // 常数必错。取不到（引擎未加载/空库）时传 0 —— `freq_weight` 据此返回 0，
-            // 等效权重退化为词库权重序，即「词频不生效」而非乱序。
-            let w_max = self.engine_mgr.loaded_max_dict_weight(&active).unwrap_or(0);
-            wind_engine::freq_rerank::rerank_pinyin_decay(
+            // 位置提升模型（docs/design/freq-rerank-model.md）：候选按**位次**前移，
+            // 不比权重，故无需引擎的量纲基准——位次天然与词库分布、混输降档都无关。
+            //
+            // ⚠️ 依赖入参已按 `candidate_display_order` 排好（base_pos 取的就是入参下标）。
+            // 本调用位于 display_order → filter 之后、shadow 之前，是最后一道整体排序。
+            wind_engine::freq_rerank::rerank_pinyin_positional(
                 candidates,
                 &recs,
                 now_unix_secs(),
                 profile,
-                w_max,
-                wind_engine::freq_rerank::DEFAULT_FREQ_SAT_COUNT,
             );
         } else {
             wind_engine::freq_rerank::rerank_codetable_usedfirst(

@@ -848,23 +848,6 @@ impl WdatReader {
         self.leaf_count
     }
 
-    /// 全库最大 weight（无条目返回 `None`）。
-    ///
-    /// **直接读 v6 MaxW 段的根节点**——该段本是前缀 Top-K 的剪枝上界（状态 i 的子树最大
-    /// weight），根状态 0 的子树即整个词库，故为 O(1)，无需遍历。
-    ///
-    /// 用途：词频等效权重的量纲基准（`docs/design/freq-weight-model.md` §5.1）。词频分
-    /// 必须相对当前引擎的 weight 量纲标定——混输把拼音候选整体 `/= PINYIN_TIER_SCALE`，
-    /// 同一个词两种模式下差 100 倍，任何跨模式的硬编码常数都会错。
-    pub fn max_weight(&self) -> Option<i32> {
-        let v = &self.main;
-        if v.dat_size == 0 {
-            return None;
-        }
-        let w = self.maxw(v, 0);
-        (w != NO_MAXW).then_some(w)
-    }
-
     #[inline]
     fn base(&self, v: &DatView, i: i32) -> i32 {
         let o = v.dat_off + (i as usize) * 4;
@@ -1486,28 +1469,6 @@ mod tests {
             "严格小于对拍",
         );
         let _ = std::fs::remove_file(&p);
-    }
-
-    /// `max_weight()` 取的是 MaxW 段根节点，须等于全库暴力最大值。
-    ///
-    /// 它是词频等效权重的量纲基准（`freq-weight-model.md` §5.1），取错会让整个词频模型
-    /// 偏移一个数量级——而这类偏移在单测里表现为「候选顺序没变」，极难归因。
-    #[test]
-    fn max_weight_equals_global_brute_force_max() {
-        let p = build(
-            "wdat_max_weight.wdat",
-            &[
-                ("ab", &[("甲", 100)][..]),
-                ("abc", &[("乙", 700)][..]),
-                ("z", &[("戊", 900)][..]),
-            ],
-        );
-        let r = WdatReader::open(&p).unwrap();
-        assert_eq!(r.max_weight(), Some(900), "根节点 maxw = 全库最大 weight");
-
-        // 空库返回 None，调用方据此关闭词频等效权重（而非拿 0 去做除数或基准）
-        let empty = build("wdat_max_weight_empty.wdat", &[]);
-        assert_eq!(WdatReader::open(&empty).unwrap().max_weight(), None);
     }
 
     /// `maxw` 必须是**真实上界**：偏大只是剪枝变弱（结果仍正确），偏小则静默漏候选。

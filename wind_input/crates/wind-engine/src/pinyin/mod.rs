@@ -248,9 +248,6 @@ pub struct PinyinEngine {
     store_layers: Option<Arc<DictManager>>,
     /// 造词反推用的单字读音索引（懒构建：首次 generate_word_pinyin 时从词典派生）。
     char_pinyin_idx: OnceLock<CharPinyinIndex>,
-    /// 全库最大 weight，词频等效权重的量纲基准（懒取：内存模式是 O(码数)）。
-    /// `Some(None)` = 已求值且词库为空。见 [`Self::max_dict_weight`]。
-    max_dict_weight_cache: OnceLock<Option<i32>>,
     /// 双拼转换器（None 表示全拼模式，输入原样传递）。
     shuangpin: Option<ShuangpinConverter>,
 }
@@ -275,26 +272,8 @@ impl PinyinEngine {
             unigram,
             store_layers: None,
             char_pinyin_idx: OnceLock::new(),
-            max_dict_weight_cache: OnceLock::new(),
             shuangpin: None,
         }
-    }
-
-    /// 全库最大 weight——词频等效权重的**量纲基准**（`docs/design/freq-weight-model.md` §5）。
-    ///
-    /// 词频分不能用跨模式的硬编码常数：混输把拼音候选整体 `/= PINYIN_TIER_SCALE`，同一个词
-    /// 两种模式差 100 倍（`的` 15,378,475 vs 153,784，p50 甚至被整数除法归零），而混输在
-    /// 「码不全走双路线」与「超码长走拼音」之间的切换发生在**同一次输入过程中**，配置项
-    /// 跟不上。故基准必须由持有词库的引擎按自身量纲给出。
-    ///
-    /// 只反映**主词典**：用户词/临时词层另有自己的量纲（`ADD_WORD_WEIGHT = 1200`）与提升
-    /// 通道（step 6 的 `promotion_cap`），不并入基准。
-    ///
-    /// 懒求值 + 缓存：mmap 模式 O(1)，内存模式 O(码数)。
-    pub fn max_dict_weight(&self) -> Option<i32> {
-        *self
-            .max_dict_weight_cache
-            .get_or_init(|| self.dict.max_weight().filter(|w| *w > 0))
     }
 
     /// 注入用户/临时造词层（L 造词显现）。链式 builder：构造后由 EngineManager 按 schema 挂上。
@@ -810,11 +789,6 @@ fn build_raw_preedit(raw_input: &str, sp: &shuangpin::SpConvertResult) -> String
 }
 
 impl Engine for PinyinEngine {
-    /// 转发到同名 inherent 方法（带 `OnceLock` 缓存）。纯拼音量纲即词库原始量纲。
-    fn max_dict_weight(&self) -> Option<i32> {
-        PinyinEngine::max_dict_weight(self)
-    }
-
     fn convert(&self, input: &str, max_candidates: usize) -> anyhow::Result<ConvertResult> {
         if input.is_empty() {
             return Ok(ConvertResult::default());
@@ -1106,13 +1080,6 @@ impl Engine for PinyinEngine {
                         // 同时抹去 is_partial（step1 标了 true，但整句是完整解读并非子短语），
                         // 否则残码场景下 is_partial=true 会在排序时被 is_partial=false 的前缀补全
                         // （如「你好吗」）压下去——后者经 trailing_partial 优化也是 false。
-                        // 留存加成前的词典权重：3e7 是「排第一」的编码而非可比量级，
-                        // contested 摘掉锚定后要靠这个值下场与同码词按量级竞争
-                        // （寺院 491 vs 思源 245）。见 [[Candidate::dict_weight]]。
-                        // 只在真被抬高时记录，且不覆盖已有值——同一候选可能多次进入本分支。
-                        if weight > existing.weight {
-                            existing.dict_weight.get_or_insert(existing.weight);
-                        }
                         existing.weight = existing.weight.max(weight);
                         existing.is_partial = false;
                         // 同文合并后它就是整句解本身，须继承整句身份，
@@ -1791,7 +1758,7 @@ impl Engine for PinyinEngine {
         // 上面的 6.5 处理的是「整句该不该让位」（合成解/模糊解 vs 精确整词），本节处理的是
         // 另一件事：整句解**自己就是**一个词典精确整词，而同码还有别的精确整词。
         // `siyuan` 的「寺院」即如此——它经 step 2 的同文合并分支继承了整句身份，而
-        // `freq_rerank` 的顶部锚定是硬闸门（衰减分连算都不算），于是同码的「思源」
+        // `freq_rerank` 的顶部锚定是硬闸门（锚定者不参与位置提升），于是同码的「思源」
         // 无论选中多少次都翻不过它。`gonghe` 共和/恭贺、`nihao` 你好/拟好同构。
         //
         // **判据与 6.5 的 `exact_max` 过滤器逐条一致**（同码、非模糊、不在补全/子短语层），
@@ -1801,6 +1768,9 @@ impl Engine for PinyinEngine {
         // 不动 weight 是有意的：无词频记录时整句仍须凭 `SENTENCE_WEIGHT_BASE` 量纲居首
         // （它确实是引擎对整串的最优解读），本标记只让它在**有用户实际选择数据时**接受
         // 挑战。已降级的整句跳过——它已经让过位了，weight 也已被压低。
+        //
+        // 位置提升模型下这一条尤其自然：3e7 只决定它的 `base_pos = 0`，摘掉锚定后同码
+        // 竞争者靠位次提升到 0 并以「被提升者在前」胜出，无需把 weight 换算成可比量级。
         //
         // 无竞争者的整句（`woshizhongguoren` 这类纯合成解、step 1.5 的超长词典整词）
         // 不置位、维持锚定：那里没有「用户明确选过另一个同码词」这个事实可依据。
@@ -1819,36 +1789,8 @@ impl Engine for PinyinEngine {
             .map(|c| c.text.clone())
             .collect();
         for text in contested {
-            // 同码最强竞争者的权重——供**合成整句**当可比量级用（判据与上面 `contested`
-            // 的过滤器逐条一致）。先算完再取可变借用。
-            let peer_max = candidates
-                .iter()
-                .filter(|o| {
-                    o.text != text
-                        && !o.is_fuzzy
-                        && !o.is_prefix
-                        && !o.is_partial
-                        && o.code == completed
-                })
-                .map(|o| o.weight)
-                .max();
             if let Some(c) = candidates.iter_mut().find(|c| c.text == text) {
                 c.is_sentence_contested = true;
-                // contested 会摘掉词频锚定、下场按量级竞争，而它的 weight 是
-                // `SENTENCE_WEIGHT_BASE` 量纲（「排第一」的编码，不可比）。经 step 2 同文
-                // 合并的整句已在那里留了 `dict_weight`（词库原值），但**合成整句没有**
-                // ——本判据只要求「是整句且有同码竞争者」，不要求它自己是词典词，
-                // `woshizhongguoren` 那类纯合成解同样会走到这里。
-                //
-                // 漏填的后果是静默的：比较器 `unwrap_or(weight)` 会拿到 3e7，竞争者
-                // 无论被选中多少次都翻不过，词频维度对该编码整体失效——正是本次改造
-                // 要修的那个 bug 换个入口重现。故用同码最强竞争者的量级顶上：语义即
-                // 「与最强竞争者平级」，无词频时靠整句 tie-break 居首，有词频时可被反超。
-                if c.dict_weight.is_none()
-                    && let Some(pm) = peer_max
-                {
-                    c.dict_weight = Some(pm);
-                }
             }
         }
 

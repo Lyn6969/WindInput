@@ -1388,18 +1388,6 @@ impl EngineManager {
     /// 与 [`schema_engine_type`](Self::schema_engine_type) 的区别是后者每次都
     /// **读文件 + 解析 TOML**，不可放进逐键路径；本函数只查已加载引擎表。
     /// 供 overlay 类模式（临拼等）按目标方案类型分流取数策略。
-    /// 已加载引擎的词频量纲基准（`Engine::max_dict_weight`）。未加载/不参与该模型返回 `None`。
-    ///
-    /// 只查已加载的引擎、**不触发加载**：与 [`Self::loaded_engine_type`] 同样的理由——
-    /// 排序热路径上不该因为取个基准而去读盘解析 TOML。
-    pub fn loaded_max_dict_weight(&self, schema_id: &str) -> Option<i32> {
-        self.engines
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .get(schema_id)
-            .and_then(|e| e.max_dict_weight())
-    }
-
     pub fn loaded_engine_type(&self, schema_id: &str) -> Option<EngineType> {
         self.engines
             .lock()

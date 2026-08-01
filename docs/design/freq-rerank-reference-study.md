@@ -6,7 +6,7 @@
 > **调研对象**：`ref/weasel`（librime）、`ref/Yzime`、`ref/fcitx5-android`。
 >
 > **fcitx5 已补齐**：submodule 初始化后，libime 的 `HistoryBigram` / `UserLanguageModel`
-> 分析见 [freq-weight-model.md](freq-weight-model.md) 第 3 节——它给出了第三条路线
+> 分析见 [freq-rerank-model.md](freq-rerank-model.md) 第 3 节——它给出了第三条路线
 > （插值混合 + `max` 下界 + 分级 LRU 老化），并成为本仓改造方案的依据。
 > 本文以下内容仅基于 librime 与 Yzime，横向对比表未含 fcitx5。
 
