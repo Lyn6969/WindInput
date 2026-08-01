@@ -5799,12 +5799,13 @@ impl MessageHandler for Coordinator {
         // coords_ready 逃生口与嵌入模式定位锚点的来源。此前只打 x/y/h，查候选窗定位问题时
         // 必须去翻 TSF 日志对时间戳才能补上这一维。
         tracing::debug!(
-            "handle_caret_update: x={} y={} h={} compStart=({},{})",
+            "handle_caret_update: x={} y={} h={} compStart=({},{}) src={}",
             data.x,
             data.y,
             data.height,
             data.composition_start_x,
-            data.composition_start_y
+            data.composition_start_y,
+            wind_ipc::protocol::caret_source::name(data.source)
         );
         // height==0：宿主尚未 reflow，GetTextExt 返回退化矩形，坐标不可靠 → 跳过（不更新缓存、
         // 不触发显示），等 OnLayoutChange 后的有效坐标（对齐 Go HandleCaretUpdate）。
@@ -5866,7 +5867,23 @@ impl MessageHandler for Coordinator {
             if !cs.2 && (data.composition_start_x != 0 || data.composition_start_y != 0) {
                 let dx = (data.composition_start_x - data.x).abs();
                 let dy = (data.composition_start_y - data.y).abs();
-                if dx < 500 && dy < 500 {
+                // ⚠ 500px 校验的前提是**两者同源**——它想抓的是「同一个 context 报出的两个坐标
+                // 却相差离谱」这种坐标系不一致。当 caret 本身来自 GUI 回退等非 TSF 通道时，
+                // 它和组合起点压根不是一个语义域，比较毫无意义。桌面输入实测：caret=(0,1388)
+                // 是任务栏残留的 Win32 光标、compStart=(473,217) 才是真实组合位置，dy=1171
+                // 让这道闸门把**唯一正确的数据**当异常丢弃了。
+                // 故非 TSF 源直接采信组合起点——此时它比 caret 可信得多。
+                if !wind_ipc::protocol::caret_source::is_tsf(data.source)
+                    && data.source != wind_ipc::protocol::caret_source::UNKNOWN
+                {
+                    *cs = (data.composition_start_x, data.composition_start_y, true);
+                    debug!(
+                        "组合起点锁定: ({},{})（跳过距离校验：caret 源={} 非 TSF，与组合起点不同源）",
+                        data.composition_start_x,
+                        data.composition_start_y,
+                        wind_ipc::protocol::caret_source::name(data.source)
+                    );
+                } else if dx < 500 && dy < 500 {
                     *cs = (data.composition_start_x, data.composition_start_y, true);
                     debug!(
                         "组合起点锁定: ({},{})（本组合内不再更新；coords_ready 逃生口据此成立）",
@@ -5874,8 +5891,10 @@ impl MessageHandler for Coordinator {
                     );
                 } else {
                     debug!(
-                        "组合起点丢弃: ({},{}) 距 caret dx={dx} dy={dy} ≥500px（疑 logical/physical 坐标系不一致）",
-                        data.composition_start_x, data.composition_start_y
+                        "组合起点丢弃: ({},{}) 距 caret dx={dx} dy={dy} ≥500px（疑 logical/physical 坐标系不一致，caret 源={}）",
+                        data.composition_start_x,
+                        data.composition_start_y,
+                        wind_ipc::protocol::caret_source::name(data.source)
                     );
                 }
             }
@@ -6636,7 +6655,53 @@ mod caret_compat_tests {
             height,
             composition_start_x: 100,
             composition_start_y: y,
+            source: wind_ipc::protocol::caret_source::TSF_SELECTION,
         }
+    }
+
+    /// 组合起点锚定的 500px 校验必须**只在 caret 与组合起点同源时**生效。
+    fn far_comp_start(source: i32) -> CaretData {
+        // 桌面输入实测形态：caret (0,1388) 是 GUI 回退取到的任务栏残留光标，
+        // compStart (473,217) 才是真实组合位置，两者 dy=1171 ≥500px。
+        CaretData {
+            x: 0,
+            y: 1388,
+            height: 20,
+            composition_start_x: 473,
+            composition_start_y: 217,
+            source,
+        }
+    }
+
+    fn lock_comp_start_with(source: i32) -> bool {
+        let c = coord();
+        {
+            let mut st = c.state.lock().unwrap();
+            st.input_buffer = "ab".to_string(); // 置为组合中，否则 caret_update 只落缓存
+        }
+        c.handle_caret_update(&far_comp_start(source));
+        c.composition_start.lock().unwrap().2
+    }
+
+    #[test]
+    fn non_tsf_caret_skips_composition_start_distance_check() {
+        // caret 来自 GUI 回退时，它与组合起点根本不是一个语义域，距离比较无意义。
+        // 旧行为在此把**唯一正确**的组合起点当异常丢弃了（桌面输入定位到任务栏的直接原因）。
+        assert!(
+            lock_comp_start_with(wind_ipc::protocol::caret_source::GUI_CARET),
+            "caret 为 GUI 回退源时应跳过距离校验、直接锁定组合起点"
+        );
+    }
+
+    #[test]
+    fn tsf_caret_still_rejects_far_composition_start() {
+        // 反向对照：同样的距离，caret 若来自 TSF 域则 500px 保护仍须生效——同源却相差离谱，
+        // 那才是它本来要抓的坐标系不一致。**缺了这条，上面那个测试无法区分「按来源放行」
+        // 与「干脆不再校验」**，把保护删光也能让它变绿。
+        assert!(
+            !lock_comp_start_with(wind_ipc::protocol::caret_source::TSF_SELECTION),
+            "TSF 同源时超 500px 仍应判为坐标系不一致而丢弃"
+        );
     }
 
     #[test]
@@ -6703,6 +6768,7 @@ mod caret_compat_tests {
             height,
             composition_start_x: x,
             composition_start_y: y,
+            source: wind_ipc::protocol::caret_source::TSF_SELECTION,
         }
     }
 
@@ -6811,6 +6877,7 @@ mod caret_compat_tests {
             height: 25,
             composition_start_x: 115,
             composition_start_y: 200,
+            source: wind_ipc::protocol::caret_source::TSF_SELECTION,
         });
         assert_eq!(
             c.last_valid_caret.lock().unwrap().0,
@@ -6840,6 +6907,7 @@ mod caret_compat_tests {
             height: 25,
             composition_start_x: 726,
             composition_start_y: 250,
+            source: wind_ipc::protocol::caret_source::TSF_SELECTION,
         });
         assert_eq!(
             c.last_valid_caret.lock().unwrap().0,
@@ -6868,6 +6936,7 @@ mod caret_compat_tests {
             height: 25,
             composition_start_x: 115,
             composition_start_y: 200,
+            source: wind_ipc::protocol::caret_source::TSF_SELECTION,
         });
         assert_eq!(
             c.last_valid_caret.lock().unwrap().0,

@@ -192,6 +192,11 @@ pub struct CaretData {
     pub height: i32,
     pub composition_start_x: i32,
     pub composition_start_y: i32,
+    /// 坐标来源（`wind_ipc::protocol::caret_source::*`）。
+    ///
+    /// **不同来源不是同一件东西**：TSF 域的坐标出自当前 context，GUI 域的是跨窗口的 Win32 光标。
+    /// 旧 DLL 与 macOS 短包给不出该值，落 `UNKNOWN`，此时按既有行为处理即可。
+    pub source: i32,
 }
 
 /// MessageHandler trait：协调器实现此接口处理各种事件

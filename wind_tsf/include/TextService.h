@@ -208,7 +208,9 @@ public:
     WCHAR ConsumeCachedPrevChar() { WCHAR c = _cachedPrevChar; _cachedPrevChar = 0; return c; }
 
     // Get and send caret position to Go Service
-    BOOL GetCaretPosition(LONG* px, LONG* py, LONG* pHeight);
+    // pSource: 非空时输出命中的是回退链的哪一级（CARET_SRC_*）。**这条链的每一级语义都不同**，
+    //          TSF 坐标与 GUI 光标分属两个域，混为一谈正是候选窗错位的历史根因。
+    BOOL GetCaretPosition(LONG* px, LONG* py, LONG* pHeight, int* pSource = nullptr);
     void SendCaretPositionUpdate();
 
     // 非按键上下文（WM_TIMER 等）专用：用异步 edit session 取坐标，结果经
@@ -216,10 +218,13 @@ public:
     // （TS_E_SYNCHRONOUS），详见 CCaretEditSession::RequestCaretRectAsync。
     BOOL RequestCaretPositionUpdateAsync();
     // 异步 edit session 的结果回调（由 CCaretEditSession 调用）
-    void OnAsyncCaretRectReady(const RECT& caretRect, BOOL hasCompStart, const RECT& compStartRect);
+    // usedCompStartAsCaret: caret 是否由组合起点降级顶替，用于标注上报坐标的来源
+    void OnAsyncCaretRectReady(const RECT& caretRect, BOOL hasCompStart, const RECT& compStartRect,
+                               BOOL usedCompStartAsCaret);
 
     // Get caret position using TSF APIs (more accurate for browsers)
-    BOOL GetCaretPositionFromTSF(LONG* px, LONG* py, LONG* pHeight);
+    // pUsedCompStart: 非空时输出「caret 是否由组合起点降级顶替」，用于区分两种 TSF 来源
+    BOOL GetCaretPositionFromTSF(LONG* px, LONG* py, LONG* pHeight, BOOL* pUsedCompStart = nullptr);
     BOOL GetCompositionStartPosition(LONG* px, LONG* py);
 
     // Input mode control
@@ -314,7 +319,7 @@ public:
 
 private:
     // 坐标出口：DPI 归一 + 更新 last known + 发 IPC。同步/异步两条取坐标路径共用。
-    void _EmitCaretUpdate(LONG x, LONG y, LONG height, LONG compStartX, LONG compStartY);
+    void _EmitCaretUpdate(LONG x, LONG y, LONG height, LONG compStartX, LONG compStartY, int source);
 
     LONG _refCount;
     ITfThreadMgr* _pThreadMgr;

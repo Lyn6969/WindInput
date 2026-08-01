@@ -9,6 +9,7 @@ CCaretEditSession::CCaretEditSession(ITfContext* pContext)
     , _compStartOffset(0)
     , _hasCompositionStart(FALSE)
     , _succeeded(FALSE)
+    , _usedCompStartAsCaret(FALSE)
     , _pAsyncOwner(nullptr)
 {
     if (_pContext)
@@ -174,6 +175,7 @@ STDAPI CCaretEditSession::DoEditSession(TfEditCookie ec)
                                _compositionStartRect.right, _compositionStartRect.bottom);
             _caretRect = _compositionStartRect;
             _succeeded = TRUE;
+            _usedCompStartAsCaret = TRUE;
 
             // 顺带探测本 context 自己的显示区域。GetScreenExt 是 TSF 语义内的参照系，不依赖
             // 窗口层级与前台状态；若实测可靠，将来可取代「所有显示器」做越界校验——「前台窗口」
@@ -216,7 +218,8 @@ STDAPI CCaretEditSession::DoEditSession(TfEditCookie ec)
     {
         if (_succeeded)
         {
-            _pAsyncOwner->OnAsyncCaretRectReady(_caretRect, _hasCompositionStart, _compositionStartRect);
+            _pAsyncOwner->OnAsyncCaretRectReady(_caretRect, _hasCompositionStart, _compositionStartRect,
+                                                _usedCompStartAsCaret);
         }
         else
         {
@@ -261,8 +264,13 @@ BOOL CCaretEditSession::GetCompositionStartResult(RECT* prc)
 BOOL CCaretEditSession::GetCaretAndCompositionStartRect(ITfContext* pContext, TfClientId tfClientId,
                                                          ITfComposition* pComposition,
                                                          RECT* pCaretRect, RECT* pCompStartRect, BOOL* pHasCompStart,
-                                                         LONG compStartOffset)
+                                                         LONG compStartOffset,
+                                                         BOOL* pUsedCompStartAsCaret)
 {
+    if (pUsedCompStartAsCaret)
+    {
+        *pUsedCompStartAsCaret = FALSE;
+    }
     if (pContext == nullptr || pCaretRect == nullptr)
     {
         return FALSE;
@@ -292,6 +300,10 @@ BOOL CCaretEditSession::GetCaretAndCompositionStartRect(ITfContext* pContext, Tf
         if (pCompStartRect && pHasCompStart)
         {
             *pHasCompStart = pEditSession->GetCompositionStartResult(pCompStartRect);
+        }
+        if (pUsedCompStartAsCaret)
+        {
+            *pUsedCompStartAsCaret = pEditSession->UsedCompStartAsCaret();
         }
     }
     else

@@ -23,10 +23,12 @@ public:
     // Execute the session and get both caret position and composition start position
     // 组合进行中 selection 的 GetTextExt 退化时，会降级用组合起点当 caret（见 DoEditSession）
     // compStartOffset: 组合起点偏移（wchar 数），见 SetCompositionStartOffset
+    // pUsedCompStartAsCaret: 非空时输出「本次是否走了降级」，供调用方标注坐标来源（CARET_SRC_*）
     static BOOL GetCaretAndCompositionStartRect(ITfContext* pContext, TfClientId tfClientId,
                                                  ITfComposition* pComposition,
                                                  RECT* pCaretRect, RECT* pCompStartRect, BOOL* pHasCompStart,
-                                                 LONG compStartOffset = 0);
+                                                 LONG compStartOffset = 0,
+                                                 BOOL* pUsedCompStartAsCaret = nullptr);
 
     // 异步取坐标：用 TF_ES_ASYNCDONTCARE 请求锁，结果经 pOwner->OnAsyncCaretRectReady 回调返回。
     //
@@ -50,6 +52,8 @@ public:
     // 应指向余码段起点（候选窗锚点跟随余码，而非已顶出的文字）。
     void SetCompositionStartOffset(LONG offset) { _compStartOffset = offset; }
     BOOL GetCompositionStartResult(RECT* prc);
+    // 本次是否走了「用组合起点顶替 caret」的降级
+    BOOL UsedCompStartAsCaret() const { return _usedCompStartAsCaret; }
     // 设为异步模式并持有 owner 强引用；见 RequestCaretRectAsync
     void SetAsyncOwner(CTextService* pOwner);
 
@@ -62,6 +66,9 @@ private:
     RECT _compositionStartRect;
     BOOL _hasCompositionStart;
     BOOL _succeeded;
+    // 本次是否走了「caret 无效 → 用组合起点顶替」的降级路径。用于给上报坐标标注来源：
+    // 降级值仍属 TSF 语义域（CARET_SRC_TSF_COMPOSITION），与 GUI 回退有本质区别。
+    BOOL _usedCompStartAsCaret;
     // 非空 = 异步模式：DoEditSession 完成后直接回调它，因为异步执行时静态入口早已返回、
     // 调用方拿不到结果。持有强引用（AddRef/Release），避免回调到达前 owner 被销毁。
     CTextService* _pAsyncOwner;

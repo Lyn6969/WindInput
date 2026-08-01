@@ -499,6 +499,9 @@ pub(crate) fn dispatch_command(
                     height: fg.caret.height,
                     composition_start_x: fg.caret.composition_start_x,
                     composition_start_y: fg.caret.composition_start_y,
+                    // 焦点载荷刻意不带 source：它内嵌 CaretPayload，加字段会改变整包布局；
+                    // 而这一帧本就只落缓存、不参与显示决策，来源信息没有消费者。
+                    source: wind_ipc::protocol::caret_source::UNKNOWN,
                 });
             }
             // 新 DLL 同步发送（is_async=false）：回传权威模式解除其阻塞并消除首键竞态。
@@ -707,6 +710,8 @@ pub(crate) fn dispatch_command(
                     height: caret.height,
                     composition_start_x: caret.composition_start_x,
                     composition_start_y: caret.composition_start_y,
+                    // v2 载荷（24 字节）才有；旧 DLL 20 字节、macOS 12 字节均落 UNKNOWN
+                    source: wind_ipc::protocol::CaretPayload::source_from_bytes(payload),
                 });
             }
             // macOS IMKit sendCaretUpdateIfAvailable 同步 send+readFrame（注释「服务端一律返
@@ -745,6 +750,7 @@ pub(crate) fn dispatch_command(
                     height: p.height,
                     composition_start_x: p.composition_start_x,
                     composition_start_y: p.composition_start_y,
+                    source: wind_ipc::protocol::CaretPayload::source_from_bytes(payload),
                 });
             } else {
                 warn!(

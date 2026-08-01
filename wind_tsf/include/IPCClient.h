@@ -143,7 +143,10 @@ public:
     BOOL SendCommitRequest(const uint8_t* payload, uint32_t payloadSize);
 
     // Send caret position update to Go Service
-    BOOL SendCaretUpdate(int x, int y, int height, int compositionStartX = 0, int compositionStartY = 0);
+    // source: CARET_SRC_*，标明这组坐标来自哪个通道。消费端据此决定能否当权威坐标、
+    //         能否与组合起点做距离比较（GUI 回退值与组合起点本就不同源，比较无意义）。
+    BOOL SendCaretUpdate(int x, int y, int height, int compositionStartX = 0, int compositionStartY = 0,
+                         int source = CARET_SRC_UNKNOWN);
 
     // Send caret-pending handshake: composition just started, real caret coming after app reflow.
     // Tells Go to extend its first-show fallback timeout so it doesn't fall back to pre-key cursor.
@@ -152,7 +155,8 @@ public:
     // Send a first-show caret probe: one pre-reflow sample taken inside an OnLayoutChange
     // burst iteration. Fire-and-forget; the service decides whether the sample is trustworthy
     // (see CMD_CARET_PROBE in BinaryProtocol.h). Never affects local composition state.
-    BOOL SendCaretProbe(int x, int y, int height, int compositionStartX, int compositionStartY);
+    BOOL SendCaretProbe(int x, int y, int height, int compositionStartX, int compositionStartY,
+                        int source = CARET_SRC_UNKNOWN);
 
     // Send selection changed notification (from ITfTextEditSink::OnEndEdit)
     // Async: notifies Go that the caret moved outside of composition (e.g., mouse click)

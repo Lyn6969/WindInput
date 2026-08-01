@@ -694,7 +694,8 @@ BOOL CIPCClient::SendCommitRequest(const uint8_t* payload, uint32_t payloadSize)
     return _SendBinaryMessage(CMD_COMMIT_REQUEST, payload, payloadSize);
 }
 
-BOOL CIPCClient::SendCaretUpdate(int x, int y, int height, int compositionStartX, int compositionStartY)
+BOOL CIPCClient::SendCaretUpdate(int x, int y, int height, int compositionStartX, int compositionStartY,
+                                 int source)
 {
     if (!_ShouldAttemptOperation())
     {
@@ -706,14 +707,16 @@ BOOL CIPCClient::SendCaretUpdate(int x, int y, int height, int compositionStartX
         return FALSE;
     }
 
-    CaretPayload payload;
-    payload.x = x;
-    payload.y = y;
-    payload.height = height;
-    payload.compositionStartX = compositionStartX;
-    payload.compositionStartY = compositionStartY;
+    CaretPayloadV2 payload;
+    payload.caret.x = x;
+    payload.caret.y = y;
+    payload.caret.height = height;
+    payload.caret.compositionStartX = compositionStartX;
+    payload.caret.compositionStartY = compositionStartY;
+    payload.source = source;
 
-    _LogDebug(L"Sending caret update (async): x=%d, y=%d, h=%d, compStart=(%d,%d)", x, y, height, compositionStartX, compositionStartY);
+    _LogDebug(L"Sending caret update (async): x=%d, y=%d, h=%d, compStart=(%d,%d) src=%d", x, y, height,
+              compositionStartX, compositionStartY, source);
 
     // Send async - no response needed for caret updates
     return _SendBinaryMessage(CMD_CARET_UPDATE, &payload, sizeof(payload), true /* async */);
@@ -780,7 +783,8 @@ BOOL CIPCClient::SendCaretPending()
     return _SendBinaryMessage(CMD_CARET_PENDING, nullptr, 0, true /* async */);
 }
 
-BOOL CIPCClient::SendCaretProbe(int x, int y, int height, int compositionStartX, int compositionStartY)
+BOOL CIPCClient::SendCaretProbe(int x, int y, int height, int compositionStartX, int compositionStartY,
+                                int source)
 {
     if (!_ShouldAttemptOperation())
     {
@@ -792,15 +796,16 @@ BOOL CIPCClient::SendCaretProbe(int x, int y, int height, int compositionStartX,
         return FALSE;
     }
 
-    CaretPayload payload;
-    payload.x = x;
-    payload.y = y;
-    payload.height = height;
-    payload.compositionStartX = compositionStartX;
-    payload.compositionStartY = compositionStartY;
+    CaretPayloadV2 payload;
+    payload.caret.x = x;
+    payload.caret.y = y;
+    payload.caret.height = height;
+    payload.caret.compositionStartX = compositionStartX;
+    payload.caret.compositionStartY = compositionStartY;
+    payload.source = source;
 
-    _LogDebug(L"Sending caret probe (async): x=%d, y=%d, h=%d, compStart=(%d,%d)",
-              x, y, height, compositionStartX, compositionStartY);
+    _LogDebug(L"Sending caret probe (async): x=%d, y=%d, h=%d, compStart=(%d,%d) src=%d",
+              x, y, height, compositionStartX, compositionStartY, source);
     return _SendBinaryMessage(CMD_CARET_PROBE, &payload, sizeof(payload), true /* async */);
 }
 

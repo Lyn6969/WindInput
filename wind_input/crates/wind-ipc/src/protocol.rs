@@ -404,8 +404,53 @@ pub struct CaretPayload {
     pub composition_start_y: i32,
 }
 
+/// 坐标来源，与 C++ `BinaryProtocol.h` 的 `CARET_SRC_*` 逐值对齐。
+///
+/// 同一组 x/y/h 可能来自语义完全不同的通道：TSF context 的插入点、组合起点，或**跨窗口**的
+/// Win32 光标。压进同一个字段后下游就再也分不开了——曾因此让 `GetGUIThreadInfo` 的光标冒充
+/// TSF 插入点，在 Word 非正文行错位 814px、在桌面输入定位到任务栏。
+pub mod caret_source {
+    pub const UNKNOWN: i32 = 0;
+    pub const TSF_SELECTION: i32 = 1;
+    pub const TSF_COMPOSITION: i32 = 2;
+    pub const TSF_CACHED: i32 = 3;
+    pub const GUI_CARET: i32 = 4;
+    pub const CONSOLE: i32 = 5;
+    pub const LAST_KNOWN: i32 = 6;
+
+    /// 是否属 TSF 语义域——即「这个坐标和组合起点出自同一个 context」。
+    /// 只有这一类才可作权威坐标，也只有这一类才可与组合起点做距离比较。
+    pub fn is_tsf(source: i32) -> bool {
+        matches!(source, TSF_SELECTION | TSF_COMPOSITION | TSF_CACHED)
+    }
+
+    pub fn name(source: i32) -> &'static str {
+        match source {
+            TSF_SELECTION => "tsf_selection",
+            TSF_COMPOSITION => "tsf_composition",
+            TSF_CACHED => "tsf_cached",
+            GUI_CARET => "gui_caret",
+            CONSOLE => "console",
+            LAST_KNOWN => "last_known",
+            _ => "unknown",
+        }
+    }
+}
+
 impl CaretPayload {
     pub const SIZE: usize = 20;
+
+    /// 从 v2 载荷（24 字节 = CaretPayload + source i32 LE）读取坐标来源。
+    ///
+    /// 短包一律 `UNKNOWN`：旧 DLL 只发 20 字节、macOS .app 只发 12 字节。故新旧两侧可任意组合，
+    /// 消费端把 UNKNOWN 当「无法判定」处理即可（保持既有行为，不新增闸门）。
+    pub fn source_from_bytes(buf: &[u8]) -> i32 {
+        if buf.len() >= 24 {
+            i32::from_le_bytes([buf[20], buf[21], buf[22], buf[23]])
+        } else {
+            caret_source::UNKNOWN
+        }
+    }
 
     pub fn from_bytes(buf: &[u8]) -> Option<Self> {
         if buf.len() < Self::SIZE {

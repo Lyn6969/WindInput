@@ -181,6 +181,34 @@ struct CaretPayload
 };
 static_assert(sizeof(CaretPayload) == 20, "CaretPayload must be 20 bytes");
 
+// ── 坐标来源（CaretPayloadV2::source）────────────────────────────────────────
+// 同一组 x/y/h 可能来自语义完全不同的通道，压进同一个字段后下游就再也分不开了。
+// 曾因此让 GetGUIThreadInfo 的 Win32 光标冒充 TSF 插入点，在 Word 非正文行错位 814px、
+// 在桌面输入定位到任务栏。消费端据此决定「这一帧能否当权威坐标」以及「能否与组合起点比较」。
+constexpr int32_t CARET_SRC_UNKNOWN        = 0; // 旧协议 / macOS 短包，无法判定
+constexpr int32_t CARET_SRC_TSF_SELECTION  = 1; // GetTextExt(selection)，最精确
+constexpr int32_t CARET_SRC_TSF_COMPOSITION= 2; // selection 退化后降级用的组合起点，仍属 TSF 域
+constexpr int32_t CARET_SRC_TSF_CACHED     = 3; // UpdateComposition edit session 内缓存，同属 TSF 域
+constexpr int32_t CARET_SRC_GUI_CARET      = 4; // GetGUIThreadInfo/GetCaretPos 回退——**跨窗口，不可作权威**
+constexpr int32_t CARET_SRC_CONSOLE        = 5; // 控制台窗口的估算位置
+constexpr int32_t CARET_SRC_LAST_KNOWN     = 6; // 上次已知好值
+
+// Caret position payload v2 (24 bytes) = CaretPayload + source
+//
+// ⚠ 刻意**不把 source 加进 CaretPayload 本身**：FocusGainedPayload 内嵌了 CaretPayload，
+// 改它的大小会连带改变焦点载荷布局，新旧两侧混用时 focus_gained 会整体错位。而焦点事件携带的
+// caret 本就是「只更新缓存、不参与显示决策」的（见 Rust handler.rs 的 handle_focus_gained_caret），
+// 不需要来源信息。故只给 CMD_CARET_UPDATE / CMD_CARET_PROBE 这两条**参与定位决策**的通道加。
+//
+// 兼容：服务端按 payload 长度分支——20 字节按旧格式解析且 source=UNKNOWN，24 字节读 source。
+// macOS .app 仍发 12 字节，同样落入 UNKNOWN。故新旧两侧可任意组合。
+struct CaretPayloadV2
+{
+    CaretPayload caret;
+    int32_t      source;
+};
+static_assert(sizeof(CaretPayloadV2) == 24, "CaretPayloadV2 must be 24 bytes");
+
 // Selection changed payload (4 bytes) - sent from ITfTextEditSink::OnEndEdit
 // Notifies Go that the caret moved outside of composition (e.g., mouse click)
 struct SelectionChangedPayload

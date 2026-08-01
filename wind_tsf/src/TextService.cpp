@@ -3672,8 +3672,13 @@ static BOOL s_hasLastCaretPos = FALSE;
 static thread_local CTextService* g_holdTimerInstance = nullptr;
 
 // Get caret position using TSF APIs (for browsers and modern apps)
-BOOL CTextService::GetCaretPositionFromTSF(LONG* px, LONG* py, LONG* pHeight)
+BOOL CTextService::GetCaretPositionFromTSF(LONG* px, LONG* py, LONG* pHeight, BOOL* pUsedCompStart)
 {
+    if (pUsedCompStart)
+    {
+        *pUsedCompStart = FALSE;
+    }
+
     if (_pThreadMgr == nullptr)
     {
         return FALSE;
@@ -3704,10 +3709,16 @@ BOOL CTextService::GetCaretPositionFromTSF(LONG* px, LONG* py, LONG* pHeight)
     // _pComposition 为 nullptr，行为与从前一致。
     RECT rc = {}, rcCompStart = {};
     BOOL hasCompStart = FALSE;
+    BOOL usedCompStart = FALSE;
     BOOL result = CCaretEditSession::GetCaretAndCompositionStartRect(
         pContext, _tfClientId, _pComposition, &rc, &rcCompStart, &hasCompStart,
-        (LONG)GetPendingCommitPrefixLength());
+        (LONG)GetPendingCommitPrefixLength(), &usedCompStart);
     pContext->Release();
+
+    if (pUsedCompStart)
+    {
+        *pUsedCompStart = usedCompStart;
+    }
 
     if (result)
     {
@@ -4013,8 +4024,13 @@ static BOOL GetConsoleCaretPosition(HWND hwndConsole, LONG* px, LONG* py, LONG* 
     return TRUE;
 }
 
-BOOL CTextService::GetCaretPosition(LONG* px, LONG* py, LONG* pHeight)
+BOOL CTextService::GetCaretPosition(LONG* px, LONG* py, LONG* pHeight, int* pSource)
 {
+    if (pSource)
+    {
+        *pSource = CARET_SRC_UNKNOWN;
+    }
+
     // First, check if the foreground window is a console/terminal
     HWND hwndForeground = GetForegroundWindow();
     BOOL isConsole = IsConsoleWindow(hwndForeground);
@@ -4026,8 +4042,13 @@ BOOL CTextService::GetCaretPosition(LONG* px, LONG* py, LONG* pHeight)
 
     // Method 1: Try TSF APIs first - this is the most reliable for browsers and modern apps
     // ITfContextView::GetTextExt provides accurate caret position in Chrome, Edge, etc.
-    if (GetCaretPositionFromTSF(px, py, pHeight))
+    BOOL usedCompStart = FALSE;
+    if (GetCaretPositionFromTSF(px, py, pHeight, &usedCompStart))
     {
+        if (pSource)
+        {
+            *pSource = usedCompStart ? CARET_SRC_TSF_COMPOSITION : CARET_SRC_TSF_SELECTION;
+        }
         return TRUE;
     }
 
@@ -4041,6 +4062,10 @@ BOOL CTextService::GetCaretPosition(LONG* px, LONG* py, LONG* pHeight)
             s_lastCaretY = *py;
             s_lastCaretHeight = *pHeight;
             s_hasLastCaretPos = TRUE;
+            if (pSource)
+            {
+                *pSource = CARET_SRC_CONSOLE;
+            }
             return TRUE;
         }
     }
@@ -4077,6 +4102,12 @@ BOOL CTextService::GetCaretPosition(LONG* px, LONG* py, LONG* pHeight)
                 s_lastCaretHeight = *pHeight;
                 s_hasLastCaretPos = TRUE;
 
+                // ⚠ 这是**跨窗口**的 Win32 光标，不属于当前 TSF context。宿主只在部分场景维护它
+                // （Word 仅正文行、shell 场景指向别的窗口），故标为 GUI 源，消费端不得当权威坐标。
+                if (pSource)
+                {
+                    *pSource = CARET_SRC_GUI_CARET;
+                }
                 return TRUE;
             }
         }
@@ -4105,6 +4136,10 @@ BOOL CTextService::GetCaretPosition(LONG* px, LONG* py, LONG* pHeight)
                 s_lastCaretHeight = *pHeight;
                 s_hasLastCaretPos = TRUE;
 
+                if (pSource)
+                {
+                    *pSource = CARET_SRC_GUI_CARET;
+                }
                 return TRUE;
             }
         }
@@ -4126,6 +4161,10 @@ BOOL CTextService::GetCaretPosition(LONG* px, LONG* py, LONG* pHeight)
                 *px = s_lastCaretX;
                 *py = s_lastCaretY;
                 *pHeight = s_lastCaretHeight;
+                if (pSource)
+                {
+                    *pSource = CARET_SRC_LAST_KNOWN;
+                }
                 return TRUE;
             }
 
@@ -4136,6 +4175,10 @@ BOOL CTextService::GetCaretPosition(LONG* px, LONG* py, LONG* pHeight)
             *pHeight = 20;
 
             WIND_LOG_DEBUG(L"GetCaretPosition: Using window position fallback\n");
+            if (pSource)
+            {
+                *pSource = CARET_SRC_LAST_KNOWN;
+            }
             return TRUE;
         }
     }
@@ -4235,7 +4278,7 @@ static void ConvertToPhysicalCoordinates(LONG& x, LONG& y, LONG& height,
 
 // 坐标出口：DPI 归一 → 记为 last known → 发 IPC。同步与异步两条取坐标路径共用，
 // 保证「记住的坐标」和「发出去的坐标」永远是同一份（曾经只有同步路径更新 last known）。
-void CTextService::_EmitCaretUpdate(LONG x, LONG y, LONG height, LONG compStartX, LONG compStartY)
+void CTextService::_EmitCaretUpdate(LONG x, LONG y, LONG height, LONG compStartX, LONG compStartY, int source)
 {
     ConvertToPhysicalCoordinates(x, y, height, compStartX, compStartY);
 
@@ -4246,7 +4289,7 @@ void CTextService::_EmitCaretUpdate(LONG x, LONG y, LONG height, LONG compStartX
 
     if (_pIPCClient != nullptr && _pIPCClient->IsConnected())
     {
-        _pIPCClient->SendCaretUpdate((int)x, (int)y, (int)height, (int)compStartX, (int)compStartY);
+        _pIPCClient->SendCaretUpdate((int)x, (int)y, (int)height, (int)compStartX, (int)compStartY, source);
     }
 }
 
@@ -4284,7 +4327,8 @@ BOOL CTextService::RequestCaretPositionUpdateAsync()
 // 异步 edit session 的回调出口。这里**刻意不做任何回退**：取不到就不发，服务端会用按键
 // 时缓存的坐标兜底，那份来自按键路径的同步 edit session，比 Win32 caret 可信得多。
 // 曾经的 bug 正是回退到 GetGUIThreadInfo，在 Word 非正文样式行上拿到无关窗口的 caret。
-void CTextService::OnAsyncCaretRectReady(const RECT& caretRect, BOOL hasCompStart, const RECT& compStartRect)
+void CTextService::OnAsyncCaretRectReady(const RECT& caretRect, BOOL hasCompStart, const RECT& compStartRect,
+                                          BOOL usedCompStartAsCaret)
 {
     // 排队期间用户可能已上屏：这份坐标属于上一轮组合，发出去会把候选窗钉在已消失的组合上。
     if (_pComposition == nullptr)
@@ -4319,10 +4363,11 @@ void CTextService::OnAsyncCaretRectReady(const RECT& caretRect, BOOL hasCompStar
         compStartY = compStartRect.bottom;
     }
 
-    WIND_LOG_DEBUG_FMT(L"OnAsyncCaretRectReady: caret(%ld,%ld h=%ld) compStart=(%ld,%ld)\n",
-                       caretRect.left, caretRect.bottom, height, compStartX, compStartY);
+    const int source = usedCompStartAsCaret ? CARET_SRC_TSF_COMPOSITION : CARET_SRC_TSF_SELECTION;
+    WIND_LOG_DEBUG_FMT(L"OnAsyncCaretRectReady: caret(%ld,%ld h=%ld) compStart=(%ld,%ld) src=%d\n",
+                       caretRect.left, caretRect.bottom, height, compStartX, compStartY, source);
 
-    _EmitCaretUpdate(caretRect.left, caretRect.bottom, height, compStartX, compStartY);
+    _EmitCaretUpdate(caretRect.left, caretRect.bottom, height, compStartX, compStartY, source);
 }
 
 void CTextService::SendCaretPositionUpdate()
@@ -4350,6 +4395,7 @@ void CTextService::SendCaretPositionUpdate()
     LONG x = 0, y = 0, height = 0;
     LONG compStartX = 0, compStartY = 0;
     BOOL hasPosition = FALSE;
+    int  source = CARET_SRC_UNKNOWN;
 
     // Priority 1: Use cached position from edit session (reliable for WebView apps
     // where separate CaretEditSession with TF_INVALID_COOKIE is rejected).
@@ -4362,6 +4408,8 @@ void CTextService::SendCaretPositionUpdate()
         y = _cachedCaretRect.bottom;
         height = _cachedCaretRect.bottom - _cachedCaretRect.top;
         hasPosition = TRUE;
+        // 缓存写自 UpdateComposition 的 edit session，与 caret/compStart 同源同 cookie，属 TSF 域
+        source = CARET_SRC_TSF_CACHED;
 
         if (_hasCachedCompStartPos)
         {
@@ -4377,7 +4425,7 @@ void CTextService::SendCaretPositionUpdate()
     // Priority 2: Normal method (separate edit session + fallbacks)
     if (!hasPosition)
     {
-        if (!GetCaretPosition(&x, &y, &height))
+        if (!GetCaretPosition(&x, &y, &height, &source))
         {
             if (_hasLastKnownCaretPos)
             {
@@ -4385,6 +4433,7 @@ void CTextService::SendCaretPositionUpdate()
                 y = _lastKnownCaretY;
                 height = _lastKnownCaretHeight;
                 hasPosition = TRUE;
+                source = CARET_SRC_LAST_KNOWN;
                 WIND_LOG_INFO_FMT(L"SendCaretPositionUpdate: using last known caret x=%ld y=%ld h=%ld", x, y, height);
             }
             else
@@ -4406,7 +4455,7 @@ void CTextService::SendCaretPositionUpdate()
     if (hasPosition)
     {
         // DPI 归一 + 记 last known + 发 IPC（fire-and-forget，无响应）
-        _EmitCaretUpdate(x, y, height, compStartX, compStartY);
+        _EmitCaretUpdate(x, y, height, compStartX, compStartY, source);
     }
 }
 
@@ -4848,15 +4897,17 @@ STDAPI CTextService::OnLayoutChange(ITfContext* pContext, TfLayoutCode lCode, IT
                 RECT probeCaret = {};
                 RECT probeCs = {};
                 BOOL probeHasCs = FALSE;
+                BOOL probeUsedCs = FALSE;
                 if (CCaretEditSession::GetCaretAndCompositionStartRect(
                         pContext, _tfClientId, _pComposition,
-                        &probeCaret, &probeCs, &probeHasCs, 0))
+                        &probeCaret, &probeCs, &probeHasCs, 0, &probeUsedCs))
                 {
                     // 与 SendCaretPositionUpdate 同口径：y 取 bottom、height 由 rect 高度算。
                     LONG ph = probeCaret.bottom - probeCaret.top;
                     LONG csx = probeHasCs ? probeCs.left : 0;
                     LONG csy = probeHasCs ? probeCs.bottom : 0;
-                    _pIPCClient->SendCaretProbe(probeCaret.left, probeCaret.bottom, ph, csx, csy);
+                    const int probeSrc = probeUsedCs ? CARET_SRC_TSF_COMPOSITION : CARET_SRC_TSF_SELECTION;
+                    _pIPCClient->SendCaretProbe(probeCaret.left, probeCaret.bottom, ph, csx, csy, probeSrc);
                 }
             }
             WIND_LOG_DEBUG(L"OnLayoutChange (first show): debouncing caret flush\n");
