@@ -1634,6 +1634,21 @@ pub struct UiCandidateConfig {
     /// 候选文本最大显示字数，超出截断（0=不限）。
     #[serde(default)]
     pub max_chars: usize,
+    /// **竖排**候选的注释段（候选右侧灰字）模板。语法见 `wind_coordinator::comment`。
+    ///
+    /// 横竖各持一份模板、互不影响：两种排布的可用横向空间差一个数量级（竖排每行独占，
+    /// 横排全部候选共享一行宽度），能放什么本就不是同一个答案。共用一份的结果是
+    /// 「为竖排配的拼音把横排候选窗撑爆」或「为横排收着配的注释让竖排一片空白」。
+    #[serde(default = "default_comment_template")]
+    pub comment_template_vertical: String,
+    /// **横排**候选的注释段模板。见 [`Self::comment_template_vertical`]。
+    #[serde(default = "default_comment_template")]
+    pub comment_template_horizontal: String,
+    /// 注释段的最大字数（0=不限），超出截断并加 `…`。
+    ///
+    /// 默认 0：本项引入前注释段从无长度限制，非 0 的默认值会让存量用户的注释突然变短。
+    #[serde(default)]
+    pub comment_max_chars: usize,
     /// 自定义序号标签（如 "asdfg"；空=默认 1-9）。每字符一个槽位。
     #[serde(default)]
     pub index_labels: String,
@@ -1665,6 +1680,15 @@ fn default_preedit_display() -> String {
 
 fn default_candidate_position_mode() -> String {
     "follow_caret".to_string()
+}
+
+/// 注释段默认模板：`${code_hint|code}` **精确等价于本功能引入前的硬编码行为**
+/// （引擎产的剩余编码优先，为空则回退到拼音候选的主码表反查码）。
+///
+/// 出厂默认能用模板原样表达，是 `${a|b}` 回退语法存在的主要理由 —— 没有它，出厂行为
+/// 就得留在代码里作特例，模板便不再是注释内容的唯一真相源。
+fn default_comment_template() -> String {
+    "${code_hint|code}".to_string()
 }
 
 /// 编码显示方式（解析自 ui.candidate.preedit_display）。
@@ -1742,6 +1766,9 @@ impl Default for UiCandidateConfig {
             pager_bar_display: String::new(),
             page_number_display: String::new(),
             max_chars: 16,
+            comment_template_vertical: default_comment_template(),
+            comment_template_horizontal: default_comment_template(),
+            comment_max_chars: 0,
             index_labels: String::new(),
             flip_when_above: false,
             swap_preedit_when_above: false,
@@ -1778,6 +1805,15 @@ impl UiCandidateConfig {
     /// 时返回该字符，否则 None。供协调器裁决「用户 > 主题 > 默认」优先级（主题层在 None 时接手）。
     pub fn user_index_label(&self, i: usize) -> Option<String> {
         self.index_labels.chars().nth(i).map(|c| c.to_string())
+    }
+
+    /// 当前排布对应的注释模板（`vertical` 为 true 取竖排那份）。
+    pub fn comment_template(&self, vertical: bool) -> &str {
+        if vertical {
+            &self.comment_template_vertical
+        } else {
+            &self.comment_template_horizontal
+        }
     }
 
     /// 按 max_chars 截断候选显示文本（0=不限）。超出时截断并加省略号 `…`

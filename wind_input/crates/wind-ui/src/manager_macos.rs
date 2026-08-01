@@ -269,7 +269,7 @@ impl Forwarder {
             UiCommand::SetPagerDisplay(m) => self.win.set_pager_display(m),
             UiCommand::SetPageNumberDisplay(m) => self.win.set_page_number_display(m),
             UiCommand::SetTooltipChaiziFont { path, family } => {
-                self.win.set_tooltip_chaizi_font(&path, &family)
+                self.win.set_chaizi_font(&path, &family)
             }
             UiCommand::Shutdown => {}
             UiCommand::CopyToClipboard(text) => crate::popup_menu::set_clipboard_text(&text),

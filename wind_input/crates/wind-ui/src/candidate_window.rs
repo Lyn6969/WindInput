@@ -349,8 +349,21 @@ impl CandidateWindow {
         self.mouse.borrow_mut().engage_delay_ms = delay_ms.max(0) as u64;
     }
 
-    /// 设置拆字字根字体（TTF 路径 + DWrite 家族名）。转发给悬停提示窗。
-    pub fn set_tooltip_chaizi_font(&mut self, path: &str, family: &str) {
+    /// 设置拆字字根字体（TTF 路径 + DWrite 家族名）。**两个渲染器都要收到**。
+    ///
+    /// 字根字符落在私用区（PUA），系统字体里没有对应字形，须靠渲染器把 PUA 连续段切到字根
+    /// 字体集（`text::dwrite` 的 `pua_runs` + `SetFontCollection`，测量与绘制共用同一函数）。
+    /// 那套机制本身与控件无关，但**它只对调用过本方法的那个 `TextRenderer` 实例生效**。
+    ///
+    /// 本方法此前名为 `set_tooltip_chaizi_font`，只转发给 `self.tooltip` —— 于是候选窗自己的
+    /// `self.text_renderer` 从未拿到过字根字体。悬停提示里的字根正常、候选行里的字根显示成
+    /// 豆腐块或空白，而配置/文件/家族名/日志四项全对，查不出所以然
+    /// （同 `project_chaizi_font_pua_plane_gap` 的形态：**四项全对就该查消费端，不是资源本身**）。
+    /// 此前无人发现是因为候选行从来没有渲染过字根——注释段接入拆字来源后才第一次有。
+    pub fn set_chaizi_font(&mut self, path: &str, family: &str) {
+        if let Err(e) = self.text_renderer.set_chaizi_font(path, family) {
+            tracing::warn!("候选窗字根字体加载失败: {e}");
+        }
         if let Some(t) = self.tooltip.as_mut() {
             t.set_chaizi_font(path, family);
         }

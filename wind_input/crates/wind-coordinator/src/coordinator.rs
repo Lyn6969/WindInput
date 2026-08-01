@@ -2645,6 +2645,9 @@ impl Coordinator {
         };
         // 反查表读锁在候选循环外取一次（写方仅 sync_chaizi_assets 的热重载路径）。
         let reverse = self.reverse.read().unwrap_or_else(|e| e.into_inner());
+        // 注释段（候选右侧灰字）模板，见 `crate::comment`。横竖各持一份、互不影响：
+        // 两种排布的可用横向空间差一个数量级，能放什么本就不是同一个答案。
+        let comment_tpl = cand_cfg.comment_template(self.desired_vertical(state));
         // [编码] 段来源方案（循环外解析一次）：码表方案=自身全部编码（码长升序 a/ab/abc）、
         // 混输=其主码表成员、拼音=全局主码表。编码按词查方案词库反查索引（word_codes_in），
         // 不按取码规则生成。候选并非用该编码方案直接输入时（来源方案≠活跃方案，或处于
@@ -2685,6 +2688,16 @@ impl Coordinator {
                     word_code.as_deref(),
                     code_source_name.as_deref(),
                 );
+                // 注释段（候选右侧灰字）：渲染当前排布对应的模板。
+                // 与悬停提示无耦合——注释放不下的内容不往气泡里塞，气泡有自己的
+                // `ui.tooltip.*` 三段（编码/拼音/拆字），塞了会与之重复。
+                let comment = self.comment_for(
+                    c,
+                    comment_tpl,
+                    cand_cfg.comment_max_chars,
+                    &reverse,
+                    pinyin_hint,
+                );
                 // 调试段：独立一行 [调试] + 来源/方案/编码/权重/序/词频。全关时不再兜底回填编码
                 // （tooltip 各 provider 全关即真正为空，不显示气泡）。
                 if let Some(ctx) = &dbg_ctx {
@@ -2708,19 +2721,7 @@ impl Coordinator {
                         self.resolve_index_label(cand_cfg, i)
                     },
                     tooltip,
-                    // 编码提示:码表候选的剩余编码由码表引擎在 convert 时已填入 c.comment(故 !empty 时保留);
-                    // 拼音候选用码表真实反查索引填(仅 text 在码表词库中存在才显示,不生成、不臆测)。
-                    comment: if !c.comment.is_empty() {
-                        c.comment.clone()
-                    } else if pinyin_hint && c.source == wind_candidate::CandidateSource::Pinyin {
-                        // 反查码:仅对**拼音来源**候选,用主码表反向索引取该词在码表里的**实际**
-                        // 编码(不存在则不显示)。不按字生成码——生成码常与码表实际码不一致,会提示
-                        // 出打不出的码。对齐 Go addCodeHintsFromCodetable(Source==Pinyin && 空 comment)。
-                        // (码表来源候选的剩余编码已由码表引擎在 convert 时填入 c.comment。)
-                        self.engine_mgr.codetable_reverse_hint(&c.text)
-                    } else {
-                        String::new()
-                    },
+                    comment,
                     no_index: false,
                 }
             })

@@ -443,6 +443,76 @@ impl ReverseLookup {
         self.pinyin = PinyinTable::build(rows);
     }
 
+    /// 词的**整词注音**（带声调，逐字以 `sep` 连接）。无读音的字跳过；全空返回空串。
+    ///
+    /// # `syllables`：用词条编码消歧多音字
+    ///
+    /// 传入该词在词库里的**音节序列**（来自词条 `code` + `boundary`，如「行长」→ `["hang","zhang"]`）
+    /// 时，逐字用对应音节筛掉不匹配的读音（按 [`strip_tone`] 后相等比较）：
+    /// 「行」的读音表 `[xíng, háng]` 被 `hang` 筛剩 `háng`，「长」的 `[cháng, zhǎng]` 被 `zhang`
+    /// 筛剩 `zhǎng` —— 得 `háng zhǎng` 而非逐字取首音的 `xíng cháng`。
+    ///
+    /// **这是唯一能让词组注音正确的信息来源**：候选文本本身不携带读音，而词条编码是词库作者
+    /// 标注的真值。传 `None`（非拼音来源候选，如五笔候选，没有拼音码可依）则逐字取最常用读音，
+    /// 多音字可能不准 —— 这是数据的下界，不是实现缺陷。
+    ///
+    /// # 声调无法从编码恢复（信息论下界）
+    ///
+    /// 拼音输入法不打声调，故**同音异调**（「好」hǎo/hào 去调都是 `hao`）筛完仍剩多个，
+    /// 只能取最常用的那个。要根治须引入词级注音表 —— 那属于独立注释库的范畴。
+    ///
+    /// # 长度不匹配即整体降级
+    ///
+    /// `syllables` 与 `text` 的字数对不上时（词条含非汉字、或调用方切分有误）**放弃筛选**、
+    /// 退回逐字首音，而不是按位错配 —— 错配比不筛更糟：它会给出一个看起来精确的错答案。
+    /// 参见加词取码在「含非汉字的词」上栽过的同型问题。
+    pub fn toned_pinyin_of(&self, text: &str, syllables: Option<&[&str]>, sep: &str) -> String {
+        let chars: Vec<char> = text.chars().collect();
+        // 对不上就不用——宁可少一层精度，也不给按位错配的结果。
+        let syls = syllables.filter(|s| s.len() == chars.len());
+        chars
+            .iter()
+            .enumerate()
+            .filter_map(|(i, &c)| {
+                let readings = self.pinyin.readings(c)?;
+                let want = syls.map(|s| strip_tone(s[i]));
+                match want {
+                    // 有音节可依：筛出去调后相等的首个读音；一个都不匹配时**不回退**到首音——
+                    // 不匹配意味着这个字的读音表里根本没有词条标注的那个音（词库或读音表有一方
+                    // 过时），此时首音同样没有依据，给出它只会掩盖数据问题。
+                    Some(w) => readings.iter().find(|r| strip_tone(r) == w),
+                    None => readings.first(),
+                }
+            })
+            .collect::<Vec<_>>()
+            .join(sep)
+    }
+
+    /// 单字在拆字库里记录的**编码**（`好` → `vbg`）；非单字、无数据均返回空串。
+    ///
+    /// 与 [`Self::radicals_of`] 取自同一条拆字记录的两列，刻意分开暴露：候选注释模板要能
+    /// 把「字根」「编码」各自摆到用户想要的位置（`亻尔 [wq]` / `wq·亻尔` / 只要其一），
+    /// 合成一个成品串就把版式写死了。悬停提示那边的 `字根 [编码]` 只是其中一种排法。
+    pub fn chaizi_code_of(&self, text: &str) -> String {
+        let mut it = text.chars();
+        match (it.next(), it.next()) {
+            (Some(c), None) => self.chaizi.code(c).unwrap_or_default().to_string(),
+            _ => String::new(),
+        }
+    }
+
+    /// 词的**整词字根串**（逐字字根以 `sep` 连接，无拆字数据的字跳过）。全空返回空串。
+    ///
+    /// 与 `tooltip_for` 的拆字段是**同源不同粒度**：那里逐字一行、每行还带该字的编码
+    /// （在教「这个字怎么拆」），这里整词一行、只给字根（在标注「这个词长什么样」）。
+    /// 候选注释段只有一行，容不下逐字展开，故需要这个整词形态。
+    pub fn radicals_of(&self, text: &str, sep: &str) -> String {
+        text.chars()
+            .filter_map(|c| self.chaizi.radicals(c))
+            .collect::<Vec<_>>()
+            .join(sep)
+    }
+
     /// 生成词的拼音编码（空格分隔、去声调小写；ü→v）。无读音的字跳过。
     /// 用于设置页 dict.genPinyin / 拼音方案加词自动出码。
     pub fn gen_pinyin(&self, text: &str) -> String {
@@ -669,6 +739,92 @@ mod tests {
         rl.set_chaizi(vec![('好', "女子", "vbg"), ('人', "人", "w")]);
         rl.set_pinyin(vec![('好', vec!["hǎo", "hào"]), ('人', vec!["rén"])]);
         rl
+    }
+
+    /// 多音字读音表：「行」xíng/háng、「长」cháng/zhǎng，首项为最常用。
+    fn heteronym_rl() -> ReverseLookup {
+        let mut rl = ReverseLookup::default();
+        rl.set_pinyin(vec![
+            ('行', vec!["xíng", "háng", "hàng"]),
+            ('长', vec!["cháng", "zhǎng"]),
+        ]);
+        rl
+    }
+
+    /// ★★ 词条音节消歧多音字 —— 本函数存在的全部理由。
+    ///
+    /// 「行长」逐字取首音会得到 `xíng cháng`，**两个字都错**。带上词库标注的音节
+    /// `["hang","zhang"]` 后各自筛剩唯一读音，得 `háng zhǎng`。
+    #[test]
+    fn syllables_disambiguate_heteronyms() {
+        let rl = heteronym_rl();
+        assert_eq!(
+            rl.toned_pinyin_of("行长", None, " "),
+            "xíng cháng",
+            "无音节可依时只能逐字取首音（这正是要修的形态）"
+        );
+        assert_eq!(
+            rl.toned_pinyin_of("行长", Some(&["hang", "zhang"]), " "),
+            "háng zhǎng",
+            "带词条音节应筛出正确读音"
+        );
+        // 同一个词换一组音节即换一组读音——证明筛选真的按音节走，不是碰巧。
+        assert_eq!(
+            rl.toned_pinyin_of("行长", Some(&["xing", "chang"]), " "),
+            "xíng cháng"
+        );
+    }
+
+    /// 声调无法从编码恢复：同音异调筛完仍剩多个，取最常用（首项）。
+    /// 这是数据下界而非实现缺陷 —— 拼音码里根本没有声调信息。
+    #[test]
+    fn same_syllable_different_tones_falls_back_to_most_common() {
+        let rl = sample_rl(); // 好: hǎo / hào，去调都是 hao
+        assert_eq!(rl.toned_pinyin_of("好", Some(&["hao"]), " "), "hǎo");
+    }
+
+    /// ★ 音节数与字数对不上时**整体放弃筛选**、退回逐字首音，而不是按位错配。
+    ///
+    /// 错配比不筛更糟：它会给出一个看起来精确的错答案（把第 2 个字的音套到第 1 个字上）。
+    #[test]
+    fn mismatched_syllable_count_degrades_instead_of_misaligning() {
+        let rl = heteronym_rl();
+        // 两个字却只给一个音节：若按位取用会拿 "hang" 套到「行」、第二字越界或错位。
+        assert_eq!(
+            rl.toned_pinyin_of("行长", Some(&["hang"]), " "),
+            "xíng cháng",
+            "数量不匹配应整体降级为逐字首音"
+        );
+    }
+
+    /// 音节与读音表全不匹配时**不回退首音**：不匹配意味着词库与读音表有一方过时，
+    /// 此时首音同样没有依据，给出它只会掩盖数据问题。
+    #[test]
+    fn unmatched_syllable_yields_nothing_for_that_char() {
+        let rl = heteronym_rl();
+        assert_eq!(
+            rl.toned_pinyin_of("行", Some(&["zzz"]), " "),
+            "",
+            "读音表里没有该音节时不得拿首音充数"
+        );
+    }
+
+    /// 无读音的字跳过（不产出空段/孤立分隔符）；整词皆无返回空串。
+    #[test]
+    fn chars_without_readings_are_skipped() {
+        let rl = heteronym_rl();
+        assert_eq!(rl.toned_pinyin_of("行X", None, " "), "xíng");
+        assert_eq!(rl.toned_pinyin_of("XY", None, " "), "");
+    }
+
+    /// 整词字根串：逐字拼接，无拆字数据的字跳过。
+    #[test]
+    fn radicals_of_joins_per_char() {
+        let rl = sample_rl();
+        assert_eq!(rl.radicals_of("好", " "), "女子");
+        assert_eq!(rl.radicals_of("好人", " "), "女子 人");
+        assert_eq!(rl.radicals_of("好X", " "), "女子", "无字根的字跳过");
+        assert_eq!(rl.radicals_of("XY", " "), "");
     }
 
     #[test]

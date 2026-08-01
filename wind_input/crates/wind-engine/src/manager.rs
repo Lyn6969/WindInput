@@ -441,6 +441,42 @@ impl EngineManager {
             .unwrap_or_default()
     }
 
+    /// 用**主拼音方案**为词推断带空格的音节码（`行长` → `hang zhang`），供候选注释的注音
+    /// 消歧；方案不可加载或推不出返回空。
+    ///
+    /// # 为什么必须走 [`Self::generate_word_pinyin`] 而不是逐字取读音
+    ///
+    /// 逐字取最常用读音在**词组上系统性出错**：「行长」得 `xíng cháng`（两个字都错）、
+    /// 「银行」得 `yín xíng`。而 `generate_word_pinyin` 是真消歧——枚举每字读音的笛卡尔积、
+    /// 取第一个**能在拼音词典里查回该词**的组合，词典查不回的组合直接被排除。
+    ///
+    /// # 谁需要它
+    ///
+    /// **拼音来源候选不需要**（它们自带 `code` + `boundary`，那是词条真值，比推断更可靠）。
+    /// 需要它的是**码表/短语等非拼音来源候选**——五笔方案下候选的 `boundary` 恒为 0、
+    /// `code` 是形码，此前只能退到逐字首音。而五笔用户恰恰是「注音」这个功能最主要的受众
+    /// （打得出但不会读），把消歧漏在这条路径上等于功能对主力场景失效。
+    ///
+    /// 成本：每次候选刷新 × 当前页 5~9 条，且仅在模板含 `${pinyin}` 时求值；`generate_word_pinyin`
+    /// 自带 `MAX_READING_COMBOS`(64) 组合数护栏，超限即放弃推断。
+    pub fn word_pinyin_syllables(&self, text: &str) -> String {
+        let target = {
+            let p = self
+                .primary_pinyin
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .clone();
+            // 空 = 固定全拼，与 resolve_temp_pinyin_target 同一约定（勿改成扫 available：
+            // 那会让调整方案顺序静默改变本函数的结果）。
+            if p.is_empty() {
+                "pinyin".to_string()
+            } else {
+                p
+            }
+        };
+        self.generate_word_pinyin(&target, text).unwrap_or_default()
+    }
+
     /// 编码/拆字的来源方案 id:码表方案=自身(其它方案的编码/拆字对本方案无意义);
     /// 混输=其主码表成员;拼音/其他=全局主码表方案。空=无来源(编码段/拆字不显示)。
     /// 按已加载引擎的内存类型判定,不读盘(此路径每次候选推送都会走)。

@@ -360,6 +360,30 @@ font_size_follow_theme = true
 per_page = 7
 per_page_extended = 0
 max_chars = 16
+# 候选注释段（候选右侧灰字）模板。横排/竖排各一份、互不影响——两种排布能放的宽度差一个
+# 数量级（竖排每行独占，横排全部候选共享一行）。
+#
+# 语法：
+#   ${name}      变量替换
+#   ${a|b|c}     取首个非空的变量
+#   { ... }      可选段：段内变量全为空则整段（含字面文字）消失
+#   另：空变量会吞掉紧邻的一个空格；整个模板的变量全空时不显示任何内容。
+#
+# 可用变量：
+#   code_hint          引擎产的编码提示（码表前缀候选的剩余编码 si→sikao 标 kao；混输标记「拼」）
+#   code               主码表整词反查编码（仅拼音来源候选，且受方案 show_code_hint 门控）
+#   pinyin             带声调注音 nǐ hǎo（多音字按词典消歧：「行长」得 háng zhǎng 而非 xíng cháng）
+#   chaizi             拆字字根串，仅单字候选（需方案配了 [engine.chaizi]）
+#   chaizi_code        该字在拆字库里的编码，仅单字候选
+#   chaizi_all[:分隔符] 拆字字根不限字数，默认空格连接；如 ${chaizi_all:／}（可能很长，慎用于横排）
+#
+# 出厂值 ${code_hint|code} 等价于本功能引入前的固定行为。
+# 例：竖排显示字根与注音 → "{〔${chaizi}〕}{ ${pinyin}}"
+# 完整说明与更多示例：https://windinput.com/docs/customize/candidate-comment
+comment_template_vertical = "${code_hint|code}"
+comment_template_horizontal = "${code_hint|code}"
+# 注释段最大字数（0=不限），超出截断并加省略号。
+comment_max_chars = 0
 layout = "horizontal"
 # 编码显示方式：app_inline=内嵌应用光标处(候选窗不显 preedit) | candidate_top=候选窗顶部独立栏 | candidate_inline=编码内联候选首单元
 preedit_display = "app_inline"

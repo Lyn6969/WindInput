@@ -1321,7 +1321,7 @@ impl UiManager {
                         candidate_window.set_page_number_display(mode);
                     }
                     UiCommand::SetTooltipChaiziFont { path, family } => {
-                        candidate_window.set_tooltip_chaizi_font(&path, &family);
+                        candidate_window.set_chaizi_font(&path, &family);
                     }
                     UiCommand::RegisterGlobalHotkeys(entries) => {
                         #[cfg(windows)]
