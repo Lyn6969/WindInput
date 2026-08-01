@@ -302,14 +302,54 @@ existing.is_sentence = true;
 词库里的 491 在候选中**完全不可见**。同时可见整句 weight 并非恒为 3e7，而是
 `3e7 + 负偏移`——偏移量随整句 log 概率浮动，所以不同整句之间仍有序，但与词库权重不可比。
 
-⇒ 需要在合并时把合并前的值留存到新字段（`base_weight`），contested 归一时取它。
+⇒ 在合并时把合并前的值留存到新字段 `dict_weight`，比较时取它。
 
 **不能改成「不抬 weight、只设 `is_sentence`」**：整句的高 weight 有两个用途，除了显示置顶，
 还有**引擎内截断前的排序**——weight 留在 491 会让整句在 `max_candidates` 截断时被丢弃。
 锚定层只能解决前者。
 
-合成整句（`else` 分支新建的 `Candidate`）不需要 `base_weight`：它不是词典词，也就永远不会
-是 contested。
+#### 实施修正一：归一放在比较器里，不改引擎 weight
+
+早期草案写的是「contested 整句**归一到** `dict_weight`」（即引擎侧改写 weight）。实施时发现
+**不可行**：`is_sentence_contested` 置位后紧跟着就是
+
+```rust
+candidates.sort_by(|a, b| cmp_match_layers(a, b).then(b.weight.cmp(&a.weight))…);
+candidates.truncate(max_candidates);
+```
+
+引擎侧降 weight 会让整句在这里下沉甚至被截掉——正是上一段警告的那个后果，只是换了触发点。
+
+改为**只在 `rerank_pinyin_decay` 的比较器里**用 `dict_weight`，引擎 weight 保持不动。这样安全，
+是因为协调器的调用顺序恰好允许：
+
+```
+sort_by(candidate_display_order)   ← 按 weight
+apply_filter
+apply_freq_rerank                  ← 词频重排（最后一道整体排序）
+apply_shadow                       ← 只置顶/删除，不整体重排
+```
+
+`freq_rerank` 在 `candidate_display_order` **之后**，其结果不会被后续按权重重排推翻。
+
+#### 实施修正二：合成整句同样会 contested
+
+早期草案称「合成整句不是词典词，也就永远不会是 contested」——**这是错的**。step 6.6 的判据是
+
+```rust
+.filter(|c| c.is_sentence && !c.is_sentence_demoted)
+.filter(|s| /* 存在同码的其他精确整词 */)
+```
+
+**不要求整句自己是词典词**，`woshizhongguoren` 那类纯合成解只要有同码竞争者就会被置位。
+而合成整句走的是新建 `Candidate` 分支，没有 `dict_weight`。
+
+漏填的后果是**静默的**：比较器的 `unwrap_or(weight)` 拿到 3e7，竞争者无论被选中多少次都
+翻不过——正是本次要修的 bug 换个入口重现，且没有任何报错。
+
+⇒ step 6.6 置位时，为尚无 `dict_weight` 的候选填**同码最强竞争者的权重**（判据与 contested
+过滤器逐条一致）。语义即「与最强竞争者平级」：无词频时靠整句 tie-break 居首，有词频时可被
+反超。已有不变量测试扫多个输入、断言每个 contested 候选都带可比量级（并防空转）。
 
 ### 6.3.1 用实测数据验算
 
@@ -423,7 +463,7 @@ c.weight /= PINYIN_TIER_SCALE;   // = 100
 | `PINYIN_FREQ_EPSILON` 阈值褪色 | **删除**，`decay→0` 时 `W_freq→0`，`max` 自然回落 |
 | 整句锚定 | **保留**（第 6.4 节修正） |
 | contested「只摘锚定不动 weight」 | **改为归一到 `peer_max`**（第 6.3 节） |
-| 字数准入判据（`37b84ba`） | **可退役**，见 9.4 |
+| 字数准入判据（`37b84ba`） | **已退役**，见 9.4 |
 
 ---
 
@@ -437,14 +477,24 @@ c.weight /= PINYIN_TIER_SCALE;   // = 100
 但仓库已有教训（`project_fuzzy_pinyin_layer_vs_penalty`）：布尔层级键 ≡ 惩罚 ∞，只配承载
 结构性质量差异，「来源」一律走 weight。当前三个层级键是否都够格，是独立议题。
 
-### 9.2 `W_eff` 必须落到 `Candidate` 上
+### 9.2 `W_eff` 是否要落到 `Candidate` 上（实施后修正：不必）
 
-`cmp_match_layers` 的文档注明层级判据曾在三处各写一遍（引擎内部排序、协调器
-`candidate_display_order`、词频重排），现已统一调用同一函数。**引入 `W_eff` 会重新制造这个
-断层**——若它只活在词频重排的排序闭包里，协调器的 `candidate_display_order` 仍按裸 weight
-重排，引擎结果被静默推翻。
+早期草案担心「`W_eff` 只活在词频重排的排序闭包里，会被协调器的 `candidate_display_order`
+按裸 weight 重排推翻」。**实施时核对顺序后确认这一担忧不成立**：
 
-⇒ `W_eff` 必须是 `Candidate` 上的字段（或在合并前就地写回），这是实施时最容易漏的一处。
+```
+sort_by(candidate_display_order)   ← 按 weight
+apply_filter
+apply_freq_rerank                  ← W_eff 在这里
+apply_shadow                       ← 只置顶/删除
+```
+
+`freq_rerank` 是**最后一道整体排序**，其后只有 `apply_shadow`（置顶/删除，不整体重排）。
+所以 `W_eff` 留在闭包里即可，不必新增字段。
+
+⚠️ **但这条正确性依赖上述顺序**。若将来在 `apply_freq_rerank` 之后插入任何按 weight 的整体
+重排，`W_eff` 会被静默推翻——届时必须改为落字段。`dict_weight` 是字段（数据），`W_eff` 是
+闭包内的派生量（决策），二者不同。
 
 ### 9.3 码表侧不动，混输拼音路线纳入
 
@@ -478,23 +528,29 @@ c.weight /= PINYIN_TIER_SCALE;   // = 100
 
 ## 11. 实施与验证
 
-分四步，每步可独立回滚：
+### 进度
 
-1. **引擎提供 `W_max`**（纯拼音 / 混输各自量纲），加 `W_eff` 字段与计算，但排序仍走旧链
-   ——只输出新旧顺序差异日志。
-   验证：`pinyin_eval` 四类指标必须与基线**完全一致**（此步不改行为）。
-2. **同文合并留存 `base_weight`** + contested 整句归一到它 + 显式 `is_sentence` tie-break。
-   验证：`pinyin_contested_sentence_yields_to_used_peer`、
-   `demoted_sentence_falls_below_all_max_weight_exact_words`、
-   `demoted_sentence_still_precedes_ordinary_candidates` 全绿；新增「无词频时 contested
-   整句仍居首」用例。
-3. **切换排序到 `W_eff`**，删除 ③⑤ 与阈值褪色。
-   验证：`pinyin_eval` A/C 类不得下降；新增用例逐行覆盖第 5.3 节表格；混输单独一组
-   （量纲差 100 倍，纯拼音全绿不能代表混输）。
-4. **退役字数判据**，`N_sat` 接入配置。
-   ⚠️ 配置项是**跨仓**的：设置 UI 在独立仓 `wind-setting`，加一个配置项有五道守门测试依次
-   拦截（快照 / mockdata 勿手改，各自自带修复命令）。若决定不进 GUI，正规落点是
-   `UNCOVERED_BY_DESIGN`，而非「设置仓不用改」。
+**步骤 1 已完成**（`deb0e6c`）：引擎提供 `W_max`（纯拼音 / 混输各自量纲，mmap 侧读 wdat v6
+MaxW 段根节点，O(1)）、`Candidate::dict_weight` 字段与同文合并留存、`freq_weight` /
+`effective_weight` 两个纯函数。排序链未动，`pinyin_eval` 四类与基线完全一致。
+
+**步骤 2 与 3 已合并完成**：单独做步骤 2（归一但不切 `W_eff`）在布尔闸门下**没有任何可观察
+的行为变化**，无从验证，故合并。同时**提前退役了字数判据**（原计划步骤 4）——两套限制并存
+会让行为无法解释，且验证时分不清是谁在起作用。
+
+比较链现为三层：锚定 → `cmp_match_layers` → `W_eff` 降序（并列时整句优先）。已删除：布尔
+used-first、衰减分、`PINYIN_FREQ_EPSILON` 阈值褪色、`freq_promotion_eligible`。
+
+**步骤 4 待做**：`N_sat` 接入配置。
+⚠️ 配置项是**跨仓**的：设置 UI 在独立仓 `wind-setting`，加一个配置项有五道守门测试依次
+拦截（快照 / mockdata 勿手改，各自自带修复命令）。若决定不进 GUI，正规落点是
+`UNCOVERED_BY_DESIGN`，而非「设置仓不用改」。
+
+### ⚠️ `pinyin_eval` 验证不了新模型
+
+评测环境**没有词频记录**，而 `apply_freq_rerank` 开头即 `if recs.is_empty() { return; }`。
+所以 eval 的「四类指标不变」只证明**无词频时基础排序无回归**（①② 层没被改坏），
+**不能读作「新模型质量已验证」**。有词频时的行为由单测与集成测试覆盖，真机手测仍是必需的。
 
 **跨步骤必须一并覆盖的组合用例**：
 

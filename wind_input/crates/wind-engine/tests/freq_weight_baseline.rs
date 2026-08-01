@@ -193,3 +193,64 @@ fn ordinary_candidate_has_no_dict_weight() {
         product.dict_weight
     );
 }
+
+/// **不变量**：任何 `is_sentence_contested` 的候选都必须带 `dict_weight`。
+///
+/// contested 会摘掉词频锚定、下场按量级竞争，而它的 `weight` 是 `SENTENCE_WEIGHT_BASE`
+/// 量纲（不可比）。缺了 `dict_weight`，比较器的 `unwrap_or(weight)` 会拿到 3e7，同码
+/// 竞争者无论被选中多少次都翻不过——**且没有任何报错**，词频维度对该编码静默失效。
+///
+/// 该判据不要求整句自己是词典词（`woshizhongguoren` 那类纯合成解同样会被置位），所以
+/// 「经同文合并的才有值」是不够的，step 6.6 必须为合成整句补上同码最强竞争者的量级。
+#[test]
+fn every_contested_sentence_has_comparable_weight() {
+    let Some(dir) = data_dir() else {
+        eprintln!("跳过：数据目录不存在");
+        return;
+    };
+    let mgr = manager(&dir, "pinyin");
+    let mut seen = 0usize;
+    for input in [
+        "siyuan",
+        "gonghe",
+        "nihao",
+        "shiyan",
+        "zhongguo",
+        "qingfeng",
+        "lianzheng",
+        "zongguo",
+        "jiandan",
+        "gongsi",
+        "beijing",
+        "shijian",
+        "wenti",
+        "xuexi",
+    ] {
+        let r = mgr.convert_with("pinyin", input, 40);
+        for c in r.candidates.iter().filter(|c| c.is_sentence_contested) {
+            seen += 1;
+            let dw = c.dict_weight.unwrap_or_else(|| {
+                panic!(
+                    "`{input}` 的 contested 候选「{}」缺 dict_weight——词频对该编码将静默失效",
+                    c.text
+                )
+            });
+            assert!(
+                dw > 0 && dw < 20_000_000,
+                "`{input}`/「{}」的 dict_weight={dw} 不是可比量级",
+                c.text
+            );
+            assert!(
+                dw < c.weight,
+                "`{input}`/「{}」的 dict_weight 应严格小于整句加成后的 weight",
+                c.text
+            );
+        }
+    }
+    // 防空转：一个 contested 都没扫到时，上面的断言全是摆设
+    assert!(
+        seen > 0,
+        "样本里未出现任何 contested 候选，本用例未真正执行——需换输入样本"
+    );
+    eprintln!("扫到 {seen} 个 contested 候选，均带可比量级");
+}

@@ -1819,8 +1819,36 @@ impl Engine for PinyinEngine {
             .map(|c| c.text.clone())
             .collect();
         for text in contested {
+            // 同码最强竞争者的权重——供**合成整句**当可比量级用（判据与上面 `contested`
+            // 的过滤器逐条一致）。先算完再取可变借用。
+            let peer_max = candidates
+                .iter()
+                .filter(|o| {
+                    o.text != text
+                        && !o.is_fuzzy
+                        && !o.is_prefix
+                        && !o.is_partial
+                        && o.code == completed
+                })
+                .map(|o| o.weight)
+                .max();
             if let Some(c) = candidates.iter_mut().find(|c| c.text == text) {
                 c.is_sentence_contested = true;
+                // contested 会摘掉词频锚定、下场按量级竞争，而它的 weight 是
+                // `SENTENCE_WEIGHT_BASE` 量纲（「排第一」的编码，不可比）。经 step 2 同文
+                // 合并的整句已在那里留了 `dict_weight`（词库原值），但**合成整句没有**
+                // ——本判据只要求「是整句且有同码竞争者」，不要求它自己是词典词，
+                // `woshizhongguoren` 那类纯合成解同样会走到这里。
+                //
+                // 漏填的后果是静默的：比较器 `unwrap_or(weight)` 会拿到 3e7，竞争者
+                // 无论被选中多少次都翻不过，词频维度对该编码整体失效——正是本次改造
+                // 要修的那个 bug 换个入口重现。故用同码最强竞争者的量级顶上：语义即
+                // 「与最强竞争者平级」，无词频时靠整句 tie-break 居首，有词频时可被反超。
+                if c.dict_weight.is_none()
+                    && let Some(pm) = peer_max
+                {
+                    c.dict_weight = Some(pm);
+                }
             }
         }
 

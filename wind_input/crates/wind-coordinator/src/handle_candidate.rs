@@ -265,15 +265,21 @@ impl Coordinator {
             return;
         }
         // 词频重排归属 engine 排序层（frequency.md §5/§7）：本协调器只负责取词频记录、按引擎
-        // 类型分流到纯函数。码表/混输永久 used-first（§3），纯拼音衰减软置前（§4）。
+        // 类型分流到纯函数。码表/混输永久 used-first（§3），纯拼音走等效权重
+        // （docs/design/freq-weight-model.md）。
         if self.engine_mgr.is_pinyin() {
             let profile = self.engine_mgr.pinyin_freq_profile();
+            // 量纲基准取自**当前引擎**：混输已按 PINYIN_TIER_SCALE 降档，跨模式的硬编码
+            // 常数必错。取不到（引擎未加载/空库）时传 0 —— `freq_weight` 据此返回 0，
+            // 等效权重退化为词库权重序，即「词频不生效」而非乱序。
+            let w_max = self.engine_mgr.loaded_max_dict_weight(&active).unwrap_or(0);
             wind_engine::freq_rerank::rerank_pinyin_decay(
                 candidates,
                 &recs,
                 now_unix_secs(),
                 profile,
-                input_len,
+                w_max,
+                wind_engine::freq_rerank::DEFAULT_FREQ_SAT_COUNT,
             );
         } else {
             wind_engine::freq_rerank::rerank_codetable_usedfirst(
