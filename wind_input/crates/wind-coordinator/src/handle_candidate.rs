@@ -273,6 +273,7 @@ impl Coordinator {
                 &recs,
                 now_unix_secs(),
                 profile,
+                input_len,
             );
         } else {
             wind_engine::freq_rerank::rerank_codetable_usedfirst(

@@ -179,6 +179,29 @@ pub fn rerank_codetable_usedfirst(
     }
 }
 
+/// 词频 used-first 的**准入判据**：候选字数不得超过输入击键数。
+///
+/// 打一个 `d` 就把用过一次的「的样子」顶成首选，是词频越权最刺眼的形态——用户只给出
+/// 1 个键的信息量，却被一个 3 字词占了首位，而权重 1.18e7 的「的」被挤下去。
+/// 不合格者按「未用过」处理，落回引擎权重序（**不是丢弃**，它仍在候选列表中）。
+///
+/// **必须做成候选自身的属性，不能写成成对条件**（如「多字候选不得跨越单字候选」）：
+/// 成对条件会破坏比较器的严格弱序，`sort_by` 的行为随即未定义。做成属性后它同时承担了
+/// 两个职责——远距离补全不提拔，以及短输入下单字自然受保护（打 `d` 时任何多字候选都不
+/// 合格，单字于是只与单字竞争）。
+///
+/// 判据取**击键数**而非音节数：全拼/双拼/简拼的码长与音节数关系各不相同，而击键数是用户
+/// 实际给出的信息量，三种形态下同域可比。也因此不依赖 `boundary`——双拼下候选码（全拼域）
+/// 与击键不同域，拿它算补全距离会错。
+///
+/// 参考实现均不用布尔闸门跨越权重轴：librime 把用户词频折算成对数概率、与系统词同量纲相加
+/// （`commits=1` 几乎不改变排序），Yzime 则「向该码最高权重渐进逼近」并提供「字频固定」保护
+/// 单字。详见 docs/design/freq-rerank-reference-study.md。本判据是其中「限制作用域」这一层的
+/// 最小落地，加权模型另议。
+fn freq_promotion_eligible(c: &Candidate, input_len: usize) -> bool {
+    c.text.chars().count() <= input_len.max(1)
+}
+
 /// 拼音词频重排（§4）：衰减软置前 + 整句豁免 + 阈值褪色。
 /// 与码表的"永久 used-first"不同——拼音"用过"随半衰期褪色（久未用 → 落回权重序）。
 /// ① 整句/短语豁免：`is_sentence`（Viterbi 整句/超长词典整词）或**精确码短语**
@@ -207,6 +230,7 @@ pub fn rerank_pinyin_decay(
     recs: &HashMap<String, FreqRecord>,
     now: i64,
     profile: FreqProfile,
+    input_len: usize,
 ) {
     use std::cmp::Ordering;
     let score = |c: &Candidate| -> f64 {
@@ -256,8 +280,8 @@ pub fn rerank_pinyin_decay(
         }
         // ②③ 非整句、同层级：阈值褪色 + 衰减分降序
         let (pa, pb) = (score(a), score(b));
-        let ua = pa >= PINYIN_FREQ_EPSILON;
-        let ub = pb >= PINYIN_FREQ_EPSILON;
+        let ua = pa >= PINYIN_FREQ_EPSILON && freq_promotion_eligible(a, input_len);
+        let ub = pb >= PINYIN_FREQ_EPSILON && freq_promotion_eligible(b, input_len);
         if ua != ub {
             return if ua {
                 Ordering::Less
@@ -315,6 +339,10 @@ mod tests {
 
     const NOW: i64 = 1_700_000_000;
 
+    /// 测试用「足够长的输入」：使 `freq_promotion_eligible` 的短输入保护不介入，
+    /// 从而这些用例仍在验证词频排序本身。短输入保护由专门用例覆盖。
+    const LONG_INPUT: usize = 32;
+
     fn pin_sentence(text: &str, weight: i32) -> Candidate {
         let mut c = pin(text, weight);
         c.is_sentence = true;
@@ -330,7 +358,7 @@ mod tests {
             pin("拟", 1000),
         ];
         let r = recs(&[("你好", 20, NOW)]);
-        rerank_pinyin_decay(&mut cands, &r, NOW, FreqProfile::default());
+        rerank_pinyin_decay(&mut cands, &r, NOW, FreqProfile::default(), LONG_INPUT);
         assert_eq!(cands[0].text, "你好世界", "整句必须锚定首位");
         assert_eq!(cands[1].text, "你好", "近用词软置前于未用词");
         assert_eq!(cands[2].text, "拟");
@@ -364,7 +392,7 @@ mod tests {
             },
         ];
         let r = recs(&[]);
-        rerank_pinyin_decay(&mut cands, &r, NOW, FreqProfile::default());
+        rerank_pinyin_decay(&mut cands, &r, NOW, FreqProfile::default(), LONG_INPUT);
         assert_eq!(cands[0].text, "廉政提醒", "精确整词须在降级整句之前");
         assert_eq!(cands[1].text, "连整体性", "降级整句仍须在普通候选之前");
         assert_eq!(cands[2].text, "连");
@@ -376,7 +404,7 @@ mod tests {
     fn pinyin_undemoted_sentence_still_anchors_from_below() {
         let mut cands = vec![pin("廉政提醒", 100_000), pin_sentence("连整体性", 99_999)];
         let r = recs(&[]);
-        rerank_pinyin_decay(&mut cands, &r, NOW, FreqProfile::default());
+        rerank_pinyin_decay(&mut cands, &r, NOW, FreqProfile::default(), LONG_INPUT);
         assert_eq!(
             cands[0].text, "连整体性",
             "未降级的整句仍恒锚定首位（本函数不看 weight）"
@@ -392,7 +420,7 @@ mod tests {
             c
         }];
         let r = recs(&[("降级整句", 20, NOW)]);
-        rerank_pinyin_decay(&mut cands, &r, NOW, FreqProfile::default());
+        rerank_pinyin_decay(&mut cands, &r, NOW, FreqProfile::default(), LONG_INPUT);
         assert_eq!(
             cands[0].text, "降级整句",
             "降级整句不再锚定，故可凭词频重新浮上来"
@@ -416,7 +444,7 @@ mod tests {
         ];
         // 只用一次：衰减分 100·log2(2) = 100 ≫ ε，足以软置前。
         let r = recs(&[("思源", 1, NOW)]);
-        rerank_pinyin_decay(&mut cands, &r, NOW, FreqProfile::default());
+        rerank_pinyin_decay(&mut cands, &r, NOW, FreqProfile::default(), LONG_INPUT);
         assert_eq!(
             cands[0].text,
             "思源",
@@ -441,7 +469,7 @@ mod tests {
             pin("思源", 245),
         ];
         let r = recs(&[]);
-        rerank_pinyin_decay(&mut cands, &r, NOW, FreqProfile::default());
+        rerank_pinyin_decay(&mut cands, &r, NOW, FreqProfile::default(), LONG_INPUT);
         assert_eq!(
             cands[0].text, "寺院",
             "无使用记录时整句仍是最优解读，须维持首位"
@@ -455,7 +483,7 @@ mod tests {
     fn pinyin_high_weight_non_sentence_still_learns() {
         let mut cands = vec![pin("高权非整句", 30_000_000), pin("近用低权", 100)];
         let r = recs(&[("近用低权", 20, NOW)]);
-        rerank_pinyin_decay(&mut cands, &r, NOW, FreqProfile::default());
+        rerank_pinyin_decay(&mut cands, &r, NOW, FreqProfile::default(), LONG_INPUT);
         assert_eq!(
             cands[0].text, "近用低权",
             "非整句候选无论权重多高都应可被词频重排下沉"
@@ -473,7 +501,7 @@ mod tests {
             c
         }];
         let r = recs(&[("普通词", 30, NOW)]);
-        rerank_pinyin_decay(&mut cands, &r, NOW, FreqProfile::default());
+        rerank_pinyin_decay(&mut cands, &r, NOW, FreqProfile::default(), LONG_INPUT);
         assert_eq!(cands[0].text, "我的邮箱", "精确码短语须与整句同享锚定");
     }
 
@@ -494,7 +522,7 @@ mod tests {
         };
         let mut cands = vec![exact_word, prefix_phrase];
         let r = recs(&[("大", 3, NOW)]); // 有词频记录 → 重排确实生效
-        rerank_pinyin_decay(&mut cands, &r, NOW, FreqProfile::default());
+        rerank_pinyin_decay(&mut cands, &r, NOW, FreqProfile::default(), LONG_INPUT);
         assert_eq!(
             cands[0].text,
             "大",
@@ -509,7 +537,7 @@ mod tests {
     fn pinyin_recent_use_floats_above_higher_weight() {
         let mut cands = vec![pin("低频高权", 5000), pin("近用低权", 100)];
         let r = recs(&[("近用低权", 8, NOW)]);
-        rerank_pinyin_decay(&mut cands, &r, NOW, FreqProfile::default());
+        rerank_pinyin_decay(&mut cands, &r, NOW, FreqProfile::default(), LONG_INPUT);
         assert_eq!(cands[0].text, "近用低权", "近期使用应软置前");
     }
 
@@ -536,7 +564,7 @@ mod tests {
             pin("四", 100),        // 精确命中，未使用
         ];
         let r = recs(&[("是", 4, NOW)]); // 「是」有使用记录（模拟 si→是 count=4）
-        rerank_pinyin_decay(&mut cands, &r, NOW, FreqProfile::default());
+        rerank_pinyin_decay(&mut cands, &r, NOW, FreqProfile::default(), LONG_INPUT);
         assert_eq!(
             cands[0].text,
             "是",
@@ -552,7 +580,7 @@ mod tests {
         let long_ago = NOW - 365 * 24 * 3600; // 一年前用过一次 → 衰减远小于 ε
         let mut cands = vec![pin("高权未用", 5000), pin("陈旧低权", 100)];
         let r = recs(&[("陈旧低权", 1, long_ago)]);
-        rerank_pinyin_decay(&mut cands, &r, NOW, FreqProfile::default());
+        rerank_pinyin_decay(&mut cands, &r, NOW, FreqProfile::default(), LONG_INPUT);
         assert_eq!(cands[0].text, "高权未用", "褪色词应落回权重序，高权在前");
     }
 
@@ -825,6 +853,69 @@ mod tests {
             order,
             vec!["左", "精确短语", "矼", "date短语"],
             "精确码短语 tier1 紧随码表精确；前缀短语 tier2 与码表前缀补全同档、不抬到补全之上"
+        );
+    }
+
+    /// 短输入下，用过一次的长词不得夺走首选（用户实测现场）。
+    ///
+    /// 词频记录 `deyangzi 的样子 count=1` 存在时，只打一个 `d` 就把「的样子」顶到首位、
+    /// 把 weight 1.18e7 的「的」挤下去。此前 used-first 是布尔闸门，一旦「用过」即跨越
+    /// 权重轴，与权重差多少无关。
+    #[test]
+    fn pinyin_freq_does_not_promote_long_word_on_short_input() {
+        let mut cands = vec![
+            pin("的", 11_799_848),
+            pin("地", 10_400_000),
+            pin("的样子", 500),
+        ];
+        let r = recs(&[("的样子", 1, NOW)]);
+        rerank_pinyin_decay(&mut cands, &r, NOW, FreqProfile::default(), 1); // 输入 `d`
+        assert_eq!(
+            cands.iter().map(|c| c.text.as_str()).collect::<Vec<_>>(),
+            vec!["的", "地", "的样子"],
+            "打一个 `d` 时，用过一次的 3 字词不该越过高权重单字"
+        );
+    }
+
+    /// **反向对照**：输入足够长时，词频照常提拔——否则「修复」可能是把词频整个废掉。
+    ///
+    /// 缺了这条，上面的断言可以靠「让词频永不生效」来满足，那是更严重的退化。
+    #[test]
+    fn pinyin_freq_still_promotes_when_input_is_long_enough() {
+        let mut cands = vec![
+            pin("的", 11_799_848),
+            pin("地", 10_400_000),
+            pin("的样子", 500),
+        ];
+        let r = recs(&[("的样子", 1, NOW)]);
+        // 输入 `deyangzi`（8 键）：候选 3 字 ≤ 8，准入通过
+        rerank_pinyin_decay(&mut cands, &r, NOW, FreqProfile::default(), 8);
+        assert_eq!(
+            cands[0].text, "的样子",
+            "用户打完整码时，用过的词应当照常上浮"
+        );
+    }
+
+    /// 单字之间的调频不受影响：判据只约束「字数 > 击键数」，同字数的竞争照旧。
+    ///
+    /// 用户数据里的 `qu 去`、`yi 以` 属于此类——它们本就是正当的调频。
+    #[test]
+    fn pinyin_freq_promotes_single_char_within_short_input() {
+        let mut cands = vec![pin("取", 10_500_000), pin("区", 10_400_000), pin("去", 900)];
+        let r = recs(&[("去", 1, NOW)]);
+        rerank_pinyin_decay(&mut cands, &r, NOW, FreqProfile::default(), 2); // 输入 `qu`
+        assert_eq!(cands[0].text, "去", "单字调频在短输入下仍应生效");
+    }
+
+    /// 边界：空输入不得因 `input_len=0` 把所有候选一律判为不合格。
+    #[test]
+    fn pinyin_freq_eligible_handles_zero_length_input() {
+        let mut cands = vec![pin("啊", 1_000_000), pin("阿", 900)];
+        let r = recs(&[("阿", 5, NOW)]);
+        rerank_pinyin_decay(&mut cands, &r, NOW, FreqProfile::default(), 0);
+        assert_eq!(
+            cands[0].text, "阿",
+            "input_len=0 时单字仍应可提拔（max(1) 兜底）"
         );
     }
 }
