@@ -579,6 +579,39 @@ fn parse_comment_dict(path: &std::path::Path) -> std::io::Result<Vec<(String, St
     Ok(out)
 }
 
+/// 精确查不到时依次重试的大小写变形（全小写 → 首字母大写 → 全大写，去掉与原文相同者）。
+///
+/// **必须双向**：英文注释库里既有小写词条（`apple`）也有大写缩写（`ABC`、`AAP`），
+/// 所以既要 `Apple` → `apple`，也要 `abc` → `ABC`。只做 `to_lowercase()` 会解决一半、
+/// 漏掉另一半，而漏掉的那半表现为「有些词就是没注释」——最难自查的那种。
+///
+/// 无 ASCII 字母（中文候选是绝大多数）直接返回空表：变形对它们恒等，白算三次
+/// `to_lowercase` 还各要一次分配。中文输入是主路径，这条守卫不是可选优化。
+///
+/// # 为什么不复用 `wind_coordinator::en_case_variants`
+///
+/// 产出形状一样，语义域不同：那个是给用户**选**的候选形态（故意剔除原文，因为原文自身
+/// 已是首候选）；这里是找同一个词在库里的**别的写法**。二者将来会各自演化——比如这里
+/// 可能要加 `US`→`U.S.` 之类的规范化，而那边不该跟着变。本 crate 也不依赖 coordinator。
+fn case_fallbacks(text: &str) -> Vec<String> {
+    if !text.bytes().any(|b| b.is_ascii_alphabetic()) {
+        return Vec::new();
+    }
+    let lower = text.to_lowercase();
+    let mut chars = lower.chars();
+    let title = match chars.next() {
+        Some(f) => f.to_uppercase().collect::<String>() + chars.as_str(),
+        None => String::new(),
+    };
+    let mut out = Vec::with_capacity(3);
+    for v in [lower, title, text.to_uppercase()] {
+        if v != text && !out.contains(&v) {
+            out.push(v);
+        }
+    }
+    out
+}
+
 /// 注释库缓存文件名：`<源文件主名>.<路径哈希>.wcmt`。
 ///
 /// 带路径哈希是因为不同目录下的同名文件是常态（系统 `data/comments/emoji.dict.yaml`
@@ -801,17 +834,23 @@ impl ReverseLookup {
     /// **两遍扫描**：先跨全部库找 code 精确命中，都没有再按挂载顺序取首条。这与合并单表
     /// 时代的语义一致（组内 code 优先于挂载顺序）—— 若改成「逐库各自先 code 后首条」，
     /// 第一个库有该词但 code 对不上时就会截胡，后面库里精确匹配的那条永远轮不到。
+    ///
+    /// 全都没命中且词含 ASCII 字母时，再按大小写变形重试一遍（见 [`case_fallbacks`]）。
     pub fn comment_of(&self, text: &str, code: Option<&str>) -> String {
         if let Some(c) = code.filter(|c| !c.is_empty())
             && let Some(hit) = self.comments.iter().find_map(|s| s.lookup_by_code(text, c))
         {
             return hit.to_string();
         }
-        self.comments
-            .iter()
-            .find_map(|s| s.lookup_first(text))
-            .unwrap_or("")
-            .to_string()
+        if let Some(hit) = self.comments.iter().find_map(|s| s.lookup_first(text)) {
+            return hit.to_string();
+        }
+        for v in case_fallbacks(text) {
+            if let Some(hit) = self.comments.iter().find_map(|s| s.lookup_first(&v)) {
+                return hit.to_string();
+            }
+        }
+        String::new()
     }
 
     /// 重载拆字表（主码表方案变更时热切换）；`path=None` 清空并释放内存。
@@ -1527,6 +1566,80 @@ mod tests {
 
         drop(rl);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// ★★ 大小写回退必须**双向**：英文库里既有小写词条也有大写缩写。
+    ///
+    /// 只做 `to_lowercase()` 的话 `Apple`→`apple` 能中，但 `abc`→`ABC` 不能——
+    /// 而后者的失败表现为「有些词就是没注释」，从界面上看不出是哪一半漏了。
+    #[test]
+    fn case_fallback_is_bidirectional() {
+        let (dir, both) = rl_both(
+            "case",
+            &[&[
+                ("apple", "n.苹果", ""), // 小写词条
+                ("ABC", "字母表", ""),   // 大写缩写
+                ("Beijing", "北京", ""), // 首字母大写的专名
+                ("好", "hǎo", ""),       // 中文：不该被大小写逻辑碰到
+            ]],
+        );
+        for (name, rl) in &both {
+            // 小写词条 ← 各种输入形态
+            assert_eq!(rl.comment_of("apple", None), "n.苹果", "{name} 精确");
+            assert_eq!(
+                rl.comment_of("Apple", None),
+                "n.苹果",
+                "{name} 首字母大写→小写"
+            );
+            assert_eq!(rl.comment_of("APPLE", None), "n.苹果", "{name} 全大写→小写");
+            // 大写缩写 ← 小写输入（单向 to_lowercase 在这里必失败）
+            assert_eq!(rl.comment_of("ABC", None), "字母表", "{name} 精确");
+            assert_eq!(rl.comment_of("abc", None), "字母表", "{name} 小写→全大写");
+            assert_eq!(
+                rl.comment_of("Abc", None),
+                "字母表",
+                "{name} 首字母大写→全大写"
+            );
+            // 专名
+            assert_eq!(
+                rl.comment_of("beijing", None),
+                "北京",
+                "{name} 小写→首字母大写"
+            );
+            // 中文与未命中
+            assert_eq!(rl.comment_of("好", None), "hǎo", "{name}");
+            assert_eq!(rl.comment_of("nosuchword", None), "", "{name}");
+        }
+        drop(both);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// ★ 精确匹配**优先于**任何大小写回退：同时存在 `US`/`us` 时各取各的，不得互相顶替。
+    #[test]
+    fn exact_case_wins_over_fallback() {
+        let (dir, both) = rl_both("case-exact", &[&[("US", "美国", ""), ("us", "我们", "")]]);
+        for (name, rl) in &both {
+            assert_eq!(rl.comment_of("US", None), "美国", "{name}");
+            assert_eq!(rl.comment_of("us", None), "我们", "{name}");
+            // 两者都不精确匹配时才回退，此处 Us→us（lower 先于 upper）
+            assert_eq!(
+                rl.comment_of("Us", None),
+                "我们",
+                "{name} 回退顺序：小写在先"
+            );
+        }
+        drop(both);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 无 ASCII 字母的词不进大小写分支（中文是主路径，这条守卫是性能约束不是可选优化）。
+    #[test]
+    fn non_ascii_text_skips_case_fallbacks() {
+        assert!(case_fallbacks("中文词").is_empty());
+        assert!(case_fallbacks("１２３").is_empty());
+        assert!(case_fallbacks("123").is_empty());
+        assert!(case_fallbacks("!@#").is_empty());
+        assert!(!case_fallbacks("a").is_empty(), "含字母才产出变形");
     }
 
     /// 挂载顺序即优先级（跨库）：同一个词在两个库里都有时取靠前那个。

@@ -1079,6 +1079,14 @@ pub struct TempEnglishConfig {
     /// 典型用法是设 `horizontal`——英文候选一行放得下，全局竖排时反而占屏。
     #[serde(default)]
     pub candidate_layout: LayoutIntent,
+    /// 生成大小写变形候选（全小写 / 首字母大写 / 全大写）。
+    ///
+    /// 关掉后候选只剩输入原文 + 词库匹配。变形候选的代价是**每条都占一个候选位**：
+    /// 每页 5 条时它们能吃掉一半，把真正的词库候选挤到下一页；且它们与词库候选交错，
+    /// 注释、词频这些附加信息在变形项上都是空的，列表看起来参差。
+    /// 需要大小写变换的人默认开着，只想要词库补全的人可以关掉。
+    #[serde(default = "default_true")]
+    pub case_variants: bool,
 }
 
 impl Default for TempEnglishConfig {
@@ -1091,6 +1099,7 @@ impl Default for TempEnglishConfig {
             allow_symbols: false,
             space_as_input: false,
             candidate_layout: LayoutIntent::default(),
+            case_variants: true,
         }
     }
 }

@@ -637,8 +637,11 @@ impl Coordinator {
         };
         if let Some(schema) = self.overlay_engine_schema(state) {
             // 大小写变形（全小写 / 首字母大写 / 全大写，去掉与原文相同者）。
-            for v in en_case_variants(&buf) {
-                push(v, &mut cands);
+            // 可关：变形项每条都占一个候选位，每页 5 条时能吃掉一半。
+            if self.rt().config.input.temp_english.case_variants {
+                for v in en_case_variants(&buf) {
+                    push(v, &mut cands);
+                }
             }
             let result = self
                 .engine_mgr

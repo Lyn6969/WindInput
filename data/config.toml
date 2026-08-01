@@ -241,6 +241,11 @@ enabled = true
 # show_candidates：候选列表 = 原文 → 大小写变形（全小写/首字母大写/全大写，去掉与原文重复者）
 #                  → 英文词库前缀匹配（保持词库原文大小写）。关闭则只留原文一条。
 show_candidates = true
+# case_variants：是否生成上面那三条大小写变形候选。
+#   它们每条都占一个候选位——每页 5 条时能吃掉一半，把词库候选挤到下一页；
+#   且变形项没有词库带来的注释/词频，与词库候选交错时列表参差。
+#   只想要英文词库补全、不需要大小写变换的人可以关掉。
+case_variants = true
 shift_behavior = "temp_english"
 trigger_keys = []
 # allow_symbols：符号与数字直接入缓冲（C++ / hello2 / x64）而非上屏退出或选词。

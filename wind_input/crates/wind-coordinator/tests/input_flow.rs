@@ -2255,6 +2255,40 @@ fn test_temp_english_case_variants_from_lowercase_entry() {
     );
 }
 
+/// `case_variants = false`：不再生成大小写变形候选，原文之后直接是词库候选。
+///
+/// 与上面两个测试互为正反面——它们钉住「开着时变形恒在前三位」，这条钉住「关掉即消失」。
+/// 只有开态测试的话，开关没接上（读了配置但没用）照样全绿。
+#[test]
+fn test_temp_english_case_variants_disabled() {
+    if !has_schemas() {
+        return;
+    }
+    let mut cfg = config_with("wubi86");
+    cfg.input.temp_english.case_variants = false;
+    let coord = Coordinator::new_headless(cfg, Some(&data_dir()));
+    press_shift_letter(&coord, 'h'); // H
+    press_letter(&coord, 'e');
+    press_letter(&coord, 'l'); // 缓冲 "Hel"
+
+    let texts = coord.debug_all_candidate_texts();
+    assert_eq!(
+        texts.first().map(|s| s.as_str()),
+        Some("Hel"),
+        "原文仍是首候选"
+    );
+    assert!(
+        !texts.iter().any(|t| t == "hel" || t == "HEL"),
+        "关掉后不得再有大小写变形候选，实际: {:?}",
+        texts
+    );
+    assert!(
+        texts.iter().any(|t| t == "help"),
+        "词库候选不受影响（本开关只管变形项），实际: {:?}",
+        texts
+    );
+}
+
 /// allow_symbols 开：数字键 1-9 一律入缓冲（英文原文优先于选词），即使此刻有词库候选。
 #[test]
 fn test_temp_english_allow_symbols_digits_go_to_buffer() {
