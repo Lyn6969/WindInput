@@ -124,7 +124,8 @@ C++ implementation files for the TSF DLL。所有文件编译链接进唯一目�
 
 ### CaretEditSession.cpp
 - `CCaretEditSession::DoEditSession()` - TSF edit session callback
-- `CCaretEditSession::GetCaretRect()` - Static method to retrieve caret position
+- `CCaretEditSession::GetCaretAndCompositionStartRect()` - 同步取 caret + 组合起点（selection 退化时降级用组合起点当 caret）
+- `CCaretEditSession::RequestCaretRectAsync()` - 异步取坐标（非按键上下文必须用它，见函数注释）
 
 ### DisplayAttributeInfo.cpp
 - `CDisplayAttributeInfoInput::GetAttributeInfo()` - Return underline styling for composition

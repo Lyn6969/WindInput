@@ -36,19 +36,32 @@ static inline uint8_t ComputeInputReason(bool disabled, UINT64 mask)
 static const GUID kGuidCompartmentKeyboardDisabled =
     { 0x71a5b253, 0x1951, 0x466b, { 0x9f, 0xbc, 0x9c, 0x88, 0x08, 0xfa, 0x84, 0xf2 } };
 
-// 判断屏幕坐标点是否落在前台窗口矩形之外（原点错误的越界坐标）。个别宿主（某些 OpenGL /
-// 异常渲染应用）的 GetTextExt 会返回越界屏幕坐标，直接用会把候选框甩到屏幕角落。检出后
-// 调用方应丢弃该坐标、回退到窗口相对的方法。参考 Weasel enhanced_position；仅在明显越界时
-// 返回 true，光标在窗口内的正常情形不受影响。
-static bool IsScreenPointOutsideForegroundWindow(LONG x, LONG y)
+// 判断屏幕坐标点是否**不落在任何显示器上**，即物理上不存在的野坐标。个别宿主（某些 Qt /
+// OpenGL / 异常渲染应用）的 GetTextExt 会返回这类坐标，直接用会把候选框甩到屏幕角落。
+// 检出后调用方应丢弃该坐标、回退到窗口相对的方法。
+//
+// ⚠ 2026-08-01 之前这里判的是「是否落在**前台窗口矩形**外」（参考 Weasel enhanced_position）。
+// 那个判据同时表达了两件事——「坐标是不是野值」和「坐标属不属于前台窗口」——而后者在下面两类
+// 合法场景里必然误判（实测误伤 19 次 vs 正确拦截 12 次）：
+//   ① **焦点窗口 ≠ 前台窗口**：桌面输入时焦点属于 shell 左上角的搜索小窗 (13,9,13,37)，
+//      而点过任务栏后前台窗口是 Shell_TrayWnd（屏幕底部一条）⇒ 合法坐标被判越界；
+//   ② **窗口移动中**：GetTextExt 与 GetWindowRect 是两次独立查询，拖动窗口时它们来自不同
+//      时刻，光标便"落在窗口外"（实测每 7ms 一帧、y 逐格递减的序列里最后一帧被误杀）。
+// 真正要挡的野坐标（(1284,1309)、(-25563,1198)、(669,-3375) 等）全部远离**所有**显示器，
+// 换成本判据照样挡得住。
+//
+// ⚠ 用 MonitorFromPoint 而非 SM_*VIRTUALSCREEN：虚拟屏幕是所有显示器的**外接矩形**，
+// 多屏错位排布时屏幕之间存在空隙（实测机器副屏 X∈[-1920,-480]、主屏 X∈[0,1707]，中间是空的），
+// 外接矩形会放行落在空隙里的坐标，逐显示器判定才挡得住。
+//
+// ⚠ 本判据比原先的前台窗口判据**粗**：它在 DPI 转换前执行，而 TSF DLL 运行在各种 DPI awareness
+// 的宿主里，显示器范围与坐标可能不同语境（前台窗口判据因 GetWindowRect 与 GetTextExt 同进程
+// 同语境而天然免疫）。可接受的理由是这里只做「离谱与否」的粗判断——真野坐标差的是几千像素，
+// 远超 DPI 缩放能造成的 1.5~2 倍偏差。
+static bool IsScreenPointOutsideAllMonitors(LONG x, LONG y)
 {
-    HWND hwndFg = GetForegroundWindow();
-    if (hwndFg == nullptr)
-        return false;
-    RECT rcWin = {};
-    if (!GetWindowRect(hwndFg, &rcWin))
-        return false;
-    return (x < rcWin.left || x > rcWin.right || y < rcWin.top || y > rcWin.bottom);
+    POINT pt = { x, y };
+    return MonitorFromPoint(pt, MONITOR_DEFAULTTONULL) == nullptr;
 }
 
 // EditSession for reading the focused context's TSF InputScope set.
@@ -696,8 +709,9 @@ private:
                 // 并重新通过 fallback 查询，因此这里不再需要标记延迟重试。
                 LONG h = caretRect.bottom - caretRect.top;
                 // 同 GetCaretPositionFromTSF：跳过退化矩形(h<=0)与越界坐标，避免把不可信坐标
-                // 缓存后被 timer 兜底取用。越界时不缓存，留待 fallback 链重新求解。
-                if (h > 0 && !IsScreenPointOutsideForegroundWindow(caretRect.left, caretRect.top))
+                // 缓存后被后续路径取用。越界时不缓存，留待 fallback 链重新求解。
+                // 越界判据同样已从「前台窗口」放宽为「所有显示器」，理由见那里的注释。
+                if (h > 0 && !IsScreenPointOutsideAllMonitors(caretRect.left, caretRect.top))
                 {
                     _pTextService->_cachedCaretRect = caretRect;
                     _pTextService->_hasCachedCaretPos = TRUE;
@@ -3684,8 +3698,15 @@ BOOL CTextService::GetCaretPositionFromTSF(LONG* px, LONG* py, LONG* pHeight)
     }
 
     // Use EditSession to get caret position
-    RECT rc = {};
-    BOOL result = CCaretEditSession::GetCaretRect(pContext, _tfClientId, &rc);
+    //
+    // 带上 _pComposition：组合进行中若 selection 的 GetTextExt 退化，edit session 内部会降级
+    // 用组合起点当 caret（见 CCaretEditSession::DoEditSession 的「锚点降级」）。无组合时
+    // _pComposition 为 nullptr，行为与从前一致。
+    RECT rc = {}, rcCompStart = {};
+    BOOL hasCompStart = FALSE;
+    BOOL result = CCaretEditSession::GetCaretAndCompositionStartRect(
+        pContext, _tfClientId, _pComposition, &rc, &rcCompStart, &hasCompStart,
+        (LONG)GetPendingCommitPrefixLength());
     pContext->Release();
 
     if (result)
@@ -3705,11 +3726,16 @@ BOOL CTextService::GetCaretPositionFromTSF(LONG* px, LONG* py, LONG* pHeight)
             return FALSE;
         }
 
-        // 坐标越界保护：TSF 坐标落在前台窗口外时判定不可信，返回 FALSE，让 GetCaretPosition
-        // 回退到 GUIThreadInfo / GetCaretPos（窗口相对、可靠）。详见 IsScreenPointOutsideForegroundWindow。
-        if (IsScreenPointOutsideForegroundWindow(rc.left, rc.top))
+        // 坐标越界保护：坐标不落在任何显示器上时判定不可信，返回 FALSE，让 GetCaretPosition
+        // 回退到 GUIThreadInfo / GetCaretPos。详见 IsScreenPointOutsideAllMonitors。
+        //
+        // ⚠ 原先用的是前台窗口判据，2026-08-01 改宽。「有回退链」曾被当成「丢弃代价小」的理由，
+        // 但**回退值的质量从未被检验**：桌面输入时 GUIThreadInfo 返回的是别的 shell 窗口残留的
+        // caret（实测 (1479,1217)，来自已关闭的"更多图标"弹框），比被丢弃的 TSF 坐标 (473,189)
+        // 差得多。判据放宽后这类误伤消失，真野坐标（远离所有显示器）照样挡住。
+        if (IsScreenPointOutsideAllMonitors(rc.left, rc.top))
         {
-            WIND_LOG_DEBUG_FMT(L"GetCaretPositionFromTSF: caret(%ld,%ld) outside fg window, falling back\n", rc.left, rc.top);
+            WIND_LOG_DEBUG_FMT(L"GetCaretPositionFromTSF: caret(%ld,%ld) outside all monitors, falling back\n", rc.left, rc.top);
             return FALSE;
         }
 
@@ -4275,9 +4301,13 @@ void CTextService::OnAsyncCaretRectReady(const RECT& caretRect, BOOL hasCompStar
         return;
     }
 
-    if (IsScreenPointOutsideForegroundWindow(caretRect.left, caretRect.top))
+    // 本路径丢弃即终点（没有回退链），误伤一次候选窗就定位失败。
+    // ⚠ 曾以「同步路径有回退链所以代价小」为由只放宽这一处，结果桌面输入第二个字走按键同步
+    // 路径照样错位——**「有回退」不等于「回退值更好」**：那里回退到的 GUIThreadInfo 值是别的
+    // shell 窗口残留的 caret，比被丢弃的 TSF 坐标差得多。三处判据现已统一。
+    if (IsScreenPointOutsideAllMonitors(caretRect.left, caretRect.top))
     {
-        WIND_LOG_DEBUG_FMT(L"OnAsyncCaretRectReady: caret(%ld,%ld) outside fg window, dropping\n",
+        WIND_LOG_DEBUG_FMT(L"OnAsyncCaretRectReady: caret(%ld,%ld) outside all monitors, dropping\n",
                            caretRect.left, caretRect.top);
         return;
     }

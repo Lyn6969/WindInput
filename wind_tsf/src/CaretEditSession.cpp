@@ -108,7 +108,12 @@ STDAPI CCaretEditSession::DoEditSession(TfEditCookie ec)
         sel[0].range->Release();
 
         // If a composition is set, also get the start position of the composition range
-        if (_succeeded && _pComposition != nullptr)
+        //
+        // ⚠ 这里**不再受 _succeeded 守卫**（2026-08-01）：caret(selection) 取失败或退化时，
+        // 组合起点往往仍然有效——实测 shell 的临时输入小窗，selection 恒返回退化矩形
+        // (2559,1367,2560,1367) h=0，而 composition range 给出有效的 (473,189,473,217)。
+        // 那时它是手上唯一可信的坐标，原先却因为这个守卫压根不去取。
+        if (_pComposition != nullptr)
         {
             ITfRange* pCompRange = nullptr;
             hr = _pComposition->GetRange(&pCompRange);
@@ -149,6 +154,39 @@ STDAPI CCaretEditSession::DoEditSession(TfEditCookie ec)
                     pStartRange->Release();
                 }
                 pCompRange->Release();
+            }
+        }
+
+        // ★ 锚点降级：caret 无效而组合起点有效时，用组合起点当 caret。
+        //
+        // 候选窗本来就该跟随「正在编辑的那段文本」，而不是插入点——两者只差一个组合宽度。
+        // 原先的行为是让上层判定 caret 无效后下坠到 GUIThreadInfo，去取一个**属于别的窗口**
+        // 的系统光标（shell 场景实测取到任务栏残留的 (0,1388)，与真实位置差 1171px），
+        // 那才是真正的错位。手上既然有同一个 edit session、同一个 cookie 下语义精确的矩形，
+        // 就没有理由舍近求远。
+        const LONG caretHeight = _caretRect.bottom - _caretRect.top;
+        const LONG compStartHeight = _compositionStartRect.bottom - _compositionStartRect.top;
+        if ((!_succeeded || caretHeight <= 0) && _hasCompositionStart && compStartHeight > 0)
+        {
+            WIND_LOG_DEBUG_FMT(L"CaretEditSession: caret 无效(succeeded=%d h=%ld)，降级用组合起点 (%ld, %ld, %ld, %ld)\n",
+                               _succeeded, caretHeight,
+                               _compositionStartRect.left, _compositionStartRect.top,
+                               _compositionStartRect.right, _compositionStartRect.bottom);
+            _caretRect = _compositionStartRect;
+            _succeeded = TRUE;
+
+            // 顺带探测本 context 自己的显示区域。GetScreenExt 是 TSF 语义内的参照系，不依赖
+            // 窗口层级与前台状态；若实测可靠，将来可取代「所有显示器」做越界校验——「前台窗口」
+            // 那个参照已被 shell 场景证伪。只在降级时打，避免每帧噪音。
+            RECT rcScreen = {};
+            if (SUCCEEDED(pContextView->GetScreenExt(&rcScreen)))
+            {
+                WIND_LOG_DEBUG_FMT(L"CaretEditSession: context GetScreenExt = (%ld, %ld, %ld, %ld)\n",
+                                   rcScreen.left, rcScreen.top, rcScreen.right, rcScreen.bottom);
+            }
+            else
+            {
+                WIND_LOG_DEBUG(L"CaretEditSession: context GetScreenExt failed\n");
             }
         }
     }
@@ -217,44 +255,6 @@ BOOL CCaretEditSession::GetCompositionStartResult(RECT* prc)
         return TRUE;
     }
     return FALSE;
-}
-
-// Static method to execute the edit session and get caret rect
-BOOL CCaretEditSession::GetCaretRect(ITfContext* pContext, TfClientId tfClientId, RECT* prc)
-{
-    if (pContext == nullptr || prc == nullptr)
-    {
-        return FALSE;
-    }
-
-    CCaretEditSession* pEditSession = new CCaretEditSession(pContext);
-    if (pEditSession == nullptr)
-    {
-        return FALSE;
-    }
-
-    HRESULT hrSession = S_OK;
-    HRESULT hr = pContext->RequestEditSession(
-        tfClientId,
-        pEditSession,
-        TF_ES_SYNC | TF_ES_READ,
-        &hrSession
-    );
-
-    BOOL result = FALSE;
-
-    if (SUCCEEDED(hr) && SUCCEEDED(hrSession))
-    {
-        result = pEditSession->GetResult(prc);
-    }
-    else
-    {
-        WIND_LOG_ERROR_FMT(L"RequestEditSession failed hr=0x%08X, hrSession=0x%08X\n", hr, hrSession);
-    }
-
-    pEditSession->Release();
-
-    return result;
 }
 
 // Static method to get both caret rect and composition start rect

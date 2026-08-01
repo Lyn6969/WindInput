@@ -20,11 +20,8 @@ public:
     // ITfEditSession
     STDMETHODIMP DoEditSession(TfEditCookie ec);
 
-    // Execute the session and get caret position
-    // Returns TRUE if successful, FALSE otherwise
-    static BOOL GetCaretRect(ITfContext* pContext, TfClientId tfClientId, RECT* prc);
-
     // Execute the session and get both caret position and composition start position
+    // 组合进行中 selection 的 GetTextExt 退化时，会降级用组合起点当 caret（见 DoEditSession）
     // compStartOffset: 组合起点偏移（wchar 数），见 SetCompositionStartOffset
     static BOOL GetCaretAndCompositionStartRect(ITfContext* pContext, TfClientId tfClientId,
                                                  ITfComposition* pComposition,
