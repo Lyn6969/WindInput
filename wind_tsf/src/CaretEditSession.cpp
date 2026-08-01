@@ -9,6 +9,7 @@ CCaretEditSession::CCaretEditSession(ITfContext* pContext)
     , _compStartOffset(0)
     , _hasCompositionStart(FALSE)
     , _succeeded(FALSE)
+    , _pAsyncOwner(nullptr)
 {
     if (_pContext)
     {
@@ -21,6 +22,7 @@ CCaretEditSession::CCaretEditSession(ITfContext* pContext)
 CCaretEditSession::~CCaretEditSession()
 {
     SafeRelease(_pContext);
+    SafeRelease(_pAsyncOwner);
 }
 
 STDAPI CCaretEditSession::QueryInterface(REFIID riid, void** ppvObj)
@@ -169,6 +171,21 @@ STDAPI CCaretEditSession::DoEditSession(TfEditCookie ec)
 
     pContextView->Release();
 
+    // 异步模式：结果只能从这里出去——静态入口在排队执行时早已返回。
+    // 失败时**不回调**：服务端会继续等自己的兜底超时，用按键时缓存的坐标显示，
+    // 那份坐标来自按键路径的同步 edit session，比任何回退值都可信。
+    if (_pAsyncOwner != nullptr)
+    {
+        if (_succeeded)
+        {
+            _pAsyncOwner->OnAsyncCaretRectReady(_caretRect, _hasCompositionStart, _compositionStartRect);
+        }
+        else
+        {
+            WIND_LOG_DEBUG(L"CaretEditSession(async): no rect obtained, not notifying owner\n");
+        }
+    }
+
     return _succeeded ? S_OK : E_FAIL;
 }
 
@@ -180,6 +197,16 @@ BOOL CCaretEditSession::GetResult(RECT* prc)
         return TRUE;
     }
     return FALSE;
+}
+
+void CCaretEditSession::SetAsyncOwner(CTextService* pOwner)
+{
+    SafeRelease(_pAsyncOwner);
+    _pAsyncOwner = pOwner;
+    if (_pAsyncOwner)
+    {
+        _pAsyncOwner->AddRef();
+    }
 }
 
 BOOL CCaretEditSession::GetCompositionStartResult(RECT* prc)
@@ -274,4 +301,49 @@ BOOL CCaretEditSession::GetCaretAndCompositionStartRect(ITfContext* pContext, Tf
 
     pEditSession->Release();
     return result;
+}
+
+// Static method to request the caret rect asynchronously (see header for why)
+BOOL CCaretEditSession::RequestCaretRectAsync(ITfContext* pContext, TfClientId tfClientId,
+                                               ITfComposition* pComposition, LONG compStartOffset,
+                                               CTextService* pOwner)
+{
+    if (pContext == nullptr || pOwner == nullptr)
+    {
+        return FALSE;
+    }
+
+    CCaretEditSession* pEditSession = new CCaretEditSession(pContext);
+    if (pEditSession == nullptr)
+    {
+        return FALSE;
+    }
+
+    pEditSession->SetComposition(pComposition);
+    pEditSession->SetCompositionStartOffset(compStartOffset);
+    pEditSession->SetAsyncOwner(pOwner);
+
+    HRESULT hrSession = S_OK;
+    HRESULT hr = pContext->RequestEditSession(
+        tfClientId,
+        pEditSession,
+        TF_ES_ASYNCDONTCARE | TF_ES_READ,
+        &hrSession
+    );
+
+    // 释放我们这一份引用。异步排队时 TSF 自己持有一份，对象活到 DoEditSession 回调完成为止。
+    pEditSession->Release();
+
+    if (FAILED(hr))
+    {
+        WIND_LOG_ERROR_FMT(L"RequestCaretRectAsync: RequestEditSession failed hr=0x%08X\n", hr);
+        return FALSE;
+    }
+
+    // hrSession == TF_S_ASYNC 表示已排队、回调稍后到达；S_OK 表示 manager 选择了同步执行，
+    // 此时回调已经在上面的调用里跑完了。两者都算受理成功。
+    WIND_LOG_DEBUG_FMT(L"RequestCaretRectAsync: accepted hrSession=0x%08X (%s)\n",
+                       hrSession,
+                       hrSession == TF_S_ASYNC ? L"queued" : L"executed inline");
+    return TRUE;
 }

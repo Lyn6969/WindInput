@@ -874,10 +874,21 @@ LRESULT CALLBACK CLangBarItemButton::_MsgWndProc(HWND hwnd, UINT msg, WPARAM wPa
             CLangBarItemButton* pThis = reinterpret_cast<CLangBarItemButton*>(GetWindowLongPtrW(hwnd, GWLP_USERDATA));
             if (pThis != nullptr && pThis->_pTextService != nullptr && pThis->_pTextService->HasActiveComposition())
             {
-                // Timer 兜底：清除 _compositionJustStarted 让 SendCaretPositionUpdate
-                // 走正常路径（消费已缓存的坐标，应对不发 OnLayoutChange 的应用）。
+                // Timer 兜底：清除 _compositionJustStarted 让取坐标走正常路径
+                // （消费已缓存的坐标，应对不发 OnLayoutChange 的应用）。
                 pThis->_pTextService->ClearCompositionJustStarted();
-                pThis->_pTextService->SendCaretPositionUpdate();
+
+                // ⚠ 这里是 WM_TIMER，不是按键上下文——同步 edit session 在这里会被宿主合法
+                // 拒绝（Word 实测 TS_E_SYNCHRONOUS 15/15），而 SendCaretPositionUpdate 失败后
+                // 会回退到 GetGUIThreadInfo 的 Win32 caret。Word 只在正文行维护那个 caret，
+                // 标题等非正文样式行上它指向别处，候选窗因此错位数百像素。
+                // 故这条路径改用异步 edit session：宿主会把请求排队，等文档可用时回调。
+                // 发不出去才退回同步路径（非 TSF 宿主仍需要 GUIThreadInfo 那条链）。
+                if (!pThis->_pTextService->RequestCaretPositionUpdateAsync())
+                {
+                    WIND_LOG_DEBUG(L"CARET_RETRY timer: async request not issued, falling back to sync path\n");
+                    pThis->_pTextService->SendCaretPositionUpdate();
+                }
             }
             return 0;
         }

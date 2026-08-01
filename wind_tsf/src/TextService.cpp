@@ -4207,6 +4207,94 @@ static void ConvertToPhysicalCoordinates(LONG& x, LONG& y, LONG& height,
                        x, y, height, compStartX, compStartY);
 }
 
+// 坐标出口：DPI 归一 → 记为 last known → 发 IPC。同步与异步两条取坐标路径共用，
+// 保证「记住的坐标」和「发出去的坐标」永远是同一份（曾经只有同步路径更新 last known）。
+void CTextService::_EmitCaretUpdate(LONG x, LONG y, LONG height, LONG compStartX, LONG compStartY)
+{
+    ConvertToPhysicalCoordinates(x, y, height, compStartX, compStartY);
+
+    _hasLastKnownCaretPos = TRUE;
+    _lastKnownCaretX = x;
+    _lastKnownCaretY = y;
+    _lastKnownCaretHeight = height > 0 ? height : DEFAULT_CARET_HEIGHT;
+
+    if (_pIPCClient != nullptr && _pIPCClient->IsConnected())
+    {
+        _pIPCClient->SendCaretUpdate((int)x, (int)y, (int)height, (int)compStartX, (int)compStartY);
+    }
+}
+
+// 非按键上下文里发起取坐标：见 CCaretEditSession::RequestCaretRectAsync 的说明。
+// 返回 FALSE 表示请求根本没发出去（无焦点 context 等），调用方需自己兜底。
+BOOL CTextService::RequestCaretPositionUpdateAsync()
+{
+    if (_pThreadMgr == nullptr || _pComposition == nullptr)
+    {
+        return FALSE;
+    }
+
+    ITfDocumentMgr* pDocMgr = nullptr;
+    HRESULT hr = _pThreadMgr->GetFocus(&pDocMgr);
+    if (FAILED(hr) || pDocMgr == nullptr)
+    {
+        return FALSE;
+    }
+
+    ITfContext* pContext = nullptr;
+    hr = pDocMgr->GetTop(&pContext);
+    pDocMgr->Release();
+    if (FAILED(hr) || pContext == nullptr)
+    {
+        return FALSE;
+    }
+
+    BOOL requested = CCaretEditSession::RequestCaretRectAsync(
+        pContext, _tfClientId, _pComposition, (LONG)GetPendingCommitPrefixLength(), this);
+    pContext->Release();
+
+    return requested;
+}
+
+// 异步 edit session 的回调出口。这里**刻意不做任何回退**：取不到就不发，服务端会用按键
+// 时缓存的坐标兜底，那份来自按键路径的同步 edit session，比 Win32 caret 可信得多。
+// 曾经的 bug 正是回退到 GetGUIThreadInfo，在 Word 非正文样式行上拿到无关窗口的 caret。
+void CTextService::OnAsyncCaretRectReady(const RECT& caretRect, BOOL hasCompStart, const RECT& compStartRect)
+{
+    // 排队期间用户可能已上屏：这份坐标属于上一轮组合，发出去会把候选窗钉在已消失的组合上。
+    if (_pComposition == nullptr)
+    {
+        WIND_LOG_DEBUG(L"OnAsyncCaretRectReady: composition already ended, dropping\n");
+        return;
+    }
+
+    LONG height = caretRect.bottom - caretRect.top;
+    if (height <= 0)
+    {
+        // 退化矩形 = 宿主尚未完成排版，判据同 GetCaretPositionFromTSF。
+        WIND_LOG_DEBUG(L"OnAsyncCaretRectReady: degenerate rect (height=0), dropping\n");
+        return;
+    }
+
+    if (IsScreenPointOutsideForegroundWindow(caretRect.left, caretRect.top))
+    {
+        WIND_LOG_DEBUG_FMT(L"OnAsyncCaretRectReady: caret(%ld,%ld) outside fg window, dropping\n",
+                           caretRect.left, caretRect.top);
+        return;
+    }
+
+    LONG compStartX = 0, compStartY = 0;
+    if (hasCompStart)
+    {
+        compStartX = compStartRect.left;
+        compStartY = compStartRect.bottom;
+    }
+
+    WIND_LOG_DEBUG_FMT(L"OnAsyncCaretRectReady: caret(%ld,%ld h=%ld) compStart=(%ld,%ld)\n",
+                       caretRect.left, caretRect.bottom, height, compStartX, compStartY);
+
+    _EmitCaretUpdate(caretRect.left, caretRect.bottom, height, compStartX, compStartY);
+}
+
 void CTextService::SendCaretPositionUpdate()
 {
     // Weasel 模式：composition 刚创建后第一次调用，不立即发 IPC。
@@ -4285,24 +4373,10 @@ void CTextService::SendCaretPositionUpdate()
         }
     }
 
-    // Convert logical coordinates to physical if host is not Per-Monitor DPI aware
     if (hasPosition)
     {
-        ConvertToPhysicalCoordinates(x, y, height, compStartX, compStartY);
-    }
-
-    if (hasPosition)
-    {
-        _hasLastKnownCaretPos = TRUE;
-        _lastKnownCaretX = x;
-        _lastKnownCaretY = y;
-        _lastKnownCaretHeight = height > 0 ? height : DEFAULT_CARET_HEIGHT;
-    }
-
-    // SendCaretUpdate is async (fire-and-forget), no response expected
-    if (_pIPCClient != nullptr && _pIPCClient->IsConnected())
-    {
-        _pIPCClient->SendCaretUpdate((int)x, (int)y, (int)height, (int)compStartX, (int)compStartY);
+        // DPI 归一 + 记 last known + 发 IPC（fire-and-forget，无响应）
+        _EmitCaretUpdate(x, y, height, compStartX, compStartY);
     }
 }
 

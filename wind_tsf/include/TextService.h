@@ -211,6 +211,13 @@ public:
     BOOL GetCaretPosition(LONG* px, LONG* py, LONG* pHeight);
     void SendCaretPositionUpdate();
 
+    // 非按键上下文（WM_TIMER 等）专用：用异步 edit session 取坐标，结果经
+    // OnAsyncCaretRectReady 回调发出。同步锁在这些上下文里会被宿主合法拒绝
+    // （TS_E_SYNCHRONOUS），详见 CCaretEditSession::RequestCaretRectAsync。
+    BOOL RequestCaretPositionUpdateAsync();
+    // 异步 edit session 的结果回调（由 CCaretEditSession 调用）
+    void OnAsyncCaretRectReady(const RECT& caretRect, BOOL hasCompStart, const RECT& compStartRect);
+
     // Get caret position using TSF APIs (more accurate for browsers)
     BOOL GetCaretPositionFromTSF(LONG* px, LONG* py, LONG* pHeight);
     BOOL GetCompositionStartPosition(LONG* px, LONG* py);
@@ -306,6 +313,9 @@ public:
     BOOL HasDeferredComposition() const { return !_deferredCompText.empty(); }
 
 private:
+    // 坐标出口：DPI 归一 + 更新 last known + 发 IPC。同步/异步两条取坐标路径共用。
+    void _EmitCaretUpdate(LONG x, LONG y, LONG height, LONG compStartX, LONG compStartY);
+
     LONG _refCount;
     ITfThreadMgr* _pThreadMgr;
     TfClientId _tfClientId;
