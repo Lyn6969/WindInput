@@ -1583,6 +1583,16 @@ pub struct StatusIndicatorConfig {
     /// 显示模式："temp"（临时,duration 后隐藏,默认）| "always"（常驻:激活/获焦时显示,失焦隐藏）。
     #[serde(default = "default_status_display_mode")]
     pub display_mode: String,
+    /// 焦点切换到新的输入框时，是否也强制显示一次状态气泡（默认关）。
+    ///
+    /// 与 `display_mode` 正交：`always` 本就在获焦时显示，本项对它无额外效果；真正改变行为的是
+    /// `temp`——原本只有用户主动切换中英/标点/全半角时才弹，开启后**换个输入框也弹一次**，
+    /// 用来提示「你现在切到的这个框，输入法是什么状态」。
+    ///
+    /// ⚠ 显示时会绕过 `show_status` 的文本去重：焦点切换恰恰是「状态文本没变但仍要重弹」的场景，
+    /// 走去重路径会让它在同状态下**完全不显示**。
+    #[serde(default)]
+    pub show_on_focus: bool,
     /// 方案名显示样式："full"（全名，默认）| "short"（图标短称 icon_label，回退全名）。
     #[serde(default = "default_schema_name_style")]
     pub schema_name_style: String,
@@ -1637,6 +1647,7 @@ impl Default for StatusIndicatorConfig {
             enabled: true,
             duration: default_status_duration(),
             display_mode: default_status_display_mode(),
+            show_on_focus: false,
             schema_name_style: default_schema_name_style(),
             position_mode: default_status_position_mode(),
             offset_x: 0,

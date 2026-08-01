@@ -2,6 +2,9 @@
 
 #include "Globals.h"
 #include "BinaryProtocol.h" // HostWindowKind / HOST_WINDOW_KIND_COUNT for the host window array
+// AsyncCaretResult / CaretProbeKind 按值出现在 OnAsyncCaretRectReady 签名里，需要完整定义。
+// 反向不成立（CaretEditSession.h 只前置声明 CTextService），故无循环包含。
+#include "CaretEditSession.h"
 #include <string>
 #include <vector>
 #include <utility>
@@ -217,10 +220,20 @@ public:
     // OnAsyncCaretRectReady 回调发出。同步锁在这些上下文里会被宿主合法拒绝
     // （TS_E_SYNCHRONOUS），详见 CCaretEditSession::RequestCaretRectAsync。
     BOOL RequestCaretPositionUpdateAsync();
+
+    // OnSetFocus 专用：焦点刚到达、**尚无 composition** 时取一次插入点。
+    //
+    // 与上面那个的差别不只是"有没有组合"：焦点路径的回调不能用 `_pComposition` 判活
+    // （它恒为 null），改用 _focusSessionId 判归属；拿到的坐标也不走组合定位，而是补一条
+    // CMD_CARET_UPDATE 更新服务端缓存，供状态气泡（ui.status.show_on_focus）落座。
+    //
+    // 返回 TRUE 仅表示请求已受理。内联档（记事本实测 hrSession=S_OK）回调会在本函数**返回前**
+    // 跑完，届时 _lastFocusCaretX/Y 已被刷成 TSF 权威值，可直接随 focus_gained 一起发出去；
+    // 排队档（Word 实测 TF_S_ASYNC，1~2ms）则晚于 focus_gained 到达，走补发通道。
+    BOOL RequestFocusCaretAsync(ITfDocumentMgr* pDocMgrFocus);
+
     // 异步 edit session 的结果回调（由 CCaretEditSession 调用）
-    // usedCompStartAsCaret: caret 是否由组合起点降级顶替，用于标注上报坐标的来源
-    void OnAsyncCaretRectReady(const RECT& caretRect, BOOL hasCompStart, const RECT& compStartRect,
-                               BOOL usedCompStartAsCaret);
+    void OnAsyncCaretRectReady(const AsyncCaretResult& result);
 
     // Get caret position using TSF APIs (more accurate for browsers)
     // pUsedCompStart: 非空时输出「caret 是否由组合起点降级顶替」，用于区分两种 TSF 来源
@@ -432,6 +445,16 @@ private:
     LONG _lastFocusCaretX;
     LONG _lastFocusCaretY;
     LONG _lastFocusCaretHeight;
+    // 上面这组焦点 caret 的来源（CARET_SRC_*）。**必须与坐标成对读写**——它们分开就等于
+    // 又回到「一个 BOOL 把『拿到了坐标』和『拿到了那个坐标』压成同一个 TRUE」的老问题。
+    int  _lastFocusCaretSource = CARET_SRC_UNKNOWN;
+    // 异步焦点探测的去重：同一个 _focusSessionId 只发起一次。OnSetFocus 在 DocMgr 抖动时
+    // 会被反复调用，不去重就会给宿主刷一串 edit session 请求。
+    ULONGLONG _focusCaretProbedSession = 0;
+    // 本会话的 focus_gained 是否已发出。异步焦点回调据此决定"随包发"还是"补发"：
+    // 内联执行时回调早于 SendFocusGained，坐标直接进包；排队执行时晚于它，必须补一条
+    // caret_update。**两者都发就会被服务端的 handle_focus_gained 覆写掉**，见回调注释。
+    ULONGLONG _focusGainedSentForSession = 0;
     BOOL _hasLastKnownCaretPos;
     LONG _lastKnownCaretX;
     LONG _lastKnownCaretY;

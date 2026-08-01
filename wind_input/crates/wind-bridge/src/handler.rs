@@ -182,6 +182,11 @@ pub struct FocusData {
     pub input_scope_mask: u64,
     pub disabled: bool,
     pub reason: u8,
+    /// 上面那组坐标的来源（`wind_ipc::protocol::caret_source::*`）。
+    ///
+    /// `OnSetFocus` 不是按键上下文，同步 edit session 必被宿主拒绝，回退链交出的是**跨窗口的**
+    /// Win32 光标。焦点气泡就锚在这组坐标上，故必须能分辨来源，详见 `FocusGainedPayload`。
+    pub caret_source: i32,
 }
 
 /// 光标位置数据

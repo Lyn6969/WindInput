@@ -822,7 +822,7 @@ BOOL CIPCClient::SendCompositionTerminated()
 }
 
 BOOL CIPCClient::SendFocusGained(int caretX, int caretY, int caretHeight, UINT64 inputScopeMask,
-                                  bool disabled, uint8_t reason)
+                                  bool disabled, uint8_t reason, int caretSource)
 {
     if (!_ShouldAttemptOperation())
     {
@@ -834,9 +834,9 @@ BOOL CIPCClient::SendFocusGained(int caretX, int caretY, int caretHeight, UINT64
         return FALSE;
     }
 
-    _LogDebug(L"Sending focus_gained (sync) with caret: x=%d, y=%d, h=%d, inputScope=0x%016llX, token=0x%016llX, disabled=%d, reason=%u",
-              caretX, caretY, caretHeight, (unsigned long long)inputScopeMask, (unsigned long long)_clientToken,
-              disabled ? 1 : 0, (unsigned)reason);
+    _LogDebug(L"Sending focus_gained (sync) with caret: x=%d, y=%d, h=%d, src=%d, inputScope=0x%016llX, token=0x%016llX, disabled=%d, reason=%u",
+              caretX, caretY, caretHeight, caretSource, (unsigned long long)inputScopeMask,
+              (unsigned long long)_clientToken, disabled ? 1 : 0, (unsigned)reason);
 
     FocusGainedPayload payload = {};
     payload.caret.x = caretX;
@@ -846,6 +846,11 @@ BOOL CIPCClient::SendFocusGained(int caretX, int caretY, int caretHeight, UINT64
     payload.inputScopeMask = inputScopeMask;
     payload.disabled = disabled ? 1 : 0;
     payload.reason = reason;
+    // CARET_SRC_* 值域 0~6，压进 1 字节。越界值（不该出现）钳到 UNKNOWN 而不是截断，
+    // 免得高位被切掉后恰好落在某个**有效**来源上，把「未知」伪装成「可信」。
+    payload.caretSource = (caretSource >= 0 && caretSource <= CARET_SRC_LAST_KNOWN)
+                              ? (uint8_t)caretSource
+                              : (uint8_t)CARET_SRC_UNKNOWN;
 
     // 同步发送（首次按键模式竞态根治，见 server_handler.go::CmdFocusGained 注释）：
     // Go 端在响应里回传权威模式（仅读内存两字段，无等待 / 无回调进本进程 → 无死锁可能），

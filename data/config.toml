@@ -450,6 +450,9 @@ style = "short"
 enabled = true
 duration = 800
 display_mode = "temp"
+# 焦点切换到新输入框时也强制显示一次（提示"这个框现在是什么状态"）。
+# follow_caret 定位模式下，只有取到 TSF 权威坐标才显示——拿不到宁可不显示，也不弹在错位置。
+show_on_focus = false
 schema_name_style = "full"
 position_mode = "follow_caret"
 offset_x = 0

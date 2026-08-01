@@ -375,6 +375,7 @@ fn handle_client(
                 input_scope_mask: fg.input_scope_mask,
                 disabled: fg.disabled != 0,
                 reason: fg.reason,
+                caret_source: fg.caret_source,
             };
             handler.handle_focus_gained(&data);
         }
@@ -499,9 +500,10 @@ pub(crate) fn dispatch_command(
                     height: fg.caret.height,
                     composition_start_x: fg.caret.composition_start_x,
                     composition_start_y: fg.caret.composition_start_y,
-                    // 焦点载荷刻意不带 source：它内嵌 CaretPayload，加字段会改变整包布局；
-                    // 而这一帧本就只落缓存、不参与显示决策，来源信息没有消费者。
-                    source: wind_ipc::protocol::caret_source::UNKNOWN,
+                    // 来源随焦点载荷尾部的第 39 字节到达（旧 DLL 落 UNKNOWN）。
+                    // 「这一帧只落缓存、没有来源信息的消费者」已不再成立——`ui.status.show_on_focus`
+                    // 让状态气泡直接锚在这组坐标上，来源是它唯一能据以判断可信度的东西。
+                    source: fg.caret_source,
                 });
             }
             // 新 DLL 同步发送（is_async=false）：回传权威模式解除其阻塞并消除首键竞态。

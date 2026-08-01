@@ -74,6 +74,9 @@ fn handle_uds_client(mut stream: UnixStream, handler: Arc<dyn MessageHandler>) {
                     input_scope_mask: fg.input_scope_mask,
                     disabled: fg.disabled != 0,
                     reason: fg.reason,
+                    // macOS `.app` 发的是短包，恒落 UNKNOWN——那边没有 TSF，坐标来源
+                    // 本就是另一套语义，不适用 CARET_SRC_* 的分级。
+                    caret_source: fg.caret_source,
                 });
             }
         }

@@ -130,6 +130,7 @@ impl Coordinator {
             MenuCmd::InitialMode(m) => self.set_initial_state_rule(false, m),
             MenuCmd::InitialPunct(m) => self.set_initial_state_rule(true, m),
             MenuCmd::StatusToggleAlways => self.status_toggle_always(),
+            MenuCmd::StatusToggleShowOnFocus => self.status_toggle_show_on_focus(),
             MenuCmd::StatusTogglePinned => self.status_toggle_pinned(),
             MenuCmd::StatusResetPosition => self.status_reset_position(),
             MenuCmd::StatusScreenshot => {
@@ -170,6 +171,19 @@ impl Coordinator {
         } else {
             self.hide_tip();
         }
+    }
+
+    /// 状态提示气泡右键菜单「焦点切换时显示」：翻转 `ui.status.show_on_focus` 并立即生效。
+    ///
+    /// 与 `status_toggle_always` 不同，这里**不立即弹一次气泡**：用户此刻正对着菜单操作，
+    /// 焦点没动，弹出来反而像误触发。下一次真的切换输入框时自然会显示。
+    pub(crate) fn status_toggle_show_on_focus(&self) {
+        let next = !self.rt().config.ui.status.show_on_focus;
+        let _ = Config::set_user_value(
+            &["ui", "status", "show_on_focus"],
+            toml::Value::Boolean(next),
+        );
+        self.refresh_config_in_memory(|c| c.ui.status.show_on_focus = next);
     }
 
     /// 状态提示气泡右键菜单「恢复默认位置」：改回跟随光标，custom_x/y 归零。
@@ -266,15 +280,18 @@ impl Coordinator {
         }
     }
 
-    /// 右键状态提示气泡请求的功能菜单：常驻显示 / 固定位置（均带勾选）/ 恢复默认位置 / 截图。
+    /// 右键状态提示气泡请求的功能菜单：常驻显示 / 焦点切换时显示 / 固定位置（均带勾选）/
+    /// 恢复默认位置 / 截图。
     pub(crate) fn show_status_menu(&self, x: i32, y: i32) {
         use wind_ui::manager::MenuItemSpec as M;
         let si_always;
         let si_fixed;
+        let si_on_focus;
         {
             let si = &self.rt().config.ui.status;
             si_always = si.display_mode.eq_ignore_ascii_case("always");
             si_fixed = si.position_mode.eq_ignore_ascii_case("fixed");
+            si_on_focus = si.show_on_focus;
         }
         // 菜单打开期间抑制气泡自动隐藏，否则临时模式下菜单还开着气泡就没了。
         let _ = self.ui_tx.send(UiCommand::SetStatusMenuOpen(true));
@@ -285,6 +302,14 @@ impl Coordinator {
                 cmd(MenuCmd::StatusToggleAlways),
                 true,
                 si_always,
+            ),
+            // 常驻模式下本项无意义（获焦本就会显示），置灰而非隐藏——项忽隐忽现比置灰更难理解，
+            // 用户会以为功能没了。
+            M::leaf(
+                "焦点切换时显示",
+                cmd(MenuCmd::StatusToggleShowOnFocus),
+                !si_always,
+                si_on_focus,
             ),
             M::leaf("固定位置", cmd(MenuCmd::StatusTogglePinned), true, si_fixed),
             M::leaf(

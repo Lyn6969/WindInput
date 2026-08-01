@@ -4,6 +4,34 @@
 
 class CTextService;
 
+// 异步取坐标的用途。**回调的作废判据随用途而不同**，这是它必须存在的唯一理由：
+//   Composition —— 组合期间取坐标，排队期间用户可能已上屏 ⇒ 判据是「组合还在不在」；
+//   Focus       —— 焦点刚到达时取坐标，此时**根本没有组合** ⇒ 只能用焦点会话号判归属。
+// 曾把两者压成同一条 `_pComposition == nullptr` 判据，结果焦点路径的回调 100% 被丢弃，
+// 而日志上一切正常（请求受理成功、edit session 也跑完了），是个彻底静默的失效。
+enum class CaretProbeKind
+{
+    Composition,
+    Focus,
+};
+
+// 异步取坐标的回调结果。
+//
+// **刻意用结构体而非平铺参数**：这里已有两个 RECT 和三个 BOOL，平铺后调用点就是一串没有
+// 名字的 TRUE/FALSE，且每加一个字段都要改动所有调用点的实参顺序——顺序错了还不报错。
+struct AsyncCaretResult
+{
+    RECT caretRect;
+    RECT compStartRect;
+    BOOL hasCompStart;
+    // caret 无效时降级用了组合起点顶替。仍属 TSF 语义域（CARET_SRC_TSF_COMPOSITION）。
+    BOOL usedCompStartAsCaret;
+    CaretProbeKind kind;
+    // 发起时刻的归属标记。Focus 用 _focusSessionId（回调到达时焦点可能已经切走，
+    // 那份坐标属于上一个应用）；Composition 不用它，靠 _pComposition 判活。
+    ULONGLONG sessionTag;
+};
+
 // EditSession for getting caret position using TSF APIs
 // This is required to call ITfContextView::GetTextExt which needs an edit cookie
 class CCaretEditSession : public ITfEditSession
@@ -39,9 +67,17 @@ public:
     // 时再回调 DoEditSession，而不是当场失败。
     //
     // 返回 TRUE 表示请求已被受理（可能已同步执行完，也可能排队等待回调），FALSE 表示发起失败。
+    //
+    // ⚠ `hrSession == S_OK` 意味着 manager 选择**内联执行**（记事本实测），此时 DoEditSession
+    // 连同 OnAsyncCaretRectReady 回调已经在本函数返回**之前**跑完了。焦点路径依赖这一点：
+    // 内联档下坐标能赶在同一次 OnSetFocus 的 SendFocusGained 之前就位。
+    //
+    // kind / sessionTag 见 CaretProbeKind 与 AsyncCaretResult。
     static BOOL RequestCaretRectAsync(ITfContext* pContext, TfClientId tfClientId,
                                        ITfComposition* pComposition, LONG compStartOffset,
-                                       CTextService* pOwner);
+                                       CTextService* pOwner,
+                                       CaretProbeKind kind = CaretProbeKind::Composition,
+                                       ULONGLONG sessionTag = 0);
 
     // Get the result after DoEditSession is called
     BOOL GetResult(RECT* prc);
@@ -56,6 +92,8 @@ public:
     BOOL UsedCompStartAsCaret() const { return _usedCompStartAsCaret; }
     // 设为异步模式并持有 owner 强引用；见 RequestCaretRectAsync
     void SetAsyncOwner(CTextService* pOwner);
+    // 异步回调的用途与归属标记，见 CaretProbeKind / AsyncCaretResult
+    void SetProbe(CaretProbeKind kind, ULONGLONG sessionTag) { _probeKind = kind; _sessionTag = sessionTag; }
 
 private:
     LONG _refCount;
@@ -72,4 +110,6 @@ private:
     // 非空 = 异步模式：DoEditSession 完成后直接回调它，因为异步执行时静态入口早已返回、
     // 调用方拿不到结果。持有强引用（AddRef/Release），避免回调到达前 owner 被销毁。
     CTextService* _pAsyncOwner;
+    CaretProbeKind _probeKind;
+    ULONGLONG _sessionTag;
 };

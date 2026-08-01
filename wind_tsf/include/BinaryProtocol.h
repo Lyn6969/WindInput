@@ -196,9 +196,9 @@ constexpr int32_t CARET_SRC_LAST_KNOWN     = 6; // 上次已知好值
 // Caret position payload v2 (24 bytes) = CaretPayload + source
 //
 // ⚠ 刻意**不把 source 加进 CaretPayload 本身**：FocusGainedPayload 内嵌了 CaretPayload，
-// 改它的大小会连带改变焦点载荷布局，新旧两侧混用时 focus_gained 会整体错位。而焦点事件携带的
-// caret 本就是「只更新缓存、不参与显示决策」的（见 Rust handler.rs 的 handle_focus_gained_caret），
-// 不需要来源信息。故只给 CMD_CARET_UPDATE / CMD_CARET_PROBE 这两条**参与定位决策**的通道加。
+// 改它的大小会连带改变焦点载荷布局，新旧两侧混用时 focus_gained 会整体错位。
+// 焦点通道改为在 FocusGainedPayload **尾部**单独追加一个字节（见 caretSource），
+// 尾部追加不动任何既有字段偏移，与本结构「另起一个 v2」是同一条兼容策略的两种写法。
 //
 // 兼容：服务端按 payload 长度分支——20 字节按旧格式解析且 source=UNKNOWN，24 字节读 source。
 // macOS .app 仍发 12 字节，同样落入 UNKNOWN。故新旧两侧可任意组合。
@@ -499,8 +499,8 @@ struct FocusLostPayload
 };
 static_assert(sizeof(FocusLostPayload) == 9, "FocusLostPayload must be 9 bytes");
 
-// CMD_FOCUS_GAINED extended payload (38 bytes = CaretPayload + clientToken + inputScopeMask
-// + disabled + reason)
+// CMD_FOCUS_GAINED extended payload (39 bytes = CaretPayload + clientToken + inputScopeMask
+// + disabled + reason + caretSource)
 struct FocusGainedPayload
 {
     CaretPayload caret;          // 20 bytes: caret position
@@ -515,8 +515,18 @@ struct FocusGainedPayload
     uint8_t      disabled;       // 1 byte: 0/1 - GUID_COMPARTMENT_KEYBOARD_DISABLED 命中
     // reason: 0 None / 1 CompartmentDisabled / 2 InputScopePassword / 3 NumericPassword
     uint8_t      reason;         // 1 byte
+    // 上面那个 caret 的来源（CARET_SRC_* 之一，值域 0~6 故 1 字节足够）。
+    //
+    // ⚠ 焦点 caret 曾被当作「只更新缓存、不参与显示决策」而无需来源信息。**「焦点切换时显示
+    // 状态提示气泡」推翻了这个前提**——那个气泡就锚在这个坐标上，于是它第一次直接参与定位。
+    // 而 OnSetFocus 不是按键上下文，同步 edit session 必被拒（TS_E_SYNCHRONOUS），回退链会
+    // 交出一个**跨窗口的** Win32 光标却仍以 TRUE 返回；消费端不知道来源就无从分辨。
+    //
+    // 兼容：尾部追加，既有字段偏移全不变。服务端按长度分支——<39 字节落 UNKNOWN（旧 DLL），
+    // ≥39 读本字段。故新旧两侧可任意组合。
+    uint8_t      caretSource;    // 1 byte: CARET_SRC_*
 };
-static_assert(sizeof(FocusGainedPayload) == 38, "FocusGainedPayload must be 38 bytes");
+static_assert(sizeof(FocusGainedPayload) == 39, "FocusGainedPayload must be 39 bytes");
 
 // CMD_INPUT_STATE_REPORT payload (14 bytes). Sent standalone (not tied to a focus_gained)
 // when the disabled/reason state changes for the currently focused control, e.g. a

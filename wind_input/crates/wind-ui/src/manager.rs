@@ -273,6 +273,8 @@ pub enum MenuCmd {
     TogglePasswordSuppress,
     /// 状态提示气泡：切换常驻显示（display_mode always/temp）
     StatusToggleAlways,
+    /// 状态提示气泡：切换「焦点切换时显示」（ui.status.show_on_focus）
+    StatusToggleShowOnFocus,
     /// 状态提示气泡：恢复默认位置（position_mode=follow_caret）
     StatusResetPosition,
     /// 状态提示气泡：截图此窗口
@@ -354,6 +356,7 @@ impl MenuKind {
                 MenuCmd::TooltipCopy => 118,
                 MenuCmd::TooltipScreenshot => 119,
                 MenuCmd::StatusTogglePinned => 122,
+                MenuCmd::StatusToggleShowOnFocus => 123,
                 MenuCmd::ToggleInputDiagnostics => 120,
                 MenuCmd::TogglePasswordSuppress => 121,
                 MenuCmd::FirstShowMode(m) => 5000 + m as i32,
@@ -397,6 +400,7 @@ impl MenuKind {
             118 => MenuCmd::TooltipCopy,
             119 => MenuCmd::TooltipScreenshot,
             122 => MenuCmd::StatusTogglePinned,
+            123 => MenuCmd::StatusToggleShowOnFocus,
 
             120 => MenuCmd::ToggleInputDiagnostics,
             121 => MenuCmd::TogglePasswordSuppress,
@@ -1596,6 +1600,7 @@ mod menu_id_tests {
             MenuCmd::StatusResetPosition,
             MenuCmd::StatusScreenshot,
             MenuCmd::StatusTogglePinned,
+            MenuCmd::StatusToggleShowOnFocus,
             MenuCmd::TooltipCopy,
             MenuCmd::TooltipScreenshot,
             MenuCmd::SchemaSelect(0),

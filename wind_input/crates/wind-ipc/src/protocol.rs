@@ -467,10 +467,10 @@ impl CaretPayload {
 }
 
 // ──────────────────────────────────────────────
-// Focus Gained Payload (38 bytes: 旧 36 + disabled(1) + reason(1))
+// Focus Gained Payload (39 bytes: 旧 36 + disabled(1) + reason(1) + caret_source(1))
 // ──────────────────────────────────────────────
 
-/// 焦点获取载荷 (38 bytes: 旧 36 + disabled(1) + reason(1))
+/// 焦点获取载荷 (39 bytes: 旧 36 + disabled(1) + reason(1) + caret_source(1))
 #[derive(Clone, Copy, Debug)]
 pub struct FocusGainedPayload {
     pub caret: CaretPayload,
@@ -478,13 +478,25 @@ pub struct FocusGainedPayload {
     pub input_scope_mask: u64,
     pub disabled: u8,
     pub reason: u8,
+    /// 上面那个 `caret` 的来源（[`caret_source`] 之一）。
+    ///
+    /// ⚠ 焦点 caret 一度被认为「只更新缓存、不参与显示决策」而无需来源信息。**「焦点切换时
+    /// 显示状态提示气泡」推翻了这个前提**——气泡就锚在这个坐标上。而 `OnSetFocus` 不是按键
+    /// 上下文，同步 edit session 必被宿主拒绝，回退链会交出**跨窗口的** Win32 光标却仍以成功
+    /// 返回；不带来源就无从分辨「拿到了一个坐标」和「拿到了**那个**坐标」。
+    ///
+    /// 旧 DLL 只发 38 字节，落 [`caret_source::UNKNOWN`]。
+    pub caret_source: i32,
 }
 
 impl FocusGainedPayload {
-    pub const SIZE: usize = 38;
+    pub const SIZE: usize = 39;
 
     pub fn from_bytes(buf: &[u8]) -> Option<Self> {
-        // 向后兼容：至少要有旧 36 字节；disabled/reason 缺省 0
+        // 向后兼容：至少要有旧 36 字节；disabled/reason/caret_source 缺省 0
+        //
+        // ⚠ 长度判据刻意**不用 `Self::SIZE`**：那样每加一个尾部字段都会把旧 DLL 整体拒掉。
+        // 这里的每个 `>=` 分支对应协议史上的一次尾部追加，逐个补齐即可。
         if buf.len() < 36 {
             return None;
         }
@@ -497,12 +509,18 @@ impl FocusGainedPayload {
         ]);
         let disabled = if buf.len() >= 37 { buf[36] } else { 0 };
         let reason = if buf.len() >= 38 { buf[37] } else { 0 };
+        let caret_source = if buf.len() >= 39 {
+            buf[38] as i32
+        } else {
+            caret_source::UNKNOWN
+        };
         Some(Self {
             caret,
             client_token,
             input_scope_mask,
             disabled,
             reason,
+            caret_source,
         })
     }
 }
@@ -784,5 +802,86 @@ mod tests {
         assert_eq!(&b[48..52], &(-3i32).to_le_bytes()); // rendered_hover_index @48
         assert_eq!(&b[52..56], &0xE1E2E3E4u32.to_le_bytes()); // target_instance_id @52
         assert_eq!(&b[56..64], &[0u8; 8]); // reserved[2] @56..64 = 0
+    }
+
+    /// 构造一个焦点载荷字节串，`with_source` 决定是否带上第 39 字节。
+    fn focus_bytes(with_source: Option<u8>) -> Vec<u8> {
+        let mut b = Vec::new();
+        b.extend_from_slice(&111i32.to_le_bytes()); // caret.x
+        b.extend_from_slice(&222i32.to_le_bytes()); // caret.y
+        b.extend_from_slice(&33i32.to_le_bytes()); // caret.height
+        b.extend_from_slice(&444i32.to_le_bytes()); // comp_start_x
+        b.extend_from_slice(&555i32.to_le_bytes()); // comp_start_y
+        b.extend_from_slice(&0x0123_4567_89AB_CDEFu64.to_le_bytes()); // client_token
+        b.extend_from_slice(&0x8000_0000u64.to_le_bytes()); // input_scope_mask
+        b.push(1); // disabled
+        b.push(2); // reason
+        if let Some(s) = with_source {
+            b.push(s);
+        }
+        b
+    }
+
+    /// 尾部追加 `caret_source` 后，**旧 DLL 的 38 字节包必须照常解析**。
+    ///
+    /// 这条不是形式主义：长度判据若图省事写成 `buf.len() < Self::SIZE`，每加一个尾部字段就会
+    /// 把所有旧 DLL 整体拒掉，而表现是「切换应用后输入法毫无反应」——焦点事件根本没进 core，
+    /// 日志上看不出是解码拒绝还是压根没收到。
+    #[test]
+    fn focus_gained_v1_38_bytes_still_parses_with_unknown_source() {
+        let b = focus_bytes(None);
+        assert_eq!(b.len(), 38, "本用例要覆盖的就是旧 DLL 的 38 字节形态");
+        let fg = FocusGainedPayload::from_bytes(&b).expect("38 字节旧包必须能解析");
+        // CaretPayload 是 #[repr(packed)]，assert_eq! 会对字段取引用 → 非对齐引用编译错误。
+        // 先按值拷到局部再断言。
+        let (cx, cy, ch) = (fg.caret.x, fg.caret.y, fg.caret.height);
+        assert_eq!(cx, 111);
+        assert_eq!(cy, 222);
+        assert_eq!(ch, 33);
+        assert_eq!(fg.client_token, 0x0123_4567_89AB_CDEF);
+        assert_eq!(fg.disabled, 1);
+        assert_eq!(fg.reason, 2);
+        assert_eq!(
+            fg.caret_source,
+            caret_source::UNKNOWN,
+            "旧包没有来源信息，必须落 UNKNOWN 而不是碰巧读到别的字节"
+        );
+    }
+
+    /// 39 字节新包读出真实来源，且**不影响任何既有字段的偏移**。
+    #[test]
+    fn focus_gained_v2_39_bytes_reads_caret_source() {
+        let b = focus_bytes(Some(caret_source::TSF_SELECTION as u8));
+        assert_eq!(b.len(), 39);
+        let fg = FocusGainedPayload::from_bytes(&b).expect("39 字节新包必须能解析");
+        assert_eq!(fg.caret_source, caret_source::TSF_SELECTION);
+        // 既有字段逐个复核：尾部追加的全部意义就是它们的偏移没动。
+        // （packed 字段先按值拷到局部，理由同上一个用例。）
+        let (cx, csx, csy) = (
+            fg.caret.x,
+            fg.caret.composition_start_x,
+            fg.caret.composition_start_y,
+        );
+        assert_eq!(cx, 111);
+        assert_eq!(csx, 444);
+        assert_eq!(csy, 555);
+        assert_eq!(fg.client_token, 0x0123_4567_89AB_CDEF);
+        assert_eq!(fg.input_scope_mask, 0x8000_0000);
+        assert_eq!(fg.disabled, 1);
+        assert_eq!(fg.reason, 2);
+        assert_eq!(FocusGainedPayload::SIZE, 39);
+    }
+
+    /// GUI 回退坐标**不属于** TSF 语义域——焦点气泡的可信度闸门整个建立在这个判定上。
+    #[test]
+    fn gui_caret_is_not_tsf_domain() {
+        assert!(caret_source::is_tsf(caret_source::TSF_SELECTION));
+        assert!(caret_source::is_tsf(caret_source::TSF_COMPOSITION));
+        assert!(caret_source::is_tsf(caret_source::TSF_CACHED));
+        // 以下每一个都曾经或可能冒充插入点，必须全部判否
+        assert!(!caret_source::is_tsf(caret_source::GUI_CARET));
+        assert!(!caret_source::is_tsf(caret_source::CONSOLE));
+        assert!(!caret_source::is_tsf(caret_source::LAST_KNOWN));
+        assert!(!caret_source::is_tsf(caret_source::UNKNOWN));
     }
 }

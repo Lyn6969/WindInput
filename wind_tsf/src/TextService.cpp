@@ -2133,22 +2133,44 @@ STDAPI CTextService::OnSetFocus(ITfDocumentMgr* pDocMgrFocus, ITfDocumentMgr* pD
         // 自留一份：IsPasswordSuppressActive 的吃键门控须在 OnTestKeyDown 本地算出（早于 IPC）。
         _focusInputScopeMask = inputScopeMask;
 
-        // Get caret position for toolbar placement (separate concern from _hasTextInputContext)
+        // 焦点 caret。**先发异步 edit session 请求，再走同步回退链** —— 顺序是有意的：
+        // 内联执行的宿主（记事本实测 hrSession=S_OK）会在下面这行里把回调跑完，
+        // 于是 _lastFocusCaretX/Y/Source 当场变成 TSF 权威值，后面的同步链只是兜底。
+        // 排队执行的宿主（Word 实测 TF_S_ASYNC）则由回调补发 caret_update。
+        //
+        // 为什么不能只靠同步链：OnSetFocus 不是按键上下文，TF_ES_SYNC 必被宿主拒绝
+        // （TS_E_SYNCHRONOUS），回退链交出的是**跨窗口的** Win32 光标却仍以 TRUE 返回。
+        _lastFocusCaretSource = CARET_SRC_UNKNOWN;
+        RequestFocusCaretAsync(pDocMgrFocus);
+
         LONG caretX = 0, caretY = 0, caretHeight = 0;
-        if (!GetCaretPosition(&caretX, &caretY, &caretHeight) && _hasLastKnownCaretPos)
+        int  caretSource = CARET_SRC_UNKNOWN;
+        if (_lastFocusCaretSource != CARET_SRC_UNKNOWN)
+        {
+            // 异步回调已内联跑完并填好了权威坐标，同步链没有必要再跑一遍。
+            caretX       = _lastFocusCaretX;
+            caretY       = _lastFocusCaretY;
+            caretHeight  = _lastFocusCaretHeight;
+            caretSource  = _lastFocusCaretSource;
+            WIND_LOG_DEBUG_FMT(L"OnSetFocus: 异步焦点坐标已内联就位 x=%ld y=%ld h=%ld src=%d",
+                               caretX, caretY, caretHeight, caretSource);
+        }
+        else if (!GetCaretPosition(&caretX, &caretY, &caretHeight, &caretSource) && _hasLastKnownCaretPos)
         {
             caretX = _lastKnownCaretX;
             caretY = _lastKnownCaretY;
             caretHeight = _lastKnownCaretHeight;
+            caretSource = CARET_SRC_LAST_KNOWN;
             WIND_LOG_INFO_FMT(L"OnSetFocus: using last known caret position x=%ld y=%ld h=%ld", caretX, caretY, caretHeight);
         }
         WIND_LOG_DEBUG_FMT(
-            L"compat.focus.caret focusSession=%llu x=%ld y=%ld height=%ld",
-            _focusSessionId, caretX, caretY, caretHeight
+            L"compat.focus.caret focusSession=%llu x=%ld y=%ld height=%ld src=%d",
+            _focusSessionId, caretX, caretY, caretHeight, caretSource
         );
         _lastFocusCaretX = caretX;
         _lastFocusCaretY = caretY;
         _lastFocusCaretHeight = caretHeight > 0 ? caretHeight : DEFAULT_CARET_HEIGHT;
+        _lastFocusCaretSource = caretSource;
 
         // XamlIsland/transient locked DocMgr guard: dynFlags=0x20 consistently
         // marks Explorer's XamlIsland container DocMgrs where RequestEditSession
@@ -2214,8 +2236,12 @@ STDAPI CTextService::OnSetFocus(ITfDocumentMgr* pDocMgrFocus, ITfDocumentMgr* pD
             // 需要能和 COM/日志开销分开归因。
             const LONGLONG focusIpcT0 = WindLog::PerfNow();
             const BOOL focusSent = _pIPCClient->SendFocusGained(
-                caretX, caretY, caretHeight, inputScopeMask, _bKeyboardDisabled != FALSE, inputReason);
+                caretX, caretY, caretHeight, inputScopeMask, _bKeyboardDisabled != FALSE, inputReason,
+                caretSource);
             focusIpcMs += WindLog::PerfMsSince(focusIpcT0);
+            // 排队档的异步回调据此判定"该补发 caret_update"。**必须在这里置位而非发送前**：
+            // 内联档的回调早已在上面跑完，那时它读到的是旧值（≠本会话），于是正确地选择"不补发"。
+            _focusGainedSentForSession = _focusSessionId;
             if (focusSent)
             {
                 WIND_LOG_DEBUG_FMT(L"FocusGained sent (sync) focusSession=%llu ipc=%.1fms",
@@ -3227,23 +3253,28 @@ void CTextService::TryRecoverFocusState()
     LONG caretX = _lastFocusCaretX;
     LONG caretY = _lastFocusCaretY;
     LONG caretHeight = _lastFocusCaretHeight > 0 ? _lastFocusCaretHeight : DEFAULT_CARET_HEIGHT;
+    // 缓存值的来源随缓存一起继承——坐标与来源必须成对读写，分开就等于又把「拿到了坐标」
+    // 和「拿到了那个坐标」压回同一个真值。
+    int  caretSource = _lastFocusCaretSource;
 
-    if (GetCaretPosition(&caretX, &caretY, &caretHeight))
+    if (GetCaretPosition(&caretX, &caretY, &caretHeight, &caretSource))
     {
         _lastFocusCaretX = caretX;
         _lastFocusCaretY = caretY;
         _lastFocusCaretHeight = caretHeight > 0 ? caretHeight : DEFAULT_CARET_HEIGHT;
+        _lastFocusCaretSource = caretSource;
     }
     else if (_hasLastKnownCaretPos)
     {
         caretX = _lastKnownCaretX;
         caretY = _lastKnownCaretY;
         caretHeight = _lastKnownCaretHeight;
+        caretSource = CARET_SRC_LAST_KNOWN;
         WIND_LOG_INFO_FMT(L"Recovering focus state with last known caret x=%ld y=%ld h=%ld", caretX, caretY, caretHeight);
     }
 
-    WIND_LOG_INFO_FMT(L"Attempting deferred focus recovery focusSession=%llu x=%ld y=%ld h=%ld",
-        _focusSessionId, caretX, caretY, caretHeight);
+    WIND_LOG_INFO_FMT(L"Attempting deferred focus recovery focusSession=%llu x=%ld y=%ld h=%ld src=%d",
+        _focusSessionId, caretX, caretY, caretHeight, caretSource);
 
     // 异步化：SendFocusGained 现在是 fire-and-forget。状态由 push pipe 经
     // CMD_ACTIVATION_STATUS_PUSH 异步送达，AsyncReader 线程的回调走 PostMessage
@@ -3260,7 +3291,8 @@ void CTextService::TryRecoverFocusState()
         pDocMgrRecover->Release();
     }
     uint8_t recoveryReason = ComputeInputReason(_bKeyboardDisabled != FALSE, recoveryMask);
-    if (_pIPCClient->SendFocusGained((int)caretX, (int)caretY, (int)caretHeight, recoveryMask, _bKeyboardDisabled != FALSE, recoveryReason))
+    if (_pIPCClient->SendFocusGained((int)caretX, (int)caretY, (int)caretHeight, recoveryMask,
+                                     _bKeyboardDisabled != FALSE, recoveryReason, caretSource))
     {
         _needsFocusRecovery = FALSE;
         _pIPCClient->ClearNeedsSyncFlag();
@@ -4318,7 +4350,48 @@ BOOL CTextService::RequestCaretPositionUpdateAsync()
     }
 
     BOOL requested = CCaretEditSession::RequestCaretRectAsync(
-        pContext, _tfClientId, _pComposition, (LONG)GetPendingCommitPrefixLength(), this);
+        pContext, _tfClientId, _pComposition, (LONG)GetPendingCommitPrefixLength(), this,
+        CaretProbeKind::Composition, 0);
+    pContext->Release();
+
+    return requested;
+}
+
+// OnSetFocus 专用的异步取坐标，见头文件说明。
+//
+// 为什么焦点路径必须走异步：OnSetFocus **不是按键上下文**，MSDN 明文限定 TF_ES_SYNC 只在
+// "documented situations (such as keystroke handling)" 下可期待成功，否则 "the call will
+// likely fail"。实测宿主返回 TS_E_SYNCHRONOUS 拒绝，GetCaretPosition 于是下坠到
+// GetGUIThreadInfo——那是个**跨窗口**的 Win32 光标，Word 只在正文行维护它，标题行上取到的是
+// 别处的陈旧值（实测偏差 814px，指纹 height=20）。
+BOOL CTextService::RequestFocusCaretAsync(ITfDocumentMgr* pDocMgrFocus)
+{
+    if (pDocMgrFocus == nullptr)
+    {
+        return FALSE;
+    }
+
+    // 同一焦点会话只探一次：OnSetFocus 在 DocMgr 抖动时会被反复调用（Excel 单元格切换、
+    // 浏览器 SPA 导航），不去重就是给宿主刷 edit session 请求。
+    if (_focusCaretProbedSession == _focusSessionId)
+    {
+        return FALSE;
+    }
+    _focusCaretProbedSession = _focusSessionId;
+
+    ITfContext* pContext = nullptr;
+    HRESULT hr = pDocMgrFocus->GetTop(&pContext);
+    if (FAILED(hr) || pContext == nullptr)
+    {
+        return FALSE;
+    }
+
+    // 传 nullptr 组合：焦点刚到达时本就没有 composition，edit session 只取 selection 的
+    // GetTextExt。这也意味着「组合起点降级」那条路在焦点场景走不到，caret 取不到就是取不到，
+    // 由回调如实丢弃——**不在这条路上造回退值**。
+    BOOL requested = CCaretEditSession::RequestCaretRectAsync(
+        pContext, _tfClientId, nullptr, 0, this,
+        CaretProbeKind::Focus, _focusSessionId);
     pContext->Release();
 
     return requested;
@@ -4327,11 +4400,28 @@ BOOL CTextService::RequestCaretPositionUpdateAsync()
 // 异步 edit session 的回调出口。这里**刻意不做任何回退**：取不到就不发，服务端会用按键
 // 时缓存的坐标兜底，那份来自按键路径的同步 edit session，比 Win32 caret 可信得多。
 // 曾经的 bug 正是回退到 GetGUIThreadInfo，在 Word 非正文样式行上拿到无关窗口的 caret。
-void CTextService::OnAsyncCaretRectReady(const RECT& caretRect, BOOL hasCompStart, const RECT& compStartRect,
-                                          BOOL usedCompStartAsCaret)
+void CTextService::OnAsyncCaretRectReady(const AsyncCaretResult& result)
 {
-    // 排队期间用户可能已上屏：这份坐标属于上一轮组合，发出去会把候选窗钉在已消失的组合上。
-    if (_pComposition == nullptr)
+    const RECT& caretRect     = result.caretRect;
+    const RECT& compStartRect = result.compStartRect;
+    const BOOL  isFocusProbe  = (result.kind == CaretProbeKind::Focus);
+
+    // 归属校验。**两种用途的判据不同，不能合并**：
+    //   Composition —— 排队期间用户可能已上屏，这份坐标属于上一轮组合，发出去会把候选窗
+    //                  钉在已消失的组合上；
+    //   Focus       —— 此时本就没有 composition（拿 _pComposition 判会 100% 丢弃，且完全
+    //                  静默），改判焦点会话号：回调到达前用户可能已经切走，那份坐标属于
+    //                  上一个应用——正是「切过去气泡出现在无关位置」的成因之一。
+    if (isFocusProbe)
+    {
+        if (result.sessionTag != _focusSessionId)
+        {
+            WIND_LOG_DEBUG_FMT(L"OnAsyncCaretRectReady(focus): 焦点已翻篇 tag=%llu now=%llu, dropping\n",
+                               result.sessionTag, _focusSessionId);
+            return;
+        }
+    }
+    else if (_pComposition == nullptr)
     {
         WIND_LOG_DEBUG(L"OnAsyncCaretRectReady: composition already ended, dropping\n");
         return;
@@ -4357,15 +4447,40 @@ void CTextService::OnAsyncCaretRectReady(const RECT& caretRect, BOOL hasCompStar
     }
 
     LONG compStartX = 0, compStartY = 0;
-    if (hasCompStart)
+    if (result.hasCompStart)
     {
         compStartX = compStartRect.left;
         compStartY = compStartRect.bottom;
     }
 
-    const int source = usedCompStartAsCaret ? CARET_SRC_TSF_COMPOSITION : CARET_SRC_TSF_SELECTION;
-    WIND_LOG_DEBUG_FMT(L"OnAsyncCaretRectReady: caret(%ld,%ld h=%ld) compStart=(%ld,%ld) src=%d\n",
+    const int source = result.usedCompStartAsCaret ? CARET_SRC_TSF_COMPOSITION : CARET_SRC_TSF_SELECTION;
+    WIND_LOG_DEBUG_FMT(L"OnAsyncCaretRectReady(%s): caret(%ld,%ld h=%ld) compStart=(%ld,%ld) src=%d\n",
+                       isFocusProbe ? L"focus" : L"composition",
                        caretRect.left, caretRect.bottom, height, compStartX, compStartY, source);
+
+    if (isFocusProbe)
+    {
+        // 刷新焦点 caret 缓存。**内联档（记事本实测 hrSession=S_OK）此刻仍在 OnSetFocus 栈里**，
+        // 这次写入会赶在同一次 SendFocusGained 读取之前，于是权威坐标直接随焦点包发出去。
+        _lastFocusCaretX      = caretRect.left;
+        _lastFocusCaretY      = caretRect.bottom;
+        _lastFocusCaretHeight = height;
+        _lastFocusCaretSource = source;
+
+        // 排队档（Word 实测 TF_S_ASYNC，1~2ms）此刻 focus_gained 已经发走，只能补一条
+        // caret_update 修正服务端缓存。内联档则跳过——那条会**早于** focus_gained 到达，
+        // 而服务端的 handle_focus_gained 随后会拿焦点包里的坐标覆写缓存，补发反被吃掉，
+        // 白白多一次 IPC。判据：焦点包是否已经发出去。
+        if (_focusGainedSentForSession == _focusSessionId)
+        {
+            _EmitCaretUpdate(caretRect.left, caretRect.bottom, height, compStartX, compStartY, source);
+        }
+        else
+        {
+            WIND_LOG_DEBUG(L"OnAsyncCaretRectReady(focus): 内联返回，坐标随 focus_gained 一并发出，跳过补发\n");
+        }
+        return;
+    }
 
     _EmitCaretUpdate(caretRect.left, caretRect.bottom, height, compStartX, compStartY, source);
 }

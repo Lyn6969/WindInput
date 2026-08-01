@@ -179,8 +179,13 @@ public:
     // 密码框判定（_focusIsPassword）：core 会据此认定「键已放行、抑制 moot」而跳过强制英文，
     // 而网页密码框恰恰只置 context 级、键并没被放行 → 密码框里照打中文（2026-07-27 修）。
     // 密码框信号一律走 inputScopeMask 的 IS_PASSWORD 位。
+    //
+    // caretSource: CARET_SRC_*，标明 caretX/Y 出自回退链的哪一级。焦点气泡（服务端
+    // ui.status.show_on_focus）直接锚在这组坐标上，而 OnSetFocus 里的同步 edit session
+    // 必被宿主拒绝、回退值是跨窗口的 Win32 光标——消费端只能靠这个字段分辨可信度。
     BOOL SendFocusGained(int caretX = 0, int caretY = 0, int caretHeight = 0, UINT64 inputScopeMask = 0,
-                         bool disabled = false, uint8_t reason = 0);
+                         bool disabled = false, uint8_t reason = 0,
+                         int caretSource = CARET_SRC_UNKNOWN);
 
     // Send input state report (async, fire-and-forget): standalone disabled/reason change
     // for the currently focused control, e.g. a GUID_COMPARTMENT_KEYBOARD_DISABLED flip that

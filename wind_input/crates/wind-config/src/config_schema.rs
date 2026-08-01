@@ -292,6 +292,7 @@ static REGISTRY: &[ConfigField] = &[
     f("ui.status.enabled", Bool),
     f("ui.status.duration", Int),
     f("ui.status.display_mode", Enum(&["temp", "always"])),
+    f("ui.status.show_on_focus", Bool),
     f("ui.status.schema_name_style", Enum(&["full", "short"])),
     f("ui.status.position_mode", Enum(&["follow_caret", "fixed"])),
     f("ui.status.offset_x", Int),

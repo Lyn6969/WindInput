@@ -11,6 +11,8 @@ CCaretEditSession::CCaretEditSession(ITfContext* pContext)
     , _succeeded(FALSE)
     , _usedCompStartAsCaret(FALSE)
     , _pAsyncOwner(nullptr)
+    , _probeKind(CaretProbeKind::Composition)
+    , _sessionTag(0)
 {
     if (_pContext)
     {
@@ -197,15 +199,30 @@ STDAPI CCaretEditSession::DoEditSession(TfEditCookie ec)
         // No selection, try to get the end of the document or use insertion point
         WIND_LOG_DEBUG(L"CaretEditSession: No selection available\n");
 
-        // Try to get screen extent as fallback
-        hr = pContextView->GetScreenExt(&_caretRect);
-        if (SUCCEEDED(hr))
+        // ⚠ 这里曾用「GetScreenExt 左上角 + 20px」冒充插入点并置 _succeeded=TRUE
+        // （2026-08-01 撤销）。那是一条**以成功的形式失败**的路径：
+        //
+        // - 返回的根本不是插入点，而是整个显示区的左上角，除非碰巧否则必错；
+        // - `height` 恒为 20 > 0，躲过 GetCaretPositionFromTSF 的退化矩形判据；
+        // - 左上角通常落在某个显示器内，也躲过越界判据；
+        // - 于是它一路以 CARET_SRC_TSF_SELECTION 的名义流到定位逻辑，把「我没拿到坐标」
+        //   伪装成「我拿到了一个 TSF 权威坐标」——正是本轮要根除的那类谎报。
+        //
+        // 而且 GetScreenExt 在 shell context 上实测返回退化矩形 (0,1368,0,1368)，
+        // 占位值会直接落到屏幕边缘。
+        //
+        // 现在一律判失败。上层回退链会接手（GUI caret → last known），那些值虽然也不精确，
+        // 但**标着自己真实的来源**，消费端能据此决定要不要用。焦点路径尤其依赖这一点：
+        // 焦点刚到达时 selection 尚未建立是常态，这条分支在那里是主路径而非冷门分支。
+        RECT rcScreenExt = {};
+        if (SUCCEEDED(pContextView->GetScreenExt(&rcScreenExt)))
         {
-            // Use the top-left of the screen extent as a fallback
-            _caretRect.right = _caretRect.left + 2;
-            _caretRect.bottom = _caretRect.top + 20;
-            _succeeded = TRUE;
-            WIND_LOG_DEBUG(L"CaretEditSession: Using screen extent as fallback\n");
+            WIND_LOG_DEBUG_FMT(L"CaretEditSession: 无 selection；GetScreenExt=(%ld,%ld,%ld,%ld)，不作插入点采信\n",
+                               rcScreenExt.left, rcScreenExt.top, rcScreenExt.right, rcScreenExt.bottom);
+        }
+        else
+        {
+            WIND_LOG_DEBUG(L"CaretEditSession: 无 selection 且 GetScreenExt 失败\n");
         }
     }
 
@@ -218,8 +235,14 @@ STDAPI CCaretEditSession::DoEditSession(TfEditCookie ec)
     {
         if (_succeeded)
         {
-            _pAsyncOwner->OnAsyncCaretRectReady(_caretRect, _hasCompositionStart, _compositionStartRect,
-                                                _usedCompStartAsCaret);
+            AsyncCaretResult result = {};
+            result.caretRect            = _caretRect;
+            result.compStartRect        = _compositionStartRect;
+            result.hasCompStart         = _hasCompositionStart;
+            result.usedCompStartAsCaret = _usedCompStartAsCaret;
+            result.kind                 = _probeKind;
+            result.sessionTag           = _sessionTag;
+            _pAsyncOwner->OnAsyncCaretRectReady(result);
         }
         else
         {
@@ -318,7 +341,8 @@ BOOL CCaretEditSession::GetCaretAndCompositionStartRect(ITfContext* pContext, Tf
 // Static method to request the caret rect asynchronously (see header for why)
 BOOL CCaretEditSession::RequestCaretRectAsync(ITfContext* pContext, TfClientId tfClientId,
                                                ITfComposition* pComposition, LONG compStartOffset,
-                                               CTextService* pOwner)
+                                               CTextService* pOwner,
+                                               CaretProbeKind kind, ULONGLONG sessionTag)
 {
     if (pContext == nullptr || pOwner == nullptr)
     {
@@ -334,6 +358,7 @@ BOOL CCaretEditSession::RequestCaretRectAsync(ITfContext* pContext, TfClientId t
     pEditSession->SetComposition(pComposition);
     pEditSession->SetCompositionStartOffset(compStartOffset);
     pEditSession->SetAsyncOwner(pOwner);
+    pEditSession->SetProbe(kind, sessionTag);
 
     HRESULT hrSession = S_OK;
     HRESULT hr = pContext->RequestEditSession(

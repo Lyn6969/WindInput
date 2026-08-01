@@ -515,6 +515,12 @@ pub(crate) struct State {
     pub(crate) caret_x: i32,
     pub(crate) caret_y: i32,
     pub(crate) caret_height: i32,
+    /// 上面这组坐标的来源（`wind_ipc::protocol::caret_source::*`）。
+    ///
+    /// **与坐标成对写入**——凡是写 `caret_x/y` 的地方都必须同时写它，否则来源会指向上一次的
+    /// 坐标，比没有这个字段更危险。焦点气泡靠它判断「这组坐标够不够格拿来定位」：
+    /// TSF 域出自当前 context，GUI 域是跨窗口的 Win32 光标，两者不是同一件东西。
+    pub(crate) caret_source: i32,
     /// 菜单是否打开（打开时键盘事件转发给菜单窗口；UI 自管导航）
     pub(crate) menu_open: bool,
     /// 菜单目标候选（页内下标 + 文本），供候选词条操作/复制
@@ -731,6 +737,15 @@ pub struct Coordinator {
     /// 置位后，该轮第一次权威坐标到达时改用放宽的容差判断要不要校正——校正动作本身
     /// 才是抖动的观感来源，小偏差不动比「跳一下修正」更稳。组合结束时复位。
     pub(crate) first_show_was_provisional: std::sync::atomic::AtomicBool,
+    /// `ui.status.show_on_focus` 的焦点气泡正等一个 TSF 权威坐标。
+    ///
+    /// 焦点事件到达时坐标常常还只是 GUI 回退值（`OnSetFocus` 拿不到同步 edit session 锁），
+    /// 直接拿它定位就是用户反馈的「还没输入时定位非常不准」。故置位挂起，由
+    /// [`Coordinator::handle_caret_update`] 在权威坐标到来时消费并补显示。
+    ///
+    /// **刻意不配兜底 timer**：超时后能做的只有「拿不可信坐标显示」，正是本机制要挡的事。
+    /// 等不到就不显示，失焦/下一次焦点事件清位。
+    pending_focus_tip: std::sync::atomic::AtomicBool,
     /// 上一次按键时刻，仅用于算出下面那个「相邻按键间隔」。
     pub(crate) last_key_at: Mutex<Option<std::time::Instant>>,
     /// **相邻两次按键**的间隔（毫秒），fast 档据此判断是否处于连续快速输入。
@@ -1356,6 +1371,7 @@ impl Coordinator {
                 caret_x: 0,
                 caret_y: 0,
                 caret_height: 0,
+                caret_source: wind_ipc::protocol::caret_source::UNKNOWN,
                 menu_open: false,
                 menu_target_page_local: 0,
                 menu_target_text: String::new(),
@@ -1400,6 +1416,7 @@ impl Coordinator {
             last_key_at: Mutex::new(None),
             last_key_interval_ms: Mutex::new(None),
             first_show_was_provisional: std::sync::atomic::AtomicBool::new(false),
+            pending_focus_tip: std::sync::atomic::AtomicBool::new(false),
             app_compat: Mutex::new(app_compat),
             compat_dirs: (
                 data_dir.map(|d| d.to_path_buf()),
@@ -3497,6 +3514,48 @@ impl Coordinator {
         self.push_server.push_to_active(&encoded);
     }
 
+    /// 焦点事件携带的 caret 落缓存的**唯一入口**。
+    ///
+    /// 焦点 caret 有两条到达路径——同步段的 [`Self::handle_focus_gained_caret`] 与重型段的
+    /// [`Self::handle_focus_gained`]——而**重型段必然晚于同步段执行**（见 `server.rs::handle_client`：
+    /// 同步段先回 `ModePush` 解除 DLL 阻塞，重型段延后到响应写出之后才跑）。
+    ///
+    /// 此前重型段自己直写 `state.caret_*`，既没有 `height == 0` 守卫也不做 `caret_use_top`
+    /// 变换，于是把同步段刚做好的两道处理**整个抹掉**：退化矩形进了缓存，微信一类宿主的
+    /// 坐标差一个行高。两处口径分裂既不编译报错也不 panic，只表现为「焦点后第一次定位偏一行」，
+    /// 是典型的看不见的分裂。故合并到此，两条路径都必须经由它。
+    fn apply_focus_caret(&self, data: &CaretData, via: &str) {
+        // 独立日志行：与 handle_caret_update 区分开，否则无法从日志判断焦点坐标走的是哪条路
+        // （2026-08-01 那轮修复第一版就因为看不出这点，白跑了一轮真机验证）。
+        tracing::debug!(
+            "{via} (no-show): x={} y={} h={} src={}",
+            data.x,
+            data.y,
+            data.height,
+            wind_ipc::protocol::caret_source::name(data.source)
+        );
+        // height==0 = 宿主尚未 reflow，GetTextExt 返回退化矩形，坐标不可信。
+        if data.height == 0 {
+            return;
+        }
+        let mut data = *data;
+        if self
+            .active_compat
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .caret_use_top
+        {
+            let raw_h = data.height;
+            data.y -= raw_h;
+            data.height = raw_h.max(CARET_USE_TOP_MIN_LINE_H);
+        }
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        state.caret_x = data.x;
+        state.caret_y = data.y;
+        state.caret_height = data.height;
+        state.caret_source = data.source;
+    }
+
     /// 在当前光标下方显示状态提示气泡（中英/标点/全半角/方案切换）
     pub(crate) fn show_tip(&self, text: &str) {
         let bundle = self.rt();
@@ -3546,6 +3605,10 @@ impl Coordinator {
 
     /// 隐藏状态提示气泡（常驻模式失焦时调用）。
     pub(crate) fn hide_tip(&self) {
+        // 挂起中的焦点气泡一并作废：焦点都走了，那次挂起等来的权威坐标也已经属于别的上下文，
+        // 补显示出来就是「切走之后气泡才姗姗弹出」。
+        self.pending_focus_tip
+            .store(false, std::sync::atomic::Ordering::Relaxed);
         let _ = self.ui_tx.send(UiCommand::HideStatusTip);
         // 清空去重缓存：否则重新获焦时"常驻显示"会因文本与隐藏前相同而不弹。
         self.last_status_text
@@ -3559,6 +3622,57 @@ impl Coordinator {
         let si = &self.rt().config.ui.status;
         if si.enabled && si.display_mode.eq_ignore_ascii_case("always") {
             self.show_tip(&self.status_indicator_text());
+        }
+    }
+
+    /// `ui.status.show_on_focus`：焦点切到新输入框时强制显示一次状态气泡。
+    ///
+    /// **不走 [`Self::show_status`]**：那条路会因「文本与上次相同」整个跳过，而焦点切换正是
+    /// 「状态没变但仍要提示」的场景——走去重就等于这个开关在同状态下完全不生效。
+    ///
+    /// ## 坐标可信度闸门
+    ///
+    /// `follow_caret` 模式下只在坐标属 TSF 语义域时才显示。理由：`OnSetFocus` 不是按键上下文，
+    /// 同步 edit session 必被宿主拒绝，回退链交出的是**跨窗口的** Win32 光标——Word 只在正文行
+    /// 维护它，标题行上取到的是别处的陈旧值（实测偏差 814px）。用那种坐标弹气泡，正是用户
+    /// 反馈的「还没输入时定位非常不准」。
+    ///
+    /// 拿不到就**不显示**，不做任何回退。下界 = 和没有这个功能一样好，不存在比原状更差的分支；
+    /// 而弹在错误位置是实实在在的负价值。DLL 侧排队档会在 1~2ms 内补一条 TSF 坐标，
+    /// 由 [`Self::handle_caret_update`] 消费本次挂起并补显示，故绝大多数宿主上并不会真的落空。
+    ///
+    /// `fixed` 模式不读 caret（用 custom_x/custom_y），故不受本闸门约束，一律直接显示。
+    pub(crate) fn show_focus_status_if_enabled(&self) {
+        let si = &self.rt().config.ui.status;
+        if !si.enabled || !si.show_on_focus {
+            return;
+        }
+        // always 模式已由 show_persistent_status_if_always 在同一处焦点回调里显示过，
+        // 这里再来一次只会重复下发同一帧。
+        if si.display_mode.eq_ignore_ascii_case("always") {
+            return;
+        }
+        if si.position_mode.eq_ignore_ascii_case("fixed") {
+            self.show_tip(&self.status_indicator_text());
+            return;
+        }
+        let source = {
+            let s = self.state.lock().unwrap_or_else(|e| e.into_inner());
+            s.caret_source
+        };
+        if wind_ipc::protocol::caret_source::is_tsf(source) {
+            self.pending_focus_tip
+                .store(false, std::sync::atomic::Ordering::Relaxed);
+            self.show_tip(&self.status_indicator_text());
+        } else {
+            // 挂起，等 DLL 补来的 TSF 坐标。挂起在下次焦点事件/失焦时作废，不设超时兜底——
+            // 超时到期只能拿现有的不可信坐标显示，那正是本闸门要挡的东西。
+            debug!(
+                "focus_tip → 挂起: 坐标来源 {} 非 TSF 域，等待权威坐标",
+                wind_ipc::protocol::caret_source::name(source)
+            );
+            self.pending_focus_tip
+                .store(true, std::sync::atomic::Ordering::Relaxed);
         }
     }
 
@@ -5433,11 +5547,22 @@ impl MessageHandler for Coordinator {
             data.client_token,
             data.input_scope_mask
         );
+        // 焦点 caret 走与同步段同一个入口。**不要在这里直写 `state.caret_*`**——重型段晚于
+        // 同步段执行，直写会把同步段的 height 守卫与 caret_use_top 变换整个覆盖掉。
+        // 详见 apply_focus_caret 的文档注释。
+        self.apply_focus_caret(
+            &CaretData {
+                x: data.x,
+                y: data.y,
+                height: data.height,
+                composition_start_x: data.composition_start_x,
+                composition_start_y: data.composition_start_y,
+                source: data.caret_source,
+            },
+            "handle_focus_gained",
+        );
         {
             let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
-            state.caret_x = data.x;
-            state.caret_y = data.y;
-            state.caret_height = data.height;
             // 焦点进入文本框 = 本输入法激活（对齐 Go HandleFocusGained → SetIMEActivated(true)）。
             // 不依赖 IME_ACTIVATED 的到达时机，确保工具栏在焦点到达时即可显示。
             state.ime_active = true;
@@ -5503,6 +5628,7 @@ impl MessageHandler for Coordinator {
         self.push_activation_status(data.client_token);
         self.notify_toolbar_async(); // 激活态 → 工具栏显示（异步，避免 is_foreground_fullscreen 阻塞 bridge 线程）
         self.show_persistent_status_if_always(); // 常驻模式:获焦即显示状态
+        self.show_focus_status_if_enabled(); // ui.status.show_on_focus:换输入框也提示一次
         let pid = (data.client_token >> 32) as u32;
         self.apply_input_diag(pid, data.disabled, data.reason, data.input_scope_mask);
         Some(status)
@@ -5843,11 +5969,35 @@ impl MessageHandler for Coordinator {
         state.caret_x = data.x;
         state.caret_y = data.y;
         state.caret_height = data.height;
+        state.caret_source = data.source;
         let now_valid =
             !(data.x == 0 && data.y == 0) && data.x.abs() < 32000 && data.y.abs() < 32000;
         if !now_valid {
             debug!("caret_update → 丢弃: 坐标无效（(0,0) 哨兵或越界）");
             return;
+        }
+        // 消费焦点气泡的挂起：DLL 在焦点路径拿不到同步锁时会异步补一条权威坐标，这就是它。
+        // **必须在下面的 `composing` 闸门之前**——焦点刚到达时用户还没输入，`composing` 恒 false，
+        // 放在闸门之后等于永远不执行（而且完全静默）。
+        //
+        // 只认 TSF 域：本闸门存在的全部意义就是不拿 GUI 回退坐标定位气泡。
+        if self
+            .pending_focus_tip
+            .load(std::sync::atomic::Ordering::Relaxed)
+            && wind_ipc::protocol::caret_source::is_tsf(data.source)
+        {
+            self.pending_focus_tip
+                .store(false, std::sync::atomic::Ordering::Relaxed);
+            debug!(
+                "focus_tip → 补显示: 等到权威坐标 ({},{}) src={}",
+                data.x,
+                data.y,
+                wind_ipc::protocol::caret_source::name(data.source)
+            );
+            // 先放锁再显示：show_tip 内部要重新取 state 锁读坐标，持锁调用会自死锁。
+            drop(state);
+            self.show_tip(&self.status_indicator_text());
+            state = self.state.lock().unwrap_or_else(|e| e.into_inner());
         }
         let composing = !state.candidates.is_empty() || !state.input_buffer.is_empty();
         if !composing {
@@ -5972,32 +6122,7 @@ impl MessageHandler for Coordinator {
     /// caret_use_top 变换要照做——坐标缓存本身必须与 handle_caret_update 写入的口径一致，
     /// 否则首键前的兜底坐标会和后续更新差一个行高。
     fn handle_focus_gained_caret(&self, data: &CaretData) {
-        // 独立日志行：与 handle_caret_update 区分开，否则无法从日志判断焦点坐标走的是
-        // 哪条路（本次修复第一版就因为看不出这点，白跑了一轮真机验证）。
-        tracing::debug!(
-            "handle_focus_gained_caret (no-show): x={} y={} h={}",
-            data.x,
-            data.y,
-            data.height
-        );
-        if data.height == 0 {
-            return;
-        }
-        let mut data = *data;
-        if self
-            .active_compat
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .caret_use_top
-        {
-            let raw_h = data.height;
-            data.y -= raw_h;
-            data.height = raw_h.max(CARET_USE_TOP_MIN_LINE_H);
-        }
-        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
-        state.caret_x = data.x;
-        state.caret_y = data.y;
-        state.caret_height = data.height;
+        self.apply_focus_caret(data, "handle_focus_gained_caret");
     }
 
     fn handle_caret_probe(&self, data: &CaretData) {
@@ -6830,6 +6955,314 @@ mod caret_compat_tests {
             *c.pending_first_show_token.lock().unwrap(),
             before,
             "wait 档应重 arm 到 600ms"
+        );
+    }
+
+    // ── ui.status.show_on_focus：焦点气泡与坐标可信度闸门 ────────────────────────────
+
+    /// 造一个开了 `show_on_focus` 的协调器，并**保留 UI 通道接收端**——「气泡有没有真的发出去」
+    /// 只能从 `ui_tx` 上观察。用 debug 方法「按同样规则再算一遍」是假测试：决策函数写对但
+    /// 生产路径没接上时，那种测试照样全绿。
+    fn coord_focus_tip(
+        show_on_focus: bool,
+        position_mode: &str,
+    ) -> (Arc<Coordinator>, std::sync::mpsc::Receiver<UiCommand>) {
+        let mut cfg = Config::default();
+        cfg.ui.status.enabled = true;
+        cfg.ui.status.show_on_focus = show_on_focus;
+        cfg.ui.status.display_mode = "temp".to_string();
+        cfg.ui.status.position_mode = position_mode.to_string();
+        Coordinator::new_headless_with_ui(cfg, None)
+    }
+
+    /// 通道里是否收到了「显示状态气泡」指令。
+    fn got_status_tip(rx: &std::sync::mpsc::Receiver<UiCommand>) -> bool {
+        rx.try_iter()
+            .any(|c| matches!(c, UiCommand::ShowStatusTip { .. }))
+    }
+
+    /// 把坐标缓存设成指定来源。
+    fn set_caret(c: &Arc<Coordinator>, x: i32, y: i32, source: i32) {
+        let mut st = c.state.lock().unwrap();
+        st.caret_x = x;
+        st.caret_y = y;
+        st.caret_height = 25;
+        st.caret_source = source;
+    }
+
+    /// follow_caret 下，坐标来自 GUI 回退时**不得**直接弹气泡——那正是用户反馈的
+    /// 「还没输入时定位非常不准」：`OnSetFocus` 拿不到同步锁，回退链交出的是跨窗口的
+    /// Win32 光标（Word 标题行实测偏差 814px）。应转为挂起等权威坐标。
+    #[test]
+    fn focus_tip_defers_when_caret_source_is_not_tsf() {
+        let (c, rx) = coord_focus_tip(true, "follow_caret");
+        set_caret(&c, 0, 1388, wind_ipc::protocol::caret_source::GUI_CARET);
+        c.show_focus_status_if_enabled();
+        assert!(
+            !got_status_tip(&rx),
+            "GUI 回退坐标不可作气泡锚点，此时不得下发显示"
+        );
+        assert!(
+            c.pending_focus_tip
+                .load(std::sync::atomic::Ordering::Relaxed),
+            "应转为挂起，等 DLL 补来的权威坐标"
+        );
+    }
+
+    /// 上一条的续集：权威坐标到达后必须补显示，且挂起位清掉。
+    ///
+    /// ⚠ 消费点必须在 `handle_caret_update` 的 `composing` 闸门**之前**——焦点刚到达时用户
+    /// 还没输入，`composing` 恒 false，放在闸门之后就是永远不执行且完全静默。本用例正是
+    /// 钉住这个顺序：`input_buffer` 特意留空。
+    #[test]
+    fn focus_tip_shows_when_authoritative_caret_arrives() {
+        let (c, rx) = coord_focus_tip(true, "follow_caret");
+        set_caret(&c, 0, 1388, wind_ipc::protocol::caret_source::GUI_CARET);
+        c.show_focus_status_if_enabled();
+        assert!(!got_status_tip(&rx));
+
+        c.handle_caret_update(&CaretData {
+            x: 473,
+            y: 217,
+            height: 28,
+            composition_start_x: 0,
+            composition_start_y: 0,
+            source: wind_ipc::protocol::caret_source::TSF_SELECTION,
+        });
+        assert!(got_status_tip(&rx), "等到 TSF 权威坐标后应补显示气泡");
+        assert!(
+            !c.pending_focus_tip
+                .load(std::sync::atomic::Ordering::Relaxed),
+            "补显示后挂起位必须清掉，否则下一帧坐标会再弹一次"
+        );
+    }
+
+    /// 反向对照：非 TSF 域的坐标即便到达也**不得**解除挂起。
+    /// 少了这条，上一条用「任何 caret_update 都补显示」的实现也能通过。
+    #[test]
+    fn focus_tip_stays_pending_for_non_tsf_caret_update() {
+        let (c, rx) = coord_focus_tip(true, "follow_caret");
+        set_caret(&c, 0, 1388, wind_ipc::protocol::caret_source::GUI_CARET);
+        c.show_focus_status_if_enabled();
+        let _ = got_status_tip(&rx); // 排空
+
+        c.handle_caret_update(&CaretData {
+            x: 10,
+            y: 20,
+            height: 20,
+            composition_start_x: 0,
+            composition_start_y: 0,
+            source: wind_ipc::protocol::caret_source::GUI_CARET,
+        });
+        assert!(!got_status_tip(&rx), "又一个 GUI 回退坐标，仍不该显示");
+        assert!(
+            c.pending_focus_tip
+                .load(std::sync::atomic::Ordering::Relaxed),
+            "挂起必须保持，直到真的等到 TSF 坐标"
+        );
+    }
+
+    /// 坐标本就可信时立即显示，不该被闸门误伤。
+    #[test]
+    fn focus_tip_shows_immediately_for_tsf_caret() {
+        let (c, rx) = coord_focus_tip(true, "follow_caret");
+        set_caret(
+            &c,
+            473,
+            217,
+            wind_ipc::protocol::caret_source::TSF_SELECTION,
+        );
+        c.show_focus_status_if_enabled();
+        assert!(got_status_tip(&rx), "TSF 域坐标应立即显示");
+        assert!(
+            !c.pending_focus_tip
+                .load(std::sync::atomic::Ordering::Relaxed),
+            "无需挂起"
+        );
+    }
+
+    /// fixed 模式压根不读 caret（用 custom_x/custom_y），故不受可信度闸门约束。
+    /// 把闸门一刀切地套到所有模式上，会让固定位置的用户永远看不到焦点气泡。
+    #[test]
+    fn focus_tip_ignores_caret_source_in_fixed_mode() {
+        let (c, rx) = coord_focus_tip(true, "fixed");
+        set_caret(&c, 0, 1388, wind_ipc::protocol::caret_source::GUI_CARET);
+        c.show_focus_status_if_enabled();
+        assert!(got_status_tip(&rx), "fixed 模式不读 caret，应照常显示");
+    }
+
+    /// 反向对照：开关关闭时一律不显示。
+    /// 少了这条，「无条件显示」的实现能让上面四条里的三条通过。
+    #[test]
+    fn focus_tip_silent_when_disabled() {
+        let (c, rx) = coord_focus_tip(false, "follow_caret");
+        set_caret(
+            &c,
+            473,
+            217,
+            wind_ipc::protocol::caret_source::TSF_SELECTION,
+        );
+        c.show_focus_status_if_enabled();
+        assert!(!got_status_tip(&rx), "show_on_focus=false 时不得显示");
+        assert!(
+            !c.pending_focus_tip
+                .load(std::sync::atomic::Ordering::Relaxed),
+            "开关关闭时连挂起都不该发生"
+        );
+    }
+
+    /// 焦点气泡必须绕过 `show_status` 的文本去重。
+    ///
+    /// 焦点切换正是「状态文本没变但仍要提示」的场景——走去重路径的话，连着切两个输入框
+    /// 只有第一次会弹，而这恰恰是本功能最主要的使用场景，等于开关基本无效。
+    #[test]
+    fn focus_tip_bypasses_text_dedup() {
+        let (c, rx) = coord_focus_tip(true, "follow_caret");
+        set_caret(
+            &c,
+            473,
+            217,
+            wind_ipc::protocol::caret_source::TSF_SELECTION,
+        );
+        c.show_focus_status_if_enabled();
+        assert!(got_status_tip(&rx), "第一次焦点切换应显示");
+        // 状态一字未改，模拟切到另一个输入框
+        c.show_focus_status_if_enabled();
+        assert!(
+            got_status_tip(&rx),
+            "文本相同也必须再显示一次——去重会让这个开关形同虚设"
+        );
+    }
+
+    /// 失焦要作废挂起中的焦点气泡，否则权威坐标晚到时会在**已经切走之后**才弹出来。
+    #[test]
+    fn hide_tip_cancels_pending_focus_tip() {
+        let (c, rx) = coord_focus_tip(true, "follow_caret");
+        set_caret(&c, 0, 1388, wind_ipc::protocol::caret_source::GUI_CARET);
+        c.show_focus_status_if_enabled();
+        assert!(
+            c.pending_focus_tip
+                .load(std::sync::atomic::Ordering::Relaxed)
+        );
+        c.hide_tip();
+        assert!(
+            !c.pending_focus_tip
+                .load(std::sync::atomic::Ordering::Relaxed),
+            "失焦后挂起必须作废"
+        );
+        let _ = got_status_tip(&rx); // 排空
+        c.handle_caret_update(&CaretData {
+            x: 473,
+            y: 217,
+            height: 28,
+            composition_start_x: 0,
+            composition_start_y: 0,
+            source: wind_ipc::protocol::caret_source::TSF_SELECTION,
+        });
+        assert!(
+            !got_status_tip(&rx),
+            "失焦之后到达的权威坐标不得再触发补显示"
+        );
+    }
+
+    /// 焦点 caret 的 `height == 0`（宿主尚未 reflow 的退化矩形）不得进缓存。
+    ///
+    /// 这条守卫原先只在同步段的 `handle_focus_gained_caret` 里有，重型段
+    /// `handle_focus_gained` 自己直写 `state.caret_*`——而**重型段必然晚于同步段执行**，
+    /// 于是守卫被后到的直写整个抹掉。两处口径分裂既不报错也不 panic，只表现为定位偏一行。
+    #[test]
+    fn focus_caret_degenerate_rect_does_not_overwrite_cache() {
+        let c = coord();
+        set_caret(
+            &c,
+            473,
+            217,
+            wind_ipc::protocol::caret_source::TSF_SELECTION,
+        );
+        c.apply_focus_caret(
+            &CaretData {
+                x: 9999,
+                y: 9999,
+                height: 0, // 退化矩形
+                composition_start_x: 0,
+                composition_start_y: 0,
+                source: wind_ipc::protocol::caret_source::GUI_CARET,
+            },
+            "test",
+        );
+        let st = c.state.lock().unwrap();
+        assert_eq!(st.caret_x, 473, "退化帧不得覆盖已有的好坐标");
+        assert_eq!(st.caret_y, 217);
+        assert_eq!(
+            st.caret_source,
+            wind_ipc::protocol::caret_source::TSF_SELECTION,
+            "来源必须与坐标同进退——只回滚其一等于伪造了一个不存在的组合"
+        );
+    }
+
+    /// 上一条只证明了守卫**存在于** `apply_focus_caret`，证明不了重型段真的路由过去。
+    /// 这条走 `handle_focus_gained` 生产入口：它一旦退回自己直写 `state.caret_*`，本用例即红。
+    ///
+    /// 顺带钉住 `caret_use_top` 也在重型段生效——那是同一次覆写抹掉的第二样东西。
+    #[test]
+    fn handle_focus_gained_routes_caret_through_shared_guard() {
+        let c = coord();
+        set_caret(
+            &c,
+            473,
+            217,
+            wind_ipc::protocol::caret_source::TSF_SELECTION,
+        );
+        c.handle_focus_gained(&FocusData {
+            x: 9999,
+            y: 9999,
+            height: 0, // 退化矩形：同步段会挡，重型段直写则不会
+            composition_start_x: 0,
+            composition_start_y: 0,
+            client_token: 0,
+            input_scope_mask: 0,
+            disabled: false,
+            reason: 0,
+            caret_source: wind_ipc::protocol::caret_source::GUI_CARET,
+        });
+        let st = c.state.lock().unwrap();
+        assert_eq!(
+            st.caret_x, 473,
+            "重型段必须经 apply_focus_caret；直写会让退化帧覆盖好坐标"
+        );
+        assert_eq!(st.caret_y, 217);
+        assert_eq!(
+            st.caret_source,
+            wind_ipc::protocol::caret_source::TSF_SELECTION
+        );
+    }
+
+    /// `caret_use_top` 变换在重型段同样要生效。
+    /// 该变换原先只在同步段做，重型段的直写把它抹掉，表现为微信一类宿主定位差一个行高。
+    #[test]
+    fn handle_focus_gained_applies_caret_use_top() {
+        let c = coord();
+        {
+            let mut ac = c.active_compat.lock().unwrap();
+            ac.caret_use_top = true;
+        }
+        c.handle_focus_gained(&FocusData {
+            x: 100,
+            y: 300,
+            height: 30,
+            composition_start_x: 0,
+            composition_start_y: 0,
+            client_token: 0,
+            input_scope_mask: 0,
+            disabled: false,
+            reason: 0,
+            caret_source: wind_ipc::protocol::caret_source::TSF_SELECTION,
+        });
+        let st = c.state.lock().unwrap();
+        assert_eq!(
+            st.caret_y,
+            300 - 30,
+            "caret_use_top 应把 Y 上移一个行高；重型段直写则原样落缓存"
         );
     }
 
