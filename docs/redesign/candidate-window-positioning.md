@@ -35,10 +35,115 @@
 | `OnLayoutChange` debounce | `OnLayoutChange` | reflow 完成的权威信号；burst 期间 debounce，等稳定后 flush（50ms，首显延迟的大头） |
 | 50ms timer 兜底 | — | 应对完全不发 `OnLayoutChange` 的应用（**比预想的多**，见第 6 层的宿主画像：Word / 记事本都不发） |
 | `SendCaretProbe` 试探采样 | `OnLayoutChange` 首帧分支 | 首帧 reflow 期间每次 layout change 采一次坐标（限前 5 次）发给服务端，供 `fast` 档提前放行；DLL 不做判断 |
-| `height==0` / 越界过滤 | `GetCaretPositionFromTSF` / `_CacheCaretPosition` | 退化矩形、`IsScreenPointOutsideForegroundWindow` 越界坐标不缓存、不上报 |
+| `height==0` / 越界过滤 | `GetCaretPositionFromTSF` / `_CacheCaretPosition` / `OnAsyncCaretRectReady` | 退化矩形、`IsScreenPointOutsideAllMonitors` 越界坐标不缓存、不上报 |
+| 异步 edit session | `RequestCaretRectAsync` → `OnAsyncCaretRectReady` | 非按键上下文取坐标的唯一正确方式，见 3.1 |
+| 锚点降级 | `CCaretEditSession::DoEditSession` | selection 退化时用组合起点当 caret，见 3.1 |
 | `SendCaretUpdate(x,y,h,compStartX,compStartY)` | reflow 后 | 发送权威坐标 + 组合起点坐标 |
 
 要点：**DLL 保证每个新组合"先发 CaretPending、reflow 后再发权威 CaretUpdate(height>0)"**。协调器据此实现"延迟首显"。
+
+## 3.1 坐标来源、锁模式与可信度（2026-08 重构）
+
+上表的每一格都在回答"怎么把坐标拿到手"。这一节回答更根本的问题：**手上有哪几个坐标来源、
+它们分别可信到什么程度、取不到时该向谁降级**。三个真实 bug（Word 标题行错位 814px、
+桌面输入定位到任务栏、桌面第二字错位）根因都在这里。
+
+### 三个坐标来源，可信度随场景变化
+
+| 来源 | 回答的问题 | 语义域 |
+|------|-----------|--------|
+| `GetTextExt(selection range)` | 文本插入点在哪 | TSF context |
+| `GetTextExt(composition range)` | 这次组合的头部在哪 | TSF context |
+| `GetGUIThreadInfo` | 这个 GUI 线程的系统光标在哪 | Win32 窗口 |
+
+**没有一个来源是恒定可信的**，实测：
+
+| 场景 | selection | composition | GUI caret | 可用的 |
+|------|-----------|-------------|-----------|--------|
+| Word 正文 / 记事本 | 有效 | 有效 | 大致正确 | 都行 |
+| Word 标题等非正文样式行 | 有效 | 有效 | **`rcCaret` 退化，指向别处** | 前两个 |
+| 桌面 / 任务栏 / 托盘弹框 | **恒退化 h=0** | 有效 | **别的 shell 窗口残留值** | **只有 composition** |
+| 非 TSF 宿主 | 无 | 无 | 唯一来源 | 只有 GUI caret |
+
+> ⚠ **回退链的危险不在"失败"，在"以成功的形式失败"**。`GetCaretPosition` 曾把「拿到了一个坐标」
+> 和「拿到了**那个**坐标」压成同一个 `TRUE`，于是 GUI caret 冒充 TSF 坐标，还抢在更可靠的
+> `_lastKnownCaretPos` 之前。`h=20`（`DEFAULT_CARET_HEIGHT`）与 `compStart=(0,0)` 是它的两条指纹。
+
+### 锁模式：`TF_ES_SYNC` 只在按键上下文合法
+
+MSDN 对 `TF_ES_SYNC` 的明文限制：*"should only be used in documented situations (such as keystroke
+handling) where it can be expected to succeed. Otherwise the call will likely fail."*
+锁协议规定，文档被锁时同步请求返回 `TS_E_SYNCHRONOUS`(`0x80040208`) 拒绝，而**异步请求会排队**，
+等文档可用再回调。
+
+所以 **WM_TIMER、焦点回调等非按键上下文必须用 `TF_ES_ASYNCDONTCARE`**。曾经用 `TF_ES_SYNC`
+的 timer 兜底路径在 Word 上 15/15 全被拒，一直靠 GUI caret 回退在苟——正文行回退值恰好正确
+（偏差 2px，被 3px 判据吞掉），标题行就露馅（偏差 814px）。
+
+实测两个宿主走了同一个 `ASYNCDONTCARE` 的两条分支，都成功（"at the discretion of the manager"）：
+
+| 宿主 | `hrSession` | 行为 |
+|------|-------------|------|
+| Word | `TF_S_ASYNC` (`0x00040300`) | 排队，**1~2ms** 后回调 |
+| 记事本 | `S_OK` | manager 选择内联执行，回调在 `RequestEditSession` 内部跑完 |
+
+> 内联执行时 `OnAsyncCaretRectReady` 日志会出现在 `accepted` **之前**，这是正常顺序不是异常。
+>
+> Weasel 全仓零 `TF_ES_SYNC`、四处 `RequestEditSession` 全用 `ASYNCDONTCARE`，且全仓零 timer
+> ——**异步锁本身就是"等"的机制**，不需要自己再造一个更差的排队器。
+
+### 越界判据：参照系必须是"物理存在"，不能是"前台窗口"
+
+原判据 `IsScreenPointOutsideForegroundWindow` 隐含前提「输入目标 ⊆ 前台窗口」。
+**shell 场景直接证伪**：输入焦点属于 explorer 的 context（渲染成屏幕一角的临时小输入窗），
+而前台窗口可能是桌面、`Shell_TrayWnd`（屏幕底部一条）或托盘图标弹框——**前台窗口与输入目标
+是两条独立的线**，点任务栏只改变前者。
+
+实测该判据**误伤 19 次 vs 正确拦截 12 次**：
+
+| 类别 | 实测坐标 | 性质 |
+|------|---------|------|
+| 焦点窗口 ≠ 前台窗口 | `(13,9)` ×9 | 合法，被误伤 |
+| 窗口移动中（`GetTextExt` 与 `GetWindowRect` 取自不同时刻） | `(473,189)` ×10 | 合法，被误伤 |
+| 真野坐标 | `(1284,1309)` `(-25563,1198)` `(2199,-1704)` `(669,-3375)` 等 | 应当拦截 |
+
+现判据 `IsScreenPointOutsideAllMonitors` 只问"这个点物理上存不存在"：真野坐标全部远离**所有**
+显示器，照样挡得住；两类误伤消失。
+
+- ⚠ 用 `MonitorFromPoint` 而非 `SM_*VIRTUALSCREEN`：虚拟屏幕是所有显示器的**外接矩形**，
+  多屏错位排布时屏幕之间有空隙（实测机器副屏 `X∈[-1920,-480]`、主屏 `X∈[0,1707]`），
+  外接矩形会放行落在空隙里的坐标。
+- ⚠ 本判据比原判据**粗**：它在 DPI 转换前执行，而 DLL 运行在各种 DPI awareness 的宿主里
+  （原判据因 `GetWindowRect` 与 `GetTextExt` 同进程同语境而天然免疫）。可接受，因为这里只做
+  "离谱与否"的粗判断，真野坐标差几千像素，远超 DPI 缩放的 1.5~2 倍偏差。
+- ❌ **`ITfContextView::GetScreenExt` 不能当参照系**：看似是"context 自己的显示区域"这个
+  语义上最正确的锚，但 shell context 上实测返回退化矩形 `(0,1368,0,1368)`。已验证，勿重试。
+
+### 锚点降级：selection 退化时用组合起点
+
+候选窗要跟随的本来就是**正在编辑的那段文本**，不是插入点——两者只差一个组合宽度。故：
+
+```
+caret(selection) 有效        → 用它
+caret 无效但 composition 有效 → 用组合起点当 caret（降级）
+两者都无效                   → 才谈回退 GUI caret
+```
+
+桌面场景正是靠这一条修好的：selection 恒退化，原先下坠到 GUI caret 取到任务栏残留的
+`(0,1388)`（与真实位置差 1171px），服务端进而以"组合起点距 caret ≥500px"把唯一正确的
+`(473,217)` 也当异常丢弃——**一个错误的基准值，把唯一正确的数据也判成了异常**。
+
+> ⚠ 组合起点的获取此前被 `if (_succeeded && _pComposition)` 守卫着，潜台词是"caret 都没取到，
+> 组合起点也不会有"——而实测正好相反。**一个数据的获取被另一个数据的成败守卫，等于宣告两者
+> 强相关**，而这个相关性从未被验证。日志表现为 `Composition start rect` 一行都不出现，看起来
+> 像"取不到"，实际是"压根没去取"。
+
+### 尚未做：来源标记与同源校验
+
+TSF 坐标与 GUI 回退坐标是两个语义域，压进同一组 `x/y/h` 字段后下游无法区分。计划给
+`CaretPayload` 加 `source` 字段，让服务端首显闸门只把 TSF 源当权威；服务端那条
+"组合起点距 caret ≥500px 即丢弃"也应改成**仅在两者同源时才比较**——当 caret 已是 GUI 回退值
+时，这个比较毫无意义，桌面场景正是这么误杀正确数据的。
 
 ## 4. 协调器 + UI 层的三层机制（对齐 Go）
 
@@ -170,8 +275,13 @@ UI 层（`wind-ui/src/candidate_window.rs`）**每帧据当前光标 + 内容尺
 |------|--------------------------|------------------|------|
 | EverEdit | 会，burst 3~4 次 | **3~10ms**（试探） | `fast` 档最理想的宿主 |
 | WPS | 会 | ~7ms（试探，前两次仍是旧坐标） | 需靠判据 1 跳过旧坐标帧 |
-| **Word** | **50 轮 0 次** | **60~190ms** | 坐标只能靠 C++ 50ms timer + 异步 `GetTextExt`，而 Word 的 edit session 排队极慢 |
-| 记事本 | 几乎不发（仅首轮 1 次） | 拿不到 | 组合期间完全不上报坐标 |
+| **Word** | **50 轮 0 次** | ~~60~190ms~~ → **1~2ms**（见下） | 坐标靠 C++ 50ms timer + 异步 `GetTextExt` |
+| 记事本 | 几乎不发（仅首轮 1 次） | 内联执行，即时 | 组合期间不发 `OnLayoutChange`，但异步 edit session 拿得到 |
+
+> **2026-08 订正**：原表「Word 组合坐标延迟 60~190ms（edit session 排队极慢）」**测的是同步
+> edit session 被拒后走 GUI caret 回退链的表现，不是宿主真实速度**。改用 `TF_ES_ASYNCDONTCARE`
+> 后（见 3.1），Word 排队授予锁只要 **1~2ms**，记事本干脆内联执行。
+> **慢的从来不是宿主，是那条注定失败的请求。**
 
 > **教训**：`OnLayoutChange` 不是普遍可依赖的信号。任何「等某个宿主回调」的策略都必须自带
 > **短于组合寿命**的兜底，否则在不发该回调的宿主上会静默退化成上一档，而日志里只表现为
@@ -202,7 +312,11 @@ UI 层（`wind-ui/src/candidate_window.rs`）**每帧据当前光标 + 内容尺
   25ms 兜底加 IPC 往返约 30ms，最短的那批赶不上。真人打字节奏（>100ms）不受影响。若要进一步压，
   只能调小 `fast_first_show_fallback_ms`（代价是更常用到旧坐标）。
 - **`fast` 档对宿主的依赖未消除**：判据 1、2 都要求宿主发 `OnLayoutChange`；不发的宿主实际是靠判据 3
-  退化成 `instant` 在工作，「快速」二字对它们名不副实。彻底解法需要一条不依赖该回调的坐标来源。
+  退化成 `instant` 在工作，「快速」二字对它们名不副实。
+  > **2026-08 部分解决**：那条"不依赖 `OnLayoutChange` 的坐标来源"已经找到——异步 edit session
+  > （3.1），它在 Word 上 1~2ms 回调、记事本上内联执行。但 `fast` 档的判据 1、2 目前仍只读
+  > `CMD_CARET_PROBE`（由 `OnLayoutChange` 驱动），**尚未接入这条新来源**；不发该回调的宿主
+  > 依然只能靠判据 3。接入后 `fast` 档才名副其实。
 - **pendingReplay（跨焦点 buffer 重放）**：Go 对 Excel 单元格/编辑栏切换等有专门的 replay 路径，Rust 暂未引入。
 
 ## 8. 调参
