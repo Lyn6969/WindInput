@@ -39,6 +39,40 @@ pub enum FreqStrategy {
     Step,
 }
 
+/// 前缀补全参与词频位置提升的范围。判据是**语义单元数**
+/// （[`wind_candidate::semantic_units`]：汉字逐字计、西文词整体计 1），不是字符数——
+/// 英文候选 `hello` 有 5 个 char，按字符数会被「只提升单个」挡死，而英文所有候选都是
+/// 前缀匹配，那等于英文调频全灭。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PromotePrefix {
+    /// 前缀补全一律不参与提升。
+    None,
+    /// 只提升单个语义单元的候选（中文单字 / 西文单词）。默认。
+    Single,
+    /// 全部参与提升。
+    All,
+}
+
+impl PromotePrefix {
+    /// 解析配置字符串；未知值落回 [`Self::Single`]（默认档，最保守的可用行为）。
+    pub fn parse(s: &str) -> Self {
+        match s {
+            "none" => Self::None,
+            "all" => Self::All,
+            _ => Self::Single,
+        }
+    }
+
+    /// 该候选文本是否获准参与提升（调用方已确认它落在有效前缀层）。
+    pub fn allows(&self, text: &str) -> bool {
+        match self {
+            Self::None => false,
+            Self::All => true,
+            Self::Single => wind_candidate::semantic_units(text) <= 1,
+        }
+    }
+}
+
 /// 活跃方案的词频排序设置（apply_freq_rerank 用）。
 /// 按方案解析后缓存，避免每键读盘（frequency.md §8）。
 #[derive(Debug, Clone, Copy)]
@@ -51,9 +85,8 @@ pub struct FreqSettings {
     /// 重排前记录基础序前 N 个候选，重排后原序回填——优先级高于词频。
     /// N 按输入码长分级：简码位保住词库钦定首选，全码位放开调频（见 `ProtectPolicy`）。
     pub protect: ProtectPolicy,
-    /// 前缀补全候选是否参与位置提升（`schema.pinyin.frequency.promote_prefix`；仅拼音用）。
-    /// 码表侧的前缀补全已由 `freq_tier` 分档隔离，不需要本开关。
-    pub promote_prefix: bool,
+    /// 前缀补全参与位置提升的范围（`schema.*.frequency.promote_prefix`）。
+    pub promote_prefix: PromotePrefix,
 }
 
 impl Default for FreqSettings {
@@ -62,7 +95,7 @@ impl Default for FreqSettings {
             enabled: false,
             strategy: FreqStrategy::Step,
             protect: ProtectPolicy::NONE,
-            promote_prefix: false,
+            promote_prefix: PromotePrefix::Single,
         }
     }
 }
@@ -1583,14 +1616,15 @@ impl EngineManager {
                 enabled: pf.frequency.enabled,
                 strategy: FreqStrategy::Step,
                 protect: ProtectPolicy::NONE,
-                promote_prefix: pf.frequency.promote_prefix,
+                promote_prefix: PromotePrefix::parse(&pf.frequency.promote_prefix),
             }
         } else {
             let ct = self.codetable.lock().unwrap_or_else(|e| e.into_inner());
             FreqSettings {
-                // 码表侧不用本开关：其前缀补全已由 `freq_tier` 分到独立档位，
-                // 词频只在档内调整，本就跨不到精确档之前。
-                promote_prefix: true,
+                // 码表侧目前恒放开：其前缀补全已由 `freq_tier` 分到独立档位，词频只在档内
+                // 调整、跨不到精确档之前，故不需要本项收窄。待码表接入 position 策略后，
+                // 这里应改为读 `schema.codetable.frequency.promote_prefix`。
+                promote_prefix: PromotePrefix::All,
                 enabled: ct.frequency.enabled,
                 strategy: Self::parse_freq_strategy(&ct.frequency.strategy),
                 protect: ProtectPolicy {

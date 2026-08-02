@@ -439,20 +439,30 @@ pub struct PinyinFrequency {
     /// 最近使用峰值。
     #[serde(default)]
     pub recency_peak: f64,
-    /// **前缀补全候选是否参与词频位置提升**（默认 `false`）。
+    /// **前缀补全候选参与词频位置提升的范围**（默认 `"single"`）。
     ///
-    /// 关闭时，码比输入长的候选（打 `d` 时的「东西」`dongxi`）不因被选中而前移——它们
-    /// 只按词库权重排。开启则一视同仁。
+    /// | 取值 | 打 `d` 选「得」 | 打 `d` 选「东西」 | 打 `hel` 选 `hello` |
+    /// |---|---|---|---|
+    /// | `"none"` | 不提升 | 不提升 | 不提升 |
+    /// | `"single"`（默认） | **提升** | 不提升 | **提升** |
+    /// | `"all"` | 提升 | 提升 | 提升 |
     ///
-    /// 默认关闭的理由：短输入下用户给出的信息量很少，把一个长词组靠词频顶到高频单字前面
-    /// 与直觉相悖（微软拼音实测「只对全码生效」，短码下怎么用都不调整）。而真正打全了码
-    /// 的场景，候选本就是精确匹配、不受本开关影响。
+    /// 判据是[语义单元数][wind_candidate::semantic_units]（汉字逐字计、西文词整体计 1），
+    /// **不是字符数**——英文候选 `hello` 有 5 个 char，按字符数会被「只提升单个」挡死，
+    /// 而英文所有候选都是前缀匹配，那等于英文调频全灭。
     ///
-    /// 判据用**有效前缀层**（`is_prefix && !is_promoted_completion`），与 `cmp_match_layers`
-    /// 同口径：被引擎主动提升进完整匹配层的候选（拼音残码上浮 / 用户长词上浮）是结构决策，
-    /// 不该被本开关误伤。
-    #[serde(default)]
-    pub promote_prefix: bool,
+    /// 默认 `"single"` 的理由：短输入下用户给出的信息量撑不起一个词组，把长词组靠词频顶到
+    /// 高频单字前面与直觉相悖（微软拼音实测「只对全码生效」是同一取舍的更强版本）。而单字
+    /// 之间的调整（「的」/「得」）是合理的，`"none"` 会连它一起挡掉。
+    ///
+    /// 只作用于**有效前缀层**（`is_prefix && !is_promoted_completion`），与 `cmp_match_layers`
+    /// 同口径：被引擎主动提升进完整匹配层的候选是结构决策，不该被本项误伤。
+    #[serde(default = "default_promote_prefix")]
+    pub promote_prefix: String,
+}
+
+fn default_promote_prefix() -> String {
+    "single".to_string()
 }
 
 /// 码表自动造词（[schema.codetable.auto_phrase]）。

@@ -122,10 +122,13 @@ half_life = 0.0
 # 保留这两项是为了将来若恢复打分模型可直接复用，见 docs/design/freq-rerank-model.md。
 base_scale = 0.0
 recency_peak = 0.0
-# 前缀补全候选是否参与词频位置提升（默认关闭）。
-# 关闭时，码比输入长的候选（打 d 时的「东西」dongxi）不因被选中而前移，只按词库权重排。
-# 短输入下用户给出的信息量很少，把长词组靠词频顶到高频单字前面与直觉相悖。
-promote_prefix = false
+# 前缀补全候选参与词频位置提升的范围：none | single | all（默认 single）。
+#   none   —— 前缀补全一律不提升
+#   single —— 只提升「单个语义单元」的候选：中文单字、西文单词（如 hello）
+#   all    —— 全部提升
+# 判据是语义单元数而非字符数：英文所有候选都是前缀匹配（打 hel 出 hello），
+# 按字符数会把英文调频整个挡死。「东西」「thank you」都是 2 个单元，不提升。
+promote_prefix = "single"
 
 # 拼音自动造词。
 

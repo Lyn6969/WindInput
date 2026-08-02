@@ -51,6 +51,9 @@ const OVERFLOW_VALUES: &[&str] = &["ignore", "commit", "commit_and_input"];
 /// 码表词频应用策略。
 const FREQ_STRATEGY_VALUES: &[&str] = &["top", "step"];
 
+/// 前缀补全参与词频位置提升的范围（按语义单元数判定）。
+const PROMOTE_PREFIX_VALUES: &[&str] = &["none", "single", "all"];
+
 /// 模式级候选布局意图（`LayoutIntent` 的 serde 形态）。临拼/临英/网址/加词共用；
 /// mix / special 的同名字段是 StructList 条目内的属性，不在本注册表单独登记。
 const LAYOUT_INTENT_VALUES: &[&str] = &["follow", "vertical", "horizontal"];
@@ -118,7 +121,10 @@ static REGISTRY: &[ConfigField] = &[
     f("schema.pinyin.frequency.half_life", Float),
     f("schema.pinyin.frequency.base_scale", Float),
     f("schema.pinyin.frequency.recency_peak", Float),
-    f("schema.pinyin.frequency.promote_prefix", Bool),
+    f(
+        "schema.pinyin.frequency.promote_prefix",
+        Enum(PROMOTE_PREFIX_VALUES),
+    ),
     f("schema.pinyin.auto_learn.enabled", Bool),
     f("schema.pinyin.auto_learn.min_word_length", Int),
     f("schema.pinyin.auto_learn.promote_count", Int),

@@ -92,6 +92,39 @@ fn is_han(ch: char) -> bool {
         || (0x20000..=0x323AF).contains(&c) // 扩展 B-H
 }
 
+/// 候选文本的**语义单元数**：汉字逐字计，连续的西文/数字段整体计 1。
+///
+/// ```text
+/// 「东西」    → 2      hello        → 1
+/// 「的样子」  → 3      thank you    → 2
+/// 「iPhone」  → 1      「新iPhone」 → 2
+/// ```
+///
+/// 用途：词频位置提升的准入判据（`schema.*.frequency.promote_prefix = "single"`）。
+///
+/// **为什么不能用 `chars().count()`**：英文候选 `hello` 有 5 个 char，按字符数判据会被
+/// 「只提升单字」的规则直接挡死——而英文**所有候选都是前缀匹配**（打 `hel` 出 `hello`），
+/// 那等于英文调频全灭。语义单元数让同一条规则在中英文下都成立：一个汉字、一个西文词，
+/// 都是用户心智里的「一个东西」。
+///
+/// PUA 按汉字计——本码表把私用区码位当生僻字使用，见 [`is_pua`]。
+pub fn semantic_units(text: &str) -> usize {
+    let mut units = 0usize;
+    let mut in_latin_word = false;
+    for ch in text.chars() {
+        if is_han(ch) || is_pua(ch) {
+            units += 1;
+            in_latin_word = false;
+        } else if ch.is_whitespace() {
+            in_latin_word = false;
+        } else if !in_latin_word {
+            units += 1;
+            in_latin_word = true;
+        }
+    }
+    units
+}
+
 /// 是否 Unicode 私用区（PUA）。本码表把 PUA 码位当汉字使用（占汉字编码、冒充生僻字），
 /// 故常用性判定须把 PUA 视作「必须查表的汉字」，不在规范字表内即判非常用。
 fn is_pua(ch: char) -> bool {
@@ -99,6 +132,40 @@ fn is_pua(ch: char) -> bool {
     (0xE000..=0xF8FF).contains(&c)          // BMP 私用区
         || (0xF0000..=0xFFFFD).contains(&c) // 补充私用区 A
         || (0x100000..=0x10FFFD).contains(&c) // 补充私用区 B
+}
+
+#[cfg(test)]
+mod semantic_units_tests {
+    use super::semantic_units;
+
+    /// 中英混排的计数口径——词频 `promote_prefix = "single"` 全靠它区分「单字/单词」与「词组」。
+    #[test]
+    fn counts_han_per_char_and_latin_per_word() {
+        // 中文逐字
+        assert_eq!(semantic_units("东"), 1);
+        assert_eq!(semantic_units("东西"), 2);
+        assert_eq!(semantic_units("的样子"), 3);
+        // 西文整词计 1 —— 这是英文调频能工作的前提
+        assert_eq!(semantic_units("hello"), 1);
+        assert_eq!(semantic_units("a"), 1);
+        assert_eq!(semantic_units("thank you"), 2);
+        assert_eq!(semantic_units("e-mail"), 1, "连字符不断词");
+        // 混排
+        assert_eq!(semantic_units("新iPhone"), 2);
+        assert_eq!(semantic_units("iPhone手机"), 3);
+        // 边界
+        assert_eq!(semantic_units(""), 0);
+        assert_eq!(semantic_units("   "), 0);
+        // 数字按一段计
+        assert_eq!(semantic_units("2026"), 1);
+    }
+
+    /// 扩展区汉字与 PUA 均按汉字逐字计——码表把私用区码位当生僻字使用。
+    #[test]
+    fn counts_ext_han_and_pua_as_chars() {
+        assert_eq!(semantic_units("\u{20000}"), 1, "扩展 B");
+        assert_eq!(semantic_units("\u{E000}\u{E001}"), 2, "PUA 逐字计");
+    }
 }
 
 #[cfg(test)]
