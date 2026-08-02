@@ -133,6 +133,9 @@ pub fn rerank_codetable_usedfirst(
     code: &str,
     strategy: FreqStrategy,
     protect: ProtectPolicy,
+    now: i64,
+    profile: FreqProfile,
+    promote_prefix: PromotePrefix,
 ) {
     // 呈现层保护：记录基础序前 N 位，重排后原序回填（不动 weight，见 frequency.md §8）。
     // 保护位数按输入码长分级——简码位（一简/二简）的钦定首选不该被一次误选永久改写，
@@ -150,28 +153,46 @@ pub fn rerank_codetable_usedfirst(
         .collect();
 
     use std::cmp::Ordering;
-    candidates.sort_by(|a, b| {
-        let ta = freq_tier(a, code);
-        let tb = freq_tier(b, code);
-        if ta != tb {
-            return ta.cmp(&tb);
-        }
-        match (recs.get(&a.text), recs.get(&b.text)) {
-            (Some(_), None) => Ordering::Less,
-            (None, Some(_)) => Ordering::Greater,
-            (None, None) => Ordering::Equal, // 同档均无记录 → 维持引擎权重序（稳定排序）
-            (Some(ra), Some(rb)) => match strategy {
-                FreqStrategy::Top => rb
-                    .last_used
-                    .cmp(&ra.last_used)
-                    .then(rb.count.cmp(&ra.count)),
-                FreqStrategy::Step => rb
-                    .count
-                    .cmp(&ra.count)
-                    .then(rb.last_used.cmp(&ra.last_used)),
-            },
-        }
-    });
+    if strategy == FreqStrategy::Position {
+        // 位次减半：与拼音共用 `rerank_positional`，只把层级判据换成来源档位。
+        // 档位仍是硬约束——前缀补全（tier 3）再怎么提升也跨不到精确全码（tier 0）之前，
+        // 「五笔优先」不受影响；提升只在**档内**发生，这正是前缀匹配为主的方案要的。
+        rerank_positional(
+            candidates,
+            recs,
+            now,
+            profile,
+            promote_prefix,
+            |_| false, // 码表无锚定层：来源档位已承担该职责
+            |a, b| freq_tier(a, code).cmp(&freq_tier(b, code)),
+        );
+    } else {
+        candidates.sort_by(|a, b| {
+            let ta = freq_tier(a, code);
+            let tb = freq_tier(b, code);
+            if ta != tb {
+                return ta.cmp(&tb);
+            }
+            match (recs.get(&a.text), recs.get(&b.text)) {
+                // 布尔 used-first：用过一次即整体跳到档内最前。`Position` 没有这道台阶。
+                (Some(_), None) => Ordering::Less,
+                (None, Some(_)) => Ordering::Greater,
+                (None, None) => Ordering::Equal, // 同档均无记录 → 维持引擎权重序（稳定排序）
+                (Some(ra), Some(rb)) => match strategy {
+                    FreqStrategy::Top => rb
+                        .last_used
+                        .cmp(&ra.last_used)
+                        .then(rb.count.cmp(&ra.count)),
+                    FreqStrategy::Step => rb
+                        .count
+                        .cmp(&ra.count)
+                        .then(rb.last_used.cmp(&ra.last_used)),
+                    // 上面已分派，此处不可达
+                    FreqStrategy::Position => Ordering::Equal,
+                },
+            }
+        });
+    }
 
     for (i, text) in protected.iter().enumerate() {
         if let Some(pos) = candidates.iter().position(|c| &c.text == text)
@@ -289,15 +310,64 @@ pub fn rerank_pinyin_positional(
     profile: FreqProfile,
     promote_prefix: PromotePrefix,
 ) {
+    rerank_positional(
+        candidates,
+        recs,
+        now,
+        profile,
+        promote_prefix,
+        // 整句 / 精确码短语锚定顶部，不参与位置提升。
+        // `is_sentence_demoted` / `is_sentence_contested` 不在此列——后者正是为了让同码
+        // 竞争者能靠位置提升反超它（`siyuan` 寺院/思源）。
+        |c| {
+            (c.is_sentence && !c.is_sentence_demoted && !c.is_sentence_contested)
+                || (c.is_phrase && c.is_exact_code)
+        },
+        // 匹配层级：简拼 / 前缀补全 / 子短语。词频不得跨层提拔。
+        wind_candidate::cmp_match_layers,
+    );
+}
+
+/// 位置提升的**通用实现**，拼音与码表共用（`docs/design/freq-rerank-model.md`）。
+///
+/// ```text
+/// target_pos = base_pos / (HALVING_BASE ^ effective_count)
+/// ```
+///
+/// 排序键：`(锚定, 层级, target_pos, 有效强度降序, base_pos)`。
+///
+/// 两个调用方只在**层级判据**上不同，位置提升逻辑完全一致：
+///
+/// | 调用方 | `anchored` | `layer_cmp` |
+/// |---|---|---|
+/// | 拼音 | 整句 / 精确码短语 | [`wind_candidate::cmp_match_layers`] |
+/// | 码表 / 混输 / 英文 | 无（恒 `false`） | `freq_tier` 来源档位 |
+///
+/// 抽出共用而非各写一份，是因为「位次减半 + 强度 tie-break + 衰减」这套逻辑踩过的坑
+/// （`as u32` 截断、`base_pos=0` 恒判未提升、整数位次下的 `MIN_PROMOTION_POWER`）
+/// 每一处都够隐蔽，落成两份必然漂移。
+///
+/// # ⚠️ 契约：入参必须已按显示序排好
+///
+/// `base_pos` 取的就是入参下标。协调器的顺序（`candidate_display_order` → `apply_filter`
+/// → **本函数** → `apply_shadow`）满足这一点，且本函数是最后一道整体排序，其结果不会被
+/// 后续按权重重排推翻。
+pub fn rerank_positional<A, L>(
+    candidates: &mut [Candidate],
+    recs: &HashMap<String, FreqRecord>,
+    now: i64,
+    profile: FreqProfile,
+    promote_prefix: PromotePrefix,
+    anchored: A,
+    layer_cmp: L,
+) where
+    A: Fn(&Candidate) -> bool,
+    L: Fn(&Candidate, &Candidate) -> std::cmp::Ordering,
+{
     let n = candidates.len();
     if n < 2 {
         return;
     }
-    let anchored = |c: &Candidate| {
-        (c.is_sentence && !c.is_sentence_demoted && !c.is_sentence_contested)
-            || (c.is_phrase && c.is_exact_code)
-    };
-    // 预计算 (锚定, 目标位次, 是否真的前移)。base_pos 即入参下标，见上文契约。
     // (锚定, 目标位次, 有效强度)
     //
     // ⚠️ 第三项曾是 `target < pos`（「是否真的前移」），那是个 bug：`base_pos = 0` 的候选
@@ -322,7 +392,7 @@ pub fn rerank_pinyin_positional(
         if aa {
             return a.cmp(&b); // 均锚定 → 维持原序，不参与提升
         }
-        wind_candidate::cmp_match_layers(&candidates[a], &candidates[b])
+        layer_cmp(&candidates[a], &candidates[b])
             .then_with(|| meta[a].1.cmp(&meta[b].1)) // 目标位次升序
             // 同位次时按**有效强度**降序：多个候选都提升到同一位次（尤其是都到 0）时，
             // 用得多的在前。无词频者 power = 0，自然落在有词频者之后。
@@ -745,6 +815,9 @@ mod tests {
             "aaaa",
             FreqStrategy::Step,
             ProtectPolicy::NONE,
+            NOW,
+            FreqProfile::default(),
+            PromotePrefix::All,
         );
         assert_eq!(cands[0].text, "戈", "step：count 高者置前");
         assert_eq!(cands[1].text, "工");
@@ -763,6 +836,9 @@ mod tests {
             "aaaa",
             FreqStrategy::Top,
             ProtectPolicy::NONE,
+            NOW,
+            FreqProfile::default(),
+            PromotePrefix::All,
         );
         assert_eq!(cands[0].text, "戈", "top：最近使用者置首");
     }
@@ -779,6 +855,9 @@ mod tests {
             "aaaa",
             FreqStrategy::Step,
             ProtectPolicy::NONE,
+            NOW,
+            FreqProfile::default(),
+            PromotePrefix::All,
         );
         assert_eq!(cands[0].text, "工", "码表精确全码档位最高，拼音不得反超");
     }
@@ -812,6 +891,9 @@ mod tests {
                 by_len: [0; 3],
                 fallback: 1,
             },
+            NOW,
+            FreqProfile::default(),
+            PromotePrefix::All,
         );
         assert_eq!(cands[0].text, "甲", "protect_top_n=1 应锁定原首位");
         assert_eq!(cands[1].text, "丙", "词频候选在保护位之后正常上浮");
@@ -857,6 +939,9 @@ mod tests {
             "a",
             FreqStrategy::Step,
             ProtectPolicy::default(),
+            NOW,
+            FreqProfile::default(),
+            PromotePrefix::All,
         );
         assert_eq!(
             cands[0].text,
@@ -879,6 +964,9 @@ mod tests {
             "aaaa",
             FreqStrategy::Step,
             ProtectPolicy::default(),
+            NOW,
+            FreqProfile::default(),
+            PromotePrefix::All,
         );
         assert_eq!(
             cands[0].text,
@@ -899,6 +987,9 @@ mod tests {
             "aa",
             FreqStrategy::Top,
             ProtectPolicy::default(),
+            NOW,
+            FreqProfile::default(),
+            PromotePrefix::All,
         );
         assert_eq!(cands[0].text, "式", "二简位在 MRU 策略下同样须保住钦定首选");
     }
@@ -925,6 +1016,9 @@ mod tests {
                 by_len: [2, 0, 0], // 名额 2 > 精确候选数 1
                 fallback: 0,
             },
+            NOW,
+            FreqProfile::default(),
+            PromotePrefix::All,
         );
         let order: Vec<&str> = cands.iter().map(|c| c.text.as_str()).collect();
         assert_eq!(
@@ -949,6 +1043,9 @@ mod tests {
                 by_len: [1, 0, 0],
                 fallback: 0,
             },
+            NOW,
+            FreqProfile::default(),
+            PromotePrefix::All,
         );
         assert_eq!(cands[0].text, "工区", "无精确候选时不设保护，词频照常生效");
     }
@@ -958,7 +1055,16 @@ mod tests {
     fn none_policy_degrades_to_no_protection() {
         let mut cands = vec![ct_exact("a", "工", 9999), ct_exact("a", "戈", 9998)];
         let r = recs(&[("戈", 5, NOW)]);
-        rerank_codetable_usedfirst(&mut cands, &r, "a", FreqStrategy::Step, ProtectPolicy::NONE);
+        rerank_codetable_usedfirst(
+            &mut cands,
+            &r,
+            "a",
+            FreqStrategy::Step,
+            ProtectPolicy::NONE,
+            NOW,
+            FreqProfile::default(),
+            PromotePrefix::All,
+        );
         assert_eq!(cands[0].text, "戈", "NONE 策略下词频照常生效");
     }
 
@@ -993,6 +1099,9 @@ mod tests {
             "da",
             FreqStrategy::Step,
             ProtectPolicy::NONE,
+            NOW,
+            FreqProfile::default(),
+            PromotePrefix::All,
         );
         let order: Vec<&str> = cands.iter().map(|c| c.text.as_str()).collect();
         assert_eq!(
@@ -1277,6 +1386,120 @@ mod tests {
             phrase[0].text, "thanks",
             "「thank you」是 2 个语义单元，与中文词组同等对待"
         );
+    }
+
+    // ─────────────── 码表 / 英文的 position 策略 ───────────────
+
+    /// 英文方案的典型场景：**候选几乎全是前缀匹配**，布尔 used-first 过于粗暴。
+    ///
+    /// `Top`/`Step` 下选一次 `hello` 就整体跳到档内最前；`Position` 则逐次前移，
+    /// 这正是「想要调频但不想那么粗暴」的方案要的。
+    #[test]
+    fn codetable_position_promotes_english_gradually() {
+        let en = |code: &str, t: &str, w: i32| {
+            let mut c = ct(code, t, w);
+            c.source = CandidateSource::English;
+            c
+        };
+        let build = || {
+            vec![
+                en("hel", "help", 9000),
+                en("hel", "hello", 5000),
+                en("hel", "hell", 3000),
+                en("hel", "helmet", 1000),
+            ]
+        };
+
+        // 用一次：第 1 位 → 第 0 位
+        let mut once = build();
+        rerank_codetable_usedfirst(
+            &mut once,
+            &recs(&[("hello", 1, NOW)]),
+            "hel",
+            FreqStrategy::Position,
+            ProtectPolicy::NONE,
+            NOW,
+            FreqProfile::default(),
+            PromotePrefix::All,
+        );
+        assert_eq!(once[0].text, "hello", "第 2 位用一次即到首位");
+
+        // 末位候选需要更多次才爬到前面——这就是「渐进」相对布尔闸门的差别
+        let mut tail = build();
+        rerank_codetable_usedfirst(
+            &mut tail,
+            &recs(&[("helmet", 1, NOW)]),
+            "hel",
+            FreqStrategy::Position,
+            ProtectPolicy::NONE,
+            NOW,
+            FreqProfile::default(),
+            PromotePrefix::All,
+        );
+        assert_eq!(
+            tail.iter().map(|c| c.text.as_str()).collect::<Vec<_>>(),
+            vec!["help", "helmet", "hello", "hell"],
+            "第 4 位用一次只到第 2 位（3/2=1），不是直接置顶"
+        );
+    }
+
+    /// **对照**：同样的记录在 `Step` 下会直接跳到档内最前——这正是「粗暴」之处。
+    ///
+    /// 缺了它，上面那条无从证明 `Position` 确实换了行为。
+    #[test]
+    fn codetable_step_is_boolean_gate_by_contrast() {
+        let en = |code: &str, t: &str, w: i32| {
+            let mut c = ct(code, t, w);
+            c.source = CandidateSource::English;
+            c
+        };
+        let mut c = vec![
+            en("hel", "help", 9000),
+            en("hel", "hello", 5000),
+            en("hel", "hell", 3000),
+            en("hel", "helmet", 1000),
+        ];
+        rerank_codetable_usedfirst(
+            &mut c,
+            &recs(&[("helmet", 1, NOW)]),
+            "hel",
+            FreqStrategy::Step,
+            ProtectPolicy::NONE,
+            NOW,
+            FreqProfile::default(),
+            PromotePrefix::All,
+        );
+        assert_eq!(
+            c[0].text, "helmet",
+            "Step 是布尔闸门：末位候选用一次即整体跳到最前"
+        );
+    }
+
+    /// `Position` 下**来源档位仍是硬约束**：前缀补全再怎么提升也跨不到精确全码之前。
+    ///
+    /// 「五笔优先」不受策略影响——用户确认英文场景要的是**档内**提升，不是跨档。
+    #[test]
+    fn codetable_position_respects_source_tiers() {
+        let mut c = vec![
+            ct("a", "工", 9999),   // tier 0：精确全码
+            ct("ab", "式", 5000),  // tier 3：前缀补全
+            ct("abc", "戒", 3000), // tier 3
+        ];
+        rerank_codetable_usedfirst(
+            &mut c,
+            &recs(&[("戒", 50, NOW)]),
+            "a",
+            FreqStrategy::Position,
+            ProtectPolicy::NONE,
+            NOW,
+            FreqProfile::default(),
+            PromotePrefix::All,
+        );
+        assert_eq!(
+            c[0].text, "工",
+            "精确全码恒在前，前缀补全用 50 次也跨不过档位"
+        );
+        assert_eq!(c[1].text, "戒", "但档内提升生效：它越过了同档的「式」");
     }
 
     /// **模型的核心断言**：提升速度与权重差距无关。

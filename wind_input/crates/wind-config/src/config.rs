@@ -395,9 +395,27 @@ pub struct CodetableFrequency {
     /// 三简位（码长 3）保护前 N 位。默认不保护——三简的钦定性弱于一二简。
     #[serde(default)]
     pub protect_top_n_len3: usize,
-    /// 词频应用策略："top"（一次到顶 MRU）/ "step"（逐次提升）。原 freq_strategy 迁入。
+    /// 词频应用策略：`"top"`（一次到顶 MRU）/ `"step"`（逐次提升，默认）/
+    /// `"position"`（位次减半）。原 freq_strategy 迁入。
+    ///
+    /// `top`/`step` 是**布尔 used-first**——用过一次即整体跳到档内最前，策略只决定「已用过
+    /// 的那批内部怎么排」。`position` 让位次连续表达强弱，没有「用过 / 没用过」这道台阶，
+    /// 适合**前缀匹配为主**的方案（英文尤甚，其候选几乎全是前缀匹配）。
     #[serde(default = "default_freq_strategy")]
     pub strategy: String,
+    /// 前缀补全候选参与词频位置提升的范围（`"none"` / `"single"` / `"all"`）。
+    ///
+    /// **仅 `strategy = "position"` 时生效**；`top`/`step` 走布尔 used-first，不读本项。
+    ///
+    /// 码表默认 `"all"`（与拼音的 `"single"` 不同）：码表的前缀补全已由来源档位隔离、
+    /// 跨不到精确档之前，无需再按语义单元收窄；且这与 `top`/`step` 的历史行为一致
+    /// （那两者对前缀补全从无限制），避免升级后存量用户的调频范围突然变窄。
+    #[serde(default = "default_codetable_promote_prefix")]
+    pub promote_prefix: String,
+}
+
+fn default_codetable_promote_prefix() -> String {
+    "all".to_string()
 }
 
 fn default_protect_len1() -> usize {
@@ -421,6 +439,7 @@ impl Default for CodetableFrequency {
             protect_top_n_len2: default_protect_len2(),
             protect_top_n_len3: 0,
             strategy: default_freq_strategy(),
+            promote_prefix: default_codetable_promote_prefix(),
         }
     }
 }

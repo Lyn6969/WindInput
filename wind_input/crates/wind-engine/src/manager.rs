@@ -37,6 +37,16 @@ pub enum FreqStrategy {
     Top,
     /// 逐次提升（默认）：count 优先，累积使用才爬升，抗误选。
     Step,
+    /// **位次减半**：候选每积累一次有效使用，目标位次除以 2，随半衰期回落
+    /// （`docs/design/freq-rerank-model.md`）。
+    ///
+    /// 与 `Top`/`Step` 的本质差别：后两者是**布尔 used-first**——只要用过一次就整体跳到
+    /// 档内最前，策略只决定「已用过的那批内部怎么排」；`Position` 则让位次连续表达强弱，
+    /// 用得越多爬得越前，没有「用过 / 没用过」这道台阶。
+    ///
+    /// 适合**前缀匹配为主**的方案（英文尤其——它几乎所有候选都是前缀匹配），那里
+    /// 布尔闸门会让任何选过一次的词直接顶到最前，过于粗暴。
+    Position,
 }
 
 /// 前缀补全参与词频位置提升的范围。判据是**语义单元数**
@@ -1621,10 +1631,10 @@ impl EngineManager {
         } else {
             let ct = self.codetable.lock().unwrap_or_else(|e| e.into_inner());
             FreqSettings {
-                // 码表侧目前恒放开：其前缀补全已由 `freq_tier` 分到独立档位，词频只在档内
-                // 调整、跨不到精确档之前，故不需要本项收窄。待码表接入 position 策略后，
-                // 这里应改为读 `schema.codetable.frequency.promote_prefix`。
-                promote_prefix: PromotePrefix::All,
+                // 码表默认 `all`：其前缀补全已由 `freq_tier` 分到独立档位、跨不到精确档
+                // 之前，无需再按语义单元收窄；且这与 `Top`/`Step` 的历史行为一致（那两者
+                // 对前缀补全从无限制），避免升级后存量用户的调频突然变窄。
+                promote_prefix: PromotePrefix::parse(&ct.frequency.promote_prefix),
                 enabled: ct.frequency.enabled,
                 strategy: Self::parse_freq_strategy(&ct.frequency.strategy),
                 protect: ProtectPolicy {
@@ -1648,6 +1658,7 @@ impl EngineManager {
     fn parse_freq_strategy(s: &str) -> FreqStrategy {
         match s {
             "top" => FreqStrategy::Top,
+            "position" => FreqStrategy::Position,
             _ => FreqStrategy::Step,
         }
     }

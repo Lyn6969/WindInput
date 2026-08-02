@@ -282,12 +282,17 @@ impl Coordinator {
                 settings.promote_prefix,
             );
         } else {
+            // `strategy = position` 时走与拼音同一套位置提升（档位仍是硬约束，只在档内
+            // 提升）；`top`/`step` 仍是布尔 used-first，不读 profile / promote_prefix。
             wind_engine::freq_rerank::rerank_codetable_usedfirst(
                 candidates,
                 &recs,
                 code,
                 settings.strategy,
                 settings.protect,
+                now_unix_secs(),
+                self.engine_mgr.pinyin_freq_profile(),
+                settings.promote_prefix,
             );
         }
     }

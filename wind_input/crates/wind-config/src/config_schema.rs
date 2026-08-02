@@ -49,7 +49,7 @@ use FieldType::{Bool, Enum, Float, Int, Map, Str, StrList, StructList};
 const OVERFLOW_VALUES: &[&str] = &["ignore", "commit", "commit_and_input"];
 
 /// 码表词频应用策略。
-const FREQ_STRATEGY_VALUES: &[&str] = &["top", "step"];
+const FREQ_STRATEGY_VALUES: &[&str] = &["top", "step", "position"];
 
 /// 前缀补全参与词频位置提升的范围（按语义单元数判定）。
 const PROMOTE_PREFIX_VALUES: &[&str] = &["none", "single", "all"];
@@ -94,6 +94,10 @@ static REGISTRY: &[ConfigField] = &[
     f(
         "schema.codetable.frequency.strategy",
         Enum(FREQ_STRATEGY_VALUES),
+    ),
+    f(
+        "schema.codetable.frequency.promote_prefix",
+        Enum(PROMOTE_PREFIX_VALUES),
     ),
     f("schema.codetable.auto_phrase.enabled", Bool),
     f("schema.codetable.auto_phrase.min_phrase_len", Int),
