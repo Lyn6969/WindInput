@@ -870,6 +870,7 @@ CTextService::CTextService()
     , _hasFocus(FALSE)
     , _hasTextInputContext(FALSE)
     , _pLastActiveDocMgr(nullptr)
+    , _pLastFocusedDocMgr(nullptr)
     , _focusLostSent(FALSE)
     , _editCtxReported(FALSE)
     , _pComposition(nullptr)
@@ -908,6 +909,11 @@ CTextService::~CTextService()
     {
         _pLastActiveDocMgr->Release();
         _pLastActiveDocMgr = nullptr;
+    }
+    if (_pLastFocusedDocMgr != nullptr)
+    {
+        _pLastFocusedDocMgr->Release();
+        _pLastFocusedDocMgr = nullptr;
     }
     DllRelease();
 }
@@ -2043,7 +2049,10 @@ STDAPI CTextService::OnSetFocus(ITfDocumentMgr* pDocMgrFocus, ITfDocumentMgr* pD
         // 销毁输入态——那正是「Excel 首字符不进编码、直接上屏」的根因。
         // 把清理推迟到「另一个文档拿到焦点」时执行，抖动便自然被判为同一文档而跳过。
         // 同源做法见 Weasel（ThreadMgrEventSink.cpp）：DocMgr 级失焦完全不碰 composition。
-        const BOOL isSameDocMgr = (_pLastActiveDocMgr != nullptr && pDocMgrFocus == _pLastActiveDocMgr);
+        // 判据取 _pLastFocusedDocMgr（含 transient）而非 _pLastActiveDocMgr：后者刻意排除
+        // locked/transient DocMgr，拿它判抖动会让 transient 永远等不到自己、次次判成换文档。
+        // explorer 地址栏正是这样丢掉首字母的，详见该字段的注释。
+        const BOOL isSameDocMgr = (_pLastFocusedDocMgr != nullptr && pDocMgrFocus == _pLastFocusedDocMgr);
         WIND_LOG_DEBUG_FMT(L"Focus gained focusSession=%llu sameDoc=%d doc=0x%p",
                            _focusSessionId, isSameDocMgr ? 1 : 0, pDocMgrFocus);
 
@@ -2270,6 +2279,18 @@ STDAPI CTextService::OnSetFocus(ITfDocumentMgr* pDocMgrFocus, ITfDocumentMgr* pD
                 _pLastActiveDocMgr->Release();
             _pLastActiveDocMgr = pDocMgrFocus;
             _pLastActiveDocMgr->AddRef();
+        }
+
+        // 抖动判据用的缓存：**无条件**记录本次获焦的 DocMgr，transient 也要记。
+        // 上面那个缓存排除 transient 是为了「换文档收口时 hint 必须指向真实文档」，
+        // 而这里回答的是另一个问题——「下次同一个 doc 又获焦时，该不该当成抖动」。
+        // 两个问题的答案对 transient 恰好相反，故必须分开存，合用一个就是首字母上屏的成因。
+        if (_pLastFocusedDocMgr != pDocMgrFocus)
+        {
+            if (_pLastFocusedDocMgr != nullptr)
+                _pLastFocusedDocMgr->Release();
+            _pLastFocusedDocMgr = pDocMgrFocus;
+            _pLastFocusedDocMgr->AddRef();
         }
     }
 

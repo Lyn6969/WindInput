@@ -409,6 +409,20 @@ private:
     // DocMgr，用于区分「同一文档抖回来」与「换了文档」。持 AddRef 保活是必须的——
     // 裸指针在旧对象释放后可能被新对象复用同一地址，导致「换了文档」被误判成抖动。
     ITfDocumentMgr* _pLastActiveDocMgr;
+    // 上一次**获焦**的 DocMgr，含 locked/transient（XamlIsland）。仅用于判断「同一个 doc
+    // 抖回来」，不参与换文档收口。
+    //
+    // ⚠ 为什么不能复用 _pLastActiveDocMgr 做这个判断：那个缓存**刻意排除** transient
+    // DocMgr（理由见 OnSetFocus 的更新处），于是 transient 永远等不到自己，`isSameDocMgr`
+    // 恒为假 ⇒ 每次焦点抖动都被判成「换了文档」⇒ 收口时 EndComposition 终止正在进行的
+    // 组合，已写入宿主的 preedit 就留在了那里。实测 explorer 地址栏：同一个 DocMgr
+    // (0x219BC540) 连续三次获焦全报 sameDoc=0，首字母因此上屏（第二键的 prevChar=0x73='s'
+    // 就是它留下的痕迹）。
+    //
+    // 两者分工：本字段回答「是不是同一个 doc 在抖」，_pLastActiveDocMgr 回答「上一个**真实**
+    // 文档是谁」（换文档收口要拿它当 hint，不能是 transient 容器）。同样持 AddRef 保活，
+    // 理由同上：裸指针在旧对象释放后可能被新对象复用同一地址。
+    ITfDocumentMgr* _pLastFocusedDocMgr;
     // focus_lost 已发出且尚未被 focus_gained 复位。SendFocusLost 不幂等（服务端据此推进
     // 状态机），而清理可能从三条路径进入（换文档 / OnKillThreadFocus / 无可编辑上下文），
     // 故需去重。⚠ CTX_LOST **不**置本标志：它不是真失焦，置了会让随后真正的
