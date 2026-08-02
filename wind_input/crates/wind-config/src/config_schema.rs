@@ -54,6 +54,9 @@ const FREQ_STRATEGY_VALUES: &[&str] = &["top", "step", "position"];
 /// 前缀补全参与词频位置提升的范围（按语义单元数判定）。
 const PROMOTE_PREFIX_VALUES: &[&str] = &["none", "single", "all"];
 
+/// 英文候选的词频记账码口径（内部配置，不进 GUI）。
+const ENGLISH_CODE_SCOPE_VALUES: &[&str] = &["candidate", "input"];
+
 /// 模式级候选布局意图（`LayoutIntent` 的 serde 形态）。临拼/临英/网址/加词共用；
 /// mix / special 的同名字段是 StructList 条目内的属性，不在本注册表单独登记。
 const LAYOUT_INTENT_VALUES: &[&str] = &["follow", "vertical", "horizontal"];
@@ -98,6 +101,10 @@ static REGISTRY: &[ConfigField] = &[
     f(
         "schema.codetable.frequency.promote_prefix",
         Enum(PROMOTE_PREFIX_VALUES),
+    ),
+    f(
+        "schema.codetable.frequency.english_code_scope",
+        Enum(ENGLISH_CODE_SCOPE_VALUES),
     ),
     f("schema.codetable.auto_phrase.enabled", Bool),
     f("schema.codetable.auto_phrase.min_phrase_len", Int),

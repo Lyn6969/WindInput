@@ -288,7 +288,7 @@ impl Coordinator {
             consumed > 0 && consumed < total && state.temp_pinyin_buffer.is_char_boundary(consumed);
         // 记账码：码表按输入码（码位独立），拼音/英文按候选码。见 `freq_code`。
         self.record_selection(
-            &Self::freq_code(&state.temp_pinyin_buffer, cand),
+            &self.freq_code(&state.temp_pinyin_buffer, cand),
             &cand.text,
             cand.source,
         );
@@ -913,7 +913,7 @@ impl Coordinator {
             let idx = (start + state.selected_index).min(state.candidates.len() - 1);
             let t = state.candidates[idx].text.clone();
             // 记账码：码表按输入码（码位独立），拼音/英文按候选码。见 `freq_code`。
-            let code = Self::freq_code(&state.input_buffer, &state.candidates[idx]);
+            let code = self.freq_code(&state.input_buffer, &state.candidates[idx]);
             self.record_selection(&code, &t, state.candidates[idx].source);
             // 进入临时拼音前顶屏高亮候选（来源候选；prefix 段已在选词时记过）。
             self.record_commit(

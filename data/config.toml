@@ -75,6 +75,11 @@ strategy = "top"
 # 码表默认 all 而拼音默认 single：码表的前缀补全已由来源档位隔离、跨不到精确档之前，
 # 无需再按语义单元收窄，且与 top/step 的历史行为一致。
 promote_prefix = "all"
+# 英文候选的词频记账码口径：candidate | input（默认 candidate）。**内部项，不进设置页**。
+#   candidate —— 打 hel 选 hello 记成 (hello, hello)，之后打 he 也受益（跨码位共享）
+#   input     —— 记成 (hel, hello)，各前缀独立学习（与码表同侧）
+# 英文几乎全是前缀匹配，两种口径各有道理，尚未定论，先留旋钮观察。
+english_code_scope = "candidate"
 
 # 码表自动造词（连续单字）：连续单字上屏累积成序列，遇终止符（标点/回车/空格/焦点切换/
 # 光标移动/多字词上屏）或空闲超时后，按方案 [[encoder.rules]] 为整串算词组编码写入**临时

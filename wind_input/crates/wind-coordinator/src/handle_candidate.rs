@@ -238,33 +238,51 @@ impl Coordinator {
         // 保护首选正以此为前提）。
         //
         // 写入端 `record_selection` 的各调用点同样经 `freq_code`，**两侧必须同口径**。
-        let recs: std::collections::HashMap<String, FreqRecord> = candidates
-            .iter()
-            .filter_map(|c| {
-                // 短语不参与词频维度（写入端 `record_selection` 对称跳过）：其次序由短语定义的
-                // weight/position 决定，且求值型短语的文本逐日变化，点查恒 miss——白花一次
-                // redb 查询，还会让人误以为词频在这里生效。
-                if c.is_phrase {
-                    return None;
+        // 先收键再**一次事务**批量查：逐候选 `get_freq` 会为每个候选开一次 redb 读事务，
+        // 五笔单字母下 78+ 候选即 78 次，是每键的固定开销（见 `get_freq_batch`）。
+        let mut probe: Vec<(String, String, String)> = Vec::new();
+        let mut probe_text: Vec<String> = Vec::new();
+        for c in candidates.iter() {
+            // 短语不参与词频维度（写入端 `record_selection` 对称跳过）：其次序由短语定义的
+            // weight/position 决定，且求值型短语的文本逐日变化，点查恒 miss——白花一次
+            // redb 查询，还会让人误以为词频在这里生效。
+            if c.is_phrase {
+                continue;
+            }
+            let consumes_all = c.consumed_length == 0 || c.consumed_length >= input_len;
+            if !consumes_all {
+                continue;
+            }
+            // 混输按候选来源读子方案键空间（无法归因跳过）；非混输用统一 schema。
+            let sid: &str = if is_mixed {
+                match c.source {
+                    CandidateSource::CodeTable => match ct_id.as_deref() {
+                        Some(v) => v,
+                        None => continue,
+                    },
+                    CandidateSource::Pinyin => match py_id.as_deref() {
+                        Some(v) => v,
+                        None => continue,
+                    },
+                    _ => continue,
                 }
-                let consumes_all = c.consumed_length == 0 || c.consumed_length >= input_len;
-                if !consumes_all {
-                    return None;
-                }
-                // 混输按候选来源读子方案键空间（无法归因跳过）；非混输用统一 schema。
-                let sid: &str = if is_mixed {
-                    match c.source {
-                        CandidateSource::CodeTable => ct_id.as_deref()?,
-                        CandidateSource::Pinyin => py_id.as_deref()?,
-                        _ => return None,
-                    }
-                } else {
-                    &schema
-                };
-                match store.get_freq(sid, &Self::freq_code(code, c), &c.text) {
-                    Ok(Some(r)) if r.count > 0 => Some((c.text.clone(), r)),
-                    _ => None,
-                }
+            } else {
+                &schema
+            };
+            probe.push((
+                sid.to_string(),
+                Self::freq_code_with(code, c, settings.english_code_by_input),
+                c.text.clone(),
+            ));
+            probe_text.push(c.text.clone());
+        }
+        let found = store.get_freq_batch(&probe).unwrap_or_default();
+        let recs: std::collections::HashMap<String, FreqRecord> = probe_text
+            .into_iter()
+            .zip(found)
+            .filter_map(|(t, r)| match r {
+                Some(r) if r.count > 0 => Some((t, r)),
+                _ => None,
             })
             .collect();
         if recs.is_empty() {
@@ -1405,9 +1423,24 @@ impl Coordinator {
     ///
     /// ⚠️ **读写两侧必须同口径**：写入端 `record_selection` 与读取端 `apply_freq_rerank`
     /// 都要经本函数，否则记了查不到、或查到不该查的。
-    pub(crate) fn freq_code(buf: &str, cand: &Candidate) -> String {
+    pub(crate) fn freq_code(&self, buf: &str, cand: &Candidate) -> String {
+        Self::freq_code_with(
+            buf,
+            cand,
+            self.engine_mgr.freq_settings().english_code_by_input,
+        )
+    }
+
+    /// [`Self::freq_code`] 的显式传参版本，供**热路径**使用。
+    ///
+    /// `apply_freq_rerank` 要对整页候选逐个取码，走实例方法会每候选取一次 `freq_settings`
+    /// （带锁的缓存查询）。那里在循环外取一次布尔量传进来即可。
+    pub(crate) fn freq_code_with(buf: &str, cand: &Candidate, english_by_input: bool) -> String {
         match cand.source {
             CandidateSource::CodeTable => buf.to_string(),
+            // 英文口径可配（内部项 `english_code_scope`）：英文几乎全是前缀匹配，
+            // 跨码位共享与码位独立各有道理，尚未定论，先留旋钮。
+            CandidateSource::English if english_by_input => buf.to_string(),
             _ => Self::cand_code(buf, cand),
         }
     }
@@ -1499,7 +1532,7 @@ impl Coordinator {
         // 拼音/英文按候选码（分段时为前缀码，如「ni」而非整串「nihao」）。
         // 上面的 `code` 仍供 `record_commit` 统计码长使用，那是另一套语义。
         self.record_selection(
-            &Self::freq_code(&state.input_buffer, cand),
+            &self.freq_code(&state.input_buffer, cand),
             &cand.text,
             cand.source,
         );
@@ -1722,7 +1755,7 @@ impl Coordinator {
         // 仅普通候选（无副作用命令 Action）才学（对齐 Go len(cand.Actions)==0）。
         if cand.actions.is_empty() {
             // 记账码：码表按输入码（码位独立），拼音/英文按候选码。见 `freq_code`。
-            let code = Self::freq_code(&state.input_buffer, &cand);
+            let code = self.freq_code(&state.input_buffer, &cand);
             self.record_selection(&code, &runes[char_index].to_string(), cand.source);
         }
         // 拼接已确认段前缀 + 选中单字，整体按简繁模式转换（与 commit_selected 一致）。
@@ -2283,7 +2316,7 @@ impl Coordinator {
         let s2t_override = state.candidates[idx].s2t_override.clone();
         let source = state.candidates[idx].source;
         // 记账码按来源分流（见 `freq_code`）：码表用输入码，拼音/英文用候选存储码。
-        let code = Self::freq_code(&state.input_buffer, &state.candidates[idx]);
+        let code = self.freq_code(&state.input_buffer, &state.candidates[idx]);
         let chinese_mode = state.chinese_mode;
         let out = self.commit_candidate(&mut state, &text, s2t_override.as_deref(), source, &code);
         // 鼠标提交后彻底复位各输入模式，避免遗留状态
@@ -2416,30 +2449,48 @@ mod finalize_candidates_tests {
         let mut ct = cand_code("有", "def");
         ct.source = CandidateSource::CodeTable;
         assert_eq!(
-            Coordinator::freq_code("de", &ct),
+            Coordinator::freq_code_with("de", &ct, false),
             "de",
             "码表须按输入码记账，否则 d/de/def 三个码位会互相串扰"
         );
-        assert_eq!(Coordinator::freq_code("d", &ct), "d");
-        assert_eq!(Coordinator::freq_code("def", &ct), "def");
+        assert_eq!(Coordinator::freq_code_with("d", &ct, false), "d");
+        assert_eq!(Coordinator::freq_code_with("def", &ct, false), "def");
 
         let mut py = cand_code("东西", "dongxi");
         py.source = CandidateSource::Pinyin;
         assert_eq!(
-            Coordinator::freq_code("d", &py),
+            Coordinator::freq_code_with("d", &py, false),
             "dongxi",
             "拼音按候选码——跨码位共享才是想要的行为"
         );
-
-        // 英文与拼音同侧：打 `hel` 选 `hello` 后，打 `he` 也该受益
-        let mut en = cand_code("hello", "hello");
-        en.source = CandidateSource::English;
-        assert_eq!(Coordinator::freq_code("hel", &en), "hello");
+        assert_eq!(
+            Coordinator::freq_code_with("d", &py, true),
+            "dongxi",
+            "英文开关不得波及拼音"
+        );
 
         // 候选无码时退回输入缓冲（`cand_code` 的既有语义，两侧一致）
         let mut bare = cand_code("啊", "");
         bare.source = CandidateSource::Pinyin;
-        assert_eq!(Coordinator::freq_code("a", &bare), "a");
+        assert_eq!(Coordinator::freq_code_with("a", &bare, false), "a");
+    }
+
+    /// 英文记账码口径可配（内部项 `english_code_scope`）：英文几乎全是前缀匹配，
+    /// 跨码位共享与码位独立各有道理，尚未定论，故留旋钮而非写死。
+    #[test]
+    fn freq_code_english_scope_is_switchable() {
+        let mut en = cand_code("hello", "hello");
+        en.source = CandidateSource::English;
+        assert_eq!(
+            Coordinator::freq_code_with("hel", &en, false),
+            "hello",
+            "默认 candidate：打 hel 选 hello 后，打 he 也该受益"
+        );
+        assert_eq!(
+            Coordinator::freq_code_with("hel", &en, true),
+            "hel",
+            "切到 input：各前缀独立学习，与码表同侧"
+        );
     }
 
     #[test]

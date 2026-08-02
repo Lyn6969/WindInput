@@ -412,6 +412,27 @@ pub struct CodetableFrequency {
     /// （那两者对前缀补全从无限制），避免升级后存量用户的调频范围突然变窄。
     #[serde(default = "default_codetable_promote_prefix")]
     pub promote_prefix: String,
+    /// **英文候选的词频记账码口径**（`"candidate"` / `"input"`，默认 `"candidate"`）。
+    ///
+    /// 内部配置，暂不进 GUI——英文该用哪种尚未定论，先留旋钮观察。
+    ///
+    /// | 取值 | 打 `hel` 选 `hello` 记成 | 之后打 `he` |
+    /// |---|---|---|
+    /// | `"candidate"`（默认） | `(hello, hello)` | **也受益**（跨码位共享） |
+    /// | `"input"` | `(hel, hello)` | 不受益（码位独立） |
+    ///
+    /// 英文几乎所有候选都是前缀匹配，跨码位共享看起来更合直觉（少打几个字母也能命中
+    /// 常用词）；但若用户希望「不同前缀各自独立学习」，`input` 更合适——这正是码表侧
+    /// 采用的口径（`d`/`de`/`def` 三个独立码位）。
+    ///
+    /// 放在码表段是因为英文引擎走的就是码表那条重排路径（`is_pinyin() == false`），
+    /// 其 `strategy`/`promote_prefix` 也读这里。
+    #[serde(default = "default_english_code_scope")]
+    pub english_code_scope: String,
+}
+
+fn default_english_code_scope() -> String {
+    "candidate".to_string()
 }
 
 fn default_codetable_promote_prefix() -> String {
@@ -440,6 +461,7 @@ impl Default for CodetableFrequency {
             protect_top_n_len3: 0,
             strategy: default_freq_strategy(),
             promote_prefix: default_codetable_promote_prefix(),
+            english_code_scope: default_english_code_scope(),
         }
     }
 }

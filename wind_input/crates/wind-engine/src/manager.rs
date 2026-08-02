@@ -97,6 +97,9 @@ pub struct FreqSettings {
     pub protect: ProtectPolicy,
     /// 前缀补全参与位置提升的范围（`schema.*.frequency.promote_prefix`）。
     pub promote_prefix: PromotePrefix,
+    /// 英文候选记账码是否用输入码（`schema.codetable.frequency.english_code_scope == "input"`）。
+    /// 内部配置；`false`（默认）= 用候选码，与拼音同侧。
+    pub english_code_by_input: bool,
 }
 
 impl Default for FreqSettings {
@@ -106,6 +109,7 @@ impl Default for FreqSettings {
             strategy: FreqStrategy::Step,
             protect: ProtectPolicy::NONE,
             promote_prefix: PromotePrefix::Single,
+            english_code_by_input: false,
         }
     }
 }
@@ -132,6 +136,14 @@ pub struct EngineManager {
     temp_pinyin: Mutex<wind_config::config::TempPinyinConfig>,
     /// 词频排序设置缓存（schema_id -> FreqSettings；按需解析、避免每键读盘）
     freq_cache: Mutex<HashMap<String, FreqSettings>>,
+    /// 方案引擎类型缓存（`schema_engine_type`）。**按 id 缓存，reload/invalidate 时清**，
+    /// 与 `freq_cache`/`name_cache` 同生命周期。
+    ///
+    /// 存在理由是性能：`read_schema` 每次都要 `fs::read_to_string` + `toml::from_str`，
+    /// 而 `apply_freq_rerank` 每次按键就要调 2 次（混输 5+ 次）——五笔单字母下与逐候选的
+    /// redb 查询叠加，造成可感知卡顿。缓存 `None` 同样有意义：方案文件不存在时反复尝试
+    /// 读盘，还会刷出成片的 `Schema file not found` 警告。
+    schema_type_cache: Mutex<HashMap<String, Option<String>>>,
     /// 方案显示名缓存（schema_id -> schema.name；缺则回退 id）。按需读盘一次。
     name_cache: Mutex<HashMap<String, String>>,
     /// 方案 override 层目录（schema_overrides/{id}.toml）；读 schema 时深合并到基础方案之上。
@@ -355,6 +367,7 @@ impl EngineManager {
             mix: Mutex::new(config.schema.mix.clone()),
             temp_pinyin: Mutex::new(config.input.temp_pinyin.clone()),
             freq_cache: Mutex::new(HashMap::new()),
+            schema_type_cache: Mutex::new(HashMap::new()),
             name_cache: Mutex::new(HashMap::new()),
             override_dir,
             primary_codetable: Mutex::new(primary_codetable),
@@ -1046,12 +1059,26 @@ impl EngineManager {
     /// 指定方案的引擎类型字符串（小写，如 "pinyin"|"codetable"|"mixed"）；读不到返回 None。
     /// 不切换活跃方案（设置页 dict.encode 据此选拼音/五笔出码规则）。
     pub fn schema_engine_type(&self, schema_id: &str) -> Option<String> {
-        Self::read_schema(
+        {
+            let cache = self
+                .schema_type_cache
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            if let Some(v) = cache.get(schema_id) {
+                return v.clone();
+            }
+        }
+        let ty = Self::read_schema(
             schema_id,
             self.data_dir.as_deref(),
             self.override_dir.as_deref(),
         )
-        .map(|s| s.engine.engine_type.to_lowercase())
+        .map(|s| s.engine.engine_type.to_lowercase());
+        self.schema_type_cache
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(schema_id.to_string(), ty.clone());
+        ty
     }
 
     /// 存储归属 id：拼音引擎方案统一为 "pinyin"（拼音/双拼共享一份用户词/临时/词频）；
@@ -1238,6 +1265,10 @@ impl EngineManager {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .remove(schema_id);
+        self.schema_type_cache
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(schema_id);
         self.name_cache
             .lock()
             .unwrap_or_else(|e| e.into_inner())
@@ -1355,6 +1386,10 @@ impl EngineManager {
             .unwrap_or_else(|e| e.into_inner())
             .clear();
         self.freq_cache
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear();
+        self.schema_type_cache
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .clear();
@@ -1627,6 +1662,8 @@ impl EngineManager {
                 strategy: FreqStrategy::Step,
                 protect: ProtectPolicy::NONE,
                 promote_prefix: PromotePrefix::parse(&pf.frequency.promote_prefix),
+                // 纯拼音方案下没有英文候选，取默认即可。
+                english_code_by_input: false,
             }
         } else {
             let ct = self.codetable.lock().unwrap_or_else(|e| e.into_inner());
@@ -1635,6 +1672,7 @@ impl EngineManager {
                 // 之前，无需再按语义单元收窄；且这与 `Top`/`Step` 的历史行为一致（那两者
                 // 对前缀补全从无限制），避免升级后存量用户的调频突然变窄。
                 promote_prefix: PromotePrefix::parse(&ct.frequency.promote_prefix),
+                english_code_by_input: ct.frequency.english_code_scope == "input",
                 enabled: ct.frequency.enabled,
                 strategy: Self::parse_freq_strategy(&ct.frequency.strategy),
                 protect: ProtectPolicy {

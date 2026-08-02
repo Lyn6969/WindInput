@@ -69,7 +69,7 @@ impl Coordinator {
                 .min(state.candidates.len() - 1);
             let t = state.candidates[i].text.clone();
             // 记账码：码表按输入码（码位独立），拼音/英文按候选码。见 `freq_code`。
-            let code = Self::freq_code(&state.input_buffer, &state.candidates[i]);
+            let code = self.freq_code(&state.input_buffer, &state.candidates[i]);
             self.record_selection(&code, &t, state.candidates[i].source);
             Some(format!("{prefix}{t}"))
         } else if !prefix.is_empty() {

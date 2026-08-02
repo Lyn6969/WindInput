@@ -2431,7 +2431,7 @@ impl Coordinator {
                 .min(state.candidates.len() - 1);
             let cand = state.candidates[idx].clone();
             // 记账码：码表按输入码（码位独立），拼音/英文按候选码。见 `freq_code`。
-            let code = Self::freq_code(&state.input_buffer, &cand);
+            let code = self.freq_code(&state.input_buffer, &cand);
             self.record_selection(&code, &cand.text, cand.source);
             out.push_str(&self.cand_s2t_text(state, &cand));
         }
@@ -5139,7 +5139,7 @@ impl MessageHandler for Coordinator {
                         let (source, code) = state
                             .candidates
                             .first()
-                            .map(|c| (c.source, Self::freq_code(&state.input_buffer, c)))
+                            .map(|c| (c.source, self.freq_code(&state.input_buffer, c)))
                             .unwrap_or_else(|| {
                                 (CandidateSource::default(), state.input_buffer.clone())
                             });
@@ -5275,7 +5275,7 @@ impl MessageHandler for Coordinator {
                         let (source, code) = state
                             .candidates
                             .first()
-                            .map(|c| (c.source, Self::freq_code(&state.input_buffer, c)))
+                            .map(|c| (c.source, self.freq_code(&state.input_buffer, c)))
                             .unwrap_or_else(|| {
                                 (CandidateSource::default(), state.input_buffer.clone())
                             });
@@ -6477,7 +6477,7 @@ impl Coordinator {
             return 0;
         };
         let sid = self.debug_schema_id_for(c, ctx);
-        let code = Self::freq_code(input_code, c);
+        let code = self.freq_code(input_code, c);
         if sid.is_empty() || code.is_empty() {
             return 0;
         }

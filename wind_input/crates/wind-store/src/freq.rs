@@ -118,6 +118,33 @@ impl Store {
         })
     }
 
+    /// **批量**取词频：一次读事务查多个 `(schema, code, text)`，按入参顺序返回。
+    ///
+    /// 逐个调 [`Self::get_freq`] 会为**每个候选**开一次 redb 读事务——五笔单字母下有
+    /// 78+ 个候选，即 78 次 `begin_read` + `open_table`。事务本身要取读快照、走锁，
+    /// 单次不贵但乘以候选数就成了每键的固定开销，与方案 TOML 的重复解析叠加后可感知。
+    ///
+    /// 三元组带 schema 而非统一一个：混输按候选来源分流归属 id（码表半边与拼音半边
+    /// 落在不同 schema），单一入参表达不了。
+    pub fn get_freq_batch(
+        &self,
+        keys: &[(String, String, String)],
+    ) -> anyhow::Result<Vec<Option<FreqRecord>>> {
+        if keys.is_empty() {
+            return Ok(Vec::new());
+        }
+        self.with_db(|db| {
+            let txn = db.begin_read()?;
+            let t = txn.open_table(FREQ)?;
+            let mut out = Vec::with_capacity(keys.len());
+            for (schema, code, text) in keys {
+                let key = enc_key(schema, code, text);
+                out.push(t.get(key.as_str())?.and_then(|g| dec_freq(g.value())));
+            }
+            Ok(out)
+        })
+    }
+
     /// 取词频记录（不存在返回 None）。
     pub fn get_freq(
         &self,
@@ -471,6 +498,55 @@ mod tests {
         let _ = std::fs::remove_file(&path);
         let _ = std::fs::remove_file(&path2);
         let _ = std::fs::remove_file(&path3);
+    }
+
+    /// 批量查询必须与逐个 `get_freq` **逐项等价**，且保持入参顺序。
+    ///
+    /// 改批量是为了性能（五笔单字母 78+ 候选 = 78 次读事务），但顺序或缺失项对不齐就会让
+    /// 词频张冠李戴——调用方是按下标 zip 回候选文本的。
+    #[test]
+    fn freq_batch_matches_individual_lookups() {
+        let path = tmp("wind_freq_batch.redb");
+        let s = Store::open(&path).unwrap();
+        s.record_freq("wb", "de", "有").unwrap();
+        s.record_freq("wb", "def", "有").unwrap();
+        s.record_freq("wb", "def", "有").unwrap(); // count=2
+        s.record_freq("py", "de", "的").unwrap();
+
+        // 含命中、未命中、跨 schema、重复项，且顺序刻意打乱
+        let keys: Vec<(String, String, String)> = [
+            ("wb", "def", "有"),
+            ("wb", "zzz", "无"),
+            ("py", "de", "的"),
+            ("wb", "de", "有"),
+            ("py", "de", "有"), // 同 code 不同 schema：不得串
+        ]
+        .iter()
+        .map(|(a, b, c)| (a.to_string(), b.to_string(), c.to_string()))
+        .collect();
+
+        let batch = s.get_freq_batch(&keys).unwrap();
+        assert_eq!(batch.len(), keys.len(), "必须逐项对齐，缺一不可");
+        for (i, (sc, code, text)) in keys.iter().enumerate() {
+            let one = s.get_freq(sc, code, text).unwrap();
+            assert_eq!(
+                batch[i].map(|r| r.count),
+                one.map(|r| r.count),
+                "第 {i} 项 ({sc},{code},{text}) 批量与逐个结果不一致"
+            );
+        }
+        // 钉住具体值，防止「两边同时错」
+        assert_eq!(batch[0].unwrap().count, 2);
+        assert!(batch[1].is_none(), "未命中项必须留 None 占位，不能被跳过");
+        assert_eq!(batch[2].unwrap().count, 1);
+        assert_eq!(batch[3].unwrap().count, 1);
+        assert!(batch[4].is_none(), "schema 隔离：py 下没有「有」");
+
+        assert!(
+            s.get_freq_batch(&[]).unwrap().is_empty(),
+            "空入参不得开事务"
+        );
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]
