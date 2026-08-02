@@ -2430,8 +2430,8 @@ impl Coordinator {
                 .highlighted_global_index(state)
                 .min(state.candidates.len() - 1);
             let cand = state.candidates[idx].clone();
-            // 记账码取候选存储码（全拼扁平域），与主选词路径 `commit_selected` 同口径。
-            let code = Self::cand_code(&state.input_buffer, &cand);
+            // 记账码：码表按输入码（码位独立），拼音/英文按候选码。见 `freq_code`。
+            let code = Self::freq_code(&state.input_buffer, &cand);
             self.record_selection(&code, &cand.text, cand.source);
             out.push_str(&self.cand_s2t_text(state, &cand));
         }
@@ -5135,11 +5135,11 @@ impl MessageHandler for Coordinator {
                 match self.update_candidates(&mut state) {
                     InputOutcome::AutoCommit(text) => {
                         // 自动上屏文本取自首候选（handle_candidate.rs 构造 AutoCommit 时同源）。
-                        // 记账码同取首候选的存储码（全拼扁平域），无候选时退回输入缓冲。
+                        // 记账码同取首候选（按来源分流，见 `freq_code`），无候选时退回输入缓冲。
                         let (source, code) = state
                             .candidates
                             .first()
-                            .map(|c| (c.source, Self::cand_code(&state.input_buffer, c)))
+                            .map(|c| (c.source, Self::freq_code(&state.input_buffer, c)))
                             .unwrap_or_else(|| {
                                 (CandidateSource::default(), state.input_buffer.clone())
                             });
@@ -5271,11 +5271,11 @@ impl MessageHandler for Coordinator {
                 }
                 match self.update_candidates(&mut state) {
                     InputOutcome::AutoCommit(text) => {
-                        // 记账码取首候选存储码（全拼扁平域），与上一处 AutoCommit 同口径。
+                        // 记账码取首候选（按来源分流，见 `freq_code`），与上一处 AutoCommit 同口径。
                         let (source, code) = state
                             .candidates
                             .first()
-                            .map(|c| (c.source, Self::cand_code(&state.input_buffer, c)))
+                            .map(|c| (c.source, Self::freq_code(&state.input_buffer, c)))
                             .unwrap_or_else(|| {
                                 (CandidateSource::default(), state.input_buffer.clone())
                             });
@@ -6464,15 +6464,20 @@ impl Coordinator {
 
     /// 候选词频使用次数（按候选归属方案点查 redb FREQ；无 store/无记录 → 0）。
     ///
-    /// 查询码走 `cand_code`（全拼扁平域）而非 `input_code`（击键缓冲）——双拼 `siyr`/全拼
-    /// 分隔符 `xi'an`/前缀补全下二者不同域，用后者查恒 miss，显示恒 0。与
-    /// `apply_freq_rerank` 及写入端 `record_selection` 同口径，三处必须一致。
+    /// 查询码走 [`Self::freq_code`]（按来源分流：拼音/英文用候选存储码，码表用输入码）。
+    ///
+    /// 拼音侧不能用击键缓冲——双拼 `siyr`/分隔符 `xi'an`/前缀补全下与候选码不同域，用后者
+    /// 查恒 miss、显示恒 0；码表侧反过来必须用输入码，否则 `d`/`de`/`def` 三个码位串扰。
+    ///
+    /// 与 `apply_freq_rerank` 及写入端 `record_selection` 同口径，**三处必须一致**——
+    /// 本处不同步的后果最隐蔽：调试信息显示的计数与排序实际用的那条不是同一个 key，
+    /// 排查时会被它带偏。
     fn debug_freq_count(&self, c: &Candidate, input_code: &str, ctx: &DebugSchemaCtx) -> u32 {
         let Some(store) = &self.store else {
             return 0;
         };
         let sid = self.debug_schema_id_for(c, ctx);
-        let code = Self::cand_code(input_code, c);
+        let code = Self::freq_code(input_code, c);
         if sid.is_empty() || code.is_empty() {
             return 0;
         }

@@ -225,13 +225,19 @@ impl Coordinator {
         // `mixed/engine.rs` 的 `convert_overflow`），故它与拼音分段子候选同样不参与本次重排。
         // 这是有意的：它只解释得了前 N 码，让它靠历史计数浮到消费整串的候选之上并不正确。
         //
-        // ⚠️ 查询码必须用 `cand_code`（候选存储码 = **全拼扁平域**），不能用 `code`（输入缓冲
-        // = **击键域**）。二者在下列输入下不相等，用错即恒 miss、词频功能整体失效：
-        // - 双拼：缓冲 `siyr`，候选码 `siyuan`；
-        // - 全拼带分隔符：缓冲 `xi'an`，候选码 `xian`；
-        // - 前缀补全：缓冲 `si`，候选码 `sikao`。
-        // 写入端 `record_selection` 用的就是 `cand_code`（见其调用点），全仓 code 域标准
-        // （用户词库 key、`generate_word_pinyin` 造词码、加词 `calc_add_word_code`）同为全拼扁平码。
+        // ⚠️ 查询码**按来源分流**，见 [`Self::freq_code`]：
+        //
+        // **拼音 / 英文**用 `cand_code`（候选存储码 = 全拼扁平域），不能用击键缓冲——二者在
+        // 下列输入下不相等，用错即恒 miss、词频整体失效：双拼缓冲 `siyr` vs 候选码 `siyuan`；
+        // 带分隔符 `xi'an` vs `xian`；前缀补全 `si` vs `sikao`。全仓 code 域标准（用户词库
+        // key、`generate_word_pinyin` 造词码、加词 `calc_add_word_code`）同为全拼扁平码。
+        //
+        // **码表**反过来用输入码。码表候选的 code 是**词条全码**（`de` 下的「有」带的是
+        // `def`），拿它当 key 会让 `d`/`de`/`def` 三个码位互相串扰——真机实测在 `de` 选中后
+        // 打 `d` 时它也跟着前移。而码表的码位本就彼此独立（`ProtectPolicy` 按输入码长分级
+        // 保护首选正以此为前提）。
+        //
+        // 写入端 `record_selection` 的各调用点同样经 `freq_code`，**两侧必须同口径**。
         let recs: std::collections::HashMap<String, FreqRecord> = candidates
             .iter()
             .filter_map(|c| {
@@ -255,7 +261,7 @@ impl Coordinator {
                 } else {
                     &schema
                 };
-                match store.get_freq(sid, &Self::cand_code(code, c), &c.text) {
+                match store.get_freq(sid, &Self::freq_code(code, c), &c.text) {
                     Ok(Some(r)) if r.count > 0 => Some((c.text.clone(), r)),
                     _ => None,
                 }
@@ -1354,10 +1360,13 @@ impl Coordinator {
     /// `s2t_override`：1对多变体候选的输出覆盖（`Candidate::s2t_override`）；来源无候选
     /// 实体（如自动上屏取首选文本）时传 None。
     ///
-    /// `code`：词频记账码，须为**候选存储码**（`Self::cand_code` 的结果，全拼扁平域），
-    /// 不是输入缓冲——双拼/分隔符/前缀补全下二者不同域。**刻意做成显式入参而非在此取
-    /// `state.input_buffer`**：本函数只拿得到 `text`，同文多候选无从反查，交由每个调用点
-    /// 交代码来源（同 `add_user_word` 的 `boundary` 入参先例）。
+    /// `code`：词频记账码，须为 [`Self::freq_code`] 的结果——**按候选来源分流**：拼音/英文
+    /// 取候选存储码（全拼扁平域；双拼/分隔符/前缀补全下与输入缓冲不同域），码表取输入码
+    /// （`d`/`de`/`def` 是独立码位，用词条全码会让它们串扰）。
+    ///
+    /// **刻意做成显式入参而非在此取 `state.input_buffer`**：本函数只拿得到 `text`，
+    /// 同文多候选无从反查，交由每个调用点交代码来源（同 `add_user_word` 的 `boundary`
+    /// 入参先例）。
     pub(crate) fn commit_candidate(
         &self,
         state: &mut State,
@@ -1377,6 +1386,30 @@ impl Coordinator {
         state.current_page = 0;
         state.selected_index = 0;
         out
+    }
+
+    /// 词频记账用的码——**码表与拼音/英文口径不同**，这是两类方案的语义差异。
+    ///
+    /// | 来源 | 用哪个码 | 理由 |
+    /// |---|---|---|
+    /// | 码表 | **输入码** | `d`/`de`/`def` 是三个**独立码位**，各自的首选独立调整 |
+    /// | 拼音 / 英文 | 候选码（[`Self::cand_code`]） | 候选码是词的读音/拼写，跨码位共享才对 |
+    ///
+    /// 码表候选的 `code` 是**词条全码**而非用户输入：`de` 下的「有」带的是 `def`
+    /// （前缀补全）。拿它当词频 key，会让「在任一码位选中」影响「所有能召回它的码位」
+    /// ——真机实测在 `de`/`def` 下选「有」后，打 `d` 时它也跟着前移。而
+    /// `ProtectPolicy` 按输入码长分级保护首选，前提正是「码位彼此独立」。
+    ///
+    /// 拼音反过来：打 `d` 选「东西」后，打 `dongxi` 也该受益——那里候选码恒是完整读音，
+    /// 跨码位共享是想要的行为。英文同理（打 `hel` 选 `hello`，打 `he` 也该受益）。
+    ///
+    /// ⚠️ **读写两侧必须同口径**：写入端 `record_selection` 与读取端 `apply_freq_rerank`
+    /// 都要经本函数，否则记了查不到、或查到不该查的。
+    pub(crate) fn freq_code(buf: &str, cand: &Candidate) -> String {
+        match cand.source {
+            CandidateSource::CodeTable => buf.to_string(),
+            _ => Self::cand_code(buf, cand),
+        }
     }
 
     /// 拼音类「消费码」：候选自带 code（拼音段）则用之，否则退回整个输入缓冲。
@@ -1462,8 +1495,14 @@ impl Coordinator {
         let code = Self::cand_code(&state.input_buffer, cand);
         let partial =
             consumed > 0 && consumed < total && state.input_buffer.is_char_boundary(consumed);
-        // 词频按候选实际编码记账（分段时为前缀码，如「ni」而非整串「nihao」）。
-        self.record_selection(&code, &cand.text, cand.source);
+        // 词频记账走 `freq_code` 而非上面的 `code`：码表按**输入码**（码位独立），
+        // 拼音/英文按候选码（分段时为前缀码，如「ni」而非整串「nihao」）。
+        // 上面的 `code` 仍供 `record_commit` 统计码长使用，那是另一套语义。
+        self.record_selection(
+            &Self::freq_code(&state.input_buffer, cand),
+            &cand.text,
+            cand.source,
+        );
         // 输入统计：每次选词记一段（分段逐字选各段各记一次，不重复整串）；
         // 在 partial 分支之前，两分支都经此处一次。
         self.record_commit(
@@ -1682,7 +1721,8 @@ impl Coordinator {
         // 词频学习：以词定字应记实际选的「单字」（非整词），否则造词策略会误判为多字词；
         // 仅普通候选（无副作用命令 Action）才学（对齐 Go len(cand.Actions)==0）。
         if cand.actions.is_empty() {
-            let code = Self::cand_code(&state.input_buffer, &cand);
+            // 记账码：码表按输入码（码位独立），拼音/英文按候选码。见 `freq_code`。
+            let code = Self::freq_code(&state.input_buffer, &cand);
             self.record_selection(&code, &runes[char_index].to_string(), cand.source);
         }
         // 拼接已确认段前缀 + 选中单字，整体按简繁模式转换（与 commit_selected 一致）。
@@ -2242,7 +2282,8 @@ impl Coordinator {
         let text = state.candidates[idx].text.clone();
         let s2t_override = state.candidates[idx].s2t_override.clone();
         let source = state.candidates[idx].source;
-        let code = Self::cand_code(&state.input_buffer, &state.candidates[idx]);
+        // 记账码按来源分流（见 `freq_code`）：码表用输入码，拼音/英文用候选存储码。
+        let code = Self::freq_code(&state.input_buffer, &state.candidates[idx]);
         let chinese_mode = state.chinese_mode;
         let out = self.commit_candidate(&mut state, &text, s2t_override.as_deref(), source, &code);
         // 鼠标提交后彻底复位各输入模式，避免遗留状态
@@ -2361,6 +2402,44 @@ mod finalize_candidates_tests {
             code: code.to_string(),
             ..Default::default()
         }
+    }
+
+    /// 词频记账的码：**码表按输入码，拼音/英文按候选码**。
+    ///
+    /// 真机现场：五笔下 `de` 的「有」带的是词条全码 `def`（前缀补全）。若拿它当词频 key，
+    /// 在 `de`/`def` 下选中后，打 `d` 时「有」也跟着前移——而 `d`/`de`/`def` 是三个独立
+    /// 码位，各自首选本该独立（`ProtectPolicy` 按输入码长分级保护正以此为前提）。
+    ///
+    /// 拼音反向：候选码是完整读音，打 `d` 选「东西」后打 `dongxi` 也该受益。
+    #[test]
+    fn freq_code_splits_codetable_from_pinyin() {
+        let mut ct = cand_code("有", "def");
+        ct.source = CandidateSource::CodeTable;
+        assert_eq!(
+            Coordinator::freq_code("de", &ct),
+            "de",
+            "码表须按输入码记账，否则 d/de/def 三个码位会互相串扰"
+        );
+        assert_eq!(Coordinator::freq_code("d", &ct), "d");
+        assert_eq!(Coordinator::freq_code("def", &ct), "def");
+
+        let mut py = cand_code("东西", "dongxi");
+        py.source = CandidateSource::Pinyin;
+        assert_eq!(
+            Coordinator::freq_code("d", &py),
+            "dongxi",
+            "拼音按候选码——跨码位共享才是想要的行为"
+        );
+
+        // 英文与拼音同侧：打 `hel` 选 `hello` 后，打 `he` 也该受益
+        let mut en = cand_code("hello", "hello");
+        en.source = CandidateSource::English;
+        assert_eq!(Coordinator::freq_code("hel", &en), "hello");
+
+        // 候选无码时退回输入缓冲（`cand_code` 的既有语义，两侧一致）
+        let mut bare = cand_code("啊", "");
+        bare.source = CandidateSource::Pinyin;
+        assert_eq!(Coordinator::freq_code("a", &bare), "a");
     }
 
     #[test]

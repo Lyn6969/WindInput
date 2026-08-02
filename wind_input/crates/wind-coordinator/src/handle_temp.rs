@@ -286,7 +286,12 @@ impl Coordinator {
         let code = Self::cand_code(&state.temp_pinyin_buffer, cand);
         let partial =
             consumed > 0 && consumed < total && state.temp_pinyin_buffer.is_char_boundary(consumed);
-        self.record_selection(&code, &cand.text, cand.source);
+        // 记账码：码表按输入码（码位独立），拼音/英文按候选码。见 `freq_code`。
+        self.record_selection(
+            &Self::freq_code(&state.temp_pinyin_buffer, cand),
+            &cand.text,
+            cand.source,
+        );
         // 输入统计：每次临拼选词记一段（来源临时拼音）。
         self.record_commit(
             &cand.text,
@@ -907,8 +912,8 @@ impl Coordinator {
             let (start, _) = self.page_range(state);
             let idx = (start + state.selected_index).min(state.candidates.len() - 1);
             let t = state.candidates[idx].text.clone();
-            // 记账码取候选存储码（全拼扁平域），与主选词路径同口径。
-            let code = Self::cand_code(&state.input_buffer, &state.candidates[idx]);
+            // 记账码：码表按输入码（码位独立），拼音/英文按候选码。见 `freq_code`。
+            let code = Self::freq_code(&state.input_buffer, &state.candidates[idx]);
             self.record_selection(&code, &t, state.candidates[idx].source);
             // 进入临时拼音前顶屏高亮候选（来源候选；prefix 段已在选词时记过）。
             self.record_commit(
