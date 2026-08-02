@@ -192,21 +192,49 @@ pub fn rerank_codetable_usedfirst(
 /// 同一个步长在两处天差地别），位次除数则与分布无关——第 2 位就是第 2 位。
 pub const POSITION_HALVING_BASE: u32 = 2;
 
-/// 一个候选的有效提升次数：`count` 经半衰期衰减后取整。
+/// 衰减殆尽的下限：有效强度低于此值视为「没用过」。
 ///
-/// 衰减乘在次数上而非结果上，语义是「久未用 ⇒ 当初那些使用逐渐不算数」，位次随之回落，
-/// 不需要额外的阈值褪色判据。取整后为 0 即完全不提升。
-fn promotion_steps(
+/// **必需，不是保险丝**。位次是整数，`base_pos = 1`（第 2 位）时任何 `divisor > 1` 都会让
+/// `1 / divisor < 1` 而 floor 到 0——即一年前用过一次、衰减到 0.01 的记录仍能把第 2 位顶上
+/// 首位。取 0.5 的语义是「累计有效使用不足半次」。
+///
+/// 这相当于把旧模型的「阈值褪色」以更合理的形式带回：作用在**归一化的有效次数**上，
+/// 而不是在权重分上（后者的阈值随词库分布漂移，正是被推翻的那套）。
+const MIN_PROMOTION_POWER: f64 = 0.5;
+
+/// 候选的**有效提升强度**：`count` 经半衰期衰减，**保留小数**。
+///
+/// ⚠️ **不能取整**。曾写作 `(count as f64 * decay) as u32`，而 `as` 是向零截断：
+/// `count = 1` 的记录只要过了一瞬间，`decay` 就略小于 1（选完 1 分钟后 ≈ 0.99984），
+/// 截断即得 0——**用一次的记录几乎立刻失效**，真机表现为「选了词，再打还是老样子」。
+/// 而单测全部用 `now == last_used`（decay 恰为 1.0）喂入，正好落在唯一能通过的点上，
+/// 全绿却掩盖了它。
+///
+/// 保留小数后除数是连续的（`2^0.99984 ≈ 1.9998`），衰减平滑无跳变。
+///
+/// 上限 64：`2^64` 已远超任何候选列表长度，同时防止 `powf` 溢出成 `inf`。
+fn promotion_power(
     c: &Candidate,
     recs: &HashMap<String, FreqRecord>,
     now: i64,
     profile: FreqProfile,
-) -> u32 {
-    recs.get(&c.text).map_or(0, |r| {
+) -> f64 {
+    recs.get(&c.text).map_or(0.0, |r| {
         let eff = r.count as f64 * profile.decay_factor(r, now);
-        // 上限 31：saturating_pow 防溢出，且 2^31 已远超任何候选列表长度
-        (eff as u32).min(31)
+        if eff < MIN_PROMOTION_POWER {
+            return 0.0;
+        }
+        eff.min(64.0)
     })
+}
+
+/// 按有效强度算目标位次：`base_pos / BASE^power`。
+fn target_position(base_pos: usize, power: f64) -> usize {
+    if power <= 0.0 {
+        return base_pos;
+    }
+    let divisor = (POSITION_HALVING_BASE as f64).powf(power);
+    (base_pos as f64 / divisor).floor() as usize
 }
 
 /// 拼音词频重排：**位置提升**模型（`docs/design/freq-rerank-model.md`）。
@@ -261,8 +289,8 @@ pub fn rerank_pinyin_positional(
         .iter()
         .enumerate()
         .map(|(pos, c)| {
-            let s = promotion_steps(c, recs, now, profile);
-            let target = pos / (POSITION_HALVING_BASE as usize).saturating_pow(s);
+            let power = promotion_power(c, recs, now, profile);
+            let target = target_position(pos, power);
             (anchored(c), target, target < pos)
         })
         .collect();
@@ -281,6 +309,33 @@ pub fn rerank_pinyin_positional(
             .then_with(|| meta[b].2.cmp(&meta[a].2)) // 同位次：被提升者在前
             .then(a.cmp(&b)) // 其余维持原序（稳定）
     });
+
+    // 诊断：本模块此前**零日志**——真机上「选了词、再打还是老样子」时无从判断是没记录、
+    // 没调用、还是提升被算成 0（那次的根因是 `as u32` 截断）。这里补一条。
+    //
+    // 用 `trace!` 而非更高级别：候选文本属用户输入内容，INFO 及以上不得记录。
+    // 先判 `enabled!` 再拼串，避免热路径上白白格式化。
+    if tracing::enabled!(tracing::Level::TRACE) {
+        let moved: Vec<String> = idx
+            .iter()
+            .enumerate()
+            .filter(|&(new_pos, &old_pos)| new_pos != old_pos)
+            .map(|(new_pos, &old_pos)| {
+                format!(
+                    "{}:{}->{}(p={:.3})",
+                    candidates[old_pos].text,
+                    old_pos,
+                    new_pos,
+                    promotion_power(&candidates[old_pos], recs, now, profile)
+                )
+            })
+            .collect();
+        if moved.is_empty() {
+            tracing::trace!(records = recs.len(), "词频重排：无候选移位");
+        } else {
+            tracing::trace!(records = recs.len(), moved = %moved.join(" "), "词频重排");
+        }
+    }
 
     // 应用置换：move 而非 clone（候选含 String，上千条时 clone 不可忽略）
     let mut reordered: Vec<Candidate> = Vec::with_capacity(n);
@@ -872,6 +927,72 @@ mod tests {
         c.is_sentence = true;
         c.is_sentence_contested = true;
         c
+    }
+
+    /// **真机回归**：`count=1` 的记录在**经过一段时间后**仍须生效。
+    ///
+    /// 这是真机上「选了『思源』，再打 siyuan 还是老样子」的根因用例。此前
+    /// `promotion_power` 写作 `(count * decay) as u32`，而 `as` 向零截断——选完仅仅
+    /// 1 分钟，decay 就掉到 0.99984，截断即得 0，提升完全消失。
+    ///
+    /// ⚠️ **本用例的关键在于 `last_used != now`**。全部旧用例都用 `now == last_used`
+    /// （decay 恰为 1.0）喂入，正好落在唯一能通过的点上，32 项全绿却漏掉了这个缺陷。
+    /// 涉及衰减的用例**必须让时间真的流逝**。
+    #[test]
+    fn single_use_still_promotes_after_realistic_delay() {
+        for (label, secs) in [("1 分钟", 60i64), ("1 小时", 3600), ("1 天", 86_400)] {
+            let mut c = vec![pin("寺院", W_SIYUAN_TEMPLE), pin("思源", W_SIYUAN_PRODUCT)];
+            let r = recs(&[("思源", 1, NOW - secs)]);
+            rerank_pinyin_positional(&mut c, &r, NOW, FreqProfile::default());
+            assert_eq!(
+                c[0].text, "思源",
+                "选过一次、{label}后再打，仍应居首（decay 略小于 1 不得被截断成 0）"
+            );
+        }
+    }
+
+    /// 配对：衰减**够久**之后必须失效，否则上面那条可以靠「永不衰减」满足。
+    ///
+    /// 半衰期 72h，`MIN_PROMOTION_POWER = 0.5` ⇒ `count=1` 的记录约一个半衰期后归零。
+    #[test]
+    fn single_use_expires_after_long_disuse() {
+        let mut c = vec![pin("寺院", W_SIYUAN_TEMPLE), pin("思源", W_SIYUAN_PRODUCT)];
+        // 30 天 ≈ 10 个半衰期，decay ≈ 0.001
+        let r = recs(&[("思源", 1, NOW - 30 * 86_400)]);
+        rerank_pinyin_positional(&mut c, &r, NOW, FreqProfile::default());
+        assert_eq!(
+            c[0].text, "寺院",
+            "一个月前用过一次不应再影响排序——否则位次的 floor 会让任何残余强度都置顶第 2 位"
+        );
+    }
+
+    /// 高频记录的衰减边界——**含一条已知局限**。
+    ///
+    /// 半衰期 72h：一周（≈2.3 个半衰期）后 `count=50` 的有效强度仍有 9.9，正常生效。
+    /// 但 30 天（≈10 个半衰期）后衰减到 0.049，低于 `MIN_PROMOTION_POWER` 而归零——
+    /// **用过 50 次的词，一个月不用就被完全遗忘**。
+    ///
+    /// ⚠️ 这是**墙钟衰减的固有行为**，不是缺陷，但也确实反直觉。fcitx5 用「被后续输入挤出
+    /// 分级 LRU 池」而非墙钟老化，正是为了避免它（放假两周回来词频不失效）。换老化机制
+    /// 需要改词频存储模型，已列为独立立项（设计文档「不在本次范围」一节）。
+    ///
+    /// 本用例把当前行为钉死：换机制时它会红，那时应连同本注释一起更新。
+    #[test]
+    fn frequent_use_decay_boundary_including_known_limitation() {
+        // 一周后仍生效：50 × decay(168h)=0.198 → 9.9
+        let mut week = vec![pin("寺院", W_SIYUAN_TEMPLE), pin("思源", W_SIYUAN_PRODUCT)];
+        let r_week = recs(&[("思源", 50, NOW - 7 * 86_400)]);
+        rerank_pinyin_positional(&mut week, &r_week, NOW, FreqProfile::default());
+        assert_eq!(week[0].text, "思源", "用过 50 次的词一周后仍应保持提升");
+
+        // 30 天后归零 —— 已知局限
+        let mut month = vec![pin("寺院", W_SIYUAN_TEMPLE), pin("思源", W_SIYUAN_PRODUCT)];
+        let r_month = recs(&[("思源", 50, NOW - 30 * 86_400)]);
+        rerank_pinyin_positional(&mut month, &r_month, NOW, FreqProfile::default());
+        assert_eq!(
+            month[0].text, "寺院",
+            "墙钟衰减下高频词一个月后也会被遗忘——已知局限，换分级 LRU 老化可解"
+        );
     }
 
     /// **模型的核心断言**：提升速度与权重差距无关。
