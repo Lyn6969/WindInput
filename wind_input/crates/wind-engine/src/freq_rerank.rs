@@ -285,13 +285,18 @@ pub fn rerank_pinyin_positional(
             || (c.is_phrase && c.is_exact_code)
     };
     // 预计算 (锚定, 目标位次, 是否真的前移)。base_pos 即入参下标，见上文契约。
-    let meta: Vec<(bool, usize, bool)> = candidates
+    // (锚定, 目标位次, 有效强度)
+    //
+    // ⚠️ 第三项曾是 `target < pos`（「是否真的前移」），那是个 bug：`base_pos = 0` 的候选
+    // 无处可移、`target` 也是 0，于是恒判为「未提升」，被所有提升者挤到后面——真机上表现为
+    // **本来排第一、用户也常用的词反而掉位**（实测 `siyuan` 下「寺院」p=8.0 却被挤到第 3）。
+    // 判据应该是「有没有词频」，不是「有没有移动」。
+    let meta: Vec<(bool, usize, f64)> = candidates
         .iter()
         .enumerate()
         .map(|(pos, c)| {
             let power = promotion_power(c, recs, now, profile);
-            let target = target_position(pos, power);
-            (anchored(c), target, target < pos)
+            (anchored(c), target_position(pos, power), power)
         })
         .collect();
 
@@ -306,7 +311,14 @@ pub fn rerank_pinyin_positional(
         }
         wind_candidate::cmp_match_layers(&candidates[a], &candidates[b])
             .then_with(|| meta[a].1.cmp(&meta[b].1)) // 目标位次升序
-            .then_with(|| meta[b].2.cmp(&meta[a].2)) // 同位次：被提升者在前
+            // 同位次时按**有效强度**降序：多个候选都提升到同一位次（尤其是都到 0）时，
+            // 用得多的在前。无词频者 power = 0，自然落在有词频者之后。
+            .then_with(|| {
+                meta[b]
+                    .2
+                    .partial_cmp(&meta[a].2)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            })
             .then(a.cmp(&b)) // 其余维持原序（稳定）
     });
 
@@ -316,17 +328,16 @@ pub fn rerank_pinyin_positional(
     // 用 `trace!` 而非更高级别：候选文本属用户输入内容，INFO 及以上不得记录。
     // 先判 `enabled!` 再拼串，避免热路径上白白格式化。
     if tracing::enabled!(tracing::Level::TRACE) {
+        // 只记**有词频**的候选：其余候选的位移全是被前者插队挤出来的连锁顺延，
+        // 记下来会让单行日志涨到数千字符而毫无信息量（实测一次输入刷出整页候选）。
         let moved: Vec<String> = idx
             .iter()
             .enumerate()
-            .filter(|&(new_pos, &old_pos)| new_pos != old_pos)
+            .filter(|&(_, &old_pos)| meta[old_pos].2 > 0.0)
             .map(|(new_pos, &old_pos)| {
                 format!(
-                    "{}:{}->{}(p={:.3})",
-                    candidates[old_pos].text,
-                    old_pos,
-                    new_pos,
-                    promotion_power(&candidates[old_pos], recs, now, profile)
+                    "{}:{}->{}(p={:.2})",
+                    candidates[old_pos].text, old_pos, new_pos, meta[old_pos].2
                 )
             })
             .collect();
@@ -992,6 +1003,36 @@ mod tests {
         assert_eq!(
             month[0].text, "寺院",
             "墙钟衰减下高频词一个月后也会被遗忘——已知局限，换分级 LRU 老化可解"
+        );
+    }
+
+    /// **真机回归**：首位候选自身有词频时，不得被后面的提升者挤下去。
+    ///
+    /// 现场（trace 日志）：`siyuan` 下「寺院」`base_pos=0`、`p=8.0`，却被挤到第 3 位。
+    /// 根因是排序键第四项曾写作 `target < base_pos`（「是否真的前移」）——`base_pos=0`
+    /// 的候选无处可移，恒判为「未提升」，于是排在所有提升者之后。判据应是「有没有词频」。
+    #[test]
+    fn top_candidate_with_freq_is_not_pushed_down() {
+        let mut c = vec![pin("寺院", W_SIYUAN_TEMPLE), pin("思源", W_SIYUAN_PRODUCT)];
+        let r = recs(&[("寺院", 8, NOW), ("思源", 6, NOW)]);
+        rerank_pinyin_positional(&mut c, &r, NOW, FreqProfile::default());
+        assert_eq!(
+            c[0].text, "寺院",
+            "首位候选用得更多，不该因为「没法再往前」而掉位"
+        );
+    }
+
+    /// **反向对照**：首位不是被钉死的——竞争者用得更多时仍能反超。
+    ///
+    /// 缺了它，上面那条可以靠「base_pos=0 恒居首」满足，那会把位置提升整个废掉。
+    #[test]
+    fn top_candidate_yields_to_stronger_peer() {
+        let mut c = vec![pin("寺院", W_SIYUAN_TEMPLE), pin("思源", W_SIYUAN_PRODUCT)];
+        let r = recs(&[("寺院", 3, NOW), ("思源", 10, NOW)]);
+        rerank_pinyin_positional(&mut c, &r, NOW, FreqProfile::default());
+        assert_eq!(
+            c[0].text, "思源",
+            "同目标位次时按有效强度排序，用得多的在前"
         );
     }
 
