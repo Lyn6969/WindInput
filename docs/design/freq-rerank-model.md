@@ -344,6 +344,23 @@ floor 到 0——即一年前用过一次、衰减到 0.01 的记录仍能把第
 
 用例 `frequent_use_decay_boundary_including_known_limitation` 把当前行为钉死，换机制时会红。
 
+### 9.1.2 遗留死链：`base_scale` / `recency_peak`
+
+位置模型只用 `FreqProfile::decay_factor`，不做打分。于是这条链整体失效：
+
+```
+schema.pinyin.frequency.{base_scale,recency_peak}
+  → FreqProfile 的同名字段
+    → FreqProfile::pinyin_score()
+      → 无生产调用者（仅其自身单测）
+```
+
+**保留而非删除**：删配置项要跨仓改 `wind-setting` 的五道守门测试，且将来若恢复打分模型
+可直接复用。已在 `data/config.toml` 与 `pinyin_score` 的文档注释上标注「当前模型不使用」，
+避免用户误以为调了有效。
+
+`half_life` 仍然生效（`decay_factor` 用它）。
+
 ### 9.2 与「权重」语义脱钩
 
 无法再说「这个词对你值多少」，只能说「它该排第几」。可解释性下降。若将来要在候选调试信息

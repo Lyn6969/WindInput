@@ -56,6 +56,13 @@ impl FreqProfile {
         (-std::f64::consts::LN_2 * age_hours / self.half_life_hours).exp()
     }
 
+    /// ⚠️ **当前生产路径不再调用本函数**（仅其自身单测使用）。
+    ///
+    /// 拼音侧已改为**位置提升**模型（`docs/design/freq-rerank-model.md`），只取
+    /// [`Self::decay_factor`]，不做打分。本函数连同它依赖的 `base_scale` / `recency_peak`
+    /// 两个配置项一并成为死链——保留而非删除，是因为删配置项要跨仓改 `wind-setting`
+    /// 的五道守门测试，且将来若恢复打分模型可直接复用。
+    ///
     /// 拼音词频衰减分（frequency.md §4）：
     /// `(base_scale * log2(count+1) + recency_peak) * exp(-ln2*age/half_life)`。
     /// 最近+高频 → 分高；久未用 → 衰减回落。count=0 返回 0。
