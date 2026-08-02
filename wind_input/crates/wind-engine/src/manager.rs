@@ -51,6 +51,9 @@ pub struct FreqSettings {
     /// 重排前记录基础序前 N 个候选，重排后原序回填——优先级高于词频。
     /// N 按输入码长分级：简码位保住词库钦定首选，全码位放开调频（见 `ProtectPolicy`）。
     pub protect: ProtectPolicy,
+    /// 前缀补全候选是否参与位置提升（`schema.pinyin.frequency.promote_prefix`；仅拼音用）。
+    /// 码表侧的前缀补全已由 `freq_tier` 分档隔离，不需要本开关。
+    pub promote_prefix: bool,
 }
 
 impl Default for FreqSettings {
@@ -59,6 +62,7 @@ impl Default for FreqSettings {
             enabled: false,
             strategy: FreqStrategy::Step,
             protect: ProtectPolicy::NONE,
+            promote_prefix: false,
         }
     }
 }
@@ -1579,10 +1583,14 @@ impl EngineManager {
                 enabled: pf.frequency.enabled,
                 strategy: FreqStrategy::Step,
                 protect: ProtectPolicy::NONE,
+                promote_prefix: pf.frequency.promote_prefix,
             }
         } else {
             let ct = self.codetable.lock().unwrap_or_else(|e| e.into_inner());
             FreqSettings {
+                // 码表侧不用本开关：其前缀补全已由 `freq_tier` 分到独立档位，
+                // 词频只在档内调整，本就跨不到精确档之前。
+                promote_prefix: true,
                 enabled: ct.frequency.enabled,
                 strategy: Self::parse_freq_strategy(&ct.frequency.strategy),
                 protect: ProtectPolicy {

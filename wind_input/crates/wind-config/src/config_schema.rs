@@ -118,6 +118,7 @@ static REGISTRY: &[ConfigField] = &[
     f("schema.pinyin.frequency.half_life", Float),
     f("schema.pinyin.frequency.base_scale", Float),
     f("schema.pinyin.frequency.recency_peak", Float),
+    f("schema.pinyin.frequency.promote_prefix", Bool),
     f("schema.pinyin.auto_learn.enabled", Bool),
     f("schema.pinyin.auto_learn.min_word_length", Int),
     f("schema.pinyin.auto_learn.promote_count", Int),

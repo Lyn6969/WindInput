@@ -279,6 +279,7 @@ impl Coordinator {
                 &recs,
                 now_unix_secs(),
                 profile,
+                settings.promote_prefix,
             );
         } else {
             wind_engine::freq_rerank::rerank_codetable_usedfirst(

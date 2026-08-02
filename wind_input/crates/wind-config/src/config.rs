@@ -439,6 +439,20 @@ pub struct PinyinFrequency {
     /// 最近使用峰值。
     #[serde(default)]
     pub recency_peak: f64,
+    /// **前缀补全候选是否参与词频位置提升**（默认 `false`）。
+    ///
+    /// 关闭时，码比输入长的候选（打 `d` 时的「东西」`dongxi`）不因被选中而前移——它们
+    /// 只按词库权重排。开启则一视同仁。
+    ///
+    /// 默认关闭的理由：短输入下用户给出的信息量很少，把一个长词组靠词频顶到高频单字前面
+    /// 与直觉相悖（微软拼音实测「只对全码生效」，短码下怎么用都不调整）。而真正打全了码
+    /// 的场景，候选本就是精确匹配、不受本开关影响。
+    ///
+    /// 判据用**有效前缀层**（`is_prefix && !is_promoted_completion`），与 `cmp_match_layers`
+    /// 同口径：被引擎主动提升进完整匹配层的候选（拼音残码上浮 / 用户长词上浮）是结构决策，
+    /// 不该被本开关误伤。
+    #[serde(default)]
+    pub promote_prefix: bool,
 }
 
 /// 码表自动造词（[schema.codetable.auto_phrase]）。
