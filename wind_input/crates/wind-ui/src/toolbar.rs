@@ -35,6 +35,13 @@ pub struct ToolbarState {
     pub s2t_enabled: bool,
     /// 是否显示简繁格（默认 false；用户开启简繁功能后显示）
     pub s2t_shown: bool,
+    /// 密码框强制英文生效中：仅影响**呈现**（模式格显 "英" 且不高亮）。
+    ///
+    /// 独立于 `icon_label` 而非直接改写它：后者是「当前方案标签」的单一语义，且会经
+    /// StatusUpdate 下发写入 TSF 的 `_inputTypeLabel`（持久值）。把这种随焦点来去的
+    /// 临时态烧进标签，离开密码框时就得指望下一次状态推送把它改回来，漏一次图标即
+    /// 长期卡在 "英"。
+    pub password_suppress: bool,
 }
 
 impl Default for ToolbarState {
@@ -47,6 +54,7 @@ impl Default for ToolbarState {
             chinese_punct: true,
             s2t_enabled: false,
             s2t_shown: false,
+            password_suppress: false,
         }
     }
 }
@@ -226,9 +234,17 @@ impl Toolbar {
     /// 布局：拖动条 | 中英状态（含方案名）| 符号 | 全半角 | [简繁] | 设置图标
     fn cells(state: &ToolbarState) -> Vec<Cell> {
         // 有效中文：中文模式且大写锁定未开（对齐 Go effectiveChinese = chineseMode && !capsLockOn）。
-        let effective_chinese = state.chinese_mode && !state.caps_lock;
+        // 密码框强制英文时同样不算「有效中文」——此刻键已全部透传给宿主，高亮着中文格
+        // 会与实际行为相反。⚠ 这是纯呈现判断，输入闸在 coordinator 的 password_suppress
+        // 分支，两者各管各的，勿把本行的结论回灌给任何状态。
+        let effective_chinese = state.chinese_mode && !state.caps_lock && !state.password_suppress;
         // 显示标签由协调器预计算存入 icon_label；此处直接使用。
-        let mode_text = &state.icon_label;
+        // 密码框例外：覆盖为 "英"，与该状态下的实际输入行为一致（见 password_suppress 注释）。
+        let mode_text: &str = if state.password_suppress {
+            "英"
+        } else {
+            &state.icon_label
+        };
 
         let mut cells = vec![
             Cell {

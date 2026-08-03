@@ -1236,6 +1236,11 @@ impl Coordinator {
             s2t_enabled: s.s2t_enabled,
             // 简繁格：已启用时才在工具栏显示（默认 false 不显示）
             s2t_shown: s.s2t_enabled,
+            // 密码框强制英文：仅供工具栏呈现（模式格显 "英"）。取的就是输入闸读的那个
+            // 原子量，两处同源，不会出现「图标说英文、实际打中文」的错位。
+            password_suppress: self
+                .password_suppress
+                .load(std::sync::atomic::Ordering::Relaxed),
         };
         drop(s);
         let _ = self.ui_tx.send(UiCommand::UpdateToolbar(tb));

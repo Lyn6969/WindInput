@@ -860,6 +860,9 @@ CTextService::CTextService()
     , _addWordHotkeysActive(FALSE)
     , _focusIsPassword(false)
     , _focusInputScopeMask(0)
+    , _langBarNoEditCtxReported(FALSE)
+    , _langBarPasswordReported(FALSE)
+    , _langBarSyncPending(FALSE)
     , _passwordSuppressEnabled(TRUE)  // 默认开，与 core 的 password_suppress_enabled 初值一致
     , _hasThreadFocus(FALSE)
     , _activateFlags(0)
@@ -1355,6 +1358,12 @@ static UINT GetRetryHotkeyMessageId()
 static constexpr UINT_PTR kFocusCheckTimerId = 0x57494E44; // 'WIND'
 static constexpr UINT     kFocusCheckIntervalMs = 500;
 
+// 语言栏输入可用性同步的迟滞。取 200ms 的依据：须显著大于宿主 DocMgr churn 的翻转
+// 间隔（实测 QQ 密码框每约 180ms 一轮「可编辑 ↔ READONLY」，轮内两次翻转相隔约 17ms），
+// 又要短到用户点进文本框后察觉不出图标滞后。托盘图标不是跟随光标的 UI，200ms 无感。
+static constexpr UINT_PTR kLangBarSyncTimerId = 0x57494E45; // 'WIND'+1
+static constexpr UINT     kLangBarSyncDelayMs = 200;
+
 // 慢焦点探针阈值：超过此值的 OnSetFocus 记一行 WARN。取 20ms 的依据——实测正常
 // 焦点切换（开 DEBUG 日志、含两次进程信息采集）约 5~13ms，关日志后更低；20ms 既
 // 不会被常规切换触发，又能抓住宿主 churn 焦点导致的堆积。
@@ -1513,6 +1522,11 @@ void CTextService::_UninitHotkeyWindow()
         DestroyWindow(_hHotkeyWnd);
         _hHotkeyWnd = nullptr;
     }
+    // DestroyWindow 会连带销毁该窗口的所有 timer（故此处无需 KillTimer，kFocusCheckTimerId
+    // 同理），但 pending 标志必须手动复位：本函数与 _InitHotkeyWindow 成对、可重入
+    // （Deactivate → Activate），标志残留为 TRUE 会让重建后的窗口再也不起计时，
+    // 语言栏图标从此卡在旧状态。
+    _langBarSyncPending = FALSE;
     if (_hotkeyWndClass != 0)
     {
         UnregisterClassW(kHotkeyWndClassName, g_hInstance);
@@ -1682,6 +1696,15 @@ LRESULT CALLBACK CTextService::_HotkeyWndProc(HWND hWnd, UINT msg, WPARAM wParam
                 WIND_LOG_DEBUG(L"Received hotkey retry signal, marked thread focus\n");
             }
         }
+        return 0;
+    }
+    // 语言栏输入可用性迟滞到期：把「不可输入 / 密码框」状态一次性推给托盘图标。
+    // 单次计时（非周期），到期即 KillTimer，见 _ApplyLangBarStateSync。
+    if (msg == WM_TIMER && wParam == kLangBarSyncTimerId)
+    {
+        CTextService* self = reinterpret_cast<CTextService*>(GetWindowLongPtrW(hWnd, GWLP_USERDATA));
+        if (self != nullptr)
+            self->_ApplyLangBarStateSync();
         return 0;
     }
     // 定时自检：兜底热键泄漏。每 500ms 跑一次，如果发现本进程不再前台但仍持有热键，
@@ -2366,6 +2389,12 @@ STDAPI CTextService::OnSetFocus(ITfDocumentMgr* pDocMgrFocus, ITfDocumentMgr* pD
 
     // 焦点/文本框上下文变化后重新评估加词热键（gaining/losing 两分支汇合于此）。
     _ReevaluateAddWordHotkey();
+
+    // 语言栏输入可用性同步挂同一个收口点：gaining 分支算出 _hasTextInputContext /
+    // _focusInputScopeMask，losing 分支把它们清零，两条路都必经此处。
+    // **刻意不在各分支里分别调用**——那要枚举所有出口，漏一个就是「图标卡在旧状态」，
+    // 而这个函数本身带迟滞与去重，多调一次无副作用。
+    _ScheduleLangBarStateSync();
 
     // 慢焦点探针收口（gaining/losing 两分支都经过这里）。见函数开头的说明。
     const double focusTotalMs = WindLog::PerfMsSince(focusProbeT0);
@@ -3958,6 +3987,60 @@ BOOL CTextService::IsPasswordSuppressActive() const
     // IS_PASSWORD=31 / IS_NUMERIC_PASSWORD=63（对齐 core is_password_scope 的两位）。
     // 常量在文件顶部单点定义——此处曾另有一份局部展开，两处各自维护即有漂移风险。
     return (_focusInputScopeMask & kPasswordScopeBits) != 0;
+}
+
+void CTextService::_ScheduleLangBarStateSync()
+{
+    if (_pLangBarItemButton == nullptr || _hHotkeyWnd == nullptr)
+        return;
+
+    const BOOL noEditCtx = _hasTextInputContext ? FALSE : TRUE;
+    const BOOL password  = IsPasswordSuppressActive();
+
+    if (noEditCtx == _langBarNoEditCtxReported && password == _langBarPasswordReported)
+    {
+        // 已回到当前显示的状态 ⇒ 撤销待定同步。
+        // 这一步是抗抖的关键：churn 期间「离开可编辑上下文」与「回到可编辑上下文」交替
+        // 出现，每次回到原状态都把计时取消，图标因此稳定在抖动前的取值。churn 停下后
+        // 最后那个状态不会再被撤销，计时到期，图标一次到位。
+        if (_langBarSyncPending)
+        {
+            KillTimer(_hHotkeyWnd, kLangBarSyncTimerId);
+            _langBarSyncPending = FALSE;
+        }
+        return;
+    }
+
+    // 与已显示的状态不同 ⇒ 起迟滞计时。
+    // ⚠ 已在计时中则**不重设**：SetTimer 用同一 id 会重新开始计时，churn 下每轮都重设
+    // 就永远等不到到期，图标再也不更新。同 Rust 侧 toolbar_gate 用 get_or_insert 而非
+    // 直接赋值的理由（那里的注释记着同一个坑）。
+    if (!_langBarSyncPending)
+    {
+        SetTimer(_hHotkeyWnd, kLangBarSyncTimerId, kLangBarSyncDelayMs, nullptr);
+        _langBarSyncPending = TRUE;
+    }
+}
+
+void CTextService::_ApplyLangBarStateSync()
+{
+    if (_hHotkeyWnd != nullptr)
+        KillTimer(_hHotkeyWnd, kLangBarSyncTimerId);
+    _langBarSyncPending = FALSE;
+
+    if (_pLangBarItemButton == nullptr)
+        return;
+
+    // 到期时**重新取值**，不用起计时那刻的快照：迟滞期内状态可能又变了几轮，
+    // 该显示的是现在的状态而非触发计时的那一个。
+    const BOOL noEditCtx = _hasTextInputContext ? FALSE : TRUE;
+    const BOOL password  = IsPasswordSuppressActive();
+    _langBarNoEditCtxReported = noEditCtx;
+    _langBarPasswordReported  = password;
+
+    WIND_LOG_DEBUG_FMT(L"langbar.availability noEditCtx=%d password=%d scopeMask=0x%llX",
+                       noEditCtx, password, _focusInputScopeMask);
+    _pLangBarItemButton->UpdateInputAvailability(noEditCtx, password);
 }
 
 BOOL CTextService::_DocMgrHasEditableContext(ITfDocumentMgr* pDocMgr, DWORD* pDynFlagsOut)

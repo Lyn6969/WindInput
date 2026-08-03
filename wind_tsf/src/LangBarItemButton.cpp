@@ -138,6 +138,8 @@ CLangBarItemButton::CLangBarItemButton(CTextService* pTextService)
     , _bChinesePunct(TRUE)
     , _bToolbarVisible(FALSE)
     , _bKeyboardDisabled(FALSE)
+    , _bNoEditContext(FALSE)
+    , _bPasswordField(FALSE)
     , _bDarkMode(IsSystemDarkMode() ? TRUE : FALSE)
     , _hMsgWnd(NULL)
 {
@@ -239,9 +241,22 @@ STDAPI CLangBarItemButton::GetTooltipString(BSTR* pbstrToolTip)
     if (pbstrToolTip == nullptr)
         return E_INVALIDARG;
 
+    // 三种「打不了中文」的成因分别措辞——图标只能表达「不可用」，说清是哪一种要靠这里。
     if (_bKeyboardDisabled)
     {
         *pbstrToolTip = SysAllocString(L"清风输入法 - 已禁用");
+        return (*pbstrToolTip != nullptr) ? S_OK : E_OUTOFMEMORY;
+    }
+
+    if (_bNoEditContext)
+    {
+        *pbstrToolTip = SysAllocString(L"清风输入法 - 当前位置不可输入");
+        return (*pbstrToolTip != nullptr) ? S_OK : E_OUTOFMEMORY;
+    }
+
+    if (_bPasswordField)
+    {
+        *pbstrToolTip = SysAllocString(L"清风输入法 - 密码框，已切换为英文");
         return (*pbstrToolTip != nullptr) ? S_OK : E_OUTOFMEMORY;
     }
 
@@ -453,7 +468,13 @@ STDAPI CLangBarItemButton::GetIcon(HICON* phIcon)
 
     // Display text is determined by Go service via _inputTypeLabel
     // (e.g., "中", "英", "A", "拼", "五", "双")
-    const wchar_t* text = _inputTypeLabel;
+    //
+    // 密码框例外：此时键已被 IsPasswordSuppressActive 全放行给宿主（等效英文输入），
+    // 图标却还显方案标签「五」，用户会以为仍能打中文——这正是本次要修的认知偏差。
+    // ⚠ **只改这一处呈现**：_inputTypeLabel 与 _bChineseMode 的持久值一概不动。
+    // 真正的英文闸在别处（C++ 的吃键放行 + core 的 password_suppress 透传），把状态
+    // 烧进标签本身，会让「图标变英、中文照样输入」的老毛病换个地方复发。
+    const wchar_t* text = _bPasswordField ? L"英" : _inputTypeLabel;
 
     // Draw white text on black using DirectWrite GDI-interop path
     // (IDWriteBitmapRenderTarget + IDWriteTextRenderer — same as Go-side candidate window)
@@ -587,7 +608,9 @@ STDAPI CLangBarItemButton::GetIcon(HICON* phIcon)
         // max(r, g, b) as alpha - preserves anti-aliased edge transitions
         BYTE alpha = r > g ? (r > b ? r : b) : (g > b ? g : b);
         // When keyboard is disabled, reduce alpha to 35% for dimmed appearance
-        if (_bKeyboardDisabled)
+        // 「焦点不在可编辑控件里」共用同一呈现：成因不同（一个是系统禁用输入法，一个是
+        // 焦点压根不在文本框上），但对用户是同一件事——一个键也打不进去。
+        if (_bKeyboardDisabled || _bNoEditContext)
             alpha = (BYTE)(alpha * 90 / 255);
         pixels[i * 4 + 0] = fgColor; // B
         pixels[i * 4 + 1] = fgColor; // G
@@ -1035,6 +1058,23 @@ void CLangBarItemButton::UpdateKeyboardDisabled(BOOL bDisabled)
         return;
 
     _bKeyboardDisabled = bDisabled;
+
+    if (_pLangBarItemSink != nullptr)
+    {
+        _pLangBarItemSink->OnUpdate(TF_LBI_ICON | TF_LBI_TEXT | TF_LBI_TOOLTIP);
+    }
+}
+
+void CLangBarItemButton::UpdateInputAvailability(BOOL bNoEditContext, BOOL bPasswordField)
+{
+    // 翻转沿去重：OnUpdate 会让系统回调 GetIcon 重建位图，而这两个量随 DocMgr 抖动
+    // 高频变化（实测 QQ 密码框每约 180ms 翻转两次），每次焦点事件都发即是图标闪烁源。
+    // 调用方另有 200ms 迟滞（_ScheduleLangBarStateSync），本处是第二道保险。
+    if (_bNoEditContext == bNoEditContext && _bPasswordField == bPasswordField)
+        return;
+
+    _bNoEditContext = bNoEditContext;
+    _bPasswordField = bPasswordField;
 
     if (_pLangBarItemSink != nullptr)
     {

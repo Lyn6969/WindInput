@@ -434,6 +434,19 @@ private:
     // 不去重会造成 IPC 洪泛。
     BOOL _editCtxReported;
 
+    // ── 语言栏「输入可用性」的迟滞同步 ──
+    // 已推给语言栏的取值，用于判断「状态是否真的变了」。
+    BOOL _langBarNoEditCtxReported;
+    BOOL _langBarPasswordReported;
+    BOOL _langBarSyncPending;         // 迟滞计时进行中
+    // 焦点相关状态变化后调用：与已上报值一致则撤销待定同步，不一致则起迟滞计时。
+    // **不直接更新语言栏**——托盘图标每次 OnUpdate 都要系统回调 GetIcon 重建位图，
+    // 而 _hasTextInputContext 随 DocMgr 抖动高频翻转（实测 QQ 密码框每约 180ms 两次），
+    // 直接驱动即是图标闪烁源。
+    void _ScheduleLangBarStateSync();
+    // 迟滞到期：按**当时**的状态更新语言栏（不是起计时那刻的快照）。
+    void _ApplyLangBarStateSync();
+
     // Composition
     ITfComposition* _pComposition;
     // Top-code committed text kept at the head of the composition, not yet

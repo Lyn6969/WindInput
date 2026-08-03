@@ -904,7 +904,13 @@ pub struct Coordinator {
     /// 最近一次输入诊断快照（compartment 禁用态 / InputScope 密码位），供 Task 6 HUD 展示。
     pub(crate) last_input_diag: Mutex<crate::input_diag::InputDiagState>,
     /// 密码框强制英文抑制态：命中密码 InputScope 时置 true，输入闸据此强制英文透传
-    /// （不改 `chinese_mode` 持久值，图标保持不变）。
+    /// （**不改 `chinese_mode` 持久值**）。
+    ///
+    /// 呈现：2026-08-04 起工具栏模式格显 "英" 且不高亮（`ToolbarState::password_suppress`），
+    /// TSF 语言栏图标同样显 "英"（C++ 侧本地判 `IsPasswordSuppressActive`，不经 IPC）。
+    /// 此前的「图标保持不变」是对齐 Go 旧版的决策，已按用户反馈推翻——图标显方案标签
+    /// 而键已被全放行，用户无从知道自己打不出中文。
+    /// ⚠ 呈现与输入闸是两条独立的路：改这里的展示**不会**改变是否抑制，反之亦然。
     pub(crate) password_suppress: std::sync::atomic::AtomicBool,
     /// 密码框抑制策略开关（默认 true）；关闭时 `apply_input_diag` 不再置位 `password_suppress`。
     pub(crate) password_suppress_enabled: std::sync::atomic::AtomicBool,
@@ -4938,7 +4944,8 @@ impl MessageHandler for Coordinator {
             return self.handle_add_word_key(&mut state, data);
         }
 
-        // 密码框强制英文抑制：透传（不改 chinese_mode 持久值/图标；设计"图标不变"）。
+        // 密码框强制英文抑制：透传（不改 chinese_mode 持久值）。图标另有呈现（显 "英"），
+        // 走 ToolbarState/语言栏的独立字段，与本判据无耦合——详见 password_suppress 字段注释。
         // 须先于下方全角分支——密码框里不该出全角字符，一律半角透传。
         // 注：透传要真生效，C++ 侧必须也没吃这个键，否则「吃了再吐」丢键（见 TSF 待办）。
         if self
