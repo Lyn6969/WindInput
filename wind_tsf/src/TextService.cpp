@@ -16,8 +16,14 @@
 static const GUID kGuidPropInputScope =
     { 0x1713dd5a, 0x68e7, 0x4a5b, { 0x9a, 0xf6, 0x59, 0x2a, 0x59, 0x5c, 0x77, 0x8d } };
 
-// InputScope bit 常量（与 Go 端、inputscope.h 一致）
+// InputScope bit 常量（与 Go 端、inputscope.h 一致）。
+// 权威定义见 Windows SDK `um/InputScope.h`：IS_PASSWORD=31、IS_NUMERIC_PASSWORD=63。
+// ⚠ 邻近的 IS_PRIVATE=61 / IS_SEARCH=50 **不是**密码框信号（无痕窗口的普通输入框即报
+// IS_PRIVATE），勿因位号相近而并入——两者的处置完全不同。
 static const UINT64 kScopeBitPassword = 1ULL << 31; // IS_PASSWORD
+static const UINT64 kScopeBitNumericPassword = 1ULL << 63; // IS_NUMERIC_PASSWORD
+// 密码框判据的唯一定义处：core 的 `is_password_scope` 与之逐位对齐，勿各自展开。
+static const UINT64 kPasswordScopeBits = kScopeBitPassword | kScopeBitNumericPassword;
 
 // 输入诊断 HUD（Task 7）：由 disabled + InputScope mask 计算上报 reason，语义与 Rust
 // coordinator 侧 reason_from 完全一致。reason: 0 None / 1 CompartmentDisabled /
@@ -2136,11 +2142,29 @@ STDAPI CTextService::OnSetFocus(ITfDocumentMgr* pDocMgrFocus, ITfDocumentMgr* pD
         // 来强制英文——mask 是这条信号唯一的出口，勿删。
         // InputScope 原始位（IS_PRIVATE/IS_SEARCH 等）仍随 mask 上报，留作将来扩展判断。
         // 密码框判据复用到加词热键门卫：密码框（中文已被抑制）不注册加词热键，缩小抢占面。
+        const UINT64 rawScopeMask = inputScopeMask; // 补位前的原始 InputScope，供诊断区分来源
         _focusIsPassword = (_hasTextInputContext && _IsFocusKeyboardDisabled(pDocMgrFocus)) != FALSE;
         if (_focusIsPassword)
             inputScopeMask |= kScopeBitPassword;
         // 自留一份：IsPasswordSuppressActive 的吃键门控须在 OnTestKeyDown 本地算出（早于 IPC）。
         _focusInputScopeMask = inputScopeMask;
+
+        // 诊断汇总：把「这个焦点为什么（不）该输入中文」的全部信号打在同一行，便于按宿主
+        // 统计取值分布。此前它们分散在多条日志里，且 **context 级 KEYBOARD_DISABLED 没有
+        // 独立记录**——只体现为 mask 的 bit31 补位，与宿主自己报的 IS_PASSWORD 混在一起，
+        // 事后无从区分来源。2026-08-03 排查 QQ 密码框正因此绕路：实测该场景
+        // rawScope=IS_PRIVATE(bit61)、ctxKbdDisabled=0、threadKbdDisabled=0，三条密码/禁用
+        // 信号全灭，真正的「不可输入」只表达为另一个 DocMgr 的 TF_SD_READONLY（hasTextCtx=0）。
+        //
+        // ⚠ 取值一律用已算好的标量，不做 bit→名字翻译：日志宏不做级别短路（见 Globals.h，
+        // WIND_LOG_DEBUG_FMT 直接展开为 OutputFmt(4, ...)），参数会在级别判定**之前**求值，
+        // 在焦点热路径上拼字符串即是无条件开销。
+        WIND_LOG_DEBUG_FMT(
+            L"compat.focus.signals focusSession=%llu hasTextCtx=%d dynFlags=0x%X rawScope=0x%llX "
+            L"scopePassword=%d ctxKbdDisabled=%d threadKbdDisabled=%d",
+            _focusSessionId, _hasTextInputContext ? 1 : 0, docMgrDynFlags, rawScopeMask,
+            (rawScopeMask & kPasswordScopeBits) != 0 ? 1 : 0,
+            _focusIsPassword ? 1 : 0, _bKeyboardDisabled ? 1 : 0);
 
         // 焦点 caret。**先发异步 edit session 请求，再走同步回退链** —— 顺序是有意的：
         // 内联执行的宿主（记事本实测 hrSession=S_OK）会在下面这行里把回调跑完，
@@ -3931,8 +3955,8 @@ BOOL CTextService::IsPasswordSuppressActive() const
         return FALSE;
     if (_bKeyboardDisabled)
         return FALSE;
-    // IS_PASSWORD=31 / IS_NUMERIC_PASSWORD=63（对齐 core is_password_scope 的两位）
-    const UINT64 kPasswordScopeBits = (1ULL << 31) | (1ULL << 63);
+    // IS_PASSWORD=31 / IS_NUMERIC_PASSWORD=63（对齐 core is_password_scope 的两位）。
+    // 常量在文件顶部单点定义——此处曾另有一份局部展开，两处各自维护即有漂移风险。
     return (_focusInputScopeMask & kPasswordScopeBits) != 0;
 }
 
