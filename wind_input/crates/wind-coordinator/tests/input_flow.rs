@@ -1260,6 +1260,8 @@ fn press_char(coord: &Coordinator, c: char) -> KeyAction {
         ')' => (0x30, true),
         ';' => (0xBA, false),
         ':' => (0xBA, true),
+        '\'' => (0xDE, false),
+        '"' => (0xDE, true),
         other => panic!("press_char 未覆盖字符 {:?}", other),
     };
     press_vk(coord, vk, shift)
@@ -1740,6 +1742,128 @@ fn quick_input_ctrl_combo_does_not_insert_literal() {
             "有待输入内容时 Ctrl 组合应放弃整段组合，实际: {:?}（回归：曾插入字面 e）",
             other
         ),
+    }
+}
+
+/// 带 `'` 的英文：`rock'n'roll`。`'` 是默认的第 3 候选键，不夺取就走不到字面输入那一步。
+///
+/// 修复前实测：`;rock` 按 `'` 选走第 3 候选「日欧」，而它 `consumed_length=2` 还会触发
+/// 分步确认——`ro` 被吃掉转成汉字、缓冲只剩 `ck`，组合区变成 `;日欧c'k`
+/// （末尾那个 `'` 是拼音引擎的**音节分隔显示**，不是用户打的）。整串输入被打散。
+#[test]
+fn quick_input_free_apostrophe_word() {
+    if !has_schemas() {
+        return;
+    }
+    let coord = Coordinator::new_headless(config_with("wubi86"), Some(&data_dir()));
+    coord.handle_key_event(&key_event(0xBA, EVENT_KEY_DOWN)); // ;
+    let last = press_str(&coord, "rock'n'roll");
+    assert_eq!(
+        action_text(&last).unwrap(),
+        ";rock'n'roll",
+        "撇号应字面入缓冲，而不是被当成第 3 候选键"
+    );
+    match coord.handle_key_event(&key_event(0x20, EVENT_KEY_DOWN)) {
+        KeyAction::InsertText { text, .. } => assert_eq!(text, "rock'n'roll"),
+        other => panic!("空格应上屏原文，实际: {:?}", other),
+    }
+}
+
+/// 分号同理（`for(;;)`）。注意首字符 `(` 已经把透镜带进 Free，此处锁的是**缓冲非空时**
+/// 的分号不再被当选词键；空缓冲按分号仍是「上屏符号并退出」（引导键二次按下），不受影响。
+#[test]
+fn quick_input_free_semicolon_in_buffer() {
+    if !has_schemas() {
+        return;
+    }
+    let coord = Coordinator::new_headless(config_with("wubi86"), Some(&data_dir()));
+    coord.handle_key_event(&key_event(0xBA, EVENT_KEY_DOWN)); // ;
+    let last = press_str(&coord, "for(;;)");
+    assert_eq!(action_text(&last).unwrap(), ";for(;;)");
+    match coord.handle_key_event(&key_event(0x20, EVENT_KEY_DOWN)) {
+        KeyAction::InsertText { text, .. } => assert_eq!(text, "for(;;)"),
+        other => panic!("空格应上屏原文，实际: {:?}", other),
+    }
+}
+
+/// `Shift+数字` 是 `!@#$%^&*(` 九个符号，**从来不是选词键**。
+///
+/// 第③步的数字选词键此前没判 shift（第④步一直有），于是 `;for(` 里的 `(`（=Shift+9）
+/// 被当成「选第 9 个候选」吃掉。自由输入上线前这些符号本就走不进缓冲，故一直没暴露。
+#[test]
+fn quick_input_shift_digit_is_symbol_not_select_key() {
+    if !has_schemas() {
+        return;
+    }
+    let coord = Coordinator::new_headless(config_with("wubi86"), Some(&data_dir()));
+    coord.handle_key_event(&key_event(0xBA, EVENT_KEY_DOWN)); // ;
+    press_str(&coord, "abc");
+    assert!(
+        !coord.debug_page_texts().is_empty(),
+        "abc 应有候选——没有候选的话选词键本就不会触发，测不出问题"
+    );
+    // `!` = Shift+1；若被当成「选第 1 个候选」，这里会得到 InsertText 而非组合区更新。
+    let act = press_vk(&coord, 0x31, true);
+    assert_eq!(
+        action_text(&act).as_deref(),
+        Some(";abc!"),
+        "Shift+1 应作符号 `!` 字面入缓冲，实际: {:?}",
+        act
+    );
+}
+
+/// ★反向对照：`free_input_takes_select_keys = false` 时 `'` 仍是第 3 候选键。
+/// 缺了这条，「夺取」就可能被实现成无条件生效而无人察觉。
+#[test]
+fn quick_input_select_keys_kept_when_not_taken() {
+    if !has_schemas() {
+        return;
+    }
+    let mut cfg = config_with("wubi86");
+    cfg.schema.mix_modes[0].free_input_takes_select_keys = false;
+    let coord = Coordinator::new_headless(cfg, Some(&data_dir()));
+    coord.handle_key_event(&key_event(0xBA, EVENT_KEY_DOWN)); // ;
+    press_str(&coord, "rock");
+    let texts = coord.debug_page_texts();
+    assert!(texts.len() >= 3, "需要至少 3 个候选才能验证第 3 候选键");
+    let third = texts[2].clone();
+    let act = press_vk(&coord, 0xDE, false); // '
+    // 第 3 候选若是部分匹配会走分步确认（组合区保留），否则整体上屏；两种都说明它**被选中了**，
+    // 而不是作字面入缓冲——故判据是「组合区/上屏文本里出现了第 3 候选的文本」。
+    let out = action_text(&act).unwrap_or_default();
+    assert!(
+        out.contains(&third),
+        "关掉夺取后 `'` 应仍选第 3 候选 {:?}，实际动作: {:?}",
+        third,
+        act
+    );
+    assert!(
+        !out.contains("rock'"),
+        "关掉夺取后 `'` 不应字面入缓冲，实际: {:?}",
+        out
+    );
+}
+
+/// ★反向对照：数字键**不在**夺取范围——它是文本透镜唯一的选词通路。
+/// 这条同时钉住了已知缺口：`;utf8` 里的 `8` 仍会选词，要打这类串需先切进自由输入。
+#[test]
+fn quick_input_digit_select_keys_are_never_taken() {
+    if !has_schemas() {
+        return;
+    }
+    let coord = Coordinator::new_headless(config_with("wubi86"), Some(&data_dir()));
+    coord.handle_key_event(&key_event(0xBA, EVENT_KEY_DOWN)); // ;
+    press_str(&coord, "nihao");
+    let texts = coord.debug_page_texts();
+    assert!(!texts.is_empty(), "nihao 应有拼音候选");
+    let first = texts[0].clone();
+    match press_char(&coord, '1') {
+        KeyAction::InsertText { text, .. } => assert!(
+            text.ends_with(&first),
+            "数字键必须始终是选词键（夺取范围只含二三候选键），实际: {:?}",
+            text
+        ),
+        other => panic!("数字键应选词上屏，实际: {:?}", other),
     }
 }
 

@@ -222,6 +222,18 @@ impl Coordinator {
         self.mix_free_input(idx) == FreeInputMode::Off
     }
 
+    /// 本 mix 实例的自由输入是否夺取二三候选键作字面输入
+    /// （`MixModeConfig::free_input_takes_select_keys`，缺省 true）。
+    pub(crate) fn mix_takes_select_keys(&self, idx: u8) -> bool {
+        self.rt()
+            .config
+            .schema
+            .mix_modes
+            .get(idx as usize)
+            .map(|m| m.free_input_takes_select_keys)
+            .unwrap_or(true)
+    }
+
     /// 当前 mix 缓冲对应的输入透镜 —— **缓冲的纯函数**，见 [`MixLens`]。
     ///
     /// 判据顺序刻意如此：
@@ -1392,19 +1404,34 @@ impl Coordinator {
                 // 走到这里的只剩控制键，继续往下落即可。
                 if lens != MixLens::Free {
                     // ③ 本 lens 选词键：数字 lens 用字母（a=首选），文本 lens 用数字（1=首选）
+                    //
+                    // 数字臂的 `!shift` 是**必须的**（④ 早就有、③ 一直漏）：`Shift+1..9` 是
+                    // `!@#$%^&*(` 这九个符号，从来不是选词键。漏判的后果是 `;for(` 里的 `(`
+                    // （=Shift+9）被当成「选第 9 个候选」吃掉，组合区变成 `;for`——自由输入
+                    // 上线后才暴露，因为在此之前这些符号本就走不进缓冲。
                     let sel = if lens == MixLens::Numeric {
                         is_letter.then(|| (data.key_code - keymap::VK_A) as usize)
                     } else {
-                        (keymap::VK_1..=keymap::VK_9)
-                            .contains(&data.key_code)
+                        (!shift && (keymap::VK_1..=keymap::VK_9).contains(&data.key_code))
                             .then(|| (data.key_code - keymap::VK_1) as usize)
                     };
                     if let Some(off) = sel {
                         return self.mix_select(state, off);
                     }
 
-                    // ④ 配置二三候选键
-                    if !shift && let Some(offset) = self.select_key_offset(data.key_code) {
+                    // ④ 配置二三候选键（默认 `;` `'`）。
+                    //
+                    // 自由输入夺取时让位字面输入：`rock'n'roll` / `don't` / `for(;;)` 里的
+                    // `'` `;` 恰好就是默认选词键，不让位就**走不到 ⑤**——实测 `;rock` 按 `'`
+                    // 会选走第 3 候选「日欧」，而它 consumed_length=2 还会触发分步确认，
+                    // 把 `ro` 吃掉转成汉字、缓冲只剩 `ck`，整串输入被打散。
+                    //
+                    // 数字键（③）刻意不在夺取范围：它是文本透镜唯一的选词通路，让位就
+                    // 一个选词键都不剩。二三候选键则是数字键 2/3 的冗余别名，让位零能力损失。
+                    if !(free_on && self.mix_takes_select_keys(state.mix_id))
+                        && !shift
+                        && let Some(offset) = self.select_key_offset(data.key_code)
+                    {
                         return self.mix_select(state, offset);
                     }
                 }

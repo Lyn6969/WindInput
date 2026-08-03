@@ -825,7 +825,12 @@ pub enum FreeInputMode {
 }
 
 /// 临时 mix 模式配置（overlay 激活面）。触发后对每个成员方案查询并按成员序合并候选。
-#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
+///
+/// ⚠️ **`Default` 手写而非 derive**：`free_input_takes_select_keys` 的 serde 缺省是 `true`，
+/// 而 derive 出来的 `bool::default()` 是 `false`——两条路径会给出相反的默认值，测试夹具
+/// （`..Default::default()`）与真实配置的行为就此分叉。新增带非零默认值的字段时，
+/// **必须同时改这里**（与 `TempEnglishConfig` 手写 `Default` 同因）。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct MixModeConfig {
     /// 实例唯一标识
     #[serde(default)]
@@ -867,6 +872,47 @@ pub struct MixModeConfig {
     /// 中文标点」；专做字面输入的实例则设 `Always`。
     #[serde(default)]
     pub free_input: FreeInputMode,
+    /// 自由输入是否**夺取二三候选键**（`keys.select_key_groups` 的键，默认 `;` `'`）
+    /// 作字面输入。默认开；`free_input = "off"` 时本项无意义。
+    ///
+    /// # 为什么需要它
+    ///
+    /// 文本透镜下「选词键」与「字面字符」是同一批物理键的两种解释，无法两全。而
+    /// `rock'n'roll` / `don't` / `for(;;)` 这类内容里的 `'` `;` 恰好就是默认选词键：
+    /// 不夺取的话它们在第④步就被 `select_key_offset` 吃掉，根本走不到第⑤步的字面输入
+    /// （实测 `;rock` 按 `'` 会选走第 3 候选「日欧」并触发分步确认，输入被打散）。
+    ///
+    /// 夺取的代价是**零能力损失**：`;`/`'` 选第 2/3 候选只是数字键 `2`/`3` 的冗余别名，
+    /// 数字键仍在。**数字键 1-9 刻意不在夺取范围内**——它们是文本透镜唯一的选词通路，
+    /// 让位就没有选词键了。代价是 `utf8` / `mp3` / `x64` 这类「纯小写字母 + 数字」仍需
+    /// 先打一个大写字母或符号切进自由输入。
+    ///
+    /// # 为什么是独立开关而非跟随 `free_input`
+    ///
+    /// 翻页键（`-`/`=`）的让位是跟着 `free_input` 走的，本项刻意不对称：翻页有
+    /// PageUp/PageDown 作等价替代，让位是纯收益；而选词键的取舍因人而异——习惯用
+    /// `;`/`'` 选词的用户可以单独关掉本项，保住手感，同时仍享有大写字母与其它符号
+    /// 触发的自由输入。
+    #[serde(default = "default_true")]
+    pub free_input_takes_select_keys: bool,
+}
+
+impl Default for MixModeConfig {
+    fn default() -> Self {
+        Self {
+            id: String::new(),
+            name: String::new(),
+            short_name: String::new(),
+            trigger_keys: Vec::new(),
+            members: Vec::new(),
+            candidate_layout: LayoutIntent::default(),
+            comment_template_vertical: None,
+            comment_template_horizontal: None,
+            free_input: FreeInputMode::default(),
+            // 与 `#[serde(default = "default_true")]` 对齐，见结构体文档的 ⚠️。
+            free_input_takes_select_keys: default_true(),
+        }
+    }
 }
 
 /// 内置「快捷」融合 mix 的实例 id（`;` 触发，成员含日期/计算/拼音/英文）。
@@ -904,6 +950,9 @@ fn default_mix_modes() -> Vec<MixModeConfig> {
         comment_template_horizontal: None,
         // 出厂开自动自由输入：`;` 是为特殊内容而进的模式，字面输入是它的常见用途。
         free_input: FreeInputMode::Auto,
+        // 夺取 `;`/`'` 作字面：它们选第 2/3 候选只是数字键的冗余别名，而 `rock'n'roll`
+        // 这类内容里的 `'` 没有别的输入通路。
+        free_input_takes_select_keys: true,
     }]
 }
 
@@ -3649,6 +3698,27 @@ y = 2
         };
         assert!(remove_nested(t, &["a", "b", "y"]));
         assert!(get_nested(&root, &["a"]).is_none(), "父表变空应逐级回收");
+    }
+
+    /// `MixModeConfig` 的两条默认值路径必须一致：serde 缺省（读一份没写该键的配置）与
+    /// `Default::default()`（测试夹具 / 代码构造）。
+    ///
+    /// `free_input_takes_select_keys` 的 serde 缺省是 `true`，而 derive 出来的
+    /// `bool::default()` 是 `false`——所以 `Default` 是手写的。本测试就是那条约束的守门：
+    /// 日后再加带非零默认值的字段而忘了改手写 `Default`，这里会红。
+    #[test]
+    fn mix_mode_config_serde_default_matches_default_impl() {
+        let from_serde: MixModeConfig =
+            toml::from_str("").expect("空表应能反序列化出全默认的 MixModeConfig");
+        assert_eq!(
+            from_serde,
+            MixModeConfig::default(),
+            "serde 缺省与 Default::default() 必须逐字段一致"
+        );
+        assert!(
+            MixModeConfig::default().free_input_takes_select_keys,
+            "夺取二三候选键默认应为开"
+        );
     }
 
     /// 退役键走显式名单清除，且**三类不得误伤**：同段里还活着的键、名字相似但仍在使用的
