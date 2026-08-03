@@ -37,6 +37,7 @@ pub mod text;
 pub mod theme_assets;
 pub mod toast;
 pub mod toolbar;
+pub mod toolbar_gate;
 pub mod tooltip;
 pub mod view;
 pub mod viewbox;

@@ -614,10 +614,10 @@ impl UiManager {
             i32,
             i32,
         )>::new(60);
-        // 工具栏隐藏防抖：HideToolbar 不立即隐藏，延后 50ms；若期间收到 UpdateToolbar
-        // （应用间切换的 FocusLost→FocusGained 串），取消隐藏并显示——消除 Alt+Tab 闪烁。
-        let mut toolbar_hide_at: Option<std::time::Instant> = None;
-        const TOOLBAR_HIDE_DEBOUNCE: std::time::Duration = std::time::Duration::from_millis(50);
+        // 工具栏显隐迟滞闸门（两侧都有迟滞，理由不同，见 toolbar_gate 模块文档）。
+        let mut toolbar_gate = crate::toolbar_gate::ToolbarGate::new();
+        // 待显示的状态：迟滞期间工具栏不可见，只需保留最后一份，到期时一次渲染。
+        let mut toolbar_pending_state: Option<crate::toolbar::ToolbarState> = None;
 
         // 右键候选弹出菜单（best-effort）
         let mut popup_menu = match crate::popup_menu::PopupMenu::new(event_tx.clone()) {
@@ -688,13 +688,23 @@ impl UiManager {
                     toast_hide_at = None;
                 }
             }
-            // 工具栏隐藏防抖到期：确认隐藏
-            if let Some(deadline) = toolbar_hide_at {
-                if std::time::Instant::now() >= deadline {
-                    if let Some(t) = &mut toolbar {
-                        t.hide();
+            // 工具栏显隐迟滞推进。无待定项时 is_active()=false 直接跳过（不取时间）。
+            if toolbar_gate.is_active() {
+                match toolbar_gate.tick_at(std::time::Instant::now()) {
+                    crate::toolbar_gate::GateTick::Show => {
+                        // 熬过窗口期没被 HideToolbar 撤销 → 真正显示。
+                        // Toolbar::update → render 是所有显示路径的单点，末尾必 show。
+                        if let (Some(t), Some(st)) = (&mut toolbar, &toolbar_pending_state) {
+                            t.update(st);
+                        }
+                        toolbar_pending_state = None;
                     }
-                    toolbar_hide_at = None;
+                    crate::toolbar_gate::GateTick::Hide => {
+                        if let Some(t) = &mut toolbar {
+                            t.hide();
+                        }
+                    }
+                    crate::toolbar_gate::GateTick::None => {}
                 }
             }
             // 非阻塞处理 Win32 消息（仅 Windows 有消息泵；非 Windows 为 mock，跳过）
@@ -1234,18 +1244,41 @@ impl UiManager {
                     }
                     UiCommand::UpdateToolbar(tb_state) => {
                         debug!("UI: UpdateToolbar {:?}", tb_state);
-                        toolbar_hide_at = None; // 取消待定隐藏（切回本输入法 → 保持显示）
-                        if let Some(t) = &mut toolbar {
-                            t.update(&tb_state);
+                        // 传当前可见性：**内容更新与可见性提升是两件事**。本命令同时承担
+                        // 「更新中英·标点·全半角」与「让工具栏出现」，整条延迟会让已显示
+                        // 时按 Shift 切中英也慢一档，手感明显退化。
+                        let visible = toolbar.as_ref().is_some_and(|t| t.is_visible());
+                        match toolbar_gate.on_update(std::time::Instant::now(), visible) {
+                            crate::toolbar_gate::UpdateAction::RenderNow => {
+                                if let Some(t) = &mut toolbar {
+                                    t.update(&tb_state);
+                                }
+                                toolbar_pending_state = None;
+                            }
+                            crate::toolbar_gate::UpdateAction::Deferred => {
+                                debug!(
+                                    "UI: UpdateToolbar 待显示（迟滞 {}ms）",
+                                    crate::toolbar_gate::SHOW_DEBOUNCE.as_millis()
+                                );
+                                toolbar_pending_state = Some(tb_state);
+                            }
                         }
                     }
                     UiCommand::HideToolbar => {
-                        debug!(
-                            "UI: HideToolbar (debounced {}ms)",
-                            TOOLBAR_HIDE_DEBOUNCE.as_millis()
-                        );
-                        // 延后隐藏：50ms 内若有 UpdateToolbar 则取消，消除应用间切换闪烁。
-                        toolbar_hide_at = Some(std::time::Instant::now() + TOOLBAR_HIDE_DEBOUNCE);
+                        match toolbar_gate.on_hide(std::time::Instant::now()) {
+                            crate::toolbar_gate::HideAction::CancelledPending => {
+                                // 撤销待显示——消除 DocMgr churn 闪烁的关键一步。
+                                // 工具栏本就不可见，无需再排隐藏。
+                                toolbar_pending_state = None;
+                                debug!("UI: HideToolbar 撤销待显示工具栏（迟滞窗口内）");
+                            }
+                            crate::toolbar_gate::HideAction::Scheduled => {
+                                debug!(
+                                    "UI: HideToolbar (debounced {}ms)",
+                                    crate::toolbar_gate::HIDE_DEBOUNCE.as_millis()
+                                );
+                            }
+                        }
                     }
                     UiCommand::SetToolbarPos { x, y } => {
                         debug!("UI: SetToolbarPos ({},{})", x, y);
@@ -1267,7 +1300,12 @@ impl UiManager {
                         let t = *theme;
                         if let Some(tb) = &mut toolbar {
                             tb.set_theme(&t);
-                            tb.repaint();
+                            // 仅在可见时重绘：repaint→render 末尾无条件 show，对隐藏中的
+                            // 工具栏调用会把它显形，绕过 toolbar_gate 的显示迟滞。
+                            // （启动时 last_state 为 None，repaint 本就是 no-op，故此前不显形。）
+                            if tb.is_visible() {
+                                tb.repaint();
+                            }
                         }
                         if let Some(m) = &mut popup_menu {
                             m.set_theme(&t);
