@@ -310,9 +310,9 @@ impl Coordinator {
             // `strategy = position` 时走与拼音同一套位置提升（档位仍是硬约束，只在档内
             // 提升）；`top`/`step` 仍是布尔 used-first，不读 profile / promote_prefix。
             //
-            // profile 取 `codetable_freq_profile` 而非拼音那份：码表的 half_life 独立可配
-            // （缺省回落拼音段）。此前这里直接用 `pinyin_freq_profile()`，等于改拼音的半衰期
-            // 会连带改码表 position 的衰减速度，而码表段根本没有这个旋钮。
+            // profile 取 `active_freq_profile`（英文方案取英文段、其余取码表段），不用拼音
+            // 那份。此前这里直接用 `pinyin_freq_profile()`，等于改拼音的半衰期会连带改码表
+            // position 的衰减速度，而码表段根本没有这个旋钮。
             wind_engine::freq_rerank::rerank_codetable_usedfirst(
                 candidates,
                 &recs,
@@ -320,7 +320,7 @@ impl Coordinator {
                 settings.strategy,
                 settings.protect,
                 now_unix_secs(),
-                self.engine_mgr.codetable_freq_profile(),
+                self.engine_mgr.active_freq_profile(),
                 settings.promote_prefix,
             );
         }
@@ -1440,16 +1440,34 @@ impl Coordinator {
         freq_code: &str,
     ) -> String {
         self.record_selection(freq_code, text, source);
-        let out = match s2t_override {
+        let mut out = match s2t_override {
             Some(t) => t.to_string(),
             None => self.maybe_s2t(state, text),
         };
+        if self.english_appends_space(source) {
+            out.push(' ');
+        }
         state.input_buffer.clear();
         state.preedit.clear();
         state.candidates.clear();
         state.current_page = 0;
         state.selected_index = 0;
         out
+    }
+
+    /// 英文候选上屏后是否补一个空格（`schema.english.commit_space`）。
+    ///
+    /// **两个判据缺一不可**，且它们查的不是同一件事：
+    /// - `source == English` —— 英文方案下也会出现短语等其它来源的候选，那些不该补空格；
+    /// - **当前方案是英文方案** —— `CandidateSource::English` 在混输、快捷输入、临时英文
+    ///   里同样出现，而那些场景用户正在写中文句子，插个英文词后面平白多个空格是错的。
+    ///
+    /// ⚠️ 注意本项与同段的 `frequency.code_scope` **判据相反**：那个按**候选来源**生效
+    /// （英文候选走到哪都该按同一口径记账），这个按**当前方案**。改动其一时别照着另一个抄。
+    fn english_appends_space(&self, source: CandidateSource) -> bool {
+        source == CandidateSource::English
+            && self.rt().config.schema.english.commit_space
+            && self.engine_mgr.active_is_english()
     }
 
     /// 词频记账用的码——**码表与拼音/英文口径不同**，这是两类方案的语义差异。

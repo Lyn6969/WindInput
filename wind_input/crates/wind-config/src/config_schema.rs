@@ -103,10 +103,22 @@ static REGISTRY: &[ConfigField] = &[
         Enum(PROMOTE_PREFIX_VALUES),
     ),
     f("schema.codetable.frequency.half_life", Float),
+    // ── 英文（[schema.english]）：不再共用码表段 ──
+    f("schema.english.frequency.enabled", Bool),
     f(
-        "schema.codetable.frequency.english_code_scope",
+        "schema.english.frequency.strategy",
+        Enum(FREQ_STRATEGY_VALUES),
+    ),
+    f(
+        "schema.english.frequency.promote_prefix",
+        Enum(PROMOTE_PREFIX_VALUES),
+    ),
+    f("schema.english.frequency.half_life", Float),
+    f(
+        "schema.english.frequency.code_scope",
         Enum(ENGLISH_CODE_SCOPE_VALUES),
     ),
+    f("schema.english.commit_space", Bool),
     f("schema.codetable.auto_phrase.enabled", Bool),
     f("schema.codetable.auto_phrase.min_phrase_len", Int),
     f("schema.codetable.auto_phrase.max_phrase_len", Int),

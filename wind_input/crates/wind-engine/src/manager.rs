@@ -97,8 +97,11 @@ pub struct FreqSettings {
     pub protect: ProtectPolicy,
     /// 前缀补全参与位置提升的范围（`schema.*.frequency.promote_prefix`）。
     pub promote_prefix: PromotePrefix,
-    /// 英文候选记账码是否用输入码（`schema.codetable.frequency.english_code_scope == "input"`）。
-    /// 内部配置；`false`（默认）= 用候选码，与拼音同侧。
+    /// 英文候选记账码是否用输入码（`schema.english.frequency.code_scope == "input"`）。
+    /// `false`（默认）= 用候选码，与拼音同侧。
+    ///
+    /// ⚠️ 本项**按候选来源生效、不按当前方案**，故 `freq_settings` 的三个分支取的是
+    /// 同一个值——混输方案里混进来的英文候选同样要按英文的口径记账。
     pub english_code_by_input: bool,
 }
 
@@ -132,6 +135,8 @@ pub struct EngineManager {
     codetable: Mutex<wind_config::CodetableGlobal>,
     /// 全局混输配置（融合策略；全局唯一，无方案级 override）。Mutex 以支持热重载。
     mix: Mutex<wind_config::MixGlobal>,
+    /// 全局英文配置（英文方案的行为与调频；全局唯一）。Mutex 以支持热重载。
+    english: Mutex<wind_config::config::EnglishGlobal>,
     /// 全局临时拼音配置（码表方案下临时切拼音反查；全局唯一）。Mutex 以支持热重载。
     temp_pinyin: Mutex<wind_config::config::TempPinyinConfig>,
     /// 词频排序设置缓存（schema_id -> FreqSettings；按需解析、避免每键读盘）
@@ -365,6 +370,7 @@ impl EngineManager {
             store,
             codetable: Mutex::new(config.schema.codetable.clone()),
             mix: Mutex::new(config.schema.mix.clone()),
+            english: Mutex::new(config.schema.english.clone()),
             temp_pinyin: Mutex::new(config.input.temp_pinyin.clone()),
             freq_cache: Mutex::new(HashMap::new()),
             schema_type_cache: Mutex::new(HashMap::new()),
@@ -1404,6 +1410,7 @@ impl EngineManager {
         *self.available.lock().unwrap_or_else(|e| e.into_inner()) = available;
         *self.codetable.lock().unwrap_or_else(|e| e.into_inner()) = config.schema.codetable.clone();
         *self.mix.lock().unwrap_or_else(|e| e.into_inner()) = config.schema.mix.clone();
+        *self.english.lock().unwrap_or_else(|e| e.into_inner()) = config.schema.english.clone();
         *self.temp_pinyin.lock().unwrap_or_else(|e| e.into_inner()) =
             config.input.temp_pinyin.clone();
         *self
@@ -1647,7 +1654,46 @@ impl EngineManager {
         }
     }
 
-    /// 码表/混输/英文的词频衰减参数。**与拼音完全独立，不读拼音段任何字段。**
+    /// 当前方案是否为英文方案（`[engine] type = "english"`）。
+    ///
+    /// 判「当前方案」而非「候选来源是英文」：`CandidateSource::English` 在混输、快捷输入、
+    /// 临时英文里都会出现，那些场景下用户正在写中文，按英文方案的规矩处理是错的。
+    pub fn active_is_english(&self) -> bool {
+        matches!(
+            self.schema_engine_type(&self.active_schema_id()).as_deref(),
+            Some("english")
+        )
+    }
+
+    /// **当前方案**的词频衰减参数：英文方案取英文段，其余取码表段。
+    ///
+    /// 拼音走 [`Self::pinyin_freq_profile`]，不经这里（消费点按引擎类型分派）。
+    ///
+    /// 存在的理由是消费端只有一个调用点，却要服务两套配置：调用方拿不到「当前是哪类
+    /// 方案」以外的信息，把选择留在那里就会变成消费点各判一次、迟早漏一处。
+    pub fn active_freq_profile(&self) -> wind_store::freq::FreqProfile {
+        if self.active_is_english() {
+            return self.english_freq_profile();
+        }
+        self.codetable_freq_profile()
+    }
+
+    /// 英文方案的词频衰减参数。与码表/拼音三者互不相干，各读各的 `half_life`。
+    pub fn english_freq_profile(&self) -> wind_store::freq::FreqProfile {
+        let hl = self
+            .english
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .frequency
+            .half_life;
+        let def = wind_store::freq::FreqProfile::default();
+        wind_store::freq::FreqProfile {
+            half_life_hours: Self::resolve_half_life(hl, def.half_life_hours),
+            ..def
+        }
+    }
+
+    /// 码表/混输的词频衰减参数。**与拼音完全独立，不读拼音段任何字段。**
     ///
     /// 曾做成「码表段为 0 时回落拼音段」，已否决：那让两套配置藕断丝连——用户在设置页把
     /// 码表半衰期留在 0，改拼音的却发现码表跟着变，而设置页上那是两个独立控件。**一个控件
@@ -1715,36 +1761,57 @@ impl EngineManager {
                 return *s;
             }
         }
-        let is_pinyin = matches!(self.schema_engine_type(&id).as_deref(), Some("pinyin"));
-        let settings = if is_pinyin {
-            let pf = self.pinyin.lock().unwrap_or_else(|e| e.into_inner());
-            // 拼音 strategy/protect 字段不参与（仅码表 used-first 排序用），取默认。
-            FreqSettings {
-                enabled: pf.frequency.enabled,
-                strategy: FreqStrategy::Step,
-                protect: ProtectPolicy::NONE,
-                promote_prefix: PromotePrefix::parse(&pf.frequency.promote_prefix),
-                // 纯拼音方案下没有英文候选，取默认即可。
-                english_code_by_input: false,
+        // 英文记账口径**按候选来源生效、不按当前方案**——混输方案里混进来的英文候选
+        // 同样读它。故在分流之外先取一次，三个分支共用同一个值；只在英文分支里读的话，
+        // 混输下的英文候选会静默回到默认口径。
+        let english_code_by_input = {
+            let en = self.english.lock().unwrap_or_else(|e| e.into_inner());
+            en.frequency.code_scope == "input"
+        };
+        let engine_type = self.schema_engine_type(&id);
+        let settings = match engine_type.as_deref() {
+            Some("english") => {
+                let en = self.english.lock().unwrap_or_else(|e| e.into_inner());
+                FreqSettings {
+                    enabled: en.frequency.enabled,
+                    strategy: Self::parse_freq_strategy(&en.frequency.strategy),
+                    // 英文没有「简码位」：一个 a 后面跟的是几万个词而不是钦定首选，
+                    // 套用码表那套按码长分级的首选保护只会锁死前几位不让调频。
+                    protect: ProtectPolicy::NONE,
+                    promote_prefix: PromotePrefix::parse(&en.frequency.promote_prefix),
+                    english_code_by_input,
+                }
             }
-        } else {
-            let ct = self.codetable.lock().unwrap_or_else(|e| e.into_inner());
-            FreqSettings {
-                // 码表默认 `all`：其前缀补全已由 `freq_tier` 分到独立档位、跨不到精确档
-                // 之前，无需再按语义单元收窄；且这与 `Top`/`Step` 的历史行为一致（那两者
-                // 对前缀补全从无限制），避免升级后存量用户的调频突然变窄。
-                promote_prefix: PromotePrefix::parse(&ct.frequency.promote_prefix),
-                english_code_by_input: ct.frequency.english_code_scope == "input",
-                enabled: ct.frequency.enabled,
-                strategy: Self::parse_freq_strategy(&ct.frequency.strategy),
-                protect: ProtectPolicy {
-                    by_len: [
-                        ct.frequency.protect_top_n_len1,
-                        ct.frequency.protect_top_n_len2,
-                        ct.frequency.protect_top_n_len3,
-                    ],
-                    fallback: ct.frequency.protect_top_n,
-                },
+            Some("pinyin") => {
+                let pf = self.pinyin.lock().unwrap_or_else(|e| e.into_inner());
+                // 拼音 strategy/protect 字段不参与（仅码表 used-first 排序用），取默认。
+                FreqSettings {
+                    enabled: pf.frequency.enabled,
+                    strategy: FreqStrategy::Step,
+                    protect: ProtectPolicy::NONE,
+                    promote_prefix: PromotePrefix::parse(&pf.frequency.promote_prefix),
+                    english_code_by_input,
+                }
+            }
+            _ => {
+                let ct = self.codetable.lock().unwrap_or_else(|e| e.into_inner());
+                FreqSettings {
+                    // 码表默认 `all`：其前缀补全已由 `freq_tier` 分到独立档位、跨不到精确档
+                    // 之前，无需再按语义单元收窄；且这与 `Top`/`Step` 的历史行为一致（那两者
+                    // 对前缀补全从无限制），避免升级后存量用户的调频突然变窄。
+                    promote_prefix: PromotePrefix::parse(&ct.frequency.promote_prefix),
+                    english_code_by_input,
+                    enabled: ct.frequency.enabled,
+                    strategy: Self::parse_freq_strategy(&ct.frequency.strategy),
+                    protect: ProtectPolicy {
+                        by_len: [
+                            ct.frequency.protect_top_n_len1,
+                            ct.frequency.protect_top_n_len2,
+                            ct.frequency.protect_top_n_len3,
+                        ],
+                        fallback: ct.frequency.protect_top_n,
+                    },
+                }
             }
         };
         self.freq_cache
@@ -2911,6 +2978,54 @@ mod tests {
         assert_eq!(py.half_life_hours, 999.0);
         assert_eq!(py.base_scale, 888.0);
         assert_eq!(py.recency_peak, 777.0);
+    }
+
+    /// 英文衰减参数与码表、拼音**三者互不相干**，各读各的 half_life。
+    ///
+    /// 英文此前共用码表段，于是「英文调频衰减慢一点」这个愿望只能靠改五笔的半衰期实现。
+    #[test]
+    fn english_profile_is_independent_of_codetable_and_pinyin() {
+        let mut cfg = Config::default();
+        cfg.schema.pinyin.frequency.half_life = 999.0;
+        cfg.schema.codetable.frequency.half_life = 888.0;
+        cfg.schema.english.frequency.half_life = 111.0;
+        let mgr = EngineManager::new(&cfg, None);
+
+        assert_eq!(mgr.english_freq_profile().half_life_hours, 111.0);
+        // 反向对照：另两侧读到的是各自的值，证明上面不是「三者碰巧都取了默认」。
+        assert_eq!(mgr.codetable_freq_profile().half_life_hours, 888.0);
+        assert_eq!(mgr.pinyin_freq_profile().half_life_hours, 999.0);
+
+        // 英文段留 0 时走 store 默认，**不回落码表的 888**。
+        cfg.schema.english.frequency.half_life = 0.0;
+        let mgr2 = EngineManager::new(&cfg, None);
+        let def = wind_store::freq::FreqProfile::default();
+        assert_eq!(
+            mgr2.english_freq_profile().half_life_hours,
+            def.half_life_hours,
+            "英文段为 0 应取内置默认，不得回落码表段"
+        );
+    }
+
+    /// 英文记账口径**对所有分支生效**——混输/码表方案下混进来的英文候选同样按它记账。
+    ///
+    /// 只在「当前是英文方案」时读这个字段的话，混输里的英文候选会静默回到默认口径，
+    /// 而读写两端口径不一致的后果是：写进去的词频记录，读的时候永远找不到。
+    #[test]
+    fn english_code_scope_applies_to_every_schema_kind() {
+        let mut cfg = Config::default();
+        cfg.schema.english.frequency.code_scope = "input".to_string();
+        // active 是码表方案（默认），英文候选仍应按 input 口径记账。
+        let mgr = EngineManager::new(&cfg, None);
+        assert!(
+            mgr.freq_settings().english_code_by_input,
+            "码表方案下英文候选也须按 schema.english 的口径"
+        );
+
+        // 反向对照：改回 candidate 时确实变 false，证明上面读的就是这个字段。
+        cfg.schema.english.frequency.code_scope = "candidate".to_string();
+        let mgr2 = EngineManager::new(&cfg, None);
+        assert!(!mgr2.freq_settings().english_code_by_input);
     }
 
     /// 词库路径解析的四级优先级。第三级（用户目录的 wdat 优先于安装目录）是关键：

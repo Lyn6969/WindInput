@@ -138,6 +138,10 @@ const RETIRED_KEYS: &[&[&str]] = &[
     // 从未被任何逻辑读取过，关掉不产生任何效果（曾被误当作快捷输入的总开关）。
     // 真正的「禁用快捷输入」＝把 quick_mix 的 trigger_keys 清空。
     &["schema", "quick_input", "enabled"],
+    // 随英文段独立迁至 `schema.english.frequency.code_scope`。**不做值迁移**：该键
+    // 从未随任何版本发布到用户手里（接进设置页的改动与本次迁移在同一个未发布版本内），
+    // 且新旧默认值都是 "candidate"，能读到它的只有开发期配置。
+    &["schema", "codetable", "frequency", "english_code_scope"],
 ];
 
 /// 从用户层删除 [`RETIRED_KEYS`] 里的退役键，返回删除数。
@@ -251,6 +255,9 @@ pub struct SchemaConfig {
     /// 全局混输配置（融合策略；全局唯一）。
     #[serde(default)]
     pub mix: MixGlobal,
+    /// 全局英文配置（英文方案自身的行为与调频；不再共用码表那套）。
+    #[serde(default)]
+    pub english: EnglishGlobal,
     /// 快捷输入（日期/计算等内置类方案）配置。将随"英文/快捷做成方案"一并重构。
     #[serde(default)]
     pub quick_input: QuickInputConfig,
@@ -272,9 +279,85 @@ impl Default for SchemaConfig {
             codetable: CodetableGlobal::default(),
             pinyin: PinyinGlobalConfig::default(),
             mix: MixGlobal::default(),
+            english: EnglishGlobal::default(),
             quick_input: QuickInputConfig::default(),
             special_modes: Vec::new(),
             mix_modes: default_mix_modes(),
+        }
+    }
+}
+
+/// 全局英文配置（[schema.english]）。
+///
+/// 英文自 0.114 起是可切换方案，行为不再挂靠码表段——那是历史包袱：英文引擎复用了
+/// 码表的重排路径，配置就顺手挂在了 `schema.codetable` 下，于是纯码表用户的「上屏行为」
+/// 里混着只对英文生效的项，而英文用户改调频策略又会连带改掉五笔的。
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
+pub struct EnglishGlobal {
+    #[serde(default)]
+    pub frequency: EnglishFrequency,
+    /// 空格上屏英文候选后**再补一个空格**。
+    ///
+    /// 英文是词间带空格的语言，连续打词时每次上屏都要多按一次空格。开启后由输入法补上。
+    #[serde(default)]
+    pub commit_space: bool,
+}
+
+/// 英文调频（[schema.english.frequency]）。
+///
+/// 不 derive `Eq`：`half_life` 是 f64。与 `CodetableFrequency` / `PinyinFrequency` 一致。
+///
+/// **没有 `protect_top_n*`**：那组是「简码位首选保护」，判据是本次输入的码长——英文
+/// 没有简码位这回事，一个 `a` 后面跟的是几万个词而不是钦定首选，照搬过来只会锁死
+/// 前几位不让调频。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct EnglishFrequency {
+    #[serde(default)]
+    pub enabled: bool,
+    /// `"top"` / `"step"` / `"position"`，默认 `"position"`。
+    ///
+    /// **与码表默认不同**：英文候选几乎全是前缀匹配，`top`/`step` 那种「用过一次即整体
+    /// 跳到没用过的那批之前」在这里过于激进——误选一次就把词顶到很显眼的位置且不衰减。
+    /// `position` 每次只前移一半、久不用会回落，更适合前缀为主的场景。
+    #[serde(default = "default_english_freq_strategy")]
+    pub strategy: String,
+    /// 前缀补全候选参与位置提升的范围；**仅 `strategy = "position"` 时生效**。
+    ///
+    /// 英文默认 `"all"`：它的候选**本来就几乎全是前缀补全**（打 `hel` 出 `hello`），
+    /// 收窄到 `single` 等于把调频关掉大半。
+    #[serde(default = "default_codetable_promote_prefix")]
+    pub promote_prefix: String,
+    /// 衰减半衰期（小时），`0` = 内置默认 72 小时；仅 `position` 策略生效。
+    #[serde(default)]
+    pub half_life: f64,
+    /// **词频记账码口径**（`"candidate"` / `"input"`，默认 `"candidate"`）。
+    ///
+    /// 原 `schema.codetable.frequency.english_code_scope`，随英文段独立迁到这里。
+    ///
+    /// | 取值 | 打 `hel` 选 `hello` 记成 | 之后打 `he` |
+    /// |---|---|---|
+    /// | `"candidate"`（默认） | `(hello, hello)` | **也受益**（跨码位共享） |
+    /// | `"input"` | `(hel, hello)` | 不受益（码位独立） |
+    ///
+    /// ⚠️ 本项**按候选来源生效，不按当前方案**——混输方案里混进来的英文候选同样读它。
+    /// 故 `EngineManager::freq_settings` 的**每个分支**都要从这里取值，不能只在
+    /// 「当前是英文方案」时读。
+    #[serde(default = "default_english_code_scope")]
+    pub code_scope: String,
+}
+
+fn default_english_freq_strategy() -> String {
+    "position".to_string()
+}
+
+impl Default for EnglishFrequency {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            strategy: default_english_freq_strategy(),
+            promote_prefix: default_codetable_promote_prefix(),
+            half_life: 0.0,
+            code_scope: default_english_code_scope(),
         }
     }
 }
@@ -458,23 +541,6 @@ pub struct CodetableFrequency {
     /// 配置层不可见时才是便利，一旦两端都有 GUI 就变成了陷阱。**
     #[serde(default)]
     pub half_life: f64,
-    /// **英文候选的词频记账码口径**（`"candidate"` / `"input"`，默认 `"candidate"`）。
-    ///
-    /// 内部配置，暂不进 GUI——英文该用哪种尚未定论，先留旋钮观察。
-    ///
-    /// | 取值 | 打 `hel` 选 `hello` 记成 | 之后打 `he` |
-    /// |---|---|---|
-    /// | `"candidate"`（默认） | `(hello, hello)` | **也受益**（跨码位共享） |
-    /// | `"input"` | `(hel, hello)` | 不受益（码位独立） |
-    ///
-    /// 英文几乎所有候选都是前缀匹配，跨码位共享看起来更合直觉（少打几个字母也能命中
-    /// 常用词）；但若用户希望「不同前缀各自独立学习」，`input` 更合适——这正是码表侧
-    /// 采用的口径（`d`/`de`/`def` 三个独立码位）。
-    ///
-    /// 放在码表段是因为英文引擎走的就是码表那条重排路径（`is_pinyin() == false`），
-    /// 其 `strategy`/`promote_prefix` 也读这里。
-    #[serde(default = "default_english_code_scope")]
-    pub english_code_scope: String,
 }
 
 fn default_english_code_scope() -> String {
@@ -507,8 +573,7 @@ impl Default for CodetableFrequency {
             protect_top_n_len3: 0,
             strategy: default_freq_strategy(),
             promote_prefix: default_codetable_promote_prefix(),
-            half_life: 0.0, // 0 = 回落到拼音段
-            english_code_scope: default_english_code_scope(),
+            half_life: 0.0, // 0 = 用内置默认 72 小时
         }
     }
 }
