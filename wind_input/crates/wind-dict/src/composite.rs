@@ -103,18 +103,26 @@ impl CompositeDict {
                     // 刻意为之（对齐 Go searchInternal：用户词不因低权重丢失码表词的自然排序位）。
                     // boundary 随 code 走：用户层的码只配用户层的边界（用户手输码恒 0 → 降级 DAG），
                     // 不可从系统层「借」一个边界过来。
-                    if cand.weight > results[idx].weight {
-                        results[idx].weight = cand.weight;
+                    let existing = &mut results[idx];
+                    if cand.weight > existing.weight {
+                        existing.weight = cand.weight;
                     }
+                    // 被丢弃这条所占的码位并入幸存者：跨层同 text 常有不同码（用户层手输码 vs
+                    // 系统层全码），丢掉即让「检索范围」过滤看不见该码位的常用性，见
+                    // `Candidate::merged_codes`。
+                    existing.absorb_codes_from(&cand);
                     // 前缀：保留最短码及其更早出现位置。
                     // boundary 描述的是 code 的音节切分，**必须与 code 同进同出**——换了码却留着
                     // 旧码的边界，会配出「A 层的 code + B 层的 boundary」这种自相矛盾的候选。
-                    if is_prefix && cand.code.len() < results[idx].code.len() {
-                        results[idx].code = cand.code.clone();
-                        results[idx].boundary = cand.boundary;
-                        if cand.natural_order < results[idx].natural_order {
-                            results[idx].natural_order = cand.natural_order;
+                    if is_prefix && cand.code.len() < existing.code.len() {
+                        let old_code = std::mem::replace(&mut existing.code, cand.code.clone());
+                        existing.boundary = cand.boundary;
+                        if cand.natural_order < existing.natural_order {
+                            existing.natural_order = cand.natural_order;
                         }
+                        // 让位给短码的旧码位转入 merged_codes；新主码则从中剔除（主码不重复记）。
+                        existing.absorb_code(&old_code);
+                        existing.merged_codes.retain(|c| c != &cand.code);
                     }
                     continue;
                 }

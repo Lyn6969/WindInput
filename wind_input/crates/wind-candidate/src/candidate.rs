@@ -60,6 +60,31 @@ pub struct Candidate {
     pub text: String,
     pub pinyin: String,
     pub code: String,
+    /// 本次检索中该文本**还占用过的其它码位**（同文本去重时，被丢弃那条的 `code` 并入此处）。
+    ///
+    /// **存在理由＝去重会破坏「检索范围」过滤的分组**。`filter_smart` 按 `(source, code)` 分组，
+    /// 组内有常用词则滤掉非常用词；而同一个字命中多个码位时只留一条，其余码位随之消失，
+    /// 于是「某码位下有常用字」这个事实在过滤之前就丢了——过滤结果因此**不单调**：
+    /// 打 `siv` 时「档」以简码命中（`code="siv"`），它在 `sivg` 的那条被去重丢弃，`sivg` 组只剩
+    /// 生僻的「桜」成了孤儿码而放行；打全 `sivg` 时「档」「桜」同组，「桜」才被滤掉。
+    /// **同一个字，打得越全反而越不出**。
+    ///
+    /// 本字段把被吃掉的码位留在幸存候选身上，使分组统计能还原词库真相。只有常用候选的
+    /// `merged_codes` 会被消费（非常用候选不遮蔽任何人），但累积是无条件的——`is_common`
+    /// 由协调器在更下游填，去重发生时还不知道谁常用。
+    ///
+    /// ⚠️ 新增按 text 去重的地方，若其结果会流向 `filter_candidates`，**必须**调用
+    /// [`Candidate::absorb_codes_from`] 并入，否则该处又会重新引入上述不单调
+    /// （编译器抓不到，现象只在特定码位组合下出现）。当前四处：跨词库层合并 `composite`、
+    /// 码表引擎 `convert` 的精确/前缀两循环、混输 `sort_dedup_truncate`、协调器 `build_candidates`。
+    ///
+    /// **反过来，这三类去重刻意不接**（并入会造出假的同码关系）：
+    /// - 跨**方案**合并（快捷输入 `handle_mode` 按 mix members 汇总）——不同方案的码不同域，
+    ///   而它们的 `source` 可能同为 `CodeTable`，守卫拦不住；该路径也不经过检索范围过滤；
+    /// - 现造候选（临英大小写变形等）`code` 恒空，无码位可言；
+    /// - 拼音模糊变体查询用的是 `LookupHit` 而非本类型，且同属一个 code 域。
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub merged_codes: Vec<String>,
     pub weight: i32,
     /// 词库**层级基序档位**（`[[dictionaries]].base_order`，默认 0）。排序时作为**独立层级**：
     /// weight 之后、natural_order 之前（见 `better`/`by_natural`）。小整数即可把整库排到另一库
@@ -252,6 +277,7 @@ impl Default for Candidate {
             text: String::new(),
             pinyin: String::new(),
             code: String::new(),
+            merged_codes: Vec::new(),
             weight: 0,
             base_order: 0,
             natural_order: 0,
@@ -285,6 +311,40 @@ impl Default for Candidate {
             id: String::new(),
             display_text: String::new(),
             actions: Vec::new(),
+        }
+    }
+}
+
+impl Candidate {
+    /// 按 text 去重时调用：把**被丢弃那条**所占的码位并入本候选（保留者吸收被弃者）。
+    ///
+    /// 语义见 [`Candidate::merged_codes`]。**必须传整个被弃候选而非它的 `code`**：被弃者自身
+    /// 可能已经吸收过更早的同文本条目，只取 `code` 会让那些码位在第二次去重时静默丢失
+    /// （去重是链式的：跨层合并 → 引擎层 → 协调器，同一个字可被连续吃掉三次）。
+    pub fn absorb_codes_from(&mut self, other: &Candidate) {
+        // ⚠️ **跨来源一律不并**。码表码与拼音码是两套编码体系，同一字符串在两边含义不同
+        // （混输下 "wang" 既是五笔码又是拼音）——`filter_smart` 正是按 `(source, code)` 分组
+        // 来隔离它们的。跨来源并入会给码表凭空造出一个「拼音码位有常用字」的假事实，
+        // 反过来误滤同码的码表生僻字，与本字段要修的 bug 恰好对称。
+        if self.source != other.source {
+            return;
+        }
+        self.absorb_code(&other.code);
+        for code in &other.merged_codes {
+            self.absorb_code(code);
+        }
+    }
+
+    /// 并入单个码位（与自身 `code` 相同或已记录则忽略）。
+    ///
+    /// 线性查重而非 `HashSet`：同一文本的命中码位实测个位数（一个字在码表里的简码 + 全码），
+    /// 而本函数在每次检索的去重循环里跑，`HashSet` 的分配开销反而占大头。
+    pub fn absorb_code(&mut self, code: &str) {
+        if code.is_empty() || code == self.code {
+            return;
+        }
+        if !self.merged_codes.iter().any(|c| c == code) {
+            self.merged_codes.push(code.to_string());
         }
     }
 }

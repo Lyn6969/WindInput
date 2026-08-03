@@ -354,8 +354,21 @@ impl MixedEngine {
                 .cmp(&a.weight)
                 .then(a.natural_order.cmp(&b.natural_order))
         });
-        let mut seen = std::collections::HashSet::new();
-        cands.retain(|c| seen.insert(c.text.clone()));
+        // 按 text 去重，并把被丢弃那条所占的码位并进幸存者（`Candidate::merged_codes`）：
+        // 否则「检索范围」过滤按 (source, code) 分组时会丢掉「该码位下有常用字」这一事实，
+        // 同一个字打前缀出、打全码反而不出。跨来源（码表 vs 拼音）由 `absorb_codes_from`
+        // 自行挡掉——两套编码不同域，并入会造出假的同码关系。
+        let mut seen: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+        let mut deduped: Vec<Candidate> = Vec::with_capacity(cands.len());
+        for c in std::mem::take(cands) {
+            if let Some(&idx) = seen.get(&c.text) {
+                deduped[idx].absorb_codes_from(&c);
+                continue;
+            }
+            seen.insert(c.text.clone(), deduped.len());
+            deduped.push(c);
+        }
+        *cands = deduped;
         Self::truncate_with_pinyin_quota(cands, max_candidates);
     }
 

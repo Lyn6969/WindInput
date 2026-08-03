@@ -62,11 +62,19 @@ fn filter_smart(candidates: Vec<Candidate>) -> Vec<Candidate> {
     // 按来源隔离后，码表候选只受同来源候选影响，混输码表与纯五笔一致。
     let mut has_common: HashMap<(CandidateSource, String), bool> = HashMap::new();
     for c in &candidates {
-        let entry = has_common
+        // 先建组（哪怕非常用），使「该码位下无常用词」与「该码位没出现过」区分开。
+        has_common
             .entry((c.source, c.code.clone()))
             .or_insert(false);
-        if c.is_common || c.is_phrase || c.is_command || c.is_group {
-            *entry = true;
+        if !(c.is_common || c.is_phrase || c.is_command || c.is_group) {
+            continue;
+        }
+        has_common.insert((c.source, c.code.clone()), true);
+        // 去重吃掉的同文本码位一并遮蔽（见 `Candidate::merged_codes`）：「档」以简码 siv 命中时，
+        // 它在 sivg 的那条已被去重丢弃，若不还原这层归属，sivg 组只剩生僻的「桜」而当孤儿码
+        // 放行 —— 同一个字打 siv 出、打全 sivg 反而不出。非常用候选无需还原：它不遮蔽任何人。
+        for code in &c.merged_codes {
+            has_common.insert((c.source, code.clone()), true);
         }
     }
 
@@ -144,6 +152,86 @@ mod tests {
         assert_eq!(FilterMode::Smart.as_config(), "smart");
         assert_eq!(FilterMode::General.as_config(), "general");
         assert_eq!(FilterMode::Gb18030.as_config(), "gb18030");
+    }
+
+    /// 回归：同一个字「打前缀出得来、打全码反而没了」。
+    ///
+    /// 现场＝五笔 `桜`(sivg)。词库里 `sivg` 码位下还有常用字「档」，而「档」另有简码 `siv`：
+    /// 打 `siv` 时「档」以 code="siv" 入列、它在 sivg 的那条被去重丢弃 → sivg 组只剩「桜」
+    /// 成孤儿码而放行；打全 `sivg` 时两者同组 → 「桜」被滤。**过滤结果因此不单调**。
+    /// 修法是让去重把被弃条目的码位并进幸存者（`merged_codes`），两种输入下遮蔽关系一致。
+    #[test]
+    fn smart_filters_uncommon_when_common_shares_code_via_merged() {
+        // 打 siv：「档」主码 siv，被去重吃掉的 sivg 记在 merged_codes
+        let mut dang = cand("档", "siv", CandidateSource::CodeTable, true);
+        dang.merged_codes = vec!["sivg".into()];
+        let out = filter_candidates(
+            vec![dang, cand("桜", "sivg", CandidateSource::CodeTable, false)],
+            FilterMode::Smart,
+        );
+        assert!(
+            !out.iter().any(|c| c.text == "桜"),
+            "sivg 码位有常用字「档」（经 merged_codes 还原），生僻的「桜」应与打全码时一样被滤"
+        );
+        assert!(out.iter().any(|c| c.text == "档"));
+    }
+
+    /// ★ 反向对照：`merged_codes` 只还原**真实存在**的同码位关系，不得无差别扩大过滤。
+    ///
+    /// 没有这条，上面那个测试同样能被「有常用字就滤掉所有生僻字」的错误实现通过 ——
+    /// 那会让 `sivs` 的「樑」等孤儿码字跟着陪葬。
+    #[test]
+    fn smart_keeps_uncommon_when_common_does_not_share_its_code() {
+        // 「档」只占 siv/sivg，与「樑」的 sivs 无关 → 樑 仍是孤儿码，须保留
+        let mut dang = cand("档", "siv", CandidateSource::CodeTable, true);
+        dang.merged_codes = vec!["sivg".into()];
+        let out = filter_candidates(
+            vec![dang, cand("樑", "sivs", CandidateSource::CodeTable, false)],
+            FilterMode::Smart,
+        );
+        assert!(
+            out.iter().any(|c| c.text == "樑"),
+            "sivs 下无常用字，孤儿码生僻字不该被别的码位牵连滤掉"
+        );
+    }
+
+    /// 归并的**传递性**：去重是链式的（跨层 → 引擎层 → 协调器），同一个字可被连续吃三次。
+    /// 若 `absorb` 只取对方的 `code`、不取对方已归并的码位，中间那次的码位会静默丢失。
+    #[test]
+    fn absorb_codes_is_transitive() {
+        let mut a = cand("档", "siv", CandidateSource::CodeTable, true);
+        let mut b = cand("档", "sivg", CandidateSource::CodeTable, true);
+        b.absorb_code("sivx"); // b 早先吃掉过 sivx
+        a.absorb_codes_from(&b);
+        assert!(a.merged_codes.contains(&"sivg".to_string()), "对方主码");
+        assert!(
+            a.merged_codes.contains(&"sivx".to_string()),
+            "对方已归并的码位不能丢"
+        );
+        // 自身主码不重复记，重复归并幂等
+        a.absorb_codes_from(&b);
+        assert!(!a.merged_codes.contains(&"siv".to_string()));
+        assert_eq!(a.merged_codes.len(), 2, "重复归并应幂等");
+    }
+
+    /// ★ 跨来源**不得**归并码位：与 `smart_keeps_uncommon_codetable_when_common_pinyin_shares_code`
+    /// 同一条约束的另一端。混输下 "wang" 既是五笔码又是拼音码，属两套编码体系；若去重时把
+    /// 拼音码并进码表候选，`(CodeTable, "wang")` 会被凭空标记为「有常用字」，反过来误滤同码的
+    /// 码表生僻字——恰好是 `merged_codes` 要修的 bug 的对称形态。
+    #[test]
+    fn absorb_ignores_cross_source_codes() {
+        let mut ct = cand("档", "sivg", CandidateSource::CodeTable, true);
+        let py = cand("档", "dang", CandidateSource::Pinyin, true);
+        ct.absorb_codes_from(&py);
+        assert!(
+            ct.merged_codes.is_empty(),
+            "拼音码不得并入码表候选，实际: {:?}",
+            ct.merged_codes
+        );
+        // 同来源仍照常归并（守卫不能把主逻辑一起挡掉）
+        let same = cand("档", "siv", CandidateSource::CodeTable, true);
+        ct.absorb_codes_from(&same);
+        assert_eq!(ct.merged_codes, vec!["siv".to_string()]);
     }
 
     #[test]

@@ -722,8 +722,20 @@ impl Coordinator {
         // （见 `mark_common` 与 `wind_candidate::is_pinyin_exact_tier`）。过滤仍在下面按模式进行。
         self.mark_common(&mut candidates);
         candidates.sort_by(|a, b| candidate_display_order(a, b, ignore_weight, mixed, input_len));
-        let mut seen = std::collections::HashSet::new();
-        candidates.retain(|c| seen.insert(c.text.clone()));
+        // 按 text 去重。**不能用 `retain` + `HashSet`**：被丢弃那条所占的码位要并进幸存者，
+        // 否则下一步的检索范围过滤按 (source, code) 分组时会丢掉「该码位下有常用字」这一事实
+        // ——同一个字打前缀出、打全码反而不出（见 `Candidate::merged_codes`）。
+        let mut seen: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+        let mut deduped: Vec<Candidate> = Vec::with_capacity(candidates.len());
+        for c in std::mem::take(&mut candidates) {
+            if let Some(&idx) = seen.get(&c.text) {
+                deduped[idx].absorb_codes_from(&c);
+                continue;
+            }
+            seen.insert(c.text.clone(), deduped.len());
+            deduped.push(c);
+        }
+        candidates = deduped;
         // 检索范围过滤（按模式裁剪；is_common 已由上面的 mark_common 填好）
         self.apply_filter(state, &mut candidates);
         // 用户词频重排（独立维度，used-first，绝不改 weight；frequency.md §3）

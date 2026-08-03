@@ -6,7 +6,7 @@
 //! 候选生成：精确匹配 + 前缀匹配。运行时词频/shadow 不在此（见 frequency.md / dict.md）。
 
 use crate::engine::{ConvertResult, Engine, EngineType, ExtendedEngine};
-use std::collections::HashSet;
+use std::collections::HashMap;
 use std::sync::Arc;
 use wind_candidate::{Candidate, CandidateSource, better, by_natural, cmp_exact_first};
 use wind_dict::DictManager;
@@ -168,29 +168,44 @@ impl Engine for CodeTableEngine {
 
         let limit = max_candidates.max(50);
         let mut candidates: Vec<Candidate> = Vec::new();
-        let mut seen: HashSet<String> = HashSet::new();
+        // text -> 已入列候选的下标。**不能退回 `HashSet`**：同文本重复命中时要把被丢弃那条
+        // 的码位并进幸存者（`absorb_codes_from`），否则「检索范围」过滤按 (source, code) 分组
+        // 时会丢掉「该码位下有常用字」这一事实，见 `Candidate::merged_codes`。
+        let mut seen: HashMap<String, usize> = HashMap::new();
 
         // 精确匹配优先（完整编码）
         for mut c in self.dm.search(input, limit) {
-            if seen.insert(c.text.clone()) {
-                c.source = CandidateSource::CodeTable;
-                // 精确层级随候选流动，供协调器重排时沿用（见 `cmp_exact_first`）。
-                c.is_exact_code = c.code == input;
-                candidates.push(c);
+            // ⚠️ source 必须**先于** `absorb_codes_from` 赋值：该方法跨来源直接 return，
+            // 而 `dm` 返回的候选 source 还是 `None`，晚一步赋值会让归并静默失效。
+            c.source = CandidateSource::CodeTable;
+            if let Some(&idx) = seen.get(&c.text) {
+                candidates[idx].absorb_codes_from(&c);
+                continue;
             }
+            seen.insert(c.text.clone(), candidates.len());
+            // 精确层级随候选流动，供协调器重排时沿用（见 `cmp_exact_first`）。
+            c.is_exact_code = c.code == input;
+            candidates.push(c);
         }
 
         // 前缀匹配补充（精确匹配模式下跳过）
         let mut completion_hint: Option<Candidate> = None;
         if !self.opts.single_code_input {
             for mut c in self.dm.search_prefix(input, limit) {
-                if seen.insert(c.text.clone()) {
-                    c.source = CandidateSource::CodeTable;
-                    // 前缀扫描也会命中输入自身（"usr".starts_with("usr")）。正常情况该条已被
-                    // 上面的精确循环占位去重，此处按 code 判定只为不依赖循环先后顺序。
-                    c.is_exact_code = c.code == input;
-                    candidates.push(c);
+                // source 须先于 absorb 赋值，理由同上面的精确循环。
+                c.source = CandidateSource::CodeTable;
+                if let Some(&idx) = seen.get(&c.text) {
+                    // 简码字在此被吃掉：打 `siv` 时「档」已由精确循环以 code="siv" 入列，
+                    // 这条 code="sivg" 的同字条目被丢弃 —— 但 sivg 码位确实被一个常用字占着，
+                    // 该事实必须留给「检索范围」过滤，否则同码位的生僻字（桜）会当孤儿码放行。
+                    candidates[idx].absorb_codes_from(&c);
+                    continue;
                 }
+                seen.insert(c.text.clone(), candidates.len());
+                // 前缀扫描也会命中输入自身（"usr".starts_with("usr")）。正常情况该条已被
+                // 上面的精确循环占位去重，此处按 code 判定只为不依赖循环先后顺序。
+                c.is_exact_code = c.code == input;
+                candidates.push(c);
             }
         } else if self.opts.single_code_complete
             && candidates.is_empty()

@@ -449,7 +449,7 @@ should_clear = ct_should_clear && !(auto_commit_block_on_pinyin && (has_pinyin |
      （Fuzzy＜子短语＜前缀补全＜完整匹配：与 PinyinEngine 内部排序一致。缺 `is_partial` 时混输 ÷100
      压缩权重后，高权重子串单字会靠 weight 反超低权重精确词组——如 `pingtan` 在混输下
      平(w=58 part=true)＞平摊(w=4 part=false)，前者插到词组前）
-④ 按 text 去重（HashSet 保留首个）
+④ 按 text 去重（保留首个）+ **把被弃条目所占码位并入幸存者**（merged_codes，见 §8.1.2）
 ⑤ apply_filter：填充 is_common（常用字表；短语豁免，判定作用域见 §8.1.1）→ wind_candidate::filter_candidates
 ⑥ apply_freq_rerank：用户词频重排（独立维度，绝不改 weight）
 ⑦ apply_shadow：shadow 规则删除过滤 + 置顶/移动重排（优先级最高，排序后应用）
@@ -493,6 +493,36 @@ should_clear = ct_should_clear && !(auto_commit_block_on_pinyin && (has_pinyin |
 > `c.is_common = c.meta.is_user_dict || self.common_chars.is_string_common(&c.text)`。
 > **豁免范围须止于 `is_user_dict`**：`is_temp_dict` 是码表自动造词的产物（连续单字+终止符
 > 自动成词，杂词率高），一并豁免等于让自动造出的杂词绕过这层过滤，而那正是它该管的。
+
+#### 8.1.2 分组键的完整性：去重不得吃掉码位（`Candidate::merged_codes`）
+
+分组按 `code`，但**去重跑在过滤之前**，会把同一个字在别的码位上的条目整条丢掉——那个码位
+的常用性归属随之消失，过滤结果因此**不单调**：
+
+- 五笔「桜」(sivg)：`sivg` 码位下另有常用字「档」，而「档」还有简码 `siv`；
+- 打 `siv` → 「档」以 `code="siv"` 入列，它在 `sivg` 的那条被去重丢弃 → `sivg` 组只剩「桜」
+  成孤儿码而**放行**；
+- 打全 `sivg` → 「档」「桜」同组 → 「桜」被滤。**同一个字，打得越全反而越不出**。
+
+修法：去重时调用 `absorb_codes_from`，把被弃条目的 `code`（及它自己早先归并的码位——去重是
+链式的）并入幸存者的 `merged_codes`；`filter_smart` 统计时，常用候选同时遮蔽自身 code 与
+merged_codes。**当前四个归并点**：`composite::merge_search`（跨词库层）、`CodeTableEngine::convert`
+的精确/前缀两循环、`MixedEngine::sort_dedup_truncate`、协调器 `build_candidates`。
+
+两条边界：
+
+- **跨来源一律不并**（`absorb_codes_from` 内置守卫）：码表码与拼音码不同域，混输下 "wang"
+  两边都合法；并入会给码表凭空造出「该码位有常用字」的假事实，误滤同码的码表生僻字——
+  正是 §8.1 按来源分组所要避免的那个缺陷的对称形态。
+- **跨方案合并不接**（快捷输入 `handle_mode` 按 mix members 汇总）：不同方案的码同样不同域，
+  而它们的 `source` 可能同为 `CodeTable`，守卫拦不住；该路径本身也不经过检索范围过滤。
+
+⚠️ `CodeTableEngine::convert` 里 `source` 必须**先于** `absorb_codes_from` 赋值——守卫跨来源
+直接 return，而 `dm` 返回的候选 `source` 尚为 `None`，晚一步赋值会让归并**静默失效**。
+
+> 本次只统一了行为，**未改变智能档的产品语义**：「桜」这类唯一编码被常用字占着的生僻字，
+> 在智能档下仍然打不出，需切「全部字符」(`gb18030`) 档。放宽规则（如全码精确命中豁免过滤）
+> 属后续优化，且须先清理词库里残留的 79 条 PUA 垃圾条目——它们目前正靠 is_common=false 被挡着。
 
 ### 8.2 词频重排（freq_rerank.rs，两策略）
 
