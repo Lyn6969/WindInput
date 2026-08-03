@@ -346,6 +346,16 @@ impl Coordinator {
         state: &mut State,
         data: &KeyEventData,
     ) -> KeyAction {
+        // Ctrl/Alt 组合守卫（见 `overlay_ctrl_alt_guard`）：必须最先，否则组合键会落到
+        // 下方各臂被当成普通输入。临拼有逐步转换的已转换前缀，故 committed_text 也算待输入。
+        if let Some(act) = self.overlay_ctrl_alt_guard(
+            state,
+            data,
+            !state.temp_pinyin_buffer.is_empty() || !state.committed_text.is_empty(),
+            |s, st| s.exit_temp_pinyin(st),
+        ) {
+            return act;
+        }
         if let Some(act) = self.handle_candidate_nav(state, data) {
             return act;
         }
@@ -540,6 +550,8 @@ impl Coordinator {
                 self.notify_ui_hide();
                 Self::commit_action(format!("{}{}", head, tail), true)
             }
+            // 守卫条件在入口的 `overlay_ctrl_alt_guard` 之后已恒真（Ctrl/Alt 组合到不了这里），
+            // 保留作纵深防御。它曾是**全仓唯一**一处模式内 Ctrl 判定，而且只护住了这一条臂。
             keymap::VK_A..=keymap::VK_Z if data.modifiers & (MOD_CTRL | MOD_ALT) == 0 => {
                 // 字母累积拼音
                 let ch = (b'a' + (data.key_code - 0x41) as u8) as char;
@@ -700,6 +712,18 @@ impl Coordinator {
                 Self::commit_action(text, true)
             }
         };
+        // Ctrl/Alt 组合守卫（见 `overlay_ctrl_alt_guard`）：必须最先。临英是独占模式、
+        // 无分段 committed，待输入内容只看自己的缓冲。
+        // 临英此前**一处 Ctrl/Alt 判定都没有**：`Ctrl+E` 落字母臂当字面 e 入缓冲、
+        // `Ctrl+1` 落数字臂当选词键、`Ctrl+,` 落标点臂顶屏候选并退出。
+        if let Some(act) = self.overlay_ctrl_alt_guard(
+            state,
+            data,
+            !state.temp_english_buffer.is_empty(),
+            |s, st| s.exit_temp_english(st),
+        ) {
+            return act;
+        }
         if let Some(act) = self.handle_candidate_nav(state, data) {
             return act;
         }

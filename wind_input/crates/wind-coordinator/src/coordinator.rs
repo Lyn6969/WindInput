@@ -10,6 +10,7 @@
 //!
 //! 候选生成委托给 [`EngineManager`]，运行时词频 boost + 最终排序在本层应用。
 
+use crate::handle_mode::MixLens;
 use crate::pipeline::{ModeKind, Rewind};
 use crate::preedit_cursor;
 use crate::theme_style::ThemeStyle;
@@ -504,9 +505,6 @@ pub(crate) struct State {
     pub(crate) mix_prefix: String,
     /// 当前 mix 模式下标（= features.mix_modes 索引；仅 active==Mix 时有效）
     pub(crate) mix_id: u8,
-    /// mix 数字模式（仅含表达式类快捷来源时有效）：首字符数字/符号 → true（表达式：数字/符号
-    /// 输入、字母选词）；首字符字母 → false（拼音/英文：字母输入、数字选词）。
-    pub(crate) mix_numeric: bool,
     /// 当前候选区是「重复上屏」候选（成员 `quick_input.repeat`，空缓冲时注入上次上屏内容）。
     ///
     /// 该候选没有对应编码，只能整体上屏：选词记录、造词、标点顶屏三条路径据此绕开它。
@@ -1374,7 +1372,6 @@ impl Coordinator {
                 mix_cursor: 0,
                 mix_id: 0,
                 mix_prefix: String::new(),
-                mix_numeric: false,
                 mix_repeat: false,
                 caret_x: 0,
                 caret_y: 0,
@@ -2736,8 +2733,14 @@ impl Coordinator {
         let t_nu = std::time::Instant::now();
         // 仅推送当前页候选（窗口按 1..N 编号，翻页后重新编号）
         let (start, end) = self.page_range(state);
-        // 数字键需录入表达式的场景用字母标签（a/b/c）选词：mix 的数字模式（含 quick_input 成员）。
-        let alpha = matches!(state.active, Some(ModeKind::Mix(_))) && state.mix_numeric;
+        // 候选序号标签有**三种**归属，旧实现是个 bool 只装得下前两种：
+        //  - 数字透镜：数字键正在录表达式 → 选词改用字母标签 a/b/c
+        //  - 自由输入：字母与数字**都是**字面输入，没有任何键能按序号选 → 干脆不画序号
+        //    （画了就是骗人——用户会去按那个数字，结果把数字打进缓冲）
+        //  - 其余：正常序号
+        let mix_lens = matches!(state.active, Some(ModeKind::Mix(_))).then(|| self.mix_lens(state));
+        let alpha = mix_lens == Some(MixLens::Numeric);
+        let hide_index = mix_lens == Some(MixLens::Free);
         // 悬停提示/候选微调配置（热重载快照）
         let rt = self.rt();
         let cand_cfg = &rt.config.ui.candidate;
@@ -2849,7 +2852,7 @@ impl Coordinator {
                     },
                     tooltip,
                     comment,
-                    no_index: false,
+                    no_index: hide_index,
                 }
             })
             .collect();

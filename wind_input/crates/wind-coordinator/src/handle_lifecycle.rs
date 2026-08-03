@@ -252,7 +252,6 @@ impl Coordinator {
         state.special_cursor = 0;
         state.mix_buffer.clear();
         state.mix_cursor = 0;
-        state.mix_numeric = false;
         // 清理可能残留的组合显示（临时拼音/快捷输入会产生候选与 preedit）
         state.input_buffer.clear();
         state.input_cursor_pos = 0;

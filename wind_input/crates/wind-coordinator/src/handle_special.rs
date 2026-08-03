@@ -238,6 +238,15 @@ impl Coordinator {
 
     /// 特殊模式按键处理：编码累积 + 候选选择 + 三档自动上屏；空格选高亮、回车上屏编码原文。
     pub(crate) fn handle_special_key(&self, state: &mut State, data: &KeyEventData) -> KeyAction {
+        // Ctrl/Alt 组合守卫（见 `overlay_ctrl_alt_guard`）：必须最先，否则组合键会落到
+        // 下方各臂被当成编码输入。
+        if let Some(act) =
+            self.overlay_ctrl_alt_guard(state, data, !state.special_buffer.is_empty(), |s, st| {
+                s.exit_special_mode(st)
+            })
+        {
+            return act;
+        }
         if let Some(act) = self.handle_candidate_nav(state, data) {
             return act;
         }

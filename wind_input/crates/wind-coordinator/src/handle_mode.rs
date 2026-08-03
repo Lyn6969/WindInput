@@ -15,8 +15,57 @@ use wind_ui::manager::UiCommand;
 use crate::coordinator::{numpad_char, printable_char, punct_char};
 use wind_bridge::handler::KeyEventData;
 use wind_candidate::Candidate;
-use wind_ipc::protocol::MOD_SHIFT;
+use wind_config::config::FreeInputMode;
+use wind_ipc::protocol::{MOD_ALT, MOD_CTRL, MOD_SHIFT};
 use wind_keys::keymap;
+
+/// mix 模式的**输入透镜**：同一个融合模式里，按键语义由当前缓冲内容决定。
+///
+/// - [`Text`](MixLens::Text)：首字符是字母 —— 字母入缓冲、数字选词、`-`/`=` 翻页
+///   （拼音 / 英文 / 码表成员）
+/// - [`Numeric`](MixLens::Numeric)：首字符是数字或符号 —— 数字与运算符入缓冲、字母选词
+///   （计算 / 日期 / 金额成员）
+/// - [`Free`](MixLens::Free)：缓冲里出现了**当前透镜接受不了的字符** —— 一切可打印键
+///   字面入缓冲，用来打 `GetTestData()` / `test_data` / `<TAB>` 这类内容
+///
+/// # 为什么是缓冲的纯函数，而不是一个状态位
+///
+/// `Free` 没有切换键（mix 里挑不出真正空闲的可打印键），因此也就没有可解释的
+/// 状态清除时机。由缓冲推导则退格删掉越界字符即自然回到原透镜，所见即所得。
+///
+/// 旧实现是 `State::mix_numeric: bool` 的粘滞位（只在首字符时写一次）。一个布尔
+/// 装不下三种语义，而且它同时被用来决定「候选序号标签用字母还是数字」——一个变量
+/// 承担两个语义，加第三态时两边对边缘输入的期望正好相反。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum MixLens {
+    Text,
+    Numeric,
+    Free,
+}
+
+impl MixLens {
+    /// 本透镜能否把 `c` 当作**编码**接受。越界即说明它不可能是编码，只能是字面内容。
+    ///
+    /// 这是 [`Coordinator::mix_lens`] 与按键分派的**单一真相源**：实际写进缓冲的字符
+    /// 必须与本函数一致，否则透镜会在两个取值之间震荡（插入 → 判越界 → 回退 → 再插入）。
+    fn accepts(self, c: char) -> bool {
+        match self {
+            // 文本透镜的缓冲只可能由 ① 的 `VK_A..=VK_Z` 小写字母构成——拼音的手动音节
+            // 分隔符走主输入路径，不进 mix 缓冲（`handle_mix_key` 里没有分隔符分支）。
+            MixLens::Text => c.is_ascii_lowercase(),
+            // 数字透镜 = 求值器的表达式字符集（共用 `wind_quick_input::is_expr_char`，
+            // 不另写一份，否则给求值器加运算符时这里会静默落后）。
+            MixLens::Numeric => wind_quick_input::is_expr_char(c),
+            MixLens::Free => true,
+        }
+    }
+
+    /// 候选是否**整体上屏**（而非拼音那种分步确认消费前缀）。
+    /// 数字透镜的结果与自由输入的原文都没有可分段的编码。
+    pub(crate) fn commits_whole(self) -> bool {
+        !matches!(self, MixLens::Text)
+    }
+}
 
 impl Coordinator {
     /// 当前是否处于临时拼音模式（测试/诊断用）。
@@ -144,6 +193,89 @@ impl Coordinator {
             .unwrap_or(false)
     }
 
+    /// 本 mix 实例的自由输入设置（实例缺失时按 `Off`——没有实例就没有自由输入可言）。
+    pub(crate) fn mix_free_input(&self, idx: u8) -> FreeInputMode {
+        self.rt()
+            .config
+            .schema
+            .mix_modes
+            .get(idx as usize)
+            .map(|m| m.free_input)
+            .unwrap_or(FreeInputMode::Off)
+    }
+
+    /// mix 的导航分派是否把**可打印键**（`page_keys` 里的 `minus_equal` / `comma_period` /
+    /// `brackets` 等键组）算作翻页键。
+    ///
+    /// 自由输入开启时一律否：那些键必须留给字面输入，否则 `all-in-one` 的 `-` 会被吃成
+    /// 翻页。翻页职责转给 PageUp/PageDown。
+    ///
+    /// **单一真相源**：`handle_mix_key` 的直接调用与 `handle_candidate_nav` 的 Mix 分支
+    /// 都问这里。此前两处各写一份且**取值相反**（前者硬编 `true`，后者写
+    /// `!mix_has_quick_numeric`），只因后者对 mix 根本不可达才没暴露出来。
+    pub(crate) fn mix_nav_include_printable(&self, idx: u8) -> bool {
+        self.mix_free_input(idx) == FreeInputMode::Off
+    }
+
+    /// 当前 mix 缓冲对应的输入透镜 —— **缓冲的纯函数**，见 [`MixLens`]。
+    ///
+    /// 判据顺序刻意如此：
+    /// 1. `Always` 直接给 `Free`（专做字面输入的实例，连基线透镜都不必算）；
+    /// 2. 基线透镜按**首字符**二分，与旧 `mix_numeric` 的取值完全一致（零回归）；
+    /// 3. `Off` 到此为止 —— 该实例上的一切维持既有行为；
+    /// 4. `Auto` 才检查越界：缓冲里只要有一个字符基线透镜接受不了，整个缓冲就只能是字面。
+    pub(crate) fn mix_lens(&self, state: &State) -> MixLens {
+        let free = self.mix_free_input(state.mix_id);
+        if free == FreeInputMode::Always {
+            return MixLens::Free;
+        }
+        // 首字符非字母且本 mix 含表达式类来源 → 数字透镜；其余一律文本透镜。
+        // （没有表达式类成员时数字键是选词键，不该开数字透镜——见 mix_has_quick_numeric。）
+        let base = match state.mix_buffer.chars().next() {
+            Some(c) if !c.is_ascii_alphabetic() && self.mix_has_quick_numeric(state.mix_id) => {
+                MixLens::Numeric
+            }
+            _ => MixLens::Text,
+        };
+        if free == FreeInputMode::Off {
+            return base;
+        }
+        if state.mix_buffer.chars().any(|c| !base.accepts(c)) {
+            MixLens::Free
+        } else {
+            base
+        }
+    }
+
+    /// **本键**应按哪个透镜分派。
+    ///
+    /// 缓冲非空时就是 [`Self::mix_lens`]；**缓冲为空时透镜由这一键自己决定**——非字母的
+    /// 可打印键（含小键盘）开数字透镜，字母开文本透镜。
+    ///
+    /// 这一层不能省：`mix_lens` 是缓冲的纯函数，而空缓冲里没有任何字符可供判断，它只能
+    /// 给出文本透镜。若首键直接拿它去分派，`;1+2` 的 `1` 会落到文本透镜的「数字键选词」
+    /// 分支被吞掉，缓冲变成 `+2`（改造过程中实测到的回归，7 个既有测试同时红）。
+    /// 旧的 `mix_numeric` 正是在首字符处写一次状态位，这里把那次判定原样保留，只是不再存。
+    fn mix_lens_for_key(&self, state: &State, data: &KeyEventData, shift: bool) -> MixLens {
+        if !state.mix_buffer.is_empty() {
+            return self.mix_lens(state);
+        }
+        if self.mix_free_input(state.mix_id) == FreeInputMode::Always {
+            return MixLens::Free;
+        }
+        let is_letter = (keymap::VK_A..=keymap::VK_Z).contains(&data.key_code);
+        // 主键盘可打印字符或小键盘键均可开数字透镜，使小键盘也能录快捷输入表达式。
+        if self.mix_has_quick_numeric(state.mix_id)
+            && !is_letter
+            && (printable_char(data.key_code, shift).is_some()
+                || numpad_char(data.key_code).is_some())
+        {
+            MixLens::Numeric
+        } else {
+            MixLens::Text
+        }
+    }
+
     /// 进入 mix 模式（至少一个成员方案可加载，由激活点保证）。
     pub(crate) fn enter_mix_mode(&self, state: &mut State, idx: u8, key_code: u32) -> KeyAction {
         state.input_buffer.clear();
@@ -152,7 +284,7 @@ impl Coordinator {
         state.mix_id = idx;
         state.mix_buffer.clear();
         state.mix_cursor = 0;
-        state.mix_numeric = false; // 由首字符（数字/字母）决定
+        // 透镜不再有状态位：由 `mix_lens(state)` 按缓冲实时推导（清空缓冲即回到基线）。
         // 显示态前缀（进入键符号，如 ";"）：只显示不消费，让用户看到按下的键。
         state.mix_prefix = keymap::vk_to_prefix_char(key_code)
             .map(|c| c.to_string())
@@ -525,14 +657,22 @@ impl Coordinator {
             ModeKind::TempEnglish => Some(("临时英文".to_string(), "英".to_string())),
             ModeKind::Url => Some(("网址输入".to_string(), "网址".to_string())),
             ModeKind::Mix(i) => {
-                let rt = self.rt();
-                let m = rt.config.schema.mix_modes.get(i as usize)?;
-                let full = if m.name.is_empty() {
-                    "快捷".to_string()
-                } else {
-                    m.name.clone()
+                let (full, short) = {
+                    let rt = self.rt();
+                    let m = rt.config.schema.mix_modes.get(i as usize)?;
+                    let full = if m.name.is_empty() {
+                        "快捷".to_string()
+                    } else {
+                        m.name.clone()
+                    };
+                    let short = Self::short_or_first(&m.short_name, &full);
+                    (full, short)
                 };
-                let short = Self::short_or_first(&m.short_name, &full);
+                // 自由输入必须在指示上可见：这个透镜下数字键不选词、标点不顶屏，用户若不知道
+                // 自己已经切进来，「为什么按 1 没选词」就无从解释。
+                if self.mix_lens(state) == MixLens::Free {
+                    return Some((format!("{}·自由", full), "字".to_string()));
+                }
                 Some((full, short))
             }
             ModeKind::Special(i) => {
@@ -704,7 +844,9 @@ impl Coordinator {
         {
             return act;
         }
-        let numeric = self.mix_has_quick_numeric(state.mix_id) && state.mix_numeric;
+        // 整体上屏 vs 分步确认的**真正判据**——数字透镜的计算结果与自由输入的原文都没有
+        // 可分段消费的编码，只有文本透镜（拼音/英文/码表）才做前缀分步确认。
+        let numeric = self.mix_lens(state).commits_whole();
         let total = state.mix_buffer.len();
         let consumed = cand.consumed_length;
         let partial = !numeric
@@ -809,7 +951,21 @@ impl Coordinator {
             self.inject_mix_repeat_candidate(state);
             return;
         }
-        let numeric = self.mix_has_quick_numeric(state.mix_id) && state.mix_numeric;
+        let lens = self.mix_lens(state);
+        if lens == MixLens::Free {
+            // 自由输入：缓冲不是任何成员的合法编码，查谁都只会得到噪声。唯一候选＝所打原文，
+            // 保证「打什么上屏什么」。**不做全角转换**——与 mix 既有上屏路径保持一致
+            // （临英会转，两者是否对齐是独立待定项，不在本次改动范围内）。
+            //
+            // 刻意**不走 `finalize_candidates`**：那是词库候选里 `$AA`/`$CC` 特殊语法的展开点，
+            // 而自由输入的文本是用户逐键打进来的字面内容——打了 `$AA` 就该出 `$AA`。
+            state.candidates = vec![Candidate {
+                text: state.mix_buffer.clone(),
+                ..Default::default()
+            }];
+            return;
+        }
+        let numeric = lens == MixLens::Numeric;
         let members = self.mix_members_resolved(state.mix_id);
         let mut cands: Vec<Candidate> = Vec::new();
         let mut seen = std::collections::HashSet::new();
@@ -917,11 +1073,60 @@ impl Coordinator {
         }
     }
 
+    /// overlay 模式的 **Ctrl/Alt 组合守卫**。
+    ///
+    /// 走到模式处理器的 Ctrl/Alt 组合**必定不是热键**——全局热键与 Ctrl+数字 候选操作
+    /// （置顶/删除）都在单点分派之前就匹配完了（见 `handle_key_event` 的顺序）。剩下的
+    /// 只可能是宿主自己的快捷键（Ctrl+A / Ctrl+C / Ctrl+V…）。
+    ///
+    /// mix 此前没有这道守卫：`Ctrl+E` 会被 ① 的字母臂当成字面 `e` 插进缓冲——用户想按
+    /// 宿主快捷键，实得组合区凭空多一个字符。自由输入让 ① 收下的键更多（一切可打印键），
+    /// 不补这道守卫的话，`Ctrl+分号`、`Ctrl+减号` 之类也会一并变成字面输入。
+    ///
+    /// 语义对齐主输入路径：有待输入内容则放弃整段组合并隐藏候选窗，空缓冲则透传给宿主。
+    ///
+    /// # ⚠️ 想加「候选窗显示时生效的快捷键」，加在上游、不要加在这里
+    ///
+    /// 本守卫是**兜底**，只处理没人认领的 Ctrl/Alt 组合。要新增在候选窗显示期间生效的
+    /// 快捷键，正确落点是 `handle_key_event` 里 `handle_candidate_action_hotkey` 那一段
+    /// （Ctrl+数字 置顶/删除就在那儿），它在单点分派**之前**，因此天然优先于本守卫，
+    /// 且五个模式一次接通。把这类键塞进各模式处理器则要写五遍，还会漏。
+    ///
+    /// 五个模式处理器（mix / 临拼 / 临英 / 特殊 / URL）**全部**接了本守卫——按「枚举模式
+    /// 处理器逐个问它接了吗」的纪律收口。收口前全仓只有**临拼的字母臂**判过一次 Ctrl/Alt
+    /// （`handle_temp.rs`），连临拼自己的数字臂与标点臂都没护住。
+    pub(crate) fn overlay_ctrl_alt_guard(
+        &self,
+        state: &mut State,
+        data: &KeyEventData,
+        has_pending: bool,
+        exit: impl Fn(&Self, &mut State),
+    ) -> Option<KeyAction> {
+        if data.modifiers & (MOD_CTRL | MOD_ALT) == 0 {
+            return None;
+        }
+        if has_pending {
+            exit(self, state);
+            self.notify_ui_hide();
+            return Some(KeyAction::ClearComposition);
+        }
+        Some(KeyAction::PassThrough)
+    }
+
     /// mix 模式按键处理 —— 双透镜统一管线（见架构说明）。
     /// 首字符确定 lens：数字/符号 → 数字 lens（符号输入、字母选词）；字母 → 文本 lens
     /// （字母输入、数字选词、`-`/`=` 翻页）。每键顺序：控制键 → ①输入字符 → ②翻页/高亮
     /// → ③本 lens 选词键 → ④配置二三候选键 → ⑤其它标点顶屏。
     pub(crate) fn handle_mix_key(&self, state: &mut State, data: &KeyEventData) -> KeyAction {
+        // Ctrl/Alt 组合守卫：必须最先——否则下方 ① 会把 `Ctrl+E` 的字母当字面输入收走。
+        if let Some(act) = self.overlay_ctrl_alt_guard(
+            state,
+            data,
+            !state.mix_buffer.is_empty() || !state.committed_text.is_empty(),
+            |s, st| s.exit_mix_mode(st),
+        ) {
+            return act;
+        }
         // 编码区光标移动（左右 / Home / End）。注：数字透镜下 -/= 等是输入字符，但方向键
         // 在两个透镜里都不是输入，故可在分派前统一拦截。
         if let Some(act) = self.overlay_cursor_key(state, data) {
@@ -947,7 +1152,12 @@ impl Coordinator {
         // 必须前置于下方数字透镜——否则 ; 等会被 printable_char 当表达式字符吞进缓冲。
         // 顺带武装智能符号：时限内再按同键即换英文形（`;` → `；` → `;`），否则这个键被模式
         // 占着、英文形没有通路。press2 的拦截在 try_activate_mode 开头，早于模式激活链。
-        if state.mix_buffer.is_empty()
+        // `free_input = always` 的实例除外：它的引导键必须能作字面字符打进缓冲，否则
+        // 「进模式后第一个想打的就是引导键那个符号」永远只会上屏符号并退出，专做字面
+        // 输入的实例连门都进不去。（这类"某开关要否决某条既有通路"的改动，历史上多次
+        // 只接了一处就以为完事——此处与 ①⑤ 的分派、②的 include_printable 是同一组。）
+        if self.mix_free_input(state.mix_id) != FreeInputMode::Always
+            && state.mix_buffer.is_empty()
             && state.committed_text.is_empty()
             && data.modifiers & MOD_SHIFT == 0
             && self.match_mix_trigger(data.key_code) == Some(state.mix_id)
@@ -1075,26 +1285,37 @@ impl Coordinator {
             }
             _ => {
                 let shift = data.modifiers & MOD_SHIFT != 0;
-                let calc = self.mix_has_quick_numeric(state.mix_id);
-                // 首字符确定 lens：非字母可打印字符（数字/符号）→ 数字 lens。
-                if state.mix_buffer.is_empty() {
-                    let is_letter = (keymap::VK_A..=keymap::VK_Z).contains(&data.key_code);
-                    // 首字符判定数字透镜：主键盘可打印字符或小键盘键（0x60-0x6F）均可触发，
-                    // 使小键盘数字/运算符也能进入快捷输入表达式。
-                    state.mix_numeric = calc
-                        && !is_letter
-                        && (printable_char(data.key_code, shift).is_some()
-                            || numpad_char(data.key_code).is_some());
-                }
-                let numeric = calc && state.mix_numeric;
+                // 透镜按**当前缓冲**（即本键落下之前的内容）推导，本键的归属据此判定；
+                // 空缓冲时改由本键自己决定（见 `mix_lens_for_key`）。
+                // 插入后由 `refresh` → `update_mix_candidates` 用新缓冲重算。
+                let lens = self.mix_lens_for_key(state, data, shift);
+                let free_on = self.mix_free_input(state.mix_id) != FreeInputMode::Off;
+                let is_letter = (keymap::VK_A..=keymap::VK_Z).contains(&data.key_code);
 
                 // ① 输入字符（按 lens）
-                let input = if numeric {
-                    Self::mix_numeric_input_char(data.key_code, shift)
-                } else if (keymap::VK_A..=keymap::VK_Z).contains(&data.key_code) {
-                    Some((b'a' + (data.key_code - keymap::VK_A) as u8) as char)
-                } else {
-                    None
+                let input = match lens {
+                    // 自由输入：一切可打印键字面入缓冲（保留 Shift 形态）；小键盘同样是字面。
+                    MixLens::Free => {
+                        printable_char(data.key_code, shift).or_else(|| numpad_char(data.key_code))
+                    }
+                    // 数字透镜：小写字母仍是选词键（否则这个透镜一个选词键都不剩），但
+                    // **大写字母任何成员都接受不了** —— 自由输入开启时直接字面，由它把
+                    // 透镜带进 Free，于是 `;12.5` 之后按 Shift+G 能续打成 `12.5GB`。
+                    MixLens::Numeric if free_on && shift && is_letter => {
+                        Some((b'A' + (data.key_code - keymap::VK_A) as u8) as char)
+                    }
+                    MixLens::Numeric => Self::mix_numeric_input_char(data.key_code, shift),
+                    // 文本透镜：字母入缓冲。自由输入关闭时 Shift 被丢弃（既有行为，恒小写）；
+                    // 开启时大写字母即越界字符，字面入缓冲并把透镜带进 Free。
+                    MixLens::Text if is_letter => {
+                        let base = (data.key_code - keymap::VK_A) as u8;
+                        Some(if free_on && shift {
+                            (b'A' + base) as char
+                        } else {
+                            (b'a' + base) as char
+                        })
+                    }
+                    MixLens::Text => None,
                 };
                 if let Some(ch) = input {
                     preedit_cursor::BufEdit::new(&mut state.mix_buffer, &mut state.mix_cursor)
@@ -1103,30 +1324,53 @@ impl Coordinator {
                 }
 
                 // ② 翻页/高亮（输入字符已消费；数字 lens 的 -/= 已作输入吃掉）
-                if let Some(act) = self.apply_nav_key(state, data, true) {
+                //
+                // `include_printable`：自由输入开启时可打印翻页键（`-`/`=` 等 `page_keys` 里
+                // 的键组）必须让位字面输入，否则 `all-in-one` 的 `-` 会被吃成翻页。翻页职责
+                // 转给 PageUp/PageDown ——本模式的数字键与二三候选键本就被选词占着，用户在
+                // 这里本来就该用功能键翻页。关闭自由输入时维持既有的 `true`。
+                if let Some(act) =
+                    self.apply_nav_key(state, data, self.mix_nav_include_printable(state.mix_id))
+                {
                     return act;
                 }
 
-                // ③ 本 lens 选词键：数字 lens 用字母（a=首选），文本 lens 用数字（1=首选）
-                let sel = if numeric {
-                    (keymap::VK_A..=keymap::VK_Z)
-                        .contains(&data.key_code)
-                        .then(|| (data.key_code - keymap::VK_A) as usize)
-                } else {
-                    (keymap::VK_1..=keymap::VK_9)
-                        .contains(&data.key_code)
-                        .then(|| (data.key_code - keymap::VK_1) as usize)
-                };
-                if let Some(off) = sel {
-                    return self.mix_select(state, off);
+                // ③④ 选词键。Free 透镜下没有选词键——字母与数字都已在 ① 作字面输入消费，
+                // 走到这里的只剩控制键，继续往下落即可。
+                if lens != MixLens::Free {
+                    // ③ 本 lens 选词键：数字 lens 用字母（a=首选），文本 lens 用数字（1=首选）
+                    let sel = if lens == MixLens::Numeric {
+                        is_letter.then(|| (data.key_code - keymap::VK_A) as usize)
+                    } else {
+                        (keymap::VK_1..=keymap::VK_9)
+                            .contains(&data.key_code)
+                            .then(|| (data.key_code - keymap::VK_1) as usize)
+                    };
+                    if let Some(off) = sel {
+                        return self.mix_select(state, off);
+                    }
+
+                    // ④ 配置二三候选键
+                    if !shift && let Some(offset) = self.select_key_offset(data.key_code) {
+                        return self.mix_select(state, offset);
+                    }
                 }
 
-                // ④ 配置二三候选键
-                if !shift && let Some(offset) = self.select_key_offset(data.key_code) {
-                    return self.mix_select(state, offset);
+                // ⑤ 越界字面输入：走到这里的可打印键在当前透镜下**既不是编码也不是功能键**，
+                // 它不可能是编码，只能是字面内容 → 入缓冲，缓冲随即被判为 Free 透镜。
+                // 这一步取代了下方⑥的顶屏语义（`_` `<` `,` `.` 等都归字面），代价是
+                // `;nihao,` 不再顶屏出「你好，」——想要标点先按空格上屏再打即可。
+                // 关闭自由输入的实例不走这条，⑥ 的既有行为原样保留。
+                if free_on
+                    && let Some(ch) =
+                        printable_char(data.key_code, shift).or_else(|| numpad_char(data.key_code))
+                {
+                    preedit_cursor::BufEdit::new(&mut state.mix_buffer, &mut state.mix_cursor)
+                        .insert(ch);
+                    return refresh(self, state);
                 }
 
-                // ⑤ 其它标点：顶屏「已转换前缀 + 当前高亮候选」+ 转换后标点，退出。
+                // ⑥ 其它标点：顶屏「已转换前缀 + 当前高亮候选」+ 转换后标点，退出。
                 // 小键盘键（direct 语义）回退 numpad_char 复用此路——仅**文本透镜**会走到这里，
                 // 数字透镜的小键盘早在 ① mix_numeric_input_char 作表达式字符入缓冲。
                 // follow_main 时键已在入口归一化为主键盘键。

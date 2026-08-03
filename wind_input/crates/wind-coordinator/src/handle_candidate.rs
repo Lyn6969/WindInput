@@ -1380,7 +1380,10 @@ impl Coordinator {
     ) -> Option<KeyAction> {
         let include_printable = match state.active {
             Some(ModeKind::Special(_)) | Some(ModeKind::TempPinyin) => true,
-            Some(ModeKind::Mix(idx)) => !self.mix_has_quick_numeric(idx),
+            // mix 目前**不经过本函数**（`handle_mix_key` 直接调 `apply_nav_key`）。保留本
+            // 分支只为「日后有人把 mix 接过来时规则仍然对」，取值统一问
+            // `mix_nav_include_printable`——此前这里独立写了一份且与活代码取值相反。
+            Some(ModeKind::Mix(idx)) => self.mix_nav_include_printable(idx),
             Some(ModeKind::TempEnglish) => !self.rt().config.input.temp_english.allow_symbols,
             _ => false,
         };

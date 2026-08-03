@@ -120,6 +120,41 @@ fn prune_redundant(root: &mut toml::Value, preset: &toml::Value) -> usize {
     removed
 }
 
+/// **已退役的配置键**：结构体里已经没有它们，`load()` 时被 serde 静默丢弃。
+///
+/// 但它们会在用户层 `config.toml` 里**永久留存**——写回走的是原始 `toml::Value`
+/// （见 [`Config::set_user_value`]），从不经过类型化结构体，未知键因此既不会被读取、
+/// 也不会被删除。留着只有坏处：用户翻开配置看见 `enable_english = true`，会以为它还在
+/// 起作用，而实际早已无人读取。
+///
+/// **只能用显式名单**，不能改成「凡未登记键一律删」——`input.punct.custom_mappings.<字符>`
+/// 这类 `Map` 子路径同样不在注册表里，一刀切会把用户的自定义标点映射删光。这也正是
+/// [`prune_redundant`] 用 `is_known_key` 把未登记键整体排除在外的原因。
+const RETIRED_KEYS: &[&[&str]] = &[
+    // 与 `mix_modes.members` 构成双真相源，已废弃：英文候选的开关只看 members 里有没有
+    // `english`。⚠️ **不是** `schema.mix.enable_english` —— 那个还活着，是混输引擎
+    // （`wubi86_pinyin` 这类方案）混入英文词库候选的开关，两者只是名字像。
+    &["schema", "quick_input", "enable_english"],
+    // 从未被任何逻辑读取过，关掉不产生任何效果（曾被误当作快捷输入的总开关）。
+    // 真正的「禁用快捷输入」＝把 quick_mix 的 trigger_keys 清空。
+    &["schema", "quick_input", "enabled"],
+];
+
+/// 从用户层删除 [`RETIRED_KEYS`] 里的退役键，返回删除数。
+///
+/// 与 [`prune_redundant`] 同一条不变量：**清理前后 `load()` 的结果逐键完全相同**——
+/// 这些键本来就已经被 serde 丢弃，删掉不改变任何生效值。
+/// 幂等；`remove_nested` 会顺带回收变空的父表（`[schema.quick_input]` 只剩这两个键时整段消失）。
+fn prune_retired(root: &mut toml::Value) -> usize {
+    let toml::Value::Table(t) = root else {
+        return 0;
+    };
+    RETIRED_KEYS
+        .iter()
+        .filter(|path| remove_nested(t, path))
+        .count()
+}
+
 /// 收集 TOML 值里所有叶子路径（表递归；数组/标量视为叶子，不下钻）。
 ///
 /// 数组**必须**当叶子：`schema.mix_modes` / `keys.page_keys` 这类整体就是一个配置项，
@@ -750,6 +785,33 @@ pub enum LayoutIntent {
 /// 是同一件事的两个层级，而不是两套发明出来的键名。
 pub type CommentTemplateOverride = Option<String>;
 
+/// 自由输入（字面输入）模式：让 mix 能打出 `GetTestData()` / `test_data` / `<TAB>`
+/// 这类**任何 member 都无法接受**的内容。
+///
+/// - `Off`：完全维持既有行为（越界字符仍走「顶屏候选 + 上屏标点 + 退出」）。
+/// - `Auto`（**默认**）：由缓冲内容自动推导，见 `MixLens`。
+/// - `Always`：本实例恒为自由输入——用于新建一个专做字面输入的融合模式。
+///
+/// # 为什么没有切换键
+///
+/// mix 里几乎每个键都已双重占用（文本透镜：数字选词、标点顶屏；数字透镜：字母选词），
+/// 挑不出一个真正空闲的可打印键；而非可打印键（Tab / 方向键 / PgUp）又都是可配置的
+/// 导航键组。于是判据落在**输入内容本身**：一个字符若不在当前透镜的合法字符集内，
+/// 它就不可能是编码，只能是字面内容。
+///
+/// # 为什么是缓冲的纯函数而非粘滞状态位
+///
+/// 没有进入键就没有退出键，粘滞态找不到可解释的清除时机。纯函数下退格删掉最后一个
+/// 越界字符就自然回到原透镜，所见即所得。
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, Default, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum FreeInputMode {
+    Off,
+    #[default]
+    Auto,
+    Always,
+}
+
 /// 临时 mix 模式配置（overlay 激活面）。触发后对每个成员方案查询并按成员序合并候选。
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
 pub struct MixModeConfig {
@@ -787,6 +849,12 @@ pub struct MixModeConfig {
     /// 本 mix 期间的注释模板覆盖（横排），见 [`CommentTemplateOverride`]。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub comment_template_horizontal: CommentTemplateOverride,
+    /// 自由（字面）输入，见 [`FreeInputMode`]。默认 `Auto`。
+    ///
+    /// 每实例独立：一个只做日期/计算的 mix 可以关掉它，保住「打完拼音按逗号顶屏出
+    /// 中文标点」；专做字面输入的实例则设 `Always`。
+    #[serde(default)]
+    pub free_input: FreeInputMode,
 }
 
 /// 内置「快捷」融合 mix 的实例 id（`;` 触发，成员含日期/计算/拼音/英文）。
@@ -822,6 +890,8 @@ fn default_mix_modes() -> Vec<MixModeConfig> {
         // None = 跟随全局注释模板（内置 quick_mix 不预设覆盖）
         comment_template_vertical: None,
         comment_template_horizontal: None,
+        // 出厂开自动自由输入：`;` 是为特殊内容而进的模式，字面输入是它的常见用途。
+        free_input: FreeInputMode::Auto,
     }]
 }
 
@@ -2456,9 +2526,6 @@ impl Config {
     ///
     /// 幂等——跑第二次删 0 个。`data/config.toml` 或用户层缺失时直接返回 0。
     pub fn prune_user_config() -> anyhow::Result<usize> {
-        let Some(preset) = Self::preset_for_pruning() else {
-            return Ok(0);
-        };
         let Some(dir) = Self::user_config_dir() else {
             return Ok(0);
         };
@@ -2470,7 +2537,13 @@ impl Config {
             return Ok(0);
         };
 
-        let removed = prune_redundant(&mut root, &preset);
+        // 退役键（[`RETIRED_KEYS`]）先清：它们与出厂默认无关，**不能**被 preset 取不到时的
+        // 提前返回挡住——否则没装 data/config.toml 的环境永远清不掉。
+        let mut removed = prune_retired(&mut root);
+        // 冗余键需要出厂默认做逐键比对，取不到时跳过（安全降级为「不清理」的旧行为）。
+        if let Some(preset) = Self::preset_for_pruning() {
+            removed += prune_redundant(&mut root, &preset);
+        }
         if removed == 0 {
             return Ok(0);
         }
@@ -2479,7 +2552,7 @@ impl Config {
         let tmp = file.with_extension("toml.tmp");
         std::fs::write(&tmp, out)?;
         std::fs::rename(&tmp, &file)?;
-        info!("Pruned {} redundant key(s) from user config", removed);
+        info!("Pruned {} stale key(s) from user config", removed);
         Ok(removed)
     }
 
@@ -3527,6 +3600,59 @@ y = 2
         };
         assert!(remove_nested(t, &["a", "b", "y"]));
         assert!(get_nested(&root, &["a"]).is_none(), "父表变空应逐级回收");
+    }
+
+    /// 退役键走显式名单清除，且**三类不得误伤**：同段里还活着的键、名字相似但仍在使用的
+    /// 另一个键、以及未登记的 Map 子路径。
+    #[test]
+    fn prune_retired_removes_dead_keys_only() {
+        let mut root = tv(r#"
+[schema.quick_input]
+enable_english = true
+enabled = true
+decimal_places = 6
+
+[schema.mix]
+enable_english = true
+
+[input.punct.custom_mappings]
+"/" = ["、", "／", "、", "/"]
+"#);
+        assert_eq!(prune_retired(&mut root), 2, "两个退役键都应删除");
+        assert!(get_nested(&root, &["schema", "quick_input", "enable_english"]).is_none());
+        assert!(get_nested(&root, &["schema", "quick_input", "enabled"]).is_none());
+        assert!(
+            get_nested(&root, &["schema", "quick_input", "decimal_places"]).is_some(),
+            "同段里还活着的键不得误删"
+        );
+        // ★ `schema.mix.enable_english` 是**另一个仍在使用的键**（混输引擎混入英文词库
+        //   候选的开关，manager.rs 实读）。它与退役的 `schema.quick_input.enable_english`
+        //   只是叶子名相同，按整条路径匹配才不会误伤。
+        assert!(
+            get_nested(&root, &["schema", "mix", "enable_english"]).is_some(),
+            "schema.mix.enable_english 仍在使用，不得误删"
+        );
+        // Map 子路径同样不在注册表里，靠「未登记就删」会把用户的自定义标点映射删光。
+        assert!(
+            get_nested(&root, &["input", "punct", "custom_mappings", "/"]).is_some(),
+            "Map 子路径不得误删"
+        );
+        assert_eq!(prune_retired(&mut root), 0, "幂等：再跑一次删 0 个");
+    }
+
+    /// 父表被清空时应整段回收——用户配置里 `[schema.quick_input]` 常常只有这两个退役键。
+    #[test]
+    fn prune_retired_reclaims_emptied_parent_table() {
+        let mut root = tv(r#"
+[schema.quick_input]
+enable_english = true
+enabled = true
+"#);
+        assert_eq!(prune_retired(&mut root), 2);
+        assert!(
+            get_nested(&root, &["schema", "quick_input"]).is_none(),
+            "两个键都删完后空的 [schema.quick_input] 段应一并回收"
+        );
     }
 
     #[test]

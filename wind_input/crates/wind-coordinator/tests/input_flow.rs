@@ -1240,6 +1240,40 @@ fn press_vk(coord: &Coordinator, vk: u32, shift: bool) -> KeyAction {
     coord.handle_key_event(&ev)
 }
 
+/// 按**字符**敲键：按美式主键盘布局还原成 `(vk, shift)`。只覆盖测试用到的 ASCII 子集，
+/// 未覆盖的字符直接 panic —— 与其静默按错键位产出一个看不懂的断言失败，不如当场报出来。
+fn press_char(coord: &Coordinator, c: char) -> KeyAction {
+    let (vk, shift) = match c {
+        'a'..='z' => ((c.to_ascii_uppercase() as u32) & 0xFF, false),
+        'A'..='Z' => ((c as u32) & 0xFF, true),
+        '0'..='9' => (c as u32, false),
+        '-' => (0xBD, false),
+        '_' => (0xBD, true),
+        ',' => (0xBC, false),
+        '<' => (0xBC, true),
+        '.' => (0xBE, false),
+        '>' => (0xBE, true),
+        '=' => (0xBB, false),
+        '+' => (0xBB, true),
+        '*' => (0x38, true),
+        '(' => (0x39, true),
+        ')' => (0x30, true),
+        ';' => (0xBA, false),
+        ':' => (0xBA, true),
+        other => panic!("press_char 未覆盖字符 {:?}", other),
+    };
+    press_vk(coord, vk, shift)
+}
+
+/// 依次敲入一串字符，返回最后一次按键的动作。
+fn press_str(coord: &Coordinator, s: &str) -> KeyAction {
+    let mut last = KeyAction::Consumed;
+    for c in s.chars() {
+        last = press_char(coord, c);
+    }
+    last
+}
+
 /// 快捷输入模式下切中英文：与临拼一致，遵循 keys.commit_on_switch —— 开启（默认）时把
 /// 剩余原码上屏（前缀 ; 不输出），而非无条件清空（回归保护：独占分支曾对 mix 恒返回空串）。
 #[test]
@@ -1443,6 +1477,367 @@ fn test_quick_input_member_removal_disables_source() {
         texts2.iter().any(|t| t.ends_with("月25日")),
         "date 成员仍在，日期候选应照常产出，实际: {:?}",
         texts2
+    );
+}
+
+// ─────────────────── 自由输入（free_input）───────────────────
+//
+// 判据：一个字符若不在**当前透镜的合法字符集**内，它不可能是编码，只能是字面内容 →
+// 转 Free 透镜，此后一切可打印键字面入缓冲。判据是缓冲的纯函数，没有切换键。
+// 正向用例覆盖四种进入路径（大写字母 / 文本透镜里的符号 / 首字符符号 / 数字透镜里的大写），
+// 反向对照锁住 `free_input = off` 与「合法缓冲不受影响」两条底线。
+
+/// 进入路径①：首字符大写字母。任何 member 的查询都在小写域，大写恒越界。
+#[test]
+fn quick_input_free_uppercase_first_char_enters_literal() {
+    if !has_schemas() {
+        return;
+    }
+    let coord = Coordinator::new_headless(config_with("wubi86"), Some(&data_dir()));
+    coord.handle_key_event(&key_event(0xBA, EVENT_KEY_DOWN)); // ;
+    let last = press_str(&coord, "GetTestData()");
+    assert_eq!(
+        action_text(&last).unwrap(),
+        ";GetTestData()",
+        "大小写与括号都应原样进组合区"
+    );
+    assert_eq!(
+        coord.debug_page_texts(),
+        vec!["GetTestData()"],
+        "自由输入的唯一候选＝所打原文"
+    );
+    match coord.handle_key_event(&key_event(0x20, EVENT_KEY_DOWN)) {
+        KeyAction::InsertText { text, .. } => assert_eq!(text, "GetTestData()"),
+        other => panic!("空格应上屏原文，实际: {:?}", other),
+    }
+}
+
+/// 进入路径②：文本透镜里出现符号（`_`）。前半段 `test` 仍是合法拼音/英文编码。
+#[test]
+fn quick_input_free_symbol_upgrades_text_lens() {
+    if !has_schemas() {
+        return;
+    }
+    let coord = Coordinator::new_headless(config_with("wubi86"), Some(&data_dir()));
+    coord.handle_key_event(&key_event(0xBA, EVENT_KEY_DOWN)); // ;
+    press_str(&coord, "test");
+    // 此刻仍是文本透镜：缓冲全小写，成员照常出候选。
+    assert!(
+        !coord.debug_page_texts().is_empty(),
+        "test 是合法编码，文本透镜应有候选"
+    );
+    let last = press_str(&coord, "_data");
+    assert_eq!(
+        action_text(&last).unwrap(),
+        ";test_data",
+        "下划线应字面入缓冲而非顶屏退出"
+    );
+    match coord.handle_key_event(&key_event(0x20, EVENT_KEY_DOWN)) {
+        KeyAction::InsertText { text, .. } => assert_eq!(text, "test_data"),
+        other => panic!("空格应上屏原文，实际: {:?}", other),
+    }
+}
+
+/// 进入路径③：首字符就是非表达式符号（`<`）。此前 `<` 会开数字透镜、后续字母被当选词键吞掉。
+#[test]
+fn quick_input_free_non_expr_first_char_enters_literal() {
+    if !has_schemas() {
+        return;
+    }
+    let coord = Coordinator::new_headless(config_with("wubi86"), Some(&data_dir()));
+    coord.handle_key_event(&key_event(0xBA, EVENT_KEY_DOWN)); // ;
+    let last = press_str(&coord, "<TAB>");
+    assert_eq!(
+        action_text(&last).unwrap(),
+        ";<TAB>",
+        "尖括号内的字母不应被数字透镜当成选词键"
+    );
+    match coord.handle_key_event(&key_event(0x20, EVENT_KEY_DOWN)) {
+        KeyAction::InsertText { text, .. } => assert_eq!(text, "<TAB>"),
+        other => panic!("空格应上屏原文，实际: {:?}", other),
+    }
+}
+
+/// 进入路径④：数字透镜里出现大写字母。小写字母仍是选词键，大写才越界。
+#[test]
+fn quick_input_free_uppercase_upgrades_numeric_lens() {
+    if !has_schemas() {
+        return;
+    }
+    let coord = Coordinator::new_headless(config_with("wubi86"), Some(&data_dir()));
+    coord.handle_key_event(&key_event(0xBA, EVENT_KEY_DOWN)); // ;
+    press_str(&coord, "12.5");
+    assert!(
+        !coord.debug_page_texts().is_empty(),
+        "12.5 是合法数字，数字透镜应有候选"
+    );
+    let last = press_str(&coord, "GB");
+    assert_eq!(action_text(&last).unwrap(), ";12.5GB");
+    match coord.handle_key_event(&key_event(0x20, EVENT_KEY_DOWN)) {
+        KeyAction::InsertText { text, .. } => assert_eq!(text, "12.5GB"),
+        other => panic!("空格应上屏原文，实际: {:?}", other),
+    }
+}
+
+/// `-` 在**文本**透镜让位字面输入（否则 `all-in-one` 的连字符会被 `minus_equal` 键组
+/// 吃成翻页）。翻页职责转给 PageUp/PageDown。
+#[test]
+fn quick_input_free_hyphen_is_literal_in_text_lens() {
+    if !has_schemas() {
+        return;
+    }
+    let coord = Coordinator::new_headless(config_with("wubi86"), Some(&data_dir()));
+    coord.handle_key_event(&key_event(0xBA, EVENT_KEY_DOWN)); // ;
+    let last = press_str(&coord, "all-in-one");
+    assert_eq!(action_text(&last).unwrap(), ";all-in-one");
+    match coord.handle_key_event(&key_event(0x20, EVENT_KEY_DOWN)) {
+        KeyAction::InsertText { text, .. } => assert_eq!(text, "all-in-one"),
+        other => panic!("空格应上屏原文，实际: {:?}", other),
+    }
+}
+
+/// ★反向对照：`-` 在**数字**透镜仍是减法运算符（它在表达式字符集内，不越界）。
+/// 同一个键在两个透镜里归属不同，这正是「越界判据按透镜分」而非全局字符集的理由。
+#[test]
+fn quick_input_free_hyphen_still_operator_in_numeric_lens() {
+    if !has_schemas() {
+        return;
+    }
+    let coord = Coordinator::new_headless(config_with("wubi86"), Some(&data_dir()));
+    coord.handle_key_event(&key_event(0xBA, EVENT_KEY_DOWN)); // ;
+    press_str(&coord, "1-5");
+    let texts = coord.debug_page_texts();
+    assert_eq!(texts[0], "-4", "1-5 应作减法求值，实际: {:?}", texts);
+}
+
+/// ★反向对照：括号是表达式字符，`(1+2)*3` 不该被误判成自由输入。
+#[test]
+fn quick_input_free_parens_still_calc() {
+    if !has_schemas() {
+        return;
+    }
+    let coord = Coordinator::new_headless(config_with("wubi86"), Some(&data_dir()));
+    coord.handle_key_event(&key_event(0xBA, EVENT_KEY_DOWN)); // ;
+    press_str(&coord, "(1+2)*3");
+    let texts = coord.debug_page_texts();
+    assert_eq!(texts[0], "9", "括号算式应照常求值，实际: {:?}", texts);
+}
+
+/// ★反向对照：文本透镜里数字键仍是选词键（它是功能键，不参与越界判定）。
+#[test]
+fn quick_input_free_digits_still_select_in_text_lens() {
+    if !has_schemas() {
+        return;
+    }
+    let coord = Coordinator::new_headless(config_with("wubi86"), Some(&data_dir()));
+    coord.handle_key_event(&key_event(0xBA, EVENT_KEY_DOWN)); // ;
+    press_str(&coord, "nihao");
+    let texts = coord.debug_page_texts();
+    assert!(!texts.is_empty(), "nihao 应有拼音候选");
+    let first = texts[0].clone();
+    match press_char(&coord, '1') {
+        KeyAction::InsertText { text, .. } => {
+            assert!(
+                text.ends_with(&first),
+                "数字键 1 应选首候选上屏（而非字面输入），实际: {:?}",
+                text
+            );
+        }
+        other => panic!("数字键应选词上屏，实际: {:?}", other),
+    }
+}
+
+/// **行为变更的正反两面**：同一串按键在 `auto` 下变字面、在 `off` 下维持顶屏出中文标点。
+///
+/// 这是本次改动影响面最大的一条 —— `;nihao,` 不再出「你好，」。用户拍板如此
+/// （快捷输入是为特殊内容而进的模式，要标点可以先按空格上屏再打），此处把两种取值
+/// 各自锁住，避免日后有人只看到一半就"顺手修好"。
+#[test]
+fn quick_input_free_comma_literal_vs_off_top_commits() {
+    if !has_schemas() {
+        return;
+    }
+    // auto（出厂默认）：逗号字面入缓冲，组合区继续存在。
+    let coord = Coordinator::new_headless(config_with("wubi86"), Some(&data_dir()));
+    coord.handle_key_event(&key_event(0xBA, EVENT_KEY_DOWN)); // ;
+    let last = press_str(&coord, "nihao,");
+    assert_eq!(
+        action_text(&last).unwrap(),
+        ";nihao,",
+        "auto 下逗号应字面入缓冲"
+    );
+
+    // off：维持既有「顶屏高亮候选 + 转换后标点 → 退出」。
+    let mut cfg = config_with("wubi86");
+    cfg.schema.mix_modes[0].free_input = wind_config::config::FreeInputMode::Off;
+    let coord_off = Coordinator::new_headless(cfg, Some(&data_dir()));
+    coord_off.handle_key_event(&key_event(0xBA, EVENT_KEY_DOWN)); // ;
+    press_str(&coord_off, "nihao");
+    match press_char(&coord_off, ',') {
+        KeyAction::InsertText { text, .. } => {
+            assert!(
+                !text.contains("nihao"),
+                "off 下应顶屏候选而非上屏原码，实际: {:?}",
+                text
+            );
+            assert!(
+                text.ends_with('，') || text.ends_with(','),
+                "off 下应带上转换后的标点，实际: {:?}",
+                text
+            );
+        }
+        other => panic!("off 下逗号应顶屏上屏并退出，实际: {:?}", other),
+    }
+}
+
+/// ★反向对照：`off` 下 `-` 仍是翻页键，不得字面入缓冲。
+#[test]
+fn quick_input_free_off_keeps_minus_as_page_key() {
+    if !has_schemas() {
+        return;
+    }
+    let mut cfg = config_with("wubi86");
+    cfg.schema.mix_modes[0].free_input = wind_config::config::FreeInputMode::Off;
+    let coord = Coordinator::new_headless(cfg, Some(&data_dir()));
+    coord.handle_key_event(&key_event(0xBA, EVENT_KEY_DOWN)); // ;
+    press_str(&coord, "nihao");
+    let before = coord.debug_page_texts();
+    assert!(!before.is_empty(), "nihao 应有拼音候选");
+    press_char(&coord, '-');
+    // 强断言：`-` 若被当成字面输入，缓冲会变成 `nihao-`，该串查不出拼音候选 → 候选列表
+    // 必然改变。仅断言「返回的动作里没有 `-`」是不够的——翻页返回 Consumed 时
+    // `action_text` 为 None，断言会被整条跳过，成为一条永远绿的假测试。
+    assert_eq!(
+        coord.debug_page_texts(),
+        before,
+        "off 下 `-` 应作翻页键（单页时为空操作），候选不该变化"
+    );
+    // 再按空格：上屏的应是候选词，而不是把 `nihao-` 当原码吐出来。
+    match coord.handle_key_event(&key_event(0x20, EVENT_KEY_DOWN)) {
+        KeyAction::InsertText { text, .. } => assert!(
+            !text.contains('-') && !text.contains("nihao"),
+            "off 下应上屏候选词，实际: {:?}",
+            text
+        ),
+        other => panic!("空格应上屏候选，实际: {:?}", other),
+    }
+}
+
+/// Ctrl 组合守卫：`Ctrl+E` 不该被当成字面 `e` 插进缓冲（此前 mix 没有这道守卫）。
+#[test]
+fn quick_input_ctrl_combo_does_not_insert_literal() {
+    if !has_schemas() {
+        return;
+    }
+    let coord = Coordinator::new_headless(config_with("wubi86"), Some(&data_dir()));
+    coord.handle_key_event(&key_event(0xBA, EVENT_KEY_DOWN)); // ;
+    press_str(&coord, "ni");
+    let mut ev = key_event(0x45, EVENT_KEY_DOWN); // E
+    ev.modifiers = 0x0002; // MOD_CTRL
+    match coord.handle_key_event(&ev) {
+        KeyAction::ClearComposition => {}
+        other => panic!(
+            "有待输入内容时 Ctrl 组合应放弃整段组合，实际: {:?}（回归：曾插入字面 e）",
+            other
+        ),
+    }
+}
+
+/// Ctrl 守卫的**模式处理器全覆盖**：五个独占模式（mix / 临拼 / 临英 / 特殊 / URL）都必须
+/// 把 Ctrl 组合当成宿主快捷键，而不是普通输入。
+///
+/// 盘查依据是「枚举 `match state.active` 的全部分支，逐个问它接了吗」——只 grep `MOD_CTRL`
+/// 会得出「已经实现了」的错误结论：全仓唯一一处命中在**临拼的字母臂**（`handle_temp.rs`），
+/// 而临拼自己的数字臂/标点臂、以及 mix / 临英 / 特殊 / URL 四个模式全都没有。
+/// 已接线的调用点无法告诉你漏了谁。
+///
+/// ⚠️ 本测试只覆盖 mix / 临拼 / 临英三个能在 headless 里稳定构造的模式；特殊模式需要
+/// 配置码表方案、URL 模式需要 `input.url.prefixes` 命中，二者的守卫接线与这三个同构
+/// （同一个 `overlay_ctrl_alt_guard`），但**未被本测试覆盖**。
+#[test]
+fn overlay_modes_treat_ctrl_combo_as_host_shortcut() {
+    if !has_schemas() {
+        return;
+    }
+    let ctrl_e = || {
+        let mut ev = key_event(0x45, EVENT_KEY_DOWN); // E
+        ev.modifiers = 0x0002; // MOD_CTRL
+        ev
+    };
+    // 三个模式共用一个 Coordinator：引擎 reader / LRU 跨实例共享且带配额语义，一个测试里
+    // 建多个 Coordinator 会与并行跑的其它测试争用，导致**无关测试**偶发红。
+    let mut cfg = config_with("wubi86");
+    cfg.input.temp_pinyin.enabled = true;
+    cfg.input.temp_pinyin.trigger_keys = vec!["z".into()];
+    let coord = Coordinator::new_headless(cfg, Some(&data_dir()));
+
+    // ① mix（快捷输入）
+    coord.handle_key_event(&key_event(0xBA, EVENT_KEY_DOWN)); // ;
+    press_str(&coord, "ni");
+    assert!(
+        matches!(
+            coord.handle_key_event(&ctrl_e()),
+            KeyAction::ClearComposition
+        ),
+        "mix 下 Ctrl 组合应放弃整段组合（回归：曾插入字面 e）"
+    );
+
+    // ② 临时拼音（五笔方案下 z 引导）
+    press_vk(&coord, 0x5A, false); // z
+    assert!(coord.debug_in_temp_pinyin(), "z 应进入临时拼音");
+    press_str(&coord, "ni");
+    assert!(
+        matches!(
+            coord.handle_key_event(&ctrl_e()),
+            KeyAction::ClearComposition
+        ),
+        "临拼下 Ctrl 组合应放弃整段组合"
+    );
+
+    // ③ 临时英文（Shift+字母进入）。此前只有字母臂判了 Ctrl，此处锁住入口处的统一守卫。
+    press_vk(&coord, 0x48, true); // Shift+H
+    press_str(&coord, "el");
+    assert!(
+        matches!(
+            coord.handle_key_event(&ctrl_e()),
+            KeyAction::ClearComposition
+        ),
+        "临英下 Ctrl 组合应放弃整段组合"
+    );
+}
+
+/// 空缓冲时 Ctrl 组合应**透传**给宿主，而不是被模式吞掉。
+#[test]
+fn overlay_ctrl_combo_passes_through_on_empty_buffer() {
+    if !has_schemas() {
+        return;
+    }
+    let coord = Coordinator::new_headless(config_with("wubi86"), Some(&data_dir()));
+    coord.handle_key_event(&key_event(0xBA, EVENT_KEY_DOWN)); // ; 进入 mix，缓冲空
+    let mut ev = key_event(0x41, EVENT_KEY_DOWN); // A
+    ev.modifiers = 0x0002; // MOD_CTRL
+    assert!(
+        matches!(coord.handle_key_event(&ev), KeyAction::PassThrough),
+        "空缓冲时 Ctrl+A 应透传给宿主（让宿主自己全选），不该被模式消费"
+    );
+}
+
+/// `free_input = always` 的实例：引导键本身也必须能作字面字符打进缓冲。
+/// 否则「进模式后第一个想打的就是引导符」永远只会上屏符号并退出。
+#[test]
+fn quick_input_free_always_allows_trigger_key_as_literal() {
+    if !has_schemas() {
+        return;
+    }
+    let mut cfg = config_with("wubi86");
+    cfg.schema.mix_modes[0].free_input = wind_config::config::FreeInputMode::Always;
+    let coord = Coordinator::new_headless(cfg, Some(&data_dir()));
+    coord.handle_key_event(&key_event(0xBA, EVENT_KEY_DOWN)); // ; 进入
+    let last = press_str(&coord, ";;");
+    assert_eq!(
+        action_text(&last).unwrap(),
+        ";;;",
+        "always 实例下引导键应字面入缓冲（组合区＝前缀 ; + 缓冲 ;;）"
     );
 }
 

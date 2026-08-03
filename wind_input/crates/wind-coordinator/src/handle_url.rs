@@ -111,6 +111,15 @@ impl Coordinator {
                 caret_pos: this.overlay_caret(state),
             }
         };
+        // Ctrl/Alt 组合守卫（见 `overlay_ctrl_alt_guard`）：必须最先，否则组合键会落到
+        // 下方 `printable_char` 臂被当成网址字符（`Ctrl+V` 粘贴时凭空多一个 v）。
+        if let Some(act) =
+            self.overlay_ctrl_alt_guard(state, data, !state.url_buffer.is_empty(), |s, st| {
+                s.exit_url_mode(st)
+            })
+        {
+            return act;
+        }
         // 编码区光标移动（左右 / Home / End）
         if let Some(act) = self.overlay_cursor_key(state, data) {
             return act;
