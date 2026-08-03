@@ -2415,7 +2415,19 @@ impl Coordinator {
     /// 状态得以保持——找生僻字常要改几次编码。
     fn expire_scope_override(&self) {
         let mut s = self.state.lock().unwrap_or_else(|e| e.into_inner());
-        if s.scope_relaxed && s.input_buffer.is_empty() {
+        if !s.scope_relaxed {
+            return;
+        }
+        // ⚠️ 判据是「**当前模式的**输入缓冲已空」。临拼的码在 `temp_pinyin_buffer`，
+        // 而它的 `input_buffer` 恒为空——用 `input_buffer` 一刀切会让临拼刚放宽就在下一次
+        // 按键被清掉，且**静默**（用户只看到「按了没用」）。退出临拼后 `active` 已变回
+        // 非 TempPinyin，走 `input_buffer` 分支照常失效。
+        let ended = if matches!(s.active, Some(ModeKind::TempPinyin)) {
+            s.temp_pinyin_buffer.is_empty()
+        } else {
+            s.input_buffer.is_empty()
+        };
+        if ended {
             s.scope_relaxed = false;
         }
     }
@@ -2433,15 +2445,33 @@ impl Coordinator {
             return false;
         }
         // 已放宽过就不再重复；`Gb18030` 本就不过滤，无可放宽
-        if state.scope_relaxed
-            || state.filter_mode == wind_candidate::FilterMode::Gb18030
-            || state.input_buffer.is_empty()
-        {
+        if state.scope_relaxed || state.filter_mode == wind_candidate::FilterMode::Gb18030 {
+            return false;
+        }
+        // ⚠️ 临拼的码在 `temp_pinyin_buffer`，主路径的在 `input_buffer`——须按当前模式取。
+        // 用 `input_buffer` 一刀切会让临拼**永远触发不了**（那边恒为空），且没有任何报错。
+        let in_temp = matches!(state.active, Some(ModeKind::TempPinyin));
+        let has_input = if in_temp {
+            !state.temp_pinyin_buffer.is_empty()
+        } else {
+            !state.input_buffer.is_empty()
+        };
+        if !has_input {
             return false;
         }
         state.scope_relaxed = true;
-        let limit = state.candidate_limit;
-        self.build_candidates(state, limit);
+        // 两条路径的候选重建函数不同：临拼走 overlay 的那套（主路径的 `build_candidates`
+        // 读 `input_buffer`，在临拼下会构建出空列表）。
+        let page_before = state.current_page;
+        if in_temp {
+            // ⚠️ `update_temp_pinyin_candidates` 会把 current_page/selected_index 归零，
+            // 重建后须还原，否则用户翻到的位置丢失。
+            self.update_temp_pinyin_candidates(state);
+            state.current_page = page_before;
+        } else {
+            let limit = state.candidate_limit;
+            self.build_candidates(state, limit);
+        }
         // 判据取「列表里有没有真的出现被滤候选」，而非「总数是否变多」——候选受 limit 截断时
         // 总数可能不变，那样会误判成「没放出东西」而撤销。
         if !state.candidates.iter().any(|c| c.is_scope_filtered) {

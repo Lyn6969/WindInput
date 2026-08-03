@@ -53,7 +53,7 @@ use wind_ui::manager::CandidateOp;
 ///   已在排序前跑过（`is_common` 是提档准入条件）。
 ///
 /// 排序规则：Exact >> Sub-phrase >> Prefix >> Fuzzy。
-fn candidate_display_order(
+pub(crate) fn candidate_display_order(
     a: &Candidate,
     b: &Candidate,
     ignore_weight: bool,

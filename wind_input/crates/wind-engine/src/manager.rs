@@ -857,6 +857,23 @@ impl EngineManager {
             .unwrap_or(false)
     }
 
+    /// **指定方案**的基础排序是否忽略权重（`base_sort = "natural"`）。
+    ///
+    /// 与 [`Self::active_base_sort_ignores_weight`] 的区别在于取哪个方案的配置：overlay 类模式
+    /// （临时拼音、快捷输入等）跑的是**另一个方案**的引擎，而活跃方案往往是码表——拿五笔的
+    /// `base_sort` 去排拼音候选是错的。这类路径必须用本方法按目标方案取。
+    pub fn base_sort_ignores_weight_of(&self, schema_id: &str) -> bool {
+        if !self.ensure_loaded(schema_id) {
+            return false;
+        }
+        self.engines
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(schema_id)
+            .map(|e| e.base_sort_ignores_weight())
+            .unwrap_or(false)
+    }
+
     /// 可用方案列表（快照拷贝）。
     pub fn available_schemas(&self) -> Vec<String> {
         self.available

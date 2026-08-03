@@ -196,3 +196,206 @@ fn temp_pinyin_paging_does_not_change_candidate_set() {
     assert_eq!(before, after, "翻页不应改变候选集合");
     assert!(after.iter().any(|t| t == "瑩"), "翻页后「瑩」仍应在候选中");
 }
+
+/// ★ 临拼也支持末页翻页放宽，与主路径同一套机制。
+///
+/// 两处判据必须按模式分流，否则临拼下**静默失效**：
+/// - 触发（`try_relax_scope_on_page_end`）：临拼的码在 `temp_pinyin_buffer`，用
+///   `input_buffer` 一刀切会让它永远触发不了（那边恒为空）；
+/// - 失效（`expire_scope_override`）：同样的原因，会让放宽在下一次按键就被清掉。
+///
+/// 反向对照用 `gb18030`：那里本就不过滤，放宽前后候选数必须相等——证明多出来的候选确实
+/// 来自「被智能档滤掉的那些」，而不是翻页顺带触发了别的扩容通路。
+#[test]
+fn temp_pinyin_relaxes_scope_on_page_end() {
+    if !has_schemas() {
+        eprintln!("跳过：词库不存在");
+        return;
+    }
+    let coord = Coordinator::new_headless(config("smart"), Some(&data_dir()));
+    coord.handle_key_event_policed(&key_event(0xC0)); // 进入临拼
+    for c in "ying".chars() {
+        coord.handle_key_event_policed(&key_event((c.to_ascii_uppercase() as u32) & 0xFF));
+    }
+    let before = coord.debug_all_candidate_texts();
+
+    // 翻到末页，再按一次触发放宽
+    for _ in 0..200 {
+        let (cur, _, total) = coord.debug_page_info();
+        if cur + 1 >= total {
+            break;
+        }
+        coord.handle_key_event_policed(&key_event(0x22)); // PageDown
+    }
+    coord.handle_key_event_policed(&key_event(0x22));
+
+    let after = coord.debug_all_candidate_texts();
+    assert!(
+        after.len() > before.len(),
+        "临拼末页再翻页应放出被滤的生僻字：{} → {}",
+        before.len(),
+        after.len()
+    );
+    assert_eq!(
+        &after[..before.len()],
+        &before[..],
+        "放宽不得改动原有候选的顺序（追加在末尾）"
+    );
+    // 放宽后应能取到智能档下被滤掉的生僻字
+    assert!(
+        after.contains(&"瑩".to_string()),
+        "放宽后 `ying` 应能打出「瑩」"
+    );
+}
+
+/// 直接用全拼方案（非临拼）打字，作为临拼的对照基准。
+fn plain_pinyin_candidates(filter_mode: &str, input: &str) -> Vec<String> {
+    let mut cfg = Config::default();
+    cfg.schema.available = vec!["pinyin".into()];
+    cfg.schema.active = "pinyin".into();
+    cfg.input.default.chinese_mode = true;
+    cfg.input.filter_mode = filter_mode.into();
+    let coord = Coordinator::new_headless(cfg, Some(&data_dir()));
+    for c in input.chars() {
+        press_letter(&coord, c);
+    }
+    coord.debug_all_candidate_texts()
+}
+
+/// ★ 临拼的候选顺序必须与**直接用该拼音方案打字**一致。
+///
+/// 回归（用户报障）：临拼下打 `ni` 首选是「年」，整页被「你的」「你们」等高频词组占满，
+/// 而全拼下首选是「你」。两个成因叠加：
+///
+/// 1. 临拼用**纯 weight 排序**（`b.weight.cmp(&a.weight).then(natural_order)`），缺了
+///    `candidate_display_order` 的 `is_prefix` 层 ⇒ 前缀补全（「年」nian 是 ni 的扩展）
+///    压过精确匹配；
+/// 2. 就算换成 `candidate_display_order`，`ignore_weight` 若取
+///    `active_base_sort_ignores_weight()` 拿到的是**活跃方案（五笔）**的 `base_sort`——
+///    用码表的排序配置排拼音候选，即用户直觉说的「被五笔干扰」。须按临拼**目标方案**取
+///    （`base_sort_ignores_weight_of`）。
+///
+/// 断言整体列表而非只比首选：只比首选时，一个「把词组整体沉底」的错误实现也能碰巧通过。
+#[test]
+fn temp_pinyin_order_matches_plain_pinyin() {
+    if !has_schemas() {
+        eprintln!("跳过：词库不存在");
+        return;
+    }
+    for input in ["ni", "shi", "zhongguo", "xian"] {
+        let temp = temp_pinyin_candidates("smart", input);
+        let plain = plain_pinyin_candidates("smart", input);
+        assert!(
+            !temp.is_empty() && !plain.is_empty(),
+            "前提：{input} 两条路径都应有候选"
+        );
+        let n = 10.min(temp.len()).min(plain.len());
+        assert_eq!(
+            &temp[..n],
+            &plain[..n],
+            "临拼 `{input}` 的候选应与全拼一致。\n临拼: {:?}\n全拼: {:?}",
+            &temp[..n],
+            &plain[..n]
+        );
+    }
+}
+
+/// 混输方案（码表 + 拼音）下打字，返回候选。
+fn mixed_candidates(input: &str) -> Vec<String> {
+    let mut cfg = Config::default();
+    cfg.schema.available = vec!["wubi86_pinyin".into()];
+    cfg.schema.active = "wubi86_pinyin".into();
+    cfg.input.default.chinese_mode = true;
+    let coord = Coordinator::new_headless(cfg, Some(&data_dir()));
+    for c in input.chars() {
+        press_letter(&coord, c);
+    }
+    coord.debug_all_candidate_texts()
+}
+
+/// 快捷输入（`;` 进入 quick_mix，其 members 含 `$primary_pinyin`）下打字，返回候选。
+fn quick_input_candidates(input: &str) -> Vec<String> {
+    let mut cfg = Config::default();
+    cfg.schema.available = vec!["wubi86".into(), "pinyin".into()];
+    cfg.schema.active = "wubi86".into();
+    cfg.input.default.chinese_mode = true;
+    let coord = Coordinator::new_headless(cfg, Some(&data_dir()));
+    coord.handle_key_event_policed(&key_event(0xBA)); // ';' 触发 quick_mix
+    for c in input.chars() {
+        coord.handle_key_event_policed(&key_event((c.to_ascii_uppercase() as u32) & 0xFF));
+    }
+    coord.debug_all_candidate_texts()
+}
+
+/// ★★ **四条拼音路径的候选顺序必须一致**：纯拼音方案 / 临时拼音 / 快捷输入 member 拼音，
+/// 三者逐项相等；混输的拼音部分保持相同相对顺序。
+///
+/// 这四条路径的候选装配方式各不相同，历史上正因如此走散过：
+///
+/// | 路径 | 装配 | 排序 |
+/// |---|---|---|
+/// | 纯拼音 | `build_candidates` | 合并短语后 `candidate_display_order` 重排 |
+/// | 临时拼音 | `update_temp_pinyin_candidates` | 同上（**曾用纯 weight，是本测试要防的回归**）|
+/// | 快捷输入 | `handle_mode` 按 member 汇总 | **不重排**，保持引擎顺序 + member 优先级 |
+/// | 混输 | `MixedEngine` 内部融合 | 引擎内按档位（码表精确 > 拼音）|
+///
+/// 三者一致同时证明了一件事：**拼音引擎自身给出的顺序就等于 `candidate_display_order`**
+/// （快捷输入不重排却与重排过的纯拼音相同）。所以临拼当初的 bug 本质是「在已正确的引擎
+/// 顺序上又用错误规则重排了一次」——纯 weight 排序缺 `is_prefix` 层，前缀补全「年」(nian)
+/// 与高频词组「你的」压过了精确匹配的单字「你」。
+///
+/// 混输单独比对：它首位是**五笔码表候选**（`ni` → 二简「悄」w9950，正是 gen_dict 给二简的
+/// 钦定权重），码表精确匹配优先于拼音属设计（见 mixed_pinyin_exact_tier），故只断言其中
+/// 拼音候选的**相对顺序**不变。
+#[test]
+fn all_pinyin_paths_share_same_order() {
+    if !has_schemas() {
+        eprintln!("跳过：词库不存在");
+        return;
+    }
+    for input in ["ni", "shi"] {
+        let plain = plain_pinyin_candidates("smart", input);
+        let temp = temp_pinyin_candidates("smart", input);
+        let quick = quick_input_candidates(input);
+        assert!(plain.len() >= 8, "前提：{input} 应有足够候选");
+
+        let n = 8.min(plain.len()).min(temp.len()).min(quick.len());
+        assert_eq!(
+            &temp[..n],
+            &plain[..n],
+            "临拼 `{input}` 应与纯拼音一致\n临拼: {:?}\n纯拼音: {:?}",
+            &temp[..n],
+            &plain[..n]
+        );
+        assert_eq!(
+            &quick[..n],
+            &plain[..n],
+            "快捷输入 `{input}` 的拼音候选应与纯拼音一致\n快捷: {:?}\n纯拼音: {:?}",
+            &quick[..n],
+            &plain[..n]
+        );
+
+        // 混输：滤出两边共有的候选，比对**前 20 位**的相对顺序（码表候选允许插在其间）。
+        //
+        // 只比前 20 而非全表：实测两侧在第 100 位附近会有个别同权重候选互换（如「念」与
+        // 「你看看」），那是稳定排序下**输入顺序不同**导致的——混输的拼音候选经过与码表的
+        // 融合，进入排序时的原始次序本就与纯拼音不同。深尾部的这种抖动不影响使用，
+        // 断言全表只会让测试变脆。
+        let take = 20;
+        let mixed = mixed_candidates(input);
+        let mixed_seq: Vec<&String> = mixed
+            .iter()
+            .filter(|t| plain.contains(t))
+            .take(take)
+            .collect();
+        let plain_seq: Vec<&String> = plain
+            .iter()
+            .filter(|t| mixed.contains(t))
+            .take(take)
+            .collect();
+        assert_eq!(
+            mixed_seq, plain_seq,
+            "混输 `{input}` 中拼音候选（前 {take} 位）的相对顺序应与纯拼音一致"
+        );
+    }
+}

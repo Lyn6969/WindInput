@@ -228,12 +228,23 @@ impl Coordinator {
         state.preedit = format!("{}{}", prefix, display);
         state.overlay_body = display; // 供光标换算（含引擎插入的音节分隔符，与缓冲不同形）
 
-        // 临时拼音候选按词库权重排序（其词频维度涉及特殊模式配置归属，待 S1 引擎层处理）。
+        // 临拼候选按**与主路径同一套层级链**排序（`candidate_display_order`：
+        // is_fuzzy → is_partial → is_prefix → weight → natural_order）。
+        //
+        // ⚠️ 曾用纯 weight 排序（`b.weight.cmp(&a.weight).then(natural_order)`），缺了
+        // `is_prefix` 那一层 ⇒ **前缀补全压过精确匹配**：实测临拼 `ni` 首选是「年」(nian)、
+        // 整页被「你的」「你们」等高频词组占满，而全拼下首选是「你」。用户报障即此。
+        //
+        // ⚠️ `ignore_weight` 必须按**临拼目标方案**取（`base_sort_ignores_weight_of`），
+        // 不能用 `active_base_sort_ignores_weight()`——活跃方案是码表（五笔），拿它的
+        // `base_sort` 去排拼音候选就是「被五笔干扰」。
+        let ignore_weight = self.engine_mgr.base_sort_ignores_weight_of(&schema);
+        // 供拼音精确档判「消费整串」。字节长度，与 `consumed_length` 同域（缓冲恒 ASCII）。
+        let input_len = state.temp_pinyin_buffer.len();
         let mut candidates = result.candidates;
+        // mixed=false：临拼是纯拼音 overlay，不存在码表/拼音跨来源竞争。
         candidates.sort_by(|a, b| {
-            b.weight
-                .cmp(&a.weight)
-                .then(a.natural_order.cmp(&b.natural_order))
+            crate::handle_candidate::candidate_display_order(a, b, ignore_weight, false, input_len)
         });
         // 截断值必须跟取数上限同源：这两处曾同用一个常量兼任「取多少」与「留多少」，
         // 只改一处会出现「取了 5000 条又砍回 50」。
