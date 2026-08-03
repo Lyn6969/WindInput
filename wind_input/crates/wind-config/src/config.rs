@@ -961,10 +961,46 @@ impl SpecialModeConfig {
 
 // ───────────────────────── input（输入行为）─────────────────────────
 
+/// 「检索范围」智能档的放宽增强（设计见 `docs/design/smart-filter-scope-relax.md`）。
+///
+/// 智能档会滤掉同码位有常用字的生僻字，代价是**唯一编码被占的生僻字彻底打不出**（如五笔
+/// 「桜」sivg 与常用「档」同码），用户只能整体切「全部字符」并常忘记切回。
+///
+/// 出路只有**一条**：候选窗内按向后翻页键翻到底，再按一次即临时放宽。刻意不做任何自动
+/// 行为——曾实现过「候选不足一页自动补充」，实测平白改变了智能档的既有观感，已删除。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ScopeRelaxConfig {
+    /// 末页再按向后翻页键即临时放宽为「全部字符」，本次组合结束后自动恢复。
+    ///
+    /// 三类引擎通用且唯一的入口——用户找生僻字本就会一路翻页，翻到底即是明确的放宽意图。
+    /// 候选**不足一页**时同样适用：那时只有一页，按翻页键一样翻不动，落到同一条路径。
+    #[serde(default = "default_true")]
+    pub page_end_key: bool,
+    /// 放宽放出来的候选的前缀标注（空=不标注），用于与正常候选区分。
+    #[serde(default = "default_scope_relax_prefix")]
+    pub prefix: String,
+}
+
+impl Default for ScopeRelaxConfig {
+    fn default() -> Self {
+        Self {
+            page_end_key: true,
+            prefix: default_scope_relax_prefix(),
+        }
+    }
+}
+
+fn default_scope_relax_prefix() -> String {
+    "·".to_string()
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct InputConfig {
     #[serde(default = "default_filter_mode")]
     pub filter_mode: String,
+    /// 检索范围放宽（智能档增强）。
+    #[serde(default)]
+    pub scope_relax: ScopeRelaxConfig,
     #[serde(default = "default_enter_behavior")]
     pub enter_behavior: String,
     #[serde(default = "default_space_behavior")]
@@ -1015,6 +1051,7 @@ impl Default for InputConfig {
     fn default() -> Self {
         Self {
             filter_mode: "smart".to_string(),
+            scope_relax: ScopeRelaxConfig::default(),
             enter_behavior: "commit".to_string(),
             space_on_empty_behavior: "commit".to_string(),
             numpad_behavior: default_numpad_behavior(),

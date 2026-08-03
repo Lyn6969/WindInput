@@ -399,6 +399,21 @@ pub(crate) struct State {
     pub(crate) s2t_enabled: bool,
     /// 检索范围过滤模式（smart/general/gb18030；运行时切换）
     pub(crate) filter_mode: wind_candidate::FilterMode,
+    /// 检索范围的**临时**放宽（手动触发：末页再按翻页键 / 专用热键）。
+    /// 设计见 `docs/design/smart-filter-scope-relax.md` §5。
+    ///
+    /// **只在内存、绝不写配置**——这是与 `set_filter_mode` 的关键区别，后者会持久化到
+    /// `input.filter_mode`。本次组合结束（缓冲清空）即失效，失效收口在
+    /// `handle_key_event_policed`（清空路径十几处，散点接线必漏）。
+    ///
+    /// 放宽时把**全部**被滤候选带 `is_scope_filtered` 标记**追加到末尾**，与自动补充同一
+    /// 呈现方式（区别只在补多少：自动补到一页、手动放全部）。
+    ///
+    /// ⚠️ 曾设计成「按真实顺序插入，与菜单切『全部字符』所见一致」，**已否决**：翻页是线性
+    /// 前进的动作，翻到末尾再翻却让新字插到第 1 页（实测 `dwi` 的字权重 8999 占三简位，正好
+    /// 排到第 1 页第 2 位），视口要么跳回页首、要么原地不动，两种都突兀。菜单切换是全局持久
+    /// 的换档，末页翻页是临时的渐进探索——语义不同，不必对齐呈现。
+    pub(crate) scope_relaxed: bool,
     /// 用户是否开启常驻工具栏（菜单开关；与“当前是否激活”正交）。
     pub(crate) toolbar_visible: bool,
     /// 本输入法当前是否处于激活态：IME_ACTIVATED/FocusGained 置真；
@@ -1369,6 +1384,7 @@ impl Coordinator {
                 chinese_punct: init_punct,
                 s2t_enabled: config.input.s2t.enabled,
                 filter_mode: wind_candidate::FilterMode::from_str(&config.input.filter_mode),
+                scope_relaxed: false,
                 toolbar_visible: config.ui.toolbar.visible, // 启动初值来自配置(运行时可菜单切换)
                 ime_active: false, // 启动未激活：工具栏待 IME_ACTIVATED/FocusGained 才显示
                 has_edit_context: false, // 同上：焦点尚未落到任何可编辑控件
@@ -2387,8 +2403,60 @@ impl Coordinator {
             state.selected_index = 0;
             true
         } else {
-            false
+            // 已在末页仍按向后翻页 ⇒「翻到底了还想看更多」＝明确的放宽意图。
+            self.try_relax_scope_on_page_end(state)
         }
+    }
+
+    /// 组合结束（输入缓冲已空）时让临时放宽失效，恢复配置的检索范围档位。
+    ///
+    /// 判据取「缓冲是否为空」而非「是否发生了上屏」：上屏、ESC 取消、切焦点清空、模式切换
+    /// 都会清空缓冲，一个判据全覆盖，无需逐路径接线。放宽期间敲字母/退格/翻页时缓冲非空，
+    /// 状态得以保持——找生僻字常要改几次编码。
+    fn expire_scope_override(&self) {
+        let mut s = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        if s.scope_relaxed && s.input_buffer.is_empty() {
+            s.scope_relaxed = false;
+        }
+    }
+
+    /// 末页再按向后翻页键 → 临时放宽检索范围为「全部字符」，重建候选并翻到新增的那页。
+    ///
+    /// 设计见 `docs/design/smart-filter-scope-relax.md` §5。这是三类引擎**通用的主入口**：
+    /// 码表候选少、翻两下就到底；拼音候选多，但用户找生僻字本就会一路翻页，翻到底同样是
+    /// 明确信号。挂在既有的「翻不动就返回 false」分支上，不占任何键位。
+    ///
+    /// 返回是否真的发生变化（上层据此决定重绘）。放宽后若没有新增候选则**撤销**，
+    /// 避免留下一个什么也没带来、却会影响后续按键的放宽态。
+    fn try_relax_scope_on_page_end(&self, state: &mut State) -> bool {
+        if !self.rt().config.input.scope_relax.page_end_key {
+            return false;
+        }
+        // 已放宽过就不再重复；`Gb18030` 本就不过滤，无可放宽
+        if state.scope_relaxed
+            || state.filter_mode == wind_candidate::FilterMode::Gb18030
+            || state.input_buffer.is_empty()
+        {
+            return false;
+        }
+        state.scope_relaxed = true;
+        let limit = state.candidate_limit;
+        self.build_candidates(state, limit);
+        // 判据取「列表里有没有真的出现被滤候选」，而非「总数是否变多」——候选受 limit 截断时
+        // 总数可能不变，那样会误判成「没放出东西」而撤销。
+        if !state.candidates.iter().any(|c| c.is_scope_filtered) {
+            // 该码位本就没有被滤的字 → 原样撤销，别留一个什么也没带来、却会影响后续按键的放宽态
+            state.scope_relaxed = false;
+            return false;
+        }
+        // 放宽出来的候选**追加在末尾**，所以照常翻到下一页就能看到，与「继续往后翻」的动作
+        // 语义完全一致。⚠️ 曾让放宽后的候选按真实顺序插入，结果 `dwi` 的新字（权重 8999 占
+        // 三简位）落到第 1 页第 2 位，视口只能跳回页首——翻页翻着翻着跳回开头，很突兀。
+        if state.current_page + 1 < self.total_pages(state) {
+            state.current_page += 1;
+            state.selected_index = 0;
+        }
+        true
     }
 
     /// 候选导航键的统一执行（配置驱动，见 `keymap::NavKeys`）：高亮上下 + 翻页。
@@ -2783,6 +2851,8 @@ impl Coordinator {
         let tip_cfg = &rt.config.ui.tooltip;
         // 命令直通车候选前缀标注（features.cmdbar.candidate_prefix）：仅命令候选(is_command)显示。
         let cmd_prefix = rt.config.input.cmdbar.candidate_prefix.as_str();
+        // 检索范围放宽（自动补充）候选的前缀标注，见 docs/design/smart-filter-scope-relax.md
+        let scope_prefix = rt.config.input.scope_relax.prefix.as_str();
         // 编码提示(反查):对拼音来源候选,用主码表真实反查索引填 comment(实际填充见下方候选构造,
         // 受 source==Pinyin 守卫)。门控两类:
         //  - 普通拼音/混输方案:跟随方案 show_code_hint(pinyin_show_code_hint 解析,混输取次方案);
@@ -2875,8 +2945,12 @@ impl Coordinator {
                 }
                 CandidateItem {
                     // 命令候选加前缀标注（截断后再加,保证前缀不被截掉）。
+                    // 检索范围放宽补进来的候选同理加标注（`input.scope_relax.prefix`），让用户
+                    // 一眼看出「这几条是超出当前检索范围补来的」，而非词库里本该有的常用字。
                     text: if c.is_command && !cmd_prefix.is_empty() {
                         format!("{cmd_prefix}{disp}")
+                    } else if c.is_scope_filtered && !scope_prefix.is_empty() {
+                        format!("{scope_prefix}{disp}")
                     } else {
                         disp
                     },
@@ -4586,6 +4660,12 @@ impl MessageHandler for Coordinator {
             }
             _ => {}
         }
+        // 检索范围临时放宽的失效：本次组合结束（缓冲已空）即恢复配置档位。
+        // 与 record_input_stats / note_commit_action 同一收口理由——`input_buffer.clear()`
+        // 有十几个调用点（上屏/取消/切焦点/模式切换），散点接线必漏。放在按键处理的唯一出口，
+        // 天然覆盖全部结束路径。用户选字上屏后下一次输入即回到智能档；而放宽期间继续敲字母、
+        // 退格改码、翻页都不会丢状态（缓冲非空），符合「找生僻字常要改几次编码」的实际。
+        self.expire_scope_override();
         // 配对状态保活：须在 handle_key_event **之后**刷新，否则本次按键的陈旧判定
         // 会先被自己刷新掉，TTL 永不触发。栈空时是空操作。
         self.touch_pair_state();

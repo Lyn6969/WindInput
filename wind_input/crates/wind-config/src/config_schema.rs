@@ -163,9 +163,8 @@ static REGISTRY: &[ConfigField] = &[
     // -- input（输入行为）--
     f("input.filter_mode", Str),
     // 检索范围放宽（智能档增强，见 docs/design/smart-filter-scope-relax.md）
-    f("input.scope_relax.auto", Bool),
-    f("input.scope_relax.prefix", Str),
     f("input.scope_relax.page_end_key", Bool),
+    f("input.scope_relax.prefix", Str),
     f("input.enter_behavior", Str),
     f("input.space_on_empty_behavior", Str),
     f("input.numpad_behavior", Str),

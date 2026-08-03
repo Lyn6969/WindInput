@@ -208,6 +208,20 @@ numpad_behavior = "direct"
 #                          （终端 / Chromium）不双写，但部分宿主会给整段画下划线。
 top_commit_mode = "direct_commit"
 
+# 检索范围放宽（filter_mode = "smart" 时的增强，见 docs/design/smart-filter-scope-relax.md）
+#
+# 智能档会滤掉「同码位已有常用字」的生僻字，代价是唯一编码被占的字彻底打不出——如五笔
+# 「桜」(sivg) 与常用「档」同码，只能整体切「全部字符」，且常忘记切回。
+#
+# 出路只有一条，且**完全由用户主动触发**：候选窗内翻页翻到底，再按一次向后翻页键，即把
+# 被滤掉的字追加到列表末尾；本次组合结束（上屏/取消）后自动恢复。刻意不做任何自动行为
+# ——「候选不足一页就自动补充」试过，平白改变了智能档的既有观感，已删除。
+[input.scope_relax]
+# 末页再按向后翻页键 → 临时放宽。候选不足一页时同样适用（那时只有一页，一样翻不动）。
+page_end_key = true
+# 放宽放出来的候选的前缀标注（空串=不标注），用于与正常候选区分。
+prefix = "·"
+
 # 启动默认状态（原 [general] 域）
 [input.default]
 remember_last_state = false

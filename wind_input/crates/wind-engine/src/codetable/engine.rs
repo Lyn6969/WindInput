@@ -121,7 +121,14 @@ fn decide_auto_commit(
     if !at_full || input.chars().count() < min_len {
         return None;
     }
-    let mut exact = candidates.iter().filter(|c| c.code == input);
+    // ⚠️ **排除检索范围放宽补进来的候选**（`is_scope_filtered`）。今天的满码自动上屏，一部分
+    // 正是靠智能过滤滤掉了同码生僻字才成立（见 `recheck_auto_commit_unique_after_filter`：
+    // `hhnu` 下常用「X」+生僻「愳」判不唯一不上屏，滤掉「愳」后复评才放行）。放宽把它们补回
+    // 列表却不在此排除，会让一批原本满码即上屏的字退化成要多按一次空格——**而且是静默退化**，
+    // 用户只觉得「上屏时灵时不灵」。排除后，自动上屏口径在自动补充/手动放宽下均与放宽前一致。
+    let mut exact = candidates
+        .iter()
+        .filter(|c| c.code == input && !c.is_scope_filtered);
     let first = exact.next()?;
     if exact.next().is_some() {
         return None; // 多个精确匹配，不自动上屏
@@ -383,6 +390,42 @@ mod tests {
             text: text.to_string(),
             ..Default::default()
         }
+    }
+
+    /// ★ 护栏：检索范围放宽补回的候选**不得**影响满码自动上屏。
+    ///
+    /// 今天的自动上屏有一部分是靠智能过滤滤掉同码生僻字才成立的（见
+    /// `recheck_auto_commit_unique_after_filter`）。放宽（自动补充 / 手动临时切换）会把这些字
+    /// 补回候选列表，若不在计数时排除，一批原本满码即上屏的字会**静默退化**成要多按一次空格，
+    /// 用户只感到「上屏时灵时不灵」。设计见 docs/design/smart-filter-scope-relax.md §2.1。
+    #[test]
+    fn scope_filtered_candidates_do_not_block_auto_commit() {
+        let mut relaxed = cand("hhnu", "愳");
+        relaxed.is_scope_filtered = true; // 智能档下本应被滤，因放宽才在列表里
+        let with_relaxed = [cand("hhnu", "X"), relaxed];
+        assert_eq!(
+            decide_auto_commit(true, 4, "hhnu", &with_relaxed, false).as_deref(),
+            Some("X"),
+            "放宽补回的同码生僻字不该否决满码自动上屏"
+        );
+
+        // ★ 反向对照：同样两条候选，只是不带放宽标记（即它本就通过了过滤）→ 仍须照旧否决。
+        // 没有这条，一个「无条件放行」的错误实现同样能让上面那句变绿。
+        let both_normal = [cand("hhnu", "X"), cand("hhnu", "愳")];
+        assert_eq!(
+            decide_auto_commit(true, 4, "hhnu", &both_normal, false),
+            None,
+            "未经放宽的两个精确同码候选仍须否决上屏（放行了说明排除条件写宽了）"
+        );
+
+        // 边界：全部候选都是放宽补回的 → 无可上屏的正常候选，不上屏
+        let mut only_relaxed = cand("hhnu", "愳");
+        only_relaxed.is_scope_filtered = true;
+        assert_eq!(
+            decide_auto_commit(true, 4, "hhnu", &[only_relaxed], false),
+            None,
+            "只有放宽候选时不该拿它自动上屏"
+        );
     }
 
     #[test]

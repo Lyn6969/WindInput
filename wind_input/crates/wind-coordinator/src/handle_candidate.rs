@@ -743,7 +743,17 @@ impl Coordinator {
         // 检索范围过滤（按模式裁剪；is_common 已由上面的 mark_common 填好）
         self.apply_filter(state, &mut candidates);
         // 用户词频重排（独立维度，used-first，绝不改 weight；frequency.md §3）
-        self.apply_freq_rerank(&mut candidates, &state.input_buffer);
+        //
+        // ⚠️ 自动补充的候选（`is_scope_filtered`，恒在末尾）**排除在重排之外**：沉底是硬约束。
+        // 否则用户误选一次补充来的生僻字，used-first 就会把它顶到常用字前面——码表侧
+        // **不衰减**，误选一次即永久翻转（见 codetable-freq-short-code-protection.md），
+        // 与「自动补充不影响原有排序」的承诺直接相悖。
+        // 用 take_while 而非 partition_point：不预设列表整体有序，只截断到首个补充候选为止。
+        let rerank_len = candidates
+            .iter()
+            .take_while(|c| !c.is_scope_filtered)
+            .count();
+        self.apply_freq_rerank(&mut candidates[..rerank_len], &state.input_buffer);
         // Shadow 规则：删除过滤 + 置顶/移动重排（优先级最高，排序后应用）
         self.apply_shadow(&mut candidates, &state.input_buffer);
         state.candidates = candidates;
@@ -916,7 +926,23 @@ impl Coordinator {
             return;
         }
         let taken = std::mem::take(candidates);
-        *candidates = wind_candidate::filter_candidates(taken, mode);
+        let outcome = wind_candidate::filter_candidates(taken, mode);
+        *candidates = outcome.kept;
+        // 临时放宽（末页再按向后翻页键触发）：把被滤候选带 `is_scope_filtered` 标记
+        // **追加到末尾**，原有候选顺序纹丝不动。标记不可省——自动上屏计数靠它排除，
+        // 否则放宽期间满码上屏会静默退化（见 `decide_auto_commit`）。
+        //
+        // **不放宽时一切照旧，这是刻意的**。曾实现过「候选不足一页就自动补充」，实测下来
+        // 平白改变了智能档的既有观感（用户没要求却凭空多出生僻字），已删除：智能档的表现
+        // 不该被任何自动行为改动，**用户不主动按翻页键就什么都不变**。
+        // 「不足一页」并未因此失去出路——只有一页时 `page_next` 同样翻不动，落到同一条
+        // 放宽分支，一条路径覆盖两种场景。
+        if state.scope_relaxed {
+            candidates.extend(outcome.filtered.into_iter().map(|mut c| {
+                c.is_scope_filtered = true;
+                c
+            }));
+        }
     }
 
     /// 应用 Shadow 规则：先按 deleted 过滤，再把 pinned 按目标位置重排。

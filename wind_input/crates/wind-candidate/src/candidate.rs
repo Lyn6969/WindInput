@@ -93,6 +93,24 @@ pub struct Candidate {
     pub natural_order: i32,
     pub comment: String,
     pub is_common: bool,
+    /// 该候选**按当前检索范围本应被滤掉**，是因用户按翻页键**临时放宽**才留在列表里
+    /// （设计见 `docs/design/smart-filter-scope-relax.md`）。
+    ///
+    /// **语义严格限定为这一个客观事实，不编码任何排序或显示决策**。三个消费者各自决定行为：
+    /// - `decide_auto_commit`：计数时**跳过**——今天的全码自动上屏，一部分正是靠智能过滤滤掉了
+    ///   同码生僻字（见该函数注释与 `recheck_auto_commit_unique_after_filter`）。放宽把它们放回来
+    ///   而不排除，会让一批原本满码即上屏的字退化成要按空格；
+    /// - 排序：追加在列表**末尾**，原有候选顺序纹丝不动（首选位置恒定，盲打安全）；
+    /// - 词频重排：**排除**在外，沉底是硬约束（否则误选一次就被 used-first 顶到常用字前，
+    ///   而码表侧 used-first 不衰减）；
+    /// - UI：加 `input.scope_relax.prefix` 前缀标注（默认 `·`）。
+    ///
+    /// ⚠️ **不要把「末尾项」写死进这个字段的语义**。它表达的是「本应被滤」这个客观事实，
+    /// 沉底是**消费端（排序）**的决定——本设计的呈现方式就改过一次（曾按真实顺序插入），
+    /// 两者混在一起会让改呈现必须连字段语义一起推翻。`is_prefix` 被静态短语借作「非精确层」、
+    /// `is_fuzzy` 被简拼借作「沉底标记」都是同类前科——来源属性与排序决策必须分开。
+    #[serde(default)]
+    pub is_scope_filtered: bool,
     pub is_phrase: bool,
     pub is_command: bool,
     /// 是否来自模糊音变体命中（非原拼音精确匹配）。
@@ -283,6 +301,7 @@ impl Default for Candidate {
             natural_order: 0,
             comment: String::new(),
             is_common: false,
+            is_scope_filtered: false,
             is_phrase: false,
             is_command: false,
             is_fuzzy: false,

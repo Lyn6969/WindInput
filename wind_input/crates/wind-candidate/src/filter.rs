@@ -35,38 +35,60 @@ impl FilterMode {
     }
 }
 
+/// 过滤结果：保留集 + **被滤集**。
+///
+/// 被滤集不是调试信息，是「检索范围放宽」的数据来源（设计见
+/// `docs/design/smart-filter-scope-relax.md`）：智能档下候选不足一页时从中回补，
+/// 手动临时放宽时整体并回。**过滤器本就算出了这个集合，此前直接丢弃**——留下它使放宽
+/// 无需重新查询词库、无需重新排序，被滤集天然保持原排序序。
+pub struct FilterOutcome {
+    /// 按当前模式保留、正常显示的候选。
+    pub kept: Vec<Candidate>,
+    /// 被本次过滤剔除的候选，保持原有相对顺序。`Gb18030`（不过滤）时恒空。
+    pub filtered: Vec<Candidate>,
+}
+
+/// 「常用词类」判据：常用字 / 短语 / 命令 / 分组一律豁免过滤。
+/// 两个模式共用同一判据，抽出以免两处分叉。
+fn is_common_like(c: &Candidate) -> bool {
+    c.is_common || c.is_phrase || c.is_command || c.is_group
+}
+
 /// 按模式过滤候选词
-pub fn filter_candidates(candidates: Vec<Candidate>, mode: FilterMode) -> Vec<Candidate> {
+pub fn filter_candidates(candidates: Vec<Candidate>, mode: FilterMode) -> FilterOutcome {
     match mode {
-        FilterMode::Gb18030 => candidates,
+        FilterMode::Gb18030 => FilterOutcome {
+            kept: candidates,
+            filtered: Vec::new(),
+        },
         FilterMode::General => filter_common_only(candidates),
         FilterMode::Smart => filter_smart(candidates),
     }
 }
 
 /// 只保留常用词、短语、命令、分组
-fn filter_common_only(candidates: Vec<Candidate>) -> Vec<Candidate> {
-    candidates
-        .into_iter()
-        .filter(|c| c.is_common || c.is_phrase || c.is_command || c.is_group)
-        .collect()
+fn filter_common_only(candidates: Vec<Candidate>) -> FilterOutcome {
+    let (kept, filtered) = candidates.into_iter().partition(is_common_like);
+    FilterOutcome { kept, filtered }
 }
 
-/// 智能过滤：同一来源+编码下有常用词则过滤非常用词
-fn filter_smart(candidates: Vec<Candidate>) -> Vec<Candidate> {
+/// 按 (来源, code) 分组统计「该组是否存在常用词」。
+///
+/// **必须带来源**：混输下码表（五笔码）与拼音候选常共用同一 code 字符串（原始输入，如
+/// "wang"），但属不同编码体系；若仅按 code 分组，常用的拼音候选会误使同 code 的生僻码表字
+/// （如 佢）被过滤，导致混输码表主方案与纯五笔表现不一致。按来源隔离后，码表候选只受同来源
+/// 候选影响，混输码表与纯五笔一致。
+fn build_has_common(
+    candidates: &[Candidate],
+) -> std::collections::HashMap<(CandidateSource, String), bool> {
     use std::collections::HashMap;
-
-    // 按 (来源, code) 分组检查是否有常用词。**必须带来源**：混输下码表（五笔码）与拼音候选常
-    // 共用同一 code 字符串（原始输入，如 "wang"），但属不同编码体系；若仅按 code 分组，常用的
-    // 拼音候选会误使同 code 的生僻码表字（如 佢）被过滤，导致混输码表主方案与纯五笔表现不一致。
-    // 按来源隔离后，码表候选只受同来源候选影响，混输码表与纯五笔一致。
     let mut has_common: HashMap<(CandidateSource, String), bool> = HashMap::new();
-    for c in &candidates {
+    for c in candidates {
         // 先建组（哪怕非常用），使「该码位下无常用词」与「该码位没出现过」区分开。
         has_common
             .entry((c.source, c.code.clone()))
             .or_insert(false);
-        if !(c.is_common || c.is_phrase || c.is_command || c.is_group) {
+        if !is_common_like(c) {
             continue;
         }
         has_common.insert((c.source, c.code.clone()), true);
@@ -77,18 +99,21 @@ fn filter_smart(candidates: Vec<Candidate>) -> Vec<Candidate> {
             has_common.insert((c.source, code.clone()), true);
         }
     }
+    has_common
+}
 
-    candidates
-        .into_iter()
-        .filter(|c| {
-            let common_exists = has_common
-                .get(&(c.source, c.code.clone()))
-                .copied()
-                .unwrap_or(false);
-            // 同来源同编码下存在常用词则只保留常用词；否则保留全部（孤儿编码）
-            !common_exists || c.is_common || c.is_phrase || c.is_command || c.is_group
-        })
-        .collect()
+/// 智能过滤：同一来源+编码下有常用词则过滤非常用词
+fn filter_smart(candidates: Vec<Candidate>) -> FilterOutcome {
+    let has_common = build_has_common(&candidates);
+    let (kept, filtered) = candidates.into_iter().partition(|c| {
+        let common_exists = has_common
+            .get(&(c.source, c.code.clone()))
+            .copied()
+            .unwrap_or(false);
+        // 同来源同编码下存在常用词则只保留常用词；否则保留全部（孤儿编码）
+        !common_exists || is_common_like(c)
+    });
+    FilterOutcome { kept, filtered }
 }
 
 #[cfg(test)]
@@ -105,11 +130,16 @@ mod tests {
         }
     }
 
+    /// 只取保留集——多数用例关心的是「显示成什么样」。被滤集另有专门用例覆盖。
+    fn kept_of(candidates: Vec<Candidate>, mode: FilterMode) -> Vec<Candidate> {
+        filter_candidates(candidates, mode).kept
+    }
+
     #[test]
     fn smart_keeps_uncommon_codetable_when_common_pinyin_shares_code() {
         // 混输：码表生僻字 佢 与常用拼音 往/王 共用 code "wang"（不同来源）。
         // 智能过滤按来源隔离 → 佢 不被拼音的常用性挤掉（与纯五笔一致）。
-        let out = filter_candidates(
+        let out = kept_of(
             vec![
                 cand("佢", "wang", CandidateSource::CodeTable, false),
                 cand("往", "wang", CandidateSource::Pinyin, true),
@@ -127,7 +157,7 @@ mod tests {
     #[test]
     fn smart_filters_uncommon_within_same_source_and_code() {
         // 同来源同 code：有常用则滤非常用（原语义不变）。
-        let out = filter_candidates(
+        let out = kept_of(
             vec![
                 cand("王", "wang", CandidateSource::Pinyin, true),
                 cand("尪", "wang", CandidateSource::Pinyin, false),
@@ -165,7 +195,7 @@ mod tests {
         // 打 siv：「档」主码 siv，被去重吃掉的 sivg 记在 merged_codes
         let mut dang = cand("档", "siv", CandidateSource::CodeTable, true);
         dang.merged_codes = vec!["sivg".into()];
-        let out = filter_candidates(
+        let out = kept_of(
             vec![dang, cand("桜", "sivg", CandidateSource::CodeTable, false)],
             FilterMode::Smart,
         );
@@ -185,7 +215,7 @@ mod tests {
         // 「档」只占 siv/sivg，与「樑」的 sivs 无关 → 樑 仍是孤儿码，须保留
         let mut dang = cand("档", "siv", CandidateSource::CodeTable, true);
         dang.merged_codes = vec!["sivg".into()];
-        let out = filter_candidates(
+        let out = kept_of(
             vec![dang, cand("樑", "sivs", CandidateSource::CodeTable, false)],
             FilterMode::Smart,
         );
@@ -214,6 +244,58 @@ mod tests {
         assert_eq!(a.merged_codes.len(), 2, "重复归并应幂等");
     }
 
+    /// 被滤集是「检索范围放宽」的唯一数据来源（自动补充从中回补、手动放宽整体并回），
+    /// 必须**完整且保持原序**——顺序即是放宽后的呈现顺序，乱序会让补充项的位置不可预期。
+    #[test]
+    fn filtered_set_captures_removed_candidates_in_order() {
+        let mut dang = cand("档", "siv", CandidateSource::CodeTable, true);
+        dang.merged_codes = vec!["sivg".into()];
+        let out = filter_candidates(
+            vec![
+                dang,
+                cand("桜", "sivg", CandidateSource::CodeTable, false),
+                cand("樑", "sivs", CandidateSource::CodeTable, false),
+                cand("醇", "sivw", CandidateSource::CodeTable, false),
+            ],
+            FilterMode::Smart,
+        );
+        let texts = |v: &[Candidate]| v.iter().map(|c| c.text.clone()).collect::<Vec<_>>();
+        // 樑/醇 是孤儿码得以保留；桜 因同码位有常用「档」（经 merged_codes 还原）被滤
+        assert_eq!(texts(&out.kept), vec!["档", "樑", "醇"]);
+        assert_eq!(texts(&out.filtered), vec!["桜"]);
+    }
+
+    /// 保留集与被滤集**恰好构成原集合的划分**：不重不漏。
+    /// 若哪天改成「过滤时顺手丢弃某类候选」，放宽就会补不回它，且没有任何现象提示。
+    #[test]
+    fn kept_and_filtered_partition_the_input() {
+        let input = vec![
+            cand("王", "wang", CandidateSource::Pinyin, true),
+            cand("尪", "wang", CandidateSource::Pinyin, false),
+            cand("往", "wang", CandidateSource::Pinyin, true),
+        ];
+        let n = input.len();
+        for mode in [FilterMode::Smart, FilterMode::General, FilterMode::Gb18030] {
+            let out = filter_candidates(input.clone(), mode);
+            assert_eq!(
+                out.kept.len() + out.filtered.len(),
+                n,
+                "{mode:?}: 保留集+被滤集须等于原集合，不重不漏"
+            );
+        }
+    }
+
+    /// `Gb18030`（不过滤）下被滤集恒空——该档位没有「放宽」可言，补充逻辑应自然退化为无操作。
+    #[test]
+    fn gb18030_yields_empty_filtered_set() {
+        let out = filter_candidates(
+            vec![cand("桜", "sivg", CandidateSource::CodeTable, false)],
+            FilterMode::Gb18030,
+        );
+        assert_eq!(out.kept.len(), 1);
+        assert!(out.filtered.is_empty(), "不过滤档不该产生被滤集");
+    }
+
     /// ★ 跨来源**不得**归并码位：与 `smart_keeps_uncommon_codetable_when_common_pinyin_shares_code`
     /// 同一条约束的另一端。混输下 "wang" 既是五笔码又是拼音码，属两套编码体系；若去重时把
     /// 拼音码并进码表候选，`(CodeTable, "wang")` 会被凭空标记为「有常用字」，反过来误滤同码的
@@ -237,7 +319,7 @@ mod tests {
     #[test]
     fn smart_keeps_orphan_uncommon_code() {
         // 孤儿编码（无常用同码）：保留全部（纯五笔生僻字场景）。
-        let out = filter_candidates(
+        let out = kept_of(
             vec![cand("佢", "wtn", CandidateSource::CodeTable, false)],
             FilterMode::Smart,
         );
