@@ -1569,6 +1569,21 @@ pub struct KeysConfig {
     pub take_screenshot: String,
     #[serde(default)]
     pub global_hotkeys: Vec<String>,
+    /// **方案直达热键**：`schema_id` → 热键串（如 `{ english = "ctrl+shift+n" }`）。
+    ///
+    /// 按下即把该方案切成当前方案（等价于用 `switch_engine` 循环键一路切到它），
+    /// 与循环切换共用同一条 `switch_schema` 路径，因而也共用「切换时是否上屏」
+    /// （`commit_on_switch`）与持久化 `schema.active` 的行为。
+    ///
+    /// 与特殊模式的 `hotkey` 是**两种不同的进入**，别混：那个是 overlay，打完一段就退回原
+    /// 方案；这个是换方案，不按第二次不会回来。英文方案属于后者——「切过去打一段英文，
+    /// 再切回中文」正是它存在的理由。
+    ///
+    /// 空串 = 不注册。指向不存在 / 未启用方案的条目在切换时安全失败（`switch_schema`
+    /// 加载不到引擎即原样返回），不做启动期校验——方案可被删除或停用，校验只会在
+    /// 那种时刻制造无从修复的启动告警。
+    #[serde(default)]
+    pub schema_hotkeys: HashMap<String, String>,
     // ── 选择/导航键（原 input.*）──
     #[serde(default = "default_select_key_groups")]
     pub select_key_groups: Vec<String>,
@@ -1648,6 +1663,7 @@ impl Default for KeysConfig {
             delete_candidate: default_delete_candidate(),
             take_screenshot: default_take_screenshot(),
             global_hotkeys: Vec::new(),
+            schema_hotkeys: HashMap::new(),
             select_key_groups: default_select_key_groups(),
             page_keys: default_page_keys(),
             highlight_keys: default_highlight_keys(),

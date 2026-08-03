@@ -16,7 +16,11 @@ use crate::coordinator::Coordinator;
 /// 解析方案的权威引擎类型（schema.toml 的 engine.type 可能为空，
 /// 此时按 Schema::is_pinyin/is_mixed 依据默认词库类型推断）。
 fn resolve_engine_type(s: &wind_config::Schema) -> &'static str {
-    if s.is_mixed() {
+    if s.engine.engine_type.eq_ignore_ascii_case("english") {
+        // 必须显式分流：english 走 `is_pinyin()` 的兜底分支（主词库 dict_type 是 "english"
+        // 而非 "rime_pinyin"）会落到 "codetable"，方案列表就会把英文标成「码表」。
+        "english"
+    } else if s.is_mixed() {
         "mixed"
     } else if s.is_pinyin() {
         "pinyin"
@@ -153,7 +157,7 @@ impl Coordinator {
     pub fn web_data_rpc(&self, method: &str, params: &Value) -> anyhow::Result<Value> {
         match method {
             // ── schema.* ─────────────────────────────────────────
-            "schema.list" => self.web_schema_list(),
+            "schema.list" => self.web_schema_list(params),
             "schema.layouts" => self.web_schema_layouts(),
             "schema.active" => Ok(json!({ "id": self.engine_mgr.active_schema_id() })),
             "schema.setActive" => {
@@ -273,13 +277,24 @@ impl Coordinator {
         }
     }
 
-    fn web_schema_list(&self) -> anyhow::Result<Value> {
+    /// `schema.list` —— 方案全集（含元信息），供设置页方案管理与主方案下拉。
+    ///
+    /// `params.includeHidden = true` 时把隐藏方案（英文、快符这类 `[schema].hidden`）
+    /// 也列出来，供设置页的「显示特殊方案」开关。默认不含——它们对大多数用户是噪音。
+    /// 每项都带 `hidden` 字段，前端据此区分该行能配什么（隐藏方案配引导键，
+    /// 普通方案配直达热键）。
+    fn web_schema_list(&self, params: &Value) -> anyhow::Result<Value> {
         use std::collections::HashMap;
+
+        let include_hidden = params
+            .get("includeHidden")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
 
         // 设置页方案下拉的显示顺序（三段式，段间固定先后）：
         //   ① 已启用的拼音方案（数量少、最常用，置顶）
         //   ② 其余已启用方案，按 config.schema.available 配置顺序
-        //   ③ 未启用方案（磁盘扫到但不在 available），按类型分组「拼音→码表→混输」，组内按 id 字典序
+        //   ③ 未启用方案（磁盘扫到但不在 available），按类型分组「拼音→码表→混输→英文」，组内按 id 字典序
         // 底层 installed_schemas() 仍返回 id 字典序全集（做稳定去重锚点），排序只在此展示层重排。
 
         // 已启用方案 → 配置位置索引，供段①②保持配置顺序。
@@ -290,13 +305,15 @@ impl Coordinator {
             .map(|(i, s)| (s.as_str(), i))
             .collect();
 
-        // 未启用段的类型分组顺序：拼音→码表→混输。
+        // 未启用段的类型分组顺序：拼音→码表→混输→英文。
+        // 英文排最后：它是给需要长时间打英文的人用的，绝大多数人不会启用。
         fn type_rank(t: &str) -> i64 {
             match t {
                 "pinyin" => 0,
                 "codetable" => 1,
                 "mixed" => 2,
-                _ => 3,
+                "english" => 3,
+                _ => 4,
             }
         }
 
@@ -306,6 +323,13 @@ impl Coordinator {
             .engine_mgr
             .installed_schemas()
             .iter()
+            // 隐藏方案默认不列；已启用的隐藏方案是例外——用户既然把它放进了 available，
+            // 藏起来只会让人找不到怎么停用它。
+            .filter(|id| {
+                include_hidden
+                    || avail_pos.contains_key(id.as_str())
+                    || !self.engine_mgr.schema_is_hidden(id)
+            })
             .map(|id| {
                 // 取合并后 Schema 一次，带出方案元信息（备注/版本/图标/作者），供设置页方案列表与详情显示。
                 let merged = self.engine_mgr.schema_merged(id);
@@ -327,6 +351,8 @@ impl Coordinator {
                     }).unwrap_or_default(),
                     // 用户目录存在同名 schema.toml 即视为用户方案（可删除）；否则内置。
                     "builtin": !self.engine_mgr.is_user_schema(id),
+                    // 隐藏方案（英文/快符）：设置页据此决定该行显示什么、能配什么。
+                    "hidden": self.engine_mgr.schema_is_hidden(id),
                     "description": info.map(|i| i.description.clone()).unwrap_or_default(),
                     "version": info.map(|i| i.version.clone()).unwrap_or_default(),
                     "icon_label": info.map(|i| i.icon_label.clone()).unwrap_or_default(),
@@ -3208,6 +3234,74 @@ mod tests {
             "shuangpin",
             "双拼方案 scheme 应为 shuangpin"
         );
+    }
+
+    /// 英文方案是可切换方案：出现在 schema.list 里，且 engineType 自成一档。
+    ///
+    /// `is_pinyin()` 对 `type = "english"` 走的是「主词库 dict_type 是不是 rime_pinyin」
+    /// 那条兜底分支，英文词库是 `type = "english"`，于是会一路落到 `"codetable"`——
+    /// 设置页的类型徽章就会把英文标成「码表」。故 `resolve_engine_type` 必须显式分流。
+    #[test]
+    fn english_schema_listed_with_its_own_engine_type() {
+        use std::io::Write;
+        let base_dir = std::env::temp_dir().join("wind_coord_schema_list_english_test");
+        let schemas = base_dir.join("schemas");
+        let _ = std::fs::remove_dir_all(&base_dir);
+        std::fs::create_dir_all(&schemas).unwrap();
+        {
+            let mut f = std::fs::File::create(schemas.join("en_test.schema.toml")).unwrap();
+            write!(
+                f,
+                "[schema]\nid = \"en_test\"\n[engine]\ntype = \"english\"\n"
+            )
+            .unwrap();
+        }
+        // 反向对照：显式 hidden 的方案必须仍被挡在列表外。少了这条，上面的断言在
+        // 「hidden 过滤整个失效」时也会通过——那才是去掉 english 的 hidden 时最该防的回归。
+        {
+            let mut f = std::fs::File::create(schemas.join("en_hidden.schema.toml")).unwrap();
+            write!(
+                f,
+                "[schema]\nid = \"en_hidden\"\nhidden = true\n[engine]\ntype = \"english\"\n"
+            )
+            .unwrap();
+        }
+        let db_path = std::env::temp_dir().join("wind_webdata_schema_list_english.redb");
+        let _ = std::fs::remove_file(&db_path);
+        let store = Arc::new(Store::open(&db_path).unwrap());
+        let c = Coordinator::new_headless_with_store(
+            Config::default(),
+            Some(base_dir.as_path()),
+            Arc::clone(&store),
+        );
+
+        let list = c.web_data_rpc("schema.list", &json!({})).unwrap();
+        let arr = list.as_array().unwrap();
+
+        let en = arr.iter().find(|s| s["id"] == "en_test");
+        assert!(en.is_some(), "英文方案应出现在 schema.list 中：{arr:?}");
+        assert_eq!(
+            en.unwrap()["engineType"],
+            "english",
+            "英文方案的 engineType 应为 english，落成 codetable 会让类型徽章显示为「码表」"
+        );
+        assert!(
+            !arr.iter().any(|s| s["id"] == "en_hidden"),
+            "hidden = true 的方案默认不得出现在列表中：{arr:?}"
+        );
+
+        // includeHidden = true：隐藏方案出现，且带 hidden 标志供设置页区分该行能配什么。
+        let list2 = c
+            .web_data_rpc("schema.list", &json!({ "includeHidden": true }))
+            .unwrap();
+        let arr2 = list2.as_array().unwrap();
+        let hid = arr2
+            .iter()
+            .find(|s| s["id"] == "en_hidden")
+            .expect("includeHidden 时隐藏方案应出现");
+        assert_eq!(hid["hidden"], true, "隐藏方案应带 hidden = true");
+        let vis = arr2.iter().find(|s| s["id"] == "en_test").unwrap();
+        assert_eq!(vis["hidden"], false, "非隐藏方案的 hidden 应为 false");
     }
 
     /// P2d：构造带混输方案（primary=ct_test、secondary=py_test）的无头 Coordinator，

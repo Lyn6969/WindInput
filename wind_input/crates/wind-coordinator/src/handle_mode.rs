@@ -817,38 +817,69 @@ impl Coordinator {
 
     pub(crate) fn cycle_schema(&self) {
         if let Some(next) = self.engine_mgr.cycle_schema() {
-            self.sync_chaizi_assets(); // 拆字库/字根字体随活跃方案切换（变更检测，未变不动）
-            self.sync_comment_dicts(); // 方案专属注释库（`schemas` 字段）同理
-            // 「切换模式时取消大小写锁定」延伸：切方案的意图是用新方案输中文，
-            // 配置开启时取消 CapsLock，且若当前为英文模式一并归位中文。
-            let caps_cancelled = self.cancel_caps_on_switch();
-            let bundle = self.rt();
-            let cancel_cfg = bundle.config.input.capslock.cancel_on_mode_switch;
-            let follow = bundle.config.input.punct.follow_mode;
-            let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
-            let to_chinese = cancel_cfg && !state.chinese_mode;
-            if caps_cancelled || to_chinese {
-                state.chinese_mode = true;
-                if follow {
-                    state.chinese_punct = true;
-                }
+            self.finish_user_schema_switch(&next, "Cycled to schema");
+        }
+    }
+
+    /// 方案直达热键：切到指定方案（`keys.schema_hotkeys`）。
+    ///
+    /// 与循环键走**同一条收尾**（[`Self::finish_user_schema_switch`]），因而持久化、状态归位、
+    /// 工具栏刷新的行为逐项一致——两个入口表达的是同一个用户意图，只是一个"下一个"、
+    /// 一个"这一个"。
+    ///
+    /// 目标未加载时只提示不切换：与 [`Self::switch_schema`] 同样的理由——在 IME 线程同步
+    /// 重熔大词库会卡顿。已在当前方案时 `engine_mgr.switch_schema` 返回 false，天然幂等。
+    pub(crate) fn switch_schema_by_id(&self, schema_id: &str) {
+        if !self.engine_mgr.is_loaded(schema_id) {
+            let name = self.engine_mgr.schema_name(schema_id);
+            self.show_tip(&format!(
+                "{}准备中…",
+                if name.is_empty() { schema_id } else { &name }
+            ));
+            return;
+        }
+        if self.engine_mgr.switch_schema(schema_id) {
+            self.finish_user_schema_switch(schema_id, "Switched to schema");
+        }
+    }
+
+    /// 用户主动切换方案后的统一收尾（引擎已切好，此处只处理状态与副作用）。
+    ///
+    /// 抽出来是因为「切方案」有三个入口，行为却各自漂移过：`switch_schema` 不持久化
+    /// `schema.active`、`select_schema` 无条件归位中文而循环键按配置、只有循环键清 preedit
+    /// 和取消 CapsLock。新增的直达热键不再添第四份，与循环键共用这里。
+    fn finish_user_schema_switch(&self, schema_id: &str, log_verb: &str) {
+        self.sync_chaizi_assets(); // 拆字库/字根字体随活跃方案切换（变更检测，未变不动）
+        self.sync_comment_dicts(); // 方案专属注释库（`schemas` 字段）同理
+        // 「切换模式时取消大小写锁定」延伸：切方案的意图是用新方案输中文，
+        // 配置开启时取消 CapsLock，且若当前为英文模式一并归位中文。
+        let caps_cancelled = self.cancel_caps_on_switch();
+        let bundle = self.rt();
+        let cancel_cfg = bundle.config.input.capslock.cancel_on_mode_switch;
+        let follow = bundle.config.input.punct.follow_mode;
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        let to_chinese = cancel_cfg && !state.chinese_mode;
+        if caps_cancelled || to_chinese {
+            state.chinese_mode = true;
+            if follow {
+                state.chinese_punct = true;
             }
-            state.input_buffer.clear();
-            state.candidates.clear();
-            state.preedit.clear();
-            drop(state);
-            if caps_cancelled || to_chinese {
-                self.record_app_mode(true);
-                self.record_last_state();
-            }
-            self.notify_ui_hide();
-            self.push_state_update();
-            self.show_status();
-            self.notify_toolbar();
-            info!("Cycled to schema: {}", next);
-            if let Err(e) = Config::set_user_string(&["schema", "active"], &next) {
-                warn!("cycle_schema: 持久化 schema.active 失败: {}", e);
-            }
+        }
+        state.input_buffer.clear();
+        state.candidates.clear();
+        state.preedit.clear();
+        drop(state);
+        if caps_cancelled || to_chinese {
+            self.record_app_mode(true);
+            self.record_last_state();
+        }
+        self.notify_ui_hide();
+        self.push_state_update();
+        self.show_status();
+        self.notify_toolbar();
+        info!("{}: {}", log_verb, schema_id);
+        if let Err(e) = Config::set_user_string(&["schema", "active"], schema_id) {
+            warn!("{}: 持久化 schema.active 失败: {}", log_verb, e);
         }
     }
 

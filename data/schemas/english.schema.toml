@@ -4,9 +4,7 @@ name = "英文"
 icon_label = "英"
 version = "1.0"
 author = "内置"
-description = "英文词库（临时英文 / 融合英文候选用，非独立可切换方案）"
-# 隐藏方案：不在设置页「方案管理」列出，也不进循环切换；仅供懒加载引用。
-hidden = true
+description = "英文输入（词库补全）；也供临时英文与融合英文候选引用"
 
 [engine]
 type = "english"

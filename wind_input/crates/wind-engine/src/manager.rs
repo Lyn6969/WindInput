@@ -722,6 +722,18 @@ impl EngineManager {
             .unwrap_or(false)
     }
 
+    /// 某方案是否标了 `[schema].hidden`（英文、快符这类不进常规方案列表的方案）。
+    ///
+    /// 供展示层过滤——[`Self::installed_schemas`] 返回全集，"设置页列不列出它"
+    /// 是调用方的决定，不是"装没装"的一部分。
+    pub fn schema_is_hidden(&self, schema_id: &str) -> bool {
+        Self::schema_hidden(
+            schema_id,
+            self.data_dir.as_deref(),
+            self.override_dir.as_deref(),
+        )
+    }
+
     /// 确保指定方案引擎已加载；返回是否可用
     /// 某方案引擎是否已加载（已就绪，切换即时无构建）。
     pub fn is_loaded(&self, schema_id: &str) -> bool {
@@ -882,7 +894,7 @@ impl EngineManager {
             .clone()
     }
 
-    /// 所有已安装且受支持的方案列表（目录扫描）。
+    /// 所有已安装且受支持的方案列表（目录扫描），**含隐藏方案**。
     ///
     /// 扫描 `data_dir/schemas/*.schema.toml`，对每个文件取去掉 `.schema.toml` 后缀的 id，
     /// 按 `is_supported()` 过滤掉不支持的方案，再并入当前 `available`（保证已启用方案即使
@@ -890,7 +902,13 @@ impl EngineManager {
     ///
     /// `data_dir` 为 None 时（纯测试）回退到 `available_schemas()`。
     ///
-    /// 供设置页"方案管理"的候选全集使用；**不影响** `available_schemas()`（循环切换用）。
+    /// **隐藏方案（`[schema].hidden`）也在返回值里**——那是「设置页列表要不要显示」的
+    /// 呈现层判断，不属于「装了哪些方案」。此处曾把它过滤掉，于是另外两个消费者静默
+    /// 拿到了子集：`rebuild_all_caches` 漏掉隐藏方案的缓存不失效，`delete_package` 的
+    /// keep 列表漏掉它们、删方案时可能连带删掉隐藏方案还在引用的共享资源。
+    /// 需要按 hidden 过滤的地方自己调 [`Self::schema_is_hidden`]。
+    ///
+    /// **不影响** `available_schemas()`（循环切换用，只认用户启用列表）。
     pub fn installed_schemas(&self) -> Vec<String> {
         let Some(data_dir) = self.data_dir.as_deref() else {
             return self.available_schemas();
@@ -920,11 +938,8 @@ impl EngineManager {
                 let fname_str = fname.to_string_lossy();
                 if let Some(id) = fname_str.strip_suffix(".schema.toml") {
                     let id = id.to_string();
-                    if !ids.contains(&id)
-                        // 只加入受支持且非隐藏的方案（隐藏方案如 english 仅供懒加载引用）
-                        && Self::schema_supported(&id, Some(data_dir), ov)
-                        && !Self::schema_hidden(&id, Some(data_dir), ov)
-                    {
+                    // 只按「受支持」过滤；隐藏与否留给调用方（见本函数文档）。
+                    if !ids.contains(&id) && Self::schema_supported(&id, Some(data_dir), ov) {
                         ids.push(id);
                     }
                 }

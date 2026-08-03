@@ -378,6 +378,12 @@ take_screenshot = "ctrl+shift+f11"
 # 写入其它名字只会进 warn 日志并被忽略。activate_ime 不在此列（走系统
 # DirectSwitchHotkeys 注册表，不经 RegisterHotKey）。空 = 全部走普通键盘钩子。
 global_hotkeys = []
+# 方案直达热键：key = 方案 id，value = 热键串。按下即把该方案切成当前方案，
+# 效果等同用 switch_engine 循环键一路切到它（同样遵循 commit_on_switch、同样持久化）。
+# 例：schema_hotkeys = { english = "ctrl+shift+n", wubi86 = "ctrl+shift+w" }
+# 与 [[schema.special_modes]] 的 hotkey 是两回事：那个进 overlay、打完一段自动退回；
+# 这个是换方案，不再按一次不会回来。
+schema_hotkeys = {}
 select_key_groups = ["semicolon_quote"]
 page_keys = ["pageupdown", "minus_equal"]
 highlight_keys = ["arrows", "tab"]

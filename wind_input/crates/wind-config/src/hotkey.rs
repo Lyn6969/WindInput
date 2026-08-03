@@ -179,6 +179,27 @@ impl Compiler {
             });
         }
 
+        // ── KeyDown：方案直达热键（切换 active 方案）──
+        // **不带 CHINESE_ONLY**：与 `switch_engine` 循环键同策略（见上面第一组）。切方案是
+        // 中英文两态下都该生效的操作——尤其"英文方案 → 中文方案"，要求恰恰是在非中文态下
+        // 也能按。加了 CHINESE_ONLY 就会变成「切得过去、切不回来」。
+        // 遍历顺序取决于 HashMap，故排序后再编译：热键冲突时（两个方案配了同一个键）
+        // 谁先入列决定谁生效，不排序会让同一份配置在不同进程里表现不同。
+        let mut schema_hotkeys: Vec<(&String, &String)> = h.schema_hotkeys.iter().collect();
+        schema_hotkeys.sort_by(|a, b| a.0.cmp(b.0));
+        for (schema_id, key) in schema_hotkeys {
+            if schema_id.is_empty() {
+                continue;
+            }
+            if let Some(raw) = parse_hotkey(key) {
+                result.key_down.push(HotkeyEntry {
+                    tsf_hash: raw,
+                    match_hash: raw,
+                    action: format!("switch_schema:{schema_id}"),
+                });
+            }
+        }
+
         // ── KeyDown：数字模板展开（PinCandidate / DeleteCandidate，session policy） ──
         for tmpl in [&h.pin_candidate, &h.delete_candidate] {
             for entry in compile_number_hotkey(tmpl) {
@@ -698,6 +719,73 @@ mod tests {
             e.match_hash & (HOTKEY_POLICY_CHINESE_ONLY | HOTKEY_POLICY_GLOBAL),
             0
         );
+    }
+
+    /// 方案直达热键编出 `switch_schema:<id>`，且**不带 CHINESE_ONLY**。
+    ///
+    /// 这个 policy 位是本条测试的重点：带上它，切到英文方案后热键就不再响应，
+    /// 用户切得过去、切不回来。特殊模式热键需要它（overlay 只在中文输入中途有意义），
+    /// 方案切换恰恰相反——同一个位，两种机制下后果相反。
+    #[test]
+    fn schema_hotkey_compiles_without_chinese_only_policy() {
+        let mut cfg = Config::default();
+        cfg.keys
+            .schema_hotkeys
+            .insert("english".to_string(), "ctrl+shift+n".to_string());
+        let compiled = Compiler::new(cfg).compile();
+        let e = compiled
+            .key_down
+            .iter()
+            .find(|e| e.action == "switch_schema:english")
+            .expect("keys.schema_hotkeys 应编出 switch_schema:<id>");
+        assert_eq!(
+            e.tsf_hash & HOTKEY_POLICY_CHINESE_ONLY,
+            0,
+            "方案切换热键不得带 CHINESE_ONLY，否则英文方案下切不回中文方案"
+        );
+        // 反向对照：同一份编译产物里，特殊模式热键确实是带 CHINESE_ONLY 的——
+        // 否则「不带」这条断言在 policy 位整体失效时也会通过。
+        let mut cfg2 = Config::default();
+        cfg2.schema.special_modes = vec![crate::config::SpecialModeConfig {
+            id: "rare".to_string(),
+            hotkey: "ctrl+shift+u".to_string(),
+            ..Default::default()
+        }];
+        let c2 = Compiler::new(cfg2).compile();
+        let e2 = c2
+            .key_down
+            .iter()
+            .find(|e| e.action == "enter_special:rare")
+            .unwrap();
+        assert!(
+            e2.tsf_hash & HOTKEY_POLICY_CHINESE_ONLY != 0,
+            "对照组：特殊模式热键应带 CHINESE_ONLY"
+        );
+    }
+
+    /// 多个方案热键按 schema id 排序编译——`HashMap` 迭代序不稳定，两个方案配了同一个
+    /// 键时谁先入列决定谁生效，不排序会让同一份配置在不同进程启动时表现不同。
+    ///
+    /// 用 7 个 id：这条测试本质上是「乱序输入应得到有序输出」，而未排序的 `HashMap` 仍有
+    /// 可能碰巧吐出升序。7 个元素把假绿概率压到 1/5040，n 少了这测试就不算数。
+    #[test]
+    fn schema_hotkeys_compile_in_sorted_order() {
+        let ids = ["zzz", "aaa", "mmm", "ddd", "sss", "ggg", "ppp"];
+        let mut cfg = Config::default();
+        for id in ids {
+            cfg.keys
+                .schema_hotkeys
+                .insert(id.to_string(), format!("ctrl+shift+{}", &id[..1]));
+        }
+        let compiled = Compiler::new(cfg).compile();
+        let order: Vec<&str> = compiled
+            .key_down
+            .iter()
+            .filter_map(|e| e.action.strip_prefix("switch_schema:"))
+            .collect();
+        let mut expect = ids.to_vec();
+        expect.sort();
+        assert_eq!(order, expect, "应按 schema id 升序编译");
     }
 
     #[test]

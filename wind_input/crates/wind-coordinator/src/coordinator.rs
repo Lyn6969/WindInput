@@ -4913,6 +4913,12 @@ impl MessageHandler for Coordinator {
                     }
                     return KeyAction::Consumed;
                 }
+            } else if let Some(id) = action.strip_prefix("switch_schema:") {
+                // 方案直达热键：切 active 方案。**不判 chinese_mode**——与循环键
+                // (`switch_engine`) 同策略。切方案在英文态下同样该生效，否则切到英文方案后
+                // 这条路径就失效了，用户回不到中文方案。
+                self.switch_schema_by_id(id);
+                return KeyAction::StatusUpdate(self.build_status());
             } else if self.dispatch_hotkey(&action) {
                 return KeyAction::StatusUpdate(self.build_status());
             }
