@@ -1326,12 +1326,12 @@ impl Coordinator {
             .unwrap_or_default();
         let toolbar_positions_init = runtime_state.toolbar_positions.clone();
         let themes_dir = data_dir.map(|d| d.join("themes"));
-        // 初始主题名：config.ui.theme.name 为单一源，未设置则回退 "default"。
+        // 初始主题名：config.ui.theme.name 为单一源，未设置则回退 FALLBACK_THEME。
         let cfg_theme = config.ui.theme.name.trim();
         let initial_theme = if !cfg_theme.is_empty() {
             cfg_theme.to_string()
         } else {
-            "default".to_string()
+            crate::handle_mode::FALLBACK_THEME.to_string()
         };
         // 初始明暗：config.ui.theme.style（system 跟随系统实时探测，见 ThemeStyle::resolve_dark）。
         let theme_style_init = ThemeStyle::from_config(&config.ui.theme.style);

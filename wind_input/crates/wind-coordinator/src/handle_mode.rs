@@ -14,6 +14,11 @@ use wind_ui::manager::UiCommand;
 
 use crate::coordinator::{numpad_char, printable_char, punct_char};
 use wind_bridge::handler::KeyEventData;
+
+/// 兜底主题 id：`config.ui.theme.name` 未设置时的初值，也是 [`Coordinator::push_theme`]
+/// 加载失败时的降级目标。两处必须同名，故只此一处定义。
+pub(crate) const FALLBACK_THEME: &str = "default";
+
 use wind_candidate::Candidate;
 use wind_config::config::FreeInputMode;
 use wind_ipc::protocol::{MOD_ALT, MOD_CTRL, MOD_SHIFT};
@@ -526,24 +531,72 @@ impl Coordinator {
         dirs
     }
 
-    /// 加载并下发指定主题（失败保留当前）。跨用户+安装目录解析（含 base 继承）。
+    /// [`Self::push_theme`] 的降级内核：探测源是参数，故降级路径可被单测覆盖。
+    ///
+    /// 抽出来的理由同 `Config::wait_until_settled`——真机上主题目录几乎总是完好，
+    /// 降级分支在开发机永远走不到，而它恰恰是这个修复的目的所在，不能靠「上真机
+    /// 删个主题试试」来验证。
+    ///
+    /// 返回 `(实际生效的主题 id, 主题)`；两级都失败返回 `None`（调用方保留当前）。
+    /// 请求的就是 [`FALLBACK_THEME`] 时不重复试第二次。
+    fn load_theme_with_fallback<T>(
+        mut load: impl FnMut(&str) -> anyhow::Result<T>,
+        name: &str,
+    ) -> Option<(String, T)> {
+        match load(name) {
+            Ok(t) => return Some((name.to_string(), t)),
+            Err(e) => warn!("Failed to load theme {}: {}", name, e),
+        }
+        if name == FALLBACK_THEME {
+            return None;
+        }
+        match load(FALLBACK_THEME) {
+            Ok(t) => {
+                warn!(
+                    "主题 {} 不可用，本次降级为 {}（配置未改，下次仍会尝试 {}）",
+                    name, FALLBACK_THEME, name
+                );
+                Some((FALLBACK_THEME.to_string(), t))
+            }
+            Err(e) => {
+                warn!("降级主题 {} 同样加载失败: {}", FALLBACK_THEME, e);
+                None
+            }
+        }
+    }
+
+    /// 加载并下发指定主题。跨用户+安装目录解析（含 base 继承）。
+    ///
+    /// 请求主题加载不了时降级到 [`FALLBACK_THEME`]，**不是**"保留当前"就完事：在**启动**
+    /// 路径上"当前"是候选窗构造时的 `Resolved::default()`（编译期派生零值，跟磁盘上那个
+    /// 叫 `default` 的主题毫无关系），一次读盘失败就把整个会话钉死在那副外观上，且只留
+    /// 一行 warn，用户只看得见"主题不对"。曾见于部署期 `data\` 半截时抢跑起来的服务。
+    ///
+    /// 降级**不动** `theme_name`、不持久化：用户选的仍是原主题，下次 reload / 切明暗
+    /// 会重新尝试。把一次读盘失败固化成配置变更，比显示不对更难查。
+    ///
+    /// 两级都失败才保留当前不下发——此时盘上多半整个 themes 目录都没了，硬发零值只会
+    /// 把**运行中**已经好用的主题也清掉（reload 路径同样走这里），那是退化不是兜底。
     pub(crate) fn push_theme(&self, name: &str, is_dark: bool) {
         let dirs = self.theme_search_dirs();
         if dirs.is_empty() {
             return;
         }
-        match wind_theme::load_resolved_dirs(&dirs, name, is_dark) {
-            Ok(t) => {
-                info!("Loaded theme: {} (dark={})", name, is_dark);
-                // 记录主题定义的序号槽位，供 index_label 裁决「用户 > 主题 > 默认」。
-                *self
-                    .theme_index_labels
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner()) = t.views.index_labels.clone();
-                let _ = self.ui_tx.send(UiCommand::SetTheme(Box::new(t)));
-            }
-            Err(e) => warn!("Failed to load theme {}: {}", name, e),
-        }
+        let loaded = Self::load_theme_with_fallback(
+            |n| wind_theme::load_resolved_dirs(&dirs, n, is_dark),
+            name,
+        );
+        let Some((used, theme)) = loaded else {
+            warn!("主题目录不可用（安装数据缺失？），保留当前外观未下发");
+            return;
+        };
+        info!("Loaded theme: {} (dark={})", used, is_dark);
+        // 记录主题定义的序号槽位，供 index_label 裁决「用户 > 主题 > 默认」。
+        *self
+            .theme_index_labels
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = theme.views.index_labels.clone();
+        let _ = self.ui_tx.send(UiCommand::SetTheme(Box::new(theme)));
     }
 
     /// 列出可用主题：(id, 显示名)。程序目录主题优先（按 order/id 排序），
@@ -1416,6 +1469,74 @@ impl Coordinator {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod theme_fallback_tests {
+    use super::FALLBACK_THEME;
+    use crate::coordinator::Coordinator;
+    use std::cell::RefCell;
+
+    /// 记录每次请求的主题 id，并按 `available` 决定成败——替身返回 `&str` 而非
+    /// `Resolved`，降级判定与主题求值无关，不该为了测它去造一份主题数据。
+    fn loader<'a>(
+        available: &'a [&'a str],
+        seen: &'a RefCell<Vec<String>>,
+    ) -> impl FnMut(&str) -> anyhow::Result<&'static str> + 'a {
+        move |n: &str| {
+            seen.borrow_mut().push(n.to_string());
+            if available.contains(&n) {
+                Ok("theme")
+            } else {
+                anyhow::bail!("theme '{}' not found", n)
+            }
+        }
+    }
+
+    #[test]
+    fn requested_theme_wins_without_touching_fallback() {
+        let seen = RefCell::new(Vec::new());
+        let got = Coordinator::load_theme_with_fallback(loader(&["violet"], &seen), "violet");
+        assert_eq!(got.map(|(id, _)| id), Some("violet".to_string()));
+        // 请求主题就绪时不该顺带去读 default——多一次读盘就是多一次半截 data 的暴露面。
+        assert_eq!(*seen.borrow(), vec!["violet"]);
+    }
+
+    /// 本用例对应的真实故障：部署期 data\ 半截，violet 没复制到而 default 已就位。
+    /// 修复前这里会让候选窗停在 `Resolved::default()` 的编译期零值外观直到重启。
+    #[test]
+    fn missing_theme_falls_back_to_default() {
+        let seen = RefCell::new(Vec::new());
+        let got = Coordinator::load_theme_with_fallback(loader(&[FALLBACK_THEME], &seen), "violet");
+        assert_eq!(
+            got.map(|(id, _)| id),
+            Some(FALLBACK_THEME.to_string()),
+            "请求主题缺失应降级到 {FALLBACK_THEME}"
+        );
+        assert_eq!(*seen.borrow(), vec!["violet", FALLBACK_THEME]);
+    }
+
+    #[test]
+    fn missing_fallback_itself_is_not_retried() {
+        let seen = RefCell::new(Vec::new());
+        let got = Coordinator::load_theme_with_fallback(loader(&[], &seen), FALLBACK_THEME);
+        assert!(got.is_none(), "default 自身缺失时无处可降级");
+        assert_eq!(
+            *seen.borrow(),
+            vec![FALLBACK_THEME],
+            "请求的就是 default 时不该重复试第二次"
+        );
+    }
+
+    /// 两级皆失败必须返回 None 让调用方**保留当前**：reload 路径也走 push_theme，
+    /// 此时硬发一份零值主题会把运行中已经好用的外观清掉——那是退化不是兜底。
+    #[test]
+    fn both_missing_yields_none_so_caller_keeps_current() {
+        let seen = RefCell::new(Vec::new());
+        let got = Coordinator::load_theme_with_fallback(loader(&["jade"], &seen), "violet");
+        assert!(got.is_none());
+        assert_eq!(*seen.borrow(), vec!["violet", FALLBACK_THEME]);
     }
 }
 
