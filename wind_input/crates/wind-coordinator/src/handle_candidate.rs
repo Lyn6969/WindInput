@@ -241,7 +241,6 @@ impl Coordinator {
         // 先收键再**一次事务**批量查：逐候选 `get_freq` 会为每个候选开一次 redb 读事务，
         // 五笔单字母下 78+ 候选即 78 次，是每键的固定开销（见 `get_freq_batch`）。
         let mut probe: Vec<(String, String, String)> = Vec::new();
-        let mut probe_text: Vec<String> = Vec::new();
         for c in candidates.iter() {
             // 短语不参与词频维度（写入端 `record_selection` 对称跳过）：其次序由短语定义的
             // weight/position 决定，且求值型短语的文本逐日变化，点查恒 miss——白花一次
@@ -274,14 +273,16 @@ impl Coordinator {
                 Self::freq_code_with(code, c, settings.english_code_by_input),
                 c.text.clone(),
             ));
-            probe_text.push(c.text.clone());
         }
         let found = store.get_freq_batch(&probe).unwrap_or_default();
-        let recs: std::collections::HashMap<String, FreqRecord> = probe_text
-            .into_iter()
+        // 只为**命中**的候选 clone 文本：五笔单字母下 78 个候选往往只有个位数有词频记录，
+        // 先收一份全量文本副本再筛是白 clone 七十多次。
+        let recs: std::collections::HashMap<String, FreqRecord> = probe
+            .iter()
+            .map(|(_, _, text)| text)
             .zip(found)
             .filter_map(|(t, r)| match r {
-                Some(r) if r.count > 0 => Some((t, r)),
+                Some(r) if r.count > 0 => Some((t.clone(), r)),
                 _ => None,
             })
             .collect();
@@ -1378,7 +1379,7 @@ impl Coordinator {
     /// `s2t_override`：1对多变体候选的输出覆盖（`Candidate::s2t_override`）；来源无候选
     /// 实体（如自动上屏取首选文本）时传 None。
     ///
-    /// `code`：词频记账码，须为 [`Self::freq_code`] 的结果——**按候选来源分流**：拼音/英文
+    /// `freq_code`：词频记账码，须为 [`Self::freq_code`] 的结果——**按候选来源分流**：拼音/英文
     /// 取候选存储码（全拼扁平域；双拼/分隔符/前缀补全下与输入缓冲不同域），码表取输入码
     /// （`d`/`de`/`def` 是独立码位，用词条全码会让它们串扰）。
     ///
@@ -1391,9 +1392,9 @@ impl Coordinator {
         text: &str,
         s2t_override: Option<&str>,
         source: CandidateSource,
-        code: &str,
+        freq_code: &str,
     ) -> String {
-        self.record_selection(code, text, source);
+        self.record_selection(freq_code, text, source);
         let out = match s2t_override {
             Some(t) => t.to_string(),
             None => self.maybe_s2t(state, text),
@@ -1755,8 +1756,8 @@ impl Coordinator {
         // 仅普通候选（无副作用命令 Action）才学（对齐 Go len(cand.Actions)==0）。
         if cand.actions.is_empty() {
             // 记账码：码表按输入码（码位独立），拼音/英文按候选码。见 `freq_code`。
-            let code = self.freq_code(&state.input_buffer, &cand);
-            self.record_selection(&code, &runes[char_index].to_string(), cand.source);
+            let freq_code = self.freq_code(&state.input_buffer, &cand);
+            self.record_selection(&freq_code, &runes[char_index].to_string(), cand.source);
         }
         // 拼接已确认段前缀 + 选中单字，整体按简繁模式转换（与 commit_selected 一致）。
         let combined = format!("{}{}", state.committed_text, runes[char_index]);
@@ -2490,6 +2491,84 @@ mod finalize_candidates_tests {
             Coordinator::freq_code_with("hel", &en, true),
             "hel",
             "切到 input：各前缀独立学习，与码表同侧"
+        );
+    }
+
+    /// 守门：**所有** `record_selection` 生产调用点的记账码都必须经 [`Coordinator::freq_code`]。
+    ///
+    /// 这道机械检查是必需的，不是洁癖。漏掉一处的后果是**静默的**：写进 FREQ 表的是个
+    /// 孤儿键（双拼击键 `siyr` / 带分隔符 `xi'an` / 前缀补全 `si`），读取端按候选码
+    /// `siyuan` 查，永远查不到——用户选了词却毫无变化，而任何常规测试都不会失败，因为
+    /// 写入本身成功了。三处漏网（标点顶屏 ×2、临拼小键盘 ×1）都是这么藏到真机上的。
+    ///
+    /// 用 `include_str!` 编译期嵌入而非运行时读盘：CI 的 test 跑 Linux 宿主、clippy 交叉编
+    /// Windows，运行时拼源码路径在两边语义不同，嵌入则与执行环境无关。
+    #[test]
+    fn every_record_selection_call_goes_through_freq_code() {
+        // 判据是「实参文本里出现 freq_code」，这顺带强制**中转变量必须命名为 `freq_code`**
+        // ——名字即声明，读代码时不必回溯赋值处就知道它已分流过。
+        //
+        // 白名单：确有理由不走 freq_code 的调用点，键为其首个实参的源码文本。
+        const ALLOWED: &[(&str, &str)] = &[(
+            "prefix",
+            "commit_top_text：顶码机制归属码表，prefix 即被顶出的输入码，本就是码表口径",
+        )];
+        let sources: &[(&str, &str)] = &[
+            ("coordinator.rs", include_str!("coordinator.rs")),
+            ("handle_candidate.rs", include_str!("handle_candidate.rs")),
+            ("handle_mode.rs", include_str!("handle_mode.rs")),
+            ("handle_special.rs", include_str!("handle_special.rs")),
+            ("handle_temp.rs", include_str!("handle_temp.rs")),
+        ];
+        let mut checked = 0usize;
+        let mut bad: Vec<String> = Vec::new();
+        for (name, src) in sources {
+            // 只看 `#[cfg(test)]` 之前的部分：测试自己用字面量直接构造键是合法的。
+            let prod = src.split("#[cfg(test)]").next().unwrap_or(src);
+            for (off, _) in prod.match_indices(".record_selection(") {
+                let args = &prod[off + ".record_selection(".len()..];
+                // 切出第一个实参：按括号深度找顶层逗号（实参可能是 `self.freq_code(a, b)`）。
+                let mut depth = 0i32;
+                let mut end = args.len();
+                for (i, ch) in args.char_indices() {
+                    match ch {
+                        '(' => depth += 1,
+                        ')' if depth == 0 => {
+                            end = i;
+                            break;
+                        }
+                        ')' => depth -= 1,
+                        ',' if depth == 0 => {
+                            end = i;
+                            break;
+                        }
+                        _ => {}
+                    }
+                }
+                let arg = args[..end].trim().trim_start_matches('&').trim();
+                checked += 1;
+                if arg.contains("freq_code") {
+                    continue;
+                }
+                if !ALLOWED.iter().any(|(a, _)| *a == arg) {
+                    // 收齐再报：逐个 assert 只暴露第一处，改完重跑才发现还有下一处。
+                    bad.push(format!("{name}: `{arg}`"));
+                }
+            }
+        }
+        assert!(
+            bad.is_empty(),
+            "以下 record_selection 的记账码未经 freq_code：\n  {}\n\
+             码表须按输入码、拼音/英文须按候选码——直接传击键缓冲会在双拼/分隔符/\n\
+             前缀补全下写成读不到的孤儿键。改用 `&self.freq_code(buf, &cand)`（中转变量\n\
+             命名为 `freq_code`），确有理由不走的请加进本测试的 ALLOWED 并写明理由。",
+            bad.join("\n  ")
+        );
+        // 反向保证：若哪天调用点被重命名/重构掉，本测试不得退化成空跑而静默变绿。
+        assert!(
+            checked >= 12,
+            "只扫到 {checked} 个 record_selection 调用点，远少于预期——\
+             调用点被改名或本测试的扫描方式失效了，先修测试再说"
         );
     }
 

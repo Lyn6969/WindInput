@@ -2431,8 +2431,8 @@ impl Coordinator {
                 .min(state.candidates.len() - 1);
             let cand = state.candidates[idx].clone();
             // 记账码：码表按输入码（码位独立），拼音/英文按候选码。见 `freq_code`。
-            let code = self.freq_code(&state.input_buffer, &cand);
-            self.record_selection(&code, &cand.text, cand.source);
+            let freq_code = self.freq_code(&state.input_buffer, &cand);
+            self.record_selection(&freq_code, &cand.text, cand.source);
             out.push_str(&self.cand_s2t_text(state, &cand));
         }
         state.input_buffer.clear();
@@ -5427,7 +5427,9 @@ impl MessageHandler for Coordinator {
                                 let idx =
                                     (start + state.selected_index).min(state.candidates.len() - 1);
                                 let cand = state.candidates[idx].clone();
-                                self.record_selection(&state.input_buffer, &cand.text, cand.source);
+                                // 记账码：码表按输入码（码位独立），拼音/英文按候选码。见 `freq_code`。
+                                let freq_code = self.freq_code(&state.input_buffer, &cand);
+                                self.record_selection(&freq_code, &cand.text, cand.source);
                                 self.record_commit(
                                     &cand.text,
                                     state.input_buffer.len() as u32,
@@ -5472,7 +5474,9 @@ impl MessageHandler for Coordinator {
                         let (start, _) = self.page_range(&state);
                         let idx = (start + state.selected_index).min(state.candidates.len() - 1);
                         let cand = state.candidates[idx].clone();
-                        self.record_selection(&state.input_buffer, &cand.text, cand.source);
+                        // 记账码：码表按输入码（码位独立），拼音/英文按候选码。见 `freq_code`。
+                        let freq_code = self.freq_code(&state.input_buffer, &cand);
+                        self.record_selection(&freq_code, &cand.text, cand.source);
                         // 标点上屏前先记被顶出的高亮候选（来源候选）。
                         self.record_commit(
                             &cand.text,
@@ -6306,33 +6310,42 @@ impl MessageHandler for Coordinator {
             return None;
         }
         let tk = data.trigger_key as u32; // 协议为 u16，统一按 VK(u32) 比对
-        // 取上屏文本与其来源：命中候选取候选 source，退回原码分支为 None（不可归因）。
-        let (text, source) = if tk == keymap::VK_SPACE {
-            if !state.candidates.is_empty() {
-                (state.candidates[0].text.clone(), state.candidates[0].source)
-            } else {
-                (state.input_buffer.clone(), CandidateSource::None)
+        // 取上屏文本、来源与记账码：命中候选取候选 source，退回原码分支为 None（不可归因）。
+        // 记账码按来源分流（见 `freq_code`）——码表按输入码、拼音/英文按候选码；退回原码的
+        // 分支上屏的就是缓冲本身，无候选可依，用输入码。
+        let cand_meta = |c: &Candidate| {
+            (
+                c.text.clone(),
+                c.source,
+                self.freq_code(&state.input_buffer, c),
+            )
+        };
+        let raw = || {
+            (
+                state.input_buffer.clone(),
+                CandidateSource::None,
+                state.input_buffer.clone(),
+            )
+        };
+        let (text, source, freq_code) = if tk == keymap::VK_SPACE {
+            match state.candidates.first() {
+                Some(c) => cand_meta(c),
+                None => raw(),
             }
         } else if tk == keymap::VK_RETURN {
-            (state.input_buffer.clone(), CandidateSource::None)
+            raw()
         } else if (keymap::VK_1..=keymap::VK_9).contains(&tk) {
-            let idx = (tk - keymap::VK_1) as usize;
-            if idx < state.candidates.len() {
-                (
-                    state.candidates[idx].text.clone(),
-                    state.candidates[idx].source,
-                )
-            } else {
-                (state.input_buffer.clone(), CandidateSource::None)
+            match state.candidates.get((tk - keymap::VK_1) as usize) {
+                Some(c) => cand_meta(c),
+                None => raw(),
             }
         } else {
-            (state.input_buffer.clone(), CandidateSource::None)
+            raw()
         };
-        let code = state.input_buffer.clone(); // 清空前捕获输入码，供词频记录
         state.input_buffer.clear();
         state.candidates.clear();
         // 与 handle_key_event 的选词路径保持一致：记录词频用于学习排序
-        self.record_selection(&code, &text, source);
+        self.record_selection(&freq_code, &text, source);
         // 上屏即组合结束：复位首显延迟状态，使下一组合首帧重新延迟到 reflow 后的权威坐标，
         // 避免其锁定到本组合旧坐标（"上屏后立即输入候选窗错位"主场景）。
         self.reset_first_show();

@@ -518,7 +518,9 @@ impl Coordinator {
                     {
                         return act;
                     }
-                    self.record_selection(&code, &cand.text, cand.source);
+                    // 记账码：码表按输入码（码位独立），拼音/英文按候选码。见 `freq_code`。
+                    // 临拼缓冲是击键域（双拼下 `siyr`），与候选码 `siyuan` 不同域。
+                    self.record_selection(&self.freq_code(&code, &cand), &cand.text, cand.source);
                     self.record_commit(
                         &cand.text,
                         code.len() as u32,
@@ -913,8 +915,8 @@ impl Coordinator {
             let idx = (start + state.selected_index).min(state.candidates.len() - 1);
             let t = state.candidates[idx].text.clone();
             // 记账码：码表按输入码（码位独立），拼音/英文按候选码。见 `freq_code`。
-            let code = self.freq_code(&state.input_buffer, &state.candidates[idx]);
-            self.record_selection(&code, &t, state.candidates[idx].source);
+            let freq_code = self.freq_code(&state.input_buffer, &state.candidates[idx]);
+            self.record_selection(&freq_code, &t, state.candidates[idx].source);
             // 进入临时拼音前顶屏高亮候选（来源候选；prefix 段已在选词时记过）。
             self.record_commit(
                 &t,

@@ -190,8 +190,8 @@ impl Coordinator {
                 .min(state.candidates.len() - 1);
             let t = state.candidates[i].text.clone();
             // 记账码：码表按输入码（码位独立），拼音/英文按候选码。见 `freq_code`。
-            let code = self.freq_code(&state.input_buffer, &state.candidates[i]);
-            self.record_selection(&code, &t, state.candidates[i].source);
+            let freq_code = self.freq_code(&state.input_buffer, &state.candidates[i]);
+            self.record_selection(&freq_code, &t, state.candidates[i].source);
             Some(format!("{prefix}{t}"))
         } else if !prefix.is_empty() {
             Some(prefix)
@@ -752,8 +752,8 @@ impl Coordinator {
             };
             if !numeric {
                 // 记账码：码表按输入码（码位独立），拼音/英文按候选码。见 `freq_code`。
-                let code = self.freq_code(&state.mix_buffer, &cand);
-                self.record_selection(&code, &cand.text, cand.source);
+                let freq_code = self.freq_code(&state.mix_buffer, &cand);
+                self.record_selection(&freq_code, &cand.text, cand.source);
                 state.committed_segs.push((
                     state.mix_buffer.clone(), // 消费整串：回退码即整个缓冲
                     code,
