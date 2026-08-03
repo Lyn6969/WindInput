@@ -162,6 +162,10 @@ static REGISTRY: &[ConfigField] = &[
     f("schema.mix_modes", StructList),
     // -- input（输入行为）--
     f("input.filter_mode", Str),
+    // 检索范围放宽（智能档增强，见 docs/design/smart-filter-scope-relax.md）
+    f("input.scope_relax.auto", Bool),
+    f("input.scope_relax.prefix", Str),
+    f("input.scope_relax.page_end_key", Bool),
     f("input.enter_behavior", Str),
     f("input.space_on_empty_behavior", Str),
     f("input.numpad_behavior", Str),
@@ -545,6 +549,26 @@ pub fn leaf_entries(value: &toml::Value) -> Vec<(String, toml::Value)> {
 mod tests {
     use super::*;
     use std::collections::BTreeSet;
+
+    /// 跨仓契约：`Float` 键必须吃得下 **TOML 整数**。
+    ///
+    /// wind-setting 的 number 控件写回时会做 `if v.fract() == 0.0 { Value::from(v as i64) }`
+    /// ——用户在设置页把半衰期填 `72`，落到 config.toml 里就是整数 `72` 而非 `72.0`。
+    /// 而 core 侧这些字段是 `f64`。两边隔着一个进程和一次文件往返，**没有任何编译期约束**
+    /// 能发现不匹配；真出问题的表现是「设置页填了值，重启后回到默认」这种最难查的静默失效。
+    #[test]
+    fn float_fields_accept_integer_toml_values() {
+        use crate::config::{CodetableFrequency, PinyinFrequency};
+        let ct: CodetableFrequency =
+            toml::from_str("half_life = 72").expect("码表 half_life 必须接受 TOML 整数");
+        assert_eq!(ct.half_life, 72.0);
+        let py: PinyinFrequency =
+            toml::from_str("half_life = 72").expect("拼音 half_life 必须接受 TOML 整数");
+        assert_eq!(py.half_life, 72.0);
+        // 反向对照：小数形式当然也要能读，否则上面那条可能只是「两边都坏」。
+        let ct2: CodetableFrequency = toml::from_str("half_life = 4.5").unwrap();
+        assert_eq!(ct2.half_life, 4.5);
+    }
 
     /// 解析仓库内系统预置 `data/config.toml`。
     fn data_config_toml() -> toml::Value {
