@@ -749,6 +749,78 @@ function Stop-WindService ([string]$suffix) {
     Start-Sleep -Milliseconds 600
 }
 
+# 部署期抑制 TSF DLL 自动拉起服务 (必须成对调用, 用 try/finally 保证清零)。
+#
+# 背景: 宿主进程里常驻的 wind_tsf DLL 连不上管道时会 CreateProcess 自行拉起服务
+# (wind_tsf\src\IPCClient.cpp 的 _StartService)。部署期服务已被杀、data\ 正在重建,
+# 此刻任何敲键/切焦点都会把服务拉起来读到【半截 data】—— 主题 not found、码表
+# os error 3、拆字库缺失。更坏的是它占住单例后, 脚本末尾那次正规启动会被单例挡掉,
+# 且单例检查在 init_logger 之前就 exit(1), 连一行日志都不留。于是那个残废进程一直
+# 服务到下次重启, 表现为"重启一下就好了"的间歇性主题/词库丢失。
+#
+# DLL 侧早有闸门: HKLM\Software\WindInput 的 InstallerRunning="1" 时直接不拉
+# (NSIS 安装器走的就是这条路), 但本脚本此前从不写它 —— 读端在本仓、写端在安装器仓,
+# 没有任何编译期约束能发现这条部署路径漏接。
+#
+# 注: 该键 release/dev 共用一个路径 (DLL 读的是同一个), 故两变体部署不可并行。
+function Set-InstallerRunning ([bool]$on) {
+    $key = "HKLM:\Software\WindInput"
+    try {
+        if ($on) {
+            if (-not (Test-Path $key)) { New-Item -Path $key -Force | Out-Null }
+            Set-ItemProperty -Path $key -Name "InstallerRunning" -Value "1" -Type String -Force -ErrorAction Stop
+            Gray "  - InstallerRunning=1 (部署期禁止 TSF DLL 拉起服务)"
+        }
+        elseif (Test-Path $key) {
+            Set-ItemProperty -Path $key -Name "InstallerRunning" -Value "0" -Type String -Force -ErrorAction Stop
+        }
+    }
+    catch {
+        # 写不进去只是失去保护, 不该中断部署 —— 但必须喊出来, 否则又变成静默的竞态温床。
+        Warn "  - InstallerRunning 闸门$(if($on){'开启'}else{'清除'})失败 ($_); 部署期请勿敲键或切换窗口"
+    }
+}
+
+# 原子替换 data\: 先复制到同盘暂存目录, 再用两次改名切过去。
+#
+# 直接 Remove + Copy 会让 data\ 有【数秒】处于空/半截状态 (几万个文件), 这正是上面
+# 那个抢跑窗口最危险的一段。改成暂存 + 改名后, 复制全程 data\ 仍是旧的【完整】数据,
+# 真正的空窗压缩到两次改名之间的几毫秒 —— 即便闸门失效 (旧版 DLL 没有该判据、或
+# 并发跑了别的部署), 抢跑进程拿到的也是一套自洽的旧数据, 而不是残废态。
+# 暂存目录必须与目标同盘, 否则 Rename-Item 跨卷失败。
+function Copy-DataAtomic ([string]$srcData, [string]$targetDir) {
+    $td      = Join-Path $targetDir "data"
+    $staging = Join-Path $targetDir "data.new_$(Get-Random -Maximum 99999999)"
+    try {
+        Copy-Item $srcData -Destination $staging -Recurse -Force -ErrorAction Stop
+    }
+    catch {
+        ErrMsg "  [错误] data\ 暂存复制失败: $_"
+        Remove-Item $staging -Recurse -Force -ErrorAction SilentlyContinue
+        return $false
+    }
+    $retired = $null
+    if (Test-Path $td) {
+        $retired = "$td.old_$(Get-Random -Maximum 99999999)"
+        try { Rename-Item $td $retired -ErrorAction Stop }
+        catch {
+            ErrMsg "  [错误] 旧 data\ 改名让路失败 (被进程占用?): $_"
+            Remove-Item $staging -Recurse -Force -ErrorAction SilentlyContinue
+            return $false
+        }
+    }
+    try { Rename-Item $staging $td -ErrorAction Stop }
+    catch {
+        ErrMsg "  [错误] 新 data\ 就位失败: $_"
+        # 切换失败必须把旧数据放回去, 否则留下一个没有 data\ 的安装目录。
+        if ($retired) { Rename-Item $retired $td -ErrorAction SilentlyContinue }
+        return $false
+    }
+    if ($retired) { Remove-Item $retired -Recurse -Force -ErrorAction SilentlyContinue }
+    Gray "  - data\ (词库、方案、主题; 暂存+改名原子切换)"
+    return $true
+}
+
 # 系统安装: 全部 build[_dev]/ → 安装目录, 注册 TSF + 开机自启 + 启动服务 (p1 / pd1)。
 function Deploy-Full ([string]$profile = "release") {
     $outdir = Out-For $profile
@@ -759,37 +831,43 @@ function Deploy-Full ([string]$profile = "release") {
         ErrMsg "无 $outdir 产物; 请先 '$(if($profile -eq 'dev'){'d1'}else{'1'})' 全构建。"; return $false
     }
     Say "`n========== 系统安装 ($profile) → $targetDir =========="
-    Say "[1/7] 停止旧进程..."; Stop-WindService $suffix
-    Say "[2/7] 反注册旧 TSF COM..."; Unregister-Tsf $targetDir $suffix
-    Say "[3/7] 准备目录..."; New-Item -ItemType Directory -Path $targetDir -Force | Out-Null
-    Say "[4/7] 复制文件..."
-    Copy-Replace $targetDir "wind_input$suffix.exe" "$outdir\wind_input$suffix.exe"
-    if (Test-Path "$outdir\wind_cli.bat")      { Copy-Replace $targetDir "wind_cli.bat"      "$outdir\wind_cli.bat" }
-    foreach ($dll in (Get-ChildItem "$outdir\wind_tsf*.dll" -ErrorAction SilentlyContinue)) {
-        Copy-Replace $targetDir $dll.Name $dll.FullName
+    # 闸门必须在停服务【之前】拉起 —— 服务一死, 宿主里的 DLL 立刻就有拉起它的动机。
+    Set-InstallerRunning $true
+    try {
+        Say "[1/7] 停止旧进程..."; Stop-WindService $suffix
+        Say "[2/7] 反注册旧 TSF COM..."; Unregister-Tsf $targetDir $suffix
+        Say "[3/7] 准备目录..."; New-Item -ItemType Directory -Path $targetDir -Force | Out-Null
+        Say "[4/7] 复制文件..."
+        Copy-Replace $targetDir "wind_input$suffix.exe" "$outdir\wind_input$suffix.exe"
+        if (Test-Path "$outdir\wind_cli.bat")      { Copy-Replace $targetDir "wind_cli.bat"      "$outdir\wind_cli.bat" }
+        foreach ($dll in (Get-ChildItem "$outdir\wind_tsf*.dll" -ErrorAction SilentlyContinue)) {
+            Copy-Replace $targetDir $dll.Name $dll.FullName
+        }
+        if (Test-Path "$outdir\wind_setting$suffix.exe") { Copy-Replace $targetDir "wind_setting$suffix.exe" "$outdir\wind_setting$suffix.exe" }
+        if (Test-Path "$outdir\wind_portable.exe")       { Copy-Replace $targetDir "wind_portable.exe"       "$outdir\wind_portable.exe" }
+        if (Test-Path "$outdir\data") {
+            if (-not (Copy-DataAtomic "$outdir\data" $targetDir)) { return $false }
+        }
+        Say "[5/7] 设置权限 + 注册 TSF COM..."
+        Grant-TsfAcl $targetDir $suffix
+        if (-not (Register-Tsf $targetDir $suffix)) { return $false }
+        Install-WubiFont $targetDir
+        Say "[6/7] 配置开机自启 + 默认启用输入法..."
+        Set-AutoStart $targetDir $suffix
+        Enable-TsfForUser $profile
+        Get-ChildItem "$targetDir\*.old*" -ErrorAction SilentlyContinue | Remove-Item -Force -ErrorAction SilentlyContinue
+        Say "[7/7] 启动输入法服务..."
+        $exe = Join-Path $targetDir "wind_input$suffix.exe"
+        Start-Process -FilePath $exe; Gray "  - 已启动 wind_input$suffix.exe"
+        Say "`n系统安装完成 ($profile) → $targetDir"
+        Say "提示: 按 Win+Space 切换到清风输入法$(if($suffix){' (Dev)'})。"
+        return $true
     }
-    if (Test-Path "$outdir\wind_setting$suffix.exe") { Copy-Replace $targetDir "wind_setting$suffix.exe" "$outdir\wind_setting$suffix.exe" }
-    if (Test-Path "$outdir\wind_portable.exe")       { Copy-Replace $targetDir "wind_portable.exe"       "$outdir\wind_portable.exe" }
-    if (Test-Path "$outdir\data") {
-        $td = Join-Path $targetDir "data"
-        if (Test-Path $td) { Remove-Item $td -Recurse -Force -ErrorAction SilentlyContinue }
-        Copy-Item "$outdir\data" -Destination $targetDir -Recurse -Force
-        Gray "  - data\ (词库、方案、主题)"
+    finally {
+        # 任何出口 (含中途 return $false 与异常) 都必须清零, 否则闸门永久留在 1,
+        # DLL 从此再不肯拉起服务 —— 那会是个比本竞态更难查的故障。
+        Set-InstallerRunning $false
     }
-    Say "[5/7] 设置权限 + 注册 TSF COM..."
-    Grant-TsfAcl $targetDir $suffix
-    if (-not (Register-Tsf $targetDir $suffix)) { return $false }
-    Install-WubiFont $targetDir
-    Say "[6/7] 配置开机自启 + 默认启用输入法..."
-    Set-AutoStart $targetDir $suffix
-    Enable-TsfForUser $profile
-    Get-ChildItem "$targetDir\*.old*" -ErrorAction SilentlyContinue | Remove-Item -Force -ErrorAction SilentlyContinue
-    Say "[7/7] 启动输入法服务..."
-    $exe = Join-Path $targetDir "wind_input$suffix.exe"
-    Start-Process -FilePath $exe; Gray "  - 已启动 wind_input$suffix.exe"
-    Say "`n系统安装完成 ($profile) → $targetDir"
-    Say "提示: 按 Win+Space 切换到清风输入法$(if($suffix){' (Dev)'})。"
-    return $true
 }
 
 # 模块名 → 该模块的产物文件。Required 缺失即判失败 (防"部署成功但什么都没换"),
@@ -826,28 +904,36 @@ function Deploy-Module ([string]$profile, [string]$mod) {
         if (-not (Test-Path "$outdir\$f")) { ErrMsg "本地无 $outdir\$f (先构建对应模块)"; return $false }
     }
     Say "`n========== 系统安装模块 ($profile/$mod) → $targetDir =========="
-    if ($touchesService) { Say "[1/4] 停止旧进程..."; Stop-WindService $suffix }
-    else                 { Say "[1/4] (跳过停服务: $mod 不参与输入法运行时)" }
-    if ($mod -eq "tsf") { Say "[2/4] 反注册旧 TSF COM..."; Unregister-Tsf $targetDir $suffix }
-    else                { Say "[2/4] ($mod 无需反注册 COM)" }
-    Say "[3/4] 复制模块文件..."
-    foreach ($f in $spec.Required) { Copy-Replace $targetDir $f "$outdir\$f" }
-    foreach ($f in $spec.Optional) { if (Test-Path "$outdir\$f") { Copy-Replace $targetDir $f "$outdir\$f" } }
-    if ($mod -eq "tsf") {
-        Grant-TsfAcl $targetDir $suffix
-        if (-not (Register-Tsf $targetDir $suffix)) { return $false }
-        Enable-TsfForUser $profile
+    # 模块部署不动 data\, 但 core/tsf 会杀服务或换 DLL —— 同样给了 DLL 抢跑的机会,
+    # 拉起的是新旧混搭的一代 (如新 DLL 配旧 exe), 故一并上闸门。
+    if ($touchesService) { Set-InstallerRunning $true }
+    try {
+        if ($touchesService) { Say "[1/4] 停止旧进程..."; Stop-WindService $suffix }
+        else                 { Say "[1/4] (跳过停服务: $mod 不参与输入法运行时)" }
+        if ($mod -eq "tsf") { Say "[2/4] 反注册旧 TSF COM..."; Unregister-Tsf $targetDir $suffix }
+        else                { Say "[2/4] ($mod 无需反注册 COM)" }
+        Say "[3/4] 复制模块文件..."
+        foreach ($f in $spec.Required) { Copy-Replace $targetDir $f "$outdir\$f" }
+        foreach ($f in $spec.Optional) { if (Test-Path "$outdir\$f") { Copy-Replace $targetDir $f "$outdir\$f" } }
+        if ($mod -eq "tsf") {
+            Grant-TsfAcl $targetDir $suffix
+            if (-not (Register-Tsf $targetDir $suffix)) { return $false }
+            Enable-TsfForUser $profile
+        }
+        Get-ChildItem "$targetDir\*.old*" -ErrorAction SilentlyContinue | Remove-Item -Force -ErrorAction SilentlyContinue
+        if ($touchesService) {
+            Say "[4/4] 启动输入法服务..."
+            $exe = Join-Path $targetDir "wind_input$suffix.exe"
+            if (Test-Path $exe) { Start-Process -FilePath $exe; Gray "  - 已启动 wind_input$suffix.exe" }
+        } else {
+            Say "[4/4] (跳过重启服务: $mod 不参与输入法运行时)"
+        }
+        Say "`n模块部署完成 ($profile/$mod)"
+        return $true
     }
-    Get-ChildItem "$targetDir\*.old*" -ErrorAction SilentlyContinue | Remove-Item -Force -ErrorAction SilentlyContinue
-    if ($touchesService) {
-        Say "[4/4] 启动输入法服务..."
-        $exe = Join-Path $targetDir "wind_input$suffix.exe"
-        if (Test-Path $exe) { Start-Process -FilePath $exe; Gray "  - 已启动 wind_input$suffix.exe" }
-    } else {
-        Say "[4/4] (跳过重启服务: $mod 不参与输入法运行时)"
+    finally {
+        if ($touchesService) { Set-InstallerRunning $false }
     }
-    Say "`n模块部署完成 ($profile/$mod)"
-    return $true
 }
 
 # ---------- 便携部署 (绿色版: 纯复制到本地目录, 免注册免污染) ----------
@@ -947,11 +1033,11 @@ function Deploy-Portable ([string]$profile = "release") {
     }
     if (Test-Path "$outdir\wind_setting$suffix.exe") { Copy-Replace $root "wind_setting$suffix.exe" "$outdir\wind_setting$suffix.exe" }
     if (Test-Path "$outdir\wind_portable.exe")       { Copy-Replace $root "wind_portable.exe"       "$outdir\wind_portable.exe" }
+    # 便携版同样走原子替换 (理由见 Copy-DataAtomic)。此处不上 InstallerRunning 闸门:
+    # 便携部署不要求管理员, 写不了 HKLM; 便携实例的服务由 launcher 托管、DLL 另走
+    # portable_mode 标记路径, 抢跑面小于系统安装。
     if (Test-Path "$outdir\data") {
-        $td = Join-Path $root "data"
-        if (Test-Path $td) { Remove-Item $td -Recurse -Force -ErrorAction SilentlyContinue }
-        Copy-Item "$outdir\data" -Destination $root -Recurse -Force
-        Gray "  - data\ (词库、方案、主题)"
+        if (-not (Copy-DataAtomic "$outdir\data" $root)) { return $false }
     }
     Get-ChildItem "$root\*.old*" -ErrorAction SilentlyContinue | Remove-Item -Force -ErrorAction SilentlyContinue
     Say "[4/5] 写便携标记..."; Write-PortableMarker $root
