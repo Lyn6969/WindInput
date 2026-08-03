@@ -315,6 +315,16 @@ pub(crate) const LEARN_ADD_WEIGHT: i32 = 800;
 /// 重新校准方法：把 `handle_selection_changed` 的 TRACE 打开，重跑分布。
 pub(crate) const SELF_COMMIT_GRACE: std::time::Duration = std::time::Duration::from_millis(200);
 
+/// 首显长兜底：坐标不可信时等待权威坐标的上限。
+///
+/// 两个用处同一语义——「这一帧的坐标值得等，因为手里那份不能用」：
+/// - `handle_caret_pending`：宿主明说「组合刚起、坐标待定」（`wait` 档）；
+/// - `fire_pending_first_show`：`fast` 档短兜底到期，但坐标缓存未经当前插入点验证。
+///
+/// 取值来自 `wait` 档既有行为（长期作默认档，用户未反馈过「候选窗要等半秒」）。实测
+/// Excel 首次输入建单元格编辑上下文需 454ms、真坐标 558ms 到达，是已知最慢的一档。
+pub(crate) const FIRST_SHOW_LONG_FALLBACK_MS: u64 = 600;
+
 /// 当前 unix 秒（拼音衰减分以此对 last_used 计龄；与 store record_freq 同口径）。
 pub(crate) fn now_unix_secs() -> i64 {
     std::time::SystemTime::now()
@@ -735,6 +745,30 @@ pub struct Coordinator {
     /// 置位后，该轮第一次权威坐标到达时改用放宽的容差判断要不要校正——校正动作本身
     /// 才是抖动的观感来源，小偏差不动比「跳一下修正」更稳。组合结束时复位。
     pub(crate) first_show_was_provisional: std::sync::atomic::AtomicBool,
+    /// 坐标缓存是否已被**当前插入点**验证过（= `state.caret_*` 还算不算数）。
+    ///
+    /// `fast` 档短兜底的隐含前提是「手里的旧坐标 ≈ 当前插入点」——同一行连打时它只差一个
+    /// 字宽，所以拿它首显毫无问题。本标志就是那个前提的显式化：
+    ///
+    /// - **置位**：[`Coordinator::handle_caret_update`] 采纳一帧权威坐标（与
+    ///   `last_authoritative_caret` 同一处，同一条「够格当基准」的判据）。
+    /// - **清位**：焦点到达（换 DocMgr，坐标属于上一个文档/单元格/应用）、
+    ///   用户移动光标（[`Coordinator::handle_selection_changed`] 的非回声分支，
+    ///   同一 DocMgr 内点到别处）。
+    ///
+    /// 清位后 `fast` 的 25ms 短兜底会退让为 [`FIRST_SHOW_LONG_FALLBACK_MS`] 长兜底（判据在
+    /// [`Coordinator::arm_pending_first_show`]）：此时「快」没有意义，只会把候选窗快速显示
+    /// 到一个错误位置、再当着用户的面跳回来。
+    ///
+    /// ⚠ **不复用 `last_authoritative_caret.2`**：那个字段回答的是「有没有可比的基准值」
+    /// （probe 判据用），本字段回答「手里的值可不可信」。当前取值恰好一致，但两者对边缘
+    /// 输入的期望会分化，合用一个必有一方错。
+    caret_cache_verified: std::sync::atomic::AtomicBool,
+    /// 本轮组合的首显是否已进入「长兜底等待」（首帧信任门命中）。
+    ///
+    /// 唯一用途是让后续按键**不重置**那段等待的计时——见
+    /// [`Coordinator::arm_pending_first_show`] 里对该死结的说明。`reset_first_show` 复位。
+    first_show_extended: std::sync::atomic::AtomicBool,
     /// `ui.status.show_on_focus` 的焦点气泡正等一个 TSF 权威坐标。
     ///
     /// 焦点事件到达时坐标常常还只是 GUI 回退值（`OnSetFocus` 拿不到同步 edit session 锁），
@@ -1421,6 +1455,8 @@ impl Coordinator {
             last_key_at: Mutex::new(None),
             last_key_interval_ms: Mutex::new(None),
             first_show_was_provisional: std::sync::atomic::AtomicBool::new(false),
+            caret_cache_verified: std::sync::atomic::AtomicBool::new(false),
+            first_show_extended: std::sync::atomic::AtomicBool::new(false),
             pending_focus_tip: std::sync::atomic::AtomicBool::new(false),
             last_focus_tip_token: Mutex::new(0),
             app_compat: Mutex::new(app_compat),
@@ -2713,7 +2749,7 @@ impl Coordinator {
             // 每一帧走了哪条路、以及是哪个逃生口生效——不必再对着 TSF 日志比时间戳。
             debug!(
                 "first_show 闸门 → 等待权威坐标（arm {}ms 兜底）: skip_caret_pending=0 coords_ready=0",
-                self.first_show_fallback_ms()
+                self.planned_first_show_timeout_ms()
             );
             self.arm_pending_first_show();
             return;
@@ -3003,6 +3039,8 @@ impl Coordinator {
     pub(crate) fn reset_first_show(&self) {
         self.first_show_was_provisional
             .store(false, std::sync::atomic::Ordering::Relaxed);
+        self.first_show_extended
+            .store(false, std::sync::atomic::Ordering::Relaxed);
         *self
             .candidate_shown
             .lock()
@@ -3027,19 +3065,75 @@ impl Coordinator {
     /// 推迟首次显示候选窗：标记 pending 并启动兜底 timer。token 比对使后续按键的 arm 自动作废
     /// 旧 timer。handle_caret_pending 握手会把 wait 档延到 600ms（应对 OnLayoutChange burst 慢的应用）。
     fn arm_pending_first_show(&self) {
+        // ★ 首帧信任门：`fast` 的短兜底建立在「手里的坐标 ≈ 当前插入点」之上，而焦点刚到达 /
+        // 用户刚移动过光标时这个前提不成立（见 `caret_cache_verified`）。此时拿旧坐标首显
+        // 必然是一次可见的错位加一次跳，「快」反而有害，让位给长兜底等权威坐标。
+        //
+        // ⚠⚠ **长等待一旦开始就不因后续按键重置**，这是本门能否成立的关键：闸门在候选窗
+        // 显示前对**每一个字母**都会调到这里（`is_first_frame` 一直为真），而
+        // `arm_pending_first_show_with_timeout` 每次都 bump token 重新计时。若照常重置，
+        // 用户多打几个字母就把这段等待反复推后，长兜底静默退化回短兜底、错位照旧——正是
+        // 「兜底超时长于组合寿命 ⇒ 永不到期」那个死结的镜像。Excel 建单元格编辑上下文要
+        // 558ms，其间用户往往已经敲了三五个字母。
+        //
+        // 反过来，长等待到期后就**不再续**（`pending` 被 fire 消费掉，`extended` 保持置位），
+        // 用旧坐标首显仍优于候选窗一直不出现。
+        if self.first_show_needs_long_wait() {
+            let already_waiting = *self
+                .pending_first_show
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                && self
+                    .first_show_extended
+                    .load(std::sync::atomic::Ordering::Relaxed);
+            if already_waiting {
+                debug!("first_show 闸门 → 保持长兜底计时（坐标缓存仍未验证，不因本次按键重置）");
+                return;
+            }
+            debug!(
+                "first_show 闸门 → 坐标缓存未经当前插入点验证，改 arm {FIRST_SHOW_LONG_FALLBACK_MS}ms 长兜底"
+            );
+            self.first_show_extended
+                .store(true, std::sync::atomic::Ordering::Relaxed);
+            self.arm_pending_first_show_with_timeout(FIRST_SHOW_LONG_FALLBACK_MS);
+            return;
+        }
         self.arm_pending_first_show_with_timeout(self.first_show_fallback_ms());
+    }
+
+    fn first_show_mode_is_fast(&self) -> bool {
+        self.active_compat
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .first_show_mode
+            == wind_config::app_compat::FirstShowMode::Fast
+    }
+
+    /// 首帧信任门是否命中：`fast` 档且坐标缓存未经当前插入点验证。
+    fn first_show_needs_long_wait(&self) -> bool {
+        self.first_show_mode_is_fast()
+            && !self
+                .caret_cache_verified
+                .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// 本次 arm **实际**会用的超时值。
+    ///
+    /// 存在的唯一理由是给首显闸门的日志用：闸门原本直接打印 `first_show_fallback_ms()`，
+    /// 而信任门命中时真正 arm 的是长兜底——日志说 25ms、实际等 600ms，排查时会被带偏。
+    /// **判据分散在两处（一处算日志、一处定行为）就必然分叉**，故收敛到同一个函数。
+    fn planned_first_show_timeout_ms(&self) -> u64 {
+        if self.first_show_needs_long_wait() {
+            FIRST_SHOW_LONG_FALLBACK_MS
+        } else {
+            self.first_show_fallback_ms()
+        }
     }
 
     /// 本档位等不到坐标时的兜底超时。fast 档取远小于 wait 的值，理由见
     /// `fast_first_show_fallback_ms` 的字段注释（150ms 会让 fast 在 Word/记事本上退化成 wait）。
     fn first_show_fallback_ms(&self) -> u64 {
-        if self
-            .active_compat
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .first_show_mode
-            == wind_config::app_compat::FirstShowMode::Fast
-        {
+        if self.first_show_mode_is_fast() {
             self.rt().config.ui.candidate.fast_first_show_fallback_ms
         } else {
             150
@@ -5604,6 +5698,12 @@ impl MessageHandler for Coordinator {
             .composition_start
             .lock()
             .unwrap_or_else(|e| e.into_inner()) = (0, 0, false);
+        // 坐标缓存作废（同上一段的理由，只是作用在另一个消费者上）：刚写进 state 的那份
+        // 是**焦点事件随包携带**的坐标，宿主此刻多半还没 reflow，甚至根本还没建好新文档的
+        // 编辑上下文（Excel 实测 454ms）。它够格当"没有更好选择时的兜底显示位置"，但不够格
+        // 让 fast 档判定"可以跳过等待了"。
+        self.caret_cache_verified
+            .store(false, std::sync::atomic::Ordering::Relaxed);
         {
             let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
             // 焦点进入文本框 = 本输入法激活（对齐 Go HandleFocusGained → SetIMEActivated(true)）。
@@ -6108,6 +6208,10 @@ impl MessageHandler for Coordinator {
             .last_authoritative_caret
             .lock()
             .unwrap_or_else(|e| e.into_inner()) = (data.x, data.y, true);
+        // 同一条「够格」判据的第二个消费者：坐标缓存自此对应当前插入点，fast 档的短兜底
+        // 可以放心拿它首显（见 caret_cache_verified 的字段注释）。
+        self.caret_cache_verified
+            .store(true, std::sync::atomic::Ordering::Relaxed);
         // 消费首显等待：本次为 reflow 后权威坐标。
         let was_pending = {
             let mut pfs = self
@@ -6260,17 +6364,20 @@ impl MessageHandler for Coordinator {
         }
         // fast 档刻意不接受这次延长：它的短兜底就是为「坐标要 60~190ms 才到」的宿主设计的，
         // 延到 600ms 等于把 fast 重新变回 wait（而组合往往活不到 100ms，兜底根本不会到期）。
-        if self
-            .active_compat
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .first_show_mode
-            == wind_config::app_compat::FirstShowMode::Fast
-        {
-            debug!("caret_pending → 忽略延长: fast 档保持短兜底");
+        //
+        // ⚠ 唯独坐标缓存不可信时**不能**在这里提前放弃延长：那种情况下短兜底会走
+        // `fire_pending_first_show` 的首帧信任门自行延长，两处口径必须一致，否则表现为
+        // 「握手到得早就短兜底、到得晚反而正确」这种随 IPC 时序摇摆的行为。
+        //
+        // ⚠ 坐标缓存不可信时 fast 档同样**不在这里**延长：那种情况的等待时长已由
+        // `arm_pending_first_show` 的首帧信任门决定（且刻意不因后续事件重置）。握手若也插
+        // 一脚就成了第二个真相源，表现为「握手到得早就长等、到得晚就短兜底」这种随 IPC
+        // 时序摇摆的行为。
+        if self.first_show_mode_is_fast() {
+            debug!("caret_pending → 忽略延长: fast 档兜底时长在 arm 时已按坐标可信度定");
             return;
         }
-        self.arm_pending_first_show_with_timeout(600);
+        self.arm_pending_first_show_with_timeout(FIRST_SHOW_LONG_FALLBACK_MS);
     }
 
     /// 宿主报告「光标移动且当前无 composition」（C++ `TextService::OnEndEdit`，守卫
@@ -6304,6 +6411,13 @@ impl MessageHandler for Coordinator {
             return;
         }
         debug!("selection_changed: since_self_commit={since:?} → 用户移动光标");
+        // 坐标缓存随之过期：用户在同一 DocMgr 内点到了别处（不发 focus_gained），而宿主
+        // 只在有 composition 时才回送 caret_update，所以缓存里仍是上次输入的位置。fast 档
+        // 若拿它给下一次输入的首帧定位，候选窗会先出现在旧位置再跳过来。
+        // ★ 复用本判据是安全的：它的两个误判方向对本用途都不致命——误判成回声只是维持
+        //   现状（不比现在差），误判成移动只是让下一次首显多等一程（慢而不错）。
+        self.caret_cache_verified
+            .store(false, std::sync::atomic::Ordering::Relaxed);
         self.terminate_auto_phrase("selection_changed");
     }
 
@@ -7439,6 +7553,213 @@ mod caret_compat_tests {
             st.caret_y,
             300 - 30,
             "caret_use_top 应把 Y 上移一个行高；重型段直写则原样落缓存"
+        );
+    }
+
+    /// 造一个 fast 档协调器并指定坐标缓存可信与否。
+    fn fast_coord(verified: bool) -> Arc<Coordinator> {
+        let c = coord();
+        set_mode(&c, wind_config::app_compat::FirstShowMode::Fast);
+        {
+            let mut st = c.state.lock().unwrap();
+            st.input_buffer = "a".to_string();
+            st.caret_x = 100;
+            st.caret_y = 200;
+            st.caret_height = 25;
+        }
+        c.caret_cache_verified
+            .store(verified, std::sync::atomic::Ordering::Relaxed);
+        c
+    }
+
+    /// 首帧信任门：坐标缓存未经当前插入点验证时不得走短兜底——拿旧坐标首显正是
+    /// Excel「进单元格第一个字漂移」的成因（手里那份属于上一个单元格）。
+    #[test]
+    fn untrusted_caret_arms_long_fallback() {
+        let c = fast_coord(false);
+        c.arm_pending_first_show();
+        assert!(
+            c.first_show_extended
+                .load(std::sync::atomic::Ordering::Relaxed),
+            "坐标不可信时应进入长兜底等待"
+        );
+        assert!(*c.pending_first_show.lock().unwrap());
+    }
+
+    /// 反向对照：坐标可信时必须照常走短兜底，否则信任门就成了无差别拖慢，
+    /// fast 档整个失去意义。
+    #[test]
+    fn trusted_caret_keeps_short_fallback() {
+        let c = fast_coord(true);
+        c.arm_pending_first_show();
+        assert!(
+            !c.first_show_extended
+                .load(std::sync::atomic::Ordering::Relaxed),
+            "坐标可信时不应进入长兜底"
+        );
+        assert_eq!(
+            c.first_show_fallback_ms(),
+            c.rt().config.ui.candidate.fast_first_show_fallback_ms
+        );
+    }
+
+    /// ★ 长等待不得被后续按键重置。闸门在候选窗显示前对**每一个字母**都会调 arm，若照常
+    /// bump token 重新计时，用户多打几个字母就把这段等待反复推后 → 长兜底静默退化回短兜底、
+    /// 错位照旧。Excel 建单元格上下文要 558ms，其间用户往往已敲了三五个字母。
+    ///
+    /// 这是「兜底超时长于组合寿命 ⇒ 永不到期」那个死结的镜像，独立守一条测试。
+    #[test]
+    fn long_fallback_survives_subsequent_keystrokes() {
+        let c = fast_coord(false);
+        c.arm_pending_first_show();
+        let token = *c.pending_first_show_token.lock().unwrap();
+        // 用户继续输入：闸门对第 2、3 个字母同样调 arm
+        c.arm_pending_first_show();
+        c.arm_pending_first_show();
+        assert_eq!(
+            *c.pending_first_show_token.lock().unwrap(),
+            token,
+            "后续按键不得重置长兜底计时，否则等待被无限推后"
+        );
+    }
+
+    /// 反向对照：坐标可信的正常连打必须照旧每次重新计时（既有行为，不能被上一条误伤）。
+    #[test]
+    fn short_fallback_still_rearms_per_keystroke() {
+        let c = fast_coord(true);
+        c.arm_pending_first_show();
+        let token = *c.pending_first_show_token.lock().unwrap();
+        c.arm_pending_first_show();
+        assert_ne!(
+            *c.pending_first_show_token.lock().unwrap(),
+            token,
+            "短兜底路径的既有行为是每次按键重新计时"
+        );
+    }
+
+    /// 长兜底到期后不再续：用旧坐标首显仍优于候选窗一直不出现。
+    #[test]
+    fn long_fallback_shows_when_it_finally_expires() {
+        let c = fast_coord(false);
+        c.arm_pending_first_show();
+        // ⚠ token 必须先 let 绑定再传：写成 `fire(*c...lock().unwrap())` 会让临时 MutexGuard
+        // 活到整个语句结束（Rust 临时值生命周期），而 fire 内部要再锁同一个 Mutex ⇒ 自死锁。
+        let token = *c.pending_first_show_token.lock().unwrap();
+        c.fire_pending_first_show(token);
+        assert!(
+            !*c.pending_first_show.lock().unwrap(),
+            "长兜底到期必须放行，否则候选窗永不出现"
+        );
+        assert!(
+            c.first_show_was_provisional
+                .load(std::sync::atomic::Ordering::Relaxed),
+            "用的是旧坐标，须记为非权威以享放宽容差"
+        );
+    }
+
+    /// wait/instant 档一字不变：它们的长兜底由 caret_pending 握手负责，信任门若也插一脚，
+    /// 两条路径叠加会让 wait 最坏等到 1200ms。
+    #[test]
+    fn trust_gate_does_not_touch_wait_mode() {
+        let c = fast_coord(false);
+        set_mode(&c, wind_config::app_compat::FirstShowMode::Wait);
+        c.arm_pending_first_show();
+        assert!(
+            !c.first_show_extended
+                .load(std::sync::atomic::Ordering::Relaxed),
+            "wait 档不受信任门影响"
+        );
+        assert_eq!(c.first_show_fallback_ms(), 150, "wait 档保持既有 150ms");
+    }
+
+    /// 闸门日志打印的超时必须等于实际 arm 的超时。此前闸门直接打 `first_show_fallback_ms()`，
+    /// 信任门命中时会「日志说 25ms、实际等 600ms」——排查首显延迟时这种分叉最坑人。
+    #[test]
+    fn logged_timeout_matches_actual_arm() {
+        let c = fast_coord(false);
+        assert_eq!(
+            c.planned_first_show_timeout_ms(),
+            FIRST_SHOW_LONG_FALLBACK_MS,
+            "信任门命中时闸门日志须报长兜底"
+        );
+        c.caret_cache_verified
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        assert_eq!(
+            c.planned_first_show_timeout_ms(),
+            c.rt().config.ui.candidate.fast_first_show_fallback_ms,
+            "未命中时须报 fast 短兜底"
+        );
+    }
+
+    /// 上屏 / 组合结束必须复位长等待标记——「这一轮已在长等待中」是**每轮独立**的事实，
+    /// 跨轮残留会让 `already_waiting` 的判据失去意义（当前因 `pending` 同时被复位而侥幸
+    /// 不出错，但那是巧合不是设计）。
+    #[test]
+    fn reset_first_show_clears_extended_flag() {
+        let c = fast_coord(false);
+        c.arm_pending_first_show();
+        assert!(
+            c.first_show_extended
+                .load(std::sync::atomic::Ordering::Relaxed)
+        );
+        c.reset_first_show();
+        assert!(
+            !c.first_show_extended
+                .load(std::sync::atomic::Ordering::Relaxed),
+            "组合结束必须复位，否则下一轮 arm 被永久跳过"
+        );
+    }
+
+    /// 焦点到达 = 换了 DocMgr，此刻 state 里那份是焦点事件随包携带的坐标（宿主多半还没
+    /// reflow，Excel 甚至还没建好编辑上下文），不够格让 fast 跳过等待。
+    #[test]
+    fn focus_gained_invalidates_caret_cache() {
+        let c = coord();
+        c.caret_cache_verified
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        c.handle_focus_gained(&FocusData {
+            x: 100,
+            y: 300,
+            height: 30,
+            composition_start_x: 0,
+            composition_start_y: 0,
+            client_token: 0,
+            input_scope_mask: 0,
+            disabled: false,
+            reason: 0,
+            caret_source: wind_ipc::protocol::caret_source::TSF_SELECTION,
+        });
+        assert!(
+            !c.caret_cache_verified
+                .load(std::sync::atomic::Ordering::Relaxed),
+            "焦点到达必须作废坐标缓存的可信标记"
+        );
+    }
+
+    /// 用户在同一 DocMgr 内点到别处：不发 focus_gained，宿主也只在有 composition 时才回送
+    /// caret_update，所以缓存里仍是上次输入的位置——必须作废。
+    #[test]
+    fn user_caret_move_invalidates_cache_but_self_commit_echo_does_not() {
+        let c = coord();
+        c.caret_cache_verified
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        c.handle_selection_changed(0);
+        assert!(
+            !c.caret_cache_verified
+                .load(std::sync::atomic::Ordering::Relaxed),
+            "用户移动光标必须作废坐标缓存"
+        );
+
+        // 反向对照：自提交回声（上屏后宿主插入文本导致的光标移动）不得作废，否则每上屏
+        // 一个字就作废一次，fast 档在连打时完全退化。
+        c.caret_cache_verified
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        *c.last_self_commit.lock().unwrap() = Some(std::time::Instant::now());
+        c.handle_selection_changed(0);
+        assert!(
+            c.caret_cache_verified
+                .load(std::sync::atomic::Ordering::Relaxed),
+            "自提交回声不得作废坐标缓存"
         );
     }
 
