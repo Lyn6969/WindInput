@@ -694,6 +694,12 @@ impl UiManager {
                     crate::toolbar_gate::GateTick::Show => {
                         // 熬过窗口期没被 HideToolbar 撤销 → 真正显示。
                         // Toolbar::update → render 是所有显示路径的单点，末尾必 show。
+                        //
+                        // 这条日志不可省：`UI: UpdateToolbar` 打在闸门判定**之前**，命令到达
+                        // 不等于工具栏出现（Deferred 的那些可能被撤销）。少了本行，日志里就
+                        // 只剩「命令到了」和「撤销了」，唯独看不到「到底显示了没有」——排查
+                        // 闪烁时最需要的恰恰是这个时刻。
+                        debug!("UI: 工具栏显示（迟滞到期）");
                         if let (Some(t), Some(st)) = (&mut toolbar, &toolbar_pending_state) {
                             t.update(st);
                         }
