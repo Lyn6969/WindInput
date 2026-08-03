@@ -1615,6 +1615,38 @@ impl EngineManager {
         }
     }
 
+    /// 码表/混输/英文的词频衰减参数。
+    ///
+    /// 只有 `half_life` 与拼音分家，`base_scale`/`recency_peak` 直接沿用拼音侧的解析结果——
+    /// 那两项是**打分模型**的系数，位置提升模型不读它们（见 `FreqProfile::pinyin_score` 的
+    /// 死链说明），给码表再开两个同样无效的旋钮只会增加误导。
+    ///
+    /// 三级回落：码表段 `half_life` > 0 → 用它；否则拼音段的值；再否则 store 默认 72 小时。
+    /// 默认 0 回落到拼音段，保证本项加入前的行为不变——此前码表 `position` 读的就是
+    /// `pinyin_freq_profile()`。
+    ///
+    /// ⚠️ 仅 `strategy = "position"` 时被消费；`top`/`step` 直接比 `count`/`last_used`。
+    pub fn codetable_freq_profile(&self) -> wind_store::freq::FreqProfile {
+        let base = self.pinyin_freq_profile();
+        let ct = self
+            .codetable
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .frequency
+            .half_life;
+        wind_store::freq::FreqProfile {
+            // base.half_life_hours 已是「拼音段 > store 默认」的解析结果，故此处只需再让
+            // 码表段抢在它前面，三级回落自然成立。
+            half_life_hours: Self::resolve_half_life(ct, base.half_life_hours),
+            ..base
+        }
+    }
+
+    /// 半衰期回落（纯映射，便于单测）：`own > 0` 用自己的，否则用 `inherited`。
+    fn resolve_half_life(own: f64, inherited: f64) -> f64 {
+        if own > 0.0 { own } else { inherited }
+    }
+
     /// 解析某方案的有效码表配置：全局基线 + 方案 `[engine.codetable]` 行为（内联 + override
     /// 已在 `read_schema` 经 `merge_toml` 合并）逐字段折叠。读不到方案时原样返回全局基线。
     fn resolve_codetable(
@@ -2795,6 +2827,30 @@ impl EngineManager {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 码表半衰期的三级回落：码表段 > 拼音段 > store 默认（72h）。
+    ///
+    /// 加这一项之前，码表 `position` 直接读 `pinyin_freq_profile()`——改拼音的半衰期会连带
+    /// 改码表的衰减速度，而码表段根本没有这个旋钮。默认 0 回落保证那之前的行为不变。
+    #[test]
+    fn codetable_half_life_falls_back_through_three_levels() {
+        let store_default = wind_store::freq::FreqProfile::default().half_life_hours;
+        assert_eq!(store_default, 72.0, "store 默认值变了，本测试的基准需同步");
+
+        // ① 码表段有值 → 用它，不受拼音段影响
+        assert_eq!(EngineManager::resolve_half_life(6.0, 24.0), 6.0);
+        // ② 码表段为 0 → 回落拼音段。**这条是 ① 的反向对照**：若实现写成恒取码表段，
+        //    ① 仍会绿，只有本条能抓到。
+        assert_eq!(EngineManager::resolve_half_life(0.0, 24.0), 24.0);
+        // ③ 两段皆 0 → store 默认（拼音段已在 pinyin_freq_profile 里折成 72，此处即 72）
+        assert_eq!(
+            EngineManager::resolve_half_life(0.0, store_default),
+            store_default
+        );
+        // 负值当未设置：配置是 f64，手改配置文件写成负数不该得出负半衰期（那会让
+        // decay_factor 随时间**增长**）。
+        assert_eq!(EngineManager::resolve_half_life(-1.0, 24.0), 24.0);
+    }
 
     /// 词库路径解析的四级优先级。第三级（用户目录的 wdat 优先于安装目录）是关键：
     /// 用户投放的 wdat-only 词库通常在用户目录，而兜底恒指向安装目录——Go 版正是为此

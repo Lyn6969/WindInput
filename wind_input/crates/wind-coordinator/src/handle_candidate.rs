@@ -309,6 +309,10 @@ impl Coordinator {
         } else {
             // `strategy = position` 时走与拼音同一套位置提升（档位仍是硬约束，只在档内
             // 提升）；`top`/`step` 仍是布尔 used-first，不读 profile / promote_prefix。
+            //
+            // profile 取 `codetable_freq_profile` 而非拼音那份：码表的 half_life 独立可配
+            // （缺省回落拼音段）。此前这里直接用 `pinyin_freq_profile()`，等于改拼音的半衰期
+            // 会连带改码表 position 的衰减速度，而码表段根本没有这个旋钮。
             wind_engine::freq_rerank::rerank_codetable_usedfirst(
                 candidates,
                 &recs,
@@ -316,7 +320,7 @@ impl Coordinator {
                 settings.strategy,
                 settings.protect,
                 now_unix_secs(),
-                self.engine_mgr.pinyin_freq_profile(),
+                self.engine_mgr.codetable_freq_profile(),
                 settings.promote_prefix,
             );
         }

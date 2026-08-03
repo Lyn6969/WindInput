@@ -102,6 +102,7 @@ static REGISTRY: &[ConfigField] = &[
         "schema.codetable.frequency.promote_prefix",
         Enum(PROMOTE_PREFIX_VALUES),
     ),
+    f("schema.codetable.frequency.half_life", Float),
     f(
         "schema.codetable.frequency.english_code_scope",
         Enum(ENGLISH_CODE_SCOPE_VALUES),

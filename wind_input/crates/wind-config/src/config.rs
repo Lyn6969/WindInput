@@ -410,7 +410,9 @@ impl CodetableGlobal {
 }
 
 /// 码表调频（[schema.codetable.frequency]）。
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+///
+/// 不 derive `Eq`：`half_life` 是 f64。与 `PinyinFrequency` 一致。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct CodetableFrequency {
     #[serde(default)]
     pub enabled: bool,
@@ -447,6 +449,16 @@ pub struct CodetableFrequency {
     /// （那两者对前缀补全从无限制），避免升级后存量用户的调频范围突然变窄。
     #[serde(default = "default_codetable_promote_prefix")]
     pub promote_prefix: String,
+    /// **衰减半衰期（小时）**；`0` = 回落到 `schema.pinyin.frequency.half_life`（再为 0 则用
+    /// store 默认 72 小时）。
+    ///
+    /// **仅 `strategy = "position"` 时生效**；`top`/`step` 直接比 `count`/`last_used`，不读衰减。
+    ///
+    /// 独立于拼音段而不是共用一个值：码表与拼音的合理衰减速度本就不同（五笔用户的用词集中度
+    /// 通常高于拼音，旧记录该留得久一些）。默认 0 回落，是为了让只想调一处的用户不必两边改，
+    /// 也保证本项加入前的行为不变——此前码表 `position` 读的就是拼音段的值。
+    #[serde(default)]
+    pub half_life: f64,
     /// **英文候选的词频记账码口径**（`"candidate"` / `"input"`，默认 `"candidate"`）。
     ///
     /// 内部配置，暂不进 GUI——英文该用哪种尚未定论，先留旋钮观察。
@@ -496,6 +508,7 @@ impl Default for CodetableFrequency {
             protect_top_n_len3: 0,
             strategy: default_freq_strategy(),
             promote_prefix: default_codetable_promote_prefix(),
+            half_life: 0.0, // 0 = 回落到拼音段
             english_code_scope: default_english_code_scope(),
         }
     }

@@ -75,6 +75,10 @@ strategy = "top"
 # 码表默认 all 而拼音默认 single：码表的前缀补全已由来源档位隔离、跨不到精确档之前，
 # 无需再按语义单元收窄，且与 top/step 的历史行为一致。
 promote_prefix = "all"
+# 衰减半衰期（小时）：调频热度衰减到一半所需时间。**仅 strategy = "position" 时生效**。
+# 0 = 回落到 schema.pinyin.frequency.half_life（那里也为 0 则用内置默认 72 小时）。
+# 与拼音分开配置：码表用户的用词集中度通常更高，旧记录该留得久一些。只想调一处就保持 0。
+half_life = 0.0
 # 英文候选的词频记账码口径：candidate | input（默认 candidate）。**内部项，不进设置页**。
 #   candidate —— 打 hel 选 hello 记成 (hello, hello)，之后打 he 也受益（跨码位共享）
 #   input     —— 记成 (hel, hello)，各前缀独立学习（与码表同侧）
