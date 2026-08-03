@@ -384,7 +384,20 @@ schema.pinyin.frequency.{base_scale,recency_peak}
 可直接复用。已在 `data/config.toml` 与 `pinyin_score` 的文档注释上标注「当前模型不使用」，
 避免用户误以为调了有效。
 
-`half_life` 仍然生效（`decay_factor` 用它）。
+`half_life` 仍然生效（`decay_factor` 用它），且**两段各有一个**：
+
+| 配置项 | 作用范围 | 缺省 |
+|---|---|---|
+| `schema.pinyin.frequency.half_life` | 拼音 | `0` → store 默认 72h |
+| `schema.codetable.frequency.half_life` | 码表 / 混输 / 英文，**仅 `position` 策略** | `0` → 回落拼音段 |
+
+分家的理由：码表 `position` 此前直接读 `pinyin_freq_profile()`，等于改拼音的半衰期会连带
+改码表的衰减速度，而码表段根本没有这个旋钮——`position` 当初只服务拼音时这是自然的，扩展
+到码表后就成了跨段依赖。且两者的合理值本就不同：码表用户的用词集中度通常高于拼音，旧记录
+该留得久一些。
+
+只分家 `half_life`，`base_scale`/`recency_peak` 仍沿用拼音侧解析结果——它们已是死链，
+给码表再开两个同样无效的旋钮只会增加误导。
 
 ### 9.1.3 ⚠️ 记账码：码表与拼音口径相反
 
