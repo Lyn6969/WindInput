@@ -827,19 +827,30 @@ impl Coordinator {
     /// 工具栏刷新的行为逐项一致——两个入口表达的是同一个用户意图，只是一个"下一个"、
     /// 一个"这一个"。
     ///
-    /// 目标未加载时只提示不切换：与 [`Self::switch_schema`] 同样的理由——在 IME 线程同步
-    /// 重熔大词库会卡顿。已在当前方案时 `engine_mgr.switch_schema` 返回 false，天然幂等。
+    /// **不要求目标方案已启用或已预热**——`engine_mgr.switch_schema` 内部是懒加载
+    /// （`ensure_loaded`），不看 `schema.available`。
+    ///
+    /// 这里刻意**没有** [`Self::switch_schema`] 那道 `is_loaded` 守卫。那道守卫防的是
+    /// 「在 IME 线程同步重熔大词库」的卡顿，但预热只覆盖 available 里的方案，对未启用方案
+    /// `is_loaded` 恒为假 —— 于是这条路径的结局只能是弹「准备中…」然后什么都不发生，
+    /// 永远。用户按下的是**指名道姓**的直达热键，同步加载一次（之后就缓存住了）比
+    /// 彻底切不过去合理。这也正是「英文方案不必先启用就能用热键切过去」的实现方式。
+    ///
+    /// 先判幂等再切，是为了让失败提示说得准：`engine_mgr.switch_schema` 对「已是当前方案」
+    /// 和「方案加载失败」都返回 false，不分开判就只能二选一——要么给正常的重复按键弹一个
+    /// 假报错，要么让方案文件损坏时按键毫无反应。
     pub(crate) fn switch_schema_by_id(&self, schema_id: &str) {
-        if !self.engine_mgr.is_loaded(schema_id) {
-            let name = self.engine_mgr.schema_name(schema_id);
-            self.show_tip(&format!(
-                "{}准备中…",
-                if name.is_empty() { schema_id } else { &name }
-            ));
+        if self.engine_mgr.active_schema_id() == schema_id {
             return;
         }
         if self.engine_mgr.switch_schema(schema_id) {
             self.finish_user_schema_switch(schema_id, "Switched to schema");
+        } else {
+            let name = self.engine_mgr.schema_name(schema_id);
+            self.show_tip(&format!(
+                "{}加载失败",
+                if name.is_empty() { schema_id } else { &name }
+            ));
         }
     }
 
@@ -885,12 +896,16 @@ impl Coordinator {
 
     /// 判断 key_code 是否为配置的 toggle 模式键（从编译后的 key_up 热键提取 vk 低 16 位）。
     /// TSF 仅在干净单击时于 keyUp 转发这些键，故据此判定即可直接切换。
+    ///
+    /// ⚠ 必须按 `action` 过滤，不能只看「key_up 里有没有这个 key_code」：修饰键作二三候选键
+    /// （`select_key_groups = ["lrctrl"]`）也登记在 key_up 里，只看 key_code 会把「只配了选词
+    /// 用的 Ctrl」当成切换键——空闲时轻敲 Ctrl 会莫名切中英文。
     pub(crate) fn is_toggle_mode_keycode(&self, key_code: u32) -> bool {
         self.rt()
             .compiled_hotkeys
             .key_up
             .iter()
-            .any(|e| (e.match_hash & 0xFFFF) == key_code)
+            .any(|e| e.action == "toggle_mode" && (e.match_hash & 0xFFFF) == key_code)
     }
 
     /// 找出 key_code 匹配的 mix 模式下标（按配置顺序先到先得）。

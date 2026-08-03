@@ -586,6 +586,40 @@ fn test_schema_cycle_skips_unloaded() {
     );
 }
 
+/// 直达热键可切到**未启用**方案（不在 available 里），且之后循环键能切回来。
+///
+/// 英文方案的典型用法：不放进 available（省得占循环位），靠热键切过去打一段再切回。
+/// 从这种状态循环时**不得跳过 available[0]**——原实现把「当前方案不在列表」当成
+/// 「在第 0 个」，于是恰好漏掉第一个方案；那条兜底以前几乎不触发，能切到未启用方案
+/// 之后就成了常规路径。
+#[test]
+fn test_switch_to_unavailable_schema_then_cycle_back() {
+    let dir = data_dir();
+    if !schema_exists(&dir, "wubi86") || !schema_exists(&dir, "pinyin") {
+        eprintln!("跳过：缺少 schema");
+        return;
+    }
+    // available 只有 wubi86，pinyin 未启用。
+    let cfg = make_config(&["wubi86"]);
+    let mgr = EngineManager::new(&cfg, Some(&dir));
+    assert_eq!(mgr.active_schema_id(), "wubi86");
+
+    // 切到未启用方案：懒加载，不看 available。
+    assert!(
+        mgr.switch_schema("pinyin"),
+        "未启用方案也应能被直达热键切到"
+    );
+    assert_eq!(mgr.active_schema_id(), "pinyin");
+
+    // 从未启用方案循环：available 只有 wubi86，应回到它而不是无处可去。
+    let next = mgr.cycle_schema();
+    assert_eq!(
+        next.as_deref(),
+        Some("wubi86"),
+        "当前方案不在 available 时，循环应从 available[0] 起，不得跳过它"
+    );
+}
+
 /// 方案显示名取自 schema.name（friendly），未知方案回退 id。
 #[test]
 fn test_schema_name_from_meta() {

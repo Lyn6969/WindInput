@@ -1465,13 +1465,26 @@ impl EngineManager {
     pub fn cycle_schema(&self) -> Option<String> {
         let available = self.available_schemas();
         let n = available.len();
-        if n <= 1 {
+        let current = self.active_schema_id();
+        // 判据是「有没有别的方案可去」，不是「列表里有几个」。
+        //
+        // 原写法 `n <= 1 → None` 隐含假设「当前方案一定在 available 里」——那时 n == 1
+        // 确实意味着无处可去。直达热键能切到**未启用**方案之后（如英文），n == 1 反而
+        // 常常意味着「有一个地方可以回」，照旧返回 None 会让用户卡在英文方案里出不来。
+        if !available.iter().any(|s| s != &current) {
             return None;
         }
-        let current = self.active_schema_id();
-        let cur = available.iter().position(|s| s == &current).unwrap_or(0);
-        for step in 1..n {
-            let cand = available[(cur + step) % n].clone();
+        // 起点：当前方案的下一个；**当前方案不在 available 时从头开始**。
+        //
+        // 原写法是 `position(..).unwrap_or(0)` 再从 +1 起步，那样「不在列表」会被当成
+        // 「在第 0 个」，于是恰好跳过 available[0]。以前 active 恒在 available 里、这条
+        // 兜底几乎不触发；直达热键能切到未启用方案之后（如英文），它就成了常规路径。
+        let start = match available.iter().position(|s| s == &current) {
+            Some(i) => i + 1,
+            None => 0,
+        };
+        for step in 0..n {
+            let cand = available[(start + step) % n].clone();
             if cand == current {
                 continue;
             }
