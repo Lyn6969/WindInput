@@ -7,15 +7,18 @@
 #   comment:              说明（仅文档用途）
 #   caret_use_top:        使用 caret rect 的 top 而非 bottom 定位候选框
 #                         适用于 GetTextExt 返回的 height 不稳定的 WebView 应用
-#   first_show_mode:      候选框首显策略，三档互斥（默认 "wait"）：
-#                         "wait"    等宿主 reflow 后的权威坐标才显示。最准，代价是
-#                                   85~95ms 首显延迟，快速连打时候选框只来得及显示几毫秒。
-#                         "fast"    仍等坐标，但等到「可信」即放行（推荐）。DLL 在首帧
+#   first_show_mode:      候选框首显策略，三档互斥（默认 "fast"）：
+#                         "fast"    默认。仍等坐标，但等到「可信」即放行。DLL 在首帧
 #                                   reflow 期间连发几条试探坐标，取第一条「与上一轮权威
 #                                   坐标不同」的采用——宿主未 reflow 时返回的正是上一轮
 #                                   那个位置，一旦变化即说明新位置已就绪。连续快速输入时
 #                                   更进一步：直接采信首条（连打不重排，跟手比精确更重要）。
-#                                   实测 EverEdit ~3ms、WPS ~11ms 出候选框。
+#                                   焦点切换或鼠标移动光标之后，手里的坐标属于别处，此时
+#                                   自动退回去等真坐标（首帧信任门），不会先错位再跳。
+#                                   实测常规连打首帧中位 7ms，焦点后首帧中位 105ms。
+#                         "wait"    等宿主 reflow 后的权威坐标才显示，代价是 85~95ms 首显
+#                                   延迟，快速连打时候选框只来得及显示几毫秒。留给
+#                                   "fast" 判据失灵的宿主兜底。
 #                         "instant" 完全不等，首帧沿用上一次的坐标。最快，但只要光标位置
 #                                   变动过（手动移动、换行、重排）那个位置就是错的。
 #   initial_mode:         进入本应用时的初始中英状态："english" | "chinese"｜不写=跟随全局。
@@ -58,11 +61,11 @@ process = "SearchHost.exe"
 comment = "Win11 开始菜单 / 任务栏搜索，候选窗无法盖过其 Band 层级，走 HostRender 代理渲染"
 host_render = true
 
-# 示例：为光标稳定的宿主消除候选框首显延迟（默认不启用，按需去掉注释并按实测调整）
+# 示例：给「fast 判据失灵」的宿主退回 wait（fast 已是默认，无需再逐个开启）
 # [[apps]]
-# process = "EverEdit.exe"
-# comment = "光标稳定，无需等 reflow 权威坐标"
-# first_show_mode = "fast"
+# process = "SomeApp.exe"
+# comment = "首帧坐标始终不更新，fast 的试探判据在此宿主上不成立"
+# first_show_mode = "wait"
 
 # 示例：搜索框类应用默认英文，用户仍可随时手动切中文（默认不启用）
 # 也可直接在该应用里右键输入法图标 →「应用独立配置」→「初始输入模式」→「英文」，

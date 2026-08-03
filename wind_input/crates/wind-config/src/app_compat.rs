@@ -42,12 +42,23 @@ fn is_false(b: &bool) -> bool {
 pub enum FirstShowMode {
     /// 等宿主 reflow 后的权威坐标才显示。最准，代价是 85~95ms 首显延迟，
     /// 快速连打时候选窗只来得及显示几毫秒，观感「迟钝」。
-    #[default]
+    ///
+    /// 2026-08-03 起不再是默认档。它的「准」有很大一部分是**碰巧**的：Excel 那类
+    /// 慢宿主上它靠 `caret_pending` 的 600ms 延长兜住，宿主再慢 50ms 一样会错位
+    /// （实测 Excel 需要 808ms 的那次它就没兜住）。真正解决错位的是首帧信任门，
+    /// 而那条判据 `fast` 同样享有。
     Wait,
     /// 仍等坐标，但等到「可信」即放行：DLL 在首帧 reflow 期间连发几条试探坐标，
     /// 取第一条「与上一轮权威坐标不同」的采用（宿主未 reflow 时返回的正是上一轮那个
     /// 位置，一旦变化即说明新位置已就绪）。连续快速输入时更进一步——直接采信首条。
     /// 实测 EverEdit ~3ms、WPS ~11ms 出候选窗。
+    ///
+    /// **默认档**（2026-08-03 起）。此前不敢作默认，是因为它在焦点切换/鼠标移动光标
+    /// 之后的首帧会拿一份属于别处的旧坐标去定位；首帧信任门补上这个洞之后
+    /// （`caret_cache_verified`，见 `docs/redesign/candidate-window-positioning.md`
+    /// 第 6 层），它在「坐标不可信」的那一刻会自动退回去等真值，其余时候保持 25ms
+    /// 短兜底。实测常规连打首帧中位 7ms，焦点后首帧中位 105ms 且位置正确。
+    #[default]
     Fast,
     /// 完全不等，首帧直接沿用上一次的坐标。最快，但只要光标位置变动过
     /// （手动移动、换行、文本重排）那个位置就是错的，会先错位显示再跳回。
@@ -55,12 +66,18 @@ pub enum FirstShowMode {
 }
 
 impl FirstShowMode {
-    /// 配置串 → 枚举。无法识别时回落 `Wait`（最保守的一档）。
+    /// 配置串 → 枚举。无法识别时回落**默认档**——「写了个认不出的值」与「没写」
+    /// 得到同样的行为，最不意外。
+    ///
+    /// ⚠ 刻意写 `Self::default()` 而非硬编码某一档：这里曾硬编码 `Wait`，与
+    /// `#[default]` 是两处独立事实，2026-08-03 调默认档时若不是顺手查了一遍就会漏改，
+    /// 而漏改**不会有任何编译或测试信号**（生产走 serde，本函数只有测试在调）。
     pub fn from_config(s: &str) -> Self {
         match s.trim().to_ascii_lowercase().as_str() {
+            "wait" => Self::Wait,
             "fast" => Self::Fast,
             "instant" => Self::Instant,
-            _ => Self::Wait,
+            _ => Self::default(),
         }
     }
     /// 枚举 → 配置串（写回 compat.toml 用）。
@@ -423,7 +440,9 @@ mod tests {
         let compat = AppCompat::from_rules(file.apps);
         let rule = compat.get_rule("foo.exe").unwrap();
         assert!(!rule.caret_use_top);
-        assert_eq!(rule.first_show_mode, FirstShowMode::Wait);
+        // 缺字段 = 取默认档。与 default() 比而非硬编码某一档：本条测的是「serde 有没有
+        // 走 #[serde(default)]」，不是「默认档是哪一个」——后者由 default_mode_is_fast 钉。
+        assert_eq!(rule.first_show_mode, FirstShowMode::default());
         // 缺字段 = 不干预。若这两个退化成 Some(English)，等于给所有未配置的应用
         // 都配上了「初始英文」——这正是字段必须用 Option 而非 bool 的原因。
         assert_eq!(rule.initial_mode, None);
@@ -538,17 +557,32 @@ mod tests {
     }
 
     #[test]
-    fn mode_parses_from_config_and_falls_back_to_wait() {
+    fn mode_parses_from_config_and_falls_back_to_default() {
         assert_eq!(FirstShowMode::from_config("fast"), FirstShowMode::Fast);
         assert_eq!(
             FirstShowMode::from_config(" INSTANT "),
             FirstShowMode::Instant
         );
         assert_eq!(FirstShowMode::from_config("wait"), FirstShowMode::Wait);
-        // 未知值回落最保守的一档，而不是 panic 或取激进档——用户手改错了不该变成抖动。
-        assert_eq!(FirstShowMode::from_config("turbo"), FirstShowMode::Wait);
-        assert_eq!(FirstShowMode::default(), FirstShowMode::Wait);
+        // 未知值回落**默认档**：写错了和没写得到同样的行为，最不意外。
+        // ⚠ 断言写成与 `default()` 比而非硬编码某一档——回落值与 `#[default]` 是两处
+        // 独立事实，各自硬编码就是漏改的温床（且漏改毫无编译信号，生产走 serde、本函数
+        // 只有测试在调）。这样写等于把「两处必须一致」本身钉成不变量。
+        assert_eq!(
+            FirstShowMode::from_config("turbo"),
+            FirstShowMode::default()
+        );
         assert_eq!(FirstShowMode::Fast.as_config(), "fast");
+    }
+
+    /// 默认档位是产品决策，单独钉一条，改动时必须显式过这一关。
+    ///
+    /// 2026-08-03 由 `wait` 改为 `fast`：`fast` 此前不敢作默认，是因为焦点切换/鼠标移动
+    /// 光标后的首帧会拿一份属于别处的旧坐标定位；首帧信任门补上该洞后，它在坐标不可信时
+    /// 会自动退回去等真值。实测常规连打首帧中位 7ms，焦点后首帧中位 105ms 且位置正确。
+    #[test]
+    fn default_mode_is_fast() {
+        assert_eq!(FirstShowMode::default(), FirstShowMode::Fast);
     }
 
     #[test]

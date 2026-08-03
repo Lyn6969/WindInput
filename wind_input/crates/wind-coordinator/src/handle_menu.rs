@@ -858,20 +858,22 @@ impl Coordinator {
                 M::separator(),
                 // 三档**互斥**，做成子菜单单选：布尔开关时代它们能同时打开，实测就因此出过
                 // 「fast 配了却从未生效」——instant 抢先放行，fast 的判据根本没机会跑。
+                // 文案按「快 → 慢」以外的另一个维度排：用户真正在选的是**遇到慢宿主时
+                // 宁可等还是宁可先显示**，故括号里写代价而不写机制。
                 M::submenu(
                     "候选窗首显",
                     vec![
                         M::leaf(
-                            "等待精确坐标（默认）",
-                            cmd(MenuCmd::FirstShowMode(0)),
-                            enabled,
-                            cur_first_show == F::Wait,
-                        ),
-                        M::leaf(
-                            "快速显示",
+                            "快速显示（默认）",
                             cmd(MenuCmd::FirstShowMode(1)),
                             enabled,
                             cur_first_show == F::Fast,
+                        ),
+                        M::leaf(
+                            "等待精确坐标（较慢）",
+                            cmd(MenuCmd::FirstShowMode(0)),
+                            enabled,
+                            cur_first_show == F::Wait,
                         ),
                         M::leaf(
                             "立即显示（最快，可能抖动）",

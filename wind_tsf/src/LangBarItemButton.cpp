@@ -872,7 +872,15 @@ LRESULT CALLBACK CLangBarItemButton::_MsgWndProc(HWND hwnd, UINT msg, WPARAM wPa
         {
             KillTimer(hwnd, wParam);
             CLangBarItemButton* pThis = reinterpret_cast<CLangBarItemButton*>(GetWindowLongPtrW(hwnd, GWLP_USERDATA));
-            if (pThis != nullptr && pThis->_pTextService != nullptr && pThis->_pTextService->HasActiveComposition())
+            const BOOL hasComp = (pThis != nullptr && pThis->_pTextService != nullptr
+                                  && pThis->_pTextService->HasActiveComposition());
+            // ⚠ 这行日志不可省。`WM_TIMER` 是消息队列里**优先级最低的合成消息**，只在队列
+            // 空闲时才生成，宿主忙时会被无限期饿死。2026-08-03 排查 Excel「点单元格后首字
+            // 错位」时，本 timer 在 680ms 的重排窗口里一次都没触发，而当时成功路径**没有
+            // 任何日志**，只能靠「这一整段零日志」反推它没跑——绕了一大圈。
+            // **判决点必须自己说话，不能靠周围的沉默去猜**：无论走哪条分支都要留下痕迹。
+            WIND_LOG_DEBUG_FMT(L"CARET_RETRY timer fired: hasComposition=%d\n", hasComp ? 1 : 0);
+            if (hasComp)
             {
                 // Timer 兜底：清除 _compositionJustStarted 让取坐标走正常路径
                 // （消费已缓存的坐标，应对不发 OnLayoutChange 的应用）。

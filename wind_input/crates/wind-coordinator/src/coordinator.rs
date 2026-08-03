@@ -7902,9 +7902,14 @@ mod caret_compat_tests {
 
     #[test]
     fn probe_ignored_unless_fast_mode() {
-        // 默认档的底线：不开开关的宿主必须保持「等 reflow 权威坐标」的原行为。
-        // 这条挂了说明默认行为被改动了——那是本功能最不能碰的东西。
+        // `wait` 档的底线：退回该档的宿主必须拿到「等 reflow 权威坐标」的原行为，
+        // probe 一条都不许消费。
+        //
+        // ⚠ 2026-08-03 前本条靠 `coord()` 的默认档恰好是 `wait` 来表达，默认档改成
+        // `fast` 后那个前提失效，故改为显式设档。**测试若靠「默认值恰好是某值」间接
+        // 表达语义，默认值一变它就从"守住语义"退化成"守住巧合"。**
         let c = coord();
+        set_mode(&c, wind_config::app_compat::FirstShowMode::Wait);
         assert!(
             still_waiting_after_probe(&c, probe_at(800, 600, 24)),
             "非 fast 档时 probe 必须被完全忽略"
