@@ -6307,6 +6307,24 @@ impl MessageHandler for Coordinator {
             debug!("caret_probe → 丢弃: 退化 rect（h<=0）");
             return;
         }
+        // ★ 首帧信任门（第二条通路）：坐标缓存未经当前插入点验证时，本函数下面两条判据
+        // **全都失去判断力**，必须一起让位给长兜底。
+        //
+        // 判据 1 靠「≠ 上一轮权威坐标」推断「宿主已 reflow」，其成立前提是那个基准与当前
+        // 插入点**可比**。焦点刚切换时基准属于另一个单元格/文档/应用，probe 值当然不等于
+        // 它 ⇒ 判据恒成立 ⇒ 必然采信一个还没 reflow 的坐标。判据 2（连打快路径）同理：
+        // 跨焦点的"上一次按键间隔"说明不了当前这一帧的坐标可信。
+        //
+        // ⚠ 实测（2026-08-03 Excel）：闸门刚 arm 了 600ms 长兜底，6ms 后 probe 就用
+        // (1299,535) 抢先首显，而 200ms 后真坐标是 (1344,744) ⇒ 显示后跳一次。
+        // **信任门只接在兜底 timer 上是不够的——首显有多条通路，否决判据必须每条都接。**
+        if self.first_show_needs_long_wait() {
+            debug!(
+                "caret_probe → 继续等待: 坐标缓存未经当前插入点验证，本轮判据无基准可比（x={} y={}）",
+                data.x, data.y
+            );
+            return;
+        }
         // 快路径：连续快速输入时直接采信首条采样，不再比对上一轮权威坐标。
         // 依据是连打时光标沿同一行顺序前移、不发生重排，坐标本来就八九不离十；而这种节奏下
         // 用户对「跟手」的敏感度远高于十几像素的偏差。窗口可经
@@ -7061,6 +7079,13 @@ mod caret_compat_tests {
             st.input_buffer = "a".to_string();
         }
         *c.last_authoritative_caret.lock().unwrap() = (500, 300, true);
+        // 与生产代码同源：`last_authoritative_caret` 置 true 和 `caret_cache_verified` 置 true
+        // 是 `handle_caret_update` 里**同一行判据**下的两个动作，现实中不可能只有前者。
+        // 二者不复用同一个字段，是因为清位不同——前者从不清（跨焦点仍为 true），后者在焦点
+        // 到达/用户移动光标时清零。probe 判据需要的恰恰是后者（"基准可比"），拿前者判就会
+        // 在焦点切换后把另一个单元格的坐标当基准，必然误判成"已 reflow"。
+        c.caret_cache_verified
+            .store(true, std::sync::atomic::Ordering::Relaxed);
         *c.pending_first_show.lock().unwrap() = true;
         c.handle_caret_probe(&probe);
         *c.pending_first_show.lock().unwrap()
@@ -7883,6 +7908,46 @@ mod caret_compat_tests {
         assert!(
             still_waiting_after_probe(&c, probe_at(800, 600, 24)),
             "非 fast 档时 probe 必须被完全忽略"
+        );
+    }
+
+    #[test]
+    /// ★ 首显有多条通路，信任门必须每条都接。本条守住 `caret_probe` 这条——它绕过闸门
+    /// 直接首显，实测（2026-08-03 Excel）在闸门刚 arm 600ms 长兜底后 **6ms** 就用
+    /// `(1299,535)` 抢先显示，而 200ms 后真坐标是 `(1344,744)` ⇒ 显示后跳一次。
+    ///
+    /// 根因是 probe 的两条判据在坐标缓存失效时**都失去判断力**：判据 1 靠「≠ 上一轮权威
+    /// 坐标」推断宿主已 reflow，而焦点切换后那个基准属于另一个单元格，probe 值当然不等于
+    /// 它 ⇒ 判据恒成立；判据 2 的"上次按键间隔"跨了焦点，同样说明不了当前帧可信。
+    #[test]
+    fn probe_defers_to_long_wait_when_cache_unverified() {
+        let c = coord();
+        *c.active_compat.lock().unwrap() = ActiveCompat {
+            pid: 1,
+            first_show_mode: wind_config::app_compat::FirstShowMode::Fast,
+            ..Default::default()
+        };
+        {
+            let mut st = c.state.lock().unwrap();
+            st.input_buffer = "a".to_string();
+        }
+        // 有基准、坐标也「变了」——判据 1 本会采信；但缓存未验证，基准不可比。
+        *c.last_authoritative_caret.lock().unwrap() = (500, 300, true);
+        c.caret_cache_verified
+            .store(false, std::sync::atomic::Ordering::Relaxed);
+        *c.pending_first_show.lock().unwrap() = true;
+        c.handle_caret_probe(&probe_at(800, 600, 24));
+        assert!(
+            *c.pending_first_show.lock().unwrap(),
+            "坐标缓存未验证时 probe 不得提前首显，须让位给长兜底等真坐标"
+        );
+
+        // 连打快路径（判据 2）同样要被拦住，否则换个入口照样绕过去。
+        *c.last_key_interval_ms.lock().unwrap() = Some(60);
+        c.handle_caret_probe(&probe_at(500, 300, 24));
+        assert!(
+            *c.pending_first_show.lock().unwrap(),
+            "连打快路径也必须过信任门——只堵判据 1 等于没堵"
         );
     }
 
