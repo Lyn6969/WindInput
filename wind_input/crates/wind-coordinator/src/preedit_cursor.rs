@@ -57,6 +57,64 @@ pub(crate) fn caret_display_bytes(prefix: &str, buffer: &str, body: &str, cursor
     prefix.len() + dpos
 }
 
+/// 「原始大小写影子串」是否作数：非空且与缓冲逐字符同形（仅 ASCII 字母大小写可能不同）。
+///
+/// 缓冲恒为全小写（引擎查询、顶码判定、词频记账都按它），用户按 Shift+字母打出的大写只存在
+/// 影子串里。**校验而非信任**是这套结构的关键：缓冲有二十余处写入点（清空、整体替换、
+/// 顶码截断…），逐个接线必然漏。失配即视为「没有大写」，于是漏接的后果是丢大写（显示退化成
+/// 小写，功能照常），而不是把上一轮的大写错套到新缓冲上。
+pub(crate) fn cased_is_valid(buffer: &str, cased: &str) -> bool {
+    !cased.is_empty() && buffer.eq_ignore_ascii_case(cased)
+}
+
+/// 缓冲的「用户所打形态」：影子串有效则用它，否则用缓冲本身。供组合区显示与上屏原码。
+pub(crate) fn cased_or_buffer<'a>(buffer: &'a str, cased: &'a str) -> &'a str {
+    if cased_is_valid(buffer, cased) {
+        cased
+    } else {
+        buffer
+    }
+}
+
+/// 把影子串的大小写投影到显示串上（display = buffer 按序插入若干分隔符的产物，同
+/// [`map_buf_pos_to_display_pos`] 的贪心同步扫描）。影子串无效时原样返回 display。
+///
+/// 大小写不改变字符数，故投影后 display 长度不变，caret 换算不受影响。
+pub(crate) fn project_case(buffer: &str, cased: &str, display: &str) -> String {
+    if !cased_is_valid(buffer, cased) {
+        return display.to_string();
+    }
+    let (mut bc, mut cc) = (buffer.chars(), cased.chars());
+    let mut pending = bc.next().zip(cc.next());
+    let mut out = String::with_capacity(display.len());
+    for dch in display.chars() {
+        match pending {
+            Some((b, c)) if dch == b => {
+                out.push(c);
+                pending = bc.next().zip(cc.next());
+            }
+            _ => out.push(dch),
+        }
+    }
+    out
+}
+
+/// 缓冲被截成自身后缀之后（顶码留余码 / 分步确认消费前缀）同步影子串：掐掉同样长度的头部。
+/// 对不上就清空——退化成全小写，好过让错位的大写留在缓冲上。
+pub(crate) fn keep_cased_tail(buffer: &str, cased: &mut String) {
+    if cased.is_empty() {
+        return;
+    }
+    if cased.len() >= buffer.len() {
+        let cut = cased.len() - buffer.len();
+        if cased.is_char_boundary(cut) && buffer.eq_ignore_ascii_case(&cased[cut..]) {
+            cased.replace_range(..cut, "");
+            return;
+        }
+    }
+    cased.clear();
+}
+
 /// 借用 buffer + cursor 的编辑视图，提供边界安全的编辑原语。
 ///
 /// 所有 cursor 运算封死在此，调用方不做裸 `usize` 加减——这是 5 个 overlay 模式各写各的
@@ -65,12 +123,37 @@ pub(crate) fn caret_display_bytes(prefix: &str, buffer: &str, body: &str, cursor
 pub(crate) struct BufEdit<'a> {
     buf: &'a mut String,
     cursor: &'a mut usize,
+    /// 与 buf 逐字符同形的「原始大小写」影子串（见 [`cased_is_valid`]）；`None` = 该缓冲
+    /// 不支持大写（5 个 overlay 各自的缓冲），空串 = 支持但当前没有大写。
+    cased: Option<&'a mut String>,
 }
 
 impl<'a> BufEdit<'a> {
     pub(crate) fn new(buf: &'a mut String, cursor: &'a mut usize) -> Self {
         *cursor = floor_boundary(buf, *cursor);
-        Self { buf, cursor }
+        Self {
+            buf,
+            cursor,
+            cased: None,
+        }
+    }
+
+    /// 带影子串的编辑视图（普通输入的 `input_buffer` 专用）。**构造即校准**：影子串与缓冲
+    /// 失配（别处清空或整体替换过缓冲）时就地清空，故陈旧的大写活不过下一次编辑。
+    pub(crate) fn new_cased(
+        buf: &'a mut String,
+        cursor: &'a mut usize,
+        cased: &'a mut String,
+    ) -> Self {
+        if !cased.is_empty() && !buf.eq_ignore_ascii_case(cased) {
+            cased.clear();
+        }
+        *cursor = floor_boundary(buf, *cursor);
+        Self {
+            buf,
+            cursor,
+            cased: Some(cased),
+        }
     }
 
     #[cfg(test)]
@@ -80,6 +163,25 @@ impl<'a> BufEdit<'a> {
 
     /// 在光标处插入字符，光标随之后移（光标在末尾时等价于原来的 `push`）。
     pub(crate) fn insert(&mut self, ch: char) {
+        self.insert_cased(ch, ch);
+    }
+
+    /// 插入字符：`ch` 进缓冲（引擎查询用，恒小写），`raw` 进影子串（用户所打的形态）。
+    /// 两者相同且影子串还空着时**什么都不多做**——没有大写就不付维护成本，也就没有
+    /// 「影子串悄悄跟缓冲分叉」的机会。
+    ///
+    /// `raw` 必须与 `ch` 等字节长（大小写变体），否则影子串与缓冲的字节位置会错开。
+    pub(crate) fn insert_cased(&mut self, ch: char, raw: char) {
+        debug_assert_eq!(raw.len_utf8(), ch.len_utf8());
+        if let Some(cased) = self.cased.as_deref_mut()
+            && (raw != ch || !cased.is_empty())
+        {
+            if cased.is_empty() {
+                // 首个大写：影子串从当前缓冲（全小写）起底，此后与它同步演进。
+                *cased = self.buf.clone();
+            }
+            cased.insert(*self.cursor, raw);
+        }
         self.buf.insert(*self.cursor, ch);
         *self.cursor += ch.len_utf8();
     }
@@ -90,6 +192,7 @@ impl<'a> BufEdit<'a> {
             return false;
         }
         let prev = floor_boundary(self.buf, *self.cursor - 1);
+        self.cut_cased(prev..*self.cursor);
         self.buf.replace_range(prev..*self.cursor, "");
         *self.cursor = prev;
         true
@@ -105,8 +208,18 @@ impl<'a> BufEdit<'a> {
             .next()
             .map(|c| *self.cursor + c.len_utf8())
             .unwrap_or(self.buf.len());
+        self.cut_cased(*self.cursor..next);
         self.buf.replace_range(*self.cursor..next, "");
         true
+    }
+
+    /// 影子串按与缓冲**相同的字节区间**同步删除（构造时已校准同形，故区间通用）。
+    fn cut_cased(&mut self, range: std::ops::Range<usize>) {
+        if let Some(cased) = self.cased.as_deref_mut()
+            && !cased.is_empty()
+        {
+            cased.replace_range(range, "");
+        }
     }
 
     /// 左移一个字符。返回是否移动了（已在最左 → false，调用方据此决定吃键还是透传）。
@@ -248,6 +361,77 @@ mod tests {
         assert_eq!(e.pos(), 2);
         assert!(e.backspace());
         assert_eq!(b.as_str(), "n");
+    }
+
+    /// 影子串按需起底：全小写输入不碰它（空 = 没有大写），出现第一个大写时才从当前缓冲成形。
+    #[test]
+    fn cased_shadow_materializes_only_on_first_uppercase() {
+        let (mut b, mut c, mut cs) = (String::new(), 0usize, String::new());
+        BufEdit::new_cased(&mut b, &mut c, &mut cs).insert_cased('a', 'a');
+        assert_eq!((b.as_str(), cs.as_str()), ("a", ""), "全小写不该维护影子串");
+
+        BufEdit::new_cased(&mut b, &mut c, &mut cs).insert_cased('b', 'B');
+        assert_eq!((b.as_str(), cs.as_str()), ("ab", "aB"));
+        BufEdit::new_cased(&mut b, &mut c, &mut cs).insert_cased('c', 'C');
+        assert_eq!((b.as_str(), cs.as_str()), ("abc", "aBC"));
+        assert_eq!(cased_or_buffer(&b, &cs), "aBC");
+    }
+
+    /// 退格/前删/光标中插：影子串与缓冲同步演进，形态不错位。
+    #[test]
+    fn cased_shadow_tracks_edits() {
+        let (mut b, mut c, mut cs) = (String::from("abc"), 3usize, String::from("aBC"));
+        assert!(BufEdit::new_cased(&mut b, &mut c, &mut cs).backspace());
+        assert_eq!((b.as_str(), cs.as_str()), ("ab", "aB"));
+
+        // 光标移到中间插入一个大写：两串同位置插入。
+        BufEdit::new_cased(&mut b, &mut c, &mut cs).move_left();
+        BufEdit::new_cased(&mut b, &mut c, &mut cs).insert_cased('x', 'X');
+        assert_eq!((b.as_str(), cs.as_str()), ("axb", "aXB"));
+
+        // Delete 删光标后一个（'b'/'B'），光标不动。
+        assert!(BufEdit::new_cased(&mut b, &mut c, &mut cs).delete());
+        assert_eq!((b.as_str(), cs.as_str()), ("ax", "aX"));
+    }
+
+    /// ★ 失配即退化：缓冲被别处清空/整体替换后，陈旧的影子串既不作数，也活不过下一次编辑。
+    /// 这是不去逐个接线二十余处缓冲写入点的**前提**——漏接的后果只能是丢大写，不能是串味。
+    #[test]
+    fn stale_cased_shadow_is_discarded_not_reused() {
+        let (mut b, mut c, mut cs) = (String::from("abc"), 3usize, String::from("aBC"));
+        // 别处清空了缓冲却没动影子串、也没动光标（模拟未接线的写入点）。
+        b.clear();
+        assert_eq!(cased_or_buffer(&b, &cs), "", "失配时读取必须退化到缓冲");
+        assert!(!cased_is_valid(&b, &cs));
+
+        // 重新打同样的三个字母（全小写）：构造时校准已把陈旧影子串清掉，不会读出 "aBC"。
+        for ch in "abc".chars() {
+            BufEdit::new_cased(&mut b, &mut c, &mut cs).insert_cased(ch, ch);
+        }
+        assert_eq!(cased_or_buffer(&b, &cs), "abc");
+    }
+
+    #[test]
+    fn project_case_onto_split_display() {
+        // 拼音拆分串含引擎插入的分隔符：大写按序投影回去，分隔符原样保留。
+        assert_eq!(project_case("nihao", "nIhao", "ni'hao"), "nI'hao");
+        assert_eq!(project_case("abc", "aBC", "abc"), "aBC");
+        // 影子串无效（空/失配）→ 原样返回，绝不臆造大写。
+        assert_eq!(project_case("nihao", "", "ni'hao"), "ni'hao");
+        assert_eq!(project_case("nihao", "aBC", "ni'hao"), "ni'hao");
+    }
+
+    #[test]
+    fn keep_cased_tail_follows_prefix_cut() {
+        // 顶码留余码：缓冲被截成后缀，影子串同步掐头。
+        let mut cs = String::from("aBCde");
+        keep_cased_tail("de", &mut cs);
+        assert_eq!(cs, "de");
+
+        // 截出来的后缀对不上（缓冲被换成了别的内容）→ 清空退化，不留错位的大写。
+        let mut cs = String::from("aBCde");
+        keep_cased_tail("xy", &mut cs);
+        assert!(cs.is_empty());
     }
 
     #[test]

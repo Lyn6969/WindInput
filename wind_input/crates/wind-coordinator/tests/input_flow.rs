@@ -6541,3 +6541,105 @@ fn test_temp_english_page_keys_yield_to_input_when_symbols_allowed() {
     );
     assert_eq!(coord.debug_page_info().0, 0, "让位输入时不应翻页");
 }
+
+// ───── 普通输入（拼音/码表）的大写字母：只进显示与上屏原码，不进匹配 ─────
+
+/// 缓冲非空时 Shift+字母：组合区如实显示大写，回车上屏也是大写（打 `aBC` 得 `aBC`）。
+///
+/// 边界（既有行为，不在本功能范围内）：**空缓冲**的 Shift+字母是临时英文的进入方式，
+/// 到不了这里；故用户要打的临时短英文须以小写字母起头。
+#[test]
+fn normal_input_keeps_uppercase_in_preedit_and_raw_commit() {
+    if !has_schemas() {
+        return;
+    }
+    let coord = Coordinator::new_headless(config_with("wubi86"), Some(&data_dir()));
+    let last = press_str(&coord, "aBC");
+    assert_eq!(
+        action_text(&last).unwrap(),
+        "aBC",
+        "组合区应如实呈现所打的大小写"
+    );
+    match coord.handle_key_event(&key_event(0x0D, EVENT_KEY_DOWN)) {
+        KeyAction::InsertText { text, .. } => assert_eq!(text, "aBC", "回车上屏原码应保留大写"),
+        other => panic!("回车应上屏原码，实际: {:?}", other),
+    }
+}
+
+/// ★ 反向对照：大写**只影响呈现**。`aBC` 与 `abc` 的候选列表必须逐项相同——
+/// 这条是「不影响码表和拼音的基础匹配」的直接判据，若哪天有人把大写写进查询串就会红。
+#[test]
+fn normal_input_uppercase_does_not_change_candidates() {
+    if !has_schemas() {
+        return;
+    }
+    let upper = Coordinator::new_headless(config_with("wubi86"), Some(&data_dir()));
+    press_str(&upper, "aBC");
+    let lower = Coordinator::new_headless(config_with("wubi86"), Some(&data_dir()));
+    press_str(&lower, "abc");
+    assert!(
+        !lower.debug_page_texts().is_empty(),
+        "前置条件：abc 须有候选，否则两边同为空的「相等」什么也没证明"
+    );
+    assert_eq!(
+        upper.debug_page_texts(),
+        lower.debug_page_texts(),
+        "大写只改呈现，候选必须与全小写完全一致"
+    );
+}
+
+/// 拼音的组合区是音节拆分串（含引擎插入的 `'`）：大写按序投影回去，分隔位置不受影响。
+#[test]
+fn normal_input_uppercase_projects_onto_pinyin_split_display() {
+    if !has_schemas() {
+        return;
+    }
+    let upper = Coordinator::new_headless(config_with("pinyin"), Some(&data_dir()));
+    let up = action_text(&press_str(&upper, "nIhao")).unwrap();
+    let lower = Coordinator::new_headless(config_with("pinyin"), Some(&data_dir()));
+    let low = action_text(&press_str(&lower, "nihao")).unwrap();
+    assert_eq!(
+        up.to_ascii_lowercase(),
+        low,
+        "投影只该改大小写，分隔符与拆分位置必须与全小写一致"
+    );
+    assert!(
+        up.contains('I'),
+        "第 2 个字母打的是大写，应如实显示: {}",
+        up
+    );
+}
+
+/// 退格后大写随之收缩：`aBC` 退一格 → `aB`，上屏也是 `aB`。
+#[test]
+fn normal_input_uppercase_survives_backspace() {
+    if !has_schemas() {
+        return;
+    }
+    let coord = Coordinator::new_headless(config_with("wubi86"), Some(&data_dir()));
+    press_str(&coord, "aBC");
+    let act = coord.handle_key_event(&key_event(0x08, EVENT_KEY_DOWN)); // Backspace
+    assert_eq!(action_text(&act).unwrap(), "aB");
+    match coord.handle_key_event(&key_event(0x0D, EVENT_KEY_DOWN)) {
+        KeyAction::InsertText { text, .. } => assert_eq!(text, "aB"),
+        other => panic!("回车应上屏原码，实际: {:?}", other),
+    }
+}
+
+/// ★ 陈旧大写不得串到下一轮输入：`aBC` → Esc → 再打全小写 `abc`，上屏必须是 `abc`。
+/// 缓冲有二十余处写入点，靠的不是逐个接线而是「影子串与缓冲失配即作废」，本条守住它。
+#[test]
+fn normal_input_uppercase_does_not_leak_into_next_composition() {
+    if !has_schemas() {
+        return;
+    }
+    let coord = Coordinator::new_headless(config_with("wubi86"), Some(&data_dir()));
+    press_str(&coord, "aBC");
+    coord.handle_key_event(&key_event(0x1B, EVENT_KEY_DOWN)); // Esc 放弃整段
+    let last = press_str(&coord, "abc");
+    assert_eq!(action_text(&last).unwrap(), "abc", "上一轮的大写不该复活");
+    match coord.handle_key_event(&key_event(0x0D, EVENT_KEY_DOWN)) {
+        KeyAction::InsertText { text, .. } => assert_eq!(text, "abc"),
+        other => panic!("回车应上屏原码，实际: {:?}", other),
+    }
+}

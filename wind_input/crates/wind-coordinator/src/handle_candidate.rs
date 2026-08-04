@@ -1478,6 +1478,10 @@ impl Coordinator {
             .iter()
             .map(|(_, _, t, _, _)| t.as_str())
             .collect();
+        // 回退段的码并回缓冲**前部** → 影子串同步前置（并回的码来自已确认段，恒小写）。
+        if !state.input_buffer_cased.is_empty() {
+            state.input_buffer_cased = format!("{}{}", raw_code, state.input_buffer_cased);
+        }
         state.input_buffer = format!("{}{}", raw_code, state.input_buffer);
         state.input_cursor_pos = state.input_buffer.len();
         self.update_candidates(state);

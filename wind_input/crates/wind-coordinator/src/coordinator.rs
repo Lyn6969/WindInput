@@ -434,6 +434,13 @@ pub(crate) struct State {
     pub(crate) has_edit_context: bool,
     pub(crate) caps_lock: bool,
     pub(crate) input_buffer: String,
+    /// `input_buffer` 的「原始大小写」影子串：用户按 Shift+字母打出的大写只存在这里。
+    /// 空 = 没有大写；与缓冲失配同样视为没有大写（见 `preedit_cursor::cased_is_valid`）。
+    ///
+    /// **缓冲本身恒为全小写**——引擎查询、顶码判定、词频记账、加词取码一律按它，大小写对
+    /// 匹配零影响。本字段只出现在两个出口：组合区显示，以及「上屏原码」（回车/空格空码/
+    /// 标点顶屏）。读写走 `preedit_cursor::BufEdit::new_cased`，勿裸改。
+    pub(crate) input_buffer_cased: String,
     /// 编码区光标：`input_buffer` 内的字节偏移，定义域 `[0, input_buffer.len()]`。
     /// 恒指向剩余编码内部——已转换前缀（`committed_text`）是只读前缀，光标进不去（Home 只到
     /// 剩余编码开头）。光标**不参与引擎查询**：`update_candidates` 恒查整串，移动光标不重算
@@ -1400,6 +1407,7 @@ impl Coordinator {
                 has_edit_context: false, // 同上：焦点尚未落到任何可编辑控件
                 caps_lock: false,
                 input_buffer: String::new(),
+                input_buffer_cased: String::new(),
                 input_cursor_pos: 0,
                 preedit: String::new(),
                 preedit_split_body: String::new(),
@@ -2612,6 +2620,7 @@ impl Coordinator {
         state.committed_text.clear();
         state.committed_segs.clear();
         state.input_buffer.clear();
+        state.input_buffer_cased.clear();
         state.input_cursor_pos = 0;
         state.preedit.clear();
         state.preedit_split_body.clear();
@@ -4219,20 +4228,25 @@ impl Coordinator {
         let text = if commit {
             // 切到英文且配置上屏：把「已转换前缀 + 剩余原码」一并上屏。
             let prefix = self.take_committed(state);
+            // 上屏原码 → 同回车，用用户所打的大小写形态（缓冲本身恒小写）。
+            let raw_code =
+                preedit_cursor::cased_or_buffer(&state.input_buffer, &state.input_buffer_cased)
+                    .to_string();
             // 模式切换上屏：committed 段已在选词时记过，此处只记剩余原码（来源模式切换）。
             self.record_commit(
-                &state.input_buffer,
-                state.input_buffer.len() as u32,
+                &raw_code,
+                raw_code.len() as u32,
                 -1,
                 CommitSource::ModeSwitch,
             );
-            self.maybe_s2t(state, &format!("{}{}", prefix, state.input_buffer))
+            self.maybe_s2t(state, &format!("{}{}", prefix, raw_code))
         } else {
             String::new()
         };
         state.committed_text.clear();
         state.committed_segs.clear();
         state.input_buffer.clear();
+        state.input_buffer_cased.clear();
         state.candidates.clear();
         state.preedit.clear();
         text
@@ -5136,9 +5150,10 @@ impl MessageHandler for Coordinator {
                     self.pop_committed_seg(&mut state)
                 } else if !state.input_buffer.is_empty() {
                     let st = &mut *state;
-                    let deleted = preedit_cursor::BufEdit::new(
+                    let deleted = preedit_cursor::BufEdit::new_cased(
                         &mut st.input_buffer,
                         &mut st.input_cursor_pos,
+                        &mut st.input_buffer_cased,
                     )
                     .backspace();
                     if !deleted {
@@ -5182,15 +5197,22 @@ impl MessageHandler for Coordinator {
                         return KeyAction::ClearComposition;
                     }
                     let prefix = self.take_committed(&mut state);
+                    // 上屏的是**用户所打的形态**：Shift+字母的大写存在影子串里，缓冲恒小写。
+                    let raw_code = preedit_cursor::cased_or_buffer(
+                        &state.input_buffer,
+                        &state.input_buffer_cased,
+                    )
+                    .to_string();
                     // 上屏剩余拼音原码：prefix(committed) 段已在选词时记过，此处只记 input_buffer 避免重复。
                     self.record_commit(
-                        &state.input_buffer,
-                        state.input_buffer.len() as u32,
+                        &raw_code,
+                        raw_code.len() as u32,
                         -1,
                         CommitSource::RawInput,
                     );
-                    let text = self.maybe_s2t(&state, &format!("{}{}", prefix, state.input_buffer));
+                    let text = self.maybe_s2t(&state, &format!("{}{}", prefix, raw_code));
                     state.input_buffer.clear();
+                    state.input_buffer_cased.clear();
                     state.candidates.clear();
                     self.notify_ui_hide();
                     Self::commit_action(text, true)
@@ -5220,15 +5242,22 @@ impl MessageHandler for Coordinator {
                         return KeyAction::ClearComposition;
                     }
                     let prefix = self.take_committed(&mut state);
+                    // 上屏的是**用户所打的形态**：Shift+字母的大写存在影子串里，缓冲恒小写。
+                    let raw_code = preedit_cursor::cased_or_buffer(
+                        &state.input_buffer,
+                        &state.input_buffer_cased,
+                    )
+                    .to_string();
                     // 上屏剩余拼音原码：prefix(committed) 段已在选词时记过，此处只记 input_buffer 避免重复。
                     self.record_commit(
-                        &state.input_buffer,
-                        state.input_buffer.len() as u32,
+                        &raw_code,
+                        raw_code.len() as u32,
                         -1,
                         CommitSource::RawInput,
                     );
-                    let text = self.maybe_s2t(&state, &format!("{}{}", prefix, state.input_buffer));
+                    let text = self.maybe_s2t(&state, &format!("{}{}", prefix, raw_code));
                     state.input_buffer.clear();
+                    state.input_buffer_cased.clear();
                     state.candidates.clear();
                     self.notify_ui_hide();
                     Self::commit_action(text, true)
@@ -5274,8 +5303,17 @@ impl MessageHandler for Coordinator {
                 self.handle_number_key_select(&mut state, 10)
             }
             keymap::VK_A..=keymap::VK_Z => {
-                // A-Z 字母累积
+                // A-Z 字母累积。缓冲恒存小写：z-fallback 探针、顶码判定、引擎查询、词频记账
+                // 全部只看它，大小写对匹配零影响。
                 let ch = (b'a' + (data.key_code - 0x41) as u8) as char;
+                // Shift+字母的大写只进影子串，供组合区显示与「上屏原码」还原用户所打的形态
+                // （打 `aBC` 回车得 `aBC`）。CapsLock 在中文输入流里到不了这一步——上面
+                // `state.caps_lock` 分支已整段接管，故此处只需判 Shift。
+                let raw = if data.modifiers & MOD_SHIFT != 0 {
+                    ch.to_ascii_uppercase()
+                } else {
+                    ch
+                };
                 // z-fallback 夺取：缓冲以 z 开头且加此键后 z… 破活码前缀 → 首 z 实为拼音触发键，
                 // 抛弃首 z、residual 进临时拼音（对齐 Go decideEngineDefaultZFallback）。须先于顶码/累积。
                 if let Some(act) = self.try_z_fallback(&mut state, ch) {
@@ -5302,8 +5340,12 @@ impl MessageHandler for Coordinator {
                 // 缓冲判定，与光标位置无关——光标只是编辑位置，不参与引擎查询。
                 {
                     let st = &mut *state;
-                    preedit_cursor::BufEdit::new(&mut st.input_buffer, &mut st.input_cursor_pos)
-                        .insert(ch);
+                    preedit_cursor::BufEdit::new_cased(
+                        &mut st.input_buffer,
+                        &mut st.input_cursor_pos,
+                        &mut st.input_buffer_cased,
+                    )
+                    .insert_cased(ch, raw);
                 }
 
                 // 顶码上屏：缓冲超过满码长且整串无匹配 → 顶前 N 码首选，余码续打
@@ -5453,9 +5495,10 @@ impl MessageHandler for Coordinator {
                     }
                 } else {
                     let st = &mut *state;
-                    let deleted = preedit_cursor::BufEdit::new(
+                    let deleted = preedit_cursor::BufEdit::new_cased(
                         &mut st.input_buffer,
                         &mut st.input_cursor_pos,
+                        &mut st.input_buffer_cased,
                     )
                     .delete();
                     if !deleted {
@@ -5673,7 +5716,11 @@ impl MessageHandler for Coordinator {
                                 );
                                 commit_text.push_str(&self.cand_s2t_text(&state, &cand));
                             } else if !state.input_buffer.is_empty() {
-                                commit_text.push_str(&state.input_buffer);
+                                // 无候选顶屏的是原码 → 同回车，用用户所打的大小写形态。
+                                commit_text.push_str(preedit_cursor::cased_or_buffer(
+                                    &state.input_buffer,
+                                    &state.input_buffer_cased,
+                                ));
                             }
                             state.input_buffer.clear();
                             state.candidates.clear();
@@ -5721,7 +5768,11 @@ impl MessageHandler for Coordinator {
                         );
                         out.push_str(&self.cand_s2t_text(&state, &cand));
                     } else if !state.input_buffer.is_empty() {
-                        out.push_str(&state.input_buffer);
+                        // 无候选顶屏的是原码 → 同回车，用用户所打的大小写形态。
+                        out.push_str(preedit_cursor::cased_or_buffer(
+                            &state.input_buffer,
+                            &state.input_buffer_cased,
+                        ));
                     }
                     let had_input = !state.input_buffer.is_empty()
                         || !state.candidates.is_empty()
