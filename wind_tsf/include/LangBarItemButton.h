@@ -171,7 +171,8 @@ private:
     BOOL _bToolbarVisible;     // Toolbar visibility
     BOOL _bKeyboardDisabled;   // Keyboard disabled by system (线程级 compartment)
     // 焦点不在可编辑控件里（CAD 绘图区、浏览器非输入区、QQ 密码框那种 READONLY DocMgr）。
-    // 与 _bKeyboardDisabled 的成因不同，但对用户是同一件事：一个键也打不进去。
+    // 呈现上与 _bPasswordField 一致（图标显「英」），**不变淡**——变淡留给线程级
+    // KEYBOARD_DISABLED，理由见 GetIcon 里的说明。差异靠 tooltip 区分。
     BOOL _bNoEditContext;
     // 密码框：已被强制英文（判据 = IsPasswordSuppressActive，含策略开关与线程级早退）。
     // 实测 Chrome/Edge 网页登录页会置 context 级 KEYBOARD_DISABLED 从而命中；

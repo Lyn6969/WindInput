@@ -469,12 +469,18 @@ STDAPI CLangBarItemButton::GetIcon(HICON* phIcon)
     // Display text is determined by Go service via _inputTypeLabel
     // (e.g., "中", "英", "A", "拼", "五", "双")
     //
-    // 密码框例外：此时键已被 IsPasswordSuppressActive 全放行给宿主（等效英文输入），
-    // 图标却还显方案标签「五」，用户会以为仍能打中文——这正是本次要修的认知偏差。
+    // 打不出中文的两种场景统一显「英」：密码框（键已被 IsPasswordSuppressActive 全放行）
+    // 与焦点不在可编辑控件里（键透传给宿主）。二者成因不同，但从用户视角是同一个问题的
+    // 同一个答案——「我现在敲键盘会出什么」——那就该是同一个图标；具体差异交给 tooltip。
+    //
+    // 曾用「变淡」表示无可编辑上下文，实测被否：变淡的语义是「输入法本身不可用」，
+    // 强度和出现频率都不匹配「焦点不在文本框上」这种日常状态（点按钮/列表/桌面都会进），
+    // 结果是图标频繁变灰、用户无从理解。变淡现在只留给线程级 KEYBOARD_DISABLED。
+    //
     // ⚠ **只改这一处呈现**：_inputTypeLabel 与 _bChineseMode 的持久值一概不动。
     // 真正的英文闸在别处（C++ 的吃键放行 + core 的 password_suppress 透传），把状态
     // 烧进标签本身，会让「图标变英、中文照样输入」的老毛病换个地方复发。
-    const wchar_t* text = _bPasswordField ? L"英" : _inputTypeLabel;
+    const wchar_t* text = (_bPasswordField || _bNoEditContext) ? L"英" : _inputTypeLabel;
 
     // Draw white text on black using DirectWrite GDI-interop path
     // (IDWriteBitmapRenderTarget + IDWriteTextRenderer — same as Go-side candidate window)
@@ -608,9 +614,10 @@ STDAPI CLangBarItemButton::GetIcon(HICON* phIcon)
         // max(r, g, b) as alpha - preserves anti-aliased edge transitions
         BYTE alpha = r > g ? (r > b ? r : b) : (g > b ? g : b);
         // When keyboard is disabled, reduce alpha to 35% for dimmed appearance
-        // 「焦点不在可编辑控件里」共用同一呈现：成因不同（一个是系统禁用输入法，一个是
-        // 焦点压根不在文本框上），但对用户是同一件事——一个键也打不进去。
-        if (_bKeyboardDisabled || _bNoEditContext)
+        // ⚠ 变淡**只给线程级 KEYBOARD_DISABLED**：它表示「输入法整个被禁用」，罕见且严重。
+        // 不要把「焦点不在可编辑控件里」并进来——那是日常状态（点按钮/列表/桌面都会进），
+        // 曾试过并入，实测图标频繁变灰、用户无从理解，已改为与密码框一样显「英」。
+        if (_bKeyboardDisabled)
             alpha = (BYTE)(alpha * 90 / 255);
         pixels[i * 4 + 0] = fgColor; // B
         pixels[i * 4 + 1] = fgColor; // G
