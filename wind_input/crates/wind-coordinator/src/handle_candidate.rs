@@ -1125,6 +1125,80 @@ impl Coordinator {
         None
     }
 
+    /// 选中「当前页第 `offset` 项」（0=首选，1=次选，2=三选），按当前活跃模式派发到各自的
+    /// 选中出口。越界（页内不足）返回 `None`，由调用方决定回落语义。
+    ///
+    /// 各模式的选中语义差异很大（临拼要分步转换、mix 要按透镜、临英/特殊要先判命令候选），
+    /// 故本函数**只做派发**，落点全是各模式 keydown 路径上用的同一个函数——两条路径若哪天
+    /// 分叉，就会出现「按 `;` 和按 Ctrl 选同一个候选，结果不一样」。
+    pub(crate) fn select_page_candidate(
+        &self,
+        state: &mut State,
+        offset: usize,
+    ) -> Option<KeyAction> {
+        let (start, end) = self.page_range(state);
+        let gi = start + offset;
+        if gi >= end {
+            return None;
+        }
+        Some(match state.active {
+            Some(ModeKind::TempPinyin) => {
+                let cand = state.candidates[gi].clone();
+                self.commit_temp_pinyin_selected(state, &cand, offset as i32)
+            }
+            Some(ModeKind::TempEnglish) => {
+                if let Some(act) = self.temp_english_try_command(state, gi) {
+                    act
+                } else {
+                    let text = state.candidates[gi].text.clone();
+                    self.commit_temp_english_text(state, text)
+                }
+            }
+            Some(ModeKind::Special(_)) => self.commit_special_candidate(state, gi),
+            Some(ModeKind::Mix(_)) => self.mix_select(state, offset),
+            // 网址模式无候选列表（不出候选窗），没有可选中的东西。
+            Some(ModeKind::Url) => return None,
+            None => {
+                let cand = state.candidates[gi].clone();
+                self.commit_selected(state, &cand, offset as i32)
+            }
+        })
+    }
+
+    /// 修饰键（`select_key_groups` 里的 `lrshift` / `lrctrl`）作二三候选键的 **keyup** 入口。
+    ///
+    /// 为什么在 keyup：见 `hotkey::compile_select_modifier_group`——纯修饰键的 keydown 既不能
+    /// 吃（宿主要看到修饰键），在 keydown 上判定又会让 `Ctrl+A` 的第一下 Ctrl 误选候选。
+    /// TSF 侧只在「轻敲」（<500ms、中途没按别的键）时才把这个 keyup 转发过来，故收到即可动作。
+    ///
+    /// 与「同一个修饰键也被配成中英文切换键」的优先级：**有候选选词、无候选切换**。
+    /// 返回 `None` 即让位给下游的 toggle 判定，故本函数必须先于它调用。
+    ///
+    /// 越界（页内候选不足 2/3 项）**吞键**，既不选也不切换，且不套 `keys.overflow.select_key`：
+    /// 那三档里有两档要「输出该键的字符」，而修饰键没有字符可输出，套过来只剩半截语义。
+    /// 吞键而非落到切换，是为了让「有候选时按它绝不切中英文」成为无例外的规则——否则
+    /// 候选恰好只有 1 个的那次会突然切走中英文，是最难复现也最恼人的一类不确定行为。
+    pub(crate) fn handle_select_key_up(&self, data: &KeyEventData) -> Option<KeyAction> {
+        // 只认纯修饰键 VK（0xA0..=0xA3）。可打印选词键（`;` `'`）在 keydown 路径消费，
+        // 万一哪天 TSF 也转发它们的 keyup，不能在这里被重复选一次。
+        if !(keymap::VK_LSHIFT..=keymap::VK_RCONTROL).contains(&data.key_code) {
+            return None;
+        }
+        let offset = self.select_key_offset(data.key_code)?;
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        if !state.chinese_mode || state.candidates.is_empty() {
+            return None;
+        }
+        debug!(
+            "select_key_up: code=0x{:02X} offset={} mode={:?}",
+            data.key_code, offset, state.active
+        );
+        Some(
+            self.select_page_candidate(&mut state, offset)
+                .unwrap_or(KeyAction::Consumed),
+        )
+    }
+
     /// 拼音手动音节分隔符判定的单一入口：`key_code` 是否应作为分隔符 `'` 压入缓冲。
     ///
     /// 每次按键实时求值（不缓存），使 `separator` 或 `select_key_groups` 热更新即时生效。

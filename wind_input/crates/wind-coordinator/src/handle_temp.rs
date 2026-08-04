@@ -684,9 +684,31 @@ impl Coordinator {
         state.candidates = self.finalize_candidates(cands, &buf);
     }
 
+    /// 临英文本上屏（可选全角）+ 退出模式。临英所有上屏出口的单一真相源。
+    pub(crate) fn commit_temp_english_text(&self, state: &mut State, t: String) -> KeyAction {
+        let text = if state.full_width {
+            to_full_width(&t)
+        } else {
+            t
+        };
+        // 临时英文上屏（独占模式，无分段 committed）：来源临英，英文无编码故 code_len=0。
+        self.record_commit(&text, 0, -1, wind_store::stats::CommitSource::TempEnglish);
+        self.exit_temp_english(state);
+        self.notify_ui_hide();
+        if text.is_empty() {
+            KeyAction::ClearComposition
+        } else {
+            Self::commit_action(text, true)
+        }
+    }
+
     /// 临英选中候选（全局下标 `gi`）的命令前置守卫：`$CC` 命令候选 → 执行动作（退出临英后异步跑），
     /// 返回 `Some(action)`；非命令 → `None`，调用方按各自文本上屏语义继续。
-    fn temp_english_try_command(&self, state: &mut State, gi: usize) -> Option<KeyAction> {
+    pub(crate) fn temp_english_try_command(
+        &self,
+        state: &mut State,
+        gi: usize,
+    ) -> Option<KeyAction> {
         let cand = state.candidates[gi].clone();
         let code = state.temp_english_buffer.clone();
         self.overlay_commit_command(state, &cand, &code, |s, st| s.exit_temp_english(st))
@@ -706,22 +728,10 @@ impl Coordinator {
             this.notify_ui_update(state);
             KeyAction::UpdateComposition { text: d, caret_pos }
         };
-        // 上屏文本（可选全角）+ 退出。
+        // 上屏文本（可选全角）+ 退出。真身是 `commit_temp_english_text`（keyup 选词路径也要用，
+        // 见 `select_page_candidate`）；这里保留同名闭包，免得改动本函数内十几处调用点。
         let commit_text = |this: &Self, state: &mut State, t: String| -> KeyAction {
-            let text = if state.full_width {
-                to_full_width(&t)
-            } else {
-                t
-            };
-            // 临时英文上屏（独占模式，无分段 committed）：来源临英，英文无编码故 code_len=0。
-            this.record_commit(&text, 0, -1, wind_store::stats::CommitSource::TempEnglish);
-            this.exit_temp_english(state);
-            this.notify_ui_hide();
-            if text.is_empty() {
-                KeyAction::ClearComposition
-            } else {
-                Self::commit_action(text, true)
-            }
+            this.commit_temp_english_text(state, t)
         };
         // Ctrl/Alt 组合守卫（见 `overlay_ctrl_alt_guard`）：必须最先。临英是独占模式、
         // 无分段 committed，待输入内容只看自己的缓冲。

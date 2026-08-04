@@ -4824,6 +4824,13 @@ impl MessageHandler for Coordinator {
                 }
                 return KeyAction::StatusUpdate(self.build_status());
             }
+            // 修饰键作二三候选键（select_key_groups 含 lrshift / lrctrl）：**先于**切换判定。
+            // 同一个键可能两个身份都配了（设置页会提示冲突，但配置文件里拦不住），此时的裁决是
+            // 「有候选选词、无候选切换」——输入到一半按 Ctrl 想选词的意图远比切中英文常见，而
+            // 空闲时按 Ctrl 除了切换也没别的可做。无候选/越界时返回 None 落到下面的 toggle。
+            if let Some(act) = self.handle_select_key_up(data) {
+                return act;
+            }
             if self.is_toggle_mode_keycode(data.key_code) {
                 debug!("toggle_mode key_up: code=0x{:02X}", data.key_code);
                 // 切换前是否有未上屏的编码/候选（决定是否需要结束应用 composition）。

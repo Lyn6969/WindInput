@@ -204,7 +204,7 @@ impl Coordinator {
     /// 特殊模式选中某候选（全局下标 `gi`）：`$AA`/`$SS` 组折叠候选 → 补全编码到完整码重查展开（二级选择）；
     /// `$CC` 命令候选 → 执行动作（退出后异步跑，触发键码不上屏）；否则文本上屏。
     /// 统一空格 / 数字键 / 二三候选键的选中入口，保证组/命令候选选中行为一致。
-    fn commit_special_candidate(&self, state: &mut State, gi: usize) -> KeyAction {
+    pub(crate) fn commit_special_candidate(&self, state: &mut State, gi: usize) -> KeyAction {
         let cand = state.candidates[gi].clone();
         // $AA/$SS 组折叠候选：补全编码到完整码并重查展开（不上屏组名）。
         if cand.is_group {

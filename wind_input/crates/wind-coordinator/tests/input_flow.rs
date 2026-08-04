@@ -2945,6 +2945,120 @@ fn test_temp_english_select_key_overflow_falls_back_to_punct() {
     );
 }
 
+// ── 修饰键作二三候选键（select_key_groups = "lrshift" / "lrctrl"）──────────────
+//
+// 这组键与可打印选词键（`;` `'`）走**完全不同的物理通路**：纯修饰键的 keydown 不能吃
+// （宿主要看得见修饰键，否则 AutoCAD 正交模式失效并卡顿），所以 TSF 只在判定为「轻敲」
+// 后转发一个 keyup 过来，选词判定挂在 keyup 上。keydown 侧的一切（`!shift` 守卫、
+// Ctrl/Alt 组合清空闸门）都与它无关，也正因如此，这条路必须由 keyup 事件单独钉住。
+
+/// 左 Ctrl 轻敲（keyup）→ 选第 2 候选；右 Ctrl → 选第 3 候选。
+#[test]
+fn modifier_select_key_up_picks_candidate() {
+    if !has_schemas() {
+        return;
+    }
+    let mut cfg = config_with("pinyin");
+    cfg.keys.select_key_groups = vec!["lrctrl".into()];
+    let coord = Coordinator::new_headless(cfg, Some(&data_dir()));
+    press_letter(&coord, 'n');
+    press_letter(&coord, 'i');
+    let cands = coord.debug_all_candidate_texts();
+    assert!(
+        cands.len() >= 3,
+        "前置条件：应有 ≥3 个候选，否则选词分支根本执行不到（假绿）"
+    );
+    let (second, third) = (cands[1].clone(), cands[2].clone());
+    match coord.handle_key_event(&key_event(0xA2, EVENT_KEY_UP)) {
+        KeyAction::InsertText { text, .. } => assert_eq!(text, second, "左 Ctrl 应选第 2 候选"),
+        other => panic!("左 Ctrl 抬起应选第 2 候选并上屏，实际: {:?}", other),
+    }
+
+    press_letter(&coord, 'n');
+    press_letter(&coord, 'i');
+    match coord.handle_key_event(&key_event(0xA3, EVENT_KEY_UP)) {
+        KeyAction::InsertText { text, .. } => assert_eq!(text, third, "右 Ctrl 应选第 3 候选"),
+        other => panic!("右 Ctrl 抬起应选第 3 候选并上屏，实际: {:?}", other),
+    }
+}
+
+/// 同一个键既是切换键又是选词键时的裁决：**有候选选词**，且不得顺带切走中英文。
+#[test]
+fn modifier_select_key_up_wins_over_toggle_when_candidates() {
+    if !has_schemas() {
+        return;
+    }
+    let mut cfg = config_with("pinyin");
+    cfg.keys.select_key_groups = vec!["lrctrl".into()];
+    cfg.keys.toggle_mode_keys = vec!["lctrl".into(), "rctrl".into()];
+    let coord = Coordinator::new_headless(cfg, Some(&data_dir()));
+    press_letter(&coord, 'n');
+    press_letter(&coord, 'i');
+    let second = coord.debug_all_candidate_texts()[1].clone();
+    match coord.handle_key_event(&key_event(0xA2, EVENT_KEY_UP)) {
+        KeyAction::InsertText { text, .. } => assert_eq!(text, second),
+        other => panic!("有候选时左 Ctrl 应选词，实际: {:?}", other),
+    }
+    assert!(coord.is_chinese_mode(), "选词不得顺带切走中英文");
+}
+
+/// 同上配置但**无候选**（空闲）：回落到中英文切换。
+#[test]
+fn modifier_select_key_up_falls_back_to_toggle_when_idle() {
+    if !has_schemas() {
+        return;
+    }
+    let mut cfg = config_with("pinyin");
+    cfg.keys.select_key_groups = vec!["lrctrl".into()];
+    cfg.keys.toggle_mode_keys = vec!["lctrl".into(), "rctrl".into()];
+    let coord = Coordinator::new_headless(cfg, Some(&data_dir()));
+    coord.handle_key_event(&key_event(0xA2, EVENT_KEY_UP));
+    assert!(!coord.is_chinese_mode(), "空闲时左 Ctrl 应切到英文");
+}
+
+/// 只把 Ctrl 配成选词键（切换键仍是 Shift）：空闲时敲 Ctrl **不得**切中英文。
+/// 回归点：`is_toggle_mode_keycode` 若只看「key_up 白名单里有没有这个 key_code」，
+/// 选词用的 Ctrl 登记同样在那张表里，就会被误当切换键。
+#[test]
+fn modifier_select_key_alone_does_not_toggle() {
+    if !has_schemas() {
+        return;
+    }
+    let mut cfg = config_with("pinyin");
+    cfg.keys.select_key_groups = vec!["lrctrl".into()];
+    cfg.keys.toggle_mode_keys = vec!["lshift".into(), "rshift".into()];
+    let coord = Coordinator::new_headless(cfg, Some(&data_dir()));
+    coord.handle_key_event(&key_event(0xA2, EVENT_KEY_UP));
+    assert!(coord.is_chinese_mode(), "未配为切换键的 Ctrl 不应切中英文");
+    // 对照：配了的 Shift 照切，证明上面的「不切」不是整条 keyup 通路坏掉。
+    coord.handle_key_event(&key_event(0xA0, EVENT_KEY_UP));
+    assert!(!coord.is_chinese_mode(), "左 Shift 仍应切到英文");
+}
+
+/// 越界（页内候选不足以命中该位次）：吞键，既不上屏也不切换。
+/// per_page=1 让第 2 位次必然越界，且此时 Ctrl 同时是切换键——若越界放行给 toggle，
+/// 这里就会切走中英文。
+#[test]
+fn modifier_select_key_up_swallowed_on_overflow() {
+    if !has_schemas() {
+        return;
+    }
+    let mut cfg = config_with("pinyin");
+    cfg.keys.select_key_groups = vec!["lrctrl".into()];
+    cfg.keys.toggle_mode_keys = vec!["lctrl".into(), "rctrl".into()];
+    cfg.ui.candidate.per_page = 1;
+    let coord = Coordinator::new_headless(cfg, Some(&data_dir()));
+    press_letter(&coord, 'n');
+    press_letter(&coord, 'i');
+    let act = coord.handle_key_event(&key_event(0xA2, EVENT_KEY_UP));
+    assert!(
+        action_text(&act).is_none(),
+        "越界不应上屏任何文本，实际: {:?}",
+        act
+    );
+    assert!(coord.is_chinese_mode(), "越界时不得回落到中英文切换");
+}
+
 /// space_as_input 开：空格被占作输入字符，回车接过「上屏高亮候选」的职责。
 /// 回归点：该配置下空格不再选词，`allow_symbols` 再开则数字键也让位，若回车仍固定上屏原文，
 /// 就一个选词键都不剩、候选窗形同虚设。

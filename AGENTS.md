@@ -78,6 +78,13 @@
   - `include_printable=false`（文本/表达式型：临英/快捷输入）：上述键作输入，不当导航。
   - overlay handler 用 `handle_candidate_nav`（按 `state.active` 自判 `include_printable`）。
 - 二三候选键：`select_key_offset`（读 `keys.select_key_groups`，经 `hotkey::select_key_vks`）。
+  - **可打印键组**（`;'` / `,.`）走 keydown：各模式 handler 自己调 `select_key_offset`。
+  - **修饰键组**（`lrshift` / `lrctrl`）走 **keyup**：纯修饰键的 keydown 不能吃（宿主要看得见
+    修饰键），且在 keydown 上判定会让 `Ctrl+A` 的第一下 Ctrl 误选候选。故它们注册进
+    `key_up`（action=`select_candidate`），由 TSF 的轻敲机制（<500ms + 中途无别的键）转发
+    keyup，协调器入口的 `handle_select_key_up` → `select_page_candidate` 按模式派发。
+    与切换键撞键时：**有候选选词、无候选切换**；越界吞键（修饰键没有字符，不套 overflow）。
+  - 因此 `is_toggle_mode_keycode` 必须按 action 过滤——key_up 表里不只有切换键了。
 - 新增模式/按键时**复用**以上，不要再写 `0x21|0x22 =>` 之类分支。
 
 ## 跨组件硬约定（违反即复现历史 bug）

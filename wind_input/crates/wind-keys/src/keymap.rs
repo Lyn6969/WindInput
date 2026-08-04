@@ -41,6 +41,14 @@ pub const VK_Z: u32 = 0x5A;
 pub const VK_0: u32 = 0x30;
 pub const VK_9: u32 = 0x39;
 pub const VK_1: u32 = 0x31;
+// 纯修饰键的左右具体键码。只在「修饰键被配成功能键」的路径出现：中英文切换键、
+// 二三候选键的 lrshift/lrctrl 组——这两条都由 TSF 在 keyup 转发**具体**键码（笼统的
+// VK_SHIFT/VK_CONTROL 已在那边解析成左右），故服务端只需认这四个。
+// 四个连号（0xA0..=0xA3），可用 `VK_LSHIFT..=VK_RCONTROL` 表达「是不是纯修饰键」。
+pub const VK_LSHIFT: u32 = 0xA0;
+pub const VK_RSHIFT: u32 = 0xA1;
+pub const VK_LCONTROL: u32 = 0xA2;
+pub const VK_RCONTROL: u32 = 0xA3;
 
 /// 候选导航动作（翻页 / 高亮移动）。统一分类的结果，见 [`NavKeys`]。
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]

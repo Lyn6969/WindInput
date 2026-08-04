@@ -406,6 +406,11 @@ global_hotkeys = []
 # 与 [[schema.special_modes]] 的 hotkey 是两回事：那个进 overlay、打完一段自动退回；
 # 这个是换方案，不再按一次不会回来。
 schema_hotkeys = {}
+# 二三候选键（第1键选第2候选、第2键选第3候选）。可选键组：
+#   semicolon_quote(;/') / comma_period(,/.) / lrshift(左右Shift) / lrctrl(左右Ctrl)
+# 修饰键组（lrshift/lrctrl）在**松开**时才选词，且只认「轻敲」——按住超过 500ms 或中途
+# 按了别的键都不算，否则 Ctrl+A 的那一下 Ctrl 就会选走候选。与 toggle_mode_keys 撞键时：
+# 有候选选词，无候选切中英文（候选不足以命中该位次则吞键，不切换）。
 select_key_groups = ["semicolon_quote"]
 page_keys = ["pageupdown", "minus_equal"]
 highlight_keys = ["arrows", "tab"]
