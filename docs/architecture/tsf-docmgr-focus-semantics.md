@@ -83,12 +83,40 @@
 同属一类：`GetGUIThreadInfo` 的**跨窗口** Win32 光标冒充 TSF 插入点。详见
 [候选窗坐标时序与定位设计 §3.1](../redesign/candidate-window-positioning.md)。
 
+### 3.5 `_hasThreadFocus` 一个变量两个职责（2026-08-04 修复）
+
+它同时被用作「热键注册门卫」与「TSF 线程焦点信号」。这两个职责在**多进程宿主**
+（WebView 类：前台窗口在渲染进程、TSF 加载在另一进程）下期望**正好相反**：
+
+| 职责 | 正确判据 | 多进程宿主下应为 |
+|------|---------|----------------|
+| 热键注册门卫（防多实例争抢同一组热键，`ERROR_HOTKEY_ALREADY_REGISTERED` 1409） | 本**进程**是否前台窗口所属进程（`GetForegroundWindow` 的 pid） | FALSE（不该抢） |
+| TSF 线程焦点（过滤 compartment 变化噪声） | `ITfThreadFocusSink` 回调 | TRUE（应用确实在前台） |
+
+500ms 自检定时器按前者把它清零，且**永不恢复**——恢复分支的条件是 `nowForeground`，
+在这类宿主里恒假。于是 `OnChange` 的 `!_hasThreadFocus` 早退恒成立，
+**DBX 里中英切换整个失效**（实测 `hasFocus=1 hasThreadFocus=0` 连续 30 次）。
+
+- **指纹**：`OnSetThreadFocus called` 之后 2ms 就出现
+  `FocusCheck timer: not foreground (fgPid=165104 ownPid=154820), releasing`，
+  两个 pid 不同即多进程宿主。
+- **反讽**：该分支的注释早就写着「它纠正的是热键状态而非 `_hasThreadFocus` 的正确性」，
+  但代码**确实在写** `_hasThreadFocus`。声明的意图与实际职责不一致，正是它能悄悄
+  搞坏多进程宿主的原因。
+- **修法**：拆成 `_hasThreadFocus`（`ITfThreadFocusSink` + 初始种子独占）与
+  `_isProcessForeground`（`GetForegroundWindow` 判据）。热键三处门卫要求两者同时成立，
+  `OnChange` 只看前者。单进程宿主下两者恒相等，**热键行为不变**。
+
 ## 4. 可推广的判据
 
 1. **先问"这个判据属于哪一层"**，再问"它取什么值"。跨层复用时，原判据的注释和实测支撑都
    留在原地，复用点看不到——**一个正确的决定被复用到它没考虑过的问题上就成了错误**。
-2. **一个变量只承担一个语义**。上面 3.1 与 3.3 都是"一个值被两个问题借用，而它们对同一个
+2. **一个变量只承担一个语义**。上面 3.1、3.3、3.5 都是"一个值被两个问题借用，而它们对同一个
    边缘输入的期望恰好相反"。合用一个缓存 = 必有一方错。
+   3.5 还多一层教训：**注释声明的职责不等于代码实际承担的职责**——那段注释写着"不纠正焦点
+   信号"，代码却在写它。审查时要以赋值语句为准，不要以注释为准。同源案例见
+   [OPENCLOSE compartment 语义 §2](tsf-openclose-compartment-semantics.md)：钉死为 1 的
+   公开理由被实验证伪，它真正影响的是完全另一件事。
 3. **基于「某事件不会再发生」的优化，要把该前提写成断言或日志**。3.1 那段注释里作者已实测
    "用户停在 transient DocMgr 上打字"，但结论是"它不会再发 focus_gained"；这个前提后来失效
    （同一 DocMgr 反复获焦）却没有任何痕迹，最终靠 `prevChar` 这个无关字段才反推出来。
