@@ -2909,7 +2909,10 @@ impl Coordinator {
         };
         // 调试提示上下文：仅开启调试段时解析一次（mixed 归属 / 方案 id），循环内按候选来源选用。
         let dbg_ctx = if tip_cfg.debug_enabled {
-            Some(self.build_debug_schema_ctx())
+            // 归属与读写两端同源（`effective_data_schema`）：特殊模式下若这里仍按 active 解析，
+            // 调试段显示的计数与排序实际用的不是同一个 key——排查时会被它带偏，
+            // 而这正是最难察觉的一种不一致。
+            Some(self.build_debug_schema_ctx(self.effective_data_schema(state).as_deref()))
         } else {
             None
         };
@@ -6661,10 +6664,12 @@ struct DebugSchemaCtx {
 }
 
 impl Coordinator {
-    /// 解析当前活跃方案的调试归属上下文。
-    fn build_debug_schema_ctx(&self) -> DebugSchemaCtx {
+    /// 解析调试归属上下文。`schema_override` = 生效方案（特殊模式），`None` 用 active。
+    fn build_debug_schema_ctx(&self, schema_override: Option<&str>) -> DebugSchemaCtx {
         use wind_candidate::CandidateSource as S;
-        let active = self.engine_mgr.active_schema_id();
+        let active = schema_override
+            .map(str::to_string)
+            .unwrap_or_else(|| self.engine_mgr.active_schema_id());
         let is_mixed = self.engine_mgr.schema_engine_type(&active).as_deref() == Some("mixed");
         let schema = self.engine_mgr.data_schema_id(&active);
         let (ct_id, py_id) = if is_mixed {

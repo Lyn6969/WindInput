@@ -186,6 +186,23 @@ impl Coordinator {
         if state.candidates.is_empty() {
             state.candidates.extend(result.completion_hint);
         }
+        // 词频重排与候选调整：归属**特殊方案自身**，与写端 `record_selection_in` 同一个 id。
+        // 取自同一处（`effective_data_schema`）是硬要求——读写分别取自不同的地方，会得到
+        // 「写进 qsym、读的是 wubi86」：记账看着成功，候选顺序永远不动。
+        //
+        // 放在补全收口**之后**：补全出来的候选也该参与重排（与主路径
+        // `update_candidates` 的次序一致）。
+        let owner = self.effective_data_schema(state);
+        self.apply_freq_rerank_in(
+            owner.as_deref(),
+            &mut state.candidates,
+            &state.special_buffer,
+        );
+        self.apply_shadow_in(
+            owner.as_deref(),
+            &mut state.candidates,
+            &state.special_buffer,
+        );
         // 自动上屏由方案码表引擎的 should_auto_commit 决定（prefix_free≈全码唯一、fixed_length 等
         // 映射到该方案的 [engine.codetable] 配置）；复核上屏目标仍在候选中。`$CC` 命令词条经
         // finalize_candidates 展开后 text 已改写为 display 标签，而引擎意向 commit_text 是原始
@@ -225,6 +242,18 @@ impl Coordinator {
         {
             return act;
         }
+        // 词频记账**归属特殊方案自身**（与主方案同层级，只是用特殊按键进入）。
+        // 记账码用输入码：特殊方案是码表语义，`a`/`ab`/`abc` 是三个独立码位，
+        // 与 `freq_code` 对 CodeTable 来源的口径一致。
+        //
+        // 此前这里只有 record_commit（统计），完全不记词频——特殊模式的候选顺序
+        // 因此永远是词库原序，用户选过多少次都不会往前走。
+        self.record_selection_in(
+            self.effective_data_schema(state).as_deref(),
+            &code,
+            &cand.text,
+            cand.source,
+        );
         self.record_commit(
             &cand.text,
             state.special_buffer.len() as u32,

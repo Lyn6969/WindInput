@@ -129,6 +129,42 @@ pub struct CodeTableSpec {
     /// z 键重复输入。
     #[serde(default)]
     pub z_key_repeat: Option<bool>,
+    /// 方案级调频覆盖（`[engine.codetable.frequency]`）。
+    ///
+    /// 缺省 = 整段跟随基线。特殊方案的基线是内置默认（不继承全局 `schema.codetable`，
+    /// 见 `EngineManager::codetable_baseline`），普通方案的基线是全局段。
+    #[serde(default)]
+    pub frequency: Option<CodeTableFrequencySpec>,
+}
+
+/// 方案级调频覆盖（`[engine.codetable.frequency]`），**逐字段稀疏**。
+///
+/// 每个字段都是 `Option`：给了就覆盖基线，没给就跟随。整段缺省 = 全部跟随。
+///
+/// 存在的理由是「同一台机器上不同码表的调频诉求本就不同」——快符表要的是稳定顺序
+/// （作者精心排过），生僻字表要的是学习，五笔要的是简码位保护。此前这些只有一份全局值。
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct CodeTableFrequencySpec {
+    #[serde(default)]
+    pub enabled: Option<bool>,
+    /// `"top"` / `"step"` / `"position"`。
+    #[serde(default)]
+    pub strategy: Option<String>,
+    /// `"none"` / `"single"` / `"all"`；仅 `position` 生效。
+    #[serde(default)]
+    pub promote_prefix: Option<String>,
+    /// 衰减半衰期（小时），`0` = 内置默认；仅 `position` 生效。
+    #[serde(default)]
+    pub half_life: Option<f64>,
+    /// 全码位（码长 ≥ 4）首选保护。
+    #[serde(default)]
+    pub protect_top_n: Option<usize>,
+    #[serde(default)]
+    pub protect_top_n_len1: Option<usize>,
+    #[serde(default)]
+    pub protect_top_n_len2: Option<usize>,
+    #[serde(default)]
+    pub protect_top_n_len3: Option<usize>,
 }
 
 /// 拼音引擎配置（[engine.pinyin]）。

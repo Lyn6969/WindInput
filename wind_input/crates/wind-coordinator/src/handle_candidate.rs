@@ -157,6 +157,22 @@ impl Coordinator {
     /// 键**——记进 FREQ 表既永远不会被命中（次日查的是新文本），又逐日累积垃圾行。
     /// 读取端 `apply_freq_rerank` 对应地跳过短语候选，两端必须同时成立。
     pub(crate) fn record_selection(&self, code: &str, text: &str, source: CandidateSource) {
+        self.record_selection_in(None, code, text, source);
+    }
+
+    /// 同 [`Self::record_selection`]，但可指定**生效方案**（特殊模式用，见
+    /// [`Self::effective_data_schema`]）。`None` = 按 active 归属。
+    ///
+    /// ⚠️ 开关也跟着生效方案走（`freq_settings_for`）：特殊方案的调频开关在它自己的
+    /// 方案文件里，拿主方案的开关来判断，会出现「主方案开着 → 往特殊方案记账」这种
+    /// 用户没配过的行为。
+    pub(crate) fn record_selection_in(
+        &self,
+        schema_override: Option<&str>,
+        code: &str,
+        text: &str,
+        source: CandidateSource,
+    ) {
         if text.is_empty() {
             return;
         }
@@ -165,13 +181,15 @@ impl Coordinator {
             return;
         }
         if let Some(store) = &self.store {
+            let owner = schema_override
+                .map(str::to_string)
+                .unwrap_or_else(|| self.engine_mgr.active_schema_id());
             // 未开启「自动调频」则不记录（配置说关、代码却记的潜在 bug，对齐 apply_freq_rerank 的开关检查）。
-            if !self.engine_mgr.freq_settings().enabled {
+            if !self.engine_mgr.freq_settings_for(&owner).enabled {
                 return;
             }
-            let schema = self.engine_mgr.active_schema_id();
             // 归属 id：非混输折叠自身/拼音；混输按候选来源分流，无法归因则跳过本次记频。
-            let Some(schema) = self.engine_mgr.write_data_schema_id(&schema, source) else {
+            let Some(schema) = self.engine_mgr.write_data_schema_id(&owner, source) else {
                 return;
             };
             if let Err(e) = store.record_freq(&schema, code, text) {
@@ -191,17 +209,33 @@ impl Coordinator {
     /// 引擎类型分流：码表/混输走永久 used-first（§3），纯拼音走衰减软置前（§4）。
     /// 注：每候选一次 redb 点查（mmap 微秒级）；后续可下沉到引擎排序层。
     pub(crate) fn apply_freq_rerank(&self, candidates: &mut [Candidate], code: &str) {
+        self.apply_freq_rerank_in(None, candidates, code);
+    }
+
+    /// 同 [`Self::apply_freq_rerank`]，但可指定**生效方案**（特殊模式用）。
+    ///
+    /// ★ 读端的方案必须与写端 [`Self::record_selection_in`] 取自同一处
+    /// （[`Self::effective_data_schema`]），否则「写进 qsym、读的是 wubi86」——
+    /// 记账看着成功，候选顺序永远不动。
+    pub(crate) fn apply_freq_rerank_in(
+        &self,
+        schema_override: Option<&str>,
+        candidates: &mut [Candidate],
+        code: &str,
+    ) {
         let Some(store) = &self.store else {
             return;
         };
         if code.is_empty() || candidates.len() < 2 {
             return;
         }
-        let settings = self.engine_mgr.freq_settings();
+        let active = schema_override
+            .map(str::to_string)
+            .unwrap_or_else(|| self.engine_mgr.active_schema_id());
+        let settings = self.engine_mgr.freq_settings_for(&active);
         if !settings.enabled {
             return;
         }
-        let active = self.engine_mgr.active_schema_id();
         // 归属方案解析：非混输单次折叠（现行为，零回归）；混输预解析两个子方案归属 id，
         // 循环内按候选来源选用（热路径纪律：非混输不走逐候选分支）。
         let is_mixed = self.engine_mgr.schema_engine_type(&active).as_deref() == Some("mixed");
@@ -310,7 +344,9 @@ impl Coordinator {
             // `strategy = position` 时走与拼音同一套位置提升（档位仍是硬约束，只在档内
             // 提升）；`top`/`step` 仍是布尔 used-first，不读 profile / promote_prefix。
             //
-            // profile 取 `active_freq_profile`（英文方案取英文段、其余取码表段），不用拼音
+            // profile 取**生效方案**那份（英文方案取英文段、其余取该方案折叠后的码表段），
+            // 与上面 `freq_settings_for` 同一个 id——一个按方案取 strategy、另一个按 active
+            // 取 half_life 的话，特殊方案会用自己的策略配上主方案的衰减速度。不用拼音
             // 那份。此前这里直接用 `pinyin_freq_profile()`，等于改拼音的半衰期会连带改码表
             // position 的衰减速度，而码表段根本没有这个旋钮。
             wind_engine::freq_rerank::rerank_codetable_usedfirst(
@@ -320,7 +356,7 @@ impl Coordinator {
                 settings.strategy,
                 settings.protect,
                 now_unix_secs(),
-                self.engine_mgr.active_freq_profile(),
+                self.engine_mgr.freq_profile_for(&active),
                 settings.promote_prefix,
             );
         }
@@ -947,6 +983,16 @@ impl Coordinator {
 
     /// 应用 Shadow 规则：先按 deleted 过滤，再把 pinned 按目标位置重排。
     pub(crate) fn apply_shadow(&self, candidates: &mut Vec<Candidate>, code: &str) {
+        self.apply_shadow_in(None, candidates, code);
+    }
+
+    /// 同 [`Self::apply_shadow`]，但可指定**生效方案**（特殊模式用）。
+    pub(crate) fn apply_shadow_in(
+        &self,
+        schema_override: Option<&str>,
+        candidates: &mut Vec<Candidate>,
+        code: &str,
+    ) {
         if code.is_empty() {
             return;
         }
@@ -954,9 +1000,11 @@ impl Coordinator {
             return;
         };
         // 候选调整按 data_schema_id 归属（拼音族折叠共享；码表/混输各自独立）。
-        let schema = self
-            .engine_mgr
-            .data_schema_id(&self.engine_mgr.active_schema_id());
+        let schema = self.engine_mgr.data_schema_id(
+            &schema_override
+                .map(str::to_string)
+                .unwrap_or_else(|| self.engine_mgr.active_schema_id()),
+        );
         let rec = match store.get_shadow_rules(&schema, code) {
             Ok(Some(r)) => r,
             _ => return,
@@ -1458,6 +1506,10 @@ impl Coordinator {
     /// 仅普通模式（active==None）有意义；覆盖层模式各自维护 preedit，不应调用此方法。
     pub(crate) fn sync_preedit_to_highlight(&self, state: &mut State) {
         let body = self.effective_preedit_body(state).to_string();
+        // 用户按 Shift+字母打出的大写只在影子串里，此处投影回显示串（拼音拆分形态含引擎插入
+        // 的分隔符，故按贪心同步扫描投影而非整串替换）。大小写不改字符数，caret 换算不受影响。
+        let body =
+            preedit_cursor::project_case(&state.input_buffer, &state.input_buffer_cased, &body);
         state.preedit = if state.committed_text.is_empty() {
             body
         } else {
@@ -1527,6 +1579,24 @@ impl Coordinator {
         state.current_page = 0;
         state.selected_index = 0;
         out
+    }
+
+    /// 用户数据（词频 / 候选调整 / 用户词库）的**生效方案**：这一次按键的候选是哪个方案的
+    /// 引擎出的。
+    ///
+    /// 普通输入 = `active`；**特殊模式 = 它引用的方案**——特殊方案与主方案同层级，有自己的
+    /// 词库和用户数据，只是用特殊按键进入，按 `active` 归属会把它的账全记到主方案头上。
+    ///
+    /// ⚠️ **临拼 / 临英 / 快捷输入刻意不在此分流**（2026-08-04 用户拍板）：它们走
+    /// `write_data_schema_id` 的按候选来源分流，实测行为正确（临拼记进 `"pinyin"`、全拼
+    /// 双拼共享一份），改动风险大于收益。往这里加模式前先确认那条路径不够用。
+    ///
+    /// 返回 `None` = 没有特殊归属，调用方走原有的 active 路径。
+    pub(crate) fn effective_data_schema(&self, state: &State) -> Option<String> {
+        match state.active {
+            Some(ModeKind::Special(idx)) => self.special_schema(idx),
+            _ => None,
+        }
     }
 
     /// 英文候选上屏后是否补一个空格（`schema.english.commit_space`）。
@@ -1693,6 +1763,8 @@ impl Coordinator {
             ));
             state.committed_text.push_str(&cand.text);
             state.input_buffer = state.input_buffer[consumed..].to_string();
+            // 剩余码是缓冲的后缀 → 影子串同步掐头（大写随之左移，不错位也不丢）。
+            preedit_cursor::keep_cased_tail(&state.input_buffer, &mut state.input_buffer_cased);
             // 分步确认消费掉前缀码：剩余编码整体左移，光标落到剩余码末尾（对齐 Go）。
             state.input_cursor_pos = state.input_buffer.len();
             let _ = self.update_candidates(state); // preedit 已含前缀（update_candidates 内拼接）
@@ -2086,6 +2158,8 @@ impl Coordinator {
             );
         }
         state.input_buffer = remainder.to_string();
+        // 余码是缓冲的后缀 → 影子串同步掐头，否则大写会在这里静默丢掉。
+        preedit_cursor::keep_cased_tail(&state.input_buffer, &mut state.input_buffer_cased);
         state.input_cursor_pos = state.input_buffer.len(); // 顶码后余码续打，光标在余码末尾
         let _ = self.update_candidates(state); // 余码候选（不再消费其结局）
         let preedit = state.preedit.clone();
@@ -2169,6 +2243,7 @@ impl Coordinator {
         }
         let src = cand.phrase_template.clone();
         state.input_buffer = remainder.to_string();
+        preedit_cursor::keep_cased_tail(&state.input_buffer, &mut state.input_buffer_cased);
         state.input_cursor_pos = state.input_buffer.len(); // 顶码后余码续打，光标在余码末尾
         let _ = self.update_candidates(state); // 余码标准候选刷新
         let preedit = state.preedit.clone();
@@ -2706,6 +2781,83 @@ mod finalize_candidates_tests {
             checked >= 12,
             "只扫到 {checked} 个 record_selection 调用点，远少于预期——\
              调用点被改名或本测试的扫描方式失效了，先修测试再说"
+        );
+    }
+
+    /// 方案归属的**读 / 写 / 调试三处必须取自同一处**（`effective_data_schema`）。
+    ///
+    /// 不一致的后果分两种，都很隐蔽：读写不同源 ⇒ 写进 qsym、读的是 wubi86，记账看着成功
+    /// 而候选顺序永远不动；调试不同源 ⇒ 调试段显示的计数与排序实际用的不是同一个 key，
+    /// 排查时被它带偏。
+    ///
+    /// 判据是「首个实参 ∈ 允许集合」，这顺带强制中转变量必须叫 `owner`——名字之外的任何
+    /// 变量名都会被拦下，逼新增调用点的人回到这里说明它取的是哪个方案。
+    #[test]
+    fn schema_scoped_reads_writes_and_debug_share_one_source() {
+        // `None` = 显式走 active 路径（普通输入）；其余必须能追溯到 effective_data_schema。
+        const ALLOWED: &[&str] = &[
+            "None",
+            "owner.as_deref()",
+            "self.effective_data_schema(state).as_deref()",
+            // 转发层：`record_selection` / `apply_freq_rerank` / `apply_shadow` 三个薄包装
+            // 把自己的参数原样传下去。
+            "schema_override",
+        ];
+        const CALLS: &[&str] = &[
+            ".record_selection_in(",
+            ".apply_freq_rerank_in(",
+            ".apply_shadow_in(",
+            ".build_debug_schema_ctx(",
+        ];
+        let sources: &[(&str, &str)] = &[
+            ("coordinator.rs", include_str!("coordinator.rs")),
+            ("handle_candidate.rs", include_str!("handle_candidate.rs")),
+            ("handle_special.rs", include_str!("handle_special.rs")),
+        ];
+        let mut checked = 0usize;
+        let mut bad: Vec<String> = Vec::new();
+        for (name, src) in sources {
+            let prod = src.split("#[cfg(test)]").next().unwrap_or(src);
+            for call in CALLS {
+                for (off, _) in prod.match_indices(call) {
+                    let args = &prod[off + call.len()..];
+                    // 切首个实参：按括号深度找顶层逗号（实参可能自带括号调用）。
+                    let mut depth = 0i32;
+                    let mut end = args.len();
+                    for (i, ch) in args.char_indices() {
+                        match ch {
+                            '(' => depth += 1,
+                            ')' if depth == 0 => {
+                                end = i;
+                                break;
+                            }
+                            ')' => depth -= 1,
+                            ',' if depth == 0 => {
+                                end = i;
+                                break;
+                            }
+                            _ => {}
+                        }
+                    }
+                    let arg = args[..end].trim();
+                    checked += 1;
+                    if !ALLOWED.contains(&arg) {
+                        bad.push(format!("{name}: {call}…) 的方案实参 `{arg}`"));
+                    }
+                }
+            }
+        }
+        assert!(
+            bad.is_empty(),
+            "以下调用点的方案归属不是取自 effective_data_schema：\n  {}\n\
+             读(apply_freq_rerank_in) / 写(record_selection_in) / 调试(build_debug_schema_ctx)\n\
+             三处必须同源，否则「写进 A、读的是 B」——记账看着成功，排序永远不动。",
+            bad.join("\n  ")
+        );
+        // 反向保证：调用点被改名或扫描失效时，本测试不得退化成空跑而静默变绿。
+        assert!(
+            checked >= 6,
+            "只扫到 {checked} 个方案归属调用点，少于预期——扫描方式失效了，先修测试"
         );
     }
 

@@ -1685,10 +1685,35 @@ impl EngineManager {
     /// 存在的理由是消费端只有一个调用点，却要服务两套配置：调用方拿不到「当前是哪类
     /// 方案」以外的信息，把选择留在那里就会变成消费点各判一次、迟早漏一处。
     pub fn active_freq_profile(&self) -> wind_store::freq::FreqProfile {
-        if self.active_is_english() {
+        self.freq_profile_for(&self.active_schema_id())
+    }
+
+    /// **指定方案**的词频衰减参数。与 [`Self::freq_settings_for`] 同一套分流，
+    /// 两者必须一起改——一个按方案取 strategy、另一个仍按 active 取 half_life 的话，
+    /// 特殊方案会用自己的策略配上主方案的衰减速度。
+    pub fn freq_profile_for(&self, schema_id: &str) -> wind_store::freq::FreqProfile {
+        if matches!(
+            self.schema_engine_type(schema_id).as_deref(),
+            Some("english")
+        ) {
             return self.english_freq_profile();
         }
-        self.codetable_freq_profile()
+        let global = self
+            .codetable
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        let ct = Self::resolve_codetable(
+            schema_id,
+            self.data_dir.as_deref(),
+            &global,
+            self.override_dir.as_deref(),
+        );
+        let def = wind_store::freq::FreqProfile::default();
+        wind_store::freq::FreqProfile {
+            half_life_hours: Self::resolve_half_life(ct.frequency.half_life, def.half_life_hours),
+            ..def
+        }
     }
 
     /// 英文方案的词频衰减参数。与码表/拼音三者互不相干，各读各的 `half_life`。
@@ -1785,11 +1810,22 @@ impl EngineManager {
         c.is_configured().then_some(c)
     }
 
-    /// 活跃方案的词频排序设置（frequency.md §3/§8）。**全局唯一、按引擎类型分**：
-    /// 码表/混输取 `schema.codetable.frequency`，拼音取 `schema.pinyin.frequency`。
-    /// 按 id 缓存（reload 时清空），避免每键重算。
+    /// 活跃方案的词频排序设置。等价于 `freq_settings_for(active_schema_id())`。
     pub fn freq_settings(&self) -> FreqSettings {
-        let id = self.active_schema_id();
+        self.freq_settings_for(&self.active_schema_id())
+    }
+
+    /// **指定方案**的词频排序设置（frequency.md §3/§8）。按引擎类型分：
+    /// 英文取 `schema.english.frequency`，拼音取 `schema.pinyin.frequency`，
+    /// 其余取**该方案折叠后的**码表调频段（全局基线 + 方案 `[engine.codetable.frequency]`）。
+    ///
+    /// 取 `schema_id` 而非恒用 active：特殊模式是 overlay，`active` 仍是主方案，而它引用的
+    /// 方案有自己的词库与调频诉求（快符表要稳定顺序、生僻字表要学习），照 active 取会让
+    /// 它跟着五笔走。
+    ///
+    /// 按 id 缓存（reload / invalidate 时清空），故每方案只解析一次方案文件。
+    pub fn freq_settings_for(&self, schema_id: &str) -> FreqSettings {
+        let id = schema_id.to_string();
         {
             let cache = self.freq_cache.lock().unwrap_or_else(|e| e.into_inner());
             if let Some(s) = cache.get(&id) {
@@ -1829,7 +1865,20 @@ impl EngineManager {
                 }
             }
             _ => {
-                let ct = self.codetable.lock().unwrap_or_else(|e| e.into_inner());
+                // **按方案折叠后的**调频段，不是全局镜像：基线（普通方案=全局、特殊方案=
+                // 内置默认）叠加该方案 `[engine.codetable.frequency]` 的稀疏覆盖。
+                // 此前这里直接读 `self.codetable.lock()`，于是方案文件里写了调频也无人读。
+                let global = self
+                    .codetable
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .clone();
+                let ct = Self::resolve_codetable(
+                    &id,
+                    self.data_dir.as_deref(),
+                    &global,
+                    self.override_dir.as_deref(),
+                );
                 FreqSettings {
                     // 码表默认 `all`：其前缀补全已由 `freq_tier` 分到独立档位、跨不到精确档
                     // 之前，无需再按语义单元收窄；且这与 `Top`/`Step` 的历史行为一致（那两者
@@ -3035,6 +3084,50 @@ mod tests {
 
     /// 英文衰减参数与码表、拼音**三者互不相干**，各读各的 half_life。
     ///
+    /// 方案文件的 `[engine.codetable.frequency]` 能覆盖基线，**且逐字段稀疏**。
+    ///
+    /// 此前 `freq_settings` 直读全局镜像，方案文件里写了调频也无人读——「每方案独立调频」
+    /// 这个能力看起来存在（字段能写进 TOML）、实际完全不生效。
+    #[test]
+    fn schema_level_frequency_overrides_baseline() {
+        use std::io::Write;
+        let base_dir = std::env::temp_dir().join("wind_eng_schema_freq");
+        let schemas = base_dir.join("schemas");
+        let _ = std::fs::remove_dir_all(&base_dir);
+        std::fs::create_dir_all(&schemas).unwrap();
+        // 方案只覆盖 enabled 与 strategy，其余（promote_prefix / protect_*）留空跟随基线。
+        let mut f = std::fs::File::create(schemas.join("ct_freq.schema.toml")).unwrap();
+        write!(
+            f,
+            "[schema]\nid = \"ct_freq\"\n[engine]\ntype = \"codetable\"\n[engine.codetable]\nmax_code_length = 4\n[engine.codetable.frequency]\nenabled = true\nstrategy = \"position\"\n"
+        )
+        .unwrap();
+        drop(f);
+
+        let mut cfg = Config::default();
+        // 全局：关、step、一简保护 3 位——三项都与方案要覆盖的不同。
+        cfg.schema.codetable.frequency.enabled = false;
+        cfg.schema.codetable.frequency.strategy = "step".to_string();
+        cfg.schema.codetable.frequency.protect_top_n_len1 = 3;
+        cfg.schema.available = vec!["ct_freq".to_string()];
+        cfg.schema.active = "ct_freq".to_string();
+        let mgr = EngineManager::new(&cfg, Some(&base_dir));
+
+        let s = mgr.freq_settings_for("ct_freq");
+        assert!(s.enabled, "方案写了 enabled = true 应覆盖全局的 false");
+        assert_eq!(
+            s.strategy,
+            FreqStrategy::Position,
+            "方案写了 position 应覆盖全局的 step"
+        );
+        assert_eq!(
+            s.protect.by_len[0], 3,
+            "方案没写的字段应跟随基线（全局一简保护 3 位）"
+        );
+
+        let _ = std::fs::remove_dir_all(&base_dir);
+    }
+
     /// 英文此前共用码表段，于是「英文调频衰减慢一点」这个愿望只能靠改五笔的半衰期实现。
     #[test]
     fn english_profile_is_independent_of_codetable_and_pinyin() {

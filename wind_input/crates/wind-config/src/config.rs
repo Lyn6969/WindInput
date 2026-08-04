@@ -488,6 +488,37 @@ impl CodetableGlobal {
         if let Some(v) = o.z_key_repeat {
             out.z_key_repeat = v;
         }
+        // 调频段逐字段折叠。整段缺省 = 全部跟随基线。
+        //
+        // ⚠️ 这一段的消费方是 `EngineManager::freq_settings`，与上面那些上屏行为字段的
+        // 消费方（`build_engine` 的 CommitOptions）不是同一条路径。加字段时两条都要看：
+        // 光在这里折叠、`freq_settings` 仍读全局镜像的话，方案文件里写了也没人读。
+        if let Some(f) = &o.frequency {
+            if let Some(v) = f.enabled {
+                out.frequency.enabled = v;
+            }
+            if let Some(v) = &f.strategy {
+                out.frequency.strategy = v.clone();
+            }
+            if let Some(v) = &f.promote_prefix {
+                out.frequency.promote_prefix = v.clone();
+            }
+            if let Some(v) = f.half_life {
+                out.frequency.half_life = v;
+            }
+            if let Some(v) = f.protect_top_n {
+                out.frequency.protect_top_n = v;
+            }
+            if let Some(v) = f.protect_top_n_len1 {
+                out.frequency.protect_top_n_len1 = v;
+            }
+            if let Some(v) = f.protect_top_n_len2 {
+                out.frequency.protect_top_n_len2 = v;
+            }
+            if let Some(v) = f.protect_top_n_len3 {
+                out.frequency.protect_top_n_len3 = v;
+            }
+        }
         out
     }
 }
