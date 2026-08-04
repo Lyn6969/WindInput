@@ -2123,8 +2123,22 @@ impl EngineManager {
                 warn!("No usable english dictionary for schema {}", schema_id);
                 return None;
             }
-            // 英文暂不挂用户词 / 临时词层（无造词学习），仅系统词库层。
             let dm = wind_dict::DictManager::new();
+            // 用户词层：英文用户词（专有名词、缩写、项目内部词汇——词库里不会有的那些）。
+            // 归属 `schema_id`（即 "english"），与 `data_schema_id` 对英文的返回值一致；
+            // 读写不同源的话，加进去的词永远查不出来。
+            //
+            // **刻意不挂临时词层**：临时词库是「自动造词的暂存区」，条目由连续上屏推导而来、
+            // 攒够次数才晋升用户词库。英文没有造词流程，挂上去只会是一张永远空的表，
+            // 却让每次查询多走一层。
+            //
+            // 注册顺序 User → System 与码表分支一致（用户词在前）。
+            if let Some(store) = &store {
+                dm.register_layer(Box::new(wind_dict::StoreUserLayer::new(
+                    store.clone(),
+                    schema_id,
+                )));
+            }
             for (name, dict, enabled, base_order, default_weight) in layers {
                 dm.register_layer(Box::new(
                     wind_dict::SystemDictLayer::with_enabled(dict, name, enabled)

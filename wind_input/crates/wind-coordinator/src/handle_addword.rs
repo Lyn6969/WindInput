@@ -764,11 +764,14 @@ impl Coordinator {
     /// 现统一走码表词库自身的单字全码 + 方案声明的公式，与「造出的词必须能打出来」对齐。
     fn calc_add_word_code(&self, word: &str) -> (String, u64) {
         let schema = self.add_word_target_schema();
-        let is_pinyin = self
-            .engine_mgr
-            .schema_engine_type(&schema)
-            .map(|t| t == "pinyin")
-            .unwrap_or(false);
+        let engine_type = self.engine_mgr.schema_engine_type(&schema);
+        // 英文方案：码即单词本身。走不到下面任何一条——`encode_word` 按方案的
+        // `[[encoder.rules]]` 从单字全码组装，英文方案没有那一段，取码必失败，
+        // 结果是英文方案下加词恒提示「当前方案取不出编码」。
+        if engine_type.as_deref() == Some("english") {
+            return Self::english_add_word_code(word);
+        }
+        let is_pinyin = engine_type.map(|t| t == "pinyin").unwrap_or(false);
         if is_pinyin {
             // 含非汉字 → 不取码，让加词中止（界面显示「无法计算编码」）。
             //
@@ -818,6 +821,28 @@ impl Coordinator {
                 }
             }
         }
+    }
+
+    /// 英文方案的加词取码：**码就是单词本身的小写**，无音节边界（boundary=0）。
+    ///
+    /// 英文词库以 `type = "english"` 声明，加载期把 code 列小写化、做大小写不敏感的前缀匹配
+    /// （打 `hel` 出 `hello`）。所以「这个词的码」这个问题对英文只有一个答案：它自己。
+    ///
+    /// 三道守卫，取空码即让加词中止（界面提示「无法计算编码」）：
+    /// - **含空白** —— 带空格的串当 key 会让前缀查询永远命中不到，加进去的词一个也打不出来
+    ///   且界面毫无异常。拼音侧正因为这个坑栽过一次（见 `calc_add_word_code` 里的长注释）。
+    /// - **非 ASCII** —— 英文词库的码空间就是 ASCII；中文字符落进来只会写出一条查不到的记录。
+    /// - **一个字母都没有** —— 纯数字/纯符号不是英文词，拦下来免得污染词库。
+    fn english_add_word_code(word: &str) -> (String, u64) {
+        if word.is_empty()
+            || !word.is_ascii()
+            || word.chars().any(|c| c.is_whitespace())
+            || !word.chars().any(|c| c.is_ascii_alphabetic())
+        {
+            debug!("addword: 英文方案取不出码（word={}）", word);
+            return (String::new(), 0);
+        }
+        (word.to_ascii_lowercase(), 0)
     }
 
     /// 显示加词预览候选窗（两行：标题行提示 + 词行编码；均为提示行，no_index 不渲染序号）。
@@ -908,6 +933,30 @@ mod tests {
     use std::sync::Arc;
     use wind_config::Config;
     use wind_store::Store;
+
+    /// 英文取码 = 单词本身的小写；三类非法输入取空码（让加词中止）。
+    ///
+    /// 「含空白」那条是重点：带空格的串当 key 会让前缀查询永远命中不到——加进去的词一个
+    /// 都打不出来，而界面毫无异常。拼音侧正因为这个坑栽过一次。
+    #[test]
+    fn english_add_word_code_is_lowercased_word() {
+        let f = Coordinator::english_add_word_code;
+        assert_eq!(f("Hello"), ("hello".to_string(), 0));
+        assert_eq!(f("WindInput"), ("windinput".to_string(), 0));
+        // 连字符/下划线/数字都是英文标识符里的常见成分，只要还有字母就放行。
+        assert_eq!(f("well-known"), ("well-known".to_string(), 0));
+        assert_eq!(f("utf8"), ("utf8".to_string(), 0));
+
+        // 空白 → 空码（前缀查询命中不到，加了等于没加）
+        assert_eq!(f("thank you").0, "", "带空格的码会让前缀查询永远查不到");
+        // 非 ASCII → 空码（英文词库的码空间是 ASCII）
+        assert_eq!(f("你好").0, "");
+        assert_eq!(f("café").0, "");
+        // 一个字母都没有 → 空码（纯数字/纯符号不是英文词）
+        assert_eq!(f("123").0, "");
+        assert_eq!(f("---").0, "");
+        assert_eq!(f("").0, "");
+    }
 
     fn coord(tag: &str) -> Arc<Coordinator> {
         let path = std::env::temp_dir().join(format!("wind_addword_{tag}.redb"));
