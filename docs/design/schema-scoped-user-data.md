@@ -126,21 +126,48 @@
 `update_special_candidates` 补 `apply_freq_rerank` + `apply_shadow`（用 P1 的生效方案）。
 ⚠️ 特殊方案多是小符号表、顺序常是作者精心排的，调频默认应**关**。
 
-### P4：配置面
+### P4：每方案调频配置（落点已定：方案文件）
 
-P0 之后特殊方案不再读全局码表配置，那么它的调频/候选调整开关只能落在**方案自身**——
-或 `[[schema.special_modes]]` 条目，或方案文件的 `[engine.codetable]`。倾向后者：它已经是
-「这个方案怎么工作」的落点，而 special_modes 条目描述的是「怎么进入」。
+**落点**：方案文件的 `[engine.codetable.frequency]`（用户 2026-08-04 拍板）。理由是它已经是
+「这个方案怎么工作」的落点，而 `special_modes` 条目描述的是「怎么进入」，两件事不该混。
+
+⚠️ **这不是「把配置项挪个位置」**。「普通码表方案其实也支持、只是默认用了全局」这个印象
+对**上屏行为**成立，对**调频不成立**——两者的读取路径根本不同：
+
+| | 方案文件可写？ | 读取路径 | 按方案折叠？ |
+| --- | --- | --- | --- |
+| 上屏行为（9 项） | ✅ `CodeTableSpec` 的 `Option` 字段 | `resolve_codetable` | ✅ |
+| **调频** | ❌ `CodeTableSpec` **没有 frequency 字段** | `freq_settings()` 直读全局镜像 `self.codetable.lock()` | ❌ |
+
+即使今天在方案文件里写 `[engine.codetable.frequency]`，也没有任何人读它。故 P4 是三步：
+
+1. `CodeTableSpec` 加稀疏 `frequency`（每字段 `Option`，照现有 9 项的样子）；
+2. `CodetableGlobal::resolved()` 折叠该段；
+3. **`freq_settings()` 改为按方案解析**——这一步是真正的风险点：
+   - 它有 `freq_cache`（`HashMap<schema_id, FreqSettings>`），键已经是 schema_id，
+     结构上是支持的，但失效时机要跟着方案 override 走；
+   - 判据同 [[freq-rerank-model]] §记账码：**读、写、调试三处同口径**，
+     `apply_freq_rerank` / `record_selection` / `debug_freq_count` 必须一起改；
+   - `active_freq_profile()`（half_life 来源）同理。
+
+顺带的收益：普通码表方案也就此获得**每方案独立调频**的能力（用户预期中本已存在的能力）。
 
 ---
 
-## 五、待拍板
+## 五、已定与待办
 
-1. **临拼 / 临英 / 快捷输入**的归属是否也要按生效方案重整？它们当前走 `write_data_schema_id`
-   的按来源分流，**实测行为正确**（临拼记进 `"pinyin"`），改动风险大于收益，倾向不动。
-2. P4 的开关落点（`special_modes` 条目 vs 方案文件 `[engine.codetable]`）。
-3. P0 是行为变更：已手写过 special_modes 且**依赖继承**的用户，其快符行为会变（回到内置默认）。
-   考虑到 `special_modes` 出厂为空、实际用户极少，倾向直接改不做兼容。
+**已定**（2026-08-04）：
+
+- P4 落点＝方案文件 `[engine.codetable.frequency]`。
+- **临拼 / 临英 / 快捷输入的归属不动**——它们走 `write_data_schema_id` 的按来源分流，
+  实测行为正确（临拼记进 `"pinyin"`、全拼双拼共享），改动风险大于收益。
+
+**待办**：
+
+- P0 是行为变更：已手写过 special_modes 且**依赖继承**的用户，其快符行为会变（回到内置默认）。
+  考虑到 `special_modes` 出厂为空、实际用户极少，倾向直接改不做兼容——**待真机确认**。
+- 实施顺序建议 P1' → P2 → P3 → P4：前三步各自独立可验证，P4 触及 `freq_settings` 这条
+  全局路径，放最后单独做、单独验。
 
 ---
 
