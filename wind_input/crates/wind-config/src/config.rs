@@ -1913,7 +1913,7 @@ pub struct StatusIndicatorConfig {
     /// 位置模式："follow_caret"（跟随光标,默认）| "fixed"（固定屏幕坐标 custom_x/custom_y）。
     #[serde(default = "default_status_position_mode")]
     pub position_mode: String,
-    /// follow_caret 下相对默认位置（光标下方居中）的水平偏移（像素，正=右）。
+    /// follow_caret 下相对默认位置（光标下方、左边缘对齐光标）的水平偏移（像素，正=右）。
     #[serde(default)]
     pub offset_x: i32,
     /// follow_caret 下相对默认位置的垂直偏移（像素，正=下）。

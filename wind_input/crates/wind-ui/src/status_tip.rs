@@ -383,7 +383,7 @@ impl StatusTip {
         (cw, ch, ml, mt)
     }
 
-    /// 显示提示文本：水平居中于光标、默认在光标下方（下方不足则上翻），加用户偏移。
+    /// 显示提示文本：左对齐于光标、默认在光标下方（下方不足则上翻），加用户偏移。
     /// `cy` 为光标底端，`caret_h` 为光标高度（上翻定位用）。
     pub fn show(&mut self, text: &str, cx: i32, cy: i32, caret_h: i32, off_x: i32, off_y: i32) {
         self.ensure_scale(cx, cy);
@@ -396,9 +396,11 @@ impl StatusTip {
             return;
         }
         drop(m);
-        // 水平居中于光标、默认光标下方（下方不足上翻），叠加用户偏移；按工作区钳位。
+        // 左对齐于光标、默认光标下方（下方不足上翻），叠加用户偏移；按工作区钳位。
+        // 左对齐而非居中：气泡宽度随 items 勾选项与方案名长度变化，居中会让左边缘随文本
+        // 长短左右横跳；左对齐把左边缘钉在 caret 上，且与候选窗 place_window 同基准。
         let gap = (4.0 * s).round() as i32;
-        let x = cx - (cw as i32) / 2 + off_x;
+        let x = cx + off_x;
         let y = cy + gap + off_y;
         let (px, py) = clamp_below_or_above(x, y, cw, ch, cy, caret_h, gap);
         // 内容锚点 − 左/上 margin，阴影向四周溢出。
@@ -490,7 +492,8 @@ impl StatusTip {
         let s = self.scale;
         let (buf, w, h, cw, ch, ml, mt, has_shadow) = self.render_bubble_to_bgra(text);
         let gap = (4.0 * s).round() as i32;
-        let x = cx - (cw as i32) / 2 + off_x;
+        // 与 `show` 同一定位公式（左对齐于光标），两条渲染路径必须一致。
+        let x = cx + off_x;
         let y = cy + gap + off_y;
         let (px, py) = clamp_below_or_above(x, y, cw, ch, cy, caret_h, gap);
         Some((buf, w, h, px - ml as i32, py - mt as i32, has_shadow))
