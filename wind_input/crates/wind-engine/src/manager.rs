@@ -1761,6 +1761,29 @@ impl EngineManager {
         if own > 0.0 { own } else { inherited }
     }
 
+    /// 某方案**当前生效**的码表配置（基线 + 方案覆盖折叠后的全实值）。
+    ///
+    /// 存在的理由是设置页需要一个「起点快照」：方案文件里的行为字段是 `Option`，
+    /// 未设置时序列化成 `null`，UI 拿到 null 无法显示成开关——它得知道「不设置的话
+    /// 实际是什么」。基线本身又分两种（普通方案跟随全局、特殊方案跟随内置默认，见
+    /// [`Self::codetable_baseline`]），UI 侧算不出来，只能由此处给。
+    ///
+    /// 与 `resolve_codetable` 的区别只是取全局镜像的方式：那个是关联函数（供 `build_engine`
+    /// 在持有配置副本时调用），这个从 `self` 取当前镜像。
+    pub fn effective_codetable(&self, schema_id: &str) -> wind_config::CodetableGlobal {
+        let global = self
+            .codetable
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        Self::resolve_codetable(
+            schema_id,
+            self.data_dir.as_deref(),
+            &global,
+            self.override_dir.as_deref(),
+        )
+    }
+
     /// 解析某方案的有效码表配置：全局基线 + 方案 `[engine.codetable]` 行为（内联 + override
     /// 已在 `read_schema` 经 `merge_toml` 合并）逐字段折叠。读不到方案时原样返回全局基线。
     fn resolve_codetable(
@@ -3449,6 +3472,78 @@ mod tests {
         );
         assert_eq!(np.z_key_repeat, global.z_key_repeat);
         assert_eq!(np.top_code_commit, global.top_code_commit);
+
+        let _ = std::fs::remove_dir_all(&base_dir);
+    }
+
+    /// `effective_codetable`（设置页的初值快照来源）必须与 `resolve_codetable`（引擎实际
+    /// 构建时用的折叠）**同口径**——它们是第三、第四个平行折叠点，一处改了另一处没改，
+    /// 用户会看到「设置页显示精确匹配是关的，实际按开的跑」。
+    ///
+    /// 顺带钉住基线分流：设置页给特殊方案显示的初值必须来自特殊基线，否则用户一打开
+    /// 「自定义码表配置」就把全局的值写进了本不继承全局的方案。
+    #[test]
+    fn effective_codetable_matches_resolve_and_splits_by_hidden() {
+        use std::io::Write;
+        let base_dir = std::env::temp_dir().join("wind_eng_effective_ct");
+        let schemas = base_dir.join("schemas");
+        let _ = std::fs::remove_dir_all(&base_dir);
+        std::fs::create_dir_all(&schemas).unwrap();
+        // 与 special_schema_does_not_inherit_global_codetable 同构：除 hidden 外逐字相同。
+        for (id, hidden) in [("eff_hidden", true), ("eff_normal", false)] {
+            let mut f = std::fs::File::create(schemas.join(format!("{id}.schema.toml"))).unwrap();
+            let h = if hidden { "hidden = true\n" } else { "" };
+            write!(
+                f,
+                "[schema]\nid = \"{id}\"\n{h}[engine]\ntype = \"codetable\"\n[engine.codetable]\nmax_code_length = 4\nsingle_code_complete = false\n"
+            )
+            .unwrap();
+        }
+
+        let def = EngineManager::special_schema_baseline();
+        let mut cfg = Config::default();
+        // 全局三项都拨到与特殊基线相反的一侧：继承与否一眼可辨。
+        cfg.schema.codetable.single_code_input = !def.single_code_input;
+        cfg.schema.codetable.z_key_repeat = !def.z_key_repeat;
+        cfg.schema.codetable.punct_commit = !def.punct_commit;
+        cfg.schema.available = vec!["eff_normal".to_string()];
+        cfg.schema.active = "eff_normal".to_string();
+        let mgr = EngineManager::new(&cfg, Some(&base_dir));
+
+        let sp = mgr.effective_codetable("eff_hidden");
+        assert_eq!(
+            sp.single_code_input, def.single_code_input,
+            "特殊方案的初值快照该来自特殊基线，不该继承全局"
+        );
+        assert_eq!(sp.z_key_repeat, def.z_key_repeat);
+        assert_eq!(sp.punct_commit, def.punct_commit);
+        assert!(
+            !sp.single_code_complete,
+            "方案文件显式写了 false，应压过基线的 true"
+        );
+
+        // 反向对照：去掉 hidden 就该继承全局——否则上面三条在「全局整个失效」时也通过。
+        let np = mgr.effective_codetable("eff_normal");
+        assert_eq!(
+            np.single_code_input, cfg.schema.codetable.single_code_input,
+            "普通方案的初值快照仍须继承全局"
+        );
+        assert_eq!(np.z_key_repeat, cfg.schema.codetable.z_key_repeat);
+
+        // 与引擎构建实际用的那条折叠路径逐字段比对（同口径守护）。
+        for id in ["eff_hidden", "eff_normal"] {
+            let via_resolve = EngineManager::resolve_codetable(
+                id,
+                Some(&base_dir),
+                &cfg.schema.codetable,
+                mgr.override_dir.as_deref(),
+            );
+            assert_eq!(
+                mgr.effective_codetable(id),
+                via_resolve,
+                "{id}: 设置页快照与引擎实际折叠必须一致"
+            );
+        }
 
         let _ = std::fs::remove_dir_all(&base_dir);
     }

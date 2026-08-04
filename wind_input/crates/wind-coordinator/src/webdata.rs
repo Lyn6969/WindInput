@@ -771,6 +771,20 @@ impl Coordinator {
                 if let Some(eng) = v.get_mut("engine").and_then(|e| e.as_object_mut()) {
                     eng.insert("type".to_string(), json!(etype));
                 }
+                // 码表方案附带「当前生效值」旁路字段：`engine.codetable` 的行为字段是
+                // Option，未设置时是 null，设置页无法把 null 显示成开关——它需要知道
+                // 「不设置的话实际是什么」。基线又分普通/特殊两种（见 codetable_baseline），
+                // UI 侧算不出来，故由此处随配置一并给出。
+                //
+                // 与 `engine.codetable` 平级但**不同名**：那份是「显式写了什么」（可为 null，
+                // 决定 saveConfig 该不该落盘），这份是「实际按什么跑」（恒为实值，只作 UI 初值）。
+                // 合并成一份会让「跟随基线」与「显式等于基线值」无从区分。
+                if etype == "codetable" {
+                    let eff = self.engine_mgr.effective_codetable(id);
+                    if let Some(obj) = v.as_object_mut() {
+                        obj.insert("effectiveCodetable".to_string(), serde_json::to_value(eff)?);
+                    }
+                }
                 Ok(v)
             }
             None => Ok(json!({})),
@@ -782,6 +796,7 @@ impl Coordinator {
         let cfg = params
             .get("cfg")
             .ok_or_else(|| anyhow::anyhow!("缺少参数 cfg"))?;
+        let cfg = &strip_readonly_fields(cfg);
         let base = self
             .engine_mgr
             .schema_base(id)
@@ -2061,6 +2076,30 @@ fn word_item(r: wind_store::user_words::UserWordRecord) -> Value {
 
 /// 稀疏 diff：返回 `cfg` 相对 `base` 的变化项（仅含改动的叶子/键）；无变化返回 None。
 /// 对象逐键递归；数组/标量按整体比较（不同则取 cfg）。用于 schema override 最小化。
+/// `getConfig` 附带的只读旁路字段——回传 `saveConfig` 时必须剥掉。
+///
+/// 它们是「当前生效值」的快照，不是方案配置的一部分。设置页的做法是拿整份 getConfig
+/// 结果、改几个字段、原样回传；若不剥，`json_diff` 会认定方案文件缺这个键，于是把整份
+/// 快照写进 override——从此该方案的行为被**冻结在打开设置页那一刻**，之后改全局配置对
+/// 它再无影响，而用户根本没动过这些项。
+///
+/// 在服务端剥而不是要求调用方自觉：这是契约边界，任何客户端都该受保护。
+const READONLY_SIDECAR_FIELDS: &[&str] = &["effectiveCodetable"];
+
+fn strip_readonly_fields(cfg: &Value) -> Value {
+    let Some(o) = cfg.as_object() else {
+        return cfg.clone();
+    };
+    if !READONLY_SIDECAR_FIELDS.iter().any(|k| o.contains_key(*k)) {
+        return cfg.clone();
+    }
+    let mut o = o.clone();
+    for k in READONLY_SIDECAR_FIELDS {
+        o.remove(*k);
+    }
+    Value::Object(o)
+}
+
 fn json_diff(base: &Value, cfg: &Value) -> Option<Value> {
     match (base, cfg) {
         (Value::Object(b), Value::Object(c)) => {
@@ -2971,6 +3010,43 @@ mod tests {
         assert_eq!(d, json!({ "a": 9, "t": { "y": 20 } }));
         // 完全相同 → None
         assert!(json_diff(&base, &base).is_none());
+    }
+
+    /// 只读旁路字段不得随 saveConfig 落进 override。
+    ///
+    /// 失败形态很隐蔽：override 里多一段 `[effectiveCodetable]`，方案照常能用，但该方案
+    /// 的所有码表行为从此被冻结在用户打开设置页那一刻——之后改全局配置对它不再有效，
+    /// 而用户从没动过那些项。
+    #[test]
+    fn save_config_strips_readonly_sidecar() {
+        let cfg = json!({
+            "schema": { "id": "wubi86" },
+            "engine": { "type": "codetable", "codetable": { "punct_commit": true } },
+            "effectiveCodetable": { "punct_commit": true, "z_key_repeat": false },
+        });
+        let stripped = strip_readonly_fields(&cfg);
+        assert!(
+            stripped.get("effectiveCodetable").is_none(),
+            "旁路字段应被剥掉，实际 {stripped}"
+        );
+        // 其余内容原样保留——剥错了会静默丢配置。
+        assert_eq!(
+            stripped.pointer("/engine/codetable/punct_commit"),
+            Some(&json!(true))
+        );
+        assert_eq!(stripped.pointer("/schema/id"), Some(&json!("wubi86")));
+
+        // 没有旁路字段时原样返回（不因为多一次 clone 就改变结构）。
+        let plain = json!({ "engine": { "type": "codetable" } });
+        assert_eq!(strip_readonly_fields(&plain), plain);
+
+        // 与 diff 串起来看：剥之后，方案文件没写过的旁路键不会被判成「新增」。
+        let base = json!({ "schema": { "id": "wubi86" }, "engine": { "type": "codetable" } });
+        let d = json_diff(&base, &stripped).unwrap_or(json!({}));
+        assert!(
+            d.get("effectiveCodetable").is_none(),
+            "diff 里不该出现旁路字段，实际 {d}"
+        );
     }
 
     #[test]
