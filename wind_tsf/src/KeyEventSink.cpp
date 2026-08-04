@@ -488,22 +488,21 @@ STDAPI CKeyEventSink::OnTestKeyDown(ITfContext* pContext, WPARAM wParam, LPARAM 
         return S_OK;
     }
 
-    // Ctrl+Space（系统 IME 中英切换热键）：这里**打标记**，真正的模式切换在
-    // CTextService::OnChange 的 OPENCLOSE 分支完成。
+    // Ctrl+Space（系统 IME 中英切换热键）：吃掉这个键，避免 Space 落进输入。
+    // **模式切换不在这里发生**——系统热键会取反 OPENCLOSE compartment，
+    // CTextService::OnChange 按值语义直接采纳，不需要按键侧参与。
     //
-    // 曾经的设计是「在这里吃掉键、阻止系统翻 compartment、自己在 OnKeyDown 切换」，
-    // 但实测证明拦不住：pfEaten=TRUE 对系统 IME 热键无效——msctf 在 keystroke sink
-    // 之下就消费了这个键，compartment 照样在同一毫秒被翻成 0，且**不再回调 OnKeyDown**。
-    // 日志佐证：ctrl_space_intercept 命中 4 次，OnKeyDown 侧的处理 0 次。那条从未执行
-    // 的路径已删除（它还是个隐患：一旦哪天 OnKeyDown 真被调用，就会与本路径双切换，
-    // Ctrl+Space 当场失灵）。
-    //
-    // 所以这里唯一的职责是留下时间戳：OPENCLOSE 变化时，「用户切换请求」与「宿主
-    // 状态请求」写入的值都是 0，compartment 本身无从区分，只有这个标记能分开。
+    // 两条已被实测否掉的设计（勿重蹈）：
+    //   1.「吃掉键以阻止系统翻 compartment，自己在 OnKeyDown 切换」——拦不住。
+    //      pfEaten=TRUE 对系统 IME 热键无效，msctf 在 keystroke sink 之下就消费了它，
+    //      compartment 照样被翻，且**不再回调 OnKeyDown**（该死代码已删）。
+    //   2.「在这里打时间戳，供 OnChange 区分『切换请求』与『宿主状态请求』」——
+    //      判据的隐含前提是「Space 会经过 keystroke sink」，而 WebView 类宿主
+    //      （实测 DBX/msedgewebview2）根本不递 Space，标记永远打不上。
+    // 值语义之后这两个问题都不存在了：值本身就是答案，无需知道是谁写的。
     if (wParam == VK_SPACE && (modifiers & KEYMOD_CTRL) && !(modifiers & (KEYMOD_ALT | KEYMOD_SHIFT)))
     {
         _CancelPendingToggle(wParam, L"ctrl_space_intercept");
-        _pTextService->NoteCtrlSpaceIntercept();
         *pfEaten = TRUE;
         _LogKeyDecision(L"test_down", _pTextService->GetFocusSessionId(), wParam, modifiers, HotkeyType::None,
                         _pTextService->IsChineseMode(), _pTextService->HasActiveComposition(), _hasCandidates,

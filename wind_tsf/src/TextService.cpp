@@ -865,6 +865,7 @@ CTextService::CTextService()
     , _langBarSyncPending(FALSE)
     , _passwordSuppressEnabled(TRUE)  // 默认开，与 core 的 password_suppress_enabled 初值一致
     , _hasThreadFocus(FALSE)
+    , _isProcessForeground(FALSE)
     , _activateFlags(0)
     , _pKeyEventSink(nullptr)
     , _pIPCClient(nullptr)
@@ -874,7 +875,6 @@ CTextService::CTextService()
     , _bChineseMode(TRUE)
     , _bFullWidth(FALSE)
     , _lastCapsKeyTick(0)
-    , _lastCtrlSpaceTick(0)
     , _lastActivateTick(0)
     , _focusSessionId(0)
     , _hasFocus(FALSE)
@@ -1408,7 +1408,8 @@ static constexpr UINT WM_WIND_REEVAL_ADDWORD = WM_APP + 0x51;
 
 STDAPI CTextService::OnSetThreadFocus()
 {
-    WIND_LOG_DEBUG(L"OnSetThreadFocus called\n");
+    // tid/inst 与 compat.openclose.onchange 对齐，用于确认两者是否同一实例。
+    WIND_LOG_DEBUG_FMT(L"OnSetThreadFocus called tid=%lu inst=0x%p\n", GetCurrentThreadId(), this);
     _hasThreadFocus = TRUE;
     // 拿回 thread focus：候选可见性热键由 NotifyCandidatesVisibilityChanged 驱动，
     // 这里不主动补——切焦点时候选窗通常已经消失。
@@ -1420,7 +1421,7 @@ STDAPI CTextService::OnSetThreadFocus()
 // ITfThreadFocusSink — 线程退出 foreground。
 STDAPI CTextService::OnKillThreadFocus()
 {
-    WIND_LOG_DEBUG(L"OnKillThreadFocus called\n");
+    WIND_LOG_DEBUG_FMT(L"OnKillThreadFocus called tid=%lu inst=0x%p\n", GetCurrentThreadId(), this);
     _hasThreadFocus = FALSE;
     // 立即让出所有热键，让前台应用的 IME 实例能注册成功。
     if (_hotkeysActive)
@@ -1499,7 +1500,11 @@ BOOL CTextService::_InitHotkeyWindow()
     {
         DWORD fgPid = 0;
         GetWindowThreadProcessId(hFg, &fgPid);
+        // 两者此刻只能用同一个猜测值：TSF 回调尚未到达，没有更好的信号。
+        // 之后各走各的权威来源——_hasThreadFocus 归 ITfThreadFocusSink，
+        // _isProcessForeground 归自检定时器。
         _hasThreadFocus = (fgPid == GetCurrentProcessId());
+        _isProcessForeground = _hasThreadFocus;
         WIND_LOG_DEBUG_FMT(L"_InitHotkeyWindow: initial thread focus seed=%d (fgPid=%u ownPid=%u)\n",
                            (int)_hasThreadFocus, fgPid, GetCurrentProcessId());
     }
@@ -1540,7 +1545,9 @@ void CTextService::_RegisterCandidateHotkeys()
     if (_hHotkeyWnd == nullptr || _hotkeysActive) return;
     // 没拿到 thread focus 时绝不注册 — 多进程 IME 实例竞争同一组热键会引发
     // ERROR_HOTKEY_ALREADY_REGISTERED (1409)，让前台应用 IME 实例反而注册不上。
-    if (!_hasThreadFocus) return;
+    // 两个条件都要：本应用在前台（TSF 信号）**且**本进程就是前台窗口所属进程。
+    // 多进程宿主（WebView 类）下后者为假，热键该让给真正拥有前台窗口的那个进程。
+    if (!_hasThreadFocus || !_isProcessForeground) return;
 
     int registered = 0;
     // Ctrl+0..9 (Pin)
@@ -1612,7 +1619,9 @@ void CTextService::_ReevaluateAddWordHotkey()
 // 主线程：按门卫条件（中文 + 文本框 + 非密码框 + thread focus）注册或注销加词热键。幂等。
 void CTextService::_DoReevaluateAddWordHotkey()
 {
-    BOOL want = _hasThreadFocus && _bChineseMode && _hasTextInputContext && !_focusIsPassword;
+    // _isProcessForeground 与 _hasThreadFocus 并列：理由见 _RegisterCandidateHotkeys。
+    BOOL want = _hasThreadFocus && _isProcessForeground
+                && _bChineseMode && _hasTextInputContext && !_focusIsPassword;
     if (want && !_addWordHotkeysActive)
     {
         _RegisterAddWordHotkeys();
@@ -1628,7 +1637,7 @@ void CTextService::_RegisterAddWordHotkeys()
     if (_hHotkeyWnd == nullptr || _addWordHotkeysActive) return;
     // 与候选热键同规：无 thread focus 绝不注册，避免多进程 IME 实例争抢同一组合键
     // 引发 ERROR_HOTKEY_ALREADY_REGISTERED (1409)。
-    if (!_hasThreadFocus || _pHotkeyManager == nullptr) return;
+    if (!_hasThreadFocus || !_isProcessForeground || _pHotkeyManager == nullptr) return;
 
     const auto& globals = _pHotkeyManager->GlobalHotkeys();
     int id = kHotkeyIdAddWordBase;
@@ -1689,12 +1698,13 @@ LRESULT CALLBACK CTextService::_HotkeyWndProc(HWND hWnd, UINT msg, WPARAM wParam
             if (hFg != nullptr) GetWindowThreadProcessId(hFg, &fgPid);
             if (fgPid == GetCurrentProcessId())
             {
-                self->_hasThreadFocus = TRUE;
+                // 恢复的是热键资格，不是焦点信号（后者归 ITfThreadFocusSink）。
+                self->_isProcessForeground = TRUE;
                 // 候选可见性热键由 NotifyCandidatesVisibilityChanged 驱动；
                 // 候选下一次出现时自然会重新注册。
                 // 加词热键不依赖候选，须在此主动重评（已在窗口线程）。
                 self->_DoReevaluateAddWordHotkey();
-                WIND_LOG_DEBUG(L"Received hotkey retry signal, marked thread focus\n");
+                WIND_LOG_DEBUG(L"Received hotkey retry signal, marked process foreground\n");
             }
         }
         return 0;
@@ -1725,7 +1735,12 @@ LRESULT CALLBACK CTextService::_HotkeyWndProc(HWND hWnd, UINT msg, WPARAM wParam
             {
                 WIND_LOG_DEBUG_FMT(L"FocusCheck timer: not foreground (fgPid=%u ownPid=%u), releasing\n",
                                    fgPid, GetCurrentProcessId());
-                self->_hasThreadFocus = FALSE;
+                // 只动热键归属，**不碰 _hasThreadFocus**——本分支的注释一直声明自己
+                // 「纠正的是热键状态而非焦点信号」，但此前确实在写焦点信号。多进程宿主
+                // （前台窗口在别的 pid）下它会把 TSF 刚给的 TRUE 冲掉且永不恢复
+                // （恢复分支要求 nowForeground，在这类宿主里恒假），OnChange 的
+                // !_hasThreadFocus 早退随之恒成立，中英切换整个失效。
+                self->_isProcessForeground = FALSE;
                 if (self->_hotkeysActive) self->_UnregisterCandidateHotkeys();
                 if (self->_addWordHotkeysActive) self->_UnregisterAddWordHotkeys();
                 // 通知前台 IME 立即重试
@@ -1746,11 +1761,11 @@ LRESULT CALLBACK CTextService::_HotkeyWndProc(HWND hWnd, UINT msg, WPARAM wParam
                     }
                 }
             }
-            else if (nowForeground && !self->_hasThreadFocus)
+            else if (nowForeground && !self->_isProcessForeground)
             {
-                // 反向：成为前台但 _hasThreadFocus 还没更新（OnSetThreadFocus 也可能漏），
-                // 标记一下；候选可见性热键由 NotifyCandidatesVisibilityChanged 驱动。
-                self->_hasThreadFocus = TRUE;
+                // 反向：本进程成为前台窗口所属进程，恢复热键资格。
+                // 候选可见性热键由 NotifyCandidatesVisibilityChanged 驱动。
+                self->_isProcessForeground = TRUE;
                 // 加词热键不依赖候选，须主动重评（已在窗口线程）。
                 self->_DoReevaluateAddWordHotkey();
             }
@@ -1778,7 +1793,8 @@ LRESULT CALLBACK CTextService::_HotkeyWndProc(HWND hWnd, UINT msg, WPARAM wParam
             {
                 WIND_LOG_DEBUG_FMT(L"WM_HOTKEY race: not foreground (fgPid=%u ownPid=%u), releasing hotkeys\n",
                                    fgPid, GetCurrentProcessId());
-                self->_hasThreadFocus = FALSE;
+                // 同上：只让出热键，焦点信号归 ITfThreadFocusSink 独占。
+                self->_isProcessForeground = FALSE;
                 if (self->_hotkeysActive) self->_UnregisterCandidateHotkeys();
                 if (self->_addWordHotkeysActive) self->_UnregisterAddWordHotkeys();
                 // 通知前台进程的 IME hidden window 立即重试注册（避免它要等下次
@@ -2453,8 +2469,8 @@ void CTextService::_SyncStateFromResponse(const ServiceResponse& response)
     _SetChineseMode(response.IsChineseMode());
     _bFullWidth = response.IsFullWidth();
 
-    // 保持 compartment 恒为 OPEN，理由见 _SetOpenCloseCompartment 定义处的说明。
-    _SetOpenCloseCompartment(TRUE);
+    // compartment 如实反映中英模式（值语义），见 _SetOpenCloseCompartment 定义处的说明。
+    _SetOpenCloseCompartment(_bChineseMode);
     // Sync真实中英文模式到 INPUTMODE_CONVERSION compartment（供 KBLSwitch / 任务栏读取）
     _SetConversionMode(_bChineseMode);
 
@@ -2729,21 +2745,17 @@ LONG CTextService::GetOpenCloseCompartmentValue()
     return var.lVal;
 }
 
-// 把 OPENCLOSE compartment 钉回 OPEN(1)。**这是一条不可随意拆除的不变量**，
-// 但它真正的理由不是长期以来注释里写的那个：
+// 写 OPENCLOSE compartment，使其**如实等于当前中英模式**（0=英文/IME 关，1=中文/IME 开）。
 //
-//   ✗ 旧说法「必须钉死 1，否则英文态收不到 OnTestKeyDown（英文统计/自动配对失效）」
-//     —— 2026-08-04 受控实验证伪：抑制全部写入后 compartment 长期停在 0，
-//     英文统计照常计数（openclose=0 实测 23 次）、字母正常上屏、中文候选正常。
-//     TSF 在 compartment=0 时依然回调 OnTestKeyDown。
+// ⚠ 不变量：任何改变 _bChineseMode 的路径都必须调用本函数同步 compartment。
+//   它现在是我们对宿主说的唯一真话——脱节的后果比当年「恒为 1」更难查，因为
+//   宿主会据此保存并恢复错误的状态（gvim 就是这么被坑的）。
 //
-//   ✓ 真实理由：保证**系统 IME 热键的 toggle 恒产出 bOpen=0**。
-//     系统热键（本机绑在 Ctrl 单键上，默认多为 Ctrl+Space）靠取反 compartment 表达
-//     「切换」。只要我们始终把它拉回 1，每次按下就必然观测到 0，OnChange 里
-//     「忽略 bOpen=1」那条规则才不会挡住切换。一旦不再拉回，compartment 自由翻转
-//     1↔0，落到 1 的那次会被忽略 ⇒ 中英切换时灵时不灵（实验版已复现）。
-//
-// 拆除前请先枚举它实际影响了什么——证伪公开理由不等于可以拆掉机制。
+// 历史（2026-08-04 用一整天实测换来，勿回退）：这里曾长期钉死为 1，公开理由是
+// 「否则英文态收不到 OnTestKeyDown，英文统计/自动配对失效」。**该理由已被受控实验
+// 证伪**：抑制全部写入后 compartment 长期停在 0，英文统计照常计数（实测 23 次）、
+// 字母正常上屏、中文候选正常——TSF 在 compartment=0 时依然回调 OnTestKeyDown。
+// 钉死带来的四个衍生缺陷与它们各自的补丁，见 OnChange 的 OPENCLOSE 分支注释。
 BOOL CTextService::_SetOpenCloseCompartment(BOOL bOpen)
 {
     if (_pThreadMgr == nullptr)
@@ -2979,8 +2991,13 @@ STDAPI CTextService::OnChange(REFGUID rguid)
     // 误报会直接翻转服务端权威模式）——忽略，下次聚焦/激活从服务同步权威值。
     // 同 CONVERSION 路径：判据须为 _hasThreadFocus（前台），而非 _hasFocus（DocMgr 级）。
     // 本路径的误报后果更重——「任何变化都被视为 toggle」，直接翻转服务端权威模式。
-    WIND_LOG_INFO_FMT(L"compat.openclose.onchange hasFocus=%d hasThreadFocus=%d curMode=%d\n",
-                      _hasFocus ? 1 : 0, _hasThreadFocus ? 1 : 0, _bChineseMode ? 1 : 0);
+    // tid/inst：同一进程里可能有多个 TSF 线程，各自持有独立的 CTextService 与
+    // 独立的 _hasThreadFocus。若 OnSetThreadFocus 落在实例 A 而本回调发生在实例 B，
+    // 表现就是「明明刚置了 TRUE，这里读到的还是 0」——不打出实例身份根本分不出
+    // 这种情况与「有人把它清零了」。
+    WIND_LOG_INFO_FMT(L"compat.openclose.onchange hasFocus=%d hasThreadFocus=%d fg=%d curMode=%d tid=%lu inst=0x%p\n",
+                      _hasFocus ? 1 : 0, _hasThreadFocus ? 1 : 0, _isProcessForeground ? 1 : 0,
+                      _bChineseMode ? 1 : 0, GetCurrentThreadId(), this);
     if (!_hasThreadFocus)
     {
         WIND_LOG_INFO(L"Compartment OPENCLOSE changed while not foreground, ignored\n");
@@ -3022,7 +3039,7 @@ STDAPI CTextService::OnChange(REFGUID rguid)
     // cancel_on_mode_switch 的注入取消）后会异步联动写 OPENCLOSE compartment（实测
     // 延迟 0.5~1s）。这不是用户的 Ctrl+Space 切换请求——若照常 toggle 并上报服务，
     // 会与服务端的 CapsLock 注入形成「注入→联动→切换→再注入」振荡回路（模式每拍
-    // 翻转、大写灯乱闪）。短窗口内只把 compartment 拉回 OPEN，不 toggle 不上报。
+    // 翻转、大写灯乱闪）。短窗口内把 compartment 拉回真实模式，不切换不上报。
     //
     // 例外（勿删）：用户「开大写后立刻按 Ctrl+Space」的真实切换与系统联动落在同一
     // 时间窗（都是 caps 活动后 0.5~1s），纯时间窗口会误吞真实请求（实测复现）。
@@ -3033,72 +3050,54 @@ STDAPI CTextService::OnChange(REFGUID rguid)
         BOOL ctrlHeld = (GetAsyncKeyState(VK_CONTROL) & 0x8000) || (GetKeyState(VK_CONTROL) & 0x8000);
         if (!ctrlHeld)
         {
-            WIND_LOG_INFO(L"Compartment OPENCLOSE changed right after CapsLock activity (no Ctrl held), suppressed (re-open only)\n");
-            _bInCompartmentChange = TRUE;
-            _SetOpenCloseCompartment(TRUE);
-            _bInCompartmentChange = FALSE;
+            WIND_LOG_INFO(L"Compartment OPENCLOSE changed right after CapsLock activity (no Ctrl held), suppressed (restore mode)\n");
+            _SetOpenCloseCompartment(_bChineseMode);
             return S_OK;
         }
         WIND_LOG_INFO(L"Compartment OPENCLOSE changed within CapsLock window but Ctrl held -> treat as user toggle\n");
     }
 
-    // 本路径要区分两类语义完全不同、而写入值可能完全相同的请求：
+    // ===== 严格值语义 =====
+    // compartment 的值**就是**中英状态的真相：0=英文（IME 关闭）、1=中文（IME 开启）。
+    // 不再把它钉死为 1，而是让它如实反映模式——这是与其它输入法一致的语义，
+    // 也是 TSF/IMM 对宿主的契约。
     //
-    //   用户 Ctrl+Space  —— 系统 IME 热键，语义是「切换」。系统靠取反 compartment 表达，
-    //                       而我们把它拉回 1，于是按下时通常只能观测到 0。
-    //   宿主状态请求     —— gvim 等宿主进出编辑模式时调 ImmSetOpenStatus，
-    //                       语义是「开/关输入法」。退出编辑模式写 0，进入时写 1。
+    // 为什么放弃「钉死 1 + 事件语义」（2026-08-04 用一整天实测换来的结论）：
+    // 钉死之后这个位同时被要求承担三件互相冲突的事，衍生出四个独立缺陷：
+    //   ① 值失去区分能力 ⇒ 只能把「任何变化」当 toggle ⇒ gvim 每次 ESC 随机翻转中英；
+    //   ② 幂等写入变成事件 ⇒ 宿主重复下发同一状态被反复触发；
+    //   ③ 宿主查询到假状态 ⇒ gvim 记住「开」并在进插入模式时恢复，覆盖用户选择；
+    //   ④ 谎言需要持续维护 ⇒ 任何跳过 re-open 的分支都会让值序列错乱
+    //      （no-op 早退不发 IPC ⇒ 补写缺失 ⇒ 系统 toggle 方向反转 ⇒「按三次才切一次」）。
+    // 为①②③④各自打的补丁（toggle、Ctrl+Space 标记、忽略 bOpen=1、Ctrl 兜底、
+    // 联动抑制窗）曾在这里堆到 9 道判据，且互相之间只靠代码顺序确定优先级。
     //
-    // 值本身没有区分能力（两者都可能是 0），唯一可靠依据是 OnTestKeyDown 那一刻的
-    // Ctrl+Space 拦截标记：实测拦截与本回调相隔 1ms，而宿主请求前面是 ESC / i 之类
-    // 的普通键，绝不会带上这个标记。
+    // 说真话之后这些全部不需要：
+    //   - 系统热键（Ctrl+Space）取反 compartment ⇒ 值变化 ⇒ 直接按值切换。
+    //     **不再需要看见那个按键**，因此 WebView 类宿主不把 Space 递给 keystroke sink
+    //     也毫无影响（DBX 正是栽在这一点上）。
+    //   - gvim 查到英文态=关 ⇒ 记住「关」⇒ 进插入模式恢复「关」⇒ 保持英文；
+    //     用户若在插入模式切了中文，它记住「开」并在下次恢复中文——正是应有的行为。
+    //   - _SetConversionMode 的联动写 0 只在「值与模式已经一致」时到达，天然是 no-op。
     //
-    // 历史教训（勿回退）：本路径原先把「任何变化」一律当 toggle，后果是
-    //   1. gvim 每次 ESC 退出编辑模式都翻转中英，且方向取决于当时模式，行为随机；
-    //   2. 用户按 Shift/Ctrl 切英文后，_SetConversionMode(0) 引发系统联动写 OPENCLOSE=0，
-    //      被当成 toggle 又切回中文——自己把自己的切换撤销掉。
-    // 改回值语义后，(2) 天然变成 no-op（请求英文时已是英文）。
+    // ⚠ 不变量：**任何改变 _bChineseMode 的路径都必须同步写 compartment**
+    //   （_SetOpenCloseCompartment(_bChineseMode)）。漏一处就会让 compartment 与实际模式
+    //   脱节，而它现在是对宿主的唯一真话——脱节比当年钉死更难查。
+    BOOL newChineseMode = bOpen;
 
-    BOOL fromCtrlSpace = _ConsumeCtrlSpaceTick();
-
-    // 宿主请求「开」：不改变中英。
-    //
-    // 我们对外恒称「开」（compartment 钉在 1，英文态也要收键做统计与自动配对），
-    // 所以宿主的「开」请求对我们本就是 no-op——它只要求输入法可用，不指定中英。
-    //
-    // 这一条必须显式忽略，不能落到下面的值语义里当「开=中文」：gvim 退出编辑模式时
-    // 会**查询**当前 IME 状态存起来，进入时再恢复。它查到的永远是我们钉死的「开」，
-    // 于是每次按 i 都要求「开」；若据此切中文，用户刚在英文态下的选择就会被覆盖，
-    // 表现为「进出编辑模式又变回中文」——正是本次要修的现象的后半段。
-    //
-    // 前半段（ESC 写 0）修好后这半段才第一次浮现：旧逻辑每次都把 compartment 拉回 1，
-    // gvim 写 1 时值没变、TSF 不触发 OnChange，这条路径从未被执行过。
-    if (!fromCtrlSpace && bOpen)
-    {
-        _SetOpenCloseCompartment(TRUE);
-        WIND_LOG_INFO_FMT(L"Compartment OPENCLOSE 1 (host state request), mode unchanged (%s)\n",
-            _bChineseMode ? L"Chinese" : L"English");
-        return S_OK;
-    }
-
-    BOOL newChineseMode = fromCtrlSpace ? !_bChineseMode  // 切换请求：取反
-                                        : FALSE;          // 宿主要求关闭：英文
-
-    // 目标与现状一致：宿主重复下发同一状态（gvim 每次 ESC 都写 0）或系统联动噪声。
-    // 必须在任何副作用之前早退——否则每次都会白跑一轮 EndComposition + 同步 IPC +
+    // 值与当前模式一致：宿主重复下发同一状态（gvim 每次 ESC 都写 0）或系统联动噪声。
+    // 早退，不做任何副作用——否则每次都会白跑一轮 EndComposition + 同步 IPC +
     // 刷 LangBar/工具栏（实测一轮 30ms），并把英文统计切成碎片段上报。
+    // 注意此处**不需要**回写 compartment：值语义下它已经是对的。
     if (newChineseMode == _bChineseMode)
     {
-        _SetOpenCloseCompartment(TRUE);
-        WIND_LOG_INFO_FMT(L"Compartment OPENCLOSE %d matches current mode (%s), no-op%s\n",
-            bOpen, _bChineseMode ? L"Chinese" : L"English",
-            fromCtrlSpace ? L" [ctrl+space]" : L"");
+        WIND_LOG_INFO_FMT(L"Compartment OPENCLOSE %d matches current mode (%s), no-op\n",
+            bOpen, _bChineseMode ? L"Chinese" : L"English");
         return S_OK;
     }
 
-    WIND_LOG_INFO_FMT(L"Compartment %s (%s): mode %s -> %s\n",
+    WIND_LOG_INFO_FMT(L"Compartment %s: mode %s -> %s\n",
         bOpen ? L"opened" : L"closed",
-        fromCtrlSpace ? L"ctrl+space toggle" : L"host state request",
         _bChineseMode ? L"Chinese" : L"English",
         newChineseMode ? L"Chinese" : L"English");
 
@@ -3137,17 +3136,19 @@ STDAPI CTextService::OnChange(REFGUID rguid)
     if (_pLangBarItemButton != nullptr)
         _pLangBarItemButton->UpdateLangBarButton(_bChineseMode);
 
-    // 把 compartment 钉回 OPEN，理由见 _SetOpenCloseCompartment 定义处的说明
-    //（保证系统热键的 toggle 恒产出 0，而**不是**为了让英文态收得到键——后者已被实验证伪）。
-    // 重入保护由 _SetOpenCloseCompartment 自己完成（它内部置/复位 _bInCompartmentChange），
-    // 此处不再外包一层——外层的复位会先于内层结束，反而让保护提前失效。
+    // compartment 通常已经等于新模式（这次变化正是宿主/系统写的），无需回写。
+    // 唯一例外：服务端把模式仲裁成了与请求不同的值（如密码框强制英文），此时必须
+    // 把 compartment 拉回真实模式，否则它对宿主说的就是假话。
     //
-    // 注意：本调用在 OnChange 上下文里**必然不生效**（实测回读 8/8 全是 0）。它内部有
-    // 「值相同就不写」的守卫，而此处 GetValue 读到的是尚未落定的旧值，于是跳过写入。
-    // 真正把 compartment 拉回 1 的是 IPC 状态推送回来后 _SyncStateFromResponse 里的
-    // 那次调用（不在 OnChange 上下文，能成功），窗口实测 400~670ms。
-    // 因此上面的判定逻辑不依赖它成功。
-    _SetOpenCloseCompartment(TRUE);
+    // 注意在 OnChange 上下文里写 compartment **未必生效**（实测：内部「值相同就不写」
+    // 的守卫会读到尚未落定的旧值而跳过）。真正兜底的是 IPC 状态推送回来后
+    // _SyncStateFromResponse 里的那次写入，窗口实测 400~670ms。判定逻辑不依赖此处成功。
+    if (newChineseMode != bOpen)
+    {
+        WIND_LOG_INFO_FMT(L"Service arbitrated mode to %s (requested %s), syncing compartment\n",
+            newChineseMode ? L"Chinese" : L"English", bOpen ? L"Chinese" : L"English");
+        _SetOpenCloseCompartment(_bChineseMode);
+    }
 
     // 同步真实中英文模式到 INPUTMODE_CONVERSION（KBLSwitch / 任务栏读取此 compartment）
     _SetConversionMode(_bChineseMode);
@@ -3156,21 +3157,6 @@ STDAPI CTextService::OnChange(REFGUID rguid)
         _bChineseMode ? L"Chinese" : L"English");
 
     return S_OK;
-}
-
-BOOL CTextService::_ConsumeCtrlSpaceTick()
-{
-    if (_lastCtrlSpaceTick == 0)
-        return FALSE;
-
-    // 时间窗与清零是两道独立防线，都不能省：
-    //   清零防「一次拦截被兑换两次」；时间窗防「拦截了但系统压根没翻 compartment」
-    //   （某些宿主/配置下 IME 热键被禁用）——那种情况下标记会残留，若无时间窗，
-    //   之后任意一次宿主状态请求都会被误判成切换请求。
-    // 实测 intercept 到 OnChange 仅隔 1ms，200ms 已是极宽松的上界。
-    BOOL fresh = (GetTickCount64() - _lastCtrlSpaceTick) < 200;
-    _lastCtrlSpaceTick = 0;
-    return fresh;
 }
 
 BOOL CTextService::_InitKeyboardDisabledCompartment()
@@ -4915,9 +4901,9 @@ void CTextService::ToggleInputMode()
 
     WIND_LOG_INFO_FMT(L"Switched to %s mode\n", _bChineseMode ? L"Chinese" : L"English");
 
-    // 保持 compartment 恒为 OPEN，理由见 _SetOpenCloseCompartment 定义处的说明。
+    // compartment 如实反映中英模式（值语义），见 _SetOpenCloseCompartment 定义处的说明。
     // The actual key pass-through is handled by pfEaten=FALSE in OnTestKeyDown.
-    _SetOpenCloseCompartment(TRUE);
+    _SetOpenCloseCompartment(_bChineseMode);
     _SetConversionMode(_bChineseMode);
 
     // Update language bar button
@@ -4939,8 +4925,8 @@ void CTextService::SetInputMode(BOOL bChineseMode)
 
     WIND_LOG_INFO_FMT(L"Mode set to %s (from service)\n", _bChineseMode ? L"Chinese" : L"English");
 
-    // 保持 compartment 恒为 OPEN，理由见 _SetOpenCloseCompartment 定义处的说明。
-    _SetOpenCloseCompartment(TRUE);
+    // compartment 如实反映中英模式（值语义），见 _SetOpenCloseCompartment 定义处的说明。
+    _SetOpenCloseCompartment(_bChineseMode);
     _SetConversionMode(_bChineseMode);
 
     // Update language bar button
@@ -5092,8 +5078,8 @@ void CTextService::UpdateFullStatus(BOOL bChineseMode, BOOL bFullWidth, BOOL bCh
     _SetChineseMode(bChineseMode);
     _bFullWidth = bFullWidth;
 
-    // 保持 compartment 恒为 OPEN，理由见 _SetOpenCloseCompartment 定义处的说明。
-    _SetOpenCloseCompartment(TRUE);
+    // compartment 如实反映中英模式（值语义），见 _SetOpenCloseCompartment 定义处的说明。
+    _SetOpenCloseCompartment(_bChineseMode);
     _SetConversionMode(_bChineseMode);
 
     if (_pLangBarItemButton != nullptr)

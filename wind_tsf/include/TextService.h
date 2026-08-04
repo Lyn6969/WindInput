@@ -263,11 +263,6 @@ public:
     // Windows 输入系统会在 CapsLock 状态变化后联动写 OPENCLOSE compartment；
     // OnCompartmentChange 据此时间戳抑制该联动噪声，防止被误判为用户模式切换。
     void NoteCapsLockKeyActivity() { _lastCapsKeyTick = GetTickCount64(); }
-    // 记录 OnTestKeyDown 识别出 Ctrl+Space 的时刻。这是 OPENCLOSE compartment 变化
-    // 中「用户切换请求」与「宿主状态请求」的唯一可靠区分依据——两者写入的值都是 0，
-    // compartment 本身分不出来（我们始终把它拉回 1，系统 toggle 只能得到 0，
-    // 宿主 ImmSetOpenStatus(FALSE) 也是 0）。实测 intercept 到 OnChange 仅隔 1ms。
-    void NoteCtrlSpaceIntercept() { _lastCtrlSpaceTick = GetTickCount64(); }
     // 当前实例是否持有输入焦点（OnSetFocus 最后一次收到非 null 的 pDocMgrFocus）。
     // 用于服务重启时避免对无焦点实例触发工具栏显示。
     BOOL HasFocus() const { return _hasFocus; }
@@ -378,7 +373,24 @@ private:
     // 让前台应用拿不到 WM_HOTKEY，反而让残留的后台进程吃掉。
     // 必须把所有 RegisterHotKey 与 thread focus 绑定：只有获得 thread focus 的
     // IME 实例才能注册，失去时立即全部卸载。
+    // 本应用是否持有 TSF 线程焦点。**权威来源只有 ITfThreadFocusSink**
+    // （OnSetThreadFocus / OnKillThreadFocus），外加 _InitHotkeyWindow 里的初始种子
+    // （TSF 只在 transition 时回调，激活时已在前台的场景收不到通知）。
+    // 用途：过滤 compartment 变化噪声——判断「这次 OPENCLOSE/CONVERSION 变化是不是
+    // 本应用前台时发生的」。**不要**用 GetForegroundWindow 的 pid 去纠正它，见
+    // _isProcessForeground 的说明。
     BOOL  _hasThreadFocus;
+    // 本**进程**是否是前台窗口所属进程（GetForegroundWindow 的 pid == 自己）。
+    // 仅用于热键注册门卫：多个 IME 实例争抢同一组全局热键会引发
+    // ERROR_HOTKEY_ALREADY_REGISTERED(1409)，只有真正拥有前台窗口的那个进程该注册。
+    //
+    // 与 _hasThreadFocus 必须分开的原因（2026-08-04 DBX/WebView 实测）：多进程宿主里
+    // 前台窗口属于渲染进程、TSF 却加载在另一个进程里，两者 pid 不同。此时
+    //   本进程是前台进程？ 否 → 不该抢热键          （本字段 = FALSE，正确）
+    //   本应用在前台？     是 → compartment 变化是真实用户操作（_hasThreadFocus = TRUE，正确）
+    // 同一场景两个判据期望相反。此前共用一个变量，自检定时器按前者把它清零，
+    // 导致 OnChange 的 !_hasThreadFocus 早退恒成立、该宿主里中英切换完全失效。
+    BOOL  _isProcessForeground;
 
     BOOL _InitHotkeyWindow();         // 创建窗口类 + 隐藏窗口
     void _UninitHotkeyWindow();       // 反向清理
@@ -533,11 +545,6 @@ private:
     DWORD _dwOpenCloseSinkCookie;
     BOOL _bInCompartmentChange;  // Guard against re-entrant OnChange
     ULONGLONG _lastCapsKeyTick;  // 最近一次 CapsLock 按键活动（GetTickCount64），见 NoteCapsLockKeyActivity
-    ULONGLONG _lastCtrlSpaceTick;  // 最近一次 Ctrl+Space 拦截时刻，见 NoteCtrlSpaceIntercept
-    // 取出并立即清零 _lastCtrlSpaceTick：一次拦截只允许兑换一次 toggle 语义。
-    // 用一次性消费而非纯时间窗，是因为纯窗口会被「按完 Ctrl+Space 立刻按 ESC」复用——
-    // 那一下 ESC 本该走值语义，却会借到上一次的切换语义。
-    BOOL _ConsumeCtrlSpaceTick();
 
     // 最近一次 ActivateEx 的时刻。激活后系统会写 compartment 做初始化同步，那不是用户
     // 操作——实测 ActivateEx 后 ~96ms 就有一次 CONVERSION 变化。焦点守卫改用
