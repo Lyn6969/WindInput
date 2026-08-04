@@ -546,6 +546,10 @@ pub(crate) struct State {
     pub(crate) caret_source: i32,
     /// 菜单是否打开（打开时键盘事件转发给菜单窗口；UI 自管导航）
     pub(crate) menu_open: bool,
+    /// 菜单打开时刻，供焦点路径的关闭守卫用（见 `menu_close_on_focus_change`）。
+    /// **必须与 `menu_open = true` 成对写入**：漏写会让守卫读到上一次打开的时间戳，
+    /// 于是刚弹出的菜单被一条迟到的焦点事件当场关掉。
+    pub(crate) menu_opened_at: Option<std::time::Instant>,
     /// 菜单目标候选（页内下标 + 文本），供候选词条操作/复制
     pub(crate) menu_target_page_local: usize,
     pub(crate) menu_target_text: String,
@@ -1434,6 +1438,7 @@ impl Coordinator {
                 caret_height: 0,
                 caret_source: wind_ipc::protocol::caret_source::UNKNOWN,
                 menu_open: false,
+                menu_opened_at: None,
                 menu_target_page_local: 0,
                 menu_target_text: String::new(),
                 add_word_active: false,
@@ -5805,6 +5810,10 @@ impl MessageHandler for Coordinator {
             data.client_token,
             data.input_scope_mask
         );
+        // 切进新的可编辑上下文同样是「用户动了别处」。⚠️focus_gained **没有任何去重**
+        // （每次 DocMgr 获焦都发一条，Excel 同一 DocMgr 6ms 抖动、VSCode 一次切换 5 次都会
+        // 各发一条），全靠 menu_close_on_focus_change 的守卫期挡住刚弹出的菜单。
+        self.menu_close_on_focus_change("focus_gained");
         // 焦点 caret 走与同步段同一个入口。**不要在这里直写 `state.caret_*`**——重型段晚于
         // 同步段执行，直写会把同步段的 height 守卫与 caret_use_top 变换整个覆盖掉。
         // 详见 apply_focus_caret 的文档注释。
@@ -5921,6 +5930,9 @@ impl MessageHandler for Coordinator {
             client_token,
             reason
         );
+        // 关菜单**先于** stale 判定与 reason 分流：菜单的生命周期与输入态无关，
+        // 陈旧失焦/噪声层失焦同样证明用户动了别处。详见 menu_close_on_focus_change。
+        self.menu_close_on_focus_change("focus_lost");
         if self.is_stale_focus_event(client_token, "handle_focus_lost") {
             return;
         }
@@ -5954,7 +5966,12 @@ impl MessageHandler for Coordinator {
                 s.input_buffer.clear();
                 s.preedit.clear();
                 s.candidates.clear();
-                s.menu_open = false; // 复位菜单态，否则下一个键被 forward_menu_key 吞掉
+                // 复位菜单态，否则下一个键被 forward_menu_key 吞掉。
+                // **本处刻意不受 MENU_FOCUS_GUARD 保护**：下面的 notify_ui_hide 会经
+                // HideCandidates 无条件隐藏菜单窗口，此时若把 menu_open 留成 true，就成了
+                // 「窗口没了、键还被吞」的状态不一致——比守卫失效更糟。
+                s.menu_open = false;
+                s.menu_opened_at = None;
                 self.reset_exclusive_modes(&mut s); // 失焦丢弃临时英文/拼音/快捷输入残留
             }
         }
@@ -6075,6 +6092,9 @@ impl MessageHandler for Coordinator {
 
     fn handle_ime_deactivated(&self, client_token: u64) {
         tracing::debug!("handle_ime_deactivated: token={:#x}", client_token);
+        // 同 handle_focus_lost：关菜单先于 stale 判定。下面清 menu_open 的那段仍保留
+        // （非陈旧路径的完整清理），两处幂等叠加无副作用。
+        self.menu_close_on_focus_change("ime_deactivated");
         // 与 focus_lost 同源的乱序风险：切走本输入法时旧宿主的 IME_DEACTIVATED 同样可能
         // 晚于新宿主的 focus_gained 到达（两者都是 fire-and-forget 异步写）。
         if self.is_stale_focus_event(client_token, "handle_ime_deactivated") {
@@ -6090,6 +6110,7 @@ impl MessageHandler for Coordinator {
             s.preedit.clear();
             s.candidates.clear();
             s.menu_open = false;
+            s.menu_opened_at = None;
             self.reset_exclusive_modes(&mut s); // 切走本输入法时丢弃独占模式残留
         }
         self.notify_toolbar_async(); // 非激活态 → notify_toolbar 内部下发 HideToolbar（异步）
@@ -8826,7 +8847,11 @@ mod focus_ownership_tests {
         );
     }
 
-    /// 陈旧失焦被丢弃时，四种 reason 都不得改动任何状态。
+    /// 陈旧失焦被丢弃时，四种 reason 都不得改动任何**输入/激活**状态。
+    ///
+    /// ⚠️ 菜单是刻意的例外（见 `stale_focus_lost_still_closes_menu`）：关菜单在 stale 判定
+    /// 之前执行，因为「这条失焦不该动激活态」不等于「没发生焦点变动」。往本测试里补断言时
+    /// 别顺手把菜单也算进"任何状态"。
     #[test]
     fn stale_focus_lost_is_inert_for_all_reasons() {
         for reason in [
@@ -8894,6 +8919,99 @@ mod focus_ownership_tests {
         let c = activated(NOTEPAD);
         c.handle_ime_deactivated(NOTEPAD);
         assert!(!c.state.lock().unwrap().ime_active);
+    }
+
+    // ———————————————— 焦点变化关闭菜单 ————————————————
+    //
+    // 菜单是模态 UI，任何焦点变动都该终结它；而输入态清理必须保守。此前两者绑在同一个
+    // `clears_input` 上，于是 CtxLost 豁免 / 陈旧失焦丢弃这两道为保护输入态而设的闸门
+    // 顺带把关菜单也吞了——表现为「切走窗口菜单还挂着」。以下几条守住解耦后的语义。
+
+    /// 构造「菜单已打开 `age` 时长」的状态。
+    /// `checked_sub` 失败（机器刚启动不足 `age`）时落到 `None`，守卫按"无时间戳=不豁免"
+    /// 处理，与本组测试期望的方向一致，故无需特殊处理。
+    fn open_menu(c: &Coordinator, age: std::time::Duration) {
+        let mut s = c.state.lock().unwrap();
+        s.menu_open = true;
+        s.menu_opened_at = std::time::Instant::now().checked_sub(age);
+    }
+
+    /// 打开够久的菜单
+    fn open_menu_settled(c: &Coordinator) {
+        open_menu(c, crate::handle_menu::MENU_FOCUS_GUARD * 4);
+    }
+
+    /// `CtxLost` 是本组的关键用例：它**不清输入态**（Excel 首字符防线），但**必须关菜单**。
+    /// 两者从此各行其是——这正是本次解耦要证明的事。
+    #[test]
+    fn ctx_lost_closes_menu_but_keeps_input() {
+        let c = activated(NOTEPAD);
+        c.state.lock().unwrap().input_buffer.push_str("nihao");
+        open_menu_settled(&c);
+
+        c.handle_focus_lost(NOTEPAD, FocusLostReason::CtxLost);
+
+        let s = c.state.lock().unwrap();
+        assert!(!s.menu_open, "CtxLost 必须关菜单（它是一次真实的焦点变动）");
+        assert_eq!(
+            s.input_buffer, "nihao",
+            "CtxLost 仍绝不可清输入态，否则复发 Excel 首字符丢失"
+        );
+    }
+
+    /// 陈旧失焦同样要关菜单：判成 stale 只说明「这条失焦不该动激活态」，
+    /// 不说明「没发生焦点变动」。跨宿主切换时旧宿主的失焦恒被判 stale，
+    /// 若跟着一起丢弃，切走应用后菜单就永远挂着。
+    #[test]
+    fn stale_focus_lost_still_closes_menu() {
+        let c = activated(NOTEPAD);
+        open_menu_settled(&c);
+
+        c.handle_focus_lost(TERMINAL, FocusLostReason::Thread);
+
+        let s = c.state.lock().unwrap();
+        assert!(!s.menu_open, "陈旧失焦也要关菜单");
+        assert!(s.ime_active, "但仍不得清激活态（工具栏闪隐的老缺陷）");
+    }
+
+    /// 切进新的可编辑上下文也算外部动作。
+    #[test]
+    fn focus_gained_closes_menu() {
+        let c = activated(NOTEPAD);
+        open_menu_settled(&c);
+        c.handle_focus_gained(&FocusData {
+            x: 10,
+            y: 20,
+            height: 16,
+            composition_start_x: 0,
+            composition_start_y: 0,
+            client_token: NOTEPAD,
+            input_scope_mask: 0,
+            disabled: false,
+            reason: 0,
+            caret_source: wind_ipc::protocol::caret_source::TSF_SELECTION,
+        });
+        assert!(!c.state.lock().unwrap().menu_open);
+    }
+
+    /// 守卫期：菜单刚弹出时到达的焦点事件是「打开菜单这个动作本身」的尾迹，不是用户切走。
+    /// 跨宿主切换时旧宿主 focus_lost 实测晚约 100ms，从任务栏语言栏图标点开菜单正落在这个
+    /// 窗口里——不豁免就会「菜单弹出即消失」。
+    ///
+    /// 用 `CtxLost` 而非 `Thread`：后者走 `clears_input` 分支，那里会无条件复位菜单态
+    /// （因为 `notify_ui_hide` 已把窗口隐藏，留 `menu_open=true` 反而状态不一致），
+    /// 刻意不受守卫保护，拿它测守卫会测错对象。
+    #[test]
+    fn menu_survives_focus_event_within_guard() {
+        let c = activated(NOTEPAD);
+        open_menu(&c, std::time::Duration::from_millis(0));
+
+        c.handle_focus_lost(NOTEPAD, FocusLostReason::CtxLost);
+
+        assert!(
+            c.state.lock().unwrap().menu_open,
+            "守卫期内的焦点事件不得关掉刚弹出的菜单"
+        );
     }
 
     /// 同一宿主内多个 DocMgr 共用一个 token，一律放行——那层抖动（doc_changed 先发

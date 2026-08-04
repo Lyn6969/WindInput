@@ -11,6 +11,13 @@ use wind_keys::keymap;
 use wind_ui::manager::{CandidateOp, MenuCmd, MenuKind, ToolbarAction, UiCommand};
 use wind_ui::toolbar::ToolbarState;
 
+/// 菜单打开后的焦点事件豁免期，见 [`Coordinator::menu_close_on_focus_change`]。
+///
+/// 取 250ms 的依据：下界须盖住跨宿主切换时旧宿主 focus_lost 迟到的约 100ms（实测
+/// 97~111ms，见 `project_toolbar_flash_stale_focus_lost` 的时序），上界须远短于用户
+/// 「点开菜单 → 切走窗口」的最短间隔（看清菜单内容至少几百毫秒）。
+pub(crate) const MENU_FOCUS_GUARD: std::time::Duration = std::time::Duration::from_millis(250);
+
 /// 把 (键, 值) 列表拼成设置程序的附加参数串（`--k=v`，空格分隔）。值为空的项跳过
 /// ——设置端把"传了空串"和"没传"当同一回事，少一个参数更省事。
 ///
@@ -320,12 +327,7 @@ impl Coordinator {
             ),
             M::leaf("截图此窗口", cmd(MenuCmd::StatusScreenshot), true, false),
         ];
-        {
-            let mut s = self.state.lock().unwrap_or_else(|e| e.into_inner());
-            s.menu_open = true;
-            s.menu_target_page_local = 0;
-            s.menu_target_text = String::new();
-        }
+        self.mark_menu_open(0, String::new());
         let _ = self.ui_tx.send(UiCommand::ShowCandidateMenu {
             items,
             x,
@@ -347,12 +349,7 @@ impl Coordinator {
             M::leaf("复制内容", cmd(MenuCmd::TooltipCopy), true, false),
             M::leaf("截图此窗口", cmd(MenuCmd::TooltipScreenshot), true, false),
         ];
-        {
-            let mut s = self.state.lock().unwrap_or_else(|e| e.into_inner());
-            s.menu_open = true;
-            s.menu_target_page_local = 0;
-            s.menu_target_text = String::new();
-        }
+        self.mark_menu_open(0, String::new());
         let _ = self.ui_tx.send(UiCommand::ShowCandidateMenu {
             items,
             x,
@@ -646,12 +643,7 @@ impl Coordinator {
     /// y_bottom 为工具栏底边，上方空间不足时改为从 y_bottom 向下弹出。
     pub(crate) fn show_main_menu(&self, x: i32, y: i32, y_bottom: i32, above: bool) {
         let items = self.build_main_menu_items();
-        {
-            let mut s = self.state.lock().unwrap_or_else(|e| e.into_inner());
-            s.menu_open = true;
-            s.menu_target_page_local = 0;
-            s.menu_target_text = String::new();
-        }
+        self.mark_menu_open(0, String::new());
         let _ = self.ui_tx.send(UiCommand::ShowCandidateMenu {
             items,
             x,
@@ -958,9 +950,68 @@ impl Coordinator {
         let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
         if state.menu_open {
             state.menu_open = false;
+            state.menu_opened_at = None;
             drop(state);
             let _ = self.ui_tx.send(UiCommand::HideMenu);
         }
+    }
+
+    /// 菜单打开的状态收口：所有 `show_*_menu` 都必须经此置位。
+    ///
+    /// 单独抽出来是因为 `menu_open` 与 `menu_opened_at` **必须成对写入**，而置位点有四个
+    /// （主菜单 / 候选右键 / 状态气泡 / tooltip）。靠"记得两行都写"在第五个入口出现时必然
+    /// 失守，且失守的表现是「菜单偶尔一弹就没」这种极难复现的时序问题。
+    fn mark_menu_open(&self, page_local: usize, text: String) {
+        let mut s = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        s.menu_open = true;
+        s.menu_opened_at = Some(std::time::Instant::now());
+        s.menu_target_page_local = page_local;
+        s.menu_target_text = text;
+    }
+
+    /// 焦点发生变化时关闭菜单（焦点路径专用，与 `menu_close` 的区别只在守卫与日志）。
+    ///
+    /// 菜单是**模态 UI**，语义是「任何外部动作都该终结它」；而输入态清理是**破坏性操作**，
+    /// 语义是「宁可晚做也不能误做」。此前关菜单寄生在 `FocusLostReason::clears_input` 上，
+    /// 于是被按后者的标准整定——`CtxLost` 豁免、陈旧失焦整条丢弃、DLL 侧翻转沿去重，三道
+    /// 为保护输入态而设的闸门各自都会顺带把关菜单一并吞掉。故本函数自成一路：
+    ///
+    /// - **不看 reason**：关菜单幂等且非破坏性，放在 DocMgr 噪声层是安全的（同理于
+    ///   `has_edit_context` 只翻可见性标志——真正不能放在噪声层的是清 buffer）。
+    /// - **须在 `is_stale_focus_event` 之前调用**：「这条失焦不该动激活态」不等于「没发生
+    ///   焦点变动」；对菜单而言，陈旧失焦同样证明用户动了别处。
+    ///
+    /// ⚠️ 覆盖面有限，**不能替代 UI 层的"点菜单外面就关"**：焦点通路只在宿主真的换了
+    /// DocMgr 时才响。同一个文本框内点一下（焦点没变）、或在 explorer 里从桌面点到任务栏
+    /// （两侧都无可编辑上下文）都不会产生任何 TSF 事件，那些情形本函数无能为力。
+    ///
+    /// ⚠️ 守卫**只保护本函数这条路**。`handle_focus_lost` 的 `clears_input` 分支照旧无条件
+    /// 关菜单（那里 `notify_ui_hide` 会连带隐藏菜单窗口，拦不住也不该拦），故「菜单刚弹出
+    /// 就被一条未被判陈旧的 `Thread` 失焦关掉」这个既有行为不变。
+    pub(crate) fn menu_close_on_focus_change(&self, why: &str) {
+        {
+            let s = self.state.lock().unwrap_or_else(|e| e.into_inner());
+            if !s.menu_open {
+                return;
+            }
+            // 守卫期内的焦点事件多半是「打开菜单这个动作本身」的尾迹，而非用户切走：
+            // 跨宿主切换时旧宿主的 focus_lost 实测晚约 100ms 到达（97~111ms），从任务栏
+            // 语言栏图标点开菜单正好落在这个窗口里，不设守卫会表现为「菜单弹出即消失」。
+            if let Some(at) = s.menu_opened_at
+                && at.elapsed() < MENU_FOCUS_GUARD
+            {
+                tracing::debug!(
+                    "menu_close_on_focus_change({why}): 距菜单打开 {:?} < 守卫期，忽略",
+                    at.elapsed()
+                );
+                return;
+            }
+        }
+        tracing::debug!("menu_close_on_focus_change({why}): 关闭菜单");
+        self.menu_close();
+        // 与 UiEvent::MenuClose 同处置：焦点路径没有后续动作派发，可立即解除 tooltip /
+        // 状态气泡的隐藏抑制（`menu_action` 那条路必须延后，理由见 clear_tooltip_menu_flag）。
+        self.clear_tooltip_menu_flag();
     }
 
     /// 解除 Tooltip 的「菜单打开中」隐藏抑制。
@@ -1056,12 +1107,7 @@ impl Coordinator {
                 M::leaf("复制", MenuKind::Copy, true, false),
             ]
         };
-        {
-            let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
-            state.menu_open = true;
-            state.menu_target_page_local = page_local;
-            state.menu_target_text = word;
-        }
+        self.mark_menu_open(page_local, word);
         // 候选右键菜单在光标处向下弹出（above=false，y_bottom 不使用）。
         let _ = self.ui_tx.send(UiCommand::ShowCandidateMenu {
             items,
