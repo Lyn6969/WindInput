@@ -437,6 +437,12 @@ pub struct CodetableGlobal {
 impl Default for CodetableGlobal {
     fn default() -> Self {
         Self {
+            // ⚠️ 这是**结构体零值**，不是「出厂默认」——出厂值在 `data/config.toml`（L2 层，
+            // 恒覆盖本处）。大量集成测试以 `Config::default()` 构造，把这些拨成 true 会连带
+            // 改变它们的输入行为（顶码/标点上屏都会生效）。
+            //
+            // 特殊方案的折叠基线**另有定义**，见 `EngineManager::SPECIAL_SCHEMA_BASELINE`——
+            // 那是「特殊方案该长什么样」，与本处的「结构体零值」不是同一件事，别合并。
             top_code_commit: false,
             clear_on_empty_max: false,
             auto_commit_at_full: false,

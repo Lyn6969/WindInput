@@ -1789,9 +1789,31 @@ impl EngineManager {
         global: &wind_config::CodetableGlobal,
     ) -> wind_config::CodetableGlobal {
         if schema.map(|s| s.schema.hidden).unwrap_or(false) {
-            wind_config::CodetableGlobal::default()
+            Self::special_schema_baseline()
         } else {
             global.clone()
+        }
+    }
+
+    /// 特殊方案的折叠基线。
+    ///
+    /// **不是 `CodetableGlobal::default()`**——那是结构体零值，大量集成测试以
+    /// `Config::default()` 构造并依赖它（顶码/标点上屏都关着），拿它当特殊方案基线会让
+    /// 快符默认不顶码、标点不上屏、精确匹配下不补全，而这些恰是用户预期存在的行为。
+    /// 两个概念共用一处定义，改哪边都会伤到另一边。
+    ///
+    /// 取值：与 `data/config.toml` 的出厂值一致，**除 `z_key_repeat`**——z 键重复上屏
+    /// 对小符号表没有意义（`z` 在那里多半是个正经编码）。
+    ///
+    /// 「不继承全局」的意义是**用户改了全局之后特殊方案不跟着变**，而不是让它们的出厂
+    /// 表现与普通方案不同。
+    fn special_schema_baseline() -> wind_config::CodetableGlobal {
+        wind_config::CodetableGlobal {
+            top_code_commit: true,
+            punct_commit: true,
+            single_code_complete: true,
+            z_key_repeat: false,
+            ..Default::default()
         }
     }
 
@@ -3397,8 +3419,10 @@ mod tests {
             .unwrap();
         }
 
-        // 全局把三个开关都拨到与内置默认相反的一侧，这样「有没有继承」一眼可辨。
-        let def = wind_config::CodetableGlobal::default();
+        // 基准是**特殊方案基线**，不是 CodetableGlobal::default()——后者是结构体零值，
+        // 与「特殊方案该长什么样」是两件事（见 special_schema_baseline 的文档）。
+        let def = EngineManager::special_schema_baseline();
+        // 全局把三个开关都拨到与该基线相反的一侧，这样「有没有继承」一眼可辨。
         let global = wind_config::CodetableGlobal {
             single_code_input: !def.single_code_input,
             z_key_repeat: !def.z_key_repeat,
