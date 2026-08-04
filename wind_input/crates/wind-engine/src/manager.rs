@@ -1745,7 +1745,29 @@ impl EngineManager {
         override_dir: Option<&Path>,
     ) -> wind_config::CodetableGlobal {
         let schema = Self::read_schema(schema_id, data_dir, override_dir);
-        global.resolved(schema.as_ref().map(|s| &s.engine.codetable))
+        let base = Self::codetable_baseline(schema.as_ref(), global);
+        base.resolved(schema.as_ref().map(|s| &s.engine.codetable))
+    }
+
+    /// 折叠方案行为时用哪份基线：普通方案用全局 `schema.codetable`，**特殊方案用内置默认值**。
+    ///
+    /// 特殊方案（`[schema].hidden`：快符、生僻字表这类）与主码表的性质完全不同——它们是
+    /// 几十条的小符号表，而全局基线是按五笔这种数万条的全码表调的。继承的后果是用户改五笔的
+    /// 「精确匹配」，快符跟着变，且改的人根本意识不到自己动了另一个表。
+    ///
+    /// 判据用 `hidden` 而非「是否被 `special_modes` 引用」：后者在这一层拿不到
+    /// （`build_engine` 没有 `config.schema.special_modes`），且 `hidden` 正是设置页据以
+    /// 分区的同一个标志——两处判据一致比各自发明一套更不容易漂。英文方案虽然也 hidden，
+    /// 但走 english 分支、根本不读码表配置，不受影响。
+    fn codetable_baseline(
+        schema: Option<&Schema>,
+        global: &wind_config::CodetableGlobal,
+    ) -> wind_config::CodetableGlobal {
+        if schema.map(|s| s.schema.hidden).unwrap_or(false) {
+            wind_config::CodetableGlobal::default()
+        } else {
+            global.clone()
+        }
     }
 
     /// 拆字配置（`[engine.chaizi]`：db/font 路径 + DWrite 家族名）。来源方案与编码段
@@ -2216,9 +2238,13 @@ impl EngineManager {
             } else {
                 4
             };
-            // 上屏策略：全局 schema.codetable 基线 + 该方案 [engine.codetable] 行为折叠。
+            // 上屏策略：基线 + 该方案 [engine.codetable] 行为折叠。
             // schema 已在 read_schema 合并了 schema_overrides，此处直接取其 engine.codetable。
-            let eff = codetable_cfg.resolved(Some(&schema.engine.codetable));
+            // 基线按方案性质选（特殊方案用内置默认、不继承全局），见 codetable_baseline。
+            // ⚠️ 与 resolve_codetable 是**两个平行的折叠点**，基线判据必须一致——
+            // 一处改了另一处没改，会得到「引擎按 A 行为构建、协调器按 B 行为决策」。
+            let eff = Self::codetable_baseline(Some(&schema), codetable_cfg)
+                .resolved(Some(&schema.engine.codetable));
             let commit_opts = crate::codetable::CommitOptions {
                 auto_commit_at_full: eff.auto_commit_at_full,
                 auto_commit_min_len: eff.auto_commit_min_len,
@@ -3210,11 +3236,14 @@ mod tests {
         let base_dir = std::env::temp_dir().join("wind_eng_inline_data");
         let schemas = base_dir.join("schemas");
         std::fs::create_dir_all(&schemas).unwrap();
-        let mut f = std::fs::File::create(schemas.join("qsym.schema.toml")).unwrap();
+        let mut f = std::fs::File::create(schemas.join("wb_test.schema.toml")).unwrap();
         // 内联：自动上屏开、顶码关；z_key_repeat 不写 → 应回落全局。
+        // **不写 hidden**：回落全局是普通方案的语义，特殊方案另有一条
+        // （见 special_schema_does_not_inherit_global_codetable）。此处原用 qsym +
+        // hidden = true，两条语义撞在同一个用例里，特殊方案改为不继承后才暴露出来。
         write!(
             f,
-            "[schema]\nid = \"qsym\"\nhidden = true\n[engine]\ntype = \"codetable\"\n[engine.codetable]\nmax_code_length = 8\nauto_commit_at_full = true\ntop_code_commit = false\n"
+            "[schema]\nid = \"wb_test\"\n[engine]\ntype = \"codetable\"\n[engine.codetable]\nmax_code_length = 8\nauto_commit_at_full = true\ntop_code_commit = false\n"
         )
         .unwrap();
         drop(f);
@@ -3229,10 +3258,66 @@ mod tests {
         // override_dir 指向空目录：证明无 override 文件也能读到内联行为。
         let ov_dir = std::env::temp_dir().join("wind_eng_inline_empty_ov");
         let _ = std::fs::remove_dir_all(&ov_dir);
-        let eff = EngineManager::resolve_codetable("qsym", Some(&base_dir), &global, Some(&ov_dir));
+        let eff =
+            EngineManager::resolve_codetable("wb_test", Some(&base_dir), &global, Some(&ov_dir));
         assert!(eff.auto_commit_at_full, "内联 Some(true) 应覆盖全局 false");
         assert!(!eff.top_code_commit, "内联 Some(false) 应覆盖全局 true");
         assert!(eff.z_key_repeat, "内联未给的字段应回落全局 true");
+
+        let _ = std::fs::remove_dir_all(&base_dir);
+    }
+
+    /// 特殊方案（`[schema].hidden`）**不继承**全局 `schema.codetable`：没写的字段取内置默认，
+    /// 而不是主码表的设置。
+    ///
+    /// 快符是几十条的小符号表，全局基线是按五笔那种数万条全码表调的。继承的后果是用户改
+    /// 五笔的「精确匹配」，快符跟着变，而改的人根本意识不到自己动了另一个表。
+    #[test]
+    fn special_schema_does_not_inherit_global_codetable() {
+        use std::io::Write;
+        let base_dir = std::env::temp_dir().join("wind_eng_special_baseline");
+        let schemas = base_dir.join("schemas");
+        let _ = std::fs::remove_dir_all(&base_dir);
+        std::fs::create_dir_all(&schemas).unwrap();
+        // 两个方案，除 hidden 外**逐字相同**——差别只能来自 hidden 本身。
+        for (id, hidden) in [("sp_hidden", true), ("sp_normal", false)] {
+            let mut f = std::fs::File::create(schemas.join(format!("{id}.schema.toml"))).unwrap();
+            let h = if hidden { "hidden = true\n" } else { "" };
+            write!(
+                f,
+                "[schema]\nid = \"{id}\"\n{h}[engine]\ntype = \"codetable\"\n[engine.codetable]\nmax_code_length = 8\n"
+            )
+            .unwrap();
+        }
+
+        // 全局把三个开关都拨到与内置默认相反的一侧，这样「有没有继承」一眼可辨。
+        let def = wind_config::CodetableGlobal::default();
+        let global = wind_config::CodetableGlobal {
+            single_code_input: !def.single_code_input,
+            z_key_repeat: !def.z_key_repeat,
+            top_code_commit: !def.top_code_commit,
+            ..Default::default()
+        };
+        let ov = std::env::temp_dir().join("wind_eng_special_baseline_ov");
+        let _ = std::fs::remove_dir_all(&ov);
+
+        let sp = EngineManager::resolve_codetable("sp_hidden", Some(&base_dir), &global, Some(&ov));
+        assert_eq!(
+            sp.single_code_input, def.single_code_input,
+            "特殊方案不该继承全局的精确匹配"
+        );
+        assert_eq!(sp.z_key_repeat, def.z_key_repeat);
+        assert_eq!(sp.top_code_commit, def.top_code_commit);
+
+        // 反向对照：同样的文件去掉 hidden 就该继承——否则上面三条在「全局基线整个失效」
+        // 时也会通过。
+        let np = EngineManager::resolve_codetable("sp_normal", Some(&base_dir), &global, Some(&ov));
+        assert_eq!(
+            np.single_code_input, global.single_code_input,
+            "普通方案仍须继承全局"
+        );
+        assert_eq!(np.z_key_repeat, global.z_key_repeat);
+        assert_eq!(np.top_code_commit, global.top_code_commit);
 
         let _ = std::fs::remove_dir_all(&base_dir);
     }
