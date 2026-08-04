@@ -245,8 +245,12 @@ public:
     // Input mode control
     void ToggleInputMode();
     void SetInputMode(BOOL bChineseMode);  // Set mode from service response (no IPC)
-    void HandleCtrlSpaceToggle();          // Handle Ctrl+Space internally (bypasses system compartment toggle)
     BOOL IsChineseMode() { return _bChineseMode; }
+    // 读取 OPENCLOSE compartment 的**真实**当前值（0/1；读取失败返回 -1）。
+    // 诊断用：我们始终尝试把它拉回 1，但 _SetOpenCloseCompartment 不保证成功，
+    // 镜像态并不可信，只有回读才算数。调用含两次 COM，**热路径上必须先用
+    // CFileLogger::IsEnabled 门控**——日志宏的实参在调用点即求值，不会被级别短路。
+    LONG GetOpenCloseCompartmentValue();
     BOOL IsFullWidth() { return _bFullWidth; }
     BOOL IsKeyboardDisabled() { return _bKeyboardDisabled; }
     // 密码框强制英文抑制当前是否生效（**镜像** core 的 `apply_input_diag`：命中密码
@@ -259,6 +263,11 @@ public:
     // Windows 输入系统会在 CapsLock 状态变化后联动写 OPENCLOSE compartment；
     // OnCompartmentChange 据此时间戳抑制该联动噪声，防止被误判为用户模式切换。
     void NoteCapsLockKeyActivity() { _lastCapsKeyTick = GetTickCount64(); }
+    // 记录 OnTestKeyDown 识别出 Ctrl+Space 的时刻。这是 OPENCLOSE compartment 变化
+    // 中「用户切换请求」与「宿主状态请求」的唯一可靠区分依据——两者写入的值都是 0，
+    // compartment 本身分不出来（我们始终把它拉回 1，系统 toggle 只能得到 0，
+    // 宿主 ImmSetOpenStatus(FALSE) 也是 0）。实测 intercept 到 OnChange 仅隔 1ms。
+    void NoteCtrlSpaceIntercept() { _lastCtrlSpaceTick = GetTickCount64(); }
     // 当前实例是否持有输入焦点（OnSetFocus 最后一次收到非 null 的 pDocMgrFocus）。
     // 用于服务重启时避免对无焦点实例触发工具栏显示。
     BOOL HasFocus() const { return _hasFocus; }
@@ -524,6 +533,11 @@ private:
     DWORD _dwOpenCloseSinkCookie;
     BOOL _bInCompartmentChange;  // Guard against re-entrant OnChange
     ULONGLONG _lastCapsKeyTick;  // 最近一次 CapsLock 按键活动（GetTickCount64），见 NoteCapsLockKeyActivity
+    ULONGLONG _lastCtrlSpaceTick;  // 最近一次 Ctrl+Space 拦截时刻，见 NoteCtrlSpaceIntercept
+    // 取出并立即清零 _lastCtrlSpaceTick：一次拦截只允许兑换一次 toggle 语义。
+    // 用一次性消费而非纯时间窗，是因为纯窗口会被「按完 Ctrl+Space 立刻按 ESC」复用——
+    // 那一下 ESC 本该走值语义，却会借到上一次的切换语义。
+    BOOL _ConsumeCtrlSpaceTick();
 
     // 最近一次 ActivateEx 的时刻。激活后系统会写 compartment 做初始化同步，那不是用户
     // 操作——实测 ActivateEx 后 ~96ms 就有一次 CONVERSION 变化。焦点守卫改用

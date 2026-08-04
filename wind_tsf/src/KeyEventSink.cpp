@@ -488,14 +488,22 @@ STDAPI CKeyEventSink::OnTestKeyDown(ITfContext* pContext, WPARAM wParam, LPARAM 
         return S_OK;
     }
 
-    // Intercept Ctrl+Space before the system can toggle the OPENCLOSE compartment.
-    // If we let the system handle it, it sets compartment=0, we re-open to 1, then the
-    // system's internal toggle state desyncs: next press tries to set 1 (already 1) ->
-    // no notification -> every-other-press bug. By eating it here, the compartment stays
-    // at 1 permanently and we handle the toggle ourselves in OnKeyDown.
+    // Ctrl+Space（系统 IME 中英切换热键）：这里**打标记**，真正的模式切换在
+    // CTextService::OnChange 的 OPENCLOSE 分支完成。
+    //
+    // 曾经的设计是「在这里吃掉键、阻止系统翻 compartment、自己在 OnKeyDown 切换」，
+    // 但实测证明拦不住：pfEaten=TRUE 对系统 IME 热键无效——msctf 在 keystroke sink
+    // 之下就消费了这个键，compartment 照样在同一毫秒被翻成 0，且**不再回调 OnKeyDown**。
+    // 日志佐证：ctrl_space_intercept 命中 4 次，OnKeyDown 侧的处理 0 次。那条从未执行
+    // 的路径已删除（它还是个隐患：一旦哪天 OnKeyDown 真被调用，就会与本路径双切换，
+    // Ctrl+Space 当场失灵）。
+    //
+    // 所以这里唯一的职责是留下时间戳：OPENCLOSE 变化时，「用户切换请求」与「宿主
+    // 状态请求」写入的值都是 0，compartment 本身无从区分，只有这个标记能分开。
     if (wParam == VK_SPACE && (modifiers & KEYMOD_CTRL) && !(modifiers & (KEYMOD_ALT | KEYMOD_SHIFT)))
     {
         _CancelPendingToggle(wParam, L"ctrl_space_intercept");
+        _pTextService->NoteCtrlSpaceIntercept();
         *pfEaten = TRUE;
         _LogKeyDecision(L"test_down", _pTextService->GetFocusSessionId(), wParam, modifiers, HotkeyType::None,
                         _pTextService->IsChineseMode(), _pTextService->HasActiveComposition(), _hasCandidates,
@@ -946,17 +954,11 @@ STDAPI CKeyEventSink::OnKeyDown(ITfContext* pContext, WPARAM wParam, LPARAM lPar
         return S_OK;
     }
 
-    // Ctrl+Space: handle mode toggle ourselves to keep compartment stable.
-    // OnTestKeyDown already ate this key, so we own it completely here.
-    if (wParam == VK_SPACE && (modifiers & KEYMOD_CTRL) && !(modifiers & (KEYMOD_ALT | KEYMOD_SHIFT)))
-    {
-        _pTextService->HandleCtrlSpaceToggle();
-        *pfEaten = TRUE;
-        _LogKeyDecision(L"down", _pTextService->GetFocusSessionId(), wParam, modifiers, HotkeyType::None,
-                        _pTextService->IsChineseMode(), _pTextService->HasActiveComposition(), _hasCandidates,
-                        _pTextService->HasActiveComposition() || _hasCandidates, TRUE, L"ctrl_space_toggle");
-        return S_OK;
-    }
+    // 此处原有一个 Ctrl+Space 分支（HandleCtrlSpaceToggle），已删除：实测 TSF 从不为
+    // 该键调用 OnKeyDown——系统 IME 热键在 keystroke sink 之下就被消费了，pfEaten 无效。
+    // 模式切换现由 OPENCLOSE compartment 回调按 OnTestKeyDown 留下的标记完成，
+    // 见 KeyEventSink 的 ctrl_space_intercept 与 CTextService::OnChange。
+    // 若在此重新引入按键侧切换，必须同时让 OnChange 停止处理，否则会双切换相互抵消。
 
     // Policy 早期闸门：Chrome / QQ 等宿主会无视 OnTestKeyDown 的 pfEaten=FALSE 仍调用
     // OnKeyDown。这里对不满足 policy 的 chineseOnly / session 热键直接 return FALSE，
@@ -2694,8 +2696,14 @@ void CKeyEventSink::_RecordEnglishKeyTrace(WPARAM wParam, uint32_t modifiers)
         return;
 
     _englishStats.StartIfIdle();
-    WIND_LOG_DEBUG_FMT(L"EnglishStats counted from key trace: vk=0x%02X total=%u shouldReport=%d\n",
-        (uint32_t)wParam, _englishStats.Total(), _englishStats.ShouldReport() ? 1 : 0);
+    // openclose 是回读的**真实** compartment 值，用于验证「英文态收键是否依赖 compartment=1」。
+    // 门控不可省：日志宏的实参在调用点即求值，不门控就等于在每个英文字符上做两次 COM 调用。
+    if (CFileLogger::Instance().IsEnabled(CFileLogger::LogLevel::Debug))
+    {
+        WIND_LOG_DEBUG_FMT(L"EnglishStats counted from key trace: vk=0x%02X total=%u shouldReport=%d openclose=%d\n",
+            (uint32_t)wParam, _englishStats.Total(), _englishStats.ShouldReport() ? 1 : 0,
+            _pTextService->GetOpenCloseCompartmentValue());
+    }
 
     if (_englishStats.ShouldReport())
         _ReportEnglishStats();

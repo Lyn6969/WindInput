@@ -874,6 +874,7 @@ CTextService::CTextService()
     , _bChineseMode(TRUE)
     , _bFullWidth(FALSE)
     , _lastCapsKeyTick(0)
+    , _lastCtrlSpaceTick(0)
     , _lastActivateTick(0)
     , _focusSessionId(0)
     , _hasFocus(FALSE)
@@ -2452,7 +2453,7 @@ void CTextService::_SyncStateFromResponse(const ServiceResponse& response)
     _SetChineseMode(response.IsChineseMode());
     _bFullWidth = response.IsFullWidth();
 
-    // Keep compartment always OPEN so TSF calls OnTestKeyDown even in English mode.
+    // 保持 compartment 恒为 OPEN，理由见 _SetOpenCloseCompartment 定义处的说明。
     _SetOpenCloseCompartment(TRUE);
     // Sync真实中英文模式到 INPUTMODE_CONVERSION compartment（供 KBLSwitch / 任务栏读取）
     _SetConversionMode(_bChineseMode);
@@ -2703,6 +2704,46 @@ void CTextService::_UninitOpenCloseCompartment()
     WIND_LOG_DEBUG(L"Compartment OPENCLOSE sink unadvised\n");
 }
 
+LONG CTextService::GetOpenCloseCompartmentValue()
+{
+    if (_pThreadMgr == nullptr)
+        return -1;
+
+    ITfCompartmentMgr* pCompMgr = nullptr;
+    if (FAILED(_pThreadMgr->QueryInterface(IID_ITfCompartmentMgr, (void**)&pCompMgr)) || pCompMgr == nullptr)
+        return -1;
+
+    ITfCompartment* pCompartment = nullptr;
+    HRESULT hr = pCompMgr->GetCompartment(GUID_COMPARTMENT_KEYBOARD_OPENCLOSE, &pCompartment);
+    pCompMgr->Release();
+    if (FAILED(hr) || pCompartment == nullptr)
+        return -1;
+
+    VARIANT var;
+    VariantInit(&var);
+    hr = pCompartment->GetValue(&var);
+    pCompartment->Release();
+
+    if (FAILED(hr) || var.vt != VT_I4)
+        return -1;
+    return var.lVal;
+}
+
+// 把 OPENCLOSE compartment 钉回 OPEN(1)。**这是一条不可随意拆除的不变量**，
+// 但它真正的理由不是长期以来注释里写的那个：
+//
+//   ✗ 旧说法「必须钉死 1，否则英文态收不到 OnTestKeyDown（英文统计/自动配对失效）」
+//     —— 2026-08-04 受控实验证伪：抑制全部写入后 compartment 长期停在 0，
+//     英文统计照常计数（openclose=0 实测 23 次）、字母正常上屏、中文候选正常。
+//     TSF 在 compartment=0 时依然回调 OnTestKeyDown。
+//
+//   ✓ 真实理由：保证**系统 IME 热键的 toggle 恒产出 bOpen=0**。
+//     系统热键（本机绑在 Ctrl 单键上，默认多为 Ctrl+Space）靠取反 compartment 表达
+//     「切换」。只要我们始终把它拉回 1，每次按下就必然观测到 0，OnChange 里
+//     「忽略 bOpen=1」那条规则才不会挡住切换。一旦不再拉回，compartment 自由翻转
+//     1↔0，落到 1 的那次会被忽略 ⇒ 中英切换时灵时不灵（实验版已复现）。
+//
+// 拆除前请先枚举它实际影响了什么——证伪公开理由不等于可以拆掉机制。
 BOOL CTextService::_SetOpenCloseCompartment(BOOL bOpen)
 {
     if (_pThreadMgr == nullptr)
@@ -3001,19 +3042,63 @@ STDAPI CTextService::OnChange(REFGUID rguid)
         WIND_LOG_INFO(L"Compartment OPENCLOSE changed within CapsLock window but Ctrl held -> treat as user toggle\n");
     }
 
-    // The system alternates compartment between 0 and 1 each Ctrl+Space press.
-    // We always re-open to 1 after handling, but _SetOpenCloseCompartment may fail
-    // inside OnChange (TSF reentrancy), leaving compartment at 0. Either way the
-    // system fires bOpen=TRUE on the next press and bOpen=FALSE on the one after.
-    // We must handle BOTH directions as mode toggle events.
+    // 本路径要区分两类语义完全不同、而写入值可能完全相同的请求：
     //
-    // Guard: _bInCompartmentChange is set TRUE before we call _SetOpenCloseCompartment(TRUE),
-    // preventing a synchronous re-entrant OnChange from causing a spurious extra toggle.
+    //   用户 Ctrl+Space  —— 系统 IME 热键，语义是「切换」。系统靠取反 compartment 表达，
+    //                       而我们把它拉回 1，于是按下时通常只能观测到 0。
+    //   宿主状态请求     —— gvim 等宿主进出编辑模式时调 ImmSetOpenStatus，
+    //                       语义是「开/关输入法」。退出编辑模式写 0，进入时写 1。
+    //
+    // 值本身没有区分能力（两者都可能是 0），唯一可靠依据是 OnTestKeyDown 那一刻的
+    // Ctrl+Space 拦截标记：实测拦截与本回调相隔 1ms，而宿主请求前面是 ESC / i 之类
+    // 的普通键，绝不会带上这个标记。
+    //
+    // 历史教训（勿回退）：本路径原先把「任何变化」一律当 toggle，后果是
+    //   1. gvim 每次 ESC 退出编辑模式都翻转中英，且方向取决于当时模式，行为随机；
+    //   2. 用户按 Shift/Ctrl 切英文后，_SetConversionMode(0) 引发系统联动写 OPENCLOSE=0，
+    //      被当成 toggle 又切回中文——自己把自己的切换撤销掉。
+    // 改回值语义后，(2) 天然变成 no-op（请求英文时已是英文）。
 
-    BOOL newChineseMode = !_bChineseMode;
+    BOOL fromCtrlSpace = _ConsumeCtrlSpaceTick();
 
-    WIND_LOG_INFO_FMT(L"Compartment %s: toggling mode %s -> %s\n",
+    // 宿主请求「开」：不改变中英。
+    //
+    // 我们对外恒称「开」（compartment 钉在 1，英文态也要收键做统计与自动配对），
+    // 所以宿主的「开」请求对我们本就是 no-op——它只要求输入法可用，不指定中英。
+    //
+    // 这一条必须显式忽略，不能落到下面的值语义里当「开=中文」：gvim 退出编辑模式时
+    // 会**查询**当前 IME 状态存起来，进入时再恢复。它查到的永远是我们钉死的「开」，
+    // 于是每次按 i 都要求「开」；若据此切中文，用户刚在英文态下的选择就会被覆盖，
+    // 表现为「进出编辑模式又变回中文」——正是本次要修的现象的后半段。
+    //
+    // 前半段（ESC 写 0）修好后这半段才第一次浮现：旧逻辑每次都把 compartment 拉回 1，
+    // gvim 写 1 时值没变、TSF 不触发 OnChange，这条路径从未被执行过。
+    if (!fromCtrlSpace && bOpen)
+    {
+        _SetOpenCloseCompartment(TRUE);
+        WIND_LOG_INFO_FMT(L"Compartment OPENCLOSE 1 (host state request), mode unchanged (%s)\n",
+            _bChineseMode ? L"Chinese" : L"English");
+        return S_OK;
+    }
+
+    BOOL newChineseMode = fromCtrlSpace ? !_bChineseMode  // 切换请求：取反
+                                        : FALSE;          // 宿主要求关闭：英文
+
+    // 目标与现状一致：宿主重复下发同一状态（gvim 每次 ESC 都写 0）或系统联动噪声。
+    // 必须在任何副作用之前早退——否则每次都会白跑一轮 EndComposition + 同步 IPC +
+    // 刷 LangBar/工具栏（实测一轮 30ms），并把英文统计切成碎片段上报。
+    if (newChineseMode == _bChineseMode)
+    {
+        _SetOpenCloseCompartment(TRUE);
+        WIND_LOG_INFO_FMT(L"Compartment OPENCLOSE %d matches current mode (%s), no-op%s\n",
+            bOpen, _bChineseMode ? L"Chinese" : L"English",
+            fromCtrlSpace ? L" [ctrl+space]" : L"");
+        return S_OK;
+    }
+
+    WIND_LOG_INFO_FMT(L"Compartment %s (%s): mode %s -> %s\n",
         bOpen ? L"opened" : L"closed",
+        fromCtrlSpace ? L"ctrl+space toggle" : L"host state request",
         _bChineseMode ? L"Chinese" : L"English",
         newChineseMode ? L"Chinese" : L"English");
 
@@ -3052,20 +3137,40 @@ STDAPI CTextService::OnChange(REFGUID rguid)
     if (_pLangBarItemButton != nullptr)
         _pLangBarItemButton->UpdateLangBarButton(_bChineseMode);
 
-    // Re-open compartment so TSF keeps calling OnTestKeyDown for English stats/auto-pair.
-    // Set the re-entrance guard so that if SetValue fires synchronously, the resulting
-    // OnChange(bOpen=TRUE) is suppressed and doesn't trigger a spurious extra toggle.
-    _bInCompartmentChange = TRUE;
+    // 把 compartment 钉回 OPEN，理由见 _SetOpenCloseCompartment 定义处的说明
+    //（保证系统热键的 toggle 恒产出 0，而**不是**为了让英文态收得到键——后者已被实验证伪）。
+    // 重入保护由 _SetOpenCloseCompartment 自己完成（它内部置/复位 _bInCompartmentChange），
+    // 此处不再外包一层——外层的复位会先于内层结束，反而让保护提前失效。
+    //
+    // 注意：本调用在 OnChange 上下文里**必然不生效**（实测回读 8/8 全是 0）。它内部有
+    // 「值相同就不写」的守卫，而此处 GetValue 读到的是尚未落定的旧值，于是跳过写入。
+    // 真正把 compartment 拉回 1 的是 IPC 状态推送回来后 _SyncStateFromResponse 里的
+    // 那次调用（不在 OnChange 上下文，能成功），窗口实测 400~670ms。
+    // 因此上面的判定逻辑不依赖它成功。
     _SetOpenCloseCompartment(TRUE);
-    _bInCompartmentChange = FALSE;
 
     // 同步真实中英文模式到 INPUTMODE_CONVERSION（KBLSwitch / 任务栏读取此 compartment）
     _SetConversionMode(_bChineseMode);
 
-    WIND_LOG_INFO_FMT(L"Mode toggled via system compartment -> %s (compartment kept open)\n",
+    WIND_LOG_INFO_FMT(L"Mode set via system compartment -> %s (compartment kept open)\n",
         _bChineseMode ? L"Chinese" : L"English");
 
     return S_OK;
+}
+
+BOOL CTextService::_ConsumeCtrlSpaceTick()
+{
+    if (_lastCtrlSpaceTick == 0)
+        return FALSE;
+
+    // 时间窗与清零是两道独立防线，都不能省：
+    //   清零防「一次拦截被兑换两次」；时间窗防「拦截了但系统压根没翻 compartment」
+    //   （某些宿主/配置下 IME 热键被禁用）——那种情况下标记会残留，若无时间窗，
+    //   之后任意一次宿主状态请求都会被误判成切换请求。
+    // 实测 intercept 到 OnChange 仅隔 1ms，200ms 已是极宽松的上界。
+    BOOL fresh = (GetTickCount64() - _lastCtrlSpaceTick) < 200;
+    _lastCtrlSpaceTick = 0;
+    return fresh;
 }
 
 BOOL CTextService::_InitKeyboardDisabledCompartment()
@@ -4794,55 +4899,6 @@ void CTextService::_UninitLangBarButton()
     }
 }
 
-void CTextService::HandleCtrlSpaceToggle()
-{
-    BOOL newChineseMode = !_bChineseMode;
-    WIND_LOG_INFO_FMT(L"HandleCtrlSpaceToggle: %s -> %s\n",
-        _bChineseMode ? L"Chinese" : L"English",
-        newChineseMode ? L"Chinese" : L"English");
-
-    // Flush English stats before mode switch
-    if (_pKeyEventSink != nullptr)
-        _pKeyEventSink->FlushEnglishStats();
-
-    // End any active composition
-    EndComposition();
-    ResetComposingState(TRUE);  // 中英切换保留配对状态：光标与已插入的右符号都没变
-
-    // Notify Go service of the mode switch
-    if (_pIPCClient != nullptr && _pIPCClient->IsConnected())
-    {
-        ServiceResponse response;
-        if (_pIPCClient->SendSystemModeSwitch(newChineseMode != FALSE, response))
-        {
-            if (response.type == ResponseType::CommitText && !response.text.empty())
-            {
-                CommitText(response.text);
-                WIND_LOG_INFO_FMT(L"HandleCtrlSpaceToggle: committed pending text (len=%zu)\n", response.text.size());
-            }
-            if (response.type == ResponseType::StatusUpdate || response.type == ResponseType::CommitText)
-                newChineseMode = response.IsChineseMode() ? TRUE : FALSE;
-        }
-        else
-        {
-            WIND_LOG_WARN(L"HandleCtrlSpaceToggle: IPC failed, proceeding with local toggle\n");
-        }
-    }
-
-    _SetChineseMode(newChineseMode);
-
-    if (_pLangBarItemButton != nullptr)
-        _pLangBarItemButton->UpdateLangBarButton(_bChineseMode);
-
-    // Do NOT call _SetOpenCloseCompartment here: compartment stays at 1 always,
-    // so the system never gets a chance to desync its internal toggle state.
-    // 但需要把真实模式写入 INPUTMODE_CONVERSION，让 KBLSwitch / 任务栏感知。
-    _SetConversionMode(_bChineseMode);
-
-    WIND_LOG_INFO_FMT(L"Mode toggled via Ctrl+Space interception -> %s (compartment unchanged)\n",
-        _bChineseMode ? L"Chinese" : L"English");
-}
-
 void CTextService::ToggleInputMode()
 {
     WIND_LOG_INFO(L"ToggleInputMode called (local fallback)\n");
@@ -4859,8 +4915,7 @@ void CTextService::ToggleInputMode()
 
     WIND_LOG_INFO_FMT(L"Switched to %s mode\n", _bChineseMode ? L"Chinese" : L"English");
 
-    // Keep compartment always OPEN so TSF calls OnTestKeyDown even in English mode.
-    // This allows English stats collection, auto-pair, and other features to work.
+    // 保持 compartment 恒为 OPEN，理由见 _SetOpenCloseCompartment 定义处的说明。
     // The actual key pass-through is handled by pfEaten=FALSE in OnTestKeyDown.
     _SetOpenCloseCompartment(TRUE);
     _SetConversionMode(_bChineseMode);
@@ -4884,7 +4939,7 @@ void CTextService::SetInputMode(BOOL bChineseMode)
 
     WIND_LOG_INFO_FMT(L"Mode set to %s (from service)\n", _bChineseMode ? L"Chinese" : L"English");
 
-    // Keep compartment always OPEN so TSF calls OnTestKeyDown even in English mode.
+    // 保持 compartment 恒为 OPEN，理由见 _SetOpenCloseCompartment 定义处的说明。
     _SetOpenCloseCompartment(TRUE);
     _SetConversionMode(_bChineseMode);
 
@@ -5037,7 +5092,7 @@ void CTextService::UpdateFullStatus(BOOL bChineseMode, BOOL bFullWidth, BOOL bCh
     _SetChineseMode(bChineseMode);
     _bFullWidth = bFullWidth;
 
-    // Keep compartment always OPEN so TSF calls OnTestKeyDown even in English mode.
+    // 保持 compartment 恒为 OPEN，理由见 _SetOpenCloseCompartment 定义处的说明。
     _SetOpenCloseCompartment(TRUE);
     _SetConversionMode(_bChineseMode);
 
