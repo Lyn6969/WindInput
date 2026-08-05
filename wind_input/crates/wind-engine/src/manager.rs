@@ -2295,6 +2295,8 @@ impl EngineManager {
                 use_smart_compose: pg.use_smart_compose,
                 // 无覆盖（纯拼音方案）时保持历史行为：简拼开。
                 enable_abbrev: pinyin_abbrev.unwrap_or(true),
+                completion_min_syllables: pg.completion.min_syllables,
+                completion_max_extra_syllables: pg.completion.max_extra_syllables,
             };
             let mut engine =
                 PinyinEngine::with_unigram(pcfg, dict, unigram).with_fuzzy(fuzzy.clone());

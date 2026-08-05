@@ -59,15 +59,16 @@ fn test_useful_completions_still_float() {
         ("zhongguor", "中国人", "距离+1 w=21385"),
         ("beijingd", "北京大学", "距离+2 w=2010，阈值取1会被误杀"),
         ("jisuanjik", "计算机科学", "距离+2 w=1609，阈值取1会被误杀"),
-        (
-            "zhonghuar",
-            "中华人民共和国",
-            "距离+5 w=3113，纯距离方案会被误杀",
-        ),
+        // ⚠️ `zhonghuar`→「中华人民共和国」曾在此列，现已移出：它的**音节** extra 是 4
+        // （输入 3 音节、词 7 音节），超出 `schema.pinyin.completion.max_extra_syllables`
+        // 的出厂值 3，默认不再产出。这是用户拍板的取舍 —— extra=4 与真机抱怨的
+        // `nih`→「你会怎么做」(extra=3) 在音节维度上同形，weight 也分不开
+        // （13330 vs 3113），只能靠这个旋钮按口味取。
+        // 把 max_extra 调到 4 即恢复，由 `far_completion_returns_when_max_extra_raised` 守卫。
         (
             "zhongguorenm",
             "中国人民解放军",
-            "距离+4 w=252，与同距离的噪音仅靠weight区分",
+            "距离+4 w=252，extra=3 恰好卡在出厂值上，是本档的下边界",
         ),
         ("zhonghuarenmingongheg", "中华人民共和国", "距离+1 w=3113"),
     ] {
@@ -81,6 +82,34 @@ fn test_useful_completions_still_float() {
             rank
         );
     }
+}
+
+/// 两个旋钮确实在起作用：`max_extra_syllables` 调大即恢复远距离补全，调小即收紧。
+///
+/// 以 `zhonghuar`→「中华人民共和国」（输入 3 音节、词 7 音节、extra=4）为标尺：
+/// 出厂值 3 时不产出，调到 4 立刻回来。缺了这条，「出厂 3」这个决定就没有守卫 ——
+/// 日后有人把过滤写死、旋钮变成摆设也不会有测试变红。
+#[test]
+fn far_completion_returns_when_max_extra_raised() {
+    let Some(dir) = data_dir() else {
+        eprintln!("跳过：拼音词库不存在");
+        return;
+    };
+
+    let has = |max_extra: u32| {
+        let mut cfg = Config::default();
+        cfg.schema.available = vec!["pinyin".to_string()];
+        cfg.schema.active = "pinyin".to_string();
+        cfg.schema.pinyin.completion.max_extra_syllables = max_extra;
+        EngineManager::new(&cfg, Some(&dir))
+            .convert_with("pinyin", "zhonghuar", 300)
+            .candidates
+            .iter()
+            .any(|c| c.text == "中华人民共和国")
+    };
+
+    assert!(!has(3), "出厂值 3 下 extra=4 的补全不该产出");
+    assert!(has(4), "调到 4 后「中华人民共和国」必须回来");
 }
 
 /// 冷僻长词补全须沉底：它们是奇偶跳动的噪音源。

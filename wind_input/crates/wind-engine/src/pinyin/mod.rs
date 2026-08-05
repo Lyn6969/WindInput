@@ -103,35 +103,6 @@ const COMPLETION_NEAR_SYLLABLES: u32 = 2;
 /// 一半的词低于它，会误沉大量高频使用但低词频的日常词。
 const COMPLETION_FAR_WEIGHT_FLOOR: i32 = 100;
 
-/// 「音节数严格匹配」档的上限：**输入自身**表达的音节数不超过这么多时，前缀补全候选的
-/// 音节数必须 ≤ 输入的音节数 —— 即短输入下不预测未输入的音节，对齐主流拼音输入法。
-///
-/// 输入的音节数 `started` = 完整音节数 + (有尾部残码 ? 1 : 0)，与
-/// [`should_promote_user_completion`] 同一个量。
-///
-/// 现象：打 `d` 或 `dian` 时候选里混着「但是」「的时候」「电话」这类词组。它们全部来自
-/// step4 前缀补全，且因残码上浮（`d` 的 `trailing_partial=true`、距离 ≤
-/// [`COMPLETION_NEAR_SYLLABLES`]）被**提升进完整匹配层**与单字同层竞争，于是第 2 页就能
-/// 见到 —— 不是排序没生效，是它们被主动提上来的。
-///
-/// **取 1 是硬约束，不是取舍**。取 2 会连带干掉 `nih`→「你好」、`meiy`→「没有」这两条
-/// —— 它们是残码上浮机制存在的理由，`pinyin_completion.rs` 有定点断言。届时
-/// `zhonghuar`→「中华人民共和国」（输入 3 音节、词 7 音节）这类远距离补全同样全灭。
-///
-/// ⚠️ **判据问的是「输入有几个音节」，不是「输入在这条候选的切分下占了几个音节」。**
-/// 后者曾被用过一版：它对精确匹配是对的（同一个 `dian`，对「点」是 1 音节、对「堤岸」
-/// 是 `di|an` 2 音节，确实没有唯一答案），但**精确匹配根本不需要这道闸门**——
-/// 它不预测任何未输入的内容。把那个理由推广到前缀补全上就错了：`xia` 会因为存在
-/// `xi|an`（西安）的切分而被当成 2 音节输入、整批放行词组，`ying` 同理漏出
-/// `yin|guo`（因果）。对前缀补全而言输入的音节数是**唯一确定**的 —— `completed_len`
-/// 是词图的性质，与走哪条切分路径无关（见 convert 中该变量的论证）。
-///
-/// ⚠️ **也不能拿"是不是前缀补全"当唯一判据**：`d` 的单字候选（「的」code=`de`）与词组
-/// 候选（「但是」code=`danshi`）出自同一条 step4，`is_prefix` 全为 true；`d` 又短于
-/// `is_abbreviation` 的 2 字母下限、简拼路径压根不启动 ⇒ 若按来源整条关掉前缀查询，
-/// `d` 会是**零候选**。两者要一起用：`is_prefix` 圈定适用范围，音节数决定去留。
-const STRICT_SYLLABLE_MATCH_MAX: u32 = 1;
-
 /// 前缀补全的取数上限（见 convert 中 `completion_limit` 处的完整说明）。
 ///
 /// 取 1000 是 `push_unique` 的 O(n²) 查重与「单字母可持续翻页」之间的平衡点：
@@ -249,6 +220,57 @@ pub struct Config {
     /// （`is_abbreviation` 只要求每字母是某音节首字母），而混输里有人只拿拼音做临时输入补位。
     /// 关闭还顺带省掉用户词层的全量扫描（见 convert step6：`search_prefix("", 0)` 枚举全部用户词）。
     pub enable_abbrev: bool,
+    /// 词组补全的音节数约束：至少输入几个音节才给词组（见 `[schema.pinyin.completion]`）。
+    /// 补全词的音节数恒 ≥ 输入音节数，故未达门槛时上限收紧到输入音节数本身，
+    /// 效果即「只出同音节数的候选」。取 1 = 不设限。
+    pub completion_min_syllables: u32,
+    /// 词组补全的音节数约束：候选最多比输入多几个音节。
+    pub completion_max_extra_syllables: u32,
+}
+
+/// 前缀补全允许的最大候选音节数 —— 词组补全两个旋钮（`[schema.pinyin.completion]`）
+/// 合成的那一个数。
+///
+/// `started` 是**输入自身**表达的音节数（完整音节 + 残码算起头的一个）。未达
+/// `min_syllables` 时收紧到 `started`：补全词的音节数恒 ≥ `started`，故这等价于
+/// 「不给词组」，但表述成同一个上限，使词库层下推也只需要它。
+///
+/// ## 判据为什么长这样（改动前必读）
+///
+/// 现象起点：打 `d` 或 `dian` 时候选里混着「但是」「的时候」「电话」。它们全部来自
+/// step4 前缀补全，且因残码上浮（`d` 的 `trailing_partial=true`、距离 ≤
+/// [`COMPLETION_NEAR_SYLLABLES`]）被**提升进完整匹配层**与单字同层竞争，于是第 2 页就能
+/// 见到 —— 不是排序没生效，是它们被主动提上来的。
+///
+/// ⚠️ **判据问的是「输入有几个音节」，不是「输入在这条候选的切分下占了几个音节」。**
+/// 后者曾被用过一版：它对精确匹配是对的（同一个 `dian`，对「点」是 1 音节、对「堤岸」
+/// 是 `di|an` 2 音节，确实没有唯一答案），但**精确匹配根本不需要这道闸门**——
+/// 它不预测任何未输入的内容。把那个理由推广到前缀补全上就错了：`xia` 会因为存在
+/// `xi|an`（西安）的切分而被当成 2 音节输入、整批放行词组，`ying` 同理漏出
+/// `yin|guo`（因果）。对前缀补全而言输入的音节数是**唯一确定**的 —— `completed_len`
+/// 是词图的性质，与走哪条切分路径无关（见 convert 中该变量的论证）。
+///
+/// ⚠️ **也不能拿"是不是前缀补全"当唯一判据**：`d` 的单字候选（「的」code=`de`）与词组
+/// 候选（「但是」code=`danshi`）出自同一条 step4，`is_prefix` 全为 true；`d` 又短于
+/// `is_abbreviation` 的 2 字母下限、简拼路径压根不启动 ⇒ 若按来源整条关掉前缀查询，
+/// `d` 会是**零候选**。两者要一起用：`is_prefix` 圈定适用范围，音节数决定去留。
+///
+/// ⚠️ **`min_syllables` 取 3 会伤到既有定点**：`nih`→「你好」、`meiy`→「没有」是残码上浮
+/// 机制存在的理由（`pinyin_completion.rs` 有断言），它们的 `started` 都恰好是 2。
+///
+/// ⚠️ **`max_extra` 两头够不着**（实测，改默认值前先读）：既有定点里
+/// `zhonghuar`→「中华人民共和国」extra=4、`zhongguorenm`→「中国人民解放军」extra=3，
+/// 而真机抱怨的 `nih`→「你会发现」extra=2、「你会怎么做」extra=3 —— 后者与前者
+/// **在音节维度上完全同形**，单靠 extra 分不开；weight 也分不开（「你会发现」13330
+/// 高于「中华人民共和国」3113）。真正的区别是「该前缀下有没有竞争者」，本轮没有实现
+/// 这个判据，故只能由用户按口味取舍：出厂 3 保住「中国人民解放军」而放弃「中华人民
+/// 共和国」，调到 1 才能消掉「你会发现」。
+fn completion_syllable_cap(started: u32, min_syllables: u32, max_extra: u32) -> u32 {
+    if started < min_syllables {
+        started
+    } else {
+        started.saturating_add(max_extra)
+    }
 }
 
 impl Default for Config {
@@ -257,6 +279,8 @@ impl Default for Config {
             show_code_hint: false,
             use_smart_compose: true,
             enable_abbrev: true,
+            completion_min_syllables: 2,
+            completion_max_extra_syllables: 3,
         }
     }
 }
@@ -1348,16 +1372,14 @@ impl Engine for PinyinEngine {
         // 长输入（`started ≥ 2`，如 `meiy`/`zhonghuar`）走不带上限的原路径，与改动前
         // 逐条一致。6.3 的 retain 仍然保留 —— 它还要兜住词库层判不了的
         // `boundary == 0`（DAG 现切）与 step6 并入的用户/临时词。
-        let completions = if started_syllables <= STRICT_SYLLABLE_MATCH_MAX {
-            dict.search_prefix_with_boundary_syllable_capped(
-                query,
-                completion_limit,
-                started_syllables,
-            )
-        } else {
-            dict.search_prefix_with_boundary(query, completion_limit)
-        };
-        for h in completions {
+        let syllable_cap = completion_syllable_cap(
+            started_syllables,
+            self.config.completion_min_syllables,
+            self.config.completion_max_extra_syllables,
+        );
+        for h in
+            dict.search_prefix_with_boundary_syllable_capped(query, completion_limit, syllable_cap)
+        {
             let demote_to_prefix_layer = if trailing_partial {
                 let distance = h.boundary.count_ones().saturating_sub(completed_syls);
                 distance > COMPLETION_NEAR_SYLLABLES && h.weight < COMPLETION_FAR_WEIGHT_FLOOR
@@ -1747,18 +1769,16 @@ impl Engine for PinyinEngine {
         //
         //     位置必须在 step 6.2 之后：用户/临时词到 step 6 才并入，简拼前缀回退到 6.2；
         //     且必须在排序/截断**之前**（P2b 同款教训：先截断再过滤会把该出的候选挤掉）。
-        if started_syllables <= STRICT_SYLLABLE_MATCH_MAX {
-            candidates.retain(|c| {
-                if !c.is_prefix {
-                    return true;
-                }
-                // 判据与词库层下推的那道**共用同一个函数**（`wind_dict::cached`），避免两处
-                // 各写一份日后漂移。差别只在入参：这里先用 `effective_boundary` 把无真值的
-                // boundary 用 DAG 补出来，词库层做不到这一步（拿不到 trie），只能放行。
-                let b = effective_boundary(&c.code, c.boundary, trie);
-                wind_dict::cached::prefix_syllable_keep(b, started_syllables)
-            });
-        }
+        candidates.retain(|c| {
+            if !c.is_prefix {
+                return true;
+            }
+            // 判据与词库层下推的那道**共用同一个函数**（`wind_dict::cached`），避免两处
+            // 各写一份日后漂移。差别只在入参：这里先用 `effective_boundary` 把无真值的
+            // boundary 用 DAG 补出来，词库层做不到这一步（拿不到 trie），只能放行。
+            let b = effective_boundary(&c.code, c.boundary, trie);
+            wind_dict::cached::prefix_syllable_keep(b, syllable_cap)
+        });
 
         // 裸声母（无完整音节，如 "m"/"zh"）单字优先：候选全为前缀补全词（is_prefix=true），
         // 纯按词频排会让高频多字词（没有/目前）压过单字（吗/么）——不合直觉。给单字提权使其

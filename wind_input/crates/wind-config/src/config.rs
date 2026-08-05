@@ -380,6 +380,57 @@ pub struct PinyinGlobalConfig {
     /// 拼音自动造词（全局唯一）。
     #[serde(default)]
     pub auto_learn: AutoLearnConfig,
+    /// 词组补全的音节数约束（全局唯一）。
+    #[serde(default)]
+    pub completion: PinyinCompletion,
+}
+
+/// 词组补全（前缀补全）的音节数约束（`[schema.pinyin.completion]`）。
+///
+/// 约束的是「码比输入长」的补全词——即引擎在**预测用户尚未输入的音节**。精确匹配、
+/// 子短语、整句、简拼都不受这两项影响（它们不预测任何东西）。
+///
+/// 判据的尺子是 `started` = 输入的完整音节数 + (有尾部残码 ? 1 : 0)，是**输入自身的
+/// 属性**。允许的候选音节数上限 = `started < min_syllables ? started : started + max_extra_syllables`。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PinyinCompletion {
+    /// 至少输入几个音节才给出词组候选。
+    ///
+    /// 补全词的音节数恒 ≥ 输入音节数，故 `started < min_syllables` 时上限收紧到
+    /// `started` 本身，效果就是「只出同音节数的候选」——单字母 `d` 与单音节 `dian`
+    /// 只出单字，不再混进「但是」「电话」。取 1 = 不设限（回到历史行为）。
+    ///
+    /// 尾部残码算作起头的一个音节：`dianh`(dian + h) 已经算 2 个，故它照常出「电话」。
+    #[serde(default = "default_completion_min_syllables")]
+    pub min_syllables: u32,
+    /// 词组最多比输入多几个音节。
+    ///
+    /// 0 = 只给音节数与输入相等的词；1 = 只补下一个音节（`nih` → 你好/你会，
+    /// 不给 4 音节的「你会发现」）；4 以上才够 `zhonghuar` → 「中华人民共和国」
+    /// （输入 3 音节、词 7 音节）。数值越大，引擎越敢预测你还没打的内容。
+    #[serde(default = "default_completion_max_extra_syllables")]
+    pub max_extra_syllables: u32,
+}
+
+fn default_completion_min_syllables() -> u32 {
+    2
+}
+
+fn default_completion_max_extra_syllables() -> u32 {
+    3
+}
+
+impl Default for PinyinCompletion {
+    /// ⚠️ 与 [`CodetableGlobal`] 那种「结构体零值」不同，这里给的是**真实默认值**，
+    /// 与 `data/config.toml` 的出厂值一致。零值在此没有意义：`min_syllables = 0`
+    /// 等于不设限，而 `max_extra_syllables = 0` 是一个合法且很严格的取值，
+    /// 没法拿来当「未配置」的哨兵。
+    fn default() -> Self {
+        Self {
+            min_syllables: default_completion_min_syllables(),
+            max_extra_syllables: default_completion_max_extra_syllables(),
+        }
+    }
 }
 
 impl Default for PinyinGlobalConfig {
@@ -391,6 +442,7 @@ impl Default for PinyinGlobalConfig {
             fuzzy: PinyinFuzzy::default(),
             frequency: PinyinFrequency::default(),
             auto_learn: AutoLearnConfig::default(),
+            completion: PinyinCompletion::default(),
         }
     }
 }
