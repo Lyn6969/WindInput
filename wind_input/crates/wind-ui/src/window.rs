@@ -27,6 +27,23 @@ pub fn take_system_color_changed() -> bool {
     SYSTEM_COLOR_CHANGED.swap(false, Ordering::Relaxed)
 }
 
+/// `LayeredWindow::show_z` 的 z 序意图。
+///
+/// 存在的理由：`show()` 历来无条件把窗口插进**置顶组**，这对候选窗/工具栏是对的
+/// （它们必须盖住一切），但对「可以被用户关掉置顶」的浮窗就成了 bug ——每次刷新都把
+/// 它重新提到最前，用户看到的是「置顶开关不起作用」。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ShowZOrder {
+    /// 插入置顶组（`HWND_TOPMOST`）。历史默认，`show()` 等价于本档。
+    Topmost,
+    /// 移出置顶组（`HWND_NOTOPMOST`，清 `WS_EX_TOPMOST`），落到非置顶组顶部。
+    /// 只在**切换的那一次**用，之后要用 [`ShowZOrder::Keep`]，否则每次刷新又把它顶到
+    /// 所有普通窗口之上。
+    NoTopmost,
+    /// 完全不动 z 序（`SWP_NOZORDER`）。别的窗口被激活时能自然盖过本窗口。
+    Keep,
+}
+
 /// 浮层窗口鼠标消息处理器（由具体窗口实现，如候选窗）。
 /// 返回 `Some(lresult)` 表示已处理；`None` 交回默认处理。
 ///
@@ -332,15 +349,31 @@ mod platform {
         }
 
         pub fn show(&self, x: i32, y: i32) {
+            self.show_z(x, y, super::ShowZOrder::Topmost)
+        }
+
+        /// 带 z 序意图的显示。语义见 [`super::ShowZOrder`]。
+        pub fn show_z(&self, x: i32, y: i32, z: super::ShowZOrder) {
+            use super::ShowZOrder;
+            let mut flags = SWP_NOACTIVATE | SWP_SHOWWINDOW;
+            // Keep 档下 hWndInsertAfter 被 SWP_NOZORDER 忽略，传什么都不生效。
+            let insert_after = match z {
+                ShowZOrder::Topmost => HWND_TOPMOST,
+                ShowZOrder::NoTopmost => HWND_NOTOPMOST,
+                ShowZOrder::Keep => {
+                    flags |= SWP_NOZORDER;
+                    HWND_TOPMOST
+                }
+            };
             unsafe {
                 let r = SetWindowPos(
                     self.hwnd,
-                    HWND_TOPMOST,
+                    insert_after,
                     x,
                     y,
                     self.width as i32,
                     self.height as i32,
-                    SWP_NOACTIVATE | SWP_SHOWWINDOW,
+                    flags,
                 );
                 // 这是唯一让窗口现身的调用，其结果此前被整个丢弃。
                 if let Err(e) = r {
@@ -511,6 +544,8 @@ mod platform {
         }
 
         pub fn show(&self, _x: i32, _y: i32) {}
+
+        pub fn show_z(&self, _x: i32, _y: i32, _z: super::ShowZOrder) {}
 
         pub fn hide(&self) {}
 
