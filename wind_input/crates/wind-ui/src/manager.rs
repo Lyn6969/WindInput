@@ -7,7 +7,7 @@ use crate::candidate_window::{CandidateItem, CandidateWindow, CandidateWindowCon
 use crate::toast::{ToastKind, ToastPosition};
 
 /// re-export：使协调器以 `wind_ui::manager::InputDiagView` 统一引用。
-pub use crate::input_diag_hud::InputDiagView;
+pub use crate::input_diag_hud::{DiagSections, InputDiagView, WindowDiagView};
 use std::sync::mpsc;
 use tracing::{debug, error, info};
 #[cfg(windows)]
@@ -78,6 +78,10 @@ pub enum UiCommand {
     ShowInputDiag(crate::input_diag_hud::InputDiagView),
     /// 隐藏输入诊断 HUD。
     HideInputDiag,
+    /// 复制输入诊断 HUD 当前显示的文本到剪贴板（右键菜单）。
+    /// 走 UI 线程而非协调器直接写剪贴板：文本以**实际渲染的行**为准（含分区隐藏结果），
+    /// 那份只有 UI 侧有。
+    CopyInputDiagText,
     /// 更新常驻工具栏状态（中英/方案/标点/全半角）
     UpdateToolbar(crate::toolbar::ToolbarState),
     /// 隐藏工具栏
@@ -279,6 +283,14 @@ pub enum MenuCmd {
     StatusResetPosition,
     /// 状态提示气泡：截图此窗口
     StatusScreenshot,
+    /// 输入诊断 HUD：复制全部内容（所见即所得，含分区隐藏后的结果）
+    InputDiagCopy,
+    /// 输入诊断 HUD：切换分区显示。参数为分区序号，见 [`DiagSections::label`]
+    InputDiagToggleSection(u8),
+    /// 输入诊断 HUD：停止/恢复刷新（冻结当前快照，便于切走观察时不被新焦点刷掉）
+    InputDiagToggleFreeze,
+    /// 输入诊断 HUD：切换窗口置顶（关掉可让 HUD 沉到被观察窗口之下）
+    InputDiagToggleTopmost,
     /// 悬停提示（编码反查气泡）：复制内容
     TooltipCopy,
     /// 悬停提示（编码反查气泡）：截图此窗口
@@ -322,7 +334,7 @@ impl MenuKind {
     /// 原样回传，Rust 据此还原动作。构建菜单树（下发）与处理回传（还原）共用此映射，
     /// 二者必须一致。`Submenu`/`Separator`/`Label` 不回传，恒为 0。
     /// id 区间：1 复制｜10-19 词条操作｜100-199 固定命令｜1000+ 方案｜2000+ 主题｜3000+ 过滤｜
-    /// 4000+ 明暗｜5000+ 候选窗首显｜6000+ 初始中英｜7000+ 初始标点。
+    /// 4000+ 明暗｜5000+ 候选窗首显｜6000+ 初始中英｜7000+ 初始标点｜8000+ 诊断 HUD 分区。
     pub fn to_menu_id(self) -> i32 {
         match self {
             MenuKind::Separator | MenuKind::Submenu | MenuKind::Label => 0,
@@ -359,6 +371,10 @@ impl MenuKind {
                 MenuCmd::StatusToggleShowOnFocus => 123,
                 MenuCmd::ToggleInputDiagnostics => 120,
                 MenuCmd::TogglePasswordSuppress => 121,
+                MenuCmd::InputDiagCopy => 124,
+                MenuCmd::InputDiagToggleFreeze => 125,
+                MenuCmd::InputDiagToggleTopmost => 126,
+                MenuCmd::InputDiagToggleSection(i) => 8000 + i as i32,
                 MenuCmd::FirstShowMode(m) => 5000 + m as i32,
                 MenuCmd::InitialMode(m) => 6000 + m as i32,
                 MenuCmd::InitialPunct(m) => 7000 + m as i32,
@@ -404,6 +420,10 @@ impl MenuKind {
 
             120 => MenuCmd::ToggleInputDiagnostics,
             121 => MenuCmd::TogglePasswordSuppress,
+            124 => MenuCmd::InputDiagCopy,
+            125 => MenuCmd::InputDiagToggleFreeze,
+            126 => MenuCmd::InputDiagToggleTopmost,
+            8000..=8999 => MenuCmd::InputDiagToggleSection((id - 8000) as u8),
             1000..=1999 => MenuCmd::SchemaSelect((id - 1000) as usize),
             2000..=2999 => MenuCmd::ThemeSelect((id - 2000) as usize),
             3000..=3999 => MenuCmd::FilterMode((id - 3000) as usize),
@@ -513,6 +533,8 @@ pub enum UiEvent {
     RequestStatusMenu { x: i32, y: i32 },
     /// 右键悬停提示（编码反查气泡）请求弹出菜单（屏幕坐标）
     RequestTooltipMenu { x: i32, y: i32 },
+    /// 输入诊断 HUD 上右键：请求其上下文菜单（复制 / 显示分类 / 停止刷新 / 置顶）。
+    RequestInputDiagMenu { x: i32, y: i32 },
     /// 系统「浅色/深色模式」已切换（Win32 `WM_SETTINGCHANGE`/`ImmersiveColorSet`）。
     /// 协调器仅在 `ui.theme.style = "system"` 时据此重解析主题，其余明暗为用户显式指定。
     SystemThemeChanged,
@@ -1222,7 +1244,7 @@ impl UiManager {
                     UiCommand::ShowInputDiag(v) => {
                         // 惰性创建：失败仅记 error，不影响其它窗口。
                         if input_diag_hud.is_none() {
-                            match crate::input_diag_hud::InputDiagHud::new() {
+                            match crate::input_diag_hud::InputDiagHud::new(event_tx.clone()) {
                                 Ok(h) => input_diag_hud = Some(h),
                                 Err(e) => error!("Failed to create input diag HUD: {}", e),
                             }
@@ -1234,6 +1256,11 @@ impl UiManager {
                     UiCommand::HideInputDiag => {
                         if let Some(h) = input_diag_hud.as_mut() {
                             h.hide();
+                        }
+                    }
+                    UiCommand::CopyInputDiagText => {
+                        if let Some(h) = input_diag_hud.as_ref() {
+                            h.copy_text();
                         }
                     }
                     UiCommand::ShowToast {
@@ -1650,6 +1677,11 @@ mod menu_id_tests {
             MenuCmd::StatusToggleShowOnFocus,
             MenuCmd::TooltipCopy,
             MenuCmd::TooltipScreenshot,
+            MenuCmd::InputDiagCopy,
+            MenuCmd::InputDiagToggleFreeze,
+            MenuCmd::InputDiagToggleTopmost,
+            MenuCmd::InputDiagToggleSection(0),
+            MenuCmd::InputDiagToggleSection(3),
             MenuCmd::SchemaSelect(0),
             MenuCmd::SchemaSelect(7),
             MenuCmd::ThemeSelect(3),

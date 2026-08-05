@@ -150,6 +150,12 @@ impl Coordinator {
             MenuCmd::TooltipCopy => {
                 let _ = self.ui_tx.send(UiCommand::CopyTooltipText);
             }
+            MenuCmd::InputDiagCopy => {
+                let _ = self.ui_tx.send(UiCommand::CopyInputDiagText);
+            }
+            MenuCmd::InputDiagToggleSection(i) => self.toggle_input_diag_section(i),
+            MenuCmd::InputDiagToggleFreeze => self.toggle_input_diag_freeze(),
+            MenuCmd::InputDiagToggleTopmost => self.toggle_input_diag_topmost(),
             MenuCmd::TooltipScreenshot => {
                 if let Some(dir) = screenshots_dir() {
                     let _ = self.ui_tx.send(UiCommand::ScreenshotTooltip {
@@ -359,12 +365,112 @@ impl Coordinator {
         });
     }
 
+    /// 输入诊断 HUD 上右键请求的菜单：复制 / 显示分类 / 停止刷新 / 置顶 / 关闭。
+    ///
+    /// 勾选态直接读运行时状态，故菜单永远反映当前真值——这类"开关型"菜单最忌讳
+    /// 勾选态与实际行为不同步，那会让用户反复点同一项。
+    pub(crate) fn show_input_diag_menu(&self, x: i32, y: i32) {
+        use std::sync::atomic::Ordering::Relaxed;
+        use wind_ui::manager::{DiagSections, MenuItemSpec as M};
+        let cmd = |c: MenuCmd| MenuKind::Command(c);
+        let sections = *self
+            .input_diag_sections
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let section_items: Vec<M> = DiagSections::ALL
+            .iter()
+            .map(|&i| {
+                M::leaf(
+                    DiagSections::label(i),
+                    cmd(MenuCmd::InputDiagToggleSection(i)),
+                    true,
+                    sections.get(i),
+                )
+            })
+            .collect();
+        let items = vec![
+            M::leaf("复制全部内容", cmd(MenuCmd::InputDiagCopy), true, false),
+            M::separator(),
+            M::submenu("显示分类", section_items),
+            M::separator(),
+            M::leaf(
+                "停止刷新",
+                cmd(MenuCmd::InputDiagToggleFreeze),
+                true,
+                self.input_diag_frozen.load(Relaxed),
+            ),
+            M::leaf(
+                "窗口置顶",
+                cmd(MenuCmd::InputDiagToggleTopmost),
+                true,
+                self.input_diag_topmost.load(Relaxed),
+            ),
+            M::separator(),
+            M::leaf(
+                "关闭诊断 HUD",
+                cmd(MenuCmd::ToggleInputDiagnostics),
+                true,
+                false,
+            ),
+        ];
+        self.mark_menu_open(0, String::new());
+        let _ = self.ui_tx.send(UiCommand::ShowCandidateMenu {
+            items,
+            x,
+            y,
+            y_bottom: y,
+            above: false,
+        });
+    }
+
+    /// 切换分区显示。
+    ///
+    /// ⚠ **必须强制推一次**：冻结中 `push_input_diag_hud_if_visible` 会早退，此时切分类
+    /// 屏幕上毫无变化，用户只能判断为"菜单坏了"。分区是显示配置而非数据，与冻结正交。
+    pub(crate) fn toggle_input_diag_section(&self, idx: u8) {
+        {
+            let mut s = self
+                .input_diag_sections
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            s.toggle(idx);
+        }
+        self.push_input_diag_hud(true);
+    }
+
+    /// 停止/恢复刷新。恢复时立即推一次当前快照，否则要等下一次焦点事件才回到实时值。
+    pub(crate) fn toggle_input_diag_freeze(&self) {
+        use std::sync::atomic::Ordering::Relaxed;
+        let now = !self.input_diag_frozen.load(Relaxed);
+        self.input_diag_frozen.store(now, Relaxed);
+        // 冻结时也推一次：HUD 要立刻显示"⏸ 已停止刷新"这行标注，否则用户无从确认开关生效。
+        self.push_input_diag_hud(true);
+    }
+
+    /// 切换窗口置顶。同样强制推——置顶状态由 UI 在渲染时应用。
+    pub(crate) fn toggle_input_diag_topmost(&self) {
+        use std::sync::atomic::Ordering::Relaxed;
+        let now = !self.input_diag_topmost.load(Relaxed);
+        self.input_diag_topmost.store(now, Relaxed);
+        self.push_input_diag_hud(true);
+    }
+
     /// 切换输入诊断 HUD 显隐（高级菜单）：开启时立即推送当前快照，关闭时下发隐藏。
     pub(crate) fn toggle_input_diag_hud(&self) {
         use std::sync::atomic::Ordering::Relaxed;
         let now = !self.input_diag_hud_visible.load(Relaxed);
         self.input_diag_hud_visible.store(now, Relaxed);
+        // 采集开关随 HUD 显隐下发（广播）。关闭时也必须推——否则 DLL 会在 HUD 早已关掉
+        // 之后继续每次焦点切换都采集窗口链，白付开销且无人消费。
+        self.push_diag_snapshot_config(0);
         if now {
+            // ⚠ 打开时复位置顶与冻结——这两个开关都能把自己的逃生口关上：
+            //   · 非置顶 → HUD 沉到宿主窗口之下 → 右键菜单点不到 → 没法再打开置顶；
+            //   · 冻结中关掉再打开 → 内容停在旧快照，看起来就是「HUD 坏了不刷新」。
+            // 「重新打开」是用户表达「重来一次」的动作，复位到默认最不意外。
+            // 分区显示不复位：它是纯显示偏好，且全关时 HUD 会给出可右键的提示行，不封死。
+            self.input_diag_topmost.store(true, Relaxed);
+            self.input_diag_frozen.store(false, Relaxed);
             self.push_input_diag_hud_if_visible();
         } else {
             let _ = self.ui_tx.send(UiCommand::HideInputDiag);

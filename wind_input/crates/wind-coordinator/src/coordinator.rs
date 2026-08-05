@@ -914,6 +914,9 @@ pub struct Coordinator {
     host_render: std::sync::OnceLock<Arc<wind_bridge::host_render_windows::HostRenderManager>>,
     /// 最近一次输入诊断快照（compartment 禁用态 / InputScope 密码位），供 Task 6 HUD 展示。
     pub(crate) last_input_diag: Mutex<crate::input_diag::InputDiagState>,
+    /// 最近一次窗口 / TSF 上下文诊断快照（`CMD_DIAG_SNAPSHOT`）。
+    /// 与 `last_input_diag` 分开存：两者上报时机不同，合成一个就得回答「只到了一半算什么」。
+    pub(crate) last_window_diag: Mutex<crate::input_diag::WindowDiagView>,
     /// 密码框强制英文抑制态：命中密码 InputScope 时置 true，输入闸据此强制英文透传
     /// （**不改 `chinese_mode` 持久值**）。
     ///
@@ -927,6 +930,15 @@ pub struct Coordinator {
     pub(crate) password_suppress_enabled: std::sync::atomic::AtomicBool,
     /// 输入诊断 HUD 是否可见（Task 6/7 接线；本任务先占位默认 false）。
     pub(crate) input_diag_hud_visible: std::sync::atomic::AtomicBool,
+    /// HUD 分区显示开关（右键菜单「显示分类」）。会话级，不持久化。
+    pub(crate) input_diag_sections: Mutex<wind_ui::manager::DiagSections>,
+    /// HUD 冻结中（右键菜单「停止刷新」）：新快照不再推给 UI。
+    ///
+    /// 冻结落在**推送**这一层而不是 UI 渲染层：数据照常进 `last_*_diag`（解冻后立即有
+    /// 最新值），只是不往屏幕上送。若改在 UI 侧丢弃，解冻后得等下一次焦点事件才恢复。
+    pub(crate) input_diag_frozen: std::sync::atomic::AtomicBool,
+    /// HUD 窗口置顶（右键菜单）。默认开——诊断浮窗被盖住就失去意义。
+    pub(crate) input_diag_topmost: std::sync::atomic::AtomicBool,
 }
 
 /// 拆字资产当前生效状态：库的解析后绝对路径 + 已下发的字根字体（路径, DWrite 家族名）。
@@ -1525,9 +1537,13 @@ impl Coordinator {
             #[cfg(windows)]
             host_render: std::sync::OnceLock::new(),
             last_input_diag: Mutex::new(Default::default()),
+            last_window_diag: Mutex::new(Default::default()),
             password_suppress: std::sync::atomic::AtomicBool::new(false),
             password_suppress_enabled: std::sync::atomic::AtomicBool::new(true),
             input_diag_hud_visible: std::sync::atomic::AtomicBool::new(false),
+            input_diag_sections: Mutex::new(Default::default()),
+            input_diag_frozen: std::sync::atomic::AtomicBool::new(false),
+            input_diag_topmost: std::sync::atomic::AtomicBool::new(true),
         });
         // 命令栏：装配 Services（ime/config/dict 后端）+ 自身 Weak 引用。
         coordinator.init_cmdbar();
@@ -1686,11 +1702,102 @@ impl Coordinator {
         self.push_input_diag_hud_if_visible();
     }
 
-    /// HUD 推送：`input_diag_hud_visible` 开启时，把 `last_input_diag` 快照经 UI 通道
-    /// 下发 `ShowInputDiag`（UI 线程惰性创建 HUD 窗口并显示/更新）。关闭时不推送。
+    /// 消费一次诊断快照：存 DLL 上报的窗口链 / TSF 实例，并**在服务端现算** host-render
+    /// 运行态后刷新 HUD。
+    ///
+    /// ⚠ host-render 三项（白名单命中 / 活跃目标 / 是否本进程）必须按**上报包里的 pid**
+    /// 直查，不得走 `ActiveCompat` 全局焦点槽——开始菜单弹出会连带激活兄弟进程污染焦点槽，
+    /// 那正是当初 avail 位被污染、DLL 陷入销毁重建循环的成因
+    /// （`docs/redesign/host-render-windows-port.md` §11.2）。HUD 若沿用被污染的槽，
+    /// 显示的会是「另一个进程的 host 状态」，排查时反而把人带偏。
+    pub(crate) fn apply_diag_snapshot(&self, snap: &wind_ipc::protocol::DiagSnapshotPayload) {
+        #[cfg(windows)]
+        let (host_whitelisted, host_active) = match self.host_render() {
+            Some(mgr) => (
+                mgr.is_process_whitelisted(snap.pid),
+                mgr.active_target().is_some_and(|t| t.pid == snap.pid),
+            ),
+            None => (false, false),
+        };
+        #[cfg(not(windows))]
+        let (host_whitelisted, host_active) = (false, false);
+
+        // 前台进程名：服务端按 fg_pid 现查（DLL 不上报——它未必有权限打开别的进程）。
+        let fg_process_name = if snap.fg_pid != 0 {
+            self.cached_proc_name((snap.fg_pid as u64) << 32)
+        } else {
+            String::new()
+        };
+
+        {
+            let mut w = self
+                .last_window_diag
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            *w = crate::input_diag::WindowDiagView {
+                focus_hwnd: snap.focus_hwnd,
+                focus_class: snap.focus_class.clone(),
+                focus_source_label: wind_ipc::protocol::window_source::label(
+                    snap.focus_hwnd_source,
+                )
+                .to_string(),
+                root_hwnd: snap.root_hwnd,
+                root_class: snap.root_class.clone(),
+                root_band: snap.root_band,
+                fg_hwnd: snap.fg_hwnd,
+                fg_class: snap.fg_class.clone(),
+                fg_pid: snap.fg_pid,
+                fg_process_name,
+                docmgr_id: snap.docmgr_id,
+                context_id: snap.context_id,
+                focus_session_id: snap.focus_session_id,
+                docmgr_changed: snap.docmgr_changed(),
+                host_band: snap.host_band,
+                host_whitelisted,
+                host_active,
+                received: true,
+            };
+        }
+        self.push_input_diag_hud_if_visible();
+    }
+
+    /// 下发诊断快照采集开关给 DLL（随 HUD 显隐 + 握手时）。
+    ///
+    /// 采集要查三次窗口类名 + band，故默认关；**握手时必须也推一次**——DLL 每次重连都从
+    /// 默认值（关）起步，只在切换时推会让重连后的宿主永远不采集，而 SearchHost 这类
+    /// transient 宿主恰恰最常重连，也恰恰最需要 HUD（它是 AppContainer，写不了日志）。
+    pub fn push_diag_snapshot_config(&self, client_token: u64) {
+        let enabled = self
+            .input_diag_hud_visible
+            .load(std::sync::atomic::Ordering::Relaxed);
+        let value = wind_ipc::codec::encode_diag_snapshot_value(enabled);
+        let msg = wind_ipc::codec::encode_sync_config(
+            wind_ipc::protocol::CONFIG_KEY_DIAG_SNAPSHOT,
+            &value,
+        );
+        if client_token != 0 {
+            self.push_server.push_to_token(client_token, &msg);
+        } else {
+            self.push_server.push_to_active(&msg);
+        }
+    }
+
+    /// HUD 推送（数据到达路径）：HUD 可见且**未冻结**时下发一帧。
     pub(crate) fn push_input_diag_hud_if_visible(&self) {
+        self.push_input_diag_hud(false);
+    }
+
+    /// HUD 推送。`force=true` 时无视冻结照常下发。
+    ///
+    /// ⚠ 冻结只该挡住**数据变化**引起的刷新，不该挡住用户自己的操作（切分区/切置顶/
+    /// 切冻结本身）。两者混为一谈的后果是"点了菜单屏幕毫无反应"——而那与"菜单坏了"
+    /// 在用户眼里完全一样。故所有菜单动作一律走 `force=true`。
+    pub(crate) fn push_input_diag_hud(&self, force: bool) {
         use std::sync::atomic::Ordering::Relaxed;
         if !self.input_diag_hud_visible.load(Relaxed) {
+            return;
+        }
+        if !force && self.input_diag_frozen.load(Relaxed) {
             return;
         }
         let d = self
@@ -1706,6 +1813,16 @@ impl Coordinator {
             let s = self.state.lock().unwrap_or_else(|e| e.into_inner());
             (s.ime_active, s.has_edit_context)
         };
+        // 窗口快照独立取（锁序：last_input_diag → state → last_window_diag，全程不嵌套）。
+        let window = self
+            .last_window_diag
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        let sections = *self
+            .input_diag_sections
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let view = wind_ui::manager::InputDiagView {
             process_name,
             pid,
@@ -1714,6 +1831,10 @@ impl Coordinator {
             mask,
             ime_active,
             has_edit_context,
+            window,
+            sections,
+            topmost: self.input_diag_topmost.load(Relaxed),
+            frozen: self.input_diag_frozen.load(Relaxed),
         };
         let _ = self
             .ui_tx
@@ -2155,6 +2276,9 @@ impl Coordinator {
                 self.push_password_suppress_config(0); // 密码框抑制策略（DLL 本地吃键门控）
                 self.push_custom_en_punct_config(0); // 英半列自定义标点：DLL 据此吃键转发
                 self.push_pair_state_ttl_config(0); // 配对状态时效（DLL 侧闸门据此判陈旧）
+                // 诊断采集开关本身与配置文件无关（会话级），这里重推纯属幂等保险——
+                // 与 password_suppress 同样处理，让"重载一次"能修好任何 DLL 侧状态漂移。
+                self.push_diag_snapshot_config(0);
                 self.show_toast(
                     "设置已更新",
                     ToastPosition::BottomCenter,
@@ -3360,6 +3484,7 @@ impl Coordinator {
             UiEvent::CandidateWindowMoved { x, y } => self.save_candidate_pos(x, y),
             UiEvent::RequestStatusMenu { x, y } => self.show_status_menu(x, y),
             UiEvent::RequestTooltipMenu { x, y } => self.show_tooltip_menu(x, y),
+            UiEvent::RequestInputDiagMenu { x, y } => self.show_input_diag_menu(x, y),
             UiEvent::SystemThemeChanged => self.on_system_theme_changed(),
         }
     }
@@ -3599,6 +3724,9 @@ impl Coordinator {
         self.push_password_suppress_config(client_token); // 密码框抑制策略（DLL 本地吃键门控）
         self.push_custom_en_punct_config(client_token); // 英半列自定义标点：DLL 据此吃键转发
         self.push_pair_state_ttl_config(client_token); // 配对状态时效（DLL 侧闸门据此判陈旧）
+        // 诊断采集开关：DLL 每次重连都从默认值（关）起步，握手不推则 HUD 开着也收不到
+        // 新连接宿主的快照——而最需要它的 SearchHost 恰恰是最常重连的那类。
+        self.push_diag_snapshot_config(client_token);
 
         let Some(mgr) = self.host_render() else {
             return;
@@ -6705,6 +6833,10 @@ impl MessageHandler for Coordinator {
 
     fn handle_input_state_report(&self, pid: u32, disabled: bool, reason: u8, mask: u64) {
         self.apply_input_diag(pid, disabled, reason, mask);
+    }
+
+    fn handle_diag_snapshot(&self, snap: &wind_ipc::protocol::DiagSnapshotPayload) {
+        self.apply_diag_snapshot(snap);
     }
 }
 
