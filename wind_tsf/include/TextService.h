@@ -258,6 +258,12 @@ public:
     // OnTestKeyDown 完成，早于 IPC，仅靠 core 回 PassThrough 会「吃了再吐」丢键。
     BOOL IsPasswordSuppressActive() const;
     void SetPasswordSuppressEnabled(BOOL bEnabled) { _passwordSuppressEnabled = bEnabled; }
+    // 诊断快照采集开关（core 经 CONFIG_KEY_DIAG_SNAPSHOT 推；默认关）。
+    void SetDiagSnapshotEnabled(BOOL bEnabled) { _diagSnapshotEnabled = bEnabled; }
+    // 采集并上报一次诊断快照。开关关闭时**立即返回**，一次 Win32 调用都不做——
+    // 采集本身要查三次窗口类名 + band，只有排查时才值得付这个开销。
+    // docMgrChanged 由调用方给出（只有 OnSetFocus 知道自己是不是换了文档）。
+    void SendDiagSnapshotIfEnabled(ITfDocumentMgr* pDocMgr, BOOL docMgrChanged);
     ULONGLONG GetFocusSessionId() const { return _focusSessionId; }
     // 记录 CapsLock 按键活动时刻（物理按键或服务端 cancel_on_mode_switch 的注入）。
     // Windows 输入系统会在 CapsLock 状态变化后联动写 OPENCLOSE compartment；
@@ -365,6 +371,9 @@ private:
     // 上报给 core 之外自己也留一份：IsPasswordSuppressActive 的吃键门控须本地可算。
     UINT64 _focusInputScopeMask;
     BOOL  _passwordSuppressEnabled;   // 抑制策略开关（core 经 CONFIG_KEY_PASSWORD_SUPPRESS 推；默认开）
+    // 诊断快照采集开关（core 经 CONFIG_KEY_DIAG_SNAPSHOT 推；**默认关**）。
+    // 默认关是硬要求：每次焦点切换都查三次类名 + band 的开销，不该由不排查的用户承担。
+    BOOL  _diagSnapshotEnabled;
     // 已注册的加词热键 (RegisterHotKey id, raw hash)。raw hash 高16位=KEYMOD、低16位=VK，
     // 供 UnregisterHotKey 与 WM_HOTKEY 分发反解。最多两项（add_word / open_add_word_dialog）。
     std::vector<std::pair<int, uint32_t>> _addWordHotkeyIds;

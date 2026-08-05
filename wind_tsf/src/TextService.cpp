@@ -864,6 +864,7 @@ CTextService::CTextService()
     , _langBarPasswordReported(FALSE)
     , _langBarSyncPending(FALSE)
     , _passwordSuppressEnabled(TRUE)  // 默认开，与 core 的 password_suppress_enabled 初值一致
+    , _diagSnapshotEnabled(FALSE)     // 默认关，与 core 的 input_diag_hud_visible 初值一致
     , _hasThreadFocus(FALSE)
     , _isProcessForeground(FALSE)
     , _activateFlags(0)
@@ -2333,6 +2334,15 @@ STDAPI CTextService::OnSetFocus(ITfDocumentMgr* pDocMgrFocus, ITfDocumentMgr* pD
             }
         }
 
+        // 诊断快照（异步、默认关）。刻意放在 focus_gained **之后**：那条是宿主 UI 线程上的
+        // 同步 IPC 往返，首字延迟就挂在它身上，采集的三次类名查询绝不能进去。
+        //
+        // ⚠ docMgrChanged 必须在下面更新 _pLastActiveDocMgr **之前**算——缓存一旦刷新，
+        // 「换没换文档」这个信息就永久丢失了，而它只有 DLL 知道，core 无从推导。
+        // 位置也刻意在 transient 跳过分支之外：那个分支不发 focus_gained，但恰恰是
+        // 「首字母上屏」「候选窗钉死旧 DocMgr」这类问题的现场，诊断必须能看见它。
+        SendDiagSnapshotIfEnabled(pDocMgrFocus, _pLastActiveDocMgr != pDocMgrFocus);
+
         // 记住本次活跃文档，供下次 OnSetFocus 比对。**必须 AddRef 保活**：仅存裸指针的话，
         // 旧 DocMgr 释放后新对象可能落在同一地址，"换了文档"会被误判成抖动而漏清理。
         // locked/transient（XamlIsland）不入缓存——上面已对其跳过 focus_gained 视作非事件，
@@ -2872,6 +2882,16 @@ STDAPI CTextService::OnChange(REFGUID rguid)
             _focusInputScopeMask = curMask;
             uint8_t curReason = ComputeInputReason(bDisabled != FALSE, curMask);
             _pIPCClient->SendInputStateReport(GetCurrentProcessId(), bDisabled != FALSE, curReason, curMask);
+            // 同一现场的窗口/上下文快照也补一份：本路径「焦点未变但禁用态翻转」不走
+            // OnSetFocus，不补的话 HUD 的输入态那半会更新、窗口那半停在上一次焦点，
+            // 两半各自为真却互相矛盾——诊断工具自身自相矛盾是最坏的一种失败。
+            // docMgrChanged=FALSE：本路径按定义就没换文档。
+            ITfDocumentMgr* pDocMgrDiag = nullptr;
+            if (SUCCEEDED(_pThreadMgr->GetFocus(&pDocMgrDiag)) && pDocMgrDiag != nullptr)
+            {
+                SendDiagSnapshotIfEnabled(pDocMgrDiag, FALSE);
+                pDocMgrDiag->Release();
+            }
         }
 
         return S_OK;
@@ -4078,6 +4098,119 @@ BOOL CTextService::IsPasswordSuppressActive() const
     // IS_PASSWORD=31 / IS_NUMERIC_PASSWORD=63（对齐 core is_password_scope 的两位）。
     // 常量在文件顶部单点定义——此处曾另有一份局部展开，两处各自维护即有漂移风险。
     return (_focusInputScopeMask & kPasswordScopeBits) != 0;
+}
+
+// GetWindowBand：user32 的未文档化导出（与 CHostWindow::_ResolveAPIs 同源）。
+// 独立解析一份而不复用 CHostWindow 的：诊断要在**未建 host 窗口**时也能报 band，
+// 那正是"该走 host 却没走"的排查现场，此时那个对象根本不存在。
+// 解析一次后缓存（含失败态：解析不到就恒返回 0，不必每次重试）。
+static DWORD _QueryWindowBand(HWND hwnd)
+{
+    typedef BOOL (WINAPI* GetWindowBand_t)(HWND, DWORD*);
+    static GetWindowBand_t s_pfnGetWindowBand = nullptr;
+    static BOOL s_resolved = FALSE;
+    if (!s_resolved)
+    {
+        s_resolved = TRUE;
+        HMODULE hUser32 = GetModuleHandleW(L"user32.dll");
+        if (hUser32 != nullptr)
+            s_pfnGetWindowBand = (GetWindowBand_t)GetProcAddress(hUser32, "GetWindowBand");
+    }
+    DWORD band = 0;
+    if (s_pfnGetWindowBand != nullptr && hwnd != nullptr)
+        s_pfnGetWindowBand(hwnd, &band);
+    return band;
+}
+
+// 窗口类名。取不到一律空串（消费端渲染成 "?"）——诊断数据缺一格也要能发出去。
+static std::wstring _QueryWindowClass(HWND hwnd)
+{
+    if (hwnd == nullptr)
+        return std::wstring();
+    wchar_t buf[256] = {};
+    int n = GetClassNameW(hwnd, buf, (int)(sizeof(buf) / sizeof(buf[0])));
+    return n > 0 ? std::wstring(buf, (size_t)n) : std::wstring();
+}
+
+// 采集并上报一次诊断快照。见 TextService.h 的声明注释。
+void CTextService::SendDiagSnapshotIfEnabled(ITfDocumentMgr* pDocMgr, BOOL docMgrChanged)
+{
+    // 关闭时一次 Win32 调用都不做。这个早退是本功能"默认零开销"的全部依据。
+    if (!_diagSnapshotEnabled)
+        return;
+    if (_pIPCClient == nullptr || !_pIPCClient->IsConnected())
+        return;
+
+    DiagSnapshotHeader head = {};
+    head.pid = GetCurrentProcessId();
+    head.focusSessionId = (uint32_t)(_focusSessionId & 0xFFFFFFFFULL);
+    head.flags = docMgrChanged ? DIAG_FLAG_DOCMGR_CHANGED : (uint8_t)0;
+    head.docMgrId = (uint64_t)(uintptr_t)pDocMgr;
+
+    // ── 焦点窗口：三条通路按可信度依次尝试，并记下**实际用了哪条** ──
+    // 不记来源的话，"焦点窗口"这一格在不同宿主下会是语义完全不同的三种东西
+    // （其中 FOREGROUND 甚至可能不属于本进程），而 HUD 的读者无从分辨。
+    HWND hwndFocus = nullptr;
+    uint8_t src = WND_SRC_NONE;
+
+    ITfContext* pContext = nullptr;
+    if (pDocMgr != nullptr && SUCCEEDED(pDocMgr->GetTop(&pContext)) && pContext != nullptr)
+    {
+        head.contextId = (uint64_t)(uintptr_t)pContext;
+        ITfContextView* pView = nullptr;
+        if (SUCCEEDED(pContext->GetActiveView(&pView)) && pView != nullptr)
+        {
+            HWND h = nullptr;
+            // 受限宿主（SearchHost 等）这里常返回 S_OK + null，故必须判 h 本身。
+            if (SUCCEEDED(pView->GetWnd(&h)) && h != nullptr)
+            {
+                hwndFocus = h;
+                src = WND_SRC_TSF_VIEW;
+            }
+            pView->Release();
+        }
+        pContext->Release();
+    }
+
+    if (hwndFocus == nullptr)
+    {
+        GUITHREADINFO gti = {};
+        gti.cbSize = sizeof(GUITHREADINFO);
+        if (GetGUIThreadInfo(GetCurrentThreadId(), &gti) && gti.hwndFocus != nullptr)
+        {
+            hwndFocus = gti.hwndFocus;
+            src = WND_SRC_GUI_THREAD;
+        }
+    }
+
+    HWND hwndFg = GetForegroundWindow();
+    if (hwndFocus == nullptr && hwndFg != nullptr)
+    {
+        hwndFocus = hwndFg;
+        src = WND_SRC_FOREGROUND;
+    }
+
+    HWND hwndRoot = (hwndFocus != nullptr) ? GetAncestor(hwndFocus, GA_ROOT) : nullptr;
+
+    head.focusHwnd = (uint64_t)(uintptr_t)hwndFocus;
+    head.focusHwndSource = src;
+    head.rootHwnd = (uint64_t)(uintptr_t)hwndRoot;
+    head.rootBand = _QueryWindowBand(hwndRoot);
+    head.fgHwnd = (uint64_t)(uintptr_t)hwndFg;
+    if (hwndFg != nullptr)
+    {
+        DWORD fgPid = 0;
+        GetWindowThreadProcessId(hwndFg, &fgPid);
+        head.fgPid = fgPid;
+    }
+    // 报**实际建成**的 band，不是当初想建的那个（见 CHostWindow::GetCurrentBand 注释）。
+    CHostWindow* pCandHost = _pHostWindow[HOST_WINDOW_CANDIDATE];
+    head.hostBand = (pCandHost != nullptr) ? pCandHost->GetCurrentBand() : 0;
+
+    _pIPCClient->SendDiagSnapshot(head,
+                                  _QueryWindowClass(hwndFocus),
+                                  _QueryWindowClass(hwndRoot),
+                                  _QueryWindowClass(hwndFg));
 }
 
 void CTextService::_ScheduleLangBarStateSync()

@@ -79,6 +79,15 @@ pub fn decode_input_state_report(payload: &[u8]) -> Result<InputStateReportPaylo
     })
 }
 
+/// 从载荷字节解码 DiagSnapshotPayload（CMD_DIAG_SNAPSHOT 0x0214）。
+/// 变长类名区残缺不算失败（见 `DiagSnapshotPayload::from_bytes`），只有定长头不足才报错。
+pub fn decode_diag_snapshot(payload: &[u8]) -> Result<DiagSnapshotPayload, CodecError> {
+    DiagSnapshotPayload::from_bytes(payload).ok_or(CodecError::BufferTooShort {
+        need: DiagSnapshotPayload::HEAD_SIZE,
+        got: payload.len(),
+    })
+}
+
 /// 编码 CommitText 响应 (CMD_COMMIT_TEXT 0x0101)
 ///
 /// 格式: CommitTextHeader(12) + UTF-8 text + optional newComposition
@@ -1101,6 +1110,12 @@ pub fn encode_english_pairs_value(enabled: bool, pairs: &[(char, char)]) -> Vec<
 /// 编码密码框抑制策略开关的值部分（对齐 TSF `OnSyncConfig` 的 CONFIG_KEY_PASSWORD_SUPPRESS）。
 /// 格式：enabled(u8)。DLL 需要它才能在 `OnTestKeyDown` 本地判定是否放行——吃键决策早于 IPC。
 pub fn encode_password_suppress_value(enabled: bool) -> Vec<u8> {
+    vec![enabled as u8]
+}
+
+/// 编码诊断快照采集开关的值部分（对齐 TSF `OnSyncConfig` 的 CONFIG_KEY_DIAG_SNAPSHOT）。
+/// 格式：enabled(u8)。默认关，随输入诊断 HUD 显隐推送；关闭时 DLL 完全不采集。
+pub fn encode_diag_snapshot_value(enabled: bool) -> Vec<u8> {
     vec![enabled as u8]
 }
 

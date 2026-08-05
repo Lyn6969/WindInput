@@ -385,6 +385,13 @@ fn handle_client(
         {
             handler.handle_input_state_report(r.pid, r.disabled != 0, r.reason, r.input_scope_mask);
         }
+
+        // 诊断快照（异步、无响应）。DLL 仅在服务端推开采集后才发，故这里不做额外门控。
+        if cmd == CMD_DIAG_SNAPSHOT
+            && let Ok(snap) = decode_diag_snapshot(payload)
+        {
+            handler.handle_diag_snapshot(&snap);
+        }
     }
 
     // 断线清理：连接彻底消失，移除其 host-render 实例状态并（若为可见 owner）隐藏其帧。

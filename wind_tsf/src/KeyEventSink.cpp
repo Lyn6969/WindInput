@@ -2385,6 +2385,14 @@ void CKeyEventSink::OnSyncConfig(const std::string& key, const std::vector<uint8
         _pTextService->SetPasswordSuppressEnabled(enabled);
         WIND_LOG_INFO_FMT(L"Password suppress policy updated: enabled=%d\n", enabled);
     }
+    else if (key == CONFIG_KEY_DIAG_SNAPSHOT)
+    {
+        // 格式：enabled(u8)（对齐 Rust encode_diag_snapshot_value）
+        if (value.empty()) return;
+        BOOL enabled = value[0] != 0;
+        _pTextService->SetDiagSnapshotEnabled(enabled);
+        WIND_LOG_INFO_FMT(L"Diag snapshot collection updated: enabled=%d\n", enabled);
+    }
     else if (key == CONFIG_KEY_STATS)
     {
         if (value.size() < 2) return;

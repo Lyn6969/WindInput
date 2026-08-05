@@ -40,6 +40,15 @@ constexpr uint32_t HOST_RENDER_FAIL_WINDOW_CREATE = 1; // CreateWindowInBand fai
 // on the same control, such as clicking a password field inside the same web page).
 // Payload: InputStateReportPayload (14 bytes). Rust side: InputStateReportPayload (Task 2).
 constexpr uint16_t CMD_INPUT_STATE_REPORT    = 0x0213;
+// Diagnostics snapshot (C++ -> core, async): focus window chain + foreground window + TSF
+// context instance ids. Payload: DiagSnapshotHeader (64 bytes) followed by three
+// length-prefixed UTF-8 class names (focus / root / foreground), each `len u16 LE + bytes`.
+//
+// 刻意**不并入** CMD_FOCUS_GAINED：那条路径是宿主 UI 线程上的同步 IPC 往返（见
+// TextService.cpp 的 focusIpcT0 计时），首字延迟直接挂在它身上。本命令要做三次窗口类名
+// 查询 + band 查询，塞进去等于给每次焦点切换加固定开销。故独立成命令、异步发送，且由
+// CONFIG_KEY_DIAG_SNAPSHOT 门控——HUD 关闭时一次都不采集。
+constexpr uint16_t CMD_DIAG_SNAPSHOT         = 0x0214;
 constexpr uint16_t CMD_COMPOSITION_TERMINATED = 0x0209; // Composition unexpectedly terminated (e.g., user clicked in input field)
 constexpr uint16_t CMD_CARET_UPDATE     = 0x0301; // Caret position update
 constexpr uint16_t CMD_SELECTION_CHANGED = 0x0302; // Selection/caret changed without composition (from ITfTextEditSink)
@@ -541,6 +550,45 @@ struct InputStateReportPayload
 };
 static_assert(sizeof(InputStateReportPayload) == 14, "InputStateReportPayload must be 14 bytes");
 
+// ── 焦点窗口句柄的来源域（DiagSnapshotHeader::focusHwndSource）────────────────
+// ⚠ 三条通路给出的**不是同一件东西**，压进一个字段而不标来源，下游就再也分不开了
+// ——与 CARET_SRC_* 给 caret 坐标分域是同一个教训。这里尤其要命：FOREGROUND 域的窗口
+// 可能根本不属于本进程（Win10 任务栏搜索就是前台窗口归 SearchUI、焦点在 explorer），
+// 拿它当"焦点窗口"去推 per-app 判据必然推错。
+constexpr uint8_t WND_SRC_NONE       = 0; // 三条通路都没拿到
+constexpr uint8_t WND_SRC_TSF_VIEW   = 1; // ITfContextView::GetWnd()——TSF 域，最准
+constexpr uint8_t WND_SRC_GUI_THREAD = 2; // GetGUIThreadInfo().hwndFocus——线程域
+constexpr uint8_t WND_SRC_FOREGROUND = 3; // GetForegroundWindow()——跨进程，兜底
+
+// DiagSnapshotHeader::flags 位：本次焦点相对上一次换了 DocMgr。
+// 只有 DLL 知道这件事（它持有 _pLastActiveDocMgr），core 无从推导，故必须随包上报。
+constexpr uint8_t DIAG_FLAG_DOCMGR_CHANGED = 0x01;
+
+// CMD_DIAG_SNAPSHOT 定长头（64 bytes）。字段顺序/偏移**必须**与 Rust
+// DiagSnapshotPayload 完全一致——两侧都是手写序列化，没有任何编译期约束把它们绑住，
+// Rust 侧 `diag_snapshot_head_layout_is_frozen` 与这里的 static_assert 是仅有的两道闸。
+//
+// 句柄一律按 uint64 传：DLL 可能是 32 位也可能是 64 位，HWND 宽度不同；统一零扩展后
+// 两侧偏移才是一个固定值。这些值只用于展示与同一性比较（"还是不是刚才那个窗口/文档"），
+// 服务进程不会拿它去调任何 Win32 API——跨进程句柄无效。
+struct DiagSnapshotHeader
+{
+    uint32_t pid;              // offset 0:  GetCurrentProcessId()
+    uint32_t fgPid;            // offset 4:  前台窗口所属进程（≠pid 即"焦点与前台分属两进程"）
+    uint64_t focusHwnd;        // offset 8:  焦点窗口，来源见 focusHwndSource
+    uint64_t rootHwnd;         // offset 16: GetAncestor(GA_ROOT)——per-app 窗口级判据取它
+    uint64_t fgHwnd;           // offset 24: GetForegroundWindow()
+    uint64_t docMgrId;         // offset 32: 焦点 ITfDocumentMgr 指针（仅作实例标识）
+    uint64_t contextId;        // offset 40: 焦点 ITfContext 指针（仅作实例标识）
+    uint32_t focusSessionId;   // offset 48: _focusSessionId 低 32 位（与日志对齐）
+    uint32_t rootBand;         // offset 52: 顶层窗口 z-band（GetWindowBand，取不到为 0）
+    uint32_t hostBand;         // offset 56: host-render band 窗口当前 band（0=未建）
+    uint8_t  focusHwndSource;  // offset 60: WND_SRC_*
+    uint8_t  flags;            // offset 61: DIAG_FLAG_*
+    uint16_t reserved;         // offset 62: 留零。加字段优先吃它，别再动偏移量
+};
+static_assert(sizeof(DiagSnapshotHeader) == 64, "DiagSnapshotHeader must be 64 bytes");
+
 // Input stats payload (from C++ to Go, async)
 // Counts of characters typed in English mode (not intercepted by Go)
 struct InputStatsPayload
@@ -567,6 +615,9 @@ constexpr const char* CONFIG_KEY_STATS = "stats";
 // OnTestKeyDown 本地判定是否放行——吃键决策发生在 IPC 之前，仅靠 core 回 PassThrough
 // 已经太晚（会形成「吃了再吐」丢键）。
 constexpr const char* CONFIG_KEY_PASSWORD_SUPPRESS = "password_suppress";
+// 诊断快照采集开关（会话级，随输入诊断 HUD 显隐）。格式：enabled(u8)。默认关。
+// 采集要查三次窗口类名 + band，属于「只有排查时才值得付」的开销。
+constexpr const char* CONFIG_KEY_DIAG_SNAPSHOT = "diag_snapshot";
 // 「英文半角列有自定义标点映射」的源字符集合。英文模式（非全角）下本 DLL 默认直接透传标点键、
 // core 收不到，用户配的「英半」列因此永远不生效；据此集合精确吃下这些键转发给 core。
 // 集合为空（默认）= 行为与历史完全一致。格式：count(u8) + [ch:u16(LE)]...

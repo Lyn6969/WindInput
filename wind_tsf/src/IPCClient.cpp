@@ -899,6 +899,53 @@ BOOL CIPCClient::SendInputStateReport(uint32_t pid, bool disabled, uint8_t reaso
     return _SendBinaryMessage(CMD_INPUT_STATE_REPORT, &payload, sizeof(payload), true /* async */);
 }
 
+// UTF-16 → UTF-8，用于诊断快照的变长类名段。失败/空串一律产出空段（诊断数据缺一格
+// 也要能发出去，见 Rust 侧 DiagSnapshotPayload::from_bytes 对截断的容忍）。
+static std::string _Utf16ToUtf8(const std::wstring& w)
+{
+    if (w.empty())
+        return std::string();
+    int need = WideCharToMultiByte(CP_UTF8, 0, w.c_str(), (int)w.size(), nullptr, 0, nullptr, nullptr);
+    if (need <= 0)
+        return std::string();
+    std::string out((size_t)need, '\0');
+    WideCharToMultiByte(CP_UTF8, 0, w.c_str(), (int)w.size(), out.data(), need, nullptr, nullptr);
+    return out;
+}
+
+BOOL CIPCClient::SendDiagSnapshot(const DiagSnapshotHeader& head,
+                                  const std::wstring& focusClass,
+                                  const std::wstring& rootClass,
+                                  const std::wstring& fgClass)
+{
+    if (!IsConnected())
+    {
+        return FALSE;
+    }
+
+    // 定长头 + 三段 `len u16 LE + UTF-8`。手写拼包（含变长区，无法用单个 struct 表达），
+    // 字段布局以 DiagSnapshotHeader 的 static_assert 与 Rust 的布局冻结测试为准。
+    std::vector<uint8_t> buf;
+    buf.resize(sizeof(DiagSnapshotHeader));
+    memcpy(buf.data(), &head, sizeof(DiagSnapshotHeader));
+
+    const std::wstring* classes[3] = { &focusClass, &rootClass, &fgClass };
+    for (const std::wstring* w : classes)
+    {
+        std::string utf8 = _Utf16ToUtf8(*w);
+        if (utf8.size() > 0xFFFF)
+            utf8.resize(0xFFFF); // 长度前缀是 u16；类名不可能到这个量级，纯防御
+        uint16_t len = (uint16_t)utf8.size();
+        buf.push_back((uint8_t)(len & 0xFF));
+        buf.push_back((uint8_t)(len >> 8));
+        buf.insert(buf.end(), utf8.begin(), utf8.end());
+    }
+
+    // 纯观测数据，异步 fire-and-forget（对齐 SendInputStateReport）：不等响应，
+    // 也绝不能让它出现在任何同步等待路径上。
+    return _SendBinaryMessage(CMD_DIAG_SNAPSHOT, buf.data(), (DWORD)buf.size(), true /* async */);
+}
+
 BOOL CIPCClient::SendIMEDeactivated()
 {
     if (!IsConnected())

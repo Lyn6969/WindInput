@@ -36,6 +36,14 @@ pub const CMD_COMPOSITION_TERMINATED: u16 = 0x0209;
 pub const CMD_SHOW_CONTEXT_MENU: u16 = 0x020A;
 pub const CMD_SYSTEM_MODE_SWITCH: u16 = 0x020B;
 pub const CMD_INPUT_STATE_REPORT: u16 = 0x0213;
+/// 诊断快照（上行，异步）：焦点窗口链 + 前台窗口 + TSF 上下文实例 id。载荷见
+/// [`DiagSnapshotPayload`]。
+///
+/// **刻意不并入 `CMD_FOCUS_GAINED`**：那条路径是宿主 UI 线程上的**同步** IPC 往返
+/// （见 `TextService.cpp` 的 `focusIpcT0` 计时），首字延迟直接挂在它身上；本命令要做
+/// 三次窗口类名查询 + band 查询，塞进去等于给每次焦点切换加固定开销。故独立成命令、
+/// 异步发送，且由 [`CONFIG_KEY_DIAG_SNAPSHOT`] 门控——HUD 关闭时 DLL 一次都不采集。
+pub const CMD_DIAG_SNAPSHOT: u16 = 0x0214;
 
 /// `CMD_FOCUS_LOST` 载荷的 reason 字段（第 9 字节）。与 C++ `BinaryProtocol.h` 的
 /// `FOCUS_LOST_REASON_*` 一一对应，改动须两边同步。
@@ -217,6 +225,12 @@ pub const CONFIG_KEY_CUSTOM_EN_PUNCT: &str = "custom_en_punct";
 /// **刻意不并入 `CONFIG_KEY_JUMP_OUT_KEYS` 的 payload**：那个格式已经改过一次
 /// （前置 `right_symbol` u8，两侧解析偏移 1→2），再叠字段容易出现偏移不同步。
 pub const CONFIG_KEY_PAIR_STATE_TTL: &str = "pair_state_ttl";
+/// 诊断快照采集开关（会话级，随输入诊断 HUD 显隐）同步键名。格式：`enabled(u8)`。
+///
+/// 采集本身要查三次窗口类名 + band，属于「只有排查时才值得付」的开销，故默认关闭、
+/// 由服务端在 HUD 打开时推开。**必须在握手时也推一次**：DLL 每次重连都从默认值
+/// （关）起步，只在切换时推会让重连后的宿主永远不采集（`push_connect_fix` 记过同型）。
+pub const CONFIG_KEY_DIAG_SNAPSHOT: &str = "diag_snapshot";
 
 // 消费确认
 pub const CMD_CONSUMED: u16 = 0x0401;
@@ -564,6 +578,166 @@ impl InputStateReportPayload {
 }
 
 // ──────────────────────────────────────────────
+// Diag Snapshot Payload (64B 定长头 + 3 段变长类名)
+// ──────────────────────────────────────────────
+
+/// 焦点窗口句柄的来源域（`DiagSnapshotPayload::focus_hwnd_source`）。
+///
+/// ⚠ **三条通路给出的不是同一件东西**，压进一个字段而不标来源，下游就再也分不开了
+/// ——这与 [`caret_source`] 给 caret 坐标分域是同一个教训（曾让 `GetGUIThreadInfo` 的
+/// Win32 光标冒充 TSF 插入点，Word 非正文行错位 814px）。这里尤其要命：
+/// `Foreground` 域的窗口**可能根本不属于本进程**（Win10 任务栏搜索就是前台窗口归
+/// SearchUI、焦点在 explorer），拿它当"焦点窗口"去推 per-app 判据必然推错。
+pub mod window_source {
+    /// 一个都没拿到（受限宿主可能三条全空）。
+    pub const NONE: u8 = 0;
+    /// `ITfContextView::GetWnd()`——TSF 域，最准；受限宿主（SearchHost）常返回 null。
+    pub const TSF_VIEW: u8 = 1;
+    /// `GetGUIThreadInfo().hwndFocus`——线程域，属于本进程但未必是 TSF 上下文所在窗口。
+    pub const GUI_THREAD: u8 = 2;
+    /// `GetForegroundWindow()`——**跨进程**，最后兜底，判据价值最低。
+    pub const FOREGROUND: u8 = 3;
+
+    /// 来源的中文标签（HUD 展示用）。
+    pub fn label(v: u8) -> &'static str {
+        match v {
+            TSF_VIEW => "TSF",
+            GUI_THREAD => "GUI",
+            FOREGROUND => "前台",
+            _ => "无",
+        }
+    }
+}
+
+/// [`DiagSnapshotPayload::flags`] 位：本次焦点相对上一次换了 DocMgr。
+///
+/// 只有 DLL 知道这件事（它持有 `_pLastActiveDocMgr`），服务端无从推导，故必须随包上报。
+pub const DIAG_FLAG_DOCMGR_CHANGED: u8 = 1 << 0;
+
+/// 诊断快照载荷：焦点窗口链 + 前台窗口 + TSF 上下文实例 id。
+///
+/// 布局＝64 字节定长头 + 三段 `len(u16 LE) + UTF-8` 类名（focus / root / foreground）。
+/// 定长头刻意留 `reserved`，加字段时优先吃它，避免又一次改动偏移量。
+///
+/// **句柄一律按 u64 传**：DLL 可能是 32 位也可能是 64 位，`HWND` 宽度不同；统一
+/// 零扩展成 u64 后两侧偏移才是一个固定值。这些值只用于展示与同一性比较（"还是不是
+/// 刚才那个窗口/文档"），服务进程不会拿它去调任何 Win32 API——跨进程句柄无效。
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct DiagSnapshotPayload {
+    /// 宿主进程 id（DLL 所在进程）。
+    pub pid: u32,
+    /// 前台窗口所属进程 id。与 `pid` 不同即说明"输入焦点和前台窗口分属两个进程"。
+    pub fg_pid: u32,
+    /// 焦点窗口句柄，来源见 `focus_hwnd_source`。
+    pub focus_hwnd: u64,
+    /// 焦点窗口的顶层窗口（`GetAncestor(GA_ROOT)`）。**per-app 窗口级判据取这个**
+    /// ——控件自身类名（`Edit`/`DirectUIHWND`）跨版本不稳定，顶层类名
+    /// （`Shell_TrayWnd`/`CabinetWClass`/`Progman`）才是干净的判据。
+    pub root_hwnd: u64,
+    /// 前台窗口句柄（可能属于别的进程）。
+    pub fg_hwnd: u64,
+    /// 焦点 `ITfDocumentMgr` 的指针值，仅作实例同一性标识。
+    pub docmgr_id: u64,
+    /// 焦点 `ITfContext`（DocMgr 的 top context）指针值，仅作实例同一性标识。
+    pub context_id: u64,
+    /// DLL 的焦点会话序号（`_focusSessionId`），用于把 HUD 快照与日志对齐。
+    pub focus_session_id: u32,
+    /// 顶层窗口的 z-band（`GetWindowBand`，未文档化导出；取不到为 0）。
+    pub root_band: u32,
+    /// DLL 的 host-render band 窗口当前 band（0 = 未建 host 窗口）。
+    pub host_band: u32,
+    /// `focus_hwnd` 的来源域，取值见 [`window_source`]。
+    pub focus_hwnd_source: u8,
+    /// 位标志，见 [`DIAG_FLAG_DOCMGR_CHANGED`]。
+    pub flags: u8,
+    /// 焦点窗口类名。
+    pub focus_class: String,
+    /// 顶层窗口类名。
+    pub root_class: String,
+    /// 前台窗口类名。
+    pub fg_class: String,
+}
+
+impl DiagSnapshotPayload {
+    /// 定长头字节数（变长类名区跟在其后）。
+    pub const HEAD_SIZE: usize = 64;
+
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let mut b = vec![0u8; Self::HEAD_SIZE];
+        b[0..4].copy_from_slice(&self.pid.to_le_bytes());
+        b[4..8].copy_from_slice(&self.fg_pid.to_le_bytes());
+        b[8..16].copy_from_slice(&self.focus_hwnd.to_le_bytes());
+        b[16..24].copy_from_slice(&self.root_hwnd.to_le_bytes());
+        b[24..32].copy_from_slice(&self.fg_hwnd.to_le_bytes());
+        b[32..40].copy_from_slice(&self.docmgr_id.to_le_bytes());
+        b[40..48].copy_from_slice(&self.context_id.to_le_bytes());
+        b[48..52].copy_from_slice(&self.focus_session_id.to_le_bytes());
+        b[52..56].copy_from_slice(&self.root_band.to_le_bytes());
+        b[56..60].copy_from_slice(&self.host_band.to_le_bytes());
+        b[60] = self.focus_hwnd_source;
+        b[61] = self.flags;
+        // b[62..64] reserved，保持 0
+        for s in [&self.focus_class, &self.root_class, &self.fg_class] {
+            let bytes = s.as_bytes();
+            let len = bytes.len().min(u16::MAX as usize);
+            b.extend_from_slice(&(len as u16).to_le_bytes());
+            b.extend_from_slice(&bytes[..len]);
+        }
+        b
+    }
+
+    /// 解析。头部不足即 `None`；变长区**残缺只让对应类名退化为空串**，不否掉整包
+    /// ——诊断数据宁可缺一格也要能显示其余部分（同 `de_initial_mode` 的爆炸半径思路）。
+    pub fn from_bytes(buf: &[u8]) -> Option<Self> {
+        if buf.len() < Self::HEAD_SIZE {
+            return None;
+        }
+        let mut p = Self {
+            pid: u32::from_le_bytes(buf[0..4].try_into().ok()?),
+            fg_pid: u32::from_le_bytes(buf[4..8].try_into().ok()?),
+            focus_hwnd: u64::from_le_bytes(buf[8..16].try_into().ok()?),
+            root_hwnd: u64::from_le_bytes(buf[16..24].try_into().ok()?),
+            fg_hwnd: u64::from_le_bytes(buf[24..32].try_into().ok()?),
+            docmgr_id: u64::from_le_bytes(buf[32..40].try_into().ok()?),
+            context_id: u64::from_le_bytes(buf[40..48].try_into().ok()?),
+            focus_session_id: u32::from_le_bytes(buf[48..52].try_into().ok()?),
+            root_band: u32::from_le_bytes(buf[52..56].try_into().ok()?),
+            host_band: u32::from_le_bytes(buf[56..60].try_into().ok()?),
+            focus_hwnd_source: buf[60],
+            flags: buf[61],
+            ..Default::default()
+        };
+        let mut off = Self::HEAD_SIZE;
+        let next = |buf: &[u8], off: &mut usize| -> String {
+            if *off + 2 > buf.len() {
+                return String::new();
+            }
+            let len = u16::from_le_bytes([buf[*off], buf[*off + 1]]) as usize;
+            *off += 2;
+            let end = (*off + len).min(buf.len());
+            let s = String::from_utf8_lossy(&buf[*off..end]).into_owned();
+            *off = end;
+            s
+        };
+        p.focus_class = next(buf, &mut off);
+        p.root_class = next(buf, &mut off);
+        p.fg_class = next(buf, &mut off);
+        Some(p)
+    }
+
+    /// 本次焦点是否换了 DocMgr。
+    pub fn docmgr_changed(&self) -> bool {
+        self.flags & DIAG_FLAG_DOCMGR_CHANGED != 0
+    }
+
+    /// 前台窗口是否属于**别的**进程。Win10 任务栏搜索的判据信号：焦点在 explorer，
+    /// 前台窗口却归 SearchUI/SearchApp——只看进程名永远看不出这件事。
+    pub fn foreground_is_other_process(&self) -> bool {
+        self.fg_pid != 0 && self.pid != 0 && self.fg_pid != self.pid
+    }
+}
+
+// ──────────────────────────────────────────────
 // Commit Request Payload (12 + variable)
 // ──────────────────────────────────────────────
 
@@ -775,6 +949,84 @@ mod input_diag_wire_tests {
         assert_eq!(d.disabled, 1);
         assert_eq!(d.reason, 1);
         assert_eq!(d.input_scope_mask, 1 << 31);
+    }
+
+    fn sample_diag() -> DiagSnapshotPayload {
+        DiagSnapshotPayload {
+            pid: 4242,
+            fg_pid: 777,
+            focus_hwnd: 0x0000_0000_00A1_B2C3,
+            root_hwnd: 0x0000_0001_1122_3344,
+            fg_hwnd: 0x0000_0000_0055_6677,
+            docmgr_id: 0x7FF6_1234_5678_9ABC,
+            context_id: 0x7FF6_1234_5678_0000,
+            focus_session_id: 19,
+            root_band: 13,
+            host_band: 6,
+            focus_hwnd_source: window_source::TSF_VIEW,
+            flags: DIAG_FLAG_DOCMGR_CHANGED,
+            focus_class: "Edit".into(),
+            root_class: "Shell_TrayWnd".into(),
+            fg_class: "Windows.UI.Core.CoreWindow".into(),
+        }
+    }
+
+    #[test]
+    fn diag_snapshot_roundtrip() {
+        let p = sample_diag();
+        let bytes = p.to_bytes();
+        let d = DiagSnapshotPayload::from_bytes(&bytes).expect("应可解析");
+        assert_eq!(d, p, "全字段往返必须一致");
+        assert!(d.docmgr_changed());
+        assert!(
+            d.foreground_is_other_process(),
+            "fg_pid≠pid 即前台属于别的进程——Win10 搜索框场景的关键信号"
+        );
+    }
+
+    /// 头部偏移是两侧手写序列化的唯一契约（C++ 侧同样手写字节，没有编译期约束把它们绑住）。
+    /// 钉死总长与几个关键字段的落点，改布局时必须显式过这一关并同步 `BinaryProtocol.h`。
+    #[test]
+    fn diag_snapshot_head_layout_is_frozen() {
+        let p = sample_diag();
+        let b = p.to_bytes();
+        assert_eq!(DiagSnapshotPayload::HEAD_SIZE, 64);
+        assert_eq!(&b[0..4], &4242u32.to_le_bytes(), "pid @0");
+        assert_eq!(&b[4..8], &777u32.to_le_bytes(), "fg_pid @4");
+        assert_eq!(&b[48..52], &19u32.to_le_bytes(), "focus_session_id @48");
+        assert_eq!(&b[52..56], &13u32.to_le_bytes(), "root_band @52");
+        assert_eq!(b[60], window_source::TSF_VIEW, "focus_hwnd_source @60");
+        assert_eq!(&b[62..64], &[0, 0], "reserved 必须留零");
+        // 变长区紧跟头部：第一段是 focus_class。
+        assert_eq!(&b[64..66], &4u16.to_le_bytes(), "focus_class 长度前缀");
+        assert_eq!(&b[66..70], b"Edit");
+    }
+
+    /// 变长区被截断时只让对应类名退化为空串，头部字段与已完整的段必须照常可读。
+    /// 诊断数据缺一格也要能显示其余部分——整包否掉等于排查时两眼一抹黑。
+    #[test]
+    fn diag_snapshot_tolerates_truncated_tail() {
+        let p = sample_diag();
+        let full = p.to_bytes();
+        // 砍到只剩头部 + 第一段类名
+        let cut = 64 + 2 + 4;
+        let d = DiagSnapshotPayload::from_bytes(&full[..cut]).expect("头部完整即应可解析");
+        assert_eq!(d.root_band, 13, "头部字段不受尾部截断影响");
+        assert_eq!(d.focus_class, "Edit", "完整的段照常可读");
+        assert_eq!(d.root_class, "", "缺失的段退化为空串");
+        assert_eq!(d.fg_class, "");
+        // 头部本身不足则整包无效（无法信任任何字段）。
+        assert!(DiagSnapshotPayload::from_bytes(&full[..63]).is_none());
+    }
+
+    #[test]
+    fn diag_snapshot_same_process_foreground_not_flagged() {
+        let mut p = sample_diag();
+        p.fg_pid = p.pid;
+        assert!(!p.foreground_is_other_process());
+        // pid 未知（0）时不得误报"跨进程"——那只是采集失败。
+        p.fg_pid = 0;
+        assert!(!p.foreground_is_other_process());
     }
 }
 

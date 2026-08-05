@@ -183,6 +183,11 @@ impl MessageHandler for DeferredHandler {
             h.handle_input_state_report(pid, disabled, reason, mask)
         })
     }
+
+    /// 诊断快照上报。同上：不转发则 HUD 的窗口/上下文分区永远是空的，且毫无报错。
+    fn handle_diag_snapshot(&self, snap: &DiagSnapshotPayload) {
+        self.with_handler((), |h| h.handle_diag_snapshot(snap))
+    }
 }
 
 #[cfg(test)]
@@ -209,6 +214,9 @@ mod tests {
         }
         fn handle_input_state_report(&self, _pid: u32, _dis: bool, _r: u8, _m: u64) {
             self.calls.lock().unwrap().push("input_state_report");
+        }
+        fn handle_diag_snapshot(&self, _s: &DiagSnapshotPayload) {
+            self.calls.lock().unwrap().push("diag_snapshot");
         }
 
         // ── 以下仅为满足 trait 的必需项，本测试不关心 ──
@@ -259,16 +267,25 @@ mod tests {
         // 未就绪：静默丢弃、不 panic（启动早期 DLL 可能已在上报）。
         deferred.handle_english_stats(1, 2, 3, 4);
         deferred.handle_input_state_report(1, true, 2, 3);
+        deferred.handle_diag_snapshot(&DiagSnapshotPayload::default());
         assert!(rec.calls.lock().unwrap().is_empty(), "未就绪时不应触达内层");
 
         deferred.set_ready(rec.clone());
         deferred.handle_english_stats(5, 0, 0, 0);
         deferred.handle_input_state_report(42, true, 1, 0xFF);
+        deferred.handle_diag_snapshot(&DiagSnapshotPayload {
+            pid: 42,
+            ..Default::default()
+        });
 
         assert!(
             rec.got("english_stats"),
             "英文统计未转发 → DLL 发了也白发，今日英文恒为 0"
         );
         assert!(rec.got("input_state_report"), "输入诊断上报未转发");
+        assert!(
+            rec.got("diag_snapshot"),
+            "诊断快照未转发 → HUD 的窗口/上下文分区恒为空"
+        );
     }
 }

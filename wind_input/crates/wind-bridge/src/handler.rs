@@ -8,6 +8,10 @@ use wind_ipc::protocol::KeyPayload;
 // 都经 `use crate::handler::*` 引入，不 re-export 会让它们各自去写 wind_ipc 路径。
 pub use wind_ipc::protocol::FocusLostReason;
 
+// 同上：诊断快照载荷直接作签名类型，不再在此复刻一份等价结构——它有 14 个字段，
+// 复刻等于给「两处独立事实」再开一个入口，而这类结构改动时最容易漏的就是中间层。
+pub use wind_ipc::protocol::DiagSnapshotPayload;
+
 /// 按键事件数据
 #[derive(Debug, Clone)]
 pub struct KeyEventData {
@@ -352,6 +356,13 @@ pub trait MessageHandler: Send + Sync {
 
     /// compartment 禁用态变更（不换焦点）上报。默认空实现。
     fn handle_input_state_report(&self, _pid: u32, _disabled: bool, _reason: u8, _mask: u64) {}
+
+    /// 诊断快照上报（焦点窗口链 / 前台窗口 / TSF 上下文实例 id）。
+    ///
+    /// 仅在服务端经 `CONFIG_KEY_DIAG_SNAPSHOT` 推开采集后才会到达；HUD 关闭时 DLL 一条不发。
+    /// 纯观测数据，**不得**参与任何输入决策——它的采集时机与吃键路径无关，拿它做判据
+    /// 会引入「诊断开着才正常」这类最难查的形态。默认空实现。
+    fn handle_diag_snapshot(&self, _snap: &DiagSnapshotPayload) {}
 }
 
 #[cfg(test)]

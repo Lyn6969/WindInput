@@ -40,7 +40,10 @@ public:
     // Returns TRUE if the host window is active and rendering.
     BOOL IsActive() const { return _active; }
 
-    // Returns the current Band of the display window.
+    // 本 band 窗口**实际所在**的 band（CreateWindowInBand 之后由 GetWindowBand 复核所得）。
+    // 0 = 尚未建窗。与 GetHostBand() 不是一回事：那个是"宿主处于哪个 band"的探测结果，
+    // 用来决定往哪建；这个是"我们最后建成的窗口落在哪"。诊断快照上报的是后者——
+    // 排查时要看的是既成事实，不是当初的意图。
     DWORD GetCurrentBand() const { return _currentBand; }
 
     // Recreate the display window at a new Band (called from TSF thread on focus change).

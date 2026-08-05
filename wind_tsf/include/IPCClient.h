@@ -192,6 +192,14 @@ public:
     // happens without a new OnSetFocus (SPA navigating into a password field in-place).
     BOOL SendInputStateReport(uint32_t pid, bool disabled, uint8_t reason, uint64_t inputScopeMask);
 
+    // Send diagnostics snapshot (async, fire-and-forget): focus window chain + foreground
+    // window + TSF context instance ids. Header 后接三段 `len u16 LE + UTF-8` 类名。
+    // 仅在 core 经 CONFIG_KEY_DIAG_SNAPSHOT 推开采集后才会被调用（调用方门控）。
+    BOOL SendDiagSnapshot(const DiagSnapshotHeader& head,
+                          const std::wstring& focusClass,
+                          const std::wstring& rootClass,
+                          const std::wstring& fgClass);
+
     // Send composition unexpectedly terminated notification
     // (e.g., user clicked in input field to change cursor position)
     BOOL SendCompositionTerminated();
