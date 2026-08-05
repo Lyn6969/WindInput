@@ -1,0 +1,41 @@
+[meta]
+id = "jiajia"
+name = "拼音加加"
+
+[initials]
+v = "zh"
+i = "sh"
+u = "ch"
+
+[finals]
+a = ["a"]
+b = ["ia", "ua"]
+c = ["uan"]
+d = ["ao"]
+e = ["e"]
+f = ["an"]
+g = ["ang"]
+h = ["iang", "uang"]
+i = ["i"]
+j = ["ian"]
+k = ["iao"]
+l = ["in"]
+m = ["ie"]
+n = ["iu"]
+o = ["uo", "o"]
+p = ["ou"]
+q = ["ing", "er"]
+r = ["en"]
+s = ["ai"]
+t = ["eng"]
+u = ["u"]
+v = ["ui", "v"]
+w = ["ei"]
+x = ["ue", "ve", "uai"]
+y = ["ong", "iong"]
+z = ["un"]
+
+[zero_initials]
+a = ["a", "ai", "an", "ang", "ao"]
+o = ["o", "ou"]
+e = ["e", "ei", "en", "eng", "er"]
