@@ -559,8 +559,128 @@ fn test_z_key_action_unknown_target_falls_through() {
     );
 }
 
-/// z 临拼模式下切中英文：应遵循 keys.commit_on_switch —— 开启（默认）时把拼音原码上屏，
+/// 字母引导键进临拼后回车放弃：上屏的原码**必须带上引导字母**（`zhang` 而非 `hang`）。
+///
+/// 符号引导键（`` ` ``）不带——它在码表里不产出编码，按它只可能是为了开模式。字母不同：
+/// z 在码表里是合法编码字符，用户按下时它既可能是开关也可能是码。回车放弃临拼的语义正是
+/// 「别猜了，把我打的原样给我」，此时吞掉 z 就是猜错了还不还。
+///
+/// 对照组见 `test_temp_pinyin_nonempty_enter_commit_still_outputs_code`（符号引导仍不带）。
+#[test]
+fn test_temp_pinyin_letter_guide_enter_keeps_guide_letter() {
+    if !has_schemas() {
+        return;
+    }
+    let mut cfg = config_with("wubi86");
+    cfg.schema.codetable.z_key_action = "temp_pinyin".into();
+    let coord = Coordinator::new_headless(cfg, Some(&data_dir()));
+    let entered = press_vk(&coord, 0x5A, false); // z → 进临拼，prefix = "z"
+    assert!(coord.debug_in_temp_pinyin(), "前置条件：z 应进入临拼");
+    // 组合区必须显示按下的 z。`temp_pinyin_prefix_for` 若用不带字母的映射，VK_Z 会返回
+    // None 并兜底成反引号——组合区凭空显示一个没按过的 `，下面归还引导字母的判据
+    // （首字符是否字母）也会永远不成立。
+    assert_eq!(
+        action_text(&entered).unwrap_or_default(),
+        "z",
+        "组合区应显示按下的引导字母，而非兜底反引号"
+    );
+    for c in "hang".chars() {
+        press_letter(&coord, c);
+    }
+    match coord.handle_key_event(&key_event(0x0D, EVENT_KEY_DOWN)) {
+        KeyAction::InsertText { text, .. } => {
+            assert_eq!(
+                text, "zhang",
+                "字母引导键回车应上屏含引导字母的原码，实际丢了 z"
+            );
+        }
+        other => panic!("回车应上屏原码，实际: {:?}", other),
+    }
+}
+
+/// 字母引导键进临拼后**切中英文**放弃：同样带上引导字母（与回车同进同出）。
+///
+/// 「上屏原码」在临拼有三个同源出口——回车、切中英文、mix 回车——判据收在
+/// `Coordinator::guide_to_return`。只改回车会立刻造出「回车带 z、Shift 切英文不带」的
+/// 不一致，而 `take_input_on_mode_switch` 的注释还写着「与各自回车上屏一致」。
+#[test]
+fn test_temp_pinyin_letter_guide_mode_switch_keeps_guide_letter() {
+    if !has_schemas() {
+        return;
+    }
+    let mut cfg = config_with("wubi86");
+    cfg.schema.codetable.z_key_action = "temp_pinyin".into();
+    cfg.keys.commit_on_switch = true;
+    let coord = Coordinator::new_headless(cfg, Some(&data_dir()));
+    press_vk(&coord, 0x5A, false); // z
+    for c in "hang".chars() {
+        press_letter(&coord, c);
+    }
+    // 左 Shift 释放：中→英，commit_on_switch=true → 上屏原码。
+    let act = coord.handle_key_event(&key_event(0xA0, EVENT_KEY_UP));
+    assert_eq!(
+        action_text(&act).unwrap_or_default(),
+        "zhang",
+        "字母引导键切中英文应上屏含引导字母的原码，实际: {:?}",
+        act
+    );
+}
+
+/// z-fallback 夺取后退格：应回到**夺取前那一帧**（`z` + repeat 候选），一次到位。
+///
+/// 曾退到 `zx`——即 `input_buffer + 触发夺取的那一键`。而夺取的前提恰恰是
+/// `has_code_prefix("zx") == false`，所以那个落点**必然无候选**：判据说「这里没东西」，
+/// 回退目标偏要退到那里。用户看到的是「第一下退格只让候选窗消失、编码还在」，得再按一次。
+///
+/// 且 `zx` 这一帧用户从未见过——按下 x 的同一帧就被夺取进临拼了。回退目标必须是用户
+/// 实际见过的某一帧，否则无论内部账目多自洽，读起来都像卡了一下。
+#[test]
+fn test_z_fallback_backspace_returns_to_hijack_origin() {
+    if !has_schemas() {
+        return;
+    }
+    let mut cfg = config_with("wubi86");
+    cfg.schema.codetable.z_key_action = "temp_pinyin".into();
+    // repeat 开 + 有上屏历史 → 首键 z 让位（裁决①），buffer 变 "z"，为 fallback 铺路。
+    cfg.schema.codetable.z_key_repeat = true;
+    let coord = Coordinator::new_headless(cfg, Some(&data_dir()));
+
+    // 先上屏一次，给 z_key_repeat 提供历史。
+    press_letter(&coord, 'a');
+    let committed = match coord.handle_key_event(&key_event(0x20, EVENT_KEY_DOWN)) {
+        KeyAction::InsertText { text, .. } => text,
+        other => panic!("前置条件：空格应上屏，实际: {:?}", other),
+    };
+
+    press_vk(&coord, 0x5A, false); // z → repeat 让位，落普通输入
+    assert!(
+        !coord.debug_in_temp_pinyin(),
+        "前置条件：repeat 开时首键 z 应让位，不进临拼"
+    );
+    press_letter(&coord, 'x'); // "zx" 非活码前缀 → fallback 夺取
+    assert!(
+        coord.debug_in_temp_pinyin(),
+        "前置条件：zx 破前缀应触发 z-fallback 夺取"
+    );
+
+    coord.handle_key_event(&key_event(0x08, EVENT_KEY_DOWN)); // Backspace
+    assert!(!coord.debug_in_temp_pinyin(), "退格应撤销夺取、退出临拼");
+    let texts = coord.debug_page_texts();
+    assert!(
+        texts.contains(&committed),
+        "退格应一次回到夺取前那一帧（buffer=\"z\"，repeat 候选「{}」在列）；\
+         若退到了 zx 则无任何候选，实际: {:?}",
+        committed,
+        texts
+    );
+}
+
+/// 临拼模式下切中英文：应遵循 keys.commit_on_switch —— 开启（默认）时把拼音原码上屏，
 /// 而非无条件清空（回归保护：此前 take_input_on_mode_switch 独占分支对临拼恒返回空串）。
+///
+/// 用**符号**引导键（`` ` ``）以隔离关切：本测试只管 commit_on_switch 这个开关本身。
+/// 字母引导键会把引导字母一并归还（`znihao` 而非 `nihao`），那是另一条语义，
+/// 由 `test_temp_pinyin_letter_guide_mode_switch_keeps_guide_letter` 单独锁。
 #[test]
 fn test_temp_pinyin_commit_on_mode_switch() {
     if !has_schemas() {
@@ -568,11 +688,11 @@ fn test_temp_pinyin_commit_on_mode_switch() {
     }
     let mut cfg = config_with("wubi86");
     cfg.input.temp_pinyin.enabled = true;
-    cfg.schema.codetable.z_key_action = "temp_pinyin".into();
     cfg.keys.commit_on_switch = true;
     let coord = Coordinator::new_headless(cfg, Some(&data_dir()));
-    // 进入 z 临拼，缓冲拼音码 nihao（不选词、不上屏）。
-    for c in "znihao".chars() {
+    // 进入临拼（反引号引导），缓冲拼音码 nihao（不选词、不上屏）。
+    coord.handle_key_event(&key_event(0xC0, EVENT_KEY_DOWN)); // `
+    for c in "nihao".chars() {
         press_letter(&coord, c);
     }
     // 左 Shift 释放：中→英切换，commit_on_switch=true → 应上屏拼音原码 nihao。
@@ -587,6 +707,7 @@ fn test_temp_pinyin_commit_on_mode_switch() {
 }
 
 /// 关闭 commit_on_switch 时：临拼切中英文应清空，不上屏原码。
+/// 同样用符号引导键隔离关切（理由见上一个测试）。
 #[test]
 fn test_temp_pinyin_no_commit_on_mode_switch_when_disabled() {
     if !has_schemas() {
@@ -594,10 +715,10 @@ fn test_temp_pinyin_no_commit_on_mode_switch_when_disabled() {
     }
     let mut cfg = config_with("wubi86");
     cfg.input.temp_pinyin.enabled = true;
-    cfg.schema.codetable.z_key_action = "temp_pinyin".into();
     cfg.keys.commit_on_switch = false;
     let coord = Coordinator::new_headless(cfg, Some(&data_dir()));
-    for c in "znihao".chars() {
+    coord.handle_key_event(&key_event(0xC0, EVENT_KEY_DOWN)); // `
+    for c in "nihao".chars() {
         press_letter(&coord, c);
     }
     let act = coord.handle_key_event(&key_event(0xA0, EVENT_KEY_UP));
@@ -7064,7 +7185,9 @@ fn temp_pinyin_overlay_still_has_no_candidate_op_scope() {
     }
     let mut cfg = config_with("wubi86");
     cfg.input.temp_pinyin.enabled = true;
-    cfg.input.temp_pinyin.trigger_keys = vec!["z".into()];
+    // z 进临拼改由方案级 `z_key_action` 配置——字母不再作全局 trigger_keys（那里只认符号）。
+    // 本测试的关切（临拼没有候选词条操作作用域）与 z 怎么进临拼无关，只换配置写法。
+    cfg.schema.codetable.z_key_action = "temp_pinyin".into();
     let coord = Coordinator::new_headless(cfg, Some(&data_dir()));
 
     press_letter(&coord, 'z'); // 空缓冲按 z 进入临拼

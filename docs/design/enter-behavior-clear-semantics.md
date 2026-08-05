@@ -39,6 +39,43 @@ if state.xxx_buffer.is_empty() && state.committed_text.is_empty() {
 
 修复：判据收口为 `Coordinator::enter_clears_composition()`，五条路径共用，且在各 `VK_RETURN` 分支的**最外层**前置判断。收口的价值在于——漏接会从「调用了但判在错误分支」（grep 搜得到字符串、看不出位置错）退化为「没有调用点」（容易发现）。
 
+## 上屏原码时，引导符归不归还
+
+`commit` 上屏的「剩余原码」里**含不含引导符**，取决于引导符是字母还是符号。判据收在
+`Coordinator::guide_to_return`，三个同源出口共用：
+
+| 出口 | 位置 |
+|---|---|
+| 临拼回车 | `handle_temp.rs` `VK_RETURN` 非空缓冲分支 |
+| mix 回车 | `handle_mode.rs` 同上 |
+| 切中英文 | `coordinator.rs::take_input_on_mode_switch` |
+
+规则：
+
+- **符号引导符不还**（`` ` ``、`;`）。它们在码表里不产出编码，用户按下只可能是为了开模式。
+  `` `nihao `` → `nihao`。
+- **字母引导符要还**（`z`，经 `schema.codetable.z_key_action` 进入）。字母在码表里是**合法
+  编码字符**，按下时它既可能是开关也可能是码。放弃整段的语义正是「别猜了，把我打的原样给我」，
+  此时吞掉那个字母就是猜错了还不还。`zhang` → `zhang` 而非 `hang`。
+- **`committed_text` 非空则一律不还**。用户已在模式内选过词，说明认可了这次进入，引导符归
+  模式所有；再吐出来只会得到「z你好ma」。
+
+z-fallback 路径尤其要还：那里的 `z` 是从 `input_buffer` 里**抢走**的真实击键（`zzha` 夺取后
+`prefix="z"` + `buffer="zha"`，归还后恰好复原成 `zzha`）。
+
+> ⚠️ 三个出口必须同进同出。只改回车会造出「回车带 z、Shift 切英文不带」的不一致，而
+> `take_input_on_mode_switch` 的注释还写着「与各自回车上屏一致」——注释会当场变成谎言。
+
+### 相关：夺取回退的落点
+
+`Rewind.snapshot` 必须是**夺取前**的 `input_buffer`，不含触发夺取的那一键。曾在
+`try_z_fallback` 里取 `buffer + ch`，那必然退到一个无候选的死状态——夺取的前提恰恰是
+`has_code_prefix(buffer + ch) == false`。用户可见指纹：`zzh`（有候选）→ 打 `a` 进拼音 →
+退格只让候选窗消失、编码还在，得再按一次才回到 `zzh`。
+
+判断这类问题的通用抓手：**回退目标必须是用户实际见过的某一帧**。`zzha` 那一帧从未渲染过
+（按下 `a` 的同一帧就被夺取了），退过去无论内部账目多自洽，读起来都像卡了一下。
+
 ## 已定决策
 
 **`clear` 一并丢弃 `committed_text`**（即临拼/混合模式下已通过选词逐步上屏的那部分转换结果），与主输入路径 `coordinator.rs` 的既有行为一致。四条路径的退出都走各自的 `exit_*` 函数，它们本就会清 `committed_text` / `committed_segs`。

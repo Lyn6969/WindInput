@@ -1395,16 +1395,20 @@ impl Coordinator {
                     }
                     return commit_text(self, state, String::new());
                 }
-                // 非空缓冲：上屏「已转换前缀 + 缓冲原文」（原行为不变，如 ;nihao → nihao）
+                // 非空缓冲：上屏「引导字母 + 已转换前缀 + 缓冲原文」。符号引导键行为不变
+                // （;nihao → nihao）；字母引导键（z_key_action = "mix:<id>"）归还那个字母，
+                // 判据与临拼回车、切中英文共用，见 `guide_to_return`。
+                let guide = Self::guide_to_return(&state.mix_prefix, &state.committed_text);
+                let raw = format!("{}{}", guide, state.mix_buffer);
                 self.record_commit(
-                    &state.mix_buffer,
-                    state.mix_buffer.len() as u32,
+                    &raw,
+                    raw.len() as u32,
                     -1,
                     wind_store::stats::CommitSource::Mix,
                 );
                 let out = self.maybe_s2t(
                     state,
-                    &format!("{}{}", state.committed_text, state.mix_buffer),
+                    &format!("{}{}{}", guide, state.committed_text, state.mix_buffer),
                 );
                 commit_text(self, state, out)
             }

@@ -25,9 +25,13 @@ impl Coordinator {
         keymap::key_name_to_vk(key)
     }
 
-    /// VK → 组合区前缀字符（统一映射，见 `keymap`；缺省回退反引号）
+    /// VK → 组合区前缀字符（统一映射，见 `keymap`；缺省回退反引号）。
+    ///
+    /// 用**带字母**的版本：z 经 `z_key_action` 进临拼时，组合区要显示用户按下的那个 `z`。
+    /// 不带字母的版本对 VK_Z 返回 None、兜底成反引号，组合区会凭空显示一个没按过的 `` ` ``，
+    /// 且回车归还引导字母的判据（首字符是否字母）也会因此永远不成立。
     pub(crate) fn temp_pinyin_prefix_for(key_code: u32) -> char {
-        keymap::vk_to_prefix_char(key_code).unwrap_or('`')
+        keymap::vk_to_prefix_char_with_letters(key_code).unwrap_or('`')
     }
 
     /// 当前按键是否匹配配置的**符号**临时拼音触发键（字母触发键见 `matched_letter_temp_trigger`）
@@ -102,15 +106,23 @@ impl Coordinator {
             return None;
         }
         let target = self.engine_mgr.temp_pinyin_target()?;
-        // residual = 去掉首 z + 新键；snapshot = 正常码流（combined），供退格 rewind 还原。
+        // residual = 去掉首 z + 新键。
         let residual = format!("{}{}", &state.input_buffer[1..], ch);
+        // snapshot = **夺取前**的正常码流，不含触发夺取的这一键（与 `Rewind::snapshot` 的字段
+        // 语义、以及 URL 那个调用点一致）。
+        //
+        // ⚠️ 曾取 `combined`（= buffer + ch），那必然退到一个无候选的死状态——夺取的前提
+        // 恰恰是 `has_code_prefix(combined) == false`，判据说「这里没东西」，回退目标却偏要
+        // 退到那里。且 `combined` 这一帧用户从没见过（按下该键的同一帧就被夺取了），退过去
+        // 看起来就像「退格没生效、只是候选窗闪没了」，得再按一次才回到有候选的那一帧。
+        let snapshot = state.input_buffer.clone();
         state.active = Some(ModeKind::TempPinyin);
         state.temp_pinyin_schema = target;
         state.temp_pinyin_buffer = residual.clone();
         state.temp_pinyin_cursor = state.temp_pinyin_buffer.len();
         state.temp_pinyin_prefix = "z".to_string();
         state.rewind = Some(Rewind {
-            snapshot: combined,
+            snapshot,
             host_text: residual,
         });
         state.input_buffer.clear();
@@ -484,17 +496,28 @@ impl Coordinator {
                     self.notify_ui_hide();
                     return KeyAction::ClearComposition;
                 }
-                // 非空缓冲：上屏「已转换前缀 + 剩余拼音原码」（原行为不变，如 `nihao → nihao）。
-                // committed 段已在选词时记过，此处只记剩余拼音原码避免重复。
+                // 非空缓冲：上屏「引导字母 + 已转换前缀 + 剩余拼音原码」
+                // （符号引导键行为不变，如 `nihao → nihao）。
+                //
+                // 引导**字母**要还回去（zhang → zhang，而非 hang）；判据与切中英文、mix 回车
+                // 共用，见 `guide_to_return`。z-fallback 进来的尤其要还——那个 z 是从
+                // `input_buffer` 里**抢走**的真实击键（zzha 夺取后 prefix="z" + buffer="zha"，
+                // 还回去恰好复原成 zzha）。
+                let guide = Self::guide_to_return(&state.temp_pinyin_prefix, &state.committed_text);
+                // committed 段已在选词时记过，此处只记本次实际上屏的原码避免重复。
+                let raw = format!("{}{}", guide, state.temp_pinyin_buffer);
                 self.record_commit(
-                    &state.temp_pinyin_buffer,
-                    state.temp_pinyin_buffer.len() as u32,
+                    &raw,
+                    raw.len() as u32,
                     -1,
                     wind_store::stats::CommitSource::TempPinyin,
                 );
                 let out = self.maybe_s2t(
                     state,
-                    &format!("{}{}", state.committed_text, state.temp_pinyin_buffer),
+                    &format!(
+                        "{}{}{}",
+                        guide, state.committed_text, state.temp_pinyin_buffer
+                    ),
                 );
                 self.exit_temp_pinyin(state);
                 self.notify_ui_hide();

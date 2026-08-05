@@ -4311,6 +4311,35 @@ impl Coordinator {
         }
     }
 
+    /// 放弃整段输入、上屏原码时该**归还**的引导符（不归还则为空串）。
+    ///
+    /// 三个同源出口共用：临拼回车 / mix 回车 / 切中英文（`take_input_on_mode_switch`）。
+    /// 只改其中一处就会造成「回车带 z、切英文不带」这类不一致，故判据收在这里。
+    ///
+    /// # 为什么字母归还、符号不归还
+    ///
+    /// 符号引导键（`` ` ``、`;`）在码表里不产出编码，用户按它只可能是为了开模式；字母
+    /// （z）在码表里是**合法编码字符**，按下时它既可能是开关也可能是码。放弃整段的语义正是
+    /// 「别猜了，把我打的原样给我」，此时吞掉那个字母就是猜错了还不还。z-fallback 进来的
+    /// 更是如此——那个 z 是从 `input_buffer` 里抢走的真实击键。
+    ///
+    /// # 为什么 committed_text 非空就不归还
+    ///
+    /// 用户已经在模式内选过词，说明他认可了这次进入，引导符归模式所有；再吐出来只会得到
+    /// 「z你好ma」这种谁也不想要的东西。
+    pub(crate) fn guide_to_return(prefix: &str, committed_text: &str) -> String {
+        if committed_text.is_empty()
+            && prefix
+                .chars()
+                .next()
+                .is_some_and(|c| c.is_ascii_alphabetic())
+        {
+            prefix.to_string()
+        } else {
+            String::new()
+        }
+    }
+
     /// 切换中英文时取消当前输入：清空缓冲/候选/preedit，并按 `hotkeys.commit_on_switch`
     /// 决定是否把已输入的原始编码上屏（仅在切到英文且有待输入时）。返回待上屏文本。
     fn take_input_on_mode_switch(&self, state: &mut State, chinese: bool) -> String {
@@ -4344,10 +4373,14 @@ impl Coordinator {
                 let has_pending = !buf.is_empty() || !state.committed_text.is_empty();
                 if !chinese && self.rt().config.keys.commit_on_switch {
                     if has_pending {
-                        // 有待输入：上屏「已转换前缀 committed_text + 剩余原码」；触发键前缀不输出。
-                        // committed 段已在选词时记过，此处只记剩余原码（来源模式切换）。
-                        self.record_commit(&buf, buf.len() as u32, -1, CommitSource::ModeSwitch);
-                        let raw = format!("{}{}", state.committed_text, buf);
+                        // 有待输入：上屏「引导字母 + 已转换前缀 committed_text + 剩余原码」。
+                        // 符号引导符不输出、字母引导符归还，判据见 `guide_to_return`
+                        // ——与临拼/mix 的回车上屏共用同一条，三处必须同进同出。
+                        // committed 段已在选词时记过，此处只记本次实际上屏的原码（来源模式切换）。
+                        let guide = Self::guide_to_return(&prefix, &state.committed_text);
+                        let code = format!("{}{}", guide, buf);
+                        self.record_commit(&code, code.len() as u32, -1, CommitSource::ModeSwitch);
+                        let raw = format!("{}{}{}", guide, state.committed_text, buf);
                         self.maybe_s2t(state, &raw)
                     } else if !prefix.is_empty() && !self.enter_clears_composition() {
                         // 只按了模式进入符（缓冲空）：原样上屏该前缀符号本身，与回车空缓冲上屏一致
