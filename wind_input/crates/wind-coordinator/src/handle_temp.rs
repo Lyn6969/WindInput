@@ -17,9 +17,10 @@ use wind_keys::keymap;
 use wind_transform::fullwidth::to_full_width;
 
 impl Coordinator {
-    /// 触发键名 → VK（**符号**触发键统一映射，见 `keymap`）。字母触发键（z）刻意不经此——
-    /// 走独立的 [`Self::matched_letter_temp_trigger`] + 三重身份裁决（对齐 Go `matchTempPinyinTrigger`
-    /// 排除 z + `judgeZFirstTrigger`），避免 z 在符号语义路径（如缓冲非空顶屏进临拼）被误触发。
+    /// 触发键名 → VK（**符号**触发键统一映射，见 `keymap`）。字母刻意不认——
+    /// z 走方案级 `schema.codetable.z_key_action` + 三重身份裁决（对齐 Go
+    /// `matchTempPinyinTrigger` 排除 z + `judgeZFirstTrigger`），避免 z 在符号语义路径
+    /// （如缓冲非空顶屏进临拼）被误触发。
     pub(crate) fn temp_pinyin_trigger_vk(key: &str) -> Option<u32> {
         keymap::key_name_to_vk(key)
     }
@@ -39,28 +40,6 @@ impl Coordinator {
             .iter()
             .filter_map(|k| Self::temp_pinyin_trigger_vk(k))
             .any(|vk| vk == key_code)
-    }
-
-    /// 临时拼音「字母触发键」（如 z）匹配：当前键是字母、且该字母在 `trigger_keys` 中配置时返回
-    /// 该字母（小写）。与符号触发键分开——符号键无条件触发，字母键需经三重身份裁决
-    /// （repeat / 正常码字母 / 临时拼音），对齐 Go `judgeZFirstTrigger`。
-    pub(crate) fn matched_letter_temp_trigger(&self, key_code: u32) -> Option<char> {
-        if !(keymap::VK_A..=keymap::VK_Z).contains(&key_code) {
-            return None;
-        }
-        let ch = (b'a' + (key_code - keymap::VK_A) as u8) as char;
-        let hit = self
-            .rt()
-            .config
-            .input
-            .temp_pinyin
-            .trigger_keys
-            .iter()
-            .any(|k| {
-                let k = k.trim().to_lowercase();
-                k.len() == 1 && k.as_bytes()[0] == ch as u8
-            });
-        hit.then_some(ch)
     }
 
     /// z 三重身份裁决的「活码前缀」判据（对齐 Go `HasPrefix`）：码表引擎候选（含 BFS 前缀扫描）
@@ -86,10 +65,24 @@ impl Coordinator {
     }
 
     /// z-fallback 夺取（对齐 Go `decideEngineDefaultZFallback` + `enterTempPinyinFromZBuffer`）：
-    /// **码表引擎** + 缓冲以 z 开头 + z 配为字母触发键，且缓冲加新键 `ch` 后 `z…` 不再是活码前缀，
-    /// 则判定首 z 实为拼音触发键——抛弃首 z，`buffer[1:]+ch` 作临时拼音编码切入，并武装退格 rewind
-    /// （首次退格还原到正常码表输入流 `buffer+ch`）。返回 `Some` 表示已夺取，`None` 表示不夺取。
-    /// 混输引擎排除（避免 `zhang` 丢首字母，对齐 Go 门禁）。
+    /// **码表引擎** + 缓冲以 z 开头 + 本方案 `z_key_action = "temp_pinyin"`，且缓冲加新键 `ch`
+    /// 后 `z…` 不再是活码前缀，则判定首 z 实为拼音触发键——抛弃首 z，`buffer[1:]+ch` 作临时
+    /// 拼音编码切入，并武装退格 rewind（首次退格还原到正常码表输入流 `buffer+ch`）。
+    /// 返回 `Some` 表示已夺取，`None` 表示不夺取。混输引擎排除（避免 `zhang` 丢首字母，
+    /// 对齐 Go 门禁）。
+    ///
+    /// # 只有 `temp_pinyin` 支持夺取
+    ///
+    /// 其余 `z_key_action`（临英 / mix / 特殊模式）只支持**首键**进入。夺取要求目标模式能接住
+    /// 一段残余编码并支持退格还原（`Rewind`），而那是临拼独有的机制；给别的模式硬套会得到
+    /// 一个退格退不回去的半残状态。
+    ///
+    /// # 与 `z_key_repeat` 的关系（刻意不检查）
+    ///
+    /// 首键裁决里 repeat 优先、z 让位落普通输入；到了这里**不再查 repeat**，`zh` 破前缀就夺取。
+    /// 即「让位」只维持一个按键，靠**用户是否继续打字母**区分意图：继续打就说明不是要重复上屏。
+    /// 这是刻意的——两者若改成互斥，开了 `z_key_repeat` 的方案上 z 进临拼会彻底不可用
+    /// （首键让位、后续也不夺取，一条进入通路都不剩）。
     pub(crate) fn try_z_fallback(&self, state: &mut State, ch: char) -> Option<KeyAction> {
         if !matches!(
             self.engine_mgr.current_engine_type(),
@@ -100,8 +93,7 @@ impl Coordinator {
         if !state.input_buffer.starts_with('z') {
             return None;
         }
-        // z 必须配为字母触发键。
-        if self.matched_letter_temp_trigger(keymap::VK_Z).is_none() {
+        if self.z_key_action() != wind_config::ZKeyAction::TempPinyin {
             return None;
         }
         let combined = format!("{}{}", state.input_buffer, ch);

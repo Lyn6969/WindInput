@@ -12,9 +12,17 @@ use wind_ipc::protocol::MOD_SHIFT;
 use wind_keys::keymap;
 
 impl Coordinator {
-    /// 引导键名 → VK（特殊模式触发；统一映射 + 额外支持单字母 a-z 引导键，见 `keymap`）。
+    /// 引导键名 → VK（特殊模式 + 临时 mix 共用；**只认符号键**，见 `keymap::KEY_TABLE`）。
+    ///
+    /// 字母**刻意不认**：字母天然是编码键，把它当引导键就意味着该字母在本方案里永远打不出
+    /// 编码，而 `trigger_keys` 是全局配置、无从表达「这个码表里 z 是死码」。曾用
+    /// `key_name_to_vk_with_letters` 支持任意 a-z，但那条路缺了三重身份裁决（repeat / 活码
+    /// 前缀 / 引导键），字母一配就无条件抢键。
+    ///
+    /// 字母的特殊能力现由**方案级** `schema.codetable.z_key_action` 承载（只管 z，经裁决链），
+    /// 见 `Coordinator::z_key_action`。
     pub(crate) fn special_trigger_vk(key: &str) -> Option<u32> {
-        keymap::key_name_to_vk_with_letters(key)
+        keymap::key_name_to_vk(key)
     }
 
     /// 找出 key_code 匹配的特殊模式下标（按配置顺序先到先得；最多 256 个）。
@@ -126,8 +134,8 @@ impl Coordinator {
         state.special_id = idx;
         state.special_buffer.clear();
         state.special_cursor = 0;
-        // 显示态前缀（进入键符号，如 "\"）：只显示不消费。
-        state.special_prefix = keymap::vk_to_prefix_char(key_code)
+        // 显示态前缀（进入键符号，如 "\"；经 z_key_action 进入时为 "z"）：只显示不消费。
+        state.special_prefix = keymap::vk_to_prefix_char_with_letters(key_code)
             .map(|c| c.to_string())
             .unwrap_or_default();
         self.update_special_candidates(state);

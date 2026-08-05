@@ -58,8 +58,18 @@ schema_overrides/{id}.toml ── 方案覆盖（仅码表；带开关；设置�
 | `single_code_input` | 精确匹配模式（不前缀匹配） |
 | `single_code_complete` | 精确匹配空码补全 |
 | `z_key_repeat` | z 键重复输入 |
+| `z_key_action` | z 键功能（进哪个模式）；`String` 而非 `bool`，值域见下 |
 
 > `user_frequency` 已**删除**：调频统一由 `schema.codetable.frequency.enabled` 控制（§3.4）。
+
+> **`z_key_action` 为什么在方案级**：字母天然是编码键，能否借作引导键取决于**这张码表里
+> 它是不是死码**（五笔 86 的 z 是，别的码表未必）。这是方案的属性——全局
+> `input.temp_pinyin.trigger_keys` 无从表达，配了字母就是所有方案里无条件抢键。故字母引导键
+> 已从各处 `trigger_keys` 移除（只认符号），能力收归本项，存量配置在加载期迁移
+> （`Config::migrate_letter_trigger_keys`）。
+>
+> 值域：`""`/`none` / `temp_pinyin` / `temp_english` / `mix:<id>` / `special:<id>`。
+> 与 `z_key_repeat` **正交**（可同时开）：repeat 先手，用户继续打字母才轮到本项。
 
 **引擎固定**（留 `.schema.toml`）：
 
@@ -197,6 +207,7 @@ struct CodetableGlobal {
     auto_commit_min_len: usize,   // 隐藏参数，默认 0=全码长
     punct_commit: bool, show_code_hint: bool,
     single_code_input: bool, single_code_complete: bool, z_key_repeat: bool,
+    z_key_action: String,            // ""/none/temp_pinyin/temp_english/mix:<id>/special:<id>
     frequency: CodetableFrequency,   // enabled / protect_top_n / strategy
     auto_phrase: AutoPhraseConfig,   // …含 promote_count
 }

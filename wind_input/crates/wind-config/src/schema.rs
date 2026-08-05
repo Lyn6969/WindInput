@@ -129,6 +129,12 @@ pub struct CodeTableSpec {
     /// z 键重复输入。
     #[serde(default)]
     pub z_key_repeat: Option<bool>,
+    /// z 键功能（`""`/`none` / `temp_pinyin` / `temp_english` / `mix:<id>` / `special:<id>`）。
+    ///
+    /// 方案级才有意义：z 能否借作引导键取决于这张码表里它是不是死码。
+    /// 值域与语义见 `wind_config::config::ZKeyAction`。
+    #[serde(default)]
+    pub z_key_action: Option<String>,
     /// 方案级调频覆盖（`[engine.codetable.frequency]`）。
     ///
     /// 缺省 = 整段跟随基线。特殊方案的基线是内置默认（不继承全局 `schema.codetable`，

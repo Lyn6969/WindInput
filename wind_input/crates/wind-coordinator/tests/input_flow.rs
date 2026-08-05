@@ -384,7 +384,7 @@ fn test_pinyin_basic_input() {
     }
 }
 
-/// z 作字母触发键：`znihao` 应经临时拼音上屏「你好」，不含字面 z。
+/// `z_key_action = "temp_pinyin"`：`znihao` 应经临时拼音上屏「你好」，不含字面 z。
 /// 无论 z 在方案里是死码（首键即进临拼，身份③）还是活码前缀（后续字母处 z-fallback 夺取，
 /// 身份②→③），都收敛到临拼编码「nihao」——故对 schema 细节鲁棒。
 #[test]
@@ -394,7 +394,7 @@ fn test_z_letter_trigger_temp_pinyin() {
     }
     let mut cfg = config_with("wubi86");
     cfg.input.temp_pinyin.enabled = true;
-    cfg.input.temp_pinyin.trigger_keys = vec!["z".into()];
+    cfg.schema.codetable.z_key_action = "temp_pinyin".into();
     let coord = Coordinator::new_headless(cfg, Some(&data_dir()));
     for c in "znihao".chars() {
         press_letter(&coord, c);
@@ -413,13 +413,13 @@ fn test_z_letter_trigger_temp_pinyin() {
     }
 }
 
-/// z 未配为触发键时：znihao 走正常五笔，不进临拼（回归保护——不误触发）。
+/// `z_key_action` 未配时：znihao 走正常五笔，不进临拼（回归保护——不误触发）。
 #[test]
 fn test_z_not_trigger_stays_normal() {
     if !has_schemas() {
         return;
     }
-    // 默认 trigger_keys 不含 z（默认 ["backtick"]）。
+    // 出厂 z_key_action 为空。
     let coord = Coordinator::new_headless(config_with("wubi86"), Some(&data_dir()));
     let a = press_letter(&coord, 'z');
     // 正常五笔：z 进缓冲（组合区含 z）或作码，绝不进临拼前缀语义。
@@ -432,6 +432,133 @@ fn test_z_not_trigger_stays_normal() {
     }
 }
 
+/// `z_key_action = "mix:<id>"`：z 进融合模式。
+///
+/// 判据取候选内容而非组合区文本——普通输入按 z 后组合区同样是 "z"（五笔码），两者在
+/// 屏幕上完全同形。内置 quick_mix 的成员含拼音，故 `zni` 应出「你」；五笔下 `zni` 不会。
+#[test]
+fn test_z_key_action_enters_mix() {
+    if !has_schemas() {
+        return;
+    }
+    let mut cfg = config_with("wubi86");
+    cfg.schema.codetable.z_key_action = "mix:quick_mix".into();
+    let coord = Coordinator::new_headless(cfg, Some(&data_dir()));
+    let a = press_vk(&coord, 0x5A, false); // z
+    assert_eq!(
+        action_text(&a).unwrap_or_default(),
+        "z",
+        "组合区应显示引导键 z（vk_to_prefix_char_with_letters）"
+    );
+    press_str(&coord, "ni");
+    let texts = coord.debug_page_texts();
+    assert!(
+        texts.iter().any(|t| t == "你"),
+        "应已进入 mix：其拼音成员应出「你」，实际: {:?}",
+        texts
+    );
+}
+
+/// z 引导进模式后空缓冲回车：**原样吐回 `z`**，与符号引导键（`;` 吐回 `;`）同语义。
+///
+/// 字母引导键旧实现下 `mix_prefix` 恒为空（`vk_to_prefix_char` 不认字母），于是这里只能
+/// 清空退出——用户按下的键凭空消失。前缀改用 `vk_to_prefix_char_with_letters` 后两类
+/// 引导键的回车语义才对齐。
+#[test]
+fn test_z_key_action_mix_empty_enter_echoes_guide_key() {
+    if !has_schemas() {
+        return;
+    }
+    let mut cfg = config_with("wubi86");
+    cfg.schema.codetable.z_key_action = "mix:quick_mix".into();
+    let coord = Coordinator::new_headless(cfg, Some(&data_dir()));
+    press_vk(&coord, 0x5A, false); // z
+    match coord.handle_key_event(&key_event(0x0D, EVENT_KEY_DOWN)) {
+        KeyAction::InsertText { text, .. } => {
+            assert_eq!(text, "z", "空缓冲回车应原样上屏引导键");
+        }
+        other => panic!("应上屏引导键 z，实际: {:?}", other),
+    }
+}
+
+/// `z_key_action = "temp_english"`：z 进临时英文，缓冲装英文原文（空格上屏原文）。
+#[test]
+fn test_z_key_action_enters_temp_english() {
+    if !has_schemas() {
+        return;
+    }
+    let mut cfg = config_with("wubi86");
+    cfg.input.temp_english.enabled = true;
+    cfg.schema.codetable.z_key_action = "temp_english".into();
+    let coord = Coordinator::new_headless(cfg, Some(&data_dir()));
+    press_vk(&coord, 0x5A, false); // z
+    for c in "hello".chars() {
+        press_letter(&coord, c);
+    }
+    // 临英首候选恒为用户原文；五笔下 "zhello" 绝不会上屏成 "hello"。
+    match coord.handle_key_event(&key_event(0x20, EVENT_KEY_DOWN)) {
+        KeyAction::InsertText { text, .. } => {
+            assert_eq!(text, "hello", "临英空格应上屏原文");
+        }
+        other => panic!("空格应上屏 InsertText，实际: {:?}", other),
+    }
+}
+
+/// `z_key_action = "special:<id>"`：z 进特殊模式，候选来自该模式引用的方案。
+#[test]
+fn test_z_key_action_enters_special() {
+    if !has_schemas() {
+        return;
+    }
+    let mut cfg = config_with("wubi86");
+    cfg.schema.special_modes = vec![wind_config::config::SpecialModeConfig {
+        id: "zpy".into(),
+        name: "测试".into(),
+        schema: "pinyin".into(),
+        ..Default::default()
+    }];
+    cfg.schema.codetable.z_key_action = "special:zpy".into();
+    let coord = Coordinator::new_headless(cfg, Some(&data_dir()));
+    press_vk(&coord, 0x5A, false); // z
+    press_str(&coord, "ni");
+    let texts = coord.debug_page_texts();
+    assert!(
+        texts.iter().any(|t| t == "你"),
+        "特殊模式应按其引用方案（pinyin）出候选，实际: {:?}",
+        texts
+    );
+}
+
+/// `z_key_action` 指向不存在的目标：**不得吞键**，z 落普通输入作正常码。
+///
+/// 吞键的后果是把 z 这个编码键废掉，且用户从现象上完全看不出原因——配错一个 id
+/// 就再也打不出 z 开头的编码。门卫没过一律返回 None，见 `enter_z_action`。
+#[test]
+fn test_z_key_action_unknown_target_falls_through() {
+    if !has_schemas() {
+        return;
+    }
+    let mut cfg = config_with("wubi86");
+    cfg.schema.codetable.z_key_action = "special:nonexistent".into();
+    let coord = Coordinator::new_headless(cfg, Some(&data_dir()));
+    let a = press_vk(&coord, 0x5A, false); // z
+    if let Some(disp) = action_text(&a) {
+        assert!(
+            disp.starts_with('z') || disp.is_empty(),
+            "未知目标应落普通输入，实际组合区: {}",
+            disp
+        );
+    }
+    // 判据取候选：回车此时无从区分（普通输入与进了模式都上屏 "z"）。
+    press_str(&coord, "ni");
+    let texts = coord.debug_page_texts();
+    assert!(
+        !texts.iter().any(|t| t == "你"),
+        "不该进任何模式：`zni` 应作五笔码，不出拼音候选，实际: {:?}",
+        texts
+    );
+}
+
 /// z 临拼模式下切中英文：应遵循 keys.commit_on_switch —— 开启（默认）时把拼音原码上屏，
 /// 而非无条件清空（回归保护：此前 take_input_on_mode_switch 独占分支对临拼恒返回空串）。
 #[test]
@@ -441,7 +568,7 @@ fn test_temp_pinyin_commit_on_mode_switch() {
     }
     let mut cfg = config_with("wubi86");
     cfg.input.temp_pinyin.enabled = true;
-    cfg.input.temp_pinyin.trigger_keys = vec!["z".into()];
+    cfg.schema.codetable.z_key_action = "temp_pinyin".into();
     cfg.keys.commit_on_switch = true;
     let coord = Coordinator::new_headless(cfg, Some(&data_dir()));
     // 进入 z 临拼，缓冲拼音码 nihao（不选词、不上屏）。
@@ -467,7 +594,7 @@ fn test_temp_pinyin_no_commit_on_mode_switch_when_disabled() {
     }
     let mut cfg = config_with("wubi86");
     cfg.input.temp_pinyin.enabled = true;
-    cfg.input.temp_pinyin.trigger_keys = vec!["z".into()];
+    cfg.schema.codetable.z_key_action = "temp_pinyin".into();
     cfg.keys.commit_on_switch = false;
     let coord = Coordinator::new_headless(cfg, Some(&data_dir()));
     for c in "znihao".chars() {
@@ -1892,7 +2019,7 @@ fn overlay_modes_treat_ctrl_combo_as_host_shortcut() {
     // 建多个 Coordinator 会与并行跑的其它测试争用，导致**无关测试**偶发红。
     let mut cfg = config_with("wubi86");
     cfg.input.temp_pinyin.enabled = true;
-    cfg.input.temp_pinyin.trigger_keys = vec!["z".into()];
+    cfg.schema.codetable.z_key_action = "temp_pinyin".into();
     let coord = Coordinator::new_headless(cfg, Some(&data_dir()));
 
     // ① mix（快捷输入）
@@ -2371,12 +2498,18 @@ fn test_temp_english_space_as_input_enter_clear_still_commits() {
     }
 }
 
+/// 字母写进 mix 的 `trigger_keys` **不生效**——该键落普通输入，作正常码字母。
+///
+/// 反证测试：本仓曾支持任意 a-z 作 special/mix 引导键（`key_name_to_vk_with_letters`），
+/// 但那条路没有三重身份裁决，字母一配就无条件抢键——而字母天然是编码键，被抢走就意味着
+/// 该字母在本方案里永远打不出编码。字母的特殊能力已收归方案级 `z_key_action`（只管 z、
+/// 经裁决链）。这里锁住「全局 trigger_keys 只认符号」这条边界，防止哪天为省事又把
+/// `key_name_to_vk_with_letters` 接回来。
 #[test]
-fn test_mix_letter_trigger_empty_enter_no_symbol() {
+fn test_mix_letter_trigger_key_is_ignored() {
     if !has_schemas() {
         return;
     }
-    // 字母触发键无 prefix 符号：空缓冲回车不应误输出字母，安全清空退出。
     let mut cfg = config_with("wubi86");
     cfg.schema.mix_modes = vec![wind_config::config::MixModeConfig {
         id: "mix_z".into(),
@@ -2387,16 +2520,22 @@ fn test_mix_letter_trigger_empty_enter_no_symbol() {
         ..Default::default()
     }];
     let coord = Coordinator::new_headless(cfg, Some(&data_dir()));
-    // 按 z(0x5A) 进入 mix（字母触发键，mix_prefix 为空）
-    coord.handle_key_event(&key_event(0x5A, EVENT_KEY_DOWN));
-    // 空缓冲回车：prefix 为空 → 走清空退出（而非上屏 z）。若误入五笔，则会上屏/提交 z 而非清空。
-    match coord.handle_key_event(&key_event(0x0D, EVENT_KEY_DOWN)) {
-        KeyAction::ClearComposition => {}
-        other => panic!(
-            "字母触发键空缓冲回车应清空退出（不输出字母），实际: {:?}",
-            other
-        ),
+    // 按 z(0x5A)：不该进 mix，应作五笔正常码进缓冲。
+    let a = coord.handle_key_event(&key_event(0x5A, EVENT_KEY_DOWN));
+    if let Some(disp) = action_text(&a) {
+        assert!(
+            disp.starts_with('z') || disp.is_empty(),
+            "字母引导键应被忽略、z 作正常码累积，实际组合区: {}",
+            disp
+        );
     }
+    // 若真进了 mix，空缓冲回车会走 ClearComposition；作正常码则不会。
+    let enter = coord.handle_key_event(&key_event(0x0D, EVENT_KEY_DOWN));
+    assert!(
+        !matches!(enter, KeyAction::ClearComposition),
+        "z 不该进 mix（进了才会空缓冲清空退出），实际: {:?}",
+        enter
+    );
 }
 
 #[test]

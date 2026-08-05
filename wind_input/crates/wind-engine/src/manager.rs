@@ -1825,8 +1825,10 @@ impl EngineManager {
     /// 快符默认不顶码、标点不上屏、精确匹配下不补全，而这些恰是用户预期存在的行为。
     /// 两个概念共用一处定义，改哪边都会伤到另一边。
     ///
-    /// 取值：与 `data/config.toml` 的出厂值一致，**除 `z_key_repeat`**——z 键重复上屏
-    /// 对小符号表没有意义（`z` 在那里多半是个正经编码）。
+    /// 取值：与 `data/config.toml` 的出厂值一致，**除 z 的两项**——`z_key_repeat`（重复上屏）
+    /// 与 `z_key_action`（借 z 作引导键）对小符号表都没有意义：`z` 在那里多半是个正经编码，
+    /// 抢走它就等于让该编码永远打不出来。两项都显式写出而非靠 `..Default::default()` 兜底，
+    /// 与本函数「与出厂值不同的项逐条列明」的写法一致。
     ///
     /// 「不继承全局」的意义是**用户改了全局之后特殊方案不跟着变**，而不是让它们的出厂
     /// 表现与普通方案不同。
@@ -1836,6 +1838,7 @@ impl EngineManager {
             punct_commit: true,
             single_code_complete: true,
             z_key_repeat: false,
+            z_key_action: String::new(),
             ..Default::default()
         }
     }

@@ -302,8 +302,9 @@ impl Coordinator {
         state.mix_buffer.clear();
         state.mix_cursor = 0;
         // 透镜不再有状态位：由 `mix_lens(state)` 按缓冲实时推导（清空缓冲即回到基线）。
-        // 显示态前缀（进入键符号，如 ";"）：只显示不消费，让用户看到按下的键。
-        state.mix_prefix = keymap::vk_to_prefix_char(key_code)
+        // 显示态前缀（进入键符号，如 ";"；经 z_key_action 进入时为 "z"）：只显示不消费，
+        // 让用户看到按下的键。
+        state.mix_prefix = keymap::vk_to_prefix_char_with_letters(key_code)
             .map(|c| c.to_string())
             .unwrap_or_default();
         self.update_mix_candidates(state);
@@ -906,6 +907,19 @@ impl Coordinator {
             .key_up
             .iter()
             .any(|e| e.action == "toggle_mode" && (e.match_hash & 0xFFFF) == key_code)
+    }
+
+    /// 按 id 在 `schema.mix_modes` 配置序中定位下标（与 `match_mix_trigger` 的 u8 下标语义一致，
+    /// 最多 256 项）。供 `z_key_action = "mix:<id>"` 分发定位；未找到返回 None。
+    pub(crate) fn mix_mode_idx(&self, id: &str) -> Option<u8> {
+        self.rt()
+            .config
+            .schema
+            .mix_modes
+            .iter()
+            .take(u8::MAX as usize + 1)
+            .position(|m| m.id == id)
+            .map(|i| i as u8)
     }
 
     /// 找出 key_code 匹配的 mix 模式下标（按配置顺序先到先得）。

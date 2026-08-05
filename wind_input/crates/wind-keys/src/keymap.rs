@@ -223,7 +223,11 @@ pub fn key_name_to_vk(name: &str) -> Option<u32> {
         .map(|d| d.vk)
 }
 
-/// 同 [`key_name_to_vk`]，但额外接受单字母 a-z 作触发键（特殊模式引导键常用）。
+/// 同 [`key_name_to_vk`]，但额外接受单字母 a-z。
+///
+/// **不再供引导键使用**——引导键（临拼 / 特殊模式 / 临时 mix 的 `trigger_keys`）一律只认
+/// 符号键，字母的特殊能力走方案级 `schema.codetable.z_key_action`。当前唯一消费者是
+/// `key_inject`（按键注入按名字找 VK，与引导键语义无关）。
 pub fn key_name_to_vk_with_letters(name: &str) -> Option<u32> {
     if let Some(vk) = key_name_to_vk(name) {
         return Some(vk);
@@ -240,6 +244,23 @@ pub fn key_name_to_vk_with_letters(name: &str) -> Option<u32> {
 /// VK → 组合区前缀字符。无映射时返回 None（调用方自定默认）。
 pub fn vk_to_prefix_char(vk: u32) -> Option<char> {
     KEY_TABLE.iter().find(|d| d.vk == vk).map(|d| d.prefix)
+}
+
+/// 同 [`vk_to_prefix_char`]，但字母 VK 返回其小写字母。
+///
+/// 与 [`key_name_to_vk`] 拒绝字母**不矛盾**——两者方向与职责不同：
+/// - `key_name_to_vk`（名字 → VK）是**配置解析**，必须严格。认了字母就等于允许把编码键
+///   配成引导键，而全局配置无从表达「这张码表里它是死码」。
+/// - `vk_to_prefix_char*`（VK → 字符）是**呈现**，字母有天然合法的显示形态。z 经方案级
+///   `z_key_action` 进模式后，组合区要显示用户按下的那个 `z`；用不带字母的版本会得到
+///   空前缀，用户看不到自己按了什么。
+pub fn vk_to_prefix_char_with_letters(vk: u32) -> Option<char> {
+    if let Some(c) = vk_to_prefix_char(vk) {
+        return Some(c);
+    }
+    (VK_A..=VK_Z)
+        .contains(&vk)
+        .then(|| (b'a' + (vk - VK_A) as u8) as char)
 }
 
 #[cfg(test)]
@@ -264,6 +285,20 @@ mod tests {
         assert_eq!(key_name_to_vk_with_letters("z"), Some(0x5A));
         assert_eq!(key_name_to_vk_with_letters("a"), Some(0x41));
         assert_eq!(key_name_to_vk_with_letters("backslash"), Some(VK_BACKSLASH));
+    }
+
+    /// 两个方向的严格度刻意不同：名字→VK 拒绝字母（配置解析，见
+    /// `Coordinator::special_trigger_vk`），VK→字符接受字母（呈现，组合区要显示按下的 z）。
+    #[test]
+    fn prefix_char_accepts_letters_while_key_name_does_not() {
+        assert_eq!(vk_to_prefix_char(VK_Z), None);
+        assert_eq!(vk_to_prefix_char_with_letters(VK_Z), Some('z'));
+        assert_eq!(vk_to_prefix_char_with_letters(VK_A), Some('a'));
+        // 符号仍走 KEY_TABLE，两个版本一致。
+        assert_eq!(vk_to_prefix_char_with_letters(VK_BACKTICK), Some('`'));
+        assert_eq!(vk_to_prefix_char_with_letters(VK_SEMICOLON), Some(';'));
+        // 非字母非符号（如数字键）两个版本都没有映射。
+        assert_eq!(vk_to_prefix_char_with_letters(0x31), None);
     }
 
     #[test]

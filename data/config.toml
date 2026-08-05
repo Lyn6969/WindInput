@@ -52,6 +52,11 @@ show_code_hint = true
 single_code_input = false
 single_code_complete = true
 z_key_repeat = true
+# z 键功能：空缓冲按 z、且 z 在本方案是死码（无以 z 开头的编码）时，进哪个模式。
+# 值域：""/none（作正常编码字母）/ temp_pinyin / temp_english / mix:<id> / special:<id>。
+# 与 z_key_repeat 正交：repeat 先手，继续打字母才轮到本项。
+# 出厂空 = 不启用；这是**方案级**配置，按码表在自己的 [engine.codetable] 里开。
+z_key_action = ""
 
 # 码表调频（全局唯一；strategy: top=一次到顶 MRU / step=逐次提升）。
 #

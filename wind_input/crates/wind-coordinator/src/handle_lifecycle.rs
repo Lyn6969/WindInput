@@ -8,6 +8,7 @@ use crate::coordinator::{Coordinator, State, punct_char};
 use crate::pipeline::ModeKind;
 use tracing::{debug, info};
 use wind_bridge::handler::{KeyAction, KeyEventData};
+use wind_config::ZKeyAction;
 use wind_ipc::protocol::{MOD_ALT, MOD_CTRL, MOD_SHIFT};
 use wind_keys::keymap;
 use wind_ui::manager::UiCommand;
@@ -52,7 +53,7 @@ impl Coordinator {
     /// 仅用于「智能符号 press2 要不要抢在模式激活之前」的门控：只有被模式占用的符号键存在
     /// 这个冲突，其余标点照常在标点分支判 press2。
     ///
-    /// 临拼的**字母**触发键（z）刻意不算：它要过三重身份裁决，且字母键根本不产出标点，
+    /// z 键功能（`z_key_action`）刻意不算：它要过三重身份裁决，且字母键根本不产出标点，
     /// `punct_char` 那一关就已经把它挡在门外。
     fn is_any_mode_trigger(&self, key_code: u32) -> bool {
         self.is_temp_pinyin_trigger(key_code)
@@ -130,7 +131,7 @@ impl Coordinator {
             && data.modifiers & (MOD_CTRL | MOD_ALT | MOD_SHIFT) == 0
             && self.is_temp_english_trigger(data.key_code)
         {
-            let prefix = wind_keys::keymap::vk_to_prefix_char(data.key_code)
+            let prefix = wind_keys::keymap::vk_to_prefix_char_with_letters(data.key_code)
                 .map(|c| c.to_string())
                 .unwrap_or_default();
             state.active = Some(ModeKind::TempEnglish);
@@ -174,39 +175,34 @@ impl Coordinator {
             });
         }
 
-        // 临时拼音「字母触发键」（z）三重身份裁决（对齐 Go judgeZFirstTrigger；符号触发键在上方
-        // is_temp_pinyin_trigger 分支处理，此处专司字母键）：码表引擎 + 空缓冲 + 无修饰键 +
-        // 配置了该字母触发键。
-        // ① z_key_repeat 开且有上屏历史 → 不进临拼（z 作 repeat，落普通输入由 update_candidates 注入
-        //    重复候选）；② 该字母是活码前缀（码表/短语有以其开头的条目，如自定义 zhang）→ 不进临拼
-        //    （作正常码字母）；③ 否则（死前缀 + 无 repeat，如标准五笔 z）→ 进临时拼音。
+        // z 键功能（方案级 `schema.codetable.z_key_action`）的三重身份裁决
+        // （对齐 Go judgeZFirstTrigger）：码表引擎 + 空缓冲 + 无修饰键 + 本方案配了 z 的功能。
+        // ① z_key_repeat 开且有上屏历史 → 不进模式（z 作 repeat，落普通输入由 update_candidates
+        //    注入重复候选）；② z 是活码前缀（码表/短语有以 z 开头的条目，如自定义 zhang）→ 不进
+        //    模式（作正常码字母）；③ 否则（死码 + 无 repeat，如标准五笔 z）→ 执行 z_key_action。
+        //
+        // 只认 z、且只在码表引擎：见 `ZKeyAction` 的「为什么是方案级、且只管 z」。混输刻意排除
+        // （避免 `zhang` 丢首字母，与 `try_z_fallback` 的门禁同源）。
         if state.input_buffer.is_empty()
             && data.modifiers & (MOD_CTRL | MOD_ALT | MOD_SHIFT) == 0
+            && data.key_code == keymap::VK_Z
             && matches!(
                 self.engine_mgr.current_engine_type(),
                 Some(wind_engine::EngineType::CodeTable)
             )
-            && let Some(letter) = self.matched_letter_temp_trigger(data.key_code)
-            && let Some(target) = self.engine_mgr.temp_pinyin_target()
         {
-            let repeat_active = self.z_key_repeat_text().is_some();
-            if !repeat_active && !self.has_code_prefix(&letter.to_string()) {
-                state.active = Some(ModeKind::TempPinyin);
-                state.temp_pinyin_schema = target;
-                state.temp_pinyin_buffer.clear();
-                state.temp_pinyin_prefix = letter.to_string();
+            let action = self.z_key_action();
+            // ①②的顺序：repeat 判据在前且更便宜，能省掉 has_code_prefix 的码表查询。
+            if action.is_enabled()
+                && self.z_key_repeat_text().is_none()
+                && !self.has_code_prefix("z")
+                && let Some(act) = self.enter_z_action(state, &action, data.key_code)
+            {
                 state.rewind = None; // 首键进入非夺取式，作废任何旧回退登记
-                self.update_temp_pinyin_candidates(state);
-                let display = state.preedit.clone();
-                self.notify_ui_update(state);
-                debug!("Entered temp pinyin via letter trigger '{}'", letter);
-                return Some(KeyAction::UpdateComposition {
-                    text: display.clone(),
-                    caret_pos: display.chars().count() as u32,
-                });
+                return Some(act);
             }
-            // ①/②：返回 None，z 落普通输入路径（buffer 变 "z"，repeat 注入 / 正常码累积；
-            // 后续按字母若 z… 破前缀，由 try_z_fallback 夺取进临拼）。
+            // ①/②/门卫未过：返回 None，z 落普通输入路径（buffer 变 "z"，repeat 注入 / 正常码
+            // 累积；后续按字母若 z… 破前缀，由 try_z_fallback 夺取——仅 temp_pinyin 支持夺取）。
         }
 
         // 特殊模式：空缓冲 + 无候选 + 无修饰键 + 引导键匹配（优先级最低）。
@@ -232,6 +228,83 @@ impl Coordinator {
         }
 
         None
+    }
+
+    /// 当前方案的 z 键功能（`schema.codetable.z_key_action` 经方案折叠后的生效值）。
+    ///
+    /// 走 `codetable_settings()` 而非直接读全局配置：这是**方案级**配置，不同码表里 z 的
+    /// 地位不同（五笔 86 是死码，别的码表未必），全局值只是没有方案覆盖时的回落基线。
+    pub(crate) fn z_key_action(&self) -> ZKeyAction {
+        ZKeyAction::parse(&self.engine_mgr.codetable_settings().z_key_action)
+    }
+
+    /// 执行 z 键功能：按 `action` 进对应模式（空缓冲进入语义，组合区前缀显示 `z`）。
+    ///
+    /// **各目标模式的可用性门卫都在这里**，与引导键进入点用的是同一套判据（临拼的
+    /// `temp_pinyin_target`、mix 的成员非空、特殊模式的 `ensure_schema`）。门卫没过返回
+    /// `None`，调用方让 z 落普通输入作正常码——绝不能吞键，否则配了个不可用的目标就等于
+    /// 把 z 这个编码键废掉，且用户完全看不出原因。
+    pub(crate) fn enter_z_action(
+        &self,
+        state: &mut State,
+        action: &ZKeyAction,
+        key_code: u32,
+    ) -> Option<KeyAction> {
+        match action {
+            ZKeyAction::None => None,
+            ZKeyAction::TempPinyin => {
+                let target = self.engine_mgr.temp_pinyin_target()?;
+                state.active = Some(ModeKind::TempPinyin);
+                state.temp_pinyin_schema = target;
+                state.temp_pinyin_buffer.clear();
+                state.temp_pinyin_prefix = Self::temp_pinyin_prefix_for(key_code).to_string();
+                self.update_temp_pinyin_candidates(state);
+                let display = state.preedit.clone();
+                self.notify_ui_update(state);
+                debug!("z_key_action: entered temp pinyin");
+                Some(KeyAction::UpdateComposition {
+                    text: display.clone(),
+                    caret_pos: display.chars().count() as u32,
+                })
+            }
+            ZKeyAction::TempEnglish => {
+                if !self.rt().config.input.temp_english.enabled {
+                    return None;
+                }
+                state.active = Some(ModeKind::TempEnglish);
+                state.temp_english_buffer.clear();
+                state.temp_english_cursor = 0;
+                state.temp_english_prefix = keymap::vk_to_prefix_char_with_letters(key_code)
+                    .map(|c| c.to_string())
+                    .unwrap_or_default();
+                self.update_temp_english_candidates(state);
+                let display = state.preedit.clone();
+                self.notify_ui_update(state);
+                debug!("z_key_action: entered temp English");
+                Some(KeyAction::UpdateComposition {
+                    text: display.clone(),
+                    caret_pos: display.chars().count() as u32,
+                })
+            }
+            ZKeyAction::Mix(id) => {
+                let idx = self.mix_mode_idx(id)?;
+                // 与引导键进入点同一门卫：含 quick_input 或至少一个可加载成员方案。
+                if !self.mix_has_quick_input(idx) && self.mix_members(idx).is_empty() {
+                    return None;
+                }
+                debug!("z_key_action: entering mix idx={}", idx);
+                Some(self.enter_mix_mode(state, idx, key_code))
+            }
+            ZKeyAction::Special(id) => {
+                let idx = self.special_mode_idx(id)?;
+                let schema = self.special_schema(idx)?;
+                if !self.engine_mgr.ensure_schema(&schema) {
+                    return None;
+                }
+                debug!("z_key_action: entering special idx={}", idx);
+                Some(self.enter_special_mode(state, idx, key_code))
+            }
+        }
     }
 
     /// 复位三种独占输入模式（临时英文/临时拼音/快捷输入）的状态。仅清空，不负责上屏；

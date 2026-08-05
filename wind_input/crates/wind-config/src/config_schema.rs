@@ -89,6 +89,8 @@ static REGISTRY: &[ConfigField] = &[
     f("schema.codetable.single_code_input", Bool),
     f("schema.codetable.single_code_complete", Bool),
     f("schema.codetable.z_key_repeat", Bool),
+    // 带参数的值域（`mix:<id>` / `special:<id>`）故用 Str 而非 Enum；解析与校验见 `ZKeyAction`。
+    f("schema.codetable.z_key_action", Str),
     f("schema.codetable.frequency.enabled", Bool),
     f("schema.codetable.frequency.protect_top_n", Int),
     f("schema.codetable.frequency.protect_top_n_len1", Int),

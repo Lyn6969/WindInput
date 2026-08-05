@@ -449,6 +449,77 @@ impl Default for PinyinGlobalConfig {
 
 /// 全局码表配置（[schema.codetable]）。所有码表方案的公共基线，方案可经
 /// `schema_overrides/{id}.toml` 的 `[codetable]` 段（带 enabled 总开关）逐字段覆盖。
+/// z 键功能（`schema.codetable.z_key_action` 的解析形态）。
+///
+/// # 为什么是方案级、且只管 z
+///
+/// 字母天然是编码键，能否借作引导键取决于**这张码表里它是不是死码**（五笔 86 的 z 是，
+/// 别的码表未必）。这是方案的属性，全局 `trigger_keys` 无从表达——那里配了字母就是无条件
+/// 抢键，该字母在所有方案里都打不出编码。故字母引导键已从 `trigger_keys` 移除
+/// （见 `Coordinator::special_trigger_vk`），能力收归本项。
+///
+/// 只管 z 而不做「任意字母可配」：本项与 `z_key_repeat` 是同一个键的两个身份，裁决链要在
+/// 二者之间选。若本项可配成别的字母，`z_key_repeat` 的状态就会去挡一个与它无关的键
+/// （旧实现正是如此：配 `u` 作触发键时，按 u 会被 z 的 repeat 历史挡住不进模式）。
+/// 严格同域才自洽。将来真有换字母的需求，改这一处即可。
+///
+/// # 值域
+///
+/// - `""` / `"none"`：z 是普通编码字母（默认）
+/// - `"temp_pinyin"`：进临时拼音
+/// - `"temp_english"`：进临时英文
+/// - `"mix:<id>"`：进指定融合模式（`mix:quick_mix` = 内置「快捷」）
+/// - `"special:<id>"`：进指定特殊模式
+///
+/// 未知值一律解析成 [`ZKeyAction::None`]（不静默变成别的功能）；指向不存在的 id 由消费端
+/// 的门卫拦下（`mix_members` / `ensure_schema`），并在加载期 `warn`。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ZKeyAction {
+    /// 不启用：z 作正常编码字母。
+    None,
+    /// 进临时拼音。
+    TempPinyin,
+    /// 进临时英文。
+    TempEnglish,
+    /// 进指定融合模式（携带实例 id）。
+    Mix(String),
+    /// 进指定特殊模式（携带实例 id）。
+    Special(String),
+}
+
+impl ZKeyAction {
+    /// 解析配置字符串。大小写与首尾空白不敏感；未知值 → [`Self::None`]。
+    pub fn parse(s: &str) -> Self {
+        let s = s.trim();
+        if let Some(id) = s.strip_prefix("mix:") {
+            let id = id.trim();
+            return if id.is_empty() {
+                Self::None
+            } else {
+                Self::Mix(id.to_string())
+            };
+        }
+        if let Some(id) = s.strip_prefix("special:") {
+            let id = id.trim();
+            return if id.is_empty() {
+                Self::None
+            } else {
+                Self::Special(id.to_string())
+            };
+        }
+        match s.to_lowercase().as_str() {
+            "temp_pinyin" => Self::TempPinyin,
+            "temp_english" => Self::TempEnglish,
+            _ => Self::None,
+        }
+    }
+
+    /// 是否启用（非 `None`）。
+    pub fn is_enabled(&self) -> bool {
+        !matches!(self, Self::None)
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct CodetableGlobal {
     /// 顶码上屏（超满码长取前 N 码首选上屏）。
@@ -478,6 +549,12 @@ pub struct CodetableGlobal {
     /// z 键重复输入。
     #[serde(default)]
     pub z_key_repeat: bool,
+    /// z 键功能：空缓冲按 z 且 z 在本方案是死码时，进哪个模式。见 [`ZKeyAction`]。
+    ///
+    /// 与 [`Self::z_key_repeat`] **正交**（可同时开）：repeat 先手，继续打字母才轮到本项，
+    /// 详见 `Coordinator::try_activate_mode` 的三重身份裁决。
+    #[serde(default)]
+    pub z_key_action: String,
     /// 码表调频（统一开关，取代旧 user_frequency）。
     #[serde(default)]
     pub frequency: CodetableFrequency,
@@ -504,6 +581,7 @@ impl Default for CodetableGlobal {
             single_code_input: false,
             single_code_complete: false,
             z_key_repeat: false,
+            z_key_action: String::new(),
             frequency: CodetableFrequency::default(),
             auto_phrase: AutoPhraseConfig::default(),
         }
@@ -545,6 +623,9 @@ impl CodetableGlobal {
         }
         if let Some(v) = o.z_key_repeat {
             out.z_key_repeat = v;
+        }
+        if let Some(v) = &o.z_key_action {
+            out.z_key_action = v.clone();
         }
         // 调频段逐字段折叠。整段缺省 = 全部跟随基线。
         //
@@ -1123,7 +1204,8 @@ pub struct SpecialModeConfig {
     /// 模式指示短称（如 "符"；空则取 name 首字）
     #[serde(default)]
     pub short_name: String,
-    /// 引导键列表（如 "grave"/"backslash"/"z"）
+    /// 引导键列表（如 "grave"/"backslash"）。**只认符号键**——字母不作引导键，
+    /// 见 `Coordinator::special_trigger_vk`；要让 z 进本模式请配 `schema.codetable.z_key_action`。
     #[serde(default)]
     pub trigger_keys: Vec<String>,
     /// 引用的方案 id（其 .schema.toml 提供码表与全码策略；不进 schema.available，仅 overlay 触发懒加载）
@@ -1547,7 +1629,8 @@ pub struct TempPinyinConfig {
     /// 总开关（原方案级 [engine.codetable.temp_pinyin].enabled 上移至此）。
     #[serde(default = "default_true")]
     pub enabled: bool,
-    /// 触发键（如 "backtick" / "z" / "semicolon"），默认反引号
+    /// 触发键（如 "backtick" / "semicolon"），默认反引号。**只认符号键**——字母触发键
+    /// 已迁往方案级 `schema.codetable.z_key_action`（见 `migrate_letter_trigger_keys`）。
     #[serde(default = "default_temp_pinyin_triggers")]
     pub trigger_keys: Vec<String>,
     /// 专用直达热键（如 "ctrl+shift+p"，空串=不注册）。与 `trigger_keys` 引导键共存；
@@ -2855,6 +2938,81 @@ impl Config {
         }
         self.migrate_quick_mix_pinyin_member();
         self.migrate_quick_input_legacy_member();
+        self.migrate_letter_trigger_keys();
+    }
+
+    /// 存量迁移：`trigger_keys` 里的单字母 → 方案级 [`ZKeyAction`]。
+    ///
+    /// 引导键曾接受任意 a-z（`key_name_to_vk_with_letters`），字母的特殊能力现已收归
+    /// `schema.codetable.z_key_action`。**必须显式迁移**：解析端改成只认符号后，
+    /// `filter_map` 会把留在配置里的字母**静默丢弃**——用户的功能无声消失，且配置文件里
+    /// 那行还在，从现象完全看不出原因。
+    ///
+    /// `z` 折算成对应 action，其余字母只能丢弃（本项只管 z）——但要 `warn` 出来，
+    /// 让日志里留下痕迹。
+    ///
+    /// 归属优先级与老的模式激活链一致（临拼 > 特殊模式 > mix）：z 同时配在多处时，
+    /// 老实现里也是临拼先匹配。已显式配过 `z_key_action` 的不覆盖——用户的新配置优先。
+    fn migrate_letter_trigger_keys(&mut self) {
+        /// 摘掉 `keys` 里的所有单字母项，返回其中是否含 `z`。
+        fn take_letters(keys: &mut Vec<String>, owner: &str) -> bool {
+            let mut has_z = false;
+            keys.retain(|k| {
+                let k = k.trim().to_lowercase();
+                let is_letter = k.len() == 1 && k.as_bytes()[0].is_ascii_lowercase();
+                if !is_letter {
+                    return true;
+                }
+                if k == "z" {
+                    has_z = true;
+                } else {
+                    warn!(
+                        "配置迁移：{} 的引导键 \"{}\" 已失效（字母不再作引导键），已移除。\
+                         若需让某个字母进模式，请配 schema.codetable.z_key_action（仅支持 z）",
+                        owner, k
+                    );
+                }
+                false
+            });
+            has_z
+        }
+
+        let mut migrated: Option<String> = None;
+        let mut claim = |action: String| {
+            if migrated.is_none() {
+                migrated = Some(action);
+            }
+        };
+
+        if take_letters(
+            &mut self.input.temp_pinyin.trigger_keys,
+            "input.temp_pinyin",
+        ) {
+            claim("temp_pinyin".to_string());
+        }
+        for m in self.schema.special_modes.iter_mut() {
+            let owner = format!("schema.special_modes[{}]", m.effective_id());
+            if take_letters(&mut m.trigger_keys, &owner) {
+                claim(format!("special:{}", m.effective_id()));
+            }
+        }
+        for m in self.schema.mix_modes.iter_mut() {
+            let owner = format!("schema.mix_modes[{}]", m.id);
+            if take_letters(&mut m.trigger_keys, &owner) {
+                claim(format!("mix:{}", m.id));
+            }
+        }
+
+        // 已显式配过则不覆盖：用户的新配置优先于存量迁移。
+        if let Some(action) = migrated
+            && self.schema.codetable.z_key_action.trim().is_empty()
+        {
+            info!(
+                "配置迁移：z 引导键 → schema.codetable.z_key_action = \"{}\"",
+                action
+            );
+            self.schema.codetable.z_key_action = action;
+        }
     }
 
     /// 存量迁移：合并成员 `"quick_input"` → 细分来源 [`wind_quick_input::LEGACY_EXPANSION`]。
@@ -3296,6 +3454,113 @@ mod tests {
         assert!(
             !scoped.applies_to("English"),
             "方案 id 区分大小写，按精确匹配"
+        );
+    }
+
+    #[test]
+    fn z_key_action_parses_value_domain() {
+        assert_eq!(ZKeyAction::parse(""), ZKeyAction::None);
+        assert_eq!(ZKeyAction::parse("none"), ZKeyAction::None);
+        assert_eq!(ZKeyAction::parse(" TEMP_PINYIN "), ZKeyAction::TempPinyin);
+        assert_eq!(ZKeyAction::parse("temp_english"), ZKeyAction::TempEnglish);
+        assert_eq!(
+            ZKeyAction::parse("mix:quick_mix"),
+            ZKeyAction::Mix("quick_mix".into())
+        );
+        assert_eq!(
+            ZKeyAction::parse("special:rare"),
+            ZKeyAction::Special("rare".into())
+        );
+        // 未知值绝不静默变成别的功能。
+        assert_eq!(ZKeyAction::parse("enter_temp_pinyin"), ZKeyAction::None);
+        assert_eq!(ZKeyAction::parse("quick_input"), ZKeyAction::None);
+        // 空 id 无从定位目标，等同不启用（消费端也会被门卫挡下，此处提前收敛）。
+        assert_eq!(ZKeyAction::parse("mix:"), ZKeyAction::None);
+        assert_eq!(ZKeyAction::parse("special:  "), ZKeyAction::None);
+        // id 大小写敏感（与 special_mode_idx / mix_mode_idx 的精确匹配同口径）。
+        assert_eq!(
+            ZKeyAction::parse("mix:Quick_Mix"),
+            ZKeyAction::Mix("Quick_Mix".into())
+        );
+    }
+
+    /// 存量迁移：`trigger_keys` 里的 z → `z_key_action`，其余字母丢弃。
+    ///
+    /// 不迁移的后果是**静默失效**：解析端只认符号后 `filter_map` 会把字母无声吃掉，
+    /// 配置文件里那行还在，用户完全看不出功能为什么没了。
+    #[test]
+    fn migrate_letter_trigger_keys_moves_z_to_action() {
+        let mut c = Config::default();
+        c.input.temp_pinyin.trigger_keys = vec!["backtick".into(), "z".into(), "q".into()];
+        c.normalize();
+
+        assert_eq!(
+            c.schema.codetable.z_key_action, "temp_pinyin",
+            "z 应折算成 z_key_action"
+        );
+        assert_eq!(
+            c.input.temp_pinyin.trigger_keys,
+            vec!["backtick".to_string()],
+            "字母项应从 trigger_keys 摘除，符号项保留"
+        );
+    }
+
+    /// 归属优先级与老的模式激活链一致：临拼 > 特殊模式 > mix。
+    #[test]
+    fn migrate_letter_trigger_keys_follows_activation_priority() {
+        let mut c = Config::default();
+        c.input.temp_pinyin.trigger_keys = vec!["z".into()];
+        c.schema.special_modes = vec![SpecialModeConfig {
+            id: "rare".into(),
+            trigger_keys: vec!["z".into()],
+            ..Default::default()
+        }];
+        c.normalize();
+
+        assert_eq!(
+            c.schema.codetable.z_key_action, "temp_pinyin",
+            "同时配在多处时按激活链取临拼（老实现也是临拼先匹配）"
+        );
+        assert!(
+            c.schema.special_modes[0].trigger_keys.is_empty(),
+            "未中选的字母项同样要摘除，否则留在配置里也是静默失效"
+        );
+    }
+
+    /// 特殊模式独有的 z：折算成 `special:<id>`。
+    #[test]
+    fn migrate_letter_trigger_keys_maps_special_mode() {
+        let mut c = Config::default();
+        c.schema.special_modes = vec![SpecialModeConfig {
+            id: "rare".into(),
+            trigger_keys: vec!["backslash".into(), "z".into()],
+            ..Default::default()
+        }];
+        c.normalize();
+
+        assert_eq!(c.schema.codetable.z_key_action, "special:rare");
+        assert_eq!(
+            c.schema.special_modes[0].trigger_keys,
+            vec!["backslash".to_string()],
+            "符号引导键不受影响，仍可与 z_key_action 并存"
+        );
+    }
+
+    /// 已显式配过 `z_key_action` 时，存量迁移不得覆盖用户的新配置。
+    #[test]
+    fn migrate_letter_trigger_keys_does_not_override_explicit() {
+        let mut c = Config::default();
+        c.schema.codetable.z_key_action = "temp_english".into();
+        c.input.temp_pinyin.trigger_keys = vec!["z".into()];
+        c.normalize();
+
+        assert_eq!(
+            c.schema.codetable.z_key_action, "temp_english",
+            "显式配置优先于存量迁移"
+        );
+        assert!(
+            c.input.temp_pinyin.trigger_keys.is_empty(),
+            "旧字母项无论是否中选都要摘除"
         );
     }
 
