@@ -2728,6 +2728,159 @@ impl Coordinator {
         self.commit_highlight_then_char(state, ch, has_comp)
     }
 
+    /// 码元字符进缓冲的公共通路：插入 → 顶码上屏 → 候选刷新 → 组合区更新。
+    ///
+    /// 字母臂与非字母码元闸门（[`Self::try_code_char_gate`]）共用本函数——两条路进来的
+    /// 只是「哪个键产出了这个字符」不同，进缓冲之后的处置完全一致。**不要复制这段**：
+    /// 顶码的显示首选一致性、自动上屏的记账码分流都在这里，复制出去必然漂移。
+    ///
+    /// `ch` 是进缓冲的小写码元，`raw` 是进影子串的原始形态（Shift 大写等）。
+    pub(crate) fn accumulate_code_char(&self, state: &mut State, ch: char, raw: char) -> KeyAction {
+        // 顶码前记住「即将成为前缀」的缓冲及其显示首选：顶码上屏文本须与用户实际所见的
+        // 首候选一致——调频置顶 / shadow 在协调器层重排（apply_freq_rerank/apply_shadow），
+        // 引擎 handle_top_code 内部 convert 看不到，会顶出权重首选而非显示首选（对齐 Go
+        // 复用 ConvertEx 取 Candidates[0] 的一致性修复）。顶码绝大多数发生在「满码+1」，
+        // 此时前缀恰为顶码前缓冲，state.candidates 正是其显示候选。
+        let pre_buf = state.input_buffer.clone();
+        // 顶码上屏候选 = 用户实际所见的**显示首选**：取顶码前缓冲（即将成为前缀）的显示
+        // 首候选——它已过智能过滤 / 词频重排 / shadow，正是用户所见。保留整条候选（含
+        // is_command / phrase_template / group_code），供顶码分流：码表候选 & 普通短语 →
+        // 文本顶上屏；$CC 命令短语 → 求值执行。短语 source 为 `Phrase`（**不参与**本
+        // filter，放行靠 is_phrase / is_command 显式判定，与 source 取值无关）；拼音/英文
+        // 候选（拼音本就排首，或智能过滤掉生僻码表字后仅剩拼音，如「wang」只有生僻字
+        // 「佢」被过滤、显示全是拼音）仍被排除 → 下方放弃顶码继续组合
+        // （对齐「上屏须与显示一致 + 非码表/短语类不上屏」）。
+        let pre_display_first = state
+            .candidates
+            .first()
+            .cloned()
+            .filter(|c| c.source == CandidateSource::CodeTable || c.is_phrase || c.is_command);
+        // 在光标处插入（光标在末尾时等价于旧的 push）。后续顶码/候选刷新一律按整串
+        // 缓冲判定，与光标位置无关——光标只是编辑位置，不参与引擎查询。
+        preedit_cursor::BufEdit::new_cased(
+            &mut state.input_buffer,
+            &mut state.input_cursor_pos,
+            &mut state.input_buffer_cased,
+        )
+        .insert_cased(ch, raw);
+
+        // 顶码上屏：缓冲超过满码长且整串无匹配 → 顶前 N 码首选，余码续打
+        // （schema.top_code_commit；置于候选刷新前，对齐 Go handleAlphaKey）。
+        if let Some((engine_top, remainder)) = self.engine_mgr.handle_top_code(&state.input_buffer)
+        {
+            let buf = state.input_buffer.clone();
+            let prefix: String = buf[..buf.len().saturating_sub(remainder.len())].to_string();
+            // 顶码候选决策：
+            // - prefix==顶码前缓冲（满码+1，最常见）：用显示首选候选（码表/普通短语/命令）；
+            //   显示首选非码表且非短语 → None → 放弃顶码（继续组合让用户选拼音）。
+            // - 否则（多级溢出，罕见 wubi 场景）：回退引擎码表顶码纯文本（无命令语义）。
+            if prefix == pre_buf {
+                match pre_display_first {
+                    // $CC 命令短语顶码：纯文本命令（≈词条）同步求值文本走标准文本顶码；
+                    // 含副作用命令（开应用/切设置等）异步执行 + 余码走标准流程。
+                    Some(cand) if cand.is_command => {
+                        let input = if cand.group_code.is_empty() {
+                            prefix.clone()
+                        } else {
+                            cand.group_code.clone()
+                        };
+                        return match self.eval_command_text_only(&cand.phrase_template, &input) {
+                            Some(text) => {
+                                self.commit_top_text(state, &prefix, text, &remainder, cand.source)
+                            }
+                            None => self.top_commit_command_with_remainder(
+                                state, &cand, &prefix, &remainder,
+                            ),
+                        };
+                    }
+                    // 码表候选 / 普通短语：文本顶上屏 + 余码续打。
+                    Some(cand) => {
+                        let source = cand.source;
+                        return self.commit_top_text(state, &prefix, cand.text, &remainder, source);
+                    }
+                    // 显示首选是拼音/英文 → 放弃顶码，落到下方正常候选刷新继续组合。
+                    None => {}
+                }
+            } else if !engine_top.is_empty() {
+                // 多级溢出：引擎码表纯文本顶码（码表无字则 engine_top 空 → 放弃顶码，
+                // 落到下方正常候选刷新继续组合）。此路来自引擎码表查询，确为码表来源。
+                return self.commit_top_text(
+                    state,
+                    &prefix,
+                    engine_top,
+                    &remainder,
+                    CandidateSource::CodeTable,
+                );
+            }
+        }
+
+        // 全码自动上屏 / 满码空码清空（schema.auto_commit_at_full / clear_on_empty_max）。
+        match self.update_candidates(state) {
+            InputOutcome::AutoCommit(text) => {
+                // 自动上屏文本取自首候选（handle_candidate.rs 构造 AutoCommit 时同源）。
+                // 记账码同取首候选（按来源分流，见 `freq_code`），无候选时退回输入缓冲。
+                let (source, code) = state
+                    .candidates
+                    .first()
+                    .map(|c| (c.source, self.freq_code(&state.input_buffer, c)))
+                    .unwrap_or_else(|| (CandidateSource::default(), state.input_buffer.clone()));
+                let out = self.commit_candidate(state, &text, None, source, &code);
+                self.notify_ui_hide();
+                return Self::commit_action(out, true);
+            }
+            // 含副作用命令自动命中：与空格选中命令同路（清组合 + 异步执行）。
+            InputOutcome::AutoCommand(cand) => {
+                return self.commit_command(state, &cand);
+            }
+            InputOutcome::Clear => {
+                state.input_buffer.clear();
+                state.candidates.clear();
+                self.notify_ui_hide();
+                return KeyAction::ClearComposition;
+            }
+            InputOutcome::Normal => {}
+        }
+        let display = state.preedit.clone();
+        let caret_pos = self.composition_caret(state);
+        self.notify_ui_update(state);
+        KeyAction::UpdateComposition {
+            caret_pos,
+            text: display,
+        }
+    }
+
+    /// 非字母码元闸门：本方案把某个数字/符号配成了码元，且此刻允许它进缓冲 → 接管。
+    ///
+    /// 置于优先级链的「模式激活/URL 夺取之后、以词定字/翻页/大 match 之前」，于是组码中
+    /// 的码元抢在选词键、翻页键、标点流水线之前——这正是「组码中码元优先」契约。
+    /// 空缓冲时 `can_enter_buffer` 查的是**首码集**，数字默认不在其中 ⇒ 不接管，
+    /// 数字键照常作选词/透传，用户不会失去「选第 1 个候选」与原生数字输入。
+    ///
+    /// 字母**不走这里**：它们在大 match 的字母臂处理，那里还有 z-fallback 等字母专属判定。
+    ///
+    /// ⚠️ 默认码元集 `a-z` 不含任何非字母字符 ⇒ 本闸门恒返回 `None`，与历史逐键等价。
+    pub(crate) fn try_code_char_gate(
+        &self,
+        state: &mut State,
+        data: &KeyEventData,
+    ) -> Option<KeyAction> {
+        // Ctrl/Alt 组合不是码元输入。上游已拦截，此处为纵深防御。
+        if data.modifiers & (MOD_CTRL | MOD_ALT) != 0 {
+            return None;
+        }
+        let shift = data.modifiers & MOD_SHIFT != 0;
+        let ch = printable_char(data.key_code, shift)?;
+        if ch.is_ascii_alphabetic() {
+            return None;
+        }
+        // 缓冲恒存小写（与字母同域）；`ch` 作为原始形态进影子串。
+        let lower = ch.to_ascii_lowercase();
+        if !self.can_enter_buffer(state, lower) {
+            return None;
+        }
+        Some(self.accumulate_code_char(state, lower, ch))
+    }
+
     /// 普通模式「顶屏高亮候选 + 输出字符」：把已转换前缀与当前高亮候选一并上屏，再接该字符。
     /// 小键盘 direct 语义共用此路（编码型缓冲里数字不是合法编码，故终结当前组合而非入缓冲；
     /// 但**不丢弃**用户已打的码——顶屏它，对齐主键盘标点键的既有行为）。
@@ -5311,6 +5464,21 @@ impl MessageHandler for Coordinator {
             state.input_buffer
         );
 
+        // 非字母码元闸门：本方案把某个数字/符号配成了码元（如 `a-z0-9` 要打 `Win10`、
+        // `a-x/` 要打含 `/` 的词条）→ 进缓冲，抢在以词定字/翻页/数字选词/标点流水线之前。
+        //
+        // 位置即契约（见 docs/design/codetable-input-chars.md「组码中码元优先，空缓冲让位」）：
+        // 置于模式激活与 URL 夺取**之后**，故空缓冲下的引导键、临拼/临英触发键、URL 前缀
+        // 一概不受影响；置于下方各闸门**之前**，故组码中这些键归码表而非选词/翻页。
+        //
+        // 空缓冲时闸门查的是**首码集**：数字默认不在其中 ⇒ 不接管 ⇒ 数字键照常选词/透传，
+        // 用户不会失去「选第 1 个候选」和原生数字输入。
+        //
+        // ⚠️ 默认码元集 a-z 不含任何非字母字符 ⇒ 恒不命中，与历史逐键等价（零回归）。
+        if let Some(act) = self.try_code_char_gate(&mut state, data) {
+            return act;
+        }
+
         // 以词定字（select_char）：配置的成对标点键从当前高亮候选词逐字上屏（对齐 Go
         // handleEngineDefault——select_char 优先于翻页键，故置于 apply_nav_key 之前）。默认
         // `select_char_keys` 为空 → select_char_index 恒 None → 跳过（零回归）。仅在缓冲非空或
@@ -5555,130 +5723,7 @@ impl MessageHandler for Coordinator {
                 if !self.can_enter_buffer(&state, ch) {
                     return self.reject_non_code_char(&mut state, raw);
                 }
-                // 顶码前记住「即将成为前缀」的缓冲及其显示首选：顶码上屏文本须与用户实际所见的
-                // 首候选一致——调频置顶 / shadow 在协调器层重排（apply_freq_rerank/apply_shadow），
-                // 引擎 handle_top_code 内部 convert 看不到，会顶出权重首选而非显示首选（对齐 Go
-                // 复用 ConvertEx 取 Candidates[0] 的一致性修复）。顶码绝大多数发生在「满码+1」，
-                // 此时前缀恰为顶码前缓冲，state.candidates 正是其显示候选。
-                let pre_buf = state.input_buffer.clone();
-                // 顶码上屏候选 = 用户实际所见的**显示首选**：取顶码前缓冲（即将成为前缀）的显示
-                // 首候选——它已过智能过滤 / 词频重排 / shadow，正是用户所见。保留整条候选（含
-                // is_command / phrase_template / group_code），供顶码分流：码表候选 & 普通短语 →
-                // 文本顶上屏；$CC 命令短语 → 求值执行。短语 source 为 `Phrase`（**不参与**本
-                // filter，放行靠 is_phrase / is_command 显式判定，与 source 取值无关）；拼音/英文
-                // 候选（拼音本就排首，或智能过滤掉生僻码表字后仅剩拼音，如「wang」只有生僻字
-                // 「佢」被过滤、显示全是拼音）仍被排除 → 下方放弃顶码继续组合
-                // （对齐「上屏须与显示一致 + 非码表/短语类不上屏」）。
-                let pre_display_first = state.candidates.first().cloned().filter(|c| {
-                    c.source == CandidateSource::CodeTable || c.is_phrase || c.is_command
-                });
-                // 在光标处插入（光标在末尾时等价于旧的 push）。后续顶码/候选刷新一律按整串
-                // 缓冲判定，与光标位置无关——光标只是编辑位置，不参与引擎查询。
-                {
-                    let st = &mut *state;
-                    preedit_cursor::BufEdit::new_cased(
-                        &mut st.input_buffer,
-                        &mut st.input_cursor_pos,
-                        &mut st.input_buffer_cased,
-                    )
-                    .insert_cased(ch, raw);
-                }
-
-                // 顶码上屏：缓冲超过满码长且整串无匹配 → 顶前 N 码首选，余码续打
-                // （schema.top_code_commit；置于候选刷新前，对齐 Go handleAlphaKey）。
-                if let Some((engine_top, remainder)) =
-                    self.engine_mgr.handle_top_code(&state.input_buffer)
-                {
-                    let buf = state.input_buffer.clone();
-                    let prefix: String =
-                        buf[..buf.len().saturating_sub(remainder.len())].to_string();
-                    // 顶码候选决策：
-                    // - prefix==顶码前缓冲（满码+1，最常见）：用显示首选候选（码表/普通短语/命令）；
-                    //   显示首选非码表且非短语 → None → 放弃顶码（继续组合让用户选拼音）。
-                    // - 否则（多级溢出，罕见 wubi 场景）：回退引擎码表顶码纯文本（无命令语义）。
-                    if prefix == pre_buf {
-                        match pre_display_first {
-                            // $CC 命令短语顶码：纯文本命令（≈词条）同步求值文本走标准文本顶码；
-                            // 含副作用命令（开应用/切设置等）异步执行 + 余码走标准流程。
-                            Some(cand) if cand.is_command => {
-                                let input = if cand.group_code.is_empty() {
-                                    prefix.clone()
-                                } else {
-                                    cand.group_code.clone()
-                                };
-                                return match self
-                                    .eval_command_text_only(&cand.phrase_template, &input)
-                                {
-                                    Some(text) => self.commit_top_text(
-                                        &mut state,
-                                        &prefix,
-                                        text,
-                                        &remainder,
-                                        cand.source,
-                                    ),
-                                    None => self.top_commit_command_with_remainder(
-                                        &mut state, &cand, &prefix, &remainder,
-                                    ),
-                                };
-                            }
-                            // 码表候选 / 普通短语：文本顶上屏 + 余码续打。
-                            Some(cand) => {
-                                let source = cand.source;
-                                return self.commit_top_text(
-                                    &mut state, &prefix, cand.text, &remainder, source,
-                                );
-                            }
-                            // 显示首选是拼音/英文 → 放弃顶码，落到下方正常候选刷新继续组合。
-                            None => {}
-                        }
-                    } else if !engine_top.is_empty() {
-                        // 多级溢出：引擎码表纯文本顶码（码表无字则 engine_top 空 → 放弃顶码，
-                        // 落到下方正常候选刷新继续组合）。此路来自引擎码表查询，确为码表来源。
-                        return self.commit_top_text(
-                            &mut state,
-                            &prefix,
-                            engine_top,
-                            &remainder,
-                            CandidateSource::CodeTable,
-                        );
-                    }
-                }
-
-                // 全码自动上屏 / 满码空码清空（schema.auto_commit_at_full / clear_on_empty_max）。
-                match self.update_candidates(&mut state) {
-                    InputOutcome::AutoCommit(text) => {
-                        // 自动上屏文本取自首候选（handle_candidate.rs 构造 AutoCommit 时同源）。
-                        // 记账码同取首候选（按来源分流，见 `freq_code`），无候选时退回输入缓冲。
-                        let (source, code) = state
-                            .candidates
-                            .first()
-                            .map(|c| (c.source, self.freq_code(&state.input_buffer, c)))
-                            .unwrap_or_else(|| {
-                                (CandidateSource::default(), state.input_buffer.clone())
-                            });
-                        let out = self.commit_candidate(&mut state, &text, None, source, &code);
-                        self.notify_ui_hide();
-                        return Self::commit_action(out, true);
-                    }
-                    // 含副作用命令自动命中：与空格选中命令同路（清组合 + 异步执行）。
-                    InputOutcome::AutoCommand(cand) => {
-                        return self.commit_command(&mut state, &cand);
-                    }
-                    InputOutcome::Clear => {
-                        state.input_buffer.clear();
-                        state.candidates.clear();
-                        self.notify_ui_hide();
-                        return KeyAction::ClearComposition;
-                    }
-                    InputOutcome::Normal => {}
-                }
-                let display = state.preedit.clone();
-                let caret_pos = self.composition_caret(&state);
-                self.notify_ui_update(&state);
-                KeyAction::UpdateComposition {
-                    caret_pos,
-                    text: display,
-                }
+                self.accumulate_code_char(&mut state, ch, raw)
             }
             keymap::VK_LEFT | keymap::VK_RIGHT | keymap::VK_HOME | keymap::VK_END => {
                 // 编码区光标移动（对齐 Go handleCursorLeft/Right/Home/End 的三态语义）：
