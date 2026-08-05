@@ -4593,6 +4593,42 @@ fn phrase_auto_commit_unique_exact_no_longer() {
     let _ = std::fs::remove_file(&store_path);
 }
 
+/// **短语的上屏文本必须保留真换行**——`Candidate::text` 就是上屏内容，不得在装配期改写。
+///
+/// 回归背景：短语候选装配曾调 `clamp_candidate_display` 做「一行化」（换行/制表→空格），
+/// 而用户词候选**不走这一步**。于是同一条含换行的内容，用户词能上屏换行、短语上屏成空格；
+/// 候选窗里也看不到 ↵，因为 text 里的换行早在装配期就没了。
+///
+/// 一行化是**显示层**关注点（杜绝多行候选撑破候选窗），现由渲染层 `visible_whitespace`
+/// 承担（换行→↵、制表→⇥，只投影不改数据）。数据层不得再有同类改写。
+#[test]
+fn phrase_commit_keeps_real_newline() {
+    if !has_schemas() {
+        return;
+    }
+    let store_path = std::env::temp_dir().join("wind_phrase_keep_newline.redb");
+    let _ = std::fs::remove_file(&store_path);
+    let store = std::sync::Arc::new(wind_store::Store::open(&store_path).unwrap());
+    // 与 phrase_auto_commit 同构造：kkkkx 在五笔 5 码处必无码表候选 → 短语唯一 → 自动上屏。
+    store.add_phrase("kkkkx", "甲\n乙", 0, 100).unwrap();
+    let mut cfg = config_with("wubi86");
+    cfg.schema.codetable.auto_commit_at_full = true;
+    let coord = Coordinator::new_headless_with_store(cfg, Some(&data_dir()), store);
+    for ch in ['k', 'k', 'k', 'k'] {
+        press_letter(&coord, ch);
+    }
+    match coord.handle_key_event(&key_event(0x58, EVENT_KEY_DOWN)) {
+        KeyAction::InsertText { text, .. } => {
+            assert_eq!(
+                text, "甲\n乙",
+                "短语上屏文本须保留真换行；若得到「甲 乙」说明装配期又做了一行化"
+            );
+        }
+        other => panic!("短语全码唯一应自动上屏(InsertText)，实际: {:?}", other),
+    }
+    let _ = std::fs::remove_file(&store_path);
+}
+
 #[test]
 fn phrase_auto_commit_effect_command_executes() {
     if !has_schemas() {

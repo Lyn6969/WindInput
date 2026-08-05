@@ -584,9 +584,17 @@ impl Coordinator {
                 // 稳定 id 取**模板原文**：text 可能是求值结果（date/time/clip），逐日变化。
                 let cand_id = Self::phrase_cand_id(&state.input_buffer, &hit.source_text);
                 candidates.push(Candidate {
-                    // text 存完整原文（仅一行化，不截断）——上屏须用原始文本，超长省略号截断
-                    // 移到 UI 下发层（见 coordinator 候选映射）。传 0 表示不限长度。
-                    text: Self::clamp_candidate_display(&hit.text, 0),
+                    // text 存**完整原文，含真换行**——它就是上屏文本，不得在此改写。
+                    //
+                    // 这里曾调 `clamp_candidate_display` 做「一行化」（换行/制表→空格），
+                    // 目的是杜绝多行候选撑破候选窗。那是 ↵ 可见符出现之前的权宜之计，
+                    // 代价是**把上屏文本一起改了**——用户词库不走这步，于是同样一条含换行的
+                    // 词条，用户词能上屏换行、短语却上屏成空格。
+                    // 现在「杜绝多行候选」由渲染层的 `wind_ui::candidate_window::
+                    // visible_whitespace` 负责（换行→↵、制表→⇥），那是显示投影、不动数据。
+                    //
+                    // ★ 一行化是**显示层关注点**，放在数据层就必然殃及上屏。
+                    text: hit.text,
                     weight: PHRASE_WEIGHT_BASE + hit.weight,
                     is_phrase: true,
                     // $CC 命令短语：标记 is_command，phrase_template 暂存命令源；
@@ -654,8 +662,9 @@ impl Coordinator {
             let phrase_prefix_is_prefix = !codetable_mode;
             let mut built: Vec<Candidate> = Vec::new();
             for hit in prefix_hits {
-                // 完整原文（仅一行化，不截断）：上屏用原始文本，截断加省略号由 UI 下发层负责。
-                let text = Self::clamp_candidate_display(&hit.text, 0);
+                // 完整原文，含真换行：它就是上屏文本。一行化由渲染层的 `visible_whitespace`
+                // 承担（见上方 `lookup` 分支的同源说明），此处不得改写。
+                let text = hit.text;
                 let is_system = hit.is_system;
                 let phrase_meta = || CandidateMeta {
                     is_system_phrase: is_system,
@@ -1684,27 +1693,11 @@ impl Coordinator {
     /// 部分匹配（候选只消费缓冲前缀）：把汉字并入 `committed_text` 前缀、裁剪缓冲、重转剩余，
     /// **留在组合区不上屏到应用**，返回 UpdateComposition。
     /// 完整匹配（消费整串）：整体上屏 `committed_text + 候选` 到应用，触发自动造词（L），清空。
-    /// 规整候选显示文本：换行/制表 → 空格（杜绝多行候选），`max`>0 时超长截断加省略号。
-    /// 短语生成层以 `max=0` 调用（仅一行化、不截断，`text` 存完整原文供上屏）；
-    /// 显示层长度截断由 `UiCandidateConfig::truncate_display`（`ui.candidate.max_chars`）负责。
-    pub(crate) fn clamp_candidate_display(s: &str, max: usize) -> String {
-        let one_line: String = s
-            .chars()
-            .map(|c| {
-                if c == '\n' || c == '\r' || c == '\t' {
-                    ' '
-                } else {
-                    c
-                }
-            })
-            .collect();
-        if max == 0 || one_line.chars().count() <= max {
-            one_line
-        } else {
-            let head: String = one_line.chars().take(max).collect();
-            format!("{head}…")
-        }
-    }
+    // 此处原有 `clamp_candidate_display`（换行/制表→空格 + 可选截断），已随「短语候选
+    // 不再一行化」删除：它唯一的两个调用点都传 max=0，实际只在做一行化，而一行化会连
+    // 上屏文本一起改掉。杜绝多行候选现由渲染层 `wind_ui` 的 `visible_whitespace` 承担
+    // （换行→↵、制表→⇥，只投影不改数据），长度截断由 `UiCandidateConfig::truncate_display`
+    // 负责——两个显示层关注点都已各归其位，数据层不该再有同类改写。
 
     /// 前缀导航候选选中：把输入缓冲补全到该组完整码并重查候选（展开成员/精确命令），
     /// 实现"敲 zz → 选标点 → 展开标点字符"的二级选择。返回新 preedit 显示文本。

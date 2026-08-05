@@ -295,6 +295,9 @@ impl PhraseLayer {
                     }
                 }
             } else if let Some(text) = expand_template(&e.text, &now) {
+                // 短语文本按原样出候选：库里存的就是真实文本（含真换行）。
+                // 转义只在系统边界发生（文本文件读写、设置页 UI 进出），见
+                // `wind_dict::store_layer::record_to_candidate` 的同源说明。
                 out.push(PhraseHit::plain(text, e.weight).with_source(&e.text));
             }
             // 本条 entry 产出的所有 hit 继承其系统/用户归属。

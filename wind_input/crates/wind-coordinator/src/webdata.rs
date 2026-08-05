@@ -218,8 +218,9 @@ impl Coordinator {
             // 加词自动出码：按方案类型选拼音/五笔规则（reverse 反查表）。
             "dict.encode" => self.web_dict_encode(params),
             "dict.genPinyin" => {
+                // 取码要按**真实文本**算：转义形态里的 `\` `n` 会被当成两个待取码的字符。
                 let text = str_param(params, "text")?;
-                Ok(json!(self.gen_pinyin_word(text)))
+                Ok(json!(self.gen_pinyin_word(&store_text(text))))
             }
             "dict.export" => self.web_dict_export(params),
             "dict.import" => self.web_dict_import(params),
@@ -472,6 +473,8 @@ impl Coordinator {
         let schema = str_param(params, "schemaId")?;
         let schema = self.engine_mgr.data_schema_id(schema); // 拼音族折叠到 "pinyin"
         let (code, text) = (str_param(params, "code")?, str_param(params, "text")?);
+        // 设置页传的是转义形态，还原成存储域（真实文本）后再落库/比对。见 [`store_text`]。
+        let text = &store_text(text);
         let weight = i32_param(params, "weight");
         let store = self
             .store
@@ -519,6 +522,9 @@ impl Coordinator {
         let schema = str_param(params, "schemaId")?;
         let schema = self.engine_mgr.data_schema_id(schema); // 拼音族折叠到 "pinyin"
         let (code, text) = (str_param(params, "code")?, str_param(params, "text")?);
+        // text 在这里是**查找键**（update_user_word_weight 按它匹配记录），
+        // 不还原就查不到 → 「改了没反应」。见 [`store_text`]。
+        let text = &store_text(text);
         let weight = i32_param(params, "weight");
         let store = self
             .store
@@ -542,8 +548,9 @@ impl Coordinator {
             .as_ref()
             .ok_or_else(|| anyhow::anyhow!("无持久化存储"))?;
         // 列表项的 code 带音节空格（见 word_item），而 key 是扁平的——不拆就删不掉。
+        // text 同理：列表给的是转义形态、key 是真实文本，不还原一样删不掉。
         let (code, _) = wind_store::wdict::split_spaced_code(code);
-        store.remove_user_word(&schema, &code, text)?;
+        store.remove_user_word(&schema, &code, &store_text(text))?;
         Ok(json!({ "ok": true }))
     }
 
@@ -1122,7 +1129,8 @@ impl Coordinator {
 
     fn web_dict_encode(&self, params: &Value) -> anyhow::Result<Value> {
         let schema = str_param(params, "schemaId")?;
-        let text = str_param(params, "text")?;
+        // 同 dict.genPinyin：取码基于真实文本，不能拿转义形态去逐字反查。
+        let text = &store_text(str_param(params, "text")?);
         // 拼音类方案出拼音码；其余（码表）按方案 [[encoder.rules]] 出词组码。
         let is_pinyin = self
             .engine_mgr
@@ -1230,7 +1238,7 @@ impl Coordinator {
             .into_iter()
             .map(|(code, text, rec)| {
                 let code = self.freq_display_code(&schema, &code, &text);
-                json!({ "code": code, "text": text, "count": rec.count, "lastUsed": rec.last_used })
+                json!({ "code": code, "text": ui_text(&text), "count": rec.count, "lastUsed": rec.last_used })
             })
             .collect();
         Ok(json!({ "items": items, "total": total }))
@@ -1278,7 +1286,7 @@ impl Coordinator {
             .ok_or_else(|| anyhow::anyhow!("无持久化存储"))?;
         // 列表项的 code 带音节空格（见 freq_display_code），而词频表 key 是扁平的。
         let (code, _) = wind_store::wdict::split_spaced_code(code);
-        store.delete_freq(&schema, &code, text)?;
+        store.delete_freq(&schema, &code, &store_text(text))?;
         Ok(json!({ "ok": true }))
     }
 
@@ -1410,12 +1418,13 @@ impl Coordinator {
             .ok_or_else(|| anyhow::anyhow!("无持久化存储"))?;
         // code 带音节空格，与用户词库列表（word_item）同形。remove/promote 两个入口
         // 会收到这个串，各自拆回扁平码——三处必须同改，否则「显示得了、删不掉」。
+        // text 同理：出口投影成转义形态、两个入口用 `store_text` 还原，缺一即同样症状。
         let items: Vec<Value> = store
             .search_temp_words_prefix(&schema, "", 0)?
             .into_iter()
             .map(|r| {
                 let code = wind_store::wdict::join_code_by_boundary(&r.code, r.boundary);
-                json!({ "code": code, "text": r.text, "count": r.count })
+                json!({ "code": code, "text": ui_text(&r.text), "count": r.count })
             })
             .collect();
         Ok(json!(items))
@@ -1431,7 +1440,7 @@ impl Coordinator {
             .ok_or_else(|| anyhow::anyhow!("无持久化存储"))?;
         // 列表项的 code 带音节空格（见 web_temp_list），key 是扁平的。
         let (code, _) = wind_store::wdict::split_spaced_code(code);
-        store.promote_temp_word(&schema, &code, text)?;
+        store.promote_temp_word(&schema, &code, &store_text(text))?;
         Ok(json!({ "ok": true }))
     }
 
@@ -1445,7 +1454,7 @@ impl Coordinator {
             .ok_or_else(|| anyhow::anyhow!("无持久化存储"))?;
         // 同 promote：列表项的 code 带音节空格，不拆则删不掉。
         let (code, _) = wind_store::wdict::split_spaced_code(code);
-        store.remove_temp_word(&schema, &code, text)?;
+        store.remove_temp_word(&schema, &code, &store_text(text))?;
         Ok(json!({ "ok": true }))
     }
 
@@ -1491,7 +1500,7 @@ impl Coordinator {
             .map(|p| {
                 json!({
                     "code": p.code,
-                    "text": p.text,
+                    "text": ui_text(&p.text),
                     "position": p.position,
                     "weight": p.weight,
                     "enabled": p.enabled,
@@ -1510,7 +1519,7 @@ impl Coordinator {
             .store
             .as_ref()
             .ok_or_else(|| anyhow::anyhow!("无持久化存储"))?;
-        store.add_phrase(code, text, position, weight)?;
+        store.add_phrase(code, &store_text(text), position, weight)?;
         self.rebuild_phrases();
         Ok(json!({ "ok": true }))
     }
@@ -1531,10 +1540,17 @@ impl Coordinator {
             .store
             .as_ref()
             .ok_or_else(|| anyhow::anyhow!("无持久化存储"))?;
-        store.update_phrase(code, text, new_code, new_text, position, weight)?;
+        // text 是查找键、new_text 是新值，两者都来自设置页，都要还原成存储域。
+        let text = store_text(text);
+        let new_text = new_text.map(store_text);
+        store.update_phrase(code, &text, new_code, new_text.as_deref(), position, weight)?;
         // 若同时携带 enabled，应用到新键。
         if let Some(en) = params.get("enabled").and_then(|v| v.as_bool()) {
-            store.set_phrase_enabled(new_code.unwrap_or(code), new_text.unwrap_or(text), en)?;
+            store.set_phrase_enabled(
+                new_code.unwrap_or(code),
+                new_text.as_deref().unwrap_or(&text),
+                en,
+            )?;
         }
         // 改 code/text 时 `update_phrase` 内部会 remove 旧键——若改的是一条遮蔽了系统条目的
         // 用户短语，旧键一删那条系统短语也没了。与 `web_phrase_remove` 同一条约束。
@@ -1549,7 +1565,7 @@ impl Coordinator {
             .store
             .as_ref()
             .ok_or_else(|| anyhow::anyhow!("无持久化存储"))?;
-        store.remove_phrase(code, text)?;
+        store.remove_phrase(code, &store_text(text))?;
         // 删掉的可能是一条**遮蔽了系统条目**的用户短语（`overrides_system`）——主键只有
         // 一把，删掉它等于把那条系统短语也删了。用户的预期恰恰相反：删掉自己加的那条
         // 就该露出系统默认那条。故补回缺失的系统条目。
@@ -1568,7 +1584,8 @@ impl Coordinator {
             .store
             .as_ref()
             .ok_or_else(|| anyhow::anyhow!("无持久化存储"))?;
-        store.set_phrase_enabled(code, text, enabled)?;
+        // text 是查找键，须还原成存储域（见 `store_text`）——漏了就「开关点了没反应」。
+        store.set_phrase_enabled(code, &store_text(text), enabled)?;
         self.rebuild_phrases();
         Ok(json!({ "ok": true }))
     }
@@ -1594,7 +1611,7 @@ impl Coordinator {
             .into_iter()
             .map(|p| {
                 json!({
-                    "code": p.code, "text": p.text, "weight": p.weight,
+                    "code": p.code, "text": ui_text(&p.text), "weight": p.weight,
                     "position": p.position, "enabled": p.enabled, "isSystem": true,
                 })
             })
@@ -1634,7 +1651,7 @@ impl Coordinator {
             .into_iter()
             .map(|p| {
                 json!({
-                    "code": p.code, "text": p.text, "weight": p.weight,
+                    "code": p.code, "text": ui_text(&p.text), "weight": p.weight,
                     "position": p.position, "enabled": p.enabled, "isSystem": false,
                     // 这条用户短语遮蔽了同码同内容的系统条目（该系统条目已从系统列表隐去，
                     // 输入期生效的是这条）。供 UI 标注来源，并提示「删除本条即恢复系统默认」。
@@ -2062,6 +2079,28 @@ impl Coordinator {
     }
 }
 
+/// 存储域 → 设置页显示域：真实文本投影为可编辑的转义形态（真换行→`\n`、制表→`\t`、
+/// 反斜杠→`\\`）。
+///
+/// 设置页是**文本编辑界面**，而编辑界面里"看不见的字符"是不可编辑的：一条含真换行的
+/// 短语在输入框里只显示成一个断行，用户既分不清那是换行还是别的空白，也无从表达
+/// "我要一个字面反斜杠"。投影成转义形态后，所见即所得。
+///
+/// 与 [`word_item`] 里 `code` 的处理同源——那里也是把存储域的扁平码投影成带空格的
+/// 音节码给人看。**存储域与显示域本就该分开**，此处只是把同一原则用到 text 上。
+fn ui_text(s: &str) -> String {
+    wind_store::wdict::escape_field(s)
+}
+
+/// 设置页显示域 → 存储域：[`ui_text`] 的逆。
+///
+/// **凡是从设置页收 text 的 RPC 都必须先过它**，不只是写入类：`dict.remove`/`update`、
+/// `freq.delete`、`temp.promote` 等拿 text 当 **key** 去匹配记录，若拿转义形态去查
+/// 真实文本的库，结果是查不到——表现为「删了没反应」，且不报错。
+fn store_text(s: &str) -> String {
+    wind_store::wdict::unescape_field(s)
+}
+
 /// UserWordRecord → 前端 UserWordItem。
 /// 用户词 → 设置页列表项。
 ///
@@ -2071,7 +2110,7 @@ impl Coordinator {
 /// 无边界（旧数据/手输码/五笔码）则不含空格，与改动前一致。
 fn word_item(r: wind_store::user_words::UserWordRecord) -> Value {
     let code = wind_store::wdict::join_code_by_boundary(&r.code, r.boundary);
-    json!({ "code": code, "text": r.text, "weight": r.weight, "enabled": true })
+    json!({ "code": code, "text": ui_text(&r.text), "weight": r.weight, "enabled": true })
 }
 
 /// 稀疏 diff：返回 `cfg` 相对 `base` 的变化项（仅含改动的叶子/键）；无变化返回 None。
@@ -2828,6 +2867,140 @@ mod tests {
             .web_data_rpc("freq.clear", &json!({ "schemaId": "py" }))
             .unwrap();
         assert_eq!(cleared, json!(1));
+    }
+
+    /// **转义形态只活在设置页边界上**：库里存真实文本，RPC 出口投影成 `\n`、
+    /// 入口还原回真实文本。
+    ///
+    /// 出入口必须**成对**。出口投影了而某个入口漏了还原，那个操作就会拿转义形态
+    /// 去匹配真实文本的 key —— 查不到、不报错、静默失败，表现为「删了没反应」。
+    /// 本测试逐个入口用「列表回什么就拿什么去操作」的方式走一遍，正是为了让漏接
+    /// 在这里失败，而不是等用户发现。
+    #[test]
+    fn phrase_ui_escape_boundary_roundtrips() {
+        let c = coord("phrase_esc");
+        // 设置页提交转义形态：`\n` 表示换行（用户在输入框里看到并编辑的就是它）
+        c.web_data_rpc(
+            "phrase.add",
+            &json!({ "code": "duo", "text": r"甲\n乙", "position": 0, "weight": 1 }),
+        )
+        .unwrap();
+
+        // 存储域：真实文本（含真换行），转义形态不入库
+        let store = c.store.as_ref().unwrap();
+        assert!(
+            store
+                .list_phrases()
+                .unwrap()
+                .iter()
+                .any(|p| p.code == "duo" && p.text == "甲\n乙"),
+            "库里应是真换行；若这里失败说明入口没还原、把字面 \\n 存进去了"
+        );
+
+        // 出口：列表回转义形态，用户可继续编辑
+        let list = c.web_data_rpc("phrase.list", &json!({})).unwrap();
+        assert_eq!(
+            list[0]["text"],
+            json!(r"甲\n乙"),
+            "列表应回转义形态而非真换行——真换行在输入框里没法编辑"
+        );
+
+        // 候选侧：短语走 PhraseLayer（比用户词多一层 rebuild + cmdbar/模板分派），
+        // 拿到的必须是真实文本。用户词与短语两条路径不同，须各自锁住。
+        c.rebuild_phrases();
+        let hits = c
+            .phrases
+            .read()
+            .unwrap()
+            .lookup("duo", &[], &|_| String::new());
+        assert_eq!(hits.len(), 1, "短语候选应命中一条：{hits:?}");
+        assert_eq!(
+            hits[0].text, "甲\n乙",
+            "短语候选须是真实文本（含真换行），不是转义形态"
+        );
+
+        // 入口 setEnabled：拿列表回的形态去操作，必须命中
+        c.web_data_rpc(
+            "phrase.setEnabled",
+            &json!({ "code": "duo", "text": r"甲\n乙", "enabled": false }),
+        )
+        .unwrap();
+        let list2 = c.web_data_rpc("phrase.list", &json!({})).unwrap();
+        assert_eq!(
+            list2[0]["enabled"],
+            json!(false),
+            "setEnabled 未命中 → 该入口漏了 store_text"
+        );
+
+        // 入口 remove：同理
+        c.web_data_rpc(
+            "phrase.remove",
+            &json!({ "code": "duo", "text": r"甲\n乙" }),
+        )
+        .unwrap();
+        let after = c.web_data_rpc("phrase.list", &json!({})).unwrap();
+        assert!(
+            after.as_array().unwrap().is_empty(),
+            "remove 未命中 → 该入口漏了 store_text"
+        );
+    }
+
+    /// 用户词库侧的同一契约（见 [`phrase_ui_escape_boundary_roundtrips`]）。
+    #[test]
+    fn user_word_ui_escape_boundary_roundtrips() {
+        let c = coord("word_esc");
+        c.web_data_rpc(
+            "dict.add",
+            &json!({ "schemaId": "wb", "code": "a", "text": r"甲\n乙", "weight": 100 }),
+        )
+        .unwrap();
+
+        // 存储域是真实文本
+        let store = c.store.as_ref().unwrap();
+        let recs = store.get_user_words("wb", "a").unwrap();
+        assert_eq!(recs.len(), 1);
+        assert_eq!(recs[0].text, "甲\n乙", "库里应是真换行");
+
+        // 出口投影
+        let list = c
+            .web_data_rpc("dict.listPaged", &json!({ "schemaId": "wb" }))
+            .unwrap();
+        let item = &list["items"][0];
+        assert_eq!(item["text"], json!(r"甲\n乙"), "列表应回转义形态");
+
+        // 入口：拿列表回的形态删除，必须命中
+        c.web_data_rpc(
+            "dict.remove",
+            &json!({ "schemaId": "wb", "code": "a", "text": r"甲\n乙" }),
+        )
+        .unwrap();
+        assert!(
+            store.get_user_words("wb", "a").unwrap().is_empty(),
+            "remove 未命中 → 该入口漏了 store_text"
+        );
+    }
+
+    /// 字面反斜杠必须能表达：用户写 `\\n` 表示"反斜杠加字母 n"，不是换行。
+    /// 没有这条，`C:\note` 这类内容就会被存成 `C:` + 换行 + `ote`。
+    #[test]
+    fn literal_backslash_survives_ui_boundary() {
+        let c = coord("backslash_esc");
+        c.web_data_rpc(
+            "phrase.add",
+            &json!({ "code": "p", "text": r"C:\\note", "position": 0, "weight": 1 }),
+        )
+        .unwrap();
+        let store = c.store.as_ref().unwrap();
+        assert!(
+            store
+                .list_phrases()
+                .unwrap()
+                .iter()
+                .any(|p| p.code == "p" && p.text == r"C:\note"),
+            "`\\\\n` 应还原为字面反斜杠加 n，而非换行"
+        );
+        let list = c.web_data_rpc("phrase.list", &json!({})).unwrap();
+        assert_eq!(list[0]["text"], json!(r"C:\\note"), "出口须重新转义反斜杠");
     }
 
     #[test]

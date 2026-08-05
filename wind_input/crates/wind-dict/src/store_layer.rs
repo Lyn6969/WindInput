@@ -19,6 +19,13 @@ use wind_store::user_words::UserWordRecord;
 /// 见 docs/design/pinyin-code-domains.md §3 L2。
 fn record_to_candidate(r: UserWordRecord, is_temp: bool, is_prefix: bool) -> Candidate {
     let mut c = Candidate {
+        // 库里存的就是真实文本（含真换行），**此处不做任何转义处理**。
+        //
+        // 转义只发生在系统边界上：文本文件（`.dict.yaml`/导入/导出）与设置页 UI
+        // 各自进出时转换，数据库与内存中一律是真实文本。若在这里反转义，等于要求
+        // 每个写入端都先转义过——而写入端有 8 条（设置页 ×3、快捷加词、自动造词、
+        // 导入、临时词、备份还原），漏一条，该路径写入的 `C:\note` 就会被展开成
+        // `C:` + 换行 + `ote`，且静默无感。
         text: r.text,
         code: r.code,
         weight: r.weight,

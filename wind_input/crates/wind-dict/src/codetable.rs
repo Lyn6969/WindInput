@@ -886,7 +886,17 @@ fn parse_rime_line(
     Some(RimeLine {
         code,
         abbrev,
-        text: text.to_string(),
+        // 词条文本反转义（`\n`→换行、`\t`→制表、`\\`→反斜杠）。**只对 text 做，不碰 code**：
+        // code 要经 `syllable_boundary_mask` 与扁平化处理，混进转义会让边界位与实际码错位。
+        //
+        // 复用 wdict 的转义表而非另写一份——同一套语义在导出（`escape_field`）、备份还原、
+        // 本处解析三条路径上必须一致，抄第二份就是下次漂移的起点。其「未知转义序列原样保留」
+        // 的性质同时把破坏面锁死在 `\n`/`\t`/`\\` 三个序列上：`C:\Users` 的 `\U` 不受影响。
+        //
+        // 注：本次刻意**未** bump `cache_fp.rs` 的 `PARSE_SEMANTICS_VERSION`（已核实全部
+        // 系统词库与第三方词库当前零反斜杠，新旧解析器对它们产出完全相同的 .wdat）。
+        // 若日后有用户报「词库里写了 \n 但不生效」，让其删除对应 `.wdat.fp` 即可强制重建。
+        text: wind_store::wdict::unescape_field(text),
         weight,
         boundary,
     })
@@ -1385,6 +1395,72 @@ mod tests {
             "不应出现空编码条目：{e:?}"
         );
         assert_eq!(collect(&e, "字"), vec![("abc".to_string(), 5)]);
+    }
+
+    /// 词条文本的转义序列须还原为真字符：`\n`→换行、`\t`→制表、`\\`→反斜杠。
+    ///
+    /// **未知序列必须原样保留**——这是破坏面的边界：`C:\Users` 里的 `\U` 不在转义表中，
+    /// 反转义后仍是 `\U`，存量词库里的 Windows 路径不会被静默改写。想要字面 `\n` 两字符
+    /// 的用户写 `\\n` 即可。
+    #[test]
+    fn text_escape_sequences_are_unescaped() {
+        let path = std::env::temp_dir().join("wind_text_escape.dict.yaml");
+        {
+            let mut f = std::fs::File::create(&path).unwrap();
+            writeln!(f, "---\nname: esc\n...").unwrap();
+            writeln!(f, "甲\\n乙\tjy\t10").unwrap(); // \n → 换行
+            writeln!(f, "丙\\t丁\tbd\t20").unwrap(); // \t → 制表（注意不是列分隔符）
+            writeln!(f, "戊\\\\己\twj\t30").unwrap(); // \\ → 单个反斜杠
+            writeln!(f, "C:\\Users\tcu\t40").unwrap(); // \U 未知 → 原样保留
+            writeln!(f, "庚\\\\n辛\tgx\t50").unwrap(); // \\n → 字面 \n 两字符，不是换行
+        }
+        let (e, _) = parse_rime_entries_parallel(&path, false).unwrap();
+        let _ = std::fs::remove_file(&path);
+
+        assert_eq!(collect(&e, "甲\n乙"), vec![("jy".to_string(), 10)]);
+        assert_eq!(collect(&e, "丙\t丁"), vec![("bd".to_string(), 20)]);
+        assert_eq!(collect(&e, "戊\\己"), vec![("wj".to_string(), 30)]);
+        assert_eq!(
+            collect(&e, "C:\\Users"),
+            vec![("cu".to_string(), 40)],
+            "未知转义序列须原样保留，存量词库里的 Windows 路径不得被改写"
+        );
+        assert_eq!(
+            collect(&e, "庚\\n辛"),
+            vec![("gx".to_string(), 50)],
+            "`\\\\n` 应还原为字面 \\n 两字符，而非换行"
+        );
+    }
+
+    /// **转义序列免疫行尾 trim**：`\n` 在 trim 阶段是两个可见字符，剥不掉；而裸空格会被
+    /// `trim_line_end` 剥除——这正是本设计的用意（有意空白用转义表达、排版噪声交给 trim）。
+    ///
+    /// 顺带锁住 CodeFirst 布局的既有行为：text 落在**末列**时，其尾随裸空格会被行尾 trim
+    /// 吃掉（TextFirst 布局下 text 在首列则不受影响）。这个列序不对称是 librime `trim_right`
+    /// 语义的自然结果，此处**明确记录而非修复**——要保留尾部空白请用转义序列。
+    #[test]
+    fn trailing_whitespace_trimmed_but_escapes_survive() {
+        let path = std::env::temp_dir().join("wind_trail_ws.dict.yaml");
+        {
+            let mut f = std::fs::File::create(&path).unwrap();
+            writeln!(f, "---\nname: t\ncolumns:\n  - code\n  - text\n...").unwrap();
+            writeln!(f, "ka\t甲   ").unwrap(); // 末列尾随裸空格 → 被行尾 trim 剥掉
+            writeln!(f, "yi\t乙\\t").unwrap(); // 转义制表在末列 → 存活
+        }
+        let (e, _) = parse_rime_entries_parallel(&path, false).unwrap();
+        let _ = std::fs::remove_file(&path);
+
+        assert_eq!(
+            collect(&e, "甲"),
+            vec![("ka".to_string(), 0)],
+            "末列 text 的尾随裸空格被行尾 trim 剥除（librime trim_right 语义）"
+        );
+        assert!(collect(&e, "甲   ").is_empty(), "带尾随空格的形态不应存在");
+        assert_eq!(
+            collect(&e, "乙\t"),
+            vec![("yi".to_string(), 0)],
+            "转义序列在 trim 阶段是可见字符，必须活到反转义那一步"
+        );
     }
 
     /// text 或 code 为空的行必须跳过：空 code 会让条目全挤进 `entries[""]`。

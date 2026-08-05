@@ -4,6 +4,7 @@
 //! 用 `crate::view` 的盒模型构建候选树（预编辑行 + 候选行[序号|文本] + 翻页指示），
 //! measure/arrange 算出尺寸与每候选的绝对矩形（供鼠标命中），再 paint 到 BGRA 缓冲区。
 
+use std::borrow::Cow;
 use std::cell::RefCell;
 use std::rc::Rc;
 use std::sync::mpsc::Sender;
@@ -17,6 +18,47 @@ use crate::sys::{
 };
 use crate::text::dwrite::TextRenderer;
 use crate::view::{Align, Edges, Layout, Rect, View, ViewImage, ViewLayer};
+
+/// 换行可见符 U+21B5（`↵`）。取编辑器通用约定（VS Code 等显示换行即此符），
+/// 而非 Control Pictures 区的 `␊`/`␤`——后者字形是小方框里塞 `LF` 字母，
+/// 候选窗字号下几乎认不出，且部分中文字体不覆盖该区段。
+const NEWLINE_GLYPH: char = '\u{21B5}';
+
+/// 制表可见符 U+21E5（`⇥`）。与换行分用不同符号：两者在文本里的语义不同，
+/// 混用一个符号等于告诉用户「这儿有个空白」却不说是哪种。
+const TAB_GLYPH: char = '\u{21E5}';
+
+/// 把候选文本里的换行/制表符替换为可见符号，**仅供显示**。
+///
+/// `Candidate::text` 本身不动——上屏走的仍是含真换行的原文。两者必须分开：
+/// 显示要的是「看得见有个换行」，上屏要的是「真的换行」。
+///
+/// 不这么做的后果不是「看不见」而是「排版坏掉」：DirectWrite 的 `CreateTextLayout`
+/// 把 `\n` 当硬换行，`measure_text_styled` 于是返回 N 倍行高，而 `view.rs` 的盒模型
+/// 按内容高布局 → 该候选被撑成多行、整个候选窗变高且行高参差。
+///
+/// CRLF 只出一个符号（不是两个）——它在用户眼里就是一个换行。
+fn visible_whitespace(s: &str) -> Cow<'_, str> {
+    if !s.contains(['\n', '\r', '\t']) {
+        return Cow::Borrowed(s); // 快路径：绝大多数候选无空白控制符，零分配
+    }
+    let mut out = String::with_capacity(s.len());
+    let mut it = s.chars().peekable();
+    while let Some(c) = it.next() {
+        match c {
+            '\r' => {
+                if it.peek() == Some(&'\n') {
+                    it.next();
+                }
+                out.push(NEWLINE_GLYPH);
+            }
+            '\n' => out.push(NEWLINE_GLYPH),
+            '\t' => out.push(TAB_GLYPH),
+            _ => out.push(c),
+        }
+    }
+    Cow::Owned(out)
+}
 use crate::window::{LayeredWindow, WindowMouse};
 use std::time::{Duration, Instant};
 
@@ -1689,7 +1731,7 @@ impl CandidateWindow {
             } else {
                 edges_or(&v.text.margin, [0.0, 0.0, 0.0, 4.0])
             };
-            let mut tleaf = View::leaf(cand.text.clone(), txt_color)
+            let mut tleaf = View::leaf(visible_whitespace(&cand.text).into_owned(), txt_color)
                 .font_size(text_fs)
                 .font_weight(eff_weight(&v.text, &v.item, is_sel, is_hover))
                 .font_family(v.text.font_family.clone())
@@ -2294,7 +2336,8 @@ impl WindowMouse for CandidateMouse {
 
 #[cfg(test)]
 mod tests {
-    use super::CandidateWindow;
+    use super::{CandidateWindow, visible_whitespace};
+    use std::borrow::Cow;
 
     /// 插入符位置一律夹到合法字符边界——`split_at` 落在字符中间会 panic 掉 UI 线程。
     #[test]
@@ -2320,6 +2363,28 @@ mod tests {
                 assert_eq!(format!("{head}{tail}"), text);
             }
         }
+    }
+
+    /// 候选文本的空白控制符须显示为可见符号，且**不得改动其他字符**。
+    ///
+    /// 这只是显示投影——`Candidate::text` 原文不动，上屏走的仍是真换行（见
+    /// [`visible_whitespace`] 的文档）。故本测试只锁「显示成什么样」，
+    /// 不能被误读成「上屏文本也变了」。
+    #[test]
+    fn whitespace_becomes_visible_glyphs() {
+        // 无控制符：原样借用，零分配
+        assert!(matches!(visible_whitespace("你好"), Cow::Borrowed("你好")));
+
+        assert_eq!(visible_whitespace("甲\n乙"), "甲↵乙");
+        assert_eq!(visible_whitespace("丙\t丁"), "丙⇥丁");
+        // CRLF 是**一个**换行，只出一个符号
+        assert_eq!(visible_whitespace("戊\r\n己"), "戊↵己");
+        // 孤立 CR 同样算换行
+        assert_eq!(visible_whitespace("庚\r辛"), "庚↵辛");
+        // 混合 + 连续
+        assert_eq!(visible_whitespace("a\n\tb"), "a↵⇥b");
+        // 普通空格不动——它本来就看得见，替换只会平添噪声
+        assert_eq!(visible_whitespace("甲 乙"), "甲 乙");
     }
 
     /// 固定位置的两个坐标系必须严格互逆。

@@ -120,7 +120,10 @@ pub fn parse_words_rime(text: &str) -> Result<(Vec<WordIo>, usize), String> {
         }
         rows.push(WordIo {
             code: normalize_code(code_raw),
-            text: word.to_string(),
+            // 反转义在 trim **之后**：`\n` 在 trim 阶段还是反斜杠加字母 n 两个可见字符，
+            // 天然免疫空白剥离，到这一步才变成换行。有意的空白由转义序列表达、排版噪声
+            // 交给 trim，两者在管线的不同阶段产生，就不需要互相区分。
+            text: crate::wdict::unescape_field(word),
             weight: parse_weight(get("weight")),
             count: 0,
         });
@@ -182,7 +185,8 @@ pub fn parse_words_tsv(text: &str) -> Result<(Vec<WordIo>, usize), String> {
         }
         rows.push(WordIo {
             code: normalize_code(code_raw),
-            text: word.to_string(),
+            // 同 Rime 路径：trim 在前、反转义在后。见 `parse_words_rime`。
+            text: crate::wdict::unescape_field(word),
             weight: parse_weight(fields.get(2).map(|s| s.trim()).unwrap_or("")),
             count: 0,
         });
@@ -272,6 +276,37 @@ mod tests {
     }
 
     /// 空白折叠：多空格/制表列内空白归一为单个空格；码表码（无空格）幂等。
+    /// 两条导入路径都须反转义词条文本，且与 `escape_field` 往返自洽
+    /// （导出 → 再导入应还原原文，这是备份还原的基本契约）。
+    #[test]
+    fn import_unescapes_text_on_both_paths() {
+        let rime = "---\nname: t\n...\n甲\\n乙\tjy\t10\nC:\\Users\tcu\t20\n";
+        let (rows, _) = parse_words_rime(rime).unwrap();
+        assert_eq!(rows[0].text, "甲\n乙", "Rime 路径须反转义 \\n");
+        assert_eq!(
+            rows[1].text, "C:\\Users",
+            "未知转义序列原样保留，路径类词条不被改写"
+        );
+
+        let tsv = "jy\t甲\\n乙\t10\ncu\tC:\\Users\t20\n";
+        let (rows, _) = parse_words_tsv(tsv).unwrap();
+        assert_eq!(rows[0].text, "甲\n乙", "TSV 路径须反转义 \\n");
+        assert_eq!(rows[1].text, "C:\\Users");
+    }
+
+    /// 反转义必须发生在 trim **之后**：转义序列在 trim 阶段是可见字符，剥不掉；
+    /// 而围绕字段的裸空格是排版噪声，照剥不误。
+    #[test]
+    fn import_trims_bare_space_but_keeps_escaped_whitespace() {
+        let tsv = "jy\t  甲乙  \t10\nbd\t丙\\t丁\t20\n";
+        let (rows, _) = parse_words_tsv(tsv).unwrap();
+        assert_eq!(rows[0].text, "甲乙", "字段两侧的裸空格按既有语义剥除");
+        assert_eq!(
+            rows[1].text, "丙\t丁",
+            "转义制表符须存活——它在 trim 阶段还不是空白"
+        );
+    }
+
     #[test]
     fn normalize_code_folds_whitespace_and_is_idempotent_for_flat() {
         assert_eq!(normalize_code("ni  hao"), "ni hao");
