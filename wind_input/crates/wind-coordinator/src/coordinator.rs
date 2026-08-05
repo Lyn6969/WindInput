@@ -1702,26 +1702,14 @@ impl Coordinator {
         self.push_input_diag_hud_if_visible();
     }
 
-    /// 消费一次诊断快照：存 DLL 上报的窗口链 / TSF 实例，并**在服务端现算** host-render
-    /// 运行态后刷新 HUD。
+    /// 消费一次诊断快照：存 DLL 上报的窗口链 / TSF 实例。
     ///
-    /// ⚠ host-render 三项（白名单命中 / 活跃目标 / 是否本进程）必须按**上报包里的 pid**
-    /// 直查，不得走 `ActiveCompat` 全局焦点槽——开始菜单弹出会连带激活兄弟进程污染焦点槽，
-    /// 那正是当初 avail 位被污染、DLL 陷入销毁重建循环的成因
-    /// （`docs/redesign/host-render-windows-port.md` §11.2）。HUD 若沿用被污染的槽，
-    /// 显示的会是「另一个进程的 host 状态」，排查时反而把人带偏。
+    /// ⚠ host-render 运行态（白名单 / 活跃）**不在这里算**——它们是服务端随时可查的实时值，
+    /// 存进快照就等于被冻结在「快照到达那一刻」。而 `active_target` 恰恰要到**首次按键**
+    /// 才置位（searchapp/SearchHost 这类 transient DocMgr 宿主不发 focus_gained，note_focus
+    /// 只能走 CMD_KEY_EVENT），快照却在 OnSetFocus 就发出了 ⇒ 存下来的必然是 `活跃: 否`，
+    /// 让人误判成 host render 没生效。现算在 [`Self::push_input_diag_hud`]。
     pub(crate) fn apply_diag_snapshot(&self, snap: &wind_ipc::protocol::DiagSnapshotPayload) {
-        #[cfg(windows)]
-        let (host_whitelisted, host_active) = match self.host_render() {
-            Some(mgr) => (
-                mgr.is_process_whitelisted(snap.pid),
-                mgr.active_target().is_some_and(|t| t.pid == snap.pid),
-            ),
-            None => (false, false),
-        };
-        #[cfg(not(windows))]
-        let (host_whitelisted, host_active) = (false, false);
-
         // 进程名：服务端按 pid 现查（DLL 不上报——它未必有权限打开别的进程）。
         // 快照来源进程与前台进程分别查：多进程宿主下它们本就可能不同，而「本快照来自谁」
         // 是判读整份数据的前提（见 `WindowDiagView::pid`）。
@@ -1761,8 +1749,9 @@ impl Coordinator {
                 focus_session_id: snap.focus_session_id,
                 docmgr_changed: snap.docmgr_changed(),
                 host_band: snap.host_band,
-                host_whitelisted,
-                host_active,
+                // 这两项由 push 时现算填入（见本函数文档），此处留默认值。
+                host_whitelisted: false,
+                host_active: false,
                 received: true,
             };
         }
@@ -1822,11 +1811,24 @@ impl Coordinator {
             (s.ime_active, s.has_edit_context)
         };
         // 窗口快照独立取（锁序：last_input_diag → state → last_window_diag，全程不嵌套）。
-        let window = self
+        let mut window = self
             .last_window_diag
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .clone();
+        // host-render 运行态**在此现算**，不沿用快照里的值：它们随时可查，存进快照就会被
+        // 冻结在快照到达那一刻（详见 `apply_diag_snapshot` 文档）。
+        //
+        // ⚠ 必须按**快照来源进程**的 pid 直查，不得走 `ActiveCompat` 全局焦点槽——开始菜单
+        // 弹出会连带激活兄弟进程污染该槽，那正是当初 avail 位被污染、DLL 陷入销毁重建循环的
+        // 成因（`docs/redesign/host-render-windows-port.md` §11.2）。
+        #[cfg(windows)]
+        if window.pid != 0
+            && let Some(mgr) = self.host_render()
+        {
+            window.host_whitelisted = mgr.is_process_whitelisted(window.pid);
+            window.host_active = mgr.active_target().is_some_and(|t| t.pid == window.pid);
+        }
         let sections = *self
             .input_diag_sections
             .lock()
