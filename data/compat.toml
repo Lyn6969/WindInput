@@ -61,6 +61,16 @@ process = "SearchHost.exe"
 comment = "Win11 开始菜单 / 任务栏搜索，候选窗无法盖过其 Band 层级，走 HostRender 代理渲染"
 host_render = true
 
+[[apps]]
+process = "searchapp.exe"
+comment = "Win10 任务栏搜索"
+host_render = true
+
+[[apps]]
+process = "startmenuexperiencehost.exe"
+comment = "Win10 开始菜单输入框"
+host_render = true
+
 # 示例：给「fast 判据失灵」的宿主退回 wait（fast 已是默认，无需再逐个开启）
 # [[apps]]
 # process = "SomeApp.exe"
