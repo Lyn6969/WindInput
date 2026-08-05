@@ -5163,7 +5163,7 @@ fn auto_pair_jump_out_key_moves_cursor_right() {
     // 按 Tab：配对栈非空 → 跳出（光标右移）
     let jump = coord.handle_key_event(&key_event(0x09, EVENT_KEY_DOWN));
     assert!(
-        matches!(jump, KeyAction::MoveCursorRight),
+        matches!(jump, KeyAction::MoveCursorRight { .. }),
         "Tab 应跳出配对（MoveCursorRight），实际: {:?}",
         jump
     );
@@ -5207,7 +5207,7 @@ fn auto_pair_stack_survives_mode_switch() {
     // 核心断言：配对栈跨模式切换存活 → Tab 仍跳出。
     let jump = coord.handle_key_event(&key_event(0x09, EVENT_KEY_DOWN));
     assert!(
-        matches!(jump, KeyAction::MoveCursorRight),
+        matches!(jump, KeyAction::MoveCursorRight { .. }),
         "中英切换不应清配对栈，切回后 Tab 应仍能跳出，实际: {jump:?}"
     );
 }
@@ -5236,7 +5236,7 @@ fn auto_pair_jump_out_works_in_english_mode() {
 
     let jump = coord.handle_key_event(&key_event(0x09, EVENT_KEY_DOWN));
     assert!(
-        matches!(jump, KeyAction::MoveCursorRight),
+        matches!(jump, KeyAction::MoveCursorRight { .. }),
         "英文模式应能跳出中文模式建立的配对，实际: {jump:?}"
     );
 }
@@ -5270,7 +5270,7 @@ fn english_halfwidth_pair_handled_by_coordinator() {
 
     let jump = coord.handle_key_event(&key_event(0x09, EVENT_KEY_DOWN));
     assert!(
-        matches!(jump, KeyAction::MoveCursorRight),
+        matches!(jump, KeyAction::MoveCursorRight { .. }),
         "英文模式应能跳出自己建立的配对，实际: {jump:?}"
     );
 }
@@ -5343,7 +5343,7 @@ fn auto_pair_survives_ctx_lost_noise() {
     }
     let act = pair_state_after_focus_lost(wind_bridge::handler::FocusLostReason::CtxLost);
     assert!(
-        matches!(act, KeyAction::MoveCursorRight),
+        matches!(act, KeyAction::MoveCursorRight { .. }),
         "CtxLost 是噪声层，不该清配对状态，实际: {act:?}"
     );
 }
@@ -5396,7 +5396,7 @@ fn jump_out_right_symbol_enabled_moves_cursor() {
     // Shift+0 → `）`：栈顶正是它 → 跳出
     let jump = coord.handle_key_event(&key_event_mods(0x30, EVENT_KEY_DOWN, 0x0001));
     assert!(
-        matches!(jump, KeyAction::MoveCursorRight),
+        matches!(jump, KeyAction::MoveCursorRight { .. }),
         "启用 right_symbol 时右括号应跳出，实际: {jump:?}"
     );
 }
@@ -5420,7 +5420,7 @@ fn jump_out_right_symbol_disabled_commits_char() {
     );
     let act = coord.handle_key_event(&key_event_mods(0x30, EVENT_KEY_DOWN, 0x0001));
     assert!(
-        !matches!(act, KeyAction::MoveCursorRight),
+        !matches!(act, KeyAction::MoveCursorRight { .. }),
         "未启用 right_symbol 时右括号不该跳出，实际: {act:?}"
     );
     assert!(
@@ -5430,7 +5430,7 @@ fn jump_out_right_symbol_disabled_commits_char() {
     // Tab 仍可跳出（栈未被右符号消费）
     let tab = coord.handle_key_event(&key_event(0x09, EVENT_KEY_DOWN));
     assert!(
-        matches!(tab, KeyAction::MoveCursorRight),
+        matches!(tab, KeyAction::MoveCursorRight { .. }),
         "Tab 应仍能跳出，实际: {tab:?}"
     );
 }

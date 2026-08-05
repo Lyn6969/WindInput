@@ -276,6 +276,12 @@ impl ImeController for CoordIme {
         }
         Ok(())
     }
+    fn pair(&self, left: &str, right: &str, jump_steps: u32) -> anyhow::Result<()> {
+        if let Some(c) = self.0.upgrade() {
+            c.cmd_pair_commit(left, right, jump_steps);
+        }
+        Ok(())
+    }
 }
 
 /// 词库控制器：dict.add 接通用户词层。

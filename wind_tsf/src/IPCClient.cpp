@@ -1561,7 +1561,14 @@ BOOL CIPCClient::_ParseResponse(const IpcHeader& header, const std::vector<uint8
     case CMD_MOVE_CURSOR:
         {
             response.type = ResponseType::MoveCursorRight;
-            _LogDebug(L"Response: MoveCursorRight");
+            // payload 缺失/过短仍按 1 格处理：跳出少移一格是可见的小错，整个不动是功能失灵。
+            if (payload.size() >= sizeof(MoveCursorPayload))
+            {
+                const MoveCursorPayload* p =
+                    reinterpret_cast<const MoveCursorPayload*>(payload.data());
+                response.moveCount = p->count > 0 ? p->count : 1;
+            }
+            _LogDebug(L"Response: MoveCursorRight count=%u", response.moveCount);
         }
         break;
 
@@ -1989,6 +1996,13 @@ void CIPCClient::SetReplaceBackwardCallback(ReplaceBackwardCallback callback)
 {
     EnterCriticalSection(&_asyncLock);
     _replaceBackwardCallback = callback;
+    LeaveCriticalSection(&_asyncLock);
+}
+
+void CIPCClient::SetPairCommitCallback(PairCommitCallback callback)
+{
+    EnterCriticalSection(&_asyncLock);
+    _pairCommitCallback = callback;
     LeaveCriticalSection(&_asyncLock);
 }
 
@@ -2583,6 +2597,38 @@ void CIPCClient::_AsyncReaderLoop()
                     if (callback && response.replaceCount > 0)
                     {
                         callback(response.replaceCount, response.text);
+                    }
+                }
+            }
+            else if (header.command == CMD_COMMIT_TEXT_WITH_CURSOR)
+            {
+                // Pair-commit push (直通 ime.pair)：上屏文本后把光标退回右段之前，并记一层
+                // 待跳出深度。载荷布局与按键响应形态一致，_ParseResponse 已填好
+                // text/cursorOffset。
+                //
+                // 这条 if/else 链是**逐命令**的：新推送命令不在此显式加分支就被静默丢弃，
+                // 症状是「词条执行了但屏幕上什么也没有」。
+                std::vector<uint8_t> payload;
+                if (header.length > 0 && bytesRead >= sizeof(IpcHeader) + header.length)
+                {
+                    payload.assign(buffer.begin() + sizeof(IpcHeader),
+                                   buffer.begin() + sizeof(IpcHeader) + header.length);
+                }
+
+                ServiceResponse response;
+                if (_ParseResponse(header, payload, response))
+                {
+                    _LogInfo(L"Async reader: pair commit received, textLen=%zu, cursorOffset=%d",
+                             response.text.length(), response.cursorOffset);
+
+                    EnterCriticalSection(&_asyncLock);
+                    PairCommitCallback callback = _pairCommitCallback;
+                    LeaveCriticalSection(&_asyncLock);
+
+                    if (callback && !response.text.empty())
+                    {
+                        callback(response.text,
+                                 response.cursorOffset > 0 ? (uint32_t)response.cursorOffset : 0);
                     }
                 }
             }

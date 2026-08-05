@@ -548,9 +548,11 @@ impl Coordinator {
                 && pairs.iter().any(|(l, r)| *r == pch && *l != *r)
             {
                 let mut tr = self.pair_tracker.lock().unwrap_or_else(|e| e.into_inner());
-                if tr.peek().is_some_and(|e| e.right == pch) {
+                // 右符号跳出只认单字符右段：本路径的触发源是一次标点按键，多字符右段
+                // （直通 `ime.pair` 压入的）永远配不上它，只能靠 Tab/Enter。
+                if tr.peek().is_some_and(|e| e.right_is_char(pch)) {
                     tr.pop();
-                    return Some(KeyAction::MoveCursorRight);
+                    return Some(KeyAction::MoveCursorRight { count: 1 });
                 }
                 tr.clear();
             }
@@ -671,9 +673,11 @@ impl Coordinator {
                 && pairs.iter().any(|(l, r)| *r == pch && *l != *r)
             {
                 let mut tr = self.pair_tracker.lock().unwrap_or_else(|e| e.into_inner());
-                if tr.peek().is_some_and(|e| e.right == pch) {
+                // 右符号跳出只认单字符右段：本路径的触发源是一次标点按键，多字符右段
+                // （直通 `ime.pair` 压入的）永远配不上它，只能靠 Tab/Enter。
+                if tr.peek().is_some_and(|e| e.right_is_char(pch)) {
                     tr.pop();
-                    return Some(KeyAction::MoveCursorRight);
+                    return Some(KeyAction::MoveCursorRight { count: 1 });
                 }
                 tr.clear();
             }
@@ -800,8 +804,64 @@ impl Coordinator {
         }
         let mut tr = self.pair_tracker.lock().unwrap_or_else(|e| e.into_inner());
         tr.peek()?;
-        tr.pop();
-        Some(KeyAction::MoveCursorRight)
+        // 右移格数取自被弹出的那一层：标点配对恒 1，直通 `ime.pair` 的多字符右段按其
+        // 声明值。取 `max(1)` 是为了「压栈时算出 0 格」也不至于变成吞键不动。
+        let steps = tr.pop().map(|e| e.jump_steps).unwrap_or(1).max(1);
+        Some(KeyAction::MoveCursorRight { count: steps })
+    }
+
+    /// 压入一层文本配对并认领归属（直通 `ime.pair` 用；单字符路径仍走 [`Self::push_pair`]）。
+    pub(crate) fn push_pair_text(&self, left: String, right: String, jump_steps: u32) {
+        let token = self.push_server.active_token();
+        let mut tr = self.pair_tracker.lock().unwrap_or_else(|e| e.into_inner());
+        if tr.is_empty() {
+            tr.set_owner_token(token);
+        }
+        tr.push_text(left, right, jump_steps);
+    }
+
+    /// `ime.pair(left, right, jump=N)`：上屏 `left+right`、光标落两段之间，并压入配对栈。
+    ///
+    /// **走 push 通道而非 KeyAction**：命令动作在独立线程执行（`run_command_candidate`），
+    /// 此刻按键响应早已返回。代价是 DLL 侧的 `_pairPendingDepth` 必须在它自己的 push 分支里
+    /// 递增——那个计数是中文模式下 Enter 能否被转发给协调器的闸门，漏掉的症状是
+    /// 「Tab 跳得出、Enter 毫无反应」（Tab 无条件转发，Enter 受会话门控）。
+    ///
+    /// 关掉 `input.auto_pair` 时退化为**纯上屏**（整串上屏、光标落末尾），而不是「照旧摆好
+    /// 光标只是跳不出去」——后者会把光标卡在两段之间，用户还得自己按方向键出来，比不做更烦。
+    /// 顺带保证 DLL 的 `_pairPendingDepth` 与本侧配对栈严格同步：带光标偏移的那条命令**只在
+    /// 真的压栈时**发出，不存在「C++ 记了一层、Rust 没记」的中间态。
+    /// 开关按当前输入模式取（中文看 `chinese`、英文看 `english`），与自动配对同口径。
+    pub(crate) fn cmd_pair_commit(&self, left: &str, right: &str, jump_steps: u32) {
+        if left.is_empty() && right.is_empty() {
+            return;
+        }
+        let text = format!("{left}{right}");
+        let pair_on = {
+            let ap = &self.rt().config.input.auto_pair;
+            if self.is_chinese_mode() {
+                ap.chinese
+            } else {
+                ap.english
+            }
+        };
+        // 右段为空 = 没有要越过的内容，压栈只会让下一次跳出键空跑一格。
+        if !pair_on || right.is_empty() {
+            debug!(
+                "ime.pair: 退化为纯上屏（配对开关={}, 右段空={}）",
+                pair_on,
+                right.is_empty()
+            );
+            self.push_commit_text(&text);
+            return;
+        }
+        // `cursor_offset` 的语义是「插入全部文本后向左移几格」（DLL 侧 `KeyEventSink` 按它
+        // 循环合成 VK_LEFT），**不是**从文本开头的偏移。而「把光标退回到右段之前」与
+        // 「跳出时越过右段」本就是同一段距离的正反两向，故两端共用 `jump_steps` 一个量：
+        // 用户在自己宿主上调准了 `jump=N`，进出就自动对称，不会出现「进得去、出不来」。
+        let encoded = wind_ipc::codec::encode_commit_text_with_cursor(&text, jump_steps);
+        self.push_server.push_commit_to_active(&encoded);
+        self.push_pair_text(left.to_string(), right.to_string(), jump_steps);
     }
 
     /// 刷新配对状态活动时间（每次按键调用；栈空时是空操作）。
@@ -810,5 +870,101 @@ impl Coordinator {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .touch();
+    }
+}
+
+#[cfg(test)]
+mod pair_commit_tests {
+    use super::*;
+    use std::sync::Arc;
+    use wind_config::config::Config;
+
+    /// 中文模式 + 中文配对开。返回的协调器可直接调 `cmd_pair_commit`。
+    fn coord(chinese_pair: bool) -> Arc<Coordinator> {
+        let mut cfg = Config::default();
+        cfg.input.auto_pair.chinese = chinese_pair;
+        cfg.input.auto_pair.jump_out_keys = vec!["tab".into()];
+        Coordinator::new_headless(cfg, None)
+    }
+
+    fn stack_top(c: &Coordinator) -> Option<(String, String, u32)> {
+        let tr = c.pair_tracker.lock().unwrap_or_else(|e| e.into_inner());
+        tr.peek()
+            .map(|e| (e.left.clone(), e.right.clone(), e.jump_steps))
+    }
+
+    /// 按一次 Tab（0x09），返回协调器裁决。
+    fn tab(c: &Coordinator) -> KeyAction {
+        c.handle_key_event(&KeyEventData {
+            key_code: 0x09,
+            scan_code: 0,
+            modifiers: 0,
+            event_type: wind_ipc::protocol::EVENT_KEY_DOWN,
+            toggles: 0,
+            event_seq: 0,
+            prev_char: 0,
+        })
+    }
+
+    /// 多字符配对压栈后，跳出键应右移**声明的格数**而不是恒 1——
+    /// 恒 1 的话 `<!-- -->` 只跳出一格，光标停在 `--|>` 里面。
+    #[test]
+    fn multichar_pair_jumps_declared_steps() {
+        let c = coord(true);
+        c.cmd_pair_commit("<!--", "-->", 3);
+        assert_eq!(
+            stack_top(&c),
+            Some(("<!--".into(), "-->".into(), 3)),
+            "应压入多字符配对"
+        );
+
+        let act = tab(&c);
+        assert!(
+            matches!(act, KeyAction::MoveCursorRight { count: 3 }),
+            "Tab 应按 jump_steps 右移 3 格，实际: {act:?}"
+        );
+        assert!(stack_top(&c).is_none(), "跳出后应弹栈");
+    }
+
+    /// 关掉 `auto_pair` 时退化为纯上屏：不压栈，Tab 不该被吞。
+    /// 这条同时锁住 C++ `_pairPendingDepth` 的同步前提——那侧只在带光标偏移的推送上记账。
+    #[test]
+    fn pair_disabled_degrades_to_plain_commit() {
+        let c = coord(false);
+        c.cmd_pair_commit("《", "》", 1);
+        assert!(stack_top(&c).is_none(), "配对关闭时不该压栈");
+
+        let act = tab(&c);
+        assert!(
+            !matches!(act, KeyAction::MoveCursorRight { .. }),
+            "栈空时 Tab 应透传给宿主，实际: {act:?}"
+        );
+    }
+
+    /// 右段为空 = 没有要越过的内容，压栈只会让下一次 Tab 空跑一格。
+    #[test]
+    fn empty_right_does_not_push() {
+        let c = coord(true);
+        c.cmd_pair_commit("前缀", "", 0);
+        assert!(stack_top(&c).is_none(), "右段为空不该压栈");
+    }
+
+    /// 分级跳出：同一词条里写两条 `ime.pair`，内层先跳出、外层后跳出，
+    /// 且各自用自己的格数。栈退化成队列的话这条会反过来。
+    #[test]
+    fn nested_pairs_jump_inner_first() {
+        let c = coord(true);
+        c.cmd_pair_commit("（", "）", 1);
+        c.cmd_pair_commit("【【", "】】", 2);
+
+        assert!(
+            matches!(tab(&c), KeyAction::MoveCursorRight { count: 2 }),
+            "第一次 Tab 应跳出内层（2 格）"
+        );
+        assert!(
+            matches!(tab(&c), KeyAction::MoveCursorRight { count: 1 }),
+            "第二次 Tab 应跳出外层（1 格）"
+        );
+        assert!(stack_top(&c).is_none());
     }
 }

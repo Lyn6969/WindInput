@@ -95,8 +95,10 @@ pub enum KeyAction {
     NotHandled,
     /// 插入文本并定位光标
     InsertTextWithCursor { text: String, cursor_offset: u32 },
-    /// 光标右移（智能跳过）
-    MoveCursorRight,
+    /// 光标右移 `count` 格（配对跳出 / 智能跳过）。
+    ///
+    /// 标点配对恒为 1；直通 `ime.pair` 压入的多字符右段按其 `jump_steps` 取值。
+    MoveCursorRight { count: u32 },
     /// 删除配对（智能删除）
     DeletePair,
     /// 删除光标前 count 个字符并插入文本（智能符号替换）

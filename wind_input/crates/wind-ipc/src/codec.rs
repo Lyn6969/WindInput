@@ -546,13 +546,17 @@ pub fn encode_commit_text_with_cursor(text: &str, cursor_offset: u32) -> Vec<u8>
 
 /// 编码 MoveCursor 响应 (CMD_MOVE_CURSOR 0x0107)
 ///
-/// 格式: direction(4) — 1=right
-pub fn encode_move_cursor(direction: u32) -> Vec<u8> {
+/// 格式: count(4) — 向右移动的格数（合成几次 VK_RIGHT）
+///
+/// **语义变更**：该字段原名 `direction`（恒为 1，C++ 侧根本没读），现改为格数。
+/// 直通 `ime.pair` 的多字符右段要越过不止一格，才需要它真的携带信息。
+/// `0` 视同 1——协调器不发 0，但旧版 DLL 与新版 core 混搭时不该退化成「跳出没反应」。
+pub fn encode_move_cursor(count: u32) -> Vec<u8> {
     let mut buf = Vec::with_capacity(IpcHeader::SIZE + 4);
 
     let ipc = IpcHeader::new(CMD_MOVE_CURSOR, 4);
     buf.extend_from_slice(&ipc.to_bytes());
-    buf.extend_from_slice(&direction.to_le_bytes());
+    buf.extend_from_slice(&count.to_le_bytes());
 
     buf
 }

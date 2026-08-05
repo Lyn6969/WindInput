@@ -64,6 +64,10 @@ struct ServiceResponse
     // For InsertTextWithCursor
     int cursorOffset = 0;
 
+    // For MoveCursorRight: 向右移动的格数（配对跳出）。默认 1 = 单字符配对的老行为，
+    // 也是旧版 core（不带 count 载荷）时的兜底。
+    uint32_t moveCount = 1;
+
     // For ReplaceBackward: 删除光标前的字符数（v1 固定 1），随后插入 text
     int replaceCount = 0;
 
@@ -274,6 +278,10 @@ public:
     // delete `count` chars before caret, then insert text (may be empty).
     using ReplaceBackwardCallback = std::function<void(int, const std::wstring&)>;
 
+    // Callback type for pair-commit push from service (直通 ime.pair):
+    // 上屏 text 后向左移 moveLeft 格，并记一层待跳出深度。
+    using PairCommitCallback = std::function<void(const std::wstring&, uint32_t)>;
+
     // Callback type for update composition from Go (mouse click partial confirm)
     using UpdateCompositionCallback = std::function<void(const std::wstring& text, int caretPos)>;
 
@@ -315,6 +323,9 @@ public:
 
     // Set callback for receiving replace-backward push from service (undo commit)
     void SetReplaceBackwardCallback(ReplaceBackwardCallback callback);
+
+    // Set callback for receiving pair-commit push from service (直通 ime.pair)
+    void SetPairCommitCallback(PairCommitCallback callback);
 
     // Set callback for receiving update composition from Go (mouse click partial confirm)
     void SetUpdateCompositionCallback(UpdateCompositionCallback callback);
@@ -432,6 +443,7 @@ private:
     CommitTextCallback _commitTextCallback;
     ClearCompositionCallback _clearCompositionCallback;
     ReplaceBackwardCallback _replaceBackwardCallback;
+    PairCommitCallback _pairCommitCallback;
     UpdateCompositionCallback _updateCompositionCallback;
     SyncConfigCallback _syncConfigCallback;
     ServiceReadyCallback _serviceReadyCallback;

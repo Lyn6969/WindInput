@@ -215,6 +215,74 @@ mod tests {
         assert_eq!(ime.0.lock().unwrap().as_slice(), &["s2t".to_string()]);
     }
 
+    /// 端到端配对命令，锁住 `data/system.phrases.toml` 里 `cojk` 那条的实际写法。
+    ///
+    /// 系统短语的语法错误**用户零感知**——候选照常出现，选中后什么都不发生。所以这条
+    /// 走完整流程（解析 → 求值 → 派发），而不是只测函数本身。
+    #[test]
+    fn run_pair_command_dispatches_left_right_and_steps() {
+        use crate::services::{ImeController, Services};
+        use std::sync::{Arc, Mutex};
+
+        #[derive(Default)]
+        struct Ime(Mutex<Vec<String>>);
+        impl ImeController for Ime {
+            fn toggle(&self, _: &str) -> anyhow::Result<()> {
+                Ok(())
+            }
+            fn open_setting(&self, _: &str, _: &str) -> anyhow::Result<()> {
+                Ok(())
+            }
+            fn open_setting_web(&self, _: &str, _: &str) -> anyhow::Result<()> {
+                Ok(())
+            }
+            fn set_schema(&self, _: &str) -> anyhow::Result<()> {
+                Ok(())
+            }
+            fn theme_cycle(&self, _: &str) -> anyhow::Result<String> {
+                Ok(String::new())
+            }
+            fn pair(&self, left: &str, right: &str, jump_steps: u32) -> anyhow::Result<()> {
+                self.0
+                    .lock()
+                    .unwrap()
+                    .push(format!("{left}|{right}|{jump_steps}"));
+                Ok(())
+            }
+        }
+
+        let ime = Arc::new(Ime::default());
+        let mut svc = Services::new();
+        svc.ime = Some(ime.clone());
+        let ctx = MemoryContext::new().with_services(svc);
+        let reg = Registry::full();
+
+        // 系统短语 cojk 的原文
+        let r = evaluate_phrase(r#"$CC("「」", ime.pair("「", "」"))"#, &ctx, &reg).unwrap();
+        let (insert, err) = match r {
+            PhraseEval::Single { actions, .. } => run_actions(&actions, &ctx, &reg),
+            _ => panic!(),
+        };
+        assert!(err.is_none(), "{err:?}");
+        // 文本由 ime.pair 自己推送，不经 $CC 的上屏通道。
+        assert_eq!(insert, "");
+        assert_eq!(ime.0.lock().unwrap().as_slice(), &["「|」|1".to_string()]);
+
+        // 具名参数形式也要能走通全流程
+        let r = evaluate_phrase(
+            r#"$CC("注释", ime.pair("<!--", "-->", jump=1))"#,
+            &ctx,
+            &reg,
+        )
+        .unwrap();
+        let (_, err) = match r {
+            PhraseEval::Single { actions, .. } => run_actions(&actions, &ctx, &reg),
+            _ => panic!(),
+        };
+        assert!(err.is_none(), "{err:?}");
+        assert_eq!(ime.0.lock().unwrap()[1], "<!--|-->|1");
+    }
+
     /// 缺服务时命令优雅降级：动作返回 ServiceUnavailable，run_actions 收集错误但不 panic。
     #[test]
     fn missing_service_degrades_gracefully() {

@@ -267,7 +267,10 @@ static_assert(sizeof(CommitTextWithCursorPayload) == 8, "CommitTextWithCursorPay
 // Move cursor payload
 struct MoveCursorPayload
 {
-    uint32_t direction; // 1=right
+    // 向右移动的格数（合成几次 VK_RIGHT）。
+    // 原为 direction（恒 1 且从未被读）；直通 ime.pair 的多字符右段要越过不止一格，
+    // 才需要它真的携带信息。0 视同 1——旧版 core 与新版 DLL 混搭时不该退化成「跳出没反应」。
+    uint32_t count;
 };
 static_assert(sizeof(MoveCursorPayload) == 4, "MoveCursorPayload must be 4 bytes");
 

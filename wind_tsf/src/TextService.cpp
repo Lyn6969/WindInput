@@ -3610,6 +3610,21 @@ BOOL CTextService::_InitIPCClient()
         }
     });
 
+    // Set up pair-commit callback for 直通 ime.pair push from service
+    _pIPCClient->SetPairCommitCallback([pThis](const std::wstring& text, uint32_t moveLeft) {
+        // Async reader thread → TSF thread via the message window（CommitText 要开
+        // EditSession、合成 VK_LEFT 依赖本线程输入状态）。
+        WIND_LOG_DEBUG_FMT(L"Pair commit received from service, moveLeft=%u\n", moveLeft);
+        if (pThis->_pLangBarItemButton != nullptr)
+        {
+            pThis->_pLangBarItemButton->PostPairCommit(text, moveLeft);
+        }
+        else
+        {
+            WIND_LOG_WARN(L"Pair commit push dropped: no LangBarItemButton\n");
+        }
+    });
+
     // Set up clear composition callback for mode toggle via menu
     _pIPCClient->SetClearCompositionCallback([pThis]() {
         // This callback is called from the async reader thread
@@ -5588,6 +5603,16 @@ BOOL CTextService::UpdateComposition(const std::wstring& text, int caretPos, BOO
 // 目前没有对所有宿主都成立的通用方案，因此保留 TSF 优先作为默认（覆盖面更广），
 // Tabby/微信类宿主的问题如果后续真机测试仍然存在，再按宿主进程名特判走合成按键
 // （kTryTsfRangeReplace 换成按 host 判断），而不是全局切换。
+void CTextService::HandlePairCommitPush(const std::wstring& text, uint32_t moveLeft)
+{
+    if (_pKeyEventSink == nullptr)
+    {
+        WIND_LOG_WARN(L"HandlePairCommitPush: KeyEventSink 未装配，丢弃 ime.pair 推送\n");
+        return;
+    }
+    _pKeyEventSink->HandlePairCommitPush(text, moveLeft);
+}
+
 BOOL CTextService::ReplacePrecedingChars(int count, const std::wstring& text)
 {
     if (count <= 0)

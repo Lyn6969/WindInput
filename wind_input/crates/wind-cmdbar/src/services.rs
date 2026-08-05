@@ -110,6 +110,18 @@ pub trait ImeController: Send + Sync {
     fn undo_commit(&self) -> anyhow::Result<()> {
         anyhow::bail!("undo_commit: 宿主未支持")
     }
+    /// 上屏配对文本并激活配对状态（`ime.pair`）：插入 `left + right`、光标落在两段之间，
+    /// 同时把这一层压入配对栈，使跳出键（Tab/Enter）能越过 `right`。
+    ///
+    /// `jump_steps` = 跳出时光标右移的格数。
+    ///
+    /// 与自动配对的分工：自动配对由标点按键触发、右段恒为单字符；本方法由词条显式调用，
+    /// 右段可以是任意文本。**受 `input.auto_pair` 总开关约束**——关闭时由宿主退化为纯上屏
+    /// （整串上屏、光标落末尾、不压栈），判定在宿主侧，本层不做。
+    fn pair(&self, left: &str, right: &str, jump_steps: u32) -> anyhow::Result<()> {
+        let _ = (left, right, jump_steps);
+        anyhow::bail!("pair: 宿主未支持")
+    }
 }
 
 /// 配置读写：`config.get` / `config.set` / `config.toggle`，key 为 YAML 路径。

@@ -123,6 +123,7 @@ const UINT CLangBarItemButton::WM_UPDATE_COMPOSITION = WM_USER + 103;
 const UINT CLangBarItemButton::WM_SERVICE_READY = WM_USER + 104;
 const UINT CLangBarItemButton::WM_ACTIVATION_STATUS = WM_USER + 105;
 const UINT CLangBarItemButton::WM_REPLACE_BACKWARD = WM_USER + 106;
+const UINT CLangBarItemButton::WM_PAIR_COMMIT = WM_USER + 107;
 
 static const UINT_PTR TIMER_ID_CARET_RETRY    = 0xC401;
 static const UINT_PTR TIMER_ID_SERVICE_READY  = 0xC402;
@@ -798,6 +799,25 @@ LRESULT CALLBACK CLangBarItemButton::_MsgWndProc(HWND hwnd, UINT msg, WPARAM wPa
         delete pData;
         return 0;
     }
+    else if (msg == WM_PAIR_COMMIT)
+    {
+        // lParam contains pointer to PairCommitData (allocated by sender)
+        PairCommitData* pData = reinterpret_cast<PairCommitData*>(lParam);
+        CLangBarItemButton* pThis = reinterpret_cast<CLangBarItemButton*>(GetWindowLongPtrW(hwnd, GWLP_USERDATA));
+
+        if (pThis != nullptr && pData != nullptr && pThis->_pTextService != nullptr)
+        {
+            WIND_LOG_DEBUG_FMT(L"MsgWndProc: Processing WM_PAIR_COMMIT, textLen=%zu, moveLeft=%u\n",
+                               pData->text.length(), pData->moveLeft);
+            // 必须在 UI（TSF）线程上做：CommitText 要开 EditSession，合成 VK_LEFT 也依赖
+            // 本线程的输入状态。
+            pThis->_pTextService->HandlePairCommitPush(pData->text, pData->moveLeft);
+        }
+
+        // Free the data allocated by sender
+        delete pData;
+        return 0;
+    }
     else if (msg == WM_CLEAR_COMPOSITION)
     {
         CLangBarItemButton* pThis = reinterpret_cast<CLangBarItemButton*>(GetWindowLongPtrW(hwnd, GWLP_USERDATA));
@@ -1219,6 +1239,31 @@ void CLangBarItemButton::PostCommitText(const std::wstring& text)
     else
     {
         WIND_LOG_DEBUG_FMT(L"PostCommitText: Message posted to UI thread, textLen=%zu\n", text.length());
+    }
+}
+
+void CLangBarItemButton::PostPairCommit(const std::wstring& text, uint32_t moveLeft)
+{
+    // 同 PostReplaceBackward：必须回到 UI（TSF）线程，没有消息窗就只能丢弃并记日志。
+    if (_hMsgWnd == NULL)
+    {
+        WIND_LOG_WARN(L"PostPairCommit: No message window, dropping pair push\n");
+        return;
+    }
+
+    // Allocate data on heap (will be freed by message handler)
+    PairCommitData* pData = new PairCommitData();
+    pData->text = text;
+    pData->moveLeft = moveLeft;
+
+    if (!PostMessageW(_hMsgWnd, WM_PAIR_COMMIT, 0, reinterpret_cast<LPARAM>(pData)))
+    {
+        delete pData;
+        WIND_LOG_WARN(L"PostPairCommit: PostMessage failed, dropping pair push\n");
+    }
+    else
+    {
+        WIND_LOG_DEBUG_FMT(L"PostPairCommit: Message posted to UI thread, moveLeft=%u\n", moveLeft);
     }
 }
 

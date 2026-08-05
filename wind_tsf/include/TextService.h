@@ -158,6 +158,10 @@ public:
     // 失败时回退到 SendInput（count 次 Backspace + Unicode 注入 text）。
     BOOL ReplacePrecedingChars(int count, const std::wstring& text);
 
+    // 直通 ime.pair 推送落点：转发给 KeyEventSink 上屏 + 左移 + 记一层待跳出深度。
+    // 深度是它自己的成员，故实现留在那边，这里只做转发（消息窗只拿得到 TextService）。
+    void HandlePairCommitPush(const std::wstring& text, uint32_t moveLeft);
+
     // End current composition.
     // pDocMgrHint: composition 所属的 DocMgr。**给出即权威**——实现不会再去问 GetFocus()，
     // 因为收口时机可能晚于焦点转移（doc_changed 路径），那时 GetFocus() 指向的是新文档，

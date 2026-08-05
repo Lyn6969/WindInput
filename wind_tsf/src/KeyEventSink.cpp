@@ -2031,8 +2031,12 @@ BOOL CKeyEventSink::_HandleServiceResponse()
 
     case ResponseType::MoveCursorRight:
         {
-            WIND_LOG_DEBUG(L"Processing MoveCursorRight response (smart skip)\n");
-            _SimulatePairKey(VK_RIGHT);
+            WIND_LOG_DEBUG_FMT(L"Processing MoveCursorRight response (smart skip), count=%u\n",
+                               response.moveCount);
+            // 一次跳出 = 越过一层配对的右段，可能是多格（直通 ime.pair 的多字符右段）。
+            // 深度只减 1：格数是「这一层有多宽」，与「弹掉几层」无关。
+            for (uint32_t i = 0; i < response.moveCount; i++)
+                _SimulatePairKey(VK_RIGHT);
             if (_pairPendingDepth > 0)
                 _pairPendingDepth--;
         }
@@ -2546,6 +2550,24 @@ void CKeyEventSink::_CheckBarrierTimeout()
 // (with repeat bit 0), which re-arms _pendingKeyUpKey and triggers mode
 // toggle when the physical Shift is released.
 // ============================================================================
+
+void CKeyEventSink::HandlePairCommitPush(const std::wstring& text, uint32_t moveLeft)
+{
+    WIND_LOG_DEBUG_FMT(L"HandlePairCommitPush: textLen=%zu, moveLeft=%u\n",
+                       text.length(), moveLeft);
+    _pTextService->CommitText(text);
+    _isComposing = FALSE;
+    _hasCandidates = FALSE;
+    for (uint32_t i = 0; i < moveLeft; i++)
+        _SimulatePairKey(VK_LEFT);
+    // moveLeft==0 说明协调器判定为「退化纯上屏」，那侧也没压栈，此处同样不记账——
+    // 深度与 core 的 pair_tracker 必须严格同步，宁可两边都没有，不要一边有。
+    if (moveLeft > 0)
+    {
+        _pairPendingDepth++;
+        TouchPairState();
+    }
+}
 
 void CKeyEventSink::_SimulatePairKey(WORD vk)
 {

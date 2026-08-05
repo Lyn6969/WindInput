@@ -84,6 +84,10 @@ public:
     // delete `count` chars before caret then insert text on the UI thread
     void PostReplaceBackward(int count, const std::wstring& text);
 
+    // Thread-safe pair commit from async thread (直通 ime.pair)：
+    // 在 UI 线程上屏 text、左移 moveLeft 格并记一层待跳出深度
+    void PostPairCommit(const std::wstring& text, uint32_t moveLeft);
+
     // Thread-safe clear composition from async thread (posts message to UI thread)
     // Used when mode is toggled via menu while there's an active composition
     void PostClearComposition();
@@ -129,6 +133,7 @@ private:
     static const UINT WM_SERVICE_READY;
     static const UINT WM_ACTIVATION_STATUS;
     static const UINT WM_REPLACE_BACKWARD;
+    static const UINT WM_PAIR_COMMIT;
 
     // Packed status for message passing
     struct StatusUpdateData {
@@ -149,6 +154,12 @@ private:
     struct ReplaceBackwardData {
         int count;
         std::wstring text;
+    };
+
+    // Data for pair-commit message (直通 ime.pair)
+    struct PairCommitData {
+        std::wstring text;
+        uint32_t moveLeft;
     };
 
     // Data for update composition message

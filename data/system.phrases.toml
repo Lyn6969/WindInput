@@ -369,7 +369,7 @@ weight = 2000
 
 [[phrases]]
 code = 'cojk'
-text = '$CC("「」", type("「」"), key.tap("Left"))'
+text = '$CC("「」", ime.pair("「", "」"))'
 weight = 2000
 
 [[phrases]]

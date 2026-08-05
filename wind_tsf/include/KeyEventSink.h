@@ -96,6 +96,13 @@ public:
     // 它们，只有这里能看全）。栈空（depth==0）时不记，避免空状态攒出活动时间。
     void TouchPairState() { if (_pairPendingDepth > 0) _pairLastActivityTick = GetTickCount64(); }
 
+    // 直通 ime.pair 的推送落点：上屏 text 后左移 moveLeft 格，并记一层待跳出深度。
+    //
+    // 与 OnKeyDown 里 InsertTextWithCursor 响应分支**同源**——那条走按键响应，这条走 push
+    // 通道（命令动作在协调器的独立线程执行，按键响应早已返回）。深度这一层不能省：它是
+    // 中文模式下 Enter 能否被转发给协调器的闸门，漏掉的症状是「Tab 跳得出、Enter 毫无反应」。
+    void HandlePairCommitPush(const std::wstring& text, uint32_t moveLeft);
+
     // 配对状态是否已陈旧。TTL=0 表示不过期。
     //
     // **判据必须留在 DLL 侧**：吃键闸门在这里，若只有协调器过期而这边照吃跳出键，

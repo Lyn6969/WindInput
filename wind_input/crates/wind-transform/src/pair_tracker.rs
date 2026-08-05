@@ -15,10 +15,31 @@
 use std::time::Instant;
 
 /// 配对条目
+///
+/// 左右两段都是**字符串**而非单字符：标点配对键恒为单字符，但直通命令
+/// （`ime.pair`）可以压入任意模板（`<!--` / `-->`、`"""` / `"""`），存不下就只能
+/// 退回「上屏对了、跳不出去」的老路。
 #[derive(Debug, Clone)]
 pub struct PairEntry {
-    pub left: char,
-    pub right: char,
+    pub left: String,
+    pub right: String,
+    /// 跳出本层时光标要右移的格数（合成几次 VK_RIGHT）。
+    ///
+    /// **不等于 `right` 的长度**：VK_RIGHT 一次越过多少内容是宿主行为——emoji 与组合字
+    /// 在多数宿主一次跨整个字素簇、少数宿主按 UTF-16 单元走。故此处存的是调用方算好或
+    /// 显式指定的格数，跳出路径照搬，不再二次推导。
+    pub jump_steps: u32,
+}
+
+impl PairEntry {
+    /// 右段是否恰为单个字符 `c`。
+    ///
+    /// 右符号跳出（`jump_out_on_right_symbol`）只可能由单个标点按键触发，故只有单字符
+    /// 右段配得上；直通压入的多字符右段在此恒为 false，只能靠 Tab/Enter 跳出。
+    pub fn right_is_char(&self, c: char) -> bool {
+        let mut it = self.right.chars();
+        it.next() == Some(c) && it.next().is_none()
+    }
 }
 
 /// 配对跟踪器
@@ -39,14 +60,28 @@ impl PairTracker {
         }
     }
 
-    /// 压入配对。首层压入时记录归属 token；每次压入都刷新活动时间。
+    /// 压入单字符配对（标点配对路径）。跳出恒右移 1 格。
     pub fn push(&mut self, left: char, right: char) {
         self.push_at(left, right, Instant::now());
     }
 
     /// [`Self::push`] 的可注入时钟版本（测试用）。
     pub fn push_at(&mut self, left: char, right: char, now: Instant) {
-        self.stack.push(PairEntry { left, right });
+        self.push_text_at(left.to_string(), right.to_string(), 1, now);
+    }
+
+    /// 压入任意文本配对（直通 `ime.pair` 路径），跳出格数由调用方指定。
+    pub fn push_text(&mut self, left: String, right: String, jump_steps: u32) {
+        self.push_text_at(left, right, jump_steps, Instant::now());
+    }
+
+    /// [`Self::push_text`] 的可注入时钟版本（测试用）。
+    pub fn push_text_at(&mut self, left: String, right: String, jump_steps: u32, now: Instant) {
+        self.stack.push(PairEntry {
+            left,
+            right,
+            jump_steps,
+        });
         self.last_activity = Some(now);
     }
 
@@ -180,6 +215,53 @@ mod tests {
         let now = Instant::now();
         let t = tracker_with_pair(now);
         assert!(!t.is_stale_at(now + Duration::from_secs(86400), 0));
+    }
+
+    /// 多字符配对：左右两段与跳出格数都要原样存住。
+    /// 单字符路径的 `push` 必须仍然等价于 `jump_steps = 1`，否则标点配对会跟着改行为。
+    #[test]
+    fn text_pair_keeps_segments_and_steps() {
+        let now = Instant::now();
+        let mut t = PairTracker::new();
+        t.push_text_at("<!--".into(), "-->".into(), 3, now);
+        let e = t.peek().expect("应有一层");
+        assert_eq!(e.left, "<!--");
+        assert_eq!(e.right, "-->");
+        assert_eq!(e.jump_steps, 3);
+
+        t.push_at('（', '）', now);
+        let e = t.peek().expect("应有第二层");
+        assert_eq!(e.jump_steps, 1, "单字符配对跳出恒 1 格");
+    }
+
+    /// 右符号跳出只认单字符右段——多字符右段配不上一次标点按键，
+    /// 若这里返回 true，打一个 `-` 就会误跳出整个 `-->`。
+    #[test]
+    fn right_is_char_rejects_multichar_right() {
+        let mut t = PairTracker::new();
+        t.push_text_at("<!--".into(), "-->".into(), 3, Instant::now());
+        let e = t.peek().unwrap();
+        assert!(!e.right_is_char('-'), "多字符右段不该被单字符命中");
+        assert!(!e.right_is_char('>'));
+
+        t.push('（', '）');
+        assert!(t.peek().unwrap().right_is_char('）'));
+        assert!(
+            !t.peek().unwrap().right_is_char(')'),
+            "半角右括号不该命中全角栈顶"
+        );
+    }
+
+    /// 栈是 LIFO：分级跳出（两条 `ime.pair` 写在同一词条里）靠的就是它，
+    /// 内层后压先弹。这条锁住顺序，避免有人改成队列。
+    #[test]
+    fn nested_text_pairs_pop_inner_first() {
+        let mut t = PairTracker::new();
+        t.push_text("（".into(), "）".into(), 1);
+        t.push_text("【".into(), "】".into(), 1);
+        assert_eq!(t.pop().unwrap().right, "】", "内层先弹");
+        assert_eq!(t.pop().unwrap().right, "）", "外层后弹");
+        assert!(t.is_empty());
     }
 
     #[test]

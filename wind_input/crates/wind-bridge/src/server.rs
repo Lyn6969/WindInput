@@ -1040,7 +1040,7 @@ fn encode_key_action(action: &KeyAction) -> Vec<u8> {
             text,
             cursor_offset,
         } => encode_commit_text_with_cursor(text, *cursor_offset),
-        KeyAction::MoveCursorRight => encode_move_cursor(1),
+        KeyAction::MoveCursorRight { count } => encode_move_cursor(*count),
         KeyAction::DeletePair => encode_delete_pair(),
         KeyAction::ReplaceBackward { count, text } => encode_replace_backward(*count, text),
         KeyAction::HoldComposition { text, timeout_ms } => {

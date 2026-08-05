@@ -5956,9 +5956,10 @@ impl MessageHandler for Coordinator {
                         {
                             let mut tr =
                                 self.pair_tracker.lock().unwrap_or_else(|e| e.into_inner());
-                            if tr.peek().is_some_and(|e| e.right == pch) {
+                            // 同 handle_punct：多字符右段配不上单个标点按键，只能 Tab/Enter 跳出。
+                            if tr.peek().is_some_and(|e| e.right_is_char(pch)) {
                                 tr.pop();
-                                return KeyAction::MoveCursorRight;
+                                return KeyAction::MoveCursorRight { count: 1 };
                             }
                             tr.clear();
                         }
