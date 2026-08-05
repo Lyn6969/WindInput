@@ -11,7 +11,9 @@
 #[cfg(windows)]
 mod imp {
     pub use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
-    pub use windows::Win32::UI::Input::KeyboardAndMouse::{ReleaseCapture, SetCapture};
+    pub use windows::Win32::UI::Input::KeyboardAndMouse::{
+        GetAsyncKeyState, ReleaseCapture, SetCapture, VK_LBUTTON, VK_MBUTTON, VK_RBUTTON,
+    };
     pub use windows::Win32::UI::WindowsAndMessaging::{
         GetCursorPos, GetWindowRect, HWND_TOPMOST, IDC_ARROW, IDC_SIZEALL, LoadCursorW, SW_HIDE,
         SWP_NOACTIVATE, SWP_NOSIZE, SWP_NOZORDER, SetCursor, SetWindowPos, ShowWindow,
@@ -57,7 +59,14 @@ mod imp {
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
     pub struct CursorName(pub usize);
 
+    /// 虚拟键码占位（对应 Win32 的 `VIRTUAL_KEY` newtype，`.0` 取值方式一致）。
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub struct VIRTUAL_KEY(pub u16);
+
     // ---- 常量 ----
+    pub const VK_LBUTTON: VIRTUAL_KEY = VIRTUAL_KEY(0x01);
+    pub const VK_RBUTTON: VIRTUAL_KEY = VIRTUAL_KEY(0x02);
+    pub const VK_MBUTTON: VIRTUAL_KEY = VIRTUAL_KEY(0x04);
     pub const IDC_ARROW: CursorName = CursorName(32512);
     pub const IDC_SIZEALL: CursorName = CursorName(32646);
     pub const SW_HIDE: i32 = 0;
@@ -90,6 +99,11 @@ mod imp {
     }
     pub unsafe fn ReleaseCapture() -> Result<(), ()> {
         Ok(())
+    }
+    /// mock：恒返回「未按下」。非 Windows 无全局按键状态可查，靠它驱动的轮询
+    /// （菜单外点击）在此平台自然静默。
+    pub unsafe fn GetAsyncKeyState(_vk: i32) -> i16 {
+        0
     }
     pub unsafe fn GetWindowRect(_hwnd: HWND, _rect: *mut RECT) -> Result<(), ()> {
         Ok(())

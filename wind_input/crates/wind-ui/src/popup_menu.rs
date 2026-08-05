@@ -11,9 +11,9 @@ use std::sync::mpsc::Sender;
 
 use crate::manager::{MenuItemSpec, MenuKind, UiEvent};
 use crate::sys::{
-    GetCursorPos, HWND, IDC_ARROW, LPARAM, LRESULT, LoadCursorW, POINT, ReleaseCapture, SW_HIDE,
-    SetCapture, SetCursor, ShowWindow, WM_LBUTTONDOWN, WM_MOUSEMOVE, WM_RBUTTONDOWN, WM_SETCURSOR,
-    WPARAM,
+    GetAsyncKeyState, GetCursorPos, HWND, IDC_ARROW, LPARAM, LRESULT, LoadCursorW, POINT,
+    ReleaseCapture, SW_HIDE, SetCapture, SetCursor, ShowWindow, VK_LBUTTON, VK_MBUTTON, VK_RBUTTON,
+    WM_LBUTTONDOWN, WM_MOUSEMOVE, WM_RBUTTONDOWN, WM_SETCURSOR, WPARAM,
 };
 use crate::text::dwrite::TextRenderer;
 use crate::view::{Align, Edges, Layout, Rect, View};
@@ -121,6 +121,25 @@ fn selectable(it: &MenuItemSpec) -> bool {
 
 fn first_selectable(items: &[MenuItemSpec]) -> usize {
     items.iter().position(selectable).unwrap_or(NONE_SEL)
+}
+
+/// 鼠标键的「按下沿」：仅上一轮未按、本轮按着时为真。
+/// 单独成函数是为了让 [`PopupMenu::poll_outside_press`] 里最易写反的那半条语义可测。
+fn press_edge(was_down: bool, now_down: bool) -> bool {
+    now_down && !was_down
+}
+
+/// 左/中/右任一鼠标键当前是否按着。
+///
+/// ⚠️ 只取 `0x8000`（当前按下）位。返回值最低位 `0x0001`（"自上次调用以来按过"）是
+/// **进程级共享**状态，任何一次调用都会把它清零——多处消费必然互相偷事件，绝不能用；
+/// 边沿一律由调用方自己保存上一轮状态来判定。
+fn any_mouse_button_down() -> bool {
+    unsafe {
+        [VK_LBUTTON, VK_MBUTTON, VK_RBUTTON]
+            .iter()
+            .any(|vk| (GetAsyncKeyState(vk.0 as i32) as u16 & 0x8000) != 0)
+    }
 }
 
 /// 菜单交互状态（与 wnd_proc 共享）。只做结构变更，dirty 触发 PopupMenu 协调重绘。
@@ -354,6 +373,9 @@ pub struct PopupMenu {
     shadow: Option<crate::view::SoftShadow>,
     /// 已应用主题（DPI 变化时按新缩放重解析几何）。
     theme: Option<wind_theme::Resolved>,
+    /// 上一轮轮询看到的「有鼠标键按着」状态，供 [`Self::poll_outside_press`] 做边沿检测。
+    /// **必须在 `show()` 里按当前真实状态初始化**，理由见该处注释。
+    mouse_was_down: bool,
 }
 
 impl PopupMenu {
@@ -389,6 +411,7 @@ impl PopupMenu {
             radius: 6.0 * scale,
             shadow: None,
             theme: None,
+            mouse_was_down: false,
         };
         // 预创建根窗口并绑定鼠标处理器（捕获后只有根窗口收消息）
         menu.ensure_windows(1)?;
@@ -580,13 +603,20 @@ impl PopupMenu {
             }
             SetCapture(self.windows[0].hwnd());
         }
+        // 边沿检测的初态**必须取当前真实按键状态，不能填 false**：菜单几乎总是由一次
+        // 尚未抬起的点击唤出的（工具栏左键、候选区右键、任务栏语言栏图标），此刻对应的
+        // 键正按着。填 false 会让下一轮轮询把这枚"旧"按下当成一次新的菜单外点击，
+        // 表现为菜单弹出即消失。
+        self.mouse_was_down = any_mouse_button_down();
     }
 
-    /// UI 循环每轮调用：脏则协调重绘；请求关闭则隐藏。
+    /// UI 循环每轮调用：轮询菜单外点击；脏则协调重绘；请求关闭则隐藏。
     pub fn tick(&mut self) {
         if !self.visible {
             return;
         }
+        // 先轮询再读 closed：本轮探到的菜单外点击立刻在同一轮生效，不必多等 8ms。
+        self.poll_outside_press();
         let (dirty, closed) = {
             let st = self.state.borrow();
             (st.dirty, st.closed)
@@ -599,6 +629,53 @@ impl PopupMenu {
             self.state.borrow_mut().dirty = false;
             self.reconcile();
         }
+    }
+
+    /// 轮询「点在菜单外」并关闭菜单。
+    ///
+    /// **为什么不能靠 `SetCapture` + `WM_LBUTTONDOWN`**：Win32 规定只有前台窗口才能真正
+    /// 捕获鼠标；菜单窗口是 `WS_EX_NOACTIVATE`（见 `window.rs`），服务进程在菜单显示期间
+    /// **从来不是前台进程**，捕获于是退化成「光标位于窗口可见区内时才收得到鼠标消息」。
+    /// 结果恰好反了：光标在面板上时（hover / 点条目）一切正常，掩盖了问题；而点任务栏、
+    /// 点别的应用、点回原文本框——正是最需要关菜单的时刻——一条消息都收不到，
+    /// `on_message` 里 `None => self.close()` 那条分支形同虚设。
+    ///
+    /// `GetAsyncKeyState` 不经消息队列，直接问系统按键的物理状态，绕开了上述捕获规则。
+    ///
+    /// ⚠️ 我们**吞不掉**这一次点击（它早已投递给了目标窗口），只能跟着关菜单。这与 Win32
+    /// 原生菜单「点外面只关菜单、不穿透」的行为有别，但正是此处想要的：点任务栏则任务栏
+    /// 响应、菜单一并收起。
+    ///
+    /// ⚠️ **点我们自己的工具栏同样算「外面」，这是有意的**。上述失效是按线程生效的：捕获
+    /// 期间同线程的工具栏窗口也收不到鼠标消息，所以菜单开着时工具栏本就是点不动的。本轮询
+    /// 关闭菜单会顺带 `ReleaseCapture`，抬起的 `WM_LBUTTONUP` 才第一次能投递到工具栏——
+    /// 于是「菜单开着时切中英」这类操作从"没反应"变成可用。代价是工具栏设置键（它的主菜单
+    /// 是在**抬起**时才发 `RequestMainMenu` 的）表现为「关闭后立刻重新弹出」而非 toggle。
+    /// 没有为此加特例：真 toggle 要么猜时间窗、要么比对锚点，两者都比这点闪烁更容易出错。
+    fn poll_outside_press(&mut self) {
+        let now_down = any_mouse_button_down();
+        let was_down = std::mem::replace(&mut self.mouse_was_down, now_down);
+        // 仅按下沿触发：按住不放期间每轮都是 down，不做边沿检测会反复关闭（本身幂等，
+        // 但会把「按住拖拽」这类操作也算成点击）；抬起沿更不该关。
+        if !press_edge(was_down, now_down) {
+            return;
+        }
+        let mut p = POINT::default();
+        unsafe {
+            if GetCursorPos(&mut p).is_err() {
+                return;
+            }
+        }
+        // 命中判定与 `on_message` 共用 `find_hit`（同为屏幕坐标），故两条路径的覆盖面
+        // 严格互补、不会重复关闭：捕获收得到消息的情形必然命中面板。
+        if self.state.borrow().find_hit(p.x, p.y).is_some() {
+            return;
+        }
+        tracing::debug!("PopupMenu: 检测到菜单外按下 → 关闭");
+        // 走 MenuState::close() 而非直接 self.hide()：它会发 UiEvent::MenuClose，
+        // 协调器据此复位服务端的 menu_open。少了这一步，菜单窗口没了但键仍被
+        // forward_menu_key 吞掉（同类不一致见 coordinator 的 clears_input 分支注释）。
+        self.state.borrow_mut().close();
     }
 
     /// 键盘转发（协调器在组合期拦截方向键/回车/ESC 后下发）。
@@ -1323,6 +1400,79 @@ fn place_child(
         }
     }
     (x, y)
+}
+
+/// 「点菜单外面就关」的判据（见 [`PopupMenu::poll_outside_press`]）。
+///
+/// 这条路是纯轮询驱动的——没有消息可依赖，错了不会编译失败也不会 panic，只会表现为
+/// 「菜单一弹就没」或「点外面关不掉」这类难复现的时序问题，所以两半判据都锁在这里。
+#[cfg(test)]
+mod outside_press_tests {
+    use super::*;
+    use std::sync::mpsc::channel;
+
+    /// 菜单几乎总是由一次**尚未抬起**的点击唤出的（工具栏左键 / 候选区右键 / 任务栏
+    /// 语言栏图标）。若 `show()` 把 `mouse_was_down` 填成 false，弹出后的第一轮轮询
+    /// 就会把这枚旧按下当成新的菜单外点击 —— 菜单弹出即消失。
+    #[test]
+    fn already_held_button_is_not_a_new_press() {
+        assert!(!press_edge(true, true));
+    }
+
+    /// 抬起沿不关：否则「按住拖过菜单外再松手」会在松手时误关。
+    #[test]
+    fn release_is_not_a_press() {
+        assert!(!press_edge(true, false));
+    }
+
+    /// 真正该关的唯一形态：上一轮空手、这一轮按下。
+    #[test]
+    fn fresh_press_is_detected() {
+        assert!(press_edge(false, true));
+    }
+
+    #[test]
+    fn idle_is_not_a_press() {
+        assert!(!press_edge(false, false));
+    }
+
+    fn state_with_panel_at(ox: i32, oy: i32, w: u32, h: u32) -> MenuState {
+        let (tx, _rx) = channel();
+        let mut lv = Level::new(
+            vec![MenuItemSpec::leaf("a", MenuKind::Copy, true, false)],
+            0,
+        );
+        lv.origin = (ox, oy);
+        lv.size = (w, h);
+        MenuState {
+            levels: vec![lv],
+            capture_origin: (777, 888), // 故意非零，见下面两条测试的说明
+            dirty: false,
+            closed: false,
+            events: tx,
+        }
+    }
+
+    /// 轮询传给 `find_hit` 的**必须是屏幕坐标**。
+    ///
+    /// 易错点：`on_message` 那条路先经 `self.screen(x, y)` 把捕获窗口的客户区坐标换算成
+    /// 屏幕坐标，而 `GetCursorPos` 拿到的**本来就是**屏幕坐标，再转一次就会平移
+    /// `capture_origin`。此处 `capture_origin` 特意设成 (777, 888)：若谁日后在轮询里补上
+    /// 了那次转换，光标就会被算到面板外，这条先红。
+    #[test]
+    fn cursor_inside_panel_hits_in_screen_coords() {
+        let st = state_with_panel_at(100, 100, 80, 40);
+        assert!(st.find_hit(120, 110).is_some());
+    }
+
+    /// 面板外 → 无命中 → 该关。任务栏、别的应用、原文本框都落在这一支。
+    #[test]
+    fn cursor_outside_panel_misses() {
+        let st = state_with_panel_at(100, 100, 80, 40);
+        assert!(st.find_hit(500, 500).is_none());
+        // 右/下边界是开区间（`sx < ox + w`），紧贴右下角外一像素也算外面。
+        assert!(st.find_hit(180, 140).is_none());
+    }
 }
 
 #[cfg(test)]
