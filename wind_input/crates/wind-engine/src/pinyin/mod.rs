@@ -103,6 +103,35 @@ const COMPLETION_NEAR_SYLLABLES: u32 = 2;
 /// 一半的词低于它，会误沉大量高频使用但低词频的日常词。
 const COMPLETION_FAR_WEIGHT_FLOOR: i32 = 100;
 
+/// 「音节数严格匹配」档的上限：**输入自身**表达的音节数不超过这么多时，前缀补全候选的
+/// 音节数必须 ≤ 输入的音节数 —— 即短输入下不预测未输入的音节，对齐主流拼音输入法。
+///
+/// 输入的音节数 `started` = 完整音节数 + (有尾部残码 ? 1 : 0)，与
+/// [`should_promote_user_completion`] 同一个量。
+///
+/// 现象：打 `d` 或 `dian` 时候选里混着「但是」「的时候」「电话」这类词组。它们全部来自
+/// step4 前缀补全，且因残码上浮（`d` 的 `trailing_partial=true`、距离 ≤
+/// [`COMPLETION_NEAR_SYLLABLES`]）被**提升进完整匹配层**与单字同层竞争，于是第 2 页就能
+/// 见到 —— 不是排序没生效，是它们被主动提上来的。
+///
+/// **取 1 是硬约束，不是取舍**。取 2 会连带干掉 `nih`→「你好」、`meiy`→「没有」这两条
+/// —— 它们是残码上浮机制存在的理由，`pinyin_completion.rs` 有定点断言。届时
+/// `zhonghuar`→「中华人民共和国」（输入 3 音节、词 7 音节）这类远距离补全同样全灭。
+///
+/// ⚠️ **判据问的是「输入有几个音节」，不是「输入在这条候选的切分下占了几个音节」。**
+/// 后者曾被用过一版：它对精确匹配是对的（同一个 `dian`，对「点」是 1 音节、对「堤岸」
+/// 是 `di|an` 2 音节，确实没有唯一答案），但**精确匹配根本不需要这道闸门**——
+/// 它不预测任何未输入的内容。把那个理由推广到前缀补全上就错了：`xia` 会因为存在
+/// `xi|an`（西安）的切分而被当成 2 音节输入、整批放行词组，`ying` 同理漏出
+/// `yin|guo`（因果）。对前缀补全而言输入的音节数是**唯一确定**的 —— `completed_len`
+/// 是词图的性质，与走哪条切分路径无关（见 convert 中该变量的论证）。
+///
+/// ⚠️ **也不能拿"是不是前缀补全"当唯一判据**：`d` 的单字候选（「的」code=`de`）与词组
+/// 候选（「但是」code=`danshi`）出自同一条 step4，`is_prefix` 全为 true；`d` 又短于
+/// `is_abbreviation` 的 2 字母下限、简拼路径压根不启动 ⇒ 若按来源整条关掉前缀查询，
+/// `d` 会是**零候选**。两者要一起用：`is_prefix` 圈定适用范围，音节数决定去留。
+const STRICT_SYLLABLE_MATCH_MAX: u32 = 1;
+
 /// 前缀补全的取数上限（见 convert 中 `completion_limit` 处的完整说明）。
 ///
 /// 取 1000 是 `push_unique` 的 O(n²) 查重与「单字母可持续翻页」之间的平衡点：
@@ -470,11 +499,12 @@ impl PinyinEngine {
                 });
             };
 
-        // ① 纯简拼系统词（同 step5，含「音节数 == 简拼字母数」过滤）
+        // ① 纯简拼系统词（同 step5，含「音节数 == 简拼字母数」过滤，boundary=0 走 DAG 兜底）
         if AbbrevMatcher::is_abbreviation(stroke, trie) {
             for abbr_code in dict.search_abbrev(stroke, 10) {
                 for h in dict.search_with_boundary(&abbr_code) {
-                    if h.boundary != 0 && h.boundary.count_ones() as usize != stroke.len() {
+                    let eb = effective_boundary(&abbr_code, h.boundary, trie);
+                    if eb != 0 && eb.count_ones() as usize != stroke.len() {
                         continue;
                     }
                     push(cands, h.text, abbr_code.clone(), h.weight, h.boundary);
@@ -683,6 +713,24 @@ fn syllables_boundary_mask(syllables: &[String], limit_len: usize) -> u64 {
         pos += s.len();
     }
     mask
+}
+
+/// 候选的音节边界，`boundary` 无真值（=0）时用 DAG 对码现切一次补出。
+///
+/// 无真值的来源：用户手输码（`infer_boundary_for` 兜不住的那部分）、模糊变体（一律置 0，
+/// 见 P2b 的候选边界归属表）、旧词典条目。现切是**猜测**，但这里本就没有真值可用——
+/// 与「凡拿 flat 码现算音节 = 把已知真值扔掉重猜」那条戒律不冲突：那条针对的是
+/// 手上有真值却不用，此处是真的没有。
+///
+/// ⚠️ 猜测走 `maximum_match`（最长匹配 ⇒ **最少**音节），故对同码多切分会偏向少的那侧：
+/// `xian` 猜成 1 音节，若某条 boundary=0 的候选实为「西安」(xi|an)，会被少算一个音节。
+/// 只影响没有边界真值的那一小撮，且仅在短输入档生效。
+fn effective_boundary(code: &str, boundary: u64, trie: &SyllableTrie) -> u64 {
+    if boundary != 0 {
+        return boundary;
+    }
+    let syls = Dag::build(code, trie).maximum_match();
+    syllables_boundary_mask(&syls, code.len())
 }
 
 /// 双拼给出的**分段边界**（全拼空间 bitmask，与候选 `boundary` 同域）。
@@ -1271,6 +1319,13 @@ impl Engine for PinyinEngine {
         // 与本文件其他位置「无边界信息一律降级放行」的处理一致。
         let trailing_partial = completed != query;
         let completed_syls = syllables.len() as u32;
+        // 输入**自身**表达的音节数：完整音节 + 尾部残码算起头的一个（`qingfengs` 的 `s`
+        // 表示用户明确要接着打这个音节，意图强于停在整音节边界）。与
+        // `should_promote_user_completion` 的 `started` 同义，也是 step 6.3 闸门的尺子。
+        //
+        // 用它而非「输入在候选切分下占的音节数」：后者会让 `xia` 因存在 `xi|an`（西安）
+        // 的切分而被当成 2 音节、放行整批词组。见 `STRICT_SYLLABLE_MATCH_MAX`。
+        let started_syllables = completed_syls + u32::from(trailing_partial);
         // 补全条数**跟随调用方请求量**，并 clamp 到 [30, MAX_COMPLETION_CANDIDATES]。
         //
         // 原先写死 30，代价是单字母输入（`b`/`y` 这类不成音节、无精确匹配的码）候选恒为 30 条、
@@ -1285,7 +1340,24 @@ impl Engine for PinyinEngine {
         // 治本要把查重换成哈希索引，但 Viterbi 整句走 `insert(0)` 绕过该闭包、后续还有
         // `retain`，两者都会让哈希集与实际列表失同步，须单独立项处理。
         let completion_limit = max_candidates.clamp(30, MAX_COMPLETION_CANDIDATES);
-        for h in dict.search_prefix_with_boundary(query, completion_limit) {
+        // **音节数过滤下推到词库层**（step 6.3 的闸门在此处提前施加，见
+        // `STRICT_SYLLABLE_MATCH_MAX`）。若只在 6.3 那里事后 retain，`limit` 配额会被
+        // 注定要丢弃的词组吃光：实测 `d` 取 1000 条补全，过闸门的只有 68 条单字，
+        // 用户翻两页就没了。下推后 top-N 直接是 N 条合格条目。
+        //
+        // 长输入（`started ≥ 2`，如 `meiy`/`zhonghuar`）走不带上限的原路径，与改动前
+        // 逐条一致。6.3 的 retain 仍然保留 —— 它还要兜住词库层判不了的
+        // `boundary == 0`（DAG 现切）与 step6 并入的用户/临时词。
+        let completions = if started_syllables <= STRICT_SYLLABLE_MATCH_MAX {
+            dict.search_prefix_with_boundary_syllable_capped(
+                query,
+                completion_limit,
+                started_syllables,
+            )
+        } else {
+            dict.search_prefix_with_boundary(query, completion_limit)
+        };
+        for h in completions {
             let demote_to_prefix_layer = if trailing_partial {
                 let distance = h.boundary.count_ones().saturating_sub(completed_syls);
                 distance > COMPLETION_NEAR_SYLLABLES && h.weight < COMPLETION_FAR_WEIGHT_FLOOR
@@ -1335,8 +1407,11 @@ impl Engine for PinyinEngine {
                     // 前者的码，回查主表却会把后者一并捞出来 —— 实测 `xa` 出「先/线/弦/
                     // 现/县」一串单字。这是「存词」改「存码」引入的，存词时不会发生。
                     //
-                    // boundary=0（无边界信息）放行，与全仓「任一侧为 0 即降级」的约定一致。
-                    if h.boundary != 0 && h.boundary.count_ones() as usize != abbr_query.len() {
+                    // boundary=0（无边界信息）**不再直接放行**：那是本判据唯一的漏网口，
+                    // 手输码用户词/旧词典条目会绕过音节数约束（`nh` 出 3 音节词）。
+                    // 改用 `effective_boundary` 对码现切补出音节数，与全拼侧 6.3 闸门同源。
+                    let eb = effective_boundary(&abbr_code, h.boundary, trie);
+                    if eb != 0 && eb.count_ones() as usize != abbr_query.len() {
                         continue;
                     }
                     let before = candidates.len();
@@ -1650,6 +1725,38 @@ impl Engine for PinyinEngine {
             candidates.retain(|c| match syllable_span(syls, &c.code) {
                 Some(k) if k >= 1 => c.text.chars().count() == k,
                 _ => true,
+            });
+        }
+
+        // 6.3 音节数匹配闸门（短输入档）：输入自身只表达了 ≤ STRICT_SYLLABLE_MATCH_MAX 个
+        //     音节时，**前缀补全**候选的音节数不得超过输入的音节数 —— 即 `d`/`dian`/`xia`
+        //     不出「电话」「西安」，对齐主流拼音输入法。判据与阈值见
+        //     [`STRICT_SYLLABLE_MATCH_MAX`]，尺子是 `started_syllables`（输入的属性）。
+        //
+        //     **只约束 `is_prefix`（码比输入长的补全词）**，其余一律放行 —— 这不是白名单，
+        //     而是判据的适用边界：闸门要挡的是「预测用户尚未输入的音节」，而只有前缀补全
+        //     在做这件事。于是三类候选天然免疫：
+        //     - 精确匹配（`dian` 的「堤岸」，code == query 但切分为 `di|an`）：它完整解释
+        //       了输入，音节数是几与「预测」无关；
+        //     - 子短语（code 短于 query，step3）与整句：同理；
+        //     - 简拼族（step5/5b/6/6.2）：`is_prefix=false`，且其 code 与击键不在同一编码域
+        //       （`nh` → `nihao`），音节数判据在各自源头按**击键字母数**施加，这里不能插手。
+        //
+        //     长输入（`started_syllables ≥ 2`）整体跳过：`meiy`→「没有」、`nih`→「你好」、
+        //     `zhonghuar`→「中华人民共和国」全部不受影响。
+        //
+        //     位置必须在 step 6.2 之后：用户/临时词到 step 6 才并入，简拼前缀回退到 6.2；
+        //     且必须在排序/截断**之前**（P2b 同款教训：先截断再过滤会把该出的候选挤掉）。
+        if started_syllables <= STRICT_SYLLABLE_MATCH_MAX {
+            candidates.retain(|c| {
+                if !c.is_prefix {
+                    return true;
+                }
+                // 判据与词库层下推的那道**共用同一个函数**（`wind_dict::cached`），避免两处
+                // 各写一份日后漂移。差别只在入参：这里先用 `effective_boundary` 把无真值的
+                // boundary 用 DAG 补出来，词库层做不到这一步（拿不到 trie），只能放行。
+                let b = effective_boundary(&c.code, c.boundary, trie);
+                wind_dict::cached::prefix_syllable_keep(b, started_syllables)
             });
         }
 
@@ -2928,34 +3035,98 @@ mod tests {
         );
     }
 
-    /// 层级 TDD：精确单字应优先于高频前缀补全词。词典 "si"→"四"(weight 100,单字精确) 与
-    /// "sikao"→"思考"(weight 9000,补全词，code 比输入长)。输入 "si" 时「四」(精确,code==输入)
-    /// 必须排在「思考」(前缀补全)之前——即便「思考」词频高得多。对齐 Go Exact>>Partial。
+    /// 层级 TDD：精确词应优先于高频前缀补全词。词典 "sikao"→"思考"(weight 100,精确) 与
+    /// "sikaozhe"→"思考者"(weight 9000,补全词，code 比输入长)。输入 "sikao" 时「思考」
+    /// (精确,code==输入) 必须排在「思考者」(前缀补全)之前——即便后者词频高得多。
+    /// 对齐 Go Exact>>Partial。
+    ///
+    /// ⚠️ **本例刻意用 2 音节输入**。原版用 `si` → 期望「思考」作为前缀补全出现，
+    /// 该场景已被 6.3 音节数闸门（[`STRICT_SYLLABLE_MATCH_MAX`]）关掉：单音节输入下
+    /// 前缀补全整体不产出，`si` 不再出「思考」，正如 `dian` 不再出「电话」。
+    /// 要验证的层级序本身没变，只能移到不进严格档的输入长度上（used=2）。
+    /// 单音节侧的新语义由 `single_syllable_drops_longer_completions` 守卫。
     #[test]
     fn exact_ranks_above_prefix_completion() {
+        let mut raw = CodetableDict::empty();
+        raw.merge_single("sikao".to_string(), "思考".to_string(), 100, 0);
+        raw.merge_single("sikaozhe".to_string(), "思考者".to_string(), 9000, 0);
+        let dict = CachedDict::Memory(raw);
+        let eng = PinyinEngine::new(Config::default(), dict);
+
+        let r = eng.convert("sikao", 10).unwrap();
+        let texts: Vec<&String> = r.candidates.iter().map(|c| &c.text).collect();
+        let pos_kao = texts.iter().position(|t| *t == "思考");
+        let pos_zhe = texts.iter().position(|t| *t == "思考者");
+        assert!(pos_kao.is_some(), "精确「思考」应存在，实际: {texts:?}");
+        assert!(pos_zhe.is_some(), "补全「思考者」应存在，实际: {texts:?}");
+        assert!(
+            pos_kao < pos_zhe,
+            "精确「思考」应优先于高频前缀补全「思考者」，实际: {texts:?}"
+        );
+        assert!(
+            !r.candidates[pos_kao.unwrap()].is_prefix,
+            "「思考」应为精确(非前缀)"
+        );
+        assert!(
+            r.candidates[pos_zhe.unwrap()].is_prefix,
+            "「思考者」应为前缀补全"
+        );
+    }
+
+    /// 6.3 音节数闸门：**输入只表达 1 个音节时，音节数更多的前缀补全一律不产出**。
+    ///
+    /// 这是上面那条测试原场景的新语义版本，也是本闸门的核心断言：`si` 只出单字「四」，
+    /// 不出 2 音节的「思考」——对齐主流拼音输入法（`dian` 不出「电话」）。
+    ///
+    /// ⚠️ `merge_single` 造的词典 **boundary 恒为 0**（P2b 记录在案），故本例同时覆盖了
+    /// `effective_boundary` 的 DAG 兜底路径：「思考」的 2 音节是现切 `si|kao` 得来的。
+    #[test]
+    fn single_syllable_drops_longer_completions() {
         let mut raw = CodetableDict::empty();
         raw.merge_single("si".to_string(), "四".to_string(), 100, 0);
         raw.merge_single("sikao".to_string(), "思考".to_string(), 9000, 0);
         let dict = CachedDict::Memory(raw);
         let eng = PinyinEngine::new(Config::default(), dict);
 
-        let r = eng.convert("si", 10).unwrap();
-        let texts: Vec<&String> = r.candidates.iter().map(|c| &c.text).collect();
-        let pos_si = texts.iter().position(|t| *t == "四");
-        let pos_kao = texts.iter().position(|t| *t == "思考");
-        assert!(pos_si.is_some(), "精确「四」应存在，实际: {texts:?}");
-        assert!(pos_kao.is_some(), "补全「思考」应存在，实际: {texts:?}");
+        let texts: Vec<String> = eng
+            .convert("si", 10)
+            .unwrap()
+            .candidates
+            .into_iter()
+            .map(|c| c.text)
+            .collect();
         assert!(
-            pos_si < pos_kao,
-            "精确单字「四」应优先于高频前缀补全「思考」，实际: {texts:?}"
+            texts.iter().any(|t| t == "四"),
+            "同音节数的精确候选必须保留，实际: {texts:?}"
         );
         assert!(
-            !r.candidates[pos_si.unwrap()].is_prefix,
-            "「四」应为精确(非前缀)"
+            !texts.iter().any(|t| t == "思考"),
+            "单音节输入下 2 音节补全词不该出现，实际: {texts:?}"
         );
+    }
+
+    /// **反向对照**：多打一个字母（`sik`，残码使 used=2）后，同一个补全词必须回来。
+    ///
+    /// 缺了这条，上面那个断言可以靠「把前缀补全整个废掉」来满足 —— 那是另一个更严重的
+    /// 回归（`meiy`→「没有」、`nih`→「你好」全灭）。
+    #[test]
+    fn trailing_partial_restores_completions() {
+        let mut raw = CodetableDict::empty();
+        raw.merge_single("si".to_string(), "四".to_string(), 100, 0);
+        raw.merge_single("sikao".to_string(), "思考".to_string(), 9000, 0);
+        let dict = CachedDict::Memory(raw);
+        let eng = PinyinEngine::new(Config::default(), dict);
+
+        let texts: Vec<String> = eng
+            .convert("sik", 10)
+            .unwrap()
+            .candidates
+            .into_iter()
+            .map(|c| c.text)
+            .collect();
         assert!(
-            r.candidates[pos_kao.unwrap()].is_prefix,
-            "「思考」应为前缀补全"
+            texts.iter().any(|t| t == "思考"),
+            "残码使输入占到 2 个音节，补全词必须回来，实际: {texts:?}"
         );
     }
 

@@ -75,6 +75,15 @@ fn texts(mgr: &EngineManager, input: &str, limit: usize) -> Vec<String> {
 ///
 /// 权重取 20 亿（与 `pinyin_user_word_merge` 同款极端值）：它远超任何系统词
 /// （单字「是」约 1180 万），若约束失效必然排到第 0 位，判据不会似是而非。
+///
+/// ## 语义变更（step 6.3 音节数闸门上线后）
+///
+/// 本条原先还断言「筛选」**仍应可达**（约束是"不上浮"而非"丢弃"）。
+/// [`STRICT_SYLLABLE_MATCH_MAX`] 上线后这一半反转了：`s` 只表达 1 个音节，
+/// 2 音节的「筛选」与系统词「所以」「时间」受同一条规则处置 —— **一律不产出**。
+/// 用户词在此不享有豁免，否则「加了词的人看到词组、没加的人看不到」，
+/// 同一个输入长度下行为不一致。可达性由 `user_word_returns_when_input_grows`
+/// 反向对照守住：多打一个字母它就回来。
 #[test]
 fn high_weight_user_word_does_not_take_top_on_single_letter() {
     let Some(dir) = data_dir() else {
@@ -94,16 +103,37 @@ fn high_weight_user_word_does_not_take_top_on_single_letter() {
         base_top.first(),
         uw_all.first()
     );
-    assert_ne!(
-        uw_all.first().map(|s| s.as_str()),
-        Some("筛选"),
-        "只打一个声母时，两音节用户词不该夺走首选"
-    );
-    // 它仍应可达（约束是「不上浮」，不是「丢弃」）。
     assert!(
-        uw_all.iter().any(|t| t == "筛选"),
-        "用户词应仍在候选中，只是不上浮"
+        !uw_all.iter().any(|t| t == "筛选"),
+        "`s` 只表达 1 个音节，2 音节用户词不该产出（与系统词同一规则）"
     );
+}
+
+/// **反向对照**：输入一长，用户词必须回来。
+///
+/// 缺了这条，上面那个断言可以靠「把用户词整个废掉」来满足 —— 那是远更严重的 bug
+/// （用户加的词永远打不出来）。
+///
+/// ⚠️ 门槛落在 `shaix` 而非 `sh`/`shai`：「筛选」切分为 `shai|xuan`，第 2 个音节起始位
+/// 是 4，输入要长到 5 字节才把它圈进来（used 才从 1 变 2）。`sh`(2)、`shai`(4) 仍是
+/// 「只起了 1 个音节的头」，此时不出 2 音节词是**正确**行为 —— 与 `dian` 要打到
+/// `dianh` 才出「电话」完全同构。
+#[test]
+fn user_word_returns_when_input_grows() {
+    let Some(dir) = data_dir() else {
+        eprintln!("跳过：拼音词库不存在");
+        return;
+    };
+    let mgr = manager(&dir, "grow", &[("shaixuan", "筛选", 2_000_000_000)]);
+
+    for input in ["shaix", "shaixu", "shaixuan"] {
+        let t = texts(&mgr, input, 300);
+        assert!(
+            t.iter().any(|x| x == "筛选"),
+            "`{input}` 下用户词「筛选」必须可达，实际前 10={:?}",
+            &t[..10.min(t.len())]
+        );
+    }
 }
 
 /// **反向对照**：精确输入下用户提权必须仍然全效。

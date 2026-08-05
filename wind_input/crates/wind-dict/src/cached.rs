@@ -21,6 +21,23 @@ pub struct DictHit {
     pub boundary: u64,
 }
 
+/// 前缀查询中该条目是否**该保留**：词的音节数不超过 `max_syllables`。
+///
+/// 拼音「短输入音节数匹配」判据的词库层半边（策略与阈值在 `wind-engine` 的
+/// `STRICT_SYLLABLE_MATCH_MAX`，`max_syllables` 由调用方按**输入自身**的音节数给出）。
+///
+/// ⚠️ **判据问的是「输入有几个音节」，不是「输入在这条候选的切分下占几个音节」。**
+/// 后者曾被用过一版，会让 `xia` 因为存在 `xi|an`（西安）这种切分而被当成 2 音节输入、
+/// 放行整批词组；同理 `ying` 会漏出 `yin|guo`（因果）。输入的音节数是**输入自己的属性**、
+/// 全局唯一（`completed_len` 是词图的性质，与走哪条切分路径无关），不该外包给候选。
+///
+/// `boundary == 0`（无边界信息）**一律放行** —— 词库层无从判断，交调用方按需用 DAG
+/// 现切兜底（见 `wind-engine` 的 `effective_boundary`）。职责分工：词库层只提前丢弃
+/// **确定不合格**的条目以免它们白占 top-N 配额，最终判定仍在引擎层。
+pub fn prefix_syllable_keep(boundary: u64, max_syllables: u32) -> bool {
+    boundary == 0 || boundary.count_ones() <= max_syllables
+}
+
 /// `foo/bar.dict.yaml` → `foo/bar.wdat`（剥掉整个 `.dict.yaml` 后缀）。
 ///
 /// **不能用 `Path::with_extension("wdat")`** —— 那只替换最后一级扩展名，会得到
@@ -263,6 +280,35 @@ impl CachedDict {
                 })
                 .collect(),
             Self::Memory(dict) => dict.search_prefix_with_boundary(prefix, limit),
+        }
+    }
+
+    /// 前缀查找（带边界），**只取音节数不超过 `max_syllables` 的条目**。
+    ///
+    /// 拼音短输入严格档专用：过滤下推到词库层，使 top-N 直接是 N 条合格条目，而不是
+    /// 让注定被丢弃的词组吃光配额（实测 `d` 取 1000 条只剩 68 条单字）。
+    /// 判据见 [`prefix_syllable_keep`]，两个后端共用同一份。
+    pub fn search_prefix_with_boundary_syllable_capped(
+        &self,
+        prefix: &str,
+        limit: usize,
+        max_syllables: u32,
+    ) -> Vec<DictHit> {
+        match self {
+            Self::Mmap(reader) => reader
+                .search_prefix_syllable_capped(prefix, limit, max_syllables)
+                .into_iter()
+                .map(|e| DictHit {
+                    code: e.code,
+                    text: e.text,
+                    weight: e.weight,
+                    order: e.order,
+                    boundary: e.boundary,
+                })
+                .collect(),
+            Self::Memory(dict) => {
+                dict.search_prefix_with_boundary_syllable_capped(prefix, limit, max_syllables)
+            }
         }
     }
 

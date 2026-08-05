@@ -1060,11 +1060,49 @@ impl WdatReader {
         self.search_prefix_stats(prefix, limit).0
     }
 
+    /// 前缀查找，**只取音节数不超过 `max_syllables` 的条目**（拼音短输入严格档，判据见
+    /// [`crate::cached::prefix_syllable_keep`]）。
+    ///
+    /// ## 为什么必须下推到这一层，而不是查完再过滤
+    ///
+    /// 过滤放在调用方时，`limit` 配额会被**注定要丢弃**的条目吃光：实测单字母 `d` 取
+    /// 1000 条补全，过闸门的只有 68 条单字，其余 932 条白占名额 —— 且把上限提到 5000
+    /// 也没用（`MAX_COMPLETION_CANDIDATES` clamp 在 1000），只是让 `push_unique` 的
+    /// O(n²) 查重陪跑。下推之后 top-N 直接就是 N 条合格条目。
+    ///
+    /// ## 剪枝仍然正确
+    ///
+    /// 过滤与分支限界的终止判据**正交**：`node.bound` 是子树内最大 weight 的上界，
+    /// `bound < worst.key.weight` 意味着该子树内**所有**条目（合格与否）都劣于当前第
+    /// `limit` 名，故合格条目也不可能入选，`break` 依然安全。代价在效率而非正确性 ——
+    /// 合格条目稀疏时堆更晚填满、剪枝更晚生效，扫描量上升（这正是找齐 N 条所必需的）。
+    pub fn search_prefix_syllable_capped(
+        &self,
+        prefix: &str,
+        limit: usize,
+        max_syllables: u32,
+    ) -> Vec<DictEntry> {
+        self.search_prefix_inner(prefix, limit, Some(max_syllables))
+            .0
+    }
+
     /// 同 [`search_prefix`](Self::search_prefix)，另返回执行统计（剪枝效果验证用）。
     pub fn search_prefix_stats(
         &self,
         prefix: &str,
         limit: usize,
+    ) -> (Vec<DictEntry>, PrefixSearchStats) {
+        self.search_prefix_inner(prefix, limit, None)
+    }
+
+    /// `search_prefix` 系列的公共实现。`max_syllables = Some(n)` 时按
+    /// [`crate::cached::prefix_syllable_keep`] 过滤条目（不影响剪枝判据，见
+    /// [`search_prefix_syllable_capped`](Self::search_prefix_syllable_capped) 的论证）。
+    fn search_prefix_inner(
+        &self,
+        prefix: &str,
+        limit: usize,
+        max_syllables: Option<u32>,
     ) -> (Vec<DictEntry>, PrefixSearchStats) {
         let mut stats = PrefixSearchStats::default();
         let v = &self.main;
@@ -1113,6 +1151,13 @@ impl WdatReader {
                     };
                     slot += 1;
                     *entries_read += 1;
+                    // 音节数过滤（严格档）：`slot` 已自增、`entries_read` 已计数，
+                    // 二者描述的是「读到了第几条」，与是否入选无关，故在此之后才丢弃。
+                    if let Some(m) = max_syllables
+                        && !crate::cached::prefix_syllable_keep(boundary, m)
+                    {
+                        return;
+                    }
                     if heap.len() >= limit {
                         // 堆顶是最差的入选者：不严格优于它就丢弃——**先比较后分配**，
                         // 绝大多数条目走到这里即返回，不触碰 code/text 的 to_string()。

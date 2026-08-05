@@ -648,6 +648,44 @@ impl CodetableDict {
         results
     }
 
+    /// 前缀查找，只保留音节数不超过 `max_syllables` 的条目（内存路径对应
+    /// [`crate::datformat::WdatReader::search_prefix_syllable_capped`]，理由见那里）。
+    ///
+    /// ⚠️ **过滤必须在 `limit * 2` 提前中断之前施加**，否则那道中断会被不合格条目填满、
+    /// 提前跳出，合格条目一条都收不到 —— 与 wdat 侧「配额被丢弃项吃光」是同一个坑，
+    /// 只是换了个形态。
+    pub fn search_prefix_with_boundary_syllable_capped(
+        &self,
+        prefix: &str,
+        limit: usize,
+        max_syllables: u32,
+    ) -> Vec<crate::cached::DictHit> {
+        let mut results: Vec<crate::cached::DictHit> = Vec::new();
+        for (code, entries) in self.entries.range(prefix.to_string()..) {
+            if !code.starts_with(prefix) {
+                break;
+            }
+            for e in entries {
+                if !crate::cached::prefix_syllable_keep(e.boundary, max_syllables) {
+                    continue;
+                }
+                results.push(crate::cached::DictHit {
+                    code: code.clone(),
+                    text: e.text.clone(),
+                    weight: e.weight,
+                    order: e.order,
+                    boundary: e.boundary,
+                });
+            }
+            if results.len() >= limit * 2 {
+                break;
+            }
+        }
+        results.sort_by(|a, b| b.weight.cmp(&a.weight).then(a.order.cmp(&b.order)));
+        results.truncate(limit);
+        results
+    }
+
     /// 是否存在**严格长于** `prefix` 的编码。内存路径对应
     /// [`crate::datformat::WdatReader::has_longer_code`]，语义与之一致。
     ///
