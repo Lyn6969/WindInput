@@ -140,6 +140,16 @@ impl CodeCharSet {
         Ok(Self { all, leading: all })
     }
 
+    /// 内置默认集（`a-z`）是否含该字符。
+    ///
+    /// 供「引擎无码元集概念」的回落判定使用：那条路上每次按键都要判一次，
+    /// 为一个布尔值构造整张位图不划算。与 `default_alpha().contains(ch)` 恒等
+    /// （有测试锁住），改其中一个必须同时改另一个。
+    #[inline]
+    pub fn default_contains(ch: char) -> bool {
+        ch.is_ascii_lowercase()
+    }
+
     /// 该字符是否为码元（可进输入缓冲）。非 ASCII 恒 `false`。
     #[inline]
     pub fn contains(&self, ch: char) -> bool {
@@ -351,6 +361,24 @@ mod tests {
             );
             assert!(s.contains('a'), "回落后必须能打字，{:?}", bad);
         }
+    }
+
+    /// `default_contains` 是 `default_alpha().contains` 的免构造版本，两者必须恒等——
+    /// 它们分别服务于「引擎无码元集」与「引擎有码元集」两条路径，漂移就会让同一个字符
+    /// 在两条路上得到相反的判定。
+    #[test]
+    fn default_contains_matches_default_alpha() {
+        let s = CodeCharSet::default_alpha();
+        for c in 0u8..128 {
+            let ch = c as char;
+            assert_eq!(
+                CodeCharSet::default_contains(ch),
+                s.contains(ch),
+                "字符 {:?} 的两种默认判定不一致",
+                ch
+            );
+        }
+        assert!(!CodeCharSet::default_contains('中'));
     }
 
     #[test]

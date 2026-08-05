@@ -2696,6 +2696,38 @@ impl Coordinator {
         Some(KeyAction::Consumed)
     }
 
+    /// 该字符此刻能否进输入缓冲：缓冲为空时查**首码集**，否则查码元**全集**。
+    ///
+    /// 首码判据取 `input_buffer.is_empty()`，而不是「无候选且无已提交」——码是按
+    /// `input_buffer` 查询的，缓冲空就是新一轮码的开头；分步上屏后续打的第一个字符
+    /// 同样算首码，与引擎的查询语义保持一致。
+    ///
+    /// 默认码元集（`a-z`）下，字母恒为真、其余恒为假，与历史逐键等价。
+    pub(crate) fn can_enter_buffer(&self, state: &State, ch: char) -> bool {
+        if state.input_buffer.is_empty() {
+            self.engine_mgr.active_is_leading_char(ch)
+        } else {
+            self.engine_mgr.active_is_code_char(ch)
+        }
+    }
+
+    /// 非码元字符的处置：终结当前组合并输出该字符。
+    ///
+    /// ⚠️ **刻意不透传**。C++ 在中文模式下对字母键是**无条件吃**的
+    /// （`KeyEventSink.cpp` 的 `chinese_letter` 分支，仅 CapsLock 透传例外），
+    /// 此处返回 `PassThrough` 就构成「吃了再吐」：不补发 `WM_KEYDOWN` 的宿主
+    /// （EverEdit 一类）直接丢字符，全角态下还会出半角。故一律由本侧出字——
+    /// 铁律是「C++ 吃键集 ⊆ Rust 出字集」，见 project_fullwidth_eat_flip。
+    ///
+    /// 空组合时同样走这条路：`commit_highlight_then_char` 在无候选无已提交时
+    /// 只输出该字符（并按全角态转换），正是需要的行为。
+    pub(crate) fn reject_non_code_char(&self, state: &mut State, ch: char) -> KeyAction {
+        let has_comp = !state.input_buffer.is_empty()
+            || !state.committed_text.is_empty()
+            || !state.candidates.is_empty();
+        self.commit_highlight_then_char(state, ch, has_comp)
+    }
+
     /// 普通模式「顶屏高亮候选 + 输出字符」：把已转换前缀与当前高亮候选一并上屏，再接该字符。
     /// 小键盘 direct 语义共用此路（编码型缓冲里数字不是合法编码，故终结当前组合而非入缓冲；
     /// 但**不丢弃**用户已打的码——顶屏它，对齐主键盘标点键的既有行为）。
@@ -5512,6 +5544,16 @@ impl MessageHandler for Coordinator {
                 // 抛弃首 z、residual 进临时拼音（对齐 Go decideEngineDefaultZFallback）。须先于顶码/累积。
                 if let Some(act) = self.try_z_fallback(&mut state, ch) {
                     return act;
+                }
+                // 非码元字母（如 `input_chars = "a-x"` 下的 y/z）：不进缓冲，终结组合并出字。
+                //
+                // ★ **必须在 try_z_fallback 之后**。z 常同时是「非码元」（a-x 方案）与
+                // 「临时拼音触发键」，若先判非码元，z 会被当成普通字符顶上屏，临拼永远
+                // 进不去——同理，空缓冲下的模式激活在更上游的 try_activate_mode 已处理完。
+                //
+                // 默认码元集 a-z 下本判定恒不命中，与历史逐键等价（零回归）。
+                if !self.can_enter_buffer(&state, ch) {
+                    return self.reject_non_code_char(&mut state, raw);
                 }
                 // 顶码前记住「即将成为前缀」的缓冲及其显示首选：顶码上屏文本须与用户实际所见的
                 // 首候选一致——调频置顶 / shadow 在协调器层重排（apply_freq_rerank/apply_shadow），

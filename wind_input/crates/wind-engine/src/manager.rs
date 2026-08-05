@@ -880,6 +880,28 @@ impl EngineManager {
             .unwrap_or_else(wind_config::CodeCharSet::default_alpha)
     }
 
+    /// 该字符在活跃方案下是否为**码元**（可进输入缓冲）。
+    ///
+    /// 与 [`Self::active_input_chars`] 的区别：本方法不克隆整张位图。它在按键热路径上
+    /// 每键调用，而 `active_engine()` 本身已含一次 `String` 分配，不该再叠一次拷贝。
+    pub fn active_is_code_char(&self, ch: char) -> bool {
+        match self.active_engine().as_ref().and_then(|e| e.input_chars()) {
+            Some(cs) => cs.contains(ch),
+            None => wind_config::CodeCharSet::default_contains(ch),
+        }
+    }
+
+    /// 该字符在活跃方案下是否可作**首码**（缓冲为空时起头）。
+    ///
+    /// 典型用途：数字是码元（打得出 `Win10`）但不是首码——空缓冲下的数字键仍须是
+    /// 选词/透传，否则用户既选不了「第 1 个候选」也拿不回原生数字输入。
+    pub fn active_is_leading_char(&self, ch: char) -> bool {
+        match self.active_engine().as_ref().and_then(|e| e.input_chars()) {
+            Some(cs) => cs.contains_leading(ch),
+            None => wind_config::CodeCharSet::default_contains(ch),
+        }
+    }
+
     /// 活跃引擎的候选排序是否忽略权重（`base_sort = "natural"`）。供协调器合并短语后按同一维度
     /// 重排（natural 模式丢弃 weight，对齐引擎 `candidate::by_natural`）；未加载/其余引擎为 false。
     pub fn active_base_sort_ignores_weight(&self) -> bool {
