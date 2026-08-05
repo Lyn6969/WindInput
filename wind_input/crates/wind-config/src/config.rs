@@ -296,9 +296,14 @@ impl Default for SchemaConfig {
 pub struct EnglishGlobal {
     #[serde(default)]
     pub frequency: EnglishFrequency,
-    /// 空格上屏英文候选后**再补一个空格**。
+    /// 英文方案下上屏一个词后**再补一个空格**。
     ///
     /// 英文是词间带空格的语言，连续打词时每次上屏都要多按一次空格。开启后由输入法补上。
+    ///
+    /// 生效范围（消费点见 `english_appends_space` / `english_space_enabled`）：
+    /// - **所有选中方式**——空格 / 数字键 / 次三选键 / 修饰键选词 / 鼠标点选；
+    /// - **空格上屏原码**（打了词库里没有的词）；
+    /// - **不含**回车上屏原码（终结性动作）、标点键顶屏（会得到 `hello ,`）、顶码。
     #[serde(default)]
     pub commit_space: bool,
 }

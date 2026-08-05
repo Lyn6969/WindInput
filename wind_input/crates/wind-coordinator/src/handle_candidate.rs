@@ -1724,19 +1724,26 @@ impl Coordinator {
         })
     }
 
-    /// 英文候选上屏后是否补一个空格（`schema.english.commit_space`）。
+    /// 英文上屏后补空格的**方案口径**（`schema.english.commit_space` + 当前是英文方案）。
     ///
-    /// **两个判据缺一不可**，且它们查的不是同一件事：
-    /// - `source == English` —— 英文方案下也会出现短语等其它来源的候选，那些不该补空格；
-    /// - **当前方案是英文方案** —— `CandidateSource::English` 在混输、快捷输入、临时英文
-    ///   里同样出现，而那些场景用户正在写中文句子，插个英文词后面平白多个空格是错的。
+    /// 供**无候选可依**的出口使用——「空格上屏原码」上屏的是输入缓冲本身
+    /// （`CandidateSource::None`），拿不到来源，只能按方案判定。
+    ///
+    /// 判「当前方案是英文方案」这一条不可省：`CandidateSource::English` 在混输、快捷输入、
+    /// 临时英文里同样出现，而那些场景用户正在写中文句子，插个英文词后面平白多个空格是错的。
     ///
     /// ⚠️ 注意本项与同段的 `frequency.code_scope` **判据相反**：那个按**候选来源**生效
     /// （英文候选走到哪都该按同一口径记账），这个按**当前方案**。改动其一时别照着另一个抄。
-    fn english_appends_space(&self, source: CandidateSource) -> bool {
-        source == CandidateSource::English
-            && self.rt().config.schema.english.commit_space
-            && self.engine_mgr.active_is_english()
+    pub(crate) fn english_space_enabled(&self) -> bool {
+        self.rt().config.schema.english.commit_space && self.engine_mgr.active_is_english()
+    }
+
+    /// 英文**候选**上屏后是否补一个空格：方案口径之上再要求候选来源是英文。
+    ///
+    /// 多出来的 `source == English` 是给「英文方案下的非英文候选」用的——英文方案里同样会
+    /// 出现短语等其它来源的候选，那些不该补空格。
+    pub(crate) fn english_appends_space(&self, source: CandidateSource) -> bool {
+        source == CandidateSource::English && self.english_space_enabled()
     }
 
     /// 词频记账用的码——**码表与拼音/英文口径不同**，这是两类方案的语义差异。
@@ -1936,10 +1943,23 @@ impl Coordinator {
             // 变体候选（用户明选「齣」类 1对多变体）：末段用覆盖文本、前缀单独转换。
             // 普通候选保持**整体**转换——STPhrases 词级最长匹配可跨 committed/候选边界
             // 消歧（「一」+「出」→「一齣」），拆开会丢掉跨段词级命中。
-            let out = match &cand.s2t_override {
+            let mut out = match &cand.s2t_override {
                 Some(t) => format!("{}{}", self.maybe_s2t(state, &state.committed_text), t),
                 None => self.maybe_s2t(state, &final_simplified),
             };
+            // 英文补空格（`schema.english.commit_space`）：本分支是英文方案下选词的**唯一**
+            // 出口——空格 / 数字键 / 次三选键 / 修饰键选词 / 鼠标点选 / 数字键越界 overflow
+            // 六类触发全汇于此，故一处接线即可覆盖，不必按触发键分别接。
+            //
+            // 只在整串分支补、`partial`（分步提交）分支不补：那里上屏的是词的前半段，后面
+            // 还要接着打。英文引擎不设 `consumed_length`（恒 0）⇒ `partial` 恒 false，英文
+            // 实际走不到那儿，此处的不对称只是把「万一日后英文也分段」的语义先定死。
+            //
+            // 补在 s2t 之后：空格不参与简繁转换，且提前补会让 STPhrases 的词级最长匹配断在
+            // 空格上。
+            if self.english_appends_space(cand.source) {
+                out.push(' ');
+            }
             self.reset_pinyin_composition(state);
             self.notify_ui_hide();
             Self::commit_action(out, true)
@@ -2248,6 +2268,10 @@ impl Coordinator {
     /// `source` 由调用方按被顶出的候选如实传入，**不能一律当码表**：本函数的三条来路里有两条
     /// 是短语（普通短语顶码、`$CC` 纯文本命令顶码），谎报成码表会让短语的求值文本被写进 FREQ
     /// 表——那正是 `record_selection` 要拦掉的逐日新键。顶码机制本身归属码表不改变候选的来源。
+    ///
+    /// 英文补空格（`schema.english.commit_space`）**不接本函数**：顶码的触发条件是输入超过
+    /// 方案码长上限，而英文引擎的码长上限取自词典最长单词，实际打不到；且顶码后余码要继续
+    /// 组合，中间插空格会把一个词劈成两截。已判定为不可达 + 语义不合，不是漏接。
     pub(crate) fn commit_top_text(
         &self,
         state: &mut State,

@@ -2724,6 +2724,9 @@ impl Coordinator {
         if has_comp {
             self.notify_ui_hide();
         }
+        // 英文补空格（`schema.english.commit_space`）**刻意不接这里**：本函数的用途是
+        // 「顶掉高亮候选 + 紧接着上屏这个字符」，补了会得到 `hello ,` 这种断开的标点。
+        // 不是漏接。
         out.push_str(&if state.full_width {
             to_full_width(&ch.to_string())
         } else {
@@ -5387,7 +5390,18 @@ impl MessageHandler for Coordinator {
                         -1,
                         CommitSource::RawInput,
                     );
-                    let text = self.maybe_s2t(&state, &format!("{}{}", prefix, raw_code));
+                    let mut text = self.maybe_s2t(&state, &format!("{}{}", prefix, raw_code));
+                    // 英文补空格（`schema.english.commit_space`）：本分支上屏的是**输入缓冲
+                    // 原码**（词库里没有的自造词），无候选可依，故用方案口径
+                    // `english_space_enabled` 而非候选口径。与选中候选补空格一致——两者都是
+                    // 「一个英文词打完了」，行为分叉才是意外。
+                    //
+                    // ⚠️ 下方 VK_RETURN 分支代码与本块**逐行同形**，但**刻意不补**：回车是
+                    // 终结性动作（多伴随换行/提交意图），语义与「接着打下一个词」相反。改这里
+                    // 时别顺手把那边也改了。
+                    if self.english_space_enabled() {
+                        text.push(' ');
+                    }
                     state.input_buffer.clear();
                     state.input_buffer_cased.clear();
                     state.candidates.clear();
@@ -5432,6 +5446,9 @@ impl MessageHandler for Coordinator {
                         -1,
                         CommitSource::RawInput,
                     );
+                    // ⚠️ 本块与上方 VK_SPACE 空码分支逐行同形，唯一差别是**不补英文空格**
+                    // （`schema.english.commit_space`）：回车是终结性动作，多伴随换行/提交
+                    // 意图，与空格「接着打下一个词」的语义相反。这是刻意的不对称，不是漏接。
                     let text = self.maybe_s2t(&state, &format!("{}{}", prefix, raw_code));
                     state.input_buffer.clear();
                     state.input_buffer_cased.clear();
@@ -6845,25 +6862,60 @@ impl MessageHandler for Coordinator {
                 state.input_buffer.clone(),
             )
         };
-        let (text, source, freq_code) = if tk == keymap::VK_SPACE {
+        // ⚠️ 这是一条**独立于按键路径的上屏通路**（DLL 侧 TSF 排水 / 顶码延迟提交发起），
+        // 补空格必须在此单独接线——只改 `commit_selected` 会得到「键盘空格补了、排水路径没补」
+        // 的间歇性不一致。第四元 `append_space` 按分支显式给出，不在末尾统一判断：四个分支
+        // 的答案各不相同，统一判断迟早把它们抹平。
+        let (text, source, freq_code, append_space) = if tk == keymap::VK_SPACE {
             match state.candidates.first() {
-                Some(c) => cand_meta(c),
-                None => raw(),
+                // 空格选首选：候选口径（与 `commit_selected` 同）。
+                Some(c) => {
+                    let (t, s, f) = cand_meta(c);
+                    let ap = self.english_appends_space(s);
+                    (t, s, f, ap)
+                }
+                // 空格退回原码：无候选可依，方案口径（与 VK_SPACE 空码分支同）。
+                None => {
+                    let (t, s, f) = raw();
+                    (t, s, f, self.english_space_enabled())
+                }
             }
         } else if tk == keymap::VK_RETURN {
-            raw()
+            // 回车恒不补：终结性动作，与按键路径的 VK_RETURN 分支同口径。
+            let (t, s, f) = raw();
+            (t, s, f, false)
         } else if (keymap::VK_1..=keymap::VK_9).contains(&tk) {
             match state.candidates.get((tk - keymap::VK_1) as usize) {
-                Some(c) => cand_meta(c),
-                None => raw(),
+                // 数字键选词：候选口径（「所有选中方式一律补」）。
+                Some(c) => {
+                    let (t, s, f) = cand_meta(c);
+                    let ap = self.english_appends_space(s);
+                    (t, s, f, ap)
+                }
+                // 数字键越界退回原码：**不补**。按键路径下此情形走
+                // `handle_overflow_number_key`，候选为空时直接吞键不上屏——本分支是 DLL 侧
+                // 独有的兜底，没有对应的键盘行为可对齐，保守不补。
+                None => {
+                    let (t, s, f) = raw();
+                    (t, s, f, false)
+                }
             }
         } else {
-            raw()
+            // 未知触发键：不可归因，不补。
+            let (t, s, f) = raw();
+            (t, s, f, false)
         };
         state.input_buffer.clear();
         state.candidates.clear();
         // 与 handle_key_event 的选词路径保持一致：记录词频用于学习排序
         self.record_selection(&freq_code, &text, source);
+        // 补空格**必须在记账之后**：`record_selection` 记的是词本身，带上尾空格会写出
+        // 「hello 」这种与读取端（`apply_freq_rerank` 按候选文本查）永远对不上的词频键。
+        let text = if append_space {
+            format!("{text} ")
+        } else {
+            text
+        };
         // 上屏即组合结束：复位首显延迟状态，使下一组合首帧重新延迟到 reflow 后的权威坐标，
         // 避免其锁定到本组合旧坐标（"上屏后立即输入候选窗错位"主场景）。
         self.reset_first_show();
