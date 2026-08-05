@@ -629,6 +629,18 @@ impl MixedEngine {
 }
 
 impl Engine for MixedEngine {
+    /// 码元字符集取**主码表子引擎**的。
+    ///
+    /// ⚠️ 必须显式代理，不能沿用 trait 默认的 `None`：默认值会让协调器回落历史行为，
+    /// 于是混输方案里配的 `input_chars` 完全不生效，且**毫无报错**——正是本仓
+    /// 「配置就位、消费点不可达」那一类静默失效。
+    ///
+    /// 只取 primary 是刻意的：`input_chars` 约束的是「哪些键进码表缓冲」，拼音次引擎
+    /// 有自己的音节合法性判定，不受本集约束（对齐 `max_code_len` 同样只取 primary）。
+    fn input_chars(&self) -> Option<&wind_config::CodeCharSet> {
+        self.primary.input_chars()
+    }
+
     /// 热插拔扩展词库：转发到主/次子引擎（码表子引擎承载 codetable-extra 层）。
     fn set_dict_enabled(&self, dict_id: &str, enabled: bool) -> bool {
         let a = self.primary.set_dict_enabled(dict_id, enabled);

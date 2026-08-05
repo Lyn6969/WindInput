@@ -108,6 +108,15 @@ pub trait Engine: Send + Sync {
         0
     }
 
+    /// 码元字符集（码表引擎返回其配置集；拼音等无「码元」概念的引擎返回 `None`）。
+    ///
+    /// 供协调器判定一次按键是进输入缓冲还是作标点/选词/透传。`None` 表示该引擎不参与
+    /// 这套判定，调用方须回落到历史行为（字母累积），**不可当成空集**——空集会让该
+    /// 方案一个字也打不出来。见 `docs/design/codetable-input-chars.md`。
+    fn input_chars(&self) -> Option<&wind_config::CodeCharSet> {
+        None
+    }
+
     /// 候选排序是否**忽略权重**（`[engine.codetable].base_sort = "natural"`）：码表引擎在 natural
     /// 模式下返回 true。供协调器合并短语后按**同一维度**重排——否则协调器仍以 weight 优先，会与
     /// 引擎的 `candidate::by_natural`（纯 base_order→natural_order、忽略权重）发散。其余引擎默认

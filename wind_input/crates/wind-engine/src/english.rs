@@ -48,6 +48,10 @@ impl Engine for EnglishEngine {
         self.inner.set_dict_enabled(dict_id, enabled)
     }
 
+    fn input_chars(&self) -> Option<&wind_config::CodeCharSet> {
+        Engine::input_chars(&self.inner)
+    }
+
     fn max_code_length(&self) -> usize {
         Engine::max_code_length(&self.inner)
     }

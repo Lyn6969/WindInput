@@ -97,9 +97,15 @@ pub struct CodeTableSpec {
     /// 基础排序："weight"（默认）/ "natural"（字根序/inner_order）。见 docs/redesign/frequency.md。
     #[serde(default)]
     pub base_sort: String,
-    /// 输入码字符集，如 "a-x" / "a-x/" / "a-z"。空=回退全局/默认。
+    /// 输入码字符集，如 "a-x" / "a-x/" / "a-z0-9"。空=回退全局/默认（`a-z`）。
     #[serde(default)]
     pub input_chars: String,
+    /// 可作**首码**的字符集（`input_chars` 的子集）。空=与 `input_chars` 相同。
+    ///
+    /// 典型用途：数字要能作码元（打得出 `Win10`），但不能起头——空缓冲下的数字键是
+    /// 选词/透传，若它同时是首码，用户就永远选不了「第 1 个候选」也拿不回原生数字输入。
+    #[serde(default)]
+    pub leading_chars: String,
 
     // ── 方案内联行为覆盖（None=回落全局 schema.codetable；Some=覆盖）──
     /// 顶码上屏（超满码长取前 N 码首选上屏）。

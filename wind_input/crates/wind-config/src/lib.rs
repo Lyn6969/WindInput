@@ -4,6 +4,7 @@
 
 pub mod app_compat;
 pub mod change_hook;
+pub mod code_charset;
 pub mod config;
 pub mod config_schema;
 pub mod dir_var;
@@ -13,6 +14,7 @@ pub mod schema;
 pub mod startup_trace;
 pub mod variant;
 
+pub use code_charset::{CodeCharSet, CodeCharSetError};
 pub use config::{
     CodetableGlobal, Config, LayoutIntent, MixGlobal, ModeIndicatorStyle, PinyinFuzzy,
     PinyinGlobalConfig, PreeditDisplay, TopCommitMode, ZKeyAction,

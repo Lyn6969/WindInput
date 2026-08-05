@@ -78,6 +78,13 @@ pub struct CodeTableEngine {
     max_code_length: usize,
     opts: CommitOptions,
     dm: Arc<DictManager>,
+    /// 码元字符集（`[engine.codetable].input_chars` / `.leading_chars`）。
+    ///
+    /// 引擎自身**不消费**它——本引擎对码元字符零假设（`convert` 是纯字符串键、
+    /// 码长一律 `chars().count()`）。放在这里是因为它与 `max_code_length` 同性质：
+    /// 方案级引擎固定参数，由协调器经 `EngineManager::active_input_chars()` 按方案取用。
+    /// 挂在引擎上，方案切换时自然跟着换，不会像全局快照那样读到别的方案的集合。
+    charset: wind_config::CodeCharSet,
 }
 
 impl CodeTableEngine {
@@ -90,7 +97,16 @@ impl CodeTableEngine {
             max_code_length,
             opts,
             dm,
+            // 默认 `a-z`，与历史硬编码 `VK_A..=VK_Z` 逐键等价。构建方按方案配置
+            // 再 `with_charset` 覆盖——如此所有既有调用点（含测试）无需改动。
+            charset: wind_config::CodeCharSet::default_alpha(),
         }
+    }
+
+    /// 注入码元字符集。缺省即内置默认 `a-z`。
+    pub fn with_charset(mut self, charset: wind_config::CodeCharSet) -> Self {
+        self.charset = charset;
+        self
     }
 
     /// 是否存在比 `input` 更长的后继编码（避免把长码精确匹配的前缀误当全码上屏）。
@@ -312,6 +328,10 @@ impl Engine for CodeTableEngine {
 
     fn max_code_length(&self) -> usize {
         self.max_code_length
+    }
+
+    fn input_chars(&self) -> Option<&wind_config::CodeCharSet> {
+        Some(&self.charset)
     }
 
     /// natural 模式（`base_sort = "natural"`）忽略权重：协调器据此对齐 `by_natural` 重排。

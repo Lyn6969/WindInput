@@ -560,6 +560,13 @@ pub struct CodetableGlobal {
     /// 详见 `Coordinator::try_activate_mode` 的三重身份裁决。
     #[serde(default)]
     pub z_key_action: String,
+    /// 码元字符集（哪些字符可进输入缓冲）。空=内置默认 `a-z`。
+    /// 解析与回落见 [`crate::code_charset::CodeCharSet`]。
+    #[serde(default)]
+    pub input_chars: String,
+    /// 可作**首码**的字符集（`input_chars` 的子集）。空=与 `input_chars` 相同。
+    #[serde(default)]
+    pub leading_chars: String,
     /// 码表调频（统一开关，取代旧 user_frequency）。
     #[serde(default)]
     pub frequency: CodetableFrequency,
@@ -587,6 +594,11 @@ impl Default for CodetableGlobal {
             single_code_complete: false,
             z_key_repeat: false,
             z_key_action: String::new(),
+            // 空串 = 未设置 → `CodeCharSet::new` 回落内置默认 `a-z`，与历史硬编码
+            // `VK_A..=VK_Z` 逐键等价。这里刻意不写 "a-z" 字面量：让「未配置」在
+            // 结构体零值与 TOML 缺省两处是同一个值，避免两套默认源不一致。
+            input_chars: String::new(),
+            leading_chars: String::new(),
             frequency: CodetableFrequency::default(),
             auto_phrase: AutoPhraseConfig::default(),
         }
@@ -628,6 +640,15 @@ impl CodetableGlobal {
         }
         if let Some(v) = o.z_key_repeat {
             out.z_key_repeat = v;
+        }
+        // 码元字符集是 `String` 而非 `Option`，故「未设置」由**空串**表达（与上面那些
+        // tri-state 字段不同）。非空才覆盖——否则方案没写这项时会把全局基线抹成空串，
+        // 落到 `CodeCharSet::new` 又被回落成 `a-z`，全局配的字符集就被静默丢弃了。
+        if !o.input_chars.is_empty() {
+            out.input_chars = o.input_chars.clone();
+        }
+        if !o.leading_chars.is_empty() {
+            out.leading_chars = o.leading_chars.clone();
         }
         if let Some(v) = &o.z_key_action {
             out.z_key_action = v.clone();

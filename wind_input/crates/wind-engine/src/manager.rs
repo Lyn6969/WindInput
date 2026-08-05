@@ -867,6 +867,19 @@ impl EngineManager {
             .unwrap_or(0)
     }
 
+    /// 活跃引擎的码元字符集（`[engine.codetable].input_chars` / `.leading_chars`）。
+    ///
+    /// 未加载引擎、或引擎无「码元」概念（拼音等，`Engine::input_chars` 返回 `None`）时，
+    /// 回落内置默认 `a-z`——**绝不回落空集**，那会让该方案一个字也打不出来。
+    /// 对协调器而言「无码元集概念」与「默认码元集」行为相同，故此处合并为一个返回值。
+    ///
+    /// 混输取主码表子引擎的集合（见 `MixedEngine::input_chars`）。
+    pub fn active_input_chars(&self) -> wind_config::CodeCharSet {
+        self.active_engine()
+            .and_then(|e| e.input_chars().cloned())
+            .unwrap_or_else(wind_config::CodeCharSet::default_alpha)
+    }
+
     /// 活跃引擎的候选排序是否忽略权重（`base_sort = "natural"`）。供协调器合并短语后按同一维度
     /// 重排（natural 模式丢弃 weight，对齐引擎 `candidate::by_natural`）；未加载/其余引擎为 false。
     pub fn active_base_sort_ignores_weight(&self) -> bool {
@@ -2409,11 +2422,21 @@ impl EngineManager {
                         .with_default_weight(default_weight),
                 ));
             }
-            Some(Box::new(CodeTableEngine::new(
-                mcl,
-                commit_opts,
-                Arc::new(dm),
-            )))
+            // 码元字符集与上屏行为同源于 `eff`（全局基线 + 方案 [engine.codetable] 折叠），
+            // 故方案里写 input_chars / leading_chars 与写 top_code_commit 走的是同一条路。
+            let charset =
+                wind_config::CodeCharSet::new(&eff.input_chars, &eff.leading_chars, schema_id);
+            if !charset.is_default_alpha() {
+                info!(
+                    "schema {} 码元集：{:?}（首码 {:?}）",
+                    schema_id,
+                    charset.chars().into_iter().collect::<String>(),
+                    charset.leading_chars().into_iter().collect::<String>()
+                );
+            }
+            Some(Box::new(
+                CodeTableEngine::new(mcl, commit_opts, Arc::new(dm)).with_charset(charset),
+            ))
         }
     }
 
