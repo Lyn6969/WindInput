@@ -2353,6 +2353,16 @@ impl Coordinator {
 
         // 重新构建候选（会重新应用 Shadow）并重绘
         self.update_candidates(&mut state);
+        // 用户看到的那一半判据。「记录删掉了、但同文的系统词条目还在」与「根本没删到」
+        // 在屏幕上完全同形（都是点了没反应），只有把这一行和上面的「删前命中」并排看
+        // 才分得开——单看任何一条都会误诊。
+        if matches!(op, CandidateOp::Delete) {
+            debug!(
+                "candidate_op(Delete): 重建后候选仍在={} text={}",
+                state.candidates.iter().any(|c| c.text == word),
+                word
+            );
+        }
         self.notify_ui_update(&state);
     }
 
@@ -2385,6 +2395,10 @@ impl Coordinator {
                 cand.group_code.as_str()
             };
             store.set_phrase_enabled(pcode, raw, false)?;
+            debug!(
+                "delete_candidate: 分支=短语禁用 code={} text={}",
+                pcode, raw
+            );
             self.rebuild_phrases();
             return Ok(());
         }
@@ -2398,14 +2412,60 @@ impl Coordinator {
             } else {
                 cand.code.as_str()
             };
-            return if cand.meta.is_user_dict {
+            let is_user = cand.meta.is_user_dict;
+            // 删前删后各查一次记录。**没有这两个值，三种结局在日志里长得一模一样**：
+            // `redb` 的 `remove` 对不存在的 key 静默成功，而 key 由 schema+code+text 三段
+            // 拼成，任一段错配的表现都是「点了删除、界面毫无变化、词还在词库里」。
+            let hit = |s: &str, c: &str| -> bool {
+                let recs = if is_user {
+                    store.get_user_words(s, c)
+                } else {
+                    store.get_temp_words(s, c)
+                };
+                recs.unwrap_or_default().iter().any(|r| r.text == cand.text)
+            };
+            let before = hit(&sid, dcode);
+            let r = if is_user {
                 store.remove_user_word(&sid, dcode, &cand.text)
             } else {
                 store.remove_temp_word(&sid, dcode, &cand.text)
             };
+            debug!(
+                "delete_candidate: 分支={} schema={} code={}（候选码={} 输入码={}）text={} 删前命中={} 结果={:?}",
+                if is_user { "用户词" } else { "临时词" },
+                sid,
+                dcode,
+                cand.code,
+                code,
+                cand.text,
+                before,
+                r.is_ok()
+            );
+            // 没命中就把「记录到底在哪个桶」探出来，省掉下一轮复现。错配来源有二：
+            // schema 段（混输下 `write_data_schema_id` / `data_schema_id` / active 自身解析
+            // 各不相同）与 code 段（双拼、前缀补全、展示域带空格时候选码≠存储码）。
+            if !before {
+                let dsid = self.engine_mgr.data_schema_id(schema);
+                for s in [sid.as_str(), dsid.as_str(), schema] {
+                    for c in [dcode, code] {
+                        if (s != sid || c != dcode) && hit(s, c) {
+                            debug!(
+                                "delete_candidate: ⚠ 键错配——记录实际在 schema={} code={}（本次删的是 schema={} code={}）",
+                                s, c, sid, dcode
+                            );
+                        }
+                    }
+                }
+            }
+            return r;
         }
         // 候选调整（系统词软隐藏）按 data_schema_id 归属（拼音族折叠）。
-        store.delete_shadow(&self.engine_mgr.data_schema_id(schema), code, &cand.text)
+        let sh = self.engine_mgr.data_schema_id(schema);
+        debug!(
+            "delete_candidate: 分支=shadow 隐藏 schema={} code={} text={}（该候选未被判为用户词/临时词）",
+            sh, code, cand.text
+        );
+        store.delete_shadow(&sh, code, &cand.text)
     }
 
     /// 候选词操作热键匹配（对齐 Go matchCandidateActionKey，但 `0` 扩展为第 10 候选）。
