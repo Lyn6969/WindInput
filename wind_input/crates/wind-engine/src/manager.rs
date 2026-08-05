@@ -2000,6 +2000,17 @@ impl EngineManager {
         engine.map(|e| e.enumerate(limit)).unwrap_or_default()
     }
 
+    /// 指定方案「进入即展示」浏览态的**呈现上限**（`Engine::browse_display_limit`）。
+    /// 内存查已加载引擎表，无 IO（区别于 `effective_codetable`，那个每次都读 TOML）。
+    /// 未加载 / 无浏览语义返回 None = 不限。
+    pub fn browse_display_limit_of(&self, schema_id: &str) -> Option<usize> {
+        self.engines
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(schema_id)
+            .and_then(|e| e.browse_display_limit())
+    }
+
     /// 反查 `(code, text)` 在该方案词典里的音节边界；方案未加载/非拼音/查不到均返回 0。
     ///
     /// **不做推断**（区别于 `generate_word_pinyin`）：拿现成的码点查取真值。

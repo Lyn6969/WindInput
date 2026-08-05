@@ -153,19 +153,23 @@ impl Engine for CodeTableEngine {
     /// 遵循精确匹配模式：`single_code_input`（关前缀枚举）时最多补 **1 条**——与空码补全
     /// `single_code_complete`「取首位后续码」同语义；非精确模式才枚举首页（`limit` 条）。
     fn enumerate(&self, limit: usize) -> Vec<Candidate> {
-        let n = if self.opts.single_code_input {
-            1
-        } else {
-            limit
-        };
+        // 全量取数，**不在此按 `single_code_input` 截断**——精确匹配模式的「只展示一条」
+        // 经 `browse_display_limit` 交给调用方在 shadow 之后施加（见 trait 文档）。
+        // 代价为零：`search_prefix` 无 early-stop，n=1 与 n=limit 同样是全表 materialize
+        // 后截断，取多取少的遍历量一样。
         self.dm
-            .search_prefix("", n)
+            .search_prefix("", limit)
             .into_iter()
             .map(|mut c| {
                 c.source = CandidateSource::CodeTable;
                 c
             })
             .collect()
+    }
+
+    fn browse_display_limit(&self) -> Option<usize> {
+        // 精确匹配模式（关前缀枚举）下浏览态只展示一条，与空码补全「取首位后续码」同语义。
+        self.opts.single_code_input.then_some(1)
     }
 
     fn convert(&self, input: &str, max_candidates: usize) -> anyhow::Result<ConvertResult> {

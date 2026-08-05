@@ -1161,7 +1161,8 @@ impl Coordinator {
     /// 词条操作的启用态/删除文案按候选来源动态化（对齐 Go window_mouse 菜单状态规则）：
     /// - 置顶/前移：首项禁用；后移：末项禁用；拼音普通候选禁全部调位（无稳定位置语义）。
     /// - 删除：短语→「禁用短语」（软删可恢复）；用户词/临时词→真删；系统词→「隐藏候选」（shadow）。
-    /// - overlay 模式（临拼/临英/特殊等，编码不在 input_buffer）：仅提供复制。
+    /// - 特殊模式（快符等）：词条操作**照常提供**，编码取其独立缓冲、归属取其引用方案。
+    /// - 无词库落点者（临拼/临英/混输/网址，以及特殊模式的空码浏览态）：仅提供复制。
     pub(crate) fn show_candidate_menu(&self, page_local: usize, x: i32, y: i32) {
         use wind_ui::manager::MenuItemSpec as M;
         let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
@@ -1175,25 +1176,22 @@ impl Coordinator {
         }
         let cand = state.candidates[idx].clone();
         let word = cand.text.clone();
-        let code = state.input_buffer.clone();
         let total = state.candidates.len();
-        let overlay = state.active.is_some();
+        let scope = self.candidate_op_scope(&state);
         drop(state);
 
         let op = |o: CandidateOp| MenuKind::Op(o);
-        // overlay 模式编码不走 input_buffer（临拼等各持独立缓冲），shadow/词库操作无处落键——
-        // 仅保留复制，不再整个菜单拒开；调整/删除待各 overlay 语义定型后接入。
-        let items = if overlay || code.is_empty() {
-            vec![M::leaf("复制", MenuKind::Copy, true, false)]
-        } else {
-            let schema = self.engine_mgr.active_schema_id();
+        // 有词库落点才给词条操作。无落点的两类状态——没有独立词库归属的 overlay（临拼/临英/
+        // 混输/网址，编码各持独立缓冲且无处落键）与空码浏览态（特殊模式 show_all_on_enter，
+        // 读端 apply_shadow_in 对空码直接 return，写了也永不生效）——仅保留复制。
+        // 判据与写端 `candidate_op` 同源，见 `candidate_op_scope`。
+        let items = if let Some(scope) = scope {
             let cand_id = (!cand.id.is_empty()).then(|| cand.id.as_str());
-            let has_rule = self.shadow_has_rule(&schema, &code, &word, cand_id);
+            let has_rule = self.shadow_has_rule(&scope.schema, &scope.code, &word, cand_id);
             // 拼音普通候选禁调位：动态权重 + 衰减软置前与 pin 位置语义冲突；命令候选仍可调。
-            let is_pinyin = matches!(
-                self.engine_mgr.current_engine_type(),
-                Some(wind_engine::EngineType::Pinyin)
-            );
+            // 引擎类型来自 scope：特殊模式问的是它引用的方案，照抄主方案会在「主方案拼音 +
+            // 快符码表」时整体误禁调位。
+            let is_pinyin = matches!(scope.engine_type, Some(wind_engine::EngineType::Pinyin));
             let group_member = candidate_is_group_member(&cand);
             let movable = !(is_pinyin && !cand.is_command) && !group_member;
             let (delete_label, delete_enabled) = candidate_delete_menu(&cand);
@@ -1212,6 +1210,8 @@ impl Coordinator {
                 M::separator(),
                 M::leaf("复制", MenuKind::Copy, true, false),
             ]
+        } else {
+            vec![M::leaf("复制", MenuKind::Copy, true, false)]
         };
         self.mark_menu_open(page_local, word);
         // 候选右键菜单在光标处向下弹出（above=false，y_bottom 不使用）。

@@ -3247,21 +3247,27 @@ impl Coordinator {
 
     /// macOS：计算当前页每候选的右键菜单禁用位并经 push 通道下发（CmdCandidateMenuFlags 0x0505）。
     /// 位定义与 Swift CandidatePanel 对齐：0x01 上移 / 0x02 下移 / 0x04 置顶 / 0x08 删除 / 0x10 恢复默认。
-    /// 语义对齐进程内 `show_candidate_menu`（共用 candidate_delete_menu 判定）：首项禁上移/置顶、
-    /// 末项禁下移；拼音普通候选禁全部调位；删除按候选来源判定；无 shadow 规则禁恢复默认。
+    /// 语义对齐进程内 `show_candidate_menu`（共用 candidate_delete_menu / candidate_op_scope 判定）：
+    /// 首项禁上移/置顶、末项禁下移；拼音普通候选禁全部调位；删除按候选来源判定；
+    /// 无 shadow 规则禁恢复默认；无词库落点整页全禁。
     /// 注：macOS 端「删除」文案固定，来源动态文案（禁用短语/删除用户词…）待协议扩展后接入。
     #[cfg(target_os = "macos")]
     pub(crate) fn push_candidate_menu_flags(&self, state: &State, start: usize, end: usize) {
         if !self.push_server.has_clients() || start >= end {
             return;
         }
-        let schema = self.engine_mgr.active_schema_id();
-        let code = &state.input_buffer;
         let total = state.candidates.len();
-        let is_pinyin = matches!(
-            self.engine_mgr.current_engine_type(),
-            Some(wind_engine::EngineType::Pinyin)
-        );
+        // 无词库落点（无独立归属的 overlay / 空码浏览态）：整页全禁，只留复制——与 Windows 侧
+        // `show_candidate_menu` 的「仅复制」分支同一判据（见 `candidate_op_scope`）。
+        let Some(scope) = self.candidate_op_scope(state) else {
+            let flags = vec![0x1Fu8; end.min(total).saturating_sub(start)];
+            self.push_server
+                .push_to_active(&wind_ipc::codec::encode_candidate_menu_flags(&flags));
+            return;
+        };
+        let schema = scope.schema;
+        let code = scope.code;
+        let is_pinyin = matches!(scope.engine_type, Some(wind_engine::EngineType::Pinyin));
         let mut flags = Vec::with_capacity(end - start);
         for idx in start..end.min(total) {
             let cand = &state.candidates[idx];
@@ -3282,7 +3288,7 @@ impl Coordinator {
                 f |= 0x08;
             }
             let cand_id = (!cand.id.is_empty()).then(|| cand.id.as_str());
-            if code.is_empty() || !self.shadow_has_rule(&schema, code, word, cand_id) {
+            if !self.shadow_has_rule(&schema, &code, word, cand_id) {
                 f |= 0x10; // 无 shadow 规则：禁恢复默认
             }
             flags.push(f);

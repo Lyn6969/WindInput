@@ -6679,3 +6679,322 @@ fn normal_input_uppercase_does_not_leak_into_next_composition() {
         other => panic!("回车应上屏原码，实际: {:?}", other),
     }
 }
+
+// ── 特殊模式（快符等）的候选词条操作 ─────────────────────────────────────────
+//
+// 回归背景：特殊方案接上词库管理时只接了**读端**（`apply_shadow_in` / `record_selection_in`
+// 按 `effective_data_schema` 归属），三条写侧通路仍停在旧假设上——右键菜单被 `overlay`
+// 判据整块拒开、`candidate_op` 因 `input_buffer` 恒空而首行 return、删除热键按 ModeKind
+// 整类屏蔽。**同一能力的多条通路只接一条等于没接**，且失效完全静默。
+
+/// 主方案**拼音** + 快符引用**五笔**：这个错配组合是回归的关键。
+/// 若引擎类型或归属方案任一处照抄主方案，症状分别是「快符候选被当拼音候选禁掉调位」
+/// 与「shadow 规则写进 pinyin 桶、读的却是 wubi86 桶」——后者记账看着成功、顺序永不动。
+fn special_op_fixture(
+    tag: &str,
+    show_all: bool,
+) -> (
+    std::sync::Arc<Coordinator>,
+    std::path::PathBuf,
+    std::sync::Arc<wind_store::Store>,
+) {
+    let store_path = std::env::temp_dir().join(format!("wind_special_op_{}.redb", tag));
+    let _ = std::fs::remove_file(&store_path);
+    let store = std::sync::Arc::new(wind_store::Store::open(&store_path).unwrap());
+    let mut cfg = config_with("pinyin");
+    cfg.schema.special_modes = vec![wind_config::config::SpecialModeConfig {
+        id: "qsym".into(),
+        trigger_keys: vec!["backslash".into()],
+        schema: "wubi86".into(),
+        show_all_on_enter: show_all,
+        ..Default::default()
+    }];
+    let coord = Coordinator::new_headless_with_store(cfg, Some(&data_dir()), store.clone());
+    (coord, store_path, store)
+}
+
+fn enter_special_mode_via_backslash(coord: &Coordinator) {
+    let act = coord.handle_key_event(&key_event(0xDC, EVENT_KEY_DOWN));
+    assert!(
+        matches!(act, KeyAction::UpdateComposition { .. }),
+        r"\ 应进入特殊模式，实际: {:?}",
+        act
+    );
+}
+
+/// 作用域解析：快符的落点是「它引用的方案 + 它自己的编码缓冲」。
+/// 菜单可用性与写端准入共用此判据，故这一条同时锁住两条通路。
+#[test]
+fn special_mode_candidate_op_scope_uses_own_schema_and_buffer() {
+    if !has_schemas() {
+        eprintln!("跳过：缺少 schema");
+        return;
+    }
+    let (coord, path, _store) = special_op_fixture("scope", false);
+
+    assert_eq!(
+        coord.debug_candidate_op_scope(),
+        None,
+        "未输入时无候选也无落点"
+    );
+
+    enter_special_mode_via_backslash(&coord);
+    assert_eq!(
+        coord.debug_candidate_op_scope(),
+        None,
+        "特殊模式空码态不应有落点：读端 apply_shadow_in 首行即对空码 return，放行只会写进永不被读的规则"
+    );
+
+    press_letter(&coord, 'a');
+    assert_eq!(
+        coord.debug_candidate_op_scope(),
+        Some(("wubi86".to_string(), "a".to_string())),
+        "快符落点应为「引用方案 wubi86 + special_buffer」，而非主方案 pinyin + input_buffer"
+    );
+
+    let _ = std::fs::remove_file(&path);
+}
+
+/// 删除：候选真消失、列表不被清空、规则落在快符方案桶且不污染主方案桶。
+#[test]
+fn special_mode_candidate_delete_writes_to_own_schema_bucket() {
+    if !has_schemas() {
+        eprintln!("跳过：缺少 schema");
+        return;
+    }
+    use wind_ui::manager::CandidateOp;
+    let (coord, path, store) = special_op_fixture("delete", false);
+    enter_special_mode_via_backslash(&coord);
+    press_letter(&coord, 'a');
+
+    let before = coord.debug_page_texts();
+    assert!(
+        !before.is_empty(),
+        "快符输入 a 应有候选（否则本用例失去意义）"
+    );
+    let target = before[0].clone();
+
+    coord.debug_candidate_op(CandidateOp::Delete, 0);
+    let after = coord.debug_page_texts();
+
+    // ★ 这条锁的是「重建走对了路径」：主路径 update_candidates 读 input_buffer，而快符下它
+    //   恒为空——走错的表现不是「界面没刷新」，是候选窗当场被清空。
+    assert!(
+        !after.is_empty(),
+        "删除后候选列表不应被清空（重建须走 update_special_candidates）"
+    );
+    assert!(!after.contains(&target), "被删的 '{}' 不应再出现", target);
+
+    // ★ 读写同源：规则必须落在快符方案桶。写进主方案桶的表现同样是「删了没反应」——
+    //   因为读端查的是 wubi86 桶。两种失败在屏幕上完全同形，只有查桶才分得开。
+    let special_bucket = store.get_shadow_rules("wubi86", "a").unwrap();
+    assert!(
+        special_bucket
+            .as_ref()
+            .is_some_and(|r| r.deleted.contains(&target)),
+        "shadow 规则应写入快符方案桶 wubi86/a，实际: {:?}",
+        special_bucket
+    );
+    assert!(
+        store
+            .get_shadow_rules("pinyin", "a")
+            .unwrap()
+            .is_none_or(|r| !r.deleted.contains(&target)),
+        "主方案 pinyin 桶不应被污染"
+    );
+
+    let _ = std::fs::remove_file(&path);
+}
+
+/// 调位：快符引用的是码表方案，即便主方案是拼音也应可置顶。
+/// 此前 `current_engine_type()` 问的是主方案，这里会被整体误禁。
+#[test]
+fn special_mode_candidate_move_top_uses_own_engine_type() {
+    if !has_schemas() {
+        eprintln!("跳过：缺少 schema");
+        return;
+    }
+    use wind_ui::manager::CandidateOp;
+    let (coord, path, _store) = special_op_fixture("movetop", false);
+    enter_special_mode_via_backslash(&coord);
+    press_letter(&coord, 'a');
+
+    let before = coord.debug_page_texts();
+    assert!(
+        before.len() >= 2,
+        "快符输入 a 应有 ≥2 个候选（否则置顶无从验证），实际: {:?}",
+        before
+    );
+    let second = before[1].clone();
+
+    coord.debug_candidate_op(CandidateOp::MoveTop, 1);
+    assert_eq!(
+        coord.debug_page_texts().first(),
+        Some(&second),
+        "快符（码表方案）候选应可置顶——引擎类型须按快符引用的方案取，而非主方案 pinyin"
+    );
+
+    let _ = std::fs::remove_file(&path);
+}
+
+/// 空码浏览态（`show_all_on_enter`）：**必须支持**词条操作，且规则要真的被读回来。
+///
+/// 这是真机报「快符右键仍只有复制」的那个场景：`max_code_length=1` +
+/// `auto_commit_at_full` 的方案敲一码即上屏，浏览态是用户唯一能右键的时机。
+/// 空码是合法 shadow 键位（key = `"{schema}\0{code}"`），读写两端都按候选非空放行。
+#[test]
+fn special_mode_show_all_browse_state_supports_candidate_op() {
+    if !has_schemas() {
+        eprintln!("跳过：缺少 schema");
+        return;
+    }
+    use wind_ui::manager::CandidateOp;
+    let (coord, path, store) = special_op_fixture("browse", true);
+    enter_special_mode_via_backslash(&coord);
+
+    let before = coord.debug_all_candidate_texts();
+    assert!(!before.is_empty(), "show_all_on_enter 应枚举出候选");
+    assert_eq!(
+        coord.debug_candidate_op_scope(),
+        Some(("wubi86".to_string(), String::new())),
+        "浏览态落点＝快符方案 + 空码；返回 None 的表现就是右键只剩「复制」"
+    );
+
+    let target = before[0].clone();
+    coord.debug_candidate_op(CandidateOp::Delete, 0);
+    let after = coord.debug_all_candidate_texts();
+    assert!(!after.is_empty(), "浏览态删除后不应清空候选");
+    assert!(
+        !after.contains(&target),
+        "浏览态删除的 '{}' 不应再出现",
+        target
+    );
+
+    // ★ 规则必须落在「快符方案 + 空码」桶，且能被浏览态重新枚举时读回——只写不读的表现是
+    //   「当场看着删掉了、重进模式又回来了」。
+    let rec = store.get_shadow_rules("wubi86", "").unwrap();
+    assert!(
+        rec.as_ref().is_some_and(|r| r.deleted.contains(&target)),
+        "shadow 规则应写入 wubi86 + 空码桶，实际: {:?}",
+        rec
+    );
+
+    let _ = std::fs::remove_file(&path);
+}
+
+/// 浏览态的调整必须**跨重新进入**存活：退出再进快符，被隐藏的候选不能复活。
+/// 这一条锁的是读端——`update_special_candidates` 的空码分支若不调 `apply_shadow_in`，
+/// 上一条测试照样全绿（规则确实写进了 store），只是永远没人读。
+#[test]
+fn special_mode_browse_state_shadow_survives_reenter() {
+    if !has_schemas() {
+        eprintln!("跳过：缺少 schema");
+        return;
+    }
+    use wind_ui::manager::CandidateOp;
+    let (coord, path, _store) = special_op_fixture("reenter", true);
+    enter_special_mode_via_backslash(&coord);
+
+    let before = coord.debug_all_candidate_texts();
+    assert!(!before.is_empty(), "show_all_on_enter 应枚举出候选");
+    let target = before[0].clone();
+    coord.debug_candidate_op(CandidateOp::Delete, 0);
+
+    // Esc 退出特殊模式，再按 \ 重新进入 → 重新枚举一遍码表
+    coord.handle_key_event(&key_event(0x1B, EVENT_KEY_DOWN));
+    enter_special_mode_via_backslash(&coord);
+
+    let reentered = coord.debug_all_candidate_texts();
+    assert!(!reentered.is_empty(), "重进后应重新枚举出候选");
+    assert!(
+        !reentered.contains(&target),
+        "重进浏览态后被隐藏的 '{}' 不应复活（空码分支须应用 shadow）",
+        target
+    );
+
+    let _ = std::fs::remove_file(&path);
+}
+
+/// 其余 overlay 不随快符一起放开：临拼没有独立词库落点（`effective_data_schema` 对它
+/// 返回 None，2026-08-04 用户拍板），放行会让规则静默落回主方案桶。
+#[test]
+fn temp_pinyin_overlay_still_has_no_candidate_op_scope() {
+    if !has_schemas() {
+        eprintln!("跳过：缺少 schema");
+        return;
+    }
+    let mut cfg = config_with("wubi86");
+    cfg.input.temp_pinyin.enabled = true;
+    cfg.input.temp_pinyin.trigger_keys = vec!["z".into()];
+    let coord = Coordinator::new_headless(cfg, Some(&data_dir()));
+
+    press_letter(&coord, 'z'); // 空缓冲按 z 进入临拼
+    for c in "hao".chars() {
+        press_letter(&coord, c);
+    }
+    assert!(
+        !coord.debug_all_candidate_texts().is_empty(),
+        "临拼 hao 应有候选（否则本用例失去意义）"
+    );
+    assert_eq!(
+        coord.debug_candidate_op_scope(),
+        None,
+        "临拼无独立词库落点，右键仍应只给复制"
+    );
+}
+
+/// 精确匹配模式 + 进入即展示：浏览态只显示 1 条，隐藏它之后应**补上下一条**而非整屏空白。
+///
+/// 回归 2026-08-05 真机：`enumerate` 在引擎内按 `single_code_input` 先截到 1 条，协调器
+/// 再 apply_shadow 过滤 → 0 条。「截断 → 过滤」这个次序把「隐藏一条」变成了「清空列表」。
+/// 不变量：**从池中择 N 条必须发生在过滤之后**。
+#[test]
+fn special_mode_browse_exact_mode_hides_first_shows_next() {
+    if !has_schemas() {
+        eprintln!("跳过：缺少 schema");
+        return;
+    }
+    use wind_ui::manager::CandidateOp;
+    let store_path = std::env::temp_dir().join("wind_special_browse_exact.redb");
+    let _ = std::fs::remove_file(&store_path);
+    let store = std::sync::Arc::new(wind_store::Store::open(&store_path).unwrap());
+    let mut cfg = config_with("pinyin");
+    // wubi86 是普通方案（非 hidden），继承全局的精确匹配开关。
+    cfg.schema.codetable.single_code_input = true;
+    cfg.schema.special_modes = vec![wind_config::config::SpecialModeConfig {
+        id: "qsym".into(),
+        trigger_keys: vec!["backslash".into()],
+        schema: "wubi86".into(),
+        show_all_on_enter: true,
+        ..Default::default()
+    }];
+    let coord = Coordinator::new_headless_with_store(cfg, Some(&data_dir()), store);
+
+    let act = coord.handle_key_event(&key_event(0xDC, EVENT_KEY_DOWN));
+    assert!(
+        matches!(act, KeyAction::UpdateComposition { .. }),
+        r"\ 应进入特殊模式，实际: {:?}",
+        act
+    );
+
+    let first = coord.debug_all_candidate_texts();
+    assert_eq!(
+        first.len(),
+        1,
+        "精确匹配模式的浏览态应只展示 1 条，实际: {:?}",
+        first
+    );
+    let hidden = first[0].clone();
+
+    coord.debug_candidate_op(CandidateOp::Delete, 0);
+    let after = coord.debug_all_candidate_texts();
+    assert_eq!(
+        after.len(),
+        1,
+        "隐藏首条后应补上下一条（截断须在 shadow 之后），实际: {:?}",
+        after
+    );
+    assert_ne!(after[0], hidden, "补上的应是下一条，不该还是被隐藏的那条");
+
+    let _ = std::fs::remove_file(&store_path);
+}

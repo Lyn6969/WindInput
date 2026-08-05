@@ -16,6 +16,21 @@ use wind_keys::keymap;
 use wind_store::freq::FreqRecord;
 use wind_ui::manager::CandidateOp;
 
+/// 候选词条操作（置顶 / 前移 / 后移 / 删除 / 恢复默认）的作用域快照。
+/// 由 [`Coordinator::candidate_op_scope`] 解析，菜单构建、写端、macOS 禁用位三处共用。
+pub(crate) struct CandidateOpScope {
+    /// 词库 / shadow 归属方案 id（**原始 id，未经 `data_schema_id` 折叠**——Delete 分支
+    /// 还要靠它走 `write_data_schema_id` 的按来源分流）。
+    pub schema: String,
+    /// 该模式的编码缓冲：主输入路 = `input_buffer`；特殊模式 = `special_buffer`。
+    pub code: String,
+    /// 出这批候选的引擎类型（调位判据用）；引擎未加载时为 None。
+    pub engine_type: Option<wind_engine::EngineType>,
+    /// 特殊模式标记：重建候选须走 `update_special_candidates`——主路径的 `update_candidates`
+    /// 读 `input_buffer`，在此模式下恒空，会把候选列表整个清掉。
+    pub special: bool,
+}
+
 /// 候选统一层级排序（合并引擎候选 + 短语后的呈现序，与所选 `base_sort` 模式**同维度**）：
 /// ① 非模糊优先于模糊；② 精确优先于前缀补全（`is_prefix`）；③ 完整匹配优先于子短语（`is_partial`）；
 /// ④ 同层内编码精确匹配优先（`is_exact_code`）；⑤ 按权重降序（`ignore_weight` 时跳过）；
@@ -400,6 +415,13 @@ impl Coordinator {
     /// 候选词条操作（测试/诊断用）
     pub fn debug_candidate_op(&self, op: CandidateOp, page_local: usize) {
         self.candidate_op(op, page_local);
+    }
+
+    /// 当前状态下词条操作的作用域 `(归属方案, 编码)`；`None` = 右键菜单只给复制（测试/诊断用）。
+    /// 菜单可用性与写端准入共用同一判据，故断言此函数等于同时锁住两条通路。
+    pub fn debug_candidate_op_scope(&self) -> Option<(String, String)> {
+        let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        self.candidate_op_scope(&state).map(|s| (s.schema, s.code))
     }
 
     /// 首次加载候选上限（对齐 Go：短前缀小批量分级加载，长前缀近全量）。
@@ -996,13 +1018,20 @@ impl Coordinator {
     }
 
     /// 同 [`Self::apply_shadow`]，但可指定**生效方案**（特殊模式用）。
+    ///
+    /// ⚠️ 守卫是 `candidates.is_empty()` 而**不是** `code.is_empty()`：空码是合法键位
+    /// （shadow key = `"{schema}\0{code}"`，空 code 与任何非空码互不冲突），特殊模式的
+    /// 「进入即展示」浏览态正是**空码 + 有候选**。此前按空码 return，导致那批候选的调整
+    /// 规则写得进去却永远读不出来；而 `max_code_length=1` + `auto_commit_at_full` 的快符
+    /// 方案敲一码即上屏，浏览态是用户**唯一**能右键的时机，等于该方案完全不能调候选。
+    /// 主路径不受影响：空码时候选本就为空，首行即 return，零额外开销。
     pub(crate) fn apply_shadow_in(
         &self,
         schema_override: Option<&str>,
         candidates: &mut Vec<Candidate>,
         code: &str,
     ) {
-        if code.is_empty() {
+        if candidates.is_empty() {
             return;
         }
         let Some(store) = &self.store else {
@@ -1610,6 +1639,71 @@ impl Coordinator {
             Some(ModeKind::Special(idx)) => self.special_schema(idx),
             _ => None,
         }
+    }
+
+    /// 候选词条操作（右键菜单 / Ctrl+数字热键 / macOS 禁用位）的**作用域**；
+    /// 返回 `None` = 当前状态不支持词库操作，调用方只保留复制。
+    ///
+    /// # 为什么三个调用方必须共用这一个函数
+    ///
+    /// 菜单可用性与写端落点若各判各的，错配是**完全静默**的。快符模式此前正是如此：
+    /// 菜单被 `overlay` 判据整块拒开（只剩复制），而写端 `candidate_op` 又因
+    /// `input_buffer` 恒空而首行 return——两处独立地失效，修好任一处都看不出效果。
+    ///
+    /// # 放行集合刻意与 [`Self::effective_data_schema`] 绑死
+    ///
+    /// 那里正是读端（`apply_shadow_in` / `apply_freq_rerank_in` / `record_selection_in`）
+    /// 取归属方案的地方。「落点存在」与「操作可行」本就是同一件事；若在此另写一份
+    /// 「哪些模式允许」的清单，两份判据迟早漂移成「写进 A、读的是 B」——记账看着成功，
+    /// 候选顺序永远不动。
+    ///
+    /// # 空 `code`：主输入路拒绝，特殊模式放行
+    ///
+    /// 主输入路空码本就无候选，无从操作。特殊模式开 `show_all_on_enter` 时**空码也会枚举出
+    /// 候选**，这批候选必须可调——`max_code_length=1` + `auto_commit_at_full` 的快符方案敲
+    /// 一码即上屏，浏览态是用户**唯一**能右键的时机。空码是合法的 shadow 键位，读端
+    /// [`Self::apply_shadow_in`] 已按候选非空（而非码非空）放行，读写两端就此对齐。
+    pub(crate) fn candidate_op_scope(&self, state: &State) -> Option<CandidateOpScope> {
+        // 没有候选就没有作用域可言（如 show_all_on_enter 关闭时刚进入特殊模式的空白态）。
+        if state.candidates.is_empty() {
+            return None;
+        }
+        let (schema, code, special) = match state.active {
+            None => (
+                self.engine_mgr.active_schema_id(),
+                state.input_buffer.clone(),
+                false,
+            ),
+            // 特殊模式（快符 / 生僻字等自定义码表方案）：编码在 special_buffer，归属是它
+            // 自己引用的方案——与读端同源取值，见上方 effective_data_schema。
+            Some(ModeKind::Special(_)) => (
+                self.effective_data_schema(state)?,
+                state.special_buffer.clone(),
+                true,
+            ),
+            // 其余 overlay（临拼 / 临英 / 混输 / 网址）没有独立词库落点：`effective_data_schema`
+            // 对它们返回 None（2026-08-04 用户拍板，见其文档），放行会静默落回主方案。
+            // 新增模式时**先补落点、再放行**，顺序不能反。
+            _ => return None,
+        };
+        // 空码只在特殊模式（浏览态）合法；主输入路空码无候选。
+        if code.is_empty() && !special {
+            return None;
+        }
+        // 调位判据要问的是「**出这批候选的**引擎是不是拼音」。`current_engine_type()` answers
+        // 的是主方案——特殊模式下照抄它，会在「主方案是拼音 + 快符是码表」时把本该可调位的
+        // 快符候选整体误禁（反之亦然）。`loaded_engine_type` 正是为 overlay 分流准备的。
+        let engine_type = if special {
+            self.engine_mgr.loaded_engine_type(&schema)
+        } else {
+            self.engine_mgr.current_engine_type()
+        };
+        Some(CandidateOpScope {
+            schema,
+            code,
+            engine_type,
+            special,
+        })
     }
 
     /// 英文候选上屏后是否补一个空格（`schema.english.commit_space`）。
@@ -2278,14 +2372,20 @@ impl Coordinator {
     }
 
     /// 候选词条操作（右键菜单）：调整 Shadow 规则并即时重排重绘。
-    /// code 取当前输入码（state.input_buffer）；按方案隔离。
+    /// 编码与归属方案取自 [`Self::candidate_op_scope`]（主输入路 = 输入码 + active 方案；
+    /// 特殊模式 = 其编码缓冲 + 它引用的方案），按方案隔离。
     /// 删除按候选来源分流（对齐 Go handleCandidateDelete）：短语软禁用 / 用户词・临时词真删 /
     /// 系统词 shadow 隐藏。菜单已按同规则灰显，此处判定为 defensive（热键路径也经此）。
     pub(crate) fn candidate_op(&self, op: CandidateOp, page_local: usize) {
         let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
-        if state.candidates.is_empty() || state.input_buffer.is_empty() {
+        if state.candidates.is_empty() {
             return;
         }
+        // 作用域即准入：拿不到落点（无词库归属的 overlay / 空码浏览态）就什么都不做，
+        // 与菜单侧「只给复制」是同一个判据的两副面孔。
+        let Some(scope) = self.candidate_op_scope(&state) else {
+            return;
+        };
         let (start, end) = self.page_range(&state);
         let idx = start + page_local;
         if idx >= end || idx >= state.candidates.len() {
@@ -2293,8 +2393,12 @@ impl Coordinator {
         }
         let cand = state.candidates[idx].clone();
         let word = cand.text.clone();
-        let code = state.input_buffer.clone();
-        let schema = self.engine_mgr.active_schema_id();
+        let CandidateOpScope {
+            schema,
+            code,
+            engine_type,
+            special,
+        } = scope;
 
         // $SS/$AA 展开成员：顺序/成员由短语定义决定，拒绝一切 shadow/删除双轨漂移。
         if crate::handle_menu::candidate_is_group_member(&cand) {
@@ -2305,12 +2409,10 @@ impl Coordinator {
             CandidateOp::MoveTop | CandidateOp::MoveUp | CandidateOp::MoveDown
         );
         // 拼音普通候选禁调位（无稳定位置语义，pin 与衰减软置前冲突）；命令候选例外。
+        // 引擎类型取自 scope（特殊模式问的是它引用的方案，不是主方案）。
         if is_move
             && !cand.is_command
-            && matches!(
-                self.engine_mgr.current_engine_type(),
-                Some(wind_engine::EngineType::Pinyin)
-            )
+            && matches!(engine_type, Some(wind_engine::EngineType::Pinyin))
         {
             return;
         }
@@ -2344,8 +2446,16 @@ impl Coordinator {
             }
         }
 
-        // 重新构建候选（会重新应用 Shadow）并重绘
-        self.update_candidates(&mut state);
+        // 重新构建候选（会重新应用 Shadow）并重绘。
+        // **必须按模式分派**：主路径的 `update_candidates` 读 `input_buffer`，而特殊模式下它
+        // 恒为空 —— 在快符里走主路径的后果不是「不刷新」而是候选窗当场被清空。
+        if special {
+            // 返回值是「全码策略请求自动上屏」的意向，此处**刻意丢弃**：编码一个字没变，
+            // 用户只是在调整候选顺序，凭空上屏是错的。
+            let _ = self.update_special_candidates(&mut state);
+        } else {
+            self.update_candidates(&mut state);
+        }
         // 用户看到的那一半判据。「记录删掉了、但同文的系统词条目还在」与「根本没删到」
         // 在屏幕上完全同形（都是点了没反应），只有把这一行和上面的「删前命中」并排看
         // 才分得开——单看任何一条都会误诊。
@@ -2484,7 +2594,8 @@ impl Coordinator {
     }
 
     /// Ctrl+数字 / Ctrl+Shift+数字 置顶/删除当前页候选（对齐 Go handle_key_event 候选热键段）。
-    /// 仅中文模式 + 正常码表输入态（有候选 + 有输入码 + 非独占模式）生效；命中即消费按键。
+    /// 仅中文模式 + 有候选 + 有词库落点（主输入路或特殊模式，见 `candidate_op_scope`）生效；
+    /// 命中即消费按键。
     /// 复用 `candidate_op`（页内序号驱动的 shadow 改写 + 重排重绘）。
     pub(crate) fn handle_candidate_action_hotkey(&self, data: &KeyEventData) -> Option<KeyAction> {
         use wind_ipc::protocol::{MOD_CTRL, MOD_SHIFT};
@@ -2505,13 +2616,14 @@ impl Coordinator {
         } else {
             return None;
         };
-        // 门控：仅正常码表输入态。独占模式 input_buffer 必空，故下方判定亦自然排除之。
+        // 门控：中文态 + 有候选 + 有词库落点。落点判定交给 `candidate_op_scope`，与右键菜单
+        // 同源——此前这里写的是 `state.active.is_some()` 整类屏蔽，于是特殊模式接上词库管理
+        // 之后，右键能删而热键仍然无效（同一能力的两条通路各判各的）。
         {
             let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
             if !state.chinese_mode
-                || state.active.is_some()
                 || state.candidates.is_empty()
-                || state.input_buffer.is_empty()
+                || self.candidate_op_scope(&state).is_none()
             {
                 return None;
             }

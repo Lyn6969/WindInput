@@ -168,6 +168,18 @@ impl Coordinator {
             {
                 let raw = self.engine_mgr.enumerate_with(&schema, 100);
                 state.candidates = self.finalize_candidates(raw, "");
+                // 浏览态**同样吃候选调整**（空码作为 shadow 键位，见 `apply_shadow_in`）。
+                // 这批候选往往是用户唯一能右键的对象：`max_code_length=1` +
+                // `auto_commit_at_full` 的快符方案敲一码就上屏，没有非空码的候选态。
+                // 不接这一句的话，右键改了顺序、重进模式照旧——规则写进了 store 却没人读。
+                let owner = self.effective_data_schema(state);
+                self.apply_shadow_in(owner.as_deref(), &mut state.candidates, "");
+                // 呈现上限（精确匹配模式只展示一条）**必须在 shadow 之后**施加。
+                // 反过来（引擎取数时就截到 1 条）的后果：用户隐藏掉那一条，池子里明明还有
+                // 下一条，屏幕却整个空白——「截断 → 过滤」把候选调整变成了删掉整个列表。
+                if let Some(n) = self.engine_mgr.browse_display_limit_of(&schema) {
+                    state.candidates.truncate(n);
+                }
             }
             return None;
         }
