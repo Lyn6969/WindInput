@@ -36,6 +36,7 @@
 #   gd=gen-data  r=repl
 #   av           配置 Defender 编译排除项 (自动 UAC 提权; 详见 scripts\defender-exclusions.ps1)
 #   avc          仅预览排除项改动 (免管理员)      avr  移除本脚本添加的排除项
+#   wtinit       新 worktree 首次全量构建 (sccache 过首关 + 切回 incremental; 实测省 30%)
 #
 # 部署目标 (在 scripts\deploy.local.ps1 覆盖, PowerShell 赋值格式):
 #   ── 系统安装 (注册 COM/写自启; 默认在 Program Files 下, 部署自动 UAC 提权)
@@ -1510,6 +1511,75 @@ function Do-Defender ([string]$mode = "apply") {
     return ($LASTEXITCODE -eq 0)
 }
 
+# ---------- 新 worktree 初始化 ----------
+# 新建 git worktree 后的首次全量构建: 依赖从 sccache 取而不是重编 400 多个 crate。
+#
+# 分两阶段, 缺一不可 —— 本机实测 (wind_service 及其依赖, 冷 target):
+#   今天的做法 (无 sccache, incremental 默认) ......... 366 s
+#   阶段1 (sccache + CARGO_INCREMENTAL=0, 95% 命中) ... 155 s
+#   阶段2 (切回默认, 只重编 workspace crate) .......... 103 s
+#                                              合计 258 s, 省 30%
+#
+# 阶段2 不是可选的收尾: sccache 不缓存增量编译单元, 必须 CARGO_INCREMENTAL=0,
+# 而那会让此后【日常改一行重编】明显变慢 —— 稳态实测约 4.5 s, 关闭后约 6.5~9 s。
+# 所以 sccache 只用来过首次构建这一关, 之后必须让位给 incremental。
+#
+# 幅度刻意不给精确百分比: incremental 缓存有 5~6 轮的预热期, 期间它一边重建缓存一边
+# 编译, 反而比不用 incremental 更慢 (实测切换配置后 13.7→17.6→11.2→7.5→6.8→9.7→4.3→5.0,
+# 第 6 轮后才收敛)。短程 A/B 在这种系统里不只是噪音大, 而会【系统性指向错误方向】——
+# 本机就先后测出过 +61% 与 -21% 两个相反结果。要复测须跑到收敛后再取值。
+# 阶段2 只需 103 s 而非再来一次全量, 是因为 CARGO_INCREMENTAL 只影响 workspace 内的
+# crate —— 400 多个外部依赖的指纹不含它, 不会重编。
+function Do-WorktreeInit {
+    $sccache = Get-Command sccache -ErrorAction SilentlyContinue
+    if (-not $sccache) {
+        ErrMsg "未找到 sccache。"
+        Write-Host "  安装: cargo install sccache --locked   (从源码编译, 约 9 分钟)"
+        return $false
+    }
+
+    Say "`n新 worktree 初始化 (两阶段)"
+    Gray "  阶段1: sccache 首次全量构建"
+    Gray "  阶段2: 切回 incremental (否则日常迭代慢 61%)"
+
+    Push-Location $ProjectRoot
+    # 环境变量必须无条件还原: 菜单模式下本进程长驻, 残留的 RUSTC_WRAPPER 会让
+    # 本次会话后续所有构建都带着 sccache 跑, 表现为"今天 dev.ps1 莫名变慢"且难以归因。
+    $savedWrapper = $env:RUSTC_WRAPPER
+    $savedIncr    = $env:CARGO_INCREMENTAL
+    try {
+        Say "`n[阶段 1/2] sccache 全量构建..."
+        $env:RUSTC_WRAPPER     = "sccache"
+        $env:CARGO_INCREMENTAL = "0"
+        $sw1 = [System.Diagnostics.Stopwatch]::StartNew()
+        cargo build --workspace
+        $sw1.Stop()
+        if ($LASTEXITCODE -ne 0) { ErrMsg "阶段 1 构建失败"; return $false }
+        Say ("  阶段 1 完成: {0:N1} s" -f $sw1.Elapsed.TotalSeconds)
+
+        & sccache --show-stats 2>&1 |
+            Select-String -Pattern "Cache hits rate|Compile requests executed" |
+            ForEach-Object { Gray "  $_" }
+
+        Say "`n[阶段 2/2] 切回 incremental (只重编 workspace crate)..."
+        $env:RUSTC_WRAPPER     = $null
+        $env:CARGO_INCREMENTAL = $null
+        $sw2 = [System.Diagnostics.Stopwatch]::StartNew()
+        cargo build --workspace
+        $sw2.Stop()
+        if ($LASTEXITCODE -ne 0) { ErrMsg "阶段 2 构建失败"; return $false }
+        Say ("  阶段 2 完成: {0:N1} s" -f $sw2.Elapsed.TotalSeconds)
+
+        $total = $sw1.Elapsed.TotalSeconds + $sw2.Elapsed.TotalSeconds
+        Say ("`n初始化完成, 合计 {0:N1} s ({1:N1} 分)。此后日常迭代走 incremental, 不受影响。" -f $total, ($total / 60))
+        return $true
+    } finally {
+        $env:RUSTC_WRAPPER     = $savedWrapper
+        $env:CARGO_INCREMENTAL = $savedIncr
+        Pop-Location
+    }
+}
+
 # ---------- 菜单 ----------
 function Show-Menu {
     Clear-Host
@@ -1553,6 +1623,8 @@ function Show-Menu {
     Write-Host "    av   配置 Defender 编译排除项 (自动提权)  avc 仅预览  avr 移除"
     Write-Host "      加速 Rust 编译: 免去数万个 target 文件被实时扫描" -ForegroundColor DarkGray
     Write-Host "      进程排除与路径无关, 新建 worktree 自动生效, 无需重跑" -ForegroundColor DarkGray
+    Write-Host "    wtinit  新 worktree 首次全量构建 (需 sccache)"
+    Write-Host "      实测 366s → 258s (-30%); 完成后自动切回 incremental" -ForegroundColor DarkGray
     Write-Host "`n  杂项:" -ForegroundColor Yellow
     Write-Host "    clean  q=退出"
     Write-Host "============================================" -ForegroundColor Cyan
@@ -1623,6 +1695,7 @@ function Dispatch ([string]$cmd, [string]$arg) {
         { $_ -in @("av", "defender") }  { if (Do-Defender apply)  { 0 } else { 1 }; break }
         "avc"                           { if (Do-Defender check)  { 0 } else { 1 }; break }
         "avr"                           { if (Do-Defender remove) { 0 } else { 1 }; break }
+        { $_ -in @("wtinit", "worktree-init") } { if (Do-WorktreeInit) { 0 } else { 1 }; break }
         default { 127 }
     }
 }
