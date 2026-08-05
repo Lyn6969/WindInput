@@ -418,7 +418,10 @@ impl MenuKind {
 }
 
 /// 菜单项规格（由协调器构建）。支持勾选态与子菜单。
-#[derive(Debug, Clone)]
+///
+/// `PartialEq` 供弹出菜单的增量重绘用：`popup_menu::reconcile` 靠它判断某一层
+/// 的内容是否真的变了，没变就不重绘、更不重排 z 序。详见 [`crate::popup_menu`]。
+#[derive(Debug, Clone, PartialEq)]
 pub struct MenuItemSpec {
     pub label: String,
     pub kind: MenuKind,

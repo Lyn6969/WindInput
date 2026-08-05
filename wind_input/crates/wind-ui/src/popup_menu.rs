@@ -72,6 +72,43 @@ impl Level {
     }
 }
 
+/// 已提交到某个窗口的一层渲染态（reconcile 的增量基线）。
+///
+/// 记录「上一帧这个窗口里画的是什么、摆在哪」，下一帧据此跳过无变化的层。
+/// `None` 语义是「该窗口当前不可见」（初始态 / 被 hide 过），必须重新 show。
+#[derive(Clone, PartialEq)]
+struct LevelRender {
+    items: Vec<MenuItemSpec>,
+    selected: usize,
+    /// 窗口几何 (x, y, w, h)，与 `LayeredWindow::show` 的入参同口径。
+    geom: (i32, i32, u32, u32),
+}
+
+/// 增量判定：`prev`（上一帧基线，None=窗口不可见）对 `want`（本帧目标）需要做什么。
+///
+/// 返回 `(需要重绘, 需要重新摆位)`，两者独立：
+/// - **重绘**（`update`）只推像素，不碰 z 序——高亮变化走这条路；
+/// - **摆位**（`show`）会 `SetWindowPos(HWND_TOPMOST)`，**副作用是把窗口提到 topmost 组最前**，
+///   所以只在首显或几何真变了时才做。
+///
+/// 这个拆分是本模块修掉「子菜单闪烁」的关键：过去 reconcile 每帧无条件对每一层
+/// 都 `show()` 一次，于是每帧的 z 序都要经历「一级在最上 → 二级在最上 → 三级在最上」
+/// 的中间态。三级子菜单因右侧空间不足翻到左侧、压在一级面板上时，这个中间态就是
+/// 肉眼可见的一帧遮挡（DWM 异步合成，故不是每次都能撞上）。
+fn plan_render(prev: Option<&LevelRender>, want: &LevelRender) -> (bool, bool) {
+    match prev {
+        // 窗口当前不可见：必须画满并摆位。
+        None => (true, true),
+        Some(p) => {
+            // 尺寸变化同时意味着 buffer 要重画（旧像素尺寸对不上）。
+            let repaint = p.items != want.items
+                || p.selected != want.selected
+                || (p.geom.2, p.geom.3) != (want.geom.2, want.geom.3);
+            (repaint, p.geom != want.geom)
+        }
+    }
+}
+
 fn is_separator(it: &MenuItemSpec) -> bool {
     matches!(it.kind, MenuKind::Separator)
 }
@@ -143,8 +180,12 @@ impl MenuState {
         self.dirty = true;
     }
 
-    /// 鼠标悬停到 (层 k, 行 r)：更新高亮、收起更深层、必要时展开子菜单。
-    /// 取消第 k 层高亮（仅当 k 为最深层，避免误关已展开子菜单）。鼠标移出条目时调用。
+    /// 取消第 k 层高亮。**仅当 k 为最深层时才生效**：更浅的层意味着它的某个子菜单
+    /// 正开着，那个父项必须保持高亮以指示展开路径，灭掉它会让菜单看起来断了链。
+    ///
+    /// 三个调用点：鼠标落到不可选条目（禁用项）、落到面板内非条目处、移出菜单外。
+    /// 只改 `selected`，不动 `levels`——灭高亮从不收起子菜单。
+    /// `levels` 为空时 `k + 1 == len` 不成立，短路保护了下面的索引。
     fn clear_hover(&mut self, k: usize) {
         if k + 1 == self.levels.len() && self.levels[k].selected != NONE_SEL {
             self.levels[k].selected = NONE_SEL;
@@ -152,6 +193,7 @@ impl MenuState {
         }
     }
 
+    /// 鼠标悬停到 (层 k, 行 r)：更新高亮、收起更深层、必要时展开子菜单。
     fn hover(&mut self, k: usize, r: usize) {
         let (ok, sub) = match self.levels[k].items.get(r) {
             Some(it) => (selectable(it), is_submenu(it)),
@@ -285,6 +327,10 @@ pub struct PopupMenu {
     scale: f32,
     state: Rc<RefCell<MenuState>>,
     visible: bool,
+    /// 与 `windows` 同下标的渲染基线：`rendered[k]` = 窗口 k 上一帧画了什么、摆在哪，
+    /// `None` = 该窗口当前不可见。reconcile 据此跳过无变化的层，见 [`plan_render`]。
+    /// 任何会改变像素但不改变 items/selected 的因素（主题、DPI）必须清空它。
+    rendered: Vec<Option<LevelRender>>,
     /// 根面板锚点（已钳制到工作区）
     anchor: (i32, i32),
     bg: [u8; 4],
@@ -327,6 +373,7 @@ impl PopupMenu {
             scale,
             state,
             visible: false,
+            rendered: Vec::new(),
             anchor: (0, 0),
             bg: BG,
             fg: FG,
@@ -355,7 +402,19 @@ impl PopupMenu {
             w.register_mouse(self.state.clone());
             self.windows.push(w);
         }
+        // 基线与窗口池同长（新窗口默认不可见 → None → 首次必然重绘并摆位）。
+        if self.rendered.len() < self.windows.len() {
+            self.rendered.resize(self.windows.len(), None);
+        }
         Ok(())
+    }
+
+    /// 作废全部渲染基线：下一次 reconcile 会全量重绘并重新摆位。
+    /// 用于「像素会变但 items/selected 不变」的场合（主题切换、DPI 变化、菜单重新弹出）。
+    fn invalidate_rendered(&mut self) {
+        for slot in &mut self.rendered {
+            *slot = None;
+        }
     }
 
     /// DPI 动态化：按显示点所在显示器实时取缩放，变化则更新字号并按新缩放重解析主题几何。
@@ -456,6 +515,10 @@ impl PopupMenu {
             self.radius = 6.0 * s;
             self.shadow = None;
         }
+        // 颜色/字号/几何全变了，但 items 与 selected 一个都没动——增量判据看不见这种变化，
+        // 必须显式作废基线，否则换主题（或跨屏改 DPI，经 ensure_scale 走到这里）后
+        // 已显示的层会一直停在旧像素上。
+        self.invalidate_rendered();
     }
 
     /// 显示菜单（顶层 items）于屏幕坐标 (x,y)。i32::MIN → 取光标位。
@@ -610,8 +673,19 @@ impl PopupMenu {
             } else {
                 content_hits.clone()
             };
+            // 增量提交：重绘与摆位是两件独立的事，必须分开判断。
+            // `show()` 走的是 SetWindowPos(HWND_TOPMOST)，副作用是把窗口顶到 topmost 组最前——
+            // 每帧对每层都调一次的话，z 序每帧都要经历「一级最上 → 二级最上 → 三级最上」的
+            // 中间态；子菜单翻到左侧压住一级面板时，那个中间态就是一帧可见的遮挡。
+            // 所以：像素变了只 update（不碰 z 序），只有首显/几何真变了才 show。
+            let want = LevelRender {
+                items: items.clone(),
+                selected: *selected,
+                geom: (wox, woy, win_w, win_h),
+            };
+            let (repaint, replace) = plan_render(self.rendered[k].as_ref(), &want);
             // 绘制到窗口 k（拆分字段借用：renderer 与 windows 是不同字段，可并存）
-            {
+            if repaint {
                 let r = &self.renderer;
                 let win = &mut self.windows[k];
                 win.resize(win_w, win_h);
@@ -632,15 +706,19 @@ impl PopupMenu {
                 }
                 root.paint(buf, win_w, win_h, r);
                 let _ = win.update();
-                win.show(wox, woy);
             }
+            if replace {
+                self.windows[k].show(wox, woy);
+            }
+            self.rendered[k] = Some(want);
             geom.push((cox, coy, cw, ch, content_hits));
             wgeom.push((wox, woy, win_w, win_h, whits));
         }
 
-        // 隐藏多余窗口
+        // 隐藏多余窗口（基线随之作废：再次用到它时必须重绘 + 重新摆位）
         for k in snap.len()..self.windows.len() {
             self.windows[k].hide();
+            self.rendered[k] = None;
         }
 
         // 写回几何（窗口坐标：origin/size 含 margin，item_rects 窗口相对）。
@@ -816,6 +894,9 @@ impl PopupMenu {
                 }
             }
             self.visible = false;
+            // 全部窗口已 SW_HIDE，基线随之作废——否则下次弹出时内容碰巧相同的层
+            // 会被判为「无变化」而跳过 show，结果是根本不出现。
+            self.invalidate_rendered();
             let mut st = self.state.borrow_mut();
             st.levels.clear();
             st.closed = false;
@@ -862,12 +943,19 @@ impl WindowMouse for MenuState {
         let (sx, sy) = self.screen(x, y);
         match msg {
             WM_MOUSEMOVE => {
+                // 高亮跟手：鼠标指向哪个条目就亮哪个，没指向条目就灭。
+                // 三条分支都只动 `selected`（不碰 `levels`），所以任何一条都不会收起
+                // 已展开的子菜单；而 `clear_hover` 只对最深层生效，父项高亮始终保留着
+                // 「当前展开路径」的指示作用。
+                //
+                // 灭高亮是廉价的：它只让对应层 `update()` 推一次像素，不会触发
+                // `show()`（见 `plan_render`），因此不会重排 z 序、不会造成窗口闪烁。
                 match self.find_hit(sx, sy) {
                     Some((k, Some(r))) => self.hover(k, r),
-                    // 面板内非条目处（分隔/空白）→ 取消该层高亮
+                    // 面板内非条目处（root padding / 边框 / 分隔线）→ 灭掉该层高亮。
                     Some((k, None)) => self.clear_hover(k),
-                    // 菜单外 → 不强制清（移出窗口保持，避免边缘闪烁）
-                    None => {}
+                    // 菜单外 → 同样灭掉最深层高亮。鼠标都移开了还亮着，观感像卡住。
+                    None => self.clear_hover(self.deepest()),
                 }
                 Some(LRESULT(0))
             }
@@ -1235,6 +1323,230 @@ fn place_child(
         }
     }
     (x, y)
+}
+
+#[cfg(test)]
+mod render_plan_tests {
+    use super::*;
+
+    fn item(label: &str) -> MenuItemSpec {
+        MenuItemSpec::leaf(label, MenuKind::Copy, true, false)
+    }
+
+    fn base() -> LevelRender {
+        LevelRender {
+            items: vec![item("a"), item("b")],
+            selected: 0,
+            geom: (100, 200, 80, 40),
+        }
+    }
+
+    /// 窗口不可见（初始态 / 刚被 hide）时必须画满并摆位——跳过任何一步都会「菜单不出现」。
+    #[test]
+    fn invisible_window_needs_both() {
+        assert_eq!(plan_render(None, &base()), (true, true));
+    }
+
+    /// 完全没变 → 一步都不做。这是消除无谓 SetWindowPos 的地基。
+    #[test]
+    fn unchanged_level_does_nothing() {
+        let prev = base();
+        assert_eq!(plan_render(Some(&prev), &base()), (false, false));
+    }
+
+    /// **本修复的核心断言**：只有高亮行变了时，重绘但**绝不**重新摆位。
+    ///
+    /// `show()` 会 `SetWindowPos(HWND_TOPMOST)` 把窗口顶到 topmost 组最前。若这里返回
+    /// `replace = true`，那么每次鼠标在任意一层移动，父层都会被顶到子菜单前面一瞬，
+    /// 子菜单翻到左侧压住父面板时就表现为「闪一下」。回归了就是这条先红。
+    #[test]
+    fn selection_change_repaints_without_restacking() {
+        let prev = base();
+        let mut want = base();
+        want.selected = 1;
+        assert_eq!(plan_render(Some(&prev), &want), (true, false));
+    }
+
+    /// 内容换了（父项切换导致同一个窗口改画另一份子菜单）→ 重绘，位置没变则不摆位。
+    #[test]
+    fn content_change_repaints_without_restacking() {
+        let prev = base();
+        let mut want = base();
+        want.items = vec![item("x")];
+        assert_eq!(plan_render(Some(&prev), &want), (true, false));
+    }
+
+    /// 只挪位置（尺寸不变）→ 必须摆位；像素没变则不必重绘。
+    #[test]
+    fn move_only_restacks_without_repaint() {
+        let prev = base();
+        let mut want = base();
+        want.geom = (150, 200, 80, 40);
+        assert_eq!(plan_render(Some(&prev), &want), (false, true));
+    }
+
+    /// 尺寸变化必须同时重绘：buffer 尺寸变了，旧像素直接失效。
+    #[test]
+    fn resize_needs_repaint_too() {
+        let prev = base();
+        let mut want = base();
+        want.geom = (100, 200, 120, 40);
+        assert_eq!(plan_render(Some(&prev), &want), (true, true));
+    }
+}
+
+/// 悬停语义测试：不依赖窗口，直接喂几何给 `MenuState`。
+#[cfg(test)]
+mod hover_tests {
+    use super::*;
+    use std::sync::mpsc::channel;
+
+    fn sub(label: &str, children: Vec<MenuItemSpec>) -> MenuItemSpec {
+        let mut it = MenuItemSpec::leaf(label, MenuKind::Submenu, true, false);
+        it.children = children;
+        it
+    }
+
+    fn leaf(label: &str) -> MenuItemSpec {
+        MenuItemSpec::leaf(label, MenuKind::Copy, true, false)
+    }
+
+    /// 造一个两层菜单：一级 origin=(0,0) 100x100，行高 20；二级 origin=(200,0) 100x100。
+    /// 二级窗口内 y<10 是 root padding（无条目），模拟真实的「窗口内但不在任何 item 上」。
+    fn two_levels() -> (MenuState, std::sync::mpsc::Receiver<UiEvent>) {
+        let (tx, rx) = channel();
+        let child_items = vec![leaf("c0"), leaf("c1")];
+        let mut lv0 = Level::new(vec![sub("s", child_items.clone()), leaf("other")], 0);
+        lv0.origin = (0, 0);
+        lv0.size = (100, 100);
+        lv0.item_rects = vec![
+            (
+                0,
+                Rect {
+                    x: 0.0,
+                    y: 0.0,
+                    w: 100.0,
+                    h: 20.0,
+                },
+            ),
+            (
+                1,
+                Rect {
+                    x: 0.0,
+                    y: 20.0,
+                    w: 100.0,
+                    h: 20.0,
+                },
+            ),
+        ];
+        let mut lv1 = Level::new(child_items, NONE_SEL);
+        lv1.origin = (200, 0);
+        lv1.size = (100, 100);
+        lv1.item_rects = vec![
+            (
+                0,
+                Rect {
+                    x: 0.0,
+                    y: 10.0,
+                    w: 100.0,
+                    h: 20.0,
+                },
+            ),
+            (
+                1,
+                Rect {
+                    x: 0.0,
+                    y: 30.0,
+                    w: 100.0,
+                    h: 20.0,
+                },
+            ),
+        ];
+        let st = MenuState {
+            levels: vec![lv0, lv1],
+            capture_origin: (0, 0),
+            dirty: false,
+            closed: false,
+            events: tx,
+        };
+        (st, rx)
+    }
+
+    /// 走 `WM_MOUSEMOVE` 的真实分派路径（capture_origin=(0,0)，故客户区坐标==屏幕坐标）。
+    fn mouse_move(st: &mut MenuState, x: i32, y: i32) {
+        let lparam = LPARAM((((y & 0xFFFF) << 16) | (x & 0xFFFF)) as isize);
+        st.on_message(HWND::default(), WM_MOUSEMOVE, WPARAM(0), lparam);
+    }
+
+    /// 高亮必须跟手：鼠标移到子菜单面板内的非条目处（root padding / 边框），该层高亮灭掉。
+    /// 残留高亮会让用户以为菜单卡住了。
+    #[test]
+    fn blank_area_inside_panel_clears_highlight() {
+        let (mut st, _rx) = two_levels();
+        st.levels[1].selected = 1;
+        // (250, 5) 落在二级窗口内，但 y=5 不在任何 item_rect 上。
+        assert_eq!(st.find_hit(250, 5), Some((1, None)));
+        mouse_move(&mut st, 250, 5);
+        assert_eq!(st.levels[1].selected, NONE_SEL, "面板空白处应灭掉本层高亮");
+        assert!(st.dirty, "灭高亮要重绘");
+    }
+
+    /// 鼠标移出全部菜单窗口 → 最深层高亮灭掉（原来是一直亮着，观感像卡住）。
+    #[test]
+    fn outside_menu_clears_deepest_highlight() {
+        let (mut st, _rx) = two_levels();
+        st.levels[1].selected = 1;
+        assert_eq!(st.find_hit(500, 500), None, "该点不在任何菜单窗口内");
+        mouse_move(&mut st, 500, 500);
+        assert_eq!(
+            st.levels[1].selected, NONE_SEL,
+            "移出菜单外应灭掉最深层高亮"
+        );
+    }
+
+    /// **灭高亮不得伤及父层**：父项高亮指示的是「子菜单从这里展开」，灭掉它菜单看起来就断链了。
+    /// 同时子菜单本身必须还在——`clear_hover` 只动 selected，绝不动 levels。
+    ///
+    /// 关键在 `(50, 50)` 这一下：它落在**父面板**窗口内、不在任何条目上（子菜单仍开着），
+    /// 于是分派路径会把**非最深层**的 k 交给 `clear_hover`，真正踩到那道「仅最深层」保护。
+    /// 少了这一下，本测试就只是在测最深层、名不副实（曾经如此，被反向对照抓出）。
+    #[test]
+    fn clearing_never_touches_parent_or_closes_submenu() {
+        let (mut st, _rx) = two_levels();
+        st.levels[1].selected = 1;
+        assert_eq!(
+            st.find_hit(50, 50),
+            Some((0, None)),
+            "该点应命中父面板空白处"
+        );
+        mouse_move(&mut st, 50, 50);
+        assert_eq!(st.levels[0].selected, 0, "父项高亮必须保留（子菜单还开着）");
+        assert_eq!(st.levels[1].selected, 1, "父面板空白处不该动子菜单的高亮");
+        // 子菜单面板内空白、菜单外，另两条路径也不得伤及父层。
+        mouse_move(&mut st, 250, 5);
+        mouse_move(&mut st, 500, 500);
+        assert_eq!(st.levels[0].selected, 0, "父项高亮必须保留（子菜单还开着）");
+        assert_eq!(st.levels.len(), 2, "灭高亮不得收起子菜单");
+    }
+
+    /// 直接调 `clear_hover` 指定非最深层同样必须是空操作（键盘/未来调用点的兜底保证）。
+    #[test]
+    fn clear_hover_skips_non_deepest_level() {
+        let (mut st, _rx) = two_levels();
+        st.clear_hover(0);
+        assert_eq!(st.levels[0].selected, 0, "父层高亮不该被清（子菜单还开着）");
+        assert!(!st.dirty);
+    }
+
+    /// 只剩一层时移出菜单外 → 该层高亮也要灭（此时它就是最深层）。
+    #[test]
+    fn single_level_clears_when_pointer_leaves() {
+        let (mut st, _rx) = two_levels();
+        st.levels.truncate(1);
+        st.levels[0].selected = 1;
+        mouse_move(&mut st, 500, 500);
+        assert_eq!(st.levels[0].selected, NONE_SEL);
+    }
 }
 
 #[cfg(all(test, windows))]
