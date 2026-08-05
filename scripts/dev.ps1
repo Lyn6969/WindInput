@@ -34,6 +34,8 @@
 #   9s / d9s     生成便携包 (跳过重建, 直接打包现有 build[_dev]/)
 #   k=check  l=clippy  t=test  f=fmt  fmt-check  ci(=fmt+clippy+test)  hooks(=激活pre-commit)  clean
 #   gd=gen-data  r=repl
+#   av           配置 Defender 编译排除项 (自动 UAC 提权; 详见 scripts\defender-exclusions.ps1)
+#   avc          仅预览排除项改动 (免管理员)      avr  移除本脚本添加的排除项
 #
 # 部署目标 (在 scripts\deploy.local.ps1 覆盖, PowerShell 赋值格式):
 #   ── 系统安装 (注册 COM/写自启; 默认在 Program Files 下, 部署自动 UAC 提权)
@@ -571,14 +573,25 @@ function Deploy-TargetForCmd ([string]$cmd) {
     return $null
 }
 
+# 需管理员但【非】部署的命令。刻意与 Deploy-TargetForCmd 分开: 后者的返回值是
+# 真实的部署目标目录, 会被部署流程当路径使用; 把非部署命令塞进去就得编造假目录,
+# 使一个返回值同时承担"目标路径"与"要不要提权"两个语义 —— 二者对边缘输入的期望相反。
+# 目前只有 Defender 排除项的写入与移除属于此类 (写系统策略)。只读预览刻意不列入
+# —— 让预览也弹一次 UAC 会毁掉它"随手看一眼"的用途。
+function Test-NeedsAdminCmd ([string]$cmd) {
+    return (@("av", "avr") -contains $cmd)
+}
+
 # 系统安装(注册 COM/icacls/字体)始终需管理员。非管理员执行部署命令时自动 UAC 提权。
 # 返回三态: "skip" = 非部署命令/已是管理员 (调用方本地执行);
 #           "done" = 提权进程已执行完毕, 输出已在当前窗口显示 (调用方直接继续);
 #           "fail" = 提权被取消/失败 (调用方报错并以非零码退出)。
 function Invoke-Elevated ([string]$cmd, [string]$arg) {
-    if (-not (Deploy-TargetForCmd $cmd)) { return "skip" }   # 非部署命令
+    $isDeploy = [bool](Deploy-TargetForCmd $cmd)
+    if (-not $isDeploy -and -not (Test-NeedsAdminCmd $cmd)) { return "skip" }   # 无需管理员
     if (Test-Admin) { return "skip" }
-    Warn "系统安装需要管理员权限, 正在请求 UAC 提升..."
+    $why = if ($isDeploy) { "系统安装" } else { "修改 Defender 排除项" }
+    Warn "$why 需要管理员权限, 正在请求 UAC 提升..."
     $host_exe = (Get-Process -Id $PID).Path   # pwsh.exe 或 powershell.exe
     if (-not $host_exe) { $host_exe = "pwsh.exe" }
     # 临时日志文件捕获提权子进程的全部输出流 (*>), 执行后读回在本窗口显示。
@@ -1468,6 +1481,35 @@ function Do-Repl ([string]$data = "") {
     try { $env:WIND_DATA = $data; cargo run --release -p wind-repl -- $data } finally { Pop-Location }
 }
 
+# ---------- Defender 编译排除项 ----------
+# Rust 编译是实时反病毒的最坏负载: 数万个中小文件的高频创建/写入/删除, 每次
+# CreateFile/CloseFile 都被 minifilter 同步拦截扫描, 开销直接串进链接关键路径。
+# 用 git worktree 并行开发时还要乘以 worktree 个数 (各自独立 target)。
+# 具体排除清单与安全取舍见 scripts\defender-exclusions.ps1 的头尾注释。
+function Do-Defender ([string]$mode = "apply") {
+    $ps1 = Join-Path $ScriptDir "defender-exclusions.ps1"
+    if (-not (Test-Path $ps1)) { ErrMsg "未找到 $ps1"; return $false }
+
+    # -Scope Workspace: dev.ps1 的构建范围本就跨兄弟仓 (wind-setting / wind-portable /
+    # wind-installer), 排除范围与构建范围对齐才不会漏掉它们的 target。
+    $splat = @{ Scope = 'Workspace' }
+    switch ($mode) {
+        "check"  { $splat['WhatIfOnly'] = $true }
+        "remove" { $splat['Remove']     = $true }
+    }
+
+    # 子脚本正常路径不调 exit, $LASTEXITCODE 会保留上一条命令的陈旧值 —— 先清零,
+    # 否则前一条失败命令的退出码会被误判成本次失败。
+    $global:LASTEXITCODE = 0
+    try {
+        & $ps1 @splat
+    } catch {
+        ErrMsg "配置 Defender 排除项失败: $($_.Exception.Message)"
+        return $false
+    }
+    return ($LASTEXITCODE -eq 0)
+}
+
 # ---------- 菜单 ----------
 function Show-Menu {
     Clear-Host
@@ -1507,6 +1549,10 @@ function Show-Menu {
     Write-Host "    k=check  l=clippy  t=test  f=fmt  ci=fmt+clippy+test"
     Write-Host "`n  数据 / 实测:" -ForegroundColor Yellow
     Write-Host "    gd=gen-data  r=repl(本机)"
+    Write-Host "`n  构建环境:" -ForegroundColor Yellow
+    Write-Host "    av   配置 Defender 编译排除项 (自动提权)  avc 仅预览  avr 移除"
+    Write-Host "      加速 Rust 编译: 免去数万个 target 文件被实时扫描" -ForegroundColor DarkGray
+    Write-Host "      进程排除与路径无关, 新建 worktree 自动生效, 无需重跑" -ForegroundColor DarkGray
     Write-Host "`n  杂项:" -ForegroundColor Yellow
     Write-Host "    clean  q=退出"
     Write-Host "============================================" -ForegroundColor Cyan
@@ -1573,6 +1619,10 @@ function Dispatch ([string]$cmd, [string]$arg) {
         "clean"                      { Do-Clean;  $LASTEXITCODE; break }
         { $_ -in @("gd", "gen-data") }  { if (Do-GenData) { 0 } else { 1 }; break }
         { $_ -in @("r", "repl") }       { Do-Repl $arg; 0; break }
+        # Defender 编译排除项 (av/avr 经 Invoke-Elevated 自动提权; avc 只读免管理员)
+        { $_ -in @("av", "defender") }  { if (Do-Defender apply)  { 0 } else { 1 }; break }
+        "avc"                           { if (Do-Defender check)  { 0 } else { 1 }; break }
+        "avr"                           { if (Do-Defender remove) { 0 } else { 1 }; break }
         default { 127 }
     }
 }
