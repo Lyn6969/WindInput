@@ -1,8 +1,15 @@
 # 码表码元字符集 `input_chars` 设计
 
-> **范围**（2026-08-05 拍板）：只做**码表引擎**的码元字符集，字符档位为**字母子集 + ASCII 标点**
-> （如 `a-x`、`a-x/`、`a-z;`）。**不含数字**——数字要动 C++ 吃键与 IPC，另立。
-> 双拼符号（`;`）不在本设计内，它有自己的处理路径。驱动场景为通用能力建设，无特定方案。
+> **范围**（2026-08-05 拍板）：只做**码表引擎**的码元字符集，字符档位为
+> **字母子集 + ASCII 标点 + 数字**（如 `a-x`、`a-x/`、`a-z0-9`）。
+> 双拼符号（`;`）不在本设计内，它有自己的处理路径。
+>
+> **数字是中途追加的**（用户实测需要打 `Win10`），追加时带一条关键约束：**数字不作第一码**。
+> 这条约束恰好让数字免于动 C++——见 §2.3。
+>
+> **状态：P1–P4 已全部实施**（提交 `7c9ef79` / `93b919d` / `1e3dd70` / 本次）。
+> 实施中有三处偏离初稿，已就地改正并标注理由：数字纳入范围（§2.3）、非码元字符
+> **不得透传**（§3.4）、`leading_chars` 提前到 P1（§5）。
 
 ---
 
@@ -68,10 +75,23 @@ fn convert(&self, input: &str, max_candidates: usize) -> anyhow::Result<ConvertR
 ⇒ 字母与 ASCII 标点在中文模式下**本来就已送达 core**，只是 core 把标点分流进了标点流水线
 而非输入缓冲。本设计做的是**在 Rust 侧改分流**，不是扩 C++ 吃键集。
 
-> ★ 铁律「C++ 吃键集 ⊆ Rust 出字集」（`project_fullwidth_eat_flip`）在此**仍然成立且方向有利**：
-> C++ 目前吃得比 Rust 用得多，本设计缩小的是分歧，不扩大。
-> 一旦档位升到含数字，方向反转、铁律立刻生效——那时必须照 `CONFIG_KEY_CUSTOM_EN_PUNCT`
-> （`BinaryProtocol.h:627` + `_IsCustomEnglishPunctKey` 数据驱动查表）的模板走，不得新开机制。
+### 2.3.1 数字为什么也不用动 C++
+
+初稿把数字整条排除，理由是「空缓冲下数字不送 core，必须扩 C++ 吃键 + 新增 `CONFIG_KEY`」。
+加上「**数字不作第一码**」这条约束后，该理由不再成立：
+
+| | C++ `Number` 吃键 | 「数字不作首码」的要求 |
+|---|---|---|
+| 空缓冲 | **不吃**，透传 | 数字本就不该进缓冲 ✓ |
+| 组码中（`hasInputSession`） | **已经吃了**并送到 core | 数字要进缓冲 ✓ |
+
+两者严丝合缝 ⇒ 数字与字母/标点同属「Rust 侧改分流」，C++ 与 IPC 均零改动。
+
+> ★ 铁律「C++ 吃键集 ⊆ Rust 出字集」（`project_fullwidth_eat_flip`）在本设计**方向有利**：
+> C++ 吃得比 Rust 用得多，改动缩小的是分歧。
+> 但**一旦允许数字作首码，方向立刻反转**——那时必须照 `CONFIG_KEY_CUSTOM_EN_PUNCT`
+> （`BinaryProtocol.h:627` + `_IsCustomEnglishPunctKey` 数据驱动查表）的模板扩 C++ 吃键，
+> 不得新开机制。`leading_chars` 因此不只是易用性设计，**它同时是这条铁律的守卫**。
 
 ---
 
@@ -80,12 +100,25 @@ fn convert(&self, input: &str, max_candidates: usize) -> anyhow::Result<ConvertR
 ### 3.1 配置模型与归属
 
 ```
-方案 [engine.codetable].input_chars  (已存在，String，空=回落)
+方案 [engine.codetable].input_chars / .leading_chars  (String，空=回落)
         ↓ read_schema 的 merge_toml 深合并 schema_overrides/{id}.toml
-全局 schema.codetable.input_chars     (新增，String，默认 "a-z")
-        ↓ CodetableGlobal::resolved()
-解析为 CodeCharSet，存进 CodeTableEngine
+全局 schema.codetable.input_chars / .leading_chars    (String，空=内置默认)
+        ↓ CodetableGlobal::resolved()（空串=未设置，非空才覆盖）
+CodeCharSet::new(all, leading, schema_id) → 存进 CodeTableEngine
 ```
+
+**两层字符集**：
+
+| 字段 | 含义 | 缺省 |
+|---|---|---|
+| `input_chars` | 全集：哪些字符可进缓冲 | `a-z` |
+| `leading_chars` | 首码集：缓冲为空时哪些可起头 | 等于全集 |
+
+首码集**恒为全集的子集**（配了全集外的字符即取交集并告警）。否则该字符会在空缓冲时进缓冲、
+下一键却因不是码元而被判非法，形成一个自己走不出去的状态。
+
+★ **解析失败或为空一律回落 `a-z`，绝不产出空集**——空集意味着该方案一个字也打不出来，
+比「忽略了这项配置」严重得多：用户会认为输入法整个坏了，而不会想到是某个字符集写错。
 
 **归属决定：`CodeCharSet` 挂在 `CodeTableEngine` 上，coordinator 经
 `EngineManager::active_input_chars()` 取。**
@@ -134,26 +167,32 @@ pub fn active_max_code_length(&self) -> usize {
   → numpad(小键盘 direct) → 大 match(Escape/Back/数字选词/VK_A..=VK_Z 累积/兜底标点)
 ```
 
-**契约：组码中的码元优先，空缓冲一律让位。**
+**契约：组码中的码元优先，空缓冲查首码集。**
 
-| 缓冲状态 | 码元集内的**符号**键 | 依据 |
+| 缓冲状态 | 码元集内的数字/符号键 | 依据 |
 |---|---|---|
-| 空缓冲（`input_buffer` / `candidates` / `committed_text` 皆空） | **行为完全不变**：模式激活 / 标点 / 透传 | 零回归 |
-| 组码中 | 作**码元累积**，抢在 `select_char` / `apply_nav_key` / 大 match 之前 | 正在组码，符号是码的一部分 |
+| 空缓冲 | 查**首码集**。不在其中（数字的默认情形）→ **行为完全不变**：模式激活 / 选词 / 标点 / 透传 | 零回归 |
+| 组码中 | 查**全集**。命中 → 作码元累积，抢在 `select_char` / `apply_nav_key` / 数字选词 / 兜底标点之前 | 正在组码，它是码的一部分 |
 
 这个分层**不是新发明**，是仓里既有形状的推广：
-- `select_char` 闸门自带缓冲守卫（`:5250-5252`），注释明说「空缓冲且无候选时放行，让 `,`/`.` 作普通标点」；
+- `select_char` 闸门自带缓冲守卫，注释明说「空缓冲且无候选时放行，让 `,`/`.` 作普通标点」；
 - `try_activate_mode` 的语义本身就是「**空缓冲**模式激活」（`handle_lifecycle.rs:64-66`）。
 
-**插入位置**：`try_activate_mode` 之后、`select_char` 之前，加一道带缓冲守卫的码元闸门。
+**实际插入位置**：`try_activate_mode` 与 URL 前缀夺取**之后**、`select_char` **之前**
+（`Coordinator::try_code_char_gate`）。置于 URL 夺取之后是初稿未写明的一点——URL 是夺取式
+语义、优先级更高，码元闸门不该抢在它前面。
 
-**逃生口**：`input_chars_leading: bool`（默认 `false`）——允许码元符号打头，供「码元集含符号且该符号可作首码」
-的方案使用。**默认关 = 零回归**；打开后空缓冲下该符号也进缓冲，其引导键/标点身份让位。
+**首码判据取 `input_buffer.is_empty()`**，而不是「无候选且无已提交」：码是按 `input_buffer`
+查询的，缓冲空就是新一轮码的开头；分步上屏后续打的第一个字符同样算首码，与引擎查询语义一致。
+
+**数字选词一刀切让位**：方案把数字配成码元 ⇒ 组码中数字键归码表，不再选第 N 个候选，
+选词改用空格与次选键 `;'`。这是拍板的取舍（备选方案是「查词典活码前缀」的动态判定，
+因有歧义且每键多一次查询而否决）。空缓冲不受影响，数字键照常选词/透传。
 
 > ★ **判据**：本仓「加任何让位类开关」的教训（`project_enter_behavior_multipath`）——
-> 必须确认**接手职责的键没被别的配置同时收走**。开 `input_chars_leading` 前要检查该符号是否同时
-> 配了临拼触发 / 临英触发 / 特殊模式引导 / `select_char_keys` / `page_keys`，冲突时**在配置校验期
-> 报警**，而不是让用户在真机上撞见静默失效。
+> 必须确认**接手职责的键没被别的配置同时收走**。故 §5 的 P4 落了一道配置体检
+> （`Coordinator::code_char_conflicts`）：把码元集里的符号逐个反查翻页 / 次选 / 以词定字 /
+> 引导键 / 临拼临英触发键 / 数字选词，冲突即启动告警，而不是让用户在真机上撞见静默失效。
 
 ### 3.4 非码元字母的处置（`a-x` 下的 `y`/`z`）
 
@@ -161,8 +200,25 @@ pub fn active_max_code_length(&self) -> usize {
 
 | 缓冲状态 | 非码元字母 | 理由 |
 |---|---|---|
-| 空缓冲 | **透传**（宿主出该字母） | 与 CapsLock 字母透传同构，保留 `WM_KEYDOWN` 给宿主快捷键 |
-| 组码中 | **先上屏当前高亮候选，再输出该字符**（`commit_highlight_then_char`） | 与小键盘 direct 语义同构（`:5271-5279`），不丢已打的码 |
+| 空缓冲 | **由本侧出字**（全角态自动转全角） | 见下方「初稿错误」——不能透传 |
+| 组码中 | **先上屏当前高亮候选，再输出该字符**（`commit_highlight_then_char`） | 与小键盘 direct 语义同构，不丢已打的码 |
+
+两种情形合并为同一条路径（`Coordinator::reject_non_code_char`）：`commit_highlight_then_char`
+在无候选无已提交时只输出该字符，正是空缓冲需要的行为。
+
+> ### ⚠️ 初稿错误：空缓冲不能「透传」
+>
+> 初稿写的是「空缓冲 → 透传，保留 `WM_KEYDOWN` 给宿主快捷键，与 CapsLock 字母透传同构」。
+> **这是错的**，实现时发现并改正：
+>
+> CapsLock 那条路之所以能透传，是因为 C++ 在该情形下**主动不吃**
+> （`KeyEventSink.cpp` 的 `chinese_capslock_letter_passthrough`，`pfEaten` 保持 FALSE）。
+> 而非码元字母走的是 `chinese_letter` 分支——**无条件吃**。此时 Rust 返回 `PassThrough`
+> 就构成「吃了再吐」：不补发 `WM_KEYDOWN` 的宿主（EverEdit 一类）直接丢字符，
+> 全角态下还会出半角。
+>
+> ★ **可复用的判据**：要照搬某条「透传」先例前，先确认 **C++ 在那个情形下到底吃不吃**。
+> 「另一处也透传」不是依据——透传合法的前提是吃键侧同意，而吃键判据是按分支给的。
 
 **顺序铁律：字母触发键判定必须先于「非码元」判定。**
 `z` 常同时是「非码元」（`a-x`）与「临拼触发键」（`matched_letter_temp_trigger`，`handle_temp.rs:47`）。
@@ -191,20 +247,41 @@ pub fn active_max_code_length(&self) -> usize {
 | 7 | z-fallback 探针 | 探针拼接 `format!("{}{}", buffer, ch)` 对符号是否仍成立 |
 | 8 | 加词取码 `dict.add` code 推导 | 该推导本就「只声明未实现」（`project_dict_add_code_derivation`） |
 | 9 | 拆字反查 / tooltip「编码」段 | 按方案词库反查时的码元域 |
-| 10 | URL 前缀夺取探针（`:5226-5234`） | `printable_char` 已支持符号，与码元闸门的先后顺序 |
+| 10 | URL 前缀夺取探针 | `printable_char` 已支持符号，与码元闸门的先后顺序 |
+
+> ### ⚠️ 这份清单的实际验证状态（勿高估）
+>
+> P1–P4 完成时，这 10 项**没有逐项做人工走查**。已有的保证是：
+>
+> - **默认字符集下全部无风险**——码元集恒为 `a-z`，缓冲内容与历史逐字节相同，
+>   `input_flow` 239 项全绿且断言零修改即是证据；
+> - **非默认字符集下，仅第 2、5 项被端到端覆盖**（顶码/满码计数经 `accumulate_code_char`
+>   共用同一实现；组合区显示在 `symbol_enters_buffer_when_composing` 等用例中断言过）。
+>
+> 其余各项（影子串大小写配对、上屏原码四出口、词频记账码、退格回退、z 探针、加词取码、
+> 拆字反查、URL 探针）在**符号或数字真正进入缓冲后**的表现**尚未验证**。
+> 第一个真实启用非默认码元集的方案落地前，应当把它们逐项走查一遍——
+> 这正是 `project_normal_input_uppercase`（上屏原码四个同源出口）与
+> `project_special_mode_codetable`（一个能力五处落点）反复教的那件事。
 
 ---
 
 ## 5. 分期
 
-| 期 | 内容 | 行为变化 |
-|---|---|---|
-| **P1** | `CodeCharSet` 解析器 + 全局字段 + `resolved()` 折叠 + `CodeTableEngine` 持有 + `active_input_chars()` | **无**（默认 `a-z`，与现状逐键等价） |
-| **P2** | 非码元字母处置（§3.4） | 仅对配了字母子集的方案生效 |
-| **P3** | 符号码元 + 组码中优先（§3.3） | 仅对码元集含符号的方案生效 |
-| **P4** | `input_chars_leading` 逃生口 + 配置期冲突校验 | 默认关 |
+四期均已实施，每期独立提交并各自跑过全量回归。
 
-P1 是纯地基、可独立合入且**可证明零行为变化**——这一点很重要，它让后续每期的回归都有干净的对照基线。
+| 期 | 内容 | 行为变化 | 提交 |
+|---|---|---|---|
+| **P1** | `CodeCharSet`（含首码集）+ 全局字段 + `resolved()` 折叠 + `CodeTableEngine` 持有 + `active_input_chars()` | **无**（默认 `a-z`，与现状逐键等价） | `7c9ef79` |
+| **P2** | 非码元字母处置（§3.4）+ `can_enter_buffer` / `active_is_code_char` | 仅对配了字母子集的方案生效 | `93b919d` |
+| **P3** | 数字与符号作码元、组码中优先（§3.3）；抽出 `accumulate_code_char` 公共通路 | 仅对码元集含非字母字符的方案生效 | `1e3dd70` |
+| **P4** | 配置冲突体检 `code_char_conflicts` + 启动告警 | 无（只写日志） | 本次 |
+
+**与初稿的分期差异**：`leading_chars` 原计划作 P4 的「逃生口」，实际提前到 P1——数字需求
+落地后它从可选项变成了数据结构的一部分（全集/首码集两层），无法后补。P4 因此只剩配置体检。
+
+P1 是纯地基、可独立合入且**可证明零行为变化**：`input_flow` 239 项全绿**且断言零修改**。
+这一点很重要——它让后续每期的回归都有干净的对照基线。
 
 ---
 
@@ -226,7 +303,7 @@ P1 是纯地基、可独立合入且**可证明零行为变化**——这一点�
 
 | 项 | 原因 |
 |---|---|
-| **数字作码元** | 需扩 C++ 吃键（空缓冲下数字不送 core）+ 新增 `CONFIG_KEY` 下发，且与数字选词键正面冲突、需要一整套让位规则。风险高一档，另立设计。 |
+| **数字作首码** | 一旦允许，C++ 吃键铁律的方向反转（空缓冲下数字不送 core），必须扩 C++ 吃键 + 新增 `CONFIG_KEY` 下发；且与数字选词、快捷输入数字透镜正面冲突。`leading_chars` 的默认用法（`input_chars = "a-z0-9"` + `leading_chars = "a-z"`）正是为了不踏进这里。 |
 | **双拼符号自定义** | 双拼有自己的处理路径（`;`），与按键分派优先级无关，混入会让本设计失焦。 |
 | **dict 层码元校验** | 设计稿 `config-schema.md:61` 提到「码表词条的合法码元据此校验」。但 `is_code_shape` 是**列序猜测**的启发式，把它改成校验器会牵动解析语义——**须 bump `PARSE_SEMANTICS_VERSION`**（`project_dict_column_layout_fix`）。独立议题。 |
 | **z-fallback 确定性化** | 红利明确但改动一条已稳定路径，见 §3.4 末。 |
@@ -236,14 +313,18 @@ P1 是纯地基、可独立合入且**可证明零行为变化**——这一点�
 
 ## 8. 相关代码位置
 
-- `wind_input/crates/wind-config/src/schema.rs:100-102`：`CodeTableSpec::input_chars`（现有字段）
-- `wind_input/crates/wind-config/src/config.rs:517`：`CodetableGlobal::resolved()`（折叠点）
-- `wind_input/crates/wind-engine/src/manager.rs:864`：`active_max_code_length()`（`active_input_chars()` 的模板）
-- `wind_input/crates/wind-engine/src/codetable/engine.rs:175`：`convert()`（纯字符串接口，零改动）
-- `wind_input/crates/wind-coordinator/src/coordinator.rs:5189-5282`：优先级链与插入位置
-- `wind_input/crates/wind-coordinator/src/coordinator.rs:5449`：待替换的 `VK_A..=VK_Z` 硬编码
-- `wind_input/crates/wind-coordinator/src/handle_lifecycle.rs:64-67`：`try_activate_mode`（空缓冲模式激活）
-- `wind_input/crates/wind-coordinator/src/handle_temp.rs:47`：`matched_letter_temp_trigger`（顺序铁律）
+- `wind_input/crates/wind-config/src/code_charset.rs`：`CodeCharSet`（解析、首码集、回落规则）
+- `wind_input/crates/wind-config/src/schema.rs`：`CodeTableSpec::input_chars` / `leading_chars`
+- `wind_input/crates/wind-config/src/config.rs`：`CodetableGlobal` 两字段 + `resolved()` 折叠
+- `wind_input/crates/wind-config/src/config_schema.rs`：注册表登记（新增配置键的守门测试要它）
+- `wind_input/crates/wind-engine/src/engine.rs`：`Engine::input_chars()`（默认 `None`）
+- `wind_input/crates/wind-engine/src/codetable/engine.rs`：`with_charset` + `input_chars()`
+- `wind_input/crates/wind-engine/src/mixed/engine.rs`：混输显式代理主码表子引擎
+- `wind_input/crates/wind-engine/src/manager.rs`：构建期注入 + `active_input_chars` / `active_is_code_char` / `active_is_leading_char`
+- `wind_input/crates/wind-coordinator/src/coordinator.rs`：`can_enter_buffer` / `reject_non_code_char` / `accumulate_code_char` / `try_code_char_gate` / `code_char_conflicts`
+- `wind_input/crates/wind-coordinator/tests/codetable_input_chars.rs`：15 条端到端用例
+- `wind_input/crates/wind-coordinator/src/handle_temp.rs`：`matched_letter_temp_trigger`（顺序铁律）
+- `data/config.toml`：出厂默认与说明
 - `wind_tsf/src/HotkeyManager.cpp:106-161`：`ClassifyInputKey`（吃键真相表来源）
 - `wind_tsf/include/BinaryProtocol.h:627`：`CONFIG_KEY_CUSTOM_EN_PUNCT`（升档到数字时的模板）
 - `docs/redesign/config-schema.md:53-70`：原始设计稿 §3b

@@ -298,6 +298,104 @@ fn default_charset_sends_symbol_to_punctuation() {
     );
 }
 
+// ────────────────────── 配置冲突体检（只告警，不改行为）──────────────────────
+
+/// 默认字符集不含非字母字符 ⇒ 恒无冲突。
+#[test]
+fn default_charset_reports_no_conflict() {
+    let d = data_dir();
+    if !dict_ready(&d) {
+        eprintln!("跳过：五笔词库不存在");
+        return;
+    }
+    let coord = Coordinator::new_headless(wubi_config("", ""), Some(&d));
+    assert!(
+        coord.code_char_conflicts().is_empty(),
+        "默认码元集不该报冲突，实际: {:?}",
+        coord.code_char_conflicts()
+    );
+}
+
+/// `-` / `=` 是出厂翻页键（`page_keys` 含 `minus_equal`），配成码元即冲突。
+#[test]
+fn conflict_with_page_keys_is_reported() {
+    let d = data_dir();
+    if !dict_ready(&d) {
+        eprintln!("跳过：五笔词库不存在");
+        return;
+    }
+    let coord = Coordinator::new_headless(wubi_config("a-z-=", "a-z"), Some(&d));
+    let conflicts = coord.code_char_conflicts();
+
+    for want in ['-', '='] {
+        let hit = conflicts.iter().find(|(c, _)| *c == want);
+        let (_, owners) = hit.unwrap_or_else(|| panic!("{want:?} 应报冲突，实际: {conflicts:?}"));
+        assert!(
+            owners.contains(&"翻页/高亮键"),
+            "{want:?} 的冲突方应含翻页键，实际: {owners:?}"
+        );
+    }
+}
+
+/// `;` 是出厂次选键（`select_key_groups` 含 `semicolon_quote`）。
+#[test]
+fn conflict_with_select_key_is_reported() {
+    let d = data_dir();
+    if !dict_ready(&d) {
+        eprintln!("跳过：五笔词库不存在");
+        return;
+    }
+    let coord = Coordinator::new_headless(wubi_config("a-z;", "a-z"), Some(&d));
+    let conflicts = coord.code_char_conflicts();
+
+    let (_, owners) = conflicts
+        .iter()
+        .find(|(c, _)| *c == ';')
+        .unwrap_or_else(|| panic!("; 应报冲突，实际: {conflicts:?}"));
+    assert!(
+        owners.contains(&"次选键"),
+        "; 的冲突方应含次选键，实际: {owners:?}"
+    );
+}
+
+/// 数字作码元 = 放弃组码期间的数字选词，须如实告警。
+#[test]
+fn digit_reports_number_select_conflict() {
+    let d = data_dir();
+    if !dict_ready(&d) {
+        eprintln!("跳过：五笔词库不存在");
+        return;
+    }
+    let coord = Coordinator::new_headless(wubi_config("a-z0-9", "a-z"), Some(&d));
+    let conflicts = coord.code_char_conflicts();
+
+    let (_, owners) = conflicts
+        .iter()
+        .find(|(c, _)| *c == '1')
+        .unwrap_or_else(|| panic!("数字应报冲突，实际: {conflicts:?}"));
+    assert!(
+        owners.contains(&"数字选词键"),
+        "数字的冲突方应含数字选词键，实际: {owners:?}"
+    );
+}
+
+/// 不冲突的符号不该被误报——否则告警会退化成背景噪音，真冲突反而被淹没。
+#[test]
+fn non_conflicting_symbol_is_not_reported() {
+    let d = data_dir();
+    if !dict_ready(&d) {
+        eprintln!("跳过：五笔词库不存在");
+        return;
+    }
+    // `/` 出厂不作翻页/次选/以词定字/引导键。
+    let coord = Coordinator::new_headless(wubi_config("a-z/", "a-z"), Some(&d));
+    assert!(
+        !coord.code_char_conflicts().iter().any(|(c, _)| *c == '/'),
+        "/ 出厂无功能占用，不该报冲突，实际: {:?}",
+        coord.code_char_conflicts()
+    );
+}
+
 /// 子集内的字母照常进缓冲——证明 `a-x` 只排除了 `y`，没把整套字母判死。
 #[test]
 fn code_letter_still_buffers_under_subset() {

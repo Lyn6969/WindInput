@@ -261,6 +261,14 @@ pub(crate) fn en_case_variants(s: &str) -> Vec<String> {
     out
 }
 
+/// 可打印字符 → 主键盘 VK（无 Shift 态）。找不到返回 `None`。
+///
+/// [`punct_char`] 的反向查询。仅供配置体检使用（启动一次），故用线性扫描而非反查表——
+/// 建表反而多一份需要与 `punct_char` 保持同步的真相源。
+fn char_to_main_vk(ch: char) -> Option<u32> {
+    (0x20u32..=0xFF).find(|&vk| punct_char(vk, false) == Some(ch))
+}
+
 /// VK + shift → 可打印 ASCII 字符（字母按 shift 决定大小写、数字/符号复用 punct_char）。
 /// 用于网址模式原样累积与前缀探测。非可打印键返回 None。
 pub(crate) fn printable_char(key_code: u32, shift: bool) -> Option<char> {
@@ -1549,6 +1557,8 @@ impl Coordinator {
         coordinator.init_cmdbar();
         // 启动即显示常驻工具栏（反映初始 中英/方案/标点/全半角）
         coordinator.notify_toolbar();
+        // 码元集与按键功能的冲突体检（只告警）。默认字符集下直接返回，无开销。
+        coordinator.warn_code_char_conflicts();
         coordinator
     }
 
@@ -2879,6 +2889,74 @@ impl Coordinator {
             return None;
         }
         Some(self.accumulate_code_char(state, lower, ch))
+    }
+
+    /// 码元字符集与既有按键功能的冲突清单：`(字符, 占用它的功能名)`，空 = 无冲突。
+    ///
+    /// 「组码中码元优先」意味着配成码元的符号会从翻页/次选/以词定字/引导键手里被夺走。
+    /// 这是方案作者的选择，不该阻止；但必须让他知道——否则现场表现是「翻页键忽然不灵了」，
+    /// 而两处配置分开看都合理，无从查起。
+    ///
+    /// 判定**反查现有函数**而非重新解析配置：`page_keys` 一类存的是键组名（`minus_equal`），
+    /// 自己再解析一遍必然与 `NavKeys::from_config` 漂移。此处对码元集里的每个非字母字符
+    /// 找回它的 VK，再逐个问那些判定函数「这个键归你吗」——判据因此永远与实际行为同源。
+    ///
+    /// 只查非字母：字母本就是默认码元，且字母触发键（z）有专门的裁决顺序，不构成冲突。
+    pub fn code_char_conflicts(&self) -> Vec<(char, Vec<&'static str>)> {
+        let charset = self.engine_mgr.active_input_chars();
+        if charset.is_default_alpha() {
+            // 默认集只有字母，不可能与符号类功能冲突——顺带免掉一整轮反查。
+            return Vec::new();
+        }
+        let rt = self.rt();
+        let mut out = Vec::new();
+        for ch in charset.chars() {
+            if ch.is_ascii_alphabetic() {
+                continue;
+            }
+            let Some(vk) = char_to_main_vk(ch) else {
+                continue;
+            };
+            let mut owners: Vec<&'static str> = Vec::new();
+            // 数字选词是硬编码的 VK_1..=VK_9 / VK_0 臂，不经任何配置，故单独判。
+            // 数字配成码元即等于放弃组码期间的数字选词（一刀切让位，见设计文档 §3.3）。
+            if ch.is_ascii_digit() {
+                owners.push("数字选词键");
+            }
+            if rt.nav_keys.classify(vk, false, true).is_some() {
+                owners.push("翻页/高亮键");
+            }
+            if self.select_key_offset(vk).is_some() {
+                owners.push("次选键");
+            }
+            if self.select_char_index(vk).is_some() {
+                owners.push("以词定字键");
+            }
+            if self.match_special_trigger(vk).is_some() {
+                owners.push("特殊模式引导键");
+            }
+            if self.is_temp_pinyin_trigger(vk) {
+                owners.push("临时拼音触发键");
+            }
+            if self.is_temp_english_trigger(vk) {
+                owners.push("临时英文触发键");
+            }
+            if !owners.is_empty() {
+                out.push((ch, owners));
+            }
+        }
+        out
+    }
+
+    /// 启动时把 [`Self::code_char_conflicts`] 的结果写进日志。只告警，不改行为。
+    pub(crate) fn warn_code_char_conflicts(&self) {
+        for (ch, owners) in self.code_char_conflicts() {
+            warn!(
+                "码元集含 {:?}，但该键同时配作 {}；组码中它归码表，这些功能在组码期间失效（空缓冲时不受影响）",
+                ch,
+                owners.join(" / ")
+            );
+        }
     }
 
     /// 普通模式「顶屏高亮候选 + 输出字符」：把已转换前缀与当前高亮候选一并上屏，再接该字符。
