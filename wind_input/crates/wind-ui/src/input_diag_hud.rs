@@ -128,6 +128,15 @@ impl Default for InputDiagView {
 /// 变更走，窗口快照随焦点走），合成一个就得回答「只到了一半时另一半算什么」。
 #[derive(Clone, Debug, Default)]
 pub struct WindowDiagView {
+    /// **本快照的来源进程**（上报它的那个 DLL 实例的 `GetCurrentProcessId`）。
+    ///
+    /// ⚠ 与 [`InputDiagView::pid`] **不保证是同一个进程**：输入态随 focus_gained /
+    /// compartment 变更走，窗口快照随焦点走，两个槽由不同进程的上报各自覆盖。多进程宿主
+    /// （Win10 任务栏搜索：explorer + searchapp 各有一个 DLL 实例）下并排显示两份数据，
+    /// 就隐含承诺了它们同源——不同源时必须显式说破，否则读者会脑补出一个不存在的完整画面。
+    pub pid: u32,
+    /// 来源进程名（服务端按 `pid` 补齐）。
+    pub process_name: String,
     /// 焦点窗口句柄（仅展示与同一性比较——跨进程句柄在服务进程里调用无效）。
     pub focus_hwnd: u64,
     /// 焦点窗口类名。
@@ -178,12 +187,23 @@ pub struct WindowDiagView {
 }
 
 impl WindowDiagView {
-    /// 前台窗口是否属于**别的**进程（`owner_pid` = 输入焦点所在进程）。
+    /// 前台窗口是否属于**别的**进程。
     ///
-    /// Win10 任务栏搜索的关键信号：焦点在 explorer，前台窗口却归 SearchUI/SearchApp。
-    /// 只看进程名永远看不出这件事，而 per-app 配置恰恰只按进程名匹配。
-    pub fn foreground_is_other_process(&self, owner_pid: u32) -> bool {
-        self.fg_pid != 0 && owner_pid != 0 && self.fg_pid != owner_pid
+    /// ⚠ 比较基准必须是**本快照自己的** `pid`，不能是 [`InputDiagView::pid`]——后者是
+    /// 「最后一次输入态上报」的进程，多进程宿主下与本快照可能根本不是一个进程，用它比
+    /// 会得到一条与事实无关的告警（真机实测：快照与前台同属 searchapp，却因输入态那半
+    /// 停在 explorer 而报出「前台属于其他进程」）。
+    ///
+    /// 这条信号本身仍是关键的：焦点进程与前台进程分家时，per-app 配置按进程名匹配就
+    /// 描述不了当前场景。
+    pub fn foreground_is_other_process(&self) -> bool {
+        self.fg_pid != 0 && self.pid != 0 && self.fg_pid != self.pid
+    }
+
+    /// 本快照与输入态分区是否来自**不同进程**（`input_pid` = [`InputDiagView::pid`]）。
+    /// 两者都非 0 且不等时为真——此时 HUD 上下两半描述的是两个进程。
+    pub fn differs_from_input_process(&self, input_pid: u32) -> bool {
+        self.pid != 0 && input_pid != 0 && self.pid != input_pid
     }
 }
 
@@ -255,6 +275,19 @@ pub fn format_diag_lines(v: &InputDiagView) -> Vec<String> {
     if s.window {
         lines.push("── 窗口 ──".to_string());
         if w.received {
+            // 快照来源进程。与首行进程不同时**必须点破**：那说明 HUD 上下两半描述的是
+            // 两个进程，而并排显示天然让人以为是同一个。Win10 任务栏搜索就是这个形态
+            // （explorer 与 searchapp 各有一个 DLL 实例，各自覆盖不同的槽）。
+            let src_name = if w.process_name.is_empty() {
+                "?".to_string()
+            } else {
+                w.process_name.clone()
+            };
+            if w.differs_from_input_process(v.pid) {
+                lines.push(format!("⚠ 本节来自 {}({})，非上方进程", src_name, w.pid));
+            } else {
+                lines.push(format!("来源: {}({})", src_name, w.pid));
+            }
             lines.push(format!(
                 "焦点: {} [{}] {}",
                 hwnd_str(w.focus_hwnd),
@@ -281,7 +314,7 @@ pub fn format_diag_lines(v: &InputDiagView) -> Vec<String> {
             ));
             // 只在"前台属于别的进程"时加这一行——它是异常信号，常态下不该占地方。
             // per-app 配置按进程名匹配，而这一行正是"进程名不足以描述当前场景"的证据。
-            if w.foreground_is_other_process(v.pid) {
+            if w.foreground_is_other_process() {
                 lines.push("⚠ 前台窗口属于其他进程".to_string());
             }
         }
@@ -866,6 +899,8 @@ mod tests {
 
     fn received_window() -> WindowDiagView {
         WindowDiagView {
+            pid: 4242, // 与 base_view().pid 同源（常态）
+            process_name: "chrome.exe".into(),
             focus_hwnd: 0xA1B2C3,
             focus_class: "Edit".into(),
             focus_source_label: "TSF".into(),
@@ -912,19 +947,72 @@ mod tests {
     #[test]
     fn foreground_other_process_warning_is_conditional() {
         let mut v = base_view();
-        v.window = received_window(); // fg_pid=777 ≠ pid=4242
+        v.window = received_window(); // 快照 pid=4242，fg_pid=777
         assert!(
             format_diag_lines(&v)
                 .join("\n")
                 .contains("⚠ 前台窗口属于其他进程")
         );
 
-        v.window.fg_pid = v.pid; // 同进程 → 不该出现
-        assert!(!format_diag_lines(&v).join("\n").contains("⚠"));
+        v.window.fg_pid = v.window.pid; // 与快照同进程 → 不该出现
+        assert!(!format_diag_lines(&v).join("\n").contains("⚠ 前台窗口"));
 
         // fg_pid 未知（0）只是采集失败，不得误报成"跨进程"。
         v.window.fg_pid = 0;
-        assert!(!format_diag_lines(&v).join("\n").contains("⚠"));
+        assert!(!format_diag_lines(&v).join("\n").contains("⚠ 前台窗口"));
+    }
+
+    /// ★ 跨进程告警的基准必须是**快照自己的 pid**，不是首行那个。
+    ///
+    /// 真机形态（Win10 任务栏搜索）：快照与前台同属 searchapp，输入态那半却停在 explorer。
+    /// 拿首行 pid 作基准就会报出一条与事实无关的「前台属于其他进程」。
+    #[test]
+    fn foreground_warning_uses_snapshot_pid_not_input_pid() {
+        let mut v = base_view();
+        v.pid = 7172; // 输入态来自 explorer
+        v.window = received_window();
+        v.window.pid = 8704; // 快照来自 searchapp
+        v.window.process_name = "searchapp.exe".into();
+        v.window.fg_pid = 8704; // 前台也是 searchapp —— 与快照同进程
+        v.window.fg_process_name = "searchapp.exe".into();
+
+        let text = format_diag_lines(&v).join("\n");
+        assert!(
+            !text.contains("⚠ 前台窗口属于其他进程"),
+            "快照与前台同进程，不得因首行 pid 不同而误报: {text}"
+        );
+    }
+
+    /// 上下两半来自不同进程时必须点破——并排显示天然让人以为它们同源。
+    #[test]
+    fn cross_process_snapshot_is_called_out() {
+        let mut v = base_view();
+        v.pid = 7172;
+        v.window = received_window();
+        v.window.pid = 8704;
+        v.window.process_name = "searchapp.exe".into();
+        let text = format_diag_lines(&v).join("\n");
+        assert!(text.contains("本节来自 searchapp.exe(8704)"), "{text}");
+        assert!(text.contains("非上方进程"), "{text}");
+
+        // 同进程（常态）→ 平铺直叙地报来源，不加警示。
+        v.window.pid = v.pid;
+        v.window.process_name = "explorer.exe".into();
+        let text = format_diag_lines(&v).join("\n");
+        assert!(text.contains("来源: explorer.exe(7172)"), "{text}");
+        assert!(!text.contains("非上方进程"), "{text}");
+    }
+
+    /// pid 未知（0）不算「不同进程」——那只是采集失败。
+    #[test]
+    fn unknown_pid_is_not_a_cross_process_signal() {
+        let w = WindowDiagView {
+            pid: 0,
+            ..received_window()
+        };
+        assert!(!w.differs_from_input_process(7172));
+        assert!(!w.foreground_is_other_process());
+        assert!(!received_window().differs_from_input_process(0));
     }
 
     /// 定位三档。**关键是第二条**：窗口在屏内时也要走钳制，而不是原样沿用当前坐标

@@ -261,6 +261,24 @@ C++ 的 `static_assert(sizeof == 64)` 与 Rust 的 `diag_snapshot_head_layout_is
 ⚠️ 前台窗口自身是置顶窗口时跳过这一步：`SetWindowPos` 的语义会让插到 topmost 之后的窗口
 也变成 topmost，刚清掉的样式会被当场戴回来。
 
+### 快照来源进程必须自报（真机暴露）
+
+首份 Win10 真机数据里三个 HWND 全是 `0x101AA`，而首行进程写着 `explorer.exe(7172)`、
+前台窗口却查出属于 `searchapp.exe(8704)`——一个 HWND 不可能同时属于两个进程。
+
+根因：`last_input_diag`（随 focus_gained / compartment 变更走）与 `last_window_diag`
+（随 `CMD_DIAG_SNAPSHOT` 走）是**两个独立的槽，可被不同进程的上报各自覆盖**。多进程宿主
+下 HUD 并排显示两份数据，就隐含承诺了它们同源，读者会脑补出一个不存在的完整画面。
+
+修法：`WindowDiagView` 带上 `pid` / `process_name`，窗口分区显示 `来源: X(pid)`；与首行
+进程不同时改显 `⚠ 本节来自 X(pid)，非上方进程`。
+
+连带修正一处误报：`foreground_is_other_process` 的比较基准此前取首行 pid，应取**快照
+自己的 pid**——真机那份数据里快照与前台本属同一个 searchapp，却因输入态那半停在 explorer
+而报出「前台窗口属于其他进程」。
+
+> 同型隐患：任何把两个独立更新的槽并排展示的界面都有这个问题。并排即承诺同源。
+
 ### 两个开关的逃生口
 
 非置顶会让 HUD 沉到宿主窗口之下、右键菜单点不到，于是**没法再打开置顶**；冻结着关掉 HUD、

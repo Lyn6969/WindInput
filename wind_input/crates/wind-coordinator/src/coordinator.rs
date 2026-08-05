@@ -1722,12 +1722,18 @@ impl Coordinator {
         #[cfg(not(windows))]
         let (host_whitelisted, host_active) = (false, false);
 
-        // 前台进程名：服务端按 fg_pid 现查（DLL 不上报——它未必有权限打开别的进程）。
-        let fg_process_name = if snap.fg_pid != 0 {
-            self.cached_proc_name((snap.fg_pid as u64) << 32)
-        } else {
-            String::new()
+        // 进程名：服务端按 pid 现查（DLL 不上报——它未必有权限打开别的进程）。
+        // 快照来源进程与前台进程分别查：多进程宿主下它们本就可能不同，而「本快照来自谁」
+        // 是判读整份数据的前提（见 `WindowDiagView::pid`）。
+        let proc_name = |pid: u32| {
+            if pid != 0 {
+                self.cached_proc_name((pid as u64) << 32)
+            } else {
+                String::new()
+            }
         };
+        let process_name = proc_name(snap.pid);
+        let fg_process_name = proc_name(snap.fg_pid);
 
         {
             let mut w = self
@@ -1735,6 +1741,8 @@ impl Coordinator {
                 .lock()
                 .unwrap_or_else(|e| e.into_inner());
             *w = crate::input_diag::WindowDiagView {
+                pid: snap.pid,
+                process_name,
                 focus_hwnd: snap.focus_hwnd,
                 focus_class: snap.focus_class.clone(),
                 focus_source_label: wind_ipc::protocol::window_source::label(
