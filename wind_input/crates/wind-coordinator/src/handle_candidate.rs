@@ -580,7 +580,14 @@ impl Coordinator {
         // 精确匹配空码补全的两个候选源，在下方「补全收口」处统一判空后择一采纳：
         // - `engine_completion`：码表引擎备下的更长编码首选（`ConvertResult::completion_hint`）；
         // - `completion_pool`：短语侧前缀命中（仅精确模式抑制了枚举时才装填）。
-        let engine_completion = result.completion_hint;
+        // ⚠️ `completion_hint` **必须同样过汇聚点**：它直接来自引擎（词库原始 value），而
+        // `result.candidates` 在下一行走了 finalize。漏掉的表现是补出来的直通命令候选原样
+        // 显示成 `$CC(...)` 源码——同一张码表里的同一条词条，正常命中时显示标签、被当作
+        // 补全兜底时显示源码。
+        let engine_completion = self.finalize_candidates(
+            result.completion_hint.into_iter().collect(),
+            &state.input_buffer,
+        );
         let mut completion_pool: Vec<Candidate> = Vec::new();
         let mut candidates = self.finalize_candidates(result.candidates, &state.input_buffer);
         let phrases = self.phrases.read().unwrap_or_else(|e| e.into_inner());

@@ -195,8 +195,16 @@ impl Coordinator {
         // 特殊模式此前只消费 `result.candidates`、丢弃了这条旁路 → 屏幕全空；此处补上收口，
         // 与主路径 `update_candidates` 一致（见 handle_candidate.rs 的补全收口）。引擎已在
         // `show_code_hint` 循环里给它标好「剩余编码」注释，直接采纳即可。
+        // ⚠️ 补全候选**必须同样过 `finalize_candidates`**：它是 `$CC`/`$AA`/`{..}` 的统一展开
+        // 汇聚点，而这条旁路直接取自引擎、绕过了上面那一行。漏掉的表现是补出来的直通命令
+        // 候选原样显示成 `$CC(...)` 源码（`result.candidates` 走了汇聚点、它没走）。
         if state.candidates.is_empty() {
-            state.candidates.extend(result.completion_hint);
+            let hint = self.finalize_candidates(
+                result.completion_hint.into_iter().collect(),
+                &state.special_buffer,
+            );
+            // 仍只采纳一条（`$AA`/`$SS` 在前缀情形折叠为单个组名候选，正常也只有一条）。
+            state.candidates.extend(hint.into_iter().next());
         }
         // 词频重排与候选调整：归属**特殊方案自身**，与写端 `record_selection_in` 同一个 id。
         // 取自同一处（`effective_data_schema`）是硬要求——读写分别取自不同的地方，会得到

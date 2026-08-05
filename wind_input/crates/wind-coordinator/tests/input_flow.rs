@@ -6998,3 +6998,51 @@ fn special_mode_browse_exact_mode_hides_first_shows_next() {
 
     let _ = std::fs::remove_file(&store_path);
 }
+
+/// 空码补全补出来的 `$CC` 直通命令候选，必须显示 display 标签而非 `$CC(...)` 源码。
+///
+/// 回归用户反馈：`completion_hint` 直接取自引擎、**绕过了 `finalize_candidates` 这个
+/// 统一展开汇聚点**，而同一行下面的 `result.candidates` 走了。于是同一条词条，正常命中
+/// 时显示标签、被当作补全兜底时显示源码。
+#[test]
+fn completion_hint_command_shows_display_label_not_source() {
+    if !has_schemas() {
+        eprintln!("跳过：缺少 schema");
+        return;
+    }
+    let store_path = std::env::temp_dir().join("wind_completion_hint_cc.redb");
+    let _ = std::fs::remove_file(&store_path);
+    let store = std::sync::Arc::new(wind_store::Store::open(&store_path).unwrap());
+    // `aab` 复用既有回归码：六库均无精确 `aab`，但主库有 `aab?` 后继（见
+    // special_mode_exact_completion_shows_longer_code）。给用户词一个压倒性权重，
+    // 保证被备下的那条 hint 就是它。
+    store
+        .add_user_word("wubi86", "aaby", r#"$CC("《》", ask("x"))"#, 9_999_999, 0)
+        .unwrap();
+    let mut cfg = config_with("wubi86");
+    // 精确匹配 + 空码补全：aab 无精确候选、更长后继有 → 引擎备下 completion_hint。
+    cfg.schema.codetable.single_code_input = true;
+    cfg.schema.codetable.single_code_complete = true;
+    let coord = Coordinator::new_headless_with_store(cfg, Some(&data_dir()), store);
+
+    for ch in ['a', 'a', 'b'] {
+        press_letter(&coord, ch);
+    }
+    let texts = coord.debug_all_candidate_texts();
+    assert!(
+        !texts.is_empty(),
+        "精确匹配+空码补全下 aab 应补出更长编码候选（本用例的前提）"
+    );
+    assert!(
+        !texts.iter().any(|t| t.contains("$CC")),
+        "补全候选不该显示 $CC 源码（须过 finalize_candidates 汇聚点），实际: {:?}",
+        texts
+    );
+    assert!(
+        texts.iter().any(|t| t == "《》"),
+        "补全出的命令候选应显示 display 标签「《》」，实际: {:?}",
+        texts
+    );
+
+    let _ = std::fs::remove_file(&store_path);
+}
