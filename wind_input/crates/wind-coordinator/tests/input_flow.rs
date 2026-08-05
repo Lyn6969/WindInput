@@ -7019,12 +7019,27 @@ fn completion_hint_command_shows_display_label_not_source() {
     store
         .add_user_word("wubi86", "aaby", r#"$CC("《》", ask("x"))"#, 9_999_999, 0)
         .unwrap();
-    let mut cfg = config_with("wubi86");
-    // 精确匹配 + 空码补全：aab 无精确候选、更长后继有 → 引擎备下 completion_hint。
+    let mut cfg = config_with("pinyin");
+    // 精确匹配 + 空码补全：aab 无精确候选、更长后继有 → 引擎备下 completion_hints。
     cfg.schema.codetable.single_code_input = true;
     cfg.schema.codetable.single_code_complete = true;
+    // 走**特殊模式**路径：它取补全池的引擎序首条（weight 降序），不经跨来源重排，
+    // 故高权重用户词必然中选——主路径要与主库后继混排，取到哪条不稳定，断不住。
+    // 这也正是用户报告该现象的场景（快符）。
+    cfg.schema.special_modes = vec![wind_config::config::SpecialModeConfig {
+        id: "qsym".into(),
+        trigger_keys: vec!["backslash".into()],
+        schema: "wubi86".into(),
+        ..Default::default()
+    }];
     let coord = Coordinator::new_headless_with_store(cfg, Some(&data_dir()), store);
 
+    let act = coord.handle_key_event(&key_event(0xDC, EVENT_KEY_DOWN));
+    assert!(
+        matches!(act, KeyAction::UpdateComposition { .. }),
+        r"\ 应进入特殊模式，实际: {:?}",
+        act
+    );
     for ch in ['a', 'a', 'b'] {
         press_letter(&coord, ch);
     }
@@ -7042,6 +7057,49 @@ fn completion_hint_command_shows_display_label_not_source() {
         texts.iter().any(|t| t == "《》"),
         "补全出的命令候选应显示 display 标签「《》」，实际: {:?}",
         texts
+    );
+
+    let _ = std::fs::remove_file(&store_path);
+}
+
+/// 空码补全的判空必须落在**过滤之后**：短语候选被 shadow 滤光时，应补出引擎备下的
+/// 更长编码候选，而不是空屏。
+///
+/// 构造要点：候选必须在**过滤阶段**才消失。若引擎那一层就没候选，老代码的早判同样
+/// 会补全，测不到次序差异。故让短语层出一条候选（引擎层无精确候选、已备好 hint），
+/// 再用一条 shadow 规则把这条短语滤掉。
+#[test]
+fn completion_fills_after_shadow_empties_the_list() {
+    if !has_schemas() {
+        eprintln!("跳过：缺少 schema");
+        return;
+    }
+    let store_path = std::env::temp_dir().join("wind_completion_after_shadow.redb");
+    let _ = std::fs::remove_file(&store_path);
+    let store = std::sync::Arc::new(wind_store::Store::open(&store_path).unwrap());
+    // 短语占住 aab（引擎层对 aab 无精确候选，故 completion_hints 已备货）。
+    store.add_phrase("aab", "短语占位", 0, 100).unwrap();
+    // 直接写 shadow 规则把这条短语隐藏——右键删短语走的是「禁用短语」，那会让它在引擎
+    // 层就不再产出，重新落回「引擎层已空」，测不到本用例要锁的次序。
+    store.delete_shadow("wubi86", "aab", "短语占位").unwrap();
+
+    let mut cfg = config_with("wubi86");
+    cfg.schema.codetable.single_code_input = true;
+    cfg.schema.codetable.single_code_complete = true;
+    let coord = Coordinator::new_headless_with_store(cfg, Some(&data_dir()), store);
+
+    for ch in ['a', 'a', 'b'] {
+        press_letter(&coord, ch);
+    }
+    let texts = coord.debug_all_candidate_texts();
+    assert!(
+        !texts.contains(&"短语占位".to_string()),
+        "被 shadow 的短语不该出现，实际: {:?}",
+        texts
+    );
+    assert!(
+        !texts.is_empty(),
+        "短语被滤光后应补出更长编码候选，而非空屏——判空须在 apply_filter/apply_shadow 之后"
     );
 
     let _ = std::fs::remove_file(&store_path);

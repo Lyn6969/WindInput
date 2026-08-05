@@ -580,14 +580,12 @@ impl Coordinator {
         // 精确匹配空码补全的两个候选源，在下方「补全收口」处统一判空后择一采纳：
         // - `engine_completion`：码表引擎备下的更长编码首选（`ConvertResult::completion_hint`）；
         // - `completion_pool`：短语侧前缀命中（仅精确模式抑制了枚举时才装填）。
-        // ⚠️ `completion_hint` **必须同样过汇聚点**：它直接来自引擎（词库原始 value），而
+        // ⚠️ `completion_hints` **必须同样过汇聚点**：它直接来自引擎（词库原始 value），而
         // `result.candidates` 在下一行走了 finalize。漏掉的表现是补出来的直通命令候选原样
         // 显示成 `$CC(...)` 源码——同一张码表里的同一条词条，正常命中时显示标签、被当作
         // 补全兜底时显示源码。
-        let engine_completion = self.finalize_candidates(
-            result.completion_hint.into_iter().collect(),
-            &state.input_buffer,
-        );
+        let engine_completion =
+            self.finalize_candidates(result.completion_hints, &state.input_buffer);
         let mut completion_pool: Vec<Candidate> = Vec::new();
         let mut candidates = self.finalize_candidates(result.candidates, &state.input_buffer);
         let phrases = self.phrases.read().unwrap_or_else(|e| e.into_inner());
@@ -766,33 +764,12 @@ impl Coordinator {
             }
         }
         drop(phrases);
-        // ── 空码补全收口 ──────────────────────────────────────────────────────
-        // 精确匹配模式下「一条候选都没有」时补一条兜底。判据必须落在**最终列表**上：码表引擎
-        // 与短语层各自只看得见自己那一半，谁先跑谁就会拿子集的空当成全局的空——引擎抢先补一条，
-        // 屏幕上短语旁边就多出无关的后续编码；反过来引擎补的那条又会让短语侧误判「已有候选」
-        // 而放弃补全。故两边都只交候选源（`completion_hint` / `completion_pool`），在此统一判空、
-        // 统一取一条。
-        //
-        // 取哪一条：**若开启前缀匹配，本会显示在最前的那一条**——用与最终列表同一个
-        // `candidate_display_order` 排序，不另立跨来源的优先级规则，将来前缀模式排序改了这里自动跟随。
-        // 末级补 text 兜底：`lookup_prefix` 由 HashMap 遍历产出、顺序不定（见 wind-phrase
-        // lookup_prefix_at），而 `candidate_display_order` 无文本末级，同分时取到的会是随机一条。
         let mixed =
             self.engine_mgr.current_engine_type() == Some(wind_engine::engine::EngineType::Mixed);
         // 供拼音精确档判「消费整串」。字节长度，与 `consumed_length` 同域（缓冲恒 ASCII）。
         let input_len = state.input_buffer.len();
-        if candidates.is_empty() {
-            completion_pool.extend(engine_completion);
-            let ignore_weight = self.engine_mgr.active_base_sort_ignores_weight();
-            // 与最终列表同一套排序 ⇒ 同样先补 is_common（否则混输档位键在此退化为空操作，
-            // 上面「本会显示在最前的那一条」这句承诺就不成立了）。
-            self.mark_common(&mut completion_pool);
-            completion_pool.sort_by(|a, b| {
-                candidate_display_order(a, b, ignore_weight, mixed, input_len)
-                    .then_with(|| a.text.cmp(&b.text))
-            });
-            candidates.extend(completion_pool.into_iter().next());
-        }
+        // 空码补全的**择一推迟到全部过滤之后**（见下方「空码补全收口」）——判空必须落在
+        // 真正的最终列表上，而 `apply_filter` / `apply_shadow` 都在下面、都可能把列表清空。
         // 候选层级排序：合并引擎候选 + 短语后按统一层级重排（见 `candidate_display_order`）。
         // base_sort=natural 时忽略权重，对齐引擎 by_natural（否则合并短语后重排会与引擎发散）。
         let ignore_weight = self.engine_mgr.active_base_sort_ignores_weight();
@@ -830,6 +807,40 @@ impl Coordinator {
         self.apply_freq_rerank(&mut candidates[..rerank_len], &state.input_buffer);
         // Shadow 规则：删除过滤 + 置顶/移动重排（优先级最高，排序后应用）
         self.apply_shadow(&mut candidates, &state.input_buffer);
+        // ── 空码补全收口 ──────────────────────────────────────────────────────
+        // 精确匹配模式下「一条候选都没有」时补一条兜底。判据必须落在**最终列表**上：码表引擎
+        // 与短语层各自只看得见自己那一半，谁先跑谁就会拿子集的空当成全局的空——引擎抢先补一条，
+        // 屏幕上短语旁边就多出无关的后续编码；反过来引擎补的那条又会让短语侧误判「已有候选」
+        // 而放弃补全。故两边都只交候选源（`completion_hint` / `completion_pool`），在此统一判空、
+        // 统一取一条。
+        //
+        // ⚠️ **必须在过滤链末尾**（原先在合并短语之后、`apply_filter`/`apply_shadow` 之前）：
+        // 「最终列表」这个判据，只有走完全部过滤才算数。某码下的候选被检索范围滤光或被用户
+        // 全部隐藏时，早判的版本看到的是「还有候选」⇒ 不补 ⇒ 过滤后空屏。
+        //
+        // ⚠️ 补全池**自己也要走同一条过滤链**。尤其是 shadow：补进来的候选同样显示在当前码
+        // 的候选窗里，用户右键隐藏的往往正是它——不过滤的话，隐藏完当场又被补回来。
+        // （早判的版本里补全候选是先并进主列表再一起过滤的，故过滤语义与此等价，只是次序不同。）
+        //
+        // 取哪一条：**若开启前缀匹配，本会显示在最前的那一条**——用与最终列表同一个
+        // `candidate_display_order` 排序，不另立跨来源的优先级规则，将来前缀模式排序改了这里自动跟随。
+        // 末级补 text 兜底：`lookup_prefix` 由 HashMap 遍历产出、顺序不定（见 wind-phrase
+        // lookup_prefix_at），而 `candidate_display_order` 无文本末级，同分时取到的会是随机一条。
+        if candidates.is_empty() {
+            completion_pool.extend(engine_completion);
+            if !completion_pool.is_empty() {
+                // 与最终列表同一套排序 ⇒ 同样先补 is_common（否则混输档位键在此退化为空操作，
+                // 上面「本会显示在最前的那一条」这句承诺就不成立了）。
+                self.mark_common(&mut completion_pool);
+                self.apply_filter(state, &mut completion_pool);
+                self.apply_shadow(&mut completion_pool, &state.input_buffer);
+                completion_pool.sort_by(|a, b| {
+                    candidate_display_order(a, b, ignore_weight, mixed, input_len)
+                        .then_with(|| a.text.cmp(&b.text))
+                });
+                candidates.extend(completion_pool.into_iter().next());
+            }
+        }
         state.candidates = candidates;
         // 满码自动上屏「显示态」复评：引擎按未过滤候选判唯一（生僻同码字致不唯一被否决），
         // 但智能过滤后可能只剩唯一精确全码码表候选 → 据显示候选复评放行（逻辑与显示一致）。

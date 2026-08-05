@@ -2070,7 +2070,7 @@ impl Engine for PinyinEngine {
             is_empty,
             should_clear: false,
             // 拼音无「全码/空码补全」概念（`single_code_*` 是码表专属）。
-            completion_hint: None,
+            completion_hints: Vec::new(),
         })
     }
 

@@ -195,23 +195,9 @@ impl Coordinator {
         // 特殊模式此前只消费 `result.candidates`、丢弃了这条旁路 → 屏幕全空；此处补上收口，
         // 与主路径 `update_candidates` 一致（见 handle_candidate.rs 的补全收口）。引擎已在
         // `show_code_hint` 循环里给它标好「剩余编码」注释，直接采纳即可。
-        // ⚠️ 补全候选**必须同样过 `finalize_candidates`**：它是 `$CC`/`$AA`/`{..}` 的统一展开
-        // 汇聚点，而这条旁路直接取自引擎、绕过了上面那一行。漏掉的表现是补出来的直通命令
-        // 候选原样显示成 `$CC(...)` 源码（`result.candidates` 走了汇聚点、它没走）。
-        if state.candidates.is_empty() {
-            let hint = self.finalize_candidates(
-                result.completion_hint.into_iter().collect(),
-                &state.special_buffer,
-            );
-            // 仍只采纳一条（`$AA`/`$SS` 在前缀情形折叠为单个组名候选，正常也只有一条）。
-            state.candidates.extend(hint.into_iter().next());
-        }
         // 词频重排与候选调整：归属**特殊方案自身**，与写端 `record_selection_in` 同一个 id。
         // 取自同一处（`effective_data_schema`）是硬要求——读写分别取自不同的地方，会得到
         // 「写进 qsym、读的是 wubi86」：记账看着成功，候选顺序永远不动。
-        //
-        // 放在补全收口**之后**：补全出来的候选也该参与重排（与主路径
-        // `update_candidates` 的次序一致）。
         let owner = self.effective_data_schema(state);
         self.apply_freq_rerank_in(
             owner.as_deref(),
@@ -223,6 +209,19 @@ impl Coordinator {
             &mut state.candidates,
             &state.special_buffer,
         );
+        // ⚠️ 补全收口在过滤**之后**（与主路径 `update_candidates` 同次序）：判空要落在真正的
+        // 最终列表上，否则「该码下的候选被用户全部隐藏」时看到的是「还有候选」⇒ 不补 ⇒ 空屏。
+        // ⚠️ 补全候选**必须同样过 `finalize_candidates`**：它是 `$CC`/`$AA`/`{..}` 的统一展开
+        // 汇聚点，而这条旁路直接取自引擎、绕过了上面那一行。漏掉的表现是补出来的直通命令
+        // 候选原样显示成 `$CC(...)` 源码（`result.candidates` 走了汇聚点、它没走）。
+        // ⚠️ 也要过 shadow：补进来的候选同样显示在当前码的候选窗里，用户右键隐藏的往往正是
+        // 它——不过滤的话隐藏完当场又被补回来。
+        if state.candidates.is_empty() {
+            let mut hint = self.finalize_candidates(result.completion_hints, &state.special_buffer);
+            self.apply_shadow_in(owner.as_deref(), &mut hint, &state.special_buffer);
+            // 仍只采纳一条（`$AA`/`$SS` 在前缀情形折叠为单个组名候选，正常也只有一条）。
+            state.candidates.extend(hint.into_iter().next());
+        }
         // 自动上屏由方案码表引擎的 should_auto_commit 决定（prefix_free≈全码唯一、fixed_length 等
         // 映射到该方案的 [engine.codetable] 配置）；复核上屏目标仍在候选中。`$CC` 命令词条经
         // finalize_candidates 展开后 text 已改写为 display 标签，而引擎意向 commit_text 是原始
