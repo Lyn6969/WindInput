@@ -75,11 +75,18 @@ impl Coordinator {
     /// 返回 `Some` 表示已夺取，`None` 表示不夺取。混输引擎排除（避免 `zhang` 丢首字母，
     /// 对齐 Go 门禁）。
     ///
-    /// # 只有 `temp_pinyin` 支持夺取
+    /// # 支持哪些目标：临拼 / 临英 / mix，不含快符
     ///
-    /// 其余 `z_key_action`（临英 / mix / 特殊模式）只支持**首键**进入。夺取要求目标模式能接住
-    /// 一段残余编码并支持退格还原（`Rewind`），而那是临拼独有的机制；给别的模式硬套会得到
-    /// 一个退格退不回去的半残状态。
+    /// 夺取要求目标模式能**接住一段残余编码**：临拼收拼音、临英收英文原文、mix 收自由输入
+    /// （日期/计算/拼音/英文各自试），三者的残余码都有意义。
+    ///
+    /// `special`（快符类）刻意排除：那类表的编码是作者精心设计的短码，`zab` 抛掉 z 之后的
+    /// `ab` 落到快符表里多半什么也查不到；且它常开 `show_all_on_enter`，价值在「进入即浏览
+    /// 整表」，而夺取路径永远给不了那一下。
+    ///
+    /// ★ 为什么非得走夺取：本项目 `system.phrases.toml` 出厂带 37 条 `zz*` 标点短语，
+    /// `has_code_prefix("z")` 恒为真，**首键 z 恒被活码判据让位**。不给这些目标补一条夺取
+    /// 回路，`z_key_action = "mix:…"` 这类配置就是配了也永远不生效（2026-08-06 真机确认）。
     ///
     /// # 与 `z_key_repeat` 的关系（刻意不检查）
     ///
@@ -98,19 +105,15 @@ impl Coordinator {
             return None;
         }
         // 走 `bound_action_for` 而非 `z_key_action()`：方案级 `[key_actions]` 里写的 z 必须
-        // 压过全局 `schema.codetable.z_key_action`。用后者的话，方案把 z 改绑到快符表后，
-        // 首键进的是快符、而这里仍按「临拼」夺取——同一个键在两条路径上是两个身份。
-        if self.bound_action_for(wind_keys::keymap::VK_Z)
-            != Some(wind_config::BoundAction::TempPinyin)
-        {
-            return None;
-        }
+        // 压过全局 `schema.codetable.z_key_action`。用后者的话，方案把 z 改绑到别的目标后，
+        // 首键判定按新目标、而这里仍按「临拼」夺取——同一个键在两条路径上是两个身份。
+        let action = self.bound_action_for(wind_keys::keymap::VK_Z)?;
         let combined = format!("{}{}", state.input_buffer, ch);
-        // 加新键后仍是活码前缀（如 zhang 存在时的 "zh"）→ 不夺取，继续正常码表。
+        // 加新键后仍是活码前缀（如 zhang 存在时的 "zh"，或系统短语 `zzbd` 的 "zz"）→ 不夺取，
+        // 继续正常码表。这条同时保住了出厂那 37 条 `zz*` 标点短语。
         if self.has_code_prefix(&combined) {
             return None;
         }
-        let target = self.engine_mgr.temp_pinyin_target()?;
         // residual = 去掉首 z + 新键。
         let residual = format!("{}{}", &state.input_buffer[1..], ch);
         // snapshot = **夺取前**的正常码流，不含触发夺取的这一键（与 `Rewind::snapshot` 的字段
@@ -121,24 +124,61 @@ impl Coordinator {
         // 退到那里。且 `combined` 这一帧用户从没见过（按下该键的同一帧就被夺取了），退过去
         // 看起来就像「退格没生效、只是候选窗闪没了」，得再按一次才回到有候选的那一帧。
         let snapshot = state.input_buffer.clone();
-        state.active = Some(ModeKind::TempPinyin);
-        state.temp_pinyin_schema = target;
-        state.temp_pinyin_buffer = residual.clone();
-        state.temp_pinyin_cursor = state.temp_pinyin_buffer.len();
-        state.temp_pinyin_prefix = "z".to_string();
+
+        // 按目标模式装载残余码。门卫没过一律返回 None（不夺取，落正常码表），
+        // 与首键进入点同策略——绝不能吞键。
+        let mode_name = match &action {
+            wind_config::BoundAction::TempPinyin => {
+                let target = self.engine_mgr.temp_pinyin_target()?;
+                state.active = Some(ModeKind::TempPinyin);
+                state.temp_pinyin_schema = target;
+                state.temp_pinyin_buffer = residual.clone();
+                state.temp_pinyin_cursor = state.temp_pinyin_buffer.len();
+                state.temp_pinyin_prefix = "z".to_string();
+                "temp pinyin"
+            }
+            wind_config::BoundAction::TempEnglish => {
+                if !self.rt().config.input.temp_english.enabled {
+                    return None;
+                }
+                state.active = Some(ModeKind::TempEnglish);
+                state.temp_english_buffer = residual.clone();
+                state.temp_english_cursor = state.temp_english_buffer.len();
+                state.temp_english_prefix = "z".to_string();
+                "temp English"
+            }
+            wind_config::BoundAction::Mix(id) => {
+                let idx = self.mix_mode_idx(id)?;
+                if !self.mix_has_quick_input(idx) && self.mix_members(idx).is_empty() {
+                    return None;
+                }
+                state.active = Some(ModeKind::Mix(idx));
+                state.mix_id = idx;
+                state.mix_buffer = residual.clone();
+                state.mix_cursor = state.mix_buffer.len();
+                state.mix_prefix = "z".to_string();
+                "mix"
+            }
+            // 快符类不走夺取（残余码在符号表里查不到，且它要的是「进入即浏览」）；
+            // None 表示本方案没给 z 绑任何东西。
+            _ => return None,
+        };
+
         state.rewind = Some(Rewind {
             snapshot,
             host_text: residual,
         });
         state.input_buffer.clear();
         state.candidates.clear();
-        self.update_temp_pinyin_candidates(state);
+        match state.active {
+            Some(ModeKind::TempPinyin) => self.update_temp_pinyin_candidates(state),
+            Some(ModeKind::TempEnglish) => self.update_temp_english_candidates(state),
+            Some(ModeKind::Mix(_)) => self.update_mix_candidates(state),
+            _ => {}
+        }
         let display = state.preedit.clone();
         self.notify_ui_update(state);
-        debug!(
-            "z-fallback: hijacked to temp pinyin (buffer={})",
-            state.temp_pinyin_buffer
-        );
+        debug!("z-fallback: hijacked to {mode_name}");
         Some(KeyAction::UpdateComposition {
             text: display.clone(),
             caret_pos: display.chars().count() as u32,

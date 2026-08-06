@@ -32,6 +32,42 @@ fn make_override(tag: &str, schema_id: &str, body: &str) -> PathBuf {
     dir
 }
 
+/// 造一个**自带 `zz` 开头编码**的临时方案数据目录。
+///
+/// 为什么不能用 build_dev/data 的 wubi86：真机上 `has_code_prefix("z")` 恒真是靠
+/// `system.phrases.toml` 那 37 条 `zz*` 标点短语，而短语层要经 redb 建立，测试里
+/// `store` 是 None、短语层为空 → z 成了死码，首键直接进模式，**根本走不到夺取路径**。
+/// 这里改用码表自带 `zz` 编码来复现「z 是活码前缀」，与真机同构。
+fn make_data_dir_with_z_code(tag: &str) -> PathBuf {
+    let dir = std::env::temp_dir().join(format!("wind_ka_data_{tag}"));
+    let _ = std::fs::remove_dir_all(&dir);
+    let schemas = dir.join("schemas");
+    std::fs::create_dir_all(schemas.join("zt")).unwrap();
+    std::fs::write(
+        schemas.join("zt.schema.toml"),
+        "[schema]\nid = \"zt\"\nname = \"Z测试\"\n\
+         [engine]\ntype = \"codetable\"\n\
+         [engine.codetable]\nmax_code_length = 4\n\
+         [[dictionaries]]\nid = \"main\"\npath = \"zt/zt.dict.yaml\"\ndefault = true\n",
+    )
+    .unwrap();
+    // rime .dict.yaml：`---` 头之后是 `文本\t编码`。zz* 模拟系统短语占位，a 保证词库非空可用。
+    std::fs::write(
+        schemas.join("zt/zt.dict.yaml"),
+        "---\nname: zt\nversion: \"1\"\n...\n阿\ta\n甲\tzzbd\n乙\tzzsz\n",
+    )
+    .unwrap();
+    dir
+}
+
+fn cfg_for_z_schema() -> Config {
+    let mut c = Config::default();
+    c.schema.available = vec!["zt".into()];
+    c.schema.active = "zt".into();
+    c.input.default.chinese_mode = true;
+    c
+}
+
 fn cfg_for(active: &str) -> Config {
     let mut c = Config::default();
     c.schema.available = vec!["wubi86".into(), "pinyin".into()];
@@ -162,6 +198,78 @@ fn z_repeat_still_wins_for_temp_pinyin() {
         "绑 temp_pinyin 时 repeat 仍优先，z 应落普通输入而非进模式（后续字母由 z-fallback 补救）"
     );
     let _ = std::fs::remove_dir_all(&ov);
+}
+
+/// z 夺取回路推广到 mix：首键让位（保住 `zz*` 系统短语），下一键破前缀时夺取进快捷输入。
+///
+/// 本项目 `system.phrases.toml` 出厂带 37 条 `zz*` 标点短语，`has_code_prefix("z")` 恒真，
+/// 故首键 z **必然**被活码判据让位。不补这条夺取回路，`z = "mix:…"` 配了也永不生效。
+#[test]
+fn z_fallback_hijacks_into_mix() {
+    let dd = make_data_dir_with_z_code("zmix");
+    let ov = make_override("zmix", "zt", "z = \"mix:quick_mix\"");
+    let coord =
+        Coordinator::new_headless_with_override(cfg_for_z_schema(), Some(&dd), Some(ov.clone()));
+
+    coord.handle_key_event(&key(VK_Z));
+    assert_eq!(
+        coord.debug_active_mode(),
+        None,
+        "首键 z 应让位（zz* 使 z 成活码前缀），否则下面测的就不是夺取路径了"
+    );
+    // r：zr 不是任何编码的前缀 → 破前缀，夺取。
+    coord.handle_key_event(&key(0x52));
+    assert_eq!(
+        coord.debug_active_mode(),
+        Some("mix"),
+        "z + 破前缀字母应夺取进 mix"
+    );
+    let _ = std::fs::remove_dir_all(&ov);
+    let _ = std::fs::remove_dir_all(&dd);
+}
+
+/// ★ 对照组：`zz` 仍走活码路径，**不**夺取——出厂那 37 条 `zz*` 标点短语必须照打。
+///
+/// 没有这一条，上面那个用例即便在「z 无条件夺取」的错误实现下也会绿，而那种实现会把
+/// 所有用户的系统短语废掉。
+#[test]
+fn z_fallback_keeps_zz_system_phrases() {
+    let dd = make_data_dir_with_z_code("zz");
+    let ov = make_override("zz", "zt", "z = \"mix:quick_mix\"");
+    let coord =
+        Coordinator::new_headless_with_override(cfg_for_z_schema(), Some(&dd), Some(ov.clone()));
+
+    coord.handle_key_event(&key(VK_Z));
+    coord.handle_key_event(&key(VK_Z)); // zz —— 仍是活码前缀（zzbd/zzsz）
+    assert_eq!(
+        coord.debug_active_mode(),
+        None,
+        "zz 是 zzbd/zzsz 的前缀，必须留在正常输入流，不能被夺取（真机上对应那 37 条系统标点短语）"
+    );
+    let _ = std::fs::remove_dir_all(&ov);
+    let _ = std::fs::remove_dir_all(&dd);
+}
+
+/// 夺取后退到边界再退格 → 还原正常码流，不是停在半残的模式里。
+#[test]
+fn z_fallback_into_mix_can_rewind() {
+    let dd = make_data_dir_with_z_code("zrw");
+    let ov = make_override("zrw", "zt", "z = \"mix:quick_mix\"");
+    let coord =
+        Coordinator::new_headless_with_override(cfg_for_z_schema(), Some(&dd), Some(ov.clone()));
+
+    coord.handle_key_event(&key(VK_Z));
+    coord.handle_key_event(&key(0x52)); // zr → 夺取进 mix，残余 "r"
+    assert_eq!(coord.debug_active_mode(), Some("mix"));
+
+    coord.handle_key_event(&key(0x08)); // Backspace：退到夺取边界
+    assert_eq!(
+        coord.debug_active_mode(),
+        None,
+        "退到边界应撤销夺取、回到正常码表输入流（active_hijack_buffer 与 rewind_hijack 都要认得 mix）"
+    );
+    let _ = std::fs::remove_dir_all(&ov);
+    let _ = std::fs::remove_dir_all(&dd);
 }
 
 /// 方案表里的 `z` 必须**压过**全局 `schema.codetable.z_key_action`。
