@@ -71,6 +71,32 @@ pub fn decode_focus_gained(payload: &[u8]) -> Result<FocusGainedPayload, CodecEr
     })
 }
 
+/// 编码扩展信封 [`CMD_EXT`]：`kindLen u32 + kind + bodyLen u32 + body`。
+///
+/// `body` 不透明（JSON 或二进制块均可），本层不解析——见 `CMD_EXT` 文档的两档划分。
+pub fn encode_ext(kind: &str, body: &[u8]) -> Vec<u8> {
+    let mut p = Vec::with_capacity(8 + kind.len() + body.len());
+    p.extend_from_slice(&(kind.len() as u32).to_le_bytes());
+    p.extend_from_slice(kind.as_bytes());
+    p.extend_from_slice(&(body.len() as u32).to_le_bytes());
+    p.extend_from_slice(body);
+    frame(CMD_EXT, p)
+}
+
+/// 解扩展信封载荷 → `(kind, body)`。
+///
+/// 越界 / 非法 UTF-8 的 kind 一律视为**解析失败**返回 `None`，由调用方按「未知消息」忽略。
+/// 刻意不做「尽力而为」的部分解析：一个截断的信封说明对端有 bug 或版本不匹配，
+/// 拿半截 kind 去分发只会把错误引向更难查的地方。
+pub fn decode_ext(payload: &[u8]) -> Option<(&str, &[u8])> {
+    let kind_len = u32::from_le_bytes(payload.get(0..4)?.try_into().ok()?) as usize;
+    let kind = std::str::from_utf8(payload.get(4..4 + kind_len)?).ok()?;
+    let off = 4 + kind_len;
+    let body_len = u32::from_le_bytes(payload.get(off..off + 4)?.try_into().ok()?) as usize;
+    let body = payload.get(off + 4..off + 4 + body_len)?;
+    Some((kind, body))
+}
+
 /// 解 CMD_FOCUS_GAINED 载荷尾部的 darwin bundleID 段（`bundleIdLen:u32 + utf8`，偏移 39）。
 ///
 /// 该段是 macOS `.app` 专属：宿主 app 的 bundle id，服务端小写后当作「进程名」，供
@@ -776,6 +802,38 @@ mod tests {
     }
 
     #[test]
+    fn ext_envelope_roundtrip() {
+        let f = encode_ext("settings.open", br#"{"args":["--page=dict"]}"#);
+        assert_eq!(u16::from_le_bytes([f[2], f[3]]), CMD_EXT);
+        let (kind, body) = decode_ext(&f[8..]).expect("解不出信封");
+        assert_eq!(kind, "settings.open");
+        assert_eq!(body, br#"{"args":["--page=dict"]}"#);
+        // 空 body（纯信号型 kind）也须能往返。
+        let f2 = encode_ext("diag.hud", b"");
+        assert_eq!(decode_ext(&f2[8..]), Some(("diag.hud", &b""[..])));
+    }
+
+    #[test]
+    fn ext_envelope_rejects_truncated_or_invalid() {
+        // 截断：kind 长度声明超出实际字节。
+        let mut bad = 99u32.to_le_bytes().to_vec();
+        bad.extend_from_slice(b"abc");
+        assert_eq!(decode_ext(&bad), None);
+        // 截断：body 长度声明超出实际字节。
+        let mut bad2 = 3u32.to_le_bytes().to_vec();
+        bad2.extend_from_slice(b"abc");
+        bad2.extend_from_slice(&99u32.to_le_bytes());
+        assert_eq!(decode_ext(&bad2), None);
+        // 非法 UTF-8 的 kind。
+        let mut bad3 = 2u32.to_le_bytes().to_vec();
+        bad3.extend_from_slice(&[0xFF, 0xFE]);
+        bad3.extend_from_slice(&0u32.to_le_bytes());
+        assert_eq!(decode_ext(&bad3), None);
+        // 空载荷。
+        assert_eq!(decode_ext(&[]), None);
+    }
+
+    #[test]
     fn focus_gained_bundle_id_roundtrip() {
         let p = focus_payload_with_bundle("com.apple.TextEdit");
         assert_eq!(decode_focus_gained_bundle_id(&p), "com.apple.TextEdit");
@@ -1024,12 +1082,6 @@ fn push_menu_items(out: &mut Vec<u8>, items: &[MenuNode]) {
         push_string(out, &it.label);
         push_menu_items(out, &it.children);
     }
-}
-
-/// CmdOpenSettings (0x0507): 请求 .app 打开设置应用。payload = page 裸 UTF-8（无长度前缀），
-/// 空串=默认页。与 Swift `CandidatePanelHost` 的 `String(data:encoding:.utf8)` 解码对齐。
-pub fn encode_open_settings(page: &str) -> Vec<u8> {
-    frame(CMD_OPEN_SETTINGS, page.as_bytes().to_vec())
 }
 
 /// 写单个按键 combo：keyLen u32 + key + modCount u32 + modCount×(modLen u32 + mod)。

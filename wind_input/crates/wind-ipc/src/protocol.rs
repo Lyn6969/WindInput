@@ -106,14 +106,14 @@ pub const CMD_CANDIDATE_SELECT: u16 = 0x020D; // payload: pageLocalIndex i32 LE�
 pub const CMD_CANDIDATE_HOVER: u16 = 0x020E; // payload: pageLocalIndex i32 LE (-1=无；Windows 另带 anchorX/belowY/aboveY 三个 i32，当前仅取 index)
 pub const CMD_CANDIDATE_CONTEXT_MENU: u16 = 0x020F; // 上行：候选右键动作 (payload: index i32 + actionLen u32 + action UTF-8)
 pub const CMD_MENU_ACTION: u16 = 0x0210; // 上行：统一菜单项被选中 (payload: 菜单 id i32 LE)
-// ⚠️ 0x0211 平台双语义（历史遗留，dispatch 按 cfg 分臂，两侧上行方向平台互斥）：
-// - Windows DLL 上行 = CANDIDATE_SCROLL（Go/C++ BinaryProtocol.h 原始定义）；
-// - macOS .app 上行 = FRONT_CONTEXT（macOS 移植期新增时误复用了该码位，Swift BinaryCodec 已固化）。
-// 若未来需要在同一平台同时使用两者，须迁移 FRONT_CONTEXT 到空闲码位并同步 Swift 端。
-pub const CMD_CANDIDATE_SCROLL: u16 = 0x0211; // Windows 上行：host 候选框滚轮 (payload: delta i32，WHEEL_DELTA 倍数，正=上滚)；服务端统一决策（默认不翻页，对齐 Go）
-// darwin .app 上报前台上下文（命令直通车 app()/title()/sel() 取值）：
-// payload = appLen u32 + app(UTF-8) + titleLen u32 + title + selLen u32 + sel，均 LE 长度前缀。
-pub const CMD_FRONT_CONTEXT: u16 = 0x0211;
+pub const CMD_CANDIDATE_SCROLL: u16 = 0x0211; // 上行：host 候选框滚轮 (payload: delta i32，WHEEL_DELTA 倍数，正=上滚)；服务端统一决策（默认不翻页，对齐 Go）
+/// 上报前台上下文（命令直通车 `app()`/`title()`/`sel()` 取值，目前仅 darwin `.app` 发）：
+/// payload = appLen u32 + app(UTF-8) + titleLen u32 + title + selLen u32 + sel，均 LE 长度前缀。
+///
+/// 该值原为 `0x0211`，与 `CMD_CANDIDATE_SCROLL` 同码位、靠 `cfg` 分臂区分平台。那是唯一
+/// 一处**同方向**的语义复用，代价是「macOS 永远做不了滚轮翻页」。macOS 尚未发布，故直接
+/// 迁到空闲码位消除该约束，两平台此后码位含义完全一致。
+pub const CMD_FRONT_CONTEXT: u16 = 0x0215;
 /// Host render: DLL 侧 Band 窗口创建失败（异步上行，payload = reason u32）。
 /// 服务端收到后记日志并让 UI 回退本地窗口。与 C++ BinaryProtocol.h:36 对齐。
 pub const CMD_HOST_RENDER_FAILED: u16 = 0x0212;
@@ -137,7 +137,8 @@ pub const CMD_CANDIDATE_RECTS: u16 = 0x0503; // 候选命中矩形 (panel-local)
 pub const CMD_MODE_STATUS: u16 = 0x0504; // 输入模式状态 (菜单栏指示器)
 pub const CMD_CANDIDATE_MENU_FLAGS: u16 = 0x0505; // 每候选右键菜单禁用位
 pub const CMD_MENU_SHOW: u16 = 0x0506; // 统一菜单树 (响应 CmdShowContextMenu)
-pub const CMD_OPEN_SETTINGS: u16 = 0x0507; // 请求 .app 打开设置应用 (payload: page 裸 UTF-8, 空=默认页)
+// 0x0507 曾是 CMD_OPEN_SETTINGS（payload 为「页名+参数」空格串）。已改走扩展信封的
+// `settings.open`（body 为 JSON argv 数组），码位空出——新增下行专用码位可从这里取。
 pub const CMD_TOOLTIP_SHOW: u16 = 0x0508; // 候选悬停 tooltip
 pub const CMD_TOOLTIP_HIDE: u16 = 0x0509;
 pub const CMD_STATUS_SHOW: u16 = 0x050A; // 模式状态气泡
@@ -152,6 +153,54 @@ pub const CMD_KEY_SEQ: u16 = 0x050F; // comboCount u32 + comboCount×combo
 pub const CMD_KEY_HOLD: u16 = 0x0510; // 单个 combo（按下保持）
 pub const CMD_KEY_RELEASE: u16 = 0x0511; // 单个 combo（抬起）
 pub const CMD_KEY_TYPE: u16 = 0x0512; // 整段 UTF-8 文本（无长度前缀），.app 走 insertText 上屏
+
+// ──────────────────────────────────────────────
+// 扩展信封 (0x0E01，上下行同码位、按方向区分)
+// ──────────────────────────────────────────────
+
+/// 通用扩展信封：`kindLen u32 + kind(UTF-8) + bodyLen u32 + body(任意字节)`。
+///
+/// # 为什么要有它
+///
+/// 每加一个小功能就占一个码位，代价是**三处常量必须同步**（本文件 /
+/// `wind_tsf/include/BinaryProtocol.h` / Swift `ProtocolTypes.swift`），且码位一旦被某端
+/// 固化就再难回收——`CMD_FRONT_CONTEXT` 当年就是这么撞上 `CMD_CANDIDATE_SCROLL` 的。
+/// 低频消息没必要为此付出这个代价。
+///
+/// # 两档划分（新增消息时按此判断，不要凭直觉）
+///
+/// 判据是**一次连续输入里会不会被反复触发**：
+///
+/// - **高频**（每键 / 每帧 / 每次鼠标移动）→ **专用码位 + 定长或长度前缀的二进制**。
+///   如 `CMD_KEY_EVENT`、`CMD_HOST_RENDER_FRAME`、`CMD_CANDIDATE_HOVER`。这类路径上
+///   一次 JSON 解析与一次堆分配都是要算的。
+/// - **低频**（菜单动作、位置回报、诊断上报、截图请求、设置深链）→ **走本信封**，
+///   `kind` 命名 + `body` 放 JSON 或数据块。加功能=加一个 `kind` 字符串，不动协议常量。
+///
+/// # 演进性
+///
+/// - **未知 `kind` 一律安静忽略**（记 debug 日志，不报错、不断连）。这是新旧版本能互相
+///   兼容的根本：旧端收到新 `kind` 就当没看见，而不是解析失败把连接搞坏。
+/// - `body` 用 JSON 时，字段增删天然向前/向后兼容（未知字段忽略、缺失字段取默认）。
+/// - `body` 是**不透明字节**，本层不解析——既支持 JSON，也支持二进制块（如截图回传）。
+///   解析归消费方，避免 `wind-ipc` 被拖进业务语义。
+///
+/// # `kind` 命名约定
+///
+/// 小写点分，`域.动作`：`pos.candidate`、`diag.hud`、`settings.open`。域名沿用既有模块名，
+/// 新域在下方 [`ext_kind`] 里登记一个常量，不要在调用处写裸字符串。
+pub const CMD_EXT: u16 = 0x0E01;
+
+/// 扩展信封的 `kind` 常量登记处。**新增 kind 必须在此登记**（而不是在调用点写裸串），
+/// 否则两端拼写不一致的错误只会表现为「消息静默丢失」。
+pub mod ext_kind {
+    /// 下行：请求 `.app` 打开设置应用。body = `{"args":["--page=dict", …]}`。
+    pub const SETTINGS_OPEN: &str = "settings.open";
+    /// 上行：候选窗被拖动到新位置。body = `{"x":123,"y":456}`（内容左上角屏幕坐标）。
+    pub const POS_CANDIDATE: &str = "pos.candidate";
+    /// 上行：状态提示气泡被拖动到新位置。body 同上。
+    pub const POS_STATUS_TIP: &str = "pos.status_tip";
+}
 
 // 批处理
 pub const CMD_BATCH_EVENTS: u16 = 0x0F01;

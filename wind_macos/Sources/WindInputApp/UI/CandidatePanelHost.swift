@@ -285,9 +285,18 @@ public final class CandidatePanelHost {
             if let flags = try? BinaryCodec.decodeCandidateMenuFlagsPayload(frame.payload) {
                 DispatchQueue.main.async { [weak self] in self?.panel.updateMenuFlags(flags) }
             }
-        case DownstreamCmd.openSettings:
-            ModeStatusController.shared.openSettings(
-                arguments: BinaryCodec.decodeOpenSettingsArguments(frame.payload))
+        case DownstreamCmd.ext:
+            // 扩展信封：低频消息统一入口。未知 kind 安静忽略（版本兼容的根本）。
+            guard let (kind, body) = BinaryCodec.decodeExt(frame.payload) else { break }
+            switch kind {
+            case ExtKind.settingsOpen:
+                // body = {"args":["--page=dict", …]}，argv 已由 Rust 侧切好，这里直接用。
+                let args = (try? JSONSerialization.jsonObject(with: body)) as? [String: Any]
+                let argv = (args?["args"] as? [String]) ?? []
+                ModeStatusController.shared.openSettings(arguments: argv)
+            default:
+                NSLog("WindInput[ext] 未处理的 kind=\(kind)")
+            }
         case DownstreamCmd.tooltipShow:
             if let p = try? BinaryCodec.decodeTooltipPayload(frame.payload) {
                 DispatchQueue.main.async { [weak self] in self?.showTooltip(p) }

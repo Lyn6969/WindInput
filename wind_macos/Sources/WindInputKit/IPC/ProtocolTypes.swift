@@ -30,7 +30,10 @@ public enum UpstreamCmd {
     public static let candidateHover: UInt16   = 0x020E   // NSPanel 鼠标悬停候选 (payload: pageLocalIndex i32, -1=无)
     public static let candidateContextMenu: UInt16 = 0x020F // NSPanel 右键菜单动作 (payload: index i32 + actionLen u32 + action UTF-8)
     public static let menuAction: UInt16       = 0x0210   // 统一菜单项被选中 (payload: id i32)
-    public static let frontContext: UInt16     = 0x0211   // 前台上下文快照 (payload: appLen+app + titleLen+title + selLen+sel)
+    public static let frontContext: UInt16     = 0x0215   // 前台上下文快照 (payload: appLen+app + titleLen+title + selLen+sel)
+    /// 扩展信封 (上行)。低频消息的统一入口，见 Rust protocol.rs 的 CMD_EXT。
+    /// 布局: kindLen u32 + kind(UTF-8) + bodyLen u32 + body(任意字节, 通常 JSON)。
+    public static let ext: UInt16              = 0x0E01
     public static let caretUpdate: UInt16     = 0x0301
     public static let selectionChanged: UInt16 = 0x0302
     public static let caretPending: UInt16    = 0x0303
@@ -71,7 +74,9 @@ public enum DownstreamCmd {
     public static let modeStatus: UInt16       = 0x0504   // 输入模式状态 (中英/全半角/标点/方案), 供菜单栏指示器
     public static let candidateMenuFlags: UInt16 = 0x0505 // 当前页候选右键菜单禁用位 (每候选 1 字节)
     public static let menuShow: UInt16         = 0x0506   // 统一菜单树 (CmdShowContextMenu 请求的响应)
-    public static let openSettings: UInt16     = 0x0507   // 请求打开设置应用 (payload: page UTF-8)
+    /// 扩展信封 (下行)。与上行同码位、按方向区分，见 Rust protocol.rs 的 CMD_EXT。
+    /// 「打开设置」等低频消息走这里 (kind = "settings.open")，不再各占一个码位。
+    public static let ext: UInt16              = 0x0E01
     public static let tooltipShow: UInt16      = 0x0508   // 候选悬停 tooltip 文本 + 主题色; .app 据悬停候选矩形定位
     public static let tooltipHide: UInt16      = 0x0509   // 隐藏 tooltip (空 payload)
     public static let statusShow: UInt16       = 0x050A   // 状态提示气泡 (模式/标点/全半角文本 + 主题色 + 位置 + 时长)
@@ -84,6 +89,17 @@ public enum DownstreamCmd {
     public static let keyRelease: UInt16       = 0x0511   // 抬起之前 hold 的组合
     public static let keyType: UInt16          = 0x0512   // Unicode 文本上屏 (走 client.insertText, 非 CGEvent)
     public static let batchResponse: UInt16    = 0x0F02
+}
+
+/// 扩展信封的 kind 常量。**须与 Rust `wind_ipc::protocol::ext_kind` 逐字一致**——
+/// 两端拼写不一致的错误只会表现为「消息静默丢失」，没有任何报错。
+public enum ExtKind {
+    /// 下行：请求打开设置应用。body = `{"args":["--page=dict", …]}`。
+    public static let settingsOpen = "settings.open"
+    /// 上行：候选窗被拖动到新位置。body = `{"x":123,"y":456}`（内容左上角屏幕坐标）。
+    public static let posCandidate = "pos.candidate"
+    /// 上行：状态提示气泡被拖动到新位置。body 同上。
+    public static let posStatusTip = "pos.status_tip"
 }
 
 /// 按键组合 (CmdKeyTap/Hold/Release 解码结果, 及 KeySeq 内单项)。

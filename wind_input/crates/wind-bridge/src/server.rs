@@ -809,11 +809,8 @@ pub(crate) fn dispatch_command(
             Some(encode_ack())
         }
 
-        // ── darwin .app 上报前台上下文（appLen+app + titleLen+title + selLen+sel，上行）──
-        // 供命令直通车 app()/title()/sel() 取值；聚焦时快照。
-        // 0x0211 与 Windows 的 CMD_CANDIDATE_SCROLL 平台双语义（见 protocol.rs 注释），
-        // 本臂仅非 Windows 编译，Windows 由下方 SCROLL 臂接管。
-        #[cfg(not(windows))]
+        // ── 上报前台上下文（appLen+app + titleLen+title + selLen+sel，上行）──
+        // 供命令直通车 app()/title()/sel() 取值；聚焦时快照。目前仅 darwin `.app` 发。
         CMD_FRONT_CONTEXT => {
             let mut off = 0usize;
             let mut take = || -> Option<String> {
@@ -872,12 +869,20 @@ pub(crate) fn dispatch_command(
         }
 
         // ── host 候选框鼠标滚轮（delta i32，WHEEL_DELTA 倍数，Windows DLL SendAsync）──
-        // 0x0211 平台双语义：Windows=SCROLL / darwin=FRONT_CONTEXT（见 protocol.rs 注释）。
-        #[cfg(windows)]
         CMD_CANDIDATE_SCROLL => {
             if payload.len() >= 4 {
                 let delta = i32::from_le_bytes(payload[0..4].try_into().unwrap());
                 handler.handle_candidate_scroll(delta);
+            }
+            if is_async { None } else { Some(encode_ack()) }
+        }
+
+        // ── 扩展信封（低频消息的统一入口，见 protocol.rs 的 CMD_EXT）──
+        // 解不出 / 未知 kind 一律安静忽略：这正是新旧版本互相兼容的根本，绝不能升级成错误。
+        CMD_EXT => {
+            match decode_ext(payload) {
+                Some((kind, body)) => handler.handle_ext(kind, body),
+                None => warn!("CMD_EXT 载荷无法解析（长度 {}），忽略", payload.len()),
             }
             if is_async { None } else { Some(encode_ack()) }
         }

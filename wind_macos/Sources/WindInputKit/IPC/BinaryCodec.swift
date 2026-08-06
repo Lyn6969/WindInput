@@ -610,44 +610,39 @@ public enum BinaryCodec {
         return out
     }
 
-    /// 解 CmdOpenSettings (0x0507) 的裸 UTF-8 载荷为设置程序的 argv。
+    /// 解扩展信封 (0x0E01)：`kindLen u32 + kind + bodyLen u32 + body`。
     ///
-    /// 载荷形态由 Rust `handle_menu.rs::open_settings_with` 拼出：**页名后接参数**，空格分隔，
-    /// 如 `dict --schema=wubi86 --type=shadow` / `add-word --text="你 好"` / `--dark`（无页名）。
-    /// 含空白的值由 `build_settings_args` 用双引号包住，故此处按 shell 风格切词（仅认双引号，
-    /// 无转义——参数值来自本进程内部拼装，不含引号字面量）。
+    /// 低频消息的统一入口，见 Rust `protocol.rs` 的 `CMD_EXT`。**未知 kind 一律安静忽略**
+    /// ——这是新旧版本互相兼容的根本，调用方不要把它升级成错误。
     ///
-    /// ⚠️ 曾经这里把整串当成单个页名直接拼 `--page=<整串>`，于是设置端 `parse_target` 拿到
-    /// `dict --schema=…` 这种非法页 id、`parse_add_word` 也匹配不上 `--page=add-word …`，
-    /// 表现为「词库管理 / 加词只打开设置默认页」——**冷启动也复现**，与单实例无关。
-    ///
-    /// 首词不以 `--` 开头时视作页名并转成 `--page=<页名>`；其余原样直通（设置端自己校验取值）。
-    public static func decodeOpenSettingsArguments(_ buf: Data) -> [String] {
-        let raw = String(data: buf, encoding: .utf8) ?? ""
-        var tokens: [String] = []
-        var cur = ""
-        var quoted = false
-        var started = false // 区分「空 token」与「尚未开始」，使 `--text=""` 得以保留
-        for ch in raw {
-            if ch == "\"" {
-                quoted.toggle()
-                started = true
-            } else if !quoted, ch.isWhitespace {
-                if started { tokens.append(cur) }
-                cur = ""
-                started = false
-            } else {
-                cur.append(ch)
-                started = true
-            }
-        }
-        if started { tokens.append(cur) }
+    /// 解不出（截断 / 非法 UTF-8 的 kind）返回 nil，同样按「忽略」处理。
+    public static func decodeExt(_ buf: Data) -> (kind: String, body: Data)? {
+        guard buf.count >= 4 else { return nil }
+        let kindLen = Int(buf.readUInt32LE(at: 0))
+        guard buf.count >= 4 + kindLen + 4 else { return nil }
+        let base = buf.startIndex
+        guard let kind = String(
+            data: buf.subdata(in: (base + 4)..<(base + 4 + kindLen)), encoding: .utf8)
+        else { return nil }
+        let off = 4 + kindLen
+        let bodyLen = Int(buf.readUInt32LE(at: off))
+        guard buf.count >= off + 4 + bodyLen else { return nil }
+        return (kind, buf.subdata(in: (base + off + 4)..<(base + off + 4 + bodyLen)))
+    }
 
-        guard let first = tokens.first else { return [] }
-        if first.hasPrefix("--") {
-            return tokens
-        }
-        return ["--page=\(first)"] + tokens.dropFirst()
+    /// 编码扩展信封 (0x0E01 上行)。
+    public static func encodeExtFrame(kind: String, body: Data) -> Data {
+        let kindBytes = Array(kind.utf8)
+        var payload = Data(count: 4)
+        payload.writeUInt32LE(UInt32(kindBytes.count), at: 0)
+        payload.append(contentsOf: kindBytes)
+        var lenField = Data(count: 4)
+        lenField.writeUInt32LE(UInt32(body.count), at: 0)
+        payload.append(lenField)
+        payload.append(body)
+        var out = encodeHeader(cmd: UpstreamCmd.ext, payloadLen: UInt32(payload.count))
+        out.append(payload)
+        return out
     }
 
     /// 解 CmdCandidateMenuFlags (0x0505): count(u32) + count×(1 字节禁用位)。

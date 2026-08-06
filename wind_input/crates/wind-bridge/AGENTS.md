@@ -37,7 +37,10 @@ Named Pipe 服务器 + Push 管道，实现 Rust 服务进程与 C++ wind_tsf TS
 - **hide 必达 + `visible_owner` 单一真源**：所有隐藏路径（HideCandidates/HideTooltip/HideStatus/special 退出/断线 cleanup/Shutdown）统一收敛到 `hide_kind`，它只看 `visible_owner[kind]`、不查白名单/评估态；hide 帧 `target_instance_id=0`（clientID 从 1 起，0 恒不匹配 → 广播隐藏）。这是 Go 版「special 退出候选窗不隐藏」多实例 bug 的根治点，勿退化。
 - **翻页/hover 三值域必须区分**（真机踩坑：翻页点击无效）：① Rust 内部 tag `HOVER_PAGE_PREV/NEXT = 100000/100001`；② SHM hit-rect 表 & `CMD_CANDIDATE_SELECT` 上行 = `-1 上页 / -2 下页`；③ `CMD_CANDIDATE_HOVER` 上行（因 hover 需独立的「无」）= `-1 无 / -2 上页 / -3 下页`。写帧时（`wind-ui/manager.rs`）必须把内部 tag 重映射为 SHM 值域，正数 tag 会被 C++ `_HitTest` 当候选索引 → `mouse_select(100000)` 被丢弃。
 - **鼠标命令一律 i32**：`CMD_CANDIDATE_SELECT/HOVER/SCROLL`（0x020D/0x020E/0x0211）payload 是 i32，负值有语义。DLL 走 `SendAsync` 不读响应，dispatch 臂须 `if is_async { None }`（回 ack 会污染管道）。
-- **0x0211 平台双语义**：Windows=`CMD_CANDIDATE_SCROLL`（Go/C++ 原始）；darwin=`CMD_FRONT_CONTEXT`（macOS 移植期误复用）。dispatch 已按 `cfg` 分臂，两端上行方向平台互斥；未来同平台需共用须迁移 FRONT_CONTEXT 并同步 Swift。
+- **码位不复用**：`CMD_FRONT_CONTEXT` 已从 0x0211 迁到 **0x0215**，两平台此后码位含义完全一致（此前 0x0211 靠 `cfg` 分臂区分 Windows=SCROLL / darwin=FRONT_CONTEXT，代价是 macOS 永远做不了滚轮翻页）。
+- **新增消息先看两档**（判据：一次连续输入里会不会反复触发，详见 `wind-ipc/src/protocol.rs` 的 `CMD_EXT`）：
+  高频（每键/每帧/每次鼠标移动）→ 专用码位 + 二进制；低频（菜单、位置回报、诊断、深链）→ 走扩展信封 `CMD_EXT`(0x0E01)，加一个 `kind` 字符串即可，不动协议常量。
+  **未知 `kind` 一律安静忽略**——这是新旧版本互相兼容的根本，不要把它升级成错误。
 - **重连补推握手**（真机踩坑：服务重启后概率停留普通渲染）：SearchHost 这类 locked/transient DocMgr 宿主重连后**不发 focus_gained（DLL 跳过）也不重发 IME_ACTIVATED** → 永无 activation push → DLL 挂死 SHM 不重新 setup。解法 = `set_client_connected_hook` 在 push token 握手后回调，白名单 pid 定向补推 activation（avail=1）触发 C++ `_EnsureHostRenderSetup(forceRefresh)`。
 - **键事件刷新焦点**：同类 transient 宿主二次聚焦时 focus_gained/IME_ACTIVATED 都缺席，`CMD_KEY_EVENT` 分发时 `note_focus` 是唯一可靠焦点信号，否则 `active_target` 滞留旧进程致回退本地渲染。
 - **avail 位按事件源 PID**：`push_activation_status(client_token)` 用 `client_token >> 32`（PID）查白名单，不用全局焦点槽（会被兄弟进程污染）。

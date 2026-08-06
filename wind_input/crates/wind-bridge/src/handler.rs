@@ -336,6 +336,16 @@ pub trait MessageHandler: Send + Sync {
     /// darwin: .app 鼠标 hover 候选（页内下标，-1=无）。默认空。
     fn handle_candidate_hover(&self, _page_local_index: i32) {}
 
+    /// 扩展信封（`CMD_EXT`）：低频消息的统一入口。`kind` 见 `wind_ipc::protocol::ext_kind`，
+    /// `body` 是不透明字节（通常是 JSON），由实现方按 kind 解析。
+    ///
+    /// **给默认实现是刻意的**，与本 trait 其余「必需方法」的取舍相反：信封的设计前提就是
+    /// 「未知 kind 安静忽略」，那么"没实现"与"不认识这个 kind"在语义上是同一件事，
+    /// 强制每个实现（含测试夹具）写一遍空函数换不来任何安全性。
+    fn handle_ext(&self, kind: &str, _body: &[u8]) {
+        tracing::debug!("未处理的扩展消息 kind={kind}");
+    }
+
     /// darwin: 查询功能菜单，返回已编码的 `CmdMenuShow` 帧字节（响应 `CmdShowContextMenu`）。
     /// `simplified=true` 为 IMK 输入源菜单用的精简树(无子菜单)，false 为候选框右键/菜单栏
     /// 指示器用的完整树(带子菜单)。`.app` 端解码为原生 NSMenu。默认返回空 `Vec`。

@@ -42,6 +42,40 @@ pub(crate) fn build_settings_args(pairs: &[(&str, &str)]) -> String {
     out
 }
 
+/// 把 `page` + [`build_settings_args`] 产出的参数串还原成设置程序的 argv。
+///
+/// 与命令行不同，IPC 传的是**结构化 argv**，故必须在此把参数串切回一个个词。切词逻辑
+/// 刻意放在本文件——它和上面加引号的 `build_settings_args` 是一对，两者的引号约定必须
+/// 同源。此前这一步在 Swift 侧重做了一遍，等于让另一门语言去猜 Rust 的引号规则。
+///
+/// 仅认双引号、不认转义：值来自本进程内部拼装，不含引号字面量。
+pub(crate) fn settings_argv(page: Option<&str>, extra: &str) -> Vec<String> {
+    let mut argv = Vec::new();
+    if let Some(p) = page {
+        argv.push(format!("--page={p}"));
+    }
+    let (mut cur, mut quoted, mut started) = (String::new(), false, false);
+    for ch in extra.chars() {
+        if ch == '"' {
+            quoted = !quoted;
+            started = true;
+        } else if !quoted && ch.is_whitespace() {
+            if started {
+                argv.push(std::mem::take(&mut cur));
+            }
+            cur.clear();
+            started = false;
+        } else {
+            cur.push(ch);
+            started = true;
+        }
+    }
+    if started {
+        argv.push(cur);
+    }
+    argv
+}
+
 /// 组装设置程序的完整命令行参数串。
 ///
 /// `--page <p>` 与附加参数各自独立成段：附加参数**不依附于页**（`--dark` / `--soft`
@@ -726,13 +760,14 @@ impl Coordinator {
         // Swift 侧解析方式不变。
         #[cfg(target_os = "macos")]
         {
-            let target = match (page, extra.is_empty()) {
-                (Some(p), false) => format!("{p} {extra}"),
-                (Some(p), true) => p.to_string(),
-                (None, false) => extra.to_string(),
-                (None, true) => String::new(),
-            };
-            let encoded = wind_ipc::codec::encode_open_settings(&target);
+            // 走扩展信封传结构化 argv：Swift 侧直接拿数组用，不必知道引号约定
+            // （旧路径传的是「页名 + 参数」空格串，切词在 Swift 侧重做了一遍）。
+            let argv = settings_argv(page, extra);
+            let body = serde_json::json!({ "args": argv }).to_string();
+            let encoded = wind_ipc::codec::encode_ext(
+                wind_ipc::protocol::ext_kind::SETTINGS_OPEN,
+                body.as_bytes(),
+            );
             self.push_server.push_to_active(&encoded);
             return;
         }
@@ -1735,6 +1770,30 @@ mod tests {
             "--text=\"a b\"",
             "含空白必须加引号，否则会被 CommandLineToArgvW 拆成两个 argv"
         );
+    }
+
+    /// `build_settings_args` 加的引号必须能被 `settings_argv` 原样还原——两者是一对，
+    /// 任一侧单独改都会让含空白的值（如加词的 `--text=你 好`）在 macOS 上被拆成两个参数。
+    #[test]
+    fn settings_argv_round_trips_quoting() {
+        use super::{build_settings_args, settings_argv};
+        assert_eq!(settings_argv(Some("dict"), ""), vec!["--page=dict"]);
+        assert_eq!(
+            settings_argv(Some("dict"), &build_settings_args(&[("schema", "wubi86")])),
+            vec!["--page=dict", "--schema=wubi86"]
+        );
+        // 含空白的值：加引号 → 切词后必须仍是**一个** argv，且引号已剥掉。
+        assert_eq!(
+            settings_argv(
+                Some("add-word"),
+                &build_settings_args(&[("text", "你 好"), ("code", "nihao")])
+            ),
+            vec!["--page=add-word", "--text=你 好", "--code=nihao"]
+        );
+        // 无页 + 无参数 → 空 argv（设置端按默认页处理）。
+        assert!(settings_argv(None, "").is_empty());
+        // 无页但有参数（`--dark` 这类）：参数不依附于页，须原样带上。
+        assert_eq!(settings_argv(None, "--dark"), vec!["--dark"]);
     }
 
     /// 附加参数不依附于页：没给页也要原样带上（`--dark`/`--soft` 无页也有意义）。

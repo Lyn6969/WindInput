@@ -143,36 +143,45 @@ final class BinaryCodecTests: XCTestCase {
         XCTAssertEqual(decoded.prevChar, 0)
     }
 
-    // MARK: - CmdOpenSettings (0x0507) 深链切词
+    // MARK: - 扩展信封 (0x0E01)
 
-    func testOpenSettingsArguments_PageOnly() {
-        XCTAssertEqual(
-            BinaryCodec.decodeOpenSettingsArguments(Data("dict".utf8)), ["--page=dict"])
+    func testExtEnvelope_Roundtrip() throws {
+        let body = Data(#"{"args":["--page=dict","--schema=wubi86"]}"#.utf8)
+        let f = BinaryCodec.encodeExtFrame(kind: ExtKind.settingsOpen, body: body)
+        let (cmd, _, _) = try BinaryCodec.decodeHeader(f)
+        XCTAssertEqual(cmd, UpstreamCmd.ext)
+        let payload = f.subdata(in: WireProtocol.headerSize ..< f.count)
+        let got = BinaryCodec.decodeExt(payload)
+        XCTAssertEqual(got?.kind, ExtKind.settingsOpen)
+        XCTAssertEqual(got?.body, body)
     }
 
-    func testOpenSettingsArguments_PageWithExtras() {
-        // 回归: 整串曾被塞进单个 --page=, 设置端 parse_target 解析不出页 id, 只开默认页。
-        let a = BinaryCodec.decodeOpenSettingsArguments(
-            Data("dict --schema=wubi86 --type=shadow".utf8))
-        XCTAssertEqual(a, ["--page=dict", "--schema=wubi86", "--type=shadow"])
+    func testExtEnvelope_EmptyBody() throws {
+        let f = BinaryCodec.encodeExtFrame(kind: "diag.hud", body: Data())
+        let payload = f.subdata(in: WireProtocol.headerSize ..< f.count)
+        XCTAssertEqual(BinaryCodec.decodeExt(payload)?.kind, "diag.hud")
+        XCTAssertEqual(BinaryCodec.decodeExt(payload)?.body.count, 0)
     }
 
-    func testOpenSettingsArguments_QuotedValueWithSpace() {
-        // build_settings_args 对含空白的值加双引号; 切词后引号须去掉、值保持完整。
-        let a = BinaryCodec.decodeOpenSettingsArguments(
-            Data("add-word --text=\"你 好\" --code=nihao".utf8))
-        XCTAssertEqual(a, ["--page=add-word", "--text=你 好", "--code=nihao"])
+    func testExtEnvelope_TruncatedReturnsNil() {
+        // 截断的信封须解成 nil 交由调用方忽略, 不能拿半截 kind 去分发。
+        var bad = Data(count: 4)
+        bad.writeUInt32LE(99, at: 0)   // kindLen 超出实际字节
+        bad.append(contentsOf: Array("abc".utf8))
+        XCTAssertNil(BinaryCodec.decodeExt(bad))
+        XCTAssertNil(BinaryCodec.decodeExt(Data()))
     }
 
-    func testOpenSettingsArguments_NoPageOnlyFlags() {
-        // page=None + extra 非空 (如 --dark): 首词已是选项, 不得再包一层 --page=。
-        XCTAssertEqual(
-            BinaryCodec.decodeOpenSettingsArguments(Data("--dark --soft".utf8)),
-            ["--dark", "--soft"])
-    }
-
-    func testOpenSettingsArguments_Empty() {
-        XCTAssertEqual(BinaryCodec.decodeOpenSettingsArguments(Data()), [])
-        XCTAssertEqual(BinaryCodec.decodeOpenSettingsArguments(Data("   ".utf8)), [])
+    /// Rust 侧 settings_argv 已把 argv 切好, Swift 只做 JSON 取值 —— 回归:
+    /// 此前是 Swift 自己按空格+双引号切词, 等于让另一门语言去猜 Rust 的引号规则。
+    func testExtEnvelope_SettingsArgsAreStructured() throws {
+        let body = Data(#"{"args":["--page=add-word","--text=\u4f60 \u597d"]}"#.utf8)
+        let f = BinaryCodec.encodeExtFrame(kind: ExtKind.settingsOpen, body: body)
+        let payload = f.subdata(in: WireProtocol.headerSize ..< f.count)
+        let got = try XCTUnwrap(BinaryCodec.decodeExt(payload))
+        let obj = try JSONSerialization.jsonObject(with: got.body) as? [String: Any]
+        let argv = try XCTUnwrap(obj?["args"] as? [String])
+        XCTAssertEqual(argv.count, 2, "含空格的值必须仍是一个 argv")
+        XCTAssertEqual(argv[1], "--text=\u{4f60} \u{597d}")
     }
 }

@@ -57,6 +57,24 @@ constexpr uint16_t CMD_CARET_PROBE      = 0x0304; // First-show probe: one pre-r
 // DLL 只上报、不做判断：首帧 reflow 期间宿主可能连续多次 layout change，前几次 GetTextExt
 // 仍返回旧坐标（实测 WPS 前两次是上一轮的值，EverEdit 第一次就已正确）。哪一帧可信由服务端
 // 按策略判定，故这里不筛不等，纯采样上报——策略留在能读 compat.toml 的那一侧。
+// Generic extension envelope (same code point both directions, distinguished by
+// direction like the rest of this file). Layout:
+//   kindLen u32 + kind(UTF-8) + bodyLen u32 + body(opaque bytes, usually JSON)
+//
+// Two-tier rule for NEW messages (see wind-ipc/src/protocol.rs CMD_EXT for the full
+// rationale). The test is whether the message repeats within one continuous typing run:
+//   - high frequency (per key / per frame / per mouse move) -> dedicated code point,
+//     fixed or length-prefixed binary layout;
+//   - low frequency (menu actions, position reports, diagnostics, deep links)
+//     -> this envelope; adding a feature means adding a `kind` string, not a constant.
+//
+// Unknown `kind` MUST be ignored silently (log at debug, never error, never drop the
+// connection) -- that is what lets old and new peers interoperate.
+//
+// Currently unused on the Windows side; declared here so the three copies of this
+// protocol (Rust / C++ / Swift) stay in step.
+constexpr uint16_t CMD_EXT              = 0x0E01;
+
 constexpr uint16_t CMD_BATCH_EVENTS     = 0x0F01; // Batch events container
 constexpr uint16_t CMD_INPUT_STATS      = 0x0F03; // Input stats report (async, from English mode)
 
