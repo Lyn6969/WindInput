@@ -39,6 +39,9 @@ pub mod screenshot;
 pub mod status;
 pub mod status_tip;
 pub mod sys;
+/// macOS 系统明暗变更监听。对位 Windows 消息泵里的 `WM_SETTINGCHANGE`。
+#[cfg(target_os = "macos")]
+pub mod system_theme_macos;
 pub mod text;
 pub mod theme_assets;
 pub mod toast;

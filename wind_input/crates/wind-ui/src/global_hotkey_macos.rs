@@ -309,6 +309,11 @@ unsafe fn drain_pending() {
         return;
     };
 
+    // 顺带在此装系统明暗观察者（幂等）。分发通知投递到**添加观察者那个线程**的 run loop，
+    // 而本函数是唯一一处「已在主线程、又拿得到 ev_tx」的地方：协调器构造期必定 sync 一次
+    // 热键表（空表也下发），所以这里必然会被走到。
+    crate::system_theme_macos::ensure_installed(ev_tx.clone());
+
     // 覆盖式：配置重载可能改键/删项，旧的必须全撤。
     {
         let mut reg = match REGISTERED.lock() {
