@@ -41,6 +41,9 @@
 - **跨平台三层（见 lib.rs，改前必读）**：① 纯 Rust 真实可测——`view` 盒模型布局/形状光栅化、`viewbox`、`debounce`、`image_cache`；② mock 近似——`text::dwrite` 非 Windows 返回等宽近似；③ 仅占位——Layered Window、DirectWrite 字形、剪贴板、消息泵在非 Windows 是空实现。动到 ② ③ 必须 Windows 实测。
 - **命令循环要点**：`ui_thread` 大 `match` 消费 `UiCommand`；连续 `UpdateCandidates` 会被合并只渲染最新帧，`HideToolbar`/状态泡走防抖（消除 Alt+Tab、连按切换的闪烁）。加功能 = 加 `UiCommand` 变体 + 加 `match` 分支（缺分支编译过但静默无效）。
 - **主题只消费不定义**：颜色/几何/背景图来自 wind-theme 的 `Resolved`/`RvNode`/`RvImage`/`schema::Dim`，经 `SetTheme(Box<Resolved>)` 分发到各窗口 `set_theme`。本 crate 不持有主题语义，别在此硬编码主题色/尺寸。
+- **候选窗定位偏移的注入点**：主题 `window.position_offset` 只在 `place_window`（跟随光标）内部、**锚点计算处**注入，不在调用方给返回值加——函数内有 `rcWork` 越界钳制，在外面加偏移会把窗口推出屏幕且钳不回来。上方锚点用**减号**（正值恒为「远离光标」）。三个调用点（Windows/macOS/render_frame）全接；`fixed_pos` 与 `drag_pin` 分支**不叠加**，那是用户显式意图。纯计算部分抽在 `caret_anchors`，因为 `place_window` 余下是 `#[cfg(windows)]` 的屏幕钳制、单测覆盖不到。
+- **一个装饰两处装配 = 迟早不同步**：模式徽标有「横排内嵌预编辑栏」与「竖排独立 chip」两条通路，已抽 `decorate_mode_chip` 共用；候选列表/翻页栏的盒装饰抽 `decorate_box`。往候选窗加这类外观时先找现成闭包，别再复制一份。
+- **边框圆角别用 `eff_border` 的第三个返回值**：它在节点未配 `border.radius` 时兜底 `0.0`，直接用会把上游按 `item_radius` 设好的圆角抹平。只取它的色与宽，圆角走节点自身的 `border_radius`（`candidate_window.rs` 内有两处注释标记这个坑）。
 - **浮层不抢焦点（不变量）**：wnd_proc 对 `WM_MOUSEACTIVATE`→`MA_NOACTIVATE`、`WM_NCHITTEST`→`HTCLIENT`，点击候选/工具栏不激活窗口、目标应用保持前台；菜单窗无焦点，键盘由协调器 `MenuKey(VK)` 转发。改窗口样式/消息处理时勿破坏这条。
 
 ### Testing Requirements

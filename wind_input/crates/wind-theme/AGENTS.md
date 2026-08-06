@@ -12,7 +12,7 @@
 | `src/lib.rs` | 对外导出：`Resolved`/`ResolvedBehavior`、`RvNode`/`RvViews`/`RvImage`/`RvGradient`、`load_resolved`/`load_resolved_dirs`/`resolve`、`Meta` 等顶层入口 |
 | `src/schema.rs` | 类型化 v3 schema：`Dim`（dp/px/%）、`Ld`（light/dark 解析中间形态）、`ViewNode`/`Views`/`Theme`/`Behavior` 等，base 深合并后的 serde 解析目标 |
 | `src/theme.rs` | TOML 加载 + base 单链继承深合并：`load_typed_dirs`（Value 层合并→normalize→类型化）、`find_theme_dir`、`theme_chain_dirs`（资产目录链）、`validate_text`（导入前校验） |
-| `src/normalize.rs` | 扁平人写 TOML → 规范嵌套形态：顶层视图表收入 `views.*`、`radius`→`border.radius`、`margin/padding/slice` 简写展开、`shadow.offset=[x,y]` 拆分为 `offset_x/y`、toolbar button `chinese/english`→`mode.*` |
+| `src/normalize.rs` | 扁平人写 TOML → 规范嵌套形态：顶层视图表收入 `views.*`、`radius`→`border.radius`、`margin/padding/slice` 简写展开、`shadow.offset=[x,y]` 拆分为 `offset_x/y`、`position_offset=[x,y]`→`{x,y}`、toolbar button `chinese/english`→`mode.*` |
 | `src/palette.rs` | 调色板解析：colors 段 → `HashMap<String, Rgba>`，支持 `${var}` 多跳递归引用 + 环检测 + `{light,dark}` 变体选取 |
 | `src/resolve.rs` | 求值入口：typed `Theme` → `Resolved`；`resolve_view_node`/`resolve_state` 通用节点/状态 patch 求值；`load_resolved_dirs` 便捷入口 |
 | `src/rvnode.rs` | 渲染消费形态：`RvNode`（颜色已解析为 `Rgba`、几何保持 `Dim` 符号态）、`RvViews`（全节点集合 + 列表级几何）、`RvImage`/`RvGradient` |
@@ -27,6 +27,8 @@
 - **`Ld` 只是解析中间形态**：`Ld::select(is_dark)` 在 `resolve_color` 中坍缩为单值后进入 `RvNode`。`RvNode` 中颜色字段类型是 `Option<Rgba>`，不存 `Ld`。新增颜色字段时遵循此分层，不得把 `Ld` 带入 `RvNode`。
 - **几何字段 `Dim` 进 `RvNode` 仍保持符号态**（`Option<Dim>`），paint 期 `Dim::resolve(scale, host)` 才换算为像素。不得在 `resolve` 层提前换算。
 - **state patch 不合并几何**：`resolve_state` 判定"有覆盖"的条件是色/图/渐变/层/字重等，纯几何 patch（只改 padding 等）返回 `None` 丢弃（防止候选框状态切换时跳动，`state_geometry unsupported`）。新增状态字段前确认是否属于此豁免范围。
+- **「默认值」不能靠 `RvViews` 的 derive `Default`**：数值型字段（非 `Option`）的零值等于「算成 0」，不等于「用出厂默认」。典型是 `accent_bar_height_ratio`——derive 给 0.0 会让条高算成 0（钳到 2px 细线），观感是强调条消失。此类字段须在 `resolve` 期显式写默认值（常量放 `rvnode.rs`，如 `DEFAULT_ACCENT_BAR_HEIGHT_RATIO`），**且消费端再判零兜底**，两处缺一都会让未配该项的主题（含全部内置主题）出问题。
+- **给 `views.*` 加字段后要检查渲染层是否真消费**：本 crate 只负责「解析 + 求值」，字段进了 `RvViews` 不代表生效。历史上 `accent_bar.height_ratio`/`.offset`、`toolbar.border.radius`/`.width` 都曾停在这一层，schema 有、resolve 有、渲染硬编码，主题写了毫无变化，而编辑器照 schema 开放了控件 —— 用户看到的是「配了不生效」。加字段的最后一步是 grep `wind-ui` 确认消费点存在。
 - **资产目录链 `Resolved.asset_dirs`**：`asset_dirs[0]` 为 self 主题目录（resources 相对路径基准），后续为 base 链目录（`theme_chain_dirs` 返回）。字面 image ref（如 `_base` 的 `chevron.svg`）需到 base 目录查找。加载路径逻辑在 `theme.rs::find_theme_dir`，靠前目录优先（用户目录可覆盖内置）。
 
 ### Testing Requirements

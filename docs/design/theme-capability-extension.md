@@ -2,6 +2,29 @@
 
 跨仓：主仓 `WindInput` + 主题编辑器 `WindInputThemeEditor`。
 
+## 实施状态：全部完成（待真机核对）
+
+| 需求 | 主仓 | 编辑器 |
+|---|---|---|
+| 5 Toast 边框预览 | 无需改动（引擎本就正确） | `e1ad8f1` |
+| 1 强调条比例 + 左缘偏移 | `8cd3e73` | `e1ad8f1` |
+| 4 工具栏整条圆角 + 边框宽 | `389906b` | `fc6449a` |
+| 3 四节点盒模型补齐 | `0419e5e` | `1a02850` |
+| 2 候选窗位置偏移 | `2430942` | `a4f08cb` |
+
+自动化验证：主仓 `wind-theme` 32 项 + `wind-ui` 95 项全绿，新增用例 9 个；
+编辑器 365 项全绿（新增 3 个），`pnpm build`（含 `vue-tsc`）通过；
+`place_window` 的 too-many-arguments clippy 告警已通过元组参数消除。
+
+**真机待核对**（`scripts/dev.ps1 d1`）：候选窗横/竖排零回归、强调条比例与偏移、
+工具栏圆角（含 `radius=0` 直角）、四节点背景边框、位置偏移的贴光标距离与上翻方向。
+
+实施中发现方案未预见的两处，已一并修：
+- 编辑器 `borderVal` 按 ViewNode 约定排除 radius，而 `dumpToolbar` 没有对应的节点级上提、
+  引擎 `normalize_toolbar` 也不下沉散键 radius —— 工具栏圆角配了之后**一导出就丢**。
+- 编辑器有两条解析路径，现行的 `theme3/resolve.ts` 里 `accentBarHRatio` 硬写 0
+  且注释说明「刻意不读主题」，与 `theme/resolveViews.ts` 不同源。
+
 ## 0. 根因总表
 
 调研结论（一手核验，附文件行号）。五项里有三项是同型病：**schema 有字段 → resolve 有透传 → 渲染层不消费**，字段"存在但是死的"。
