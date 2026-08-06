@@ -101,7 +101,20 @@ unsafe extern "C" {
         actual_size: *mut usize,
         data: *mut c_void,
     ) -> OSStatus;
+    fn TransformProcessType(psn: *const ProcessSerialNumber, form: u32) -> OSStatus;
 }
+
+#[repr(C)]
+struct ProcessSerialNumber {
+    high: u32,
+    low: u32,
+}
+
+/// `kCurrentProcess`（`{0, 2}`）。
+const CURRENT_PROCESS: ProcessSerialNumber = ProcessSerialNumber { high: 0, low: 2 };
+/// `kProcessTransformToUIElementApplication`：提升为「UI 元素应用」——有窗口服务器连接，
+/// 但**不进 Dock、不占菜单栏**。
+const TRANSFORM_TO_UI_ELEMENT: u32 = 4;
 
 // ── Carbon 修饰键掩码（Events.h）──
 const CARBON_CMD: u32 = 0x0100;
@@ -202,6 +215,21 @@ pub fn stop_main_loop() {
 /// **必须在进程主线程调用**（见模块头「线程约定」）。
 pub fn run_main_loop() {
     unsafe {
+        // 0. 把本进程提升为「UI 元素应用」。
+        //
+        // ⚠️ **这一步不能省，且它的缺失极难从返回码上看出来**：服务是 LaunchAgent 拉起的
+        // 裸可执行文件，默认是后台进程，没有窗口服务器连接。此时 `InstallEventHandler` 与
+        // `RegisterEventHotKey` **都照常返回 noErr**（日志里赫然写着「N/N 条生效」），
+        // 但热键事件经由窗口服务器投递到应用事件队列，而这个进程根本没有那个队列——
+        // 回调于是一次也不会触发。
+        //
+        // 实测判据：不做本调用时进程不出现在 `lsappinfo list` 里，做了才出现。
+        // UIElement 形态不进 Dock、不占菜单栏，对一个输入法服务没有可见副作用。
+        let st = TransformProcessType(&CURRENT_PROCESS, TRANSFORM_TO_UI_ELEMENT);
+        if st != 0 {
+            tracing::warn!("全局热键: TransformProcessType 失败 OSStatus={st}，热键可能收不到事件");
+        }
+
         // 1. 装热键 handler（应用级 target，收 kEventHotKeyPressed）。
         let spec = EventTypeSpec {
             event_class: K_EVENT_CLASS_KEYBOARD,

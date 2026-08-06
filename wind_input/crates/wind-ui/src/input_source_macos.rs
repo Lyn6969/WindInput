@@ -28,7 +28,7 @@ use core_foundation_sys::dictionary::{
 };
 use core_foundation_sys::string::{CFStringCreateWithBytes, CFStringRef, kCFStringEncodingUTF8};
 use std::ffi::c_void;
-use tracing::{debug, info, warn};
+use tracing::{info, warn};
 
 type OSStatus = i32;
 type TISInputSourceRef = *mut c_void;
