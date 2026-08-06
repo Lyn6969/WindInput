@@ -29,6 +29,9 @@ wind-ipc = { path = "../wind-ipc" }
 # wind-ipc 供 manager_macos forwarder 编码 host-render / 候选命中 / 状态帧。
 [target.'cfg(target_os = "macos")'.dependencies]
 core-foundation = "0.10"
+core-foundation-sys = "0.8"
 core-graphics = "0.25"
 core-text = "22.0.0"
 wind-ipc = { path = "../wind-ipc" }
+# 全局热键（global_hotkey_macos）复用 key_inject 的 VK → CGKeyCode 表，禁止另起一份。
+wind-keys = { path = "../wind-keys" }

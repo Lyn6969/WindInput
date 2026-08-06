@@ -383,6 +383,41 @@ fn main() {
     }
 
     // 10. 阻塞主线程，直到菜单触发"重启服务"
+    //
+    // macOS 例外：主线程改跑 CFRunLoop。Carbon 全局热键的事件只投递到**主线程**的
+    // 事件队列，辅助线程自己跑 run loop 收不到（见 wind_ui::global_hotkey_macos 模块头）。
+    // 「重启服务」的等待挪到辅助线程，收到信号后停 run loop，主线程回到这里走原重启路径
+    // ——语义与其它平台一致，只是等待的姿势不同。
+    #[cfg(target_os = "macos")]
+    {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        static RESTART: AtomicBool = AtomicBool::new(false);
+        std::thread::Builder::new()
+            .name("restart-waiter".into())
+            .spawn(move || {
+                if restart_rx.recv().is_ok() {
+                    RESTART.store(true, Ordering::SeqCst);
+                }
+                // 通道断开（不应发生）时同样停 loop：RESTART 仍为 false，下方退回挂起，
+                // 与其它平台 `Err(_) => park()` 的结局一致。
+                wind_ui::global_hotkey_macos::stop_main_loop();
+            })
+            .expect("spawn restart waiter");
+
+        wind_ui::global_hotkey_macos::run_main_loop();
+
+        if RESTART.load(Ordering::SeqCst) {
+            info!("Restart requested, relaunching service...");
+            drop(_singleton_guard);
+            relaunch_self();
+            std::process::exit(0);
+        }
+        loop {
+            std::thread::park();
+        }
+    }
+
+    #[cfg(not(target_os = "macos"))]
     match restart_rx.recv() {
         Ok(()) => {
             info!("Restart requested, relaunching service...");

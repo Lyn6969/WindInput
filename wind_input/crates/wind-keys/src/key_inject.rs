@@ -174,8 +174,10 @@ fn tap_combo(mods: &[u32], vk: u32) -> anyhow::Result<()> {
 /// 纯查表逻辑、跨平台可测，故下方测试不加平台门控（Windows 上照跑）。不能给函数本体加
 /// `cfg(target_os = "macos")`——那会让 Windows 构建下的测试引用不到它、丢掉这份覆盖；
 /// 改用条件 `allow`，只在非 macOS 平台关掉必然触发的 dead_code。
+/// 对外公开：`wind-ui` 的 macOS 全局热键（Carbon `RegisterEventHotKey`）同样吃 CGKeyCode，
+/// 必须与本表同源——热键与按键注入若各持一张表，改一处漏一处的错法是静默失效。
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
-pub(crate) fn vk_to_cgkeycode(vk: u32) -> Option<u16> {
+pub fn vk_to_cgkeycode(vk: u32) -> Option<u16> {
     let code: u16 = match vk {
         // 修饰键
         0x10 => 56, // VK_SHIFT   -> kVK_Shift

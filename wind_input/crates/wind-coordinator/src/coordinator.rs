@@ -1154,16 +1154,20 @@ impl Coordinator {
         #[cfg(target_os = "macos")]
         let (ui_tx, event_rx) = {
             let (tx, rx) = std::sync::mpsc::channel::<UiCommand>();
+            // 候选/菜单的**鼠标**交互确实经 push/bridge 协议从 .app 回流，不走这里；
+            // 但进程内仍有 UiEvent 源——全局热键由服务进程自己注册（语义要求本输入法
+            // 未激活时也生效，.app 只在被 IMK 拉起后才在），触发后经本通道回协调器。
+            // 后续拖动落点回报（CandidateWindowMoved / StatusTipMoved）等也走这条。
+            let (ev_tx, ev_rx) = std::sync::mpsc::channel::<UiEvent>();
             let sink: Arc<dyn wind_bridge::HostRenderSink> = push_server.clone();
             let suffix = push_server.suffix().to_string();
             if let Err(e) = std::thread::Builder::new()
                 .name("ui-forwarder-macos".into())
-                .spawn(move || wind_ui::manager_macos::forwarder_thread(rx, sink, suffix))
+                .spawn(move || wind_ui::manager_macos::forwarder_thread(rx, ev_tx, sink, suffix))
             {
                 warn!("Failed to spawn macOS host-render forwarder: {}", e);
             }
-            // mac 侧候选交互经 push/bridge 协议回流，无进程内 UiEvent 源。
-            (tx, None::<std::sync::mpsc::Receiver<UiEvent>>)
+            (tx, Some(ev_rx))
         };
         #[cfg(not(target_os = "macos"))]
         let (ui_tx, event_rx) = match UiManager::new() {

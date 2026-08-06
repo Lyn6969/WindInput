@@ -2610,6 +2610,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "core-foundation",
+ "core-foundation-sys",
  "core-graphics",
  "core-text",
  "image",
@@ -2621,6 +2622,7 @@ dependencies = [
  "wind-candidate",
  "wind-config",
  "wind-ipc",
+ "wind-keys",
  "wind-theme",
  "windows",
  "windows-core 0.58.0",

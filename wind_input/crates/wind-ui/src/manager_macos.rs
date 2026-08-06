@@ -5,7 +5,7 @@
 //! 用 `#[cfg(unix)]` 让本模块在 Linux/macOS 都编译，便于在开发机直接跑测试。
 
 use std::sync::Arc;
-use std::sync::mpsc::Receiver;
+use std::sync::mpsc::{Receiver, Sender};
 
 use crate::candidate_window::{CandidateWindow, CandidateWindowConfig};
 use crate::manager::{UiCommand, UiEvent};
@@ -66,14 +66,14 @@ pub struct Forwarder {
     /// 拆字字根字体绝对路径（`SetTooltipChaiziFont` 下发）。缺它则 .app 侧
     /// PUA 字根渲染成方框——对齐 Windows 64a2b50 修的同一问题。
     chaizi_font: String,
-    /// 保活 dummy 事件接收端，避免 CandidateWindow 内部 send 报错。
-    _ev_rx: Receiver<UiEvent>,
+    /// 回协调器的事件通道（全局热键触发等）。
+    ev_tx: Sender<UiEvent>,
 }
 
 impl Forwarder {
-    pub fn new(sink: Arc<dyn HostRenderSink>, suffix: String) -> Self {
-        let (ev_tx, ev_rx) = std::sync::mpsc::channel();
-        let win = CandidateWindow::new(CandidateWindowConfig::default(), ev_tx)
+    pub fn new(ev_tx: Sender<UiEvent>, sink: Arc<dyn HostRenderSink>, suffix: String) -> Self {
+        // CandidateWindow 在非 Windows 是纯光栅 mock，不产生鼠标事件；共用同一 tx 即可。
+        let win = CandidateWindow::new(CandidateWindowConfig::default(), ev_tx.clone())
             .expect("create candidate window (mock/raster host)");
         Self {
             win,
@@ -82,7 +82,7 @@ impl Forwarder {
             suffix,
             tips: TipColors::default(),
             chaizi_font: String::new(),
-            _ev_rx: ev_rx,
+            ev_tx,
         }
     }
 
@@ -356,10 +356,17 @@ impl Forwarder {
                 self.chaizi_font = path.clone();
                 self.win.set_chaizi_font(&path, &family)
             }
+            UiCommand::RegisterGlobalHotkeys(entries) => {
+                // 只入队 + 唤醒主线程；真正的 Carbon 注册在主线程做（见该模块头「线程约定」）。
+                crate::global_hotkey_macos::apply(entries, self.ev_tx.clone());
+            }
+            UiCommand::OpenPath(path) => crate::manager::open_path(&path),
+            UiCommand::OpenApp { path, args } => crate::manager::open_app(&path, &args),
             UiCommand::Shutdown => {}
             UiCommand::CopyToClipboard(text) => crate::popup_menu::set_clipboard_text(&text),
-            // 其余（SetToolbarPos / SetToolbarCorner / ShowCandidateMenu / MenuKey /
-            // HideMenu / OpenPath）：darwin 侧由 .app 原生处理或属 W9，留桩。
+            // 其余未接的变体（截图族 / 输入诊断 HUD / 拖动落点回报 / 候选右键菜单键盘
+            // 导航 / 工具栏位置）见 wind_macos/AGENTS.md「与 Windows 的功能差距」表。
+            // 新接一个就从那张表里划掉一行。
             other => {
                 tracing::debug!("forwarder: 暂未处理 {:?}", std::mem::discriminant(&other));
             }
@@ -375,8 +382,13 @@ impl Forwarder {
     }
 }
 
-pub fn forwarder_thread(rx: Receiver<UiCommand>, sink: Arc<dyn HostRenderSink>, suffix: String) {
-    let mut fwd = Forwarder::new(sink, suffix);
+pub fn forwarder_thread(
+    rx: Receiver<UiCommand>,
+    ev_tx: Sender<UiEvent>,
+    sink: Arc<dyn HostRenderSink>,
+    suffix: String,
+) {
+    let mut fwd = Forwarder::new(ev_tx, sink, suffix);
     tracing::info!("macOS host-render forwarder started");
     for cmd in rx {
         if matches!(cmd, UiCommand::Shutdown) {
@@ -411,14 +423,23 @@ mod tests {
             no_index: false,
         }
     }
-    fn mk(cap: Arc<Mutex<Vec<Vec<u8>>>>, suffix: &str) -> Forwarder {
-        Forwarder::new(Arc::new(CapSink(cap)), suffix.into())
+    /// 事件通道的接收端在测试里不消费，但必须**持有**——drop 掉会让 forwarder 里的
+    /// `ev_tx.send` 立刻报错。故连同 Forwarder 一起返回。
+    fn mk(
+        cap: Arc<Mutex<Vec<Vec<u8>>>>,
+        suffix: &str,
+    ) -> (Forwarder, std::sync::mpsc::Receiver<UiEvent>) {
+        let (ev_tx, ev_rx) = std::sync::mpsc::channel();
+        (
+            Forwarder::new(ev_tx, Arc::new(CapSink(cap)), suffix.into()),
+            ev_rx,
+        )
     }
 
     #[test]
     fn update_candidates_emits_frame_and_rects() {
         let cap = Arc::new(Mutex::new(Vec::new()));
-        let mut f = mk(cap.clone(), "_t1");
+        let (mut f, _ev) = mk(cap.clone(), "_t1");
         f.handle(UiCommand::UpdateCandidates {
             preedit: "a".into(),
             preedit_caret: 1,
@@ -450,7 +471,7 @@ mod tests {
     #[test]
     fn hide_emits_hidden_frame() {
         let cap = Arc::new(Mutex::new(Vec::new()));
-        let mut f = mk(cap.clone(), "_t2");
+        let (mut f, _ev) = mk(cap.clone(), "_t2");
         // 先显示一帧建 shm。
         f.handle(UiCommand::UpdateCandidates {
             preedit: "a".into(),
@@ -483,7 +504,7 @@ mod tests {
     #[test]
     fn update_toolbar_emits_mode_status() {
         let cap = Arc::new(Mutex::new(Vec::new()));
-        let mut f = mk(cap.clone(), "_t3");
+        let (mut f, _ev) = mk(cap.clone(), "_t3");
         f.handle(UiCommand::UpdateToolbar(
             crate::toolbar::ToolbarState::default(),
         ));
@@ -498,7 +519,7 @@ mod tests {
     #[test]
     fn status_tip_fixed_overrides_coords() {
         let cap = Arc::new(Mutex::new(Vec::new()));
-        let mut f = mk(cap.clone(), "_t4");
+        let (mut f, _ev) = mk(cap.clone(), "_t4");
         f.handle(UiCommand::ShowStatusTip {
             text: "中".into(),
             x: 10,
@@ -532,7 +553,7 @@ mod tests {
     #[test]
     fn status_tip_non_fixed_applies_offset() {
         let cap = Arc::new(Mutex::new(Vec::new()));
-        let mut f = mk(cap.clone(), "_t5");
+        let (mut f, _ev) = mk(cap.clone(), "_t5");
         f.handle(UiCommand::ShowStatusTip {
             text: "x".into(),
             x: 10,
@@ -562,7 +583,7 @@ mod tests {
     #[test]
     fn hide_status_tip_and_toast_and_toolbar_emit() {
         let cap = Arc::new(Mutex::new(Vec::new()));
-        let mut f = mk(cap.clone(), "_t6");
+        let (mut f, _ev) = mk(cap.clone(), "_t6");
         f.handle(UiCommand::HideStatusTip);
         f.handle(UiCommand::ShowToast {
             text: "ok".into(),

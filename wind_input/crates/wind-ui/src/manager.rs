@@ -1666,7 +1666,7 @@ fn try_host_render_candidates(
 
 /// 用资源管理器打开路径（best-effort）
 #[cfg(windows)]
-fn open_path(path: &str) {
+pub(crate) fn open_path(path: &str) {
     use windows::Win32::Foundation::HWND;
     use windows::Win32::UI::Shell::ShellExecuteW;
     use windows::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
@@ -1685,12 +1685,25 @@ fn open_path(path: &str) {
     }
 }
 
-#[cfg(not(windows))]
-fn open_path(_path: &str) {}
+/// macOS：交给 LaunchServices（`/usr/bin/open`）。目录→Finder、URL→默认浏览器，
+/// 与 Windows 的 `ShellExecuteW("open", ...)` 语义对齐。
+#[cfg(target_os = "macos")]
+pub(crate) fn open_path(path: &str) {
+    match std::process::Command::new("/usr/bin/open")
+        .arg(path)
+        .spawn()
+    {
+        Ok(_) => debug!("open_path: {path}"),
+        Err(e) => tracing::warn!("open_path 失败 {path}: {e}"),
+    }
+}
+
+#[cfg(not(any(windows, target_os = "macos")))]
+pub(crate) fn open_path(_path: &str) {}
 
 /// 启动可执行程序并传参（ShellExecute open + params）；args 为空时等价 open_path。
 #[cfg(windows)]
-fn open_app(path: &str, args: &str) {
+pub(crate) fn open_app(path: &str, args: &str) {
     use windows::Win32::Foundation::HWND;
     use windows::Win32::UI::Shell::ShellExecuteW;
     use windows::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
@@ -1715,8 +1728,55 @@ fn open_app(path: &str, args: &str) {
     }
 }
 
-#[cfg(not(windows))]
-fn open_app(_path: &str, _args: &str) {}
+/// macOS：`.app` 包走 `open -a … --args …`（LaunchServices 负责激活已在跑的实例），
+/// 裸可执行文件直接 spawn。args 按空白切分——Windows 侧那串是拼给 ShellExecute 的
+/// 单一参数串，macOS 需要切成 argv；含空格的取值请在构造端加引号（`build_settings_args`
+/// 已如此），此处按引号成对保留。
+#[cfg(target_os = "macos")]
+pub(crate) fn open_app(path: &str, args: &str) {
+    let argv = split_args(args);
+    let spawned = if path.ends_with(".app") {
+        let mut c = std::process::Command::new("/usr/bin/open");
+        c.arg("-a").arg(path);
+        if !argv.is_empty() {
+            c.arg("--args").args(&argv);
+        }
+        c.spawn()
+    } else {
+        std::process::Command::new(path).args(&argv).spawn()
+    };
+    match spawned {
+        Ok(_) => debug!("open_app: {path} {args}"),
+        Err(e) => tracing::warn!("open_app 失败 {path}: {e}"),
+    }
+}
+
+/// 把 Windows 口径的单一参数串切成 argv：按空白切分，成对的 `"` 内空白不切。
+/// 不做转义处理（`\"` 之类）——构造端只会产出简单的 `--k=v` 与带引号的取值。
+#[cfg(target_os = "macos")]
+fn split_args(s: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut cur = String::new();
+    let mut in_quote = false;
+    for ch in s.chars() {
+        match ch {
+            '"' => in_quote = !in_quote,
+            c if c.is_whitespace() && !in_quote => {
+                if !cur.is_empty() {
+                    out.push(std::mem::take(&mut cur));
+                }
+            }
+            c => cur.push(c),
+        }
+    }
+    if !cur.is_empty() {
+        out.push(cur);
+    }
+    out
+}
+
+#[cfg(not(any(windows, target_os = "macos")))]
+pub(crate) fn open_app(_path: &str, _args: &str) {}
 
 #[cfg(test)]
 mod menu_id_tests {
