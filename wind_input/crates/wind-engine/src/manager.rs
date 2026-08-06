@@ -3621,6 +3621,50 @@ mod tests {
         assert_eq!(t.get("z").unwrap().as_integer(), Some(30), "新增键加入");
     }
 
+    /// **键集合可变的表**（键名是数据而非结构字段，如 `key_actions` 的按键名）同样逐键合并。
+    ///
+    /// 与上一个用例的区别：那里的 x/y/z 是已知字段，这里的键由用户任意填写。`merge_toml`
+    /// 不关心键名语义，故两者行为一致——但这是 `docs/design/schema-key-actions.md` §3
+    /// 「逐键合并」覆盖语义能成立的前提，值得单独钉住。
+    ///
+    /// ★ 顺带钉住一条**能力缺口**：override **无法表达「删除 base 的某个键」**。
+    /// 合并只会新增/覆盖，base 里有而 override 里没有的键恒保留。因此「本方案禁用某个
+    /// 全局绑定」只能靠显式哨兵值（设计里的 `none`），不能靠"从 override 里删掉这一行"。
+    #[test]
+    fn merge_toml_merges_tables_with_arbitrary_key_sets() {
+        // base = 方案作者内联；over = 用户 override。键名均为按键名，非结构字段。
+        let mut base: toml::Value =
+            toml::from_str("[key_actions]\nbackslash = \"special:fuhao\"\nz = \"temp_pinyin\"\n")
+                .unwrap();
+        let over: toml::Value = toml::from_str(
+            "[key_actions]\nz = \"temp_english\"\nrshift = \"toggle_schema:english\"\n",
+        )
+        .unwrap();
+        merge_toml(&mut base, over);
+
+        let ka = base.get("key_actions").unwrap();
+        assert_eq!(
+            ka.get("backslash").unwrap().as_str(),
+            Some("special:fuhao"),
+            "override 未提及的键保留——这是逐键合并而非整段替换的判据"
+        );
+        assert_eq!(
+            ka.get("z").unwrap().as_str(),
+            Some("temp_english"),
+            "同名键被 override 覆盖"
+        );
+        assert_eq!(
+            ka.get("rshift").unwrap().as_str(),
+            Some("toggle_schema:english"),
+            "override 新增的键加入"
+        );
+        assert_eq!(
+            ka.as_table().unwrap().len(),
+            3,
+            "合并结果 = 两侧键集合的并集"
+        );
+    }
+
     /// dictionaries 的 override 是**按 id 的稀疏合并**，不是数组整体替换：
     /// 只有 enabled 会被覆盖，结构定义（顺序/path/label/base_order）恒以方案文件为准。
     #[test]
