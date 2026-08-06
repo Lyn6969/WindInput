@@ -68,6 +68,10 @@ pub struct Forwarder {
     chaizi_font: String,
     /// 回协调器的事件通道（全局热键触发等）。
     ev_tx: Sender<UiEvent>,
+    /// 候选窗当前是否有帧在显示。外观类命令（主题/字号/布局…）只在**显示中**才重推帧。
+    visible: bool,
+    /// 最近一帧随附的 hover tooltip 文本。重推时须一并带上，否则换主题会把气泡弄丢。
+    last_tip: Option<String>,
 }
 
 impl Forwarder {
@@ -83,6 +87,8 @@ impl Forwarder {
             tips: TipColors::default(),
             chaizi_font: String::new(),
             ev_tx,
+            visible: false,
+            last_tip: None,
         }
     }
 
@@ -100,7 +106,38 @@ impl Forwarder {
         self.shm.as_mut()
     }
 
+    /// 该命令是否只改**外观**而不改内容。
+    ///
+    /// 这类命令在 Windows 上由窗口自己重绘，macOS 却是「渲染在服务进程、像素经 SHM 推给
+    /// `.app`」——不主动重推一帧，已经显示着的候选窗就停在旧样子，直到下一次按键 / 鼠标
+    /// 悬停触发 `UpdateCandidates` 才更新。表现为「菜单里换了主题要把鼠标移到候选项上才生效」。
+    fn affects_appearance(cmd: &UiCommand) -> bool {
+        matches!(
+            cmd,
+            UiCommand::SetTheme(_)
+                | UiCommand::SetCandidateLayout(_)
+                | UiCommand::SetPreeditEmbedded(_)
+                | UiCommand::SetCandidateFontSize(_)
+                | UiCommand::SetCandidateFontFamily(_)
+                | UiCommand::SetCandidateFlipWhenAbove(_)
+                | UiCommand::SetCandidateSwapWhenAbove(_)
+                | UiCommand::SetPagerInPreedit(_)
+                | UiCommand::SetPagerDisplay(_)
+                | UiCommand::SetPageNumberDisplay(_)
+        )
+    }
+
     pub fn handle(&mut self, cmd: UiCommand) {
+        let repaint = Self::affects_appearance(&cmd);
+        self.handle_inner(cmd);
+        // 只在显示中才重推：不可见时重推会把一个空窗口推上屏。
+        if repaint && self.visible {
+            let tip = self.last_tip.clone();
+            self.push_current_frame(tip);
+        }
+    }
+
+    fn handle_inner(&mut self, cmd: UiCommand) {
         match cmd {
             UiCommand::UpdateCandidates {
                 preedit,
@@ -151,79 +188,7 @@ impl Forwarder {
                 );
                 self.win
                     .set_position(caret_x, caret_y, caret_height, caret_valid);
-                match self.win.render_frame() {
-                    Some(f) => {
-                        let (sx, sy, w, h, scale, soft) = (
-                            f.screen_x,
-                            f.screen_y,
-                            f.width,
-                            f.height,
-                            f.scale,
-                            f.software_shadow,
-                        );
-                        // 翻页器命中矩形的内部 tag(HOVER_PAGE_PREV/NEXT=100000/100001)重映射为
-                        // Swift/Go 约定的 -1(上页)/-2(下页)，否则 100000>=0 会被 .app 误当候选选中
-                        // (index 100000) → 翻页失效；候选 tag(>=0)原样。对齐 Go forwarder_darwin。
-                        let rects: Vec<(i32, i32, i32, i32, i32)> = f
-                            .hit_rects
-                            .iter()
-                            .map(|(i, r)| {
-                                let wire = if *i == crate::manager::HOVER_PAGE_PREV {
-                                    -1
-                                } else if *i == crate::manager::HOVER_PAGE_NEXT {
-                                    -2
-                                } else {
-                                    *i
-                                };
-                                (wire, r.x as i32, r.y as i32, r.w as i32, r.h as i32)
-                            })
-                            .collect();
-                        let buf = f.buf;
-                        // 先写 SHM 像素并取 seq；shm 建失败则整帧放弃——
-                        // 不能只推命中矩形/tooltip 而无底帧，否则 .app 拿到无像素的命中区（不一致）。
-                        let seq = match self.ensure_shm() {
-                            Some(shm) => shm.write_frame(sx, sy, w, h, &buf),
-                            None => return,
-                        };
-                        let mut flags = SharedRenderHeader::FLAG_VISIBLE
-                            | SharedRenderHeader::FLAG_CONTENT_READY;
-                        if soft {
-                            flags |= SharedRenderHeader::FLAG_SOFTWARE_SHADOW;
-                        }
-                        self.sink.push_frame(&encode_host_render_frame(
-                            seq,
-                            sx,
-                            sy,
-                            w,
-                            h,
-                            flags,
-                            scale.round().max(1.0) as u32,
-                        ));
-                        self.sink.push_frame(&encode_candidate_rects(&rects));
-                        match tip {
-                            Some(t) => self.sink.push_frame(&encode_tooltip_show(
-                                &t,
-                                &self.tips.tooltip_bg,
-                                &self.tips.tooltip_fg,
-                                &self.chaizi_font,
-                            )),
-                            None => self.sink.push_frame(&encode_tooltip_hide()),
-                        }
-                        tracing::debug!(
-                            "forwarder pushed host-render frame seq={} {}x{} at ({},{}) scale={}",
-                            seq,
-                            w,
-                            h,
-                            sx,
-                            sy,
-                            scale
-                        );
-                    }
-                    None => {
-                        tracing::debug!("forwarder render_frame=None → hide");
-                        self.hide_frame();
-                    }
-                }
+                self.push_current_frame(tip);
             }
             UiCommand::HideCandidates => self.hide_frame(),
             UiCommand::UpdateToolbar(s) => {
@@ -373,7 +338,93 @@ impl Forwarder {
         }
     }
 
+    /// 按 `win` 的当前状态渲染一帧并推给 `.app`（像素走 SHM，元数据走 push 管道）。
+    ///
+    /// 内容更新（`UpdateCandidates`）与纯外观变更（换主题/字号…）共用此路径——后者若不
+    /// 走这里重推一帧，显示中的候选窗就会停在旧样子。
+    fn push_current_frame(&mut self, tip: Option<String>) {
+        match self.win.render_frame() {
+            Some(f) => {
+                let (sx, sy, w, h, scale, soft) = (
+                    f.screen_x,
+                    f.screen_y,
+                    f.width,
+                    f.height,
+                    f.scale,
+                    f.software_shadow,
+                );
+                // 翻页器命中矩形的内部 tag(HOVER_PAGE_PREV/NEXT=100000/100001)重映射为
+                // Swift/Go 约定的 -1(上页)/-2(下页)，否则 100000>=0 会被 .app 误当候选选中
+                // (index 100000) → 翻页失效；候选 tag(>=0)原样。对齐 Go forwarder_darwin。
+                let rects: Vec<(i32, i32, i32, i32, i32)> = f
+                    .hit_rects
+                    .iter()
+                    .map(|(i, r)| {
+                        let wire = if *i == crate::manager::HOVER_PAGE_PREV {
+                            -1
+                        } else if *i == crate::manager::HOVER_PAGE_NEXT {
+                            -2
+                        } else {
+                            *i
+                        };
+                        (wire, r.x as i32, r.y as i32, r.w as i32, r.h as i32)
+                    })
+                    .collect();
+                let buf = f.buf;
+                // 先写 SHM 像素并取 seq；shm 建失败则整帧放弃——
+                // 不能只推命中矩形/tooltip 而无底帧，否则 .app 拿到无像素的命中区（不一致）。
+                let seq = match self.ensure_shm() {
+                    Some(shm) => shm.write_frame(sx, sy, w, h, &buf),
+                    None => return,
+                };
+                let mut flags =
+                    SharedRenderHeader::FLAG_VISIBLE | SharedRenderHeader::FLAG_CONTENT_READY;
+                if soft {
+                    flags |= SharedRenderHeader::FLAG_SOFTWARE_SHADOW;
+                }
+                self.sink.push_frame(&encode_host_render_frame(
+                    seq,
+                    sx,
+                    sy,
+                    w,
+                    h,
+                    flags,
+                    scale.round().max(1.0) as u32,
+                ));
+                self.sink.push_frame(&encode_candidate_rects(&rects));
+                match &tip {
+                    Some(t) => self.sink.push_frame(&encode_tooltip_show(
+                        t,
+                        &self.tips.tooltip_bg,
+                        &self.tips.tooltip_fg,
+                        &self.chaizi_font,
+                    )),
+                    None => self.sink.push_frame(&encode_tooltip_hide()),
+                }
+                self.visible = true;
+                self.last_tip = tip;
+                tracing::debug!(
+                    "forwarder pushed host-render frame seq={} {}x{} at ({},{}) scale={}",
+                    seq,
+                    w,
+                    h,
+                    sx,
+                    sy,
+                    scale
+                );
+            }
+            None => {
+                tracing::debug!("forwarder render_frame=None → hide");
+                self.hide_frame();
+            }
+        }
+    }
+
     fn hide_frame(&mut self) {
+        // 无论 SHM 建没建起来都得落 visible=false：否则外观类命令会对着一个已经隐藏的
+        // 候选窗重推帧，把它又推回屏幕上。
+        self.visible = false;
+        self.last_tip = None;
         if let Some(shm) = self.shm.as_mut() {
             let seq = shm.write_hidden();
             self.sink
@@ -465,6 +516,61 @@ mod tests {
         assert!(
             v.iter()
                 .any(|x| cmd_of(x) == wind_ipc::protocol::CMD_CANDIDATE_RECTS)
+        );
+    }
+
+    /// 造一条最小的 UpdateCandidates，供需要「先显示一帧」的用例复用。
+    fn show_two(f: &mut Forwarder) {
+        f.handle(UiCommand::UpdateCandidates {
+            preedit: "a".into(),
+            preedit_caret: 1,
+            mode_label: "".into(),
+            candidates: vec![item("中"), item("国")],
+            selected: 0,
+            hover: -1,
+            page: 1,
+            total_pages: 1,
+            caret_x: 100,
+            caret_y: 200,
+            caret_height: 20,
+            caret_valid: true,
+            fixed: false,
+            fixed_x: 0,
+            fixed_y: 0,
+        });
+    }
+
+    #[test]
+    fn theme_change_repaints_visible_candidates() {
+        // 回归：换主题只改了 win 的配色却不重推帧，显示中的候选窗停在旧样子，
+        // 要等下一次按键/鼠标悬停才更新（用户可见症状：菜单里换主题「不生效」）。
+        let cap = Arc::new(Mutex::new(Vec::new()));
+        let (mut f, _ev) = mk(cap.clone(), "_t_theme");
+        show_two(&mut f);
+        cap.lock().unwrap().clear();
+
+        f.handle(UiCommand::SetTheme(Box::default()));
+        let v = cap.lock().unwrap();
+        assert!(
+            v.iter()
+                .any(|x| cmd_of(x) == wind_ipc::protocol::CMD_HOST_RENDER_FRAME),
+            "换主题后必须重推一帧"
+        );
+    }
+
+    #[test]
+    fn theme_change_does_not_resurrect_hidden_candidates() {
+        // 反向：候选窗已隐藏时换主题不得把它推回屏幕上。
+        let cap = Arc::new(Mutex::new(Vec::new()));
+        let (mut f, _ev) = mk(cap.clone(), "_t_theme2");
+        show_two(&mut f);
+        f.handle(UiCommand::HideCandidates);
+        cap.lock().unwrap().clear();
+
+        f.handle(UiCommand::SetTheme(Box::default()));
+        assert!(
+            cap.lock().unwrap().is_empty(),
+            "隐藏状态下换主题不该推任何帧"
         );
     }
 
