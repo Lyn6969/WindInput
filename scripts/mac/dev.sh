@@ -23,7 +23,9 @@
 #   u/u1 / ud/ud1     系统卸载 release / dev (撤销 app+service+设置+LaunchAgent, 保留用户数据)
 #   8  / d8           生成 .pkg 安装包 (release / dev): 全构建后打包 (含设置 app)
 #   8s / d8s          生成 .pkg (跳过重建, 直接用现有产物打包)
-#   k=check  l=clippy  t=test  f=fmt  fmt-check  ci(=fmt-check+clippy+test)  clean
+#   k=check  l=clippy  t=test  f=fmt  fmt-check  ci(=fmt-check+clippy+test)
+#   hooks             激活 .githooks/pre-commit (提交前自动 cargo fmt --check)
+#   clean
 #   gd=gen-data       下载词库 + 生成 unigram/pinyin_map + 组装 data/ → build_mac/data + 校验
 #   r=repl            候选 REPL (cargo run -p wind-repl -- <data>; data 默认 build_mac/data)
 #
@@ -319,7 +321,28 @@ app_build() {
         if [[ -f "$ENTS" ]]; then
             SIGN_ARGS+=(--entitlements "$ENTS")
         fi
-        codesign "${SIGN_ARGS[@]}" "$APP_BUNDLE"
+        # ⚠️ 必须显式判退出码 —— 本脚本里 errexit 是失效的 (见文件末 run_tokens 处说明)。
+        # 且签名失败**不可**放过: codesign 失败会原样留下链接器的 ad-hoc 签名, 装上去的
+        # 表现是「能切过去但打不出字」(IMK 不拉起控制器), 比构建直接失败难查得多。
+        if ! codesign "${SIGN_ARGS[@]}" "$APP_BUNDLE"; then
+            err "codesign 失败: $APP_BUNDLE"
+            if [[ -n "$SIGN_IDENTITY" ]]; then
+                err "常见成因与对策:"
+                err "  · errSecInternalComponent = codesign 拿不到私钥。多为 login keychain"
+                err "    未授权非交互访问 → 跑 'scripts/mac/dev.sh sign-setup grant'"
+                err "    (在 ssh/无 tty 会话里也会这样, 换本机 Terminal 再试)"
+                err "  · 证书不存在 → 'scripts/mac/dev.sh sign-setup create'"
+                err "  · 现有身份 → 'scripts/mac/dev.sh sign-setup check'"
+                err "  · 只想先出个能跑单测的产物: SIGN_IDENTITY= scripts/mac/dev.sh m1 (ad-hoc)"
+            fi
+            err "拒绝产出 ad-hoc 冒充的 .app —— 那个装上去能切换但无法输入。"
+            return 1
+        fi
+        # ⚠️ 这里显示的签名信息**可能是旧的**: 紧跟 `--force --sign` 之后查询, securityd
+        # 往往还给的是缓存里上一版的结果 (典型表现: 明明签成功了却显示 adhoc,linker-signed,
+        # 隔几十秒再查就正常)。**不要**据此判定签名成败——签成没签成以上面 codesign 的
+        # 退出码为准, 那才是权威信号 (SIGN_IDENTITY 非空且非 "-" 时, 退 0 即已用该身份签成)。
+        # 曾在此加过一道「输出里必须有 Authority= 否则报错」的复核, 结果正是被这个缓存误杀。
         codesign -dv --verbose=2 "$APP_BUNDLE" 2>&1 | sed 's/^/    /' | head -12
     fi
 
@@ -953,7 +976,14 @@ PY
                 && info "已解锁 login keychain (供 codesign)" || info "解锁 login keychain 失败"
         fi
         info "固定证书重签 .app: \"$SIGN_IDENTITY\" (去 hardened-runtime, 仅换签名身份)"
-        codesign --force --sign "$SIGN_IDENTITY" --deep "$INSTALL_APP" 2>&1 | sed 's/^/    /' || true
+        # 失败不中止 (.app 已就位, 原签名多半仍可用), 但**必须让人看见**: 重签没成
+        # 就等于留着 hardened-runtime 的签名, 症状正是「列表里有、能切、但打不出字」,
+        # 而这种症状极易被误判成 TIS 缓存问题去反复注销重登。
+        if ! codesign --force --sign "$SIGN_IDENTITY" --deep "$INSTALL_APP" 2>&1 | sed 's/^/    /'; then
+            warn "重签失败! 装好的 .app 仍带原签名(可能含 hardened-runtime)。"
+            warn "若切过去打不出字, 先手动重签再试, 而不是反复注销:"
+            warn "  codesign --force --sign \"$SIGN_IDENTITY\" --deep \"$INSTALL_APP\""
+        fi
     elif codesign -dv --verbose=2 "$INSTALL_APP" 2>&1 | grep -qi "adhoc"; then
         info "ad-hoc 产物: 去 hardened-runtime 重签 (codesign --force --sign -)"
         codesign --force --sign - --deep "$INSTALL_APP" 2>&1 | sed 's/^/    /' || true
@@ -1002,6 +1032,13 @@ PY
         info "    PID=$REGISTER_PID (要停止后台 register: kill $REGISTER_PID)"
         head -2 /tmp/wind_register.log 2>/dev/null | sed 's/^/    /'
     fi
+
+    # .app 刚被整包替换, 但此刻可能还有一个**旧** bundle 的控制器进程在跑 (p1 的顺序是
+    # 先装 service——那一步的 kick 会让 IMK 用旧 .app 重拉一个控制器——再装 app)。
+    # 不踢掉它就留下「跑着旧二进制 / 连接已失效」的控制器, 表现正是
+    # 「输入法能切过去, 但一个字都打不出来」, 且极易被误判成 TIS 缓存问题去反复注销重登。
+    # 这里补一次 kick: 只杀控制器实例, 保留上面刚 fork 的 --register-input-source 守护。
+    kick_ime_app
 
     bold "==> Done"
     cat <<EOF
@@ -1253,14 +1290,18 @@ EOF
 
 # ───────────── 组合: 编 + 装 ─────────────
 install_service() {
-    build_service
+    # 显式判构建结果: errexit 在本脚本失效 (见 run_tokens 处说明), 不判就会「构建失败
+    # 却把上一次的旧产物装进系统」——装完看不出异常, 只是行为还是老版本。
+    build_service || { err "service 构建失败, 不予安装"; return 1; }
     local data; data="$(resolve_data)"
     bold "==> 安装 service ($VARIANT, data=$data)"
     service_install ${APP_VARIANT_FLAG[@]+"${APP_VARIANT_FLAG[@]}"} --data "$data"
 }
 
 install_app() {
-    build_app
+    # 同 install_service: 必须显式判。此处漏判尤其坏——下方会把 build/ 里的 .app 删掉,
+    # 于是「构建失败 → 装了旧 app → 证据也被清掉」, 事后完全查不出装进去的是哪一版。
+    build_app || { err ".app 构建失败, 不予安装"; return 1; }
     bold "==> 安装 app ($VARIANT)"
     app_install ${APP_VARIANT_FLAG[@]+"${APP_VARIANT_FLAG[@]}"}
     # 防复发: 删掉 build/ 里的 .app 并注销其 LS 登记。它与 ~/Library 里的真身同 bundle-ID,
@@ -1277,22 +1318,37 @@ install_app() {
 }
 
 install_all() {
-    install_service
-    install_app
-    install_setting   # best-effort: 设置仓缺失/构建失败不影响 IME 安装
+    install_service || { err "service 安装失败, 中止"; return 1; }
+    install_app     || { err ".app 安装失败, 中止"; return 1; }
+    install_setting || warn "设置程序未安装 (非致命: 仓库缺失或构建失败; IME 本身可用)"
     bold "==> 系统安装完成 ($VARIANT) — 切到 $(app_name_for_variant) 试输入"
 }
 
 do_full() {
     bold "========== 全构建 ($VARIANT) =========="
-    build_service
-    build_app
-    build_setting || warn "wind_setting 构建跳过/失败 (非致命, 设置 app 缺失)"
-    do_gendata
-    verify_dist_data
+    # 每步显式判退出码: 本脚本 errexit 失效 (见文件末 run_tokens 处说明), 漏判就会
+    # 「某步失败了却一路跑到『全构建完成』」——正是 codesign 失败仍报成功的老形态。
+    build_service || { err "service 构建失败, 中止全构建"; return 1; }
+    build_app     || { err ".app 构建失败, 中止全构建"; return 1; }
+    # wind_setting 是独立仓库, 允许缺席; 但失败与否要如实反映在下方产物清单里。
+    local setting_ok=1
+    build_setting || { setting_ok=0; warn "wind_setting 构建跳过/失败 (非致命, 设置 app 缺失)"; }
+    do_gendata        || { err "gen-data 失败, 中止全构建"; return 1; }
+    verify_dist_data  || { err "发布数据校验失败, 中止全构建"; return 1; }
+
     bold "========== 全构建完成 ($VARIANT) =========="
     local setting_disp="清风输入法设置"; [[ $VARIANT == dev ]] && setting_disp="清风输入法设置开发版"
-    info "产物: service=target/$([[ $VARIANT == dev ]] && echo dev-variant || echo release)/wind_input  app=$MACOS_DIR/build/$(app_name_for_variant).app  setting=$MACOS_DIR/build/$setting_disp.app  data=$DATA_SNAPSHOT"
+    local prof; prof=$([[ $VARIANT == dev ]] && echo dev-variant || echo release)
+    info "产物:"
+    info "  service = target/$prof/wind_input"
+    info "  app     = $MACOS_DIR/build/$(app_name_for_variant).app"
+    # 只报真的在那儿的东西 —— 此前无条件打印设置 app 路径, 构建失败时也照报, 等于骗人。
+    if (( setting_ok )) && [[ -d "$MACOS_DIR/build/$setting_disp.app" ]]; then
+        info "  setting = $MACOS_DIR/build/$setting_disp.app"
+    else
+        warn "  setting = (缺失: wind_setting 未构建成功; 装出来的系统里没有设置程序)"
+    fi
+    info "  data    = $DATA_SNAPSHOT"
     info "下一步: scripts/mac/dev.sh $([[ $VARIANT == dev ]] && echo pd1 || echo p1)  (系统安装)"
 }
 
@@ -1723,7 +1779,7 @@ show_menu() {
     echo   "    8    生成安装包 (release)        d8    生成安装包 (dev)"
     echo   "    8s   跳过重建直接打包 (release)  d8s   跳过重建直接打包 (dev)"
     printf "\033[33m  代码质量:\033[0m\n"
-    echo   "    k=check  l=clippy  t=test  f=fmt  fmt-check  ci  clean"
+    echo   "    k=check  l=clippy  t=test  f=fmt  fmt-check  ci  hooks  clean"
     printf "\033[33m  数据 / 实测:\033[0m\n"
     echo   "    gd=gen-data  r=repl(本机)"
     printf "\033[33m  macOS 便利命令:\033[0m\n"
@@ -1764,6 +1820,7 @@ dispatch() {
         f|fmt)     ( cd "$RUST_DIR" && bold "==> cargo fmt" && cargo fmt ) ;;
         fmt-check) ( cd "$RUST_DIR" && bold "==> cargo fmt --check" && cargo fmt --all -- --check ) ;;
         ci)        do_ci ;;
+        hooks)     do_hooks_install ;;
         clean)     do_cargo clean ;;
         gd|gen-data) apply_variant release; do_gendata && verify_dist_data ;;
         run)       apply_variant release; do_run ;;
@@ -1776,6 +1833,15 @@ dispatch() {
 
 do_cargo() { bold "==> cargo $1 --workspace"; ( cd "$RUST_DIR" && cargo "$1" --workspace ); }
 
+# 激活仓库自带 pre-commit hook (提交前跑 cargo fmt --check)。对齐 dev.ps1 Do-HooksInstall。
+# 纯本地 git config, 不随仓库传播 —— 每个 clone/worktree 都要单独激活一次。
+do_hooks_install() {
+    bold "==> 激活 .githooks/pre-commit (git config core.hooksPath .githooks)"
+    ( cd "$REPO_DIR" && git config core.hooksPath .githooks ) || return $?
+    chmod +x "$REPO_DIR/.githooks/pre-commit" 2>/dev/null || true
+    info "已激活：提交前将自动跑 cargo fmt --check"
+}
+
 do_ci() {
     ( cd "$RUST_DIR" && bold "==> cargo fmt --check" && cargo fmt --all -- --check ) || return $?
     do_cargo clippy || return $?
@@ -1784,7 +1850,21 @@ do_ci() {
 }
 
 # 顺序执行一串命令 token (空格分隔); 前者失败即停。每个命令在子 shell 里跑, 保留内联函数的
-# `exit` 语义又不终止整个脚本, 且子 shell 继承 set -e → 命令内部失败会以其退出码中止。
+# `exit` 语义又不终止整个脚本。
+#
+# ⚠️⚠️ 本脚本里 `set -e` (errexit) 是**失效**的, 别指望它 ⚠️⚠️
+#
+# 下面 `( dispatch "$cmd" ) || rc=$?` 把子 shell 放在了 `||` 列表左侧。按 POSIX/bash
+# 语义, 处于 `&&`/`||` 列表中(非末项)的命令一律豁免 errexit, 且该豁免会**穿透**进子 shell、
+# 函数体与其中所有嵌套调用 —— bash 手册原话是「即使设置了 -e 也不生效」。实测连在子 shell
+# 里重新 `set -e` 都救不回来。
+#
+# 后果: dispatch 之下(build_service / app_build / do_gendata / …)任何命令失败都**不会**
+# 自动中止, 脚本会若无其事地跑到「完成」。历史事故: codesign 失败后原样留下 ad-hoc 签名,
+# 却照报构建成功, 装上去表现为「能切输入法但打不出字」。
+#
+# 因此: 关键步骤必须**显式**判退出码 (`cmd || return 1` / `if ! cmd; then … fi`),
+# 尤其是签名、安装、数据校验这类失败后果不可见的步骤。新增步骤时照此办理。
 run_tokens() {
     local toks=("$@") n=$# i=0 cmd rc
     while (( i < n )); do
