@@ -31,7 +31,7 @@ Rust 核心跨平台，引擎/词库/候选/词频类改动 macOS 自动受益�
 | `TakeScreenshot` / `ScreenshotCandidateToClipboard` / `ScreenshotStatusTip` / `ScreenshotTooltip` / `CopyTooltipText` | 浮层截图与复制内容缺失 | Win 侧走 GDI 取窗口位图；mac 需从 SHM 帧或 NSPanel 取 |
 | `ReportCandidatePos` / `ReportStatusTipPos` | 候选窗 / 状态气泡的拖动与位置固定缺失 | 拖动在 .app 侧，落点须经上行帧回报给服务持久化（协议要新增码位） |
 | `ShowCandidateMenu` / `HideMenu` / `MenuKey` | 候选右键菜单的键盘导航缺失 | 菜单树本身已走 `CmdMenuShow` + `UnifiedMenuBuilder` |
-| `SetToolbarPos` / `SetToolbarAutoHide` | 语义部分 N/A（mac 用菜单栏指示器，无浮动工具栏） | 但配置项当前无处落地 |
+| `SetToolbarPos` / `SetToolbarAutoHide` | N/A（mac 用菜单栏指示器，无浮动工具栏） | 对应配置项已在设置清单里按平台隐藏（`platform = "windows"`），不再是"无处落地" |
 | `SetHostRender` | Windows 专有（宿主进程内 Band 窗口） | mac 无对应概念 |
 
 已接：`RegisterGlobalHotkeys`（见下）、`OpenPath` / `OpenApp`（`/usr/bin/open`，
@@ -39,6 +39,41 @@ Rust 核心跨平台，引擎/词库/候选/词频类改动 macOS 自动受益�
 
 未接的变体落在 `Forwarder::handle` 的 `other =>` 兜底臂，只打一条 debug 日志。
 **新接一个变体时同步更新本表**。
+
+### 按应用配置 / 焦点重型段
+
+`.app` 的 `FocusGained` 载荷此前只有 12 字节（pid 占位 + inputScopeMask），而 Rust
+`FocusGainedPayload::from_bytes` 的下限是 36 —— **解码恒失败，整个焦点重型段从未在
+macOS 上跑过**。载荷现已补齐为与 Windows 同构的 39 字节 + 尾部 `bundleIdLen + bundleId`。
+
+宿主名的来源两平台不同：Windows 由服务进程 `OpenProcess` 反查进程名，macOS 反查不到
+（服务里的 `process_name` 恒返回空串），只能由 `.app` 取 IMKit `client.bundleIdentifier()`
+随焦点事件送上来。落点是既有的 `pid_names` 缓存，`update_active_compat` 已改为
+**缓存优先于反查** —— 缓存之后的两平台路径完全一致。
+
+`compat.toml` 的 `process` 字段是小写全等匹配，故 `wechat.exe` 与
+`com.tencent.xinwechat` 可并存于同一份规则表，不需要分平台的规则文件。
+
+caret 段发全 0 是安全的：`apply_focus_caret` 见 `height == 0` 即返回，坐标另经
+`CmdCaretUpdate` 上报。
+
+### 输入源切换（activate_ime）
+
+`keys.activate_ime` 在 Windows 上由 ctfmon 从 `DirectSwitchHotkeys` 注册表接管；macOS
+无对应机制，改由**服务进程**注册 Carbon 全局热键 + `TISSelectInputSource`
+（`wind-ui/src/input_source_macos.rs`）。放在服务进程是必须的：该热键的语义是「本输入法
+没激活时也生效」，那时 `.app` 通常没在跑。
+
+**语义差异不可消除**：Windows 是 per-app 切换（只改当前前台应用），macOS 的
+`TISSelectInputSource` 是全局切换 —— 系统没有「只改这个 app」的公开 API。设置界面的
+hint 已如实写明两平台差异。
+
+### 系统明暗
+
+`theme_style::system_prefers_dark` 的 macOS 分支读全局偏好 `AppleInterfaceStyle`
+（浅色时该键**不存在**，深色为 `"Dark"`）。走 `CFPreferencesCopyAppValue` 而非读
+`.GlobalPreferences.plist`：偏好由 cfprefsd 托管并带写回延迟，直接读文件会拿到用户刚改过、
+尚未落盘的旧值。
 
 ### 全局热键（Carbon）
 
@@ -54,8 +89,10 @@ Manager 是主线程亲和的，症状会是热键**时灵时不灵**。
 
 修饰键按**物理键直译**：Alt→Option、Win→Command，不做「Ctrl 自动换 Command」的翻译
 ——否则设置界面显示的与实际生效的不是一回事。VK→CGKeyCode 复用 `wind_keys::key_inject::
-vk_to_cgkeycode`（与按键注入同源，禁止另起一张表）。表里没有的 VK（OEM 符号键等）跳过
-并 warn，**不能**当成 keycode 0（那会注册出一个按 `a` 就触发的热键）。
+vk_to_cgkeycode`（与按键注入同源，禁止另起一张表）。该表已覆盖修饰键 / 功能键 / F1-F12 /
+字母 / 数字 / OEM 符号键（`[` `]` `;` `'` `,` `.` `/` `\` `` ` `` `-` `=`）——出厂默认
+`keys.activate_ime = "ctrl+shift+["` 正落在 `VK_OEM_4` 上，漏了它该功能就开箱即哑。
+仍未覆盖的 VK 跳过并 warn，**不能**当成 keycode 0（那会注册出一个按 `a` 就触发的热键）。
 
 另有两处协议侧的既有约束，不是"漏做"而是设计所限：
 
@@ -100,6 +137,25 @@ Program 公证——已多次实测。
 （`com.wails.wind_setting[_debug]`）。
 
 变体化的完整对照表在 `scripts/mac/dev.sh` 头部注释「变体身份」一节。
+
+（`com.wails.` 前缀是历史包袱——设置程序早已是 Rust + windui，不是 Wails。改它要同步
+`scripts/mac/dev.sh` 与所有已安装机器，**不值当**。）
+
+### 设置深链（CmdOpenSettings 0x0507）
+
+两处约束，都踩过：
+
+1. **载荷是「页名 + 参数」的空格串**，不是单个页名（`handle_menu.rs::open_settings_with`
+   拼出，如 `dict --schema=wubi86 --type=shadow`）。Swift 侧必须按 shell 风格切词
+   （`BinaryCodec.decodeOpenSettingsArguments`，只认双引号，对应 `build_settings_args`
+   对含空白值的加引号），首词非选项时转成 `--page=<页名>`。整串塞进 `--page=` 的后果是
+   设置端解析不出页 id、只开默认页——**冷启动即复现**。
+2. **设置程序已在运行时 LaunchServices 不重传 arguments**，只激活窗口。深链要在已开着的
+   窗口上生效，靠的是 windui 的单实例转发（`wind-ui-rust/src/single_instance/unix.rs`，
+   Unix domain socket）。那一层在 macOS 上一度是空实现，深链因此"时灵时不灵"。
+
+排查入口：设置程序日志里的 `二次实例 argv: [...]`。有这行 = argv 送到了，问题在 cli 解析；
+没有 = 转发层没通。
 
 **关键**：两变体 `.app` 可执行同名 `WindInput`，进程定位须用 `.app` 路径；
 SHM / socket / config 全部变体隔离（漏一处即冲突，如曾漏 SHM → 开机后开发版候选框不显示）。
