@@ -250,6 +250,21 @@ pub fn vk_to_cgkeycode(vk: u32) -> Option<u16> {
         0x37 => 26, // 7
         0x38 => 28, // 8
         0x39 => 25, // 9
+        // OEM 符号键（`parse_key` 认这些名字：`[` `]` `;` `'` `,` `.` `/` `\` `` ` `` `-` `=`）。
+        //
+        // 缺了它们不是"少几个冷门键"：出厂默认 keys.activate_ime = "ctrl+shift+[" 就落在
+        // VK_OEM_4 上，表里没有 → 全局热键注册被跳过 → 该功能在 macOS 上开箱即哑。
+        0xBA => 41, // VK_OEM_1      ;  -> kVK_ANSI_Semicolon
+        0xBB => 24, // VK_OEM_PLUS   =  -> kVK_ANSI_Equal
+        0xBC => 43, // VK_OEM_COMMA  ,  -> kVK_ANSI_Comma
+        0xBD => 27, // VK_OEM_MINUS  -  -> kVK_ANSI_Minus
+        0xBE => 47, // VK_OEM_PERIOD .  -> kVK_ANSI_Period
+        0xBF => 44, // VK_OEM_2      /  -> kVK_ANSI_Slash
+        0xC0 => 50, // VK_OEM_3      `  -> kVK_ANSI_Grave
+        0xDB => 33, // VK_OEM_4      [  -> kVK_ANSI_LeftBracket
+        0xDC => 42, // VK_OEM_5      \  -> kVK_ANSI_Backslash
+        0xDD => 30, // VK_OEM_6      ]  -> kVK_ANSI_RightBracket
+        0xDE => 39, // VK_OEM_7      '  -> kVK_ANSI_Quote
         _ => return None,
     };
     Some(code)
@@ -520,9 +535,21 @@ mod tests {
     }
 
     #[test]
+    fn vk_to_cgkeycode_oem_symbols() {
+        // 出厂默认 keys.activate_ime = "ctrl+shift+[" 就落在 OEM_4 上：漏了它，
+        // macOS 的「切换到本输入法」热键开箱即注册不上（只有一条 warn）。
+        assert_eq!(vk_to_cgkeycode(0xDB), Some(33)); // [
+        assert_eq!(vk_to_cgkeycode(0xDD), Some(30)); // ]
+        assert_eq!(vk_to_cgkeycode(0xBA), Some(41)); // ;
+        assert_eq!(vk_to_cgkeycode(0xC0), Some(50)); // `
+        assert_eq!(vk_to_cgkeycode(0xBF), Some(44)); // /
+        assert_eq!(vk_to_cgkeycode(0xDE), Some(39)); // '
+    }
+
+    #[test]
     fn vk_to_cgkeycode_unknown() {
         assert_eq!(vk_to_cgkeycode(0xFFFF), None);
-        assert_eq!(vk_to_cgkeycode(0xBA), None); // OEM_1 ; 未覆盖
         assert_eq!(vk_to_cgkeycode(0x00), None);
+        assert_eq!(vk_to_cgkeycode(0x91), None); // ScrollLock，本表不覆盖
     }
 }
