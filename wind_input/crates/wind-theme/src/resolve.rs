@@ -738,6 +738,73 @@ height = 30
         assert_eq!(r2.views.toolbar_border_color, Some([0x22, 0x22, 0x22, 255]));
     }
 
+    /// 四个「此前渲染层不读自身盒模型」的节点：背景与边框须完整进 RvNode。
+    ///
+    /// preedit_bar / mode_label 的圆角原先借用 item.border_radius（调候选项圆角会连带
+    /// 改预编辑栏）；candidate_list / footer_bar 连背景边框都没接线。渲染侧已补齐，
+    /// 这里锁数据通路——防止日后在 resolve 里加节点白名单时又把它们漏掉。
+    #[test]
+    fn test_container_nodes_carry_own_box_model() {
+        let text = "\
+[colors]
+accent = \"#3B82F6\"
+
+[preedit_bar]
+background = \"#111111\"
+radius = 7
+border = { color = \"#222222\", width = 2 }
+
+[mode_label]
+background = \"#333333\"
+radius = 9
+border = { color = \"#444444\" }
+
+[candidate_list]
+background = \"#555555\"
+radius = 11
+border = { color = \"#666666\" }
+
+[footer_bar]
+background = \"#777777\"
+radius = 13
+border = { color = \"#888888\" }
+";
+        let value: toml::Value = toml::from_str(text).unwrap();
+        let theme: Theme = crate::normalize::normalize_theme(value).try_into().unwrap();
+        let v = resolve(&theme, false, &[data_dir()]).views;
+
+        let cases: [(&str, &RvNode, u8, u8, f32); 4] = [
+            ("preedit_bar", &v.preedit_bar, 0x11, 0x22, 7.0),
+            ("mode_label", &v.mode_label, 0x33, 0x44, 9.0),
+            ("candidate_list", &v.candidate_list, 0x55, 0x66, 11.0),
+            ("footer_bar", &v.footer_bar, 0x77, 0x88, 13.0),
+        ];
+        for (name, node, bg, border, radius) in cases {
+            assert_eq!(node.bg_color, Some([bg, bg, bg, 255]), "{name} 背景色");
+            assert_eq!(
+                node.border_color,
+                Some([border, border, border, 255]),
+                "{name} 边框色"
+            );
+            assert_eq!(
+                node.border_radius,
+                Some(crate::schema::Dim::Dp(radius)),
+                "{name} 圆角（自身的，不是借 item 的）"
+            );
+        }
+        // preedit_bar 显式边框宽也要透传（渲染层 `dim(border_width, 0).max(1)`）。
+        assert_eq!(
+            v.preedit_bar.border_width,
+            Some(crate::schema::Dim::Dp(2.0))
+        );
+        // 未配圆角的节点保持 None —— 渲染层据此回退（preedit_bar/mode_label 回退 item）。
+        let bare: toml::Value = toml::from_str("[colors]\naccent = \"#3B82F6\"\n").unwrap();
+        let t2: Theme = crate::normalize::normalize_theme(bare).try_into().unwrap();
+        let v2 = resolve(&t2, false, &[data_dir()]).views;
+        assert_eq!(v2.preedit_bar.border_radius, None);
+        assert_eq!(v2.mode_label.border_radius, None);
+    }
+
     /// 工具栏整条外框圆角/线宽：此前只提取了 border.color，radius/width 解析到
     /// schema 就断了 —— 编辑器把两个控件都开放着，实机却毫无变化。
     #[test]

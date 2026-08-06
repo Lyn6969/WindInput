@@ -1440,6 +1440,61 @@ impl CandidateWindow {
             st.and_then(|n| n.bg_color).or(node.bg_color)
         };
 
+        // 通用盒装饰：底色 / 背景图 / 渐变 / z 层覆盖图 / 边框 + 圆角。
+        // 每项都是 Option —— 主题未配则原样返回，几何与观感零变化。供此前只有文字色、
+        // 连背景边框都没接线的容器节点（candidate_list / footer_bar）复用。
+        // 圆角只在显式配了 border_radius 时设置：View 默认 0，不设即方角，与原行为一致。
+        let decorate_box = |view: View, node: &RvNode| -> View {
+            let mut view = view;
+            if let Some(c) = node.bg_color {
+                view = view.bg(c);
+            }
+            if let Some(vi) = self.rv_image(node.bg_image.as_ref()) {
+                view = view.bg_image(vi);
+            }
+            if let Some(g) = self.rv_gradient(node.bg_gradient.as_ref()) {
+                view = view.bg_gradient(g);
+            }
+            let layers = self.rv_layers(&node.layers);
+            if !layers.is_empty() {
+                view = view.layers(layers);
+            }
+            if let Some(r) = node.border_radius {
+                view = view.radius(r.resolve(s, 0.0));
+            }
+            if let Some(bc) = node.border_color {
+                view = view.border(bc, dim(node.border_width, 0.0).max(1.0));
+            }
+            view
+        };
+
+        // 模式徽标的盒装饰（底色 / 边框 / 圆角 / 内边距）。
+        // **横排内嵌与竖排独立 chip 是两条通路**，抽成闭包共用——本仓「同一功能两处装配、
+        // 只改一处」是高发 bug 形态。
+        // 门控：有底色**或**有边框才渲染成徽标盒（原先只看底色，那样「只要边框的空心徽标」
+        // 表达不出来）；两者皆无时保持纯文字，零回归。
+        // 圆角一律取 mode_label.border_radius ?? item.border_radius —— **不能用 eff_border
+        // 返回的第三个值**，它在未配 border.radius 时兜底 0.0，会把徽标圆角抹平（同 :1824 的坑）。
+        let decorate_mode_chip = |chip: View| -> View {
+            let border = eff_border(&v.mode_label, false, false);
+            if v.mode_label.bg_color.is_none() && border.is_none() {
+                return chip;
+            }
+            let mut chip = chip
+                .radius(dim(
+                    v.mode_label.border_radius.or(v.item.border_radius),
+                    4.0,
+                ))
+                .pad(edges_or(&v.mode_label.padding, [1.0, 6.0, 1.0, 6.0]));
+            if let Some(bg) = v.mode_label.bg_color {
+                chip = chip.bg(bg);
+            }
+            if let Some((bc, bw, _)) = border {
+                chip = chip.border(bc, bw);
+            }
+            chip
+        };
+
         let mut root = View::container(Layout::Column)
             .bg(col(v.window.bg_color, [255, 255, 255, 255]))
             .border(
@@ -1475,7 +1530,13 @@ impl CandidateWindow {
             let mut band = View::container(Layout::Row)
                 .cross(Align::Center)
                 .bg(col(v.preedit_bar.bg_color, [240, 240, 240, 255]))
-                .radius(dim(v.item.border_radius, 4.0))
+                // 圆角：preedit_bar 自己的优先，未配才跟随 item（历史行为——此前只读
+                // item.border_radius，调候选项圆角会连带改预编辑栏）。`.or()` 保回退链，
+                // 老主题零变化。
+                .radius(dim(
+                    v.preedit_bar.border_radius.or(v.item.border_radius),
+                    4.0,
+                ))
                 .pad(edges_or(&v.preedit_bar.padding, [3.0, 8.0, 3.0, 8.0]))
                 .margin(edges_or(&v.preedit_bar.margin, [0.0; 4]))
                 .child(self.preedit_view(preedit_fs));
@@ -1501,23 +1562,19 @@ impl CandidateWindow {
             // 模式标记：右对齐到栏行末尾（在翻页栏之左）；字号取主题 mode_label 配置。
             if !self.mode_label.is_empty() {
                 let ml_fs = node_fs(&v.mode_label);
-                let mut chip = View::leaf(
-                    self.mode_label.clone(),
-                    col(v.mode_label.text_color, [120, 120, 128, 255]),
-                )
-                .font_size(ml_fs)
-                .font_weight(v.mode_label.font_weight)
-                .font_family(v.mode_label.font_family.clone())
-                .margin(Edges {
-                    l: 12.0 * s,
-                    ..Edges::default()
-                });
-                if let Some(bg) = v.mode_label.bg_color {
-                    chip = chip
-                        .bg(bg)
-                        .radius(dim(v.item.border_radius, 4.0))
-                        .pad(edges_or(&v.mode_label.padding, [1.0, 6.0, 1.0, 6.0]));
-                }
+                let chip = decorate_mode_chip(
+                    View::leaf(
+                        self.mode_label.clone(),
+                        col(v.mode_label.text_color, [120, 120, 128, 255]),
+                    )
+                    .font_size(ml_fs)
+                    .font_weight(v.mode_label.font_weight)
+                    .font_family(v.mode_label.font_family.clone())
+                    .margin(Edges {
+                        l: 12.0 * s,
+                        ..Edges::default()
+                    }),
+                );
                 band = band.child(chip);
             }
             // 翻页栏并入（pager_will_inline）：在末尾装配段追加到此 band 末尾（spacer 右侧）。
@@ -1580,15 +1637,23 @@ impl CandidateWindow {
         // 并排成单行，高度 = 一个候选行，与横排一致；否则竖排下徽标行与占位行会纵向
         // 堆叠致提示窗口过高（网址/临拼/临英刚进入时尤甚）。preedit/徽标分隔方向亦随之。
         let list_vertical = self.vertical && !self.candidates.is_empty();
-        let mut list = if list_vertical {
-            // fill_cross 让候选列撑满 root 宽度（= max(最宽候选, 翻页栏)），
-            // 再配合各候选 item 的 fill_cross，所有候选高亮宽度统一。
-            View::container(Layout::Column).gap(row_gap_v).fill_cross()
-        } else {
-            View::container(Layout::Row)
-                .gap(box_gap)
-                .cross(Align::Center)
-        };
+        // candidate_list 此前只贡献 gap/row_gap/band_gap 三个间距，背景与边框从不接线，
+        // 「候选区与编码栏用不同底色分区」这类设计表达不出来。装饰全 Option，未配零回归。
+        let mut list = decorate_box(
+            if list_vertical {
+                // fill_cross 让候选列撑满 root 宽度（= max(最宽候选, 翻页栏)），
+                // 再配合各候选 item 的 fill_cross，所有候选高亮宽度统一。
+                View::container(Layout::Column).gap(row_gap_v).fill_cross()
+            } else {
+                View::container(Layout::Row)
+                    .gap(box_gap)
+                    .cross(Align::Center)
+            }
+            // 候选区内边距（默认全 0=零回归）。footer_bar 不加这项——它的 padding
+            // 已被翻页箭头消费（fpad），容器再加一层会双重生效。
+            .pad(edges_or(&v.candidate_list.padding, [0.0; 4])),
+            &v.candidate_list,
+        );
         // 内联编码的"沉底"（swap_preedit_when_above 在首单元内联下的落点）：
         // 内联模式没有独立编码栏可参与末尾那段 band/list 交换装配，编码是 list 的首个子节点。
         // 横排下首单元 = 行首（最左），与上下无关，开关本就无意义 → 不参与；
@@ -1646,21 +1711,18 @@ impl CandidateWindow {
                     ..Edges::default()
                 }
             };
-            let mut chip = View::leaf(
-                self.mode_label.clone(),
-                col(v.mode_label.text_color, [120, 120, 128, 255]),
-            )
-            .font_size(ml_fs)
-            .font_weight(v.mode_label.font_weight)
-            .font_family(v.mode_label.font_family.clone())
-            .margin(sep);
-            // 主题为 mode_label 配了底色 → 渲染为小徽标（圆角 + 内边距）以更醒目。
-            if let Some(bg) = v.mode_label.bg_color {
-                chip = chip
-                    .bg(bg)
-                    .radius(dim(v.item.border_radius, 4.0))
-                    .pad(edges_or(&v.mode_label.padding, [1.0, 6.0, 1.0, 6.0]));
-            }
+            // 主题为 mode_label 配了底色或边框 → 渲染为小徽标（圆角 + 内边距）以更醒目。
+            // 与横排内嵌通路共用 decorate_mode_chip，两处装配保持一致。
+            let chip = decorate_mode_chip(
+                View::leaf(
+                    self.mode_label.clone(),
+                    col(v.mode_label.text_color, [120, 120, 128, 255]),
+                )
+                .font_size(ml_fs)
+                .font_weight(v.mode_label.font_weight)
+                .font_family(v.mode_label.font_family.clone())
+                .margin(sep),
+            );
             if inline_preedit_bottom {
                 inline_tail.push(chip);
             } else {
@@ -1896,37 +1958,40 @@ impl CandidateWindow {
                     node
                 };
             Some(
-                View::container(Layout::Row)
-                    .cross(Align::Center)
-                    .margin(edges_or(&v.footer_bar.margin, [0.0, 0.0, 0.0, 8.0]))
-                    .child(arrow(
-                        prev_icon,
-                        "‹",
-                        TAG_PAGE_PREV,
-                        prev_on,
-                        self.hover == TAG_PAGE_PREV,
-                    ))
-                    .child(
-                        View::leaf(
-                            if self.page_number_visible() {
-                                format!("{}/{}", self.page, self.total_pages)
-                            } else {
-                                String::new()
-                            },
-                            // 页码颜色用主题 footer_bar.color（如 svgtest 的亮红/暗粉），缺则回退 text_dim。
-                            col(v.footer_bar.text_color, marker_c),
-                        )
-                        .font_size(footer_fs)
-                        .font_weight(v.footer_bar.font_weight)
-                        .font_family(v.footer_bar.font_family.clone()),
+                decorate_box(
+                    View::container(Layout::Row)
+                        .cross(Align::Center)
+                        .margin(edges_or(&v.footer_bar.margin, [0.0, 0.0, 0.0, 8.0])),
+                    &v.footer_bar,
+                )
+                .child(arrow(
+                    prev_icon,
+                    "‹",
+                    TAG_PAGE_PREV,
+                    prev_on,
+                    self.hover == TAG_PAGE_PREV,
+                ))
+                .child(
+                    View::leaf(
+                        if self.page_number_visible() {
+                            format!("{}/{}", self.page, self.total_pages)
+                        } else {
+                            String::new()
+                        },
+                        // 页码颜色用主题 footer_bar.color（如 svgtest 的亮红/暗粉），缺则回退 text_dim。
+                        col(v.footer_bar.text_color, marker_c),
                     )
-                    .child(arrow(
-                        next_icon,
-                        "›",
-                        TAG_PAGE_NEXT,
-                        next_on,
-                        self.hover == TAG_PAGE_NEXT,
-                    )),
+                    .font_size(footer_fs)
+                    .font_weight(v.footer_bar.font_weight)
+                    .font_family(v.footer_bar.font_family.clone()),
+                )
+                .child(arrow(
+                    next_icon,
+                    "›",
+                    TAG_PAGE_NEXT,
+                    next_on,
+                    self.hover == TAG_PAGE_NEXT,
+                )),
             )
         } else {
             None
