@@ -774,6 +774,42 @@ impl Coordinator {
         self.overlay_commit_command(state, &cand, &code, |s, st| s.exit_temp_english(st))
     }
 
+    /// 临英下字符 `ch` 是否被放行「直接入缓冲」——`allow_symbols` 总开关 + `symbol_chars`
+    /// 白名单的**单一真相源**。
+    ///
+    /// ★ 该判据有四个消费点，语义各不相同却必须同批读它，漏一个就是「某个字符设了不生效」：
+    /// 1. 标点臂（`_ =>`）：放行 → 入缓冲，否则「上屏高亮候选 + 转换后标点 → 退出」。
+    /// 2. 数字臂（`VK_1..=VK_9`）：放行 → 入缓冲，否则按页选词。
+    /// 3. 选词键 `;`/`'`：放行 → 让位，落标点臂入缓冲；否则选第 2/3 候选。
+    /// 4. 导航门控（`handle_candidate_nav`）：放行 → 让位；否则 `-=[],.` 仍翻页。
+    ///
+    /// 此前它是一个 bool（`allow_symbols`），四处一开全开——想打 `C++` 就得连带牺牲
+    /// 全部选词键与翻页键。改成按**字符**问之后，每个键各自决定，互不牵连。
+    ///
+    /// 判定按字符而非按键：`@` 是 Shift+2、`+` 是 Shift+=，同一个键的两个 shift 态是
+    /// 两个独立字符，白名单也就该分别管辖（`punct_char(vk, shift)` 本就返回具体字符）。
+    pub(crate) fn temp_english_char_allowed(&self, ch: char) -> bool {
+        let te = &self.rt().config.input.temp_english;
+        te.allow_symbols && te.symbol_chars.contains(ch)
+    }
+
+    /// 临英缓冲是否已进入「纯文本累积态」——含任何非字母字符（`C++` / `x64` / `e-mail`）。
+    ///
+    /// 此态下数字键无条件入缓冲，不再当选词键。原判据 `state.candidates.len() > 1` 表达的
+    /// 本意是「有候选可选才选词」，但取值口径不对：`update_temp_english_candidates` 恒把
+    /// 原文塞进首候选，`case_variants` 又对含符号串照样产出变形（`C++` → `c++`），于是
+    /// `len > 1` 恒真，按 `1` 直接上屏 `C++` 并退出——`C++11` 根本打不出来。
+    ///
+    /// 判据落在缓冲而不是候选上：缓冲一旦含符号，词库必然查不到，剩下的候选全是「原文 +
+    /// 大小写变形」这类没有词库来源的条目，选词已无价值。这条规则也让白名单不含数字的配置
+    /// （只放行 `+`）仍能打出 `C++11`。
+    pub(crate) fn temp_english_buffer_is_literal(state: &State) -> bool {
+        state
+            .temp_english_buffer
+            .chars()
+            .any(|c| !c.is_ascii_alphabetic())
+    }
+
     /// 临时英文模式按键处理（首版：缓冲累积 + 空格/回车/标点上屏，暂无词库候选）
     pub(crate) fn handle_temp_english_key(
         &self,
@@ -911,11 +947,14 @@ impl Coordinator {
                 refresh(self, state)
             }
             keymap::VK_1..=keymap::VK_9 if data.modifiers & MOD_SHIFT == 0 => {
-                // allow_symbols 开：数字是合法英文内容（hello2 / mp3 / x64），一律入缓冲——
-                // 该开关的语义是「英文原文优先于选词」，此前它只接到下方标点臂，数字臂完全没读它，
-                // 于是开了开关也仍被候选抢走；连带 `0` 走独立臂无条件入缓冲，成了「0 能打、1-9 不能」
-                // 的不一致。此时选词改走：方向/翻页键导航高亮 + 空格上屏（回车仍上屏原文）。
-                let digits_as_input = self.rt().config.input.temp_english.allow_symbols;
+                let ch = (b'0' + (data.key_code - 0x30) as u8) as char;
+                // 数字入缓冲有两条独立通路，缺一不可：
+                // 1. 该数字被显式列入白名单（`symbol_chars` 出厂含 `0-9`）——数字是合法英文
+                //    内容（hello2 / mp3 / x64），此时选词改走「方向/翻页键导航 + 空格上屏」。
+                // 2. 缓冲已是纯文本态（含非字母字符）——见 `temp_english_buffer_is_literal`。
+                //    白名单不含数字时靠这条兜底，否则 `C++11` 打不出来。
+                let digits_as_input = self.temp_english_char_allowed(ch)
+                    || Self::temp_english_buffer_is_literal(state);
                 // 数字：有词库候选（>1，即除原文外还有匹配）时按页选词；否则作输入（英文含数字 v2）
                 let (start, end) = self.page_range(state);
                 let gi = start + (data.key_code - 0x31) as usize;
@@ -926,12 +965,13 @@ impl Coordinator {
                     let text = state.candidates[gi].text.clone();
                     commit_text(self, state, text)
                 } else {
-                    let ch = (b'0' + (data.key_code - 0x30) as u8) as char;
                     Self::temp_english_insert(state, ch);
                     refresh(self, state)
                 }
             }
             0x30 if data.modifiers & MOD_SHIFT == 0 => {
+                // `0` 不参与选词（选词键是 1-9），没有与之竞争的语义，故**不受白名单管辖**，
+                // 与既有行为一致。受管辖只会带来「把 0 从列表里删掉后 0 键静默无反应」的回归。
                 Self::temp_english_insert(state, '0');
                 refresh(self, state)
             }
@@ -949,11 +989,14 @@ impl Coordinator {
                 // `select_key_offset` 的模式处理器（主流程 / 临拼 / 特殊 / mix 都接了），
                 // 于是次选键一路落到下方标点臂，被判成「上屏高亮候选 + 标点」——用户按 `;`
                 // 想选第 2 候选，实得首候选被直接上屏并退出临英。
-                // 与数字臂同构地受 allow_symbols 抑制：该开关的语义是符号/数字「入缓冲，
-                // 而非上屏退出**或选词**」（见 config.toml 该项说明）。
+                // 与数字臂同构地受白名单抑制：列入的字符语义是「入缓冲，而非上屏退出**或
+                // 选词**」（见 config.toml `symbol_chars` 说明）。此前问的是 allow_symbols
+                // 这个整体开关，于是为了打 `C++` 就得连 `;`/`'` 的选词能力一起赔进去；
+                // 现在只有 `;` 自己被列入白名单时它才让位。
                 // 越界（页内候选不足）不在此处理，落下方标点臂保持既有语义。
                 if !shift
-                    && !self.rt().config.input.temp_english.allow_symbols
+                    && punct_char(data.key_code, shift)
+                        .is_none_or(|ch| !self.temp_english_char_allowed(ch))
                     && let Some(offset) = self.select_key_offset(data.key_code)
                 {
                     let (start, end) = self.page_range(state);
@@ -968,8 +1011,10 @@ impl Coordinator {
                 }
                 // 其它（标点等）：上屏当前高亮候选 + 转换后标点，退出
                 if let Some(ch) = punct_char(data.key_code, shift) {
-                    // allow_symbols：可见符号直接入缓冲累积（如 C++），不上屏退出（对齐 Go）。
-                    if self.rt().config.input.temp_english.allow_symbols {
+                    // 白名单内的可见符号直接入缓冲累积（如 C++），不上屏退出（对齐 Go）。
+                    // 列表外的照旧走下方「上屏高亮候选 + 转换后标点 → 退出」——这条通路是
+                    // 「打完英文顺手加句号上屏」的唯一实现，不能因为开了总开关就整体消失。
+                    if self.temp_english_char_allowed(ch) {
                         Self::temp_english_insert(state, ch);
                         return refresh(self, state);
                     }

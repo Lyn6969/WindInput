@@ -3234,6 +3234,65 @@ fn test_temp_english_allow_symbols_digits_go_to_buffer() {
     assert_eq!(action_text(&act).unwrap(), "Hel2-", "符号应入缓冲");
 }
 
+/// 数字兜底：白名单**不含数字**，但缓冲已含符号（`C++`）时数字仍直接入缓冲。
+///
+/// 回归点：原判据是 `state.candidates.len() > 1`，本意「有候选可选才选词」，但取值口径不对
+/// ——首候选恒是原文，`case_variants` 又对含符号串照样产出变形（`C++` → `c++`），于是
+/// `len > 1` 恒真，按 `1` 直接上屏 `C++` 并退出临英，`C++11` 根本打不出来。
+/// 判据改到缓冲上（含非字母字符 = 纯文本累积态），与白名单是否含数字无关。
+#[test]
+fn test_temp_english_digits_go_to_buffer_after_symbol_even_if_not_listed() {
+    if !has_schemas() {
+        return;
+    }
+    let mut cfg = config_with("wubi86");
+    cfg.input.temp_english.allow_symbols = true;
+    cfg.input.temp_english.symbol_chars = "+".into(); // 刻意只放行 `+`，不含 0-9
+    let coord = Coordinator::new_headless(cfg, Some(&data_dir()));
+    press_shift_letter(&coord, 'c');
+    press_vk(&coord, 0xBB, true); // Shift+= → `+`
+    let act = press_vk(&coord, 0xBB, true); // 再一个 `+`
+    assert_eq!(action_text(&act).unwrap(), "C++", "前置：`+` 应入缓冲");
+    assert!(
+        coord.debug_all_candidate_texts().len() > 1,
+        "前置条件：候选须 >1（原文 + 大小写变形），否则旧判据本就放行，测不出兜底"
+    );
+    let act = press_vk(&coord, 0x31, false); // `1`
+    assert_eq!(
+        action_text(&act).unwrap(),
+        "C++1",
+        "缓冲含符号后数字应入缓冲，而非选首候选并退出"
+    );
+}
+
+/// 白名单**之外**的符号维持旧语义：上屏高亮候选 + 转换后标点 → 退出临英。
+///
+/// 这条通路是「打完英文顺手按句号上屏」的唯一实现。旧实现下 allow_symbols 一开它整体消失
+/// （任何符号都只入缓冲）；改造后只有列入的字符被摘出去，其余照旧。
+#[test]
+fn test_temp_english_unlisted_punct_keeps_commit_and_exit() {
+    if !has_schemas() {
+        return;
+    }
+    let mut cfg = config_with("wubi86");
+    cfg.input.temp_english.allow_symbols = true;
+    cfg.input.temp_english.symbol_chars = "+".into(); // 不含 `.`
+    let coord = Coordinator::new_headless(cfg, Some(&data_dir()));
+    press_shift_letter(&coord, 'h');
+    press_letter(&coord, 'e');
+    press_letter(&coord, 'l');
+    match coord.handle_key_event(&key_event(0xBE, EVENT_KEY_DOWN)) {
+        // `.` 未列入 → 上屏「高亮候选 + 转换后标点」并退出（默认高亮 = 首候选 = 原文）
+        KeyAction::InsertText { text, .. } => {
+            assert!(
+                text.starts_with("Hel") && text.chars().count() > 3,
+                "`.` 未列入白名单，应上屏候选 + 标点并退出，实际: {text:?}"
+            );
+        }
+        other => panic!("`.` 未列入白名单，应走标点上屏臂，实际: {:?}", other),
+    }
+}
+
 /// 对照组：allow_symbols 关（默认）时数字键仍是选词键——守住既有行为不被上面的改动误伤。
 #[test]
 fn test_temp_english_digits_still_select_when_symbols_disallowed() {
@@ -3290,16 +3349,17 @@ fn test_temp_english_select_keys_pick_candidates() {
     }
 }
 
-/// 对照组一：allow_symbols 开时二三候选键让位于字符输入——该开关的声明语义是
-/// 符号「入缓冲而非上屏退出**或选词**」，与数字臂同构，不能被上面的接线改动破坏。
+/// 对照组一：`;` **被列入白名单**时让位于字符输入——列入的字符语义是「入缓冲而非上屏退出
+/// **或选词**」，与数字臂同构，不能被选词接线破坏。
 #[test]
-fn test_temp_english_select_keys_yield_to_input_when_symbols_allowed() {
+fn test_temp_english_select_keys_yield_to_input_when_listed() {
     if !has_schemas() {
         return;
     }
     let mut cfg = config_with("wubi86");
     cfg.keys.select_key_groups = vec!["semicolon_quote".into()];
     cfg.input.temp_english.allow_symbols = true;
+    cfg.input.temp_english.symbol_chars = ";".into();
     let coord = Coordinator::new_headless(cfg, Some(&data_dir()));
     press_shift_letter(&coord, 'h');
     press_letter(&coord, 'e');
@@ -3312,8 +3372,39 @@ fn test_temp_english_select_keys_yield_to_input_when_symbols_allowed() {
     assert_eq!(
         action_text(&act).unwrap(),
         "Hel;",
-        "allow_symbols 开启时 `;` 应入缓冲而非选第 2 候选"
+        "`;` 在白名单内时应入缓冲而非选第 2 候选"
     );
+}
+
+/// 对照组一之反向：总开关开着、但 `;` **不在**白名单里时它仍是选词键。
+///
+/// 这是本次「bool → 白名单」改造的核心收益，也是唯一能证明改造真的落地的方向：
+/// 旧实现下 allow_symbols 一开，`;` 无条件让位，本断言必红。缺了这条反向对照，
+/// 上面那条测试在旧实现下同样是绿的（旧实现让位得更狠），等于什么都没锁住。
+#[test]
+fn test_temp_english_select_keys_still_select_when_not_listed() {
+    if !has_schemas() {
+        return;
+    }
+    let mut cfg = config_with("wubi86");
+    cfg.keys.select_key_groups = vec!["semicolon_quote".into()];
+    cfg.input.temp_english.allow_symbols = true;
+    cfg.input.temp_english.symbol_chars = "+-_".into(); // 刻意不含 `;`
+    let coord = Coordinator::new_headless(cfg, Some(&data_dir()));
+    press_shift_letter(&coord, 'h');
+    press_letter(&coord, 'e');
+    press_letter(&coord, 'l');
+    assert!(
+        coord.debug_all_candidate_texts().len() >= 3,
+        "前置条件：应有 ≥3 个候选，否则测不到选词分支"
+    );
+    match coord.handle_key_event(&key_event(0xBA, EVENT_KEY_DOWN)) {
+        KeyAction::InsertText { text, .. } => assert_eq!(
+            text, "hel",
+            "`;` 不在白名单时应照常选第 2 候选（全小写变形）"
+        ),
+        other => panic!("`;` 未列入白名单，应选第 2 候选并上屏，实际: {:?}", other),
+    }
 }
 
 /// 对照组二：页内候选不足时 `;` 仍走标点臂（上屏高亮候选 + 标点并退出），
@@ -6949,10 +7040,10 @@ fn test_temp_english_page_keys_flip_pages_when_symbols_disallowed() {
     assert_eq!(coord.debug_page_info().0, 0, "`-` 应翻回第 1 页");
 }
 
-/// 对照组：allow_symbols 开时翻页键让位于字符输入——该开关的声明语义是符号「入缓冲，
-/// 而非上屏退出、选词或导航」，与二三候选键 / 数字臂同构，不能被上面的接线改动破坏。
+/// 对照组：`=` **被列入白名单**时翻页键让位于字符输入——列入的字符语义是「入缓冲，
+/// 而非上屏退出、选词或导航」，与二三候选键 / 数字臂同构，不能被翻页接线破坏。
 #[test]
-fn test_temp_english_page_keys_yield_to_input_when_symbols_allowed() {
+fn test_temp_english_page_keys_yield_to_input_when_listed() {
     if !has_schemas() {
         return;
     }
@@ -6960,6 +7051,7 @@ fn test_temp_english_page_keys_yield_to_input_when_symbols_allowed() {
     cfg.keys.page_keys = vec!["pageupdown".into(), "minus_equal".into()];
     cfg.ui.candidate.per_page = 3;
     cfg.input.temp_english.allow_symbols = true;
+    cfg.input.temp_english.symbol_chars = "=".into();
     let coord = Coordinator::new_headless(cfg, Some(&data_dir()));
     press_shift_letter(&coord, 'h');
     press_letter(&coord, 'e');
@@ -6972,9 +7064,46 @@ fn test_temp_english_page_keys_yield_to_input_when_symbols_allowed() {
     assert_eq!(
         action_text(&act).unwrap(),
         "Hel=",
-        "allow_symbols 开启时 `=` 应入缓冲而非翻页"
+        "`=` 在白名单内时应入缓冲而非翻页"
     );
     assert_eq!(coord.debug_page_info().0, 0, "让位输入时不应翻页");
+}
+
+/// 对照组之反向：白名单只含 `-` 时，同一键组的另一半 `=` 仍翻页。
+///
+/// 锁住「按字符而非按键组让位」这个判据——`minus_equal` 是成对键组，旧实现下
+/// allow_symbols 一开两个一起让位；改造后 `-` 入缓冲、`=` 照旧翻下一页。
+/// 这也是出厂白名单含 `-` 的已知代价（上一页只剩 ↑ 与 PgUp）的行为快照。
+#[test]
+fn test_temp_english_page_key_group_split_by_whitelist() {
+    if !has_schemas() {
+        return;
+    }
+    let mut cfg = config_with("wubi86");
+    cfg.keys.page_keys = vec!["pageupdown".into(), "minus_equal".into()];
+    cfg.ui.candidate.per_page = 3;
+    cfg.input.temp_english.allow_symbols = true;
+    cfg.input.temp_english.symbol_chars = "-".into(); // 只列 `-`，不列 `=`
+    let coord = Coordinator::new_headless(cfg, Some(&data_dir()));
+    press_shift_letter(&coord, 'h');
+    press_letter(&coord, 'e');
+    press_letter(&coord, 'l');
+    assert!(
+        coord.debug_page_info().2 >= 2,
+        "前置条件：应有 ≥2 页候选，否则测不到翻页分支"
+    );
+    let act = press_vk(&coord, 0xBB, false); // `=` 未列入 → 仍翻页
+    assert!(
+        matches!(act, KeyAction::Consumed),
+        "`=` 不在白名单时应作翻页被消费，实际: {act:?}"
+    );
+    assert_eq!(coord.debug_page_info().0, 1, "`=` 应翻到第 2 页");
+    let act = press_vk(&coord, 0xBD, false); // `-` 已列入 → 入缓冲
+    assert_eq!(
+        action_text(&act).unwrap(),
+        "Hel-",
+        "`-` 在白名单内时应入缓冲，不参与翻页"
+    );
 }
 
 // ───── 普通输入（拼音/码表）的大写字母：只进显示与上屏原码，不进匹配 ─────

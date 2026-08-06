@@ -4,7 +4,7 @@
 
 use crate::coordinator::{
     Coordinator, DEFERRED_COMPOSITION_FALLBACK_MS, InputOutcome, LEARN_ADD_WEIGHT,
-    PHRASE_WEIGHT_BASE, State, now_unix_secs,
+    PHRASE_WEIGHT_BASE, State, now_unix_secs, punct_char,
 };
 use crate::pipeline::ModeKind;
 use crate::preedit_cursor;
@@ -12,6 +12,7 @@ use tracing::{debug, warn};
 use wind_bridge::handler::{KeyAction, KeyEventData};
 use wind_candidate::{Candidate, CandidateMeta, CandidateSource};
 use wind_config::hotkey;
+use wind_ipc::protocol::MOD_SHIFT;
 use wind_keys::keymap;
 use wind_store::freq::FreqRecord;
 use wind_ui::manager::CandidateOp;
@@ -1584,11 +1585,19 @@ impl Coordinator {
     /// 判据是 `mix_has_quick_numeric` 而非 `mix_has_quick_input`：只配了 `quick_input.repeat`
     /// 的 mix 没有表达式录入，`-`/`=` 仍应是翻页键。
     ///
-    /// 临英按 `allow_symbols` 动态判定，不是恒排除：该开关关闭时符号本就进不了缓冲，
-    /// `-`/`=` 不再承担任何输入语义，却因这里恒 `false` 落到 `_ =>` 标点臂，被判成
-    /// 「上屏高亮候选 + 标点 → 退出」——用户按 `=` 想翻页，实得首候选被直接上屏。
-    /// 与二三候选键 `;`/`'` 受 `allow_symbols` 抑制同构：该开关的语义是符号「入缓冲，
-    /// 而非上屏退出、选词**或导航**」，开着时仍让位输入（`e-mail` 这类词打得出）。
+    /// 临英**逐键**动态判定，既不是恒排除也不是整类开关：
+    /// - 恒 `false`（最初版）：`allow_symbols` 关时符号本就进不了缓冲，`-`/`=` 不承担任何
+    ///   输入语义，却落到 `_ =>` 标点臂被判成「上屏高亮候选 + 标点 → 退出」——用户按 `=`
+    ///   想翻页，实得首候选被直接上屏。
+    /// - 读 `allow_symbols`（第二版）：整类让位。为了打 `e-mail` 的一个 `-`，`=`/`[`/`]`/
+    ///   `,`/`.` 的翻页能力全部一起赔进去，即用户所说的「过于宽泛」。
+    /// - 读 `symbol_chars` 白名单（本版）：只有该键实际产出的字符被列入时它才让位输入，
+    ///   同键组的另一半（列了 `-` 没列 `=`）照旧翻页。判据必须取**字符**而非键——`+` 是
+    ///   Shift+=、`@` 是 Shift+2，同一个键的两个 shift 态归白名单分别管辖。
+    ///
+    /// ★ 这是「静态类别判据 vs 动态配置判据」错配的第二次修正：上次把恒 false 改成读开关，
+    /// 这次把读开关改成读字符。凡按 `ModeKind` 整类给值的门控，都要复查它对每个模式的取值
+    /// 是否仍成立——`include_printable` 的历史注释里写死过「临英要输符号」这个静态假设。
     pub(crate) fn handle_candidate_nav(
         &self,
         state: &mut State,
@@ -1600,7 +1609,13 @@ impl Coordinator {
             // 分支只为「日后有人把 mix 接过来时规则仍然对」，取值统一问
             // `mix_nav_include_printable`——此前这里独立写了一份且与活代码取值相反。
             Some(ModeKind::Mix(idx)) => self.mix_nav_include_printable(idx),
-            Some(ModeKind::TempEnglish) => !self.rt().config.input.temp_english.allow_symbols,
+            // 非可打印键（PgUp/方向键/Tab）`punct_char` 返回 None，恒作导航——它们本就不在
+            // `printable` 绑定里，`include_printable` 对其取何值都不改变结果。
+            Some(ModeKind::TempEnglish) => {
+                let shift = data.modifiers & MOD_SHIFT != 0;
+                punct_char(data.key_code, shift)
+                    .is_none_or(|ch| !self.temp_english_char_allowed(ch))
+            }
             _ => false,
         };
         self.apply_nav_key(state, data, include_printable)

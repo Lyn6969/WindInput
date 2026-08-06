@@ -223,6 +223,7 @@ static REGISTRY: &[ConfigField] = &[
     ),
     f("input.temp_english.trigger_keys", StrList),
     f("input.temp_english.allow_symbols", Bool),
+    f("input.temp_english.symbol_chars", Str),
     f("input.temp_english.space_as_input", Bool),
     f("input.temp_english.case_variants", Bool),
     f(

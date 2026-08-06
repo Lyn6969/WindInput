@@ -1582,6 +1582,16 @@ fn default_english_pairs() -> Vec<String> {
     ["()", "[]", "{}"].iter().map(|s| s.to_string()).collect()
 }
 
+/// 临英符号白名单出厂值：数字 + 标识符/代码里最常用的符号。
+///
+/// 含 `.` 与 `-` 是刻意的（`obj.prop` / `e-mail` / `snake_case` 都要打得出），代价是这
+/// 两个键在临英下交出各自的翻页职责——`comma_period` / `minus_equal` 两个键组各被劈掉
+/// 一半，「上一页」只剩 ↑ 与 PgUp；「打完英文顺手按句号上屏」这条通路也随之失效。
+/// 不需要代码场景的人把这两个字符从列表里删掉即可拿回。
+fn default_temp_english_symbol_chars() -> String {
+    "0123456789+-_.@#/".to_string()
+}
+
 /// 临时英文配置（[input.temp_english]，原 input.shift_temp_english）。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TempEnglishConfig {
@@ -1596,10 +1606,22 @@ pub struct TempEnglishConfig {
     #[serde(default)]
     pub trigger_keys: Vec<String>,
     /// 允许符号与数字直接入缓冲（`C++` / `hello2` / `x64`）而非触发上屏或选词。
-    /// 开启后数字键 1-9 也不再当选词键——语义是「英文原文优先于选词」，选词改走
-    /// 方向/翻页键导航 + 空格上屏。
+    /// 总开关，放行哪些字符由 [`Self::symbol_chars`] 精确决定。
     #[serde(default)]
     pub allow_symbols: bool,
+    /// 允许入缓冲的符号/数字白名单（**纯字面字符集**，逐字符匹配）。仅 `allow_symbols`
+    /// 开启时生效；**列表外的字符一律维持关闭时的语义**——符号仍「上屏高亮候选 +
+    /// 转换后标点 → 退出临英」，`;`/`'` 仍选第 2/3 候选，`-=[],.` 仍翻页，数字键 1-9
+    /// 仍选词。即：白名单只把选中的字符从这套语义里摘出来改成入缓冲。
+    ///
+    /// 留空 = 一个字符都不放行（等价于关掉 `allow_symbols`）。
+    ///
+    /// ★ 刻意**不**复用码元集 `input_chars` 的 `a-z` 范围语法：`-` 在符号集里是高频
+    /// 字符（`e-mail`），那套语法下 `+-_` 会被解析成 `0x2B..=0x5F` 一整片（含全部大写
+    /// 字母与 `:;<=>?@[\]^`），用户在设置页填一个减号就静默放行几十个字符。与同类的
+    /// `symbol.english_chars` / `symbol.smart_chars` 一致，字面即全部真相。
+    #[serde(default = "default_temp_english_symbol_chars")]
+    pub symbol_chars: String,
     /// 空格作为输入字符入缓冲（可打出带空格的英文短句）。上屏职责随之转给回车，
     /// 且回车此时上屏**高亮候选**而非原文——否则该配置下没有任何选词键可用。
     #[serde(default)]
@@ -1634,6 +1656,7 @@ impl Default for TempEnglishConfig {
             shift_behavior: "temp_english".to_string(),
             trigger_keys: Vec::new(),
             allow_symbols: false,
+            symbol_chars: default_temp_english_symbol_chars(),
             space_as_input: false,
             candidate_layout: LayoutIntent::default(),
             case_variants: true,
