@@ -74,9 +74,11 @@ fn handle_uds_client(mut stream: UnixStream, handler: Arc<dyn MessageHandler>) {
                     input_scope_mask: fg.input_scope_mask,
                     disabled: fg.disabled != 0,
                     reason: fg.reason,
-                    // macOS `.app` 发的是短包，恒落 UNKNOWN——那边没有 TSF，坐标来源
-                    // 本就是另一套语义，不适用 CARET_SRC_* 的分级。
+                    // macOS `.app` 的 caret 段恒为 0（含 height），服务端 apply_focus_caret
+                    // 见 height==0 即返回；坐标另经 CmdCaretUpdate 上报。来源恒落 UNKNOWN
+                    // ——那边没有 TSF，不适用 CARET_SRC_* 的分级。
                     caret_source: fg.caret_source,
+                    bundle_id: wind_ipc::codec::decode_focus_gained_bundle_id(&payload).to_string(),
                 });
             }
         }

@@ -84,24 +84,36 @@ final class BinaryCodecTests: XCTestCase {
     }
 
     func testFocusGainedFrame_InputScopeMask() throws {
-        // 密码框: IS_PASSWORD 位 (bit31)。布局 = pid:u32(0) + inputScopeMask:u64。
+        // 密码框: IS_PASSWORD 位 (bit31)。载荷与 Win 端同构 (39B) + bundleID 段。
         let mask: UInt64 = UInt64(1) << 31
-        let f = BinaryCodec.encodeFocusGainedFrame(inputScopeMask: mask)
+        let token: UInt64 = (UInt64(4321) << 32) | 7
+        let f = BinaryCodec.encodeFocusGainedFrame(
+            clientToken: token, inputScopeMask: mask, bundleID: "com.apple.TextEdit")
         let (cmd, len, _) = try BinaryCodec.decodeHeader(f)
         XCTAssertEqual(cmd, UpstreamCmd.focusGained)
-        XCTAssertEqual(len, 12)
+        XCTAssertEqual(len, UInt32(43 + "com.apple.TextEdit".utf8.count))
         let payload = f.subdata(in: WireProtocol.headerSize ..< f.count)
-        XCTAssertEqual(payload.readUInt32LE(at: 0), 0) // pid 占位
-        let lo = UInt64(payload.readUInt32LE(at: 4))
-        let hi = UInt64(payload.readUInt32LE(at: 8))
-        XCTAssertEqual(lo | (hi << 32), mask)
+        // caret 段全 0: 服务端 apply_focus_caret 见 height==0 即返回, 不污染坐标缓存。
+        for i in 0..<20 { XCTAssertEqual(payload[payload.startIndex + i], 0) }
+        XCTAssertEqual(payload.readUInt64LE(at: 20), token)
+        XCTAssertEqual(payload.readUInt64LE(at: 28), mask)
+        XCTAssertEqual(payload[payload.startIndex + 38], 0) // caretSource = UNKNOWN
+        let n = Int(payload.readUInt32LE(at: 39))
+        XCTAssertEqual(
+            String(data: payload.subdata(in: (payload.startIndex + 43)..<(payload.startIndex + 43 + n)),
+                   encoding: .utf8),
+            "com.apple.TextEdit")
     }
 
-    func testFocusGainedFrame_NonSensitiveMaskZero() throws {
-        let f = BinaryCodec.encodeFocusGainedFrame(inputScopeMask: 0)
+    func testFocusGainedFrame_MeetsRustMinimumLength() throws {
+        // 回归: 曾只发 12 字节, 而 Rust FocusGainedPayload::from_bytes 下限是 36 —— 解码恒
+        // 失败, FOCUS_GAINED 重型段 (按应用初始模式 / compat 规则 / 密码框抑制) 从未执行。
+        let f = BinaryCodec.encodeFocusGainedFrame(
+            clientToken: 0, inputScopeMask: 0, bundleID: "")
+        let (_, len, _) = try BinaryCodec.decodeHeader(f)
+        XCTAssertGreaterThanOrEqual(len, 39)
         let payload = f.subdata(in: WireProtocol.headerSize ..< f.count)
-        XCTAssertEqual(payload.readUInt32LE(at: 4), 0)
-        XCTAssertEqual(payload.readUInt32LE(at: 8), 0)
+        XCTAssertEqual(payload.readUInt32LE(at: 39), 0) // bundleID 为空也要有长度字段
     }
 
     func testDecodeKeyEventPayloadTooShort() {

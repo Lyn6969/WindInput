@@ -193,6 +193,12 @@ pub struct FocusData {
     /// `OnSetFocus` 不是按键上下文，同步 edit session 必被宿主拒绝，回退链交出的是**跨窗口的**
     /// Win32 光标。焦点气泡就锚在这组坐标上，故必须能分辨来源，详见 `FocusGainedPayload`。
     pub caret_source: i32,
+    /// 宿主 app 的 bundle id（**仅 macOS**，由 `.app` 随焦点事件上报；Windows 恒空串）。
+    ///
+    /// macOS 的服务进程无法像 Windows 那样按 pid 反查进程名，「当前是哪个应用」只能由
+    /// `.app` 告知。服务端小写后填进 `pid_names` 缓存，compat.toml 规则匹配与 per-app
+    /// 中英记忆都从那里取名——两平台在缓存之后的路径完全一致。
+    pub bundle_id: String,
 }
 
 /// 光标位置数据

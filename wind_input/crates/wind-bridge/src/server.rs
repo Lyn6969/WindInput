@@ -376,6 +376,8 @@ fn handle_client(
                 disabled: fg.disabled != 0,
                 reason: fg.reason,
                 caret_source: fg.caret_source,
+                // Windows DLL 不发 bundleID 段（那边由服务进程 OpenProcess 反查进程名）。
+                bundle_id: String::new(),
             };
             handler.handle_focus_gained(&data);
         }

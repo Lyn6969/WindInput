@@ -135,13 +135,55 @@ public class InputController: IMKInputController {
         let secure = IsSecureEventInputEnabled()
         lastReportedSecureInput = secure
         let mask: UInt64 = secure ? Self.inputScopePasswordBit : 0
+        let bundleID = currentClient?.bundleIdentifier() ?? ""
         do {
-            try bridge.send(BinaryCodec.encodeFocusGainedFrame(inputScopeMask: mask))
+            try bridge.send(BinaryCodec.encodeFocusGainedFrame(
+                clientToken: Self.clientToken(pid: hostPid(for: bundleID), client: currentClient),
+                inputScopeMask: mask,
+                bundleID: bundleID))
             _ = try bridge.readFrame()
         } catch {
             NSLog("WindInput[sendFocusGained] io error: \(error)")
             reconnect()
         }
+    }
+
+    /// 宿主 app 的 pid, 供服务端做「焦点是否跨应用切入」判定 (clientToken 高 32 位)。
+    ///
+    /// 优先取前台 app 的真实 pid, 但**必须核对 bundleID 一致**: 输入法与宿主是两个进程,
+    /// Spotlight / 通知中心等场景下 frontmostApplication 未必就是持有文本框的那个 app,
+    /// 认错了会把 A 应用的模式记到 B 头上。核对不上时退化为 bundleID 的稳定散列 ——
+    /// 它同样满足服务端的全部需求 (同 app 恒等、异 app 相异), 只是重启 app 后仍相等,
+    /// 对「按应用记忆中英」而言反而更合用。
+    private func hostPid(for bundleID: String) -> UInt32 {
+        if !bundleID.isEmpty,
+           let front = NSWorkspace.shared.frontmostApplication,
+           front.bundleIdentifier == bundleID,
+           front.processIdentifier > 0
+        {
+            return UInt32(front.processIdentifier)
+        }
+        return Self.stableHash(bundleID)
+    }
+
+    /// FNV-1a 32 位散列, 结果恒非 0 (服务端以 pid==0 表示「未知宿主」并跳过按应用逻辑)。
+    private static func stableHash(_ s: String) -> UInt32 {
+        if s.isEmpty { return 0 }
+        var h: UInt32 = 2_166_136_261
+        for b in s.utf8 {
+            h = (h ^ UInt32(b)) &* 16_777_619
+        }
+        return h == 0 ? 1 : h
+    }
+
+    /// clientToken = pid(高 32) | client 实例标识(低 32)。
+    /// 低位取 IMKit client 的对象身份: 同一文本框重复聚焦得同一 token, 换文本框则不同 ——
+    /// 对齐 Windows 端「pid | docMgrId」的语义 (服务端据此区分同应用内的焦点跳转)。
+    private static func clientToken(pid: UInt32, client: (IMKTextInput & NSObjectProtocol)?) -> UInt64 {
+        let low: UInt32 = client.map {
+            UInt32(truncatingIfNeeded: UInt(bitPattern: ObjectIdentifier($0).hashValue))
+        } ?? 0
+        return (UInt64(pid) << 32) | UInt64(low)
     }
 
     /// 发前台上下文帧 (CmdFrontContext 0x0211): client app bundle id / 聚焦窗口标题 / 选中文本,

@@ -71,6 +71,32 @@ pub fn decode_focus_gained(payload: &[u8]) -> Result<FocusGainedPayload, CodecEr
     })
 }
 
+/// 解 CMD_FOCUS_GAINED 载荷尾部的 darwin bundleID 段（`bundleIdLen:u32 + utf8`，偏移 39）。
+///
+/// 该段是 macOS `.app` 专属：宿主 app 的 bundle id，服务端小写后当作「进程名」，供
+/// compat.toml 规则匹配与 per-app 中英记忆使用（macOS 上无法像 Windows 那样由服务进程
+/// `OpenProcess` 反查，只能由 `.app` 随焦点事件带上来）。
+///
+/// Windows DLL 不发该段；段缺失 / 长度越界 / 非法 UTF-8 一律返回空串——「取不到宿主名」
+/// 与「宿主名为空」在下游是同一语义（跳过按应用逻辑），不必区分。
+pub fn decode_focus_gained_bundle_id(payload: &[u8]) -> &str {
+    const OFF: usize = FocusGainedPayload::BUNDLE_ID_OFFSET;
+    if payload.len() < OFF + 4 {
+        return "";
+    }
+    let n = u32::from_le_bytes([
+        payload[OFF],
+        payload[OFF + 1],
+        payload[OFF + 2],
+        payload[OFF + 3],
+    ]) as usize;
+    let start = OFF + 4;
+    match payload.get(start..start + n) {
+        Some(b) => std::str::from_utf8(b).unwrap_or(""),
+        None => "",
+    }
+}
+
 /// 从载荷字节解码 InputStateReportPayload（CMD_INPUT_STATE_REPORT 0x0213）
 pub fn decode_input_state_report(payload: &[u8]) -> Result<InputStateReportPayload, CodecError> {
     InputStateReportPayload::from_bytes(payload).ok_or(CodecError::BufferTooShort {
@@ -740,6 +766,40 @@ mod shell_exec_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 拼一份 macOS `.app` 形态的 FOCUS_GAINED 载荷（39 定长 + bundleID 段）。
+    fn focus_payload_with_bundle(id: &str) -> Vec<u8> {
+        let mut p = vec![0u8; 39];
+        p.extend_from_slice(&(id.len() as u32).to_le_bytes());
+        p.extend_from_slice(id.as_bytes());
+        p
+    }
+
+    #[test]
+    fn focus_gained_bundle_id_roundtrip() {
+        let p = focus_payload_with_bundle("com.apple.TextEdit");
+        assert_eq!(decode_focus_gained_bundle_id(&p), "com.apple.TextEdit");
+        // 定长段本身仍须能解（bundleID 是纯追加，不影响既有字段）。
+        assert!(decode_focus_gained(&p).is_ok());
+    }
+
+    #[test]
+    fn focus_gained_bundle_id_absent_or_malformed_is_empty() {
+        // Windows DLL 的 39 字节包：无 bundleID 段。
+        assert_eq!(decode_focus_gained_bundle_id(&[0u8; 39]), "");
+        // 旧 macOS `.app` 的 12 字节短包。
+        assert_eq!(decode_focus_gained_bundle_id(&[0u8; 12]), "");
+        // 长度字段越界（截断的帧）：不得 panic，按「取不到」处理。
+        let mut p = vec![0u8; 39];
+        p.extend_from_slice(&999u32.to_le_bytes());
+        p.extend_from_slice(b"abc");
+        assert_eq!(decode_focus_gained_bundle_id(&p), "");
+        // 非法 UTF-8 同样按「取不到」处理。
+        let mut q = vec![0u8; 39];
+        q.extend_from_slice(&2u32.to_le_bytes());
+        q.extend_from_slice(&[0xFF, 0xFE]);
+        assert_eq!(decode_focus_gained_bundle_id(&q), "");
+    }
 
     #[test]
     fn test_encode_host_render_setup_layout_matches_cpp() {

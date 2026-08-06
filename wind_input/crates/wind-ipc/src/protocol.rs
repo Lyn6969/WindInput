@@ -501,10 +501,16 @@ pub struct FocusGainedPayload {
     ///
     /// 旧 DLL 只发 38 字节，落 [`caret_source::UNKNOWN`]。
     pub caret_source: i32,
+    // ⚠ 第 39 字节起还有一段 darwin 专属的 `bundleIdLen:u32 + bundleId`（宿主 app 的
+    // bundle id，服务端当作「进程名」用于 compat.toml 匹配与 per-app 记忆）。它是变长的，
+    // 放进本结构会让 `Copy` 失效并波及全部既有调用点，故单独由
+    // [`crate::codec::decode_focus_gained_bundle_id`] 解析。Windows DLL 不发该段。
 }
 
 impl FocusGainedPayload {
     pub const SIZE: usize = 39;
+    /// darwin bundleID 段的起始偏移（`bundleIdLen:u32` 的首字节）。
+    pub const BUNDLE_ID_OFFSET: usize = 39;
 
     pub fn from_bytes(buf: &[u8]) -> Option<Self> {
         // 向后兼容：至少要有旧 36 字节；disabled/reason/caret_source 缺省 0

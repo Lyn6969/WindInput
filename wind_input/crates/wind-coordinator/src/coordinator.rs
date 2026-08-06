@@ -1859,11 +1859,22 @@ impl Coordinator {
         if pid == 0 {
             return;
         }
+        // 缓存优先于反查：macOS 的 `.app` 随焦点事件把宿主 bundle id 送进 `pid_names`
+        // （服务进程那边 `process_name` 恒返回空串），此处必须先读缓存才能拿到宿主名。
+        // Windows 上首次见到该 pid 时缓存为空 → 照常 OpenProcess 反查，行为不变。
+        //
+        // ⚠ 在取 `active_compat` 锁**之前**读缓存：本函数末尾是「先 drop(ac) 再锁
+        // pid_names」，两把锁在此嵌套会引入一个方向相反的持有序。
+        let cached_name = self.cached_proc_name(client_token);
         let mut ac = self.active_compat.lock().unwrap_or_else(|e| e.into_inner());
         if ac.pid == pid {
             return; // 同进程，规则已缓存
         }
-        let name = process_name(pid);
+        let name = if cached_name.is_empty() {
+            process_name(pid)
+        } else {
+            cached_name
+        };
         let (next, rule_matched, rule_initial_mode, rule_initial_punct) = {
             let table = self.app_compat.lock().unwrap_or_else(|e| e.into_inner());
             let rule = table.get_rule(&name);
@@ -7021,6 +7032,15 @@ impl MessageHandler for Coordinator {
         // 跑完之后读到的已是新进程的规则，「切换前那个应用有没有初始规则」就永远取不到了。
         // 漏掉这点不会编译报错、不会 panic，只表现为「从规则应用切出去后模式不恢复」。
         let new_pid = (data.client_token >> 32) as u32;
+        // macOS：宿主名只能由 `.app` 告知（服务进程的 `process_name` 恒空）。必须**先于**
+        // update_active_compat 落进缓存，否则那边读到空名 → compat 规则匹配不上、per-app
+        // 记忆表查不到，整条按应用链路静默退化成全局行为。Windows 恒为空串，不进此分支。
+        if !data.bundle_id.is_empty() && new_pid != 0 {
+            self.pid_names
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .insert(new_pid, data.bundle_id.to_lowercase());
+        }
         let (old_pid, old_has_rule) = {
             let ac = self.active_compat.lock().unwrap_or_else(|e| e.into_inner());
             (ac.pid, ac.has_initial_rule)
@@ -8844,6 +8864,7 @@ mod caret_compat_tests {
             disabled: false,
             reason: 0,
             caret_source: wind_ipc::protocol::caret_source::GUI_CARET,
+            bundle_id: String::new(),
         });
         let st = c.state.lock().unwrap();
         assert_eq!(
@@ -8879,6 +8900,7 @@ mod caret_compat_tests {
             disabled: false,
             reason: 0,
             caret_source: wind_ipc::protocol::caret_source::TSF_SELECTION,
+            bundle_id: String::new(),
         });
         assert!(
             !c.composition_start.lock().unwrap().2,
@@ -8906,6 +8928,7 @@ mod caret_compat_tests {
             disabled: false,
             reason: 0,
             caret_source: wind_ipc::protocol::caret_source::TSF_SELECTION,
+            bundle_id: String::new(),
         });
         let st = c.state.lock().unwrap();
         assert_eq!(
@@ -9087,6 +9110,7 @@ mod caret_compat_tests {
             disabled: false,
             reason: 0,
             caret_source: wind_ipc::protocol::caret_source::TSF_SELECTION,
+            bundle_id: String::new(),
         });
         assert!(
             !c.caret_cache_verified
@@ -9443,6 +9467,32 @@ mod caret_compat_tests {
         let token = (4321u64 << 32) | 7;
         c.update_active_compat(token);
         assert_eq!(c.active_compat.lock().unwrap().pid, 4321);
+    }
+
+    #[test]
+    fn update_active_compat_prefers_cached_name_over_process_lookup() {
+        // macOS 路径：宿主名由 `.app` 随焦点事件送进 pid_names，`process_name` 恒空串。
+        // 缓存必须优先于反查，否则 compat 规则永远匹配不到宿主。
+        let c = coord();
+        let pid = 5150u32;
+        let token = (pid as u64) << 32 | 3;
+        c.pid_names
+            .lock()
+            .unwrap()
+            .insert(pid, "com.apple.textedit".into());
+        let mut rules = Vec::new();
+        wind_config::app_compat::set_first_show_mode(
+            &mut rules,
+            "com.apple.textedit",
+            wind_config::app_compat::FirstShowMode::Fast,
+        );
+        *c.app_compat.lock().unwrap() = wind_config::app_compat::AppCompat::from_rules(rules);
+        c.update_active_compat(token);
+        assert_eq!(
+            c.active_compat.lock().unwrap().first_show_mode,
+            wind_config::app_compat::FirstShowMode::Fast,
+            "缓存里的 bundle id 必须参与 compat 规则匹配"
+        );
     }
 }
 
@@ -10167,6 +10217,7 @@ mod focus_ownership_tests {
             disabled: false,
             reason: 0,
             caret_source: wind_ipc::protocol::caret_source::TSF_SELECTION,
+            bundle_id: String::new(),
         });
         assert!(!c.state.lock().unwrap().menu_open);
     }

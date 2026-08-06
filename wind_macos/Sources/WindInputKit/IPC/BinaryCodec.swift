@@ -132,18 +132,43 @@ public enum BinaryCodec {
         return out
     }
 
-    /// 编码 CmdFocusGained (0x0201 upstream) 帧, 携带 InputScope bitmask (darwin)。
-    /// 布局: header(8) + payload {
-    ///   pid:u32 (4)            // darwin 无 PID 概念, 恒 0 占位 (与 Win 端 [0:4]=pid 约定对齐)
-    ///   inputScopeMask:u64 (8) // TSF InputScope bitmask; macOS 仅用 bit31 (IS_PASSWORD) 标记安全输入
-    /// }
-    /// 密码框/安全输入检测见 InputController.activateServer (IsSecureEventInputEnabled)。
-    /// 空帧 (旧版无 payload) 由 server_darwin 解析为 mask=0, 向后兼容。
-    public static func encodeFocusGainedFrame(inputScopeMask: UInt64) -> Data {
-        var payload = Data(count: 12)
-        payload.writeUInt32LE(0, at: 0) // pid 占位
-        payload.writeUInt32LE(UInt32(truncatingIfNeeded: inputScopeMask), at: 4)        // 低 32 位
-        payload.writeUInt32LE(UInt32(truncatingIfNeeded: inputScopeMask >> 32), at: 8)  // 高 32 位
+    /// 编码 CmdFocusGained (0x0201 upstream) 帧。布局与 Windows TSF 端**同构**, 尾部追加
+    /// darwin 专属的 bundleID 段:
+    /// ```
+    ///   caret:20            // x/y/height/compositionStartX/Y (i32 ×5)
+    ///   clientToken:u64     // 高 32 位 = 宿主 pid, 低 32 位 = client 实例标识
+    ///   inputScopeMask:u64  // TSF InputScope bitmask; macOS 仅用 bit31 (IS_PASSWORD)
+    ///   disabled:u8         // TSF compartment 禁用态, macOS 恒 0
+    ///   reason:u8           // 同上, 恒 0
+    ///   caretSource:u8      // caret_source::UNKNOWN(0) —— macOS 无 TSF 语义域
+    ///   bundleIdLen:u32 + bundleId  // darwin 追加段, Windows DLL 不发
+    /// ```
+    ///
+    /// ⚠️ **必须发满 39 字节**。此前只发 12 字节 (pid 占位 + mask), 而 Rust
+    /// `FocusGainedPayload::from_bytes` 的下限是 36 —— 解码恒失败, 于是 FOCUS_GAINED 的
+    /// **整个重型段从未在 macOS 上执行过**: 按应用初始模式 / compat.toml 规则 / 焦点状态气泡 /
+    /// 密码框强制英文 全部静默失效 (那句"darwin 无 PID 概念"的注释是错的, macOS 有 pid)。
+    ///
+    /// caret 段全 0 是安全的: 服务端 `apply_focus_caret` 在 `height == 0` 时直接返回,
+    /// 不会污染坐标缓存 —— macOS 的插入点坐标另有 CmdCaretUpdate 通路。
+    ///
+    /// - Parameter bundleID: 宿主 app 的 bundle id (取自 IMKit `client.bundleIdentifier()`),
+    ///   服务端小写后当作「进程名」用于 compat.toml 匹配与 per-app 记忆。空串 = 未知。
+    public static func encodeFocusGainedFrame(
+        clientToken: UInt64, inputScopeMask: UInt64, bundleID: String
+    ) -> Data {
+        let bundleBytes = Array(bundleID.utf8)
+        var payload = Data(count: 43)
+        // [0, 20) caret 全 0 (height=0 → 服务端忽略)
+        payload.writeUInt32LE(UInt32(truncatingIfNeeded: clientToken), at: 20)
+        payload.writeUInt32LE(UInt32(truncatingIfNeeded: clientToken >> 32), at: 24)
+        payload.writeUInt32LE(UInt32(truncatingIfNeeded: inputScopeMask), at: 28)
+        payload.writeUInt32LE(UInt32(truncatingIfNeeded: inputScopeMask >> 32), at: 32)
+        payload[36] = 0 // disabled
+        payload[37] = 0 // reason
+        payload[38] = 0 // caretSource = UNKNOWN
+        payload.writeUInt32LE(UInt32(bundleBytes.count), at: 39)
+        payload.append(contentsOf: bundleBytes)
         var out = encodeHeader(cmd: UpstreamCmd.focusGained, payloadLen: UInt32(payload.count))
         out.append(payload)
         return out
