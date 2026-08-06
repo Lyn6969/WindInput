@@ -26,6 +26,9 @@ pub mod dpi;
 pub mod global_hotkey_macos;
 pub mod image_cache;
 pub mod input_diag_hud;
+/// macOS 输入源切换（TISSelectInputSource）。对位 Windows 的 DirectSwitchHotkeys 注册表。
+#[cfg(target_os = "macos")]
+pub mod input_source_macos;
 pub mod manager;
 /// macOS host-render forwarder：把 UiCommand 光栅化进 POSIX SHM + push 推帧给 .app。
 #[cfg(target_os = "macos")]

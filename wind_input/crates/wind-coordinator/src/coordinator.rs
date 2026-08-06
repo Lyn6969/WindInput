@@ -5059,6 +5059,9 @@ impl Coordinator {
                 self.trigger_screenshot();
                 true
             }
+            // macOS 专属：Windows 上该动作由 ctfmon 原生处理，本进程收不到、也不该处理。
+            #[cfg(target_os = "macos")]
+            "activate_ime" => wind_ui::input_source_macos::select_self(),
             _ => {
                 debug!("Unhandled hotkey action: {}", action);
                 false
@@ -5074,9 +5077,13 @@ impl Coordinator {
         self.dispatch_hotkey(action);
     }
 
-    /// 从 keys.global_hotkeys（动作名列表）构建 Win32 RegisterHotKey 条目。
-    /// 对齐 Go buildGlobalHotkeyEntries：仅支持无需按键上下文的动作；
-    /// activate_ime 不在此列（走 DirectSwitchHotkeys 注册表，不经 RegisterHotKey）。
+    /// 从 keys.global_hotkeys（动作名列表）构建全局热键条目（Win32 RegisterHotKey /
+    /// macOS Carbon RegisterEventHotKey）。对齐 Go buildGlobalHotkeyEntries：仅支持无需
+    /// 按键上下文的动作。
+    ///
+    /// activate_ime 是个例外，不读 keys.global_hotkeys：Windows 上它由 ctfmon 从
+    /// DirectSwitchHotkeys 注册表直接接管（见 `sync_direct_switch_hotkey`），macOS 无对应
+    /// 机制，改由本进程注册 Carbon 热键并调 TISSelectInputSource（见函数末尾的 macOS 分支）。
     fn build_global_hotkey_entries(&self) -> Vec<GlobalHotkeyEntry> {
         let rt = self.rt();
         let k = &rt.config.keys;
@@ -5107,6 +5114,27 @@ impl Coordinator {
                 vk,
                 action: name.clone(),
             });
+        }
+        // macOS：activate_ime 也走本进程的 Carbon 全局热键。
+        //
+        // 它**不**读 keys.global_hotkeys——那个列表是「哪些动作要额外提升为全局」的开关，
+        // 而 activate_ime 的语义本来就只有全局一种（本输入法没激活时才需要它）。Windows 上
+        // 它同样不在该列表里，是由 ctfmon 从注册表直接接管的；macOS 无对应机制，只能自己注册。
+        // 判据因此是「配了就注册」，与 sync_direct_switch_hotkey 的 Windows 分支一致。
+        #[cfg(target_os = "macos")]
+        {
+            let hotkey = self.rt().config.keys.activate_ime.trim().to_string();
+            if !hotkey.is_empty() && !hotkey.eq_ignore_ascii_case("none") {
+                match hotkey::parse_hotkey(&hotkey) {
+                    Some(hash) => entries.push(GlobalHotkeyEntry {
+                        id: entries.len() as i32 + 1,
+                        modifiers: wind_mods_to_win32(hash >> 16),
+                        vk: hash & 0xFFFF,
+                        action: "activate_ime".to_string(),
+                    }),
+                    None => warn!("activate_ime 热键 {:?} 解析失败，忽略", hotkey),
+                }
+            }
         }
         entries
     }
@@ -5217,7 +5245,10 @@ impl Coordinator {
 
     /// 同步 activate_ime 到 Windows DirectSwitchHotkeys 注册表（启动与配置热重载时调用）。
     /// 该热键由 ctfmon 原生处理（per-app 切换到本输入法），本进程不参与按键分发；
-    /// 未配置/解析失败 → 仅清理注册表旧条目。非 Windows 平台为空操作。
+    /// 未配置/解析失败 → 仅清理注册表旧条目。
+    ///
+    /// 非 Windows 为空操作：macOS 的 activate_ime 走 `build_global_hotkey_entries` 里的
+    /// Carbon 注册（切换是**全局**的，非 per-app——系统无对应 API，差异不可消除）。
     pub(crate) fn sync_direct_switch_hotkey(&self) {
         #[cfg(windows)]
         {
