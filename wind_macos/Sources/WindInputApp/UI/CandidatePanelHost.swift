@@ -286,8 +286,8 @@ public final class CandidatePanelHost {
                 DispatchQueue.main.async { [weak self] in self?.panel.updateMenuFlags(flags) }
             }
         case DownstreamCmd.openSettings:
-            let page = String(data: frame.payload, encoding: .utf8) ?? ""
-            ModeStatusController.shared.openSettings(page: page)
+            ModeStatusController.shared.openSettings(
+                arguments: BinaryCodec.decodeOpenSettingsArguments(frame.payload))
         case DownstreamCmd.tooltipShow:
             if let p = try? BinaryCodec.decodeTooltipPayload(frame.payload) {
                 DispatchQueue.main.async { [weak self] in self?.showTooltip(p) }

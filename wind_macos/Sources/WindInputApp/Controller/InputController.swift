@@ -335,7 +335,7 @@ public class InputController: IMKInputController {
     }
 
     @objc public func imkOpenSettings(_ sender: Any!) {
-        ModeStatusController.shared.openSettings(page: "")
+        ModeStatusController.shared.openSettings(arguments: [])
     }
 
     public override func handle(_ event: NSEvent!, client sender: Any!) -> Bool {

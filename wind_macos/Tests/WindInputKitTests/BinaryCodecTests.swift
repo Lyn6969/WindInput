@@ -130,4 +130,37 @@ final class BinaryCodecTests: XCTestCase {
         XCTAssertEqual(decoded.eventSeq, 7)
         XCTAssertEqual(decoded.prevChar, 0)
     }
+
+    // MARK: - CmdOpenSettings (0x0507) 深链切词
+
+    func testOpenSettingsArguments_PageOnly() {
+        XCTAssertEqual(
+            BinaryCodec.decodeOpenSettingsArguments(Data("dict".utf8)), ["--page=dict"])
+    }
+
+    func testOpenSettingsArguments_PageWithExtras() {
+        // 回归: 整串曾被塞进单个 --page=, 设置端 parse_target 解析不出页 id, 只开默认页。
+        let a = BinaryCodec.decodeOpenSettingsArguments(
+            Data("dict --schema=wubi86 --type=shadow".utf8))
+        XCTAssertEqual(a, ["--page=dict", "--schema=wubi86", "--type=shadow"])
+    }
+
+    func testOpenSettingsArguments_QuotedValueWithSpace() {
+        // build_settings_args 对含空白的值加双引号; 切词后引号须去掉、值保持完整。
+        let a = BinaryCodec.decodeOpenSettingsArguments(
+            Data("add-word --text=\"你 好\" --code=nihao".utf8))
+        XCTAssertEqual(a, ["--page=add-word", "--text=你 好", "--code=nihao"])
+    }
+
+    func testOpenSettingsArguments_NoPageOnlyFlags() {
+        // page=None + extra 非空 (如 --dark): 首词已是选项, 不得再包一层 --page=。
+        XCTAssertEqual(
+            BinaryCodec.decodeOpenSettingsArguments(Data("--dark --soft".utf8)),
+            ["--dark", "--soft"])
+    }
+
+    func testOpenSettingsArguments_Empty() {
+        XCTAssertEqual(BinaryCodec.decodeOpenSettingsArguments(Data()), [])
+        XCTAssertEqual(BinaryCodec.decodeOpenSettingsArguments(Data("   ".utf8)), [])
+    }
 }

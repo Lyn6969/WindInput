@@ -117,15 +117,19 @@ public final class ModeStatusController: NSObject, NSMenuDelegate {
         menu.addItem(item)
     }
 
-    /// 打开设置应用 (wind_setting.app, Wails)。经 LaunchServices 按 bundleID 查找并启动,
+    /// 打开设置应用 (wind_setting.app, Rust + windui)。经 LaunchServices 按 bundleID 查找并启动,
     /// 已在运行则激活已有窗口 (macOS .app 天然单实例)。
-    @objc private func openSettingsMenuAction() { openSettings(page: "") }
+    @objc private func openSettingsMenuAction() { openSettings(arguments: []) }
 
-    /// 打开设置应用并可选跳转到指定页 (page 非空时传 --page=<page>)。
+    /// 打开设置应用, arguments 为原样直通的命令行参数 (深链见
+    /// `BinaryCodec.decodeOpenSettingsArguments`)。空数组 = 默认页。
     /// 经 LaunchServices 按 bundleID 启动/激活已有实例。线程安全 (切主线程)。
-    public func openSettings(page: String) {
+    ///
+    /// ⚠️ 已在运行时 LaunchServices **不重传 arguments**, 只激活窗口 —— 深链要在已开着的
+    /// 设置窗口上生效, 靠的是 windui 的单实例转发 (二次实例把 argv 发给首实例)。
+    public func openSettings(arguments: [String]) {
         if !Thread.isMainThread {
-            DispatchQueue.main.async { [weak self] in self?.openSettings(page: page) }
+            DispatchQueue.main.async { [weak self] in self?.openSettings(arguments: arguments) }
             return
         }
         // 设置应用按本 IME 变体启动: dev IME → dev 设置应用 (连 WindInputDev 服务 rpc.sock),
@@ -137,13 +141,15 @@ public final class ModeStatusController: NSObject, NSMenuDelegate {
         let ws = NSWorkspace.shared
         if let url = ws.urlForApplication(withBundleIdentifier: bundleID) {
             let cfg = NSWorkspace.OpenConfiguration()
-            if !page.isEmpty { cfg.arguments = ["--page=\(page)"] }
+            if !arguments.isEmpty { cfg.arguments = arguments }
             ws.openApplication(at: url, configuration: cfg)
         } else {
             // LaunchServices 尚未登记时的兜底: open -b 触发一次注册+启动。
             let p = Process()
             p.launchPath = "/usr/bin/open"
-            p.arguments = page.isEmpty ? ["-b", bundleID] : ["-b", bundleID, "--args", "--page=\(page)"]
+            p.arguments = arguments.isEmpty
+                ? ["-b", bundleID]
+                : ["-b", bundleID, "--args"] + arguments
             try? p.run()
         }
     }
