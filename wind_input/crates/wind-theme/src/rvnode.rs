@@ -6,6 +6,13 @@
 use crate::palette::Rgba;
 use crate::schema::Dim;
 
+/// 强调条条高占行高的默认比例（主题未配 `accent_bar.height_ratio` 时）。
+///
+/// ⚠️ `RvViews` derive 的 `Default` 会把 `accent_bar_height_ratio` 置 0.0，那是
+/// 「条高算成 0」而非「用默认比例」。凡消费该字段处都须判零回退到本常量，
+/// 否则未配比例的主题强调条会塌成 2px 细线。
+pub const DEFAULT_ACCENT_BAR_HEIGHT_RATIO: f32 = 0.6;
+
 /// None=0/未设。paint 期 `Dim::resolve(scale, host)` 求值。
 #[inline]
 fn dim_px(d: Option<Dim>, scale: f32, host: f32) -> f32 {
@@ -159,6 +166,8 @@ pub struct RvViews {
     pub accent_bar_enabled: bool,
     pub accent_bar_width: Option<Dim>,
     pub accent_bar_offset: Option<Dim>,
+    /// 条高 = 行高 × 此比例。0=未经 resolve 填充，消费方须回退
+    /// [`DEFAULT_ACCENT_BAR_HEIGHT_RATIO`]（resolve 期已保证落在 (0,1]）。
     pub accent_bar_height_ratio: f32,
     pub shadow_offset_x: Option<Dim>,
     pub shadow_offset_y: Option<Dim>,

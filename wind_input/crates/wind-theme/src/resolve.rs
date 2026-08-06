@@ -7,7 +7,9 @@
 //!   配合 `Option` 兜底（缺默认=沿用基态/渲染器内置），外部坏主题不黑屏。
 
 use crate::palette::{Rgba, parse_hex, resolve_palette};
-use crate::rvnode::{RvEdges, RvGradient, RvImage, RvNode, RvViews};
+use crate::rvnode::{
+    DEFAULT_ACCENT_BAR_HEIGHT_RATIO, RvEdges, RvGradient, RvImage, RvNode, RvViews,
+};
 use crate::schema::{Ld, Theme, ViewGradient, ViewImage, ViewNode, Views};
 use std::collections::HashMap;
 use std::path::Path;
@@ -421,9 +423,21 @@ fn resolve_views(v: &Views, palette: &HashMap<String, Rgba>, is_dark: bool) -> R
     rv.accent_bar_enabled = v.accent_bar.enabled.unwrap_or(false);
     rv.accent_bar_width = v.accent_bar.width;
     rv.accent_bar_offset = v.accent_bar.offset;
-    if let Some(r) = v.accent_bar.height_ratio {
-        rv.accent_bar_height_ratio = r;
-    }
+    // 条高比：值域 (0, 1]，越界或未配一律落 DEFAULT_ACCENT_BAR_HEIGHT_RATIO。
+    // ⚠️ 这里必须写出默认值而不是留 `f32` 的零值——`RvViews::default()` 的 0.0 会让
+    // 强调条高度算成 0（钳到 2px 的细线），未配主题的强调条形同消失。
+    rv.accent_bar_height_ratio = match v.accent_bar.height_ratio {
+        Some(r) if r > 0.0 && r <= 1.0 => r,
+        Some(r) => {
+            tracing::warn!(
+                ratio = r,
+                "accent_bar.height_ratio 超出值域 (0,1]，回退默认 {}",
+                DEFAULT_ACCENT_BAR_HEIGHT_RATIO
+            );
+            DEFAULT_ACCENT_BAR_HEIGHT_RATIO
+        }
+        None => DEFAULT_ACCENT_BAR_HEIGHT_RATIO,
+    };
 
     // 其它窗口（status/tooltip/toast）：各注入自己 palette 默认色（T5 再补 toolbar/menu）。
     rv.status = v
@@ -636,6 +650,53 @@ radius = 6
         assert_eq!(disabled.text_color, Some([0x55, 0x55, 0x55, 255]));
         let sep = r.views.menu_separator.as_ref().expect("menu_separator");
         assert_eq!(sep.bg_color, Some([0x66, 0x66, 0x66, 255]));
+    }
+
+    /// 强调条条高比：显式值透传；未配 / 越界一律落默认 0.6。
+    ///
+    /// ⚠️ 这条锁的是「未配 ≠ 0.0」。`RvViews` derive 的 Default 会给 0.0，若 resolve
+    /// 不显式写默认值，所有未配该项的主题（含全部内置主题）强调条会塌成 2px 细线。
+    #[test]
+    fn test_accent_bar_height_ratio_defaults_and_clamps() {
+        let build = |accent: &str| {
+            let text = format!("[colors]\naccent = \"#3B82F6\"\n\n[accent_bar]\n{accent}");
+            let value: toml::Value = toml::from_str(&text).unwrap();
+            let theme: Theme = crate::normalize::normalize_theme(value).try_into().unwrap();
+            resolve(&theme, false, &[data_dir()])
+                .views
+                .accent_bar_height_ratio
+        };
+
+        // 未配 → 默认
+        assert_eq!(build("enabled = true\n"), DEFAULT_ACCENT_BAR_HEIGHT_RATIO);
+        // 显式值透传
+        assert_eq!(build("enabled = true\nheight_ratio = 1.0\n"), 1.0);
+        assert_eq!(build("enabled = true\nheight_ratio = 0.35\n"), 0.35);
+        // 越界（≤0 / >1）→ 回退默认，不 fail
+        assert_eq!(
+            build("enabled = true\nheight_ratio = 0.0\n"),
+            DEFAULT_ACCENT_BAR_HEIGHT_RATIO
+        );
+        assert_eq!(
+            build("enabled = true\nheight_ratio = -0.5\n"),
+            DEFAULT_ACCENT_BAR_HEIGHT_RATIO
+        );
+        assert_eq!(
+            build("enabled = true\nheight_ratio = 1.5\n"),
+            DEFAULT_ACCENT_BAR_HEIGHT_RATIO
+        );
+    }
+
+    /// 内置主题都没写 height_ratio —— 它们必须拿到 0.6 而不是 0.0。
+    #[test]
+    fn test_builtin_themes_get_default_accent_ratio() {
+        for name in ["default", "msime"] {
+            let r = load(name, false);
+            assert_eq!(
+                r.views.accent_bar_height_ratio, DEFAULT_ACCENT_BAR_HEIGHT_RATIO,
+                "{name} 未配 height_ratio，应落默认值而非 0"
+            );
+        }
     }
 
     /// 工具栏整体背景色/边框色：节点优先，未配回退 toolbar_* token。

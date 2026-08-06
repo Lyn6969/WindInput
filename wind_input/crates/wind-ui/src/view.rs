@@ -125,6 +125,20 @@ impl Rect {
     }
 }
 
+/// 左侧强调条参数（选中候选的竖条）。**覆盖层语义**：不参与 measure/布局，仅 paint 期
+/// 在节点左内边距内绘制。四个字段里三个是 `f32`，故用具名结构体而非元组——位置写反
+/// 编译器抓不到。
+#[derive(Clone, Copy, Debug)]
+pub struct LeftBar {
+    pub color: [u8; 4],
+    /// 条宽（设备像素，调用方按 DPI 缩放后传入）。
+    pub width: f32,
+    /// 条高 = 节点高 × 此比例，结果钳到 ≥2px。主题 `accent_bar.height_ratio`，默认 0.6。
+    pub height_ratio: f32,
+    /// 左缘偏移（设备像素）：正值把条向右推离节点左缘。主题 `accent_bar.offset`，默认 0。
+    pub offset: f32,
+}
+
 /// 一个视图节点（容器或文本叶子）
 pub struct View {
     pub layout: Layout,
@@ -156,8 +170,8 @@ pub struct View {
     pub caret_at: Option<usize>,
     /// 插入符竖线宽度（像素；调用方按 DPI 缩放传入）。
     pub caret_w: f32,
-    /// 左侧强调条 (颜色, 宽度 px)：在节点左缘内绘制竖条（选中候选用）；不占布局空间（落在左内边距内）。
-    pub left_bar: Option<([u8; 4], f32)>,
+    /// 左侧强调条：在节点左缘内绘制竖条（选中候选用）；不占布局空间（落在左内边距内）。
+    pub left_bar: Option<LeftBar>,
     /// 圆形背景色：在节点中心画真圆（直径=min(w,h)）；序号圆圈用，替代圆角矩形药丸近似。
     pub circle_bg: Option<[u8; 4]>,
     /// 背景填充图（叠在底色之上，裁到圆角内）。
@@ -323,8 +337,8 @@ impl View {
         self.bg_gradient = Some(g);
         self
     }
-    pub fn left_bar(mut self, color: [u8; 4], width: f32) -> Self {
-        self.left_bar = Some((color, width));
+    pub fn left_bar(mut self, bar: LeftBar) -> Self {
+        self.left_bar = Some(bar);
         self
     }
     pub fn circle_bg(mut self, color: [u8; 4]) -> Self {
@@ -543,11 +557,21 @@ impl View {
         if let Some(img) = &self.bg_image {
             paint_bg_image(buf, buf_w, buf_h, r, self.corner_radius, img);
         }
-        // 左侧强调条（选中候选）：在左内边距内画竖条，高 = 内容高的 60%，垂直居中。不占布局。
-        if let Some((color, bw)) = self.left_bar {
-            let bh = (r.h * 0.6).max(2.0);
+        // 左侧强调条（选中候选）：在左内边距内画竖条，高 = 内容高 × height_ratio，垂直居中。不占布局。
+        if let Some(bar) = self.left_bar {
+            let bh = (r.h * bar.height_ratio).max(2.0);
             let by = r.y + (r.h - bh) * 0.5;
-            fill_rounded(buf, buf_w, buf_h, r.x, by, bw, bh, color, bw * 0.5);
+            fill_rounded(
+                buf,
+                buf_w,
+                buf_h,
+                r.x + bar.offset,
+                by,
+                bar.width,
+                bh,
+                bar.color,
+                bar.width * 0.5,
+            );
         }
         // 圆形背景（序号圆圈）：节点中心真圆，直径 = min(w,h)。
         if let Some(color) = self.circle_bg {
@@ -1464,6 +1488,64 @@ mod geom_tests {
         // 边框环：靠边像素被描边，正中心（挖空）保持透明
         assert!(buf[(0 * 20 + 10) * 4 + 3] > 0, "上边框应被描边");
         assert_eq!(buf[(10 * 20 + 10) * 4 + 3], 0, "环中心应镂空透明");
+    }
+
+    // ── 左侧强调条：height_ratio / offset ──────────────────────────────────
+    // 用无文本的固定尺寸容器，几何跨平台确定（不依赖 DirectWrite / mock 测量差异）。
+
+    /// 在 40×40 缓冲里画一个 40×40 的容器，带指定强调条参数；返回 BGRA 缓冲。
+    fn paint_left_bar(height_ratio: f32, offset: f32, width: f32) -> Vec<u8> {
+        let tr = crate::text::dwrite::TextRenderer::new("test", 20.0).unwrap();
+        let mut v = View::container(Layout::Row)
+            .fixed_w(40.0)
+            .fixed_h(40.0)
+            .left_bar(LeftBar {
+                color: [255, 0, 0, 255],
+                width,
+                height_ratio,
+                offset,
+            });
+        v.layout(0.0, 0.0, &tr);
+        let mut buf = vec![0u8; 40 * 40 * 4];
+        v.paint(&mut buf, 40, 40, &tr);
+        buf
+    }
+
+    /// (x, y) 处 alpha。
+    fn alpha_at(buf: &[u8], x: usize, y: usize) -> u8 {
+        buf[(y * 40 + x) * 4 + 3]
+    }
+
+    #[test]
+    fn left_bar_height_ratio_controls_bar_height() {
+        // ratio=1.0：条高 = 行高，顶部与中部都被填充。
+        let full = paint_left_bar(1.0, 0.0, 4.0);
+        assert!(alpha_at(&full, 1, 1) > 0, "ratio=1.0 顶部应被填充");
+        assert!(alpha_at(&full, 1, 20) > 0, "ratio=1.0 中部应被填充");
+
+        // ratio=0.5：条高 = 行高一半、垂直居中 → 中部填充、顶部留白。
+        let half = paint_left_bar(0.5, 0.0, 4.0);
+        assert!(alpha_at(&half, 1, 20) > 0, "ratio=0.5 中部应被填充");
+        assert_eq!(alpha_at(&half, 1, 1), 0, "ratio=0.5 顶部应留白");
+    }
+
+    #[test]
+    fn left_bar_offset_shifts_bar_right() {
+        // offset=0：条贴左缘。
+        let flush = paint_left_bar(1.0, 0.0, 4.0);
+        assert!(alpha_at(&flush, 1, 20) > 0, "offset=0 左缘应被填充");
+
+        // offset=10：条右移 10px → 左缘留白，10px 之后才是条。
+        let shifted = paint_left_bar(1.0, 10.0, 4.0);
+        assert_eq!(alpha_at(&shifted, 1, 20), 0, "offset=10 左缘应留白");
+        assert!(alpha_at(&shifted, 11, 20) > 0, "offset=10 处应被填充");
+    }
+
+    /// 极小 ratio 仍保底 2px——否则主题写个 0.01 会让条彻底消失。
+    #[test]
+    fn left_bar_tiny_ratio_clamped_to_min_height() {
+        let tiny = paint_left_bar(0.001, 0.0, 4.0);
+        assert!(alpha_at(&tiny, 1, 20) > 0, "极小比例仍应保底 2px 可见");
     }
 }
 

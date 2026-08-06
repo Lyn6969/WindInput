@@ -17,7 +17,8 @@ use crate::sys::{
     WM_RBUTTONDOWN, WM_SETCURSOR, WPARAM, clamp_content_to_monitor,
 };
 use crate::text::dwrite::TextRenderer;
-use crate::view::{Align, Edges, Layout, Rect, View, ViewImage, ViewLayer};
+use crate::view::{Align, Edges, Layout, LeftBar, Rect, View, ViewImage, ViewLayer};
+use wind_theme::DEFAULT_ACCENT_BAR_HEIGHT_RATIO;
 
 /// 换行可见符 U+21B5（`↵`）。取编辑器通用约定（VS Code 等显示换行即此符），
 /// 而非 Control Pictures 区的 `␊`/`␤`——后者字形是小方框里塞 `LF` 字母，
@@ -1561,11 +1562,17 @@ impl CandidateWindow {
         let box_gap = (item_spacing - item_pad.l - item_pad.r).max(0.0);
         let row_gap_v = dim(v.row_gap, 0.0);
         // 选中候选左侧强调条（仅主题启用时，如 msime/jidian）。
-        let accent_bar = v.accent_bar_enabled.then(|| {
-            (
-                col(v.accent_bar.bg_color, [66, 133, 244, 255]),
-                dim(v.accent_bar_width, 3.0),
-            )
+        // height_ratio 判零回退：RvViews 若未经 resolve 填充（Default 构造）该字段是 0.0，
+        // 直接乘会把条高算成 0 → 钳到 2px 细线，观感是强调条消失。
+        let accent_bar = v.accent_bar_enabled.then(|| LeftBar {
+            color: col(v.accent_bar.bg_color, [66, 133, 244, 255]),
+            width: dim(v.accent_bar_width, 3.0),
+            height_ratio: if v.accent_bar_height_ratio > 0.0 {
+                v.accent_bar_height_ratio
+            } else {
+                DEFAULT_ACCENT_BAR_HEIGHT_RATIO
+            },
+            offset: dim(v.accent_bar_offset, 0.0),
         });
 
         // 候选列表：横排=Row（cell 并列）；竖排=Column（候选纵向堆叠）。
@@ -1784,8 +1791,8 @@ impl CandidateWindow {
             // 选中底色优先于悬停底色（两者独立：选中=空格上屏目标，悬停=鼠标提示）
             if is_sel {
                 item = item.bg(sel_bg);
-                if let Some((c, w)) = accent_bar {
-                    item = item.left_bar(c, w);
+                if let Some(bar) = accent_bar {
+                    item = item.left_bar(bar);
                 }
             } else if is_hover {
                 item = item.bg(hover_bg);
