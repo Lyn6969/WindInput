@@ -503,6 +503,10 @@ fn resolve_views(v: &Views, palette: &HashMap<String, Rgba>, is_dark: bool) -> R
             .or_else(|| tk("toolbar_background"));
         rv.toolbar_border_color = resolve_color(tb.border.color.as_ref(), palette, is_dark)
             .or_else(|| tk("toolbar_border"));
+        // 整条外框圆角/线宽：此前只提取了色，radius/width 解析到 schema 就断了，
+        // 主题写了不生效（渲染层硬编码 h×0.30 与 1dp）。
+        rv.toolbar_border_radius = tb.border.radius;
+        rv.toolbar_border_width = tb.border.width;
     }
 
     rv
@@ -732,6 +736,36 @@ height = 30
         let r2 = resolve(&t2, false, &[data_dir()]);
         assert_eq!(r2.views.toolbar_bg_color, Some([0x11, 0x11, 0x11, 255]));
         assert_eq!(r2.views.toolbar_border_color, Some([0x22, 0x22, 0x22, 255]));
+    }
+
+    /// 工具栏整条外框圆角/线宽：此前只提取了 border.color，radius/width 解析到
+    /// schema 就断了 —— 编辑器把两个控件都开放着，实机却毫无变化。
+    #[test]
+    fn test_toolbar_border_radius_and_width_extracted() {
+        let text = "\
+[toolbar]
+border = { color = \"#BB0000\", radius = 0, width = \"2px\" }
+";
+        let value: toml::Value = toml::from_str(text).unwrap();
+        let theme: Theme = crate::normalize::normalize_theme(value).try_into().unwrap();
+        let r = resolve(&theme, false, &[data_dir()]);
+        // radius=0 必须是「显式直角」而非「未配」——硬边缘风格靠它。
+        assert_eq!(
+            r.views.toolbar_border_radius,
+            Some(crate::schema::Dim::Dp(0.0))
+        );
+        // px 单位不随 DPI 加粗（发丝线）。
+        assert_eq!(
+            r.views.toolbar_border_width,
+            Some(crate::schema::Dim::Px(2.0))
+        );
+
+        // 未配 → None，渲染层落内置派生值（条高×0.30 / 1dp），零回归。
+        let bare: toml::Value = toml::from_str("[toolbar]\nheight = 30\n").unwrap();
+        let t2: Theme = crate::normalize::normalize_theme(bare).try_into().unwrap();
+        let r2 = resolve(&t2, false, &[data_dir()]);
+        assert_eq!(r2.views.toolbar_border_radius, None);
+        assert_eq!(r2.views.toolbar_border_width, None);
     }
 
     #[test]

@@ -110,6 +110,9 @@ pub struct Toolbar {
     tb_button_width: Option<Dim>,
     tb_button_padding: Option<Dim>,
     tb_button_radius: Option<Dim>,
+    /// 整条外框圆角 / 线宽（[toolbar] border.radius / .width）。None→内置派生值。
+    tb_border_radius: Option<Dim>,
+    tb_border_width: Option<Dim>,
 }
 
 impl Toolbar {
@@ -171,6 +174,8 @@ impl Toolbar {
             tb_button_width: None,
             tb_button_padding: None,
             tb_button_radius: None,
+            tb_border_radius: None,
+            tb_border_width: None,
         })
     }
 
@@ -193,6 +198,8 @@ impl Toolbar {
         self.tb_button_width = v.toolbar_button_width;
         self.tb_button_padding = v.toolbar_button_padding;
         self.tb_button_radius = v.toolbar_button_radius;
+        self.tb_border_radius = v.toolbar_border_radius;
+        self.tb_border_width = v.toolbar_border_width;
         // [toolbar] 节点色覆盖上面的 token 兜底。
         if let Some(c) = v.toolbar_bg_color {
             self.bg = c;
@@ -344,9 +351,20 @@ impl Toolbar {
         {
             let buf = self.window.buffer_mut();
             buf[..buf_size].fill(0);
-            let radius = (h as f32 * 0.30) as u32;
+            // 整条圆角：主题 [toolbar] border.radius 优先，未配则 = 条高×0.30（原派生行为，
+            // 胶囊外形）。配 0 即直角——硬边缘风格靠这条实现。
+            let radius = self
+                .tb_border_radius
+                .map(|d| d.resolve(s, 0.0))
+                .unwrap_or(h as f32 * 0.30) as u32;
             fill_rounded(buf, w, h, 0, 0, w, h, self.bg, radius);
             // 细边框（与背景同弧度），增强浅色背景下的轮廓（对齐设计稿胶囊外框）。
+            // 线宽：主题 border.width 优先，未配落 1dp（原字面量）。
+            let border_w = self
+                .tb_border_width
+                .map(|d| d.resolve(s, 0.0))
+                .unwrap_or(1.0 * s)
+                .max(1.0);
             crate::view::fill_ring(
                 buf,
                 w,
@@ -357,7 +375,7 @@ impl Toolbar {
                 h as f32,
                 self.sep,
                 radius as f32,
-                (1.0 * s).max(1.0),
+                border_w,
             );
             // 拖动柄点阵
             draw_grip(buf, w, h, grip_w as u32, self.grip, s);

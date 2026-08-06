@@ -189,4 +189,8 @@ pub struct RvViews {
     /// 这里只提取两个色；背景图/渐变待补。None=未配，渲染层回退 toolbar_* token。
     pub toolbar_bg_color: Option<Rgba>,
     pub toolbar_border_color: Option<Rgba>,
+    /// 工具栏整条外框圆角 / 线宽（[toolbar] border.radius、border.width）。
+    /// None→toolbar.rs 内置默认（圆角 = 条高×0.30，线宽 = 1dp）。
+    pub toolbar_border_radius: Option<Dim>,
+    pub toolbar_border_width: Option<Dim>,
 }
