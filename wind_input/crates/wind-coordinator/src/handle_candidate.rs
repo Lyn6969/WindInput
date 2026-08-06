@@ -523,16 +523,7 @@ impl Coordinator {
         // 走 **_cached**：本闭包在每次按键的候选构建期求值，只用于拼显示标签，绝不能
         // 卡按键线程（`get_clipboard_text` 打不开时会 sleep 重试至 40ms）。真正执行动作
         // 时另有 CmdbarCtx 用非缓存版取值。
-        let clip = |_n: i64| -> String {
-            #[cfg(windows)]
-            {
-                wind_ui::popup_menu::get_clipboard_text_cached()
-            }
-            #[cfg(not(windows))]
-            {
-                String::new()
-            }
-        };
+        let clip = |_n: i64| -> String { wind_ui::popup_menu::get_clipboard_text_cached() };
         let mut expanded: Vec<Candidate> = Vec::with_capacity(raw.len());
         for cand in raw.into_iter() {
             if cand.is_phrase || cand.is_command {

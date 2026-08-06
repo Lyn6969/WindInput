@@ -1282,9 +1282,166 @@ pub fn get_clipboard_text() -> String {
     }
 }
 
+// ── macOS 剪贴板缓存读取（Carbon Pasteboard Manager，免子进程） ──────────────
+//
+// `get_clipboard_text` 走 `pbpaste`，一次 fork+exec 数毫秒；而
+// [`get_clipboard_text_cached`] 的调用点在**每次按键的候选构建期**，那里绝不能
+// spawn 进程。故显示路径另走 Pasteboard Manager 的 C API 直读，并按变更计数缓存。
+//
+// 用 `PasteboardCopyItemFlavorData` 而不是「变更计数 + pbpaste」：既然都要 FFI 拿
+// 计数，顺手把内容也读了，省掉子进程这一层。
+
+/// macOS 剪贴板缓存：长生命周期的 `PasteboardRef` + 上次读到的文本。
+///
+/// **`PasteboardRef` 必须常驻**：变更判据是 `PasteboardSynchronize` 返回的
+/// `kPasteboardModified`，其语义是「自**该 ref** 上次同步以来是否被改过」。每次新建 ref
+/// 就没有"上次"可比（实测新建后首次同步恒返回 0），判据直接失效。
+///
+/// 裸指针跨线程：Pasteboard Manager 的调用全部收在本模块的 Mutex 之内，无并发访问。
+#[cfg(target_os = "macos")]
+struct ClipCacheMac {
+    pb: pasteboard::PasteboardRef,
+    text: String,
+    /// 是否已真正读过一次。新建 ref 的首次同步不报 modified，故须靠它强制首读。
+    primed: bool,
+}
+#[cfg(target_os = "macos")]
+unsafe impl Send for ClipCacheMac {}
+
+#[cfg(target_os = "macos")]
+static CLIP_CACHE_MAC: std::sync::Mutex<Option<ClipCacheMac>> = std::sync::Mutex::new(None);
+
+#[cfg(target_os = "macos")]
+mod pasteboard {
+    use core_foundation_sys::base::CFTypeRef;
+    use core_foundation_sys::data::CFDataRef;
+    use core_foundation_sys::string::CFStringRef;
+    use std::ffi::c_void;
+
+    pub type OSStatus = i32;
+    pub type PasteboardRef = *mut c_void;
+    pub type PasteboardItemID = *mut c_void;
+
+    #[link(name = "ApplicationServices", kind = "framework")]
+    unsafe extern "C" {
+        pub fn PasteboardCreate(name: CFStringRef, out: *mut PasteboardRef) -> OSStatus;
+        /// 与系统剪贴板同步，返回本次同步的标志位；顺带更新变更计数。
+        pub fn PasteboardSynchronize(pb: PasteboardRef) -> u32;
+        pub fn PasteboardGetItemCount(pb: PasteboardRef, out: *mut u64) -> OSStatus;
+        pub fn PasteboardGetItemIdentifier(
+            pb: PasteboardRef,
+            index: u64,
+            out: *mut PasteboardItemID,
+        ) -> OSStatus;
+        pub fn PasteboardCopyItemFlavorData(
+            pb: PasteboardRef,
+            item: PasteboardItemID,
+            flavor: CFStringRef,
+            out: *mut CFDataRef,
+        ) -> OSStatus;
+        pub fn CFRelease(cf: CFTypeRef);
+    }
+}
+
+/// 造一个 CFString（+1，调用方负责释放）。
+#[cfg(target_os = "macos")]
+unsafe fn cfstr(s: &str) -> core_foundation_sys::string::CFStringRef {
+    use core_foundation_sys::base::kCFAllocatorDefault;
+    use core_foundation_sys::string::{CFStringCreateWithBytes, kCFStringEncodingUTF8};
+    unsafe {
+        CFStringCreateWithBytes(
+            kCFAllocatorDefault,
+            s.as_ptr(),
+            s.len() as isize,
+            kCFStringEncodingUTF8,
+            false as u8,
+        )
+    }
+}
+
+/// 同 [`get_clipboard_text`]，但**不 spawn 子进程**：经 Pasteboard Manager 直读，
+/// 并按变更计数缓存，剪贴板没变时是一次纯内存查表。
+///
+/// 专供**只用于显示**的场景（候选标签）。执行动作的路径请用 [`get_clipboard_text`]。
+#[cfg(target_os = "macos")]
+pub fn get_clipboard_text_cached() -> String {
+    use pasteboard::*;
+    /// `kPasteboardModified`：自本 ref 上次同步以来剪贴板被改过。
+    const K_PASTEBOARD_MODIFIED: u32 = 1;
+    /// `kPasteboardClipboard` 在头文件里是 `CFSTR(...)` 宏、不是导出符号，故自造。
+    const CLIPBOARD_NAME: &str = "com.apple.pasteboard.clipboard";
+    const UTF8_FLAVOR: &str = "public.utf8-plain-text";
+
+    let mut guard = CLIP_CACHE_MAC.lock().unwrap_or_else(|e| e.into_inner());
+    unsafe {
+        if guard.is_none() {
+            let name = cfstr(CLIPBOARD_NAME);
+            if name.is_null() {
+                return String::new();
+            }
+            let mut pb: PasteboardRef = std::ptr::null_mut();
+            let st = PasteboardCreate(name, &mut pb);
+            CFRelease(name as _);
+            if st != 0 || pb.is_null() {
+                return String::new();
+            }
+            *guard = Some(ClipCacheMac {
+                pb,
+                text: String::new(),
+                primed: false,
+            });
+        }
+        let cache = guard.as_mut().expect("刚建过");
+
+        let flags = PasteboardSynchronize(cache.pb);
+        if cache.primed && flags & K_PASTEBOARD_MODIFIED == 0 {
+            return cache.text.clone(); // 未变更：纯内存命中，不碰系统
+        }
+
+        let mut text = String::new();
+        let flavor = cfstr(UTF8_FLAVOR);
+        let mut n: u64 = 0;
+        if !flavor.is_null() && PasteboardGetItemCount(cache.pb, &mut n) == 0 {
+            // 项索引从 1 起（Pasteboard Manager 的约定，不是 0）。
+            for i in 1..=n {
+                let mut id: PasteboardItemID = std::ptr::null_mut();
+                if PasteboardGetItemIdentifier(cache.pb, i, &mut id) != 0 {
+                    continue;
+                }
+                let mut data: core_foundation_sys::data::CFDataRef = std::ptr::null();
+                if PasteboardCopyItemFlavorData(cache.pb, id, flavor, &mut data) == 0
+                    && !data.is_null()
+                {
+                    use core_foundation_sys::data::{CFDataGetBytePtr, CFDataGetLength};
+                    let len = CFDataGetLength(data) as usize;
+                    let ptr = CFDataGetBytePtr(data);
+                    if !ptr.is_null() && len > 0 {
+                        text = String::from_utf8_lossy(std::slice::from_raw_parts(ptr, len))
+                            .into_owned();
+                    }
+                    CFRelease(data as _);
+                    break; // 只取第一项文本，与 pbpaste 行为一致
+                }
+            }
+        }
+        if !flavor.is_null() {
+            CFRelease(flavor as _);
+        }
+        cache.text = text.clone();
+        cache.primed = true;
+        text
+    }
+}
+
 /// 读剪贴板文本（其它非 Windows mock：返回空串）。
 #[cfg(all(not(windows), not(target_os = "macos")))]
 pub fn get_clipboard_text() -> String {
+    String::new()
+}
+
+/// 其它非 Windows mock：无剪贴板可读。
+#[cfg(all(not(windows), not(target_os = "macos")))]
+pub fn get_clipboard_text_cached() -> String {
     String::new()
 }
 
@@ -1928,5 +2085,42 @@ mod tests {
         let (x2, _) = place_menu(&a, 400, 500, MW, MH, WA, 2.0);
         assert_eq!(x1 - a.right, GAP);
         assert_eq!(x2 - a.right, GAP * 2);
+    }
+}
+
+#[cfg(all(test, target_os = "macos"))]
+mod clipboard_tests_macos {
+    use super::*;
+
+    /// macOS 版的同一条不变量：缓存必须随剪贴板变更失效。
+    ///
+    /// `#[ignore]` 的理由与 Windows 版同：**它真写系统剪贴板**，会覆盖跑测试者当下的
+    /// 内容（末尾尽力恢复，进程被中断则恢复不了），不该混进 `cargo test` 日常批次。
+    ///
+    /// 改动 `get_clipboard_text_cached` 的 macOS 实现后手动跑：
+    /// `cargo test -p wind-ui --lib clipboard_cache -- --ignored --nocapture`
+    #[test]
+    #[ignore = "真写系统剪贴板，会覆盖使用者当前内容；须在 macOS 本机手动跑"]
+    fn clipboard_cache_invalidates_on_change_macos() {
+        const A: &str = "WindInput-clip-cache-A";
+        const B: &str = "WindInput-clip-cache-B";
+        let original = get_clipboard_text();
+
+        set_clipboard_text(A);
+        assert_eq!(get_clipboard_text_cached(), A, "写入后首读");
+        assert_eq!(get_clipboard_text_cached(), A, "二读（应命中缓存）");
+
+        // 内容变更 → PasteboardSynchronize 置 kPasteboardModified → 缓存必须失效。
+        // 判据失灵的后果是候选标签一直显示上一次的剪贴板内容。
+        set_clipboard_text(B);
+        assert_eq!(
+            get_clipboard_text_cached(),
+            B,
+            "缓存未随剪贴板变更失效（候选标签会显示旧内容）"
+        );
+
+        if !original.is_empty() {
+            set_clipboard_text(&original);
+        }
     }
 }
