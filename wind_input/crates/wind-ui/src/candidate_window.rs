@@ -580,6 +580,7 @@ impl CandidateWindow {
         // 从而 (1) 输入缓冲变化致尺寸变化时按需重定位、不溢出屏幕；(2) 上方显示以底边贴光标为参考；
         // (3) 已显示后宿主 caret 微抖动(<4px)不跳，位置保护；显著变化(换行/reflow 修正)才跟随；
         // (4) 一旦上翻则粘滞上方。新组合首显已由协调器延迟到 reflow 后的权威坐标，故首帧即落在正确处。
+        let offset = self.position_offset_px();
         let (px0, py0, above) = Self::place_window(
             self.x,
             self.y,
@@ -587,6 +588,7 @@ impl CandidateWindow {
             content_w,
             content_h,
             self.placed_above,
+            offset,
         );
         self.placed_above = above;
         // 位置稳定性：窗口已显示且新位置与上次内容锚点微移(<4px*scale)→保持原位，吞掉 caret 微抖。
@@ -724,6 +726,7 @@ impl CandidateWindow {
         // 定位：据光标 + 内容尺寸算锚点。place_window 约定 caret_y 为光标【底端】（下方锚点=
         // 底端+gap），但 macOS .app 的 caretRectToWire 发的是光标行【顶端】(top-left)，故这里
         // 把行高补上传光标底端 = self.y + self.caret_height，候选窗才落在光标行下方、不遮挡输入。
+        let offset = self.position_offset_px();
         let (px0, py0, above) = Self::place_window(
             self.x,
             self.y + self.caret_height,
@@ -731,6 +734,7 @@ impl CandidateWindow {
             content_w,
             content_h,
             self.placed_above,
+            offset,
         );
         self.placed_above = above;
         let (px, py) = match self.last_content_pos {
@@ -881,6 +885,8 @@ impl CandidateWindow {
         };
         if screen_xy.is_none() {
             // Windows 的 self.y 已是光标底端（与 show() 语义一致），直接传入。
+            // 主题位置偏移只在这条「跟随光标」分支叠加——上面两个分支是用户显式定位。
+            let offset = self.position_offset_px();
             let (px0, py0, above) = Self::place_window(
                 self.x,
                 self.y,
@@ -888,6 +894,7 @@ impl CandidateWindow {
                 content_w,
                 content_h,
                 self.placed_above,
+                offset,
             );
             self.placed_above = above;
             let (px, py) = match self.last_content_pos {
@@ -1157,6 +1164,31 @@ impl CandidateWindow {
     /// 仅「跟随光标」定位方式走这里；固定位置见 [`Self::place_fixed`]。
     // 非 Windows 下窗口钳制为空实现，caret_h/w/h 及 x/y 的可变性仅 Windows 分支需要。
     #[cfg_attr(not(windows), allow(unused_variables, unused_mut))]
+    /// 候选窗相对光标的**锚点**计算（纯函数，不含屏幕钳制）：返回 `(x, below_y, above_y)`。
+    ///
+    /// `caret_y` 为光标**底端**。下方锚点 = 底端 + gap；上方锚点以窗口底边贴光标顶端为参考。
+    /// 主题偏移 `off_y` 语义恒为「远离光标」：下方 **+**、上方 **−**。写成同号会让上翻时
+    /// 偏移把窗口压向光标，与配置意图相反——这是本函数存在的唯一理由（抽出来才测得到，
+    /// `place_window` 余下部分是 `#[cfg(windows)]` 的屏幕钳制，依赖真实显示器）。
+    fn caret_anchors(
+        caret_x: i32,
+        caret_y: i32,
+        caret_h: i32,
+        window_h: i32,
+        off_x: i32,
+        off_y: i32,
+    ) -> (i32, i32, i32) {
+        let gap = 2;
+        let below_y = caret_y + gap + off_y;
+        let above_y = caret_y - caret_h.max(0) - window_h - gap - off_y;
+        (caret_x + off_x, below_y, above_y)
+    }
+
+    /// 跟随光标定位。`offset` 为主题 `window.position_offset`（设备像素，已 ×scale）。
+    ///
+    /// ⚠️ 偏移**必须在此函数内、锚点计算处注入**，不能在调用方给返回值加：
+    /// 下方那段 `rcWork` 越界兜底要在偏移之后跑，否则偏移能把窗口推出屏幕且再也钳不回来。
+    /// 上方锚点用**减号**——`off_y` 正值语义恒为「远离光标」，上翻时是向上推。
     fn place_window(
         caret_x: i32,
         caret_y: i32,
@@ -1164,13 +1196,12 @@ impl CandidateWindow {
         w: u32,
         h: u32,
         sticky_above: bool,
+        offset: (i32, i32),
     ) -> (i32, i32, bool) {
-        let gap = 2;
         let (wi, hi) = (w as i32, h as i32);
-        // caret_y 为光标底端（与 Go 一致）。下方锚点 = 光标底端 + gap；上方锚点以底边贴光标顶端为参考。
-        let below_y = caret_y + gap;
-        let above_y = caret_y - caret_h.max(0) - hi - gap;
-        let (mut x, mut y) = (caret_x, below_y);
+        let (ax, below_y, above_y) =
+            Self::caret_anchors(caret_x, caret_y, caret_h, hi, offset.0, offset.1);
+        let (mut x, mut y) = (ax, below_y);
         let mut above = false;
         #[cfg(windows)]
         {
@@ -1274,6 +1305,19 @@ impl CandidateWindow {
     /// RvImage[] → ViewLayer[]（委托共享 theme_assets）。
     fn rv_layers(&self, layers: &[wind_theme::RvImage]) -> Vec<ViewLayer> {
         crate::theme_assets::rv_layers(&self.theme, layers, self.scale)
+    }
+
+    /// 主题 `window.position_offset` → 设备像素 (x, y)。未配=(0,0)，与旧行为一致。
+    ///
+    /// 供边缘带装饰的主题拉开候选窗与光标的观感距离。**只喂给 place_window**——
+    /// 固定位置与用户拖动是显式意图，再叠加会让窗口莫名偏离用户放的地方，
+    /// 且会破坏拖动落盘的 window↔content 换算互逆性（见 place_fixed 一侧的坐标约定）。
+    fn position_offset_px(&self) -> (i32, i32) {
+        let v = &self.theme.views;
+        let px = |d: Option<wind_theme::schema::Dim>| {
+            d.map(|x| x.resolve(self.scale, 0.0)).unwrap_or(0.0).round() as i32
+        };
+        (px(v.window_offset_x), px(v.window_offset_y))
     }
 
     /// RvGradient → 渲染用 ViewGradient（stop 颜色直通 [R,G,B,A]）。
@@ -2410,6 +2454,41 @@ impl WindowMouse for CandidateMouse {
 mod tests {
     use super::{CandidateWindow, visible_whitespace};
     use std::borrow::Cow;
+
+    /// 主题位置偏移的方向语义：正值恒为「远离光标」。
+    ///
+    /// 上方锚点若照抄下方的加号，上翻时偏移会把窗口**压向**光标，与配置意图相反。
+    /// 这类符号错误从现象很难反推（只有触发上翻的场景才露馅），故直接锁死。
+    #[test]
+    fn position_offset_always_pushes_away_from_caret() {
+        let (caret_x, caret_y, caret_h, win_h) = (100, 200, 20, 80);
+        let base = CandidateWindow::caret_anchors(caret_x, caret_y, caret_h, win_h, 0, 0);
+        let off = CandidateWindow::caret_anchors(caret_x, caret_y, caret_h, win_h, 5, 12);
+
+        // x：正值右移
+        assert_eq!(off.0 - base.0, 5, "x 偏移右移");
+        // 下方锚点：正值下移（远离光标）
+        assert_eq!(off.1 - base.1, 12, "下方锚点应向下推离光标");
+        // 上方锚点：正值上移（同样远离光标）——差值为负
+        assert_eq!(off.2 - base.2, -12, "上方锚点应向上推离光标，而非压向它");
+
+        // 零偏移 == 旧行为
+        assert_eq!(base.1, caret_y + 2, "下方 = 光标底端 + gap");
+        assert_eq!(
+            base.2,
+            caret_y - caret_h - win_h - 2,
+            "上方 = 底边贴光标顶端"
+        );
+    }
+
+    /// 负偏移允许（把窗口拉近光标），语义对称。
+    #[test]
+    fn position_offset_accepts_negative() {
+        let a = CandidateWindow::caret_anchors(0, 100, 20, 50, 0, 0);
+        let b = CandidateWindow::caret_anchors(0, 100, 20, 50, 0, -6);
+        assert_eq!(b.1 - a.1, -6, "下方锚点上移=靠近光标");
+        assert_eq!(b.2 - a.2, 6, "上方锚点下移=靠近光标");
+    }
 
     /// 插入符位置一律夹到合法字符边界——`split_at` 落在字符中间会 panic 掉 UI 线程。
     #[test]

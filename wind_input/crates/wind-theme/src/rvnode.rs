@@ -178,6 +178,12 @@ pub struct RvViews {
     pub shadow_spread_offset_y: Option<Dim>,
     pub shadow_color: Option<Rgba>,
 
+    /// 候选窗相对光标的位置偏移（window.position_offset）。None=0。
+    /// 正值恒为「远离光标」：下方定位向下推、上翻定位向上推。
+    /// 仅跟随光标定位消费；固定位置/拖动不叠加。
+    pub window_offset_x: Option<Dim>,
+    pub window_offset_y: Option<Dim>,
+
     // 工具栏几何（None→toolbar.rs 内置默认；由主题 [toolbar] 描述，去渲染器硬编码）。
     pub toolbar_height: Option<Dim>,
     pub toolbar_grip_width: Option<Dim>,

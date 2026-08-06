@@ -419,6 +419,11 @@ fn resolve_views(v: &Views, palette: &HashMap<String, Rgba>, is_dark: bool) -> R
             rv.shadow_color = Some(c);
         }
     }
+    // 候选窗位置偏移（window 节点 → 顶层，与 shadow_* 同一「属性归位」模式）。
+    if let Some(po) = &v.window.position_offset {
+        rv.window_offset_x = po.x;
+        rv.window_offset_y = po.y;
+    }
     // accent_bar 启用 + 几何。
     rv.accent_bar_enabled = v.accent_bar.enabled.unwrap_or(false);
     rv.accent_bar_width = v.accent_bar.width;
@@ -736,6 +741,30 @@ height = 30
         let r2 = resolve(&t2, false, &[data_dir()]);
         assert_eq!(r2.views.toolbar_bg_color, Some([0x11, 0x11, 0x11, 255]));
         assert_eq!(r2.views.toolbar_border_color, Some([0x22, 0x22, 0x22, 255]));
+    }
+
+    /// 候选窗位置偏移：内联表与 `[x, y]` 简写等价，未配为 None（=0，旧行为）。
+    #[test]
+    fn test_window_position_offset() {
+        let load_offset = |body: &str| {
+            let value: toml::Value = toml::from_str(body).unwrap();
+            let theme: Theme = crate::normalize::normalize_theme(value).try_into().unwrap();
+            let v = resolve(&theme, false, &[data_dir()]).views;
+            (v.window_offset_x, v.window_offset_y)
+        };
+
+        let inline = load_offset("[window]\nposition_offset = { x = 3, y = 4 }\n");
+        assert_eq!(inline.0, Some(crate::schema::Dim::Dp(3.0)));
+        assert_eq!(inline.1, Some(crate::schema::Dim::Dp(4.0)));
+        // 数组简写（与 shadow.offset 一致的书写体验）→ 归一化成同一形态
+        assert_eq!(load_offset("[window]\nposition_offset = [3, 4]\n"), inline);
+        // px 单位不随 DPI 缩放
+        assert_eq!(
+            load_offset("[window]\nposition_offset = { y = \"2px\" }\n").1,
+            Some(crate::schema::Dim::Px(2.0))
+        );
+        // 未配 → None，place_window 拿到 0，定位与旧版逐像素一致
+        assert_eq!(load_offset("[window]\nradius = 8\n"), (None, None));
     }
 
     /// 四个「此前渲染层不读自身盒模型」的节点：背景与边框须完整进 RvNode。

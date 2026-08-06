@@ -257,6 +257,11 @@ pub struct ViewNode {
     // 仅特定节点字段（无关节点为 None，不消费）：
     /// 窗口投影（window / status / tooltip / toast）。
     pub shadow: Option<ViewShadow>,
+    /// 仅 window：候选窗相对光标的位置偏移（dp，随 DPI 缩放）。
+    /// 正值把窗口推离光标——y 在下方定位时向下、上翻定位时向上，语义恒为「远离」。
+    /// 供边缘带装饰（发光边/外描边/九宫格留白）的主题拉开与光标的观感距离。
+    /// **仅作用于跟随光标定位**；固定位置与用户拖动是显式意图，不叠加。
+    pub position_offset: Option<ViewPoint>,
     /// 仅 candidate_list：横排候选项横向间距基数。
     pub gap: Option<Dim>,
     /// 仅 candidate_list：band 间距。

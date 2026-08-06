@@ -92,6 +92,10 @@ fn normalize_node(v: Value) -> Value {
     if let Some(sh) = t.remove("shadow") {
         t.insert("shadow".to_string(), normalize_shadow(sh));
     }
+    // position_offset：`[x, y]` 简写 → `{ x, y }`（与 shadow.offset 的书写体验一致）。
+    if let Some(po) = t.remove("position_offset") {
+        t.insert("position_offset".to_string(), expand_point(po));
+    }
     if let Some(Value::Array(arr)) = t.remove("layers") {
         let layers = arr.into_iter().map(normalize_image).collect();
         t.insert("layers".to_string(), Value::Array(layers));
@@ -160,6 +164,19 @@ fn normalize_shadow(v: Value) -> Value {
             t.insert("offset_y".to_string(), y);
         }
     }
+    Value::Table(t)
+}
+
+/// Point 简写展开：`[x, y]` → `{ x, y }`；表/其它原样。
+fn expand_point(v: Value) -> Value {
+    let Value::Array(a) = v else { return v };
+    if a.len() != 2 {
+        // 非法长度：原样返回（serde 报错或忽略），与 expand_edges 同策。
+        return Value::Array(a);
+    }
+    let mut t = Table::new();
+    t.insert("x".to_string(), a[0].clone());
+    t.insert("y".to_string(), a[1].clone());
     Value::Table(t)
 }
 
