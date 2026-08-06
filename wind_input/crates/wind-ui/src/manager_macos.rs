@@ -17,11 +17,55 @@ use wind_ipc::protocol::*;
 
 const SHM_MAX: usize = MAX_SHARED_RENDER_SIZE;
 
+/// 把 `Rgba` 编成 wire 用的 `#RRGGBBAA`（Swift `NSColor(windHex:)` 认 6/8 位）。
+fn hex(c: wind_theme::Rgba) -> String {
+    format!("#{:02X}{:02X}{:02X}{:02X}", c[0], c[1], c[2], c[3])
+}
+
+/// 取「palette token 兜底 → 视图节点覆盖」的底色/文字色，与 Windows 侧各窗口
+/// `set_theme` 的优先级一致（节点色在 resolve 阶段已合成 token 默认）。
+fn node_colors(
+    theme: &wind_theme::Resolved,
+    bg_token: &str,
+    fg_token: &str,
+    node: Option<&wind_theme::RvNode>,
+    fallback: (wind_theme::Rgba, wind_theme::Rgba),
+) -> (String, String) {
+    let mut bg = theme.color(bg_token, fallback.0);
+    let mut fg = theme.color(fg_token, fallback.1);
+    if let Some(n) = node {
+        if let Some(c) = n.bg_color {
+            bg = c;
+        }
+        if let Some(c) = n.text_color {
+            fg = c;
+        }
+    }
+    (hex(bg), hex(fg))
+}
+
+/// macOS 侧提示类窗口的配色快照。.app 原生渲染 tooltip / 状态气泡 / Toast，
+/// 拿不到 `Resolved`，故在此把主题求值成 hex 串随帧下发；空串 = .app 用内置默认。
+#[derive(Default, Clone)]
+struct TipColors {
+    tooltip_bg: String,
+    tooltip_fg: String,
+    status_bg: String,
+    status_fg: String,
+    toast_bg: String,
+    toast_fg: String,
+}
+
 pub struct Forwarder {
     win: CandidateWindow,
     shm: Option<PosixSharedMemory>,
     sink: Arc<dyn HostRenderSink>,
     suffix: String,
+    /// 提示类窗口配色（`SetTheme` 时求值一次，随 show 帧下发）。
+    tips: TipColors,
+    /// 拆字字根字体绝对路径（`SetTooltipChaiziFont` 下发）。缺它则 .app 侧
+    /// PUA 字根渲染成方框——对齐 Windows 64a2b50 修的同一问题。
+    chaizi_font: String,
     /// 保活 dummy 事件接收端，避免 CandidateWindow 内部 send 报错。
     _ev_rx: Receiver<UiEvent>,
 }
@@ -36,6 +80,8 @@ impl Forwarder {
             shm: None,
             sink,
             suffix,
+            tips: TipColors::default(),
+            chaizi_font: String::new(),
             _ev_rx: ev_rx,
         }
     }
@@ -155,7 +201,12 @@ impl Forwarder {
                         ));
                         self.sink.push_frame(&encode_candidate_rects(&rects));
                         match tip {
-                            Some(t) => self.sink.push_frame(&encode_tooltip_show(&t, "", "", "")),
+                            Some(t) => self.sink.push_frame(&encode_tooltip_show(
+                                &t,
+                                &self.tips.tooltip_bg,
+                                &self.tips.tooltip_fg,
+                                &self.chaizi_font,
+                            )),
                             None => self.sink.push_frame(&encode_tooltip_hide()),
                         }
                         tracing::debug!(
@@ -215,8 +266,8 @@ impl Forwarder {
                 };
                 self.sink.push_frame(&encode_status_show(
                     &text,
-                    "",
-                    "",
+                    &self.tips.status_bg,
+                    &self.tips.status_fg,
                     fx,
                     fy,
                     duration_ms as i32,
@@ -249,15 +300,48 @@ impl Forwarder {
                 self.sink.push_frame(&encode_toast_show(
                     "",
                     &text,
-                    "",
-                    "",
+                    &self.tips.toast_bg,
+                    &self.tips.toast_fg,
                     accent,
                     pos,
                     duration_ms as i32,
                     0,
                 ));
             }
-            UiCommand::SetTheme(t) => self.win.set_theme(*t),
+            UiCommand::SetTheme(t) => {
+                // 提示类窗口在 .app 侧原生渲染，配色须在此求值成 hex 随帧下发；
+                // 兜底值与各自 Windows 实现的编译期默认逐字一致，避免两端观感分叉。
+                let (tooltip_bg, tooltip_fg) = node_colors(
+                    &t,
+                    "tooltip_bg",
+                    "tooltip_text",
+                    t.views.tooltip.as_ref(),
+                    ([60, 60, 64, 240], [240, 240, 245, 255]),
+                );
+                let (status_bg, status_fg) = node_colors(
+                    &t,
+                    "status_bg",
+                    "status_text",
+                    t.views.status.as_ref(),
+                    ([40, 40, 40, 235], [245, 245, 245, 255]),
+                );
+                let (toast_bg, toast_fg) = node_colors(
+                    &t,
+                    "toast_bg",
+                    "toast_text",
+                    t.views.toast.as_ref(),
+                    ([44, 44, 48, 240], [240, 240, 245, 255]),
+                );
+                self.tips = TipColors {
+                    tooltip_bg,
+                    tooltip_fg,
+                    status_bg,
+                    status_fg,
+                    toast_bg,
+                    toast_fg,
+                };
+                self.win.set_theme(*t);
+            }
             UiCommand::SetCandidateLayout(v) => self.win.set_vertical(v),
             UiCommand::SetPreeditEmbedded(v) => self.win.set_preedit_embedded(v),
             UiCommand::SetCandidateFontSize(s) => self.win.set_font_size_override(s),
@@ -269,6 +353,7 @@ impl Forwarder {
             UiCommand::SetPagerDisplay(m) => self.win.set_pager_display(m),
             UiCommand::SetPageNumberDisplay(m) => self.win.set_page_number_display(m),
             UiCommand::SetTooltipChaiziFont { path, family } => {
+                self.chaizi_font = path.clone();
                 self.win.set_chaizi_font(&path, &family)
             }
             UiCommand::Shutdown => {}
