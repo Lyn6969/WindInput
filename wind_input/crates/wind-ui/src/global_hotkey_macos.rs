@@ -10,18 +10,25 @@
 //! 一旦授权掉了就是静默失灵。且那两条路要接管全局按键流，为了几个组合键去过一遍所有按键，
 //! 量级不对。Carbon 热键免授权，只在命中组合时回调。
 //!
-//! # 线程约定（照做，不要"顺手"简化）
+//! # 三个前提，缺一条都表现为「注册成功但从不触发」
 //!
-//! 热键事件由系统投递到**主线程**的 Carbon 事件队列，只有主线程在跑 CFRunLoop 才收得到；
-//! 辅助线程自己跑一个 CFRunLoop 是收不到的。因此：
+//! 这条路上有三个坑，**共同点是返回码全部正常**——`InstallEventHandler` 与
+//! `RegisterEventHotKey` 一律回 `noErr`，日志里写着「N/N 条生效」，按下去却毫无反应。
+//! 别把其中任何一条当成可以"顺手"简化的样板代码。
 //!
-//! - **主线程**调 [`run_main_loop`]：装 handler + 建唤醒源 + 跑 CFRunLoop（服务的 `main`
-//!   在 macOS 上最后停在这里，取代原先的 `restart_rx.recv()` 阻塞）；
-//! - **forwarder 线程**调 [`apply`]：只把新热键表塞进 `PENDING` 并唤醒主线程；真正的
-//!   `RegisterEventHotKey` / `UnregisterEventHotKey` 一律在主线程的 perform 回调里执行。
+//! 1. **进程要是 app**。服务是 LaunchAgent 拉起的裸可执行文件，默认无窗口服务器连接，
+//!    收不到经窗口服务器投递的事件。故 [`run_main_loop`] 开头先
+//!    `TransformProcessType(kProcessTransformToUIElementApplication)`。
+//!    判据：不调时进程不出现在 `lsappinfo list` 里。
+//! 2. **要跑 Carbon 事件循环**。事件先落进 Carbon 主事件队列，需有人 `ReceiveNextEvent`
+//!    取出再派发。`RunApplicationEventLoop`（或 AppKit 的 `[NSApp run]`）做这件事，
+//!    裸 `CFRunLoopRun` **不做**。
+//! 3. **注册要在主线程**。热键事件只投递到主线程的 Carbon 事件队列。故
+//!    **forwarder 线程**调 [`apply`] 时只把热键表塞进 `PENDING` 并唤醒主线程，真正的
+//!    `RegisterEventHotKey` / `UnregisterEventHotKey` 一律在主线程的 perform 回调里执行。
+//!    放在 forwarder 线程同样能编过，症状是热键**时灵时不灵**——比彻底不灵更难查。
 //!
-//! 把注册直接放在 forwarder 线程上跑，表面上"能编过也不报错"，但 Carbon Event Manager
-//! 是主线程亲和的，出问题的形态是热键**时灵时不灵**——比查不出来更糟。
+//! 服务的 `main` 在 macOS 上最后停在 [`run_main_loop`]，取代原先的 `restart_rx.recv()` 阻塞。
 
 use std::collections::HashMap;
 use std::ffi::c_void;
@@ -30,11 +37,10 @@ use std::sync::mpsc::Sender;
 use std::sync::{Mutex, OnceLock};
 
 use core_foundation_sys::base::CFIndex;
-use core_foundation_sys::date::CFTimeInterval;
 use core_foundation_sys::runloop::{
-    CFRunLoopAddSource, CFRunLoopGetMain, CFRunLoopRunInMode, CFRunLoopSourceContext,
-    CFRunLoopSourceCreate, CFRunLoopSourceRef, CFRunLoopSourceSignal, CFRunLoopStop,
-    CFRunLoopWakeUp, kCFRunLoopCommonModes, kCFRunLoopDefaultMode,
+    CFRunLoopAddSource, CFRunLoopGetMain, CFRunLoopSourceContext, CFRunLoopSourceCreate,
+    CFRunLoopSourceRef, CFRunLoopSourceSignal, CFRunLoopStop, CFRunLoopWakeUp,
+    kCFRunLoopCommonModes,
 };
 
 use crate::manager::{GlobalHotkeyEntry, UiEvent};
@@ -102,6 +108,10 @@ unsafe extern "C" {
         data: *mut c_void,
     ) -> OSStatus;
     fn TransformProcessType(psn: *const ProcessSerialNumber, form: u32) -> OSStatus;
+    /// Carbon 应用事件循环：内部驱动 CFRunLoop，并把主事件队列里的事件派发给 handler。
+    fn RunApplicationEventLoop();
+    /// 结束 [`RunApplicationEventLoop`]。**须在主线程调用**。
+    fn QuitApplicationEventLoop();
 }
 
 #[repr(C)]
@@ -205,9 +215,20 @@ pub fn apply(entries: Vec<GlobalHotkeyEntry>, ev_tx: Sender<UiEvent>) {
 }
 
 /// 请求主循环退出（服务重启路径）。可从任意线程调用。
+///
+/// `QuitApplicationEventLoop` 要在**主线程**调，故这里只置标志 + 叫醒主线程，
+/// 真正的退出在 [`wake_perform`] 里做（与热键注册同一套「入队 + 唤醒」的约定）。
 pub fn stop_main_loop() {
     SHOULD_EXIT.store(true, Ordering::SeqCst);
-    unsafe { CFRunLoopStop(CFRunLoopGetMain()) };
+    if let Some(src) = WAKE_SOURCE.get() {
+        unsafe {
+            CFRunLoopSourceSignal(src.0 as CFRunLoopSourceRef);
+            CFRunLoopWakeUp(CFRunLoopGetMain());
+        }
+    } else {
+        // 唤醒源还没建起来（主循环尚未进入）：退回直接停 run loop。
+        unsafe { CFRunLoopStop(CFRunLoopGetMain()) };
+    }
 }
 
 /// 主线程入口：装 Carbon handler、建唤醒源，然后跑 CFRunLoop 直到 [`stop_main_loop`]。
@@ -279,19 +300,31 @@ pub fn run_main_loop() {
         //    先 drain 一次，避免那批热键要等到下一次配置变更才生效。
         drain_pending();
 
-        tracing::info!("全局热键: 主线程 CFRunLoop 启动");
-        while !SHOULD_EXIT.load(Ordering::SeqCst) {
-            // 大超时 + 循环重入：CFRunLoopStop 会让本次调用返回，回到循环顶再判退出标志。
-            // 用 RunInMode 而非 CFRunLoopRun，是为了「先置 SHOULD_EXIT 再 Stop」与
-            // 「Stop 早于 Run 到达」两种时序都能正确退出，不会卡死在 loop 里。
-            CFRunLoopRunInMode(kCFRunLoopDefaultMode, 1.0e10 as CFTimeInterval, 0);
-        }
-        tracing::info!("全局热键: 主线程 CFRunLoop 退出");
+        // 4. 跑 **Carbon 应用事件循环**，而不是裸 CFRunLoop。
+        //
+        // ⚠️ 这是第二个「看返回码完全看不出来」的坑，与上面的 TransformProcessType 叠在一起：
+        // 热键事件先落进 Carbon 的**主事件队列**，要有人调 `ReceiveNextEvent` 把它取出来再
+        // `SendEventToEventTarget` 派发给 handler。`RunApplicationEventLoop`（以及 AppKit 的
+        // `[NSApp run]`）做的正是这件事；裸 `CFRunLoopRun`/`CFRunLoopRunInMode` **不做**——
+        // 于是注册成功、handler 装上、事件也进了队列，但永远没人派发，回调一次都不触发。
+        //
+        // 它内部照常驱动 CFRunLoop，故上面建的唤醒源、以及 system_theme_macos 的分发通知
+        // 观察者都不受影响（已实测：RunApplicationEventLoop 里 CFRunLoopTimer 正常触发）。
+        tracing::info!("全局热键: 主线程 Carbon 事件循环启动");
+        RunApplicationEventLoop();
+        tracing::info!("全局热键: 主线程 Carbon 事件循环退出");
     }
 }
 
-/// 唤醒源回调（主线程）。
+/// 唤醒源回调（主线程）：应用待处理的热键表；收到退出请求则结束事件循环。
+///
+/// `QuitApplicationEventLoop` 必须在主线程调用，而 [`stop_main_loop`] 来自辅助线程，
+/// 故经本回调转手。
 extern "C" fn wake_perform(_info: *const c_void) {
+    if SHOULD_EXIT.load(Ordering::SeqCst) {
+        unsafe { QuitApplicationEventLoop() };
+        return;
+    }
     unsafe { drain_pending() };
 }
 
