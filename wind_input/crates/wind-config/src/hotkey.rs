@@ -5,7 +5,20 @@
 //! 用于按键事件中的热键匹配。
 
 use crate::config::Config;
-use tracing::debug;
+use tracing::{debug, warn};
+
+/// `keys.key_actions` 当前支持的动词。
+///
+/// 白名单而非「解析得动就收」：写错的动词若静默进热键表，按下时分发端匹配不上、
+/// 什么都不发生，而用户看不出是自己拼错了还是功能坏了。这里拦下并 warn，与
+/// `global_hotkeys` 对不支持动作的处理同策略。
+///
+/// 值域随阶段扩充，语义见 docs/design/schema-key-actions.md §2。
+fn is_supported_key_action(action: &str) -> bool {
+    action
+        .strip_prefix("toggle_schema:")
+        .is_some_and(|id| !id.trim().is_empty())
+}
 
 /// 修饰键常量（与 wind-ipc MOD_* / Go ipc.Mod* 对齐）
 const MOD_SHIFT: u32 = 0x0001;
@@ -197,6 +210,35 @@ impl Compiler {
                     match_hash: raw,
                     action: format!("switch_schema:{schema_id}"),
                 });
+            }
+        }
+
+        // ── KeyDown：按键功能表（keys.key_actions）──
+        // **不带 CHINESE_ONLY**，理由与上面方案直达热键同：`toggle_schema` 的回程恰恰要在
+        // 非中文态下按得动（切到英文方案后带上该位就回不来了）。
+        //
+        // ⚠ 后续接入别的动词时**策略位必须按动词分**，不能沿用这里的"一律不带"：进 overlay
+        // 的动词（enter_special / temp_pinyin 那类）只在中文输入中途有意义，需要
+        // CHINESE_ONLY | GLOBAL——同一个位在两类机制下后果相反（见上方 enter_special 那段）。
+        //
+        // BTreeMap 遍历即有序，无需像 schema_hotkeys 那样显式排序：撞键时的胜者顺序
+        // 在任何进程里都一致。
+        for (key, action) in &h.key_actions {
+            let action = action.trim();
+            if key.is_empty() || action.is_empty() {
+                continue;
+            }
+            if !is_supported_key_action(action) {
+                warn!("keys.key_actions: 不支持的动词 {action:?}（键 {key:?}），忽略");
+                continue;
+            }
+            match parse_hotkey(key) {
+                Some(raw) => result.key_down.push(HotkeyEntry {
+                    tsf_hash: raw,
+                    match_hash: raw,
+                    action: action.to_string(),
+                }),
+                None => warn!("keys.key_actions: 键 {key:?} 解析失败，忽略"),
             }
         }
 
@@ -836,6 +878,56 @@ mod tests {
     /// 这个 policy 位是本条测试的重点：带上它，切到英文方案后热键就不再响应，
     /// 用户切得过去、切不回来。特殊模式热键需要它（overlay 只在中文输入中途有意义），
     /// 方案切换恰恰相反——同一个位，两种机制下后果相反。
+    #[test]
+    /// `keys.key_actions` 编出对应动词，且与方案直达热键同策略（不带 CHINESE_ONLY）。
+    ///
+    /// policy 位对 `toggle_schema` 比对 `switch_schema` 更要命：带上它，切到英文方案后
+    /// **回程那一下**就不响应了——功能恰好废掉一半，而"切过去"仍然好用，很容易被当成
+    /// 「回程没实现」而不是「策略位配错」。
+    #[test]
+    fn key_actions_compile_toggle_schema_without_chinese_only_policy() {
+        let mut cfg = Config::default();
+        cfg.keys.key_actions.insert(
+            "ctrl+shift+n".to_string(),
+            "toggle_schema:english".to_string(),
+        );
+        let compiled = Compiler::new(cfg).compile();
+        let e = compiled
+            .key_down
+            .iter()
+            .find(|e| e.action == "toggle_schema:english")
+            .expect("keys.key_actions 应编出 toggle_schema:<id>");
+        assert_eq!(
+            e.tsf_hash & HOTKEY_POLICY_CHINESE_ONLY,
+            0,
+            "往返热键不得带 CHINESE_ONLY，否则从英文方案回不来"
+        );
+    }
+
+    /// 不支持的动词与解析不了的键都被丢弃，不进热键表。
+    ///
+    /// 守的是「静默失效」：写错的动词若混进表里，按下时分发端匹配不上，表现是「按了没反应」，
+    /// 与热键没注册上完全同形，用户无从分辨自己拼错了还是功能坏了。
+    #[test]
+    fn key_actions_drop_unknown_verbs_and_unparsable_keys() {
+        let mut cfg = Config::default();
+        cfg.keys.key_actions.insert(
+            "ctrl+shift+n".to_string(),
+            "no_such_verb:english".to_string(),
+        );
+        cfg.keys
+            .key_actions
+            .insert("ctrl+shift+m".to_string(), "toggle_schema:".to_string());
+        cfg.keys.key_actions.insert(
+            "这不是热键".to_string(),
+            "toggle_schema:english".to_string(),
+        );
+        let n = Config::default();
+        let base = Compiler::new(n).compile().key_down.len();
+        let compiled = Compiler::new(cfg).compile();
+        assert_eq!(compiled.key_down.len(), base, "三条非法项都不该进热键表");
+    }
+
     #[test]
     fn schema_hotkey_compiles_without_chinese_only_policy() {
         let mut cfg = Config::default();

@@ -1097,6 +1097,145 @@ fn test_schema_switch_via_menu() {
     assert_eq!(coord.active_schema_id(), "wubi86", "再切回 wubi86");
 }
 
+/// `toggle_schema:<id>` 往返：按过去、再按回来源。
+///
+/// 与 `switch_schema:<id>` 的唯一差别就是第二次按——那个是 no-op，这个回来源。
+fn config_with_toggle_hotkey(active: &str, target: &str) -> Config {
+    let mut cfg = config_with(active);
+    cfg.keys
+        .key_actions
+        .insert("ctrl+shift+n".into(), format!("toggle_schema:{target}"));
+    cfg
+}
+
+/// 按下 Ctrl+Shift+N（配好的往返热键）。
+fn press_toggle_hotkey(coord: &Coordinator) -> KeyAction {
+    use wind_ipc::protocol::{MOD_CTRL, MOD_SHIFT};
+    coord.handle_key_event(&key_event_mods(0x4E, EVENT_KEY_DOWN, MOD_CTRL | MOD_SHIFT))
+}
+
+#[test]
+fn test_toggle_schema_returns_to_origin() {
+    if !has_schemas() {
+        return;
+    }
+    let coord = Coordinator::new_headless(
+        config_with_toggle_hotkey("wubi86", "pinyin"),
+        Some(&data_dir()),
+    );
+    assert_eq!(coord.active_schema_id(), "wubi86");
+
+    press_toggle_hotkey(&coord);
+    assert_eq!(coord.active_schema_id(), "pinyin", "第一次按应切到目标方案");
+
+    press_toggle_hotkey(&coord);
+    assert_eq!(
+        coord.active_schema_id(),
+        "wubi86",
+        "第二次按应回到来源方案——这正是与 switch_schema 的区别"
+    );
+
+    press_toggle_hotkey(&coord);
+    assert_eq!(
+        coord.active_schema_id(),
+        "pinyin",
+        "第三次按再过去（来源已在上一步用掉并重记）"
+    );
+}
+
+/// 已在目标方案且无来源记录（刚启动就按）：**不动作**。
+///
+/// 守的是「往返键退化成随机跳转键」：此时没有任何依据说明用户想去哪，切走比不动更糟。
+#[test]
+fn test_toggle_schema_without_origin_is_noop() {
+    if !has_schemas() {
+        return;
+    }
+    let coord = Coordinator::new_headless(
+        config_with_toggle_hotkey("pinyin", "pinyin"),
+        Some(&data_dir()),
+    );
+    assert_eq!(coord.active_schema_id(), "pinyin");
+
+    press_toggle_hotkey(&coord);
+    assert_eq!(
+        coord.active_schema_id(),
+        "pinyin",
+        "无来源时按往返键不该切走"
+    );
+}
+
+/// 期间用**别的方式**切了方案，来源作废。
+///
+/// 构造：往返进 pinyin（记下 origin=wubi86）→ 用菜单循环两次绕回 pinyin → 再按往返键。
+/// 来源若没被清，这一按会把用户送回几步之前的 wubi86；清了则是 no-op。
+///
+/// ★ 循环两次而非一次是必须的：只循环一次时 current(wubi86) != target(pinyin)，
+/// 会走"切过去"分支，清没清来源的结果完全相同，用例区分不出来。
+#[test]
+fn test_toggle_schema_origin_invalidated_by_other_switch() {
+    if !has_schemas() {
+        return;
+    }
+    let coord = Coordinator::new_headless(
+        config_with_toggle_hotkey("wubi86", "pinyin"),
+        Some(&data_dir()),
+    );
+    press_toggle_hotkey(&coord);
+    assert_eq!(coord.active_schema_id(), "pinyin");
+
+    coord.handle_menu_command("switch_engine");
+    coord.handle_menu_command("switch_engine");
+    assert_eq!(coord.active_schema_id(), "pinyin", "循环两次绕回 pinyin");
+
+    press_toggle_hotkey(&coord);
+    assert_eq!(
+        coord.active_schema_id(),
+        "pinyin",
+        "循环切换已作废来源，此时按往返键应不动作，而非弹回 wubi86"
+    );
+}
+
+/// 来源失效必须覆盖**绕过 `finish_user_schema_switch` 的切换路径**。
+///
+/// 设置页的 `schema.setActive` RPC 不走那个"统一收尾"——它只同步拆字/注释库便返回。
+/// 切方案在协调器侧共五条路径，只有两条走 finish，所以「在 finish 里清来源」只能清一半。
+/// 本用例走的正是没被 finish 覆盖的那条：来源改由 `schema_generation` 代际校验失效后，
+/// 它才成立。
+#[test]
+fn test_toggle_schema_origin_invalidated_via_path_bypassing_finish() {
+    if !has_schemas() {
+        return;
+    }
+    let coord = Coordinator::new_headless(
+        config_with_toggle_hotkey("wubi86", "pinyin"),
+        Some(&data_dir()),
+    );
+    press_toggle_hotkey(&coord);
+    assert_eq!(coord.active_schema_id(), "pinyin", "往返键进入 pinyin");
+
+    let set_active = |id: &str| {
+        coord
+            .web_data_rpc("schema.setActive", &serde_json::json!({ "id": id }))
+            .expect("schema.setActive 应成功");
+    };
+    set_active("wubi86");
+    assert_eq!(coord.active_schema_id(), "wubi86");
+    set_active("pinyin");
+    assert_eq!(
+        coord.active_schema_id(),
+        "pinyin",
+        "绕开 finish 绕回 pinyin"
+    );
+
+    press_toggle_hotkey(&coord);
+    assert_eq!(
+        coord.active_schema_id(),
+        "pinyin",
+        "经 RPC 的切换同样要作废来源，此时应不动作而非弹回 wubi86"
+    );
+}
+
 #[test]
 fn test_schema_switch_clears_input() {
     if !has_schemas() {

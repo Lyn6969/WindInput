@@ -272,6 +272,7 @@ static REGISTRY: &[ConfigField] = &[
     f("keys.take_screenshot", Str),
     f("keys.global_hotkeys", StrList),
     f("keys.schema_hotkeys", Map),
+    f("keys.key_actions", Map),
     f("keys.select_key_groups", StrList),
     f("keys.page_keys", StrList),
     f("keys.highlight_keys", StrList),

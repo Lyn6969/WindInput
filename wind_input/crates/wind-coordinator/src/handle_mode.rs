@@ -855,12 +855,63 @@ impl Coordinator {
         }
     }
 
+    /// 方案往返热键（`keys.key_actions` 的 `toggle_schema:<id>`）：切到目标方案，
+    /// **再按一次回到来源方案**。
+    ///
+    /// 与 [`Self::switch_schema_by_id`] 的唯一区别就是这个回程。之所以不把回程直接做进
+    /// 那个函数（让所有方案热键都变往返），是因为它同时服务菜单/工具栏/RPC 等入口，
+    /// 那些地方「切过去就是切过去」，凭空多出个回程反而不可预期。
+    ///
+    /// # 回程为什么记来源、而不是配置里写死目标
+    ///
+    /// 写死目标的话，从别的方案按进来时回程会把用户送到一个他没待过的方案（拼音 → 英文
+    /// → 五笔）。记来源则 `拼音→英文→拼音`、`五笔→英文→五笔` 都成立，且**不要求目标
+    /// 方案配对称的绑定**——后者正是「切过去回不来」那类锁死的根源（见
+    /// docs/design/schema-key-actions.md §5）。
+    pub(crate) fn toggle_schema_by_id(&self, schema_id: &str) {
+        let current = self.engine_mgr.active_schema_id();
+        if current == schema_id {
+            // 已在目标方案：回来源。take 而非 clone——回程用掉这一次记录，
+            // 连按第三次不该又弹回去（那时来源已由下面的切换重新写入）。
+            let origin = self
+                .schema_toggle_origin
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .take();
+            match origin {
+                // 代际相等 = 自记录以来无人动过活跃方案，这条来源仍代表用户的往返意图。
+                Some((origin, generation)) if generation == self.engine_mgr.schema_generation() => {
+                    self.switch_schema_by_id(&origin)
+                }
+                // 无来源（刚启动）或来源已失效（期间用别的方式切过方案）：**no-op**。
+                // 不切走是刻意的——此时没有任何依据说明用户想去哪，随便挑一个（如循环到
+                // 下一个方案）会把「往返键」变成「随机跳转键」。
+                _ => debug!("toggle_schema: 已在 {schema_id} 且无有效来源，不动作"),
+            }
+            return;
+        }
+        self.switch_schema_by_id(schema_id);
+        // 切换失败（方案加载不了）时 active 未变，不该记来源——否则下次按会把用户
+        // 送去一个他从未离开过的地方。
+        if self.engine_mgr.active_schema_id() == schema_id {
+            // 代际取**切换之后**的值：这条记录的有效期从现在开始。
+            let generation = self.engine_mgr.schema_generation();
+            *self
+                .schema_toggle_origin
+                .lock()
+                .unwrap_or_else(|e| e.into_inner()) = Some((current, generation));
+        }
+    }
+
     /// 用户主动切换方案后的统一收尾（引擎已切好，此处只处理状态与副作用）。
     ///
     /// 抽出来是因为「切方案」有三个入口，行为却各自漂移过：`switch_schema` 不持久化
     /// `schema.active`、`select_schema` 无条件归位中文而循环键按配置、只有循环键清 preedit
     /// 和取消 CapsLock。新增的直达热键不再添第四份，与循环键共用这里。
     fn finish_user_schema_switch(&self, schema_id: &str, log_verb: &str) {
+        // 注：往返键的来源记录**不在这里清**。本函数只覆盖五条切方案路径中的两条，
+        // 清在这里等于只清一半；改由 `schema_generation` 代际校验统一失效，
+        // 见 `Coordinator::schema_toggle_origin` 的字段说明。
         self.sync_chaizi_assets(); // 拆字库/字根字体随活跃方案切换（变更检测，未变不动）
         self.sync_comment_dicts(); // 方案专属注释库（`schemas` 字段）同理
         // 「切换模式时取消大小写锁定」延伸：切方案的意图是用新方案输中文，

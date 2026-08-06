@@ -123,6 +123,18 @@ pub struct EngineManager {
     engines: Mutex<HashMap<String, Arc<dyn Engine>>>,
     /// 当前活跃方案 ID
     active: Mutex<String>,
+    /// 活跃方案的**变更代际**：每次 `active` 真正改变时 +1。
+    ///
+    /// 供上层判断「自我上次记录以来，活跃方案有没有被动过」——只比对 id 是做不到的，
+    /// 「切走又切回来」与「从未变过」在值上完全同形。当前消费者是协调器的方案往返键
+    /// （`toggle_schema`）：来源记录必须在期间发生任何切换时作废，否则会把用户送回
+    /// 几步之前的方案。
+    ///
+    /// 递增与 [`crate::active_hook::notify_active_changed`] **绑死在
+    /// [`Self::on_active_changed`] 里**，不是各赋值点自己加。理由是漏掉通知会让设置界面
+    /// 的方案显示不刷新（看得见、会被报），漏掉计数则只在往返键那个低频路径上出错
+    /// （看不见）——把易漏的接线搭在不易漏的接线上。
+    schema_generation: std::sync::atomic::AtomicU64,
     /// 可用方案列表（已过滤不支持的方案，用于循环切换）。
     /// Mutex 以支持配置热重载时原地更新（无需重建 EngineManager）。
     available: Mutex<Vec<String>>,
@@ -365,6 +377,7 @@ impl EngineManager {
         let mgr = Self {
             engines: Mutex::new(HashMap::new()),
             active: Mutex::new(active_id.clone()),
+            schema_generation: std::sync::atomic::AtomicU64::new(0),
             available: Mutex::new(available),
             data_dir: data_dir.map(|d| d.to_path_buf()),
             store,
@@ -1384,6 +1397,23 @@ impl EngineManager {
     }
 
     /// 切换到指定方案；成功返回 true（必要时懒加载）
+    /// 活跃方案变更的统一收尾：记一代 + 通知上层。**所有改 `active` 的地方都要调它**。
+    ///
+    /// 必须在**释放 active 锁之后**调用——回调是上层代码（RPC 广播），不应在持锁期间执行。
+    fn on_active_changed(&self, id: &str) {
+        self.schema_generation
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        crate::active_hook::notify_active_changed(id);
+    }
+
+    /// 活跃方案的变更代际，见 [`Self::schema_generation`] 字段说明。
+    ///
+    /// 用法是「记下当时的值，之后比对是否仍相等」，**不要**对差值或绝对值做判断。
+    pub fn schema_generation(&self) -> u64 {
+        self.schema_generation
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
     pub fn switch_schema(&self, schema_id: &str) -> bool {
         if !self.ensure_loaded(schema_id) {
             return false;
@@ -1397,7 +1427,7 @@ impl EngineManager {
             *active = schema_id.to_string();
         }
         // 出锁后再通知：回调是上层代码（RPC 广播），不在持锁期间执行。
-        crate::active_hook::notify_active_changed(schema_id);
+        self.on_active_changed(schema_id);
         true
     }
 
@@ -1490,7 +1520,7 @@ impl EngineManager {
             new_active, changed
         );
         if changed {
-            crate::active_hook::notify_active_changed(&new_active);
+            self.on_active_changed(&new_active);
         }
         changed
     }
@@ -1529,7 +1559,7 @@ impl EngineManager {
                     info!("Cycling schema: {} -> {}", *active, cand);
                     *active = cand.clone();
                 }
-                crate::active_hook::notify_active_changed(&cand);
+                self.on_active_changed(&cand);
                 return Some(cand);
             }
         }

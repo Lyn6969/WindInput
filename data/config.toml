@@ -440,6 +440,15 @@ global_hotkeys = []
 # 与 [[schema.special_modes]] 的 hotkey 是两回事：那个进 overlay、打完一段自动退回；
 # 这个是换方案，不再按一次不会回来。
 schema_hotkeys = {}
+# 按键功能表：key = 热键串，value = 动词。与上面「一个功能一个字段」的写法不同，
+# 这是「这个键干什么」的通用表，将来方案文件的 [key_actions] 用同一套动词值域
+# （见 docs/design/schema-key-actions.md）。
+# 当前支持的动词：
+#   toggle_schema:<方案id>  切到该方案；**再按一次回到来源方案**
+# 例：key_actions = { "ctrl+shift+n" = "toggle_schema:english" }
+# 与 schema_hotkeys 的区别就是那个回程：那个切过去不再按一次不会回来，这个会。
+# 无法识别的动词只进 warn 日志并被忽略。
+key_actions = {}
 # 二三候选键（第1键选第2候选、第2键选第3候选）。可选键组：
 #   semicolon_quote(;/') / comma_period(,/.) / lrshift(左右Shift) / lrctrl(左右Ctrl)
 # 修饰键组（lrshift/lrctrl）在**松开**时才选词，且只认「轻敲」——按住超过 500ms 或中途

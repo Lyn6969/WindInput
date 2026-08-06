@@ -875,6 +875,24 @@ pub struct Coordinator {
     /// 在 `show_status` 做文本比对而非判断"这次变的是哪个字段"，是因为后者要给全部
     /// 十余个调用点传参，而文本比对一处生效、且将来新增状态项零成本。
     pub(crate) last_status_text: Mutex<String>,
+    /// `toggle_schema:<id>` 的**来源**：`(从哪个方案按进来, 写入时的方案变更代际)`。
+    ///
+    /// 刻意只存运行时、不落配置：它描述的是「用户此刻的往返意图」，不是偏好。持久化会让
+    /// 重启后第一次按跳到一个用户早忘了的方案——那正是「回到来源」这个语义最容易失信的
+    /// 时刻。无有效来源时按 `toggle_schema` 到已在的方案是 no-op（不切走）。
+    ///
+    /// # 为什么带代际，而不是在切方案时清空
+    ///
+    /// 切 active 方案在协调器侧有**五条路径**（循环键 / 直达热键 / 命令栏 / 菜单
+    /// `select_schema` / 设置页 RPC），其中只有两条走 `finish_user_schema_switch`——
+    /// 那个"统一收尾"从来就没统一到全部。散点补清空必漏，且漏掉的表现是「往返键把人送回
+    /// 几步之前的方案」，低频且难复现。
+    ///
+    /// 改为记下写入时 `EngineManager::schema_generation()` 的值，读取时比对是否仍相等：
+    /// 期间**任何**路径切过方案，代际就对不上，来源自动失效。零散点接线。
+    ///
+    /// 只比对方案 id 是不够的——「切走又切回来」与「从未变过」在 id 上完全同形。
+    pub(crate) schema_toggle_origin: Mutex<Option<(String, u64)>>,
     /// 当前主题定义的序号槽位字符（views.index.labels）；push_theme 载入时刷新。
     /// 序号优先级：用户配置 index_labels > 本字段 > 默认数字。
     pub(crate) theme_index_labels: Mutex<Vec<String>>,
@@ -1528,6 +1546,7 @@ impl Coordinator {
             themes_dir,
             theme_name: Mutex::new(initial_theme),
             last_status_text: Mutex::new(String::new()),
+            schema_toggle_origin: Mutex::new(None),
             theme_style: Mutex::new(theme_style_init),
             theme_index_labels: Mutex::new(Vec::new()),
             cmdbar_services: std::sync::OnceLock::new(),
@@ -5435,6 +5454,11 @@ impl MessageHandler for Coordinator {
                     }
                     return KeyAction::Consumed;
                 }
+            } else if let Some(id) = action.strip_prefix("toggle_schema:") {
+                // 方案往返热键（keys.key_actions）：切过去，再按一次回来源。
+                // 与 switch_schema 同样**不判 chinese_mode**——回程尤其要在英文态按得动。
+                self.toggle_schema_by_id(id);
+                return KeyAction::StatusUpdate(self.build_status());
             } else if let Some(id) = action.strip_prefix("switch_schema:") {
                 // 方案直达热键：切 active 方案。**不判 chinese_mode**——与循环键
                 // (`switch_engine`) 同策略。切方案在英文态下同样该生效，否则切到英文方案后

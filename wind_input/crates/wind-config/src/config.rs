@@ -12,7 +12,7 @@
 
 use anyhow::Context;
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 use tracing::{debug, info, warn};
 
@@ -1847,6 +1847,16 @@ pub struct KeysConfig {
     /// 那种时刻制造无从修复的启动告警。
     #[serde(default)]
     pub schema_hotkeys: HashMap<String, String>,
+    /// **按键功能表**：热键串 → 动词（如 `{ "ctrl+shift+n" = "toggle_schema:english" }`）。
+    ///
+    /// 与上面那批「一个功能一个字段」的热键不同，这是「键 → 干什么」的通用表——同一套
+    /// 动词值域将来也用于方案级 `[key_actions]`（见 docs/design/schema-key-actions.md）。
+    /// 当前只接 `toggle_schema:<id>`，其余动词随后续阶段接入。
+    ///
+    /// 用 `BTreeMap` 而非 `HashMap`：编译成热键条目时遍历顺序即冲突时的胜者顺序，
+    /// `HashMap` 会让同一份配置在不同进程里表现不同（`schema_hotkeys` 为此要显式排序）。
+    #[serde(default)]
+    pub key_actions: BTreeMap<String, String>,
     // ── 选择/导航键（原 input.*）──
     #[serde(default = "default_select_key_groups")]
     pub select_key_groups: Vec<String>,
@@ -1927,6 +1937,7 @@ impl Default for KeysConfig {
             take_screenshot: default_take_screenshot(),
             global_hotkeys: Vec::new(),
             schema_hotkeys: HashMap::new(),
+            key_actions: BTreeMap::new(),
             select_key_groups: default_select_key_groups(),
             page_keys: default_page_keys(),
             highlight_keys: default_highlight_keys(),
