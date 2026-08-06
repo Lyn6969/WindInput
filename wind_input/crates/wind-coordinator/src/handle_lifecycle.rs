@@ -13,6 +13,17 @@ use wind_ipc::protocol::{MOD_ALT, MOD_CTRL, MOD_SHIFT};
 use wind_keys::keymap;
 use wind_ui::manager::UiCommand;
 
+/// 方案级按键功能表对某个键的裁决，见 [`Coordinator::bound_key_decision`]。
+pub(crate) enum BoundKeyDecision {
+    /// 方案表未对该键表态 —— 照常走全局引导键链（未配置者行为不变）。
+    NotBound,
+    /// 表了态但该键让位（显式 `none` / 活码前缀 / z 的 repeat 身份）——
+    /// 落普通输入，且**不再落全局引导键链**。
+    Yield,
+    /// 执行这个动作。
+    Act(BoundAction),
+}
+
 impl Coordinator {
     /// 重启服务进程：隐藏 UI 后向 main 发重启信号（main 释放单例并重拉自身）。
     pub(crate) fn restart_service(&self) {
@@ -212,22 +223,22 @@ impl Coordinator {
         //
         // 命中即执行并跳过下方全局引导键链；显式 `none` 则两边都不走（return None 落普通
         // 输入）；未声明的键才落全局链——这是「未配置者行为逐字节不变」的保证。
-        if state.input_buffer.is_empty()
-            && data.modifiers & (MOD_CTRL | MOD_ALT | MOD_SHIFT) == 0
-            && let Some(action) = self.bound_action_for(data.key_code)
-        {
-            if !self.bound_action_key_yields(data.key_code, &action) {
-                if let Some(act) = self.enter_bound_action(state, &action, data.key_code) {
-                    state.rewind = None; // 首键进入非夺取式，作废任何旧回退登记
-                    return Some(act);
+        if state.input_buffer.is_empty() && data.modifiers & (MOD_CTRL | MOD_ALT | MOD_SHIFT) == 0 {
+            match self.bound_key_decision(data.key_code) {
+                BoundKeyDecision::Act(action) => {
+                    if let Some(act) = self.enter_bound_action(state, &action, data.key_code) {
+                        state.rewind = None; // 首键进入非夺取式，作废任何旧回退登记
+                        return Some(act);
+                    }
+                    // 门卫没过（目标模式不可用）：不吞键，落普通输入。绝不能返回 Consumed——
+                    // 配了个不可用的目标就等于把这个键废掉，且用户完全看不出原因。
+                    return None;
                 }
-                // 门卫没过（目标模式不可用）：不吞键，落普通输入。绝不能返回 Consumed——
-                // 配了个不可用的目标就等于把这个键废掉，且用户完全看不出原因。
-                return None;
+                // 让位（显式 none / 活码前缀 / z 的 repeat 身份）：该键作正常码，同样不落
+                // 全局引导键链——方案既然给这个键表了态，就不该再被全局 trigger_keys 抢走。
+                BoundKeyDecision::Yield => return None,
+                BoundKeyDecision::NotBound => {}
             }
-            // 让位（活码前缀 / z 的 repeat 身份）：该键作正常码，同样不落全局引导键链——
-            // 方案既然给这个键表了态，就不该再被全局 trigger_keys 抢走。
-            return None;
         }
 
         // 特殊模式 / 临时 mix：空缓冲 + 无候选 + 无修饰键 + 引导键匹配（优先级最低）。
@@ -266,6 +277,25 @@ impl Coordinator {
     /// 与 `[key_actions]` 表的关系见 [`Self::bound_action_for`]：表里显式写了 `z` 就以表为准。
     pub(crate) fn z_key_action(&self) -> BoundAction {
         BoundAction::parse(&self.engine_mgr.codetable_settings().z_key_action)
+    }
+
+    /// 方案级按键功能表对某个键的**最终裁决**，供所有「按引导键进模式」的通路共用。
+    ///
+    /// ★ 必须单点：进同一个模式有**两条**通路——空缓冲的 `try_activate_mode`，以及有缓冲/
+    /// 候选时「顶字 + 进模式」的 `decideBufferedTrigger` 链（`coordinator.rs` 的 `_ =>` 臂）。
+    /// 后者的模式触发判定**不要求缓冲非空**，空码按键同样会走到。只接一条的后果是：方案里
+    /// 写了 `semicolon = "none"`，空码按 `;` 仍然进快捷输入——第一条放行、第二条接管。
+    ///
+    /// 同源教训见 `project_mixed_overflow_vs_topcode`（混输上屏三条通路，否决开关必须三处
+    /// 都接）。盘查的判据是「进这个模式有几个入口」，不是「我改的函数里有几个分支」。
+    pub(crate) fn bound_key_decision(&self, key_code: u32) -> BoundKeyDecision {
+        match self.bound_action_for(key_code) {
+            None => BoundKeyDecision::NotBound,
+            Some(action) if self.bound_action_key_yields(key_code, &action) => {
+                BoundKeyDecision::Yield
+            }
+            Some(action) => BoundKeyDecision::Act(action),
+        }
     }
 
     /// 这个键在当前方案里绑了什么动作；未绑定返回 `None`（落全局引导键链）。

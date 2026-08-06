@@ -1055,6 +1055,7 @@ impl Coordinator {
             ui_tx,
             user_dir,
             store,
+            None, // 生产路径：override 目录由 EngineManager 取用户配置目录下的默认值
         );
 
         // 鼠标事件处理线程：候选窗的点击/悬停/滚轮经此回到协调器
@@ -1218,7 +1219,34 @@ impl Coordinator {
             suffix: String::new(),
             write_timeout_ms: 30_000,
         }));
-        Self::build(config, data_dir, push_server, ui_tx, None, None)
+        Self::build(config, data_dir, push_server, ui_tx, None, None, None)
+    }
+
+    /// 无头 + **指定方案 override 目录**（测试用）。
+    ///
+    /// `new_headless` 让 `EngineManager` 自己取 `Config::user_config_dir()/schema_overrides`
+    /// ——那是**真实用户目录**，测试写进去会污染用户配置，于是一切「方案级覆盖」的行为都
+    /// 没法在集成测试里验证。方案级 `[key_actions]` 的分派 bug 正是因此漏到了真机上。
+    pub fn new_headless_with_override(
+        config: Config,
+        data_dir: Option<&Path>,
+        override_dir: Option<std::path::PathBuf>,
+    ) -> Arc<Self> {
+        let (ui_tx, _rx) = std::sync::mpsc::channel();
+        drop(_rx);
+        let push_server = Arc::new(PushServer::new(PushConfig {
+            suffix: String::new(),
+            write_timeout_ms: 30_000,
+        }));
+        Self::build(
+            config,
+            data_dir,
+            push_server,
+            ui_tx,
+            None,
+            None,
+            override_dir,
+        )
     }
 
     /// 无头 + **保留 UI 通道接收端**（测试用）。
@@ -1237,7 +1265,7 @@ impl Coordinator {
             write_timeout_ms: 30_000,
         }));
         (
-            Self::build(config, data_dir, push_server, ui_tx, None, None),
+            Self::build(config, data_dir, push_server, ui_tx, None, None, None),
             rx,
         )
     }
@@ -1254,7 +1282,15 @@ impl Coordinator {
             suffix: String::new(),
             write_timeout_ms: 30_000,
         }));
-        Self::build(config, data_dir, push_server, ui_tx, None, Some(store))
+        Self::build(
+            config,
+            data_dir,
+            push_server,
+            ui_tx,
+            None,
+            Some(store),
+            None,
+        )
     }
 
     fn build(
@@ -1264,9 +1300,16 @@ impl Coordinator {
         ui_tx: std::sync::mpsc::Sender<UiCommand>,
         user_dir: Option<std::path::PathBuf>,
         store: Option<Arc<Store>>,
+        override_dir: Option<std::path::PathBuf>,
     ) -> Arc<Self> {
         // 注入 redb Store：码表引擎注册用户词/临时词层，用户词进候选合并。
-        let engine_mgr = EngineManager::with_store(&config, data_dir, store.clone());
+        // override_dir 为 None 时由 EngineManager 取默认（用户配置目录下的 schema_overrides）。
+        let engine_mgr = match override_dir {
+            Some(od) => {
+                EngineManager::with_store_override(&config, data_dir, store.clone(), Some(od))
+            }
+            None => EngineManager::with_store(&config, data_dir, store.clone()),
+        };
         // 应用兼容规则：系统层(data/compat.toml) + 用户层覆盖。供焦点进程按名查规则
         // （如微信 caret_use_top）。
         let app_compat = wind_config::app_compat::AppCompat::load(data_dir, user_dir.as_deref());
@@ -6038,31 +6081,36 @@ impl MessageHandler for Coordinator {
                             }
                         }
                     }
-                    // D. 模式触发键 → 顶屏高亮候选 + 进模式。
-                    // 特殊模式引导键（判定顺序对齐空缓冲时 handle_lifecycle：special 先于 mix）——
-                    // 方案不可加载则不拦截，落普通流程（与空缓冲进入同守卫）。传真实 key_code
-                    // → 组合区写引导符，与空缓冲进入一致。
-                    if let Some(idx) = self.match_special_trigger(data.key_code)
-                        && let Some(schema) = self.special_schema(idx)
-                        && self.engine_mgr.ensure_schema(&schema)
-                    {
-                        return self.commit_and_enter_special_mode(&mut state, idx, data.key_code);
-                    }
-                    // 融合「快捷」（现唯一的快捷输入形态，成员含日期/计算/拼音/英文）——对齐空缓冲
-                    // 时 handle_lifecycle 的 enter_mix_mode，使有无候选都进同一融合模式。
-                    if let Some(idx) = self.match_mix_trigger(data.key_code)
-                        && (self.mix_has_quick_input(idx) || !self.mix_members(idx).is_empty())
-                    {
-                        return self.commit_and_enter_mix_mode(&mut state, idx, data.key_code);
-                    }
-                    if self.is_temp_pinyin_trigger(data.key_code)
-                        && let Some(target) = self.engine_mgr.temp_pinyin_target()
-                    {
-                        return self.commit_and_enter_temp_pinyin(
-                            &mut state,
-                            data.key_code,
-                            target,
-                        );
+                    // D0. 方案级按键功能表（`[key_actions]`）先于全局引导键裁决。
+                    //
+                    // ★ 这是进模式的**第二条通路**（顶字 + 进模式），与空缓冲的
+                    // `try_activate_mode` 并列。两条都必须接同一个裁决，否则方案里写的
+                    // `none` 只挡得住一条——空码按 `;` 会被这里接管，表现为「禁用没生效」。
+                    // 本臂的模式触发判定不要求缓冲非空，故空码同样走到这里。
+                    match self.bound_key_decision(data.key_code) {
+                        crate::handle_lifecycle::BoundKeyDecision::Act(action) => {
+                            if let Some(act) = self.commit_and_enter_bound_action(
+                                &mut state,
+                                &action,
+                                data.key_code,
+                            ) {
+                                return act;
+                            }
+                            // 门卫没过：不吞键，落普通流程（与空缓冲进入同策略）。
+                        }
+                        // 让位：跳过下面全部模式触发判定，落普通流程。
+                        crate::handle_lifecycle::BoundKeyDecision::Yield => {}
+                        crate::handle_lifecycle::BoundKeyDecision::NotBound => {
+                            // D. 模式触发键 → 顶屏高亮候选 + 进模式。
+                            // 特殊模式引导键（判定顺序对齐空缓冲时 handle_lifecycle：special 先于
+                            // mix）——方案不可加载则不拦截，落普通流程（与空缓冲进入同守卫）。
+                            // 传真实 key_code → 组合区写引导符，与空缓冲进入一致。
+                            if let Some(act) =
+                                self.try_global_trigger_commit_enter(&mut state, data)
+                            {
+                                return act;
+                            }
+                        }
                     }
                     // E. 次/三选键越界且非模式触发键 → 按 input.overflow.select_key 处理
                     if let Some(ch) = select_overflow {

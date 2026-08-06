@@ -268,12 +268,37 @@ A 类反过来排到最后——它是功能完整性，不是任何人的诉求
   本身绑死在 z 上，不是通用概念。
 - 字母键沿用「仅码表引擎」的限制（拼音/混输里字母全是有效输入，借作功能键会丢首字母）；
   **符号键不限引擎**——拼音方案里用 `\` 进快符同样合理，这是二期新增的能力。
-- ⚠️ **测试缺口**：方案级表的读取与逐键合并有 wind-engine 单测覆盖
-  （`active_key_actions_*`），分派逻辑由既有 z 用例覆盖（两者共用 `enter_bound_action`），
-  但「符号键经方案表进特殊模式」这条端到端路径**没有集成测试**——
-  `Coordinator::new_headless` 不接受 override 目录，其 `EngineManager` 用的是真实用户目录
-  的 `schema_overrides`，测试写那里会污染用户配置。三期做设置页时会有真实配置可测，
-  届时补上。
+### ★★ 二期真机翻车：进模式有两条通路，方案表只接了一条
+
+**现象**：方案里写 `semicolon = "none"`，空码按 `;` 仍然进快捷输入。
+
+**根因**：进同一个模式有**两条**通路——
+1. `try_activate_mode`（空缓冲激活链，`handle_lifecycle.rs`）
+2. `decideBufferedTrigger` 的「顶字 + 进模式」链（`coordinator.rs` 的 `_ =>` 臂）
+
+第二条的注释写着「缓冲非空/有候选时」，但那个守卫只管到 `select_overflow`，**模式触发判定
+本身不要求缓冲非空**，空码按键照样走到。于是第一条按 `none` 放行（`return None`），
+第二条毫不知情地接管。
+
+**修法**：判据抽成单点 `bound_key_decision() -> BoundKeyDecision{NotBound|Yield|Act}`，
+两条通路都接；第二条另需一份「顶字版」进入函数 `commit_and_enter_bound_action`
+（与 `commit_and_enter_mix_mode` 之于 `enter_mix_mode` 同构）。
+
+★ **盘查的判据是「进这个模式有几个入口」，不是「我改的那个函数里有几个分支」**。
+同源教训已记录在 `project_mixed_overflow_vs_topcode`（混输上屏三条通路，否决开关必须三处
+都接，已栽四次）——本次是第五次，因为只盘查了自己改的函数内部。
+
+同批修的第二处漏接：`try_z_fallback` 读的是 `z_key_action()` 而非 `bound_action_for()`，
+方案把 z 改绑到快符表后，首键进快符、而夺取路径仍按「临拼」判定，同一个键在两条路径上
+成了两个身份。
+
+### 测试缺口已补
+
+`Coordinator::new_headless_with_override` 允许集成测试指定**临时** override 目录。
+此前只有 `new_headless`，它让 `EngineManager` 取真实用户目录的 `schema_overrides`，
+测试写进去会污染用户配置——于是方案级覆盖的行为整个没法在集成测试里验证，上面那个
+两条通路的 bug 正是因此漏到真机。`tests/schema_key_actions.rs` 覆盖 `none` 的否决
+（含对照组）与「方案表压过全局 `z_key_action`」。
 
 ## 8. 测试要求
 

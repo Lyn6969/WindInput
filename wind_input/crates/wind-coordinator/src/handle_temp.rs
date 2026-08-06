@@ -97,7 +97,12 @@ impl Coordinator {
         if !state.input_buffer.starts_with('z') {
             return None;
         }
-        if self.z_key_action() != wind_config::BoundAction::TempPinyin {
+        // 走 `bound_action_for` 而非 `z_key_action()`：方案级 `[key_actions]` 里写的 z 必须
+        // 压过全局 `schema.codetable.z_key_action`。用后者的话，方案把 z 改绑到快符表后，
+        // 首键进的是快符、而这里仍按「临拼」夺取——同一个键在两条路径上是两个身份。
+        if self.bound_action_for(wind_keys::keymap::VK_Z)
+            != Some(wind_config::BoundAction::TempPinyin)
+        {
             return None;
         }
         let combined = format!("{}{}", state.input_buffer, ch);

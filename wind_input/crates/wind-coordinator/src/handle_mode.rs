@@ -9,6 +9,7 @@ use crate::preedit_cursor;
 use crate::theme_style::ThemeStyle;
 use tracing::{debug, info, warn};
 use wind_bridge::handler::KeyAction;
+use wind_config::BoundAction;
 use wind_config::Config;
 use wind_ui::manager::UiCommand;
 
@@ -316,6 +317,103 @@ impl Coordinator {
         KeyAction::UpdateComposition {
             text: display.clone(),
             caret_pos: display.chars().count() as u32,
+        }
+    }
+
+    /// 全局引导键的「顶字 + 进模式」判定（special > mix > 临拼，对齐空缓冲时的
+    /// `try_activate_mode` 顺序）。命中返回已处理的 KeyAction；都不命中返回 None。
+    ///
+    /// 从 `handle_key_event` 的 `decideBufferedTrigger` 臂原样抽出，供方案级
+    /// `[key_actions]` 未表态（`NotBound`）时调用——表了态的键不该再走全局链。
+    pub(crate) fn try_global_trigger_commit_enter(
+        &self,
+        state: &mut State,
+        data: &KeyEventData,
+    ) -> Option<KeyAction> {
+        if let Some(idx) = self.match_special_trigger(data.key_code)
+            && let Some(schema) = self.special_schema(idx)
+            && self.engine_mgr.ensure_schema(&schema)
+        {
+            return Some(self.commit_and_enter_special_mode(state, idx, data.key_code));
+        }
+        // 融合「快捷」（现唯一的快捷输入形态，成员含日期/计算/拼音/英文）——对齐空缓冲
+        // 时 handle_lifecycle 的 enter_mix_mode，使有无候选都进同一融合模式。
+        if let Some(idx) = self.match_mix_trigger(data.key_code)
+            && (self.mix_has_quick_input(idx) || !self.mix_members(idx).is_empty())
+        {
+            return Some(self.commit_and_enter_mix_mode(state, idx, data.key_code));
+        }
+        if self.is_temp_pinyin_trigger(data.key_code)
+            && let Some(target) = self.engine_mgr.temp_pinyin_target()
+        {
+            return Some(self.commit_and_enter_temp_pinyin(state, data.key_code, target));
+        }
+        None
+    }
+
+    /// 方案级按键功能的「顶字 + 进模式」版本，与 [`Self::enter_bound_action`] 对应。
+    ///
+    /// 两者的关系 == `commit_and_enter_mix_mode` 之于 `enter_mix_mode`：一个先把已转换
+    /// 前缀和高亮候选上屏再进，一个直接进。门卫完全一致，没过一律返回 None 不吞键。
+    pub(crate) fn commit_and_enter_bound_action(
+        &self,
+        state: &mut State,
+        action: &BoundAction,
+        key_code: u32,
+    ) -> Option<KeyAction> {
+        match action {
+            BoundAction::None => None,
+            BoundAction::TempPinyin => {
+                let target = self.engine_mgr.temp_pinyin_target()?;
+                Some(self.commit_and_enter_temp_pinyin(state, key_code, target))
+            }
+            BoundAction::TempEnglish => {
+                if !self.rt().config.input.temp_english.enabled {
+                    return None;
+                }
+                // 临英没有专用的「顶字进入」出口，就地拼：先顶已转换前缀 + 高亮候选，
+                // 再走空缓冲进入语义。合并方式与 commit_and_enter_mix_mode 一致。
+                let prefix = self.take_committed(state);
+                let committed = if !state.candidates.is_empty() {
+                    let i = self
+                        .highlighted_global_index(state)
+                        .min(state.candidates.len() - 1);
+                    let t = state.candidates[i].text.clone();
+                    let freq_code = self.freq_code(&state.input_buffer, &state.candidates[i]);
+                    self.record_selection(&freq_code, &t, state.candidates[i].source);
+                    Some(format!("{prefix}{t}"))
+                } else if !prefix.is_empty() {
+                    Some(prefix)
+                } else {
+                    None
+                };
+                let enter = self.enter_bound_action(state, action, key_code)?;
+                Some(match committed {
+                    Some(text) => {
+                        let new_comp = match &enter {
+                            KeyAction::UpdateComposition { text, .. } => text.clone(),
+                            _ => state.preedit.clone(),
+                        };
+                        self.commit_then_new_composition(text, new_comp)
+                    }
+                    None => enter,
+                })
+            }
+            BoundAction::Mix(id) => {
+                let idx = self.mix_mode_idx(id)?;
+                if !self.mix_has_quick_input(idx) && self.mix_members(idx).is_empty() {
+                    return None;
+                }
+                Some(self.commit_and_enter_mix_mode(state, idx, key_code))
+            }
+            BoundAction::Special(id) => {
+                let idx = self.special_mode_idx(id)?;
+                let schema = self.special_schema(idx)?;
+                if !self.engine_mgr.ensure_schema(&schema) {
+                    return None;
+                }
+                Some(self.commit_and_enter_special_mode(state, idx, key_code))
+            }
         }
     }
 
