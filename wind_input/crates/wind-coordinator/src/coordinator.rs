@@ -2607,8 +2607,12 @@ impl Coordinator {
         if !self.rt().config.input.scope_relax.page_end_key {
             return false;
         }
-        // 已放宽过就不再重复；`Gb18030` 本就不过滤，无可放宽
-        if state.scope_relaxed || state.filter_mode == wind_candidate::FilterMode::Gb18030 {
+        // 已放宽过就不再重复。放宽是**智能档专属**的补偿：只有智能档会按「同码位有常用字」
+        // 滤掉生僻字，也只有它需要一条把被滤掉的放回来的出路（见上方引用的设计文档，全篇
+        // 以 `filter_mode = "smart"` 为前提）。常用字档若也能放宽，它与智能档的差异就被
+        // 抹平了——用户选「常用字」要的正是一个稳定只出常用字的列表；`Gb18030` 本就不过滤，
+        // 更无可放宽。
+        if state.scope_relaxed || state.filter_mode != wind_candidate::FilterMode::Smart {
             return false;
         }
         // ⚠️ 临拼的码在 `temp_pinyin_buffer`，主路径的在 `input_buffer`——须按当前模式取。

@@ -224,6 +224,47 @@ fn short_list_relaxes_via_page_key_too() {
     );
 }
 
+/// ★★ **常用字档不参与放宽**——放宽是智能档专属的补偿。
+///
+/// 智能档按「同码位有常用字」滤掉生僻字，才需要一条把它们放回来的出路；常用字档要的
+/// 正是一个稳定只出常用字的列表，若它也能翻到底放宽，两档的差异就被抹平了，用户也就
+/// 没有理由再选常用字档。
+///
+/// 门禁曾写作「排除 Gb18030」，等价于常用字档照样放宽——与设计文档（全篇以
+/// `filter_mode = "smart"` 为前提）不符。这条钉住修正后的语义。
+#[test]
+fn general_scope_does_not_relax_on_page_end() {
+    if !dict_ready(&data_dir()) {
+        eprintln!("跳过：五笔词库不存在");
+        return;
+    }
+    let coord = coord_with("general");
+    press(&coord, "sivg");
+    let before = coord.debug_all_candidate_texts();
+    assert!(
+        !before.is_empty(),
+        "前提：常用字档下 sivg 应有候选，否则本用例验不出东西"
+    );
+    assert!(
+        !before.contains(&"桜".to_string()),
+        "前提：常用字档下不该出生僻字「桜」。实际: {before:?}"
+    );
+
+    // 候选不足一页时按一次向后翻页键，就是「翻到底再按一次」那条路径
+    // （同 short_list_relaxes_via_page_key_too 的前提）。
+    coord.handle_key_event_policed(&key_event(VK_NEXT));
+
+    let after = coord.debug_all_candidate_texts();
+    assert!(
+        !after.contains(&"桜".to_string()),
+        "常用字档不得放宽出生僻字。实际: {after:?}"
+    );
+    assert_eq!(
+        before, after,
+        "常用字档的候选列表不该因向后翻页键发生任何变化"
+    );
+}
+
 /// 放宽把被滤候选**追加到末尾**，原有顺序纹丝不动。
 ///
 /// **追加而非按真实顺序插入**是刻意的——翻页是线性前进的动作，翻到末尾再翻却让新字插到
