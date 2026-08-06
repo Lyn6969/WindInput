@@ -50,6 +50,15 @@ public enum DownstreamCmd {
     public static let moveCursor: UInt16       = 0x0107
     public static let deletePair: UInt16       = 0x0108
     public static let replaceBackward: UInt16  = 0x0109   // 删除光标前 N 字符 + 插入文本 (智能符号)
+    // ── 延迟组合三兄弟 (timeout_ms 前缀) ──
+    // 名字带 "hold/defer" 是 TSF 的说法: Win 侧 C++ 必须把组合「吃了再吐」, 故要计时器兜底。
+    // IMKit 无此约束 (insertText 后可立即 setMarkedText), 故 .app 侧只用文本、忽略 timeout。
+    // ⚠️ 这三条**不是** Windows 专有: commitThenDefer 由码表顶码 direct_commit 产生
+    // (handle_candidate.rs), 是跨平台通路 —— 早期 macOS 侧漏接, 顶码上屏的字被 router
+    // 的 default 分支静默吞掉 (返回 true 消费按键却不出字)。
+    public static let holdComposition: UInt16  = 0x010A   // timeout_ms u32 + textLen u32 + text
+    public static let commitAndHold: UInt16    = 0x010B   // timeout_ms u32 + commitLen u32 + holdLen u32 + 两段文本
+    public static let commitThenDefer: UInt16  = 0x010C   // timeout_ms u32 + commitLen u32 + deferLen u32 + 两段文本
     public static let consumed: UInt16         = 0x0401
     public static let statusUpdate: UInt16     = 0x0202
     public static let statePush: UInt16        = 0x0206

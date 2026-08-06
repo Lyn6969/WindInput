@@ -184,6 +184,55 @@ public enum BinaryCodec {
         return CommitTextPayload(flags: flags, text: text, newComposition: comp)
     }
 
+    /// 已被 `CommitTextReplacingHeld` 消费的 held 组合标记 (Rust encode_commit_text_inner
+    /// 的 replacing_held 位)。置位表示这次上屏是在替换先前 hold 住的组合文本,
+    /// .app 须先清掉 marked text 再插入, 否则 held 预览与新文本会同时留在宿主里。
+    public static let commitFlagReplacingHeld: UInt32 = 0x0008
+
+    /// 延迟组合三兄弟的公共解码结果。`hold`/`defer` 段语义随 cmd 而异:
+    /// - holdComposition: commit 为空, hold = 要显示的组合文本
+    /// - commitAndHold:   commit 先上屏, hold = 随后开启的组合文本
+    /// - commitThenDefer: commit 先上屏, hold = 延迟开启的余码组合
+    public struct DeferredCompositionPayload: Equatable {
+        public let timeoutMs: UInt32
+        public let commitText: String
+        public let holdText: String
+    }
+
+    /// 解 CmdHoldComposition (0x010A). 布局: timeoutMs:u32 + textLen:u32 + text
+    public static func decodeHoldCompositionPayload(_ buf: Data) throws -> DeferredCompositionPayload {
+        guard buf.count >= 8 else {
+            throw IPCError.payloadTooShort(expected: 8, got: buf.count)
+        }
+        let timeout = buf.readUInt32LE(at: 0)
+        let textLen = Int(buf.readUInt32LE(at: 4))
+        guard buf.count >= 8 + textLen else {
+            throw IPCError.payloadTooShort(expected: 8 + textLen, got: buf.count)
+        }
+        let start = buf.startIndex + 8
+        let text = String(data: buf.subdata(in: start..<(start + textLen)), encoding: .utf8) ?? ""
+        return DeferredCompositionPayload(timeoutMs: timeout, commitText: "", holdText: text)
+    }
+
+    /// 解 CmdCommitAndHold (0x010B) / CmdCommitThenDefer (0x010C) —— 两者线格式相同.
+    /// 布局: timeoutMs:u32 + commitLen:u32 + holdLen:u32 + commit + hold
+    public static func decodeCommitAndHoldPayload(_ buf: Data) throws -> DeferredCompositionPayload {
+        guard buf.count >= 12 else {
+            throw IPCError.payloadTooShort(expected: 12, got: buf.count)
+        }
+        let timeout   = buf.readUInt32LE(at: 0)
+        let commitLen = Int(buf.readUInt32LE(at: 4))
+        let holdLen   = Int(buf.readUInt32LE(at: 8))
+        guard buf.count >= 12 + commitLen + holdLen else {
+            throw IPCError.payloadTooShort(expected: 12 + commitLen + holdLen, got: buf.count)
+        }
+        let commitStart = buf.startIndex + 12
+        let holdStart   = commitStart + commitLen
+        let commit = String(data: buf.subdata(in: commitStart..<holdStart), encoding: .utf8) ?? ""
+        let hold   = String(data: buf.subdata(in: holdStart..<(holdStart + holdLen)), encoding: .utf8) ?? ""
+        return DeferredCompositionPayload(timeoutMs: timeout, commitText: commit, holdText: hold)
+    }
+
     public struct UpdateCompositionPayload: Equatable {
         public let caretPos: UInt32   // preedit 内光标位置 (UTF-16 unit 还是 rune, 看 Go 端约定; M2.2 阶段照 Go 端原样上送)
         public let text: String       // preedit 文本

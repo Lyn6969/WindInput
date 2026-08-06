@@ -106,6 +106,33 @@ public final class BridgeResponseRouter {
             }
             return true
 
+        case DownstreamCmd.holdComposition:
+            // 智能符号 HoldComposition 方案 press1: 把待定标点作为组合预览显示。
+            // 不实现 timeout 自动提交 —— Win 侧那个计时器是给 TSF 的「吃了再吐」兜底,
+            // IMKit 里组合会一直挂到 press2 (CommitTextReplacingHeld) 或失焦清理。
+            if let p = try? BinaryCodec.decodeHoldCompositionPayload(frame.payload) {
+                applyUpdateComposition(
+                    BinaryCodec.UpdateCompositionPayload(caretPos: UInt32(p.holdText.count),
+                                                         text: p.holdText),
+                    client: client)
+            }
+            return true
+
+        case DownstreamCmd.commitAndHold, DownstreamCmd.commitThenDefer:
+            // 先真上屏 commitText, 再把余码/待定文本开成新组合。
+            // commitThenDefer 是码表顶码 direct_commit 的正常通路 (非 Windows 专有),
+            // 早先落在 default 分支 → 顶码上屏的字被吞。Win 侧的「延迟到触发键 keyup
+            // 才开组合」是 TSF 组合边界的规避手段, IMKit 无此约束, 立即开即可。
+            if let p = try? BinaryCodec.decodeCommitAndHoldPayload(frame.payload) {
+                applyCommitText(
+                    BinaryCodec.CommitTextPayload(
+                        flags: p.holdText.isEmpty ? 0 : BinaryCodec.commitFlagHasNewComposition,
+                        text: p.commitText,
+                        newComposition: p.holdText),
+                    client: client)
+            }
+            return true
+
         default:
             return true   // 未知 cmd: 默认消费, 避免重复出字符
         }
@@ -115,6 +142,15 @@ public final class BridgeResponseRouter {
 
     public func applyCommitText(_ p: BinaryCodec.CommitTextPayload, client: TextInputClient?) {
         let notFound = NSRange(location: NSNotFound, length: NSNotFound)
+        // replacingHeld: 这次上屏是在替换先前 HoldComposition 挂着的组合预览 (智能符号
+        // press2)。宿主对「marked 未清就 insertText」的处理不统一, 先显式清一次再插,
+        // 免得待定标点与替换结果同时留在文本里。仅在本端确实还挂着 marked 时才清。
+        if p.flags & BinaryCodec.commitFlagReplacingHeld != 0, !composition.text.isEmpty {
+            client?.setMarkedText("",
+                                  selectionRange: NSRange(location: 0, length: 0),
+                                  replacementRange: notFound)
+            composition.clear()
+        }
         client?.insertText(p.text, replacementRange: notFound)
 
         if !p.newComposition.isEmpty {

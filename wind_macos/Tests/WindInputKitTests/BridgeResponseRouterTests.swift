@@ -213,4 +213,94 @@ final class BridgeResponseRouterTests: XCTestCase {
         XCTAssertEqual(mock.insertCalls[0].text, "你")
         XCTAssertTrue(r.composition.isEmpty)
     }
+
+    // MARK: - 延迟组合三兄弟 (0x010A/0x010B/0x010C)
+
+    /// timeoutMs + commitLen + holdLen + commit + hold
+    private func deferredPayload(timeout: UInt32, commit: String, hold: String) -> Data {
+        var d = Data(count: 12)
+        d.writeUInt32LE(timeout, at: 0)
+        d.writeUInt32LE(UInt32(commit.utf8.count), at: 4)
+        d.writeUInt32LE(UInt32(hold.utf8.count), at: 8)
+        d.append(contentsOf: commit.utf8)
+        d.append(contentsOf: hold.utf8)
+        return d
+    }
+
+    /// 顶码 direct_commit 走 commitThenDefer: 必须真上屏, 且余码开成新组合。
+    /// 回归钉子 —— 此前落在 router 的 default 分支, 按键被消费但一个字都不出。
+    func testApply_CommitThenDefer_CommitsAndOpensDeferredComposition() {
+        let r = BridgeResponseRouter()
+        let mock = MockClient()
+        let payload = deferredPayload(timeout: 300, commit: "好", hold: "vv")
+
+        let consumed = r.apply(Frame(cmd: DownstreamCmd.commitThenDefer,
+                                     isAsync: false, payload: payload), to: mock)
+
+        XCTAssertTrue(consumed)
+        XCTAssertEqual(mock.insertCalls.count, 1)
+        XCTAssertEqual(mock.insertCalls[0].text, "好")
+        XCTAssertEqual(mock.setMarkedCalls.map { $0.text }, ["vv"])
+        XCTAssertEqual(r.composition.text, "vv")
+    }
+
+    /// 余码为空时只上屏, 不留空组合。
+    func testApply_CommitThenDefer_EmptyDeferred_ClearsComposition() {
+        let r = BridgeResponseRouter()
+        let mock = MockClient()
+        let payload = deferredPayload(timeout: 0, commit: "好", hold: "")
+
+        _ = r.apply(Frame(cmd: DownstreamCmd.commitThenDefer, isAsync: false, payload: payload),
+                    to: mock)
+
+        XCTAssertEqual(mock.insertCalls.map { $0.text }, ["好"])
+        XCTAssertTrue(mock.setMarkedCalls.isEmpty)
+        XCTAssertTrue(r.composition.isEmpty)
+    }
+
+    /// 智能符号 HoldComposition press1: 待定标点作为组合预览, 不上屏。
+    func testApply_HoldComposition_ShowsMarkedTextOnly() {
+        let r = BridgeResponseRouter()
+        let mock = MockClient()
+        var d = Data(count: 8)
+        d.writeUInt32LE(500, at: 0)
+        d.writeUInt32LE(UInt32("，".utf8.count), at: 4)
+        d.append(contentsOf: "，".utf8)
+
+        let consumed = r.apply(Frame(cmd: DownstreamCmd.holdComposition,
+                                     isAsync: false, payload: d), to: mock)
+
+        XCTAssertTrue(consumed)
+        XCTAssertTrue(mock.insertCalls.isEmpty)
+        XCTAssertEqual(mock.setMarkedCalls.map { $0.text }, ["，"])
+        XCTAssertEqual(r.composition.text, "，")
+    }
+
+    /// press2 的 CommitTextReplacingHeld 带 replacingHeld 位: 先清 held 预览再插入,
+    /// 否则待定标点与替换结果会同时留在宿主里。
+    func testApply_CommitTextReplacingHeld_ClearsMarkedBeforeInsert() {
+        let r = BridgeResponseRouter()
+        let mock = MockClient()
+
+        // press1: hold "，"
+        var hold = Data(count: 8)
+        hold.writeUInt32LE(500, at: 0)
+        hold.writeUInt32LE(UInt32("，".utf8.count), at: 4)
+        hold.append(contentsOf: "，".utf8)
+        _ = r.apply(Frame(cmd: DownstreamCmd.holdComposition, isAsync: false, payload: hold),
+                    to: mock)
+
+        // press2: 替换为 ","
+        let text = ","
+        var c = Data(count: 12)
+        c.writeUInt32LE(BinaryCodec.commitFlagReplacingHeld, at: 0)
+        c.writeUInt32LE(UInt32(text.utf8.count), at: 4)
+        c.writeUInt32LE(0, at: 8)
+        c.append(contentsOf: text.utf8)
+        _ = r.apply(Frame(cmd: DownstreamCmd.commitText, isAsync: false, payload: c), to: mock)
+
+        XCTAssertEqual(mock.setMarkedCalls.map { $0.text }, ["，", ""])
+        XCTAssertEqual(mock.insertCalls.map { $0.text }, [","])
+        XCTAssertTrue(r.composition.isEmpty)
+    }
 }
