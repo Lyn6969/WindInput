@@ -99,6 +99,71 @@ fn without_none_semicolon_still_enters_mix() {
     let _ = std::fs::remove_dir_all(&ov);
 }
 
+/// `z_key_repeat` 只压得住**有夺取回路**的目标。
+///
+/// `temp_pinyin` 有 `try_z_fallback`：首键让位给 repeat 后，继续打字母仍会被夺取进临拼，
+/// 两个功能共存。而 special / mix / 临英只支持首键进入——让位一次就是这个方案里再也进不去，
+/// 尤其快符那种 `show_all_on_enter` 的模式，全部价值就在首键那一下。
+///
+/// 本用例先真上屏一次（喂出 repeat 历史），再按 z：绑 special 时必须照进不误。
+#[test]
+fn z_repeat_does_not_steal_targets_without_rescue_path() {
+    if !has_schemas() {
+        return;
+    }
+    // 目标取内置 quick_mix：它与快符同属「只支持首键进入、没有夺取回路」那一类，验证的是
+    // 同一条判据。不用 special 是因为快符类方案不在 build_dev/data 里，`ensure_schema`
+    // 门卫过不了，测出来的会是「方案缺失」而不是「被 repeat 抢走」——两者在结果上同形。
+    let ov = make_override("zrepeat", "wubi86", "z = \"mix:quick_mix\"");
+    let mut cfg = cfg_for("wubi86");
+    cfg.schema.codetable.z_key_repeat = true;
+    let coord = Coordinator::new_headless_with_override(cfg, Some(&data_dir()), Some(ov.clone()));
+
+    // 先上屏一次，喂出 repeat 历史（无历史时 repeat 本就不生效，测不出让位）。
+    for c in ['a', 'a'] {
+        coord.handle_key_event(&key(c.to_ascii_uppercase() as u32));
+    }
+    coord.handle_key_event(&key(0x20)); // 空格上屏
+
+    coord.handle_key_event(&key(VK_Z));
+    // ⚠️ 判据必须是「进没进模式」，不能看 KeyAction 的形状——让位后 z 落普通输入、
+    // buffer 变 "z"，返回的同样是 UpdateComposition，两种结局在那一层完全同形。
+    assert_eq!(
+        coord.debug_active_mode(),
+        Some("mix"),
+        "z 绑无夺取回路的目标时不该被 repeat 抢走：让位即这个方案里永久进不去"
+    );
+    let _ = std::fs::remove_dir_all(&ov);
+}
+
+/// 反向对照：绑 `temp_pinyin` 时 repeat **仍然**优先（它有 z-fallback 补救）。
+///
+/// 没有这条，上面那个用例在「repeat 整个失效」时也会绿。
+#[test]
+fn z_repeat_still_wins_for_temp_pinyin() {
+    if !has_schemas() {
+        return;
+    }
+    let ov = make_override("zrepeat_tp", "wubi86", "z = \"temp_pinyin\"");
+    let mut cfg = cfg_for("wubi86");
+    cfg.schema.codetable.z_key_repeat = true;
+    cfg.input.temp_pinyin.enabled = true;
+    let coord = Coordinator::new_headless_with_override(cfg, Some(&data_dir()), Some(ov.clone()));
+
+    for c in ['a', 'a'] {
+        coord.handle_key_event(&key(c.to_ascii_uppercase() as u32));
+    }
+    coord.handle_key_event(&key(0x20));
+
+    coord.handle_key_event(&key(VK_Z));
+    assert_eq!(
+        coord.debug_active_mode(),
+        None,
+        "绑 temp_pinyin 时 repeat 仍优先，z 应落普通输入而非进模式（后续字母由 z-fallback 补救）"
+    );
+    let _ = std::fs::remove_dir_all(&ov);
+}
+
 /// 方案表里的 `z` 必须**压过**全局 `schema.codetable.z_key_action`。
 ///
 /// 现场：全局配 `z_key_action = "temp_pinyin"`，方案表配 `z = "temp_english"`。

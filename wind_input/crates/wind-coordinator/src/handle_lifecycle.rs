@@ -351,8 +351,20 @@ impl Coordinator {
         ) {
             return true;
         }
-        // repeat 判据在前且更便宜，能省掉 has_code_prefix 的码表查询。
-        if key_code == keymap::VK_Z && self.z_key_repeat_text().is_some() {
+        // z 的 repeat 身份**只压得住有夺取回路的目标**。
+        //
+        // `temp_pinyin` 有 `try_z_fallback`：首键让位给 repeat 之后，用户继续打字母、`z…`
+        // 破了活码前缀时仍会被夺取进临拼——两个功能真正共存，让位只维持一个按键。
+        //
+        // 其余目标（special / mix / 临英）**只支持首键进入**，没有夺取回路。让位一次就是
+        // 这个方案里再也进不去，尤其快符那种 `show_all_on_enter` 的模式——它的全部价值
+        // 就在首键那一下「进入即列出符号表」，被 repeat 抢掉等于功能不存在。
+        //
+        // 判据落在「目标模式有没有补救通路」，不是「谁更重要」：前者可验证，后者会随人而变。
+        if key_code == keymap::VK_Z
+            && matches!(action, BoundAction::TempPinyin)
+            && self.z_key_repeat_text().is_some()
+        {
             return true;
         }
         self.has_code_prefix(&ch.to_ascii_lowercase().to_string())
