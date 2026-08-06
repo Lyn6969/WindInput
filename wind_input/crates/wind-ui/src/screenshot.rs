@@ -19,9 +19,13 @@ pub fn timestamp() -> String {
     )
 }
 
+/// 非 Windows 取本地时间（与 Windows 分支的 `GetLocalTime` 同口径、同格式）。
+///
+/// ⚠ 这里此前返回常量 `"00000000_000000"`。文件名由它拼出，于是同一目录下每张截图都
+/// 叫 `candidate_00000000_000000.png` —— 第二张起静默覆盖第一张，而截图本身"成功"。
 #[cfg(not(windows))]
 pub fn timestamp() -> String {
-    "00000000_000000".to_string()
+    chrono::Local::now().format("%Y%m%d_%H%M%S").to_string()
 }
 
 /// 裁去四周 alpha ≤ 阈值的透明边缘行/列，返回 (裁剪后 buffer, new_w, new_h)。
@@ -214,9 +218,49 @@ pub fn copy_bgra_to_clipboard(buffer: &[u8], width: u32, height: u32) -> Result<
     Ok(())
 }
 
-#[cfg(not(windows))]
+/// macOS：BGRA → PNG 临时文件 → `osascript` 写入剪贴板（`«class PNGf»`）。
+///
+/// 走子进程而不是 `NSPasteboard`：与本仓既有的文本剪贴板同一路数（`popup_menu` 的
+/// `set_clipboard_text` 用 `pbcopy`），服务进程无需引入 AppKit 依赖、无需主线程。
+/// 代价是多一次落盘 + 两次 exec，但截图是低频操作，换掉一整个 ObjC 依赖是划算的。
+///
+/// ⚠ 之前这里是 `Ok(())` 空实现——**报告成功却什么都没做**，上层据此弹出「已截图到剪贴板」
+/// 的成功提示，用户去粘贴才发现是空的。宁可如实报错。
+#[cfg(target_os = "macos")]
+pub fn copy_bgra_to_clipboard(buffer: &[u8], width: u32, height: u32) -> Result<(), String> {
+    use std::process::Command;
+
+    // 复用 save_bgra_to_png 的裁边/反预乘处理，保证与存盘的那张一模一样。
+    let mut tmp = std::env::temp_dir();
+    tmp.push(format!("windinput_clip_{}.png", std::process::id()));
+    save_bgra_to_png(buffer, width, height, &tmp)?;
+
+    // POSIX 路径进 AppleScript 字符串：反斜杠与双引号需转义，否则含这些字符的
+    // 临时目录路径会让脚本语法错误（TMPDIR 由系统给出，不假设它一定"干净"）。
+    let escaped = tmp
+        .to_string_lossy()
+        .replace('\\', r"\\")
+        .replace('"', "\\\"");
+    let script = format!(r#"set the clipboard to (read (POSIX file "{escaped}") as «class PNGf»)"#);
+    let out = Command::new("/usr/bin/osascript")
+        .arg("-e")
+        .arg(&script)
+        .output();
+    let _ = std::fs::remove_file(&tmp);
+    match out {
+        Ok(o) if o.status.success() => Ok(()),
+        Ok(o) => Err(format!(
+            "osascript 写剪贴板失败: {}",
+            String::from_utf8_lossy(&o.stderr).trim()
+        )),
+        Err(e) => Err(format!("osascript 启动失败: {e}")),
+    }
+}
+
+/// 其它非 Windows 平台（Linux mock）：明确报不支持，不谎报成功。
+#[cfg(all(not(windows), not(target_os = "macos")))]
 pub fn copy_bgra_to_clipboard(_buffer: &[u8], _width: u32, _height: u32) -> Result<(), String> {
-    Ok(())
+    Err("图片剪贴板：当前平台暂未支持".into())
 }
 
 #[cfg(test)]

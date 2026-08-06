@@ -15,6 +15,8 @@ anyhow = { workspace = true }
 thiserror = { workspace = true }
 image = { workspace = true }
 resvg = "0.44"
+# 截图文件名的本地时间戳（非 Windows 分支；Windows 用 GetLocalTime）
+chrono = "0.4"
 
 [target.'cfg(windows)'.dependencies]
 # 局部追加 StationsAndDesktops：诊断浮层归属的桌面/窗口站（见 window.rs 的

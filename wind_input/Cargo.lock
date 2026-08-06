@@ -2610,6 +2610,7 @@ name = "wind-ui"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "chrono",
  "core-foundation",
  "core-foundation-sys",
  "core-graphics",
