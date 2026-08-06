@@ -307,6 +307,33 @@ A 类反过来排到最后——它是功能完整性，不是任何人的诉求
 方案把 z 改绑到快符表后，首键进快符、而夺取路径仍按「临拼」判定，同一个键在两条路径上
 成了两个身份。
 
+### ⚠️ 消费点在按键热路径上，表必须缓存
+
+`bound_action_for` 每次按键都调 `active_key_actions()`，而 `read_schema` **自身不带任何
+缓存**——每调一次就是：解析方案文件路径 → 读文件 → 解析 TOML → 读 override 文件 →
+解析 TOML → `merge_toml` → 反序列化整个 `Schema`。加上进模式有两条通路各调一次，
+等于每键最多跑两遍这套流程。
+
+已在 `EngineManager` 加 `key_actions_cache`（schema_id → 表），与 `schema_type_cache`
+同批失效：`invalidate_schema`（含 `write_schema_override` 内部调用）与
+`reload_from_config` 各清一次。
+
+★ 这是二期实现时的疏漏，写的时候只想着"读出来能用"，没问"这个函数多久被调一次"。
+**给热路径新增数据源时，第一个问题应该是调用频率，不是正确性。**
+
+### 诊断：让位原因进日志
+
+「配了不生效」是这套机制最常见的求助形态，而它有五个成因——没绑上 / 显式 `none` /
+非码表引擎 / repeat 身份 / 活码前缀——**单看现象完全同形**。故
+`bound_action_yield_reason` 返回原因字符串，直接进 debug 日志：
+
+```
+key_action: vk=0x5A 让位 —— 字母键仅码表引擎生效（拼音/混输里字母全是有效输入）
+key_action: vk=0xDC → Special("quick_symbols")
+```
+
+排查时一眼可辨，不必再逐个假设去试。
+
 ### 测试缺口已补
 
 `Coordinator::new_headless_with_override` 允许集成测试指定**临时** override 目录。

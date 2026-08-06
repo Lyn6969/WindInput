@@ -289,12 +289,18 @@ impl Coordinator {
     /// 同源教训见 `project_mixed_overflow_vs_topcode`（混输上屏三条通路，否决开关必须三处
     /// 都接）。盘查的判据是「进这个模式有几个入口」，不是「我改的函数里有几个分支」。
     pub(crate) fn bound_key_decision(&self, key_code: u32) -> BoundKeyDecision {
-        match self.bound_action_for(key_code) {
-            None => BoundKeyDecision::NotBound,
-            Some(action) if self.bound_action_key_yields(key_code, &action) => {
+        let Some(action) = self.bound_action_for(key_code) else {
+            return BoundKeyDecision::NotBound;
+        };
+        match self.bound_action_yield_reason(key_code, &action) {
+            Some(reason) => {
+                debug!("key_action: vk=0x{key_code:02X} 让位 —— {reason}");
                 BoundKeyDecision::Yield
             }
-            Some(action) => BoundKeyDecision::Act(action),
+            None => {
+                debug!("key_action: vk=0x{key_code:02X} → {action:?}");
+                BoundKeyDecision::Act(action)
+            }
         }
     }
 
@@ -335,21 +341,28 @@ impl Coordinator {
     ///
     /// 字母键额外限定码表引擎：拼音/混输里字母全是有效输入，借作功能键会丢首字母
     /// （与 `try_z_fallback` 的门禁同源）。符号键不限引擎——拼音方案里用 `\` 进快符同样合理。
-    fn bound_action_key_yields(&self, key_code: u32, action: &BoundAction) -> bool {
+    /// 同上，但返回**让位原因**（`None` = 不让位）供日志说明。
+    ///
+    /// 「配了不生效」是这套机制最常见的求助形态，而它有五个成因（没绑上 / 显式 none /
+    /// 非码表引擎 / repeat / 活码前缀），单看现象完全同形。原因字符串直接进 debug 日志，
+    /// 排查时一眼可辨，不必再逐个假设去试。
+    fn bound_action_yield_reason(
+        &self,
+        key_code: u32,
+        action: &BoundAction,
+    ) -> Option<&'static str> {
         if !action.is_enabled() {
-            return true; // 显式 none：本就不执行
+            return Some("显式 none");
         }
-        let Some(ch) = keymap::vk_to_prefix_char_with_letters(key_code) else {
-            return false;
-        };
+        let ch = keymap::vk_to_prefix_char_with_letters(key_code)?;
         if !ch.is_ascii_alphabetic() {
-            return false; // 符号键：不让位，也不限引擎
+            return None; // 符号键：不让位，也不限引擎
         }
         if !matches!(
             self.engine_mgr.current_engine_type(),
             Some(wind_engine::EngineType::CodeTable)
         ) {
-            return true;
+            return Some("字母键仅码表引擎生效（拼音/混输里字母全是有效输入）");
         }
         // z 的 repeat 身份**只压得住有夺取回路的目标**。
         //
@@ -365,9 +378,10 @@ impl Coordinator {
             && matches!(action, BoundAction::TempPinyin)
             && self.z_key_repeat_text().is_some()
         {
-            return true;
+            return Some("z 的 repeat 身份（目标是临拼，有 z-fallback 补救）");
         }
         self.has_code_prefix(&ch.to_ascii_lowercase().to_string())
+            .then_some("该字母在本方案是活码前缀")
     }
 
     /// 执行 z 键功能：按 `action` 进对应模式（空缓冲进入语义，组合区前缀显示 `z`）。

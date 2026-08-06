@@ -161,6 +161,14 @@ pub struct EngineManager {
     /// redb 查询叠加，造成可感知卡顿。缓存 `None` 同样有意义：方案文件不存在时反复尝试
     /// 读盘，还会刷出成片的 `Schema file not found` 警告。
     schema_type_cache: Mutex<HashMap<String, Option<String>>>,
+    /// 方案级 `[key_actions]` 表缓存（schema_id → 表）。
+    ///
+    /// **必须缓存**：消费点 `Coordinator::bound_action_for` 在按键热路径上，且进模式的两条
+    /// 通路各调一次。没有它就是每键读两个文件（方案 + override）、解析两份 TOML、再反序列化
+    /// 整个 `Schema`——`read_schema` 本身不带任何缓存。
+    ///
+    /// 与 `schema_type_cache` 等同批失效（`invalidate_schema`）。
+    key_actions_cache: Mutex<HashMap<String, std::collections::BTreeMap<String, String>>>,
     /// 方案显示名缓存（schema_id -> schema.name；缺则回退 id）。按需读盘一次。
     name_cache: Mutex<HashMap<String, String>>,
     /// 方案 override 层目录（schema_overrides/{id}.toml）；读 schema 时深合并到基础方案之上。
@@ -387,6 +395,7 @@ impl EngineManager {
             temp_pinyin: Mutex::new(config.input.temp_pinyin.clone()),
             freq_cache: Mutex::new(HashMap::new()),
             schema_type_cache: Mutex::new(HashMap::new()),
+            key_actions_cache: Mutex::new(HashMap::new()),
             name_cache: Mutex::new(HashMap::new()),
             override_dir,
             primary_codetable: Mutex::new(primary_codetable),
@@ -1355,6 +1364,10 @@ impl EngineManager {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .remove(schema_id);
+        self.key_actions_cache
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(schema_id);
         self.name_cache
             .lock()
             .unwrap_or_else(|e| e.into_inner())
@@ -1464,6 +1477,11 @@ impl EngineManager {
             .unwrap_or_else(|e| e.into_inner()) = primary;
         // 主码表可能变更:失效反查索引,下次按新主码表重建。
         self.reverse_index
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear();
+        // 方案文件/override 可能随配置重载而变（设置页改完即热重载），按键功能表一并失效。
+        self.key_actions_cache
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .clear();
@@ -1689,9 +1707,22 @@ impl EngineManager {
     /// 读不到方案（文件缺失/解析失败）时返回空表 = 不覆盖任何键，各键照常走全局链。
     pub fn active_key_actions(&self) -> std::collections::BTreeMap<String, String> {
         let id = self.active_schema_id();
-        Self::read_schema(&id, self.data_dir.as_deref(), self.override_dir.as_deref())
+        if let Some(cached) = self
+            .key_actions_cache
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&id)
+        {
+            return cached.clone();
+        }
+        let table = Self::read_schema(&id, self.data_dir.as_deref(), self.override_dir.as_deref())
             .map(|s| s.key_actions)
-            .unwrap_or_default()
+            .unwrap_or_default();
+        self.key_actions_cache
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(id, table.clone());
+        table
     }
 
     pub fn codetable_settings(&self) -> wind_config::CodetableGlobal {
