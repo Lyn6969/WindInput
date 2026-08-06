@@ -75,6 +75,16 @@ macOS 目前仅支持从源码构建，暂未提供安装包。
 [pinyin-data](https://github.com/mozillazg/pinyin-data)、[OpenCC](https://github.com/BYVoid/OpenCC)
 等第三方项目，适用各自的许可证条款，完整声明详见 [NOTICE.md](NOTICE.md)。
 
+## 关于项目名称
+
+MIT 许可证授予您对源代码的完整权利，本项目不对此附加任何限制。
+
+若您将本项目分支后公开发布，请更换项目名称与 logo，并注明为非官方分支，
+以便用户区分软件的实际维护者。
+
+本项目未注册商标，上述为约定与请求而非法律条款，
+详见 [项目名称与标识使用约定](BRANDING.md)。
+
 ## 交流与反馈
 
 - **QQ 交流群**：[1085293418](https://qm.qq.com/q/u2A8FfafIs)

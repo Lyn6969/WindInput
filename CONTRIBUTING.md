@@ -140,3 +140,6 @@ scripts/dev.sh hooks       # Linux/macOS
 ## 许可证
 
 提交贡献即表示您同意您的贡献将按照项目的 [MIT 许可证](LICENSE) 进行授权。词库相关的第三方资源许可证请参阅 [NOTICE.md](NOTICE.md)。
+
+此外，若您将本项目分支后公开发布，请更换项目名称与 logo 并注明为非官方分支。
+该项不影响您对代码的任何权利，详见 [项目名称与标识使用约定](BRANDING.md)。

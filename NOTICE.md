@@ -114,3 +114,9 @@ GPL-3.0 许可的词库数据（rime-frost）不包含在本仓库中，而是�
 Apache-2.0（极点五笔码表）与 Unicode-3.0（Unicode CLDR，当前仅研究用）
 均为宽松许可证，允许修改后再分发，其加工产物可直接包含在本仓库中，
 无 copyleft 传染性。
+
+## 本项目自身的名称与标识
+
+本项目的 logo（`pic/logo.png`）与应用图标为原创图形作品，不在 MIT 许可证的
+授权范围内。关于项目名称「清风输入法」「WindInput」的使用，
+详见 [BRANDING.md](BRANDING.md)。
