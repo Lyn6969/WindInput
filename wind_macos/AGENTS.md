@@ -22,20 +22,21 @@ Win 的 `m2`=核心 exe ↔ mac 的 `m2`=Rust 服务）。
 ### 与 Windows 的功能差距（待补）
 
 Rust 核心跨平台，引擎/词库/候选/词频类改动 macOS 自动受益；差距集中在**宿主层**。
-`wind-ui` 的 `UiCommand` 有 42 个变体，`manager_macos.rs` 的 Forwarder 目前接了 24 个。
+`wind-ui` 的 `UiCommand` 有 42 个变体，`manager_macos.rs` 的 Forwarder 目前接了 27 个。
 未接的：
 
 | UiCommand | 影响 | 备注 |
 |---|---|---|
 | `ShowInputDiag` / `HideInputDiag` / `CopyInputDiagText` | 输入诊断 HUD 整套缺失 | 设计见 `docs/design/input-diagnostics-hud.md` |
-| `TakeScreenshot` / `ScreenshotCandidateToClipboard` / `ScreenshotStatusTip` / `ScreenshotTooltip` / `CopyTooltipText` | 浮层截图与复制内容缺失 | Win 侧走 GDI 取窗口位图；mac 需从 SHM 帧或 NSPanel 取 |
+| `ScreenshotStatusTip` / `ScreenshotTooltip` | 状态气泡 / 悬停提示的截图缺失 | **像素不在本进程**：这两者是 `.app` 侧原生 NSPanel，服务只下发文本与配色。要做得由 `.app` 截图并回传，需新增协议码位 |
 | `ReportCandidatePos` / `ReportStatusTipPos` | 候选窗 / 状态气泡的拖动与位置固定缺失 | 拖动在 .app 侧，落点须经上行帧回报给服务持久化（协议要新增码位） |
 | `ShowCandidateMenu` / `HideMenu` / `MenuKey` | 候选右键菜单的键盘导航缺失 | 菜单树本身已走 `CmdMenuShow` + `UnifiedMenuBuilder` |
 | `SetToolbarPos` / `SetToolbarAutoHide` | N/A（mac 用菜单栏指示器，无浮动工具栏） | 对应配置项已在设置清单里按平台隐藏（`platform = "windows"`），不再是"无处落地" |
 | `SetHostRender` | Windows 专有（宿主进程内 Band 窗口） | mac 无对应概念 |
 
 已接：`RegisterGlobalHotkeys`（见下）、`OpenPath` / `OpenApp`（`/usr/bin/open`，
-`.app` 包走 `open -a … --args`）。
+`.app` 包走 `open -a … --args`）、`TakeScreenshot` / `ScreenshotCandidateToClipboard` /
+`CopyTooltipText`（见下）。
 
 未接的变体落在 `Forwarder::handle` 的 `other =>` 兜底臂，只打一条 debug 日志。
 **新接一个变体时同步更新本表**。
@@ -67,6 +68,23 @@ caret 段发全 0 是安全的：`apply_focus_caret` 见 `height == 0` 即返回
 **语义差异不可消除**：Windows 是 per-app 切换（只改当前前台应用），macOS 的
 `TISSelectInputSource` 是全局切换 —— 系统没有「只改这个 app」的公开 API。设置界面的
 hint 已如实写明两平台差异。
+
+### 候选窗截图 / 提示复制
+
+macOS 的候选窗**像素本来就在服务进程里**（我们光栅化后经 SHM 推给 `.app`），故截图不需要
+`.app` 参与：`Forwarder::capture_candidate` 直接拿 `render_frame()` 的 buffer 编码存盘。
+悬停提示的文本同理（随帧下发，服务侧有 `last_tip`），复制也不需要 `.app`。
+
+反过来，**状态气泡与悬停提示的截图做不了**：那两者是 `.app` 侧原生 NSPanel，像素不在本进程。
+
+两处踩过的坑：
+
+- `screenshot::timestamp()` 在非 Windows 曾恒返回 `"00000000_000000"`，截图文件名不含真实
+  时间 → 第二张起静默覆盖第一张，而操作本身"成功"。现用 `chrono::Local`。
+- `copy_bgra_to_clipboard` 在非 Windows 曾是 `Ok(())` 空实现——**报告成功却什么都没做**，
+  上层据此弹「已截图到剪贴板」，用户粘贴才发现是空的。现走 PNG 临时文件 + `osascript`
+  的 `«class PNGf»`（与文本剪贴板走 `pbcopy` 同一路数，服务进程不必引入 AppKit）；
+  其它平台改为如实报错而非谎报成功。
 
 ### 系统明暗
 

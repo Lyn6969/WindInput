@@ -246,33 +246,7 @@ impl Forwarder {
                 position,
                 kind,
                 duration_ms,
-            } => {
-                let pos = match position {
-                    ToastPosition::Center => "center",
-                    ToastPosition::TopCenter => "top_center",
-                    ToastPosition::BottomCenter => "bottom_center",
-                    ToastPosition::TopLeft => "top_left",
-                    ToastPosition::TopRight => "top_right",
-                    ToastPosition::BottomLeft => "bottom_left",
-                    ToastPosition::BottomRight => "bottom_right",
-                };
-                // accent 取 ToastKind 对应强调色（与 toast.rs ToastKind::accent 一致）。
-                let accent = match kind {
-                    ToastKind::Info => "#409EFF",
-                    ToastKind::Success => "#52C46E",
-                    ToastKind::Error => "#F56C6C",
-                };
-                self.sink.push_frame(&encode_toast_show(
-                    "",
-                    &text,
-                    &self.tips.toast_bg,
-                    &self.tips.toast_fg,
-                    accent,
-                    pos,
-                    duration_ms as i32,
-                    0,
-                ));
-            }
+            } => self.push_toast(&text, position, kind, duration_ms as i32),
             UiCommand::SetTheme(t) => {
                 // 提示类窗口在 .app 侧原生渲染，配色须在此求值成 hex 随帧下发；
                 // 兜底值与各自 Windows 实现的编译期默认逐字一致，避免两端观感分叉。
@@ -325,6 +299,72 @@ impl Forwarder {
                 // 只入队 + 唤醒主线程；真正的 Carbon 注册在主线程做（见该模块头「线程约定」）。
                 crate::global_hotkey_macos::apply(entries, self.ev_tx.clone());
             }
+            UiCommand::TakeScreenshot { dir } => {
+                let dir = std::path::PathBuf::from(&dir);
+                let (msg, kind) = match self.capture_candidate() {
+                    Some((buf, w, h)) => {
+                        let path =
+                            dir.join(format!("candidate_{}.png", crate::screenshot::timestamp()));
+                        match crate::screenshot::save_bgra_to_png(&buf, w, h, &path) {
+                            Ok(()) => {
+                                tracing::info!("Screenshot saved: {:?}", path);
+                                // 存盘同时进剪贴板（对齐 Windows）：截完直接能粘贴，省去翻目录。
+                                // 剪贴板失败不影响"已存盘"这个既成事实，只在文案里说明。
+                                match crate::screenshot::copy_bgra_to_clipboard(&buf, w, h) {
+                                    Ok(()) => (
+                                        "候选窗口已截图（已存盘并复制）".to_string(),
+                                        ToastKind::Success,
+                                    ),
+                                    Err(e) => {
+                                        tracing::warn!("截图进剪贴板失败: {e}");
+                                        (
+                                            "候选窗口已截图（存盘成功，剪贴板失败）".to_string(),
+                                            ToastKind::Info,
+                                        )
+                                    }
+                                }
+                            }
+                            Err(e) => {
+                                tracing::warn!("截图存盘失败: {e}");
+                                (format!("截图失败：{e}"), ToastKind::Error)
+                            }
+                        }
+                    }
+                    // 状态气泡 / 悬停提示在 .app 侧原生渲染，像素不在本进程，故本命令
+                    // 在 macOS 上只覆盖候选窗——与 Windows 的"有什么截什么"不同。
+                    None => ("候选窗口未显示，无法截图".to_string(), ToastKind::Info),
+                };
+                self.push_result_toast(&msg, kind);
+            }
+            UiCommand::ScreenshotCandidateToClipboard => {
+                let (msg, kind) = match self.capture_candidate() {
+                    Some((buf, w, h)) => {
+                        match crate::screenshot::copy_bgra_to_clipboard(&buf, w, h) {
+                            Ok(()) => {
+                                tracing::info!("Candidate screenshot copied to clipboard");
+                                ("候选窗口已截图到剪贴板".to_string(), ToastKind::Success)
+                            }
+                            Err(e) => {
+                                tracing::warn!("Screenshot to clipboard failed: {e}");
+                                (format!("截图到剪贴板失败：{e}"), ToastKind::Error)
+                            }
+                        }
+                    }
+                    None => ("候选窗口未显示，无法截图".to_string(), ToastKind::Info),
+                };
+                self.push_result_toast(&msg, kind);
+            }
+            UiCommand::CopyTooltipText => {
+                // 提示气泡由 .app 渲染，但文本是本进程随帧下发的，故复制无需 .app 参与。
+                let (msg, kind) = match self.last_tip.as_deref().filter(|s| !s.is_empty()) {
+                    Some(t) => {
+                        crate::popup_menu::set_clipboard_text(t);
+                        ("提示内容已复制".to_string(), ToastKind::Success)
+                    }
+                    None => ("提示内容为空，无法复制".to_string(), ToastKind::Info),
+                };
+                self.push_result_toast(&msg, kind);
+            }
             UiCommand::OpenPath(path) => crate::manager::open_path(&path),
             UiCommand::OpenApp { path, args } => crate::manager::open_app(&path, &args),
             UiCommand::Shutdown => {}
@@ -336,6 +376,53 @@ impl Forwarder {
                 tracing::debug!("forwarder: 暂未处理 {:?}", std::mem::discriminant(&other));
             }
         }
+    }
+
+    /// 推一条 toast 给 `.app`（原生渲染）。
+    fn push_toast(&self, text: &str, position: ToastPosition, kind: ToastKind, duration_ms: i32) {
+        let pos = match position {
+            ToastPosition::Center => "center",
+            ToastPosition::TopCenter => "top_center",
+            ToastPosition::BottomCenter => "bottom_center",
+            ToastPosition::TopLeft => "top_left",
+            ToastPosition::TopRight => "top_right",
+            ToastPosition::BottomLeft => "bottom_left",
+            ToastPosition::BottomRight => "bottom_right",
+        };
+        // accent 取 ToastKind 对应强调色（与 toast.rs ToastKind::accent 一致）。
+        let accent = match kind {
+            ToastKind::Info => "#409EFF",
+            ToastKind::Success => "#52C46E",
+            ToastKind::Error => "#F56C6C",
+        };
+        self.sink.push_frame(&encode_toast_show(
+            "",
+            text,
+            &self.tips.toast_bg,
+            &self.tips.toast_fg,
+            accent,
+            pos,
+            duration_ms,
+            0,
+        ));
+    }
+
+    /// 截图/复制类操作的结果反馈：右下角 toast，3 秒（与 Windows 侧同一形态）。
+    fn push_result_toast(&self, text: &str, kind: ToastKind) {
+        self.push_toast(text, ToastPosition::BottomRight, kind, 3000);
+    }
+
+    /// 取候选窗当前帧的像素（BGRA + 尺寸）。窗口未显示时返回 `None`。
+    ///
+    /// macOS 的候选窗像素本来就在服务进程里（我们光栅化后经 SHM 推给 `.app`），故截图
+    /// 无需 `.app` 参与——直接把同一份 buffer 编码存盘即可。这也是为什么状态气泡 / 悬停
+    /// 提示的截图**做不了**：那两者是 `.app` 侧原生 NSPanel，像素不在本进程。
+    fn capture_candidate(&mut self) -> Option<(Vec<u8>, u32, u32)> {
+        if !self.visible {
+            return None;
+        }
+        let f = self.win.render_frame()?;
+        Some((f.buf, f.width as u32, f.height as u32))
     }
 
     /// 按 `win` 的当前状态渲染一帧并推给 `.app`（像素走 SHM，元数据走 push 管道）。
@@ -571,6 +658,79 @@ mod tests {
         assert!(
             cap.lock().unwrap().is_empty(),
             "隐藏状态下换主题不该推任何帧"
+        );
+    }
+
+    /// 从抓到的帧里取出 toast 文本（CmdToastShow 的第二个长度前缀字段）。
+    fn toast_texts(v: &[Vec<u8>]) -> Vec<String> {
+        v.iter()
+            .filter(|f| cmd_of(f) == wind_ipc::protocol::CMD_TOAST_SHOW)
+            .filter_map(|f| {
+                let p = &f[8..];
+                let n0 = u32::from_le_bytes(p[0..4].try_into().ok()?) as usize;
+                let off = 4 + n0;
+                let n1 = u32::from_le_bytes(p[off..off + 4].try_into().ok()?) as usize;
+                String::from_utf8(p[off + 4..off + 4 + n1].to_vec()).ok()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn screenshot_without_visible_candidates_reports_instead_of_saving() {
+        // 候选窗没显示时必须如实说"没显示"，不能悄悄存一张空图。
+        let cap = Arc::new(Mutex::new(Vec::new()));
+        let (mut f, _ev) = mk(cap.clone(), "_t_shot0");
+        let dir = std::env::temp_dir().join("windinput_test_shots_none");
+        f.handle(UiCommand::TakeScreenshot {
+            dir: dir.display().to_string(),
+        });
+        let texts = toast_texts(&cap.lock().unwrap());
+        assert!(
+            texts.iter().any(|t| t.contains("未显示")),
+            "应提示未显示，实际 {texts:?}"
+        );
+        assert!(!dir.exists(), "不该建目录/落文件");
+    }
+
+    #[test]
+    fn screenshot_saves_png_when_visible() {
+        let cap = Arc::new(Mutex::new(Vec::new()));
+        let (mut f, _ev) = mk(cap.clone(), "_t_shot1");
+        show_two(&mut f);
+        let dir = std::env::temp_dir().join(format!("windinput_test_shots_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        f.handle(UiCommand::TakeScreenshot {
+            dir: dir.display().to_string(),
+        });
+
+        let files: Vec<_> = std::fs::read_dir(&dir)
+            .map(|d| d.filter_map(|e| e.ok()).map(|e| e.file_name()).collect())
+            .unwrap_or_default();
+        assert_eq!(files.len(), 1, "应存出一张 PNG，实际 {files:?}");
+        let name = files[0].to_string_lossy().to_string();
+        assert!(
+            name.starts_with("candidate_") && name.ends_with(".png"),
+            "{name}"
+        );
+        // 回归：timestamp() 曾在非 Windows 恒返回 "00000000_000000"，多张截图互相覆盖。
+        assert!(
+            !name.contains("00000000_000000"),
+            "文件名须含真实时间戳，实际 {name}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn copy_tooltip_text_reports_empty_when_no_tip() {
+        let cap = Arc::new(Mutex::new(Vec::new()));
+        let (mut f, _ev) = mk(cap.clone(), "_t_tip");
+        show_two(&mut f); // hover=-1 → 无 tooltip
+        cap.lock().unwrap().clear();
+        f.handle(UiCommand::CopyTooltipText);
+        let texts = toast_texts(&cap.lock().unwrap());
+        assert!(
+            texts.iter().any(|t| t.contains("为空")),
+            "应提示内容为空，实际 {texts:?}"
         );
     }
 
