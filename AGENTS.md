@@ -268,6 +268,17 @@ $env:WIND_REMOTE_SLOT = "off"    # 关掉槽位，与主树共用目录（串台
   依赖的 crate；**`wind-coordinator` 传递依赖 `windows` crate，不能在 Linux host 跑测试**。
 - 部署调试版到 Windows：`scripts/dev.sh push debug`（配置见 `scripts/deploy.local`）。
 
+### macOS 本机（`scripts/mac/dev.sh`）
+
+- host 即目标：`cargo check/test --workspace` 全 workspace 可直接跑（含 `wind-coordinator`
+  ——`windows` crate 是 `cfg(windows)` 依赖，非 Windows 上不参与编译）。脚本快捷键与
+  `dev.ps1` 对齐：`k`/`l`/`t`/`f`/`fmt-check`/`ci`/`hooks`/`clean`/`gd`/`r`。
+- 模块映射：Win 的 `m1`(TSF DLL) ↔ mac 的 `m1`(`WindInput.app`，Swift/IMKit)；
+  Win 的 `m2`(核心 exe) ↔ mac 的 `m2`(Rust 服务)。全构建 `1`/`d1`，系统安装 `p1`/`pd1`，
+  安装包 `8`/`d8` → `.pkg`。
+- `.app` 侧单测：`cd wind_macos && swift test`。
+- 与 Windows 的功能差距（宿主层）登记在 `wind_macos/AGENTS.md`「与 Windows 的功能差距」。
+
 ### 注意
 
 - 部分集成测试依赖 `build_dev/` 下的数据（junction/词库）；**数据缺失时测试族静默跳过，
