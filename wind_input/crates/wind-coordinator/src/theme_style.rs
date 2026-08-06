@@ -106,8 +106,66 @@ pub fn system_prefers_dark() -> bool {
     dark
 }
 
-/// 非 Windows 恒浅色：macOS 的明暗由 `.app` 侧 `effectiveAppearance` 决定，尚未接回本进程。
-#[cfg(not(windows))]
+/// macOS 读全局偏好 `AppleInterfaceStyle`：浅色时该键**不存在**，深色时值为 `"Dark"`。
+///
+/// 走 `CFPreferencesCopyAppValue` 而不是读 `.GlobalPreferences.plist` 文件：偏好由
+/// cfprefsd 托管并带写回延迟，直接读文件会拿到用户刚改过、尚未落盘的旧值。也不用
+/// `defaults` 子进程——本函数在每次主题解析时调用，spawn 的量级不合适。
+///
+/// 服务进程是用户会话内的 LaunchAgent，读到的就是当前用户域，无需额外指定 user/host。
+///
+/// 与 Windows 分支同样的兜底方向：取不到一律按浅色（深色是更"重"的假设，猜错会让浅底
+/// 主题叠深色文本而不可读）。
+#[cfg(target_os = "macos")]
+pub fn system_prefers_dark() -> bool {
+    use core_foundation_sys::base::{CFRelease, CFTypeRef, kCFAllocatorDefault};
+    use core_foundation_sys::preferences::{
+        CFPreferencesCopyAppValue, kCFPreferencesAnyApplication,
+    };
+    use core_foundation_sys::string::{
+        CFStringCreateWithBytes, CFStringGetCString, CFStringRef, kCFStringEncodingUTF8,
+    };
+
+    const KEY: &[u8] = b"AppleInterfaceStyle";
+    let dark = unsafe {
+        let key = CFStringCreateWithBytes(
+            kCFAllocatorDefault,
+            KEY.as_ptr(),
+            KEY.len() as isize,
+            kCFStringEncodingUTF8,
+            false as u8,
+        );
+        if key.is_null() {
+            return false;
+        }
+        let value = CFPreferencesCopyAppValue(key, kCFPreferencesAnyApplication);
+        CFRelease(key as CFTypeRef);
+        if value.is_null() {
+            // 键不存在 = 浅色（这是浅色模式下的正常状态，不是错误）。
+            return false;
+        }
+        // 该键的类型契约是字符串；真拿到别的类型时 CFStringGetCString 会失败并返回 false，
+        // 不必先做 CFGetTypeID 判别（多一次 FFI 换不来额外的安全性）。
+        let mut buf = [0i8; 32];
+        let ok = CFStringGetCString(
+            value as CFStringRef,
+            buf.as_mut_ptr(),
+            buf.len() as isize,
+            kCFStringEncodingUTF8,
+        );
+        CFRelease(value);
+        ok != 0 && {
+            let s = std::ffi::CStr::from_ptr(buf.as_ptr()).to_string_lossy();
+            // 实测取值恒为 "Dark"；用 eq_ignore_ascii_case 而非全等，容忍未来的大小写变体。
+            s.eq_ignore_ascii_case("dark")
+        }
+    };
+    debug!("系统明暗探测: AppleInterfaceStyle → dark={}", dark);
+    dark
+}
+
+/// 其余平台（Linux 等）恒浅色：无统一的系统明暗来源。
+#[cfg(not(any(windows, target_os = "macos")))]
 pub fn system_prefers_dark() -> bool {
     false
 }

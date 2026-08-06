@@ -34,6 +34,10 @@ windows = { workspace = true }
 # DirectSwitchHotkeys 注册表同步（direct_switch.rs）
 winreg = "0.52"
 
+[target.'cfg(target_os = "macos")'.dependencies]
+# 系统明暗探测（theme_style.rs 读全局偏好 AppleInterfaceStyle）
+core-foundation-sys = "0.8"
+
 [dev-dependencies]
 wind-config = { path = "../wind-config" }
 wind-bridge = { path = "../wind-bridge" }
