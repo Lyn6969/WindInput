@@ -2055,7 +2055,36 @@ impl Coordinator {
                 e
             );
         }
-        Ok(json!({ "ok": true, "slug": theme_id, "display_name": meta.name }))
+
+        // 推送的就是当前生效主题 → 立刻重解析下发，编辑器里改完即见效。
+        // 不做则只落盘，用户得手动切走再切回来（或重启）才看得到自己刚推的改动。
+        //
+        // 判据是**目录 id 相同**，不比对文件内容：主题可能被 base 继承链间接影响，
+        // 且重解析一次远比误判便宜。用户目录优先于安装目录，所以推一个与内置主题
+        // 同 id 的用户主题（如 slug=default）同样会改变实际生效外观，这里一并覆盖。
+        let current = self
+            .theme_name
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        let reloaded = current == theme_id;
+        if reloaded {
+            // 明暗沿用当前 style（system 时按系统实时判定），与 on_system_theme_changed 同一出口。
+            let dark = self
+                .theme_style
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .resolve_dark();
+            tracing::info!("导入的是当前主题 {}，重新加载以即时生效", theme_id);
+            self.push_theme(&theme_id, dark);
+        }
+        Ok(json!({
+            "ok": true,
+            "slug": theme_id,
+            "display_name": meta.name,
+            // 供设置层如实回报给编辑器（此前那一层硬编码 false）。
+            "reloaded": reloaded,
+        }))
     }
 
     fn web_theme_list(&self) -> anyhow::Result<Value> {
