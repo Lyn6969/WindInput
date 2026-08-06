@@ -97,7 +97,7 @@ impl Coordinator {
         if !state.input_buffer.starts_with('z') {
             return None;
         }
-        if self.z_key_action() != wind_config::ZKeyAction::TempPinyin {
+        if self.z_key_action() != wind_config::BoundAction::TempPinyin {
             return None;
         }
         let combined = format!("{}{}", state.input_buffer, ch);

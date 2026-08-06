@@ -476,10 +476,10 @@ impl Default for PinyinGlobalConfig {
 /// - `"mix:<id>"`：进指定融合模式（`mix:quick_mix` = 内置「快捷」）
 /// - `"special:<id>"`：进指定特殊模式
 ///
-/// 未知值一律解析成 [`ZKeyAction::None`]（不静默变成别的功能）；指向不存在的 id 由消费端
+/// 未知值一律解析成 [`BoundAction::None`]（不静默变成别的功能）；指向不存在的 id 由消费端
 /// 的门卫拦下（`mix_members` / `ensure_schema`），并在加载期 `warn`。
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum ZKeyAction {
+pub enum BoundAction {
     /// 不启用：z 作正常编码字母。
     None,
     /// 进临时拼音。
@@ -492,7 +492,7 @@ pub enum ZKeyAction {
     Special(String),
 }
 
-impl ZKeyAction {
+impl BoundAction {
     /// 解析配置字符串。大小写与首尾空白不敏感；未知值 → [`Self::None`]。
     pub fn parse(s: &str) -> Self {
         let s = s.trim();
@@ -554,7 +554,7 @@ pub struct CodetableGlobal {
     /// z 键重复输入。
     #[serde(default)]
     pub z_key_repeat: bool,
-    /// z 键功能：空缓冲按 z 且 z 在本方案是死码时，进哪个模式。见 [`ZKeyAction`]。
+    /// z 键功能：空缓冲按 z 且 z 在本方案是死码时，进哪个模式。见 [`BoundAction`]。
     ///
     /// 与 [`Self::z_key_repeat`] **正交**（可同时开）：repeat 先手，继续打字母才轮到本项，
     /// 详见 `Coordinator::try_activate_mode` 的三重身份裁决。
@@ -2978,7 +2978,7 @@ impl Config {
         self.migrate_letter_trigger_keys();
     }
 
-    /// 存量迁移：`trigger_keys` 里的单字母 → 方案级 [`ZKeyAction`]。
+    /// 存量迁移：`trigger_keys` 里的单字母 → 方案级 [`BoundAction`]。
     ///
     /// 引导键曾接受任意 a-z（`key_name_to_vk_with_letters`），字母的特殊能力现已收归
     /// `schema.codetable.z_key_action`。**必须显式迁移**：解析端改成只认符号后，
@@ -3496,28 +3496,28 @@ mod tests {
 
     #[test]
     fn z_key_action_parses_value_domain() {
-        assert_eq!(ZKeyAction::parse(""), ZKeyAction::None);
-        assert_eq!(ZKeyAction::parse("none"), ZKeyAction::None);
-        assert_eq!(ZKeyAction::parse(" TEMP_PINYIN "), ZKeyAction::TempPinyin);
-        assert_eq!(ZKeyAction::parse("temp_english"), ZKeyAction::TempEnglish);
+        assert_eq!(BoundAction::parse(""), BoundAction::None);
+        assert_eq!(BoundAction::parse("none"), BoundAction::None);
+        assert_eq!(BoundAction::parse(" TEMP_PINYIN "), BoundAction::TempPinyin);
+        assert_eq!(BoundAction::parse("temp_english"), BoundAction::TempEnglish);
         assert_eq!(
-            ZKeyAction::parse("mix:quick_mix"),
-            ZKeyAction::Mix("quick_mix".into())
+            BoundAction::parse("mix:quick_mix"),
+            BoundAction::Mix("quick_mix".into())
         );
         assert_eq!(
-            ZKeyAction::parse("special:rare"),
-            ZKeyAction::Special("rare".into())
+            BoundAction::parse("special:rare"),
+            BoundAction::Special("rare".into())
         );
         // 未知值绝不静默变成别的功能。
-        assert_eq!(ZKeyAction::parse("enter_temp_pinyin"), ZKeyAction::None);
-        assert_eq!(ZKeyAction::parse("quick_input"), ZKeyAction::None);
+        assert_eq!(BoundAction::parse("enter_temp_pinyin"), BoundAction::None);
+        assert_eq!(BoundAction::parse("quick_input"), BoundAction::None);
         // 空 id 无从定位目标，等同不启用（消费端也会被门卫挡下，此处提前收敛）。
-        assert_eq!(ZKeyAction::parse("mix:"), ZKeyAction::None);
-        assert_eq!(ZKeyAction::parse("special:  "), ZKeyAction::None);
+        assert_eq!(BoundAction::parse("mix:"), BoundAction::None);
+        assert_eq!(BoundAction::parse("special:  "), BoundAction::None);
         // id 大小写敏感（与 special_mode_idx / mix_mode_idx 的精确匹配同口径）。
         assert_eq!(
-            ZKeyAction::parse("mix:Quick_Mix"),
-            ZKeyAction::Mix("Quick_Mix".into())
+            BoundAction::parse("mix:Quick_Mix"),
+            BoundAction::Mix("Quick_Mix".into())
         );
     }
 

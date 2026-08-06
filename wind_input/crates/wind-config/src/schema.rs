@@ -19,6 +19,20 @@ pub struct Schema {
     pub dictionaries: Vec<DictSpec>,
     #[serde(default)]
     pub encoder: Option<EncoderSpec>,
+    /// **方案级按键功能表**（`[key_actions]`）：按键名 → 动词。
+    ///
+    /// 与 `[engine]` 平级而非放在 `[engine.codetable]` 下：按键功能与引擎类型无关，
+    /// 拼音方案同样需要它。值域与语义见 [`crate::BoundAction`] 与
+    /// `docs/design/schema-key-actions.md`。
+    ///
+    /// 空表 = 不覆盖任何键，各键照常走全局引导键链。**逐键合并**，不是整段替换：
+    /// 方案文件内联段与 `schema_overrides/{id}.toml` 在 toml 层由 `merge_toml` 合并，
+    /// 那里只能新增/覆盖、无法删除键——故「本方案禁用某个全局绑定」必须写显式
+    /// `"none"`，不能靠从 override 里删掉那一行。
+    ///
+    /// 用 `BTreeMap`：顺序无语义（优先级由分派插入点决定），键唯一由类型保证。
+    #[serde(default)]
+    pub key_actions: std::collections::BTreeMap<String, String>,
 }
 
 /// 方案元信息（[schema]）
@@ -138,7 +152,7 @@ pub struct CodeTableSpec {
     /// z 键功能（`""`/`none` / `temp_pinyin` / `temp_english` / `mix:<id>` / `special:<id>`）。
     ///
     /// 方案级才有意义：z 能否借作引导键取决于这张码表里它是不是死码。
-    /// 值域与语义见 `wind_config::config::ZKeyAction`。
+    /// 值域与语义见 `wind_config::config::BoundAction`。
     #[serde(default)]
     pub z_key_action: Option<String>,
     /// 方案级调频覆盖（`[engine.codetable.frequency]`）。

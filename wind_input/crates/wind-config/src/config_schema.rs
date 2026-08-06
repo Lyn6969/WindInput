@@ -89,7 +89,7 @@ static REGISTRY: &[ConfigField] = &[
     f("schema.codetable.single_code_input", Bool),
     f("schema.codetable.single_code_complete", Bool),
     f("schema.codetable.z_key_repeat", Bool),
-    // 带参数的值域（`mix:<id>` / `special:<id>`）故用 Str 而非 Enum；解析与校验见 `ZKeyAction`。
+    // 带参数的值域（`mix:<id>` / `special:<id>`）故用 Str 而非 Enum；解析与校验见 `BoundAction`。
     f("schema.codetable.z_key_action", Str),
     // 码元字符集：范围+字面的自由文本（如 `a-x/`、`a-z0-9`），值域无法枚举故用 Str；
     // 解析与非法回落见 `CodeCharSet`。空 = 内置默认 `a-z`。

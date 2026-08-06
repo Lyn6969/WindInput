@@ -8,7 +8,7 @@ use crate::coordinator::{Coordinator, State, punct_char};
 use crate::pipeline::ModeKind;
 use tracing::{debug, info};
 use wind_bridge::handler::{KeyAction, KeyEventData};
-use wind_config::ZKeyAction;
+use wind_config::BoundAction;
 use wind_ipc::protocol::{MOD_ALT, MOD_CTRL, MOD_SHIFT};
 use wind_keys::keymap;
 use wind_ui::manager::UiCommand;
@@ -204,34 +204,30 @@ impl Coordinator {
             });
         }
 
-        // z 键功能（方案级 `schema.codetable.z_key_action`）的三重身份裁决
-        // （对齐 Go judgeZFirstTrigger）：码表引擎 + 空缓冲 + 无修饰键 + 本方案配了 z 的功能。
-        // ① z_key_repeat 开且有上屏历史 → 不进模式（z 作 repeat，落普通输入由 update_candidates
-        //    注入重复候选）；② z 是活码前缀（码表/短语有以 z 开头的条目，如自定义 zhang）→ 不进
-        //    模式（作正常码字母）；③ 否则（死码 + 无 repeat，如标准五笔 z）→ 执行 z_key_action。
+        // 方案级按键功能表（方案文件 / schema_overrides 的 `[key_actions]`）。
         //
-        // 只认 z、且只在码表引擎：见 `ZKeyAction` 的「为什么是方案级、且只管 z」。混输刻意排除
-        // （避免 `zhang` 丢首字母，与 `try_z_fallback` 的门禁同源）。
+        // 位置：**英文模式分水岭之后**（那在 handle_key_event 里，早已 PassThrough 返回）。
+        // 有字符的键必须排在这里而不是热键路径，否则该字符在英文模式下永远打不出来。
+        // 详见 docs/design/schema-key-actions.md §4.1。
+        //
+        // 命中即执行并跳过下方全局引导键链；显式 `none` 则两边都不走（return None 落普通
+        // 输入）；未声明的键才落全局链——这是「未配置者行为逐字节不变」的保证。
         if state.input_buffer.is_empty()
             && data.modifiers & (MOD_CTRL | MOD_ALT | MOD_SHIFT) == 0
-            && data.key_code == keymap::VK_Z
-            && matches!(
-                self.engine_mgr.current_engine_type(),
-                Some(wind_engine::EngineType::CodeTable)
-            )
+            && let Some(action) = self.bound_action_for(data.key_code)
         {
-            let action = self.z_key_action();
-            // ①②的顺序：repeat 判据在前且更便宜，能省掉 has_code_prefix 的码表查询。
-            if action.is_enabled()
-                && self.z_key_repeat_text().is_none()
-                && !self.has_code_prefix("z")
-                && let Some(act) = self.enter_z_action(state, &action, data.key_code)
-            {
-                state.rewind = None; // 首键进入非夺取式，作废任何旧回退登记
-                return Some(act);
+            if !self.bound_action_key_yields(data.key_code, &action) {
+                if let Some(act) = self.enter_bound_action(state, &action, data.key_code) {
+                    state.rewind = None; // 首键进入非夺取式，作废任何旧回退登记
+                    return Some(act);
+                }
+                // 门卫没过（目标模式不可用）：不吞键，落普通输入。绝不能返回 Consumed——
+                // 配了个不可用的目标就等于把这个键废掉，且用户完全看不出原因。
+                return None;
             }
-            // ①/②/门卫未过：返回 None，z 落普通输入路径（buffer 变 "z"，repeat 注入 / 正常码
-            // 累积；后续按字母若 z… 破前缀，由 try_z_fallback 夺取——仅 temp_pinyin 支持夺取）。
+            // 让位（活码前缀 / z 的 repeat 身份）：该键作正常码，同样不落全局引导键链——
+            // 方案既然给这个键表了态，就不该再被全局 trigger_keys 抢走。
+            return None;
         }
 
         // 特殊模式 / 临时 mix：空缓冲 + 无候选 + 无修饰键 + 引导键匹配（优先级最低）。
@@ -266,8 +262,70 @@ impl Coordinator {
     ///
     /// 走 `codetable_settings()` 而非直接读全局配置：这是**方案级**配置，不同码表里 z 的
     /// 地位不同（五笔 86 是死码，别的码表未必），全局值只是没有方案覆盖时的回落基线。
-    pub(crate) fn z_key_action(&self) -> ZKeyAction {
-        ZKeyAction::parse(&self.engine_mgr.codetable_settings().z_key_action)
+    ///
+    /// 与 `[key_actions]` 表的关系见 [`Self::bound_action_for`]：表里显式写了 `z` 就以表为准。
+    pub(crate) fn z_key_action(&self) -> BoundAction {
+        BoundAction::parse(&self.engine_mgr.codetable_settings().z_key_action)
+    }
+
+    /// 这个键在当前方案里绑了什么动作；未绑定返回 `None`（落全局引导键链）。
+    ///
+    /// 两个来源，方案表优先：
+    /// 1. 方案文件 / `schema_overrides` 的 `[key_actions]`（任意键）
+    /// 2. `schema.codetable.z_key_action`（只管 z，早于本表存在的专用字段）
+    ///
+    /// 键名走 `key_name_to_vk_with_letters`——本表**接受字母**，与只认符号的全局
+    /// `trigger_keys` 相反：字母能否借作功能键取决于「这张码表里它是不是死码」，那正是
+    /// 方案级配置才能表达的判断（见 [`Self::bound_action_key_yields`]）。
+    pub(crate) fn bound_action_for(&self, key_code: u32) -> Option<BoundAction> {
+        for (name, action) in self.engine_mgr.active_key_actions() {
+            if keymap::key_name_to_vk_with_letters(&name) == Some(key_code) {
+                return Some(BoundAction::parse(&action));
+            }
+        }
+        // 表里没写 z 时，回落到专用字段（其自身已含全局→方案的折叠）。
+        if key_code == keymap::VK_Z {
+            let z = self.z_key_action();
+            if z.is_enabled() {
+                return Some(z);
+            }
+        }
+        None
+    }
+
+    /// 绑了动作的键是否**让位**给正常输入（此时既不进模式、也不落全局引导键链）。
+    ///
+    /// 两条判据，都只对**字母键**成立——符号键在码表里不产出编码，按下只可能是为了触发功能：
+    ///
+    /// - **活码前缀**：本方案的码表/短语里有以该字母开头的条目（如自定义 `zhang`）。不让位的话
+    ///   那个字母在这个方案里就彻底打不出编码了，且毫无提示。这条原是 z 专有的裁决
+    ///   （对齐 Go `judgeZFirstTrigger`），随 `[key_actions]` 泛化到任意字母。
+    /// - **z 的 repeat 身份**：`z_key_repeat` 开且有上屏历史时 z 归重复输入。这条**仍是 z 专有**
+    ///   ——repeat 功能本身就绑死在 z 上，不是通用概念。
+    ///
+    /// 字母键额外限定码表引擎：拼音/混输里字母全是有效输入，借作功能键会丢首字母
+    /// （与 `try_z_fallback` 的门禁同源）。符号键不限引擎——拼音方案里用 `\` 进快符同样合理。
+    fn bound_action_key_yields(&self, key_code: u32, action: &BoundAction) -> bool {
+        if !action.is_enabled() {
+            return true; // 显式 none：本就不执行
+        }
+        let Some(ch) = keymap::vk_to_prefix_char_with_letters(key_code) else {
+            return false;
+        };
+        if !ch.is_ascii_alphabetic() {
+            return false; // 符号键：不让位，也不限引擎
+        }
+        if !matches!(
+            self.engine_mgr.current_engine_type(),
+            Some(wind_engine::EngineType::CodeTable)
+        ) {
+            return true;
+        }
+        // repeat 判据在前且更便宜，能省掉 has_code_prefix 的码表查询。
+        if key_code == keymap::VK_Z && self.z_key_repeat_text().is_some() {
+            return true;
+        }
+        self.has_code_prefix(&ch.to_ascii_lowercase().to_string())
     }
 
     /// 执行 z 键功能：按 `action` 进对应模式（空缓冲进入语义，组合区前缀显示 `z`）。
@@ -276,15 +334,15 @@ impl Coordinator {
     /// `temp_pinyin_target`、mix 的成员非空、特殊模式的 `ensure_schema`）。门卫没过返回
     /// `None`，调用方让 z 落普通输入作正常码——绝不能吞键，否则配了个不可用的目标就等于
     /// 把 z 这个编码键废掉，且用户完全看不出原因。
-    pub(crate) fn enter_z_action(
+    pub(crate) fn enter_bound_action(
         &self,
         state: &mut State,
-        action: &ZKeyAction,
+        action: &BoundAction,
         key_code: u32,
     ) -> Option<KeyAction> {
         match action {
-            ZKeyAction::None => None,
-            ZKeyAction::TempPinyin => {
+            BoundAction::None => None,
+            BoundAction::TempPinyin => {
                 let target = self.engine_mgr.temp_pinyin_target()?;
                 state.active = Some(ModeKind::TempPinyin);
                 state.temp_pinyin_schema = target;
@@ -293,13 +351,13 @@ impl Coordinator {
                 self.update_temp_pinyin_candidates(state);
                 let display = state.preedit.clone();
                 self.notify_ui_update(state);
-                debug!("z_key_action: entered temp pinyin");
+                debug!("key_action: entered temp pinyin");
                 Some(KeyAction::UpdateComposition {
                     text: display.clone(),
                     caret_pos: display.chars().count() as u32,
                 })
             }
-            ZKeyAction::TempEnglish => {
+            BoundAction::TempEnglish => {
                 if !self.rt().config.input.temp_english.enabled {
                     return None;
                 }
@@ -312,28 +370,28 @@ impl Coordinator {
                 self.update_temp_english_candidates(state);
                 let display = state.preedit.clone();
                 self.notify_ui_update(state);
-                debug!("z_key_action: entered temp English");
+                debug!("key_action: entered temp English");
                 Some(KeyAction::UpdateComposition {
                     text: display.clone(),
                     caret_pos: display.chars().count() as u32,
                 })
             }
-            ZKeyAction::Mix(id) => {
+            BoundAction::Mix(id) => {
                 let idx = self.mix_mode_idx(id)?;
                 // 与引导键进入点同一门卫：含 quick_input 或至少一个可加载成员方案。
                 if !self.mix_has_quick_input(idx) && self.mix_members(idx).is_empty() {
                     return None;
                 }
-                debug!("z_key_action: entering mix idx={}", idx);
+                debug!("key_action: entering mix idx={}", idx);
                 Some(self.enter_mix_mode(state, idx, key_code))
             }
-            ZKeyAction::Special(id) => {
+            BoundAction::Special(id) => {
                 let idx = self.special_mode_idx(id)?;
                 let schema = self.special_schema(idx)?;
                 if !self.engine_mgr.ensure_schema(&schema) {
                     return None;
                 }
-                debug!("z_key_action: entering special idx={}", idx);
+                debug!("key_action: entering special idx={}", idx);
                 Some(self.enter_special_mode(state, idx, key_code))
             }
         }

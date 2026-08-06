@@ -1680,6 +1680,20 @@ impl EngineManager {
     /// 活跃方案的**有效**码表行为配置：全局 `schema.codetable` 经该方案 `.schema.toml` 的
     /// `[engine.codetable]`（内联 + `schema_overrides` 合并后）行为字段折叠。供 coordinator 读
     /// punct_commit / z_key_repeat 等行为字段（取代旧的直接读 schema 字段）。
+    /// 当前方案的**按键功能表**（`[key_actions]`，方案文件内联 + `schema_overrides` 已合并）。
+    ///
+    /// 与 [`Self::codetable_settings`] 不同，**混输方案不下钻到 primary_schema**：按键功能是
+    /// 「用户在这个方案里按这个键想干什么」，属于方案自身的交互属性，不像码表行为那样是
+    /// 「这张码表怎么工作」。混输方案想配就在自己的文件里配。
+    ///
+    /// 读不到方案（文件缺失/解析失败）时返回空表 = 不覆盖任何键，各键照常走全局链。
+    pub fn active_key_actions(&self) -> std::collections::BTreeMap<String, String> {
+        let id = self.active_schema_id();
+        Self::read_schema(&id, self.data_dir.as_deref(), self.override_dir.as_deref())
+            .map(|s| s.key_actions)
+            .unwrap_or_default()
+    }
+
     pub fn codetable_settings(&self) -> wind_config::CodetableGlobal {
         let id = self.active_schema_id();
         let global = self
@@ -3751,6 +3765,93 @@ mod tests {
             toml::from_str("[[dictionaries]]\nid = \"ext1\"\nenabled = true\n").unwrap();
         merge_toml(&mut base, over);
         assert!(base.get("dictionaries").is_none());
+    }
+
+    /// 方案级 `[key_actions]`：方案文件内联 + override **逐键合并**，不是整段替换。
+    ///
+    /// 这是 `docs/design/schema-key-actions.md` §3 覆盖语义的端到端确认——上游
+    /// `merge_toml_merges_tables_with_arbitrary_key_sets` 只证明了 toml 层的合并行为，
+    /// 这里证明它真的贯通到 `active_key_actions()` 的返回值。
+    #[test]
+    fn active_key_actions_merges_schema_file_and_override_per_key() {
+        use std::io::Write;
+        let base_dir = std::env::temp_dir().join("wind_eng_ka_data");
+        let schemas = base_dir.join("schemas");
+        std::fs::create_dir_all(&schemas).unwrap();
+        let mut f = std::fs::File::create(schemas.join("ka.schema.toml")).unwrap();
+        // 方案作者内联：`\` 进快符，z 进临拼。
+        write!(
+            f,
+            "[schema]\nid = \"ka\"\n[engine]\ntype = \"codetable\"\n\
+             [key_actions]\nbackslash = \"special:fuhao\"\nz = \"temp_pinyin\"\n"
+        )
+        .unwrap();
+        drop(f);
+
+        let ov_dir = std::env::temp_dir().join("wind_eng_ka_overrides");
+        let _ = std::fs::remove_dir_all(&ov_dir);
+
+        let mut cfg = Config::default();
+        cfg.schema.active = "ka".to_string();
+        cfg.schema.available = vec!["ka".to_string()];
+        let mgr =
+            EngineManager::with_store_override(&cfg, Some(&base_dir), None, Some(ov_dir.clone()));
+
+        let inline = mgr.active_key_actions();
+        assert_eq!(
+            inline.get("backslash").map(String::as_str),
+            Some("special:fuhao")
+        );
+        assert_eq!(inline.get("z").map(String::as_str), Some("temp_pinyin"));
+
+        // 用户 override：改 z 的去向、给 grave 加禁用、不提 backslash。
+        let ov: toml::Value =
+            toml::from_str("[key_actions]\nz = \"temp_english\"\ngrave = \"none\"\n").unwrap();
+        mgr.write_schema_override("ka", &ov).unwrap();
+
+        let merged = mgr.active_key_actions();
+        assert_eq!(
+            merged.get("backslash").map(String::as_str),
+            Some("special:fuhao"),
+            "override 未提及的键必须保留——整段替换会让它消失"
+        );
+        assert_eq!(
+            merged.get("z").map(String::as_str),
+            Some("temp_english"),
+            "同名键被 override 覆盖"
+        );
+        assert_eq!(
+            merged.get("grave").map(String::as_str),
+            Some("none"),
+            "override 新增的禁用项加入"
+        );
+
+        let _ = std::fs::remove_dir_all(&base_dir);
+        let _ = std::fs::remove_dir_all(&ov_dir);
+    }
+
+    /// 方案没写 `[key_actions]` 时返回空表——各键照常走全局引导键链。
+    #[test]
+    fn active_key_actions_empty_when_schema_declares_none() {
+        use std::io::Write;
+        let base_dir = std::env::temp_dir().join("wind_eng_ka_none_data");
+        let schemas = base_dir.join("schemas");
+        std::fs::create_dir_all(&schemas).unwrap();
+        let mut f = std::fs::File::create(schemas.join("kan.schema.toml")).unwrap();
+        write!(
+            f,
+            "[schema]\nid = \"kan\"\n[engine]\ntype = \"codetable\"\n"
+        )
+        .unwrap();
+        drop(f);
+
+        let mut cfg = Config::default();
+        cfg.schema.active = "kan".to_string();
+        cfg.schema.available = vec!["kan".to_string()];
+        let mgr = EngineManager::with_store_override(&cfg, Some(&base_dir), None, None);
+        assert!(mgr.active_key_actions().is_empty());
+
+        let _ = std::fs::remove_dir_all(&base_dir);
     }
 
     #[test]

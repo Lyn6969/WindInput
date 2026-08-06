@@ -214,8 +214,23 @@ handle_select_key_up（二三候选键，有候选时赢）
 
 | 旧 | 新 | 时机 |
 |---|---|---|
-| `schema.codetable.z_key_action` | `key_actions["z"]` | 一期，加载期 `migrate_*`，与 `migrate_letter_trigger_keys` 同处 |
-| 五处 `trigger_keys` | `keys.key_actions` | 三期 |
+| `schema.codetable.z_key_action` | **不迁移，改为回落**（见下） | 二期 |
+| 五处 `trigger_keys` | `keys.key_actions` | 五期 |
+
+### `z_key_action` 为什么不迁移而是回落
+
+原计划把它 `migrate_*` 成 `key_actions["z"]`，实施时发现**迁不过去**：`z_key_action` 是
+**全局配置**（`config.toml` 的 `schema.codetable`，方案经 `CodeTableSpec` 覆盖），而
+`[key_actions]` 在**方案文件**里。全局值不知道该写给哪个方案——用户装了五个码表方案，
+迁移代码没有依据挑其中一个。
+
+改为查表时**两个来源、方案表优先**（`Coordinator::bound_action_for`）：
+
+1. 方案的 `[key_actions]` 里显式写了 `z` → 以它为准（含显式 `"none"` 禁用）
+2. 没写 → 回落 `schema.codetable.z_key_action`（其自身已含全局→方案的折叠）
+
+存量配置因此零改动继续生效，而新写法可以逐方案覆盖它。代价是 z 在两处可配，靠文档与
+设置页说明消化——比起为迁移瞎猜一个目标方案，这个代价更小。
 
 `ZKeyAction` 类型改名 `KeyAction`（值域扩充，解析逻辑不变）。注意与 `wind-coordinator`
 既有的 `KeyAction`（按键返回值）**重名**——建议叫 `KeyBinding` 或 `BoundAction`，命名在
@@ -226,7 +241,7 @@ handle_select_key_up（二三候选键，有候选时赢）
 | 期 | 内容 | 风险 |
 |---|---|---|
 | ~~一~~ ✅ | `toggle_schema:<id>` 动词 + `keys.key_actions` 全局表 | 已完成 |
-| 二 | 方案级 `key_actions` 表（B/D 类 + 有字符键）+ `z_key_action` 迁移 + 字母裁决泛化 | 中，未配置者行为不变 |
+| ~~二~~ ✅ | 方案级 `[key_actions]` 表（B/D 类 + 有字符键）+ 字母裁决泛化 | 已完成 |
 | 三 | 设置页动态列表编辑器（见 §9.3） | 中，新控件 |
 | 四 | 无字符键（修饰键 keyup 通路）+ C 类进方案级表 | 中高，触碰 `is_toggle_mode_keycode` |
 | 五 | 全局层收编 + 冲突检测 + **A 类补全** | 高，改既有行为 |
@@ -244,6 +259,21 @@ A 类反过来排到最后——它是功能完整性，不是任何人的诉求
   功能坏了。
 - 无字符键（`rshift` 那类）仍不可用——它要走 keyup 轻敲通路，是四期的事。一期能配的是
   组合键，如 `"ctrl+shift+n" = "toggle_schema:english"`。
+
+二期落地情况（方案级 `[key_actions]`）：
+
+- 字母的「活码前缀」裁决按计划从 z 泛化到**任意绑了动作的字母键**
+  （`bound_action_key_yields`）。没有这条，用户在某方案把 `u` 绑成功能键后，`u` 开头的编码
+  在该方案里就彻底打不出来且毫无提示。`z_key_repeat` 那条**仍是 z 专有**——repeat 功能
+  本身绑死在 z 上，不是通用概念。
+- 字母键沿用「仅码表引擎」的限制（拼音/混输里字母全是有效输入，借作功能键会丢首字母）；
+  **符号键不限引擎**——拼音方案里用 `\` 进快符同样合理，这是二期新增的能力。
+- ⚠️ **测试缺口**：方案级表的读取与逐键合并有 wind-engine 单测覆盖
+  （`active_key_actions_*`），分派逻辑由既有 z 用例覆盖（两者共用 `enter_bound_action`），
+  但「符号键经方案表进特殊模式」这条端到端路径**没有集成测试**——
+  `Coordinator::new_headless` 不接受 override 目录，其 `EngineManager` 用的是真实用户目录
+  的 `schema_overrides`，测试写那里会污染用户配置。三期做设置页时会有真实配置可测，
+  届时补上。
 
 ## 8. 测试要求
 

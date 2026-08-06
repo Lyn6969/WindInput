@@ -532,7 +532,7 @@ fn test_z_key_action_enters_special() {
 /// `z_key_action` 指向不存在的目标：**不得吞键**，z 落普通输入作正常码。
 ///
 /// 吞键的后果是把 z 这个编码键废掉，且用户从现象上完全看不出原因——配错一个 id
-/// 就再也打不出 z 开头的编码。门卫没过一律返回 None，见 `enter_z_action`。
+/// 就再也打不出 z 开头的编码。门卫没过一律返回 None，见 `enter_bound_action`。
 #[test]
 fn test_z_key_action_unknown_target_falls_through() {
     if !has_schemas() {
