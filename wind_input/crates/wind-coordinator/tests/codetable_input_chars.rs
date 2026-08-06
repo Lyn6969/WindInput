@@ -67,6 +67,8 @@ fn press_vk(coord: &Coordinator, vk: u32) -> KeyAction {
 
 /// `/` 键的虚拟键码（VK_OEM_2）。
 const VK_SLASH: u32 = 0xBF;
+/// `;` 键的虚拟键码（VK_OEM_1）。
+const VK_SEMICOLON: u32 = 0xBA;
 
 /// 上屏动作的文本；非上屏动作返回 `None`。
 fn committed(action: &KeyAction) -> Option<&str> {
@@ -280,6 +282,25 @@ fn symbol_enters_buffer_when_composing() {
     );
 }
 
+/// `;` 是出厂次选键，但**组码中码元优先**——闸门排在 `decideBufferedTrigger` 那条
+/// 次选/三选链之前。这条锁住「符号被别的功能占用时，组码中仍归码表」。
+#[test]
+fn semicolon_beats_select_key_when_composing() {
+    let d = data_dir();
+    if !dict_ready(&d) {
+        eprintln!("跳过：五笔词库不存在");
+        return;
+    }
+    let coord = Coordinator::new_headless(wubi_config("a-z;", "a-z"), Some(&d));
+
+    press(&coord, "a");
+    let act = press_vk(&coord, VK_SEMICOLON);
+    assert!(
+        composing(&act).is_some_and(|t| t.contains("a;")),
+        "组码中的 ; 应作码元进缓冲，而非选第 2 个候选，实际: {act:?}"
+    );
+}
+
 /// ★ **反向对照**：默认字符集下同一个 `/` 走标点流水线上屏，不进缓冲。
 #[test]
 fn default_charset_sends_symbol_to_punctuation() {
@@ -295,6 +316,134 @@ fn default_charset_sends_symbol_to_punctuation() {
     assert!(
         composing(&act).is_none_or(|t| !t.contains("a/")),
         "默认字符集下 / 不该进缓冲（否则主用例是假绿），实际: {act:?}"
+    );
+}
+
+// ────────── 首码集仲裁：码元 vs 模式引导键（现场：`;` 与快捷输入）──────────
+
+/// 复现用户现场：`;` 既是 `quick_mix` 的引导键，又被方案写进 `input_chars`。
+fn wubi_config_with_semicolon_mix(input_chars: &str, leading_chars: &str) -> Config {
+    let mut cfg = wubi_config(input_chars, leading_chars);
+    cfg.schema.mix_modes = vec![wind_config::config::MixModeConfig {
+        id: "quick_mix".into(),
+        name: "快捷".into(),
+        trigger_keys: vec!["semicolon".into()],
+        members: vec!["quick_input.calc".into()],
+        ..Default::default()
+    }];
+    cfg
+}
+
+/// ★ 首码集**不含** `;` ⇒ 空缓冲归模式，快捷输入照常进得去。
+///
+/// 这是「两者共存」的配法：`;` 只在组码中作码元。
+#[test]
+fn mode_trigger_wins_when_symbol_is_not_leading() {
+    let d = data_dir();
+    if !dict_ready(&d) {
+        eprintln!("跳过：五笔词库不存在");
+        return;
+    }
+    let coord = Coordinator::new_headless(wubi_config_with_semicolon_mix("a-z;", "a-z"), Some(&d));
+
+    press_vk(&coord, VK_SEMICOLON);
+    assert_eq!(
+        coord.debug_active_mode(),
+        Some("mix"),
+        "; 不在首码集时，空缓冲应照常进快捷输入"
+    );
+}
+
+/// ★ 首码集**含** `;` ⇒ 空缓冲归码表，引导键让位。
+#[test]
+fn code_char_wins_when_symbol_is_leading() {
+    let d = data_dir();
+    if !dict_ready(&d) {
+        eprintln!("跳过：五笔词库不存在");
+        return;
+    }
+    // leading_chars 留空 = 首码集等于全集，`;` 可作首码——正是用户当前的配法。
+    let coord = Coordinator::new_headless(wubi_config_with_semicolon_mix("a-z;", ""), Some(&d));
+
+    let act = press_vk(&coord, VK_SEMICOLON);
+    assert_eq!(
+        coord.debug_active_mode(),
+        None,
+        "; 在首码集时不应再进快捷输入，实际: {act:?}"
+    );
+    assert!(
+        composing(&act).is_some_and(|t| t.contains(';')),
+        "; 应作首码进缓冲，实际: {act:?}"
+    );
+}
+
+/// 组码中不受首码集影响：`;` 一律作码元（模式激活只在空缓冲，够不着）。
+#[test]
+fn composing_always_takes_symbol_regardless_of_leading() {
+    let d = data_dir();
+    if !dict_ready(&d) {
+        eprintln!("跳过：五笔词库不存在");
+        return;
+    }
+    let coord = Coordinator::new_headless(wubi_config_with_semicolon_mix("a-z;", "a-z"), Some(&d));
+
+    press(&coord, "a");
+    let act = press_vk(&coord, VK_SEMICOLON);
+    assert_eq!(coord.debug_active_mode(), None, "组码中不该进模式");
+    assert!(
+        composing(&act).is_some_and(|t| t.contains("a;")),
+        "组码中的 ; 应作码元，实际: {act:?}"
+    );
+}
+
+/// 冲突体检要报出 mix 引导键——用户此前配 `;` 时一句告警都没有，只能靠试。
+#[test]
+fn mix_trigger_conflict_is_reported_when_leading() {
+    let d = data_dir();
+    if !dict_ready(&d) {
+        eprintln!("跳过：五笔词库不存在");
+        return;
+    }
+    let coord = Coordinator::new_headless(wubi_config_with_semicolon_mix("a-z;", ""), Some(&d));
+    let conflicts = coord.code_char_conflicts();
+
+    let (_, owners) = conflicts
+        .iter()
+        .find(|(c, _)| *c == ';')
+        .unwrap_or_else(|| panic!("; 应报冲突，实际: {conflicts:?}"));
+    assert!(
+        owners.contains(&"快捷输入/混输引导键"),
+        "应报出 mix 引导键被夺走，实际: {owners:?}"
+    );
+}
+
+/// ★ **反向对照**：`;` 不作首码时，mix 引导键**不该**被报为冲突。
+///
+/// 此时模式只在空缓冲用、码元只在组码中用，井水不犯河水。报出来只会变成噪音，
+/// 把真冲突淹掉——这正是告警最容易退化的方式。
+#[test]
+fn mix_trigger_not_reported_when_symbol_is_not_leading() {
+    let d = data_dir();
+    if !dict_ready(&d) {
+        eprintln!("跳过：五笔词库不存在");
+        return;
+    }
+    let coord = Coordinator::new_headless(wubi_config_with_semicolon_mix("a-z;", "a-z"), Some(&d));
+    let conflicts = coord.code_char_conflicts();
+
+    let owners = conflicts
+        .iter()
+        .find(|(c, _)| *c == ';')
+        .map(|(_, o)| o.clone())
+        .unwrap_or_default();
+    assert!(
+        !owners.contains(&"快捷输入/混输引导键"),
+        "; 不作首码时不该报 mix 冲突（模式仍可用），实际: {owners:?}"
+    );
+    // 次选键属于「组码中类」占用，仍应如实报出。
+    assert!(
+        owners.contains(&"次选键"),
+        "组码中类占用（次选键）仍应报出，实际: {owners:?}"
     );
 }
 

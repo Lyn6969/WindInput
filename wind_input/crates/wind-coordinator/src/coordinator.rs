@@ -2443,6 +2443,18 @@ impl Coordinator {
     }
 
     /// 是否还有更多候选未加载（测试/诊断用）
+    /// 当前激活的 overlay 模式类别名；`None` = 普通输入。仅供测试断言。
+    pub fn debug_active_mode(&self) -> Option<&'static str> {
+        match self.state.lock().unwrap_or_else(|e| e.into_inner()).active {
+            Some(ModeKind::TempPinyin) => Some("temp_pinyin"),
+            Some(ModeKind::TempEnglish) => Some("temp_english"),
+            Some(ModeKind::Url) => Some("url"),
+            Some(ModeKind::Special(_)) => Some("special"),
+            Some(ModeKind::Mix(_)) => Some("mix"),
+            None => None,
+        }
+    }
+
     pub fn debug_has_more(&self) -> bool {
         self.state
             .lock()
@@ -2922,6 +2934,9 @@ impl Coordinator {
                 continue;
             };
             let mut owners: Vec<&'static str> = Vec::new();
+
+            // ── 组码中类占用：码元在组码中恒优先，故恒冲突 ──
+            //
             // 数字选词是硬编码的 VK_1..=VK_9 / VK_0 臂，不经任何配置，故单独判。
             // 数字配成码元即等于放弃组码期间的数字选词（一刀切让位，见设计文档 §3.3）。
             if ch.is_ascii_digit() {
@@ -2936,14 +2951,26 @@ impl Coordinator {
             if self.select_char_index(vk).is_some() {
                 owners.push("以词定字键");
             }
-            if self.match_special_trigger(vk).is_some() {
-                owners.push("特殊模式引导键");
-            }
-            if self.is_temp_pinyin_trigger(vk) {
-                owners.push("临时拼音触发键");
-            }
-            if self.is_temp_english_trigger(vk) {
-                owners.push("临时英文触发键");
+
+            // ── 空缓冲类占用：模式引导键 ──
+            //
+            // ★ 只在该字符**可作首码**时才是真冲突。首码仲裁
+            // （`code_char_takes_lead`）此时让引导键让位给码表 ⇒ 该模式再也进不去。
+            // 不能作首码时两者井水不犯河水——模式只在空缓冲用、码元只在组码中用，
+            // 报出来只会变成噪音，把真冲突淹掉。
+            if charset.contains_leading(ch) {
+                if self.match_special_trigger(vk).is_some() {
+                    owners.push("特殊模式引导键");
+                }
+                if self.match_mix_trigger(vk).is_some() {
+                    owners.push("快捷输入/混输引导键");
+                }
+                if self.is_temp_pinyin_trigger(vk) {
+                    owners.push("临时拼音触发键");
+                }
+                if self.is_temp_english_trigger(vk) {
+                    owners.push("临时英文触发键");
+                }
             }
             if !owners.is_empty() {
                 out.push((ch, owners));
@@ -2954,12 +2981,25 @@ impl Coordinator {
 
     /// 启动时把 [`Self::code_char_conflicts`] 的结果写进日志。只告警，不改行为。
     pub(crate) fn warn_code_char_conflicts(&self) {
+        let charset = self.engine_mgr.active_input_chars();
         for (ch, owners) in self.code_char_conflicts() {
-            warn!(
-                "码元集含 {:?}，但该键同时配作 {}；组码中它归码表，这些功能在组码期间失效（空缓冲时不受影响）",
-                ch,
-                owners.join(" / ")
-            );
+            // 后果按「能否作首码」分档：首码意味着连空缓冲都归码表，被占用的模式引导键
+            // 会彻底进不去；仅后续码则只影响组码期间。文案里直接给出化解办法，
+            // 否则用户看到告警也不知道下一步该改哪。
+            if charset.contains_leading(ch) {
+                warn!(
+                    "码元集含 {:?} 且允许其作首码，但该键原配作 {}；空缓冲时它将归码表，这些功能再也进不去。\
+                     要两者共存：把它排除出 leading_chars（它便只在组码中作码元）",
+                    ch,
+                    owners.join(" / ")
+                );
+            } else {
+                warn!(
+                    "码元集含 {:?}（仅作后续码），该键同时配作 {}；组码中它归码表，这些功能在组码期间失效，空缓冲时不受影响",
+                    ch,
+                    owners.join(" / ")
+                );
+            }
         }
     }
 

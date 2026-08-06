@@ -62,6 +62,33 @@ impl Coordinator {
             || self.match_mix_trigger(key_code).is_some()
     }
 
+    /// 该键在空缓冲时是否已被方案声明为**首码** —— 是则符号类模式引导键让位给码表。
+    ///
+    /// 冲突现场：`;` 既是 `quick_mix` 的引导键，又被某方案写进了 `input_chars`。模式激活
+    /// 排在码元闸门之前且守卫同为「空缓冲」，于是引导键恒赢、方案里配的码元只在组码中生效
+    /// （`abc;` 可用而 `;abc` 不可用），且毫无提示。
+    ///
+    /// 仲裁交给**首码集**：写进 `leading_chars`（未显式配置时等于 `input_chars`）即表示
+    /// 「这个字符可以起头」，那它在空缓冲时就该归码表。想两者共存，把该符号排除出
+    /// `leading_chars` 即可——它便只在组码中作码元，空缓冲仍进模式。
+    ///
+    /// ★ **只管非字母**。字母默认全在首码集里，一并让位会直接废掉两个既有功能：
+    /// Shift+字母进临时英文、以及 `z_key_action` 的三重身份裁决（后者本就自带
+    /// `has_code_prefix("z")` 判据处理码元冲突，不需要也不能被本函数接管）。
+    pub(crate) fn code_char_takes_lead(&self, data: &KeyEventData) -> bool {
+        if data.modifiers & (MOD_CTRL | MOD_ALT | MOD_SHIFT) != 0 {
+            return false;
+        }
+        let Some(ch) = punct_char(data.key_code, false) else {
+            return false;
+        };
+        if ch.is_ascii_alphabetic() {
+            return false;
+        }
+        self.engine_mgr
+            .active_is_leading_char(ch.to_ascii_lowercase())
+    }
+
     /// 空缓冲模式激活的单一入口（对齐 key-pipeline.md §2.1 优先级链）。
     /// 优先级：临时英文(Shift+字母) > 快捷输入 > 临时拼音 > 特殊模式。命中返回激活 KeyAction，
     /// 都不命中返回 None（落普通输入）。URL 前缀夺取是「缓冲扩展夺取」语义，不在此链，单独处理。
@@ -130,6 +157,7 @@ impl Coordinator {
             && self.rt().config.input.temp_english.enabled
             && data.modifiers & (MOD_CTRL | MOD_ALT | MOD_SHIFT) == 0
             && self.is_temp_english_trigger(data.key_code)
+            && !self.code_char_takes_lead(data)
         {
             let prefix = wind_keys::keymap::vk_to_prefix_char_with_letters(data.key_code)
                 .map(|c| c.to_string())
@@ -156,6 +184,7 @@ impl Coordinator {
         if state.input_buffer.is_empty()
             && data.modifiers & (MOD_CTRL | MOD_ALT | MOD_SHIFT) == 0
             && self.is_temp_pinyin_trigger(data.key_code)
+            && !self.code_char_takes_lead(data)
             && let Some(target) = self.engine_mgr.temp_pinyin_target()
         {
             state.active = Some(ModeKind::TempPinyin);
@@ -205,11 +234,14 @@ impl Coordinator {
             // 累积；后续按字母若 z… 破前缀，由 try_z_fallback 夺取——仅 temp_pinyin 支持夺取）。
         }
 
-        // 特殊模式：空缓冲 + 无候选 + 无修饰键 + 引导键匹配（优先级最低）。
+        // 特殊模式 / 临时 mix：空缓冲 + 无候选 + 无修饰键 + 引导键匹配（优先级最低）。
         // 码表不可用时不拦截该键，返回 None 继续普通流程。
+        //
+        // `code_char_takes_lead`：该符号已被方案声明为首码 ⇒ 让位给码表（见其文档）。
         if state.input_buffer.is_empty()
             && state.candidates.is_empty()
             && data.modifiers & (MOD_CTRL | MOD_ALT | MOD_SHIFT) == 0
+            && !self.code_char_takes_lead(data)
         {
             if let Some(idx) = self.match_special_trigger(data.key_code) {
                 // 方案可加载才进入（否则不拦截该键，落普通流程）。
