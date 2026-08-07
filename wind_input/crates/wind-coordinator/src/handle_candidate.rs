@@ -374,6 +374,18 @@ impl Coordinator {
         // （docs/design/freq-rerank-model.md）。
         if self.engine_mgr.is_pinyin() {
             let profile = self.engine_mgr.pinyin_freq_profile();
+            // **未消费整串的整句摘掉顶部锚定**，判据与上面收词频记录时的 `consumes_all` 同源
+            // （`consumed_length == 0` = 引擎未标注、按整串算，不在此列）。
+            //
+            // 锚定是硬闸门，而本次调用是最后一道整体排序：`buzhidaok` 下 step 2 的整句
+            // 「不知道」只消费 8/9 键，它若锚定，一有任何词频记录就会把协调器按消费长度
+            // 排在首位的「不知道看」(9/9) 挤到第二 —— **P0 的 by_consumed 被整个推翻**。
+            // 这条在残码整句出现之前就存在，只是那时没有消费更多的候选来暴露它。
+            for c in candidates.iter_mut() {
+                if c.is_sentence && c.consumed_length != 0 && c.consumed_length < input_len {
+                    c.is_sentence_unanchored = true;
+                }
+            }
             // 位置提升模型（docs/design/freq-rerank-model.md）：候选按**位次**前移，
             // 不比权重，故无需引擎的量纲基准——位次天然与词库分布、混输降档都无关。
             //

@@ -1365,6 +1365,10 @@ impl Engine for PinyinEngine {
                         existing.weight = existing.weight.max(weight);
                         existing.is_partial = false;
                         existing.is_sentence = true;
+                        // ⚠️ 合并分支同样要标：它现在**就是**残码整句，锚定豁免必须跟着走。
+                        // 漏标不会编译报错，只会让 `nihaom` 这类「整句恰好等于词库词」的
+                        // 输入重新对词频免疫——正是本字段要修的那个 bug 的一半。
+                        existing.is_sentence_unanchored = true;
                     } else {
                         candidates.insert(
                             0,
@@ -1377,6 +1381,19 @@ impl Engine for PinyinEngine {
                                 natural_order: 0,
                                 source: CandidateSource::Pinyin,
                                 is_sentence: true,
+                                // 摘掉 freq_rerank 的顶部锚定：本路径猜了一个用户还没输入的
+                                // 音节，不该对词频免疫。见该字段文档。
+                                //
+                                // ⚠️ **看起来冗余，实际不可省**：step 6.6 目前碰巧也会给残码
+                                // 整句标上 `is_sentence_contested`（同样摘锚定），于是删掉本行
+                                // 不会有任何测试变红。但那是**判据的副作用**——6.6 找的是
+                                // `o.code == completed` 的竞争者，而残码整句自己的 code 含残码
+                                // （`zhonghuar` vs 竞争者「中华」的 `zhonghua`），**两者其实
+                                // 不同码**。谁把 6.6 修正成真正的「同码竞争者」，这里就会静默
+                                // 恢复锚定、词频再次失效。故按意图显式置位，并由
+                                // `pinyin_completion::partial_sentence_is_marked_unanchored`
+                                // 直接断言标记本身（而非排序效果）。
+                                is_sentence_unanchored: true,
                                 boundary: result.boundary,
                                 ..Default::default()
                             },

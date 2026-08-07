@@ -317,10 +317,19 @@ pub fn rerank_pinyin_positional(
         profile,
         promote_prefix,
         // 整句 / 精确码短语锚定顶部，不参与位置提升。
-        // `is_sentence_demoted` / `is_sentence_contested` 不在此列——后者正是为了让同码
-        // 竞争者能靠位置提升反超它（`siyuan` 寺院/思源）。
+        //
+        // 三个例外都是为了让别的候选能靠位置提升反超它：
+        // - `is_sentence_demoted`：已让位于精确整词；
+        // - `is_sentence_contested`：有同码竞争者（`siyuan` 寺院/思源）；
+        // - `is_sentence_unanchored`：残码补全整句，或**未消费整串**的整句。后者尤其要紧——
+        //   锚定是硬闸门且本函数是最后一道整体排序，`buzhidaok` 下只消费 8/9 键的「不知道」
+        //   若锚定，一有词频记录就会把协调器按消费长度排在首位的「不知道看」挤到第二，
+        //   **P0 的 by_consumed 被整个推翻**。置位点见该字段文档。
         |c| {
-            (c.is_sentence && !c.is_sentence_demoted && !c.is_sentence_contested)
+            (c.is_sentence
+                && !c.is_sentence_demoted
+                && !c.is_sentence_contested
+                && !c.is_sentence_unanchored)
                 || (c.is_phrase && c.is_exact_code)
         },
         // 匹配层级：简拼 / 前缀补全 / 子短语。词频不得跨层提拔。

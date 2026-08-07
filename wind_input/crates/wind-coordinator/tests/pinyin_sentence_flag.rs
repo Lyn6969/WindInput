@@ -101,3 +101,106 @@ fn test_sentence_flags_survive_to_freq_rerank() {
 
     let _ = std::fs::remove_file(&store_path);
 }
+
+/// 有词频记录时，**未消费整串的整句**不得靠锚定推翻按消费长度排好的序。
+///
+/// `buzhidaok`：step 2 整句「不知道」只消费 8/9 键（残码 `k` 没进去），step 2c 的残码整句
+/// 「不知道看」消费满 9/9。协调器把后者排在首位（P0 的 `by_consumed`），但 `freq_rerank`
+/// 是**最后一道整体排序**且锚定是**硬闸门** —— 只要存在任何一条词频记录（哪怕与这两个词
+/// 都无关）重排就会触发，「不知道」若保持锚定就会把「不知道看」挤到第二。
+///
+/// ⚠️ 这条**与 step 2c 无关地早已存在**，只是在残码整句出现之前没有「消费更多的候选」
+/// 来暴露它。判据 `is_sentence_unanchored` 由协调器按 `consumes_all` 置位。
+#[test]
+fn test_partial_consumption_sentence_does_not_anchor_over_full() {
+    let d = data_dir();
+    if !d.join("schemas/pinyin/cn_dicts/base.dict.yaml").exists() {
+        eprintln!("跳过：拼音词库不存在");
+        return;
+    }
+    let store_path = std::env::temp_dir().join("wind_partial_anchor_test.redb");
+    let _ = std::fs::remove_file(&store_path);
+    let store = std::sync::Arc::new(wind_store::Store::open(&store_path).unwrap());
+    // ⚠️ 必须给**本次候选里真实存在**的词记账，否则 freq_rerank 压根不会跑，本用例假绿。
+    // `recs` 只收「候选自身 freq_code 查到的」记录（见 `apply_freq_rerank_in` 的 probe 收集），
+    // 无关记录进不了 recs，`recs.is_empty()` 便直接 return —— 初版正是写了条无关记录，
+    // 回退被测代码后测试照样绿。
+    //
+    // 选「不知道看什么」：它 w=32 未过 `COMPLETION_FAR_WEIGHT_FLOOR`(100) 故未上浮
+    // （`is_promoted_completion=false`），于是被默认的 `promote_prefix=single` 挡在提升之外
+    // （power=0），**只触发重排、不参与排序竞争**，恰好不干扰本用例要测的那组对比。
+    for _ in 0..3 {
+        store
+            .record_freq("pinyin", "buzhidaokanshenme", "不知道看什么")
+            .unwrap();
+    }
+
+    let mut cfg = Config::default();
+    cfg.schema.available = vec!["pinyin".into()];
+    cfg.schema.active = "pinyin".into();
+    cfg.input.default.chinese_mode = true;
+    cfg.schema.pinyin.frequency.enabled = true;
+    let coord = Coordinator::new_headless_with_store(cfg, Some(&d), store);
+    for c in "buzhidaok".chars() {
+        press_letter(&coord, c);
+    }
+
+    let all = coord.debug_all_candidate_texts();
+    let head: Vec<&str> = all.iter().take(5).map(|s| s.as_str()).collect();
+    assert_eq!(
+        all.first().map(|s| s.as_str()),
+        Some("不知道看"),
+        "首选须仍是消费满 9 键的残码整句，不得被只消费 8 键的「不知道」靠锚定顶掉，实际: {head:?}"
+    );
+    let _ = std::fs::remove_file(&store_path);
+}
+
+/// **残码整句不锚定**：用户反复选过的词须能靠位置提升反超它。
+///
+/// 残码整句多猜了一个用户还没输入的音节（`jisuanjik` → 「计算机**看**」），置信度低一档，
+/// 而残码场景恰是最需要词频学习的地方。若它锚定，词频维度对整个残码编码整体失效——
+/// 这与 `siyuan` 寺院/思源、`gonghe` 共和/恭贺是同一个现场（见本文件顶部说明）。
+///
+/// ⚠️ **记账码必须用候选自己的码**（`jisuanjikexue`），不是输入串：拼音走 `freq_code` 的
+/// 候选码口径（见 `Coordinator::freq_code_with` 与守门测试
+/// `every_record_selection_call_goes_through_freq_code`）。用输入串会写出一个孤儿键，
+/// 读取端永远查不到，测试于是假绿——作者本人在写这条时就先踩了一次。
+#[test]
+fn test_speculative_sentence_yields_to_frequently_used_word() {
+    let d = data_dir();
+    if !d.join("schemas/pinyin/cn_dicts/base.dict.yaml").exists() {
+        eprintln!("跳过：拼音词库不存在");
+        return;
+    }
+    let store_path = std::env::temp_dir().join("wind_spec_sentence_test.redb");
+    let _ = std::fs::remove_file(&store_path);
+    let store = std::sync::Arc::new(wind_store::Store::open(&store_path).unwrap());
+    for _ in 0..30 {
+        store
+            .record_freq("pinyin", "jisuanjikexue", "计算机科学")
+            .unwrap();
+    }
+
+    let mut cfg = Config::default();
+    cfg.schema.available = vec!["pinyin".into()];
+    cfg.schema.active = "pinyin".into();
+    cfg.input.default.chinese_mode = true;
+    cfg.schema.pinyin.frequency.enabled = true;
+    let coord = Coordinator::new_headless_with_store(cfg, Some(&d), store);
+    for c in "jisuanjik".chars() {
+        press_letter(&coord, c);
+    }
+
+    let all = coord.debug_all_candidate_texts();
+    let head: Vec<&str> = all.iter().take(5).map(|s| s.as_str()).collect();
+    assert_eq!(
+        all.first().map(|s| s.as_str()),
+        Some("计算机科学"),
+        "选过 30 次的词须能反超残码整句「计算机看」（后者不该锚定），实际: {head:?}"
+    );
+    assert!(
+        all.iter().any(|t| t == "计算机看"),
+        "残码整句只是退居其后、不得消失（本标记只摘锚定、不动 weight），实际: {head:?}"
+    );
+    let _ = std::fs::remove_file(&store_path);
+}

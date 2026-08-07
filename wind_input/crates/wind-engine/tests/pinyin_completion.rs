@@ -464,3 +464,39 @@ fn test_partial_completion_skips_single_syllable_input() {
         "1 音节 + 残码不该走残码整句，实际产出: {sentences:?}"
     );
 }
+
+/// 残码整句必须带 `is_sentence_unanchored`（摘掉 `freq_rerank` 的顶部锚定）。
+///
+/// **本用例断言的是标记本身，不是排序效果**，这是有意的：step 6.6 目前碰巧也会给残码整句
+/// 标上 `is_sentence_contested`（同样摘锚定），于是任何按排序结果写的断言都测不出这个标记
+/// 的存在与否——实测删掉置位点后协调器级的三条词频用例全部照绿。
+///
+/// 而 6.6 的覆盖是**判据副作用**：它找的是 `o.code == completed` 的竞争者，残码整句自己的
+/// code 含残码（`zhonghuar` vs 竞争者「中华」的 `zhonghua`），两者其实不同码。谁把 6.6
+/// 修正成真正的「同码竞争者」，锚定就会静默恢复、词频对整个残码编码再次失效。
+#[test]
+fn partial_sentence_is_marked_unanchored() {
+    let Some(dir) = data_dir() else {
+        eprintln!("跳过：拼音词库不存在");
+        return;
+    };
+    let mgr = manager(&dir);
+
+    for (input, want) in [
+        ("buzhidaok", "不知道看"),
+        ("zhonghuar", "中华人"),
+        ("nihaom", "你好吗"),
+    ] {
+        let cands = mgr.convert_with("pinyin", input, 300).candidates;
+        let hit = cands
+            .iter()
+            .find(|c| c.text == want)
+            .unwrap_or_else(|| panic!("{input} 应产出残码整句「{want}」"));
+        assert!(
+            hit.is_sentence && hit.is_sentence_unanchored,
+            "「{want}」须同时带整句身份与 unanchored 标记（实际 sentence={} unanchored={}）",
+            hit.is_sentence,
+            hit.is_sentence_unanchored
+        );
+    }
+}
