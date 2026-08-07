@@ -91,6 +91,9 @@ pub enum UiCommand {
     /// 工具栏自动隐藏配置（开关 + 超时毫秒）。来自 ui.toolbar.auto_hide / auto_hide_delay，
     /// 协调器 apply_ui_config（启动 + 配置重载）下发。
     SetToolbarAutoHide { enabled: bool, delay_ms: u64 },
+    /// 工具栏纵向排列（true=竖条）。来自 ui.toolbar.vertical，
+    /// 协调器 apply_ui_config（启动 + 配置重载）下发。
+    SetToolbarVertical(bool),
     /// 应用主题（协调器加载解析后下发）
     SetTheme(Box<wind_theme::Resolved>),
     /// 候选布局方向（true=竖排）。来自 ui.candidate.layout。
@@ -1329,6 +1332,12 @@ impl UiManager {
                         );
                         if let Some(t) = &mut toolbar {
                             t.set_auto_hide(enabled, delay_ms);
+                        }
+                    }
+                    UiCommand::SetToolbarVertical(v) => {
+                        debug!("UI: SetToolbarVertical {}", v);
+                        if let Some(t) = &mut toolbar {
+                            t.set_vertical(v);
                         }
                     }
                     UiCommand::SetTheme(theme) => {

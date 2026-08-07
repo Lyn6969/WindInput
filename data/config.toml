@@ -601,6 +601,8 @@ hide_in_fullscreen = true
 # 自动隐藏：显示后 auto_hide_delay 秒无交互则 1 秒淡出（悬停/拖动顺延；默认关）
 auto_hide = false
 auto_hide_delay = 5
+# 纵向排列：竖着摆放工具栏（默认横条）。几何仍取主题 [toolbar]，条宽=height、每格高=button_width。
+vertical = false
 
 [stats]
 enabled = true

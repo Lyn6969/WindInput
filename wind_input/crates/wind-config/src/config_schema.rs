@@ -349,6 +349,7 @@ static REGISTRY: &[ConfigField] = &[
     f("ui.toolbar.hide_in_fullscreen", Bool),
     f("ui.toolbar.auto_hide", Bool),
     f("ui.toolbar.auto_hide_delay", Int),
+    f("ui.toolbar.vertical", Bool),
     // -- stats（统计，原 features.stats 升顶级）--
     f("stats.enabled", Bool),
     f("stats.track_english", Bool),

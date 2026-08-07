@@ -2489,6 +2489,7 @@ impl Coordinator {
             enabled: tb.auto_hide,
             delay_ms: u64::from(tb.auto_hide_delay.max(1)) * 1000,
         });
+        let _ = self.ui_tx.send(UiCommand::SetToolbarVertical(tb.vertical));
     }
 
     /// 当前活跃方案 ID（测试/诊断用）

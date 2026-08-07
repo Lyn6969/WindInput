@@ -113,6 +113,68 @@ pub struct Toolbar {
     /// 整条外框圆角 / 线宽（[toolbar] border.radius / .width）。None→内置派生值。
     tb_border_radius: Option<Dim>,
     tb_border_width: Option<Dim>,
+    /// 纵向排列（ui.toolbar.vertical，非主题——见 `bar_layout`）。
+    vertical: bool,
+}
+
+/// 整条工具栏的几何：窗口尺寸 + 每格矩形（设备像素，相对窗口左上角）。
+struct BarLayout {
+    w: f32,
+    h: f32,
+    /// 拖动柄占据的区域（横条=左端竖条，纵条=顶端横条）。
+    grip: Rect,
+    cells: Vec<Rect>,
+}
+
+/// 按朝向铺开整条工具栏。**纵向恒为横向的转置**：`thickness`（主题 `[toolbar] height`）
+/// 在横条里是条高、在纵条里是条宽；`cell`（`button_width`）在横条里是格宽、纵条里是格高。
+/// 于是同一套主题几何在两个朝向下都成立，不必为纵向另配一套尺寸。
+///
+/// 抽成纯函数是为了可单测：`render` 的其余部分要拿 DirectWrite 测文字、要提交 Layered
+/// Window，在非 Windows 上是 mock/空实现，覆盖不到。
+fn bar_layout(vertical: bool, thickness: f32, grip_len: f32, cell: f32, n: usize) -> BarLayout {
+    let long = grip_len + cell * n as f32;
+    let (w, h) = if vertical {
+        (thickness, long)
+    } else {
+        (long, thickness)
+    };
+    let grip = if vertical {
+        Rect {
+            x: 0.0,
+            y: 0.0,
+            w: thickness,
+            h: grip_len,
+        }
+    } else {
+        Rect {
+            x: 0.0,
+            y: 0.0,
+            w: grip_len,
+            h: thickness,
+        }
+    };
+    let cells = (0..n)
+        .map(|i| {
+            let off = grip_len + cell * i as f32;
+            if vertical {
+                Rect {
+                    x: 0.0,
+                    y: off,
+                    w: thickness,
+                    h: cell,
+                }
+            } else {
+                Rect {
+                    x: off,
+                    y: 0.0,
+                    w: cell,
+                    h: thickness,
+                }
+            }
+        })
+        .collect();
+    BarLayout { w, h, grip, cells }
 }
 
 impl Toolbar {
@@ -176,6 +238,7 @@ impl Toolbar {
             tb_button_radius: None,
             tb_border_radius: None,
             tb_border_width: None,
+            vertical: false,
         })
     }
 
@@ -206,6 +269,25 @@ impl Toolbar {
         }
         if let Some(c) = v.toolbar_border_color {
             self.sep = c;
+        }
+    }
+
+    /// 配置纵向排列（`ui.toolbar.vertical`，经 SetToolbarVertical 下发）。
+    ///
+    /// 换向会改窗口尺寸，故可见时立即用缓存状态重绘——否则要等下一次状态推送（切中英等）
+    /// 才换向，设置页里改完看着像没生效。
+    ///
+    /// ⚠️ 重绘必须受 `visible` 门控：`repaint`→`render` 末尾无条件 `show`，对隐藏中的
+    /// 工具栏调用会把它显形，绕过 `toolbar_gate` 的显示迟滞（同 `SetTheme` 分支的约束）。
+    /// 隐藏期间换向不必出图——朝向已存好，而所有重新显示的路径都经 `update`→`render`
+    /// 重算尺寸，不会留下旧朝向的残帧。
+    pub fn set_vertical(&mut self, vertical: bool) {
+        if self.vertical == vertical {
+            return;
+        }
+        self.vertical = vertical;
+        if self.visible {
+            self.repaint();
         }
     }
 
@@ -331,20 +413,20 @@ impl Toolbar {
         let dim = |o: Option<Dim>, def_logical: f32| {
             o.map(|x| x.resolve(s, 0.0)).unwrap_or(def_logical * s)
         };
-        let height = dim(self.tb_height, Self::HEIGHT).ceil();
-        let grip_w = dim(self.tb_grip_width, Self::GRIP_W).ceil();
+        // 纵向下这两个值转 90°：thickness 成条宽、grip_len 成顶端拖动区高度。
+        let thickness = dim(self.tb_height, Self::HEIGHT).ceil();
+        let grip_len = dim(self.tb_grip_width, Self::GRIP_W).ceil();
 
         let cells = Self::cells(state);
         // 英文模式下标点固定显示半角，无需看 chinese_punct。
         let effective_chinese = state.chinese_mode && !state.caps_lock;
 
-        // 每格等宽（默认 30dp≈方形）：标点/简繁等图标与文字均居中于等宽格，
-        // 状态切换不改变格宽，工具栏整体宽度稳定不抖动。主题可配 button_width 覆盖。
-        let cell_w = dim(self.tb_button_width, Self::BUTTON_W);
-        let cell_widths: Vec<f32> = cells.iter().map(|_| cell_w).collect();
-        let total_w: f32 = grip_w + cell_w * cells.len() as f32;
-        let w = total_w.ceil() as u32;
-        let h = height as u32;
+        // 每格等长（默认 30dp≈方形）：标点/简繁等图标与文字均居中于等长格，
+        // 状态切换不改变格尺寸，工具栏整体长度稳定不抖动。主题可配 button_width 覆盖。
+        let cell_len = dim(self.tb_button_width, Self::BUTTON_W);
+        let layout = bar_layout(self.vertical, thickness, grip_len, cell_len, cells.len());
+        let w = layout.w.ceil() as u32;
+        let h = layout.h.ceil() as u32;
 
         self.window.resize(w, h);
         let buf_size = (w * h * 4) as usize;
@@ -378,28 +460,29 @@ impl Toolbar {
                 border_w,
             );
             // 拖动柄点阵
-            draw_grip(buf, w, h, grip_w as u32, self.grip, s);
+            draw_grip(buf, w, h, &layout.grip, self.vertical, self.grip, s);
         }
 
         // 逐格绘制 + 记录命中矩形
-        let mut x = grip_w;
         let font_h = self.renderer.measure_text("中").height;
         let mut hits: Vec<(ToolbarAction, Rect)> = Vec::with_capacity(cells.len());
         for (i, c) in cells.iter().enumerate() {
-            let cw = cell_widths[i];
-            hits.push((
-                c.action,
-                Rect {
-                    x,
-                    y: 0.0,
-                    w: cw,
-                    h: h as f32,
-                },
-            ));
+            let r = layout.cells[i];
+            hits.push((c.action, r));
             // 分隔线：仅「拖动柄之后」(首格前) 与「设置图标之前」绘制（对齐设计稿，状态格之间不画）。
             let is_settings = matches!(c.action, ToolbarAction::OpenSettings);
             if i == 0 || is_settings {
-                draw_vsep(self.window.buffer_mut(), w, h, x as u32, self.sep, s);
+                // 画在格的**起始边**上：横条取左缘 x、纵条取上缘 y。
+                let pos = if self.vertical { r.y } else { r.x };
+                draw_sep(
+                    self.window.buffer_mut(),
+                    w,
+                    h,
+                    pos as u32,
+                    self.vertical,
+                    self.sep,
+                    s,
+                );
             }
             // 激活格（中文模式）画主题色底 + 高亮文字；悬停格画极淡底。
             // hl_bg 成对配合 hl_fg（如 msime 白字蓝底），缺底色时白字在亮色工具栏上不可见。
@@ -412,21 +495,35 @@ impl Toolbar {
             };
             if let Some(bgc) = cell_bg {
                 let inset = dim(self.tb_button_padding, Self::BUTTON_PAD) as u32;
-                let hx = x as u32 + inset / 2;
-                let hy = inset;
-                let hw = (cw as u32).saturating_sub(inset);
-                let hh = h.saturating_sub(inset * 2);
-                // 高亮格圆角：主题 button_radius 优先，否则 = 内高×0.3（原派生行为）。
+                // 长轴方向两端各缩 inset/2、厚度方向两端各缩 inset（横条既有比例，纵条转置
+                // 施加）——高亮块因此在两个朝向下都是"沿条身更瘦"的胶囊，而非贴边方块。
+                let (hx, hy, hw, hh) = if self.vertical {
+                    (
+                        r.x as u32 + inset,
+                        r.y as u32 + inset / 2,
+                        (r.w as u32).saturating_sub(inset * 2),
+                        (r.h as u32).saturating_sub(inset),
+                    )
+                } else {
+                    (
+                        r.x as u32 + inset / 2,
+                        r.y as u32 + inset,
+                        (r.w as u32).saturating_sub(inset),
+                        (r.h as u32).saturating_sub(inset * 2),
+                    )
+                };
+                // 高亮格圆角：主题 button_radius 优先，否则 = 内**短边**×0.3。横条下短边
+                // 恒是内高（厚度方向缩得更多），故与原「内高×0.3」等值，纵条则自动转置。
                 let hr = self
                     .tb_button_radius
                     .map(|d| d.resolve(s, 0.0))
-                    .unwrap_or(hh as f32 * 0.3) as u32;
+                    .unwrap_or(hw.min(hh) as f32 * 0.3) as u32;
                 fill_rounded(self.window.buffer_mut(), w, h, hx, hy, hw, hh, bgc, hr);
             }
             if is_settings {
                 let size = font_h * 0.80;
-                let dx = x + (cw - size) * 0.5;
-                let dy = (h as f32 - size) * 0.5;
+                let dx = r.x + (r.w - size) * 0.5;
+                let dy = r.y + (r.h - size) * 0.5;
                 crate::view::draw_svg_icon(
                     self.window.buffer_mut(),
                     w,
@@ -454,8 +551,8 @@ impl Toolbar {
                     _ => WIDTH_HALF_SVG,
                 };
                 let size = font_h * 0.80;
-                let dx = x + (cw - size) * 0.5;
-                let dy = (h as f32 - size) * 0.5;
+                let dx = r.x + (r.w - size) * 0.5;
+                let dy = r.y + (r.h - size) * 0.5;
                 crate::view::draw_svg_icon(
                     self.window.buffer_mut(),
                     w,
@@ -469,8 +566,8 @@ impl Toolbar {
             } else {
                 // 居中文字
                 let m = self.renderer.measure_text(&c.text);
-                let tx = x + (cw - m.width) * 0.5;
-                let ty = (h as f32 - font_h) * 0.5;
+                let tx = r.x + (r.w - m.width) * 0.5;
+                let ty = r.y + (r.h - font_h) * 0.5;
                 let fg = if c.highlight {
                     self.hl_fg
                 } else if c.dim {
@@ -482,13 +579,12 @@ impl Toolbar {
                     self.window.buffer_mut(),
                     w,
                     h,
-                    tx.max(x),
-                    ty.max(0.0),
+                    tx.max(r.x),
+                    ty.max(r.y),
                     &c.text,
                     fg,
                 );
             }
-            x += cw;
         }
         if let Err(e) = self.window.update() {
             tracing::warn!("Toolbar update failed: {}", e);
@@ -881,40 +977,57 @@ fn dim_color(c: [u8; 4]) -> [u8; 4] {
     [c[0], c[1], c[2], (c[3] as f32 * 0.65) as u8]
 }
 
-/// 竖直分隔线（在 x 处，上下各内缩 6px）
-fn draw_vsep(buf: &mut [u8], buf_w: u32, buf_h: u32, x: u32, color: [u8; 4], scale: f32) {
+/// 格间分隔线：横条画竖线（`pos` 是 x），纵条画横线（`pos` 是 y）；线两端各内缩 6px。
+fn draw_sep(
+    buf: &mut [u8],
+    buf_w: u32,
+    buf_h: u32,
+    pos: u32,
+    vertical: bool,
+    color: [u8; 4],
+    scale: f32,
+) {
     let inset = (6.0 * scale) as u32;
-    let y0 = inset;
-    let y1 = buf_h.saturating_sub(inset);
-    if x >= buf_w || y1 <= y0 {
+    // across = 线要横跨的那条边（横条跨条高、纵条跨条宽）。
+    let across = if vertical { buf_h } else { buf_w };
+    let span = if vertical { buf_w } else { buf_h };
+    let a0 = inset;
+    let a1 = span.saturating_sub(inset);
+    if pos >= across || a1 <= a0 {
         return;
     }
-    // 1px 竖线 = 直角矩形（tiny-skia），与其它形状统一
-    crate::view::fill_rounded(
-        buf,
-        buf_w,
-        buf_h,
-        x as f32,
-        y0 as f32,
-        1.0,
-        (y1 - y0) as f32,
-        color,
-        0.0,
-    );
+    let (x, y, w, h) = if vertical {
+        (a0 as f32, pos as f32, (a1 - a0) as f32, 1.0)
+    } else {
+        (pos as f32, a0 as f32, 1.0, (a1 - a0) as f32)
+    };
+    // 1px 线 = 直角矩形（tiny-skia），与其它形状统一
+    crate::view::fill_rounded(buf, buf_w, buf_h, x, y, w, h, color, 0.0);
 }
 
-/// 左侧拖动柄：2×3 点阵
-fn draw_grip(buf: &mut [u8], buf_w: u32, buf_h: u32, grip_w: u32, color: [u8; 4], scale: f32) {
+/// 拖动柄点阵，居中于 `grip` 区。横条 2 列×3 行、纵条转置为 3 列×2 行——点阵的长边
+/// 始终垂直于条身，看着才像「抓手」而不是顺着条身的一道装饰线。
+fn draw_grip(
+    buf: &mut [u8],
+    buf_w: u32,
+    buf_h: u32,
+    grip: &Rect,
+    vertical: bool,
+    color: [u8; 4],
+    scale: f32,
+) {
     let dot = (2.0 * scale).max(1.0);
     let gap = 4.0 * scale;
-    let cx = grip_w as f32 / 2.0;
-    let cy = buf_h as f32 / 2.0;
-    let start_y = cy - gap;
-    for row in 0..3 {
-        let y = start_y + row as f32 * gap;
-        for col in 0..2 {
-            let dx = cx - gap / 2.0 + col as f32 * gap;
-            fill_dot(buf, buf_w, buf_h, dx, y, dot / 2.0, color);
+    let cx = grip.x + grip.w / 2.0;
+    let cy = grip.y + grip.h / 2.0;
+    let (cols, rows) = if vertical { (3, 2) } else { (2, 3) };
+    let x0 = cx - (cols - 1) as f32 * gap / 2.0;
+    let y0 = cy - (rows - 1) as f32 * gap / 2.0;
+    for row in 0..rows {
+        for col in 0..cols {
+            let x = x0 + col as f32 * gap;
+            let y = y0 + row as f32 * gap;
+            fill_dot(buf, buf_w, buf_h, x, y, dot / 2.0, color);
         }
     }
 }
@@ -935,4 +1048,85 @@ fn toolbar_bottom(hwnd: HWND, top: i32) -> i32 {
     }
     let _ = hwnd;
     top + 30
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // 典型值：主题 [toolbar] 默认（条厚 30dp、拖动柄 12dp、格 30dp）× scale 1.0，
+    // 4 格（模式/标点/全半角/设置）。
+    const THICK: f32 = 30.0;
+    const GRIP: f32 = 12.0;
+    const CELL: f32 = 30.0;
+    const N: usize = 4;
+
+    /// 横条：回归基线。重构成 `bar_layout` 之前，render 内联算的就是这组值——
+    /// 这条测试的作用是「纵向功能没有偷偷改掉横向的既有排布」。
+    #[test]
+    fn horizontal_layout_matches_legacy_geometry() {
+        let l = bar_layout(false, THICK, GRIP, CELL, N);
+        assert_eq!((l.w, l.h), (12.0 + 30.0 * 4.0, 30.0));
+        assert_eq!(
+            (l.grip.x, l.grip.y, l.grip.w, l.grip.h),
+            (0.0, 0.0, 12.0, 30.0)
+        );
+        // 格自拖动柄之后起，沿 x 依次排开，各格占满条厚。
+        for (i, c) in l.cells.iter().enumerate() {
+            assert_eq!(c.x, 12.0 + 30.0 * i as f32, "第 {i} 格 x");
+            assert_eq!((c.y, c.w, c.h), (0.0, 30.0, 30.0), "第 {i} 格");
+        }
+    }
+
+    /// 纵条：整条与横条互为转置——宽高对调、格沿 y 排开、各格占满条宽。
+    #[test]
+    fn vertical_layout_is_transpose_of_horizontal() {
+        let h = bar_layout(false, THICK, GRIP, CELL, N);
+        let v = bar_layout(true, THICK, GRIP, CELL, N);
+        assert_eq!((v.w, v.h), (h.h, h.w), "整条宽高对调");
+        assert_eq!((v.grip.w, v.grip.h), (h.grip.h, h.grip.w), "拖动柄区对调");
+        assert_eq!(v.cells.len(), h.cells.len());
+        for (i, (cv, ch)) in v.cells.iter().zip(h.cells.iter()).enumerate() {
+            assert_eq!((cv.x, cv.y), (ch.y, ch.x), "第 {i} 格坐标对调");
+            assert_eq!((cv.w, cv.h), (ch.h, ch.w), "第 {i} 格尺寸对调");
+        }
+    }
+
+    /// 主题几何在两个朝向下同源：条厚恒取 `height`、格长恒取 `button_width`。
+    /// 若哪天有人为纵向另引一套尺寸，这条会红——那正是要挡的改动。
+    #[test]
+    fn vertical_reuses_same_theme_dimensions() {
+        let v = bar_layout(true, THICK, GRIP, CELL, N);
+        assert_eq!(v.w, THICK, "纵条宽 = 主题 height");
+        for c in &v.cells {
+            assert_eq!(c.h, CELL, "纵条每格高 = 主题 button_width");
+            assert_eq!(c.w, THICK, "纵条每格宽 = 条宽");
+        }
+        assert_eq!(v.h, GRIP + CELL * N as f32, "纵条总高 = 拖动柄 + 各格");
+    }
+
+    /// 格数随简繁格增减（`cells()` 的既有行为），布局须跟着长短，不能越界。
+    #[test]
+    fn layout_tracks_cell_count() {
+        let four = bar_layout(true, THICK, GRIP, CELL, 4);
+        let five = bar_layout(true, THICK, GRIP, CELL, 5);
+        assert_eq!(five.h - four.h, CELL, "多一格恰长一格");
+        assert_eq!(five.cells.len(), 5);
+        // 末格不得超出整条（渲染越界会被静默裁掉，看着像"最后一格没画出来"）。
+        let last = five.cells.last().unwrap();
+        assert!(
+            last.y + last.h <= five.h,
+            "末格越界：{} > {}",
+            last.y + last.h,
+            five.h
+        );
+    }
+
+    /// 缩放只改绝对值、不改结构：dp→设备像素由调用方（render 的 dim 闭包）算好再传入。
+    #[test]
+    fn layout_scales_uniformly() {
+        let one = bar_layout(true, THICK, GRIP, CELL, N);
+        let two = bar_layout(true, THICK * 2.0, GRIP * 2.0, CELL * 2.0, N);
+        assert_eq!((two.w, two.h), (one.w * 2.0, one.h * 2.0));
+    }
 }

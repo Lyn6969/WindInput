@@ -2099,6 +2099,11 @@ pub struct ToolbarConfig {
     /// 自动隐藏超时（秒，默认 5；下限 1 由协调器钳制）。
     #[serde(default = "default_toolbar_auto_hide_delay")]
     pub auto_hide_delay: u32,
+    /// 纵向排列（默认 false=横条）。纵向是横向的转置：条宽取主题 `[toolbar] height`，
+    /// 每格高取 `button_width`，故同一套主题几何在两个朝向下都成立、无需另配。
+    /// 属用户偏好而非视觉设计，所以落在此处而非主题。
+    #[serde(default)]
+    pub vertical: bool,
 }
 
 impl Default for ToolbarConfig {
@@ -2108,6 +2113,7 @@ impl Default for ToolbarConfig {
             hide_in_fullscreen: true,
             auto_hide: false,
             auto_hide_delay: 5,
+            vertical: false,
         }
     }
 }
