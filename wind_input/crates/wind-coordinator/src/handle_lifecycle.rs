@@ -469,6 +469,10 @@ impl Coordinator {
                 warn!("key_actions: toggle_schema:{id} 只能绑修饰键（无字符键），此处忽略");
                 None
             }
+            // A 类同样不在这里执行：`dispatch_hotkey` 自加锁，本函数持锁。
+            // keydown 走 `bound_lock_free_action_for_keydown`（判定后 drop 锁），
+            // keyup 走 `handle_bound_modifier_key_up`，两条都在锁外。
+            BoundAction::Action(_) => None,
         }
     }
 
@@ -485,6 +489,86 @@ impl Coordinator {
         debug!("key_actions: toggle_schema -> {id}");
         self.toggle_schema_by_id(id, trigger_vk);
         Some(KeyAction::StatusUpdate(self.build_status()))
+    }
+
+    /// 执行 A 类状态切换，转交 `dispatch_hotkey`（这批动作的既有单点）。
+    ///
+    /// **必须在不持 `State` 锁时调用**——`dispatch_hotkey` 的每个分支都自己 `state.lock()`。
+    /// 与 C 类同一约束，故两者共用 [`Self::run_lock_free_bound_action`] 这个分流口。
+    ///
+    /// 分发端不认的动词返回 `None` 不吞键：白名单已在 `BoundAction::parse` 拦过一道，
+    /// 走到这里还失败说明两处不同步，此时让键落回正常输入比静默吃掉好查。
+    fn run_dispatch_action(&self, action: &str) -> Option<KeyAction> {
+        if !self.dispatch_hotkey(action) {
+            warn!("key_actions: 动作 {action} 未被 dispatch_hotkey 接受，不动作");
+            return None;
+        }
+        debug!("key_actions: dispatch {action}");
+        Some(KeyAction::StatusUpdate(self.build_status()))
+    }
+
+    /// A/C 两类「不建 overlay、只改全局状态」的动作的统一分流口。
+    ///
+    /// 它们的共同点不是语义而是**调用约束**：目标函数（`toggle_schema_by_id` /
+    /// `dispatch_hotkey`）都自己加 `State` 锁，故一律要在锁外执行。B 类相反——它建
+    /// overlay，需要 `&mut State`。这条线就是 keydown 路径上两个插入点的分界。
+    ///
+    /// 返回 `None` 表示「不是这两类」，调用方继续走原有链路。
+    /// 该动作是否属于「锁外执行」那一类（A/C）。与
+    /// [`Self::run_lock_free_bound_action`] 的 match 臂同源——分成两个函数是因为
+    /// keyup 路径要**先判断再决定取不取锁**，而不是拿到结果才知道。
+    pub(crate) fn is_lock_free_bound(&self, action: &BoundAction) -> bool {
+        matches!(
+            action,
+            BoundAction::ToggleSchema(_) | BoundAction::Action(_)
+        )
+    }
+
+    pub(crate) fn run_lock_free_bound_action(
+        &self,
+        action: &BoundAction,
+        trigger_vk: u32,
+    ) -> Option<KeyAction> {
+        match action {
+            BoundAction::ToggleSchema(id) => self.run_toggle_schema_action(id, trigger_vk),
+            BoundAction::Action(a) => self.run_dispatch_action(a),
+            _ => None,
+        }
+    }
+
+    /// keydown 路径上的 A 类分派判定：**判定在锁内、执行在锁外**。
+    ///
+    /// 调用方拿到 `Some` 后须先 `drop` 掉 `State` guard 再执行（见
+    /// [`Self::run_lock_free_bound_action`] 的锁约束）。本函数只读 `state`，不改。
+    ///
+    /// 三道门：
+    /// - **空缓冲**：打字打到一半按下绑定键，意图多半是输入而非切状态；且 A 类不吞
+    ///   已有编码，留给下游的顶字逻辑更合理。
+    /// - **无修饰键**：`Ctrl+\` 是宿主的快捷键，不该被方案绑定截走。
+    /// - **不限修饰键的动作**：`toggle_mode` 那类绑在有字符的键上是单程票，
+    ///   见 [`BoundAction::requires_modifier_key`]。
+    pub(crate) fn bound_lock_free_action_for_keydown(
+        &self,
+        state: &State,
+        data: &KeyEventData,
+    ) -> Option<BoundAction> {
+        if !state.input_buffer.is_empty() || data.modifiers & (MOD_CTRL | MOD_ALT | MOD_SHIFT) != 0
+        {
+            return None;
+        }
+        let BoundKeyDecision::Act(action) = self.bound_key_decision(data.key_code) else {
+            return None;
+        };
+        if action.requires_modifier_key() {
+            // 有字符的键到不了英文态，绑这类动作等于单程票。core 侧忽略并 warn，
+            // 设置页对同一组合给行内提示。
+            warn!(
+                "key_actions: {action:?} 只能绑修饰键（无字符键），键 0x{:02X} 上忽略",
+                data.key_code
+            );
+            return None;
+        }
+        matches!(action, BoundAction::Action(_)).then_some(action)
     }
 
     /// 纯修饰键 keyup 上的方案级绑定分派（`rshift = "toggle_schema:english"` 这类）。
@@ -511,9 +595,9 @@ impl Coordinator {
                 debug!("bound modifier key_up 0x{key_code:02X} 让位（多为显式 none）");
                 Some(KeyAction::Consumed)
             }
-            // C 类必须在**锁外**执行（`toggle_schema_by_id` 自己加锁），故先于取锁分流。
-            BoundKeyDecision::Act(BoundAction::ToggleSchema(id)) => {
-                self.run_toggle_schema_action(&id, key_code)
+            // A/C 类必须在**锁外**执行（目标函数自己加锁），故先于取锁分流。
+            BoundKeyDecision::Act(action) if self.is_lock_free_bound(&action) => {
+                self.run_lock_free_bound_action(&action, key_code)
             }
             BoundKeyDecision::Act(action) => {
                 let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());

@@ -462,3 +462,102 @@ fn return_authorization_is_consumed_once() {
     );
     let _ = std::fs::remove_dir_all(&ov);
 }
+
+// ──────────────── 五期：A 类状态切换 ────────────────
+
+/// A 类绑在**有字符键**上：中文态按下即切换标点，不需要修饰键。
+///
+/// 与 C 类刻意不同——`toggle_punct` 本就只在中文态有意义（全局那份也带
+/// CHINESE_ONLY），不存在「切过去回不来」的问题，故 keydown 路径可用。
+#[test]
+fn dispatch_action_on_character_key_toggles_punct() {
+    if !has_schemas() {
+        eprintln!("跳过：缺少 build_dev/data 方案");
+        return;
+    }
+    let ov = make_override("act_punct", "wubi86", "backslash = \"toggle_punct\"");
+    let coord = Coordinator::new_headless_with_override(
+        cfg_for("wubi86"),
+        Some(&data_dir()),
+        Some(ov.clone()),
+    );
+    let before = coord.is_chinese_punct();
+    coord.handle_key_event(&key(0xDC)); // backslash
+    assert_ne!(
+        coord.is_chinese_punct(),
+        before,
+        "绑在 backslash 上的 toggle_punct 应切换中英标点"
+    );
+    let _ = std::fs::remove_dir_all(&ov);
+}
+
+/// ★ A 类里「用来离开英文态」的那几个（`toggle_mode` / `switch_engine`）**限修饰键**。
+///
+/// 绑在有字符的键上是单程票：那条 keydown 链在英文模式分水岭之后，切到英文态就
+/// 再也按不动了。core 侧忽略并 warn，判据见 `BoundAction::requires_modifier_key`。
+#[test]
+fn toggle_mode_ignored_on_character_key() {
+    if !has_schemas() {
+        eprintln!("跳过：缺少 build_dev/data 方案");
+        return;
+    }
+    let ov = make_override("act_mode_char", "wubi86", "backslash = \"toggle_mode\"");
+    let coord = Coordinator::new_headless_with_override(
+        cfg_for("wubi86"),
+        Some(&data_dir()),
+        Some(ov.clone()),
+    );
+    assert!(coord.is_chinese_mode());
+    coord.handle_key_event(&key(0xDC));
+    assert!(
+        coord.is_chinese_mode(),
+        "有字符键上的 toggle_mode 应被忽略（否则切到英文就回不来）"
+    );
+    let _ = std::fs::remove_dir_all(&ov);
+}
+
+/// 同一个动作绑到**修饰键**上则生效，且能来回切——这正是「限修饰键」要保住的能力。
+#[test]
+fn toggle_mode_works_on_modifier_key() {
+    if !has_schemas() {
+        eprintln!("跳过：缺少 build_dev/data 方案");
+        return;
+    }
+    let ov = make_override("act_mode_mod", "wubi86", "rshift = \"toggle_mode\"");
+    let coord = Coordinator::new_headless_with_override(
+        cfg_for("wubi86"),
+        Some(&data_dir()),
+        Some(ov.clone()),
+    );
+    assert!(coord.is_chinese_mode());
+    coord.handle_key_event(&key_up(VK_RSHIFT));
+    assert!(!coord.is_chinese_mode(), "右 Shift 应切到英文");
+    // 回程：英文态下同一个键仍走 keyup 路径，按得动。
+    coord.handle_key_event(&key_up(VK_RSHIFT));
+    assert!(coord.is_chinese_mode(), "再按应切回中文");
+    let _ = std::fs::remove_dir_all(&ov);
+}
+
+/// 缓冲非空时 A 类不接管：打字打到一半按下绑定键，意图多半是输入而非切状态。
+#[test]
+fn dispatch_action_yields_while_typing() {
+    if !has_schemas() {
+        eprintln!("跳过：缺少 build_dev/data 方案");
+        return;
+    }
+    let ov = make_override("act_typing", "wubi86", "backslash = \"toggle_punct\"");
+    let coord = Coordinator::new_headless_with_override(
+        cfg_for("wubi86"),
+        Some(&data_dir()),
+        Some(ov.clone()),
+    );
+    coord.handle_key_event(&key(0x41)); // a：缓冲非空
+    let before = coord.is_chinese_punct();
+    coord.handle_key_event(&key(0xDC));
+    assert_eq!(
+        coord.is_chinese_punct(),
+        before,
+        "缓冲非空时不该被 A 类接管"
+    );
+    let _ = std::fs::remove_dir_all(&ov);
+}

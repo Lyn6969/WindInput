@@ -2552,6 +2552,14 @@ impl Coordinator {
         self.rt().compiled_hotkeys.key_up_tsf_hashes()
     }
 
+    /// 当前是否中文标点（测试/诊断用）
+    pub fn is_chinese_punct(&self) -> bool {
+        self.state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .chinese_punct
+    }
+
     /// 当前是否中文模式（测试/诊断用）
     pub fn is_chinese_mode(&self) -> bool {
         self.state
@@ -4578,7 +4586,7 @@ impl Coordinator {
     }
 
     /// 分发热键动作；返回是否已处理
-    fn dispatch_hotkey(&self, action: &str) -> bool {
+    pub(crate) fn dispatch_hotkey(&self, action: &str) -> bool {
         match action {
             "toggle_mode" => {
                 let (status, _) = self.handle_toggle_mode();
@@ -5677,6 +5685,24 @@ impl MessageHandler for Coordinator {
             Some(ModeKind::Special(_)) => return self.handle_special_key(&mut state, data),
             Some(ModeKind::Mix(_)) => return self.handle_mix_key(&mut state, data),
             None => {}
+        }
+
+        // 方案级表的 A 类状态切换（`backslash = "toggle_punct"` 这类）。
+        //
+        // 与紧随其后的 `try_activate_mode` 分属两半：B 类建 overlay、要 `&mut State`，
+        // 故在锁内；A/C 类只改全局状态，目标函数（dispatch_hotkey / toggle_schema_by_id）
+        // 各自加锁，**必须锁外执行**——判定在这里做完，guard 就地 drop 掉。
+        //
+        // 位置在英文模式分水岭之后，与 B 类同：有字符的键在英文态必须能出字。代价是
+        // `toggle_mode` 那类「用来离开英文态」的动作在此不可达，故它们限修饰键（keyup 路径），
+        // 见 `BoundAction::requires_modifier_key`。
+        if let Some(action) = self.bound_lock_free_action_for_keydown(&state, data) {
+            drop(state);
+            if let Some(act) = self.run_lock_free_bound_action(&action, data.key_code) {
+                return act;
+            }
+            // 门卫没过：不吞键，重新取锁走原有链路（与各模式门卫同策略）。
+            state = self.state.lock().unwrap_or_else(|e| e.into_inner());
         }
 
         // 空缓冲模式激活：单一入口，优先级链见 try_activate_mode（对齐 key-pipeline.md §2.1）。

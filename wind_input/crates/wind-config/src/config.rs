@@ -498,9 +498,54 @@ pub enum BoundAction {
     /// 往返语义由**运行时来源**兜底，不要求目标方案配对称的绑定。
     /// 见 docs/design/schema-key-actions.md §5。
     ToggleSchema(String),
+    /// A 类状态切换（`toggle_punct` / `take_screenshot` 那类）。
+    ///
+    /// 携带动词原文，由协调器转交 `dispatch_hotkey` ——那里是这批动作的既有单点，
+    /// 复制一份实现只会让两处慢慢漂移。值域见 [`Self::DISPATCH_ACTIONS`]。
+    Action(String),
 }
 
 impl BoundAction {
+    /// A 类可绑的状态切换动词，与 `Coordinator::dispatch_hotkey` 的分支一一对应。
+    ///
+    /// 白名单而非「解析得动就收」：写错的动词若静默通过，按下时分发端匹配不上、
+    /// 什么都不发生，与「没绑上」完全同形，用户无从分辨（同 `is_supported_key_action`）。
+    ///
+    /// `add_word` / `open_add_word_dialog` **不在此列**：它们要返回占位 composition
+    /// 来激活 C++ 转发全部按键，不符 `dispatch_hotkey` 的 `bool` 契约，在按键路径上
+    /// 是单独特判的（`coordinator.rs` 的热键分支）。混进来会变成「按了没反应」。
+    pub const DISPATCH_ACTIONS: &'static [&'static str] = &[
+        "toggle_mode",
+        "switch_engine",
+        "toggle_full_width",
+        "toggle_punct",
+        "toggle_s2t",
+        "toggle_toolbar",
+        "open_settings",
+        "take_screenshot",
+    ];
+
+    /// 该动作是否**只能绑无字符键**（修饰键）。
+    ///
+    /// 判据是「它是不是**从英文态出来**的手段」——是的话，绑在有字符的键上就等于
+    /// 单程票：有字符的键走 keydown 链，那条链在英文模式分水岭之后，英文态根本到不了，
+    /// 于是切过去就再也切不回来。
+    ///
+    /// | 动作 | 限修饰键 | why |
+    /// |---|---|---|
+    /// | `toggle_mode` / `switch_engine` / `toggle_schema:*` | 是 | 正是用来离开/返回英文态的 |
+    /// | `toggle_punct` / `toggle_s2t` / `take_screenshot` … | 否 | 本就只在中文态有意义（全局那份也带 `CHINESE_ONLY`） |
+    ///
+    /// 这与「键有没有字符」是**正交的两问**，合起来才定得了插入点，见
+    /// docs/design/schema-key-actions.md §4.1。
+    pub fn requires_modifier_key(&self) -> bool {
+        match self {
+            Self::ToggleSchema(_) => true,
+            Self::Action(a) => matches!(a.as_str(), "toggle_mode" | "switch_engine"),
+            _ => false,
+        }
+    }
+
     /// 解析配置字符串。大小写与首尾空白不敏感；未知值 → [`Self::None`]。
     pub fn parse(s: &str) -> Self {
         let s = s.trim();
@@ -528,9 +573,11 @@ impl BoundAction {
                 Self::ToggleSchema(id.to_string())
             };
         }
-        match s.to_lowercase().as_str() {
+        let lower = s.to_lowercase();
+        match lower.as_str() {
             "temp_pinyin" => Self::TempPinyin,
             "temp_english" => Self::TempEnglish,
+            a if Self::DISPATCH_ACTIONS.contains(&a) => Self::Action(a.to_string()),
             _ => Self::None,
         }
     }

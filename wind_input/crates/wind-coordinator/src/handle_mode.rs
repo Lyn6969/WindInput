@@ -414,10 +414,12 @@ impl Coordinator {
                 }
                 Some(self.commit_and_enter_special_mode(state, idx, key_code))
             }
-            // C 类只在修饰键 keyup 上可用，而本函数是**有字符键**的 keydown 路径。
-            // 两条独立理由（`toggle_schema_by_id` 自加锁会死锁 + 英文模式分水岭后走不到
-            // 就回不来）见 `enter_bound_action` 的同名分支。
-            BoundAction::ToggleSchema(_) => None,
+            // A/C 类不建 overlay，「顶字再进」这套对它们没有意义；且目标函数自加锁，
+            // 本函数持锁。两类都在锁外的专用分派点执行，见 `enter_bound_action` 的同名分支。
+            //
+            // 注：走到本函数说明缓冲非空，而 A 类的 keydown 分派要求空缓冲——打字打到
+            // 一半按下绑定键，意图多半是输入而非切状态。
+            BoundAction::ToggleSchema(_) | BoundAction::Action(_) => None,
         }
     }
 
