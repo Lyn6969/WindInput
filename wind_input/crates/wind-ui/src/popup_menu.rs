@@ -1345,7 +1345,18 @@ fn place_menu(
             } else {
                 ax - w as i32
             };
-            (x, ay)
+            // 纵坐标与锚点**底边**对齐（菜单贴着工具栏往上长，同任务栏菜单）。
+            //
+            // 不能用顶边对齐：纵条只有百来像素高、菜单常有三四百，顶边对齐后底边顶出
+            // 工作区，钳回来就把整个菜单推到条顶之上老远——正是「在左边了但还在上方」
+            // 那个观感的由来。钳制只会把越界的部分推回来，它救不了一个从一开始就选错
+            // 的对齐边。
+            //
+            // 底边对齐同样可能顶出工作区**上**边（纵条被拖到屏幕顶部时），那时改回顶边
+            // 对齐向下展开——与 `Above` 分支同样的「首选 + 越界回退」结构。
+            let up = anchor.bottom - h as i32;
+            let fits_up = wa.map(|(_, top, _, _)| up >= top).unwrap_or(true);
+            (x, if fits_up { up } else { ay })
         }
     }
 }
@@ -1812,8 +1823,9 @@ mod tests {
     /// 纵条在屏幕左侧：右边装得下 → 菜单贴右边缘展开，纵坐标对齐条顶。
     #[test]
     fn side_prefers_right_when_it_fits() {
+        // 条占 y[500,700]，菜单高 300 → 底边对齐 700，顶边落 400。
         let a = MenuAnchor::beside_rect(20, 500, 50, 700);
-        assert_eq!(place_menu(&a, 20, 500, MW, MH, WA), (50, 500));
+        assert_eq!(place_menu(&a, 20, 500, MW, MH, WA), (50, 400));
     }
 
     /// 纵条在屏幕右下角（默认落点）：右边放不下 → 翻到左侧，菜单右缘贴条左缘。
@@ -1822,7 +1834,7 @@ mod tests {
         let a = MenuAnchor::beside_rect(1870, 600, 1900, 800);
         assert_eq!(
             place_menu(&a, 1870, 600, MW, MH, WA),
-            (1870 - MW as i32, 600)
+            (1870 - MW as i32, 500)
         );
     }
 
@@ -1832,7 +1844,7 @@ mod tests {
     fn side_keeps_right_when_neither_side_fits() {
         let narrow = Some((0, 0, 150, 1040));
         let a = MenuAnchor::beside_rect(100, 300, 130, 500);
-        assert_eq!(place_menu(&a, 100, 300, MW, MH, narrow), (130, 300));
+        assert_eq!(place_menu(&a, 100, 300, MW, MH, narrow), (130, 200));
     }
 
     /// 取不到工作区时按「首选方向装得下」处理：让首选生效、越界交给钳制，
@@ -1842,13 +1854,28 @@ mod tests {
         let up = MenuAnchor::above_rect(100, 500, 530);
         assert_eq!(place_menu(&up, 100, 500, MW, MH, None), (100, 200));
         let side = MenuAnchor::beside_rect(100, 500, 130, 700);
-        assert_eq!(place_menu(&side, 100, 500, MW, MH, None), (130, 500));
+        assert_eq!(place_menu(&side, 100, 500, MW, MH, None), (130, 400));
     }
 
-    /// 侧向不改纵坐标——菜单与工具栏顶边齐平，越界由调用方钳制处理。
+    /// 侧向按**底边**对齐锚点底边（菜单贴着工具栏往上长，同任务栏菜单）。
+    ///
+    /// 钉住这条是因为顶边对齐会栽：纵条只有百来像素高、菜单常有三四百，顶边对齐后
+    /// 底边顶出工作区，钳回来就把整个菜单推到条顶之上——「在左边了但还在上方」。
     #[test]
-    fn side_never_shifts_vertically() {
-        let a = MenuAnchor::beside_rect(20, 777, 50, 900);
-        assert_eq!(place_menu(&a, 20, 777, MW, MH, WA).1, 777);
+    fn side_aligns_bottom_with_anchor_bottom() {
+        // 条占 y[896,1028]（右下角典型落点），菜单高 300 → 顶边 728、底边 1028 齐平。
+        let a = MenuAnchor::beside_rect(1870, 896, 1900, 1028);
+        let (_, y) = place_menu(&a, 1870, 896, MW, MH, WA);
+        assert_eq!(y, 1028 - MH as i32);
+        assert_eq!(y + MH as i32, 1028, "菜单底边与工具栏底边齐平");
+        assert!(y < 896, "菜单比条高，理应向上长出条顶");
+    }
+
+    /// 纵条被拖到屏幕顶部：底边对齐会把菜单顶出工作区上边，改回顶边对齐向下展开。
+    #[test]
+    fn side_flips_to_top_align_when_no_room_up() {
+        // 条占 y[12,144]，菜单高 300 → 底边对齐得 -156，越界；回退到顶边对齐 12。
+        let a = MenuAnchor::beside_rect(20, 12, 50, 144);
+        assert_eq!(place_menu(&a, 20, 12, MW, MH, WA), (50, 12));
     }
 }
