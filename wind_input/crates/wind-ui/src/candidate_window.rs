@@ -1176,12 +1176,23 @@ impl CandidateWindow {
         caret_h: i32,
         window_h: i32,
         off_x: i32,
-        off_y: i32,
     ) -> (i32, i32, i32) {
         let gap = 2;
-        let below_y = caret_y + gap + off_y;
-        let above_y = caret_y - caret_h.max(0) - window_h - gap - off_y;
+        let below_y = caret_y + gap;
+        let above_y = caret_y - caret_h.max(0) - window_h - gap;
         (caret_x + off_x, below_y, above_y)
+    }
+
+    /// 按最终方位施加主题 Y 偏移：`off_y` 正值**恒为远离光标**——在下方就向下、
+    /// 在上方就向上。
+    ///
+    /// ⚠️ 必须在**方位已定之后**调用，不能把偏移预先加进锚点：
+    /// `below_ok`/`above_ok` 是拿锚点跟工作区边界比出来的，锚点含偏移会让 off_y 越大
+    /// 两个条件越难成立 —— 本该上翻的场景被判成「上方也放不下」，落回下方分支再被钳到
+    /// `wa.bottom - hi`（贴屏幕底），窗口就压在光标上了。偏移只该改变距离，不该改变
+    /// 「往上还是往下」这个决策。
+    fn apply_offset_y(y: i32, above: bool, off_y: i32) -> i32 {
+        if above { y - off_y } else { y + off_y }
     }
 
     /// 跟随光标定位。`offset` 为主题 `window.position_offset`（设备像素，已 ×scale）。
@@ -1199,9 +1210,9 @@ impl CandidateWindow {
         offset: (i32, i32),
     ) -> (i32, i32, bool) {
         let (wi, hi) = (w as i32, h as i32);
-        let (ax, below_y, above_y) =
-            Self::caret_anchors(caret_x, caret_y, caret_h, hi, offset.0, offset.1);
-        let (mut x, mut y) = (ax, below_y);
+        // 净锚点（不含 Y 偏移）：方位决策必须基于它，见 apply_offset_y 的说明。
+        let (ax, below_y, above_y) = Self::caret_anchors(caret_x, caret_y, caret_h, hi, offset.0);
+        let (mut x, mut y) = (ax, Self::apply_offset_y(below_y, false, offset.1));
         let mut above = false;
         #[cfg(windows)]
         {
@@ -1221,6 +1232,9 @@ impl CandidateWindow {
                 };
                 if GetMonitorInfoW(mon, &mut mi).as_bool() {
                     let wa = mi.rcWork;
+                    // 可行性判定用**净锚点**（不含主题偏移）：偏移只该改变距离，
+                    // 不该左右「往上还是往下」——含偏移会让 off_y 越大越容易判成两边都
+                    // 放不下，落回下方再被钳到屏幕底、压住光标。
                     let below_ok = below_y + hi <= wa.bottom;
                     let above_ok = above_y >= wa.top;
                     // 垂直方位决策：
@@ -1231,8 +1245,14 @@ impl CandidateWindow {
                     } else {
                         !below_ok && above_ok
                     };
-                    y = if above { above_y } else { below_y };
+                    // 方位定后再施加偏移：上方向上、下方向下，均为远离光标。
+                    y = Self::apply_offset_y(
+                        if above { above_y } else { below_y },
+                        above,
+                        offset.1,
+                    );
                     // 方位定后的越界兜底：贴住对应屏幕边。
+                    // 偏移可能把窗口顶出工作区，这里兜回来——所以偏移必须在钳制之前施加。
                     if above {
                         if y < wa.top {
                             y = wa.top;
@@ -2455,39 +2475,40 @@ mod tests {
     use super::{CandidateWindow, visible_whitespace};
     use std::borrow::Cow;
 
-    /// 主题位置偏移的方向语义：正值恒为「远离光标」。
+    /// 主题位置偏移的方向语义：正值恒为「远离光标」——下方向下、上方向上。
     ///
-    /// 上方锚点若照抄下方的加号，上翻时偏移会把窗口**压向**光标，与配置意图相反。
+    /// 上方若照抄下方的加号，上翻时偏移会把窗口**压向**光标，与配置意图相反。
     /// 这类符号错误从现象很难反推（只有触发上翻的场景才露馅），故直接锁死。
     #[test]
     fn position_offset_always_pushes_away_from_caret() {
-        let (caret_x, caret_y, caret_h, win_h) = (100, 200, 20, 80);
-        let base = CandidateWindow::caret_anchors(caret_x, caret_y, caret_h, win_h, 0, 0);
-        let off = CandidateWindow::caret_anchors(caret_x, caret_y, caret_h, win_h, 5, 12);
-
-        // x：正值右移
-        assert_eq!(off.0 - base.0, 5, "x 偏移右移");
-        // 下方锚点：正值下移（远离光标）
-        assert_eq!(off.1 - base.1, 12, "下方锚点应向下推离光标");
-        // 上方锚点：正值上移（同样远离光标）——差值为负
-        assert_eq!(off.2 - base.2, -12, "上方锚点应向上推离光标，而非压向它");
-
-        // 零偏移 == 旧行为
-        assert_eq!(base.1, caret_y + 2, "下方 = 光标底端 + gap");
-        assert_eq!(
-            base.2,
-            caret_y - caret_h - win_h - 2,
-            "上方 = 底边贴光标顶端"
-        );
+        // 下方：正值下移
+        assert_eq!(CandidateWindow::apply_offset_y(300, false, 12), 312);
+        // 上方：正值上移（同样是远离，不是压向光标）
+        assert_eq!(CandidateWindow::apply_offset_y(300, true, 12), 288);
+        // 零偏移两侧都是恒等
+        assert_eq!(CandidateWindow::apply_offset_y(300, false, 0), 300);
+        assert_eq!(CandidateWindow::apply_offset_y(300, true, 0), 300);
+        // 负偏移语义对称（把窗口拉近光标）
+        assert_eq!(CandidateWindow::apply_offset_y(300, false, -6), 294);
+        assert_eq!(CandidateWindow::apply_offset_y(300, true, -6), 306);
     }
 
-    /// 负偏移允许（把窗口拉近光标），语义对称。
+    /// **净锚点不含 Y 偏移**——这是「偏移不左右上下翻转决策」的地基。
+    ///
+    /// `below_ok`/`above_ok` 拿锚点跟工作区边界比：锚点一旦含偏移，off_y 越大两个条件
+    /// 越难成立，本该上翻的场景会被判成「上方也放不下」，落回下方再被钳到屏幕底、
+    /// 压住光标——表现就是「下方正常、上方遮盖」。故锁死锚点与 off_y 无关。
     #[test]
-    fn position_offset_accepts_negative() {
-        let a = CandidateWindow::caret_anchors(0, 100, 20, 50, 0, 0);
-        let b = CandidateWindow::caret_anchors(0, 100, 20, 50, 0, -6);
-        assert_eq!(b.1 - a.1, -6, "下方锚点上移=靠近光标");
-        assert_eq!(b.2 - a.2, 6, "上方锚点下移=靠近光标");
+    fn caret_anchors_are_independent_of_y_offset() {
+        let (caret_x, caret_y, caret_h, win_h) = (100, 200, 20, 80);
+        let a = CandidateWindow::caret_anchors(caret_x, caret_y, caret_h, win_h, 0);
+        // 净锚点即旧行为：下方=光标底端+gap，上方=底边贴光标顶端
+        assert_eq!(a.1, caret_y + 2, "下方 = 光标底端 + gap");
+        assert_eq!(a.2, caret_y - caret_h - win_h - 2, "上方 = 底边贴光标顶端");
+        // x 偏移仍在锚点里（水平方向没有翻转决策，不受影响）
+        let b = CandidateWindow::caret_anchors(caret_x, caret_y, caret_h, win_h, 5);
+        assert_eq!(b.0 - a.0, 5, "x 偏移右移");
+        assert_eq!((b.1, b.2), (a.1, a.2), "x 偏移不该动垂直锚点");
     }
 
     /// 插入符位置一律夹到合法字符边界——`split_at` 落在字符中间会 panic 掉 UI 线程。
