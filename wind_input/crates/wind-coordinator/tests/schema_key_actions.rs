@@ -304,3 +304,161 @@ fn schema_table_overrides_global_z_key_action() {
     }
     let _ = std::fs::remove_dir_all(&ov);
 }
+
+// ──────────────── 四期：修饰键 keyup 通路 + C 类 toggle_schema ────────────────
+
+const VK_RSHIFT: u32 = 0xA1;
+
+/// 修饰键的 keyup 事件（TSF 只在「干净单击」后转发这类事件，见 KeyEventSink.cpp）。
+fn key_up(vk: u32) -> KeyEventData {
+    KeyEventData {
+        key_code: vk,
+        scan_code: 0,
+        modifiers: 0,
+        event_type: wind_ipc::protocol::EVENT_KEY_UP,
+        toggles: 0,
+        event_seq: 0,
+        prev_char: 0,
+    }
+}
+
+/// C 类 `toggle_schema` 的往返：五笔按右 Shift 去拼音，再按回五笔。
+///
+/// ★ 回程**不要求目标方案配对称的绑定**——本例 pinyin 的 override 里没有任何
+/// `key_actions`，回程仍然成立。这正是方案级只收 `toggle_schema`、不收单向
+/// `switch_schema` 的理由：后者会把用户锁在目标方案里（见设计文档 §5）。
+#[test]
+fn toggle_schema_on_modifier_round_trips() {
+    if !has_schemas() {
+        eprintln!("跳过：缺少 build_dev/data 方案");
+        return;
+    }
+    let ov = make_override("tgl_rt", "wubi86", "rshift = \"toggle_schema:pinyin\"");
+    let coord = Coordinator::new_headless_with_override(
+        cfg_for("wubi86"),
+        Some(&data_dir()),
+        Some(ov.clone()),
+    );
+    assert_eq!(coord.active_schema_id(), "wubi86");
+
+    coord.handle_key_event(&key_up(VK_RSHIFT));
+    assert_eq!(coord.active_schema_id(), "pinyin", "右 Shift 应切到 pinyin");
+
+    // 回程靠运行时来源，与 pinyin 有没有配 rshift 无关。
+    coord.handle_key_event(&key_up(VK_RSHIFT));
+    assert_eq!(coord.active_schema_id(), "wubi86", "再按应回到来源方案");
+
+    let _ = std::fs::remove_dir_all(&ov);
+}
+
+/// 修饰键的绑定必须进 `key_up` 转发集，否则 TSF 压根不发这个 keyup ——
+/// 绑定在配置里躺着但永远不触发，是「配了不生效」里最难查的一种。
+///
+/// 断言的是**推给 C++ 的白名单**，不是内部结构：这是可达性的唯一来源。
+#[test]
+fn modifier_binding_enters_key_up_forward_set() {
+    if !has_schemas() {
+        eprintln!("跳过：缺少 build_dev/data 方案");
+        return;
+    }
+    let ov = make_override("tgl_fwd", "wubi86", "rshift = \"toggle_schema:pinyin\"");
+    let coord = Coordinator::new_headless_with_override(
+        cfg_for("wubi86"),
+        Some(&data_dir()),
+        Some(ov.clone()),
+    );
+    let hashes = coord.debug_key_up_hotkeys();
+    assert!(
+        hashes.iter().any(|h| (h & 0xFFFF) == VK_RSHIFT),
+        "rshift 应在 key_up 转发集里，实际: {hashes:?}"
+    );
+    let _ = std::fs::remove_dir_all(&ov);
+}
+
+/// 转发集取**所有方案的并集**：即便当前活跃的是 pinyin，wubi86 里绑的 rshift
+/// 也要在集合里。按活跃方案裁剪就得在每次切方案后重推白名单，漏一次的表现是
+/// 「刚切完方案这个键不灵、点下别的窗口又灵了」。
+#[test]
+fn key_up_forward_set_is_union_across_schemas() {
+    if !has_schemas() {
+        eprintln!("跳过：缺少 build_dev/data 方案");
+        return;
+    }
+    let ov = make_override("tgl_union", "wubi86", "rshift = \"toggle_schema:pinyin\"");
+    // 活跃方案是 pinyin，它自己没配任何 key_actions。
+    let coord = Coordinator::new_headless_with_override(
+        cfg_for("pinyin"),
+        Some(&data_dir()),
+        Some(ov.clone()),
+    );
+    let hashes = coord.debug_key_up_hotkeys();
+    assert!(
+        hashes.iter().any(|h| (h & 0xFFFF) == VK_RSHIFT),
+        "别的方案绑的修饰键也要在转发集里，实际: {hashes:?}"
+    );
+    // 但**不动作**：活跃方案没绑，keyup 落回全局链。
+    assert_eq!(coord.active_schema_id(), "pinyin");
+    coord.handle_key_event(&key_up(VK_RSHIFT));
+    assert_eq!(
+        coord.active_schema_id(),
+        "pinyin",
+        "活跃方案没绑该键，不应切方案"
+    );
+    let _ = std::fs::remove_dir_all(&ov);
+}
+
+/// `toggle_schema` 绑在**有字符的键**上不生效（core 侧忽略 + warn）。
+///
+/// 不是遗漏：它必须在英文模式下也按得动（否则切到英文方案就回不来），而有字符的键
+/// 走的 keydown 链在英文模式分水岭之后。设置页对这个组合给行内提示。
+#[test]
+fn toggle_schema_ignored_on_character_key() {
+    if !has_schemas() {
+        eprintln!("跳过：缺少 build_dev/data 方案");
+        return;
+    }
+    let ov = make_override("tgl_char", "wubi86", "backslash = \"toggle_schema:pinyin\"");
+    let coord = Coordinator::new_headless_with_override(
+        cfg_for("wubi86"),
+        Some(&data_dir()),
+        Some(ov.clone()),
+    );
+    coord.handle_key_event(&key(0xDC)); // backslash
+    assert_eq!(
+        coord.active_schema_id(),
+        "wubi86",
+        "有字符的键上的 toggle_schema 应被忽略"
+    );
+    let _ = std::fs::remove_dir_all(&ov);
+}
+
+/// ★ 回程记录**用掉即失效**：连按三次是「去 → 回 → 再去」，不是在两边反复横跳时
+/// 拿陈旧记录乱送。
+///
+/// 第三次按下时活跃方案已回到 wubi86，该方案里 rshift **有**绑定，故走的是正常去程；
+/// 若回程记录没被 take 掉，这一次会被当成回程处理。
+#[test]
+fn return_authorization_is_consumed_once() {
+    if !has_schemas() {
+        eprintln!("跳过：缺少 build_dev/data 方案");
+        return;
+    }
+    let ov = make_override("tgl_once", "wubi86", "rshift = \"toggle_schema:pinyin\"");
+    let coord = Coordinator::new_headless_with_override(
+        cfg_for("wubi86"),
+        Some(&data_dir()),
+        Some(ov.clone()),
+    );
+
+    coord.handle_key_event(&key_up(VK_RSHIFT));
+    assert_eq!(coord.active_schema_id(), "pinyin", "第一次：去程");
+    coord.handle_key_event(&key_up(VK_RSHIFT));
+    assert_eq!(coord.active_schema_id(), "wubi86", "第二次：回程");
+    coord.handle_key_event(&key_up(VK_RSHIFT));
+    assert_eq!(
+        coord.active_schema_id(),
+        "pinyin",
+        "第三次应是新的去程，而非拿用掉的记录再回一次"
+    );
+    let _ = std::fs::remove_dir_all(&ov);
+}

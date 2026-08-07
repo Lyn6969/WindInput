@@ -241,6 +241,36 @@ pub fn key_name_to_vk_with_letters(name: &str) -> Option<u32> {
     None
 }
 
+/// 纯修饰键名 → VK（`lshift` / `rshift` / `lctrl` / `rctrl`，别名见实现）。
+/// 大小写与首尾空白不敏感；非修饰键返回 None。
+///
+/// # 为什么单开一张表，不并进 [`KEY_TABLE`]
+///
+/// `KEY_TABLE` 是**引导键**的配置解析入口（`trigger_keys` 五处、`special_trigger_vk`），
+/// 而引导键走 keydown。修饰键在 keydown 上根本不工作——它必须走 keyup 轻敲
+/// （keydown 不能吃、`Ctrl+A` 的第一下会误触发、按住会连触发，见
+/// `KeyEventSink.cpp::_IsPureModifierKey`）。并进去就等于让引导键的设置项接受一个
+/// 「配得上、永远不触发」的值，与临拼触发键里那个失效的 `z` 选项同型（已修，勿再造）。
+///
+/// 另一半理由是 `KeyDef.prefix`：修饰键没有字符，填什么都是假的，而 `vk_to_prefix_char`
+/// 拿它写组合区。
+///
+/// 当前唯一消费者是方案级 `[key_actions]`（见 `Coordinator::bound_action_for`）。
+pub fn modifier_name_to_vk(name: &str) -> Option<u32> {
+    match name.trim().to_lowercase().as_str() {
+        "lshift" | "leftshift" | "left_shift" => Some(VK_LSHIFT),
+        "rshift" | "rightshift" | "right_shift" => Some(VK_RSHIFT),
+        "lctrl" | "lcontrol" | "leftctrl" | "left_ctrl" => Some(VK_LCONTROL),
+        "rctrl" | "rcontrol" | "rightctrl" | "right_ctrl" => Some(VK_RCONTROL),
+        _ => None,
+    }
+}
+
+/// 该 VK 是否为纯修饰键（四个连号，见常量定义处说明）。
+pub fn is_pure_modifier_vk(vk: u32) -> bool {
+    (VK_LSHIFT..=VK_RCONTROL).contains(&vk)
+}
+
 /// VK → 组合区前缀字符。无映射时返回 None（调用方自定默认）。
 pub fn vk_to_prefix_char(vk: u32) -> Option<char> {
     KEY_TABLE.iter().find(|d| d.vk == vk).map(|d| d.prefix)
@@ -370,5 +400,31 @@ mod tests {
         assert_eq!(vk_to_prefix_char(VK_SLASH), Some('/'));
         assert_eq!(vk_to_prefix_char(VK_BACKSLASH), Some('\\'));
         assert_eq!(vk_to_prefix_char(0x41), None); // 字母无前缀定义
+    }
+
+    /// 修饰键走**独立**的解析入口，不进 `KEY_TABLE`——后者是引导键（keydown）的配置
+    /// 解析口，而修饰键只在 keyup 轻敲上工作。混在一起就会让引导键设置项接受一个
+    /// 配得上却永不触发的值（临拼触发键里那个失效的 `z` 选项就是这么来的，已修）。
+    #[test]
+    fn modifier_names_resolve_only_via_dedicated_entry() {
+        assert_eq!(modifier_name_to_vk("rshift"), Some(VK_RSHIFT));
+        assert_eq!(modifier_name_to_vk("RShift"), Some(VK_RSHIFT)); // 大小写不敏感
+        assert_eq!(modifier_name_to_vk(" lctrl "), Some(VK_LCONTROL)); // 首尾空白不敏感
+        assert_eq!(modifier_name_to_vk("rcontrol"), Some(VK_RCONTROL)); // 别名
+        assert_eq!(modifier_name_to_vk("backslash"), None); // 符号键不归它管
+        // 反向：引导键的解析口**不认**修饰键，否则 trigger_keys 里能配 rshift 却永不触发。
+        assert_eq!(key_name_to_vk("rshift"), None);
+        assert_eq!(key_name_to_vk_with_letters("rshift"), None);
+    }
+
+    /// 纯修饰键判定覆盖四个连号，且不误伤相邻 VK。
+    #[test]
+    fn pure_modifier_vk_range_is_exact() {
+        for vk in [VK_LSHIFT, VK_RSHIFT, VK_LCONTROL, VK_RCONTROL] {
+            assert!(is_pure_modifier_vk(vk), "0x{vk:02X} 应是纯修饰键");
+        }
+        assert!(!is_pure_modifier_vk(0x9F)); // 区间下界之前
+        assert!(!is_pure_modifier_vk(0xA4)); // VK_LMENU，区间上界之后
+        assert!(!is_pure_modifier_vk(VK_Z));
     }
 }

@@ -414,6 +414,10 @@ impl Coordinator {
                 }
                 Some(self.commit_and_enter_special_mode(state, idx, key_code))
             }
+            // C 类只在修饰键 keyup 上可用，而本函数是**有字符键**的 keydown 路径。
+            // 两条独立理由（`toggle_schema_by_id` 自加锁会死锁 + 英文模式分水岭后走不到
+            // 就回不来）见 `enter_bound_action` 的同名分支。
+            BoundAction::ToggleSchema(_) => None,
         }
     }
 
@@ -963,10 +967,12 @@ impl Coordinator {
     /// # 回程为什么记来源、而不是配置里写死目标
     ///
     /// 写死目标的话，从别的方案按进来时回程会把用户送到一个他没待过的方案（拼音 → 英文
-    /// → 五笔）。记来源则 `拼音→英文→拼音`、`五笔→英文→五笔` 都成立，且**不要求目标
-    /// 方案配对称的绑定**——后者正是「切过去回不来」那类锁死的根源（见
+    /// → 五笔）。记来源则 `拼音→英文→拼音`、`五笔→英文→五笔` 都成立（见
     /// docs/design/schema-key-actions.md §5）。
-    pub(crate) fn toggle_schema_by_id(&self, schema_id: &str) {
+    ///
+    /// `trigger_vk` = 触发本次切换的键（0 = 全局热键等非方案级绑定）。记下它，回程才
+    /// **真正**不依赖目标方案的配置——见 [`Self::schema_return_key_action`]。
+    pub(crate) fn toggle_schema_by_id(&self, schema_id: &str, trigger_vk: u32) {
         let current = self.engine_mgr.active_schema_id();
         if current == schema_id {
             // 已在目标方案：回来源。take 而非 clone——回程用掉这一次记录，
@@ -978,7 +984,9 @@ impl Coordinator {
                 .take();
             match origin {
                 // 代际相等 = 自记录以来无人动过活跃方案，这条来源仍代表用户的往返意图。
-                Some((origin, generation)) if generation == self.engine_mgr.schema_generation() => {
+                Some((origin, generation, _))
+                    if generation == self.engine_mgr.schema_generation() =>
+                {
                     self.switch_schema_by_id(&origin)
                 }
                 // 无来源（刚启动）或来源已失效（期间用别的方式切过方案）：**no-op**。
@@ -997,7 +1005,53 @@ impl Coordinator {
             *self
                 .schema_toggle_origin
                 .lock()
-                .unwrap_or_else(|e| e.into_inner()) = Some((current, generation));
+                .unwrap_or_else(|e| e.into_inner()) = Some((current, generation, trigger_vk));
+        }
+    }
+
+    /// 该键此刻是否是「回程键」——即刚才正是用它把用户带到当前方案的。
+    ///
+    /// # 为什么需要它
+    ///
+    /// 方案级 `[key_actions]` 按**活跃方案**查表。去程后活跃方案已经是目标方案了，若目标
+    /// 方案没配同一个键，查表落空 ⇒ 按不动 ⇒ 回不来。于是「五笔按 RShift 进英文方案」
+    /// 变成要求英文方案自己也配一遍 RShift——那正是 §5 想消除的对称配置负担，只是从
+    /// 「N² 个定向绑定」降到了「每个方案配同一个键」，并没有消除。
+    ///
+    /// 有了触发键记录，去程后该键在目标方案里**临时**获得回程语义，有效期与来源记录
+    /// 同寿（代际一变即失效）。这才兑现「回程不依赖目标方案的配置」。
+    ///
+    /// `vk == 0` 的记录（全局热键触发）不参与：那类键本来就在所有方案里都生效。
+    pub(crate) fn schema_return_key_action(&self, key_code: u32) -> bool {
+        if key_code == 0 {
+            return false;
+        }
+        let guard = self
+            .schema_toggle_origin
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        matches!(
+            guard.as_ref(),
+            Some((_, generation, vk))
+                if *vk == key_code && *generation == self.engine_mgr.schema_generation()
+        )
+    }
+
+    /// 执行回程：回到来源方案并用掉记录。调用方须先用
+    /// [`Self::schema_return_key_action`] 确认，且**不得持 `State` 锁**。
+    pub(crate) fn run_schema_return(&self) -> bool {
+        let origin = self
+            .schema_toggle_origin
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take();
+        match origin {
+            Some((origin, generation, _)) if generation == self.engine_mgr.schema_generation() => {
+                debug!("toggle_schema: 回程 -> {origin}");
+                self.switch_schema_by_id(&origin);
+                true
+            }
+            _ => false,
         }
     }
 

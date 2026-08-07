@@ -195,18 +195,57 @@ Ctrl 误触发、宿主对按住的键重复发 keydown（实测 28 秒 145 次�
 
 做法复用既有机制、C++ 零改动：注册进 `CompiledHotkeys.key_up`，由 `IsKeyUpHotkey` 接管。
 
+C++ 零改动已查证（`KeyEventSink.cpp`）：`IsKeyUpHotkey` 命中只是把该键标记成
+`isToggleModeKey`（历史命名，实为「这个键的 keyup 要送服务端」），而 keydown 侧
+`*pfEaten = !_IsPureModifierKey(wParam)` —— **纯修饰键一律放行不吃**，AutoCAD 那个坑
+早已修过。C++ 不关心服务端拿这个 keyup 干什么。
+
+#### ★ 缺口：方案级表的键怎么进转发集（2026-08-07 补，原设计漏了这一环）
+
+上面那句「注册进 `CompiledHotkeys.key_up`」隐含了一个当时没验证的前提。实际情况是：
+**`CompiledHotkeys` 由 `ConfigBundle::build` 从全局 `Config` 编译，方案文件根本不在其中**。
+而 `key_up_tsf_hashes()` 是推给 C++ 的白名单——不在里面，TSF 就不发这个 keyup，
+绑定在配置里躺着但永远不触发。这是 keyup 类绑定**唯一**的可达性来源。
+
+修法：转发集取**所有方案的并集**（`EngineManager::all_key_action_keys`，启动时算一次），
+动作按**活跃方案**裁决。
+
+| 方案 | 取舍 |
+|---|---|
+| 并集（选用） | 静态，无时序风险。代价：方案 A 绑的 `rshift` 在方案 B 里也被转发但不动作——keydown 不吃、服务端查表落空即 return，宿主无感 |
+| 按活跃方案裁剪 | 每次切方案都要重编译 + 重推白名单。漏一次的表现是「刚切完方案这个键不灵，点下别的窗口又灵了」——低频、难复现 |
+
+`all_key_action_keys` 走的是**静态** `read_schema(id, data_dir, override_dir)`，不需要方案
+被加载，故在 `Coordinator::build` 里 `EngineManager` 刚建好就能算。
+
 > ⚠️ **必须重查 `is_toggle_mode_keycode` 的判定**。该函数原本按「key_up 表里有没有这个
 > key_code」判定，`select_key_groups` 进表时已经踩过一次（只配了选词用的 Ctrl 会被当成
 > 切换键，空闲敲 Ctrl 莫名切中英文），修法是**按 `action` 过滤**而非按键码。`key_actions`
 > 的修饰键条目进表是第二次触碰这条，同样要按 action 过滤。
+>
+> 实施时用了独立 action 名 `schema_bound`（不复用 `toggle_mode`），故该函数无需改动——
+> 但这正是因为它当初已经改成按 action 过滤了。
 
 keyup 分支内的优先级，沿用既有裁决「有候选选词、无候选切换」：
 
 ```
 handle_select_key_up（二三候选键，有候选时赢）
-  → key_actions 查表
+  → key_actions 查表（handle_bound_modifier_key_up）
   → is_toggle_mode_keycode
 ```
+
+#### ★★ C 类只能绑修饰键：两条独立理由指向同一结论
+
+`toggle_schema` **不在有字符的键上生效**（core 侧忽略并 `warn`，设置页给行内提示）：
+
+1. **英文模式分水岭**（§4.1）：有字符的键走 keydown 位置 12，英文模式下根本到不了。
+   切到英文方案后按不动 = 回不来，而回程正是这个动词存在的理由。
+2. **锁约束**（实施时发现）：`enter_bound_action` 的契约是「调用方持 `State` 锁」，而
+   `toggle_schema_by_id` → `finish_user_schema_switch` 自己 `state.lock()` —— 在那里调
+   就是死锁。故 C 类由 `run_toggle_schema_action` 在**锁外**执行。
+
+两条各自独立成立，都指向「C 类 ⇒ 无字符键 ⇒ keyup 通路」。判据仍是**键的形态**，
+不是动词类别——这与 §4.1 的表格是同一条规则的两次应用。
 
 ### 4.5 与全局 `trigger_keys` 的关系（一期不动全局）
 
@@ -301,8 +340,8 @@ handle_select_key_up（二三候选键，有候选时赢）
 |---|---|---|
 | ~~一~~ ✅ | `toggle_schema:<id>` 动词 + `keys.key_actions` 全局表 | 已完成 |
 | ~~二~~ ✅ | 方案级 `[key_actions]` 表（B/D 类 + 有字符键）+ 字母裁决泛化 | 已完成 |
-| 三 | 设置页动态列表编辑器（见 §9.3） | 中，新控件 |
-| 四 | 无字符键（修饰键 keyup 通路）+ C 类进方案级表 | 中高，触碰 `is_toggle_mode_keycode` |
+| ~~三~~ ✅ | 设置页动态列表编辑器（见 §9.3） | 已完成 |
+| ~~四~~ ✅ | 无字符键（修饰键 keyup 通路）+ C 类进方案级表 | 已完成 |
 | 五 | 全局层收编 + 冲突检测 + **A 类补全** | 高，改既有行为 |
 
 设置页排在三期而非最后：二期交付后能力只能靠手改方案文件使用，中间隔太久等于没交付。
@@ -346,6 +385,20 @@ A/C 类动词在方案级表里的行为（尚未实施）。
   本身绑死在 z 上，不是通用概念。
 - 字母键沿用「仅码表引擎」的限制（拼音/混输里字母全是有效输入，借作功能键会丢首字母）；
   **符号键不限引擎**——拼音方案里用 `\` 进快符同样合理，这是二期新增的能力。
+
+四期落地情况（修饰键 keyup 通路 + C 类）：
+
+- 修饰键的键名解析**单开一张表**（`keymap::modifier_name_to_vk`），不并进 `KEY_TABLE`。
+  后者是**引导键**的配置解析入口，而引导键走 keydown、修饰键在那条路上根本不工作——
+  并进去就等于让引导键设置项接受一个「配得上、永远不触发」的值，与已修掉的「临拼触发键里
+  那个失效的 z 选项」同型。另一半理由是 `KeyDef.prefix`：修饰键没有字符，填什么都是假的。
+- 转发集的可达性缺口见 §4.4 的补充段——那是原设计漏掉的一环，也是四期真正的工作量所在。
+- C 类只能绑修饰键，两条独立理由见 §4.4 末段。
+- 仍未做：**A 类**（`toggle_punct` / `take_screenshot` 那类）进方案级表，属五期。
+
+⚠️ 四期**尚未真机验证**。单测覆盖了往返、转发集并集、有字符键上的忽略，但
+「TSF 是否真的按新白名单转发 RShift 的 keyup」只有真机能证——那正是本期唯一的
+跨进程环节，也是最可能出问题的地方。
 ### ★★ 二期真机翻车：进模式有两条通路，方案表只接了一条
 
 **现象**：方案里写 `semicolon = "none"`，空码按 `;` 仍然进快捷输入。

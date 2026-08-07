@@ -628,9 +628,40 @@ pub(crate) struct ConfigBundle {
     pub(crate) custom_en_punct_chars: std::collections::BTreeSet<char>,
 }
 
+/// 所有方案 `[key_actions]` 里绑过的纯修饰键 VK（并集）。
+///
+/// 取并集而非活跃方案那一份：`CompiledHotkeys` 随 activation 推给 C++，按活跃方案裁剪
+/// 就得在每次切方案后重推，漏一次的表现是「刚切完方案这个键不灵、点下别的窗口又灵了」。
+/// 并集是静态的，代价只是别的方案里多转发一个不动作的 keyup（keydown 侧纯修饰键一律
+/// 放行，宿主无感）。理由详见 [`EngineManager::all_key_action_keys`]。
+fn schema_bound_modifier_vks(mgr: &EngineManager) -> std::collections::BTreeSet<u32> {
+    mgr.all_key_action_keys()
+        .iter()
+        .filter_map(|name| keymap::modifier_name_to_vk(name))
+        .collect()
+}
+
 impl ConfigBundle {
-    fn build(config: Config) -> Self {
-        let compiled_hotkeys = hotkey::Compiler::new(config.clone()).compile();
+    /// `schema_bound_modifiers` = 所有方案 `[key_actions]` 里出现过的**纯修饰键** VK
+    /// （见 [`Coordinator::schema_bound_modifier_vks`]）。它们要追加进 `key_up` 转发集，
+    /// 否则 TSF 根本不把这些键的 keyup 送过来——`CompiledHotkeys` 编译自全局 config，
+    /// 方案文件不在其中，这是 keyup 类绑定唯一的可达性来源。
+    fn build(config: Config, schema_bound_modifiers: &std::collections::BTreeSet<u32>) -> Self {
+        let mut compiled_hotkeys = hotkey::Compiler::new(config.clone()).compile();
+        // action 用专门的 `schema_bound` 而不是 `toggle_mode`：`is_toggle_mode_keycode` 按
+        // action 过滤，混用会让「只在某方案里绑了 rshift」的键在所有方案里都切中英文
+        // （与 `select_key_groups` 那次踩的是同一个坑，见该函数的 ⚠ 注释）。
+        for vk in schema_bound_modifiers {
+            // 修饰键的 hash 要带通用位+具体位，与 `compile_toggle_mode_key` 同构：
+            // C++ `GetCurrentModifiers()` 对修饰键同时返回两者，只带一边匹配不上。
+            if let Some(hash) = hotkey::compile_modifier_key_up_hash(*vk) {
+                compiled_hotkeys.key_up.push(hotkey::HotkeyEntry {
+                    tsf_hash: hash,
+                    match_hash: hash,
+                    action: "schema_bound".to_string(),
+                });
+            }
+        }
         let nav_keys =
             keymap::NavKeys::from_config(&config.keys.page_keys, &config.keys.highlight_keys);
         let cn_pairs = parse_pairs(&config.input.auto_pair.chinese_pairs);
@@ -753,6 +784,11 @@ pub struct Coordinator {
     // Shadow 规则已迁至 redb（self.store 的 SHADOW 表）。
     /// 工具栏位置，按显示器 key（"workRight,workBottom"）独立记录。
     pub(crate) toolbar_positions: Mutex<std::collections::HashMap<String, (i32, i32)>>,
+    /// 工具栏当前所在显示器的 key（None=尚未定位）。`sync_toolbar_monitor` 的去重依据：
+    /// notify_toolbar 在每次模式切换/焦点事件上都跑，无此缓存就会把用户拖动过的位置
+    /// 反复重置回记忆值。拖动落盘时（`save_toolbar_pos`）同步更新，否则拖到别的屏之后
+    /// 这里仍记着旧 key，下一次校正会被误判为「屏没变」而跳过。
+    pub(crate) current_toolbar_monitor: Mutex<Option<String>>,
     /// 候选反查（编码/拆字/拼音）供悬停提示与加词出码；拆字段随主码表方案
     /// 热重载（见 `sync_chaizi_assets`），拼音段启动加载后不变。
     pub(crate) reverse: std::sync::RwLock<wind_reverse::ReverseLookup>,
@@ -892,7 +928,15 @@ pub struct Coordinator {
     /// 期间**任何**路径切过方案，代际就对不上，来源自动失效。零散点接线。
     ///
     /// 只比对方案 id 是不够的——「切走又切回来」与「从未变过」在 id 上完全同形。
-    pub(crate) schema_toggle_origin: Mutex<Option<(String, u64)>>,
+    ///
+    /// 第三项是**触发键 VK**（0 = 非方案级绑定触发，如全局热键）。有它，回程才真正
+    /// 「不依赖目标方案的配置」：去程后该键在目标方案里临时获得回程语义，哪怕目标方案
+    /// 的 `[key_actions]` 是空的。
+    ///
+    /// ★ 没有这一项时，「五笔按 RShift 去英文方案」要求英文方案**自己也配一遍** RShift
+    /// 才回得来——设计文档 §5 原本断言 `toggle_schema` 对锁死「从结构上免疫」，那只覆盖了
+    /// 「回到哪」，没覆盖「怎么按得动」。测试里复现过。
+    pub(crate) schema_toggle_origin: Mutex<Option<(String, u64, u32)>>,
     /// 当前主题定义的序号槽位字符（views.index.labels）；push_theme 载入时刷新。
     /// 序号优先级：用户配置 index_labels > 本字段 > 默认数字。
     pub(crate) theme_index_labels: Mutex<Vec<String>>,
@@ -1100,10 +1144,9 @@ impl Coordinator {
             });
         }
 
-        // 恢复持久化的工具栏位置（按当前光标所在显示器的 key 查找）
-        if let Some((x, y)) = coordinator.toolbar_pos_for_cursor() {
-            let _ = coordinator.ui_tx.send(UiCommand::SetToolbarPos { x, y });
-        }
+        // 恢复持久化的工具栏位置（按前台窗口所在显示器的 key 查找）。
+        // 与运行期换屏走同一个函数——判据分成两套迟早漂移。
+        coordinator.init_toolbar_pos();
 
         // 加载并下发初始主题。明暗必须走 resolve_theme_dark（system 实时探测系统明暗），
         // 不能硬编码 false——否则跟随系统在**冷启动**这一刻永远回落亮色（实时跟随另有 WM_SETTINGCHANGE
@@ -1314,7 +1357,8 @@ impl Coordinator {
         // （如微信 caret_use_top）。
         let app_compat = wind_config::app_compat::AppCompat::load(data_dir, user_dir.as_deref());
         // 配置的轻量派生缓存集中到 ConfigBundle（支持运行时热替换）。
-        let bundle = ConfigBundle::build(config.clone());
+        let schema_mods = schema_bound_modifier_vks(&engine_mgr);
+        let bundle = ConfigBundle::build(config.clone(), &schema_mods);
         info!(
             "Compiled hotkeys: {} key_down, {} key_up",
             bundle.compiled_hotkeys.key_down.len(),
@@ -1552,6 +1596,7 @@ impl Coordinator {
             s2t: Mutex::new(s2t),
             common_chars,
             toolbar_positions: Mutex::new(toolbar_positions_init),
+            current_toolbar_monitor: Mutex::new(None),
             reverse: std::sync::RwLock::new(reverse),
             chaizi_assets: Mutex::new(ChaiziAssets {
                 db: chaizi_db,
@@ -2250,7 +2295,8 @@ impl Coordinator {
     pub(crate) fn refresh_config_in_memory(&self, mutate: impl FnOnce(&mut Config)) {
         let mut cfg = self.rt().config.clone();
         mutate(&mut cfg);
-        let bundle = std::sync::Arc::new(ConfigBundle::build(cfg));
+        let mods = schema_bound_modifier_vks(&self.engine_mgr);
+        let bundle = std::sync::Arc::new(ConfigBundle::build(cfg, &mods));
         *self.rt.write().unwrap_or_else(|e| e.into_inner()) = bundle;
         // 状态气泡去重缓存只在"内容配置不变"的前提下有效：改了 ui.status.items 之类后，
         // 同一状态该合成出不同文本，留着旧缓存会把改动后的第一次显示误判成"内容没变"而吞掉。
@@ -2274,7 +2320,8 @@ impl Coordinator {
                 let cand_was_fixed = old.config.ui.candidate.is_fixed_position();
                 drop(old);
 
-                let bundle = std::sync::Arc::new(ConfigBundle::build(cfg));
+                let mods = schema_bound_modifier_vks(&self.engine_mgr);
+                let bundle = std::sync::Arc::new(ConfigBundle::build(cfg, &mods));
                 let new_cfg = bundle.config.clone();
                 *self.rt.write().unwrap_or_else(|e| e.into_inner()) = bundle;
                 info!("User config hot-reloaded (schema_dirty={})", schema_dirty);
@@ -2495,6 +2542,14 @@ impl Coordinator {
     /// 当前活跃方案 ID（测试/诊断用）
     pub fn active_schema_id(&self) -> String {
         self.engine_mgr.active_schema_id()
+    }
+
+    /// 推给 TSF 的 key_up 热键白名单（测试/诊断用）。
+    ///
+    /// 这正是 `push_activation_status` 发出去的那份，不是另算一遍——修饰键类绑定
+    /// 「能不能被触发」完全取决于它在不在这里面，用旁路重算的值断言等于没测。
+    pub fn debug_key_up_hotkeys(&self) -> Vec<u32> {
+        self.rt().compiled_hotkeys.key_up_tsf_hashes()
     }
 
     /// 当前是否中文模式（测试/诊断用）
@@ -3998,7 +4053,7 @@ impl Coordinator {
         }
     }
 
-    fn build_status(&self) -> StatusUpdateData {
+    pub(crate) fn build_status(&self) -> StatusUpdateData {
         let (chinese_mode, full_width, chinese_punct, toolbar_visible, caps_lock) = {
             let s = self.state.lock().unwrap_or_else(|e| e.into_inner());
             (
@@ -5398,6 +5453,18 @@ impl MessageHandler for Coordinator {
             if let Some(act) = self.handle_select_key_up(data) {
                 return act;
             }
+            // 方案级 `[key_actions]` 绑在修饰键上的功能（`rshift = "toggle_schema:english"`）。
+            // **先于** is_toggle_mode_keycode：同一个键两处都配时，方案级是更具体的声明，
+            // 与 keydown 侧「方案表命中即跳过全局链」同一裁决方向。
+            //
+            // 只处理纯修饰键：有字符的键归 keydown 的 try_activate_mode 管（英文模式下
+            // 必须让它出字），两条路各管一半、不重叠。判据是键的形态而非动词类别，
+            // 见 docs/design/schema-key-actions.md §4.1。
+            if keymap::is_pure_modifier_vk(data.key_code) {
+                if let Some(act) = self.handle_bound_modifier_key_up(data.key_code) {
+                    return act;
+                }
+            }
             if self.is_toggle_mode_keycode(data.key_code) {
                 debug!("toggle_mode key_up: code=0x{:02X}", data.key_code);
                 // 切换前是否有未上屏的编码/候选（决定是否需要结束应用 composition）。
@@ -5496,7 +5563,10 @@ impl MessageHandler for Coordinator {
             } else if let Some(id) = action.strip_prefix("toggle_schema:") {
                 // 方案往返热键（keys.key_actions）：切过去，再按一次回来源。
                 // 与 switch_schema 同样**不判 chinese_mode**——回程尤其要在英文态按得动。
-                self.toggle_schema_by_id(id);
+                //
+                // trigger_vk 传 0：全局热键在所有方案里都生效，不需要「回程键临时授权」
+                // 那套（那是方案级绑定专有的问题，见 `schema_return_key_action`）。
+                self.toggle_schema_by_id(id, 0);
                 return KeyAction::StatusUpdate(self.build_status());
             } else if let Some(id) = action.strip_prefix("switch_schema:") {
                 // 方案直达热键：切 active 方案。**不判 chinese_mode**——与循环键
@@ -7517,7 +7587,7 @@ mod reload_tests {
         let mut cfg = Config::default();
         cfg.input.auto_pair.chinese_pairs = vec!["（）".to_string(), "【】".to_string()];
         cfg.input.auto_pair.english_pairs = vec!["()".to_string()];
-        let b = ConfigBundle::build(cfg);
+        let b = ConfigBundle::build(cfg, &Default::default());
         assert_eq!(b.cn_pairs, vec![('（', '）'), ('【', '】')]);
         assert_eq!(b.en_pairs, vec![('(', ')')]);
     }
@@ -7547,7 +7617,7 @@ mod reload_tests {
     fn config_bundle_parses_jump_out_keys() {
         let mut cfg = Config::default();
         cfg.input.auto_pair.jump_out_keys = vec!["tab".into(), "enter".into()];
-        let b = ConfigBundle::build(cfg);
+        let b = ConfigBundle::build(cfg, &Default::default());
         assert!(b.jump_out_keys.contains(&keymap::VK_TAB));
         assert!(b.jump_out_keys.contains(&keymap::VK_RETURN));
         assert_eq!(b.jump_out_keys.len(), 2);
@@ -7559,7 +7629,7 @@ mod reload_tests {
         let mut cfg = Config::default();
         cfg.input.symbol.smart_mode = true;
         cfg.ui.candidate.per_page = 9;
-        let b = ConfigBundle::build(cfg);
+        let b = ConfigBundle::build(cfg, &Default::default());
         assert!(b.config.input.symbol.smart_mode);
         assert_eq!(b.config.ui.candidate.per_page, 9);
     }

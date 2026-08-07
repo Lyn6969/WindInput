@@ -117,6 +117,21 @@ impl Default for FreqSettings {
     }
 }
 
+/// 「作为混输辅助的拼音」才有的收敛项。
+///
+/// 存在的理由：有些拼音行为只在混输语境下需要收紧——混输的击键串**同时是码表码**，
+/// 把它整串当拼音解读会抢走码表候选的首位。这类判据不能从全局配置读（纯拼音方案不该
+/// 受影响），只能由调用方按语境注入，故设为 `build_engine` 的参数而非配置字段。
+///
+/// `Option<MixPinyinOpts>` 的 `None`/`Some` **本身就是判据**（是不是混输辅助），
+/// 字段则承载具体取值。此前这里是个裸 `Option<bool>`（只有简拼开关），语境判据与取值
+/// 挤在一个布尔里，加第二个收敛项时无处安放。
+#[derive(Clone, Copy)]
+struct MixPinyinOpts {
+    /// `schema.mix.enable_pinyin_abbrev`：是否产出简拼候选。
+    abbrev: bool,
+}
+
 /// 引擎管理器（懒加载：仅在需要时构建对应方案引擎，降低启动内存）
 pub struct EngineManager {
     /// schema_id -> 引擎实例（懒加载，Arc 便于无锁 convert）
@@ -1725,6 +1740,35 @@ impl EngineManager {
         table
     }
 
+    /// **所有**可用方案的 `[key_actions]` 里出现过的键名（并集，去重）。
+    ///
+    /// 用途只有一个：算出「需要让 TSF 转发 keyup 的修饰键」。转发集必须是并集而非
+    /// 活跃方案的那一份——`CompiledHotkeys` 在启动时编译一次并随 activation 推给 C++，
+    /// 若按活跃方案裁剪，切方案后 C++ 手里就是旧表，修饰键要等下次焦点切换才生效
+    /// （表现为「刚切完方案这个键不灵，点一下别的窗口又灵了」）。
+    ///
+    /// 取并集的代价是方案 A 配的 `rshift` 在方案 B 里也被转发。无害：keydown 侧纯修饰键
+    /// 一律放行不吃（`KeyEventSink.cpp::_IsPureModifierKey`），到了服务端
+    /// `bound_action_for` 按**活跃**方案查表落空即不动作。
+    ///
+    /// 不走 `key_actions_cache`：该缓存按活跃方案 id 存单份，而这里要的是跨方案的并集。
+    pub fn all_key_action_keys(&self) -> std::collections::BTreeSet<String> {
+        let ids = self
+            .available
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        let mut out = std::collections::BTreeSet::new();
+        for id in ids {
+            if let Some(s) =
+                Self::read_schema(&id, self.data_dir.as_deref(), self.override_dir.as_deref())
+            {
+                out.extend(s.key_actions.into_keys());
+            }
+        }
+        out
+    }
+
     pub fn codetable_settings(&self) -> wind_config::CodetableGlobal {
         let id = self.active_schema_id();
         let global = self
@@ -2222,9 +2266,7 @@ impl EngineManager {
 
     /// 为指定 schema 构建引擎
     ///
-    /// `pinyin_abbrev`：拼音简拼开关的**上下文覆盖**。`None` = 用引擎默认（开，历史行为）；
-    /// 仅混输构建 secondary 时传 `Some(schema.mix.enable_pinyin_abbrev)`——简拼是「混输时」
-    /// 的选项，纯拼音方案不受影响，故不能只看全局配置、须由调用方按语境注入。
+    /// `mix_pinyin`：见 [`MixPinyinOpts`]。`None` = 不是混输辅助拼音，走引擎默认。
     #[allow(clippy::too_many_arguments)]
     fn build_engine(
         schema_id: &str,
@@ -2234,7 +2276,7 @@ impl EngineManager {
         mix_cfg: &wind_config::MixGlobal,
         override_dir: Option<&Path>,
         pinyin_cfg: &wind_config::config::PinyinGlobalConfig,
-        pinyin_abbrev: Option<bool>,
+        mix_pinyin: Option<MixPinyinOpts>,
     ) -> Option<Box<dyn Engine>> {
         let data_dir = data_dir?;
         let schemas = data_dir.join("schemas");
@@ -2257,8 +2299,8 @@ impl EngineManager {
                 pinyin_cfg,
                 None,
             )?;
-            // secondary（拼音）是**唯一**注入简拼开关的地方：`schema.mix.enable_pinyin_abbrev`
-            // 只约束「作为混输辅助的拼音」，纯拼音方案走 build_engine 时仍传 None（简拼照常开）。
+            // secondary（拼音）是**唯一**注入 [`MixPinyinOpts`] 的地方：这些收敛只约束
+            // 「作为混输辅助的拼音」，纯拼音方案走 build_engine 时仍传 None（行为不变）。
             let secondary = if m.secondary_schema.is_empty() {
                 None
             } else {
@@ -2270,7 +2312,9 @@ impl EngineManager {
                     mix_cfg,
                     override_dir,
                     pinyin_cfg,
-                    Some(mix_cfg.enable_pinyin_abbrev),
+                    Some(MixPinyinOpts {
+                        abbrev: mix_cfg.enable_pinyin_abbrev,
+                    }),
                 )
             };
             let boost = if m.codetable_weight_boost > 0 {
@@ -2418,7 +2462,11 @@ impl EngineManager {
                 show_code_hint: pg.show_code_hint,
                 use_smart_compose: pg.use_smart_compose,
                 // 无覆盖（纯拼音方案）时保持历史行为：简拼开。
-                enable_abbrev: pinyin_abbrev.unwrap_or(true),
+                enable_abbrev: mix_pinyin.map(|o| o.abbrev).unwrap_or(true),
+                // 残码整句只在**非混输**下启用，理由见 `PinyinConfig::enable_partial_final`。
+                // ⚠️ 判据是「是不是混输辅助」本身，不是 `abbrev` 的取值——两个开关恰好都
+                // 「混输时关掉」，但语义正交，串用会在其中一个被单独调整时静默错配。
+                enable_partial_final: mix_pinyin.is_none(),
                 completion_min_syllables: pg.completion.min_syllables,
                 completion_max_extra_syllables: pg.completion.max_extra_syllables,
             };

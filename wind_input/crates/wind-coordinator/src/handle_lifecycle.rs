@@ -6,7 +6,7 @@
 
 use crate::coordinator::{Coordinator, State, punct_char};
 use crate::pipeline::ModeKind;
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 use wind_bridge::handler::{KeyAction, KeyEventData};
 use wind_config::BoundAction;
 use wind_ipc::protocol::{MOD_ALT, MOD_CTRL, MOD_SHIFT};
@@ -313,9 +313,16 @@ impl Coordinator {
     /// 键名走 `key_name_to_vk_with_letters`——本表**接受字母**，与只认符号的全局
     /// `trigger_keys` 相反：字母能否借作功能键取决于「这张码表里它是不是死码」，那正是
     /// 方案级配置才能表达的判断（见 [`Self::bound_action_key_yields`]）。
+    ///
+    /// 再叠一层 `modifier_name_to_vk`：修饰键的键名**不在** `KEY_TABLE` 里（那是引导键的
+    /// 解析口，走 keydown，修饰键在那条路上不工作），故必须显式并进来。少了这一层的表现是
+    /// 「转发集里有这个键、TSF 也发了 keyup，但查表查不到、什么都不发生」——已在测试里
+    /// 复现过一次。
     pub(crate) fn bound_action_for(&self, key_code: u32) -> Option<BoundAction> {
         for (name, action) in self.engine_mgr.active_key_actions() {
-            if keymap::key_name_to_vk_with_letters(&name) == Some(key_code) {
+            let vk = keymap::key_name_to_vk_with_letters(&name)
+                .or_else(|| keymap::modifier_name_to_vk(&name));
+            if vk == Some(key_code) {
                 return Some(BoundAction::parse(&action));
             }
         }
@@ -449,6 +456,72 @@ impl Coordinator {
                 }
                 debug!("key_action: entering special idx={}", idx);
                 Some(self.enter_special_mode(state, idx, key_code))
+            }
+            // C 类**不在这里执行**，见 [`Self::run_toggle_schema_action`]。
+            //
+            // 本函数的契约是「调用方持 `State` 锁」，而 `toggle_schema_by_id` 要走
+            // `finish_user_schema_switch`，那里自己 `self.state.lock()` —— 在这里调就是死锁。
+            //
+            // 这条锁约束与 §4.1 的插入点判据**独立地指向同一结论**：C 类必须在英文模式下
+            // 也生效（否则切到英文方案就回不来），而本函数在分水岭之后的 keydown 路径上，
+            // 英文态根本走不到。故 C 类只在无字符键（修饰键 keyup）上可用。
+            BoundAction::ToggleSchema(id) => {
+                warn!("key_actions: toggle_schema:{id} 只能绑修饰键（无字符键），此处忽略");
+                None
+            }
+        }
+    }
+
+    /// 执行 C 类 `toggle_schema`。**必须在不持 `State` 锁时调用**——内部经
+    /// `finish_user_schema_switch` 自行加锁，见 [`Self::enter_bound_action`] 里的说明。
+    ///
+    /// 目标加载不了时返回 `None` 不吞键：与各模式门卫同策略，配了个不可用的目标不该
+    /// 把这个键废掉，且用户看不出原因。
+    fn run_toggle_schema_action(&self, id: &str, trigger_vk: u32) -> Option<KeyAction> {
+        if !self.engine_mgr.ensure_schema(id) {
+            warn!("key_actions: toggle_schema 目标 {id} 加载失败，不动作");
+            return None;
+        }
+        debug!("key_actions: toggle_schema -> {id}");
+        self.toggle_schema_by_id(id, trigger_vk);
+        Some(KeyAction::StatusUpdate(self.build_status()))
+    }
+
+    /// 纯修饰键 keyup 上的方案级绑定分派（`rshift = "toggle_schema:english"` 这类）。
+    ///
+    /// 与 keydown 侧的 `try_activate_mode` 是**互补的两半**，不是重复：修饰键没有字符，
+    /// 到不了 keydown 那条链（TSF 只在干净单击后于 keyup 转发，见 `KeyEventSink.cpp`）。
+    /// 判据是键的形态（有无字符），不是动词类别——见 schema-key-actions.md §4.1。
+    ///
+    /// 返回 `None` 表示本函数不接管，调用方继续走 `is_toggle_mode_keycode`。
+    pub(crate) fn handle_bound_modifier_key_up(&self, key_code: u32) -> Option<KeyAction> {
+        match self.bound_key_decision(key_code) {
+            // 活跃方案没绑这个键，但它可能是**回程键**——刚才正是用它把用户带到当前方案的。
+            // 少了这一条，「五笔按 RShift 去英文方案」就要求英文方案自己也配一遍才回得来。
+            // 见 `schema_return_key_action`。
+            BoundKeyDecision::NotBound => {
+                if self.schema_return_key_action(key_code) && self.run_schema_return() {
+                    return Some(KeyAction::StatusUpdate(self.build_status()));
+                }
+                None
+            }
+            // 显式 `none`：屏蔽该键的全局绑定（多半是 `toggle_mode`）。必须**接管**并
+            // 返回 Consumed，落到下面就等于 `none` 没生效——这正是 `;` 那次漏接的形态。
+            BoundKeyDecision::Yield => {
+                debug!("bound modifier key_up 0x{key_code:02X} 让位（多为显式 none）");
+                Some(KeyAction::Consumed)
+            }
+            // C 类必须在**锁外**执行（`toggle_schema_by_id` 自己加锁），故先于取锁分流。
+            BoundKeyDecision::Act(BoundAction::ToggleSchema(id)) => {
+                self.run_toggle_schema_action(&id, key_code)
+            }
+            BoundKeyDecision::Act(action) => {
+                let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+                let act = self.enter_bound_action(&mut state, &action, key_code);
+                drop(state);
+                // 门卫没过（目标模式不可用）时**不吞键**：返回 None 让全局链接手，
+                // 与 keydown 侧 `enter_bound_action` 返回 None 的处置一致。
+                act
             }
         }
     }

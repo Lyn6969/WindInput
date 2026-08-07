@@ -322,6 +322,22 @@ fn compile_toggle_mode_key(key: &str) -> Option<u32> {
     }
 }
 
+/// 纯修饰键 VK → keyup hash（含通用位+具体位）。方案级 `[key_actions]` 绑修饰键时，
+/// 用它把该键登记进 `key_up` 转发集——不登记 TSF 就不发这个 keyup，绑定形同虚设。
+///
+/// 与 [`compile_toggle_mode_key`] 同格式但入参是 VK 而非键名：调用方（协调器）手里
+/// 已经是解析好的 VK（`keymap::modifier_name_to_vk`），再转回字符串只为了重新解析
+/// 一次，中间多一层拼写契约就多一处静默失配的机会。
+pub fn compile_modifier_key_up_hash(vk: u32) -> Option<u32> {
+    match vk {
+        VK_LSHIFT => Some(key_hash(MOD_SHIFT | MOD_LSHIFT, VK_LSHIFT)),
+        VK_RSHIFT => Some(key_hash(MOD_SHIFT | MOD_RSHIFT, VK_RSHIFT)),
+        VK_LCONTROL => Some(key_hash(MOD_CTRL | MOD_LCTRL, VK_LCONTROL)),
+        VK_RCONTROL => Some(key_hash(MOD_CTRL | MOD_RCTRL, VK_RCONTROL)),
+        _ => None,
+    }
+}
+
 /// 展开 "ctrl+number" / "ctrl+shift+number" 为 0-9 共 10 个 session 热键
 fn compile_number_hotkey(template: &str) -> Vec<HotkeyEntry> {
     let mods = match template.trim().to_lowercase().as_str() {
@@ -1016,5 +1032,27 @@ mod tests {
                 .any(|e| e.action.starts_with("enter_special:") || e.action == "enter_temp_pinyin"),
             "空 hotkey / 空 id 不应产生直达热键条目"
         );
+    }
+
+    /// 修饰键的 keyup hash 必须带**通用位 + 具体位**：C++ `GetCurrentModifiers()` 对
+    /// 修饰键同时返回两者，只带一边会匹配不上（表现为「绑了没反应」）。
+    /// 与 `compile_toggle_mode_key` 同格式——两者服务于同一条 TSF keyup 通路。
+    #[test]
+    fn modifier_key_up_hash_matches_toggle_format() {
+        assert_eq!(
+            compile_modifier_key_up_hash(VK_RSHIFT),
+            compile_toggle_mode_key("rshift"),
+            "同一个键经两条入口应得到同一个 hash"
+        );
+        assert_eq!(
+            compile_modifier_key_up_hash(VK_LCONTROL),
+            compile_toggle_mode_key("lctrl")
+        );
+        // 低 16 位是 VK，供 is_pure_modifier_vk / 分派点反查。
+        let h = compile_modifier_key_up_hash(VK_RSHIFT).unwrap();
+        assert_eq!(h & 0xFFFF, VK_RSHIFT);
+        // 非修饰键没有 keyup 形态（CapsLock 也不在此列：它走 toggle_mode_keys 那条）。
+        assert_eq!(compile_modifier_key_up_hash(VK_OEM_1), None);
+        assert_eq!(compile_modifier_key_up_hash(VK_CAPITAL), None);
     }
 }

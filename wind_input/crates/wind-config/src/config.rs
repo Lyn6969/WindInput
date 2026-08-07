@@ -475,6 +475,7 @@ impl Default for PinyinGlobalConfig {
 /// - `"temp_english"`：进临时英文
 /// - `"mix:<id>"`：进指定融合模式（`mix:quick_mix` = 内置「快捷」）
 /// - `"special:<id>"`：进指定特殊模式
+/// - `"toggle_schema:<id>"`：切到指定方案，再按回来（仅方案级 `[key_actions]` 用）
 ///
 /// 未知值一律解析成 [`BoundAction::None`]（不静默变成别的功能）；指向不存在的 id 由消费端
 /// 的门卫拦下（`mix_members` / `ensure_schema`），并在加载期 `warn`。
@@ -490,6 +491,13 @@ pub enum BoundAction {
     Mix(String),
     /// 进指定特殊模式（携带实例 id）。
     Special(String),
+    /// 切到指定方案，**再按回到来源**（携带目标方案 id）。
+    ///
+    /// 与全局热键的 `switch_schema:<id>`（单向）刻意不同名：方案级绑定 + 单向切换
+    /// 会锁死用户（五笔里配 `rshift`→英文方案，而英文方案没配 `rshift` ⇒ 回不来）。
+    /// 往返语义由**运行时来源**兜底，不要求目标方案配对称的绑定。
+    /// 见 docs/design/schema-key-actions.md §5。
+    ToggleSchema(String),
 }
 
 impl BoundAction {
@@ -510,6 +518,14 @@ impl BoundAction {
                 Self::None
             } else {
                 Self::Special(id.to_string())
+            };
+        }
+        if let Some(id) = s.strip_prefix("toggle_schema:") {
+            let id = id.trim();
+            return if id.is_empty() {
+                Self::None
+            } else {
+                Self::ToggleSchema(id.to_string())
             };
         }
         match s.to_lowercase().as_str() {
