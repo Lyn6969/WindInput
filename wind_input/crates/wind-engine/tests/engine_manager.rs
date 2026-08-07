@@ -380,13 +380,20 @@ fn test_pinyin_trailing_partial_keeps_sentence() {
     // 尾部多打一个不成音节的残码「m」：整句「你好」**不得被残码破坏**（bug①），
     // 残码不计入消费（consumed_length=5，留「m」在缓冲续输）。
     //
-    // ⚠️ 本测试原先断言的是「整句排**首位**」。那是 bug① 修复时顺手写下的实现细节，
-    // 而它真正要守的是「整句没被残码毁掉」——当年的故障形态是整句**消失/退化**，不是排序。
-    // 现整句在 step 6.5b 让位于「恰好用完残码的补全」（`nihaoma` 音节数 3 == completed 2 + 1），
-    // 属**降级不销毁**：整句仍在候选中、consumed_length 不变，只是排到「你好吗」之后。
-    // 故原不变量逐条仍被下面断言守着，只是不再要求它占首位。
-    // 理由见 `pinyin/mod.rs` step 6.5b 注释（对齐 librime `has_exact_match_phrase`：
-    // 存在覆盖完整输入的精确词条时不生成整句）。
+    // ⚠️ 本测试**两度**收窄过断言，两次都是因为它在测别的层的事：
+    //
+    // ① 原先断言「整句排首位」。那是 bug① 修复时顺手写下的实现细节，它真正要守的是
+    //    「整句没被残码毁掉」——当年的故障形态是整句**消失/退化**，不是排序。
+    // ② 后改断言「首选是你好吗」（step 6.5b 让位的结果）。step 2c 落地后这条也不成立了：
+    //    Viterbi 现在**直接产出**「你好吗」作为残码整句（`prefix=0`、`code=nihaom`），
+    //    它不再是「让位的受益者」而就是整句本身，6.5b 自然不触发（`is_sentence_demoted=0`）。
+    //    此时引擎层首选回到消费更少但 log_prob 更高的「你好」（少一个词），**这没有错**：
+    //    引擎侧刻意不按 `consumed_length` 排序（那会让消费少的候选被 truncate 整批丢弃，
+    //    见 `handle_candidate.rs` 比较链 ⓪ 的注释）。
+    //
+    // ⇒ 「谁排首位」是**协调器**的事，由 `wind-coordinator/tests/pinyin_trailing_partial_order.rs`
+    //    守着（那里断言 nihaom 首选是「你好吗」）。本测试只守引擎层的不变量：
+    //    两个候选都在、身份正确、consumed_length 各自正确。
     let r = mgr.convert("nihaom", 9);
     let top: Vec<&str> = r
         .candidates
@@ -394,9 +401,14 @@ fn test_pinyin_trailing_partial_keeps_sentence() {
         .take(8)
         .map(|c| c.text.as_str())
         .collect();
+    let responded = r
+        .candidates
+        .iter()
+        .find(|c| c.text == "你好吗")
+        .unwrap_or_else(|| panic!("「你好吗」须在候选中（它响应了残码 m），实际: {top:?}"));
     assert_eq!(
-        r.candidates[0].text, "你好吗",
-        "首候选应为 你好吗（它响应了残码 m），实际: {top:?}"
+        responded.consumed_length, 6,
+        "「你好吗」须消费全部 6 键，实际: {top:?}"
     );
     let sentence = r
         .candidates

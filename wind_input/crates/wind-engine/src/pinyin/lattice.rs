@@ -136,6 +136,39 @@ const PARTIAL_FINAL_NODE_LIMIT: usize = 12;
 /// 对 crate 内可见：`PinyinEngine::convert` 用它给「覆盖全部输入的词典精确整词」
 /// 算单节点等价分，使其与 Viterbi 整句在同一量纲比较（见 mod.rs step 1.5）。
 pub(crate) fn score_node(word: &str, weight: i32, unigram: Option<&dyn UnigramLookup>) -> f64 {
+    score_node_inner(word, weight, unigram, true)
+}
+
+/// **尾部残码待定音节**专用打分：与 [`score_node`] 相同，但**不给单字虚词优待**。
+///
+/// ## 为什么必须去掉
+///
+/// 虚词优待合计 **8.0** 的量级差（`FUNCTION_WORD_BONUS` +2.0、实词 `SINGLE_CHAR_PENALTY`
+/// −3.0、再豁免 `WORD_PENALTY` 3.0），足以碾压任何 unigram 差距。落在残码位上的后果：
+/// `zhonghuar` 补出「中华**让**」而非「中华人」、`nihaom` 补出「你好**们**」而非「你好吗」
+/// ——「让」「们」都在虚词表里，「人」「吗」不在。
+///
+/// ## 为什么这不是给残码开特例
+///
+/// 虚词优待的**前提**是「虚词随内容词出现是语法黏着，不该付投机拆分的代价」（见
+/// [`score_node`] 内 `WORD_PENALTY` 处的长注释）。那个前提描述的是**整句内部**已经成形的
+/// 搭配。残码位是「用户打到一半的那个音节」——它是虚词的先验并不比实词高，语法黏着
+/// 无从谈起。**同一条加成，在两个位置的前提不同**，故按位置区分而非按词性区分。
+pub(crate) fn score_node_partial_final(
+    word: &str,
+    weight: i32,
+    unigram: Option<&dyn UnigramLookup>,
+) -> f64 {
+    score_node_inner(word, weight, unigram, false)
+}
+
+/// `function_word_credit`：是否给单字虚词优待，见 [`score_node_partial_final`]。
+fn score_node_inner(
+    word: &str,
+    weight: i32,
+    unigram: Option<&dyn UnigramLookup>,
+    function_word_credit: bool,
+) -> f64 {
     const SINGLE_CHAR_PENALTY: f64 = -3.0;
     const FUNCTION_WORD_BONUS: f64 = 2.0; // 虚词加成（Go 原名 functionWordPenalty，值为正）
     const VERB_PARTICLE_PENALTY: f64 = -1.0;
@@ -161,7 +194,7 @@ pub(crate) fn score_node(word: &str, weight: i32, unigram: Option<&dyn UnigramLo
     };
 
     if char_count == 1 {
-        if is_function_word(word) {
+        if function_word_credit && is_function_word(word) {
             log_prob += FUNCTION_WORD_BONUS;
         } else {
             log_prob += SINGLE_CHAR_PENALTY;
@@ -195,7 +228,7 @@ pub(crate) fn score_node(word: &str, weight: i32, unigram: Option<&dyn UnigramLo
     // （填鸭式 w=152）便能压过「天涯+是」这种 2 词正解——这正是 bigram P(是|天涯)
     // 该解决而 unigram 解决不了的（lm.rs SimpleBigramModel 已备、缺磁盘语料）。豁免虚词
     // 的每词罚是对该缺陷的近似补偿：不让「虚词自成一词」这件语法必然的事付投机拆分的代价。
-    if !(char_count == 1 && is_function_word(word)) {
+    if !(function_word_credit && char_count == 1 && is_function_word(word)) {
         log_prob -= WORD_PENALTY;
     }
     log_prob
@@ -499,7 +532,10 @@ impl LatticeBuilder {
             {
                 continue;
             }
-            let log_prob = score_node(&hit.text, hit.weight, unigram) - PARTIAL_FINAL_PENALTY;
+            // ⚠️ 用 `score_node_partial_final` 而非 `score_node`：残码位不给虚词优待，
+            // 否则「让」「们」这类虚词凭 8.0 的量级差碾压「人」「吗」。见该函数文档。
+            let log_prob =
+                score_node_partial_final(&hit.text, hit.weight, unigram) - PARTIAL_FINAL_PENALTY;
             nodes[input_len].push(LatticeNode {
                 start: completed_len,
                 end: input_len,

@@ -219,10 +219,17 @@ fn sentence_yields_to_completion_that_exhausts_trailing_partial() {
     };
 
     // 正例：补全恰好用完残码（音节数 == completed + 1）⇒ 整句让位。
+    //
+    // ⚠️ `nihaom`→你好吗 与 `zhongguor`→中国人 **已从本列表移出**，不是因为坏了，而是
+    // step 2c（残码整句）落地后它们不再经过本机制：Viterbi 直接把残码补成那个字，产出的
+    // 整句**就是**「你好吗」/「中国人」本身（`is_prefix=0`、`code` 含残码），既不是补全、
+    // 也就无所谓让位（实测 `is_sentence_demoted=0`）。它们改由
+    // `test_trailing_partial_completes_into_sentence` 覆盖。
+    //
+    // 6.5b 仍然必要且在此被守着：留下的两条是**Viterbi 选出的字与词库补全不一致**的情形
+    // ——`zhongguorenm` 整句是「中国人吗」而补全是「中国人民」，此时才需要让位。
     for (input, want, note) in [
-        ("nihaom", "你好吗", "3 == 2+1，整句「你好」让位"),
-        ("zhongguor", "中国人", "3 == 2+1，整句「中国」让位"),
-        ("zhongguorenm", "中国人民", "4 == 3+1，整句「中国人」让位"),
+        ("zhongguorenm", "中国人民", "4 == 3+1，整句「中国人吗」让位"),
         (
             "zhonghuarenmingongheg",
             "中华人民共和国",
@@ -365,7 +372,17 @@ fn test_trailing_partial_completes_into_sentence() {
     };
     let mgr = manager(&dir);
 
-    for (input, want) in [("buzhidaok", "不知道看"), ("jisuanjik", "计算机看")] {
+    // 后三条从 `sentence_yields_to_completion_that_exhausts_trailing_partial` 移入：
+    // 它们此前靠 6.5b「整句让位于补全」间接达成，现在由 step 2c 直接产出。
+    // ⚠️「人」「吗」都是**实词/非虚词表成员**，而被它们取代的「让」「们」在虚词表里——
+    // 这三条同时守着 `score_node_partial_final`（残码位不给虚词优待），去掉那个函数即变红。
+    for (input, want) in [
+        ("buzhidaok", "不知道看"),
+        ("jisuanjik", "计算机看"),
+        ("nihaom", "你好吗"),
+        ("zhongguor", "中国人"),
+        ("zhonghuar", "中华人"),
+    ] {
         let cands = mgr.convert_with("pinyin", input, 300).candidates;
         let hit = cands.iter().find(|c| c.text == want).unwrap_or_else(|| {
             panic!(

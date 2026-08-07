@@ -131,6 +131,13 @@
   （`buzhidaok` → 「不知道」+ `k`→「看」→ **不知道看**）。对齐 librime `enable_completion`
   （`algo/syllabifier.cc`）与 fcitx5 的「不完整拼音」。
   惩罚 `PARTIAL_FINAL_PENALTY = ln2`（= librime `kCompletionPenalty` 的量级）。
+  ★ **残码位不给单字虚词优待**（`score_node_partial_final`）：`score_node` 给单字虚词
+  `FUNCTION_WORD_BONUS`(+2.0)、给实词 `SINGLE_CHAR_PENALTY`(−3.0)，再豁免 `WORD_PENALTY`(3.0)，
+  合计 **8.0** 的量级差，碾压任何 unigram 差距 —— 实测补出「中华**让**」而非「中华人」、
+  「你好**们**」而非「你好吗」（让/们在虚词表，人/吗不在）。该优待的前提是「虚词随内容词
+  出现是语法黏着」，描述的是**整句内部已成形的搭配**；残码位是「用户打到一半的那个音节」，
+  是虚词的先验并不比实词高，前提不成立。**同一条加成在两个位置前提不同 ⇒ 按位置区分，
+  不按词性区分。**
   ★ **不能让 `add_abbrev_nodes` 兼职**：二者都是「补音节图给不出的节点」、代码形状几乎一样，
   但简拼节点会把**已完成的音节也重切**成声母序列。实测放开简拼闸门让残码入图，
   `buzhidaok` 产出「不直达欧卡」、`nihaom` 产出「你黑暗欧美」——`bu zhi dao` 被拆回
