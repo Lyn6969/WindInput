@@ -8,7 +8,7 @@ use crate::theme_style::ThemeStyle;
 use wind_bridge::handler::MessageHandler;
 use wind_config::Config;
 use wind_keys::keymap;
-use wind_ui::manager::{CandidateOp, MenuCmd, MenuKind, ToolbarAction, UiCommand};
+use wind_ui::manager::{CandidateOp, MenuAnchor, MenuCmd, MenuKind, ToolbarAction, UiCommand};
 use wind_ui::toolbar::ToolbarState;
 
 /// 菜单打开后的焦点事件豁免期，见 [`Coordinator::menu_close_on_focus_change`]。
@@ -336,10 +336,7 @@ impl Coordinator {
         self.mark_menu_open(0, String::new());
         let _ = self.ui_tx.send(UiCommand::ShowCandidateMenu {
             items,
-            x,
-            y,
-            y_bottom: y,
-            above: false,
+            anchor: MenuAnchor::at_point(x, y),
         });
     }
 
@@ -358,10 +355,7 @@ impl Coordinator {
         self.mark_menu_open(0, String::new());
         let _ = self.ui_tx.send(UiCommand::ShowCandidateMenu {
             items,
-            x,
-            y,
-            y_bottom: y,
-            above: false,
+            anchor: MenuAnchor::at_point(x, y),
         });
     }
 
@@ -416,10 +410,7 @@ impl Coordinator {
         self.mark_menu_open(0, String::new());
         let _ = self.ui_tx.send(UiCommand::ShowCandidateMenu {
             items,
-            x,
-            y,
-            y_bottom: y,
-            above: false,
+            anchor: MenuAnchor::at_point(x, y),
         });
     }
 
@@ -744,19 +735,13 @@ impl Coordinator {
 
     /// 循环切换到下一个主题，重绘并持久化选择。
     /// 构建并显示功能主菜单（对齐 Go 统一菜单：方案/主题子菜单 + 勾选态）。
-    /// x/y 为屏幕坐标；i32::MIN 表示由 UI 取光标位置。
-    /// above=true：菜单在 (x,y) 上方弹出（工具栏触发，避免遮挡工具栏）；
-    /// y_bottom 为工具栏底边，上方空间不足时改为从 y_bottom 向下弹出。
-    pub(crate) fn show_main_menu(&self, x: i32, y: i32, y_bottom: i32, above: bool) {
+    /// 位置与展开方向全由 `anchor` 描述，见 [`wind_ui::manager::MenuPlacement`]。
+    pub(crate) fn show_main_menu(&self, anchor: MenuAnchor) {
         let items = self.build_main_menu_items();
         self.mark_menu_open(0, String::new());
-        let _ = self.ui_tx.send(UiCommand::ShowCandidateMenu {
-            items,
-            x,
-            y,
-            y_bottom,
-            above,
-        });
+        let _ = self
+            .ui_tx
+            .send(UiCommand::ShowCandidateMenu { items, anchor });
     }
 
     /// macOS 精简功能菜单（IMK 输入源菜单 + 候选框右键空白菜单共用）。
@@ -1217,10 +1202,7 @@ impl Coordinator {
         // 候选右键菜单在光标处向下弹出（above=false，y_bottom 不使用）。
         let _ = self.ui_tx.send(UiCommand::ShowCandidateMenu {
             items,
-            x,
-            y,
-            y_bottom: y,
-            above: false,
+            anchor: MenuAnchor::at_point(x, y),
         });
     }
 

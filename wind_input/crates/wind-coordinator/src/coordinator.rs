@@ -3856,12 +3856,7 @@ impl Coordinator {
             UiEvent::RequestCandidateMenu { page_local, x, y } => {
                 self.show_candidate_menu(page_local, x, y)
             }
-            UiEvent::RequestMainMenu {
-                x,
-                y,
-                y_bottom,
-                above,
-            } => self.show_main_menu(x, y, y_bottom, above),
+            UiEvent::RequestMainMenu(anchor) => self.show_main_menu(anchor),
             UiEvent::MenuAction(kind) => self.menu_action(kind),
             UiEvent::MenuClose => {
                 // ESC / 点击别处关闭：无动作派发，可直接解除 tooltip 隐藏抑制。
@@ -5203,7 +5198,7 @@ impl MessageHandler for Coordinator {
         // 若在此调 show_main_menu 会把协调器置 menu_open=true 并经 forward_menu_key 吞掉后续
         // 所有按键，而 macOS 无弹窗、永不回 MenuClose → 输入被永久卡死 (打字无响应)。
         #[cfg(not(target_os = "macos"))]
-        self.show_main_menu(x, y, y, false);
+        self.show_main_menu(wind_ui::manager::MenuAnchor::at_point(x, y));
         #[cfg(target_os = "macos")]
         let _ = (x, y);
     }

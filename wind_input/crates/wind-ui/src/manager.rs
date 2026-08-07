@@ -120,14 +120,9 @@ pub enum UiCommand {
     /// 拆字字根字体（PUA 字根字符渲染）：TTF 文件路径 + DWrite 家族名（取自方案 [engine.chaizi]）。
     SetTooltipChaiziFont { path: String, family: String },
     /// 显示菜单（候选右键菜单 / 功能主菜单；UI 自管导航与子菜单）。
-    /// above=true：菜单底边对齐 (x,y) 向上展开（工具栏菜单用，避免遮挡工具栏）；
-    /// y_bottom 为锚点区域下边界，上方空间不足时改为从 y_bottom 向下弹出。
     ShowCandidateMenu {
         items: Vec<MenuItemSpec>,
-        x: i32,
-        y: i32,
-        y_bottom: i32,
-        above: bool,
+        anchor: MenuAnchor,
     },
     /// 转发键给打开的菜单（方向键/回车/ESC/空格）；菜单窗无焦点，键由协调器转发
     MenuKey(u32),
@@ -440,6 +435,75 @@ impl MenuKind {
     }
 }
 
+/// 菜单相对锚点的展开方向。
+///
+/// 取代早先的 `above: bool`——加入侧向后就是三态，布尔位表达不了，硬塞会变成
+/// `above`/`side` 两个互斥布尔而类型不作担保。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MenuPlacement {
+    /// 顶边贴锚点顶边向下展开（光标处右键：候选/状态泡/Tooltip/诊断 HUD）。
+    Below,
+    /// 底边贴锚点顶边向上展开；上方装不下则翻到锚点底边之下。
+    /// 横向工具栏用，避免菜单压住工具栏本身。
+    Above,
+    /// 贴锚点侧边展开：右侧装得下走右侧，否则走左侧。
+    /// 纵向工具栏用——竖条上仍向上弹会让菜单飘到条顶之上老远。
+    Side,
+}
+
+/// 菜单锚点：屏幕坐标矩形 + 展开方向。
+///
+/// 聚合成一个类型而非散落的 `x/y/right/bottom/placement` 五个参数：**哪些边参与定位是
+/// 由 `placement` 决定的**（`Below` 只看左上、`Above` 还要下边、`Side` 还要右边），
+/// 这份知识只有收在一处才不会在某个调用点被漏填成 0 而静默错位。
+#[derive(Debug, Clone, Copy)]
+pub struct MenuAnchor {
+    /// 锚点左边（`i32::MIN` = 由 UI 取当前光标位，此时其余边同样退化为该点）。
+    pub x: i32,
+    /// 锚点上边。
+    pub y: i32,
+    /// 锚点右边（仅 `Side` 使用）。
+    pub right: i32,
+    /// 锚点下边（仅 `Above` 的翻转回退使用）。
+    pub bottom: i32,
+    pub placement: MenuPlacement,
+}
+
+impl MenuAnchor {
+    /// 点状锚点，向下展开。`i32::MIN` 表示取光标位。
+    pub fn at_point(x: i32, y: i32) -> Self {
+        Self {
+            x,
+            y,
+            right: x,
+            bottom: y,
+            placement: MenuPlacement::Below,
+        }
+    }
+
+    /// 矩形锚点，向上展开（横向工具栏）。
+    pub fn above_rect(x: i32, y: i32, bottom: i32) -> Self {
+        Self {
+            x,
+            y,
+            right: x,
+            bottom,
+            placement: MenuPlacement::Above,
+        }
+    }
+
+    /// 矩形锚点，侧向展开（纵向工具栏）。
+    pub fn beside_rect(x: i32, y: i32, right: i32, bottom: i32) -> Self {
+        Self {
+            x,
+            y,
+            right,
+            bottom,
+            placement: MenuPlacement::Side,
+        }
+    }
+}
+
 /// 菜单项规格（由协调器构建）。支持勾选态与子菜单。
 ///
 /// `PartialEq` 供弹出菜单的增量重绘用：`popup_menu::reconcile` 靠它判断某一层
@@ -512,15 +576,8 @@ pub enum UiEvent {
     CandidateOp { op: CandidateOp, page_local: usize },
     /// 右键候选请求弹出菜单（页内下标 + 屏幕坐标）；协调器据此构建菜单项回送
     RequestCandidateMenu { page_local: usize, x: i32, y: i32 },
-    /// 请求功能主菜单（屏幕坐标）；来自候选窗空白/工具栏右键或设置键。
-    /// above=true：菜单在 (x,y) 上方弹出（工具栏触发，避免遮挡工具栏）；
-    /// y_bottom 为工具栏底边，上方空间不足时改为从 y_bottom 向下弹出。
-    RequestMainMenu {
-        x: i32,
-        y: i32,
-        y_bottom: i32,
-        above: bool,
-    },
+    /// 请求功能主菜单；来自候选窗空白/工具栏右键或设置键。
+    RequestMainMenu(MenuAnchor),
     /// 菜单项激活（携带动作）：UI 自管导航/子菜单，仅把最终动作回送协调器
     MenuAction(MenuKind),
     /// 关闭菜单（点击菜单外 / ESC / 右键）
@@ -921,16 +978,16 @@ impl UiManager {
                             m.hide();
                         }
                     }
-                    UiCommand::ShowCandidateMenu {
-                        items,
-                        x,
-                        y,
-                        y_bottom,
-                        above,
-                    } => {
-                        debug!("UI: ShowMenu ({} items) at ({},{})", items.len(), x, y);
+                    UiCommand::ShowCandidateMenu { items, anchor } => {
+                        debug!(
+                            "UI: ShowMenu ({} items) at ({},{}) {:?}",
+                            items.len(),
+                            anchor.x,
+                            anchor.y,
+                            anchor.placement
+                        );
                         if let Some(m) = &mut popup_menu {
-                            m.show(items, x, y, y_bottom, above);
+                            m.show(items, anchor);
                         }
                     }
                     UiCommand::MenuKey(key) => {

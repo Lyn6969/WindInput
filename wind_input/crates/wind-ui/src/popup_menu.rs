@@ -9,7 +9,7 @@ use std::cell::RefCell;
 use std::rc::Rc;
 use std::sync::mpsc::Sender;
 
-use crate::manager::{MenuItemSpec, MenuKind, UiEvent};
+use crate::manager::{MenuAnchor, MenuItemSpec, MenuKind, MenuPlacement, UiEvent};
 use crate::sys::{
     GetAsyncKeyState, GetCursorPos, HWND, IDC_ARROW, LPARAM, LRESULT, LoadCursorW, POINT,
     ReleaseCapture, SW_HIDE, SetCapture, SetCursor, ShowWindow, VK_LBUTTON, VK_MBUTTON, VK_RBUTTON,
@@ -544,42 +544,28 @@ impl PopupMenu {
         self.invalidate_rendered();
     }
 
-    /// 显示菜单（顶层 items）于屏幕坐标 (x,y)。i32::MIN → 取光标位。
-    /// `y_bottom`：锚点区域下边界（工具栏底边）；`above=true` 时优先向上展开，
-    /// 上方工作区空间不足则改为从 `y_bottom` 向下弹出。
-    pub fn show(&mut self, items: Vec<MenuItemSpec>, x: i32, y: i32, y_bottom: i32, above: bool) {
+    /// 显示菜单（顶层 items）于 `anchor` 描述的位置。展开方向见 [`MenuPlacement`]。
+    pub fn show(&mut self, items: Vec<MenuItemSpec>, anchor: MenuAnchor) {
         if items.is_empty() {
             return;
         }
         if self.ensure_windows(1).is_err() {
             return;
         }
-        let (ax, mut ay) = if x == i32::MIN || y == i32::MIN {
+        let (ax, ay) = if anchor.x == i32::MIN || anchor.y == i32::MIN {
             let mut p = POINT::default();
             unsafe {
                 let _ = GetCursorPos(&mut p);
             }
             (p.x, p.y)
         } else {
-            (x, y)
+            (anchor.x, anchor.y)
         };
         // DPI 动态化：先按显示点所在显示器取缩放，再测量/构建（几何依赖 scale）。
         self.ensure_scale(ax, ay);
         // 先测量根面板尺寸以钳制锚点（选中态不影响尺寸，传无选中即可）。
         let (_root, w, h, _hits) = self.build_view(&items, NONE_SEL);
-        // above：菜单底边对齐 (x,y) 向上展开（工具栏菜单用，避免遮挡工具栏）。
-        // 若向上展开后顶边低于工作区上边界，则翻转为从 y_bottom 向下弹出。
-        if above {
-            let tentative = ay - h as i32;
-            let has_space = work_area_of(ax, ay)
-                .map(|(_, top, _, _)| tentative >= top)
-                .unwrap_or(true);
-            if has_space {
-                ay = tentative;
-            } else {
-                ay = y_bottom; // 上方空间不足，改为向下弹出
-            }
-        }
+        let (ax, ay) = place_menu(&anchor, ax, ay, w, h, work_area_of(ax, ay));
         self.anchor = clamp_to_work_area(ax, ay, w, h);
         {
             let mut st = self.state.borrow_mut();
@@ -1319,6 +1305,51 @@ fn dpi_scale() -> f32 {
     }
 }
 
+/// 按 `placement` 把菜单摆到锚点旁，返回菜单左上角（**尚未钳制**到工作区）。
+///
+/// `ax`/`ay` 是解析过 `i32::MIN`（取光标位）之后的锚点左上角；`wa` 为该点所在显示器的
+/// 工作区，取不到时一律按「首选方向装得下」处理——让首选方向生效，越界交给调用方的
+/// `clamp_to_work_area` 兜底，而不是凭空翻转。
+///
+/// 抽成纯函数是为了可单测：`show` 余下部分要建 View 树、量 DPI、开 Win32 窗口，
+/// 非 Windows 覆盖不到。
+fn place_menu(
+    anchor: &MenuAnchor,
+    ax: i32,
+    ay: i32,
+    w: u32,
+    h: u32,
+    wa: Option<(i32, i32, i32, i32)>,
+) -> (i32, i32) {
+    match anchor.placement {
+        MenuPlacement::Below => (ax, ay),
+        MenuPlacement::Above => {
+            // 底边贴锚点顶边向上展开；顶出工作区则翻到锚点底边之下。
+            let up = ay - h as i32;
+            let fits_up = wa.map(|(_, top, _, _)| up >= top).unwrap_or(true);
+            (ax, if fits_up { up } else { anchor.bottom })
+        }
+        MenuPlacement::Side => {
+            // 右侧装得下走右侧，否则走左侧。
+            //
+            // 两侧都装不下时仍取右侧：左侧会把菜单推成负坐标，钳回来后正好压在工具栏
+            // 上——那是本分支要避免的事；贴右边缘至少还留着工具栏可见。
+            let fits_right = wa
+                .map(|(_, _, right, _)| anchor.right + w as i32 <= right)
+                .unwrap_or(true);
+            let fits_left = wa
+                .map(|(left, _, _, _)| ax - w as i32 >= left)
+                .unwrap_or(true);
+            let x = if fits_right || !fits_left {
+                anchor.right
+            } else {
+                ax - w as i32
+            };
+            (x, ay)
+        }
+    }
+}
+
 /// 取某屏幕点所在显示器的工作区矩形 (left, top, right, bottom)。
 fn work_area_of(x: i32, y: i32) -> Option<(i32, i32, i32, i32)> {
     #[cfg(windows)]
@@ -1744,5 +1775,80 @@ mod clipboard_tests {
         if !original.is_empty() {
             set_clipboard_text(&original);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // 1080p 典型工作区（底部留 40px 任务栏）。
+    const WA: Option<(i32, i32, i32, i32)> = Some((0, 0, 1920, 1040));
+    // 菜单典型尺寸。
+    const MW: u32 = 200;
+    const MH: u32 = 300;
+
+    /// 光标处右键：顶边贴锚点，原样落点。
+    #[test]
+    fn below_places_menu_at_anchor() {
+        let a = MenuAnchor::at_point(500, 400);
+        assert_eq!(place_menu(&a, 500, 400, MW, MH, WA), (500, 400));
+    }
+
+    /// 横条工具栏（屏幕右下角）：菜单底边贴条顶边向上展开。
+    #[test]
+    fn above_expands_upward_from_anchor_top() {
+        let a = MenuAnchor::above_rect(1700, 900, 930);
+        assert_eq!(place_menu(&a, 1700, 900, MW, MH, WA), (1700, 600));
+    }
+
+    /// 横条贴在屏幕顶部：上方装不下 → 翻到条底边之下，而不是钻出屏幕。
+    #[test]
+    fn above_flips_below_when_no_room_up() {
+        let a = MenuAnchor::above_rect(100, 10, 40);
+        assert_eq!(place_menu(&a, 100, 10, MW, MH, WA), (100, 40));
+    }
+
+    /// 纵条在屏幕左侧：右边装得下 → 菜单贴右边缘展开，纵坐标对齐条顶。
+    #[test]
+    fn side_prefers_right_when_it_fits() {
+        let a = MenuAnchor::beside_rect(20, 500, 50, 700);
+        assert_eq!(place_menu(&a, 20, 500, MW, MH, WA), (50, 500));
+    }
+
+    /// 纵条在屏幕右下角（默认落点）：右边放不下 → 翻到左侧，菜单右缘贴条左缘。
+    #[test]
+    fn side_falls_back_to_left_when_right_is_tight() {
+        let a = MenuAnchor::beside_rect(1870, 600, 1900, 800);
+        assert_eq!(
+            place_menu(&a, 1870, 600, MW, MH, WA),
+            (1870 - MW as i32, 600)
+        );
+    }
+
+    /// 两侧都装不下（窄屏/超宽菜单）：仍取右侧。左侧会算出负坐标，钳回来后正好压在
+    /// 工具栏上——那恰是侧向弹出要避免的事；贴右边缘至少留着工具栏可见。
+    #[test]
+    fn side_keeps_right_when_neither_side_fits() {
+        let narrow = Some((0, 0, 150, 1040));
+        let a = MenuAnchor::beside_rect(100, 300, 130, 500);
+        assert_eq!(place_menu(&a, 100, 300, MW, MH, narrow), (130, 300));
+    }
+
+    /// 取不到工作区时按「首选方向装得下」处理：让首选生效、越界交给钳制，
+    /// 而不是凭空翻转到另一侧。
+    #[test]
+    fn missing_work_area_keeps_preferred_direction() {
+        let up = MenuAnchor::above_rect(100, 500, 530);
+        assert_eq!(place_menu(&up, 100, 500, MW, MH, None), (100, 200));
+        let side = MenuAnchor::beside_rect(100, 500, 130, 700);
+        assert_eq!(place_menu(&side, 100, 500, MW, MH, None), (130, 500));
+    }
+
+    /// 侧向不改纵坐标——菜单与工具栏顶边齐平，越界由调用方钳制处理。
+    #[test]
+    fn side_never_shifts_vertically() {
+        let a = MenuAnchor::beside_rect(20, 777, 50, 900);
+        assert_eq!(place_menu(&a, 20, 777, MW, MH, WA).1, 777);
     }
 }

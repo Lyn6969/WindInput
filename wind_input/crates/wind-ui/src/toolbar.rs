@@ -9,7 +9,7 @@ use std::rc::Rc;
 use std::sync::mpsc::Sender;
 
 use crate::auto_hide::{AutoHide, AutoHideAction};
-use crate::manager::{ToolbarAction, UiEvent};
+use crate::manager::{MenuAnchor, ToolbarAction, UiEvent};
 use crate::sys::{
     GetCursorPos, GetWindowRect, HWND, HWND_TOPMOST, IDC_ARROW, IDC_SIZEALL, LPARAM, LRESULT,
     LoadCursorW, POINT, RECT, ReleaseCapture, SWP_NOACTIVATE, SWP_NOSIZE, SWP_NOZORDER, SetCapture,
@@ -212,6 +212,8 @@ impl Toolbar {
             hover_idx: -1,
             dirty: false,
             cursor_inside: false,
+            size: (0, 0),
+            vertical: false,
         }));
         window.register_mouse(mouse.clone());
         Ok(Self {
@@ -595,6 +597,9 @@ impl Toolbar {
         let (px, py) = {
             let mut m = self.mouse.borrow_mut();
             m.hits = hits; // 同步命中矩形给鼠标处理器
+            // 菜单锚点要用的尺寸/朝向，与命中矩形同源同刻更新——分开更新迟早错位。
+            m.size = (w, h);
+            m.vertical = self.vertical;
             let raw = m.pos.unwrap_or_else(|| Self::corner_position(w, h));
             let clamped = clamp_to_work_area(raw.0, raw.1, w, h);
             m.pos = Some(clamped);
@@ -755,9 +760,31 @@ pub struct ToolbarMouse {
     /// 光标是否在工具栏窗口内（WM_MOUSEMOVE 置 true / WM_MOUSELEAVE 置 false）；
     /// 自动隐藏顺延判据——不能用 hover_idx（拖动柄区为 -1 但光标仍在窗内）。
     cursor_inside: bool,
+    /// 最近一次渲染的窗口尺寸与朝向，由 `render` 同步（与 `hits` 同一处）。
+    /// 菜单锚点据此计算——比现取 `GetWindowRect` 准（渲染刚定的尺寸，无需等窗口生效）
+    /// 且无系统调用。`render` 必先于任何鼠标事件发生，故不存在 (0,0) 被用到的时机。
+    size: (u32, u32),
+    vertical: bool,
 }
 
 impl ToolbarMouse {
+    /// 工具栏当前占据的屏幕矩形 `(left, top, right, bottom)`。
+    fn rect(&self) -> (i32, i32, i32, i32) {
+        let (x, y) = self.pos.unwrap_or((0, 0));
+        (x, y, x + self.size.0 as i32, y + self.size.1 as i32)
+    }
+
+    /// 主菜单锚点：横条向上弹（避免压住工具栏），纵条向侧面弹——竖条上仍向上弹会让
+    /// 菜单飘到条顶之上老远，与点击位置差出整条的高度。
+    fn menu_anchor(&self) -> MenuAnchor {
+        let (l, t, r, b) = self.rect();
+        if self.vertical {
+            MenuAnchor::beside_rect(l, t, r, b)
+        } else {
+            MenuAnchor::above_rect(l, t, b)
+        }
+    }
+
     fn cell_at(&self, x: f32, y: f32) -> Option<ToolbarAction> {
         self.hits
             .iter()
@@ -895,15 +922,10 @@ impl WindowMouse for ToolbarMouse {
                     let _ = self.events.send(UiEvent::ToolbarMoved { x, y });
                 } else if let Some(action) = self.cell_at(cx, cy) {
                     if matches!(action, ToolbarAction::OpenSettings) {
-                        // 设置键 = 弹出功能主菜单（工具栏上方，避免遮挡）。
-                        let (mx, my) = self.pos.unwrap_or((0, 0));
-                        let my_bottom = toolbar_bottom(self.hwnd, my);
-                        let _ = self.events.send(UiEvent::RequestMainMenu {
-                            x: mx,
-                            y: my,
-                            y_bottom: my_bottom,
-                            above: true,
-                        });
+                        // 设置键 = 弹出功能主菜单（贴着工具栏，避免遮挡它）。
+                        let _ = self
+                            .events
+                            .send(UiEvent::RequestMainMenu(self.menu_anchor()));
                     } else {
                         // 其它单元格：按下未拖动 → 抬起时触发切换
                         let _ = self.events.send(UiEvent::Toolbar(action));
@@ -912,21 +934,10 @@ impl WindowMouse for ToolbarMouse {
                 Some(LRESULT(0))
             }
             WM_RBUTTONDOWN => {
-                // 右键工具栏 → 功能主菜单，在工具栏上方弹出（避免遮挡工具栏）。
-                let (mx, my) = self.pos.unwrap_or_else(|| {
-                    let mut p = POINT::default();
-                    unsafe {
-                        let _ = GetCursorPos(&mut p);
-                    }
-                    (p.x, p.y)
-                });
-                let my_bottom = toolbar_bottom(self.hwnd, my);
-                let _ = self.events.send(UiEvent::RequestMainMenu {
-                    x: mx,
-                    y: my,
-                    y_bottom: my_bottom,
-                    above: true,
-                });
+                // 右键工具栏 → 功能主菜单，贴着工具栏弹出（避免遮挡工具栏）。
+                let _ = self
+                    .events
+                    .send(UiEvent::RequestMainMenu(self.menu_anchor()));
                 Some(LRESULT(0))
             }
             WM_SETCURSOR => {
@@ -1035,19 +1046,6 @@ fn draw_grip(
 fn fill_dot(buf: &mut [u8], buf_w: u32, buf_h: u32, cx: f32, cy: f32, r: f32, color: [u8; 4]) {
     // 抗锯齿圆点（tiny-skia），与其它形状统一
     crate::view::fill_circle(buf, buf_w, buf_h, cx, cy, r, color);
-}
-
-/// 取工具栏窗口的底边屏幕坐标（GetWindowRect），失败时以 top + 30 估算。
-fn toolbar_bottom(hwnd: HWND, top: i32) -> i32 {
-    #[cfg(windows)]
-    unsafe {
-        let mut r = RECT::default();
-        if GetWindowRect(hwnd, &mut r).is_ok() {
-            return r.bottom;
-        }
-    }
-    let _ = hwnd;
-    top + 30
 }
 
 #[cfg(test)]

@@ -9,7 +9,9 @@ use std::cell::RefCell;
 use std::rc::Rc;
 use std::sync::mpsc::Sender;
 
-use crate::manager::{HOVER_PAGE_NEXT as TAG_PAGE_NEXT, HOVER_PAGE_PREV as TAG_PAGE_PREV, UiEvent};
+use crate::manager::{
+    HOVER_PAGE_NEXT as TAG_PAGE_NEXT, HOVER_PAGE_PREV as TAG_PAGE_PREV, MenuAnchor, UiEvent,
+};
 use crate::sys::{
     GetCursorPos, GetWindowRect, HWND, HWND_TOPMOST, IDC_ARROW, IDC_SIZEALL, LPARAM, LRESULT,
     LoadCursorW, POINT, RECT, ReleaseCapture, SWP_NOACTIVATE, SWP_NOSIZE, SWP_NOZORDER, SetCapture,
@@ -2435,13 +2437,10 @@ impl WindowMouse for CandidateMouse {
                         y: sy,
                     });
                 } else {
-                    // 空白处 → 功能主菜单
-                    let _ = self.events.send(UiEvent::RequestMainMenu {
-                        x: sx,
-                        y: sy,
-                        y_bottom: sy,
-                        above: false,
-                    });
+                    // 空白处 → 功能主菜单（光标处向下弹）
+                    let _ = self
+                        .events
+                        .send(UiEvent::RequestMainMenu(MenuAnchor::at_point(sx, sy)));
                 }
                 Some(LRESULT(0))
             }
