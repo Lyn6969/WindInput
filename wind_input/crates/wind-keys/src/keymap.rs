@@ -241,6 +241,18 @@ pub fn key_name_to_vk_with_letters(name: &str) -> Option<u32> {
     None
 }
 
+/// 全部符号键的「规范名 + 组合区字符」。规范名取 [`KEY_TABLE`] 每行的**首个**别名。
+///
+/// 供跨仓边界回答「这个键在某方案里是不是码元」——设置页只认键名，而码元集是字符集，
+/// 两边需要一张对照表。放在这里而不是让设置页自己拼：`KEY_TABLE` 增删时，那边不会
+/// 跟着改，表现为新键的冲突提示永远不出（跨仓契约无编译期约束，本仓已栽过）。
+pub fn symbol_keys() -> impl Iterator<Item = (&'static str, char)> {
+    KEY_TABLE.iter().filter_map(|d| {
+        let name = d.names.first()?;
+        Some((*name, d.prefix))
+    })
+}
+
 /// 纯修饰键名 → VK（`lshift` / `rshift` / `lctrl` / `rctrl`，别名见实现）。
 /// 大小写与首尾空白不敏感；非修饰键返回 None。
 ///
@@ -426,5 +438,37 @@ mod tests {
         assert!(!is_pure_modifier_vk(0x9F)); // 区间下界之前
         assert!(!is_pure_modifier_vk(0xA4)); // VK_LMENU，区间上界之后
         assert!(!is_pure_modifier_vk(VK_Z));
+    }
+
+    /// `symbol_keys()` 的键名是**跨仓契约**：设置页按这些名字匹配自己的下拉选项
+    /// （`TRIGGER_KEY_OPTIONS`），对不上就表现为「提示永远不出」——静默降级，没人会发现。
+    ///
+    /// 快照式断言而非「非空即可」：改 `KEY_TABLE` 某行的**首个**别名不会破坏本仓任何
+    /// 功能（其余别名仍能解析），却会静默切断那条契约。这里红一下，提醒去同步设置页。
+    #[test]
+    fn symbol_key_names_are_a_cross_repo_contract() {
+        let names: Vec<&str> = symbol_keys().map(|(n, _)| n).collect();
+        assert_eq!(
+            names,
+            vec![
+                "backtick",
+                "semicolon",
+                "quote",
+                "comma",
+                "period",
+                "slash",
+                "lbracket",
+                "rbracket",
+                "backslash",
+                "minus",
+                "equal",
+            ],
+            "改动此列表须同步 wind-setting 的 TRIGGER_KEY_OPTIONS / key_options"
+        );
+        // 字符侧也一并锁住：core 用它判「该键是不是码元」，错一个就报错冲突。
+        let by_name = |n: &str| symbol_keys().find(|(k, _)| *k == n).map(|(_, c)| c);
+        assert_eq!(by_name("backtick"), Some('`'));
+        assert_eq!(by_name("backslash"), Some('\\'));
+        assert_eq!(by_name("semicolon"), Some(';'));
     }
 }

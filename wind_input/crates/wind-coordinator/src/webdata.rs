@@ -792,6 +792,30 @@ impl Coordinator {
                         obj.insert("effectiveCodetable".to_string(), serde_json::to_value(eff)?);
                     }
                 }
+                // 首码集里的符号键（键名形式）。给设置页判「按键功能表绑的这个键，是不是
+                // 同一方案的码元首码」——两者同层冲突，内核裁决是绑定优先，于是该符号
+                // 起头的编码在本方案静默失效（见 schema-key-actions.md §4.3）。
+                //
+                // 给**键名**而不是字符集原文：`input_chars` 有区间语法（`a-x/`），设置页
+                // 再写一份解析器就是两处慢慢漂移——跨仓契约无编译期约束，本仓已栽过。
+                // 边界上传语义结果，不传待解析的原料。
+                //
+                // 组装放在协调器而不是引擎：引擎层不该依赖 `wind-keys`（层次倒置）。
+                // 引擎只出「字符集」，键名↔字符的对照表归按键层。
+                //
+                // 只报符号键：字母恒在默认码元集里，全列出来是噪音；「字母绑功能键」那条
+                // 冲突内核另有活码前缀裁决（`bound_action_key_yields`），不归本判据管。
+                let leading_keys: Vec<&str> = match self.engine_mgr.schema_code_char_set(id) {
+                    Some(set) => wind_keys::keymap::symbol_keys()
+                        .filter(|(_, ch)| set.contains_leading(*ch))
+                        .map(|(name, _)| name)
+                        .collect(),
+                    // 读不到方案就不提示——凭空报一个不存在的冲突比不报更糟。
+                    None => Vec::new(),
+                };
+                if let Some(obj) = v.as_object_mut() {
+                    obj.insert("leadingCodeKeys".to_string(), json!(leading_keys));
+                }
                 Ok(v)
             }
             None => Ok(json!({})),
@@ -2152,7 +2176,7 @@ fn word_item(r: wind_store::user_words::UserWordRecord) -> Value {
 /// 它再无影响，而用户根本没动过这些项。
 ///
 /// 在服务端剥而不是要求调用方自觉：这是契约边界，任何客户端都该受保护。
-const READONLY_SIDECAR_FIELDS: &[&str] = &["effectiveCodetable"];
+const READONLY_SIDECAR_FIELDS: &[&str] = &["effectiveCodetable", "leadingCodeKeys"];
 
 fn strip_readonly_fields(cfg: &Value) -> Value {
     let Some(o) = cfg.as_object() else {
@@ -3249,6 +3273,22 @@ mod tests {
             d.get("effectiveCodetable").is_none(),
             "diff 里不该出现旁路字段，实际 {d}"
         );
+
+        // ★ 逐个覆盖 READONLY_SIDECAR_FIELDS，而不是只测其中一个：新增旁路字段却忘了
+        // 登记，正是这个坑的复发形态，只测 effectiveCodetable 的话照样全绿。
+        for f in READONLY_SIDECAR_FIELDS {
+            let mut one = json!({ "schema": { "id": "wubi86" } });
+            one.as_object_mut()
+                .unwrap()
+                .insert((*f).to_string(), json!("任意值"));
+            let s = strip_readonly_fields(&one);
+            assert!(s.get(*f).is_none(), "旁路字段 {f} 未被剥掉，实际 {s}");
+            assert_eq!(
+                s.pointer("/schema/id"),
+                Some(&json!("wubi86")),
+                "剥 {f} 时误伤了真实配置"
+            );
+        }
     }
 
     #[test]

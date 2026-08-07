@@ -1751,6 +1751,27 @@ impl EngineManager {
     /// 一律放行不吃（`KeyEventSink.cpp::_IsPureModifierKey`），到了服务端
     /// `bound_action_for` 按**活跃**方案查表落空即不动作。
     ///
+    /// 指定方案的码元字符集（按 id，非活跃方案也能查）。
+    ///
+    /// 与引擎构建走**同一个构造器**，不另写一份解析：区间语法（`a-x/`）、`leading_chars`
+    /// 为空时等于全集、非法时回落全集——这些规则只该有一处。
+    ///
+    /// 读不到方案时返回 `None`（而非默认 `a-z`）：调用方多半是要「据此提示用户」，
+    /// 拿默认值去提示等于凭空报一个不存在的事实。
+    pub fn schema_code_char_set(&self, schema_id: &str) -> Option<wind_config::CodeCharSet> {
+        let schema = Self::read_schema(
+            schema_id,
+            self.data_dir.as_deref(),
+            self.override_dir.as_deref(),
+        )?;
+        let ct = &schema.engine.codetable;
+        Some(wind_config::CodeCharSet::new(
+            &ct.input_chars,
+            &ct.leading_chars,
+            &format!("schema {schema_id}"),
+        ))
+    }
+
     /// 不走 `key_actions_cache`：该缓存按活跃方案 id 存单份，而这里要的是跨方案的并集。
     pub fn all_key_action_keys(&self) -> std::collections::BTreeSet<String> {
         let ids = self
@@ -3907,6 +3928,48 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(&base_dir);
         let _ = std::fs::remove_dir_all(&ov_dir);
+    }
+
+    /// `schema_code_char_set` 必须与引擎构建同规则：`leading_chars` 为空时等于全集。
+    ///
+    /// 它服务于设置页的「这个键是不是本方案首码」提示。两处规则若不一致，提示就会
+    /// 指向一个内核并不认可的冲突——比不提示更糟，用户会按提示去改一个没坏的配置。
+    #[test]
+    fn schema_code_char_set_follows_engine_rules() {
+        use std::io::Write;
+        let base_dir = std::env::temp_dir().join("wind_eng_ccs_data");
+        let schemas = base_dir.join("schemas");
+        let _ = std::fs::remove_dir_all(&base_dir);
+        std::fs::create_dir_all(&schemas).unwrap();
+        // input_chars 含 `;`，leading_chars 未写 → 首码集 = 全集，故 `;` 可起头。
+        let mut f = std::fs::File::create(schemas.join("ccs.schema.toml")).unwrap();
+        write!(
+            f,
+            "[schema]
+id = \"ccs\"
+[engine]
+type = \"codetable\"
+             [engine.codetable]
+input_chars = \"a-z;\"
+"
+        )
+        .unwrap();
+        drop(f);
+
+        let mut cfg = Config::default();
+        cfg.schema.active = "ccs".to_string();
+        cfg.schema.available = vec!["ccs".to_string()];
+        let mgr = EngineManager::with_store_override(&cfg, Some(&base_dir), None, None);
+
+        let set = mgr.schema_code_char_set("ccs").expect("方案应可读");
+        assert!(set.contains_leading(';'), "leading_chars 为空时应等于全集");
+        assert!(set.contains_leading('a'));
+        assert!(!set.contains_leading('/'), "没配的符号不该在首码集里");
+
+        // 读不到的方案返回 None，而不是默认 a-z——拿默认值去提示等于凭空报冲突。
+        assert!(mgr.schema_code_char_set("no_such_schema").is_none());
+
+        let _ = std::fs::remove_dir_all(&base_dir);
     }
 
     /// 方案没写 `[key_actions]` 时返回空表——各键照常走全局引导键链。
