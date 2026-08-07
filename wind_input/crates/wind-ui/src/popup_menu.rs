@@ -565,7 +565,7 @@ impl PopupMenu {
         self.ensure_scale(ax, ay);
         // 先测量根面板尺寸以钳制锚点（选中态不影响尺寸，传无选中即可）。
         let (_root, w, h, _hits) = self.build_view(&items, NONE_SEL);
-        let (ax, ay) = place_menu(&anchor, ax, ay, w, h, work_area_of(ax, ay));
+        let (ax, ay) = place_menu(&anchor, ax, ay, w, h, work_area_of(ax, ay), self.scale);
         self.anchor = clamp_to_work_area(ax, ay, w, h);
         {
             let mut st = self.state.borrow_mut();
@@ -1305,6 +1305,11 @@ fn dpi_scale() -> f32 {
     }
 }
 
+/// 侧向弹出时菜单与锚点之间的间隙（dp，随 DPI 缩放）。
+///
+/// 左右两侧取同一个值——观感统一是这里的唯一目的，别按方向调偏。
+const SIDE_GAP_DP: f32 = 6.0;
+
 /// 按 `placement` 把菜单摆到锚点旁，返回菜单左上角（**尚未钳制**到工作区）。
 ///
 /// `ax`/`ay` 是解析过 `i32::MIN`（取光标位）之后的锚点左上角；`wa` 为该点所在显示器的
@@ -1320,6 +1325,7 @@ fn place_menu(
     w: u32,
     h: u32,
     wa: Option<(i32, i32, i32, i32)>,
+    scale: f32,
 ) -> (i32, i32) {
     match anchor.placement {
         MenuPlacement::Below => (ax, ay),
@@ -1330,20 +1336,26 @@ fn place_menu(
             (ax, if fits_up { up } else { anchor.bottom })
         }
         MenuPlacement::Side => {
-            // 右侧装得下走右侧，否则走左侧。
+            // 两侧留同样宽的间隙。`w` 是**内容**宽（软投影的四向外扩在 reconcile 里另算，
+            // 不进这里），故左右紧贴时几何上本就对称——但投影带方向性偏移，贴着摆时那道
+            // 半透明暗边会落在菜单与工具栏之间，看着就成了「一侧紧贴、一侧有缝」。
+            // 留出间隙后两侧观感一致，也不再依赖某个主题的投影参数。
+            let gap = (SIDE_GAP_DP * scale).round() as i32;
+            // 右侧装得下走右侧，否则走左侧。间隙要一并计入判据，否则边界上会选出
+            // 一个「算得下、加了间隙却出界」的方向。
             //
             // 两侧都装不下时仍取右侧：左侧会把菜单推成负坐标，钳回来后正好压在工具栏
             // 上——那是本分支要避免的事；贴右边缘至少还留着工具栏可见。
             let fits_right = wa
-                .map(|(_, _, right, _)| anchor.right + w as i32 <= right)
+                .map(|(_, _, right, _)| anchor.right + gap + w as i32 <= right)
                 .unwrap_or(true);
             let fits_left = wa
-                .map(|(left, _, _, _)| ax - w as i32 >= left)
+                .map(|(left, _, _, _)| ax - gap - w as i32 >= left)
                 .unwrap_or(true);
             let x = if fits_right || !fits_left {
-                anchor.right
+                anchor.right + gap
             } else {
-                ax - w as i32
+                ax - gap - w as i32
             };
             // 纵坐标与锚点**底边**对齐（菜单贴着工具栏往上长，同任务栏菜单）。
             //
@@ -1798,43 +1810,45 @@ mod tests {
     // 菜单典型尺寸。
     const MW: u32 = 200;
     const MH: u32 = 300;
+    /// scale=1.0 下的侧向间隙（设备像素），与 `SIDE_GAP_DP` 同源。
+    const GAP: i32 = SIDE_GAP_DP as i32;
 
     /// 光标处右键：顶边贴锚点，原样落点。
     #[test]
     fn below_places_menu_at_anchor() {
         let a = MenuAnchor::at_point(500, 400);
-        assert_eq!(place_menu(&a, 500, 400, MW, MH, WA), (500, 400));
+        assert_eq!(place_menu(&a, 500, 400, MW, MH, WA, 1.0), (500, 400));
     }
 
     /// 横条工具栏（屏幕右下角）：菜单底边贴条顶边向上展开。
     #[test]
     fn above_expands_upward_from_anchor_top() {
         let a = MenuAnchor::above_rect(1700, 900, 930);
-        assert_eq!(place_menu(&a, 1700, 900, MW, MH, WA), (1700, 600));
+        assert_eq!(place_menu(&a, 1700, 900, MW, MH, WA, 1.0), (1700, 600));
     }
 
     /// 横条贴在屏幕顶部：上方装不下 → 翻到条底边之下，而不是钻出屏幕。
     #[test]
     fn above_flips_below_when_no_room_up() {
         let a = MenuAnchor::above_rect(100, 10, 40);
-        assert_eq!(place_menu(&a, 100, 10, MW, MH, WA), (100, 40));
+        assert_eq!(place_menu(&a, 100, 10, MW, MH, WA, 1.0), (100, 40));
     }
 
     /// 纵条在屏幕左侧：右边装得下 → 菜单贴右边缘展开，纵坐标对齐条顶。
     #[test]
     fn side_prefers_right_when_it_fits() {
-        // 条占 y[500,700]，菜单高 300 → 底边对齐 700，顶边落 400。
+        // 条占 y[500,700]、右缘 50；菜单高 300 → 底边对齐 700 得顶边 400，左缘 50+GAP。
         let a = MenuAnchor::beside_rect(20, 500, 50, 700);
-        assert_eq!(place_menu(&a, 20, 500, MW, MH, WA), (50, 400));
+        assert_eq!(place_menu(&a, 20, 500, MW, MH, WA, 1.0), (50 + GAP, 400));
     }
 
-    /// 纵条在屏幕右下角（默认落点）：右边放不下 → 翻到左侧，菜单右缘贴条左缘。
+    /// 纵条在屏幕右下角（默认落点）：右边放不下 → 翻到左侧，菜单右缘距条左缘一个间隙。
     #[test]
     fn side_falls_back_to_left_when_right_is_tight() {
         let a = MenuAnchor::beside_rect(1870, 600, 1900, 800);
         assert_eq!(
-            place_menu(&a, 1870, 600, MW, MH, WA),
-            (1870 - MW as i32, 500)
+            place_menu(&a, 1870, 600, MW, MH, WA, 1.0),
+            (1870 - GAP - MW as i32, 500)
         );
     }
 
@@ -1844,7 +1858,10 @@ mod tests {
     fn side_keeps_right_when_neither_side_fits() {
         let narrow = Some((0, 0, 150, 1040));
         let a = MenuAnchor::beside_rect(100, 300, 130, 500);
-        assert_eq!(place_menu(&a, 100, 300, MW, MH, narrow), (130, 200));
+        assert_eq!(
+            place_menu(&a, 100, 300, MW, MH, narrow, 1.0),
+            (130 + GAP, 200)
+        );
     }
 
     /// 取不到工作区时按「首选方向装得下」处理：让首选生效、越界交给钳制，
@@ -1852,9 +1869,12 @@ mod tests {
     #[test]
     fn missing_work_area_keeps_preferred_direction() {
         let up = MenuAnchor::above_rect(100, 500, 530);
-        assert_eq!(place_menu(&up, 100, 500, MW, MH, None), (100, 200));
+        assert_eq!(place_menu(&up, 100, 500, MW, MH, None, 1.0), (100, 200));
         let side = MenuAnchor::beside_rect(100, 500, 130, 700);
-        assert_eq!(place_menu(&side, 100, 500, MW, MH, None), (130, 400));
+        assert_eq!(
+            place_menu(&side, 100, 500, MW, MH, None, 1.0),
+            (130 + GAP, 400)
+        );
     }
 
     /// 侧向按**底边**对齐锚点底边（菜单贴着工具栏往上长，同任务栏菜单）。
@@ -1865,7 +1885,7 @@ mod tests {
     fn side_aligns_bottom_with_anchor_bottom() {
         // 条占 y[896,1028]（右下角典型落点），菜单高 300 → 顶边 728、底边 1028 齐平。
         let a = MenuAnchor::beside_rect(1870, 896, 1900, 1028);
-        let (_, y) = place_menu(&a, 1870, 896, MW, MH, WA);
+        let (_, y) = place_menu(&a, 1870, 896, MW, MH, WA, 1.0);
         assert_eq!(y, 1028 - MH as i32);
         assert_eq!(y + MH as i32, 1028, "菜单底边与工具栏底边齐平");
         assert!(y < 896, "菜单比条高，理应向上长出条顶");
@@ -1876,6 +1896,37 @@ mod tests {
     fn side_flips_to_top_align_when_no_room_up() {
         // 条占 y[12,144]，菜单高 300 → 底边对齐得 -156，越界；回退到顶边对齐 12。
         let a = MenuAnchor::beside_rect(20, 12, 50, 144);
-        assert_eq!(place_menu(&a, 20, 12, MW, MH, WA), (50, 12));
+        assert_eq!(place_menu(&a, 20, 12, MW, MH, WA, 1.0), (50 + GAP, 12));
+    }
+
+    /// **两侧间隙必须一样宽**——这正是用户报的「一边紧贴、一边有缝」。
+    /// 用同一个锚点分别逼出左右两种落点，比较各自到锚点的距离。
+    #[test]
+    fn side_gap_is_symmetric_on_both_sides() {
+        // 右侧装得下 → 走右侧。
+        let roomy = MenuAnchor::beside_rect(400, 500, 430, 700);
+        let (rx, _) = place_menu(&roomy, 400, 500, MW, MH, WA, 1.0);
+        let right_gap = rx - roomy.right;
+
+        // 同尺寸的条挪到屏幕右缘 → 右侧放不下，走左侧。
+        let tight = MenuAnchor::beside_rect(1890, 500, 1920, 700);
+        let (lx, _) = place_menu(&tight, 1890, 500, MW, MH, WA, 1.0);
+        let left_gap = tight.x - (lx + MW as i32);
+
+        assert_eq!(
+            right_gap, left_gap,
+            "左右间隙不等：右 {right_gap} / 左 {left_gap}"
+        );
+        assert_eq!(right_gap, GAP);
+    }
+
+    /// 间隙是 dp，随 DPI 缩放——高分屏上不能缩成一条看不见的线。
+    #[test]
+    fn side_gap_scales_with_dpi() {
+        let a = MenuAnchor::beside_rect(400, 500, 430, 700);
+        let (x1, _) = place_menu(&a, 400, 500, MW, MH, WA, 1.0);
+        let (x2, _) = place_menu(&a, 400, 500, MW, MH, WA, 2.0);
+        assert_eq!(x1 - a.right, GAP);
+        assert_eq!(x2 - a.right, GAP * 2);
     }
 }
