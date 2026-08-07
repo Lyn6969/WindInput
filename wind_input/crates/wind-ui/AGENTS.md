@@ -16,7 +16,7 @@
 | `src/window.rs` | `LayeredWindow`：Win32 `UpdateLayeredWindow` 封装 + `WindowMouse` 鼠标 trait + 非 Windows mock；wnd_proc 鼠标分发 |
 | `src/view.rs` | **实际盒模型引擎**：measure→arrange→paint + 命中矩形提取；圆角/边框/阴影/渐变/九宫格背景图/z 层。各窗口共用 |
 | `src/candidate_window.rs` | 候选窗：从候选构建 View 树、布局、绘制、鼠标命中/悬停防抖、翻页；含 `CandidateItem`/`CandidateWindowConfig` |
-| `src/toolbar.rs` | 常驻工具栏窗口（中英/方案/标点/全半角），可拖动，命中回送 `ToolbarAction` |
+| `src/toolbar.rs` | 常驻工具栏窗口（中英/方案/标点/全半角），可拖动，命中回送 `ToolbarAction`；横/纵朝向见 `bar_layout` |
 | `src/popup_menu.rs` | 级联弹出菜单（右键候选菜单 + 功能主菜单）；多级子菜单、勾选态、键盘导航经协调器 `MenuKey` 转发 |
 | `src/status_tip.rs` | 状态提示气泡（切换中英/标点/全半角/方案时短暂或常驻显示） |
 | `src/toast.rs` | 一次性通知 Toast（按位置/类型配色，定时自动隐藏） |
@@ -42,6 +42,7 @@
 - **命令循环要点**：`ui_thread` 大 `match` 消费 `UiCommand`；连续 `UpdateCandidates` 会被合并只渲染最新帧，`HideToolbar`/状态泡走防抖（消除 Alt+Tab、连按切换的闪烁）。加功能 = 加 `UiCommand` 变体 + 加 `match` 分支（缺分支编译过但静默无效）。
 - **主题只消费不定义**：颜色/几何/背景图来自 wind-theme 的 `Resolved`/`RvNode`/`RvImage`/`schema::Dim`，经 `SetTheme(Box<Resolved>)` 分发到各窗口 `set_theme`。本 crate 不持有主题语义，别在此硬编码主题色/尺寸。
 - **候选窗定位偏移的施加顺序**：主题 `window.position_offset` 在 `place_window`（跟随光标）内部按 **净锚点 → 方位决策 → 施加偏移 → 边界钳制** 的顺序处理。三条不可换位：① 偏移**不能**预先加进锚点——`below_ok`/`above_ok` 拿锚点跟工作区边界比，含偏移会让 `off_y` 越大越容易判成两边都放不下，本该上翻的场景落回下方再被钳到屏幕底、压住光标（真机反馈的「下方正常、上方遮盖」就是它）；② 偏移必须在钳制**之前**施加，否则会把窗口推出工作区且兜不回来；③ 上方用**减号**（`apply_offset_y`），正值恒为「远离光标」。三个调用点（Windows show/macOS render_frame/Windows render_frame）全接；`fixed_pos` 与 `drag_pin` 分支**不叠加**，那是用户显式意图。纯计算抽在 `caret_anchors`/`apply_offset_y`，因为 `place_window` 余下是 `#[cfg(windows)]` 的屏幕钳制、单测覆盖不到。
+- **工具栏朝向是 config 不是主题**：`ui.toolbar.vertical` 走 `SetToolbarVertical`（同 `SetToolbarAutoHide` 的下发链）。**纵向恒为横向的转置**——条厚取主题 `[toolbar] height`、格长取 `button_width`，故同一套主题几何在两个朝向下都成立，别为纵向另引一套尺寸（`bar_layout` 的单测就是挡这个的）。绘制一律基于 `bar_layout` 给出的格矩形，横竖只在三处分叉：拖动柄点阵（2×3↔3×2）、分隔线画向、高亮块两个方向的内缩比例。⚠️ `set_vertical` 的重绘必须受 `visible` 门控——`repaint`→`render` 末尾无条件 `show`，对隐藏中的工具栏调用会绕过 `toolbar_gate` 的显示迟滞（`SetTheme` 分支同此约束）。编辑器侧有同源实现 `preview/otherWindows.ts::toolbarLayout` 与 `engineParity` 测试，改这里要同步那边。
 - **一个装饰两处装配 = 迟早不同步**：模式徽标有「横排内嵌预编辑栏」与「竖排独立 chip」两条通路，已抽 `decorate_mode_chip` 共用；候选列表/翻页栏的盒装饰抽 `decorate_box`。往候选窗加这类外观时先找现成闭包，别再复制一份。
 - **边框圆角别用 `eff_border` 的第三个返回值**：它在节点未配 `border.radius` 时兜底 `0.0`，直接用会把上游按 `item_radius` 设好的圆角抹平。只取它的色与宽，圆角走节点自身的 `border_radius`（`candidate_window.rs` 内有两处注释标记这个坑）。
 - **浮层不抢焦点（不变量）**：wnd_proc 对 `WM_MOUSEACTIVATE`→`MA_NOACTIVATE`、`WM_NCHITTEST`→`HTCLIENT`，点击候选/工具栏不激活窗口、目标应用保持前台；菜单窗无焦点，键盘由协调器 `MenuKey(VK)` 转发。改窗口样式/消息处理时勿破坏这条。
