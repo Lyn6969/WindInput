@@ -89,13 +89,43 @@ pub(crate) fn candidate_display_order(
     } else {
         std::cmp::Ordering::Equal
     };
-    wind_candidate::cmp_match_layers(a, b)
+    // 消费输入长度是**首要**键，对齐 librime：其候选容器
+    // `DictEntryCollector = map<size_t, DictEntryIterator>` 以「消费的输入长度」为 key，
+    // `phrase_->rbegin()` 从最长开始遍历 ⇒ 消费更多输入者恒优先，先于词频、先于任何层级。
+    //
+    // 这个键此前排在链尾，前面六级早已分出胜负 ⇒ **等价于从未生效**。`buzhidaok` 的残码
+    // `k` 被整串忽略正由此而来（「不知道看什么」原在第 136 位）。
+    //
+    // ⚠️ `consumed_length == 0` 是「引擎未标注 ⇒ 按整串算」的全仓约定（**码表候选恒为 0**），
+    // 不归一化就直接降序会把码表候选整体甩到最后。
+    //
+    // ## ⚠️ 层级键必须原样复用 `cmp_match_layers`，不要在此另写一份
+    //
+    // 曾在这里写过一份「同构但忽略 `is_promoted_completion`」的副本，动机是：该标志本是
+    // 引擎侧用来让高价值补全活过 `truncate` 的，协调器不截断、留着只会把 w=0 的冷僻补全
+    // 提到高频词前面。**动机成立，但代价被漏算了**——层级键是布尔的，等价于惩罚 ∞，于是
+    // 引擎侧一切「用 weight 表达的让位」在协调器全部失效：step 6.5b 把整句压到
+    // `补全 weight - 1` 让位给「恰好用完残码的补全」，到这里因为补全停在 `is_prefix` 层而
+    // 被整句反超，`nihaom` 首选从「你好吗」变成「你好们」、`beijingd` 变成「背景的」。
+    //
+    // 当初那个动机本身也已消失：`zhonghuar` 的「种花人」(w=0) 能登顶是因为当时没有候选
+    // 消费到第 9 字节，残码补全整句（step 2c）落地后它自然被压下去。
+    let eff_consumed = |c: &Candidate| {
+        if c.consumed_length == 0 {
+            input_len
+        } else {
+            c.consumed_length
+        }
+    };
+    let by_consumed = eff_consumed(b).cmp(&eff_consumed(a));
+
+    by_consumed
+        .then_with(|| wind_candidate::cmp_match_layers(a, b))
         .then_with(|| wind_candidate::cmp_exact_first(a, b))
         .then(by_pinyin_exact)
         .then(by_weight)
         .then(a.base_order.cmp(&b.base_order))
         .then(a.natural_order.cmp(&b.natural_order))
-        .then(a.consumed_length.cmp(&b.consumed_length).reverse())
 }
 
 /// 满码空码清空的**最终复核**：候选列表里是否存在「拦得住清空」的候选。

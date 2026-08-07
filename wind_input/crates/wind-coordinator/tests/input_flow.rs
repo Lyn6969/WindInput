@@ -6155,6 +6155,27 @@ fn type_str(coord: &Coordinator, s: &str) -> KeyAction {
     last
 }
 
+/// 按**文本**选中候选：翻页找到它，再按该页对应的数字键。
+///
+/// ⚠️ **不要在分步上屏类测试里写死候选位置**。这族测试要守的是「选中一个只消费部分
+/// 输入的候选之后，退格/光标/只读前缀的行为」，候选排在第几位是它**不关心**的东西。
+/// 旧写法 `tap(&coord, 0x33)`（写死数字键 3 = 第 3 个候选）在排序按「消费输入长度优先」
+/// 调整后全部失效 —— 单字候选被整体推到消费整串的词之后（`nihao` 下「你」到了第 35 位），
+/// 而机制本身完好。依赖了不关心的东西，就会为不相干的改动买单。
+fn select_by_text(coord: &Coordinator, text: &str) -> KeyAction {
+    let (_, _, total_pages) = coord.debug_page_info();
+    for _ in 0..total_pages.max(1) {
+        if let Some(i) = coord.debug_page_texts().iter().position(|t| t == text) {
+            return tap(coord, 0x31 + i as u32); // '1'..'9'
+        }
+        tap(coord, 0x22); // PageDown
+    }
+    panic!(
+        "候选中找不到「{text}」（共 {total_pages} 页）：{:?}",
+        coord.debug_all_candidate_texts()
+    );
+}
+
 /// 光标左移跨过引擎插入的音节分隔符时，caret 需按**显示串**位置换算（buffer "nihao" 的第 2
 /// 字节 → 显示 "ni'hao" 的第 2 位，一次左移跨两个显示位）。这是 buffer→display 映射的核心用例。
 #[test]
@@ -6275,8 +6296,8 @@ fn test_committed_prefix_is_readonly_and_delete_pops_segment() {
     }
     let coord = Coordinator::new_headless(config_with("pinyin"), Some(&data_dir()));
     type_str(&coord, "nihao");
-    // 数字键 3 = 分步确认「你」，剩余编码 "hao" 留在组合区
-    let act = tap(&coord, 0x33);
+    // 分步确认「你」（只消费 "ni"），剩余编码 "hao" 留在组合区
+    let act = select_by_text(&coord, "你");
     assert_eq!(action_text(&act).as_deref(), Some("你hao"));
     assert_eq!(
         action_caret(&act),
@@ -6312,7 +6333,7 @@ fn test_backspace_pops_segment_regardless_of_cursor() {
     }
     let coord = Coordinator::new_headless(config_with("pinyin"), Some(&data_dir()));
     type_str(&coord, "nihao");
-    tap(&coord, 0x33); // 「你」+ "hao"
+    select_by_text(&coord, "你"); // 「你」+ "hao"
     tap(&coord, VK_HOME); // 光标到剩余编码最左
     let act = tap(&coord, VK_BACK);
     assert_eq!(
@@ -6346,15 +6367,10 @@ fn test_shuangpin_backspace_restores_raw_keys() {
         cfg
     };
 
-    // hcma → 「好吗」。选第 6 候选「好」（分步上屏，消费 hc 两键），再退格。
+    // hcma → 「好吗」。选单字候选「好」（分步上屏，消费 hc 两键），再退格。
     let coord = Coordinator::new_headless(sp_cfg(), Some(&d));
     type_str(&coord, "hcma");
-    let page = coord.debug_page_texts();
-    let i = page
-        .iter()
-        .position(|t| t == "好")
-        .expect("首页应有单字候选「好」");
-    let act = tap(&coord, 0x31 + i as u32);
+    let act = select_by_text(&coord, "好");
     assert_eq!(
         action_text(&act).as_deref(),
         Some("好ma"),
@@ -6370,9 +6386,7 @@ fn test_shuangpin_backspace_restores_raw_keys() {
     // 对照：ni 的双拼码与全拼码相同，行为不得改变。
     let coord = Coordinator::new_headless(sp_cfg(), Some(&d));
     type_str(&coord, "nihc");
-    let page = coord.debug_page_texts();
-    let i = page.iter().position(|t| t == "你").expect("首页应有「你」");
-    tap(&coord, 0x31 + i as u32);
+    select_by_text(&coord, "你");
     assert_eq!(
         action_text(&tap(&coord, VK_BACK)).as_deref(),
         Some("ni'hc"),

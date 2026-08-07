@@ -377,8 +377,16 @@ fn test_pinyin_trailing_partial_keeps_sentence() {
     let cfg = make_config(&["pinyin"]);
     let mgr = EngineManager::new(&cfg, Some(&dir));
 
-    // 尾部多打一个不成音节的残码「m」：整句「你好」仍应排首位（bug①），
+    // 尾部多打一个不成音节的残码「m」：整句「你好」**不得被残码破坏**（bug①），
     // 残码不计入消费（consumed_length=5，留「m」在缓冲续输）。
+    //
+    // ⚠️ 本测试原先断言的是「整句排**首位**」。那是 bug① 修复时顺手写下的实现细节，
+    // 而它真正要守的是「整句没被残码毁掉」——当年的故障形态是整句**消失/退化**，不是排序。
+    // 现整句在 step 6.5b 让位于「恰好用完残码的补全」（`nihaoma` 音节数 3 == completed 2 + 1），
+    // 属**降级不销毁**：整句仍在候选中、consumed_length 不变，只是排到「你好吗」之后。
+    // 故原不变量逐条仍被下面断言守着，只是不再要求它占首位。
+    // 理由见 `pinyin/mod.rs` step 6.5b 注释（对齐 librime `has_exact_match_phrase`：
+    // 存在覆盖完整输入的精确词条时不生成整句）。
     let r = mgr.convert("nihaom", 9);
     let top: Vec<&str> = r
         .candidates
@@ -387,11 +395,20 @@ fn test_pinyin_trailing_partial_keeps_sentence() {
         .map(|c| c.text.as_str())
         .collect();
     assert_eq!(
-        r.candidates[0].text, "你好",
-        "首候选应为 你好（残码不破坏整句），实际: {top:?}"
+        r.candidates[0].text, "你好吗",
+        "首候选应为 你好吗（它响应了残码 m），实际: {top:?}"
+    );
+    let sentence = r
+        .candidates
+        .iter()
+        .find(|c| c.text == "你好")
+        .unwrap_or_else(|| panic!("整句「你好」须仍在候选中（让位≠销毁），实际: {top:?}"));
+    assert!(
+        sentence.is_sentence,
+        "「你好」须仍带整句身份（is_sentence 表来源、不因降级而清），实际: {top:?}"
     );
     assert_eq!(
-        r.candidates[0].consumed_length, 5,
+        sentence.consumed_length, 5,
         "你好 应只消费 nihao 五字节，残码 m 留缓冲"
     );
 }

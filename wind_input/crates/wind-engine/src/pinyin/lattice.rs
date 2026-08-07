@@ -111,6 +111,25 @@ const ABBREV_NODE_LIMIT: usize = 8;
 /// 简拼跨度的最大字母数（= 最大音节数）。与 `AbbrevMatcher::find_candidates` 的上限一致。
 const MAX_ABBREV_SPAN: usize = 6;
 
+/// 尾部残码补全节点（[`LatticeBuilder::add_partial_final_nodes`]）的对数概率罚。
+///
+/// 对齐 librime 的 `kCompletionPenalty = log(0.5)`（`script_translator.cc`）：残码是
+/// 「用户还没打完的音节」，把它当成某个具体音节是一次**预测**，须付出确定性代价。
+/// 我们的 `log_prob` 同为自然对数（`lm.rs` 的 `(f/total).ln()`），故数值直接取 `ln 2`。
+///
+/// **为何不按残码长度递减**：直觉上 `zho` 比 `z` 确定（候选音节少），但候选面收窄这件事
+/// 已经由 `search_prefix_*` 的召回集合自然表达了——`z` 捞出的字横跨 za/zai/zan/…，
+/// 它们要各自与整句其余部分竞争；`zho` 只剩 zhong/zhou 两族。**再按长度加一道折扣等于
+/// 把同一个信息扣两次**。同类先例见 `ABBREV_NODE_PENALTY` 的反向情形：那里按音节数递增
+/// 是因为简拼段的召回集合**不随段长收窄**（每个字母恒是一个声母），信息未被表达。
+pub(crate) const PARTIAL_FINAL_PENALTY: f64 = std::f64::consts::LN_2;
+
+/// 尾部残码跨度最多取几个单字进图。
+///
+/// 残码召回面比简拼更宽（`k` 覆盖 ka/kai/kan/kang/ke/ken/keng/kong/kou/ku/kua/… 全部单字），
+/// 但真正可能赢下整句路径的只有高频字，故比 `ABBREV_NODE_LIMIT`(8) 略放宽即可。
+const PARTIAL_FINAL_NODE_LIMIT: usize = 12;
+
 /// 节点对数概率打分（对齐 Go lattice calcLogProb + 惩罚/加成）。
 /// 无 unigram 时回退到归一化词典权重。
 ///
@@ -417,6 +436,78 @@ impl LatticeBuilder {
                     }
                 }
             }
+        }
+    }
+
+    /// 在已建好的词图上**追加尾部残码节点**，供残码补全整句解码
+    /// （`buzhidaok` → 「不知道」+ 残码 `k` 补成「看」→ 整句「不知道看」）。
+    ///
+    /// ## 这条通路解决什么
+    ///
+    /// 尾部残码（未成音节的声母/半音节）原本被完全排除在整句解码之外——`convert` 只在
+    /// `completed`（完整音节前缀）上建图，`buzhidaok` 的整句止步于「不知道」，末尾的 `k`
+    /// 无人认领。主流输入法（librime `enable_completion`、fcitx5 的「不完整拼音」）都会把
+    /// 残码当作一个**待定音节**放进格子，由 LM 选出最优单字。本方法补上这条通路。
+    ///
+    /// ## 为什么不能让 [`Self::add_abbrev_nodes`] 兼职
+    ///
+    /// 二者都是「给词图补音节图给不出的节点」，长得几乎一样，但**约束强弱不同**：简拼节点
+    /// 会把整串重新按声母序列切分，已完成的音节也会被重切。实测放开简拼闸门让残码入图，
+    /// `buzhidaok` 产出的是「不直达欧卡」、`nihaom` 是「你黑暗欧美」——`bu zhi dao` 被拆回
+    /// b/u/zh/i/d/a/o 去凑简拼了。残码补全要的是**保留已完成音节、只展开最后那一段**，
+    /// 是简拼组句的严格子集约束，故必须独立成路。
+    ///
+    /// ## 召回与音节标注
+    ///
+    /// 候选 = 以残码为前缀、**音节数为 1** 的词条（`syllable_capped(.., 1)` 把过滤下推到
+    /// 词库层），再筛出单字。跨度恒为 `[completed_len, input_len)` 的一整段，`syl_mask` 记
+    /// 一个音节位——残码在击键空间就是「一个还没打完的音节」，与全拼节点在同一字节空间里
+    /// 天然可串（理由同 [`Self::add_abbrev_nodes`] 的「与全拼节点的兼容性」）。
+    ///
+    /// ⚠️ 调用方须保证 `nodes.len() > input_len`，即词图建在**含残码的整串**上而非
+    /// `completed` 上——否则残码末端没有槽位，Viterbi 永远到不了串尾。
+    ///
+    /// ⚠️ `input` 必须是**原始击键串**，双拼下须跳过（理由同 [`Self::add_abbrev_nodes`]）。
+    pub fn add_partial_final_nodes(
+        &self,
+        input: &str,
+        completed_len: usize,
+        dict: &CachedDict,
+        unigram: Option<&dyn UnigramLookup>,
+        nodes: &mut [Vec<LatticeNode>],
+    ) {
+        let input_len = input.len();
+        if completed_len >= input_len || input_len >= nodes.len() {
+            return;
+        }
+        let partial = &input[completed_len..];
+        // 残码必须整段是小写 ASCII 字母：分隔符/数字/大写都不是「没打完的音节」。
+        if !partial.bytes().all(|b| b.is_ascii_lowercase()) {
+            return;
+        }
+        for hit in
+            dict.search_prefix_with_boundary_syllable_capped(partial, PARTIAL_FINAL_NODE_LIMIT, 1)
+        {
+            // 只收单字：残码补的是「正在打的那一个字」。单音节多字词（儿化/连绵词）落到
+            // 这里会让一个待定音节兑出两个字，与用户已敲的音节数对不上。
+            if hit.text.chars().count() != 1 {
+                continue;
+            }
+            if nodes[input_len]
+                .iter()
+                .any(|n| n.word == hit.text && n.start == completed_len)
+            {
+                continue;
+            }
+            let log_prob = score_node(&hit.text, hit.weight, unigram) - PARTIAL_FINAL_PENALTY;
+            nodes[input_len].push(LatticeNode {
+                start: completed_len,
+                end: input_len,
+                word: hit.text,
+                syllables: vec![partial.to_string()],
+                syl_mask: 1,
+                log_prob,
+            });
         }
     }
 }

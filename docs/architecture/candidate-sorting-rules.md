@@ -64,7 +64,7 @@
 | `is_partial` | bool | **子短语**（候选码是输入的真前缀、比输入短，如 `baoan`→报`bao`） | 拼音引擎 |
 | `is_exact_code` | bool | **精确匹配档**（候选 `code`==输入的完全匹配；或引导键导航候选的既定置顶） | 码表引擎（`code==input`）；协调器精确码短语（`lookup`） |
 | `is_sentence` | bool | 引擎合成的整句解（Viterbi 多词/超长整词） | 拼音引擎 |
-| `is_sentence_demoted` | bool | 整句已让位于精确整词（降级，不参与锚定） | 拼音引擎 |
+| `is_sentence_demoted` | bool | 整句已让位（① 精确整词 ② 用完残码的补全；降级，不参与锚定） | 拼音引擎 |
 | `is_phrase` | bool | 全局短语（`self.phrases` 注入的，系统/用户皆然） | 协调器短语注入 |
 | `is_command`/`is_group` | bool | `$CC` 命令 / `$SS·$AA` 组——**决定选中行为，不参与排序** | 短语注入 / `finalize_candidates` |
 | `weight` | i32 | 权重（**一物多用**：真实词频 + 隐式类别加成，见 §3 红线①） | 引擎 + 各套加成 |
@@ -116,7 +116,55 @@
   （混输下码表精确恒先于拼音，靠这个约定）。
 - 排序首要键 `cmp_match_layers`（见 §6），再按权重等。
 - 特例：**裸声母**（无完整音节，如 `m`/`zh`）单字 +`BARE_INITIAL_SINGLE_CHAR_BOOST=10M` 提到多字词前；
-  **残码前缀补全**故意不标 `is_prefix`（否则数百单字淹掉目标词，见 `meiy`→没有 案）。
+  **残码前缀补全**标 `is_promoted_completion=true` 上浮进完整匹配层（`is_prefix` 保持结构真值，
+  否则数百单字淹掉目标词，见 `meiy`→没有 案）。
+- **补全折扣**（`COMPLETION_WEIGHT_DISCOUNT=0.5`）：上浮层内部按「未输入的音节数」**连续**打折，
+  `w_eff = w × 0.5^extra`。这一级不可省 —— 只有上浮层级而无折扣时，层内**只比裸词频**，
+  extra=1 与 extra=3 同等对待：实测 `nih` 下「你会发现」(w=13330, extra=3) 压过
+  「你好」(w=5328, extra=1)，且 114 条补全把单字「你」(w=492791) 整层压到第 114 位。
+  取 0.5 对齐 librime `kCompletionPenalty`=log(0.5)（`algo/syllabifier.cc:22`，与词频同轴相加
+  于 `dict/dictionary.cc:155`）与 fcitx5/libime `overLengthCost = log10(0.5) × lengthDiff`
+  （`pinyin/pinyindictionary.cpp:471`）。⚠️ 降级门槛 `COMPLETION_FAR_WEIGHT_FLOOR` 仍比**原始**
+  weight（它按原始权重分布标定），折扣与降级是正交的两件事。
+- **残码补全整句解码**（step 2c，`lattice.rs::add_partial_final_nodes`）：把尾部残码当作一个
+  **待定音节**放进词图，候选 = 以残码为前缀且音节数为 1 的单字，由 Viterbi 选最优
+  （`buzhidaok` → 「不知道」+ `k`→「看」→ **不知道看**）。对齐 librime `enable_completion`
+  （`algo/syllabifier.cc`）与 fcitx5 的「不完整拼音」。
+  惩罚 `PARTIAL_FINAL_PENALTY = ln2`（= librime `kCompletionPenalty` 的量级）。
+  ★ **不能让 `add_abbrev_nodes` 兼职**：二者都是「补音节图给不出的节点」、代码形状几乎一样，
+  但简拼节点会把**已完成的音节也重切**成声母序列。实测放开简拼闸门让残码入图，
+  `buzhidaok` 产出「不直达欧卡」、`nihaom` 产出「你黑暗欧美」——`bu zhi dao` 被拆回
+  b/u/zh/i/d/a/o 去凑简拼了。残码补全是简拼组句的**严格子集约束**，必须独立成路。
+  ★ **必须另起一条路径，不能改 step 2**：step 2 建图在 `completed` 上，`nodes` 长度只到
+  `completed.len()+1`，**残码末端没有槽位**，Viterbi 到不了串尾（这正是原注释「lattice 到不了
+  残码末端、整句退化成单字」的约束）。step 2c 在含残码的 `query` 上重建图。
+  ★ 两条路径的产出**都保留**（不同 `consumed_length` 层）：`nihaom` 既给整句「你好」
+  (consumed=5，选它则 `m` 留缓冲续输)、也给残码整句 (consumed=6)。**改成「用残码整句替换
+  step 2 结果」会破坏分步上屏。**
+  ★ 门槛 `syllables.len() >= 2`（同 step 2）：`nim` 这类 1 音节 + 残码不走，那种输入的正解是
+  词库补全（你们/你没），残码整句「你吗」只会挤掉它。同 fcitx5 `partialLongWordLimit` 的精神。
+  双拼跳过（`query` 是转换后全拼、与击键不同域），分隔符跳过（`completed` 由音节 join 得出，
+  与 `query` 字节位不同源）。
+- **整句让位于「用完残码的补全」**（step 6.5b）：残码存在时，整句只解释 `completed`、**把用户
+  已按下的残码丢掉**，却靠 `SENTENCE_WEIGHT_BASE`(3e7) 无条件置顶 —— 实测 2/3/4/6 音节一律
+  如此（`nihaom`→你好 而非 你好吗、`zhongguor`→中国 而非 中国人）。判据复刻 librime
+  `has_exact_match_phrase`（`gear/script_translator.cc:387`：存在覆盖完整输入的精确词条时
+  **不生成整句**）：**补全词音节数 == completed + 1**（残码补成一个音节后恰好用完）。
+  手法同 6.5 —— 降到该批补全的 `max-1` 并标 `is_sentence_demoted`，**降级不销毁**。
+  ★ 判据自带过滤：`beijingdaxuex` 的「北京大学校长」6 ≠ 4+1 不触发，w=4 的冷僻预测词
+  因此顶不掉「北京大学」；换成「extra ≤ 2」一刀切就会放它进来。
+  ★ 之所以降 weight 就能换位：残码补全经上浮 `is_promoted_completion=true` ⇒ `eff_prefix`
+  为 false，与整句**同层**；若不同层则跨层不比权重，降多少都没用。
+  ★ **让位须过置信度门槛** `SENTENCE_YIELD_WEIGHT_FLOOR`：否则 `zhonghuar` 的「种花人」
+  (w=0，音节数恰好 3=2+1) 就能顶掉整句「中华」并把它压成 **w=-1**。librime 不需要这道门槛
+  （整句与词条同轴，w=0 自然排不上去）；我们的整句跨轴置顶、让位只能是二值开关，
+  **把连续比较压成布尔，就得自己补回被丢掉的门槛**。
+- **上浮距离收到 1**（`COMPLETION_UNCONDITIONAL_FLOAT_SYLLABLES`）：只有「补完手头这个音节」
+  （距离 1）无条件上浮，距离 ≥2 一律要过 `COMPLETION_FAR_WEIGHT_FLOOR`。旧值 2 让距离 2
+  整档白白豁免门槛，w=18 的「中华人民」因此在 `zhonghuar` 时登顶、压过整句「中华」——
+  这正是用户报的「候选长度来回跳动」：有残码时冷僻长词靠豁免登顶、无残码时整句 3e7 登顶，
+  两套依据逐键切换。⚠️ 该常量**不是** `COMPLETION_NEAR_SYLLABLES`（后者只管用户词长词上浮，
+  两者一度共用一个 2，改动时连带打断 `qingfengshu`→「清风输入法」）。
 
 ### 4.3 混输引擎（`mixed/engine.rs`）——**独立的权重分档系统**
 
@@ -170,16 +218,41 @@
 
 ## 6. 协调器 `candidate_display_order`（第 5 步，权威显示序）
 
-对**全部候选无条件重排**。`candidate_display_order` 本体是**六级**比较链（`handle_candidate.rs`）：
+对**全部候选无条件重排**。`candidate_display_order` 本体是**七级**比较链（⓪~⑥）（`handle_candidate.rs`）：
 
 ```
-① cmp_match_layers        is_fuzzy 升 → is_prefix 升 → is_partial 升 （非模糊 > 完整/子短语 > 前缀补全 > 模糊）
+⓪ by_consumed             **消费输入长度降序**（P0，首要键）
+                          对齐 librime：`DictEntryCollector = map<size_t, DictEntryIterator>` 以
+                          「消费的输入长度」为 key、`phrase_->rbegin()` 从最长遍历 ⇒ 消费更多者
+                          恒优先，**先于词频、先于任何层级**。`buzhidaok` 的「不知道看什么」靠它
+                          从第 136 位到首位（残码 k 终于被响应）。
+                          ⚠️ `consumed_length == 0` = 「未标注按整串算」（**码表候选恒为 0**），
+                             必须归一化成 input_len 再比，否则码表候选整体被甩到最后。
+                          ⚠️ **引擎侧刻意不用这个键**：那边 `truncate` 紧随排序，用它会让消费更少的
+                             候选（`xi'an` 的「西」、`nihao` 的「你」）被整批丢弃而非仅仅排后
+                             （实测红 10 条，含两条真回归）。根因是架构差异——librime 的
+                             `Translation` 惰性流式从不全局截断，我们是一次性产生 N 条 + 截断。
+① cmp_match_layers        is_abbrev 升 → **eff_prefix** 升 → is_partial 升
+                          （`eff_prefix = is_prefix && !is_promoted_completion`，与引擎、
+                            `freq_rerank` 共用同一个函数，三处不得各写一份）
+                          ⚠️ 曾在协调器另写过一份「同构但忽略 `is_promoted_completion`」的副本，
+                             动机是该标志本为「让高价值补全活过引擎 truncate」而设、协调器不截断。
+                             **动机成立但代价被漏算**：层级键是布尔的 = 惩罚 ∞，于是引擎侧一切
+                             **用 weight 表达的让位**在协调器全部失效 —— step 6.5b 把整句压到
+                             「补全 weight - 1」让位给恰好用完残码的补全，到协调器却因补全停在
+                             `is_prefix` 层而被整句反超（`nihaom` 首选「你好吗」→「你好们」、
+                             `beijingd` →「背景的」）。已还原为直接调用 `cmp_match_layers`。
+                             当初的动机也已消失：`zhonghuar` 的「种花人」(w=0) 能登顶是因为当时
+                             无候选消费到第 9 字节，step 2c 残码整句落地后它自然被压下去。
+                          ⚠️ is_fuzzy **已不是层级键**（曾是首要键 = 惩罚 ∞，把「是」压到第 231 位），
+                             模糊音改走 weight 折扣 FUZZY_WEIGHT_SCALE=0.01；补全同理走 0.5^extra
 ② cmp_exact_first         is_exact_code 降                          （同层内精确档优先）
 ③ cmp_pinyin_exact_first  拼音精确档 降   （**仅混输**；is_pinyin_exact_tier，先于码表前缀补全）
 ④ by_weight               weight 降       （base_sort=natural 时 ignore_weight 跳过本级）
 ⑤ base_order              升              （词库档位，跨库隔离）
 ⑥ natural_order           升              （每库局部出现序）
-⑦ consumed_length         降              （消费整串者优先，供分段上屏；对齐引擎 better 末级）
+   （原末级 `consumed_length 降` 已上升为首要键 ⓪ —— 它此前排在第 7 级，前六级早就分出
+     胜负，等于从不生效；`buzhidaok` 的残码被忽略正是这么来的）
 ```
 
 **③ 拼音精确档（混输专属）**：判据 `wind_candidate::is_pinyin_exact_tier(c, input_len)` =
@@ -324,6 +397,13 @@
 | `PINYIN_TIER_SCALE` | 100 | `mixed/engine.rs` | 混输拼音 ÷ 降档 |
 | `PINYIN_QUOTA_DIVISOR` | 5 | `mixed/engine.rs` | 截断时拼音**保底配额**分母（`max/5`，300 ⇒ 60 席） |
 | `BARE_INITIAL_SINGLE_CHAR_BOOST` | 10,000,000 | `pinyin/mod.rs` | 裸声母单字提权 |
+| `COMPLETION_WEIGHT_DISCOUNT` | 0.5 | `pinyin/mod.rs` | 前缀补全**每个未输入音节**的权重折扣（`w × 0.5^extra`） |
+| `COMPLETION_UNCONDITIONAL_FLOAT_SYLLABLES` | 1 | `pinyin/mod.rs` | 补全无条件上浮的最大距离；≥2 须过下面那道门槛 |
+| `COMPLETION_FAR_WEIGHT_FLOOR` | 100 | `pinyin/mod.rs` | 远距离补全上浮的词频门槛（挡住 w=18 的「中华人民」，放行 w=2010 的「北京大学」） |
+| `SENTENCE_YIELD_WEIGHT_FLOOR` | 50 | `pinyin/mod.rs` | 6.5b 整句让位的置信度下限（折后值，等价原始 100） |
+| `COMPLETION_NEAR_SYLLABLES` | 2 | `pinyin/mod.rs` | ⚠️ **只管用户词长词上浮**，与上面三个无关 |
+| `PARTIAL_FINAL_PENALTY` | ln2 ≈ 0.693 | `pinyin/lattice.rs` | step 2c 残码待定音节的 log_prob 罚（对齐 librime `kCompletionPenalty`） |
+| `PARTIAL_FINAL_NODE_LIMIT` | 12 | `pinyin/lattice.rs` | 残码跨度最多取几个单字进词图 |
 | `LEARN_ADD_WEIGHT` | 800 | `coordinator.rs` | 加词/学习临时权重 |
 | `freq_tier` | 0/1/2/3 | `freq_rerank.rs` | 词频重排档位（见 §7.3） |
 

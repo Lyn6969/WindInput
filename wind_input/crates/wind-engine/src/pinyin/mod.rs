@@ -85,12 +85,33 @@ fn fuzzy_penalized(weight: i32) -> i32 {
 /// 重排冲掉）。仅裸声母（syllables 为空）时应用——完整音节输入的单字已靠 is_prefix 层级就位。
 const BARE_INITIAL_SINGLE_CHAR_BOOST: i32 = 10_000_000;
 
-/// 残码补全的「近距离」上限（音节数）：补全结果比已完成音节多出不超过此数时，
-/// 视为「补完手头正在输入的这个音节（及紧随的一两个）」，置信度天然高，无条件上浮。
+/// **用户/临时词**长词上浮（[`should_promote_user_completion`]）的「距词尾」上限。
 ///
-/// 取 2 而非 1 有实测依据：`beijingd`→「北京大学」、`jisuanjik`→「计算机科学」都是 +2，
-/// 若取 1 会直接干掉这类极常见场景。
+/// ⚠️ **本常量只服务用户词判据，不要拿它当系统词库补全的判据** —— 系统词那边用
+/// [`COMPLETION_UNCONDITIONAL_FLOAT_SYLLABLES`]。两者一度共用同一个 2，改动时连带
+/// 破坏了 `qingfengshu`→「清风输入法」（`promote_user_completion_thresholds` 当场抓到）。
+/// 数值相近纯属巧合，语义是两回事：这里问的是「这个词还差几个音节打完」，
+/// 那里问的是「这条补全预测了多少你还没输入的内容」。
+///
+/// 取 2 而非 1：`qingfengshu`(剩 2)/`qingfengs`(剩 2) 要给，`qingfeng`(剩 3) 不给。
 const COMPLETION_NEAR_SYLLABLES: u32 = 2;
+
+/// **系统词库前缀补全**无条件上浮进完整匹配层的最大距离（候选音节数 - 已完成音节数）。
+///
+/// 距离 1 = 「补完手头正在输入的这个音节」，词恰好在此结束，置信度天然高；距离 ≥ 2 起
+/// 就是在预测用户**尚未输入**的内容，必须过 [`COMPLETION_FAR_WEIGHT_FLOOR`] 才配上浮。
+///
+/// ## 为什么从 2 收到 1（实测推翻了旧注释）
+///
+/// 旧值 2 的理由写的是「`beijingd`→北京大学、`jisuanjik`→计算机科学 都是 +2，取 1 会
+/// 直接干掉这类极常见场景」。**该判断不成立**：取 1 之后它们只是改走 FLOOR 那条路，而
+/// 北京大学 w=2010、计算机科学 w=1609 都远高于门槛 100，照样上浮（实测位次不变）。
+///
+/// 代价则是实打实的：距离 2 整档白白豁免了 FLOOR，于是 `zhonghuar`（打「中华人民共和国」
+/// 打到第 3 个字母）的首选是 **w=18 的「中华人民」**，压过整句「中华」。用户报的
+/// 「候选长度来回跳动」正由此而来 —— 有残码时冷僻长词靠豁免登顶，无残码时整句 3e7 登顶，
+/// 两套依据逐键切换。收到 1 后该序列的首选长度恢复单调。
+const COMPLETION_UNCONDITIONAL_FLOAT_SYLLABLES: u32 = 1;
 
 /// 远距离补全的权重门槛：超出近距离的补全属于「预测用户尚未输入的内容」，
 /// 需足够高频才配上浮，否则沉回前缀补全层级（仍在候选中，只是排到精确匹配之后）。
@@ -102,6 +123,67 @@ const COMPLETION_NEAR_SYLLABLES: u32 = 2;
 /// 注意不能对近距离补全也套这道门槛：词库 weight_spec 的 median 仅 200，
 /// 一半的词低于它，会误沉大量高频使用但低词频的日常词。
 const COMPLETION_FAR_WEIGHT_FLOOR: i32 = 100;
+
+/// step 6.5b「整句让位于用完残码的补全」的**置信度下限**（按折后权重标定）。
+///
+/// 缺了它，任何一条码上挂着的冷僻词都能把整句顶掉：实测 `zhonghuar` 首选变成
+/// **`种花人`（w=0）**，整句「中华」被降到 **w=-1**。而同一机制下「你好吗」(原始 166)
+/// 顶掉「你好」是用户明确要的 —— 二者的差别只在词频，故必须有一条线。
+///
+/// **为什么 librime 不需要这道门槛**：其整句由 Poet 与词条**同轴**打分，w=0 的词条自然
+/// 排不上去；我们的整句拿 [`SENTENCE_WEIGHT_BASE`] (3e7) 跨轴置顶，「让位」只能做成二值
+/// 开关 —— 一旦把连续比较压成布尔，就必须自己补回那道被丢掉的门槛。
+///
+/// **取值＝ [`COMPLETION_FAR_WEIGHT_FLOOR`] 的一半，两者是同一条线**：6.5b 的候选
+/// distance 恒为 1（音节数 == completed + 1），折扣恒 `0.5^1`，故折后 50 等价于原始 100。
+/// 代入实测：你好吗 166 ✓ / 中国人民 605 ✓ / 中华人民共和国 3113 ✓ 让位；
+/// 计算机课 41 ✗ / 种花人 0 ✗ 不让位。
+const SENTENCE_YIELD_WEIGHT_FLOOR: i32 = COMPLETION_FAR_WEIGHT_FLOOR / 2;
+
+/// 前缀补全的**每音节权重折扣**：候选每比已输入内容多出一个音节，权重打对折。
+///
+/// ## 为什么要有它（改动前必读）
+///
+/// 「残码上浮」原本只有 [`Candidate::is_promoted_completion`] 一个布尔开关：上浮的补全整批
+/// 进入完整匹配层，层内**只比裸词频**，extra=1 与 extra=3 同等对待。真实词库实测 `nih`：
+/// 114 条补全全部上浮，首选「你会」(w=22262)、「你会发现」(w=13330) 第 2，而「你好」
+/// (w=5328) 落到第 3、单字「你」(w=492791) 被整层压到**第 114 位**。
+/// 布尔层级等价于「惩罚 = 0 或 ∞」，中间地带无法表达 —— 同款前科见
+/// `Candidate::is_fuzzy` 字段文档（它曾是层级键，把「是」压到第 231 位）。
+///
+/// ## 取 0.5 的依据：两个成熟实现独立地选了同一个数
+///
+/// - **librime**（`algo/syllabifier.cc:22`）：`kCompletionPenalty = log(0.5)`，每个补全音节
+///   累加进 `SpellingProperties::credibility`；而 credibility 与词频**同轴相加**
+///   （`dict/dictionary.cc:155` `weight = e.weight - log(1e8) + chunk.credibility`），
+///   排序时一并比较（`dict/dictionary.cc:74`）—— 不存在独立层级。
+///   同族常量 `kAbbreviationPenalty` / `kFuzzySpellingPenalty` 也都是 log(0.5)。
+/// - **fcitx5/libime**（`pinyin/pinyindictionary.cpp:471`）：
+///   `overLengthCost = log10(0.5) * lengthDiff`，`lengthDiff` = 候选音节数 - 已输入音节数，
+///   直接加进候选 cost。
+///
+/// 两者都在 log 概率空间做加法，等价于本仓 weight 空间的**幂次乘法**。语义是朴素先验：
+/// 用户每少打一个音节，这个猜测的可信度减半。
+///
+/// ⚠️ 本折扣**不替代**上浮层级：「覆盖输入更长的候选优先」三家一致（librime 的
+/// `phrase_->rbegin()` 按 code_length 倒序、libime 的 lattice 覆盖全长路径优先、本仓的
+/// `is_partial` 层），删掉层级会让 `meiy`→「没有」重新被数百个单字「没/每/美」淹掉。
+const COMPLETION_WEIGHT_DISCOUNT: f64 = 0.5;
+
+/// 按「未输入的音节数」对前缀补全施加权重折扣，见 [`COMPLETION_WEIGHT_DISCOUNT`]。
+///
+/// `extra` = 候选音节数 - 已完成音节数。`boundary == 0`（无边界信息的旧词典/手输码用户词）
+/// 算出 0，即不折扣 —— 与本文件其他位置「无边界信息一律降级放行」的处理一致。
+///
+/// 饱和到 `>= 1`：与 [`fuzzy_penalized`] 同理，折扣不该把候选压成 0/负权重，
+/// 那会改变它与「无权重」候选的关系。
+fn completion_penalized(weight: i32, extra: u32) -> i32 {
+    if weight <= 1 || extra == 0 {
+        return weight;
+    }
+    let scale = COMPLETION_WEIGHT_DISCOUNT.powi(extra as i32);
+    ((weight as f64) * scale).round().max(1.0) as i32
+}
 
 /// 前缀补全的取数上限（见 convert 中 `completion_limit` 处的完整说明）。
 ///
@@ -220,6 +302,18 @@ pub struct Config {
     /// （`is_abbreviation` 只要求每字母是某音节首字母），而混输里有人只拿拼音做临时输入补位。
     /// 关闭还顺带省掉用户词层的全量扫描（见 convert step6：`search_prefix("", 0)` 枚举全部用户词）。
     pub enable_abbrev: bool,
+    /// 是否让**尾部残码**参与整句解码（step 2c，`buzhidaok`→「不知道看」）。
+    /// 默认 true = 纯拼音方案的行为。
+    ///
+    /// **混输关闭它**：混输的击键串同时是码表码，把它整串当拼音组句是过度解读。真机现象
+    /// 是打五笔 `aaw`（本意 `aawt`→「工作」）时首选变成拼音「啊啊我」——残码 `w` 被补成
+    /// 「我」后整句消费满 3/3 键，于是跨过「消费整串」这道闸门抢走首位。
+    ///
+    /// ⚠️ **不要复用 [`Self::enable_abbrev`] 当判据**（两者恰好都是「混输时关掉」）：
+    /// 一个问「要不要把整串按声母读成简拼」，一个问「要不要把最后半个音节猜完」，
+    /// 语义正交。共用一个开关的代价见 `COMPLETION_NEAR_SYLLABLES` 的文档——那次
+    /// 两个不相干的功能共用一个常量，改动时连带打断了 `qingfengshu`→「清风输入法」。
+    pub enable_partial_final: bool,
     /// 词组补全的音节数约束：至少输入几个音节才给词组（见 `[schema.pinyin.completion]`）。
     /// 补全词的音节数恒 ≥ 输入音节数，故未达门槛时上限收紧到输入音节数本身，
     /// 效果即「只出同音节数的候选」。取 1 = 不设限。
@@ -279,6 +373,7 @@ impl Default for Config {
             show_code_hint: false,
             use_smart_compose: true,
             enable_abbrev: true,
+            enable_partial_final: true,
             completion_min_syllables: 2,
             completion_max_extra_syllables: 3,
         }
@@ -1186,6 +1281,111 @@ impl Engine for PinyinEngine {
             }
         }
 
+        // 2c. **残码补全整句解码**：尾部残码作为「待定音节」入图，由 LM 选出最优单字
+        //     （`buzhidaok` → 「不知道」+ `k` 补成「看」→ 整句「不知道看」）。
+        //
+        //     ## 为什么必须另起一条路径而不是改 step 2
+        //
+        //     step 2 建图在 `completed` 上，`nodes` 数组长度 = `completed.len()+1`，**残码
+        //     末端根本没有槽位**，Viterbi 到不了串尾（`completed_len` 处的注释记着这个约束：
+        //     「否则 lattice 到不了残码末端、Viterbi 失败、整句退化成单字」）。本路径在含
+        //     残码的 `query` 上重建图，槽位才够。
+        //
+        //     两条路径的产出**都保留**，它们是不同 `consumed_length` 层的候选：`nihaom` 既
+        //     给「你好」(consumed=5，选它则残码 `m` 留缓冲续输)，也给残码整句(consumed=6)。
+        //     协调器按消费长度优先排序，后者在前，但前者仍在候选中可选——这正是分步上屏
+        //     依赖的行为，改成「用残码整句替换 step 2 结果」会破坏它。
+        //
+        //     ## 门槛
+        //
+        //     `syllables.len() >= 2`（与 step 2 一致）：至少两个完整音节才谈得上「组句」。
+        //     `nim` 这类 1 音节 + 残码不走本路径——那种输入的正解是词库补全（你们/你没），
+        //     残码整句「你吗」只会挤掉它。同 fcitx5 `partialLongWordLimit` 的精神：短输入
+        //     不做激进的部分匹配。
+        //
+        //     双拼跳过（`sp_result.is_none()`）：`query` 是转换后的全拼、与击键不同域，
+        //     残码的字节位在两个域里对不上。分隔符跳过（`!has_sep`）：`completed` 由音节
+        //     `join` 得出，`completed_len` 与 `query` 的字节位不同源。
+        //
+        //     **混输跳过**（`enable_partial_final`，见该字段文档）：混输的击键串同时是码表码，
+        //     整串当拼音组句会抢走码表首位——真机 `aaw`（本意五笔 `aawt`→工作）首选变成
+        //     「啊啊我」。★ 注意这不是「防线被绕过」而是**防线的前提被改掉**：`is_pinyin_exact_tier`
+        //     靠「拼音整句解释不了全部输入」把它挡在精确档外，step 2c 让它真的消费满整串，
+        //     那道判据便合法地放行了。加新的生成路径时，要回头查有哪些判据隐含假设了它不存在。
+        if self.config.use_smart_compose
+            && self.config.enable_partial_final
+            && syllables.len() >= 2
+            && completed_len < query.len()
+            && sp_result.is_none()
+            && !has_sep
+        {
+            let seg_graph = SegGraph::from_dag(&Dag::build(query, trie));
+            let mut lattice_nodes = self.lattice_builder.build(
+                query,
+                &seg_graph,
+                dict,
+                Some(&self.fuzzy_config),
+                self.unigram.as_deref(),
+                true,
+            );
+            self.lattice_builder.add_partial_final_nodes(
+                query,
+                completed_len,
+                dict,
+                self.unigram.as_deref(),
+                &mut lattice_nodes,
+            );
+            let full_len = query.len();
+            let mut lattice: Vec<Vec<WordNode>> = vec![Vec::new(); full_len + 1];
+            for (end_pos, nodes_at_end) in lattice_nodes.iter().enumerate() {
+                if end_pos > full_len {
+                    continue;
+                }
+                for node in nodes_at_end {
+                    lattice[end_pos].push(WordNode {
+                        start: node.start,
+                        end: node.end,
+                        word: node.word.clone(),
+                        syl_mask: node.syl_mask,
+                        log_prob: node.log_prob,
+                    });
+                }
+            }
+            let result = self.viterbi.decode(&lattice, full_len);
+            if !result.words.is_empty() && result.log_prob.is_finite() {
+                let sentence: String = result.words.join("");
+                if !sentence.is_empty() {
+                    let log_offset = (result.log_prob * 1000.0)
+                        .clamp(-(SENTENCE_WEIGHT_BASE as f64), 0.0)
+                        as i32;
+                    let weight = SENTENCE_WEIGHT_BASE.saturating_add(log_offset);
+                    if let Some(existing) = candidates.iter_mut().find(|c| c.text == sentence) {
+                        // 同文合并（`nihaom` 的残码整句「你好吗」与 step4 的前缀补全同文）：
+                        // 取更强的身份，理由同 step 2 的同文合并分支。
+                        existing.weight = existing.weight.max(weight);
+                        existing.is_partial = false;
+                        existing.is_sentence = true;
+                    } else {
+                        candidates.insert(
+                            0,
+                            Candidate {
+                                text: sentence,
+                                // 码取整串（含残码）⇒ `consumed_length = query.len()`：本路径
+                                // 的整句**解释了全部输入**，这正是它区别于 step 2 结果之处。
+                                code: query.to_string(),
+                                weight,
+                                natural_order: 0,
+                                source: CandidateSource::Pinyin,
+                                is_sentence: true,
+                                boundary: result.boundary,
+                                ..Default::default()
+                            },
+                        );
+                    }
+                }
+            }
+        }
+
         // 2b. **混合整句解码**：简拼段与全拼段在同一张词图里由 Viterbi 选路径
         //     （`bzdhaobuhao` → 「不知道」+「好不好」→ 整句「不知道好不好」）。
         //
@@ -1380,19 +1580,26 @@ impl Engine for PinyinEngine {
         for h in
             dict.search_prefix_with_boundary_syllable_capped(query, completion_limit, syllable_cap)
         {
+            // 候选比已完成音节多出的音节数（`boundary == 0` → 0）。同时供「是否降级」判据
+            // 与 `completion_penalized` 的折扣指数使用。
+            let distance = h.boundary.count_ones().saturating_sub(completed_syls);
             let demote_to_prefix_layer = if trailing_partial {
-                let distance = h.boundary.count_ones().saturating_sub(completed_syls);
-                distance > COMPLETION_NEAR_SYLLABLES && h.weight < COMPLETION_FAR_WEIGHT_FLOOR
+                // ⚠️ 门槛比的是**原始** weight：COMPLETION_FAR_WEIGHT_FLOOR 按原始权重分布
+                // 标定（合理项下界「中国人民解放军」252 / 噪音上界 60），拿折后值比会让这条
+                // 线整体失准 —— 折扣与降级是两件正交的事。
+                distance > COMPLETION_UNCONDITIONAL_FLOAT_SYLLABLES
+                    && h.weight < COMPLETION_FAR_WEIGHT_FLOOR
             } else {
                 true // 无残码：正常前缀补全，沉在精确匹配之后
             };
             // is_prefix 恒表结构事实（search_prefix_with_boundary 返回的都是码更长的补全）；
-            // 「是否沉到非精确层」的排序决策由 is_promoted_completion 承接（残码上浮即提升）。
+            // 「是否沉到非精确层」的排序决策由 is_promoted_completion 承接（残码上浮即提升）；
+            // **层内**的远近之别由 completion_penalized 的连续折扣承接（见该常量文档）。
             push_unique(
                 &mut candidates,
                 h.text,
                 h.code,
-                h.weight,
+                completion_penalized(h.weight, distance),
                 h.order,
                 false,
                 true,
@@ -1880,6 +2087,79 @@ impl Engine for PinyinEngine {
             }
         }
 
+        // 6.5b 整句让位于「恰好用完残码的补全」
+        //
+        // ## 现象
+        //
+        // 打 `nihaom`（`m` 是残码）时首选恒是整句「你好」—— 它只解释了 `nihao`，**把用户
+        // 已经按下的 `m` 丢掉了**；真正响应了 `m` 的「你好吗」屈居第 2。实测该规律与音节数
+        // 无关，2/3/4/6 音节一律如此：`zhongguor`→中国(丢 r)、`zhongguorenm`→中国人(丢 m)、
+        // `zhonghuarenmingongheg`→中华人民共和(丢 g)。根因是整句拿着
+        // [`SENTENCE_WEIGHT_BASE`] (3e7) 无条件置顶，而补全只有真实词频（个位数 ~ 1e4），
+        // 差 4~7 个数量级，永远翻不过去。
+        //
+        // ## 判据来自 librime，且比「按 extra 一刀切」更准
+        //
+        // librime `gear/script_translator.cc:387`：**存在覆盖完整输入的精确词条时，根本不
+        // 生成整句**（`if (!has_exact_match_phrase(...)) sentence_ = MakeSentence(...)`）。
+        // 其音节级 completion 会把残码 `m` 补成 `ma/mai/mei…`，于是 `ni|hao|ma` 覆盖全部
+        // 输入、「你好吗」成为 exact match ⇒ 不做整句。fcitx5/libime 同理：不完整拼音是
+        // lattice 里的合法节点，覆盖全长的路径天然优先。
+        //
+        // 我们的残码被排除在音节图之外（见 step 2 附近注释：否则 lattice 到不了残码末端），
+        // 「你好吗」只能以**补全**身份出现，故复刻其语义而非其实现：
+        // **补全词音节数 == 已完成音节数 + 1** —— 残码补成一个完整音节后，这个词恰好用完。
+        //
+        // ★ 这个判据自带过滤，无须再给低频词打补丁（实测代入）：
+        //
+        // | 输入 | 候选 | 音节数 vs completed+1 | 结果 |
+        // |---|---|---|---|
+        // | `nihaom` | 你好吗 | 3 == 2+1 | 让位 ✓ |
+        // | `zhongguor` | 中国人 | 3 == 2+1 | 让位 ✓ |
+        // | `zhongguorenm` | 中国人民 | 4 == 3+1 | 让位 ✓ |
+        // | `zhonghuarenmingongheg` | 中华人民共和国 | 7 == 6+1 | 让位 ✓ |
+        // | `beijingdaxuex` | 北京大学校长 | 6 ≠ 4+1 | **不让位**（w=4 的冷僻预测词） |
+        //
+        // 换成「extra ≤ 2」这类一刀切，最后一行就会放进来，w=4 的「北京大学校长」顶掉
+        // 「北京大学」。**判据选对，坏例子不需要额外条件挡。**
+        //
+        // ## 手法与 6.5 一致：降级，不销毁
+        //
+        // 降到该批补全的 `max - 1`（理由同 6.5 的相对权重论证），整句仍在候选里、就在其后。
+        // 取 `min` 是因为 6.5 可能已经降过一次 —— 两次让位取更低者，不能把已让的位抬回来。
+        //
+        // 同层性：残码补全经上浮已是 `is_promoted_completion=true` ⇒ `cmp_match_layers` 的
+        // `eff_prefix` 为 false，与整句**同层**，故降 weight 即可换位（若不同层则跨层不比权重，
+        // 降多少都没用 —— 这正是 6.5 注释里那条不变量的另一面）。
+        //
+        // `boundary == 0`（无边界信息）的候选 `count_ones()` 恒为 0，永不满足判据 ⇒ 自动
+        // 排除，与本文件「无边界信息一律降级放行」一致（此处「放行」= 不触发让位 = 保守）。
+        let exhausting_completion_max = if trailing_partial {
+            candidates
+                .iter()
+                .filter(|c| {
+                    c.is_prefix
+                        && !c.is_fuzzy
+                        && c.boundary.count_ones() == completed_syls + 1
+                        // 置信度下限，见 SENTENCE_YIELD_WEIGHT_FLOOR：没有它，
+                        // `zhonghuar` 的「种花人」(w=0) 就能把整句「中华」顶掉并压成 -1。
+                        && c.weight >= SENTENCE_YIELD_WEIGHT_FLOOR
+                })
+                .map(|c| c.weight)
+                .max()
+        } else {
+            None
+        };
+        if let Some(max_w) = exhausting_completion_max {
+            let target = max_w.saturating_sub(1);
+            for c in candidates.iter_mut().filter(|c| c.is_sentence) {
+                if c.weight > target {
+                    c.weight = target;
+                    c.is_sentence_demoted = true;
+                }
+            }
+        }
+
         // 6.6 整句解「有同码竞争者」标记：**只摘词频锚定，不动 weight**
         //
         // 上面的 6.5 处理的是「整句该不该让位」（合成解/模糊解 vs 精确整词），本节处理的是
@@ -1946,14 +2226,12 @@ impl Engine for PinyinEngine {
             }
         }
 
-        candidates.sort_by(|a, b| {
-            wind_candidate::cmp_match_layers(a, b)
-                .then(b.weight.cmp(&a.weight))
-                .then(a.natural_order.cmp(&b.natural_order))
-        });
-        candidates.truncate(max_candidates);
-
         // 分段上屏所需：标注每个候选实际消费的输入字节数。
+        //
+        // 本块原在 `sort_by` + `truncate` **之后**，现提到其前。当前排序并不消费它（理由见
+        // 下方 sort_by 注释），提前纯粹是为消除一个隐患：日后若有人想让排序用上
+        // `consumed_length`，在原位置它恒为 0，改动会静默失效且无诊断。位置提前不改变任何
+        // 现有行为（计算只依赖 `c.code`/`query`/`sp_result`，三者此刻均已就绪）。
         // code 为 input（全拼）的前缀（如 "ni" ⊂ "nihao"）→ 只消费该前缀，选中后保留剩余拼音续转；
         // 否则（整句/前缀补全/非前缀子串）消费整串。0 表示未知（由调用方按整串处理）。
         // 双拼激活时：全拼字节数需通过 map_consumed_length 回算为双拼原始键数，
@@ -1986,6 +2264,26 @@ impl Engine for PinyinEngine {
                 None => fp_consumed,
             };
         }
+
+        // ⚠️ **引擎侧刻意不用「消费长度优先」排序**（协调器 `candidate_display_order` 用）。
+        //
+        // 试过，会破坏分段上屏：紧随其后的 `truncate` 使排序决定谁**活过截断**，而消费更少
+        // 的候选（`xi'an` 的子短语「西」、`nihao` 的单字「你」）会被整批丢弃 —— 不是排到
+        // 后面翻页可见，是根本不在列表里。实测红 10 条，其中 `separator_two_step_segmentation`
+        // / `mouse_select_two_step_segmentation` 是真回归。
+        //
+        // 根因是架构差异：librime 的 `Translation` 惰性流式、按需产生、从不全局截断，
+        // 排序键只影响顺序；我们「一次性产生 N 条 + 截断」，排序键同时决定了去留。
+        // ⇒ 引擎侧的匹配层级（含 `is_promoted_completion` 上浮）保证的是「高价值候选活过
+        // 截断」，与协调器 P0 的「显示顺序」**不是同一件事，不可互相替代**。
+        // 要下沉 P0 必须先给 `truncate` 配一套按消费长度分档的保底配额（参考混输
+        // `PINYIN_QUOTA_DIVISOR`），本轮未做。
+        candidates.sort_by(|a, b| {
+            wind_candidate::cmp_match_layers(a, b)
+                .then(b.weight.cmp(&a.weight))
+                .then(a.natural_order.cmp(&b.natural_order))
+        });
+        candidates.truncate(max_candidates);
 
         let (mut preedit_display, completed_syllables, partial_syllable) =
             self.compute_composition(input);
@@ -2490,6 +2788,24 @@ mod tests {
             should_promote_user_completion(2, true, 0),
             "无边界 2 音节 + 残码（started 3）上浮"
         );
+    }
+
+    /// 补全折扣：每多一个未输入音节，权重减半（对齐 librime `kCompletionPenalty`
+    /// 与 fcitx5 `overLengthCost`，见 [`COMPLETION_WEIGHT_DISCOUNT`]）。
+    #[test]
+    fn completion_penalty_halves_per_extra_syllable() {
+        // extra=0（候选音节数 == 已完成音节数，或 boundary=0 算不出）：原样不动。
+        assert_eq!(completion_penalized(5328, 0), 5328);
+        // 「你好」nih 下 extra=1。
+        assert_eq!(completion_penalized(5328, 1), 2664);
+        // 「你会发现」nih 下 extra=3：13330 × 0.125 = 1666.25 → 1666，
+        // 于是落到「你好」2664 之后 —— 这正是本机制要达成的效果。
+        assert_eq!(completion_penalized(13330, 3), 1666);
+        // 饱和到 >=1：折扣不该把候选压成 0 而改变它与「无权重」候选的关系。
+        assert_eq!(completion_penalized(4, 10), 1);
+        // weight <= 1 短路，不因折扣变负/变 0。
+        assert_eq!(completion_penalized(1, 5), 1);
+        assert_eq!(completion_penalized(0, 5), 0);
     }
 
     /// 用户造词的简拼应可命中（现算，非离线索引）：用户新增「菜鸟驿站」（全拼
