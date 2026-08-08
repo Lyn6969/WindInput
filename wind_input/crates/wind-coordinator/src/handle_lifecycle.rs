@@ -101,7 +101,8 @@ impl Coordinator {
     }
 
     /// 空缓冲模式激活的单一入口（对齐 key-pipeline.md §2.1 优先级链）。
-    /// 优先级：临时英文(Shift+字母) > 快捷输入 > 临时拼音 > 特殊模式。命中返回激活 KeyAction，
+    /// 优先级（**以本函数的实际调用顺序为准**）：临时英文(Shift+字母) > 临时英文触发键 >
+    /// 临时拼音 > 特殊模式 > 快捷输入(mix)。命中返回激活 KeyAction，
     /// 都不命中返回 None（落普通输入）。URL 前缀夺取是「缓冲扩展夺取」语义，不在此链，单独处理。
     pub(crate) fn try_activate_mode(
         &self,

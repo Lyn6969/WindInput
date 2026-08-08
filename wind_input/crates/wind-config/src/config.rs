@@ -3068,6 +3068,94 @@ impl Config {
         self.migrate_quick_mix_pinyin_member();
         self.migrate_quick_input_legacy_member();
         self.migrate_letter_trigger_keys();
+        // 须在 migrate_letter_trigger_keys **之后**：那一步先把字母项摘干净，
+        // 这里看到的 trigger_keys 已只剩符号键。
+        self.migrate_trigger_keys_into_key_actions();
+    }
+
+    /// 存量迁移：四处 `trigger_keys` → `keys.key_actions`（设计文档五c「全局层收编」）。
+    ///
+    /// 折算在**内存里**做，不写回配置文件：与本文件其余 `migrate_*` 同策略。用户的
+    /// config.toml 保持原样，回退一个版本就能照常工作；旧字段的真正消失发生在用户下次
+    /// 用设置页保存时（GUI 按新的工作态全量写回）。
+    ///
+    /// # 冲突处置：先到先得，顺序必须复现 `try_activate_mode` 的**真实**调用顺序
+    ///
+    /// ★ 那个顺序是 **临英 > 临拼 > special > mix**（`handle_lifecycle.rs` 里依次是
+    /// 临英触发键 → 临拼触发键 → 特殊模式 → mix）。设计文档 §1 曾写成
+    /// 「临英 > 快捷输入 > 临拼 > 特殊模式」，**是错的**——照那个顺序迁移会让
+    /// 「`;` 同时配给 mix 和临拼」的用户在升级后进错模式，且现象是「一直用的键突然
+    /// 变了功能」，极难联想到是迁移干的。以代码为准，不以文档为准。
+    ///
+    /// 同一个键被多处占用时，未中选的那几处也要清空——留在配置里同样是静默失效，
+    /// 而用户会以为它还生效（这正是本次收编要消除的问题之一）。
+    ///
+    /// 已在 `keys.key_actions` 里显式配过的键**不覆盖**：用户的新配置优先于存量迁移。
+    fn migrate_trigger_keys_into_key_actions(&mut self) {
+        // (键名 → 动词)，按优先级先到先得。
+        let mut claimed: std::collections::BTreeMap<String, String> =
+            std::collections::BTreeMap::new();
+        // 收走一处的触发键：中选的进 claimed，未中选的丢弃并 warn。两种情况都清空原字段。
+        let mut take = |keys: &mut Vec<String>, action: String, owner: &str| {
+            for k in keys.drain(..) {
+                let k = k.trim().to_lowercase();
+                if k.is_empty() {
+                    continue; // 空串项是历史遗留的占位，本就不生效
+                }
+                match claimed.get(&k) {
+                    Some(winner) => warn!(
+                        "配置迁移：{owner} 的引导键 {k:?} 与 {winner:?} 争用，\
+                         按激活链已归 {winner:?}（该键在 {owner} 上原本就静默失效）"
+                    ),
+                    None => {
+                        claimed.insert(k, action.clone());
+                    }
+                }
+            }
+        };
+
+        take(
+            &mut self.input.temp_english.trigger_keys,
+            "temp_english".to_string(),
+            "input.temp_english",
+        );
+        take(
+            &mut self.input.temp_pinyin.trigger_keys,
+            "temp_pinyin".to_string(),
+            "input.temp_pinyin",
+        );
+        for m in self.schema.special_modes.iter_mut() {
+            // effective_id 借的是 &self，先取成 owned 再动 trigger_keys。
+            let id = m.effective_id().to_string();
+            if id.is_empty() {
+                m.trigger_keys.clear();
+                continue;
+            }
+            let owner = format!("schema.special_modes[{id}]");
+            take(&mut m.trigger_keys, format!("special:{id}"), &owner);
+        }
+        for m in self.schema.mix_modes.iter_mut() {
+            if m.id.is_empty() {
+                m.trigger_keys.clear();
+                continue;
+            }
+            let owner = format!("schema.mix_modes[{}]", m.id);
+            take(&mut m.trigger_keys, format!("mix:{}", m.id), &owner);
+        }
+
+        for (key, action) in claimed {
+            // 键名解析不了的（历史脏数据）丢弃并 warn：留着也进不了任何通路。
+            if crate::hotkey::route_of_key_action(&key).is_none() {
+                warn!("配置迁移：引导键 {key:?} 无法解析为按键，已丢弃（动作 {action:?}）");
+                continue;
+            }
+            if self.keys.key_actions.contains_key(&key) {
+                info!("配置迁移：{key:?} 已在 keys.key_actions 显式配置，保留用户设置");
+                continue;
+            }
+            info!("配置迁移：引导键 {key:?} → keys.key_actions = {action:?}");
+            self.keys.key_actions.insert(key, action);
+        }
     }
 
     /// 存量迁移：`trigger_keys` 里的单字母 → 方案级 [`BoundAction`]。
@@ -3627,10 +3715,21 @@ mod tests {
             c.schema.codetable.z_key_action, "temp_pinyin",
             "z 应折算成 z_key_action"
         );
+        // 字母项被本步摘除；符号项随后由五c 的收编迁移移进 keys.key_actions
+        // （`normalize` 里两步依次跑）。断言它**去了哪**而不是「还在原地」——
+        // 后者在收编后是个必然失败的观察点，但字母摘除这条契约本身没变。
+        assert!(
+            c.input.temp_pinyin.trigger_keys.is_empty(),
+            "符号项应已被收编迁移取走"
+        );
         assert_eq!(
-            c.input.temp_pinyin.trigger_keys,
-            vec!["backtick".to_string()],
-            "字母项应从 trigger_keys 摘除，符号项保留"
+            c.keys.key_actions.get("backtick").map(String::as_str),
+            Some("temp_pinyin"),
+            "符号引导键应完整折算进 keys.key_actions，不能在两步之间丢失"
+        );
+        assert!(
+            !c.keys.key_actions.contains_key("q"),
+            "被摘除的字母不该跟着进新表"
         );
     }
 
@@ -3656,6 +3755,123 @@ mod tests {
         );
     }
 
+    /// 五c 迁移：四处 `trigger_keys` 折算进 `keys.key_actions`。
+    #[test]
+    fn migrate_trigger_keys_folds_all_four_sources() {
+        let mut c = Config::default();
+        c.input.temp_pinyin.trigger_keys = vec!["backtick".into()];
+        c.input.temp_english.trigger_keys = vec!["quote".into()];
+        c.schema.special_modes = vec![SpecialModeConfig {
+            id: "fuhao".into(),
+            trigger_keys: vec!["backslash".into()],
+            ..Default::default()
+        }];
+        c.schema.mix_modes = vec![MixModeConfig {
+            id: "quick_mix".into(),
+            trigger_keys: vec!["semicolon".into()],
+            ..Default::default()
+        }];
+        c.normalize();
+
+        let ka = &c.keys.key_actions;
+        assert_eq!(ka.get("backtick").map(String::as_str), Some("temp_pinyin"));
+        assert_eq!(ka.get("quote").map(String::as_str), Some("temp_english"));
+        assert_eq!(
+            ka.get("backslash").map(String::as_str),
+            Some("special:fuhao")
+        );
+        assert_eq!(
+            ka.get("semicolon").map(String::as_str),
+            Some("mix:quick_mix")
+        );
+
+        // 旧字段清空——留着也是静默失效，而用户会以为它还生效。
+        assert!(c.input.temp_pinyin.trigger_keys.is_empty());
+        assert!(c.input.temp_english.trigger_keys.is_empty());
+        assert!(c.schema.special_modes[0].trigger_keys.is_empty());
+        assert!(c.schema.mix_modes[0].trigger_keys.is_empty());
+    }
+
+    /// ★★ 争用同一个键时，归属必须复现 `try_activate_mode` 的**真实**调用顺序：
+    /// 临英 > 临拼 > special > mix。
+    ///
+    /// 设计文档 §1 曾把顺序写成「临英 > 快捷输入 > 临拼 > 特殊模式」，照那个迁移会让
+    /// 「`;` 同时配给 mix 和临拼」的用户升级后进错模式——现象是「一直用的键突然变了
+    /// 功能」，极难联想到是迁移干的。以代码为准。
+    #[test]
+    fn migrate_trigger_keys_follows_real_activation_order() {
+        let mut c = Config::default();
+        // 同一个 `;` 配给四处，按真实顺序应归临英。
+        c.input.temp_english.trigger_keys = vec!["semicolon".into()];
+        c.input.temp_pinyin.trigger_keys = vec!["semicolon".into()];
+        c.schema.special_modes = vec![SpecialModeConfig {
+            id: "sp".into(),
+            trigger_keys: vec!["semicolon".into()],
+            ..Default::default()
+        }];
+        c.schema.mix_modes = vec![MixModeConfig {
+            id: "mx".into(),
+            trigger_keys: vec!["semicolon".into()],
+            ..Default::default()
+        }];
+        c.normalize();
+        assert_eq!(
+            c.keys.key_actions.get("semicolon").map(String::as_str),
+            Some("temp_english"),
+            "临英在激活链最前，应赢下争用"
+        );
+
+        // 单独验临拼 > special：去掉临英那一处。
+        let mut c2 = Config::default();
+        c2.input.temp_pinyin.trigger_keys = vec!["grave".into()];
+        c2.schema.special_modes = vec![SpecialModeConfig {
+            id: "sp".into(),
+            trigger_keys: vec!["grave".into()],
+            ..Default::default()
+        }];
+        c2.normalize();
+        assert_eq!(
+            c2.keys.key_actions.get("grave").map(String::as_str),
+            Some("temp_pinyin"),
+            "临拼排在特殊模式之前"
+        );
+    }
+
+    /// 用户已在 `keys.key_actions` 显式配过的键不被存量迁移覆盖。
+    #[test]
+    fn migrate_trigger_keys_does_not_override_explicit() {
+        let mut c = Config::default();
+        c.keys
+            .key_actions
+            .insert("backtick".into(), "temp_english".into());
+        c.input.temp_pinyin.trigger_keys = vec!["backtick".into()];
+        c.normalize();
+        assert_eq!(
+            c.keys.key_actions.get("backtick").map(String::as_str),
+            Some("temp_english"),
+            "用户的新配置优先于存量迁移"
+        );
+        // 旧字段仍要清空：它已经不可能生效了。
+        assert!(c.input.temp_pinyin.trigger_keys.is_empty());
+    }
+
+    /// 空串项与解析不了的键名都不该进新表——前者是历史占位，后者是脏数据。
+    #[test]
+    fn migrate_trigger_keys_skips_empty_and_unparsable() {
+        let mut c = Config::default();
+        c.schema.special_modes = vec![SpecialModeConfig {
+            id: "sp".into(),
+            trigger_keys: vec!["".into(), "  ".into(), "根本不是键".into()],
+            ..Default::default()
+        }];
+        c.normalize();
+        assert!(
+            !c.keys.key_actions.values().any(|v| v == "special:sp"),
+            "空串/无法解析的键名不该进表，实际 {:?}",
+            c.keys.key_actions
+        );
+    }
+
     /// 特殊模式独有的 z：折算成 `special:<id>`。
     #[test]
     fn migrate_letter_trigger_keys_maps_special_mode() {
@@ -3668,10 +3884,13 @@ mod tests {
         c.normalize();
 
         assert_eq!(c.schema.codetable.z_key_action, "special:rare");
+        // 同上：符号引导键随后被收编迁移取走，断言它完整到达新表。
+        // 「z 走 z_key_action、符号走 key_actions」两条路并存这一点没变。
+        assert!(c.schema.special_modes[0].trigger_keys.is_empty());
         assert_eq!(
-            c.schema.special_modes[0].trigger_keys,
-            vec!["backslash".to_string()],
-            "符号引导键不受影响，仍可与 z_key_action 并存"
+            c.keys.key_actions.get("backslash").map(String::as_str),
+            Some("special:rare"),
+            "符号引导键应完整折算进 keys.key_actions"
         );
     }
 

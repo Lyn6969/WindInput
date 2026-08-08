@@ -17,8 +17,14 @@
 
 五处 `trigger_keys`：`input.temp_pinyin` / `input.temp_english` / `schema.mix_modes[]` /
 `schema.special_modes[]`，加上 `keys.toggle_mode_keys`。前四者的优先级是**代码顺序**
-（`try_activate_mode`，`handle_lifecycle.rs:95`），不是数据；`match_special_trigger` 用
+（`try_activate_mode`，`handle_lifecycle.rs`），不是数据；`match_special_trigger` 用
 `.find()` 先到先得，两个实例配同一个键时后者**静默失效**。
+
+> ⚠️ 真实顺序是 **临英 > 临拼 > special > mix**（`try_activate_mode` 里四个
+> `*_trigger` 的调用次序）。本文档早先写成「临英 > 快捷输入 > 临拼 > 特殊模式」，
+> **是错的**。五c 的迁移要复现这个顺序来决定争用归属，照错的写会让「同一个键配给
+> mix 和临拼」的用户升级后进错模式——现象是「一直用的键突然变了功能」，极难联想到
+> 是迁移干的。**以代码为准**；`handle_lifecycle.rs` 里那句同样错误的注释已一并修正。
 
 **关键事实**：第一张表的值域已经覆盖了本设计需要的绝大部分动词，且 `enter_special:<id>`
 与 `switch_schema:<id>` 这类带实例 id 的形态也已存在。本设计不发明动词，只做两件事：
