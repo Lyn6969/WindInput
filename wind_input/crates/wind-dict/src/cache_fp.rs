@@ -40,7 +40,7 @@ const PARSE_SEMANTICS_VERSION: u32 = 3;
 /// `tag` 用于区分「同一份源文件、但解析方式不同」的缓存。**没有它就会出现这种静默错误**：
 /// 把某词库的 `dict_type` 在 english ↔ 非 english 之间切换，只改变 `lowercase_code`
 /// 而 `.yaml` 字节不变 → 指纹命中 → 永久复用大小写错误的缓存。
-/// 同理，不同种类的缓存（词库 / unigram）也应各自持 tag，免得共用一个语义版本号
+/// 同理，不同种类的缓存（词库 / 注释库）也应各自持 tag，免得共用一个语义版本号
 /// 却各改各的、谁也没动机去 +1。
 ///
 /// 任一源不可读 → None（视为需重建）。
@@ -88,10 +88,6 @@ pub fn dict_tag(lowercase_code: bool) -> &'static str {
         "dict/raw"
     }
 }
-
-/// unigram 词频缓存的 tag。它与词库解析无关，单独持 tag 后，
-/// 改 unigram 解析只需改这里的版本后缀，不必去动全局的 [`PARSE_SEMANTICS_VERSION`]。
-pub const UNIGRAM_TAG: &str = "unigram/v1";
 
 /// 注释库缓存的 tag。同理独立于词库解析：注释库用的是 `wind-reverse` 里那份精简解析器
 /// （只取 text/comment/code 三列），与 `codetable` 的 rime 解析各自演进。
@@ -148,7 +144,7 @@ mod tests {
         assert_ne!(raw, lower, "lowercase 与否必须得到不同指纹");
         assert_ne!(
             raw,
-            fingerprint(&[&src], UNIGRAM_TAG).unwrap(),
+            fingerprint(&[&src], COMMENT_TAG).unwrap(),
             "不同种类缓存必须得到不同指纹"
         );
 

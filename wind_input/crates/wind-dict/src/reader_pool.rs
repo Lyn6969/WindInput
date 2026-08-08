@@ -29,7 +29,6 @@
 
 use crate::commentdict::CommentReader;
 use crate::datformat::WdatReader;
-use crate::unigram::UnigramReader;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock, Weak};
@@ -63,7 +62,6 @@ fn file_stamp(path: &Path) -> FileStamp {
 type Pool<T> = OnceLock<Mutex<HashMap<PathBuf, Entry<T>>>>;
 
 static WDAT_POOL: Pool<WdatReader> = OnceLock::new();
-static UNIGRAM_POOL: Pool<UnigramReader> = OnceLock::new();
 static COMMENT_POOL: Pool<CommentReader> = OnceLock::new();
 
 #[allow(clippy::type_complexity)]
@@ -104,13 +102,6 @@ pub fn file_lock(path: &Path) -> Arc<Mutex<()>> {
 pub fn open_wdat(path: &Path) -> anyhow::Result<Arc<WdatReader>> {
     get_or_open(WDAT_POOL.get_or_init(Default::default), path, |p| {
         WdatReader::open(p)
-    })
-}
-
-/// 打开 unigram.wdb；同一路径已有存活 reader 时复用，不再新建映射。
-pub fn open_unigram(path: &Path) -> anyhow::Result<Arc<UnigramReader>> {
-    get_or_open(UNIGRAM_POOL.get_or_init(Default::default), path, |p| {
-        UnigramReader::open(p)
     })
 }
 

@@ -16,7 +16,6 @@ pub mod fuzzy;
 pub mod generate;
 pub mod interp;
 pub mod lattice;
-pub mod lm;
 pub mod mixed_abbrev;
 pub mod parser;
 pub mod scorer;
@@ -225,7 +224,7 @@ const MIXED_ABBREV_INDEX_LIMIT: usize = 64;
 /// 按一下数字键即可选到，「首词命中 0%」并不等于分步上屏那条路断了。
 ///
 /// ⚠️ 正确与错误的分布**在 -5 ~ -6.5 区间大幅重叠**，任何阈值都必然既误伤正解又放行错解；
-/// -8.0 只保证「不误伤」。真正的区分需要上下文概率（`lm.rs` 的 bigram 插值已实现、缺语料）。
+/// -8.0 只保证「不误伤」。真正的区分需要上下文概率（尚无 bigram，缺语料）。
 /// 改动本值必须重跑 `pinyin_eval` 的 D 类并做同样的受控对比。
 const MIXED_SENTENCE_MIN_LOGP_PER_CHAR: f64 = -8.0;
 

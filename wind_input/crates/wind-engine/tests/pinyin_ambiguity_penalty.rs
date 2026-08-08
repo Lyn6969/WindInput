@@ -91,7 +91,7 @@ fn test_zero_initial_split_suppressed() {
 ///
 /// 用户已在两者间选择优先修复原始缺陷（见
 /// `docs/design/pinyin-boundary-aware-lattice.md`）。真正的区分需要 bigram 上下文
-/// （「李安‖导演」vs「李安‖整体性」），`lm.rs:327-337` 已实现插值、缺磁盘语料。
+/// （「李安‖导演」vs「李安‖整体性」），尚无 bigram（缺磁盘语料）。
 ///
 /// 本测试断言的是**当前的取舍结果**而非理想行为：若将来补上 bigram 使「李安导演」
 /// 重新夺魁，本测试会红——那时应当删掉它，并把该例移回

@@ -141,9 +141,9 @@ fn resource_rels(schema: &wind_config::schema::Schema) -> Vec<String> {
         rels.push(cz.font_path.clone());
     }
     let py = &schema.engine.pinyin;
-    if !py.unigram_path.is_empty() {
-        rels.push(py.unigram_path.clone());
-    }
+    // （unigram.txt 已不在收集之列：引擎侧读取链移除后它不再随 data/ 分发，
+    // 词图打分改用词条自身的词典权重。老方案包里若带着它，解包时多出一个无人读的
+    // 文件，无害。）
     if !py.shuangpin.layout.is_empty() {
         rels.push(format!("shuangpin/{}.toml", py.shuangpin.layout));
     }

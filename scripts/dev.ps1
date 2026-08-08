@@ -391,10 +391,10 @@ function Assemble-Data ([string]$outdir = $BuildDevDir) {
         if (Test-Path "$rimeFrost\en_dicts\$f") { Copy-Item "$rimeFrost\en_dicts\$f" $english -Force }
     }
 
-    # 4. Unigram 语言模型
-    $unigram = "$CacheDir\pinyin-frost\unigram.txt"
-    if (Test-Path $unigram) { Copy-Item $unigram "$pinyin\unigram.txt" -Force }
-    else { Warn "缺 unigram.txt (运行 gen-data 生成)" }
+    # 4. (unigram.txt 不再随 data/ 分发：引擎侧的读取链已移除, 词图打分改用词条自身的
+    #    词典权重, 见 wind-engine/pinyin/lattice.rs::score_node_inner。
+    #    .cache 里的 unigram.txt 仍由 gen-data 生成 —— gen_dict 用它给五笔扩展词库的
+    #    CJK 条目赋权, 见 gen_dict/extra.rs::assign_bucket_weights。)
 
     # 4b. 汉字拼音反查表
     $pinyinMap = "$CacheDir\pinyin-data\pinyin_map.txt"

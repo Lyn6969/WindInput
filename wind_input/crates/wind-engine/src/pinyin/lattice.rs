@@ -88,7 +88,7 @@ pub(crate) const WORD_PENALTY: f64 = 3.0;
 /// `liandaoyan` 劣化为「连导演」。**聚合指标在 0.30~0.35 之间完全不变**，
 /// 这两个定点是仅有的差异——因为它们是同一个词、同一个 `li|an` 拆分、同一个
 /// 歧义接缝，切分层没有可区分二者的信息。真正的区分需要 bigram 上下文
-/// （`lm.rs:327-337` 已实现插值，缺磁盘语料）。
+/// （需要 bigram 上下文；旧 lm.rs 里的简化插值实现已随 unigram 合并删除，缺磁盘语料）。
 pub(crate) const AMBIGUOUS_PENALTY: f64 = 0.35;
 
 /// 简拼节点每个音节的惩罚（混合整句解码用，见 [`LatticeBuilder::add_abbrev_nodes`]）。
@@ -114,7 +114,7 @@ const MAX_ABBREV_SPAN: usize = 6;
 ///
 /// 对齐 librime 的 `kCompletionPenalty = log(0.5)`（`script_translator.cc`）：残码是
 /// 「用户还没打完的音节」，把它当成某个具体音节是一次**预测**，须付出确定性代价。
-/// 我们的 `log_prob` 同为自然对数（`lm.rs` 的 `(f/total).ln()`），故数值直接取 `ln 2`。
+/// 我们的 `log_prob` 同为自然对数（`ln(weight / DICT_TOTAL)`），故数值直接取 `ln 2`。
 ///
 /// **为何不按残码长度递减**：直觉上 `zho` 比 `z` 确定（候选音节少），但候选面收窄这件事
 /// 已经由 `search_prefix_*` 的召回集合自然表达了——`z` 捞出的字横跨 za/zai/zan/…，
@@ -242,7 +242,7 @@ fn score_node_inner(word: &str, weight: i32, function_word_credit: bool) -> f64 
     // 片段」的投机拆分，而单字虚词随内容词出现是语法黏着、不是碎片。unigram 的独立性
     // 假设对 P(内容词)·P(虚词) 双重扣了 ln(total)（每词一份），一个低频 3 字整词
     // （填鸭式 w=152）便能压过「天涯+是」这种 2 词正解——这正是 bigram P(是|天涯)
-    // 该解决而 unigram 解决不了的（lm.rs SimpleBigramModel 已备、缺磁盘语料）。豁免虚词
+    // 该解决而 unigram 解决不了的（缺磁盘语料，尚无 bigram）。豁免虚词
     // 的每词罚是对该缺陷的近似补偿：不让「虚词自成一词」这件语法必然的事付投机拆分的代价。
     if !(function_word_credit && char_count == 1 && is_function_word(word)) {
         log_prob -= WORD_PENALTY;
