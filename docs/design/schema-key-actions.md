@@ -350,7 +350,7 @@ handle_select_key_up（二三候选键，有候选时赢）
 | ~~四~~ ✅ | 无字符键（修饰键 keyup 通路）+ C 类进方案级表 | 已完成 |
 | 五a | ~~A 类补全~~ ✅ | 已完成 |
 | ~~五b~~ ✅ | 冲突检测（方案级 × `leading_chars`） | 已完成 |
-| 五c | 全局层收编（五处 `trigger_keys` → `keys.key_actions`） | **高，改所有用户的既有行为** |
+| ~~五c~~ ✅ | 全局层收编（四处 `trigger_keys` → `keys.key_actions`） | 已完成 |
 
 设置页排在三期而非最后：二期交付后能力只能靠手改方案文件使用，中间隔太久等于没交付。
 A 类反过来排到最后——它是功能完整性，不是任何人的诉求。
@@ -462,118 +462,46 @@ A/C 类动词在方案级表里的行为（尚未实施）。
 > 方案级 × 全局 `trigger_keys` 的争用**刻意不报**：内核裁决明确（方案表优先跳过全局链），
 > 且那正是这个功能的设计意图，报出来是噪音。
 
-**五c 全局层收编**（未实施）：把五处 `trigger_keys` 折算进 `keys.key_actions`、删掉硬编码
-优先级链。这是唯一会**改所有用户既有行为**的一步（前面各期都是「未配置者行为逐字节
-不变」），需要配置迁移 + 设置页把五个触发键设置项合并成一张表 + 真机回归。单独排期。
-### ★★ 二期真机翻车：进模式有两条通路，方案表只接了一条
+五c 落地情况（全局层收编）：
 
-**现象**：方案里写 `semicolon = "none"`，空码按 `;` 仍然进快捷输入。
+分四步走，每步可编译可测、可单独回退：
 
-**根因**：进同一个模式有**两条**通路——
-1. `try_activate_mode`（空缓冲激活链，`handle_lifecycle.rs`）
-2. `decideBufferedTrigger` 的「顶字 + 进模式」链（`coordinator.rs` 的 `_ =>` 臂）
+1. **通路分流**：`keys.key_actions` 按**键的形态**分三条路——组合键→key_down 热键、
+   修饰键→keyup 轻敲、单符号键→keydown 引导键链。⚠️ 单键**绝不能**进 key_down 热键表：
+   `parse_hotkey("backtick")` 返回无修饰位的裸 VK，进表后 TSF 会当热键吞掉，该符号就
+   再也打不出来。
+2. **折算**：四处 `trigger_keys` 在 `normalize()` 里折算进新表并清空原字段。在内存里做，
+   不写盘——用户的 config.toml 保持原样、回退一版就能工作。
+3. **删链**：`try_activate_mode` 里那四段固定顺序删除。四个 `*_trigger` 函数**不删**而是
+   改数据源（它们被「模式内二次按同键退出」等五处复用）。
+4. **设置页**：四个 UI 入口改读写新表，形态不变。
 
-第二条的注释写着「缓冲非空/有候选时」，但那个守卫只管到 `select_overflow`，**模式触发判定
-本身不要求缓冲非空**，空码按键照样走到。于是第一条按 `none` 放行（`return None`），
-第二条毫不知情地接管。
+#### ★ `toggle_mode_keys` 不在收编范围
 
-**修法**：判据抽成单点 `bound_key_decision() -> BoundKeyDecision{NotBound|Yield|Act}`，
-两条通路都接；第二条另需一份「顶字版」进入函数 `commit_and_enter_bound_action`
-（与 `commit_and_enter_mix_mode` 之于 `enter_mix_mode` 同构）。
+它的合法值含 `capslock`，而 `parse_key_name` 不认——迁移进去会让配了 CapsLock 切中英文
+的用户直接失效；且 C++ 侧对 CapsLock 有依赖 key_up 白名单的独立处理链。它是 keyup 语义，
+与那四个 keydown 引导键不同类。
 
-★ **盘查的判据是「进这个模式有几个入口」，不是「我改的那个函数里有几个分支」**。
-同源教训已记录在 `project_mixed_overflow_vs_topcode`（混输上屏三条通路，否决开关必须三处
-都接，已栽四次）——本次是第五次，因为只盘查了自己改的函数内部。
+#### ★★ 默认值必须留在「被折算的那一侧」
 
-同批修的第二处漏接：`try_z_fallback` 读的是 `z_key_action()` 而非 `bound_action_for()`，
-方案把 z 改绑到快符表后，首键进快符、而夺取路径仍按「临拼」判定，同一个键在两条路径上
-成了两个身份。
+曾试图把出厂引导键直接写进 `data/config.toml` 的 `keys.key_actions`（让「恢复默认」拿得到
+正确值），**被自己推翻**：合并后 `trigger_keys = []` 与「从没配过」同形，折算跳过、默认
+绑定仍在 ⇒ **用户清空触发键的意图丢失**。
 
-### ⚠️ 消费点在按键热路径上，表必须缓存
+保持默认值在 `trigger_keys` 一侧则三种情况全对：没配过→折算出默认、改成别的键→折算出
+新值、清空→折算出空。代价只是「恢复默认」后要重启才恢复，比语义错误轻得多。
 
-`bound_action_for` 每次按键都调 `active_key_actions()`，而 `read_schema` **自身不带任何
-缓存**——每调一次就是：解析方案文件路径 → 读文件 → 解析 TOML → 读 override 文件 →
-解析 TOML → `merge_toml` → 反序列化整个 `Schema`。加上进模式有两条通路各调一次，
-等于每键最多跑两遍这套流程。
+#### 实施中暴露的两处既有缺陷
 
-已在 `EngineManager` 加 `key_actions_cache`（schema_id → 表），与 `schema_type_cache`
-同批失效：`invalidate_schema`（含 `write_schema_override` 内部调用）与
-`reload_from_config` 各清一次。
+- `normalize()` 原先只在 `Config::load()` 里跑，而 `refresh_config_in_memory`（设置页保存
+  后的生产路径）绕过它。消费点改成只读新表后，表现是「在设置页保存一次，引导键全失效」。
+  改由 `ConfigBundle::build` 调用——那是所有配置生效的必经之路。
+- `collect_leaf_keys` 对 Map 型配置键继续下钻，把 `keys.key_actions.backtick` 这种**数据**
+  当成注册表键。此前没暴露只因出厂配置里所有 Map 都是空表。
 
-★ 这是二期实现时的疏漏，写的时候只想着"读出来能用"，没问"这个函数多久被调一次"。
-**给热路径新增数据源时，第一个问题应该是调用频率，不是正确性。**
+#### 顺带修好的一处旧缺陷
 
-### 诊断：让位原因进日志
+四个 `*_trigger` 函数改读 `bound_action_for` 后，「模式内二次按同键退出」「智能符号
+press2 门控」「设置页冲突检测」这三个场景第一次看得见**方案级** `[key_actions]` 的绑定
+——它们原先只读全局 `trigger_keys`。
 
-「配了不生效」是这套机制最常见的求助形态，而它有五个成因——没绑上 / 显式 `none` /
-非码表引擎 / repeat 身份 / 活码前缀——**单看现象完全同形**。故
-`bound_action_yield_reason` 返回原因字符串，直接进 debug 日志：
-
-```
-key_action: vk=0x5A 让位 —— 字母键仅码表引擎生效（拼音/混输里字母全是有效输入）
-key_action: vk=0xDC → Special("quick_symbols")
-```
-
-排查时一眼可辨，不必再逐个假设去试。
-
-### 测试缺口已补
-
-`Coordinator::new_headless_with_override` 允许集成测试指定**临时** override 目录。
-此前只有 `new_headless`，它让 `EngineManager` 取真实用户目录的 `schema_overrides`，
-测试写进去会污染用户配置——于是方案级覆盖的行为整个没法在集成测试里验证，上面那个
-两条通路的 bug 正是因此漏到真机。`tests/schema_key_actions.rs` 覆盖 `none` 的否决
-（含对照组）与「方案表压过全局 `z_key_action`」。
-
-## 8. 测试要求
-
-- **未配置 `key_actions` 时行为不变**：现有 `input_flow.rs` 全量即是这条的回归网。
-- **每类动词至少一个方案级用例**，且必须先断言「确实进了该方案」——触发键未生效时
-  按键会落普通输入，而普通输入的某些结局与预期结局同形，不验证进入就是假绿。
-- **`none` 的用例**：配了 `none` 的键既不执行 action、也不落全局链。
-- **锁死回归**：`toggle_schema` 从 A 进 B 再按回 A，且 B 的 `key_actions` 为空。
-- **字母裁决**：某字母绑 action 但在本方案是活码前缀 → action 不执行、编码正常打出。
-- ⚠️ 符号键测试不能按字符传 VK（`/` = 0x2F ≠ `VK_OEM_2` 0xBF，错了照样绿）。
-- ⚠️ 依赖真实词库的用例需 `build_dev/data`，缺失时静默跳过且计数照常绿，判据是耗时。
-
-## 9. 已定决策
-
-### 9.1 落点：方案文件顶层
-
-`Schema` 结构加与 `engine` 平级的字段。见 §3。
-
-### 9.2 A 类只作功能补全
-
-方案级的 A 类没有真实诉求——唯一想得到的用途「在本方案禁用某键」由 D 类的 `none`
-承担。故排在最后一期，做它是为了动词表完整（用户能在设置页看到所有功能而不必记
-「哪些能配方案级、哪些不能」），不是为了解决问题。
-
-### 9.3 设置页：动态列表，可增删
-
-一行一条绑定（键 + 动词），支持添加/删除，与 `dialog_button_mix_members` 那种列表
-编辑器对齐——现有 manifest 的 `select` / `checkbox_group` 装不下动态行数。
-
-三条约束：
-
-- **键唯一性即时校验**：Map 的后写覆盖先写是静默的，UI 必须在添加重复键时当场拦，
-  否则用户会看到自己刚配的一行凭空消失。
-- **顺序不可作为优先级呈现**：列表看起来有序，用户会自然以为上面的先生效。UI 应按
-  键名排序（与 `BTreeMap` 一致）而非按添加顺序，从呈现上就断掉这个误解。
-- **动词选项要按当前已安装方案动态生成**：`special:<id>` / `mix:<id>` / `toggle_schema:<id>`
-  的实例 id 随安装增删。参考 `z_key_action` 下拉的做法——清单列举不到的当前取值必须由
-  「保留当前配置」项兜住，否则保存时静默改写成首项。
-
-## 10. 已验证：`merge_toml` 对键集合可变的表逐键合并
-
-原为待验证项（§3 的覆盖语义能否落地取决于它）。已实证，结论有利：
-
-`merge_toml`（`wind-engine/src/manager.rs:199`）对 `Table` 递归逐键合并，只有非 Table
-才整体替换。它**不关心键名是结构字段还是用户数据**，故 `[key_actions]` 这种键集合可变
-的表与已有的固定字段表行为一致：override 未提及的键保留、同名键覆盖、新增键加入，
-结果 = 两侧键集合的并集。
-
-用例 `merge_toml_merges_tables_with_arbitrary_key_sets`（同文件 tests 模块）钉住这条，
-并顺带钉住那条**能力缺口**——合并无法删除键，故 §3 的 `none` 哨兵是必需的。
-
-> 该用例与既有的 `merge_toml_table_recurse_and_scalar_replace` 看似重复，保留两个的
-> 理由：后者用的是已知字段（x/y/z），改动它的人不会意识到自己同时也在改「用户任意
-> 键名」那条契约。分开写，改哪个红哪个。
