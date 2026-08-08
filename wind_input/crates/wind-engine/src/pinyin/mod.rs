@@ -1604,8 +1604,16 @@ impl Engine for PinyinEngine {
                 // ⚠️ 门槛比的是**原始** weight：COMPLETION_FAR_WEIGHT_FLOOR 按原始权重分布
                 // 标定（合理项下界「中国人民解放军」252 / 噪音上界 60），拿折后值比会让这条
                 // 线整体失准 —— 折扣与降级是两件正交的事。
-                distance > COMPLETION_UNCONDITIONAL_FLOAT_SYLLABLES
-                    && h.weight < COMPLETION_FAR_WEIGHT_FLOOR
+                //
+                // ★ `weight <= 0` 一律降级，**距离 1 的无条件上浮也不例外**：w≤0 是词库对
+                // 「存疑 / 非标准条目」的标记（`lattice.rs::score_node` 早就对它罚 -10），
+                // 而无条件上浮那条原本没有任何权重下限，于是最不可靠的词反而被提到最显眼处
+                // ——`zhonghuar` 的「种花人」(w=0，距离恰好 1) 因此排到第 2，压过 w=18 的
+                // 「中华人民」（后者距离 2、要过 FLOOR 而没过）。librime 用
+                // `log(w > 0 ? w : DBL_EPSILON)` 在结构上避免了这类条目参与竞争。
+                h.weight <= 0
+                    || (distance > COMPLETION_UNCONDITIONAL_FLOAT_SYLLABLES
+                        && h.weight < COMPLETION_FAR_WEIGHT_FLOOR)
             } else {
                 true // 无残码：正常前缀补全，沉在精确匹配之后
             };

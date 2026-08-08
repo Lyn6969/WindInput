@@ -500,3 +500,37 @@ fn partial_sentence_is_marked_unanchored() {
         );
     }
 }
+
+/// `weight <= 0` 的词条不得获得「距离 1 无条件上浮」的特权。
+///
+/// w≤0 是词库对**存疑 / 非标准条目**的标记（`lattice.rs::score_node` 早就对它罚 -10），
+/// 而无条件上浮那条原本没有任何权重下限 —— 于是最不可靠的词反而被提到最显眼处：
+/// `zhonghuar` 的「种花人」(w=0、距离恰好 1) 排到第 2，压过 w=18 的「中华人民」
+/// （后者距离 2、要过 `COMPLETION_FAR_WEIGHT_FLOOR` 而没过）。
+///
+/// librime 用 `log(w > 0 ? w : DBL_EPSILON)` 在结构上避免了这类条目参与竞争。
+#[test]
+fn zero_weight_completion_does_not_get_unconditional_float() {
+    let Some(dir) = data_dir() else {
+        eprintln!("跳过：拼音词库不存在");
+        return;
+    };
+    let mgr = manager(&dir);
+    let cands = mgr.convert_with("pinyin", "zhonghuar", 300).candidates;
+    let pos = |t: &str| cands.iter().position(|c| c.text == t);
+    let head = || {
+        cands
+            .iter()
+            .take(6)
+            .map(|c| format!("{}(w={})", c.text, c.weight))
+            .collect::<Vec<_>>()
+    };
+
+    let zhonghuaren = pos("中华人民").expect("「中华人民」应在候选中");
+    let zhonghuaren0 = pos("种花人").expect("「种花人」应仍在候选中（降级≠销毁）");
+    assert!(
+        zhonghuaren < zhonghuaren0,
+        "w=18 的「中华人民」须排在 w=0 的「种花人」之前，实际: {:?}",
+        head()
+    );
+}
