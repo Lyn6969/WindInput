@@ -561,3 +561,75 @@ fn dispatch_action_yields_while_typing() {
     );
     let _ = std::fs::remove_dir_all(&ov);
 }
+
+/// ★ z 夺取进 mix 后，**数字要能进缓冲**，而不是被当成选词键。
+///
+/// 现场：`z = "mix:quick_mix"` 时按 `z1+2`。z 恒是活码（zz* 编码）故首键让位，
+/// 第二键才触发夺取——而 `try_z_fallback` 原先只挂在字母臂上，数字在缓冲非空时
+/// 走「数字选词」臂、根本到不了夺取判定。表现是「z 进快捷输入后算不了数」，
+/// 而同一个 mix 用 `;` 进就正常（`;` 首键直接进模式，之后所有键都归 mix）。
+#[test]
+fn z_fallback_hijacks_into_mix_on_digit() {
+    let dd = make_data_dir_with_z_code("zmixdigit");
+    let ov = make_override("zmixdigit", "zt", "z = \"mix:quick_mix\"");
+    let coord =
+        Coordinator::new_headless_with_override(cfg_for_z_schema(), Some(&dd), Some(ov.clone()));
+
+    coord.handle_key_event(&key(VK_Z));
+    let act = coord.handle_key_event(&key(0x31)); // 数字 1
+    assert!(
+        matches!(act, KeyAction::UpdateComposition { .. }),
+        "z1 应夺取进 mix，实际: {act:?}"
+    );
+    assert_eq!(coord.debug_active_mode(), Some("mix"), "应处于 mix 模式");
+    let _ = std::fs::remove_dir_all(&ov);
+    let _ = std::fs::remove_dir_all(&dd);
+}
+
+/// z 夺取进 mix 后，**算式符号要归 mix 处理**（`z1+2` 应得到 `1+2` 的计算）。
+///
+/// 这才是用户实际会打的形态。符号**自己**触发夺取（`z` 直接接 `-`）刻意不做：
+/// `-` / `=` 默认是翻页键（`page_keys = [..., "minus_equal"]`），在更上游就被消费，
+/// 为了一个罕见入口去动翻页键不划算。进了模式之后符号本就归 mix 管，不受此限。
+#[test]
+fn z_fallback_mix_accepts_operators_after_hijack() {
+    let dd = make_data_dir_with_z_code("zmixcalc");
+    let ov = make_override("zmixcalc", "zt", "z = \"mix:quick_mix\"");
+    let coord =
+        Coordinator::new_headless_with_override(cfg_for_z_schema(), Some(&dd), Some(ov.clone()));
+
+    coord.handle_key_event(&key(VK_Z));
+    coord.handle_key_event(&key(0x31)); // 1 —— 触发夺取
+    assert_eq!(coord.debug_active_mode(), Some("mix"), "z1 应已进 mix");
+
+    coord.handle_key_event(&key(0xBB)); // = 键（Shift 未按下时是 `=`，算式里用 +）
+    let act = coord.handle_key_event(&key(0x32)); // 2
+    assert!(
+        matches!(act, KeyAction::UpdateComposition { .. }),
+        "进 mix 后的按键应由 mix 处理，实际: {act:?}"
+    );
+    assert_eq!(coord.debug_active_mode(), Some("mix"), "不该被踢出 mix");
+    let _ = std::fs::remove_dir_all(&ov);
+    let _ = std::fs::remove_dir_all(&dd);
+}
+
+/// ★ 临拼的残余码只可能是拼音字母/// ★ 临拼的残余码只可能是拼音字母，故数字**不该**夺取——`z1` 里的 1 仍是选词键。
+/// 判据按目标模式的「残余码语义」分，与设计文档 §4.2 那张表同源。
+#[test]
+fn z_fallback_does_not_hijack_digits_for_temp_pinyin() {
+    let dd = make_data_dir_with_z_code("zpydigit");
+    let ov = make_override("zpydigit", "zt", "z = \"temp_pinyin\"");
+    let mut cfg = cfg_for_z_schema();
+    cfg.input.temp_pinyin.enabled = true;
+    let coord = Coordinator::new_headless_with_override(cfg, Some(&dd), Some(ov.clone()));
+
+    coord.handle_key_event(&key(VK_Z));
+    coord.handle_key_event(&key(0x31));
+    assert_ne!(
+        coord.debug_active_mode(),
+        Some("temp_pinyin"),
+        "数字不该把临拼夺取进来——拼音里数字没有意义"
+    );
+    let _ = std::fs::remove_dir_all(&ov);
+    let _ = std::fs::remove_dir_all(&dd);
+}

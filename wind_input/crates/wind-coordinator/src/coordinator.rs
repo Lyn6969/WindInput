@@ -5801,6 +5801,34 @@ impl MessageHandler for Coordinator {
             return self.commit_highlight_then_char(&mut state, npc, has_comp);
         }
 
+        // ── z-fallback 夺取：**必须早于下面的按键分派** ──
+        //
+        // 缓冲以 z 开头、加上这一键后 `z…` 破活码前缀 ⇒ 首 z 实为引导键，抛弃它、
+        // 残余码切进目标模式（见 `try_z_fallback`，内含全部门禁：码表引擎 / z 有绑定 /
+        // 目标接得住这个字符 / 破前缀）。
+        //
+        // ★ 放在 match **之前**而不是各臂里：数字键在缓冲非空时是选词键、符号走标点
+        // 流水线，两条都会当场把键消费掉——夺取判定挂在臂里就永远轮不到。原先只挂在
+        // 字母臂上，于是 `z = "mix:quick_mix"` 的用户「进了快捷输入却算不了数」，而同一个
+        // mix 用 `;` 进就正常（`;` 首键直接进模式，之后所有键都归 mix 处理）。
+        //
+        // 单点而非三处各接一次：这仓已多次栽在「N 条通路只接了 N-1 条」上
+        // （见 project_mixed_overflow_vs_topcode）。
+        if data.modifiers & (MOD_CTRL | MOD_ALT) == 0 {
+            let probe = if (keymap::VK_A..=keymap::VK_Z).contains(&data.key_code) {
+                Some((b'a' + (data.key_code - keymap::VK_A) as u8) as char)
+            } else if (keymap::VK_0..=keymap::VK_9).contains(&data.key_code) {
+                Some((b'0' + (data.key_code - keymap::VK_0) as u8) as char)
+            } else {
+                punct_char(data.key_code, data.modifiers & MOD_SHIFT != 0)
+            };
+            if let Some(ch) = probe
+                && let Some(act) = self.try_z_fallback(&mut state, ch)
+            {
+                return act;
+            }
+        }
+
         match data.key_code {
             keymap::VK_ESCAPE => {
                 // Escape：取消整个组合（含已转换前缀），不上屏
@@ -5994,16 +6022,15 @@ impl MessageHandler for Coordinator {
                 } else {
                     ch
                 };
-                // z-fallback 夺取：缓冲以 z 开头且加此键后 z… 破活码前缀 → 首 z 实为拼音触发键，
-                // 抛弃首 z、residual 进临时拼音（对齐 Go decideEngineDefaultZFallback）。须先于顶码/累积。
-                if let Some(act) = self.try_z_fallback(&mut state, ch) {
-                    return act;
-                }
+                // 注：z-fallback 夺取已上移到 match **之前**统一处理（数字/符号臂同样需要它，
+                // 而那两条会当场消费掉按键）。故此处不再调用。
+                //
                 // 非码元字母（如 `input_chars = "a-x"` 下的 y/z）：不进缓冲，终结组合并出字。
                 //
-                // ★ **必须在 try_z_fallback 之后**。z 常同时是「非码元」（a-x 方案）与
+                // ★ **必须在 z-fallback 之后**。z 常同时是「非码元」（a-x 方案）与
                 // 「临时拼音触发键」，若先判非码元，z 会被当成普通字符顶上屏，临拼永远
                 // 进不去——同理，空缓冲下的模式激活在更上游的 try_activate_mode 已处理完。
+                // 上移之后这条顺序仍然成立（夺取在 match 前，更早）。
                 //
                 // 默认码元集 a-z 下本判定恒不命中，与历史逐键等价（零回归）。
                 if !self.can_enter_buffer(&state, ch) {

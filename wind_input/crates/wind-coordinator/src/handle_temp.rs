@@ -91,6 +91,27 @@ impl Coordinator {
     /// 即「让位」只维持一个按键，靠**用户是否继续打字母**区分意图：继续打就说明不是要重复上屏。
     /// 这是刻意的——两者若改成互斥，开了 `z_key_repeat` 的方案上 z 进临拼会彻底不可用
     /// （首键让位、后续也不夺取，一条进入通路都不剩）。
+    /// 目标模式能否**接住**这个残余字符——夺取的前提是残余码在目标里有意义。
+    ///
+    /// | 目标 | 接受 | why |
+    /// |---|---|---|
+    /// | `temp_pinyin` | 仅字母 | 拼音里数字/符号没有意义，`z1` 的 1 仍该是选词键 |
+    /// | `temp_english` | 字母+数字+符号 | 收英文原文，`z-` → `-` 是合法开头 |
+    /// | `mix:<id>` | 字母+数字+符号 | 收自由输入，**算式与日期恰恰要数字和运算符** |
+    ///
+    /// ★ 这条判据是 2026-08-08 补的。夺取机制原本只为临拼而建（残余码只可能是字母），
+    /// 故只挂在字母臂上；推广到 mix 时没跟着放开字符类别，表现是「z 进快捷输入后算不了数」
+    /// ——数字在缓冲非空时走数字选词臂、符号走标点流水线，都到不了夺取判定。
+    fn z_fallback_accepts(action: &wind_config::BoundAction, ch: char) -> bool {
+        use wind_config::BoundAction as BA;
+        match action {
+            BA::TempPinyin => ch.is_ascii_alphabetic(),
+            BA::TempEnglish | BA::Mix(_) => ch.is_ascii_graphic(),
+            // special 不走夺取（见本函数文档），其余动词与夺取无关。
+            _ => false,
+        }
+    }
+
     pub(crate) fn try_z_fallback(&self, state: &mut State, ch: char) -> Option<KeyAction> {
         if !matches!(
             self.engine_mgr.current_engine_type(),
@@ -105,6 +126,11 @@ impl Coordinator {
         // 压过全局 `schema.codetable.z_key_action`。用后者的话，方案把 z 改绑到别的目标后，
         // 首键判定按新目标、而这里仍按「临拼」夺取——同一个键在两条路径上是两个身份。
         let action = self.bound_action_for(wind_keys::keymap::VK_Z)?;
+        // 残余码在目标模式里有没有意义。放在活码判据之前——它更便宜，且不通过时
+        // 本就该让该键走它原本的身份（数字选词 / 标点上屏）。
+        if !Self::z_fallback_accepts(&action, ch) {
+            return None;
+        }
         let combined = format!("{}{}", state.input_buffer, ch);
         // 加新键后仍是活码前缀（如 zhang 存在时的 "zh"，或系统短语 `zzbd` 的 "zz"）→ 不夺取，
         // 继续正常码表。这条同时保住了出厂那 37 条 `zz*` 标点短语。
