@@ -520,6 +520,20 @@ pub fn validate(key: &str, value: &toml::Value) -> Result<(), ValidateError> {
 /// 故 `[ui.candidate]`（非空表）会下钻，而 `input.punct.custom_mappings = {}`（空表）作叶子保留。
 fn collect_leaf_keys(prefix: &str, value: &toml::Value, out: &mut Vec<String>) {
     match value {
+        // ★ 注册表里登记为 Map 的键**就是叶子**，不再下钻。
+        //
+        // Map 的内容是**数据**（`keys.key_actions` 的键名 → 动词、`schema_hotkeys` 的
+        // 方案 id → 热键），不是配置项。下钻会把 `keys.key_actions.backtick` 这种数据
+        // 当成注册表键去比对——两个方向同时报错：注册表里没有它（"孤立键"），而
+        // `keys.key_actions` 本身又因为没出现过被算作"缺失"。
+        //
+        // 此前没暴露只是因为出厂配置里所有 Map 都是空表（`= {}`），没有子键可下钻。
+        toml::Value::Table(_)
+            if !prefix.is_empty()
+                && matches!(field(prefix).map(|f| f.ty), Some(FieldType::Map)) =>
+        {
+            out.push(prefix.to_string())
+        }
         toml::Value::Table(t) if !t.is_empty() => {
             for (k, v) in t {
                 let child = if prefix.is_empty() {

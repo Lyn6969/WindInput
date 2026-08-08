@@ -1263,6 +1263,13 @@ fn default_mix_modes() -> Vec<MixModeConfig> {
         id: QUICK_MIX_ID.to_string(),
         name: "快捷".to_string(),
         short_name: "快".to_string(),
+        // ★ 出厂引导键**刻意仍放在这里**（而不是 data/config.toml 的 keys.key_actions）。
+        //
+        // 收编后它由 `normalize` 折算进 `keys.key_actions`。默认值必须留在**被折算的
+        // 那一侧**，折算结果才能如实反映用户意图：没配过→折算出默认；改成别的键→
+        // 折算出新值；**清空→折算出空**。若把默认值直接写进 key_actions，第三种就废了
+        // ——合并后 `trigger_keys = []` 与「从没配过」同形，折算跳过、默认绑定仍在，
+        // 用户清空了个寂寞。见 docs/design/schema-key-actions.md 五c。
         trigger_keys: vec!["semicolon".to_string()],
         members,
         // 出厂强制竖排：快捷输入的候选是日期/算式结果等长文本，横排放不下。
@@ -4828,6 +4835,8 @@ active = "x"
         let c = Config::default();
         // 模式三件套归 schema
         assert_eq!(c.schema.mix_modes.len(), 1, "默认一个快捷 mix");
+        // 引导键的**默认值**仍挂在实例上（由 normalize 折算进 keys.key_actions）——
+        // 放在被折算的一侧，「用户清空」才折算得出空。理由见 default_mix_modes。
         assert_eq!(c.schema.mix_modes[0].trigger_keys, vec!["semicolon"]);
         assert_eq!(c.schema.quick_input.decimal_places, 6);
         // input 子组
