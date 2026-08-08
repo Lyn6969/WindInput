@@ -188,12 +188,18 @@ DAT 从已排序编码列表 BFS 直接构建，峰值内存仅 base/check 两�
   ian_iang/uan_uang），`lookup_with_fuzzy()`（mod.rs:221）对各音节变体做笛卡尔积扩展查询
   （组合数 > 64 跳过），命中标 `is_fuzzy`。
 
-### 4.2 六步候选生成（`convert()`，mod.rs:371-700）
+### 4.2 候选生成各步（`convert()`，`pinyin/mod.rs`）
+
+> 下表按产出顺序列主干步骤（原标题「六步」已不准——②b/②c 是后加的独立解码路径）。
+> 步骤号沿用代码注释里的编号，便于对照；排序与层级的**权威描述**在
+> `candidate-sorting-rules.md`，本节只讲「候选从哪来」。
 
 | 步骤 | 内容 | 标志 |
 |---|---|---|
 | ① 精确查找 | `lookup_with_fuzzy(completed)`——以**完成音节前缀**（去尾部残码）为查询码与存储 code | — |
-| ② Viterbi 整句 | `use_smart_compose` 且 ≥2 音节：LatticeBuilder 建词图（max_word_len=6，模糊变体 -0.5 惩罚）→ ViterbiDecoder DP 最优路径；权重 = `SENTENCE_WEIGHT_BASE(30M) + clamp(log_prob×1000)`，置顶 | 整句候选 insert(0) |
+| ② Viterbi 整句 | `use_smart_compose` 且 ≥2 音节：LatticeBuilder 建词图（`max_word_len=10`，模糊变体 -0.5 惩罚）→ ViterbiDecoder DP 最优路径；权重 = `SENTENCE_WEIGHT_BASE(30M) + clamp(log_prob×1000)`。**只在 `completed`（去尾部残码）上建图** | `is_sentence`，insert(0) |
+| ②b 混合整句 | 简拼段与全拼段同图解码（`bzdhaobuhao`→不知道好不好）；在**整串**上建图 + `add_abbrev_nodes` | `is_sentence` |
+| ②c **残码整句** | 尾部残码作为**待定音节**入图（`add_partial_final_nodes`），Viterbi 选最优单字：`buzhidaok`→「不知道**看**」。在**含残码的整串**上重建图——step ② 的 `nodes` 只到 `completed.len()+1`，残码末端没有槽位。对齐 librime `enable_completion` / fcitx5 不完整拼音。门槛：≥2 完整音节、非双拼、非分隔符、**非混输**（`enable_partial_final`） | `is_sentence` + `is_sentence_unanchored` |
 | ③ DAG 子短语 | 前 6 音节的各前缀子段查词（分段上屏候选） | `is_partial` |
 | ④ 前缀补全 | `search_prefix(query, 30)` | `is_prefix` |
 | ⑤ 简拼 | `AbbrevMatcher` 判定（每字母为音节首字母且非完整音节序列）→ `search_abbrev(query, 10)` | natural_order=999999 沉底 |
@@ -202,11 +208,27 @@ DAT 从已排序编码列表 BFS 直接构建，峰值内存仅 base/check 两�
 节点打分（lattice.rs `score_node()`）：unigram log_prob 为基础，叠加单字实词惩罚(-3.0)/虚词加成(+2.0)/
 多字词典词加成(+3.0×√字数×freq_factor)/OOV 字符均值(-2.0) 等调整。
 
-> **尾部残码前缀补全上浮**：输入尾带未完成音节时（`meiy` 的 `y`），step ④ 前缀补全产出的候选
-> （如 `meiyou→没有`）**不标 `is_prefix=true`**。若标了会被引擎排序与协调器 `is_prefix asc` 重排
-> 双重压到数百条 step ① 精确子串（`is_prefix=false`，没/每/美/…）之后，用户翻 15+ 页才见。
-> 不标时 `push_unique` 自动判 `is_partial=false`（code 长于 query），`is_partial asc` 将补全候选
-> 自然浮到 `is_partial=true` 的精确子串之上。无残码（`meiyou`）保持原行为。
+> ⚠️ **残码待定音节（②c）走 `score_node_partial_final()`，不给单字虚词优待**。虚词优待合计
+> **8.0** 的量级差（虚词 +2.0、实词 −3.0、再豁免 `WORD_PENALTY` 3.0），足以碾压任何 unigram
+> 差距：实测补出「中华**让**」而非「中华人」、「你好**们**」而非「你好吗」（让/们在虚词表，
+> 人/吗不在）。该优待的前提是「虚词随内容词出现是语法黏着」，说的是**整句内部已成形的搭配**；
+> 残码位是「用户打到一半的那个音节」，前提不成立。**同一条加成在两个位置前提不同 ⇒ 按位置
+> 区分，不按词性区分。**
+
+> **尾部残码前缀补全上浮**：输入尾带未完成音节时（`meiy` 的 `y`），step ④ 的补全候选
+> （`meiyou→没有`）须浮到数百条 step ① 精确子串（没/每/美/…）之上，否则用户翻 15+ 页才见。
+>
+> ⚠️ **实现已变**：早期做法是**给补全硬标 `is_prefix=false`**，使该字段名不符实（一条码更长的
+> 候选却说自己不是补全）。现拆为两个正交字段——`is_prefix` 恒表**结构事实**（码严格长于输入），
+> 排序决策由 `is_promoted_completion` 承接，`cmp_match_layers` 取 `eff_prefix = is_prefix &&
+> !is_promoted_completion`。上浮不再无条件，三道约束：
+> - 距离 ≤ `COMPLETION_UNCONDITIONAL_FLOAT_SYLLABLES`(1)：只补完手头这个音节的才无条件上浮；
+> - 距离 ≥2 须过 `COMPLETION_FAR_WEIGHT_FLOOR`(100)；
+> - **`weight ≤ 0` 一律降级**（词库对存疑条目的标记，`zhonghuar` 的「种花人」w=0 曾靠距离 1
+>   的无条件上浮排到第 2、压过 w=18 的「中华人民」）。
+>
+> 层内还有 `COMPLETION_WEIGHT_DISCOUNT`(0.5^未输入音节数) 的连续折扣——只有层级而无折扣时，
+> 层内只比裸词频，`nih` 下「你会发现」(extra=3) 会压过「你好」(extra=1)。
 >
 > Viterbi 更新既有条目时同时清除 `is_partial`（整句是完整解读而非子短语），否则 30M 置顶但仍挂
 > `is_partial=true` 会被残码补全 `is_partial=false` 反超。
@@ -218,13 +240,22 @@ DAT 从已排序编码列表 BFS 直接构建，峰值内存仅 base/check 两�
 
 ### 4.4 排序层级（mod.rs:636-651）
 
-`is_fuzzy asc（非模糊优先）→ is_prefix asc（完整/子短语优先于补全）→ is_partial asc（完整优先于子短语）
-→ weight desc → natural_order asc`，再截断。
+`cmp_match_layers`（`is_abbrev asc → eff_prefix asc → is_partial asc`）`→ weight desc →
+natural_order asc`，再截断。权威描述见 `candidate-sorting-rules.md`。
+
+⚠️ 两处与旧版本不同：
+- **`is_fuzzy` 已不是层级键**。它曾是首要键（等价惩罚 ∞），真实词典下打 `si` 时「是」被压到
+  第 231 位、`zong` 时「中」在第 158 位，而生产候选上限仅 50~300 ⇒ 模糊音在全部三条路径上
+  等价于未实现。改由 weight 折扣 `FUZZY_WEIGHT_SCALE`(0.01) 表达。
+- **引擎侧刻意不按 `consumed_length` 排序**（协调器才按它排，且是首要键）。这里 `truncate`
+  紧随排序，用消费长度当键会让消费更少的候选（`xi'an` 的「西」）被**整批丢弃**而非仅仅排后
+  ——librime 的 `Translation` 惰性流式从不全局截断，我们是一次性产生 N 条 + 截断，架构不同。
 
 **裸声母单字优先**：打单个声母（`m`/`n`/`h`/`zh` 等，`syllables` 为空、无完整音节）时候选全为前缀
 补全词，纯按词频排会让高频多字词（没有/目前）压过单字（吗/么），不合主流输入法直觉。故裸声母时
-给**单字候选**加 `BARE_INITIAL_SINGLE_CHAR_BOOST`(1e7)——高于常规词频、低于整句底线
-`PINYIN_SENTENCE_FLOOR`(2e7，不被 freq_rerank 误锚定）。**经 weight 表达**（非引擎排序），才能穿过
+给**单字候选**加 `BARE_INITIAL_SINGLE_CHAR_BOOST`(1e7)——高于常规词频（单字基础权重上限 ~2e6）。
+（历史注记：此值原本还须刻意低于 `PINYIN_SENTENCE_FLOOR`(2e7) 以免被 `freq_rerank` 误当整句锚定。
+**该阈值已废弃**——整句锚定改按 `Candidate::is_sentence` 标记判定，此处不必再避让任何数值线。）**经 weight 表达**（非引擎排序），才能穿过
 协调器 `build_candidates` 按 `(is_fuzzy, is_prefix, weight)` 的重排。仅裸声母生效——完整音节输入的
 单字已靠 `is_prefix` 精确层级就位（`nihao` 仍 `你好` 优先）。
 
