@@ -370,7 +370,7 @@ candidate_layout = "follow"
 # comment_template_vertical   = "${dict}"
 # comment_template_horizontal = "${dict}"
 # 同样的两个键在 [input.temp_pinyin]、[input.url]、[[schema.mix_modes]]、
-# [[schema.special_modes]] 下也可用。说明见 https://windinput.com/docs/customize/candidate-comment
+# [[schema.special_modes]] 下也可用。说明见 https://windinput.com/docs/settings/appearance/candidate-comment
 
 [input.capslock]
 cancel_on_mode_switch = false
@@ -516,7 +516,7 @@ max_chars = 16
 #
 # 出厂值 ${code_hint|code} 等价于本功能引入前的固定行为。
 # 例：竖排显示字根与注音 → "{〔${chaizi}〕}{ ${pinyin}}"
-# 完整说明与更多示例：https://windinput.com/docs/customize/candidate-comment
+# 完整说明与更多示例：https://windinput.com/docs/settings/appearance/candidate-comment
 comment_template_vertical = "${code_hint|code}"
 comment_template_horizontal = "${code_hint|code}"
 # 注释段最大字数（0=不限），超出截断并加省略号。
@@ -537,7 +537,7 @@ comment_max_chars = 0
 #
 # 数组顺序即优先级（同一个词多库都有注释时取靠前的）。schemas 用来避免无谓开销：
 # 一份大英汉词典写 schemas = ["english"] 后，中文方案下根本不加载。
-# 格式与更多示例：https://windinput.com/docs/customize/candidate-comment
+# 格式与更多示例：https://windinput.com/docs/settings/appearance/candidate-comment
 layout = "horizontal"
 # 编码显示方式：app_inline=内嵌应用光标处(候选窗不显 preedit) | candidate_top=候选窗顶部独立栏 | candidate_inline=编码内联候选首单元
 preedit_display = "app_inline"
