@@ -13,7 +13,6 @@ pub trait UnigramLookup: Send + Sync {
     fn log_prob(&self, word: &str) -> f64;
     fn contains(&self, word: &str) -> bool;
     fn char_based_score(&self, word: &str) -> f64;
-    fn boost_user_freq(&self, word: &str, delta: i32);
 }
 
 /// 解析 unigram.txt（`词\t频次`，`#` 注释）为 (词, 频次) 列表。
@@ -42,21 +41,16 @@ pub fn parse_unigram_freqs(path: &Path) -> anyhow::Result<Vec<(String, f64)>> {
     Ok(freqs)
 }
 
-/// mmap 版 Unigram 模型：词频数据走 mmap（几乎不占常驻内存），
-/// 仅 user_freq（用户选词加成）在内存。优先选用此实现。
+/// mmap 版 Unigram 模型：词频数据走 mmap（几乎不占常驻内存）。优先选用此实现。
 pub struct MmapUnigram {
     /// 经 [`wind_dict::reader_pool`] 按路径共享：pinyin / shuangpin / 混输子引擎都指向
     /// 同一个 `<cache>/pinyin/unigram.wdb`，此前各映射一份。
     reader: std::sync::Arc<UnigramReader>,
-    user_freq: RwLock<HashMap<String, i32>>,
 }
 
 impl MmapUnigram {
     pub fn new(reader: std::sync::Arc<UnigramReader>) -> Self {
-        Self {
-            reader,
-            user_freq: RwLock::new(HashMap::new()),
-        }
+        Self { reader }
     }
 
     pub fn size(&self) -> usize {
@@ -66,21 +60,10 @@ impl MmapUnigram {
 
 impl UnigramLookup for MmapUnigram {
     fn log_prob(&self, word: &str) -> f64 {
-        let base = match self.reader.lookup(word) {
+        match self.reader.lookup(word) {
             Some(lp) => lp as f64,
             None if word.chars().count() > 1 => self.char_based_score(word),
             None => self.reader.min_prob() as f64,
-        };
-        let freq = *self
-            .user_freq
-            .read()
-            .unwrap_or_else(|e| e.into_inner())
-            .get(word)
-            .unwrap_or(&0);
-        if freq > 0 {
-            base + ((freq as f64) * 0.5).min(5.0)
-        } else {
-            base
         }
     }
 
@@ -96,12 +79,6 @@ impl UnigramLookup for MmapUnigram {
         let sum: f64 = chars.iter().map(|c| self.log_prob(&c.to_string())).sum();
         sum / chars.len() as f64
     }
-
-    fn boost_user_freq(&self, word: &str, delta: i32) {
-        let mut freq = self.user_freq.write().unwrap_or_else(|e| e.into_inner());
-        let entry = freq.entry(word.to_string()).or_insert(0);
-        *entry = (*entry + delta).min(100);
-    }
 }
 
 /// 从文件加载的 Unigram 模型（对齐 Go `UnigramModel`）。
@@ -111,7 +88,6 @@ impl UnigramLookup for MmapUnigram {
 /// 多字 OOV 用字符平均（避免合法多字词被单字组合碾压）。
 pub struct UnigramModel {
     log_probs: HashMap<String, f64>,
-    user_freq: RwLock<HashMap<String, i32>>,
     min_prob: f64,
 }
 
@@ -148,7 +124,6 @@ impl UnigramModel {
         }
         Ok(Self {
             log_probs,
-            user_freq: RwLock::new(HashMap::new()),
             min_prob: (0.5 / total).ln(),
         })
     }
@@ -160,23 +135,12 @@ impl UnigramModel {
 
 impl UnigramLookup for UnigramModel {
     fn log_prob(&self, word: &str) -> f64 {
-        let base = if let Some(p) = self.log_probs.get(word) {
+        if let Some(p) = self.log_probs.get(word) {
             *p
         } else if word.chars().count() > 1 {
             self.char_based_score(word)
         } else {
             self.min_prob
-        };
-        let freq = *self
-            .user_freq
-            .read()
-            .unwrap_or_else(|e| e.into_inner())
-            .get(word)
-            .unwrap_or(&0);
-        if freq > 0 {
-            base + ((freq as f64) * 0.5).min(5.0)
-        } else {
-            base
         }
     }
 
@@ -189,16 +153,10 @@ impl UnigramLookup for UnigramModel {
         if chars.is_empty() {
             return self.min_prob;
         }
-        // 逐字走 log_prob（含 user_freq boost），与 Go CharBasedScore→LogProb 链一致。
+        // 逐字走 log_prob，与 Go CharBasedScore→LogProb 链一致。
         // 单字不会再递归进本函数（log_prob 仅对多字 OOV 调用 char_based_score）。
         let sum: f64 = chars.iter().map(|c| self.log_prob(&c.to_string())).sum();
         sum / chars.len() as f64
-    }
-
-    fn boost_user_freq(&self, word: &str, delta: i32) {
-        let mut freq = self.user_freq.write().unwrap_or_else(|e| e.into_inner());
-        let entry = freq.entry(word.to_string()).or_insert(0);
-        *entry = (*entry + delta).min(100);
     }
 }
 
@@ -218,10 +176,6 @@ mod tests {
         assert!(m.contains("中国"));
         // OOV 单字回退 min_prob；多字 OOV 用字符平均
         assert!(m.log_prob("龘") <= m.log_prob("爱"));
-        // 用户频率 boost
-        let before = m.log_prob("爱");
-        m.boost_user_freq("爱", 4);
-        assert!(m.log_prob("爱") > before);
         let _ = std::fs::remove_file(&tmp);
     }
 }
@@ -230,8 +184,6 @@ mod tests {
 pub struct DictUnigramModel {
     /// word -> log_probability
     probs: RwLock<HashMap<String, f64>>,
-    /// 用户选择频率 boost
-    user_freq: RwLock<HashMap<String, i32>>,
     /// 默认 OOV 概率
     default_prob: f64,
 }
@@ -240,7 +192,6 @@ impl DictUnigramModel {
     pub fn new() -> Self {
         Self {
             probs: RwLock::new(HashMap::new()),
-            user_freq: RwLock::new(HashMap::new()),
             default_prob: -10.0,
         }
     }
@@ -267,16 +218,7 @@ impl DictUnigramModel {
 impl UnigramLookup for DictUnigramModel {
     fn log_prob(&self, word: &str) -> f64 {
         let probs = self.probs.read().unwrap();
-        let base = *probs.get(word).unwrap_or(&self.default_prob);
-
-        // 加上用户频率 boost（最多 +5.0）
-        let user_boost = {
-            let freq = self.user_freq.read().unwrap();
-            *freq.get(word).unwrap_or(&0) as f64
-        };
-        let boost = (user_boost * 0.5).min(5.0);
-
-        base + boost
+        *probs.get(word).unwrap_or(&self.default_prob)
     }
 
     fn contains(&self, word: &str) -> bool {
@@ -296,12 +238,6 @@ impl UnigramLookup for DictUnigramModel {
             })
             .sum();
         total / char_count as f64
-    }
-
-    fn boost_user_freq(&self, word: &str, delta: i32) {
-        let mut freq = self.user_freq.write().unwrap();
-        let entry = freq.entry(word.to_string()).or_insert(0);
-        *entry = (*entry + delta).min(100); // 上限 100
     }
 }
 
