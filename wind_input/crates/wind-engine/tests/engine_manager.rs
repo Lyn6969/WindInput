@@ -253,7 +253,7 @@ fn test_pinyin_engine_candidates() {
         .take(10)
         .map(|c| c.text.as_str())
         .collect();
-    // 整句应在首位（SENTENCE_WEIGHT_BASE 置顶）。
+    // 整句应在首位（等效词频量纲，旧为 SENTENCE_WEIGHT_BASE 置顶）。
     assert_eq!(
         result.candidates[0].text, "你好",
         "首候选应为 你好，实际: {top10:?}"

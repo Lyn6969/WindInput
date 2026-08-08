@@ -37,8 +37,63 @@ use wind_candidate::{Candidate, CandidateSource};
 use wind_dict::DictManager;
 use wind_dict::cached::CachedDict;
 
-/// 整句候选权重基准（高于拼音词频上限 ~19260817，确保整句置顶且不被截断）
-const SENTENCE_WEIGHT_BASE: i32 = 30_000_000;
+/// 整句解的**等效词频**：把 Viterbi 路径分换算回词频域，与其余候选同量纲。
+///
+/// ```text
+/// W_eff = clamp(exp(log_prob) × DICT_TOTAL, 1 ..= i32::MAX)
+/// ```
+///
+/// ## 为什么要同量纲（退役 `SENTENCE_WEIGHT_BASE`）
+///
+/// 整句原本拿 `3e7 + log_prob×1000`，而其余候选的 weight 是**词频**（1 ~ 5e5），
+/// 二者差两个数量级以上、**不可比**。后果不是「整句排太前」，而是**每次想调整整句的
+/// 相对位置都只能加一个二值开关**——连续的权重比较在跨轴时根本不成立。现存补丁：
+/// step 1.5（反向把词典整词抬到整句量纲）、step 6.5 / 6.5b（改 weight 到 `max-1`）、
+/// step 6.6（`is_sentence_contested` 摘锚定）、`is_sentence_unanchored`、
+/// `SENTENCE_YIELD_WEIGHT_FLOOR`，以及 `Candidate` 上 4 个整句相关布尔。
+///
+/// ## 为什么这不会把整句压下去（实测，见 `docs/design/sentence-weight-same-axis.md`）
+///
+/// 高频整句本身就是词典词，同文合并取 `max(词典 weight, W_eff)` 后用的是词典值：
+/// `gonghe` 共和 597 vs 恭贺 77、`siyuan` 寺院 491 vs 思源 245、`sixiang` 思想 26133
+/// vs 四项 656、`nihao` 你好 5328 vs 拟好 64 —— 四个经典冲突场景顺序全部不变。
+/// **3e7 从未起决定性作用，它只是掩盖了「词典权重本来就够用」这个事实。**
+///
+/// 纯合成整句的 W_eff 很低（`我是中国人` 18.5、`今天天气很好` 饱和到 1），但它们的
+/// `consumed_length` 恒最大，靠协调器比较链 ⓪ 取胜，用不到 weight。反过来，错误合成
+/// （`sixiang` 若出「是想」）W_eff 极低，自然输给「思想」——这正是 step 6.5 手工在做的事。
+///
+/// ## ⚠️ 为什么按词数乘回 `DICT_TOTAL`（不是笔误）
+///
+/// `log_prob = Σ ln(f_i / T)`，若直接 `exp(log_prob) × T` 得到的是 `∏f_i / T^(n-1)`
+/// —— **比 librime 多除了 n−1 次 T**，整句被系统性压低。实测后果：`jisuanjik` 的首选从
+/// 残码整句「计算机看」翻成补全「计算机科学」(w=402)、`zhongguor` 从「中国人」翻成
+/// 「中国人的」，而用户明确指出主流输入法给的是前者。
+///
+/// librime 的整句分是 `Σ log(f_i) = log(∏f_i)`（`poet.cc:216` 累加 `dict_compiler.cc:257`
+/// 写入的 `log(freq)`），**不归一化**。两个词的频次相乘（1e5×1e5=1e10）天然远大于任何
+/// 单个词典词 —— 「就算没有词也强制组句」正源于此。故这里乘 `T^n` 抵消归一化：
+///
+/// ```text
+/// exp(log_prob + n·ln T) = ∏f_i        （n = 词数）
+/// ```
+///
+/// 单词整句（step 1.5 的词典整词）n=1 ⇒ 还原成 `f` 本身，与词典权重同量纲，符合直觉。
+///
+/// ⚠️ **长整句会饱和到 `i32::MAX`**：三词以上乘积即溢出。可接受——整句之间靠
+/// `consumed_length`（协调器比较链 ⓪）区分，同 consumed 的整句同时出现属极少数。
+/// 但这条依赖 ⓪ 的语义，若它变化须重新评估。
+///
+/// ⚠️ **饱和不等于「整句永远赢」**：step 6.5/6.5b 让位时是**显式赋值**
+/// （`c.weight = max_w - 1`），不受饱和影响；`zhongguorenm` 的「中国人吗」仍会让位给
+/// 「中国人民」。整句优先是默认，让位是显式例外，两者分工不变。
+///
+/// ⚠️ `log_prob` 含各类惩罚/加成（`WORD_PENALTY`、单字罚、实词加成…），故 `exp(log_prob)`
+/// 不是严格的整句概率，`DICT_TOTAL` 实际充当**标定系数**。改那些惩罚常数须重新标定。
+fn sentence_weight(log_prob: f64, word_count: usize) -> i32 {
+    let unnormalized = log_prob + word_count as f64 * lattice::DICT_TOTAL.ln();
+    unnormalized.exp().clamp(1.0, i32::MAX as f64) as i32
+}
 
 /// 模糊音命中的权重折扣（对齐 Go `ranker.go` 的 `IsFuzzy → score -= 100`）。
 ///
@@ -61,7 +116,7 @@ const SENTENCE_WEIGHT_BASE: i32 = 30_000_000;
 /// 更大的值（如 0.5）会让模糊高频字直接夺走首选位（`si`→「是\* 时\* 四」），等于把
 /// 「我分不清 s/sh」曲解成「我要的就是 sh」。
 ///
-/// **本常数不作用于整句路径**：Viterbi 整句拿 [`SENTENCE_WEIGHT_BASE`] (3e7) 基准分，
+/// **本常数不作用于整句路径**：Viterbi 整句拿 旧的 `SENTENCE_WEIGHT_BASE`(3e7，已退役) 基准分，
 /// 与词频量纲差几个数量级，任何比例折扣都压不下来。模糊整句改走 step 6.5 的
 /// `is_sentence_demoted` 降级（降到精确整词之下），见该处注释。
 const FUZZY_WEIGHT_SCALE: f64 = 0.01;
@@ -129,7 +184,7 @@ const COMPLETION_FAR_WEIGHT_FLOOR: i32 = 100;
 /// 顶掉「你好」是用户明确要的 —— 二者的差别只在词频，故必须有一条线。
 ///
 /// **为什么 librime 不需要这道门槛**：其整句由 Poet 与词条**同轴**打分，w=0 的词条自然
-/// 排不上去；我们的整句拿 [`SENTENCE_WEIGHT_BASE`] (3e7) 跨轴置顶，「让位」只能做成二值
+/// 排不上去；我们的整句拿 旧的 `SENTENCE_WEIGHT_BASE`(3e7，已退役) 跨轴置顶，「让位」只能做成二值
 /// 开关 —— 一旦把连续比较压成布尔，就必须自己补回那道被丢掉的门槛。
 ///
 /// **取值＝ [`COMPLETION_FAR_WEIGHT_FLOOR`] 的一半，两者是同一条线**：6.5b 的候选
@@ -200,7 +255,7 @@ const MIXED_ABBREV_INDEX_LIMIT: usize = 64;
 
 /// 混合整句的**质量闸门**：路径平均每字 log_prob 低于此值就不插入候选。
 ///
-/// 为什么需要它：整句靠 [`SENTENCE_WEIGHT_BASE`] (3e7) 无条件置顶，而混合整句的简拼段
+/// 为什么需要它：整句靠 旧的 `SENTENCE_WEIGHT_BASE`(3e7，已退役) 无条件置顶，而混合整句的简拼段
 /// 歧义极大——`bzd` 要在 12 个同简拼词里选，靠 unigram 常常选错。没有闸门时**错误整句
 /// 100% 占据首选**，连原本可用的部分候选（分步上屏的「不知道」）都被顶掉。
 /// 调 `ABBREV_NODE_PENALTY` 治不了这个：`log_offset` 那点差异撼动不了 3e7 的基准
@@ -1135,7 +1190,7 @@ impl Engine for PinyinEngine {
 
         // 1.5 超长词典整词兜底：与整句同量纲化
         //
-        // 整句权重 = SENTENCE_WEIGHT_BASE(30M) + 各节点 log_prob 之和；而词典精确命中只带
+        // 整句权重 = 旧的 SENTENCE_WEIGHT_BASE(30M，已退役) + 各节点 log_prob 之和；而词典精确命中只带
         // 原始词频（「中华人民共和国」= 3113）。二者量纲不同却在同一个 weight 维度上比较
         // （排序键三个布尔位此时全部打平），词典整词必然输给整句——哪怕整句是由语义碎片
         // 拼出的错误切分。这里按 lattice 的同一个 score_node 公式给它算「单节点等价整句分」，
@@ -1157,11 +1212,7 @@ impl Engine for PinyinEngine {
                     continue;
                 }
                 let log_prob = lattice::score_node(&c.text, c.weight);
-                let log_offset =
-                    (log_prob * 1000.0).clamp(-(SENTENCE_WEIGHT_BASE as f64), 0.0) as i32;
-                c.weight = c
-                    .weight
-                    .max(SENTENCE_WEIGHT_BASE.saturating_add(log_offset));
+                c.weight = c.weight.max(sentence_weight(log_prob, 1));
                 // 与整句同量纲即同身份：它是引擎对整串输入的最优解读，只是恰好由一个词典
                 // 整词构成。不标的话 freq_rerank 会把 is_sentence 的拼接整句锚定到它之上，
                 // 「冠状动脉粥样硬化性心脏病」又会被「罐装动脉…」压回去。
@@ -1226,10 +1277,7 @@ impl Engine for PinyinEngine {
                 if !sentence.is_empty() {
                     // 整句优先：给予高权重置顶（log_prob 为负，原 .max(1) 会被截断淘汰）。
                     // clamp + saturating_add 防止超长低频句的 log_prob 溢出 i32 导致沉底/panic。
-                    let log_offset = (result.log_prob * 1000.0)
-                        .clamp(-(SENTENCE_WEIGHT_BASE as f64), 0.0)
-                        as i32;
-                    let weight = SENTENCE_WEIGHT_BASE.saturating_add(log_offset);
+                    let weight = sentence_weight(result.log_prob, result.words.len());
                     if let Some(existing) = candidates.iter_mut().find(|c| c.text == sentence) {
                         // 整句与已有候选（如精确匹配 你好）同文：提升其权重置顶，
                         // 同时抹去 is_partial（step1 标了 true，但整句是完整解读并非子短语），
@@ -1337,10 +1385,7 @@ impl Engine for PinyinEngine {
             if !result.words.is_empty() && result.log_prob.is_finite() {
                 let sentence: String = result.words.join("");
                 if !sentence.is_empty() {
-                    let log_offset = (result.log_prob * 1000.0)
-                        .clamp(-(SENTENCE_WEIGHT_BASE as f64), 0.0)
-                        as i32;
-                    let weight = SENTENCE_WEIGHT_BASE.saturating_add(log_offset);
+                    let weight = sentence_weight(result.log_prob, result.words.len());
                     if let Some(existing) = candidates.iter_mut().find(|c| c.text == sentence) {
                         // 同文合并（`nihaom` 的残码整句「你好吗」与 step4 的前缀补全同文）：
                         // 取更强的身份，理由同 step 2 的同文合并分支。
@@ -1459,9 +1504,6 @@ impl Engine for PinyinEngine {
                     && logp_per_char >= MIXED_SENTENCE_MIN_LOGP_PER_CHAR
                     && !candidates.iter().any(|c| c.text == sentence)
                 {
-                    let log_offset = (result.log_prob * 1000.0)
-                        .clamp(-(SENTENCE_WEIGHT_BASE as f64), 0.0)
-                        as i32;
                     candidates.insert(
                         0,
                         Candidate {
@@ -1469,7 +1511,7 @@ impl Engine for PinyinEngine {
                             // code = 整串**击键**。混合整句本就不是词库主键（它是解读不是词），
                             // 与 step 2 的整句一样以「本次输入」为码；消费整串由此自然成立。
                             code: abbr_query.to_string(),
-                            weight: SENTENCE_WEIGHT_BASE.saturating_add(log_offset),
+                            weight: sentence_weight(result.log_prob, result.words.len()),
                             natural_order: 0,
                             source: CandidateSource::Pinyin,
                             is_sentence: true,
@@ -2004,7 +2046,7 @@ impl Engine for PinyinEngine {
         // 6.5 整句让位于精确整词：**降级，不销毁**
         //
         // 输入 `lianzhengtixing` 时用户词「廉政提醒」严格覆盖整串，而 Viterbi 拼出的
-        // 「连整体性」靠 SENTENCE_WEIGHT_BASE(30M) 的量纲优势恒占首位——30M 碾压一切词频，
+        // 「连整体性」靠 旧的 SENTENCE_WEIGHT_BASE(30M，已退役) 的量纲优势恒占首位——30M 碾压一切词频，
         // 用户把词加进词库、配再高的权重也换不回首选。
         //
         // 早先试过的「有精确整词就不构造整句」是**销毁**：整句连候选都不在，用户想选也
@@ -2053,7 +2095,7 @@ impl Engine for PinyinEngine {
         // ② **模糊命中**的整句（词典有此词，但经模糊变体召回——如 `sixiang` 经 s↔sh 命中
         //    词条「是想」，在词图里成为覆盖全串的单节点被 Viterbi 选中）。
         //
-        // ② 必须走这条路而非 `fuzzy_penalized` 的比例折扣：整句拿的是 `SENTENCE_WEIGHT_BASE`
+        // ② 必须走这条路而非 `fuzzy_penalized` 的比例折扣：整句拿的是旧的 `SENTENCE_WEIGHT_BASE`（已退役）
         // (3e7) 基准分，与词典词的词频量纲（1e2~1e6）差几个数量级，任何比例折扣都压不下来
         // （0.01 折扣后仍有 3e5，照样碾过「思想」的 26133）。而「降到精确整词之下」在语义上
         // 恰好对：模糊解读让位于精确解读。
@@ -2097,7 +2139,7 @@ impl Engine for PinyinEngine {
         // 已经按下的 `m` 丢掉了**；真正响应了 `m` 的「你好吗」屈居第 2。实测该规律与音节数
         // 无关，2/3/4/6 音节一律如此：`zhongguor`→中国(丢 r)、`zhongguorenm`→中国人(丢 m)、
         // `zhonghuarenmingongheg`→中华人民共和(丢 g)。根因是整句拿着
-        // [`SENTENCE_WEIGHT_BASE`] (3e7) 无条件置顶，而补全只有真实词频（个位数 ~ 1e4），
+        // 旧的 `SENTENCE_WEIGHT_BASE`(3e7，已退役) 无条件置顶，而补全只有真实词频（个位数 ~ 1e4），
         // 差 4~7 个数量级，永远翻不过去。
         //
         // ## 判据来自 librime，且比「按 extra 一刀切」更准
@@ -2174,7 +2216,7 @@ impl Engine for PinyinEngine {
         // 差别只在这里要的是「存在性」而非「最大权重」。两处若不一致，会出现「6.5 认为有
         // 竞争者而降级、6.6 认为没有而仍锚定」这类自相矛盾的状态。
         //
-        // 不动 weight 是有意的：无词频记录时整句仍须凭 `SENTENCE_WEIGHT_BASE` 量纲居首
+        // 不动 weight 是有意的：无词频记录时整句仍须凭等效词频量纲居首
         // （它确实是引擎对整串的最优解读），本标记只让它在**有用户实际选择数据时**接受
         // 挑战。已降级的整句跳过——它已经让过位了，weight 也已被压低。
         //
@@ -3817,9 +3859,12 @@ mod tests {
             c.is_sentence_contested,
             "同码存在「拟好」→ 须标 contested（否则词频对 nihao 整体失效）"
         );
+        // 本标记只摘锚定、**不动 weight**。整句退役 SENTENCE_WEIGHT_BASE 后量纲改为
+        // 等效词频，故断言改为「不低于它作为词典整词的原权重」：同文合并取
+        // `max(词典 weight, W_eff)`，50_000 是构造里「你好」的词典值。
         assert!(
-            c.weight >= SENTENCE_WEIGHT_BASE - 1_000_000,
-            "本标记只摘锚定、**不动 weight**，整句仍须保有 SENTENCE_WEIGHT_BASE 量纲，实际 {}",
+            c.weight >= 50_000,
+            "本标记只摘锚定、不动 weight，整句权重不该低于其词典权重，实际 {}",
             c.weight
         );
         assert_eq!(

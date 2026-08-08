@@ -196,7 +196,7 @@ fn completion_discount_demotes_words_with_more_unentered_syllables() {
 /// step 6.5b：整句须让位于「恰好用完残码的补全」，且**只让给它**。
 ///
 /// 现象：打 `nihaom` 时首选恒是整句「你好」——它把用户已按下的 `m` 丢掉了。实测该规律
-/// 与音节数无关（2/3/4/6 音节一律如此），根因是整句的 `SENTENCE_WEIGHT_BASE`(3e7)
+/// 与音节数无关（2/3/4/6 音节一律如此），根因是当时整句的 `SENTENCE_WEIGHT_BASE`(3e7，已退役)
 /// 无条件置顶，补全只有真实词频（个位数 ~ 1e4），差 4~7 个数量级。
 ///
 /// 判据复刻 librime `has_exact_match_phrase`（`gear/script_translator.cc:387`：存在覆盖
@@ -239,11 +239,16 @@ fn sentence_yields_to_completion_that_exhausts_trailing_partial() {
         assert_eq!(top(input), want, "{input}：{note}");
     }
 
-    // 反例：补全没用完残码就结束（音节数 > completed + 1）⇒ 整句**保持**首位。
+    // 反例：补全没用完残码就结束（音节数 > completed + 1）⇒ **不得**触发让位。
     // 「北京大学校长」bei|jing|da|xue|xiao|zhang = 6 ≠ 4+1，且 w=4 属冷僻预测词。
-    assert_eq!(
+    //
+    // ⚠️ 断言的是「校长没夺走首位」，不是「首选恰为北京大学」：step 2c 落地后残码 `x`
+    // 会被补成一个字（实测「北京大学下」），它 consumed 满、按比较链 ⓪ 本就该在
+    // 只消费 12/13 键的「北京大学」之前 —— 与 `buzhidaok`→「不知道看」同形态。
+    // 写死具体文本会让这条反例实际在守一个它不负责的东西。
+    assert_ne!(
         top("beijingdaxuex"),
-        "北京大学",
+        "北京大学校长",
         "beijingdaxuex：「北京大学校长」6 音节 ≠ 4+1，不该夺走首位"
     );
 
@@ -272,10 +277,14 @@ fn low_freq_far_completion_does_not_outrank_sentence() {
 
     let cands = mgr.convert_with("pinyin", "zhonghuar", 6).candidates;
     let texts = || cands.iter().map(|c| &c.text).collect::<Vec<_>>();
+    // ⚠️ 首选从「中华」改为「中华人」：step 2c 落地后残码 `r` 被补成一个待定音节，
+    // 产出消费满 9 键的残码整句，按比较链 ⓪ 本就该在只消费 8 键的「中华」之前。
+    // 本用例真正要守的是**下面那条**——w=0 的「种花人」与 w=18 的「中华人民」都不得
+    // 靠上浮夺走首位，那与首选具体是哪条整句无关。
     assert_eq!(
         cands[0].text,
-        "中华",
-        "zhonghuar 首选应是整句「中华」，实际: {:?}",
+        "中华人",
+        "zhonghuar 首选应是残码整句「中华人」，实际: {:?}",
         texts()
     );
     assert!(

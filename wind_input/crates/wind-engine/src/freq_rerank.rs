@@ -606,7 +606,7 @@ mod tests {
     /// 有同码竞争者的整句（`is_sentence_contested`）**不再锚定**：同码精确整词可凭词频反超。
     ///
     /// 现场 `siyuan`：「寺院」既是词典精确整词、又被 Viterbi 选为最优解（step 2 同文合并
-    /// 继承整句身份，weight 被抬到 SENTENCE_WEIGHT_BASE 量纲），而「思源」同码。锚定是
+    /// 继承整句身份，weight 被抬到整句量纲），而「思源」同码。锚定是
     /// 硬闸门，实测灌到 count=5000 都翻不动 —— 词频对该编码整体失效。
     #[test]
     fn pinyin_contested_sentence_yields_to_used_peer() {
@@ -663,7 +663,7 @@ mod tests {
     #[test]
     fn pinyin_high_weight_non_sentence_still_learns() {
         // 92,194 = 8105 常用字表的 p99，是非整句候选够得到的真实量级
-        // （早先用例写 30,000,000，那是 SENTENCE_WEIGHT_BASE 量级，非整句候选到不了）。
+        // （早先用例写 30,000,000，那是旧的 SENTENCE_WEIGHT_BASE 量级，非整句候选到不了）。
         let mut cands = vec![pin("高权非整句", 92_194), pin("近用低权", 100)];
         let r = recs(&[("近用低权", 1, NOW)]);
         rerank_pinyin_positional(
