@@ -7,17 +7,58 @@
 use crate::config::Config;
 use tracing::{debug, warn};
 
-/// `keys.key_actions` 当前支持的动词。
+/// `keys.key_actions` 里**组合键**条目支持的动词。
 ///
 /// 白名单而非「解析得动就收」：写错的动词若静默进热键表，按下时分发端匹配不上、
 /// 什么都不发生，而用户看不出是自己拼错了还是功能坏了。这里拦下并 warn，与
 /// `global_hotkeys` 对不支持动作的处理同策略。
 ///
-/// 值域随阶段扩充，语义见 docs/design/schema-key-actions.md §2。
-fn is_supported_key_action(action: &str) -> bool {
+/// ★ **只管组合键**。单键条目走的是引导键通路（`Coordinator::bound_action_for`），
+/// 值域是完整的 [`BoundAction`]，不经本函数——两条通路的分发端不同，能认的动词自然
+/// 不同。用一张表管两条路的结果，是要么放行了热键分发端不认的（配了没反应），
+/// 要么挡住了引导键通路完全支持的（能力凭空少一半）。
+///
+/// 值域语义见 docs/design/schema-key-actions.md §2。
+fn is_supported_hotkey_action(action: &str) -> bool {
     action
         .strip_prefix("toggle_schema:")
         .is_some_and(|id| !id.trim().is_empty())
+}
+
+/// `keys.key_actions` 的一条条目该走哪条通路。由**键的形态**决定，不由动词决定。
+///
+/// 三条通路各有各的到达条件，判据见 docs/design/schema-key-actions.md §4.1 与 §4.4：
+///
+/// | 形态 | 通路 | 为什么 |
+/// |---|---|---|
+/// | 组合键（带 Ctrl/Alt/Shift/Win） | key_down 热键 → `dispatch_hotkey` | 不与输入争键，可全局拦截 |
+/// | 纯修饰键（`rshift`） | key_up 轻敲 | keydown 不能吃（宿主要看到修饰键），只能在干净单击的 keyup 上判 |
+/// | 单个有字符的键（`backtick`） | keydown 引导键链 | 英文模式下必须让它出字，故排在分水岭之后 |
+///
+/// ⚠ 单键**绝不能**编译进 key_down 热键表：`parse_hotkey("backtick")` 返回的是无修饰位的
+/// 裸 VK，进表后 TSF 会把它当热键转发并吞掉，该符号就再也打不出来了。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KeyActionRoute {
+    /// 组合键：编译进 key_down 热键表。
+    Hotkey,
+    /// 纯修饰键：编译进 key_up 转发集。
+    ModifierKeyUp,
+    /// 单个有字符的键：不进任何热键表，由引导键链查表消费。
+    LeadingKey,
+}
+
+/// 按键名判定通路。无法解析的键名返回 `None`（调用方 warn 后忽略）。
+pub fn route_of_key_action(key: &str) -> Option<KeyActionRoute> {
+    let raw = parse_hotkey(key)?;
+    let has_modifier = (raw >> 16) & MOD_GENERIC_MASK != 0;
+    if has_modifier {
+        return Some(KeyActionRoute::Hotkey);
+    }
+    let vk = raw & 0xFFFF;
+    if (VK_LSHIFT..=VK_RCONTROL).contains(&vk) {
+        return Some(KeyActionRoute::ModifierKeyUp);
+    }
+    Some(KeyActionRoute::LeadingKey)
 }
 
 /// 修饰键常量（与 wind-ipc MOD_* / Go ipc.Mod* 对齐）
@@ -228,17 +269,41 @@ impl Compiler {
             if key.is_empty() || action.is_empty() {
                 continue;
             }
-            if !is_supported_key_action(action) {
-                warn!("keys.key_actions: 不支持的动词 {action:?}（键 {key:?}），忽略");
+            let Some(route) = route_of_key_action(key) else {
+                warn!("keys.key_actions: 键 {key:?} 解析失败，忽略");
                 continue;
-            }
-            match parse_hotkey(key) {
-                Some(raw) => result.key_down.push(HotkeyEntry {
-                    tsf_hash: raw,
-                    match_hash: raw,
-                    action: action.to_string(),
-                }),
-                None => warn!("keys.key_actions: 键 {key:?} 解析失败，忽略"),
+            };
+            let raw = match parse_hotkey(key) {
+                Some(r) => r,
+                None => continue, // route_of_key_action 已解析成功，此处不可达
+            };
+            match route {
+                KeyActionRoute::Hotkey => {
+                    if !is_supported_hotkey_action(action) {
+                        warn!("keys.key_actions: 组合键不支持动词 {action:?}（键 {key:?}），忽略");
+                        continue;
+                    }
+                    result.key_down.push(HotkeyEntry {
+                        tsf_hash: raw,
+                        match_hash: raw,
+                        action: action.to_string(),
+                    });
+                }
+                // 修饰键：只登记转发，动作由服务端按 `BoundAction` 裁决。
+                // action 用 `schema_bound` 而非动词本身——`is_toggle_mode_keycode` 按 action
+                // 过滤，塞进动词会让它认不出来（那条判据只认 `toggle_mode`）。
+                KeyActionRoute::ModifierKeyUp => {
+                    if let Some(hash) = compile_modifier_key_up_hash(raw & 0xFFFF) {
+                        result.key_up.push(HotkeyEntry {
+                            tsf_hash: hash,
+                            match_hash: hash,
+                            action: "schema_bound".to_string(),
+                        });
+                    }
+                }
+                // 单个有字符的键：**不进任何热键表**。进了 TSF 就会把它当热键吞掉，
+                // 该符号再也打不出来。由引导键链（`bound_action_for`）查配置消费。
+                KeyActionRoute::LeadingKey => {}
             }
         }
 
@@ -1054,5 +1119,83 @@ mod tests {
         // 非修饰键没有 keyup 形态（CapsLock 也不在此列：它走 toggle_mode_keys 那条）。
         assert_eq!(compile_modifier_key_up_hash(VK_OEM_1), None);
         assert_eq!(compile_modifier_key_up_hash(VK_CAPITAL), None);
+    }
+
+    /// `keys.key_actions` 按**键形态**分三条通路，不按动词。
+    #[test]
+    fn key_action_routes_split_by_key_shape() {
+        use KeyActionRoute::*;
+        assert_eq!(route_of_key_action("ctrl+shift+n"), Some(Hotkey));
+        assert_eq!(route_of_key_action("ctrl+space"), Some(Hotkey));
+        assert_eq!(route_of_key_action("rshift"), Some(ModifierKeyUp));
+        assert_eq!(route_of_key_action("lctrl"), Some(ModifierKeyUp));
+        assert_eq!(route_of_key_action("backtick"), Some(LeadingKey));
+        assert_eq!(route_of_key_action("semicolon"), Some(LeadingKey));
+        assert_eq!(route_of_key_action("z"), Some(LeadingKey));
+        assert_eq!(route_of_key_action("不存在的键"), None);
+    }
+
+    /// ★★ 单个有字符的键**绝不能**进 key_down 热键表。
+    ///
+    /// `parse_hotkey("backtick")` 返回的是无修饰位的裸 VK（0xC0）。进表后 TSF 会把它
+    /// 当热键转发并吞掉，于是 `` ` `` 这个符号在所有方案里都再也打不出来——而用户只是
+    /// 想给它绑个功能。这条是本次收编最危险的一处，故单独立测。
+    #[test]
+    fn single_character_key_never_enters_keydown_hotkeys() {
+        let mut cfg = Config::default();
+        cfg.keys
+            .key_actions
+            .insert("backtick".into(), "temp_pinyin".into());
+        cfg.keys
+            .key_actions
+            .insert("semicolon".into(), "mix:quick_mix".into());
+        cfg.keys
+            .key_actions
+            .insert("rshift".into(), "toggle_mode".into());
+        cfg.keys
+            .key_actions
+            .insert("ctrl+shift+n".into(), "toggle_schema:wubi86".into());
+        let compiled = Compiler::new(cfg).compile();
+
+        // ★ 判据是「有没有产生**带这个动词的** key_down 条目」，不是「这个 VK 在不在
+        // key_down 里」——`;` / `'` 本来就被默认的选词键组 `semicolon_quote` 以
+        // FORWARD_ONLY 登记着，按 VK 判会把那条误当成本段的产物，测了个寂寞。
+        for verb in ["temp_pinyin", "mix:quick_mix"] {
+            assert!(
+                !compiled.key_down.iter().any(|e| e.action == verb),
+                "单键条目 {verb} 不该产生 key_down 热键，实际 {:?}",
+                compiled
+                    .key_down
+                    .iter()
+                    .map(|e| &e.action)
+                    .collect::<Vec<_>>()
+            );
+        }
+        // 反向确认分流真的生效：选词键组那条仍在（action 为空的转发登记），
+        // 说明上面的「没有」不是因为整段编译被跳过了。
+        assert!(
+            compiled
+                .key_down
+                .iter()
+                .any(|e| (e.match_hash & 0xFFFF) == VK_OEM_1 && e.action.is_empty()),
+            "选词键组的 `;` 转发登记应不受影响"
+        );
+
+        // 组合键照常进 key_down（收编不该动这条既有通路）。
+        assert!(
+            compiled
+                .key_down
+                .iter()
+                .any(|e| e.action == "toggle_schema:wubi86"),
+            "组合键条目应仍走热键通路"
+        );
+        // 修饰键进 key_up，且 action 是 schema_bound 而非动词本身——
+        // `is_toggle_mode_keycode` 按 action 过滤，塞动词进去它就认不出来了。
+        let up = compiled
+            .key_up
+            .iter()
+            .find(|e| (e.match_hash & 0xFFFF) == VK_RSHIFT)
+            .expect("rshift 应进 key_up 转发集");
+        assert_eq!(up.action, "schema_bound");
     }
 }

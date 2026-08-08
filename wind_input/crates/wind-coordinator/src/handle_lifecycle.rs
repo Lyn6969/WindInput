@@ -306,9 +306,15 @@ impl Coordinator {
 
     /// 这个键在当前方案里绑了什么动作；未绑定返回 `None`（落全局引导键链）。
     ///
-    /// 两个来源，方案表优先：
+    /// 三个来源，**由具体到一般**：
     /// 1. 方案文件 / `schema_overrides` 的 `[key_actions]`（任意键）
-    /// 2. `schema.codetable.z_key_action`（只管 z，早于本表存在的专用字段）
+    /// 2. 全局 `keys.key_actions` 里的**单键**条目（组合键走热键通路，不在此列）
+    /// 3. `schema.codetable.z_key_action`（只管 z，早于本表存在的专用字段）
+    ///
+    /// 第 2 层是五c「全局层收编」的落点：五处 `trigger_keys` 折算到这里之后，
+    /// 「谁先谁后」由**层级**决定（方案覆盖全局），不再由 `try_activate_mode` 里的
+    /// 硬编码调用顺序决定——那套顺序不是数据、无从配置，且两个实例配同一个键时
+    /// 后者静默失效。
     ///
     /// 键名走 `key_name_to_vk_with_letters`——本表**接受字母**，与只认符号的全局
     /// `trigger_keys` 相反：字母能否借作功能键取决于「这张码表里它是不是死码」，那正是
@@ -324,6 +330,30 @@ impl Coordinator {
                 .or_else(|| keymap::modifier_name_to_vk(&name));
             if vk == Some(key_code) {
                 return Some(BoundAction::parse(&action));
+            }
+        }
+        // 全局 `keys.key_actions` 的单键条目。方案没表态时才落到这里——方案覆盖全局是
+        // 本设计的基本层级，与码表行为、注释模板等其它方案级配置同构。
+        //
+        // 只认单键：组合键条目由热键通路消费（`Compiler::compile` 已按形态分流），
+        // 在这里再认一次就是同一个键两条路都触发。
+        for (name, action) in &self.rt().config.keys.key_actions {
+            if !matches!(
+                wind_config::hotkey::route_of_key_action(name),
+                Some(wind_config::hotkey::KeyActionRoute::LeadingKey)
+                    | Some(wind_config::hotkey::KeyActionRoute::ModifierKeyUp)
+            ) {
+                continue;
+            }
+            let vk = keymap::key_name_to_vk_with_letters(name)
+                .or_else(|| keymap::modifier_name_to_vk(name));
+            if vk == Some(key_code) {
+                let parsed = BoundAction::parse(action);
+                if parsed.is_enabled() {
+                    return Some(parsed);
+                }
+                // 显式 `none`：全局层也能禁用，语义与方案级同——不再往下回落。
+                return Some(BoundAction::None);
             }
         }
         // 表里没写 z 时，回落到专用字段（其自身已含全局→方案的折叠）。
