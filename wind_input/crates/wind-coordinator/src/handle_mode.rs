@@ -1127,19 +1127,14 @@ impl Coordinator {
             .map(|i| i as u8)
     }
 
-    /// 找出 key_code 匹配的 mix 模式下标（按配置顺序先到先得）。
+    /// 找出 key_code 绑定的 mix 模式下标。
+    ///
+    /// 「按配置顺序先到先得」的歧义已随收编消失：新表是 Map，一个键只能有一个动词。
     pub(crate) fn match_mix_trigger(&self, key_code: u32) -> Option<u8> {
-        for (i, m) in self.rt().config.schema.mix_modes.iter().enumerate() {
-            if i > u8::MAX as usize {
-                break;
-            }
-            if m.trigger_keys
-                .iter()
-                .filter_map(|k| Self::special_trigger_vk(k))
-                .any(|vk| vk == key_code)
-            {
-                return Some(i as u8);
-            }
+        // 数据源同 `match_special_trigger`：统一走 `bound_action_for`，
+        // `mix_modes[].trigger_keys` 已由 `normalize` 折算进 `keys.key_actions`。
+        if let Some(wind_config::BoundAction::Mix(id)) = self.bound_action_for(key_code) {
+            return self.mix_mode_idx(&id);
         }
         None
     }

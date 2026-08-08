@@ -17,14 +17,6 @@ use wind_keys::keymap;
 use wind_transform::fullwidth::to_full_width;
 
 impl Coordinator {
-    /// 触发键名 → VK（**符号**触发键统一映射，见 `keymap`）。字母刻意不认——
-    /// z 走方案级 `schema.codetable.z_key_action` + 三重身份裁决（对齐 Go
-    /// `matchTempPinyinTrigger` 排除 z + `judgeZFirstTrigger`），避免 z 在符号语义路径
-    /// （如缓冲非空顶屏进临拼）被误触发。
-    pub(crate) fn temp_pinyin_trigger_vk(key: &str) -> Option<u32> {
-        keymap::key_name_to_vk(key)
-    }
-
     /// VK → 组合区前缀字符（统一映射，见 `keymap`；缺省回退反引号）。
     ///
     /// 用**带字母**的版本：z 经 `z_key_action` 进临拼时，组合区要显示用户按下的那个 `z`。
@@ -34,16 +26,21 @@ impl Coordinator {
         keymap::vk_to_prefix_char_with_letters(key_code).unwrap_or('`')
     }
 
-    /// 当前按键是否匹配配置的**符号**临时拼音触发键（字母触发键见 `matched_letter_temp_trigger`）
+    /// 当前按键是否为临时拼音的引导键。
+    ///
+    /// 数据源是 [`Self::bound_action_for`]（方案表 → 全局 `keys.key_actions` → `z_key_action`），
+    /// 不再直接读 `input.temp_pinyin.trigger_keys`——那个字段已由 `normalize` 折算进
+    /// `keys.key_actions`（设计文档五c）。
+    ///
+    /// ★ 顺带修好一处旧缺陷：本函数被「模式内二次按同键退出」「智能符号 press2 门控」
+    /// 「设置页冲突检测」共用，而它们原先只看得到**全局** trigger_keys。方案级 `[key_actions]`
+    /// 里绑的引导键对它们是不可见的——进了临拼后按那个键不退出、press2 也不武装。
+    /// 换成统一来源后这些场景自动跟上。
     pub(crate) fn is_temp_pinyin_trigger(&self, key_code: u32) -> bool {
-        self.rt()
-            .config
-            .input
-            .temp_pinyin
-            .trigger_keys
-            .iter()
-            .filter_map(|k| Self::temp_pinyin_trigger_vk(k))
-            .any(|vk| vk == key_code)
+        matches!(
+            self.bound_action_for(key_code),
+            Some(wind_config::BoundAction::TempPinyin)
+        )
     }
 
     /// z 三重身份裁决的「活码前缀」判据（对齐 Go `HasPrefix`）：码表引擎候选（含 BFS 前缀扫描）
@@ -186,15 +183,12 @@ impl Coordinator {
     }
 
     /// 当前按键是否匹配配置的临时英文触发键
+    /// 当前按键是否为临时英文的引导键。来源与理由同 [`Self::is_temp_pinyin_trigger`]。
     pub(crate) fn is_temp_english_trigger(&self, key_code: u32) -> bool {
-        self.rt()
-            .config
-            .input
-            .temp_english
-            .trigger_keys
-            .iter()
-            .filter_map(|k| keymap::key_name_to_vk(k))
-            .any(|vk| vk == key_code)
+        matches!(
+            self.bound_action_for(key_code),
+            Some(wind_config::BoundAction::TempEnglish)
+        )
     }
 
     /// 临拼：回退最后一个已转换段——把它消费的码并回缓冲**前部**并重转，光标落码末尾

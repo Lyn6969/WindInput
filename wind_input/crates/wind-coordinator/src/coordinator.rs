@@ -646,7 +646,12 @@ impl ConfigBundle {
     /// （见 [`Coordinator::schema_bound_modifier_vks`]）。它们要追加进 `key_up` 转发集，
     /// 否则 TSF 根本不把这些键的 keyup 送过来——`CompiledHotkeys` 编译自全局 config，
     /// 方案文件不在其中，这是 keyup 类绑定唯一的可达性来源。
-    fn build(config: Config, schema_bound_modifiers: &std::collections::BTreeSet<u32>) -> Self {
+    fn build(mut config: Config, schema_bound_modifiers: &std::collections::BTreeSet<u32>) -> Self {
+        // 归一化 + 存量迁移。放在这里而不是只在 `Config::load()` 里：本函数是**所有**
+        // 配置生效的必经之路（启动、热重载、RPC 改配置后的 `refresh_config_in_memory`、
+        // 测试直接构造）。挂在 load 上会漏掉后三条——设置页保存一次就绕过了迁移，
+        // 而消费点已改成只读新表，表现是「保存后引导键全失效」。`normalize` 幂等。
+        config.normalize();
         let mut compiled_hotkeys = hotkey::Compiler::new(config.clone()).compile();
         // action 用专门的 `schema_bound` 而不是 `toggle_mode`：`is_toggle_mode_keycode` 按
         // action 过滤，混用会让「只在某方案里绑了 rshift」的键在所有方案里都切中英文

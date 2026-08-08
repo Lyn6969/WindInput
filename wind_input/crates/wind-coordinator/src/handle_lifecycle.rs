@@ -86,11 +86,12 @@ impl Coordinator {
     /// ★ **只管非字母**。字母默认全在首码集里，一并让位会直接废掉两个既有功能：
     /// Shift+字母进临时英文、以及 `z_key_action` 的三重身份裁决（后者本就自带
     /// `has_code_prefix("z")` 判据处理码元冲突，不需要也不能被本函数接管）。
-    pub(crate) fn code_char_takes_lead(&self, data: &KeyEventData) -> bool {
-        if data.modifiers & (MOD_CTRL | MOD_ALT | MOD_SHIFT) != 0 {
-            return false;
-        }
-        let Some(ch) = punct_char(data.key_code, false) else {
+    ///
+    /// ★★ 五c 之后**只对全局层绑定生效**（`bound_key_decision` 按来源分流）：这是
+    /// **跨层**仲裁——全局配置无从知道某个方案把这个符号当码元用了。方案级 `[key_actions]`
+    /// 与同方案的 `leading_chars` 是同层冲突，显式绑定优先，见 §4.3。
+    pub(crate) fn code_char_takes_lead(&self, key_code: u32) -> bool {
+        let Some(ch) = punct_char(key_code, false) else {
             return false;
         };
         if ch.is_ascii_alphabetic() {
@@ -100,10 +101,24 @@ impl Coordinator {
             .active_is_leading_char(ch.to_ascii_lowercase())
     }
 
-    /// 空缓冲模式激活的单一入口（对齐 key-pipeline.md §2.1 优先级链）。
-    /// 优先级（**以本函数的实际调用顺序为准**）：临时英文(Shift+字母) > 临时英文触发键 >
-    /// 临时拼音 > 特殊模式 > 快捷输入(mix)。命中返回激活 KeyAction，
-    /// 都不命中返回 None（落普通输入）。URL 前缀夺取是「缓冲扩展夺取」语义，不在此链，单独处理。
+    /// 空缓冲模式激活的单一入口。命中返回激活 KeyAction，都不命中返回 None（落普通输入）。
+    /// URL 前缀夺取是「缓冲扩展夺取」语义，不在此链，单独处理。
+    ///
+    /// # 五c 之后：硬编码优先级链已消失
+    ///
+    /// 曾经这里按固定顺序依次问「是不是临英触发键 / 临拼触发键 / 特殊模式 / mix」，
+    /// 那套顺序**不是数据、无从配置**，且两个实例配同一个键时后者静默失效。
+    /// 现在只剩两段：
+    ///
+    /// 1. **临时英文 Shift+字母** —— 它不由 `key_actions` 表达（键是 Shift+任意字母，
+    ///    不是某个具体键），故仍是独立分支。
+    /// 2. **`bound_key_decision`** —— 所有具名键的绑定，方案级 → 全局单键 → `z_key_action`
+    ///    由具体到一般。一个键只有一个动作，冲突在配置合并期就定了。
+    ///
+    /// ⚠️ 行为统一：老实现里临英/special/mix 三段要求 `candidates.is_empty()`、临拼那段
+    /// 刻意不要求（其注释明说「不要求候选空」）。单点裁决无法按动作分条件而不增复杂度，
+    /// 统一取**不要求**——跟随临拼的既有行为。影响面是「空缓冲但有候选」（空码补全等）
+    /// 时按引导键：原先 special/mix 不进、现在进。这是本次收编唯一有意的行为变化。
     pub(crate) fn try_activate_mode(
         &self,
         state: &mut State,
@@ -163,59 +178,6 @@ impl Coordinator {
         // 快捷输入已退役为内置类方案 mix 成员（quick_input），不再独立激活：
         // 想要纯快捷输入，配一个 members=["quick_input"] 的 mix 即可。; 默认走「快捷」融合 mix。
 
-        // 临时英文触发键：符号键进入（空缓冲 + 无候选 + 已启用 + 无修饰键 + 匹配 trigger_keys）
-        if state.input_buffer.is_empty()
-            && state.candidates.is_empty()
-            && self.rt().config.input.temp_english.enabled
-            && data.modifiers & (MOD_CTRL | MOD_ALT | MOD_SHIFT) == 0
-            && self.is_temp_english_trigger(data.key_code)
-            && !self.code_char_takes_lead(data)
-        {
-            let prefix = wind_keys::keymap::vk_to_prefix_char_with_letters(data.key_code)
-                .map(|c| c.to_string())
-                .unwrap_or_default();
-            state.active = Some(ModeKind::TempEnglish);
-            state.temp_english_buffer.clear();
-            state.temp_english_prefix = prefix;
-            self.update_temp_english_candidates(state);
-            let disp = state.preedit.clone();
-            self.notify_ui_update(state);
-            debug!(
-                "Entered temp English mode via trigger key (prefix={})",
-                state.temp_english_prefix
-            );
-            return Some(KeyAction::UpdateComposition {
-                text: disp.clone(),
-                caret_pos: disp.chars().count() as u32,
-            });
-        }
-
-        // 临时拼音：空缓冲 + 匹配触发键 + 无修饰键（不要求候选空）。
-        // 方案适用范围（仅码表/混输）由 temp_pinyin_target() 统一把关——它是所有进入点的
-        // 公共门卫（引导键/字母触发/热键/顶屏进模式/z-fallback），判据放这里才不会漏网。
-        if state.input_buffer.is_empty()
-            && data.modifiers & (MOD_CTRL | MOD_ALT | MOD_SHIFT) == 0
-            && self.is_temp_pinyin_trigger(data.key_code)
-            && !self.code_char_takes_lead(data)
-            && let Some(target) = self.engine_mgr.temp_pinyin_target()
-        {
-            state.active = Some(ModeKind::TempPinyin);
-            state.temp_pinyin_schema = target;
-            state.temp_pinyin_buffer.clear();
-            state.temp_pinyin_prefix = Self::temp_pinyin_prefix_for(data.key_code).to_string();
-            self.update_temp_pinyin_candidates(state);
-            let display = state.preedit.clone();
-            self.notify_ui_update(state);
-            debug!(
-                "Entered temp pinyin mode (prefix={})",
-                state.temp_pinyin_prefix
-            );
-            return Some(KeyAction::UpdateComposition {
-                text: display.clone(),
-                caret_pos: display.chars().count() as u32,
-            });
-        }
-
         // 方案级按键功能表（方案文件 / schema_overrides 的 `[key_actions]`）。
         //
         // 位置：**英文模式分水岭之后**（那在 handle_key_event 里，早已 PassThrough 返回）。
@@ -242,31 +204,6 @@ impl Coordinator {
             }
         }
 
-        // 特殊模式 / 临时 mix：空缓冲 + 无候选 + 无修饰键 + 引导键匹配（优先级最低）。
-        // 码表不可用时不拦截该键，返回 None 继续普通流程。
-        //
-        // `code_char_takes_lead`：该符号已被方案声明为首码 ⇒ 让位给码表（见其文档）。
-        if state.input_buffer.is_empty()
-            && state.candidates.is_empty()
-            && data.modifiers & (MOD_CTRL | MOD_ALT | MOD_SHIFT) == 0
-            && !self.code_char_takes_lead(data)
-        {
-            if let Some(idx) = self.match_special_trigger(data.key_code) {
-                // 方案可加载才进入（否则不拦截该键，落普通流程）。
-                if let Some(schema) = self.special_schema(idx)
-                    && self.engine_mgr.ensure_schema(&schema)
-                {
-                    return Some(self.enter_special_mode(state, idx, data.key_code));
-                }
-            }
-            // 临时 mix：含 quick_input 或至少一个可加载成员方案才进入（优先级最低）。
-            if let Some(idx) = self.match_mix_trigger(data.key_code)
-                && (self.mix_has_quick_input(idx) || !self.mix_members(idx).is_empty())
-            {
-                return Some(self.enter_mix_mode(state, idx, data.key_code));
-            }
-        }
-
         None
     }
 
@@ -290,9 +227,16 @@ impl Coordinator {
     /// 同源教训见 `project_mixed_overflow_vs_topcode`（混输上屏三条通路，否决开关必须三处
     /// 都接）。盘查的判据是「进这个模式有几个入口」，不是「我改的函数里有几个分支」。
     pub(crate) fn bound_key_decision(&self, key_code: u32) -> BoundKeyDecision {
-        let Some(action) = self.bound_action_for(key_code) else {
+        let Some((action, from_schema)) = self.bound_action_with_source(key_code) else {
             return BoundKeyDecision::NotBound;
         };
+        // 跨层仲裁：**全局**引导键遇上方案声明的首码要让位——全局配置无从知道某个方案
+        // 把这个符号当码元用了。方案级绑定则相反（同层冲突，显式绑定优先于字符集推导）。
+        // 见 docs/design/schema-key-actions.md §4.3 与 [`Self::bound_action_with_source`]。
+        if !from_schema && self.code_char_takes_lead(key_code) {
+            debug!("key_action: vk=0x{key_code:02X} 让位 —— 全局绑定遇方案首码（跨层仲裁）");
+            return BoundKeyDecision::Yield;
+        }
         match self.bound_action_yield_reason(key_code, &action) {
             Some(reason) => {
                 debug!("key_action: vk=0x{key_code:02X} 让位 —— {reason}");
@@ -326,11 +270,27 @@ impl Coordinator {
     /// 「转发集里有这个键、TSF 也发了 keyup，但查表查不到、什么都不发生」——已在测试里
     /// 复现过一次。
     pub(crate) fn bound_action_for(&self, key_code: u32) -> Option<BoundAction> {
+        self.bound_action_with_source(key_code).map(|(a, _)| a)
+    }
+
+    /// 同 [`Self::bound_action_for`]，但一并给出**这条绑定来自哪一层**
+    /// （`true` = 方案级 `[key_actions]`，`false` = 全局 `keys.key_actions` / `z_key_action`）。
+    ///
+    /// 层级信息是 `code_char_takes_lead` 仲裁的必需输入，不是锦上添花：
+    ///
+    /// - **全局**引导键 × 方案的 `leading_chars` 是**跨层**冲突 ⇒ 让位给码表。全局配置
+    ///   无从知道某个方案把这个符号当码元用了。
+    /// - **方案级**绑定 × 同方案的 `leading_chars` 是**同层**冲突 ⇒ 绑定优先。两条声明
+    ///   都出自这个方案，显式绑定比从字符集隐式推导更具体。
+    ///
+    /// 见 docs/design/schema-key-actions.md §4.3。合并两层来源时若丢掉这个区分，
+    /// 全局引导键就会变成「绑定优先」，把方案自己的码元抢走。
+    pub(crate) fn bound_action_with_source(&self, key_code: u32) -> Option<(BoundAction, bool)> {
         for (name, action) in self.engine_mgr.active_key_actions() {
             let vk = keymap::key_name_to_vk_with_letters(&name)
                 .or_else(|| keymap::modifier_name_to_vk(&name));
             if vk == Some(key_code) {
-                return Some(BoundAction::parse(&action));
+                return Some((BoundAction::parse(&action), true));
             }
         }
         // 全局 `keys.key_actions` 的单键条目。方案没表态时才落到这里——方案覆盖全局是
@@ -351,17 +311,19 @@ impl Coordinator {
             if vk == Some(key_code) {
                 let parsed = BoundAction::parse(action);
                 if parsed.is_enabled() {
-                    return Some(parsed);
+                    return Some((parsed, false));
                 }
                 // 显式 `none`：全局层也能禁用，语义与方案级同——不再往下回落。
-                return Some(BoundAction::None);
+                return Some((BoundAction::None, false));
             }
         }
         // 表里没写 z 时，回落到专用字段（其自身已含全局→方案的折叠）。
         if key_code == keymap::VK_Z {
             let z = self.z_key_action();
             if z.is_enabled() {
-                return Some(z);
+                // z_key_action 本身是方案级配置（经 codetable_settings 折叠），
+                // 故按方案级来源计——它与 leading_chars 同样是同层冲突。
+                return Some((z, true));
             }
         }
         None

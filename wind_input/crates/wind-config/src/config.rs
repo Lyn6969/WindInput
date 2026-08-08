@@ -3061,7 +3061,14 @@ impl Config {
     }
 
     /// 反序列化后的归一化：修正无效值（如 per_page=0 视为未设置，回退默认）。
-    fn normalize(&mut self) {
+    /// 归一化 + 存量迁移。**幂等**，且必须挂在「所有配置生效的必经之路」上，
+    /// 而不是只在 `load()` 里调一次。
+    ///
+    /// ★ 教训：迁移最初只在 `load()` 里跑，于是 `refresh_config_in_memory`
+    /// （设置页改配置后的生产路径，直接重建 bundle）拿到的 cfg 没经过折算——
+    /// 而消费点已改成只读新表，表现是「在设置页保存一次，引导键就全失效」。
+    /// 现由 `ConfigBundle::build` 统一调用，那是配置生效的单一入口。
+    pub fn normalize(&mut self) {
         if self.ui.candidate.per_page == 0 {
             self.ui.candidate.per_page = default_per_page();
         }
