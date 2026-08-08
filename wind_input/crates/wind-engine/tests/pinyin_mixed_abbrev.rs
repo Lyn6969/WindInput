@@ -36,15 +36,27 @@ fn fixture(tag: &str) -> CachedDict {
 
     let mut w = WdatWriter::new();
     // (text, weight, order, boundary)  boundary = 各音节起始字节位
-    w.add_with_boundary("nihao".into(), vec![("你好".into(), 9000, 0, 0b101)]);
-    w.add_with_boundary("nanhai".into(), vec![("南海".into(), 8000, 0, 0b1001)]);
-    w.add_with_boundary("nihaoma".into(), vec![("你好吗".into(), 2000, 0, 0b100101)]);
+    //
+    // ⚠️ **权重一律取 `cn_dicts` 里的真实值**，不要随手编。
+    //
+    // 节点打分是 `ln(weight / DICT_TOTAL)`，而 step 2b 的质量闸门
+    // `MIXED_SENTENCE_MIN_LOGP_PER_CHAR`(-8.0) 是在**真实词库的权重分布**上标定的
+    // （见其文档：`bzdhaobuhao`→不知道好不好 每字 -3.90）。编造的权重会让夹具落在闸门的
+    // 另一侧，测出的是另一个世界的行为。
+    //
+    // 历史：这批权重原本是编的（不知道 7000 / 哈 4000 / 你好 9000），当时 `score_node` 对
+    // **无 unigram** 的引擎走 `weight / 100_000` 的线性回退，与真实路径的对数量纲根本不在
+    // 同一数轴上，夹具因此「碰巧」落在闸门通过侧。2026-08-08 unigram 并回 dict、量纲统一后
+    // 这批编造值立即被闸门挡下 —— 那不是回归，是夹具一直在验证一条生产走不到的路径。
+    w.add_with_boundary("nihao".into(), vec![("你好".into(), 5328, 0, 0b101)]);
+    w.add_with_boundary("nanhai".into(), vec![("南海".into(), 991, 0, 0b1001)]);
+    w.add_with_boundary("nihaoma".into(), vec![("你好吗".into(), 166, 0, 0b100101)]);
     // bu|zhi|dao —— 供「简拼族前缀回退」用例：`bzdha` 整串无词，须退到 `bzd`
     w.add_with_boundary(
         "buzhidao".into(),
-        vec![("不知道".into(), 7000, 0, 0b100101)],
+        vec![("不知道".into(), 62492, 0, 0b100101)],
     );
-    w.add_with_boundary("ha".into(), vec![("哈".into(), 4000, 0, 0b1)]);
+    w.add_with_boundary("ha".into(), vec![("哈".into(), 16497, 0, 0b1)]);
     // biao|zhang|da|hui —— 简拼 `bzdh`，**权重刻意远低于「不知道」**。
     // 真机现场：打 `bzdhaobuhao` 时 `bzdh` 这个更长的切点把 `h` 抢走，首选成了「表彰大会」。
     // boundary = bit 0/4/9/11：biao(0..4) zhang(4..9) da(9..11) hui(11..14)

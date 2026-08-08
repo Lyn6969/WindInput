@@ -2451,18 +2451,10 @@ impl EngineManager {
                     return None;
                 }
             };
-            // 加载 unigram 语言模型（长句 Viterbi 打分）：mmap 零拷贝，失败回退词典权重。
-            let unigram: Option<Arc<dyn crate::pinyin::lm::UnigramLookup>> =
-                if schema.engine.pinyin.unigram_path.is_empty() {
-                    None
-                } else {
-                    // 必须走 resolve_schema_file（用户目录优先）而非直接拼安装目录：
-                    // 第三方拼音方案的 unigram 只存在于用户目录，只拼 data_dir 会永远找不到，
-                    // 且失败路径是静默回退词典权重（长句打分变差、无任何报错）。
-                    let ug_txt =
-                        Self::resolve_schema_file(&schema.engine.pinyin.unigram_path, data_dir);
-                    Self::load_unigram_mmap(&ug_txt)
-                };
+            // （unigram 语言模型的加载已移除：它是 cn_dicts 的一份副本，词图打分改用词条
+            // 自身的词典权重，见 `pinyin::lattice::score_node_inner`。`schema.engine.pinyin
+            // .unigram_path` 与 unigram.txt/wdb 产物随后一并清理。）
+            //
             // 从全局拼音配置构建引擎配置和模糊音（Task 1.4：修 fuzzy 从未生效 bug）。
             // enabled 作总开关：未启用时所有模糊标志归零（与 Go 行为一致）。
             let pg = pinyin_cfg;
@@ -2491,8 +2483,7 @@ impl EngineManager {
                 completion_min_syllables: pg.completion.min_syllables,
                 completion_max_extra_syllables: pg.completion.max_extra_syllables,
             };
-            let mut engine =
-                PinyinEngine::with_unigram(pcfg, dict, unigram).with_fuzzy(fuzzy.clone());
+            let mut engine = PinyinEngine::new(pcfg, dict).with_fuzzy(fuzzy.clone());
             // 双拼方案：按 layout 加载布局并注入 ShuangpinConverter
             if schema
                 .engine
@@ -2603,52 +2594,6 @@ impl EngineManager {
             Some(Box::new(
                 CodeTableEngine::new(mcl, commit_opts, Arc::new(dm)).with_charset(charset),
             ))
-        }
-    }
-
-    /// 加载 unigram 语言模型（mmap）：从 unigram.txt 懒生成 unigram.wdb 后 mmap 打开。
-    /// 几乎不占常驻内存（页按需载入），替代旧的全量 HashMap 方案。
-    fn load_unigram_mmap(ug_txt: &Path) -> Option<Arc<dyn crate::pinyin::lm::UnigramLookup>> {
-        use crate::pinyin::lm::{MmapUnigram, parse_unigram_freqs};
-        use wind_dict::unigram::write_unigram_wdb;
-
-        let ug_wdb = cache_path(ug_txt, "wdb");
-        // 按缓存文件 single-flight：三个拼音系方案的 unigram_path 都是 pinyin/unigram.txt，
-        // 冷启动时会同时解析 8MB 文本并 rename 同一个 wdb。
-        let build_lock = wind_dict::reader_pool::file_lock(&ug_wdb);
-        let _build_guard = build_lock.lock().unwrap_or_else(|e| e.into_inner());
-        // wdb 比 txt 新则直接用；否则从 txt 重建（拿锁后复查）
-        let fresh =
-            Self::combined_cache_fresh(&[ug_txt], &ug_wdb, wind_dict::cache_fp::UNIGRAM_TAG);
-        if !(ug_wdb.exists() && fresh) {
-            match parse_unigram_freqs(ug_txt) {
-                Ok(freqs) => match write_unigram_wdb(&ug_wdb, &freqs) {
-                    Ok(()) => wind_dict::cache_fp::write_cache_fp(
-                        &ug_wdb,
-                        &[ug_txt],
-                        wind_dict::cache_fp::UNIGRAM_TAG,
-                    ),
-                    Err(e) => warn!("Failed to write unigram.wdb {}: {}", ug_wdb.display(), e),
-                },
-                Err(e) => {
-                    warn!("Failed to parse unigram {}: {}", ug_txt.display(), e);
-                    return None;
-                }
-            }
-        }
-        match wind_dict::reader_pool::open_unigram(&ug_wdb) {
-            Ok(reader) => {
-                info!(
-                    "Unigram mmap: {} ({} keys)",
-                    ug_wdb.display(),
-                    reader.key_count()
-                );
-                Some(Arc::new(MmapUnigram::new(reader)))
-            }
-            Err(e) => {
-                warn!("Failed to mmap unigram.wdb {}: {}", ug_wdb.display(), e);
-                None
-            }
         }
     }
 

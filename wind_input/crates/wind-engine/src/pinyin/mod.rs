@@ -29,7 +29,6 @@ use dag::{Dag, SegGraph};
 use fuzzy::FuzzyConfig;
 use generate::CharPinyinIndex;
 use lattice::LatticeBuilder;
-use lm::UnigramLookup;
 use scorer::AbbrevMatcher;
 use shuangpin::ShuangpinConverter;
 use std::sync::{Arc, OnceLock};
@@ -389,8 +388,6 @@ pub struct PinyinEngine {
     viterbi: ViterbiDecoder,
     lattice_builder: LatticeBuilder,
     fuzzy_config: FuzzyConfig,
-    /// Unigram 语言模型（长句 Viterbi 打分；缺失时回退词典权重）
-    unigram: Option<Arc<dyn UnigramLookup>>,
     /// 用户/临时造词层（L 造词显现）：仅含 StoreUserLayer/StoreTempLayer，无系统层。
     /// 拼音候选除主词典外，按相同的码并入这些层的用户造词（None=无持久化，如纯测试）。
     store_layers: Option<Arc<DictManager>>,
@@ -401,15 +398,9 @@ pub struct PinyinEngine {
 }
 
 impl PinyinEngine {
+    /// （`with_unigram` 已随 unigram 表并回 dict 移除，见 `lattice::score_node_inner`：
+    /// 词图打分改用词条自身的词典权重，引擎不再需要持有语言模型。）
     pub fn new(config: Config, dict: CachedDict) -> Self {
-        Self::with_unigram(config, dict, None)
-    }
-
-    pub fn with_unigram(
-        config: Config,
-        dict: CachedDict,
-        unigram: Option<Arc<dyn UnigramLookup>>,
-    ) -> Self {
         Self {
             config,
             dict,
@@ -417,7 +408,6 @@ impl PinyinEngine {
             viterbi: ViterbiDecoder::new(),
             lattice_builder: LatticeBuilder::new(),
             fuzzy_config: FuzzyConfig::default(),
-            unigram,
             store_layers: None,
             char_pinyin_idx: OnceLock::new(),
             shuangpin: None,
@@ -1167,7 +1157,7 @@ impl Engine for PinyinEngine {
                 if c.is_fuzzy || c.is_prefix || c.code != completed {
                     continue;
                 }
-                let log_prob = lattice::score_node(&c.text, c.weight, self.unigram.as_deref());
+                let log_prob = lattice::score_node(&c.text, c.weight);
                 let log_offset =
                     (log_prob * 1000.0).clamp(-(SENTENCE_WEIGHT_BASE as f64), 0.0) as i32;
                 c.weight = c
@@ -1211,7 +1201,6 @@ impl Engine for PinyinEngine {
                 &seg_graph,
                 dict,
                 Some(&self.fuzzy_config),
-                self.unigram.as_deref(),
                 true,
             );
             let input_len = completed.len();
@@ -1320,19 +1309,13 @@ impl Engine for PinyinEngine {
             && !has_sep
         {
             let seg_graph = SegGraph::from_dag(&Dag::build(query, trie));
-            let mut lattice_nodes = self.lattice_builder.build(
-                query,
-                &seg_graph,
-                dict,
-                Some(&self.fuzzy_config),
-                self.unigram.as_deref(),
-                true,
-            );
+            let mut lattice_nodes =
+                self.lattice_builder
+                    .build(query, &seg_graph, dict, Some(&self.fuzzy_config), true);
             self.lattice_builder.add_partial_final_nodes(
                 query,
                 completed_len,
                 dict,
-                self.unigram.as_deref(),
                 &mut lattice_nodes,
             );
             let full_len = query.len();
@@ -1440,15 +1423,10 @@ impl Engine for PinyinEngine {
                 &graph,
                 dict,
                 Some(&self.fuzzy_config),
-                self.unigram.as_deref(),
                 false,
             );
-            self.lattice_builder.add_abbrev_nodes(
-                abbr_query,
-                dict,
-                self.unigram.as_deref(),
-                &mut lattice_nodes,
-            );
+            self.lattice_builder
+                .add_abbrev_nodes(abbr_query, dict, &mut lattice_nodes);
 
             let input_len = abbr_query.len();
             let mut lattice: Vec<Vec<WordNode>> = vec![Vec::new(); input_len + 1];
@@ -3790,10 +3768,15 @@ mod tests {
     /// 构造带单字词典的拼音引擎（供整句/Viterbi 相关测试使用）：
     /// 词典含 "ni"→"你"、"hao"→"好"，但无 "nihao"→"你好" 整词。
     /// 任何 "你好" 候选只能来自 Viterbi 整句路径。
+    /// ⚠️ 权重取 `cn_dicts` 的真实值（你 492791 / 好 124546），不要随手编：节点打分是
+    /// `ln(weight / DICT_TOTAL)`，各类闸门与惩罚常数都在真实权重分布上标定。原值 100 会让
+    /// 每个节点落到 -14.7，整句被质量闸门挡下 —— 测出的是另一个世界的行为。
+    /// （2026-08-08 之前 `score_node` 对无 unigram 的引擎走 `weight/100_000` 线性回退，
+    /// 与真实路径不在同一数轴，编造值因此「碰巧」可用。）
     fn engine_for_sentence_tests(config: Config) -> PinyinEngine {
         let mut raw = CodetableDict::empty();
-        raw.merge_single("ni".to_string(), "你".to_string(), 100, 0);
-        raw.merge_single("hao".to_string(), "好".to_string(), 100, 1);
+        raw.merge_single("ni".to_string(), "你".to_string(), 492_791, 0);
+        raw.merge_single("hao".to_string(), "好".to_string(), 124_546, 1);
         PinyinEngine::new(config, CachedDict::Memory(raw))
     }
 
@@ -3884,12 +3867,15 @@ mod tests {
         let mut raw = CodetableDict::empty();
         // 单字给高权重，确保 Viterbi 选「你+好」而非把某个 nihao 词条当单节点整句
         // （那样会走同文合并分支，压根不触发降级，测试就测空了）。
-        raw.merge_single("ni".to_string(), "你".to_string(), 100_000, 0);
-        raw.merge_single("hao".to_string(), "好".to_string(), 100_000, 1);
+        // ⚠️ 权重取真实量级，理由同 `demoted_sentence_still_precedes_ordinary_candidates`：
+        // 整句是概率**连乘**，编造的 (1e5, 1e5) vs 同码词 5000 会让 Viterbi 直接选同码词、
+        // 整句根本不产生。
+        raw.merge_single("ni".to_string(), "你".to_string(), 492_791, 0);
+        raw.merge_single("hao".to_string(), "好".to_string(), 124_546, 1);
         // 三个精确整词，权重并列且同为最大
-        raw.merge_single("nihao".to_string(), "拟好".to_string(), 5000, 2);
-        raw.merge_single("nihao".to_string(), "泥好".to_string(), 5000, 3);
-        raw.merge_single("nihao".to_string(), "尼好".to_string(), 5000, 4);
+        raw.merge_single("nihao".to_string(), "拟好".to_string(), 64, 2);
+        raw.merge_single("nihao".to_string(), "泥好".to_string(), 64, 3);
+        raw.merge_single("nihao".to_string(), "尼好".to_string(), 64, 4);
         let e = PinyinEngine::new(Config::default(), CachedDict::Memory(raw));
         let r = e.convert("nihao", 50).unwrap();
 
@@ -3911,7 +3897,10 @@ mod tests {
         let sc = &r.candidates[sent];
         assert!(sc.is_sentence, "「你好」应是合成整句");
         assert!(sc.is_sentence_demoted, "存在精确整词时整句须降级");
-        assert_eq!(sc.weight, 4999, "权重须为 max(5000) - 1");
+        // 64 = 上面三个同码精确整词的权重（取自 cn_dicts 的「拟好」真实值）。
+        // 写成 `64 - 1` 而非硬编码 63：本断言要守的是「降到 max(同码词) - 1」这个关系，
+        // 跟着构造走；写死数值会在下次调整夹具权重时变成一个无从追溯的魔数。
+        assert_eq!(sc.weight, 64 - 1, "权重须为 max(同码精确整词) - 1");
         for w in ["拟好", "泥好", "尼好"] {
             assert!(
                 pos(w) < sent,
@@ -3932,9 +3921,15 @@ mod tests {
     #[test]
     fn demoted_sentence_still_precedes_ordinary_candidates() {
         let mut raw = CodetableDict::empty();
-        raw.merge_single("ni".to_string(), "你".to_string(), 100_000, 0);
-        raw.merge_single("hao".to_string(), "好".to_string(), 100_000, 1);
-        raw.merge_single("nihao".to_string(), "拟好".to_string(), 5000, 2);
+        // ⚠️ 单字与「拟好」取 cn_dicts 真实权重。节点打分是 `ln(w / DICT_TOTAL)`，整句为各词
+        // **概率连乘**，故两字拼句天然弱于同码整词：编造的 (你 1e5, 好 1e5, 拟好 5000) 下
+        // P(拟好)=2.07e-5 远高于 P(你)·P(好)=1.7e-7，Viterbi 会直接选「拟好」而不产生
+        // 「你好」整句，本用例的前提就没了。真实权重下 P(你)·P(好)=1.05e-6 > P(拟好)=2.6e-7，
+        // 整句成立。（2026-08-08 前无 unigram 的引擎走 `weight/100_000` 线性相加，没有连乘
+        // 衰减、系统性偏好多词切分，编造值因此「碰巧」可用。）
+        raw.merge_single("ni".to_string(), "你".to_string(), 492_791, 0);
+        raw.merge_single("hao".to_string(), "好".to_string(), 124_546, 1);
+        raw.merge_single("nihao".to_string(), "拟好".to_string(), 64, 2);
         // 前缀补全（码比输入长）：权重顶到 2e9，仍应留在整句之后
         raw.merge_single(
             "nihaoma".to_string(),

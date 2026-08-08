@@ -5,7 +5,6 @@
 
 use crate::pinyin::dag::{MaskCheck, SegGraph};
 use crate::pinyin::fuzzy::{FuzzyConfig, FuzzyMatcher};
-use crate::pinyin::lm::UnigramLookup;
 use wind_dict::cached::CachedDict;
 
 /// 虚词集合（单字时轻微惩罚，对齐 Go functionWords）
@@ -130,13 +129,24 @@ pub(crate) const PARTIAL_FINAL_PENALTY: f64 = std::f64::consts::LN_2;
 /// 但真正可能赢下整句路径的只有高频字，故比 `ABBREV_NODE_LIMIT`(8) 略放宽即可。
 const PARTIAL_FINAL_NODE_LIMIT: usize = 12;
 
-/// 节点对数概率打分（对齐 Go lattice calcLogProb + 惩罚/加成）。
-/// 无 unigram 时回退到归一化词典权重。
+/// 词频归一化基准 —— **标定系数，非精确的词库总权重**，理由见 [`score_node_inner`]。
 ///
-/// 对 crate 内可见：`PinyinEngine::convert` 用它给「覆盖全部输入的词典精确整词」
+/// 取值 = 合并前 `unigram.txt` 的总频次（实测 242,154,693），使 99.95% 的词在这次合并前后
+/// `log_prob` **数值完全不变**。参照：`cn_dicts` 实测总权重 243,154,024，差 0.41%
+/// （差额全部来自 w=0 条目、纯 ASCII 词与多音合并，w=0 的权重和本就为 0）。
+///
+/// ⚠️ 它与 [`WORD_PENALTY`] 共同构成「每词固定罚」这一个旋钮（`Σ ln(f/T) = Σ ln(f) − n·ln T`），
+/// 换词库导致的漂移只等价于该罚值的微调（词库总权重 +50% 也只让每词罚变化 0.4，相对
+/// `WORD_PENALTY`=3.0 约 13%），故不必随词库精确浮动。
+pub(crate) const DICT_TOTAL: f64 = 242_154_693.0;
+
+/// 节点对数概率打分（对齐 Go lattice calcLogProb + 惩罚/加成）。
+///
+/// 基础分由词条自身的**词典权重**算出（见 [`score_node_inner`] 的长注释：为何不再查
+/// unigram）。对 crate 内可见：`PinyinEngine::convert` 用它给「覆盖全部输入的词典精确整词」
 /// 算单节点等价分，使其与 Viterbi 整句在同一量纲比较（见 mod.rs step 1.5）。
-pub(crate) fn score_node(word: &str, weight: i32, unigram: Option<&dyn UnigramLookup>) -> f64 {
-    score_node_inner(word, weight, unigram, true)
+pub(crate) fn score_node(word: &str, weight: i32) -> f64 {
+    score_node_inner(word, weight, true)
 }
 
 /// **尾部残码待定音节**专用打分：与 [`score_node`] 相同，但**不给单字虚词优待**。
@@ -154,43 +164,54 @@ pub(crate) fn score_node(word: &str, weight: i32, unigram: Option<&dyn UnigramLo
 /// [`score_node`] 内 `WORD_PENALTY` 处的长注释）。那个前提描述的是**整句内部**已经成形的
 /// 搭配。残码位是「用户打到一半的那个音节」——它是虚词的先验并不比实词高，语法黏着
 /// 无从谈起。**同一条加成，在两个位置的前提不同**，故按位置区分而非按词性区分。
-pub(crate) fn score_node_partial_final(
-    word: &str,
-    weight: i32,
-    unigram: Option<&dyn UnigramLookup>,
-) -> f64 {
-    score_node_inner(word, weight, unigram, false)
+pub(crate) fn score_node_partial_final(word: &str, weight: i32) -> f64 {
+    score_node_inner(word, weight, false)
 }
 
 /// `function_word_credit`：是否给单字虚词优待，见 [`score_node_partial_final`]。
-fn score_node_inner(
-    word: &str,
-    weight: i32,
-    unigram: Option<&dyn UnigramLookup>,
-    function_word_credit: bool,
-) -> f64 {
+fn score_node_inner(word: &str, weight: i32, function_word_credit: bool) -> f64 {
     const SINGLE_CHAR_PENALTY: f64 = -3.0;
     const FUNCTION_WORD_BONUS: f64 = 2.0; // 虚词加成（Go 原名 functionWordPenalty，值为正）
     const VERB_PARTICLE_PENALTY: f64 = -1.0;
     const BASE_CONTENT_WORD_BONUS: f64 = 3.0;
-    const CHAR_BASED_PENALTY: f64 = -2.0; // 多字 OOV 用字符平均估算时的惩罚（对齐 Go）
     const LOG_PROB_MIN: f64 = -15.0;
     const LOG_PROB_RANGE: f64 = 12.0;
 
     let chars: Vec<char> = word.chars().collect();
     let char_count = chars.len();
 
-    let Some(ug) = unigram else {
-        // 无 unigram：用词典权重归一化（与 Go calcLogProb 的 nil 分支一致）
-        return weight as f64 / 100_000.0;
-    };
-
-    // 基础 logProb：单字或在 unigram 中的词直接取；多字 OOV 用字符平均 + 惩罚，
-    // 避免高频字组合（如"接了"）虚高碾压有真实词频的词（如"和解"）。
-    let mut log_prob = if char_count <= 1 || ug.contains(word) {
-        ug.log_prob(word)
+    // 基础 logProb 直接由**该词条自己的**词典权重算出，不再查 unigram 表。
+    //
+    // ## 为什么不查 unigram（2026-08-08 合并）
+    //
+    // unigram.txt 由 `gen_unigram` 从**同一批 cn_dicts** 生成，实测 608,446/608,754
+    // (99.95%) 的取值与 dict weight 完全相等、缺失 0 条 —— 它是一份副本，不是独立数据。
+    // 而剩下的 0.05%（308 条）是**副本引入的缺陷**：`gen_unigram` 按词去重时取 `max`，
+    // 于是多音字的冷僻读音被按常见读音计价：
+    //
+    //   说(shui) 真实 w=4  → 按 267,892 计价（虚高 66,973 倍）
+    //   了(liao) 真实 w=51 → 按 1,758,342 计价（虚高 34,477 倍）
+    //
+    // 而调用方（`LatticeBuilder::build`）手上的 `hit.weight` 正是**该读音**的真实权重。
+    // 对齐 librime：`dict_compiler.cc:257` 编译期 `log(w > 0 ? w : DBL_EPSILON)`，词图打分
+    // 直接用词条自带 weight，**没有独立的 unigram 表**。（fcitx5 确有第二个数据源，但那是
+    // 独立语料训练的 KenLM —— 提供词典没有的信息，与本副本性质不同。）
+    //
+    // ⚠️ [`DICT_TOTAL`] 不是精确的词库总权重，而是**标定系数**：整句分
+    // `Σ ln(freq_i/TOTAL) = Σ ln(freq_i) − n·ln(TOTAL)`，其中 `−n·ln(TOTAL)` 与
+    // `WORD_PENALTY` 的 `−n×3.0` 是同一种「每词固定罚」。二者共同构成一个已被实测标定的
+    // 旋钮，故 TOTAL 无需随词库精确浮动；取当前值是为了让 99.95% 的词 log_prob **数值不变**，
+    // 把改动的扰动面压到最小。
+    let mut log_prob = if weight > 0 {
+        (weight as f64 / DICT_TOTAL).ln()
     } else {
-        ug.char_based_score(word) + CHAR_BASED_PENALTY
+        // w ≤ 0 = 词库对「存疑 / 非标准读音」的标记（如 那→ne 方言读法）。等价于「频次 0.5」，
+        // 与 librime 用 `DBL_EPSILON` 让这类条目排不上去同一思路。
+        //
+        // 旧实现是「各字平均(char_based_score) + CHAR_BASED_PENALTY，再减 10.0」，实测
+        // 「种花人」为 −20.29，本式为 −19.99，**数值连续**；且不再依赖各字频率，
+        // 由高频字组成的存疑词不会再借「各字平均」拿到虚高基础分。
+        (0.5 / DICT_TOTAL).ln()
     };
 
     if char_count == 1 {
@@ -206,17 +227,12 @@ fn score_node_inner(
             .unwrap_or(false)
         {
             log_prob += VERB_PARTICLE_PENALTY;
-        } else if ug.contains(word) {
+        } else if weight > 0 {
+            // 原判据是 `ug.contains(word)`（词是否在 unigram 表内）。二者等价：
+            // `gen_unigram` 只过滤 `freq<=0` 与纯 ASCII 词 ⇒ 凡 weight>0 的中文词都在表内。
             let freq_factor = ((log_prob - LOG_PROB_MIN) / LOG_PROB_RANGE).clamp(0.0, 1.0);
             log_prob += BASE_CONTENT_WORD_BONUS * (char_count as f64).sqrt() * freq_factor;
         }
-    }
-    // Weight ≤ 0 = 字典标记的非标准读音映射（如 那→ne 方言读法 w=0）。其 unigram
-    // 高频不应凌驾字典的显式判断——否则 Viterbi 会在 ne 音节选 那 而非 呢(w=262461)。
-    // -10.0 足够压过典型虚词-实词间的 unigram 差距（~2-8），又留足余量使正确
-    // 但低频的单字（w>0 正常条目）不被误伤。
-    if weight <= 0 {
-        log_prob -= 10.0;
     }
     // Phase 4：每词固定罚。Viterbi 的路径分是各节点 log_prob 之和，故「每节点减 W」
     // 等价于「按路径词数罚 k·W」——把低频词打碎成两个高频片段不再免费。
@@ -298,7 +314,6 @@ impl LatticeBuilder {
         graph: &SegGraph,
         dict: &CachedDict,
         fuzzy_config: Option<&FuzzyConfig>,
-        unigram: Option<&dyn UnigramLookup>,
         require_reachable: bool,
     ) -> Vec<Vec<LatticeNode>> {
         let input_len = input.len();
@@ -334,7 +349,7 @@ impl LatticeBuilder {
                         },
                         MaskCheck::Reject => continue,
                     };
-                    let log_prob = score_node(&hit.text, hit.weight, unigram)
+                    let log_prob = score_node(&hit.text, hit.weight)
                         - AMBIGUOUS_PENALTY * graph.ambiguous_count(p, q, &offsets) as f64;
                     nodes[q].push(LatticeNode {
                         start: p,
@@ -378,7 +393,7 @@ impl LatticeBuilder {
                             }
                             // 模糊命中同样按图上那条标注路径计歧义罚：惩罚是**切分**的
                             // 属性（该路径是否踩在歧义接缝上），与词条来源无关。
-                            let log_prob = score_node(text, *weight, unigram)
+                            let log_prob = score_node(text, *weight)
                                 - 0.5 // 模糊匹配轻微惩罚
                                 - AMBIGUOUS_PENALTY * graph.ambiguous_count(p, q, &offsets) as f64;
                             nodes[q].push(LatticeNode {
@@ -421,13 +436,7 @@ impl LatticeBuilder {
     ///
     /// ⚠️ `input` 必须是**原始击键串**。双拼下 `input` 是转换后的全拼、与击键不同域，
     /// 简拼判据会全部失配（文档 §5 约束 4），故调用方须在双拼下跳过本方法。
-    pub fn add_abbrev_nodes(
-        &self,
-        input: &str,
-        dict: &CachedDict,
-        unigram: Option<&dyn UnigramLookup>,
-        nodes: &mut [Vec<LatticeNode>],
-    ) {
+    pub fn add_abbrev_nodes(&self, input: &str, dict: &CachedDict, nodes: &mut [Vec<LatticeNode>]) {
         let input_len = input.len();
         let bytes = input.as_bytes();
         for p in 0..input_len {
@@ -455,8 +464,8 @@ impl LatticeBuilder {
                         if nodes[q].iter().any(|n| n.word == hit.text && n.start == p) {
                             continue;
                         }
-                        let log_prob = score_node(&hit.text, hit.weight, unigram)
-                            - ABBREV_NODE_PENALTY * span as f64;
+                        let log_prob =
+                            score_node(&hit.text, hit.weight) - ABBREV_NODE_PENALTY * span as f64;
                         nodes[q].push(LatticeNode {
                             start: p,
                             end: q,
@@ -506,7 +515,6 @@ impl LatticeBuilder {
         input: &str,
         completed_len: usize,
         dict: &CachedDict,
-        unigram: Option<&dyn UnigramLookup>,
         nodes: &mut [Vec<LatticeNode>],
     ) {
         let input_len = input.len();
@@ -534,8 +542,7 @@ impl LatticeBuilder {
             }
             // ⚠️ 用 `score_node_partial_final` 而非 `score_node`：残码位不给虚词优待，
             // 否则「让」「们」这类虚词凭 8.0 的量级差碾压「人」「吗」。见该函数文档。
-            let log_prob =
-                score_node_partial_final(&hit.text, hit.weight, unigram) - PARTIAL_FINAL_PENALTY;
+            let log_prob = score_node_partial_final(&hit.text, hit.weight) - PARTIAL_FINAL_PENALTY;
             nodes[input_len].push(LatticeNode {
                 start: completed_len,
                 end: input_len,
