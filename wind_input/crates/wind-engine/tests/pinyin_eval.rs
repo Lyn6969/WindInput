@@ -224,23 +224,19 @@ fn read_all_dicts(dir: &Path) -> Vec<(String, String, u64)> {
     out
 }
 
-fn read_unigram(path: &Path) -> HashMap<String, u64> {
-    let mut m = HashMap::new();
-    let Ok(raw) = std::fs::read_to_string(path) else {
-        return m;
-    };
-    for line in raw.lines() {
-        if line.is_empty() || line.starts_with('#') {
-            continue;
-        }
-        let mut it = line.split('\t');
-        if let (Some(w), Some(f)) = (it.next(), it.next()) {
-            if let Ok(f) = f.trim().parse::<u64>() {
-                m.entry(w.to_string())
-                    .and_modify(|v| *v = (*v).max(f))
-                    .or_insert(f);
-            }
-        }
+/// 词频表：就地从已读入的词库条目汇总，同一词被多库收录时**取最高频次**
+/// （与 `gen_unigram` 的口径一致，理由见该工具头部：累加等于重复计数）。
+///
+/// 早前读 `schemas/pinyin/unigram.txt`。该文件已不再随 `data/` 分发——引擎的词图打分
+/// 改用词条自身的词典权重，unigram 只剩 `gen_dict` 一个消费者、留在 `.cache/`。
+/// 就地汇总既与那份产物同源，又免了「文件缺失 → 空表 → 抽样分层静默失效、指标照出」
+/// 这种最难发现的退化。
+fn collect_word_freqs(raw: &[(String, String, u64)]) -> HashMap<String, u64> {
+    let mut m: HashMap<String, u64> = HashMap::new();
+    for (text, _code, weight) in raw {
+        m.entry(text.clone())
+            .and_modify(|v| *v = (*v).max(*weight))
+            .or_insert(*weight);
     }
     m
 }
@@ -333,8 +329,8 @@ fn build_mixed_samples(
     // 「达拉特旗」+「半道儿」这种没人会打的串，拿它调阈值会把参数调偏——被度量的场景
     // 与样本分布不匹配时，指标越精确越误导。
     //
-    // 判据取 unigram 词频前 1/3（须在语言模型里，`unigram > 0`）：整句解码本就靠 unigram
-    // 打分，模型里没有的词无论如何都拼不出整句，留在池里只会把指标压成噪声。
+    // 判据取词频前 1/3（须 `unigram > 0`）：整句解码就是靠这份词频打分，权重为 0 的词
+    // 无论如何都拼不出整句，留在池里只会把指标压成噪声。
     let mut common: Vec<&Sample> = pool.iter().filter(|s| s.unigram > 0).collect();
     common.sort_by(|a, b| b.unigram.cmp(&a.unigram).then_with(|| a.text.cmp(&b.text)));
     common.truncate((common.len() / 3).max(1));
@@ -409,7 +405,7 @@ fn build_mixed_samples(
 
 // ---------------------------------------------------------------- 抽样
 
-/// 按 unigram 词频分三层等量抽样，保证不全是低频词。
+/// 按词频分三层等量抽样，保证不全是低频词。
 fn stratified_sample(mut pool: Vec<Sample>, n: usize, seed: u64) -> Vec<Sample> {
     if pool.len() <= n {
         return pool;
@@ -608,7 +604,7 @@ fn pinyin_eval_report() {
     // ---- 1. 生成评测集
     let t_gen = Instant::now();
     let raw = read_all_dicts(&dir);
-    let unigram = read_unigram(&dir.join("schemas/pinyin/unigram.txt"));
+    let unigram = collect_word_freqs(&raw);
 
     let trie = SyllableTrie::new();
     let mut reject: HashMap<&'static str, usize> = HashMap::new();
@@ -994,7 +990,7 @@ fn pinyin_eval_class_census() {
         return;
     };
     let raw = read_all_dicts(&dir);
-    let unigram = read_unigram(&dir.join("schemas/pinyin/unigram.txt"));
+    let unigram = collect_word_freqs(&raw);
 
     let trie = SyllableTrie::new();
     let mut reject = HashMap::new();
