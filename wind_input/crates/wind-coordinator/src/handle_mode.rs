@@ -846,29 +846,16 @@ impl Coordinator {
                 Some((full, short))
             }
             ModeKind::Special(i) => {
-                // 瘦身条目只写 schema + trigger_keys：name/short_name 缺省时从被引用方案文件派生
-                // （schema.name / schema.icon_label），避免与方案文件重复。
-                let (name, short_name, schema) = {
-                    let rt = self.rt();
-                    let m = rt.config.schema.special_modes.get(i as usize)?;
-                    (m.name.clone(), m.short_name.clone(), m.schema.clone())
-                };
-                let full = if name.is_empty() {
-                    self.engine_mgr.schema_name(&schema)
+                // 实例即方案：显示名/短称直接是方案文件的 [schema] name / icon_label。
+                // 原先 special_modes 条目里另有一份 name/short_name、缺省时才回落方案文件——
+                // 那份重复随数组一并消失，这里不再有「两个来源取其一」的分支。
+                let e = self.engine_mgr.overlay_modes().get(i as usize)?.clone();
+                let short = if e.icon_label.is_empty() {
+                    Self::short_or_first("", &e.name)
                 } else {
-                    name
+                    e.icon_label
                 };
-                let short = if short_name.is_empty() {
-                    let icon = self.engine_mgr.schema_icon_label(&schema);
-                    if icon.is_empty() {
-                        Self::short_or_first("", &full)
-                    } else {
-                        icon
-                    }
-                } else {
-                    Self::short_or_first(&short_name, &full)
-                };
-                Some((full, short))
+                Some((e.name, short))
             }
         }
     }

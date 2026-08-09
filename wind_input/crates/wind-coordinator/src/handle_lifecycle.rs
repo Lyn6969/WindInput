@@ -619,6 +619,9 @@ impl Coordinator {
         state.rewind = None;
         state.special_buffer.clear();
         state.special_cursor = 0;
+        // `[overlay]` 段快照随模式一并丢弃。消费点都先判 `active == Special`，残留本不会
+        // 被读到——但那条「先判 active」是消费点的实现细节，不是这里可以依赖的契约。
+        state.overlay_spec = None;
         state.mix_buffer.clear();
         state.mix_cursor = 0;
         // 清理可能残留的组合显示（临时拼音/快捷输入会产生候选与 preedit）

@@ -27,17 +27,12 @@ impl Coordinator {
         }
     }
 
-    /// 按 id 在 `schema.special_modes` 配置序中定位下标（与 `match_special_trigger` 的 u8 下标语义
-    /// 一致，最多 256 项）。供直达热键 `enter_special:<id>` 分发定位；未找到返回 None。
+    /// 按**方案 id** 在 overlay 注册表中定位下标（与 `match_special_trigger` 的 u8 下标语义
+    /// 一致）。供直达热键 `enter_special:<id>` 分发定位；未找到返回 None。
+    ///
+    /// 身份即方案 id：`special:<id>` 里的 `<id>` 现在就是方案文件名，不再是实例别名。
     pub(crate) fn special_mode_idx(&self, id: &str) -> Option<u8> {
-        self.rt()
-            .config
-            .schema
-            .special_modes
-            .iter()
-            .take(u8::MAX as usize + 1)
-            .position(|m| m.effective_id() == id)
-            .map(|i| i as u8)
+        self.engine_mgr.overlay_index_of(id)
     }
 
     /// 顶屏当前普通输入的半成品（复用 `take_committed` + 高亮候选）并进入特殊模式，
@@ -84,25 +79,25 @@ impl Coordinator {
         }
     }
 
-    /// 当前特殊模式是否开启「进入即展示候选」（`show_all_on_enter`；按 special_id 定位配置）。
+    /// 当前特殊模式是否开启「进入即展示候选」（`[overlay] show_all_on_enter`）。
+    /// 取进入时的快照，不查注册表——理由见 `State::overlay_spec`。
     fn special_mode_show_all(&self, state: &State) -> bool {
-        self.rt()
-            .config
-            .schema
-            .special_modes
-            .get(state.special_id as usize)
-            .map(|m| m.show_all_on_enter)
+        state
+            .overlay_spec
+            .as_ref()
+            .map(|o| o.show_all_on_enter)
             .unwrap_or(false)
     }
 
-    /// 特殊模式引用的方案 id（features.special_modes[idx].schema）。
+    /// 特殊模式对应的方案 id（= overlay 注册表该下标的方案自身）。
+    ///
+    /// 原先是 `special_modes[idx].schema`——一个指向别处的引用字段；现在实例即方案，
+    /// 这个「引用」退化成自指，故直接取注册表条目的 `schema_id`。
     pub(crate) fn special_schema(&self, idx: u8) -> Option<String> {
-        self.rt()
-            .config
-            .schema
-            .special_modes
+        self.engine_mgr
+            .overlay_modes()
             .get(idx as usize)
-            .map(|m| m.schema.clone())
+            .map(|e| e.schema_id.clone())
             .filter(|s| !s.is_empty())
     }
 
@@ -117,6 +112,12 @@ impl Coordinator {
         state.candidates.clear();
         state.active = Some(ModeKind::Special(idx));
         state.special_id = idx;
+        // `[overlay]` 段快照：布局/注释/进入即展示三处都取它，见 `State::overlay_spec`。
+        state.overlay_spec = self
+            .engine_mgr
+            .overlay_modes()
+            .get(idx as usize)
+            .map(|e| e.spec.clone());
         state.special_buffer.clear();
         state.special_cursor = 0;
         // 显示态前缀（进入键符号，如 "\"；经 z_key_action 进入时为 "z"）：只显示不消费。
@@ -136,6 +137,7 @@ impl Coordinator {
     /// 退出特殊模式并清空相关状态（码表缓存保留供复用）。
     pub(crate) fn exit_special_mode(&self, state: &mut State) {
         state.active = None;
+        state.overlay_spec = None;
         state.special_buffer.clear();
         state.special_cursor = 0;
         state.special_prefix.clear();
@@ -506,41 +508,85 @@ mod tests {
     use std::sync::Arc;
     use wind_candidate::Candidate;
     use wind_config::Config;
-    use wind_config::config::SpecialModeConfig;
     use wind_store::Store;
 
+    /// 造一个含若干 overlay 方案的 data_dir。
+    ///
+    /// 实例集合的真相源已是**方案文件目录**（带 `[overlay]` 段者入表），不再是
+    /// `config.schema.special_modes` 数组——故装置从「造 Config」改成「造方案文件」。
+    fn data_dir_with_overlays(tag: &str, ids: &[&str]) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("wind_special_hk_data_{tag}"));
+        let _ = std::fs::remove_dir_all(&dir);
+        let schemas = dir.join("schemas");
+        std::fs::create_dir_all(&schemas).unwrap();
+        for id in ids {
+            std::fs::write(
+                schemas.join(format!("{id}.schema.toml")),
+                format!(
+                    "[schema]\nid = \"{id}\"\nname = \"{id}\"\nhidden = true\n\
+                     [engine]\ntype = \"codetable\"\n\
+                     [overlay]\nkind = \"special\"\n"
+                ),
+            )
+            .unwrap();
+        }
+        dir
+    }
+
     fn coord_with(tag: &str, cfg: Config) -> Arc<Coordinator> {
+        coord_with_overlays(tag, cfg, &[])
+    }
+
+    fn coord_with_overlays(tag: &str, cfg: Config, ids: &[&str]) -> Arc<Coordinator> {
         let path = std::env::temp_dir().join(format!("wind_special_hk_{tag}.redb"));
         let _ = std::fs::remove_file(&path);
         let store = Arc::new(Store::open(&path).unwrap());
-        Coordinator::new_headless_with_store(cfg, None, store)
+        let dir = (!ids.is_empty()).then(|| data_dir_with_overlays(tag, ids));
+        Coordinator::new_headless_with_store(cfg, dir.as_deref(), store)
     }
 
-    fn cfg_with_modes(ids: &[&str]) -> Config {
-        let mut cfg = Config::default();
-        cfg.schema.special_modes = ids
-            .iter()
-            .map(|id| SpecialModeConfig {
-                id: (*id).to_string(),
-                ..Default::default()
-            })
-            .collect();
-        cfg
-    }
-
+    /// id → 下标定位走 overlay 注册表（按方案 id 字典序），未知 id 返回 None。
+    ///
+    /// ⚠️ **只断言相对顺序，不断言绝对下标**：`installed_schemas` 会一并扫描
+    /// `Config::user_config_dir()/schemas`，开发机上那里可能装着真实的快符方案，
+    /// 绝对下标会随之平移。这不是测试将就，而是下标语义本身就是「注册表内的位次」。
     #[test]
-    fn special_mode_idx_locates_by_config_order() {
-        let c = coord_with("idx", cfg_with_modes(&["rare", "sym", "cjk"]));
-        assert_eq!(c.special_mode_idx("rare"), Some(0));
-        assert_eq!(c.special_mode_idx("sym"), Some(1));
-        assert_eq!(c.special_mode_idx("cjk"), Some(2));
+    fn special_mode_idx_locates_by_registry_order() {
+        let c = coord_with_overlays("idx", Config::default(), &["zz_c", "zz_a", "zz_b"]);
+        let (a, b, cc) = (
+            c.special_mode_idx("zz_a").expect("zz_a 应在表内"),
+            c.special_mode_idx("zz_b").expect("zz_b 应在表内"),
+            c.special_mode_idx("zz_c").expect("zz_c 应在表内"),
+        );
+        // 文件写入序是 c/a/b，注册表按 id 字典序 ⇒ a < b < c。这条同时证明顺序
+        // 不来自任何「配置顺序」——那正是本次改造要消除的东西。
+        assert!(a < b && b < cc, "应按 id 字典序：a={a} b={b} c={cc}");
         // 未知 id → None（分发点据此安全吞键，不 panic）
         assert_eq!(c.special_mode_idx("nope"), None);
     }
 
+    /// 进入模式时把 `[overlay]` 段快照进 `State`，退出时清掉。
+    ///
+    /// 快照是布局/注释/进入即展示三处的取值来源，见 `State::overlay_spec`。
+    #[test]
+    fn entering_snapshots_overlay_spec_and_exit_clears_it() {
+        let c = coord_with_overlays("snap", Config::default(), &["zz_snap"]);
+        let idx = c.special_mode_idx("zz_snap").expect("应在表内");
+        let mut st = c.state.lock().unwrap();
+        st.chinese_mode = true;
+        assert!(st.overlay_spec.is_none(), "进入前无快照");
+
+        c.enter_special_mode(&mut st, idx, 0);
+        let spec = st.overlay_spec.as_ref().expect("进入后应有快照");
+        assert_eq!(spec.kind, "special", "快照应取自方案文件的 [overlay] 段");
+
+        c.exit_special_mode(&mut st);
+        assert!(st.overlay_spec.is_none(), "退出后快照必须清掉");
+    }
+
     #[test]
     fn commit_and_enter_special_writes_no_guide_prefix() {
-        let c = coord_with("enter_empty", cfg_with_modes(&["rare"]));
+        let c = coord_with_overlays("enter_empty", Config::default(), &["zz_rare"]);
         let mut st = c.state.lock().unwrap();
         st.chinese_mode = true;
         // 空缓冲进入：无半成品可上屏 → 返回 UpdateComposition，组合区无引导符。
@@ -555,7 +601,7 @@ mod tests {
 
     #[test]
     fn commit_and_enter_special_commits_pending_candidate() {
-        let c = coord_with("enter_commit", cfg_with_modes(&["rare"]));
+        let c = coord_with_overlays("enter_commit", Config::default(), &["zz_rare"]);
         let mut st = c.state.lock().unwrap();
         st.chinese_mode = true;
         // 模拟普通输入半成品：编码 + 高亮候选。

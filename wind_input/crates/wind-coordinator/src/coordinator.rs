@@ -533,8 +533,19 @@ pub(crate) struct State {
     /// 特殊模式编码区光标（`special_buffer` 内字节偏移）。
     /// 注：Go 版特殊模式**不支持**光标（尾加尾删），此处随共享层一并补齐，不再留缺口。
     pub(crate) special_cursor: usize,
-    /// 当前特殊模式下标（= features.special_modes 索引；仅 active==Special 时有效）
+    /// 当前特殊模式下标（= `EngineManager::overlay_modes()` 注册表下标；仅 active==Special 时有效）
     pub(crate) special_id: u8,
+    /// 当前特殊模式的 `[overlay]` 段**快照**（进入时填、退出时清）。
+    ///
+    /// 快照而非每次查注册表，三个理由：
+    /// 1. `comment::template_for` 返回借用 `cfg` 的 `&str`（刻意不分配），临时 Vec 借不出来；
+    /// 2. 布局/注释取值在候选更新路径上，省掉每次的整表 clone；
+    /// 3. ★ 注册表按 id 排序，装一个新 overlay 方案会让其后方案的下标平移——快照让
+    ///    「模式进行中装了方案」不至于把当前模式的行为换成隔壁那个的。
+    ///
+    /// 这不是 `layout.rs` 反对的那种「进入时保存、退出时回放」：快照的是**只读配置**，
+    /// 随 `active = None` 自然失效，没有需要被回放的动作，声明式重算的性质不变。
+    pub(crate) overlay_spec: Option<wind_config::OverlaySpec>,
     /// 特殊模式显示态前缀（进入键符号，如 "\"；只显示不消费，组合区前缀，对齐临时拼音）
     pub(crate) special_prefix: String,
     /// 临时 mix 编码缓冲
@@ -1324,6 +1335,20 @@ impl Coordinator {
         data_dir: Option<&Path>,
         store: Arc<Store>,
     ) -> Arc<Self> {
+        Self::new_headless_with_store_override(config, data_dir, store, None)
+    }
+
+    /// 无头 + store + **指定方案 override 目录**（测试用）。
+    ///
+    /// 特殊模式的实例集合来自「带 `[overlay]` 段的已安装方案」，而测试不能往真实
+    /// `data/schemas` 里写方案文件。走 override 层即可：`read_schema` 会把它深合并进
+    /// 方案，效果等同该方案自带 `[overlay]` 段，同时保住真实词库不动。
+    pub fn new_headless_with_store_override(
+        config: Config,
+        data_dir: Option<&Path>,
+        store: Arc<Store>,
+        override_dir: Option<std::path::PathBuf>,
+    ) -> Arc<Self> {
         let (ui_tx, _rx) = std::sync::mpsc::channel();
         drop(_rx);
         let push_server = Arc::new(PushServer::new(PushConfig {
@@ -1337,7 +1362,7 @@ impl Coordinator {
             ui_tx,
             None,
             Some(store),
-            None,
+            override_dir,
         )
     }
 
@@ -1565,6 +1590,7 @@ impl Coordinator {
                 special_buffer: String::new(),
                 special_cursor: 0,
                 special_id: 0,
+                overlay_spec: None,
                 special_prefix: String::new(),
                 mix_buffer: String::new(),
                 mix_cursor: 0,

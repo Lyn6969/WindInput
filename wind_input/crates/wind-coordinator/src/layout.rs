@@ -17,7 +17,7 @@
 
 use crate::coordinator::{Coordinator, State};
 use crate::pipeline::ModeKind;
-use wind_config::{Config, LayoutIntent};
+use wind_config::{Config, LayoutIntent, OverlaySpec};
 use wind_ui::manager::UiCommand;
 
 /// 「模式 → 布局意图」映射。**唯一一处**把这层对应关系写死的地方——新增模式只加一行。
@@ -28,7 +28,16 @@ use wind_ui::manager::UiCommand;
 /// 注意 `add_word` **不在** `state.active` 里（它是独立的 `add_word_active` 标志），
 /// 所以「当前是什么模式」的判定必须把它一起收进来——这正是需要一个集中函数、
 /// 而不是各模式内部各判各的理由。
-pub(crate) fn intent_for(cfg: &Config, active: Option<ModeKind>, add_word: bool) -> LayoutIntent {
+///
+/// `overlay` = 当前特殊模式的 `[overlay]` 段快照（`State::overlay_spec`）。特殊模式的
+/// 配置住在方案文件而不是 `Config` 里，故它必须单独传入——保持本函数是纯函数，
+/// 测试直接造 `OverlaySpec` 即可，不必构造 `EngineManager`。
+pub(crate) fn intent_for(
+    cfg: &Config,
+    overlay: Option<&OverlaySpec>,
+    active: Option<ModeKind>,
+    add_word: bool,
+) -> LayoutIntent {
     if add_word {
         return cfg.input.add_word.candidate_layout;
     }
@@ -38,11 +47,7 @@ pub(crate) fn intent_for(cfg: &Config, active: Option<ModeKind>, add_word: bool)
             .mix_modes
             .get(i as usize)
             .map(|m| m.candidate_layout),
-        Some(ModeKind::Special(i)) => cfg
-            .schema
-            .special_modes
-            .get(i as usize)
-            .map(|m| m.candidate_layout),
+        Some(ModeKind::Special(_)) => overlay.map(|o| o.candidate_layout),
         Some(ModeKind::TempPinyin) => Some(cfg.input.temp_pinyin.candidate_layout),
         Some(ModeKind::TempEnglish) => Some(cfg.input.temp_english.candidate_layout),
         Some(ModeKind::Url) => Some(cfg.input.url.candidate_layout),
@@ -68,7 +73,12 @@ impl Coordinator {
     /// 当前生效的布局意图（[`intent_for`] 的取值包装）。
     pub(crate) fn layout_intent(&self, state: &State) -> LayoutIntent {
         let rt = self.rt();
-        intent_for(&rt.config, state.active, state.add_word_active)
+        intent_for(
+            &rt.config,
+            state.overlay_spec.as_ref(),
+            state.active,
+            state.add_word_active,
+        )
     }
 
     /// 期望的候选方向（true = 竖排）。
@@ -119,9 +129,12 @@ impl Coordinator {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use wind_config::config::{MixModeConfig, SpecialModeConfig};
+    use wind_config::config::MixModeConfig;
 
     /// 造一份把各模式意图都设成指定值的配置。
+    ///
+    /// **不含特殊模式**——它的意图住在方案文件的 `[overlay]` 段，由 [`overlay_with`]
+    /// 单独造出来经参数传入（见 `intent_for` 的 `overlay` 参数）。
     fn cfg_with(intent: LayoutIntent) -> Config {
         let mut c = Config::default();
         c.input.temp_pinyin.candidate_layout = intent;
@@ -132,11 +145,15 @@ mod tests {
             candidate_layout: intent,
             ..Default::default()
         }];
-        c.schema.special_modes = vec![SpecialModeConfig {
+        c
+    }
+
+    /// 造一份 `[overlay]` 段快照（= 特殊模式那一路的配置来源）。
+    fn overlay_with(intent: LayoutIntent) -> OverlaySpec {
+        OverlaySpec {
             candidate_layout: intent,
             ..Default::default()
-        }];
-        c
+        }
     }
 
     const MODES: &[ModeKind] = &[
@@ -163,7 +180,8 @@ mod tests {
                 (LayoutIntent::Horizontal, true, false), // ← 旧布尔表达不了这一格
             ] {
                 let cfg = cfg_with(intent);
-                let got = vertical_for(intent_for(&cfg, Some(mode), false), baseline);
+                let ovs = overlay_with(intent);
+                let got = vertical_for(intent_for(&cfg, Some(&ovs), Some(mode), false), baseline);
                 assert_eq!(
                     got, want,
                     "mode={mode:?} intent={intent:?} baseline={baseline} 应得 {want}"
@@ -176,9 +194,11 @@ mod tests {
     #[test]
     fn no_active_mode_follows_baseline() {
         let cfg = cfg_with(LayoutIntent::Vertical);
-        assert_eq!(intent_for(&cfg, None, false), LayoutIntent::Follow);
-        assert!(!vertical_for(intent_for(&cfg, None, false), false));
-        assert!(vertical_for(intent_for(&cfg, None, true), true));
+        let ovs = overlay_with(LayoutIntent::Vertical);
+        let ov = Some(&ovs);
+        assert_eq!(intent_for(&cfg, ov, None, false), LayoutIntent::Follow);
+        assert!(!vertical_for(intent_for(&cfg, ov, None, false), false));
+        assert!(vertical_for(intent_for(&cfg, ov, None, true), true));
     }
 
     /// 加词优先于底层模式：底层要横排，加词仍按加词的意图。
@@ -186,38 +206,60 @@ mod tests {
     fn add_word_outranks_active_mode() {
         let mut cfg = cfg_with(LayoutIntent::Horizontal);
         cfg.input.add_word.candidate_layout = LayoutIntent::Vertical;
+        let ovs = overlay_with(LayoutIntent::Horizontal);
+        let ov = Some(&ovs);
         for &mode in MODES {
             assert_eq!(
-                intent_for(&cfg, Some(mode), true),
+                intent_for(&cfg, ov, Some(mode), true),
                 LayoutIntent::Vertical,
                 "mode={mode:?} 下加词应优先"
             );
         }
         // 无底层模式时同样生效。
-        assert_eq!(intent_for(&cfg, None, true), LayoutIntent::Vertical);
+        assert_eq!(intent_for(&cfg, None, None, true), LayoutIntent::Vertical);
     }
 
-    /// 下标越界（热重载删掉了该实例）回落 Follow，不猜方向、不 panic。
+    /// mix 下标越界（热重载删掉了该实例）回落 Follow，不猜方向、不 panic。
+    /// 特殊模式侧的对应情形是**快照缺失**（该方案没有 `[overlay]` 段），同样回落。
     #[test]
     fn out_of_range_instance_falls_back_to_follow() {
         let cfg = cfg_with(LayoutIntent::Vertical);
         assert_eq!(
-            intent_for(&cfg, Some(ModeKind::Mix(9)), false),
+            intent_for(&cfg, None, Some(ModeKind::Mix(9)), false),
             LayoutIntent::Follow
         );
         assert_eq!(
-            intent_for(&cfg, Some(ModeKind::Special(9)), false),
-            LayoutIntent::Follow
+            intent_for(&cfg, None, Some(ModeKind::Special(0)), false),
+            LayoutIntent::Follow,
+            "无 [overlay] 快照时回落跟随全局"
         );
         // 回落后仍跟随基线两个方向。
         assert!(vertical_for(
-            intent_for(&cfg, Some(ModeKind::Mix(9)), false),
+            intent_for(&cfg, None, Some(ModeKind::Mix(9)), false),
             true
         ));
         assert!(!vertical_for(
-            intent_for(&cfg, Some(ModeKind::Mix(9)), false),
+            intent_for(&cfg, None, Some(ModeKind::Mix(9)), false),
             false
         ));
+    }
+
+    /// 特殊模式的意图**只来自 `[overlay]` 快照**，与下标、与 `Config` 都无关。
+    ///
+    /// 这条钉住的是本次下沉的核心：配置从 config.toml 的数组搬到了方案文件，
+    /// 若有人把取值改回读 `cfg`，这里会红。
+    #[test]
+    fn special_mode_intent_comes_from_overlay_spec() {
+        // cfg 里所有模式都是 Horizontal，快照是 Vertical——取值必须听快照的。
+        let cfg = cfg_with(LayoutIntent::Horizontal);
+        let ovs = overlay_with(LayoutIntent::Vertical);
+        for idx in [0u8, 9u8] {
+            assert_eq!(
+                intent_for(&cfg, Some(&ovs), Some(ModeKind::Special(idx)), false),
+                LayoutIntent::Vertical,
+                "下标 {idx} 不参与取值"
+            );
+        }
     }
 
     /// 每个模式只读自己的配置项，不串味（防止映射表复制粘贴写错字段）。
@@ -225,8 +267,10 @@ mod tests {
     fn each_mode_reads_its_own_key() {
         let mut cfg = cfg_with(LayoutIntent::Follow);
         cfg.input.temp_english.candidate_layout = LayoutIntent::Horizontal;
+        let ovs = overlay_with(LayoutIntent::Follow);
+        let ov = Some(&ovs);
         assert_eq!(
-            intent_for(&cfg, Some(ModeKind::TempEnglish), false),
+            intent_for(&cfg, ov, Some(ModeKind::TempEnglish), false),
             LayoutIntent::Horizontal
         );
         for &mode in MODES {
@@ -234,7 +278,7 @@ mod tests {
                 continue;
             }
             assert_eq!(
-                intent_for(&cfg, Some(mode), false),
+                intent_for(&cfg, ov, Some(mode), false),
                 LayoutIntent::Follow,
                 "改临英不应影响 {mode:?}"
             );
@@ -248,7 +292,7 @@ mod tests {
     fn builtin_quick_mix_defaults_to_vertical() {
         let cfg = Config::default();
         assert!(
-            vertical_for(intent_for(&cfg, Some(ModeKind::Mix(0)), false), false),
+            vertical_for(intent_for(&cfg, None, Some(ModeKind::Mix(0)), false), false),
             "内置 quick_mix 应出厂竖排"
         );
     }
@@ -257,6 +301,6 @@ mod tests {
     #[test]
     fn add_word_defaults_to_vertical() {
         let cfg = Config::default();
-        assert!(vertical_for(intent_for(&cfg, None, true), false));
+        assert!(vertical_for(intent_for(&cfg, None, None, true), false));
     }
 }

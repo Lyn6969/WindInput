@@ -55,8 +55,8 @@
 use crate::coordinator::State;
 use crate::pipeline::ModeKind;
 use wind_candidate::{Candidate, CandidateSource};
-use wind_config::Config;
 use wind_config::config::CommentTemplateOverride;
+use wind_config::{Config, OverlaySpec};
 
 /// 一次变量引用：名字 + 可选参数（`${chaizi_all:／}` 的 `／`）。
 ///
@@ -348,8 +348,13 @@ fn pinyin_text(
 /// 但**刻意不含 `add_word`**：加词面板走 `show_add_word_preview` 独立绘制路径，
 /// 根本不经过 `comment_for`，给它加键只会是永远不生效的死配置。
 /// 这两个函数的模式集合不同不是遗漏——布局要管所有会显示候选窗的路径，注释只管渲染注释的那条。
+///
+/// `overlay` = 当前特殊模式的 `[overlay]` 段快照（`State::overlay_spec`）。它与 `cfg`
+/// 共用生命周期 `'a`，因为返回值可能借用其中任一方——快照存在 `State` 里正是为了让
+/// 这个借用有处可依：特殊模式的配置已下沉到方案文件，每次现查注册表拿到的是临时值。
 pub(crate) fn template_for<'a>(
     cfg: &'a Config,
+    overlay: Option<&'a OverlaySpec>,
     active: Option<ModeKind>,
     vertical: bool,
 ) -> Option<&'a str> {
@@ -362,11 +367,9 @@ pub(crate) fn template_for<'a>(
             .mix_modes
             .get(i as usize)
             .and_then(|m| pick(&m.comment_template_vertical, &m.comment_template_horizontal)),
-        Some(ModeKind::Special(i)) => cfg
-            .schema
-            .special_modes
-            .get(i as usize)
-            .and_then(|m| pick(&m.comment_template_vertical, &m.comment_template_horizontal)),
+        Some(ModeKind::Special(_)) => {
+            overlay.and_then(|o| pick(&o.comment_template_vertical, &o.comment_template_horizontal))
+        }
         Some(ModeKind::TempPinyin) => pick(
             &cfg.input.temp_pinyin.comment_template_vertical,
             &cfg.input.temp_pinyin.comment_template_horizontal,
@@ -390,10 +393,10 @@ impl crate::coordinator::Coordinator {
     pub(crate) fn comment_template_for<'a>(
         &self,
         cfg: &'a Config,
-        state: &State,
+        state: &'a State,
         vertical: bool,
     ) -> &'a str {
-        template_for(cfg, state.active, vertical)
+        template_for(cfg, state.overlay_spec.as_ref(), state.active, vertical)
             .unwrap_or_else(|| cfg.ui.candidate.comment_template(vertical))
     }
 
@@ -477,7 +480,7 @@ impl crate::coordinator::Coordinator {
 #[cfg(test)]
 mod mode_template_tests {
     use super::*;
-    use wind_config::config::{MixModeConfig, SpecialModeConfig};
+    use wind_config::config::MixModeConfig;
 
     /// 全局两份模板设成可辨认的值，模式级一律留空（跟随）。
     fn base_cfg() -> Config {
@@ -497,8 +500,8 @@ mod mode_template_tests {
             Some(ModeKind::TempPinyin),
             Some(ModeKind::Url),
         ] {
-            assert_eq!(template_for(&c, active, true), None, "{active:?} 竖");
-            assert_eq!(template_for(&c, active, false), None, "{active:?} 横");
+            assert_eq!(template_for(&c, None, active, true), None, "{active:?} 竖");
+            assert_eq!(template_for(&c, None, active, false), None, "{active:?} 横");
         }
     }
 
@@ -511,12 +514,15 @@ mod mode_template_tests {
         let mut c = base_cfg();
         c.input.temp_pinyin.comment_template_vertical = Some(String::new());
         assert_eq!(
-            template_for(&c, Some(ModeKind::TempPinyin), true),
+            template_for(&c, None, Some(ModeKind::TempPinyin), true),
             Some(""),
             "空串必须原样返回（= 本模式不显示），不能退化成 None（= 跟随全局）"
         );
         // 同模式的另一方向未配 → 仍跟随
-        assert_eq!(template_for(&c, Some(ModeKind::TempPinyin), false), None);
+        assert_eq!(
+            template_for(&c, None, Some(ModeKind::TempPinyin), false),
+            None
+        );
     }
 
     /// ★ 横竖两个方向各自独立三态：只覆盖竖排时，横排仍跟随全局。
@@ -525,11 +531,11 @@ mod mode_template_tests {
         let mut c = base_cfg();
         c.input.temp_english.comment_template_vertical = Some("${dict}".into());
         assert_eq!(
-            template_for(&c, Some(ModeKind::TempEnglish), true),
+            template_for(&c, None, Some(ModeKind::TempEnglish), true),
             Some("${dict}")
         );
         assert_eq!(
-            template_for(&c, Some(ModeKind::TempEnglish), false),
+            template_for(&c, None, Some(ModeKind::TempEnglish), false),
             None,
             "只配了竖排，横排必须仍跟随全局"
         );
@@ -540,15 +546,15 @@ mod mode_template_tests {
     fn override_is_scoped_to_its_mode() {
         let mut c = base_cfg();
         c.input.temp_english.comment_template_vertical = Some("${dict}".into());
-        assert_eq!(template_for(&c, None, true), None, "无模式不受影响");
+        assert_eq!(template_for(&c, None, None, true), None, "无模式不受影响");
         assert_eq!(
-            template_for(&c, Some(ModeKind::TempPinyin), true),
+            template_for(&c, None, Some(ModeKind::TempPinyin), true),
             None,
             "别的模式不受影响"
         );
     }
 
-    /// 实例型模式（mix / special）按下标各自独立。
+    /// mix 实例按下标各自独立（其配置仍在 `Config` 里）。
     #[test]
     fn instance_modes_are_per_index() {
         let mut c = base_cfg();
@@ -559,29 +565,49 @@ mod mode_template_tests {
             },
             MixModeConfig::default(),
         ];
-        c.schema.special_modes = vec![SpecialModeConfig {
-            comment_template_horizontal: Some("快符用".into()),
-            ..Default::default()
-        }];
         assert_eq!(
-            template_for(&c, Some(ModeKind::Mix(0)), true),
+            template_for(&c, None, Some(ModeKind::Mix(0)), true),
             Some("快捷用")
         );
-        assert_eq!(template_for(&c, Some(ModeKind::Mix(1)), true), None);
-        assert_eq!(
-            template_for(&c, Some(ModeKind::Special(0)), false),
-            Some("快符用")
-        );
-        assert_eq!(template_for(&c, Some(ModeKind::Special(0)), true), None);
+        assert_eq!(template_for(&c, None, Some(ModeKind::Mix(1)), true), None);
     }
 
-    /// 下标越界（热重载删掉了该实例）回落跟随全局，不 panic。
-    /// 与 `layout::intent_for` 的同名保证一致。
+    /// 特殊模式的模板来自**方案文件的 `[overlay]` 段**（经 `State::overlay_spec` 快照传入），
+    /// 不再来自 `Config`。下标只用于判「是不是 Special」，取值一律走 overlay 参数。
+    #[test]
+    fn special_mode_template_comes_from_overlay_spec() {
+        let c = base_cfg();
+        let ov = OverlaySpec {
+            comment_template_horizontal: Some("快符用".into()),
+            ..Default::default()
+        };
+        assert_eq!(
+            template_for(&c, Some(&ov), Some(ModeKind::Special(0)), false),
+            Some("快符用")
+        );
+        assert_eq!(
+            template_for(&c, Some(&ov), Some(ModeKind::Special(0)), true),
+            None,
+            "只配了横排，竖排仍跟随全局"
+        );
+        // 下标不参与取值：换个下标、同一份快照，结果不变。
+        assert_eq!(
+            template_for(&c, Some(&ov), Some(ModeKind::Special(9)), false),
+            Some("快符用")
+        );
+    }
+
+    /// 没有快照（未进入特殊模式 / 该方案无 `[overlay]` 段）回落跟随全局，不 panic。
+    /// mix 侧的下标越界（热重载删掉了该实例）同样回落。
     #[test]
     fn out_of_range_index_falls_back_to_follow() {
         let c = base_cfg();
-        assert_eq!(template_for(&c, Some(ModeKind::Mix(7)), true), None);
-        assert_eq!(template_for(&c, Some(ModeKind::Special(7)), true), None);
+        assert_eq!(template_for(&c, None, Some(ModeKind::Mix(7)), true), None);
+        assert_eq!(
+            template_for(&c, None, Some(ModeKind::Special(7)), true),
+            None,
+            "快照为 None 时不该 panic，跟随全局"
+        );
     }
 }
 

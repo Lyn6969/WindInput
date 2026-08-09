@@ -28,6 +28,35 @@ fn has_schemas() -> bool {
     ok("wubi86") && ok("pinyin")
 }
 
+/// 让指定方案获得 `[overlay]` 段（= 成为 overlay 方案），返回可传给构造函数的 override 目录。
+///
+/// 特殊模式的实例集合已是「带 `[overlay]` 段的已安装方案」，不再是 `schema.special_modes`
+/// 数组。测试不能往真实 `data/schemas` 写文件，故走 override 层——`read_schema` 的
+/// `merge_toml` 会把它合并进方案，效果等同方案自带该段，真实词库分毫不动。
+fn overlay_override_dir(tag: &str, schemas: &[(&str, bool)]) -> PathBuf {
+    let dir = std::env::temp_dir().join(format!("wind_overlay_ov_{tag}"));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    for (id, show_all) in schemas {
+        std::fs::write(
+            dir.join(format!("{id}.toml")),
+            format!("[overlay]\nkind = \"special\"\nshow_all_on_enter = {show_all}\n"),
+        )
+        .unwrap();
+    }
+    dir
+}
+
+/// 把某个键绑成「进入该 overlay 方案」。
+///
+/// 引导键的落点是 `keys.key_actions`（五c 收编），`special:<id>` 里的 `<id>` 现在
+/// 就是**方案 id**——实例即方案，不再有指向别处的实例别名。
+fn bind_special(cfg: &mut Config, key: &str, schema_id: &str) {
+    cfg.keys
+        .key_actions
+        .insert(key.into(), format!("special:{schema_id}"));
+}
+
 fn config_with(active: &str) -> Config {
     let mut cfg = Config::default();
     cfg.schema.available = vec!["wubi86".into(), "pinyin".into()];
@@ -504,21 +533,16 @@ fn test_z_key_action_enters_temp_english() {
     }
 }
 
-/// `z_key_action = "special:<id>"`：z 进特殊模式，候选来自该模式引用的方案。
+/// `z_key_action = "special:<方案id>"`：z 进特殊模式，候选来自该 overlay 方案自身。
 #[test]
 fn test_z_key_action_enters_special() {
     if !has_schemas() {
         return;
     }
     let mut cfg = config_with("wubi86");
-    cfg.schema.special_modes = vec![wind_config::config::SpecialModeConfig {
-        id: "zpy".into(),
-        name: "测试".into(),
-        schema: "pinyin".into(),
-        ..Default::default()
-    }];
-    cfg.schema.codetable.z_key_action = "special:zpy".into();
-    let coord = Coordinator::new_headless(cfg, Some(&data_dir()));
+    let ov = overlay_override_dir("test_z_key_action_enters_special", &[("pinyin", false)]);
+    cfg.schema.codetable.z_key_action = "special:pinyin".into();
+    let coord = Coordinator::new_headless_with_override(cfg, Some(&data_dir()), Some(ov));
     press_vk(&coord, 0x5A, false); // z
     press_str(&coord, "ni");
     let texts = coord.debug_page_texts();
@@ -2640,13 +2664,12 @@ fn test_special_mode_nonempty_enter_clear_discards() {
     }
     let mut cfg = config_with("wubi86");
     cfg.input.enter_behavior = "clear".into();
-    cfg.schema.special_modes = vec![wind_config::config::SpecialModeConfig {
-        id: "sym".into(),
-        trigger_keys: vec!["backslash".into()],
-        schema: "pinyin".into(),
-        ..Default::default()
-    }];
-    let coord = Coordinator::new_headless(cfg, Some(&data_dir()));
+    let ov = overlay_override_dir(
+        "test_special_mode_nonempty_enter_clear_d",
+        &[("pinyin", false)],
+    );
+    bind_special(&mut cfg, "backslash", "pinyin");
+    let coord = Coordinator::new_headless_with_override(cfg, Some(&data_dir()), Some(ov));
     let act = coord.handle_key_event(&key_event(0xDC, EVENT_KEY_DOWN)); // \
     assert!(
         matches!(act, KeyAction::UpdateComposition { .. }),
@@ -4441,13 +4464,12 @@ fn test_special_trigger_with_candidates_commits_and_enters() {
     // （此前只有空缓冲入口，有候选时 \ 落标点流程上屏 、）。默认 direct_commit：
     // 真提交候选、引导符新组合延迟到 keyup 才开。
     let mut cfg = config_with("wubi86");
-    cfg.schema.special_modes = vec![wind_config::config::SpecialModeConfig {
-        id: "sym".into(),
-        trigger_keys: vec!["backslash".into()],
-        schema: "pinyin".into(),
-        ..Default::default()
-    }];
-    let coord = Coordinator::new_headless(cfg, Some(&data_dir()));
+    let ov = overlay_override_dir(
+        "test_special_trigger_with_candidates_com",
+        &[("pinyin", false)],
+    );
+    bind_special(&mut cfg, "backslash", "pinyin");
+    let coord = Coordinator::new_headless_with_override(cfg, Some(&data_dir()), Some(ov));
     press_letter(&coord, 'a');
     let texts = coord.debug_page_texts();
     if texts.is_empty() {
@@ -5413,13 +5435,13 @@ fn special_mode_effect_command_auto_commit_executes() {
         .unwrap();
     let mut cfg = config_with("wubi86");
     cfg.schema.codetable.auto_commit_at_full = true;
-    cfg.schema.special_modes = vec![wind_config::config::SpecialModeConfig {
-        id: "sym".into(),
-        trigger_keys: vec!["backslash".into()],
-        schema: "wubi86".into(),
-        ..Default::default()
-    }];
-    let coord = Coordinator::new_headless_with_store(cfg, Some(&data_dir()), store);
+    let ov = overlay_override_dir(
+        "special_mode_effect_command_auto_commit_",
+        &[("wubi86", false)],
+    );
+    bind_special(&mut cfg, "backslash", "wubi86");
+    let coord =
+        Coordinator::new_headless_with_store_override(cfg, Some(&data_dir()), store, Some(ov));
     // 空缓冲按 \ 进入特殊模式
     let act = coord.handle_key_event(&key_event(0xDC, EVENT_KEY_DOWN));
     assert!(
@@ -5457,13 +5479,13 @@ fn special_mode_exact_completion_shows_longer_code() {
     let mut cfg = config_with("wubi86");
     cfg.schema.codetable.single_code_input = true;
     cfg.schema.codetable.single_code_complete = true;
-    cfg.schema.special_modes = vec![wind_config::config::SpecialModeConfig {
-        id: "sym".into(),
-        trigger_keys: vec!["backslash".into()],
-        schema: "wubi86".into(),
-        ..Default::default()
-    }];
-    let coord = Coordinator::new_headless_with_store(cfg, Some(&data_dir()), store);
+    let ov = overlay_override_dir(
+        "special_mode_exact_completion_shows_long",
+        &[("wubi86", false)],
+    );
+    bind_special(&mut cfg, "backslash", "wubi86");
+    let coord =
+        Coordinator::new_headless_with_store_override(cfg, Some(&data_dir()), store, Some(ov));
     // 空缓冲按 \ 进入特殊模式
     let act = coord.handle_key_event(&key_event(0xDC, EVENT_KEY_DOWN));
     assert!(
@@ -5496,14 +5518,13 @@ fn special_mode_show_all_on_enter_lists_candidates() {
         let _ = std::fs::remove_file(&store_path);
         let store = std::sync::Arc::new(wind_store::Store::open(&store_path).unwrap());
         let mut cfg = config_with("wubi86");
-        cfg.schema.special_modes = vec![wind_config::config::SpecialModeConfig {
-            id: "sym".into(),
-            trigger_keys: vec!["backslash".into()],
-            schema: "wubi86".into(),
-            show_all_on_enter: show_all,
-            ..Default::default()
-        }];
-        let coord = Coordinator::new_headless_with_store(cfg, Some(&data_dir()), store);
+        let ov = overlay_override_dir(
+            "special_mode_show_all_on_enter_lists_can",
+            &[("wubi86", show_all)],
+        );
+        bind_special(&mut cfg, "backslash", "wubi86");
+        let coord =
+            Coordinator::new_headless_with_store_override(cfg, Some(&data_dir()), store, Some(ov));
         // 空缓冲按 \ 进入特殊模式（尚未敲任何编码）
         let act = coord.handle_key_event(&key_event(0xDC, EVENT_KEY_DOWN));
         assert!(
@@ -5540,14 +5561,13 @@ fn special_mode_show_all_respects_single_code_input() {
         let mut cfg = config_with("wubi86");
         // 全局基线设 single_code_input；wubi86 方案未覆盖 → tri-state 回落此值。
         cfg.schema.codetable.single_code_input = single_code;
-        cfg.schema.special_modes = vec![wind_config::config::SpecialModeConfig {
-            id: "sym".into(),
-            trigger_keys: vec!["backslash".into()],
-            schema: "wubi86".into(),
-            show_all_on_enter: true,
-            ..Default::default()
-        }];
-        let coord = Coordinator::new_headless_with_store(cfg, Some(&data_dir()), store);
+        let ov = overlay_override_dir(
+            "special_mode_show_all_respects_single_co",
+            &[("wubi86", true)],
+        );
+        bind_special(&mut cfg, "backslash", "wubi86");
+        let coord =
+            Coordinator::new_headless_with_store_override(cfg, Some(&data_dir()), store, Some(ov));
         coord.handle_key_event(&key_event(0xDC, EVENT_KEY_DOWN));
         let texts = coord.debug_all_candidate_texts();
         let _ = std::fs::remove_file(&store_path);
@@ -7244,14 +7264,14 @@ fn special_op_fixture(
     let _ = std::fs::remove_file(&store_path);
     let store = std::sync::Arc::new(wind_store::Store::open(&store_path).unwrap());
     let mut cfg = config_with("pinyin");
-    cfg.schema.special_modes = vec![wind_config::config::SpecialModeConfig {
-        id: "qsym".into(),
-        trigger_keys: vec!["backslash".into()],
-        schema: "wubi86".into(),
-        show_all_on_enter: show_all,
-        ..Default::default()
-    }];
-    let coord = Coordinator::new_headless_with_store(cfg, Some(&data_dir()), store.clone());
+    let ov = overlay_override_dir(tag, &[("wubi86", show_all)]);
+    bind_special(&mut cfg, "backslash", "wubi86");
+    let coord = Coordinator::new_headless_with_store_override(
+        cfg,
+        Some(&data_dir()),
+        store.clone(),
+        Some(ov),
+    );
     (coord, store_path, store)
 }
 
@@ -7505,14 +7525,13 @@ fn special_mode_browse_exact_mode_hides_first_shows_next() {
     let mut cfg = config_with("pinyin");
     // wubi86 是普通方案（非 hidden），继承全局的精确匹配开关。
     cfg.schema.codetable.single_code_input = true;
-    cfg.schema.special_modes = vec![wind_config::config::SpecialModeConfig {
-        id: "qsym".into(),
-        trigger_keys: vec!["backslash".into()],
-        schema: "wubi86".into(),
-        show_all_on_enter: true,
-        ..Default::default()
-    }];
-    let coord = Coordinator::new_headless_with_store(cfg, Some(&data_dir()), store);
+    let ov = overlay_override_dir(
+        "special_mode_browse_exact_mode_hides_fir",
+        &[("wubi86", true)],
+    );
+    bind_special(&mut cfg, "backslash", "wubi86");
+    let coord =
+        Coordinator::new_headless_with_store_override(cfg, Some(&data_dir()), store, Some(ov));
 
     let act = coord.handle_key_event(&key_event(0xDC, EVENT_KEY_DOWN));
     assert!(
@@ -7570,13 +7589,13 @@ fn completion_hint_command_shows_display_label_not_source() {
     // 走**特殊模式**路径：它取补全池的引擎序首条（weight 降序），不经跨来源重排，
     // 故高权重用户词必然中选——主路径要与主库后继混排，取到哪条不稳定，断不住。
     // 这也正是用户报告该现象的场景（快符）。
-    cfg.schema.special_modes = vec![wind_config::config::SpecialModeConfig {
-        id: "qsym".into(),
-        trigger_keys: vec!["backslash".into()],
-        schema: "wubi86".into(),
-        ..Default::default()
-    }];
-    let coord = Coordinator::new_headless_with_store(cfg, Some(&data_dir()), store);
+    let ov = overlay_override_dir(
+        "completion_hint_command_shows_display_la",
+        &[("wubi86", false)],
+    );
+    bind_special(&mut cfg, "backslash", "wubi86");
+    let coord =
+        Coordinator::new_headless_with_store_override(cfg, Some(&data_dir()), store, Some(ov));
 
     let act = coord.handle_key_event(&key_event(0xDC, EVENT_KEY_DOWN));
     assert!(
