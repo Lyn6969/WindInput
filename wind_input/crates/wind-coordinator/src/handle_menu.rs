@@ -1219,7 +1219,14 @@ impl Coordinator {
         let Some((key, work_right, work_bottom)) = focus_monitor() else {
             return;
         };
-        {
+        // 「判定换屏 + 记新屏 + 取该屏坐标」必须在同一临界区里完成，否则中间那道缝会让
+        // 刚拖好的位置被顶掉：本线程认定换到 B 屏并释放锁后、尚未读表时，拖动线程
+        // （`save_toolbar_pos`）把 B 屏的新坐标写进表——本线程随后读到的是旧值，下发出去
+        // 就把屏上刚拖好的工具栏拽回了旧处，且表里是新值、屏上是旧值，要到下次换屏才纠正。
+        //
+        // 锁序 `current_toolbar_monitor` → `toolbar_positions`，与 `save_toolbar_pos`
+        // 的取用先后一致（那边不嵌套）；⚠️ 新增取这两把锁的代码请沿用同一顺序。
+        let saved = {
             let mut cur = self
                 .current_toolbar_monitor
                 .lock()
@@ -1227,14 +1234,14 @@ impl Coordinator {
             if cur.as_deref() == Some(key.as_str()) {
                 return;
             }
-            *cur = Some(key.clone());
-        }
-        let saved = {
-            let map = self
+            let saved = self
                 .toolbar_positions
                 .lock()
-                .unwrap_or_else(|e| e.into_inner());
-            map.get(&key).copied()
+                .unwrap_or_else(|e| e.into_inner())
+                .get(&key)
+                .copied();
+            *cur = Some(key.clone());
+            saved
         };
         let cmd = match saved {
             Some((x, y)) => UiCommand::SetToolbarPos { x, y },
@@ -1250,6 +1257,10 @@ impl Coordinator {
 
     /// 启动时的初始定位：与运行期同一判据（前台窗口所在显示器），并把该 key 记进
     /// `current_toolbar_monitor`，使首个 notify_toolbar 不会重复下发。
+    ///
+    /// 非 Windows 上 `focus_monitor` 恒为 None，故本函数恒为 no-op——位置恢复整体不生效。
+    /// 无实际影响：`manager_macos.rs` 的 forwarder 本就把 `SetToolbarPos`/`SetToolbarCorner`
+    /// 当留桩丢弃，工具栏在那边由 .app 原生承载。
     pub(crate) fn init_toolbar_pos(&self) {
         self.sync_toolbar_monitor();
     }
@@ -1261,7 +1272,12 @@ impl Coordinator {
     /// 键空间语义——取那侧问的是「焦点屏上记过什么位置」，存那侧答的是「这块屏上
     /// 工具栏在哪」，只有 key 同源才对得上。
     pub(crate) fn save_toolbar_pos(&self, x: i32, y: i32) {
-        let key = monitor_key_from_point(x, y);
+        let Some(key) = monitor_key_from_point(x, y) else {
+            // 查不到显示器就别存：这块表的读取侧（`focus_monitor`）在同样的失败下返回
+            // None，存进任何兜底 key 都只会是永远读不出来的垃圾。
+            tracing::debug!("工具栏位置未保存：查不到 ({},{}) 所在显示器", x, y);
+            return;
+        };
         // 拖到别的屏 = 用户在那块屏上重新定了位；同步当前屏记录，否则下一次
         // sync_toolbar_monitor 会认为「屏没变」而不再校正。
         {
@@ -1486,8 +1502,12 @@ fn cursor_pos() -> (i32, i32) {
 }
 
 /// 根据屏幕坐标计算显示器 key（工作区右下角："workRight,workBottom"）。
-/// 找不到显示器时返回 "0,0"（退化为单显示器情况下的无键状态）。
-fn monitor_key_from_point(x: i32, y: i32) -> String {
+/// 查不到显示器时返回 None。
+///
+/// 失败语义要与 `focus_monitor` 对称——它同样在查不到时返回 None。此前这里回落到
+/// `"0,0"`，于是保存侧会把坐标写进一个**读取侧永远问不出来的 key**（`focus_monitor`
+/// 不可能产出 `"0,0"`），位置静默丢失。存取共用一张表，两侧的失败也得共用一套语义。
+fn monitor_key_from_point(x: i32, y: i32) -> Option<String> {
     #[cfg(target_os = "windows")]
     {
         use std::mem::{size_of, zeroed};
@@ -1501,14 +1521,14 @@ fn monitor_key_from_point(x: i32, y: i32) -> String {
             let mut mi: MONITORINFO = zeroed();
             mi.cbSize = size_of::<MONITORINFO>() as u32;
             if GetMonitorInfoW(hmon, &mut mi).as_bool() {
-                return format!("{},{}", mi.rcWork.right, mi.rcWork.bottom);
+                return Some(format!("{},{}", mi.rcWork.right, mi.rcWork.bottom));
             }
         }
-        "0,0".to_string()
+        None
     }
     #[cfg(not(target_os = "windows"))]
     {
-        "0,0".to_string()
+        None
     }
 }
 

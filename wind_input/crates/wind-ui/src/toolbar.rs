@@ -120,6 +120,11 @@ pub struct Toolbar {
     /// 存边界而不是直接算坐标，是因为落点要减去工具栏自身尺寸，而**尺寸在 `render` 之前
     /// 不可信**——窗口以 `create(160, 40)` 的占位尺寸起步，`set_vertical` 在隐藏期间又
     /// 不重排（不出图），于是首次渲染前 `window.size()` 既不是横条真值也不是纵条真值。
+    ///
+    /// **跨 `hide` 存活**：隐藏不该丢弃「下次该落到哪块屏」这个意图，重新显示时由
+    /// `render` 消费。清除它的只有 `render` 的 `take()` 与 `set_pos`（后到的显式位置覆盖）。
+    /// 边界过时不必担心：这对数值正是协调器 `sync_toolbar_monitor` 的去重 key 本身，
+    /// 边界一变 key 必变，下一次 sync 会重新下发覆盖。
     pending_corner: Option<(i32, i32)>,
 }
 
@@ -721,20 +726,13 @@ impl Toolbar {
         }
     }
 
-    pub fn show(&mut self) {
-        let pos = self.mouse.borrow().pos;
-        if let Some((x, y)) = pos {
-            let (w, h) = self.window.size();
-            let (cx, cy) = clamp_to_work_area(x, y, w, h);
-            self.mouse.borrow_mut().pos = Some((cx, cy));
-            self.window.show(cx, cy);
-            self.visible = true;
-            // 显示路径同 render()：重置自动隐藏计时（未启用时 on_shown 为 no-op）。
-            self.auto_hide.on_shown(std::time::Instant::now());
-        }
-    }
+    // 曾有一个 `show()`（用缓存 pos 直接显示、不重绘），长期无调用者。删除而非保留：
+    // 它绕开 `render`，既不消费 `pending_corner`（显示完再被下一次 render 取出算落点，
+    // 视觉上凭空跳一次），也不按当前朝向/DPI 重排尺寸。所有显示路径收口于 `render` 是
+    // 本模块的既有约定，一个不走 render 的显示入口只会是下一个人的陷阱。
+    // 若将来真需要「不改状态地重新显形」，用 `repaint()`（受 `visible` 门控）。
 
-    /// 当前是否可见（`show` 置 true，`hide` 置 false）。
+    /// 当前是否可见（`render` 置 true，`hide` 置 false）。
     pub fn is_visible(&self) -> bool {
         self.visible
     }
@@ -771,8 +769,12 @@ impl Toolbar {
         )
     }
 
-    /// 主显示器工作区右下角位置（避开任务栏）——工具栏**首次**显示且无任何记忆位置时的落点。
-    /// `SPI_GETWORKAREA` 取的恒是主屏；跟随焦点换屏走 `set_corner`，不经过这里。
+    /// 主显示器工作区右下角位置（避开任务栏）。
+    ///
+    /// **仅在协调器那侧 `focus_monitor()` 失败时才轮得到**——它正常总能给出焦点所在屏，
+    /// 于是首帧要么走 `pending_corner`（该屏无记忆位置）、要么走 `mouse.pos`（有记忆位置），
+    /// 两条路都不经过这里。`SPI_GETWORKAREA` 取的恒是主屏，用它给多屏定位是错的；
+    /// 别照着这个函数名去调它。
     #[cfg_attr(not(windows), allow(unused_variables))]
     fn corner_position(w: u32, h: u32) -> (i32, i32) {
         #[cfg(windows)]
@@ -822,7 +824,13 @@ pub struct ToolbarMouse {
     hits: Vec<(ToolbarAction, Rect)>,
     events: Sender<UiEvent>,
     hwnd: HWND,
-    /// 当前位置（屏幕坐标）；None = 尚未定位
+    /// 当前位置（屏幕坐标）；None = 尚未定位。
+    ///
+    /// ⚠️ **首次 `render` 之前可能是未钳制的原始值**：`Toolbar::set_pos` 在隐藏期间不钳制
+    /// （那时窗口尺寸还是占位值，钳了反而错——见其文档），要到 `render` 才按真实尺寸钳并
+    /// 回写。今天安全，因为本结构体的其余读者（`rect`/`menu_anchor`/拖动 `origin`）全部
+    /// 挂在鼠标消息上，而隐藏窗口收不到鼠标消息。**若日后新增不依赖鼠标消息的读路径，
+    /// 先确认它是否可能在首帧之前触发。**（`size` 在首帧前同为 `(0,0)`，同一道门挡住。）
     pos: Option<(i32, i32)>,
     dragging: bool,
     /// 拖动起点：光标屏幕坐标
