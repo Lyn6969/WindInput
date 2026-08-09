@@ -297,9 +297,9 @@ fn target_position(base_pos: usize, power: f64) -> usize {
 ///
 /// # 三层的分工
 ///
-/// ① **锚定**（`is_sentence` 或精确码短语）恒占顶部、互相维持原序，**不参与位置提升**。
-///    `is_sentence_demoted` / `is_sentence_contested` 的整句不在此列——后者正是为了让同码
-///    竞争者能靠位置提升反超它（`siyuan` 寺院/思源）。
+/// ① **锚定**（精确码短语）恒占顶部、互相维持原序，**不参与位置提升**。整句**不在此列**
+///    ——它的 weight 已与词库同量纲，靠 `candidate_display_order` 挣位置，然后与其余候选
+///    一样接受词频挑战。
 /// ② **匹配层级** `cmp_match_layers`：词频不得跨层提拔（模糊「是」不能压过精确「四」）。
 /// ③ **目标位次**升序；同位次时**被提升者在前**——否则提升到 0 的候选会与原本就在 0 位的
 ///    并列，再按 `base_pos` 排又回到原位，提升等于没做。
@@ -316,22 +316,25 @@ pub fn rerank_pinyin_positional(
         now,
         profile,
         promote_prefix,
-        // 整句 / 精确码短语锚定顶部，不参与位置提升。
+        // 精确码短语锚定顶部，不参与位置提升。
         //
-        // 三个例外都是为了让别的候选能靠位置提升反超它：
-        // - `is_sentence_demoted`：已让位于精确整词；
-        // - `is_sentence_contested`：有同码竞争者（`siyuan` 寺院/思源）；
-        // - `is_sentence_unanchored`：残码补全整句，或**未消费整串**的整句。后者尤其要紧——
-        //   锚定是硬闸门且本函数是最后一道整体排序，`buzhidaok` 下只消费 8/9 键的「不知道」
-        //   若锚定，一有词频记录就会把协调器按消费长度排在首位的「不知道看」挤到第二，
-        //   **P0 的 by_consumed 被整个推翻**。置位点见该字段文档。
-        |c| {
-            (c.is_sentence
-                && !c.is_sentence_demoted
-                && !c.is_sentence_contested
-                && !c.is_sentence_unanchored)
-                || (c.is_phrase && c.is_exact_code)
-        },
+        // **整句不再锚定**：整句 weight 已与词库同量纲（`pinyin::sentence_weight`），它靠
+        // weight 在 `candidate_display_order` 里挣到自己的 base_pos，然后与其余候选一样
+        // 参与位置提升竞争。锚定原本是硬闸门（命中即维持原序、衰减分连算都不算），只要
+        // 它还在，「整句同量纲」就只在无词频记录时成立。
+        //
+        // 三个摘锚定布尔（`is_sentence_demoted` / `is_sentence_contested` /
+        // `is_sentence_unanchored`）都是为了在硬闸门上凿洞，随锚定一并失去存在理由。
+        //
+        // 实测移除的影响面极小 —— 锚定此前已被两侧夹到名存实亡：
+        // - 同码同层的竞争者存在 ⇒ step 6.6 已置 `is_sentence_contested` 摘掉锚定；
+        // - 不同层的候选（前缀补全「今天天气」、子短语）⇒ `cmp_match_layers` 在排序键里
+        //   位于 target_pos 之前，位置提升推不动它们跨层，锚定与否都一样。
+        //
+        // 唯一真正变化的是**模糊同码候选**：6.6 的过滤器带 `!o.is_fuzzy`，不把它算作
+        // 竞争者，于是整句保持锚定、用户选中再多次也翻不过。守门测试
+        // `pinyin_fuzzy_peer_can_overtake_sentence`。
+        |c| c.is_phrase && c.is_exact_code,
         // 匹配层级：简拼 / 前缀补全 / 子短语。词频不得跨层提拔。
         wind_candidate::cmp_match_layers,
     );
@@ -349,7 +352,7 @@ pub fn rerank_pinyin_positional(
 ///
 /// | 调用方 | `anchored` | `layer_cmp` |
 /// |---|---|---|
-/// | 拼音 | 整句 / 精确码短语 | [`wind_candidate::cmp_match_layers`] |
+/// | 拼音 | 精确码短语 | [`wind_candidate::cmp_match_layers`] |
 /// | 码表 / 混输 / 英文 | 无（恒 `false`） | `freq_tier` 来源档位 |
 ///
 /// 抽出共用而非各写一份，是因为「位次减半 + 强度 tie-break + 衰减」这套逻辑踩过的坑
@@ -499,11 +502,20 @@ mod tests {
         c
     }
 
-    /// 整句豁免：整句恒置顶，即使某非整句词被频繁使用也不能反超。
+    /// 整句**不再锚定**：同层的常用词可凭位置提升反超它。
+    ///
+    /// 断言方向已随整句退役 `SENTENCE_WEIGHT_BASE` 反转（原为「整句恒锚定首位」）。整句
+    /// weight 现与词库同量纲，它靠 weight 在 `candidate_display_order` 里挣到 base_pos 0，
+    /// 但**不再对词频免疫** —— 硬闸门只要还在，「同量纲」就只在无词频记录时成立。
+    ///
+    /// 无词频时整句仍居首，见 `pinyin_sentence_leads_without_freq`（对照组，缺了它
+    /// 本条也能被「整句被无条件压到最后」这种实现骗过）。
     #[test]
-    fn pinyin_sentence_is_anchored_on_top() {
+    fn pinyin_sentence_can_be_overtaken_by_frequent_peer() {
+        // weight 取等效词频量级（几千），不再是旧的 3e7 —— 本函数从不比 weight，
+        // 但编造一个已不存在的量级会误导读者以为整句仍在另一根轴上。
         let mut cands = vec![
-            pin_sentence("你好世界", 30_000_000),
+            pin_sentence("你好世界", 4000),
             pin("你好", 2000),
             pin("拟", 1000),
         ];
@@ -515,9 +527,67 @@ mod tests {
             FreqProfile::default(),
             PromotePrefix::All,
         );
-        assert_eq!(cands[0].text, "你好世界", "整句必须锚定首位");
-        assert_eq!(cands[1].text, "你好", "近用词软置前于未用词");
+        assert_eq!(
+            cands[0].text, "你好",
+            "选过 20 次的同层词须能提升到首位、反超整句"
+        );
+        assert_eq!(
+            cands[1].text, "你好世界",
+            "整句只是退居第二，不得被赶出列表"
+        );
         assert_eq!(cands[2].text, "拟");
+    }
+
+    /// ★ **模糊同码候选**能靠词频反超整句 —— 这是移除整句锚定唯一实际改变的场景。
+    ///
+    /// 移除前，其余情形都已被两侧夹掉、锚定名存实亡：
+    /// - 同码同层的竞争者存在 ⇒ 引擎侧 step 6.6 置 `is_sentence_contested`、锚定已摘；
+    /// - 不同层的候选（前缀补全 / 子短语）⇒ `cmp_match_layers` 在排序键里位于 target_pos
+    ///   之前，位置提升本就推不动它们跨层。
+    ///
+    /// 剩下的缝隙正是这里：6.6 的竞争者过滤器带 `!o.is_fuzzy`，**模糊候选不算竞争者**，
+    /// 于是整句不标 contested、锚定保留，用户把模糊音候选选中再多次也翻不过它。
+    /// 移除锚定后它才下场竞争 —— 用户明确选过的东西就该能赢。
+    #[test]
+    fn pinyin_fuzzy_peer_can_overtake_sentence() {
+        let fuzzy_peer = {
+            let mut c = pin("事实", 2000);
+            c.is_fuzzy = true; // 模糊音候选：6.6 不把它算作竞争者
+            c
+        };
+        let mut cands = vec![pin_sentence("是识", 4000), fuzzy_peer];
+        let r = recs(&[("事实", 20, NOW)]);
+        rerank_pinyin_positional(
+            &mut cands,
+            &r,
+            NOW,
+            FreqProfile::default(),
+            PromotePrefix::All,
+        );
+        assert_eq!(
+            cands[0].text, "事实",
+            "选过 20 次的模糊同码候选须能反超整句（此前被锚定硬闸门挡死）"
+        );
+    }
+
+    /// 对照组：无词频记录时整句仍居首（靠入参显示序，即 weight）。
+    ///
+    /// 与上一条合看才说明「整句让位」是**词频**造成的，而非本函数把整句一律压后。
+    #[test]
+    fn pinyin_sentence_leads_without_freq() {
+        let mut cands = vec![
+            pin_sentence("你好世界", 4000),
+            pin("你好", 2000),
+            pin("拟", 1000),
+        ];
+        rerank_pinyin_positional(
+            &mut cands,
+            &recs(&[]),
+            NOW,
+            FreqProfile::default(),
+            PromotePrefix::All,
+        );
+        assert_eq!(cands[0].text, "你好世界", "无词频时整句仍是最优解读");
     }
 
     /// 降级整句**不参与**锚定：让位于精确整词后，须停在精确整词之后、普通候选之前。
@@ -560,10 +630,16 @@ mod tests {
         assert_eq!(cands[2].text, "连");
     }
 
-    /// 对照组：**未**降级的整句即使排在后面也会被锚定拉回首位。与上一条合看，
-    /// 才证明 `is_sentence_demoted` 确实是起作用的那个开关，而非「本函数恰好没动它」。
+    /// 整句排在哪里由**入参显示序**决定，本函数不会把它拉回首位。
+    ///
+    /// 断言方向已随锚定移除反转（原为「未降级的整句即使排在后面也会被锚定拉回首位」）。
+    /// 那条拉回正是硬闸门的表现：本函数不看 weight，只要标志为真就置顶，于是引擎侧
+    /// 精心排好的序在这里被推翻。现在整句与其余候选同轴，**这一层不再有隐形的重排**。
+    ///
+    /// 锁住这条等于锁住「协调器 `candidate_display_order` 是权威显示序」——谁再往
+    /// `anchored` 里加整句判据，本断言即会红。
     #[test]
-    fn pinyin_undemoted_sentence_still_anchors_from_below() {
+    fn pinyin_sentence_is_not_pulled_back_to_top() {
         let mut cands = vec![pin("廉政提醒", 100_000), pin_sentence("连整体性", 99_999)];
         let r = recs(&[]);
         rerank_pinyin_positional(
@@ -574,9 +650,10 @@ mod tests {
             PromotePrefix::All,
         );
         assert_eq!(
-            cands[0].text, "连整体性",
-            "未降级的整句仍恒锚定首位（本函数不看 weight）"
+            cands[0].text, "廉政提醒",
+            "入参序即显示序，整句不得被拉回首位"
         );
+        assert_eq!(cands[1].text, "连整体性");
     }
 
     /// 降级整句失去锚定后，词频学习对它生效（未降级的整句则恒锚定，见上一条）。
@@ -1605,15 +1682,22 @@ mod tests {
         assert_eq!(c[0].text, "寺院", "无词频记录时整句解仍是最优解读");
     }
 
-    /// 锚定候选**不参与位置提升**：用再多次也不会把整句挤下去。
+    /// 锚定候选**不参与位置提升**：用再多次也推不动它。
     ///
-    /// 与 contested 的区别正在于此——后者被摘掉锚定才下场竞争。
+    /// 锚定机制本身还在，只是唯一的享用者变成了精确码短语（用户显式定义、码完全匹配）。
+    /// 整句已退出锚定，见 `pinyin_sentence_can_be_overtaken_by_frequent_peer`。
     #[test]
-    fn anchored_sentence_is_immune_to_promotion() {
-        let mut c = vec![pin_sentence("整句解", 30_000_000), pin("普通词", 5000)];
+    fn anchored_exact_phrase_is_immune_to_promotion() {
+        let phrase = {
+            let mut c = pin("我的邮箱", 5000);
+            c.is_phrase = true;
+            c.is_exact_code = true;
+            c
+        };
+        let mut c = vec![phrase, pin("普通词", 5000)];
         let r = recs(&[("普通词", 50, NOW)]);
         rerank_pinyin_positional(&mut c, &r, NOW, FreqProfile::default(), PromotePrefix::All);
-        assert_eq!(c[0].text, "整句解", "锚定整句不受位置提升影响");
+        assert_eq!(c[0].text, "我的邮箱", "锚定的精确码短语不受位置提升影响");
     }
 
     /// 衰减：久未用则有效次数归零，位次回落原处。

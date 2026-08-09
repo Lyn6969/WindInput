@@ -16,6 +16,15 @@
 //!
 //! 现由 `Candidate::is_sentence_contested` 标记这类「有同码竞争者」的整句并摘掉其锚定。
 //!
+//! ## ⚠️ 锚定本身已移除（整句退役 `SENTENCE_WEIGHT_BASE` 的步骤 2）
+//!
+//! `freq_rerank` 的 `anchored` 只剩精确码短语，整句一律不锚定。本文件下面提到的「摘锚定」
+//! 因此都是**历史成因**——`is_sentence_contested` / `is_sentence_unanchored` 两个字段的
+//! 存在理由随之消失，待 `docs/design/sentence-weight-same-axis.md` §5 步骤 3/4 回收。
+//!
+//! **三条用例的目标不变**：它们锁的是「整句不得压死词频」，锚定移除后这个目标只会更强地
+//! 成立，故断言一字未改。跨层重建把标记丢掉的失效模式也仍被它们覆盖。
+//!
 //! **本测试保护的目标没有变**：`is_sentence` 与 `is_sentence_contested` 同为 Candidate 上
 //! 相邻的 `serde(skip)` 字段，「跨层重建把标记丢掉」这一失效模式会同时丢掉两者 ——
 //! 丢掉 contested 则锚定恢复、「共和」重回首位，本断言即会失败。判据方向反了，守的

@@ -64,7 +64,7 @@
 | `is_partial` | bool | **子短语**（候选码是输入的真前缀、比输入短，如 `baoan`→报`bao`） | 拼音引擎 |
 | `is_exact_code` | bool | **精确匹配档**（候选 `code`==输入的完全匹配；或引导键导航候选的既定置顶） | 码表引擎（`code==input`）；协调器精确码短语（`lookup`） |
 | `is_sentence` | bool | 引擎合成的整句解（Viterbi 多词/超长整词） | 拼音引擎 |
-| `is_sentence_demoted` | bool | 整句已让位（① 精确整词 ② 用完残码的补全；降级，不参与锚定） | 拼音引擎 |
+| `is_sentence_demoted` | bool | 整句已让位（① 精确整词 ② 用完残码的补全；引擎侧把 weight 压到 `max-1`） | 拼音引擎 |
 | `is_phrase` | bool | 全局短语（`self.phrases` 注入的，系统/用户皆然） | 协调器短语注入 |
 | `is_command`/`is_group` | bool | `$CC` 命令 / `$SS·$AA` 组——**决定选中行为，不参与排序** | 短语注入 / `finalize_candidates` |
 | `weight` | i32 | 权重（**一物多用**：真实词频 + 隐式类别加成，见 §3 红线①） | 引擎 + 各套加成 |
@@ -364,10 +364,18 @@
 
 ### 7.4 纯拼音：`rerank_pinyin_decay`
 
-- **锚定**：`(is_sentence && !is_sentence_demoted) || (is_phrase && is_exact_code)` 的候选恒锚定顶部
-  （互相维持引擎权重序）。**只锚定精确码短语**——前缀短语（`is_phrase && !is_exact_code`）不锚定，
-  落到下面 `cmp_match_layers` 靠 `is_prefix` 降到精确候选之下（与 §7.3 `freq_tier` tier1/tier2、
-  §6 `candidate_display_order` **同口径**：完全匹配才提前、前缀避让）。
+- **锚定**：只有 `is_phrase && is_exact_code`（精确码短语）恒锚定顶部、互相维持引擎权重序。
+  前缀短语（`is_phrase && !is_exact_code`）不锚定，落到下面 `cmp_match_layers` 靠 `is_prefix`
+  降到精确候选之下（与 §7.3 `freq_tier` tier1/tier2、§6 `candidate_display_order` **同口径**：
+  完全匹配才提前、前缀避让）。
+- ★ **整句不锚定**：整句 weight 已与词库同量纲（`pinyin::sentence_weight`），靠
+  `candidate_display_order` 挣位置，然后与其余候选一样接受词频挑战。此前 `is_sentence` 也在
+  锚定之列，那是硬闸门——命中即维持原序、衰减分连算都不算，于是「整句同量纲」只在无词频
+  记录时成立。移除的实测影响面极小，锚定早被两侧夹到名存实亡：同码同层的竞争者会让引擎侧
+  step 6.6 置 `is_sentence_contested` 摘掉锚定，不同层的候选则被 `cmp_match_layers` 挡在
+  target_pos 之前推不动。唯一真变化是**模糊同码候选**（6.6 的过滤器带 `!o.is_fuzzy`，不算
+  竞争者）现在能靠词频反超整句。守门测试 `pinyin_fuzzy_peer_can_overtake_sentence`
+  + `pinyin_sentence_is_not_pulled_back_to_top`。
 - 其余：先 `cmp_match_layers`（不跨层提拔），再按衰减分（半衰期）软置前，褪色（< ε）落回权重序。
 
 > ✅ **已对齐**：此前 `|| is_phrase` 一刀切锚定所有短语，导致纯拼音下 `date` 前缀短语在「自动调频开
