@@ -200,42 +200,6 @@ pub struct Candidate {
     /// 引擎内部用，不推送 UI。
     #[serde(skip)]
     pub is_sentence_demoted: bool,
-    /// 该整句解**不配占据 `freq_rerank` 的顶部锚定**（排序决策，与 `is_sentence` 的来源语义正交）。
-    ///
-    /// 锚定的正当性来自「这是引擎对**整串输入**的最优解读」。下列两种整句都不满足这个前提，
-    /// 由两个不同的生产点分别置位：
-    ///
-    /// 1. **残码补全整句**（`pinyin::convert` step 2c）：尾部残码被当作待定音节、由 Viterbi
-    ///    猜出一个字（`buzhidaok`→「不知道**看**」）。它多猜了一个**用户还没输入**的音节，
-    ///    置信度本质上低一档；而残码场景恰恰是用户最需要词频学习的地方——同一个 `zhonghuar`
-    ///    可能指向中华人民 / 中华人民共和国 / 中华民族，默认猜测更容易错。
-    /// 2. **未消费整串的整句**（协调器 `apply_freq_rerank`）：`buzhidaok` 下 step 2 的整句
-    ///    「不知道」只消费 8/9 键，残码 `k` 根本没进去。它连「整串」都没解释完。
-    ///
-    /// **要解决什么**：`freq_rerank` 的顶部锚定是**硬闸门**（`return Ordering::Less`，衰减分
-    /// 连算都不算），且它是**最后一道整体排序**。于是：
-    /// - 情形 1 让**词频对整个残码编码整体失效**；
-    /// - 情形 2 让**协调器按消费长度排好的序被整个推翻**——实测 `buzhidaok` 一旦有任何词频
-    ///   记录，首选就从「不知道看」(consumed=9) 退回锚定的「不知道」(consumed=8)。
-    ///
-    /// 情形 2 的判据与 `apply_freq_rerank` 收词频记录时的 `consumes_all` **同源**（那里早已
-    /// 写着「分段子候选不能被整串码的历史计数上浮」），此前只用在查询侧、漏了锚定侧。
-    ///
-    /// （曾有一个并列的 `is_sentence_contested` 表达「存在同码精确整词的竞争者」，效果同为
-    /// 摘锚定。整句锚定移除后它成了纯死码，已回收 —— 当时不合并两者是因为**字段名撒谎比
-    /// 多一个字段更糟**：这里的两种整句都没有同码词。）
-    ///
-    /// **为什么不复用 `is_sentence_demoted`**：后者语义是「已让位」并会压 weight；本字段
-    /// **不动 weight**，无词频记录时整句仍须凭其等效词频量纲居首，
-    /// 只是不再对词频免疫。
-    ///
-    /// **为什么不给 `rerank_pinyin_positional` 加 `input_len` 参数**（情形 2 的自然写法）：
-    /// 那需要改签名并同步 24 处既有单元测试调用，而判据本身在协调器侧唾手可得。用字段传递
-    /// 还顺带让两种情形收敛到同一个概念上。
-    ///
-    /// 引擎内部用，不推送 UI。
-    #[serde(skip)]
-    pub is_sentence_unanchored: bool,
     /// 前缀补全**已被提升进完整匹配层**（排序决策，与 `is_prefix` 表达的「码更长」结构事实正交）。
     ///
     /// `is_prefix=true` 表达的是结构事实——候选码严格长于输入（补全词）；而「该不该沉到
@@ -321,7 +285,6 @@ impl Default for Candidate {
             is_exact_code: false,
             is_sentence: false,
             is_sentence_demoted: false,
-            is_sentence_unanchored: false,
             is_promoted_completion: false,
             consumed_length: 0,
             boundary: 0,

@@ -323,8 +323,9 @@ pub fn rerank_pinyin_positional(
         // 参与位置提升竞争。锚定原本是硬闸门（命中即维持原序、衰减分连算都不算），只要
         // 它还在，「整句同量纲」就只在无词频记录时成立。
         //
-        // 摘锚定布尔（`is_sentence_demoted` / `is_sentence_unanchored`，以及已回收的
-        // `is_sentence_contested`）都是为了在硬闸门上凿洞，随锚定一并失去存在理由。
+        // 那些摘锚定布尔（`is_sentence_contested` / `is_sentence_unanchored`）都是为了在
+        // 硬闸门上凿洞，已随锚定一并回收。`is_sentence_demoted` 留着 —— 它另有本职：
+        // step 6.5/6.5b 靠它记录「已让位」，并真的把 weight 压到 `max-1`。
         //
         // 实测移除的影响面极小 —— 锚定此前已被两侧夹到名存实亡：
         // - 同码同层的竞争者存在 ⇒ step 6.6 已摘掉锚定（该步骤现已随本改动删除）；

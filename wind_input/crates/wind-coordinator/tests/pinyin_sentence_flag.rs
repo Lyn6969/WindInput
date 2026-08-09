@@ -20,7 +20,7 @@
 //!
 //! `freq_rerank` 的 `anchored` 只剩精确码短语，整句一律不锚定（整句 weight 与词库同量纲
 //! 之后，硬闸门让「同量纲」只在无词频记录时成立）。于是 step 6.6 与
-//! `is_sentence_contested` 字段一并删除，`is_sentence_unanchored` 亦已无消费点、待回收。
+//! `is_sentence_contested`、`is_sentence_unanchored` 两个字段一并删除。
 //!
 //! **三条用例的目标不变**：它们锁的是「整句不得压死词频」，锚定移除后这个目标只会更强地
 //! 成立，故断言一字未改 —— 现在它们守的是「整句不锚定」这条性质本身。
@@ -119,7 +119,7 @@ fn test_sentence_flags_survive_to_freq_rerank() {
 /// 都无关）重排就会触发，「不知道」若保持锚定就会把「不知道看」挤到第二。
 ///
 /// ⚠️ 这条**与 step 2c 无关地早已存在**，只是在残码整句出现之前没有「消费更多的候选」
-/// 来暴露它。判据 `is_sentence_unanchored` 由协调器按 `consumes_all` 置位。
+/// 来暴露它。现由「整句一律不锚定」直接保证，协调器不再按 `consumes_all` 标摘锚定位。
 #[test]
 fn test_partial_consumption_sentence_does_not_anchor_over_full() {
     let d = data_dir();

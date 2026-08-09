@@ -49,7 +49,7 @@ use wind_dict::cached::CachedDict;
 /// 二者差两个数量级以上、**不可比**。后果不是「整句排太前」，而是**每次想调整整句的
 /// 相对位置都只能加一个二值开关**——连续的权重比较在跨轴时根本不成立。现存补丁：
 /// step 1.5（反向把词典整词抬到整句量纲）、step 6.5 / 6.5b（改 weight 到 `max-1`）、
-/// step 6.6（`is_sentence_contested` 摘锚定，**已随整句锚定一并删除**）、`is_sentence_unanchored`、
+/// step 6.6（`is_sentence_contested` 摘锚定）与 `is_sentence_unanchored`（**均已随整句锚定删除**）、
 /// `SENTENCE_YIELD_WEIGHT_FLOOR`，以及 `Candidate` 上 4 个整句相关布尔。
 ///
 /// ## 为什么这不会把整句压下去（实测，见 `docs/design/sentence-weight-same-axis.md`）
@@ -1392,10 +1392,6 @@ impl Engine for PinyinEngine {
                         existing.weight = existing.weight.max(weight);
                         existing.is_partial = false;
                         existing.is_sentence = true;
-                        // ⚠️ 合并分支同样要标：它现在**就是**残码整句，锚定豁免必须跟着走。
-                        // 漏标不会编译报错，只会让 `nihaom` 这类「整句恰好等于词库词」的
-                        // 输入重新对词频免疫——正是本字段要修的那个 bug 的一半。
-                        existing.is_sentence_unanchored = true;
                     } else {
                         candidates.insert(
                             0,
@@ -1408,13 +1404,6 @@ impl Engine for PinyinEngine {
                                 natural_order: 0,
                                 source: CandidateSource::Pinyin,
                                 is_sentence: true,
-                                // 摘掉 freq_rerank 的顶部锚定：本路径猜了一个用户还没输入的
-                                // 音节，不该对词频免疫。见该字段文档。
-                                //
-                                // 由 `pinyin_completion::partial_sentence_is_marked_unanchored`
-                                // 直接断言标记本身（而非排序效果）—— 排序效果测不出它：整句
-                                // 锚定已整体移除，置不置位当前都不改变任何顺序。
-                                is_sentence_unanchored: true,
                                 boundary: result.boundary,
                                 ..Default::default()
                             },

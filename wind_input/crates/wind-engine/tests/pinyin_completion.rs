@@ -474,15 +474,19 @@ fn test_partial_completion_skips_single_syllable_input() {
     );
 }
 
-/// 残码整句必须带 `is_sentence_unanchored`。
+/// 残码整句必须产出、带整句身份、且**消费整串**。
 ///
-/// **本用例断言的是标记本身，不是排序效果**，这是有意的：整句锚定已整体移除，置不置位当前
-/// 都不改变任何顺序，任何按排序结果写的断言都测不出这个标记的存在与否。
+/// 三条输入覆盖 step 2c 的两个分支：`buzhidaok`/`zhonghuar` 走新建候选，`nihaom` 走同文
+/// 合并（残码整句「你好吗」恰好等于词库里已有的前缀补全）—— 合并分支漏标 `is_sentence`
+/// 不会编译报错，只会让它在排序里退化成普通补全。
 ///
-/// 该字段现已无消费点，等同于一条待回收的死码 —— 保留本断言是为了在它被回收之前，
-/// 「置位点被误删」这件事仍有东西守着。回收时连同本用例一并删除。
+/// `consumed_length == 输入长度` 是残码整句区别于 step 2 整句的关键：后者在 `buzhidaok`
+/// 下只消费 8/9 键。协调器比较链 ⓪ 靠这个值把「不知道看」排在「不知道」之前。
+///
+/// （曾另有一条 `is_sentence_unanchored` 断言，用于守「摘掉 freq_rerank 顶部锚定」。
+///  整句锚定已整体移除、该字段随之回收。）
 #[test]
-fn partial_sentence_is_marked_unanchored() {
+fn partial_sentence_is_marked_sentence_and_consumes_all() {
     let Some(dir) = data_dir() else {
         eprintln!("跳过：拼音词库不存在");
         return;
@@ -499,11 +503,11 @@ fn partial_sentence_is_marked_unanchored() {
             .iter()
             .find(|c| c.text == want)
             .unwrap_or_else(|| panic!("{input} 应产出残码整句「{want}」"));
-        assert!(
-            hit.is_sentence && hit.is_sentence_unanchored,
-            "「{want}」须同时带整句身份与 unanchored 标记（实际 sentence={} unanchored={}）",
-            hit.is_sentence,
-            hit.is_sentence_unanchored
+        assert!(hit.is_sentence, "「{want}」须带整句身份");
+        assert_eq!(
+            hit.consumed_length,
+            input.len(),
+            "「{want}」须消费整串（含残码），否则协调器 ⓪ 会把它排到 step 2 整句之后"
         );
     }
 }
