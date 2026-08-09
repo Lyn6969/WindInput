@@ -20,9 +20,36 @@ use tracing::{debug, warn};
 ///
 /// 值域语义见 docs/design/schema-key-actions.md §2。
 fn is_supported_hotkey_action(action: &str) -> bool {
-    action
-        .strip_prefix("toggle_schema:")
-        .is_some_and(|id| !id.trim().is_empty())
+    hotkey_action_entry(action).is_some()
+}
+
+/// 组合键动词 → `(分发端 action, 策略位)`；不支持的动词返回 `None`。
+///
+/// ★★ **策略位必须按动词分**，不能一律不带：同一个位在两类机制下后果相反。
+///
+/// | 动词 | 策略位 | why |
+/// |---|---|---|
+/// | `toggle_schema:<id>` | 无 | 回程恰恰要在**非中文态**下按得动——带上 `CHINESE_ONLY` 就成了单程票，切到英文方案后回不来 |
+/// | `special:<id>` | `CHINESE_ONLY \| GLOBAL` | 进 overlay 只在中文输入中途有意义；`GLOBAL` 让 TSF 用 `RegisterHotKey` 抢占，穿透 QQNT/Tabby 等 Chromium 宿主的同名加速键 |
+///
+/// ★ 动词形态在此做一次映射：引导键通路用 `special:<id>`（[`crate::BoundAction`] 的值域），
+/// 而热键分发端认的是 `enter_special:<id>`。两条通路的分发端不同，动词形态也就不同——
+/// 映射放在编译期，分发端零改动。
+fn hotkey_action_entry(action: &str) -> Option<(String, u32)> {
+    if let Some(id) = action.strip_prefix("toggle_schema:")
+        && !id.trim().is_empty()
+    {
+        return Some((action.to_string(), 0));
+    }
+    if let Some(id) = action.strip_prefix("special:")
+        && !id.trim().is_empty()
+    {
+        return Some((
+            format!("enter_special:{}", id.trim()),
+            HOTKEY_POLICY_CHINESE_ONLY | HOTKEY_POLICY_GLOBAL,
+        ));
+    }
+    None
 }
 
 /// `keys.key_actions` 的一条条目该走哪条通路。由**键的形态**决定，不由动词决定。
@@ -208,23 +235,16 @@ impl Compiler {
             }
         }
 
-        // ── KeyDown：特殊模式 / 临拼 直达热键（CHINESE_ONLY | GLOBAL，与加词键同策略） ──
-        // 与引导键（trigger_keys）共存：热键路径进入时组合区不写引导符（分发点传 key_code=0）。
+        // ── KeyDown：临拼直达热键（CHINESE_ONLY | GLOBAL，与加词键同策略） ──
+        // 与引导键共存：热键路径进入时组合区不写引导符（分发点传 key_code=0）。
         // GLOBAL 位使 TSF 在「中文 + 文本框」时 RegisterHotKey 全局拦截，穿透 QQNT/Tabby 等
-        // Chromium 宿主的加速键双处理。id 为空的特殊模式跳过（分发点无法按 id 定位）。
+        // Chromium 宿主的加速键双处理。
+        //
+        // 特殊模式的直达热键**不在这里**：它已收编进 `keys.key_actions`（写作
+        // `"ctrl+shift+u" = "special:<方案id>"`），由上方的 `KeyActionRoute::Hotkey`
+        // 分支按动词取策略位编译。原先那段遍历 `schema.special_modes[].hotkey` 的循环
+        // 连同「id 为空则跳过」那条陷阱一并消失——身份现在就是方案 id，不可能为空。
         let mode_policy = HOTKEY_POLICY_CHINESE_ONLY | HOTKEY_POLICY_GLOBAL;
-        for m in &self.config.schema.special_modes {
-            if m.id.is_empty() {
-                continue;
-            }
-            if let Some(raw) = parse_hotkey(&m.hotkey) {
-                result.key_down.push(HotkeyEntry {
-                    tsf_hash: raw | mode_policy,
-                    match_hash: raw,
-                    action: format!("enter_special:{}", m.id),
-                });
-            }
-        }
         if let Some(raw) = parse_hotkey(&self.config.input.temp_pinyin.hotkey) {
             result.key_down.push(HotkeyEntry {
                 tsf_hash: raw | mode_policy,
@@ -279,14 +299,16 @@ impl Compiler {
             };
             match route {
                 KeyActionRoute::Hotkey => {
-                    if !is_supported_hotkey_action(action) {
+                    let Some((dispatch_action, policy)) = hotkey_action_entry(action) else {
                         warn!("keys.key_actions: 组合键不支持动词 {action:?}（键 {key:?}），忽略");
                         continue;
-                    }
+                    };
                     result.key_down.push(HotkeyEntry {
-                        tsf_hash: raw,
+                        // match_hash 恒不含策略位——策略位是给 TSF 看的转发/抢占指示，
+                        // 服务端匹配只认裸 hash（与 enter_special / add_word 同构）。
+                        tsf_hash: raw | policy,
                         match_hash: raw,
-                        action: action.to_string(),
+                        action: dispatch_action,
                     });
                 }
                 // 修饰键：只登记转发，动作由服务端按 `BoundAction` 裁决。
@@ -912,21 +934,20 @@ mod tests {
         assert!(tp.tsf_hash & HOTKEY_POLICY_CHINESE_ONLY != 0);
     }
 
+    /// 特殊模式直达热键现在写在 `keys.key_actions` 里（`special:<方案id>`），
+    /// 编译时映射成分发端认的 `enter_special:<id>`，并带 CHINESE_ONLY | GLOBAL。
     #[test]
     fn special_mode_hotkey_compiles_with_global_policy() {
-        use crate::config::SpecialModeConfig;
         let mut cfg = Config::default();
-        cfg.schema.special_modes = vec![SpecialModeConfig {
-            id: "rare".to_string(),
-            hotkey: "ctrl+shift+u".to_string(),
-            ..Default::default()
-        }];
+        cfg.keys
+            .key_actions
+            .insert("ctrl+shift+u".to_string(), "special:rare".to_string());
         let compiled = Compiler::new(cfg).compile();
         let e = compiled
             .key_down
             .iter()
             .find(|e| e.action == "enter_special:rare")
-            .expect("special_modes[].hotkey 应编出 enter_special:<id>");
+            .expect("key_actions 的 special:<id> 应编出 enter_special:<id>");
         // 与加词键同策略：CHINESE_ONLY | GLOBAL；match_hash 不含任何 policy 位
         assert!(e.tsf_hash & HOTKEY_POLICY_GLOBAL != 0);
         assert!(e.tsf_hash & HOTKEY_POLICY_CHINESE_ONLY != 0);
@@ -1029,11 +1050,9 @@ mod tests {
         // 反向对照：同一份编译产物里，特殊模式热键确实是带 CHINESE_ONLY 的——
         // 否则「不带」这条断言在 policy 位整体失效时也会通过。
         let mut cfg2 = Config::default();
-        cfg2.schema.special_modes = vec![crate::config::SpecialModeConfig {
-            id: "rare".to_string(),
-            hotkey: "ctrl+shift+u".to_string(),
-            ..Default::default()
-        }];
+        cfg2.keys
+            .key_actions
+            .insert("ctrl+shift+u".to_string(), "special:rare".to_string());
         let c2 = Compiler::new(cfg2).compile();
         let e2 = c2
             .key_down
@@ -1071,24 +1090,19 @@ mod tests {
         assert_eq!(order, expect, "应按 schema id 升序编译");
     }
 
+    /// 动词 id 为空（`special:`）不产生条目；`temp_pinyin.hotkey` 默认空同理。
+    ///
+    /// 「id 为空」原先是 `special_modes[]` 条目的一个真实陷阱（只写 schema 不写 id 的
+    /// 条目会静默不注册热键）。身份收敛到方案 id 后它不可能为空，这里只剩防脏数据。
     #[test]
     fn empty_or_idless_mode_hotkey_produces_no_entry() {
-        use crate::config::SpecialModeConfig;
         let mut cfg = Config::default();
-        // 空 hotkey（默认）+ 空 id 的特殊模式：都不该产生条目
-        cfg.schema.special_modes = vec![
-            SpecialModeConfig {
-                id: String::new(),
-                hotkey: "ctrl+shift+u".to_string(), // 有键但 id 空 → 跳过
-                ..Default::default()
-            },
-            SpecialModeConfig {
-                id: "empty_hk".to_string(),
-                hotkey: String::new(), // 有 id 但键空 → 跳过
-                ..Default::default()
-            },
-        ];
-        // temp_pinyin.hotkey 默认空 → 无条目
+        cfg.keys
+            .key_actions
+            .insert("ctrl+shift+u".to_string(), "special:".to_string());
+        cfg.keys
+            .key_actions
+            .insert("ctrl+shift+i".to_string(), "special:   ".to_string());
         let compiled = Compiler::new(cfg).compile();
         assert!(
             !compiled

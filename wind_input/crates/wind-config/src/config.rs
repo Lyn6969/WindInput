@@ -261,9 +261,18 @@ pub struct SchemaConfig {
     /// 快捷输入（日期/计算等内置类方案）配置。将随"英文/快捷做成方案"一并重构。
     #[serde(default)]
     pub quick_input: QuickInputConfig,
-    /// 特殊模式列表（各自带码表 + 上屏策略；引导键触发）。
-    #[serde(default)]
-    pub special_modes: Vec<SpecialModeConfig>,
+    /// **已废弃**：特殊模式的实例集合改由「带 `[overlay]` 段的已安装方案」定义
+    /// （`EngineManager::overlay_modes`），见 `docs/redesign/overlay-mode-config.md`。
+    ///
+    /// 字段保留只为**读得出残留值以便告警**（[`Config::warn_legacy_special_modes`]）——
+    /// 删掉的话 serde 会静默丢弃这一段，用户改了半天配置没反应还查不到原因。
+    /// 不参与任何行为，也不再写出（`skip_serializing_if`）。
+    #[serde(
+        rename = "special_modes",
+        default,
+        skip_serializing_if = "Vec::is_empty"
+    )]
+    pub legacy_special_modes: Vec<toml::Value>,
     /// 临时 mix 模式列表（引导键触发，合并多个成员方案的候选）。
     #[serde(default = "default_mix_modes")]
     pub mix_modes: Vec<MixModeConfig>,
@@ -281,7 +290,7 @@ impl Default for SchemaConfig {
             mix: MixGlobal::default(),
             english: EnglishGlobal::default(),
             quick_input: QuickInputConfig::default(),
-            special_modes: Vec::new(),
+            legacy_special_modes: Vec::new(),
             mix_modes: default_mix_modes(),
         }
     }
@@ -1287,59 +1296,10 @@ fn default_mix_modes() -> Vec<MixModeConfig> {
     }]
 }
 
-/// 特殊模式配置（纯 overlay 激活面）。引擎/码表配置拉平到其引用的真实方案
-/// `<schema>.schema.toml`，全码策略复用方案的 [engine.codetable]。
-#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
-pub struct SpecialModeConfig {
-    /// 实例唯一标识
-    #[serde(default)]
-    pub id: String,
-    /// 显示名（UI 徽标 / 模式指示全称，如 "快符"）
-    #[serde(default)]
-    pub name: String,
-    /// 模式指示短称（如 "符"；空则取 name 首字）
-    #[serde(default)]
-    pub short_name: String,
-    /// 引导键列表（如 "grave"/"backslash"）。**只认符号键**——字母不作引导键，
-    /// 见 `Coordinator::special_trigger_vk`；要让 z 进本模式请配 `schema.codetable.z_key_action`。
-    #[serde(default)]
-    pub trigger_keys: Vec<String>,
-    /// 引用的方案 id（其 .schema.toml 提供码表与全码策略；不进 schema.available，仅 overlay 触发懒加载）
-    #[serde(default)]
-    pub schema: String,
-    /// 专用直达热键（如 "ctrl+shift+u"，空串=不注册）。与 `trigger_keys` 引导键共存；
-    /// 热键进入时组合区不写引导符（见 docs/design/special-mode-entry-hotkey.md）。
-    #[serde(default)]
-    pub hotkey: String,
-    /// 进入模式即展示候选：空编码（刚进入、尚未敲码）时枚举该方案码表首页候选（按 weight 降序），
-    /// UI 按 per_page 分页浏览。默认 false（进入空白，敲码才出候选）。
-    /// 面向快符/生僻字等**小符号表**的「进入即浏览」；大表会遍历全表取首 N 条、有开销，慎用。
-    #[serde(default)]
-    pub show_all_on_enter: bool,
-    /// 进入本特殊模式期间的候选布局（默认跟随全局）。每实例独立——快符表可竖排、
-    /// 生僻字表可横排，互不影响。
-    #[serde(default)]
-    pub candidate_layout: LayoutIntent,
-    /// 本特殊模式期间的注释模板覆盖（竖排），见 [`CommentTemplateOverride`]。
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub comment_template_vertical: CommentTemplateOverride,
-    /// 本特殊模式期间的注释模板覆盖（横排），见 [`CommentTemplateOverride`]。
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub comment_template_horizontal: CommentTemplateOverride,
-}
-
-impl SpecialModeConfig {
-    /// 有效 id：`id` 非空则用之，否则回退 `schema`（瘦身条目只写 `schema` + `trigger_keys`，
-    /// 身份从被引用方案文件派生）。供直达热键 `enter_special:<id>` 定位。
-    pub fn effective_id(&self) -> &str {
-        if self.id.is_empty() {
-            &self.schema
-        } else {
-            &self.id
-        }
-    }
-}
-
+/// ⛔ `SpecialModeConfig` 已删除。特殊模式的实例集合改由「带 `[overlay]` 段的已安装方案」
+/// 定义（`EngineManager::overlay_modes`）：呈现配置落方案文件的 `[overlay]` 段，引导键与
+/// 直达热键落 `keys.key_actions`（`special:<方案id>`）。
+/// 见 `docs/redesign/overlay-mode-config.md`。残留旧配置的告警见 `warn_legacy_special_modes`。
 // ───────────────────────── input（输入行为）─────────────────────────
 
 /// 「检索范围」智能档的放宽增强（设计见 `docs/design/smart-filter-scope-relax.md`）。
@@ -3085,6 +3045,46 @@ impl Config {
         // 须在 migrate_letter_trigger_keys **之后**：那一步先把字母项摘干净，
         // 这里看到的 trigger_keys 已只剩符号键。
         self.migrate_trigger_keys_into_key_actions();
+        self.warn_legacy_special_modes();
+    }
+
+    /// 残留的 `schema.special_modes` 告警（**不迁移**，见 `docs/redesign/overlay-mode-config.md` §5）。
+    ///
+    /// 该键已废弃：实例集合改由「带 `[overlay]` 段的已安装方案」定义。刻意不做自动迁移——
+    /// 呈现字段的新家是 `schema_overrides/{id}.toml`，而本函数所在的 `normalize` 是
+    /// **零 IO、幂等、纯内存**的（五c 立的口径：不写盘，回退一版就能工作），写盘型迁移要
+    /// 另起一套「一次性副作用 + 迁移状态标记」的机制，代价远超它能省下的那几行手工配置。
+    ///
+    /// 但也**不能静默丢弃**：用户的 config.toml 里那一段还在，看起来像仍然生效。
+    /// 一条 warn 是「让失效可见」的最低成本手段——这正是本仓反复栽过的「配了没反应」那类。
+    fn warn_legacy_special_modes(&mut self) {
+        if self.schema.legacy_special_modes.is_empty() {
+            return;
+        }
+        let ids: Vec<String> = self
+            .schema
+            .legacy_special_modes
+            .iter()
+            .map(|v| {
+                // 身份现在就是方案 id，故优先报 `schema` 字段——那才是用户要去建
+                // `[overlay]` 段的那个方案文件。
+                v.get("schema")
+                    .or_else(|| v.get("id"))
+                    .and_then(|s| s.as_str())
+                    .unwrap_or("?")
+                    .to_string()
+            })
+            .collect();
+        warn!(
+            "schema.special_modes 已废弃且不再生效（残留 {} 条：{}）。\
+             改法：在对应方案的 .schema.toml（或 schema_overrides/<id>.toml）加 [overlay] 段，\
+             引导键与直达热键写进 keys.key_actions（如 backslash = \"special:<方案id>\"）。\
+             详见 docs/redesign/overlay-mode-config.md",
+            ids.len(),
+            ids.join(", ")
+        );
+        // 清空：留着会让后续任何「有没有配过」的判断读到假信号。
+        self.schema.legacy_special_modes.clear();
     }
 
     /// 存量迁移：四处 `trigger_keys` → `keys.key_actions`（设计文档五c「全局层收编」）。
@@ -3138,16 +3138,9 @@ impl Config {
             "temp_pinyin".to_string(),
             "input.temp_pinyin",
         );
-        for m in self.schema.special_modes.iter_mut() {
-            // effective_id 借的是 &self，先取成 owned 再动 trigger_keys。
-            let id = m.effective_id().to_string();
-            if id.is_empty() {
-                m.trigger_keys.clear();
-                continue;
-            }
-            let owner = format!("schema.special_modes[{id}]");
-            take(&mut m.trigger_keys, format!("special:{id}"), &owner);
-        }
+        // 特殊模式**不在此折算**：它的实例已不来自 `schema.special_modes`，引导键与直达
+        // 热键直接写在 `keys.key_actions` 里（`special:<方案id>`）。残留旧配置由
+        // `warn_legacy_special_modes` 告警，不做迁移（见设计文档 §5）。
         for m in self.schema.mix_modes.iter_mut() {
             if m.id.is_empty() {
                 m.trigger_keys.clear();
@@ -3221,12 +3214,8 @@ impl Config {
         ) {
             claim("temp_pinyin".to_string());
         }
-        for m in self.schema.special_modes.iter_mut() {
-            let owner = format!("schema.special_modes[{}]", m.effective_id());
-            if take_letters(&mut m.trigger_keys, &owner) {
-                claim(format!("special:{}", m.effective_id()));
-            }
-        }
+        // 特殊模式那一路已随 `schema.special_modes` 一并废弃：z 要进某个 overlay 方案，
+        // 直接写 `schema.codetable.z_key_action = "special:<方案id>"`（或方案级 key_actions）。
         for m in self.schema.mix_modes.iter_mut() {
             let owner = format!("schema.mix_modes[{}]", m.id);
             if take_letters(&mut m.trigger_keys, &owner) {
@@ -3747,13 +3736,16 @@ mod tests {
         );
     }
 
-    /// 归属优先级与老的模式激活链一致：临拼 > 特殊模式 > mix。
+    /// 归属优先级与老的模式激活链一致：临拼 > mix。
+    ///
+    /// （原先链中的「特殊模式」一环已随 `schema.special_modes` 废弃——z 要进 overlay
+    /// 方案改为直接写 `z_key_action = "special:<方案id>"`，不再有可折算的来源。）
     #[test]
     fn migrate_letter_trigger_keys_follows_activation_priority() {
         let mut c = Config::default();
         c.input.temp_pinyin.trigger_keys = vec!["z".into()];
-        c.schema.special_modes = vec![SpecialModeConfig {
-            id: "rare".into(),
+        c.schema.mix_modes = vec![MixModeConfig {
+            id: "mx".into(),
             trigger_keys: vec!["z".into()],
             ..Default::default()
         }];
@@ -3764,22 +3756,20 @@ mod tests {
             "同时配在多处时按激活链取临拼（老实现也是临拼先匹配）"
         );
         assert!(
-            c.schema.special_modes[0].trigger_keys.is_empty(),
+            c.schema.mix_modes[0].trigger_keys.is_empty(),
             "未中选的字母项同样要摘除，否则留在配置里也是静默失效"
         );
     }
 
-    /// 五c 迁移：四处 `trigger_keys` 折算进 `keys.key_actions`。
+    /// 五c 迁移：三处 `trigger_keys` 折算进 `keys.key_actions`。
+    ///
+    /// 原为四处——`schema.special_modes[]` 那一处已随该键废弃而消失（实例集合改由带
+    /// `[overlay]` 段的方案定义，引导键直接写 `keys.key_actions`）。
     #[test]
     fn migrate_trigger_keys_folds_all_four_sources() {
         let mut c = Config::default();
         c.input.temp_pinyin.trigger_keys = vec!["backtick".into()];
         c.input.temp_english.trigger_keys = vec!["quote".into()];
-        c.schema.special_modes = vec![SpecialModeConfig {
-            id: "fuhao".into(),
-            trigger_keys: vec!["backslash".into()],
-            ..Default::default()
-        }];
         c.schema.mix_modes = vec![MixModeConfig {
             id: "quick_mix".into(),
             trigger_keys: vec!["semicolon".into()],
@@ -3791,10 +3781,6 @@ mod tests {
         assert_eq!(ka.get("backtick").map(String::as_str), Some("temp_pinyin"));
         assert_eq!(ka.get("quote").map(String::as_str), Some("temp_english"));
         assert_eq!(
-            ka.get("backslash").map(String::as_str),
-            Some("special:fuhao")
-        );
-        assert_eq!(
             ka.get("semicolon").map(String::as_str),
             Some("mix:quick_mix")
         );
@@ -3802,7 +3788,6 @@ mod tests {
         // 旧字段清空——留着也是静默失效，而用户会以为它还生效。
         assert!(c.input.temp_pinyin.trigger_keys.is_empty());
         assert!(c.input.temp_english.trigger_keys.is_empty());
-        assert!(c.schema.special_modes[0].trigger_keys.is_empty());
         assert!(c.schema.mix_modes[0].trigger_keys.is_empty());
     }
 
@@ -3818,11 +3803,6 @@ mod tests {
         // 同一个 `;` 配给四处，按真实顺序应归临英。
         c.input.temp_english.trigger_keys = vec!["semicolon".into()];
         c.input.temp_pinyin.trigger_keys = vec!["semicolon".into()];
-        c.schema.special_modes = vec![SpecialModeConfig {
-            id: "sp".into(),
-            trigger_keys: vec!["semicolon".into()],
-            ..Default::default()
-        }];
         c.schema.mix_modes = vec![MixModeConfig {
             id: "mx".into(),
             trigger_keys: vec!["semicolon".into()],
@@ -3835,11 +3815,11 @@ mod tests {
             "临英在激活链最前，应赢下争用"
         );
 
-        // 单独验临拼 > special：去掉临英那一处。
+        // 单独验临拼 > mix：去掉临英那一处。
         let mut c2 = Config::default();
         c2.input.temp_pinyin.trigger_keys = vec!["grave".into()];
-        c2.schema.special_modes = vec![SpecialModeConfig {
-            id: "sp".into(),
+        c2.schema.mix_modes = vec![MixModeConfig {
+            id: "mx".into(),
             trigger_keys: vec!["grave".into()],
             ..Default::default()
         }];
@@ -3847,7 +3827,7 @@ mod tests {
         assert_eq!(
             c2.keys.key_actions.get("grave").map(String::as_str),
             Some("temp_pinyin"),
-            "临拼排在特殊模式之前"
+            "临拼排在 mix 之前"
         );
     }
 
@@ -3873,39 +3853,63 @@ mod tests {
     #[test]
     fn migrate_trigger_keys_skips_empty_and_unparsable() {
         let mut c = Config::default();
-        c.schema.special_modes = vec![SpecialModeConfig {
-            id: "sp".into(),
+        c.schema.mix_modes = vec![MixModeConfig {
+            id: "mx".into(),
             trigger_keys: vec!["".into(), "  ".into(), "根本不是键".into()],
             ..Default::default()
         }];
         c.normalize();
         assert!(
-            !c.keys.key_actions.values().any(|v| v == "special:sp"),
+            !c.keys.key_actions.values().any(|v| v == "mix:mx"),
             "空串/无法解析的键名不该进表，实际 {:?}",
             c.keys.key_actions
         );
     }
 
-    /// 特殊模式独有的 z：折算成 `special:<id>`。
+    /// 残留的 `schema.special_modes` **能被读出来**（供告警），且 `normalize` 后清空。
+    ///
+    /// ★ 「读得出」这一条是关键：字段若直接删掉，serde 会静默丢弃整段——用户 config.toml
+    /// 里那几行还在、看起来仍然生效，实际早已无人消费。本仓反复栽过的「配了没反应」正是
+    /// 这个形状，故这里用 `Vec<toml::Value>` 把它接住，只为发一条 warn。
     #[test]
-    fn migrate_letter_trigger_keys_maps_special_mode() {
-        let mut c = Config::default();
-        c.schema.special_modes = vec![SpecialModeConfig {
-            id: "rare".into(),
-            trigger_keys: vec!["backslash".into(), "z".into()],
-            ..Default::default()
-        }];
-        c.normalize();
+    fn legacy_special_modes_is_read_then_cleared_with_warning() {
+        let toml_src = r#"
+[schema]
+active = "wubi86"
 
-        assert_eq!(c.schema.codetable.z_key_action, "special:rare");
-        // 同上：符号引导键随后被收编迁移取走，断言它完整到达新表。
-        // 「z 走 z_key_action、符号走 key_actions」两条路并存这一点没变。
-        assert!(c.schema.special_modes[0].trigger_keys.is_empty());
+[[schema.special_modes]]
+id = "kf"
+schema = "kf"
+show_all_on_enter = true
+"#;
+        let mut c: Config = toml::from_str(toml_src).expect("含废弃段的配置仍须解析成功");
         assert_eq!(
-            c.keys.key_actions.get("backslash").map(String::as_str),
-            Some("special:rare"),
-            "符号引导键应完整折算进 keys.key_actions"
+            c.schema.legacy_special_modes.len(),
+            1,
+            "废弃段必须读得出来，否则无法告警"
         );
+        c.normalize();
+        assert!(
+            c.schema.legacy_special_modes.is_empty(),
+            "告警后须清空——留着会让后续「有没有配过」的判断读到假信号"
+        );
+        // 且**不做**任何迁移：不得凭空往 key_actions 里塞绑定（见设计文档 §5）。
+        assert!(
+            !c.keys
+                .key_actions
+                .values()
+                .any(|v| v.starts_with("special:")),
+            "本轮刻意不迁移，实际 {:?}",
+            c.keys.key_actions
+        );
+    }
+
+    /// 废弃字段不再写出：`skip_serializing_if` 保证保存后 config.toml 里不会又冒出来。
+    #[test]
+    fn legacy_special_modes_is_not_serialized_back() {
+        let c = Config::default();
+        let out = toml::to_string(&c).expect("序列化");
+        assert!(!out.contains("special_modes"), "废弃字段不该写回配置文件");
     }
 
     /// 已显式配过 `z_key_action` 时，存量迁移不得覆盖用户的新配置。

@@ -26,16 +26,20 @@ primary_codetable = ""
 # 主拼音方案 ID（临时拼音的目标方案，如双拼方案 id），留空 = 全拼 "pinyin"
 primary_pinyin = ""
 
-# ── 刻意不在本文件出现的两个键（实例集合，注册表类型 StructList）────────────
-# schema.special_modes  特殊模式列表（引导键 + 引用方案 id；代码默认 = 空数组）
+# ── 刻意不在本文件出现的一个键（实例集合，注册表类型 StructList）────────────
 # schema.mix_modes      临时融合模式列表（代码默认 = 内置「快捷」quick_mix，`;` 触发，
 #                       成员 quick_input.calc/.date/.number/.repeat + $primary_pinyin + english）
 #
-# 二者是**结构体数组**，本文件一旦写出就会整体替换代码默认值，把当时的定义**冻结**
+# 它是**结构体数组**，本文件一旦写出就会整体替换代码默认值，把当时的定义**冻结**
 # 成快照——日后在 `default_mix_modes()` 里给内置「快捷」加成员或改触发键，全部会被
 # 这份陈旧快照静默遮蔽（用户配置层已因设置页整表写回踩过同一个坑，见
 # `Config::migrate_quick_mix_pinyin_member`）。故真相源留在代码侧，本文件不写。
-# 二者已在 `data_config_toml_covers_registry` 的豁免名单中登记。
+# 它已在 `data_config_toml_covers_registry` 的豁免名单中登记。
+#
+# 原先并列的 `schema.special_modes` 已**删除**：特殊模式（快符/生僻字等）的实例集合
+# 改由「带 [overlay] 段的已安装方案」定义，呈现配置写在方案文件的 [overlay] 段，
+# 引导键与直达热键写在下方 [keys.key_actions]（如 backslash = "special:<方案id>"）。
+# 见 docs/redesign/overlay-mode-config.md。
 
 # 全局码表配置：所有码表方案公共基线（出厂取主力码表 wubi86 偏好）。
 # 方案个性覆盖：在方案 .schema.toml 的 [engine.codetable] 内联行为字段（作者基线），或

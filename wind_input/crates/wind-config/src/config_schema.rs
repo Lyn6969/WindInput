@@ -26,7 +26,7 @@ pub enum FieldType {
     StrList,
     /// 键值映射表（如自定义标点 mappings）。
     Map,
-    /// 结构体数组（如 special_modes / mix_modes），整体作不透明叶子。
+    /// 结构体数组（如 mix_modes），整体作不透明叶子。
     StructList,
 }
 
@@ -178,7 +178,6 @@ static REGISTRY: &[ConfigField] = &[
     // 强制竖排原在此（force_vertical）。它其实是 quick_mix **实例**的显示属性，已迁往
     // mix_modes[].candidate_layout；per-instance 字段由 StructList 条目承载，不另立项
     // （一个配置键只能有一个 manifest 项）。
-    f("schema.special_modes", StructList),
     f("schema.mix_modes", StructList),
     // -- input（输入行为）--
     f("input.filter_mode", Str),
@@ -704,7 +703,6 @@ mod tests {
     /// **加条目前请三思**：豁免一个键 = 它的默认值从此不在说明书里，
     /// 只有「写进去会造成实际危害」才够格，「懒得写」不够格。
     const ABSENT_FROM_DATA_CONFIG: &[&str] = &[
-        "schema.special_modes",
         "schema.mix_modes",
         // 注释词库挂载列表：**出厂为空数组**（不随附任何注释词库——词典内容多有版权，
         // 由用户自行放置）。写进预置文件除了一行 `comment_dicts = []` 没有任何信息量，
