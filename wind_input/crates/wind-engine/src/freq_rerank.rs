@@ -323,11 +323,11 @@ pub fn rerank_pinyin_positional(
         // 参与位置提升竞争。锚定原本是硬闸门（命中即维持原序、衰减分连算都不算），只要
         // 它还在，「整句同量纲」就只在无词频记录时成立。
         //
-        // 三个摘锚定布尔（`is_sentence_demoted` / `is_sentence_contested` /
-        // `is_sentence_unanchored`）都是为了在硬闸门上凿洞，随锚定一并失去存在理由。
+        // 摘锚定布尔（`is_sentence_demoted` / `is_sentence_unanchored`，以及已回收的
+        // `is_sentence_contested`）都是为了在硬闸门上凿洞，随锚定一并失去存在理由。
         //
         // 实测移除的影响面极小 —— 锚定此前已被两侧夹到名存实亡：
-        // - 同码同层的竞争者存在 ⇒ step 6.6 已置 `is_sentence_contested` 摘掉锚定；
+        // - 同码同层的竞争者存在 ⇒ step 6.6 已摘掉锚定（该步骤现已随本改动删除）；
         // - 不同层的候选（前缀补全「今天天气」、子短语）⇒ `cmp_match_layers` 在排序键里
         //   位于 target_pos 之前，位置提升推不动它们跨层，锚定与否都一样。
         //
@@ -541,7 +541,7 @@ mod tests {
     /// ★ **模糊同码候选**能靠词频反超整句 —— 这是移除整句锚定唯一实际改变的场景。
     ///
     /// 移除前，其余情形都已被两侧夹掉、锚定名存实亡：
-    /// - 同码同层的竞争者存在 ⇒ 引擎侧 step 6.6 置 `is_sentence_contested`、锚定已摘；
+    /// - 同码同层的竞争者存在 ⇒ 引擎侧 step 6.6 已摘掉锚定（该步骤此后删除）；
     /// - 不同层的候选（前缀补全 / 子短语）⇒ `cmp_match_layers` 在排序键里位于 target_pos
     ///   之前，位置提升本就推不动它们跨层。
     ///
@@ -680,11 +680,12 @@ mod tests {
         );
     }
 
-    /// 有同码竞争者的整句（`is_sentence_contested`）**不再锚定**：同码精确整词可凭词频反超。
+    /// 有同码竞争者的整句**接受词频挑战**：同码精确整词可凭词频反超。
     ///
     /// 现场 `siyuan`：「寺院」既是词典精确整词、又被 Viterbi 选为最优解（step 2 同文合并
-    /// 继承整句身份，weight 被抬到整句量纲），而「思源」同码。锚定是
-    /// 硬闸门，实测灌到 count=5000 都翻不动 —— 词频对该编码整体失效。
+    /// 继承整句身份），而「思源」同码。这里曾经需要一个 `is_sentence_contested` 标记去摘
+    /// 锚定 —— 锚定是硬闸门，实测灌到 count=5000 都翻不动、词频对该编码整体失效。整句
+    /// 锚定移除后，标记连同 step 6.6 一并回收，本行为改由「整句本就不锚定」直接保证。
     #[test]
     fn pinyin_contested_sentence_yields_to_used_peer() {
         let mut cands = vec![pin_contested("寺院"), pin("思源", 245)];
@@ -706,20 +707,13 @@ mod tests {
         assert_eq!(cands[1].text, "寺院", "整句退居第二，不是被赶出列表");
     }
 
-    /// 与上一条配对：**无词频记录时 contested 整句仍居首**。
+    /// 与上一条配对：**无词频记录时同款整句仍居首**。
     ///
-    /// 本字段只摘锚定、不动 weight —— 引擎那边「寺院」拿的仍是 3e7 量纲，靠调用方喂进来的
-    /// 权重序 + 稳定排序保住首位。若哪天误把本字段做成降权，这条会挂。
+    /// 有同码竞争者这件事本身不该压低整句 —— 它靠调用方喂进来的权重序 + 稳定排序保住首位。
+    /// 若哪天误把「有竞争者」做成降权，这条会挂。
     #[test]
     fn pinyin_contested_sentence_still_leads_without_freq() {
-        let mut cands = vec![
-            {
-                let mut c = pin_sentence("寺院", 29_984_561);
-                c.is_sentence_contested = true;
-                c
-            },
-            pin("思源", 245),
-        ];
+        let mut cands = vec![pin_sentence("寺院", 491), pin("思源", 245)];
         let r = recs(&[]);
         rerank_pinyin_positional(
             &mut cands,
@@ -1211,12 +1205,12 @@ mod tests {
     const W_SIYUAN_TEMPLE: i32 = 491;
     const W_SIYUAN_PRODUCT: i32 = 245;
 
-    /// contested 整句：weight 是真机实测的整句量级（3e7 + log_offset）。
-    /// 位置模型不看这个数值，它只决定 base_pos——整句因 3e7 天然占据第 0 位。
+    /// 有同码竞争者的整句。weight 取「寺院」的真实词典值 491 —— 同文合并取
+    /// `max(词典 weight, W_eff)`，整句退役 `SENTENCE_WEIGHT_BASE` 后这就是它的实际量级。
+    /// 位置模型不看这个数值，它只决定 base_pos。
     fn pin_contested(text: &str) -> Candidate {
-        let mut c = pin(text, 29_984_561);
+        let mut c = pin(text, W_SIYUAN_TEMPLE);
         c.is_sentence = true;
-        c.is_sentence_contested = true;
         c
     }
 

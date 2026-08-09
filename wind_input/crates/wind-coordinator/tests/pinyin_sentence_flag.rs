@@ -14,16 +14,16 @@
 //! 于是同码的「恭贺」无论被选中多少次都翻不过它 —— 词频维度对整个 `gonghe` 编码失效。
 //! `siyuan` 的「寺院」压住「思源」是同一现场（实测灌到 count=5000 仍纹丝不动）。
 //!
-//! 现由 `Candidate::is_sentence_contested` 标记这类「有同码竞争者」的整句并摘掉其锚定。
+//! 当时的修法是给这类「有同码竞争者」的整句标 `is_sentence_contested` 并摘掉其锚定。
 //!
-//! ## ⚠️ 锚定本身已移除（整句退役 `SENTENCE_WEIGHT_BASE` 的步骤 2）
+//! ## ⚠️ 锚定本身已移除，contested 已回收
 //!
-//! `freq_rerank` 的 `anchored` 只剩精确码短语，整句一律不锚定。本文件下面提到的「摘锚定」
-//! 因此都是**历史成因**——`is_sentence_contested` / `is_sentence_unanchored` 两个字段的
-//! 存在理由随之消失，待 `docs/design/sentence-weight-same-axis.md` §5 步骤 3/4 回收。
+//! `freq_rerank` 的 `anchored` 只剩精确码短语，整句一律不锚定（整句 weight 与词库同量纲
+//! 之后，硬闸门让「同量纲」只在无词频记录时成立）。于是 step 6.6 与
+//! `is_sentence_contested` 字段一并删除，`is_sentence_unanchored` 亦已无消费点、待回收。
 //!
 //! **三条用例的目标不变**：它们锁的是「整句不得压死词频」，锚定移除后这个目标只会更强地
-//! 成立，故断言一字未改。跨层重建把标记丢掉的失效模式也仍被它们覆盖。
+//! 成立，故断言一字未改 —— 现在它们守的是「整句不锚定」这条性质本身。
 //!
 //! **本测试保护的目标没有变**：`is_sentence` 与 `is_sentence_contested` 同为 Candidate 上
 //! 相邻的 `serde(skip)` 字段，「跨层重建把标记丢掉」这一失效模式会同时丢掉两者 ——
@@ -64,8 +64,8 @@ fn press_letter(coord: &Coordinator, c: char) {
 
 /// 「恭贺」被反复使用出高词频后，gonghe 的首选须让给它；整句「共和」退居第二而非消失。
 ///
-/// 若 `is_sentence_contested` 在跨层传递中丢失，「共和」会恢复顶部锚定、把「恭贺」
-/// 永久压在下面——本断言即会失败（这正是修复前的行为）。
+/// 若整句在 `freq_rerank` 里恢复顶部锚定，「共和」会把「恭贺」永久压在下面——本断言
+/// 即会失败（这正是最初的行为）。
 #[test]
 fn test_sentence_flags_survive_to_freq_rerank() {
     let d = data_dir();
@@ -100,7 +100,7 @@ fn test_sentence_flags_survive_to_freq_rerank() {
     assert_eq!(
         all.first().map(|s| s.as_str()),
         Some("恭贺"),
-        "反复使用过的同码词须能反超整句（is_sentence_contested 应贯通到 freq_rerank），实际候选: {head:?}"
+        "反复使用过的同码词须能反超整句（整句不得在 freq_rerank 里锚定），实际候选: {head:?}"
     );
     assert_eq!(
         all.get(1).map(|s| s.as_str()),

@@ -49,7 +49,7 @@ use wind_dict::cached::CachedDict;
 /// 二者差两个数量级以上、**不可比**。后果不是「整句排太前」，而是**每次想调整整句的
 /// 相对位置都只能加一个二值开关**——连续的权重比较在跨轴时根本不成立。现存补丁：
 /// step 1.5（反向把词典整词抬到整句量纲）、step 6.5 / 6.5b（改 weight 到 `max-1`）、
-/// step 6.6（`is_sentence_contested` 摘锚定）、`is_sentence_unanchored`、
+/// step 6.6（`is_sentence_contested` 摘锚定，**已随整句锚定一并删除**）、`is_sentence_unanchored`、
 /// `SENTENCE_YIELD_WEIGHT_FLOOR`，以及 `Candidate` 上 4 个整句相关布尔。
 ///
 /// ## 为什么这不会把整句压下去（实测，见 `docs/design/sentence-weight-same-axis.md`）
@@ -1411,15 +1411,9 @@ impl Engine for PinyinEngine {
                                 // 摘掉 freq_rerank 的顶部锚定：本路径猜了一个用户还没输入的
                                 // 音节，不该对词频免疫。见该字段文档。
                                 //
-                                // ⚠️ **看起来冗余，实际不可省**：step 6.6 目前碰巧也会给残码
-                                // 整句标上 `is_sentence_contested`（同样摘锚定），于是删掉本行
-                                // 不会有任何测试变红。但那是**判据的副作用**——6.6 找的是
-                                // `o.code == completed` 的竞争者，而残码整句自己的 code 含残码
-                                // （`zhonghuar` vs 竞争者「中华」的 `zhonghua`），**两者其实
-                                // 不同码**。谁把 6.6 修正成真正的「同码竞争者」，这里就会静默
-                                // 恢复锚定、词频再次失效。故按意图显式置位，并由
-                                // `pinyin_completion::partial_sentence_is_marked_unanchored`
-                                // 直接断言标记本身（而非排序效果）。
+                                // 由 `pinyin_completion::partial_sentence_is_marked_unanchored`
+                                // 直接断言标记本身（而非排序效果）—— 排序效果测不出它：整句
+                                // 锚定已整体移除，置不置位当前都不改变任何顺序。
                                 is_sentence_unanchored: true,
                                 boundary: result.boundary,
                                 ..Default::default()
@@ -2204,46 +2198,11 @@ impl Engine for PinyinEngine {
             }
         }
 
-        // 6.6 整句解「有同码竞争者」标记：**只摘词频锚定，不动 weight**
-        //
-        // 上面的 6.5 处理的是「整句该不该让位」（合成解/模糊解 vs 精确整词），本节处理的是
-        // 另一件事：整句解**自己就是**一个词典精确整词，而同码还有别的精确整词。
-        // `siyuan` 的「寺院」即如此——它经 step 2 的同文合并分支继承了整句身份，而
-        // `freq_rerank` 的顶部锚定是硬闸门（锚定者不参与位置提升），于是同码的「思源」
-        // 无论选中多少次都翻不过它。`gonghe` 共和/恭贺、`nihao` 你好/拟好同构。
-        //
-        // **判据与 6.5 的 `exact_max` 过滤器逐条一致**（同码、非模糊、不在补全/子短语层），
-        // 差别只在这里要的是「存在性」而非「最大权重」。两处若不一致，会出现「6.5 认为有
-        // 竞争者而降级、6.6 认为没有而仍锚定」这类自相矛盾的状态。
-        //
-        // 不动 weight 是有意的：无词频记录时整句仍须凭等效词频量纲居首
-        // （它确实是引擎对整串的最优解读），本标记只让它在**有用户实际选择数据时**接受
-        // 挑战。已降级的整句跳过——它已经让过位了，weight 也已被压低。
-        //
-        // 位置提升模型下这一条尤其自然：3e7 只决定它的 `base_pos = 0`，摘掉锚定后同码
-        // 竞争者靠位次提升到 0 并以「被提升者在前」胜出，无需把 weight 换算成可比量级。
-        //
-        // 无竞争者的整句（`woshizhongguoren` 这类纯合成解、step 1.5 的超长词典整词）
-        // 不置位、维持锚定：那里没有「用户明确选过另一个同码词」这个事实可依据。
-        let contested: Vec<String> = candidates
-            .iter()
-            .filter(|c| c.is_sentence && !c.is_sentence_demoted)
-            .filter(|s| {
-                candidates.iter().any(|o| {
-                    o.text != s.text
-                        && !o.is_fuzzy
-                        && !o.is_prefix
-                        && !o.is_partial
-                        && o.code == completed
-                })
-            })
-            .map(|c| c.text.clone())
-            .collect();
-        for text in contested {
-            if let Some(c) = candidates.iter_mut().find(|c| c.text == text) {
-                c.is_sentence_contested = true;
-            }
-        }
+        // （step 6.6「整句有同码竞争者 → 标 `is_sentence_contested` 摘词频锚定」已删除。
+        //  它的唯一作用是在 `freq_rerank` 的顶部锚定上凿一个洞，好让 `siyuan` 的「思源」、
+        //  `gonghe` 的「恭贺」能靠词频反超同码整句。整句锚定本身已随「整句 weight 与词库
+        //  同量纲」一并移除，这个洞便失去了要凿的墙 —— 实测拆除前后 45 个真机场景逐条一致。
+        //  字段 `Candidate::is_sentence_contested` 同批回收。）
 
         // 引擎内部排序（层级对齐 Go：完整匹配 >> 子短语 >> 前缀补全 >> 模糊）：
         // ① 非模糊优先于模糊（is_fuzzy=false 在前）；② 完整匹配/子短语(is_prefix=false)优先于
@@ -3826,17 +3785,20 @@ mod tests {
         c.is_sentence
     }
 
-    // ── 整句有同码竞争者（step 6.6 摘词频锚定）──────────────────────────────────
+    // ── 词典整词被 Viterbi 选中时的同文合并 ─────────────────────────────────────
 
-    /// 整句解**自己就是**词典精确整词、且同码还有别的精确整词时，须标 `is_sentence_contested`。
+    /// 词典整词恰好被 Viterbi 选为最优解时，经 step 2 的**同文合并**分支继承整句身份，
+    /// 且 weight 取 `max(词典 weight, W_eff)`。
     ///
-    /// 现场 `siyuan`：「寺院」经 step 2 同文合并继承整句身份 → `freq_rerank` 顶部锚定
-    /// （硬闸门）→ 同码「思源」灌到 count=5000 都翻不动。此处用 `nihao` 你好/拟好复现
-    /// 同一结构：**给整词高权重、单字低权重**，迫使 Viterbi 选「你好」这个单节点，
-    /// 从而走同文合并分支（与 `demoted_sentence_falls_below_all_max_weight_exact_words`
-    /// 的构造正好相反 —— 那里要的是合成整句）。
+    /// 构造要点：**给整词高权重、单字低权重**，迫使 Viterbi 选「你好」这个单节点，从而
+    /// 走同文合并分支（与 `demoted_sentence_falls_below_all_max_weight_exact_words` 的
+    /// 构造正好相反 —— 那里要的是多节点合成整句）。
+    ///
+    /// 这个结构曾是 step 6.6 `is_sentence_contested` 的现场（`siyuan` 寺院/思源：整句
+    /// 锚定是硬闸门，同码词灌到 count=5000 都翻不动）。锚定与该字段均已移除，本用例
+    /// 保留的是同文合并本身的三条事实。
     #[test]
-    fn dict_word_sentence_with_same_code_peer_is_contested() {
+    fn dict_word_selected_by_viterbi_inherits_sentence_identity() {
         let mut raw = CodetableDict::empty();
         raw.merge_single("ni".to_string(), "你".to_string(), 100, 0);
         raw.merge_single("hao".to_string(), "好".to_string(), 100, 1);
@@ -3855,31 +3817,20 @@ mod tests {
             !c.is_sentence_demoted,
             "它本身即精确整词，无处可让，不该走 6.5 降级"
         );
-        assert!(
-            c.is_sentence_contested,
-            "同码存在「拟好」→ 须标 contested（否则词频对 nihao 整体失效）"
-        );
-        // 本标记只摘锚定、**不动 weight**。整句退役 SENTENCE_WEIGHT_BASE 后量纲改为
-        // 等效词频，故断言改为「不低于它作为词典整词的原权重」：同文合并取
-        // `max(词典 weight, W_eff)`，50_000 是构造里「你好」的词典值。
+        // 同文合并取 `max(词典 weight, W_eff)`，50_000 是构造里「你好」的词典值。
         assert!(
             c.weight >= 50_000,
-            "本标记只摘锚定、不动 weight，整句权重不该低于其词典权重，实际 {}",
+            "同文合并不得压低词典权重，实际 {}",
             c.weight
         );
-        assert_eq!(
-            r.candidates[0].text, "你好",
-            "无词频记录时整句仍居首（引擎侧顺序不因本标记改变）"
-        );
+        assert_eq!(r.candidates[0].text, "你好", "无词频记录时整句居首");
     }
 
-    /// 对照组：同码**没有**别的精确整词 → 不标 contested，锚定保留。
+    /// 对照组：同码**没有**别的精确整词时，整句身份照样成立。
     ///
-    /// 与上一条合看才证明判据真在看「有无竞争者」，而非恒置位。少了这条，把 6.6 写成
-    /// 无条件置位也能让上一条通过 —— 那会连 `woshizhongguoren` 这类无竞争者的整句
-    /// 一起摘掉锚定。
+    /// 与上一条合看，说明「继承整句身份」取决于 Viterbi 选没选中它，与同码有无竞争者无关。
     #[test]
-    fn dict_word_sentence_without_peer_is_not_contested() {
+    fn dict_word_sentence_without_peer_still_is_sentence() {
         let mut raw = CodetableDict::empty();
         raw.merge_single("ni".to_string(), "你".to_string(), 100, 0);
         raw.merge_single("hao".to_string(), "好".to_string(), 100, 1);
@@ -3893,10 +3844,7 @@ mod tests {
             .find(|c| c.text == "你好")
             .expect("候选中应有「你好」");
         assert!(c.is_sentence, "仍是整句");
-        assert!(
-            !c.is_sentence_contested,
-            "同码无竞争者 → 不得标 contested，锚定须保留"
-        );
+        assert!(c.weight >= 50_000, "同文合并同样取 max，实际 {}", c.weight);
     }
 
     // ── 整句让位于精确整词（step 6.5 降级）─────────────────────────────────────

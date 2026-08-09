@@ -200,32 +200,6 @@ pub struct Candidate {
     /// 引擎内部用，不推送 UI。
     #[serde(skip)]
     pub is_sentence_demoted: bool,
-    /// 整句解**存在同码精确整词的竞争者**（排序决策，与 `is_sentence` 的来源语义正交）。
-    ///
-    /// 触发条件：该候选是整句解（`is_sentence`）且未被降级，而候选中还存在**另一个**
-    /// 覆盖同一段输入的严格精确整词（`code == completed`，非模糊、不在前缀补全/子短语层）。
-    ///
-    /// **要解决什么**：`siyuan` 的「寺院」既是词典精确整词、又恰好被 Viterbi 选为最优解，
-    /// 于是经 `pinyin::convert` step 2 的同文合并分支继承整句身份。而 `freq_rerank` 的顶部
-    /// 锚定是**硬闸门**（`return Ordering::Less`，衰减分连算都不算），于是同码的「思源」
-    /// 无论被选中多少次都永远翻不过它 —— 词频维度对该编码整体失效。`gonghe` 的
-    /// 「共和」vs「恭贺」、`nihao` 的「你好」vs「拟好」同构。
-    ///
-    /// **为什么不直接不标 `is_sentence`**：该标记还被 step 6.5 的**模糊整句降级**消费
-    /// （`is_sentence && is_fuzzy` → 让位于精确整词，`sixiang` 的「是想」让位「思想」）。
-    /// 抹掉来源标记会连带废掉那条判据。同 `is_sentence_demoted` 的先例：**来源事实与排序
-    /// 决策分开表达**。
-    ///
-    /// **为什么不复用 `is_sentence_demoted`**：后者的语义是「已让位」——它同时把 weight
-    /// 压到「最强精确整词 - 1」。本字段**不动 weight**：无词频记录时整句仍须凭其
-    /// 等效词频量纲居首（它确实是引擎的最优解读），只是不再对词频免疫。
-    ///
-    /// **边界**：无同码竞争者的整句（`woshizhongguoren` 这类纯合成解、超长词典整词）
-    /// 不置位，维持锚定 —— 那里没有「用户明确选过另一个同码词」这一事实可依据。
-    ///
-    /// 引擎内部用，不推送 UI。
-    #[serde(skip)]
-    pub is_sentence_contested: bool,
     /// 该整句解**不配占据 `freq_rerank` 的顶部锚定**（排序决策，与 `is_sentence` 的来源语义正交）。
     ///
     /// 锚定的正当性来自「这是引擎对**整串输入**的最优解读」。下列两种整句都不满足这个前提，
@@ -247,10 +221,9 @@ pub struct Candidate {
     /// 情形 2 的判据与 `apply_freq_rerank` 收词频记录时的 `consumes_all` **同源**（那里早已
     /// 写着「分段子候选不能被整串码的历史计数上浮」），此前只用在查询侧、漏了锚定侧。
     ///
-    /// **为什么不复用 [`Self::is_sentence_contested`]**：两者的**效果**确实相同（都是摘锚定、
-    /// 都不动 weight），但那个字段名明确表达「存在同码精确整词的竞争者」。这里的两种整句都
-    /// 没有同码词，硬塞进去会让读到 `is_sentence_contested=true` 的人以为有同码词存在——
-    /// **字段名撒谎比多一个字段更糟**。
+    /// （曾有一个并列的 `is_sentence_contested` 表达「存在同码精确整词的竞争者」，效果同为
+    /// 摘锚定。整句锚定移除后它成了纯死码，已回收 —— 当时不合并两者是因为**字段名撒谎比
+    /// 多一个字段更糟**：这里的两种整句都没有同码词。）
     ///
     /// **为什么不复用 `is_sentence_demoted`**：后者语义是「已让位」并会压 weight；本字段
     /// **不动 weight**，无词频记录时整句仍须凭其等效词频量纲居首，
@@ -348,7 +321,6 @@ impl Default for Candidate {
             is_exact_code: false,
             is_sentence: false,
             is_sentence_demoted: false,
-            is_sentence_contested: false,
             is_sentence_unanchored: false,
             is_promoted_completion: false,
             consumed_length: 0,
