@@ -49,8 +49,14 @@ use wind_dict::cached::CachedDict;
 /// 二者差两个数量级以上、**不可比**。后果不是「整句排太前」，而是**每次想调整整句的
 /// 相对位置都只能加一个二值开关**——连续的权重比较在跨轴时根本不成立。现存补丁：
 /// step 1.5（反向把词典整词抬到整句量纲）、step 6.5 / 6.5b（改 weight 到 `max-1`）、
-/// step 6.6（`is_sentence_contested` 摘锚定）与 `is_sentence_unanchored`（**均已随整句锚定删除**）、
+/// step 6.6（`is_sentence_contested` 摘锚定）与 `is_sentence_unanchored`、
 /// `SENTENCE_YIELD_WEIGHT_FLOOR`，以及 `Candidate` 上 4 个整句相关布尔。
+///
+/// **清理结果**：step 1.5 / 6.6 / `is_sentence_unanchored` 已删（各自零行为差异），
+/// 布尔减到 2 个。**step 6.5 / 6.5b 保留** —— 实测拆不掉，因为同量纲没有解决「整句分数
+/// 系统性偏高」：① 同文合并的 `max(词典 weight, W_eff)` 把模糊惩罚旁路了；
+/// ② 不归一化的 `∏f_i` 让高频字拼成的合成解天然巨大（`sishi`→「是是」压过「四十」）。
+/// 详见 `docs/design/sentence-weight-same-axis.md` §3.2 的实测表。
 ///
 /// ## 为什么这不会把整句压下去（实测，见 `docs/design/sentence-weight-same-axis.md`）
 ///

@@ -372,9 +372,10 @@
   `candidate_display_order` 挣位置，然后与其余候选一样接受词频挑战。此前 `is_sentence` 也在
   锚定之列，那是硬闸门——命中即维持原序、衰减分连算都不算，于是「整句同量纲」只在无词频
   记录时成立。移除的实测影响面极小，锚定早被两侧夹到名存实亡：同码同层的竞争者会让引擎侧
-  step 6.6 置 `is_sentence_contested` 摘掉锚定，不同层的候选则被 `cmp_match_layers` 挡在
-  target_pos 之前推不动。唯一真变化是**模糊同码候选**（6.6 的过滤器带 `!o.is_fuzzy`，不算
-  竞争者）现在能靠词频反超整句。守门测试 `pinyin_fuzzy_peer_can_overtake_sentence`
+  step 6.6 置 `is_sentence_contested` 摘掉锚定（该步骤与字段此后一并删除），不同层的候选
+  则被 `cmp_match_layers` 挡在 target_pos 之前推不动。唯一真变化是**模糊同码候选**（6.6 的
+  过滤器带 `!o.is_fuzzy`，不算竞争者）现在能靠词频反超整句。守门测试
+  `pinyin_fuzzy_peer_can_overtake_sentence`
   + `pinyin_sentence_is_not_pulled_back_to_top`。
 - 其余：先 `cmp_match_layers`（不跨层提拔），再按衰减分（半衰期）软置前，褪色（< ε）落回权重序。
 
