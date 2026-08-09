@@ -7,23 +7,19 @@
 use crate::config::Config;
 use tracing::{debug, warn};
 
-/// `keys.key_actions` 里**组合键**条目支持的动词。
+/// `keys.key_actions` 里**组合键**条目的动词表：动词 → `(分发端 action, 策略位)`；
+/// 不支持的动词返回 `None`。
 ///
 /// 白名单而非「解析得动就收」：写错的动词若静默进热键表，按下时分发端匹配不上、
-/// 什么都不发生，而用户看不出是自己拼错了还是功能坏了。这里拦下并 warn，与
+/// 什么都不发生，而用户看不出是自己拼错了还是功能坏了。调用点拦下并 warn，与
 /// `global_hotkeys` 对不支持动作的处理同策略。
 ///
 /// ★ **只管组合键**。单键条目走的是引导键通路（`Coordinator::bound_action_for`），
-/// 值域是完整的 [`BoundAction`]，不经本函数——两条通路的分发端不同，能认的动词自然
-/// 不同。用一张表管两条路的结果，是要么放行了热键分发端不认的（配了没反应），
+/// 值域是完整的 [`crate::BoundAction`]，不经本函数——两条通路的分发端不同，能认的动词
+/// 自然不同。用一张表管两条路的结果，是要么放行了热键分发端不认的（配了没反应），
 /// 要么挡住了引导键通路完全支持的（能力凭空少一半）。
 ///
 /// 值域语义见 docs/design/schema-key-actions.md §2。
-fn is_supported_hotkey_action(action: &str) -> bool {
-    hotkey_action_entry(action).is_some()
-}
-
-/// 组合键动词 → `(分发端 action, 策略位)`；不支持的动词返回 `None`。
 ///
 /// ★★ **策略位必须按动词分**，不能一律不带：同一个位在两类机制下后果相反。
 ///
