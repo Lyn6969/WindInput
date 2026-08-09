@@ -2,9 +2,13 @@
 //!
 //! 用法：gen_unigram --rime <cn_dicts_dir> --out <unigram.txt>
 //!
-//! 输出格式与 wind-engine/pinyin/lm.rs 的 parse_unigram_freqs() 一致：
+//! 输出格式（与 `gen_dict` 的读取端 `weight::load_unigram()` 一致）：
 //!   # 注释行
 //!   词语\t频次
+//!
+//! **唯一消费者是 `gen_dict`**：它拿这份词频给五笔扩展词库的 CJK 条目赋权。产物留在
+//! `.cache/`，不随 `data/` 分发——引擎的词图打分已改用词条自身的词典权重
+//! （见 wind-engine/pinyin/lattice.rs::score_node_inner），不再读语言模型文件。
 
 use std::collections::HashMap;
 use std::io::Write;

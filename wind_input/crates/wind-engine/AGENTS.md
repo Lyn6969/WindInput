@@ -25,7 +25,7 @@
 - **引擎构建唯一入口是 `manager.rs::build_engine`**：读方案 TOML（用户目录 > 安装目录，再深合并 `schema_overrides/{id}.toml`），按 `engine_type` 分派；mixed 递归构建 primary/secondary 子引擎。新增方案字段须在此解析，并考虑是否需在 `reload_from_config` 热更新（否则改设置要重启才生效）。
 - **码表行为分层（仅码表有 override）**：上屏等行为解析顺序为 方案 `schema_overrides/{id}.toml [codetable]`（带 `enabled` 总开关，逐字段 `Some` 覆盖）> 全局 `schema.codetable` > 内置默认；统一经 `CodetableGlobal::resolved()` / `resolve_codetable()`。拼音、混输**无方案 override**，只读全局 `schema.pinyin` / `schema.mix`。混输的码表类行为继承主码表 `schema.codetable`。调频/造词全局唯一按引擎分（`schema.codetable.frequency` / `schema.pinyin.frequency`）。详见 `docs/redesign/schema-config-layering.md`。
 - **词频是与 weight 解耦的独立维度**：引擎 `convert` 只产出基础权重候选；`freq_rerank` 是 coordinator 排序后调用的纯函数，**不得在引擎内改 weight 做词频**。两套语义（码表永久 used-first / 拼音衰减褪色）不可混用。
-- **拼音 vs 码表的根本差异**：拼音走连续解码（DAG 分词 + Viterbi/unigram 打分 + 层级排序），码表只做 `DictManager` 精确 + 前缀查表无评分。匹配层级的**唯一真相**是 `wind_candidate::cmp_match_layers`（`is_abbrev`/`is_prefix`/`is_partial`），引擎层、协调器 `candidate_display_order`、`freq_rerank` 三处统一调用它，勿再各写一份。
+- **拼音 vs 码表的根本差异**：拼音走连续解码（DAG 分词 + Viterbi 打分 + 层级排序，节点分取自词条自身的词典权重），码表只做 `DictManager` 精确 + 前缀查表无评分。匹配层级的**唯一真相**是 `wind_candidate::cmp_match_layers`（`is_abbrev`/`is_prefix`/`is_partial`），引擎层、协调器 `candidate_display_order`、`freq_rerank` 三处统一调用它，勿再各写一份。
 - **「层级」与「来源」必须分开**：层级键是布尔的，等价于「惩罚 = ∞」，只该用于结构性的匹配质量差异。召回**来源**（模糊音 `is_fuzzy`、用户词 `meta.is_user_dict`）一律走 weight 上的惩罚/加成，不得塞进 `cmp_match_layers`。`is_fuzzy` 曾是其首要键，真实词库下把模糊候选整体压到 200 名开外（`si` 下「是」第 231 位，而生产候选上限 50~300），模糊音在拼音/混输/临拼三条路径上全部等价于未实现；现改为 `FUZZY_WEIGHT_SCALE` 折扣。同理 `is_prefix` 被静态短语、`is_fuzzy` 被用户词简拼借作「沉底」标记都已拆出独立字段（`is_promoted_completion` / `is_abbrev`）——**要沉底就加自己的字段，别借现成的布尔**。
 - **整句候选不吃比例折扣**：Viterbi 整句带 `SENTENCE_WEIGHT_BASE`(3e7) 基准分，与词频量纲（1e2~1e6）差几个数量级，任何 `weight * k` 都压不到同一区间。整句要降位只能走 `is_sentence_demoted`（降到精确整词之下）。
 - **懒加载 + single-flight 构建锁**：`ensure_loaded` 抢方案专属 build_lock 后复查，避免后台预热与首次切换重复熔大词库；不同方案可并行构建。引擎缓存仅在 `invalidate_schema`/`reload_from_config` 清除（无 LRU 驱逐，与 Go 版不同）。
@@ -45,7 +45,7 @@
 
 ### Internal
 - `wind-candidate` — `Candidate`/`CandidateSource`/`better` 排序
-- `wind-dict` — `CachedDict`、`DictManager`/CompositeDict、`SystemDictLayer`/`StoreUserLayer`/`StoreTempLayer`、unigram mmap
+- `wind-dict` — `CachedDict`、`DictManager`/CompositeDict、`SystemDictLayer`/`StoreUserLayer`/`StoreTempLayer`、wdat/wcmt mmap
 - `wind-store` — redb 用户/临时词库与词频记录（`FreqRecord`/`FreqProfile`）
 - `wind-config` — `Config`、`schema::Schema`/`DictSpec`、`CodeCommitConfig`、`PinyinGlobalConfig`
 

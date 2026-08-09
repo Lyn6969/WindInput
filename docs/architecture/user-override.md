@@ -28,7 +28,7 @@
 |---|---|---|
 | `Config::resolve_data_file(data_dir, rel)` | 数据根 `data/` | 数据根下的自带文件 |
 | `Config::resolve_schema_resource(data_dir, rel)` | `data/schemas/` | 方案附属资源（拆字库、字根字体、常用字表） |
-| `EngineManager::resolve_schema_file(rel, data_dir)` | `data/schemas/` | 方案文件 `*.schema.toml`、unigram |
+| `EngineManager::resolve_schema_file(rel, data_dir)` | `data/schemas/` | 方案文件 `*.schema.toml` |
 | `EngineManager::resolve_dict_file(rel, schemas_dir)` | `data/schemas/` | 词库，**四级**优先级（见下） |
 
 词库那条多两级，因为支持 **wdat-only 分发**（用户可只投放编译好的 `.wdat` 而不带源 yaml）：
@@ -76,7 +76,6 @@
 |---|---|---|---|---|
 | 方案文件 | `schemas/{id}.schema.toml` | A | `schema` | `EngineManager::resolve_schema_file` |
 | 词库 | `schemas/{方案}/*.dict.yaml` \| `*.wdat` | A（四级） | `dict` | `EngineManager::resolve_dict_file_in` |
-| unigram 语言模型 | `schemas/{方案}/unigram.txt` | A | `schema` | `build_engine` → `resolve_schema_file` |
 | 拆字库 | `schemas/` 下，由 `[engine.chaizi].db_path` 指定 | A | `resource` | `coordinator.rs` → `resolve_schema_resource` |
 | 字根字体 | `schemas/` 下，由 `[engine.chaizi].font_path` 指定 | A | `resource` | 同上 |
 | 常用字表 | `schemas/common_chars.txt` | A | `resource` | `coordinator.rs` → `resolve_schema_resource` |

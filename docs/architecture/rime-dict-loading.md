@@ -231,7 +231,10 @@ DictManager（每方案一个）→ CompositeDict
 |---|---|---|
 | **wdat** (`datformat.rs`) | `WDAT` / **v4** | **生产链路唯一使用的词库格式**。双数组 Trie，零拷贝 mmap；v3 加 `order`，v4 加 `boundary` + 独立 `AbbrevSection` |
 | wdb (`binformat.rs`) | `WDIC` | **当前生产链路不使用**（仅测试引用）。`DictEntry::boundary` 类型定义仍被 wdat 复用 |
-| unigram (`unigram.rs`) | `WUNI` / v1 | 词频，与词库无关 |
+| wcmt (`commentdict.rs`) | `WCMT` | 候选注释表（词 → 注释），mmap + 二分点查 |
+
+> `unigram`（`WUNI`）已随语言模型移除：词图打分改用词条自身的词典权重。老用户缓存目录里
+> 残留的 `unigram.wdb` 由方案缓存清理逻辑扫走。
 
 缓存根：`%LOCALAPPDATA%\WindInput[Dev]\cache\{方案名}\`。
 `CACHE_DIR` 为 None 时**回退写到源文件旁**（安装目录可能只读）。
@@ -346,13 +349,14 @@ librime 完全允许 `columns: [code, text, weight]` 的**拼音**词库，旧�
    `cache_path` 也只由源文件名派生。把某库在 english ↔ 非 english 之间切换，`.yaml`
    字节不变 → 指纹命中 → **永久复用大小写错误的 wdat**。
 3. 附带：`unigram.wdb` 也挂在 `PARSE_SEMANTICS_VERSION` 上，但该常量的历史记录只描述
-   码表列序语义，改 unigram 解析时没有自然动机去 +1。
+   码表列序语义，改 unigram 解析时没有自然动机去 +1。（该产物此后随语言模型一并移除，
+   本条只作模式留档：**多种缓存共用一个版本常量**时，改 A 的人不会想到给 B 的语义 +1。）
 
 **已修**：① 抽出 `EngineManager::rime_source_paths`，combined 与 merged 两层共用，
 指纹覆盖全部真实输入（此前两处各写一份，正是这条陈旧路径的成因）；
 ② `cache_fp` 的读写增加 `tag` 参数——`dict_tag(lowercase_code)` 区分英文库的大小写化，
-`COMBINED_CACHE_TAG` / `MERGED_CACHE_TAG` / `UNIGRAM_TAG` 区分缓存种类，
-各自演进互不牵连。
+`COMBINED_CACHE_TAG` / `MERGED_CACHE_TAG`（当时还有 `UNIGRAM_TAG`，已随语言模型移除）
+区分缓存种类，各自演进互不牵连。
 
 ### R8 `##` 分组名仍按注释丢弃（有意为之）
 用户词库里实际有 11 行 `##` 分组名（`## 次选` / `## 符号组` / `## 生僻字` 等，

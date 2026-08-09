@@ -1,16 +1,17 @@
-//! wdat / unigram mmap reader 的进程级共享池。
+//! wdat / wcmt mmap reader 的进程级共享池。
 //!
 //! 同一个缓存文件常被多个方案引用：`pinyin.schema.toml` 与 `shuangpin.schema.toml` 都指向
 //! `pinyin/rime_frost.dict.yaml`，混输方案（`wubi86_pinyin`）还会再递归建一套子引擎。而
 //! `EngineManager::cache_path` 用**源文件父目录名**做命名空间，三者最终都解析到同一个
-//! `<cache>/pinyin/rime_frost.merged.wdat` —— 实测该 62MB 文件被 mmap 三份、`unigram.wdb`
-//! 三份、`wubi86_jidian.wdat` 两份。本池按缓存文件路径复用同一个 reader。
+//! `<cache>/pinyin/rime_frost.merged.wdat` —— 实测该 62MB 文件被 mmap 三份、`wubi86_jidian
+//! .wdat` 两份（当时还有 `unigram.wdb` 三份，该产物已随语言模型移除）。本池按缓存文件
+//! 路径复用同一个 reader。
 //!
 //! # 为什么池里存 `Weak` 而不是 `Arc`
 //!
 //! 池**不持有**强引用：最后一个引擎释放后 `Arc` 计数归零，mmap 随即解除。这在 Windows 上
 //! 是必需的 —— 文件被 mmap 期间 `rename`/删除会 Access Denied，而词库重建全部要 rename
-//! 覆盖（`CachedDict::write_cache`、combined/merged 重写、`write_unigram_wdb`）。若池持强
+//! 覆盖（`CachedDict::write_cache`、combined/merged 重写、`write_comment_wcmt`）。若池持强
 //! 引用，reader 将永久驻留，重建会从「偶发失败」恶化成「永久失败」。
 //!
 //! 存 `Weak` 则天然保住既有的释放语义：`EngineManager::reload_from_config` 的

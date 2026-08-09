@@ -2548,8 +2548,8 @@ impl EngineManager {
                 }
             };
             // （unigram 语言模型的加载已移除：它是 cn_dicts 的一份副本，词图打分改用词条
-            // 自身的词典权重，见 `pinyin::lattice::score_node_inner`。`schema.engine.pinyin
-            // .unigram_path` 与 unigram.txt/wdb 产物随后一并清理。）
+            // 自身的词典权重，见 `pinyin::lattice::score_node_inner`。配置键与 unigram.txt/
+            // wdb 产物已一并清理；老用户机器上残留的 wdb 由缓存目录清理逻辑扫走。）
             //
             // 从全局拼音配置构建引擎配置和模糊音（Task 1.4：修 fuzzy 从未生效 bug）。
             // enabled 作总开关：未启用时所有模糊标志归零（与 Go 行为一致）。

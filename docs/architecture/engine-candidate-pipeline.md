@@ -109,7 +109,7 @@ DAT 从已排序编码列表 BFS 直接构建，峰值内存仅 base/check 两�
 `cached.rs`：`enum CachedDict { Mmap(WdatReader), Memory(CodetableDict) }`。
 加载时若 `.wdat` 缓存存在且**内容指纹**（sidecar，非 mtime）匹配源文件 → 直接 mmap；
 否则加载 yaml → 写 `.wdat` → mmap 重开。缓存根 `%LOCALAPPDATA%\WindInput\cache\{方案}/`。
-拼音另有合并缓存：`merged.wdb`（主库+import_tables）与 unigram 的 `.wdb` 缓存（manager.rs:1538+）。
+拼音另有合并缓存：`merged.wdb`（主库+import_tables）。
 
 ### 2.3 多层合并（CompositeDict）
 
@@ -173,9 +173,12 @@ DAT 从已排序编码列表 BFS 直接构建，峰值内存仅 base/check 两�
 ## 4. 拼音引擎（PinyinEngine，全拼）
 
 文件：`wind-engine/src/pinyin/`。词库：`rime_pinyin` 主库合并 import_tables 缓存为 `merged.wdb` mmap；
-语言模型 unigram（`lm.rs`，`UnigramLookup` trait：`log_prob()` / `char_based_score()` /
-`boost_user_freq()`）从 `unigram.txt` 加载并缓存为 mmap `.wdb`。用户/临时造词层经
-`with_store_layers()` 注入。
+用户/临时造词层经 `with_store_layers()` 注入。
+
+> **没有独立的语言模型文件**。词图节点分直接取自词条自身的词典权重（`lattice.rs::score_node_inner`），
+> 与 librime 一致。早前那份 `unigram.txt` 是 `cn_dicts` 的一份副本（同源、跨库取 max），
+> 双源冗余还引入了多音字污染（「说」按 shui 读音也拿到 shuo 的频次，虚高 6.7 万倍），
+> 已连同 `lm.rs` / `UnigramLookup` / `boost_user_freq` 一并移除。
 
 ### 4.1 音节切分
 
@@ -205,11 +208,12 @@ DAT 从已排序编码列表 BFS 直接构建，峰值内存仅 base/check 两�
 | ⑤ 简拼 | `AbbrevMatcher` 判定（每字母为音节首字母且非完整音节序列）→ `search_abbrev(query, 10)` | natural_order=999999 沉底 |
 | ⑥ 用户/临时造词层 | store_layers 整串精确 + 子码 + 前缀，按 text 与系统词典去重 | — |
 
-节点打分（lattice.rs `score_node()`）：unigram log_prob 为基础，叠加单字实词惩罚(-3.0)/虚词加成(+2.0)/
+节点打分（lattice.rs `score_node()`）：以 `ln(weight / DICT_TOTAL)` 为基础（`weight` 即词条自身的
+词典权重，`w ≤ 0` 走 `0.5/T` 兜底，对齐 librime 的 `DBL_EPSILON` 思路），叠加单字实词惩罚(-3.0)/虚词加成(+2.0)/
 多字词典词加成(+3.0×√字数×freq_factor)/OOV 字符均值(-2.0) 等调整。
 
 > ⚠️ **残码待定音节（②c）走 `score_node_partial_final()`，不给单字虚词优待**。虚词优待合计
-> **8.0** 的量级差（虚词 +2.0、实词 −3.0、再豁免 `WORD_PENALTY` 3.0），足以碾压任何 unigram
+> **8.0** 的量级差（虚词 +2.0、实词 −3.0、再豁免 `WORD_PENALTY` 3.0），足以碾压任何词频
 > 差距：实测补出「中华**让**」而非「中华人」、「你好**们**」而非「你好吗」（让/们在虚词表，
 > 人/吗不在）。该优待的前提是「虚词随内容词出现是语法黏着」，说的是**整句内部已成形的搭配**；
 > 残码位是「用户打到一半的那个音节」，前提不成立。**同一条加成在两个位置前提不同 ⇒ 按位置
@@ -580,7 +584,7 @@ merged_codes。**当前四个归并点**：`composite::merge_search`（跨词库
 
 | 阶段 | 码表 | 拼音（全拼） | 双拼 | 混输 | 英文 |
 |---|---|---|---|---|---|
-| 词库 | codetable 多层（主+扩展+用户+临时） | rime_pinyin merged.wdb + unigram LM + 用户/临时层 | 同拼音 | 主码表全套 + 拼音全套 + 可选英文 | 码表格式，code 小写化 |
+| 词库 | codetable 多层（主+扩展+用户+临时） | rime_pinyin merged.wdb + 用户/临时层 | 同拼音 | 主码表全套 + 拼音全套 + 可选英文 | 码表格式，code 小写化 |
 | 输入预处理 | 无（原始码） | `'` 分段 + DAG 音节切分 + 模糊音扩展 | **先双拼→全拼**（Layout 表 + 位置映射），后同全拼 | 双路各自原样进子引擎 | 小写化 |
 | 候选生成 | 精确 + 前缀 + 空码补全 | 六步：精确/Viterbi 整句/子短语/前缀/简拼/用户层 | 同全拼 | 码表全流程 + 拼音全流程 + 英文，档位加权合并 | 精确 + 前缀 |
 | 引擎内排序 | better()（weight 主导） | 层级（模糊/前缀/子短语）→ weight | 同全拼 | 档位 weight（码表 1e7 >> 短语 1M >> 英文/前缀 500K >> 拼音 ÷100） | weight |
