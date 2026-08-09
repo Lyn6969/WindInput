@@ -2583,6 +2583,19 @@ impl Coordinator {
         self.rt().compiled_hotkeys.key_up_tsf_hashes()
     }
 
+    /// 直接装载短语层（仅测试用）：`(code, text, weight, position, is_system)`。
+    ///
+    /// ★ 补的是一个**结构性**测试缺口：真机短语层经 redb `store` 建立，而 headless 测试的
+    /// `store` 是 `None` → 短语层恒空 → 所有依赖短语的判据（`has_code_prefix` 的前缀命中、
+    /// z 的活码身份、夺取回路的触发条件）在测试里全都走不到。测试演示的是「z 是死码」那条
+    /// 分支，真机跑的是「z 有 37 条 `zz*` 前缀」那条——两边结构性分叉，测试再绿也盖不住真机。
+    ///
+    /// 这个缺口让「让位判据与候选构建门槛不同源」整个漏到真机（见 `has_code_prefix` 文档）。
+    pub fn debug_install_phrases(&self, records: Vec<(String, String, i32, i32, bool)>) {
+        *self.phrases.write().unwrap_or_else(|e| e.into_inner()) =
+            wind_phrase::PhraseLayer::from_records(records);
+    }
+
     /// 当前是否中文标点（测试/诊断用）
     pub fn is_chinese_punct(&self) -> bool {
         self.state

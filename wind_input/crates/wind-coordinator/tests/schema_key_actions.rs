@@ -613,7 +613,7 @@ fn z_fallback_mix_accepts_operators_after_hijack() {
     let _ = std::fs::remove_dir_all(&dd);
 }
 
-/// ★ 临拼的残余码只可能是拼音字母/// ★ 临拼的残余码只可能是拼音字母，故数字**不该**夺取——`z1` 里的 1 仍是选词键。
+/// ★ 临拼的残余码只可能是拼音字母，故数字**不该**夺取——`z1` 里的 1 仍是选词键。
 /// 判据按目标模式的「残余码语义」分，与设计文档 §4.2 那张表同源。
 #[test]
 fn z_fallback_does_not_hijack_digits_for_temp_pinyin() {
@@ -632,4 +632,212 @@ fn z_fallback_does_not_hijack_digits_for_temp_pinyin() {
     );
     let _ = std::fs::remove_dir_all(&ov);
     let _ = std::fs::remove_dir_all(&dd);
+}
+
+/// 出厂 `system.phrases.toml` 那批 `zz*` 标点短语的最小复刻（码长均 ≥2）。
+///
+/// 真机上正是它们让 `has_code_prefix("z")` 为真。headless 测试的 `store` 是 `None`、
+/// 短语层恒空，不显式装载的话下面这些用例测的全是「z 是死码」那条分支——与真机分叉。
+fn zz_system_phrases() -> Vec<(String, String, i32, i32, bool)> {
+    vec![
+        ("zzbd".into(), "、".into(), 0, 0, true),
+        ("zzsz".into(), "…".into(), 0, 0, true),
+    ]
+}
+
+/// ★★ `input.phrase.min_prefix` 对**绑了动作的字母同样有效**——反馈不能拿短语顶上。
+///
+/// 真机上 `zz*` 是 `1 标点 2 数字 3 字母 4 偏旁` 这样的 `$SS` 分组导航条目。曾为了填补
+/// 「让位空帧」把绑定字母的枚举门槛降到 1，结果按 z 就弹出整屏分组，等于把 `zz` 那一级的
+/// 导航提前了一整级，用户设的 `min_prefix` 形同虚设（2026-08-09 用户反馈推翻）。
+///
+/// ★ 教训：`has_code_prefix`（存在性，问「z 是不是活码」）与 `build_candidates`
+/// （显示策略，问「现在显示什么」）**回答的不是同一个问题**，不该被强行对齐到任一边。
+/// 让位那一帧的反馈另有来源，见 `bound_letter_yield_frame_shows_repeat`。
+#[test]
+fn min_prefix_respected_on_bound_letter() {
+    if !has_schemas() {
+        return;
+    }
+    let ov = make_override("zminpfx", "wubi86", "z = \"mix:quick_mix\"");
+    let cfg = cfg_for("wubi86"); // input.phrase.min_prefix 默认 2
+    let coord = Coordinator::new_headless_with_override(cfg, Some(&data_dir()), Some(ov.clone()));
+    coord.debug_install_phrases(zz_system_phrases());
+
+    coord.handle_key_event(&key(VK_Z));
+    assert_eq!(
+        coord.debug_active_mode(),
+        None,
+        "z 在本方案是活码前缀（有 `zz*`），首键应让位给正常输入"
+    );
+    let texts = coord.debug_all_candidate_texts();
+    assert!(
+        !texts.iter().any(|t| t == "、"),
+        "按 z 那一帧不该列出 `zz*`——那是 `zz` 那一级的导航，min_prefix=2 挡着。实际: {texts:?}"
+    );
+    let _ = std::fs::remove_dir_all(&ov);
+}
+
+/// 对照：没绑动作的字母同样受 `min_prefix` 约束。
+///
+/// 与上一条合起来说明「绑不绑动作，短语门槛都一视同仁」——曾经的破例已彻底移除。
+#[test]
+fn min_prefix_respected_on_unbound_letter() {
+    if !has_schemas() {
+        return;
+    }
+    let ov = make_override("zrelax", "wubi86", "z = \"mix:quick_mix\"");
+    let coord = Coordinator::new_headless_with_override(
+        cfg_for("wubi86"),
+        Some(&data_dir()),
+        Some(ov.clone()),
+    );
+    let mut phrases = zz_system_phrases();
+    phrases.push(("ccbd".into(), "○".into(), 0, 0, true));
+    coord.debug_install_phrases(phrases);
+
+    coord.handle_key_event(&key('C' as u32));
+    assert!(
+        !coord.debug_all_candidate_texts().iter().any(|t| t == "○"),
+        "c 没绑动作，单字母帧同样受 min_prefix=2 约束"
+    );
+    let _ = std::fs::remove_dir_all(&ov);
+}
+
+/// ★★ 让位那一帧的反馈＝**重复上屏**，且资格来自**目标 mix 的 members**。
+///
+/// 用户拍板的优先级（2026-08-09）：「只显示重复上屏，如果没有重复的，应该显示快捷模式的
+/// 提示」。本用例锁第一条。
+///
+/// 关键点是**不开 `z_key_repeat` 也该有**：内置 quick_mix 的 members 含
+/// `quick_input.repeat`，而走让位路径的引导键永远到不了 mix 的空缓冲帧（夺取路径的
+/// `mix_buffer` 恒等于残余码，至少一个字符），那个成员对这类配置本来形同虚设——用户报的
+/// 「z 进的快捷输入没有重复输入功能」正是它。
+///
+/// 上屏内容用 `zzbd` 打出的「、」，而不是随便敲两个字母：后者出什么字取决于码表，
+/// 断言只能写成「非空」，那在 repeat 整个失效时也会绿。
+#[test]
+fn bound_letter_yield_frame_shows_repeat() {
+    if !has_schemas() {
+        return;
+    }
+    let ov = make_override("zrepeat_member", "wubi86", "z = \"mix:quick_mix\"");
+    let cfg = cfg_for("wubi86"); // 刻意不开 z_key_repeat
+    let coord = Coordinator::new_headless_with_override(cfg, Some(&data_dir()), Some(ov.clone()));
+    coord.debug_install_phrases(zz_system_phrases());
+
+    // 先用 `zzbd` 上屏一个**确定**的内容。
+    for vk in [VK_Z, VK_Z, 'B' as u32, 'D' as u32] {
+        coord.handle_key_event(&key(vk));
+    }
+    coord.handle_key_event(&key(0x20)); // 空格上屏「、」
+
+    coord.handle_key_event(&key(VK_Z));
+    let texts = coord.debug_all_candidate_texts();
+    assert_eq!(
+        texts.first().map(String::as_str),
+        Some("、"),
+        "让位那一帧首选应是「重复上屏」（上次上屏的「、」），实际: {texts:?}"
+    );
+    let _ = std::fs::remove_dir_all(&ov);
+}
+
+/// ★★ z 的三条路必须**同时**走得通——这正是用户说的「临拼不冲突」的完整形态，
+/// 现在临英与 mix 也补齐了：
+///
+/// | 打法 | 归属 | 机制 |
+/// |---|---|---|
+/// | `z` | 让位（反馈＝重复上屏） | 活码前缀判据 + `leading_letter_repeat_text` |
+/// | `zzbd` | 系统标点短语 | 正常码表输入，精确命中 |
+/// | `z1` / `zri` | 目标模式 | `try_z_fallback` 破前缀夺取 |
+///
+/// 三条各测一遍。任何一条断掉都说明这次改动把某一路挤掉了。
+#[test]
+fn z_three_paths_coexist() {
+    if !has_schemas() {
+        return;
+    }
+    let ov = make_override("z3path", "wubi86", "z = \"mix:quick_mix\"");
+    let coord = Coordinator::new_headless_with_override(
+        cfg_for("wubi86"),
+        Some(&data_dir()),
+        Some(ov.clone()),
+    );
+    coord.debug_install_phrases(zz_system_phrases());
+
+    // ① 首键 z：让位给正常输入（不进模式、也不抢编码）。
+    coord.handle_key_event(&key(VK_Z));
+    assert_eq!(coord.debug_active_mode(), None, "首键 z 应让位");
+
+    // ② `zzbd`：走正常码表输入，精确命中系统短语。
+    for vk in [VK_Z, 'B' as u32, 'D' as u32] {
+        coord.handle_key_event(&key(vk));
+    }
+    let texts = coord.debug_all_candidate_texts();
+    assert!(
+        texts.first().map(String::as_str) == Some("、"),
+        "`zzbd` 应精确命中系统标点短语并居首，实际: {texts:?}"
+    );
+    coord.handle_key_event(&key(0x1B)); // ESC 清空缓冲
+
+    // ③ `z1`：破前缀，夺取进 mix。
+    coord.handle_key_event(&key(VK_Z));
+    coord.handle_key_event(&key(0x31));
+    assert_eq!(
+        coord.debug_active_mode(),
+        Some("mix"),
+        "`z1` 破了活码前缀，应由夺取回路接进 mix"
+    );
+    let _ = std::fs::remove_dir_all(&ov);
+}
+
+/// 精确码短语不受 `min_prefix` 约束（`lookup` 无门槛），故码就是 `z` 的短语必须照常让位。
+///
+/// 把修复的边界钉死：改的是**前缀枚举**那一条，不是把短语判据整个放宽。
+#[test]
+fn exact_code_phrase_still_yields_regardless_of_min_prefix() {
+    if !has_schemas() {
+        return;
+    }
+    let ov = make_override("zexact", "wubi86", "z = \"mix:quick_mix\"");
+    let cfg = cfg_for("wubi86"); // min_prefix = 2
+    let coord = Coordinator::new_headless_with_override(cfg, Some(&data_dir()), Some(ov.clone()));
+    coord.debug_install_phrases(vec![("z".into(), "◎".into(), 0, 0, true)]);
+
+    coord.handle_key_event(&key(VK_Z));
+    assert_eq!(
+        coord.debug_active_mode(),
+        None,
+        "码就是 `z` 的短语是精确命中、那一帧确有候选——必须让位"
+    );
+    let _ = std::fs::remove_dir_all(&ov);
+}
+
+/// 没绑动作、也没开 `z_key_repeat` 的字母，那一帧**不该**凭空多出重复候选。
+///
+/// 反向守卫：`leading_letter_repeat_text` 的资格判定若写漏（比如只看「单字母」不看绑定），
+/// 每个死码字母按下去都会冒出上次上屏的内容。
+#[test]
+fn unbound_letter_gets_no_repeat_candidate() {
+    if !has_schemas() {
+        return;
+    }
+    let ov = make_override("znorepeat", "wubi86", "z = \"mix:quick_mix\"");
+    let cfg = cfg_for("wubi86"); // 不开 z_key_repeat
+    let coord = Coordinator::new_headless_with_override(cfg, Some(&data_dir()), Some(ov.clone()));
+    coord.debug_install_phrases(zz_system_phrases());
+
+    for vk in [VK_Z, VK_Z, 'B' as u32, 'D' as u32] {
+        coord.handle_key_event(&key(vk));
+    }
+    coord.handle_key_event(&key(0x20)); // 上屏「、」，喂出历史
+
+    // c 没绑动作：即使有上屏历史，也不该出现重复候选。
+    coord.handle_key_event(&key('C' as u32));
+    let texts = coord.debug_all_candidate_texts();
+    assert!(
+        texts.first().map(String::as_str) != Some("、"),
+        "没绑动作的字母不该出重复上屏候选，实际: {texts:?}"
+    );
+    let _ = std::fs::remove_dir_all(&ov);
 }

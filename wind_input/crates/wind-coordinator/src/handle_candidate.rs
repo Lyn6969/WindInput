@@ -1190,11 +1190,10 @@ impl Coordinator {
         }
         let limit = self.initial_candidate_limit(&state.input_buffer);
         let (engine_count, outcome) = self.build_candidates(state, limit);
-        // Z 键重复上屏：输入恰为 "z" 且当前方案启用 z_key_repeat 时，把最近一次上屏内容作为
-        // 首选候选注入到候选顶部（对齐 Go），供「z + 选词」重复上一次输入。
-        if state.input_buffer == "z"
-            && let Some(last) = self.z_key_repeat_text()
-        {
+        // 引导字母的「重复上屏」：输入恰为单个引导字母时，把最近一次上屏内容注入候选顶部
+        // （对齐 Go），供「引导键 + 选词」重复上一次输入。资格判定见
+        // `leading_letter_repeat_text`——它同时承担「让位那一帧不能空无一物」这个职责。
+        if let Some(last) = self.leading_letter_repeat_text(&state.input_buffer) {
             state.candidates.insert(
                 0,
                 Candidate {
@@ -1217,6 +1216,67 @@ impl Coordinator {
         // 组合区按高亮候选类型重算（混输高亮跟随；含已转换前缀拼接）。
         self.sync_preedit_to_highlight(state);
         outcome
+    }
+
+    /// 单个引导字母那一帧的「重复上屏」文本（无资格 / 无历史 → None）。
+    ///
+    /// # ★★ 它同时是「让位那一帧的反馈」
+    ///
+    /// 绑了动作的字母按下后，若该字母在本方案是活码前缀（`has_code_prefix`），按键**让位**
+    /// 给正常输入——这是对的，否则那个字母开头的编码在本方案彻底打不出来。但让位那一帧
+    /// 默认空无一物：五笔 86 的 z 本身是死码，`zz*` 短语又够不着 `input.phrase.min_prefix`
+    /// （默认 2）。用户按下 z 只看到一个光秃秃的 `z`，分不清「绑定没生效」还是「还要再按
+    /// 一键」（2026-08-08 真机反馈）。
+    ///
+    /// ⚠️ 曾试图把绑定字母的**短语枚举门槛**降到 1 来填这一帧，被推翻：真机上 `zz*` 是
+    /// `1 标点 2 数字 3 字母 4 偏旁` 这样的 `$SS` 分组导航，按 z 就弹出整屏等于把 `zz` 那
+    /// 一级的导航提前了一整级，用户设的 `min_prefix` 形同虚设（2026-08-09 用户反馈）。
+    /// **反馈和短语是两回事**——短语门槛管「显示策略」，这一帧的反馈另找来源。
+    ///
+    /// # 资格的两个来源（合并在此，不再各判各的）
+    ///
+    /// - `z_key_repeat`：z 专有的老开关（repeat 功能本就绑死在 z 上）；
+    /// - 该字母绑了 `mix:<id>` 且那个 mix 的 members 含 `quick_input.repeat`：按下去本就是
+    ///   要进那个模式，把它**空缓冲帧**的能力提前一格给出来。没有这条，走让位路径的引导键
+    ///   永远到不了 mix 的空缓冲帧（夺取路径的 `mix_buffer` 恒等于残余码，至少一个字符），
+    ///   那个成员对这类配置形同虚设——用户报的「z 进的快捷输入没有重复输入功能」正是它。
+    fn leading_letter_repeat_text(&self, buffer: &str) -> Option<String> {
+        let mut it = buffer.chars();
+        let (Some(c), None) = (it.next(), it.next()) else {
+            return None; // 仅「恰好一个字符」那一帧
+        };
+        if !c.is_ascii_alphabetic() {
+            return None;
+        }
+        // ① z 专有老开关（含 z_key_repeat 的开关判定与历史取数）。
+        if buffer == "z"
+            && let Some(t) = self.z_key_repeat_text()
+        {
+            return Some(t);
+        }
+        // ② 目标 mix 的 repeat 成员。
+        let vk = keymap::VK_A + (c.to_ascii_lowercase() as u32 - 'a' as u32);
+        let Some(wind_config::BoundAction::Mix(id)) = self.bound_action_for(vk) else {
+            return None;
+        };
+        let idx = self.mix_mode_idx(&id)?;
+        let has_repeat = self
+            .rt()
+            .config
+            .schema
+            .mix_modes
+            .get(idx as usize)
+            .is_some_and(|m| {
+                m.members
+                    .iter()
+                    .any(|s| s == wind_quick_input::MEMBER_REPEAT)
+            });
+        if !has_repeat {
+            return None;
+        }
+        self.recent_commits_snapshot()
+            .into_iter()
+            .find(|t| !t.is_empty())
     }
 
     /// Z 键重复上屏：当前方案（码表/混输）启用 z_key_repeat 时返回最近一次上屏文本，否则 None。
