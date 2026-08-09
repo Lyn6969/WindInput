@@ -1206,21 +1206,71 @@ impl Coordinator {
         });
     }
 
-    /// 读取当前光标所在显示器对应的工具栏位置。
-    pub(crate) fn toolbar_pos_for_cursor(&self) -> Option<(i32, i32)> {
-        let (cx, cy) = cursor_pos();
-        let key = monitor_key_from_point(cx, cy);
-        let map = self
-            .toolbar_positions
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        map.get(&key).copied()
+    /// 把工具栏移到「输入焦点所在显示器」上的记忆位置（该屏没记过则落到它的右下角）。
+    ///
+    /// 仅在显示器**发生变化**时下发，靠 `current_toolbar_monitor` 去重：notify_toolbar
+    /// 在每次模式切换/焦点事件上都跑，无条件下发会把用户拖动过的位置反复重置回记忆值，
+    /// 且拖动中途（save 尚未落地）还会把工具栏拽回原处。
+    ///
+    /// 调用点必须在 `UpdateToolbar` **之前**——反过来会先在旧屏渲染一帧再跳过去，
+    /// 表现为切屏闪一下。`Toolbar::set_pos` 内部受 `visible` 门控（隐藏中只记坐标不显形），
+    /// 故本路径不会绕过 `toolbar_gate` 的显示迟滞。
+    fn sync_toolbar_monitor(&self) {
+        let Some((key, work_right, work_bottom)) = focus_monitor() else {
+            return;
+        };
+        {
+            let mut cur = self
+                .current_toolbar_monitor
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            if cur.as_deref() == Some(key.as_str()) {
+                return;
+            }
+            *cur = Some(key.clone());
+        }
+        let saved = {
+            let map = self
+                .toolbar_positions
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            map.get(&key).copied()
+        };
+        let cmd = match saved {
+            Some((x, y)) => UiCommand::SetToolbarPos { x, y },
+            // 该屏从未拖过：交给 UI 侧按自己的尺寸算右下角（协调器不知道工具栏 w/h）。
+            None => UiCommand::SetToolbarCorner {
+                work_right,
+                work_bottom,
+            },
+        };
+        tracing::debug!("工具栏跟随焦点显示器 key={} saved={:?}", key, saved);
+        let _ = self.ui_tx.send(cmd);
     }
 
-    /// 持久化工具栏位置（按光标所在显示器 key 独立存储，best-effort）。
+    /// 启动时的初始定位：与运行期同一判据（前台窗口所在显示器），并把该 key 记进
+    /// `current_toolbar_monitor`，使首个 notify_toolbar 不会重复下发。
+    pub(crate) fn init_toolbar_pos(&self) {
+        self.sync_toolbar_monitor();
+    }
+
+    /// 持久化工具栏位置（按显示器 key 独立存储，best-effort）。
+    ///
+    /// key 取自**工具栏落点自身**而非光标：拖动结束时光标压在工具栏上，两者碰巧同屏，
+    /// 但工具栏坐标才是「这条工具栏属于哪块屏」的直接事实。存取两侧由此共用同一个
+    /// 键空间语义——取那侧问的是「焦点屏上记过什么位置」，存那侧答的是「这块屏上
+    /// 工具栏在哪」，只有 key 同源才对得上。
     pub(crate) fn save_toolbar_pos(&self, x: i32, y: i32) {
-        let (cx, cy) = cursor_pos();
-        let key = monitor_key_from_point(cx, cy);
+        let key = monitor_key_from_point(x, y);
+        // 拖到别的屏 = 用户在那块屏上重新定了位；同步当前屏记录，否则下一次
+        // sync_toolbar_monitor 会认为「屏没变」而不再校正。
+        {
+            let mut cur = self
+                .current_toolbar_monitor
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            *cur = Some(key.clone());
+        }
         {
             let mut map = self
                 .toolbar_positions
@@ -1377,6 +1427,9 @@ impl Coordinator {
                 .load(std::sync::atomic::Ordering::Relaxed),
         };
         drop(s);
+        // 焦点换屏则先把工具栏挪到那块屏（内部按显示器 key 去重，未换屏时零下发）。
+        // 必须先于 UpdateToolbar：反序会先在旧屏渲染一帧再跳。
+        self.sync_toolbar_monitor();
         let _ = self.ui_tx.send(UiCommand::UpdateToolbar(tb));
         // HUD 刷新收口于此（两个出口各一次）。诊断 HUD 展示的 ime_active /
         // has_edit_context 正是上面那道合取的输入，而**凡是改动它们的路径都必须调
@@ -1419,22 +1472,17 @@ pub(crate) fn candidate_delete_menu(cand: &wind_candidate::Candidate) -> (&'stat
 }
 
 /// 返回当前鼠标光标的屏幕坐标；获取失败时返回 (0, 0)。
+/// 唯一调用者是 `focus_monitor` 的无前台窗口回退分支，故只在 Windows 下存在。
+#[cfg(target_os = "windows")]
 fn cursor_pos() -> (i32, i32) {
-    #[cfg(target_os = "windows")]
-    {
-        use std::mem::zeroed;
-        use windows::Win32::Foundation::POINT;
-        use windows::Win32::UI::WindowsAndMessaging::GetCursorPos;
-        let mut pt: POINT = unsafe { zeroed() };
-        unsafe {
-            let _ = GetCursorPos(&mut pt);
-        }
-        (pt.x, pt.y)
+    use std::mem::zeroed;
+    use windows::Win32::Foundation::POINT;
+    use windows::Win32::UI::WindowsAndMessaging::GetCursorPos;
+    let mut pt: POINT = unsafe { zeroed() };
+    unsafe {
+        let _ = GetCursorPos(&mut pt);
     }
-    #[cfg(not(target_os = "windows"))]
-    {
-        (0, 0)
-    }
+    (pt.x, pt.y)
 }
 
 /// 根据屏幕坐标计算显示器 key（工作区右下角："workRight,workBottom"）。
@@ -1461,6 +1509,56 @@ fn monitor_key_from_point(x: i32, y: i32) -> String {
     #[cfg(not(target_os = "windows"))]
     {
         "0,0".to_string()
+    }
+}
+
+/// 输入焦点所在显示器：`(key, 工作区右边界, 工作区下边界)`；查不到返回 None（不动工具栏）。
+///
+/// 判据取**前台窗口**而非光标：键盘切窗（Alt+Tab、窗口热键）时光标根本不动，用光标
+/// 问不出「用户在哪块屏上打字」。前台窗口恒有值、查询不阻塞，`is_foreground_fullscreen`
+/// 已用同一套 `GetForegroundWindow` + `MonitorFromWindow`。
+///
+/// ⚠ 这里刻意**不用** caret 坐标：caret 属于 TSF 层、常处于未就绪态（coords_ready /
+/// caret_pending），拿它当窗口层的判据会在首帧把工具栏定到错屏上——两层判据不可互换。
+///
+/// 前台窗口是桌面/Shell（无应用在前台）时回退到光标所在屏：仍是同一层的「屏幕上某点」，
+/// 只是换了个更弱的信号源，不引入跨层耦合。
+fn focus_monitor() -> Option<(String, i32, i32)> {
+    #[cfg(target_os = "windows")]
+    {
+        use std::mem::{size_of, zeroed};
+        use windows::Win32::Foundation::{HWND, POINT};
+        use windows::Win32::Graphics::Gdi::{
+            GetMonitorInfoW, HMONITOR, MONITOR_DEFAULTTONEAREST, MONITORINFO, MonitorFromPoint,
+            MonitorFromWindow,
+        };
+        use windows::Win32::UI::WindowsAndMessaging::{
+            GetDesktopWindow, GetForegroundWindow, GetShellWindow,
+        };
+        unsafe {
+            let hwnd = GetForegroundWindow();
+            let hmon: HMONITOR = if hwnd == HWND::default()
+                || hwnd == GetDesktopWindow()
+                || hwnd == GetShellWindow()
+            {
+                let (cx, cy) = cursor_pos();
+                MonitorFromPoint(POINT { x: cx, y: cy }, MONITOR_DEFAULTTONEAREST)
+            } else {
+                MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST)
+            };
+            let mut mi: MONITORINFO = zeroed();
+            mi.cbSize = size_of::<MONITORINFO>() as u32;
+            if GetMonitorInfoW(hmon, &mut mi).as_bool() {
+                let wa = mi.rcWork;
+                // key 与 monitor_key_from_point 同格式，两者必须一致——存/取共用一张表。
+                return Some((format!("{},{}", wa.right, wa.bottom), wa.right, wa.bottom));
+            }
+        }
+        None
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        None
     }
 }
 

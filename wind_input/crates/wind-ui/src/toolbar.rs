@@ -115,6 +115,12 @@ pub struct Toolbar {
     tb_border_width: Option<Dim>,
     /// 纵向排列（ui.toolbar.vertical，非主题——见 `bar_layout`）。
     vertical: bool,
+    /// 待落的「某显示器右下角」请求：`(工作区右边界, 下边界)`，由 `render` 消费。
+    ///
+    /// 存边界而不是直接算坐标，是因为落点要减去工具栏自身尺寸，而**尺寸在 `render` 之前
+    /// 不可信**——窗口以 `create(160, 40)` 的占位尺寸起步，`set_vertical` 在隐藏期间又
+    /// 不重排（不出图），于是首次渲染前 `window.size()` 既不是横条真值也不是纵条真值。
+    pending_corner: Option<(i32, i32)>,
 }
 
 /// 整条工具栏的几何：窗口尺寸 + 每格矩形（设备像素，相对窗口左上角）。
@@ -241,6 +247,7 @@ impl Toolbar {
             tb_border_radius: None,
             tb_border_width: None,
             vertical: false,
+            pending_corner: None,
         })
     }
 
@@ -310,14 +317,47 @@ impl Toolbar {
         }
     }
 
-    /// 设置工具栏位置（启动恢复持久化位置）；钳制到工作区内。
-    /// 仅启动时调用（淡出尚不可能发生），故不做 alpha 恢复/计时重置。
+    /// 设置工具栏位置（启动恢复持久化位置 / 运行期跟随焦点换屏）。
+    ///
+    /// **隐藏期间不钳制**，原样存下交给 `render`：钳制要拿工具栏尺寸比对工作区边界，而
+    /// 首次渲染前 `window.size()` 还是 `create` 时的占位值 160×40。启动序列恰好命中这一点
+    /// ——位置在 `init_toolbar_pos` 下发，朝向要到其后的 `apply_ui_config` 才下发，且
+    /// `set_vertical` 隐藏期间不重排，于是纵条会被按 160 宽钳制：贴右保存的坐标被判越界，
+    /// 拉回 `工作区右边界 - 160`，重启后凭空左移 100+px（y 方向 40 高不越界，故只横向偏）。
+    /// `render` 里那次钳制用的是刚 `resize` 出来的真实尺寸，是唯一可信的时机。
+    ///
+    /// 不做 alpha 恢复与计时重置：协调器的换屏下发**紧接着**就是 `UpdateToolbar`，
+    /// 而 `render` 末尾以 alpha=255 提交并 `on_shown`，两件事都在那里发生。
+    ///
+    /// ⚠️ `window.show` 受 `visible` 门控：对隐藏中的工具栏只记坐标不显形，否则会绕过
+    /// `toolbar_gate` 的显示迟滞（同 `set_vertical` 的约束）。
     pub fn set_pos(&mut self, x: i32, y: i32) {
-        let (w, h) = self.window.size();
-        let (cx, cy) = clamp_to_work_area(x, y, w, h);
-        self.mouse.borrow_mut().pos = Some((cx, cy));
+        // 显式位置优先于待落的角落请求，否则 render 会拿 pending 覆盖掉这次设定。
+        self.pending_corner = None;
         if self.visible {
+            let (w, h) = self.window.size();
+            let (cx, cy) = clamp_to_work_area(x, y, w, h);
+            self.mouse.borrow_mut().pos = Some((cx, cy));
             self.window.show(cx, cy);
+        } else {
+            self.mouse.borrow_mut().pos = Some((x, y));
+        }
+    }
+
+    /// 移到指定显示器工作区的右下角——焦点切到一块**从未拖过工具栏**的屏时用。
+    ///
+    /// 由协调器传工作区右/下边界、这边算落点，而不是协调器直接算坐标下发：右下角要减去
+    /// 工具栏自身的 w/h，而尺寸只有 UI 侧知道（随主题/朝向/DPI 变）。留边同 `corner_position`。
+    ///
+    /// 隐藏期间同样把计算推迟到 `render`（理由见 `set_pos`）——此处若按占位尺寸算，
+    /// 纵条会落在偏左偏下 100+px 的地方。
+    pub fn set_corner(&mut self, work_right: i32, work_bottom: i32) {
+        if self.visible {
+            let (w, h) = self.window.size();
+            let (x, y) = Self::corner_in_work_area(work_right, work_bottom, w, h);
+            self.set_pos(x, y);
+        } else {
+            self.pending_corner = Some((work_right, work_bottom));
         }
     }
 
@@ -594,13 +634,22 @@ impl Toolbar {
 
         // 位置：优先用持久化/拖动后的位置；首次落在工作区右下角（避开任务栏）。
         // 钳制到当前显示器工作区内——避免切换显示器/远程后旧坐标落在屏外不可见。
+        //
+        // 一切依赖尺寸的落点计算都收口在这里：上面刚按当前朝向/主题/DPI 排完版并 resize，
+        // `w`/`h` 此刻才是真值。`set_pos`/`set_corner` 在隐藏期间只登记意图、不算坐标，
+        // 就是为了不在 `window.size()` 仍是占位值 160×40 时下判断（见 `set_pos` 文档）。
         let (px, py) = {
             let mut m = self.mouse.borrow_mut();
             m.hits = hits; // 同步命中矩形给鼠标处理器
             // 菜单锚点要用的尺寸/朝向，与命中矩形同源同刻更新——分开更新迟早错位。
             m.size = (w, h);
             m.vertical = self.vertical;
-            let raw = m.pos.unwrap_or_else(|| Self::corner_position(w, h));
+            let raw = match self.pending_corner.take() {
+                Some((work_right, work_bottom)) => {
+                    Self::corner_in_work_area(work_right, work_bottom, w, h)
+                }
+                None => m.pos.unwrap_or_else(|| Self::corner_position(w, h)),
+            };
             let clamped = clamp_to_work_area(raw.0, raw.1, w, h);
             m.pos = Some(clamped);
             clamped
@@ -694,7 +743,22 @@ impl Toolbar {
         self.auto_hide.on_hidden();
     }
 
-    /// 工作区右下角位置（避开任务栏），右/下各留 12px 边距
+    /// 给定工作区右/下边界，算工具栏右下角落点（右/下各留 12px 边距）。
+    ///
+    /// 纯几何、无系统调用，故可被任意显示器复用——`corner_position` 喂主屏，
+    /// `set_corner` 喂焦点所在屏。`max(0)` 的下限只在单屏（工作区从 0 起）时有意义，
+    /// 副屏的工作区左/上边界可为负，钳到 0 会把工具栏推回主屏；真正的越界回收交给
+    /// `set_pos` 里的 `clamp_to_work_area`（它按落点解析显示器，不预设原点）。
+    fn corner_in_work_area(work_right: i32, work_bottom: i32, w: u32, h: u32) -> (i32, i32) {
+        const MARGIN: i32 = 12;
+        (
+            work_right - w as i32 - MARGIN,
+            work_bottom - h as i32 - MARGIN,
+        )
+    }
+
+    /// 主显示器工作区右下角位置（避开任务栏）——工具栏**首次**显示且无任何记忆位置时的落点。
+    /// `SPI_GETWORKAREA` 取的恒是主屏；跟随焦点换屏走 `set_corner`，不经过这里。
     #[cfg_attr(not(windows), allow(unused_variables))]
     fn corner_position(w: u32, h: u32) -> (i32, i32) {
         #[cfg(windows)]
@@ -712,9 +776,7 @@ impl Toolbar {
                     SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS(0),
                 );
                 if ok.is_ok() && rect.right > rect.left {
-                    let margin = 12;
-                    let x = rect.right - w as i32 - margin;
-                    let y = rect.bottom - h as i32 - margin;
+                    let (x, y) = Self::corner_in_work_area(rect.right, rect.bottom, w, h);
                     return (x.max(0), y.max(0));
                 }
             }
@@ -1074,6 +1136,49 @@ mod tests {
             assert_eq!(c.x, 12.0 + 30.0 * i as f32, "第 {i} 格 x");
             assert_eq!((c.y, c.w, c.h), (0.0, 30.0, 30.0), "第 {i} 格");
         }
+    }
+
+    /// 右下角落点：从工作区右/下边界各退去工具栏尺寸再留 12px 边距。
+    #[test]
+    fn corner_backs_off_from_work_area_edges() {
+        // 1920×1080 主屏，任务栏 40px：工作区右下 (1920, 1040)；工具栏 132×30。
+        let (x, y) = Toolbar::corner_in_work_area(1920, 1040, 132, 30);
+        assert_eq!((x, y), (1920 - 132 - 12, 1040 - 30 - 12));
+    }
+
+    /// 副屏在主屏**左侧**时工作区坐标为负，落点必须跟着为负。
+    ///
+    /// 这正是不能在此处 `max(0)` 的理由：钳到 0 会把工具栏推回主屏，表现为「切到左边那块屏
+    /// 工具栏没跟过去」。越界回收由 `set_pos` 里的 `clamp_to_work_area` 负责——它按落点
+    /// 反查显示器，不预设桌面原点在 (0,0)。
+    #[test]
+    fn corner_allows_negative_coords_on_left_side_monitor() {
+        // 左侧副屏：虚拟桌面 x ∈ [-1920, 0)，工作区右下 (0, 1080)。
+        let (x, y) = Toolbar::corner_in_work_area(0, 1080, 132, 30);
+        assert_eq!(x, -144, "落点应留在左侧副屏上（负坐标）");
+        assert_eq!(y, 1038);
+    }
+
+    /// 落点是**尺寸的函数**——同一块屏上横条与纵条的右下角必然落在不同位置。
+    ///
+    /// 这条测试把「算落点时尺寸必须已是真值」钉死。窗口以 `create(160, 40)` 的占位尺寸
+    /// 起步，`set_vertical` 在隐藏期间不重排，故首次 `render` 之前 `window.size()` 两种
+    /// 朝向的真值都不是。启动序列恰好在那个窗口里恢复位置，用占位尺寸算/钳的结果就是
+    /// 重启后凭空左移——量级见末尾断言。修法是 `set_pos`/`set_corner` 隐藏期间只登记
+    /// 意图，落点与钳制统一由 `render` 用刚 `resize` 出的尺寸计算。
+    #[test]
+    fn corner_depends_on_bar_orientation() {
+        // 1920×1080 屏、底部 40px 任务栏 → 工作区右下 (1920, 1040)。
+        // 默认几何：横条 132×30，转置后纵条 30×132。
+        let horizontal = Toolbar::corner_in_work_area(1920, 1040, 132, 30);
+        let vertical = Toolbar::corner_in_work_area(1920, 1040, 30, 132);
+        assert_eq!(vertical.0 - horizontal.0, 102, "纵条更窄，落点更靠右");
+        assert_eq!(horizontal.1 - vertical.1, 102, "纵条更高，落点更靠上");
+
+        // 占位尺寸算出的落点比纵条真值靠左 130px——「重启后位置左移」的正是这个量。
+        // 若哪天改了 create 的占位尺寸，这条会红，提醒回来确认推迟计算仍然成立。
+        let placeholder = Toolbar::corner_in_work_area(1920, 1040, 160, 40);
+        assert_eq!(vertical.0 - placeholder.0, 130);
     }
 
     /// 纵条：整条与横条互为转置——宽高对调、格沿 y 排开、各格占满条宽。

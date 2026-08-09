@@ -273,8 +273,8 @@ impl Forwarder {
             }
             UiCommand::Shutdown => {}
             UiCommand::CopyToClipboard(text) => crate::popup_menu::set_clipboard_text(&text),
-            // 其余（SetToolbarPos / ShowCandidateMenu / MenuKey / HideMenu /
-            // OpenPath）：darwin 侧由 .app 原生处理或属 W9，留桩。
+            // 其余（SetToolbarPos / SetToolbarCorner / ShowCandidateMenu / MenuKey /
+            // HideMenu / OpenPath）：darwin 侧由 .app 原生处理或属 W9，留桩。
             other => {
                 tracing::debug!("forwarder: 暂未处理 {:?}", std::mem::discriminant(&other));
             }

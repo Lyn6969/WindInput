@@ -86,8 +86,11 @@ pub enum UiCommand {
     UpdateToolbar(crate::toolbar::ToolbarState),
     /// 隐藏工具栏
     HideToolbar,
-    /// 设置工具栏位置（启动时恢复持久化位置）
+    /// 设置工具栏位置（启动恢复持久化位置 / 焦点换屏后落到该屏的记忆位置）
     SetToolbarPos { x: i32, y: i32 },
+    /// 把工具栏落到指定显示器工作区的右下角——焦点切到一块从未拖过工具栏的屏时下发。
+    /// 传边界而非坐标：右下角要减工具栏自身尺寸，那只有 UI 侧知道。
+    SetToolbarCorner { work_right: i32, work_bottom: i32 },
     /// 工具栏自动隐藏配置（开关 + 超时毫秒）。来自 ui.toolbar.auto_hide / auto_hide_delay，
     /// 协调器 apply_ui_config（启动 + 配置重载）下发。
     SetToolbarAutoHide { enabled: bool, delay_ms: u64 },
@@ -1380,6 +1383,15 @@ impl UiManager {
                         debug!("UI: SetToolbarPos ({},{})", x, y);
                         if let Some(t) = &mut toolbar {
                             t.set_pos(x, y);
+                        }
+                    }
+                    UiCommand::SetToolbarCorner {
+                        work_right,
+                        work_bottom,
+                    } => {
+                        debug!("UI: SetToolbarCorner work=({},{})", work_right, work_bottom);
+                        if let Some(t) = &mut toolbar {
+                            t.set_corner(work_right, work_bottom);
                         }
                     }
                     UiCommand::SetToolbarAutoHide { enabled, delay_ms } => {
