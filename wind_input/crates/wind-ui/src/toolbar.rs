@@ -349,15 +349,20 @@ impl Toolbar {
     /// 由协调器传工作区右/下边界、这边算落点，而不是协调器直接算坐标下发：右下角要减去
     /// 工具栏自身的 w/h，而尺寸只有 UI 侧知道（随主题/朝向/DPI 变）。留边同 `corner_position`。
     ///
-    /// 隐藏期间同样把计算推迟到 `render`（理由见 `set_pos`）——此处若按占位尺寸算，
-    /// 纵条会落在偏左偏下 100+px 的地方。
+    /// **无论可见与否都只登记意图**，落点由 `render` 计算。隐藏期间是因为尺寸还是占位值
+    /// （见 `set_pos`）；可见期间则是因为目标屏 DPI 可能与当前屏不同——`render` 里
+    /// `ensure_scale` 先按目标屏定 scale、再排版出尺寸，只有那一刻两者才同时正确。
+    /// 若在这里用当前 `window.size()` 算，跨 DPI 换屏首帧会按旧屏尺寸定位。
+    ///
+    /// 可见时自己 `repaint` 兜底：协调器当前总是紧跟一条 `UpdateToolbar`（`notify_toolbar`
+    /// 里 `sync_toolbar_monitor` 之后必然下发），但那是**调用方的时序契约**，不该由它
+    /// 决定本次请求是否生效——多渲染一帧在换屏这种低频事件上无关紧要。
+    /// ⚠️ `repaint` 必须受 `visible` 门控：`render` 末尾无条件 `show`，对隐藏中的工具栏
+    /// 调用会把它显形，绕过 `toolbar_gate` 的显示迟滞（同 `set_vertical` 的约束）。
     pub fn set_corner(&mut self, work_right: i32, work_bottom: i32) {
+        self.pending_corner = Some((work_right, work_bottom));
         if self.visible {
-            let (w, h) = self.window.size();
-            let (x, y) = Self::corner_in_work_area(work_right, work_bottom, w, h);
-            self.set_pos(x, y);
-        } else {
-            self.pending_corner = Some((work_right, work_bottom));
+            self.repaint();
         }
     }
 
@@ -423,8 +428,17 @@ impl Toolbar {
 
     /// DPI 动态化：按工具栏当前位置所在显示器实时取缩放（拖到别的显示器后自动适配）。
     /// 工具栏仅颜色随主题、几何随 scale 现算，故只需更新 scale 与字号。
+    ///
+    /// 有待落的换屏请求时按**目标屏**取：此刻 `mouse.pos` 还停在上一块屏上，用它会让
+    /// 这一帧按旧屏 DPI 排版，而 `render` 末尾又拿这套尺寸去算目标屏的落点——两屏 DPI
+    /// 不同则整条大小与位置都偏，要等下一帧才自愈（视觉上是一跳）。
+    /// `set_pos` 那条路径无需特判：它已把 `mouse.pos` 更新成目标屏坐标。
     fn ensure_scale(&mut self) {
-        let pos = self.mouse.borrow().pos.unwrap_or((0, 0));
+        let pos = match self.pending_corner {
+            // 工作区右/下边界是排他的，退 1px 取屏内点。
+            Some((work_right, work_bottom)) => (work_right - 1, work_bottom - 1),
+            None => self.mouse.borrow().pos.unwrap_or((0, 0)),
+        };
         let sc = crate::dpi::scale_for_point(pos.0, pos.1);
         if (sc - self.scale).abs() > 0.01 {
             self.scale = sc;
