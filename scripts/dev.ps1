@@ -437,17 +437,18 @@ function Assemble-Data ([string]$outdir = $BuildDevDir) {
 function Do-GenData ([string]$outdir = $BuildDevDir) {
     if (-not (Download-Dicts)) { return $false }
 
-    # 生成 Unigram 语言模型 (Rust 工具 gen_unigram)
+    # 生成 unigram 词频表 (Rust 工具 gen_unigram)。仅供 gen_dict 给五笔扩展词库的
+    # CJK 条目赋权, 不随 data\ 分发 —— 引擎侧已改用词条自身的词典权重打分。
     $unigram = "$CacheDir\pinyin-frost\unigram.txt"
     New-Item -ItemType Directory -Path (Split-Path $unigram -Parent) -Force | Out-Null
     if (-not (Test-Path $unigram)) {
-        Say "生成 Unigram 语言模型..."
+        Say "生成 unigram 词频表..."
         Push-Location $ProjectRoot
         try {
             cargo run -q -p wind-tools --bin gen_unigram -- --rime "$CacheDir\rime-frost\cn_dicts" --out $unigram
-            if ($LASTEXITCODE -ne 0) { Warn "Unigram 生成失败 (智能组句不可用)" }
+            if ($LASTEXITCODE -ne 0) { Warn "unigram 生成失败 (gen_dict 五笔赋权将随之失败)" }
         } finally { Pop-Location }
-    } else { Gray "Unigram 已缓存" }
+    } else { Gray "unigram 已缓存" }
 
     # 生成汉字拼音反查表 (Rust 工具 gen_pinyin)
     $pinyinMap = "$CacheDir\pinyin-data\pinyin_map.txt"
@@ -470,7 +471,6 @@ function Verify-DistData ([string]$outdir = $BuildDir) {
     $data = "$outdir\data"
     $ok = $true
     $checks = @(
-        @{ Path = "schemas\pinyin\unigram.txt";            Min = 1000000 },
         @{ Path = "schemas\pinyin\cn_dicts\base.dict.yaml"; Min = 1000000 },
         @{ Path = "schemas\pinyin\cn_dicts\8105.dict.yaml"; Min = 10000 },
         @{ Path = "schemas\english\en.dict.yaml";           Min = 1000 },
@@ -496,7 +496,7 @@ function Verify-DistData ([string]$outdir = $BuildDir) {
 
     if (-not $ok) {
         ErrMsg "`n发布数据校验失败! 上述文件缺失或异常会导致功能残缺。"
-        ErrMsg "请排查 gen-data 的下载/生成 (词库源、网络、gen_unigram/gen_opencc/gen_dict)。"
+        ErrMsg "请排查 gen-data 的下载/生成 (词库源、网络、gen_opencc/gen_dict)。"
         return $false
     }
     Say "发布数据校验通过 ✓"; return $true
@@ -1474,7 +1474,7 @@ function Do-Installer ([string]$profile = "release", [bool]$skipBuild = $false) 
 # ---------- 候选 REPL (本机) ----------
 function Do-Repl ([string]$data = "") {
     if (-not $data) {
-        if (Test-Path "$BuildDevDir\data\schemas\pinyin\unigram.txt") { $data = "$BuildDevDir\data" }
+        if (Test-Path "$BuildDevDir\data\schemas\pinyin\cn_dicts\base.dict.yaml") { $data = "$BuildDevDir\data" }
         else { Warn "未找到词库数据; 请先运行 gen-data"; $data = "$BuildDevDir\data" }
     }
     Say "`n启动候选 REPL (data=$data)..."

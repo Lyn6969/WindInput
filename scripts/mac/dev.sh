@@ -653,9 +653,9 @@ assemble_data() {
         [[ -f "$rime/en_dicts/$f.dict.yaml" ]] && cp -f "$rime/en_dicts/$f.dict.yaml" "$english/"
     done
 
-    # 4. Unigram 语言模型。
-    local unigram="$CACHE_DIR/pinyin-frost/unigram.txt"
-    if [[ -f "$unigram" ]]; then cp -f "$unigram" "$pinyin/unigram.txt"; else warn "缺 unigram.txt (先跑 gd 生成)"; fi
+    # 4. (unigram.txt 不再随 data/ 分发: 引擎侧的读取链已移除, 词图打分改用词条自身的
+    #    词典权重, 见 wind-engine/pinyin/lattice.rs::score_node_inner。
+    #    .cache 里的 unigram.txt 仍由 gd 生成 —— gen_dict 用它给五笔扩展词库赋权。)
 
     # 4b. 汉字拼音反查表。
     local pmap="$CACHE_DIR/pinyin-data/pinyin_map.txt"
@@ -696,15 +696,16 @@ do_gendata() {
     bold "========== gen-data (下载 + 生成 + 组装) → $DATA_SNAPSHOT =========="
     download_dicts
 
-    # 生成 Unigram 语言模型 (Rust 工具 gen_unigram)。
+    # 生成 unigram 词频表 (Rust 工具 gen_unigram)。仅供 gen_dict 给五笔扩展词库赋权,
+    # 不随 data/ 分发 —— 引擎侧已改用词条自身的词典权重打分。
     local unigram="$CACHE_DIR/pinyin-frost/unigram.txt"
     mkdir -p "$(dirname "$unigram")"
     if [[ ! -f "$unigram" ]]; then
-        bold "==> 生成 Unigram 语言模型"
+        bold "==> 生成 unigram 词频表"
         ( cd "$RUST_DIR" && cargo run -q -p wind-tools --bin gen_unigram -- --rime "$CACHE_DIR/rime-frost/cn_dicts" --out "$unigram" ) \
-            || warn "Unigram 生成失败 (智能组句不可用)"
+            || warn "unigram 生成失败 (gen_dict 五笔赋权将随之失败)"
     else
-        info "Unigram 已缓存"
+        info "unigram 已缓存"
     fi
 
     # 生成汉字拼音反查表 (Rust 工具 gen_pinyin)。
@@ -733,7 +734,6 @@ verify_dist_data() {
         if (( sz < min )); then err "  ✗ 过小 (${sz}B < 期望 ${min}B): $rel"; ok=0
         else info "  ✓ $rel ($((sz / 1024))KB)"; fi
     }
-    _check_min "schemas/pinyin/unigram.txt"            1000000
     _check_min "schemas/pinyin/cn_dicts/base.dict.yaml" 1000000
     _check_min "schemas/pinyin/cn_dicts/8105.dict.yaml" 10000
     _check_min "schemas/english/en.dict.yaml"           1000
@@ -749,7 +749,7 @@ verify_dist_data() {
 
     if (( ok == 0 )); then
         err "发布数据校验失败! 上述文件缺失或异常会导致功能残缺。"
-        err "请排查 gd 的下载/生成 (词库源、网络、gen_unigram/gen_opencc)。"
+        err "请排查 gd 的下载/生成 (词库源、网络、gen_opencc/gen_dict)。"
         return 1
     fi
     bold "==> 发布数据校验通过"

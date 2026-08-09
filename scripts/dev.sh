@@ -389,13 +389,10 @@ assemble_data() {
         [ -f "$rime_frost/en_dicts/$f" ] && cp -f "$rime_frost/en_dicts/$f" "$english/"
     done
 
-    # 4. Unigram 语言模型
-    local unigram_cache="$CACHE_DIR/pinyin-frost/unigram.txt"
-    if [ -f "$unigram_cache" ]; then
-        cp -f "$unigram_cache" "$pinyin/unigram.txt"
-    else
-        warn "缺 unigram.txt（运行 gen-data 生成）"
-    fi
+    # 4.（unigram.txt 不再随 data/ 分发：引擎侧的读取链已移除，词图打分改用词条自身的
+    #    词典权重，见 wind-engine/pinyin/lattice.rs::score_node_inner。
+    #    .cache 里的 unigram.txt 仍由 gen-data 生成 —— gen_dict 用它给五笔扩展词库的
+    #    CJK 条目赋权，见 gen_dict/extra.rs::assign_weights。）
 
     # 4b. 汉字拼音反查表（候选拼音提示/拼音方案自动出码）
     local pinyin_map_cache="$CACHE_DIR/pinyin-data/pinyin_map.txt"
@@ -442,7 +439,7 @@ assemble_data() {
 do_repl() {
     local data="${1:-}"
     if [ -z "$data" ]; then
-        if [ -f "$BUILD_DEV_DIR/data/schemas/pinyin/unigram.txt" ]; then
+        if [ -f "$BUILD_DEV_DIR/data/schemas/pinyin/cn_dicts/base.dict.yaml" ]; then
             data="$BUILD_DEV_DIR/data"
         elif [ -d "$CACHE_DIR/pulled-data" ]; then
             data="$CACHE_DIR/pulled-data"
@@ -682,17 +679,18 @@ do_gen_data() {
 
     download_dicts || return 1
 
-    # 生成 Unigram 语言模型（Rust 工具 gen_unigram）
+    # 生成 unigram 词频表（Rust 工具 gen_unigram）。仅供 gen_dict 给五笔扩展词库的
+    # CJK 条目赋权，不随 data/ 分发 —— 引擎侧已改用词条自身的词典权重打分。
     local unigram_cache="$CACHE_DIR/pinyin-frost/unigram.txt"
     mkdir -p "$(dirname "$unigram_cache")"
     if [ ! -f "$unigram_cache" ]; then
-        say "生成 Unigram 语言模型..."
+        say "生成 unigram 词频表..."
         ( cd "$RUST_WORKSPACE" && cargo run -q --bin gen_unigram -- \
             --rime "$CACHE_DIR/rime-frost/cn_dicts" \
             --out "$unigram_cache" ) \
-            || warn "Unigram 生成失败（智能组句不可用）"
+            || warn "unigram 生成失败（gen_dict 五笔赋权将随之失败）"
     else
-        gray "Unigram 已缓存"
+        gray "unigram 已缓存"
     fi
 
     # 生成汉字拼音反查表（Rust 工具 gen_pinyin）
@@ -719,7 +717,6 @@ verify_dist_data() {
     local ok=1
     # "相对 data/ 的路径|最小字节数"(下限粗略,仅为捕获缺失/0 字节/截断)
     local checks=(
-        "schemas/pinyin/unigram.txt|1000000"
         "schemas/pinyin/cn_dicts/base.dict.yaml|1000000"
         "schemas/pinyin/cn_dicts/8105.dict.yaml|10000"
         "schemas/english/en.dict.yaml|1000"
@@ -755,7 +752,7 @@ verify_dist_data() {
 
     if [ "$ok" -ne 1 ]; then
         err "\n发布数据校验失败!上述文件缺失或异常会导致安装器功能残缺。"
-        err "请排查 gen-data 的下载/生成(词库源、网络、gen_unigram/gen_opencc)。"
+        err "请排查 gen-data 的下载/生成(词库源、网络、gen_opencc/gen_dict)。"
         return 1
     fi
     say "发布数据校验通过 ✓"
