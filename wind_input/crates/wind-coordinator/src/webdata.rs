@@ -3291,6 +3291,81 @@ mod tests {
         }
     }
 
+    /// `[overlay]` 段经 getConfig → 改 → saveConfig 往返，并**立即体现在 overlay 注册表里**。
+    ///
+    /// 这条锁的是「设置页把一个普通方案变成 overlay 方案（快符）」的整条通路。它之所以
+    /// 几乎不需要新代码，正是这次下沉的收益：`[overlay]` 住在方案文件里，于是方案配置
+    /// 已有的读（getConfig 三层合并）、写（saveConfig 稀疏 diff 落 override）、生效
+    /// （read_schema 的 merge_toml）三条通路全部现成——原先它住在 config.toml 的
+    /// StructList 数组里，这三样一样都够不着。
+    #[test]
+    fn schema_overlay_section_roundtrips_through_save_config() {
+        let dir = std::env::temp_dir().join("wind_webdata_overlay_rt");
+        let _ = std::fs::remove_dir_all(&dir);
+        let schemas = dir.join("schemas");
+        std::fs::create_dir_all(&schemas).unwrap();
+        // 出厂是个**普通**码表方案：没有 [overlay] 段。
+        std::fs::write(
+            schemas.join("zz_rt.schema.toml"),
+            "[schema]\nid = \"zz_rt\"\nname = \"往返\"\n\
+             [engine]\ntype = \"codetable\"\n[engine.codetable]\nmax_code_length = 4\n",
+        )
+        .unwrap();
+        let ov_dir = dir.join("overrides");
+        std::fs::create_dir_all(&ov_dir).unwrap();
+
+        let store_path = std::env::temp_dir().join("wind_webdata_overlay_rt.redb");
+        let _ = std::fs::remove_file(&store_path);
+        let store = std::sync::Arc::new(wind_store::Store::open(&store_path).unwrap());
+        let c = Coordinator::new_headless_with_store_override(
+            wind_config::Config::default(),
+            Some(&dir),
+            store,
+            Some(ov_dir.clone()),
+        );
+
+        // 起点：不是 overlay 方案。
+        assert!(
+            c.engine_mgr.overlay_index_of("zz_rt").is_none(),
+            "出厂无 [overlay] 段，不该在注册表里"
+        );
+        let mut cfg = c
+            .web_data_rpc("schema.getConfig", &json!({ "id": "zz_rt" }))
+            .unwrap();
+        assert!(
+            cfg.get("overlay").is_none_or(|v| v.is_null()),
+            "未配置时 overlay 应缺省/为 null，实际 {cfg}"
+        );
+
+        // 设置页动作：加上 [overlay] 段并保存。
+        cfg.as_object_mut().unwrap().insert(
+            "overlay".to_string(),
+            json!({ "kind": "special", "show_all_on_enter": true, "candidate_layout": "vertical" }),
+        );
+        c.web_data_rpc("schema.saveConfig", &json!({ "id": "zz_rt", "cfg": cfg }))
+            .unwrap();
+
+        // 落盘的是**稀疏 diff**：只有改动项进 override，方案文件的其余定义仍可透传。
+        let written = std::fs::read_to_string(ov_dir.join("zz_rt.toml")).unwrap();
+        assert!(
+            written.contains("[overlay]"),
+            "override 未写入 [overlay]：{written}"
+        );
+
+        // 生效：注册表整表随 invalidate 重建，该方案成为 overlay 方案。
+        c.engine_mgr.invalidate_schema("zz_rt");
+        let idx = c
+            .engine_mgr
+            .overlay_index_of("zz_rt")
+            .expect("保存后应进 overlay 注册表");
+        let e = c.engine_mgr.overlay_modes()[idx as usize].clone();
+        assert!(e.spec.show_all_on_enter);
+        assert_eq!(e.spec.candidate_layout, wind_config::LayoutIntent::Vertical);
+        assert_eq!(e.name, "往返", "override 未提及的字段仍来自方案文件");
+
+        let _ = std::fs::remove_file(&store_path);
+    }
+
     #[test]
     fn schema_get_config_graceful_without_data_dir() {
         // data_dir=None（coord helper）→ 无方案文件 → getConfig 返回 {}，saveConfig 报错（无基础）。
