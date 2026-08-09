@@ -1188,37 +1188,18 @@ impl Engine for PinyinEngine {
             );
         }
 
-        // 1.5 超长词典整词兜底：与整句同量纲化
+        // （step 1.5「超长词典整词兜底」已删除。它把音节数超过 `max_word_len` 的词典精确
+        //  整词按 `score_node` 折算成「单节点等价整句分」并抬到整句量纲，同时标 `is_sentence`
+        //  —— 因为旧整句拿 3e7 基座，词典精确命中只带原始词频（「中华人民共和国」3113），
+        //  在同一个 weight 维度上必输，哪怕整句是语义碎片拼出的错误切分。
         //
-        // 整句权重 = 旧的 SENTENCE_WEIGHT_BASE(30M，已退役) + 各节点 log_prob 之和；而词典精确命中只带
-        // 原始词频（「中华人民共和国」= 3113）。二者量纲不同却在同一个 weight 维度上比较
-        // （排序键三个布尔位此时全部打平），词典整词必然输给整句——哪怕整句是由语义碎片
-        // 拼出的错误切分。这里按 lattice 的同一个 score_node 公式给它算「单节点等价整句分」，
-        // 使二者公平比较：合理的整句照样赢（冷僻精确词自身 log_prob 很低），词典里确实存在
-        // 的长词不再被结构性埋没。
+        //  整句退役 3e7、改用等效词频后，这段成了 no-op：`sentence_weight(log_prob, 1)` 对
+        //  单词整句还原成 `f × exp(各类惩罚) < f`，`max` 恒取原权重。而排序结果之所以不变，
+        //  是因为错误拼接整句的 W_eff 本就极低（一串低频字的乘积趋近 clamp 下限 1），词典
+        //  整词的真实词频天然压过它 —— 这正是同量纲要达到的效果，无需再手工抬权。
         //
-        // 仅限音节数超过词图上限的词。上限内的词 Viterbi 已能作为单节点自行选中（这正是
-        // max_word_len 6→10 修好「中华人民共和国」的原因），无需在此干预；若不加这道限制，
-        // 所有精确整词（gonghe 的恭贺/共贺等）都会被授予 is_sentence 身份而锚定在顶部，
-        // 永久失去词频学习能力——「整句解」应是引擎对整串输入的最优解读，不是"凡精确即整句"。
-        //
-        // 只在无残码时生效（query == completed）：有残码时精确命中只覆盖完成音节前缀，
-        // 本就不该与覆盖全输入的整句同级竞争。
-        // 放在 step 2 之前：整句尚未插入，无需排除整句自身；同文时 step 2 的
-        // `existing.weight.max(weight)` 会自然取二者较高者。
-        if query.len() == completed.len() && syllables.len() > self.lattice_builder.max_word_len() {
-            for c in candidates.iter_mut() {
-                if c.is_fuzzy || c.is_prefix || c.code != completed {
-                    continue;
-                }
-                let log_prob = lattice::score_node(&c.text, c.weight);
-                c.weight = c.weight.max(sentence_weight(log_prob, 1));
-                // 与整句同量纲即同身份：它是引擎对整串输入的最优解读，只是恰好由一个词典
-                // 整词构成。不标的话 freq_rerank 会把 is_sentence 的拼接整句锚定到它之上，
-                // 「冠状动脉粥样硬化性心脏病」又会被「罐装动脉…」压回去。
-                c.is_sentence = true;
-            }
-        }
+        //  `pinyin_long_word::test_over_limit_long_word_falls_back_to_dict_exact` 的 5 个用例
+        //  当年是按「依赖本段」挑的，删除后仍全绿，即为此事的实证。）
 
         // Viterbi **新合成**的整句文本（词典里没有这个词，只能由多个节点拼出来）。
         // 与词典整词同文而被合并的那一支不记入——它本身就是精确整词，不存在「让位」问题。
