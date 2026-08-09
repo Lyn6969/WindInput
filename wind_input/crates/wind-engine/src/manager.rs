@@ -132,6 +132,23 @@ struct MixPinyinOpts {
     abbrev: bool,
 }
 
+/// overlay 方案注册表的一条（见 [`EngineManager::overlay_modes`]）。
+///
+/// **实例身份 = 方案 id**。此前这是 `config.schema.special_modes` 的一个数组条目，
+/// 身份靠数组下标；那让「一个 key 一个控件」的设置页模型套不上，也让预置配置文件
+/// 写不进去（写出即冻结快照）。见 `docs/redesign/overlay-mode-config.md`。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OverlayEntry {
+    /// 被引用（即自身）的方案 id。
+    pub schema_id: String,
+    /// 显示名（`[schema] name`，空则回退 id）。
+    pub name: String,
+    /// 模式指示短称（`[schema] icon_label` 首字符，可空）。
+    pub icon_label: String,
+    /// `[overlay]` 段本体。
+    pub spec: wind_config::OverlaySpec,
+}
+
 /// 引擎管理器（懒加载：仅在需要时构建对应方案引擎，降低启动内存）
 pub struct EngineManager {
     /// schema_id -> 引擎实例（懒加载，Arc 便于无锁 convert）
@@ -186,6 +203,12 @@ pub struct EngineManager {
     key_actions_cache: Mutex<HashMap<String, std::collections::BTreeMap<String, String>>>,
     /// 方案显示名缓存（schema_id -> schema.name；缺则回退 id）。按需读盘一次。
     name_cache: Mutex<HashMap<String, String>>,
+    /// overlay 方案注册表缓存（见 [`Self::overlay_modes`]）。
+    ///
+    /// 与其它缓存不同，这是**整表**缓存而非 per-schema：它是一个集合，任何方案的
+    /// 安装/删除/`[overlay]` 段变更都会改变它的内容**与下标**，按 id 局部失效没有意义。
+    /// 故 `invalidate_schema` 里直接整表置 `None`。
+    overlay_cache: Mutex<Option<Vec<OverlayEntry>>>,
     /// 方案 override 层目录（schema_overrides/{id}.toml）；读 schema 时深合并到基础方案之上。
     /// None=不读 override（如纯测试）。设置页 saveConfig 写此目录。
     override_dir: Option<std::path::PathBuf>,
@@ -412,6 +435,7 @@ impl EngineManager {
             schema_type_cache: Mutex::new(HashMap::new()),
             key_actions_cache: Mutex::new(HashMap::new()),
             name_cache: Mutex::new(HashMap::new()),
+            overlay_cache: Mutex::new(None),
             override_dir,
             primary_codetable: Mutex::new(primary_codetable),
             primary_pinyin: Mutex::new(config.schema.primary_pinyin.clone()),
@@ -1029,6 +1053,75 @@ impl EngineManager {
         ids
     }
 
+    /// **overlay 方案注册表**：所有带 `[overlay]` 段的已安装方案，按 id 字典序。
+    ///
+    /// 这是「有哪些特殊模式」的**唯一真相源**，取代了原先的 `config.schema.special_modes`
+    /// 数组。`ModeKind::Special(u8)` / `State.special_id` 的下标即本表下标。
+    ///
+    /// ★ **枚举源是 [`Self::installed_schemas`] 而不是 `available`**：overlay 方案
+    /// `hidden = true`、不进 `schema.available`（不参与循环切换），只由 overlay 触发懒加载。
+    /// 用 `available` 会得到一张恒空的表。⚠️ `all_key_action_keys` 至今仍只遍历
+    /// `available`——将来若要收 overlay 方案自己的 `[key_actions]`，那里也得换源。
+    ///
+    /// ★ 走静态 `read_schema`（含 `schema_overrides/{id}.toml` 的 `merge_toml` 深合并），
+    /// 故用户在设置页对 `[overlay]` 的覆盖**自动生效**，无需额外接线；方案也不必被加载。
+    ///
+    /// ★ **下标稳定性**：按 id 排序意味着安装一个新 overlay 方案会改变其后方案的下标。
+    /// 这不比原先的 config 数组序差（热重载删条目同样错位，`layout.rs` 已在处理越界回落），
+    /// 且 overlay 是瞬态的（上屏即退出）。整表随 [`Self::invalidate_schema`] 失效。
+    pub fn overlay_modes(&self) -> Vec<OverlayEntry> {
+        if let Some(v) = self
+            .overlay_cache
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_ref()
+        {
+            return v.clone();
+        }
+        let out: Vec<OverlayEntry> = self
+            .installed_schemas()
+            .into_iter()
+            .filter_map(|id| {
+                let s =
+                    Self::read_schema(&id, self.data_dir.as_deref(), self.override_dir.as_deref())?;
+                let spec = s.overlay?;
+                let name = if s.schema.name.is_empty() {
+                    id.clone()
+                } else {
+                    s.schema.name
+                };
+                // 与 `schema_icon_label` 同口径只取首字符：第三方方案可能配多字符 label，
+                // 在单字符宽度的工具栏格内会触发换行/截断。
+                let icon_label = s
+                    .schema
+                    .icon_label
+                    .chars()
+                    .next()
+                    .map(|c| c.to_string())
+                    .unwrap_or_default();
+                Some(OverlayEntry {
+                    schema_id: id,
+                    name,
+                    icon_label,
+                    spec,
+                })
+            })
+            // u8 下标上限：超出的条目进不了 `ModeKind::Special(u8)`，索性不入表——
+            // 入表而无法激活比不入表更难排查（设置页列得出来、按键毫无反应）。
+            .take(u8::MAX as usize + 1)
+            .collect();
+        *self.overlay_cache.lock().unwrap_or_else(|e| e.into_inner()) = Some(out.clone());
+        out
+    }
+
+    /// 按方案 id 定位 overlay 注册表下标（供 `special:<id>` / `enter_special:<id>` 分发）。
+    pub fn overlay_index_of(&self, schema_id: &str) -> Option<u8> {
+        self.overlay_modes()
+            .iter()
+            .position(|e| e.schema_id == schema_id)
+            .map(|i| i as u8)
+    }
+
     /// 枚举可选的双拼布局：合并扫描 [用户目录, 安装目录] 的
     /// `schemas/shuangpin/*.toml`，用户目录同名（按文件名 stem）覆盖安装目录。
     ///
@@ -1387,6 +1480,9 @@ impl EngineManager {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .remove(schema_id);
+        // overlay 注册表是**集合**：装/删方案或改 [overlay] 段都会改变它的内容与下标，
+        // 按 id 局部失效没有意义，整表置 None 由下次 overlay_modes() 重建。
+        *self.overlay_cache.lock().unwrap_or_else(|e| e.into_inner()) = None;
         // 主码表(及其词库/override)可能变更:失效反查索引,下次按新内容重建。
         self.reverse_index
             .lock()
@@ -3221,6 +3317,153 @@ impl EngineManager {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ───────────────────────── overlay 方案注册表 ─────────────────────────
+
+    /// 造一个含三个方案的 data_dir：两个带 `[overlay]` 段、一个不带。
+    ///
+    /// ⚠️ **不能断言 `overlay_modes().len()`**：`installed_schemas` 还会扫描
+    /// `Config::user_config_dir()/schemas`（真实用户目录），开发机上那里可能就装着快符方案。
+    /// 故所有断言都写成「我造的这几个的相对关系」，不写绝对数量。
+    fn make_overlay_data_dir(tag: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("wind_overlay_data_{tag}"));
+        let _ = std::fs::remove_dir_all(&dir);
+        let schemas = dir.join("schemas");
+        std::fs::create_dir_all(&schemas).unwrap();
+        // zz_kf / zz_rare：overlay 方案。id 刻意用 `zz_` 前缀——注册表按 id 字典序，
+        // 这样它们排在真实用户方案之后，相对顺序断言不受开发机上装了什么影响。
+        std::fs::write(
+            schemas.join("zz_kf.schema.toml"),
+            "[schema]\nid = \"zz_kf\"\nname = \"快符\"\nicon_label = \"符号\"\nhidden = true\n\
+             [engine]\ntype = \"codetable\"\n\
+             [engine.codetable]\nmax_code_length = 1\n\
+             [overlay]\nkind = \"special\"\nshow_all_on_enter = true\ncandidate_layout = \"vertical\"\n",
+        )
+        .unwrap();
+        std::fs::write(
+            schemas.join("zz_rare.schema.toml"),
+            "[schema]\nid = \"zz_rare\"\nname = \"生僻字\"\nhidden = true\n\
+             [engine]\ntype = \"codetable\"\n\
+             [overlay]\n",
+        )
+        .unwrap();
+        // 普通码表方案：无 [overlay] 段，不该进注册表。
+        std::fs::write(
+            schemas.join("zz_plain.schema.toml"),
+            "[schema]\nid = \"zz_plain\"\nname = \"普通\"\n\
+             [engine]\ntype = \"codetable\"\n",
+        )
+        .unwrap();
+        dir
+    }
+
+    fn overlay_mgr(tag: &str) -> (EngineManager, std::path::PathBuf) {
+        let dir = make_overlay_data_dir(tag);
+        let ov = dir.join("overrides");
+        std::fs::create_dir_all(&ov).unwrap();
+        let cfg = Config::default();
+        let mgr = EngineManager::with_store_override(&cfg, Some(&dir), None, Some(ov.clone()));
+        (mgr, ov)
+    }
+
+    /// 注册表的准入判据是**`[overlay]` 段存在**，不是 `hidden`。
+    ///
+    /// 这两个属性正交：`english` 也是 hidden（供临英/融合候选懒加载），但它没有 overlay
+    /// 生命周期。拿 hidden 当判据会把它误收进特殊模式列表。
+    #[test]
+    fn overlay_modes_admits_by_section_presence() {
+        let (mgr, _ov) = overlay_mgr("admit");
+        let modes = mgr.overlay_modes();
+        let ids: Vec<&str> = modes.iter().map(|e| e.schema_id.as_str()).collect();
+
+        assert!(ids.contains(&"zz_kf"), "带 [overlay] 的方案应进表：{ids:?}");
+        assert!(
+            ids.contains(&"zz_rare"),
+            "空 [overlay] 段同样算声明：{ids:?}"
+        );
+        assert!(
+            !ids.contains(&"zz_plain"),
+            "无 [overlay] 段的普通方案不该进表：{ids:?}"
+        );
+    }
+
+    /// 下标 = 按 id 字典序，且 `overlay_index_of` 与之一致。
+    ///
+    /// 这条钉住的是 `ModeKind::Special(u8)` 的下标语义来源：它必须由本表给出，
+    /// 不再是用户 config 数组的顺序。
+    #[test]
+    fn overlay_modes_sorted_by_id_and_index_matches() {
+        let (mgr, _ov) = overlay_mgr("order");
+        let modes = mgr.overlay_modes();
+        let kf = modes.iter().position(|e| e.schema_id == "zz_kf").unwrap();
+        let rare = modes.iter().position(|e| e.schema_id == "zz_rare").unwrap();
+        assert!(kf < rare, "zz_kf 应排在 zz_rare 之前（id 字典序）");
+
+        assert_eq!(mgr.overlay_index_of("zz_kf"), Some(kf as u8));
+        assert_eq!(mgr.overlay_index_of("zz_rare"), Some(rare as u8));
+        assert_eq!(
+            mgr.overlay_index_of("zz_plain"),
+            None,
+            "不在表里的方案定位不到"
+        );
+    }
+
+    /// 显示名/短称从方案文件 `[schema]` 派生，短称只取首字符。
+    ///
+    /// 原先这两个字段在 `special_modes` 条目里重复了一份、缺省时才回落方案文件；
+    /// 下沉后条目即方案，重复消失。
+    #[test]
+    fn overlay_entry_derives_name_and_icon_from_schema() {
+        let (mgr, _ov) = overlay_mgr("name");
+        let modes = mgr.overlay_modes();
+        let kf = modes.iter().find(|e| e.schema_id == "zz_kf").unwrap();
+        assert_eq!(kf.name, "快符");
+        assert_eq!(kf.icon_label, "符", "多字符 label 只取首字符");
+        assert!(kf.spec.show_all_on_enter);
+        assert_eq!(
+            kf.spec.candidate_layout,
+            wind_config::LayoutIntent::Vertical
+        );
+
+        let rare = modes.iter().find(|e| e.schema_id == "zz_rare").unwrap();
+        assert_eq!(rare.icon_label, "", "未配 icon_label 时为空，不臆造");
+        assert!(!rare.spec.show_all_on_enter, "空 [overlay] 段取字段默认值");
+    }
+
+    /// `schema_overrides/{id}.toml` 的 `[overlay]` 覆盖**自动生效**——注册表走的是
+    /// 静态 `read_schema`，它内部已做 `merge_toml` 深合并，无需为 overlay 另接一条线。
+    ///
+    /// 这正是「配置下沉到方案文件」相对「留在 config.toml 数组」的核心收益：
+    /// 用户改动的存储、编辑、保存通路全部现成。
+    #[test]
+    fn overlay_spec_honors_schema_override_layer() {
+        let (mgr, ov) = overlay_mgr("override");
+        // 覆盖前：方案文件写的是 vertical。
+        let before = mgr.overlay_modes();
+        let kf = before.iter().find(|e| e.schema_id == "zz_kf").unwrap();
+        assert_eq!(
+            kf.spec.candidate_layout,
+            wind_config::LayoutIntent::Vertical
+        );
+
+        // 用户在设置页改成横排 + 关掉进入即展示 → 落 override 层。
+        std::fs::write(
+            ov.join("zz_kf.toml"),
+            "[overlay]\ncandidate_layout = \"horizontal\"\nshow_all_on_enter = false\n",
+        )
+        .unwrap();
+        mgr.invalidate_schema("zz_kf"); // 整表失效（见 overlay_cache 的文档）
+
+        let after = mgr.overlay_modes();
+        let kf = after.iter().find(|e| e.schema_id == "zz_kf").unwrap();
+        assert_eq!(
+            kf.spec.candidate_layout,
+            wind_config::LayoutIntent::Horizontal,
+            "override 的 [overlay] 未生效"
+        );
+        assert!(!kf.spec.show_all_on_enter);
+        assert_eq!(kf.name, "快符", "override 未提及的字段仍来自方案文件");
+    }
 
     /// 半衰期回落只有**两级**：本段的值 > store 默认（72h）。
     ///

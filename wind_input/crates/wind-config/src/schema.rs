@@ -33,6 +33,54 @@ pub struct Schema {
     /// 用 `BTreeMap`：顺序无语义（优先级由分派插入点决定），键唯一由类型保证。
     #[serde(default)]
     pub key_actions: std::collections::BTreeMap<String, String>,
+    /// **overlay 激活面**（`[overlay]`）：本方案可被引导键/直达热键叠加激活时的呈现配置。
+    ///
+    /// **段存在即声明「我是 overlay 方案」**——这同时是实例集合的枚举依据
+    /// （`EngineManager::overlay_modes`）。`None` = 普通方案，只能作 base 常驻使用。
+    ///
+    /// 不能复用 `[schema] hidden` 作这个判据：`english` 也是 hidden（供临英/融合候选
+    /// 懒加载），但它没有 overlay 生命周期。两者是正交的属性。
+    ///
+    /// 见 `docs/redesign/overlay-mode-config.md`。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub overlay: Option<OverlaySpec>,
+}
+
+/// overlay 激活面配置（`[overlay]`）。
+///
+/// ★ 这一段装的**不是**「这张码表是什么」（那是 `[engine.codetable]`），而是
+/// 「这张码表**被叠加使用时**怎么表现」——三个字段的语义都依赖 overlay 生命周期：
+/// `show_all_on_enter` 只在存在「进入这一刻」时才有意义；`candidate_layout` 的语义是
+/// 「本模式期间覆盖全局、退出自动恢复」。段名 `overlay` 由此而来。
+///
+/// ⛔ **刻意不含 `trigger_keys` / `hotkey`**：引导键与直达热键统一住在 `keys.key_actions`
+/// （全局）与方案文件 `[key_actions]`（按源方案分流）两张表里。在此再开一个入口字段
+/// 就是第三个真相源，正是本轮重构要消除的东西。见设计文档 §2.2。
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct OverlaySpec {
+    /// overlay 类别。当前只有 `"special"`（引导键特殊模式）；空 = 按 `special` 处理。
+    ///
+    /// 留这个字段是为消歧：`overlay` 在本仓有两个粒度——运行时状态（临拼/临英/mix/URL
+    /// 也都是 overlay，但它们无宿主方案、配置只能待在 `input.*`）与方案文件的这一段
+    /// （仅有宿主方案者）。段说「我可以被当 overlay 用」，本字段说「哪一类」。
+    #[serde(default)]
+    pub kind: String,
+    /// 进入模式即展示候选：空编码（刚进入、尚未敲码）时枚举本方案码表首页候选
+    /// （按 weight 降序），UI 按 per_page 分页浏览。默认 false（进入空白，敲码才出候选）。
+    ///
+    /// 面向快符/生僻字等**小符号表**的「进入即浏览」；大表会遍历全表取首 N 条、有开销，慎用。
+    #[serde(default)]
+    pub show_all_on_enter: bool,
+    /// 进入本模式期间的候选布局（默认跟随全局）。每个 overlay 方案独立——快符表可竖排、
+    /// 生僻字表可横排，互不影响。
+    #[serde(default)]
+    pub candidate_layout: crate::config::LayoutIntent,
+    /// 本模式期间的注释模板覆盖（竖排）。三态见 [`crate::config::CommentTemplateOverride`]。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub comment_template_vertical: crate::config::CommentTemplateOverride,
+    /// 本模式期间的注释模板覆盖（横排）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub comment_template_horizontal: crate::config::CommentTemplateOverride,
 }
 
 /// 方案元信息（[schema]）
@@ -203,10 +251,6 @@ pub struct PinyinSpec {
     /// 双拼布局 id（引用 data/schemas/shuangpin/<layout>.toml）
     #[serde(default)]
     pub shuangpin: ShuangpinSpec,
-    /// unigram 语言模型路径（相对 schemas 目录），拼音长句 Viterbi 打分用。
-    /// 属解码/引擎职责（非用户学习），故置于 [engine.pinyin] 而非 [learning]。
-    #[serde(default)]
-    pub unigram_path: String,
 }
 
 /// 双拼布局（[engine.pinyin.shuangpin]）
