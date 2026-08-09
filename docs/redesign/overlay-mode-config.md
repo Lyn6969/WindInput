@@ -203,15 +203,50 @@ backslash = "special:kf"       # 引导键与直达热键从此是同一张表�
 | 文件 | 改动 |
 |---|---|
 | `src/special_modes.rs` | **整个删除**（`ensure_special_mode_entry` 的存在理由消失） |
-| `src/dialogs/schema_manager.rs` | 删 `special_modes: Rc<RefCell<Vec<Value>>>` 工作态；引导键改写 `keys.key_actions`；新增 overlay 配置区 |
+| `src/dialogs/schema_manager.rs` | 删 `special_modes` 工作态；引导键单写 `keys.key_actions`；新增「特殊模式」节 |
+| `src/state.rs` | 删 `schema.special_modes` writer；冲突检测换源（见下） |
 | `src/capabilities.rs` | 删 `schema.special_modes` 豁免 |
-| `src/mockdata/config.json` | 删 `special_modes` 段 |
-| `capabilities.snapshot.json` | 重新生成 |
+| `src/mockdata/config.json` / `capabilities.snapshot.json` | 各自的重生成命令同步 |
 
 ⚠️ **同一方案的 override 全局只允许有一个写入者**：`schema.saveConfig` 是"整份 cfg 与
 方案文件 diff、结果全量重写 override"，overlay 配置与码表配置若各注册一个 `SideCommitter`，
 后提交者会用自己那份 cfg 的 diff 把前者整个覆盖掉。两者必须投递进**同一个** per-schema
-待提交队列（`schema_mgr.commit_pending_edits` 已按 id 累积合并）。
+待提交队列（`schema_mgr.commit_pending_edits` 已按 id 累积合并）。**实施时确认既有的
+`stage_settings_edits` 早已是这个形态**，overlay 只需追加一段。
+
+#### 「特殊模式」节的最终形态（用户拍板，与初稿不同）
+
+初稿设想「所有码表方案都显示该节 + 一个『设为特殊方案』总开关」。**实测后否决**：
+
+> 给每个码表方案都挂一节「要不要变成特殊模式」，只会让常规码表配置变乱——而那是
+> 绝大多数人唯一会看的地方。
+
+定为：**本节只在方案已声明 `[overlay]` 段时出现，节内无总开关**，只调段内行为参数
+（进入即展示候选 / 候选排列）。「是不是 overlay 方案」是方案的固有属性，由方案文件
+（作者或手写）决定。
+
+★ 去掉总开关还有一条独立理由：节只在已声明时出现 ⇒ 关掉总开关后这一节就消失，用户
+再也开不回来，是个**单程门**。
+
+★ 代价：目前**没有 UI 入口把普通方案变成 overlay 方案**，第一次必须手写方案文件。
+将来若要给入口，合适的位置是方案管理列表的右键菜单或新建方案流程，而不是每个码表
+方案的设置页。
+
+#### ⚠️ 顺带修掉的一个五c 遗留缺口：冲突检测的数据源
+
+审查时发现 `state.rs` 的两个分组函数仍在读已删除的 `schema.special_modes`（死代码）。
+顺着查出更大的问题：**`keys.key_actions` 从来没被纳入过冲突检测**——五c 把四处
+`trigger_keys` 收编进那张表后，本检测没跟着换源，于是：
+
+- 「引导键撞车」实际上很久检不出来了（旧字段在 core 侧已被 `normalize` 折算清空）；
+- `toggle_schema:` 一直写在那张表里、却从未参与过热键域检测。
+
+本轮只换数据源、不动分组语义：单键 → 触发键域；组合键 → 热键域（与 11 个功能键、
+`schema_hotkeys` 在内核是同一张 key_down 表）；纯修饰键走 keyup 不争用，排除；
+`none` 哨兵不产生绑定，排除。
+
+键形态判据用「键串含 `+`」近似 core 的 `route_of_key_action`——对实际取值足够，且
+不必在本仓再写一份键名解析器（跨仓两份解析器慢慢漂移是本仓栽过的）。
 
 ### 文档站（WindInputDocs）
 
@@ -226,8 +261,21 @@ backslash = "special:kf"       # 引导键与直达热键从此是同一张表�
 | 3 | `hotkey` 收编 + 删除 `SpecialModeConfig` + 残留 warn | `602f14b` ✅ |
 | 4 | `saveConfig` 往返测试 + `schema.list` 带 overlay 标志 | `61c3e1f` / `4639b08` ✅ |
 | 5 | wind-setting：清理 + 新增「特殊模式」配置节 | `d69a41e` / `85f43d1` ✅ |
+| 6 | 真机反馈修正：崩溃修复 / 节的显示条件 / 控件形态 / 冲突检测换源 | `ea8a666` / `5162889` / `ed9d0b0` ✅ |
 
-**未真机验证**：引导键/直达热键实际进入、设置页新节的渲染与保存效果，均需真机确认。
+**真机已验证**（2026-08-09，Dev 变体）：两个引导键各进各的模式（按候选内容与图标短称
+区分）、进入即展示、敲码上屏、设置页各节渲染与保存。
+
+### ★ 真机才暴露的一个崩溃：`.small()` 用在了 segmented 上
+
+windui 的 `.small()` 只对 Button/CheckBox/Switch 有定义，落到别的 widget 会走
+`config_button` 的 `debug_assert!(false, "small() 只能用于 Element::button(..)")`。
+于是「特殊模式」节一打开就 panic，而**编译与既有 419 个测试全绿**——这套链式 API 用
+**运行时 downcast** 做类型检查，写错只在真机上炸。
+
+补了 `every_settings_section_builds_without_panicking`：对每个 `SettingsSection` 调一次
+`build_section`，测的不是布局对不对，而是链式 API 有没有用错对象，新增配置节自动覆盖。
+反向对照已跑——把 `.small()` 加回去，该测试打出的正是用户报告的那句崩溃原话。
 
 ### 实施中的两处修正
 
