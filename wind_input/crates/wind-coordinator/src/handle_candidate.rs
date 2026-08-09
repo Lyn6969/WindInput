@@ -1193,7 +1193,12 @@ impl Coordinator {
         // 引导字母的「重复上屏」：输入恰为单个引导字母时，把最近一次上屏内容注入候选顶部
         // （对齐 Go），供「引导键 + 选词」重复上一次输入。资格判定见
         // `leading_letter_repeat_text`——它同时承担「让位那一帧不能空无一物」这个职责。
-        if let Some(last) = self.leading_letter_repeat_text(&state.input_buffer) {
+        //
+        // 传**当前帧是否已有候选**：隐式来源（mix 的 repeat 成员）只填空帧，不抢首选，
+        // 否则活码字母上按空格会上屏上次内容而非用户刚打的字。
+        if let Some(last) =
+            self.leading_letter_repeat_text(&state.input_buffer, state.candidates.is_empty())
+        {
             state.candidates.insert(
                 0,
                 Candidate {
@@ -1240,7 +1245,15 @@ impl Coordinator {
     ///   要进那个模式，把它**空缓冲帧**的能力提前一格给出来。没有这条，走让位路径的引导键
     ///   永远到不了 mix 的空缓冲帧（夺取路径的 `mix_buffer` 恒等于残余码，至少一个字符），
     ///   那个成员对这类配置形同虚设——用户报的「z 进的快捷输入没有重复输入功能」正是它。
-    fn leading_letter_repeat_text(&self, buffer: &str) -> Option<String> {
+    /// `frame_empty` = 这一帧的正常候选是否为空，**只约束来源 ②**：
+    ///
+    /// - ① `z_key_repeat` 是用户显式打开的开关，「按 z 重复上屏」就是它的全部语义，
+    ///   有候选也照样抢首选——那是用户要的。
+    /// - ② mix members 那条是**隐式**推导的（用户只写了 `z = "mix:…"`，没要求 repeat），
+    ///   职责仅限于填补让位后的空帧。绑了动作的字母**恰恰可能是活码**（那正是它让位的
+    ///   原因），此时那一帧有真候选，再插到顶上就会让用户按空格上屏上次的内容而不是
+    ///   自己打的字。
+    fn leading_letter_repeat_text(&self, buffer: &str, frame_empty: bool) -> Option<String> {
         let mut it = buffer.chars();
         let (Some(c), None) = (it.next(), it.next()) else {
             return None; // 仅「恰好一个字符」那一帧
@@ -1254,7 +1267,10 @@ impl Coordinator {
         {
             return Some(t);
         }
-        // ② 目标 mix 的 repeat 成员。
+        // ② 目标 mix 的 repeat 成员——仅填补空帧，不抢占正常候选。
+        if !frame_empty {
+            return None;
+        }
         let vk = keymap::VK_A + (c.to_ascii_lowercase() as u32 - 'a' as u32);
         let Some(wind_config::BoundAction::Mix(id)) = self.bound_action_for(vk) else {
             return None;

@@ -813,6 +813,43 @@ fn exact_code_phrase_still_yields_regardless_of_min_prefix() {
     let _ = std::fs::remove_dir_all(&ov);
 }
 
+/// ★ 隐式的 repeat 来源（mix members）**只填空帧，不抢首选**。
+///
+/// 绑了动作的字母**恰恰可能是活码**——那正是它让位的原因。此时那一帧有真候选，若把重复
+/// 上屏插到顶上，用户按空格上屏的就是上次内容而不是自己刚打的字。
+///
+/// 用 `zt` 方案（码表自带 `zzbd`→甲 / `zzsz`→乙）：z 是活码前缀，按 z 有真候选。
+/// 与 `bound_letter_yield_frame_shows_repeat`（wubi86 的 z 是死码、帧为空）构成受控对比,
+/// 唯一变量就是「这一帧有没有候选」。
+///
+/// 显式开关 `z_key_repeat` 不受此限：用户开了它就是要 z 干这个，抢首选是本意。
+#[test]
+fn implicit_repeat_does_not_outrank_real_candidates() {
+    let dd = make_data_dir_with_z_code("zrepeatrank");
+    let ov = make_override("zrepeatrank", "zt", "z = \"mix:quick_mix\"");
+    let cfg = cfg_for_z_schema(); // 不开 z_key_repeat
+    let coord = Coordinator::new_headless_with_override(cfg, Some(&dd), Some(ov.clone()));
+
+    // 先上屏「阿」（码 a）喂出历史。
+    coord.handle_key_event(&key('A' as u32));
+    coord.handle_key_event(&key(0x20));
+
+    coord.handle_key_event(&key(VK_Z));
+    assert_eq!(coord.debug_active_mode(), None, "z 是活码前缀，应让位");
+    let texts = coord.debug_all_candidate_texts();
+    assert!(
+        !texts.is_empty(),
+        "前提不成立：zt 方案按 z 本该有码表前缀候选，否则本用例测不出「抢首选」"
+    );
+    assert_ne!(
+        texts.first().map(String::as_str),
+        Some("阿"),
+        "这一帧有真候选，隐式 repeat 不该插到首位，实际: {texts:?}"
+    );
+    let _ = std::fs::remove_dir_all(&ov);
+    let _ = std::fs::remove_dir_all(&dd);
+}
+
 /// 没绑动作、也没开 `z_key_repeat` 的字母，那一帧**不该**凭空多出重复候选。
 ///
 /// 反向守卫：`leading_letter_repeat_text` 的资格判定若写漏（比如只看「单字母」不看绑定），
