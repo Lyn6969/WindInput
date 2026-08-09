@@ -34,13 +34,32 @@ fn has_schemas() -> bool {
 /// 数组。测试不能往真实 `data/schemas` 写文件，故走 override 层——`read_schema` 的
 /// `merge_toml` 会把它合并进方案，效果等同方案自带该段，真实词库分毫不动。
 fn overlay_override_dir(tag: &str, schemas: &[(&str, bool)]) -> PathBuf {
+    overlay_override_dir_with_codetable(tag, schemas, "")
+}
+
+/// 同 [`overlay_override_dir`]，但额外给每个方案写一段 `[engine.codetable]` 覆盖。
+///
+/// ★ **overlay 方案不继承全局 `schema.codetable`**（`EngineManager::codetable_baseline`
+/// 按 `[overlay]` 段存在与否分流，取内置基线）。所以想让它按某个码表行为跑，必须写在
+/// **方案自己名下**——拨 `cfg.schema.codetable.*` 对它完全无效，而那样写出来的测试
+/// 会以「行为没生效」的形态失败，很容易被误读成功能坏了。
+fn overlay_override_dir_with_codetable(
+    tag: &str,
+    schemas: &[(&str, bool)],
+    codetable: &str,
+) -> PathBuf {
     let dir = std::env::temp_dir().join(format!("wind_overlay_ov_{tag}"));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
     for (id, show_all) in schemas {
+        let ct = if codetable.is_empty() {
+            String::new()
+        } else {
+            format!("[engine.codetable]\n{codetable}")
+        };
         std::fs::write(
             dir.join(format!("{id}.toml")),
-            format!("[overlay]\nkind = \"special\"\nshow_all_on_enter = {show_all}\n"),
+            format!("[overlay]\nkind = \"special\"\nshow_all_on_enter = {show_all}\n{ct}"),
         )
         .unwrap();
     }
@@ -5434,10 +5453,11 @@ fn special_mode_effect_command_auto_commit_executes() {
         .add_user_word("wubi86", "kkkkx", r#"$CC("《》", ask("x"))"#, 0, 0)
         .unwrap();
     let mut cfg = config_with("wubi86");
-    cfg.schema.codetable.auto_commit_at_full = true;
-    let ov = overlay_override_dir(
+    // ★ 自动上屏写在方案名下：overlay 方案不继承全局 `schema.codetable`。
+    let ov = overlay_override_dir_with_codetable(
         "special_mode_effect_command_auto_commit_",
         &[("wubi86", false)],
+        "auto_commit_at_full = true\n",
     );
     bind_special(&mut cfg, "backslash", "wubi86");
     let coord =
@@ -5559,11 +5579,11 @@ fn special_mode_show_all_respects_single_code_input() {
         let _ = std::fs::remove_file(&store_path);
         let store = std::sync::Arc::new(wind_store::Store::open(&store_path).unwrap());
         let mut cfg = config_with("wubi86");
-        // 全局基线设 single_code_input；wubi86 方案未覆盖 → tri-state 回落此值。
-        cfg.schema.codetable.single_code_input = single_code;
-        let ov = overlay_override_dir(
+        // ★ 写在**方案自己名下**，不是全局：overlay 方案不继承全局 `schema.codetable`。
+        let ov = overlay_override_dir_with_codetable(
             "special_mode_show_all_respects_single_co",
             &[("wubi86", true)],
+            &format!("single_code_input = {single_code}\n"),
         );
         bind_special(&mut cfg, "backslash", "wubi86");
         let coord =
@@ -7523,11 +7543,11 @@ fn special_mode_browse_exact_mode_hides_first_shows_next() {
     let _ = std::fs::remove_file(&store_path);
     let store = std::sync::Arc::new(wind_store::Store::open(&store_path).unwrap());
     let mut cfg = config_with("pinyin");
-    // wubi86 是普通方案（非 hidden），继承全局的精确匹配开关。
-    cfg.schema.codetable.single_code_input = true;
-    let ov = overlay_override_dir(
+    // ★ 精确匹配写在方案名下：wubi86 在本用例里带 `[overlay]` 段，不继承全局码表配置。
+    let ov = overlay_override_dir_with_codetable(
         "special_mode_browse_exact_mode_hides_fir",
         &[("wubi86", true)],
+        "single_code_input = true\n",
     );
     bind_special(&mut cfg, "backslash", "wubi86");
     let coord =

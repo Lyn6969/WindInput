@@ -38,8 +38,10 @@ pub struct Schema {
     /// **段存在即声明「我是 overlay 方案」**——这同时是实例集合的枚举依据
     /// （`EngineManager::overlay_modes`）。`None` = 普通方案，只能作 base 常驻使用。
     ///
-    /// 不能复用 `[schema] hidden` 作这个判据：`english` 也是 hidden（供临英/融合候选
-    /// 懒加载），但它没有 overlay 生命周期。两者是正交的属性。
+    /// 不能复用 `[schema] hidden` 作这个判据：两者回答的是不同问题。`hidden` 是**展示**
+    /// 属性（列不列进方案切换列表），本段是**行为**属性（有没有叠加进入/退出的生命周期）。
+    /// 一个 overlay 方案完全可以不 hidden（作者想让它同时能常驻切换），一个 hidden 的
+    /// 码表方案也可能只是 mix 成员、没有 overlay 生命周期。
     ///
     /// 见 `docs/redesign/overlay-mode-config.md`。
     #[serde(default, skip_serializing_if = "Option::is_none")]

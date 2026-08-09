@@ -358,7 +358,8 @@ impl Coordinator {
                     // 热键临时叠加进入（快符/生僻字那类）。设置页据此枚举 `special:<id>`
                     // 动词的可选项，并决定要不要显示 overlay 那一节配置。
                     //
-                    // ⚠️ 与 `hidden` **正交**，不可互推：english 也是 hidden 但没有 overlay
+                    // ⚠️ 与 `hidden` **正交**，不可互推：hidden 只说「不列进方案切换列表」，
+                    // 隐藏的码表方案也可能只是 mix 成员、没有 overlay
                     // 生命周期；反过来一个 overlay 方案也可以不隐藏。
                     "overlay": merged.as_ref().is_some_and(|s| s.overlay.is_some()),
                     "description": info.map(|i| i.description.clone()).unwrap_or_default(),

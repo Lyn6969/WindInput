@@ -287,14 +287,38 @@ windui 的 `.small()` 只对 Button/CheckBox/Switch 有定义，落到别的 wid
 随 `active = None` 自然失效，没有需要被执行的恢复动作。
 
 **② 设置页判据从 `entry.hidden` 换成 `entry.overlay`**。引导键那一行原先按 `hidden`
-显示，那是 overlay 的**代理**（当年只有快符/英文两个隐藏方案）。但它一直不准：`english`
-也是 hidden 却没有 overlay 生命周期，给它配引导键按下去什么都不会发生。
+显示，那是 overlay 的**代理**（当年快符与英文都是隐藏方案）。但它一直不准：隐藏方案
+未必有 overlay 生命周期，给这类方案配引导键按下去什么都不会发生。
 
-### ⚠️ 顺带发现、**刻意未改**的一处同形问题
+### ③ `codetable_baseline` 判据同步换掉（补做）
 
 `EngineManager::codetable_baseline`（`manager.rs`）判定「特殊方案用内置基线而非全局
 `schema.codetable`」用的也是 `s.schema.hidden`——同样是拿 hidden 当 overlay 的代理。
-它不依赖已删除的数组，故本次改造没碰坏它。
 
-**没顺手改对，是因为改了会动 `english` 的码表基线取值**（它是 hidden），而 english 走
-的是 `EnglishGlobal` 还是这条路径需要单独确认，属于另一件事的风险。留作独立小项。
+本轮先记为「刻意未改」，理由写的是「改了会动 `english` 的码表基线取值（它是 hidden）」。
+**复查发现这条理由双重不成立**，遂补做：
+
+1. `english` 自 `8d3351bf`「英文改为可切换方案」起就**不再是 hidden**（0.114 的事）。
+   当初那句是沿用 `manager.rs` 里更早的一段过时注释，没有实测。
+2. 就算它是，也够不着——`build_engine` 里 english 有独立分支，用
+   `CommitOptions::default()` 提前 `return`，比 `codetable_baseline` 早；
+   `effective_codetable` 那条路又被 `etype == "codetable"` 挡掉。
+
+**判据要与理由对齐**：注释给的理由是「它是被叠加使用的几十条小符号表，不该继承按五笔
+那种数万条全码表调的基线」——那正是 `[overlay]` 声明的事。`hidden` 回答的是「列不列进
+方案切换列表」，与该折叠哪份基线无关。
+
+改后行为差异只在两个反对角组合上，已由 `codetable_baseline_keys_on_overlay_section_not_hidden`
+钉住（换判据前该测试是红的，做过反向对照）：
+
+| 方案 | 旧（hidden） | 新（overlay） |
+|---|---|---|
+| 有 `[overlay]`、无 `hidden` | 全局 ❌ 会继承五笔的精确匹配 | 内置基线 ✅ |
+| 有 `hidden`、无 `[overlay]` | 内置基线 ❌ | 全局 ✅ 它只是不列进切换列表的普通码表 |
+
+实测当前无人受影响：内置 5 个方案一个 `hidden` 都没有；真机用户数据里 hidden 与
+overlay 完全重合。
+
+★ **可复用教训**：把一处「暂不改」记进文档时，**理由本身也要有证据**。这条理由是从一段
+过时注释里抄来的，它让一个五分钟的改动被搁置了一轮，且如果没人复查就会一直被引用下去。
+同形见 [[project_theme_follow_system]]「功能不工作时先确认它是否真被实现过」。

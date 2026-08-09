@@ -2068,21 +2068,29 @@ impl EngineManager {
         base.resolved(schema.as_ref().map(|s| &s.engine.codetable))
     }
 
-    /// 折叠方案行为时用哪份基线：普通方案用全局 `schema.codetable`，**特殊方案用内置默认值**。
+    /// 折叠方案行为时用哪份基线：普通方案用全局 `schema.codetable`，**overlay 方案用内置默认值**。
     ///
-    /// 特殊方案（`[schema].hidden`：快符、生僻字表这类）与主码表的性质完全不同——它们是
-    /// 几十条的小符号表，而全局基线是按五笔这种数万条的全码表调的。继承的后果是用户改五笔的
-    /// 「精确匹配」，快符跟着变，且改的人根本意识不到自己动了另一个表。
+    /// overlay 方案（快符、生僻字表这类）与主码表的性质完全不同——它们是几十条的小符号表，
+    /// 而全局基线是按五笔这种数万条的全码表调的。继承的后果是用户改五笔的「精确匹配」，
+    /// 快符跟着变，且改的人根本意识不到自己动了另一个表。
     ///
-    /// 判据用 `hidden` 而非「是否被 `special_modes` 引用」：后者在这一层拿不到
-    /// （`build_engine` 没有 `config.schema.special_modes`），且 `hidden` 正是设置页据以
-    /// 分区的同一个标志——两处判据一致比各自发明一套更不容易漂。英文方案虽然也 hidden，
-    /// 但走 english 分支、根本不读码表配置，不受影响。
+    /// ★ **判据是 `[overlay]` 段存在，不是 `[schema].hidden`**。两者正交，回答的是不同问题：
+    /// `hidden` 管「列不列进方案切换列表」，与该折叠哪份基线无关；上面那条理由讲的是
+    /// 「它被**叠加使用**、是张小符号表」——那正是 `[overlay]` 声明的事。
+    ///
+    /// ⚠️ 曾用 `hidden`，理由是「是否被 `special_modes` 引用在这一层拿不到」。该理由随
+    /// `special_modes` 数组解散而失效：`[overlay]` 就在 `Schema` 里，本函数已持有它。
+    /// 当时另一条理由「英文方案虽然也 hidden」更是早已过时——english 自 `8d3351bf`
+    /// 「英文改为可切换方案」起就不是 hidden 了，且它在 `build_engine` 里走独立 english
+    /// 分支、用 `CommitOptions::default()` 提前 return，根本到不了这里。
+    ///
+    /// 换判据后，「hidden 但非 overlay 的码表方案」（如只作 mix 成员用的隐藏小码表）
+    /// 改为跟随全局——它被当普通候选来源使用，跟随全局本就更合理。
     fn codetable_baseline(
         schema: Option<&Schema>,
         global: &wind_config::CodetableGlobal,
     ) -> wind_config::CodetableGlobal {
-        if schema.map(|s| s.schema.hidden).unwrap_or(false) {
+        if schema.map(|s| s.overlay.is_some()).unwrap_or(false) {
             Self::special_schema_baseline()
         } else {
             global.clone()
@@ -3368,8 +3376,8 @@ mod tests {
 
     /// 注册表的准入判据是**`[overlay]` 段存在**，不是 `hidden`。
     ///
-    /// 这两个属性正交：`english` 也是 hidden（供临英/融合候选懒加载），但它没有 overlay
-    /// 生命周期。拿 hidden 当判据会把它误收进特殊模式列表。
+    /// 这两个属性正交：`hidden` 只说「不列进方案切换列表」，隐藏的码表方案也可能只是
+    /// mix 成员、并无 overlay 生命周期。拿 hidden 当判据会把这类方案误收进特殊模式列表。
     #[test]
     fn overlay_modes_admits_by_section_presence() {
         let (mgr, _ov) = overlay_mgr("admit");
@@ -3812,25 +3820,25 @@ mod tests {
         let _ = std::fs::remove_dir_all(&base_dir);
     }
 
-    /// 特殊方案（`[schema].hidden`）**不继承**全局 `schema.codetable`：没写的字段取内置默认，
-    /// 而不是主码表的设置。
+    /// overlay 方案（带 `[overlay]` 段）**不继承**全局 `schema.codetable`：没写的字段取内置
+    /// 默认，而不是主码表的设置。
     ///
     /// 快符是几十条的小符号表，全局基线是按五笔那种数万条全码表调的。继承的后果是用户改
     /// 五笔的「精确匹配」，快符跟着变，而改的人根本意识不到自己动了另一个表。
     #[test]
-    fn special_schema_does_not_inherit_global_codetable() {
+    fn overlay_schema_does_not_inherit_global_codetable() {
         use std::io::Write;
         let base_dir = std::env::temp_dir().join("wind_eng_special_baseline");
         let schemas = base_dir.join("schemas");
         let _ = std::fs::remove_dir_all(&base_dir);
         std::fs::create_dir_all(&schemas).unwrap();
-        // 两个方案，除 hidden 外**逐字相同**——差别只能来自 hidden 本身。
-        for (id, hidden) in [("sp_hidden", true), ("sp_normal", false)] {
+        // 两个方案，除 `[overlay]` 段外**逐字相同**——差别只能来自那一段本身。
+        for (id, overlay) in [("sp_overlay", true), ("sp_normal", false)] {
             let mut f = std::fs::File::create(schemas.join(format!("{id}.schema.toml"))).unwrap();
-            let h = if hidden { "hidden = true\n" } else { "" };
+            let ov = if overlay { "[overlay]\n" } else { "" };
             write!(
                 f,
-                "[schema]\nid = \"{id}\"\n{h}[engine]\ntype = \"codetable\"\n[engine.codetable]\nmax_code_length = 8\n"
+                "[schema]\nid = \"{id}\"\n[engine]\ntype = \"codetable\"\n[engine.codetable]\nmax_code_length = 8\n{ov}"
             )
             .unwrap();
         }
@@ -3848,16 +3856,17 @@ mod tests {
         let ov = std::env::temp_dir().join("wind_eng_special_baseline_ov");
         let _ = std::fs::remove_dir_all(&ov);
 
-        let sp = EngineManager::resolve_codetable("sp_hidden", Some(&base_dir), &global, Some(&ov));
+        let sp =
+            EngineManager::resolve_codetable("sp_overlay", Some(&base_dir), &global, Some(&ov));
         assert_eq!(
             sp.single_code_input, def.single_code_input,
-            "特殊方案不该继承全局的精确匹配"
+            "overlay 方案不该继承全局的精确匹配"
         );
         assert_eq!(sp.z_key_repeat, def.z_key_repeat);
         assert_eq!(sp.top_code_commit, def.top_code_commit);
 
-        // 反向对照：同样的文件去掉 hidden 就该继承——否则上面三条在「全局基线整个失效」
-        // 时也会通过。
+        // 反向对照：同样的文件去掉 `[overlay]` 就该继承——否则上面三条在「全局基线整个
+        // 失效」时也会通过。
         let np = EngineManager::resolve_codetable("sp_normal", Some(&base_dir), &global, Some(&ov));
         assert_eq!(
             np.single_code_input, global.single_code_input,
@@ -3869,26 +3878,94 @@ mod tests {
         let _ = std::fs::remove_dir_all(&base_dir);
     }
 
+    /// ★ 基线判据是 `[overlay]` 段而**不是** `hidden`：钉住两个「反对角」组合。
+    ///
+    /// 这两例正是旧判据（`hidden`）判错的地方，本测试在换判据前是红的：
+    ///
+    /// | 方案 | 旧判据（hidden） | 新判据（overlay） |
+    /// |---|---|---|
+    /// | 有 `[overlay]`、无 `hidden` | 全局 ❌ 会继承五笔的精确匹配 | 内置基线 ✅ |
+    /// | 有 `hidden`、无 `[overlay]` | 内置基线 ❌ | 全局 ✅ 它只是不列进切换列表的普通码表 |
+    ///
+    /// 必须两条一起断言：只测其一的话，判据被改成恒真/恒假时另一半照样通过。
+    #[test]
+    fn codetable_baseline_keys_on_overlay_section_not_hidden() {
+        use std::io::Write;
+        let base_dir = std::env::temp_dir().join("wind_eng_baseline_offdiag");
+        let schemas = base_dir.join("schemas");
+        let _ = std::fs::remove_dir_all(&base_dir);
+        std::fs::create_dir_all(&schemas).unwrap();
+        // 两个方案的 hidden 与 overlay 刻意**取反**，两个属性由此可分辨。
+        for (id, extra) in [("od_overlay_only", "[overlay]\n"), ("od_hidden_only", "")] {
+            let mut f = std::fs::File::create(schemas.join(format!("{id}.schema.toml"))).unwrap();
+            let h = if id == "od_hidden_only" {
+                "hidden = true\n"
+            } else {
+                ""
+            };
+            write!(
+                f,
+                "[schema]\nid = \"{id}\"\n{h}[engine]\ntype = \"codetable\"\n[engine.codetable]\nmax_code_length = 8\n{extra}"
+            )
+            .unwrap();
+        }
+
+        let def = EngineManager::special_schema_baseline();
+        // 全局拨到与内置基线相反的一侧，「取了哪份基线」一眼可辨。
+        let global = wind_config::CodetableGlobal {
+            single_code_input: !def.single_code_input,
+            z_key_repeat: !def.z_key_repeat,
+            ..Default::default()
+        };
+        let ov = std::env::temp_dir().join("wind_eng_baseline_offdiag_ov");
+        let _ = std::fs::remove_dir_all(&ov);
+
+        // 有 [overlay] 但没写 hidden：仍取内置基线（旧判据在这里会去继承全局）。
+        let a = EngineManager::resolve_codetable(
+            "od_overlay_only",
+            Some(&base_dir),
+            &global,
+            Some(&ov),
+        );
+        assert_eq!(
+            a.single_code_input, def.single_code_input,
+            "声明了 [overlay] 就该取内置基线，与写没写 hidden 无关"
+        );
+        assert_eq!(a.z_key_repeat, def.z_key_repeat);
+
+        // hidden 但没有 [overlay]：它只是不进切换列表的普通码表，该跟随全局
+        // （旧判据在这里会误给内置基线）。
+        let b =
+            EngineManager::resolve_codetable("od_hidden_only", Some(&base_dir), &global, Some(&ov));
+        assert_eq!(
+            b.single_code_input, global.single_code_input,
+            "hidden 只是不列进切换列表，没有 [overlay] 就该跟随全局"
+        );
+        assert_eq!(b.z_key_repeat, global.z_key_repeat);
+
+        let _ = std::fs::remove_dir_all(&base_dir);
+    }
+
     /// `effective_codetable`（设置页的初值快照来源）必须与 `resolve_codetable`（引擎实际
     /// 构建时用的折叠）**同口径**——它们是第三、第四个平行折叠点，一处改了另一处没改，
     /// 用户会看到「设置页显示精确匹配是关的，实际按开的跑」。
     ///
-    /// 顺带钉住基线分流：设置页给特殊方案显示的初值必须来自特殊基线，否则用户一打开
-    /// 「自定义码表配置」就把全局的值写进了本不继承全局的方案。
+    /// 顺带钉住基线分流：设置页给 overlay 方案显示的初值必须来自 overlay 基线，否则用户
+    /// 一打开「自定义码表配置」就把全局的值写进了本不继承全局的方案。
     #[test]
-    fn effective_codetable_matches_resolve_and_splits_by_hidden() {
+    fn effective_codetable_matches_resolve_and_splits_by_overlay() {
         use std::io::Write;
         let base_dir = std::env::temp_dir().join("wind_eng_effective_ct");
         let schemas = base_dir.join("schemas");
         let _ = std::fs::remove_dir_all(&base_dir);
         std::fs::create_dir_all(&schemas).unwrap();
-        // 与 special_schema_does_not_inherit_global_codetable 同构：除 hidden 外逐字相同。
-        for (id, hidden) in [("eff_hidden", true), ("eff_normal", false)] {
+        // 与 overlay_schema_does_not_inherit_global_codetable 同构：除 `[overlay]` 外逐字相同。
+        for (id, overlay) in [("eff_overlay", true), ("eff_normal", false)] {
             let mut f = std::fs::File::create(schemas.join(format!("{id}.schema.toml"))).unwrap();
-            let h = if hidden { "hidden = true\n" } else { "" };
+            let ov = if overlay { "[overlay]\n" } else { "" };
             write!(
                 f,
-                "[schema]\nid = \"{id}\"\n{h}[engine]\ntype = \"codetable\"\n[engine.codetable]\nmax_code_length = 4\nsingle_code_complete = false\n"
+                "[schema]\nid = \"{id}\"\n[engine]\ntype = \"codetable\"\n[engine.codetable]\nmax_code_length = 4\nsingle_code_complete = false\n{ov}"
             )
             .unwrap();
         }
@@ -3903,10 +3980,10 @@ mod tests {
         cfg.schema.active = "eff_normal".to_string();
         let mgr = EngineManager::new(&cfg, Some(&base_dir));
 
-        let sp = mgr.effective_codetable("eff_hidden");
+        let sp = mgr.effective_codetable("eff_overlay");
         assert_eq!(
             sp.single_code_input, def.single_code_input,
-            "特殊方案的初值快照该来自特殊基线，不该继承全局"
+            "overlay 方案的初值快照该来自 overlay 基线，不该继承全局"
         );
         assert_eq!(sp.z_key_repeat, def.z_key_repeat);
         assert_eq!(sp.punct_commit, def.punct_commit);
@@ -3915,7 +3992,7 @@ mod tests {
             "方案文件显式写了 false，应压过基线的 true"
         );
 
-        // 反向对照：去掉 hidden 就该继承全局——否则上面三条在「全局整个失效」时也通过。
+        // 反向对照：去掉 `[overlay]` 就该继承全局——否则上面三条在「全局整个失效」时也通过。
         let np = mgr.effective_codetable("eff_normal");
         assert_eq!(
             np.single_code_input, cfg.schema.codetable.single_code_input,
@@ -3924,7 +4001,7 @@ mod tests {
         assert_eq!(np.z_key_repeat, cfg.schema.codetable.z_key_repeat);
 
         // 与引擎构建实际用的那条折叠路径逐字段比对（同口径守护）。
-        for id in ["eff_hidden", "eff_normal"] {
+        for id in ["eff_overlay", "eff_normal"] {
             let via_resolve = EngineManager::resolve_codetable(
                 id,
                 Some(&base_dir),
