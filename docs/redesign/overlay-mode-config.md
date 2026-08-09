@@ -217,12 +217,36 @@ backslash = "special:kf"       # 引导键与直达热键从此是同一张表�
 
 配置参考页删 `schema.special_modes`、新增方案文件 `[overlay]` 段；用法页改写快符配置示例。
 
-## 7. 分期
+## 7. 分期与落地情况
 
-| 期 | 内容 | 可独立提交 |
+| 期 | 内容 | commit |
 |---|---|---|
-| 1 | `OverlaySpec` + overlay 注册表（纯新增，不删任何东西） | ✅ |
-| 2 | 6 个消费点切到注册表（`special_modes` 仍在但不再被读） | ✅ |
-| 3 | `hotkey` 收编 + 删除 `SpecialModeConfig` + 残留 warn | ✅ |
-| 4 | `schema.getConfig/saveConfig` 带 overlay 段 | ✅ |
-| 5 | wind-setting UI | ✅（跨仓） |
+| 1 | `OverlaySpec` + overlay 注册表（纯新增） | `39f09e1` ✅ |
+| 2 | 6 个消费点切到注册表 | `057b28b` ✅ |
+| 3 | `hotkey` 收编 + 删除 `SpecialModeConfig` + 残留 warn | `602f14b` ✅ |
+| 4 | `saveConfig` 往返测试 + `schema.list` 带 overlay 标志 | `61c3e1f` / `4639b08` ✅ |
+| 5 | wind-setting：清理 + 新增「特殊模式」配置节 | `d69a41e` / `85f43d1` ✅ |
+
+**未真机验证**：引导键/直达热键实际进入、设置页新节的渲染与保存效果，均需真机确认。
+
+### 实施中的两处修正
+
+**① `State.overlay_spec` 快照**（设计原稿没有）。原打算让 `intent_for`/`template_for`
+直接吃 `&[OverlayEntry]`，实施时发现 `template_for` 返回的是**借用 `cfg` 的 `&str`**
+（刻意不分配），临时 Vec 借不出来。改为进入模式时把 `[overlay]` 段快照进 `State`：
+借用有处可依、省掉候选路径上的整表 clone，且**注册表因装新方案而下标平移时，进行中的
+模式不会被换成隔壁那个**。这不是 `layout.rs` 反对的「保存/回放」——快照的是只读配置，
+随 `active = None` 自然失效，没有需要被执行的恢复动作。
+
+**② 设置页判据从 `entry.hidden` 换成 `entry.overlay`**。引导键那一行原先按 `hidden`
+显示，那是 overlay 的**代理**（当年只有快符/英文两个隐藏方案）。但它一直不准：`english`
+也是 hidden 却没有 overlay 生命周期，给它配引导键按下去什么都不会发生。
+
+### ⚠️ 顺带发现、**刻意未改**的一处同形问题
+
+`EngineManager::codetable_baseline`（`manager.rs`）判定「特殊方案用内置基线而非全局
+`schema.codetable`」用的也是 `s.schema.hidden`——同样是拿 hidden 当 overlay 的代理。
+它不依赖已删除的数组，故本次改造没碰坏它。
+
+**没顺手改对，是因为改了会动 `english` 的码表基线取值**（它是 hidden），而 english 走
+的是 `EnglishGlobal` 还是这条路径需要单独确认，属于另一件事的风险。留作独立小项。
