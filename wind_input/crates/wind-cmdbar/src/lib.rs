@@ -23,6 +23,7 @@ pub use ast::{ArrayPhrase, CommandPhrase, Expr, ModValue, Modifiers, Phrase};
 pub use context::{EvalContext, History, MemoryContext};
 pub use error::{CmdbarError, Result};
 pub use eval::{ArrayElement, ArrayExpansion, Evaluated, evaluate, expand_array};
+pub use funcs::value::generate_uuid;
 pub use parser::parse;
 pub use phrase::{PhraseEval, evaluate_phrase, is_cmdbar_grammar, run_actions};
 pub use registry::{Category, FuncSpec, Registry, default_registry};

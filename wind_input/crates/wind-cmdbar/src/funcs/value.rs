@@ -23,6 +23,7 @@ pub fn specs() -> Vec<FuncSpec> {
         "time" : Value (0, 1) pure => fn_time,  "当前时间; 默认 fmt='HH:mm:ss'", "time(\"HH:mm\")";
         "now"  : Value (0, 0) pure => fn_now,   "当前日期时间, 等价 date('YYYY-MM-DD HH:mm:ss')", "now()";
         "env"  : Value (1, 1) pure => fn_env,   "读取环境变量", "env(\"HOME\")";
+        "uuid" : Value (0, 1) pure => fn_uuid,  "随机 UUID (v4); flags 含 'n' 去横杠、'u' 转大写, 可组合", "uuid(\"n\")";
     }
 }
 
@@ -95,6 +96,41 @@ fn fn_now(ctx: &dyn EvalContext, _args: &[String]) -> Result<String> {
 fn fn_env(ctx: &dyn EvalContext, args: &[String]) -> Result<String> {
     // env 透传 ctx.env（ctx 持有 env 快照，与 Go 行为一致）。
     Ok(ctx.env(&args[0]))
+}
+
+fn fn_uuid(_ctx: &dyn EvalContext, args: &[String]) -> Result<String> {
+    generate_uuid(args.first().map(String::as_str).unwrap_or(""))
+}
+
+/// 生成随机 UUID（v4）。`flags` 为大小写不敏感的标志串：`n` 去掉横杠、`u` 转大写，
+/// 可组合（`"nu"`）；空串 = 标准带横杠小写。未知标志报错而非静默忽略——写错标志时
+/// 用户得不到任何提示的话，只会看到「格式没生效」却无从分辨是拼错还是不支持。
+///
+/// 与短语侧的 `$uuid` 模板变量共用本函数（`wind_phrase::expand_template`）：同一写法
+/// 在 `{uuid()}` 与 `$uuid` 两处必须给出同样的结果，否则用户无从分辨是语法错还是没支持
+/// （与 `${APP_DIR}` 等内部目录变量的同源处理一致）。
+pub fn generate_uuid(flags: &str) -> Result<String> {
+    let mut no_hyphen = false;
+    let mut upper = false;
+    for c in flags.chars() {
+        match c.to_ascii_lowercase() {
+            'n' => no_hyphen = true,
+            'u' => upper = true,
+            _ => {
+                return Err(CmdbarError::runtime(
+                    "uuid",
+                    format!("unknown flag {c:?} (want 'n' = no hyphen / 'u' = uppercase)"),
+                ));
+            }
+        }
+    }
+    let id = uuid::Uuid::new_v4();
+    let s = if no_hyphen {
+        id.simple().to_string()
+    } else {
+        id.hyphenated().to_string()
+    };
+    Ok(if upper { s.to_uppercase() } else { s })
 }
 
 /// 用户格式别名 → chrono strftime（最长前缀优先）。
@@ -192,6 +228,42 @@ mod tests {
         let mut c = MemoryContext::new();
         c.clock = Some(Local.with_ymd_and_hms(y, mo, d, h, mi, s).unwrap());
         c
+    }
+
+    #[test]
+    fn uuid_default_and_flags() {
+        let d = generate_uuid("").unwrap();
+        assert_eq!(d.len(), 36);
+        assert_eq!(d.matches('-').count(), 4);
+        assert_eq!(d, d.to_lowercase());
+        // v4 版本位：第 15 个字符恒为 '4'
+        assert_eq!(d.chars().nth(14), Some('4'));
+
+        let n = generate_uuid("n").unwrap();
+        assert_eq!(n.len(), 32);
+        assert!(!n.contains('-'));
+
+        let u = generate_uuid("U").unwrap(); // 标志大小写不敏感
+        assert_eq!(u.len(), 36);
+        assert_eq!(u, u.to_uppercase());
+
+        let nu = generate_uuid("nu").unwrap();
+        assert_eq!(nu.len(), 32);
+        assert_eq!(nu, nu.to_uppercase());
+
+        // 每次都是新值
+        assert_ne!(generate_uuid("").unwrap(), generate_uuid("").unwrap());
+
+        // 未知标志报错而非静默忽略
+        assert!(generate_uuid("x").is_err());
+        assert!(generate_uuid("nx").is_err());
+    }
+
+    #[test]
+    fn uuid_func_takes_optional_flags() {
+        let ctx = ctx_at(2026, 6, 14, 9, 5, 7);
+        assert_eq!(fn_uuid(&ctx, &[]).unwrap().len(), 36);
+        assert_eq!(fn_uuid(&ctx, &["n".into()]).unwrap().len(), 32);
     }
 
     #[test]

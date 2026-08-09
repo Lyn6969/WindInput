@@ -299,6 +299,16 @@ impl PhraseLayer {
                 // 转义只在系统边界发生（文本文件读写、设置页 UI 进出），见
                 // `wind_dict::store_layer::record_to_candidate` 的同源说明。
                 out.push(PhraseHit::plain(text, e.weight).with_source(&e.text));
+            } else {
+                // 含不支持的模板变量 → 整条跳过（打全码一个候选都没有）。
+                // 前缀路径 `lookup_prefix_at` 对同一失败是**回退原文显示**，两边现象相反
+                // （打全码没反应、打前缀反而看得见字面 `$xxx`），不留日志就没人查得动。
+                // 隐私红线（docs/logging-convention.md）：warn 不得含词条明文，源文降到 debug。
+                warn!(
+                    "短语模板变量不支持，该条被跳过 (chars={})",
+                    e.text.chars().count()
+                );
+                debug!("短语模板展开失败 code={:?} text={:?}", code, e.text);
             }
             // 本条 entry 产出的所有 hit 继承其系统/用户归属。
             for h in out[sys_start..].iter_mut() {
@@ -702,6 +712,9 @@ fn expand_var(name: &str, now: &DateTime<Local>) -> Option<String> {
         "DC" => small_int_chinese(now.day()),
         "ts" => now.timestamp().to_string(),
         "tsms" => now.timestamp_millis().to_string(),
+        // 随机 UUID：与命令栏 `{uuid()}` 共用同一份生成逻辑（同 dir_var 的理由——
+        // 同一个写法不能只在 $CC 里生效、直接写就不生效）。此处走默认格式，不会失败。
+        "uuid" => wind_cmdbar::generate_uuid("").ok()?,
         // 内部目录变量（${APP_DIR} 等）与命令栏字符串走同一份真相源：同样的写法
         // 若只在 $CC 里生效、直接写就不生效，用户无从分辨是语法错还是没支持。
         _ => return wind_config::dir_var_str(name),
@@ -1208,6 +1221,42 @@ mod tests {
         let got = layer.lookup_prefix_at("dat", fixed(), &[], 2);
         assert_eq!(got.len(), 1, "前缀枚举也不应丢弃 ${{YC}} 模板短语");
         assert_eq!(got[0].text, "二〇二六年六月十四日");
+    }
+
+    /// 回归：系统短语 `uuid = '$uuid'` 曾因 `expand_var` 没有 `uuid` 分支而整条被丢弃
+    /// （打全码无候选），前缀路径却回退显示字面 `$uuid`——同一根因两个相反现象。
+    ///
+    /// **必须从 `lookup_at` 进**（同 `lookup_expands_brace_template_vars` 的理由）：
+    /// 只测 `expand_template` 会绕过 `is_cmdbar_grammar` 分发。
+    #[test]
+    fn lookup_expands_uuid_variable() {
+        let mut map: HashMap<String, Vec<PhraseEntry>> = HashMap::new();
+        map.insert(
+            "uuid".into(),
+            vec![PhraseEntry {
+                text: "$uuid".into(),
+                weight: 1000,
+                position: 0,
+                is_system: true,
+            }],
+        );
+        let layer = PhraseLayer { map };
+
+        // 精确匹配路径：必须出候选，且不是字面量。
+        let got = layer.lookup_at("uuid", fixed(), &[], &no_clip());
+        assert_eq!(got.len(), 1, "$uuid 短语不应被丢弃");
+        assert_ne!(got[0].text, "$uuid", "应展开而非原样上屏");
+        assert_eq!(got[0].text.len(), 36, "默认格式为带横杠 UUID");
+        assert_eq!(got[0].text.matches('-').count(), 4);
+
+        // 前缀枚举路径：同样展开，不再回退成字面 `$uuid`。
+        let got_prefix = layer.lookup_prefix_at("uui", fixed(), &[], 2);
+        assert_eq!(got_prefix.len(), 1);
+        assert_ne!(got_prefix[0].text, "$uuid");
+
+        // 每次求值都是新值（区别于 date/time 的秒级稳定值）。
+        let again = layer.lookup_at("uuid", fixed(), &[], &no_clip());
+        assert_ne!(got[0].text, again[0].text, "uuid 应每次重新生成");
     }
 
     /// 真正的 cmdbar 插值 `{expr}` 不受上面的 `${` 豁免影响。
