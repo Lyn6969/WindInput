@@ -333,12 +333,12 @@ impl Coordinator {
         // 不能用 `active_base_sort_ignores_weight()`——活跃方案是码表（五笔），拿它的
         // `base_sort` 去排拼音候选就是「被五笔干扰」。
         let ignore_weight = self.engine_mgr.base_sort_ignores_weight_of(&schema);
-        // 供拼音精确档判「消费整串」。字节长度，与 `consumed_length` 同域（缓冲恒 ASCII）。
-        let input_len = state.temp_pinyin_buffer.len();
+        // 供跨来源档位判「消费整串」与「码 == 输入」。缓冲恒 ASCII，字节长度与 `consumed_length` 同域。
+        let input_str = state.temp_pinyin_buffer.clone();
         let mut candidates = result.candidates;
         // mixed=false：临拼是纯拼音 overlay，不存在码表/拼音跨来源竞争。
         candidates.sort_by(|a, b| {
-            crate::handle_candidate::candidate_display_order(a, b, ignore_weight, false, input_len)
+            crate::handle_candidate::candidate_display_order(a, b, ignore_weight, false, &input_str)
         });
         // 截断值必须跟取数上限同源：这两处曾同用一个常量兼任「取多少」与「留多少」，
         // 只改一处会出现「取了 5000 条又砍回 50」。

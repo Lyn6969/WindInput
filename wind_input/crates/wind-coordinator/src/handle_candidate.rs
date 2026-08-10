@@ -58,15 +58,17 @@ pub(crate) struct CandidateOpScope {
 ///   缺失，留谁将由一个不含该字段的键随机决定，留下「消费整串」那条会让分段上屏把剩余拼音
 ///   一并吃掉。该级在 `better` 里早已存在，此前漏抄到本函数。
 ///
-/// - `input_len`：本次输入的**字节**长度，供拼音精确档判「消费整串」（与 `consumed_length` 同域，
-///   输入缓冲恒为 ASCII）。⚠️ 不可省成 `!is_partial`：Viterbi 整句只解释部分输入时
-///   `is_partial` 仍是 false（`aaw` → 「啊啊」只消费 2/3 键），会被误提档并抢走首位。
-/// - `mixed`：当前是混输引擎时，在 `is_exact_code` 之后、权重之前插入**拼音精确档**
-///   （`wind_candidate::cmp_pinyin_exact_first`），使三档顺序为「码表精确 → 拼音精确 → 码表前缀
-///   补全」。解决混输打 `xu` 时拼音「需」被码表 `xu*` 的 124 条前缀补全压到第 125 位。
-///   ⚠️ **必须由调用方按引擎语境传入、不可恒 true**：纯拼音下全体候选同为 `Pinyin` 来源，该键会
-///   退化成「`is_common` 优先」，把含生僻字的多字词硬降到全部常用单字之后。依赖 `mark_common`
-///   已在排序前跑过（`is_common` 是提档准入条件）。
+/// - `input`：本次输入的原始码串。取长度供档位判「消费整串」（字节长度与 `consumed_length`
+///   同域，输入缓冲恒为 ASCII）；取全串供 `source_tier` 判「码 == 输入」（档 0）。
+///   ⚠️ 「消费整串」不可省成 `!is_partial`：Viterbi 整句只解释部分输入时 `is_partial` 仍是
+///   false（`aaw` → 「啊啊」只消费 2/3 键），会被误提档并抢走首位。
+/// - `mixed`：当前是混输引擎时，在 `is_exact_code` 之后、权重之前插入**跨来源档位**
+///   （[`wind_candidate::source_tier`]），档序为「码表精确 → 精确码短语 → 拼音精确 →
+///   码表前缀补全/前缀短语 → 拼音其余/英文」。解决混输打 `xu` 时拼音「需」被码表 `xu*` 的
+///   124 条前缀补全压到第 125 位。
+///   ⚠️ **必须由调用方按引擎语境传入、不可恒 true**：纯拼音下全体候选同为 `Pinyin` 来源，档位会
+///   退化成「`is_common` 优先」（档 2 vs 档 4），把含生僻字的多字词硬降到全部常用单字之后。
+///   依赖 `mark_common` 已在排序前跑过（`is_common` 是档 2 的准入条件）。
 ///
 /// 排序规则：Exact >> Sub-phrase >> Prefix >> Fuzzy。
 pub(crate) fn candidate_display_order(
@@ -74,18 +76,26 @@ pub(crate) fn candidate_display_order(
     b: &Candidate,
     ignore_weight: bool,
     mixed: bool,
-    input_len: usize,
+    input: &str,
 ) -> std::cmp::Ordering {
+    // `source_tier` 的档 0 判据是 `c.code == input`（完整串比较），故本函数收 `&str` 而非长度。
+    let input_len = input.len();
     let by_weight = if ignore_weight {
         std::cmp::Ordering::Equal
     } else {
         b.weight.cmp(&a.weight)
     };
-    // 混输专属层级：拼音精确档先于码表前缀补全（见 `cmp_pinyin_exact_first`）。
-    // 纯拼音/纯码表下必须为空操作——纯拼音时它会退化成「is_common 优先」，把含生僻字的
-    // 多字词硬降到全部常用单字之后。
-    let by_pinyin_exact = if mixed {
-        wind_candidate::cmp_pinyin_exact_first(a, b, input_len)
+    // 混输专属层级：**跨来源档位**（`source_tier`，跨来源先后的唯一真相源）。
+    //
+    // 此前这里只用 `cmp_pinyin_exact_first`，即整个档位体系里只承认「是不是拼音精确档」
+    // 一个二分。其余档次（码表精确 / 精确码短语 / 码表前缀 / 拼音其余）当时由混输引擎的
+    // 权重加成表达（`PHRASE_WEIGHT_BOOST` 等），于是同一语义分散在两处、且已经不一致
+    // （混输加成给短语一律 +1M 不分精确/前缀，`source_tier` 把前缀短语降到档 3）。
+    //
+    // 纯拼音/纯码表下必须为空操作——纯拼音时全体候选同源，档位会退化成「is_common 优先」
+    // （档 2 vs 档 4），把含生僻字的多字词硬降到全部常用单字之后。
+    let by_source_tier = if mixed {
+        wind_candidate::source_tier(a, input).cmp(&wind_candidate::source_tier(b, input))
     } else {
         std::cmp::Ordering::Equal
     };
@@ -122,7 +132,7 @@ pub(crate) fn candidate_display_order(
     by_consumed
         .then_with(|| wind_candidate::cmp_match_layers(a, b))
         .then_with(|| wind_candidate::cmp_exact_first(a, b))
-        .then(by_pinyin_exact)
+        .then(by_source_tier)
         .then(by_weight)
         .then(a.base_order.cmp(&b.base_order))
         .then(a.natural_order.cmp(&b.natural_order))
@@ -803,8 +813,8 @@ impl Coordinator {
         drop(phrases);
         let mixed =
             self.engine_mgr.current_engine_type() == Some(wind_engine::engine::EngineType::Mixed);
-        // 供拼音精确档判「消费整串」。字节长度，与 `consumed_length` 同域（缓冲恒 ASCII）。
-        let input_len = state.input_buffer.len();
+        // 供跨来源档位判「消费整串」与「码 == 输入」。缓冲恒 ASCII，字节长度与 `consumed_length` 同域。
+        let input_str = state.input_buffer.clone();
         // 空码补全的**择一推迟到全部过滤之后**（见下方「空码补全收口」）——判空必须落在
         // 真正的最终列表上，而 `apply_filter` / `apply_shadow` 都在下面、都可能把列表清空。
         // 候选层级排序：合并引擎候选 + 短语后按统一层级重排（见 `candidate_display_order`）。
@@ -813,7 +823,7 @@ impl Coordinator {
         // ⚠️ 常用字判定必须**先于排序**：混输的拼音精确档拿 `is_common` 作提档准入条件
         // （见 `mark_common` 与 `wind_candidate::is_pinyin_exact_tier`）。过滤仍在下面按模式进行。
         self.mark_common(&mut candidates);
-        candidates.sort_by(|a, b| candidate_display_order(a, b, ignore_weight, mixed, input_len));
+        candidates.sort_by(|a, b| candidate_display_order(a, b, ignore_weight, mixed, &input_str));
         // 按 text 去重。**不能用 `retain` + `HashSet`**：被丢弃那条所占的码位要并进幸存者，
         // 否则下一步的检索范围过滤按 (source, code) 分组时会丢掉「该码位下有常用字」这一事实
         // ——同一个字打前缀出、打全码反而不出（见 `Candidate::merged_codes`）。
@@ -872,7 +882,7 @@ impl Coordinator {
                 self.apply_filter(state, &mut completion_pool);
                 self.apply_shadow(&mut completion_pool, &state.input_buffer);
                 completion_pool.sort_by(|a, b| {
-                    candidate_display_order(a, b, ignore_weight, mixed, input_len)
+                    candidate_display_order(a, b, ignore_weight, mixed, &input_str)
                         .then_with(|| a.text.cmp(&b.text))
                 });
                 candidates.extend(completion_pool.into_iter().next());
@@ -3265,9 +3275,10 @@ mod finalize_candidates_tests {
         assert!(out[0].is_command);
     }
 
-    /// 本组用例的输入长度（`xu` 两字节）。传给 `candidate_display_order` 的拼音精确档，
-    /// 用来判「候选是否消费了整串」；`mixed=false` 的用例里该档不参与，取值无影响。
-    const XU_LEN: usize = 2;
+    /// 本组用例的输入串。传给 `candidate_display_order` 的跨来源档位：取长度判「候选是否
+    /// 消费了整串」、取全串判「码 == 输入」（档 0）；`mixed=false` 的用例里该档不参与，
+    /// 取值无影响。
+    const XU_LEN: &str = "xu";
 
     fn cand_ordered(text: &str, base_order: i32, natural_order: i32, weight: i32) -> Candidate {
         Candidate {
