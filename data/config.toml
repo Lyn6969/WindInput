@@ -463,6 +463,18 @@ schema_hotkeys = {}
 # 与 schema_hotkeys 的区别就是那个回程：那个切过去不再按一次不会回来，这个会。
 # 无法识别的动词只进 warn 日志并被忽略。
 key_actions = {}
+# 会话态按键功能表：key = 键名，value = 动词。管的是「**正在打字**（有编码或候选）时这个
+# 键干什么」，与上面 key_actions 的「空闲时这个键干什么」是两张表——同一个键在两种状态下
+# 可以是两个动作（如 Tab 打字时翻页、空闲时仍是宿主的制表符）。
+# 键名：tab / shift+tab / capslock / pageup / pagedown / up / down / left / right / home /
+#       end，以及符号键 minus equal lbracket rbracket comma period semicolon quote 等。
+#       只认 shift+ 一种前缀；带 ctrl/alt 的组合键请写在上面的 key_actions 里。
+# 动词：page_prev / page_next / highlight_up / highlight_down / none(在本态禁用该键)
+# 例（Tab 向下翻页、CapsLock 向上翻页）：
+#   session_actions = { tab = "page_next", "shift+tab" = "page_prev", capslock = "page_prev" }
+# 下面的 page_keys / highlight_keys 会**自动折算进本表**，本表里显式写的键优先。
+# 出厂默认留在那两项里，不写在这，这样把它们清成 [] 就真的能关掉翻页键。
+session_actions = {}
 # 二三候选键（第1键选第2候选、第2键选第3候选）。可选键组：
 #   semicolon_quote(;/') / comma_period(,/.) / lrshift(左右Shift) / lrctrl(左右Ctrl)
 # 修饰键组（lrshift/lrctrl）在**松开**时才选词，且只认「轻敲」——按住超过 500ms 或中途

@@ -133,6 +133,80 @@ const VK_OEM_MINUS: u32 = 0xBD; // -
 const VK_OEM_PLUS: u32 = 0xBB; // =
 const VK_OEM_4: u32 = 0xDB; // [
 const VK_OEM_6: u32 = 0xDD; // ]
+const VK_END: u32 = 0x23;
+const VK_HOME: u32 = 0x24;
+const VK_LEFT: u32 = 0x25;
+const VK_UP: u32 = 0x26;
+const VK_RIGHT: u32 = 0x27;
+const VK_DOWN: u32 = 0x28;
+const VK_OEM_2: u32 = 0xBF; // /
+const VK_OEM_3: u32 = 0xC0; // `
+const VK_OEM_5: u32 = 0xDC; // \
+
+/// `keys.session_actions` 里 keyup 类绑定的 action 名。
+///
+/// ★ **必须与 `toggle_mode` 区分开**。`is_toggle_mode_keycode` 按 action 过滤而非按键码
+/// ——若复用 `toggle_mode`，只把 CapsLock 配成翻页键的用户会在空闲敲 CapsLock 时莫名
+/// 切中英文。`select_key_groups` 进 keyup 表时已经踩过一次这个坑，`schema_bound` 是
+/// 第二次，本项是第三次；每次往 `key_up` 加东西都要重查这条。
+pub const SESSION_ACTION: &str = "session_action";
+
+/// 会话态键名 → (VK, 是否需 Shift)。支持单个 `shift+` 前缀。
+///
+/// ⚠️ **这是 `wind_keys::keymap::session_key_name_to_vk` 的第二份实现**，因为
+/// `wind-config` 不能依赖 `wind-keys`（后者经 `wind-cmdbar` 反向依赖本 crate，加进去成环）。
+/// 本文件早已因同样的理由自带一份 VK 常量与键组展开表，这里延续该结构。
+///
+/// 两份表的一致性**没有编译期约束**，靠 `wind-coordinator` 的
+/// `session_key_tables_agree_across_crates` 守门（那里同时依赖两个 crate）。跨仓/跨 crate
+/// 契约漂移是本仓反复栽过的一类，别指望「改的时候会记得」。
+pub fn session_key_to_vk(name: &str) -> Option<(u32, bool)> {
+    let raw = name.trim().to_lowercase();
+    let (shift, base) = match raw.strip_prefix("shift+") {
+        Some(rest) => (true, rest.trim()),
+        None => (false, raw.as_str()),
+    };
+    let vk = match base {
+        "tab" => VK_TAB,
+        "pageup" | "pgup" | "prior" => VK_PRIOR,
+        "pagedown" | "pgdn" | "next" => VK_NEXT,
+        "up" => VK_UP,
+        "down" => VK_DOWN,
+        "left" => VK_LEFT,
+        "right" => VK_RIGHT,
+        "home" => VK_HOME,
+        "end" => VK_END,
+        "capslock" | "caps" => VK_CAPITAL,
+        "lshift" => VK_LSHIFT,
+        "rshift" => VK_RSHIFT,
+        "lctrl" | "lcontrol" => VK_LCONTROL,
+        "rctrl" | "rcontrol" => VK_RCONTROL,
+        "semicolon" | ";" => VK_OEM_1,
+        "quote" | "'" => VK_OEM_7,
+        "comma" | "," => VK_OEM_COMMA,
+        "period" | "." => VK_OEM_PERIOD,
+        "minus" | "-" => VK_OEM_MINUS,
+        "equal" | "equals" | "=" => VK_OEM_PLUS,
+        "lbracket" | "[" => VK_OEM_4,
+        "rbracket" | "]" => VK_OEM_6,
+        "slash" | "/" => VK_OEM_2,
+        "backtick" | "grave" | "`" => VK_OEM_3,
+        "backslash" | "\\" => VK_OEM_5,
+        _ => return None,
+    };
+    Some((vk, shift))
+}
+
+/// keyup-only 键（CapsLock / 四个纯修饰键）的 keyup hash；其余键返回 `None`。
+///
+/// 这批键绑任何功能都只能走 keyup 轻敲（keydown 不能吃、`Ctrl+A` 会误触发、按住会连发），
+/// 判据同 `is_key_up_only_vk`。⚠️ CapsLock 与四个修饰键**不连号**，用区间判定会漏掉它。
+fn session_key_up_hash(vk: u32) -> Option<u32> {
+    if vk == VK_CAPITAL {
+        return Some(key_hash(MOD_CAPSLOCK, VK_CAPITAL));
+    }
+    compile_modifier_key_up_hash(vk)
+}
 
 /// 单个编译后的热键条目
 #[derive(Debug, Clone)]
@@ -345,9 +419,36 @@ impl Compiler {
             }
         }
 
-        // ── KeyDown：翻页键组（pageupdown / minus_equal / brackets / comma_period / shift_tab） ──
-        for group in &self.config.keys.page_keys {
-            for raw in compile_page_key_group(group) {
+        // ── 会话态按键功能表（keys.session_actions）──
+        //
+        // 数据源已由 `Config::normalize` 把 `page_keys` / `highlight_keys` 折算进来；本编译器
+        // 的唯一调用方 `ConfigBundle::build` 保证「先 normalize 后 compile」。⚠️ 顺序反了的
+        // 表现是翻页键全失效——`page_keys` 那一侧已经没有消费者了。
+        //
+        // ★ 按**键的形态**分两条路，与五c 给 `keys.key_actions` 做的分流同构：
+        //   - keyup-only 键（CapsLock / 纯修饰键）→ `key_up` 表，带 SESSION 位，让 C++ 区分
+        //     「toggle 语义」（恒吃 keydown）与「会话语义」（仅有会话时吃）；
+        //   - 其余（功能键 + 可打印符号键）→ `key_down` 表，带 FORWARD_ONLY 位。
+        //
+        // ⚠️ 功能键（Tab / PgUp / 方向键）本就在 C++ 的 `_IsSessionKey` 表里、有会话时免费
+        //    转发，登记与否都能工作。这里**仍照旧全部登记**：旧的 `compile_page_key_group`
+        //    就是这么做的，收编时顺手改可达性会把一次配置重构变成一次跨进程行为变更，
+        //    而后者只有真机才验得了。
+        for (name, verb) in &self.config.keys.session_actions {
+            if !crate::config::SessionAction::parse(verb).is_enabled() {
+                continue;
+            }
+            let Some((vk, shift)) = session_key_to_vk(name) else {
+                continue;
+            };
+            if let Some(hash) = session_key_up_hash(vk) {
+                result.key_up.push(HotkeyEntry {
+                    tsf_hash: hash | HOTKEY_POLICY_SESSION,
+                    match_hash: hash,
+                    action: SESSION_ACTION.to_string(),
+                });
+            } else {
+                let raw = key_hash(if shift { MOD_SHIFT } else { 0 }, vk);
                 result.key_down.push(HotkeyEntry {
                     tsf_hash: raw | HOTKEY_POLICY_FORWARD_ONLY,
                     match_hash: raw,
@@ -507,16 +608,6 @@ pub fn select_char_vks(group: &str) -> Vec<u32> {
 }
 
 /// 翻页键组 → raw hash 列表
-fn compile_page_key_group(group: &str) -> Vec<u32> {
-    match group.trim().to_lowercase().as_str() {
-        "pageupdown" => vec![key_hash(0, VK_PRIOR), key_hash(0, VK_NEXT)],
-        "minus_equal" => vec![key_hash(0, VK_OEM_MINUS), key_hash(0, VK_OEM_PLUS)],
-        "brackets" => vec![key_hash(0, VK_OEM_4), key_hash(0, VK_OEM_6)],
-        "comma_period" => vec![key_hash(0, VK_OEM_COMMA), key_hash(0, VK_OEM_PERIOD)],
-        "shift_tab" => vec![key_hash(MOD_SHIFT, VK_TAB), key_hash(0, VK_TAB)],
-        _ => Vec::new(),
-    }
-}
 
 /// 计算 key_hash（与 wind-ipc::protocol::calc_key_hash 对齐）
 fn calc_key_hash(modifiers: u32, key_code: u32) -> u32 {
@@ -776,21 +867,40 @@ mod tests {
         );
     }
 
+    /// 把 (键名, 动词) 对拼成 `keys.session_actions`。测试直接构造 `Compiler`、不经
+    /// `Config::normalize`，故须显式写出折算后的形态。
+    fn session_actions(pairs: &[(&str, &str)]) -> std::collections::BTreeMap<String, String> {
+        pairs
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect()
+    }
+
     #[test]
     fn forward_only_bit_marks_page_and_select_keys_only() {
         let mut cfg = Config::default();
         cfg.keys.toggle_full_width = "shift+space".to_string();
         cfg.keys.select_key_groups = vec!["semicolon_quote".into()];
-        cfg.keys.page_keys = vec!["minus_equal".into(), "shift_tab".into()];
+        // 等价于旧的 `page_keys = ["minus_equal", "shift_tab"]` 折算后的样子。
+        cfg.keys.session_actions = session_actions(&[
+            ("minus", "page_prev"),
+            ("equal", "page_next"),
+            ("shift+tab", "page_prev"),
+            ("tab", "page_next"),
+        ]);
         let compiled = Compiler::new(cfg).compile();
 
         // ⚠ 判据不能用「action 为空」：pin/delete 候选的数字热键 action 同样是空串
         //（动作由服务端按 hash 自认），它们是 session 热键、不该带 FORWARD_ONLY。
-        // 只有翻页键组 / 选词键组才是仅注册转发，故按 raw hash 精确点名。
+        // 只有会话态键 / 选词键组才是仅注册转发，故按 raw hash 精确点名。
         let forward_only_raw: Vec<u32> = [
             compile_select_key_group("semicolon_quote"),
-            compile_page_key_group("minus_equal"),
-            compile_page_key_group("shift_tab"),
+            vec![
+                key_hash(0, VK_OEM_MINUS),
+                key_hash(0, VK_OEM_PLUS),
+                key_hash(MOD_SHIFT, VK_TAB),
+                key_hash(0, VK_TAB),
+            ],
         ]
         .concat();
         assert_eq!(forward_only_raw.len(), 6, "样例键组应展开出 6 个键");
@@ -859,6 +969,90 @@ mod tests {
                 .count(),
             2,
             "切换键登记不应被选词登记挤掉"
+        );
+    }
+
+    /// 用户诉求二：`capslock = "page_prev"`。CapsLock 只有 keyup 到得了服务端，故必须进
+    /// `key_up` 表并带 SESSION 位——C++ 靠这个位区分「toggle 语义」（恒吃 keydown）与
+    /// 「会话语义」（仅有会话时吃）。
+    ///
+    /// ★★ 回归保护：action **不能**是 `toggle_mode`。`is_toggle_mode_keycode` 按 action
+    /// 过滤，混用会让「只把 CapsLock 配成翻页键」的用户在空闲敲 CapsLock 时莫名切中英文。
+    /// 这是第三次触碰该判据（前两次是 `select_key_groups` 与 `schema_bound`）。
+    #[test]
+    fn capslock_session_action_registers_on_key_up_with_session_policy() {
+        let mut cfg = Config::default();
+        cfg.keys.session_actions = session_actions(&[("capslock", "page_prev")]);
+        let compiled = Compiler::new(cfg).compile();
+
+        let e = compiled
+            .key_up
+            .iter()
+            .find(|e| e.action == SESSION_ACTION)
+            .expect("capslock 的会话态绑定应登记进 key_up");
+        assert_eq!(e.match_hash, key_hash(MOD_CAPSLOCK, VK_CAPITAL));
+        assert!(
+            e.tsf_hash & HOTKEY_POLICY_SESSION != 0,
+            "缺 SESSION 位，C++ 会把它当 toggle 键处理，keydown 恒被吃 ⇒ 大小写切换全局失效"
+        );
+        assert_eq!(
+            e.match_hash & HOTKEY_POLICY_SESSION,
+            0,
+            "match_hash 是服务端匹配用的裸 hash，policy 位不该混进去"
+        );
+        assert_ne!(
+            e.action, "toggle_mode",
+            "见本测试文档：会让空闲敲 CapsLock 切中英文"
+        );
+        assert!(
+            !compiled
+                .key_down
+                .iter()
+                .any(|e| e.match_hash & 0xFFFF == VK_CAPITAL),
+            "CapsLock 不得进 key_down —— C++ 侧根本不发它的 keydown"
+        );
+    }
+
+    /// 会话态的**功能键**走 key_down + FORWARD_ONLY（与旧 `page_keys` 的登记形态一致）。
+    /// 无会话时 C++ 靠 FORWARD_ONLY 闸门放行，键回落宿主的原语义（Tab 仍是制表符）。
+    #[test]
+    fn session_function_keys_register_on_key_down_forward_only() {
+        let mut cfg = Config::default();
+        cfg.keys.session_actions =
+            session_actions(&[("tab", "page_next"), ("shift+tab", "page_prev")]);
+        let compiled = Compiler::new(cfg).compile();
+
+        for (want_mods, label) in [(0, "tab"), (MOD_SHIFT, "shift+tab")] {
+            let raw = key_hash(want_mods, VK_TAB);
+            let e = compiled
+                .key_down
+                .iter()
+                .find(|e| e.match_hash == raw)
+                .unwrap_or_else(|| panic!("{label} 应登记进 key_down"));
+            assert!(
+                e.tsf_hash & HOTKEY_POLICY_FORWARD_ONLY != 0,
+                "{label} 缺 FORWARD_ONLY：无会话时 TSF 会把它当动作热键吞掉"
+            );
+            assert!(
+                e.action.is_empty(),
+                "会话态键是仅注册转发，动作由服务端自认"
+            );
+        }
+    }
+
+    /// 显式 `none` 与拼错的键名都不产出登记，且不 panic。
+    #[test]
+    fn session_actions_skip_disabled_and_unknown_keys() {
+        let mut cfg = Config::default();
+        cfg.keys.session_actions =
+            session_actions(&[("tab", "none"), ("pgeup", "page_prev"), ("up", "")]);
+        let compiled = Compiler::new(cfg).compile();
+        assert!(
+            !compiled
+                .key_down
+                .iter()
+                .any(|e| matches!(e.match_hash & 0xFFFF, VK_TAB | VK_UP)),
+            "none / 空值不应登记"
         );
     }
 
@@ -976,7 +1170,31 @@ mod tests {
     /// 这个 policy 位是本条测试的重点：带上它，切到英文方案后热键就不再响应，
     /// 用户切得过去、切不回来。特殊模式热键需要它（overlay 只在中文输入中途有意义），
     /// 方案切换恰恰相反——同一个位，两种机制下后果相反。
+    ///
+    /// ⚠️ 本测试的**函数体一度整个丢失**：注释与 `#[test]` 还在，函数被后加的
+    /// `key_actions_compile_toggle_schema_...` 顶替，两个 `#[test]` 落在同一个 fn 上。
+    /// 编译器只报一句 `duplicated attribute` 警告，而读代码的人看到注释会以为这条契约
+    /// 有守门——**「注释还在」是比「没有测试」更坏的状态**。2026-08-10 补回。
     #[test]
+    fn schema_hotkeys_compile_without_chinese_only_policy() {
+        let mut cfg = Config::default();
+        cfg.keys
+            .schema_hotkeys
+            .insert("english".to_string(), "ctrl+shift+n".to_string());
+        let compiled = Compiler::new(cfg).compile();
+        let e = compiled
+            .key_down
+            .iter()
+            .find(|e| e.action == "switch_schema:english")
+            .expect("schema_hotkeys 应编出 switch_schema:<id>");
+        assert_eq!(
+            e.tsf_hash & HOTKEY_POLICY_CHINESE_ONLY,
+            0,
+            "带上 CHINESE_ONLY 会让用户切到英文方案后回不来"
+        );
+        assert_eq!(e.tsf_hash, e.match_hash, "无 policy 位时两个 hash 应相等");
+    }
+
     /// `keys.key_actions` 编出对应动词，且与方案直达热键同策略（不带 CHINESE_ONLY）。
     ///
     /// policy 位对 `toggle_schema` 比对 `switch_schema` 更要命：带上它，切到英文方案后

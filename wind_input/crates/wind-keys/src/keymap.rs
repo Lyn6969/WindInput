@@ -49,6 +49,82 @@ pub const VK_LSHIFT: u32 = 0xA0;
 pub const VK_RSHIFT: u32 = 0xA1;
 pub const VK_LCONTROL: u32 = 0xA2;
 pub const VK_RCONTROL: u32 = 0xA3;
+/// CapsLock。与四个纯修饰键同属「只有 keyup 到得了服务端」的一类，但**不连号**，
+/// 故不在 `VK_LSHIFT..=VK_RCONTROL` 区间里——判「能否走 keydown」要用
+/// [`is_key_up_only_vk`]，不能只判那个区间。
+pub const VK_CAPITAL: u32 = 0x14;
+
+/// 会话态键名的解析结果（[`session_key_name_to_vk`]）。
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct SessionKey {
+    pub vk: u32,
+    /// 是否要求 Shift 同时按下（键名前缀 `shift+`）。
+    pub shift: bool,
+    /// 该键本身是否产出字符。`true` 的键在文本/表达式模式（临英 / 快捷输入）里必须
+    /// 回落成输入字符，不能被夺为导航——见 [`NavKeys::classify`] 的 `include_printable`。
+    pub printable: bool,
+}
+
+/// 会话态功能键名 → VK。**不含符号键**（那些走 [`KEY_TABLE`]，且 `printable = true`）。
+///
+/// 只收「有会话时确实需要重新绑定」的键。刻意**不收** `enter` / `space` / `backspace`：
+/// 它们各自已有专属的策略参数（`input.enter_behavior` / `input.space_on_empty_behavior` /
+/// 退格粒度），那是枚举形状而非绑定形状，混进本表会形成两个真相源。理由见
+/// docs/design/session-key-actions.md §6.1。
+const SESSION_FUNCTION_KEYS: &[(&str, u32)] = &[
+    ("tab", VK_TAB),
+    ("pageup", VK_PRIOR),
+    ("pgup", VK_PRIOR),
+    ("prior", VK_PRIOR),
+    ("pagedown", VK_NEXT),
+    ("pgdn", VK_NEXT),
+    ("next", VK_NEXT),
+    ("up", VK_UP),
+    ("down", VK_DOWN),
+    ("left", VK_LEFT),
+    ("right", VK_RIGHT),
+    ("home", VK_HOME),
+    ("end", VK_END),
+    ("capslock", VK_CAPITAL),
+    ("caps", VK_CAPITAL),
+];
+
+/// 会话态键名 → [`SessionKey`]。大小写与首尾空白不敏感；不认的名字返回 `None`。
+///
+/// 支持单个 `shift+` 前缀（`shift+tab`）。**刻意不认 `ctrl+` / `alt+`**：带这两个修饰的
+/// 组合键归 `keys.key_actions`（key_down 热键表）——它们无会话时同样要能触发，与本表
+/// 「只在组合输入期间改写键义」的语义不同，混收会让同一个组合键有两个注册入口。
+pub fn session_key_name_to_vk(name: &str) -> Option<SessionKey> {
+    let raw = name.trim().to_lowercase();
+    let (shift, base) = match raw.strip_prefix("shift+") {
+        Some(rest) => (true, rest.trim()),
+        None => (false, raw.as_str()),
+    };
+    if let Some((_, vk)) = SESSION_FUNCTION_KEYS.iter().find(|(n, _)| *n == base) {
+        return Some(SessionKey {
+            vk: *vk,
+            shift,
+            printable: false,
+        });
+    }
+    key_name_to_vk(base).map(|vk| SessionKey {
+        vk,
+        shift,
+        printable: true,
+    })
+}
+
+/// 该 VK 是否**只有 keyup 到得了服务端**（纯修饰键与 CapsLock）。
+///
+/// 这批键绑任何功能都只能走 keyup 轻敲：keydown 不能吃（吃掉会让 AutoCAD 看不到修饰键）、
+/// keydown 上判定会让 `Ctrl+A` 的第一下误触发、宿主对按住的键重复发 keydown 会连续触发。
+/// 详见 docs/design/schema-key-actions.md §4.4。
+///
+/// ⚠️ CapsLock 与那四个修饰键**不连号**，故不能用 `VK_LSHIFT..=VK_RCONTROL` 区间判定
+/// ——那样写会把 CapsLock 漏成「可走 keydown」，而 C++ 侧压根不发它的 keydown。
+pub fn is_key_up_only_vk(vk: u32) -> bool {
+    matches!(vk, VK_LSHIFT..=VK_RCONTROL | VK_CAPITAL)
+}
 
 /// 候选导航动作（翻页 / 高亮移动）。统一分类的结果，见 [`NavKeys`]。
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -78,57 +154,32 @@ pub struct NavKeys {
 }
 
 impl NavKeys {
-    /// 从配置组名编译。page 组：pageupdown / minus_equal / brackets / comma_period / shift_tab；
-    /// highlight 组：arrows / tab。未识别组名忽略。
-    pub fn from_config(page_groups: &[String], highlight_groups: &[String]) -> Self {
-        use NavAction::*;
-        let mut binds = Vec::new();
-        let mut push = |key, shift, action, printable| {
-            binds.push(NavBind {
-                key,
-                shift,
-                action,
-                printable,
+    /// 从 (键名, 动作) 对编译。键名解析走 [`session_key_name_to_vk`]。
+    ///
+    /// 数据源是 `keys.session_actions`（旧的 `page_keys` / `highlight_keys` 组名已在
+    /// `Config::normalize` 里折算进那张表）。本函数只认**已解析好的动作**，不解析动词
+    /// 字符串——动词值域住在 `wind-config` 的 `SessionAction`，而本 crate 是它的下游；
+    /// 在这里再写一份解析就是两处慢慢漂移。映射由协调器做，那里同时依赖两个 crate。
+    ///
+    /// ★ **顺序即优先级**：[`classify`](Self::classify) 用 `.find()` 取第一个匹配，同一个
+    /// (键, shift) 被声明两次时**先来的赢**。旧实现按「page 组全部 push 完再 push highlight
+    /// 组」建表，于是 `tab` 两组都配时 page 赢——调用方的折算必须复现这条，否则用户会
+    /// 遇到「一直用的 Tab 突然从翻页变成移高亮」。
+    ///
+    /// 不认的键名**静默跳过**：本函数无日志依赖，告警由调用方在加载期发（那里才分得清
+    /// 「拼错了」与「显式 none」）。
+    pub fn from_binds<'a>(binds: impl IntoIterator<Item = (&'a str, NavAction)>) -> Self {
+        let binds = binds
+            .into_iter()
+            .filter_map(|(name, action)| {
+                session_key_name_to_vk(name).map(|k| NavBind {
+                    key: k.vk,
+                    shift: k.shift,
+                    action,
+                    printable: k.printable,
+                })
             })
-        };
-        for g in page_groups {
-            match g.trim().to_lowercase().as_str() {
-                "pageupdown" => {
-                    push(VK_PRIOR, false, PagePrev, false);
-                    push(VK_NEXT, false, PageNext, false);
-                }
-                "minus_equal" => {
-                    push(VK_MINUS, false, PagePrev, true);
-                    push(VK_EQUAL, false, PageNext, true);
-                }
-                "brackets" => {
-                    push(VK_LBRACKET, false, PagePrev, true);
-                    push(VK_RBRACKET, false, PageNext, true);
-                }
-                "comma_period" => {
-                    push(VK_COMMA, false, PagePrev, true);
-                    push(VK_PERIOD, false, PageNext, true);
-                }
-                "shift_tab" => {
-                    push(VK_TAB, true, PagePrev, false);
-                    push(VK_TAB, false, PageNext, false);
-                }
-                _ => {}
-            }
-        }
-        for g in highlight_groups {
-            match g.trim().to_lowercase().as_str() {
-                "arrows" => {
-                    push(VK_UP, false, HighlightUp, false);
-                    push(VK_DOWN, false, HighlightDown, false);
-                }
-                "tab" => {
-                    push(VK_TAB, true, HighlightUp, false);
-                    push(VK_TAB, false, HighlightDown, false);
-                }
-                _ => {}
-            }
-        }
+            .collect();
         Self { binds }
     }
 
@@ -343,12 +394,25 @@ mod tests {
         assert_eq!(vk_to_prefix_char_with_letters(0x31), None);
     }
 
+    /// 出厂默认折算后的绑定集（`pageupdown` + `minus_equal` / `arrows` + `tab`）。
+    /// 顺序须与 `Config::migrate_nav_keys_into_session_actions` 的折算序一致：page 先、
+    /// highlight 后——`classify` 用 `.find()`，顺序即优先级。
+    fn default_nav_keys() -> NavKeys {
+        NavKeys::from_binds([
+            ("pageup", NavAction::PagePrev),
+            ("pagedown", NavAction::PageNext),
+            ("minus", NavAction::PagePrev),
+            ("equal", NavAction::PageNext),
+            ("up", NavAction::HighlightUp),
+            ("down", NavAction::HighlightDown),
+            ("shift+tab", NavAction::HighlightUp),
+            ("tab", NavAction::HighlightDown),
+        ])
+    }
+
     #[test]
     fn nav_classify_config_driven() {
-        let nk = NavKeys::from_config(
-            &["pageupdown".into(), "minus_equal".into()],
-            &["arrows".into(), "tab".into()],
-        );
+        let nk = default_nav_keys();
         // 专用导航键恒生效
         assert_eq!(
             nk.classify(VK_PRIOR, false, false),
@@ -392,7 +456,10 @@ mod tests {
     fn comma_period_pages() {
         // 设置页提供 comma_period 选项，但组名曾未被识别（走 `_ => {}` 静默忽略）→
         // 无翻页绑定，逗号/句号落到标点臂直接上屏。
-        let nk = NavKeys::from_config(&["comma_period".into()], &[]);
+        let nk = NavKeys::from_binds([
+            ("comma", NavAction::PagePrev),
+            ("period", NavAction::PageNext),
+        ]);
         assert_eq!(
             nk.classify(VK_COMMA, false, true),
             Some(NavAction::PagePrev)
@@ -404,6 +471,74 @@ mod tests {
         // 可打印键：文本/表达式模式（临英/快捷输入）里仍作输入字符，不夺为翻页。
         assert_eq!(nk.classify(VK_COMMA, false, false), None);
         assert_eq!(nk.classify(VK_PERIOD, false, false), None);
+    }
+
+    /// 用户诉求一：Tab 向下翻页、Shift+Tab 向上翻页（把 Tab 从高亮组改到翻页组）。
+    /// Tab 是功能键（`printable = false`），故在临英 / 快捷输入里同样生效——这与
+    /// `-`/`=` 那类可打印键刻意不同。
+    #[test]
+    fn tab_can_be_rebound_to_paging() {
+        let nk = NavKeys::from_binds([
+            ("shift+tab", NavAction::PagePrev),
+            ("tab", NavAction::PageNext),
+        ]);
+        assert_eq!(nk.classify(VK_TAB, false, false), Some(NavAction::PageNext));
+        assert_eq!(nk.classify(VK_TAB, true, false), Some(NavAction::PagePrev));
+    }
+
+    /// 用户诉求二：CapsLock 向上翻页。解析层必须认得它，且必须被标成「只有 keyup
+    /// 到得了服务端」——协调器据此把它送进 keyup 分支而非 keydown 链。
+    #[test]
+    fn capslock_resolves_as_key_up_only() {
+        let k = session_key_name_to_vk("capslock").expect("capslock 应可解析");
+        assert_eq!(k.vk, VK_CAPITAL);
+        assert!(!k.printable, "CapsLock 不产出字符");
+        assert!(
+            is_key_up_only_vk(k.vk),
+            "CapsLock 只有 keyup 到得了服务端；漏判会让绑定挂在永不触发的 keydown 上"
+        );
+        // ⚠️ 回归保护：CapsLock 与四个纯修饰键**不连号**，用区间判定会把它漏掉。
+        assert!(!(VK_LSHIFT..=VK_RCONTROL).contains(&VK_CAPITAL));
+    }
+
+    /// `shift+` 前缀只认这一个修饰。带 ctrl/alt 的组合键归 `keys.key_actions`
+    /// （key_down 热键表）——它们无会话时也要能触发，两张表的语义不同。
+    #[test]
+    fn session_key_names_reject_ctrl_alt_combos() {
+        assert!(session_key_name_to_vk("ctrl+tab").is_none());
+        assert!(session_key_name_to_vk("alt+tab").is_none());
+        assert!(session_key_name_to_vk("ctrl+shift+tab").is_none());
+        // 拼错的名字返回 None（由调用方在加载期告警），不静默变成别的键。
+        assert!(session_key_name_to_vk("pgeup").is_none());
+    }
+
+    /// 符号键复用 `KEY_TABLE`，且必须带 `printable`——丢了这个标志，临英里就打不出减号。
+    #[test]
+    fn symbol_session_keys_are_printable() {
+        for (name, vk) in [
+            ("minus", VK_MINUS),
+            ("equal", VK_EQUAL),
+            ("lbracket", VK_LBRACKET),
+            ("comma", VK_COMMA),
+        ] {
+            let k = session_key_name_to_vk(name).expect("符号键应可解析");
+            assert_eq!(k.vk, vk);
+            assert!(
+                k.printable,
+                "{name} 是可打印键，须在文本模式里回落为输入字符"
+            );
+        }
+    }
+
+    /// 同一个 (键, shift) 被声明两次时**先来的赢**——`classify` 用 `.find()`。
+    /// 配置折算依赖这条来复现「page 组优先于 highlight 组」的历史行为。
+    #[test]
+    fn first_bind_wins_for_duplicate_key() {
+        let nk = NavKeys::from_binds([
+            ("tab", NavAction::PageNext),
+            ("tab", NavAction::HighlightDown),
+        ]);
+        assert_eq!(nk.classify(VK_TAB, false, false), Some(NavAction::PageNext));
     }
 
     #[test]

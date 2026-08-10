@@ -597,6 +597,98 @@ impl BoundAction {
     }
 }
 
+/// **会话态**按键动词（`keys.session_actions` 的值域）。
+///
+/// 与 [`BoundAction`] 是同构的姊妹表，分野是**触发态**：那张表管「无输入会话时这个键干
+/// 什么」（进模式 / 切方案 / 状态切换），本表管「**正在组合一段输入**时这个键干什么」。
+///
+/// # 为什么必须是两张表，而不是一张带条件的表
+///
+/// 因为诉求本身就是「同一个键在两种态下是两个动作」：Tab 有会话时翻页、无会话时该是
+/// 宿主的制表符。合表就只能往动词里长出条件维度，分发端迟早要拆回来。
+///
+/// 更硬的一条是**可达性是物理约束**：C++ 侧把键分成三个区间——`_IsSessionKey` 里的功能键
+/// （Tab / Esc / 方向 / PgUp…）有会话时**免费转发**、可打印符号键须带
+/// `HOTKEY_POLICY_FORWARD_ONLY` 显式登记、修饰键与 CapsLock 只有 keyup。两张表的边界与
+/// 这个区间划分重合，不是巧合。详见 docs/design/session-key-actions.md §3。
+///
+/// # 判据是「有会话」，不是「有候选」
+///
+/// 初版拟名 `candidate_actions`、判据取 `!candidates.is_empty()`，**已否决**：`clear` 这类
+/// 动词在「打了码还没出候选」时同样要能用，而 C++ 的 `FORWARD_ONLY` 闸门判据本来就是
+/// `hasComp || _hasCandidates`。两侧判据必须同构，否则「C++ 吃键集 ⊆ Rust 出字集」这条
+/// 不变量守不住。
+///
+/// 「有候选才有意义」的动词（导航类）由**消费点**自己守一行空候选判据，不靠表结构表达
+/// ——状态维度进分发端是加法，进表结构是乘法。
+///
+/// # 值域（一期只有导航类）
+///
+/// - `"none"`：在本态禁用该键（第三态，非「未声明」）
+/// - `"page_prev"` / `"page_next"`：上一页 / 下一页
+/// - `"highlight_up"` / `"highlight_down"`：高亮上移 / 下移
+///
+/// 处置类（`clear` / `cancel`）与选择类（`select_candidate:N`）留到二、三期，届时扩充本
+/// 枚举即可，不必先拆掉任何机制。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SessionAction {
+    /// 未启用 / 显式禁用。
+    None,
+    PagePrev,
+    PageNext,
+    HighlightUp,
+    HighlightDown,
+}
+
+impl SessionAction {
+    /// 解析配置字符串。大小写与首尾空白不敏感；未知值 → [`Self::None`]。
+    ///
+    /// 未知值不静默变成别的动作，与 `BoundAction::parse` 同策略。写错的动词落 `None`
+    /// 后表现为「这个键在会话态没绑定」，与「没配」同形——所以调用方在加载期要 `warn`
+    /// （见 [`Self::parse_checked`]）。
+    pub fn parse(s: &str) -> Self {
+        match s.trim().to_lowercase().as_str() {
+            "page_prev" => Self::PagePrev,
+            "page_next" => Self::PageNext,
+            "highlight_up" => Self::HighlightUp,
+            "highlight_down" => Self::HighlightDown,
+            _ => Self::None,
+        }
+    }
+
+    /// 同 [`Self::parse`]，但把「写错的动词」与「显式 none」区分开，供加载期告警。
+    ///
+    /// 返回 `None` 表示**值不认识**；`Some(Self::None)` 表示用户明确写了 `none`。
+    /// 静默忽略拼写错误与「功能坏了」完全同形，用户无从分辨——同
+    /// `is_supported_key_action` 立的口径。
+    pub fn parse_checked(s: &str) -> Option<Self> {
+        let t = s.trim().to_lowercase();
+        if t.is_empty() || t == "none" {
+            return Some(Self::None);
+        }
+        match Self::parse(&t) {
+            Self::None => None,
+            a => Some(a),
+        }
+    }
+
+    /// 配置字符串形式（折算与写回用）。
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::PagePrev => "page_prev",
+            Self::PageNext => "page_next",
+            Self::HighlightUp => "highlight_up",
+            Self::HighlightDown => "highlight_down",
+        }
+    }
+
+    /// 是否启用（非 [`Self::None`]）。
+    pub fn is_enabled(&self) -> bool {
+        !matches!(self, Self::None)
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct CodetableGlobal {
     /// 顶码上屏（超满码长取前 N 码首选上屏）。
@@ -1911,11 +2003,31 @@ pub struct KeysConfig {
     /// `HashMap` 会让同一份配置在不同进程里表现不同（`schema_hotkeys` 为此要显式排序）。
     #[serde(default)]
     pub key_actions: BTreeMap<String, String>,
+    /// **会话态按键功能表**：键名 → 动词（如 `{ tab = "page_next", capslock = "page_prev" }`）。
+    ///
+    /// 与 [`Self::key_actions`] 同构的姊妹表，分野是触发态：那张管无会话态，本表管
+    /// 「正在组合一段输入」时。值域见 [`SessionAction`]，键名解析见
+    /// `wind_keys::keymap::session_key_name_to_vk`（认功能键、修饰键与符号键，支持
+    /// `shift+tab` 这样的单修饰前缀）。
+    ///
+    /// **`page_keys` / `highlight_keys` 在 `normalize()` 里折算进本表**（组名 → 具体键），
+    /// 用户显式写在这里的键优先、不被折算覆盖。⚠️ 默认值刻意**留在那两个字段**一侧：
+    /// 若把出厂绑定直接写进本表，`page_keys = []`（用户清空）就与「从没配过」同形，
+    /// 折算跳过而默认绑定仍在 —— 用户清空的意图会静默丢失。这是五c 折算 `trigger_keys`
+    /// 时用血换来的教训，见 docs/design/session-key-actions.md §6。
+    ///
+    /// 用 `BTreeMap` 而非 `HashMap`：理由同 `key_actions`——遍历顺序即冲突时的胜者顺序，
+    /// `HashMap` 会让同一份配置在不同进程里表现不同。
+    #[serde(default)]
+    pub session_actions: BTreeMap<String, String>,
     // ── 选择/导航键（原 input.*）──
     #[serde(default = "default_select_key_groups")]
     pub select_key_groups: Vec<String>,
+    /// 翻页键组。**消费点已改为 [`Self::session_actions`]**，本字段是折算来源与
+    /// 默认值的家（见那边的注释）。
     #[serde(default = "default_page_keys")]
     pub page_keys: Vec<String>,
+    /// 高亮移动键组。同 [`Self::page_keys`]，折算进 `session_actions` 后消费。
     #[serde(default = "default_highlight_keys")]
     pub highlight_keys: Vec<String>,
     #[serde(default)]
@@ -1972,6 +2084,52 @@ fn default_highlight_keys() -> Vec<String> {
     vec!["arrows".to_string(), "tab".to_string()]
 }
 
+/// 翻页键**组名** → 折算出的 (键名, 动词) 对。组名值域与旧 `NavKeys::from_config` 一一对应。
+///
+/// ⚠️ 键名必须与 `wind_keys::keymap::session_key_name_to_vk` 认的规范名逐字一致。这是一条
+/// **无编译期约束**的跨 crate 拼写契约：写错了这里的键会解析不出 VK，表现为「升级后翻页键
+/// 全没了」而无任何报错。`config.rs` 的单测 `nav_group_names_resolve` 守这条。
+fn page_key_group_binds(group: &str) -> &'static [(&'static str, SessionAction)] {
+    match group.trim().to_lowercase().as_str() {
+        "pageupdown" => &[
+            ("pageup", SessionAction::PagePrev),
+            ("pagedown", SessionAction::PageNext),
+        ],
+        "minus_equal" => &[
+            ("minus", SessionAction::PagePrev),
+            ("equal", SessionAction::PageNext),
+        ],
+        "brackets" => &[
+            ("lbracket", SessionAction::PagePrev),
+            ("rbracket", SessionAction::PageNext),
+        ],
+        "comma_period" => &[
+            ("comma", SessionAction::PagePrev),
+            ("period", SessionAction::PageNext),
+        ],
+        "shift_tab" => &[
+            ("shift+tab", SessionAction::PagePrev),
+            ("tab", SessionAction::PageNext),
+        ],
+        _ => &[],
+    }
+}
+
+/// 高亮移动键**组名** → 折算出的 (键名, 动词) 对。约束同 [`page_key_group_binds`]。
+fn highlight_key_group_binds(group: &str) -> &'static [(&'static str, SessionAction)] {
+    match group.trim().to_lowercase().as_str() {
+        "arrows" => &[
+            ("up", SessionAction::HighlightUp),
+            ("down", SessionAction::HighlightDown),
+        ],
+        "tab" => &[
+            ("shift+tab", SessionAction::HighlightUp),
+            ("tab", SessionAction::HighlightDown),
+        ],
+        _ => &[],
+    }
+}
+
 impl Default for KeysConfig {
     fn default() -> Self {
         Self {
@@ -1992,6 +2150,7 @@ impl Default for KeysConfig {
             global_hotkeys: Vec::new(),
             schema_hotkeys: HashMap::new(),
             key_actions: BTreeMap::new(),
+            session_actions: BTreeMap::new(),
             select_key_groups: default_select_key_groups(),
             page_keys: default_page_keys(),
             highlight_keys: default_highlight_keys(),
@@ -3047,7 +3206,51 @@ impl Config {
         // 须在 migrate_letter_trigger_keys **之后**：那一步先把字母项摘干净，
         // 这里看到的 trigger_keys 已只剩符号键。
         self.migrate_trigger_keys_into_key_actions();
+        self.migrate_nav_keys_into_session_actions();
         self.warn_legacy_special_modes();
+    }
+
+    /// 存量折算：`keys.page_keys` / `keys.highlight_keys` → `keys.session_actions`
+    /// （见 docs/design/session-key-actions.md §6）。
+    ///
+    /// 与 `migrate_trigger_keys_into_key_actions` 同策略：**在内存里做，不写回配置文件**。
+    /// 用户的 config.toml 保持原样，回退一个版本就能照常工作。
+    ///
+    /// # ★ 优先级必须复现 `NavKeys::classify` 的 `.find()` 语义
+    ///
+    /// 旧实现把 page 组与 highlight 组**依次**推进同一个 `binds`，再用 `.find()` 取第一个
+    /// 匹配——于是同一个键（`tab` / `shift+tab`）被两组同时声明时 **page 组赢**。折算必须
+    /// 复现这条：先折 page、后折 highlight，**已占的键不覆盖**。搞反了的表现是「一直用的
+    /// Tab 突然从翻页变成移高亮」，而用户什么都没改，极难联想到是折算干的。
+    ///
+    /// 用户**显式**写在 `session_actions` 里的键最优先，折算一律不覆盖它——新配置优先于
+    /// 存量迁移，同五c 收编 `trigger_keys` 时立的口径。
+    ///
+    /// # 为什么折算完要清空原字段
+    ///
+    /// 消费点已改读 `session_actions`；留着原字段就是僵尸配置——用户改了没反应，而那正是
+    /// 本次收编要消除的问题。默认值仍然留在原字段的 `default_*` 函数里（**不能**搬进
+    /// `session_actions`），三种情况才都对：没配过→折算出默认、改成别的→折算出新值、
+    /// 清空成 `[]`→折算出空。
+    fn migrate_nav_keys_into_session_actions(&mut self) {
+        if self.keys.page_keys.is_empty() && self.keys.highlight_keys.is_empty() {
+            return;
+        }
+        let mut folded: Vec<(&'static str, SessionAction)> = Vec::new();
+        for g in &self.keys.page_keys {
+            folded.extend_from_slice(page_key_group_binds(g));
+        }
+        for g in &self.keys.highlight_keys {
+            folded.extend_from_slice(highlight_key_group_binds(g));
+        }
+        for (key, action) in folded {
+            self.keys
+                .session_actions
+                .entry(key.to_string())
+                .or_insert_with(|| action.as_str().to_string());
+        }
+        self.keys.page_keys.clear();
+        self.keys.highlight_keys.clear();
     }
 
     /// 残留的 `schema.special_modes` 告警（**不迁移**，见 `docs/redesign/overlay-mode-config.md` §5）。
@@ -3704,6 +3907,136 @@ mod tests {
             BoundAction::parse("mix:Quick_Mix"),
             BoundAction::Mix("Quick_Mix".into())
         );
+    }
+
+    /// 出厂默认（`page_keys = [pageupdown, minus_equal]` / `highlight_keys = [arrows, tab]`）
+    /// 折算后必须逐键等价于旧 `NavKeys::from_config` 的产物——否则升级即回归。
+    #[test]
+    fn nav_keys_fold_into_session_actions_preserving_defaults() {
+        let mut c = Config::default();
+        c.normalize();
+        let sa = &c.keys.session_actions;
+        for (key, want) in [
+            ("pageup", "page_prev"),
+            ("pagedown", "page_next"),
+            ("minus", "page_prev"),
+            ("equal", "page_next"),
+            ("up", "highlight_up"),
+            ("down", "highlight_down"),
+            ("tab", "highlight_down"),
+            ("shift+tab", "highlight_up"),
+        ] {
+            assert_eq!(
+                sa.get(key).map(String::as_str),
+                Some(want),
+                "默认绑定 {key} 折算后应为 {want}，实际 {:?}",
+                sa.get(key)
+            );
+        }
+        assert!(
+            c.keys.page_keys.is_empty(),
+            "折算后原字段须清空，否则是僵尸配置"
+        );
+        assert!(c.keys.highlight_keys.is_empty());
+    }
+
+    /// ★ page 组优先于 highlight 组——复现 `NavKeys::classify` 的 `.find()` 语义。
+    ///
+    /// 两组都声明 `tab` 时（`page_keys=[shift_tab]` + 默认 `highlight_keys=[…, tab]`），
+    /// 旧实现按「page 全部 push 完再 push highlight」建表，`.find()` 取到 page 那条。
+    /// 搞反了的表现是「一直用的 Tab 突然从翻页变成移高亮」，用户什么都没改。
+    #[test]
+    fn nav_fold_gives_page_group_priority_over_highlight() {
+        let mut c = Config::default();
+        c.keys.page_keys = vec!["shift_tab".into()];
+        c.keys.highlight_keys = vec!["tab".into()];
+        c.normalize();
+        assert_eq!(
+            c.keys.session_actions.get("tab").map(String::as_str),
+            Some("page_next"),
+            "tab 两组都配时 page 组应赢"
+        );
+        assert_eq!(
+            c.keys.session_actions.get("shift+tab").map(String::as_str),
+            Some("page_prev")
+        );
+    }
+
+    /// 用户**显式**写在 `session_actions` 里的键不被折算覆盖：新配置优先于存量迁移。
+    /// 这是「用户要 Tab 清空、但 highlight_keys 默认还带着 tab」时唯一正确的裁决。
+    #[test]
+    fn explicit_session_action_survives_nav_fold() {
+        let mut c = Config::default();
+        c.keys
+            .session_actions
+            .insert("tab".into(), "page_next".into());
+        c.normalize();
+        assert_eq!(
+            c.keys.session_actions.get("tab").map(String::as_str),
+            Some("page_next"),
+            "显式配置应压过默认 highlight_keys 折算出的 highlight_down"
+        );
+    }
+
+    /// ★★ 用户把 `page_keys` 清成 `[]` 的**意图不能丢**。
+    ///
+    /// 这正是「默认值必须留在被折算的那一侧」的理由：若把出厂绑定直接写进
+    /// `session_actions`，空数组就与「从没配过」同形，折算跳过而默认绑定仍在——
+    /// 用户明明关掉了翻页键，重启后又回来了。五c 折算 `trigger_keys` 时踩过。
+    #[test]
+    fn cleared_page_keys_yield_no_paging_binds() {
+        let mut c = Config::default();
+        c.keys.page_keys = vec![];
+        c.keys.highlight_keys = vec![];
+        c.normalize();
+        assert!(
+            c.keys.session_actions.is_empty(),
+            "两组都清空时不应折算出任何绑定，实际 {:?}",
+            c.keys.session_actions
+        );
+    }
+
+    /// `normalize` 幂等：跑两次结果一致（热重载 / 设置页保存都会重跑）。
+    #[test]
+    fn nav_fold_is_idempotent() {
+        let mut c = Config::default();
+        c.normalize();
+        let once = c.keys.session_actions.clone();
+        c.normalize();
+        assert_eq!(c.keys.session_actions, once, "折算须幂等");
+    }
+
+    /// ⚠️ 组名展开表里的键名是**跨 crate 拼写契约**（消费端在 `wind-keys` 与
+    /// `hotkey.rs` 各有一份解析）。这里只能守住「本 crate 自己认得」这一半：
+    /// 写错的键名会让绑定解析不出 VK，表现为「升级后翻页键全没了」且无任何报错。
+    /// 另一半（两份解析表一致）由 `wind-coordinator` 的跨 crate 测试守。
+    #[test]
+    fn nav_group_names_resolve() {
+        for g in [
+            "pageupdown",
+            "minus_equal",
+            "brackets",
+            "comma_period",
+            "shift_tab",
+        ] {
+            assert_eq!(
+                page_key_group_binds(g).len(),
+                2,
+                "page 组 {g} 应展开出两个键"
+            );
+        }
+        for g in ["arrows", "tab"] {
+            assert_eq!(
+                highlight_key_group_binds(g).len(),
+                2,
+                "highlight 组 {g} 应展开出两个键"
+            );
+        }
+        assert!(page_key_group_binds("nonexistent").is_empty());
+        // 每个折算出的动词都必须解析得回来——写错动词字面量会静默落 None。
+        for (_, a) in page_key_group_binds("shift_tab") {
+            assert!(SessionAction::parse(a.as_str()).is_enabled());
+        }
     }
 
     /// 存量迁移：`trigger_keys` 里的 z → `z_key_action`，其余字母丢弃。

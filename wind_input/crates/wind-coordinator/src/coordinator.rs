@@ -652,6 +652,32 @@ fn schema_bound_modifier_vks(mgr: &EngineManager) -> std::collections::BTreeSet<
         .collect()
 }
 
+/// 加载期告警：`keys.session_actions` 里认不出的键名 / 动词。
+///
+/// ★ 静默忽略与「这个功能坏了」完全同形——用户无从分辨自己拼错了、还是该功能压根没实现。
+/// 这是 `is_supported_key_action` 当初立的口径，本表沿用。
+///
+/// 分两条报而不是合并成一条：键名错与动词错的修法不同，合并后用户还要自己二选一去试。
+fn warn_unknown_session_actions(config: &Config) {
+    for (name, verb) in &config.keys.session_actions {
+        if wind_config::SessionAction::parse_checked(verb).is_none() {
+            warn!(
+                "keys.session_actions[\"{name}\"] = \"{verb}\"：动词无法识别，该绑定被忽略。\
+                 可选 page_prev / page_next / highlight_up / highlight_down / none",
+            );
+            continue;
+        }
+        if keymap::session_key_name_to_vk(name).is_none() {
+            warn!(
+                "keys.session_actions[\"{name}\"]：键名无法识别，该绑定被忽略。\
+                 可选 tab / shift+tab / capslock / pageup / pagedown / up / down / left / \
+                 right / home / end，以及符号键 minus / equal / lbracket / rbracket / \
+                 comma / period / semicolon / quote / slash / backtick / backslash",
+            );
+        }
+    }
+}
+
 impl ConfigBundle {
     /// `schema_bound_modifiers` = 所有方案 `[key_actions]` 里出现过的**纯修饰键** VK
     /// （见 [`Coordinator::schema_bound_modifier_vks`]）。它们要追加进 `key_up` 转发集，
@@ -678,8 +704,29 @@ impl ConfigBundle {
                 });
             }
         }
-        let nav_keys =
-            keymap::NavKeys::from_config(&config.keys.page_keys, &config.keys.highlight_keys);
+        warn_unknown_session_actions(&config);
+        // 会话态导航键。数据源是折算后的 `keys.session_actions`——上一行的 `normalize()`
+        // 已把 `page_keys` / `highlight_keys` 的组名展开进去（见
+        // `Config::migrate_nav_keys_into_session_actions`）。
+        //
+        // ★ `SessionAction` → `NavAction` 的映射放在**这里**，不放任一侧的 crate：
+        // `wind-keys` 不认识动词值域（那住在 `wind-config`），而 `wind-config` 不能反向
+        // 依赖 `wind-keys`（后者经 `wind-cmdbar` 依赖本 crate，加进去成环）。本函数是唯一
+        // 同时看得见两者的地方，也正是接缝该在的位置。
+        let nav_keys = keymap::NavKeys::from_binds(config.keys.session_actions.iter().filter_map(
+            |(name, verb)| {
+                let action = match wind_config::SessionAction::parse(verb) {
+                    wind_config::SessionAction::PagePrev => keymap::NavAction::PagePrev,
+                    wind_config::SessionAction::PageNext => keymap::NavAction::PageNext,
+                    wind_config::SessionAction::HighlightUp => keymap::NavAction::HighlightUp,
+                    wind_config::SessionAction::HighlightDown => keymap::NavAction::HighlightDown,
+                    // 显式 none / 写错的动词都落这里。写错的那种在加载期由
+                    // `warn_unknown_session_actions` 报出来——静默忽略与「功能坏了」同形。
+                    wind_config::SessionAction::None => return None,
+                };
+                Some((name.as_str(), action))
+            },
+        ));
         let cn_pairs = parse_pairs(&config.input.auto_pair.chinese_pairs);
         let en_pairs = parse_pairs(&config.input.auto_pair.english_pairs);
         let jump_out_keys = parse_jump_out_keys(&config.input.auto_pair.jump_out_keys);
@@ -2918,6 +2965,27 @@ impl Coordinator {
             }
         }
         Some(KeyAction::Consumed)
+    }
+
+    /// keyup-only 键（CapsLock / 纯修饰键）上的会话态绑定（`keys.session_actions`）。
+    ///
+    /// 这批键**只有 keyup 到得了服务端**：C++ 对纯修饰键的 keydown 一律放行不吃（吃掉会让
+    /// AutoCAD 看不到修饰键、正交模式覆盖失效），CapsLock 的 keydown 则压根不转发给服务端。
+    /// 所以它们的绑定只能在这里消费——挂到 keydown 链上是配得上、永不触发。
+    ///
+    /// 一期只有导航类动词，[`Self::apply_nav_key`] 自带「无候选返回 `None`」的守卫，正好
+    /// 实现「有会话归绑定、无会话归原语义」：空闲时按 CapsLock 仍然切大小写。
+    ///
+    /// ⚠️ 二期加 `clear` / `cancel` 时，判据要放宽到「有编码**或**有候选」——那时改**这一处**
+    /// 的守卫，别在各调用点各判一次（Esc 散成七处就是那么来的）。
+    fn handle_session_action_key_up(&self, data: &KeyEventData) -> Option<KeyAction> {
+        if !keymap::is_key_up_only_vk(data.key_code) {
+            return None;
+        }
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        // include_printable 取值在这里无关紧要——keyup-only 键没有一个是可打印的。
+        // 传 true 与主输入路径保持一致，免得日后有人照抄这行时带走一个错误的先例。
+        self.apply_nav_key(&mut state, data, true)
     }
 
     /// 该字符此刻能否进输入缓冲：缓冲为空时查**首码集**，否则查码元**全集**。
@@ -5569,6 +5637,29 @@ impl MessageHandler for Coordinator {
         // 于 keyUp 转发该键事件（_SendKeyToService(..., KEY_EVENT_UP)）。因此服务端
         // 收到 toggle 键的 keyUp 即应直接切换，无需 keydown/pending（对齐 Go HandleKeyEvent）。
         if data.event_type == EVENT_KEY_UP {
+            // 修饰键作二三候选键（select_key_groups 含 lrshift / lrctrl）：**先于**下面一切。
+            // 同一个键可能多个身份都配了（设置页会提示冲突，但配置文件里拦不住），既有裁决是
+            // 「有候选选词、无候选切换」——输入到一半按 Ctrl 想选词的意图远比切中英文常见，而
+            // 空闲时按 Ctrl 除了切换也没别的可做。无候选/越界时返回 None 落到下面各分支。
+            //
+            // ⚠ 2026-08-10 从 CapsLock 分支**之后**上移到这里。CapsLock 永远不在
+            // `select_key_vks` 的值域里（那边只有 semicolon/quote/comma/period/lrshift/lrctrl），
+            // 故这次上移对 CapsLock 是无副作用的空转；上移的目的是让下面新增的会话态绑定
+            // 也排在选词之后，保住「选词优先」这条既有裁决。
+            if let Some(act) = self.handle_select_key_up(data) {
+                return act;
+            }
+            // 会话态绑定里的 keyup-only 键（`capslock = "page_prev"` 那类）。
+            //
+            // ★ **必须先于**下面 CapsLock 的状态同步分支：那条会调 `take_input_on_mode_switch`
+            // 把正在打的编码上屏或丢弃。配了 CapsLock 翻页的用户每翻一页就毁一次输入，
+            // 现象是「翻页时编码莫名没了」——极难联想到是大小写同步干的。
+            //
+            // 无候选时本函数返回 None，键照常落到下面的原有处理（CapsLock 仍切大小写、
+            // 修饰键仍切中英文）。「有会话归绑定、无会话归原语义」正是两张表的分野。
+            if let Some(act) = self.handle_session_action_key_up(data) {
+                return act;
+            }
             // CapsLock 单独处理：C++ 侧总是发送此 key_up（不经 key_up_tsf_hashes 过滤），
             // 故须先于 is_toggle_mode_keycode 检查。同步真实大写锁定状态，不翻转 chinese_mode
             // （对齐 Go handleCapsLockStateNoLock：capsLockOn 跟随 data.toggles & 0x01）。
@@ -5610,13 +5701,6 @@ impl MessageHandler for Coordinator {
                     };
                 }
                 return KeyAction::StatusUpdate(self.build_status());
-            }
-            // 修饰键作二三候选键（select_key_groups 含 lrshift / lrctrl）：**先于**切换判定。
-            // 同一个键可能两个身份都配了（设置页会提示冲突，但配置文件里拦不住），此时的裁决是
-            // 「有候选选词、无候选切换」——输入到一半按 Ctrl 想选词的意图远比切中英文常见，而
-            // 空闲时按 Ctrl 除了切换也没别的可做。无候选/越界时返回 None 落到下面的 toggle。
-            if let Some(act) = self.handle_select_key_up(data) {
-                return act;
             }
             // 方案级 `[key_actions]` 绑在修饰键上的功能（`rshift = "toggle_schema:english"`）。
             // **先于** is_toggle_mode_keycode：同一个键两处都配时，方案级是更具体的声明，
