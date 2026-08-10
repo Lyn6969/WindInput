@@ -430,6 +430,57 @@ pub fn is_pinyin_exact_tier(c: &Candidate, input_len: usize) -> bool {
         && (c.consumed_length == 0 || c.consumed_length >= input_len)
 }
 
+/// 候选**来源档位**（数字越小越靠前）——跨来源先后的**唯一真相源**。
+///
+/// ```text
+/// 0  码表精确全码（code == input）
+/// 1  精确码短语（is_phrase && is_exact_code）
+/// 2  拼音精确档（is_pinyin_exact_tier：精确音节 + 常用字）  ← 先于码表前缀补全
+/// 3  码表前缀补全 + 前缀短语 + 其余来源
+/// 4  拼音其余（前缀补全/子短语/简拼/模糊/生僻） + 英文
+/// ```
+///
+/// 五笔优先的硬约束：码表精确全码恒在拼音之上，词频重排只在同档内调整。
+/// 纯拼音 / 纯码表模式下同源候选档位相同，退化为按词频排序。
+///
+/// ★ 档 2 是「五笔优先」的一处**有意松动**：码表**精确**仍恒先于拼音（档 0 < 档 2），但码表
+/// **前缀补全**要让位于拼音精确匹配。理由是短输入下二者置信度恰好反相关——`xu` 的 124 条码表
+/// 前缀补全全都要打满 4 码才精确，而拼音 `xu` 已是完整音节。
+///
+/// ## 为什么放在 `wind-candidate`
+///
+/// 本函数原名 `freq_rerank::freq_tier`，是「跨来源档位」这个语义的**第二份**实现——
+/// 协调器 `candidate_display_order` 的 `cmp_exact_first` + `cmp_pinyin_exact_first`
+/// 是第一份，混输引擎的权重加成（`PHRASE_WEIGHT_BOOST` 等）是第三份。三份必须人工保持
+/// 一致（`docs/architecture/candidate-sorting-rules.md` 红线③），而实际上**已经不一致**：
+/// 混输加成给短语一律 `+1_000_000` 不分精确/前缀，本函数却把前缀短语降到档 3。
+///
+/// 搬到这里是收敛的第一步：让判据只有一个定义，调用方各自决定**在哪一级用它**。
+///
+/// ⚠ `c.code == input` 与 [`Candidate::is_exact_code`]（见 [`cmp_exact_first`]）是同一概念的
+/// 两份判据，纯码表路径结论一致。未合并是因为本档位还承载来源语义（`is_phrase` 独占档 1、
+/// 按来源分 Pinyin/English 档）。
+pub fn source_tier(c: &Candidate, input: &str) -> u8 {
+    use CandidateSource::*;
+    if c.is_phrase {
+        // 短语按「完全匹配 vs 前缀匹配」再分档，勿因 is_phrase 一刀切抬到码表前缀补全之上：
+        // - 精确码短语（`lookup`，码==输入的完全匹配 → `is_exact_code=true`）留档 1、紧随码表精确；
+        // - 前缀短语（`lookup_prefix` 命中 → `is_exact_code=false`）降到档 3，与码表前缀补全同档。
+        //   否则混输/拼音下打 `da` 会让 `date` 短语只因 is_phrase 就压过码表前缀补全（如 矼）。
+        return if c.is_exact_code { 1 } else { 3 };
+    }
+    if is_pinyin_exact_tier(c, input.len()) {
+        return 2;
+    }
+    match c.source {
+        CodeTable if c.code == input => 0, // 码表精确全码（如五笔 cang→駏）
+        CodeTable => 3,                    // 码表前缀补全
+        Pinyin => 4,                       // 拼音（非精确档：前缀补全/子短语/简拼/模糊/生僻）
+        English => 4,
+        _ => 3,
+    }
+}
+
 /// 「拼音精确档先于码表前缀补全」比较（**仅混输**，见 `candidate_display_order` 的 `mixed` 参数）。
 ///
 /// **要解决什么**：混输打 `xu`，首选是码表精确全码「弱」（`xu` 是二简码），但拼音的「需」

@@ -69,55 +69,17 @@ impl ProtectPolicy {
     }
 }
 
-/// 候选来源档位（数字越小越靠前）。五笔优先的硬约束：码表精确全码恒在拼音之上，
-/// 词频重排只在同档内调整。纯拼音/纯码表模式下同源候选档位相同，退化为按词频排序。
+/// 候选来源档位。**定义已搬到 [`wind_candidate::source_tier`]**（跨来源先后的唯一真相源），
+/// 本别名只为保留调用点可读性与本模块的文档锚点。
 ///
-/// ```text
-/// 0  码表精确全码（code == input）
-/// 1  精确码短语（is_phrase && is_exact_code）
-/// 2  拼音精确档（is_pinyin_exact_tier：精确音节 + 常用字）  ← 先于码表前缀补全
-/// 3  码表前缀补全 + 前缀短语
-/// 4  拼音其余（前缀补全/子短语/简拼/模糊/生僻） + 英文
-/// ```
+/// ⚠️ 本档位是 `rerank_codetable_usedfirst` 的**首要键**：开启自动调频时会整体压过协调器的
+/// 显示序，也因此会掩盖 `is_exact_code` 的效果（验证精确匹配优先时须关闭自动调频）。
 ///
-/// ★ 档 2 是「五笔优先」的一处**有意松动**：码表**精确**仍恒先于拼音（档 0 < 档 2），但码表
-/// **前缀补全**要让位于拼音精确匹配。理由是短输入下二者置信度恰好反相关——`xu` 的 124 条码表
-/// 前缀补全全都要打满 4 码才精确，而拼音 `xu` 已是完整音节。
-///
-/// ⚠ 下面的 `c.code == input` 与 `Candidate::is_exact_code`（见 `wind_candidate::cmp_exact_first`）
-/// 是同一概念的两份判据，纯码表路径结论一致。未合并是因为本档位还承载词频语义（`is_phrase`
-/// 独占档 1、按来源分 Pinyin/English 档）。**改动任一处须同步核对另一处**——本函数的档位是
-/// `rerank_codetable_usedfirst` 的首要键，开启自动调频时会整体压过协调器的显示序，
-/// 也因此会掩盖 `is_exact_code` 的效果（验证精确匹配优先时须关闭自动调频）。
+/// ⚠️ 这里**不必**像协调器那样区分「是否混输」：本函数只服务
+/// `rerank_codetable_usedfirst`（码表 / 混输），纯拼音走 `rerank_pinyin_positional` 不经过此处；
+/// 而纯码表下没有 `Pinyin` 来源候选，档 2 天然是空操作。
 fn freq_tier(c: &Candidate, input: &str) -> u8 {
-    use wind_candidate::CandidateSource::*;
-    if c.is_phrase {
-        // 短语按「完全匹配 vs 前缀匹配」再分档，勿因 is_phrase 一刀切抬到码表前缀补全之上：
-        // - 精确码短语（`lookup`，码==输入的完全匹配 → `is_exact_code=true`）留 tier 1、紧随码表精确；
-        // - 前缀短语（`lookup_prefix` 命中 → `is_exact_code=false`）降到 tier 3，与码表前缀补全同档。
-        //   否则混输/拼音下打 `da` 会让 `date` 短语只因 is_phrase 就压过码表前缀补全（如 矼）。
-        //   与协调器 `candidate_display_order`（is_exact_code/is_prefix）、混输侧口径对齐。
-        return if c.is_exact_code { 1 } else { 3 };
-    }
-    // 拼音精确档（tier 2）：先于码表前缀补全。与协调器 `candidate_display_order` 的
-    // `cmp_pinyin_exact_first` **共用同一个判据函数**（红线③：三套排序系统口径必须一致）。
-    // 混输打 `xu` 时拼音「需」若只按来源落 tier 4，会被码表 `xu*` 的 124 条前缀补全整体压住 ——
-    // 那正是本档要修的现场，且开自动调频时 `freq_tier` 是首要键、会整体压过协调器显示序，
-    // 只改协调器一侧等于没改。
-    //
-    // ⚠️ 这里**不必**像协调器那样区分「是否混输」：本函数只服务
-    // `rerank_codetable_usedfirst`（码表 / 混输），纯拼音走 `rerank_pinyin_positional` 不经过此处；
-    // 而纯码表下没有 `Pinyin` 来源候选，本档天然是空操作。
-    if wind_candidate::is_pinyin_exact_tier(c, input.len()) {
-        return 2;
-    }
-    match c.source {
-        CodeTable if c.code == input => 0, // 码表精确全码（如五笔 cang→駏）
-        CodeTable => 3,                    // 码表前缀补全
-        Pinyin => 4,                       // 拼音（非精确档：前缀补全/子短语/简拼/模糊/生僻）
-        English => 4,
-        _ => 3,
-    }
+    wind_candidate::source_tier(c, input)
 }
 
 /// 码表/混输词频重排（§3）：档位感知的**永久** used-first（五笔优先）。
