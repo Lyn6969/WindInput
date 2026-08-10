@@ -2077,7 +2077,7 @@ STDAPI CTextService::OnSetFocus(ITfDocumentMgr* pDocMgrFocus, ITfDocumentMgr* pD
     // 焦点切换罕见时这个取舍是划算的（换来首键模式必然就绪），但宿主若高频 churn 焦点，
     // 每次都占住 UI 线程，WM_MOUSEMOVE 排其后 → 表现为鼠标光标卡顿。
     // 记 WARN 而非 DEBUG 的用意：WARN 恒进环形缓冲（见 WindLog::Output 的 ringWorthy），
-    // 用户无需开启文件日志即可用 Ctrl+Shift+F11 导出证据——开 DEBUG 本身会加重卡顿，
+    // 用户无需开启文件日志即可用 Ctrl+Shift+F12 导出证据——开 DEBUG 本身会加重卡顿，
     // 让被测对象因观测而改变。
     const LONGLONG focusProbeT0 = WindLog::PerfNow();
     double focusIpcMs = 0.0;
@@ -2986,7 +2986,7 @@ STDAPI CTextService::OnChange(REFGUID rguid)
         }
 
         _SetChineseMode(newChineseMode);
-    
+
         if (_pLangBarItemButton != nullptr)
             _pLangBarItemButton->UpdateLangBarButton(_bChineseMode);
 

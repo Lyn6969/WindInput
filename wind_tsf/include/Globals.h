@@ -69,7 +69,7 @@ namespace WindLog {
         while (len > 0 && (cleanMsg[len - 1] == L'\n' || cleanMsg[len - 1] == L'\r'))
             cleanMsg[--len] = L'\0';
 
-        // Write to ring buffer for INFO and above (Ctrl+Shift+F11 dump)
+        // Write to ring buffer for INFO and above (Ctrl+Shift+F12 dump)
         if (ringWorthy)
             logger.WriteToRingBuffer(fileLevel, cleanMsg);
 

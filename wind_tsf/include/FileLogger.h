@@ -36,7 +36,7 @@
 // Auto-rotation: 5MB max, rotates to wind_tsf.old.log
 //
 // Ring Buffer: Always captures last RING_BUFFER_LINES log entries in memory,
-//   regardless of mode. Press Ctrl+Shift+F11 to dump via text insertion.
+//   regardless of mode. Press Ctrl+Shift+F12 to dump via text insertion.
 // ============================================================================
 
 class CFileLogger
