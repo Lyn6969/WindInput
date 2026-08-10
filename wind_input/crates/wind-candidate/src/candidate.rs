@@ -460,6 +460,17 @@ pub fn is_pinyin_exact_tier(c: &Candidate, input_len: usize) -> bool {
 /// ⚠ `c.code == input` 与 [`Candidate::is_exact_code`]（见 [`cmp_exact_first`]）是同一概念的
 /// 两份判据，纯码表路径结论一致。未合并是因为本档位还承载来源语义（`is_phrase` 独占档 1、
 /// 按来源分 Pinyin/English 档）。
+///
+/// ## ⚠️⚠️ 只能在**协调器侧**调用，引擎内部用不了
+///
+/// 档 2 的判据 [`is_pinyin_exact_tier`] 要求 `c.is_common`，而 `is_common` **只在协调器
+/// `mark_common` 置位**（`handle_candidate.rs`），引擎产出的候选该字段恒为 `false`（Default）。
+/// 于是在引擎里调用本函数，拼音精确候选会静默落到档 4 —— **不报错、不 panic，只是档位悄悄错**。
+///
+/// 这条约束的后果：混输引擎内部的排序（`sort_dedup_truncate`，决定**截断时谁进得来**）
+/// 无法直接改用本函数，它现在靠权重加成（`PHRASE_WEIGHT_BOOST` / `PARTIAL_MATCH_BOOST` /
+/// `PINYIN_TIER_SCALE`）表达同一套档位。要把那批加成也收敛掉，得先解决「引擎侧拿不到
+/// `is_common`」——那是改截断策略的活，不是删几个常数。
 pub fn source_tier(c: &Candidate, input: &str) -> u8 {
     use CandidateSource::*;
     if c.is_phrase {
