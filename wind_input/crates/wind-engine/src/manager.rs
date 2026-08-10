@@ -2629,6 +2629,14 @@ impl EngineManager {
                 enable_partial_final: mix_pinyin.is_none(),
                 completion_min_syllables: pg.completion.min_syllables,
                 completion_max_extra_syllables: pg.completion.max_extra_syllables,
+                // 全拼降级输入（双拼下多人共用）。**混输强制关闭**，理由同上面的
+                // `enable_partial_final`：混输的击键串同时是码表码，再挂一条全拼流是过度
+                // 解读。何况混输接双拼这个组合本身就不成立（`MixedEngine::pinyin_may_continue`
+                // 的「前提：混输不接双拼」），此处不必也不该为它留口子。
+                //
+                // 非双拼方案下本项即便为 true 也不生效——引擎侧判据是它与 `shuangpin.is_some()`
+                // 取与（见 `PinyinConfig::allow_full_pinyin`）。
+                allow_full_pinyin: pg.shuangpin.allow_full_pinyin && mix_pinyin.is_none(),
             };
             let mut engine = PinyinEngine::new(pcfg, dict).with_fuzzy(fuzzy.clone());
             // 双拼方案：按 layout 加载布局并注入 ShuangpinConverter

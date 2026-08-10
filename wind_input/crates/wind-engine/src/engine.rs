@@ -27,6 +27,16 @@ pub struct ConvertResult {
     /// 空串（恒原始码）。判据与 `preedit_display` 的「≥2 完成音节」刻意不同，见
     /// `MixedEngine::pinyin_split_of`。
     pub preedit_pinyin: String,
+    /// **全拼降级形态**：双拼方案下把击键串按全拼切分的串（`zaijian` → `zai'jian`）。
+    ///
+    /// 供协调器的高亮跟随：高亮到 [`Candidate::is_fullpinyin_fallback`] 的候选时显示它，
+    /// 其余情形仍按 `preedit_display`（双拼自己的切分 `za'ij'ia'n`）。空串 = 无此形态
+    /// （非双拼方案 / 开关关 / 闸门未放行）。
+    ///
+    /// ⚠️ **另立字段而非复用上面两个**：`preedit_display` 与 `preedit_pinyin` 的语义已被
+    /// 混输的高亮跟随占住（拆分串 vs 原始码），双拼在它们之上还需要第三种形态——同一串
+    /// 击键的**两种切法**。挤进老字段会连带改掉混输行为，那是两条无关的路径。
+    pub preedit_fullpinyin: String,
     /// 已完成音节（拼音 UI 高亮用）
     pub completed_syllables: Vec<String>,
     /// 末尾未完成音节（拼音）

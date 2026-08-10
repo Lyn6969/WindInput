@@ -461,6 +461,10 @@ pub(crate) struct State {
     /// 拆分串；高亮码表/五笔候选 → 用原始码（input_buffer）。空串 = 无拆分形态（码表/无拼音，
     /// 恒原始码）。每次 build_candidates 重置；非普通模式（active!=None）不读取。
     pub(crate) preedit_split_body: String,
+    /// **全拼降级**的音节拆分形态（双拼方案下把击键按全拼切分，`zaijian` → `zai'jian`）。
+    /// 高亮到 `is_fullpinyin_fallback` 的候选时 preedit 用它；其余情形不读。
+    /// 空串 = 无此形态（非双拼 / 开关关 / 支路无产出）。每次 build_candidates 重置。
+    pub(crate) preedit_fp_body: String,
     pub(crate) candidates: Vec<Candidate>,
     /// 当前页内高亮候选下标（0-based，相对当前页）——键盘选中项，空格上屏的目标
     pub(crate) selected_index: usize,
@@ -1625,6 +1629,7 @@ impl Coordinator {
                 input_cursor_pos: 0,
                 preedit: String::new(),
                 preedit_split_body: String::new(),
+                preedit_fp_body: String::new(),
                 candidates: Vec::new(),
                 selected_index: 0,
                 hover_index: -1,
@@ -3419,6 +3424,7 @@ impl Coordinator {
         state.input_cursor_pos = 0;
         state.preedit.clear();
         state.preedit_split_body.clear();
+        state.preedit_fp_body.clear();
         state.candidates.clear();
         state.current_page = 0;
         state.selected_index = 0;

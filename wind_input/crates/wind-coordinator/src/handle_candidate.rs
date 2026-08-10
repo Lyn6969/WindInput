@@ -612,6 +612,8 @@ impl Coordinator {
         // 码表 / 无拼音 → 空串（恒原始码）。state.preedit 本身由 sync_preedit_to_highlight
         // 按高亮重算（见 update_candidates 末尾 / apply_session_action）。
         state.preedit_split_body = result.preedit_pinyin.clone();
+        // 全拼降级形态（双拼下按全拼的切法），供 effective_preedit_body 按高亮候选切换。
+        state.preedit_fp_body = result.preedit_fullpinyin.clone();
         let engine_count = result.candidates.len();
         // 引擎给出的全码自动上屏意向（基于引擎候选；下方 shadow 后复核存活性）。
         let auto_commit = if result.should_commit && !result.commit_text.is_empty() {
@@ -1184,6 +1186,7 @@ impl Coordinator {
         state.candidates.clear();
         state.preedit = state.input_buffer.clone();
         state.preedit_split_body.clear();
+        state.preedit_fp_body.clear();
         if state.input_buffer.is_empty() {
             state.has_more = false;
             state.candidate_input.clear();
@@ -1508,9 +1511,20 @@ impl Coordinator {
             return &state.preedit_split_body;
         }
         let hi = self.highlighted_global_index(state);
-        let want_split = state
-            .candidates
-            .get(hi)
+        let cand = state.candidates.get(hi);
+        // 双拼下的**全拼降级候选**：编码栏按全拼切法显示（`zai'jian`），而不是双拼的
+        // `za'ij'ia'n`——三段编码配着两字候选「再见」，用户看不懂，退格时更会以为光标错位。
+        //
+        // ★ 必须在这里（按高亮）判，不能由引擎就地算定：引擎每次按键只 convert 一次，而
+        // 翻页 / 方向键移动高亮都发生在那之后，就地算定的形态不会跟着变。本函数由
+        // `sync_preedit_to_highlight` 在每次高亮变化时重算，是唯一能跟住的位置。
+        //
+        // 与下面 `source == Pinyin` 那条判据分开：双拼流与全拼支路的候选**来源同为
+        // Pinyin**，那条分不开它们；且它的两个分支（拆分串 / 原始码）都不是全拼切法。
+        if !state.preedit_fp_body.is_empty() && cand.is_some_and(|c| c.is_fullpinyin_fallback) {
+            return &state.preedit_fp_body;
+        }
+        let want_split = cand
             .map(|c| c.source == wind_candidate::CandidateSource::Pinyin)
             // 无候选（极少见）：有拆分形态则倾向拆分（纯拼音空候选边界）。
             .unwrap_or(true);

@@ -397,6 +397,35 @@ pub struct PinyinGlobalConfig {
     /// 词组补全的音节数约束（全局唯一）。
     #[serde(default)]
     pub completion: PinyinCompletion,
+    /// 双拼相关的全局行为（`[schema.pinyin.shuangpin]`）。
+    #[serde(default)]
+    pub shuangpin: PinyinShuangpin,
+}
+
+/// 双拼相关的**全局**行为（`[schema.pinyin.shuangpin]`）。
+///
+/// 与**方案级** `engine.pinyin.shuangpin` 的分工：那里放 `layout`（＝这个方案的编码规则，
+/// 换布局就是换方案）；本段放「这台机器怎么用双拼」的偏好，一次配置对所有双拼方案生效。
+///
+/// 判据即本仓那条「配置落点看**实例身份从哪来**」：布局的身份来自方案，故归方案级；而
+/// 「允不允许别人用全拼打字」跟装了哪个双拼方案无关，归全局。
+///
+/// 代价是**不能按方案区分**（`PinyinGlobalConfig` 全体无方案级 override）——做不到
+/// 「小鹤允许、自然码不允许」。真有此需求时应整体重估这一段的归属，而不是单独挪一个键。
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PinyinShuangpin {
+    /// 双拼方案下是否额外把击键串当全拼解释一遍（`nihao` → 「你好」）。
+    ///
+    /// 服务「多人共用一台机器」：主力用户打双拼，偶尔来的人只会全拼。产出的候选里只有
+    /// **低置信**那部分沉底（前缀补全 / 子短语），精确整词与整句和双拼候选同层竞争，
+    /// 见 [`wind_candidate::Candidate::is_fullpinyin_fallback`]。
+    ///
+    /// 非双拼方案下本项无效（引擎侧判据是 `shuangpin.is_some() && 本项`）；混输的拼音
+    /// 次引擎强制关闭，理由同 `PinyinConfig::enable_partial_final`。
+    ///
+    /// 默认 `false`：新功能，不打扰既有用户。
+    #[serde(default)]
+    pub allow_full_pinyin: bool,
 }
 
 /// 词组补全（前缀补全）的音节数约束（`[schema.pinyin.completion]`）。
@@ -457,6 +486,7 @@ impl Default for PinyinGlobalConfig {
             frequency: PinyinFrequency::default(),
             auto_learn: AutoLearnConfig::default(),
             completion: PinyinCompletion::default(),
+            shuangpin: PinyinShuangpin::default(),
         }
     }
 }

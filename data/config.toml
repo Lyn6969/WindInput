@@ -124,6 +124,15 @@ show_code_hint = true
 use_smart_compose = true
 separator = "auto"
 
+# 双拼相关的全局行为。与**方案级** [engine.pinyin.shuangpin]（那里放 layout＝这个方案的
+# 编码规则）分工：本段是「这台机器怎么用双拼」的偏好，一次配置对所有双拼方案生效。
+[schema.pinyin.shuangpin]
+# 双拼方案下额外把击键当全拼再解释一遍（多人共用一台机器：主力打双拼，别人只会全拼）。
+# 只有**低置信**的全拼候选（前缀补全 / 子短语）沉底；精确整词与整句和双拼候选同层竞争，
+# 由消费长度决定先后。同一个词双拼也打得出时，留下的是双拼那条。
+# 非双拼方案下本项无效；混输的拼音次引擎强制关闭。
+allow_full_pinyin = false
+
 # 模糊音：enabled 是总开关，下面每项各自控制一组等价音（默认全关，逐项按需开启）。
 [schema.pinyin.fuzzy]
 enabled = false

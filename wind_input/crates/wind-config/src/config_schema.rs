@@ -160,6 +160,10 @@ static REGISTRY: &[ConfigField] = &[
     f("schema.pinyin.auto_learn.promote_count", Int),
     f("schema.pinyin.completion.min_syllables", Int),
     f("schema.pinyin.completion.max_extra_syllables", Int),
+    // 双拼下的全拼降级输入（多人共用机器）。非双拼方案无效，混输次引擎强制关闭。
+    // 落在 [schema.pinyin.shuangpin] 子段：它只对双拼有意义，不该混在「所有拼音方案共用」
+    // 的顶层里（与 fuzzy/frequency/completion 同为子段）。
+    f("schema.pinyin.shuangpin.allow_full_pinyin", Bool),
     // 全局混输（融合策略）
     f("schema.mix.show_source_hint", Bool),
     f("schema.mix.enable_english", Bool),

@@ -138,6 +138,40 @@ pub struct Candidate {
     /// 本字段统一承接后者；前者的 `is_prefix` 维持不动（改它会动到前缀补全层的既有序）。
     #[serde(default)]
     pub is_abbrev: bool,
+    /// 是否为**全拼降级**候选：双拼方案下把击键串当全拼解释所得（`nihao` → 「你好」）。
+    ///
+    /// 服务「多人共用一台机器」——主力用户打双拼，偶尔来的人只会全拼。开关见
+    /// `schema.pinyin.shuangpin.allow_full_pinyin`；关闭时本字段全域恒 `false`。
+    ///
+    /// ## 这是**来源标记**，不是层级键
+    ///
+    /// 本字段只回答「这条候选来自全拼降级支路吗」。**沉不沉底是另一回事**，由
+    /// [`cmp_match_layers`] 叠加置信度判定（高置信＝精确整词且消费整串 → 不沉底；
+    /// 前缀补全 / 子短语 → 沉底）。二者拆开与 [[is_prefix]]（结构事实）和
+    /// [[is_promoted_completion]]（排序决策）的关系同构。
+    ///
+    /// ⚠️ **曾经二者合一，是错的**：首版把「是否沉底」直接编码进本字段，于是高置信候选
+    /// 不带标记 —— 而下面三处豁免认的正是这个标记，结果 preedit 跟随和边界校验豁免对精确
+    /// 整词齐齐失灵。字段承担两种含义，改一个就会碰坏另一个。
+    ///
+    /// 「双拼优先」也不靠本字段兜底，而是由**同文去重**保证：同一个词双拼也解释得出时
+    /// （consumed 相等），保留双拼那条（见 `recall_full_pinyin` 的 push）。
+    ///
+    /// ## ⚠️ 与 `is_abbrev` 同构：三处豁免缺一不可
+    ///
+    /// 本字段标记的候选，其 `code` 是**词的全拼码**、与双拼击键**不同域**，故双拼引擎里
+    /// 三处按「击键即双拼」立论的逻辑必须一并豁免（`pinyin/mod.rs`）：
+    /// ① `sp_boundary_mask` 真值边界校验（不豁免 ⇒ **整批候选被静默滤光**）；
+    /// ② `consumed_length` 的 `map_consumed_length` 回映射（本流消费数本就是击键域，
+    ///    再换算一次即错位）；
+    /// ③ preedit 的 `build_raw_preedit`（按双拼音节边界切，首选是全拼候选时自相矛盾）。
+    ///
+    /// 三处的现成写法照抄 `is_abbrev` 即可——它们是同一类东西。
+    ///
+    /// 非双拼方案 / 开关关闭时恒 `false`，故对码表、混输、纯全拼三条路径零回归。
+    /// 引擎内部用于排序，不推送 UI。
+    #[serde(skip)]
+    pub is_fullpinyin_fallback: bool,
     /// 是否为前缀补全候选（候选编码比输入更长，如输入 si 补全出「思考」(sikao)）。
     /// 排序时前缀补全整体降到精确匹配（code==输入）之后，使等长精确候选优先
     /// （如输入 si 时单字「四」优先于补全词「思考」），对齐 Go 的 Exact>>Partial 层级。
@@ -280,6 +314,7 @@ impl Default for Candidate {
             is_command: false,
             is_fuzzy: false,
             is_abbrev: false,
+            is_fullpinyin_fallback: false,
             is_prefix: false,
             is_partial: false,
             is_exact_code: false,
@@ -341,11 +376,15 @@ impl Candidate {
     }
 }
 
-/// 候选「匹配层级」比较——`Exact >> 子短语 >> 前缀补全 >> 简拼` 的**唯一真相**。
+/// 候选「匹配层级」比较——`Exact >> 子短语 >> 前缀补全 >> 简拼 >> 全拼降级` 的**唯一真相**。
 ///
+/// ⓪ 本方案编码的候选优先于**全拼降级**候选（双拼下打 `nihao`，双拼解读先于全拼解读）；
 /// ① 全拼优先于简拼（输入 nh 时全拼命中先于简拼「你好」）；
 /// ② 精确/子短语（**有效前缀层**为 false）优先于前缀补全（输入 si 时「四」先于补全「思考」）；
 /// ③ 完整匹配优先于子短语（输入 baoan 时「保安」「报案」先于单字「报」「宝」）。
+///
+/// ⓪ 的位置与理由见 [[Candidate::is_fullpinyin_fallback]]（它是唯一一个「来源差异」却做成
+/// 层级键的字段，判据是「用户显式声明了主编码方案」，不可照此给别的来源开口子）。
 ///
 /// **有效前缀层** = `is_prefix && !is_promoted_completion`：`is_prefix` 表结构事实（码更长），
 /// `is_promoted_completion` 表「已被提升进完整匹配层」的排序决策（拼音残码上浮 / 用户长词
@@ -364,8 +403,28 @@ impl Candidate {
 pub fn cmp_match_layers(a: &Candidate, b: &Candidate) -> std::cmp::Ordering {
     // 有效前缀层：结构补全被提升后等价于非补全（落进精确/子短语层）。
     let eff_prefix = |c: &Candidate| c.is_prefix && !c.is_promoted_completion;
-    a.is_abbrev
-        .cmp(&b.is_abbrev)
+    // 全拼降级候选**只有低置信的那部分**沉底。
+    //
+    // `is_fullpinyin_fallback` 本身是**来源标记**（「这条来自全拼降级支路」），单独拿它当
+    // 层级键会把精确整词一起沉掉 —— 真机 `zaijian` 的正解「再见」当时被整层压到第 8 位，
+    // 沉底沉掉的不是噪音而是答案本身。故判据叠加置信度：
+    // - **高置信**（精确整词 + 消费整串，如 `zaijian`→「再见」）→ 不沉底，与双拼候选同层
+    //   竞争，由协调器的「消费长度优先」把它排到那些只吃 2 键的同音单字之前；
+    // - **低置信**（`is_prefix` 前缀补全＝预测尚未输入的音节、`is_partial` 子短语＝只解释
+    //   了开头一截）→ 沉底。它们与双拼候选高度同质，放出来只挤占版面。
+    //
+    // 「双拼优先」不靠这个键兜底，而是由**同文去重**保证（consumed 相同则保留双拼那条，
+    // 见 `recall_full_pinyin` 的 push）—— 两件事各归各位。
+    //
+    // ⚠️ 必须是**首键**：挂在 `is_abbrev` 之后会让双拼简拼候选反而沉得更深（简拼在第一键
+    // 就输了），而简拼是双拼用户自己在用的输入方式，理应高于给外人预备的降级通道。
+    //
+    // **零回归**：非双拼 / 开关关闭时全域 `is_fullpinyin_fallback == false`，首键恒相等，
+    // 比较直接落到原来的三键，与改动前逐字节等价。
+    let fp_demoted = |c: &Candidate| c.is_fullpinyin_fallback && (c.is_prefix || c.is_partial);
+    fp_demoted(a)
+        .cmp(&fp_demoted(b))
+        .then(a.is_abbrev.cmp(&b.is_abbrev))
         .then(eff_prefix(a).cmp(&eff_prefix(b)))
         .then(a.is_partial.cmp(&b.is_partial))
 }

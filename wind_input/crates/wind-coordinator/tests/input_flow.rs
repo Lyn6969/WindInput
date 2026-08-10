@@ -7894,3 +7894,198 @@ fn completion_fills_after_shadow_empties_the_list() {
 
     let _ = std::fs::remove_file(&store_path);
 }
+
+// ===== 双拼下的全拼降级输入（schema.pinyin.shuangpin.allow_full_pinyin）=====
+//
+// ⚠️ 引擎侧已有 `wind-engine` 的 `full_pinyin_*` 一组单测覆盖转换逻辑。下面三条验的是
+// **用户入口**：配置到底有没有传到引擎、候选到底有没有出现在协调器的候选列表里。
+// 本仓反复出现的故障形态正是「引擎 convert 全绿，用户却打不出」——判据在分派层而非
+// 引擎层，故两层都得有测试。
+
+/// 构造双拼协调器，`allow` 控制全拼降级开关。
+fn shuangpin_coord(allow: bool) -> Option<std::sync::Arc<Coordinator>> {
+    let d = data_dir();
+    if !d.join("schemas/shuangpin.schema.toml").exists() {
+        eprintln!("跳过：缺少 shuangpin.schema.toml");
+        return None;
+    }
+    let mut cfg = Config::default();
+    cfg.schema.available = vec!["shuangpin".into()];
+    cfg.schema.active = "shuangpin".into();
+    cfg.input.default.chinese_mode = true;
+    cfg.schema.pinyin.shuangpin.allow_full_pinyin = allow;
+    Some(Coordinator::new_headless(cfg, Some(&d)))
+}
+
+/// 开启后，双拼方案下按**全拼**打 `nihao`（5 键）应能出「你好」。
+///
+/// 双拼的正确打法是 4 键 `nihc`；5 键 `nihao` 被双拼解释为 ni|ha|o，与「你好」的词典
+/// 边界 ni|hao 不符而遭边界校验拒绝——全拼降级支路补的正是这一条。
+#[test]
+fn shuangpin_full_pinyin_enabled_recalls_word() {
+    let Some(coord) = shuangpin_coord(true) else {
+        return;
+    };
+    for c in "nihao".chars() {
+        press_letter(&coord, c);
+    }
+    let all = coord.debug_all_candidate_texts();
+    assert!(
+        all.iter().any(|t| t == "你好"),
+        "开启 allow_full_pinyin 后按全拼打 nihao 应出「你好」，实际候选前 10: {:?}",
+        &all[..all.len().min(10)]
+    );
+}
+
+/// 反向对照：关闭时行为与改动前逐字一致。
+///
+/// **这条不可省**——没有它就无法区分「支路真的生效了」与「双拼本来就出得来这个词」，
+/// 上面那条会退化成一个恒真断言。
+#[test]
+fn shuangpin_full_pinyin_disabled_keeps_old_behavior() {
+    let Some(coord) = shuangpin_coord(false) else {
+        return;
+    };
+    for c in "nihao".chars() {
+        press_letter(&coord, c);
+    }
+    let all = coord.debug_all_candidate_texts();
+    assert!(
+        !all.iter().any(|t| t == "你好"),
+        "关闭时 5 键 nihao 不该出「你好」（正确双拼打法是 nihc），实际候选前 10: {:?}",
+        &all[..all.len().min(10)]
+    );
+}
+
+/// 整句：真实词库下全拼降级流也要组得出句子，而不只是查得到词。
+///
+/// 这是「完整的全拼也能工作」与「勉强查得到几个词」的分界线。
+#[test]
+fn shuangpin_full_pinyin_composes_sentence() {
+    let Some(coord) = shuangpin_coord(true) else {
+        return;
+    };
+    for c in "wojintianhenkaixin".chars() {
+        press_letter(&coord, c);
+    }
+    let all = coord.debug_all_candidate_texts();
+    assert!(
+        all.iter().any(|t| t == "我今天很开心"),
+        "全拼长串应组出整句「我今天很开心」，实际候选前 10: {:?}",
+        &all[..all.len().min(10)]
+    );
+}
+
+/// ★★ 真机回归：`zaijian` 选「再见」必须**吃掉全部 7 键**，且排在同码词之前。
+///
+/// 首版的三个缺陷在这一条用例里一起现形过，逐条都值得记住：
+/// ① 双拼流的**简拼前缀回退**（step 6.2）先用前 4 键 `zaij` 召回了「再见」并标
+///    `consumed=4`，本支路想以 `consumed=7`（完整解释）补一条，却被「同文保留先到者」
+///    挡掉 ⇒ 用户选中后缓冲里凭空剩下 `ian`。去重规则因此改为「保留解释得更多的那条」；
+/// ② 支路的子短语 `zai` 同音单字 20+ 条吃光了 `MAX_FULL_PINYIN_RECALL` 配额 ⇒ ① 精确整词
+///    只挤进 4 条、③ 前缀补全一条不剩，「再见」压根没被召回。故 ② 逐级限流；
+/// ③ 全拼候选一律沉底 ⇒ 「再见」排到第 8 位。故高置信候选（精确整词 + 消费整串）不沉底。
+#[test]
+fn shuangpin_full_pinyin_zaijian_commits_whole_buffer() {
+    let Some(coord) = shuangpin_coord(true) else {
+        return;
+    };
+    for c in "zaijian".chars() {
+        press_letter(&coord, c);
+    }
+    let page = coord.debug_page_texts();
+    let pos = page
+        .iter()
+        .position(|t| t == "再见")
+        .unwrap_or_else(|| panic!("「再见」应在首页，实际: {:?}", page));
+
+    // ③ 高置信全拼候选不该被同码的冷僻组合压住。
+    if let Some(p_other) = page.iter().position(|t| t == "在建") {
+        assert!(
+            pos < p_other,
+            "「再见」(w=2837) 应排在同码的「在建」(w=375) 之前，实际: {:?}",
+            page
+        );
+    }
+
+    // ①② 选中后必须消费整个缓冲，不留余码。
+    match coord.debug_mouse_select(pos) {
+        Some(KeyAction::InsertText {
+            text,
+            has_new_composition,
+            ..
+        }) => {
+            assert_eq!(text, "再见");
+            assert!(
+                !has_new_composition,
+                "「再见」完整解释了 7 键，选中后不得留余码（曾因让位给 consumed=4 的简拼候选而剩 `ian`）"
+            );
+        }
+        other => panic!(
+            "选「再见」应整体上屏 InsertText，实际: {:?}（UpdateComposition 即意味着有余码）",
+            other
+        ),
+    }
+    assert_eq!(coord.debug_candidate_count(), 0, "上屏后组合区应清空");
+}
+
+/// ★ 编码栏必须**跟随高亮候选**在两种切分间切换，而不是按键时算定一次就不动。
+///
+/// `zaijian` 有两种读法：双拼读作 `za'ij'ia'n`（4 段），全拼读作 `zai'jian`（2 段）。
+/// 高亮在全拼候选（「再见」）上时显示后者，移到双拼候选上时必须切回前者——三段编码配着
+/// 两字候选，用户看不懂，退格时更会以为光标错位。
+///
+/// ⚠️ 首版把形态判定写在引擎里（按首选就地算定 preedit_display），真机现象正是「翻页或
+/// 移动光标到双拼候选，编码栏还停在全拼拆分」：引擎每次按键只 convert 一次，而高亮是之后
+/// 才移动的。判定必须落在协调器的 `effective_preedit_body`（由 `sync_preedit_to_highlight`
+/// 在每次高亮变化时重算）。
+#[test]
+fn shuangpin_preedit_follows_highlight_between_domains() {
+    let Some(coord) = shuangpin_coord(true) else {
+        return;
+    };
+    let mut last = None;
+    for c in "zaijian".chars() {
+        last = Some(press_letter(&coord, c));
+    }
+    let preedit0 = action_text(&last.expect("按键应有回执")).unwrap_or_default();
+    assert_eq!(
+        preedit0,
+        "zai'jian",
+        "首选是全拼候选「再见」，编码栏应按全拼切分；实际候选: {:?}",
+        coord.debug_page_texts()
+    );
+
+    // 逐个下移高亮，落到任一**双拼**候选上时，编码栏须切回双拼切分。
+    // 不锁定具体位置（词库权重会浮动），只要求这个切换确实发生。
+    let mut switched_back = false;
+    for _ in 0..24 {
+        let act = coord.handle_key_event(&key_event(0x28, EVENT_KEY_DOWN));
+        if action_text(&act).as_deref() == Some("za'ij'ia'n") {
+            switched_back = true;
+            break;
+        }
+    }
+    assert!(
+        switched_back,
+        "高亮移到双拼候选时编码栏应切回 za'ij'ia'n，实际候选: {:?}",
+        coord.debug_all_candidate_texts()
+    );
+}
+
+/// 双拼正路不受支路影响：开着开关，4 键 `nihc` 照样出「你好」。
+#[test]
+fn shuangpin_full_pinyin_does_not_break_native_path() {
+    let Some(coord) = shuangpin_coord(true) else {
+        return;
+    };
+    for c in "nihc".chars() {
+        press_letter(&coord, c);
+    }
+    let all = coord.debug_all_candidate_texts();
+    assert!(
+        all.iter().any(|t| t == "你好"),
+        "双拼正确打法 nihc 应照常出「你好」，实际候选前 10: {:?}",
+        &all[..all.len().min(10)]
+    );
+}

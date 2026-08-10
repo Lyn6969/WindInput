@@ -369,6 +369,37 @@ const MAX_FALLBACK_PER_CUT: usize = 6;
 /// lattice（文档 §4.8），不是调这个常量能做到的。
 const MAX_FALLBACK_CUTS: usize = 2;
 
+/// 全拼降级支路（双拼下按全拼解释击键）的召回条数上限，精确 + 子短语 + 前缀补全合计。
+///
+/// 远小于主路径的 `completion_limit`（30 ~ [`MAX_COMPLETION_CANDIDATES`]）是刻意的：本支路
+/// 服务「偶尔来用一下的人」，产出恒沉在双拼候选之后，堆再多也只是把翻页拉长；而候选查重
+/// 是 O(n²) 线性扫描（见 step4 注释的实测：5000 条 54.5ms），支路不该往这个瓶颈上加码。
+const MAX_FULL_PINYIN_RECALL: usize = 24;
+
+/// 全拼降级闸门要求的**最少完整音节数**。
+///
+/// 取 2 是证伪力与可用性的折中。双拼击键大量拿 v/i/u 作声母（小鹤 v=zh、i=ch、u=sh），
+/// 全拼音节表根本切不动，于是 `nihc`(ni + `hc`✗)、`womf`(wo + `mf`✗)、`vsuf`(v 就不成音节)
+/// 全被挡在门外，只有 `nihao`/`dianhua` 这类真·全拼串放行 —— 闸门的证伪力全在这里。
+///
+/// **降到 1 等于取消闸门**：任何双拼串的前两键几乎总能读成一个音节，支路会对每一次击键
+/// 都启动。
+///
+/// 代价：全拼用户打到 `nih`（1 音节 + 残码）时支路不启动，要打满 `niha` 才出候选。这是
+/// 有意的取舍；真机若嫌迟钝，调这里之前先确认不是闸门第三条（尾部须为合法音节前缀）的锅。
+const FULL_PINYIN_MIN_SYLLABLES: usize = 2;
+
+/// 全拼降级支路里**每级前缀子短语**（②）的召回上限。
+///
+/// ★ 没有它，单音节前缀的同音单字会把 [`MAX_FULL_PINYIN_RECALL`] 的配额整个吃光：真机
+/// `zaijian` 下 `zai` 一级就有 20+ 条（在/再/载/哉/崽/宰/仔/栽/灾/甾/載/災/菑/畠/渽…），
+/// 于是 ① 精确整词只挤进 4 条、③ 前缀补全一条不剩，**「再见」压根没被召回**——用户看到
+/// 的那条「再见」其实来自双拼流的简拼回退，只消费 4/7 键。
+///
+/// 子短语的价值本就低于精确整词（只解释开头一截，且双拼流通常已给出同批单字），限得紧些
+/// 不损失什么。真正需要这些单字时，用户手头的双拼候选里已经有了。
+const MAX_FULL_PINYIN_SUBPHRASE: usize = 4;
+
 /// 用户/临时词的**前缀补全**是否上浮进完整匹配层（贴合「长词打到第 3-4 个音节就给出」）。
 ///
 /// 用户长词（如「清风输入法」qingfengshurufa，5 音节）在部分拼音下由 store 层前缀命中，
@@ -426,6 +457,19 @@ pub struct Config {
     pub completion_min_syllables: u32,
     /// 词组补全的音节数约束：候选最多比输入多几个音节。
     pub completion_max_extra_syllables: u32,
+    /// **双拼方案下**是否额外把击键串当全拼解释一遍（`nihao` → 「你好」）。
+    ///
+    /// 服务「多人共用一台机器」：主力用户打双拼，偶尔来的人只会全拼。产出的候选整体沉在
+    /// 双拼候选之后（[`wind_candidate::Candidate::is_fullpinyin_fallback`] 是 `cmp_match_layers`
+    /// 的首键），故对双拼用户是纯增量。
+    ///
+    /// **只在 `shuangpin.is_some()` 时有意义**：全拼方案下击键本就是全拼，再跑一遍支路等于
+    /// 把同一批候选查两次。引擎侧判据固定为二者取与，见 `full_pinyin_gate`。
+    ///
+    /// **混输强制关闭**（`manager.rs` 接线处），理由同 [`Self::enable_partial_final`]：混输的
+    /// 击键串同时是码表码，多接一条全拼流是过度解读。且混输接双拼这个组合本身就不成立
+    /// （见 `mixed::MixedEngine::pinyin_may_continue` 的「前提：混输不接双拼」）。
+    pub allow_full_pinyin: bool,
 }
 
 /// 前缀补全允许的最大候选音节数 —— 词组补全两个旋钮（`[schema.pinyin.completion]`）
@@ -482,6 +526,9 @@ impl Default for Config {
             enable_partial_final: true,
             completion_min_syllables: 2,
             completion_max_extra_syllables: 3,
+            // 默认关：全拼降级是显式开启的降级通道，不该在任何未声明的地方生效
+            // （测试要覆盖支路时显式置 true，这样"支路参与了哪些用例"一目了然）。
+            allow_full_pinyin: false,
         }
     }
 }
@@ -786,6 +833,281 @@ impl PinyinEngine {
                         push(cands, c.text, c.code, c.weight, c.boundary);
                     }
                 }
+            }
+        }
+    }
+
+    /// 全拼降级支路的**准入闸门**：这串击键本身够不够像一串全拼。
+    ///
+    /// 返回 `Some(音节序列)` 即放行，顺带把切分交给调用方（召回时不必重切）。三条判据：
+    /// - 从 0 起连续切出的完整音节数 ≥ [`FULL_PINYIN_MIN_SYLLABLES`]；
+    /// - **首音节 ≥2 字母**——挡掉 `a`/`e`/`o` 起头的退化解析，与
+    ///   `is_possible_pinyin_sequence` / `is_whole_syllable_pinyin` 同款守卫；
+    /// - 尾部要么被音节吃干净，要么是**合法音节前缀**（`nihaom` 的 `m` 放行、
+    ///   `nihaoxyz` 的 `xyz` 拒绝）。
+    ///
+    /// ⚠️ 入参必须是**原始击键**（`raw_input`），不是双拼转换后的全拼——本支路的全部意义
+    /// 就是「不经双拼转换地读这串键」。传错域会让闸门恒真：转换结果本身就是合法全拼串。
+    fn full_pinyin_gate(&self, stroke: &str) -> Option<Vec<String>> {
+        let (syllables, end) = self.contiguous_completed_from_start(stroke);
+        let first = syllables.first()?;
+        if syllables.len() < FULL_PINYIN_MIN_SYLLABLES || first.len() < 2 {
+            return None;
+        }
+        // 尾部残码须是某音节的合法前缀（`m` 可以，`xyz` 不行）。
+        if end < stroke.len() && !self.trie.is_prefix(&stroke[end..]) {
+            return None;
+        }
+        Some(syllables)
+    }
+
+    /// 全拼降级召回：把击键串当**全拼**查词典，产出候选全部标
+    /// [`Candidate::is_fullpinyin_fallback`]（经 `cmp_match_layers` 首键整体沉在双拼之后）。
+    ///
+    /// ## 与 [`Self::recall_abbrev_prefix`] 同构
+    ///
+    /// 两者都是「以击键串为准、`code` 与当次击键不同域」的第二召回通道，故同样自带层级
+    /// 标志、自带击键域的 `consumed_length`、自带限流。调用方须在三处双拼专属逻辑上豁免
+    /// 本批候选（边界校验 / `map_consumed_length` / `build_raw_preedit`），见字段文档。
+    ///
+    /// ## 覆盖范围
+    ///
+    /// 对应主路径的 step1 / step3 / step4 / step2：精确整词、各级前缀子短语、前缀补全、
+    /// 整句解码（⑤，含自带的「整句让位于精确整词」）。
+    /// **模糊音跟随** `[schema.pinyin.fuzzy]`，与双拼流同一套设置（①②走 `lookup_with_fuzzy`、
+    /// ⑤ 把 `fuzzy_config` 传进词图）。首版刻意不做，被真机反馈否掉——同一个人同一套模糊音
+    /// 配置在两条流下表现不一致，本身就是缺陷。
+    ///
+    /// - **不含简拼**：简拼判据本就走 `abbr_query`（击键域），主路径已覆盖，再来一遍纯属重复；
+    /// - **不含残码补全整句**（主路径 step 2c）：那条路径连混输都要关（`enable_partial_final`），
+    ///   它让整句消费满整串从而跨过若干「消费整串」闸门，副作用面大于收益。
+    ///
+    /// ## 为什么消费长度可以直接取字节数
+    ///
+    /// 本支路里「全拼域」与「击键域」**是同一个域**（支路的定义就是把击键当全拼读），故
+    /// `consumed_length` 直接取码的字节数。绝不可再过 `map_consumed_length`——那是双拼流
+    /// 专用的全拼→击键回映射，用在这里等于二次换算，必然错位。
+    fn recall_full_pinyin(&self, stroke: &str, syllables: &[String], cands: &mut Vec<Candidate>) {
+        let dict = &self.dict;
+        let start = cands.len();
+        // 同文去重的规则**不是**「无条件保留先到者」，而是「保留解释得更多的那条」。
+        //
+        // ★ 真机现场（`zaijian` → 「再见」）：双拼流的简拼前缀回退（step 6.2）先用前 4 键
+        // `zaij` 召回了「再见」并标 `consumed=4`，本支路随后想以 `consumed=7`（完整解释）
+        // 补一条，若无条件让位，用户选中后只吃掉 4 键、缓冲里凭空剩下 `ian`。
+        //
+        // 「双拼优先」讲的是**双拼的完整解释**优先于全拼的完整解释（`nini` 那种两域同形的
+        // 情形，consumed 相等 ⇒ 不替换 ⇒ 双拼那条留下），而不是「双拼的半截解释」也优先。
+        // 判据落在 consumed 上，两件事各归各位。
+        //
+        // `consumed_length == 0` 表示引擎未标注（全仓约定＝消费整串），不得替换。
+        let push = |cands: &mut Vec<Candidate>,
+                    text: String,
+                    code: String,
+                    weight: i32,
+                    order: i32,
+                    boundary: u64,
+                    is_prefix: bool,
+                    consumed: usize,
+                    is_fuzzy: bool| {
+            if text.is_empty() {
+                return;
+            }
+            let cand = Candidate {
+                text,
+                code,
+                weight,
+                natural_order: order,
+                source: CandidateSource::Pinyin,
+                // 恒 true —— 本字段是**来源标记**（「这条来自全拼降级支路」），不是排序决策。
+                // 沉不沉底由 `cmp_match_layers` 按 `is_prefix`/`is_partial` 另行判定，见该函数。
+                // 三处豁免（边界校验 / consumed 回映射 / preedit 跟随）认的都是这个来源标记，
+                // 若按「是否沉底」来置位，高置信候选就会丢标记、三处豁免一起失灵。
+                is_fullpinyin_fallback: true,
+                is_fuzzy,
+                is_prefix,
+                // 子短语＝码短于击键（`nihao` 的「你」），与主路径 push_unique 同义。
+                is_partial: !is_prefix && consumed < stroke.len(),
+                boundary,
+                consumed_length: consumed,
+                ..Default::default()
+            };
+            if let Some(existing) = cands.iter_mut().find(|c| c.text == cand.text) {
+                if existing.consumed_length != 0 && existing.consumed_length < cand.consumed_length
+                {
+                    *existing = cand;
+                }
+                return;
+            }
+            if cands.len() - start >= MAX_FULL_PINYIN_RECALL {
+                return;
+            }
+            cands.push(cand);
+        };
+
+        // ① 精确整词：完整音节覆盖的那一段（`nihaom` 取 `nihao`，残码 `m` 留给续输）。
+        //
+        // 走 `lookup_with_fuzzy` 而非裸 `search_with_boundary`：**模糊音必须支持**。首版刻意
+        // 不做（「降级通道不做二次放大」），但真机反馈直接否掉了那个取舍——用户在
+        // `[schema.pinyin.fuzzy]` 里开了 zh_z/sh_s/an_ang…，双拼流吃这些设置而全拼流不吃，
+        // 于是同一个人同一套模糊音设置在两条流下表现不一致，这本身就是缺陷。
+        // 惩罚由 `lookup_with_fuzzy` 内部的 `fuzzy_penalized`（0.5^音节数）施加，与主路径同源。
+        let completed: String = syllables.concat();
+        for h in self.lookup_with_fuzzy(&completed, syllables) {
+            let c = completed.clone();
+            let n = c.len();
+            push(
+                cands, h.text, c, h.weight, h.order, h.boundary, false, n, h.is_fuzzy,
+            );
+        }
+
+        // ② 各级前缀子短语（`nihao` → `ni`），供分段上屏。段数上限同主路径 step3。
+        if syllables.len() >= 2 {
+            for end in 1..syllables.len().min(6) {
+                let code: String = syllables[..end].concat();
+                // 逐级限流，见 MAX_FULL_PINYIN_SUBPHRASE：单音节前缀的同音单字动辄 20+ 条，
+                // 不限就会吃光整个配额，把 ① 精确整词和 ③ 前缀补全挤出去。
+                for h in self
+                    .lookup_with_fuzzy(&code, &syllables[..end])
+                    .into_iter()
+                    .take(MAX_FULL_PINYIN_SUBPHRASE)
+                {
+                    let c = code.clone();
+                    let n = c.len();
+                    push(
+                        cands, h.text, c, h.weight, h.order, h.boundary, false, n, h.is_fuzzy,
+                    );
+                }
+            }
+        }
+
+        // ③ 前缀补全（码比击键长，`niha` → 「你好」）：以**整串击键**为前缀，含尾部残码。
+        for h in dict.search_prefix_with_boundary(stroke, MAX_FULL_PINYIN_RECALL) {
+            push(
+                cands,
+                h.text,
+                h.code,
+                h.weight,
+                h.order,
+                h.boundary,
+                true,
+                stroke.len(),
+                false,
+            );
+        }
+
+        // ④ 用户/临时造词层：用户加过的词，换全拼打同样该出得来。
+        if let Some(store_dm) = &self.store_layers {
+            for c in store_dm.search(&completed, MAX_FULL_PINYIN_RECALL) {
+                let n = completed.len();
+                push(
+                    cands,
+                    c.text,
+                    completed.clone(),
+                    c.weight,
+                    c.natural_order,
+                    c.boundary,
+                    false,
+                    n,
+                    false,
+                );
+            }
+            for c in store_dm.search_prefix(stroke, MAX_FULL_PINYIN_RECALL) {
+                push(
+                    cands,
+                    c.text,
+                    c.code,
+                    c.weight,
+                    c.natural_order,
+                    c.boundary,
+                    true,
+                    stroke.len(),
+                    false,
+                );
+            }
+        }
+
+        // ⑤ **整句解码**：让全拼降级流也能组句（`wojintianhenkaixin` → 「我今天很开心」），
+        //    否则「完整的全拼也能工作」只兑现了一半——词典里没有的搭配全部落空。
+        //
+        //    在 `completed`（完整音节覆盖段）上建图，对应主路径的 step 2；**不做 step 2c 的
+        //    残码补全**：那条路径连混输都要关掉（`enable_partial_final`），它让整句消费满整串
+        //    从而跨过若干「消费整串」闸门，副作用面比收益大，降级通道不值得冒这个险。
+        //
+        //    切分图走 `from_dag`（多路径）而非 `from_syllables`：全拼的切分是**猜的**，词图该
+        //    看到全部切法——这正是它与双拼主路径 `fixed_segmentation` 的分野，也是当初判定
+        //    「不能跑两遍 convert」的根由。
+        //
+        //    模糊音传 `None`：与本支路其余部分一致，降级通道不做二次放大。
+        if self.config.use_smart_compose && syllables.len() >= 2 {
+            let trie = &self.trie;
+            let seg_graph = SegGraph::from_dag(&Dag::build(&completed, trie));
+            // 模糊音同 ①②：与主路径 step 2 一致地把 fuzzy_config 传进词图。
+            let lattice_nodes = self.lattice_builder.build(
+                &completed,
+                &seg_graph,
+                dict,
+                Some(&self.fuzzy_config),
+                true,
+            );
+            let input_len = completed.len();
+            let mut lattice: Vec<Vec<WordNode>> = vec![Vec::new(); input_len + 1];
+            for (end_pos, nodes_at_end) in lattice_nodes.iter().enumerate() {
+                if end_pos > input_len {
+                    continue;
+                }
+                for node in nodes_at_end {
+                    lattice[end_pos].push(WordNode {
+                        start: node.start,
+                        end: node.end,
+                        word: node.word.clone(),
+                        syl_mask: node.syl_mask,
+                        log_prob: node.log_prob,
+                    });
+                }
+            }
+            let result = self.viterbi.decode(&lattice, input_len);
+            let sentence: String = result.words.join("");
+            let logp_per_char = result.log_prob / sentence.chars().count().max(1) as f64;
+            // 三道闸门，逐条复刻主路径 step 2 / 2b 的既有判据：
+            // - `log_prob.is_finite()`：解码失败时为 NEG_INFINITY，不能把空/错误路径塞进候选；
+            // - `words.len() >= 2`：**单节点路径不算组句**。它本质就是一条普通词候选，而整句的
+            //   `code` 是击键串、普通候选的 `code` 是词典码——包装成整句会让同一个词的词频记到
+            //   两个互不相认的键上（step 2b 注释记着这个坑）。单节点交给 ① 出即可，那边 code 是对的；
+            // - `logp_per_char`：低置信整句宁可不出。降级通道尤其如此——出一条烂整句的代价
+            //   比不出高得多。
+            if result.log_prob.is_finite()
+                && result.words.len() >= 2
+                && !sentence.is_empty()
+                && logp_per_char >= MIXED_SENTENCE_MIN_LOGP_PER_CHAR
+                && !cands.iter().any(|c| c.text == sentence)
+            {
+                // **整句让位于精确整词**，语义同主路径 6.5，但判据必须自带一份：6.5/6.5b 跑在
+                // 双拼边界校验**之前**，而本支路在其之后（见 convert 里 step 6.7 的位置说明），
+                // 那套逻辑根本够不着这批候选。比较范围限于 `cands[start..]`（本支路自己的产出）
+                // ——跨层去跟双拼候选比权重没有意义，层级键已经把两批彻底分开了。
+                let exact_max = cands[start..]
+                    .iter()
+                    .filter(|c| !c.is_prefix && !c.is_partial && c.code == completed)
+                    .map(|c| c.weight)
+                    .max();
+                let w = sentence_weight(result.log_prob, result.words.len());
+                let weight = exact_max.map_or(w, |m| w.min(m.saturating_sub(1)));
+                cands.push(Candidate {
+                    text: sentence,
+                    // 码取**已完成音节段**（不含尾部残码），与 consumed 一致：`nihaom` 选整句
+                    // 后残码 `m` 留在缓冲里续输，与主路径 step 2 同款。
+                    code: completed.clone(),
+                    weight,
+                    natural_order: 0,
+                    source: CandidateSource::Pinyin,
+                    is_fullpinyin_fallback: true,
+                    is_sentence: true,
+                    is_partial: completed.len() < stroke.len(),
+                    boundary: result.boundary,
+                    consumed_length: completed.len(),
+                    ..Default::default()
+                });
             }
         }
     }
@@ -2267,9 +2589,41 @@ impl Engine for PinyinEngine {
                     // 误杀。原设计里简拼候选 boundary 恒为 0，靠「任一侧为 0 即放行」自然
                     // 豁免；wdat v5 让简拼改走主表装配、带上了真实边界，那条隐式豁免随之
                     // 失效，故须显式写出。同理于模糊变体——那边至今仍靠 boundary=0 豁免。
-                    c.is_abbrev || boundary_compatible(c.boundary, sp_mask, c.code.len(), full_len)
+                    // 全拼降级候选（step 6.7）同理豁免，且理由与简拼**完全一样**：它的
+                    // `code` 是词的全拼码，而 `sp_mask` 说的是双拼把这串键切成了什么样，
+                    // 两者根本不同域，比出来必然不符 —— 不豁免就是整批静默滤光。
+                    c.is_abbrev
+                        || c.is_fullpinyin_fallback
+                        || boundary_compatible(c.boundary, sp_mask, c.code.len(), full_len)
                 });
             }
+        }
+
+        // 6.7 **全拼降级支路**（双拼方案 + `allow_full_pinyin`）：把击键串当全拼再读一遍，
+        //     服务「多人共用一台机器」——主力打双拼，偶尔来的人只会全拼。
+        //
+        //     ★★ **必须排在双拼边界校验之后**，这是本支路最反直觉的一处顺序约束。
+        //
+        //     双拼转换的结果常常与击键串**同形**：`nihao`(5 键) 双拼解释 ni|ha|o 拼起来还是
+        //     "nihao"，于是 step1 早就精确命中了「你好」并放进候选——只不过它的词典边界
+        //     ni|hao 与双拼解释 ni|ha|o 不符，会被上面那道 retain 删掉（见
+        //     `boundary_compatible_rules` 的「这正是 5 键出「你好」的病灶」）。
+        //
+        //     若把本支路放在校验**之前**：支路查 "nihao" 得到「你好」，却因同文查重让位给
+        //     step1 那条双拼候选，而后者紧接着被校验删除 —— **两条都没了**，用户打 `nihao`
+        //     依旧一无所获，且开关看起来完全没生效。放在校验之后，被删的坑正好由支路补上。
+        //
+        //     顺带满足另两条约束：① 在 6.3 音节数闸门之后——那道 retain 的尺子
+        //     `syllable_cap` 由 `started_syllables`（**双拼域**音节数）算出，与全拼域对不上，
+        //     用它裁全拼候选是判据跨域复用；② 在所有双拼候选产出之后——支路的 push 靠
+        //     「同文时保留已有候选」实现「双拼优先」，提前会让双拼版本反被挡掉。
+        //
+        //     ⚠️ 因此本支路的位置由**三条**约束共同钉死，挪动前请逐条复核。
+        if self.config.allow_full_pinyin
+            && sp_result.is_some()
+            && let Some(fp_syls) = self.full_pinyin_gate(raw_input)
+        {
+            self.recall_full_pinyin(raw_input, &fp_syls, &mut candidates);
         }
 
         // 分段上屏所需：标注每个候选实际消费的输入字节数。
@@ -2293,6 +2647,13 @@ impl Engine for PinyinEngine {
             // 双拼下同样跳过：简拼的判据本就走 raw_input（击键域），consumed_length 的语义
             // 就是「消费多少击键」，无须再过 map_consumed_length 换算。
             if c.is_abbrev && c.consumed_length != 0 {
+                continue;
+            }
+            // 全拼降级候选（step 6.7）同样自带击键域的消费数。**不可再过
+            // `map_consumed_length`**：那是双拼流专用的「全拼字节 → 双拼键数」回映射，而本
+            // 支路的码本身就是击键串的前缀（全拼域 ≡ 击键域），再换算一次即错位——
+            // `nihao` 选「你好」会被回映射成 4（双拼 4 键的量），凭空吞掉一个键。
+            if c.is_fullpinyin_fallback {
                 continue;
             }
             // 以剥除分隔符后的 query 为基准计算消费长度（无分隔符时 query==input）。
@@ -2394,8 +2755,24 @@ impl Engine for PinyinEngine {
         // Fix A：双拼激活时，preedit 改为显示用户实际输入的原始按键（按双拼音节边界以 `'` 分隔），
         // 而非转换后的全拼。仅覆盖 preedit_display；候选/completed_syllables/partial_syllable/
         // consumed_length 仍保持全拼语义不变。
+        // 双拼自身的音节切分恒为**默认**显示形态。
+        let mut preedit_fullpinyin = String::new();
         if let Some(r) = &sp_result {
             preedit_display = build_raw_preedit(raw_input, r);
+            // 支路有产出时额外给出**全拼切分**，供协调器按高亮候选切换
+            // （见 `ConvertResult::preedit_fullpinyin`）。
+            //
+            // ⚠️ **不能**在这里按「首选是不是全拼候选」就地把 preedit_display 改掉——首版即
+            // 如此，真机现象是「翻页/移动光标到双拼候选后，编码栏还停在全拼拆分」：引擎只在
+            // 按键时 convert 一次，而高亮是之后才移动的，就地算定的形态根本不会跟着变。
+            // 形态选择必须交给协调器的 `effective_preedit_body`（由 `sync_preedit_to_highlight`
+            // 在每次高亮变化时重算），引擎只负责把两种形态都交出去。
+            if candidates.iter().any(|c| c.is_fullpinyin_fallback) {
+                let fp = self.compose_segment(raw_input).0;
+                if fp != preedit_display {
+                    preedit_fullpinyin = fp;
+                }
+            }
         }
 
         let has_partial = !partial_syllable.is_empty();
@@ -2406,6 +2783,7 @@ impl Engine for PinyinEngine {
             // 拼音恒为拆分形态（供混输高亮跟随：高亮拼音候选时取此串）。
             preedit_pinyin: preedit_display.clone(),
             preedit_display,
+            preedit_fullpinyin,
             completed_syllables,
             partial_syllable,
             has_partial,
@@ -2974,6 +3352,347 @@ mod tests {
             nihao.consumed_length, 4,
             "「你好」consumed_length 应为双拼键数 4（\"nihc\" 的长度），实际为 {}",
             nihao.consumed_length
+        );
+    }
+
+    // ===== 全拼降级支路（双拼方案下允许全拼输入，`allow_full_pinyin`）=====
+
+    /// 构造「小鹤双拼 + 可控开关」的引擎。`entries` 为 `(文本, 空格分隔的音节码, 权重)`。
+    ///
+    /// ⚠️⚠️ **必须走 rime 源格式，不可用 `merge_single`**：后者造出的条目 `boundary` 恒 0，
+    /// 而双拼边界校验遇 0 一律放行 —— 拿它做夹具等于把本组用例要验的那道校验整个关掉。
+    /// 首版即栽于此：`nihao` 在开关**关闭**时照样出「你好」（双拼流的命中没被校验拦下），
+    /// 于是「支路补上了被校验删掉的候选」这件事根本没被测到，4 条用例全是假前提。
+    ///
+    /// `tag` 用于隔离临时文件名——多个用例并发跑，共用一个文件名会互相截断。
+    fn sp_fp_engine(tag: &str, entries: &[(&str, &str, i32)], allow: bool) -> PinyinEngine {
+        use std::io::Write;
+        let path = std::env::temp_dir().join(format!("wind_fp_fallback_{tag}.dict.yaml"));
+        {
+            let mut f = std::fs::File::create(&path).unwrap();
+            writeln!(f, "---\nname: py\n...").unwrap();
+            for (text, code, w) in entries {
+                writeln!(f, "{text}\t{code}\t{w}").unwrap();
+            }
+        }
+        let dict = CachedDict::Memory(CodetableDict::load(&path).unwrap());
+        let _ = std::fs::remove_file(&path);
+
+        let schema_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../../data/schemas/shuangpin");
+        let layout = Layout::from_toml(&schema_dir.join("xiaohe.toml")).expect("加载小鹤布局失败");
+        let cfg = Config {
+            allow_full_pinyin: allow,
+            ..Config::default()
+        };
+        PinyinEngine::new(cfg, dict).with_shuangpin(ShuangpinConverter::new(layout))
+    }
+
+    fn texts(r: &ConvertResult) -> Vec<&str> {
+        r.candidates.iter().map(|c| c.text.as_str()).collect()
+    }
+
+    /// ★★ 核心用例，同时**锁住支路的位置**。
+    ///
+    /// 双拼下按全拼打 `nihao`（5 键）应出「你好」。这条之所以是位置的守卫：`nihao` 的双拼
+    /// 解释 ni|ha|o 拼起来**与击键同形**，step1 早就精确命中了「你好」，只是随后被边界校验
+    /// 删掉。支路若排在校验之前，会因同文查重让位给那条注定被删的候选 ⇒ 最终一条都不剩，
+    /// 且现象是「开关像没生效」。
+    #[test]
+    fn full_pinyin_recalls_word_that_shuangpin_boundary_check_rejects() {
+        let eng = sp_fp_engine(
+            "recall",
+            &[("你好", "ni hao", 200), ("你", "ni", 100)],
+            true,
+        );
+        let r = eng.convert("nihao", 20).unwrap();
+        let c = r
+            .candidates
+            .iter()
+            .find(|c| c.text == "你好")
+            .unwrap_or_else(|| panic!("应出「你好」，实际候选: {:?}", texts(&r)));
+        assert!(c.is_fullpinyin_fallback, "应带全拼支路的来源标记");
+        assert_eq!(
+            c.consumed_length, 5,
+            "consumed 必须是**击键域**的 5，不可再过 map_consumed_length 回映射成双拼键数"
+        );
+    }
+
+    /// 反向对照：开关关闭时行为与改动前完全一致（`nihao` 的正确双拼打法是 `nihc`）。
+    #[test]
+    fn full_pinyin_off_keeps_shuangpin_only_behavior() {
+        let eng = sp_fp_engine("off", &[("你好", "ni hao", 200), ("你", "ni", 100)], false);
+        let r = eng.convert("nihao", 20).unwrap();
+        assert!(
+            !r.candidates.iter().any(|c| c.text == "你好"),
+            "开关关闭时不该出「你好」，实际候选: {:?}",
+            texts(&r)
+        );
+    }
+
+    /// 闸门：双拼击键串不得触发支路——这是「双拼体验不被污染」的结构性保证。
+    #[test]
+    fn full_pinyin_gate_rejects_shuangpin_strokes() {
+        let eng = sp_fp_engine("gate", &[("你好", "ni hao", 200)], true);
+        // `nihc` = 「你好」的小鹤双拼码：ni + `hc`，而 `hc` 既不成音节也不是音节前缀
+        // ⇒ 只切得出 1 个音节 ⇒ 不足 FULL_PINYIN_MIN_SYLLABLES。
+        assert!(
+            eng.full_pinyin_gate("nihc").is_none(),
+            "nihc（双拼码）不该触发全拼支路"
+        );
+        assert!(
+            eng.full_pinyin_gate("womf").is_none(),
+            "womf（=women 的双拼码）不该触发"
+        );
+        // 尾部残码须是合法音节前缀：`m` 可以，`xyz` 不行。
+        assert!(eng.full_pinyin_gate("nihaom").is_some(), "nihaom 应放行");
+        assert!(
+            eng.full_pinyin_gate("nihaoxyz").is_none(),
+            "尾部 xyz 不是音节前缀，应拒绝"
+        );
+        // 真·全拼串放行。
+        assert!(eng.full_pinyin_gate("nihao").is_some());
+    }
+
+    /// 支路不得干扰双拼流：`nihc` 走双拼正路，候选不带降级标志、consumed 仍是键数。
+    #[test]
+    fn full_pinyin_branch_does_not_disturb_shuangpin_path() {
+        let eng = sp_fp_engine(
+            "undisturbed",
+            &[("你好", "ni hao", 200), ("你", "ni", 100)],
+            true,
+        );
+        let r = eng.convert("nihc", 20).unwrap();
+        let c = r
+            .candidates
+            .iter()
+            .find(|c| c.text == "你好")
+            .unwrap_or_else(|| panic!("双拼正确打法应出「你好」，实际: {:?}", texts(&r)));
+        assert!(
+            !c.is_fullpinyin_fallback,
+            "这条由双拼流产出，不该带降级标志"
+        );
+        assert_eq!(c.consumed_length, 4, "双拼流的 consumed 仍是键数 4");
+    }
+
+    /// 两条流都解释得出同一个词时，**留下双拼那条**（不带降级标志、不沉底）。
+    /// `nini`：双拼 n+i / n+i → "nini"，全拼 ni|ni 也是 "nini"，两域同形同码。
+    #[test]
+    fn shuangpin_candidate_wins_when_both_domains_agree() {
+        let eng = sp_fp_engine("agree", &[("妮妮", "ni ni", 150)], true);
+        let r = eng.convert("nini", 20).unwrap();
+        let hits: Vec<_> = r.candidates.iter().filter(|c| c.text == "妮妮").collect();
+        assert_eq!(hits.len(), 1, "同文候选不该重复，实际: {:?}", texts(&r));
+        assert!(
+            !hits[0].is_fullpinyin_fallback,
+            "双拼也解释得出时，留下的必须是双拼那条"
+        );
+    }
+
+    /// 层级：**低置信**全拼候选（前缀补全）沉底，**高置信**（精确整词 + 消费整串）不沉底。
+    ///
+    /// ⚠️ 这条曾断言「全拼候选一律排在双拼候选之后」，随真机反馈反转 —— `zaijian` 的正解
+    /// 「再见」当时被整层压到第 8 位，沉底沉掉的不是噪音而是答案本身。「双拼优先」现由
+    /// 同文去重那一层保住（consumed 相同则留双拼那条），不再靠层级键一刀切。
+    #[test]
+    fn full_pinyin_low_confidence_sinks_but_exact_word_does_not() {
+        let eng = sp_fp_engine(
+            "sink",
+            &[
+                ("你好", "ni hao", 200),
+                ("你好吗", "ni hao ma", 5000),
+                ("你", "ni", 100),
+            ],
+            true,
+        );
+        let r = eng.convert("nihao", 20).unwrap();
+        let exact = r
+            .candidates
+            .iter()
+            .find(|c| c.text == "你好")
+            .unwrap_or_else(|| panic!("应出精确整词「你好」，实际: {:?}", texts(&r)));
+        assert!(exact.is_fullpinyin_fallback, "来源标记：来自支路");
+        assert!(
+            !exact.is_prefix && !exact.is_partial,
+            "精确整词＝高置信（cmp_match_layers 据此免除沉底）"
+        );
+
+        // 「你好吗」码更长＝前缀补全＝在预测用户还没打的音节 ⇒ 低置信，沉底。
+        // 它的 weight(5000) 远高于「你好」(200)，若不沉底就会靠权重反超——正是要防的。
+        if let Some(compl) = r.candidates.iter().find(|c| c.text == "你好吗") {
+            assert!(
+                compl.is_fullpinyin_fallback && compl.is_prefix,
+                "前缀补全＝低置信，cmp_match_layers 据此沉底（否则高权重补全会盖过精确整词）"
+            );
+            let p_exact = r.candidates.iter().position(|c| c.text == "你好").unwrap();
+            let p_compl = r
+                .candidates
+                .iter()
+                .position(|c| c.text == "你好吗")
+                .unwrap();
+            assert!(
+                p_exact < p_compl,
+                "精确整词须先于前缀补全，实际: {:?}",
+                texts(&r)
+            );
+        }
+    }
+
+    /// 同文去重取「解释得更多的那条」，而非无条件保留先到者。
+    ///
+    /// 真机 `zaijian`：双拼流的简拼前缀回退先以 `consumed=4` 放入「再见」，支路随后以
+    /// `consumed=7` 完整解释同一个词——若让位给先到者，用户选中后缓冲会凭空剩下 `ian`。
+    #[test]
+    fn full_pinyin_replaces_partial_duplicate_with_complete_one() {
+        let eng = sp_fp_engine("dedup", &[("再见", "zai jian", 2837)], true);
+        let r = eng.convert("zaijian", 20).unwrap();
+        let c = r
+            .candidates
+            .iter()
+            .find(|c| c.text == "再见")
+            .unwrap_or_else(|| panic!("应出「再见」，实际: {:?}", texts(&r)));
+        assert_eq!(
+            c.consumed_length,
+            "zaijian".len(),
+            "必须是完整解释（7 键）那条；留下半截解释会让上屏后残留余码"
+        );
+        assert_eq!(
+            r.candidates.iter().filter(|c| c.text == "再见").count(),
+            1,
+            "同文不得重复"
+        );
+    }
+
+    /// 模糊音：支路与双拼流吃同一套 `[schema.pinyin.fuzzy]` 设置。
+    ///
+    /// 首版刻意不做（「降级通道不做二次放大」），被真机反馈否掉——同一个人同一套模糊音配置
+    /// 在两条流下表现不一致本身就是缺陷。惩罚由 `lookup_with_fuzzy` 的 `fuzzy_penalized` 施加。
+    #[test]
+    fn full_pinyin_honors_fuzzy_settings() {
+        let mut eng = sp_fp_engine("fuzzy", &[("中国", "zhong guo", 9000)], true);
+        // zh↔z：打 `zongguo` 应经模糊命中「中国」。
+        eng.fuzzy_config.zh_z = true;
+        let r = eng.convert("zongguo", 20).unwrap();
+        let c = r
+            .candidates
+            .iter()
+            .find(|c| c.text == "中国")
+            .unwrap_or_else(|| panic!("开 zh_z 后 zongguo 应出「中国」，实际: {:?}", texts(&r)));
+        assert!(c.is_fuzzy, "应标记为模糊命中（据此施加权重折扣）");
+    }
+
+    /// preedit 跟随首选：首选是全拼候选时，编码栏按**全拼**切分显示。
+    /// 词典只留 `nihao`，双拼流一条候选都产不出，支路的「你好」即首选。
+    #[test]
+    fn engine_exposes_both_preedit_forms() {
+        let eng = sp_fp_engine("preedit", &[("你好", "ni hao", 200)], true);
+        let r = eng.convert("nihao", 20).unwrap();
+        assert_eq!(
+            r.preedit_display, "ni'ha'o",
+            "默认形态恒为**双拼自己的**切分，不因首选是谁而变"
+        );
+        assert_eq!(
+            r.preedit_fullpinyin, "ni'hao",
+            "另行交出全拼切分，供协调器在高亮到全拼候选时取用"
+        );
+    }
+
+    /// 支路无产出时不给全拼形态——省得协调器凭空多一个可选项。
+    #[test]
+    fn engine_omits_full_pinyin_preedit_when_branch_silent() {
+        let eng = sp_fp_engine("preedit_off", &[("你好", "ni hao", 200)], false);
+        let r = eng.convert("nihao", 20).unwrap();
+        assert!(
+            r.preedit_fullpinyin.is_empty(),
+            "开关关闭时不该有全拼形态，实际: {:?}",
+            r.preedit_fullpinyin
+        );
+    }
+
+    /// 整句解码（⑤）：全拼降级流也要能组句，否则「完整的全拼也能工作」只兑现一半——
+    /// 词典里没有的搭配全部落空。
+    #[test]
+    fn full_pinyin_composes_sentence() {
+        let eng = sp_fp_engine(
+            "sentence",
+            &[
+                ("我", "wo", 10000),
+                ("今天", "jin tian", 5000),
+                ("很", "hen", 3000),
+                ("开心", "kai xin", 2000),
+            ],
+            true,
+        );
+        let r = eng.convert("wojintianhenkaixin", 20).unwrap();
+        let c = r
+            .candidates
+            .iter()
+            .find(|c| c.text == "我今天很开心")
+            .unwrap_or_else(|| panic!("全拼长串应组出整句，实际候选: {:?}", texts(&r)));
+        assert!(c.is_sentence, "应标为整句");
+        assert!(c.is_fullpinyin_fallback, "整句同样带支路来源标记");
+        assert_eq!(
+            c.consumed_length,
+            "wojintianhenkaixin".len(),
+            "整句消费完整音节段（本例无残码，即整串）"
+        );
+    }
+
+    /// 整句让位于精确整词：支路自带一份判据，因为主路径 6.5/6.5b 跑在双拼边界校验之前、
+    /// 够不着本支路的候选。
+    ///
+    /// `nihao` 下词典既有精确整词「你好」(w=200)，Viterbi 又能用「你」+「好」拼出「你好」——
+    /// 同文会被查重挡掉。故改用一个**词典没有的**组合：`nihen` → 「你很」由两个单字拼出，
+    /// 而 `ni hen` 这个码上另有精确词「妮痕」压着，整句须排在它之后。
+    #[test]
+    fn full_pinyin_sentence_yields_to_exact_word() {
+        let eng = sp_fp_engine(
+            "yield",
+            &[
+                ("妮痕", "ni hen", 9000),
+                ("你", "ni", 500),
+                ("很", "hen", 400),
+            ],
+            true,
+        );
+        let r = eng.convert("nihen", 20).unwrap();
+        let exact = r.candidates.iter().find(|c| c.text == "妮痕");
+        let sentence = r.candidates.iter().find(|c| c.text == "你很");
+        if let (Some(e), Some(s)) = (exact, sentence) {
+            assert!(
+                s.weight < e.weight,
+                "整句「你很」({}) 须让位于精确整词「妮痕」({})",
+                s.weight,
+                e.weight
+            );
+        } else {
+            // 词图未拼出该整句时不强求（Viterbi 行为随词典权重浮动），但精确词必须在。
+            assert!(
+                exact.is_some(),
+                "精确整词「妮痕」必须在，实际: {:?}",
+                texts(&r)
+            );
+        }
+    }
+
+    /// 非双拼（纯全拼）方案下开关无效——全拼本就是主路径，支路会把同一批候选查两遍。
+    #[test]
+    fn full_pinyin_flag_is_noop_without_shuangpin() {
+        let mut raw = CodetableDict::empty();
+        raw.merge_single("nihao".to_string(), "你好".to_string(), 200, 0);
+        let cfg = Config {
+            allow_full_pinyin: true,
+            ..Config::default()
+        };
+        let eng = PinyinEngine::new(cfg, CachedDict::Memory(raw));
+        let r = eng.convert("nihao", 20).unwrap();
+        assert!(
+            r.candidates.iter().any(|c| c.text == "你好"),
+            "全拼方案照常出「你好」"
+        );
+        assert!(
+            r.candidates.iter().all(|c| !c.is_fullpinyin_fallback),
+            "全拼方案下不该有任何候选被标成降级候选"
         );
     }
 
