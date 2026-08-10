@@ -67,6 +67,12 @@ fn test_trailing_partial_sentence_takes_top() {
     for (input, want, longer) in [
         ("buzhidaok", "不知道看", "不知道看什么"),
         ("jisuanjik", "计算机看", "计算机科学"),
+        // `zhonghuar` 同时存在两条整句：残码整句「中华人」(消费 9 键) 与 step 2 整句
+        // 「中华」(消费 8 键)。**它们的先后只由 ⓪ `consumed_length` 决定**，与 weight
+        // 无关 —— 整句 weight 改几何平均后「中华」在**引擎级**反超（单词整句 vs 两词
+        // 整句），而这里必须仍是「中华人」。引擎级那条断言已相应放宽为「首选是某条
+        // 整句」，判据搬到本层，见 `pinyin_completion::low_freq_far_completion_*`。
+        ("zhonghuar", "中华人", "中华人民"),
     ] {
         let cands = candidates_for(input);
         assert_eq!(

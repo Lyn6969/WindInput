@@ -277,14 +277,20 @@ fn low_freq_far_completion_does_not_outrank_sentence() {
 
     let cands = mgr.convert_with("pinyin", "zhonghuar", 6).candidates;
     let texts = || cands.iter().map(|c| &c.text).collect::<Vec<_>>();
-    // ⚠️ 首选从「中华」改为「中华人」：step 2c 落地后残码 `r` 被补成一个待定音节，
-    // 产出消费满 9 键的残码整句，按比较链 ⓪ 本就该在只消费 8 键的「中华」之前。
+    // 首选必须是**某条整句**，但**不断言是哪一条**。
+    //
+    // `zhonghuar` 下有两条：step 2c 的残码整句「中华人」(消费 9 键) 与 step 2 的整句
+    // 「中华」(消费 8 键)。谁在前由协调器比较链 ⓪ `consumed_length` 决定，而**引擎级
+    // 排序根本不看 consumed** —— 本断言一度写死「中华人」并注明「按比较链 ⓪ 本就该在
+    // 「中华」之前」，那是把协调器的判据安到了引擎头上：这里实际比的是 weight。
+    // 整句 weight 改几何平均后，单词整句「中华」反超两词整句「中华人」，本断言即红，
+    // 而同一批输入的**协调器级 survey 零差异**（⓪ 照常把「中华人」排在首位）。
+    //
     // 本用例真正要守的是**下面那条**——w=0 的「种花人」与 w=18 的「中华人民」都不得
     // 靠上浮夺走首位，那与首选具体是哪条整句无关。
-    assert_eq!(
-        cands[0].text,
-        "中华人",
-        "zhonghuar 首选应是残码整句「中华人」，实际: {:?}",
+    assert!(
+        cands[0].is_sentence,
+        "zhonghuar 首选应是整句（「中华人」或「中华」皆可），实际: {:?}",
         texts()
     );
     assert!(

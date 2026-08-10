@@ -65,40 +65,51 @@ use wind_dict::cached::CachedDict;
 /// vs 四项 656、`nihao` 你好 5328 vs 拟好 64 —— 四个经典冲突场景顺序全部不变。
 /// **3e7 从未起决定性作用，它只是掩盖了「词典权重本来就够用」这个事实。**
 ///
-/// 纯合成整句的 W_eff 很低（`我是中国人` 18.5、`今天天气很好` 饱和到 1），但它们的
-/// `consumed_length` 恒最大，靠协调器比较链 ⓪ 取胜，用不到 weight。反过来，错误合成
-/// （`sixiang` 若出「是想」）W_eff 极低，自然输给「思想」——这正是 step 6.5 手工在做的事。
-///
-/// ## ⚠️ 为什么按词数乘回 `DICT_TOTAL`（不是笔误）
-///
-/// `log_prob = Σ ln(f_i / T)`，若直接 `exp(log_prob) × T` 得到的是 `∏f_i / T^(n-1)`
-/// —— **比 librime 多除了 n−1 次 T**，整句被系统性压低。实测后果：`jisuanjik` 的首选从
-/// 残码整句「计算机看」翻成补全「计算机科学」(w=402)、`zhongguor` 从「中国人」翻成
-/// 「中国人的」，而用户明确指出主流输入法给的是前者。
-///
-/// librime 的整句分是 `Σ log(f_i) = log(∏f_i)`（`poet.cc:216` 累加 `dict_compiler.cc:257`
-/// 写入的 `log(freq)`），**不归一化**。两个词的频次相乘（1e5×1e5=1e10）天然远大于任何
-/// 单个词典词 —— 「就算没有词也强制组句」正源于此。故这里乘 `T^n` 抵消归一化：
+/// ## 公式：各词频次的**几何平均**
 ///
 /// ```text
-/// exp(log_prob + n·ln T) = ∏f_i        （n = 词数）
+/// log_prob = Σ ln(f_i / T)                       （n = 词数，T = DICT_TOTAL）
+/// W_eff    = exp(log_prob / n + ln T) = (∏ f_i)^(1/n)
 /// ```
 ///
-/// 单词整句（step 1.5 的词典整词）n=1 ⇒ 还原成 `f` 本身，与词典权重同量纲，符合直觉。
+/// n = 1 时还原成 `f` 本身，与词典权重同量纲。
 ///
-/// ⚠️ **长整句会饱和到 `i32::MAX`**：三词以上乘积即溢出。可接受——整句之间靠
-/// `consumed_length`（协调器比较链 ⓪）区分，同 consumed 的整句同时出现属极少数。
-/// 但这条依赖 ⓪ 的语义，若它变化须重新评估。
+/// ### ⚠️ 为什么要除以 n（这一步是后补的，别再拿掉）
 ///
-/// ⚠️ **饱和不等于「整句永远赢」**：step 6.5/6.5b 让位时是**显式赋值**
-/// （`c.weight = max_w - 1`），不受饱和影响；`zhongguorenm` 的「中国人吗」仍会让位给
-/// 「中国人民」。整句优先是默认，让位是显式例外，两者分工不变。
+/// 初版按 librime 的「不归一化」写作 `exp(log_prob + n·ln T) = ∏f_i`。librime 确实不
+/// 归一化（`poet.cc:216` 累加 `dict_compiler.cc:257` 写入的 `log(freq)`），但它**全程在
+/// 对数域比较**，而我们要把结果落进 `i32` 的 `weight` 字段 —— `∏f_i` 必然溢出：
 ///
-/// ⚠️ `log_prob` 含各类惩罚/加成（`WORD_PENALTY`、单字罚、实词加成…），故 `exp(log_prob)`
-/// 不是严格的整句概率，`DICT_TOTAL` 实际充当**标定系数**。改那些惩罚常数须重新标定。
+/// ```text
+/// 实测 19 个常见输入，5 个饱和到 i32::MAX：
+///   我是中国人 / 我们是 / 他是谁 / 我今天很开心 / 吃饭了
+///   被近似 1,690,885,022（濒临）
+/// ```
+///
+/// 饱和的后果不是「整句排太前」，而是**整句之间彻底无法区分**（都等于 i32::MAX，只能
+/// 靠 `base_order` 决定先后，实质是随机）。实测 `gongzuosi` 的首选是饱和的「工作是」，
+/// 而用户要的「工作室」只有 w=82。
+///
+/// 几何平均把结果压回词频量纲（恒 ≤ max f_i），**永不溢出，整句之间恒可比**。
+///
+/// ### 「没有词也强制组句」不受影响
+///
+/// 那个行为**不靠 weight**，靠协调器比较链 ⓪ `consumed_length`：合成整句消费的输入恒
+/// 最长，在 weight 参与比较之前就赢了。weight 只决定**同 consumed 的候选之间**谁先，
+/// 而那正是需要「几何平均」这种可比量纲的地方。
+///
+/// ⚠️ 这条依赖 ⓪ 的语义。若 `consumed_length` 不再是比较链首键，须重新评估本公式。
+///
+/// ⚠️ 下界仍 clamp 到 1：长整句的几何平均可能落到 0（低频字连乘再开根仍 < 1），
+/// 而 0 与「无权重」候选语义混淆。
+///
+/// ⚠️ `log_prob` 含各类惩罚/加成（`WORD_PENALTY`、单字罚、实词加成、模糊音罚…），故
+/// `exp(log_prob/n)` 不是严格的整句概率，`DICT_TOTAL` 实际充当**标定系数**。改那些惩罚
+/// 常数须重新标定。
 fn sentence_weight(log_prob: f64, word_count: usize) -> i32 {
-    let unnormalized = log_prob + word_count as f64 * lattice::DICT_TOTAL.ln();
-    unnormalized.exp().clamp(1.0, i32::MAX as f64) as i32
+    let n = word_count.max(1) as f64;
+    let geometric_mean = log_prob / n + lattice::DICT_TOTAL.ln();
+    geometric_mean.exp().clamp(1.0, i32::MAX as f64) as i32
 }
 
 /// 模糊音命中的权重折扣（对齐 Go `ranker.go` 的 `IsFuzzy → score -= 100`）。
