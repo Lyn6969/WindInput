@@ -2363,7 +2363,8 @@ pub struct UiCandidateConfig {
     /// 自定义序号标签（如 "asdfg"；空=默认 1-9）。每字符一个槽位。
     #[serde(default)]
     pub index_labels: String,
-    /// 候选窗在光标上方时反转候选排列顺序。
+    /// 候选窗在光标上方时反转候选排列顺序。**仅竖排生效**：横排候选左右并列，
+    /// 反转与窗口在上在下无关，只会把读序倒过来，故对横排一律忽略。
     #[serde(default)]
     pub flip_when_above: bool,
     /// 候选窗在光标上方时交换编码栏与候选栏位置（编码区沉底贴光标）。与 flip_when_above 正交，可叠加。

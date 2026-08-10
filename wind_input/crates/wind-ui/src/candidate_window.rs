@@ -231,7 +231,8 @@ pub struct CandidateWindow {
     preedit_embedded: bool,
     /// 候选字号覆盖（>0 时取代主题 behavior.font_size）。来自 ui.candidate.font_size。
     font_size_override: f32,
-    /// 候选窗在光标上方时反转候选顺序。来自 ui.candidate.flip_when_above。
+    /// 候选窗在光标上方时反转候选顺序（仅竖排生效，见 [`CandidateWindow::above_layout`]）。
+    /// 来自 ui.candidate.flip_when_above。
     flip_when_above: bool,
     /// 当前锚点是否落在光标上方（定位时计算，随锚点锁定保持）。供 flip 判定。
     placed_above: bool,
@@ -343,6 +344,30 @@ impl CandidateWindow {
     /// 设置"上方时交换编码栏与候选栏位置"。来自 ui.candidate.swap_preedit_when_above。
     pub fn set_swap_preedit_when_above(&mut self, swap: bool) {
         self.swap_preedit_when_above = swap;
+    }
+
+    /// 两个「上方专属」开关的最终生效判定（纯函数）：返回 `(反转候选, 交换编码/候选带)`。
+    ///
+    /// `flip_when_above` **只对竖排成立**：竖排下候选沿光标方向纵向排开，"反转"= 让候选 1
+    /// 落到离光标最近的一侧，语义明确；横排下候选是左右并列，反转只是把 1..n 变成 n..1，
+    /// 读序被打乱且与窗口在上在下毫无关系（同 `inline_preedit_bottom` 对横排的处置）。
+    /// `swap_preedit_when_above` 交换的是编码带与候选带的**上下**位置，横竖排都成立，不受此限。
+    ///
+    /// 抽成纯函数是为了让「重建视图树的触发条件」与「build_tree 内的实际派生」共用同一份
+    /// 判据：否则横排开了 flip 时外层仍会每帧重建一棵与原树完全相同的树，白付 build+layout。
+    fn above_layout(above: bool, vertical: bool, flip: bool, swap: bool) -> (bool, bool) {
+        (above && vertical && flip, above && swap)
+    }
+
+    /// 当前落位下是否有生效的「上方专属」布局 —— 有才需要按 `above=true` 重建视图树。
+    fn above_layout_active(&self) -> bool {
+        let (flip, swap) = Self::above_layout(
+            self.placed_above,
+            self.vertical,
+            self.flip_when_above,
+            self.swap_preedit_when_above,
+        );
+        flip || swap
     }
 
     /// 设置"翻页栏并入编码栏行"。来自 ui.candidate.pager_in_preedit。
@@ -606,8 +631,8 @@ impl CandidateWindow {
             _ => (px0, py0),
         };
         self.last_content_pos = Some((px, py));
-        // 上方显示且启用 → 逆序重建候选树（项数/尺寸/位置不变，仅排列翻转）
-        if self.placed_above && (self.flip_when_above || self.swap_preedit_when_above) {
+        // 上方显示且有开关真正生效 → 按上方布局重建候选树（项数/尺寸/位置不变，仅排列翻转）
+        if self.above_layout_active() {
             root = self.build_tree(true);
             root.layout(ml as f32, mt as f32, &self.text_renderer);
         }
@@ -751,7 +776,7 @@ impl CandidateWindow {
             _ => (px0, py0),
         };
         self.last_content_pos = Some((px, py));
-        if self.placed_above && (self.flip_when_above || self.swap_preedit_when_above) {
+        if self.above_layout_active() {
             root = self.build_tree(true);
             root.layout(ml as f32, mt as f32, &self.text_renderer);
         }
@@ -913,7 +938,7 @@ impl CandidateWindow {
             self.last_content_pos = Some((px, py));
             screen_xy = Some((px - ml as i32, py - mt as i32));
         }
-        if self.placed_above && (self.flip_when_above || self.swap_preedit_when_above) {
+        if self.above_layout_active() {
             root = self.build_tree(true);
             root.layout(ml as f32, mt as f32, &self.text_renderer);
         }
@@ -1358,7 +1383,7 @@ impl CandidateWindow {
     /// 按当前状态构建候选视图树（横向布局）。
     /// T3：从 RVNode 树（`Resolved.views`）取色/几何，颜色 None→兜底（与旧 ResolvedTheme 默认等值，零回归）。
     /// 构建候选 View 树。`above=true`（窗口上翻到光标上方）时按三个正交开关调整布局：
-    /// 反转候选（flip_when_above）、交换编码/候选区（swap_preedit_when_above）、翻页栏并入编码栏
+    /// 反转候选（flip_when_above，仅竖排）、交换编码/候选区（swap_preedit_when_above）、翻页栏并入编码栏
     /// （pager_in_preedit，与 above 无关的常驻行为）。任何情形下每项 tag/序号标签/选中判定仍用
     /// 原始索引 i，确保命中/选中映射不受排列变化影响。
     /// 把插入符位置夹到合法字符边界。协调器发来的偏移与它自己的 preedit 同源、本应恒合法，
@@ -1397,11 +1422,16 @@ impl CandidateWindow {
         let t = &self.theme;
         let v = &t.views;
         // above=true（窗口被上翻到光标上方）时，据两个正交开关派生上方专属行为：
-        //   flip_cands = 反转候选项排列顺序（ui.candidate.flip_when_above）
+        //   flip_cands = 反转候选项排列顺序（ui.candidate.flip_when_above，仅竖排有意义）
         //   swap_bands = 交换编码区↔候选区上下位置（ui.candidate.swap_preedit_when_above，编码沉底贴光标）
         // 二者可单独或叠加：叠加时候选块内部反转 + 编码沉底 = 候选1 紧挨编码栏。
-        let flip_cands = above && self.flip_when_above;
-        let swap_bands = above && self.swap_preedit_when_above;
+        // 生效判据见 above_layout（与外层「要不要重建」共用同一份，避免两处各判一套）。
+        let (flip_cands, swap_bands) = Self::above_layout(
+            above,
+            self.vertical,
+            self.flip_when_above,
+            self.swap_preedit_when_above,
+        );
         // 翻页栏并入编码栏行（右对齐）：需开关开启 + 有独立编码栏（非嵌入）+ 翻页栏本身可见。
         // 满足时翻页栏随编码区一同装配（swap 时自动跟随沉底）；否则回退候选行尾/竖排底部独立行。
         let pager_will_inline = self.pager_in_preedit
@@ -2508,6 +2538,41 @@ mod tests {
         let b = CandidateWindow::caret_anchors(caret_x, caret_y, caret_h, win_h, 5);
         assert_eq!(b.0 - a.0, 5, "x 偏移右移");
         assert_eq!((b.1, b.2), (a.1, a.2), "x 偏移不该动垂直锚点");
+    }
+
+    /// 「上方反转候选」只对竖排成立，横排必须原样保持 1..n。
+    ///
+    /// 横排候选是左右并列，"反转"跟窗口在光标上方还是下方没有任何关系，只会把读序
+    /// 倒过来（1 跑到最右）。两个开关正交，故一并锁死 swap 不受排列方向影响。
+    #[test]
+    fn flip_when_above_applies_to_vertical_only() {
+        // (above, vertical, flip, swap) -> (flip_cands, swap_bands)
+        let f = CandidateWindow::above_layout;
+        assert_eq!(
+            f(true, true, true, false),
+            (true, false),
+            "竖排上方：反转生效"
+        );
+        assert_eq!(
+            f(true, false, true, false),
+            (false, false),
+            "横排上方：反转不得生效"
+        );
+        assert_eq!(
+            f(false, true, true, false),
+            (false, false),
+            "下方：一律不生效"
+        );
+        // swap 交换的是上下两条带，横竖排都成立
+        assert_eq!(
+            f(true, false, false, true),
+            (false, true),
+            "横排上方：交换仍生效"
+        );
+        assert_eq!(f(true, true, false, true), (false, true));
+        // 叠加：竖排两个都开 → 两个都生效；横排只剩 swap
+        assert_eq!(f(true, true, true, true), (true, true));
+        assert_eq!(f(true, false, true, true), (false, true));
     }
 
     /// 插入符位置一律夹到合法字符边界——`split_at` 落在字符中间会 panic 掉 UI 线程。
