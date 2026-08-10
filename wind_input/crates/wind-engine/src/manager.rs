@@ -496,33 +496,11 @@ impl EngineManager {
         is_sp
     }
 
-    /// 活跃方案为双拼且 `key`（ASCII 字节）是其布局的韵母键时返回 true，否则 false。
-    /// 供选词热键避让：正在输入双拼时，韵母键优先作编码输入而非触发选词（对齐 Go IsShuangpinFinalKey）。
-    /// 内部按活跃方案 id 缓存韵母键集合，方案切换/reload/invalidate 时自动失效。
-    pub fn shuangpin_final_key(&self, key: u8) -> bool {
-        let active_id = self.active_schema_id();
-        // 检查缓存是否命中
-        {
-            let cache = self
-                .shuangpin_finals_cache
-                .lock()
-                .unwrap_or_else(|e| e.into_inner());
-            if cache.0 == active_id {
-                return cache.1.as_ref().map(|s| s.contains(&key)).unwrap_or(false);
-            }
-        }
-        // 缓存未命中：读取活跃方案，判断是否双拼并构建韵母键集合
-        let finals_set = self.build_shuangpin_finals(&active_id);
-        let result = finals_set
-            .as_ref()
-            .map(|s| s.contains(&key))
-            .unwrap_or(false);
-        *self
-            .shuangpin_finals_cache
-            .lock()
-            .unwrap_or_else(|e| e.into_inner()) = (active_id, finals_set);
-        result
-    }
+    // 注：曾有 `shuangpin_final_key(key) -> bool`（对齐 Go IsShuangpinFinalKey），供协调器
+    // 在选词分支前避让双拼韵母键。**已删**——它只让键跳过选词，下游没人接住，键继续流向
+    // 模式引导键与标点流水线，微软/搜狗/紫光的 `;` = ing 照样打不出。现由码元字符集
+    // 单点仲裁：`PinyinEngine::input_chars` 从双拼布局推导，协调器的 `try_code_char_gate`
+    // 抢在选词/引导键/标点**全部三条**之前接管。本处缓存仍为 `pinyin_is_shuangpin` 服务。
 
     /// 内部辅助：为指定方案 id 构建双拼韵母键集（非双拼返回 None）。
     fn build_shuangpin_finals(&self, schema_id: &str) -> Option<std::collections::HashSet<u8>> {
@@ -4393,50 +4371,82 @@ input_chars = \"a-z;\"
         let _ = std::fs::remove_dir_all(&ov_dir);
     }
 
-    /// Task 5.1：双拼活跃时，韵母键 shuangpin_final_key 返回 true；非韵母键返回 false。
-    /// 用真实 data 目录 + mspy 布局（含 `;` = ing）验证。
+    /// 双拼布局的非字母键（mspy `;` = ing）必须成为**码元**、但**不可作首码**。
+    ///
+    /// 这是「`;` 能打 ying」的唯一接线点：协调器只认 `active_is_code_char`，
+    /// 布局里写了 `";" = ["ing"]` 而这里为 false，`;` 就会被次选键 / quick_mix 引导键 /
+    /// 标点流水线依次拦下（三条都拦，故只堵一条无用）。首码为 false 同样是硬要求——
+    /// 一旦 `;` 能起头，空缓冲按 `;` 就归码表，快捷输入再也进不去。
+    /// ⚠️ 必须用 `build_dev/data`（带编译好的词典）而不是源码 `data/`：码元集挂在
+    /// **活跃引擎**上，引擎建不起来 → `active_engine()` 为 None → 回落 `a-z` → 断言全红。
+    /// 旧的 `shuangpin_final_key` 只读布局 TOML 文件，源 `data/` 就够，这条依赖是新增的。
     #[test]
-    fn shuangpin_final_key_true_for_shuangpin() {
-        use std::io::Write;
-
-        // 真实 data 目录（含 shuangpin/ 布局文件 + 可读的 schema TOML）
-        let data_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../../data");
-        // 把测试用 schema 写到 data/schemas/ 目录下（与真实布局同 data_dir）
-        // 注意：测试结束后删除，防止污染。
-        let sp_schema_path = data_dir.join("schemas").join("sp_mspy_test.schema.toml");
-        {
-            let mut f = std::fs::File::create(&sp_schema_path).unwrap();
-            write!(
-                f,
-                "[schema]\nid = \"sp_mspy_test\"\n[engine]\ntype = \"pinyin\"\n[engine.pinyin]\nscheme = \"shuangpin\"\n[engine.pinyin.shuangpin]\nlayout = \"mspy\"\n"
-            )
-            .unwrap();
+    fn shuangpin_symbol_final_is_code_char_but_not_leading() {
+        let data_dir =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../../build_dev/data");
+        if !data_dir.join("schemas/shuangpin.schema.toml").exists() {
+            eprintln!("跳过：缺 build_dev/data（未构建）");
+            return;
         }
 
-        let mut cfg = Config::default();
-        cfg.schema.active = "sp_mspy_test".into();
-        cfg.schema.available = vec!["sp_mspy_test".into()];
-
-        let ov_dir = std::env::temp_dir().join("wind_eng_sp_finalkey_ov");
+        // override 把内置 shuangpin 方案的布局换成 mspy（`;` = ing），不动真实方案文件。
+        let ov_dir = std::env::temp_dir().join("wind_eng_sp_charset_ov");
         let _ = std::fs::remove_dir_all(&ov_dir);
+        std::fs::create_dir_all(&ov_dir).unwrap();
+        std::fs::write(
+            ov_dir.join("shuangpin.toml"),
+            "[engine.pinyin.shuangpin]\nlayout = \"mspy\"\n",
+        )
+        .unwrap();
+
+        let mut cfg = Config::default();
+        cfg.schema.active = "shuangpin".into();
+        cfg.schema.available = vec!["shuangpin".into()];
 
         let mgr =
             EngineManager::with_store_override(&cfg, Some(&data_dir), None, Some(ov_dir.clone()));
 
-        // mspy `;` = ing → 是韵母键
-        assert!(mgr.shuangpin_final_key(b';'), "mspy `;` 应是韵母键");
-        // `k` 在 mspy 是韵母键（ao）
-        assert!(mgr.shuangpin_final_key(b'k'), "mspy `k` 应是韵母键");
-        // `[` 不是 mspy 的韵母键（mspy finals 仅含字母和 `;`）
-        assert!(!mgr.shuangpin_final_key(b'['), "mspy `[` 不应是韵母键");
+        // mspy `;` = ing → 码元，但只能作第二码
+        assert!(mgr.active_is_code_char(';'), "mspy `;` 应是码元（= ing）");
+        assert!(
+            !mgr.active_is_leading_char(';'),
+            "mspy `;` 只作韵母（第二码），不得进首码集——否则夺走 quick_mix 引导键"
+        );
+        // 字母键不受影响：仍是码元且可起头
+        assert!(mgr.active_is_code_char('k'), "字母 k 应是码元");
+        assert!(mgr.active_is_leading_char('n'), "声母 n 应可作首码");
+        // 布局没用到的符号不得混进来
+        assert!(!mgr.active_is_code_char('['), "mspy 未用 `[`，不应是码元");
 
-        let _ = std::fs::remove_file(&sp_schema_path);
+        // 反向对照：换回全字母布局（小鹤）后必须回落默认集——否则上面的断言可能只是
+        // 「某处无条件把 `;` 放进码元集」，而不是真的从布局推导出来的。
+        let ov2 = std::env::temp_dir().join("wind_eng_sp_charset_ov_xh");
+        let _ = std::fs::remove_dir_all(&ov2);
+        std::fs::create_dir_all(&ov2).unwrap();
+        std::fs::write(
+            ov2.join("shuangpin.toml"),
+            "[engine.pinyin.shuangpin]\nlayout = \"xiaohe\"\n",
+        )
+        .unwrap();
+        let mgr2 =
+            EngineManager::with_store_override(&cfg, Some(&data_dir), None, Some(ov2.clone()));
+        assert!(
+            !mgr2.active_is_code_char(';'),
+            "小鹤布局无符号键 → `;` 不得是码元"
+        );
+        assert!(
+            mgr2.active_input_chars().is_default_alpha(),
+            "全字母布局应回落内置 a-z"
+        );
+
         let _ = std::fs::remove_dir_all(&ov_dir);
+        let _ = std::fs::remove_dir_all(&ov2);
     }
 
-    /// Task 5.1：非双拼方案（codetable）时，shuangpin_final_key 对任何键返回 false。
+    /// 对照：非双拼方案（codetable，未配 `input_chars`）码元集回落内置 `a-z`，
+    /// `;` 不得因为「别的方案用它作韵母」而变成码元——码元集是**方案级**的。
     #[test]
-    fn shuangpin_final_key_false_for_non_shuangpin() {
+    fn non_shuangpin_schema_keeps_default_alpha_charset() {
         use std::io::Write;
 
         let base_dir = std::env::temp_dir().join("wind_eng_sp_finalkey_ct_test");
@@ -4461,14 +4471,14 @@ input_chars = \"a-z;\"
         let mgr =
             EngineManager::with_store_override(&cfg, Some(&base_dir), None, Some(ov_dir.clone()));
 
-        // 非双拼方案，任何键均应返回 false
         assert!(
-            !mgr.shuangpin_final_key(b';'),
-            "codetable 方案 `;` 应返回 false"
+            !mgr.active_is_code_char(';'),
+            "codetable 方案未配 input_chars → `;` 不是码元"
         );
+        assert!(mgr.active_is_code_char('k'), "字母仍是码元（回落 a-z）");
         assert!(
-            !mgr.shuangpin_final_key(b'k'),
-            "codetable 方案 `k` 应返回 false"
+            mgr.active_input_chars().is_default_alpha(),
+            "未配 input_chars 的方案必须恰好回落内置 a-z"
         );
 
         let _ = std::fs::remove_dir_all(&base_dir);

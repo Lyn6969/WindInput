@@ -502,6 +502,13 @@ pub struct PinyinEngine {
     char_pinyin_idx: OnceLock<CharPinyinIndex>,
     /// 双拼转换器（None 表示全拼模式，输入原样传递）。
     shuangpin: Option<ShuangpinConverter>,
+    /// 双拼布局含非字母键时的码元字符集（如微软/搜狗/紫光的 `;` = ing）。
+    ///
+    /// 没有它，`;` 就不是码元 → 协调器的非字母码元闸门放行 → 键一路流到次选键 /
+    /// 模式引导键 / 标点流水线被吃掉，`ing` 韵母整个打不出来（引擎侧 `convert("n;")`
+    /// 明明返回 `ning`，故障只在分派层）。全拼与「布局全是字母」时为 `None`，
+    /// 协调器回落内置 `a-z`，与历史逐键等价。
+    input_chars: Option<wind_config::CodeCharSet>,
 }
 
 impl PinyinEngine {
@@ -518,6 +525,7 @@ impl PinyinEngine {
             store_layers: None,
             char_pinyin_idx: OnceLock::new(),
             shuangpin: None,
+            input_chars: None,
         }
     }
 
@@ -534,7 +542,11 @@ impl PinyinEngine {
     }
 
     /// 注入双拼转换器（链式 builder）。注入后 convert/compute_composition 均先把输入转为全拼。
+    ///
+    /// 码元字符集在此一并算定（见 [`Layout::code_char_set`]）：布局是引擎的构造参数，
+    /// 换布局＝重建引擎，故字段与引擎同生命周期，不会像按方案 id 缓存那样有失效时机问题。
     pub fn with_shuangpin(mut self, conv: ShuangpinConverter) -> Self {
+        self.input_chars = conv.layout().code_char_set();
         self.shuangpin = Some(conv);
         self
     }
@@ -1055,6 +1067,12 @@ fn build_raw_preedit(raw_input: &str, sp: &shuangpin::SpConvertResult) -> String
 }
 
 impl Engine for PinyinEngine {
+    /// 双拼布局带非字母键时返回该布局的码元集，否则 `None`（回落内置 `a-z`）。
+    /// 拼音没有「码表码元」那层配置，本集**完全由双拼布局推导**，不读 `[engine.codetable]`。
+    fn input_chars(&self) -> Option<&wind_config::CodeCharSet> {
+        self.input_chars.as_ref()
+    }
+
     fn convert(&self, input: &str, max_candidates: usize) -> anyhow::Result<ConvertResult> {
         if input.is_empty() {
             return Ok(ConvertResult::default());

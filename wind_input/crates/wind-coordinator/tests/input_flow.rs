@@ -6434,6 +6434,141 @@ fn test_shuangpin_backspace_restores_raw_keys() {
     );
 }
 
+// ---- 双拼：非字母韵母键（微软/搜狗/紫光的 `;` = ing）----
+
+/// 把内置 shuangpin 方案的布局换成指定 id（override 层，不动真实方案文件）。
+fn shuangpin_layout_override(tag: &str, layout: &str) -> PathBuf {
+    let dir = std::env::temp_dir().join(format!("wind_sp_layout_{tag}"));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+        dir.join("shuangpin.toml"),
+        format!("[engine.pinyin.shuangpin]\nlayout = \"{layout}\"\n"),
+    )
+    .unwrap();
+    dir
+}
+
+fn shuangpin_cfg() -> Config {
+    let mut cfg = Config::default();
+    cfg.schema.available = vec!["shuangpin".into()];
+    cfg.schema.active = "shuangpin".into();
+    cfg.input.default.chinese_mode = true;
+    cfg
+}
+
+/// 组码中的 `;` 必须作 **ing 韵母**进缓冲，而不是被次选键 / quick_mix 引导键 / 标点吃掉。
+///
+/// 这三条通路会**依次**拦这个键，缺一条没接就仍旧打不出——曾经的
+/// `is_shuangpin_final` 只跳过了选词分支，`y;` 的实际结果是「也」上屏 + 进快捷输入。
+/// 现由码元字符集在 `try_code_char_gate` 一处仲裁（拼音引擎的 `input_chars` 从布局推导）。
+#[test]
+fn test_shuangpin_symbol_final_enters_buffer() {
+    let d = data_dir();
+    if !d.join("schemas/shuangpin.schema.toml").exists() {
+        eprintln!("跳过：缺 shuangpin.schema.toml");
+        return;
+    }
+    let ov = shuangpin_layout_override("mspy_final", "mspy");
+    let coord =
+        Coordinator::new_headless_with_override(shuangpin_cfg(), Some(&d), Some(ov.clone()));
+
+    press_letter(&coord, 'y');
+    let act = press_char(&coord, ';');
+    // 组合区显示**原始击键**（双拼刻意如此，见 pinyin/mod.rs 的 Fix A：`hcma` 显示
+    // `hc'ma` 而非 `hao'ma`），故这里是 `y;` 不是 `ying`；`;` 真的进了缓冲的证据
+    // 是候选——转换成 ying 才查得到这些字。
+    assert_eq!(
+        action_text(&act).as_deref(),
+        Some("y;"),
+        "`;` 应作韵母进缓冲（组合区显示击键），而不是顶字上屏"
+    );
+    assert_eq!(
+        coord.debug_active_mode(),
+        None,
+        "不得被 quick_mix 引导键截走"
+    );
+    let page = coord.debug_page_texts();
+    assert!(
+        page.iter().any(|t| t == "应" || t == "英" || t == "影"),
+        "`y;` 须解成 ying 并给出其候选，实际={page:?}"
+    );
+
+    // 退格删的是那一个击键，回到 `y` 继续组合（不是把整串清掉、也不是删出半个音节）。
+    assert_eq!(
+        action_text(&tap(&coord, VK_BACK)).as_deref(),
+        Some("y"),
+        "退格应还原到 y"
+    );
+
+    // 多音节：`;` 须参与音节边界切分，`n;` + `ni` 显示为 `n;'ni`（击键 + 边界分隔符）。
+    // 单音节场景看不出边界有没有算对，这条才锁得住。
+    let coord_multi =
+        Coordinator::new_headless_with_override(shuangpin_cfg(), Some(&d), Some(ov.clone()));
+    press_letter(&coord_multi, 'n');
+    press_char(&coord_multi, ';');
+    press_letter(&coord_multi, 'n');
+    let act = press_letter(&coord_multi, 'i');
+    assert_eq!(
+        action_text(&act).as_deref(),
+        Some("n;'ni"),
+        "`;` 须参与音节边界（ning + ni），而不是被当成粘在串里的普通字符"
+    );
+
+    // Shift+`;` 是 `:`，不在码元集里 → 仍作标点（顶字上屏 + 全角冒号）。
+    let coord2 = Coordinator::new_headless_with_override(shuangpin_cfg(), Some(&d), Some(ov));
+    press_letter(&coord2, 'y');
+    let act = press_char(&coord2, ':');
+    let text = action_text(&act).unwrap_or_default();
+    assert!(
+        text.ends_with('：') || text.ends_with(':'),
+        "Shift+`;` 应作冒号标点，实际={text:?}"
+    );
+}
+
+/// 空缓冲下的 `;` **不归双拼**：它在布局里只作韵母（第二码），故不进首码集，
+/// quick_mix 引导键照常生效。这是「首码集是仲裁者」契约的另一半——
+/// 只接前半条（`;` 进全集）会让用户永远进不去快捷输入。
+#[test]
+fn test_shuangpin_symbol_final_yields_on_empty_buffer() {
+    let d = data_dir();
+    if !d.join("schemas/shuangpin.schema.toml").exists() {
+        eprintln!("跳过：缺 shuangpin.schema.toml");
+        return;
+    }
+    let ov = shuangpin_layout_override("mspy_lead", "mspy");
+    let coord = Coordinator::new_headless_with_override(shuangpin_cfg(), Some(&d), Some(ov));
+
+    press_char(&coord, ';');
+    assert_eq!(
+        coord.debug_active_mode(),
+        Some("mix"),
+        "空缓冲按 `;` 应进快捷输入（`;` 不是双拼首码）"
+    );
+}
+
+/// 反向对照：小鹤布局的键全是字母 → 码元集回落 `a-z`，`;` 仍是次选键。
+/// 没有这条，上面两个测试也可能被「无条件把 `;` 当码元」蒙混过去。
+#[test]
+fn test_shuangpin_alpha_only_layout_keeps_semicolon_as_select_key() {
+    let d = data_dir();
+    if !d.join("schemas/shuangpin.schema.toml").exists() {
+        eprintln!("跳过：缺 shuangpin.schema.toml");
+        return;
+    }
+    let ov = shuangpin_layout_override("xiaohe_sel", "xiaohe");
+    let coord = Coordinator::new_headless_with_override(shuangpin_cfg(), Some(&d), Some(ov));
+
+    type_str(&coord, "ni");
+    let second = coord.debug_page_texts().get(1).cloned();
+    let act = press_char(&coord, ';');
+    assert_eq!(
+        action_text(&act),
+        second,
+        "小鹤布局下 `;` 应仍选第 2 个候选，不得被当成码元累积"
+    );
+}
+
 // ---- overlay 模式的编码区光标 ----
 
 /// 临时英文：Shift+字母进入时缓冲已含首字母，光标须落其后（回归：曾因光标停在 0 而把

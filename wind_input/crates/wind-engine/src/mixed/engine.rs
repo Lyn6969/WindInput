@@ -637,6 +637,12 @@ impl Engine for MixedEngine {
     ///
     /// 只取 primary 是刻意的：`input_chars` 约束的是「哪些键进码表缓冲」，拼音次引擎
     /// 有自己的音节合法性判定，不受本集约束（对齐 `max_code_len` 同样只取 primary）。
+    ///
+    /// ⚠️ **已知边界**：拼音引擎现在也会产出码元集（双拼布局带非字母韵母键时，如微软
+    /// 双拼的 `;` = ing，见 `PinyinEngine::input_chars`），而次引擎的集在此被丢弃。
+    /// 内置混输方案的 `secondary_schema` 是全拼 `pinyin`，无影响；若有人把它指向双拼方案，
+    /// 那个 `;` 在混输下仍进不了缓冲。合并两侧的集须先想清「码表侧的非码元字符要不要因
+    /// 次引擎而放行」，不是加个并集就完事，故留待真有此需求时再定。
     fn input_chars(&self) -> Option<&wind_config::CodeCharSet> {
         self.primary.input_chars()
     }

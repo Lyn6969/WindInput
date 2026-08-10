@@ -2,7 +2,11 @@
 
 > **范围**（2026-08-05 拍板）：只做**码表引擎**的码元字符集，字符档位为
 > **字母子集 + ASCII 标点 + 数字**（如 `a-x`、`a-x/`、`a-z0-9`）。
-> 双拼符号（`;`）不在本设计内，它有自己的处理路径。
+>
+> **范围修订（2026-08-10）：双拼符号已并入本机制**。原判断「双拼符号有自己的处理路径」
+> 是错的——那条路径（`is_shuangpin_final`）只让韵母键跳过选词分支，下游没人接住它，
+> 键继续流向模式引导键与标点流水线，微软/搜狗/紫光双拼的 `;` = ing **从来就打不出**。
+> 现由 `PinyinEngine::input_chars()` 从双拼布局推导码元集，与码表走同一个闸门。见 §3.6。
 >
 > **数字是中途追加的**（用户实测需要打 `Win10`），追加时带一条关键约束：**数字不作第一码**。
 > 这条约束恰好让数字免于动 C++——见 §2.3。
@@ -263,6 +267,39 @@ Shift+字母临英、`z_key_action` 三条**不该**让位，而它们与要让�
 > 谁先谁赢就完全取决于代码顺序——而顺序往往是随手定的。这种地方必须显式写下仲裁规则，
 > 并且让规则由**用户可见的配置**表达（此处是 `leading_chars`），而不是藏在调用顺序里。
 
+### 3.6 拼音双拼的非字母韵母键（2026-08-10 并入）
+
+微软 / 搜狗 / 紫光双拼把 `;` 配成 `ing`（`data/schemas/shuangpin/*.toml` 的 `";" = ["ing"]`）。
+数据、`ShuangpinConverter::convert("n;") == "ning"`、专门的单元测试全都在，**用户照样打不出**——
+故障整个在按键分派层：`;` 不是码元，闸门放行，键接着被次选键 / `quick_mix` 引导键 /
+标点流水线依次接管。
+
+原有的 `is_shuangpin_final`（`coordinator.rs`，对齐 Go `IsShuangpinFinalKey`）只挡住了
+**三条里的第一条**：它让键跳过选词分支，却没有任何地方把它累积进缓冲。注释写的是
+「让该键作为编码输入累积」，实现只做到前半句——典型的半截修复，也是它长期没被发现的原因
+（看代码像是处理过了）。
+
+**做法**：`PinyinEngine::input_chars()` 从双拼布局推导码元集，与码表共用 `try_code_char_gate`：
+
+| 布局里的位置 | 归属 | 效果 |
+|---|---|---|
+| `finals` / `zero_pairs` 次字节（第二码） | 全集，**不进**首码集 | `y;` → ying；空缓冲 `;` 仍进快捷输入 |
+| `initials` / `zero_initials` / `zero_pairs` 首字节（第一码） | 全集 + 首码集 | 符号作声母键时可起头 |
+| 全是字母的布局（小鹤/自然码/abc/首道） | 返回 `None` | 回落 `a-z`，零回归 |
+
+判据是「这个键出现在**第几码**」而不是「是不是字母」——这让 §3.5 的首码集仲裁天然适用：
+`;` 恒为第二码 ⇒ 不进首码集 ⇒ 空缓冲归模式、组码中归码表，两个功能都完整。
+
+★ 副作用是**如实的**：双拼激活后 `;` 在组码中不再选第 2 候选（启动日志会照 §3.5 的分类
+报一条「仅作后续码」的冲突告警）。官方微软拼音同样如此——`;` 就是 ing 键。
+
+⚠️ **两处未覆盖**，都是既有边界、非本次引入：
+
+- **overlay 模式**（临拼 / 特殊模式 / mix）在 `handle_key_event` 的模式分派处整段接管，
+  早于 `try_code_char_gate`，码元集根本不参与。临拼目标若是双拼方案，其 `;` 仍打不出。
+- **混输次引擎**：`MixedEngine::input_chars` 只取 primary（见该处注释）。内置混输的
+  `secondary_schema` 是全拼，无影响。
+
 ---
 
 ## 4. 缓冲出口兼容性盘查清单
@@ -328,6 +365,14 @@ P1 是纯地基、可独立合入且**可证明零行为变化**：`input_flow` 
 - **端到端**：`a-x` 方案下 `y` 键行为（空缓冲 vs 组码中）；`a-x/` 方案下 `/` 在组码中作码元、空缓冲仍作引导键。
 - **反向对照**：每条「符号作码元」的用例都要配一条「同符号在空缓冲下仍是标点/引导键」的对照。
   只测正向会漏掉「闸门吃得过宽」这一整类缺陷。
+- **双拼（§3.6）**：`input_flow.rs` 的 `test_shuangpin_symbol_final_*` 三条 ——
+  组码中 `y;` → ying 候选 / 空缓冲 `;` 仍进快捷输入 / 小鹤布局下 `;` 仍是次选键。
+
+> ★ **测试的入口必须与用户的入口同层**。双拼 `;` 这个缺陷躲过了引擎侧一整套守卫：
+> `shuangpin_coverage.rs` 用反向枚举跑遍 7 方案 × 411 音节，`mspy_semicolon_final_e2e`
+> 专测 `convert("n;") == "ning"`——**全绿，而用户一个 ing 字都打不出**。
+> 因为它们的入口是引擎的 `convert(&str)`，用户的入口是 VK；中间整条按键分派链没有测试。
+> 判据：一个特性若要经过按键分派才生效，它至少需要一条**从 VK 出发**的集成测试。
 
 > ⚠️ **报「全量通过」前先读 `project_build_dev_data_missing`**：`build_dev/data` 缺失时，
 > 依赖真实词库的测试会**静默跳过、计数照常绿**，唯一判据是耗时。
@@ -339,7 +384,7 @@ P1 是纯地基、可独立合入且**可证明零行为变化**：`input_flow` 
 | 项 | 原因 |
 |---|---|
 | **数字作首码** | 一旦允许，C++ 吃键铁律的方向反转（空缓冲下数字不送 core），必须扩 C++ 吃键 + 新增 `CONFIG_KEY` 下发；且与数字选词、快捷输入数字透镜正面冲突。`leading_chars` 的默认用法（`input_chars = "a-z0-9"` + `leading_chars = "a-z"`）正是为了不踏进这里。 |
-| **双拼符号自定义** | 双拼有自己的处理路径（`;`），与按键分派优先级无关，混入会让本设计失焦。 |
+| ~~**双拼符号自定义**~~ | ~~双拼有自己的处理路径（`;`），与按键分派优先级无关~~ **已推翻并实施，见 §3.6**：那条「自己的处理路径」只挡了三条拦截里的一条，`;` = ing 从来打不出。它与按键分派优先级**正是**同一个问题。 |
 | **dict 层码元校验** | 设计稿 `config-schema.md:61` 提到「码表词条的合法码元据此校验」。但 `is_code_shape` 是**列序猜测**的启发式，把它改成校验器会牵动解析语义——**须 bump `PARSE_SEMANTICS_VERSION`**（`project_dict_column_layout_fix`）。独立议题。 |
 | **z-fallback 确定性化** | 红利明确但改动一条已稳定路径，见 §3.4 末。 |
 | **通用全字符集** | 冲突面最大，需要完整定义与选词/翻页/引导/标点的优先级契约。本设计的分层契约（§3.3）是它的前置。 |
@@ -355,6 +400,8 @@ P1 是纯地基、可独立合入且**可证明零行为变化**：`input_flow` 
 - `wind_input/crates/wind-engine/src/engine.rs`：`Engine::input_chars()`（默认 `None`）
 - `wind_input/crates/wind-engine/src/codetable/engine.rs`：`with_charset` + `input_chars()`
 - `wind_input/crates/wind-engine/src/mixed/engine.rs`：混输显式代理主码表子引擎
+- `wind_input/crates/wind-engine/src/pinyin/shuangpin.rs`：`Layout::code_char_set()`（双拼布局 → 码元集，§3.6）
+- `wind_input/crates/wind-engine/src/pinyin/mod.rs`：`PinyinEngine::input_chars()` + `with_shuangpin` 注入点
 - `wind_input/crates/wind-engine/src/manager.rs`：构建期注入 + `active_input_chars` / `active_is_code_char` / `active_is_leading_char`
 - `wind_input/crates/wind-coordinator/src/coordinator.rs`：`can_enter_buffer` / `reject_non_code_char` / `accumulate_code_char` / `try_code_char_gate` / `code_char_conflicts`
 - `wind_input/crates/wind-coordinator/tests/codetable_input_chars.rs`：15 条端到端用例

@@ -6219,29 +6219,28 @@ impl MessageHandler for Coordinator {
                 // 触发键优先级链（对齐 Go decideBufferedTrigger，缓冲非空/有候选时）：
                 if !shift {
                     // B/C. 二/三候选键 + 候选足够 → 选候选
-                    // 双拼韵母键避让：正在输入双拼（缓冲非空）且该键是当前布局的韵母键时，
-                    // 跳过选词分支，让该键作为编码输入累积（对齐 Go IsShuangpinFinalKey）。
-                    let is_shuangpin_final = !state.input_buffer.is_empty()
-                        && punct_char(data.key_code, false)
-                            .map(|c| self.engine_mgr.shuangpin_final_key(c as u8))
-                            .unwrap_or(false);
+                    //
+                    // ★ 双拼韵母键（微软/搜狗/紫光的 `;` = ing）**到不了这里**：它们已由
+                    // 上游的非字母码元闸门 `try_code_char_gate` 接管进缓冲。此处原有一段
+                    // `is_shuangpin_final` 局部避让，只做到「跳过选词」而没人接住那个键——
+                    // 它接着流到 D0 的模式引导键（`;` 出厂绑 quick_mix）和下方标点流水线，
+                    // 于是 `ing` 韵母仍旧打不出。三条拦截通路只挡了一条，是典型的半截修复。
+                    // 现由码元集单点仲裁（拼音引擎的 `input_chars` 从双拼布局推导）。
                     let mut select_overflow: Option<char> = None;
-                    if !is_shuangpin_final {
-                        if let Some(offset) = self.select_key_offset(data.key_code) {
-                            let (start, end) = self.page_range(&state);
-                            let idx = start + offset;
-                            if idx < end {
-                                let cand = state.candidates[idx].clone();
-                                return self.commit_selected(&mut state, &cand, offset as i32);
-                            }
-                            // E. 越界：记下触发键字符，延后到模式触发判定之后再按 overflow 策略处理
-                            // （对齐 Go decideBufferedTrigger——次/三选键越界时 overflow 排在
-                            // 模式激活之后，故 `;` 候选不足时优先进快捷输入而非 overflow）。
-                            // 仅在有 input session 时才标记越界；空缓冲+空候选（完全空闲态）
-                            // 应回落到下方普通标点流程，否则 ' / ; 在中文空闲模式下永远被吞。
-                            if !state.input_buffer.is_empty() || !state.candidates.is_empty() {
-                                select_overflow = punct_char(data.key_code, false);
-                            }
+                    if let Some(offset) = self.select_key_offset(data.key_code) {
+                        let (start, end) = self.page_range(&state);
+                        let idx = start + offset;
+                        if idx < end {
+                            let cand = state.candidates[idx].clone();
+                            return self.commit_selected(&mut state, &cand, offset as i32);
+                        }
+                        // E. 越界：记下触发键字符，延后到模式触发判定之后再按 overflow 策略处理
+                        // （对齐 Go decideBufferedTrigger——次/三选键越界时 overflow 排在
+                        // 模式激活之后，故 `;` 候选不足时优先进快捷输入而非 overflow）。
+                        // 仅在有 input session 时才标记越界；空缓冲+空候选（完全空闲态）
+                        // 应回落到下方普通标点流程，否则 ' / ; 在中文空闲模式下永远被吞。
+                        if !state.input_buffer.is_empty() || !state.candidates.is_empty() {
+                            select_overflow = punct_char(data.key_code, false);
                         }
                     }
                     // D0. 方案级按键功能表（`[key_actions]`）先于全局引导键裁决。

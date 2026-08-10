@@ -120,6 +120,69 @@ impl Layout {
     pub fn final_key_set(&self) -> std::collections::HashSet<u8> {
         self.finals.keys().copied().collect()
     }
+
+    /// 本布局的码元字符集：`a-z` + 布局用到的**非字母**键（微软/搜狗/紫光的 `;` = ing）。
+    /// 全是字母（小鹤/自然码/abc/首道）时返回 `None` —— 与内置默认 `a-z` 等价，
+    /// 让协调器走「默认集」快捷路径，零回归。
+    ///
+    /// ★ **首码集按「这个键出现在第几码」分**，不是「是不是字母」：
+    /// 声母 / 零声母引导键（`initials`、`zero_initials`、`zero_pairs` 的**首**字节）是第一码
+    /// → 进首码集；韵母键（`finals`、`zero_pairs` 的**次**字节）只能作第二码 → 不进。
+    /// 这正是 `;` 既能打 `ying` 又不夺走空缓冲下 `;` 的快捷输入引导键的原因
+    /// （见 `docs/design/codetable-input-chars.md`「首码集是仲裁者」）。
+    ///
+    /// 现有 7 个内置布局的第一码全是字母，故首码集实际恒为 `a-z`；按语义写而非硬编码，
+    /// 是为了让「哪天有布局把符号配成声母键」时不必再改这里。
+    pub fn code_char_set(&self) -> Option<wind_config::CodeCharSet> {
+        // 第一码键：声母 + 零声母引导（zero_pairs 的首字节）。
+        let leading_extra: Vec<u8> = self
+            .initials
+            .keys()
+            .chain(self.zero_initials.keys())
+            .copied()
+            .chain(self.zero_pairs.keys().map(|p| p[0]))
+            .filter(|k| !k.is_ascii_alphabetic())
+            .collect();
+        // 全集键：第一码 + 韵母（zero_pairs 的次字节同为第二码）。
+        let all_extra: Vec<u8> = self
+            .finals
+            .keys()
+            .copied()
+            .chain(self.zero_pairs.keys().map(|p| p[1]))
+            .filter(|k| !k.is_ascii_alphabetic())
+            .chain(leading_extra.iter().copied())
+            .collect();
+        if all_extra.is_empty() {
+            return None;
+        }
+        Some(wind_config::CodeCharSet::new(
+            &charset_spec(&all_extra),
+            &charset_spec(&leading_extra),
+            &format!("双拼布局 {}", self.id),
+        ))
+    }
+}
+
+/// 把一组非字母键拼成 `CodeCharSet` 规格串（`a-z` + 这些字面字符）。
+///
+/// ⚠️ **`-` 必须排在末位**：规格串里 `-` 只在首/末位才是字面，夹在中间会被当范围符
+/// （`"a-z-;"` → 解析 `z-;` → 端点逆序 → 整串解析失败 → 静默回落 `a-z`，
+/// 于是布局里的符号键一个都进不了缓冲，而错误只在日志里）。
+/// 非 ASCII / 不可打印键在此就地丢弃：它们过不了 `CodeCharSet::parse`，
+/// 留着会让**整串**失败，把同布局里合法的符号键一起拖下水。
+fn charset_spec(extra: &[u8]) -> String {
+    let mut keys: Vec<u8> = extra
+        .iter()
+        .copied()
+        .filter(|&k| k.is_ascii_graphic())
+        .collect();
+    keys.sort_unstable();
+    keys.dedup();
+    // `-` 置尾（见上）。
+    keys.sort_by_key(|&k| k == b'-');
+    let mut spec = String::from("a-z");
+    spec.extend(keys.into_iter().map(|k| k as char));
+    spec
 }
 
 // ============================================================================
@@ -661,6 +724,88 @@ k = ["ao"]
             sd.zero_of(b'a').is_empty(),
             "首道使用 zero_pairs 时 zero_initials 应为空"
         );
+    }
+
+    /// 7 个内置布局的码元集：只有 finals 里带 `;` 的三家产出非默认集，其余为 None。
+    ///
+    /// ⚠️ 这条断言是「`;` 能不能打出 ing」的**唯一**结构性守卫。布局 TOML 里写了
+    /// `";" = ["ing"]` 只是数据；数据要变成行为，必须经由本集告诉协调器「`;` 是码元」。
+    /// 引擎的 `convert("n;") == "ning"` 全绿而用户打不出，正是因为这段接线曾经不存在。
+    #[test]
+    fn builtin_layouts_code_char_set() {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../../data/schemas/shuangpin");
+        let load = |id: &str| Layout::from_toml(&dir.join(format!("{id}.toml"))).unwrap();
+
+        for id in ["mspy", "sogou", "ziguang"] {
+            let cs = load(id)
+                .code_char_set()
+                .unwrap_or_else(|| panic!("{id} 的 finals 含 `;`，应产出非默认码元集"));
+            assert!(cs.contains(';'), "{id}：`;` 应是码元");
+            assert!(
+                !cs.contains_leading(';'),
+                "{id}：`;` 是韵母（第二码），不得进首码集"
+            );
+            assert!(
+                cs.contains('a') && cs.contains_leading('a'),
+                "{id}：字母不受影响"
+            );
+            assert!(!cs.contains('['), "{id}：布局没用到的符号不得混入");
+            assert!(
+                cs.has_non_leading(),
+                "{id}：应存在「是码元但不能起头」的字符"
+            );
+        }
+
+        // 韵母键全是字母的布局 → None，协调器回落内置 a-z（零回归）。
+        for id in ["xiaohe", "ziranma", "abc", "shoudao"] {
+            assert!(
+                load(id).code_char_set().is_none(),
+                "{id} 的键全是字母，应回落默认集而非构造一份等价副本"
+            );
+        }
+    }
+
+    /// 非字母键出现在**第一码**（声母/零声母引导）时必须进首码集——判据是「第几码」，
+    /// 不是「是不是字母」。内置布局都没这么配，故只能构造布局来锁住这条语义。
+    #[test]
+    fn code_char_set_leading_follows_key_position() {
+        let t = r#"
+[meta]
+id = "x"
+name = "x"
+[initials]
+"/" = "zh"
+[finals]
+";" = ["ing"]
+"#;
+        let cs = Layout::from_str(t).unwrap().code_char_set().unwrap();
+        assert!(
+            cs.contains('/') && cs.contains_leading('/'),
+            "声母键应可起头"
+        );
+        assert!(
+            cs.contains(';') && !cs.contains_leading(';'),
+            "韵母键不可起头"
+        );
+    }
+
+    /// `-` 作码元键时必须排到规格串末位，否则 `"a-z-;"` 里的 `z-;` 被当范围符、
+    /// 端点逆序 → 整串解析失败 → 静默回落 `a-z`，同布局里合法的 `;` 一起失效。
+    #[test]
+    fn code_char_set_hyphen_key_does_not_break_spec() {
+        let t = r#"
+[meta]
+id = "x"
+name = "x"
+[finals]
+"-" = ["ang"]
+";" = ["ing"]
+"#;
+        let cs = Layout::from_str(t).unwrap().code_char_set().unwrap();
+        assert!(cs.contains('-'), "`-` 应是码元");
+        assert!(cs.contains(';'), "`;` 不得被 `-` 的解析失败连累");
+        assert!(cs.contains('a') && cs.contains('z'), "a-z 范围应完好");
     }
 
     #[test]
