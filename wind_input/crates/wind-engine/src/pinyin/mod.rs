@@ -106,6 +106,28 @@ use wind_dict::cached::CachedDict;
 /// ⚠️ `log_prob` 含各类惩罚/加成（`WORD_PENALTY`、单字罚、实词加成、模糊音罚…），故
 /// `exp(log_prob/n)` 不是严格的整句概率，`DICT_TOTAL` 实际充当**标定系数**。改那些惩罚
 /// 常数须重新标定。
+///
+/// ### ⚠️ 已知偏差：`/n` 会摊薄「局部特征」类惩罚（已评估决定不修）
+///
+/// 除以 n 的是**整个** `log_prob`，于是两类惩罚命运不同：
+///
+/// | 惩罚 | 与词数的关系 | 除以 n 后 |
+/// |---|---|---|
+/// | `WORD_PENALTY`(3.0/词)、单字罚、虚词加成 | 总量正比于 n | **恒定，不受影响** |
+/// | `AMBIGUOUS_PENALTY`(每个歧义接缝) | 与 n 无关 | **被摊薄** |
+/// | 模糊音罚(每个模糊音节) | 与 n 无关 | **被摊薄** `0.5^(k/n)` |
+///
+/// 即 5 词整句里 1 个模糊音节，惩罚从 `0.5` 稀释成 `0.5^0.2 ≈ 0.87` —— **长句里的模糊音
+/// 几乎免罚**，而候选层 [`fuzzy_penalized`] 对同一个概念扣的是 `0.5^k`，两处自相矛盾。
+///
+/// **不修的理由**：① 触发要同时满足「长整句 + 含模糊音 + 走得到 weight」，而长整句的
+/// `consumed_length` 恒最大、在比较链 ⓪ 就赢了；② 修法（把模糊惩罚从 `log_prob` 剥离、
+/// 归一化后按 `0.5^k` 重施）等于给「求平均」的映射开后门让某一项不参与平均，而
+/// `AMBIGUOUS_PENALTY` 同样被摊薄 —— 下次就得再开一个后门，规则边界无原则可依。
+///
+/// ⚠️ **什么现象出现时回来重新考虑**：真机上「长句里含模糊音的整句不该赢却赢了」，且该
+/// 场景确实走到了 weight 比较（与竞争者 `consumed_length` 相同）。
+/// 完整论证与参考实现对照见 `docs/design/sentence-weight-same-axis.md` §7。
 fn sentence_weight(log_prob: f64, word_count: usize) -> i32 {
     let n = word_count.max(1) as f64;
     let geometric_mean = log_prob / n + lattice::DICT_TOTAL.ln();

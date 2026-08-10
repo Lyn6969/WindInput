@@ -109,8 +109,11 @@ W_eff = max(1, round(exp(log_prob) × DICT_TOTAL))
 > 与 `si`→「是」压过「四」是同一个现象，只是发生在整句层。
 >
 > ⇒ **step 6.5 做的是结构性让位（模糊解读让位于精确解读），不是量级比较。** 任何比例折扣
-> 都替代不了它。librime 不需要这条补丁，是因为它的整句由 Poet 与词条同轴打分且有真正的
-> 语言模型 —— 我们没有。
+> 都替代不了它。
+>
+> ❌ 本文档一度写「librime 不需要这条补丁，是因为它的整句由 Poet 与词条同轴打分且有真正
+> 的语言模型 —— 我们没有」。**该说法已被源码推翻**：librime **有**等价物，而且比我们更硬
+> —— 有精确整词时它**压根不造句**。详见 §7.2。
 >
 > ⚠️ 谁再想拆 6.5 / 6.5b：先解决上面两条，且**必须开着模糊音跑探针** —— 6.5 的模糊那一半
 > 在默认配置下完全不可见，只跑默认配置会得到「零差异，可以拆」的错误结论。
@@ -252,3 +255,101 @@ w≤0 的 -10 惩罚。
 - 词频场景：`pinyin_sentence_flag.rs` 的 3 条（含锚定与位置提升）
 - ⚠️ `pinyin_eval` 走 `EngineManager`（引擎级），**测不到协调器排序**，不能作为本改动的
   唯一判据
+
+---
+
+## 7. 与参考实现的对照（2026-08-10 实读源码）
+
+源码位置：`../ref/weasel/librime/`、`../ref/fcitx5-android/lib/libime/`。
+本节是**核对过的事实**，不是印象；此前本文档基于印象的两处归因都被推翻了（§3.2、§4.3）。
+
+### 7.1 两个参考实现都有 Viterbi 整句
+
+| | 整句解码 | 位置 |
+|---|---|---|
+| librime | `Poet::MakeSentence`，states/Line 的 DP 路径搜索 | `gear/poet.cc` |
+| libime | Viterbi + beam search（`lattice` / `beamSize` / `setScore` / `setPrev`） | `core/decoder.cpp` |
+
+所以「整句解码」本身不是我们的特有设计，差异全在**整句分怎么与其它候选比较**。
+
+### 7.2 ★ librime 有 step 6.5 的等价物，而且做得更早更硬
+
+`gear/script_translator.cc:387`：
+
+```cpp
+// make sentences when there is no exact-matching phrase candidate
+bool has_at_least_two_syllables = syllable_graph.edges.size() >= 2;
+if (has_at_least_two_syllables &&
+    !has_exact_match_phrase(phrase_, phrase_iter_, consumed) &&
+    !has_exact_match_phrase(user_phrase_, user_phrase_iter_, consumed)) {
+  sentence_ = MakeSentence(dict, user_dict);
+}
+```
+
+**有精确整词时它根本不造句。** 我们的 step 6.5 是「造了再把 weight 降到 `max−1`」，
+意图完全相同，只是阶段不同（生成期 vs 排序期）。
+
+⇒ **6.5 不是「缺语言模型的权宜补偿」，是与 librime 同源的正当设计。** 它拆不掉是应该的。
+顺带：我们的做法比 librime **宽容**——整句降级后仍留在第 2 位可选，librime 那边直接没有。
+
+### 7.3 它们为什么不需要「量纲转换」
+
+**librime：词典权重在编译期就存成对数**（`dict/dict_compiler.cc:257`）：
+
+```cpp
+e->weight = log(r->weight > 0 ? r->weight : DBL_EPSILON);
+```
+
+于是词典候选 weight = `log(f)`、整句 weight = `Σ log(f_i)`（`poet.cc` 沿路径累加，
+`dictionary.cc:155` 把 `credibility` 也加进同一个域）——**两者天生同域，无需任何转换**。
+
+**libime：所有候选统一为「句子」**（`pinyin/pinyincontext.cpp:182`）：
+
+```cpp
+insertCandidate(nodeRange.front().toSentenceResult());   // 单词候选也转成 SentenceResult
+```
+
+`candidates_` 的类型就是 `std::vector<SentenceResult>`。既然只有一种东西，自然不存在
+跨类型比较。
+
+### 7.4 我们为什么不能照做
+
+`Candidate::weight` 是 **i32 线性词频，且是跨引擎的公共契约**（码表 / 拼音 / 英文 / 混输）。
+码表引擎没有「路径」概念，它的 weight 就是词库里那个数。统一到对数域的两条路都堵着：
+
+| 路线 | 阻塞点 |
+|---|---|
+| 全局改对数域 | 码表排序、IPC 协议、用户词库存储、设置页显示全要动 |
+| 只在拼音引擎内部统一（词典直查候选也走 `score_node`） | 撞混输：码表候选 weight 是词频、拼音候选变成对数映射值，两者又不可比（旧伤疤见 `mixed/engine.rs` 的 `PINYIN_TIER_SCALE`／100） |
+
+⇒ **几何平均那个映射不是随手选的近似，它是混合来源架构下唯一的公共尺度。**
+真要向参考实现靠拢，方向是 libime 的 `toSentenceResult()` 思路（候选生成统一成「路径」），
+那是架构级改动，前提是先解决混输的跨来源比较。
+
+### 7.5 几何平均的已知偏差：摊薄「局部特征」类惩罚
+
+`W_eff = exp(log_prob/n + ln T)` 把 `log_prob` **整体**除以 n，于是：
+
+| 惩罚 | 与词数的关系 | 除以 n 后 |
+|---|---|---|
+| `WORD_PENALTY`(3.0/词) | 总量 = 3n，正比于 n | **3，恒定 —— 不受影响** |
+| 单字罚 / 虚词加成 | 大致每词一次 | 基本不受影响 |
+| `AMBIGUOUS_PENALTY`(每个歧义接缝) | 与 n 无关 | **被摊薄** |
+| 模糊惩罚(每个模糊音节) | 与 n 无关 | **被摊薄** `0.5^(k/n)` |
+
+即：**每词恒定的惩罚正好不受影响**（总量正比于 n，除以 n 后还原），只有「局部特征」类
+被摊薄。后果举例：5 词整句里 1 个模糊音节，惩罚从 `0.5` 稀释成 `0.5^0.2 ≈ 0.87`，
+**长句里的模糊音几乎免罚**，而候选层同一个概念扣的是 `0.5^k` —— 两处自相矛盾。
+
+**已评估并决定不修**，理由：
+
+1. 触发条件苛刻：要同时满足「长整句 + 含模糊音 + 需要靠 weight 竞争」。而长整句的
+   `consumed_length` 恒最大，在协调器比较链 ⓪ 就赢了，**走不到 weight**。
+2. 修法（把模糊惩罚从 `log_prob` 剥离、归一化后再按 `0.5^k` 重施）是**给"求平均"的映射
+   开后门让某一项不参与平均**。`AMBIGUOUS_PENALTY` 同样被摊薄，下次就得再开一个后门 ——
+   规则的边界没有原则可依。
+3. 它**不会**让 6.5 变得可拆：`sixiang` 那类现场是单词/双词整句，`0.5^(k/n)` 与 `0.5^k`
+   差别极小甚至相同。
+
+⚠️ **什么现象出现时该回来重新考虑**：真机上出现「长句里含模糊音的整句不该赢却赢了」，
+且该场景确实走到了 weight 比较（即与竞争者 `consumed_length` 相同）。
