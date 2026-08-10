@@ -1552,6 +1552,78 @@ fn test_temp_pinyin_backtick_trigger_and_commit() {
     assert_eq!(action_text(&act).unwrap(), "a", "退出临时拼音后五笔应正常");
 }
 
+/// 回归：`` ` `` 与 z **同绑** `temp_pinyin` 时，用 `` ` `` 进临拼后按 z 必须累积拼音。
+///
+/// 缺陷形态：「进入键二次按下」那条分支的判据只问得出「这个键是不是**某个**临拼引导键」
+/// （临拼是全局单例、没有 special / mix 那样的实例 id），产出却取 `temp_pinyin_prefix`
+/// ——进入时按的那个键。两者不同源，于是按 z 被判成二次按下、上屏了进入键的 `·`，
+/// z 开头的拼音（zi / zuo / zhang）一个都打不出来。
+///
+/// 判据取「候选含 张」而非组合区文本：组合区 `` `z `` 在「z 入了拼音缓冲」与别的形态下
+/// 可能同形，只有真跑到拼音引擎才出得来汉字。
+#[test]
+fn test_temp_pinyin_other_trigger_key_letter_accumulates_pinyin() {
+    if !has_schemas() {
+        return;
+    }
+    let mut cfg = config_with("wubi86");
+    cfg.input.temp_pinyin.enabled = true;
+    // z 也绑临拼——与出厂已绑 backtick 的全局配置构成「两个键同绑同一动作」。
+    cfg.schema.codetable.z_key_action = "temp_pinyin".into();
+    let coord = Coordinator::new_headless(cfg, Some(&data_dir()));
+
+    let act = press_vk(&coord, 0xC0, false);
+    assert_eq!(
+        action_text(&act).as_deref(),
+        Some("`"),
+        "反引号应进入临时拼音"
+    );
+
+    let act = press_letter(&coord, 'z');
+    assert!(
+        !matches!(act, KeyAction::InsertText { .. }),
+        "临拼内按 z 不应上屏（曾被判成进入键二次按下、上屏 `·`），实际: {:?}",
+        act
+    );
+    assert_eq!(
+        coord.debug_active_mode(),
+        Some("temp_pinyin"),
+        "按 z 后应仍在临拼内"
+    );
+    for c in "hang".chars() {
+        press_letter(&coord, c);
+    }
+    let texts = coord.debug_page_texts();
+    assert!(
+        texts.iter().any(|t| t.contains("张")),
+        "临拼 zhang 候选应含 张，实际: {:?}",
+        texts
+    );
+}
+
+/// 反向对照：同一份「两个键同绑临拼」的配置下，按**进入用的那个键**照旧上屏中文标点并退出。
+/// 少了这条，上面那个测试把整条「二次按下」分支删掉也照样绿。
+#[test]
+fn test_temp_pinyin_own_trigger_key_still_commits_punct() {
+    if !has_schemas() {
+        return;
+    }
+    let mut cfg = config_with("wubi86");
+    cfg.input.temp_pinyin.enabled = true;
+    cfg.schema.codetable.z_key_action = "temp_pinyin".into();
+    let coord = Coordinator::new_headless(cfg, Some(&data_dir()));
+
+    press_vk(&coord, 0xC0, false); // 进入
+    match press_vk(&coord, 0xC0, false) {
+        // 二次按下
+        KeyAction::InsertText { text, .. } => {
+            assert!(!text.is_empty(), "二次按反引号应上屏标点");
+        }
+        other => panic!("二次按反引号应上屏标点并退出，实际: {:?}", other),
+    }
+    assert_eq!(coord.debug_active_mode(), None, "上屏标点后应已退出临拼");
+}
+
 #[test]
 fn test_temp_pinyin_commit_and_enter_with_candidates() {
     if !has_schemas() {

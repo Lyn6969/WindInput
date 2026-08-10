@@ -471,23 +471,30 @@ impl Coordinator {
         // 进入键二次按下（缓冲空 + 无已转换前缀）：按中英标点配置上屏该符号并退出。
         // 顺带武装智能符号：时限内再按同键即换英文形——否则这个键被模式占着，英文形没有通路
         // （空闲态一按就又进模式）。press2 的拦截在 try_activate_mode 开头，早于模式激活链。
+        //
+        // ★★ 上屏字符取**当前按键**，不取 `temp_pinyin_prefix`（进入时按的那个键）。
+        //
+        // 临拼是全局单例、没有 special / mix 那样的实例 id，判据只问得出「这个键是不是**某个**
+        // 临拼引导键」。而同绑是常态：全局 `backtick = "temp_pinyin"` 配上方案级
+        // `z_key_action = "temp_pinyin"`，`` ` `` 与 z 就互相认领了对方的身份。判据取当前键、
+        // 产出取进入键 ⇒ 用 `` ` `` 进临拼后按 z 被判成二次按下，上屏的却是 `·`，
+        // z 开头的拼音（zi / zuo / zhang）一个都打不出来。
+        //
+        // 改取当前键后，字母键被 `punct_char` 自然挡在门外（字母无标点形态），落下方字母臂
+        // 正常累积拼音；两个符号键同绑时也各自上屏自己的符号。至此与 special
+        // （`handle_special.rs`）、mix（`handle_mode.rs`）的同名分支完全同构——那两处正是靠
+        // 这道 `punct_char` 关卡才没暴露同一个缺陷。
         if state.temp_pinyin_buffer.is_empty()
             && state.committed_text.is_empty()
             && self.is_temp_pinyin_trigger(data.key_code)
+            && let Some(ch) = punct_char(data.key_code, data.modifiers & MOD_SHIFT != 0)
         {
-            let ch = state
-                .temp_pinyin_prefix
-                .chars()
-                .next()
-                .or_else(|| punct_char(data.key_code, data.modifiers & MOD_SHIFT != 0));
-            if let Some(ch) = ch {
-                let out = self.convert_punct_char(state, ch);
-                self.arm_smart_symbol_after_commit(state, ch, &out);
-                self.record_commit(&out, 0, -1, wind_store::stats::CommitSource::Punctuation);
-                self.exit_temp_pinyin(state);
-                self.notify_ui_hide();
-                return Self::commit_action(out, true);
-            }
+            let out = self.convert_punct_char(state, ch);
+            self.arm_smart_symbol_after_commit(state, ch, &out);
+            self.record_commit(&out, 0, -1, wind_store::stats::CommitSource::Punctuation);
+            self.exit_temp_pinyin(state);
+            self.notify_ui_hide();
+            return Self::commit_action(out, true);
         }
         match data.key_code {
             keymap::VK_ESCAPE => {
