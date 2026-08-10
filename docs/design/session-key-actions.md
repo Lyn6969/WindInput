@@ -1,0 +1,300 @@
+# 会话态按键功能表（`keys.session_actions`）
+
+> 目标：让「有输入会话时某个键干什么」成为一张可配置的表，与
+> [schema-key-actions.md](schema-key-actions.md) 的 `key_actions`（无会话态）构成完整的两层。
+>
+> 直接诉求有三个：**Tab 向下翻页**、**CapsLock 向上翻页**、**自定义清空键**（Esc 太远，
+> 想用 Tab）。但设计要能装下这一族后续需求——它们的共同点是「候选窗开着的时候按某个键」。
+>
+> 状态：**设计，未实施**。
+
+## 1. 为什么不是「再加两个配置项」
+
+现状是三套形状不同的机制并存，用户的三个诉求正好各落一套：
+
+| 机制 | 形状 | 触发态 | 加一个键的成本 |
+|---|---|---|---|
+| `keys.key_actions` + 方案级 `[key_actions]` | **键 → 动词**（Map，白名单值域） | 无会话 / 全局态 | 白名单一条 + dispatch 一臂 |
+| `NavKeys`（`keys.page_keys` / `highlight_keys`） | **组名 → 成对绑定**（StrList，组硬编码） | 有候选 | 改 `from_config` 加组 + 设置页加勾选项 |
+| 各 handler 里的裸 `match vk` | 硬编码 | 混杂 | 改 N 处 |
+
+第三类的规模：`VK_ESCAPE` 在协调器里**独立出现七处**（`coordinator.rs` 主路径、`handle_url`、
+`handle_temp` ×2、`handle_mode`、`handle_special`、`handle_addword`、`handle_menu`）——与
+[enter-behavior-clear-semantics.md](enter-behavior-clear-semantics.md) 记的「回车五条路径」
+同族：分发即 `return`，主路径的任何逻辑都不惠及其余。
+
+★ 一个功能「配置项散落」与「实现散落」通常是同一件事的两面：**Esc 有七个实现点，所以它
+至今没有任何配置项**——没人愿意接七次线。加配置项之前先收口，否则第八次接线还在等着。
+
+### 已有能力：Tab 翻页其实不用改内核
+
+`NavKeys::from_config`（`wind-keys/src/keymap.rs:112`）的 page 组已有 `shift_tab`：
+Tab → 下一页、Shift+Tab → 上一页。出厂默认把 Tab 给了高亮组
+（`data/config.toml:473`：`highlight_keys = ["arrows", "tab"]`）。
+
+把 `page_keys` 加 `"shift_tab"`、`highlight_keys` 去掉 `"tab"` 即达成诉求一。C++ 侧也通：
+Tab 在 `_IsSessionKey` 表里（`wind_tsf/include/KeyEventSink.h:225`），有会话时恒吃恒转发。
+**待确认的只是设置页有没有暴露 `shift_tab` 这个选项**（wind-setting 仓）。
+
+## 2. ★★ 状态归属判据（本文档最该留下来的一节）
+
+协调器里现存十三个会影响按键处理的状态。若按状态数决定表数，机制立刻失控。正确的做法是
+先分类，判据是**「用户是不是停留在这个处境里、反复按键、且有肌肉记忆」**：
+
+| 类 | 状态 | 判据来源 | 归属 |
+|---|---|---|---|
+| **A 闸门** | 密码框抑制 | `password_suppress` | **永不进表** |
+| | 英文模式 | `chinese_mode` | |
+| | 全角 / CapsLock ON | `IsFullWidth()` / `GetKeyState` | |
+| **B 有输入会话** | overlay 模式内 | `state.active: Option<ModeKind>` | **本表** |
+| | 有编码 / 有候选 | `input_buffer` / `candidates` | |
+| | 分步上屏中 | `committed_segs` 非空 | |
+| | 顶码待确认 | `top_commit_mode = pre_confirm` | |
+| **C 模态窗口** | 右键菜单 | `menu_open` → `forward_menu_key` | 不进表，**共享两个动词** |
+| | 快捷加词 | `add_word_active`（消费全部按键） | |
+| **D 瞬时武装** | 配对跳出待定 | `_pairPendingDepth > 0` | **永不进表** |
+| | 智能符号已武装 | `arm.armed` + 500ms | |
+| | 夺取回退已登记 | `Rewind{snapshot, host_text}` | |
+| | 检索范围已放宽 | `scope_relaxed` | |
+
+四条判据，逐条给出理由：
+
+- **A 闸门**回答的是「要不要走这条链」，不是「这个键干什么」。把闸门写成绑定，用户就得先
+  理解闸门才能预测键的行为。
+- **B 是一个状态，不是四个**。overlay 模式、有无候选、分步上屏、顶码待确认，全是「用户正在
+  组合一段输入」的子态。子态差异进**分发端**，不进**表结构**——见 §2.1。
+- **C 有自己的焦点与导航模型**，键位是窗口的属性而非输入法的属性。但它们与 B 共享
+  `cancel` / `confirm` 两个动词，这正是 Esc 散成七处的由来。
+- **D 是上一次按键的余波**，用户不在里面停留并决策。给它配键 = 让用户配一个自己感知不到
+  何时生效的键，配了必然报「时灵时不灵」。
+
+> ⚠️ D 类的危险在于它**看起来像**可配置项。`scope_relaxed`（末页再按翻页键 → 放宽检索范围）
+> 就是典型：它是翻页键的**第二语义**，属于 `page_next` 这个动词的实现细节，不是一个新绑定。
+> 做成配置项，用户就得先理解「什么时候算末页」才能预测这个键。
+
+### 2.1 ★ 状态维度进分发端，不进表结构
+
+`page_next` / `highlight_up` 只在有候选时有意义，但**不需要为此再开一张表**——在动词的消费点
+守一行 `if candidates.is_empty() { return None }` 即可（`apply_nav_key` 现在就是这么写的）。
+
+理由是成本的量纲：状态进表结构是**乘法**（3 状态 × 2 层 = 6 张表），进分发端是**加法**。
+这条判据决定了本设计**到此为止**——不会有第三张表。
+
+## 3. ★★★ 两表边界的真正立论：可达性是物理约束
+
+「插入点不同」只是逻辑理由。更硬的一条是：**C++ 的转发规则本来就把键分成了三个可达性区间**，
+两张表的边界与它重合，这不是巧合。
+
+| 通路 | 哪些键 | C++ 机制 | 转发条件 |
+|---|---|---|---|
+| ① 会话键 | Enter / Space / Backspace / Delete / **Esc / Tab** / 方向 / Home / End / PgUp / PgDn / 数字 | `_IsSessionKey`（`KeyEventSink.h:224-228`） | **有会话时免费转发**，无需注册 |
+| ② 可打印符号键 | `-` `=` `[` `]` `;` `'` `,` `.` | key_down 热键表 + `HOTKEY_POLICY_FORWARD_ONLY` | 须显式注册；无会话时放行给宿主 |
+| ③ 修饰键 / CapsLock | `lshift` `rshift` `lctrl` `rctrl` `capslock` | keyup 白名单（`IsKeyUpHotkey`） | 须显式注册，且只有 keyup |
+
+★ **`FORWARD_ONLY` 的闸门判据是 `hasComp || _hasCandidates`**（`KeyEventSink.cpp:341-343`）——
+C++ 侧**早已在用「有会话」这个判据**决定要不要把这批键交给引擎。第二张表沿用同一判据，
+两侧天然同构。
+
+这也解释了为什么 CapsLock 是三个诉求里唯一麻烦的：它**三个区间都不在**——不在 `_IsSessionKey`
+表里，keydown 在 `isToggleModeKey` 分支被吃掉且**从不发服务端**，只有 keyup 恒发。
+
+⇒ ★ 可复用判据：**以后再有某个键需要动 C++，一定是因为它落在这三个集合的缝隙里。**
+先查这三个集合，再决定要不要改 C++——而不是反过来先改再试。
+
+## 4. 第二张表的判据是「有会话」，不是「有候选」
+
+初版拟名 `candidate_actions`、判据取 `!candidates.is_empty()`。**否决**，三条理由：
+
+1. **诉求本身就要求放宽**。「Tab 清空」在打了码**没出候选**时更需要——而 `apply_nav_key`
+   第一行就是 `if state.candidates.is_empty() { return None; }`。
+2. **Esc 现在的实际判据就是「有会话」**，七处无一例外。表若用更窄的判据，收编 Esc 时会
+   悄悄改变它的行为。
+3. **跨进程判据必须同构**（§3）。那条「C++ 吃键集必须 ⊆ Rust 出字集」的不变量，只有两边
+   用同一判据才守得住；判据错位正是全角吃键翻转那次的病灶（`KeyEventSink.cpp` 里
+   `_HasInputSession` 的注释仍留着那次的教训：判据不一致会形成「吃了再吐」，严格 TSF 宿主
+   直接丢键）。
+
+故定名 **`keys.session_actions`**，判据 = `has_composition || has_candidates`，
+与 C++ 的 `_HasInputSession()` 一一对应。
+
+## 5. 配置形态与动词值域
+
+```toml
+[keys.session_actions]
+tab      = "page_next"
+capslock = "page_prev"
+# 或者：tab = "clear"
+```
+
+键名解析、白名单校验、`none` 哨兵三态，全部复用 `key_actions` 的既有实现
+（`is_supported_key_action` 那套）。**不做方案级**——翻页在哪个方案都是翻页，加一层合并
+与冲突检测是纯成本。同 schema-key-actions.md §2 判 A 类「方案级价值低」。
+
+动词按「它动的是什么」分三组：
+
+| 组 | 动词 | 来源 |
+|---|---|---|
+| 导航 | `page_prev` `page_next` `highlight_up` `highlight_down` | 收编 `NavAction` |
+| 选择 | `select_candidate:2` `select_candidate:3` `select_char:1` `select_char:2` | 收编 `select_key_groups` / `select_char_keys` |
+| 处置 | `clear` `cancel` `commit_raw` `commit_first` | 收编七处 Esc |
+| — | `none` | 禁用该键在本态的绑定 |
+
+## 6. 收编范围：哪些折算，哪些不折算
+
+| 现有配置 | 形状 | 折算 |
+|---|---|---|
+| `keys.page_keys` | 组名 StrList | ✅ |
+| `keys.highlight_keys` | 组名 StrList | ✅ |
+| `keys.select_key_groups` | 组名 StrList | ✅ |
+| `keys.select_char_keys` | 组名 StrList | ✅ |
+| `keys.overflow.*` | Enum ×3 | ❌ 见 §6.2 |
+| `input.enter_behavior` | Enum | ❌ 见 §6.1 |
+
+折算手法照抄 schema-key-actions.md 五c 的「四处 `trigger_keys` → `keys.key_actions`」，
+连同那条已经用血换来的教训：
+
+> ★★ **默认值必须留在被折算的那一侧。** 曾试图把默认值直接写进新表，被推翻：合并后
+> `page_keys = []` 与「从没配过」同形，折算跳过、默认绑定仍在 ⇒ **用户清空的意图丢失**。
+> 保持默认值在旧字段一侧则三种情况全对：没配过→折算出默认、改成别的键→折算出新值、
+> 清空→折算出空。
+
+### 6.1 ★★★ `input.enter_behavior` 为什么不折算成 Enter 的绑定
+
+表面上它就是「Enter 键做什么」，而表里恰好有 `clear` 动词，看起来是同一件事。**不是。**
+四条独立理由，每条单独成立：
+
+#### ① 判据：一组取值只对一个键有意义 ⇒ 它是那个键的参数，不是动词
+
+- `page_next` 能有意义地绑给 Tab / CapsLock / `=` / `.` → **动词**
+- `clear` 能有意义地绑给 Tab / Esc / `\` → **动词**
+- `commit` / `clear` / `commit_converted` 这一组，只有绑给 Enter 才成立 → **参数**
+
+关键区别不在动词名，在**形状**：
+
+| | 绑定表 | 策略参数 |
+|---|---|---|
+| 语义 | 「让这个键**也能**做 X」——加法 | 「这个角色**用哪种方式**履职」——在互斥全集里选一 |
+| 未声明时 | 落默认链 | 无「未声明」，恒有一个取值 |
+| `none` | 合法（禁用该键） | 不成立 |
+
+#### ② Enter 是最后的兜底出口，不能被 `none` 哨兵架空
+
+表的三态含「显式禁用」。用户写 `enter = "none"`，这一段输入就**没有上屏通路**了。这与
+enter-behavior-clear-semantics.md §「临时英文是唯一例外」记的死锁**同形**——那次是
+`space_as_input` + `clear` 两个开关叠加才归零，这次一步到位，连叠加都不需要。
+
+★ 绑定表的 `none` 语义对「兜底出口」类的键天然有害。识别方法：**问「这个键被禁用后，
+用户还有没有别的路完成同一件事」**。Tab 有（Esc 还在），Enter 没有。
+
+#### ③ 待办的第三种取值证明它是枚举
+
+enter-behavior-clear-semantics.md 已定：`commit_converted`（上屏已转换部分、丢弃剩余原码）
+**必须作为第三种取值扩展，不要在 `clear` 内部加分支**。三个取值互斥且穷尽「Enter 如何结束
+这一段」——这是枚举的形状。做成动词，则这三个动词只能绑给 Enter 一个键，而**一个只对单键
+有意义的动词集，本质就是那个键的参数**，绕了一圈回到原点，还多了一层。
+
+#### ④ 它有 per-mode 豁免，而绑定表没有「豁免」这个概念
+
+临英的 `clear` 只管空缓冲，非空缓冲一律照常上屏（`handle_temp.rs` 那条被反转过一次的决策）。
+作为策略参数，「临英对该策略有豁免」是可文档化的正常事；作为绑定，就变成「这个键配了在
+某模式下不生效」——那正是最难排查的一类（`bound_action_yield_reason` 那五个同形成因就是
+为此而生）。
+
+#### ★★ 但实现层必须合并：配置不合并 ≠ 代码不合并
+
+`clear` 动词的消费点与 `enter_behavior = "clear"` **必须走同一个函数**（把
+`enter_clears_composition()` 推广成 `clear_composition_action()`）。否则「Tab 清空」与
+「Enter 清空」会在**丢不丢 `committed_text`** 上慢慢漂移——而那已经拍过板（clear 一并丢弃，
+与主输入路径一致）。
+
+> ★★★ 提炼：**配置层按「这是绑定还是参数」分家；实现层按「最终做同一件事吗」合并。**
+> 两个维度独立，不要用其中一个推另一个。参照 schema-key-actions.md §4.2.1 记的那次
+> 「两处读同一概念却取值不同」——那里的结论是**先问它们是不是在回答同一个问题**，
+> 两个对齐方向各被真机推翻一次。本节要防的是它的镜像：**不该合的配置硬合**。
+
+#### 边界：表里出现 `enter` 键名怎么办
+
+**显式拒绝并 `warn`**，不静默忽略。理由同 `is_supported_key_action` 白名单：静默忽略与
+「配了没生效」完全同形，用户无从分辨自己拼错了还是功能坏了。
+
+#### 对照组：Space **可以**进表
+
+Space 也有一个 `input.space_on_empty_behavior`，但它管的是**空缓冲**时的处置，而「空格翻页」
+这类诉求是**有会话**时的绑定——两者作用域不重叠，可以共存。
+
+★ 所以判据不是「凡带 `behavior` 后缀的都不折算」，而是**作用域是否正面撞车 + 是否枚举形状**。
+`enter_behavior` 的两个取值都在有会话时起作用，与表正面撞车；`space_on_empty_behavior` 不撞。
+
+### 6.2 `keys.overflow.*` 同理不折算
+
+它回答的是「这个动作**失败**时怎么办」（数字键 / 二三候选键 / 以词定字键超界），是动词的
+**失败策略**，与绑定正交。硬并进去会让表里混进一个维度不同的东西。
+
+`input.numpad_behavior`（follow_main / direct）、`input.top_commit_mode` 同族，都留在原处。
+
+★ 这四个加上 `enter_behavior` 构成一整族「某键/某类键在某情形下的处置策略」。**只折算其中
+一个，表里就混进了异类；全折算，表就退化成配置总汇**，失去「键 → 动词」的单一语义。
+
+## 7. CapsLock：本设计唯一的 C++ 改动
+
+现状（`KeyEventSink.cpp`）：
+
+- **keydown**：仅在 `isToggleModeKey` 时被吃（`*pfEaten = TRUE` 直接 return），**从不发服务端**。
+- **keyup**：恒发，带 `KEYMOD_CAPSLOCK`；非切换键时或上 `0x8000` 标记「仅状态通知」。
+
+作翻页键的通路只能是 **keyup**，与修饰键同族（三条独立理由见 schema-key-actions.md §4.4：
+keydown 不能吃 / `Ctrl+A` 误触发 / 宿主对按住的键重复发 keydown）。
+
+⚠️ **keydown 必须在有会话时吃掉**，否则每翻一页大小写锁定翻转一次。判据现成：C++ 侧
+`_hasCandidates` 成员已存在，用 §4 的 `hasComp || _hasCandidates` 与其它路径同口径。
+
+⚠️ 守住不变量：**C++ 吃键集必须 ⊆ Rust 出字集**。吃了
+CapsLock keydown 就必须保证 Rust 侧在该状态下确实产出，否则键凭空消失。
+
+★ 这是唯一的跨进程环节，也**必须真机验证**：单测只能证明 hash 进了集合，证明不了 TSF
+拿到集合后真的转发。schema-key-actions.md 四期在这里栽过一次（绑定写进配置了，但键没进
+`key_up_tsf_hashes()`，配置躺着永不触发）。
+
+## 8. 三条实施约束
+
+1. **`printable` 标志不能在收编时丢**。`-` `=` `[` `]` `,` `.` 作导航键时，在临英 / 快捷输入
+   里必须回落成输入字符——这就是 `NavKeys::classify(..., include_printable)` 那个参数的由来
+   （`wind-keys/src/keymap.rs:135-147`）。换成 Map 表达后要有等价物，否则临英里打不出减号。
+2. **三个调用点都要接**。`apply_nav_key` 现有三处调用：主路径（`coordinator.rs:5938`）、
+   `handle_mix_key`（`handle_mode.rs:1649`）、`handle_candidate_nav_key`
+   （`handle_candidate.rs:1743`）。只接主路径的表现是「快捷输入里 Tab 不翻页」——本仓
+   「一个能力有多条通路、闸门必须每条都接」已反复栽过，混输上屏那组通路栽了四次。
+3. **模态窗口只共享两个动词**。菜单 / 快捷加词的 `cancel` / `confirm` 跟随本表绑定（用户
+   改了「Tab = 取消」，在加词小窗里也该是 Tab），**导航键不跟随**——那是窗口自己的模型。
+   这条边界要在实施前定死，别留给临场判断。
+
+## 9. 分期
+
+| 期 | 内容 | 交付 |
+|---|---|---|
+| 一 | 建 `keys.session_actions`；`page_keys` / `highlight_keys` 折算；CapsLock keyup 通路（含 C++ 那处） | 三个诉求里的两个翻页需求可用；Esc 一行不动 |
+| 二 | `clear` / `cancel` 动词 + 七处 Esc 收敛为单点查表 | 「Tab 清空」；此后同类需求零成本 |
+| 三 | `select_key_groups` / `select_char_keys` 折算 | 二三候选键、以词定字键可自由改绑 |
+| 四 | 设置页改造（wind-setting 仓） | 不必手改 config.toml |
+
+一期不碰 Esc：它是七处硬编码，风险与收益都在二期，而用户现在等的是翻页。
+
+## 10. 测试陷阱
+
+- ★★ **每个模式的用例必须先断言「确实进了该模式」**。七处 Esc 的返回值很可能都是
+  `ClearComposition`——触发键没生效、按键落回主输入路径，测试照样绿。这与
+  enter-behavior-clear-semantics.md 记的假绿**同形**，那次是靠把判据临时改成 `false && …`
+  做回退验证才逼出来的（四个 clear 测试须全挂、对照组须仍过）。
+- ★ **对照组不可删**：没有 commit 模式的对照，无法区分「配置生效」与「该模式本来就不上屏」。
+- ⚠️ **跑测试前先确认 `build_dev/data` 存在**。`input_flow.rs` 全部用例以
+  `if !has_schemas() { return; }` 开头，缺数据时全部静默跳过、计数照绿。判据是耗时：
+  假绿 0.0x s，真跑约 1.6 s。缺数据时先跑 `scripts/dev.ps1 gd`。
+- ⚠️ CapsLock 那条**单测覆盖不到**（跨进程）。真机清单至少含：有候选时按 CapsLock 翻页且
+  大小写锁定状态不变、无候选时 CapsLock 仍正常切大小写、配了 `toggle_mode_keys = ["capslock"]`
+  的用户升级后行为不变。
+
+## 11. 相关文档
+
+- [schema-key-actions.md](schema-key-actions.md) —— 第一张表（无会话态），本表的形态来源
+- [enter-behavior-clear-semantics.md](enter-behavior-clear-semantics.md) —— §6.1 的论据来源
+- [../redesign/key-pipeline.md](../redesign/key-pipeline.md) —— S5「按钮自定义」的原始预留
