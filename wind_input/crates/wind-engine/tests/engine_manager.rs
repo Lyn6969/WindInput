@@ -750,3 +750,149 @@ fn sentence_function_word_not_penalized_as_fragment() {
             .collect::<Vec<_>>()
     );
 }
+
+// ───────────────────── 批量出码（纯词列表导入）─────────────────────
+//
+// 批量入口存在的唯一理由是把「读方案」提到循环外：`read_schema` 无缓存，每次调用都要
+// 读盘 + 解析 TOML + 合并 override，逐词调 `encode_word` 在万级词表上会退化成万次文件
+// 解析。既然是为性能分出的第二条路，就必须证明它与原路**结果完全一致**——否则单条加词
+// 与批量导入会给同一个词出两种码，词库里留下打不出来的条目。
+
+/// 批量与逐个必须逐位相同。这是批量入口的正当性所在：它只改准备时机，不改规则。
+#[test]
+fn encode_words_matches_encode_word_one_by_one() {
+    let dir = data_dir();
+    if !schema_exists(&dir, "wubi86") {
+        eprintln!("跳过：wubi86 schema 不存在");
+        return;
+    }
+    let mgr = EngineManager::new(&make_config(&["wubi86"]), Some(&dir));
+    let words = ["中国", "计算机", "输入法", "人工智能", "王", "深度学习"];
+
+    let batch = mgr.encode_words("wubi86", &words);
+    let one_by_one: Vec<String> = words
+        .iter()
+        .map(|w| mgr.encode_word("wubi86", w).unwrap_or_default())
+        .collect();
+
+    assert_eq!(batch.len(), words.len(), "必须与入参同序等长");
+    assert_eq!(
+        batch, one_by_one,
+        "批量与逐个出码必须逐位一致，否则加词与导入会给同一个词两种码"
+    );
+    assert!(
+        batch.iter().any(|c| !c.is_empty()),
+        "真实 wubi86 词库下不该整批都出不了码（说明 fixture 或取码链路坏了）"
+    );
+}
+
+/// 出不了码的位置回**空串占位**，不是跳过——调用方靠下标把码配回词，
+/// 少一个元素会让其后所有词错位配到别人的码上，静默写进词库。
+#[test]
+fn encode_words_keeps_position_for_unencodable() {
+    let dir = data_dir();
+    if !schema_exists(&dir, "wubi86") {
+        eprintln!("跳过：wubi86 schema 不存在");
+        return;
+    }
+    let mgr = EngineManager::new(&make_config(&["wubi86"]), Some(&dir));
+    // 中间那个是拉丁字母，码表里必然取不到码。
+    let words = ["中国", "abc", "输入法"];
+    let codes = mgr.encode_words("wubi86", &words);
+
+    assert_eq!(codes.len(), 3, "失败项必须占位，长度不能缩水");
+    assert!(codes[1].is_empty(), "取不到码的位置应为空串");
+    assert_eq!(
+        codes[0],
+        mgr.encode_word("wubi86", "中国").unwrap_or_default(),
+        "前面的词不受影响"
+    );
+    assert_eq!(
+        codes[2],
+        mgr.encode_word("wubi86", "输入法").unwrap_or_default(),
+        "失败项之后的词不能错位"
+    );
+}
+
+#[test]
+fn encode_words_handles_empty_input() {
+    let dir = data_dir();
+    let mgr = EngineManager::new(&make_config(&["wubi86"]), Some(&dir));
+    assert!(mgr.encode_words("wubi86", &[]).is_empty());
+    // 方案不存在时也要同序等长（全空串），不能 panic 或返回空 Vec。
+    assert_eq!(
+        mgr.encode_words("no_such_schema", &["中国", "计算机"])
+            .len(),
+        2
+    );
+}
+
+/// 拼音侧同理：批量只把引擎句柄的获取提到循环外，产出必须与逐个一致。
+#[test]
+fn generate_words_pinyin_matches_one_by_one() {
+    let dir = data_dir();
+    if !schema_exists(&dir, "pinyin")
+        || !dir.join("schemas/pinyin/cn_dicts/base.dict.yaml").exists()
+    {
+        eprintln!("跳过：pinyin schema/词库不存在");
+        return;
+    }
+    let mgr = EngineManager::new(&make_config(&["pinyin"]), Some(&dir));
+    let texts = ["中国", "计算机", "银行", "重复"];
+
+    let batch = mgr.generate_words_pinyin("pinyin", &texts);
+    let one_by_one: Vec<Option<String>> = texts
+        .iter()
+        .map(|t| mgr.generate_word_pinyin("pinyin", t))
+        .collect();
+
+    assert_eq!(batch.len(), texts.len(), "必须与入参同序等长");
+    assert_eq!(batch, one_by_one, "批量与逐个生成必须逐位一致");
+}
+
+/// 批量入口的**存在理由**本身的对照：批量必须显著快于逐个。
+///
+/// 默认 `#[ignore]`（性能数字随机器波动，不适合当门禁），需要时手动跑：
+/// `cargo test -p wind-engine --test engine_manager encode_words_batch_is_faster -- --ignored --nocapture`
+///
+/// 若有人日后把 `encode_words` 改回内部循环调用 `encode_word`，这个对照会立刻塌回 1x ——
+/// 那正是本入口要防的退化（`read_schema` 无缓存，逐词调用 = 逐词读盘解析 TOML）。
+#[test]
+#[ignore]
+fn encode_words_batch_is_faster_than_one_by_one() {
+    let dir = data_dir();
+    if !schema_exists(&dir, "wubi86") {
+        eprintln!("跳过：wubi86 schema 不存在");
+        return;
+    }
+    let mgr = EngineManager::new(&make_config(&["wubi86"]), Some(&dir));
+    let base = ["中国", "计算机", "输入法", "人工智能", "深度学习"];
+    let words: Vec<&str> = base.iter().cycle().take(1000).copied().collect();
+
+    // 预热：首次调用要建单字全码表（有缓存），不让它计入任一侧。
+    let _ = mgr.encode_words("wubi86", &base);
+
+    let t0 = std::time::Instant::now();
+    let batch = mgr.encode_words("wubi86", &words);
+    let batch_ms = t0.elapsed();
+
+    let t1 = std::time::Instant::now();
+    let one_by_one: Vec<String> = words
+        .iter()
+        .map(|w| mgr.encode_word("wubi86", w).unwrap_or_default())
+        .collect();
+    let loop_ms = t1.elapsed();
+
+    assert_eq!(batch, one_by_one, "快也必须给出相同结果");
+    println!(
+        "1000 词：批量 {:?} / 逐个 {:?} → {:.1}x",
+        batch_ms,
+        loop_ms,
+        loop_ms.as_secs_f64() / batch_ms.as_secs_f64().max(1e-9)
+    );
+    assert!(
+        batch_ms * 5 < loop_ms,
+        "批量应至少快 5 倍（实测 批量 {batch_ms:?} vs 逐个 {loop_ms:?}）——\
+         若接近 1x，多半是批量实现退化成了内部逐词调用 encode_word"
+    );
+}

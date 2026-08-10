@@ -723,6 +723,48 @@ impl EngineManager {
         encoder::calc_word_code(word, &spec, |c| codes.get(&c).cloned())
     }
 
+    /// 批量版 [`Self::encode_word`]：规则完全一致，但**方案只读一次**。
+    ///
+    /// 分出这个入口不是锦上添花：`read_schema` 没有缓存，每次调用都要读盘、解析 TOML、
+    /// 合并 override 层。逐词调 `encode_word` 在万级词表上就退化成万次文件解析，
+    /// 而单字全码表（`single_char_full_codes`）本身是带缓存的，真正的热点只有前者。
+    ///
+    /// 返回与 `words` **同序等长**；取不到码的位置为空串——调用方靠下标把码配回词，
+    /// 跳过失败项会让其后所有词错位配到别人的码上。
+    pub fn encode_words(&self, schema_id: &str, words: &[&str]) -> Vec<String> {
+        let spec = Self::read_schema(
+            schema_id,
+            self.data_dir.as_deref(),
+            self.override_dir.as_deref(),
+        )
+        .and_then(|s| s.encoder)
+        .unwrap_or_default();
+        let codes = self.single_char_full_codes(schema_id);
+        let mut failed = 0usize;
+        let out: Vec<String> = words
+            .iter()
+            .map(
+                |w| match encoder::calc_word_code(w, &spec, |c| codes.get(&c).cloned()) {
+                    Ok(code) => code,
+                    Err(_) => {
+                        failed += 1;
+                        String::new()
+                    }
+                },
+            )
+            .collect();
+        // 逐条打日志在万级批量下反而淹没有用信息，只汇总一行。
+        if failed > 0 {
+            tracing::debug!(
+                "encode_words({}): {}/{} 个词取不到码",
+                schema_id,
+                failed,
+                words.len()
+            );
+        }
+        out
+    }
+
     /// 解析主码表方案 id:config 显式指定优先;否则取 available 中首个 codetable 类型方案;都无返回空。
     fn resolve_primary_codetable(
         cfg_primary: &str,
@@ -2304,6 +2346,29 @@ impl EngineManager {
             .get(schema_id)
             .cloned()?;
         engine.generate_word_pinyin(text)
+    }
+
+    /// 批量版 [`Self::generate_word_pinyin`]：引擎句柄只取一次（`ensure_loaded` +
+    /// 一次 `engines` 加锁），其余与逐个调用等价。
+    ///
+    /// 返回与 `texts` **同序等长**；生成不出的位置为 None，由调用方决定回退还是留空。
+    pub fn generate_words_pinyin(&self, schema_id: &str, texts: &[&str]) -> Vec<Option<String>> {
+        if !self.ensure_loaded(schema_id) {
+            return vec![None; texts.len()];
+        }
+        let engine = self
+            .engines
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(schema_id)
+            .cloned();
+        let Some(engine) = engine else {
+            return vec![None; texts.len()];
+        };
+        texts
+            .iter()
+            .map(|t| engine.generate_word_pinyin(t))
+            .collect()
     }
 
     // ───────────────────────── 词典加载 ─────────────────────────

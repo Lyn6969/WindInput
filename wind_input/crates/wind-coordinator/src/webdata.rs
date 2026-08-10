@@ -217,6 +217,8 @@ impl Coordinator {
             "dict.stats" => self.web_dict_stats(),
             // 加词自动出码：按方案类型选拼音/五笔规则（reverse 反查表）。
             "dict.encode" => self.web_dict_encode(params),
+            // 批量出码：纯词列表导入按批调用（设置端每批约 1000 词）。
+            "dict.encodeWords" => self.web_dict_encode_words(params),
             "dict.genPinyin" => {
                 // 取码要按**真实文本**算：转义形态里的 `\` `n` 会被当成两个待取码的字符。
                 let text = str_param(params, "text")?;
@@ -1162,38 +1164,69 @@ impl Coordinator {
     fn web_dict_encode(&self, params: &Value) -> anyhow::Result<Value> {
         let schema = str_param(params, "schemaId")?;
         // 同 dict.genPinyin：取码基于真实文本，不能拿转义形态去逐字反查。
-        let text = &store_text(str_param(params, "text")?);
-        // 拼音类方案出拼音码；其余（码表）按方案 [[encoder.rules]] 出词组码。
+        let text = store_text(str_param(params, "text")?);
+        let code = self
+            .encode_texts(schema, std::slice::from_ref(&text))
+            .into_iter()
+            .next()
+            .unwrap_or_default();
+        Ok(json!(code))
+    }
+
+    /// 批量出码（纯词列表导入）。规则与 `dict.encode` 完全一致——两者共用
+    /// [`Self::encode_texts`]，避免两条出码口径各自漂移。
+    ///
+    /// 契约：`codes` 与入参 `texts` **同序等长**，出不了码的位置为空串。
+    /// 调用方靠下标把码配回词，跳过失败项会让其后所有词错位配到别人的码上。
+    /// 故非字符串元素也要占位（按空串处理），不能 filter 掉。
+    fn web_dict_encode_words(&self, params: &Value) -> anyhow::Result<Value> {
+        let schema = str_param(params, "schemaId")?;
+        let texts: Vec<String> = params
+            .get("texts")
+            .and_then(|v| v.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .map(|x| store_text(x.as_str().unwrap_or("")))
+                    .collect()
+            })
+            .unwrap_or_default();
+        Ok(json!({ "codes": self.encode_texts(schema, &texts) }))
+    }
+
+    /// 出码统一入口：拼音类方案出拼音码，其余（码表）按方案 `[[encoder.rules]]` 出词组码。
+    /// 返回与 `texts` 同序等长，失败位置为空串。
+    ///
+    /// 一次性准备（读方案 / 取引擎句柄）都在这一层之下完成，故传一个词与传一万个词
+    /// 的固定开销相同——`dict.encode` 走单元素切片没有额外代价。
+    fn encode_texts(&self, schema: &str, texts: &[String]) -> Vec<String> {
+        if texts.is_empty() {
+            return Vec::new();
+        }
+        let refs: Vec<&str> = texts.iter().map(|s| s.as_str()).collect();
         let is_pinyin = self
             .engine_mgr
             .schema_engine_type(schema)
             .map(|t| t == "pinyin")
             .unwrap_or(false);
-        let code = if is_pinyin {
-            // 优先词级消歧（多音字按词典权重），引擎无果时回退逐字反查表。
-            // 本 RPC 只回 code 给 UI（契约为裸字符串），边界丢弃——入库时由 web_dict_add
-            // 的 infer_boundary_for 按「手输码 == 推导码」重新取回。
-            let reverse = self.reverse.read().unwrap_or_else(|e| e.into_inner());
-            // 直接回**带空格的音节码**，让用户看清拼音词库的音节格式（与 word_item 同形）。
-            // 安全前提：UI 会把它回填进编码框再提交，而写入侧 normalize_add_code 会拆回
-            // 扁平 key，并把用户打的空格当作**显式声明的切分**采信（优先于推断兜底）。
-            // 逐字反查表回退**同样**以空格分隔（每字一音节，`gen_pinyin` 以 `.join(" ")`
-            // 收尾），故两条路出来的都是同形的音节码，本 RPC 无需再做区分。
-            self.engine_mgr
-                .generate_word_pinyin(schema, text)
-                .unwrap_or_else(|| reverse.gen_pinyin(text))
-        } else {
+        if !is_pinyin {
             // 与自动造词/快捷加词同一取码入口（码源=码表词库自身，规则=方案声明的公式）。
             // 原走 wubi_word_code：拆字表码源 + 硬编码五笔 86 规则，未配拆字的方案恒空、
             // 非五笔方案静默出错。见 docs/design/codetable-auto-phrase.md §2「码源统一」。
-            self.engine_mgr
-                .encode_word(schema, text)
-                .unwrap_or_else(|e| {
-                    tracing::debug!("dict.encode: 取码失败（{}）: {}", text, e);
-                    String::new()
-                })
-        };
-        Ok(json!(code))
+            return self.engine_mgr.encode_words(schema, &refs);
+        }
+        // 优先词级消歧（多音字按词典权重），引擎无果时回退逐字反查表。
+        // 回的是**带空格的音节码**，让用户看清拼音词库的音节格式（与 word_item 同形）。
+        // 安全前提：写入侧 normalize_add_code 会拆回扁平 key，并把空格当作**显式声明的
+        // 切分**采信。逐字反查表回退同样以空格分隔（`gen_pinyin` 以 `.join(" ")` 收尾），
+        // 故两条路出来的都是同形的音节码，无需再做区分。
+        let generated = self.engine_mgr.generate_words_pinyin(schema, &refs);
+        // 反查表的读锁在循环外取一次：逐词加锁在万级批量上纯属浪费。
+        let reverse = self.reverse.read().unwrap_or_else(|e| e.into_inner());
+        generated
+            .into_iter()
+            .zip(&refs)
+            .map(|(code, text)| code.unwrap_or_else(|| reverse.gen_pinyin(text)))
+            .collect()
     }
 
     /// 为词语生成拼音码：优先用拼音引擎词级消歧（活跃方案→"pinyin"方案），
