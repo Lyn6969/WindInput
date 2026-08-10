@@ -53,6 +53,16 @@ public:
     // Returns true if the key matches a KeyUp hotkey in the whitelist
     BOOL IsKeyUpHotkey(uint32_t keyHash) const;
 
+    // 该 keyup 键**只有会话语义**（keys.session_actions 里的绑定），没有 toggle 语义。
+    //
+    // 用途只有一个：CapsLock 的 keydown 该不该吃。配成 toggle_mode_keys 时恒吃（那是它
+    // 本来的契约——专职切中英文、不再切大小写）；只配成会话态绑定（如打字时翻页）时，
+    // 无会话必须放行，否则用户在**任何时候**都切不动大小写锁定，而他只是想让它在打字时翻页。
+    //
+    // 两者都配时按 toggle 语义（恒吃）——toggle 要求 keydown 一定被吃，会话语义只是条件吃，
+    // 取严格的那个才不会让 toggle 静默失效。
+    BOOL IsKeyUpSessionOnlyHotkey(uint32_t keyHash) const;
+
     // Check if a virtual key is a toggle mode key (Shift/Ctrl for mode switch)
     // This is a fallback that works even without hotkey whitelist sync
     static BOOL IsToggleModeKeyByVK(WPARAM vk);
@@ -118,4 +128,10 @@ private:
 
     // Hotkey whitelist (KeyUp triggered - for toggle mode keys)
     std::unordered_set<uint32_t> _keyUpHotkeys;
+
+    // keyup 登记按语义再分两个正交子集（都已剥 policy 位，与 _keyUpHotkeys 同 key）：
+    // 带 SESSION 位的进 _keyUpSession（keys.session_actions 的绑定），其余进 _keyUpNonSession
+    // （toggle_mode / select_candidate / schema_bound）。同一个键可能两边都有。
+    std::unordered_set<uint32_t> _keyUpSession;
+    std::unordered_set<uint32_t> _keyUpNonSession;
 };

@@ -457,6 +457,25 @@ STDAPI CKeyEventSink::OnTestKeyDown(ITfContext* pContext, WPARAM wParam, LPARAM 
     if (isToggleModeKey)
     {
         BOOL hasSession = _pTextService->HasActiveComposition() || _hasCandidates;
+        // ★ CapsLock 只配了**会话态绑定**（keys.session_actions，如「打字时翻页」）而没配成
+        // toggle_mode_keys 时：无候选必须放行，让系统照常翻转大写锁定。吃掉 keydown 会让
+        // 大小写在**任何时候**都切不动，而用户只是想给它在打字时加一个用途。
+        //
+        // ⚠ 判据用 `_hasCandidates` 而**不是** hasSession —— 必须与服务端 `apply_nav_key`
+        // 的守卫逐字一致。宽一格（有 composition 无候选时也吃）的后果不是「多吃一次」：
+        // 服务端那边不翻页，会落回 CapsLock 的状态同步分支去 take_input_on_mode_switch，
+        // 用户看到的是「大小写没变、正在打的编码却没了」。二期给本表加 clear/cancel 动词、
+        // 服务端守卫放宽到「有编码或有候选」时，**这里要同步放宽**。
+        if (wParam == VK_CAPITAL && !_hasCandidates && pHotkeyMgr != nullptr
+            && pHotkeyMgr->IsKeyUpSessionOnlyHotkey(keyUpHash))
+        {
+            *pfEaten = FALSE;
+            _LogKeyDecision(L"test_down", _pTextService->GetFocusSessionId(), wParam, modifiers,
+                            HotkeyType::ToggleMode, _pTextService->IsChineseMode(),
+                            _pTextService->HasActiveComposition(), _hasCandidates, hasSession, FALSE,
+                            L"capslock_session_only_no_candidates");
+            return S_OK;
+        }
         BOOL hasTextCtx = _pTextService->RefreshTextInputContext();
         WIND_LOG_DEBUG_FMT(L"compat.toggle_key test_down: vk=0x%02X resolvedVK=0x%02X mods=0x%04X hasSession=%d hasTextCtx=%d",
             (uint32_t)wParam, resolvedVK, modifiers, (int)hasSession, (int)hasTextCtx);
@@ -872,6 +891,20 @@ STDAPI CKeyEventSink::OnKeyDown(ITfContext* pContext, WPARAM wParam, LPARAM lPar
         // CapsLock has its own special handling in OnKeyUp, don't set pending here
         if (wParam == VK_CAPITAL)
         {
+            // 与 OnTestKeyDown 的同名判据**必须逐条一致**：那边放行、这边吃就是「吃了再吐」，
+            // 严格 TSF 宿主会直接丢键。详细理由（含为什么用 _hasCandidates 而非 hasSession）
+            // 见 OnTestKeyDown 里 capslock_session_only_no_candidates 那段。
+            if (!_hasCandidates && pHotkeyMgr != nullptr
+                && pHotkeyMgr->IsKeyUpSessionOnlyHotkey(keyUpHash))
+            {
+                *pfEaten = FALSE;
+                _LogKeyDecision(L"down", _pTextService->GetFocusSessionId(), wParam, modifiers,
+                                HotkeyType::ToggleMode, _pTextService->IsChineseMode(),
+                                _pTextService->HasActiveComposition(), _hasCandidates,
+                                _HasInputSession(), FALSE,
+                                L"capslock_session_only_no_candidates");
+                return S_OK;
+            }
             // Just consume the KeyDown, let OnKeyUp handle it
             _pTextService->NoteCapsLockKeyActivity(); // 供 OPENCLOSE 联动噪声抑制
             *pfEaten = TRUE;
@@ -1421,7 +1454,13 @@ STDAPI CKeyEventSink::OnKeyUp(ITfContext* pContext, WPARAM wParam, LPARAM lParam
         uint32_t keyHash = CHotkeyManager::CalcKeyHash(KEYMOD_CAPSLOCK, VK_CAPITAL);
 
         // Check if CapsLock is configured as toggle key (for Chinese/English switching)
-        BOOL isConfiguredAsToggle = (pHotkeyMgr != nullptr && pHotkeyMgr->IsKeyUpHotkey(keyHash));
+        //
+        // ⚠ 必须排掉「只有会话语义」的登记：`keys.session_actions` 里的 CapsLock 绑定同样
+        // 落在 _keyUpHotkeys 里（那是转发白名单，两类语义共用），但它不是切中英文的配置。
+        // 不排会让「只配了 CapsLock 打字时翻页」的用户丢掉 0x8000 状态通知标记，服务端
+        // 收到的就成了「这是一次模式切换请求」。
+        BOOL isConfiguredAsToggle = (pHotkeyMgr != nullptr && pHotkeyMgr->IsKeyUpHotkey(keyHash)
+                                     && !pHotkeyMgr->IsKeyUpSessionOnlyHotkey(keyHash));
 
         // Get current Caps Lock state
         BOOL capsLockOn = (GetKeyState(VK_CAPITAL) & 0x0001) != 0;

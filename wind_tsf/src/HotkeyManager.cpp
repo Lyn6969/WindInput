@@ -20,6 +20,8 @@ void CHotkeyManager::UpdateHotkeys(const std::vector<uint32_t>& keyDownHotkeys,
     _globalHotkeys.clear();
     _keyDownForwardOnly.clear();
     _keyUpHotkeys.clear();
+    _keyUpSession.clear();
+    _keyUpNonSession.clear();
 
     // Add KeyDown hotkeys — 按 policy 位分流到三个 set
     for (uint32_t hash : keyDownHotkeys)
@@ -50,9 +52,23 @@ void CHotkeyManager::UpdateHotkeys(const std::vector<uint32_t>& keyDownHotkeys,
     }
 
     // Add KeyUp hotkeys (for toggle mode keys like Shift, Ctrl, CapsLock)
+    //
+    // ⚠ 必须剥 policy 位：查询侧（IsKeyUpHotkey）传的是 CalcKeyHash 算出的裸 hash。
+    // keyup 侧原本不剥，是因为当时所有 keyup 登记都不带 policy 位；`keys.session_actions`
+    // 的绑定带 SESSION 位，不剥就会静默查不到——现象是「CapsLock 绑定配了没反应」，
+    // 而这类失配没有任何报错。
     for (uint32_t hash : keyUpHotkeys)
     {
-        _keyUpHotkeys.insert(hash);
+        uint32_t rawHash = hash & ~HOTKEY_POLICY_MASK;
+        _keyUpHotkeys.insert(rawHash);
+        if (hash & HOTKEY_POLICY_SESSION)
+        {
+            _keyUpSession.insert(rawHash);
+        }
+        else
+        {
+            _keyUpNonSession.insert(rawHash);
+        }
     }
 
     LogConfig();
@@ -81,6 +97,14 @@ BOOL CHotkeyManager::IsKeyDownForwardOnlyHotkey(uint32_t keyHash) const
 BOOL CHotkeyManager::IsKeyUpHotkey(uint32_t keyHash) const
 {
     return _keyUpHotkeys.find(keyHash) != _keyUpHotkeys.end();
+}
+
+BOOL CHotkeyManager::IsKeyUpSessionOnlyHotkey(uint32_t keyHash) const
+{
+    // 「只有会话语义」＝ 在 session 子集里，且不在 non-session 子集里。
+    // 两者都有时返回 FALSE（按 toggle 语义恒吃），理由见头文件声明处。
+    return _keyUpSession.find(keyHash) != _keyUpSession.end()
+        && _keyUpNonSession.find(keyHash) == _keyUpNonSession.end();
 }
 
 // Static method: Check if a virtual key is a toggle mode key
