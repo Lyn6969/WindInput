@@ -324,28 +324,31 @@ impl Toolbar {
 
     /// 设置工具栏位置（启动恢复持久化位置 / 运行期跟随焦点换屏）。
     ///
-    /// **隐藏期间不钳制**，原样存下交给 `render`：钳制要拿工具栏尺寸比对工作区边界，而
-    /// 首次渲染前 `window.size()` 还是 `create` 时的占位值 160×40。启动序列恰好命中这一点
-    /// ——位置在 `init_toolbar_pos` 下发，朝向要到其后的 `apply_ui_config` 才下发，且
-    /// `set_vertical` 隐藏期间不重排，于是纵条会被按 160 宽钳制：贴右保存的坐标被判越界，
-    /// 拉回 `工作区右边界 - 160`，重启后凭空左移 100+px（y 方向 40 高不越界，故只横向偏）。
-    /// `render` 里那次钳制用的是刚 `resize` 出来的真实尺寸，是唯一可信的时机。
+    /// **只登记原始坐标，一律不在这里钳制**——钳制要拿工具栏尺寸比对工作区边界，而这一刻
+    /// 尺寸不可信，且**钳制有损不可逆**：错误尺寸钳出来的坐标一旦写回，正确值就永远回不来。
+    /// 两个时机都会踩到：
     ///
-    /// 不做 alpha 恢复与计时重置：协调器的换屏下发**紧接着**就是 `UpdateToolbar`，
-    /// 而 `render` 末尾以 alpha=255 提交并 `on_shown`，两件事都在那里发生。
+    /// - **启动**：窗口以 `create` 的占位尺寸 160×40 起步，位置在 `init_toolbar_pos` 下发、
+    ///   朝向要到其后的 `apply_ui_config` 才下发，且 `set_vertical` 隐藏期间不重排。纵条
+    ///   于是被按 160 宽钳制，贴右保存的坐标被判越界拉回 `右边界-160`，重启后左移 100+px。
+    /// - **跨 DPI 换屏**：`window.size()` 还是**上一块屏** DPI 下的尺寸（`ensure_scale` 要到
+    ///   随后的 `render` 才跑）。真机实测：右屏 100% 的纵条 48×212 贴死右下角存 (2512,1156)，
+    ///   切到 133% 的左屏再切回来时按 64×282 钳，被拉到 (2496,1086)——左移 16、上移 70，
+    ///   且因为结果写回了 `mouse.pos`，之后用正确尺寸重钳也已不越界，位置永久走样。
     ///
-    /// ⚠️ `window.show` 受 `visible` 门控：对隐藏中的工具栏只记坐标不显形，否则会绕过
-    /// `toolbar_gate` 的显示迟滞（同 `set_vertical` 的约束）。
+    /// 落点与钳制统一由 `render` 做：那里 `ensure_scale` 已按目标屏定好 scale、`resize`
+    /// 也已按当前朝向排完版，`w`/`h` 才是真值。数值本体见 `sys::clamp_rect_tests`。
+    ///
+    /// 不做 alpha 恢复与计时重置：`render` 末尾以 alpha=255 提交并 `on_shown`。
+    ///
+    /// ⚠️ `repaint` 受 `visible` 门控：`render` 末尾无条件 `show`，对隐藏中的工具栏调用会把
+    /// 它显形，绕过 `toolbar_gate` 的显示迟滞（同 `set_vertical` 的约束）。
     pub fn set_pos(&mut self, x: i32, y: i32) {
         // 显式位置优先于待落的角落请求，否则 render 会拿 pending 覆盖掉这次设定。
         self.pending_corner = None;
+        self.mouse.borrow_mut().pos = Some((x, y));
         if self.visible {
-            let (w, h) = self.window.size();
-            let (cx, cy) = clamp_to_work_area(x, y, w, h);
-            self.mouse.borrow_mut().pos = Some((cx, cy));
-            self.window.show(cx, cy);
-        } else {
-            self.mouse.borrow_mut().pos = Some((x, y));
+            self.repaint();
         }
     }
 

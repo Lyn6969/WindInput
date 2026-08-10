@@ -210,9 +210,46 @@ fn clamp_content_in_bounds(
     (nx - ml, ny - mt)
 }
 
+/// [`clamp_to_work_area`] 的纯几何内核：把 `w×h` 的窗口钳进 `bounds`，返回窗口左上。
+///
+/// `bounds` = 工作区 (left, top, right, bottom)。抽出来是为了可测——真正要锁住的性质是
+/// **钳制有损且不可逆**：拿错误的 `w/h` 钳一次，正确坐标就再也回不来了（见本模块测试
+/// `stale_size_destroys_a_flush_corner_position`）。
+fn clamp_rect_in_bounds(
+    x: i32,
+    y: i32,
+    w: u32,
+    h: u32,
+    bounds: (i32, i32, i32, i32),
+) -> (i32, i32) {
+    let (bl, bt, br, bb) = bounds;
+    let (wi, hi) = (w as i32, h as i32);
+    let mut nx = x;
+    let mut ny = y;
+    // 先按右/下回拉，再按左/上兜底：窗口比工作区还大时保证左上角可见。
+    if nx + wi > br {
+        nx = br - wi;
+    }
+    if ny + hi > bb {
+        ny = bb - hi;
+    }
+    if nx < bl {
+        nx = bl;
+    }
+    if ny < bt {
+        ny = bt;
+    }
+    (nx, ny)
+}
+
 /// 将 (x,y,w,h) 钳制到所在（或最近）显示器工作区内，保证窗口完整可见。
 /// 用于拖动窗口时防止拖出桌面/拖入任务栏，以及切换显示器 / 远程连接后旧坐标落到屏外时拉回。
 /// 多显示器下 `MonitorFromPoint(NEAREST)` 会随光标过界切到目标显示器。
+///
+/// ⚠️ **`w`/`h` 必须是当前真实尺寸**。本函数无从校验传入的尺寸是否属于目标屏，而错误尺寸
+/// 会把本来合法的坐标钳走且**无法复原**——跨 DPI 换屏时若用上一块屏的尺寸钳新屏的记忆
+/// 位置，贴边位置就会被永久拉离边缘。调用方须确保此刻已按目标屏排版（见
+/// `Toolbar::set_pos` 的文档）。
 // 非 Windows 下无显示器工作区查询，w/h 仅 Windows 分支使用。
 #[cfg_attr(not(windows), allow(unused_variables))]
 pub fn clamp_to_work_area(x: i32, y: i32, w: u32, h: u32) -> (i32, i32) {
@@ -230,26 +267,75 @@ pub fn clamp_to_work_area(x: i32, y: i32, w: u32, h: u32) -> (i32, i32) {
             };
             if GetMonitorInfoW(mon, &mut mi).as_bool() {
                 let wa = mi.rcWork;
-                let (wi, hi) = (w as i32, h as i32);
-                let mut nx = x;
-                let mut ny = y;
-                if nx + wi > wa.right {
-                    nx = wa.right - wi;
-                }
-                if ny + hi > wa.bottom {
-                    ny = wa.bottom - hi;
-                }
-                if nx < wa.left {
-                    nx = wa.left;
-                }
-                if ny < wa.top {
-                    ny = wa.top;
-                }
-                return (nx, ny);
+                return clamp_rect_in_bounds(x, y, w, h, (wa.left, wa.top, wa.right, wa.bottom));
             }
         }
     }
     (x, y)
+}
+
+#[cfg(test)]
+mod clamp_rect_tests {
+    use super::clamp_rect_in_bounds;
+
+    /// 真机日志（2026-08-10）里的两块屏：右屏 100%、左屏约 133%，工具栏纵向。
+    /// 右屏工作区右下 (2560, 1368)，纵条 48×212，用户拖到贴死右下角 → 存 (2512, 1156)。
+    /// 左屏工作区右下 (0, 1704)，同一条在该屏 DPI 下是 64×282。
+    const RIGHT_SCREEN: (i32, i32, i32, i32) = (0, 0, 2560, 1368);
+    const FLUSH_POS: (i32, i32) = (2512, 1156);
+    const SIZE_ON_RIGHT: (u32, u32) = (48, 212);
+    const SIZE_ON_LEFT: (u32, u32) = (64, 282);
+
+    /// 用**目标屏**的尺寸钳贴边位置：恰好不越界，原样保留。
+    /// 边界是闭合的 —— `x + w == right` 不算越界，否则贴边永远保不住。
+    #[test]
+    fn flush_corner_survives_clamp_with_correct_size() {
+        let got = clamp_rect_in_bounds(
+            FLUSH_POS.0,
+            FLUSH_POS.1,
+            SIZE_ON_RIGHT.0,
+            SIZE_ON_RIGHT.1,
+            RIGHT_SCREEN,
+        );
+        assert_eq!(got, FLUSH_POS, "贴边位置不该被钳走");
+    }
+
+    /// 回归：用**上一块屏**的尺寸钳，会把贴边位置永久拉离边缘。
+    ///
+    /// 这是「从左屏切回右屏后位置不再贴边」的算术本体：`2512+64=2576 > 2560` → 2496；
+    /// `1156+282=1438 > 1368` → 1086。左移 16、上移 70，与用户实测一致。
+    /// 关键在于**结果会被写回记忆位置**，而钳制不可逆——随后即便用正确尺寸重钳，
+    /// (2496,1086) 也已不越界，原值再也回不来。故调用方必须保证尺寸属于目标屏。
+    #[test]
+    fn stale_size_destroys_a_flush_corner_position() {
+        let damaged = clamp_rect_in_bounds(
+            FLUSH_POS.0,
+            FLUSH_POS.1,
+            SIZE_ON_LEFT.0,
+            SIZE_ON_LEFT.1,
+            RIGHT_SCREEN,
+        );
+        assert_eq!(damaged, (2496, 1086));
+
+        // 不可逆：拿正确尺寸再钳一次也救不回来。
+        let rechecked = clamp_rect_in_bounds(
+            damaged.0,
+            damaged.1,
+            SIZE_ON_RIGHT.0,
+            SIZE_ON_RIGHT.1,
+            RIGHT_SCREEN,
+        );
+        assert_eq!(rechecked, damaged, "钳制有损，第二次钳不会复原");
+        assert_ne!(rechecked, FLUSH_POS);
+    }
+
+    /// 左屏工作区右边界为 0（屏在主屏左侧，坐标为负）：贴边位置同样必须保住。
+    #[test]
+    fn flush_corner_survives_on_negative_coordinate_monitor() {
+        let left_screen = (-2048, 0, 0, 1704);
+        let got = clamp_rect_in_bounds(-64, 1422, SIZE_ON_LEFT.0, SIZE_ON_LEFT.1, left_screen);
+        assert_eq!(got, (-64, 1422));
+    }
 }
 
 #[cfg(test)]
