@@ -134,6 +134,7 @@ impl Coordinator {
             MenuCmd::ToggleInputDiagnostics => self.toggle_input_diag_hud(),
             MenuCmd::TogglePasswordSuppress => self.toggle_password_suppress(),
             MenuCmd::FirstShowMode(m) => self.set_first_show_mode(m),
+            MenuCmd::AutoPairRule(m) => self.set_auto_pair_rule(m),
             MenuCmd::InitialMode(m) => self.set_initial_state_rule(false, m),
             MenuCmd::InitialPunct(m) => self.set_initial_state_rule(true, m),
             MenuCmd::StatusToggleAlways => self.status_toggle_always(),
@@ -546,6 +547,58 @@ impl Coordinator {
         self.show_status();
     }
 
+    /// 为当前焦点应用设置符号自动配对开关，并写入用户层 compat.toml。
+    /// `mode_id`：0=跟随全局（清除规则）1=启用 2=禁用。
+    ///
+    /// 前三步与 [`Self::set_first_show_mode`] 完全同构，缺一不可，理由见那里的注释。
+    /// **第四步是本项特有**：还要把英文配对配置重推给 DLL——纯英文模式的配对由 C++ 侧
+    /// `_englishPairEngine` 独立处理，它只认握手/配置变更时推过去的那份值。不重推的症状是
+    /// 「中文模式关掉了，切到英文又配上了」，且要等下次重连才好，极难归因。
+    pub(crate) fn set_auto_pair_rule(&self, mode_id: u8) {
+        let enabled = match mode_id {
+            1 => Some(true),
+            2 => Some(false),
+            _ => None,
+        };
+        let name = self.active_process_name();
+        if name.is_empty() {
+            tracing::warn!("set_auto_pair_rule: 当前焦点进程未知，忽略本次设置");
+            return;
+        }
+        let Some(user_dir) = self.compat_dirs.1.clone() else {
+            tracing::warn!("set_auto_pair_rule: 无用户配置目录，无法持久化");
+            return;
+        };
+        if let Err(e) = wind_config::app_compat::set_user_auto_pair(&user_dir, &name, enabled) {
+            tracing::error!("set_auto_pair_rule: 写用户 compat.toml 失败: {e}");
+            return;
+        }
+        // 2）重载整表（系统层 + 用户层），与启动时同一口径。
+        let reloaded = wind_config::app_compat::AppCompat::load(
+            self.compat_dirs.0.as_deref(),
+            Some(user_dir.as_path()),
+        );
+        *self.app_compat.lock().unwrap_or_else(|e| e.into_inner()) = reloaded;
+        #[cfg(windows)]
+        self.sync_host_render_whitelist();
+        // 3）当前应用立即生效（同 pid 时 `update_active_compat` 提前 return，不会自己刷）。
+        self.active_compat
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .auto_pair = enabled;
+        // 4）重推英文配对配置：逐客户端按各自 PID 现算，本进程拿到新值、别的进程不受影响。
+        self.push_english_pair_config(0);
+        tracing::info!(
+            "符号自动配对 for process={name}: {}",
+            match enabled {
+                Some(true) => "启用",
+                Some(false) => "禁用",
+                None => "跟随全局",
+            }
+        );
+        self.show_status();
+    }
+
     /// 为当前焦点应用设置初始中英状态（`is_punct=false`）或初始标点（`is_punct=true`），
     /// 并写入用户层 compat.toml。`mode_id`：0=跟随全局（清除规则）1=英文 2=中文。
     ///
@@ -919,6 +972,11 @@ impl Coordinator {
                 .first_show_mode;
             let cur_mode = self.rule_initial_mode(&proc);
             let cur_punct = self.rule_initial_punct(&proc);
+            let cur_auto_pair = self
+                .active_compat
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .auto_pair;
             let header = if enabled {
                 proc.clone()
             } else {
@@ -963,6 +1021,32 @@ impl Coordinator {
                             cmd(MenuCmd::FirstShowMode(2)),
                             enabled,
                             cur_first_show == F::Instant,
+                        ),
+                    ],
+                ),
+                // 「跟随全局」同样必须是独立一档（理由见上面 `tri`）。禁用一档主要给表格类
+                // 宿主：Excel / WPS 表格「输入态」下方向键 = 确认单元格并移动，配对后的
+                // 光标回退在那里无法实现，关掉配对是唯一可行的兼容策略。
+                M::submenu(
+                    "符号自动配对",
+                    vec![
+                        M::leaf(
+                            "跟随全局",
+                            cmd(MenuCmd::AutoPairRule(0)),
+                            enabled,
+                            cur_auto_pair.is_none(),
+                        ),
+                        M::leaf(
+                            "启用",
+                            cmd(MenuCmd::AutoPairRule(1)),
+                            enabled,
+                            cur_auto_pair == Some(true),
+                        ),
+                        M::leaf(
+                            "禁用",
+                            cmd(MenuCmd::AutoPairRule(2)),
+                            enabled,
+                            cur_auto_pair == Some(false),
                         ),
                     ],
                 ),

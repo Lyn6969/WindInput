@@ -307,6 +307,12 @@ pub enum MenuCmd {
     /// 为当前焦点应用设置初始中英标点（compat.toml 的 initial_punct）。
     /// 参数同 [`MenuCmd::InitialMode`]。
     InitialPunct(u8),
+    /// 为当前焦点应用设置符号自动配对开关（compat.toml 的 auto_pair）。
+    /// 参数：0=跟随全局（清除规则）1=启用 2=禁用。
+    ///
+    /// 「禁用」主要给表格类宿主用：Excel / WPS 表格在「输入态」下把方向键解释成
+    /// 「确认单元格并移动」，配对后的光标回退无法实现（TSF 路线已实测失败）。
+    AutoPairRule(u8),
 }
 
 /// 菜单项的动作类型（右键候选菜单 + 功能主菜单共用）
@@ -379,6 +385,7 @@ impl MenuKind {
                 MenuCmd::FirstShowMode(m) => 5000 + m as i32,
                 MenuCmd::InitialMode(m) => 6000 + m as i32,
                 MenuCmd::InitialPunct(m) => 7000 + m as i32,
+                MenuCmd::AutoPairRule(m) => 9000 + m as i32,
                 MenuCmd::SchemaSelect(i) => 1000 + i as i32,
                 MenuCmd::ThemeSelect(i) => 2000 + i as i32,
                 MenuCmd::FilterMode(i) => 3000 + i as i32,
@@ -432,6 +439,7 @@ impl MenuKind {
             5000..=5999 => MenuCmd::FirstShowMode((id - 5000) as u8),
             6000..=6999 => MenuCmd::InitialMode((id - 6000) as u8),
             7000..=7999 => MenuCmd::InitialPunct((id - 7000) as u8),
+            9000..=9999 => MenuCmd::AutoPairRule((id - 9000) as u8),
             _ => return None,
         };
         Some(MenuKind::Command(cmd))

@@ -227,6 +227,17 @@ impl PushServer {
         }
     }
 
+    /// 逐客户端生成并投递消息：`make(token)` 按各自的 token 现算内容。
+    ///
+    /// 用于 **per-app 配置**——不同宿主进程的取值不同（如 `compat.toml` 按进程关掉自动配对），
+    /// 拿 [`Self::push_to_active`] 广播同一条会把某个进程的规则套到所有进程头上。
+    pub fn push_per_client(&self, make: impl Fn(u64) -> Vec<u8>) {
+        let clients = self.clients.lock().unwrap();
+        for client in clients.iter() {
+            let _ = client.tx.send(make(client.token));
+        }
+    }
+
     /// 仅向活动客户端投递（用于 commit 等带副作用的消息，避免广播导致多次上屏）。
     /// 优先按活动 token 匹配；无匹配且仅一个客户端时兜底发它；否则跳过。
     /// 返回是否已投入某客户端的发送队列（false = 无客户端/无匹配/通道已断，

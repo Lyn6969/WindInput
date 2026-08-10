@@ -5,6 +5,7 @@
 //! 系统预置（`{data_dir}/compat.toml`）→ 用户覆盖（`{user_config_dir}/compat.toml`），
 //! 用户层同进程名规则覆盖系统层。
 
+use crate::config::SmartMethod;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::Path;
@@ -195,6 +196,47 @@ pub struct AppCompatRule {
     /// `docs/redesign/host-render-windows-port.md` §11.2。
     #[serde(default, skip_serializing_if = "is_false")]
     pub host_render: bool,
+    /// 该应用是否启用符号自动配对；`None` = 不干预，沿用全局 `input.auto_pair.*`。
+    ///
+    /// **必须是 `Option` 不能是 `bool`**：理由同 `initial_mode`——`#[serde(default)]` 下的
+    /// bool 会让所有未配置规则的应用都拿到 `false`，等于给全世界关掉了自动配对。
+    ///
+    /// 典型用途是表格类宿主（Excel / WPS 表格）：配对后要把光标退回两符号之间，而它们在
+    /// 「输入态」下把方向键解释成"确认单元格并移动"，光标回退无法实现（TSF `SetSelection`
+    /// 路线已实测失败，见 project_pair_caret_tsf_setselection_rejected）。关掉配对是目前
+    /// 唯一可行的兼容策略。
+    ///
+    /// ⚠ 消费点有**三条**，缺一即半截修复：`active_pairs()`（中文标点态）、
+    /// `english_pairs_via_pipeline()`（英文标点流水线）、`push_english_pair_config()`
+    /// （纯英文模式由 C++ `_englishPairEngine` 独立处理，协调器根本收不到那些键）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auto_pair: Option<bool>,
+    /// 该应用的智能符号替换方案；`None` = 沿用全局 `input.symbol.smart_method`。
+    ///
+    /// `DeleteReplace`（全局默认）依赖对宿主做删改，在 Tabby 一类终端上会出严重错误；
+    /// `HoldComposition` 全程不做删改、兼容性更好。两者本就是现成的全局枚举，这里只是
+    /// 让它可以按宿主覆盖。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub smart_method: Option<SmartMethod>,
+    /// 光标坐标水平校正（像素，正=右）。
+    ///
+    /// 用于宿主报告的 caret 坐标**系统性偏移**的场景（如 Windows Terminal，其它输入法
+    /// 同样偏），与主题里的候选窗偏移不是一回事：那个是候选窗相对光标的**布局**（样式层），
+    /// 这个修的是光标坐标本身（兼容层），故候选窗/状态气泡/HUD 等所有消费者一并受益。
+    ///
+    /// 用 `i32` 而非 `Option`：0 就是"不偏移"，语义无歧义，不存在 bool 那种"默认值污染"。
+    ///
+    /// ⚠ 消费点有**两处**（`apply_focus_caret` / `handle_caret_update`），与 `caret_use_top`
+    /// 同层同处；漏一处的症状是「有时生效有时不生效」。
+    #[serde(default, skip_serializing_if = "is_zero_i32")]
+    pub caret_offset_x: i32,
+    /// 光标坐标垂直校正（像素，正=下）。语义见 [`Self::caret_offset_x`]。
+    #[serde(default, skip_serializing_if = "is_zero_i32")]
+    pub caret_offset_y: i32,
+}
+
+fn is_zero_i32(v: &i32) -> bool {
+    *v == 0
 }
 
 /// 在一组规则上就地修改指定进程的**某一个**字段。
@@ -242,6 +284,28 @@ pub fn set_initial_punct(rules: &mut Vec<AppCompatRule>, process: &str, mode: Op
 /// 在一组规则上设置指定进程是否加入 HostRender 白名单。语义见 [`upsert_rule`]。
 pub fn set_host_render(rules: &mut Vec<AppCompatRule>, process: &str, enabled: bool) {
     upsert_rule(rules, process, |r| r.host_render = enabled);
+}
+
+/// 在一组规则上设置指定进程的符号自动配对开关（`None` = 清除规则，回到跟随全局）。
+pub fn set_auto_pair(rules: &mut Vec<AppCompatRule>, process: &str, enabled: Option<bool>) {
+    upsert_rule(rules, process, |r| r.auto_pair = enabled);
+}
+
+/// 在一组规则上设置指定进程的智能符号替换方案（`None` = 清除规则，回到跟随全局）。
+pub fn set_smart_method(
+    rules: &mut Vec<AppCompatRule>,
+    process: &str,
+    method: Option<SmartMethod>,
+) {
+    upsert_rule(rules, process, |r| r.smart_method = method);
+}
+
+/// 在一组规则上设置指定进程的光标坐标校正偏移（像素，正=右/下；0 = 不偏移）。
+pub fn set_caret_offset(rules: &mut Vec<AppCompatRule>, process: &str, dx: i32, dy: i32) {
+    upsert_rule(rules, process, |r| {
+        r.caret_offset_x = dx;
+        r.caret_offset_y = dy;
+    });
 }
 
 /// 把规则集渲染成用户层 compat.toml 全文（含固定文件头）。纯函数，便于单测断言产物。
@@ -306,6 +370,37 @@ pub fn set_user_host_render(
     enabled: bool,
 ) -> Result<(), std::io::Error> {
     update_user_rule(user_dir, process, |r| r.host_render = enabled)
+}
+
+/// 设置用户层 compat.toml 中指定进程的符号自动配对开关（`None` = 清除规则）。
+pub fn set_user_auto_pair(
+    user_dir: &Path,
+    process: &str,
+    enabled: Option<bool>,
+) -> Result<(), std::io::Error> {
+    update_user_rule(user_dir, process, |r| r.auto_pair = enabled)
+}
+
+/// 设置用户层 compat.toml 中指定进程的智能符号替换方案（`None` = 清除规则）。
+pub fn set_user_smart_method(
+    user_dir: &Path,
+    process: &str,
+    method: Option<SmartMethod>,
+) -> Result<(), std::io::Error> {
+    update_user_rule(user_dir, process, |r| r.smart_method = method)
+}
+
+/// 设置用户层 compat.toml 中指定进程的光标坐标校正偏移（像素，正=右/下）。
+pub fn set_user_caret_offset(
+    user_dir: &Path,
+    process: &str,
+    dx: i32,
+    dy: i32,
+) -> Result<(), std::io::Error> {
+    update_user_rule(user_dir, process, |r| {
+        r.caret_offset_x = dx;
+        r.caret_offset_y = dy;
+    })
 }
 
 /// 所有应用兼容性规则 + 运行时查找表。
@@ -408,6 +503,73 @@ fn merge_rules(base: Vec<AppCompatRule>, user: Vec<AppCompatRule>) -> Vec<AppCom
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 三个新增 per-app 字段的解析。`auto_pair` / `smart_method` 是 `Option`，
+    /// **未配置必须是 `None` 而不是 `Some(false)`/`Some(默认值)`**——那是「跟随全局」
+    /// 与「显式关掉」的分界，退化成 bool 就等于给所有未配规则的应用都关掉了功能。
+    #[test]
+    fn parse_per_app_pair_symbol_and_offset() {
+        let toml = r#"
+            [[apps]]
+            process = "EXCEL.EXE"
+            auto_pair = false
+            caret_offset_x = -2
+            caret_offset_y = 3
+
+            [[apps]]
+            process = "Tabby.exe"
+            smart_method = "hold_composition"
+
+            [[apps]]
+            process = "plain.exe"
+            caret_use_top = true
+        "#;
+        let compat = AppCompat::from_rules(toml::from_str::<AppCompatFile>(toml).unwrap().apps);
+
+        let excel = compat.get_rule("excel.exe").unwrap();
+        assert_eq!(excel.auto_pair, Some(false));
+        assert_eq!((excel.caret_offset_x, excel.caret_offset_y), (-2, 3));
+        assert_eq!(excel.smart_method, None, "未配 = 跟随全局");
+
+        let tabby = compat.get_rule("TABBY.EXE").unwrap();
+        assert_eq!(tabby.smart_method, Some(SmartMethod::HoldComposition));
+        assert_eq!(tabby.auto_pair, None, "未配 = 跟随全局");
+
+        // 只配了别的字段的规则，三个新字段必须全部是"不干预"，不能被默认值污染。
+        let plain = compat.get_rule("plain.exe").unwrap();
+        assert_eq!(plain.auto_pair, None);
+        assert_eq!(plain.smart_method, None);
+        assert_eq!((plain.caret_offset_x, plain.caret_offset_y), (0, 0));
+    }
+
+    /// 写回只落被触碰的字段，且 `None`/0 不进 TOML（`skip_serializing_if`）——
+    /// 否则用户层会把「未配置」冻结成显式值，日后改全局默认对老用户静默失效。
+    #[test]
+    fn per_app_writeback_is_sparse() {
+        let mut rules = Vec::new();
+        set_auto_pair(&mut rules, "EXCEL.EXE", Some(false));
+        set_caret_offset(&mut rules, "WindowsTerminal.exe", 0, -4);
+
+        let out = render_user_compat(&rules).unwrap();
+        assert!(out.contains("auto_pair = false"));
+        assert!(out.contains("caret_offset_y = -4"));
+        // dx 为 0：不落盘。
+        assert!(
+            !out.contains("caret_offset_x"),
+            "0 偏移不应写进 TOML: {out}"
+        );
+        // 没碰过的字段一律不出现。
+        assert!(!out.contains("smart_method"), "未触碰字段不应落盘: {out}");
+        assert!(!out.contains("caret_use_top"), "未触碰字段不应落盘: {out}");
+
+        // 清除规则（回到跟随全局）后该字段整个消失，而不是写成 auto_pair = true。
+        set_auto_pair(&mut rules, "EXCEL.EXE", None);
+        let cleared = render_user_compat(&rules).unwrap();
+        assert!(
+            !cleared.contains("auto_pair"),
+            "清除后不应残留该键: {cleared}"
+        );
+    }
 
     #[test]
     fn parse_apps_array_and_lookup_case_insensitive() {

@@ -730,6 +730,18 @@ pub(crate) struct ActiveCompat {
     /// （出厂默认）下这会把模式重置成配置默认，用户在 Word 手切的英文切到 Chrome
     /// 就没了，与 Everything 毫无关系。
     pub(crate) has_initial_rule: bool,
+    /// 本进程的符号自动配对开关；`None` = 跟随全局 `input.auto_pair.*`。
+    ///
+    /// ⚠ 消费点三条，缺一即半截修复（见 `AppCompatRule::auto_pair` 的说明）：中文标点态、
+    /// 英文标点流水线、以及推给 DLL 的英文配对配置——纯英文模式的配对完全在 C++ 侧独立
+    /// 处理，协调器收不到那些键，只关前两条的话切到英文模式配对照旧。
+    pub(crate) auto_pair: Option<bool>,
+    /// 本进程的智能符号替换方案；`None` = 跟随全局 `input.symbol.smart_method`。
+    pub(crate) smart_method: Option<wind_config::config::SmartMethod>,
+    /// 光标坐标校正偏移（像素，正=右/下）。宿主报告的 caret 系统性偏移时用，
+    /// 与 `caret_use_top` 在同两处消费（`apply_focus_caret` / `handle_caret_update`）。
+    pub(crate) caret_offset_x: i32,
+    pub(crate) caret_offset_y: i32,
 }
 
 /// 焦点切换时是否需要重算初始状态（即是否调用 `apply_initial_mode`）。
@@ -1757,6 +1769,10 @@ impl Coordinator {
                     caret_use_top: rule.map(|r| r.caret_use_top).unwrap_or(false),
                     first_show_mode: rule.map(|r| r.first_show_mode).unwrap_or_default(),
                     has_initial_rule: initial_mode.is_some() || initial_punct.is_some(),
+                    auto_pair: rule.and_then(|r| r.auto_pair),
+                    smart_method: rule.and_then(|r| r.smart_method),
+                    caret_offset_x: rule.map(|r| r.caret_offset_x).unwrap_or(0),
+                    caret_offset_y: rule.map(|r| r.caret_offset_y).unwrap_or(0),
                 },
                 rule.is_some(),
                 initial_mode,
@@ -1767,7 +1783,7 @@ impl Coordinator {
         // 规则未命中与「命中但全 false」在日志里无从区分，查「某应用兼容项没生效」时看不到
         // 究竟是没匹配上进程名还是字段没读到。
         debug!(
-            "Compat rule for process={name}: matched={} caret_use_top={} first_show_mode={} initial_mode={} initial_punct={}",
+            "Compat rule for process={name}: matched={} caret_use_top={} first_show_mode={} initial_mode={} initial_punct={} auto_pair={} smart_method={} caret_offset=({},{})",
             rule_matched,
             next.caret_use_top,
             next.first_show_mode.as_config(),
@@ -1776,7 +1792,19 @@ impl Coordinator {
                 .unwrap_or("(follow-global)"),
             rule_initial_punct
                 .map(|m| m.as_config())
-                .unwrap_or("(follow-global)")
+                .unwrap_or("(follow-global)"),
+            match next.auto_pair {
+                Some(true) => "on",
+                Some(false) => "off",
+                None => "(follow-global)",
+            },
+            match next.smart_method {
+                Some(wind_config::config::SmartMethod::DeleteReplace) => "delete_replace",
+                Some(wind_config::config::SmartMethod::HoldComposition) => "hold_composition",
+                None => "(follow-global)",
+            },
+            next.caret_offset_x,
+            next.caret_offset_y
         );
         *ac = next;
         drop(ac);
@@ -4040,8 +4068,28 @@ impl Coordinator {
         )
     }
 
+    /// 当前焦点应用是否启用符号自动配对。per-app 规则（`compat.toml` 的 `auto_pair`）
+    /// 优先，未配则跟随全局——全局开关仍在各自的 `input.auto_pair.chinese/english` 里，
+    /// 本函数只回答「这个宿主要不要一刀切关掉」。
+    ///
+    /// ⚠ 三个消费点必须都问它：`active_pairs()`、`english_pairs_via_pipeline()`、
+    /// `push_english_pair_config()`。前两条走协调器，第三条是 C++ 侧英文配对引擎——
+    /// 纯英文模式的标点键根本到不了协调器，漏接它等于「切到英文就又配对了」。
+    pub(crate) fn auto_pair_allowed_here(&self) -> bool {
+        self.active_compat
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .auto_pair
+            .unwrap_or(true)
+    }
+
     /// 当前模式下生效的配对表（按中/英标点 + 各自开关）
     pub(crate) fn active_pairs(&self, chinese_punct: bool) -> Option<Vec<(char, char)>> {
+        // per-app 关闭：返回 None 等价于「配对表为空」，插对与右符号跳出一并失效。
+        // 在取表这一层收口，而不是在每个使用点各加一个 if——后者是本仓栽过四次的形态。
+        if !self.auto_pair_allowed_here() {
+            return None;
+        }
         let rt = self.rt();
         if chinese_punct {
             if rt.config.input.auto_pair.chinese {
@@ -4229,19 +4277,56 @@ impl Coordinator {
         self.push_activation_status(client_token);
     }
 
-    /// 推送英文自动配对配置到指定客户端（或广播到所有活跃客户端）。
+    /// 指定 PID 的进程是否启用符号自动配对（per-app 规则，未配则跟随全局）。
+    ///
+    /// ⚠ **按 PID 直查规则表，绝不走 `active_compat` 焦点槽**：本函数的调用方是推送路径，
+    /// 目标客户端未必是当前焦点进程（新客户端握手、配置变更广播都会推给后台进程）。
+    /// 拿焦点槽的值会把焦点应用的规则套到别人头上——同 `host_render` 的既有纪律。
+    fn auto_pair_allowed_for_pid(&self, pid: u32) -> bool {
+        if pid == 0 {
+            return true;
+        }
+        let name = {
+            let cached = self
+                .pid_names
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .get(&pid)
+                .cloned();
+            cached.unwrap_or_else(|| process_name(pid))
+        };
+        if name.is_empty() {
+            return true;
+        }
+        self.app_compat
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get_rule(&name)
+            .and_then(|r| r.auto_pair)
+            .unwrap_or(true)
+    }
+
+    /// 推送英文自动配对配置到指定客户端（或逐个推给所有活跃客户端）。
+    ///
+    /// 这是 per-app 自动配对开关的**第三条**消费通路：纯英文模式的配对完全由 C++ 侧
+    /// `_englishPairEngine` 处理，那些标点键根本到不了协调器，只关另两条的话「切到英文
+    /// 模式又配上了」。故 enabled 必须按**目标进程**现算，不能全局广播同一个值。
     pub fn push_english_pair_config(&self, client_token: u64) {
         let rt = self.rt();
-        let enabled = rt.config.input.auto_pair.english;
-        let value = wind_ipc::codec::encode_english_pairs_value(enabled, &rt.en_pairs);
-        let msg = wind_ipc::codec::encode_sync_config(
-            wind_ipc::protocol::CONFIG_KEY_ENGLISH_PAIRS,
-            &value,
-        );
+        let make = |token: u64| {
+            let pid = (token >> 32) as u32;
+            let enabled = rt.config.input.auto_pair.english && self.auto_pair_allowed_for_pid(pid);
+            let value = wind_ipc::codec::encode_english_pairs_value(enabled, &rt.en_pairs);
+            wind_ipc::codec::encode_sync_config(
+                wind_ipc::protocol::CONFIG_KEY_ENGLISH_PAIRS,
+                &value,
+            )
+        };
         if client_token != 0 {
-            self.push_server.push_to_token(client_token, &msg);
+            self.push_server
+                .push_to_token(client_token, &make(client_token));
         } else {
-            self.push_server.push_to_active(&msg);
+            self.push_server.push_per_client(make);
         }
     }
 
@@ -4376,6 +4461,43 @@ impl Coordinator {
     /// 变换，于是把同步段刚做好的两道处理**整个抹掉**：退化矩形进了缓存，微信一类宿主的
     /// 坐标差一个行高。两处口径分裂既不编译报错也不 panic，只表现为「焦点后第一次定位偏一行」，
     /// 是典型的看不见的分裂。故合并到此，两条路径都必须经由它。
+    /// 应用 per-app 的光标坐标兼容变换：`caret_use_top` 抬升 + `caret_offset_*` 校正。
+    ///
+    /// ★ **两个调用点必须都走它**（`apply_focus_caret` 与 `handle_caret_update`）。
+    /// `caret_use_top` 原本就是分头写在这两处的，任何新增变换只要漏一处，症状就是
+    /// 「有时生效有时不生效」——取决于本次坐标是走焦点路径还是常规更新路径，极难归因。
+    ///
+    /// 偏移校正针对的是**宿主报告的坐标本身系统性偏移**（如 Windows Terminal，别家输入法
+    /// 同样偏）。与主题里的候选窗偏移不是一回事：那个是候选窗相对光标的布局（样式层），
+    /// 这个修的是光标坐标（兼容层），故候选窗/状态气泡/HUD 等所有消费者一并受益。
+    ///
+    /// 组合起点坐标同步平移以保持锚点一致；为 0（未提供）时不动，避免把「没有值」
+    /// 变成「一个偏移后的假值」。
+    fn apply_caret_compat(&self, data: &mut CaretData) {
+        let (use_top, dx, dy) = {
+            let ac = self.active_compat.lock().unwrap_or_else(|e| e.into_inner());
+            (ac.caret_use_top, ac.caret_offset_x, ac.caret_offset_y)
+        };
+        if use_top && data.height > 0 {
+            let raw_h = data.height;
+            data.y -= raw_h;
+            data.height = raw_h.max(CARET_USE_TOP_MIN_LINE_H);
+            if data.composition_start_y != 0 {
+                data.composition_start_y -= raw_h;
+            }
+        }
+        if dx != 0 || dy != 0 {
+            data.x += dx;
+            data.y += dy;
+            if data.composition_start_x != 0 {
+                data.composition_start_x += dx;
+            }
+            if data.composition_start_y != 0 {
+                data.composition_start_y += dy;
+            }
+        }
+    }
+
     fn apply_focus_caret(&self, data: &CaretData, via: &str) {
         // 独立日志行：与 handle_caret_update 区分开，否则无法从日志判断焦点坐标走的是哪条路
         // （2026-08-01 那轮修复第一版就因为看不出这点，白跑了一轮真机验证）。
@@ -4391,16 +4513,7 @@ impl Coordinator {
             return;
         }
         let mut data = *data;
-        if self
-            .active_compat
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .caret_use_top
-        {
-            let raw_h = data.height;
-            data.y -= raw_h;
-            data.height = raw_h.max(CARET_USE_TOP_MIN_LINE_H);
-        }
+        self.apply_caret_compat(&mut data);
         let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
         state.caret_x = data.x;
         state.caret_y = data.y;
@@ -6944,20 +7057,7 @@ impl MessageHandler for Coordinator {
         // 让上方显示正确避让正文（偏大只是多留空隙，偏小才会遮挡——宁大勿小）。
         // 组合起点 Y 同步上移以保持锚点一致。后续逻辑全部基于变换后的本地副本。
         let mut data = *data;
-        if data.height > 0
-            && self
-                .active_compat
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .caret_use_top
-        {
-            let raw_h = data.height;
-            data.y -= raw_h;
-            data.height = raw_h.max(CARET_USE_TOP_MIN_LINE_H);
-            if data.composition_start_y != 0 {
-                data.composition_start_y -= raw_h;
-            }
-        }
+        self.apply_caret_compat(&mut data);
         let data = &data;
         let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
         let (prev_x, prev_y) = (state.caret_x, state.caret_y);
@@ -9755,6 +9855,134 @@ mod focus_ownership_tests {
     fn no_active_client_is_not_stale() {
         let c = Coordinator::new_headless(Config::default(), None);
         assert!(!c.is_stale_focus_event(TERMINAL, "test"));
+    }
+}
+
+#[cfg(test)]
+mod per_app_compat_tests {
+    //! per-app 兼容规则：自动配对开关、智能符号方案、光标坐标校正。
+    use super::*;
+    use wind_config::config::SmartMethod;
+
+    fn coord_with(cfg: Config) -> Arc<Coordinator> {
+        Coordinator::new_headless(cfg, None)
+    }
+
+    /// CaretData 无 `Default`，测试里显式构造（字段少，且显式写出更能看清哪些参与变换）。
+    fn caret(x: i32, y: i32, height: i32, cs_x: i32, cs_y: i32) -> CaretData {
+        CaretData {
+            x,
+            y,
+            height,
+            composition_start_x: cs_x,
+            composition_start_y: cs_y,
+            source: 0,
+        }
+    }
+
+    fn pair_cfg() -> Config {
+        let mut cfg = Config::default();
+        cfg.input.auto_pair.chinese = true;
+        cfg.input.auto_pair.english = true;
+        cfg.input.auto_pair.chinese_pairs = vec!["（）".to_string()];
+        cfg.input.auto_pair.english_pairs = vec!["()".to_string()];
+        cfg
+    }
+
+    /// per-app 关闭后，`active_pairs` 在**中英两种标点态**都必须返回 None。
+    ///
+    /// 分别断言两种标点态而不是只测一种：全局开关本来就是 chinese / english 两个独立字段，
+    /// 只在其中一条上加闸门是本仓反复出现的「半截修复」形态。
+    #[test]
+    fn auto_pair_rule_off_kills_both_punct_modes() {
+        let c = coord_with(pair_cfg());
+        assert!(c.active_pairs(true).is_some(), "默认（未配规则）应跟随全局");
+        assert!(c.active_pairs(false).is_some());
+
+        c.active_compat.lock().unwrap().auto_pair = Some(false);
+        assert!(c.active_pairs(true).is_none(), "中文标点态应被关掉");
+        assert!(c.active_pairs(false).is_none(), "英文标点态应被关掉");
+
+        // 显式启用 = 跟随全局的开关，不是无条件开。
+        c.active_compat.lock().unwrap().auto_pair = Some(true);
+        assert!(c.active_pairs(true).is_some());
+    }
+
+    /// `is_auto_pair_char` 建立在 `active_pairs` 之上，规则关闭后必须一并失效——
+    /// 它是「智能符号与自动配对互斥」的判据，若还认为字符参与配对，智能符号会被误让位。
+    #[test]
+    fn auto_pair_rule_off_releases_smart_symbol_interlock() {
+        let c = coord_with(pair_cfg());
+        c.state.lock().unwrap().chinese_punct = true;
+        {
+            let state = c.state.lock().unwrap();
+            assert!(c.is_auto_pair_char(&state, '（'), "默认应认为参与配对");
+        }
+
+        c.active_compat.lock().unwrap().auto_pair = Some(false);
+        {
+            let state = c.state.lock().unwrap();
+            assert!(!c.is_auto_pair_char(&state, '（'), "规则关闭后互锁应解除");
+        }
+    }
+
+    /// 光标坐标校正：两个消费点（`apply_focus_caret` / `handle_caret_update`）共用
+    /// `apply_caret_compat`，此处直接锁住那个变换本身。
+    #[test]
+    fn caret_offset_shifts_coordinates() {
+        let c = coord_with(Config::default());
+        {
+            let mut ac = c.active_compat.lock().unwrap();
+            ac.caret_offset_x = -3;
+            ac.caret_offset_y = 7;
+        }
+        let mut data = caret(100, 200, 20, 0, 0);
+        c.apply_caret_compat(&mut data);
+        assert_eq!((data.x, data.y), (97, 207));
+        assert_eq!(data.height, 20, "偏移不应改动行高");
+        // compStart 为 0 表示"未提供"，不能被平移成一个假坐标。
+        assert_eq!((data.composition_start_x, data.composition_start_y), (0, 0));
+
+        // compStart 有真值时随之平移，保持与 caret 的锚点关系。
+        let mut with_cs = caret(100, 200, 20, 50, 180);
+        c.apply_caret_compat(&mut with_cs);
+        assert_eq!(
+            (with_cs.composition_start_x, with_cs.composition_start_y),
+            (47, 187)
+        );
+    }
+
+    /// 零偏移必须是彻底的 no-op：未配规则的应用绝不能因为这条链路而坐标漂移。
+    #[test]
+    fn caret_offset_zero_is_noop() {
+        let c = coord_with(Config::default());
+        let orig = caret(100, 200, 20, 50, 180);
+        let mut data = orig;
+        c.apply_caret_compat(&mut data);
+        assert_eq!((data.x, data.y), (orig.x, orig.y));
+        assert_eq!(
+            (data.composition_start_x, data.composition_start_y),
+            (orig.composition_start_x, orig.composition_start_y)
+        );
+    }
+
+    /// 智能符号方案：per-app 覆盖优先，未配则跟随全局。
+    #[test]
+    fn smart_method_per_app_overrides_global() {
+        let mut cfg = Config::default();
+        cfg.input.symbol.smart_method = SmartMethod::DeleteReplace;
+        let c = coord_with(cfg);
+        assert_eq!(c.effective_smart_method(), SmartMethod::DeleteReplace);
+
+        c.active_compat.lock().unwrap().smart_method = Some(SmartMethod::HoldComposition);
+        assert_eq!(c.effective_smart_method(), SmartMethod::HoldComposition);
+
+        c.active_compat.lock().unwrap().smart_method = None;
+        assert_eq!(
+            c.effective_smart_method(),
+            SmartMethod::DeleteReplace,
+            "清除规则应回到全局值"
+        );
     }
 }
 

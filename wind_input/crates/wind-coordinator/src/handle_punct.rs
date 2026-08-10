@@ -239,7 +239,7 @@ impl Coordinator {
         if !self.any_smart_symbol_enabled() {
             return None;
         }
-        let method = self.rt().config.input.symbol.smart_method.clone();
+        let method = self.effective_smart_method();
         let timeout_ms = self.smart_symbol_timeout().as_millis() as u32;
         let mut arm = self.smart_symbol.lock().unwrap_or_else(|e| e.into_inner());
 
@@ -444,7 +444,7 @@ impl Coordinator {
         if !bundle.config.input.symbol.english_mode {
             return None;
         }
-        let method = bundle.config.input.symbol.smart_method.clone();
+        let method = self.effective_smart_method();
         let mut arm = self.smart_symbol.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(act) = self.smart_symbol_press2(state, ch, prev_char, &method, &mut arm) {
             return Some(act);
@@ -484,7 +484,7 @@ impl Coordinator {
         if !self.any_smart_symbol_enabled() {
             return None;
         }
-        let method = self.rt().config.input.symbol.smart_method.clone();
+        let method = self.effective_smart_method();
         let mut arm = self.smart_symbol.lock().unwrap_or_else(|e| e.into_inner());
         self.smart_symbol_press2(state, ch, prev_char, &method, &mut arm)
     }
@@ -587,7 +587,32 @@ impl Coordinator {
     /// （`english_pairs` 含引号时立刻错位）。构造配对表是**查询**，不该有副作用。
     ///
     /// 调用前须已置 `state.chinese_punct = false`（「英文标点」列语义）。
+    /// 当前焦点应用生效的智能符号替换方案。per-app 规则（`compat.toml` 的 `smart_method`）
+    /// 优先，未配则跟随全局 `input.symbol.smart_method`。
+    ///
+    /// 收敛成单一入口而非在各调用点重复 `config.input.symbol.smart_method`：本判定原有
+    /// **三个**读取点（press1 两条 + press2 一条），分散写必然漏掉新增的那个。
+    ///
+    /// 典型用途：全局默认 `DeleteReplace`（体感更好）在多数宿主正常，但它依赖对宿主做
+    /// 删改，Tabby 一类终端下会出严重错误——给那类宿主单独配 `HoldComposition`，
+    /// 全程不做删改。
+    pub(crate) fn effective_smart_method(&self) -> SmartMethod {
+        if let Some(m) = self
+            .active_compat
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .smart_method
+        {
+            return m;
+        }
+        self.rt().config.input.symbol.smart_method
+    }
+
     fn english_pairs_via_pipeline(&self, state: &State) -> Option<Vec<(char, char)>> {
+        // per-app 关闭：与 `active_pairs()` 同一道闸门，两条通路都要问（见那里的说明）。
+        if !self.auto_pair_allowed_here() {
+            return None;
+        }
         let rt = self.rt();
         if !rt.config.input.auto_pair.english {
             return None;

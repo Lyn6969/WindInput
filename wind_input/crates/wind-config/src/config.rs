@@ -1455,7 +1455,8 @@ impl Default for PunctConfig {
 /// - `HoldComposition`：press1 开启 TSF 组合态展示中文符号，press2 替换组合提交英文；
 ///   超时（smart_timeout_ms）后自动提交中文。全程不做删改，**兼容性更好**，
 ///   适合对删改敏感、DeleteReplace 下表现异常的宿主。
-#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
+// Copy + Eq：本身是无字段枚举，且要按值放进 per-app 的 `ActiveCompat`（那是个 Copy 结构）。
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, Default, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum SmartMethod {
     #[default]

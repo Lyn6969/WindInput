@@ -29,9 +29,30 @@
 #                         Band 层级的受限宿主（如 Win11 开始菜单 SearchHost.exe）：候选窗
 #                         改由服务进程渲染后经共享内存转交宿主进程内的 DLL 上屏。
 #                         普通应用不要开启——多一层渲染路径，出问题时本地窗口路径更好排查。
+#   auto_pair:            本应用是否启用符号自动配对：true | false｜不写=跟随全局。
+#                         典型用途是表格类宿主（Excel / WPS 表格）：配对后需要把光标退回
+#                         两个符号之间，而它们在「输入态」（选中单元格直接打字，区别于
+#                         F2/双击进入的「编辑态」）下把方向键解释成「确认单元格并移动」，
+#                         于是配对内容当场被提交、光标跑到隔壁单元格。该限制无法绕开
+#                         （改用 TSF 设置光标位置的方案已实测失败：宿主报告成功但光标不动），
+#                         关掉配对是目前唯一可行的兼容策略。关闭后左符号照常上屏，
+#                         只是不再自动补右符号。
+#   smart_method:         本应用的智能符号替换方案："delete_replace" | "hold_composition"
+#                         ｜不写=跟随全局 input.symbol.smart_method。
+#                         delete_replace（全局默认）体感更好，但依赖对宿主做删改，在
+#                         Tabby 一类终端上会出严重错误；hold_composition 全程不做删改，
+#                         用 TSF 组合态承载待定符号，兼容性更好。
+#   caret_offset_x:       光标坐标水平校正（像素，正=右，默认 0）。
+#   caret_offset_y:       光标坐标垂直校正（像素，正=下，默认 0）。
+#                         用于宿主报告的光标坐标**系统性偏移**的场景（如 Windows Terminal，
+#                         其它输入法同样偏）。注意与主题里的候选窗偏移不是一回事：那个调的
+#                         是候选窗相对光标的布局，这里修的是光标坐标本身，故候选窗、状态
+#                         提示气泡等所有跟随光标的元素会一起被校正。
 #
-# 上述三项对应右键菜单：「应用独立配置（<进程名>）」子菜单，各自单选。
+# first_show_mode / initial_mode / initial_punct / auto_pair 对应右键菜单：
+# 「应用独立配置（<进程名>）」子菜单，各自单选。
 # （菜单切换会写入用户层 compat.toml，不改本文件）
+# smart_method 与 caret_offset_* 不进菜单，按需手工编辑用户层 compat.toml。
 #
 # ⚠ initial_mode / initial_punct 的语义是「初始值」而不是「锁定」：
 #   - 每次焦点**从别的应用**切进来时套用一次；停留在本应用期间用户可自由手动切换，
@@ -84,3 +105,24 @@ host_render = true
 # process = "Everything.exe"
 # comment = "文件搜索框，默认英文"
 # initial_mode = "english"
+
+# 示例：表格类宿主关掉符号自动配对（默认不启用——是否需要由用户自己决定）
+# 同样可在该应用里右键 →「应用独立配置」→「符号自动配对」→「禁用」。
+# [[apps]]
+# process = "EXCEL.EXE"
+# comment = "输入态下方向键=移动单元格，配对光标无法退回符号之间"
+# auto_pair = false
+
+# 示例：终端类宿主改用组合态智能符号（不进菜单，需手工配置）
+# [[apps]]
+# process = "Tabby.exe"
+# comment = "delete_replace 的删改在此宿主上出错，改用不做删改的组合态方案"
+# smart_method = "hold_composition"
+
+# 示例：校正宿主报告的光标坐标偏移（不进菜单，需手工配置）
+# 数值按实际观感微调：先估个方向，偏多少调多少。
+# [[apps]]
+# process = "WindowsTerminal.exe"
+# comment = "宿主上报的 caret 位置系统性偏移，其它输入法同样偏"
+# caret_offset_x = 0
+# caret_offset_y = -2
