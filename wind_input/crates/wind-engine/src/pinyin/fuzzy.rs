@@ -244,10 +244,15 @@ impl FuzzyMatcher {
     /// `slice_syllables` 切过一次）——本函数即为收口这两处而抽出。
     ///
     /// 组合数超 [`MAX_FUZZY_COMBOS`] 时返回空（放弃扩展），避免组合爆炸。
-    pub fn expand_syllables(syllables: &[String], config: &FuzzyConfig) -> Vec<String> {
+    /// 返回 `(变体码, 被模糊的音节数)`。**第二项是惩罚的计量单位**：librime 的
+    /// `kFuzzySpellingPenalty` 与 libime 的 `fuzzyCost` 都是「每个模糊拼写 log(0.5)」并
+    /// 逐个累加，即概率域按模糊音节数**累乘 0.5**。我们此前两处惩罚（词图 −0.5、候选层
+    /// ×0.01）都是**一次性固定值**，`beijinsi`（2 个模糊音节）与 `si`（1 个）同等对待。
+    pub fn expand_syllables(syllables: &[String], config: &FuzzyConfig) -> Vec<(String, usize)> {
         let per_syllable: Vec<Vec<String>> = syllables
             .iter()
             .map(|s| {
+                // opts[0] 恒为原音节，故「下标 > 0」即「该音节被模糊了」。
                 let mut opts = vec![s.clone()];
                 opts.extend(Self::fuzzy_variants(s, config));
                 opts
@@ -263,12 +268,12 @@ impl FuzzyMatcher {
             }
         }
 
-        let mut codes: Vec<String> = vec![String::new()];
+        let mut codes: Vec<(String, usize)> = vec![(String::new(), 0)];
         for opts in &per_syllable {
-            let mut next: Vec<String> = Vec::with_capacity(codes.len() * opts.len());
-            for prefix in &codes {
-                for opt in opts {
-                    next.push(format!("{prefix}{opt}"));
+            let mut next: Vec<(String, usize)> = Vec::with_capacity(codes.len() * opts.len());
+            for (prefix, fuzzy_count) in &codes {
+                for (i, opt) in opts.iter().enumerate() {
+                    next.push((format!("{prefix}{opt}"), fuzzy_count + usize::from(i > 0)));
                 }
             }
             codes = next;
@@ -312,7 +317,18 @@ mod tests {
 
     // ---------------------------------------------------------------- expand_syllables
 
-    /// 全原音节组合恒排第一（调用方据 `variant == code` 跳过精确命中，依赖此性质）。
+    /// 测试辅助：只取变体码，丢掉模糊音节数。
+    fn codes(out: &[(String, usize)]) -> Vec<String> {
+        out.iter().map(|(c, _)| c.clone()).collect()
+    }
+
+    /// 测试辅助：查某个变体码对应的模糊音节数。
+    fn fuzzy_count_of(out: &[(String, usize)], code: &str) -> Option<usize> {
+        out.iter().find(|(c, _)| c == code).map(|(_, k)| *k)
+    }
+
+    /// 全原音节组合恒排第一、且模糊音节数为 0（调用方据 `variant == code` 跳过精确命中，
+    /// 依赖此性质）。
     #[test]
     fn expand_first_combo_is_original_code() {
         let c = cfg(|c| {
@@ -320,22 +336,28 @@ mod tests {
             c.sh_s = true;
         });
         let out = FuzzyMatcher::expand_syllables(&syls(&["zhong", "guo"]), &c);
-        assert_eq!(out[0], "zhongguo", "首个组合须是原码，实际: {out:?}");
+        assert_eq!(out[0].0, "zhongguo", "首个组合须是原码，实际: {out:?}");
+        assert_eq!(out[0].1, 0, "原码的模糊音节数须为 0");
     }
 
     #[test]
     fn expand_disabled_yields_only_original() {
         let out = FuzzyMatcher::expand_syllables(&syls(&["si", "jin"]), &FuzzyConfig::default());
-        assert_eq!(out, vec!["sijin".to_string()], "全关时只应有原码");
+        assert_eq!(
+            out,
+            vec![("sijin".to_string(), 0)],
+            "全关时只应有原码，且计数为 0"
+        );
     }
 
     #[test]
     fn expand_single_syllable_degrades_to_variants() {
         let out = FuzzyMatcher::expand_syllables(&syls(&["si"]), &cfg(|c| c.sh_s = true));
-        assert!(out.contains(&"si".to_string()));
-        assert!(
-            out.contains(&"shi".to_string()),
-            "单音节 s→sh，实际: {out:?}"
+        assert!(codes(&out).contains(&"si".to_string()));
+        assert_eq!(
+            fuzzy_count_of(&out, "shi"),
+            Some(1),
+            "单音节 s→sh 须计 1 个模糊音节，实际: {out:?}"
         );
     }
 
@@ -344,9 +366,10 @@ mod tests {
     #[test]
     fn expand_covers_non_initial_syllable_initial() {
         let out = FuzzyMatcher::expand_syllables(&syls(&["zhong", "zou"]), &cfg(|c| c.zh_z = true));
-        assert!(
-            out.contains(&"zhongzhou".to_string()),
-            "第 2 音节 zou→zhou 须被展开，实际: {out:?}"
+        assert_eq!(
+            fuzzy_count_of(&out, "zhongzhou"),
+            Some(1),
+            "第 2 音节 zou→zhou 须被展开并计 1，实际: {out:?}"
         );
     }
 
@@ -354,14 +377,19 @@ mod tests {
     #[test]
     fn expand_covers_non_initial_syllable_final() {
         let out = FuzzyMatcher::expand_syllables(&syls(&["bei", "jin"]), &cfg(|c| c.in_ing = true));
-        assert!(
-            out.contains(&"beijing".to_string()),
-            "第 2 音节 in→ing 须被展开，实际: {out:?}"
+        assert_eq!(
+            fuzzy_count_of(&out, "beijing"),
+            Some(1),
+            "第 2 音节 in→ing 须被展开并计 1，实际: {out:?}"
         );
     }
 
     /// **多处音节同时模糊**（笛卡尔积的意义）：`beijinsi` → `beijingshi`（北京市）
     /// 需要第 2 音节 in→ing **且** 第 3 音节 s→sh。
+    ///
+    /// ★ 计数须为 **2** —— 惩罚按模糊音节数累乘（`0.5^2`），对齐 librime
+    /// `kFuzzySpellingPenalty` 与 libime `fuzzyCost` 的逐个累加。写成一次性固定折扣时，
+    /// 本串与单音节模糊同等对待，置信度差异被抹平。
     #[test]
     fn expand_covers_multiple_syllables_at_once() {
         let c = cfg(|c| {
@@ -369,10 +397,15 @@ mod tests {
             c.sh_s = true;
         });
         let out = FuzzyMatcher::expand_syllables(&syls(&["bei", "jin", "si"]), &c);
-        assert!(
-            out.contains(&"beijingshi".to_string()),
-            "第 2、3 音节须能同时变体，实际: {out:?}"
+        assert_eq!(
+            fuzzy_count_of(&out, "beijingshi"),
+            Some(2),
+            "第 2、3 音节同时变体须计 2，实际: {out:?}"
         );
+        // 同一次展开里，只改一个音节的组合计 1 —— 与上面合看才说明计数真在数音节，
+        // 而非「只要有模糊就置 1」或「恒等于音节总数」。
+        assert_eq!(fuzzy_count_of(&out, "beijingsi"), Some(1));
+        assert_eq!(fuzzy_count_of(&out, "beijinshi"), Some(1));
     }
 
     /// **回归守卫（钉死旧 bug）**：对多音节**拼接串**整体调 `fuzzy_variants` 拿不到
@@ -392,7 +425,7 @@ mod tests {
 
         // 而逐音节展开可以——两者的差集正是本次修复的价值。
         let per_syllable = FuzzyMatcher::expand_syllables(&syls(&["bei", "jin", "si"]), &c);
-        assert!(per_syllable.contains(&"beijingshi".to_string()));
+        assert!(codes(&per_syllable).contains(&"beijingshi".to_string()));
     }
 
     /// 组合数超上限时整体放弃（避免爆炸），而非截断出半份结果。
@@ -414,7 +447,7 @@ mod tests {
         let out = FuzzyMatcher::expand_syllables(&[], &cfg(|c| c.zh_z = true));
         assert_eq!(
             out,
-            vec![String::new()],
+            vec![(String::new(), 0)],
             "空音节列表只产出空串，交调用方跳过"
         );
     }

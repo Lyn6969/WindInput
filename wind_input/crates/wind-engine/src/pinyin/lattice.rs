@@ -91,6 +91,19 @@ pub(crate) const WORD_PENALTY: f64 = 3.0;
 /// （需要 bigram 上下文；旧 lm.rs 里的简化插值实现已随 unigram 合并删除，缺磁盘语料）。
 pub(crate) const AMBIGUOUS_PENALTY: f64 = 0.35;
 
+/// 词图节点的**每模糊音节**对数惩罚，`ln(2)` ⇒ 概率域每个模糊音节乘 0.5。
+///
+/// 与候选层的 [`super::FUZZY_WEIGHT_SCALE`]（=0.5，乘性）是**同一个量在两个域的表达**，
+/// 两者必须同步改：候选层管词典直查的模糊命中，本常数管词图节点、进而管整句路径。
+///
+/// 取值对齐 librime `kFuzzySpellingPenalty`（`= log(0.5)`，加进 `credibility` 再进 weight）
+/// 与 libime `fuzzyCost`（`= log10(0.5)`，`extraCost = fuzzies × fuzzyCost`）—— 两者都是
+/// **每个模糊拼写 0.5、多个累乘**。
+///
+/// 此前这里写死 `-0.5`（≈ ×0.61）且不看音节数，`beijinsi`（2 个模糊音节）与单音节模糊
+/// 同等对待。
+pub(crate) const FUZZY_SYLLABLE_LOG_PENALTY: f64 = std::f64::consts::LN_2;
+
 /// 简拼节点每个音节的惩罚（混合整句解码用，见 [`LatticeBuilder::add_abbrev_nodes`]）。
 ///
 /// **按音节数计而非固定值**：简拼段越长，「每个字母只给了一个声母」积累的不确定性越大
@@ -378,7 +391,7 @@ impl LatticeBuilder {
                         continue;
                     };
                     let syls = slice_syllables(code, &offsets);
-                    for variant in FuzzyMatcher::expand_syllables(&syls, fuzzy) {
+                    for (variant, fuzzy_count) in FuzzyMatcher::expand_syllables(&syls, fuzzy) {
                         // 全原音节组合 == 原码，属精确命中，已由上面的 search_with_boundary
                         // 循环加入（且带真值边界校验），不可在此重复添加为模糊节点。
                         if variant == code {
@@ -392,7 +405,7 @@ impl LatticeBuilder {
                             // 模糊命中同样按图上那条标注路径计歧义罚：惩罚是**切分**的
                             // 属性（该路径是否踩在歧义接缝上），与词条来源无关。
                             let log_prob = score_node(text, *weight)
-                                - 0.5 // 模糊匹配轻微惩罚
+                                - FUZZY_SYLLABLE_LOG_PENALTY * fuzzy_count as f64
                                 - AMBIGUOUS_PENALTY * graph.ambiguous_count(p, q, &offsets) as f64;
                             nodes[q].push(LatticeNode {
                                 start: p,

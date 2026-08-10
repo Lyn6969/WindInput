@@ -124,27 +124,41 @@ fn sentence_weight(log_prob: f64, word_count: usize) -> i32 {
 /// 词频仅 ×0.00001），而本侧 weight 直接就是词频量纲且跨来源差异极大（词典词 ~1e2、
 /// 前缀补全可达 2e9、整句 3e7）。固定减法在不同量纲上效果天差地别，乘性折扣则量纲无关。
 ///
-/// **取值依据（build_dev 真实词库实测，非估算）**：汉语单字词频跨数量级，同音字之间常差
-/// 1~2 个量级——「是」=1799848 vs「四」=22625（80 倍），「中」=497871 vs「总」=20874（24 倍）。
-/// 要让精确命中守住首选位，折扣必须小于二者之比，即 `si` 需 <0.013、`zong` 需 <0.042。
-/// 取 **0.01** 同时满足两者并留余量；实测下 `si`→「四 死 是\* 斯」、`zong`→「总 中\* 纵」，
-/// 精确守首位而模糊命中仍稳定落在首屏可见区（第 2~3 位），这正是模糊音要的效果。
+/// ## 取值 0.5，**按被模糊的音节数累乘**（对齐两个参考实现）
 ///
-/// 更大的值（如 0.5）会让模糊高频字直接夺走首选位（`si`→「是\* 时\* 四」），等于把
-/// 「我分不清 s/sh」曲解成「我要的就是 sh」。
+/// | | 惩罚 | 按音节累计 |
+/// |---|---|---|
+/// | librime `kFuzzySpellingPenalty` | `log(0.5)` 加进 `credibility` | ✅ |
+/// | libime `fuzzyCost` | `log10(0.5)`，`extraCost = fuzzies × fuzzyCost` | ✅ |
+/// | 本常数 | `×0.5` per 音节 | ✅ |
 ///
-/// **本常数不作用于整句路径**：Viterbi 整句拿 旧的 `SENTENCE_WEIGHT_BASE`(3e7，已退役) 基准分，
-/// 与词频量纲差几个数量级，任何比例折扣都压不下来。模糊整句改走 step 6.5 的
-/// `is_sentence_demoted` 降级（降到精确整词之下），见该处注释。
-const FUZZY_WEIGHT_SCALE: f64 = 0.01;
+/// 两个参考实现在这一点上完全一致：**每个模糊拼写乘 0.5**，多个模糊音节累乘。
+///
+/// ### 曾用 0.01 一次性折扣，两处偏差
+///
+/// 1. **量级**：0.01 比参考实现严 50 倍。当时的标定依据是「让精确守住首选位」——汉语同音
+///    字词频跨数量级（「是」1799848 vs「四」22625 = 80 倍），要让「四」守住首位，折扣必须
+///    < 1/80。这是个**产品取向**选择，不是参考实现的做法；改为对齐后 `si` 会出「是」在前。
+/// 2. **不按音节数**：`beijinsi`（jin→jing 且 si→shi，2 个模糊音节）与 `si`（1 个）拿同样
+///    的折扣。两个参考实现都累计 —— 模糊得越多，置信度越低。
+///
+/// ### 作用域：候选层与词图层同轴
+///
+/// 词图层在 `lattice.rs` 用 `FUZZY_SYLLABLE_LOG_PENALTY`（= `ln(0.5)`）施加同一惩罚，
+/// 于是**整句路径也吃到模糊惩罚**了。此前词图固定 −0.5、候选层 ×0.01，同一个「模糊」
+/// 概念两个量级，且整句 weight 走 `max(词典 weight, W_eff)` 把词图那份惩罚旁路掉 ——
+/// 这正是 step 6.5 的模糊降级拆不掉的根因。
+const FUZZY_WEIGHT_SCALE: f64 = 0.5;
 
-/// 对模糊命中施加权重折扣，见 [`FUZZY_WEIGHT_SCALE`]。
+/// 对模糊命中施加权重折扣：`weight × 0.5^fuzzy_syllables`，见 [`FUZZY_WEIGHT_SCALE`]。
+///
 /// 饱和到 `>= 1`：折扣不该把候选压成 0/负权重而改变它与「无权重」候选的关系。
-fn fuzzy_penalized(weight: i32) -> i32 {
-    if weight <= 1 {
+fn fuzzy_penalized(weight: i32, fuzzy_syllables: usize) -> i32 {
+    if weight <= 1 || fuzzy_syllables == 0 {
         return weight;
     }
-    ((weight as f64) * FUZZY_WEIGHT_SCALE).round().max(1.0) as i32
+    let scale = FUZZY_WEIGHT_SCALE.powi(fuzzy_syllables as i32);
+    ((weight as f64) * scale).round().max(1.0) as i32
 }
 
 /// 裸声母（无完整音节，如 "m"）单字提权：使单字候选（吗/么）排在多字前缀补全词
@@ -783,7 +797,8 @@ impl PinyinEngine {
                     if seen.insert(text.clone()) {
                         results.push(LookupHit {
                             text,
-                            weight: fuzzy_penalized(weight),
+                            // 单音节路径恒 1 个模糊音节。
+                            weight: fuzzy_penalized(weight, 1),
                             order,
                             is_fuzzy: true,
                             boundary: 0,
@@ -793,7 +808,7 @@ impl PinyinEngine {
             }
         } else {
             // 多音节：笛卡尔积展开各音节变体，拼成完整 altCode 查询。
-            for alt_code in self.expand_code(syllables) {
+            for (alt_code, fuzzy_count) in self.expand_code(syllables) {
                 if alt_code == code {
                     continue;
                 }
@@ -801,7 +816,7 @@ impl PinyinEngine {
                     if seen.insert(text.clone()) {
                         results.push(LookupHit {
                             text,
-                            weight: fuzzy_penalized(weight),
+                            weight: fuzzy_penalized(weight, fuzzy_count),
                             order,
                             is_fuzzy: true,
                             boundary: 0,
@@ -819,7 +834,8 @@ impl PinyinEngine {
     /// 实现收口在 [`fuzzy::FuzzyMatcher::expand_syllables`]，与 `lattice.rs` 的整句路径共用
     /// **同一份**逐音节展开逻辑——两处曾各写一套，且 lattice 那套对整串求变体，非首音节的
     /// 模糊永远命中不了（见该函数文档）。
-    fn expand_code(&self, syllables: &[String]) -> Vec<String> {
+    /// 返回 `(变体码, 被模糊的音节数)`——第二项供 [`fuzzy_penalized`] 按音节数累乘折扣。
+    fn expand_code(&self, syllables: &[String]) -> Vec<(String, usize)> {
         fuzzy::FuzzyMatcher::expand_syllables(syllables, &self.fuzzy_config)
     }
 }
@@ -3330,11 +3346,21 @@ mod tests {
         );
     }
 
-    /// 优先级 TDD：原对应拼音（精确匹配）应优先于模糊命中——即便模糊词词频更高。
-    /// 词典 "si"→"四"(weight 100) 与 "shi"→"是"(weight 9000，更高频)；fuzzy sh_s=true。
-    /// 输入 "si"：「四」是精确命中、「是」是模糊命中，「四」必须排在「是」之前。
+    /// 模糊命中受 `×0.5` 折扣，但**不是硬闸门**：词频差距足够大时模糊仍可胜出。
+    ///
+    /// ## ⚠️ 断言方向已随「对齐 librime/fcitx5」反转
+    ///
+    /// 原语义是「精确必须排在模糊之前，即便模糊词词频更高」，靠 `FUZZY_WEIGHT_SCALE=0.01`
+    /// 实现——那个取值是为「让精确守住首选位」标定的（汉语同音字词频常差 1~2 个量级，
+    /// 折扣必须 < 1/80 才压得住），**不是参考实现的做法**。
+    ///
+    /// 两个参考实现都用 `log(0.5)`：librime `kFuzzySpellingPenalty`、libime `fuzzyCost`。
+    /// 折扣只表达「模糊召回的置信度低一档」，压不压得住由词频差距自己决定 ——
+    /// 「是」(1799848) 打 `si` 时排在「四」(22625) 前面，正是这两个实现的行为。
+    ///
+    /// 本用例改为守**折扣本身存在且按音节累乘**，那才是与实现无关的不变量。
     #[test]
-    fn fuzzy_exact_ranks_above_fuzzy() {
+    fn fuzzy_hit_is_discounted_but_not_gated() {
         let mut raw = CodetableDict::empty();
         raw.merge_single("si".to_string(), "四".to_string(), 100, 0);
         raw.merge_single("shi".to_string(), "是".to_string(), 9000, 0);
@@ -3345,19 +3371,41 @@ mod tests {
 
         let r = eng.convert("si", 10).unwrap();
         let texts: Vec<&String> = r.candidates.iter().map(|c| &c.text).collect();
-        let pos_si = texts.iter().position(|t| *t == "四");
-        let pos_shi = texts.iter().position(|t| *t == "是");
-        assert!(pos_si.is_some(), "精确候选「四」应存在，实际: {texts:?}");
-        assert!(pos_shi.is_some(), "模糊候选「是」应存在，实际: {texts:?}");
-        assert!(
-            pos_si < pos_shi,
-            "精确命中「四」应排在模糊命中「是」之前（即便「是」词频更高），实际: {texts:?}"
+        let si = r.candidates.iter().find(|c| c.text == "四");
+        let shi = r.candidates.iter().find(|c| c.text == "是");
+        let si = si.unwrap_or_else(|| panic!("精确候选「四」应存在，实际: {texts:?}"));
+        let shi = shi.unwrap_or_else(|| panic!("模糊候选「是」应存在，实际: {texts:?}"));
+
+        assert!(!si.is_fuzzy, "「四」应为非模糊");
+        assert!(shi.is_fuzzy, "「是」应为模糊命中");
+        // 折扣确实施加了：9000 → 4500（单音节 ⇒ 0.5^1）。
+        assert_eq!(
+            shi.weight, 4500,
+            "模糊命中须按 0.5^1 折扣，实际 {}",
+            shi.weight
         );
-        // 「四」是精确（非模糊），「是」是模糊命中
-        assert!(!r.candidates[pos_si.unwrap()].is_fuzzy, "「四」应为非模糊");
-        assert!(
-            r.candidates[pos_shi.unwrap()].is_fuzzy,
-            "「是」应为模糊命中"
+        assert_eq!(si.weight, 100, "精确命中权重不受影响");
+        // 90 倍的词频差距压过一档折扣 —— 折扣不是硬闸门。
+        assert_eq!(r.candidates[0].text, "是", "实际: {texts:?}");
+    }
+
+    /// 配对：**词频相当时折扣说了算**，精确胜出。
+    ///
+    /// 与上一条合看才说明 0.5 是个真折扣：少了这条，「模糊完全不打折」也能让上一条通过。
+    #[test]
+    fn fuzzy_loses_to_exact_at_equal_weight() {
+        let mut raw = CodetableDict::empty();
+        raw.merge_single("si".to_string(), "四".to_string(), 9000, 0);
+        raw.merge_single("shi".to_string(), "是".to_string(), 9000, 0);
+        let mut fz = FuzzyConfig::default();
+        fz.sh_s = true;
+        let eng = PinyinEngine::new(Config::default(), CachedDict::Memory(raw)).with_fuzzy(fz);
+
+        let r = eng.convert("si", 10).unwrap();
+        let texts: Vec<&String> = r.candidates.iter().map(|c| &c.text).collect();
+        assert_eq!(
+            r.candidates[0].text, "四",
+            "同权重下模糊被折扣压住，精确胜出，实际: {texts:?}"
         );
     }
 
