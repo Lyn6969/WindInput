@@ -437,7 +437,7 @@ pub struct Config {
     ///
     /// 混输经 `schema.mix.enable_pinyin_abbrev` 关闭它：简拼让「几乎任何字母串都可能是拼音」
     /// （`is_abbreviation` 只要求每字母是某音节首字母），而混输里有人只拿拼音做临时输入补位。
-    /// 关闭还顺带省掉用户词层的全量扫描（见 convert step6：`search_prefix("", 0)` 枚举全部用户词）。
+    /// 关闭时连简拼族的召回一并省掉（step5/5b/6/6.2 整条支路）。
     pub enable_abbrev: bool,
     /// 是否让**尾部残码**参与整句解码（step 2c，`buzhidaok`→「不知道看」）。
     /// 默认 true = 纯拼音方案的行为。
@@ -696,9 +696,15 @@ impl PinyinEngine {
         interp::spans_for_full_pinyin(input, &self.trie)
     }
 
-    /// 由全拼码取简拼（各音节声母拼接），供用户/临时造词层动态简拼匹配。
-    /// 系统词库规模大，离线预建 AbbrevSection 索引（性能考量）；用户词库规模小，
-    /// 现场取声母足够快，无需为其单独建索引/维护写入时的双写一致性。
+    /// 由全拼码取简拼（各音节声母拼接），供用户/临时造词层的简拼**判据**使用。
+    ///
+    /// ⚠️ 这是**判据**，不是召回：候选集由声母索引给出（`wind_store::abbrev_index`，
+    /// 键就是本函数 `boundary != 0` 分支的产物），本函数负责逐条比对。两侧对 boundary
+    /// 的解释必须**逐位一致**——那边加了个这边没有的守卫，索引键就永远匹配不上查询，
+    /// 表现为「简拼一条都召不回」而不是报错。
+    ///
+    /// 曾经这里的注释写的是「用户词库规模小，现场取声母足够快，无需建索引」——
+    /// 那个假设在 19 万词时失效（实测枚举一次 172ms，而 step 6.2 逐切点还要再来十几遍）。
     ///
     /// **优先采信候选自带的 `boundary`（音节起始字节位 bitmask）**——那是造词/词库解析
     /// 期留下的真值，直接取这些位置的字符即得声母。仅当 `boundary == 0`（旧数据、
@@ -775,7 +781,11 @@ impl PinyinEngine {
             };
 
         // ① 纯简拼系统词（同 step5，含「音节数 == 简拼字母数」过滤，boundary=0 走 DAG 兜底）
-        if AbbrevMatcher::is_abbreviation(stroke, trie) {
+        //
+        // 本函数整体已由调用方按 `config.enable_abbrev` 把关（见 step 6.2 的入口条件），
+        // 故此处只需判形态。该值下面 ③④ 复用，不重算——重算就多一次漂移的机会。
+        let plain = AbbrevMatcher::is_abbreviation(stroke, trie);
+        if plain {
             for abbr_code in dict.search_abbrev(stroke, 10) {
                 for h in dict.search_with_boundary(&abbr_code) {
                     let eb = effective_boundary(&abbr_code, h.boundary, trie);
@@ -822,19 +832,73 @@ impl PinyinEngine {
         }
 
         // ③④ 用户/临时造词层的纯简拼与混合简拼（同 step6 末段）
+        //
+        // 经**声母索引**取候选，判据一字未动：索引只保证「声母投影对得上」，
+        // 音节数、逐段全等仍在下面逐条判。见 `DictLayer::search_abbrev`。
         if let Some(store_dm) = &self.store_layers {
-            if AbbrevMatcher::is_abbreviation(stroke, trie) || !pats.is_empty() {
-                for c in store_dm.search_prefix("", 0) {
-                    let plain = self.abbrev_of_code(&c.code, c.boundary).as_deref() == Some(stroke);
-                    let mixed = !plain
-                        && mixed_abbrev::syllables_from_boundary(&c.code, c.boundary)
-                            .is_some_and(|syls| pats.iter().any(|p| p.matches(&syls)));
-                    if plain || mixed {
-                        push(cands, c.text, c.code, c.weight, c.boundary);
-                    }
+            for c in self.recall_store_by_abbrev(store_dm, stroke, plain, &pats) {
+                let plain = self.abbrev_of_code(&c.code, c.boundary).as_deref() == Some(stroke);
+                let mixed = !plain
+                    && mixed_abbrev::syllables_from_boundary(&c.code, c.boundary)
+                        .is_some_and(|syls| pats.iter().any(|p| p.matches(&syls)));
+                if plain || mixed {
+                    push(cands, c.text, c.code, c.weight, c.boundary);
                 }
             }
         }
+    }
+
+    /// 从用户/临时词层按**声母索引**取简拼候选集（整串路径与前缀回退路径共用）。
+    ///
+    /// ## 要查哪些声母串
+    ///
+    /// - 纯简拼：击键串本身就是声母串（`nh` → 查 `nh`）；
+    /// - 混合简拼：每条模式的**声母投影键**（`nhao` = n + hao → 投影键 `nh`）。
+    ///   这正是 `mixed_abbrev` 模块设计时就为系统词库 `AbbrevSection` 准备的那个键
+    ///   （见其模块文档的四步图），用户词索引沿用同一套键，故两侧完全同构。
+    ///
+    /// ## `plain` 必须由调用方传入，**不得在此重算**
+    ///
+    /// 调用方的闸门是 `config.enable_abbrev && is_abbreviation(stroke, trie)`。这里若图省事
+    /// 只重算 `is_abbreviation`，就会丢掉 `enable_abbrev` 那一半：混输下用户明明关了简拼
+    /// （`schema.mix.enable_pinyin_abbrev = false`），召回照样出候选。
+    ///
+    /// 这是「闸门长在调用点、召回搬进新函数只搬了一半」的老毛病——重算有漏项的自由度，
+    /// 传参没有。`pats` 同理：调用方已按 `enable_abbrev` 决定它是否为空。
+    ///
+    /// 入口条件（`plain || !pats.is_empty()`）保持原样：`nih` 这类形态 `is_abbreviation`
+    /// 判假（`i` 不是任何音节首字母）却有合法混合解释，故取或。
+    ///
+    /// ## 返回的是超集
+    ///
+    /// 索引只保证声母投影相等，**判据一律留给调用方**：纯简拼要比对整串、混合简拼要
+    /// 逐段校验音节。这条边界是刻意的——改索引不该改变简拼的语义，只该改变取候选的代价。
+    ///
+    /// 去重按 (code, text)：一个词可能同时落在纯简拼键与某条混合模式的投影键下。
+    fn recall_store_by_abbrev(
+        &self,
+        store_dm: &DictManager,
+        stroke: &str,
+        plain: bool,
+        pats: &[mixed_abbrev::MixedPattern],
+    ) -> Vec<Candidate> {
+        let mut keys: Vec<&str> = Vec::new();
+        if plain {
+            keys.push(stroke);
+        }
+        keys.extend(pats.iter().map(|p| p.key()));
+        keys.sort_unstable();
+        keys.dedup();
+
+        let mut out: Vec<Candidate> = Vec::new();
+        for key in keys {
+            for c in store_dm.search_abbrev(key, 0) {
+                if !out.iter().any(|x| x.code == c.code && x.text == c.text) {
+                    out.push(c);
+                }
+            }
+        }
+        out
     }
 
     /// 全拼降级支路的**准入闸门**：这串击键本身够不够像一串全拼。
@@ -2242,14 +2306,21 @@ impl Engine for PinyinEngine {
                 candidates.push(c);
             }
 
-            // 简拼匹配（用户/临时造词层）：用户词写入时只存全拼码，不像系统词库那样离线
-            // 预建 AbbrevSection——规模小，现算即可（枚举该 schema 下全部用户/临时词，
-            // 按各词自带的音节边界取声母比对，见 abbrev_of_code）。natural_order 对齐
-            // step5 系统简拼候选，同样排在全拼之后。
-            // 混合简拼（step 5b）在这里共用同一次全表枚举：`nih` 这类形态 `is_abbreviation`
-            // 判假（`i` 不是任何音节首字母）却有合法混合解释，故入口条件是两者取或。
-            if stroke_is_plain_abbrev || !mixed_pats.is_empty() {
-                for mut c in store_dm.search_prefix("", 0) {
+            // 简拼匹配（用户/临时造词层）：经**声母索引**取候选集。
+            //
+            // 此前这里是「枚举该 schema 下全部用户/临时词、按各词自带的边界现算声母比对」，
+            // 注释写的理由是「规模小，现算即可」——19 万词后该假设失效，实测 172ms/次，
+            // 且 step6.2 还要逐切点再来十几遍。索引把候选集从全层缩到一个声母组，
+            // **判据一字未动**（见 recall_store_by_abbrev）。
+            //
+            // natural_order 对齐 step5 系统简拼候选，同样排在全拼之后。
+            {
+                for mut c in self.recall_store_by_abbrev(
+                    store_dm,
+                    abbr_query,
+                    stroke_is_plain_abbrev,
+                    &mixed_pats,
+                ) {
                     if c.text.is_empty() || candidates.iter().any(|x| x.text == c.text) {
                         continue;
                     }

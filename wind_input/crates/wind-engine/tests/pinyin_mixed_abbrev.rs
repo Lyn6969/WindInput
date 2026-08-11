@@ -283,7 +283,8 @@ fn disabling_abbrev_also_disables_mixed() {
     );
 }
 
-/// 用户/临时造词层的混合简拼：不经索引，按各词自带的 boundary 现算比对。
+/// 用户/临时造词层的混合简拼：经声母索引取候选，再按各词自带的 boundary 逐段比对。
+/// 索引本身的行为见 `pinyin_store_abbrev_index.rs`，此处只关心混合式判据。
 ///
 /// 用户词「大菠萝哥」da|bo|luo|ge，混合式 `dbluoge` = d + b + luo + ge。
 /// 注意 `is_abbreviation("dbluoge")` 判**假**（`u` 不是任何音节的首字母），

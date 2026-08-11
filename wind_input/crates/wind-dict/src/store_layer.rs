@@ -101,6 +101,20 @@ impl DictLayer for StoreUserLayer {
             .collect();
         sort_trunc(cands, limit)
     }
+
+    /// `is_prefix = false`：简拼命中的是**整词**，不是前缀补全。引擎侧会据此
+    /// 把它归入简拼层（`is_abbrev`），与 `is_prefix` 的补全层是两回事。
+    fn search_abbrev(&self, abbrev: &str, limit: usize) -> Vec<Candidate> {
+        let recs = self
+            .store
+            .search_user_words_by_abbrev(&self.schema_id, abbrev, limit)
+            .unwrap_or_default();
+        let cands = recs
+            .into_iter()
+            .map(|r| record_to_candidate(r, false, false))
+            .collect();
+        sort_trunc(cands, limit)
+    }
 }
 
 /// 临时学习词层（redb 后端，可变）。
@@ -154,6 +168,20 @@ impl DictLayer for StoreTempLayer {
             .collect();
         sort_trunc(cands, limit)
     }
+
+    /// 临时词同样要走索引：简拼召回是**跨层**的（引擎侧的 DictManager 同时注册了
+    /// 用户层与临时层），只索引其一等于只修一半。
+    fn search_abbrev(&self, abbrev: &str, limit: usize) -> Vec<Candidate> {
+        let recs = self
+            .store
+            .search_temp_words_by_abbrev(&self.schema_id, abbrev, limit)
+            .unwrap_or_default();
+        let cands = recs
+            .into_iter()
+            .map(|r| record_to_candidate(r, true, false))
+            .collect();
+        sort_trunc(cands, limit)
+    }
 }
 
 #[cfg(test)]
@@ -197,6 +225,74 @@ mod tests {
         // 无边界记录仍是 0（旧数据 / 手输码 → 消费方降级回 DAG），不得凭空造出边界
         s.add_user_word("pinyin", "abcd", "工作", 100, 0).unwrap();
         assert_eq!(ul.search("abcd", 10)[0].boundary, 0);
+    }
+
+    /// 简拼召回走索引，且**跨层合并语义与改用索引之前一致**。
+    ///
+    /// 此前这条路是 `search_prefix("", 0)` 全层枚举后由 merge_search 合并；换成索引后
+    /// 仍必须经同一套合并——否则同一个词同时在用户层与临时层时会返回两条、
+    /// 权重不再取 max，排序静默变化。索引换的是取候选的代价，不是候选本身。
+    #[test]
+    fn abbrev_recall_goes_through_the_index_and_merges_across_layers() {
+        let s = store("abbrev_recall");
+        s.add_user_word("py", "nihao", "你好", 500, 0b101).unwrap();
+        s.learn_temp_word("py", "nihao", "你好", 900, 0b101)
+            .unwrap();
+        // ni|hao|ma → 起始 {0,2,5}；zai|jian → 起始 {0,3}
+        s.add_user_word("py", "nihaoma", "你好吗", 300, 0b100101)
+            .unwrap();
+        s.add_user_word("py", "zaijian", "再见", 700, 0b1001)
+            .unwrap();
+
+        let dm = crate::manager::DictManager::new();
+        dm.register_layer(Box::new(StoreUserLayer::new(s.clone(), "py")));
+        dm.register_layer(Box::new(StoreTempLayer::new(s.clone(), "py")));
+
+        let nh = dm.search_abbrev("nh", 0);
+        assert_eq!(nh.len(), 1, "nh 只该命中「你好」（nhm 是三音节，不同组）");
+        assert_eq!(nh[0].text, "你好");
+        assert_eq!(
+            nh[0].weight, 900,
+            "跨层同 text 须继承更高权重（临时层 900），与改用索引前一致"
+        );
+        assert_eq!(nh[0].code, "nihao", "保留全拼码，不得覆盖成简拼串");
+        assert_eq!(nh[0].boundary, 0b101, "边界必须穿过来，双拼校验吃这个值");
+        assert!(!nh[0].is_prefix, "简拼命中的是整词，不是前缀补全");
+
+        assert_eq!(dm.search_abbrev("nhm", 0)[0].text, "你好吗");
+        assert_eq!(dm.search_abbrev("zj", 0)[0].text, "再见");
+        assert!(dm.search_abbrev("zg", 0).is_empty(), "无关声母串不该有产出");
+    }
+
+    /// 没有声母索引的层（系统词库层等）默认**不产出**，而非回退到全层枚举。
+    /// 静默的全表扫正是简拼卡顿的根因，让它召不回、在测试里立刻暴露，好过悄悄慢下去。
+    #[test]
+    fn layers_without_an_index_yield_nothing_rather_than_scanning() {
+        use crate::layer::{DictLayer, LayerType};
+        struct Bare;
+        impl DictLayer for Bare {
+            fn name(&self) -> &str {
+                "bare"
+            }
+            fn layer_type(&self) -> LayerType {
+                LayerType::System
+            }
+            fn search(&self, _: &str, _: usize) -> Vec<Candidate> {
+                vec![Candidate {
+                    text: "不该出现".into(),
+                    ..Default::default()
+                }]
+            }
+            fn search_prefix(&self, _: &str, _: usize) -> Vec<Candidate> {
+                vec![Candidate {
+                    text: "更不该出现".into(),
+                    ..Default::default()
+                }]
+            }
+        }
+        let composite = CompositeDict::new();
+        composite.register_layer(Box::new(Bare));
+        assert!(composite.search_abbrev("nh", 0).is_empty());
     }
 
     #[test]

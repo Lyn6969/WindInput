@@ -64,12 +64,44 @@ impl Store {
             db: Mutex::new(Some(db)),
         };
         store.run_migrations()?;
+        store.backfill_abbrev_indexes();
         info!(
             "Store opened: {} (v{})",
             store.path.display(),
             store.version().unwrap_or(0)
         );
         Ok(store)
+    }
+
+    /// 存量库补建简拼索引：升级到带索引的版本时，老库里的词一条索引都没有，
+    /// 不补建则简拼**静默召不回**（比慢更糟）。
+    ///
+    /// 放在 `open` 里而不是交给调用方判断，是因为 `Store::open` 有多个入口（协调器、
+    /// 设置页、备份还原、各类测试）——留给调用方就等于留一个「忘了调」的口子，
+    /// 而这类遗漏的表现是静默失效。
+    ///
+    /// 常态开销 O(1)：索引条目数与主表条目数恒等（每条词正好一条索引），
+    /// 故只有「索引空而主表非空」时才会真正扫一遍。失败只记日志不阻断启动——
+    /// 简拼召不回是退化，打不开词库是故障，不该用后者换前者。
+    fn backfill_abbrev_indexes(&self) {
+        let need = self
+            .with_db(|db| {
+                use redb::ReadableTableMetadata;
+                let txn = db.begin_read()?;
+                let idx =
+                    txn.open_table(USER_ABBREV)?.len()? + txn.open_table(TEMP_ABBREV)?.len()?;
+                let main =
+                    txn.open_table(USER_WORDS)?.len()? + txn.open_table(TEMP_WORDS)?.len()?;
+                Ok(idx == 0 && main > 0)
+            })
+            .unwrap_or(false);
+        if !need {
+            return;
+        }
+        match self.rebuild_abbrev_indexes() {
+            Ok(n) => info!("简拼索引补建完成：{} 条", n),
+            Err(e) => warn!("简拼索引补建失败（简拼召回将失效）：{}", e),
+        }
     }
 
     /// 建表（首次打开表即创建；幂等）。

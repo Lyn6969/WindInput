@@ -509,6 +509,41 @@ mod tests {
         let _ = std::fs::remove_file(&p);
     }
 
+    /// **重开库时自动补建**：老库升级上来索引是空的，若等调用方来判断就会漏
+    /// （`Store::open` 有协调器/设置页/备份还原等多个入口），而漏掉的表现是静默失效。
+    #[test]
+    fn reopening_an_unindexed_db_backfills_automatically() {
+        let p = tmp("wind_abbrev_backfill.redb");
+        {
+            let s = Store::open(&p).unwrap();
+            s.add_user_word("py", "nihao", "你好", 500, 0b101).unwrap();
+            s.learn_temp_word("py", "haoya", "好呀", 500, 0b1001)
+                .unwrap();
+            // 模拟老库：主表有数据、索引为空
+            s.with_db(|db| {
+                let txn = db.begin_write()?;
+                for t in [USER_ABBREV, TEMP_ABBREV] {
+                    abbrev_index::clear_schema(&mut txn.open_table(t)?, "py")?;
+                }
+                txn.commit()?;
+                Ok(())
+            })
+            .unwrap();
+            assert_eq!(s.abbrev_index_len(), 0, "前提：索引确实被清空了");
+        }
+        let s = Store::open(&p).unwrap();
+        assert_eq!(s.abbrev_index_len(), 2, "重开时应自动补建");
+        assert_eq!(
+            s.search_user_words_by_abbrev("py", "nh", 0).unwrap().len(),
+            1
+        );
+        assert_eq!(
+            s.search_temp_words_by_abbrev("py", "hy", 0).unwrap().len(),
+            1
+        );
+        let _ = std::fs::remove_file(&p);
+    }
+
     /// 存量数据补建覆盖**两张**索引：只补用户词等于临时词简拼仍然失效。
     #[test]
     fn rebuild_covers_both_tables() {

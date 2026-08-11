@@ -31,6 +31,22 @@ pub trait DictLayer: Send + Sync {
     /// 前缀查找
     fn search_prefix(&self, prefix: &str, limit: usize) -> Vec<Candidate>;
 
+    /// **按声母串查找**（简拼召回）：返回该层里声母投影等于 `abbrev` 的词条。
+    ///
+    /// 返回的是**超集**，调用方仍须逐条过自己的判据（音节数、逐段全等、混合模式校验）。
+    /// 本方法只负责把「候选集」从全层缩到一个声母组——判据一律留在引擎侧，
+    /// 这样索引不会悄悄改变简拼的语义，只改变取候选的代价。
+    ///
+    /// 默认返回空：只有背后有声母索引的层才实现（当前是 `StoreUserLayer` /
+    /// `StoreTempLayer`）。系统词库层走的是另一条路——`CachedDict::search_abbrev`
+    /// 查 wdat 的 `AbbrevSection` 拿到**码**再回查，由引擎直接调用，不经本层接口。
+    ///
+    /// ⚠️ 默认实现返回空**而不是回退到全层枚举**：静默的全表扫正是简拼卡顿的根因，
+    /// 与其让新层不知不觉继承那个代价，不如让它召不回、在测试里立刻暴露。
+    fn search_abbrev(&self, _abbrev: &str, _limit: usize) -> Vec<Candidate> {
+        Vec::new()
+    }
+
     /// 该层是否存在**严格长于** `prefix` 的编码——「更长后继」存在性判据，供上屏安全阀
     /// （自动上屏 / 满码清空 / 顶码）使用：还能接着打就别急着替用户上屏。
     ///

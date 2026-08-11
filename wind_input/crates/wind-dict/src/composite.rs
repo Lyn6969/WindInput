@@ -13,6 +13,17 @@ pub struct CompositeDict {
     layers: RwLock<Vec<Box<dyn DictLayer>>>,
 }
 
+/// `merge_search` 的查询种类：决定问各层哪个方法，其余合并逻辑三者共用。
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Query {
+    /// 精确码
+    Exact,
+    /// 前缀补全
+    Prefix,
+    /// 声母串（简拼召回）
+    Abbrev,
+}
+
 impl CompositeDict {
     pub fn new() -> Self {
         Self {
@@ -50,12 +61,22 @@ impl CompositeDict {
 
     /// 精确查找：跨层合并去重。
     pub fn search(&self, code: &str, limit: usize) -> Vec<Candidate> {
-        self.merge_search(code, limit, false)
+        self.merge_search(code, limit, Query::Exact)
     }
 
     /// 前缀查找：跨层合并去重。
     pub fn search_prefix(&self, prefix: &str, limit: usize) -> Vec<Candidate> {
-        self.merge_search(prefix, limit, true)
+        self.merge_search(prefix, limit, Query::Prefix)
+    }
+
+    /// 按声母串查找（简拼召回）：跨层合并去重，见 [`DictLayer::search_abbrev`]。
+    ///
+    /// **走同一套 `merge_search`** 而不是各层结果直接拼接，是为了保住跨层合并语义：
+    /// 同一个词同时在用户层与临时层时，此前经 `search_prefix` 合并成一条、权重取 max；
+    /// 若改成拼接后由引擎「先到先得」去重，就会拿到用户层那条的原权重，排序静默变化。
+    /// 索引换的是取候选的代价，不该顺手改掉候选本身。
+    pub fn search_abbrev(&self, abbrev: &str, limit: usize) -> Vec<Candidate> {
+        self.merge_search(abbrev, limit, Query::Abbrev)
     }
 
     /// 是否存在**严格长于** `prefix` 的编码：任一**启用**层命中即 true，命中即短路。
@@ -78,20 +99,23 @@ impl CompositeDict {
     ///   - 每层叠加该层 `base_order()`（设计者经 [[dictionaries]].base_order 配置），
     ///     使等权/`base_sort=natural` 时按设计者指定的层间基序排列（取代旧的按注册位置偏移）。
     /// 与 Go composite.go `searchInternal` 对齐。
-    fn merge_search(&self, query: &str, limit: usize, is_prefix: bool) -> Vec<Candidate> {
+    fn merge_search(&self, query: &str, limit: usize, kind: Query) -> Vec<Candidate> {
         let layers = self.layers.read().unwrap();
         let mut results: Vec<Candidate> = Vec::new();
         let mut seen: HashMap<String, usize> = HashMap::new();
+        // 「同 text 取最短码」只对前缀查询成立：那时各层给的是**不同长度的补全码**。
+        // 精确与简拼查询给的都是整词码，换码就成了「A 层的 code 配 B 层的边界」。
+        let is_prefix = matches!(kind, Query::Prefix);
 
         for layer in layers.iter() {
             // 禁用层（如关闭的码表扩展词库）跳过。
             if !layer.enabled() {
                 continue;
             }
-            let layer_results = if is_prefix {
-                layer.search_prefix(query, limit)
-            } else {
-                layer.search(query, limit)
+            let layer_results = match kind {
+                Query::Exact => layer.search(query, limit),
+                Query::Prefix => layer.search_prefix(query, limit),
+                Query::Abbrev => layer.search_abbrev(query, limit),
             };
             // 层级基序档位：写入候选的 base_order 字段（独立排序层级，不折进 natural_order）。
             let layer_base_order = layer.base_order();
