@@ -6,7 +6,8 @@
 //!
 //! key 编码：`"{schema}\0{code}\0{text}"`（store.md §2）。
 
-use crate::store::{Store, USER_WORDS};
+use crate::abbrev_index;
+use crate::store::{Store, USER_ABBREV, USER_WORDS};
 use crate::wdict;
 use redb::ReadableTable;
 use serde::{Deserialize, Serialize};
@@ -117,6 +118,10 @@ impl Store {
                     }
                     None => (weight, 0, now_secs(), boundary),
                 };
+                // 边界可能从 0 被补齐（见上），索引键随之改变 → shift 负责删旧建新。
+                let old_b = existing.map(|(_, _, _, ob)| ob);
+                let mut idx = txn.open_table(USER_ABBREV)?;
+                abbrev_index::shift(&mut idx, schema, code, text, old_b, b)?;
                 t.insert(key.as_str(), enc_val(w, c, ca, b).as_slice())?;
             }
             txn.commit()?;
@@ -198,7 +203,15 @@ impl Store {
             let txn = db.begin_write()?;
             {
                 let mut t = txn.open_table(USER_WORDS)?;
+                // 先读边界才能算出索引键——删主表之后就查不到了，顺序不可调换。
+                let b = t
+                    .get(key.as_str())?
+                    .and_then(|g| dec_val(g.value()))
+                    .map(|(_, _, _, b)| b);
                 t.remove(key.as_str())?;
+                if let Some(b) = b {
+                    abbrev_index::remove(&mut txn.open_table(USER_ABBREV)?, schema, code, text, b)?;
+                }
             }
             txn.commit()?;
             Ok(())
@@ -250,10 +263,9 @@ impl Store {
             {
                 let mut t = txn.open_table(USER_WORDS)?;
                 // 不存在则创建 weight=0 记录（隐性造词路径）：此处只有扁平 code，无边界可算 → 0。
-                let (w, c, ca, b) = t
-                    .get(key.as_str())?
-                    .and_then(|g| dec_val(g.value()))
-                    .unwrap_or((0, 0, now_secs(), 0));
+                let existing = t.get(key.as_str())?.and_then(|g| dec_val(g.value()));
+                let is_new = existing.is_none();
+                let (w, c, ca, b) = existing.unwrap_or((0, 0, now_secs(), 0));
                 let nc = c.saturating_add(1);
                 let nw = if count_threshold > 0 && nc % count_threshold == 0 {
                     w.saturating_add(boost_delta)
@@ -261,6 +273,12 @@ impl Store {
                     w
                 };
                 t.insert(key.as_str(), enc_val(nw, nc, ca, b).as_slice())?;
+                // ⚠️ **本路径会凭空造出用户词**（上面那句注释说的「隐性造词」），故必须建索引。
+                // 改权重不用动索引（value 空），但新增必须——漏了这一处，靠选词自动产生的
+                // 词就永远进不了简拼索引，且只在「用过一段时间后」才显形。
+                if is_new {
+                    abbrev_index::insert(&mut txn.open_table(USER_ABBREV)?, schema, code, text, b)?;
+                }
             }
             txn.commit()?;
             Ok(())
@@ -292,6 +310,7 @@ impl Store {
                     t.remove(k.as_str())?;
                 }
             }
+            abbrev_index::clear_schema(&mut txn.open_table(USER_ABBREV)?, schema)?;
             txn.commit()?;
             Ok(n)
         })
@@ -310,6 +329,7 @@ impl Store {
             let mut c = WordsImportCounts::default();
             {
                 let mut t = txn.open_table(USER_WORDS)?;
+                let mut idx = txn.open_table(USER_ABBREV)?;
                 for r in rows {
                     // code 列可能是带空格的音节码（`ni hao`）→ 拆成扁平 key + 边界。
                     // 无空格（五笔码/旧版导出）→ boundary=0，与改动前等价。
@@ -322,6 +342,7 @@ impl Store {
                                 key.as_str(),
                                 enc_val(r.weight, r.count, now_secs(), in_b).as_slice(),
                             )?;
+                            abbrev_index::insert(&mut idx, schema, &code, &r.text, in_b)?;
                             c.added += 1;
                         }
                         Some((w, cnt, ca, b)) => {
@@ -334,6 +355,17 @@ impl Store {
                             let nb = if b != 0 { b } else { in_b };
                             if nw != w || nc != cnt || nb != b {
                                 t.insert(key.as_str(), enc_val(nw, nc, ca, nb).as_slice())?;
+                                // 边界被补齐时索引键随之改变 → shift 删旧建新。
+                                if nb != b {
+                                    abbrev_index::shift(
+                                        &mut idx,
+                                        schema,
+                                        &code,
+                                        &r.text,
+                                        Some(b),
+                                        nb,
+                                    )?;
+                                }
                                 c.updated += 1;
                             } else {
                                 c.unchanged += 1;
@@ -612,6 +644,190 @@ mod tests {
         s.add_user_word("py", "nihao", "你好", 100, 0).unwrap();
         let r3 = s.get_user_words("py", "nihao").unwrap();
         assert_eq!(r3[0].boundary, 0b101, "已有边界不该被 0 覆盖");
+    }
+
+    /// 无边界词（手输码/旧版扁平导入）仍须被简拼查询捞出来交给引擎现判，
+    /// 且**只在首字符对得上时**才捞——这正是分组的意义。
+    #[test]
+    fn no_boundary_words_are_recalled_by_first_char_only() {
+        let p = tmp("wind_abbrev_noboundary.redb");
+        let s = Store::open(&p).unwrap();
+        s.add_user_word("py", "xianning", "西安宁", 100, 0).unwrap();
+        s.add_user_word("py", "nihao", "你好", 100, 0).unwrap();
+
+        let texts = |ab: &str| -> Vec<String> {
+            s.search_user_words_by_abbrev("py", ab, 0)
+                .unwrap()
+                .into_iter()
+                .map(|r| r.text)
+                .collect()
+        };
+        // 首字符 x → 只捞出 x 开头的那条，n 开头的那条被分组挡掉
+        assert_eq!(texts("xan"), vec!["西安宁"]);
+        assert_eq!(texts("nh"), vec!["你好"]);
+        // 首字符对不上 → 一条不返回（改动前是整库返回）
+        assert!(texts("zg").is_empty());
+        let _ = std::fs::remove_file(&p);
+    }
+
+    /// **索引必须覆盖每一条写路径。**
+    ///
+    /// 这是本方案唯一的系统性风险：主表写了、索引没写，简拼就静默召不回那个词——
+    /// 不报错、不告警。五条写路径逐一验证。
+    #[test]
+    fn every_write_path_maintains_the_index() {
+        let p = tmp("wind_abbrev_paths.redb");
+        let s = Store::open(&p).unwrap();
+        let hit = |ab: &str| -> Vec<String> {
+            s.search_user_words_by_abbrev("py", ab, 0)
+                .unwrap()
+                .into_iter()
+                .map(|r| r.text)
+                .collect()
+        };
+
+        // ① add_user_word
+        s.add_user_word("py", "nihao", "你好", 500, 0b101).unwrap();
+        assert_eq!(hit("nh"), vec!["你好"], "add_user_word 应建索引");
+
+        // ② import_user_words
+        s.import_user_words(
+            "py",
+            &[wdict::WordIo {
+                code: "xi an ning".into(),
+                text: "西安宁".into(),
+                weight: 700,
+                count: 0,
+            }],
+        )
+        .unwrap();
+        assert_eq!(hit("xan"), vec!["西安宁"], "import 应建索引");
+
+        // ③ on_word_selected 的隐性造词（最容易漏的一条）
+        s.on_word_selected("py", "zg", "中国", 0, 0).unwrap();
+        assert_eq!(
+            hit("zg"),
+            vec!["中国"],
+            "隐性造词的记录 boundary=0，应落在 z 的兜底组（否则它永远召不回）"
+        );
+
+        // ④ remove_user_word
+        s.remove_user_word("py", "nihao", "你好").unwrap();
+        assert!(hit("nh").is_empty(), "remove 应删索引");
+
+        // ⑤ clear_user_words
+        s.clear_user_words("py").unwrap();
+        assert!(
+            hit("xan").is_empty() && hit("zg").is_empty(),
+            "clear 应清索引"
+        );
+        assert_eq!(s.abbrev_index_len(), 0, "索引应随主表一起清空");
+        let _ = std::fs::remove_file(&p);
+    }
+
+    /// **改权重不该动索引**——这正是 value 留空的收益。
+    /// 若哪天把 weight 塞进 value，这两条高频路径就都得同步更新，漏一处即静默错乱。
+    #[test]
+    fn weight_changes_do_not_touch_the_index() {
+        let p = tmp("wind_abbrev_weight.redb");
+        let s = Store::open(&p).unwrap();
+        s.add_user_word("py", "nihao", "你好", 500, 0b101).unwrap();
+        let before = s.abbrev_index_len();
+
+        s.update_user_word_weight("py", "nihao", "你好", 900)
+            .unwrap();
+        s.on_word_selected("py", "nihao", "你好", 100, 1).unwrap();
+        assert_eq!(s.abbrev_index_len(), before, "索引条数不该变");
+
+        let got = s.search_user_words_by_abbrev("py", "nh", 0).unwrap();
+        assert_eq!(got.len(), 1);
+        assert!(
+            got[0].weight >= 900,
+            "回主表点查拿到的必须是**最新**权重，实际 {}",
+            got[0].weight
+        );
+        let _ = std::fs::remove_file(&p);
+    }
+
+    /// 边界从 0 被补齐时，索引键要跟着搬家——旧键残留会变成永远匹配不上的幽灵。
+    #[test]
+    fn filling_boundary_moves_the_index_key() {
+        let p = tmp("wind_abbrev_move.redb");
+        let s = Store::open(&p).unwrap();
+        s.add_user_word("py", "nihao", "你好", 500, 0).unwrap(); // 无边界 → \u{1}n 兜底组
+        // 探针：`nx` 的声母组必然为空，故命中只可能来自 n 的兜底组。
+        assert_eq!(
+            s.search_user_words_by_abbrev("py", "nx", 0).unwrap().len(),
+            1,
+            "补齐前它躺在 n 的兜底组里"
+        );
+
+        s.add_user_word("py", "nihao", "你好", 500, 0b101).unwrap(); // 补齐边界
+        assert_eq!(
+            s.abbrev_index_len(),
+            1,
+            "补齐后仍应只有一条索引（旧键必须被删）"
+        );
+        assert!(
+            s.search_user_words_by_abbrev("py", "nx", 0)
+                .unwrap()
+                .is_empty(),
+            "补齐边界后不该再留在兜底组（残留即幽灵：查什么都跟着出来）"
+        );
+        assert_eq!(
+            s.search_user_words_by_abbrev("py", "nh", 0).unwrap().len(),
+            1
+        );
+        let _ = std::fs::remove_file(&p);
+    }
+
+    /// 存量数据补建索引：老库升级上来时索引是空的，不补建则简拼静默失效。
+    #[test]
+    fn rebuild_covers_preexisting_words() {
+        let p = tmp("wind_abbrev_rebuild.redb");
+        let s = Store::open(&p).unwrap();
+        s.add_user_word("py", "nihao", "你好", 500, 0b101).unwrap();
+        s.add_user_word("wb", "aaaa", "工工", 100, 0).unwrap();
+
+        // 模拟老库：主表有数据、索引为空
+        s.with_db(|db| {
+            let txn = db.begin_write()?;
+            {
+                let mut idx = txn.open_table(USER_ABBREV)?;
+                let keys: Vec<String> = idx
+                    .iter()?
+                    .filter_map(|i| i.ok().map(|(k, _)| k.value().to_string()))
+                    .collect();
+                for k in &keys {
+                    idx.remove(k.as_str())?;
+                }
+            }
+            txn.commit()?;
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(s.abbrev_index_len(), 0, "前提：索引确实被清空了");
+        assert!(
+            s.search_user_words_by_abbrev("py", "nh", 0)
+                .unwrap()
+                .is_empty(),
+            "前提校验：没有索引时确实召不回——这正是必须补建的理由"
+        );
+
+        assert_eq!(s.rebuild_abbrev_indexes().unwrap(), 2);
+        assert_eq!(
+            s.search_user_words_by_abbrev("py", "nh", 0).unwrap().len(),
+            1,
+            "补建后应能召回"
+        );
+        assert_eq!(
+            s.search_user_words_by_abbrev("wb", "aaaa", 0)
+                .unwrap()
+                .len(),
+            1,
+            "跨 schema 的词也要补建，且各归各的 schema"
+        );
+        let _ = std::fs::remove_file(&p);
     }
 
     #[test]

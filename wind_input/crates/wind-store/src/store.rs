@@ -19,6 +19,18 @@ pub const CURRENT_VERSION: u32 = 1;
 pub(crate) const USER_WORDS: TableDefinition<&str, &[u8]> = TableDefinition::new("user_words");
 /// 临时词：同上
 pub(crate) const TEMP_WORDS: TableDefinition<&str, &[u8]> = TableDefinition::new("temp_words");
+/// 用户词**简拼索引**：key = `"{schema}\0{group}\0{code}\0{text}"`，value 空。
+/// 键的构成、分组规则与维护契约全在 [`crate::abbrev_index`]。
+///
+/// 新表无需迁移：`init_tables` 在写事务里 `open_table` 即创建；存量数据的索引由
+/// [`Store::rebuild_abbrev_indexes`] 在首次发现索引为空时补建。
+pub(crate) const USER_ABBREV: TableDefinition<&str, &[u8]> = TableDefinition::new("user_abbrev");
+/// 临时词**简拼索引**：与 [`USER_ABBREV`] 同构，索引 `TEMP_WORDS`。
+///
+/// 两层都要索引，因为简拼召回是**跨层**的：引擎侧挂的 `DictManager` 同时注册了
+/// `StoreUserLayer` 与 `StoreTempLayer`，只索引其一等于只修一半——自动造词开着时，
+/// 临时词库（默认上限 5000 条）仍会被逐切点全量枚举。
+pub(crate) const TEMP_ABBREV: TableDefinition<&str, &[u8]> = TableDefinition::new("temp_abbrev");
 /// 用户词频：key = "{schema}\0{code}\0{text}"，value = {count,last_used}（见 frequency.md）
 pub(crate) const FREQ: TableDefinition<&str, &[u8]> = TableDefinition::new("freq");
 /// Shadow 规则：key = "{schema}\0{code}"
@@ -65,7 +77,9 @@ impl Store {
         let w = db.begin_write()?;
         {
             w.open_table(USER_WORDS)?;
+            w.open_table(USER_ABBREV)?;
             w.open_table(TEMP_WORDS)?;
+            w.open_table(TEMP_ABBREV)?;
             w.open_table(FREQ)?;
             w.open_table(SHADOW)?;
             w.open_table(PHRASES)?;
