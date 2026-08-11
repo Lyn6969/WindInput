@@ -456,6 +456,12 @@ STDAPI CKeyEventSink::OnTestKeyDown(ITfContext* pContext, WPARAM wParam, LPARAM 
         // ⚠ 判据必须与 OnKeyDown 的同名分支逐字一致：那边吃这边放就是「吃了再吐」，
         // 严格 TSF 宿主直接丢键。两侧同用 _HasInputSession()，它与服务端
         // `Coordinator::has_input_session` 对齐（有编码 / 有候选 / overlay）。
+        // 自注入的复原事件：放行且不做任何处理（判据与 OnKeyDown 一致）。
+        if (_IsCapsSelfInjected())
+        {
+            *pfEaten = FALSE;
+            return S_OK;
+        }
         BOOL eat = _HasInputSession();
         *pfEaten = eat;
         _LogKeyDecision(L"test_down", _pTextService->GetFocusSessionId(), wParam, modifiers,
@@ -890,11 +896,20 @@ STDAPI CKeyEventSink::OnKeyDown(ITfContext* pContext, WPARAM wParam, LPARAM lPar
     if (wParam == VK_CAPITAL && pHotkeyMgr != nullptr
         && pHotkeyMgr->IsKeyUpSessionOnlyHotkey(CHotkeyManager::CalcKeyHash(KEYMOD_CAPSLOCK, VK_CAPITAL)))
     {
+        // 自注入的复原事件：放行且不做任何处理，否则会再触发一次复原（无限递归）。
+        if (_IsCapsSelfInjected())
+        {
+            *pfEaten = FALSE;
+            return S_OK;
+        }
         BOOL eat = _HasInputSession();
         if (eat)
         {
-            // 吃掉 keydown 压住大写翻转；翻页/取消由 OnKeyUp 转发给服务端执行。
             _pTextService->NoteCapsLockKeyActivity(); // 供 OPENCLOSE 联动噪声抑制
+            // ★ 吃掉 keydown **压不住**大写锁定翻转——系统在 TSF 之前就改了输入线程状态
+            // （2026-08-11 真机实测推翻了「必须吃掉才能压制」那条注释）。只能回敲复原，
+            // 而复原必须等物理 keyup 处理完（见 _RestoreCapsLockToggle 声明处）。这里只记账。
+            _capsSessionEaten = TRUE;
         }
         *pfEaten = eat;
         _LogKeyDecision(L"down", _pTextService->GetFocusSessionId(), wParam, modifiers,
@@ -1399,6 +1414,13 @@ STDAPI CKeyEventSink::OnTestKeyUp(ITfContext* pContext, WPARAM wParam, LPARAM lP
     // Also handle Caps Lock for indicator
     if (wParam == VK_CAPITAL)
     {
+        // 自注入的复原 keyup：放行，绝不能吃——吃了就会调 OnKeyUp，那里会再发一次
+        // keyup IPC 给服务端，等于按一下 CapsLock 翻两页。
+        if (_IsCapsSelfInjected())
+        {
+            *pfEaten = FALSE;
+            return S_OK;
+        }
         _pTextService->NoteCapsLockKeyActivity(); // 供 OPENCLOSE 联动噪声抑制
         *pfEaten = TRUE;
         return S_OK;
@@ -1461,6 +1483,12 @@ STDAPI CKeyEventSink::OnKeyUp(ITfContext* pContext, WPARAM wParam, LPARAM lParam
     // Handle Caps Lock key release
     if (wParam == VK_CAPITAL)
     {
+        // 自注入的复原 keyup：放行，不发 IPC（否则按一下翻两页），也不清 _capsSessionEaten。
+        if (_IsCapsSelfInjected())
+        {
+            *pfEaten = FALSE;
+            return S_OK;
+        }
         _pTextService->NoteCapsLockKeyActivity(); // 供 OPENCLOSE 联动噪声抑制
 
         CHotkeyManager* pHotkeyMgr = _pTextService->GetHotkeyManager();
@@ -1508,6 +1536,19 @@ STDAPI CKeyEventSink::OnKeyUp(ITfContext* pContext, WPARAM wParam, LPARAM lParam
             // IPC failed, fall back to local update
             WIND_LOG_ERROR(L"IPC failed for CapsLock, updating locally");
             _pTextService->UpdateCapsLockState(capsLockOn);
+        }
+
+        // ★ 复原大写锁定态，且必须在 IPC 之后：这次 keyup 正是触发翻页/取消的那个事件，
+        // 提前注入会让「放行自注入事件」的时间窗把它一起放行，动作就不执行了。
+        //
+        // 判据取 keydown 时记下的 _capsSessionEaten，**不**在这里重新判定：中途候选消失
+        // （如引擎异步刷新）会导致「吃了 keydown 却不复原」，大写锁定被永久翻转，而用户
+        // 完全无从知道是哪一下按键干的。无论是否复原都要清标志，避免残留影响下一次。
+        BOOL restore = _capsSessionEaten;
+        _capsSessionEaten = FALSE;
+        if (restore)
+        {
+            _RestoreCapsLockToggle();
         }
 
         *pfEaten = TRUE;
@@ -2697,6 +2738,30 @@ bool CKeyEventSink::_AreModifiersHeld()
     return (GetAsyncKeyState(VK_SHIFT) & 0x8000) != 0 ||
            (GetAsyncKeyState(VK_CONTROL) & 0x8000) != 0 ||
            (GetAsyncKeyState(VK_MENU) & 0x8000) != 0;
+}
+
+void CKeyEventSink::_RestoreCapsLockToggle()
+{
+    // ★★ 刻意**不用** skip 表，尽管本文件其它自注入（auto-pair / _ReplayKeyToHost）都用它。
+    //
+    // skip 只在 OnTestKeyDown / OnTestKeyUp 消费，而 CapsLock 的处理分支在 OnKeyDown /
+    // OnKeyUp **也各有一份**。2026-08-11 第一版按 skip 写，真机表现是 CapsLock 疯狂闪烁：
+    // 注入的 down 在 OnTest 层被 skip 放行了，却照样走进 OnKeyDown 的分支，于是再注入一次，
+    // 无限递归。防护的覆盖范围必须与副作用的位置对齐——副作用在 On* 层，防护就不能只守
+    // OnTest* 层。时间窗对四个入口一视同仁，不依赖任何 TSF 调用契约。
+    _capsInjectTick = GetTickCount();
+    if (_capsInjectTick == 0)
+        _capsInjectTick = 1; // 0 是「无窗口」的哨兵值，避开 GetTickCount 的 49.7 天回绕
+
+    INPUT inputs[2] = {};
+    inputs[0].type = INPUT_KEYBOARD;
+    inputs[0].ki.wVk = VK_CAPITAL;
+    inputs[1].type = INPUT_KEYBOARD;
+    inputs[1].ki.wVk = VK_CAPITAL;
+    inputs[1].ki.dwFlags = KEYEVENTF_KEYUP;
+    UINT sent = SendInput(2, inputs, sizeof(INPUT));
+    WIND_LOG_DEBUG_FMT(L"capslock_restore_toggle: sent=%d capsWas=%d\n",
+                       (int)sent, (int)((GetKeyState(VK_CAPITAL) & 0x0001) != 0));
 }
 
 void CKeyEventSink::_PushSkipKey(WORD vk)
